@@ -593,6 +593,47 @@ SELECT vfb_startup() AS c2 \gset
 SELECT :c0 = :c1 AS "priced exact", :c0 <> :c2 AS "not as probes";
 RESET pg_lion.vector_exact_rows;
 RESET pg_lion.vector_exact_per_partition;
+-- ... and as core prices the sort of the lion bitmap scan's rows it competes
+-- with (DESIGN.md §44.7, "Exact path pricing"): its members' vectors read
+-- from the heap, each heap page once, as the bitmap scan reads them, where
+-- until 2026-10-18 every member cost a random page: 1,200 members (s < 60)
+-- lie on some 850 of vfb's 1,482 pages, and a random page each priced the
+-- node at 2.6 times the sort.  At l2_distance()'s COST 100 (DESIGN.md
+-- §44.11), for this transaction alone.
+CREATE FUNCTION vfb_price(node boolean) RETURNS float8 LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	first text;
+	ok boolean := false;
+	want text := CASE WHEN node THEN 'Custom Scan \(LionOrdered\)' ELSE '->  Sort ' END;
+	sort text := current_setting('enable_sort');
+	ordered text := current_setting('pg_lion.enable_ordered_scan');
+	postfilter text := current_setting('pg_lion.vector_postfilter');
+BEGIN
+	IF node THEN
+		PERFORM set_config('enable_sort', 'off', true);
+	ELSE
+		PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+		PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
+	END IF;
+	FOR ln IN EXECUTE 'EXPLAIN SELECT id FROM vfb WHERE s < 60
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10' LOOP
+		first := coalesce(first, ln);
+		IF ln ~ want THEN
+			ok := true;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_sort', sort, true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', ordered, true);
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
+	RETURN CASE WHEN ok
+		THEN substring(first from '\.\.([0-9]+\.[0-9]+) ')::float8 END;
+END $$;
+BEGIN;
+ALTER FUNCTION l2_distance(vector, vector) COST 100;
+SELECT abs(vfb_price(true) / vfb_price(false) - 1) < 0.1 AS "priced as the sort";
+ROLLBACK;
+DROP FUNCTION vfb_price(boolean);
 -- the setting's range
 SET pg_lion.vector_exact_per_partition = -1;
 SET pg_lion.vector_exact_per_partition = 1000001;

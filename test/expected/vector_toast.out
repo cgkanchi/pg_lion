@@ -1248,8 +1248,146 @@ SELECT tt_cmp('SELECT id, v <-> tt_vec(-1, 1536) AS d FROM ttu ORDER BY v <-> tt
 (1 row)
 
 DROP TABLE ttu;
+-- ---------------------------------------------------------------------
+-- 7. Which plan (DESIGN.md §44.7, "Exact path pricing"): the exact path is
+--    priced as core prices the plan it competes with, a sort of the lion
+--    bitmap scan's rows.  Read by place, a member costs its share of the
+--    LOC pages and no page of the heap or of TOAST: the sort's detoast reads
+--    the same TOAST pages, through the TOAST index, and core prices none of
+--    them.  Read from the heap, a member costs its heap page as the bitmap
+--    scan's rows do.  3,000 rows of 1536 dimensions, each with a kilobyte
+--    of text, as a table of embeddings keeps its chunks' text: under a
+--    filter of 1% (30 rows) LionOrdered is the plan with the vectors in
+--    TOAST, where until 2026-10-18 a random page a member and another a
+--    row returned kept the sort the plan; with the same rows inline, or
+--    read from the heap, the two plans read the same pages and are priced
+--    within a tenth of each other.  pgvector's l2_distance() at COST 100,
+--    as lionvec's documentation asks (§44.11), for this transaction alone.
+-- ---------------------------------------------------------------------
+SELECT setseed(0.25);
+ setseed 
+---------
+ 
+(1 row)
+
+CREATE TABLE ttc (id int, s int, note text, v vector(1536))
+	WITH (autovacuum_enabled = off);
+INSERT INTO ttc
+SELECT i, i % 100, repeat(md5(i::text), 32),
+	   (SELECT array_agg(random()::real) FROM generate_series(1, 1536)
+		 WHERE i > 0)::vector
+  FROM generate_series(1, 3000) i;
+-- the same rows, their vectors inline
+CREATE TABLE ttc_in (LIKE ttc)
+	WITH (autovacuum_enabled = off, toast_tuple_target = 8160);
+INSERT INTO ttc_in SELECT * FROM ttc;
+CREATE INDEX ttc_s ON ttc USING lion (s);
+CREATE INDEX ttc_v ON ttc USING lionvec (v) WITH (partitions = 4);
+CREATE INDEX ttc_in_s ON ttc_in USING lion (s);
+CREATE INDEX ttc_in_v ON ttc_in USING lionvec (v) WITH (partitions = 4);
+VACUUM (FREEZE, ANALYZE) ttc;
+VACUUM (FREEZE, ANALYZE) ttc_in;
+SELECT tt_meta('ttc_v') AS toast, tt_meta('ttc_in_v') AS inline;
+                             toast                             |                             inline                             
+---------------------------------------------------------------+----------------------------------------------------------------
+ format 5, flags 3, a locator, 2 runs in a refine item's place | format 5, flags 1, no locator, 0 runs in a refine item's place
+(1 row)
+
+/*
+ * tt_price() is the planner's price of q - its first line's, the Limit's,
+ * for the rows it takes - through LionOrdered (node: sorts off) or as a
+ * sort of the filter's rows (the node off, pg_lion.vector_postfilter
+ * exact); NULL if the plan is not that.
+ */
+CREATE FUNCTION tt_price(q text, node boolean) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	first text;
+	ok boolean := false;
+	want text := CASE WHEN node THEN 'Custom Scan \(LionOrdered\)' ELSE '->  Sort ' END;
+	sort text := current_setting('enable_sort');
+	ordered text := current_setting('pg_lion.enable_ordered_scan');
+	postfilter text := current_setting('pg_lion.vector_postfilter');
+BEGIN
+	IF node THEN
+		PERFORM set_config('enable_sort', 'off', true);
+	ELSE
+		PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+		PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
+	END IF;
+	FOR ln IN EXECUTE 'EXPLAIN ' || q LOOP
+		first := coalesce(first, ln);
+		IF ln ~ want THEN
+			ok := true;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_sort', sort, true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', ordered, true);
+	PERFORM set_config('pg_lion.vector_postfilter', postfilter, true);
+	RETURN CASE WHEN ok
+		THEN substring(first from '\.\.([0-9]+\.[0-9]+) ')::float8 END;
+END $$;
+BEGIN;
+ALTER FUNCTION l2_distance(vector, vector) COST 100;
+-- in TOAST: LionOrdered, which computes the 30 members' distances by place
+PREPARE ttc_q(vector) AS
+	SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> $1 LIMIT 10;
+SET LOCAL plan_cache_mode = force_generic_plan;
+EXPLAIN (COSTS OFF) EXECUTE ttc_q(tt_vec(-1, 1536));
+               QUERY PLAN               
+----------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on ttc
+         Ordered By: ttc_v
+         Order By: (v <-> $1)
+         Lion Cond: (s = 3)
+         Lion Indexes: ttc_s
+(6 rows)
+
+DEALLOCATE ttc_q;
+-- (prepared, and run once, as tt_x above)
+SET LOCAL pg_lion.vector_prefetch = off;
+PREPARE ttc_x AS SELECT count(*) FROM (SELECT id FROM ttc WHERE s = 3
+	ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
+EXECUTE ttc_x;
+ count 
+-------
+    10
+(1 row)
+
+SET LOCAL client_min_messages = debug1;
+EXECUTE ttc_x;
+DEBUG:  lionvec scan of "ttc_v": 0 members fetched, 10 returned, 30 read by place (10 locator pages, 0 not), 10 checked
+ count 
+-------
+    10
+(1 row)
+
+RESET client_min_messages;
+DEALLOCATE ttc_x;
+SELECT tt_price(q, true) AS node, tt_price(q, false) AS sort,
+	   tt_price(replace(q, 'ttc', 'ttc_in'), true) AS node_in,
+	   tt_price(replace(q, 'ttc', 'ttc_in'), false) AS sort_in
+  FROM (VALUES ('SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10')) q(q) \gset
+-- read from the heap, the vectors' TOAST pages unpriced as the sort's are
+SET LOCAL pg_lion.vector_toast_direct = off;
+SELECT tt_price('SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10',
+				true) AS heap \gset
+RESET pg_lion.vector_toast_direct;
+ROLLBACK;
+SELECT :node < 0.8 * :sort AS "in TOAST, the exact path the cheaper",
+	   abs(:heap / :sort - 1) < 0.1 AS "from the heap, as the sort",
+	   abs(:node_in / :sort_in - 1) < 0.1 AS "inline, as the sort";
+ in TOAST, the exact path the cheaper | from the heap, as the sort | inline, as the sort 
+--------------------------------------+----------------------------+---------------------
+ t                                    | t                          | t
+(1 row)
+
+DROP TABLE ttc, ttc_in;
 DROP FUNCTION tt_vec(bigint, int, float8), tt_u16(bytea, int), tt_u32(bytea, int),
 	tt_meta(regclass, text), tt_pages(regclass, int, text), tt_locs(regclass),
 	tt_slots(regclass), tt_raw(regclass, int), tt_visible(regclass),
 	tt_places(regclass, oid), tt_check(regclass), tt_runs(regclass),
-	tt_run(text, boolean), tt_cmp(text, boolean), tt_all(regclass, int, text, text);
+	tt_run(text, boolean), tt_cmp(text, boolean), tt_all(regclass, int, text, text),
+	tt_price(text, boolean);
