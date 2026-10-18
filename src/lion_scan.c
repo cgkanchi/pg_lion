@@ -1334,11 +1334,17 @@ lion_sets_reserve(LionScanSets *acc, int n)
 {
 	int			first = acc->nsets;
 
+	/*
+	 * Huge: a list held whole - a multi-key `op ANY (array)`, a second list
+	 * beside the one a bitmap scan batches, the planner's probe or the facets'
+	 * filter (lion_scankey_sets()) - is some 120 bytes a set here, and a
+	 * parameter's array has no length cap (DESIGN.md §15).
+	 */
 	if (acc->nsets + n > acc->maxsets)
 	{
 		acc->maxsets = Max(acc->maxsets * 2, acc->nsets + n);
 		acc->sets = (LionPostingSet *)
-			repalloc(acc->sets, sizeof(LionPostingSet) * acc->maxsets);
+			repalloc_huge(acc->sets, sizeof(LionPostingSet) * acc->maxsets);
 	}
 	memset(&acc->sets[first], 0, sizeof(LionPostingSet) * n);
 	acc->nsets += n;
@@ -1390,6 +1396,218 @@ lion_scan_shift(LionKeyNode *node, int base)
 	}
 	for (i = 0; i < node->nargs; i++)
 		lion_scan_shift(node->args[i], base);
+}
+
+/*
+ * A scalar `col = ANY (array)`: how many elements, NULL or not, its array
+ * has, or -1 when the key is not such a list at all.  The array is detoasted
+ * once, and the copy, if that made one, freed again.
+ */
+static int
+lion_scankey_list_length(LionState *col, ScanKey skey)
+{
+	ArrayType  *arr;
+	int			n;
+
+	if (col->multikey ||
+		(skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL |
+						   SK_ISNULL)) != SK_SEARCHARRAY ||
+		skey->sk_strategy != LION_STRAT_EQUAL)
+		return -1;
+	arr = DatumGetArrayTypeP(skey->sk_argument);
+	n = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+	if ((Pointer) arr != DatumGetPointer(skey->sk_argument))
+		pfree(arr);
+	return n;
+}
+
+/*
+ * An IN list located a batch at a time (DESIGN.md §15, "A list too long to
+ * locate at once"; §29.4).  A parameter's array has no length cap, and every
+ * located set takes some 200 bytes - past nine million values an array of
+ * them is more than the 1GB a plain allocation may be, and long before that
+ * more than work_mem.  So such a list is not located whole: its values are
+ * sorted once into the order a lookup locates them in (lion_probe_sort(),
+ * with their hashes), byte-for-byte repeats dropped as the count drops them
+ * (lion_probe_sort_unique()), and each batch is cut only where the hash
+ * changes - every value of one equality class compares equal and hashes
+ * alike, so no class, and no entry, is in two batches.  What is held whole is
+ * the values: the array, and a Datum and a hash each, as the count's
+ * batches hold them.  The plain scan's LIST (§29.4) and the bitmap scan's
+ * intersections (lion_bitmap_list_batch()) both take their batches from here.
+ */
+typedef struct LionScanList
+{
+	AttrNumber	attno;			/* the list's key column */
+	Oid			type;			/* its elements' type */
+	Datum	   *values;			/* the non-NULL ones, in lookup order */
+	uint32	   *hashes;			/* ... and their hashes */
+	int			nvalues;
+	int			pos;			/* the first value not located yet */
+} LionScanList;
+
+/*
+ * Sort the values of the list key into *l, in the current memory context.  A
+ * by-reference value points into the key's detoasted array, which stays
+ * there with it.  False when the array has no non-NULL value: the list
+ * selects nothing.
+ */
+static bool
+lion_scan_list_begin(Relation index, ScanKey key, LionScanList *l)
+{
+	ArrayType  *arr = DatumGetArrayTypeP(key->sk_argument);
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+
+	l->attno = key->sk_attno;
+	l->type = ARR_ELEMTYPE(arr);
+	l->pos = 0;
+	get_typlenbyvalalign(l->type, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, l->type, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+	l->values = (Datum *)
+		palloc_extended(sizeof(Datum) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	l->hashes = (uint32 *)
+		palloc_extended(sizeof(uint32) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	l->nvalues = lion_probe_sort(index, l->attno, l->type, nelems, elems,
+								 nulls, l->values, l->hashes);
+	l->nvalues = lion_probe_sort_unique(l->values, l->hashes, l->nvalues,
+										elmbyval, elmlen);
+	pfree(elems);
+	pfree(nulls);
+	return l->nvalues > 0;
+}
+
+/*
+ * Locate the list's next batch: at most batch values, and more only to keep
+ * the values of one hash together.  The sets come out in a new array, in the
+ * current memory context, of extra slots - zeroed, for the caller's other
+ * sets - and then the batch's: *nsets of them located there, packed, *nfound
+ * of which have an entry.  Each of the *nsets must be handed to
+ * lion_posting_set_release().  NULL past the end of the list.
+ */
+static LionPostingSet *
+lion_scan_list_locate(Relation index, LionScanList *l, int batch, int extra,
+					  int *nsets, int *nfound)
+{
+	LionPostingSet *sets;
+	int			start = l->pos;
+	int			end;
+
+	if (start >= l->nvalues)
+		return NULL;
+	end = start + Min(batch, l->nvalues - start);
+	while (end < l->nvalues && l->hashes[end] == l->hashes[end - 1])
+		end++;
+	l->pos = end;
+
+	sets = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * ((Size) extra + (end - start)),
+						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+	*nsets = lion_posting_set_lookup_many_col(index, l->attno, l->type,
+											  end - start, &l->values[start],
+											  NULL, &sets[extra], nfound);
+	return sets;
+}
+
+/*
+ * Which of a bitmap scan's keys is located a batch at a time: a scalar `col =
+ * ANY (array)` of more values than lion_array_batch_size() - a work_mem of
+ * located sets, never fewer than the thousand a literal list may have, the
+ * count's own batch - and the longest of them when there are several, so
+ * that what is located whole is as little as it can be.  -1 for none.
+ */
+static int
+lion_bitmap_long_list(LionScanOpaque so, ScanKey *keys, int nkeys)
+{
+	int			best = -1;
+	int			bestn = lion_array_batch_size();
+	int			i;
+
+	for (i = 0; i < nkeys; i++)
+	{
+		int			n = lion_scankey_list_length(lion_column(so->ix,
+															 keys[i]->sk_attno),
+												 keys[i]);
+
+		if (n > bestn)
+		{
+			best = i;
+			bestn = n;
+		}
+	}
+	return best;
+}
+
+/*
+ * The next batch of a bitmap scan's long list beside the other trees
+ * (lion_emit_columns(), lion_emit_intersect()): in batchcxt, which is reset
+ * first, the sets - the other trees' nrest, copied, and then the batch's,
+ * whose pins are let go at once (the bitmap heap scan visits every TID) -
+ * and the tree over them, the other trees ANDed with the batch's union.  A
+ * bitmap is a set, so the union over the batches of (batch AND rest) is
+ * (list AND rest): the answer of the list located whole.  A batch none of
+ * whose values has an entry selects nothing and is passed over.  False past
+ * the end of the list.  The caller releases the batch's sets, [nrest ..
+ * *nsets), before it asks for the next.
+ */
+static bool
+lion_bitmap_list_batch(Relation index, LionScanList *l, MemoryContext batchcxt,
+					   int nrest, const LionPostingSet *rest,
+					   LionKeyNode **restargs, int nrestargs,
+					   LionPostingSet **sets, int *nsets, LionKeyNode **tree)
+{
+	int			batch = lion_array_batch_size();
+
+	for (;;)
+	{
+		MemoryContext oldcxt;
+		LionPostingSet *all;
+		LionKeyNode **leaves;
+		LionKeyNode **args;
+		int			nb;
+		int			nfound;
+		int			i;
+
+		MemoryContextReset(batchcxt);
+		oldcxt = MemoryContextSwitchTo(batchcxt);
+		all = lion_scan_list_locate(index, l, batch, nrest, &nb, &nfound);
+		if (all == NULL)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			return false;
+		}
+		for (i = 0; i < nb; i++)
+			lion_posting_set_unpin(&all[nrest + i]);
+		if (nfound == 0)
+		{
+			for (i = 0; i < nb; i++)
+				lion_posting_set_release(&all[nrest + i]);
+			MemoryContextSwitchTo(oldcxt);
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
+
+		if (nrest > 0)
+			memcpy(all, rest, sizeof(LionPostingSet) * nrest);
+		leaves = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nb);
+		for (i = 0; i < nb; i++)
+			leaves[i] = lion_scan_leaf(nrest + i);
+		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (nrestargs + 1));
+		for (i = 0; i < nrestargs; i++)
+			args[i] = restargs[i];
+		args[nrestargs] = lion_scan_op(LION_KN_OR, leaves, nb);
+
+		*sets = all;
+		*nsets = nrest + nb;
+		*tree = lion_scan_op(LION_KN_AND, args, nrestargs + 1);
+		MemoryContextSwitchTo(oldcxt);
+		return true;
+	}
 }
 
 /*
@@ -1651,6 +1869,13 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
  * expressed is dropped and *recheck is set, which is correct because the
  * bitmap heap scan re-applies the original quals.  Returns -1 when NOTHING
  * could be expressed, so the caller falls back to a single-qual answer.
+ *
+ * A list too long to locate at once (lion_bitmap_long_list()) is not one of
+ * the trees: the others are located, and the list is then located a batch
+ * at a time, each batch's union ANDed with them and emitted into the same
+ * bitmap (lion_bitmap_list_batch(); DESIGN.md §15, "A list too long to
+ * locate at once").  Each pass reads the other trees again, as each of the
+ * count's batches does.
  */
 static int64
 lion_emit_columns(LionScanOpaque so, ScanKey *keys,
@@ -1658,10 +1883,11 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 {
 	LionScanSets acc;
 	LionKeyNode **args;
-	LionKeyNode *tree;
 	LionQueryEmitState es;
+	LionScanList list;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
+	int			listkey;
 	int			nargs = 0;
 	int			i;
 	int			j;
@@ -1675,6 +1901,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nkeys);
+	listkey = lion_bitmap_long_list(so, keys, nkeys);
 
 	for (i = 0; i < nkeys; i++)
 	{
@@ -1683,6 +1910,9 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		nomatch;
 		bool		lossy;
+
+		if (i == listkey)
+			continue;			/* located below, a batch at a time */
 
 		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch,
 								  &lossy, false);
@@ -1706,16 +1936,20 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		args[nargs++] = node;
 	}
 
-	if (nargs == 0)
+	/*
+	 * Nothing expressible; or a long list of NULLs only, which selects
+	 * nothing, so the intersection does not either.
+	 */
+	if ((nargs == 0 && listkey < 0) ||
+		(listkey >= 0 &&
+		 !lion_scan_list_begin(so->index, keys[listkey], &list)))
 	{
 		for (i = 0; i < acc.nsets; i++)
 			lion_posting_set_release(&acc.sets[i]);
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);
-		return -1;
+		return (listkey < 0) ? -1 : 0;
 	}
-
-	tree = lion_scan_op(LION_KN_AND, args, nargs);
 
 	/*
 	 * Every set is located; the leaves the INLINE ones pinned protect
@@ -1732,8 +1966,36 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	es.posfilter = NULL;
 	es.keep = NULL;
 
-	(void) lion_sets_iterate(acc.nsets, acc.sets, tree, lion_query_emit_cb,
-							 &es);
+	if (listkey < 0)
+		(void) lion_sets_iterate(acc.nsets, acc.sets,
+								 lion_scan_op(LION_KN_AND, args, nargs),
+								 lion_query_emit_cb, &es);
+	else
+	{
+		MemoryContext batchcxt;
+		LionPostingSet *bsets;
+		LionKeyNode *tree;
+		int			nbsets;
+
+		/*
+		 * A batch is walked in its own context, which the next one resets:
+		 * its sets, its tree and the walk's cursors.
+		 */
+		batchcxt = AllocSetContextCreate(cxt, "lion index scan list batch",
+										 ALLOCSET_DEFAULT_SIZES);
+		while (lion_bitmap_list_batch(so->index, &list, batchcxt, acc.nsets,
+									  acc.sets, args, nargs, &bsets, &nbsets,
+									  &tree))
+		{
+			MemoryContextSwitchTo(batchcxt);
+			(void) lion_sets_iterate(nbsets, bsets, tree, lion_query_emit_cb,
+									 &es);
+			MemoryContextSwitchTo(cxt);
+			for (i = acc.nsets; i < nbsets; i++)
+				lion_posting_set_release(&bsets[i]);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
 
 	for (i = 0; i < acc.nsets; i++)
 		lion_posting_set_release(&acc.sets[i]);
@@ -2039,6 +2301,30 @@ lion_rwin_fill(LionRangeWindow *w, LionSetStream *st, bool *done, Size budget,
 }
 
 /*
+ * One stream of the other columns' answer, window by window, through the
+ * walks of the range columns rc[first .. nrange - 1] and into the bitmap.
+ */
+static void
+lion_rwin_run(LionRangeWindow *w, LionScanOpaque so, LionSetStream *st,
+			  LionScanRangeCol *rc, int first, int nrange, Size budget)
+{
+	bool		done = false;
+	int			i;
+
+	while (lion_rwin_fill(w, st, &done, budget, nrange - first > 1))
+	{
+		for (i = first; i < nrange && w->n > 0; i++)
+		{
+			w->last = (i == nrange - 1);
+			lion_rwin_walk(w, so, &rc[i]);
+			if (!w->last)
+				lion_rwin_apply(w);
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
  * Answer a scan whose keys span several key columns when at least one of them
  * is answered by a RANGE (DESIGN.md §28): the other columns' set trees ANDed
  * into ONE stream of containers in ascending container key, and each range
@@ -2060,6 +2346,12 @@ lion_rwin_fill(LionRangeWindow *w, LionSetStream *st, bool *done, Size budget,
  * rangekeys[] names each range column by its chosen key: a plain range key,
  * whose column's range keys are then walked together, or `col < ANY (array)`,
  * one walk to the widest element.
+ *
+ * A list too long to locate at once (lion_bitmap_long_list()) is located a
+ * batch at a time, as lion_emit_columns() locates it: each batch's union,
+ * ANDed with the other columns' trees, is a stream of its own, taken window
+ * by window through the range walks into the same bitmap - which makes the
+ * union over the batches.  The walks are made again for each batch's windows.
  *
  * (Deviation from the version before it, which walked each range into a
  * TIDBitmap of its own, of work_mem, and intersected the bitmaps - core's
@@ -2087,9 +2379,10 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	LionScanRangeCol *rc;
 	LionRangeWindow w;
 	LionSetStream *st;
+	LionScanList list;
 	Size		budget = (Size) lion_scan_window_bytes();
-	bool		done = false;
 	bool		nomatch = false;
+	int			listkey;
 	int			nargs = 0;
 	int			first = 0;
 	int64		ntids;
@@ -2105,6 +2398,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (nkeys + 1));
+	listkey = lion_bitmap_long_list(so, keys, nkeys);
 
 	/*
 	 * Each range column's ranges.  One that can hold nothing - a NULL bound,
@@ -2134,6 +2428,9 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		bool		none;
 		bool		lossy;
 
+		if (i == listkey)
+			continue;			/* located below, a batch at a time */
+
 		node = lion_scan_col_tree(so->index,
 								  lion_column(so->ix, keys[i]->sk_attno),
 								  keys[i], &acc, &ok, &none, &lossy, false);
@@ -2149,7 +2446,12 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		}
 	}
 
-	if (!nomatch && nargs == 0 && nrange == 1)
+	/* A long list of NULLs only selects nothing. */
+	if (!nomatch && listkey >= 0 &&
+		!lion_scan_list_begin(so->index, keys[listkey], &list))
+		nomatch = true;
+
+	if (!nomatch && nargs == 0 && listkey < 0 && nrange == 1)
 	{
 		/* Nothing beside the range could be expressed: the range alone. */
 		ScanKey		skey = rangekeys[0];
@@ -2165,7 +2467,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		return lion_emit_array_range(so, col, skey, tbm);
 	}
 
-	if (!nomatch && nargs == 0)
+	if (!nomatch && nargs == 0 && listkey < 0)
 	{
 		/*
 		 * Nothing but ranges: the first one, collected, stands for the other
@@ -2220,8 +2522,6 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	 */
 	for (i = 0; i < acc.nsets; i++)
 		lion_posting_set_unpin(&acc.sets[i]);
-	st = lion_stream_begin_bounded(acc.nsets, acc.sets,
-								   lion_scan_op(LION_KN_AND, args, nargs));
 
 	memset(&w, 0, sizeof(w));
 	w.max = 64;
@@ -2246,20 +2546,42 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	w.entrycxt = AllocSetContextCreate(cxt, "lion index range entry",
 									   ALLOCSET_DEFAULT_SIZES);
 
-	while (lion_rwin_fill(&w, st, &done, budget, nrange - first > 1))
+	if (listkey < 0)
 	{
-		for (i = first; i < nrange && w.n > 0; i++)
+		st = lion_stream_begin_bounded(acc.nsets, acc.sets,
+									   lion_scan_op(LION_KN_AND, args, nargs));
+		lion_rwin_run(&w, so, st, rc, first, nrange, budget);
+		lion_stream_end(st);
+	}
+	else
+	{
+		MemoryContext batchcxt;
+		LionPostingSet *bsets;
+		LionKeyNode *tree;
+		int			nbsets;
+
+		/*
+		 * Each batch's stream lives in the batch's context, which the next
+		 * batch resets: its sets, its tree and its cursors.  The window's
+		 * own memory is w.cxt's, reset by every window.
+		 */
+		batchcxt = AllocSetContextCreate(cxt, "lion index scan list batch",
+										 ALLOCSET_DEFAULT_SIZES);
+		while (lion_bitmap_list_batch(index, &list, batchcxt, acc.nsets,
+									  acc.sets, args, nargs, &bsets, &nbsets,
+									  &tree))
 		{
-			w.last = (i == nrange - 1);
-			lion_rwin_walk(&w, so, &rc[i]);
-			if (!w.last)
-				lion_rwin_apply(&w);
+			MemoryContextSwitchTo(batchcxt);
+			st = lion_stream_begin_bounded(nbsets, bsets, tree);
+			lion_rwin_run(&w, so, st, rc, first, nrange, budget);
+			lion_stream_end(st);
+			MemoryContextSwitchTo(cxt);
+			for (i = acc.nsets; i < nbsets; i++)
+				lion_posting_set_release(&bsets[i]);
 		}
-		CHECK_FOR_INTERRUPTS();
 	}
 	ntids = w.ntids + w.tst.total;
 
-	lion_stream_end(st);
 	for (i = 0; i < acc.nsets; i++)
 		lion_posting_set_release(&acc.sets[i]);
 	MemoryContextSwitchTo(oldcxt);
@@ -2806,12 +3128,7 @@ struct LionSource
 	LionContainer *ibuf;		/* an INLINE entry's item, aligned */
 
 	/* LIST: the list's values in lookup order, located a batch at a time */
-	AttrNumber	listattno;
-	Oid			listtype;
-	Datum	   *lvalues;
-	uint32	   *lhashes;
-	int			nlvalues;
-	int			lpos;			/* the first value not located yet */
+	LionScanList list;
 	LionPostingSet *bsets;		/* the batch's sets, in entrycxt */
 	int			nbsets;
 
@@ -2981,7 +3298,20 @@ lion_scan_col_ranges(LionScanOpaque so, LionState *col, ScanKey best,
 		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 						  &elems, &nulls, &nelems);
 
-		ranges = (LionRange *) palloc(sizeof(LionRange) * Max(nelems, 1));
+		/*
+		 * The widest element is one range.  Only a column that cannot order
+		 * the elements has one each, and holds them, in a huge allocation: a
+		 * parameter's array has no length cap (DESIGN.md §15), and a range
+		 * each for every element of an ordered column - all but the first
+		 * never used - failed with "invalid memory alloc request size" past
+		 * 22 million elements, where the ordinary plan answers.
+		 */
+		if (probe->hassort)
+			ranges = (LionRange *) palloc(sizeof(LionRange));
+		else
+			ranges = (LionRange *)
+				palloc_extended(sizeof(LionRange) * Max(nelems, 1),
+								MCXT_ALLOC_HUGE);
 		nranges = 0;
 
 		for (i = 0; i < nelems; i++)
@@ -3037,23 +3367,6 @@ lion_source_ranges(LionSource *src, LionState *col, ScanKey best)
 {
 	return lion_scan_col_ranges(src->so, col, best, &src->ranges,
 								&src->nranges);
-}
-
-/*
- * A scalar `col = ANY (array)` long enough to be located a batch at a time
- * (§29.4): how many non-NULL-or-not elements the array has, or -1 when the key
- * is not such a list at all.
- */
-static int
-lion_scankey_list_length(LionState *col, ScanKey skey)
-{
-	if (col->multikey ||
-		(skey->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL | SK_SEARCHNOTNULL |
-						   SK_ISNULL)) != SK_SEARCHARRAY ||
-		skey->sk_strategy != LION_STRAT_EQUAL)
-		return -1;
-	return ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(skey->sk_argument)),
-						  ARR_DIMS(DatumGetArrayTypeP(skey->sk_argument)));
 }
 
 /*
@@ -3400,31 +3713,9 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			nomatch = true;
 	}
 
-	if (!nomatch && listkey != NULL)
-	{
-		ArrayType  *arr = DatumGetArrayTypeP(listkey->sk_argument);
-		int16		elmlen;
-		bool		elmbyval;
-		char		elmalign;
-		Datum	   *elems;
-		bool	   *nulls;
-		int			nelems;
-
-		src->listattno = listkey->sk_attno;
-		src->listtype = ARR_ELEMTYPE(arr);
-		get_typlenbyvalalign(src->listtype, &elmlen, &elmbyval, &elmalign);
-		deconstruct_array(arr, src->listtype, elmlen, elmbyval, elmalign,
-						  &elems, &nulls, &nelems);
-		src->lvalues = (Datum *) palloc(sizeof(Datum) * Max(nelems, 1));
-		src->lhashes = (uint32 *) palloc(sizeof(uint32) * Max(nelems, 1));
-		src->nlvalues = lion_probe_sort(so->index, src->listattno,
-										src->listtype, nelems, elems, nulls,
-										src->lvalues, src->lhashes);
-		pfree(elems);
-		pfree(nulls);
-		if (src->nlvalues == 0)
-			nomatch = true;
-	}
+	if (!nomatch && listkey != NULL &&
+		!lion_scan_list_begin(so->index, listkey, &src->list))
+		nomatch = true;			/* a list of NULLs only */
 
 	if (nomatch || unioncol >= 0)
 	{
@@ -3576,7 +3867,8 @@ lion_source_end_batch(LionSource *src)
  * The next batch of a LIST (§29.4): at most lion_scan_list_batch() values, and
  * more only to keep the values of one hash - which include every value of one
  * equality class - together, so that no entry is located by two batches and
- * returned twice.  Returns false at the end of the list.
+ * returned twice (lion_scan_list_locate()).  Returns false at the end of the
+ * list.
  */
 static bool
 lion_source_list_batch(LionSource *src)
@@ -3586,32 +3878,22 @@ lion_source_list_batch(LionSource *src)
 	LionKeyNode **leaves;
 	LionKeyNode **args;
 	int			batch = lion_scan_list_batch();
-	int			start;
-	int			end;
 	int			nb;
 	int			nfound;
 	int			i;
 
 	for (;;)
 	{
-		if (src->lpos >= src->nlvalues)
-			return false;
-
-		start = src->lpos;
-		end = Min(start + batch, src->nlvalues);
-		while (end < src->nlvalues && src->lhashes[end] == src->lhashes[end - 1])
-			end++;
-		src->lpos = end;
-
 		oldcxt = MemoryContextSwitchTo(src->entrycxt);
-		all = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
-										 (src->nsets + (end - start)));
+		all = lion_scan_list_locate(src->index, &src->list, batch, src->nsets,
+									&nb, &nfound);
+		if (all == NULL)
+		{
+			MemoryContextSwitchTo(oldcxt);
+			return false;
+		}
 		if (src->nsets > 0)
 			memcpy(all, src->sets, sizeof(LionPostingSet) * src->nsets);
-		nb = lion_posting_set_lookup_many_col(src->index, src->listattno,
-											 src->listtype, end - start,
-											 &src->lvalues[start], NULL,
-											 &all[src->nsets], &nfound);
 		src->bsets = &all[src->nsets];
 		src->nbsets = nb;
 
