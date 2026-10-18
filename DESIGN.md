@@ -1521,8 +1521,17 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   lion index, the LionCount (count, GROUP BY, FK join) and LionOrdered hooks offer nothing, and
   what reaches a lion index under an MVCC snapshot anyway - a direct SQL count, a plan with every
   other path disabled - is an ERROR (`ERRCODE_FEATURE_NOT_SUPPORTED`) in amgettuple, amgetbitmap
-  and the count functions. The snapshot is not known yet in ambeginscan, which is why the refusal
-  is in the calls that read. Inserts and VACUUM are not affected; neither is
+  and the count functions. A lionvec index (§44) is not read either (2026-10-18; until then its
+  scans ran under the threshold, and only its reads of vectors by their TOAST places, §44.13, were
+  off). It has no such test: VACUUM's early horizon removes a dead row's CODE items as any other's,
+  a scan never meets the row again, and 16's index fetch (`heapam_index_fetch_tuple()`,
+  `heap_hot_search_buffer()`) tests no heap page, so an old snapshot's nearest neighbours came back
+  short without a word, on the exact path as on the probing one. `lionveccostestimate()` adds
+  `disable_cost` to every order on one - a filtered order is then planned exactly, not refused under
+  `pg_lion.vector_postfilter = error`, since no lionvec order is read for a Filter to follow - and
+  amgettuple, its only read (it has no amgetbitmap), errors before it reads a page (`lv_start()`),
+  in each process of a parallel scan. The snapshot is not known yet in ambeginscan, which is why the
+  refusal is in the calls that read. Inserts and VACUUM are not affected; neither is
   `lion_index_verify()`, whose heap scan raises "snapshot too old" itself on any page early
   pruning changed, and whose structural checks use no snapshot. The setting is a postmaster one,
   which a regression file cannot set, so the test is `make hookcheck`'s: on 16 alone it restarts
@@ -21211,6 +21220,22 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   it. A centroid's REFINE item missing is corruption.
 - **Serializable**: `ampredlocks = false`, so a reader takes a predicate lock on the whole index
   (`index_beginscan()`), and an insert checks it.
+- **`old_snapshot_threshold`** (PostgreSQL 16 only; 17 removed it): with it set VACUUM may remove
+  rows a snapshot older than the threshold still sees - their CODE and REFINE items with them - so
+  "VACUUM removes only rows dead to every snapshot" above does not hold. Core's access methods turn
+  that into "snapshot too old" by testing every page they read (`TestForOldSnapshot()`); lionvec
+  tests none, and the heap fetch it returns rows through (`table_index_fetch_tuple()`, 16's
+  `heap_hot_search_buffer()`) none either, so such a snapshot's nearest neighbours would come back
+  short without a word: on a 16 server at a threshold of one minute, a REPEATABLE READ transaction
+  counted 2,000 rows through a lionvec scan, another deleted 500 of them and VACUUMed a minute and
+  a half later (`tuples: 500 removed`), and the same scan in the same transaction counted 1,500,
+  where a sequential scan raised "snapshot too old". As lion is (§9), lionvec is not read while the
+  threshold is set: `lionveccostestimate()` adds `disable_cost` to every order, so a sort of the
+  rows wins; `lion_ordered_set_rel_pathlist()` raises no `pg_lion.vector_postfilter = error` for a
+  filtered order, which no lionvec scan answers then; and what reaches one anyway, a plan with
+  every other path disabled, is `ERRCODE_FEATURE_NOT_SUPPORTED` in `lv_start()`, at the scan's
+  first amgettuple (the snapshot is not known in ambeginscan) and before it reads a page, in each
+  process of a parallel scan. Inserts, VACUUM and builds are not refused.
 - **Format checks**: every page's type and id before anything on it is read; every CODE item's
   length against its flags and `dimsp`, its flags against each other (a copy is neither NULL nor
   zero), and a copy anywhere but a partition's chain of an index that spills; the meta page's flags
@@ -22568,6 +22593,16 @@ faster from the disk and the same warm, and the inline table's queries took main
 - **vector_toast.sql**, **vector_toast_corrupt.sql**, **test/isolation/lionvec_toast_scan.spec**
   and test/recovery's phase 5 (2026-10-17): vectors in TOAST read by their chunks' places, and
   every history and damage that can make a place wrong (§44.13, "Tests").
+- **test/modules/lion_hooktest/sql/oldsnapshot_vector.sql** (2026-10-18; `make hookcheck` on 16
+  with pgvector, next to oldsnapshot.sql on its server started with `old_snapshot_threshold = 60`,
+  §44.5): a plain order and a filtered one (no LionOrdered, and no error under `error`) planned as
+  a sort, with a sort's rows; with every other path disabled, a lionvec scan priced with
+  `disable_cost` and stopping at its ERROR - inline, under a Filter (`allow`), and over vectors in
+  TOAST, whose index keeps a locator; and inserts, updates, deletes, VACUUM (the index's row count
+  the table's after it) and REINDEX not refused. Against the code before, the filtered order
+  failed at plan time and every forced scan ran. A parallel scan cannot be forced there: its path
+  and the serial one both carry `disable_cost`, which puts them within `add_path()`'s fuzz of each
+  other, and the serial one is kept.
 
 ### 44.11 Not done
 
@@ -22950,10 +22985,11 @@ its vectors (other wide columns can push even a short vector out) reads those ro
 When the scan starts (`lv_start_toast()`) it reads by place if the index keeps a locator,
 `pg_lion.vector_toast_direct` is on (§44.8; off reads every row as before, which the tests compare
 against), the heap is heap-AM and its TOAST relation the meta page's `toastrelid`, the dimensions
-are known, the snapshot is an MVCC one, and (on 16) `old_snapshot_threshold` is off (below). It
-opens the TOAST relation once, with `AccessShareLock` as a detoast takes it - held to the end of
-the transaction, which keeps the relation from being rewritten (`VACUUM FULL`) or truncated under
-the scan - and counts its blocks then: a place at or past that count is never read. Then:
+are known, and the snapshot is an MVCC one (on 16 under `old_snapshot_threshold` no scan gets
+this far, below). It opens the TOAST relation once, with `AccessShareLock` as a detoast takes it -
+held to the end of the transaction, which keeps the relation from being rewritten (`VACUUM FULL`)
+or truncated under the scan - and counts its blocks then: a place at or past that count is never
+read. Then:
 
 1. The members, from the lion set, in TID order, as before.
 2. The LOCDIR chain, whole (`lionvec_locdir_read()`), and of its items those whose range holds a
@@ -23130,8 +23166,11 @@ named, in `vector_toast.sql` unless said):
   (`lionvec_stored_pointer()` takes only a tuple that ends its chain, as an insert's does).
 - **`old_snapshot_threshold`** (16 only; 17 removed it): a TOAST value a snapshot older than the
   threshold sees may be removed, and core's fetch then fails with "snapshot too old" on the TOAST
-  index's pages, which a read by place does not read. On 16 with it set, the scan does not read by
-  place.
+  index's pages, which a read by place does not read. With it set no lionvec index is read at all
+  (§9, "old_snapshot_threshold"; §44.5): the scan refuses before it starts, so there is nothing to
+  read by place and no case of its own here. (Until 2026-10-18 the scan ran and only read every
+  vector through the table instead - which the threshold made no more right, VACUUM's early
+  horizon removing the CODE items of rows such a snapshot sees.)
 - **Serializable transactions**: a member read by place and not returned has no heap fetch, and so
   no SIREAD lock on its tuple, where the heap fetch takes one. lionvec takes a predicate lock on the
   whole index (`ampredlocks = false`, §44.5), which every insert into it checks, and a change of a
