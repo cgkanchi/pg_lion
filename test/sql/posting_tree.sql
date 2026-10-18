@@ -74,6 +74,22 @@ SELECT container_pages > 2 * 16 AS many_leaves,
 SELECT lion_index_posting_root('pt_grow_k', 0) = :root0 AS root0_unchanged,
 	   lion_index_posting_root('pt_grow_k', 1) = :root1 AS root1_unchanged;
 
+-- lion_index_posting_root() takes a key with the column's representation,
+-- as the count functions take one: a domain over the column's type, and on a
+-- varchar column of text_ops a varchar.  A key the family merely compares
+-- with the column's type (int8 on int4) it does not look up.
+CREATE DOMAIN pt_dom AS int;
+SELECT lion_index_posting_root('pt_grow_k', 0::pt_dom) = :root0 AS domain_key_same_root,
+	   lion_index_count('pt_grow_k', 1::pt_dom) = lion_index_count('pt_grow_k', 1) AS domain_key_counts;
+SELECT lion_index_posting_root('pt_grow_k', 0::int8);
+DROP DOMAIN pt_dom;
+CREATE TABLE pt_vc (v varchar NOT NULL);
+INSERT INTO pt_vc SELECT 'k' || (i % 2) FROM generate_series(1, 5000) i;
+CREATE INDEX pt_vc_v ON pt_vc USING lion (v) WITH (inline_limit = 64);
+SELECT lion_index_posting_root('pt_vc_v', 'k0'::varchar) =
+	   lion_index_posting_root('pt_vc_v', 'k0'::text) AS varchar_key_same_root;
+DROP TABLE pt_vc;
+
 SELECT lion_index_verify('pt_grow_k', true);
 SELECT count(*) FROM pt_grow WHERE k = 0;
 SELECT count(*) FROM pt_grow WHERE k = 1;

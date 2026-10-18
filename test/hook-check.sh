@@ -34,6 +34,12 @@
 #      out of buffers (DESIGN.md §15, "The pin budget").  Here and not in
 #      installcheck because it needs a pool that small, which only a restart
 #      sets; it has nothing to do with the hooks.
+#   5. on PostgreSQL 16 only, old_snapshot_threshold = 60: no lion index is
+#      read while it is set (DESIGN.md §9, "old_snapshot_threshold"), which
+#      sql/oldsnapshot.sql checks of the planner, the scans, the SQL counts
+#      and the writes.  Here for the same reason as 4: a postmaster setting,
+#      which only a restart sets.  17 removed the setting - a server of 17 or
+#      later refuses to start with it - so there the step says it is skipped.
 #
 # Each order-sensitive test checks from inside the other hook which one ran
 # first, that LionCount is still in the plan, and that the answers equal the
@@ -156,6 +162,20 @@ if start_with "-c shared_buffers=128kB"; then
 	run "shared_buffers 128kB" pinpool
 else
 	FAILED="$FAILED [shared_buffers 128kB: server did not start]"
+fi
+
+# ---- 5. old_snapshot_threshold, PostgreSQL 16 only -------------------------
+# The major is pg_config's ("PostgreSQL 16.4", "PostgreSQL 20devel"); one that
+# cannot be read is a failure, never a skip, so that 16 cannot lose the step.
+major=$("$PG_CONFIG" --version | sed -n 's/^PostgreSQL \([0-9][0-9]*\).*/\1/p')
+if [ -z "$major" ]; then
+	FAILED="$FAILED [old_snapshot_threshold: no major version in '$("$PG_CONFIG" --version)']"
+elif [ "$major" -ge 17 ]; then
+	echo "== old_snapshot_threshold: PostgreSQL $major has no such setting (17 removed it); skipped"
+elif start_with "-c old_snapshot_threshold=60"; then
+	run "old_snapshot_threshold 60min" oldsnapshot
+else
+	FAILED="$FAILED [old_snapshot_threshold 60min: server did not start]"
 fi
 
 if [ -z "$FAILED" ]; then

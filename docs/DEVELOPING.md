@@ -5,16 +5,26 @@ Building, testing and finding your way around the source. Section numbers (§) r
 ## Supported versions and CI
 
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
-`src/lion_compat.h`.  CI (`.github/workflows/ci.yml`) builds and tests every
-one of those majors on each push: the unit tests, every SQL regression file in
-`test/sql` and every isolation spec in `test/isolation` in both WAL modes, and, on the 19 and master
-source builds, the crash-recovery/hot-standby harness in both modes.  One gap is deliberate and worth
-knowing: the isolation specs that park a backend on an injection point (`grep -l injection_points
-test/isolation/*.spec`), which are the race tests of the VACUUM/count/split interlocks, need a server
-configured with `--enable-injection-points` and the `injection_points` test module.  PostgreSQL 16
-has no injection points, and the PGDG packages of 17 and 18 ship without the module, so CI runs those
-specs only on its 19 and master source builds; on 16-18 the interlocks are covered by the same code
-and by those specs on the newer majors, not by a test on that major.
+`src/lion_compat.h`.  CI (`.github/workflows/ci.yml`) builds and tests every one of those majors on
+each push - 16 to 19 as the PGDG packages, 19 and master also built from source with assertions and
+injection points - and on every one of them runs the unit tests (as built, and under ASan and
+UBSan), the SQL regression files in `test/sql` and the isolation specs in `test/isolation` in both
+WAL modes, `make hookcheck`, and the crash-recovery/hot-standby harness (`test/recovery/run.sh`) in
+both WAL modes with `wal_consistency_checking`.  One gap is deliberate and worth knowing: what parks
+a backend on an injection point - the isolation specs that do (`grep -l injection_points
+test/isolation/*.spec`), which are the race tests of the VACUUM/count/split interlocks, and the
+harness's phases 1b-1e, 1g and 3 - needs a server configured with `--enable-injection-points` and
+the `injection_points` test module.  PostgreSQL 16 has no injection points, and the PGDG packages
+ship without the module, so CI runs those specs and phases only on its 19 and master source builds,
+where a missing module fails the job (`INJECTION_POINTS=1`); on the packages the Makefile leaves the
+specs out and says so, and the harness runs its phases 1, 1f, 2, 4 and 5.  On 16-18 the interlocks
+are covered by the same code and by those tests on the newer majors, not by a test on that major.
+lionvec's tests need pgvector, which every job installs or builds; a failed install or build fails
+the job, and `PGVECTOR=1` keeps the Makefile and the harness from skipping them, except on 19's
+packages while apt.postgresql.org has none for a beta.  The source builds are also the only ones
+with assertions, so `debug_discard_caches` runs there (`discard_caches.sql`), and `make hookcheck`
+on 16 is where the refusal to read a lion index under `old_snapshot_threshold` is tested (16 alone
+has the setting, DESIGN.md §9).
 
 ## Build and test
 
@@ -65,7 +75,8 @@ replay, so turning it on for a primary that never replays proves nothing.
 - **pgvector** 0.7 or later (for `halfvec`) for `vector.sql`, `vector_filter.sql`,
   `vector_half.sql` and the `lionvec_*` isolation specs, lionvec's files (DESIGN.md §44): the PGDG
   package `postgresql-N-pgvector`, or a build of github.com/pgvector/pgvector against the same
-  `pg_config`.  Where it is missing those files are skipped and the run says so (`PGVECTOR=1` forces them; `PGVECTOR=0` skips them).
+  `pg_config`.  Where it is missing those files are skipped and the run says so (`PGVECTOR=1` forces them; `PGVECTOR=0` skips them),
+  as is the recovery harness's phase 5, which under `PGVECTOR=1` fails instead.
   pg_lion itself builds and loads without it.
 - **Session settings** the expected plans assume (`work_mem`, `maintenance_work_mem`, no parallel
   workers, no JIT) are passed to every connection the suite makes through `PGOPTIONS`

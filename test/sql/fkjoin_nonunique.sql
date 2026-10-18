@@ -395,6 +395,35 @@ SELECT lion_nj_pick('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SE
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndb d WHERE d.k = f.fk)');
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND EXISTS (SELECT 1 FROM lion_ndb d WHERE d.k = f.fk AND d.attr = 5)', false);
 
+/*
+ * What the node charges for sorting the dimension's keys, at work_mem `mem`:
+ * its startup cost less its child's total, which is that sort and nothing
+ * else (lion_add_fkjoin_paths()); joins disabled.
+ */
+CREATE FUNCTION lion_nj_sortcost(q text, mem text) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE
+	plan jsonb;
+	node jsonb;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	PERFORM set_config('work_mem', mem, true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+	node := jsonb_path_query_first(plan, '$.** ? (@."Custom Plan Provider" == "LionCount")');
+	RETURN (node->>'Startup Cost')::numeric - (node->'Plans'->0->>'Total Cost')::numeric;
+END $$;
+-- The sort holds the bare keys, which is what it is priced by: lion_ndh's
+-- 3000 int8 keys are 70 kB of sort entries, a key passed by value having no
+-- copy beside its entry, so they fit in 80 kB of work_mem and are priced as
+-- in 64 MB, and spill in 64 kB.  At the child's row width, and with a copy
+-- of each key, they were priced as spilling below 94 kB.
+SELECT lion_nj_sortcost(q, '80kB') = lion_nj_sortcost(q, '64MB') AS fits_in_80kb,
+	   lion_nj_sortcost(q, '64kB') > lion_nj_sortcost(q, '64MB') AS spills_in_64kb
+  FROM (VALUES ('SELECT count(*) FROM lion_nf f WHERE f.fk IN (SELECT d.k FROM lion_ndh d)')) v(q);
+DROP FUNCTION lion_nj_sortcost(text, text);
+
 -- ---- 7. parallel: every participant sorts all the keys, and they divide the
 -- distinct ones among themselves ---------------------------------------------------
 SET max_parallel_workers_per_gather = 2;
