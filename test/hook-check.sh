@@ -37,7 +37,8 @@
 #   5. on PostgreSQL 16 only, old_snapshot_threshold = 60: no lion index is
 #      read while it is set (DESIGN.md §9, "old_snapshot_threshold"), which
 #      sql/oldsnapshot.sql checks of the planner, the scans, the SQL counts
-#      and the writes.  Here for the same reason as 4: a postmaster setting,
+#      and the writes, and sql/oldsnapshot_vector.sql the same of lionvec
+#      where pgvector is installed (PGVECTOR as the Makefile guesses it).  Here for the same reason as 4: a postmaster setting,
 #      which only a restart sets.  17 removed the setting - a server of 17 or
 #      later refuses to start with it - so there the step says it is skipped.
 #
@@ -173,7 +174,13 @@ if [ -z "$major" ]; then
 elif [ "$major" -ge 17 ]; then
 	echo "== old_snapshot_threshold: PostgreSQL $major has no such setting (17 removed it); skipped"
 elif start_with "-c old_snapshot_threshold=60"; then
-	run "old_snapshot_threshold 60min" oldsnapshot
+	vec=oldsnapshot_vector
+	if [ "${PGVECTOR:-}" = 0 ] || { [ -z "${PGVECTOR:-}" ] &&
+			[ ! -f "$("$PG_CONFIG" --sharedir)/extension/vector.control" ]; }; then
+		echo "== old_snapshot_threshold: no pgvector in this installation; skipping oldsnapshot_vector"
+		vec=
+	fi
+	run "old_snapshot_threshold 60min" oldsnapshot $vec
 else
 	FAILED="$FAILED [old_snapshot_threshold 60min: server did not start]"
 fi
