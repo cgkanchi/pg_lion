@@ -388,8 +388,10 @@ build_extension() {
 	mkdir "$BUILDDIR"
 	cp -r "$PROJECT/src" "$PROJECT/Makefile" "$PROJECT"/pg_lion*.control \
 		"$PROJECT"/pg_lion*--*.sql "$BUILDDIR/"
-	# Never reuse objects built against another server.
-	rm -f "$BUILDDIR"/src/*.o "$BUILDDIR"/src/*.bc "$BUILDDIR"/*.so
+	# Never reuse objects built against another server, nor the header
+	# dependencies the compiler wrote beside them (src/*.d), which name that
+	# server's headers.
+	rm -f "$BUILDDIR"/src/*.o "$BUILDDIR"/src/*.d "$BUILDDIR"/src/*.bc "$BUILDDIR"/*.so
 	mkdir -p "$BUILDDIR/test/sql" "$BUILDDIR/test/isolation"
 	(
 		cd "$BUILDDIR" &&
