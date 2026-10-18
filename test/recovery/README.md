@@ -55,7 +55,8 @@ servers). Phase 5 needs pgvector and `pageinspect`, and is skipped, with a
 line in the summary, without them. `INJECTION_POINTS=1` in the environment turns every
 such skip into a failure, so a server that should have injection points and
 does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
-none of those phases; CI's source-build jobs set it.
+none of those phases; CI's source-build jobs set it. `PGVECTOR=1` does the
+same for phase 5, and CI sets it wherever it built or installed pgvector.
 
 The run creates everything it needs in ONE private directory that
 `mktemp -d` makes for it under `$RECOVERY_TMPDIR` (default `$TMPDIR`, else
