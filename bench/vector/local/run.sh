@@ -13,13 +13,29 @@ set -euo pipefail
 . "$(dirname "$0")/env.sh"
 PY=$VENV/bin/python
 KNN="$PY $REPO/bench/vector/knn_dbpedia.py"
-STATE=$BENCH_DIR/state
-mkdir -p "$STATE" "$BENCH_DIR/logs"
-
-ROWS=$(( NSHARDS * 38462 ))      # every shard but the last holds 38,462 rows
-[ "$NSHARDS" -eq 26 ] && ROWS=1000000
+# DATASET=msmarco: MS MARCO v2.1 under Cohere Embed v3 (knn_msmarco.py), the
+# first KNN_ROWS (default 50M) passages as halfvec(1024), its own database,
+# cache, state and logs under $BENCH_DIR/msmarco, the downloads in
+# MSMARCO_DIR (fetch_msmarco.sh; 104 GB for 50M rows)
+DATASET=${DATASET:-dbpedia}
+if [ "$DATASET" = msmarco ]; then
+	DS_DIR=$BENCH_DIR/msmarco
+	ROWS=${KNN_ROWS:-50000000}
+	PREP="$PY $REPO/bench/vector/knn_msmarco.py"
+	export KNN_ROWS=$ROWS KNN_TABLE=msmarco
+	export MSMARCO_DIR=${MSMARCO_DIR:-/mnt/d/lionbench-msmarco}
+	export KNN_MSMARCO_NPY=$MSMARCO_DIR/npy KNN_MSMARCO_QUERIES=$MSMARCO_DIR/queries/queries.parquet
+else
+	DS_DIR=$BENCH_DIR
+	ROWS=$(( NSHARDS * 38462 ))      # every shard but the last holds 38,462 rows
+	[ "$NSHARDS" -eq 26 ] && ROWS=1000000
+	PREP=$KNN
+fi
+STATE=$DS_DIR/state
+LOGS=$DS_DIR/logs
+mkdir -p "$STATE" "$LOGS"
 if [ -s "$STATE/out" ]; then OUT=$(cat "$STATE/out"); else
-	OUT=$REPO/bench/results/$(date -u +%F)-dbpedia-local-$(( ROWS / 1000 ))k
+	OUT=$REPO/bench/results/$(date -u +%F)-$DATASET-local-$(( ROWS / 1000 ))k
 	echo "$OUT" > "$STATE/out"
 fi
 # VectorChord's lists: sqrt(n), 1,000 at 1M (339 at 115k, the better of the
@@ -27,8 +43,8 @@ fi
 # afterwards adds another count (the build replaces the index)
 LISTS=${LISTS:-$("$PY" -c "print(round($ROWS ** 0.5))")}
 
-export KNN_DSN="dbname=dbpedia" KNN_ADMIN_DSN="dbname=postgres"
-export KNN_CACHE=$BENCH_DIR/cache KNN_OUT=$OUT KNN_SRC=$REPO
+export KNN_DSN="dbname=$DATASET" KNN_ADMIN_DSN="dbname=postgres"
+export KNN_CACHE=$DS_DIR/cache KNN_OUT=$OUT KNN_SRC=$REPO
 export KNN_SHARDS="$BENCH_DIR/shards/train-*-of-*.parquet" KNN_NSHARDS=$NSHARDS
 # past ~200k rows the table's vectors no longer fit shared_buffers: the index
 # goes there, the table (and TOAST) into the kernel's cache
@@ -58,8 +74,8 @@ step() {      # step NAME COMMAND...: run it once, logged
 	local t=$SECONDS
 	# (set -e does not reach into a function called from an && list, so the
 	# failure is checked here)
-	if ! ( cd "$REPO" && "$@" ) 2>&1 | tee "$BENCH_DIR/logs/$name.log"; then
-		echo "== $name failed: $BENCH_DIR/logs/$name.log"; exit 1
+	if ! ( cd "$REPO" && "$@" ) 2>&1 | tee "$LOGS/$name.log"; then
+		echo "== $name failed: $LOGS/$name.log"; exit 1
 	fi
 	echo "== $name: $(( (SECONDS - t) / 60 )) min"
 	touch "$STATE/$name.done"
@@ -69,7 +85,8 @@ machine() {
 	mkdir -p "$OUT"
 	{
 		echo "date: $(date -u +%FT%TZ)"
-		echo "rows: $ROWS ($NSHARDS shards)"
+		echo "dataset: $DATASET"
+		if [ "$DATASET" = msmarco ]; then echo "rows: $ROWS"; else echo "rows: $ROWS ($NSHARDS shards)"; fi
 		echo "cpu: $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2-) ($(nproc) threads)"
 		echo "memory: $(awk '/MemTotal/ {printf "%.1f GB", $2 / 1048576}' /proc/meminfo) visible to Linux"
 		echo "kernel: $(uname -r)"
@@ -97,9 +114,13 @@ want() { [[ " $STEPS " == *" $1 "* ]]; }
 # second run with another LISTS lands beside the first
 name() { [ "$1" = vchord ] && echo "vchord-l$LISTS" || echo "$1"; }
 
-want fetch   && step fetch "$PY" "$LOCAL/fetch.py" "$BENCH_DIR/shards" "$NSHARDS"
-want prepare && step prepare $KNN prepare
-want load    && step load $KNN load
+if [ "$DATASET" = msmarco ]; then
+	want fetch && step fetch "$LOCAL/fetch_msmarco.sh" "$MSMARCO_DIR" "$ROWS"
+else
+	want fetch && step fetch "$PY" "$LOCAL/fetch.py" "$BENCH_DIR/shards" "$NSHARDS"
+fi
+want prepare && step prepare $PREP prepare
+want load    && step load $PREP load
 if want build; then
 	for k in "${KINDS[@]}"; do
 		case $k in
