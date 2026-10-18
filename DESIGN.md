@@ -226,6 +226,21 @@ in-place insert, a replacement and VACUUM's delete), and the directory entry a r
 whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
 
+The 2026-10-18 review's damaged pages added two checks to that list. The entry a record rewrites
+is exactly one of INLINE and CHAIN (`lion_page_entry_fetch()`, verify()'s rule): every writer
+picks its path by those flags while the header form follows CHAIN alone, so an entry flagged both,
+at a CHAIN entry's length, passed every check, went down the INLINE path of an insert of its key
+and was rewritten, damage and all, in a record. And a page a record only ADDS an item to has its
+header checked first (`lion_page_check_header()`, before the add of a directory entry, of a
+posting leaf's item and of a posting downlink; `lionvec_check_page()` for every lionvec page,
+§44.5): `PageAddItemExtended()` answers a header it finds damaged with a PANIC of its own, in
+either WAL mode, and the buffer manager's check of a page it reads (`PageIsVerifiedExtended()`)
+lets in a `pd_lower` below the end of the header - one of the things it PANICs on - with which the
+page reads as one with no items and room to spare. `test/sql/corrupt_records.sql` and
+`test/sql/vector_corrupt_records.sql`, which damage the file and have the server read it back by
+moving the index to another tablespace (`ALTER INDEX ... SET TABLESPACE` copies the FILE, after
+writing out only what is dirty), and so run on PostgreSQL 16 as well.
+
 **Whole-bitset kernels** (2026-09-30). Every pass over all 512 words of a BITSET that counts what it
 sees is one call of a fused kernel (lion_container.c, "whole-bitset kernels"), which reads the
 operands, writes the result if the operation has one and counts, in the same pass:
@@ -8354,7 +8369,8 @@ page in shared buffers that no record describes. Everything fallible therefore
 has to happen BEFORE the record opens - which includes looking at the line
 pointers the record is going to move, overwrite or delete items by (§3,
 2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
-`lion_page_entry_fetch()`). Three consequences, all of them
+`lion_page_entry_fetch()`), and the header of a page it only adds an item to
+(§3, 2026-10-18: `lion_page_check_header()`). Three consequences, all of them
 deviations from what this section assumed:
 
 - `lion_new_buffer_xl()` is gone. Allocating a page is split into
@@ -21254,7 +21270,15 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   (a negative length makes a bound whose lower end lies past its upper, and the ranking of an
   insert's candidates come up short, which is checked too), and the PART chain's numbering against
   the meta page's count; chain cycles (`lionvec_chain_step()`); the meta page's fields. Each is
-  ERRCODE_INDEX_CORRUPTED, never a crash.
+  ERRCODE_INDEX_CORRUPTED, never a crash. Every page's header is within the bounds
+  `PageAddItemExtended()` PANICs outside of (`lionvec_check_page()`, §3, 2026-10-18). And an insert,
+  which holds the meta page from its first page to its last, refuses a block it is about to read
+  that names the meta page - a chain end or `refine_tail` on the meta page, a PART item's tail or
+  centroid, a REGION item's run, a chain's next link - as it refuses a LOC tail that is also the
+  LOCDIR tail and a partition's tail that is its PART page, BEFORE the lock
+  (`lionvec_insert_readbuf()`): a buffer content lock is not reentrant, and the second one waited
+  for this very backend with interrupts held off, which only a restart of the server ended
+  (`test/sql/vector_corrupt_records.sql`).
 
 ### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
 
@@ -22602,6 +22626,11 @@ faster from the disk and the same warm, and the inline table's queries took main
 - **vector_toast.sql**, **vector_toast_corrupt.sql**, **test/isolation/lionvec_toast_scan.spec**
   and test/recovery's phase 5 (2026-10-17): vectors in TOAST read by their chunks' places, and
   every history and damage that can make a place wrong (§44.13, "Tests").
+- **vector_corrupt_records.sql** (2026-10-18): an insert into an index whose meta page names
+  itself as the NULL chain's end and as `refine_tail`, which waited for its own lock for ever, and
+  into a CODE tail whose `pd_lower` is inside the page header, which PANICked: each an ERROR now
+  (§44.5, "Format checks"). On 16 too: the file is read back through `ALTER INDEX ... SET
+  TABLESPACE` (§3, 2026-10-18).
 
 ### 44.11 Not done
 

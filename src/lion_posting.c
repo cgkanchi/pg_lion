@@ -1546,8 +1546,13 @@ lion_posting_place_pivot(Relation index, Relation heaprel, uint32 hash,
 
 	if (PageGetFreeSpace(page) >= MAXALIGN(LION_POSTING_PIVOT_SIZE))
 	{
-		LionWalState *xstate = lion_wal_begin(index);
-		Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+		LionWalState *xstate;
+		Page		p;
+
+		/* PageAddItemExtended() PANICs on a damaged header (lion_pages.c) */
+		lion_page_check_header(index, page, BufferGetBlockNumber(buf));
+		xstate = lion_wal_begin(index);
+		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 
 		if (PageAddItemExtended(p, (char *) pivot, LION_POSTING_PIVOT_SIZE,
 								off, 0) == InvalidOffsetNumber)
