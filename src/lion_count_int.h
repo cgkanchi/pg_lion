@@ -115,7 +115,10 @@
 #include "lion_count.h"
 
 
-/* First size of the recheck TID array, and the step it grows past its budget. */
+/*
+ * First size of the recheck TID array, and the step it would grow by past its
+ * budget, which it does not (LION_RECHECK_BLOCK_TIDS, below).
+ */
 #define LION_RECHECK_INIT_TIDS	256
 #define LION_RECHECK_GROW_TIDS	1024
 
@@ -127,6 +130,19 @@
  */
 #define LION_RECHECK_MIN_BATCH	4096
 #define LION_RECHECK_MAX_BATCH	((int) (MaxAllocSize / sizeof(ItemPointerData) / 2))
+
+/*
+ * The most TIDs one heap block can put on a recheck list: every offset a
+ * code can hold (lion_tid.h), a block's rows coming onto a list once each.
+ * A list is flushed at a block boundary once the next block might not fit
+ * in what is left of its budget (lion_recheck_add()), so that it never holds
+ * more than its budget; no budget is smaller than this, so that a flush
+ * always has whole blocks to take, as it always had.
+ */
+#define LION_RECHECK_BLOCK_TIDS	(1 << LION_OFFSET_BITS)
+
+StaticAssertDecl(LION_RECHECK_BLOCK_TIDS <= LION_RECHECK_MIN_BATCH,
+				 "pg_lion: a recheck batch must hold a whole heap block");
 
 /*
  * LION_OR_BITSET_MIN (lion_count.h, because the cost model needs the same
@@ -976,6 +992,7 @@ extern void lion_vis_fill_page(LionCountCtx *cx, Buffer buf, BlockNumber blkno,
 
 /* lion_count.c */
 extern int lion_recheck_budget(void);
+extern int lion_recheck_budget_for(Size entry);
 extern void lion_count_container_masks(LionCountCtx *cx,
 									   const LionContainer *c, uint64 members,
 									   uint64 allvis);
@@ -1164,8 +1181,7 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
 	if (kind == LION_KN_AND)
 		mem += (Size) nargs * sizeof(int);	/* order */
-	if (kind == LION_KN_POSFILTER)
-		mem += LION_POSFILTER_MEM;	/* the filter */
+	/* a LION_KN_POSFILTER's filter grows with its query: lion_plan_node() */
 	if (kind == LION_KN_OR)
 	{
 		mem += (Size) nargs * LION_OR_CHILD_OVERHEAD;	/* heap, hot, hotc */
