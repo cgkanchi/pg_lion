@@ -111,9 +111,9 @@ are created on the empty table and filled by `aminsert`, so their entries go
 through INLINE→CHAIN spills, sparse-segment promotions and container-page
 splits under WAL; four are built by `ambuild` after the load.
 `inline_limit = 64` on three of them makes spills and splits frequent rather
-than rare, `buckets = 8`/`16` forces bucket-page chains, and the 3000 distinct
-values of `t` over ~800 heap pages give about one member per container key,
-which is what puts sparse segments in an index at all.
+than rare, and the 3000 distinct values of `t` over ~800 heap pages give about
+one member per container key, which is what puts sparse segments in an index at
+all.
 
 **Phase 1, crash recovery under load.** Eight rounds of: ~2 s of mixed writes
 (pgbench, 4 clients, `synchronous_commit = on`, ~430 transactions/s), then kill

@@ -29,8 +29,7 @@ SELECT c.relname, c.reloptions
  WHERE c.relname IN ('lion_opt_b0', 'lion_opt_b1', 'lion_opt_b4096', 'lion_opt_i64')
  ORDER BY 1;
 
--- the upper boundary is accepted by the parser (building it would allocate
--- 65537 pages, so only validate the option here)
+-- the upper boundary is accepted by the parser, and the one past it is not
 ALTER INDEX lion_opt_b0 SET (buckets = 65536);
 ALTER INDEX lion_opt_b0 SET (buckets = 65537);
 ALTER INDEX lion_opt_b0 RESET (buckets);
