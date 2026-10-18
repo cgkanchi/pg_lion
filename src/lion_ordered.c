@@ -2258,7 +2258,6 @@ typedef enum LoKnnWhy
 {
 	LO_KNN_NONE,				/* nothing in the way but the clauses */
 	LO_KNN_DISABLED,			/* pg_lion.enable_ordered_scan is off */
-	LO_KNN_SNAPSHOT,			/* 16's old_snapshot_threshold (§9) */
 	LO_KNN_RELATION,			/* not a relation the node scans (§30.1) */
 	LO_KNN_MEMORY				/* the set would not fit (§30.3) */
 } LoKnnWhy;
@@ -2736,8 +2735,6 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					   table, clauses.data) :
 			 knn->why == LO_KNN_DISABLED ?
 			 errdetail("pg_lion.enable_ordered_scan is off, so LionOrdered cannot restrict the scan to the rows that pass the filter.") :
-			 knn->why == LO_KNN_SNAPSHOT ?
-			 errdetail("No lion index is read while old_snapshot_threshold is set, so LionOrdered cannot restrict the scan to the rows that pass the filter.") :
 			 knn->why == LO_KNN_MEMORY ?
 			 errdetail("Lion's set of the rows that pass the filter would not fit in hash_mem (work_mem times hash_mem_multiplier), so LionOrdered cannot restrict the scan to them.") :
 			 errdetail("LionOrdered, which restricts the scan to the rows that pass a filter, does not scan \"%s\" in this query.",
@@ -2775,10 +2772,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		return;
 	/* no lion index is read under 16's old_snapshot_threshold (§9) */
 	if (lion_old_snapshot_threshold_active())
-	{
-		lo_knn_why(knn, LO_KNN_SNAPSHOT);
 		return;
-	}
 	if (!lo_rel_ok(root, rel, rte))
 	{
 		lo_knn_why(knn, LO_KNN_RELATION);
@@ -3105,7 +3099,10 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
  * away, not the rule: such a query then gets an exact plan, or the error.
  * Under error, the default, a relation whose lionvec order had to go, with
  * no LionOrdered over it and no other lionvec order left (a partial index's,
- * whose predicate implies every clause), fails the query here.  The partial
+ * whose predicate implies every clause), fails the query here - except
+ * while 16's old_snapshot_threshold is set, when no lionvec order is read
+ * at all (DESIGN.md §9; lionveccostestimate() prices each out), so none is
+ * filtered after its scan and the exact plan is what is left.  The partial
  * paths of the orders left then get their parallel cost (lo_knn_partial()).
  * Before all that, under every setting, a lionvec order of a table with
  * row-level security fails the query (lionvec_refuse_rls()).
@@ -3134,7 +3131,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	lo_knn_partial(rel);
 	lo_set_rel_pathlist(root, rel, rte, &knn);
 	if (knn.taken != NIL && knn.offered == 0 &&
-		lionvec_postfilter == LIONVEC_POSTFILTER_ERROR && !lo_knn_kept(rel))
+		lionvec_postfilter == LIONVEC_POSTFILTER_ERROR && !lo_knn_kept(rel) &&
+		!lion_old_snapshot_threshold_active())
 		lo_knn_error(root, rel, rte, &knn);
 }
 
