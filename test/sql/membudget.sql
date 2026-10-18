@@ -1,0 +1,306 @@
+-- What the count's memory budgets hold (2026-10 review).  Each of these held
+-- more than it was charged, or than its budget said, and none of them changed
+-- an answer: the recheck queues of a grouped walk (DESIGN.md §10), a floor of
+-- 4096 TIDs a group that put 256 groups at 6 MB against a work_mem of 4 MB;
+-- a recheck list that filled to its budget and then to the end of a heap
+-- block (§9, step 5); the decoded walk's tally (§34), whose bound wrapped
+-- past 192 GB of hash_mem and spilled at every combination, and its recheck
+-- list, sized by its TIDs where a row takes two and a half times one; and the
+-- position filter (§17, "Stored positions"), charged a flat 160 kB against
+-- the open budget where a phrase of a thousand lexemes holds 24 MB.  Every
+-- query below runs through the pushdown with every other scan disabled, and
+-- through a sequential scan with the pushdown off, and the two answers must
+-- be equal as multisets.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+/*
+ * lmb_check() runs q under EXPLAIN ANALYZE with every other scan disabled, so
+ * that a LionCount path that is built at all is the plan, and again for its
+ * rows; then as a sequential scan with the pushdown off.  It says whether the
+ * node ran, whether the groups were counted in batches against the collected
+ * WHERE, whether the decoded walk ran and its tally spilled, and whether the
+ * two answers are equal.  It does not say how many TIDs or rows went to the
+ * heap: on pages no VACUUM has made all-visible that depends on what read the
+ * table before, since on-access pruning sets the map's bits from 19 on, as
+ * count.sql says.
+ */
+CREATE FUNCTION lmb_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	batches int := 0;
+	decoded boolean := false;
+	spills int := 0;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			pushed := true;
+		ELSIF ln ~ 'Group Batches: ' THEN
+			batches := substring(ln FROM 'Group Batches: (\d+)')::int;
+		ELSIF ln ~ 'Group Strategy: Decoded' THEN
+			decoded := true;
+		ELSIF ln ~ 'Tally Spills: ' THEN
+			spills := substring(ln FROM 'Tally Spills: (\d+)')::int;
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE lmb_on AS ' || q;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE 'CREATE TEMP TABLE lmb_off AS ' || q;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	SELECT count(*) INTO nrows FROM lmb_off;
+	SELECT (SELECT count(*) FROM (TABLE lmb_on EXCEPT ALL TABLE lmb_off) x) +
+		   (SELECT count(*) FROM (TABLE lmb_off EXCEPT ALL TABLE lmb_on) y)
+	  INTO ndiff;
+	DROP TABLE lmb_on;
+	DROP TABLE lmb_off;
+	RETURN format('%s%s%s%s, %s rows, %s',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'NOT PUSHED DOWN' END,
+				  CASE WHEN batches > 0 THEN ', groups in batches' ELSE '' END,
+				  CASE WHEN decoded THEN ', decoded' ELSE '' END,
+				  CASE WHEN spills > 0 THEN ', tally spilled' ELSE '' END,
+				  nrows,
+				  CASE WHEN ndiff = 0 THEN 'same as the sequential scan' ELSE 'DIFFERENT' END);
+END $$;
+
+-- ---------- the recheck queues of a grouped walk ----------
+-- 60 groups of some 600 rows the WHERE keeps, on pages no VACUUM has made
+-- all-visible, so rows go to the heap through their group's queue (all of
+-- them up to 18; from 19 on-access pruning sets some pages' bits).  At
+-- 64kB a batch is some thirty groups (the open budget's floor, 256 kB, of
+-- page images), and each queue's share of the 64 kB a few hundred TIDs, less
+-- than the heap block's worth a share holds at the least: each queue is
+-- flushed at every block it moves past.  At 1MB and 4MB the shares are
+-- larger, and every queue is flushed after the walk.
+CREATE TABLE lmb_g (id int NOT NULL, g int NOT NULL, a int NOT NULL,
+					b int NOT NULL, pad text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lmb_g
+SELECT i, i % 60, (i % 10 <> 0)::int, (i % 7 <> 0)::int, repeat('p', 40)
+  FROM generate_series(1, 48000) i;
+CREATE INDEX lmb_g_g ON lmb_g USING lion (g);
+CREATE INDEX lmb_g_a ON lmb_g USING lion (a);
+CREATE INDEX lmb_g_b ON lmb_g USING lion (b);
+ANALYZE lmb_g;
+SET work_mem = '64kB';
+SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
+SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 AND g > 4 GROUP BY g HAVING count(*) > 600');
+SET work_mem = '1MB';
+SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
+SET work_mem = '4MB';
+SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
+-- the ungrouped count's own list: the same rows, at 64kB some ten thousand
+-- TIDs, flushed at the block boundary before the next block might not fit
+SET work_mem = '64kB';
+SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
+SET work_mem = '4MB';
+SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
+RESET work_mem;
+-- some pages all-visible, the rest not: each group's queue takes what the
+-- map does not answer
+VACUUM lmb_g;
+UPDATE lmb_g SET pad = repeat('q', 40) WHERE id % 50 = 0 AND id < 10000;
+SET work_mem = '64kB';
+SELECT lmb_check('SELECT g, count(*) FROM lmb_g WHERE a = 1 AND b = 1 GROUP BY g');
+SELECT lmb_check('SELECT count(*) FROM lmb_g WHERE a = 1 AND b = 1');
+RESET work_mem;
+DROP TABLE lmb_g;
+
+-- ---------- the decoded walk: its tally, and its recheck list ----------
+-- Three columns of 256, 1000 and 1000 values make 256 million combinations,
+-- past what an array may hold, so the tally is a hash table.  At a hash_mem
+-- of exactly 192 GB (256MB times 768) its bound came out 0 and the tally
+-- spilled at every new combination; now it holds them all.
+CREATE TABLE lmb_d (a int NOT NULL, b int NOT NULL, c int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lmb_d SELECT i % 256, i % 1000, (i * 7) % 1000
+  FROM generate_series(1, 3000) i;
+CREATE INDEX lmb_d_abc ON lmb_d USING lion (a, b, c);
+VACUUM (FREEZE, ANALYZE) lmb_d;
+SET work_mem = '256MB';
+SET hash_mem_multiplier = 768;
+SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d GROUP BY a, b, c');
+RESET hash_mem_multiplier;
+RESET work_mem;
+SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d GROUP BY a, b, c');
+DROP TABLE lmb_d;
+-- Rows on pages that are not all-visible go to the heap in a list of their
+-- TIDs, combinations and answers: at 64kB some four thousand of them, so
+-- thirty thousand rows flush it several times.
+CREATE TABLE lmb_d2 (a int NOT NULL, b int NOT NULL, c int NOT NULL,
+					 e int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lmb_d2 SELECT i % 4, (i / 4) % 10, (i * 7) % 25, i % 3
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lmb_d2_abce ON lmb_d2 USING lion (a, b, c, e);
+ANALYZE lmb_d2;
+SET work_mem = '64kB';
+SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 GROUP BY a, b, c');
+SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 WHERE e = 1 GROUP BY a, b, c');
+RESET work_mem;
+SELECT lmb_check('SELECT a, b, c, count(*) AS n FROM lmb_d2 GROUP BY a, b, c');
+DROP TABLE lmb_d2;
+
+-- ---------- the position filter's charge ----------
+-- 300 rows of a thousand words: half of them the phrase w1 .. w1000 in
+-- order, half with one word of it replaced.  Every lexeme is in three
+-- hundred rows, a CHAIN entry with a position tree (inline_limit = 64), so a
+-- filter of the long phrase copies a leaf and its items for each of its
+-- thousand lexemes - and so does one of a NOT of it, whose superset is one
+-- lexeme's set: such a filter was charged less than one leaf cursor's page
+-- image and a flat 160 kB, two of them under an OR fitted a 4MB budget
+-- opened at once, and held 49 MB.
+CREATE FUNCTION lion_debug_posfilter_mem(regclass, tsquery,
+	OUT charged bigint, OUT held bigint, OUT held_elsewhere bigint)
+	RETURNS record
+	AS '$libdir/pg_lion' LANGUAGE C STRICT;
+CREATE TABLE lmb_p (id int NOT NULL, k int NOT NULL, d tsvector NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lmb_p
+SELECT j, j % 3,
+	   to_tsvector('simple', string_agg(CASE WHEN j > 150 AND i = j * 3
+											 THEN 'other' ELSE 'w' || i END,
+										' ' ORDER BY i))
+  FROM generate_series(1, 300) j, generate_series(1, 1000) i
+ GROUP BY j;
+CREATE INDEX lmb_p_d ON lmb_p USING lion (d)
+	WITH (store_positions = on, inline_limit = 64);
+CREATE INDEX lmb_p_k ON lmb_p USING lion (k);
+VACUUM (FREEZE, ANALYZE) lmb_p;
+-- (a tsquery is stored plain, and one of a thousand lexemes is too long for
+-- a row: the queries are kept as text)
+CREATE TEMP TABLE lmb_q (name text, q text);
+INSERT INTO lmb_q
+SELECT 'phrase of 1000', string_agg('w' || i, ' <-> ' ORDER BY i)
+  FROM generate_series(1, 1000) i
+UNION ALL
+SELECT 'phrase of 500', string_agg('w' || i, ' <-> ' ORDER BY i)
+  FROM generate_series(1, 500) i
+UNION ALL
+SELECT 'phrase of 500, reversed', string_agg('w' || i, ' <-> ' ORDER BY i DESC)
+  FROM generate_series(1, 500) i
+UNION ALL
+SELECT 'not the phrase', 'w1 & !(' || string_agg('w' || i, ' <-> ' ORDER BY i) || ')'
+  FROM generate_series(2, 1000) i
+UNION ALL
+SELECT 'not the phrase, again', 'w2 & !(' || string_agg('w' || i, ' <-> ' ORDER BY i) || ')'
+  FROM generate_series(3, 1000) i
+UNION ALL
+SELECT 'phrase of 2', 'w1 <-> w2'
+UNION ALL
+SELECT 'weighted', 'w1:D <-> w2:D & !other'
+UNION ALL
+SELECT 'repeated', 'w1 <-> w2 <-> w1 <-> w2';
+-- what a filter holds against what it is charged: the charge covers it, and
+-- grows with the query - the long phrase holds tens of megabytes, which the
+-- flat charge of 160 kB said nothing of.  What it holds is the same begun in
+-- a small context and in a default-sized one, and whatever the session did
+-- before: its own contexts are of sizes aset.c recycles no context for, and
+-- a small context that took over one begun to grow to 8 MB gave each of its
+-- leaves a block of 16 kB, which the charge did not cover.
+SELECT name, m.held <= m.charged AS covered, m.charged < 2 * m.held AS close,
+	   m.held > 20000000 AS large, m.held = m.held_elsewhere AS same
+  FROM lmb_q, lion_debug_posfilter_mem('lmb_p_d', q::tsquery) m ORDER BY name;
+-- the same answers from the pushdown, a bitmap scan and the heap, alone and
+-- ORed: two filters of the NOTs do not fit 1MB together, and are read as a
+-- windowed union, one filter open at a time; they fit 128MB.  (An OR of the
+-- long phrases is windowed at 128MB too where their sets' pins outgrow what
+-- the lists leave of the pin budget.)
+CREATE TEMP TABLE lmb_shapes AS
+SELECT format('SELECT count(*) FROM lmb_p WHERE d @@ %L::tsquery', q) AS s
+  FROM lmb_q
+UNION ALL
+SELECT format('SELECT count(*) FROM lmb_p WHERE d @@ %L::tsquery OR d @@ %L::tsquery',
+			  a.q, b.q)
+  FROM lmb_q a, lmb_q b
+ WHERE (a.name, b.name) IN (('phrase of 1000', 'phrase of 2'),
+							('phrase of 500', 'phrase of 500, reversed'),
+							('not the phrase', 'not the phrase, again'),
+							('not the phrase', 'phrase of 1000'),
+							('repeated', 'weighted'))
+UNION ALL
+SELECT format('SELECT k, count(*) FROM lmb_p '
+			  'WHERE d @@ %L::tsquery OR d @@ %L::tsquery GROUP BY k', a.q, b.q)
+  FROM lmb_q a, lmb_q b
+ WHERE (a.name, b.name) IN (('phrase of 1000', 'phrase of 500, reversed'),
+							('not the phrase', 'not the phrase, again'));
+CREATE FUNCTION lmb_shape(s text) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	a text;
+	b text;
+	c text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || s LOOP
+		pushed := pushed OR ln LIKE '%Custom Scan (LionCount)%';
+	END LOOP;
+	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO b;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO c;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN CASE WHEN NOT pushed THEN 'NOT PUSHED DOWN'
+				WHEN a IS DISTINCT FROM c THEN 'pushdown DIFFERENT: ' || a || ' against ' || c
+				WHEN b IS DISTINCT FROM c THEN 'bitmap scan DIFFERENT: ' || b || ' against ' || c
+				ELSE 'same' END;
+END $$;
+SET work_mem = '1MB';
+SELECT count(*) AS shapes, count(*) FILTER (WHERE r <> 'same') AS differ,
+	   min(r) FILTER (WHERE r <> 'same') AS first_difference
+  FROM (SELECT lmb_shape(s) AS r FROM lmb_shapes) x;
+SET work_mem = '128MB';
+SELECT count(*) AS shapes, count(*) FILTER (WHERE r <> 'same') AS differ,
+	   min(r) FILTER (WHERE r <> 'same') AS first_difference
+  FROM (SELECT lmb_shape(s) AS r FROM lmb_shapes) x;
+RESET work_mem;
+SELECT name, (SELECT count(*) FROM lmb_p WHERE d @@ q::tsquery) AS n
+  FROM lmb_q ORDER BY name;
+DROP FUNCTION lmb_shape(text);
+DROP TABLE lmb_shapes, lmb_q, lmb_p;
+DROP FUNCTION lion_debug_posfilter_mem(regclass, tsquery);
+
+-- ---------- a build's summary keys, of every length ----------
+-- The keys a column's summary buckets end at are read back from the build's
+-- file into one buffer, grown as they lengthen (lion_sum_finish()): keys of
+-- one to 1500 bytes, in their order, make each bucket's last key longer than
+-- the one before.
+CREATE TABLE lmb_s (id int NOT NULL, t text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lmb_s SELECT i, repeat('x', i) FROM generate_series(1, 1500) i;
+CREATE INDEX lmb_s_t ON lmb_s USING lion (t)
+	WITH (summaries = on, summary_tids = 32);
+VACUUM (FREEZE, ANALYZE) lmb_s;
+SELECT summary_entries > 40 AS many, summary_tids = ntids AS covers
+  FROM lion_index_stats('lmb_s_t');
+SELECT lion_index_verify('lmb_s_t', true);
+SELECT lmb_check(format('SELECT count(*) FROM lmb_s WHERE t > %L', repeat('x', 300)));
+SELECT lmb_check(format('SELECT count(*) FROM lmb_s WHERE t >= %L AND t < %L',
+						repeat('x', 40), repeat('x', 1400)));
+DROP TABLE lmb_s;
+
+DROP FUNCTION lmb_check(text);

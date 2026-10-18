@@ -1559,7 +1559,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    at most `work_mem` worth of TIDs (floor: a few thousand). When it fills up, the batch it holds is
    rechecked right there, its visible rows are added to the running total and the list starts over;
    the flush waits for a heap-block boundary, so no block is pinned twice and `blocks_rechecked`
-   stays exact. Without a bound, 20M candidates - which a standby produces for any 20M-row posting
+   stays exact - the first boundary past which the next block might not fit (a block puts at most
+   `LION_RECHECK_BLOCK_TIDS`, 512 at 8 kB pages, on the list), so the list never outgrows its budget.
+   It used to fill to the budget and then to the end of the block it was on, a step of 1024 TIDs
+   more, which every queue of a grouped walk (§10) took past its share (2026-10 review). Without a
+   bound, 20M candidates - which a standby produces for any 20M-row posting
    set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
    allocation.
    Flushing mid-merge does not weaken the interlock above: the ordering rule is that the VM question
@@ -2387,8 +2391,12 @@ walk of container keys (`lion_count_groups_copy()`, lion_count_groups.c):
   blocks is counted without the intersection being built; otherwise it is built and counted as
   every container is (`lion_count_container_masks()`, the second half of
   `lion_count_container_vm()`), its dirty blocks' TIDs queued for the heap in the group's own
-  recheck queue, which takes a share of one count's budget. The queues are flushed group by group
-  after the walk and share the visibility cache as the groups' counts did, each a count begun;
+  recheck queue, which takes a share of one count's budget: the shares add up to it, each a heap
+  block's TIDs at the least (§9, step 5), a floor that binds only below the open budget's own floor
+  of 256 kB. The floor used to be one count's, 4096 TIDs a group - 256 groups held 6 MB of queues
+  at the default work_mem of 4 MB (2026-10 review). A queue that fills is flushed where it is, and
+  the queues are flushed group by group after the walk; they share the visibility cache as the
+  groups' counts did, each a count begun;
 - where the copy has no container, the groups below its next key are sought to it, and after a key
   each group standing there goes straight to the copy's next key - a step where that is the next
   key, a seek (§22) past the keys between otherwise.
@@ -4062,7 +4070,9 @@ What changed, each where the cost was:
   16, or the limit itself where that is smaller - 2026-09-29 review), so that a list's leaf pins and
   its cursors' page pins come out of ONE limit per backend. The
   plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
-  buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
+  buffer or page image, an OR's heap entries and accumulators, a `LION_KN_POSFILTER`'s filter (§17,
+  "Stored positions": `lion_posfilter_mem()`, which grows with its query) - and decides the three
+  shapes below.
   An ordinary query is under the budget everywhere and is built exactly as before; the plan also
   carries each node's `pinned`, the §9 property the count needs of one positive source, so the
   shape and the interlock are one decision.
@@ -5330,6 +5340,23 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     it sees an ordinary built container; the child stands at the key while its positions are
     read, so its pins carry §9 as any node's do, and a wide union opens the node a window at a
     time like any child.  Its cost is the filter's, per candidate, as above.
+  - **What a filter holds** grows with its query, and the node is charged that against the open
+    budget (§15, "Bounded cursors"; `lion_posfilter_mem()`): a cursor per distinct lexeme, each a
+    copy of its position tree's leaf and a pointer per item that leaf may have (24 kB) or an INLINE
+    entry's chunk - which of them is not known before the entry is read, so every operand is
+    charged a tree's - beside the filter's two member arrays (128 kB). So an OR of filters too big
+    for work_mem is read as a windowed union, one filter open at a time. The charge used to be a
+    flat 160 kB, and a phrase of a thousand lexemes allocated 24 MB under it (2026-10 review). The
+    filter is in a memory context of its own, of sizes aset.c keeps no deleted context for
+    (`LION_POSFILTER_CXT_SIZES`), so that what it holds is the same whatever context it is begun
+    in and whatever the backend did before, and the charge is an upper bound of it: every buffer
+    and array past 512 bytes is a block of its own, its size and the headers. A recycled small
+    context keeps the chunk limit of the context it was first, and one first begun to grow to
+    8 MB put each 8 kB leaf in a block of 16 kB, so that the same filter held a third more in
+    one session than in another. What only finding the cursors' keys takes - the opclass's
+    extracted keys, the entry lookups - goes with a context of its own when the filter begins,
+    and what `TS_execute()` allocates for a candidate - a phrase's positions - goes after each
+    candidate, not after each container's thousands of them.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
@@ -17998,6 +18025,13 @@ that outgrows hash_mem writes its entries to a temporary file and starts again, 
 memory is bounded whatever the planner estimated. The same combination may then come out more than
 once, which is why the node's rows are PARTIAL counts under a Finalize HashAggregate, as a
 partitioned table's are (§16): core adds them up, and spills to disk itself if the groups do not fit.
+The hash holds at most 2^31 entries, whatever hash_mem says (`LION_DECODE_TALLY_MAX_ENTS`: a
+simplehash counts its members in a uint32): its bound was hash_mem over twice an entry's 24 bytes,
+cast to a uint32, which wrapped past 192 GB - at exactly that it came out 0, and the tally spilled at
+every new combination, right but at a write a row (2026-10 review). The rows the heap has to decide
+wait in a list of their TID, combination and answer, 15 bytes a row, which holds at most work_mem
+of them (§9, step 5); sized by the TID alone and doubled past that, it took two and a half to five
+times work_mem.
 
 **Chunks and passes** (`LionDecodeRun`, lion_exec_count.c). Each column's values are read off its
 entry walk (§21) a chunk at a time: column 0's as many as a batch of groups may pin
