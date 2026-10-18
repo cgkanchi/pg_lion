@@ -20457,7 +20457,10 @@ page that holds no member (§44.6).
   `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
   `maintenance_work_mem` 1 GB, 60,000 partitions (the heap scans take 8 s): before, the build ran
   on past 150 s of a 60 s `statement_timeout` and a cancel, and took `kill -9`; after, it stops at
-  10.02 s of a 10 s one and 60.01 s of a 60 s one. The second heap scan, which finds each row's
+  10.02 s of a 10 s one and 60.01 s of a 60 s one. The coding of the FINAL centroids after
+  k-means, each one's REFINE item put as it is coded (`lionvec_build_centroids()`), checks once a
+  centroid as well since the 2026-10-18 review; it had no check, which at `LIONVEC_MAX_PARTS` =
+  262,144 partitions of many dimensions is seconds. The second heap scan, which finds each row's
   partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
   for another reason found measuring the first: the build kept the REFINE page it was filling
   locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned
