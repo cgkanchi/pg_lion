@@ -339,6 +339,122 @@ RESET enable_indexscan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_count_pushdown;
 RESET work_mem;
+-- ---------- one range per element (an unordered column) ----------
+/*
+ * A class whose proc 4 is a SQL function no btree family sorts with builds
+ * its directory in hash order (DESIGN.md §21 rule 3): `a < ANY (array)` on
+ * it cannot be cut down to the widest element, and is one range per element.
+ * With nothing but ranges in the query the first range column is collected
+ * into a set that stands for the other columns: the union of its ranges, as
+ * one set in one window's memory (lion_ranges_collect()), where each range
+ * was a set of its own with all of that memory.  At work_mem and the window
+ * floor's least, the 25 ranges of a < 0 .. 1500, scattered over 3000 heap
+ * blocks, outgrow the window as they are ORed in - the union is optimized
+ * only once its walks are done (lion_range_union_finish()) - and the
+ * collection goes on a window at a time, every window a walk of each range,
+ * into one temporary file.
+ */
+CREATE FUNCTION lion_slu_cmp(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	AS 'SELECT btint4cmp($1, $2)';
+CREATE OPERATOR FAMILY lion_slu_fam USING lion;
+CREATE OPERATOR CLASS lion_slu_ops FOR TYPE int4 USING lion FAMILY lion_slu_fam AS
+	OPERATOR 1 = (int4, int4),
+	OPERATOR 6 < (int4, int4),
+	OPERATOR 7 <= (int4, int4),
+	OPERATOR 8 >= (int4, int4),
+	OPERATOR 9 > (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_slu_cmp(int4, int4);
+CREATE TABLE lion_slu (id int, a int, b int, pad text);
+INSERT INTO lion_slu
+SELECT i, (i * 7919) % 3000, i % 997, repeat('x', 160) FROM generate_series(1, 120000) i;
+CREATE INDEX lion_slu_ab ON lion_slu USING lion (a lion_slu_ops, b);
+VACUUM (FREEZE, ANALYZE) lion_slu;
+SELECT ordered FROM lion_index_stats('lion_slu_ab') WHERE attno = 1;
+ ordered 
+---------
+ f
+(1 row)
+
+SELECT pg_relation_size('lion_slu') / current_setting('block_size')::int >= 2900 AS heap_blocks;
+ heap_blocks 
+-------------
+ t
+(1 row)
+
+SET work_mem = '64kB';
+SET pg_lion.scan_window_floor = '64kB';
+SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a < ANY (array(SELECT g * 60 FROM generate_series(1, 25) g)) AND b < 700', 'lion_slu_ab');
+               lion_slcmp                
+-----------------------------------------
+ bitmap scan of lion_slu_ab, same answer
+(1 row)
+
+SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a >= ANY (array(SELECT 2999 - g * 150 FROM generate_series(1, 12) g)) AND b >= 400', 'lion_slu_ab');
+               lion_slcmp                
+-----------------------------------------
+ bitmap scan of lion_slu_ab, same answer
+(1 row)
+
+SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a <= ANY (array(SELECT CASE WHEN g % 3 = 0 THEN NULL ELSE g * 90 END FROM generate_series(1, 15) g)) AND b BETWEEN 100 AND 300', 'lion_slu_ab');
+               lion_slcmp                
+-----------------------------------------
+ bitmap scan of lion_slu_ab, same answer
+(1 row)
+
+-- the temporary files the first one's bitmap scan alone makes
+-- (pg_stat_database, flushed on demand): one, so the windows were walked
+SET pg_lion.enable_count_pushdown = off;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_clear_snapshot();
+ pg_stat_clear_snapshot 
+------------------------
+ 
+(1 row)
+
+SELECT temp_files AS lion_slu_tf FROM pg_stat_database WHERE datname = current_database() \gset
+SELECT count(*) AS union_rows FROM lion_slu
+ WHERE a < ANY (array(SELECT g * 60 FROM generate_series(1, 25) g)) AND b < 700;
+ union_rows 
+------------
+      42180
+(1 row)
+
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_clear_snapshot();
+ pg_stat_clear_snapshot 
+------------------------
+ 
+(1 row)
+
+SELECT temp_files - :lion_slu_tf AS union_temp_files
+  FROM pg_stat_database WHERE datname = current_database();
+ union_temp_files 
+------------------
+                1
+(1 row)
+
+RESET enable_indexscan;
+RESET enable_seqscan;
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.scan_window_floor;
+RESET work_mem;
+DROP TABLE lion_slu;
+DROP OPERATOR CLASS lion_slu_ops USING lion;
+DROP OPERATOR FAMILY lion_slu_fam USING lion;
+DROP FUNCTION lion_slu_cmp(int4, int4);
 -- ---------- arrays past an allocation's limit ----------
 /*
  * The failures the review found, cheaply: an array of nine million NULLs and

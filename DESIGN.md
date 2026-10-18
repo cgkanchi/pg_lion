@@ -13166,7 +13166,12 @@ container at a time (`lion_emit_intersect()`), exactly:
 - With nothing beside the ranges that the sets can express, the first range column is COLLECTED
   into a set of its own (`lion_range_collect()`, summaries and all, into a temporary file past the
   window's memory, §32) and stands for the other columns; a range left on its own is walked straight
-  into the bitmap, rechecked for the qual that was dropped.
+  into the bitmap, rechecked for the qual that was dropped. A column that cannot order the elements
+  of `col < ANY (array)` has a range per element, and their union is collected as the one set
+  (`lion_ranges_collect()`): every window of the collection walks each range into the one union, so
+  the ranges share the window's memory and a spill's one file. *(Until 2026-10-18 each range was a
+  set of its own, collected in all of the window's memory and ORed in the tree: as many windows'
+  memory as the array had elements, and a temporary file for each that spilled.)*
 - A long IN list among the other columns' quals is located a batch at a time (§15, "A list too
   long to locate at once"): each batch's union, ANDed with the other trees, is a stream of its own,
   taken window by window through the range walks into the same bitmap. The walks are made again for
