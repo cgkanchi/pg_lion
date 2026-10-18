@@ -568,7 +568,7 @@ injection_points_set_local
 (1 row)
 
 step s2_free_p: DELETE FROM vp WHERE k = 1;
-step s2_vacuum_p: VACUUM vp;
+step s2_vacuum_p: VACUUM (FREEZE) vp;
 step s2_xid: SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid;
 took_an_xid
 -----------
@@ -650,7 +650,7 @@ injection_points_set_local
 (1 row)
 
 step s2_free_p: DELETE FROM vp WHERE k = 1;
-step s2_vacuum_p: VACUUM vp;
+step s2_vacuum_p: VACUUM (FREEZE) vp;
 step s2_xid: SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid;
 took_an_xid
 -----------
