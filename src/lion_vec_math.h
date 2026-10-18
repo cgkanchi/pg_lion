@@ -833,4 +833,32 @@ lionvec_lift_key(double lo, double offset, double qnorm, double maxnorm2,
 	return qnorm * (d * d - 1.0 - maxnorm2) / 2.0 + offset;
 }
 
+/*
+ * What the planner charges for reading the pages n rows of a relation of T
+ * pages lie on, each page once and in block order (lion_vec.c,
+ * lionvec_exact_cost(); DESIGN.md §44.7, "Exact path pricing"): as
+ * costsize.c prices a bitmap heap scan's pages (compute_bitmap_pages() and
+ * cost_bitmap_heap_scan(), one loop), Mackert and Lohman's count of the
+ * pages read with none read twice, 2Tn / (2T + n) rounded up and at most T,
+ * each priced from random_page_cost towards seq_page_cost by the square
+ * root of the share of the pages read, and a single page at the random
+ * price.  index_pages_fetched()'s re-reads, past a table's share of
+ * effective_cache_size, are an index scan's, whose rows come in the
+ * index's order; these come in the pages' own, as a bitmap's do.
+ */
+static inline double
+lionvec_pages_in_order(double n, double T, double spc_random, double spc_seq)
+{
+	double		pages;
+	double		perpage = spc_random;
+
+	T = Max(T, 1.0);
+	n = Max(n, 1.0);
+	pages = 2.0 * T * n / (2.0 * T + n);
+	pages = pages >= T ? T : ceil(pages);
+	if (pages >= 2.0)
+		perpage -= (spc_random - spc_seq) * sqrt(pages / T);
+	return pages * perpage;
+}
+
 #endif							/* LION_VEC_MATH_H */
