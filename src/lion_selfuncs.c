@@ -2716,6 +2716,12 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 		rel->reloptkind == RELOPT_JOINREL || rel->indexlist == NIL)
 		return 1.0;
 
+	/*
+	 * Every path's cost asks this: each index's arrays are let go of once it
+	 * is not the one taken, or once that one is measured, as
+	 * lion_isect_factor_run() lets go of its own, rather than piling up in
+	 * the planner's context (2026-10 review).
+	 */
 	amoid = lion_get_am_oid();
 	foreach(lc, rel->indexlist)
 	{
@@ -2729,16 +2735,31 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 		n = lion_isect_rel_clauses(rel, idx, &cols, &clauses);
 		if (n > bestn)
 		{
+			if (best != NULL)
+			{
+				pfree(bestcols);
+				pfree(bestclauses);
+			}
 			best = idx;
 			bestn = n;
 			bestcols = cols;
 			bestclauses = clauses;
+		}
+		else
+		{
+			pfree(cols);
+			pfree(clauses);
 		}
 	}
 
 	if (best != NULL && bestn >= 2)
 		factor = lion_isect_factor_run(root, rel, best, bestn, bestcols,
 									   bestclauses, false);
+	if (best != NULL)
+	{
+		pfree(bestcols);
+		pfree(bestclauses);
+	}
 	return factor;
 }
 
