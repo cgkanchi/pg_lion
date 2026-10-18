@@ -326,9 +326,15 @@ so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` row
 up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's partitions if that
 is more, is answered exactly, from every member's distance; a larger one by reading partitions as
 above, counting its patience in matching rows. A very selective filter, or one a sort answers more
-cheaply, is planned as a sort of the lion bitmap scan's rows, which is exact. A `WHERE` clause no
-lion index answers - a column without one, `id > 0` - is never applied to the rows the `lionvec`
-scan returns: the scan pauses and skips late rows by the rows it returns,
+cheaply, is planned as a sort of the lion bitmap scan's rows, which is exact. Under a wide filter,
+where building the set costs more than the rows it saves (about 170 ns a matching row, 845 ms for
+5 million), `LionOrdered` builds none: the scan reads partitions as an unfiltered one does and tests
+the `WHERE` on the table row of each row it fetches for its exact distance, dropping one that fails,
+so it still returns matching rows only (`Lion Filter:` in `EXPLAIN` where the set's plan says `Lion
+Cond:`, and `Rows Removed by Lion Filter` under `EXPLAIN ANALYZE`). The planner prices both and
+takes the cheaper; `pg_lion.vector_restrict` (below) pins either (DESIGN.md §44.6, "Filter at the
+fetch"). A `WHERE` clause no lion index answers - a column without one, `id > 0` - is never applied
+to the rows the `lionvec` scan returns: the scan pauses and skips late rows by the rows it returns,
 not by those a `Filter` keeps, so the answer would depend on the plan (DESIGN.md §44.6,
 "Post-filtering"). By default such a query fails when it is planned (`pg_lion.vector_postfilter`,
 below, whose `exact` plans it as a sort of the filter's rows instead); for an approximate answer,
@@ -686,6 +692,16 @@ its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which onl
 `LIMIT`, or a large one, over rows its codes cannot tell apart reaches. `error` fails the query;
 `stop` ends the scan with a NOTICE, the rows it returned being in order, each once, and the
 nearest it found (DESIGN.md §44.4).
+
+`pg_lion.vector_restrict` (`auto`, `set` or `filter`): how `LionOrdered` restricts a `lionvec` scan
+to the rows a lion filter keeps. `set` builds lion's set of them before the scan's first row and
+the scan reads and scores only those, exact under `pg_lion.vector_exact_rows` (the only way before
+2026-10-18); `filter` builds none, and the scan scores every row it reads and tests the filter on
+the table row of each it fetches for its exact distance, dropping one that fails - about ten
+fetches for each matching row it needs under a 10% filter - and is never exact; `auto`, the
+default, prices both and plans the cheaper, which is the filter's under wide filters, and wherever
+the set would not fit `hash_mem`. With `pg_lion.vector_patience` at 0 the two return the same rows
+(DESIGN.md §44.6, "Filter at the fetch", §44.7).
 
 `pg_lion.vector_postfilter` (`error`, `exact` or `allow`): whether a plan may apply a `WHERE` clause
 to the rows a `lionvec` scan returns, after the scan (DESIGN.md §44.6, "Post-filtering"). Such a
