@@ -476,6 +476,7 @@ extern bool lionvec_vector_inline(Relation index, Relation heap, int dims,
 								  bool half);
 extern void lionvec_check_page(Relation index, Page page, BlockNumber blk,
 							   uint16 type);
+extern Buffer lionvec_insert_readbuf(Relation index, BlockNumber blk);
 extern LionVecCode *lionvec_code_at(Relation index, Page page, BlockNumber blk,
 									OffsetNumber off, int dimsp, bool copies);
 extern LionVecRefine *lionvec_refine_at(Relation index, Page page,
