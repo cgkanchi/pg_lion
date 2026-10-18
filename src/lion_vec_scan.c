@@ -1815,16 +1815,19 @@ lv_check_placed(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
 
 /*
  * Whether this scan reads vectors by their places in TOAST (DESIGN.md
- * §44.13): an index that keeps a locator, pg_lion.vector_toast_direct on,
- * a heap of the heap access method whose TOAST relation is the one the
- * index was built over, and a regular MVCC snapshot.  (No scan gets here
- * under 16's old_snapshot_threshold, which would let a value an old
- * snapshot sees be gone with no error from a read by place: lv_start()
- * refuses it first.)  Then the exact path reads its members so, from the
- * locator (lv_exact_places()), and the rerank, in an index whose REFINE
- * items hold places, the rows it reranks (lv_rerank_placed()).  The TOAST
- * relation is opened once, locked as a detoast locks it, which keeps it
- * from being truncated or rewritten while the transaction lasts, so its
+ * §44.13): lionvec_reads_placed() of its meta page - an index that keeps a
+ * locator, pg_lion.vector_toast_direct on, a heap of the heap access method
+ * whose TOAST relation is the one the index was built over - which the
+ * planner asks of the same meta page, so that it prices the exact path's
+ * reads as they will be made (lion_vec.c, lionvec_startup_cost()); and a
+ * regular MVCC snapshot, which the planner takes every query's to be.  (No
+ * scan gets here under 16's old_snapshot_threshold, which would let a value
+ * an old snapshot sees be gone with no error from a read by place:
+ * lv_start() refuses it first.)  Then the exact path reads its members so,
+ * from the locator (lv_exact_places()), and the rerank, in an index whose
+ * REFINE items hold places, the rows it reranks (lv_rerank_placed()).  The
+ * TOAST relation is opened once, locked as a detoast locks it, which keeps
+ * it from being truncated or rewritten while the transaction lasts, so its
  * blocks counted now bound every place read.
  * A scan under a filter reads none by place: the rows it reranks are each
  * fetched from the heap for the filter's test, and their vectors come with
@@ -1843,18 +1846,15 @@ lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
 	so->tpf = 0;
 	so->ttried = so->tfailed = 0;
 	lion_ask_reset(&so->task);
-	if (!lionvec_toast_direct || so->filter != NULL ||
-		(so->meta.flags & LIONVEC_META_LOCATOR) == 0 ||
-		heap == NULL || heap->rd_tableam != GetHeapamTableAmRoutine() ||
-		!OidIsValid(heap->rd_rel->reltoastrelid) ||
-		heap->rd_rel->reltoastrelid != so->meta.toastrelid ||
-		so->info->dims <= 0 || so->meta.dims != so->info->dims ||
+	if (so->filter != NULL ||
+		!lionvec_reads_placed(heap, &so->meta, so->info->dims,
+							  so->info->half) ||
 		!IsMVCCSnapshot(scan->xs_snapshot))
 		return;
 	extsize = lionvec_toast_extsize(so->info->dims, so->info->half);
 	nchunks = lionvec_toast_nchunks(extsize, LION_TOAST_MAX_CHUNK_SIZE);
-	if (nchunks < 1 || nchunks > LIONVEC_LOC_MAXRUNS)
-		return;
+	/* lionvec_reads_placed() holds a value's chunks to a LOC entry's runs */
+	Assert(nchunks >= 1 && nchunks <= LIONVEC_LOC_MAXRUNS);
 
 	if (so->toastrel != NULL &&
 		RelationGetRelid(so->toastrel) != so->meta.toastrelid)

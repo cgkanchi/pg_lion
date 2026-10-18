@@ -552,6 +552,37 @@ lionvec_vector_inline(Relation index, Relation heap, int dims, bool half)
 	return dims > 0 && sz <= within;
 }
 
+/*
+ * Whether a scan of an index whose meta page is meta, of dims dimensions
+ * (of a halfvec if half), over heap reads its vectors in TOAST by their
+ * chunks' places (DESIGN.md §44.13): the index keeps a locator,
+ * pg_lion.vector_toast_direct is on, the heap is of the heap access method
+ * and its TOAST relation the one the index was built over, the dimensions
+ * are known and the meta page's, and a value's chunks fit a LOC entry's
+ * runs.  The scan asks it as it starts (lion_vec_scan.c, lv_start_toast();
+ * which also wants an MVCC snapshot, as every query's is, and runs under no
+ * old_snapshot_threshold, which lv_start() refuses first), and the planner
+ * of the same meta page (lionvec_code_pages()), so that the exact path is
+ * priced as it will read (§44.7).
+ */
+bool
+lionvec_reads_placed(Relation heap, const LionVecMetaData *meta, int dims,
+					 bool half)
+{
+	int			nchunks;
+
+	if (!lionvec_toast_direct ||
+		(meta->flags & LIONVEC_META_LOCATOR) == 0 ||
+		heap == NULL || heap->rd_tableam != GetHeapamTableAmRoutine() ||
+		!OidIsValid(heap->rd_rel->reltoastrelid) ||
+		heap->rd_rel->reltoastrelid != meta->toastrelid ||
+		dims <= 0 || meta->dims != dims)
+		return false;
+	nchunks = lionvec_toast_nchunks(lionvec_toast_extsize(dims, half),
+									LION_TOAST_MAX_CHUNK_SIZE);
+	return nchunks >= 1 && nchunks <= LIONVEC_LOC_MAXRUNS;
+}
+
 /* pgvector's own error, so a query reads the same with or without the index */
 void
 lionvec_check_dims(const LionVecInfo *info, int dim)
