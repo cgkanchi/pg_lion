@@ -28,8 +28,8 @@ RECOVERY_RUN_AS=postgres make recovery-check RECOVERY_PREFIX=<prefix>
 `share/postgresql/extension`), and it is REQUIRED - `--prefix` or
 `RECOVERY_PREFIX`; the run refuses to start without one. There is no default
 on purpose: the extension is rebuilt from a clean copy of this tree — `src/`,
-the Makefile, the control and SQL files, with `src/*.o` removed — and
-*installed* into that prefix, exactly as `bench/lib.sh`'s
+the Makefile, the control and SQL files, with the objects and the compiler's
+`src/*.d` removed — and *installed* into that prefix, exactly as `bench/lib.sh`'s
 `bench_build_extension` does, so a guessed prefix would be somebody else's
 server. `make install` is never run in the source tree, and the prefix is
 deliberately not derived from `PG_CONFIG`.
@@ -55,7 +55,8 @@ servers). Phase 5 needs pgvector and `pageinspect`, and is skipped, with a
 line in the summary, without them. `INJECTION_POINTS=1` in the environment turns every
 such skip into a failure, so a server that should have injection points and
 does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
-none of those phases; CI's source-build jobs set it.
+none of those phases; CI's source-build jobs set it. `PGVECTOR=1` does the
+same for phase 5, and CI sets it wherever it built or installed pgvector.
 
 The run creates everything it needs in ONE private directory that
 `mktemp -d` makes for it under `$RECOVERY_TMPDIR` (default `$TMPDIR`, else
@@ -111,9 +112,9 @@ are created on the empty table and filled by `aminsert`, so their entries go
 through INLINE→CHAIN spills, sparse-segment promotions and container-page
 splits under WAL; four are built by `ambuild` after the load.
 `inline_limit = 64` on three of them makes spills and splits frequent rather
-than rare, `buckets = 8`/`16` forces bucket-page chains, and the 3000 distinct
-values of `t` over ~800 heap pages give about one member per container key,
-which is what puts sparse segments in an index at all.
+than rare, and the 3000 distinct values of `t` over ~800 heap pages give about
+one member per container key, which is what puts sparse segments in an index at
+all.
 
 **Phase 1, crash recovery under load.** Eight rounds of: ~2 s of mixed writes
 (pgbench, 4 clients, `synchronous_commit = on`, ~430 transactions/s), then kill

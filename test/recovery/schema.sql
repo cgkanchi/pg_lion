@@ -75,19 +75,18 @@ $$;
  * their entries go through INLINE -> CHAIN spills, segment promotions and
  * container-page splits under WAL; the other four are built by ambuild after
  * the load.  inline_limit = 64 forces a spill on the first few members, which
- * is what makes the split and spill records of section 4 frequent; buckets = 8
- * forces bucket-page chains.
+ * is what makes the split and spill records of section 4 frequent.
  */
-CREATE INDEX lion_rec_ct  ON lion_rec USING lion (ct)  WITH (buckets = 8);
+CREATE INDEX lion_rec_ct  ON lion_rec USING lion (ct);
 CREATE INDEX lion_rec_b   ON lion_rec USING lion (b)   WITH (inline_limit = 64);
-CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64, buckets = 16);
+CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64);
 
 INSERT INTO lion_rec
 SELECT g.* FROM generate_series(1, 40000) i, lion_rec_gen(i) g;
 
 CREATE INDEX lion_rec_k4  ON lion_rec USING lion (k4) WITH (inline_limit = 64);
 CREATE INDEX lion_rec_t   ON lion_rec USING lion (t);
-CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn) WITH (buckets = 8);
+CREATE INDEX lion_rec_nn  ON lion_rec USING lion (nn);
 CREATE INDEX lion_rec_tsv ON lion_rec USING lion (tsv);
 
 /*

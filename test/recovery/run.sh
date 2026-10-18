@@ -64,6 +64,10 @@
 #                     (as CI's source jobs set it) that is a failure instead:
 #                     a server that should have them and does not must not
 #                     end in "ALL ... PASSED" having run none of them.
+#   PGVECTOR=1        the same for phase 5, which needs pgvector (and
+#                     pageinspect) and is otherwise skipped without it; CI
+#                     sets it wherever it installed pgvector, as the Makefile
+#                     takes it for lionvec's regression files and specs.
 #
 # Exit status is 0 only if every check passed.  A summary is printed at the
 # end; the full log is written to test/recovery/log/run.log, and on failure the
@@ -129,6 +133,7 @@ RUN_AS=${RECOVERY_RUN_AS:-}
 TMPROOT=${RECOVERY_TMPDIR:-${TMPDIR:-/tmp}}
 SKIP_INSTALL=${RECOVERY_SKIP_INSTALL:-0}
 REQUIRE_INJECTION=${INJECTION_POINTS:-0}
+REQUIRE_PGVECTOR=${PGVECTOR:-0}
 ITERS=8
 KEEP=0
 MODE=generic
@@ -383,8 +388,10 @@ build_extension() {
 	mkdir "$BUILDDIR"
 	cp -r "$PROJECT/src" "$PROJECT/Makefile" "$PROJECT"/pg_lion*.control \
 		"$PROJECT"/pg_lion*--*.sql "$BUILDDIR/"
-	# Never reuse objects built against another server.
-	rm -f "$BUILDDIR"/src/*.o "$BUILDDIR"/src/*.bc "$BUILDDIR"/*.so
+	# Never reuse objects built against another server, nor the header
+	# dependencies the compiler wrote beside them (src/*.d), which name that
+	# server's headers.
+	rm -f "$BUILDDIR"/src/*.o "$BUILDDIR"/src/*.d "$BUILDDIR"/src/*.bc "$BUILDDIR"/*.so
 	mkdir -p "$BUILDDIR/test/sql" "$BUILDDIR/test/isolation"
 	(
 		cd "$BUILDDIR" &&
@@ -2510,6 +2517,9 @@ phase5() {
 	log ""
 	log "=== phase 5: lionvec's TOAST locator through crash recovery and a hot standby ==="
 	if [ "$(psql_p -tAc "select count(*) from pg_available_extensions where name in ('vector', 'pageinspect')" 2>>"$RUNLOG" || true)" != 2 ]; then
+		if [ "$REQUIRE_PGVECTOR" = 1 ]; then
+			die "phase 5 needs pgvector and pageinspect, and this server lacks one of them (PGVECTOR=1 makes that a failure rather than a skip)"
+		fi
 		log "phase 5 skipped: this server has no pgvector or no pageinspect"
 		SUMMARY+=("phase5              skipped (no pgvector or no pageinspect)")
 		return 0

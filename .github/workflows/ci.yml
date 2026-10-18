@@ -19,8 +19,17 @@
 #
 # The crash-recovery and hot-standby harness (test/recovery/run.sh) runs on
 # every major, in both WAL modes and with wal_consistency_checking, so that
-# every major replays lion's records: its phases 1, 1f, 2 and 4 on the packages,
-# and all of them, the injection-point phases included, on the source builds.
+# every major replays lion's records: its phases 1, 1f, 2, 4 and 5 on the
+# packages, and all of them, the injection-point phases included, on the
+# source builds.
+#
+# lionvec's tests (the vector*.sql files, the lionvec_*.spec specs and the
+# harness's phase 5) need pgvector: its package on the pgdg jobs, a build of
+# its default branch on the source jobs, its 18 package on the dist job.
+# Where it is expected - every job but a beta major's packages, which may not
+# have one yet - a failed install or build fails the job, and PGVECTOR=1
+# makes the Makefile and the harness fail instead of skipping those tests, as
+# INJECTION_POINTS=1 does for the injection-point ones.
 #
 # The pgdg and source jobs run the unit tests twice: as built, and with
 # AddressSanitizer and UndefinedBehaviorSanitizer (make unit SANITIZE=1),
@@ -83,13 +92,24 @@ jobs:
           ln -sfn "/usr/lib/postgresql/$PG" .local/pg
           .local/pg/bin/pg_config --version
 
-      # pg_lion_vector's tests need pgvector; without it they are skipped
-      # (Makefile), so a major apt.postgresql.org has no package for yet still
-      # tests everything else.
+      # pg_lion_vector's tests need pgvector.  Every released major has a
+      # package, and a missing one fails the job; once it is installed,
+      # PGVECTOR=1 goes into the job's environment, under which the Makefile
+      # will not leave lionvec's regression files and specs out, nor the
+      # recovery harness its phase 5 - so an install that put nothing where
+      # the server looks cannot pass green with no lionvec test run.  A beta
+      # major apt.postgresql.org has no package for yet still tests
+      # everything else, and says so.
       - name: Install pgvector
         run: |
-          sudo apt-get install -y --no-install-recommends "postgresql-$PG-pgvector" ||
-            echo "::notice::no pgvector package for PostgreSQL $PG; the vector tests are skipped"
+          if sudo apt-get install -y --no-install-recommends "postgresql-$PG-pgvector"; then
+            echo "PGVECTOR=1" >> "$GITHUB_ENV"
+          elif [ "$PG" -ge 19 ]; then
+            echo "::warning::no pgvector package for PostgreSQL $PG yet; the vector tests are skipped"
+          else
+            echo "::error::no pgvector package for PostgreSQL $PG"
+            exit 1
+          fi
 
       - name: Build
         run: make -j4 WERROR=1
@@ -118,7 +138,9 @@ jobs:
 
       # pg_lion beside another extension on the same planner hook and with
       # its own resource manager, in both load orders, the non-heap table AM
-      # refusals, and counts on a sixteen-buffer pool (test/hook-check.sh).
+      # refusals, counts on a sixteen-buffer pool, and - on 16, the only
+      # major with the setting - the refusal to read a lion index under
+      # old_snapshot_threshold (test/hook-check.sh).
       # The test module goes into the packaged installation with sudo, like
       # pg_lion itself.
       - name: hookcheck (hook coexistence, table AMs)
@@ -170,6 +192,10 @@ jobs:
       # Makefile then refuses to leave the injection-point specs out, and
       # test/recovery/run.sh fails instead of skipping its phases 1b-1e, 1g and 3.
       INJECTION_POINTS: "1"
+      # The same for pgvector, which the job builds: lionvec's regression
+      # files and specs, and the recovery harness's phase 5, fail rather
+      # than skip without it.
+      PGVECTOR: "1"
     steps:
       - uses: actions/checkout@v7
 
@@ -209,14 +235,17 @@ jobs:
           ln -sfn "$PGPREFIX" .local/pg
           .local/pg/bin/pg_config --version
 
-      # As in the pgdg jobs: pg_lion_vector's tests run if pgvector builds
-      # against this branch, and are skipped if it does not.
+      # pgvector's default branch, built against this one.  A build that
+      # fails fails the job, here, rather than leaving the Makefile to find
+      # no vector.control and skip every lionvec test with the job still
+      # green, as continue-on-error did; a master pgvector does not build
+      # against yet is a red job to look at, not a silent loss of coverage.
       - name: Build pgvector
-        continue-on-error: true
         run: |
           git clone -q --depth 1 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
           make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PWD/$PG_CONFIG"
           make -s -C "$RUNNER_TEMP/pgvector" install PG_CONFIG="$PWD/$PG_CONFIG"
+          test -f "$("$PG_CONFIG" --sharedir)/extension/vector.control"
 
       - name: Build
         run: make -j4 WERROR=1
@@ -300,6 +329,9 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       PG: "18"
+      # its pgvector package is installed below, and the archive's tests
+      # must not skip lionvec's
+      PGVECTOR: "1"
     steps:
       - uses: actions/checkout@v7
 

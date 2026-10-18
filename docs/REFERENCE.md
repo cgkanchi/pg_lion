@@ -394,6 +394,12 @@ insert that adds a key as the entries on its directory leaf times the number of 
 rejects a row.  For a multi-key column the keys are the extracted elements or lexemes.
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
 moves out of its entry tuple onto container pages of its own.
+`buckets` (0 .. 65536, default 0): accepted and ignored. It sized the hash directory of the
+first index formats, which a B-tree keyed by the index key replaced (DESIGN.md §21); that tree
+grows by splitting and has nothing to size, so an index built with any value is the index built
+without it. A value above 0 is answered with a NOTICE saying so when it is set, by `CREATE INDEX`
+or `ALTER INDEX ... SET`; a value outside the range is an error, as for any reloption.
+`fillfactor` is what decides how full the build packs the directory's leaves.
 `summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
 With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
 consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their

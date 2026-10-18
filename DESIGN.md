@@ -1524,7 +1524,14 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
   and the count functions. The snapshot is not known yet in ambeginscan, which is why the refusal
   is in the calls that read. Inserts and VACUUM are not affected; neither is
   `lion_index_verify()`, whose heap scan raises "snapshot too old" itself on any page early
-  pruning changed, and whose structural checks use no snapshot.
+  pruning changed, and whose structural checks use no snapshot. The setting is a postmaster one,
+  which a regression file cannot set, so the test is `make hookcheck`'s: on 16 alone it restarts
+  the dev cluster with `old_snapshot_threshold = 60` for
+  `test/modules/lion_hooktest/sql/oldsnapshot.sql`, which checks that a count, a GROUP BY, a
+  plain scan's query, a LionOrdered and a LionBm25 query are all planned without lion, that a
+  bitmap and a plain scan forced onto a lion index, and every direct SQL count and `lion_bm25()`,
+  stop at the ERROR, and that inserts, updates, deletes, VACUUM and `lion_index_verify()` still
+  work (2026-10-18 review: the refusals had no test at all).
 
 Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *keys, Snapshot snap)`
 1. For each (index, key): locate the entry (bucket head SHARE lock; copy the entry header; for INLINE
@@ -1900,7 +1907,10 @@ Planner integration
     nothing to this column, is not. GROUP BY an enum, the value-representation rule, the FK-side
     join (§27) on an enum key and EXPLAIN needed nothing more. `lion_index_posting_root()` made the
     same mistake (`keytype != opcintype`) and refused every enum key; it takes the column's enum,
-    or a domain over it, now.
+    or a domain over it, now - and, since the 2026-10-18 review, a domain over any key column's
+    type and a value of the column's own type (a varchar on a varchar column of `text_ops`), the
+    keys the count functions take that have the column's representation; a cross-type key (int8
+    on int4), which the counts resolve through a probe, it still refuses.
   - Collations follow the planner's IndexCollMatchesExprColl() rule: a collation-sensitive clause
     (OpExpr/ScalarArrayOpExpr inputcollid valid) or grouping column may only use an index whose
     indexcollations[i] - of the KEY COLUMN that indexes the clause's column (§24) - equals that
@@ -7833,6 +7843,9 @@ Against the dev cluster, restarted with the options on pg_ctl's command line:
   id): the postmaster refuses to start with core's `failed to register custom resource manager
   "lion_hooktest" with ID 170` / `Custom resource manager "pg_lion" already registered with the
   same ID` - the collision the `pg_lion.rmgr_id` GUC exists to move out of;
+- two restarts that have nothing to do with the hooks and are here because only a restart sets
+  them: `shared_buffers = 128kB`, the counts of §15's pin budgets on sixteen buffers; and, on 16
+  alone, `old_snapshot_threshold = 60`, under which no lion index is read (§9);
 - `HOOKCHECK_FULL=1` also runs the whole regression and isolation suite in both preload orders
   (done once, on 18: green).
 
@@ -10344,7 +10357,10 @@ rescans of the Gather each run's.
 **Cost.** The child's total cost and the sort's are the node's startup: `LION_FKJOIN_SORT_COMPARE_COST`
 (a quarter of a `cpu_operator_cost`) a comparison, N log2 N of them, and `LION_FKJOIN_SORT_KEY_COST`
 (6) a key for putting it in, taking it out and comparing it with the previous distinct key, plus one
-merge pass past `work_mem`. Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
+merge pass past `work_mem` - which the sort's own bytes decide: three words a key and, for a key
+passed by reference, the key at its column's width (`lion_fkjoin_sort_cost()`; until the
+2026-10-18 review the child's whole row width, and a copy of every key, which priced a sort that
+fits in memory as spilling - an overcharge only). Measured: 0.108 us a key to put in and sort 40,000 or 199,000 keys, and
 0.023 us to take them out and compare them - about 13 `cpu_operator_cost` a key at the 250 units a
 millisecond the node's other terms run at. `cost_sort()` charges 36 a key at 200,000, three times
 the time the sort takes (while `cost_agg()` charges core's hashed unique-ification one a row), and it
