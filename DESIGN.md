@@ -5636,10 +5636,14 @@ rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into th
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
 below).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
-those and nothing else.  A page of a LIVE set is never mistaken for a leak, because pass 2 visits
-every page of every chain it found, and a chain created after pass 1 read its bucket page has no
-empty page in it (a spill and a split both fill every page they allocate inside the record that
-allocates it, under the lock they hold throughout) and names a root that is live.
+those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
+page it reads passes the cost-based delay first, as every page the walk reads does (since the
+2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
+free pages neither answered a cancel nor paced its reads and records).  A page of a LIVE set is
+never mistaken for a leak, because pass 2 visits every page of every chain it found, and a chain
+created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
+every page they allocate inside the record that allocates it, under the lock they hold
+throughout) and names a root that is live.
 lion_index_stats() reports deleted_pages; VACUUM is told the counts below.
 
 **Page counts** (2026-09-25 review).  IndexBulkDeleteResult has three: `pages_newly_deleted`,
