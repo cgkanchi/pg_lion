@@ -110,3 +110,42 @@ of the time; `NSHARDS=3` reproduces the 115k set of the earlier results. Use a s
 measured at 1M yet; at 115k on 4 cores lionvec's build went from 125-134 s to 38 s with 4
 workers, and VectorChord's from 21 s to 12 s (4 workers and 4 threads). Then about an hour of warm sweeps and 20 minutes
 cold, after the 9.5 GB download.
+
+## MS MARCO at tens of millions of rows
+
+`DATASET=msmarco run.sh` runs the same steps on
+[CohereLabs/msmarco-v2.1-embed-english-v3](https://huggingface.co/datasets/CohereLabs/msmarco-v2.1-embed-english-v3):
+the TREC-RAG 2024 corpus's 113,520,750 passages under Cohere Embed English v3, 1024 dimensions
+stored as float16. `knn_msmarco.py` does its fetch, prepare and load; the builds, warm and cold
+runs and tables are `knn_dbpedia.py`'s, on `KNN_TABLE=msmarco`.
+
+- **Rows.** The first `KNN_ROWS` passages (default 50,000,000), in the order of the data set's
+  `passages_npy` files, as `msmarco (id int primary key, u float8, embedding halfvec(1024))`:
+  halfvec holds the float16 values exactly. `u` is the filter column, uniform from a fixed seed.
+- **Queries.** The data set's own (TREC Deep Learning 2021-2023), `KNN_NQ` of its 1,677 drawn with a
+  fixed seed and rounded to float16 as the query's cast rounds them, rather than held-out rows.
+- **Truth.** The exact ten nearest by cosine under each filter, from one streaming pass (each
+  query's 100 best a filter in float32, then scored again in float64). Unfiltered it is checked
+  against the data set's top-1000 neighbours cut to the table's rows, and the agreement is written
+  to `info.json` (0.9995 at 50M).
+- **Where things go.** The downloads in `MSMARCO_DIR` (default `/mnt/d/lionbench-msmarco`, a
+  Windows drive, since they are only read); the database `msmarco` in the same cluster, and its
+  cache, state and logs in `~/lionbench/msmarco`. Reading the files over WSL's 9p mount is slow
+  (about 64 MB/s for one reader, less for several): copying them to the Linux disk first and
+  pointing `MSMARCO_DIR` there made the load 8 minutes instead of hours.
+- **Space at 50M.** 104 GB of downloads (26 of the 60 files); a 130 GB table with the vectors
+  inline, lionvec's index about 75 GB and VectorChord's about 146 GB.
+- **Sweeps.** With the table and indexes many times the RAM, every query is mostly disk-bound and a
+  filtered VectorChord query with its prefilter took seconds, so the 50M run used smaller sweeps:
+  `KNN_NQ=100 KNN_MARGINS=2,3,6,12,24 KNN_PROBES=20,40,80,160,320 KNN_VCHORD_SORT_OFF=0`
+  (the last leaves out VectorChord's `enable_sort = off` plan, whose recall is its plain plan's).
+
+```sh
+DATASET=msmarco STEPS="fetch" bench/vector/local/run.sh          # 104 GB to MSMARCO_DIR
+cp -r /mnt/d/lionbench-msmarco ~/lionbench/msmarco/data          # optional, much faster load
+MSMARCO_DIR=~/lionbench/msmarco/data KNN_NQ=100 KNN_MARGINS=2,3,6,12,24 \
+  KNN_PROBES=20,40,80,160,320 KNN_VCHORD_SORT_OFF=0 DATASET=msmarco bench/vector/local/run.sh
+```
+
+At 50M on the 5700X3D: prepare 27 minutes, load with its indexes 26, lionvec's build 76 and
+VectorChord's 42 (8 workers each), the warm sweeps 4 hours and the cold step 6 minutes.
