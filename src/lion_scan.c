@@ -2339,7 +2339,7 @@ lion_rwin_run(LionRangeWindow *w, LionScanOpaque so, LionSetStream *st,
  * walk; a range over a summarized column (§32) walks the summaries of the
  * buckets it covers rather than their keys, so a wide one is short.  When
  * nothing beside the ranges could be expressed, the first range column,
- * collected into a set of its own (lion_range_collect(), summaries and all),
+ * collected into a set of its own (lion_ranges_collect(), summaries and all),
  * stands for the other columns, and a range left on its own is simply walked
  * into the bitmap, rechecked.
  *
@@ -2472,35 +2472,38 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		/*
 		 * Nothing but ranges: the first one, collected, stands for the other
 		 * columns' sets.  Past the window's memory the collection goes on in
-		 * a temporary file, a window of container keys at a time.
+		 * a temporary file, a window of container keys at a time.  A column
+		 * that cannot order the elements of `col < ANY (array)` has a range
+		 * per element, and their union is collected as the one set, in the
+		 * one window's memory (lion_ranges_collect()): a set each, each with
+		 * all of that memory, was an array's worth of it at once.
 		 */
-		LionKeyNode **leaves = (LionKeyNode **)
-			palloc(sizeof(LionKeyNode *) * Max(rc[0].nranges, 1));
-		int			nleaves = 0;
+		LionRange **live = (LionRange **)
+			palloc(sizeof(LionRange *) * Max(rc[0].nranges, 1));
+		int			nlive = 0;
+		int			base;
+		Size		held;
+		bool		spilled;
+		int64		nsets;
+		int64		nsums;
 
 		for (r = 0; r < rc[0].nranges; r++)
 		{
-			int			base;
-			Size		held;
-			bool		spilled;
-			int64		nsets;
-			int64		nsums;
-
-			if (rc[0].ranges[r].empty)
-				continue;
-			base = lion_sets_reserve(&acc, 1);
-			(void) lion_range_collect(index, rc[0].attno, &rc[0].ranges[r],
-									  budget, true, &acc.sets[base], &held,
-									  &spilled, &nsets, &nsums);
-			if (acc.sets[base].found)
-				leaves[nleaves++] = lion_scan_leaf(base);
-			else
-				acc.nsets--;	/* the range holds no row */
+			if (!rc[0].ranges[r].empty)
+				live[nlive++] = &rc[0].ranges[r];
 		}
-		if (nleaves == 0)
-			nomatch = true;
+		Assert(nlive > 0);		/* else the ranges settled the scan above */
+		base = lion_sets_reserve(&acc, 1);
+		(void) lion_ranges_collect(index, rc[0].attno, live, nlive, budget,
+								   true, &acc.sets[base], &held, &spilled,
+								   &nsets, &nsums);
+		if (acc.sets[base].found)
+			args[nargs++] = lion_scan_leaf(base);
 		else
-			args[nargs++] = lion_scan_op(LION_KN_OR, leaves, nleaves);
+		{
+			acc.nsets--;		/* the ranges hold no row */
+			nomatch = true;
+		}
 		first = 1;
 	}
 
