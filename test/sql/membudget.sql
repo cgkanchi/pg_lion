@@ -25,8 +25,11 @@ SET max_parallel_workers_per_gather = 0;
  * that a LionCount path that is built at all is the plan, and again for its
  * rows; then as a sequential scan with the pushdown off.  It says whether the
  * node ran, whether the groups were counted in batches against the collected
- * WHERE, whether the decoded walk ran and its tally spilled, how many TIDs or
- * rows went to the heap, and whether the two answers are equal.
+ * WHERE, whether the decoded walk ran and its tally spilled, and whether the
+ * two answers are equal.  It does not say how many TIDs or rows went to the
+ * heap: on pages no VACUUM has made all-visible that depends on what read the
+ * table before, since on-access pruning sets the map's bits from 19 on, as
+ * count.sql says.
  */
 CREATE FUNCTION lmb_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -36,7 +39,6 @@ DECLARE
 	batches int := 0;
 	decoded boolean := false;
 	spills int := 0;
-	rechecked bigint := 0;
 	nrows bigint;
 	ndiff bigint;
 BEGIN
@@ -54,12 +56,6 @@ BEGIN
 			decoded := true;
 		ELSIF ln ~ 'Tally Spills: ' THEN
 			spills := substring(ln FROM 'Tally Spills: (\d+)')::int;
-		ELSIF ln ~ 'Heap TIDs Rechecked: ' THEN
-			rechecked := rechecked +
-				substring(ln FROM 'Heap TIDs Rechecked: (\d+)')::bigint;
-		ELSIF ln ~ 'Decoded Rows Rechecked: ' THEN
-			rechecked := rechecked +
-				substring(ln FROM 'Decoded Rows Rechecked: (\d+)')::bigint;
 		END IF;
 	END LOOP;
 	EXECUTE 'CREATE TEMP TABLE lmb_on AS ' || q;
@@ -76,18 +72,19 @@ BEGIN
 	  INTO ndiff;
 	DROP TABLE lmb_on;
 	DROP TABLE lmb_off;
-	RETURN format('%s%s%s%s, %s rechecked, %s rows, %s',
+	RETURN format('%s%s%s%s, %s rows, %s',
 				  CASE WHEN pushed THEN 'pushed down' ELSE 'NOT PUSHED DOWN' END,
 				  CASE WHEN batches > 0 THEN ', groups in batches' ELSE '' END,
 				  CASE WHEN decoded THEN ', decoded' ELSE '' END,
 				  CASE WHEN spills > 0 THEN ', tally spilled' ELSE '' END,
-				  rechecked, nrows,
+				  nrows,
 				  CASE WHEN ndiff = 0 THEN 'same as the sequential scan' ELSE 'DIFFERENT' END);
 END $$;
 
 -- ---------- the recheck queues of a grouped walk ----------
 -- 60 groups of some 600 rows the WHERE keeps, on pages no VACUUM has made
--- all-visible, so every row goes to the heap through its group's queue.  At
+-- all-visible, so rows go to the heap through their group's queue (all of
+-- them up to 18; from 19 on-access pruning sets some pages' bits).  At
 -- 64kB a batch is some thirty groups (the open budget's floor, 256 kB, of
 -- page images), and each queue's share of the 64 kB a few hundred TIDs, less
 -- than the heap block's worth a share holds at the least: each queue is
