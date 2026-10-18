@@ -1552,7 +1552,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    at most `work_mem` worth of TIDs (floor: a few thousand). When it fills up, the batch it holds is
    rechecked right there, its visible rows are added to the running total and the list starts over;
    the flush waits for a heap-block boundary, so no block is pinned twice and `blocks_rechecked`
-   stays exact. Without a bound, 20M candidates - which a standby produces for any 20M-row posting
+   stays exact - the first boundary past which the next block might not fit (a block puts at most
+   `LION_RECHECK_BLOCK_TIDS`, 512 at 8 kB pages, on the list), so the list never outgrows its budget.
+   It used to fill to the budget and then to the end of the block it was on, a step of 1024 TIDs
+   more, which every queue of a grouped walk (§10) took past its share (2026-10 review). Without a
+   bound, 20M candidates - which a standby produces for any 20M-row posting
    set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
    allocation.
    Flushing mid-merge does not weaken the interlock above: the ordering rule is that the VM question
@@ -2377,8 +2381,12 @@ walk of container keys (`lion_count_groups_copy()`, lion_count_groups.c):
   blocks is counted without the intersection being built; otherwise it is built and counted as
   every container is (`lion_count_container_masks()`, the second half of
   `lion_count_container_vm()`), its dirty blocks' TIDs queued for the heap in the group's own
-  recheck queue, which takes a share of one count's budget. The queues are flushed group by group
-  after the walk and share the visibility cache as the groups' counts did, each a count begun;
+  recheck queue, which takes a share of one count's budget: the shares add up to it, each a heap
+  block's TIDs at the least (§9, step 5), a floor that binds only below the open budget's own floor
+  of 256 kB. The floor used to be one count's, 4096 TIDs a group - 256 groups held 6 MB of queues
+  at the default work_mem of 4 MB (2026-10 review). A queue that fills is flushed where it is, and
+  the queues are flushed group by group after the walk; they share the visibility cache as the
+  groups' counts did, each a count begun;
 - where the copy has no container, the groups below its next key are sought to it, and after a key
   each group standing there goes straight to the copy's next key - a step where that is the next
   key, a seek (§22) past the keys between otherwise.
