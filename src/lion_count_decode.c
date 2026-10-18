@@ -55,6 +55,17 @@ lion_tally_hash_code(uint64 k)
 	return (uint32) k;
 }
 
+/*
+ * The most members the hash holds before it spills, whatever hash_mem says:
+ * simplehash counts them in a uint32 and stops growing at 2^32 buckets,
+ * which it fills to 98% at most.  Past it the quotient of hash_mem by the
+ * entries' size was cast to a uint32 and wrapped - at 192 GB of hash_mem it
+ * came out 0, and the tally spilled at every new combination (2026-10
+ * review).  2^31 members take a table of 2^32 buckets, 96 GB, as much as the
+ * hash_mem at which this bound begins to apply.
+ */
+#define LION_DECODE_TALLY_MAX_ENTS	((Size) PG_INT32_MAX)
+
 #define SH_PREFIX		lion_tally
 #define SH_ELEMENT_TYPE	LionTallyEnt
 #define SH_KEY_TYPE		uint64
@@ -147,8 +158,9 @@ lion_decode_tally_begin(LionDecodeTally *t, int ncol, const int *radix)
 	{
 		t->dense = NULL;
 		t->hash = lion_tally_create(t->cxt, 256, NULL);
-		t->maxents = (uint32) Max(t->maxbytes / (2 * sizeof(LionTallyEnt)),
-								  (Size) 1024);
+		t->maxents = (uint32)
+			Min(Max(t->maxbytes / (2 * sizeof(LionTallyEnt)), (Size) 1024),
+				LION_DECODE_TALLY_MAX_ENTS);
 	}
 	return true;
 }
@@ -333,11 +345,21 @@ lion_decode_recheck_flush(LionDecodeRecheck *rc)
 }
 
 /*
+ * What the list keeps a row: its TID, its combination and the heap's answer.
+ * Its budget is work_mem of those (lion_recheck_budget_for()): sized by the
+ * TID alone, and doubled past it, it took two and a half to five times
+ * work_mem (2026-10 review).
+ */
+#define LION_DECODE_RECHECK_ENTRY \
+	(sizeof(ItemPointerData) + sizeof(uint64) + sizeof(bool))
+
+/*
  * One row for the heap to decide on, with its combination.  The rows come key
  * by key and in lo order inside a key, so the list is in TID order; it is
- * rechecked, and emptied, once it holds its budget - at a block boundary, as
- * lion_recheck_add() does, and for the reason given there, which holds here:
- * the map has been asked about every block of it already, under the pins.
+ * rechecked, and emptied, before it outgrows its budget - at a block
+ * boundary, as lion_recheck_add() does, and for the reason given there, which
+ * holds here: the map has been asked about every block of it already, under
+ * the pins.
  */
 static void
 lion_decode_recheck_add(LionDecodeRecheck *rc, uint32 ckey, uint32 lo,
@@ -347,7 +369,8 @@ lion_decode_recheck_add(LionDecodeRecheck *rc, uint32 ckey, uint32 lo,
 	ItemPointerData tid;
 
 	lion_code_to_tid(((uint64) ckey << LION_CONTAINER_BITS) | lo, &tid);
-	if (cx->ntids >= cx->batchmax &&
+	if (cx->ntids > 0 &&
+		cx->ntids + LION_RECHECK_BLOCK_TIDS > cx->batchmax &&
 		ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
 		ItemPointerGetBlockNumber(&tid))
 		lion_decode_recheck_flush(rc);
@@ -355,7 +378,12 @@ lion_decode_recheck_add(LionDecodeRecheck *rc, uint32 ckey, uint32 lo,
 	if (cx->ntids >= rc->cap)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(cx->cxt);
-		int			newcap = (rc->cap == 0) ? 1024 : rc->cap * 2;
+		int			newcap = (rc->cap == 0) ? Min(1024, cx->batchmax) :
+			Min(rc->cap * 2, cx->batchmax);
+
+		/* a block larger than the budget: no budget is that small */
+		if (newcap <= rc->cap)
+			newcap = rc->cap + LION_RECHECK_BLOCK_TIDS;
 
 		if (rc->cap == 0)
 		{
@@ -527,7 +555,7 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 	base.filter = (cache != NULL) ? cache->filter : NULL;
 	if (base.filter != NULL && base.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
-	base.batchmax = lion_recheck_budget();
+	base.batchmax = lion_recheck_budget_for(LION_DECODE_RECHECK_ENTRY);
 
 	memset(&rc, 0, sizeof(rc));
 	rc.cx = &base;
