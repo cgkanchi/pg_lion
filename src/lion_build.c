@@ -1953,8 +1953,9 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 			BufFileReadExact(sum->file, &hdr, sizeof(hdr));
 			if (hdr.rawlen > rawcap)
 			{
-				rawcap = (Size) hdr.rawlen;
-				raw = (char *) MemoryContextAlloc(sum->cxt, rawcap);
+				/* as lion_sum_key_done() grows lastraw, not a new one a key */
+				rawcap = Max((Size) hdr.rawlen, rawcap * 2);
+				raw = (char *) repalloc(raw, rawcap);
 			}
 			BufFileReadExact(sum->file, raw, hdr.rawlen);
 
