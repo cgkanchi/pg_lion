@@ -17990,6 +17990,13 @@ that outgrows hash_mem writes its entries to a temporary file and starts again, 
 memory is bounded whatever the planner estimated. The same combination may then come out more than
 once, which is why the node's rows are PARTIAL counts under a Finalize HashAggregate, as a
 partitioned table's are (§16): core adds them up, and spills to disk itself if the groups do not fit.
+The hash holds at most 2^31 entries, whatever hash_mem says (`LION_DECODE_TALLY_MAX_ENTS`: a
+simplehash counts its members in a uint32): its bound was hash_mem over twice an entry's 24 bytes,
+cast to a uint32, which wrapped past 192 GB - at exactly that it came out 0, and the tally spilled at
+every new combination, right but at a write a row (2026-10 review). The rows the heap has to decide
+wait in a list of their TID, combination and answer, 15 bytes a row, which holds at most work_mem
+of them (§9, step 5); sized by the TID alone and doubled past that, it took two and a half to five
+times work_mem.
 
 **Chunks and passes** (`LionDecodeRun`, lion_exec_count.c). Each column's values are read off its
 entry walk (§21) a chunk at a time: column 0's as many as a batch of groups may pin
