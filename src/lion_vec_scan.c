@@ -1692,14 +1692,15 @@ lv_check_placed(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
  * Whether this scan reads vectors by their places in TOAST (DESIGN.md
  * §44.13): an index that keeps a locator, pg_lion.vector_toast_direct on,
  * a heap of the heap access method whose TOAST relation is the one the
- * index was built over, a regular MVCC snapshot, and, on 16, no
- * old_snapshot_threshold, under which a value an old snapshot sees may be
- * gone with no error to say so from a read by place.  Then the exact path
- * reads its members so, from the locator (lv_exact_places()), and the
- * rerank, in an index whose REFINE items hold places, the rows it reranks
- * (lv_rerank_placed()).  The TOAST relation is opened once, locked as a
- * detoast locks it, which keeps it from being truncated or rewritten while
- * the transaction lasts, so its blocks counted now bound every place read.
+ * index was built over, and a regular MVCC snapshot.  (No scan gets here
+ * under 16's old_snapshot_threshold, which would let a value an old
+ * snapshot sees be gone with no error from a read by place: lv_start()
+ * refuses it first.)  Then the exact path reads its members so, from the
+ * locator (lv_exact_places()), and the rerank, in an index whose REFINE
+ * items hold places, the rows it reranks (lv_rerank_placed()).  The TOAST
+ * relation is opened once, locked as a detoast locks it, which keeps it
+ * from being truncated or rewritten while the transaction lasts, so its
+ * blocks counted now bound every place read.
  */
 static void
 lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
@@ -1719,7 +1720,6 @@ lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
 		!OidIsValid(heap->rd_rel->reltoastrelid) ||
 		heap->rd_rel->reltoastrelid != so->meta.toastrelid ||
 		so->info->dims <= 0 || so->meta.dims != so->info->dims ||
-		lion_old_snapshot_threshold_active() ||
 		!IsMVCCSnapshot(scan->xs_snapshot))
 		return;
 	extsize = lionvec_toast_extsize(so->info->dims, so->info->half);
@@ -3942,6 +3942,27 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("lionvec index \"%s\" can only be scanned with an MVCC snapshot",
 						RelationGetRelationName(index))));
+
+	/*
+	 * Nor at all while PostgreSQL 16's old_snapshot_threshold is set
+	 * (DESIGN.md §9, "old_snapshot_threshold"; §44.5).  VACUUM then removes
+	 * the items of rows an old snapshot still sees, which core's access
+	 * methods notice by testing every page they read (TestForOldSnapshot())
+	 * and lionvec does not - nor does its heap fetch, 16's
+	 * heap_hot_search_buffer() testing no page - so such a row would be
+	 * missing without a word.  The planner prices every lionvec path out
+	 * (lionveccostestimate()); a plan with nothing else left stops here,
+	 * before the scan reads a page, in each process of a parallel scan.  The
+	 * snapshot is not known yet in ambeginscan (index_beginscan() sets it
+	 * after), which is why the refusal is in the call that reads.
+	 */
+	if (lion_old_snapshot_threshold_active())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("lionvec index \"%s\" cannot be read while old_snapshot_threshold is set",
+						RelationGetRelationName(index)),
+				 errdetail("A lionvec index does not detect \"snapshot too old\", so it could miss rows an old snapshot must see."),
+				 errhint("Set old_snapshot_threshold to -1 and restart the server.")));
 
 	so->info = lionvec_get_info(index);
 	so->metric = so->info->metric;

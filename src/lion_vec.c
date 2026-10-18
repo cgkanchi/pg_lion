@@ -5105,6 +5105,21 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 */
 	lionvec_order_cost(path, indexStartupCost, indexTotalCost, &ranking,
 					   indexPages);
+
+	/*
+	 * No lionvec index may be read while PostgreSQL 16's
+	 * old_snapshot_threshold is set (DESIGN.md §9, §44.5; lv_start()): every
+	 * order on one priced out of the running, the way 16 prices a disabled
+	 * scan and lioncostestimate() a lion path - a sort of the rows wins.  A
+	 * plan that has nothing else left still gets it, and stops at the scan's
+	 * ERROR.  lion_vec_parallel_cost() takes only its own terms back off a
+	 * partial path, so the partial paths keep it too.
+	 */
+	if (lion_old_snapshot_threshold_active())
+	{
+		*indexStartupCost += disable_cost;
+		*indexTotalCost += disable_cost;
+	}
 }
 
 /* ----------------------------------------------------------------

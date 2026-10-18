@@ -809,10 +809,11 @@ every source it intersects. The SQL count functions require SELECT
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
-the setting) does not read lion indexes at all: lion does not detect "snapshot too old", so the
-planner prices them out and declines the count pushdown and `LionOrdered`, and a scan or SQL count
-that reaches one anyway fails with an error rather than return a different answer than the
-snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
+the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
+the planner prices them out and declines the count pushdown and `LionOrdered` - a filtered
+nearest-neighbour query is then planned as a sort, under every `pg_lion.vector_postfilter` - and a
+scan or SQL count that reaches one anyway fails with an error rather than return a different answer
+than the snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
 It has no search operators, no bitmap or index-only scans and no INCLUDE columns, scans in
