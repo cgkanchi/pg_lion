@@ -226,6 +226,21 @@ in-place insert, a replacement and VACUUM's delete), and the directory entry a r
 whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
 
+The 2026-10-18 review's damaged pages added two checks to that list. The entry a record rewrites
+is exactly one of INLINE and CHAIN (`lion_page_entry_fetch()`, verify()'s rule): every writer
+picks its path by those flags while the header form follows CHAIN alone, so an entry flagged both,
+at a CHAIN entry's length, passed every check, went down the INLINE path of an insert of its key
+and was rewritten, damage and all, in a record. And a page a record only ADDS an item to has its
+header checked first (`lion_page_check_header()`, before the add of a directory entry, of a
+posting leaf's item and of a posting downlink; `lionvec_check_page()` for every lionvec page,
+§44.5): `PageAddItemExtended()` answers a header it finds damaged with a PANIC of its own, in
+either WAL mode, and the buffer manager's check of a page it reads (`PageIsVerifiedExtended()`)
+lets in a `pd_lower` below the end of the header - one of the things it PANICs on - with which the
+page reads as one with no items and room to spare. `test/sql/corrupt_records.sql` and
+`test/sql/vector_corrupt_records.sql`, which damage the file and have the server read it back by
+moving the index to another tablespace (`ALTER INDEX ... SET TABLESPACE` copies the FILE, after
+writing out only what is dirty), and so run on PostgreSQL 16 as well.
+
 **Whole-bitset kernels** (2026-09-30). Every pass over all 512 words of a BITSET that counts what it
 sees is one call of a fused kernel (lion_container.c, "whole-bitset kernels"), which reads the
 operands, writes the result if the operation has one and counts, in the same pass:
@@ -1568,7 +1583,11 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    at most `work_mem` worth of TIDs (floor: a few thousand). When it fills up, the batch it holds is
    rechecked right there, its visible rows are added to the running total and the list starts over;
    the flush waits for a heap-block boundary, so no block is pinned twice and `blocks_rechecked`
-   stays exact. Without a bound, 20M candidates - which a standby produces for any 20M-row posting
+   stays exact - the first boundary past which the next block might not fit (a block puts at most
+   `LION_RECHECK_BLOCK_TIDS`, 512 at 8 kB pages, on the list), so the list never outgrows its budget.
+   It used to fill to the budget and then to the end of the block it was on, a step of 1024 TIDs
+   more, which every queue of a grouped walk (§10) took past its share (2026-10 review). Without a
+   bound, 20M candidates - which a standby produces for any 20M-row posting
    set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
    allocation.
    Flushing mid-merge does not weaken the interlock above: the ordering rule is that the VM question
@@ -2396,8 +2415,12 @@ walk of container keys (`lion_count_groups_copy()`, lion_count_groups.c):
   blocks is counted without the intersection being built; otherwise it is built and counted as
   every container is (`lion_count_container_masks()`, the second half of
   `lion_count_container_vm()`), its dirty blocks' TIDs queued for the heap in the group's own
-  recheck queue, which takes a share of one count's budget. The queues are flushed group by group
-  after the walk and share the visibility cache as the groups' counts did, each a count begun;
+  recheck queue, which takes a share of one count's budget: the shares add up to it, each a heap
+  block's TIDs at the least (§9, step 5), a floor that binds only below the open budget's own floor
+  of 256 kB. The floor used to be one count's, 4096 TIDs a group - 256 groups held 6 MB of queues
+  at the default work_mem of 4 MB (2026-10 review). A queue that fills is flushed where it is, and
+  the queues are flushed group by group after the walk; they share the visibility cache as the
+  groups' counts did, each a count begun;
 - where the copy has no container, the groups below its next key are sought to it, and after a key
   each group standing there goes straight to the copy's next key - a step where that is the next
   key, a seek (§22) past the keys between otherwise.
@@ -4071,7 +4094,9 @@ What changed, each where the cost was:
   16, or the limit itself where that is smaller - 2026-09-29 review), so that a list's leaf pins and
   its cursors' page pins come out of ONE limit per backend. The
   plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
-  buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
+  buffer or page image, an OR's heap entries and accumulators, a `LION_KN_POSFILTER`'s filter (§17,
+  "Stored positions": `lion_posfilter_mem()`, which grows with its query) - and decides the three
+  shapes below.
   An ordinary query is under the budget everywhere and is built exactly as before; the plan also
   carries each node's `pinned`, the §9 property the count needs of one positive source, so the
   shape and the interlock are one decision.
@@ -5339,6 +5364,23 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     it sees an ordinary built container; the child stands at the key while its positions are
     read, so its pins carry §9 as any node's do, and a wide union opens the node a window at a
     time like any child.  Its cost is the filter's, per candidate, as above.
+  - **What a filter holds** grows with its query, and the node is charged that against the open
+    budget (§15, "Bounded cursors"; `lion_posfilter_mem()`): a cursor per distinct lexeme, each a
+    copy of its position tree's leaf and a pointer per item that leaf may have (24 kB) or an INLINE
+    entry's chunk - which of them is not known before the entry is read, so every operand is
+    charged a tree's - beside the filter's two member arrays (128 kB). So an OR of filters too big
+    for work_mem is read as a windowed union, one filter open at a time. The charge used to be a
+    flat 160 kB, and a phrase of a thousand lexemes allocated 24 MB under it (2026-10 review). The
+    filter is in a memory context of its own, of sizes aset.c keeps no deleted context for
+    (`LION_POSFILTER_CXT_SIZES`), so that what it holds is the same whatever context it is begun
+    in and whatever the backend did before, and the charge is an upper bound of it: every buffer
+    and array past 512 bytes is a block of its own, its size and the headers. A recycled small
+    context keeps the chunk limit of the context it was first, and one first begun to grow to
+    8 MB put each 8 kB leaf in a block of 16 kB, so that the same filter held a third more in
+    one session than in another. What only finding the cursors' keys takes - the opclass's
+    extracted keys, the entry lookups - goes with a context of its own when the filter begins,
+    and what `TS_execute()` allocates for a candidate - a phrase's positions - goes after each
+    candidate, not after each container's thousands of them.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
@@ -5655,10 +5697,14 @@ rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into th
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
 below).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
-those and nothing else.  A page of a LIVE set is never mistaken for a leak, because pass 2 visits
-every page of every chain it found, and a chain created after pass 1 read its bucket page has no
-empty page in it (a spill and a split both fill every page they allocate inside the record that
-allocates it, under the lock they hold throughout) and names a root that is live.
+those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
+page it reads passes the cost-based delay first, as every page the walk reads does (since the
+2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
+free pages neither answered a cancel nor paced its reads and records).  A page of a LIVE set is
+never mistaken for a leak, because pass 2 visits every page of every chain it found, and a chain
+created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
+every page they allocate inside the record that allocates it, under the lock they hold
+throughout) and names a root that is live.
 lion_index_stats() reports deleted_pages; VACUUM is told the counts below.
 
 **Page counts** (2026-09-25 review).  IndexBulkDeleteResult has three: `pages_newly_deleted`,
@@ -8336,7 +8382,8 @@ page in shared buffers that no record describes. Everything fallible therefore
 has to happen BEFORE the record opens - which includes looking at the line
 pointers the record is going to move, overwrite or delete items by (§3,
 2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
-`lion_page_entry_fetch()`). Three consequences, all of them
+`lion_page_entry_fetch()`), and the header of a page it only adds an item to
+(§3, 2026-10-18: `lion_page_check_header()`). Three consequences, all of them
 deviations from what this section assumed:
 
 - `lion_new_buffer_xl()` is gone. Allocating a page is split into
@@ -16733,14 +16780,17 @@ more. A bucket's codes are collected in an array, which switches to an INT8 tupl
 of `maintenance_work_mem` past an eighth (one key of a column with few keys can be most of the
 table), freeing the array; the spool leaves the summaries that quarter of its budget (§24
 "Build"). A closed bucket is sorted, run through a collecting builder into the same items a
-posting set is made of, and put aside in a temporary BufFile after a header naming its key. A
-full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not when it fills, so that
-when the column's values are done (`lion_sum_finish()`) there is always a last bucket, and it is
-closed as the SUMLAST whatever its size - a column with rows always has its open bucket (one that
-filled exactly at the last key used to be closed as a regular summary, and the column had none);
-`auto` decides, and the file is replayed through ordinary builders into entries written after the
-column's values - which is where they sort. The build's DEBUG1 line reports the buckets per column
-and whether they were kept.
+posting set is made of, and put aside in a temporary BufFile after a header naming its key; the
+array's sort (a `sort_template.h` sort that checks for interrupts as it partitions, not `qsort()`)
+and both loops over the codes answer a cancel, the loops every 64K codes as the pass's own loop
+does (`lion_sum_close_bucket()`, since the 2026-10-18 review: a bucket of millions of codes had
+no check at all). A full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not
+when it fills, so that when the column's values are done (`lion_sum_finish()`) there is always a
+last bucket, and it is closed as the SUMLAST whatever its size - a column with rows always has
+its open bucket (one that filled exactly at the last key used to be closed as a regular summary,
+and the column had none); `auto` decides, and the file is replayed through ordinary builders into
+entries written after the column's values - which is where they sort. The build's DEBUG1 line
+reports the buckets per column and whether they were kept.
 
 ### Insert (lion_insert.c)
 
@@ -18007,6 +18057,13 @@ that outgrows hash_mem writes its entries to a temporary file and starts again, 
 memory is bounded whatever the planner estimated. The same combination may then come out more than
 once, which is why the node's rows are PARTIAL counts under a Finalize HashAggregate, as a
 partitioned table's are (§16): core adds them up, and spills to disk itself if the groups do not fit.
+The hash holds at most 2^31 entries, whatever hash_mem says (`LION_DECODE_TALLY_MAX_ENTS`: a
+simplehash counts its members in a uint32): its bound was hash_mem over twice an entry's 24 bytes,
+cast to a uint32, which wrapped past 192 GB - at exactly that it came out 0, and the tally spilled at
+every new combination, right but at a write a row (2026-10 review). The rows the heap has to decide
+wait in a list of their TID, combination and answer, 15 bytes a row, which holds at most work_mem
+of them (§9, step 5); sized by the TID alone and doubled past that, it took two and a half to five
+times work_mem.
 
 **Chunks and passes** (`LionDecodeRun`, lion_exec_count.c). Each column's values are read off its
 entry walk (§21) a chunk at a time: column 0's as many as a batch of groups may pin
@@ -20475,7 +20532,10 @@ page that holds no member (§44.6).
   `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
   `maintenance_work_mem` 1 GB, 60,000 partitions (the heap scans take 8 s): before, the build ran
   on past 150 s of a 60 s `statement_timeout` and a cancel, and took `kill -9`; after, it stops at
-  10.02 s of a 10 s one and 60.01 s of a 60 s one. The second heap scan, which finds each row's
+  10.02 s of a 10 s one and 60.01 s of a 60 s one. The coding of the FINAL centroids after
+  k-means, each one's REFINE item put as it is coded (`lionvec_build_centroids()`), checks once a
+  centroid as well since the 2026-10-18 review; it had no check, which at `LIONVEC_MAX_PARTS` =
+  262,144 partitions of many dimensions is seconds. The second heap scan, which finds each row's
   partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
   for another reason found measuring the first: the build kept the REFINE page it was filling
   locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned
@@ -21245,7 +21305,15 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   (a negative length makes a bound whose lower end lies past its upper, and the ranking of an
   insert's candidates come up short, which is checked too), and the PART chain's numbering against
   the meta page's count; chain cycles (`lionvec_chain_step()`); the meta page's fields. Each is
-  ERRCODE_INDEX_CORRUPTED, never a crash.
+  ERRCODE_INDEX_CORRUPTED, never a crash. Every page's header is within the bounds
+  `PageAddItemExtended()` PANICs outside of (`lionvec_check_page()`, §3, 2026-10-18). And an insert,
+  which holds the meta page from its first page to its last, refuses a block it is about to read
+  that names the meta page - a chain end or `refine_tail` on the meta page, a PART item's tail or
+  centroid, a REGION item's run, a chain's next link - as it refuses a LOC tail that is also the
+  LOCDIR tail and a partition's tail that is its PART page, BEFORE the lock
+  (`lionvec_insert_readbuf()`): a buffer content lock is not reentrant, and the second one waited
+  for this very backend with interrupts held off, which only a restart of the server ended
+  (`test/sql/vector_corrupt_records.sql`).
 
 ### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
 
@@ -22593,6 +22661,11 @@ faster from the disk and the same warm, and the inline table's queries took main
 - **vector_toast.sql**, **vector_toast_corrupt.sql**, **test/isolation/lionvec_toast_scan.spec**
   and test/recovery's phase 5 (2026-10-17): vectors in TOAST read by their chunks' places, and
   every history and damage that can make a place wrong (§44.13, "Tests").
+- **vector_corrupt_records.sql** (2026-10-18): an insert into an index whose meta page names
+  itself as the NULL chain's end and as `refine_tail`, which waited for its own lock for ever, and
+  into a CODE tail whose `pd_lower` is inside the page header, which PANICked: each an ERROR now
+  (§44.5, "Format checks"). On 16 too: the file is read back through `ALTER INDEX ... SET
+  TABLESPACE` (§3, 2026-10-18).
 - **test/modules/lion_hooktest/sql/oldsnapshot_vector.sql** (2026-10-18; `make hookcheck` on 16
   with pgvector, next to oldsnapshot.sql on its server started with `old_snapshot_threshold = 60`,
   §44.5): a plain order and a filtered one (no LionOrdered, and no error under `error`) planned as

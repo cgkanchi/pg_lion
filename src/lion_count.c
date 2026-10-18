@@ -49,9 +49,20 @@ typedef struct LionRecheckCollector
 int
 lion_recheck_budget(void)
 {
-	int64		budget = ((int64) work_mem * INT64CONST(1024)) /
-		(int64) sizeof(ItemPointerData);
+	return lion_recheck_budget_for(sizeof(ItemPointerData));
+}
 
+/*
+ * ... for a list that keeps `entry` bytes a TID: the decoded walk's keeps
+ * each row's combination and the heap's answer beside it (DESIGN.md §34),
+ * and its budget is work_mem of those, not of the TIDs alone.
+ */
+int
+lion_recheck_budget_for(Size entry)
+{
+	int64		budget = ((int64) work_mem * INT64CONST(1024)) / (int64) entry;
+
+	Assert(entry >= sizeof(ItemPointerData));
 	if (budget < LION_RECHECK_MIN_BATCH)
 		budget = LION_RECHECK_MIN_BATCH;
 	if (budget > LION_RECHECK_MAX_BATCH)
@@ -90,12 +101,21 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 	 *
 	 * The only cost of an early flush is that a heap block whose TIDs
 	 * straddle two batches is pinned twice, so the flush waits for a block
-	 * boundary; that also keeps blocks_rechecked exact.
+	 * boundary; that also keeps blocks_rechecked exact.  It comes at the
+	 * first boundary past which the next block might not fit - a block puts
+	 * at most LION_RECHECK_BLOCK_TIDS on the list - so that the list never
+	 * outgrows batchmax: it used to fill to batchmax and then to the end of
+	 * the block it was on, a step of LION_RECHECK_GROW_TIDS more, which the
+	 * hundreds of queues of a grouped walk (lion_count_groups_copy()) each
+	 * took past their share (2026-10 review).  A list out of order has no
+	 * blocks to wait for, and is flushed when it is full.
 	 */
-	if (cx->ntids >= cx->batchmax &&
-		(!cx->tids_sorted ||
-		 ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
-		 ItemPointerGetBlockNumber(&tid)))
+	if (cx->ntids > 0 &&
+		(cx->tids_sorted ?
+		 (cx->ntids + LION_RECHECK_BLOCK_TIDS > cx->batchmax &&
+		  ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
+		  ItemPointerGetBlockNumber(&tid)) :
+		 cx->ntids >= cx->batchmax))
 		lion_recheck_flush(cx);
 
 	if (cx->ntids >= cx->maxtids)
@@ -108,7 +128,10 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 		else if (cx->maxtids < cx->batchmax)
 			newmax = Min(cx->maxtids * 2, cx->batchmax);
 		else
-			newmax = cx->maxtids + LION_RECHECK_GROW_TIDS;	/* a long block */
+		{
+			/* a block larger than the budget: no budget is that small */
+			newmax = cx->maxtids + LION_RECHECK_GROW_TIDS;
+		}
 
 		if (cx->tids == NULL)
 			cx->tids = (ItemPointerData *)

@@ -1764,14 +1764,19 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 	sum->codes[sum->ncodes++] = code;
 }
 
-static int
-lion_sum_code_cmp(const void *a, const void *b)
-{
-	uint64		x = *(const uint64 *) a;
-	uint64		y = *(const uint64 *) b;
-
-	return (x < y) ? -1 : (x > y) ? 1 : 0;
-}
+/*
+ * The sort of a bucket's array of codes, which is up to LION_SUM_SHARE_KB
+ * kilobytes of them - millions at a large maintenance_work_mem - and so has to
+ * answer a cancel: the template checks for interrupts as it partitions, where
+ * qsort() with a comparison function did not check at all.
+ */
+#define ST_SORT lion_sum_sort_codes
+#define ST_ELEMENT_TYPE uint64
+#define ST_COMPARE(a, b) ((int) (*(a) > *(b)) - (int) (*(a) < *(b)))
+#define ST_CHECK_FOR_INTERRUPTS
+#define ST_SCOPE static
+#define ST_DEFINE
+#include "lib/sort_template.h"
 
 /*
  * Close the bucket being collected: its codes in ascending order, grouped into
@@ -1790,6 +1795,7 @@ lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
 	uint32		end = LION_SUM_END_OF_ITEMS;
 	uint64		prev = 0;
 	bool		any = false;
+	uint64		nseen = 0;
 
 	if (sum->ncodes == 0)
 		return;
@@ -1812,6 +1818,13 @@ lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
 	lion_sparse_init(b->seg, 0);
 	b->tofile = sum->file;
 
+	/*
+	 * A bucket is summary_tids codes and a key's worth more, and one key can
+	 * be any number of rows (lion_sum_begin()): both loops below check for
+	 * interrupts every 64K codes, as the build's loop over a key's codes does
+	 * (lion_build_emit()), and the array's sort checks as it goes.  Nothing
+	 * is locked here; the items go to the file.
+	 */
 	if (sum->sort != NULL)
 	{
 		Datum		val;
@@ -1822,6 +1835,8 @@ lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
 		{
 			uint64		code = (uint64) DatumGetInt64(val);
 
+			if ((++nseen & 0xFFFF) == 0)
+				CHECK_FOR_INTERRUPTS();
 			if (any && code == prev)
 				continue;
 			lion_builder_add(bs, b, code);
@@ -1840,10 +1855,11 @@ lion_sum_close_bucket(LionBuildState *bs, LionSumBuild *sum, bool last)
 		 * arrive in - hands its buckets over already sorted.
 		 */
 		if (!sum->sorted)
-			qsort(sum->codes, (size_t) sum->ncodes, sizeof(uint64),
-				  lion_sum_code_cmp);
+			lion_sum_sort_codes(sum->codes, (size_t) sum->ncodes);
 		for (i = 0; i < sum->ncodes; i++)
 		{
+			if ((++nseen & 0xFFFF) == 0)
+				CHECK_FOR_INTERRUPTS();
 			if (any && sum->codes[i] == prev)
 				continue;
 			lion_builder_add(bs, b, sum->codes[i]);
@@ -1953,8 +1969,9 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
 			BufFileReadExact(sum->file, &hdr, sizeof(hdr));
 			if (hdr.rawlen > rawcap)
 			{
-				rawcap = (Size) hdr.rawlen;
-				raw = (char *) MemoryContextAlloc(sum->cxt, rawcap);
+				/* as lion_sum_key_done() grows lastraw, not a new one a key */
+				rawcap = Max((Size) hdr.rawlen, rawcap * 2);
+				raw = (char *) repalloc(raw, rawcap);
 			}
 			BufFileReadExact(sum->file, raw, hdr.rawlen);
 

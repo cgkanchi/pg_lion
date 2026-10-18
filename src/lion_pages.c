@@ -418,14 +418,20 @@ lion_page_item_fetch(Relation index, Page page, BlockNumber blkno,
  *	  items, moves them to a new page or rewrites several of them;
  *	- lion_page_check_alone(), the one item a record overwrites or deletes in
  *	  place;
- *	- lion_page_entry_fetch(), the directory entry a record rewrites.
+ *	- lion_page_entry_fetch(), the directory entry a record rewrites;
+ *	- lion_page_check_header(), the page header, before a record that adds
+ *	  an item to a page it has not checked otherwise.  PageAddItemExtended()
+ *	  tests the header itself and answers a damaged one with a PANIC, in
+ *	  either WAL mode, and the buffer manager's check of a page it reads
+ *	  (PageIsVerifiedExtended()) lets through a pd_lower below the end of
+ *	  the header, which is one of the things it PANICs on.
  *
  * A container item has been through lion_page_item_fetch() as well, which
  * bounds what its line pointer may claim beyond its size.
  */
 
 /* The header bounds, as bufpage.c tests them before it moves anything. */
-static void
+void
 lion_page_check_header(Relation index, Page page, BlockNumber blkno)
 {
 	PageHeader	phdr = (PageHeader) page;
@@ -576,7 +582,11 @@ lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
  * for the key the header gives - and, for a CHAIN entry, exactly that long,
  * which is what lion_index_verify() requires of one and what every record
  * that rewrites one relies on (lion_put_entry(): the entry keeps its size, so
- * "this cannot fail", inside a critical section).
+ * "this cannot fail", inside a critical section).  And it is exactly one of
+ * INLINE and CHAIN, as verify() requires too: every writer of an entry picks
+ * its path by those flags, and the header form follows CHAIN alone, so an
+ * entry flagged both, at a CHAIN entry's length, passed everything above and
+ * went down the INLINE path, which rewrote it - damage and all - in a record.
  */
 /* lion_entry_at()'s ERROR, out of line */
 void
@@ -623,6 +633,14 @@ lion_page_entry_fetch(Relation index, Page page, BlockNumber blkno,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": entry %u on block %u is %zu bytes, too small for its header and key",
 						RelationGetRelationName(index), off, blkno, len)));
+	if (unlikely((entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN)) !=
+				 LION_ENTRY_INLINE &&
+				 (entry->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN)) !=
+				 LION_ENTRY_CHAIN))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": entry %u on block %u has flags 0x%04X, expected exactly one of INLINE and CHAIN",
+						RelationGetRelationName(index), off, blkno, entry->flags)));
 	if (unlikely((entry->flags & LION_ENTRY_CHAIN) != 0 &&
 				 len != LionEntryPayloadOffset(entry)))
 		ereport(ERROR,
