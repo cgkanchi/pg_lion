@@ -1191,7 +1191,7 @@ typedef struct LionPosSpec
 	LionState  *col;
 	Datum		query;
 	StrategyNumber strategy;
-	Size		mem;			/* what each such filter holds, about
+	Size		mem;			/* what each such filter holds, at most
 								 * (lion_posfilter_mem()) */
 } LionPosSpec;
 

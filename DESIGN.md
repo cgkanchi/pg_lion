@@ -5336,11 +5336,17 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     entry's chunk - which of them is not known before the entry is read, so every operand is
     charged a tree's - beside the filter's two member arrays (128 kB). So an OR of filters too big
     for work_mem is read as a windowed union, one filter open at a time. The charge used to be a
-    flat 160 kB, and a phrase of a thousand lexemes allocated 24 MB under it (2026-10 review). What
-    only finding the cursors' keys takes - the opclass's extracted keys, the entry lookups - goes
-    with a context of its own when the filter begins, and what `TS_execute()` allocates for a
-    candidate - a phrase's positions - goes after each candidate, not after each container's
-    thousands of them.
+    flat 160 kB, and a phrase of a thousand lexemes allocated 24 MB under it (2026-10 review). The
+    filter is in a memory context of its own, of sizes aset.c keeps no deleted context for
+    (`LION_POSFILTER_CXT_SIZES`), so that what it holds is the same whatever context it is begun
+    in and whatever the backend did before, and the charge is an upper bound of it: every buffer
+    and array past 512 bytes is a block of its own, its size and the headers. A recycled small
+    context keeps the chunk limit of the context it was first, and one first begun to grow to
+    8 MB put each 8 kB leaf in a block of 16 kB, so that the same filter held a third more in
+    one session than in another. What only finding the cursors' keys takes - the opclass's
+    extracted keys, the entry lookups - goes with a context of its own when the filter begins,
+    and what `TS_execute()` allocates for a candidate - a phrase's positions - goes after each
+    candidate, not after each container's thousands of them.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to
