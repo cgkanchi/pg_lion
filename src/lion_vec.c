@@ -632,6 +632,48 @@ lionvec_check_page(Relation index, Page page, BlockNumber blk, uint16 type)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a page of type %u where one of type %u belongs, at block %u",
 						RelationGetRelationName(index), op->type, type, blk)));
+
+	/*
+	 * The header within the bounds PageAddItemExtended() PANICs outside of -
+	 * on a GenericXLog copy as on the page itself.  The buffer manager's
+	 * check of a page it reads lets in a pd_lower below the end of the
+	 * header, and the page then reads as one with no items and room to
+	 * spare: the next row appended to such a tail PANICked (the
+	 * directory's lion_page_check_header(), lion_pages.c).
+	 */
+	if (unlikely(((PageHeader) page)->pd_lower < SizeOfPageHeaderData ||
+				 ((PageHeader) page)->pd_lower > ((PageHeader) page)->pd_upper ||
+				 ((PageHeader) page)->pd_upper > ((PageHeader) page)->pd_special))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a corrupt page header at block %u (lower %u, upper %u, special %u)",
+						RelationGetRelationName(index), blk,
+						((PageHeader) page)->pd_lower, ((PageHeader) page)->pd_upper,
+						((PageHeader) page)->pd_special)));
+}
+
+/*
+ * Block blk of the index, for an insert, which holds the meta page locked
+ * EXCLUSIVE from its first page to its last (lionvec_append()).  Every block
+ * it reads it has read off a page - the meta page's chain ends and
+ * refine_tail, a PART item's chain and centroid, a REGION item's run, a
+ * chain's next link - and one that damage has made the meta page's would
+ * lock that page a second time: a buffer content lock is not reentrant, and
+ * the wait, for this very backend, holds interrupts off, so it answered no
+ * cancel and no terminate, only a restart of the server.  So it is refused
+ * before the read, as the directory's lion_dir_held_link() refuses its own
+ * (lion_dir.c); a page of any other wrong kind is its check's to name, once
+ * it is locked.
+ */
+Buffer
+lionvec_insert_readbuf(Relation index, BlockNumber blk)
+{
+	if (unlikely(blk == LIONVEC_METAPAGE))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" links to its meta page where an insert follows a link",
+						RelationGetRelationName(index))));
+	return ReadBuffer(index, blk);
 }
 
 /*
@@ -1959,6 +2001,13 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 		lionvec_build_region_maker_free(&mk);
 	}
 
+	/*
+	 * Each centroid coded and its REFINE item put, checking for interrupts
+	 * once a centroid as every loop of k-means does (DESIGN.md §44.3): at
+	 * LIONVEC_MAX_PARTS partitions of many dimensions this is seconds.  The
+	 * REFINE page is locked only while an item goes in, so nothing is locked
+	 * at the check.
+	 */
 	bs->crblk = palloc(sizeof(BlockNumber) * k);
 	bs->croff = palloc(sizeof(OffsetNumber) * k);
 	ref = palloc0(rsize);
@@ -1967,6 +2016,7 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 		LionVecEncoded e;
 		float	   *c = bs->a.cent + (Size) j * dimsp;
 
+		CHECK_FOR_INTERRUPTS();
 		memcpy(w.x, c, sizeof(float) * dimsp);
 		e.bits = bs->a.cbits + (Size) j * nw;
 		e.codes = bs->a.ccodes + (Size) j * dimsp;
@@ -3782,7 +3832,7 @@ lionvec_cent_refine(Relation index, BlockNumber rblk, OffsetNumber roff,
 	ItemPointerData tid;
 	LionVecRefine *ref;
 
-	*buf = ReadBuffer(index, rblk);
+	*buf = lionvec_insert_readbuf(index, rblk);
 	LockBuffer(*buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(*buf);
 	lionvec_check_page(index, page, rblk, LIONVEC_PAGE_REFINE);
@@ -3896,7 +3946,7 @@ lionvec_insert_read_parts(Relation index, const LionVecMetaData *meta,
 
 		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &visited, &nblocks);
-		buf = ReadBuffer(index, blk);
+		buf = lionvec_insert_readbuf(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_PART);
@@ -3960,7 +4010,7 @@ lionvec_insert_read_run(Relation index, const LionVecMetaData *meta,
 					 errmsg("lionvec index \"%s\" has the PART chain end after %d of region %d's %d partitions",
 							RelationGetRelationName(index), got, regno, count)));
 		lionvec_chain_step(index, visited, nblocks);
-		buf = ReadBuffer(index, blk);
+		buf = lionvec_insert_readbuf(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_PART);
@@ -4029,7 +4079,7 @@ lionvec_insert_read_regions(Relation index, const LionVecMetaData *meta,
 
 		CHECK_FOR_INTERRUPTS();
 		lionvec_chain_step(index, &visited, &nblocks);
-		buf = ReadBuffer(index, blk);
+		buf = lionvec_insert_readbuf(index, blk);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		page = BufferGetPage(buf);
 		lionvec_check_page(index, page, blk, LIONVEC_PAGE_REGION);
@@ -4253,7 +4303,7 @@ lionvec_append_code(Relation index, Buffer metabuf, int dimsp,
 	Page		page;
 	GenericXLogState *state;
 
-	cbuf = ReadBuffer(index, dest->tail);
+	cbuf = lionvec_insert_readbuf(index, dest->tail);
 	LockBuffer(cbuf, BUFFER_LOCK_EXCLUSIVE);
 	lionvec_check_page(index, BufferGetPage(cbuf), dest->tail, LIONVEC_PAGE_CODE);
 	if (BlockNumberIsValid(LionVecPageGetOpaque(BufferGetPage(cbuf))->next))
@@ -4265,7 +4315,14 @@ lionvec_append_code(Relation index, Buffer metabuf, int dimsp,
 		nbuf = lionvec_new_buffer(index, MAIN_FORKNUM);
 	if (dest->partno >= 0 && BufferIsValid(nbuf))
 	{
-		pbuf = ReadBuffer(index, dest->pblk);
+		/* the tail, held, is a CODE page, and pblk was a PART page when read */
+		if (unlikely(dest->pblk == dest->tail))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lionvec index \"%s\" has partition %d's chain end on its PART page, block %u",
+							RelationGetRelationName(index), dest->partno,
+							dest->tail)));
+		pbuf = lionvec_insert_readbuf(index, dest->pblk);
 		LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
 		lionvec_check_page(index, BufferGetPage(pbuf), dest->pblk, LIONVEC_PAGE_PART);
 	}
@@ -4378,7 +4435,7 @@ lionvec_append(Relation index, const LionVecInfo *info, LionVecItems *it)
 
 		if (BlockNumberIsValid(meta.refine_tail))
 		{
-			rbuf = ReadBuffer(index, meta.refine_tail);
+			rbuf = lionvec_insert_readbuf(index, meta.refine_tail);
 			LockBuffer(rbuf, BUFFER_LOCK_EXCLUSIVE);
 			lionvec_check_page(index, BufferGetPage(rbuf), meta.refine_tail,
 							   LIONVEC_PAGE_REFINE);

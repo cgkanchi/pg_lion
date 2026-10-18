@@ -174,8 +174,19 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 	if (base.filter != NULL && base.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
 
-	/* each group's recheck queue takes its share of one count's */
-	batchmax = Max(lion_recheck_budget() / ngroups, LION_RECHECK_MIN_BATCH);
+	/*
+	 * Each group's recheck queue takes its share of one count's budget, and
+	 * the shares add up to that budget.  The floor of one count's,
+	 * LION_RECHECK_MIN_BATCH, is no floor of a share: 256 groups took 4096
+	 * TIDs each, 6 MB of queues at the default work_mem of 4 MB (2026-10
+	 * review).  A share holds a heap block's TIDs at the least, the fewest a
+	 * flush takes anyway, since it waits for a block boundary.  That floor
+	 * binds only where work_mem is below the open budget's floor
+	 * (LION_OPEN_MIN_BYTES), which then sizes the batch: above it,
+	 * lion_count_groups_batch() gives each group a page image out of
+	 * work_mem, and a page image is more bytes than a block's TIDs.
+	 */
+	batchmax = Max(lion_recheck_budget() / ngroups, LION_RECHECK_BLOCK_TIDS);
 
 	gcx = (LionCountCtx *) palloc(sizeof(LionCountCtx) * ngroups);
 	cur = (LionSetCursor *) palloc(sizeof(LionSetCursor) * ngroups);

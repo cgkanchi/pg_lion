@@ -646,6 +646,13 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
  * Remember the level-1 page blk, locked, as the one a descent took its leaf's
  * downlink from (LionDirParent).  A high key longer than a pivot can be is
  * damage the next read of the page reports; it is just not remembered.
+ *
+ * The high key is read by its line pointer without lion_entry_at() because
+ * the one caller has just compared it, under the same lock, through
+ * lion_page_highkey() - the walk right stops on a page that is not rightmost
+ * only by that comparison - and lion_entry_at() refused it then unless it
+ * lies inside the page and holds a header and its key.  What is new below
+ * is its length against a pivot's, which the copy is sized by.
  */
 static void
 lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
@@ -1032,6 +1039,16 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
 	if (!keep)
 		UnlockReleaseBuffer(buf);
 
+	/*
+	 * For an index in shared buffers this check does nothing: nbuf is locked
+	 * here, as the guard is from the walk's first step to its caller's
+	 * release, and a content lock holds interrupts off (lion.h) - which is
+	 * why the walk's bound, and not this, is what ends a cycle, and a cancel
+	 * is seen at the first check after the guard goes.  Nothing is lost by
+	 * that: an ERROR raised with content locks held releases them in its
+	 * abort.  The check is live for a temporary index, whose local buffers
+	 * LockBuffer() does not lock.
+	 */
 	CHECK_FOR_INTERRUPTS();
 	return nbuf;
 }
@@ -1430,6 +1447,19 @@ lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	}
 	else if (PageGetFreeSpace(page) >= MAXALIGN(size))
 	{
+		/*
+		 * PageAddItemExtended() answers a page header it finds damaged with
+		 * a PANIC of its own, in either WAL mode - and a leaf whose pd_lower
+		 * is below the end of the header gets past the buffer manager's
+		 * check of the page it reads, reads as a leaf with no items, and
+		 * has all the room an insert could ask for.  So the header is
+		 * checked here, before the record; nothing else has looked at it
+		 * (lion_page_check_header()).  With it in bounds, and the room and
+		 * the offset - the binary search's, at most one past the last item
+		 * - checked under the exclusive lock, the add cannot fail, and the
+		 * ERROR below is the "can't happen" of DESIGN.md §25.
+		 */
+		lion_page_check_header(index, page, BufferGetBlockNumber(buf));
 		xstate = lion_wal_begin(index);
 		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
 		if (PageAddItemExtended(p, (char *) item, size, off, 0) ==

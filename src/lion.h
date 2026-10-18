@@ -324,7 +324,13 @@ lion_posting_highkey(Page page)
  * even be cancelled: a posting-tree writer holds its key's directory leaf the
  * whole time, the directory's find-or-create holds its guard, and a content
  * lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing there and
- * statement_timeout never fires.  The size is asked for only once a walk is
+ * statement_timeout never fires.  (That holds on every major: LockBuffer()
+ * takes an LWLock through LWLockAcquire() up to 18 and its own lock through
+ * BufferLockAcquire() from 19, and both HOLD_INTERRUPTS() until the release.
+ * An ERROR raised with such a lock held does not leak it either: the abort
+ * releases it, LWLockReleaseAll() up to 18 and the resource owner's
+ * ResOwnerReleaseBuffer() from 19.  A temporary index's local buffers are not
+ * locked at all.)  The size is asked for only once a walk is
  * LION_RIGHTWALK_CHEAP pages long, which almost no walk ever is, and again
  * each time the walk outgrows it, because the index grows meanwhile.
  *
@@ -1191,6 +1197,8 @@ typedef struct LionPosSpec
 	LionState  *col;
 	Datum		query;
 	StrategyNumber strategy;
+	Size		mem;			/* what each such filter holds, at most
+								 * (lion_posfilter_mem()) */
 } LionPosSpec;
 
 typedef struct LionKeyNode
@@ -1937,9 +1945,13 @@ extern LionContainer *lion_page_item_fetch(Relation index, Page page,
  * space and no two overlapping (lion_page_check_items(), before items are
  * deleted, moved to another page or rewritten); the item at off alone in the
  * bytes the page allots it (lion_page_check_alone(), before it is overwritten
- * or deleted in place); and the directory entry at off a whole one, of the
- * size a CHAIN entry has to have (lion_page_entry_fetch()).
+ * or deleted in place); the directory entry at off a whole one, exactly one
+ * of INLINE and CHAIN, and of the size a CHAIN entry has to have
+ * (lion_page_entry_fetch()); and the page header within the bounds
+ * PageAddItemExtended() PANICs outside of (lion_page_check_header(), before
+ * an item is added to a page nothing else has checked).
  */
+extern void lion_page_check_header(Relation index, Page page, BlockNumber blkno);
 extern void lion_page_check_items(Relation index, Page page, BlockNumber blkno);
 extern void lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
 								  OffsetNumber off);
@@ -2530,16 +2542,9 @@ extern const LionPosMember *lion_poscursor_next(Relation index,
 												uint64 code);
 extern void lion_poscursor_close(LionPosCursor *cur);
 
-/*
- * What a LION_KN_POSFILTER cursor holds, about: the filter's two member
- * arrays and its container, and a leaf page copied for each position cursor,
- * taken to be four.
- */
-#define LION_POSFILTER_MEM \
-	(2 * sizeof(uint16) * LION_CONTAINER_RANGE + LION_CONTAINER_MAX_SIZE + \
-	 4 * BLCKSZ)
 extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy);
+extern Size lion_posfilter_mem(Datum query);
 extern int	lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
 									 uint16 *keep);
 extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
