@@ -1007,6 +1007,14 @@ lion_emit_array_range(LionScanOpaque so, LionState *col,
 	{
 		LionRange	range;
 
+		/*
+		 * The array's length is a parameter's and has no cap (DESIGN.md
+		 * §15), and the search for the widest element below answers no
+		 * cancel of its own.
+		 */
+		if ((i & 0x3ff) == 0x3ff)
+			CHECK_FOR_INTERRUPTS();
+
 		if (nulls[i])
 			continue;			/* a strict comparison with NULL is not true */
 
@@ -2908,6 +2916,9 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 		lion_probe_init(index, col, k->sk_subtype, &probe);
 		for (i = 0; i < nelems && ndistinct < 2; i++)
 		{
+			/* an array of one value repeated: as long as a parameter's is */
+			if ((i & 0x3ff) == 0x3ff)
+				CHECK_FOR_INTERRUPTS();
 			if (nulls[i])
 				continue;
 			if (ndistinct == 0)
@@ -3319,6 +3330,10 @@ lion_scan_col_ranges(LionScanOpaque so, LionState *col, ScanKey best,
 
 		for (i = 0; i < nelems; i++)
 		{
+			/* the array's length is a parameter's, and has no cap */
+			if ((i & 0x3ff) == 0x3ff)
+				CHECK_FOR_INTERRUPTS();
+
 			if (nulls[i])
 				continue;		/* a strict comparison with NULL is not true */
 
@@ -4752,6 +4767,7 @@ typedef struct LionOrderPointSort
 {
 	FmgrInfo   *sortproc;
 	Oid			collation;
+	uint32		ncmp;			/* comparisons made by the sort */
 } LionOrderPointSort;
 
 static int
@@ -4762,6 +4778,22 @@ lion_order_point_cmp(const void *a, const void *b, void *arg)
 	return DatumGetInt32(FunctionCall2Coll(ctx->sortproc, ctx->collation,
 										   *(const Datum *) a,
 										   *(const Datum *) b));
+}
+
+/*
+ * The same, as the sort of the whole list calls it, for lion_probe_sort_cmp()'s
+ * reason: a list whose length is a parameter's has no cap (DESIGN.md §15), its
+ * sort calls the opclass's comparison some n log n times, and nothing else in
+ * it would answer a cancel.  No lock is held while the list is sorted.
+ */
+static int
+lion_order_point_sort_cmp(const void *a, const void *b, void *arg)
+{
+	LionOrderPointSort *ctx = (LionOrderPointSort *) arg;
+
+	if ((++ctx->ncmp & 0xffff) == 0)
+		CHECK_FOR_INTERRUPTS();
+	return lion_order_point_cmp(a, b, arg);
 }
 
 /*
@@ -4814,13 +4846,17 @@ lion_order_points(LionOrderWalk *w, LionState *col, ScanKey k)
 	}
 	ctx.sortproc = &probe.sortproc;
 	ctx.collation = col->collation;
+	ctx.ncmp = 0;
 	if (n > 1)
 	{
 		int			m = 1;
 
-		qsort_arg(w->points, n, sizeof(Datum), lion_order_point_cmp, &ctx);
+		qsort_arg(w->points, n, sizeof(Datum), lion_order_point_sort_cmp,
+				  &ctx);
 		for (i = 1; i < n; i++)
 		{
+			if ((i & 0x3ff) == 0)
+				CHECK_FOR_INTERRUPTS();
 			if (lion_order_point_cmp(&w->points[m - 1], &w->points[i], &ctx) != 0)
 				w->points[m++] = w->points[i];
 		}
