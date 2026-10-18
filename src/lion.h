@@ -324,7 +324,13 @@ lion_posting_highkey(Page page)
  * even be cancelled: a posting-tree writer holds its key's directory leaf the
  * whole time, the directory's find-or-create holds its guard, and a content
  * lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing there and
- * statement_timeout never fires.  The size is asked for only once a walk is
+ * statement_timeout never fires.  (That holds on every major: LockBuffer()
+ * takes an LWLock through LWLockAcquire() up to 18 and its own lock through
+ * BufferLockAcquire() from 19, and both HOLD_INTERRUPTS() until the release.
+ * An ERROR raised with such a lock held does not leak it either: the abort
+ * releases it, LWLockReleaseAll() up to 18 and the resource owner's
+ * ResOwnerReleaseBuffer() from 19.  A temporary index's local buffers are not
+ * locked at all.)  The size is asked for only once a walk is
  * LION_RIGHTWALK_CHEAP pages long, which almost no walk ever is, and again
  * each time the walk outgrows it, because the index grows meanwhile.
  *
