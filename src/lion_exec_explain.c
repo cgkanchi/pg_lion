@@ -136,13 +136,18 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * one case where the name is wanted and the relation is not in hand.  The heap
  * attribute number is the one the plan carries; a partitioned scan prints no
  * index name at all, so it never gets here with a parent's numbering.
+ *
+ * The name is palloc'd in the caller's context, EXPLAIN's, like the
+ * get_rel_name() it is printed beside; it was a static buffer, which two
+ * calls in one argument list would have overwritten, the first printing
+ * the second's column.
  */
 static const char *
 lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 {
-	static char buf[NAMEDATALEN + 2];
 	Relation	idx;
 	AttrNumber	col;
+	char	   *name;
 
 	if (!OidIsValid(idxoid) || heapattno <= 0)
 		return "";
@@ -155,11 +160,11 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 	}
 
 	col = lion_index_col_for(idx, heapattno, multikey, vcols);
-	snprintf(buf, sizeof(buf), ".%s",
-			 NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
+	name = psprintf(".%s",
+					NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
 	index_close(idx, AccessShareLock);
 
-	return buf;
+	return name;
 }
 
 /* ... for one clause, whose kind says which kind of column answers it. */
