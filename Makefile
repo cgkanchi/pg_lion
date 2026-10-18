@@ -70,6 +70,9 @@ src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
               test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
               test/unit/readahead_test test/results test/isolation/results
+# Every object and dependency file in src, not only those OBJS names now, so
+# that a source removed or renamed leaves no object behind.
+EXTRA_CLEAN += src/*.o src/*.d src/*.bc
 
 PG_CONFIG ?= $(if $(wildcard .local/pg/bin/pg_config),.local/pg/bin/pg_config,pg_config)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
@@ -187,24 +190,16 @@ unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_
 	./test/unit/vec_test_nosimd
 	./test/unit/readahead_test
 
-# header deps (the PostgreSQL build we compile against was not configured with --enable-depend)
-# (every header lion.h includes, and each of the others' includers; a missing
-# line leaves a stale object with an old struct layout after a header change)
-$(OBJS): src/lion.h src/lion_compat.h src/lion_container.h src/lion_sparse.h src/lion_positions.h src/lion_tid.h \
-         src/lion_wal.h
-$(COUNT_OBJS) $(CUSTOMSCAN_OBJS) $(FUNCS_OBJS) src/lion_am.o src/lion_amcost.o src/lion_ordered.o \
-          src/lion_scan.o src/lion_selfuncs.o: src/lion_count.h
-$(CUSTOMSCAN_OBJS) src/lion_fkjoin.o: src/lion_fkjoin.h
-src/lion_costs.o $(CUSTOMSCAN_OBJS) src/lion_am.o src/lion_amcost.o src/lion_ordered.o: src/lion_costs.h
-$(COUNT_OBJS): src/lion_count_int.h
-$(CUSTOMSCAN_OBJS): src/lion_customscan.h
-src/lion_plan_private.o src/lion_exec_begin.o src/lion_plan_hooks.o \
-          src/lion_plan_fkjoin.o: src/lion_plan_private.h
-$(FUNCS_OBJS): src/lion_funcs.h
-src/lion_build.o src/lion_spool.o: src/lion_spool.h
-src/lion_wal.o src/lion_waldelta.o: src/lion_waldelta.h
-$(VEC_OBJS) src/lion_am.o src/lion_ordered.o: src/lion_vec.h src/lion_vec_math.h
-$(READAHEAD_OBJS) src/lion_vec.o src/lion_vec_scan.o: src/lion_readahead.h src/lion_readahead_ring.h
+# Header dependencies, made by the compiler: each object's .d file lists every
+# header its source includes, so no hand-kept list can miss one and leave a
+# stale object with an old struct layout after a header change.  A server
+# configured with --enable-depend already does this in its own rules (into
+# .deps/); elsewhere - the distributions' packages are not - it is done here.
+# -MP keeps a deleted header from breaking the build.
+ifneq ($(autodepend),yes)
+override CFLAGS += -MMD -MP
+-include $(OBJS:.o=.d)
+endif
 
 # Crash-recovery and hot-standby tests (test/recovery/README.md).  These need a
 # whole PostgreSQL *installation* to initdb their own private clusters into,
