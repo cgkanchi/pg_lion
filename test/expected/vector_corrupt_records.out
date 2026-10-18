@@ -1,0 +1,228 @@
+-- Damage a lionvec insert would have carried on with: an ERROR before it
+-- locks the wrong page or writes, never a wait for ever or a PANIC.
+--
+-- 1. A meta page whose chain end, or whose refine_tail, names the meta page
+--    itself.  An insert holds the meta page EXCLUSIVE from its first page to
+--    its last (lionvec_append()), and it locked it a second time: a buffer
+--    content lock is not reentrant, so the backend waited for itself, with
+--    interrupts held off - no cancel, no terminate, only a restart of the
+--    server ended it (lionvec_insert_readbuf()).
+-- 2. The CODE tail of the NULL rows with its pd_lower inside the page
+--    header, which the buffer manager reads in - it checks pd_lower against
+--    pd_upper, not against the header - and which then reads as a page with
+--    no items and room to spare: the next NULL row was added to it in a
+--    GenericXLog copy, where PageAddItemExtended() PANICked
+--    (lionvec_check_page()).
+--
+-- As in test/sql/corrupt_records.sql, the pages are damaged ON DISK and read
+-- back from there by moving the index to another tablespace, which copies
+-- the file as it is, so that this runs on PostgreSQL 16 too.  The meta
+-- page's fields follow the 24-byte page header (LionVecMetaData):
+-- null_tail at 72, refine_tail at 76.  The byte offsets assume a
+-- little-endian server.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS pg_lion_vector;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+-- left behind by a run that stopped part-way
+DROP TABLESPACE IF EXISTS lion_vr_ts;
+RESET client_min_messages;
+SET statement_timeout = '60s';
+SET max_parallel_maintenance_workers = 0;
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE lion_vr_ts LOCATION '';
+RESET allow_in_place_tablespaces;
+CREATE FUNCTION lion_vr_u32(f bytea, off int) RETURNS bigint
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT get_byte(f, off)::bigint | (get_byte(f, off + 1)::bigint << 8) |
+		   (get_byte(f, off + 2)::bigint << 16) | (get_byte(f, off + 3)::bigint << 24)
+$$;
+CREATE FUNCTION lion_vr_le32(v bigint) RETURNS bytea
+LANGUAGE sql IMMUTABLE AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		0, (v & 255)::int), 1, ((v >> 8) & 255)::int),
+		2, ((v >> 16) & 255)::int), 3, ((v >> 24) & 255)::int)
+$$;
+-- Block blk of an index, read from the file.
+CREATE FUNCTION lion_vr_block(idx regclass, blk bigint) RETURNS bytea
+LANGUAGE sql AS $$
+	SELECT pg_read_binary_file(pg_relation_filepath(idx),
+							   blk * current_setting('block_size')::int,
+							   current_setting('block_size')::int)
+$$;
+-- Write an index out, so that its file is what the buffer pool holds.
+CREATE FUNCTION lion_vr_flush(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	CHECKPOINT;
+END $$;
+-- Overwrite bytes at byte pos of block blk of the file, with the page's new
+-- checksum (pd_checksum, the uint16 at byte 8).
+CREATE FUNCTION lion_vr_poke(idx regclass, blk bigint, pos int, bytes bytea)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	path text := pg_relation_filepath(idx);
+	bs int := current_setting('block_size')::int;
+	f bytea := pg_read_binary_file(path);
+	page bytea;
+	ck int;
+	lo oid;
+BEGIN
+	page := substring(f FROM (blk * bs)::int + 1 FOR bs);
+	page := overlay(page PLACING bytes FROM pos + 1);
+	ck := page_checksum(page, blk::int)::int & 65535;
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, ck & 255), 1, ck >> 8)
+					FROM 9);
+	f := overlay(f PLACING page FROM (blk * bs)::int + 1);
+	lo := lo_from_bytea(0, f);
+	PERFORM lo_export(lo, path);
+	PERFORM lo_unlink(lo);
+END $$;
+-- Have the server read the index from its file: move it to the other
+-- tablespace, which copies the file as it is.
+CREATE FUNCTION lion_vr_reread(idx regclass) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE format('ALTER INDEX %s SET TABLESPACE %I', idx,
+				   CASE WHEN (SELECT reltablespace FROM pg_class WHERE oid = idx) = 0
+						THEN 'lion_vr_ts' ELSE 'pg_default' END);
+END $$;
+-- Run a statement; report its SQLSTATE and its message with the numbers out.
+CREATE FUNCTION lion_vr_try(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || regexp_replace(SQLERRM, '[0-9]+', 'N', 'g');
+END $$;
+CREATE TABLE lion_vr (id int, v vector(3)) WITH (autovacuum_enabled = off);
+INSERT INTO lion_vr SELECT i, ARRAY[i, i % 7, 1]::vector FROM generate_series(1, 50) i;
+INSERT INTO lion_vr VALUES (0, NULL);
+-- ---------- 1. a link to the meta page ----------
+-- The NULL rows' chain end, and then refine_tail, made 0.
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_flush('lion_vr_i');
+ lion_vr_flush 
+---------------
+ 
+(1 row)
+
+SELECT lion_vr_u32(m, 72) > 0 AS null_tail, lion_vr_u32(m, 76) > 0 AS refine_tail
+  FROM lion_vr_block('lion_vr_i', 0) m;
+ null_tail | refine_tail 
+-----------+-------------
+ t         | t
+(1 row)
+
+SELECT lion_vr_poke('lion_vr_i', 0, 72, lion_vr_le32(0));
+ lion_vr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_vr_reread('lion_vr_i');
+ lion_vr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_vr_try('INSERT INTO lion_vr VALUES (100, NULL)');
+                                      lion_vr_try                                       
+----------------------------------------------------------------------------------------
+ XX002: lionvec index "lion_vr_i" links to its meta page where an insert follows a link
+(1 row)
+
+DROP INDEX lion_vr_i;
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_flush('lion_vr_i');
+ lion_vr_flush 
+---------------
+ 
+(1 row)
+
+SELECT lion_vr_poke('lion_vr_i', 0, 76, lion_vr_le32(0));
+ lion_vr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_vr_reread('lion_vr_i');
+ lion_vr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_vr_try($$INSERT INTO lion_vr VALUES (102, '[1,2,3]')$$);
+                                      lion_vr_try                                       
+----------------------------------------------------------------------------------------
+ XX002: lionvec index "lion_vr_i" links to its meta page where an insert follows a link
+(1 row)
+
+DROP INDEX lion_vr_i;
+-- ---------- 2. a CODE tail whose pd_lower is inside the page header ----------
+-- The NULL rows' tail, its pd_lower (bytes 12 and 13) made 0.
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_flush('lion_vr_i');
+ lion_vr_flush 
+---------------
+ 
+(1 row)
+
+SELECT lion_vr_u32(lion_vr_block('lion_vr_i', 0), 72) AS lion_vr_tail \gset
+SELECT get_byte(p, 12) | (get_byte(p, 13) << 8) > 24 AS has_items
+  FROM lion_vr_block('lion_vr_i', :lion_vr_tail) p;
+ has_items 
+-----------
+ t
+(1 row)
+
+SELECT lion_vr_poke('lion_vr_i', :lion_vr_tail, 12, '\x0000'::bytea);
+ lion_vr_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_vr_reread('lion_vr_i');
+ lion_vr_reread 
+----------------
+ 
+(1 row)
+
+SELECT lion_vr_try('INSERT INTO lion_vr VALUES (100, NULL)');
+                                             lion_vr_try                                             
+-----------------------------------------------------------------------------------------------------
+ XX002: lionvec index "lion_vr_i" has a corrupt page header at block N (lower N, upper N, special N)
+(1 row)
+
+DROP INDEX lion_vr_i;
+-- ---------- an undamaged index still works ----------
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_reread('lion_vr_i');
+ lion_vr_reread 
+----------------
+ 
+(1 row)
+
+INSERT INTO lion_vr VALUES (100, NULL), (101, '[1,2,3]');
+SET enable_seqscan = off;
+SELECT id FROM lion_vr ORDER BY v <-> '[1,2,3]' LIMIT 1;
+ id  
+-----
+ 101
+(1 row)
+
+RESET enable_seqscan;
+RESET statement_timeout;
+RESET max_parallel_maintenance_workers;
+DROP TABLE lion_vr;
+DROP FUNCTION lion_vr_try(text);
+DROP FUNCTION lion_vr_reread(regclass);
+DROP FUNCTION lion_vr_poke(regclass, bigint, int, bytea);
+DROP FUNCTION lion_vr_flush(regclass);
+DROP FUNCTION lion_vr_block(regclass, bigint);
+DROP FUNCTION lion_vr_le32(bigint);
+DROP FUNCTION lion_vr_u32(bytea, int);
+DROP TABLESPACE lion_vr_ts;

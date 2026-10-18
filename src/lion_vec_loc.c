@@ -686,10 +686,16 @@ lionvec_loc_append(Relation index, Buffer metabuf, const LionVecMetaData *meta,
 	OffsetNumber doff = InvalidOffsetNumber;
 
 	Assert((meta->flags & LIONVEC_META_LOCATOR) != 0);
-	lbuf = ReadBuffer(index, meta->loc_tail);
+	lbuf = lionvec_insert_readbuf(index, meta->loc_tail);
 	LockBuffer(lbuf, BUFFER_LOCK_EXCLUSIVE);
 	lionvec_check_page(index, BufferGetPage(lbuf), meta->loc_tail, LIONVEC_PAGE_LOC);
-	dbuf = ReadBuffer(index, meta->loc_dtail);
+	/* the LOC tail is held, and locking it again would wait for ever */
+	if (unlikely(meta->loc_dtail == meta->loc_tail))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has its locator and its locator directory end on one page, block %u",
+						RelationGetRelationName(index), meta->loc_tail)));
+	dbuf = lionvec_insert_readbuf(index, meta->loc_dtail);
 	LockBuffer(dbuf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(dbuf);
 	lionvec_check_page(index, page, meta->loc_dtail, LIONVEC_PAGE_LOCDIR);
