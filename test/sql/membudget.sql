@@ -169,7 +169,8 @@ DROP TABLE lmb_d2;
 -- image and a flat 160 kB, two of them under an OR fitted a 4MB budget
 -- opened at once, and held 49 MB.
 CREATE FUNCTION lion_debug_posfilter_mem(regclass, tsquery,
-	OUT charged bigint, OUT held bigint) RETURNS record
+	OUT charged bigint, OUT held bigint, OUT held_elsewhere bigint)
+	RETURNS record
 	AS '$libdir/pg_lion' LANGUAGE C STRICT;
 CREATE TABLE lmb_p (id int NOT NULL, k int NOT NULL, d tsvector NOT NULL)
 	WITH (autovacuum_enabled = off);
@@ -210,9 +211,13 @@ UNION ALL
 SELECT 'repeated', 'w1 <-> w2 <-> w1 <-> w2';
 -- what a filter holds against what it is charged: the charge covers it, and
 -- grows with the query - the long phrase holds tens of megabytes, which the
--- flat charge of 160 kB said nothing of
+-- flat charge of 160 kB said nothing of.  What it holds is the same begun in
+-- a small context and in a default-sized one, and whatever the session did
+-- before: its own contexts are of sizes aset.c recycles no context for, and
+-- a small context that took over one begun to grow to 8 MB gave each of its
+-- leaves a block of 16 kB, which the charge did not cover.
 SELECT name, m.held <= m.charged AS covered, m.charged < 2 * m.held AS close,
-	   m.held > 20000000 AS large
+	   m.held > 20000000 AS large, m.held = m.held_elsewhere AS same
   FROM lmb_q, lion_debug_posfilter_mem('lmb_p_d', q::tsquery) m ORDER BY name;
 -- the same answers from the pushdown, a bitmap scan and the heap, alone and
 -- ORed: two filters of the NOTs do not fit 1MB together, and are read as a
