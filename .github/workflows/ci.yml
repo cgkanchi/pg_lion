@@ -118,7 +118,9 @@ jobs:
 
       # pg_lion beside another extension on the same planner hook and with
       # its own resource manager, in both load orders, the non-heap table AM
-      # refusals, and counts on a sixteen-buffer pool (test/hook-check.sh).
+      # refusals, counts on a sixteen-buffer pool, and - on 16, the only
+      # major with the setting - the refusal to read a lion index under
+      # old_snapshot_threshold (test/hook-check.sh).
       # The test module goes into the packaged installation with sudo, like
       # pg_lion itself.
       - name: hookcheck (hook coexistence, table AMs)

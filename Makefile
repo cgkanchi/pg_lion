@@ -261,8 +261,10 @@ installcheck-rmgr:
 
 # pg_lion beside another extension that chains the same planner hook and
 # registers its own WAL resource manager, in both load orders (DESIGN.md §23),
-# the table-AM refusals that need a table AM other than the heap (§2), and
-# counts on a pool of sixteen buffers, which the pin budgets must fit (§15).
+# the table-AM refusals that need a table AM other than the heap (§2),
+# counts on a pool of sixteen buffers, which the pin budgets must fit (§15),
+# and, on PostgreSQL 16, that no lion index is read while
+# old_snapshot_threshold is set (§9).
 # Builds and installs the test-only test/modules/lion_hooktest into the
 # installation PG_CONFIG names, and restarts the dev cluster as
 # installcheck-rmgr does.
