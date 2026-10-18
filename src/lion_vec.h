@@ -38,6 +38,7 @@
 #include "access/relscan.h"
 #include "catalog/pg_type_d.h"
 #include "storage/bufmgr.h"
+#include "nodes/execnodes.h"
 #include "nodes/pathnodes.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
@@ -602,6 +603,30 @@ extern void lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 							  LionContainer *const *conts);
 
 /*
+ * ... or, likewise, to the rows that pass a filter, tested on the heap
+ * tuple of each row whose exact distance the scan fetches, and of each row
+ * its walks of NULL and zero vectors would return (DESIGN.md §44.6, "Filter
+ * at the fetch"): a row that fails it is dropped there, as a non-member of
+ * the set is before its estimate, and never returned.  The filter is
+ * evaluated in econtext, over a slot of the table access method's own type
+ * (table_slot_callbacks()), which it must have been initialised for; the
+ * scan resets econtext's per-tuple memory before each row and puts back its
+ * scan tuple after.  Both must outlive the scan, or the next rescan, which
+ * forgets them.  members is how many of the index's rows the planner expects
+ * the filter to keep, or 0 if it does not know: the scan sizes the rows it
+ * keeps and pauses by to hold its query's members (lv_start()).  Never with
+ * lion_vec_restrict(), nor in a parallel scan.
+ */
+extern void lion_vec_restrict_filter(IndexScanDesc scan, ExprState *filter,
+									 ExprContext *econtext, double members);
+
+/*
+ * ... and how many rows such a filter has removed, in every scan of this
+ * descriptor so far, for EXPLAIN ANALYZE.
+ */
+extern int64 lion_vec_filter_removed(IndexScanDesc scan);
+
+/*
  * ... and tell it, likewise after its rescan and before its first tuple,
  * how many rows its query will take from it, when the planner knew: the
  * LIMIT, OFFSET included, of the query level it is in (§44.4, "A known
@@ -618,6 +643,16 @@ extern void lion_vec_scan_limit(IndexScanDesc scan, int64 rows);
  * costs before its first row, for the planner (§44.7).
  */
 extern Cost lion_vec_scan_cost(IndexOptInfo *index, double members);
+
+/*
+ * ... or under a filter that keeps `members` of them
+ * (lion_vec_restrict_filter()): the same probes, every row walked
+ * estimated, and 1 / frac as many refines and fetches; *fetched is the rows
+ * it expects to fetch, each tested by the filter (§44.6, "Filter at the
+ * fetch"; §44.7).
+ */
+extern Cost lion_vec_filter_cost(IndexOptInfo *index, double members,
+								 double *fetched);
 
 /*
  * ... and the price of a partial path of a lionvec order, which core gives
