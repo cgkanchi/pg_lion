@@ -4060,7 +4060,9 @@ What changed, each where the cost was:
   16, or the limit itself where that is smaller - 2026-09-29 review), so that a list's leaf pins and
   its cursors' page pins come out of ONE limit per backend. The
   plan estimates bottom-up what each node's cursors would hold - the `LionExprCursor`, the staging
-  buffer or page image, an OR's heap entries and accumulators - and decides the three shapes below.
+  buffer or page image, an OR's heap entries and accumulators, a `LION_KN_POSFILTER`'s filter (§17,
+  "Stored positions": `lion_posfilter_mem()`, which grows with its query) - and decides the three
+  shapes below.
   An ordinary query is under the budget everywhere and is built exactly as before; the plan also
   carries each node's `pinned`, the §9 property the count needs of one positive source, so the
   shape and the interlock are one decision.
@@ -5328,6 +5330,17 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     it sees an ordinary built container; the child stands at the key while its positions are
     read, so its pins carry §9 as any node's do, and a wide union opens the node a window at a
     time like any child.  Its cost is the filter's, per candidate, as above.
+  - **What a filter holds** grows with its query, and the node is charged that against the open
+    budget (§15, "Bounded cursors"; `lion_posfilter_mem()`): a cursor per distinct lexeme, each a
+    copy of its position tree's leaf and a pointer per item that leaf may have (24 kB) or an INLINE
+    entry's chunk - which of them is not known before the entry is read, so every operand is
+    charged a tree's - beside the filter's two member arrays (128 kB). So an OR of filters too big
+    for work_mem is read as a windowed union, one filter open at a time. The charge used to be a
+    flat 160 kB, and a phrase of a thousand lexemes allocated 24 MB under it (2026-10 review). What
+    only finding the cursors' keys takes - the opclass's extracted keys, the entry lookups - goes
+    with a context of its own when the filter begins, and what `TS_execute()` allocates for a
+    candidate - a phrase's positions - goes after each candidate, not after each container's
+    thousands of them.
   - Why reading positions at any moment of a scan is safe: a member's TID can change hands only
     after VACUUM has removed the old row's positions, and the new row is then inserted after the
     scan's snapshot was taken, so it is invisible to the scan and its page is not all-visible to

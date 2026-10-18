@@ -375,6 +375,8 @@ lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
 	p->nsub = node->nargs;
 
 	summem = lion_node_overhead(node->kind, node->nargs);
+	if (node->kind == LION_KN_POSFILTER)
+		summem += node->pos->mem;	/* its filter (lion_posfilter_mem()) */
 	for (i = 0; i < node->nargs; i++)
 	{
 		LionNodePlan *cp = build ? &p->sub[i] : &scratch;

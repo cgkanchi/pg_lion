@@ -48,6 +48,8 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -58,6 +60,8 @@
 #include "utils/rel.h"
 
 #include "lion.h"
+#include "lion_count_int.h"
+#include "lion_funcs.h"
 #include "lion_positions.h"
 
 /* A forward reader over one key's members. */
@@ -90,6 +94,9 @@ typedef struct LionPosCursor
 	LionPosMember m;
 } LionPosCursor;
 
+/* A position tree cursor's pointers to the items of its leaf, as many as fit. */
+#define LION_POSCURSOR_CHUNKS_BYTES	(sizeof(LionContainer *) * MaxOffsetNumber)
+
 struct LionPosFilter
 {
 	Relation	index;
@@ -103,7 +110,8 @@ struct LionPosFilter
 	uint16	   *los;			/* LION_CONTAINER_RANGE members of a container */
 	uint16	   *keep;			/* ... and those lion_posfilter_apply() keeps */
 	LionContainer *work;		/* what lion_posfilter_apply() hands back */
-	MemoryContext cxt;			/* reset per container: the callback's pallocs */
+	MemoryContext cxt;			/* reset per candidate: what TS_execute() and
+								 * the callback allocate */
 	int64		nchecked;
 	int64		nremoved;
 };
@@ -299,11 +307,12 @@ lion_poscursor_seek(Relation index, LionPosCursor *cur, uint64 code)
 /*
  * Locate key's positions.  False when the entry does not say where they are -
  * an index whose entries predate them should never get here - and the
- * filter is then not used at all.
+ * filter is then not used at all.  What the cursor keeps is allocated in
+ * keep; the lookup's scratch in the current context.
  */
 static bool
 lion_poscursor_init(Relation index, LionState *col, Datum key,
-					LionPosCursor *cur)
+					LionPosCursor *cur, MemoryContext keep)
 {
 	Buffer		buf = InvalidBuffer;
 	OffsetNumber off;
@@ -338,19 +347,21 @@ lion_poscursor_init(Relation index, LionState *col, Datum key,
 				cur->absent = true;
 			else
 			{
-				cur->leaf = palloc(BLCKSZ);
+				cur->leaf = MemoryContextAlloc(keep, BLCKSZ);
 				cur->chunks = (LionContainer **)
-					palloc(sizeof(LionContainer *) * MaxOffsetNumber);
+					MemoryContextAlloc(keep, LION_POSCURSOR_CHUNKS_BYTES);
 			}
 		}
 		else
 		{
-			cur->inl = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			cur->inl = (LionContainer *) MemoryContextAlloc(keep,
+															LION_CONTAINER_MAX_SIZE);
 			if (lion_entry_inline_poschunk(index, e,
 										   ItemIdGetLength(PageGetItemId(page, off)),
 										   blkno, off, cur->inl))
 			{
-				cur->chunks = (LionContainer **) palloc(sizeof(LionContainer *));
+				cur->chunks = (LionContainer **)
+					MemoryContextAlloc(keep, sizeof(LionContainer *));
 				cur->chunks[0] = cur->inl;
 				cur->nchunks = 1;
 				cur->rightmost = true;
@@ -455,6 +466,7 @@ lion_posfilter_keynode(Relation index, LionState *col, Datum query,
 	spec->col = col;
 	spec->query = query;
 	spec->strategy = strategy;
+	spec->mem = lion_posfilter_mem(query);
 
 	n->kind = LION_KN_POSFILTER;
 	n->nargs = 1;
@@ -473,23 +485,50 @@ LionPosFilter *
 lion_posfilter_begin(Relation index, LionState *col, Datum query,
 					 StrategyNumber strategy)
 {
+	MemoryContext cxt = CurrentMemoryContext;
+	MemoryContext setup;
 	LionPosFilter *pf;
 	Datum	   *itemkeys;
 	Datum	   *curkeys;
+	int32		noperands = 0;
 	int32		i;
+	bool		ok;
 
 	Assert(col->positions);
-	if (!lion_tsquery_item_keys(col, query, strategy, &itemkeys))
+
+	/*
+	 * What finding the cursors' keys takes and nothing after it - the
+	 * opclass's extracted keys and their arrays, each lexeme's detoasted
+	 * copy, the lookups of their entries - goes with a context of its own
+	 * before the filter is used.  It was left in the caller's, once a filter,
+	 * for as long as that lasted (2026-10 review).
+	 */
+	setup = AllocSetContextCreate(cxt, "lion position filter setup",
+								  ALLOCSET_SMALL_SIZES);
+	MemoryContextSwitchTo(setup);
+	ok = lion_tsquery_item_keys(col, query, strategy, &itemkeys);
+	MemoryContextSwitchTo(cxt);
+	if (!ok)
+	{
+		MemoryContextDelete(setup);
 		return NULL;
+	}
 
 	pf = (LionPosFilter *) palloc0(sizeof(LionPosFilter));
 	pf->index = index;
 	pf->query = DatumGetTSQuery(query);
 	pf->items = GETQUERY(pf->query);
+	for (i = 0; i < pf->query->size; i++)
+	{
+		if (pf->items[i].type == QI_VAL)
+			noperands++;
+	}
 	pf->itemcur = (int *) palloc(sizeof(int) * pf->query->size);
+	/* a cursor per distinct operand at most: none for an operator */
 	pf->cursors = (LionPosCursor *)
-		palloc(sizeof(LionPosCursor) * pf->query->size);
-	curkeys = (Datum *) palloc(sizeof(Datum) * pf->query->size);
+		palloc(sizeof(LionPosCursor) * Max(noperands, 1));
+	curkeys = (Datum *) MemoryContextAlloc(setup,
+										   sizeof(Datum) * Max(noperands, 1));
 
 	for (i = 0; i < pf->query->size; i++)
 	{
@@ -507,25 +546,89 @@ lion_posfilter_begin(Relation index, LionState *col, Datum query,
 		}
 		if (k == pf->ncursors)
 		{
-			if (!lion_poscursor_init(index, col, itemkeys[i],
-									 &pf->cursors[k]))
-			{
-				lion_posfilter_end(pf);
-				return NULL;
-			}
+			MemoryContextSwitchTo(setup);
+			ok = lion_poscursor_init(index, col, itemkeys[i],
+									 &pf->cursors[k], cxt);
+			MemoryContextSwitchTo(cxt);
+			if (!ok)
+				break;
 			curkeys[k] = itemkeys[i];
 			pf->ncursors++;
 		}
 		pf->itemcur[i] = k;
 	}
+	MemoryContextDelete(setup);
+	if (!ok)
+	{
+		lion_posfilter_end(pf);
+		return NULL;
+	}
 
 	pf->los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 	pf->keep = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 	pf->work = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-	pf->cxt = AllocSetContextCreate(CurrentMemoryContext,
+	pf->cxt = AllocSetContextCreate(cxt,
 									"lion position filter",
 									ALLOCSET_SMALL_SIZES);
 	return pf;
+}
+
+/*
+ * What a filter for query holds while it is open, about: the charge of a
+ * LION_KN_POSFILTER node against the open budget (lion_plan_node(),
+ * DESIGN.md §15 "Bounded cursors"), which lion_posfilter_begin() allocates
+ * and lion_posfilter_container() resets once a candidate.  Most of it grows
+ * with the query.  Each distinct lexeme's cursor holds a copy of a leaf of
+ * its position tree and a pointer per item that leaf may have, 24 kB, or an
+ * INLINE entry's chunk, 8 kB; which of them a lexeme has is not known before
+ * its entry is read, so each operand is charged a tree's.  The callback's
+ * allocations for one candidate are about a list of positions an item.
+ *
+ * The charge used to be a flat 160 kB - the member arrays and four leaves -
+ * and a phrase of a thousand lexemes allocated 24 MB under it, inside the
+ * very budget meant to decide whether an OR of such filters can be opened at
+ * once (2026-10 review).
+ */
+Size
+lion_posfilter_mem(Datum query)
+{
+	TSQuery		q = DatumGetTSQuery(query);
+	Size		nitems = (Size) Max(q->size, 0);
+	Size		noperands = 0;
+	Size		percursor;
+	Size		mem;
+	int32		i;
+
+	for (i = 0; i < q->size; i++)
+	{
+		if (GETQUERY(q)[i].type == QI_VAL)
+			noperands++;
+	}
+
+	/* the filter, a copy of the query, itemcur and the cursors */
+	mem = lion_alloc_size(sizeof(LionPosFilter)) +
+		lion_alloc_size(VARSIZE(q)) +
+		lion_alloc_size(sizeof(int) * Max(nitems, 1)) +
+		lion_alloc_size(sizeof(LionPosCursor) * Max(noperands, 1));
+
+	/* what each cursor copies: a tree's leaf and its items, or a chunk */
+	percursor = Max(lion_alloc_size(BLCKSZ) +
+					lion_alloc_size(LION_POSCURSOR_CHUNKS_BYTES),
+					lion_alloc_size(LION_CONTAINER_MAX_SIZE) +
+					lion_alloc_size(sizeof(LionContainer *)));
+	mem += noperands * percursor;
+
+	/* los, keep and work */
+	mem += 2 * lion_alloc_size(sizeof(uint16) * LION_CONTAINER_RANGE) +
+		lion_alloc_size(LION_CONTAINER_MAX_SIZE);
+
+	/* cxt, and what one candidate allocates in it */
+	mem += ALLOCSET_SMALL_INITSIZE +
+		nitems * lion_alloc_size(sizeof(WordEntryPos) * LION_POS_MAX_NPOS);
+
+	if ((Pointer) q != DatumGetPointer(query))
+		pfree(q);
+	return mem;
 }
 
 /*
@@ -560,6 +663,14 @@ lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
 	}
 	pf->nextcode = lion_make_code(c->ckey, pf->los[n - 1]);
 
+	/*
+	 * What TS_execute() and the callback allocate - a phrase operator's
+	 * positions, an operand's weighted copy of them - lasts one candidate:
+	 * reset after each, it is one candidate's evaluation at most, which is
+	 * what lion_posfilter_mem() charges, where a container's thousands of
+	 * candidates used to pile theirs up.  A reset of a context nothing was
+	 * allocated in does nothing.
+	 */
 	oldcxt = MemoryContextSwitchTo(pf->cxt);
 	for (i = 0; i < n; i++)
 	{
@@ -567,9 +678,9 @@ lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
 		if (TS_execute(GETQUERY(pf->query), pf, TS_EXEC_EMPTY,
 					   lion_posfilter_check))
 			keep[nkeep++] = pf->los[i];
+		MemoryContextReset(pf->cxt);
 	}
 	MemoryContextSwitchTo(oldcxt);
-	MemoryContextReset(pf->cxt);
 
 	pf->nchecked += n;
 	pf->nremoved += n - nkeep;
@@ -648,7 +759,7 @@ lion_poscursor_open(Relation index, LionState *col, Datum key,
 {
 	LionPosCursor *cur = (LionPosCursor *) palloc(sizeof(LionPosCursor));
 
-	if (!lion_poscursor_init(index, col, key, cur))
+	if (!lion_poscursor_init(index, col, key, cur, CurrentMemoryContext))
 	{
 		pfree(cur);
 		return NULL;
@@ -693,4 +804,68 @@ lion_poscursor_close(LionPosCursor *cur)
 	if (cur->chunks != NULL)
 		pfree(cur->chunks);
 	pfree(cur);
+}
+
+/* ---------------------------------------------------------------------
+ * lion_debug_posfilter_mem(): what a filter is charged, and what it holds
+ * --------------------------------------------------------------------- */
+
+/*
+ * lion_debug_posfilter_mem(idx regclass, query tsquery, OUT charged bigint,
+ * OUT held bigint): what lion_posfilter_mem() charges a filter of query
+ * against the open budget, and what one begun on the first column of idx
+ * holds - the bytes its memory context and the context under it allocated -
+ * so that a test can see the charge cover what the filter takes.  The
+ * context allocates every chunk past 1 kB a block of its own, so that held
+ * is what the filter asked for and not a block it left room in.  A test
+ * function like lion_debug_key_positions(): the tests create it from the
+ * library.  Superuser only.
+ */
+PG_FUNCTION_INFO_V1(lion_debug_posfilter_mem);
+
+Datum
+lion_debug_posfilter_mem(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Datum		query = PG_GETARG_DATUM(1);
+	TupleDesc	tupdesc;
+	Relation	index;
+	LionState  *state;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionPosFilter *pf;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	int64		held;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_posfilter_mem() is for superusers")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	index = lion_open_index(relid, AccessShareLock);
+	state = lion_get_state(index);
+	if (!state->positions)
+		elog(ERROR, "index \"%s\" does not store positions",
+			 RelationGetRelationName(index));
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion debug position filter",
+								ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	pf = lion_posfilter_begin(index, state, query, LION_STRAT_MATCH);
+	MemoryContextSwitchTo(oldcxt);
+	if (pf == NULL)
+		elog(ERROR, "a position filter cannot follow that query");
+	held = (int64) MemoryContextMemAllocated(cxt, true);
+	lion_posfilter_end(pf);
+	MemoryContextDelete(cxt);
+	index_close(index, AccessShareLock);
+
+	values[0] = Int64GetDatum((int64) lion_posfilter_mem(query));
+	values[1] = Int64GetDatum(held);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values,
+													  nulls)));
 }
