@@ -2766,8 +2766,24 @@ lion_vacuum_sweep(LionVacState *vs)
 			Buffer		buf;
 			Page		page;
 
+			/*
+			 * Interrupts are checked at the top of every block, with nothing
+			 * locked.  Nearly every block leaves the body by a `continue`, and
+			 * the check used to sit at the bottom, which only a full leaf of a
+			 * live set reached: a sweep of many free pages read and recorded
+			 * every one of them without answering a cancel, and the pass over
+			 * a healthy index, which skips every block, had no check at all.
+			 * A block the walk accounted for costs a bit test and the check;
+			 * one the sweep reads, and may write a record for, passes the
+			 * cost-based delay first, as every page the other passes read
+			 * does.
+			 */
 			if (lion_vac_visited(vs, blk))
+			{
+				CHECK_FOR_INTERRUPTS();
 				continue;
+			}
+			lion_vacuum_delay_point();
 
 			buf = ReadBuffer(vs->index, blk);
 			if (!ConditionalLockBufferForCleanup(buf))
@@ -2874,7 +2890,6 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			UnlockReleaseBuffer(buf);
-			CHECK_FOR_INTERRUPTS();
 		}
 
 		if (!progress)

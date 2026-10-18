@@ -5688,10 +5688,14 @@ rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into th
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
 below).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
-those and nothing else.  A page of a LIVE set is never mistaken for a leak, because pass 2 visits
-every page of every chain it found, and a chain created after pass 1 read its bucket page has no
-empty page in it (a spill and a split both fill every page they allocate inside the record that
-allocates it, under the lock they hold throughout) and names a root that is live.
+those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
+page it reads passes the cost-based delay first, as every page the walk reads does (since the
+2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
+free pages neither answered a cancel nor paced its reads and records).  A page of a LIVE set is
+never mistaken for a leak, because pass 2 visits every page of every chain it found, and a chain
+created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
+every page they allocate inside the record that allocates it, under the lock they hold
+throughout) and names a root that is live.
 lion_index_stats() reports deleted_pages; VACUUM is told the counts below.
 
 **Page counts** (2026-09-25 review).  IndexBulkDeleteResult has three: `pages_newly_deleted`,
@@ -16767,14 +16771,17 @@ more. A bucket's codes are collected in an array, which switches to an INT8 tupl
 of `maintenance_work_mem` past an eighth (one key of a column with few keys can be most of the
 table), freeing the array; the spool leaves the summaries that quarter of its budget (§24
 "Build"). A closed bucket is sorted, run through a collecting builder into the same items a
-posting set is made of, and put aside in a temporary BufFile after a header naming its key. A
-full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not when it fills, so that
-when the column's values are done (`lion_sum_finish()`) there is always a last bucket, and it is
-closed as the SUMLAST whatever its size - a column with rows always has its open bucket (one that
-filled exactly at the last key used to be closed as a regular summary, and the column had none);
-`auto` decides, and the file is replayed through ordinary builders into entries written after the
-column's values - which is where they sort. The build's DEBUG1 line reports the buckets per column
-and whether they were kept.
+posting set is made of, and put aside in a temporary BufFile after a header naming its key; the
+array's sort (a `sort_template.h` sort that checks for interrupts as it partitions, not `qsort()`)
+and both loops over the codes answer a cancel, the loops every 64K codes as the pass's own loop
+does (`lion_sum_close_bucket()`, since the 2026-10-18 review: a bucket of millions of codes had
+no check at all). A full bucket is closed when the NEXT key arrives (`lion_sum_key_begin()`), not
+when it fills, so that when the column's values are done (`lion_sum_finish()`) there is always a
+last bucket, and it is closed as the SUMLAST whatever its size - a column with rows always has
+its open bucket (one that filled exactly at the last key used to be closed as a regular summary,
+and the column had none); `auto` decides, and the file is replayed through ordinary builders into
+entries written after the column's values - which is where they sort. The build's DEBUG1 line
+reports the buckets per column and whether they were kept.
 
 ### Insert (lion_insert.c)
 
@@ -20516,7 +20523,10 @@ page that holds no member (§44.6).
   `partitions` reloption's old ceiling of a million. Measured on 500,000 rows of 16 dimensions,
   `maintenance_work_mem` 1 GB, 60,000 partitions (the heap scans take 8 s): before, the build ran
   on past 150 s of a 60 s `statement_timeout` and a cancel, and took `kill -9`; after, it stops at
-  10.02 s of a 10 s one and 60.01 s of a 60 s one. The second heap scan, which finds each row's
+  10.02 s of a 10 s one and 60.01 s of a 60 s one. The coding of the FINAL centroids after
+  k-means, each one's REFINE item put as it is coded (`lionvec_build_centroids()`), checks once a
+  centroid as well since the 2026-10-18 review; it had no check, which at `LIONVEC_MAX_PARTS` =
+  262,144 partitions of many dimensions is seconds. The second heap scan, which finds each row's
   partitions (below) and so costs as much as an iteration of k-means over every row, was deaf too,
   for another reason found measuring the first: the build kept the REFINE page it was filling
   locked from row to row, and a content lock holds off interrupts. It now keeps the page pinned

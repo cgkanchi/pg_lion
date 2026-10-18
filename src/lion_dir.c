@@ -1039,6 +1039,16 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
 	if (!keep)
 		UnlockReleaseBuffer(buf);
 
+	/*
+	 * For an index in shared buffers this check does nothing: nbuf is locked
+	 * here, as the guard is from the walk's first step to its caller's
+	 * release, and a content lock holds interrupts off (lion.h) - which is
+	 * why the walk's bound, and not this, is what ends a cycle, and a cancel
+	 * is seen at the first check after the guard goes.  Nothing is lost by
+	 * that: an ERROR raised with content locks held releases them in its
+	 * abort.  The check is live for a temporary index, whose local buffers
+	 * LockBuffer() does not lock.
+	 */
 	CHECK_FOR_INTERRUPTS();
 	return nbuf;
 }
