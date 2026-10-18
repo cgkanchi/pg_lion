@@ -646,6 +646,13 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
  * Remember the level-1 page blk, locked, as the one a descent took its leaf's
  * downlink from (LionDirParent).  A high key longer than a pivot can be is
  * damage the next read of the page reports; it is just not remembered.
+ *
+ * The high key is read by its line pointer without lion_entry_at() because
+ * the one caller has just compared it, under the same lock, through
+ * lion_page_highkey() - the walk right stops on a page that is not rightmost
+ * only by that comparison - and lion_entry_at() refused it then unless it
+ * lies inside the page and holds a header and its key.  What is new below
+ * is its length against a pivot's, which the copy is sized by.
  */
 static void
 lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
