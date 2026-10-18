@@ -4965,20 +4965,28 @@ lionvec_page_items(Size itemsz)
 /*
  * What the planner needs of the index: the CODE pages' share of its
  * `pages` pages, by the dimensions the meta page records (or 1536 if none
- * yet), how many rows a CODE page holds, the partitions, and the CODE items
- * a row has - two if the build spilled (the meta page's flags), else one.
+ * yet), how many rows a CODE page holds, the partitions, the CODE items a
+ * row has - two if the build spilled (the meta page's flags), else one -
+ * and whether a scan reads the vectors by their places in TOAST, which the
+ * scan asks of its meta page as it starts (lionvec_reads_placed()).
  */
 static double
 lionvec_code_pages(Oid indexoid, double pages, double *perpage,
-				   double *nparts, double *items)
+				   double *nparts, double *items, bool *placed)
 {
 	Relation	index = index_open(indexoid, NoLock);
+	Relation	heap;
 	LionVecMetaData meta;
 	double		code;
 	double		ref;
 	int			dimsp;
 
 	lionvec_read_meta(index, &meta);
+	/* the query holds the table's lock, as it does the index's */
+	heap = table_open(index->rd_index->indrelid, NoLock);
+	*placed = lionvec_reads_placed(heap, &meta, meta.dims,
+								   lionvec_index_half(index));
+	table_close(heap, NoLock);
 	index_close(index, NoLock);
 	*nparts = meta.nparts;
 	*items = (meta.flags & LIONVEC_META_SPILL) != 0 ? 2.0 : 1.0;
@@ -4994,19 +5002,83 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
 }
 
 /*
+ * The exact path's start-up (DESIGN.md §44.7, "Exact path pricing"), for n
+ * members: priced as core prices the plan it competes with, a sort of the
+ * lion bitmap scan's rows, which reads the same members' vectors.  A
+ * member costs an index tuple, a row's work (LIONVEC_ROW_OPS) and the ORDER
+ * BY operator's function, which the scan calls on every member as core
+ * charges the sort's input every row of the expression (at COST 100 a
+ * quarter of a sequential page); and the pages it reads, by how the scan
+ * will read them (placed, lionvec_reads_placed()):
+ *
+ * - By place: the LOC pages whose heap blocks hold a member, in block
+ *   order (a row's entry on each, LIONVEC_LOC_SIZE(1), the common case's
+ *   one run), and the LOCDIR, whole, read in order; and no page of the
+ *   heap or of TOAST a member.  A member's TOAST pages are read by every
+ *   plan that computes its distance, the sort's detoast too - through the
+ *   TOAST index, one at a time, after the row's heap page - and core prices
+ *   none of them: charged to the exact path alone, even at seq_page_cost
+ *   a page, they kept the sort the plan at 0.3% to 3% of 100,000 rows of
+ *   1536 dimensions in TOAST, where LionOrdered ran 2.0 to 2.7 times faster
+ *   warm and 1.3 to 1.65 cold (§44.7).  The row's heap page is read when it
+ *   is returned (lv_check_placed()): *fetch, as it is.
+ * - From the heap: the members' heap pages, each once in TID order, as the
+ *   bitmap heap scan reads the same rows' pages, where until 2026-10-18
+ *   every member was a random page, however few pages they lay on; and
+ *   nothing more when a row is returned (*fetch 0), its page read then.
+ */
+static Cost
+lionvec_exact_cost(PlannerInfo *root, IndexPath *path, double n, bool placed,
+				   Cost *fetch)
+{
+	IndexOptInfo *index = path->indexinfo;
+	QualCost	orderby;
+	Cost		cost;
+	double		spc_random;
+	double		spc_seq;
+
+	n = Max(n, 1.0);
+	cost_qual_eval(&orderby, path->indexorderbys, root);
+	cost = orderby.startup +
+		n * (cpu_index_tuple_cost + LIONVEC_ROW_OPS * cpu_operator_cost +
+			 orderby.per_tuple);
+	if (placed)
+	{
+		double		locpages = ceil(Max(index->tuples, 1.0) /
+									lionvec_page_items(LIONVEC_LOC_SIZE(1)));
+		double		dirpages = ceil(locpages /
+									lionvec_page_items(sizeof(LionVecLocDir)));
+
+		get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
+		cost += lionvec_pages_in_order(n, locpages, spc_random, spc_seq) +
+			dirpages * spc_seq;
+	}
+	else
+	{
+		get_tablespace_page_costs(index->rel->reltablespace, &spc_random,
+								  &spc_seq);
+		cost += lionvec_pages_in_order(n, (double) index->rel->pages,
+									   spc_random, spc_seq);
+		*fetch = 0.0;
+	}
+	return cost;
+}
+
+/*
  * The cost of a scan's first row, which is most of its cost.  Restricted to
  * no more members than lionvec_exact_limit() allows - by the same partition
- * count the scan reads from the meta page, so that the two agree - the
- * members' distances from the heap, every one, a random page each, which
- * is what a cold scan pays (§44.6; priced so, at 1.3 members a partition
- * the plain scan with a Filter, priced low under a selective filter, can
- * come out cheaper than either exact plan, §44.7).  Otherwise every
- * centroid's estimate, then the partitions a scan probes, a random read
- * each and their CODE pages in order, plane 1 of their members, and a
- * batch's refines and exact distances, each a page read and a heap fetch.
- * `members` is how many rows a restriction admits, or the index's rows.
- * *ranking is the centroids' part, which every participant of a parallel
- * scan pays (lion_vec_parallel_cost()); none for the members alone.
+ * count the scan reads from the meta page, so that the two agree - every
+ * member's distance, read as the scan will read it (lionvec_exact_cost()).
+ * Otherwise every centroid's estimate, then the partitions a scan probes,
+ * a random read each and their CODE pages in order, plane 1 of their
+ * members, and a batch's refines and exact distances, each a page read and
+ * a heap fetch.  `members` is how many rows a restriction admits, or the
+ * index's rows.  *ranking is the centroids' part, which every participant
+ * of a parallel scan pays (lion_vec_parallel_cost()); none for the members
+ * alone.  *fetch is the page a row costs when it is returned, a random heap
+ * page unless the exact path read it before its first row.  *fetched is
+ * the rows fetched before the first: the batch's, or every member's on the
+ * exact path.
  *
  * A scan under a filter (`filtered`; DESIGN.md §44.6, "Filter at the
  * fetch") of `members` of the rows probes as the restricted scan of them
@@ -5014,19 +5086,21 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
  * members only from their heap tuples: it never takes the exact path, it
  * estimates every row it walks, and it refines and fetches 1 / frac rows
  * for each of the batch's members, no more than it walks.  *fetched is
- * those rows, which the filter is tested on; the batch's refines and
- * fetches when not filtered.
+ * then those rows, which the filter is tested on.
  */
 static Cost
-lionvec_startup_cost(IndexOptInfo *index, double members, bool filtered,
-					 double *codepages, Cost *ranking, double *fetched)
+lionvec_startup_cost(PlannerInfo *root, IndexPath *path, double members,
+					 bool filtered, double *codepages, Cost *ranking,
+					 Cost *fetch, double *fetched)
 {
+	IndexOptInfo *index = path->indexinfo;
 	double		tuples = Max(index->tuples, 1.0);
 	double		perpage;
 	double		nparts;
 	double		items;
+	bool		placed;
 	double		pages = lionvec_code_pages(index->indexoid, index->pages, &perpage,
-										   &nparts, &items);
+										   &nparts, &items, &placed);
 	double		frac = Min(1.0, Max(members, 0.0) / tuples);
 	double		share;
 	double		read;
@@ -5036,6 +5110,8 @@ lionvec_startup_cost(IndexOptInfo *index, double members, bool filtered,
 	double		batch = Min((double) lionvec_batch, Max(members, 1.0));
 	double		scored;
 
+	get_tablespace_page_costs(index->rel->reltablespace, &spc_random, &spc_seq);
+	*fetch = spc_random;
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 
 	if (!filtered && frac < 1.0 && members <= lionvec_exact_limit(nparts))
@@ -5043,8 +5119,7 @@ lionvec_startup_cost(IndexOptInfo *index, double members, bool filtered,
 		*codepages = 0.0;
 		*ranking = 0.0;
 		*fetched = Max(members, 1.0);
-		return Max(members, 1.0) * (spc_random + cpu_index_tuple_cost +
-									LIONVEC_ROW_OPS * cpu_operator_cost);
+		return lionvec_exact_cost(root, path, members, placed, fetch);
 	}
 
 	share = 1.0;
@@ -5081,24 +5156,27 @@ lion_vec_index(IndexOptInfo *index)
 }
 
 Cost
-lion_vec_scan_cost(IndexOptInfo *index, double members)
+lion_vec_scan_cost(PlannerInfo *root, IndexPath *path, double members,
+				   Cost *fetch)
 {
 	double		codepages;
 	Cost		ranking;
 	double		fetched;
 
-	return lionvec_startup_cost(index, members, false, &codepages, &ranking,
-								&fetched);
+	return lionvec_startup_cost(root, path, members, false, &codepages,
+								&ranking, fetch, &fetched);
 }
 
 Cost
-lion_vec_filter_cost(IndexOptInfo *index, double members, double *fetched)
+lion_vec_filter_cost(PlannerInfo *root, IndexPath *path, double members,
+					 double *fetched)
 {
 	double		codepages;
 	Cost		ranking;
+	Cost		fetch;
 
-	return lionvec_startup_cost(index, members, true, &codepages, &ranking,
-								fetched);
+	return lionvec_startup_cost(root, path, members, true, &codepages,
+								&ranking, &fetch, fetched);
 }
 
 /*
@@ -5115,18 +5193,19 @@ lion_vec_filter_cost(IndexOptInfo *index, double members, double *fetched)
  * that did not pause tied LionOrdered at 1% and ran 7 times slower.
  */
 static void
-lionvec_order_cost(IndexPath *path, Cost *startup, Cost *total,
-				   Cost *ranking, double *pages)
+lionvec_order_cost(PlannerInfo *root, IndexPath *path, Cost *startup,
+				   Cost *total, Cost *ranking, double *pages)
 {
 	IndexOptInfo *index = path->indexinfo;
 	double		deeper;
 	double		spc_random;
 	double		spc_seq;
+	Cost		fetch;
 	double		fetched;
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
-	*startup = lionvec_startup_cost(index, index->tuples, false, pages, ranking,
-									&fetched);
+	*startup = lionvec_startup_cost(root, path, index->tuples, false, pages,
+									ranking, &fetch, &fetched);
 	deeper = lionvec_patience > 0 ? LIONVEC_DEEPER_PAUSED : LIONVEC_DEEPER;
 	*total = *startup +
 		Max(index->tuples, 1.0) *
@@ -5164,7 +5243,7 @@ lionvec_parallel_divisor(Path *path)
  * partial paths that come out of it.
  */
 void
-lion_vec_parallel_cost(IndexPath *path)
+lion_vec_parallel_cost(PlannerInfo *root, IndexPath *path)
 {
 	Cost		startup;
 	Cost		total;
@@ -5177,7 +5256,7 @@ lion_vec_parallel_cost(IndexPath *path)
 	if (path->path.parallel_workers <= 0 || path->indexorderbys == NIL ||
 		!lion_vec_index(path->indexinfo))
 		return;
-	lionvec_order_cost(path, &startup, &total, &ranking, &pages);
+	lionvec_order_cost(root, path, &startup, &total, &ranking, &pages);
 	divisor = lionvec_parallel_divisor(&path->path);
 	pstartup = ranking + (startup - ranking) / divisor;
 	ptotal = pstartup + (total - startup) / divisor;
@@ -5223,8 +5302,8 @@ lionveccostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	 * min_parallel_index_scan_size), unless the table's parallel_workers
 	 * says how many; its cost is lion_vec_parallel_cost()'s.
 	 */
-	lionvec_order_cost(path, indexStartupCost, indexTotalCost, &ranking,
-					   indexPages);
+	lionvec_order_cost(root, path, indexStartupCost, indexTotalCost,
+					   &ranking, indexPages);
 
 	/*
 	 * No lionvec index may be read while PostgreSQL 16's

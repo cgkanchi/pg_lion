@@ -641,10 +641,13 @@ extern int64 lion_vec_filter_removed(IndexScanDesc scan);
 extern void lion_vec_scan_limit(IndexScanDesc scan, int64 rows);
 
 /*
- * ... and what a scan of it restricted to `members` of its `tuples` rows
- * costs before its first row, for the planner (§44.7).
+ * ... and what a scan of path's order restricted to `members` of the
+ * index's rows costs before its first row, for the planner (§44.7), and
+ * *fetch, the page each row it returns costs then: a random heap page,
+ * or none where the exact path read it before the first.
  */
-extern Cost lion_vec_scan_cost(IndexOptInfo *index, double members);
+extern Cost lion_vec_scan_cost(PlannerInfo *root, IndexPath *path,
+							   double members, Cost *fetch);
 
 /*
  * ... or under a filter that keeps `members` of them
@@ -653,8 +656,8 @@ extern Cost lion_vec_scan_cost(IndexOptInfo *index, double members);
  * it expects to fetch, each tested by the filter (§44.6, "Filter at the
  * fetch"; §44.7).
  */
-extern Cost lion_vec_filter_cost(IndexOptInfo *index, double members,
-								 double *fetched);
+extern Cost lion_vec_filter_cost(PlannerInfo *root, IndexPath *path,
+								 double members, double *fetched);
 
 /*
  * ... and the price of a partial path of a lionvec order, which core gives
@@ -662,6 +665,6 @@ extern Cost lion_vec_filter_cost(IndexOptInfo *index, double members,
  * probes and its rows divided among the processes (§44.7), called by
  * LionOrdered's set_rel_pathlist_hook for each such path.
  */
-extern void lion_vec_parallel_cost(IndexPath *path);
+extern void lion_vec_parallel_cost(PlannerInfo *root, IndexPath *path);
 
 #endif							/* LION_VEC_H */

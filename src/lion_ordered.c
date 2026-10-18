@@ -1536,11 +1536,13 @@ lo_knn_path(IndexPath *ipath)
 /*
  * The cost of the node over a lionvec index's order (DESIGN.md §44.6): the
  * set, built as lo_cost() prices it; the vector scan restricted to its
- * members, which reads plane 1 of the CODE pages that hold one before its
- * first row (lion_vec_scan_cost()); and then, for every member it returns,
- * at worst a refine and the heap fetch of its exact distance, and the
- * node's own fetch of that row - from the page the scan has just read - its
- * set probe and its quals.
+ * members, which before its first row reads plane 1 of the CODE pages that
+ * hold one, or computes every member's distance (lion_vec_scan_cost()); and
+ * then, for every member it returns, at worst a refine and the heap fetch
+ * of its exact distance - or the exact path's check of a row it read by
+ * place, or nothing for one it read from the heap, whose page it read
+ * before the first row (`fetch`) - and the node's own fetch of that row,
+ * from the page the scan has just read, its set probe and its quals.
  */
 static void
 lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
@@ -1553,8 +1555,7 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		pages = Max((double) rel->pages, 1.0);
 	double		members;
 	double		ncont;
-	double		spc_random;
-	double		spc_seq;
+	Cost		fetch;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
@@ -1567,10 +1568,9 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	startup = lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
-		lion_vec_scan_cost(ord->indexinfo, members);
+		lion_vec_scan_cost(root, ord, members, &fetch);
 
-	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
-	run = members * (spc_random + cpu_index_tuple_cost + cpu_operator_cost +
+	run = members * (fetch + cpu_index_tuple_cost + cpu_operator_cost +
 					 cpu_tuple_cost);
 
 	cost_qual_eval(&qcost, residual, root);
@@ -1613,7 +1613,7 @@ lo_cost_knn_filter(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 	members = clamp_row_est(sel * tuples);
 	cost_qual_eval(&fcost, lionqual, root);
-	startup = lion_vec_filter_cost(ord->indexinfo, members, &fetched) +
+	startup = lion_vec_filter_cost(root, ord, members, &fetched) +
 		fcost.startup + fetched * fcost.per_tuple;
 
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
@@ -2556,7 +2556,7 @@ lo_knn_take(PlannerInfo *root, RelOptInfo *rel, LoKnn *knn)
  * offered again.
  */
 static void
-lo_knn_partial(RelOptInfo *rel)
+lo_knn_partial(PlannerInfo *root, RelOptInfo *rel)
 {
 	List	   *repriced = NIL;
 	ListCell   *lc;
@@ -2579,7 +2579,7 @@ lo_knn_partial(RelOptInfo *rel)
 
 		if (!lionvec_parallel_scan)
 			continue;
-		lion_vec_parallel_cost(ipath);
+		lion_vec_parallel_cost(root, ipath);
 		add_partial_path(rel, (Path *) ipath);
 	}
 	list_free(repriced);
@@ -3282,7 +3282,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	knn.why = LO_KNN_NONE;
 	if (lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 		lo_knn_take(root, rel, &knn);
-	lo_knn_partial(rel);
+	lo_knn_partial(root, rel);
 	lo_set_rel_pathlist(root, rel, rte, &knn);
 	if (knn.taken != NIL && knn.offered == 0 &&
 		lionvec_postfilter == LIONVEC_POSTFILTER_ERROR && !lo_knn_kept(rel) &&
