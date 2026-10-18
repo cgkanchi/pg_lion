@@ -28,8 +28,8 @@ RECOVERY_RUN_AS=postgres make recovery-check RECOVERY_PREFIX=<prefix>
 `share/postgresql/extension`), and it is REQUIRED - `--prefix` or
 `RECOVERY_PREFIX`; the run refuses to start without one. There is no default
 on purpose: the extension is rebuilt from a clean copy of this tree — `src/`,
-the Makefile, the control and SQL files, with `src/*.o` removed — and
-*installed* into that prefix, exactly as `bench/lib.sh`'s
+the Makefile, the control and SQL files, with the objects and the compiler's
+`src/*.d` removed — and *installed* into that prefix, exactly as `bench/lib.sh`'s
 `bench_build_extension` does, so a guessed prefix would be somebody else's
 server. `make install` is never run in the source tree, and the prefix is
 deliberately not derived from `PG_CONFIG`.
