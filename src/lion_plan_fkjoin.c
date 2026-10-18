@@ -879,20 +879,46 @@ lion_fkjoin_private(const LionCountPriv *base, int joinclause, int jointype,
 }
 
 /*
+ * The width of the dimension's key column, as core's set_rel_width() set it
+ * for the dimension's rel: the column's statistics where ANALYZE left some,
+ * the type's guess otherwise.
+ */
+static int32
+lion_fkjoin_key_width(const LionFkJoin *fj)
+{
+	RelOptInfo *dim = fj->dimrel;
+	AttrNumber	attno = fj->pkvar->varattno;
+
+	if (dim != NULL && dim->attr_widths != NULL &&
+		attno >= dim->min_attr && attno <= dim->max_attr &&
+		dim->attr_widths[attno - dim->min_attr] > 0)
+		return dim->attr_widths[attno - dim->min_attr];
+	return get_typavgwidth(fj->pkvar->vartype, fj->pkvar->vartypmod);
+}
+
+/*
  * What making the keys of a forward semi join over a non-unique key distinct
  * costs (DESIGN.md §27, "Forward semi joins over a non-unique key"): the keys
- * of `rows` child rows, `width` bytes each, sorted, and each taken out of the
- * sort again and compared with the previous distinct key.  All of it comes
- * before the first key is looked up.  A datum sort holds three words a key,
- * and the key itself when it is passed by reference; past work_mem it writes
+ * of `rows` child rows sorted, and each taken out of the sort again and
+ * compared with the previous distinct key.  All of it comes before the first
+ * key is looked up.  A datum sort holds three words a key, and the key itself
+ * when it is passed by reference, `keywidth` bytes; past work_mem it writes
  * its keys out and reads them back once, three quarters of the pages in
  * sequence, as core's cost_tuplesort() charges one merge pass.
+ *
+ * The sort is of the bare keys (lion_join_sort_keys(), lion_exec_fkjoin.c),
+ * never of the child's rows, so it is the key that decides when it outgrows
+ * work_mem.  It was priced at the child's whole row width, and a key passed
+ * by value at a copy it does not have, which made the sort spill on paper
+ * where it fits in memory and the semi join dearer than it is - never
+ * cheaper.
  */
 static Cost
-lion_fkjoin_sort_cost(double rows, int width)
+lion_fkjoin_sort_cost(double rows, bool keybyval, int32 keywidth)
 {
 	double		n = Max(rows, 2.0);
-	double		bytes = n * (MAXALIGN(width) + 3 * sizeof(Datum));
+	double		keybytes = keybyval ? 0.0 : (double) MAXALIGN(keywidth);
+	double		bytes = n * (keybytes + 3 * sizeof(Datum));
 	Cost		cost;
 
 	cost = LION_FKJOIN_SORT_COMPARE_COST * n * (log(n) / log(2.0)) +
@@ -1251,7 +1277,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	lion_units_cold(&units, run, reads);
 	if (unique)
 		sortcost = lion_fkjoin_sort_cost(child->rows,
-										 child->pathtarget->width);
+										 get_typbyval(fj->pkvar->vartype),
+										 lion_fkjoin_key_width(fj));
 	run = lion_units_price(&units, run);
 	sortcost = lion_units_price(&units, sortcost);
 
