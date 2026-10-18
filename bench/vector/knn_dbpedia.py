@@ -152,6 +152,10 @@ EFS = [int(x) for x in os.environ.get('KNN_EF', '20,40,70,100,200,400').split(',
 PROBES = [int(x) for x in os.environ.get('KNN_PROBES', '10,20,40,80,160,320').split(',')]
 SEARCH_LIST = [int(x) for x in os.environ.get('KNN_SEARCH_LIST', '10,20,30,50,100,200,400').split(',')]
 RESCORE = [int(x) for x in os.environ.get('KNN_RESCORE', '50').split(',')]
+# VectorChord's filtered sweep without its prefilter but with sorts off; its
+# recall is the plain plan's, so KNN_VCHORD_SORT_OFF=0 leaves it out where a
+# query takes seconds (MS MARCO at 50M)
+VCHORD_SORT_OFF = os.environ.get('KNN_VCHORD_SORT_OFF', '1') == '1'
 INDEXES = {kind: f'{TABLE}_{suffix}' for kind, suffix in
            (('lionvec', 'lv'), ('hnsw', 'hnsw'), ('vchord', 'vchord'), ('diskann', 'diskann'))}
 ON_EMBEDDING = (INDEXES['lionvec'], INDEXES['vchord'], INDEXES['diskann'])    # on the column itself
@@ -607,8 +611,9 @@ def methods(kind, sel):
             if sel < 1.0:
                 m.append((f'vchord probes={probes} prefilter', sql(kind, sel),
                           s + ['SET vchordrq.prefilter = on', 'SET enable_sort = off']))
-                m.append((f'vchord probes={probes} enable_sort=off', sql(kind, sel),
-                          s + ['SET enable_sort = off']))
+                if VCHORD_SORT_OFF:
+                    m.append((f'vchord probes={probes} enable_sort=off', sql(kind, sel),
+                              s + ['SET enable_sort = off']))
     else:
         # pgvectorscale's diskann: the search list size and the rescored
         # count; under a filter its streaming scan with the filter applied to
