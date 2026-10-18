@@ -1181,8 +1181,7 @@ lion_node_overhead(LionKeyNodeKind kind, int nargs)
 		mem += 2 * lion_alloc_size(LION_CONTAINER_MAX_SIZE);	/* acc[] */
 	if (kind == LION_KN_AND)
 		mem += (Size) nargs * sizeof(int);	/* order */
-	if (kind == LION_KN_POSFILTER)
-		mem += LION_POSFILTER_MEM;	/* the filter */
+	/* a LION_KN_POSFILTER's filter grows with its query: lion_plan_node() */
 	if (kind == LION_KN_OR)
 	{
 		mem += (Size) nargs * LION_OR_CHILD_OVERHEAD;	/* heap, hot, hotc */

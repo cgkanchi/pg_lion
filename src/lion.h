@@ -1191,6 +1191,8 @@ typedef struct LionPosSpec
 	LionState  *col;
 	Datum		query;
 	StrategyNumber strategy;
+	Size		mem;			/* what each such filter holds, about
+								 * (lion_posfilter_mem()) */
 } LionPosSpec;
 
 typedef struct LionKeyNode
@@ -2530,16 +2532,9 @@ extern const LionPosMember *lion_poscursor_next(Relation index,
 												uint64 code);
 extern void lion_poscursor_close(LionPosCursor *cur);
 
-/*
- * What a LION_KN_POSFILTER cursor holds, about: the filter's two member
- * arrays and its container, and a leaf page copied for each position cursor,
- * taken to be four.
- */
-#define LION_POSFILTER_MEM \
-	(2 * sizeof(uint16) * LION_CONTAINER_RANGE + LION_CONTAINER_MAX_SIZE + \
-	 4 * BLCKSZ)
 extern LionPosFilter *lion_posfilter_begin(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy);
+extern Size lion_posfilter_mem(Datum query);
 extern int	lion_posfilter_container(LionPosFilter *pf, const LionContainer *c,
 									 uint16 *keep);
 extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
