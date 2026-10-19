@@ -35,7 +35,9 @@ INSERT INTO rcon_readers VALUES
 	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
 	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
 	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$),
+	('lion_bm25, a named column',    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10, col => 'd')$$),
 	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$),
+	('lion_bm25_score, a named column', $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d', col => 'd') > 0$$),
 	('lion_index_facets',            $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_d', 3)$$),
 	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$);
 

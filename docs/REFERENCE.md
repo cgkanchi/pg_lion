@@ -7,8 +7,8 @@ SQL functions, key types, multi-key operators, index options, settings and known
 Ordinary SQL is the interface - the planner uses the index and the `LionCount` pushdown on its own -
 and these functions are for testing, diagnostics and the occasional direct count:
 
-    lion_bm25(idx, query, k [, k1, b])              the k best rows by BM25, best first (an index with positions)
-    lion_bm25_score(tsv, query, idx [, k1, b])      one row's BM25 score; ORDER BY it for the LionBm25 scan
+    lion_bm25(idx, query, k [, k1, b, col])         the k best rows by BM25, best first (an index with positions)
+    lion_bm25_score(tsv, query, idx [, k1, b, col]) one row's BM25 score; ORDER BY it for the LionBm25 scan
     lion_index_count(idx, key)                      count(*) WHERE col = key, through one index
     lion_index_count(idx1, key1, idx2, key2)        ... AND col2 = key2, two indexes on one table
     lion_index_count_any(idx, keys)                 count(*) WHERE col = ANY (keys)
@@ -144,7 +144,7 @@ a weight or a NOT, and is not used for ranking, can leave them out:
 
     CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = off);
 
-An index with positions also ranks. `lion_bm25(index, query, k [, k1, b])` returns the `k` rows
+An index with positions also ranks. `lion_bm25(index, query, k [, k1, b, col])` returns the `k` rows
 with the highest BM25 score for the query's lexemes, best first, scored entirely from the index
 (term frequencies, document frequencies and each row's length, which the index keeps under its own
 key); the heap is read only to check that the rows returned are visible. Join on `ctid` for the rows:
@@ -164,10 +164,24 @@ are skipped (MaxScore), so a very common lexeme next to rarer ones costs little.
 security applies to the caller: the statistics count every row, so a score would reveal what the
 hidden rows hold.
 
-`lion_bm25_score(tsv, query, index [, k1, b])` is the same score for one row, from its tsvector and
-the index's statistics. Ordered by it, with a `WHERE` that matches on the same column, the planner
-returns the rows best first straight from the index (a `LionBm25` scan) instead of scoring and
-sorting every match:
+An index on several `tsvector` columns ranks each of them on its own. Every column that stores
+positions keeps statistics of its own, so a column ranks exactly as an index on that column alone
+would, and `col` says which one; it is needed only when more than one column of the index stores
+positions, and leaving it out then is an error that names the candidates:
+
+    CREATE INDEX doc_text_idx ON doc USING lion (title, body, lang);
+    SELECT * FROM lion_bm25('doc_text_idx', 'cat | dog', 10, col => 'body');
+
+`col` is the column's name in the index, as `\d doc_text_idx` lists it under Column: for a plain
+column the table column's name when the index was built, and for an expression the name CREATE
+INDEX gave it, such as `to_tsvector`, then `to_tsvector1` for a second one. A name the index does
+not have, or a column that does not store positions, is an error; `col => NULL` is the same as
+leaving it out. A NULL in any other argument gives no rows (`lion_bm25_score()`: NULL).
+
+`lion_bm25_score(tsv, query, index [, k1, b, col])` is the same score for one row, from its
+tsvector and the statistics of the index column `col` names. Ordered by it, with a `WHERE` that
+matches on the same column, the planner returns the rows best first straight from the index (a
+`LionBm25` scan) instead of scoring and sorting every match:
 
     SELECT d.*, lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') AS score
       FROM doc d
@@ -175,10 +189,13 @@ sorting every match:
      ORDER BY lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') DESC
      LIMIT 10;
 
-The scan is offered when the query and index are constants and every row the `WHERE`'s tsquery can
-match has one of the scored lexemes - the usual case of the same query in both places. Other
-`WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
-else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
+The scan is offered when the query, index and `col` are constants, the tsvector scored is the
+column the function ranks - `d.body` in `lion_bm25_score(d.body, q, 'doc_text_idx', col =>
+'body')`, a plain column, not an expression - and every row the `WHERE`'s tsquery can match has
+one of the scored lexemes, the usual case of the same query in both places. Other `WHERE` clauses
+filter its rows, and a second sort key is an incremental sort above it. Elsewhere - another
+tsvector scored against a column's statistics included - the function scores row by row; either
+way the rows and scores are the function's. `pg_lion.enable_bm25_scan` turns the scan off.
 
 A lexeme of up to 2043 bytes is a key as it is. A longer one (tsvector allows 2047) is stored as its
 first bytes and its SHA-256, and a query that names a lexeme of 2043 bytes or more has every
@@ -506,9 +523,9 @@ working around a bad choice:
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
   catch up (DESIGN.md §36). Off, every group is counted.
-- `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(col, query, index)
-  DESC` with a `WHERE col @@ ...` it covers: the rows best first from the index's BM25 walk
-  (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
+- `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(tsv, query, index
+  [, ...]) DESC` with a `WHERE tsv @@ ...` it covers: the rows best first from the index's BM25
+  walk (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would

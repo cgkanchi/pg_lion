@@ -84,7 +84,12 @@ INSERT INTO nc_nodes VALUES
 	('LionBm25',
 	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'') FROM nc WHERE d @@ ''w1 & w3''
 	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'') DESC LIMIT 5',
-	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8)',
+	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
+	 'enable_seqscan enable_bitmapscan enable_indexscan'),
+	('LionBm25, a named column',
+	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') FROM nc WHERE d @@ ''w1 & w3''
+	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') DESC LIMIT 5',
+	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
 	 'enable_seqscan enable_bitmapscan enable_indexscan');
 
 -- lion's paths on and the core settings in force off, or the other way round
