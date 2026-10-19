@@ -1687,6 +1687,10 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	 */
 	ResetExprContext(econtext);
 
+	/* rows counted from the relation's indexes (lion_count_report_reads()) */
+	if (st->heap != NULL)
+		st->statrows += count;
+
 	ExecClearTuple(slot);
 	for (i = 0; i < st->ntlist; i++)
 	{

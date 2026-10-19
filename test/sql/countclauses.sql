@@ -37,8 +37,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_nestloop', 'off', true);
@@ -62,8 +61,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_cc_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_cc_on' INTO nrows;
@@ -94,8 +92,7 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_ccp_on AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_ccp_on(' || args || ')' LOOP
@@ -115,8 +112,7 @@ BEGIN
 	EXECUTE 'PREPARE lion_ccp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_cc_off AS EXECUTE lion_ccp_off(%s)', args);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_ccp_on';
 	EXECUTE 'DEALLOCATE lion_ccp_off';
@@ -351,8 +347,7 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 -- What EXPLAIN prints: each clause as core prints its index condition.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'val1';
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status IN ('val1', 'val3');
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE dstatus::lion_cc_ws = 'val1';
@@ -367,8 +362,7 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE d >= current_date - 30;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE pc IN (lion_cc_pick(), 3);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 /*
  * A generic plan keeps an expression over a Param as it is, and the node
@@ -386,8 +380,7 @@ SELECT lion_cc_prep('SELECT count(*) FROM lion_cc_t WHERE pc = $1 + 1', 'NULL');
 SET plan_cache_mode = force_generic_plan;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 PREPARE lion_ccq(int) AS SELECT count(*) FROM lion_cc_t WHERE pc = $1 + 1;
 EXPLAIN (COSTS OFF) EXECUTE lion_ccq(4);
 EXECUTE lion_ccq(4);
@@ -421,8 +414,7 @@ SELECT v.k, s.c FROM (VALUES (1), (4), (6)) v(k),
 RESET pg_lion.enable_count_pushdown;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- The same clauses through the access method's own scans.
 SELECT lion_cc_scan('index', $$SELECT id FROM lion_cc_t WHERE status = 'val2'$$);
@@ -454,15 +446,13 @@ SELECT n, lion_cc(q) FROM lion_cc_q ORDER BY n;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE status = 'val1' AND flag;
 EXPLAIN (COSTS OFF) SELECT flag, count(*) FROM lion_cc_t WHERE status IN ('val1', 'val3') GROUP BY flag;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_cc_t WHERE ts >= now() - interval '30 days' AND NOT flag;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 SELECT lion_cc_prep('SELECT count(*) FROM lion_cc_t WHERE d >= $1::date + 1 AND status = $2', 'current_date - 20, ''val1''');
 

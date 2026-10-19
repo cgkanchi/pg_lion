@@ -469,6 +469,31 @@ lion_path_disabled(const Path *p)
 #endif
 }
 
+/*
+ * Disable a lion path the way core's enable_* settings disable the index
+ * access it stands for (REFERENCE.md, "Settings"): kept, but marked, so that
+ * it is chosen only where nothing enabled is left - a disabled node more
+ * (PostgreSQL 18), or disable_cost on its price, as cost_index() charged it
+ * before.  enable_indexscan disables every index scan, index-only ones
+ * included, as cost_index() does; a path that answers from the index alone
+ * (LION_CORE_INDEXONLY) is disabled by enable_indexonlyscan too, since it has
+ * no form that reads the rows to fall back to, which core's index-only scans
+ * have.  Called once its price is final: add_path() compares the price.
+ */
+void
+lion_path_core_switches(Path *path, LionCoreScan scan)
+{
+	if (enable_indexscan &&
+		(scan != LION_CORE_INDEXONLY || enable_indexonlyscan))
+		return;
+#if PG_VERSION_NUM >= 180000
+	path->disabled_nodes++;
+#else
+	path->startup_cost += disable_cost;
+	path->total_cost += disable_cost;
+#endif
+}
+
 /* Does a bitmap path's tree of quals read a lion index? */
 static bool
 lion_bitmap_reads_lion(Path *bitmapqual, Oid lionam)

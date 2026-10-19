@@ -35,8 +35,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
 		|| q INTO j;
@@ -55,8 +54,7 @@ BEGIN
 	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
 		INTO want;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	IF got IS DISTINCT FROM want THEN
@@ -73,14 +71,12 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	EXECUTE 'EXPLAIN (ANALYZE, TIMING OFF, COSTS OFF, SUMMARY OFF, BUFFERS OFF, FORMAT JSON) '
 		|| q INTO j;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	RETURN jsonb_path_query_first(j, 'strict $.** ? (@."Custom Plan Provider" == "LionCount")') ->> prop;
 END $$;
 
@@ -179,7 +175,7 @@ SET plan_cache_mode = force_generic_plan;
 PREPARE lion_rsp(int, int) AS SELECT count(*) FROM lion_rs WHERE k >= $1 AND g = $2;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) EXECUTE lion_rsp(0, 3);
 EXECUTE lion_rsp(0, 3);
 EXECUTE lion_rsp(5, 3);
@@ -187,7 +183,7 @@ EXECUTE lion_rsp(900, 3);
 EXECUTE lion_rsp(NULL, 3);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SET pg_lion.enable_count_pushdown = off;
 EXECUTE lion_rsp(0, 3);
 EXECUTE lion_rsp(5, 3);

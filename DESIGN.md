@@ -9529,8 +9529,9 @@ replanned after its unique index and then its NOT NULL are dropped; and a partit
 per-partition unique indexes over repeating values, then a primary key. Every query there runs
 with LionOrdered (§30) switched off beside core's scans, and so does `group_coalesce.sql`: a btree
 on the DISTINCT or GROUP BY column gives core an aggregate over LionOrdered's presorted rows, which
-`enable_indexscan` does not disable, and which is the cheaper plan for a walk over a column with an
-entry per row (`count(DISTINCT u)` of a nullable unique `u`, `GROUP BY u`). From 17 core counts an
+`enable_indexscan` disables as it disables core's index scans (§39, "Core's switches"), so that it
+still competes wherever core's other scans are switched off too, and which is the cheaper plan for a
+walk over a column with an entry per row (`count(DISTINCT u)` of a nullable unique `u`, `GROUP BY u`). From 17 core counts an
 index on ANY grouping or DISTINCT key as useful for grouping, not only one on the leading key, so
 the same queries meet that competitor more often there than on 16. Left on, it decides the plan by
 cost and says nothing about whether the node was built; the first CI run of the test tripped over
@@ -14325,6 +14326,24 @@ reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
   trees) - the executor never has to iterate the elements with rescans.
 - `pgstat_count_index_scan()` and, on 18+, `instrument->nsearches` are counted once per source
   opened, i.e. once per rescan, as btree counts one per primitive scan.
+- **Statistics.** The custom nodes and the SQL functions keep `pg_stat_user_indexes` and
+  `pg_stat_user_tables` as the scans above do, so that an index lion reads never shows as unused.
+  A scan of an index (`pgstat_count_index_scan()`, which sets `last_idx_scan` too) is counted once
+  per scan and per rescan of each index read: LionCount (`lion_count_report_reads()`, as a run's
+  relation closes or the node rescans, from the relation's `statread` and `statrows`), the FK-side
+  joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
+  is counted by core's own scan under them), LionBm25 and the lionvec scan once per scan, and the
+  SQL functions once per call - `lion_bm25_score()` once a query, when it reads the index's
+  statistics into its cache. `idx_tup_read` counts what the index gave: a count's rows counted
+  (the distinct values of a `count(DISTINCT)`, the rows of the keys `lion_index_facets()` counted),
+  credited to each index of the count, since every one of them answered for each; a semi or anti
+  join's rows returned; the members of LionOrdered's sets and the entries of its walks of a lion
+  column; the entries of BM25's walks. `idx_tup_fetch` (`pgstat_count_heap_fetch()`) counts the rows
+  a node fetched by the index's order itself - a walk of a lion column, the rows BM25 returns - and
+  the rows fetched by a set's TIDs or rechecked in the heap by a count go to the table alone, as a
+  bitmap heap scan's do (`tuples_fetched` of the heap relation's `pgstat_info`). No node counts a
+  sequential scan. test/sql/index_usage.sql reads the deltas of every path after
+  `pg_stat_force_next_flush()`.
 - `amendscan` does everything `amrescan` does and frees the contexts. An ERROR in the middle of a
   scan leaves pins to the resource owner, which releases them, and the list pin budget is zeroed
   at the end of the transaction (§15).
@@ -16800,8 +16819,9 @@ what the defaults are fitted to:
   path well above the competitor's ratio is overpriced, and well below it underpriced, which is
   the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
   *(Since §39 a lion path's cost is in its competitor's units, and over a margin if one is set:
-  force its plans with core's `enable_*` settings, or set every `pg_lion.*_rate` and
-  `pg_lion.pushdown_margin` to 1, to read lion's own, and calibrate the rates themselves against
+  force its plans with core's `enable_*` settings and `pg_lion.enable_plain_scan` on a table
+  with no other index, or set every `pg_lion.*_rate` and `pg_lion.pushdown_margin` to 1, to read
+  lion's own, and calibrate the rates themselves against
   core's plans the same way.)*
 - Which setting to move is the one whose term dominates the path's price, read against the
   node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
@@ -19261,7 +19281,7 @@ margin.
 
 ### The margin
 
-`pg_lion.pushdown_margin`, default **1**, no margin. Set below 1, a lion custom path's own price, in
+`pg_lion.pushdown_margin`, default **1**, no margin, range 0.01 to 1000. Set below 1, a lion custom path's own price, in
 its competitor's units, is divided by the margin before the path is offered to `add_path()`, so that
 a lion path is chosen only where its price comes to at most that share of the best core plan's - at
 0.8, a near tie within 25% goes to core. It applies to every lion custom path - LionCount (serial,
@@ -19284,9 +19304,9 @@ paths meet their competitors later:
   would lose every LIMIT; declined only by dominance, the margin would never apply to it.
 
 A divided price carries the margin into every comparison it is in, whenever and wherever that is
-made, and forcing a plan works as it did: core's `enable_*` settings disable core's paths
-(`disabled_nodes` on PostgreSQL 18, `disable_cost` before it), which lose to an enabled lion path
-whatever its price, and `pg_lion.enable_*` leave lion's out. What it costs is that a lion path's
+made, and a disabled path still loses to an enabled one whatever the margin: core's `enable_*`
+settings disable core's paths and lion's alike ("Core's switches", below), and `pg_lion.enable_*`
+leave lion's out. What it costs is that a lion path's
 cost in EXPLAIN is its price over the margin, where one is set.
 
 **Not where it hedges nothing.** The margin is a hedge against the error of lion's price alone;
@@ -19341,8 +19361,43 @@ three wins go to core at 0.9 or 0.8, and the loss only at 0.6, the three wins lo
 had the fewest mispicks and the least time lost of the sweep in both runs ("The matrix", below). So
 the default is 1; the setting stays, with the exemptions above, for a site whose own matrix says
 otherwise. A margin above 1 - lion favoured - would have taken three more of the seven (the first
-three rows), and the setting stops at 1: on 39 queries that would be a fit, not the correction of a
-known bias.
+three rows), and the default stays at 1: on 39 queries that would be a fit, not the correction of a
+known bias. Above 1 the setting is a lever for tests and calibration: at 1000 it hands a lion path
+every comparison with an enabled core plan of the competitor's kind, which is how a test forces one
+over core's index scans: `enable_indexscan` cannot switch those off without disabling the lion
+paths too (below).
+
+### Core's switches (`lion_path_core_switches()`)
+
+Each lion custom path stands in for an index scan, and core's `enable_indexscan`,
+`enable_indexonlyscan` and `enable_bitmapscan` are what a user turns off to keep index scans out of
+a plan. So the first two disable the lion paths that do an index scan's or an index-only scan's
+work, by core's own mechanism: the path is kept and marked, `disabled_nodes` incremented on
+PostgreSQL 18 and later, `disable_cost` added to its startup and total cost before 18, so that it
+loses to any enabled path and still wins where every path left is disabled, as core's do. Removing
+it instead would leave a query whose every other path is disabled without a plan of lion's, which
+core's disabled paths never do. The mapping follows what the node reads:
+
+- **Index-only** (`LION_CORE_INDEXONLY`, disabled when `enable_indexscan` or `enable_indexonlyscan`
+  is off, as core's index-only scan is): LionCount in every form (serial, parallel, grouped,
+  partitioned, the FK-side join's count) and LionSemiJoin and LionAntiJoin answer from the index
+  alone - the heap is read only to recheck a row, as an index-only scan reads it for a page not all
+  visible.
+- **Index** (`LION_CORE_INDEXSCAN`, disabled when `enable_indexscan` is off, as core's plain index
+  scan is): LionOrdered (over a B-tree, or walking a lion or lionvec column), LionBtreeScan and
+  LionBm25 return the table's rows in an index's order or by an index's TIDs. LionOrdered and
+  LionBtreeScan in index-only mode are, as before, not offered with `enable_indexonlyscan` off
+  (§40.1); their heap mode stays.
+- **`enable_bitmapscan`** disables nothing of lion's: no custom node builds a TID bitmap for a heap
+  scan of core's, and the AM's own bitmap scans are core's paths, which the setting already
+  disables.
+
+The disabled mark goes on the node's own cost, outside the margin and the competitor's units: the
+price is divided by the margin first, then marked, so that no margin turns a disabled path into an
+enabled one. `pg_lion.enable_*` are unchanged and still leave a lion path out altogether. To force a
+lion path, a test switches off what it competes with that is not an index scan (`enable_seqscan`,
+`enable_bitmapscan`, `pg_lion.enable_plain_scan` for the AM's own plain scans) and sets
+`pg_lion.pushdown_margin` to 1000 for the core index scans it leaves on.
 
 ### Resident index pages: §22's third rung
 
@@ -19845,8 +19900,9 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   ordered paths and the lion columns' walks of §30.11, and with it off the unordered paths claim no
   order whatever core found useful - a `LionOrdered` must not appear with its switch off - and are
   all `LionBtreeScan`s; `pg_lion.enable_btree_scan` (bool, default on) gates the unordered paths.
-  Core's `enable_indexscan` leaves both alone, as it left `LionOrdered` alone: the node is priced
-  from `indextotalcost`, which carries no `disable_cost`.
+  Core's `enable_indexscan` disables both, as it disables the B-tree's own index scans (§39,
+  "Core's switches"): the path is kept and marked disabled after it is priced, since its price
+  comes from `indextotalcost`, which carries no `disable_cost`.
 - **Partitions**: as §30.11, each leaf is scanned like a table under core's Append or MergeAppend.
 
 ### 40.3 Cost (`lo_cost()`, index-only)
@@ -21704,8 +21760,9 @@ there went from LionOrdered probing (warm, 0.964 of the ten nearest in 8.7 and 9
 margin) to the plain scan (0.960 in 16.9 ms, 0.957 in 10.8 ms), where LionOrdered, forced, is exact
 in 4.2 and 7.8 ms and the sort exact in 2.9 and 4.6. The cost follows the scan, as it must for the
 planner to compare what will run; what is wrong is the plain scan's price, which the follow-up's
-problem 1 is to fix. Until then `enable_indexscan = off` with `enable_sort = off` takes LionOrdered,
-and `enable_indexscan = off` alone the sort, both exact there.
+problem 1 is to fix. Until then `pg_lion.enable_plain_scan = off` with `enable_sort = off` and
+`pg_lion.pushdown_margin = 1000` takes LionOrdered, and `pg_lion.enable_plain_scan = off` alone the
+sort, both exact there (`enable_indexscan = off` disables LionOrdered with the plain scan, §39).
 **2026-10-16**: under a restriction the plain scan is no longer a candidate (§44.6,
 "Post-filtering"), so the comparison of it with LionOrdered that this charge decides arises only
 under `pg_lion.vector_postfilter = allow`. On the 1M-row DBpedia set, at `random_page_cost` 1.1,

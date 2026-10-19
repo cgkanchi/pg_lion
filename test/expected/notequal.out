@@ -38,8 +38,9 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', (how = 'bitmap')::text, true);
-	PERFORM set_config('enable_indexscan', (how = 'plain')::text, true);
-	PERFORM set_config('enable_indexonlyscan', (how = 'plain')::text, true);
+	PERFORM set_config('enable_indexscan', (how IN ('plain', 'count'))::text, true);
+	PERFORM set_config('enable_indexonlyscan', (how IN ('plain', 'count'))::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (how = 'plain')::text, true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', (how = 'count')::text, true);
 	want := CASE how WHEN 'bitmap' THEN 'Bitmap Index Scan'
 					 WHEN 'plain' THEN 'Index (Only )?Scan using'
@@ -60,6 +61,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_nq_on' INTO nrows;
@@ -633,8 +635,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
 			used := true;
@@ -645,8 +646,7 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	FOR r IN EXECUTE q LOOP
 		b := b || r::text;
@@ -796,7 +796,7 @@ CREATE INDEX lion_ne_m_m ON lion_ne_m USING lion (m);
 VACUUM (FREEZE, ANALYZE) lion_ne_m;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT * FROM lion_nplan($$SELECT m, id FROM lion_ne_m WHERE m::text LIKE '%.00' ORDER BY m LIMIT 5$$);
                  lion_nplan                 
 --------------------------------------------
@@ -814,7 +814,7 @@ SELECT count(*) FROM (SELECT m, id FROM lion_ne_m WHERE m::text LIKE '%.00' ORDE
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE lion_ne_z, lion_ne_m;
 DROP FUNCTION lion_no(text);
 DROP FUNCTION lion_nrun(text);

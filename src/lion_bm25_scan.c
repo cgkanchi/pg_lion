@@ -61,6 +61,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "pgstat.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -113,6 +114,7 @@ typedef struct LionBm25ScanState
 	int64		L;				/* what the last walk was asked for; 0: none */
 	int64		seen;			/* the rows the walks have given, added up */
 	bool		last;			/* that walk was the last one */
+	bool		counted;		/* this scan is in pg_stat_user_indexes */
 	TupleTableSlot *heapslot;	/* the table's row, fetched */
 	int			natts;			/* the scan tuple's columns */
 	AttrNumber *attnos;			/* each one's table column; the score: none */
@@ -524,6 +526,8 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	priv.firstL = firstL;
 	cp->custom_private = lion_bm25_priv_encode(&priv);
 	cp->methods = &lion_bm25_path_methods;
+	/* a walk of the index that fetches each row, as an index scan is */
+	lion_path_core_switches(&cp->path, LION_CORE_INDEXSCAN);
 	add_path(rel, &cp->path);
 }
 
@@ -693,6 +697,13 @@ lion_bm25_next(ScanState *ss)
 	Snapshot	snapshot = ss->ps.state->es_snapshot;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
+	/* a scan of the index, once per scan or rescan, as core counts one */
+	if (!st->counted)
+	{
+		pgstat_count_index_scan(st->index);
+		st->counted = true;
+	}
+
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -707,6 +718,7 @@ lion_bm25_next(ScanState *ss)
 			if (!table_tuple_fetch_row_version(heap, &tid, snapshot,
 											   st->heapslot))
 				continue;
+			pgstat_count_heap_fetch(st->index);
 			return lion_bm25_store(st, c->score);
 		}
 		if (!st->valid || st->last)
@@ -731,6 +743,7 @@ lion_bm25_next(ScanState *ss)
 									   have_after ? &after : NULL, st->best);
 		}
 		lion_bm25_sort(st->best, st->nbest);
+		pgstat_count_index_tuples(st->index, st->nbest);
 		st->next = 0;
 		st->seen += st->nbest;
 		if (st->nbest < st->L)
@@ -774,6 +787,7 @@ lion_bm25_rescan(CustomScanState *node)
 	st->L = 0;
 	st->seen = 0;
 	st->last = false;
+	st->counted = false;
 }
 
 static void

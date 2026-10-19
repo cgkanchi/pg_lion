@@ -383,14 +383,14 @@ SELECT lion_pp('SELECT a, count(*) FROM lion_parte GROUP BY a');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_pplan('SELECT count(*) FROM lion_parte WHERE a = 1');
 SELECT lion_pplan('SELECT a, count(*) FROM lion_parte GROUP BY a');
 SELECT count(*) FROM lion_parte WHERE a = 1;
 SELECT a, count(*) FROM lion_parte GROUP BY a;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE lion_parte;
 
 -- ---- partial aggregates, finalized (and spilled) by core -------------------
@@ -415,7 +415,7 @@ CREATE INDEX lion_pbig_k ON lion_pbig USING lion (k);
 VACUUM (FREEZE, ANALYZE) lion_pbig;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET hash_mem_multiplier = 1.0;
 SET work_mem = '64kB';			-- 5000 groups do not fit: the finalize spills
 SELECT lion_pplan('SELECT g, count(*) FROM lion_pbig GROUP BY g');
@@ -453,7 +453,7 @@ RESET work_mem;
 RESET hash_mem_multiplier;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SELECT count(*) FROM (SELECT g, count(*) FROM lion_pbig GROUP BY g) s;
 DROP TABLE lion_pbig;
 
