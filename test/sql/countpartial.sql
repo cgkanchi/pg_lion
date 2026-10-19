@@ -7,7 +7,10 @@
 -- updated rows on pages the visibility map no longer vouches for.  cp_q()
 -- names the custom scans the plan used, the lion indexes it read and the
 -- restrictions it left out; a query the partial index cannot answer exactly
--- shows the whole index's plan, or the ordinary one.
+-- shows the whole index's plan, or the ordinary one.  With anynode, it names
+-- no custom scan, only that one was used: where two lion nodes read the same
+-- indexes and which wins is a price PostgreSQL 16 and 17 cannot tell apart
+-- (below).
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -61,7 +64,8 @@ UPDATE pc SET x = CASE WHEN x > 10 THEN 3 ELSE 50 END WHERE id <= 5000 AND id % 
 UPDATE pc SET kind = 'k0', w = 9 WHERE id <= 5000 AND id % 5 = 2;
 UPDATE pc SET act = true, st = 'on', kind = 'k0', x = NULL WHERE id = 29000;
 
-CREATE FUNCTION cp_q(q text, nojoins boolean DEFAULT false) RETURNS text
+CREATE FUNCTION cp_q(q text, nojoins boolean DEFAULT false,
+					 anynode boolean DEFAULT false) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -130,6 +134,7 @@ BEGIN
 	SELECT array_agg(i ORDER BY i) INTO idxs FROM unnest(idxs) i;
 	RETURN format('%s%s%s, %s rows',
 				  CASE WHEN cardinality(nodes) = 0 THEN 'no lion node'
+					   WHEN anynode THEN 'a lion node'
 					   ELSE array_to_string(nodes, ' + ') END,
 				  CASE WHEN cardinality(idxs) > 0
 					   THEN ' [' || array_to_string(idxs, ' ') || ']' ELSE '' END,
@@ -297,10 +302,17 @@ SELECT cp_q($$SELECT d.region, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE 
 SELECT cp_q($$SELECT d.region, f.g, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE f.act AND f.st = 'on' AND f.kind = 'k0' GROUP BY d.region, f.g$$, true);
 SELECT cp_q($$SELECT d.region, count(f.id) FROM pcd d LEFT JOIN pc f ON f.a = d.k AND f.act AND f.st = 'on' AND f.kind = 'k0' GROUP BY d.region$$, true);
 SELECT cp_q($$SELECT count(*) FROM pcd d WHERE EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.act AND f.st = 'on' AND f.kind = 'k0' AND f.b = 9 AND f.g = 4 AND f.x = 7)$$);
-SELECT cp_q($$SELECT count(*) FROM pcd d WHERE NOT EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.act AND f.st = 'on' AND f.kind = 'k0' AND f.b = 9 AND f.g = 4 AND f.x = 7)$$);
+/*
+ * LionCount of the anti join and LionAntiJoin below an Aggregate read the
+ * same index, and from PostgreSQL 18 LionCount is the cheaper.  Before 18 the
+ * disabled scans of the dimension add disable_cost to both, add_path() takes
+ * the two for the same price and keeps the join (the tie in
+ * fkjoin_dimjoin.sql); so too the semi join of x > 10 below.
+ */
+SELECT cp_q($$SELECT count(*) FROM pcd d WHERE NOT EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.act AND f.st = 'on' AND f.kind = 'k0' AND f.b = 9 AND f.g = 4 AND f.x = 7)$$, false, true);
 -- ... the fact side's rows the partial index's entries of the key alone
 SELECT cp_q($$SELECT count(*) FROM pcd d WHERE NOT EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.act AND f.st = 'on' AND f.kind = 'k0')$$);
-SELECT cp_q($$SELECT count(*) FROM pcd d WHERE EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.x > 10)$$);
+SELECT cp_q($$SELECT count(*) FROM pcd d WHERE EXISTS (SELECT 1 FROM pc f WHERE f.a = d.k AND f.x > 10)$$, false, true);
 -- the fk read from a whole index, a fact filter from the partial one
 SELECT cp_q($$SELECT d.region, count(*) FROM pc f JOIN pcd d ON f.y = d.k WHERE f.act AND f.st = 'on' AND f.kind = 'k0' AND f.a = 4 GROUP BY d.region$$, true);
 -- ... and from nothing that holds the count: the whole index
@@ -342,4 +354,4 @@ SELECT cp_q($$SELECT d.region, count(*) FROM pcp f JOIN pcd d ON f.a = d.k WHERE
 DROP TABLE pcp;
 DROP TABLE pcd;
 DROP TABLE pc;
-DROP FUNCTION cp_q(text, boolean);
+DROP FUNCTION cp_q(text, boolean, boolean);
