@@ -17675,9 +17675,11 @@ over:
   incoming container, which for such a column is per member.
 
 **The probed sum** (`lion_sum_walk()`, and `lion_walk_range_part()` for a range source walked
-because it would not fit in memory). A summed walk over a summarized column that has handed out
-`LION_PROBE_SWITCH` (2) times the rows of F's smallest positive source - it has shown itself to be
-the larger side - turns around for the rest of its sets (`lion_sum_probe_due()`):
+because it would not fit in memory). A summed walk over a summarized column that has come to its
+summaries, and whose counts have visited `LION_PROBE_SWITCH` (2) times as many containers as F's
+smallest positive source can lie at, turns around for the rest of its sets
+(`lion_sum_probe_due()`; until 2026-10-19 it waited until it had handed out twice that source's
+ROWS, "The price of a probe that does not fit" below):
 
 1. F is collected once (`lion_sources_collect()`: the intersection of its positive sources minus
    the negated ones, pinless, in at most half of `work_mem`).
@@ -17698,7 +17700,8 @@ marks: no count, no merge and no set-up per set, and F's containers read once in
 summary. The step count is still up to T × min(S, F_c), but a step is a comparison or two - a pair
 compared, a key found by a galloping search - where a merge step was a probe, an AND and a map
 question. The switch is bounded regret: the probe costs one count of F to collect it and one to
-finish, and is only begun once the walk has read twice F's rows.
+finish, and is only begun once the walk's own counts have visited twice F's containers - about
+what those two counts visit - so it can at most double what the walk spent.
 
 **Why it is exact.** The sets of a summed walk are disjoint and their union is exactly the rows of
 the part ("Readers" above), so the sum of their counts is the count of their union ANDed with F;
@@ -17725,8 +17728,11 @@ range's index (`lion_sources_all_rmgr()`), as each set did when it was counted o
 **Not probed:** a walk that reads no summary (a column without them, a range inside one bucket:
 §28 and its measurements stand), an existence test (it stops at the first set with a row), F with
 a range still to be walked, F with no positive source, or none that carries the interlock, and F
-whose copy would not fit `work_mem`. Nor the range ALONE: `count(*) WHERE <scattered range>` still
-counts each summary on its own, a map question per container under the summary's own pin. A dense
+whose smallest positive source would not fit `work_mem` as a probe - its copy within half, the
+copy, the marks and the count's set within all of it (`lion_range_probe_fits()`, asked before
+anything is collected, and of the same source's estimate by the planner). Nor the range ALONE:
+`count(*) WHERE <scattered range>` still counts each summary on its own, a map question per
+container under the summary's own pin. A dense
 union with one question per container key would need, at each key, a pin on every page its members
 came from - every summary of a window at once, which the pin budget (§15) forbids.
 
@@ -17791,20 +17797,169 @@ set per whole bucket, and each is as many containers as the bucket has rows; a s
 buckets - a summary per run of summaries - would let a wide range read a set per run instead. It
 changes what VACUUM and inserts maintain and the readers' disjointness argument, and is not done.
 
+### The price of a probe that does not fit (2026-10-19)
+
+A production workload counted a 90-day window on a near-unique timestamp with summaries, beside an
+equality and a multi-key overlap, on a heap the timestamp lies in no order on. The count was priced
+above a plain scan of the same index feeding `count(*)` and was not chosen. Reproduced on a release
+build over 20M rows: 729,000 heap pages, 11,392 container keys. Each summary of 4,096 rows is at
+some 3,440 of them, one or two rows at each. The equality holds half the rows, and the overlap a
+million, all of them of the equality's value. The planner, which takes the two as independent,
+estimates their intersection at 495,000.
+
+What the count cost and what it was priced at did not match in five places:
+
+1. **The memory test.** The planner priced the walk probed whenever F's rows at two bytes each fit
+   `work_mem`, F being the estimated intersection: 495,000 rows, so probed at 4MB. The executor
+   tested its smallest positive source at the same four bytes a row: the overlap's 999,065 rows,
+   3.996 MB, just inside 4MB, so it tried. Then it collected F, gave up past half of `work_mem` (the
+   copy is 2.23 MB: 88 members a container, 196 bytes each with its pointer and offset), and counted
+   every summary: 930 ms, priced as if probed. At 64MB it probed.
+2. **The switch.** The executor turned to probing once the walk had handed out twice the smallest
+   source's rows. A scattered summary's rows are its containers, so that was after more than half
+   of the window's 3.7M rows, about 500 summaries counted one by one: 530 ms, where probing from
+   the first took 200.
+3. **The counted summary.** It was priced as every source of F probed in memory at every one of its
+   container keys: 714 units a summary. A source of a million rows is never copied into memory
+   (more than `LION_MATERIALIZE_MAX_CONTAINERS` containers and more than
+   `LION_MATERIALIZE_MAX_BYTES` of members, §9), so it is sought on its posting pages. The merge
+   seeks the second source only where the first left a row, here one key in seventeen. Measured:
+   272 ns a container of the summaries counted beside both sources, 167 beside the overlap alone,
+   273 beside the equality alone, and 26 for the walk alone.
+4. **The probe's step** was a derived 2 `cpu_operator_cost`, 10 ns. Measured: 58 ns a container,
+   the slope of probed walks over 1.5M to 5.0M summary containers (30, 90 and 180 days, `work_mem`
+   64MB).
+5. **The race** that picks the side (`lion_range_choose_on()`) was charged the pages of the
+   smaller side twice, a whole bucket's summary posting pages among them. It reads directory leaves
+   only: a summary's entry, not its posting set. That was 56,000 of the window's 284,000 units.
+
+The plain scan it was set against was priced at 159,000 units and runs in 340 ms warm. An earlier
+measurement of 6.4 s was the virtual machine's page faults on a heap untouched for a while, and so
+was each first run after a restart, 18 s at 365 days. At 4MB the plain scan was therefore the right
+plan, because the count cannot probe there. At 64MB the count was the right plan, but only with a
+switch that probes from its first summaries.
+
+**What changed.**
+
+- **One memory test, asked of the same numbers.** `lion_range_probe_fits(rows, containers,
+  maxbytes)` (`lion_rangesrc.c`) is `lion_range_probe_begin()`'s test, taken before anything is
+  collected. It requires the copy within half of `maxbytes`, as `lion_collect_container()` accounts
+  it. It requires the copy, the marks and the count's set within all of it, as
+  `lion_range_probe_begin()` adds them up: an ARRAY's members again with a bit each and 16 bytes,
+  and two maximal containers for any other kind. Each container is taken at the average, as an
+  ARRAY while that is no larger than a NARROW of width 1, and at the most a container takes past
+  that. It is asked of F's smallest positive source: its rows, and the most containers they can
+  lie at, one a member and no more than the heap has keys (`lion_containers_for()`; an entry's
+  item count is no use here, as a sparse segment is one item of many containers). The
+  intersection has no more containers and no more members in any of them, and a container is
+  optimized to its smallest form. While the containers are all ARRAYs, or all past them, more
+  containers take more and an even spread is the most the sizes can add up to, so the test is an
+  upper bound of what the probe takes. It is none where the members lie unevenly about the ARRAY
+  limit: a container past it is marked in two maximal containers, 8,240 bytes, where an ARRAY of
+  256 members takes 568 (Not done, below). The executor asks it in place of the four bytes a row
+  (`lion_sum_probe_init()`). The planner asks it of its estimate of the same source
+  (`lion_cost_range_sum()`): each positive clause's own selectivity, an OR restriction's at most
+  the sum over its arms of their fewest rows, and the same most containers. So a walk is priced
+  probed when it will be, as far as the single-clause estimates are right. The planner no longer
+  uses the intersection, which is where independence goes wrong. A probe that turns out smaller
+  than the bound only makes the count cheaper than priced; one that would fit only because the
+  intersection is small is not taken.
+- **The switch in containers visited.** The walk turns to probing once its counts have visited
+  `LION_PROBE_SWITCH` (2) times as many containers as F's smallest positive source can lie at, the
+  same most containers. The counter is the node's Containers Visited, measured around the counts
+  as the FK join's switch measures it (`lion_join_count_key()`). The executor asks before every
+  count, not only before every leaf, since a leaf holds a hundred summaries. It does not turn
+  before the walk has handed out a summary: a walk with no whole bucket is counted as §28
+  measured, as the planner prices it. Visits are what a count's time goes with. Collecting F
+  visits its smallest source's containers and seeks the others at them, and the final count does
+  it once more. So once the counts have visited twice the most that can be, the probe can at most
+  double what the walk spent. What a set will cost to count is not on its entry: an entry records
+  its items, and a scattered summary keeps 3,440 containers in a few dozen sparse segments. The
+  planner predicts the switch the same way, two visits a key of whichever of the set and F's
+  smallest source has fewer.
+- **The counted set priced as its merge.** `lion_cost_range_set_count()` prices an entry's or a
+  summary's count with `lion_merge_cpu_cost_sets()`, the model of every AND of sets. The source
+  with the fewest rows drives, the next is sought at each of its keys, and the ones after that only
+  where the AND still has rows. Each source is sought on its posting pages (`LION_PROBE_COST`)
+  unless the count copies it into memory on its second use (`LION_MEMORY_PROBE_COST`), as one small
+  enough that fits what `work_mem` has left is copied. 714 units a summary became 521. That is 303
+  ns a container modelled against the 272 measured, and 245 against the 167 measured beside the
+  overlap alone, whose seeks land on one posting page after another, where the equality's land on
+  a page each.
+- **The step measured**: `pg_lion.probe_step_cost` 10 (`LION_PROBE_STEP_COST`). With
+  `LION_AND_MEMBER_COST` for the member marked it comes to 55 ns a container, against the 58
+  measured. The probe's sets are stepped at the keys they share with F's copy, the fewer of the
+  two: a set with nothing at F's keys is skipped by the cursor's seeks, not stepped through.
+- **The probe's overhead.** It is F collected (a merge of its sources) plus what the marks hold
+  built and counted with F, where it was two counts of F at a probe into every source a container.
+- **The race reads leaves.** `lion_cost_range_side()` hands back the pages the race reads of a side:
+  its keys' pages, and a whole bucket's summary at its entry's share of a directory leaf.
+
+**Measured** (backend CPU, release build, PostgreSQL 18; plain is the lion index scan feeding
+`count(*)` with the pushdown off; the count is forced; steady state, the first runs after a restart
+left out):
+
+| window, `work_mem` | count's price before / after | count before / after (ms) | plain scan's price, time (ms) | chosen before / after |
+|---|---|---|---|---|
+| 30 days, 4MB | 226,855 / 242,535 | 392 / 449 | 84,458, 174 | plain / plain |
+| 30 days, 64MB | 226,855 / 71,294 | 402 / 99 | 83,745, 195 | plain / count |
+| 90 days, 4MB | 284,259 / 501,971 | 854 / 878 | 159,225, 336 | plain / plain |
+| 90 days, 64MB | 284,259 / 138,190 | 531 / 186 | 158,438, 341 | plain / count |
+| 180 days, 4MB | 348,696 / 793,199 | 1,395 / 1,471 | 239,322, 476 | plain / plain |
+| 180 days, 64MB | 348,695 / 213,246 | 594 / 297 | 238,452, 504 | plain / count |
+| 365 days, 64MB | 457,838 / 340,308 | 766 / 483 | 366,216, 676 | plain / count |
+
+(The counts before are the least of three runs, the rest of six once warm. The plain scan is the
+same code before and after. At 365 days and 4MB the count, priced at 1,286,487, is the complement.)
+
+Beside the overlap alone at 64MB the count went from 362 ms at 90 days, probed after half its
+summaries, to 184. It is now chosen over the lion B-tree scan, which takes 860, at a price of
+133,080. Beside the equality alone the probe cannot fit at either `work_mem`: its 10M rows are a
+NARROW or a BITSET at every key, which the marks take a bitset image of. The count runs in 830 ms
+and is priced at 483,770, above the lion B-tree scan's 225,000 for its 1,400 ms. The window alone
+is unchanged, at 104,381 units for 84 ms. None of these choices got worse. Without summaries the
+walk is §28's: it is never probed, and it is priced with the merge model above in place of a probe
+into every source. `test/sql/summary_probe_cost.sql` pins the plan and the probe at both ends of
+the fit on a heap of 112 container keys, and the index rebuilt without summaries.
+
+**Not done.**
+
+- **A probe in windows.** Past `work_mem` the walk counts every summary, which at 4MB is 2.5 times
+  the plain scan. Probing F a window of container keys at a time would take a walk of the range per
+  window, as the plain scan takes (§29.3). Over 11,392 keys and a copy of 2.23 MB that is two
+  walks, against counting 900 summaries. It needs the walk to be restartable at a window's first
+  key and the marks per window.
+- **The window alone, and the lion B-tree scan.** `count(*)` over a scattered window with nothing
+  beside it is priced at 1.25 times a B-tree index-only scan that takes four times as long (84 ms
+  against 357 at 90 days). One reason is `LION_CONTAINER_COST` at 41 ns against the 26 a one-member
+  container of a sparse segment takes. The other is a summary's pages, priced as the pages of the
+  keys it stands for. The lion B-tree scan (§44) of the equality or the overlap beside the window is
+  priced at about 0.4 times its time against the count's 1.1. Both are outside this change's model
+  and are left to §31's next calibration.
+- **The seek on posting pages** is one constant, 200 ns. It is 120 ns where a source's containers
+  are small and many to a page, and 250 where each is a page of its own.
+- **Marks for an uneven F.** The memory test takes F's smallest source at its average a
+  container. Where some of its containers are past the ARRAY form and the rest well below it, the
+  marks take far more than the average says: two maximal containers for each one past it. Then
+  `lion_range_probe_begin()` refuses the probe once F is collected, and the walk counts every set,
+  priced probed. That is the walk of before this change at the cost of one collection of F. Marks
+  sized to such a container rather than to the largest one would make the test a bound and let
+  such an F be probed.
+
 ### Costs (lion_plan_cost.c)
 
 `lion_cost_range_sum()` prices each side of a summed range with `lion_cost_range_side()`. On a
 summarized column a bucket holds `max(summary_tids, rows per key)` rows and so `bucket rows / rows
 per key` keys; a side of `n` keys covers `n / keys per bucket - 1` buckets whole (half a bucket is
-left at each end on average), walks the keys of the partial buckets as before, and counts each
-whole bucket's summary at `LION_RANGE_ENTRY_COST` plus its containers - bucket rows spread over the
-heap as the column's correlation says - read and counted, and each of the other sources probed at
-them in memory, at §31's per-container, per-member and per-probe costs as an entry is; it reads
-about the pages of the keys it stands for, scaled by the containers the union saves. `LION_SUMMARY_PHASE_DESCENTS` (2) charges
-the phases' own descents. Without a whole bucket, or without summaries, the model is §28's. The
-recheck is spread over the side's counts rather than its keys. The sum over every entry of a
-summarized column (`k IS NOT NULL` alone, §14) is priced as a range over all of it
-(`LION_RANGED_SUMALL`).
+left at each end on average), walks the keys of the partial buckets as before, and counts each whole
+bucket's summary at `LION_RANGE_ENTRY_COST` plus its containers - bucket rows spread over the heap
+as the column's correlation says - merged with the other sources as any AND of sets is priced
+(`lion_cost_range_set_count()`, `lion_merge_cpu_cost_sets()`), as an entry is; it reads about the
+pages of the keys it stands for, scaled by the containers the union saves.
+`LION_SUMMARY_PHASE_DESCENTS` (2) charges the phases' own descents. Without a whole bucket, or
+without summaries, the model is §28's. The recheck is spread over the side's counts rather than its
+keys. The sum over every entry of a summarized column (`k IS NOT NULL` alone, §14) is priced as a
+range over all of it (`LION_RANGED_SUMALL`).
 
 Buckets hold `summary_tids` rows only when keys arrive in order. Keys that arrive in descending
 order all go into the first bucket (the open one, on an index built empty), and keys in no order
@@ -17821,24 +17976,25 @@ model with a giant bucket's share of the keys walked - needs the keys per bucket
 summaries do not carry; the average is what the index can say cheaply.)
 
 **A probed side** (2026-09-28, "Summed ranges: dense and probed" above;
-`lion_cost_range_side_probed()`). Beside F with a positive source that is not itself a range, whose
-copy would fit `work_mem`, a side that uses summaries and holds `LION_PROBE_SWITCH` times F's rows
-(`tuples x selectivity of F`, as the rest of the model estimates them) is priced as the executor
-runs it: the share of its sets before the switch as above, the rest probed - a summary and an entry
-each `LION_RANGE_UNION_ENTRY_COST` with no count of its own, every container of it
-`LION_PROBE_STEP_COST` (2 `cpu_operator_cost`) and the ones at F's keys `LION_AND_MEMBER_COST` for
-each member marked, the fewer of the two sides' per container - and two counts of F on top, the
-copy and the final count, each what the complement's count of F costs. The heap recheck is then
-spread over the counts before the switch and the one after it. The step constant is DERIVED, not
-measured - a quarter of `LION_CONTAINER_COST`, by what the step leaves out (no map, no merge, no
-count) - and is flagged for §31's next calibration. Every other shape is priced exactly as before:
-the function returns `lion_cost_range_side()`'s price whenever the probe does not apply, so plans
-change only for sums over a summarized column beside a clause with far fewer rows than the range,
-where the per-summary merges it used to charge - a probe into F per container of every summary -
-made a scattered column's range cost many times what the executor now spends. A scattered range of
-a thousand whole buckets of 4096 rows beside a clause of 5000 scattered rows, on a heap of 100,000
-container keys, was about 400 units a summary (4096 probes into F at `LION_MEMORY_PROBE_COST`) and
-is now about 30.
+`lion_cost_range_side_probed()`; revised 2026-10-19, "The price of a probe that does not fit"
+above). Beside F with a positive source that is not itself a range, whose smallest positive source
+would fit `work_mem` as a probe - the executor's own test (`lion_range_probe_fits()`) asked of that
+source's estimate - a side with a whole bucket whose counts would visit more than
+`LION_PROBE_SWITCH` times that source's containers (a container of the set and one of F at each key
+of whichever of the two has fewer, for each set) is priced as the executor runs it: the share of
+its sets before the switch as above, the rest probed - a summary and an entry each
+`LION_RANGE_UNION_ENTRY_COST` with no count of its own, each container it shares with F's copy
+`LION_PROBE_STEP_COST` (10 `cpu_operator_cost`, measured) and `LION_AND_MEMBER_COST` for each
+member marked, the fewer of the two sides' per container - and on top F collected (a merge of its
+sources) and what the probe marked built and counted with F. The heap recheck is then spread over
+the counts before the switch and the one after it. Every other shape is priced as
+`lion_cost_range_side()` prices it. (Until 2026-10-19 the test was F's rows at two bytes each
+against `work_mem`, F being the intersection the rest of the model estimates, the switch was at
+twice F's rows, and the step a derived 2 `cpu_operator_cost`: the walk was priced probed at
+a `work_mem` the executor counted every summary at, and the probe at a fifth of what it costs. A
+scattered range of a thousand whole buckets of 4096 rows beside a clause of 5000 scattered rows, on
+a heap of 100,000 container keys, was about 400 units a summary before the probe was modelled at
+all - 4096 probes into F at `LION_MEMORY_PROBE_COST` - and about 30 with it.)
 
 A range taken as a source costs its collection once per relation - the same walk, with nothing to
 AND and nothing to recheck, and the union it builds of what the walk hands out
@@ -18172,7 +18328,19 @@ leave out.
   as sources; and a narrow table whose range and clause are bitsets at every container key, so
   that the probe ORs into images as well as marking an ARRAY's members, with a range source too
   large for work_mem's floor walked, and probed, at each group's count. Every count against a
-  sequential scan, with whether the walk was probed or the range collected.
+  sequential scan, with whether the walk was probed or the range collected. Since 2026-10-19 the
+  walks within a few hundred keys of a bucket beside a clause of a thousand rows or more probe as
+  well: their counts visit twice that clause's containers within the first summaries.
+- `test/sql/summary_probe_cost.sql` (2026-10-19, "The price of a probe that does not fit"): a
+  42-day window over a timestamp that is a permutation of the row number, with summaries of 128
+  rows, beside an equality and an overlap of a tag on a tenth of the rows that the equality holds
+  all of, in one multicolumn index, at 64kB (the tag's probe does not fit: counted, priced so, and
+  the plain scan chosen), 128kB and 4MB (probed and chosen, at under half the counted price, the
+  same price both times); a window short of a bucket (never probed); a tag of a fifth of the rows,
+  whose NARROW containers take a bitset image each in the marks (counted at 128kB, probed at
+  4MB); a tag of seven tenths beside the equality's half, which a switch at twice the smaller
+  source's rows never reached in that window; and the index rebuilt without summaries (walked,
+  never probed, the plain scan chosen). Each against a sequential scan, at `random_page_cost` 1.1.
 - `test/sql/corrupt.sql` section 4, and `test/sql/rangesum.sql`'s two-bounds case; `range.sql`,
   `distinct.sql` and `fkjoin.sql` keep their formerly declined shapes, now answered, beside a clause
   no posting set answers.
@@ -18218,11 +18386,14 @@ The choices made conservatively here, each with the alternative:
 - **Not used by**: GROUP BY k walks, count(DISTINCT k), ordered scans, and the index scans' walks
   of a whole column (`IS NOT NULL`) - they want keys, or could take summaries (a whole column) in a
   later change. The bitmap and plain index scans of a range use them (§28, "Bitmap scans").
-- **The probed sum** ("Summed ranges: dense and probed") turns at twice F's rows
-  (`LION_PROBE_SWITCH`), within `work_mem` for F's copy and the marks, and prices its steps at a
-  derived constant (`LION_PROBE_STEP_COST`). The alternatives are a switch the planner decides
-  from its estimates - no regret bound when they are wrong - and a measured constant, which is
-  §31's next calibration. A scattered range ALONE still counts summary by summary; a union with one
+- **The probed sum** ("Summed ranges: dense and probed") turns once its counts have visited twice
+  the containers of F's smallest source (`LION_PROBE_SWITCH`), within `work_mem` for that source's
+  copy and the marks, and prices its steps at a constant measured on one shape
+  (`LION_PROBE_STEP_COST`, 2026-10-19). The alternative is a switch the planner decides from its
+  estimates - no regret bound when they are wrong. Past `work_mem` it does not probe at all, and a
+  scattered range then counts every summary: a probe of F a window of container keys at a time,
+  as the plain scan walks its range, is not done ("The price of a probe that does not fit"). A
+  scattered range ALONE still counts summary by summary; a union with one
   map question per container key needs pins no budget allows, and summaries of summaries (a format
   change) are the way to fewer, larger sets.
 - **The insert fast path** an appending column could have - remembering where the open bucket is,

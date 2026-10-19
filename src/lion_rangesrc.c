@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "lion_count_int.h"
 
 /*
@@ -797,6 +799,63 @@ lion_ckey_gallop(const uint32 *keys, int n, int from, uint32 target)
 			hi = mid;
 	}
 	return lo;
+}
+
+/*
+ * Would a probe of an F of `rows` rows over `containers` container keys fit
+ * maxbytes (DESIGN.md §32, "Summed ranges: dense and probed")?  This is the
+ * test lion_range_probe_begin() makes once F is collected, taken before it
+ * is: the copy within half of maxbytes, as lion_collect_container() accounts
+ * it - each container at its MAXALIGNed size, a pointer and an offset - and
+ * the copy with the marks and the count's set within all of it, as
+ * lion_range_probe_begin() adds them up: an ARRAY's members again, a bit
+ * each and 16 bytes, two maximal containers for any other kind.
+ *
+ * Every container is taken at the average, as an ARRAY while that is no
+ * larger than the narrowest NARROW and at the most a container takes past
+ * that.  It is asked of the rows of one of F's sources - its smallest, which
+ * bounds the intersection the probe copies - and the most containers they can
+ * lie at, one a member and no more than the heap has keys
+ * (lion_containers_for()).  The intersection has no more containers and no
+ * more members in any of them, a container is optimized to the smallest form
+ * that holds its members, and while they are all ARRAYs, or all past them,
+ * more containers take more and an even spread adds up to the most.  It is
+ * no bound where the members lie unevenly about the ARRAY limit: the marks
+ * of a container past it take two maximal containers, 8,240 bytes, where an
+ * ARRAY of 256 members takes 568 of them.  Then lion_range_probe_begin()
+ * refuses the probe once F is collected, and the walk counts on, as it would
+ * have without this test.  The executor asks it before it collects anything
+ * (lion_sum_probe_init()), the planner before it prices a walk probed
+ * (lion_cost_range_sum()), the same question of the same numbers, so that a
+ * walk is priced probed when it will be.
+ */
+bool
+lion_range_probe_fits(double rows, double containers, Size maxbytes)
+{
+	double		n = Max(ceil(containers), 1.0);
+	double		card;
+	double		item;
+	double		marks;
+	double		copy;
+	double		need;
+
+	if (rows <= 0.0)
+		return true;			/* nothing to copy, nothing to mark */
+	card = Min(rows / n, (double) LION_CONTAINER_RANGE);
+	item = (double) LION_CONTAINER_HDRSZ + card * sizeof(uint16);
+	if (item <= (double) LION_NARROW_SIZE(1))
+		marks = item + 16.0 + ceil(card / 64.0) * sizeof(uint64);
+	else
+	{
+		item = Min(item, (double) LION_CONTAINER_MAX_SIZE);
+		marks = 2.0 * (LION_CONTAINER_MAX_SIZE + 16);
+	}
+	item = ceil(item / MAXIMUM_ALIGNOF) * MAXIMUM_ALIGNOF;
+
+	copy = sizeof(LionMatSet) +
+		n * (item + sizeof(LionContainer *) + sizeof(uint32));
+	need = copy + n * (marks + sizeof(uint32) + 2 * sizeof(void *));
+	return copy <= (double) (maxbytes / 2) && need <= (double) maxbytes;
 }
 
 /*
