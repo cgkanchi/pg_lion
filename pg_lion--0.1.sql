@@ -590,58 +590,62 @@ CREATE FUNCTION lion_bm25_score(doc tsvector, query tsquery, index regclass,
  * result is always exactly count(*) of the equivalent SELECT under the same
  * snapshot, so these are VOLATILE.
  *
- * A key is taken as `col = key` would take it: the column's own type, a type
- * the column's operator family compares it with (an int8 key on an int4
- * column), or a binary coercion to the column's type (varchar on text); a
- * domain as its base type; and for enum_ops the column's own enum and no
- * other (DESIGN.md section 9, "SQL surface").  It is compared under the
- * collation `col = key` would use - the key's own when it brings one (an
- * explicit COLLATE), otherwise the column's - and where that is not the
- * index's collation and either of the two is nondeterministic, the count is
- * refused: the index's equality is not the query's then.  The grouped form
- * groups under the column's collation, as `GROUP BY col` does.
+ * A key is taken as `col = key` would take it: the parser resolves `=` for
+ * the column's type and the key's, and coerces the key as the query would -
+ * an untyped literal through the column's input function, 1 to numeric on a
+ * numeric column, 0.1 to float8 on a float4 one - and the count is made when
+ * that `=` is the index's own equality on the column as it is (DESIGN.md
+ * section 9, "SQL surface").  Where the query would cast the COLUMN instead
+ * (`intcol = 1.5` compares as numeric) the count is refused, never made
+ * another way.  The key is "any", so that an untyped literal arrives as one.
+ * It is compared under the collation `col = key` would use - the key's own
+ * when it brings one (an explicit COLLATE), otherwise the column's - and
+ * where that is not the index's collation and either of the two is
+ * nondeterministic, the count is refused: the index's equality is not the
+ * query's then.  The grouped form groups under the column's collation, as
+ * `GROUP BY col` does.
  *
- * They are STRICT: a NULL index or key answers NULL - no count is made -
- * where `count(*) WHERE col = NULL` answers 0 (section 9 says why).  A NULL
- * element of lion_index_count_any()'s array selects nothing and counts 0.
+ * They are not STRICT: a NULL key counts 0, as `count(*) WHERE col = NULL`
+ * does, after the same checks as any key; a NULL index answers NULL.  A NULL
+ * element of lion_index_count_any()'s array selects nothing and counts 0,
+ * and so does a NULL array.
  * --------------------------------------------------------------------- */
 
-CREATE FUNCTION lion_index_count(idx regclass, key anyelement)
+CREATE FUNCTION lion_index_count(idx regclass, key "any")
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'lion_index_count'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count(regclass, anyelement) IS
+COMMENT ON FUNCTION lion_index_count(regclass, "any") IS
 	'count rows with key from a lion index, skipping all-visible heap pages';
 
 /*
- * The two keys are of two unrelated polymorphic types: each is compared with
- * its own index's column, and nothing says the two columns share a type.
- * With one anyelement for both, `lion_index_count('i', 1, 't', 'x'::text)`
- * could not be called at all.
+ * Each key is compared with its own index's column, and nothing says the two
+ * columns share a type.
  */
-CREATE FUNCTION lion_index_count(idx1 regclass, key1 anyelement,
-									idx2 regclass, key2 anycompatible)
+CREATE FUNCTION lion_index_count(idx1 regclass, key1 "any",
+									idx2 regclass, key2 "any")
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'lion_index_count2'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count(regclass, anyelement, regclass, anycompatible) IS
+COMMENT ON FUNCTION lion_index_count(regclass, "any", regclass, "any") IS
 	'count rows matching both keys from two lion indexes on the same table';
 
 /*
  * count(*) WHERE col = ANY (keys): the union of the listed values' posting
  * sets (DESIGN.md section 15), located in bucket order and merged k-way.
+ * keys is an array, or an untyped literal of one ('{a,b}').
  */
-CREATE FUNCTION lion_index_count_any(idx regclass, keys anyarray)
+CREATE FUNCTION lion_index_count_any(idx regclass, keys "any")
 RETURNS bigint
 AS 'MODULE_PATHNAME', 'lion_index_count_any'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count_any(regclass, anyarray) IS
+COMMENT ON FUNCTION lion_index_count_any(regclass, "any") IS
 	'count rows whose key is in the array, skipping all-visible heap pages';
 
-CREATE FUNCTION lion_index_count_stats(idx regclass, key anyelement,
+CREATE FUNCTION lion_index_count_stats(idx regclass, key "any",
 										  OUT count bigint,
 										  OUT blocks_skipped bigint,
 										  OUT tids_rechecked bigint,
@@ -649,9 +653,9 @@ CREATE FUNCTION lion_index_count_stats(idx regclass, key anyelement,
 										  OUT cache_hits bigint)
 RETURNS record
 AS 'MODULE_PATHNAME', 'lion_index_count_stats'
-LANGUAGE C STRICT VOLATILE PARALLEL UNSAFE;
+LANGUAGE C VOLATILE PARALLEL UNSAFE;
 
-COMMENT ON FUNCTION lion_index_count_stats(regclass, anyelement) IS
+COMMENT ON FUNCTION lion_index_count_stats(regclass, "any") IS
 	'lion_index_count() plus how much of the heap it had to visit';
 
 /*

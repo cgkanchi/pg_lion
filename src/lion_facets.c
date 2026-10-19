@@ -1496,7 +1496,7 @@ lion_index_facets(PG_FUNCTION_ARGS)
 	 * collation, row-level security, snapshot eligibility and the predicate
 	 * lock, as for lion_index_count_group_stats().
 	 */
-	lion_count_open_indexes(run.snapshot, 1, &idxoid, NULL, NULL, attno, true,
+	lion_count_open_indexes(run.snapshot, 1, &idxoid, NULL, attno, true,
 							&call);
 	run.heap = call.heap;
 	run.index = call.index[0];

@@ -148,7 +148,7 @@ SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_nums');
 -- lion_index_count() is a single-key function: a multi-key index has no
 -- equality strategy to look a value up with, and says so.
 SELECT lion_index_count('lion_arr_tags', '{t5}'::text[]);
-ERROR:  type text[] cannot be compared with index "lion_arr_tags"
+ERROR:  key column 1 of index "lion_arr_tags" has a multi-key operator class, whose entries are not column values
 -- ---- plans -------------------------------------------------------------
 SELECT lion_arrplan($$SELECT id FROM lion_arr WHERE tags @> '{t5}'$$);
                  lion_arrplan                 

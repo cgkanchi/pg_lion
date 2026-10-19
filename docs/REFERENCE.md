@@ -21,7 +21,13 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_posting_root(idx, key)               a key's posting-set head block (the root, or the first leaf), for tests
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
-and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
+and take the key as `col = key` takes it: the same operator, and the key converted as the query
+converts it - an untyped literal (`lion_index_count('idx', 'abc')`, `lion_index_count_any('idx',
+'{1,2}')`) as the column's type, `1` to numeric on a numeric column, `0.1` to float8 on a float4 one
+(where, as in the query, no float4 value equals it). Where the query would convert the column
+instead - `intcol = 1.5` compares `intcol::numeric` - the count is an error that says to cast the
+key to the column's type. A NULL key, or a NULL array, counts 0, as `col = NULL` selects no row; a
+NULL index answers NULL. The counts ask for what the query would: SELECT on the table or its indexed columns, and no row-level security in
 force for the caller.  A count under a collation the index does not compare in is an error, never
 a different number; on a column of a nondeterministic collation that includes a key of the default
 collation - a literal's, which the call cannot tell from an explicit `COLLATE "default"` - so there
