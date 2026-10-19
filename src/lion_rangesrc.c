@@ -811,7 +811,7 @@ lion_ckey_gallop(const uint32 *keys, int n, int from, uint32 target)
 LionRangeProbe *
 lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 					   LionCountSource *sources, Size maxbytes,
-					   LionCountStats *stats)
+					   LionCountStats *stats, uint32 lo, uint64 hi)
 {
 	LionRangeProbe *rp;
 	MemoryContext cxt;
@@ -886,9 +886,19 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 		return NULL;
 	}
 
-	/* F's rows, copied: half of the memory, the marks and the count the rest */
-	if (!lion_sources_collect(heap, snapshot, nsources, sources, maxbytes / 2,
-							  false, &rp->probe, &spilled, stats))
+	/*
+	 * F's rows, copied: half of the memory, the marks and the count the rest.
+	 * Of a window's keys alone, in a range of a parallel count (DESIGN.md
+	 * §10, "A count in parallel"), whose final count is confined to them: the
+	 * walk's sets are then read only at F's keys there.
+	 */
+	if (!((lo > 0 || hi < LION_KEYS_END) ?
+		  lion_sources_collect_range(heap, snapshot, nsources, sources,
+									 maxbytes / 2, false, lo, hi, &rp->probe,
+									 &spilled, stats) :
+		  lion_sources_collect(heap, snapshot, nsources, sources,
+							   maxbytes / 2, false, &rp->probe, &spilled,
+							   stats)))
 	{
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);

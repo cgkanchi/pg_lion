@@ -1404,6 +1404,7 @@ typedef struct LionSumSets
 {
 	double		counts;
 	double		rows;
+	double		pages;			/* the walk's pages, of the side taken */
 	bool		outside;
 } LionSumSets;
 
@@ -1738,6 +1739,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		{
 			sets->counts = Max(setcounts, 1.0);
 			sets->rows = tuples * sel / sets->counts;
+			sets->pages = setpages;
 			sets->outside = false;
 		}
 
@@ -1782,6 +1784,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 									&setcounts, &setpages);
 		sets->counts = setcounts + 1.0;
 		sets->rows = nout * rowsper / Max(setcounts, 1.0);
+		sets->pages = setpages;
 		sets->outside = true;
 	}
 
@@ -2348,6 +2351,9 @@ typedef struct LionCountRelCost
 	Var		   *rangevar;
 	bool		rangesum;
 	LionRangeCost *rc;
+	Cost		rangeseek;		/* what a range of a parallel count pays to
+								 * seek the WHERE's sets (§10), priced while
+								 * clauseset is there to price it from */
 	LionWalkSave *walksave; /* NULL, or what walking the ranges too
 								 * large to collect saves (below) */
 
@@ -3191,6 +3197,47 @@ lion_count_rel_merge(LionCountRelCost *c)
 }
 
 /*
+ * What a range of a parallel count (DESIGN.md §10, "A count in parallel")
+ * pays to seek every set of every WHERE source to its first key: a descent
+ * of a chain's posting tree, a page of the index's at its third rung
+ * (lion_index_page_cost()), as a range of a parallel GROUP BY seeks each
+ * group's set (lion_count_rel_merge()), and a range taken as a source, a
+ * copy in memory, a probe there.  Priced from each clause's sets as the AND
+ * prices them (clauseset), so before lion_count_rel_set_pages() frees them;
+ * lion_count_rel_range_price() adds it to what the range pays.
+ */
+static Cost
+lion_count_rel_range_seek(LionCountRelCost *c)
+{
+	ListCell   *lc1;
+	ListCell   *lc2;
+	Cost		seek = 0;
+	int			ci = 0;
+
+	forboth(lc1, c->whereidx, lc2, c->wherekinds)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		int			kind = lfirst_int(lc2);
+		double		sets = 1.0;
+
+		if (kind == LION_CLAUSE_RANGESRC || idx == NULL)
+		{
+			seek += LION_MEMORY_PROBE_COST;
+			ci++;
+			continue;
+		}
+		if (LION_CLAUSE_IS_POSITIVE(kind) && ci < c->nclause)
+			sets = Max(Max(c->clauseset[ci].nsets, c->clauseset[ci].nkeys),
+					   1.0);
+		seek += sets * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES *
+						lion_index_page_cost(c->root, (double) idx->pages,
+											 seq_page_cost));
+		ci++;
+	}
+	return seek;
+}
+
+/*
  * The pages each clause's sets read, walked or sought (lion_cost_set_pages()),
  * and the directory leaves of their lookups; frees the per-clause and
  * per-source arrays.
@@ -3222,6 +3269,8 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 	}
 	c->random_pages = lion_cost_leaf_pages(c->nclause, c->clauseindex,
 										   c->clauseset);
+	if (c->rc != NULL)
+		c->rangeseek = lion_count_rel_range_seek(c);
 	pfree(c->clauseset);
 	pfree(c->clauseindex);
 	pfree(c->clausesrc);
@@ -3661,6 +3710,69 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 }
 
 /*
+ * What a parallel count of one row (DESIGN.md §10, "A count in parallel")
+ * pays over this one count, into rc: what each range of container keys pays
+ * again (countrange), what every participant pays whole (whole), and the
+ * pages it reads (pages).
+ *
+ * A range seeks every set of every WHERE source to its first key
+ * (c->rangeseek, lion_count_rel_range_seek()), and a walk over a column's
+ * entries, a sum over every one of them or over a range's (§14, §28), walks
+ * them again and counts each, sought to the range too: what the counts cost at
+ * their containers is divided among the ranges, what they cost to set up is
+ * not.  The lookups that locate the WHERE are every participant's own, as
+ * are the ranges taken as sources it collects (§32), whole each time: they
+ * do not divide at all.  The pages are what the count reads of its sets, its
+ * walk and the heap, as the serial price has them.
+ */
+static void
+lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
+{
+	double		counts = 0;
+
+	if (c->groupidx != NULL)
+	{
+		Cost		leaf = LION_RANGE_DESCENT_PAGES *
+			lion_index_page_cost(c->root, (double) c->groupidx->pages,
+								 seq_page_cost);
+		double		walkpages;
+
+		if (c->rangesum)
+		{
+			counts = Max(c->sumsets.counts, 1.0);
+			walkpages = c->sumsets.pages;
+		}
+		else
+		{
+			counts = Max(c->walked, 1.0);
+			walkpages = Max(1.0, (double) c->groupidx->pages *
+							lion_index_column_share(c->root, c->rel,
+													c->groupidx,
+													c->groupcol) *
+							c->drivefrac);
+		}
+
+		/* each count sets up and seeks its set, and the walk reads again */
+		rc->countrange += counts * (LION_ENTRY_COUNT_COST + LION_PROBE_COST +
+									leaf) +
+			walkpages * lion_index_page_cost(c->root,
+											 (double) c->groupidx->pages,
+											 seq_page_cost);
+		rc->pages += walkpages;
+	}
+
+	/*
+	 * The WHERE's sets are sought once a range, or once a count of a walk
+	 * where they are not yet copied - which they are from their second use
+	 * on (§9): the walk's counts probe them in memory.
+	 */
+	rc->countrange += c->rangeseek + counts * c->nsrc * LION_MEMORY_PROBE_COST;
+	rc->whole += c->random_pages * random_page_cost + c->descent_cost +
+		c->lookup_cost + c->rangesrc_cost;
+	rc->pages += c->seq_pages + c->probed_pages + c->recheck_pages;
+}
+
+/*
  * What a LionCount path costs over one relation, phase by phase: the WHERE
  * clauses' lookups and the sources of their AND, the merges that count them,
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
@@ -3766,6 +3878,10 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	lion_count_rel_entry_scan(&c);
 	lion_count_rel_pair_cost(&c);
 	lion_count_rel_recheck(&c);
+
+	/* ... and what a parallel count's ranges pay of it (§10) */
+	if (rc != NULL)
+		lion_count_rel_range_price(&c, rc);
 
 	run = c.random_pages * random_page_cost;
 	run += c.descent_cost;
@@ -3913,7 +4029,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 									   clauses, kinds, tors, numgroups,
 									   outer_entries, inner_entries,
 									   distinct, drivefrac, rangevar,
-									   rangesum, NULL, topk, topkrows, true,
+									   rangesum, rc, topk, topkrows, true,
 									   walksave);
 	}
 	pfree(outside);
@@ -4033,6 +4149,9 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	{
 		rc->batched = false;
 		rc->perrange = 0;
+		rc->countrange = 0;
+		rc->whole = 0;
+		rc->pages = 0;
 	}
 
 	foreach(lc, targets)

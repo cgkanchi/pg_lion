@@ -571,8 +571,9 @@ working around a bad choice:
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
-fewest container keys - of 64 heap blocks each - a range of a parallel count covers when it runs
-(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
+fewest container keys - of 64 heap blocks each - a range of a parallel count or `GROUP BY`
+covers when it runs (DESIGN.md §10, "A GROUP BY in parallel" and "A count in parallel"; the
+planner prices the default),
 `pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
 containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
 §29.11, "Unions probed"; the answers are the same either way; `EXPLAIN ANALYZE` of a count prints
