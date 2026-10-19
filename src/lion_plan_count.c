@@ -120,6 +120,114 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * A PARALLEL COUNT (DESIGN.md §10, "A count in parallel"): the node of one
+ * row - the count of a WHERE, or a sum over a column's entries, with any
+ * filtered counts beside it - made parallel-aware, its partial counts under a
+ * Gather and core's Finalize Aggregate, which adds them up and applies the
+ * HAVING the partial target leaves to it.  Its participants claim the
+ * heap's container keys a range at a time, as a parallel GROUP BY's do, and
+ * count each claimed range of each run whole (lion_count_ranged()).
+ *
+ * WORKERS: what a parallel scan of the pages the count reads - its sets, its
+ * walk and the heap, as the serial price has them (rc->pages) - would get,
+ * capped by max_parallel_workers_per_gather; a parallel_workers setting on
+ * the table decides alone, as for core's scans.  A heap the executor would
+ * cut into one range gets no parallel count: one participant would count it
+ * all, after the others had started for nothing.
+ *
+ * COST, one participant's: its share of the serial count (`serialrun`, the
+ * serial node's price before its HAVING) but for what every participant pays
+ * whole (rc->whole: the lookups that locate the WHERE, and the ranges taken
+ * as sources it collects), that whole, and what each range it counts pays
+ * again (rc->countrange, every run's: each set sought to the range, a walk's
+ * entries counted again), plus a cpu_tuple_cost for its one row.  The Gather
+ * prices its rows and set-up, core's Finalize Agg its own work.
+ */
+static void
+lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
+							 RelOptInfo *output_rel, CustomPath *serial,
+							 Cost serialrun, const LionRangeCost *rc,
+							 List *having)
+{
+	PathTarget *partialtarget;
+	CustomPath *cpath;
+	LionCountPriv priv;
+	Path	   *gather;
+	AggClauseCosts agg_final_costs;
+	double		divisor;
+	double		totalrows;
+	Cost		share;
+	uint32		ckeys;
+	int			workers;
+	int			nranges;
+	int			cut;
+
+	workers = compute_parallel_worker(rel, -1, Max(rc->pages, 1.0),
+									  max_parallel_workers_per_gather);
+	if (workers <= 0)
+		return;
+
+	/*
+	 * A range is counted by one participant, so the count divides among no
+	 * more participants than the executor will cut ranges - with
+	 * pg_lion.parallel_range_keys as it is, the one thing here that does not
+	 * price the default - and a heap of one range not at all.
+	 */
+	cut = lion_key_ranges(rel->pages, workers + 1, lion_parallel_range_keys,
+						  &ckeys);
+	if (cut < 2)
+		return;
+	divisor = Min(lion_parallel_divisor(workers), (double) cut);
+	nranges = lion_key_ranges(rel->pages, workers + 1,
+							  LION_PARALLEL_RANGE_KEYS, &ckeys);
+	share = Max(serialrun - rc->whole, 0.0);
+	totalrows = (double) (workers + 1);
+
+	partialtarget = lion_make_partial_target(root, output_rel->reltarget,
+											 having);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = partialtarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = true;
+	cpath->path.parallel_safe = true;
+	cpath->path.parallel_workers = workers;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = 1;
+	cpath->path.total_cost = share / divisor + rc->whole +
+		((double) nranges / divisor) * rc->countrange + cpu_tuple_cost;
+	cpath->path.startup_cost = cpath->path.total_cost;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->flags = serial->flags;
+	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	/* the serial node's plan, but for the HAVING, which is the Agg's here */
+	lion_count_priv_decode(serial->custom_private, LION_PRIV_STAGE_PATH,
+						   &priv);
+	priv.having = NIL;
+	cpath->custom_private = lion_count_priv_encode(&priv,
+												   LION_PRIV_STAGE_PATH);
+	cpath->methods = serial->methods;
+
+	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
+										 partialtarget, NULL, &totalrows);
+
+	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, gather,
+							 output_rel->reltarget,
+							 AGG_PLAIN, AGGSPLIT_FINAL_DESERIAL,
+							 NIL, having, &agg_final_costs, 1.0));
+}
+
+/*
  * Turn the RANGE clauses of every range column but `keep` (an index into
  * rangepos, or -1 for none) into bounds of ranges taken as sources
  * (DESIGN.md §32): LION_CLAUSE_RANGESRC in the clause lists, which is all the
@@ -3390,8 +3498,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 		lion_cost_decode_path(root, cpath, targets, cx->whereclauses,
 							  cx->wherekinds, cx->ors, cx->ngroup,
 							  cx->groupest, cx->numgroups, cx->outrows);
-		rangeprice->batched = false;
-		rangeprice->perrange = 0;
+		memset(rangeprice, 0, sizeof(LionRangeCost));
 	}
 	else if (cx->topkn > 0)
 	{
@@ -3405,8 +3512,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							(cx->rangevar != NULL) ? cx->rangesel : 1.0,
 							(double) cx->topkcand, cx->topkrows,
 							Min(cx->outrows, (double) cx->topkcand));
-		rangeprice->batched = false;
-		rangeprice->perrange = 0;
+		memset(rangeprice, 0, sizeof(LionRangeCost));
 	}
 	else
 		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
@@ -3466,6 +3572,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	{
 		Cost		startup = 0;
 		Cost		total = 0;
+		LionRangeCost runs = {0};	/* a parallel count's, over the runs */
 		int			r;
 
 		for (r = 0; r <= cx->nfilter; r++)
@@ -3474,9 +3581,15 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 								  &rangeprice, &walksave);
 			startup += cpath->path.startup_cost;
 			total += cpath->path.total_cost;
+			runs.countrange += rangeprice.countrange;
+			runs.whole += rangeprice.whole;
+			runs.pages += rangeprice.pages;
 		}
 		cpath->path.startup_cost = startup;
 		cpath->path.total_cost = total;
+		rangeprice.countrange = runs.countrange;
+		rangeprice.whole = runs.whole;
+		rangeprice.pages = runs.pages;
 	}
 
 	/*
@@ -3537,6 +3650,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 												cpath->path.startup_cost);
 	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
+	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
+	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
 	serialrun = cpath->path.total_cost;
 
 	/*
@@ -3593,11 +3708,12 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * one grouping column walked whole, a WHERE that is collected - priced as
 	 * the groups of a walk counted together (rangeprice.batched), with a
 	 * source that is positive whatever its value, and no range taken as one -
-	 * and partial counts core can add up.  Before the serial path is added,
-	 * which may free it.
+	 * and partial counts core can add up.  A GROUP BY coalesce(col, c) is
+	 * one too: its two entries go up as partial rows of c, which the Agg
+	 * adds together.  Before the serial path is added, which may free it.
 	 */
 	if (cx->ngroup == 1 && !cx->sumall && !cx->singlegroup &&
-		cx->groupcoal == NULL && cx->nfilter == 0 &&
+		cx->nfilter == 0 &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
 		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
@@ -3611,6 +3727,26 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 									 serialrun, &rangeprice,
 									 first->driveidx[0], first->drivecol[0],
 									 cx->having, cx->numgroups);
+
+	/*
+	 * ... and a count of one row of one table, divided among them the same
+	 * way (DESIGN.md §10, "A count in parallel"): the merge of its WHERE or a
+	 * sum over a column's entries, with whatever filtered counts, residual
+	 * clauses, complement ORs, ranges taken as sources or a range bounding
+	 * the sum beside it - each range counted as the serial node counts the
+	 * whole.  Not a count(DISTINCT), the aggregates over keys, the FK-side
+	 * join or a partitioned table, which count in other ways, nor a group
+	 * folded to a constant, whose missing row partial counts cannot say.
+	 */
+	if (cx->ngroup == 0 && !cx->singlegroup && !cx->partitioned &&
+		cx->fj == NULL && cx->distvar == NULL && cx->wattnos == NIL &&
+		cx->topkn == 0 && !cx->decode && cx->groupcoal == NULL &&
+		input_rel->consider_parallel && output_rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) cx->priv.consts) &&
+		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		!RecoveryInProgress())
+		lion_add_parallel_count_path(root, input_rel, output_rel, cpath,
+									 serialrun, &rangeprice, cx->having);
 
 	add_path(output_rel, &cpath->path);
 }

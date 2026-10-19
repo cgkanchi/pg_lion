@@ -87,16 +87,21 @@ lion_filter_with_negated(LionCountScanState *st)
  * A count with nothing to take its candidates from (lion_filter_with_negated()):
  * the heap is read once, sequentially, with the row filter tested on each row
  * the snapshot sees.  It is the ordinary plan's work, which the cost model
- * charged for a value it could not estimate (lion_cost_recheck()).
+ * charged for a value it could not estimate (lion_cost_recheck()).  A range
+ * of a parallel count reads its own blocks alone (DESIGN.md §10, "A count in
+ * parallel").
  */
 static int64
 lion_count_scan_filtered(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
+	uint32		lo;
+	uint64		hi;
 
+	(void) lion_vis_cache_window(st->viscache, &lo, &hi);
 	return lion_count_heap_filtered(st->heap, estate->es_snapshot,
 									lion_filter_with_negated(st),
-									&st->stats);
+									&st->stats, lo, hi);
 }
 
 /*
@@ -251,6 +256,11 @@ lion_count_batched(LionCountScanState *st)
 	MemoryContext oldcxt;
 	int64		count = 0;
 	int			start = 0;
+	int			b = 0;
+
+	if (lb->nparts < 1 || lb->part < 0 || lb->part >= lb->nparts)
+		elog(ERROR, "LionCount: list batches of part %d of %d", lb->part,
+			 lb->nparts);
 
 	batchcxt = AllocSetContextCreate(st->wherecxt, "LionCount list batch",
 									 ALLOCSET_DEFAULT_SIZES);
@@ -264,6 +274,17 @@ lion_count_batched(LionCountScanState *st)
 
 		while (end < lb->nval && lb->hash[end] == lb->hash[end - 1])
 			end++;
+
+		/*
+		 * A range of a parallel count takes the batches of its part of them
+		 * whole (lion_count_ranged()); the cut is the same in every
+		 * participant, which sorts the same values the same way.
+		 */
+		if (b++ % lb->nparts != lb->part)
+		{
+			start = end;
+			continue;
+		}
 
 		lb->batches++;
 		oldcxt = MemoryContextSwitchTo(batchcxt);
@@ -437,8 +458,16 @@ lion_sum_probe_due(LionCountScanState *st, LionSumProbe *sp, double rows,
 	for (i = 0; i < nsource; i++)
 		if (i != slot)
 			others[n++] = sources[i];
-	sp->rp = lion_range_probe_begin(st->heap, estate->es_snapshot, n, others,
-									(Size) work_mem * 1024, &st->stats);
+	{
+		uint32		lo;
+		uint64		hi;
+
+		/* a range of a parallel count probes its own keys (§10) */
+		(void) lion_vis_cache_window(st->viscache, &lo, &hi);
+		sp->rp = lion_range_probe_begin(st->heap, estate->es_snapshot, n,
+										others, (Size) work_mem * 1024,
+										&st->stats, lo, hi);
+	}
 	pfree(others);
 	MemoryContextSwitchTo(oldcxt);
 
@@ -1058,6 +1087,26 @@ lion_run_has_plain_source(LionCountScanState *st)
 }
 
 /*
+ * The count of run r of a node of one row (DESIGN.md §10, "Filtered
+ * counts"), its WHERE located: a sum over every entry (`sum`,
+ * LION_FLAG_SUMALL) is how run 0 is counted; a filter's run that has a source
+ * that selects rows and holds the interlock, and no range bounding the
+ * driving walk, is that source's intersection with the others instead, which
+ * reads only the sets that select rows.  Where none has, it is the sum, the
+ * driving walk carrying the interlock (§32).  A node without filtered counts
+ * has run 0 alone.
+ */
+static int64
+lion_run_count(LionCountScanState *st, bool sum, int r)
+{
+	if (!sum ||
+		(r > 0 && !lion_plan_flag(st, LION_FLAG_RANGE) &&
+		 lion_run_has_plain_source(st)))
+		return lion_count_relation(st);
+	return lion_sumall_relation(st);
+}
+
+/*
  * The counts of the runs of a node of one row with filtered counts
  * (DESIGN.md §10, "Filtered counts"): run 0's - the WHERE's - and each
  * filter's, the rows the WHERE and that filter select together, each
@@ -1065,13 +1114,8 @@ lion_run_has_plain_source(LionCountScanState *st)
  * partition in turn.  Into st->runcount; returns run 0's.
  *
  * Each run is a count of its own: its sets located, counted and released
- * before the next run's are located, so no pin of one outlives it (§9).  A
- * sum over every entry (`sum`, LION_FLAG_SUMALL) is how run 0 is counted;
- * a filter's run that has a source that selects rows and holds the
- * interlock, and no range bounding the driving walk, is that source's
- * intersection with the others instead, which reads only the sets that
- * select rows.  Where none has, it is the sum, the driving walk carrying
- * the interlock (§32).
+ * before the next run's are located, so no pin of one outlives it (§9), and
+ * counted as lion_run_count() says.
  */
 int64
 lion_count_runs(LionCountScanState *st, bool sum)
@@ -1092,12 +1136,7 @@ lion_count_runs(LionCountScanState *st, bool sum)
 		{
 			lion_select_run(st, r);
 			lion_locate_where(st);
-			if (!sum ||
-				(r > 0 && !lion_plan_flag(st, LION_FLAG_RANGE) &&
-				 lion_run_has_plain_source(st)))
-				st->runcount[r] += lion_count_relation(st);
-			else
-				st->runcount[r] += lion_sumall_relation(st);
+			st->runcount[r] += lion_run_count(st, sum, r);
 			lion_release_where(st);
 		}
 		lion_select_run(st, 0);
@@ -1107,6 +1146,163 @@ lion_count_runs(LionCountScanState *st, bool sum)
 	}
 	st->runsready = true;
 	return st->runcount[0];
+}
+
+/*
+ * One chunk of a parallel count (lion_count_ranged()): run `run`'s count,
+ * its WHERE located, at the keys of range `sub` of the cut of ckeys keys
+ * into nranges - every count the node makes for it confined to them through
+ * the visibility cache, which every one of them is handed
+ * (lion_vis_cache_set_window()) - or, for a run with an IN list too long to
+ * locate at once, the count of its batches b with b % nranges == sub, at
+ * every key: a window would locate every batch again for each range.
+ */
+static int64
+lion_count_range(LionCountScanState *st, bool sum, int run, int sub,
+				 int nranges, uint32 ckeys)
+{
+	LionListBatch *lb = st->lbatch;
+	uint32		lo;
+	uint64		hi;
+	int64		count;
+
+	if (lb != NULL && lb->item >= 0)
+	{
+		lb->part = sub;
+		lb->nparts = nranges;
+		count = lion_run_count(st, sum, run);
+		lb->part = 0;
+		lb->nparts = 1;
+		return count;
+	}
+
+	lion_key_range(nranges, ckeys, sub, &lo, &hi);
+	lion_vis_cache_set_window(st->viscache, lo, hi);
+	count = lion_run_count(st, sum, run);
+	lion_vis_cache_clear_window(st->viscache);
+	return count;
+}
+
+/*
+ * A PARALLEL COUNT (DESIGN.md §10, "A count in parallel"): this participant's
+ * share of a node of one row - its partial count, which core's Finalize
+ * Aggregate above the Gather adds to the others' - and of each filtered
+ * count's run beside it, into runcount (runsready).  Returns run 0's.
+ *
+ * The work is cut into CHUNKS: the heap's container keys into ranges, a few
+ * for each participant the plan was made for (lion_key_ranges(), when the
+ * Gather sets up its shared memory), once for each run, the runs one after
+ * the other.  Each participant claims the next chunk nobody has from the
+ * shared counter, and counts the chunk's run at the keys of its range alone
+ * (lion_count_range()).  The counter only grows, so a participant meets the
+ * runs in order: it locates a run's WHERE once, when it claims its first
+ * chunk of it, and releases it before it locates the next, as the serial
+ * node does (lion_count_runs()).
+ *
+ * WHY IT IS EXACT.  The ranges of a cut cover every container key once - the
+ * last one has no end, for a heap that has grown since it was cut - and a
+ * row lies at exactly one key, its block's.  Every count the node makes of a
+ * run is a count of rows: the merge of its sources, the disjoint sum of a
+ * list, a walk's sum over entries, a complement OR's two counts (§35), a
+ * range walked at every count (§32), a probed walk's final count, the heap
+ * scan of a WHERE nothing narrows; each identity they rest on - that the
+ * entries of a scalar column are disjoint, that |F AND (P OR NOT M)| = |F
+ * AND NOT M| + |F AND M AND P| - holds of the rows at any set of keys as it
+ * holds of all of them.  So the counts of the ranges add up to the serial
+ * node's.  And each is an ordinary count of the containers at its keys: its
+ * positive cursors are sought to the range's first key and the merge stops
+ * at its end (LionCountCtx.windowed), the containers in between are put to
+ * the visibility map before the page they came from is let go, under the
+ * pins the serial count holds (§9), and what the map does not vouch for goes
+ * to the heap under the leader's snapshot, which every worker runs under,
+ * with the predicate locks of SERIALIZABLE taken as the serial count takes
+ * them.  A participant's sets are its own, located under its own pins.
+ *
+ * Run without the Gather's shared memory - which a Gather that cannot run in
+ * parallel mode does not set up - the node is the only participant, and
+ * counts every run whole as the serial node does.
+ */
+int64
+lion_count_ranged(LionCountScanState *st, bool sum)
+{
+	LionJoinShared *shared = st->shared;
+	LionRangedState *rs = lion_st_ranged(st);
+	int			nrun = Max(st->nrun, 1);
+	int			located = -1;
+	int64		total = 0;
+	uint64		nchunks;
+	int			r;
+
+	if (st->npart > 0 || st->join != NULL || st->topk != NULL ||
+		(st->wagg != NULL && st->wagg->nagg > 0) ||
+		lion_plan_flag(st, LION_FLAG_SINGLEGROUP))
+		elog(ERROR, "LionCount: a parallel count of another shape");
+
+	if (shared == NULL)
+	{
+		if (st->nrun > 1)
+			return lion_count_runs(st, sum);
+		if (!st->located)
+			lion_locate_where(st);
+		return lion_run_count(st, sum, 0);
+	}
+	if (shared->nranges < 1 || shared->nranges > PG_INT32_MAX / nrun)
+		elog(ERROR, "LionCount: a parallel count cut into %d ranges",
+			 shared->nranges);
+
+	if (st->nrun > 1)
+	{
+		for (r = 0; r < st->nrun; r++)
+			st->runcount[r] = 0;
+	}
+	if (st->located)
+		lion_release_where(st);
+
+	nchunks = (uint64) nrun * (uint64) shared->nranges;
+	for (;;)
+	{
+		uint32		c = pg_atomic_fetch_add_u32(&shared->nextchunk, 1);
+		int			run;
+		int			sub;
+		int64		count;
+
+		if ((uint64) c >= nchunks)
+			break;
+		CHECK_FOR_INTERRUPTS();
+
+		run = (int) (c / (uint32) shared->nranges);
+		sub = (int) (c % (uint32) shared->nranges);
+		if (run != located)
+		{
+			/* the counter only grows: an earlier run is never claimed again */
+			if (run < located)
+				elog(ERROR, "LionCount: a parallel count's run %d after %d",
+					 run, located);
+			if (located >= 0)
+				lion_release_where(st);
+			lion_select_run(st, run);
+			lion_locate_where(st);
+			located = run;
+		}
+
+		rs->ranges++;
+		count = lion_count_range(st, sum, run, sub, shared->nranges,
+								 shared->ckeys);
+		if (st->nrun > 1)
+			st->runcount[run] += count;
+		else
+			total += count;
+	}
+
+	if (located >= 0)
+		lion_release_where(st);
+	lion_select_run(st, 0);
+	if (st->nrun > 1)
+	{
+		st->runsready = true;
+		return st->runcount[0];
+	}
+	return total;
 }
 
 /* ---------------------------------------------------------------------
@@ -1581,11 +1777,21 @@ lion_group_range_next(LionCountScanState *st)
  * group's count in the range this participant is counting, the ranges taken
  * one after the other until none is left.  A group with no row in the range
  * has no row of it.
+ *
+ * GROUP BY coalesce(g, c) (st->coal, DESIGN.md §10): the NULL entry's rows
+ * and those of the entry the grouping equality finds equal to c are both
+ * c's group, and each goes up as a partial row of the value c itself, which
+ * the Finalize Agg adds to the group's others like any partial row of one
+ * key - so nothing here is added up across entries or across ranges, and
+ * the group the two make has the value c, as the serial walk's has.  The
+ * classes of one index are disjoint, so no other entry is c's.
  */
 TupleTableSlot *
 lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
 {
 	LionRangedState *rs = lion_st_ranged(st);
+	LionCoalState *coal = st->coal;
+	bool		isc;
 
 	*exhausted = false;
 
@@ -1603,6 +1809,21 @@ lion_next_group_ranged(LionCountScanState *st, bool *exhausted)
 
 			if (st->gbcount[i] == 0)
 				continue;
+			if (coal != NULL && !st->gbnull[i])
+			{
+				/* whatever the equality leaks, pergroup's to free */
+				MemoryContext oldcxt = MemoryContextSwitchTo(st->pergroup);
+
+				isc = DatumGetBool(FunctionCall2Coll(&coal->eqfn, coal->coll,
+													 st->gbkey[i],
+													 coal->value->constvalue));
+				MemoryContextSwitchTo(oldcxt);
+			}
+			else
+				isc = (coal != NULL);
+			if (isc)
+				return lion_emit_tuple(st, coal->value->constvalue, false,
+									   (Datum) 0, true, st->gbcount[i]);
 			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
 								   (Datum) 0, true, st->gbcount[i]);
 		}
