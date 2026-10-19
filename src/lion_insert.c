@@ -621,9 +621,20 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 										  Min((Size) state->ix->meta.inline_limit, room),
 										  Max(maxsize, payoff + newlen));
 			payarea = alloc - payoff;
-			if ((MAXALIGN(payoff + payarea) - payoff) + poslen > limit)
-				payarea = newlen;
 		}
+
+		/*
+		 * The test above is the payload's length; the entry is built at its
+		 * AREA, slack included.  An area the payload still fits, kept from
+		 * the last rewrite, plus positions that grew since can be past the
+		 * limit - next to a long key that limit is LION_MAX_ENTRY_SIZE, and
+		 * the rebuild then refuses the entry instead of anything spilling,
+		 * for this row and for every later one of the key.  The slack goes
+		 * first: the payload at its own length fits, which is what `fits`
+		 * says.
+		 */
+		if ((MAXALIGN(payoff + payarea) - payoff) + poslen > limit)
+			payarea = newlen;
 
 		newentry = lion_entry_rebuild_pos(entry, newpay, newlen, payarea,
 										  (const char *) chunk, poslen,
