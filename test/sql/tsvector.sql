@@ -186,6 +186,17 @@ SELECT lion_tscmp($$SELECT id FROM lion_ts
 SELECT lion_tscmp($$SELECT id FROM lion_ts
 				  WHERE tsv @@ plainto_tsquery('english', 'alpha w1')$$);
 
+-- `@@@` is `@@`
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'w1 & w2')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'alpha & !w1')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'bravo <-> charlie')$$);
+SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv @@@ to_tsquery('english', 'w1:*')$$);
+SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'w1 | w2')$$);
+
 -- NULL and empty tsvectors
 SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv IS NULL$$);
 SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv IS NOT NULL$$);

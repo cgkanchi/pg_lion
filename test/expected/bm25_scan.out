@@ -131,6 +131,32 @@ SELECT bs_same('w1 | t3', 'w1 | t3', 0);			-- no LIMIT: every row
 (1 row)
 
 RESET enable_sort;
+-- a WHERE narrower than the score: every row it keeps has one of the
+-- score's lexemes, which is all the walk needs
+SELECT bs_same('w1', 'w1 & w7', 30);
+      bs_same      
+-------------------
+ 30 rows, 0 differ
+(1 row)
+
+SELECT bs_same('w1 | w2', '(w1 | w2) & t3 & !w9', 20);
+      bs_same      
+-------------------
+ 20 rows, 0 differ
+(1 row)
+
+SELECT bs_same('w2', 'w5 <-> w2', 10);
+      bs_same      
+-------------------
+ 10 rows, 0 differ
+(1 row)
+
+SELECT bs_same('w1', 'w1 & w9:*', 10);
+      bs_same      
+-------------------
+ 10 rows, 0 differ
+(1 row)
+
 -- not offered: ascending, no WHERE, a WHERE lexeme the score lacks, a WHERE
 -- an empty document matches, a prefix
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
@@ -165,6 +191,20 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1:*'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS prefix;
  prefix 
 --------
+ f
+(1 row)
+
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 | w9 & w7'
+	ORDER BY lion_bm25_score(d, 'w7', 'bs_docs_d') DESC LIMIT 10$$) AS or_arm_without;
+ or_arm_without 
+----------------
+ f
+(1 row)
+
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w9 & !w1'
+	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS only_negated;
+ only_negated 
+--------------
  f
 (1 row)
 

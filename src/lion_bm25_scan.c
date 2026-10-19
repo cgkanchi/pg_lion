@@ -11,13 +11,13 @@
  *		every row the WHERE matches, scoring each and sorting them.
  *
  * The order is only claimed when the walk's candidates hold every row the
- * scan may return: rows the WHERE keeps all match q2, and a row that matches
- * q2 has one of q2's lexemes not under a NOT unless an empty document
- * matches q2 too - a tsquery is monotone in its operands once its NOTs are
- * pushed down to them.  So the scan is offered when q2 does not match an
- * empty document and every such lexeme of q2 is one of q's: a row with none
- * of q's lexemes scores 0 and would be missing from the walk, but such a row
- * fails the WHERE.  q2 is usually q itself.
+ * scan may return: rows the WHERE keeps all match q2, and the walk reads the
+ * rows that have one of q's lexemes.  So the scan is offered when no
+ * document without q's lexemes can match q2: q2 evaluated with each of q's
+ * lexemes absent and every other operand unknown comes out false
+ * (lion_bm25_where_covered()).  A row with none of q's lexemes scores 0 and
+ * would be missing from the walk, but such a row fails the WHERE.  q2 is
+ * usually q itself, or narrower: `tsv @@ 'w1 & w2'` under a score of 'w1'.
  *
  * The scan asks the walk for the best L rows - the LIMIT and 16 more when
  * the planner knows the LIMIT, else 64 - fetches them best first under the
@@ -299,52 +299,59 @@ lion_bm25_order_score(PlannerInfo *root)
 	return NULL;
 }
 
-static TSTernaryValue
-lion_bm25_absent(void *arg, QueryOperand *val, ExecPhraseData *data)
+/* The WHERE's tsquery, and q's lexemes, for lion_bm25_without_q(). */
+typedef struct LionBm25Cover
 {
-	return TS_NO;
+	char	   *operands;
+	List	   *qlexemes;
+} LionBm25Cover;
+
+/*
+ * An operand of the WHERE's tsquery in a document that has none of q's
+ * lexemes: absent when it is filed under the key of one of them (a long
+ * lexeme under its hashed key, as qlexemes are), and unknown otherwise -
+ * another lexeme, or a prefix, which may stand for lexemes q does not have.
+ */
+static TSTernaryValue
+lion_bm25_without_q(void *arg, QueryOperand *val, ExecPhraseData *data)
+{
+	LionBm25Cover *cover = (LionBm25Cover *) arg;
+	text	   *w;
+	ListCell   *lc;
+
+	if (val->prefix)
+		return TS_MAYBE;
+	w = lion_lexeme_key(cover->operands + val->distance, val->length, NULL);
+	foreach(lc, cover->qlexemes)
+	{
+		text	   *t = (text *) lfirst(lc);
+
+		if (VARSIZE_ANY_EXHDR(t) == VARSIZE_ANY_EXHDR(w) &&
+			memcmp(VARDATA_ANY(t), VARDATA_ANY(w),
+				   VARSIZE_ANY_EXHDR(w)) == 0)
+			return TS_NO;
+	}
+	return TS_MAYBE;
 }
 
 /*
- * Does every row matching where have one of q's lexemes (the header)?  Its
- * lexemes not under a NOT all q's, no prefix among its operands, and an
- * empty document not matching it.
+ * Does every row matching where have one of q's lexemes (the header)?  The
+ * WHERE is evaluated in ternary logic over a document with none of them and
+ * anything else: TS_execute() is false only where the answer is no whatever
+ * the unknown operands are, NOT and phrases included.  An empty document is
+ * one such document, so a WHERE that matches it is not covered.
  */
 static bool
 lion_bm25_where_covered(TSQuery where, List *qlexemes)
 {
-	bool		prefix;
-	List	   *wl;
-	ListCell   *lc;
+	LionBm25Cover cover;
 
 	if (where->size == 0)
 		return false;
-	wl = lion_bm25_lexemes(where, &prefix);
-	if (prefix || wl == NIL)
-		return false;
-	foreach(lc, wl)
-	{
-		text	   *w = (text *) lfirst(lc);
-		ListCell   *lc2;
-		bool		found = false;
-
-		foreach(lc2, qlexemes)
-		{
-			text	   *t = (text *) lfirst(lc2);
-
-			if (VARSIZE_ANY_EXHDR(t) == VARSIZE_ANY_EXHDR(w) &&
-				memcmp(VARDATA_ANY(t), VARDATA_ANY(w),
-					   VARSIZE_ANY_EXHDR(w)) == 0)
-			{
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			return false;
-	}
-	return !TS_execute(GETQUERY(where), NULL, TS_EXEC_EMPTY,
-					   lion_bm25_absent);
+	cover.operands = GETOPERAND(where);
+	cover.qlexemes = qlexemes;
+	return !TS_execute(GETQUERY(where), &cover, TS_EXEC_EMPTY,
+					   lion_bm25_without_q);
 }
 
 /* The rows the walk would read for query: its lexemes' rows, added up. */

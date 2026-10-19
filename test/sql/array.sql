@@ -189,6 +189,47 @@ SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags IS NULL$$);
 SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags IS NOT NULL$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags IS NULL$$);
 
+-- ---- array = (the rows holding every element, rechecked) -------------
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = '{t5,t5,t5}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = '{t5,t18,t2}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = '{t18,t5,t2}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = ARRAY['t13', NULL, 't0']$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = '{}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE nums = '{3,4}'$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE nums = '{3,4}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags = NULL$$);
+SELECT count(*) FROM lion_arr WHERE nums = '{3,4}';
+SELECT count(*) FROM lion_arr WHERE tags = '{t5,t18,t2}';
+
+-- equal elements, but not equal arrays: repeats, NULLs, order, dimensions
+-- and lower bounds
+CREATE TABLE lion_arr_eq (id int, a int[]);
+INSERT INTO lion_arr_eq SELECT i, ARRAY[i % 5, i % 7] FROM generate_series(1, 3000) i;
+INSERT INTO lion_arr_eq VALUES (10001, '{}'), (10002, '{NULL}'), (10003, '{1,NULL}'),
+	(10004, '{1,1}'), (10005, '[0:1]={1,1}'), (10006, '{{1,1}}'), (10007, '{1}'),
+	(10008, NULL), (10009, '{NULL,NULL}'), (10010, '{NULL,1}');
+CREATE INDEX lion_arr_eq_a ON lion_arr_eq USING lion (a);
+VACUUM ANALYZE lion_arr_eq;
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{1,1}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{1}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{NULL}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{1,NULL}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{{1,1}}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '[0:1]={1,1}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{3,4}'$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_eq WHERE a = '{3,4}'$$);
+SELECT id FROM lion_arr_eq WHERE a = '{1,1}' AND id > 10000 ORDER BY id;
+SELECT id FROM lion_arr_eq WHERE a = '{NULL}' ORDER BY id;
+SELECT id FROM lion_arr_eq WHERE a = '{}' ORDER BY id;
+-- after writes
+INSERT INTO lion_arr_eq VALUES (10011, '{1,1}'), (10012, '{4,3}');
+DELETE FROM lion_arr_eq WHERE id = 10004;
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{1,1}'$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_eq WHERE a = '{4,3}'$$);
+SELECT lion_index_verify('lion_arr_eq_a', true);
+DROP TABLE lion_arr_eq;
+
 -- ---- the count pushdown ------------------------------------------------
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{t5,t2}'$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags && '{t5,t2}'$$);

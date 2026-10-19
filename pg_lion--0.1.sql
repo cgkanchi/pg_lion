@@ -466,7 +466,11 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING lion AS
  * one row at a time - so the strategy numbers and what they mean are the
  * roaring AM's own:
  *
- *		1 =		2 @>	3 &&	4 <@	5 @@
+ *		1 =		2 @>	3 &&	4 <@	5 @@	17 array =	18 @@@
+ *
+ * Array `=` is the rows that hold every element of the query array, which
+ * the bitmap heap scan rechecks (GIN's strategy 4 does the same), and `@@@`
+ * is `@@` under its deprecated name, as in GIN's tsvector_ops.
  *
  * The STORAGE type is the key type.  array_ops stores anyelement, which is
  * resolved to the column's element type when the index is created, and has
@@ -481,6 +485,7 @@ CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
 	OPERATOR	2	@> (anyarray, anyarray),
 	OPERATOR	3	&& (anyarray, anyarray),
 	OPERATOR	4	<@ (anyarray, anyarray),
+	OPERATOR	17	= (anyarray, anyarray),
 	FUNCTION	2	ginarrayextract(anyarray, internal, internal),
 	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
 	STORAGE		anyelement;
@@ -507,6 +512,7 @@ CREATE FUNCTION lion_tsvector_extract_query(tsvector, internal, int2, internal, 
 
 CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
 	OPERATOR	5	@@ (tsvector, tsquery),
+	OPERATOR	18	@@@ (tsvector, tsquery),
 	FUNCTION	1	hashtext(text),
 	FUNCTION	4	bttextcmp(text, text),
 	FUNCTION	2	lion_tsvector_extract_value(tsvector, internal, internal),

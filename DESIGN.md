@@ -4834,7 +4834,7 @@ segments, VACUUM, the visibility-map interlock - is unchanged.
     proc 3   GIN extractQuery(query, &nkeys, strategy, &pmatch, &extra_data, &nullFlags,
                               &searchMode) -> Datum *keys
 
-    strategies   1 =      2 @>      3 &&      4 <@      5 @@
+    strategies   1 =      2 @>      3 &&      4 <@      5 @@      17 array =      18 @@@
 
 The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
 
@@ -4842,12 +4842,14 @@ The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
         OPERATOR 2 @> (anyarray, anyarray),
         OPERATOR 3 && (anyarray, anyarray),
         OPERATOR 4 <@ (anyarray, anyarray),
+        OPERATOR 17 = (anyarray, anyarray),
         FUNCTION 2 ginarrayextract(anyarray, internal, internal),
         FUNCTION 3 ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
         STORAGE  anyelement;
 
     CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
         OPERATOR 5 @@ (tsvector, tsquery),
+        OPERATOR 18 @@@ (tsvector, tsquery),
         FUNCTION 1 hashtext(text),
         FUNCTION 2 lion_tsvector_extract_value(tsvector, internal, internal),
         FUNCTION 3 lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal),
@@ -4872,15 +4874,27 @@ Two consequences of borrowing GIN's functions, both binding on any future multi-
   extraction answers for the wrong operator and returns INCLUDE_EMPTY, which only costs a rechecking
   full scan - so it is one function with one switch.
 
+Array `=` (strategy 17) and `@@@` (18) are there because GIN's classes have them, so a query that
+uses them can use the index.  `a = q` holds only where a has every element of q, so it is the AND of
+those elements' posting sets, as for `@>`, and the bitmap heap scan's recheck decides the rest - how
+often each element occurs, their order, the dimensions and lower bounds; a NULL element of q is left
+out of the AND, and an empty q is every row (ginqueryarrayextract()'s INCLUDE_EMPTY).  It is never
+exact, so `lion_extract_query()` gives it no tree and only the superset answers it.  `@@@` is `@@`
+under its deprecated name: `LION_STRAT_CANONICAL()` turns 18 into 5 at rescan and wherever a
+strategy reaches the extraction.  Neither is in `LION_STRAT_IS_MULTI()`, so the count pushdown,
+facets and the planner's probe decline them and the AM's bitmap and index scans answer them, as GIN's
+do.
+
 `lionvalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
 (T) -> int4, strategy 1 only, every operator's types hashable by the family).  An opclass is
 multi-key iff the family has proc 2 for (opcintype, opcintype); then procs 2 and 3 must have GIN's
-signatures, every operator's strategy must be in {2,3,4,5}, and proc 1 is required unless
+signatures, every operator's strategy must be a multi-key one (2 to 5, jsonb's 11 to 16, 17 or 18),
+and proc 1 is required unless
 `opckeytype` is polymorphic.  The "every type an operator mentions must be hashable" rule does not
 apply to a multi-key family, whose operators mention anyarray and tsquery and whose hashing is of
 keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing but equality
-operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
-is never asked about two members of the same roaring family that disagree.
+operators and a multi-key one at most one, array_ops' `=`, so `equality_ops_are_compatible()` is
+never asked about two members of the same roaring family that disagree.
 
 ### Key type resolution (`lion_fill_state`, lion_state.c)
 
@@ -5535,15 +5549,14 @@ float from either, bit for bit, as an incremental sort over the scan's order nee
 `LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
 whose query's first pathkey is `lion_bm25_score(col, Const, Const, Const, Const) DESC`, the index a
 lion index on that table storing positions for `col`. The order is claimed only when the walk's
-candidates hold every row the scan may return, so a restriction `col @@ q2` must be there with:
-
-- q2's lexemes not under a NOT all among the scored query's, and no prefix in q2;
-- an empty document not matching q2.
-
-A tsquery is monotone in its operands once its NOTs are pushed down to them, so a row with none of
-q2's positive lexemes evaluates no higher than the empty document, and fails q2. Every row that
-passes therefore has a scored lexeme and is a candidate. The usual query has the same q in both
-places.
+candidates hold every row the scan may return, so a restriction `col @@ q2` must be there that no
+document without the scored lexemes matches. `lion_bm25_where_covered()` evaluates q2 with
+`TS_execute()` in ternary logic: each scored lexeme is absent, and every other operand - another
+lexeme, a prefix - is unknown. q2 is covered when the answer is no whatever the unknowns are, NOTs
+and phrases included. Every row that passes it therefore has a scored lexeme and is a candidate.
+The usual query has the same q in both places, or a narrower q2: `'w1 & w2'`, `'w1 & !w9'` or
+`'w9 <-> w1'` under a score of `'w1'`. Not `'w1 | w2'`, `'w9 & !w1'` or a bare prefix, which a row
+without `w1` can match.
 
 The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 16, or 64 when the
 LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and

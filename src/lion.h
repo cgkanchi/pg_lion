@@ -1112,7 +1112,11 @@ lion_index_row_column(const LionIndexState *ix)
  * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
  * class has beside its proc 4, and 10 is `<>` (§35), which it has beside
  * them: every entry but one, a range with a hole in it.  11 .. 16 are
- * jsonb_contains_ops' (DESIGN.md §42, §43), which are multi-key too.
+ * jsonb_contains_ops' (DESIGN.md §42, §43), which are multi-key too.  17 is
+ * array `=`, which the keys only bound - the rows holding every element of
+ * the query, rechecked - and 18 tsvector's `@@@`, `@@` under its deprecated
+ * name, which a scan takes as 5 (LION_STRAT_CANONICAL()); a bitmap scan is
+ * all that answers either, as for GIN.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
@@ -1130,7 +1134,13 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_STRAT_JSONB_EXISTS_ALL	14	/* jsonb ?& text[] */
 #define LION_STRAT_JSONPATH_EXISTS	15	/* jsonb @? jsonpath (§43) */
 #define LION_STRAT_JSONPATH_MATCH	16	/* jsonb @@ jsonpath */
-#define LION_NSTRATEGIES			16
+#define LION_STRAT_ARRAY_EQUAL	17	/* anyarray = anyarray (§17) */
+#define LION_STRAT_MATCH_OLD		18	/* tsvector @@@ tsquery, which is @@ */
+#define LION_NSTRATEGIES			18
+
+/* a strategy as the scan answers it: `@@@` is `@@` */
+#define LION_STRAT_CANONICAL(s) \
+	((s) == LION_STRAT_MATCH_OLD ? LION_STRAT_MATCH : (s))
 
 /* a multi-key strategy (§17) */
 #define LION_STRAT_IS_MULTI(s) \
