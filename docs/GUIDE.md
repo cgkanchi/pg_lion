@@ -453,6 +453,23 @@ its sample of the rows, up to half of `maintenance_work_mem`, in shared memory: 
 stops with "could not resize shared memory segment"; `SET max_parallel_maintenance_workers = 0`
 builds alone.
 
+The partitions are chosen from that sample, half of `maintenance_work_mem`, at least 16 of its
+rows each, so a large table needs it large: 376 MB for a million rows of 1536 dimensions, 12 GB
+for a billion, where the default 64 MB is enough for 28,985 such rows. Given too little, the build
+stops early - as soon as it has read enough rows to know - with an error that says how many
+partitions it wants, how many the sample has rows for, and the setting that would be enough:
+
+```
+ERROR:  lionvec index "items_emb" wants 8000 partitions, and its sample has rows for 1361
+DETAIL:  About 1000000 rows with a vector want 8000 partitions of at least 16 sample rows each, and half of maintenance_work_mem (64MB) holds a sample of 21788 rows of 1536 dimensions.
+HINT:  Set maintenance_work_mem to at least 376MB, or set pg_lion.vector_build_sample to allow to build 1361 partitions.
+```
+
+Set it and build again, or `SET pg_lion.vector_build_sample = allow` to build the fewer, larger
+partitions, which make a scan read more rows for the same recall. A `pg_restore` or `reindexdb`
+builds at the server's `maintenance_work_mem` unless told otherwise:
+`PGOPTIONS='-c maintenance_work_mem=4GB' pg_restore ...`.
+
 The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
 partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the
 table; `Heap Fetches` in `EXPLAIN ANALYZE` counts the rows the node fetched, about `k`. A set of up

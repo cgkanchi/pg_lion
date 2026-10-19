@@ -286,6 +286,10 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
 - A `lionvec` query under a `WHERE` that no lion index answers fails by default
   (`pg_lion.vector_postfilter`); `SET pg_lion.vector_postfilter = exact` plans it as an exact sort
   instead.
+- A `lionvec` build chooses its partitions from a sample of what half of `maintenance_work_mem`
+  holds, so a large table needs it large (376 MB for a million rows of 1536 dimensions, 12 GB for a
+  billion); given too little, the build fails early, naming the setting it needs
+  (`pg_lion.vector_build_sample`; `allow` builds fewer partitions instead).
 - `lionvec` does not support row-level security: it builds no index on a table that has it
   enabled, or on a partition of one, and a query such an index could order fails.
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating

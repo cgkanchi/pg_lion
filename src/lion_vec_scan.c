@@ -106,6 +106,7 @@
 #include "port/atomics.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
+#include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/float.h"
 #include "utils/lsyscache.h"

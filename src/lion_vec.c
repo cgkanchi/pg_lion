@@ -106,6 +106,7 @@ int			lionvec_exact_rows = LIONVEC_EXACT_DEFAULT;
 double		lionvec_exact_per_part = LIONVEC_EXACT_PER_PART_DEFAULT;
 int			lionvec_overflow = LIONVEC_OVERFLOW_ERROR;
 int			lionvec_postfilter = LIONVEC_POSTFILTER_ERROR;
+int			lionvec_build_sample = LIONVEC_BUILD_SAMPLE_ERROR;
 int			lionvec_prefetch = LION_READAHEAD_DEFAULT;
 bool		lionvec_toast_direct = true;
 bool		lionvec_parallel_scan = false;
@@ -148,6 +149,12 @@ static const struct config_enum_entry lionvec_postfilter_options[] = {
 	{NULL, 0, false}
 };
 
+static const struct config_enum_entry lionvec_build_sample_options[] = {
+	{"error", LIONVEC_BUILD_SAMPLE_ERROR, false},
+	{"allow", LIONVEC_BUILD_SAMPLE_ALLOW, false},
+	{NULL, 0, false}
+};
+
 static relopt_kind lionvec_relopt_kind;
 
 static void lionveccostestimate(PlannerInfo *root, IndexPath *path,
@@ -159,7 +166,7 @@ static void lionveccostestimate(PlannerInfo *root, IndexPath *path,
 typedef struct LionVecOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int			partitions;		/* 0: by the rows' count (lionvec_partitions()) */
+	int			partitions;		/* 0: by the rows' count (lionvec_parts()) */
 	bool		spill;			/* a copy of each row in a second partition */
 } LionVecOptions;
 
@@ -366,6 +373,33 @@ lion_vec_init(void)
 							 &lionvec_overflow,
 							 LIONVEC_OVERFLOW_ERROR,
 							 lionvec_overflow_options,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §44.8: the partitions a build makes must not follow a
+	 * memory setting unseen.  The build chooses them from a sample of what
+	 * half of maintenance_work_mem holds, and makes no more than the sample
+	 * has rows for: were that all, at the default 64 MB a table of 1536
+	 * dimensions would get 1,361 partitions whatever its rows, a billion's
+	 * 252,982 wanting 12.5 GB, with only a DEBUG1 line to say so.  error,
+	 * the default, fails the build in its first pass, at the first row that
+	 * makes the sample too small (lionvec_build_report_short()); allow
+	 * builds the partitions the sample has rows for, with a NOTICE.
+	 */
+	DefineCustomEnumVariable("pg_lion.vector_build_sample",
+							 "What a lionvec build does when maintenance_work_mem holds too small a "
+							 "sample for the partitions it wants.",
+							 "A build chooses its partitions from a sample of the rows, as many as half of "
+							 "maintenance_work_mem holds, and makes no more than the sample has rows for: "
+							 "16 a partition it chooses by itself, one a partition the partitions option "
+							 "asks for.  error, the default, fails a build whose sample holds fewer of the "
+							 "rows than that, saying the maintenance_work_mem that would hold enough; allow "
+							 "builds the partitions the sample has rows for, with a NOTICE.",
+							 &lionvec_build_sample,
+							 LIONVEC_BUILD_SAMPLE_ERROR,
+							 lionvec_build_sample_options,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
@@ -1273,24 +1307,12 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_KMEANS_ITERS	10
 
 /*
- * The most rows the reservoir holds, whatever maintenance_work_mem does: 64
- * a partition at LIONVEC_MAX_PARTS, half of what k-means is given a
- * partition at most (LIONVEC_SAMPLE_PER_PART_MAX).  It holds rows x
- * (dimsp + 4) bytes, 1,540 a row at 1536 dimensions, so 25.8 GB at this cap,
- * which a maintenance_work_mem of 52 GB reaches; it starts at
- * LIONVEC_SAMPLE_FIRST rows and doubles as it fills, so that a small table's
- * sample takes what its rows do and not the half of maintenance_work_mem it
- * may.
+ * The reservoir (lion_vec_math.h, lionvec_sample_max()) starts at
+ * LIONVEC_SAMPLE_FIRST rows and doubles as it fills, so that a small
+ * table's sample takes what its rows do and not the half of
+ * maintenance_work_mem it may.
  */
-#define LIONVEC_SAMPLE_MAX		(1 << 24)
 #define LIONVEC_SAMPLE_FIRST	1024
-
-/*
- * The fewest sample rows a partition the build chooses by itself, and the
- * fewest rows a table must have for it to make more than one.
- */
-#define LIONVEC_SAMPLE_PER_PART	16
-#define LIONVEC_MIN_AUTO_ROWS	10000
 
 /*
  * The reservoir keeps what half of maintenance_work_mem holds, and the
@@ -1301,18 +1323,6 @@ lionvec_note_key(Page page, ItemPointer tid)
  * LIONVEC_SEED, the regions' one past it).
  */
 #define LIONVEC_SEED_SUBSAMPLE	((uint64) LIONVEC_SEED + 2)
-
-/*
- * The partitions the build chooses by itself, per square root of the rows:
- * 8 sqrt(n), 8,000 for a million rows, where it was 2 sqrt(n).  Partitions
- * a quarter the size read 1.55 to 1.78 times fewer rows for the same recall
- * in the numpy model of DBpedia's text-embedding-3-large rows, and 1.5
- * times fewer CODE pages for 0.95 of the true ten on an index of 115,186 of
- * them - no faster there, where ranking four times the centroids costs what
- * the pages save (DESIGN.md §44.3, §44.9).  The build's time grows with
- * the partitions.
- */
-#define LIONVEC_PARTS_PER_ROOT	8.0
 
 /*
  * The CODE items go through a sort by group - a partition, then the rows in
@@ -1382,10 +1392,11 @@ typedef struct LionVecBuildState
 	int			metric;
 	bool		half;			/* the column is a halfvec */
 	int			dims;
-	/* the first pass: the mean, and a sample (lionvec_build_sample()) */
+	/* the first pass: the mean, and a sample (lionvec_build_draw()) */
 	float	   *hbuf;			/* [dims]: a halfvec row's floats */
 	double	   *sum;			/* [dims] */
 	double		nsum;			/* rows with a vector (cosine: a nonzero one) */
+	BlockNumber hblocks;		/* the heap's blocks as the pass began */
 	LionVecRotation srot;
 	uint8	   *scodes;			/* [scap][dimsp] */
 	float	   *sscale;			/* [scap] */
@@ -1520,17 +1531,18 @@ lionvec_build_info(int metric, bool half, int dims, const float *mean)
 }
 
 /*
- * The first pass's sample (DESIGN.md §44.2): as many rows as half of
- * maintenance_work_mem holds as 8-bit codes, by reservoir sampling (Vitter's
- * algorithm R) - the n-th row with a vector takes a place when it is one of
- * the first smax, and otherwise with probability smax / n, in place of one
- * chosen at random - from a generator seeded alike every build, so that a
- * build of the same rows makes the same partitions.  The rows are rotated
- * but not centred, the mean not being known yet; the codes are within a
- * percent of the rows, which k-means does not notice.
+ * The first pass's sample (DESIGN.md §44.3): as many rows as half of
+ * maintenance_work_mem holds as 8-bit codes (lionvec_sample_max()), by
+ * reservoir sampling (Vitter's algorithm R) - the n-th row with a vector
+ * takes a place when it is one of the first smax, and otherwise with
+ * probability smax / n, in place of one chosen at random - from a generator
+ * seeded alike every build, so that a build of the same rows makes the same
+ * partitions.  The rows are rotated but not centred, the mean not being
+ * known yet; the codes are within a percent of the rows, which k-means does
+ * not notice.
  */
 static void
-lionvec_build_sample(LionVecBuildState *bs, const float *v, int dim)
+lionvec_build_draw(LionVecBuildState *bs, const float *v, int dim)
 {
 	int			dimsp = LIONVEC_PADDED(dim);
 	int			slot;
@@ -1539,11 +1551,9 @@ lionvec_build_sample(LionVecBuildState *bs, const float *v, int dim)
 
 	if (bs->scodes == NULL)
 	{
-		Size		budget = (Size) maintenance_work_mem * 1024 / 2;
-		Size		per = (Size) dimsp + sizeof(float);
 		MemoryContext old = MemoryContextSwitchTo(bs->buildcxt);
 
-		bs->smax = (int) Max(Min(budget / per, (Size) LIONVEC_SAMPLE_MAX), 1);
+		bs->smax = lionvec_sample_max(maintenance_work_mem, dimsp);
 		bs->scap = Min(bs->smax, LIONVEC_SAMPLE_FIRST);
 		bs->scodes = MemoryContextAllocHuge(bs->buildcxt, (Size) bs->scap * dimsp);
 		bs->sscale = palloc(sizeof(float) * bs->scap);
@@ -1581,6 +1591,89 @@ lionvec_build_sample(LionVecBuildState *bs, const float *v, int dim)
 	e.codes = bs->scodes + (Size) slot * dimsp;
 	lionvec_encode(NULL, dimsp, x, &e);
 	bs->sscale[slot] = e.rnorm8 > 0.0f ? e.norm / e.rnorm8 : 0.0f;
+}
+
+/* The index's `partitions` option: 0 chooses by the rows' count. */
+static int
+lionvec_asked_parts(Relation index)
+{
+	LionVecOptions *opts = (LionVecOptions *) index->rd_options;
+
+	return opts != NULL ? opts->partitions : 0;
+}
+
+/*
+ * The rows with a vector the table holds, as the first pass reckons them at
+ * the row of tid: the rows counted so far times the heap's blocks over those
+ * read, which it reads in order from the first (allow_sync = false).  Never
+ * fewer than the rows counted; for lionvec_build_report_short()'s numbers
+ * alone, when the pass stops before the table's end.
+ */
+static double
+lionvec_build_rows_about(const LionVecBuildState *bs, ItemPointer tid)
+{
+	double		read = (double) ItemPointerGetBlockNumber(tid) + 1.0;
+
+	if ((double) bs->hblocks <= read)
+		return bs->nsum;
+	return bs->nsum * ((double) bs->hblocks / read);
+}
+
+/*
+ * Why lionvec_build_report_short() says what it does: the rows and what
+ * they want, by the option or by their count, and the sample.
+ */
+static int
+lionvec_build_short_detail(const LionVecBuildState *bs, int asked, int want,
+						   double nrows, bool about)
+{
+	char	   *mwm = GetConfigOptionByName("maintenance_work_mem", NULL, false);
+
+	if (asked > 0)
+		return errdetail("The partitions option asks for %d of %s%.0f rows with a vector, at least a sample row each, and half of maintenance_work_mem (%s) holds a sample of %d rows of %d dimensions.",
+						 asked, about ? "about " : "", nrows, mwm, bs->smax, bs->dims);
+	return errdetail("%s%.0f rows with a vector want %d partitions of at least %d sample rows each, and half of maintenance_work_mem (%s) holds a sample of %d rows of %d dimensions.",
+					 about ? "About " : "", nrows, want, LIONVEC_SAMPLE_PER_PART,
+					 mwm, bs->smax, bs->dims);
+}
+
+/*
+ * The build's sample has rows for fewer partitions than nrows rows with a
+ * vector want (lionvec_parts_short()), maintenance_work_mem holding too few
+ * of them.  Under pg_lion.vector_build_sample = error, the default, the
+ * build fails, saying the partitions it wants, those the sample has rows
+ * for, and the maintenance_work_mem whose sample would make them all
+ * (lionvec_parts_sample(), lionvec_sample_mem()), rounded up to a megabyte;
+ * under allow it makes those it can and says so with a NOTICE.  about says
+ * nrows is reckoned (lionvec_build_rows_about()), not counted.
+ */
+static void
+lionvec_build_report_short(const LionVecBuildState *bs, double nrows, bool about)
+{
+	const char *name = RelationGetRelationName(bs->index);
+	int			asked = lionvec_asked_parts(bs->index);
+	int			want = lionvec_parts_wanted(asked, nrows);
+	int			have = lionvec_parts(asked, nrows, bs->smax);
+	int64		mem = lionvec_sample_mem(lionvec_parts_sample(asked, want),
+										 LIONVEC_PADDED(bs->dims));
+	int64		mb = (mem + 1023) / 1024;
+
+	Assert(bs->dims > 0 && have < want);
+	if (lionvec_build_sample == LIONVEC_BUILD_SAMPLE_ALLOW)
+		ereport(NOTICE,
+				(errmsg("lionvec index \"%s\" has %d partitions, fewer than the %d it wants",
+						name, have, want),
+				 lionvec_build_short_detail(bs, asked, want, nrows, about),
+				 errhint("At a maintenance_work_mem of " INT64_FORMAT "MB or more its build makes %d.",
+						 mb, want)));
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("lionvec index \"%s\" wants %d partitions, and its sample has rows for %d",
+						name, want, have),
+				 lionvec_build_short_detail(bs, asked, want, nrows, about),
+				 errhint("Set maintenance_work_mem to at least " INT64_FORMAT "MB, or set pg_lion.vector_build_sample to allow to build %d partitions.",
+						 mb, have)));
 }
 
 static void
@@ -1626,7 +1719,17 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 		for (i = 0; i < dim; i++)
 			bs->sum[i] += v[i] * scale;
 		bs->nsum += 1.0;
-		lionvec_build_sample(bs, v, dim);
+		lionvec_build_draw(bs, v, dim);
+
+		/*
+		 * The rows so far want more partitions than the full reservoir has
+		 * rows for: the table's rows, which can only be more, want more
+		 * still (lionvec_parts_short()), so the build fails at the first
+		 * such row, before the rest of the pass, k-means and the second.
+		 */
+		if (lionvec_build_sample == LIONVEC_BUILD_SAMPLE_ERROR &&
+			lionvec_parts_short(lionvec_asked_parts(index), bs->nsum, bs->smax))
+			lionvec_build_report_short(bs, lionvec_build_rows_about(bs, tid), true);
 	}
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(bs->tmpcxt);
@@ -1667,33 +1770,6 @@ lionvec_build_subsample(LionVecBuildState *bs, int m)
 	bs->scap = m;
 	bs->scodes = repalloc_huge(bs->scodes, (Size) m * dimsp);
 	bs->sscale = repalloc_huge(bs->sscale, sizeof(float) * (Size) m);
-}
-
-/*
- * How many partitions the build makes of nrows rows with a vector, sampled
- * sampled: as the index's `partitions` option asks, or else one for a table
- * of fewer than LIONVEC_MIN_AUTO_ROWS of them and LIONVEC_PARTS_PER_ROOT
- * times their square root for a larger (8,000 for a million rows), no more
- * than the sample has LIONVEC_SAMPLE_PER_PART rows for.  Never more than the
- * sample's rows, and none without one.
- */
-static int
-lionvec_partitions(Relation index, double nrows, int sampled)
-{
-	LionVecOptions *opts = (LionVecOptions *) index->rd_options;
-	double		want;
-
-	if (nrows < 1.0 || sampled < 1)
-		return 0;
-	if (opts != NULL && opts->partitions > 0)
-		want = opts->partitions;
-	else if (nrows < LIONVEC_MIN_AUTO_ROWS)
-		want = 1.0;
-	else
-		want = Min(LIONVEC_PARTS_PER_ROOT * sqrt(nrows),
-				   Max(1.0, floor((double) sampled / LIONVEC_SAMPLE_PER_PART)));
-	want = Min(want, (double) sampled);
-	return (int) Max(1.0, Min(want, (double) LIONVEC_MAX_PARTS));
 }
 
 /*
@@ -3531,6 +3607,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * sorted back into heap order (by TID) whatever order it reads them in.
 	 */
 	INSTR_TIME_SET_CURRENT(start);
+	bs.hblocks = RelationGetNumberOfBlocks(heap);
 	table_index_build_scan(heap, index, indexInfo, false, false,
 						   lionvec_build_mean_callback, &bs, NULL);
 
@@ -3562,8 +3639,16 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		meta.mean_head = lionvec_build_write_mean(index, bs.info->mean,
 												  bs.info->dimsp);
 
-	/* the partitions, and whether rows spill to a second (two at least) */
-	bs.nparts = bs.dims > 0 ? lionvec_partitions(index, bs.nsum, bs.sn) : 0;
+	/*
+	 * the partitions (lionvec_parts()), and whether rows spill to a second
+	 * (two at least); fewer than the rows want only under
+	 * pg_lion.vector_build_sample = allow - the first pass fails the build
+	 * otherwise - which says so here, of the rows counted
+	 */
+	Assert(bs.nsum < 1.0 || (double) bs.sn == Min(bs.nsum, (double) bs.smax));
+	bs.nparts = bs.dims > 0 ? lionvec_parts(lionvec_asked_parts(index), bs.nsum, bs.sn) : 0;
+	if (bs.nparts > 0 && lionvec_parts_short(lionvec_asked_parts(index), bs.nsum, bs.smax))
+		lionvec_build_report_short(&bs, bs.nsum, false);
 
 	/*
 	 * ... and k-means' sample: the rows drawn, cut to what k-means is given

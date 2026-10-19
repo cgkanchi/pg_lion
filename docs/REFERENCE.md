@@ -290,17 +290,29 @@ NaN, as a sort puts them.
 
 `partitions` (0 to 262,144) sets how many partitions the build makes; 0, the default, makes one
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
-larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
-The build samples as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
-row, at most 16.8 million rows, 25.8 GB) and runs k-means over at most 128 of them a partition
-(never fewer than 65,536 rows): the
-default 64 MB holds about 21,800 rows of 1536 dimensions, so at most 1,361 partitions; a million
-rows need 376 MB for their 8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a
-billion rows' 252,982 need 12.5 GB. More partitions make a scan score fewer rows and rank more
-centroids, and make the build slower (it grows with the rows times the square root of the
-partitions); they leave the
-pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting takes
-effect at the next `REINDEX`.
+larger (8,000 for a million rows, never more than a sixteenth of the rows). The build chooses them
+from a sample of as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
+row, at most 16.8 million rows, 25.8 GB), at least 16 sample rows a partition it chooses and one a
+partition `partitions` asks for, and runs k-means over at most 128 of them a partition (never
+fewer than 65,536 rows): the default 64 MB holds about 21,800 rows of 1536 dimensions, enough for
+1,361 partitions, which a table of 28,986 rows outgrows; a million rows need 376 MB for their
+8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a billion rows' 252,982 need
+12.5 GB. A build whose sample is too small for the partitions its rows want, or for those
+`partitions` asks (up to the table's rows), fails as soon as its first pass has read enough rows
+to know it, before the rest of the build, naming the `maintenance_work_mem` that would be enough
+(for the rows the table holds, reckoned from the part read so far - "About"):
+
+    ERROR:  lionvec index "items_emb" wants 252982 partitions, and its sample has rows for 1361
+    DETAIL:  About 1000000000 rows with a vector want 252982 partitions of at least 16 sample rows each, and half of maintenance_work_mem (64MB) holds a sample of 21788 rows of 1536 dimensions.
+    HINT:  Set maintenance_work_mem to at least 11890MB, or set pg_lion.vector_build_sample to allow to build 1361 partitions.
+
+`SET pg_lion.vector_build_sample = allow` builds the fewer partitions instead, with a NOTICE
+(below). A table of fewer than 10,000 rows, which has one partition, builds at any
+`maintenance_work_mem`, and a `partitions` larger than the table's rows wants one a row, which a
+sample of every row makes. More partitions make a scan score fewer rows and rank more centroids,
+and make the build slower (it grows with the rows times the square root of the partitions); they
+leave the pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting
+takes effect at the next `REINDEX`.
 
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (spill = off);
 
@@ -717,6 +729,16 @@ of the scan's rows, and one of the vector column alone (`embedding IS NOT NULL`,
 filters them under every value; any other is a filter, a key's `id = 5` too. A table with
 row-level security `lionvec` refuses under every value (below).
 
+`pg_lion.vector_build_sample` (`error`, or `allow`): what a `lionvec` build does when half of
+`maintenance_work_mem` holds too small a sample of the rows for the partitions it wants - fewer
+than a sample of every row would give (above, and DESIGN.md §44.8). `error`, the default, fails the
+build in its first pass, as soon as the rows it has read want more partitions than the sample has
+rows for - before k-means and the second pass, and for a parallel build before its workers start -
+naming the partitions wanted, those the sample has rows for, and the `maintenance_work_mem` that
+would hold enough, rounded up to a megabyte. `allow` builds the partitions the sample has rows for,
+with a NOTICE that names the same. The partitions decide which rows a scan reads, so its answers,
+which is why a memory setting does not change them unseen; a `REINDEX` reads the setting again.
+
 `pg_lion.vector_parallel_scan` (`off`): whether the planner may scan a `lionvec` index in parallel
 (above, and DESIGN.md §44.4, "A parallel scan"). Off, a `lionvec` order gets no partial path at all,
 whatever core's parallel settings say: on every query measured the parallel scan was slower than
@@ -852,7 +874,9 @@ from PostgreSQL 16, for a table of 10,000 rows or more or one whose `parallel_wo
 and 36 s with three workers on four cores, where comparing each row with every centroid took
 292 s and 85 s. A parallel build holds its sample, up to half of `maintenance_work_mem`,
 and the centroids in dynamic shared memory, which Docker limits to 64 MB unless given
-`--shm-size`.
+`--shm-size`. A build whose `maintenance_work_mem` holds too small a sample for its partitions
+fails (`pg_lion.vector_build_sample`, above), `pg_restore`'s and `reindexdb`'s too, which run at
+the server's setting unless told otherwise (`PGOPTIONS='-c maintenance_work_mem=12GB'`).
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
 A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
 client_min_messages = debug1` shows the passes). What a scan remembers of the rows it has read is
