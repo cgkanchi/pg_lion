@@ -90,12 +90,6 @@ typedef struct LionRangeUnion
 /* What one kept container costs beyond its chunk: its hash entry. */
 #define LION_RANGE_UNION_OVERHEAD	(sizeof(LionRangeUnionEnt) + 16)
 
-/*
- * The least memory a window has, whatever is left of the caller's: several
- * bitsets, so that a window always keeps some keys and gets on.
- */
-#define LION_RANGE_WINDOW_MIN		(32 * 1024)
-
 static int
 lion_ckey_cmp(const void *a, const void *b)
 {
@@ -488,17 +482,19 @@ lion_range_union_sorted(LionRangeUnion *u, long *n)
  * union did at the peak (2026-09-28 review).
  *
  * One that does not fit fails - the caller walks the range at every count
- * instead - unless spill says it may not: an OR's leaf, which cannot be taken
- * apart that way and used to be collected whatever it took.  It is then
- * collected a WINDOW of container keys at a time into a temporary file
- * (LionSpill): a window keeps the keys from where the last one ended; when
- * its memory - maxbytes, and never below LION_RANGE_WINDOW_MIN - runs out it
- * gives back the upper half of its keys and ends where they began
- * (lion_range_union_evict()); at the end of the walk its containers go to
- * the file in key order, and the next window reads the range again from its
- * end.  Every window is a walk of the range, so a union n times the memory
- * costs about 2n walks; each is read after the snapshot like the first, and
- * the windows are disjoint ranges of TIDs, so the file holds each row once.
+ * instead, where its plan chose that - unless spill says it may not, which
+ * is every other caller's: a count whose plan collects its ranges, an OR's
+ * leaf, which cannot be taken apart that way, the decoded walk's WHERE and
+ * the FK-side join's fact filters.  It is then collected a WINDOW of
+ * container keys at a time into a temporary file (LionSpill): a window keeps
+ * the keys from where the last one ended; when its memory - maxbytes, and
+ * never below LION_RANGE_WINDOW_MIN - runs out it gives back the upper half
+ * of its keys and ends where they began (lion_range_union_evict()); at the
+ * end of the walk its containers go to the file in key order, and the next
+ * window reads the range again from its end.  Every window is a walk of the
+ * range, so a union n times the memory costs about 2n walks; each is read
+ * after the snapshot like the first, and the windows are disjoint ranges of
+ * TIDs, so the file holds each row once.
  * The set reads the file a container at a time; what it keeps in memory is
  * sixteen bytes a container key.
  */
@@ -630,6 +626,7 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 			hash_destroy(u.byckey);
 			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
 				MemoryContextMemAllocated(cxt, true);
+			mat->unioncxt = cxt;
 
 			out->found = true;
 			out->mat = mat;
@@ -672,6 +669,43 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 	*held = mat->held;
 	*spilled = true;
 	return true;
+}
+
+/*
+ * A range collected in memory, sent to a file to make room for one collected
+ * after it that does not fit what it left (lion_locate_range()).  Its
+ * containers are in key order, which is how a spill takes them, and they go
+ * to the file as they are; the set's entries are made where the set is, and
+ * the union's context, with every container in it, is deleted.
+ */
+void
+lion_range_spill_set(LionMatSet *mat, Size *held)
+{
+	LionSpill	sp;
+	LionMatSet *spilled;
+	Size		was;
+	int			i;
+
+	if (mat == NULL || mat->unioncxt == NULL || mat->containers == NULL ||
+		lion_mat_spills(mat) || mat->ncontainers <= 0)
+		elog(ERROR, "lion index: a range's set to spill is not one in memory");
+
+	was = mat->held;
+	PrepareTempTablespaces();
+	memset(&sp, 0, sizeof(sp));
+	lion_spill_begin(&sp, GetMemoryChunkContext(mat));
+	for (i = 0; i < mat->ncontainers; i++)
+		lion_spill_add(&sp, mat->containers[i]);
+	spilled = lion_spill_finish(&sp);
+
+	pfree(mat->containers);
+	MemoryContextDelete(mat->unioncxt);
+	*mat = *spilled;
+	pfree(spilled);
+	Assert(mat->unioncxt == NULL && lion_mat_spills(mat));
+
+	*held -= Min(*held, was);
+	*held += mat->held;
 }
 
 /* ---------------------------------------------------------------------

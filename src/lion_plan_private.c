@@ -17,7 +17,8 @@
 /* Every LION_FLAG_* and LION_JOINFLAG_* bit this build knows. */
 #define LION_FLAG_ALL \
 	(LION_FLAG_SINGLEGROUP | LION_FLAG_SUMALL | LION_FLAG_GROUPIDX | \
-	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID)
+	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID | \
+	 LION_FLAG_RANGEWALK)
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
@@ -117,11 +118,15 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 		LionCountPrivClause *cl = &out->clause[i];
 
 		cl->kind = list_nth_int(ckinds, i);
+		cl->walk = (cl->kind & LION_CLAUSE_WALK) != 0;
+		cl->kind &= ~LION_CLAUSE_WALK;
 		cl->idxoid = list_nth_oid(oids, 3 + i);
 		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(ops, i);
 		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_NOTMULTI)
 			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
+		if (cl->walk && cl->kind != LION_CLAUSE_RANGESRC)
+			elog(ERROR, "LionCount: a clause of kind %d walked", cl->kind);
 	}
 }
 
@@ -710,7 +715,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	{
 		oids = lappend_oid(oids, p->clause[i].idxoid);
 		ints = lappend_int(ints, (int) p->clause[i].attno);
-		ckinds = lappend_int(ckinds, p->clause[i].kind);
+		ckinds = lappend_int(ckinds, p->clause[i].kind |
+							 (p->clause[i].walk ? LION_CLAUSE_WALK : 0));
 		ops = lappend_oid(ops, p->clause[i].opno);
 	}
 	for (i = 0; i < p->npart; i++)
@@ -1113,6 +1119,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	bool		joinunite = (jflags & LION_JOINFLAG_UNITE) != 0;
 	bool		joinleft = (jflags & LION_JOINFLAG_LEFT) != 0;
 	AttrNumber	driveattno;
+	int			walks;
 	int			i;
 	int			j;
 
@@ -1130,6 +1137,25 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		(sumall || decode || p->hasjoin || p->npart > 0 || p->nwcol > 0 ||
 		 parallel_aware))
 		elog(ERROR, "LionCount: residual clauses in a shape that tests no row");
+
+	/*
+	 * Ranges too large to collect walked at every count (DESIGN.md §32, "Too
+	 * large to collect") are a choice of the count's own price: never the
+	 * decoded walk's, whose WHERE is one copy, a join's, the top k's or a
+	 * parallel GROUP BY's, none of which the planner prices that way.
+	 */
+	if ((p->flags & LION_FLAG_RANGEWALK) != 0 &&
+		(decode || p->hasjoin || p->topkn > 0 || parallel_aware))
+		elog(ERROR, "LionCount: ranges walked in a shape that collects them");
+
+	/* ... and the plan that walks some names them, and only it */
+	walks = 0;
+	for (i = 0; i < p->nclause; i++)
+		if (p->clause[i].walk)
+			walks++;
+	if ((walks > 0) != ((p->flags & LION_FLAG_RANGEWALK) != 0))
+		elog(ERROR, "LionCount: %d ranges walked in a plan %s",
+			 walks, (walks > 0) ? "that walks none" : "that walks some");
 
 	/*
 	 * The top k by count (DESIGN.md §36) is made of one grouping column

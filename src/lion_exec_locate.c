@@ -651,6 +651,7 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 				 cl->idxcol != rs->col)
 			elog(ERROR, "LionCount: the bounds of one range on two indexes");
 
+		rs->walk |= cl->walk;
 		strategy = get_op_opfamily_strategy(cl->opno,
 											cl->idx->rd_opfamily[cl->idxcol - 1]);
 		lion_range_add(&rs->range, cl->idx, strategy, get_opcode(cl->opno),
@@ -663,21 +664,57 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 }
 
 /*
+ * Send the ranges collected in memory so far to files of their own
+ * (lion_range_spill_set()), for one after them that does not fit what they
+ * left (lion_locate_range()): each then holds what a range collected in
+ * windows holds, and counts as spilled.
+ */
+static void
+lion_rangesrc_evict(LionCountScanState *st)
+{
+	ListCell   *lc;
+
+	foreach(lc, st->rangesrc_mem)
+	{
+		lion_range_spill_set((struct LionMatSet *) lfirst(lc),
+							 &st->rangesrc_held);
+		st->rangesrc_spilled++;
+	}
+	list_free(st->rangesrc_mem);
+	st->rangesrc_mem = NIL;
+}
+
+/*
  * Locate a range taken as a source (DESIGN.md §32, "A range as a source"):
  * the rows whose key lies in it, which is the union of the disjoint sets a
  * walk of it hands out - entries, and the summaries of the buckets it covers
- * whole.  They are COLLECTED into one private set when that fits what is
- * left of a hash table's memory (get_hash_memory_limit(), shared by every
- * range of the relation), which the counts then read like any other set.
- * One that does not fit is left to be walked at every count instead
- * (src->rangewalk, lion_node_count()) - unless it is an OR's leaf, which
- * cannot be taken apart that way, or a source of the decoded walk's WHERE
- * (DESIGN.md §34), which is read as one collected copy (`walkable` false; the
- * planner declines an OR's leaf it expects to be large, and prices the
- * decoded walk's as collected in windows, lion_cost_range_source()).  That one used to be collected whatever it took,
- * in memory; it gets the same memory as the others now, and past it is
- * collected a window of container keys at a time into a temporary file
- * (lion_range_collect(), 2026-09-28 review).
+ * whole.  They are COLLECTED into one private set within what is left of a
+ * hash table's memory (get_hash_memory_limit(), shared by every range of the
+ * relation, as the planner shares it, lion_cost_range_source()), which the
+ * counts then read like any other set - and past it a window of container
+ * keys at a time into a temporary file (lion_range_collect()), which they
+ * read a container at a time.  Every way of counting the copy - the WHERE
+ * collected once, the groups counted in batches, the FK-side join's copy of
+ * its filters - takes it as it takes any collected set.
+ *
+ * A range that does not fit what the ranges collected in memory before it
+ * left takes that memory back: they go to files of their own
+ * (lion_rangesrc_evict()), and it is collected in what that frees - in
+ * memory, or in windows of nearly all of it.  Left to what they left, it
+ * would be walked once a window of whatever crumbs remained, and a range
+ * that filled the memory to its last few kilobytes would make the next one
+ * cost a walk for every few kilobytes of it; written out, they cost a write
+ * and a read of each container a count seeks.
+ *
+ * Unless the plan says to walk it (`walkable`, LION_FLAG_RANGEWALK and
+ * LION_CLAUSE_WALK): where there are few counts the planner may have found
+ * walking the range at every count cheaper than collecting it in windows,
+ * and if it does not fit it is then left to be walked instead
+ * (src->rangewalk, lion_node_count()).  Only the ranges the planner priced
+ * so: one it expected to fit is collected, in windows if it must.  An OR's
+ * leaf is never walked - it cannot be taken apart that way - nor a source of
+ * the decoded walk's WHERE (DESIGN.md §34) or of the FK-side join, whose
+ * plans never say so.
  *
  * Returns the source's tree the way lion_locate_leaf() does: NULL when the
  * range selects nothing - an empty range, a NULL bound, or no row in it - and
@@ -691,6 +728,7 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	Size		budget;
 	LionPostingSet ps;
 	Size		held;
+	bool		collected;
 	bool		spilled;
 	int64		nread;
 	int64		nsums;
@@ -703,8 +741,22 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 		return NULL;
 
 	budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-	if (!lion_range_collect(rs->index, rs->col, &rs->range, budget, !walkable,
-							&ps, &held, &spilled, &nread, &nsums))
+	if (walkable || st->rangesrc_mem == NIL)
+		collected = lion_range_collect(rs->index, rs->col, &rs->range, budget,
+									   !walkable, &ps, &held, &spilled,
+									   &nread, &nsums);
+	else if (!(collected = lion_range_collect(rs->index, rs->col, &rs->range,
+											  budget, false, &ps, &held,
+											  &spilled, &nread, &nsums)))
+	{
+		lion_rangesrc_evict(st);
+		budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
+		if (!lion_range_collect(rs->index, rs->col, &rs->range, budget, true,
+								&ps, &held, &spilled, &nread, &nsums))
+			elog(ERROR, "LionCount: a range to collect in windows refused");
+		collected = true;
+	}
+	if (!collected)
 	{
 		st->rangesrc_walked++;
 		*walked = true;
@@ -718,6 +770,13 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	if (!ps.found)
 		return NULL;
 	st->rangesrc_held += held;
+	if (!spilled)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
+
+		st->rangesrc_mem = lappend(st->rangesrc_mem, ps.mat);
+		MemoryContextSwitchTo(oldcxt);
+	}
 
 	*sets = (LionPostingSet *) palloc(sizeof(LionPostingSet));
 	(*sets)[0] = ps;
@@ -1290,14 +1349,13 @@ lion_locate_where(LionCountScanState *st)
 		}
 
 		/*
-		 * A range as a source (DESIGN.md §32): collected, or walked - but
-		 * never walked beside the decoded walk (§34), which reads the WHERE
-		 * as one collected copy: collected there, past the memory into a
-		 * file.
+		 * A range as a source (DESIGN.md §32): collected, past the memory
+		 * into a file - or walked, where the plan says so.
 		 */
 		if (st->item[k].rangesrc)
 		{
 			LionRangeSource *rs;
+			bool		walkable;
 			bool		walked;
 			int			first;
 			int			n;
@@ -1306,9 +1364,12 @@ lion_locate_where(LionCountScanState *st)
 			lion_clause_window(st, st->item[k].clauseno, &first, &n);
 			rs = lion_rangesrc_range(st, first, n, true, cl->attno);
 
-			src->tree = lion_locate_range(st, rs, st->decode == NULL,
+			/* walked only where the plan priced it so */
+			walkable = rs->walk && lion_plan_flag(st, LION_FLAG_RANGEWALK);
+			Assert(!walkable || (st->decode == NULL && st->join == NULL));
+			src->tree = lion_locate_range(st, rs, walkable,
 										  &src->sets, &src->nsets, &walked);
-			Assert(!walked || st->decode == NULL);
+			Assert(!walked || walkable);
 			if (walked)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
@@ -1550,6 +1611,7 @@ lion_release_where(LionCountScanState *st)
 		src->rangewalk = NULL;
 	}
 	st->rangesrc_held = 0;
+	st->rangesrc_mem = NIL;		/* it lived in wherecxt too */
 
 	/*
 	 * The collected WHERE (lion_group_count()): its file, if it spilled, is

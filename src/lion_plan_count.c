@@ -3368,11 +3368,15 @@ lion_count_run_targets(LionCountPathBuild *cx, int r)
 /*
  * The node's own price for counting `targets`: its startup and total cost
  * and its rows set on cpath, in cost units of its own (lion_units_price()
- * makes them the competitor's).
+ * makes them the competitor's).  Every range source too large to collect is
+ * priced collected in windows; what walking them at every count would save
+ * instead is added to walksave, with the clauses that bound them, where the
+ * plan may walk them (lion_count_path_add()).
  */
 static void
 lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
-					  List *targets, LionRangeCost *rangeprice)
+					  List *targets, LionRangeCost *rangeprice,
+					  LionWalkSave *walksave)
 {
 	PlannerInfo *root = cx->root;
 
@@ -3420,7 +3424,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							  LION_RANGED_SUMALL :
 							  LION_RANGED_NONE) :
 							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
-							 cx->rangesel, rangeprice);
+							 cx->rangesel, rangeprice, walksave);
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
 	 * after - or, with no count in the target list, instead of - the sum over
@@ -3440,6 +3444,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	GroupPathExtraData *extra = cx->extra;
 	LionCountTarget *first = cx->first;
 	LionRangeCost rangeprice;	/* ... and what its ranges pay */
+	LionWalkSave walksave = {0};	/* ... and what walking them would
+									 * save */
 	Cost		serialrun;		/* the serial node's price, without HAVING */
 	LionUnits	units;			/* the competitor's (§39) */
 
@@ -3455,7 +3461,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * clauses priced into it.
 	 */
 	if (cx->nfilter == 0)
-		lion_count_path_price(cx, cpath, cx->targets, &rangeprice);
+		lion_count_path_price(cx, cpath, cx->targets, &rangeprice, &walksave);
 	else
 	{
 		Cost		startup = 0;
@@ -3465,13 +3471,52 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		for (r = 0; r <= cx->nfilter; r++)
 		{
 			lion_count_path_price(cx, cpath, lion_count_run_targets(cx, r),
-								  &rangeprice);
+								  &rangeprice, &walksave);
 			startup += cpath->path.startup_cost;
 			total += cpath->path.total_cost;
 		}
 		cpath->path.startup_cost = startup;
 		cpath->path.total_cost = total;
 	}
+
+	/*
+	 * A range taken as a source too large for the memory (DESIGN.md §32,
+	 * "Too large to collect") is collected in windows into a temporary file,
+	 * or walked at every count it is part of: the first is what the price
+	 * takes, and the second is cheaper where there are few counts - one
+	 * count, a few groups - which the plan then says (LION_FLAG_RANGEWALK),
+	 * for all of the node's ranges at once, naming the clauses of those it
+	 * priced walked (LION_CLAUSE_WALK): only they are walked, where they do
+	 * not fit.  Not beside the decoded walk, whose WHERE is one copy, nor
+	 * the top k, whose price leaves it out, nor where the aggregates over
+	 * entries are all the node prices.
+	 */
+	if (walksave.save > 0 && !cx->decode && cx->topkn == 0 &&
+		(cx->wattnos == NIL || cx->wcounts))
+	{
+		bool		walks = false;
+		int			i;
+
+		for (i = 0; i < cx->priv.nclause; i++)
+		{
+			cx->priv.clause[i].walk =
+				cx->priv.clause[i].kind == LION_CLAUSE_RANGESRC &&
+				list_member_ptr(walksave.clauses,
+								list_nth(cx->whereclauses, i));
+			walks |= cx->priv.clause[i].walk;
+		}
+		if (walks)
+		{
+			cpath->path.total_cost -= walksave.save;
+			if (cpath->path.startup_cost > 0)
+				cpath->path.startup_cost = Max(cpath->path.startup_cost -
+											   walksave.save, 0.0);
+			cx->priv.flags |= LION_FLAG_RANGEWALK;
+			cpath->custom_private =
+				lion_count_priv_encode(&cx->priv, LION_PRIV_STAGE_PATH);
+		}
+	}
+	list_free(walksave.clauses);
 
 	/* the residual clauses' test of each row the others select (§10) */
 	if (cx->residual != NIL)

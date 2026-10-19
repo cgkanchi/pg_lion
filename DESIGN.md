@@ -2285,11 +2285,12 @@ that one set (`lion_group_count()`, lion_exec_count.c). Three drivers take it: t
 (`lion_next_group()`), an IN list that drives its own groups (`lion_next_group_inlist()`, §15, whose
 list is no item of the WHERE), and the pairs of two columns (`lion_next_group2()`, §20).
 
-- **What is collected.** Every WHERE item of the relation except a range taken as a source that was
-  too large to collect (§32): each count still walks that one beside the collected set, which is
-  how the planner priced it. A negated item with nothing to subtract (`IS NOT NULL` over a column
-  with no NULLs, a multi-key query no key narrows) is no item, and a WHERE with no positive item has
-  nothing to intersect and is never collected.
+- **What is collected.** Every WHERE item of the relation except a range taken as a source that the
+  plan walks at every count (§32, `LION_FLAG_RANGEWALK`): each count still walks that one beside the
+  collected set, which is how the planner priced it. A range collected in windows is a set like any
+  other, and is collected with the rest, from its file. A negated item with nothing to subtract
+  (`IS NOT NULL` over a column with no NULLs, a multi-key query no key narrows) is no item, and a
+  WHERE with no positive item has nothing to intersect and is never collected.
 - **Memory.** What the ranges taken as sources have left of a hash table's memory
   (`get_hash_memory_limit()`), and past that the set SPILLS to a temporary file (`LionSpill`, §27):
   sixteen bytes a container key in memory, a container read back at a time. It lives in the WHERE
@@ -2346,8 +2347,8 @@ small enough to copy; the collection makes it true of the rest. What it now over
 every item probed where one collected set is, and each union's sets set up again
 (`LION_UNION_SET_COST`). A later calibration can price the collection itself, as
 `lion_cost_fkjoin_rel()` prices the fact filters' copy; until then a grouped count is priced as it
-was, which errs high where the WHERE is collected. A range too large to collect is still priced as
-walked by every count, which it still is. *(Superseded by the next subsection, which prices the
+was, which errs high where the WHERE is collected. A range too large to collect is priced as §32
+prices it. *(Superseded by the next subsection, which prices the
 collection and the batched walk that follows it.)*
 
 EXPLAIN ANALYZE prints `WHERE Sets Collected` - the relations whose WHERE was collected, one per
@@ -2448,12 +2449,12 @@ the map takes its blocks' predicate locks through the ordinary path.
 
 **When.** A single GROUP BY column walked by its index's entries, once its WHERE is collected, when
 every count is that one set ANDed with the group's own: not beside a range walked with it (§32, a
-range too large to collect), and not for `GROUP BY coalesce(g, c)`, which adds two entries into one
-group. The group counted before the collection - the first, over groups that span the heap - is
-counted as it always was. **Not taken**: an IN list that drives its own groups (§15), whose sets are
-the clause's; two GROUP BY columns (§20), whose pairs each AND two groups' sets; count(DISTINCT)
-(§26), whose tests stop at a row. They count against the collected copy one count at a time, as
-before.
+range too large to collect that the plan walks), and not for `GROUP BY coalesce(g, c)`, which adds
+two entries into one group. The group counted before the collection - the first, over groups that
+span the heap - is counted as it always was. **Not taken**: an IN list that drives its own groups
+(§15), whose sets are the clause's; two GROUP BY columns (§20), whose pairs each AND two groups'
+sets; count(DISTINCT) (§26), whose tests stop at a row. They count against the collected copy one
+count at a time, as before.
 
 **Parallel.** As first written the walk was serial, as every LionCount path but the FK-side join
 of §27 was: `parallel_safe` false, no workers. With `max_parallel_workers_per_gather` 4 the repro's
@@ -7905,9 +7906,9 @@ every scan shape against a sequential scan on an enum column, a list longer than
   - DONE (2026-09-27, §32 "A range as a source"): a range on a column that does NOT drive the
     count (`g, count(*) ... WHERE <range on k> GROUP BY g`, the commonest shape of all; a range
     under an OR; a range as an FK-join fact filter) is a union SOURCE, collected per container key
-    into one private set - or walked at every count when it is too large to collect. Left: a
-    walked OR arm (inclusion-exclusion over the range's pieces), and the bitmap scan of a range
-    reading summaries;
+    into one private set, past the memory into a temporary file - or walked at every count where
+    the planner finds that the cheaper. Left: a walked OR arm (inclusion-exclusion over the range's
+    pieces), and the bitmap scan of a range reading summaries;
   - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
     (§26's existence test), printing its key under the value-representation contract; max needs the
     backward walk §21's leftlink was kept for;
@@ -9782,8 +9783,9 @@ plan, and so is any other array a stable expression computes (`x = ANY
 expression's array at its plan-time estimate, which the clause analysis puts in the clause (§10) -
 and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
 wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
-that many times over, which is what the review measured. So the copy is what is chosen whenever it
-is expected to fit, and a copy that does not fit at run time spills to a temporary file ("The fact
+that many times over, which is what the review measured. So the copy is what is chosen wherever it
+is the cheaper - priced spilled where it is not expected to fit - and a copy that does not fit at
+run time spills to a temporary file ("The fact
 filters, collected once" below; it used to fall back to the probes, the very per-row work the
 guess was meant to avoid). `IN ($1, $2)` keeps its length at plan time and is priced like a literal
 list.
@@ -10004,9 +10006,23 @@ too low costs.
   a probe of every other source at each of them, each union built in full) and
   `LION_FKJOIN_COPY_CONTAINER_COST` per container copied; per dimension row
   `LION_FKJOIN_COPY_COUNT_COST`, and per fk container `LION_FKJOIN_COPY_PROBE_COST` and
-  `LION_FKJOIN_COPY_MEMBER_COST` per member it holds. Only when the copy is expected to fit in
-  the same `get_hash_memory_limit()` the executor gives it: a container's members at two bytes
-  each, a bitset's 4 kB at most - and never on a hot standby, which makes no copy.
+  `LION_FKJOIN_COPY_MEMBER_COST` per member it holds. The copy is sized as it is made, a
+  container at its smallest: its members at two bytes each, or a bitmap no wider than the
+  offsets of the relation's pages - a NARROW (§38), 1,032 bytes at 120 rows a page - and a
+  bitset's 4 kB at most (`lion_container_max_bytes()`). Past the `get_hash_memory_limit()` the
+  executor gives it - times the participants, for one shared - it is priced SPILLED: its pages
+  written once at `seq_page_cost`, and every fk container a count looks up read back from the file
+  at `LION_SPILL_READ_COST` (`pg_lion.spill_read_cost`). Never on a hot standby, which makes no
+  copy.
+
+  The read is measured (2026-10-19, assert-enabled build): the copy of `x IN (1, 2, 3, 4, 5)` over
+  3M rows, 1.5M of them, spilled at a 64 kB `work_mem`, against the same plan with the copy in
+  memory: 20,000 dimension rows read 2.49M containers back, from 830,000 pages of the file, in 580
+  ms more (799 ms against 210 to 219) - 233 ns a container on a build that counts against the copy
+  in memory at 287 units a millisecond, 135 ns at the reference's 500: 27 `cpu_operator_cost`. At
+  256 kB the copy, 1.5M rows of 120 a page in NARROWs, is 400 kB and fits the 512 kB hash table,
+  which a bitset's 4 kB a container put at 1.6 MB, past it: the node takes the query in 204 ms
+  where core's hash join takes 907.
 
 A copy the estimate said would fit and that does not is spilled, not abandoned (above), so the plan
 the estimate chose runs as collected whatever the fact filters turn out to hold; an IN list of a
@@ -11717,10 +11733,13 @@ room), each union's image at each of its keys and its members set in it (`LION_U
 `LION_UNION_MEMBER_COST`), and the copy's containers made (`LION_FKJOIN_COPY_CONTAINER_COST`). The
 copy's size is the planner's formula over the rows the filters' product leaves, taken as
 independent, in no more containers than the sparsest filter has. No price - no switch - where no
-copy can be made: a hot standby, filters that only subtract, a range too large to collect (§32), a
-list located a batch at a time; nor where the copy is not expected to fit a hash join's memory
-(`get_hash_memory_limit()`), which is what a plan that collects is given. A copy that turns out
-larger than expected spills to a temporary file, as a planned one does.
+copy can be made: a hot standby, filters that only subtract, a list located a batch at a time. A
+copy expected not to fit a hash join's memory (`get_hash_memory_limit()`, what a plan that collects
+is given) is priced as it will be made, SPILLED: its pages written once - and every count after the
+switch reads the containers it looks up back from the file, which the account takes off what each
+probed count would have cost against the copy (`LION_SPILL_READ_COST`). A copy that turns out
+larger than expected spills all the same, as a planned one does. A range among the filters is a
+collected set, in memory or in a file, and is read into the copy as any filter is.
 
 **The switch** (`lion_join_maybe_switch()`). After each count, between two keys, a run whose account
 has reached the price collects the filters (`lion_join_collect_into()`, as a planned collection does
@@ -11829,8 +11848,9 @@ planner's choice, `pg_lion.fkjoin_collect_container_cost`, which the run's own p
 over a fact whose forty heavy keys core estimates at one dimension row, and checks against the
 pushdown off: counts, a grouped count, an IN list, semi and anti joins, row at a time and walked in
 key order, each switching after a stated number of keys; filters that never meet, whose copy made
-part way through is empty, over inner and anti joins, row at a time and walked; the knob off, and a
-copy that would not fit 64 kB, probing to their ends; two rescans below a correlated subquery,
+part way through is empty, over inner and anti joins, row at a time and walked; the knob off,
+probing to its end, and at 64 kB a copy expected not to fit, priced spilled and switched to all the
+same; two rescans below a correlated subquery,
 two switches; a partitioned fact, three leaves switching each on its own, grouped, semi and anti
 joins; parallel plans, plain and partitioned, whose participants switch; and a dirty heap - rows
 deleted, moved to other keys and to other terms - before and after VACUUM. Its empty copies are all
@@ -13583,8 +13603,9 @@ could not see that the keys outside a range might be a handful. Now:
   `count(*) WHERE mid > 10 AND hi > 10` over 2M rows - `hi > 10` summed, `mid > 10` collected - was
   priced at a tenth of the inside walk it made: 38,488 for 2.5 s, where the sequential scan it
   rejected, at 63,522, takes 0.33. It is 316,199 now, and the sequential scan is chosen. A range too
-  large to collect is walked at every count instead, and can drive; the model takes it as collected
-  all the same, which prices such a count at its inside, what it costs at most.)*
+  large to collect is collected in windows and cannot drive either; one the plan walks at every
+  count can, and the model takes it as collected all the same, which prices such a count at its
+  inside, what it costs at most.)*
 - **Each entry walked** costs a fixed amount, `LION_RANGE_UNION_ENTRY_COST` (12 `cpu_tuple_cost`)
   for a small entry counted with its leaf and `LION_RANGE_ENTRY_COST` (40) for one counted on its
   own. On top of that come its OWN containers: the rows of one key of k (`tuples × sel / nin`), not
@@ -17149,16 +17170,71 @@ because it is read after the snapshot was taken).
 
 **Too large to collect.** The collections of one relation share one hash table's memory
 (`get_hash_memory_limit()`): a union is at most a container per container key of the heap, about
-two bytes a row until those fill up. A range that would not fit is not collected but WALKED at
-every count it is part of (`LionCountSource.rangewalk`, `lion_node_count()`): the rows of the
-range are the disjoint union of the sets its walk hands out, so the count is the SUM over them of
-the count of each - a leaf's worth of small entries at a time, as §28 counts - ANDed with the other
-sources, or, when the leaf-by-leaf race says the outside is shorter, the count of the other sources
-minus the column's NULL entry less the sums below and above (§28's complement). An existence test
-walks the inside and stops at the first piece with a row. Every count and existence test the node
-makes goes through `lion_node_count()`, which expands a walked range and hands everything else to
-the counting core unchanged - so a multi-key clause answered only as a superset (a phrase, a NULL
+two bytes a row until those fill up. The planner budgets them as the executor holds them, one after
+the other out of that one memory (`lion_cost_range_source()`'s `LionRangeMem`, the node's
+`rangesrc_held`): a range that would not fit what the ranges before it left is collected in
+WINDOWS into a temporary file (below), and priced so - the walk of the range twice for each
+window's worth of its union, and the file written once and read once - and every count that reads
+the file back pays for each container it seeks there (`LION_SPILL_READ_COST`,
+`lion_count_rel_spill_reads()`). The file is a collected set like any other, so every way of
+counting one takes it: the WHERE collected once and the groups counted in batches (§10), the
+FK-side join's copy of its fact filters (§27), a sum probed at F's rows.
+
+A range that does not fit what the ranges collected in memory before it left takes that memory
+back first (`lion_locate_range()`): the executor finds it does not fit by trying, those ranges go
+to files of their own (`lion_range_spill_set()`, each written once in key order, to hold sixteen
+bytes a container key as a range collected in windows does), and it is collected in what that
+freed - in memory, or in windows of nearly all of it. Left to what they left, a range that filled
+the memory to its last few kilobytes would make the next one cost a walk of it for every
+`LION_RANGE_WINDOW_MIN` of its union. The planner prices it so: the try, the files written and
+read, and every count's reads of them.
+
+Such a range may instead be WALKED at every count it is part of (`LionCountSource.rangewalk`,
+`lion_node_count()`), where the plan says so (`LION_FLAG_RANGEWALK`): the rows of the range are
+the disjoint union of the sets its walk hands out, so the count is the SUM over them of the count
+of each - a leaf's worth of small entries at a time, as §28 counts - ANDed with the other sources,
+or, when the leaf-by-leaf race says the outside is shorter, the count of the other sources minus
+the column's NULL entry less the sums below and above (§28's complement). An existence test walks
+the inside and stops at the first piece with a row. Every count and existence test the node makes
+goes through `lion_node_count()`, which expands a walked range and hands everything else to the
+counting core unchanged - so a multi-key clause answered only as a superset (a phrase, a NULL
 element) is rechecked there as it always is.
+
+That is a walk of the range per count, which is no plan for many counts, and the planner takes it
+as a choice, priced (`lion_count_rel_walk_save()`): the collection the executor tries first, until
+the memory runs out, and the walk at every count the relation makes - its groups, pairs or tests,
+or the sets of the range it sums - with the count's own set and the other sources for F
+(`lion_cost_range_sum()` with F given: an existence test's share of the inside, a second walked
+range at every set the first hands out), against the windows, the reads of the file and the
+counts' merges, which a walk makes itself. A summed range beside one is priced at the side it
+takes beside the range collected - its inside, as often as not, which is what walking costs at
+most. The choice is the node's, and names the ranges it priced walked: the first bound of each is
+`LION_CLAUSE_WALK` in the plan's clause kinds, and the executor walks those where they do not fit
+(`lion_locate_range()`). Every other range of the node - one the planner sized to fit - is
+collected, in windows if its union outgrows the memory all the same: a range nobody priced walked
+is never walked at every set of another's walk. Never beside the decoded walk (§34) or in an
+FK-side join (§27), whose WHERE is one collected copy and whose counts are the dimension rows, nor
+for an OR's leaf, which cannot be walked.
+
+Measured on the assert-enabled build (2026-10-19): 3M rows on 25,000 pages, `r` a hash of the row
+number with summaries, `r < 5592405` a third of them, 1.6 MB as its union builds it, at `work_mem`
+256 kB (a 512 kB hash table) and with the plain plan as the reference for every answer. Seven
+groups count against the range in windows in 93 ms, where walking it at each takes 213; 500 groups
+in 159 ms, 8.1 s walked; `count(DISTINCT h)`'s 500 existence tests walk it, 18 ms, where the
+windows take 101; an OR's leaf, `(r < 5592405 OR x = 3) GROUP BY g`, 94 ms, against core's
+sequential scan at 726; among an FK-side
+join's fact filters, 335 ms against 120 s walked at each of 20,000 dimension rows, and core's hash
+join at 710. `count(*) WHERE id >= 100 AND r BETWEEN 1000 AND 5592405` is collected in windows
+(108 ms) where the walk takes 29 to 54, the summed `id` then taking its complement: the price of
+pricing a summed range at its inside. Two ranges of a quarter of the rows each, `r < 4194304 AND
+fk < 5000 GROUP BY g`, each about 1.3 MB as its union comes out: where the first fits and the
+second does not fit what it left, the first goes to a file and the second is collected in what
+that freed - 76 ms at a 1 MB `work_mem`, 471 at 512 kB - where collecting the second in windows of
+what the first left took 462 and 1,430, and walking it at each group 740 and 640; at 256 kB, where
+neither fits, 560 ms, against 98 s walking both. Beside a walked range, 360,000 rows at 64 kB, `r <
+524288 AND s < 65536 GROUP BY g`: `s` sized to fit, its union outgrowing the memory all the same,
+is collected in windows - 70 ms - where walking it at each of the 1,041 sets the walk of `r` hands
+out took 627.
 
 **What it needs beside it.** A collected range holds no pin, so a count with nothing else that
 carries the §9 interlock would recheck every row in the heap. The planner therefore takes a range
@@ -17166,10 +17242,8 @@ as a source only beside something that does: the walk that drives the count (a G
 over another range, a count(DISTINCT) walk), the fk set of a join, or a clause - or an OR of
 clauses - outside the ranges. `count(*) WHERE k < 10 OR a = 3` alone is left to the ordinary plan.
 An OR's leaf cannot be walked (the union's other arms would have to be subtracted from each piece),
-and the planner prices one it expects not to fit out of the plan (`lion_cost_range_source()`). One
-that does not fit anyway - the estimate was wrong - used to be collected whatever it took, with no
-limit, and at about twice the union at the peak: the hash table still held every container while
-the final copy was built. Both are gone (2026-09-28 review):
+and is collected in windows past the memory as any other range is (below). What a collection holds
+is bounded (2026-09-28 review):
 
 - **The union is the set.** A collection that fits keeps its containers where the union built them,
   and the set's `containers[]` points at them in key order; there is no second copy. The containers
@@ -17177,11 +17251,11 @@ the final copy was built. Both are gone (2026-09-28 review):
   array is a block of its own at its own size, where the default context rounded a 4104-byte bitset
   up to 8 kB; and what the union holds is counted as the allocator hands it out
   (`GetMemoryChunkSpace()`), where it used to be counted at the containers' own sizes.
-- **An OR's leaf is collected in WINDOWS past the memory**, into a temporary file (`LionSpill`, the
-  same the FK-side join's copy spills into, §27), and so is every range beside the decoded walk
-  (§34), whose WHERE is one collected copy. It gets what every range of the relation gets -
-  what is left of the hash table's memory, and never less than `LION_RANGE_WINDOW_MIN` (32 kB,
-  several bitsets, so that a window always gets on).
+- **Past the memory, a range is collected in WINDOWS**, into a temporary file (`LionSpill`, the
+  same the FK-side join's copy spills into, §27): an OR's leaf, every range beside the decoded walk
+  (§34), whose WHERE is one collected copy, and every range of a plan that does not walk them. It
+  gets what every range of the relation gets - what is left of the hash table's memory, and never
+  less than `LION_RANGE_WINDOW_MIN` (32 kB, several bitsets, so that a window always gets on).
   A window keeps the container keys from where the last one ended; when its memory runs out it
   gives back the upper half of the keys it holds and ends where they began
   (`lion_range_union_evict()`); at the end of its walk its containers go to the file in key order,
@@ -17189,13 +17263,13 @@ the final copy was built. Both are gone (2026-09-28 review):
   time and seeks it by the keys it keeps in memory, sixteen bytes a container key. Every window is
   read after the snapshot, as the one walk always was, and the windows are disjoint ranges of TIDs,
   so the file holds every row of the range once and none twice - the collected set's argument
-  unchanged. A union n times the memory costs about 2n walks of the range: a price for a
-  misestimate, not a plan, and bounded where it was not. EXPLAIN ANALYZE counts `Range Sources
+  unchanged. A union n times the memory costs about 2n walks of the range, which is the price the
+  planner puts on it (`lion_cost_range_source()`). EXPLAIN ANALYZE counts `Range Sources
   Spilled`.
 
 **Flagged:** a walked OR arm by inclusion-exclusion - `|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B
-∩ Z − Y|` over R's pieces B - would answer such a leaf without its union, and is still the way to
-let the planner take one it expects to be large.
+∩ Z − Y|` over R's pieces B - would answer such a leaf without its union or its windows, which
+for few counts would be the cheaper.
 
 EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
 EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
@@ -17303,7 +17377,7 @@ member is moved a bounded number of times; the buffer - at most half the union, 
 collection's memory as the union is - may put a collection over its memory a little sooner than
 before, which then walks or spills as any other. A RUN on either side is widened (below). The
 windowed union of §15 (`lion_wide_fill()`) was not reused: a window of container keys would walk the
-range once per window, where the union either fits the memory it is allowed or is walked instead. It
+range once per window, where the union either fits the memory it is allowed or is spilled past it. It
 is also what a bitmap scan collects of the first of several range columns with nothing else beside
 them (§28, "Bitmap scans"), and grows the same way there.
 

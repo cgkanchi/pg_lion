@@ -180,10 +180,12 @@ lion_fkjoin_probe_one(double heap_pages, double members, double cfk)
  *	  over all of their containers, as a single count of them would make, and
  *	  a private copy of what survives, which every count then looks up at its
  *	  own containers' keys (LION_FKJOIN_COPY_PROBE_COST a lookup and its AND).
- *	  Only when the copy is expected to fit in a hash join's memory
- *	  (get_hash_memory_limit(), which is also what the executor gives it) - a
- *	  container's members at two bytes each, a bitset's 4 kB at most - because
- *	  past it the executor gives up and probes.
+ *	  The copy - a container's members at two bytes each, a bitset's 4 kB at
+ *	  most - is given a hash join's memory (get_hash_memory_limit(), as the
+ *	  executor gives it; `copyroom` is what the copies of the leaves before
+ *	  it left of that), and past it SPILLS to a temporary file, as the hash
+ *	  join's table does: its pages written once, and each count's lookups
+ *	  read from the file, a page each, never more than the copy has.
  *
  *	  In a parallel plan (workers above zero) the participants collect ONE
  *	  copy together (DESIGN.md §27, "One copy per query"), so what it takes
@@ -221,6 +223,8 @@ typedef struct LionFkJoinCost
 	Cost		collected;		/* ... or collected once, and looked up */
 	Cost		located;		/* the part of `other` locating the filters */
 	double		copybytes;		/* what the collected copy is expected to take */
+	double		copyheld;		/* ... and to hold of the memory: all of it,
+								 * or a spilled copy's entries */
 	bool		cancollect;		/* there is anything to collect at all */
 	double		reads;			/* the pages it reads (lion_units_cold()) */
 
@@ -268,8 +272,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					 List *wherecol, Var *fkvar, int joinclause,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
-					 double rowbytes, int workers, bool *collect, bool *walk,
-					 bool force, LionFkJoinCost *parts)
+					 double rowbytes, int workers, double copyroom,
+					 bool *collect, bool *walk, bool force,
+					 LionFkJoinCost *parts)
 {
 	bool		wantcollect = force && *collect;
 	bool		wantwalk = force && *walk;
@@ -286,6 +291,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double	   *srcsets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double	   *srcprobesets = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
 	double	   *srcmembers = (double *) palloc0(sizeof(double) * (nclause + nsrc + 1));
+	bool	   *srcspills = (bool *) palloc0(sizeof(bool) * (nclause + nsrc + 1));
 	double		probesets;
 	double		nd;
 	double		perkey;
@@ -305,6 +311,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double		filtered;
 	double		copyckeys;
 	double		copybytes;
+	double		copypages;
+	LionRangeMem rangemem = {0};
+	List	   *rangeinmem = NIL;	/* the sources of the ranges in memory */
 	int			npositive = 0;
 	Cost		run = 0;
 	Cost		located = 0;
@@ -397,12 +406,20 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 		/*
 		 * A range taken as a source (DESIGN.md §32): collected once, by the
-		 * first of its bounds, and read from memory by every count - or walked
-		 * by each, when it is too large to collect (lion_cost_range_source()).
+		 * first of its bounds, within what the ranges before it left of a
+		 * hash table's memory or in windows into a temporary file past it
+		 * (lion_cost_range_source()), and read by every count - from the
+		 * file, if that is where it is, or where one that did not fit what
+		 * it left sent it.  Never walked at each: the dimension rows are the
+		 * counts, which core may estimate far too low, and the copy of the
+		 * filters is made of it.
 		 */
 		if (kind == LION_CLAUSE_RANGESRC)
 		{
 			List	   *bounds = NIL;
+			bool		spills;
+			bool		evicts;
+			ListCell   *lc5;
 			int			j;
 
 			if (rangelead[ci] != ci)
@@ -420,10 +437,19 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			srcmembers[sno] += tuples * sel;
 			located += lion_cost_range_source(root, rel, idx,
 											  (AttrNumber) lfirst_int(lc4),
-											  bounds, sel, dimrows,
-											  (orgrp[ci] >= 0) ?
-											  LION_RANGESRC_ORLEAF :
-											  LION_RANGESRC_WALK);
+											  bounds, sel, &rangemem,
+											  &spills, &evicts, NULL);
+			if (evicts)
+			{
+				foreach(lc5, rangeinmem)
+					srcspills[lfirst_int(lc5)] = true;
+				list_free(rangeinmem);
+				rangeinmem = NIL;
+			}
+			if (spills)
+				srcspills[sno] = true;
+			else
+				rangeinmem = lappend_int(rangeinmem, sno);
 			list_free(bounds);
 			ci++;
 			continue;
@@ -546,6 +572,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			}
 			probed += found * seeks * readshare *
 				lion_fkjoin_probe_one(heap_pages, setm, cfk);
+
+			/* ... and a range spilled to a file reads each one back */
+			if (srcspills[sno])
+				probed += found * seeks * readshare * LION_SPILL_READ_COST;
 		}
 
 		/*
@@ -570,23 +600,38 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	pfree(rangelead);
 	pfree(srcsets);
 	pfree(srcprobesets);
+	pfree(srcspills);
+	list_free(rangeinmem);
 	pfree(srcmembers);
 
 	/*
 	 * What the collected copy holds and how large it is: the filters' rows, in
-	 * as many containers as those rows can occupy, each at most a bitset.
+	 * as many containers as those rows can occupy, each at most a bitmap of
+	 * the relation's pages (lion_container_max_bytes()).
 	 */
 	filtered = tuples * wheresel;
 	copyckeys = lion_containers_for(heap_pages, filtered);
-	copybytes = copyckeys * (LION_CONTAINER_HDRSZ + sizeof(LionContainer *) +
-							 Min(2.0 * filtered / copyckeys,
-								 (double) LION_BITSET_BYTES));
+	copybytes = copyckeys * (sizeof(LionContainer *) +
+							 Min(LION_CONTAINER_HDRSZ + 2.0 * filtered / copyckeys,
+								 lion_container_max_bytes(tuples,
+														  heap_pages)));
+	copypages = ceil(copybytes / BLCKSZ);
 	probed += found * LION_FKJOIN_COUNT_COST;
 	if (npositive > 0)
 	{
+		bool		spills = (copybytes > copyroom);
+
 		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
 			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
+
+		/*
+		 * A copy past the memory it has SPILLS to a temporary file
+		 * (lion_sources_collect()), as a hash join's table does: every page
+		 * of it written once ...
+		 */
+		if (spills)
+			collected += copypages * seq_page_cost;
 
 		/* ... made once, by all the participants of a parallel plan */
 		if (workers > 0)
@@ -597,19 +642,31 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 							   perkey / cfk * LION_FKJOIN_COPY_MEMBER_COST));
 
 		/*
+		 * ... and every count reads what it looks up of a spilled copy back
+		 * from the file, a seek and a read for each container
+		 * (LION_SPILL_READ_COST).
+		 */
+		if (spills)
+			collected += found * Min(cfk, copyckeys) * readshare *
+				LION_SPILL_READ_COST;
+
+		/*
 		 * A hot standby never makes the copy (lion_join_collect()), so there
 		 * every count probes, and is priced so (2026-09-28 review): a plan
 		 * made there as if the copy would be made chose the node where each
-		 * dimension row then built the filters' unions again.
+		 * dimension row then built the filters' unions again.  A copy too
+		 * large for the memory is chosen as any other, spilled and priced
+		 * so.
 		 */
 		if (force ? wantcollect :
-			(copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-			 collected < probed && !RecoveryInProgress()))
+			(collected < probed && !RecoveryInProgress()))
 			*collect = true;
 		if (parts != NULL)
 		{
 			parts->cancollect = true;
 			parts->copybytes = copybytes;
+			parts->copyheld = spills ?
+				copyckeys * LION_SPILL_ENTRY_BYTES + BLCKSZ : copybytes;
 		}
 	}
 	run += *collect ? collected : probed;
@@ -770,6 +827,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	Cost		collected = 0;
 	Cost		located = 0;
 	double		copybytes = 0;
+	double		copyheld = 0;
+	double		copylimit = (double) get_hash_memory_limit() * (workers + 1);
 	double		batches;
 	double		unmatched = 1.0;
 	double		looked = 0.0;
@@ -803,7 +862,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
-								   collect, walk, force, &parts);
+								   copylimit, collect, walk, force, &parts);
 		if (reads != NULL)
 			*reads = parts.reads;
 
@@ -886,8 +945,9 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 
 		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar, tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
-									exists, rowbytes, workers, &tcollect,
-									&twalk, false, &parts);
+									exists, rowbytes, workers,
+									Max(copylimit - copyheld, 0.0),
+									&tcollect, &twalk, false, &parts);
 
 		/* ... and a fact column's groups count each key once per group */
 		tgroups = lion_fact_groups(root, t);
@@ -917,6 +977,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups,
 											  parts.collected);
 			copybytes += parts.copybytes;
+			copyheld += parts.copyheld;
 		}
 		else
 			collected += parts.probed +
@@ -952,9 +1013,8 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	else
 	{
 		*walk = (walked < descents);
-		*collect = (copybytes > 0 &&
-					copybytes <= (double) get_hash_memory_limit() * (workers + 1) &&
-					collected < probed && !RecoveryInProgress());
+		*collect = (copybytes > 0 && collected < probed &&
+					!RecoveryInProgress());
 	}
 	if (mayunite && united < (*collect ? collected : probed))
 	{
