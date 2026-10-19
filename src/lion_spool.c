@@ -72,6 +72,14 @@
  * left (lion_merge_materialise()), and a merge into a run copies their
  * records as they are and leaves them to the next (lion_merge_copy_group()).
  *
+ * A column that STORES POSITIONS (DESIGN.md §17) keeps them in the same
+ * streams: each of its keys' codes is followed by the positions the row has
+ * for the key, a varbyte count and that many WordEntryPos values, and a
+ * code and its positions - a MEMBER - travel together through every spill,
+ * merge and export, so they come out of the merge together and in code
+ * order, and the budget counts them as it counts the codes.  The reserved
+ * entries of such a column have no positions.
+ *
  * A PARALLEL build (lion_build.c) gives each participant a spool of its own
  * and a shared fileset; at the end of its part of the scan a participant
  * merges its runs into ONE tape with a section per column
@@ -99,6 +107,7 @@
 #include "varatt.h"
 
 #include "lion.h"
+#include "lion_positions.h"
 #include "lion_spool.h"
 
 /* A varbyte-coded uint64 takes at most this many bytes. */
@@ -106,6 +115,12 @@
 
 /* A code a stream holds out of order: a zero delta, then the code. */
 #define LION_ESCAPED_MAX	(1 + LION_VARBYTE_MAX)
+
+/* A member's positions (see the file header): a count, then the values. */
+#define LION_POSDATA_MAX	(LION_VARBYTE_MAX + sizeof(uint16) * LION_POS_MAX_NPOS)
+
+/* The most bytes one code takes in a stream, its positions included. */
+#define LION_MEMBER_MAX		(LION_ESCAPED_MAX + LION_POSDATA_MAX)
 
 /* A run's codes are written in chunks of at most this many bytes. */
 #define LION_RUN_CHUNK		8192
@@ -216,9 +231,6 @@ struct LionSpool
 	double		ntids;			/* (key, code) pairs added */
 	int			nspills;		/* runs spilled, all columns together */
 	int			unchecked;		/* pairs added since the budget was checked */
-	LionSpoolPosSink possink;	/* where a positions column's positions go
-								 * (DESIGN.md §17), or NULL */
-	void	   *possinkarg;
 };
 
 struct LionSpoolReader
@@ -291,6 +303,16 @@ typedef struct LionRunCursor
 	uint8	   *cbuf;			/* a tape record's current chunk */
 	uint8		single[LION_VARBYTE_MAX];
 
+	/*
+	 * The record's members carry positions (see the file header); the
+	 * current code's, valid until the cursor moves.  fill keeps `need` bytes
+	 * between p and end: one whole member.
+	 */
+	bool		haspos;
+	Size		need;
+	uint16		npos;
+	const uint8 *pos;
+
 	/* an unsorted stream is handed out one heap page at a time */
 	bool		resort;
 	uint64	   *page;
@@ -298,7 +320,23 @@ typedef struct LionRunCursor
 	int			ipage;
 	bool		havepeek;
 	uint64		peek;
+	/* ... and with positions, each member's kept beside it */
+	struct LionPageMember *pagemem;
+	uint8	   *pagepos;
+	Size		pageposlen;
+	Size		pageposcap;
+	uint16		peeknpos;
+	uint8	   *peekpos;		/* LION_POSDATA_MAX bytes */
 } LionRunCursor;
+
+/* A member of an unsorted heap page with positions: its code and where its
+ * positions were copied to. */
+typedef struct LionPageMember
+{
+	uint64		code;
+	Size		off;			/* in the cursor's pagepos */
+	uint16		npos;
+} LionPageMember;
 
 /* An entry in the order a spill or a merge wants it. */
 typedef struct LionSortItem
@@ -337,6 +375,10 @@ struct LionSpoolGroup
 	int			active;			/* the cursor being drained, or -1 */
 	uint64		limit;			/* ... while its codes stay below this */
 	bool		havelimit;
+
+	/* the positions of the code handed out last (see the file header) */
+	uint16		npos;
+	uint16	   *pos;			/* LION_POS_MAX_NPOS of them */
 
 	/*
 	 * A hash collision: (code, distinct key) pairs through a sort, and the
@@ -395,6 +437,44 @@ lion_varbyte_get(const uint8 **pp, const uint8 *end)
 
 	*pp = p;
 	return v;
+}
+
+/* What lion_varbyte_put() takes for v. */
+static inline Size
+lion_varbyte_size(uint64 v)
+{
+	Size		n = 1;
+
+	while (v >= 0x80)
+	{
+		v >>= 7;
+		n++;
+	}
+	return n;
+}
+
+/* A member's positions, as a stream holds them (see the file header). */
+static inline Size
+lion_posdata_size(uint32 npos)
+{
+	return lion_varbyte_size(npos) + sizeof(uint16) * npos;
+}
+
+static inline Size
+lion_posdata_put(uint8 *p, uint32 npos, const void *pos)
+{
+	Size		n = lion_varbyte_put(p, npos);
+
+	if (npos > 0)
+		memcpy(p + n, pos, sizeof(uint16) * npos);
+	return n + sizeof(uint16) * npos;
+}
+
+/* The npos a row's key positions are kept with: as many as a member holds. */
+static inline uint32
+lion_kp_npos(const LionKeyPositions *kp)
+{
+	return Min((uint32) kp->npos, (uint32) LION_POS_MAX_NPOS);
 }
 
 static int
@@ -472,7 +552,7 @@ lion_acc_used(LionAccCol *col)
 
 static LionAccEntry *
 lion_acc_new_entry(LionAccCol *col, int kind, Datum key, uint32 hash,
-				   uint64 code)
+				   uint64 code, const LionKeyPositions *kp)
 {
 	LionState  *cs = col->state;
 	LionAccEntry *e = lion_acc_alloc(col, sizeof(LionAccEntry));
@@ -500,6 +580,20 @@ lion_acc_new_entry(LionAccCol *col, int kind, Datum key, uint32 hash,
 			lion_store_key(cs, key, raw);
 			e->key = PointerGetDatum(raw);
 		}
+	}
+
+	/*
+	 * A key with positions keeps its first member in the buffer too: a code
+	 * alone in the entry would have nowhere to keep them.
+	 */
+	if (kp != NULL)
+	{
+		uint32		npos = lion_kp_npos(kp);
+
+		e->cap = Max((Size) 32, LION_VARBYTE_MAX + lion_posdata_size(npos));
+		e->buf = MemoryContextAlloc(col->cxt, e->cap);
+		e->len = lion_varbyte_put(e->buf, code);
+		e->len += lion_posdata_put(e->buf + e->len, npos, kp->pos);
 	}
 	col->nentries++;
 	return e;
@@ -533,9 +627,9 @@ lion_acc_rekey(LionAccCol *col, LionAccEntry *e, Datum key)
 }
 
 static void
-lion_acc_grow(LionAccCol *col, LionAccEntry *e)
+lion_acc_grow(LionAccCol *col, LionAccEntry *e, Size extra)
 {
-	Size		need = e->len + LION_ESCAPED_MAX;
+	Size		need = e->len + LION_ESCAPED_MAX + extra;
 
 	if (e->buf == NULL)
 	{
@@ -552,10 +646,16 @@ lion_acc_grow(LionAccCol *col, LionAccEntry *e)
 }
 
 static inline void
-lion_acc_append(LionAccCol *col, LionAccEntry *e, uint64 code)
+lion_acc_append(LionAccCol *col, LionAccEntry *e, uint64 code,
+				const LionKeyPositions *kp)
 {
-	if (unlikely(e->buf == NULL || e->len + LION_ESCAPED_MAX > e->cap))
-		lion_acc_grow(col, e);
+	uint32		npos = (kp != NULL) ? lion_kp_npos(kp) : 0;
+	Size		extra = (kp != NULL) ? lion_posdata_size(npos) : 0;
+
+	Assert((kp != NULL) == (e->buf != NULL && e->kind == LION_KIND_VALUE &&
+							col->state->positions));
+	if (unlikely(e->buf == NULL || e->len + LION_ESCAPED_MAX + extra > e->cap))
+		lion_acc_grow(col, e, extra);
 	if (likely(code > e->lastcode))
 		e->len += lion_varbyte_put(e->buf + e->len, code - e->lastcode);
 	else
@@ -569,10 +669,13 @@ lion_acc_append(LionAccCol *col, LionAccEntry *e, uint64 code)
 			e->mincode = code;
 	}
 	e->lastcode = code;
+	if (kp != NULL)
+		e->len += lion_posdata_put(e->buf + e->len, npos, kp->pos);
 }
 
 static void
-lion_acc_add(LionSpool *sp, LionAccCol *col, Datum key, uint64 code)
+lion_acc_add(LionSpool *sp, LionAccCol *col, Datum key, uint64 code,
+			 const LionKeyPositions *kp)
 {
 	LionAccEntry probe;
 	LionAccSlot *slot;
@@ -585,13 +688,13 @@ lion_acc_add(LionSpool *sp, LionAccCol *col, Datum key, uint64 code)
 							   &found);
 	if (!found)
 		slot->entry = lion_acc_new_entry(col, LION_KIND_VALUE, key,
-										 probe.hash, code);
+										 probe.hash, code, kp);
 	else
 	{
 		e = slot->entry;
 		if (unlikely(code < e->mincode))
 			lion_acc_rekey(col, e, key);
-		lion_acc_append(col, e, code);
+		lion_acc_append(col, e, code, kp);
 	}
 	sp->ntids += 1;
 	sp->unchecked++;
@@ -604,9 +707,9 @@ lion_acc_add_reserved(LionSpool *sp, LionAccCol *col, int kind, uint64 code)
 
 	if (col->reserved[i] == NULL)
 		col->reserved[i] = lion_acc_new_entry(col, kind, (Datum) 0,
-											  LION_NULLKEY_HASH, code);
+											  LION_NULLKEY_HASH, code, NULL);
 	else
-		lion_acc_append(col, col->reserved[i], code);
+		lion_acc_append(col, col->reserved[i], code, NULL);
 	sp->ntids += 1;
 	sp->unchecked++;
 }
@@ -856,10 +959,23 @@ lion_run_put_code(LionRunWriter *w, uint64 code)
 	w->last = code;
 }
 
+/* A code and its positions, for a column that stores them. */
+static inline void
+lion_run_put_member(LionRunWriter *w, uint64 code, uint32 npos,
+					const void *pos)
+{
+	Assert(code > w->last);
+	if (w->len + LION_MEMBER_MAX > LION_RUN_CHUNK)
+		lion_run_flush_chunk(w);
+	w->len += lion_varbyte_put(w->buf + w->len, code - w->last);
+	w->len += lion_posdata_put(w->buf + w->len, npos, pos);
+	w->last = code;
+}
+
 /*
  * A whole record's codes that are already in the run encoding: an in-memory
- * entry's buffer, sorted.  The reader does not mind a code split between two
- * chunks (lion_cursor_fill()).
+ * entry's buffer, sorted.  The reader does not mind a code or a member split
+ * between two chunks (lion_cursor_fill()).
  */
 static void
 lion_run_put_encoded(LionRunWriter *w, const uint8 *p, Size len)
@@ -895,6 +1011,16 @@ lion_run_end_column(LogicalTape *tape)
 	LogicalTapeWrite(tape, &h, sizeof(h));
 }
 
+/* The cursor's current code, and its positions when the record has them. */
+static inline void
+lion_run_put_current(LionRunWriter *w, const LionRunCursor *c)
+{
+	if (c->haspos)
+		lion_run_put_member(w, c->code, c->npos, c->pos);
+	else
+		lion_run_put_code(w, c->code);
+}
+
 /* ---------------------------------------------------------------------
  * Cursors
  * --------------------------------------------------------------------- */
@@ -908,6 +1034,35 @@ lion_cursor_init(LionRunCursor *c, LionState *state, int index)
 	c->cxt = CurrentMemoryContext;
 	c->eos = true;
 	c->lastchunk = true;
+	c->need = LION_ESCAPED_MAX;
+}
+
+/* Whether the record the cursor has just moved to carries positions. */
+static void
+lion_cursor_set_kind(LionRunCursor *c, uint8 kind)
+{
+	c->kind = kind;
+	c->haspos = (c->state->positions && kind == LION_KIND_VALUE);
+	c->need = c->haspos ? LION_MEMBER_MAX : LION_ESCAPED_MAX;
+	c->npos = 0;
+	c->pos = NULL;
+}
+
+/* An unsorted record is about to be read: the page buffers it needs. */
+static void
+lion_cursor_page_buffers(LionRunCursor *c)
+{
+	if (c->haspos)
+	{
+		if (c->pagemem == NULL)
+		{
+			c->pagemem = MemoryContextAlloc(c->cxt,
+											sizeof(LionPageMember) * LION_PAGE_CODES);
+			c->peekpos = MemoryContextAlloc(c->cxt, LION_POSDATA_MAX);
+		}
+	}
+	else if (c->page == NULL)
+		c->page = MemoryContextAlloc(c->cxt, sizeof(uint64) * LION_PAGE_CODES);
 }
 
 static void
@@ -916,7 +1071,7 @@ lion_cursor_init_tape(LionRunCursor *c, LionState *state, int index,
 {
 	lion_cursor_init(c, state, index);
 	c->tape = tape;
-	c->cbuf = palloc(LION_RUN_CHUNK + LION_ESCAPED_MAX);
+	c->cbuf = palloc(LION_RUN_CHUNK + LION_MEMBER_MAX);
 	c->p = c->end = c->cbuf;
 }
 
@@ -932,13 +1087,14 @@ lion_cursor_init_memory(LionRunCursor *c, LionState *state, int index,
 }
 
 /*
- * Keep at least one whole code, escaped or not, between p and end, reading
- * chunks for as long as the record has them.
+ * Keep at least one whole code, escaped or not, between p and end - with its
+ * positions when the record has them - reading chunks for as long as the
+ * record has them.
  */
 static void
 lion_cursor_fill(LionRunCursor *c)
 {
-	while (!c->lastchunk && c->end - c->p < LION_ESCAPED_MAX)
+	while (!c->lastchunk && (Size) (c->end - c->p) < c->need)
 	{
 		Size		rest = c->end - c->p;
 		uint32		n;
@@ -958,9 +1114,13 @@ lion_cursor_fill(LionRunCursor *c)
 	}
 }
 
-/* The next code in the order the stream holds them. */
+/*
+ * The next code in the order the stream holds them, and when the record has
+ * positions, the code's (*npos and *pos, valid until the next read).
+ */
 static inline bool
-lion_cursor_raw_next(LionRunCursor *c, uint64 *code)
+lion_cursor_raw_next(LionRunCursor *c, uint64 *code, uint16 *npos,
+					 const uint8 **pos)
 {
 	uint64		d;
 
@@ -974,7 +1134,116 @@ lion_cursor_raw_next(LionRunCursor *c, uint64 *code)
 	else
 		*code = c->last + d;
 	c->last = *code;
+	if (c->haspos)
+	{
+		uint64		n = lion_varbyte_get(&c->p, c->end);
+
+		if (n > LION_POS_MAX_NPOS ||
+			(Size) (c->end - c->p) < sizeof(uint16) * n)
+			elog(ERROR, "lion index build: malformed positions in a spilled run");
+		*npos = (uint16) n;
+		*pos = c->p;
+		c->p += sizeof(uint16) * n;
+	}
 	return true;
+}
+
+static int
+lion_page_member_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const LionPageMember *) a)->code;
+	uint64		y = ((const LionPageMember *) b)->code;
+
+	return (x > y) - (x < y);
+}
+
+/* Keep a member of an unsorted heap page, its positions copied. */
+static void
+lion_cursor_page_keep(LionRunCursor *c, uint64 code, uint16 npos,
+					  const uint8 *pos)
+{
+	Size		len = sizeof(uint16) * npos;
+	LionPageMember *m;
+
+	if (c->npage >= LION_PAGE_CODES)
+		elog(ERROR, "lion index build: more codes for one heap page than it has offsets");
+	if (c->pageposlen + len > c->pageposcap)
+	{
+		Size		cap = Max(c->pageposcap * 2, c->pageposlen + len);
+
+		cap = Max(cap, (Size) BLCKSZ);
+		c->pagepos = (c->pagepos == NULL) ?
+			MemoryContextAlloc(c->cxt, cap) : repalloc(c->pagepos, cap);
+		c->pageposcap = cap;
+	}
+	m = &c->pagemem[c->npage++];
+	m->code = code;
+	m->off = c->pageposlen;
+	m->npos = npos;
+	if (len > 0)
+		memcpy(c->pagepos + c->pageposlen, pos, len);
+	c->pageposlen += len;
+}
+
+/*
+ * lion_cursor_step() of an unsorted record with positions: the same page at
+ * a time, each member's positions kept with its code.
+ */
+static void
+lion_cursor_step_resort_pos(LionRunCursor *c)
+{
+	uint64		x;
+	uint16		npos;
+	const uint8 *pos;
+	uint64		blk;
+	LionPageMember *m;
+
+	if (c->ipage >= c->npage)
+	{
+		c->npage = 0;
+		c->pageposlen = 0;
+		if (c->havepeek)
+		{
+			lion_cursor_page_keep(c, c->peek, c->peeknpos, c->peekpos);
+			c->havepeek = false;
+		}
+		else if (lion_cursor_raw_next(c, &x, &npos, &pos))
+			lion_cursor_page_keep(c, x, npos, pos);
+		else
+		{
+			c->hascode = false;
+			return;
+		}
+
+		blk = c->pagemem[0].code >> LION_OFFSET_BITS;
+		while (lion_cursor_raw_next(c, &x, &npos, &pos))
+		{
+			if ((x >> LION_OFFSET_BITS) != blk)
+			{
+				c->peek = x;
+				c->peeknpos = npos;
+				if (npos > 0)
+					memcpy(c->peekpos, pos, sizeof(uint16) * npos);
+				c->havepeek = true;
+				break;
+			}
+			lion_cursor_page_keep(c, x, npos, pos);
+		}
+		if (c->npage > 1)
+			qsort(c->pagemem, c->npage, sizeof(LionPageMember),
+				  lion_page_member_cmp);
+#ifdef USE_ASSERT_CHECKING
+		for (int i = 1; i < c->npage; i++)
+			Assert(c->pagemem[i - 1].code < c->pagemem[i].code);
+#endif
+		c->ipage = 0;
+	}
+
+	m = &c->pagemem[c->ipage++];
+	c->code = m->code;
+	c->npos = m->npos;
+	c->pos = c->pagepos + m->off;
+	c->hascode = true;
 }
 
 /*
@@ -987,10 +1256,17 @@ lion_cursor_step(LionRunCursor *c)
 {
 	uint64		x;
 	uint64		blk;
+	uint16		npos;
+	const uint8 *pos;
 
 	if (!c->resort)
 	{
-		c->hascode = lion_cursor_raw_next(c, &c->code);
+		c->hascode = lion_cursor_raw_next(c, &c->code, &c->npos, &c->pos);
+		return;
+	}
+	if (c->haspos)
+	{
+		lion_cursor_step_resort_pos(c);
 		return;
 	}
 
@@ -1007,7 +1283,7 @@ lion_cursor_step(LionRunCursor *c)
 		c->page[c->npage++] = c->peek;
 		c->havepeek = false;
 	}
-	else if (lion_cursor_raw_next(c, &x))
+	else if (lion_cursor_raw_next(c, &x, &npos, &pos))
 		c->page[c->npage++] = x;
 	else
 	{
@@ -1016,7 +1292,7 @@ lion_cursor_step(LionRunCursor *c)
 	}
 
 	blk = c->page[0] >> LION_OFFSET_BITS;
-	while (lion_cursor_raw_next(c, &x))
+	while (lion_cursor_raw_next(c, &x, &npos, &pos))
 	{
 		if ((x >> LION_OFFSET_BITS) != blk)
 		{
@@ -1066,7 +1342,7 @@ lion_cursor_next_record(LionRunCursor *c)
 		c->nextitem++;
 
 		c->eos = false;
-		c->kind = e->kind;
+		lion_cursor_set_kind(c, e->kind);
 		c->hash = e->hash;
 		c->key = e->key;
 		c->raw = lion_acc_raw(c->state, e);
@@ -1085,9 +1361,7 @@ lion_cursor_next_record(LionRunCursor *c)
 		if (e->unsorted)
 		{
 			c->resort = true;
-			if (c->page == NULL)
-				c->page = MemoryContextAlloc(c->cxt,
-											 sizeof(uint64) * LION_PAGE_CODES);
+			lion_cursor_page_buffers(c);
 		}
 		lion_cursor_step(c);
 		Assert(c->hascode && c->code == e->mincode);
@@ -1115,7 +1389,7 @@ lion_cursor_next_record(LionRunCursor *c)
 		elog(ERROR, "lion index build: malformed record in a spilled run");
 
 	c->eos = false;
-	c->kind = h.kind;
+	lion_cursor_set_kind(c, h.kind);
 	c->flags = h.flags;
 	c->hash = h.hash;
 	c->rawlen = h.keylen;
@@ -1184,6 +1458,30 @@ lion_group_end(LionSpoolGroup *g)
 	g->sort = NULL;
 }
 
+/* The positions of the cursor's current code, before it moves on. */
+static inline void
+lion_group_take_positions(LionSpoolGroup *group, const LionRunCursor *c)
+{
+	if (!c->haspos)
+		return;
+	group->npos = c->npos;
+	if (c->npos > 0)
+		memcpy(group->pos, c->pos, sizeof(uint16) * c->npos);
+}
+
+/*
+ * The positions of the code lion_spool_group_next() handed out last, in a
+ * group of one key of a column that stores them (see the file header).
+ */
+void
+lion_spool_group_positions(const LionSpoolGroup *group, LionKeyPositions *kp)
+{
+	if (group->materialised || group->ncurs == 0 || !group->curs[0]->haspos)
+		elog(ERROR, "lion index build: positions asked of a group that has none");
+	kp->npos = group->npos;
+	kp->pos = group->pos;
+}
+
 int
 lion_spool_group_size(const LionSpoolGroup *group)
 {
@@ -1225,6 +1523,7 @@ lion_spool_group_next(LionSpoolGroup *group, int *entry, uint64 *code)
 			if (!c->hascode)
 				return false;
 			*code = c->code;
+			lion_group_take_positions(group, c);
 			lion_cursor_step(c);
 			return true;
 		}
@@ -1267,6 +1566,7 @@ lion_spool_group_next(LionSpoolGroup *group, int *entry, uint64 *code)
 			c = group->curs[best];
 		}
 		*code = c->code;
+		lion_group_take_positions(group, c);
 		lion_cursor_step(c);
 		return true;
 	}
@@ -1582,7 +1882,7 @@ lion_merge_copy_group(LionMerge *m, LionRunCursor **grp, int ngrp)
 								  c->hash, c->raw, c->rawlen);
 			while (c->hascode)
 			{
-				lion_run_put_code(w, c->code);
+				lion_run_put_current(w, c);
 				lion_cursor_step(c);
 			}
 			lion_run_end_record(w);
@@ -1604,13 +1904,19 @@ static void
 lion_run_emit(LionRunWriter *w, LionSpoolGroup *group)
 {
 	const LionSpoolEntry *e = &group->entries[0];
+	bool		haspos = group->curs[0]->haspos;
 	int			which;
 	uint64		code;
 
 	Assert(!group->materialised && group->nentries == 1);
 	lion_run_begin_record(w, (uint8) e->kind, 0, e->hash, e->raw, e->rawlen);
 	while (lion_spool_group_next(group, &which, &code))
-		lion_run_put_code(w, code);
+	{
+		if (haspos)
+			lion_run_put_member(w, code, group->npos, group->pos);
+		else
+			lion_run_put_code(w, code);
+	}
 	lion_run_end_record(w);
 }
 
@@ -1626,6 +1932,7 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 	binaryheap *heap;
 	LionRunCursor **grp;
 	LionSpoolGroup group;
+	uint16	   *pos;
 	int			i;
 
 	if (nin == 0)
@@ -1633,6 +1940,8 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 
 	heap = binaryheap_allocate(nin, lion_merge_heap_cmp, m);
 	grp = palloc(sizeof(LionRunCursor *) * nin);
+	pos = m->state->positions ?
+		palloc(sizeof(uint16) * LION_POS_MAX_NPOS) : NULL;
 	for (i = 0; i < nin; i++)
 	{
 		if (!in[i]->eos)
@@ -1667,6 +1976,7 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 		}
 
 		memset(&group, 0, sizeof(group));
+		group.pos = pos;
 		if (streaming)
 		{
 			LionRunCursor *rep = grp[0];
@@ -1723,6 +2033,8 @@ lion_merge_column(LionMerge *m, LionRunCursor **in, int nin,
 
 	binaryheap_free(heap);
 	pfree(grp);
+	if (pos != NULL)
+		pfree(pos);
 }
 
 /* ---------------------------------------------------------------------
@@ -1860,10 +2172,12 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 	LogicalTape *tape;
 	LionRunWriter *w;
 	uint64	   *page = NULL;
+	LionRunCursor bufs;
 	int			i;
 
 	if (col->nentries == 0)
 		return;
+	memset(&bufs, 0, sizeof(bufs));
 
 	lion_spool_tapes(sp);
 	old = MemoryContextSwitchTo(sp->mergecxt);
@@ -1886,21 +2200,29 @@ lion_spool_spill_column(LionSpool *sp, LionAccCol *col)
 			LionRunCursor c;
 
 			/*
-			 * A cursor of its own for each unsorted entry, and one page
-			 * buffer for all of them: a cursor allocates its own otherwise,
-			 * and nothing frees it before the spill is over, which with many
-			 * HOT-updated keys is many times the budget.
+			 * A cursor of its own for each unsorted entry, and one set of
+			 * page buffers for all of them: a cursor allocates its own
+			 * otherwise, and nothing frees them before the spill is over,
+			 * which with many HOT-updated keys is many times the budget.
 			 */
 			if (page == NULL)
 				page = palloc(sizeof(uint64) * LION_PAGE_CODES);
 			lion_cursor_init_memory(&c, col->state, 0, &items[i], NULL, 1);
 			c.page = page;
+			c.pagemem = bufs.pagemem;
+			c.peekpos = bufs.peekpos;
+			c.pagepos = bufs.pagepos;
+			c.pageposcap = bufs.pageposcap;
 			lion_cursor_next_record(&c);
 			while (c.hascode)
 			{
-				lion_run_put_code(w, c.code);
+				lion_run_put_current(w, &c);
 				lion_cursor_step(&c);
 			}
+			bufs.pagemem = c.pagemem;
+			bufs.peekpos = c.peekpos;
+			bufs.pagepos = c.pagepos;
+			bufs.pageposcap = c.pageposcap;
 		}
 		lion_run_end_record(w);
 	}
@@ -1939,6 +2261,26 @@ lion_spool_largest(LionSpool *sp)
 }
 
 /*
+ * What the columns take with the sorted list of their entries a spill or a
+ * merge reads them through (lion_acc_sorted()), which is not small beside
+ * them: a column of distinct keys has many entries of a few bytes each.
+ */
+static Size
+lion_spool_memory_sorted(LionSpool *sp)
+{
+	Size		total = lion_spool_memory(sp);
+	int			c;
+
+	for (c = 0; c < sp->ncols; c++)
+	{
+		if (sp->cols[c].nentries > 0)
+			total += (Size) (sp->cols[c].nentries + 2) *
+				(sizeof(LionSortItem) + 1);
+	}
+	return total;
+}
+
+/*
  * The budget (see the file header).  Over it, spill the largest columns until
  * half of it is free: a column of few keys takes little and is left alone, so
  * it ends up with few runs or none.
@@ -1949,9 +2291,9 @@ lion_spool_check(LionSpool *sp)
 	LionAccCol *victim;
 
 	sp->unchecked = 0;
-	if (lion_spool_memory(sp) <= sp->membytes)
+	if (lion_spool_memory_sorted(sp) <= sp->membytes)
 		return;
-	while (lion_spool_memory(sp) > sp->membytes / 2 &&
+	while (lion_spool_memory_sorted(sp) > sp->membytes / 2 &&
 		   (victim = lion_spool_largest(sp)) != NULL)
 		lion_spool_spill_column(sp, victim);
 }
@@ -2005,16 +2347,14 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			LionKeyPositions *kpos = NULL;
 
 			/*
-			 * A column that stores positions (DESIGN.md §17) hands each key's
-			 * positions to the sink the build gave, which writes them once
-			 * the directory is on disk (lion_posbuild.c); the spool itself
-			 * keeps only the codes, as for any column.
+			 * A column that stores positions (DESIGN.md §17) keeps each key's
+			 * positions in the row with its code (see the file header).
 			 */
 			if (cs->positions)
 			{
-				if (sp->possink == NULL)
-					elog(ERROR, "lion index: a column that stores positions has no sink for them");
 				nkeys = lion_extract_value_pos(cs, values[c], &keys, &kpos);
+				if (nkeys > 0 && kpos == NULL)
+					elog(ERROR, "lion index build: a column that stores positions extracted keys without them");
 			}
 			else
 				nkeys = lion_extract_value(cs, values[c], &keys);
@@ -2023,9 +2363,8 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);
 			for (i = 0; i < nkeys; i++)
 			{
-				if (kpos != NULL)
-					sp->possink(sp->possinkarg, c, keys[i], code, &kpos[i]);
-				lion_acc_add(sp, col, keys[i], code);
+				lion_acc_add(sp, col, keys[i], code,
+							 kpos != NULL ? &kpos[i] : NULL);
 				/* one row can have any number of them */
 				if (sp->unchecked >= LION_CHECK_KEYS)
 					lion_spool_check(sp);
@@ -2046,19 +2385,12 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 				 VARATT_IS_COMPRESSED(DatumGetPointer(key))))
 				key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-			lion_acc_add(sp, col, key, code);
+			lion_acc_add(sp, col, key, code, NULL);
 		}
 	}
 
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(sp->rowcxt);
-}
-
-void
-lion_spool_set_possink(LionSpool *sp, LionSpoolPosSink sink, void *arg)
-{
-	sp->possink = sink;
-	sp->possinkarg = arg;
 }
 
 double
@@ -2125,7 +2457,7 @@ lion_spool_merge_need(LionSpool *sp, LionAccCol *col)
 	Size		need;
 
 	need = (Size) Min(col->nruns, sp->maxorder) *
-		(sp->readbuf + LION_RUN_CHUNK + LION_ESCAPED_MAX);
+		(sp->readbuf + LION_RUN_CHUNK + LION_MEMBER_MAX);
 	if (col->nentries > 0)
 		need += (Size) (col->nentries + 2) * (sizeof(LionSortItem) + 1);
 	return need;
@@ -2311,7 +2643,7 @@ lion_spool_reader_emit_column(LionSpoolReader *rd, int col,
 	int			workmem;
 	int			i;
 
-	used = (Size) rd->nparts * (rd->readbuf + LION_RUN_CHUNK + LION_ESCAPED_MAX) +
+	used = (Size) rd->nparts * (rd->readbuf + LION_RUN_CHUNK + LION_MEMBER_MAX) +
 		reserve;
 	workmem = (used < rd->membytes) ?
 		(int) Min((rd->membytes - used) / 1024, (Size) INT_MAX) : 0;

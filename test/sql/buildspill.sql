@@ -8,9 +8,9 @@
 -- heap's rows.
 --
 -- Then the same for stored positions (DESIGN.md §17, "Stored positions"),
--- whose share of the memory is spilled in runs of its own, many more of them
--- than one merge reads, so that they are merged into fewer first; serially
--- and in parallel, where each participant merges its runs into one.
+-- which go through the spool with the codes, in many more runs than one
+-- merge reads, so that they are merged into fewer first; serially and in
+-- parallel.
 --
 -- UNLOGGED for the byte comparison, as in build.sql.  The codes' builds are
 -- serial only: 16 builds nothing else, and build.sql covers the parallel

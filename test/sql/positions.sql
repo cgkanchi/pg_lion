@@ -176,9 +176,9 @@ REINDEX INDEX pos_hot_d;
 RESET maintenance_work_mem;
 SELECT * FROM pos_hot_check();
 SELECT lion_index_verify('pos_hot_d', true);
--- A parallel build: each participant keeps the positions of its share of the
--- heap, and the leader merges a key's by heap block (PostgreSQL 17 and later;
--- before, the same build runs serially)
+-- A parallel build: each participant spools the positions of its share of the
+-- heap with the codes, and the leader merges a key's members by code
+-- (PostgreSQL 17 and later; before, the same build runs serially)
 ALTER TABLE pos_hot SET (parallel_workers = 2);
 SET max_parallel_maintenance_workers = 2;
 SET maintenance_work_mem = '96MB';
