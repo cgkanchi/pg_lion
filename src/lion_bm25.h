@@ -32,7 +32,7 @@ typedef struct LionBm25Cand
 typedef struct LionBm25Query
 {
 	Relation	index;			/* open while the walk runs; NULL after */
-	LionState  *col;
+	LionState  *col;			/* the column ranked, lion_bm25_column() */
 	int			nterms;
 	text	  **lexemes;
 	double	   *idfs;
@@ -43,11 +43,18 @@ typedef struct LionBm25Query
 	uint64		ncodes;			/* the lexemes' rows, added up */
 } LionBm25Query;
 
-extern int	lion_bm25_column(Relation index, LionIndexState *ix);
+/*
+ * The arguments of lion_bm25_score(doc, query, index, k1, b, col), as the
+ * planner hands them over with the defaults filled in.
+ */
+#define LION_BM25_SCORE_NARGS	6
+
+extern AttrNumber lion_bm25_column(Relation index, LionIndexState *ix,
+								   const char *colname, bool missing_ok);
 extern List *lion_bm25_lexemes(TSQuery query, bool *prefix);
 extern void lion_bm25_check_params(double k1, double b);
-extern bool lion_bm25_prepare(Relation index, TSQuery query, double k1,
-							  double b, LionBm25Query *q);
+extern bool lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query,
+							  double k1, double b, LionBm25Query *q);
 extern int64 lion_bm25_topk(const LionBm25Query *q, int64 L,
 							const LionBm25Cand *after, LionBm25Cand *best);
 extern int64 lion_bm25_next_L(int64 L, int64 first, const LionBm25Query *q,

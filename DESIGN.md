@@ -5441,9 +5441,9 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 
 ### Ranking: BM25 from the index (2026-10-07)
 
-`lion_bm25(index, query, k, k1, b)` (lion_bm25.c) ranks the rows of an index that stores positions
-by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` and
-`tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
+`lion_bm25(index, query, k, k1, b, col)` (lion_bm25.c) ranks the rows of an index by one key column
+that stores positions, by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))`
+and `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
 
 - **tf** is the npos of the row's member under the lexeme, a stripped lexeme counting once, read
   from the position tree with a counts-only cursor that steps over the positions. **df** is the
@@ -5455,8 +5455,18 @@ by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))` and
   some other way. It is an ordinary VALUE entry, so insert, build, parallel build, VACUUM and
   verify carry it with no change, and it costs one member per row (about 2 MB at 500k rows).
 - **N** is the empty key's `ntids`. **avgdl** is the mean of its members' lengths; reading it walks
-  the whole key, so a backend keeps it per index until the key's `ntids` moves by more than 1/64 or
-  the index is rebuilt.
+  the whole key, so a backend keeps it per index column until the key's `ntids` moves by more than
+  1/64 or the index is rebuilt.
+- **The column.** Keys are per key column (§24), so every column that stores positions has an empty
+  key and lexeme entries of its own: its N, df, |d| and avgdl count that column alone, and a column
+  of a multi-column index ranks exactly as an index on that column alone would, bit for bit.
+  `col` names it as the index's own pg_attribute does (the Column of `\d index`): a plain column by
+  the table column's name at CREATE INDEX, an expression by the name CREATE INDEX chose
+  (`to_tsvector`, `to_tsvector1`). NULL, the default, is the index's one column that stores
+  positions, and an error whose hint names the candidates when there are several
+  (`lion_bm25_column()`); a name the index lacks, or a column without positions, is an error too.
+  The functions are declared CALLED ON NULL INPUT for col's NULL, and give no rows (a NULL score)
+  for a NULL in any other argument, as STRICT would.
 
 The query's lexemes are its operands not under a NOT, once each; a prefix is refused. Candidates
 stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with the empty
@@ -5503,16 +5513,25 @@ the walk still reads every member. Block-max bounds (a maximum per chunk, not pe
 skip whole chunks there, but need a maximum tf and a minimum length stored per chunk, which the
 format does not have.
 
-**The planner path.** `lion_bm25_score(doc, query, index, k1, b)` is the score of one row,
-computed from its tsvector with the index's N, df and avgdl, read once per call site. Its tf, length
-(every occurrence of every non-empty lexeme, capped at 65535) and order of addition are the walk's:
-both add a row's terms in descending order of idf, ties in query order, so a row gets the same
-float from either, bit for bit, as an incremental sort over the scan's order needs.
+**The planner path.** `lion_bm25_score(doc, query, index, k1, b, col)` is the score of one row,
+computed from its tsvector with the N, df and avgdl of the index column `col` names, read once per
+call site. Its tf, length (every occurrence of every non-empty lexeme, capped at 65535) and order
+of addition are the walk's: both add a row's terms in descending order of idf, ties in query order,
+so a row gets the same float from either, bit for bit, as an incremental sort over the scan's order
+needs.
 
 `LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
-whose query's first pathkey is `lion_bm25_score(col, Const, Const, Const, Const) DESC`, the index a
-lion index on that table storing positions for `col`. The order is claimed only when the walk's
-candidates hold every row the scan may return, so a restriction `col @@ q2` must be there with:
+whose query's first pathkey is `lion_bm25_score(doc, Const, Const, Const, Const, Const) DESC`, the
+index a lion index on that table whose key column the function ranks indexes `doc`, a plain
+column. The planner resolves `col` with the function's own `lion_bm25_column()`, and the walk ranks
+that key column, which the plan records. Anything else is left to the ordinary plan, which calls
+the function for each row, so that the rows and scores are the function's in every plan: a `doc`
+that is another column, an expression, or a key column other than the one named is a tsvector the
+walk does not read, and a `col` that settles no column (NULL on an index with several, a name it
+lacks) is an error the function raises. Nor is the column ever taken from `doc`: the function
+cannot see where its tsvector came from, so the scan would rank where the function raises an
+error. The order is claimed only when the walk's candidates hold every row the scan may return, so
+a restriction `doc @@ q2` must be there with:
 
 - q2's lexemes not under a NOT all among the scored query's, and no prefix in q2;
 - an empty document not matching q2.

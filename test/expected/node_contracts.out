@@ -106,7 +106,12 @@ INSERT INTO nc_nodes VALUES
 	('LionBm25',
 	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'') FROM nc WHERE d @@ ''w1 & w3''
 	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'') DESC LIMIT 5',
-	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8)',
+	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
+	 'enable_seqscan enable_bitmapscan enable_indexscan'),
+	('LionBm25, a named column',
+	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') FROM nc WHERE d @@ ''w1 & w3''
+	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') DESC LIMIT 5',
+	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
 	 'enable_seqscan enable_bitmapscan enable_indexscan');
 -- lion's paths on, and the core settings in force turned off (for the
 -- transaction); or every lion path off and core's settings back
@@ -244,8 +249,8 @@ BEGIN
 	EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', n.fn);
 END $$;
 SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
-                       node                       |                                                                                   nc_check                                                                                   
---------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                       node                       |                                                                                     nc_check                                                                                      
+--------------------------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  LionAntiJoin                                     | plan: planned
  LionAntiJoin                                     | every privilege: the ordinary plan's answer
  LionAntiJoin                                     | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -255,11 +260,18 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionAntiJoin                                     | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
  LionBm25                                         | plan: planned
  LionBm25                                         | every privilege: the ordinary plan's answer
- LionBm25                                         | without EXECUTE on lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision): ERROR: permission denied for function lion_bm25_score, as the ordinary plan
+ LionBm25                                         | without EXECUTE on lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision,name): ERROR: permission denied for function lion_bm25_score, as the ordinary plan
  LionBm25                                         | plain EXPLAIN: as the ordinary plan
  LionBm25                                         | granted to the role: the answer
  LionBm25                                         | a cached plan (planned, the answer) without it: ERROR: permission denied for function lion_bm25_score
  LionBm25                                         | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function lion_bm25_score
+ LionBm25, a named column                         | plan: planned
+ LionBm25, a named column                         | every privilege: the ordinary plan's answer
+ LionBm25, a named column                         | without EXECUTE on lion_bm25_score(tsvector,tsquery,regclass,double precision,double precision,name): ERROR: permission denied for function lion_bm25_score, as the ordinary plan
+ LionBm25, a named column                         | plain EXPLAIN: as the ordinary plan
+ LionBm25, a named column                         | granted to the role: the answer
+ LionBm25, a named column                         | a cached plan (planned, the answer) without it: ERROR: permission denied for function lion_bm25_score
+ LionBm25, a named column                         | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function lion_bm25_score
  LionBtreeScan                                    | plan: planned
  LionBtreeScan                                    | every privilege: the ordinary plan's answer
  LionBtreeScan                                    | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -400,7 +412,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                                     | granted to the role: the answer
  LionSemiJoin                                     | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionSemiJoin                                     | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(154 rows)
+(161 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');
