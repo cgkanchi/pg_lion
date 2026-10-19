@@ -70,6 +70,7 @@ extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes,
 extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
 extern double lion_spool_ntids(const LionSpool *spool);
+extern double lion_spool_nrows(const LionSpool *spool);
 
 /*
  * The build's positions (lion_posbuild.c): NULL from begin when no column

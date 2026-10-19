@@ -75,6 +75,54 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 	return Max(dirpages, 1.0);
 }
 
+/*
+ * The rows lion index idx holds (DESIGN.md §45): every row of rel for a whole
+ * index, and for a partial one its own row count - estimate_rel_size()'s
+ * from its reltuples, which lion reports as rows (DESIGN.md §18,
+ * "Statistics") - or, where it has none yet, the share of rel's rows its
+ * predicate keeps, as core prices a partial index scan.
+ */
+double
+lion_index_rows(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		rows;
+
+	if (idx == NULL || idx->indpred == NIL)
+		return tuples;
+	if (idx->tuples > 0)
+		rows = idx->tuples;
+	else
+		rows = tuples * clauselist_selectivity(root, idx->indpred,
+											   rel->relid, JOIN_INNER, NULL);
+	return Max(Min(rows, tuples), 1.0);
+}
+
+/*
+ * The share of the rows of lion index idx that `clause` (one of rel's, with
+ * its expression columns put back) selects: its selectivity for a whole
+ * index, and for a partial one the share of the predicate's rows that the
+ * clause and the predicate select together (DESIGN.md §45).  `sel` is the
+ * clause's own selectivity.
+ */
+static Selectivity
+lion_index_clause_share(PlannerInfo *root, IndexOptInfo *idx, Node *clause,
+						Selectivity sel)
+{
+	Selectivity predsel;
+	Selectivity both;
+
+	if (idx == NULL || idx->indpred == NIL)
+		return sel;
+	predsel = clauselist_selectivity(root, idx->indpred, 0, JOIN_INNER, NULL);
+	if (predsel <= 0.0)
+		return sel;
+	both = clauselist_selectivity(root,
+								  lappend(list_copy(idx->indpred), clause),
+								  0, JOIN_INNER, NULL);
+	return Min(both / predsel, 1.0);
+}
+
 /* A key column's n_distinct, or -1 for an expression column. */
 static double
 lion_index_column_nd(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
@@ -822,7 +870,6 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					 AttrNumber col, Node *clause, LionSetClause *sc)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		tuples = Max(rel->tuples, 1.0);
 	Node	   *bare = IsA(clause, RestrictInfo) ?
 		(Node *) ((RestrictInfo *) clause)->clause : clause;
 	double		share;
@@ -831,11 +878,22 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		container_pages;
 	double		nkeys = 1.0;
 	double		sel;
+	double		itup;
+	double		psel;
 
 	memset(sc, 0, sizeof(*sc));
 	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
 							 NULL);
 	sc->sel = sel;
+
+	/*
+	 * A partial index's sets hold its predicate's rows alone (DESIGN.md §45):
+	 * the rows the index has (itup), and the share of them the clause
+	 * selects (psel), price its sets where a whole index's are the table's
+	 * rows and the clause's selectivity.
+	 */
+	itup = lion_index_rows(root, rel, idx);
+	psel = lion_index_clause_share(root, idx, lion_vcol_unvar(bare), sel);
 
 	/*
 	 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md §24):
@@ -917,7 +975,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 */
 		sc->descent = nkeys * LION_DESCENT_COST *
 			(1.0 + height * Min(1.0, dirpages / nkeys));
-		sc->pages = Min(Max(nkeys, container_pages * sel), container_pages);
+		sc->pages = Min(Max(nkeys, container_pages * psel), container_pages);
 	}
 	else
 	{
@@ -930,7 +988,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 */
 		sc->randompages = 1.0;
 		sc->descent = (height + 1.0) * LION_DESCENT_COST;
-		sc->pages = Max(1.0, container_pages * sel);
+		sc->pages = Max(1.0, container_pages * psel);
 	}
 
 	/*
@@ -950,9 +1008,9 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	 * what a union is built of (§15, §19), or a sum adds up - costs the
 	 * merge's price of a container the driver reads (lion_merge_cpu_cost()).
 	 */
-	sc->members = tuples * sel;
+	sc->members = itup * psel;
 	sc->containers = nkeys * lion_key_containers(root, rel, idx, col,
-												 tuples * sel / nkeys);
+												 sc->members / nkeys);
 	sc->readall = sc->containers *
 		(LION_CONTAINER_COST +
 		 LION_MEMBER_COST * Min(sc->members / sc->containers, LION_MEMBER_CAP));
@@ -3016,12 +3074,12 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 	double		share = 1.0;
 	int			s;
 
-	mem[c->nsrc] = c->tuples / oe;
+	mem[c->nsrc] = lion_index_rows(c->root, c->rel, c->groupidx) / oe;
 	keys[c->nsrc] = lion_key_containers(c->root, c->rel, c->groupidx,
-										c->groupcol, c->tuples / oe);
-	mem[c->nsrc + 1] = c->tuples / ie;
+										c->groupcol, mem[c->nsrc]);
+	mem[c->nsrc + 1] = lion_index_rows(c->root, c->rel, c->groupidx2) / ie;
 	keys[c->nsrc + 1] = lion_key_containers(c->root, c->rel, c->groupidx2,
-											c->groupcol2, c->tuples / ie);
+											c->groupcol2, mem[c->nsrc + 1]);
 
 	/*
 	 * The (g, k) pair test of a count(DISTINCT k) (DESIGN.md §26) stops at
@@ -3108,12 +3166,13 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 		}
 		else if (gnd > 0.0)
 		{
-			gm = c->tuples / gnd;
+			gm = lion_index_rows(c->root, c->rel, c->groupidx) / gnd;
 			c->walked = Max(gnd * c->drivefrac, 1.0);
 		}
 		else
 		{
-			gm = c->tuples / Max(c->numgroups, 1.0);
+			gm = lion_index_rows(c->root, c->rel, c->groupidx) /
+				Max(c->numgroups, 1.0);
 			c->walked = Max(c->ingroups, 1.0);
 		}
 	}
@@ -4253,9 +4312,7 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	LionCountTarget *t = (LionCountTarget *) linitial(targets);
 	RelOptInfo *rel = t->rel;
 	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		tuples = Max(rel->tuples, 1.0);
 	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
-	double		rowsperkey = tuples / nkeys;
 	double		whererows = Max(rel->rows, 1.0);
 	double		keys;
 	double		keyfrac;
@@ -4301,10 +4358,13 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 				 ((double) sizeof(PGAlignedBlock) + 512.0) / (ncol - 1), 16.0);
 	for (c = 0; c < ncol; c++)
 	{
-		double		vals = Min(Max(groupest[c], 1.0), rowsperkey);
+		/* a partial index's column holds its predicate's rows (§45) */
+		double		colrows = lion_index_rows(root, rel, t->driveidx[c]) /
+			nkeys;
+		double		vals = Min(Max(groupest[c], 1.0), colrows);
 		double		cap = (c == 0) ? (double) LION_GROUP_BATCH_MAX : percap;
 
-		perkey += rowsperkey * LION_DECODE_MEMBER_COST;
+		perkey += colrows * LION_DECODE_MEMBER_COST;
 		perkey += vals * LION_DECODE_CONTAINER_COST;
 		if (c > 0)
 		{

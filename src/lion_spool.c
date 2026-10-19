@@ -229,6 +229,7 @@ struct LionSpool
 	BlockNumber curblk;			/* the heap page the scan is on */
 	bool		haveblk;
 	double		ntids;			/* (key, code) pairs added */
+	double		nrows;			/* rows added, each once */
 	int			nspills;		/* runs spilled, all columns together */
 	int			unchecked;		/* pairs added since the budget was checked */
 };
@@ -2307,6 +2308,7 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 	int			c;
 
 	lion_check_key_offset(tid);
+	sp->nrows += 1;
 
 	/* the budget, at every heap page and every LION_CHECK_KEYS keys */
 	if (sp->haveblk && blk < sp->curblk)
@@ -2397,6 +2399,16 @@ double
 lion_spool_ntids(const LionSpool *sp)
 {
 	return sp->ntids;
+}
+
+/*
+ * The rows added: what the index's pg_class.reltuples is to say (DESIGN.md
+ * §18, "Statistics"), and for a partial index the rows its predicate keeps.
+ */
+double
+lion_spool_nrows(const LionSpool *sp)
+{
+	return sp->nrows;
 }
 
 int
