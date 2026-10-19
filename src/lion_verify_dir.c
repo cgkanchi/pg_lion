@@ -385,6 +385,34 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			lion_corrupt("lion index \"%s\": rightmost directory page %u carries a high key",
 						RelationGetRelationName(vs->index), blk);
 
+		/*
+		 * Every internal page begins with a minus-infinity downlink, and all
+		 * but the rightmost of a level carry two downlinks at least: what
+		 * bounds the directory's height (LION_MAX_DIR_HEIGHT).  The build may
+		 * leave one on the rightmost page of a level.
+		 */
+		if (!isleaf)
+		{
+			int			ndown = 0;
+
+			if (firstdata > maxoff)
+				lion_corrupt("lion index \"%s\": internal page %u has no downlink",
+							RelationGetRelationName(vs->index), blk);
+			if (!ItemIdIsUsed(PageGetItemId(page, firstdata)) ||
+				!LionEntryIsMinusInf(lion_page_entry(page, firstdata)))
+				lion_corrupt("lion index \"%s\": the first downlink of internal page %u is not minus infinity",
+							RelationGetRelationName(vs->index), blk);
+			for (off = firstdata; off <= maxoff; off++)
+			{
+				if (ItemIdIsUsed(PageGetItemId(page, off)))
+					ndown++;
+			}
+			if (ndown < LION_ABS_MIN_DOWNLINKS && !LionPageIsRightmost(page))
+				lion_corrupt("lion index \"%s\": internal page %u has %d downlink%s, fewer than %d",
+							RelationGetRelationName(vs->index), blk, ndown,
+							ndown == 1 ? "" : "s", LION_ABS_MIN_DOWNLINKS);
+		}
+
 		for (off = firstdata; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
@@ -408,7 +436,11 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 				lion_corrupt_reindex("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
 									RelationGetRelationName(vs->index), off, blk);
 
-			if (firstkey == NULL)
+			/*
+			 * The page's first KEY: on an internal page, past its
+			 * minus-infinity downlink, whose key is this page's lower bound.
+			 */
+			if (firstkey == NULL && !LionEntryIsMinusInf(item))
 			{
 				firstkey = lion_verify_copy_item(page, off);
 				if (prevhigh != NULL &&
@@ -427,8 +459,16 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			}
 			else
 			{
+				/*
+				 * The separator of the child of a minus-infinity downlink is
+				 * this page's lower bound: the high key of the page to its
+				 * left, which the walk has just read, or minus infinity
+				 * itself on the leftmost page of the level.
+				 */
 				if (children != NULL)
 					lion_verify_level_add(children, lion_entry_head(item),
+										  LionEntryIsMinusInf(item) &&
+										  prevhigh != NULL ? prevhigh :
 										  lion_verify_copy_item(page, off),
 										  NULL, false);
 			}
@@ -719,10 +759,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V11)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V12)
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V11);
+					meta->version, LION_MAGIC, LION_VERSION_V12);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))

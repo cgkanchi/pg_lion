@@ -473,7 +473,14 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * them; and LION_MAX_ENTRY_SIZE, which leaves room for the largest pivot,
  * shrank, so an INLINE entry a version 10 build wrote may be larger than a
  * page now leaves room for.  Opening a version 10 index is an ERROR whose
- * hint asks for REINDEX.  Every index this build writes is version 11.
+ * hint asks for REINDEX.
+ *
+ * Version 12 begins EVERY internal directory page with a minus-infinity
+ * downlink, where version 11 did so only on the leftmost page of a level
+ * (DESIGN.md §21, "Height").  A version 11 directory may have internal pages
+ * of one downlink and any height, which is what version 12 rules out, so
+ * opening one is an ERROR whose hint asks for REINDEX.  Every index this
+ * build writes is version 12.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
@@ -481,6 +488,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V9			9	/* varbyte sparse segments (§13) */
 #define LION_VERSION_V10		10	/* compact entry tuples (§21) */
 #define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
+#define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
 
 /* May the index of this meta page hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta) \
@@ -858,6 +866,27 @@ lion_pivot_kindflags(uint16 flags)
 #define LION_NONLEAF_FILLFACTOR	70
 #define LION_MIN_DOWNLINKS		3
 #define LION_ABS_MIN_DOWNLINKS	2
+
+/*
+ * The tallest directory a meta page may record (its `height`, the root's
+ * level, 0 for a root that is a leaf); a taller one is damage.
+ *
+ * No INSERT can reach it, whatever the keys and their order (DESIGN.md §21,
+ * "Height").  Every internal page's FIRST downlink is minus infinity - a
+ * header and no key, its lower bound being its left sibling's high key - so
+ * an internal page split has the room for two downlinks on each half even
+ * when every key is LION_MAX_KEY_SIZE (lion_dir_choose_split()), and so does
+ * the build (lion_build_level_add()).  Downlinks are never removed.  So every
+ * internal page has at least LION_ABS_MIN_DOWNLINKS downlinks, except that
+ * the build may leave ONE on the rightmost page of a level; and a root has
+ * two, because it is made by a root split or is the one page of the build's
+ * top level over a level of at least two.  A directory of height h therefore
+ * has at least 2^(k-1) + 1 pages at level h - k for k >= 1, and at least
+ * 2^h + h pages in all.  A relation has fewer than 2^32 blocks, so h <= 31,
+ * and a root split that would make it 32 means the pages it stands on are
+ * damaged: lion_dir_split() refuses it before it writes anything.
+ */
+#define LION_MAX_DIR_HEIGHT		31
 
 typedef struct LionOptions
 {
@@ -1593,6 +1622,13 @@ lion_page_first_data(Page page)
 	return LionPageIsRightmost(page) ? FirstOffsetNumber :
 		OffsetNumberNext(FirstOffsetNumber);
 }
+
+/*
+ * The first data item of a directory page that carries a key: past the
+ * minus-infinity downlink every internal page begins with (DESIGN.md §21).
+ * One past the last item when there is none.
+ */
+extern OffsetNumber lion_dir_first_keyed(Page page);
 
 extern void lion_entry_size_error(Page page, ItemId iid);
 
