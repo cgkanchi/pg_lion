@@ -581,6 +581,7 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 
 		if (idxname == NULL || relkind == '\0')
 			lion_count_no_relation(idxoid[i]);
+		lion_refuse_partitioned_index(idxoid[i]);
 		if (relkind != RELKIND_INDEX)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),

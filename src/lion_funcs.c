@@ -22,7 +22,10 @@ PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 Relation
 lion_open_index(Oid relid, LOCKMODE lockmode)
 {
-	Relation	index = index_open(relid, lockmode);
+	Relation	index;
+
+	lion_refuse_partitioned_index(relid);
+	index = index_open(relid, lockmode);
 
 	if (index->rd_rel->relkind != RELKIND_INDEX ||
 		index->rd_indam == NULL ||
@@ -265,6 +268,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
+
+		/*
+		 * A partitioned index has no storage, so nothing to describe: no
+		 * rows, as pg_relation_size() says 0 of it, and a query over every
+		 * lion index in pg_class goes on to its partitions' indexes.
+		 */
+		if (lion_is_partitioned_index(relid))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			SRF_RETURN_DONE(funcctx);
+		}
 
 		index = lion_open_index(relid, AccessShareLock);
 		ix = lion_get_index_state(index);

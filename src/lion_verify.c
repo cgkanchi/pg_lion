@@ -2219,6 +2219,8 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.showvalues = superuser();
 	vs.concurrent = !inrecovery;
 
+	/* before its table is locked: a partitioned index has one too */
+	lion_refuse_partitioned_index(relid);
 	heapoid = IndexGetRelation(relid, true);
 	if (!OidIsValid(heapoid))
 	{
