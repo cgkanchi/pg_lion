@@ -5341,7 +5341,12 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   CHAIN entry points at its position tree (`pos_root`).  Reserved entries never store positions.
 - **Insert** writes a row's positions before its TID (W1): in the INLINE entry's one record, or
   into the position tree before the posting set.  An INLINE entry that outgrows itself spills
-  both, the new position head written in the spill's last record with the entry.
+  both, the new position head written in the spill's last record with the entry.  "Outgrows" is
+  judged on the payload at its own length plus the chunk, against `lion_inline_max()` - which
+  next to a long key is LION_MAX_ENTRY_SIZE less the key, not `inline_limit` - and the entry is
+  then written with whatever growth slack (§4) still fits beside the chunk, none if none does:
+  the area the last rewrite gave the payload is kept only while it does, since an entry built at
+  that area beside a grown chunk can be over LION_MAX_ENTRY_SIZE although the payload itself fits.
 - **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
   member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
   the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
