@@ -1196,7 +1196,13 @@ typedef struct LionVColScope
  *		aggregates' arguments - where setrefs.c points their columns at
  *		LION_TL_RESID columns of custom_scan_tlist and SS_finalize_plan()
  *		sees their Params - and leaves this member empty
- *	22	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	22	List, or empty: the partial indexes the count reads (DESIGN.md §45):
+ *		an OidList of them, each once, and a List of String, the WHERE
+ *		clauses their predicates imply, left out of the plan altogether as
+ *		EXPLAIN prints them ("Implied by Index Predicate") - deparsed when
+ *		the plan is made, as member 13's are.  Empty when every index read
+ *		is a whole one
+ *	23	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1221,7 +1227,8 @@ typedef struct LionVColScope
 #define LION_PRIV_VCOLS		19
 #define LION_PRIV_FILTERS	20
 #define LION_PRIV_RESID		21
-#define LION_PRIV_TLKINDS	22
+#define LION_PRIV_PARTIAL	22
+#define LION_PRIV_TLKINDS	23
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1318,6 +1325,10 @@ typedef struct LionVColScope
  * and the LION_JOINFLAG_LEFT flag ("The dimension LEFT JOIN the fact"), whose
  * rows of count 0 an older build would have dropped.
  *
+ * Shape 27 added the PARTIAL member (22) in front of the target-list kinds:
+ * partial indexes, whose predicates imply WHERE clauses the plan leaves out
+ * (DESIGN.md §45), which an older build would have printed nothing of.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1330,8 +1341,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491a
-#define LION_PRIV_NMEMBERS	23
+#define LION_PRIV_MAGIC		0x5242491b
+#define LION_PRIV_NMEMBERS	24
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2245,6 +2256,10 @@ typedef struct LionCountPriv
 
 	List	   *implied;		/* IMPLIED (§16): String nodes */
 
+	/* PARTIAL (§45): both NIL, or partialidx not */
+	List	   *partialidx;		/* OidList: the partial indexes read */
+	List	   *predimplied;	/* String: the clauses their predicates imply */
+
 	/* FACTGROUP (§27, "Grouped by a fact column"): Max(npart, 1) each */
 	AttrNumber	fgattno;		/* or 0 */
 	Oid		   *fgidxoid;		/* InvalidOid where fgconst is the value */
@@ -3140,6 +3155,25 @@ extern bool lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 								 const LionImply *imply, List **targets);
 extern Bitmapset *lion_notnullattnums(PlannerInfo *root, RelOptInfo *rel);
 
+/* lion_plan_partial.c (DESIGN.md §45) */
+typedef struct LionPartialCands LionPartialCands;
+extern LionPartialCands *lion_partial_find(PlannerInfo *root,
+										   RelOptInfo *rel);
+extern int	lion_partial_ncands(const LionPartialCands *pc);
+extern bool lion_partial_enter(const LionPartialCands *pc, int rank,
+							   void **saved);
+extern void lion_partial_leave(void *saved);
+extern bool lion_partial_active(void);
+extern IndexOptInfo *lion_partial_index_of(RelOptInfo *rel);
+extern bool lion_partial_drops(PlannerInfo *root, RelOptInfo *toprel,
+							   Node *clause);
+extern void lion_partial_note_drop(char *text);
+extern List *lion_partial_dropped(void);
+extern List *lion_partial_used(void);
+extern bool lion_partial_anchored(List *targets, List *clauseinfos,
+								  List *ors, int ndrive, bool allrows,
+								  int nfilter);
+
 /* lion_plan_target.c */
 extern bool lion_agg_is_count(PlannerInfo *root, Aggref *agg, Index rti,
 							  RelOptInfo *rel, const AttrNumber *groupattno,
@@ -3309,6 +3343,8 @@ extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  double matched, double counts, double ceiling);
 extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *rel,
 								 List *residual);
+extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,
+							  IndexOptInfo *idx);
 extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
 							   List *residual, double counts);
 
@@ -3318,6 +3354,13 @@ extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
  * one is no cheaper than the sequential scan that reads them all.
  */
 #define LION_RESID_MAX_SHARE	0.5
+
+/*
+ * How many of a relation's partial indexes whose predicates the query
+ * implies a count is planned with, one at a time and the smallest first
+ * (DESIGN.md §45): each is a whole planning of the count.
+ */
+#define LION_PARTIAL_TRIES		3
 
 /* lion_plan_fkjoin_cost.c */
 extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,

@@ -1390,6 +1390,73 @@ lion_count_path_snapshot(const LionCountPathBuild *cx,
 	snap->rangepos = list_copy(cx->rangepos);
 }
 
+/*
+ * The columns of the relation counted that the output prints outside an
+ * aggregate, other than the GROUP BY's: the target list's and the HAVING's,
+ * as attnos offset by FirstLowInvalidHeapAttributeNumber (pull_varattnos()).
+ * A WHERE clause that pins one is what its printed value comes from (§10),
+ * so it is never left out for a partial index's predicate (DESIGN.md §45).
+ */
+static Bitmapset *
+lion_count_path_printed(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	List	   *exprs = list_copy(cx->output_rel->reltarget->exprs);
+	Bitmapset  *printed = NULL;
+	Bitmapset  *grouped = NULL;
+	List	   *vars;
+	ListCell   *lc;
+
+	exprs = list_concat(exprs, cx->having);
+	vars = pull_var_clause((Node *) exprs,
+						   PVC_INCLUDE_AGGREGATES |
+						   PVC_INCLUDE_WINDOWFUNCS |
+						   PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (IsA(v, Var) && v->varno == (int) cx->rti && v->varlevelsup == 0)
+			printed = bms_add_member(printed,
+									 v->varattno -
+									 FirstLowInvalidHeapAttributeNumber);
+	}
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+
+		if (tle != NULL)
+			pull_varattnos((Node *) tle->expr, cx->rti, &grouped);
+	}
+	return bms_difference(printed, grouped);
+}
+
+/*
+ * Is restriction rinfo one the predicate of the partial index the count is
+ * planned with implies (lion_partial_drops(), DESIGN.md §45)?  It is then
+ * left out of the count, as core leaves it out of a partial index scan's
+ * indrestrictinfo, and EXPLAIN says so ("Implied by Index Predicate") - but
+ * not where it pins a column the output prints (`printed`).
+ */
+static bool
+lion_count_path_pred_drops(LionCountPathBuild *cx, RestrictInfo *rinfo,
+						   Bitmapset *printed)
+{
+	Bitmapset  *attnos = NULL;
+
+	if (!lion_partial_active())
+		return false;
+	pull_varattnos((Node *) rinfo->clause, cx->rti, &attnos);
+	if (bms_overlap(attnos, printed))
+		return false;
+	if (!lion_partial_drops(cx->root, cx->input_rel, (Node *) rinfo->clause))
+		return false;
+	lion_partial_note_drop(lion_deparse_rel_clause(cx->root, cx->rti,
+												   (Node *) rinfo->clause));
+	return true;
+}
+
 static bool
 lion_count_path_where(LionCountPathBuild *cx)
 {
@@ -1398,6 +1465,8 @@ lion_count_path_where(LionCountPathBuild *cx)
 	Index		rti = cx->rti;
 	ListCell   *lc;
 	LionCountPathBuild snap;
+	Bitmapset  *printed = lion_partial_active() ?
+		lion_count_path_printed(cx) : NULL;
 
 	/*
 	 * ---- every WHERE clause must be one the posting sets can answer ----
@@ -1420,6 +1489,10 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return false;
+
+		/* TRUE wherever the count reads (DESIGN.md §45): left out */
+		if (lion_count_path_pred_drops(cx, rinfo, printed))
+			continue;
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
@@ -1790,6 +1863,46 @@ lion_count_path_distinct(LionCountPathBuild *cx)
 }
 
 /*
+ * The columns of count(col)s that the predicate of the partial index the
+ * count is planned with proves non-NULL (DESIGN.md §45), as nonnullattnos:
+ * the restrictions imply that predicate in every relation counted, so every
+ * row the query selects has col, and count(col) is the rows' count.  Before
+ * lion_count_path_countcol() and the target list's checks, which ask.
+ */
+static void
+lion_count_path_pred_nonnull(LionCountPathBuild *cx)
+{
+	ListCell   *lc;
+
+	if (!lion_partial_active())
+		return;
+	foreach(lc, cx->checkexprs)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		Var		   *v;
+		NullTest   *nt;
+
+		if (!IsA(agg, Aggref) || agg->aggfnoid != F_COUNT_ANY ||
+			list_length(agg->args) != 1)
+			continue;
+		v = (Var *) lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr);
+		if (v == NULL || !IsA(v, Var) || v->varno != (int) cx->rti ||
+			v->varlevelsup != 0 || v->varattno <= 0 ||
+			LION_ATTNO_IS_VCOL(v->varattno) ||
+			list_member_int(cx->nonnullattnos, (int) v->varattno))
+			continue;
+		nt = makeNode(NullTest);
+		nt->arg = (Expr *) copyObject(v);
+		nt->nulltesttype = IS_NOT_NULL;
+		nt->argisrow = false;
+		nt->location = -1;
+		if (lion_partial_drops(cx->root, cx->input_rel, (Node *) nt))
+			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+											(int) v->varattno);
+	}
+}
+
+/*
  * count(col) of a nullable column (DESIGN.md §10, "Shapes rewritten to the
  * node's counts"): without a GROUP BY, where every aggregate is count(col)
  * of that one column, it is count(*) of the rows the WHERE selects AND `col
@@ -1807,6 +1920,7 @@ lion_count_path_countcol(LionCountPathBuild *cx)
 	NullTest   *nt;
 	ListCell   *lc;
 
+	lion_count_path_pred_nonnull(cx);
 	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
 		cx->groupcoal != NULL || cx->distvar != NULL)
 		return true;
@@ -2359,9 +2473,11 @@ lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel, AttrNumber *attnos,
  * and between them - the NULL entry included - hold every row of the table,
  * so the sum over them, less what the negated clauses subtract from each, is
  * the count; the column with the fewest entries is the cheapest walk.  Only a
- * column of a scalar, non-partial, non-expression index will do
- * (lion_find_roaring_index()): a multi-key column's entries overlap and miss
- * the rows with no keys, and a partial index holds only its predicate's rows.
+ * column of a scalar, non-expression index will do (lion_find_roaring_index()):
+ * a multi-key column's entries overlap and miss the rows with no keys, and a
+ * partial index holds only its predicate's rows - which is every row the
+ * count is to read when it is planned with that index (DESIGN.md §45), and
+ * then its columns come first.
  * A column with an `IS NOT NULL` of its own is preferred when it is no
  * dearer, since its NULL entry is then skipped and its clause dropped
  * (lion_locate_where()).  A partitioned table's candidates are those of its
@@ -2375,7 +2491,9 @@ lion_count_all_driver(LionCountPathBuild *cx)
 	int			natts = Max((int) rel->max_attr, 0);
 	AttrNumber *attnos = (AttrNumber *) palloc0(sizeof(AttrNumber) * Max(natts, 1));
 	RelOptInfo *leaf;
+	IndexOptInfo *part;
 	Var		   *best = NULL;
+	bool		bestpart = false;
 	double		bestentries = 0.0;
 	int			a;
 
@@ -2384,6 +2502,7 @@ lion_count_all_driver(LionCountPathBuild *cx)
 	leaf = lion_count_first_leaf(root, rel, attnos, natts);
 	if (leaf == NULL)
 		return NULL;
+	part = lion_partial_index_of(leaf);
 
 	for (a = 0; a < natts; a++)
 	{
@@ -2394,11 +2513,15 @@ lion_count_all_driver(LionCountPathBuild *cx)
 		VariableStatData vardata;
 		bool		isdefault;
 		double		entries;
+		IndexOptInfo *idx;
+		bool		inpart;
 
 		/* an indexed column is no dropped one, nor maps to none (§16) */
 		if (attnos[a] == 0 ||
-			lion_find_roaring_index(leaf, attnos[a], false, NULL) == NULL)
+			(idx = lion_find_roaring_index(leaf, attnos[a], false,
+										   NULL)) == NULL)
 			continue;
+		inpart = (part != NULL && idx == part);
 		get_atttypetypmodcoll(cx->rte->relid, (AttrNumber) (a + 1), &type,
 							  &typmod, &coll);
 		var = makeVar(cx->rti, (AttrNumber) (a + 1), type, typmod, coll, 0);
@@ -2411,9 +2534,16 @@ lion_count_all_driver(LionCountPathBuild *cx)
 			var->varattno == cx->notnullvar->varattno)
 			entries = Max(entries - 1.0, 1.0);
 
-		if (best == NULL || entries < bestentries)
+		/*
+		 * A column of the partial index the count is planned with first
+		 * (DESIGN.md §45): its entries are the predicate's rows, which is
+		 * what holds a count with restrictions left out to them.
+		 */
+		if (best == NULL || (inpart && !bestpart) ||
+			(inpart == bestpart && entries < bestentries))
 		{
 			best = var;
+			bestpart = inpart;
 			bestentries = entries;
 		}
 	}
@@ -2828,6 +2958,17 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		return false;
 	if (cx->targets == NIL)
 		return false;			/* everything was pruned: leave it to the planner */
+
+	/*
+	 * Planned with a partial index (DESIGN.md §45): every row the count can
+	 * reach has to be one of its predicate's.  A sum over every row with
+	 * nothing bounding its walk counts a filtered count's run that has a
+	 * source of its own by that source, and not by the walk.
+	 */
+	if (!lion_partial_anchored(cx->targets, cx->clauseinfos, cx->ors, ndrive,
+							   cx->sumall && cx->rangevar == NULL,
+							   cx->nfilter))
+		return false;
 	cx->first = (LionCountTarget *) linitial(cx->targets);
 	return true;
 }
@@ -3242,6 +3383,10 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		p->coalcoll = cx->groupvar[0]->varcollid;
 	}
 	p->implied = cx->impliedtexts;
+
+	/* the partial indexes read, and what their predicates imply (§45) */
+	p->partialidx = lion_partial_used();
+	p->predimplied = lion_partial_dropped();
 
 	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
 	if (cx->decode)
@@ -3988,6 +4133,56 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 }
 
 /*
+ * The rest of lion_try_count_path() for one build: inside the scope of the
+ * relation's expression columns.  The expressions of the table's lion
+ * indexes are columns from here on (DESIGN.md §41): of one table, which no
+ * FK-side join reads.  A partition numbers its own Vars, and its indexes'
+ * expressions are its own, so a partitioned table has none.
+ */
+static void
+lion_try_count_path_vcols(LionCountPathBuild *cxp)
+{
+	LionCountPathBuild cx = *cxp;
+	LionVColScope saved;
+
+	if (cx.fj == NULL && !cx.partitioned)
+		cx.vcols = lion_vcol_collect(cx.input_rel);
+	saved = lion_vcol_enter(cx.vcols, cx.rti);
+	PG_TRY();
+	{
+		lion_try_count_path_scoped(&cx);
+	}
+	PG_FINALLY();
+	{
+		lion_vcol_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * One more build of lion_try_count_path(), with each relation's rank'th
+ * partial index (DESIGN.md §45), when one has any.
+ */
+static void
+lion_try_count_path_partial(LionCountPathBuild *cx,
+							const LionPartialCands *cands, int rank)
+{
+	void	   *saved;
+
+	if (!lion_partial_enter(cands, rank, &saved))
+		return;
+	PG_TRY();
+	{
+		lion_try_count_path_vcols(cx);
+	}
+	PG_FINALLY();
+	{
+		lion_partial_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
@@ -4007,7 +4202,8 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						const LionFkJoin *fj, bool distinctstage)
 {
 	LionCountPathBuild cx;
-	LionVColScope saved;
+	LionPartialCands *cands;
+	int			rank;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 	cx.distinctstage = distinctstage;
@@ -4017,24 +4213,21 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!lion_count_path_rel(&cx))
 		return;
 
+	/* with the relation's whole indexes */
+	lion_try_count_path_vcols(&cx);
+
 	/*
-	 * The expressions of the table's lion indexes are columns from here on
-	 * (DESIGN.md §41): of one table, which no FK-side join reads.  A
-	 * partition numbers its own Vars, and its indexes' expressions are its
-	 * own, so a partitioned table has none.
+	 * ... and once more with each partial index whose predicate the
+	 * restrictions imply (DESIGN.md §45), the smallest first: every lookup
+	 * tries that index first, the restrictions it implies are left out, and
+	 * the count is held to its rows.  add_path() keeps the cheapest.
 	 */
-	if (fj == NULL && !cx.partitioned)
-		cx.vcols = lion_vcol_collect(cx.input_rel);
-	saved = lion_vcol_enter(cx.vcols, cx.rti);
-	PG_TRY();
-	{
-		lion_try_count_path_scoped(&cx);
-	}
-	PG_FINALLY();
-	{
-		lion_vcol_leave(saved);
-	}
-	PG_END_TRY();
+	if (!lion_enable_count_partial)
+		return;
+	cands = lion_partial_find(root, cx.input_rel);
+	for (rank = 0; rank < Min(lion_partial_ncands(cands), LION_PARTIAL_TRIES);
+		 rank++)
+		lion_try_count_path_partial(&cx, cands, rank);
 }
 
 void

@@ -407,6 +407,46 @@ lion_explain_partitions(LionCountScanState *st, ExplainState *es)
 }
 
 /*
+ * The partial indexes the count reads (DESIGN.md §45): a partitioned scan's,
+ * whose "Lion Indexes" name no index, on a line of their own; and for any
+ * scan the WHERE clauses their predicates imply, which the plan leaves out,
+ * as core leaves them out of a partial index scan.
+ */
+static void
+lion_explain_partial(LionCountScanState *st, ExplainState *es)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	if (st->plan.partialidx != NIL && st->npart > 0)
+	{
+		initStringInfo(&buf);
+		foreach(lc, st->plan.partialidx)
+		{
+			char	   *name = get_rel_name(lfirst_oid(lc));
+
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, name != NULL ? name : "?");
+		}
+		ExplainPropertyText("Partial Indexes", buf.data, es);
+		pfree(buf.data);
+	}
+	if (st->plan.predimplied != NIL)
+	{
+		initStringInfo(&buf);
+		foreach(lc, st->plan.predimplied)
+		{
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, strVal(lfirst(lc)));
+		}
+		ExplainPropertyText("Implied by Index Predicate", buf.data, es);
+		pfree(buf.data);
+	}
+}
+
+/*
  * The entry of "Lion Indexes" for the index whose entries drive the count
  * (LION_FLAG_GROUPIDX): the index, what is walked of it - a range's bounds,
  * the column or all of its keys - and the inner index of a pair walked, if
@@ -1502,6 +1542,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		lion_explain_partitions(st, es);
 
 	lion_explain_indexes(st, ancestors, es);
+	lion_explain_partial(st, es);
 
 	/*
 	 * The residual clauses (DESIGN.md §10, "Residual clauses"), tested on the

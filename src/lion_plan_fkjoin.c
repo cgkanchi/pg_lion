@@ -1688,6 +1688,15 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 		return false;
 	if (targets == NIL)
 		return false;
+
+	/*
+	 * Planned with a partial index (DESIGN.md §45): every row a key is
+	 * counted in has to be one of its predicate's - which the key's own
+	 * equality holds it to when the fk is read from it.
+	 */
+	if (!lion_partial_anchored(targets, clauseinfos, ors,
+							   fgdrive != NULL ? 1 : 0, false, 0))
+		return false;
 	partitioned = rte->inh;
 	fkpages = 0;
 	foreach(lc, targets)
@@ -1723,6 +1732,8 @@ lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 	base->exec_funcs = (List *) lsecond(exec);
 	base->exec_groupfuncs = (List *) lthird(exec);
 	base->implied = (imply != NULL) ? imply->skipped : NIL;
+	base->partialidx = lion_partial_used();
+	base->predimplied = lion_partial_dropped();
 
 	/*
 	 * A fact column grouped by: each relation's index for it, or its value.

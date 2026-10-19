@@ -540,6 +540,14 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_count_partial`: let the count pushdown read a partial Lion index whose predicate
+  the query's `WHERE` implies - `CREATE INDEX ... USING lion (g, c) WHERE f AND s = 'a'` for a
+  query with `WHERE f AND s = 'a' AND c = 3` - leaving out the clauses the predicate implies, as a
+  partial index scan does (DESIGN.md §45). It is used only where every row the count can reach is
+  one of the index's: a clause read from it that selects rows (`=`, `IN`, `IS NULL`, a range), or
+  its entries walked for a `GROUP BY`, a `count(DISTINCT)` or the count of every row. EXPLAIN lists
+  the index among the `Lion Indexes` (`Partial Indexes` on a partitioned table) and the clauses
+  left out under `Implied by Index Predicate`. Off, the pushdown reads whole Lion indexes only.
 - `pg_lion.enable_count_residual`: let the count pushdown take a `WHERE` clause no Lion index
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
   the heap row of each row the others select (DESIGN.md §10, "Residual clauses"). Off, such a count
@@ -871,7 +879,9 @@ lists of more than 1000 values are left to the ordinary plan, a multi-key index 
 `GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values; `USING lion (doc)`
 on `jsonb` is one, and `doc jsonb_ops` the index for `=` and `count(DISTINCT doc)` on whole
 documents), and the cost model inherits the
-stale `relallvisible` blind spot of index-only scans.
+stale `relallvisible` blind spot of index-only scans. A partial Lion index is read by the count
+pushdown only when the query's `WHERE` implies its predicate, one per table or partition in a plan,
+and never for a uniqueness proof, the facet counts or the planner's estimates (DESIGN.md §45).
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
 interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only

@@ -80,15 +80,16 @@ lion_index_col_expr(IndexOptInfo *idx, int i)
 
 /*
  * The expressions of rel's lion indexes that a count can treat as columns:
- * each key column of a whole (non-partial) index that is an expression and
- * has a scalar opclass, whose entries are the expression's values, one per
- * row, and that reads a column: an index on `(1)` has one entry for every
- * row and stands for no expression a query writes.  Nor is a binary-coercible
- * cast of a column one, `(v::text)` of a varchar v: stripped of its relabel it
- * is the bare column, which is a column already, not an expression the plan
- * can carry (lion_count_priv_decode() refuses it).  A multi-key column's
- * entries are keys, which answer only its own
- * operators (DESIGN.md §17), and a partial index needs its predicate.  Each
+ * each key column of a whole index - or of the partial one whose scope the
+ * count is planned in (DESIGN.md §45) - that is an expression and has a
+ * scalar opclass, whose entries are the expression's values, one per row,
+ * and that reads a column: an index on `(1)` has one entry for every row and
+ * stands for no expression a query writes.  Nor is a binary-coercible cast
+ * of a column one, `(v::text)` of a varchar v: stripped of its relabel it is
+ * the bare column, which is a column already, not an expression the plan can
+ * carry (lion_count_priv_decode() refuses it).  A multi-key column's entries
+ * are keys, which answer only its own operators (DESIGN.md §17), and any
+ * other partial index holds rows the count may not read.  Each
  * expression once, relabels stripped, in the order the indexes come: the
  * position is its LION_VCOL_ATTNO().  The planner's index expressions are
  * normalised as the query's clauses are - folded and fixed up the same way -
@@ -107,7 +108,8 @@ lion_vcol_collect(RelOptInfo *rel)
 		int			i;
 
 		if (idx->relam != amoid || idx->hypothetical ||
-			idx->indpred != NIL || idx->indexprs == NIL)
+			(idx->indpred != NIL && idx != lion_partial_index_of(rel)) ||
+			idx->indexprs == NIL)
 			continue;
 		for (i = 0; i < idx->nkeycolumns; i++)
 		{
@@ -376,6 +378,86 @@ lion_vcol_name(Oid relid, Node *vcol)
 }
 
 /*
+ * The key column (1-based) of lion index idx that answers column attno - or
+ * expression column vcol, when that is not NULL - with an opclass of the
+ * kind asked (multi-key or scalar), or 0.  ANY key column, not just the
+ * first (DESIGN.md §24).  INCLUDE columns (ncolumns > nkeycolumns) cannot
+ * happen - amcaninclude is false - but the loop is bounded by nkeycolumns
+ * anyway, because an INCLUDE column has no opclass to ask about.  An
+ * expression column has indexkeys[i] == 0, which no heap column's attno
+ * is, and answers only the expression column whose expression it is
+ * (DESIGN.md §41).
+ */
+static AttrNumber
+lion_index_key_col(IndexOptInfo *idx, AttrNumber attno, Node *vcol,
+				   bool multikey)
+{
+	int			i;
+
+	for (i = 0; i < idx->nkeycolumns; i++)
+	{
+		if (vcol != NULL ?
+			!equal(lion_index_col_expr(idx, i), vcol) :
+			idx->indexkeys[i] != attno)
+			continue;
+		if (lion_opfamily_is_multikey(idx->opfamily[i],
+									 idx->opcintype[i]) != multikey)
+			continue;
+		return (AttrNumber) (i + 1);
+	}
+	return 0;
+}
+
+/*
+ * The expression of expression column attno (DESIGN.md §41) in *vcolp, or
+ * NULL for a heap column; false when attno is neither, which no index
+ * answers.
+ */
+static bool
+lion_attno_vcol(AttrNumber attno, Node **vcolp)
+{
+	*vcolp = NULL;
+	if (LION_ATTNO_IS_VCOL(attno))
+	{
+		*vcolp = lion_vcol_expr(attno);
+		return *vcolp != NULL;
+	}
+	return attno > 0;			/* no expression's key column answers it */
+}
+
+/*
+ * The first WHOLE lion index of rel, in index order, with a key column for
+ * attno (lion_index_key_col()), and that column in *colp.
+ */
+static IndexOptInfo *
+lion_find_whole_index(RelOptInfo *rel, AttrNumber attno, Node *vcol,
+					  bool multikey, AttrNumber *colp)
+{
+	Oid			amoid = lion_get_am_oid();
+	ListCell   *lc;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		AttrNumber	col;
+
+		/*
+		 * `indpred`: a partial index holds only its predicate's rows, which
+		 * only a count planned inside its scope may read (DESIGN.md §45).
+		 */
+		if (idx->relam != amoid || idx->hypothetical || idx->indpred != NIL)
+			continue;
+		col = lion_index_key_col(idx, attno, vcol, multikey);
+		if (col != 0)
+		{
+			*colp = col;
+			return idx;
+		}
+	}
+	return NULL;
+}
+
+/*
  * A usable lion index on one plain column of rel, or NULL.  Only indexes
  * the planner put in rel->indexlist are considered, which already excludes
  * invalid ones (get_relation_info() skips !indisvalid).
@@ -392,68 +474,32 @@ lion_vcol_name(Oid relid, Node *vcol)
  * set of entries, so ANY of its columns will do and the rest of this file
  * carries that number beside the index; colp may be NULL for a caller that
  * only asks whether such an index exists.
+ *
+ * Inside the scope of a partial index (DESIGN.md §45, lion_plan_partial.c)
+ * rel's partial index is tried first, and the whole ones after it; no other
+ * partial index is ever taken.  An expression column (DESIGN.md §41) is
+ * answered by any key column whose expression is that one: the first, in
+ * index order, like a column.
  */
 IndexOptInfo *
 lion_find_roaring_index(RelOptInfo *rel, AttrNumber attno, bool multikey,
 					   AttrNumber *colp)
 {
-	Oid			amoid = lion_get_am_oid();
-	Node	   *vcol = NULL;
-	ListCell   *lc;
+	IndexOptInfo *part = lion_partial_index_of(rel);
+	Node	   *vcol;
+	AttrNumber	col = 0;
+	IndexOptInfo *idx;
 
-	/*
-	 * An expression column (DESIGN.md §41) is answered by any key column whose
-	 * expression is that one: the first, in index order, like a column.
-	 */
-	if (LION_ATTNO_IS_VCOL(attno))
-	{
-		vcol = lion_vcol_expr(attno);
-		if (vcol == NULL)
-			return NULL;
-	}
-	else if (attno <= 0)
-		return NULL;			/* no expression's key column answers it */
-
-	foreach(lc, rel->indexlist)
-	{
-		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
-		int			i;
-
-		if (idx->relam != amoid)
-			continue;
-		if (idx->hypothetical)
-			continue;
-		if (idx->indpred != NIL)
-			continue;
-
-		/*
-		 * ANY key column, not just the first (DESIGN.md §24).  INCLUDE columns
-		 * (ncolumns > nkeycolumns) cannot happen - amcaninclude is false - but
-		 * the loop is bounded by nkeycolumns anyway, because an INCLUDE column
-		 * has no opclass to ask about.
-		 *
-		 * An expression column has indexkeys[i] == 0, which no heap column's
-		 * attno is, and answers only the expression column whose expression
-		 * it is (DESIGN.md §41).  `indpred`: a partial index would need its
-		 * predicate applied, which this node does not do.
-		 */
-		for (i = 0; i < idx->nkeycolumns; i++)
-		{
-			if (vcol != NULL ?
-				!equal(lion_index_col_expr(idx, i), vcol) :
-				idx->indexkeys[i] != attno)
-				continue;
-			if (lion_opfamily_is_multikey(idx->opfamily[i],
-										 idx->opcintype[i]) != multikey)
-				continue;
-
-			if (colp != NULL)
-				*colp = (AttrNumber) (i + 1);
-			return idx;
-		}
-	}
-
-	return NULL;
+	if (!lion_attno_vcol(attno, &vcol))
+		return NULL;
+	if (part != NULL &&
+		(col = lion_index_key_col(part, attno, vcol, multikey)) != 0)
+		idx = part;
+	else
+		idx = lion_find_whole_index(rel, attno, vcol, multikey, &col);
+	if (idx != NULL && colp != NULL)
+		*colp = col;
+	return idx;
 }
 
 /*
@@ -636,21 +682,54 @@ lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
  * (`positions`) needs a column that stores positions, which decide it.
  *
  * Every partition is checked separately, because nothing stops one of them
- * from carrying a lion index built with a different opclass.
+ * from carrying a lion index built with a different opclass.  Inside the
+ * scope of a partial index (DESIGN.md §45) that index answers the clause
+ * when it can, and the first whole index with the column when it cannot.
  */
+static bool lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind,
+							   Oid opno, Oid cmptype, StrategyNumber strategy,
+							   Oid extractquery, Oid exprcoll,
+							   bool positions);
+
 IndexOptInfo *
 lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
 				Oid exprcoll, bool positions, AttrNumber *colp)
 {
 	bool		multikey = LION_CLAUSE_IS_MULTI(kind);
-	AttrNumber	col = 1;
-	IndexOptInfo *idx = lion_find_roaring_index(rel, attno, multikey, &col);
-	int			i;
+	IndexOptInfo *part = lion_partial_index_of(rel);
+	Node	   *vcol;
+	AttrNumber	col = 0;
+	IndexOptInfo *idx;
 
-	if (idx == NULL)
+	if (!lion_attno_vcol(attno, &vcol))
 		return NULL;
-	i = col - 1;				/* the KEY COLUMN's opclass (DESIGN.md §24) */
+	if (part != NULL &&
+		(col = lion_index_key_col(part, attno, vcol, multikey)) != 0 &&
+		lion_index_answers(part, col, kind, opno, cmptype, strategy,
+						   extractquery, exprcoll, positions))
+		idx = part;
+	else
+	{
+		idx = lion_find_whole_index(rel, attno, vcol, multikey, &col);
+		if (idx == NULL ||
+			!lion_index_answers(idx, col, kind, opno, cmptype, strategy,
+								extractquery, exprcoll, positions))
+			return NULL;
+	}
+	if (colp != NULL)
+		*colp = col;
+	return idx;
+}
+
+/* Does key column col of idx answer the clause (lion_match_index())? */
+static bool
+lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
+				   Oid cmptype, StrategyNumber strategy, Oid extractquery,
+				   Oid exprcoll, bool positions)
+{
+	bool		multikey = LION_CLAUSE_IS_MULTI(kind);
+	int			i = col - 1;	/* the KEY COLUMN's opclass (DESIGN.md §24) */
 
 	/*
 	 * The planner's own rule, IndexCollMatchesExprColl(): a collation-
@@ -664,21 +743,19 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	 */
 	if (OidIsValid(exprcoll) && OidIsValid(idx->indexcollations[i]) &&
 		idx->indexcollations[i] != exprcoll)
-		return NULL;
+		return false;
 
 	if (multikey)
 	{
 		if (get_op_opfamily_strategy(opno, idx->opfamily[i]) != strategy)
-			return NULL;
+			return false;
 		if (get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 							  idx->opcintype[i],
 							  LION_EXTRACTQUERY_PROC) != extractquery)
-			return NULL;
+			return false;
 		if (positions && !lion_index_stores_positions(idx, col))
-			return NULL;
-		if (colp != NULL)
-			*colp = col;
-		return idx;
+			return false;
+		return true;
 	}
 
 	/*
@@ -719,10 +796,10 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 	{
 		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
 														  idx->opfamily[i])))
-			return NULL;
+			return false;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 										  cmptype, LION_CMP_PROC)))
-			return NULL;
+			return false;
 	}
 	else if (kind == LION_CLAUSE_NE)
 	{
@@ -733,26 +810,24 @@ lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 		 * possible.
 		 */
 		if (get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_NE)
-			return NULL;
+			return false;
 	}
 	else if (OidIsValid(opno) &&
 			 get_op_opfamily_strategy(opno, idx->opfamily[i]) != LION_STRAT_EQUAL)
-		return NULL;
+		return false;
 
 	if (OidIsValid(cmptype))
 	{
 		if (!OidIsValid(get_opfamily_member(idx->opfamily[i],
 											idx->opcintype[i], cmptype,
 											LION_STRAT_EQUAL)))
-			return NULL;
+			return false;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], cmptype, cmptype,
 										  LION_HASH_PROC)))
-			return NULL;
+			return false;
 	}
 
-	if (colp != NULL)
-		*colp = col;
-	return idx;
+	return true;
 }
 
 /*

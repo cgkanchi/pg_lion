@@ -173,6 +173,40 @@ only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND t
 bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
+When every query of a workload carries the same few filters that keep most of the table - `WHERE
+active AND state = 'published' AND ...` - a partial index on them holds only those rows, and the
+count pushdown can read it (DESIGN.md §45):
+
+```sql
+CREATE INDEX events_current ON events USING lion (country, event_type, device)
+    WHERE active AND state = 'published';
+
+SELECT country, count(*) FROM events
+ WHERE active AND state = 'published' AND event_type = 'purchase' GROUP BY country;
+```
+
+```
+ Custom Scan (LionCount)
+   Lion Indexes: events_current.country (country), events_current.event_type (event_type = 'purchase'::text)
+   Implied by Index Predicate: active, (state = 'published'::text)
+   Group Key: country
+```
+
+The filters the predicate implies are left out of the count, as a partial index scan leaves them
+out (`Implied by Index Predicate`), and the other columns' sets are those of the predicate's rows
+alone, so there is less to read and nothing dense to intersect: on four million rows whose three
+default filters kept 77% of them, a count with one more filter took 0.2 ms against 0.47, a range
+2.4 ms against 28, and a `GROUP BY` 3.0 against 5.8. The query has to imply the predicate - a
+stronger condition does (`x > 20` under `WHERE x > 10`), a parameter of a generic plan usually
+does not - and the partial index is read only where every row the count reaches is one of its
+own: through a clause it answers that selects rows (`=`, `IN`, `IS NULL`, a range) or a walk of
+its entries (a `GROUP BY`, a `count(DISTINCT)`, the count of every row). A count that would have
+to take the rest from another index - `active AND state = 'published' AND region = 'eu'` with no
+`region` in the partial index - reads the whole index instead, and so does a query that leaves
+the predicate's filters out. A partial index made on a partitioned table is one per partition,
+and each partition reads its own (`Partial Indexes` in EXPLAIN). `pg_lion.enable_count_partial =
+off` turns this off.
+
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
 side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
