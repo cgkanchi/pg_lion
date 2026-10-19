@@ -20,7 +20,11 @@
  *		The ordered side may also be a lionvec index's order by distance from
  *		a vector (ORDER BY v <-> q, lion_vec.c, DESIGN.md §44.6): the set is
  *		built, and handed to the vector scan, which then reads and scores
- *		only its members.
+ *		only its members - or no set is built, and the vector scan is handed
+ *		the lion side's clauses instead, to test on the heap tuple of each
+ *		row it fetches for its exact distance (§44.6, "Filter at the
+ *		fetch"), dropping a row that fails there as the set would have
+ *		before.
  *
  *		When the btree returns every column the node must produce, the row's
  *		values come from the index tuple and the heap is visited only for
@@ -107,6 +111,29 @@ bool		lion_enable_ordered_scan = true;
 bool		lion_enable_btree_scan = true;
 bool		lion_enable_lazy_set = true;
 static double lion_ordered_switch_ratio = 32.0;
+
+/*
+ * pg_lion.vector_restrict (DESIGN.md §44.6, "Filter at the fetch"; §44.8):
+ * how LionOrdered restricts a lionvec scan to the rows its filter keeps -
+ * by the set, built before the scan's first row, or by the filter, tested
+ * on the heap tuple of each row the scan fetches - or both offered, at
+ * their prices.
+ */
+typedef enum LoVecRestrict
+{
+	LO_VEC_RESTRICT_AUTO,		/* both, the cheaper chosen (the default) */
+	LO_VEC_RESTRICT_SET,		/* the set alone, as before 2026-10-18 */
+	LO_VEC_RESTRICT_FILTER		/* the filter alone */
+} LoVecRestrict;
+
+static int	lion_vector_restrict = LO_VEC_RESTRICT_AUTO;
+
+static const struct config_enum_entry lo_vec_restrict_options[] = {
+	{"auto", LO_VEC_RESTRICT_AUTO, false},
+	{"set", LO_VEC_RESTRICT_SET, false},
+	{"filter", LO_VEC_RESTRICT_FILTER, false},
+	{NULL, 0, false}
+};
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
 /*
@@ -124,7 +151,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					is (LO_NODE_AND or LO_NODE_OR, number of children), a leaf
  *					(LO_NODE_LEAF, number of quals, their index columns ...);
  *					NIL when a lion column's walk has no set and every row it
- *					meets is fetched
+ *					meets is fetched, and for a lionvec order under its
+ *					filter (LO_FLAG_KNNFILTER), which reads no lion index
  *	LO_PRIV_LEAVES	OidList: each leaf's lion index, in preorder
  *	LO_PRIV_SORT	the path's pathkeys as sort keys over the relation's own
  *					columns, for the fetch-and-sort switch (§30.4): a List of
@@ -137,7 +165,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *	LO_PRIV_EXPECTED a float8 Const: the entries the planner expects the walk
  *					to visit (the ordered index's selectivity, or the walked
  *					range's, times the relation's tuples), for the switch's
- *					density gate (§40.4)
+ *					density gate (§40.4); under LO_FLAG_KNNFILTER the rows
+ *					it expects the lion qual to keep, which the vector scan
+ *					sizes its rows by (lion_vec_restrict_filter())
  *	LO_PRIV_LIMIT	an int8 Const: a lionvec order's (LO_FLAG_KNN), the rows
  *					its query level's LIMIT takes, OFFSET included, which the
  *					vector scan pauses by (lion_vec_scan_limit(), DESIGN.md
@@ -150,7 +180,8 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *						order (heap Vars; the executor substitutes INDEX_VAR)
  *	LO_EXPR_ORDQUALS	the ordered index's index quals, likewise
  *	LO_EXPR_LIONQUAL	the lion side's ORIGINAL qual (implicit AND), the
- *						recheck of an inexact set
+ *						recheck of an inexact set; under LO_FLAG_KNNFILTER
+ *						the filter the vector scan tests instead of a set
  *	LO_EXPR_ORDORIG		the ordered index's original clauses (implicit AND),
  *						the recheck when the index sets xs_recheck
  *	LO_EXPR_VALUEQUAL	a lion column's walk: the restriction clauses on the
@@ -286,6 +317,8 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
 #define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
 #define LO_FLAG_KNN			0x0020	/* the order is a lionvec index's (§44.6) */
+#define LO_FLAG_KNNFILTER	0x0040	/* ... restricted by the lion qual tested
+									 * at its fetch, not by a set (§44.6) */
 
 /*
  * The plan's custom_private as a C struct: lo_priv_decode() is its one
@@ -436,6 +469,10 @@ lo_priv_decode(List *priv, LoPriv *out)
 	if (out->limit != -1 &&
 		(out->limit <= 0 || (out->flags & LO_FLAG_KNN) == 0))
 		elog(ERROR, "LionOrdered: malformed LIMIT " INT64_FORMAT, out->limit);
+	if ((out->flags & LO_FLAG_KNNFILTER) != 0 &&
+		((out->flags & LO_FLAG_KNN) == 0 || out->tree != NIL ||
+		 out->leaves != NIL))
+		elog(ERROR, "LionOrdered: malformed filter of a lionvec order");
 }
 
 /* lo_priv_encode() without its check */
@@ -699,12 +736,16 @@ typedef struct LionOrderedState
 	/*
 	 * ... or a lionvec index's order by distance (DESIGN.md §44.6): its
 	 * ORDER BY key, whose run-time value is among ortkeys, and the set
-	 * handed to its scan after every rescan.
+	 * handed to its scan after every rescan - or, knnfilter, no set: the
+	 * lion qual (lionrecheck) handed to the scan instead, evaluated in
+	 * knncxt (§44.6, "Filter at the fetch").
 	 */
 	bool		knn;
 	ScanKey		obkeys;
 	int			nobkeys;
 	int64		knnlimit;		/* the rows its LIMIT takes, or -1 */
+	bool		knnfilter;
+	ExprContext *knncxt;
 
 	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
@@ -1294,6 +1335,48 @@ lo_lion_adds(Path *lion, List *ordclauses)
 	return false;
 }
 
+/* The entries the leaves of a lion access read (lion_cost_path_entries()). */
+static double
+lo_lion_entries(PlannerInfo *root, Path *lion)
+{
+	double		entries = 0.0;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+		return lion_cost_path_entries(root, (IndexPath *) lion);
+	foreach(lc, IsA(lion, BitmapAndPath) ?
+			((BitmapAndPath *) lion)->bitmapquals :
+			castNode(BitmapOrPath, lion)->bitmapquals)
+		entries += lo_lion_entries(root, (Path *) lfirst(lc));
+	return entries;
+}
+
+/*
+ * What copying the lion side's answer into the set costs, beyond its
+ * lookups and a cpu_operator_cost a container key (DESIGN.md §30.3, §44.7):
+ * each leaf's source hands the set a container for each entry it reads at
+ * each container key that entry's rows reach, and each is copied
+ * (lo_set_push()) and then sorted by key and ORed into the set
+ * (lo_set_finish()).  A range over a unique column brings about a piece a
+ * member: its summaries' buckets each hold rows from nearly every key of the
+ * heap.  So the pieces are min(members, entries x keys) - a 10% equality on
+ * a column the heap is ordered by brings a piece a key, the same filter as a
+ * range over a unique column one a member - each at LO_PROBE_TUPLES
+ * cpu_tuple_costs, the walk's 170 ns an entry: at 50M rows a 10% range on a
+ * unique double with summaries built 5M pieces in 845 ms, 170 ns each; at
+ * 5M rows the same filter's 500,000 members, 1.36 a piece, took 44 to 48
+ * ms, 90 ns a member.  Before 2026-10-18 nothing was charged for them, and
+ * that 10% filter's set at 50M rows was priced as its 1,220 summary entries
+ * and 260,417 keys alone: 650 for 845 ms.
+ */
+static Cost
+lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
+{
+	double		pieces = Min(members, lo_lion_entries(root, lion) * ncont);
+
+	return pieces * LO_PROBE_TUPLES * cpu_tuple_cost;
+}
+
 /*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
@@ -1333,7 +1416,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
 	/* the lookups, and the copy of their answer into the set */
-	startup = lioncost + ncont * cpu_operator_cost;
+	startup = lioncost + ncont * cpu_operator_cost +
+		lo_set_pieces(root, lion, members, ncont);
 
 	/* the walk: the ordered index's own cost, and the probe of each entry */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
@@ -1482,11 +1566,59 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
 	startup = lioncost + ncont * cpu_operator_cost +
+		lo_set_pieces(root, lion, members, ncont) +
 		lion_vec_scan_cost(ord->indexinfo, members);
 
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	run = members * (spc_random + cpu_index_tuple_cost + cpu_operator_cost +
 					 cpu_tuple_cost);
+
+	cost_qual_eval(&qcost, residual, root);
+	startup += qcost.startup + rel->reltarget->cost.startup;
+	run += members * qcost.per_tuple + rows * rel->reltarget->cost.per_tuple;
+
+	*startup_p = startup;
+	*total_p = startup + run;
+}
+
+/*
+ * The cost of the node over a lionvec index's order under its filter, with
+ * no set (DESIGN.md §44.6, "Filter at the fetch"; §44.7): no lookup and no
+ * copy, the lion access only saying how many members there are; the vector
+ * scan of the index's rows that probes as the restricted scan of the members
+ * would, estimates every row it walks and refines and fetches 1 / frac rows
+ * for each of its batch's members, testing the lion qual on each fetched
+ * (lion_vec_filter_cost()); and then, for every member it returns, at worst
+ * 1 / frac refines and fetches, each tested - the table's rows over all
+ * the members - and the node's own fetch of that row and its quals.  The
+ * set's price grows with the members, this one with the rows a member costs.
+ */
+static void
+lo_cost_knn_filter(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
+				   Path *lion, List *lionqual, List *residual, double rows,
+				   Cost *startup_p, Cost *total_p)
+{
+	Cost		lioncost;
+	Selectivity sel;
+	double		tuples = Max(rel->tuples, 1.0);
+	double		members;
+	double		fetched;
+	double		spc_random;
+	double		spc_seq;
+	QualCost	fcost;
+	QualCost	qcost;
+	Cost		startup;
+	Cost		run;
+
+	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	members = clamp_row_est(sel * tuples);
+	cost_qual_eval(&fcost, lionqual, root);
+	startup = lion_vec_filter_cost(ord->indexinfo, members, &fetched) +
+		fcost.startup + fetched * fcost.per_tuple;
+
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	run = tuples * (spc_random + cpu_index_tuple_cost + fcost.per_tuple) +
+		members * cpu_tuple_cost;
 
 	cost_qual_eval(&qcost, residual, root);
 	startup += qcost.startup + rel->reltarget->cost.startup;
@@ -2955,17 +3087,39 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				if (lo_knn_others(residual, ord->indexinfo) != NIL &&
 					lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 					continue;
-				/* a lionvec index returns no values: heap mode (§44.6) */
-				lo_cost_knn(root, rel, ord, lion, residual, rows,
-							&startup, &total, &setbytes);
-				if (setbytes > (double) limit)
+
+				/*
+				 * The scan restricted to the set, unless
+				 * pg_lion.vector_restrict is filter; and to the lion qual
+				 * tested at its fetch, which needs no set and so no
+				 * hash_mem, unless it is set.  add_path() takes the cheaper
+				 * (§44.6, "Filter at the fetch").  A lionvec index returns
+				 * no values: heap mode (§44.6).
+				 */
+				if (lion_vector_restrict != LO_VEC_RESTRICT_FILTER)
 				{
-					lo_knn_why(knn, LO_KNN_MEMORY);
-					continue;
+					lo_cost_knn(root, rel, ord, lion, residual, rows,
+								&startup, &total, &setbytes);
+					if (setbytes > (double) limit)
+						lo_knn_why(knn, LO_KNN_MEMORY);
+					else
+					{
+						lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
+									list_make3(ord, lion, NIL), rows,
+									startup, total);
+						knn->offered++;
+					}
 				}
-				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
-							list_make3(ord, lion, NIL), rows, startup, total);
-				knn->offered++;
+				if (lion_vector_restrict != LO_VEC_RESTRICT_SET)
+				{
+					lo_cost_knn_filter(root, rel, ord, lion, lionqual,
+									   residual, rows, &startup, &total);
+					lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
+								list_make4(ord, lion, NIL,
+										   makeInteger(LO_FLAG_KNNFILTER)),
+								rows, startup, total);
+					knn->offered++;
+				}
 				continue;
 			}
 
@@ -3288,7 +3442,10 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 		/*
 		 * A lionvec index's order (DESIGN.md §44.6): its ORDER BY clause, and
-		 * the set built at once, for the scan to be restricted to.
+		 * the set built at once, for the scan to be restricted to - or, the
+		 * path's fourth member says (lo_set_rel_pathlist()), no set, and the
+		 * lion qual for the scan to test at its fetch instead (§44.6,
+		 * "Filter at the fetch").
 		 */
 		if (lo_knn_path(ord))
 		{
@@ -3297,7 +3454,22 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 					 linitial_int(ord->indexorderbycols));
 			orderbys = ord->indexorderbys;
 			dir = (int) ForwardScanDirection;
-			flags |= LO_FLAG_KNN | LO_FLAG_BUILD;
+			if (list_length(best_path->custom_private) == 4 &&
+				intVal(lfourth(best_path->custom_private)) == LO_FLAG_KNNFILTER)
+			{
+				Cost		lioncost;
+				Selectivity sel;
+
+				/*
+				 * Under its filter, the rows the planner expects it to keep,
+				 * which the scan sizes its rows by (lion_vec_restrict_filter())
+				 */
+				flags |= LO_FLAG_KNN | LO_FLAG_KNNFILTER;
+				cost_bitmap_tree_node(lion, &lioncost, &sel);
+				expected = clamp_row_est(sel * rel->tuples);
+			}
+			else
+				flags |= LO_FLAG_KNN | LO_FLAG_BUILD;
 
 			/*
 			 * The rows its query level's LIMIT takes, OFFSET included, when
@@ -3355,6 +3527,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * share of its walk a LIMIT on the node alone lets it go, and the entries
 	 * that comes to.
 	 */
+	if ((flags & LO_FLAG_KNNFILTER) == 0)
 	{
 		double		share = 1.0;
 
@@ -3367,12 +3540,20 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			flags |= LO_FLAG_BUILD;
 	}
 
+	/*
+	 * The lion side: its tree, for the set; under its filter only its qual,
+	 * tested on each heap tuple, which no lossy index clause makes inexact,
+	 * and no lion index read.
+	 */
 	if (lion != NULL)
 	{
 		lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
-		lo_lion_tree(lion, &tree, &leaves, &lionquals);
-		if (lossy)
-			flags |= LO_FLAG_LOSSY;
+		if ((flags & LO_FLAG_KNNFILTER) == 0)
+		{
+			lo_lion_tree(lion, &tree, &leaves, &lionquals);
+			if (lossy)
+				flags |= LO_FLAG_LOSSY;
+		}
 	}
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
@@ -4538,6 +4719,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->indexonly = (priv.flags & LO_FLAG_INDEXONLY) != 0;
 	st->lionheaprecheck = (priv.flags & LO_FLAG_HEAPRECHECK) != 0;
 	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
+	st->knnfilter = (priv.flags & LO_FLAG_KNNFILTER) != 0;
 	st->knnlimit = priv.limit;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
@@ -4551,7 +4733,9 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	orderbys = (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDERBYS);
 	if (st->knn ?
 		(list_length(orderbys) != 1 || st->lionwalk || st->indexonly ||
-		 !ScanDirectionIsForward(st->dir) || tree == NIL) :
+		 !ScanDirectionIsForward(st->dir) || (tree == NIL) != st->knnfilter ||
+		 (st->knnfilter &&
+		  list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL) == NIL)) :
 		orderbys != NIL)
 		elog(ERROR, "LionOrdered: malformed order by distance");
 
@@ -4574,8 +4758,15 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 
 	st->nleaves = list_length(leafoids);
 	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * Max(st->nleaves, 1));
+
+	/*
+	 * No set for a lion column's walk without one, whose clauses are its
+	 * filter, nor for a lionvec order under its filter, whose scan tests
+	 * the lion qual (lionrecheck) on every row it fetches (§44.6, "Filter at
+	 * the fetch"): the node does not test it again.
+	 */
 	st->noset = (tree == NIL);
-	if (st->noset && !st->lionwalk)
+	if (st->noset && !st->lionwalk && !st->knnfilter)
 		elog(ERROR, "LionOrdered: a btree's walk without a lion set");
 	if (!st->noset)
 	{
@@ -4661,6 +4852,22 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 													  0)),
 							   true, &st->obkeys, &st->nobkeys,
 							   &st->ortkeys, &st->nortkeys, NULL, NULL);
+
+		/*
+		 * Under its filter, the scan evaluates the lion qual on its own slot
+		 * of the table AM's type (lion_vec_restrict_filter()), which the
+		 * qual, initialised on the scan slot, must have been initialised
+		 * for: its Vars are read by that slot type's deform.  An
+		 * ExprContext of its own, which the scan resets for each row, its
+		 * Params read through the EState as the node's own are.
+		 */
+		if (st->knnfilter)
+		{
+			if (node->ss.ss_ScanTupleSlot->tts_ops !=
+				table_slot_callbacks(node->ss.ss_currentRelation))
+				elog(ERROR, "LionOrdered: the scan slot is not the table's type");
+			st->knncxt = CreateExprContext(estate);
+		}
 	}
 	if (st->indexonly)
 	{
@@ -5001,18 +5208,24 @@ lo_start_walk(LionOrderedState *st)
 	index_rescan(st->scan, st->okeys, st->nokeys, st->obkeys, st->nobkeys);
 
 	/*
-	 * A lionvec scan reads and scores only the set's members (§44.6), and
-	 * pauses and gathers by the rows the LIMIT takes (§44.4); every rescan
-	 * forgets both, and a rebuilt set has moved.
+	 * A lionvec scan reads and scores only the set's members (§44.6), or
+	 * tests the lion qual on the rows it fetches ("Filter at the fetch"),
+	 * and pauses and gathers by the rows the LIMIT takes (§44.4); every
+	 * rescan forgets all of it, and a rebuilt set has moved.  The qual reads
+	 * this scan's Params when it is evaluated.
 	 */
-	if (st->knn)
+	if (st->knn && st->knnfilter)
+		lion_vec_restrict_filter(st->scan, st->lionrecheck, st->knncxt,
+								 st->expectwalk);
+	else if (st->knn)
 	{
 		if (st->set == NULL)
 			elog(ERROR, "LionOrdered: a lionvec order without its set");
 		lion_vec_restrict(st->scan, st->set->n, st->set->keys,
 						  st->set->conts);
-		lion_vec_scan_limit(st->scan, st->knnlimit);
 	}
+	if (st->knn)
+		lion_vec_scan_limit(st->scan, st->knnlimit);
 	st->scans++;
 	st->started = true;
 	st->done = false;
@@ -5649,8 +5862,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_ORDERBYS),
 					"Order By", ancestors, es);
+	/* a lionvec order under its filter: the qual its scan tests (§44.6) */
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
-					"Lion Cond", ancestors, es);
+					st->knnfilter ? "Lion Filter" : "Lion Cond", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_VALUEQUAL),
 					"Filter per Value", ancestors, es);
@@ -5698,6 +5912,10 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			ExplainPropertyInteger("Lion Set Hits", NULL, (int64) st->hits,
 								   es);
 		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
+		if (st->knnfilter)
+			ExplainPropertyInteger("Rows Removed by Lion Filter", NULL,
+								   st->scan != NULL ?
+								   lion_vec_filter_removed(st->scan) : 0, es);
 		/* a node that never made its set has no exactness to report */
 		if (st->removed > 0 ||
 			((st->builds > 0 || st->lazykeys > 0) && !st->exact))
@@ -5796,6 +6014,26 @@ lion_ordered_init(void)
 							 "Off, the set is built for the whole table before the walk starts.",
 							 &lion_enable_lazy_set,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §44.6, "Filter at the fetch": how LionOrdered restricts a
+	 * lionvec scan - set, its set built before the first row, as before
+	 * 2026-10-18; filter, the lion qual tested by the scan on each row it
+	 * fetches; auto, both priced - for comparing the two, and for the tests
+	 * that pin either.
+	 */
+	DefineCustomEnumVariable("pg_lion.vector_restrict",
+							 "How LionOrdered restricts a lionvec scan to the rows a lion filter keeps.",
+							 "set builds the filter's set of rows before the scan's first row, and the "
+							 "scan reads and scores only them; filter builds none, and the scan tests "
+							 "the filter on each row it fetches for its exact distance, dropping one "
+							 "that fails; auto offers both and lets the planner choose by cost.",
+							 &lion_vector_restrict,
+							 LO_VEC_RESTRICT_AUTO,
+							 lo_vec_restrict_options,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);

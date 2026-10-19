@@ -24,6 +24,12 @@ SET max_parallel_workers_per_gather = 0;
 SET pg_lion.vector_epsilon = 6;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
+-- The node restricts the scan by lion's set unless said otherwise below: the
+-- tests from before the filter at the fetch (2026-10-18) are the set's, and
+-- pinned to it so that the flavour pg_lion.vector_restrict = auto would price
+-- lower does not change what they test.  The filter's own tests below set it,
+-- compare the two, and ask auto which it plans.
+SET pg_lion.vector_restrict = set;
 
 CREATE FUNCTION vf_vec(seed bigint, n int, scale float8 DEFAULT 1.0)
 RETURNS vector LANGUAGE sql IMMUTABLE AS $$
@@ -209,6 +215,171 @@ SELECT vf_ord('SELECT q.id, (SELECT sum(id) FROM (SELECT id FROM vf
 									ORDER BY v <-> q.v LIMIT 5) s)::float8 AS d
 				 FROM vf q WHERE q.id BETWEEN 100 AND 140 ORDER BY q.id');
 
+-- Filter at the fetch (DESIGN.md §44.6, 2026-10-18): the node's other flavour
+-- builds no set, and hands the vector scan the lion clauses instead, which it
+-- tests on the heap tuple of each row it fetches for its exact distance,
+-- dropping a row that fails as the set drops it before its estimate.
+-- pg_lion.vector_restrict pins either flavour; under auto, the default, both
+-- are offered and the cheaper planned.
+
+/*
+ * vf_both() runs q - which returns columns id and d, ORDER BY d - through the
+ * node under each flavour, the set's and then the filter's, compares the two
+ * answers as vf_ord() compares the node's with the ordinary plan's, and says
+ * which flavour each plan was: EXPLAIN's "Lion Cond" (the set) or "Lion
+ * Filter".
+ */
+CREATE FUNCTION vf_both(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	m text;
+	kind text;
+	kinds text[] := '{}';
+	d text[];
+	ids int[];
+	ad text[];
+	ai int[];
+	restrict text := current_setting('pg_lion.vector_restrict');
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_tidscan', 'off', true);
+	FOREACH m IN ARRAY ARRAY['set', 'filter'] LOOP
+		PERFORM set_config('pg_lion.vector_restrict', m, true);
+		kind := 'no LionOrdered';
+		FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+			IF ln ~ '^\s*Lion Cond:' THEN
+				kind := 'set';
+			ELSIF ln ~ '^\s*Lion Filter:' THEN
+				kind := 'filter';
+			END IF;
+		END LOOP;
+		kinds := kinds || kind;
+		d := '{}';
+		ids := '{}';
+		FOR r IN EXECUTE q LOOP
+			d := d || coalesce(round(r.d::numeric, 4)::text, 'NULL');
+			IF r.d IS NOT NULL THEN
+				ids := ids || r.id;
+			END IF;
+		END LOOP;
+		IF m = 'set' THEN
+			ad := d;
+			ai := ids;
+		END IF;
+	END LOOP;
+	PERFORM set_config('pg_lion.vector_restrict', restrict, true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_tidscan', 'on', true);
+
+	IF ad IS DISTINCT FROM d THEN
+		RETURN format('MISMATCH: %s rows through the set, %s through the filter; distances %s / %s',
+					  coalesce(array_length(ad, 1), 0), coalesce(array_length(d, 1), 0),
+					  ad[1:3], d[1:3]);
+	END IF;
+	IF (SELECT array_agg(x ORDER BY x) FROM unnest(ai) x) IS DISTINCT FROM
+	   (SELECT array_agg(x ORDER BY x) FROM unnest(ids) x) THEN
+		RETURN 'MISMATCH: other rows at the same distances';
+	END IF;
+	RETURN format('%s / %s, %s rows', kinds[1], kinds[2],
+				  coalesce(array_length(d, 1), 0));
+END $$;
+
+-- the same rows from both, every metric under each kind of filter, at any
+-- LIMIT: the zero vectors (cosine: NaN) and the NULL rows after the rest,
+-- each walk's rows tested by the filter too
+SELECT op, f, k,
+	   vf_both(format('SELECT id, v %s (SELECT v FROM vf WHERE id = 17) AS d FROM vf
+					   WHERE %s ORDER BY v %s (SELECT v FROM vf WHERE id = 17) %s',
+					  op, f, op, k)) AS result
+  FROM vf_cases ORDER BY op, f, k;
+-- the zero vector (cosine: NaN for every row) and a NULL query vector (NULL
+-- for every row): only the walks, which return a member only
+SELECT vf_both(format('SELECT id, v <=> %L::vector AS d FROM vf WHERE grp = 5
+					   ORDER BY v <=> %L::vector',
+					  array_fill(0, ARRAY[24])::real[]::vector,
+					  array_fill(0, ARRAY[24])::real[]::vector));
+SELECT vf_both('SELECT id, v <-> (SELECT v FROM vf WHERE id = 211) AS d FROM vf
+				WHERE tag < 10 ORDER BY v <-> (SELECT v FROM vf WHERE id = 211) LIMIT 50');
+
+-- the two plans: the filter's names no lion index, and reads none
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET pg_lion.vector_restrict = set;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 7 OR cat = 4 ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
+SET pg_lion.vector_restrict = filter;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 7 OR cat = 4 ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
+-- a clause the vector index's own column answers stays the node's Filter
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag < 30 AND v IS NOT NULL ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
+-- auto prices both and plans the cheaper: on these 10,000 rows the set,
+-- whose members cost little to collect, even under the filter that keeps nine
+-- rows in ten (a set that would not fit hash_mem leaves auto the filter:
+-- vfn's, below)
+SET pg_lion.vector_restrict = auto;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE tag = 3 ORDER BY v <-> vf_vec(1, 24) LIMIT 10;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vf WHERE cat <> 5 ORDER BY v <-> vf_vec(1, 24) LIMIT 10;
+SET pg_lion.vector_restrict = filter;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+-- and what it did: the rows the filter removed, at the fetch of their exact
+-- distances or as a walk met them, which the node never saw
+SELECT * FROM vf_run('SELECT id FROM vf WHERE tag < 30 ORDER BY v <-> vf_vec(1, 24) LIMIT 5');
+SELECT * FROM vf_run('SELECT id FROM vf WHERE grp = 5 ORDER BY v <=> vf_vec(0, 24, 0.0)');
+
+-- a generic plan's Params, the filter's and the vector, read where the scan
+-- evaluates the filter
+PREPARE vff(int, vector) AS
+	SELECT id, v <-> $2 AS d FROM vf WHERE tag = $1 ORDER BY v <-> $2 LIMIT 10;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) EXECUTE vff(3, vf_vec(1, 24));
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+SELECT vf_ord('EXECUTE vff(3, vf_vec(1, 24))',
+			  'SELECT id, v <-> vf_vec(1, 24) AS d FROM vf WHERE tag = 3
+			   ORDER BY v <-> vf_vec(1, 24) LIMIT 10');
+SELECT vf_ord('EXECUTE vff(42, vf_vec(2, 24))',
+			  'SELECT id, v <-> vf_vec(2, 24) AS d FROM vf WHERE tag = 42
+			   ORDER BY v <-> vf_vec(2, 24) LIMIT 10');
+RESET plan_cache_mode;
+DEALLOCATE vff;
+
+-- rescans, the filter handed to the scan again after each: a correlated
+-- subquery, and a LATERAL subquery under a nested loop, each outer row with a
+-- filter and a vector of its own
+SELECT vf_ord('SELECT q.id, (SELECT sum(id) FROM (SELECT id FROM vf
+									WHERE cat = q.cat AND tag <> q.tag
+									ORDER BY v <-> q.v LIMIT 5) s)::float8 AS d
+				 FROM vf q WHERE q.id BETWEEN 100 AND 140 ORDER BY q.id');
+-- (the sort off, not the scans: a scan switched off is the outer side's
+-- only plan, and 18 says so under it)
+SET enable_sort = off;
+EXPLAIN (COSTS OFF)
+SELECT q.id, s.id FROM vf q,
+	   LATERAL (SELECT id FROM vf WHERE cat = q.cat AND tag < 50
+				ORDER BY v <-> q.v LIMIT 3) s
+ WHERE q.id IN (101, 102, 103);
+RESET enable_sort;
+SELECT vf_ord('SELECT q.id * 100000 + s.id AS id, s.d FROM vf q,
+					  LATERAL (SELECT id, v <-> q.v AS d FROM vf
+								WHERE cat = q.cat AND tag < 50
+								ORDER BY v <-> q.v LIMIT 3) s
+				WHERE q.id BETWEEN 100 AND 130 ORDER BY q.id, s.d');
+SELECT * FROM vf_run('SELECT q.id, s.id FROM vf q,
+						  LATERAL (SELECT id FROM vf WHERE cat = q.cat AND tag < 50
+								   ORDER BY v <-> q.v LIMIT 3) s
+					 WHERE q.id IN (101, 102, 103)');
+SET pg_lion.vector_restrict = set;
+
 -- a set that outgrows hash_mem at run time degrades to its container keys,
 -- and every member is rechecked (DESIGN.md §30.4): planned at 64MB (a
 -- generic plan keeps it), run at 64kB.  Half of vfn's 400,000 rows, 65 to a
@@ -227,6 +398,22 @@ SELECT i, ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int,
 CREATE INDEX vfn_l2 ON vfn USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX vfn_c2 ON vfn USING lion (c2);
 VACUUM (FREEZE, ANALYZE) vfn;
+-- planned at 64kB, the set would not fit, and is no plan: under set the
+-- query fails (pg_lion.vector_postfilter's default), and auto plans the
+-- filter at the fetch, which needs no hash_mem (DESIGN.md §44.6, "Filter at
+-- the fetch")
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vfn WHERE c2 = 1 ORDER BY v <-> '[0.5,-0.25,0.125]' LIMIT 10;
+SET pg_lion.vector_restrict = auto;
+EXPLAIN (COSTS OFF)
+SELECT id FROM vfn WHERE c2 = 1 ORDER BY v <-> '[0.5,-0.25,0.125]' LIMIT 10;
+SET pg_lion.vector_restrict = set;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET hash_mem_multiplier;
+RESET work_mem;
 SET work_mem = '64MB';
 SET plan_cache_mode = force_generic_plan;
 PREPARE vfd(int) AS
@@ -340,6 +527,13 @@ SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+-- under its filter the scan never computes every member's distance, which
+-- needs their list: it probes, and its line counts the rows the filter
+-- removed (DESIGN.md §44.6, "Filter at the fetch")
+SET pg_lion.vector_restrict = filter;
+SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 10
+					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
+SET pg_lion.vector_restrict = set;
 SET pg_lion.vector_exact_per_partition = 10;
 SELECT count(*) FROM (SELECT id FROM vfb WHERE s < 200
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10) s;
@@ -450,6 +644,23 @@ SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5
 	   AS "most of the nearest"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
  GROUP BY op ORDER BY op;
+-- and under the filter at the fetch, which probes as the set's scan does but
+-- tells the members only as it fetches them, its tiers and patience counted
+-- in rows (DESIGN.md §44.6, "Filter at the fetch")
+SET pg_lion.vector_restrict = filter;
+SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE cat <> 5
+								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
+								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
+	   AS "most of the nearest"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
+ GROUP BY op ORDER BY op;
+SELECT op, avg(vf_recall(format('SELECT id FROM vf WHERE tag < 30
+								  ORDER BY v %s vf_vec(-%s, 24) + vf_vec(%s, 24, 0.3)
+								  LIMIT 10', op, s % 10 + 1, s + 20000))) >= 0.9
+	   AS "most of the nearest"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op), generate_series(1, 20) s
+ GROUP BY op ORDER BY op;
+SET pg_lion.vector_restrict = set;
 
 -- a restricted scan that pauses at once, every partition within its margin
 -- and its patience one partition's members (a unit is the members of one
@@ -469,6 +680,16 @@ SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x
   FROM (SELECT array_agg(d) AS a
 		  FROM (SELECT v <-> vf_vec(4, 24) AS d FROM vf WHERE cat <> 5
 				 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000) l) s;
+-- the same under the filter, whose pause comes on rows, members or not
+SET pg_lion.vector_restrict = filter;
+SELECT count(*) FILTER (WHERE ln ~ 'LionOrdered') AS "through the node",
+	   count(*) FILTER (WHERE ln ~ '^\s*Lion Filter:') AS "its filter"
+  FROM vf_run('SELECT id FROM vf WHERE cat <> 5 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000') ln;
+SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x) AS "in order"
+  FROM (SELECT array_agg(d) AS a
+		  FROM (SELECT v <-> vf_vec(4, 24) AS d FROM vf WHERE cat <> 5
+				 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000) l) s;
+SET pg_lion.vector_restrict = set;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
@@ -516,12 +737,19 @@ END $$;
 
 -- each member once, though it is in two partitions: under filters that
 -- probe (9,000 and 2,500 members), past the members' count, at the default
--- margin and patience and at the tests'
+-- margin and patience and at the tests'; by the set, and by the filter
 SELECT op, f, vf_unique(format('SELECT id FROM vf WHERE %s ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
 							   f, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
 	   (VALUES ('cat <> 5'), ('tag < 25')) f(f)
  ORDER BY op, f;
+SET pg_lion.vector_restrict = filter;
+SELECT op, f, vf_unique(format('SELECT id FROM vf WHERE %s ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							   f, op)) AS result
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op),
+	   (VALUES ('cat <> 5'), ('tag < 25')) f(f)
+ ORDER BY op, f;
+SET pg_lion.vector_restrict = set;
 -- (at the defaults a pause skips the few rows it finds too late, §44.4)
 RESET pg_lion.vector_margin;
 RESET pg_lion.vector_patience;
@@ -529,6 +757,12 @@ SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_v
 							op)) ~ '^LionOrdered: (\d+) rows, \1 distinct; ordinary: (\d+) rows, \2 distinct$'
 	   AS "each once"
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+SET pg_lion.vector_restrict = filter;
+SELECT op, vf_unique(format('SELECT id FROM vf WHERE cat <> 5 ORDER BY v %s vf_vec(4, 24) LIMIT 20000',
+							op)) ~ '^LionOrdered: (\d+) rows, \1 distinct; ordinary: (\d+) rows, \2 distinct$'
+	   AS "each once"
+  FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
+SET pg_lion.vector_restrict = set;
 SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 0;
 

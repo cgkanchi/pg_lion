@@ -2037,6 +2037,9 @@ extern bool lion_rel_is_unexpanded_parent(struct RangeTblEntry *rte);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);
+/* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
+extern double lion_cost_path_entries(struct PlannerInfo *root,
+									 struct IndexPath *path);
 extern bool lion_enable_plain_scan;	/* GUC pg_lion.enable_plain_scan */
 
 /*
