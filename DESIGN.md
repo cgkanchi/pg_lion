@@ -20615,23 +20615,28 @@ page that holds no member (§44.6).
   rows as half of `maintenance_work_mem` holds as 8-bit codes (rotated, not centred - the mean is
   not known yet - a percent off the floats, which k-means does not notice), at most 2^24
   (`LIONVEC_SAMPLE_MAX`; 2^20 until the regions, below). The
-  number of partitions C is the `partitions` reloption's, or else 1 below 10,000 rows and `8
-  sqrt(n)` above (`LIONVEC_PARTS_PER_ROOT`: 8,000 for a million rows, 2,715 for DBpedia's
-  115,186), at most a sixteenth of the sample, never more than its rows, and 0 for an empty table.
+  number of partitions C (`lionvec_parts()`, lion_vec_math.h) is the `partitions` reloption's, or
+  else 1 below 10,000 rows and `8 sqrt(n)` above (`LIONVEC_PARTS_PER_ROOT`: 8,000 for a million
+  rows, 2,715 for DBpedia's 115,186), at most a sixteenth of the sample, never more than its rows,
+  and 0 for an empty table.
   It was `2 sqrt(n)` (1,974 for the benchmark's 975,000) until DBpedia (§44.9): partitions a
   quarter the size read 1.55 to 1.78 times fewer rows for a recall in the numpy model, and on the
   index 1.5 times fewer CODE pages for 0.95 of the true ten, which is the direction a billion rows
   needs (§44.11), though at 115,186 rows no faster. The sixteenth means the default needs a sample
   of `128 sqrt(n)` rows, 1,540 bytes each at 1536 dimensions, so `maintenance_work_mem` of 2 x 1,540
-  x 128 sqrt(n) bytes: 376 MB for a million rows. The default 64 MB holds 21,788 rows and so caps
-  any table of more than 28,900 such rows at 1,361 partitions (at `2 sqrt(n)`, more than 463,000);
-  1 GB holds 348,617, 44 a partition at a million rows, about the 42 the numpy model trained on
-  with every row; every row of a million takes 2.9 GB. A sample row is `dimsp + 4` bytes (its
+  x 128 sqrt(n) bytes: 376 MB for a million rows. The default 64 MB holds 21,788 rows, a sixteenth
+  of them 1,361 partitions, which a table of 28,986 such rows outgrows: a build whose sample has
+  rows for fewer partitions than a sample of every row would make fails, at the first row that
+  makes it so, naming the `maintenance_work_mem` that would hold enough, unless
+  `pg_lion.vector_build_sample` is `allow` (§44.8). 1 GB holds 348,617, 44 a partition at a
+  million rows, about the 42 the numpy model trained on with every row, and enough to 7,418,133
+  rows; every row of a million takes 2.9 GB. A sample row is `dimsp + 4` bytes (its
   codes and its scale), so the cap of 2^24 rows is 25.8 GB at 1536 dimensions, reached at a
   `maintenance_work_mem` of 52 GB; it is 64 rows a partition at `LIONVEC_MAX_PARTS` (262,144, §44.8),
   and the sixteenth binds only past 2^20 partitions, so the default is `8 sqrt(n)` up to that
   ceiling, which it reaches at 1.07 billion rows. A billion rows want 252,982 partitions, at least
-  4.05 million sample rows (6.2 GB, a `maintenance_work_mem` of 12.5 GB) to be given them, and
+  4.05 million sample rows (6.2 GB, a `maintenance_work_mem` of 12.5 GB, 11,890 MB as the
+  build's error rounds it) to be given them, and
   the cap's 2^24, 66 a partition, with 52 GB. (The cap was 2^20 rows, 3 GB, and the ceiling 65,536
   partitions, which then held every table of more than 67 million rows - a billion's 15,000 rows a
   partition.) **k-means' share** of the sample is at most 128 rows a partition
@@ -21381,9 +21386,11 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   partitions, and the REFINE items of its candidates.
 - **Build**: two heap scans. The first computes the mean (its rows normalized for cosine) and
   takes the sample, from which k-means finds the centroids (§44.3), whose REFINE items are the
-  first written. The second writes each row's REFINE item in place and puts its CODE item into a
-  tuplesort (`maintenance_work_mem`) keyed by its group - its partition, then the REST and NULL
-  chains - and its TID, from which the CODE chains are written in one run of blocks, each group
+  first written; it fails the build at the first row with which the rows so far want more
+  partitions than the sample has rows for (`pg_lion.vector_build_sample`, §44.8). The second
+  writes each row's REFINE item in place and puts its CODE item into a tuplesort
+  (`maintenance_work_mem`) keyed by its group - its partition, then the REST and NULL chains - and
+  its TID, from which the CODE chains are written in one run of blocks, each group
   starting a page, and each partition's count, spread and longest row summed in that order; then
   the PART chain, then the meta page. In an index that
   spills the sort holds two items a row, the copy under its second partition's group, so it is
@@ -21932,6 +21939,42 @@ could have lost to; LionOrdered's paths are serial.
   index's own, of the vector column alone (`v IS NOT NULL`, a distance bound; 2026-10-17), are no
   filter here. A table with row-level security lionvec refuses under every value (§44.6,
   "Row-level security").
+- `pg_lion.vector_build_sample` (enum, `error` or `allow`, default `error`; 2026-10-19): what a
+  build does when its sample has rows for fewer partitions than the table's rows want - fewer than
+  a sample of every row would make (`lionvec_parts_short()`, lion_vec_math.h). The build chooses
+  its partitions from a reservoir of what half of `maintenance_work_mem` holds, and makes no more
+  than the reservoir has rows for: 16 a partition it chooses by itself, one a partition the
+  `partitions` option asks for (§44.3). Were that all, the partitions would follow a memory
+  setting, unseen: at the default 64 MB a table of more than 28,985 rows of 1536 dimensions would
+  get 1,361 partitions whatever its size - a billion rows, which want 252,982, 734,000 rows each -
+  and a `partitions` of 30,000 over 40,000 rows 21,788, with only the DEBUG1 line to say so; and
+  the partitions decide which rows a scan reads at a margin (§44.4), so the answers would follow it
+  too. `error`: the build fails in its first pass, at the first row with which the rows counted so
+  far want more partitions than the full reservoir has rows for. With the reservoir's size fixed, a
+  count of rows that is short stays short as the rows grow - the partitions made stop at what the
+  reservoir allows, and those wanted only grow - which the unit tests check over every count to
+  200,000 and every 0.05% from there to 4 billion, so the table's rows would be short too and the
+  error is never wrong; and it comes before the rest of the first pass, k-means and the second
+  pass, the build's other 98% (§44.12): at 64 MB a billion rows of 1536 dimensions fail at the
+  28,986th. A parallel build's first pass is the leader's alone, so it fails before its parallel
+  context is set up. The message names the partitions wanted, those the sample has rows for, and
+  the `maintenance_work_mem` whose reservoir would make them all - the rows
+  `lionvec_parts_sample()` says, at `lionvec_sample_mem()`, rounded up to a megabyte; a kilobyte
+  less than the unrounded figure is short (vector_build_sample.sql). For a pass that stops before
+  the table's end those are for the rows it reckons the table holds (`lionvec_build_rows_about()`:
+  the rows counted times the heap's blocks over those read, which it reads in order from the first,
+  "About" in the message), so that the setting named is for the table and not for the rows read: on
+  40,000 rows of 1536 dimensions at 64 MB the build failed in 1.0 s at the 28,986th row, reckoning
+  39,954 and naming 76 MB, where building the 1,361 partitions took 10.2 s and the 1,600 at 76 MB
+  11.7 s (75 MB failed, its sample having rows for 1,595). A table whose rows are not spread evenly
+  over its blocks may be reckoned low, and then fails again at the setting named, later in the pass
+  and reckoned better. `allow`: the partitions the sample has rows for, with a NOTICE that counts
+  the rows and names the same `maintenance_work_mem`. Under neither does a build fail for what no
+  memory changes: a table of fewer than 10,000 rows has one partition however few of them the
+  sample holds, and a `partitions` above the table's rows wants as many as the rows, and is held to
+  those alone. Nor for the reservoir's cap: 2^24 rows have 16 each for 2^20 partitions, four times
+  `LIONVEC_MAX_PARTS` (a static assertion), so past 1.07 billion rows the build wants 262,144, the
+  format's ceiling, whatever the memory.
 - `pg_lion.vector_prefetch` (enum, `off`, `fadvise` or `stream`, default `stream` from 17 and
   `fadvise` on 16; 2026-10-17, a boolean from 2026-10-16, whose `on`, the default, and `off` it
   still takes): how a scan reads ahead the pages it will read next (§44.4, "Prefetch" and "Read
@@ -21970,8 +22013,10 @@ could have lost to; LionOrdered's paths are serial.
   scan's start-up.
 - `partitions` (reloption, 0 to 262,144, default 0; 1,000,000 until a review found the build at a
   million partitions days long and uncancellable, then 65,536 until the regions, §44.3): the
-  partitions the build makes; 0 chooses by the rows' count, `8 sqrt(n)` above 10,000 rows as
-  `maintenance_work_mem`'s sample allows (§44.3; `2 sqrt(n)` until DBpedia, §44.9). 262,144
+  partitions the build makes; 0 chooses by the rows' count, `8 sqrt(n)` above 10,000 rows, at
+  most a sixteenth of a sample of every row (§44.3; `2 sqrt(n)` until DBpedia, §44.9); a build
+  whose sample, what `maintenance_work_mem` holds, has too few rows for either fails
+  (`pg_lion.vector_build_sample`, above). 262,144
   (`LIONVEC_MAX_PARTS`, 2^18) is what `8 sqrt(n)` gives at 1.07 billion rows. A partition number
   is an `int` everywhere, never 16 bits, and the sort's group (`LIONVEC_SORT_GROUP`, an int4)
   holds it with room for the two groups after the partitions. The build's arrays of the
@@ -22009,7 +22054,8 @@ could have lost to; LionOrdered's paths are serial.
   two items a row when the index spills; a parallel build divides the sort's share among its
   processes, as core's builds do, and holds the sample once, in shared memory (§44.12). A sample
   row takes `dimsp + 4` bytes, 1,540 at 1536 dimensions, so the default partitions want 2 x 1,540
-  x 16 `8 sqrt(n)` bytes, 376 MB at a million rows and 12.5 GB at a billion, and k-means is given
+  x 16 `8 sqrt(n)` bytes, 376 MB at a million rows and 12.5 GB at a billion, a build given less
+  failing (`pg_lion.vector_build_sample`, above), and k-means is given
   at most 128 a partition of it, never fewer than 65,536 rows (§44.3), 1.6 GB of sample at a
   million rows' 8,000 partitions (so 3.2 GB is the most a million rows can use); the reservoir
   stops at 2^24 rows, 25.8 GB, which 52 GB reaches. A parallel build's shared memory holds the
@@ -22869,6 +22915,27 @@ faster from the disk and the same warm, and the inline table's queries took main
   index built, then the parent's row-level security enabled, a query of the parent and one of the
   partition failing, and a new index on the partition refused. At `allow`: the vector scan with a
   Filter, LionOrdered with one, and their rows the sort's.
+- **vector_build_sample.sql** (2026-10-19): `pg_lion.vector_build_sample` (§44.8), at 8
+  dimensions, where `maintenance_work_mem`'s least, 64kB, holds 481 sample rows, 16 each for 30
+  partitions, and the partitions are read off the meta page (pageinspect). 10,000 rows want 625:
+  the build fails, at its last row, with the DETAIL and the HINT's 2MB; at 2MB, and at the
+  unrounded 1,329kB, it makes 625, and at 1,328kB a REINDEX fails, its sample having rows for
+  624, and leaves the 625. 20,000 rows want 1,131: the build fails at the 10,000th row, the
+  first that makes the sample short, which an index expression counting its calls through a
+  sequence shows, reckoning the 20,000 as 19,894; under `allow` it makes 30, with the NOTICE of
+  the 20,000 counted, and at `error` again a REINDEX fails and leaves them, the index still
+  answering. The same with the table's `parallel_workers` at 2: the error, and under `allow` 30.
+  The `partitions` option of 600 over 1,000 rows fails at the 482nd row, makes 481 under `allow`
+  and 600 at the hint's 1MB; an option of 2,000 over the 1,000, from a sample of every row, makes
+  1,000 and does not fail, nor does a table of 9,999 rows, of one partition, at 64kB; and the
+  setting refuses any other value. In test/unit/vec_test.c: `lionvec_parts()` at the rule's
+  figures, the reservoir's at §44.3's (21,788 rows at 64 MB and 1536 dimensions, 348,617 at
+  1 GB, the cap from 52 GB) and a billion rows' (252,982 partitions, 4,047,712 sample rows,
+  12,174,759 kB); and for options of 0 to 262,144, reservoirs of 1 to 2^24 rows and every count
+  of rows to 200,000 and every 0.05% from there to 4 billion, that a sample of every row is never
+  short, that the cap takes no partition away, that short stays short as the rows grow, and that
+  the `maintenance_work_mem` the error names makes the partitions wanted, at 64 to 8,128
+  dimensions, where a kilobyte less does not.
 - **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
   2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
   REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
@@ -22984,7 +23051,7 @@ faster from the disk and the same warm, and the inline table's queries took main
   spilling second pass; and the cap is 2^24 rows and the ceiling 262,144 partitions, so that a
   billion rows get the default `8 sqrt(n)`, 252,982 partitions of 3,950 rows, given the
   `maintenance_work_mem` (12.5 GB at 1536 dimensions for the sixteen a partition the default
-  needs, 52 GB for the cap's 66, §44.8). At 503 regions of some 503 centroids that build is,
+  needs, without which the build fails, 52 GB for the cap's 66, §44.8). At 503 regions of some 503 centroids that build is,
   by arithmetic (not measured), 16.8 million sample rows x 10 iterations x about 3,000 estimates
   for k-means, 5 x 10^11, and a billion rows x about 8,550 for the second pass, 8.6 x 10^12, where
   every centroid for every row was 4.2 x 10^13 and 2.5 x 10^14. DBpedia's 53 regions save less
@@ -23006,6 +23073,15 @@ faster from the disk and the same warm, and the inline table's queries took main
   parallel scan's tens of milliseconds from memory (arithmetic on two sizes, not measured).
   Spill (§44.3) is the other lever on the rows read, measured so far at 115,000 rows (§44.9); the
   index over the centroids is still to be built.
+- **The sample's rows** (§44.8, `pg_lion.vector_build_sample`). The build fails rather than make
+  fewer partitions than its rows want, but which rows the reservoir draws, and so the centroids,
+  still follow `maintenance_work_mem` wherever it holds fewer rows than the table has: another
+  size of reservoir keeps other rows, and k-means is given 16 to 128 of them a partition as it
+  holds more (§44.3). The answers at a margin follow the centroids. A reservoir of one size
+  whatever the setting - k-means' 128 a partition, or every row - spilled to a temporary file past
+  `maintenance_work_mem` as LionOrdered's set is (§30.4), would make the same centroids at every
+  setting; at a billion rows of 1536 dimensions it is 32 million rows, 50 GB, and k-means reads
+  it ten times.
 - **What the parallel scan leaves** (§44.4, "A parallel scan"; 2026-10-16). LionOrdered stays
   serial: its lion set is one process's, and a parallel restricted scan would need the set shared
   or built in each participant, and a partial path of the node. The stop rules are each
@@ -23091,7 +23167,9 @@ iterations at C `sqrt(C)` estimates each, some tens of milliseconds here and, by
 7 x 10^8 estimates at `LIONVEC_MAX_PARTS`, where an iteration over the 2^24 rows the sample can
 hold is 5 x 10^10 shared among the processes.
 
-- **The phases.** The first pass, the mean and the sample, stays serial: reservoir sampling draws
+- **The phases.** The first pass, the mean and the sample, stays serial, and with it the check that
+  fails a build whose sample is too small for its partitions (§44.8), before the parallel
+  context is set up: reservoir sampling draws
   the same rows only when it meets them in the same order, and it is a fiftieth of the time. With
   the partitions known, the leader sets up a parallel context (`lionvec_begin_parallel()`, the
   workers' entry `lionvec_parallel_build_main()`): a shared struct with a parallel heap scan from
