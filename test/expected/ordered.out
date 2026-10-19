@@ -709,7 +709,7 @@ SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
  Index Entries Walked: 27
  Lion Set Hits: 20
  Heap Fetches: 20
- Lion Set: 97 containers, exact, spilled 71 kB
+ Lion Set: 97 containers, exact, spilled 76 kB
 (5 rows)
 
 SELECT lion_ord('EXECUTE lo_big(1)',
