@@ -457,12 +457,14 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING lion AS
 /* ---------------------------------------------------------------------
  * Multi-key operator classes (DESIGN.md §17)
  *
- * One indexed value contributes many keys.  The extraction is GIN's, reused
- * verbatim: support function 2 is extractValue and 3 is extractQuery, with
- * GIN's own signatures, so `ginarrayextract` and friends are named here
- * directly.  What is NOT reused is GIN's consistent function - a roaring scan
- * combines whole posting sets instead of testing one row at a time - so the
- * strategy numbers and what they mean are the roaring AM's own:
+ * One indexed value contributes many keys.  The extraction is GIN's: support
+ * function 2 is extractValue and 3 is extractQuery, with GIN's own
+ * signatures, so `ginarrayextract` and friends are named here directly, and
+ * tsvector_ops names two functions that call GIN's and file a lexeme too long
+ * to be a key under a hash of it.  What is NOT reused is GIN's consistent
+ * function - a roaring scan combines whole posting sets instead of testing
+ * one row at a time - so the strategy numbers and what they mean are the
+ * roaring AM's own:
  *
  *		1 =		2 @>	3 &&	4 <@	5 @@
  *
@@ -490,16 +492,25 @@ CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
  * weight and `a & !b` are answered exactly from the index - no heap recheck
  * in a scan, and none on an all-visible page in a count - for about three
  * bytes per lexeme and row more.
+ *
+ * Support functions 2 and 3 are gin_extract_tsvector() and
+ * gin_extract_tsquery() with each lexeme longer than 2043 bytes, which no key
+ * can hold, replaced by its first bytes and its SHA-256 (DESIGN.md §17, "Long
+ * lexemes"); a query that names one is rechecked.
  */
 CREATE FUNCTION lion_tsvector_positions(tsvector, internal) RETURNS internal
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT;
+CREATE FUNCTION lion_tsvector_extract_value(tsvector, internal, internal)
+	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal)
+	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
 
 CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
 	OPERATOR	5	@@ (tsvector, tsquery),
 	FUNCTION	1	hashtext(text),
 	FUNCTION	4	bttextcmp(text, text),
-	FUNCTION	2	gin_extract_tsvector(tsvector, internal, internal),
-	FUNCTION	3	gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
+	FUNCTION	2	lion_tsvector_extract_value(tsvector, internal, internal),
+	FUNCTION	3	lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal),
 	FUNCTION	5	lion_tsvector_positions(tsvector, internal),
 	STORAGE		text;
 

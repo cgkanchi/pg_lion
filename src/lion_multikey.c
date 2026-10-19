@@ -12,9 +12,11 @@
  *	 proc 3 = extractQuery(query, &nkeys, strategy, &pmatch, &extra_data,
  *						   &nullFlags, &searchMode) -> Datum *keys
  *
- * so `ginarrayextract`, `ginqueryarrayextract`, `gin_extract_tsvector` and
- * `gin_extract_tsquery` are what our array_ops and tsvector_ops name.  What
- * this file does NOT reuse is GIN's consistent function: a roaring scan does
+ * so `ginarrayextract` and `ginqueryarrayextract` are what our array_ops
+ * names.  tsvector_ops names two of its own that call `gin_extract_tsvector`
+ * and `gin_extract_tsquery` and file a lexeme too long to be a key under a
+ * hash of it (lion_lexeme_key(), "Long lexemes" below).  What this file does
+ * NOT reuse is GIN's consistent function: a roaring scan does
  * not test one row at a time against a bitmap of "which keys matched", it
  * combines whole posting sets.  So the query side turns the extracted keys
  * into a boolean TREE (LionKeyNode) that the set algebra in lion_expr.c can
@@ -33,6 +35,9 @@
 #include "access/stratnum.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
@@ -269,7 +274,10 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
  * The same, with the positions of every key: support proc 5 returns them for
  * the raw keys of proc 2, one per key in proc 2's order, and they travel with
  * their keys through the sort.  A key extracted twice keeps the positions of
- * its first copy (a tsvector never has two; its lexemes are unique).
+ * its first copy: a tsvector's lexemes are unique, but a 2043-byte one can be
+ * spelled like a longer one's hashed key (DESIGN.md §17, "Long lexemes"), and
+ * then the first in the tsvector's order is kept.  The row's length counts
+ * both, as lion_bm25_score() does from the row.
  */
 int
 lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
@@ -305,6 +313,7 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 	int			nlive = 0;
 	int			nout = 0;
 	int			runstart = 0;	/* where this run's distinct keys start */
+	uint32		rowlen = 0;
 	int			i;
 	int			j;
 
@@ -382,6 +391,9 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 		if (lion_is_length_key(state, key))
 			continue;
 
+		/* the row's length (below) counts a key extracted twice twice */
+		rowlen += (rawpos != NULL) ? Max((uint32) rawpos[ord[i].pos].npos, 1) : 1;
+
 		/*
 		 * A new hash value, or a key the ordering puts after the previous
 		 * one, starts a new run of possible equals.
@@ -429,15 +441,11 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 	 */
 	if (state->positions && state->typid == TEXTOID && nout > 0)
 	{
-		uint32		len = 0;
-
-		for (j = 0; j < nout; j++)
-			len += (outpos != NULL) ? Max((uint32) outpos[j].npos, 1) : 1;
 		if (outpos != NULL)
 		{
 			uint16	   *lp = (uint16 *) palloc(sizeof(uint16));
 
-			*lp = (uint16) Min(len, (uint32) PG_UINT16_MAX);
+			*lp = (uint16) Min(rowlen, (uint32) PG_UINT16_MAX);
 			outpos[nout].npos = 1;
 			outpos[nout].pos = lp;
 		}
@@ -1311,8 +1319,10 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
  * runs, whose j'th key is the j'th QI_VAL item's (lion_tsquery_plan()).
  * False when some operand has no key a filter can follow: a prefix lexeme
  * (any number of keys), or a key extractQuery flagged partial or NULL, or an
- * extraction that is not the plain one.  The filter then stays out of the way
- * and the caller rechecks, as it always did.
+ * extraction that is not the plain one - which includes one with an
+ * ambiguous key, whose positions may be another lexeme's (DESIGN.md §17,
+ * "Long lexemes").  The filter then stays out of the way and the caller
+ * rechecks, as it always did.
  */
 bool
 lion_tsquery_item_keys(LionState *state, Datum query, StrategyNumber strategy,
@@ -1443,6 +1453,169 @@ lion_tsvector_positions(PG_FUNCTION_ARGS)
 		}
 	}
 	PG_RETURN_POINTER(out);
+}
+
+/* ---------------------------------------------------------------------
+ * Long lexemes (DESIGN.md §17, "Long lexemes")
+ * --------------------------------------------------------------------- */
+
+/*
+ * A lexeme is at most 2047 bytes (ts_type.h's MAXSTRLEN), and a key at most
+ * LION_LEXEME_KEY_MAX = 2043 and its varlena header.  A lexeme of up to
+ * LION_LEXEME_KEY_MAX bytes is its own key; a longer one is filed under a key
+ * of exactly LION_LEXEME_KEY_MAX bytes: its first bytes, as many whole
+ * characters as fit in LION_LEXEME_KEY_KEEP, then '#' up to the hash, then
+ * the SHA-256 of the whole lexeme in hex.  Every byte of it is text of the
+ * database's encoding, so lion_index_facets() can print it.
+ *
+ * Nothing tells a key of LION_LEXEME_KEY_MAX bytes that is a lexeme of that
+ * length from one that is the hash of a longer lexeme: a lexeme may be any
+ * text, including one that spells out another's key.  Such a key is
+ * AMBIGUOUS - its rows have one of the lexemes it stands for - and a query
+ * that names one, as a lexeme of its own or as a key a prefix expands into,
+ * is answered with LION_SEARCH_MODE_LOSSY: every caller rechecks its
+ * candidates in the heap, and the position filter stays out of the way
+ * (lion_tsquery_item_keys()), since a row's positions under the key may be
+ * either lexeme's.  Every shorter key is the one lexeme it spells, as before.
+ *
+ * Keeping the first bytes puts the key where its lexeme sorts among the
+ * others, so `foo:*` finds a long lexeme starting with foo in the run of
+ * keys starting with foo, as long as every hashed key keeps foo whole:
+ * lion_lexeme_prefix_max() bytes.  A longer prefix is not expanded
+ * (lion_qtn_expand()), and answered from every row with a recheck.
+ */
+StaticAssertDecl(LION_LEXEME_KEY_HASH == 2 * PG_SHA256_DIGEST_LENGTH,
+				 "a hashed lexeme key ends in a SHA-256 in hex");
+StaticAssertDecl(LION_LEXEME_KEY_KEEP > 0,
+				 "a hashed lexeme key keeps the lexeme's first bytes");
+
+/*
+ * The key of the lexeme lex[0 .. len), palloc'd: the lexeme itself, or the
+ * hashed key of a long one.  *ambiguous, when given, says whether the key is
+ * LION_LEXEME_KEY_MAX bytes long, which a hashed one always is.
+ */
+text *
+lion_lexeme_key(const char *lex, int len, bool *ambiguous)
+{
+	static const char hexdigit[] = "0123456789abcdef";
+	pg_cryptohash_ctx *ctx;
+	uint8		digest[PG_SHA256_DIGEST_LENGTH];
+	text	   *key;
+	char	   *p;
+	int			keep;
+	int			i;
+
+	if (ambiguous != NULL)
+		*ambiguous = len >= LION_LEXEME_KEY_MAX;
+	if (len <= LION_LEXEME_KEY_MAX)
+		return cstring_to_text_with_len(lex, len);
+
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (pg_cryptohash_init(ctx) < 0 ||
+		pg_cryptohash_update(ctx, (const uint8 *) lex, len) < 0 ||
+		pg_cryptohash_final(ctx, digest, sizeof(digest)) < 0)
+		elog(ERROR, "could not compute a SHA-256 digest: %s",
+			 pg_cryptohash_error(ctx));
+	pg_cryptohash_free(ctx);
+
+	key = (text *) palloc(VARHDRSZ + LION_LEXEME_KEY_MAX);
+	SET_VARSIZE(key, VARHDRSZ + LION_LEXEME_KEY_MAX);
+	p = VARDATA(key);
+	keep = pg_mbcliplen(lex, len, LION_LEXEME_KEY_KEEP);
+	memcpy(p, lex, keep);
+	memset(p + keep, '#',
+		   LION_LEXEME_KEY_MAX - LION_LEXEME_KEY_HASH - keep);
+	p += LION_LEXEME_KEY_MAX - LION_LEXEME_KEY_HASH;
+	for (i = 0; i < PG_SHA256_DIGEST_LENGTH; i++)
+	{
+		*p++ = hexdigit[digest[i] >> 4];
+		*p++ = hexdigit[digest[i] & 0x0f];
+	}
+	return key;
+}
+
+/*
+ * The longest prefix every hashed key keeps whole: LION_LEXEME_KEY_KEEP, less
+ * what cutting at a character boundary may take off it in this database's
+ * encoding.
+ */
+int
+lion_lexeme_prefix_max(void)
+{
+	return LION_LEXEME_KEY_KEEP - (pg_database_encoding_max_length() - 1);
+}
+
+PG_FUNCTION_INFO_V1(lion_tsvector_extract_value);
+PG_FUNCTION_INFO_V1(lion_tsvector_extract_query);
+
+/*
+ * lion_tsvector_extract_value(tsvector, internal, internal) returns internal:
+ * gin_extract_tsvector()'s keys, one per lexeme in the tsvector's order -
+ * the order lion_tsvector_positions() gives their positions in - with each
+ * lexeme too long to be a key replaced by its hashed key.
+ */
+Datum
+lion_tsvector_extract_value(PG_FUNCTION_ARGS)
+{
+	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
+	Datum	   *keys;
+	int32		i;
+
+	keys = (Datum *) DatumGetPointer(DirectFunctionCall3(gin_extract_tsvector,
+														 PG_GETARG_DATUM(0),
+														 PG_GETARG_DATUM(1),
+														 PG_GETARG_DATUM(2)));
+	for (i = 0; keys != NULL && i < *nentries; i++)
+	{
+		text	   *t = DatumGetTextPP(keys[i]);
+
+		if (VARSIZE_ANY_EXHDR(t) > LION_LEXEME_KEY_MAX)
+			keys[i] = PointerGetDatum(lion_lexeme_key(VARDATA_ANY(t),
+													  VARSIZE_ANY_EXHDR(t),
+													  NULL));
+	}
+	PG_RETURN_POINTER(keys);
+}
+
+/*
+ * lion_tsvector_extract_query(tsvector, internal, int2, internal, internal,
+ * internal, internal) returns internal: gin_extract_tsquery()'s keys, one
+ * per operand in the query's order, with each lexeme that is not a prefix
+ * replaced by its key, and LION_SEARCH_MODE_LOSSY where one of them is
+ * ambiguous and the query was to be answered from its keys.
+ */
+Datum
+lion_tsvector_extract_query(PG_FUNCTION_ARGS)
+{
+	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
+	bool	  **pmatch = (bool **) PG_GETARG_POINTER(3);
+	int32	   *searchMode = (int32 *) PG_GETARG_POINTER(6);
+	Datum	   *keys;
+	int32		i;
+
+	keys = (Datum *) DatumGetPointer(DirectFunctionCall7(gin_extract_tsquery,
+														 PG_GETARG_DATUM(0),
+														 PG_GETARG_DATUM(1),
+														 PG_GETARG_DATUM(2),
+														 PG_GETARG_DATUM(3),
+														 PG_GETARG_DATUM(4),
+														 PG_GETARG_DATUM(5),
+														 PG_GETARG_DATUM(6)));
+	for (i = 0; keys != NULL && i < *nentries; i++)
+	{
+		text	   *t = DatumGetTextPP(keys[i]);
+
+		/* a prefix names a run of keys, and is never looked up as one */
+		if ((*pmatch != NULL && (*pmatch)[i]) ||
+			VARSIZE_ANY_EXHDR(t) < LION_LEXEME_KEY_MAX)
+			continue;
+		keys[i] = PointerGetDatum(lion_lexeme_key(VARDATA_ANY(t),
+												  VARSIZE_ANY_EXHDR(t),
+												  NULL));
+		if (*searchMode == GIN_SEARCH_MODE_DEFAULT)
+			*searchMode = LION_SEARCH_MODE_LOSSY;
+	}
+	PG_RETURN_POINTER(keys);
 }
 
 /*
@@ -1673,6 +1846,14 @@ lion_qtn_expand(Relation index, LionState *col, QTNode *node, int *budget)
 		QTNode	   *repl;
 		int			n;
 
+		/*
+		 * A long lexeme's key keeps only its first bytes (DESIGN.md §17,
+		 * "Long lexemes"), and one that starts with a longer prefix may be
+		 * filed outside the prefix's run.
+		 */
+		if (op->length > lion_lexeme_prefix_max())
+			return false;
+
 		n = lion_prefix_keys(index, col, node->word, op->length,
 							 *budget + 1, &keys);
 		if (n < 0)
@@ -1718,12 +1899,16 @@ lion_qtn_expand(Relation index, LionState *col, QTNode *node, int *budget)
  * committed, and so before this walk: a lexeme a visible row has is a key
  * here.  The rewritten query therefore selects exactly the rows the original
  * does, among the rows the caller can see.  Keys of rows the caller cannot
- * see may be found too, and only make the query longer.
+ * see may be found too, and only make the query longer.  A key of a long
+ * lexeme (lion_lexeme_key()) in the run keeps the prefix whole, and stands
+ * in the rewritten query as itself: extracting it again gives the same key,
+ * which is ambiguous, so the query is answered with a recheck.
  *
  * *expanded is false, and the query is returned as it was, when the column
- * is not one whose keys are byte strings in byte order, or when the query
- * would grow past LION_MAX_QUERY_KEYS lexemes; the caller then answers the
- * prefix the way it did before, by every row and a recheck.
+ * is not one whose keys are byte strings in byte order, when a prefix is
+ * longer than a long lexeme's key keeps, or when the query would grow past
+ * LION_MAX_QUERY_KEYS lexemes; the caller then answers the prefix the way it
+ * did before, by every row and a recheck.
  */
 Datum
 lion_tsquery_expand_prefixes(Relation index, LionState *col, Datum query,
