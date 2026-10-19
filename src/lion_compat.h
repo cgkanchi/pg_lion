@@ -435,4 +435,32 @@ lion_toast_snapshot(SnapshotData *data)
 #define pg_noreturn pg_attribute_noreturn()
 #endif
 
+/*
+ * n rows fetched by rel - an index whose order fetched them, or the table a
+ * bitmap-like read fetched them from - as pgstat_count_heap_fetch() counts
+ * one (pg_stat_user_indexes.idx_tup_fetch, pg_stat_user_tables.idx_tup_fetch).
+ * PostgreSQL 20 keeps an index's counts apart from a table's, in a union of
+ * the backend's relation status, and defines PGSTAT_KIND_INDEX for them.
+ */
+#include "pgstat.h"
+
+#ifdef PGSTAT_KIND_INDEX
+#define lion_pgstat_count_fetches(rel, n) \
+	do { \
+		if (pgstat_should_count_relation(rel)) \
+		{ \
+			if ((rel)->pgstat_info->kind == PGSTAT_KIND_INDEX) \
+				(rel)->pgstat_info->idx.tuples_fetched += (n); \
+			else \
+				(rel)->pgstat_info->tab.counts.tuples_fetched += (n); \
+		} \
+	} while (0)
+#else
+#define lion_pgstat_count_fetches(rel, n) \
+	do { \
+		if (pgstat_should_count_relation(rel)) \
+			(rel)->pgstat_info->counts.tuples_fetched += (n); \
+	} while (0)
+#endif
+
 #endif							/* LION_COMPAT_H */

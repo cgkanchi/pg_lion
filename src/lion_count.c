@@ -1119,8 +1119,8 @@ lion_recheck_heap(LionCountCtx *cx)
 	 * The rows the heap gave, as a bitmap heap scan counts the ones it
 	 * returns: the table's tuples fetched (pg_stat_user_tables.idx_tup_fetch).
 	 */
-	if (visible > 0 && pgstat_should_count_relation(cx->heap))
-		cx->heap->pgstat_info->counts.tuples_fetched += visible;
+	if (visible > 0)
+		lion_pgstat_count_fetches(cx->heap, visible);
 	return visible;
 }
 

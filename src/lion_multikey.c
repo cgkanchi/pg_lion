@@ -1235,20 +1235,20 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 		return;
 	}
 
+	/*
+	 * `a = q` holds only where a has every element of q - the AND of their
+	 * sets, as for `@>` - and the recheck decides the rest: the count of each
+	 * element, the order, the dimensions and their lower bounds.  A NULL
+	 * element is left out of the AND, as array equality matches NULL with
+	 * NULL; an empty q is ginqueryarrayextract()'s INCLUDE_EMPTY, every row,
+	 * above.
+	 */
+	if (strategy == LION_STRAT_ARRAY_EQUAL)
+		lossy = true;
+
 	switch (strategy)
 	{
 		case LION_STRAT_ARRAY_EQUAL:
-
-			/*
-			 * `a = q` holds only where a has every element of q - the AND of
-			 * their sets, as for `@>` - and the recheck decides the rest:
-			 * the count of each element, the order, the dimensions and their
-			 * lower bounds.  A NULL element is left out of the AND, as array
-			 * equality matches NULL with NULL; an empty q is
-			 * ginqueryarrayextract()'s INCLUDE_EMPTY, every row, above.
-			 */
-			lossy = true;
-			/* FALLTHROUGH */
 		case LION_STRAT_CONTAINS:
 		case LION_STRAT_JSONB_CONTAINS:
 		case LION_STRAT_JSONB_EXISTS:

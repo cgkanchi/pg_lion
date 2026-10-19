@@ -840,8 +840,8 @@ out:
 	 */
 	pgstat_count_index_scan(index);
 	pgstat_count_index_tuples(index, seen);
-	if (emitted > 0 && pgstat_should_count_relation(index))
-		index->pgstat_info->counts.tuples_fetched += emitted;
+	if (emitted > 0)
+		lion_pgstat_count_fetches(index, emitted);
 	index_close(index, AccessShareLock);
 	table_close(heap, AccessShareLock);
 	return (Datum) 0;
