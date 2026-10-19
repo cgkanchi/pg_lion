@@ -14,6 +14,10 @@
 SET client_min_messages = warning;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
+-- the heap compresses with pglz whatever the server's default (lz4 on 19
+-- built with it), as the sizes, row positions and plans below are pglz's;
+-- lk4 stores lz4's form
+SET default_toast_compression = pglz;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS citext;
 CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
@@ -148,6 +152,35 @@ SELECT lion_index_verify('lk_v', true);
 REINDEX INDEX lk_v;
 SELECT lk_same(q) FROM lk_q;
 SELECT lion_index_verify('lk_v', true);
+
+-- the same values compressed with lz4 in the heap, where the server has it
+-- (pglz otherwise, with the same output): a key that fits in lz4's form is
+-- stored in it, and is still one key with its pglz and uncompressed forms.
+-- v || '' makes each value anew: a value copied as it is keeps lk's form
+CREATE TABLE lk4 (id int, v text) WITH (autovacuum_enabled = off);
+CREATE FUNCTION lk_lz4() RETURNS boolean LANGUAGE sql AS $$
+	SELECT 'lz4' = ANY (enumvals) FROM pg_settings WHERE name = 'default_toast_compression' $$;
+DO $$
+BEGIN
+	IF lk_lz4() THEN
+		ALTER TABLE lk4 ALTER COLUMN v SET COMPRESSION lz4;
+	END IF;
+END $$;
+INSERT INTO lk4 SELECT id, v || '' FROM lk WHERE id < 40000;
+SELECT bool_and(pg_column_compression(v) = CASE WHEN lk_lz4() THEN 'lz4' ELSE 'pglz' END) AS lz4_where_it_can
+  FROM lk4 WHERE octet_length(v) > 2043;
+CREATE INDEX lk4_v ON lk4 USING lion (v);
+ALTER TABLE lk4 ALTER COLUMN v SET COMPRESSION pglz;
+INSERT INTO lk4 SELECT 100000 + id, v || '' FROM lk WHERE octet_length(v) > 2043 AND id < 40000;
+ALTER TABLE lk4 ALTER COLUMN v SET STORAGE EXTERNAL;
+INSERT INTO lk4 SELECT 200000 + id, v || '' FROM lk WHERE octet_length(v) > 2043 AND id < 40000;
+VACUUM (FREEZE, ANALYZE) lk4;
+SELECT lion_index_verify('lk4_v', true);
+SELECT (SELECT entries FROM lion_index_stats('lk4_v')) = (SELECT count(DISTINCT v) FROM lk4) AS one_entry_each;
+-- the plan's node is left out: it follows the sizes, which are lz4's
+SELECT split_part(lk_same(replace(q, 'FROM lk ', 'FROM lk4 ')), ': ', 2) FROM lk_q;
+SELECT lion_index_count('lk4_v', repeat('abc', 20000)) AS lion,
+	   (SELECT count(*) FROM lk4 WHERE v = repeat('abc', 20000)) AS query;
 
 -- ---------------------------------------------------------------------
 -- char(n) wider than a key: every value is blank-padded to 2500 bytes
@@ -391,7 +424,7 @@ SELECT lk_facets_same('lk_t_tsv', 3, NULL, $$SELECT word AS e, ndoc AS c FROM ts
 SELECT lk_facets_same('lk_t_tsv', NULL, 'tsv @@ ''t1''', $$SELECT word AS e, ndoc AS c FROM ts_stat('SELECT tsv FROM lk_t WHERE tsv @@ ''t1''')$$);
 SELECT octet_length(key), count FROM lion_index_facets('lk_t_tsv') ORDER BY 1, 2;
 
-DROP TABLE lk, lk_q, lk_ch, lk_n, lk_ci, lk_j, lk_w, lk_a, lk_ag, lk_aq, lk_t;
-DROP FUNCTION lk_same(text), lk_rand(int, int), lk_sub(text), lk_acheck(), lk_facets_same(text, int, text, text);
+DROP TABLE lk, lk4, lk_q, lk_ch, lk_n, lk_ci, lk_j, lk_w, lk_a, lk_ag, lk_aq, lk_t;
+DROP FUNCTION lk_same(text), lk_lz4(), lk_rand(int, int), lk_sub(text), lk_acheck(), lk_facets_same(text, int, text, text);
 DROP EXTENSION pg_lion_citext;
 DROP EXTENSION citext;
