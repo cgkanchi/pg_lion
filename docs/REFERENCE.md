@@ -450,6 +450,24 @@ or temporary one writes no WAL and is written anywhere), which needs
     shared_preload_libraries = 'pg_lion'      # and a restart
     # optional: pg_lion.rmgr_id = 170         # the id to register under
 
+So once an index is built in rmgr mode, `pg_lion` has to stay in `shared_preload_libraries`. On a
+server started without it, INSERT, UPDATE and COPY into the index's table fail, and so does every
+VACUUM that has dead rows to remove from the index - autovacuum included, which reports the error
+only in the server log while the table's dead rows (`n_dead_tup`) accumulate. Reads, DELETE and
+DROP INDEX still work. The error's hint names both ways out: preload the library again and restart,
+or rebuild the index in generic mode. To stop preloading the library, rebuild every rmgr-mode index
+first, while it is still preloaded:
+
+    SELECT c.oid::regclass, lion_index_wal_mode(c.oid)
+      FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+     WHERE a.amname = 'lion' AND c.relkind = 'i';
+
+    ALTER INDEX idx SET (wal_mode = generic);
+    REINDEX INDEX idx;
+
+A REINDEX or TRUNCATE on a server without the preload rebuilds an index left at `auto` in generic
+mode, and it stays generic when the library is preloaded again, until the next REINDEX there.
+
 `pg_lion.rmgr_id` defaults to 170, the id reserved for pg_lion on the
 [list of custom resource managers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers#List_of_Custom_Rmgrs).
 Two extensions that take the same id cannot be loaded together, so change it only to move out of
