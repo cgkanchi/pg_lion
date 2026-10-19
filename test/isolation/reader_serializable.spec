@@ -1,12 +1,11 @@
 # The contract every reader of a lion index keeps under SERIALIZABLE (DESIGN.md
-# §9, "Direct readers"): it takes the relation-level predicate lock
-# index_beginscan() takes for an AM without ampredlocks, before it reads, so
-# a read that finds nothing still conflicts with a later insert of what it
-# looked for.  Two transactions each read an absent key through the same
+# §9, "SERIALIZABLE"): a lookup that finds nothing predicate-locks the leaf
+# where the key would be, so it still conflicts with a later insert of what
+# it looked for.  Two transactions each read an absent key through the same
 # reader, each insert it, and the second commit must fail, as it does for an
-# ordinary index scan.  One permutation per reader: the SQL functions
-# (lion_reader_vet()) and the custom scans (lion_reader_lock()).  A new
-# reader gets a step pair and a permutation here.
+# ordinary index scan.  One permutation per reader: the SQL functions and the
+# custom scans.  A new reader gets a step pair and a permutation here;
+# serializable_keys.spec has the readers of keys that exist.
 
 setup
 {

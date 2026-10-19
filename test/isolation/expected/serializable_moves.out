@@ -1,0 +1,95 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s2_begin s1_read s2_read s3_root s3_spill s3_root s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT count(*) FROM sm WHERE k = 5000;
+count
+-----
+    1
+(1 row)
+
+step s2_read: SELECT count(*) FROM sm WHERE k = 15000;
+count
+-----
+    1
+(1 row)
+
+step s3_root: SELECT lion_index_posting_root('sm_k', 5000) IS NOT NULL AS chain;
+chain
+-----
+f    
+(1 row)
+
+step s3_spill: INSERT INTO sm SELECT -g, 5000 FROM generate_series(1, 200) g;
+step s3_root: SELECT lion_index_posting_root('sm_k', 5000) IS NOT NULL AS chain;
+chain
+-----
+t    
+(1 row)
+
+step s1_insert: INSERT INTO sm VALUES (-1, 15000);
+step s2_insert: INSERT INTO sm VALUES (-2, 5000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_read s2_read s3_split s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT count(*) FROM sm WHERE k = 5000;
+count
+-----
+    1
+(1 row)
+
+step s2_read: SELECT count(*) FROM sm WHERE k = 15000;
+count
+-----
+    1
+(1 row)
+
+step s3_split: INSERT INTO sm SELECT -g, 5000 - g FROM generate_series(1, 4999) g
+				  WHERE g % 10 <> 0;
+step s1_insert: INSERT INTO sm VALUES (-1, 15000);
+step s2_insert: INSERT INTO sm VALUES (-2, 5000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s3_root3 s3_delete s1_begin s2_begin s1_read3 s2_read s3_vacuum s3_root3 s1_insert s2_insert3 s1_commit s2_commit
+step s3_root3: SELECT lion_index_posting_root('sm_k', 3000) IS NOT NULL AS chain,
+				    lion_index_count('sm_k', 3000) AS rows;
+chain|rows
+-----+----
+t    | 201
+(1 row)
+
+step s3_delete: DELETE FROM sm WHERE k = 3000;
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read3: SELECT count(*) FROM sm WHERE k = 3000;
+count
+-----
+    0
+(1 row)
+
+step s2_read: SELECT count(*) FROM sm WHERE k = 15000;
+count
+-----
+    1
+(1 row)
+
+step s3_vacuum: VACUUM sm;
+step s3_root3: SELECT lion_index_posting_root('sm_k', 3000) IS NOT NULL AS chain,
+				    lion_index_count('sm_k', 3000) AS rows;
+chain|rows
+-----+----
+f    |   0
+(1 row)
+
+step s1_insert: INSERT INTO sm VALUES (-1, 15000);
+step s2_insert3: INSERT INTO sm VALUES (-2, 3000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions

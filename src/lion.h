@@ -2296,12 +2296,14 @@ extern void lion_meta_count_bulkdelete(Relation index,
  * search whose opfamily has no cross-type ordering function (support proc 4)
  * cannot descend at all and falls back to a walk of every leaf, which is
  * correct and slow; the default opclasses of pg_lion all carry one.
+ * *movedright, when given, is lion_dir_find()'s.
  */
 extern bool lion_find_entry_ext(Relation index, LionState *state, int lockmode,
 							   Datum key, uint32 hash,
 							   FmgrInfo *eqproc, FmgrInfo *cmpproc,
 							   Oid collation,
-							   Buffer *buf, OffsetNumber *offnum);
+							   Buffer *buf, OffsetNumber *offnum,
+							   bool *movedright);
 
 /*
  * May this transaction use index for a query under snapshot?  Requires
@@ -2323,9 +2325,10 @@ extern void lion_check_old_snapshot(Relation index, Snapshot snapshot);
  * Direct readers of a lion index (lion_reader.c): what a function handed an
  * index by name, or a node reading one without index_beginscan(), owes the
  * caller.  LION_READ_ROWS for anything that returns or counts rows, which
- * vets the index for the snapshot, refuses row-level security and takes the
- * predicate lock; LION_READ_STATS for index-wide statistics only, which
- * refuses row-level security too.
+ * vets the index for the snapshot and refuses row-level security;
+ * LION_READ_STATS for index-wide statistics only, which refuses row-level
+ * security too.  Predicate locks are not the policy's: every lookup and walk
+ * takes them on what it reads (below).
  */
 typedef enum LionReadPolicy
 {
@@ -2338,7 +2341,25 @@ extern Relation lion_reader_open(Oid indexoid, LionReadPolicy policy,
 								 Relation *heap);
 extern void lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
 							const char *action);
-extern void lion_reader_lock(Relation index, Snapshot snapshot);
+
+/*
+ * SERIALIZABLE predicate locks (lion_reader.c, DESIGN.md §9): what a reader
+ * takes on the pages it reads, and what an insert checks before it changes
+ * an entry.  All of them do nothing outside a SERIALIZABLE transaction.
+ */
+extern void lion_reader_lock_page(Relation index, BlockNumber blkno);
+extern void lion_reader_lock_entry(Relation index, BlockNumber leaf,
+								   const LionEntryTuple *entry);
+extern void lion_reader_lock_absent(Relation index, Buffer buf,
+									bool movedright);
+extern void lion_reader_lock_leaf(Relation index, Buffer buf,
+								  AttrNumber attno);
+extern void lion_writer_check(Relation index, Buffer leafbuf,
+							  OffsetNumber off, bool found);
+extern void lion_predlock_copy(Relation index, BlockNumber from,
+							   BlockNumber to);
+extern void lion_predlock_move(Relation index, BlockNumber from,
+							   BlockNumber to);
 
 
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */
