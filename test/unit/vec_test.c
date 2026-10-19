@@ -47,7 +47,9 @@
  *		top by a heap, lionvec_rank()'s set;
  *	  - the locator (vectors in TOAST): the chunks a vector takes, the runs
  *		made of their places and their checks, and the LOC pages a scan's
- *		members choose, against models.
+ *		members choose, against models;
+ *	  - the exact path's price of the pages it reads in order: a bitmap heap
+ *		scan's, as costsize.c prices it, bounded by the rows and the pages.
  *
  *	  Every array is an exact-size heap allocation, which `make unit
  *	  SANITIZE=1` checks to the byte.  Exit status is 0 only if every check
@@ -3894,6 +3896,49 @@ test_locator(void)
 	CHECK(ok, "select: the pages whose ranges hold a member's block, in order, once");
 }
 
+/*
+ * The exact path's page pricing (DESIGN.md §44.7, "Exact path pricing"):
+ * lionvec_pages_in_order() is costsize.c's price of a bitmap heap scan's
+ * pages - 875.23 for 966 rows of 834 pages at random_page_cost 4, the
+ * Bitmap Heap Scan's cost less its index's, CPU and target in EXPLAIN on
+ * 100,000 rows in TOAST; every page at seq_page_cost once the rows are
+ * twice the pages, even two of two; a single page at random_page_cost;
+ * never more pages than rows, nor than the relation has, at a price
+ * between the two; no rows, or no pages, counted as one; and equal prices
+ * give the pages.
+ */
+static void
+test_costs(void)
+{
+	bool		ok = true;
+	int			n;
+
+	cur_phase = "costs";
+	CHECK(fabs(lionvec_pages_in_order(966, 834, 4.0, 1.0) - 875.23) < 0.01,
+		  "pages in order: a bitmap heap scan's price, to the cent");
+	CHECK(lionvec_pages_in_order(2000, 1000, 4.0, 1.0) == 1000.0 &&
+		  lionvec_pages_in_order(1e9, 1000, 4.0, 1.0) == 1000.0 &&
+		  lionvec_pages_in_order(2000, 1000, 1.1, 1.0) == 1000.0,
+		  "pages in order: every page, sequentially, at twice as many rows");
+	CHECK(lionvec_pages_in_order(1, 1000, 4.0, 1.0) == 4.0 &&
+		  lionvec_pages_in_order(1, 1, 4.0, 1.0) == 4.0 &&
+		  lionvec_pages_in_order(0, 1000, 4.0, 1.0) == 4.0 &&
+		  lionvec_pages_in_order(5, 0, 4.0, 1.0) == 4.0 &&
+		  lionvec_pages_in_order(3, 2, 4.0, 1.0) == 2.0,
+		  "pages in order: one row a random page, no rows one, a relation of none one page");
+	for (n = 1; n <= 5000; n++)
+	{
+		double		T = 1.0 + (double) (n * 7919 % 3001);
+		double		pages = lionvec_pages_in_order(n, T, 1.5, 1.5) / 1.5;
+		double		c = lionvec_pages_in_order(n, T, 4.0, 1.0);
+
+		ok &= fabs(pages - rint(pages)) < 1e-9 && pages >= 1.0 &&
+			pages <= Min((double) n, T) &&
+			c >= pages - 1e-9 && c <= 4.0 * pages + 1e-9;
+	}
+	CHECK(ok, "pages in order: no more pages than rows or than the relation's, priced between the two");
+}
+
 int
 main(void)
 {
@@ -3925,6 +3970,7 @@ main(void)
 	test_regions();
 	test_prefetch();
 	test_locator();
+	test_costs();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
 	return nfail == 0 ? 0 : 1;
