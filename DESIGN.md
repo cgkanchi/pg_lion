@@ -26,7 +26,8 @@ entry deletion and page recycling in §18)
 - Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build
   (arrived in §24, "Build") and scan,
   fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
-  key sizes above LION_MAX_KEY_SIZE (§4; tsvector and jsonb keys past it are hashed, §17 and §42.1).
+  key sizes above LION_MAX_KEY_SIZE (§4; longer varlena keys are stored compressed, §4 "Long keys",
+  and tsvector, text array and jsonb keys past it are hashed, §17 and §42.1).
 
 ## 2. TID encoding
 
@@ -386,14 +387,53 @@ layout, which has a short header for INLINE entries and a longer one for CHAIN e
 
 Key data is stored with datumCopy semantics, except that a by-value type is stored at its own width
 (`typlen` bytes); fixed-length by-reference types as typlen bytes; varlena as a detoasted,
-4-byte-header varlena; cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2047 bytes,
-the 4-byte header included, are an ERROR, except where an opclass files a longer one under a hash:
-tsvector_ops a lexeme of more than 2043 bytes (§17, "Long lexemes"), jsonb_contains_ops any key
-past the limit (§42.1). *(The limit was 2000 bytes until format version 11, which a tsvector lexeme
+4-byte-header varlena, or a compressed one when that is too long (below); cstring as strlen+1
+bytes. Keys larger than LION_MAX_KEY_SIZE = 2047 bytes, the 4-byte header included, are an ERROR,
+except where an opclass files a longer one under a hash: tsvector_ops a lexeme of more than 2043
+bytes (§17, "Long lexemes"), array_ops a text, varchar or bytea element of more than 2043 bytes
+(§17, "Long elements"), jsonb_contains_ops any key past the limit (§42.1). *(The limit was 2000 bytes until format version 11, which a tsvector lexeme
 of up to 2047 bytes passes; a version 10 index is refused, since its jsonb keys of 2001 to 2047
 bytes are hashes that this build would look for whole.)* Entry lookup compares the key's hash, computed from the key and never stored, then
 calls the opclass equality operator's function (strategy 1 of the opfamily, looked up once per
 relation and cached in `rd_amcache`) with the index collation.
+
+### Long keys
+
+btree stores a long value compressed (`index_form_tuple()` compresses a varlena past
+`TOAST_INDEX_TARGET`) and checks its ~2704-byte limit against the compressed size, so it takes a
+value of any length that compresses well enough: `repeat('abc', 20000)` in 699 bytes, a `char(2500)`
+of `'code1'` and its blanks in a few dozen, a 5000-digit numeric in 49. A lion key that a plain
+4-byte header would put past `LION_MAX_KEY_SIZE` is stored the same way, COMPRESSED
+(`lion_key_form()`, lion_state.c): an inline compressed varlena, which every function of the type
+detoasts as it detoasts a heap value, so the key compares, hashes, prints and is emitted (GROUP BY,
+min/max, LionOrdered) as the value it is. Nothing else in the index looks at a key's bytes as the
+value: an entry is found by the opclass's comparison and equality, and the bytewise tail of the
+order (§21) and the owner stamps (§18) only need the stored bytes to be the entry's own.
+
+- A key that fits plain is stored plain, as before, so an index of short keys is unchanged.
+- One that arrives compressed (inline in the heap) and fits as it is is stored as it came, pglz or
+  lz4; any other is compressed with pglz, asked only to fit - not to save the quarter TOAST asks of
+  a heap value - and to give up as soon as its output passes the limit, so an incompressible value
+  of a megabyte costs a couple of kilobytes of work. Two equal values may therefore be stored in
+  different bytes, which the directory already allows (citext's 'Alice' and 'alice' are one entry).
+- A stored compressed key is checked like any other (§21, "Readers"): an inline compressed header
+  whose length is the key's, a method this build knows, and a raw length past the limit, since no
+  shorter key is ever compressed.
+- A value still over the limit compressed is the ERROR btree raises, worded alike, naming the index
+  and, from an insert or a build, the heap row (`lion_key_prepare()`, which the insert and the build
+  call on every key before they write anything): `index key size N exceeds lion maximum 2047 for
+  index "..."`, `Index row references tuple (b,o) in relation "..."`. btree's limit is about 650
+  bytes larger; an incompressible value between the two is the one value btree takes that lion
+  does not (below).
+- **Not done: incompressible ordered keys past the limit.** The pivot of an internal page is a key,
+  and three of them and a high key must fit a page (§21, "Split"), which is what sets the limit. A
+  hashed key - a prefix and a hash, rechecked - keeps neither the type's order nor its value, so
+  for an ordered scalar column it would have to live in an order of its own (a kind after VALUE),
+  every range and the ordered walks (LionOrdered, GROUP BY, count(DISTINCT), min/max, the
+  aggregates over keys, the semi and FK joins, the summaries) would have to merge it in from the
+  heap or decline at run time once the index held one, and the planner would have to cost that. A
+  multi-key column needs none of it: its keys are only ever looked up, which is why text array
+  elements are hashed (§17, "Long elements") and scalar keys are not.
 
 INLINE entries hold their containers in the entry tuple while the payload is ≤ `inline_limit`
 bytes (reloption, default 4096 = LION_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
@@ -1309,6 +1349,19 @@ members share their indexed values. Only for a plain column of a non-partial ind
 would have to be evaluated, and a partial index's rows are not all of the filter's. 5 is the ratio
 of a key counted in a batch (some 5 µs) to a row fetched and taken apart (some 1 µs), measured on
 the table below.
+
+**Hashed keys.** A key of 2043 bytes of a tsvector column, or of a text, varchar or bytea array
+column, may be the hashed key of longer lexemes or elements and a lexeme or element spelled like it
+(§17, "Long lexemes", "Long elements"), and its rows are all of theirs; `ts_stat()` and `GROUP BY e`
+show each with its own rows. So when such a key is counted (`lion_facets_keep_key()`), its rows that
+the filter keeps - its set ANDed with the filter's copy, or with the filter's own sets on a standby
+- are fetched under the snapshot as the selective filter's are, and each is counted under every
+lexeme or element of its own value that is filed under the key (`lion_ambiguous_values()`, which
+runs GIN's extraction without the hashing), the value being the index column's, an expression's
+too (`FormIndexDatum()`). The same rows the key's count counts, so each count is exact and none is
+larger than the key's bound: the top k's stop rule holds as it is. The selective filter's own read
+does the same for a row's hashed keys. Keys of `jsonb_contains_ops` past the limit keep no value to
+show and still print as `sha256:<hex>`.
 
 DEBUG1 reports each call: entries read, keys counted, whether the column was walked whole, rows
 read from the heap.
@@ -5579,7 +5632,7 @@ extractValue and extractQuery wrappers and in the ranking:
 - A lexeme of up to `LION_LEXEME_KEY_MAX` = 2043 bytes is its own key.
 - A longer one is filed under a key of exactly 2043 bytes: its first bytes, as many whole characters
   as fit in `LION_LEXEME_KEY_KEEP` = 1978, then `#` up to byte 1979, then the 64 hex digits of the
-  SHA-256 of the whole lexeme. Facets show it as that text.
+  SHA-256 of the whole lexeme. Facets show the lexeme itself (§7, "Facet counts").
 - **Exactness.** A 2043-byte key is ambiguous: it is a 2043-byte lexeme or the key of a longer one,
   and a 2043-byte lexeme can be spelled like another's key. So the extractQuery wrapper turns a
   query that names one into `LION_SEARCH_MODE_LOSSY`: every candidate is rechecked in the heap (the
@@ -5598,8 +5651,8 @@ extractValue and extractQuery wrappers and in the ranking:
   agree with the index. A lexeme that shares its key with no other scores as itself. Two lexemes of
   one row with one key count as one term with the positions of the first in the tsvector's order,
   which is the one the extraction keeps; the row's length counts both.
-- **Other keys** are not hashed: an array element, a scalar key or any other opclass's key past
-  `LION_MAX_KEY_SIZE` is still an ERROR.
+- **Other keys**: array_ops hashes long text, varchar and bytea elements the same way ("Long
+  elements" below); a scalar key past `LION_MAX_KEY_SIZE` is stored compressed (§4, "Long keys").
 
 `test/sql/tsvector_long.sql`: lexemes of 1990 to 2047 bytes (the 2047-byte ones through binary
 COPY), long ones that share their first 2030 bytes, multibyte ones, and a 2043-byte lexeme spelled
@@ -5607,6 +5660,31 @@ like another's key; AND, OR, NOT, phrases, weights and prefixes at and past the 
 keeps; bitmap, index, count and literal paths with and without positions against a sequential
 scan and GIN; BM25 against SQL and the LionBm25 scan against sorting; writes, VACUUM, REINDEX and
 verify; a scalar and an array key past the limit.
+
+### Long elements (2026-10-19)
+
+GIN takes an array element of any length whose compressed index tuple fits in ~2712 bytes. array_ops
+names `lion_array_extract_value()` and `lion_array_extract_query()`, which call `ginarrayextract()`
+and `ginqueryarrayextract()` and treat an element as tsvector_ops treats a lexeme: one of more than
+2043 bytes is filed under `lion_long_key()` of it - its first bytes, `#`, its SHA-256 in hex, 2043
+bytes in all - and a query that names an element of 2043 bytes or more is
+`LION_SEARCH_MODE_LOSSY`, every candidate rechecked, with the same planner behaviour as a long
+lexeme. So a long element is never an error, where GIN's limit applies to the compressed one.
+
+Only for an element type whose equality is equality of its bytes, so that a hash of the bytes is
+the same for two equal elements: text and varchar under a deterministic collation (the column's,
+as the extraction is called with it), and bytea, whose first bytes are cut anywhere rather than at
+a character. A hashed key is the type's own value - the directory calls the type's comparison and
+hash on it - and is equal only to a value spelled the same, which is 2043 bytes long and so
+rechecked as well. An element of any other type (numeric, citext, jsonb, ...) is a key as it is or,
+past the limit, compressed (§4, "Long keys"), and an ERROR when that does not fit, as GIN's is. The
+decision depends on the element's raw length alone, never on how well it compresses, so an insert
+and a query always agree on whether an element is hashed.
+
+`lion_index_facets()` shows a hashed key's elements, each with its own rows (§7, "Facet counts").
+`test/sql/long_keys.sql`: text, varchar and bytea elements of 2042 to 100000 bytes, multibyte and
+incompressible ones and one spelled like another's key, under `@>`, `&&` and `<@`, bitmap and count
+paths against a sequential scan and GIN, before and after writes, and the facets.
 
 ### Cardinality guard
 
@@ -6920,8 +6998,10 @@ two damaged bytes of a text key, `01 01` - the header of an INDIRECT TOAST point
 descent that compared against it detoast through whatever the page held, a SIGSEGV (2026-09-29
 review). A stored key has exactly one form, the one `lion_store_key()` writes: `typlen` bytes
 for a by-value type and for a fixed-length one, a plain 4-byte varlena header whose length is
-the key's (`PG_DETOAST_DATUM()` gives every stored key one), a cstring whose only NUL is its last
-byte, and at most `LION_MAX_KEY_SIZE` bytes in any case. So every key that comes off a page is
+the key's (`PG_DETOAST_DATUM()` gives every stored key one) - or, for a key too long for that, an
+inline compressed header of a method this build knows whose raw length is past the limit (§4,
+"Long keys") - a cstring whose only NUL is its last byte, and at most `LION_MAX_KEY_SIZE` bytes in
+any case. So every key that comes off a page is
 checked for that form before any opclass function sees it (`lion_entry_key()`, `lion_check_key()`,
 lion_state.c) - in the descent's comparisons, the prefix-run scans, the entry and summary walks, the
 posting sets' stored keys that LionOrdered and the GROUP BY counts emit, the planner's probes and
