@@ -195,7 +195,8 @@ SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
 The planner turns this into a `LionBm25` scan, which finds the top rows from the index and skips
 rows that can't make the cut, instead of scoring and sorting every match. `lion_bm25(index, query, k)`
 returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's
-BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable).
+BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable). An index on several tsvector columns ranks each one
+by its own statistics; name it with `col => 'body'`.
 
 ### Nearest neighbours
 

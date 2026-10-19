@@ -313,14 +313,14 @@ BEGIN
 			 ELSE ' | the ordinary plan: ' || roff END;
 END $$;
 
-REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) FROM PUBLIC;
 SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
 	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
 -- the score shown as well, which the scan's column stands in for too
 SELECT lion_exb('SELECT id, lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') FROM lion_exb
 	WHERE d @@ ''w1 & w3 & w4'' ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
 -- granted to one role: that one may, the other may not
-GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) TO lion_exec_user;
+GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) TO lion_exec_user;
 SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
 	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC');
 SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
@@ -350,8 +350,8 @@ RESET plan_cache_mode;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
 RESET enable_indexscan;
-REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) FROM lion_exec_user;
-GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8) TO PUBLIC;
+REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) FROM lion_exec_user;
+GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) TO PUBLIC;
 -- granted again: every role, and the same rows as the ordinary plan
 SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
 	ORDER BY lion_bm25_score(d, ''w1 & w3 & w4'', ''lion_exb_d'') DESC', 'lion_exec_other');
@@ -386,7 +386,7 @@ SELECT p.oid::regprocedure
                  'hashint4(int4)'::regprocedure,
                  'enum_eq(anyenum,anyenum)'::regprocedure, 'texteq(text,text)'::regprocedure,
                  'count()'::regprocedure, 'count("any")'::regprocedure,
-                 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8)'::regprocedure)
+                 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)'::regprocedure)
    AND NOT has_function_privilege('public', p.oid, 'EXECUTE');
 
 DROP FUNCTION lion_ex_def_other(int);
