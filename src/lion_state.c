@@ -18,16 +18,21 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/generic_xlog.h"
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/table.h"
+#include "access/toast_compression.h"
+#include "access/toast_internals.h"
+#include "catalog/index.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
+#include "common/pg_lzcompress.h"
 #include "miscadmin.h"
 #include "parser/parse_coerce.h"
 #include "utils/builtins.h"
@@ -754,6 +759,7 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 
 	memset(ix, 0, sizeof(LionIndexState));
 	ix->meta = *meta;
+	ix->indexrelid = RelationGetRelid(index);
 	ix->ncolumns = ncols;
 	ix->cols = (LionState *) MemoryContextAllocZero(cxt,
 													sizeof(LionState) * ncols);
@@ -994,9 +1000,195 @@ lion_hash_key(LionState *state, Datum key)
 }
 
 /*
+ * LONG KEYS (DESIGN.md §4, "Long keys").  A varlena key is stored with a
+ * plain 4-byte header, as PG_DETOAST_DATUM() gives it, when that fits in
+ * LION_MAX_KEY_SIZE.  A longer one is stored COMPRESSED, as btree's
+ * index_form_tuple() stores a long value: an inline compressed varlena, which
+ * every function that takes the type detoasts as it detoasts a heap value, so
+ * that the key compares, hashes and prints as the value does.  So a value of
+ * any length is a key when its compressed form fits - repeat('abc', 20000)
+ * in 699 bytes, a char(2500) of 'code1' and its blanks in a few dozen - and
+ * only a value whose compressed form is still past LION_MAX_KEY_SIZE is an
+ * ERROR (lion_key_too_long()).
+ *
+ * A value that arrives compressed and fits is stored as it came, pglz or lz4;
+ * one that does not is compressed with pglz, and asked only to fit
+ * (lion_key_pglz()), not to save the quarter TOAST asks of a heap value.  Two
+ * equal values may therefore be stored in different bytes, which the
+ * directory already allows (citext's 'Alice' and 'alice' are one entry under
+ * either's bytes): an entry is found by the opclass's comparison and
+ * equality, never by its bytes.  A key that fits uncompressed is never
+ * compressed, so every key of an index that has no long one is stored as it
+ * always was.
+ */
+
+/* Is v a compressed key in the form lion_key_form() stores it? */
+static bool
+lion_key_compressed_ok(const struct varlena *v, Size len)
+{
+	ToastCompressionId cmid;
+
+	if (len < VARHDRSZ_COMPRESSED || len > LION_MAX_KEY_SIZE ||
+		!VARATT_IS_4B_C(v) || VARSIZE(v) != len)
+		return false;
+	cmid = (ToastCompressionId) VARDATA_COMPRESSED_GET_COMPRESS_METHOD(v);
+	return (cmid == TOAST_PGLZ_COMPRESSION_ID ||
+			cmid == TOAST_LZ4_COMPRESSION_ID) &&
+		VARDATA_COMPRESSED_GET_EXTSIZE(v) > LION_MAX_KEY_SIZE - VARHDRSZ;
+}
+
+/*
+ * The plain value v compressed with pglz into a compressed inline varlena of
+ * at most LION_MAX_KEY_SIZE bytes, palloc'd; NULL when it does not get that
+ * small.  The strategy asks for no saving but the one that makes it fit, and
+ * gives up as soon as the output passes what would - so an incompressible
+ * value of a megabyte costs a couple of kilobytes of work, not a megabyte.
+ */
+static struct varlena *
+lion_key_pglz(const struct varlena *v)
+{
+	int32		valsize = VARSIZE(v) - VARHDRSZ;
+	int32		target = LION_MAX_KEY_SIZE - VARHDRSZ_COMPRESSED;
+	int32		percent = valsize / 100;
+	PGLZ_Strategy strategy = *PGLZ_strategy_always;
+	struct varlena *c;
+	int32		len;
+
+	/* pglz_compress() fails past (valsize / 100) * (100 - min_comp_rate) */
+	if (percent > 0)
+		strategy.min_comp_rate =
+			Max(0, 100 - (target + percent - 1) / percent);
+
+	c = (struct varlena *) palloc(PGLZ_MAX_OUTPUT(valsize) + VARHDRSZ_COMPRESSED);
+	len = pglz_compress(VARDATA(v), valsize,
+						(char *) c + VARHDRSZ_COMPRESSED, &strategy);
+	if (len < 0 || len > target)
+	{
+		pfree(c);
+		return NULL;
+	}
+	SET_VARSIZE_COMPRESSED(c, len + VARHDRSZ_COMPRESSED);
+	TOAST_COMPRESS_SET_SIZE_AND_COMPRESS_METHOD(c, valsize,
+												TOAST_PGLZ_COMPRESSION_ID);
+	return c;
+}
+
+/*
+ * The form the varlena key v is stored in: v itself, a palloc'd copy, or
+ * NULL when no form fits, and in *size the stored size - of the smallest
+ * form tried, when none fits.
+ */
+static struct varlena *
+lion_key_form(struct varlena *v, Size *size)
+{
+	struct varlena *plain = v;
+	struct varlena *c;
+
+	if (VARATT_IS_EXTERNAL(v))
+		plain = detoast_external_attr(v);
+	if (VARATT_IS_COMPRESSED(plain))
+	{
+		if (lion_key_compressed_ok(plain, VARSIZE(plain)))
+		{
+			*size = VARSIZE(plain);
+			return plain;
+		}
+		c = detoast_attr(plain);
+		if (plain != v)
+			pfree(plain);
+		plain = c;
+	}
+	else if (VARATT_IS_SHORT(plain))
+		plain = detoast_attr(plain);	/* a 4-byte header */
+
+	*size = VARSIZE(plain);
+	if (*size <= LION_MAX_KEY_SIZE)
+		return plain;
+
+	c = lion_key_pglz(plain);
+	if (plain != v)
+		pfree(plain);
+	if (c == NULL)
+		return NULL;
+	*size = VARSIZE(c);
+	return c;
+}
+
+/*
+ * A key too long to store, the ERROR btree raises for a value too long for
+ * an index tuple, of the index and - when the caller knows it - the heap row.
+ */
+static void
+lion_key_too_long(LionState *state, Size size, Relation heap, ItemPointer tid)
+{
+	Oid			indexoid = (state->ix != NULL) ? state->ix->indexrelid :
+		InvalidOid;
+	char	   *idxname = OidIsValid(indexoid) ? get_rel_name(indexoid) : NULL;
+	char	   *relname = NULL;
+
+	if (tid != NULL)
+	{
+		if (heap != NULL)
+			relname = RelationGetRelationName(heap);
+		else if (OidIsValid(indexoid))
+			relname = get_rel_name(IndexGetRelation(indexoid, true));
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			 errmsg("index key size %zu exceeds lion maximum %d for index \"%s\"",
+					size, LION_MAX_KEY_SIZE,
+					idxname != NULL ? idxname : "?"),
+			 (tid != NULL && relname != NULL) ?
+			 errdetail("Index row references tuple (%u,%u) in relation \"%s\".",
+					   ItemPointerGetBlockNumber(tid),
+					   ItemPointerGetOffsetNumber(tid), relname) : 0,
+			 errhint("Values whose stored form, compressed when it is larger, is over %d bytes cannot be indexed.\n"
+					 "Consider a function index of an MD5 hash of the value, or use full text indexing.",
+					 LION_MAX_KEY_SIZE),
+			 heap != NULL && idxname != NULL ?
+			 errtableconstraint(heap, idxname) : 0));
+}
+
+/*
+ * The key as it will be stored, for an insert or a build that has it from
+ * the heap row at tid (heap may be NULL; tid too, then the ERROR names no
+ * row): a key that fits as it is comes back as it is, a long varlena one in
+ * the form lion_key_form() gives it, so that lion_key_datum_size() and
+ * lion_store_key() do not compress it again, and a key too long to store is
+ * the ERROR, before anything is written.
+ */
+Datum
+lion_key_prepare(LionState *state, Datum key, Relation heap, ItemPointer tid)
+{
+	struct varlena *v;
+	struct varlena *form;
+	Size		size;
+
+	if (state->typlen == -2)
+	{
+		size = strlen(DatumGetCString(key)) + 1;
+		if (size > LION_MAX_KEY_SIZE)
+			lion_key_too_long(state, size, heap, tid);
+		return key;
+	}
+	if (state->typlen != -1)
+		return key;
+
+	v = (struct varlena *) DatumGetPointer(key);
+	if (VARATT_IS_SHORT(v) ||
+		(VARATT_IS_4B_U(v) && VARSIZE(v) <= LION_MAX_KEY_SIZE))
+		return key;
+	form = lion_key_form(v, &size);
+	if (form == NULL)
+		lion_key_too_long(state, size, heap, tid);
+	return PointerGetDatum(form);
+}
+
+/*
  * Number of bytes needed to store key (DESIGN.md §21, "Entry tuples"): a
  * by-value key at its type's width, a by-reference one with datumCopy
- * semantics.
+ * semantics, a long varlena one compressed (above).
  */
 Size
 lion_key_datum_size(LionState *state, Datum key)
@@ -1007,9 +1199,11 @@ lion_key_datum_size(LionState *state, Datum key)
 		size = (Size) state->typlen;
 	else if (state->typlen == -1)
 	{
-		struct varlena *v = PG_DETOAST_DATUM(key);
+		struct varlena *v = lion_key_form((struct varlena *) DatumGetPointer(key),
+										  &size);
 
-		size = VARSIZE(v);
+		if (v == NULL)
+			lion_key_too_long(state, size, NULL, NULL);
 		if ((Pointer) v != DatumGetPointer(key))
 			pfree(v);
 	}
@@ -1020,10 +1214,7 @@ lion_key_datum_size(LionState *state, Datum key)
 	}
 
 	if (size > LION_MAX_KEY_SIZE)
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("lion index key size %zu exceeds maximum %d",
-						size, LION_MAX_KEY_SIZE)));
+		lion_key_too_long(state, size, NULL, NULL);
 
 	return size;
 }
@@ -1040,8 +1231,12 @@ lion_store_key(LionState *state, Datum key, char *dest)
 		memcpy(dest, DatumGetPointer(key), (Size) state->typlen);
 	else if (state->typlen == -1)
 	{
-		struct varlena *v = PG_DETOAST_DATUM(key);
+		Size		size;
+		struct varlena *v = lion_key_form((struct varlena *) DatumGetPointer(key),
+										  &size);
 
+		if (v == NULL)
+			lion_key_too_long(state, size, NULL, NULL);
 		memcpy(dest, v, VARSIZE(v));
 		if ((Pointer) v != DatumGetPointer(key))
 			pfree(v);
@@ -1085,7 +1280,10 @@ lion_fetch_key(LionState *state, const char *src)
  *	fixed length	typlen bytes;
  *	varlena			a plain 4-byte header whose length is the key's -
  *					PG_DETOAST_DATUM() gives every stored key one, never a
- *					short, compressed or external one;
+ *					short or external one - or, for a key too long for
+ *					that, an inline compressed one of a method this build
+ *					knows whose raw length is past LION_MAX_KEY_SIZE
+ *					(lion_key_form(): no shorter key is ever compressed);
  *	cstring			its terminating NUL as its last byte, and no other;
  *
  * and 1 .. LION_MAX_KEY_SIZE bytes in any case.  A few comparisons (a strnlen
@@ -1099,8 +1297,9 @@ lion_key_is_valid(LionState *state, const char *key, Size keylen)
 	if (state->typlen > 0)
 		return keylen == (Size) state->typlen;
 	if (state->typlen == -1)
-		return keylen >= VARHDRSZ && VARATT_IS_4B_U(key) &&
-			VARSIZE(key) == keylen;
+		return keylen >= VARHDRSZ &&
+			((VARATT_IS_4B_U(key) && VARSIZE(key) == keylen) ||
+			 lion_key_compressed_ok((const struct varlena *) key, keylen));
 	return strnlen(key, keylen) == keylen - 1;
 }
 

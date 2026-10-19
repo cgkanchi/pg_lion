@@ -146,6 +146,9 @@ typedef struct LionFacetRun
 	PGAlignedBlock *images;		/* ... and their cursors' page images */
 	MemoryContext percount;		/* reset around every count */
 	MemoryContext keycxt;		/* the keys kept */
+	EState	   *estate;			/* the key column's value of a row, made by
+								 * lion_facets_row_value(); NULL until then */
+	IndexInfo  *indexinfo;
 
 	/* the keys counted, and a min-heap of the k largest counts */
 	LionFacetKey *res;
@@ -930,6 +933,335 @@ lion_facets_keep(LionFacetRun *run, LionFacetKey *k, int64 count)
 		lion_facets_heap_push(run, count);
 }
 
+/* ---------------------------------------------------------------------
+ * The rows of a set, read from the heap
+ * --------------------------------------------------------------------- */
+
+/* What lion_facets_rows() hands each row it fetches to. */
+typedef void (*LionFacetRowFn) (LionFacetRun *run, TupleTableSlot *slot,
+								void *arg);
+
+/*
+ * Every row of stream's TIDs that the snapshot sees, fetched as an index scan
+ * fetches it (table_index_fetch_tuple(): the HOT chain followed, the snapshot
+ * applied, the predicate lock taken) and handed to fn in a context of its
+ * own, which is reset around each: not percount, which a caller's counts may
+ * still be in (lion_facets_count_keep()).
+ */
+static void
+lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
+				 void *arg)
+{
+#if PG_VERSION_NUM < 200000
+	IndexFetchTableData *fetch;
+#endif
+	TupleTableSlot *slot;
+	const LionContainer *c;
+	uint16	   *los;
+	MemoryContext rowcxt;
+	MemoryContext oldcxt;
+
+	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	rowcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "lion index facet row",
+								   ALLOCSET_DEFAULT_SIZES);
+	/*
+	 * The heap side of an index scan, as lo_fetch_walk() has it: 19 gave
+	 * table_index_fetch_begin() scan options, and 20 moved the HOT chain
+	 * search into the table AM (table_fetch_tid(), then the version it found).
+	 */
+#if PG_VERSION_NUM >= 200000
+#elif PG_VERSION_NUM >= 190000
+	fetch = table_index_fetch_begin(run->heap, SO_NONE);
+#else
+	fetch = table_index_fetch_begin(run->heap);
+#endif
+	slot = table_slot_create(run->heap, NULL);
+
+	while ((c = lion_stream_next(stream)) != NULL)
+	{
+		uint32		n = lion_container_to_array(c, los);
+		uint32		i;
+
+		CHECK_FOR_INTERRUPTS();
+		for (i = 0; i < n; i++)
+		{
+			ItemPointerData tid;
+			bool		all_dead = false;
+
+			lion_code_to_tid(lion_make_code(c->ckey, los[i]), &tid);
+#if PG_VERSION_NUM >= 200000
+			if (!table_fetch_tid(run->heap, &tid, run->snapshot, &all_dead) ||
+				!table_tuple_fetch_row_version(run->heap, &tid, run->snapshot,
+												slot))
+				continue;
+#else
+			{
+				bool		call_again = false;
+
+				if (!table_index_fetch_tuple(fetch, &tid, run->snapshot, slot,
+											 &call_again, &all_dead))
+					continue;
+			}
+#endif
+			run->fetched++;
+
+			MemoryContextReset(rowcxt);
+			oldcxt = MemoryContextSwitchTo(rowcxt);
+			fn(run, slot, arg);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+#if PG_VERSION_NUM < 200000
+	table_index_fetch_end(fetch);
+#endif
+	pfree(los);
+	MemoryContextDelete(rowcxt);
+}
+
+/* The keys of the rows, as a hash table under the column's own equality. */
+typedef struct LionFacetHashEnt
+{
+	Datum		key;
+	int64		count;
+} LionFacetHashEnt;
+
+static LionState *lion_facets_hash_state;
+
+static uint32
+lion_facets_hash(const void *key, Size keysize)
+{
+	return lion_hash_key(lion_facets_hash_state, *(const Datum *) key);
+}
+
+static int
+lion_facets_match(const void *key1, const void *key2, Size keysize)
+{
+	return lion_keys_equal(lion_facets_hash_state, *(const Datum *) key1,
+						   *(const Datum *) key2) ? 0 : 1;
+}
+
+static HTAB *
+lion_facets_htab(LionFacetRun *run)
+{
+	HASHCTL		ctl;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Datum);
+	ctl.entrysize = sizeof(LionFacetHashEnt);
+	ctl.hash = lion_facets_hash;
+	ctl.match = lion_facets_match;
+	ctl.hcxt = run->keycxt;
+	lion_facets_hash_state = run->state;
+	return hash_create("lion index facets", 1024, &ctl,
+					   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+}
+
+/* One row under key: its entry in htab, made with a copy of the key if new. */
+static void
+lion_facets_heap_add(LionFacetRun *run, HTAB *htab, Datum key)
+{
+	LionFacetHashEnt *ent;
+	bool		found;
+
+	lion_facets_hash_state = run->state;
+	ent = (LionFacetHashEnt *) hash_search(htab, &key, HASH_ENTER, &found);
+	if (!found)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(run->keycxt);
+
+		ent->key = datumCopy(key, run->state->typbyval, run->state->typlen);
+		ent->count = 0;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	ent->count++;
+}
+
+/*
+ * Every key of htab with its count, passed to lion_facets_keep() with bound
+ * as its bound, and htab destroyed.  Each entry's key passes to
+ * lion_facets_keep(), which may free it; the table is only walked and
+ * destroyed after that, never searched.
+ */
+static void
+lion_facets_keep_htab(LionFacetRun *run, HTAB *htab, uint64 bound)
+{
+	HASH_SEQ_STATUS seq;
+	LionFacetHashEnt *ent;
+
+	hash_seq_init(&seq, htab);
+	while ((ent = (LionFacetHashEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		LionFacetKey k;
+
+		k.ntids = bound;
+		k.count = ent->count;
+		k.key = ent->key;
+		k.isnull = false;
+		lion_facets_keep(run, &k, ent->count);
+	}
+	hash_destroy(htab);
+	lion_facets_hash_state = NULL;
+}
+
+/* ---------------------------------------------------------------------
+ * Hashed keys
+ * --------------------------------------------------------------------- */
+
+/*
+ * A key of LION_LEXEME_KEY_MAX bytes of a tsvector column, or of a text or
+ * bytea array one (lion_key_is_ambiguous()), may be the hashed key of longer
+ * lexemes or elements as well as one spelled like it (DESIGN.md §17, "Long
+ * lexemes"), and its rows are those of all of them.  ts_stat() and `GROUP BY
+ * e` show each with its own rows, and so does this: the key's rows that the
+ * filter keeps and the snapshot sees are read from the heap, and each is
+ * counted under every value of its own that is filed under the key
+ * (lion_ambiguous_values()) - the rows the key's count counts, so the counts
+ * of its values are exact and none is larger than the key's bound.  A row's
+ * value is the index column's, an expression's too (FormIndexDatum()).
+ */
+static Datum
+lion_facets_row_value(LionFacetRun *run, TupleTableSlot *slot, bool *isnull)
+{
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnulls[INDEX_MAX_KEYS];
+	ExprContext *econtext;
+
+	if (run->estate == NULL)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(run->keycxt);
+
+		run->indexinfo = BuildIndexInfo(run->index);
+		run->estate = CreateExecutorState();
+		MemoryContextSwitchTo(oldcxt);
+	}
+	econtext = GetPerTupleExprContext(run->estate);
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = slot;
+	FormIndexDatum(run->indexinfo, slot, run->estate, values, isnulls);
+	*isnull = isnulls[run->attno - 1];
+	return values[run->attno - 1];
+}
+
+typedef struct LionFacetResolve
+{
+	HTAB	   *htab;
+	Datum		key;
+} LionFacetResolve;
+
+static void
+lion_facets_resolve_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
+{
+	LionFacetResolve *r = (LionFacetResolve *) arg;
+	Datum	   *values;
+	bool		isnull;
+	Datum		value = lion_facets_row_value(run, slot, &isnull);
+	int			n;
+	int			i;
+
+	if (isnull)
+		return;
+	n = lion_ambiguous_values(run->state, value, r->key, &values);
+	for (i = 0; i < n; i++)
+		lion_facets_heap_add(run, r->htab, values[i]);
+}
+
+/* A copy of tree with every key number moved up by off. */
+static LionKeyNode *
+lion_facets_tree_shift(const LionKeyNode *tree, int off)
+{
+	LionKeyNode *n = (LionKeyNode *) palloc(sizeof(LionKeyNode));
+	int			i;
+
+	*n = *tree;
+	if (tree->kind == LION_KN_KEY)
+		n->keyno = tree->keyno + off;
+	if (tree->nargs > 0)
+	{
+		n->args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * tree->nargs);
+		for (i = 0; i < tree->nargs; i++)
+			n->args[i] = lion_facets_tree_shift(tree->args[i], off);
+	}
+	return n;
+}
+
+/*
+ * The values a hashed key k stands for, each kept with its own count; k's
+ * copy is freed.
+ */
+static void
+lion_facets_resolve(LionFacetRun *run, LionFacetKey *k)
+{
+	MemoryContext setcxt;
+	MemoryContext oldcxt;
+	LionFacetResolve r;
+	LionPostingSet *sets;
+	LionKeyNode *tree = NULL;
+	int			nsets = 1;
+	LionSetStream *stream;
+
+	setcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "lion index facet key rows",
+								   ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(setcxt);
+	r.htab = lion_facets_htab(run);
+	r.key = k->key;
+
+	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
+									  (1 + Max(run->filtersrc.nsets, 1)));
+	if (lion_posting_set_lookup_col(run->index, run->attno, k->key,
+									InvalidOid, &sets[0]))
+	{
+		LionKeyNode *args[2];
+
+		if (run->hascopy)
+		{
+			sets[1] = run->copy;
+			nsets = 2;
+			args[0] = lion_keynode_leaf(0);
+			args[1] = lion_keynode_leaf(1);
+			tree = lion_keynode_op(LION_KN_AND, args, 2);
+		}
+		else if (run->hasfilter)
+		{
+			LionKeyNode *ftree = lion_source_tree(&run->filtersrc);
+
+			if (ftree == NULL)
+				elog(ERROR, "lion index facets: a filter with no sets");
+			memcpy(&sets[1], run->filtersrc.sets,
+				   sizeof(LionPostingSet) * run->filtersrc.nsets);
+			nsets = 1 + run->filtersrc.nsets;
+			args[0] = lion_keynode_leaf(0);
+			args[1] = lion_facets_tree_shift(ftree, 1);
+			tree = lion_keynode_op(LION_KN_AND, args, 2);
+		}
+		stream = lion_stream_begin(nsets, sets, tree, false);
+		lion_facets_rows(run, stream, lion_facets_resolve_row, &r);
+		lion_stream_end(stream);
+	}
+	lion_posting_set_release(&sets[0]);
+	MemoryContextSwitchTo(oldcxt);
+
+	lion_facets_keep_htab(run, r.htab, k->ntids);
+	lion_facets_key_free(run, k);
+	MemoryContextDelete(setcxt);
+}
+
+/*
+ * Keep a key counted from the index, as lion_facets_keep() does - or, for a
+ * hashed key with rows, the values it stands for.
+ */
+static void
+lion_facets_keep_key(LionFacetRun *run, LionFacetKey *k, int64 count)
+{
+	if (count > 0 && !k->isnull && lion_key_is_ambiguous(run->state, k->key))
+		lion_facets_resolve(run, k);
+	else
+		lion_facets_keep(run, k, count);
+}
+
 /*
  * Count n keys and keep them, each passed to lion_facets_keep() or freed.
  * Against a collected filter they are counted together, a batch at a time
@@ -953,7 +1285,8 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 	if (!run->hascopy || n == 1)
 	{
 		for (i = 0; i < n; i++)
-			lion_facets_keep(run, &keys[i], lion_facets_count(run, &keys[i]));
+			lion_facets_keep_key(run, &keys[i],
+								 lion_facets_count(run, &keys[i]));
 		return;
 	}
 
@@ -991,7 +1324,7 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 	MemoryContextSwitchTo(oldcxt);
 
 	for (i = 0; i < nfound; i++)
-		lion_facets_keep(run, &keys[which[i]], counts[i]);
+		lion_facets_keep_key(run, &keys[which[i]], counts[i]);
 }
 
 /*
@@ -1080,28 +1413,6 @@ lion_facets_walk(LionFacetRun *run)
  */
 #define LION_FACET_KEY_ROWS		5
 
-/* The keys of the rows, as a hash table under the column's own equality. */
-typedef struct LionFacetHashEnt
-{
-	Datum		key;
-	int64		count;
-} LionFacetHashEnt;
-
-static LionState *lion_facets_hash_state;
-
-static uint32
-lion_facets_hash(const void *key, Size keysize)
-{
-	return lion_hash_key(lion_facets_hash_state, *(const Datum *) key);
-}
-
-static int
-lion_facets_match(const void *key1, const void *key2, Size keysize)
-{
-	return lion_keys_equal(lion_facets_hash_state, *(const Datum *) key1,
-						   *(const Datum *) key2) ? 0 : 1;
-}
-
 /*
  * May the filter's rows be read from the heap instead?  The key column must
  * be a column of the table - its value is read from the row - and the index
@@ -1116,26 +1427,6 @@ lion_facets_heap_ok(LionFacetRun *run)
 					   NULL);
 }
 
-/* One row under key: its entry in htab, made with a copy of the key if new. */
-static void
-lion_facets_heap_add(LionFacetRun *run, HTAB *htab, Datum key)
-{
-	LionFacetHashEnt *ent;
-	bool		found;
-
-	lion_facets_hash_state = run->state;
-	ent = (LionFacetHashEnt *) hash_search(htab, &key, HASH_ENTER, &found);
-	if (!found)
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(run->keycxt);
-
-		ent->key = datumCopy(key, run->state->typbyval, run->state->typlen);
-		ent->count = 0;
-		MemoryContextSwitchTo(oldcxt);
-	}
-	ent->count++;
-}
-
 /*
  * The keys of every row of the filter's copy that the snapshot sees, counted:
  * what `SELECT e, count(*) ... GROUP BY e` does over the rows the filter
@@ -1147,140 +1438,80 @@ lion_facets_heap_add(LionFacetRun *run, HTAB *htab, Datum key)
  * the index's own extraction, which drops NULL and repeated elements, and
  * grouped under the column's equality - the index's entries' classes.
  */
+typedef struct LionFacetHeapRows
+{
+	HTAB	   *htab;
+	AttrNumber	heapatt;
+	int64		nullcount;
+} LionFacetHeapRows;
+
+static void
+lion_facets_heap_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
+{
+	LionFacetHeapRows *h = (LionFacetHeapRows *) arg;
+	bool		isnull;
+	Datum		value = slot_getattr(slot, h->heapatt, &isnull);
+
+	if (isnull)
+	{
+		/* the NULL group of GROUP BY col; unnest(NULL) is no row */
+		if (!run->state->multikey)
+			h->nullcount++;
+	}
+	else if (run->state->multikey)
+	{
+		Datum	   *keys;
+		int			nkeys = lion_extract_value(run->state, value, &keys);
+		int			j;
+
+		for (j = 0; j < nkeys; j++)
+		{
+			if (lion_is_length_key(run->state, keys[j]))
+				continue;
+			/* a hashed key: the row's own values under it (above) */
+			if (lion_key_is_ambiguous(run->state, keys[j]))
+			{
+				Datum	   *values;
+				int			n = lion_ambiguous_values(run->state, value,
+													  keys[j], &values);
+				int			i;
+
+				for (i = 0; i < n; i++)
+					lion_facets_heap_add(run, h->htab, values[i]);
+			}
+			else
+				lion_facets_heap_add(run, h->htab, keys[j]);
+		}
+	}
+	else
+		lion_facets_heap_add(run, h->htab, value);
+}
+
 static void
 lion_facets_heap(LionFacetRun *run)
 {
-	AttrNumber	heapatt = run->index->rd_index->indkey.values[run->attno - 1];
-	HASHCTL		ctl;
-	HTAB	   *htab;
-	HASH_SEQ_STATUS seq;
-	LionFacetHashEnt *ent;
+	LionFacetHeapRows h;
 	LionSetStream *stream;
-#if PG_VERSION_NUM < 200000
-	IndexFetchTableData *fetch;
-#endif
-	TupleTableSlot *slot;
-	const LionContainer *c;
-	uint16	   *los;
-	int64		nullcount = 0;
-	MemoryContext oldcxt;
 
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Datum);
-	ctl.entrysize = sizeof(LionFacetHashEnt);
-	ctl.hash = lion_facets_hash;
-	ctl.match = lion_facets_match;
-	ctl.hcxt = run->keycxt;
-	lion_facets_hash_state = run->state;
-	htab = hash_create("lion index facets", 1024, &ctl,
-					   HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
+	h.htab = lion_facets_htab(run);
+	h.heapatt = run->index->rd_index->indkey.values[run->attno - 1];
+	h.nullcount = 0;
 
-	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 	stream = lion_stream_begin(1, &run->copy, NULL, false);
-	/*
-	 * The heap side of an index scan, as lo_fetch_walk() has it: 19 gave
-	 * table_index_fetch_begin() scan options, and 20 moved the HOT chain
-	 * search into the table AM (table_fetch_tid(), then the version it found).
-	 */
-#if PG_VERSION_NUM >= 200000
-#elif PG_VERSION_NUM >= 190000
-	fetch = table_index_fetch_begin(run->heap, SO_NONE);
-#else
-	fetch = table_index_fetch_begin(run->heap);
-#endif
-	slot = table_slot_create(run->heap, NULL);
-
-	while ((c = lion_stream_next(stream)) != NULL)
-	{
-		uint32		n = lion_container_to_array(c, los);
-		uint32		i;
-
-		CHECK_FOR_INTERRUPTS();
-		for (i = 0; i < n; i++)
-		{
-			ItemPointerData tid;
-			bool		all_dead = false;
-			bool		isnull;
-			Datum		value;
-
-			lion_code_to_tid(lion_make_code(c->ckey, los[i]), &tid);
-#if PG_VERSION_NUM >= 200000
-			if (!table_fetch_tid(run->heap, &tid, run->snapshot, &all_dead) ||
-				!table_tuple_fetch_row_version(run->heap, &tid, run->snapshot,
-												slot))
-				continue;
-#else
-			{
-				bool		call_again = false;
-
-				if (!table_index_fetch_tuple(fetch, &tid, run->snapshot, slot,
-											 &call_again, &all_dead))
-					continue;
-			}
-#endif
-			run->fetched++;
-
-			MemoryContextReset(run->percount);
-			oldcxt = MemoryContextSwitchTo(run->percount);
-			value = slot_getattr(slot, heapatt, &isnull);
-			if (isnull)
-			{
-				/* the NULL group of GROUP BY col; unnest(NULL) is no row */
-				if (!run->state->multikey)
-					nullcount++;
-			}
-			else if (run->state->multikey)
-			{
-				Datum	   *keys;
-				int			nkeys = lion_extract_value(run->state, value, &keys);
-				int			j;
-
-				for (j = 0; j < nkeys; j++)
-				{
-					if (!lion_is_length_key(run->state, keys[j]))
-						lion_facets_heap_add(run, htab, keys[j]);
-				}
-			}
-			else
-				lion_facets_heap_add(run, htab, value);
-			MemoryContextSwitchTo(oldcxt);
-		}
-	}
-
-	ExecDropSingleTupleTableSlot(slot);
-#if PG_VERSION_NUM < 200000
-	table_index_fetch_end(fetch);
-#endif
+	lion_facets_rows(run, stream, lion_facets_heap_row, &h);
 	lion_stream_end(stream);
-	pfree(los);
 
-	/*
-	 * Each entry's key passes to lion_facets_keep(), which may free it; the
-	 * table is only walked and destroyed after that, never searched.
-	 */
-	hash_seq_init(&seq, htab);
-	while ((ent = (LionFacetHashEnt *) hash_seq_search(&seq)) != NULL)
+	lion_facets_keep_htab(run, h.htab, 0);
+	if (h.nullcount > 0)
 	{
 		LionFacetKey k;
 
 		k.ntids = 0;
-		k.count = ent->count;
-		k.key = ent->key;
-		k.isnull = false;
-		lion_facets_keep(run, &k, ent->count);
-	}
-	if (nullcount > 0)
-	{
-		LionFacetKey k;
-
-		k.ntids = 0;
-		k.count = nullcount;
+		k.count = h.nullcount;
 		k.key = (Datum) 0;
 		k.isnull = true;
-		lion_facets_keep(run, &k, nullcount);
+		lion_facets_keep(run, &k, h.nullcount);
 	}
-	hash_destroy(htab);
-	lion_facets_hash_state = NULL;
 }
 
 /* How many entries of the column hold a key's rows: a walk of the headers. */
@@ -1601,6 +1832,8 @@ lion_index_facets(PG_FUNCTION_ARGS)
 	if (run.hascopy)
 		lion_posting_set_release(&run.copy);
 	lion_vis_cache_destroy(run.cache);
+	if (run.estate != NULL)
+		FreeExecutorState(run.estate);
 	MemoryContextDelete(run.percount);
 	MemoryContextDelete(run.keycxt);
 	lion_count_sql_close(&call);
