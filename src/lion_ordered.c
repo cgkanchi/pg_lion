@@ -521,9 +521,20 @@ typedef struct LionTidSet
 /*
  * Bytes of directory the planner counts per container key, on top of the
  * container (§30.3): keys[] and conts[] grow by doubling, so about a third
- * over their entries.
+ * over their entries; and the key's first place (LionOrderedState.places).
  */
-#define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4))
+#define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4 + \
+									 sizeof(uint64)))
+
+/*
+ * The walk's visited bits (DESIGN.md §30.4, "Stopping early"), a bit a place
+ * of the set's members (lion_container_places()), come in chunks of this
+ * many, each made when the walk first meets a member of its places: a
+ * LIMIT walk that meets a few members clears a few chunks, not a bit for
+ * every member of the set.
+ */
+#define LO_VISITED_BITS		((uint64) LION_CONTAINER_RANGE)
+#define LO_VISITED_BYTES	((Size) (LO_VISITED_BITS / 8))
 
 /*
  * A flush of a key's gathered members (lo_gather_flush()) merges them
@@ -759,9 +770,11 @@ typedef struct LionOrderedState
 	LionArena  *arena;			/* the set past hash_mem (§30.4, "Spilling") */
 	File		arenafile;		/* its temporary file, once needed */
 	MemoryContextCallback arenacb;	/* unmaps it with the query's memory */
-	Size		spillbytes;		/* EXPLAIN: arena bytes the last build took */
+	Size		spillbytes;		/* EXPLAIN: arena bytes the last build and its
+								 * walks' visited bits took */
 	bool		exact;
 	uint64		members;		/* members of the set */
+	uint64	   *places;			/* [set->n + 1]: the places before each key */
 
 	/*
 	 * ... or the set evaluated only at the container keys the walk meets
@@ -785,14 +798,15 @@ typedef struct LionOrderedState
 	uint64		lazywhy[LO_LAZY_NWHY];	/* ... and why it was built, per build */
 
 	/*
-	 * This scan's walk (DESIGN.md §30.4): which members it has met, one
-	 * bitmap per container key touched, so that a member counts once however
-	 * often the walk meets its TID; and the fetch-and-sort switch.
+	 * This scan's walk (DESIGN.md §30.4): which members it has met, a bit a
+	 * place (places[] above), so that a member counts once however often the
+	 * walk meets its TID - the bits in chunks of LO_VISITED_BITS,
+	 * lo_set_alloc()'s as the set's memory is, within hash_mem and past it in
+	 * the arena; and the fetch-and-sort switch.
 	 */
 	MemoryContext scancxt;		/* reset per scan */
-	uint64	  **visited;		/* [set->n], NULL until touched */
-	Size		visitedbytes;
-	bool		novisit;		/* over budget: no early stop, no switch */
+	uint64	  **visited;		/* [nvisited], NULL until a member is met */
+	uint64		nvisited;		/* chunks */
 	uint64		distinct;		/* members met in this scan */
 	uint64		scanwalked;		/* entries walked in this scan */
 	uint64		scanreturned;	/* rows this scan returned */
@@ -838,7 +852,6 @@ typedef struct LionOrderedState
 	bool		sorted;			/* sortstats are the last switch's */
 	TuplesortInstrumentation sortstats;
 	uint64		earlystops;		/* scans the early stop ended */
-	uint64		uncounted;		/* scans that stopped counting members */
 } LionOrderedState;
 
 static Plan *lo_plan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -850,6 +863,7 @@ static TupleTableSlot *lo_exec(CustomScanState *node);
 static void lo_end(CustomScanState *node);
 static void lo_rescan(CustomScanState *node);
 static void lo_scan_reset(LionOrderedState *st);
+static bool lo_mark_place(LionOrderedState *st, int idx, uint32 place);
 static void lo_explain(CustomScanState *node, List *ancestors,
 					   ExplainState *es);
 
@@ -1355,13 +1369,16 @@ lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
 /*
  * The bytes the set is expected to take (DESIGN.md §30.3): a directory
  * entry and a container header a key, and two bytes a member up to a
- * BITSET a key.
+ * BITSET a key; and the walk's visited bits, a bit a place, counted as a
+ * bit a member - an ARRAY's or a RUN's places are its members, a bitmap's
+ * its bits, as many bytes as the bitmap itself takes.
  */
 static double
 lo_set_bytes(double members, double ncont)
 {
 	return ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
-		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES) +
+		members / 8.0;
 }
 
 /*
@@ -4220,6 +4237,8 @@ lo_build_set(LionOrderedState *st)
 {
 	int			i;
 
+	/* the walk's visited bits are given back before (lo_scan_reset()) */
+	Assert(st->visited == NULL);
 	MemoryContextReset(st->setcxt);
 	if (st->arena != NULL)
 		lion_arena_reset(st->arena);
@@ -4233,10 +4252,21 @@ lo_build_set(LionOrderedState *st)
 	st->set = lo_build_node(st, st->tree);
 	MemoryContextReset(st->buildcxt);
 
+	/*
+	 * The members, and the places of the walk's visited bits before each key
+	 * (§30.4, "Stopping early"): at most LION_CONTAINER_RANGE a key.
+	 */
 	st->ncont = st->set->n;
 	st->members = 0;
+	st->places = (uint64 *) lo_set_alloc(st, st->setcxt,
+										 sizeof(uint64) * ((Size) st->set->n + 1));
+	st->places[0] = 0;
 	for (i = 0; i < st->set->n; i++)
+	{
 		st->members += st->set->conts[i]->cardinality;
+		st->places[i + 1] = st->places[i] +
+			lion_container_places(st->set->conts[i]);
+	}
 	st->spillbytes = st->spilled ? lion_arena_used(st->arena) : 0;
 	st->builds++;
 }
@@ -4664,12 +4694,12 @@ lo_set_key_index(const LionTidSet *set, uint32 ckey)
  * the walk met and marked, which the built set no longer has.  Carried over,
  * those would let the count of members met reach the set's members while
  * live members were still ahead, and the early stop would end the scan before
- * them.  Should a whole container key be missing, the scan stops counting
- * (novisit) rather than let the switch fetch it again.
+ * them.  A key the built set has no member at any more lost only such TIDs,
+ * which no snapshot sees and the switch does not fetch.
  *
  * The lazy set goes first: the build evaluates the leaves' run-time keys
  * again, and the values the lazy sets were located from go with them.  What
- * the walk met lives in scancxt, and outlives it.
+ * the walk met lives in scancxt, and is let go as it is handed over.
  */
 static void
 lo_lazy_convert(LionOrderedState *st)
@@ -4679,9 +4709,8 @@ lo_lazy_convert(LionOrderedState *st)
 	uint32	   *mkeys;
 	uint64	  **mvisited;
 	int			nmet = 0;
-	uint64	  **visited = NULL;
-	uint64	   *img = NULL;
-	bool		lost = false;
+	uint16	   *los = NULL;
+	uint32	   *places = NULL;
 	int			i;
 
 	mkeys = (uint32 *) MemoryContextAlloc(st->scancxt,
@@ -4699,41 +4728,38 @@ lo_lazy_convert(LionOrderedState *st)
 	lo_lazy_end(st);
 
 	lo_build_set(st);
-	if (st->set->n > 0)
-	{
-		visited = (uint64 **) MemoryContextAllocZero(st->scancxt,
-													 sizeof(uint64 *) * st->set->n);
-		img = (uint64 *) palloc(LION_BITSET_BYTES);
-	}
 	st->distinct = 0;
+	if (nmet > 0 && st->set->n > 0)
+	{
+		los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+		places = (uint32 *) palloc(sizeof(uint32) * LION_CONTAINER_RANGE);
+	}
 	for (i = 0; i < nmet; i++)
 	{
-		int			idx = (visited != NULL) ?
+		int			idx = (los != NULL) ?
 			lo_set_key_index(st->set, mkeys[i]) : -1;
-		int			w;
-
-		if (idx < 0)
-		{
-			lost = true;
-			continue;
-		}
-		visited[idx] = mvisited[i];
-		st->visitedbytes += LION_BITSET_BYTES;
 
 		/* the members met at this key that the built set still has */
-		memset(img, 0, LION_BITSET_BYTES);
-		lion_container_or_into_bitset(st->set->conts[idx], img);
-		for (w = 0; w < LION_BITSET_WORDS; w++)
-			img[w] &= mvisited[i][w];
-		st->distinct += lion_container_image_cardinality(img);
+		if (idx >= 0)
+		{
+			uint32		n = lion_container_to_places(st->set->conts[idx],
+													 los, places);
+			uint32		j;
+
+			for (j = 0; j < n; j++)
+			{
+				if ((mvisited[i][los[j] >> 6] &
+					 (UINT64CONST(1) << (los[j] & 63))) != 0 &&
+					lo_mark_place(st, idx, places[j]))
+					st->distinct++;
+			}
+		}
+		pfree(mvisited[i]);
 	}
-	st->visited = visited;
-	if (img != NULL)
-		pfree(img);
-	if (lost && !st->novisit)
+	if (los != NULL)
 	{
-		st->novisit = true;
-		st->uncounted++;
+		pfree(los);
+		pfree(places);
 	}
 	pfree(mkeys);
 	pfree(mvisited);
@@ -5403,13 +5429,25 @@ lo_scan_reset(LionOrderedState *st)
 		}
 	}
 
+	/* the visited bits, back to where lo_set_alloc() took them from */
+	if (st->visited != NULL)
+	{
+		uint64		i;
+
+		for (i = 0; i < st->nvisited; i++)
+		{
+			if (st->visited[i] != NULL)
+				lo_set_free(st, st->visited[i], LO_VISITED_BYTES);
+		}
+		lo_set_free(st, st->visited, sizeof(uint64 *) * st->nvisited);
+	}
+	st->visited = NULL;
+	st->nvisited = 0;
+
 	/* the switch's sort, and its files, before the memory it lives in */
 	lo_sort_end(st);
 	if (st->scancxt != NULL)
 		MemoryContextReset(st->scancxt);
-	st->visited = NULL;
-	st->visitedbytes = 0;
-	st->novisit = false;
 	st->distinct = 0;
 	st->scanwalked = 0;
 	st->scanreturned = 0;
@@ -5421,47 +5459,91 @@ lo_scan_reset(LionOrderedState *st)
 	st->sortrowcap = 0;
 }
 
+/*
+ * Has this scan's walk met the member at `place` of the set's key idx
+ * (DESIGN.md §30.4, "Stopping early")?  A place past the key's - only a
+ * damaged container has a member there - never has been.
+ */
 static inline bool
-lo_visited(LionOrderedState *st, int idx, uint16 lo)
+lo_visited(LionOrderedState *st, int idx, uint32 place)
 {
-	return st->visited != NULL && st->visited[idx] != NULL &&
-		(st->visited[idx][lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0;
+	uint64		p;
+	uint64	   *chunk;
+
+	if (st->visited == NULL ||
+		(uint64) place >= st->places[idx + 1] - st->places[idx])
+		return false;
+	p = st->places[idx] + place;
+	Assert(p / LO_VISITED_BITS < st->nvisited);
+	chunk = st->visited[p / LO_VISITED_BITS];
+	return chunk != NULL &&
+		(chunk[(p % LO_VISITED_BITS) >> 6] & (UINT64CONST(1) << (p & 63))) != 0;
 }
 
 /*
- * Note that this scan's walk met member tid (in container idx), and say
- * whether it is the first time (DESIGN.md §30.4, "Stopping early").  One
- * bitmap per container key the walk touches, within hash_mem; past that the
- * scan stops tracking - and with it no longer stops early or switches - and
- * every meeting counts as a first, which is harmless: a TID met twice is a
- * recycled slot, never visible to the snapshot.
+ * Note that this scan's walk met the member at `place` of the set's key idx,
+ * and say whether it is the first time (DESIGN.md §30.4, "Stopping early").
+ * The bits are the set's places, a chunk of LO_VISITED_BITS made, cleared,
+ * when the walk first meets a member of its places, through lo_set_alloc():
+ * within hash_mem with the set, and past it in the arena, so the walk
+ * counts whatever work_mem is.  A place past the key's - only a damaged
+ * container has a member there - is a first meeting every time, and marks
+ * nothing.
+ */
+static bool
+lo_mark_place(LionOrderedState *st, int idx, uint32 place)
+{
+	uint64		p;
+	uint64		c;
+	uint64	   *w;
+	uint64		bit;
+
+	if ((uint64) place >= st->places[idx + 1] - st->places[idx])
+		return true;
+	p = st->places[idx] + place;
+	if (st->visited == NULL)
+	{
+		uint64		total = st->places[st->set->n];
+		uint64		n = (total + LO_VISITED_BITS - 1) / LO_VISITED_BITS;
+
+		if (n > (uint64) (MaxAllocHugeSize / sizeof(uint64 *)))
+			elog(ERROR, "LionOrdered: %llu places of members to mark",
+				 (unsigned long long) total);
+		st->visited = (uint64 **)
+			lo_set_alloc(st, st->scancxt, sizeof(uint64 *) * (Size) n);
+		memset(st->visited, 0, sizeof(uint64 *) * (Size) n);
+		st->nvisited = n;
+	}
+	c = p / LO_VISITED_BITS;
+	Assert(c < st->nvisited);
+	if (st->visited[c] == NULL)
+	{
+		st->visited[c] = (uint64 *) lo_set_alloc(st, st->scancxt,
+												 LO_VISITED_BYTES);
+		memset(st->visited[c], 0, LO_VISITED_BYTES);
+		/* EXPLAIN's spill: the set's, and its walks' bits past hash_mem */
+		if (st->spilled)
+			st->spillbytes = Max(st->spillbytes, lion_arena_used(st->arena));
+	}
+	w = &st->visited[c][(p % LO_VISITED_BITS) >> 6];
+	bit = UINT64CONST(1) << (p & 63);
+	if ((*w & bit) != 0)
+		return false;
+	*w |= bit;
+	return true;
+}
+
+/*
+ * lo_mark_place() for member tid of the set's key idx.  A TID met twice is
+ * a recycled slot, never visible to the snapshot (§30.4).
  */
 static bool
 lo_mark(LionOrderedState *st, int idx, ItemPointer tid)
 {
 	uint16		lo = lion_code_lo(lion_tid_to_code(tid));
 
-	if (st->novisit)
-		return true;
-	if (st->visited == NULL)
-		st->visited = (uint64 **)
-			MemoryContextAllocZero(st->scancxt, sizeof(uint64 *) * st->set->n);
-	if (st->visited[idx] == NULL)
-	{
-		if (st->visitedbytes + LION_BITSET_BYTES > get_hash_memory_limit())
-		{
-			st->novisit = true;
-			st->uncounted++;
-			return true;
-		}
-		st->visited[idx] = (uint64 *)
-			MemoryContextAllocZero(st->scancxt, LION_BITSET_BYTES);
-		st->visitedbytes += LION_BITSET_BYTES;
-	}
-	if (lo_visited(st, idx, lo))
-		return false;
-	st->visited[idx][lo >> 6] |= UINT64CONST(1) << (lo & 63);
-	return true;
+	return lo_mark_place(st, idx,
+						 lion_container_place(st->set->conts[idx], lo));
 }
 
 /*
@@ -5561,6 +5643,7 @@ lo_switch(LionOrderedState *st)
 	TupleTableSlot *fslot = st->indexonly ? st->tabslot : slot;
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
 	uint16	   *los;
+	uint32	   *places;
 	MemoryContext oldcxt;
 	int			i;
 
@@ -5577,11 +5660,13 @@ lo_switch(LionOrderedState *st)
 		tuplesort_set_bound(st->sortstate,
 							st->bound - (int64) st->scanreturned);
 	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	places = (uint32 *) palloc(sizeof(uint32) * LION_CONTAINER_RANGE);
 	MemoryContextSwitchTo(oldcxt);
 
 	for (i = 0; i < st->set->n; i++)
 	{
-		uint32		n = lion_container_to_array(st->set->conts[i], los);
+		uint32		n = lion_container_to_places(st->set->conts[i], los,
+												 places);
 		uint32		j;
 
 		for (j = 0; j < n; j++)
@@ -5589,7 +5674,7 @@ lo_switch(LionOrderedState *st)
 			ItemPointerData tid;
 			bool		all_dead = false;
 
-			if (lo_visited(st, i, los[j]))
+			if (lo_visited(st, i, places[j]))
 				continue;
 			CHECK_FOR_INTERRUPTS();
 			lion_code_to_tid(lion_make_code(st->set->keys[i], los[j]), &tid);
@@ -5622,6 +5707,7 @@ lo_switch(LionOrderedState *st)
 	}
 	ExecClearTuple(slot);
 	pfree(los);
+	pfree(places);
 
 	tuplesort_performsort(st->sortstate);
 	tuplesort_get_stats(st->sortstate, &st->sortstats);
@@ -5763,7 +5849,7 @@ lo_next(ScanState *ss)
 				lo_lazy_convert(st);
 			}
 		}
-		counted = !st->noset && !st->lazy && !st->novisit;
+		counted = !st->noset && !st->lazy;
 
 		/*
 		 * Every member met: nothing further along can be one (§30.4,
@@ -6178,9 +6264,6 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 								tuplesort_space_type_name(st->sortstats.spaceType),
 								es);
 		}
-		if (st->uncounted > 0)
-			ExplainPropertyInteger("Scans Not Counting Members", NULL,
-								   (int64) st->uncounted, es);
 		if (st->earlystops > 0)
 			ExplainPropertyInteger("Scans Stopped Early", NULL,
 								   (int64) st->earlystops, es);
