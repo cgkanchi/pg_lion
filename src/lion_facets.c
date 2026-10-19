@@ -725,8 +725,8 @@ lion_facets_report(LionFacetRun *run, LionFacetFilter *ff)
 		pgstat_count_index_scan(index);
 		pgstat_count_index_tuples(index, run->rows);
 	}
-	if (run->fetched > 0 && pgstat_should_count_relation(run->heap))
-		run->heap->pgstat_info->counts.tuples_fetched += run->fetched;
+	if (run->fetched > 0)
+		lion_pgstat_count_fetches(run->heap, run->fetched);
 }
 
 static void

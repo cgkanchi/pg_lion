@@ -25,7 +25,6 @@
 #include "access/nbtree.h"
 #include "access/table.h"
 #include "access/toast_compression.h"
-#include "access/toast_internals.h"
 #include "catalog/index.h"
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_collation.h"
@@ -1169,8 +1168,15 @@ lion_key_pglz(const struct varlena *v)
 		return NULL;
 	}
 	SET_VARSIZE_COMPRESSED(c, len + VARHDRSZ_COMPRESSED);
-	TOAST_COMPRESS_SET_SIZE_AND_COMPRESS_METHOD(c, valsize,
-												TOAST_PGLZ_COMPRESSION_ID);
+
+	/*
+	 * The raw size and the method, in the word after the length (varatt.h's
+	 * va_tcinfo), as core's own compression sets them.  A varlena's data is
+	 * under 1 GB, which the size bits hold.
+	 */
+	Assert((uint32) valsize <= VARLENA_EXTSIZE_MASK);
+	((varattrib_4b *) c)->va_compressed.va_tcinfo = (uint32) valsize |
+		((uint32) TOAST_PGLZ_COMPRESSION_ID << VARLENA_EXTSIZE_BITS);
 	return c;
 }
 

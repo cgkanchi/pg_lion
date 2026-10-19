@@ -326,7 +326,7 @@ lion_dirdel_rewrite(LionWalState *xstate, Page p, const LionPageOpaqueData *opaq
 {
 	lion_init_page(p, opaque->flags);
 	memcpy(LionPageGetOpaque(p), opaque, sizeof(LionPageOpaqueData));
-	if (PageAddItemExtended(p, (Item) hk, hksz, FirstOffsetNumber, 0) !=
+	if (PageAddItemExtended(p, hk, hksz, FirstOffsetNumber, 0) !=
 		FirstOffsetNumber)
 		elog(PANIC, "lion index: could not put a high key on an empty page");
 	lion_wal_op(xstate, p, LION_OP_INIT, 0, opaque->flags, opaque,
@@ -492,7 +492,7 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
 	lion_wal_save_item(xstate, p, poff);
-	if (!PageIndexTupleOverwrite(p, poff, (Item) retarget, retargetsz))
+	if (!PageIndexTupleOverwrite(p, poff, retarget, retargetsz))
 		elog(PANIC, "lion index: could not rewrite a downlink in place");
 	lion_wal_op_replace(xstate, p, poff, retarget, retargetsz);
 	PageIndexTupleDelete(p, OffsetNumberNext(poff));

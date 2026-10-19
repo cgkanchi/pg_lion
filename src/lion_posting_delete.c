@@ -352,7 +352,7 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 	{
 		p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
 		lion_wal_save_item(xstate, p, poff);
-		if (!PageIndexTupleOverwrite(p, poff, (Item) &retarget,
+		if (!PageIndexTupleOverwrite(p, poff, &retarget,
 									 LION_POSTING_PIVOT_SIZE))
 			elog(PANIC, "lion index: could not rewrite a posting downlink in place");
 		lion_wal_op_replace(xstate, p, poff, &retarget, LION_POSTING_PIVOT_SIZE);
