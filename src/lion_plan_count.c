@@ -3541,6 +3541,193 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							cx->wnaggs, cx->wcounts);
 }
 
+/*
+ * THE AM'S OWN SCAN OF THE COUNT'S SETS (DESIGN.md §39, "The AM's own scan
+ * of the same sets"): does a lion index path, ip, read only sets the count
+ * reads?  Every clause of it is one of the relation's restrictions the count
+ * reads from that same index (idxfor, by the restriction's position), each
+ * marked in covered.
+ */
+static bool
+lion_count_ownscan_reads(IndexPath *ip, RelOptInfo *rel, Oid lionam,
+						 IndexOptInfo **idxfor, bool *covered)
+{
+	ListCell   *lc;
+
+	if (ip->indexinfo == NULL || ip->indexinfo->relam != lionam ||
+		ip->path.parent != rel || ip->path.param_info != NULL)
+		return false;
+	foreach(lc, ip->indexclauses)
+	{
+		IndexClause *ic = (IndexClause *) lfirst(lc);
+		int			r = 0;
+		bool		found = false;
+		ListCell   *l2;
+
+		foreach(l2, rel->baserestrictinfo)
+		{
+			if ((RestrictInfo *) lfirst(l2) == ic->rinfo)
+			{
+				found = true;
+				break;
+			}
+			r++;
+		}
+		if (!found || idxfor[r] == NULL ||
+			idxfor[r]->indexoid != ip->indexinfo->indexoid)
+			return false;
+		covered[r] = true;
+	}
+	return true;
+}
+
+/* ... and the IndexPaths of a bitmap's tree of quals: ANDs of them only */
+static bool
+lion_count_ownscan_bitmap(Path *bitmapqual, RelOptInfo *rel, Oid lionam,
+						  IndexOptInfo **idxfor, bool *covered)
+{
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+		return lion_count_ownscan_reads((IndexPath *) bitmapqual, rel, lionam,
+										idxfor, covered);
+	if (!IsA(bitmapqual, BitmapAndPath))
+		return false;
+	foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
+	{
+		if (!lion_count_ownscan_bitmap((Path *) lfirst(lc), rel, lionam,
+									   idxfor, covered))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The cheapest of output_rel's paths that count the rows of a scan of the
+ * relation through the lion indexes the count reads - a plain Agg, under
+ * nothing that does not pass its row up, over a plain or bitmap scan whose
+ * index clauses are every restriction of the relation, each read from the
+ * index the count reads it from (lion_count_ownscan_reads()).  Such a scan
+ * reads every set the count reads, as the count reads them, and then
+ * fetches each row it finds from the heap, where the count tests the
+ * visibility map: whatever the rows, it does what the count does and more.
+ * Its total cost, or 0 when there is none, or the count is not one such a
+ * scan can be: one table's plain count, with no GROUP BY, range, filter,
+ * HAVING or residual clause, its WHERE answered by the sets alone.
+ *
+ * Not a parallel scan, under a Gather: it divides the heap's side among the
+ * workers, which the count, serial, does not, and its price is compared as
+ * it is.  Nor a path some enable_* setting disabled, which loses to the
+ * count whatever its cost.
+ */
+static Cost
+lion_count_ownscan_cost(LionCountPathBuild *cx)
+{
+	RelOptInfo *rel = cx->input_rel;
+	Oid			lionam = lion_get_am_oid();
+	int			nbase = list_length(rel->baserestrictinfo);
+	int			nclause = list_length(cx->clauseinfos);
+	IndexOptInfo **idxfor;
+	bool	   *covered;
+	Cost		best = 0.0;
+	ListCell   *lc;
+	int			i;
+
+	if (!OidIsValid(lionam) || cx->fj != NULL || cx->partitioned ||
+		cx->ngroup != 0 || cx->singlegroup || cx->sumall || cx->decode ||
+		cx->distvar != NULL || cx->rangevar != NULL || cx->hasrangesrc ||
+		cx->nfilter != 0 || cx->residual != NIL || cx->topkn != 0 ||
+		cx->wattnos != NIL || cx->partialtarget != NULL ||
+		cx->having != NIL || cx->ncompl != 0 || cx->runtimemulti ||
+		cx->newnegated || cx->first == NULL ||
+		list_length(cx->targets) != 1 ||
+		rel->reloptkind != RELOPT_BASEREL ||
+		nbase == 0 || nclause == 0 ||
+		list_length(cx->first->whereidx) != nclause)
+		return 0.0;
+
+	/* the index the count reads each restriction from: one, or none */
+	idxfor = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) * nbase);
+	covered = (bool *) palloc(sizeof(bool) * nbase);
+	i = 0;
+	foreach(lc, cx->clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+		IndexOptInfo *idx = (IndexOptInfo *) list_nth(cx->first->whereidx, i);
+
+		i++;
+		if (ci->rinfono < 0 || ci->rinfono >= nbase || idx == NULL ||
+			(idxfor[ci->rinfono] != NULL &&
+			 idxfor[ci->rinfono]->indexoid != idx->indexoid))
+		{
+			pfree(idxfor);
+			pfree(covered);
+			return 0.0;
+		}
+		idxfor[ci->rinfono] = idx;
+	}
+	for (i = 0; i < nbase; i++)
+	{
+		if (idxfor[i] == NULL)
+		{
+			pfree(idxfor);
+			pfree(covered);
+			return 0.0;
+		}
+	}
+
+	foreach(lc, cx->output_rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		AggPath    *agg;
+		Path	   *scan;
+		bool		reads;
+
+		if (p->param_info != NULL || !IsA(p, AggPath) ||
+			lion_path_has_lion(p))
+			continue;
+#if PG_VERSION_NUM >= 180000
+		if (p->disabled_nodes > 0)
+			continue;
+#endif
+		agg = (AggPath *) p;
+		if (agg->aggstrategy != AGG_PLAIN || agg->aggsplit != AGGSPLIT_SIMPLE ||
+			agg->groupClause != NIL || agg->qual != NIL)
+			continue;
+		scan = agg->subpath;
+		while (scan != NULL && IsA(scan, ProjectionPath))
+			scan = ((ProjectionPath *) scan)->subpath;
+		if (scan == NULL || scan->parent != rel || scan->param_info != NULL ||
+			scan->parallel_aware)
+			continue;
+
+		memset(covered, 0, sizeof(bool) * nbase);
+		if (IsA(scan, IndexPath))
+			reads = lion_count_ownscan_reads((IndexPath *) scan, rel, lionam,
+											 idxfor, covered);
+		else if (IsA(scan, BitmapHeapPath))
+			reads = lion_count_ownscan_bitmap(((BitmapHeapPath *) scan)->bitmapqual,
+											  rel, lionam, idxfor, covered);
+		else
+			reads = false;
+		for (i = 0; reads && i < nbase; i++)
+			reads = covered[i];
+		if (reads && (best <= 0.0 || p->total_cost < best))
+			best = p->total_cost;
+	}
+	pfree(idxfor);
+	pfree(covered);
+	return best;
+}
+
+/*
+ * How far below the AM's own scan of the same sets the count is priced: past
+ * the fuzz add_path() calls two costs the same within (1%, pathnode.c's
+ * STD_FUZZ_FACTOR), where the scan's Agg, parallel safe, would win the tie
+ * against the count, which is not.
+ */
+#define LION_COUNT_OWNSCAN_EDGE		1.02
+
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 {
@@ -3674,6 +3861,28 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 																cx->having,
 																0, JOIN_INNER,
 																NULL));
+	}
+
+	/*
+	 * Never at or within core's fuzz above the AM's own scan of the same sets
+	 * feeding an Agg (DESIGN.md §39, "The AM's own scan of the same sets"),
+	 * which does what the count does and fetches every row besides: whatever
+	 * the rows are estimated at, which price the scan's heap and the count's
+	 * visibility tests both, the count is the cheaper.
+	 */
+	{
+		Cost		ownscan = lion_count_ownscan_cost(cx);
+
+		if (ownscan > 0.0)
+			elog(DEBUG2, "lion: count priced %.2f against the AM's own scan of its sets at %.2f",
+				 cpath->path.total_cost, ownscan);
+		if (ownscan > 0.0 &&
+			cpath->path.total_cost * LION_COUNT_OWNSCAN_EDGE > ownscan)
+		{
+			cpath->path.total_cost = ownscan / LION_COUNT_OWNSCAN_EDGE;
+			cpath->path.startup_cost = Min(cpath->path.startup_cost,
+										   cpath->path.total_cost);
+		}
 	}
 
 	/*

@@ -1873,6 +1873,25 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
 										uint32 ckey, uint16 level);
 
+/*
+ * The SEPARATORS of the posting set rooted at head - the first container key
+ * of every child of its root, in key order, and of every child of those
+ * children for as long as there are fewer than `want` and the level below
+ * can be read in at most maxpages pages in all - for the intersection
+ * probe's sample by rank (DESIGN.md §29.11, "A sample of the driver's own
+ * rows").  The leaves of a posting tree hold about equal bytes of it, so
+ * the separators of one level are its quantiles by bytes.  palloc'd, *nsep
+ * of them; *level the level whose pages they are the first keys of (1: the
+ * leaves; 0, and NULL returned, for a tree with no internal level, whose
+ * head is its only leaf or the first of a few), and *pages the pages read.
+ * NULL as well when the set is gone (a page that does not belong to it).
+ * A reader's SHARE locks, one page at a time, every pivot and downlink
+ * checked as a descent checks them: a damaged one is an ERROR.
+ */
+extern uint32 *lion_posting_separators(Relation index, BlockNumber head,
+									   int want, int maxpages, int *nsep,
+									   int *level, int *pages);
+
 /* The leftmost leaf, where every sequential walk of a posting set starts. */
 extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
 											  BlockNumber head);

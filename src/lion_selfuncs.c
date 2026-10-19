@@ -1770,6 +1770,29 @@ bool		lion_enable_rows_correction = true;
 #define LION_ISECT_MIN_HITS		3
 
 /*
+ * How the driver's containers are chosen (DESIGN.md §29.11, "A sample of the
+ * driver's own rows"): by their RANK among the driver's own, so that the
+ * sample stands for its rows however they lie in the heap.  A driver of at
+ * most LION_ISECT_WALK_PAGES posting leaves and LION_ISECT_WALK_KEYS
+ * containers is walked once to rank them - no more pages than its samples'
+ * seeks would read; a single set of more is ranked by its posting tree's
+ * separators, its leaves being about equal bytes of it, in at most
+ * LION_ISECT_SEPARATOR_PAGES pages: the root and, below a root of fewer
+ * children than samples, the level under it.  What can be ranked neither way
+ * - a list or a multi-key query of more - is sampled in strata of the heap's
+ * container keys, as before.
+ */
+#define LION_ISECT_WALK_PAGES		32
+#define LION_ISECT_WALK_KEYS		8192
+#define LION_ISECT_SEPARATOR_PAGES	(LION_ISECT_KEYS + 1)
+
+/*
+ * The normal quantile of the one-sided bound a sample lowers an estimate to
+ * at most: 95% (lion_isect_upper()).
+ */
+#define LION_ISECT_BOUND_Z		1.645
+
+/*
  * The buffer accesses all of a planner run's probes together may make,
  * locating their sets and seeking them, before a probe gives up and core's
  * estimate stands.  A probe may take whatever the run has left: the bound is
@@ -1959,11 +1982,21 @@ typedef struct LionIsectSample
 	LionContainer *tmp;
 	int64		start;			/* lion_isect_buffers() when the probe began */
 	int64		budget;			/* ... and what it may add to that */
-	double		drvrows;		/* the driver's rows in the containers sampled */
+	double		drvrows;		/* the driver's rows in the containers sampled,
+								 * weighted */
 	double		androws;		/* ... and those the AND kept */
 	int			nsampled;		/* the containers sampled */
 	int			hits;			/* ... and those in which the AND kept a row */
-	uint32		first;			/* ... the first of them */
+	double		units;			/* ... the units of evidence they are
+								 * (lion_isect_take()) */
+	double		andunits;		/* ... and the rows of the AND among them */
+	double		scale;			/* the share of the driver's rows the
+								 * containers sampled from stand for: 1 but
+								 * where the others' absence ruled the rest
+								 * out (lion_isect_by_rank()) */
+	double		walkedrows;		/* the driver's rows, counted by a walk of
+								 * it, or 0 */
+	uint32		first;			/* the first container sampled */
 	double		end;			/* the key past the last one's stratum */
 } LionIsectSample;
 
@@ -1971,6 +2004,122 @@ static bool
 lion_isect_spent(const LionIsectSample *s)
 {
 	return lion_isect_buffers() - s->start > s->budget;
+}
+
+/*
+ * The members of container c on the heap blocks of `blocks`, a
+ * lion_container_block_mask() of c's or a part of it.
+ */
+static double
+lion_isect_block_members(const LionContainer *c, uint64 blocks)
+{
+	double		members = 0;
+	int			b;
+
+	if (blocks == lion_container_block_mask(c))
+		return (double) lion_container_cardinality(c);
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+	{
+		if ((blocks & (UINT64CONST(1) << b)) == 0)
+			continue;
+		members += (double)
+			lion_container_range_cardinality(c,
+											 (uint16) (b << LION_OFFSET_BITS),
+											 (uint16) (((b + 1) << LION_OFFSET_BITS) - 1));
+	}
+	return members;
+}
+
+/*
+ * Sample the driver's container c: AND the other sources' containers at its
+ * key, the sources of fewer rows first, and add what it came to, both
+ * weighted by `weight` - what c stands for of the driver.
+ *
+ * And what it can rule out (DESIGN.md §29.11, "What a sample can rule out").
+ * A sample is of containers, and the rows of one are no independent draws:
+ * on a heap loaded in batches a container holds one stretch of rows, and a
+ * source whose rows lie in other stretches is absent from it whatever the
+ * AND holds elsewhere.  So a container where some source has no container
+ * at all is ONE unit of evidence, and stops the AND there, as it always
+ * did; one where every source has members is as many units as the driver
+ * has members on the heap blocks every source has members on - rows side by
+ * side on one page, where the AND, or its absence, is a fact about rows and
+ * not about which stretch the sample met - and one at least.  The sources
+ * after the one that empties the AND are still sought, for their blocks.
+ */
+static void
+lion_isect_take(LionIsectSample *s, const LionContainer *c, double weight)
+{
+	double		members = (double) lion_container_cardinality(c);
+	double		survive = members;
+	uint64		blocks = lion_container_block_mask(c);
+	bool		present = true;
+	int			j;
+
+	/* nothing of the driver's to stand for: no sample */
+	if (members <= 0 || weight <= 0)
+		return;
+
+	memcpy(s->acc, c, lion_container_size(c));
+	for (j = 1; j < s->n; j++)
+	{
+		int			k = s->order[j];
+		const LionContainer *cj = NULL;
+
+		if (!s->done[k])
+			cj = lion_stream_at(s->st[k], c->ckey);
+		if (cj == NULL)
+			s->done[k] = true;	/* nothing at or past this key, ever */
+		if (cj == NULL || cj->ckey != c->ckey)
+		{
+			present = false;
+			survive = 0;
+			break;
+		}
+		blocks &= lion_container_block_mask(cj);
+		if (survive > 0)
+		{
+			LionContainer *swap;
+
+			survive = (double) lion_container_and(s->acc, cj, s->tmp);
+			swap = s->acc;
+			s->acc = s->tmp;
+			s->tmp = swap;
+		}
+	}
+	s->drvrows += members * weight;
+	s->androws += survive * weight;
+	if (survive > 0)
+		s->hits++;
+	if (present)
+	{
+		s->units += Max(lion_isect_block_members(c, blocks), 1.0);
+		s->andunits += survive;
+	}
+	else
+		s->units += 1.0;
+	s->nsampled++;
+}
+
+/*
+ * The most the share of the driver's rows that survive can be, at 95%, by
+ * the sample's units of evidence: `units` draws of which `hits` were rows of
+ * the AND (lion_isect_take()) - Wilson and Hilferty's form of the Poisson's
+ * upper limit, (h + 1)(1 - 1/9(h + 1) + z/3 sqrt(h + 1))^3 over the draws:
+ * 2.97 for none, the rule of three's 3.00; 4.73 for one (4.74), 6.29 for two
+ * (6.30), within 1% from there on.  What a sample cannot put the share
+ * below.
+ */
+static double
+lion_isect_upper(double hits, double units)
+{
+	double		h1 = Max(hits, 0.0) + 1.0;
+	double		w;
+
+	if (units <= 0.0)
+		return 1.0;
+	w = 1.0 - 1.0 / (9.0 * h1) + LION_ISECT_BOUND_Z / (3.0 * sqrt(h1));
+	return Min(h1 * w * w * w / units, 1.0);
 }
 
 /*
@@ -1996,11 +2145,9 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 	while (target < hi)
 	{
 		const LionContainer *c;
-		double		survive;
 		double		next;
 		double		per;
 		double		affordable;
-		int			j;
 
 		if (lion_isect_spent(s))
 			return taken >= LION_ISECT_MIN_KEYS;
@@ -2010,35 +2157,9 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 		if (taken >= 2 * keys)
 			return false;
 
-		memcpy(s->acc, c, lion_container_size(c));
-		survive = (double) s->acc->cardinality;
-		s->drvrows += survive * stride;
 		if (taken == 0)
 			s->first = c->ckey;
-		for (j = 1; j < s->n && survive > 0; j++)
-		{
-			int			k = s->order[j];
-			const LionContainer *cj = NULL;
-			LionContainer *swap;
-
-			if (!s->done[k])
-				cj = lion_stream_at(s->st[k], s->acc->ckey);
-			if (cj == NULL)
-				s->done[k] = true;	/* nothing at or past this key, ever */
-			if (cj == NULL || cj->ckey != s->acc->ckey)
-			{
-				survive = 0;
-				break;
-			}
-			survive = (double) lion_container_and(s->acc, cj, s->tmp);
-			swap = s->acc;
-			s->acc = s->tmp;
-			s->tmp = swap;
-		}
-		s->androws += survive * stride;
-		if (survive > 0)
-			s->hits++;
-		s->nsampled++;
+		lion_isect_take(s, c, stride);
 		taken++;
 
 		/*
@@ -2071,20 +2192,365 @@ lion_isect_pass(LionIsectSample *s, double lo, double hi, double end, int keys)
 	return true;
 }
 
+/* How a driver's containers came to be sampled (lion_isect_by_rank()). */
+typedef enum LionIsectRanked
+{
+	LION_ISECT_UNRANKED,		/* not: the heap's strata it is */
+	LION_ISECT_RANKED,			/* by rank among the driver's own */
+	LION_ISECT_EVERY,			/* ... every one of them: a count */
+	LION_ISECT_OVER				/* the probe's budget ran out */
+} LionIsectRanked;
+
+/*
+ * Walk the driver - its sets, as its own stream - and keep its container
+ * keys, in order, and their members: *nkeys of them, palloc'd, the members
+ * in *members.  NULL when it has more than LION_ISECT_WALK_KEYS or reads
+ * more than LION_ISECT_WALK_PAGES buffers, or the probe's budget runs out
+ * first.
+ */
+static uint32 *
+lion_isect_walk(LionIsectSample *s, int nsets, LionPostingSet *sets,
+				LionKeyNode *tree, int *nkeys, double **members)
+{
+	LionSetStream *st = lion_stream_begin(nsets, sets, tree, false);
+	int64		start = lion_isect_buffers();
+	uint32	   *keys = (uint32 *) palloc(sizeof(uint32) * LION_ISECT_WALK_KEYS);
+	double	   *m = (double *) palloc(sizeof(double) * LION_ISECT_WALK_KEYS);
+	const LionContainer *c;
+	int			n = 0;
+
+	while ((c = lion_stream_next(st)) != NULL)
+	{
+		if (n >= LION_ISECT_WALK_KEYS ||
+			lion_isect_buffers() - start > LION_ISECT_WALK_PAGES ||
+			lion_isect_spent(s))
+		{
+			n = -1;
+			break;
+		}
+		if (lion_container_cardinality(c) > 0)
+		{
+			keys[n] = c->ckey;
+			m[n++] = (double) lion_container_cardinality(c);
+		}
+	}
+	lion_stream_end(st);
+	pfree(st);
+	if (n < 0)
+	{
+		pfree(keys);
+		pfree(m);
+		return NULL;
+	}
+	*nkeys = n;
+	*members = m;
+	return keys;
+}
+
+/*
+ * Which of the driver's walked containers, keys[0 .. nkeys), every other
+ * source has a container at: cand[i] cleared for the others.  The AND has
+ * no row in a container some source is absent from, so those are known to
+ * be empty of it, not sampled: on a heap loaded in batches the AND of a
+ * filter is often confined to a few stretches of the driver's - the rows of
+ * one batch that the others' keys pick out - which a sample of the driver's
+ * containers meets once or not at all.  The sources are walked along the
+ * keys, as a merge seeks them, the fewest rows first, at most
+ * LION_ISECT_WALK_PAGES buffers each; false when that or the probe's budget
+ * runs out first, and nothing is cleared then.
+ */
+static bool
+lion_isect_presence(LionIsectSample *s, const int *nsets,
+					LionPostingSet **sets, LionKeyNode **trees,
+					const uint32 *keys, int nkeys, bool *cand)
+{
+	bool	   *keep = (bool *) palloc(sizeof(bool) * Max(nkeys, 1));
+	int			i;
+	int			j;
+
+	memcpy(keep, cand, sizeof(bool) * nkeys);
+	for (j = 1; j < s->n; j++)
+	{
+		int			k = s->order[j];
+		LionSetStream *st = lion_stream_begin(nsets[k], sets[k], trees[k],
+											  false);
+		int64		start = lion_isect_buffers();
+		bool		over = false;
+
+		for (i = 0; i < nkeys && !over; i++)
+		{
+			const LionContainer *c;
+
+			if (!keep[i])
+				continue;
+			if (lion_isect_buffers() - start > LION_ISECT_WALK_PAGES ||
+				lion_isect_spent(s))
+			{
+				over = true;
+				break;
+			}
+			c = lion_stream_at(st, keys[i]);
+			if (c == NULL)
+			{
+				/* nothing at or past this key: none of the rest has one */
+				for (; i < nkeys; i++)
+					keep[i] = false;
+				break;
+			}
+			if (c->ckey != keys[i] || lion_container_cardinality(c) == 0)
+				keep[i] = false;
+		}
+		lion_stream_end(st);
+		pfree(st);
+		if (over)
+		{
+			pfree(keep);
+			return false;
+		}
+	}
+	memcpy(cand, keep, sizeof(bool) * nkeys);
+	pfree(keep);
+	return true;
+}
+
+/*
+ * Sample the driver at the keys targets[0 .. ntargets), ascending: its first
+ * container at or past each, which a target that lands where the last one
+ * did does not sample again.  bybytes: each stands for an equal share of the
+ * driver's posting BYTES, the first container of a leaf or a subtree - which
+ * is a container met in proportion to its size, as the one a boundary
+ * between equal parts of a sequence of items falls in is - and is weighted
+ * by its bytes' inverse, which makes the sample stand for containers again.
+ * False when the budget ran out.
+ */
+static bool
+lion_isect_sample_at(LionIsectSample *s, const uint32 *targets, int ntargets,
+					 bool bybytes)
+{
+	bool		any = false;
+	uint32		last = 0;
+	int			i;
+
+	for (i = 0; i < ntargets; i++)
+	{
+		const LionContainer *c;
+
+		if (lion_isect_spent(s))
+			return false;
+		c = lion_stream_at(s->st[s->order[0]], targets[i]);
+		if (c == NULL)
+			break;
+		if (any && c->ckey == last)
+			continue;
+		if (!any)
+			s->first = c->ckey;
+		any = true;
+		last = c->ckey;
+		lion_isect_take(s, c,
+						bybytes ?
+						1.0 / (double) (lion_container_size(c) + sizeof(ItemIdData)) :
+						1.0);
+	}
+	return true;
+}
+
+/*
+ * Is a source's tree its sets' union - one set, or an OR of sets - rather
+ * than a multi-key query's expression over them?
+ */
+static bool
+lion_isect_tree_is_union(const LionKeyNode *tree)
+{
+	int			i;
+
+	if (tree == NULL || tree->kind == LION_KN_KEY)
+		return true;
+	if (tree->kind != LION_KN_OR)
+		return false;
+	for (i = 0; i < tree->nargs; i++)
+	{
+		if (tree->args[i] == NULL || tree->args[i]->kind != LION_KN_KEY)
+			return false;
+	}
+	return true;
+}
+
+/*
+ * Sample the driver by the RANK of its containers among its own (DESIGN.md
+ * §29.11, "A sample of the driver's own rows"), keys of them: what the
+ * heap's strata cannot do where the driver's rows lie in stretches with
+ * other rows between - a stratum that begins between two stretches samples
+ * the first container of the next, and on a heap loaded in batches the
+ * first rows of a batch are no sample of its rows.  Two ways:
+ *
+ *	- a driver of a few posting leaves is walked once and its containers'
+ *	  keys kept (lion_isect_walk()), those some other source has no
+ *	  container at ruled out - the AND has no row there
+ *	  (lion_isect_presence()) - and the rest sampled every n/keys-th, each
+ *	  standing for its share of them and they for theirs of the driver's
+ *	  rows (s->scale); or every one when there are no more than `whole`, as
+ *	  many as the other sources' sets can be sought at within the probe's
+ *	  seeks: then the AND is counted, not sampled;
+ *	- a single set of more, which its posting tree's separators divide into
+ *	  leaves of about equal bytes (lion_posting_separators()), at keys of
+ *	  them spread evenly, each weighted by its bytes' inverse.
+ *
+ * LION_ISECT_UNRANKED, nothing sampled, for a driver neither can rank: a
+ * list or a multi-key query too large to walk.
+ */
+static LionIsectRanked
+lion_isect_by_rank(LionIsectSample *s, Relation index, const int *allnsets,
+				   LionPostingSet **allsets, LionKeyNode **alltrees, int keys,
+				   int whole)
+{
+	int			nsets = allnsets[s->order[0]];
+	LionPostingSet *sets = allsets[s->order[0]];
+	LionKeyNode *tree = alltrees[s->order[0]];
+	uint32	   *seps = NULL;
+	uint32	   *targets;
+	int			nseps = 0;
+	int			found = 0;
+	int			single = -1;
+	bool		large = false;
+	int			i;
+
+	for (i = 0; i < nsets; i++)
+	{
+		if (sets[i].found)
+		{
+			found++;
+			single = i;
+		}
+	}
+
+	/* a single posting tree: its separators, where it has an internal level */
+	if (lion_isect_tree_is_union(tree) && found == 1 &&
+		!sets[single].is_inline && sets[single].mat == NULL)
+	{
+		int			level = 0;
+		int			pages = 0;
+
+		seps = lion_posting_separators(index, sets[single].head, keys,
+									   LION_ISECT_SEPARATOR_PAGES, &nseps,
+									   &level, &pages);
+		large = (seps != NULL &&
+				 (level > 1 || nseps > LION_ISECT_WALK_PAGES));
+		if (lion_isect_spent(s))
+			return LION_ISECT_OVER;
+	}
+
+	if (!large)
+	{
+		int			nkeys = 0;
+		double	   *members = NULL;
+		uint32	   *walked = lion_isect_walk(s, nsets, sets, tree, &nkeys,
+											 &members);
+
+		if (walked == NULL && lion_isect_spent(s))
+			return LION_ISECT_OVER;
+		if (walked != NULL)
+		{
+			bool	   *cand = (bool *) palloc(sizeof(bool) * Max(nkeys, 1));
+			uint32	   *candkeys = (uint32 *) palloc(sizeof(uint32) *
+													 Max(nkeys, 1));
+			double		all = 0;
+			double		within = 0;
+			int			ncand = 0;
+			int			ntargets;
+
+			/* the containers the AND can have rows in: every source's */
+			for (i = 0; i < nkeys; i++)
+				cand[i] = true;
+			if (!lion_isect_presence(s, allnsets, allsets, alltrees, walked,
+									 nkeys, cand) &&
+				lion_isect_spent(s))
+				return LION_ISECT_OVER;
+			for (i = 0; i < nkeys; i++)
+			{
+				all += members[i];
+				if (cand[i])
+				{
+					within += members[i];
+					candkeys[ncand++] = walked[i];
+				}
+			}
+			s->walkedrows = all;
+
+			/*
+			 * Every one of them, when the others can be sought at each within
+			 * the probe's seeks: a count.  Else every n/keys-th, from the
+			 * middle of the first n/keys, standing for its share of them -
+			 * and they for theirs of the driver's rows.
+			 */
+			ntargets = (ncand <= whole) ? ncand : Min(ncand, keys);
+			targets = (uint32 *) palloc(sizeof(uint32) * Max(ntargets, 1));
+			for (i = 0; i < ntargets; i++)
+				targets[i] = candkeys[(int) (((double) i + 0.5) *
+											 (double) ncand / (double) ntargets)];
+			if (ntargets < ncand)
+			{
+				for (i = 0; i < s->n; i++)
+					lion_stream_far(s->st[i]);
+			}
+			if (!lion_isect_sample_at(s, targets, ntargets, false))
+				return LION_ISECT_OVER;
+			if (within <= 0)
+			{
+				/* no container of every source: the AND is empty */
+				s->drvrows = all;
+				return LION_ISECT_EVERY;
+			}
+
+			/*
+			 * The containers sampled are the ones walked, unless the index
+			 * changed between the walk and the sample: then nothing it
+			 * measured is a count, and a driver met empty is not measured.
+			 */
+			if (s->drvrows <= 0)
+				return LION_ISECT_OVER;
+			s->scale = within / all;
+			s->drvrows /= s->scale;
+			return (ntargets == ncand && s->nsampled == ntargets) ?
+				LION_ISECT_EVERY : LION_ISECT_RANKED;
+		}
+	}
+
+	/* the separators: keys of them, spread evenly, or every one of fewer */
+	if (seps != NULL && nseps >= LION_ISECT_MIN_KEYS)
+	{
+		int			ntargets = Min(nseps, keys);
+
+		targets = (uint32 *) palloc(sizeof(uint32) * ntargets);
+		for (i = 0; i < ntargets; i++)
+			targets[i] = seps[(int) (((double) i + 0.5) *
+									 (double) nseps / (double) ntargets)];
+		for (i = 0; i < s->n; i++)
+			lion_stream_far(s->st[i]);
+		if (!lion_isect_sample_at(s, targets, ntargets, true))
+			return LION_ISECT_OVER;
+		return LION_ISECT_RANKED;
+	}
+	return LION_ISECT_UNRANKED;
+}
+
 /*
  * Measure the AND of the n clauses: the share of the driver's rows that
- * survive it at the sampled container keys, times the driver's rows - its
+ * survive it at the sampled containers, times the driver's rows - its
  * sets' exact count when that is its rows (one set, or an IN list's disjoint
  * entries), core's estimate of it otherwise (a multi-key query's keys
  * overlap).  At most `budget` buffer accesses, and *used says how many it
  * made; false when a bound was reached first.  *hits is how many of the
  * containers sampled kept a row of the AND - INT_MAX when every container of
- * the heap was one, and the AND is counted rather than sampled.
+ * the driver was one, or of the heap, and the AND is counted rather than
+ * sampled; *probeub the most the AND can hold by what the sample can rule
+ * out (lion_isect_upper()), and *probelb the least: the rows of the AND the
+ * sample met, which it holds whatever the rest of it is - both *probesel
+ * itself for a count.
  */
 static bool
 lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 				   LionIsectClause *cl, int64 budget, double *probesel,
-				   int64 *used, int *hits)
+				   double *probeub, double *probelb, int64 *used, int *hits)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "lion intersection probe",
@@ -2103,6 +2569,7 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 	double		ckeys = Max(ceil((double) rel->pages / LION_BLOCKS_PER_CONTAINER),
 							1.0);
 	double		stride = 1.0;
+	LionIsectRanked ranked = LION_ISECT_UNRANKED;
 	int			keys;
 	int			totalsets = 0;
 	int			driver = 0;
@@ -2120,6 +2587,7 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 	s.tmp = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	s.start = buffers;
 	s.budget = budget;
+	s.scale = 1.0;
 
 	/* ---- locate every clause's sets, and let go of their pins ---- */
 	for (i = 0; i < n && ok; i++)
@@ -2148,18 +2616,8 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 
 	if (ok && !empty)
 	{
-		/*
-		 * The heap's container keys in `keys` strata, and the driver's first
-		 * container in each: every container, when there are no more keys
-		 * than strata.  A heap grown past rel->pages makes more strata than
-		 * that, up to twice as many before the probe gives up.  Strata of
-		 * several container keys each are as many posting leaves apart, and
-		 * a set is sought there by a descent of its tree, not by stepping
-		 * right (lion_stream_far()).
-		 */
 		keys = Min(LION_ISECT_KEYS,
 				   Max(LION_ISECT_MIN_KEYS, LION_ISECT_SEEKS / Max(totalsets, 1)));
-		stride = Max(ckeys / (double) keys, 1.0);
 
 		/* the driver is the set of the fewest rows; the others by their rows */
 		for (i = 0; i < n; i++)
@@ -2170,40 +2628,67 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 				s.order[k] = s.order[k - 1];
 			s.order[k] = i;
 			s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
-			if (stride > 1.0)
-				lion_stream_far(s.st[i]);
 		}
 		driver = s.order[0];
 
-		ok = lion_isect_pass(&s, 0.0, LION_ISECT_KEY_END, ckeys, keys);
-
-		/*
-		 * A driver whose rows lie in a stretch of the heap a few strata wide
-		 * - a hidden attribute that follows the order the rows came in - was
-		 * sampled at a few keys only.  Its keys lie in [first, the end of the
-		 * last one's stratum): sample that stretch again, in strata of its
-		 * own, and take the second pass when it completes.
-		 */
-		if (ok && s.nsampled > 0 && s.nsampled < LION_ISECT_MIN_KEYS &&
-			stride > 1.0)
+		/* ---- the driver's own containers, by their rank among them ---- */
+		ranked = lion_isect_by_rank(&s, index, nsets, sets, trees, keys,
+									Max(keys, LION_ISECT_SEEKS /
+										Max(totalsets - nsets[driver], 1)));
+		if (ranked == LION_ISECT_OVER)
+			ok = false;
+		else if (ranked == LION_ISECT_UNRANKED)
 		{
-			LionIsectSample again = s;
-			double		lo = (double) s.first;
-			double		hi = s.end;
-
-			for (i = 0; i < n; i++)
+			/*
+			 * ... or, where they have no rank to sample by, the heap's
+			 * container keys in `keys` strata, and the driver's first
+			 * container in each: every container, when there are no more keys
+			 * than strata.  A heap grown past rel->pages makes more strata
+			 * than that, up to twice as many before the probe gives up.
+			 * Strata of several container keys each are as many posting
+			 * leaves apart, and a set is sought there by a descent of its
+			 * tree, not by stepping right (lion_stream_far()).
+			 */
+			stride = Max(ckeys / (double) keys, 1.0);
+			if (stride > 1.0)
 			{
-				lion_stream_end(s.st[i]);
-				s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i], false);
-				lion_stream_far(s.st[i]);
-				s.done[i] = false;
+				for (i = 0; i < n; i++)
+					lion_stream_far(s.st[i]);
 			}
-			again.drvrows = 0;
-			again.androws = 0;
-			again.nsampled = 0;
-			again.hits = 0;
-			if (lion_isect_pass(&again, lo, hi, hi, keys))
-				s = again;
+			ok = lion_isect_pass(&s, 0.0, LION_ISECT_KEY_END, ckeys, keys);
+
+			/*
+			 * A driver whose rows lie in a stretch of the heap a few strata
+			 * wide - a hidden attribute that follows the order the rows came
+			 * in - was sampled at a few keys only.  Its keys lie in [first,
+			 * the end of the last one's stratum): sample that stretch again,
+			 * in strata of its own, and take the second pass when it
+			 * completes.
+			 */
+			if (ok && s.nsampled > 0 && s.nsampled < LION_ISECT_MIN_KEYS &&
+				stride > 1.0)
+			{
+				LionIsectSample again = s;
+				double		lo = (double) s.first;
+				double		hi = s.end;
+
+				for (i = 0; i < n; i++)
+				{
+					lion_stream_end(s.st[i]);
+					s.st[i] = lion_stream_begin(nsets[i], sets[i], trees[i],
+												false);
+					lion_stream_far(s.st[i]);
+					s.done[i] = false;
+				}
+				again.drvrows = 0;
+				again.androws = 0;
+				again.nsampled = 0;
+				again.hits = 0;
+				again.units = 0;
+				again.andunits = 0;
+				if (lion_isect_pass(&again, lo, hi, hi, keys))
+					s = again;
+			}
 		}
 
 		for (i = 0; i < n; i++)
@@ -2213,14 +2698,30 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 	if (ok)
 	{
 		double		rows = 0;
+		double		drows = (s.walkedrows > 0) ? s.walkedrows :
+			exact[driver] ? ntids[driver] : cl[driver].sel * tuples;
+		bool		counted = empty || ranked == LION_ISECT_EVERY ||
+			(ranked == LION_ISECT_UNRANKED && stride <= 1.0);
 
 		if (!empty && s.drvrows > 0)
-			rows = s.androws / s.drvrows *
-				(exact[driver] ? ntids[driver] : cl[driver].sel * tuples);
+			rows = s.androws / s.drvrows * drows;
 		*probesel = Min(rows / tuples, 1.0);
-		*hits = (stride <= 1.0) ? INT_MAX : s.hits;
+		*probeub = counted ? *probesel :
+			Min(lion_isect_upper(s.andunits, s.units) * s.scale * drows / tuples,
+				1.0);
+		*probelb = counted ? *probesel : Min(s.andunits / tuples, *probesel);
+		*hits = counted ? INT_MAX : s.hits;
 	}
 	*used = lion_isect_buffers() - buffers;
+	elog(DEBUG2, "lion: intersection probe of %d clauses on \"%s\": %s, %d of the driver's containers, %d with a row of the AND, %.0f units of evidence with %.0f rows of it: %.6g, at most %.6g, in %lld buffers",
+		 n, RelationGetRelationName(index),
+		 !ok ? "over budget" : empty ? "a clause matches nothing" :
+		 ranked == LION_ISECT_EVERY ? "every one" :
+		 ranked == LION_ISECT_RANKED ? "by rank" :
+		 stride <= 1.0 ? "every heap key" : "by heap key",
+		 s.nsampled, s.hits, s.units, s.andunits,
+		 ok ? *probesel : -1.0, ok ? *probeub : -1.0,
+		 (long long) *used);
 
 	for (i = 0; i < n; i++)
 		for (j = 0; j < nsets[i]; j++)
@@ -2510,6 +3011,8 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	Selectivity coresel;
 	Selectivity minsel = 1.0;
 	double		probesel = 0.0;
+	double		probeub = 1.0;
+	double		probelb = 0.0;
 	double		factor = 1.0;
 	int			hits = 0;
 	int			ncl = 0;
@@ -2648,7 +3151,8 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		measured = lion_isect_measure(rel, idx, ncl, cl,
 									  LION_ISECT_RUN_BUFFERS -
 									  cache->isectbuffers,
-									  &probesel, &used, &hits);
+									  &probesel, &probeub, &probelb, &used,
+									  &hits);
 		cache->isectbuffers += used;
 
 		/*
@@ -2659,15 +3163,31 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 * filter's sample met the few stretches that hold its rows once or
 		 * not at all, and the one that did stood for its whole stratum -
 		 * twenty-two times the rows (DESIGN.md §29.11, "Wide filters").
-		 * Such a measure raises no estimate; one that lowers it stands, as
-		 * it always did.
+		 * Such a measure raises an estimate only as far as the rows of the
+		 * AND it met, which the AND holds whatever the rest of it is; to
+		 * less than LION_ISECT_ERROR times core's it is no measure.
+		 *
+		 * And one that lowers it lowers it only as far as the sample can rule
+		 * out (DESIGN.md §29.11, "What a sample can rule out"): to the most
+		 * the AND can hold by the sample's units of evidence, at 95%, and
+		 * not below.  It used to stand whatever it was: thirty-two containers
+		 * of a driver whose batches lie in stretches, none of which kept a
+		 * row of the AND, measured it empty - a filter of millions of rows
+		 * estimated at one, the relation's rows with it.  A count of every
+		 * container of the driver (hits INT_MAX) is no sample, and stands.
 		 */
 		if (measured && hits < LION_ISECT_MIN_HITS &&
 			Min(probesel, minsel) >= coresel * LION_ISECT_ERROR)
-			measured = false;
+		{
+			probesel = Min(probelb, minsel);
+			if (probesel < coresel * LION_ISECT_ERROR)
+				measured = false;
+		}
 		if (measured)
 		{
 			probesel = Min(probesel, minsel);
+			if (probesel < coresel)
+				probesel = Min(Max(probesel, Min(probeub, minsel)), coresel);
 			if (probesel >= coresel * LION_ISECT_ERROR ||
 				probesel * LION_ISECT_ERROR <= coresel)
 				factor = probesel / coresel;
