@@ -33,7 +33,7 @@ static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
 	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
-	"RESID",
+	"RESID", "PARTIAL",
 	"TLKINDS"
 };
 
@@ -60,6 +60,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_List,						/* VCOLS */
 	T_List,						/* FILTERS */
 	T_List,						/* RESID */
+	T_List,						/* PARTIAL */
 	T_IntList					/* TLKINDS */
 };
 
@@ -505,6 +506,39 @@ lion_priv_decode_filters(List *priv, LionPrivStage stage, LionCountPriv *out)
 }
 
 /*
+ * The partial indexes the count reads (DESIGN.md §45): each a valid Oid,
+ * once, and the clauses their predicates imply, for EXPLAIN.
+ */
+static void
+lion_priv_decode_partial(List *priv, LionCountPriv *out)
+{
+	List	   *m = (List *) list_nth(priv, LION_PRIV_PARTIAL);
+	ListCell   *lc;
+
+	if (m == NIL)
+		return;
+	lion_priv_expect_length(m, LION_PRIV_PARTIAL, 2);
+	out->partialidx = (List *) linitial(m);
+	out->predimplied = (List *) lsecond(m);
+	if (out->partialidx == NIL || !IsA(out->partialidx, OidList) ||
+		!lion_priv_is(out->predimplied, T_List))
+		elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	foreach(lc, out->partialidx)
+	{
+		if (!OidIsValid(lfirst_oid(lc)) ||
+			list_member_oid(list_copy_head(out->partialidx,
+										   foreach_current_index(lc)),
+							lfirst_oid(lc)))
+			elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	}
+	foreach(lc, out->predimplied)
+	{
+		if (lfirst(lc) == NULL || !IsA(lfirst(lc), String))
+			elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	}
+}
+
+/*
  * Take custom_private apart into *out, checking as it goes that it is the
  * list this build writes at `stage` (lion_plan_private.h): the shape marker
  * and the number of members before anything else, then every member's node
@@ -677,6 +711,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	}
 
 	lion_priv_decode_filters(priv, stage, out);
+	lion_priv_decode_partial(priv, out);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
@@ -859,6 +894,10 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	}
 	priv = lappend(priv, m);
 	priv = lappend(priv, p->resid);
+
+	Assert(p->partialidx != NIL || p->predimplied == NIL);
+	priv = lappend(priv, (p->partialidx != NIL) ?
+				   list_make2(p->partialidx, p->predimplied) : NIL);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 	{

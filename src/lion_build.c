@@ -504,7 +504,7 @@ typedef struct LionBuildState
 	int			nbuilders;
 	int			maxbuilders;
 
-	double		indtuples;		/* TIDs pushed into the index */
+	double		indtuples;		/* rows pushed into the index */
 
 	/* Summary posting sets (DESIGN.md §32). */
 	int			sumopt;			/* the `summaries` reloption, LION_SUMOPT_* */
@@ -2304,7 +2304,7 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	SpinLockAcquire(&shared->mutex);
 	shared->nparticipantsdone++;
 	shared->reltuples += reltuples;
-	shared->indtuples += lion_spool_ntids(spool);
+	shared->indtuples += lion_spool_nrows(spool);
 	if (indexInfo->ii_BrokenHotChain)
 		shared->brokenhotchain = true;
 	SpinLockRelease(&shared->mutex);
@@ -2695,7 +2695,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		 */
 		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 										   lion_build_callback, bs.spool, NULL);
-		bs.indtuples = lion_spool_ntids(bs.spool);
+		bs.indtuples = lion_spool_nrows(bs.spool);
 	}
 
 	/*
@@ -2806,6 +2806,14 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 #endif
 	MemoryContextDelete(bs.buildctx);
 
+	/*
+	 * The index's tuples are its ROWS, as VACUUM reports them (DESIGN.md §18,
+	 * "Statistics"): pg_class.reltuples, which the planner sizes a partial
+	 * index by (estimate_rel_size()), and the count pushdown prices one by
+	 * (DESIGN.md §45).  The postings a row makes - one a key column, one an
+	 * element - would make a partial index's rows a multiple of themselves
+	 * until the first VACUUM or ANALYZE.
+	 */
 	result = (IndexBuildResult *) palloc0(sizeof(IndexBuildResult));
 	result->heap_tuples = reltuples;
 	result->index_tuples = bs.indtuples;
