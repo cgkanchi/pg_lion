@@ -157,32 +157,36 @@ SELECT lion_bm25_score(title, 'w1', 'bc_title', col => 'title') =
  t
 (1 row)
 
--- expression columns, named as CREATE INDEX named them
+-- expression columns, named as CREATE INDEX named them: to_tsvector and
+-- to_tsvector1 on PostgreSQL 19, other names on other versions, so taken
+-- from the index into bc_e1 and bc_e2
 CREATE INDEX bc_expr ON bc_docs USING lion (to_tsvector('simple', txt), to_tsvector('english', txt));
 CREATE INDEX bc_english ON bc_docs USING lion (to_tsvector('english', txt));
-SELECT attnum, attname FROM pg_attribute WHERE attrelid = 'bc_expr'::regclass ORDER BY attnum;
- attnum |   attname    
---------+--------------
-      1 | to_tsvector
-      2 | to_tsvector1
-(2 rows)
+SELECT max(attname::text) FILTER (WHERE attnum = 1) AS bc_e1,
+	   max(attname::text) FILTER (WHERE attnum = 2) AS bc_e2
+  FROM pg_attribute WHERE attrelid = 'bc_expr'::regclass \gset
+SELECT :'bc_e1' <> :'bc_e2' AS distinct_names;
+ distinct_names 
+----------------
+ t
+(1 row)
 
 SELECT count(*) FILTER (WHERE a.ctid IS DISTINCT FROM s.ctid OR a.score IS DISTINCT FROM s.score) AS differ,
 	   count(*) AS rows
-  FROM lion_bm25('bc_expr', 'run & cat', 40, col => 'to_tsvector1') WITH ORDINALITY AS a(ctid, score, r)
+  FROM lion_bm25('bc_expr', 'run & cat', 40, col => :'bc_e2') WITH ORDINALITY AS a(ctid, score, r)
   FULL JOIN lion_bm25('bc_english', 'run & cat', 40) WITH ORDINALITY AS s(ctid, score, r) USING (r);
  differ | rows 
 --------+------
       0 |   40
 (1 row)
 
-SELECT count(*) FROM lion_bm25('bc_expr', 'run & cat', 40, col => 'to_tsvector');
+SELECT count(*) FROM lion_bm25('bc_expr', 'run & cat', 40, col => :'bc_e1');
  count 
 -------
      0
 (1 row)
 
-SELECT count(*) FILTER (WHERE lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => 'to_tsvector1')
+SELECT count(*) FILTER (WHERE lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => :'bc_e2')
 							  IS DISTINCT FROM lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_english')) AS differ
   FROM bc_docs;
  differ 
@@ -254,9 +258,11 @@ HINT:  Name a column it stores positions for: col => 'title' or col => 'body'.
 SELECT lion_bm25_score(title, 'w1', 'bc_all', col => 'k') FROM bc_docs WHERE id = 1;
 ERROR:  column "k" of lion index "bc_all" does not store positions
 HINT:  Name a column it stores positions for: col => 'title' or col => 'body'.
+-- (its hint names bc_e1 and bc_e2)
+\set VERBOSITY terse
 SELECT * FROM lion_bm25('bc_expr', 'w1', 10);
 ERROR:  lion index "bc_expr" stores positions for more than one column
-HINT:  Name the column to rank: col => 'to_tsvector' or col => 'to_tsvector1'.
+\set VERBOSITY default
 CREATE INDEX bc_plain ON bc_docs USING lion (title, body) WITH (store_positions = off);
 SELECT * FROM lion_bm25('bc_plain', 'w1', 10);
 ERROR:  lion index "bc_plain" does not store positions
@@ -419,9 +425,9 @@ SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', 'body', 10, '')) AS title_by_b
  f
 (1 row)
 
-SELECT bc_scanned($$SELECT id FROM bc_docs WHERE to_tsvector('english', txt) @@ 'run'
-	ORDER BY lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => 'to_tsvector1') DESC
-	LIMIT 10$$) AS expression;
+SELECT bc_scanned(format($$SELECT id FROM bc_docs WHERE to_tsvector('english', txt) @@ 'run'
+	ORDER BY lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => %L) DESC
+	LIMIT 10$$, :'bc_e2')) AS expression;
  expression 
 ------------
  f

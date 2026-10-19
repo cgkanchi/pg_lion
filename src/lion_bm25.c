@@ -40,7 +40,8 @@
  *
  * col names the column as the index does, in its own pg_attribute: a plain
  * column by the table column's name when the index was built, an expression
- * by the name CREATE INDEX chose for it (to_tsvector, to_tsvector1, ...).
+ * by the name CREATE INDEX chose for it (to_tsvector, to_tsvector1, ... on
+ * PostgreSQL 19; the names differ between versions).
  * NULL is the index's one column that stores positions, and an error when it
  * has several (lion_bm25_column()).  Each column that stores positions has
  * an empty key of its own, so N, df and avgdl are the column's, and a column

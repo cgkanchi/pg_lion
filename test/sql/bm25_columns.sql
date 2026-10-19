@@ -84,16 +84,21 @@ SELECT lion_bm25_score(title, 'w1', 'bc_title', col => 'title') =
 	   lion_bm25_score(title, 'w1', 'bc_title') AS same
   FROM bc_docs WHERE id = 1;
 
--- expression columns, named as CREATE INDEX named them
+-- expression columns, named as CREATE INDEX named them: to_tsvector and
+-- to_tsvector1 on PostgreSQL 19, other names on other versions, so taken
+-- from the index into bc_e1 and bc_e2
 CREATE INDEX bc_expr ON bc_docs USING lion (to_tsvector('simple', txt), to_tsvector('english', txt));
 CREATE INDEX bc_english ON bc_docs USING lion (to_tsvector('english', txt));
-SELECT attnum, attname FROM pg_attribute WHERE attrelid = 'bc_expr'::regclass ORDER BY attnum;
+SELECT max(attname::text) FILTER (WHERE attnum = 1) AS bc_e1,
+	   max(attname::text) FILTER (WHERE attnum = 2) AS bc_e2
+  FROM pg_attribute WHERE attrelid = 'bc_expr'::regclass \gset
+SELECT :'bc_e1' <> :'bc_e2' AS distinct_names;
 SELECT count(*) FILTER (WHERE a.ctid IS DISTINCT FROM s.ctid OR a.score IS DISTINCT FROM s.score) AS differ,
 	   count(*) AS rows
-  FROM lion_bm25('bc_expr', 'run & cat', 40, col => 'to_tsvector1') WITH ORDINALITY AS a(ctid, score, r)
+  FROM lion_bm25('bc_expr', 'run & cat', 40, col => :'bc_e2') WITH ORDINALITY AS a(ctid, score, r)
   FULL JOIN lion_bm25('bc_english', 'run & cat', 40) WITH ORDINALITY AS s(ctid, score, r) USING (r);
-SELECT count(*) FROM lion_bm25('bc_expr', 'run & cat', 40, col => 'to_tsvector');
-SELECT count(*) FILTER (WHERE lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => 'to_tsvector1')
+SELECT count(*) FROM lion_bm25('bc_expr', 'run & cat', 40, col => :'bc_e1');
+SELECT count(*) FILTER (WHERE lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => :'bc_e2')
 							  IS DISTINCT FROM lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_english')) AS differ
   FROM bc_docs;
 
@@ -120,7 +125,10 @@ SELECT * FROM lion_bm25('bc_all', 'w1', 10, col => 'nosuch');
 SELECT * FROM lion_bm25('bc_all', 'w1', 10, col => 'Title');
 SELECT * FROM lion_bm25('bc_all', 'w1', 10, col => 'k');
 SELECT lion_bm25_score(title, 'w1', 'bc_all', col => 'k') FROM bc_docs WHERE id = 1;
+-- (its hint names bc_e1 and bc_e2)
+\set VERBOSITY terse
 SELECT * FROM lion_bm25('bc_expr', 'w1', 10);
+\set VERBOSITY default
 CREATE INDEX bc_plain ON bc_docs USING lion (title, body) WITH (store_positions = off);
 SELECT * FROM lion_bm25('bc_plain', 'w1', 10);
 SELECT * FROM lion_bm25('bc_plain', 'w1', 10, col => 'title');
@@ -212,9 +220,9 @@ SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', NULL, 10, '')) AS no_col;
 SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', 'nosuch', 10, '')) AS no_such_col;
 SELECT bc_scanned(bc_sql('body', 'w1', 'bc_all', 'title', 10, '')) AS body_by_title;
 SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', 'body', 10, '')) AS title_by_body;
-SELECT bc_scanned($$SELECT id FROM bc_docs WHERE to_tsvector('english', txt) @@ 'run'
-	ORDER BY lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => 'to_tsvector1') DESC
-	LIMIT 10$$) AS expression;
+SELECT bc_scanned(format($$SELECT id FROM bc_docs WHERE to_tsvector('english', txt) @@ 'run'
+	ORDER BY lion_bm25_score(to_tsvector('english', txt), 'run', 'bc_expr', col => %L) DESC
+	LIMIT 10$$, :'bc_e2')) AS expression;
 SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', 'title', 10, '')) AS title_by_title;
 -- col a parameter: a generic plan cannot tell the column, a custom one can
 SET enable_seqscan = off;

@@ -5462,9 +5462,10 @@ and `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
   of a multi-column index ranks exactly as an index on that column alone would, bit for bit.
   `col` names it as the index's own pg_attribute does (the Column of `\d index`): a plain column by
   the table column's name at CREATE INDEX, an expression by the name CREATE INDEX chose
-  (`to_tsvector`, `to_tsvector1`). NULL, the default, is the index's one column that stores
-  positions, and an error whose hint names the candidates when there are several
-  (`lion_bm25_column()`); a name the index lacks, or a column without positions, is an error too.
+  (`to_tsvector`, `to_tsvector1` on PostgreSQL 19; the names differ between versions). NULL, the
+  default, is the index's one column that stores positions, and an error whose hint names the
+  candidates when there are several (`lion_bm25_column()`); a name the index lacks, or a column
+  without positions, is an error too.
   The functions are declared CALLED ON NULL INPUT for col's NULL, and give no rows (a NULL score)
   for a NULL in any other argument, as STRICT would.
 
