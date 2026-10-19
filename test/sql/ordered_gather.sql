@@ -182,9 +182,16 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE g BETWEEN 10 AND 40 ORDER BY k, i
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 20000');
 SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
 --    the spill goes through the server's temporary files: temp_file_limit
---    stops it, and EXPLAIN (BUFFERS) counts its blocks written
+--    stops it (caught here, the GUC's name unquoted: PostgreSQL 17 quotes
+--    it in the message), and EXPLAIN (BUFFERS) counts its blocks written
 SET temp_file_limit = '512kB';
-SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
+DO $$
+BEGIN
+	PERFORM og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
+	RAISE NOTICE 'not stopped';
+EXCEPTION WHEN OTHERS THEN
+	RAISE NOTICE '%: %', SQLSTATE, replace(SQLERRM, '"', '');
+END $$;
 RESET temp_file_limit;
 SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
 SELECT og_temp('SELECT id FROM ogn WHERE u < 0.03 ORDER BY k, id LIMIT 5');
