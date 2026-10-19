@@ -3584,11 +3584,6 @@ lo_spill_begin(LionOrderedState *st)
 			palloc(sizeof(LionArenaRegion) * LO_ARENA_REGIONS);
 
 		MemoryContextSwitchTo(oldcxt);
-		if (!lion_arena_available())
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("LionOrdered's set of the rows that pass the filter does not fit in hash_mem, and this platform cannot spill it to a temporary file"),
-					 errhint("Raise work_mem or hash_mem_multiplier.")));
 		lion_arena_init(arena, regions, LO_ARENA_REGIONS, lo_arena_extend,
 						lo_arena_fd, st);
 		/* registered before anything is mapped: it finds nothing to undo */

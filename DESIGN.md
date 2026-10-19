@@ -15994,8 +15994,8 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   back one at a time: this set is probed at random, by every TID the walk or the scan meets. Cost:
   about 5 us a page of 8 kB on the 2M emulation (a 64 kB `hash_mem` against the default: the 10%
   range's set, 1.3 MB spilled, 20.9 ms against 20.1; the 30% range's, 3.1 MB, 84.3 against 82.9;
-  the 90% range's, 6.2 MB, within the noise of 250), the price in §30.3. Not on Windows, which has
-  no `mmap()`: there a set past `hash_mem` is an error asking for more `work_mem`. The visited
+  the 90% range's, 6.2 MB, within the noise of 250), the price in §30.3. The arena maps its file
+  with POSIX `mmap()`, which it needs: pg_lion builds where there is one. The visited
   bitmaps of the walk (below, "Stopping early") still live within `hash_mem`; past it the walk
   only stops counting. *(Before this the set DEGRADED past `hash_mem`: it freed every container
   and kept the keys - "every TID of these 64 heap blocks may be a member" -, rechecking every
