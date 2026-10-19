@@ -26,7 +26,7 @@ entry deletion and page recycling in §18)
 - Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build
   (arrived in §24, "Build") and scan,
   fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
-  key sizes above 2000 bytes.
+  key sizes above LION_MAX_KEY_SIZE (§4; tsvector and jsonb keys past it are hashed, §17 and §42.1).
 
 ## 2. TID encoding
 
@@ -357,8 +357,8 @@ container_bits, nbuckets, inline_limit, unused padding to 64 bytes }. *(Version 
 with summary posting sets, which records them in `summary_cols` and `summary_tids`, two words that
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
 with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
-segments of delta varints. Version 10, §21: compact entry tuples, which every index this build
-writes is and the only one it reads; whether there are summaries is `summary_cols`, and whether the
+segments of delta varints. Version 10, §21: compact entry tuples. Version 11, below: keys of up to
+2047 bytes, which every index this build writes is and the only one it reads; whether there are summaries is `summary_cols`, and whether the
 build wrote a NARROW is the `LION_META_NARROW` bit of `order_flags`.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
@@ -386,8 +386,12 @@ layout, which has a short header for INLINE entries and a longer one for CHAIN e
 
 Key data is stored with datumCopy semantics, except that a by-value type is stored at its own width
 (`typlen` bytes); fixed-length by-reference types as typlen bytes; varlena as a detoasted,
-4-byte-header varlena; cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2000 bytes
-are an ERROR. Entry lookup compares the key's hash, computed from the key and never stored, then
+4-byte-header varlena; cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2047 bytes,
+the 4-byte header included, are an ERROR, except where an opclass files a longer one under a hash:
+tsvector_ops a lexeme of more than 2043 bytes (§17, "Long lexemes"), jsonb_contains_ops any key
+past the limit (§42.1). *(The limit was 2000 bytes until format version 11, which a tsvector lexeme
+of up to 2047 bytes passes; a version 10 index is refused, since its jsonb keys of 2001 to 2047
+bytes are hashes that this build would look for whole.)* Entry lookup compares the key's hash, computed from the key and never stored, then
 calls the opclass equality operator's function (strategy 1 of the opfamily, looked up once per
 relation and cached in `rd_amcache`) with the index collation.
 
@@ -4832,9 +4836,13 @@ The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
     CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
         OPERATOR 5 @@ (tsvector, tsquery),
         FUNCTION 1 hashtext(text),
-        FUNCTION 2 gin_extract_tsvector(tsvector, internal, internal),
-        FUNCTION 3 gin_extract_tsquery(tsvector, internal, int2, internal, internal, internal, internal),
+        FUNCTION 2 lion_tsvector_extract_value(tsvector, internal, internal),
+        FUNCTION 3 lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal),
         STORAGE  text;
+
+`lion_tsvector_extract_value()` and `lion_tsvector_extract_query()` call `gin_extract_tsvector()`
+and `gin_extract_tsquery()` and hash the lexemes too long to be keys ("Long lexemes" below); in
+everything said here about GIN's functions they stand for them.
 
 GIN's *consistent* function is deliberately NOT reused: it answers "given which keys matched, does
 this one row match", and a roaring scan never asks that - it combines whole posting sets.  The query
@@ -5560,6 +5568,45 @@ scan, index scan, count pushdown), never in the planner, so new lexemes are alwa
   cleared (`lion_tsquery_strip_prefixes()`), the closest stand-in for an expansion they cannot
   do.  A prefix under an OR of clauses in the count pushdown is refused: that path has no
   recheck to fall back on if the expansion goes past the cap.
+
+### Long lexemes (2026-10-19)
+
+A tsvector lexeme can be 2047 bytes long (`MAXSTRLEN`: text input stops at 2046, a dictionary or
+binary input does not), and a key with its 4-byte header at most `LION_MAX_KEY_SIZE` = 2047 (§4).
+So `tsvector_ops` puts every lexeme through `lion_lexeme_key()` (lion_multikey.c), in its
+extractValue and extractQuery wrappers and in the ranking:
+
+- A lexeme of up to `LION_LEXEME_KEY_MAX` = 2043 bytes is its own key.
+- A longer one is filed under a key of exactly 2043 bytes: its first bytes, as many whole characters
+  as fit in `LION_LEXEME_KEY_KEEP` = 1978, then `#` up to byte 1979, then the 64 hex digits of the
+  SHA-256 of the whole lexeme. Facets show it as that text.
+- **Exactness.** A 2043-byte key is ambiguous: it is a 2043-byte lexeme or the key of a longer one,
+  and a 2043-byte lexeme can be spelled like another's key. So the extractQuery wrapper turns a
+  query that names one into `LION_SEARCH_MODE_LOSSY`: every candidate is rechecked in the heap (the
+  bitmap scan's recheck, the index scan's `xs_recheck`, the count pushdown's row filter), and the
+  position filter stays out, since `lion_tsquery_item_keys()` needs the default search mode. The
+  planner asks the same wrapper (`lion_multikey_query_is_exact()`, `lion_query_posexact()`), so such
+  a literal under an OR of clauses stays with the ordinary plan. Lexemes of up to 2042 bytes keep
+  every exact path.
+- **Prefixes.** A long lexeme's key begins with its first 1978 bytes, or up to
+  `pg_database_encoding_max_length() - 1` fewer where a character straddles byte 1978, so its key
+  is in the run of every prefix no longer than `lion_lexeme_prefix_max()`, and that key, being
+  ambiguous, makes the expansion rechecked. A longer prefix is not expanded: the query keeps the
+  path past the cap above, every candidate rechecked.
+- **Ranking.** BM25 scores keys: `lion_bm25_lexemes()` returns the query's keys, deduplicated, and
+  `lion_bm25_score()` finds a row's term frequency by key (`lion_bm25_doc_lexeme()`), so the two
+  agree with the index. A lexeme that shares its key with no other scores as itself. Two lexemes of
+  one row with one key count as one term with the positions of the first in the tsvector's order,
+  which is the one the extraction keeps; the row's length counts both.
+- **Other keys** are not hashed: an array element, a scalar key or any other opclass's key past
+  `LION_MAX_KEY_SIZE` is still an ERROR.
+
+`test/sql/tsvector_long.sql`: lexemes of 1990 to 2047 bytes (the 2047-byte ones through binary
+COPY), long ones that share their first 2030 bytes, multibyte ones, and a 2043-byte lexeme spelled
+like another's key; AND, OR, NOT, phrases, weights and prefixes at and past the longest a key
+keeps; bitmap, index, count and literal paths with and without positions against a sequential
+scan and GIN; BM25 against SQL and the LionBm25 scan against sorting; writes, VACUUM, REINDEX and
+verify; a scalar and an array key past the limit.
 
 ### Cardinality guard
 
@@ -6289,8 +6336,9 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 10 (`LION_VERSION_V10`). An index of an older version is refused with the
-REINDEX hint: its entries would be read at the wrong offsets.
+The format is version 11 (`LION_VERSION_V11`): these entry tuples, with keys of up to 2047 bytes
+(§4). An index of an older version is refused with the REINDEX hint: its entries would be read at
+the wrong offsets, or its long jsonb keys looked for in the wrong form.
 
 ### The order
 
@@ -6619,15 +6667,15 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
   model tell a directory page from a container page without reading the index.
   **The two walk-backs can pull in OPPOSITE directions and leave no cut at all**, and that is no
   longer an error (2026-09-22 review of this section). An 8 KiB page has room for one item plus one
-  pivot (6092 + 2036 = 8128) but not for two items plus a pivot, so a page holding two large entries
+  pivot (6056 + 2068 = 8124) but not for two items plus a pivot, so a page holding two large entries
   under a large high key would have no two-way cut for a third large item between them. The split
   then runs in two steps: the page is split as it STANDS, which always has a cut - k = 1 puts one item
   plus its high key on the left and a suffix of what the page already held plus its old high key on
   the right, and both were on the page a moment ago - and the item is then placed again on whichever
   half now owns it. That terminates, because every split moves at least one item off the page and a
   page holding one item always takes a second. With today's size caps the shape is in fact
-  unreachable - a fresh entry is at most 2052 bytes on a page and a replacement grows by at most a
-  few dozen - but the caps are three independent constants and none of them should be load-bearing
+  unreachable - a fresh entry is a little over 2 kB at most on a page and a replacement grows by at
+  most a few dozen - but the caps are three independent constants and none of them should be load-bearing
   for whether an INSERT errors out. **A posting-tree internal page needs none of this** (§22): its
   pivots are fixed size, so the middle cut always fits.
 - **Root split** is ATOMIC instead: left, right, the new root and the meta page are four buffers, so
@@ -6783,7 +6831,7 @@ room the page does not have, and reserving for the incoming key alone (what the 
 overflowed the page and failed the build outright. `lion_build_level_flush()` therefore moves
 trailing items to the next page until the high key fits, and the first of THEM supplies it - a pivot
 copy of a key that was already on the page, which is never larger than the item it came from, so the
-reserve is exact by construction. `test/sql/directory.sql` §8 puts a 2000-byte key behind short ones
+reserve is exact by construction. `test/sql/directory.sql` §8 puts a 2047-byte key behind short ones
 at every distance from a page boundary, at the default fill and at 100.
 
 ### Readers
