@@ -2351,6 +2351,9 @@ typedef struct LionCountRelCost
 	Var		   *rangevar;
 	bool		rangesum;
 	LionRangeCost *rc;
+	Cost		rangeseek;		/* what a range of a parallel count pays to
+								 * seek the WHERE's sets (§10), priced while
+								 * clauseset is there to price it from */
 	LionWalkSave *walksave; /* NULL, or what walking the ranges too
 								 * large to collect saves (below) */
 
@@ -3194,6 +3197,47 @@ lion_count_rel_merge(LionCountRelCost *c)
 }
 
 /*
+ * What a range of a parallel count (DESIGN.md §10, "A count in parallel")
+ * pays to seek every set of every WHERE source to its first key: a descent
+ * of a chain's posting tree, a page of the index's at its third rung
+ * (lion_index_page_cost()), as a range of a parallel GROUP BY seeks each
+ * group's set (lion_count_rel_merge()), and a range taken as a source, a
+ * copy in memory, a probe there.  Priced from each clause's sets as the AND
+ * prices them (clauseset), so before lion_count_rel_set_pages() frees them;
+ * lion_count_rel_range_price() adds it to what the range pays.
+ */
+static Cost
+lion_count_rel_range_seek(LionCountRelCost *c)
+{
+	ListCell   *lc1;
+	ListCell   *lc2;
+	Cost		seek = 0;
+	int			ci = 0;
+
+	forboth(lc1, c->whereidx, lc2, c->wherekinds)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
+		int			kind = lfirst_int(lc2);
+		double		sets = 1.0;
+
+		if (kind == LION_CLAUSE_RANGESRC || idx == NULL)
+		{
+			seek += LION_MEMORY_PROBE_COST;
+			ci++;
+			continue;
+		}
+		if (LION_CLAUSE_IS_POSITIVE(kind) && ci < c->nclause)
+			sets = Max(Max(c->clauseset[ci].nsets, c->clauseset[ci].nkeys),
+					   1.0);
+		seek += sets * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES *
+						lion_index_page_cost(c->root, (double) idx->pages,
+											 seq_page_cost));
+		ci++;
+	}
+	return seek;
+}
+
+/*
  * The pages each clause's sets read, walked or sought (lion_cost_set_pages()),
  * and the directory leaves of their lookups; frees the per-clause and
  * per-source arrays.
@@ -3225,6 +3269,8 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 	}
 	c->random_pages = lion_cost_leaf_pages(c->nclause, c->clauseindex,
 										   c->clauseset);
+	if (c->rc != NULL)
+		c->rangeseek = lion_count_rel_range_seek(c);
 	pfree(c->clauseset);
 	pfree(c->clauseindex);
 	pfree(c->clausesrc);
@@ -3669,12 +3715,10 @@ lion_count_rel_walk_save(LionCountRelCost *c)
  * again (countrange), what every participant pays whole (whole), and the
  * pages it reads (pages).
  *
- * A range seeks every set of every WHERE source to its first key - a
- * descent of a chain's posting tree, a page of the index's at its third rung
- * (lion_index_page_cost()), as a range of a parallel GROUP BY seeks each
- * group's set (lion_count_rel_merge()) - and a walk over a column's entries,
- * a sum over every one of them or over a range's (§14, §28), walks them
- * again and counts each, sought to the range too: what the counts cost at
+ * A range seeks every set of every WHERE source to its first key
+ * (c->rangeseek, lion_count_rel_range_seek()), and a walk over a column's
+ * entries, a sum over every one of them or over a range's (§14, §28), walks
+ * them again and counts each, sought to the range too: what the counts cost at
  * their containers is divided among the ranges, what they cost to set up is
  * not.  The lookups that locate the WHERE are every participant's own, as
  * are the ranges taken as sources it collects (§32), whole each time: they
@@ -3684,33 +3728,7 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 static void
 lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
 {
-	ListCell   *lc1;
-	ListCell   *lc2;
-	Cost		seek = 0;
 	double		counts = 0;
-	int			ci = 0;
-
-	forboth(lc1, c->whereidx, lc2, c->wherekinds)
-	{
-		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
-		int			kind = lfirst_int(lc2);
-		double		sets = 1.0;
-
-		/* a range taken as a source is a copy in memory, sought there */
-		if (kind == LION_CLAUSE_RANGESRC || idx == NULL)
-		{
-			seek += LION_MEMORY_PROBE_COST;
-			ci++;
-			continue;
-		}
-		if (LION_CLAUSE_IS_POSITIVE(kind) && ci < c->nclause)
-			sets = Max(Max(c->clauseset[ci].nsets, c->clauseset[ci].nkeys),
-					   1.0);
-		seek += sets * (LION_PROBE_COST + LION_RANGE_DESCENT_PAGES *
-						lion_index_page_cost(c->root, (double) idx->pages,
-											 seq_page_cost));
-		ci++;
-	}
 
 	if (c->groupidx != NULL)
 	{
@@ -3748,7 +3766,7 @@ lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
 	 * where they are not yet copied - which they are from their second use
 	 * on (§9): the walk's counts probe them in memory.
 	 */
-	rc->countrange += seek + counts * c->nsrc * LION_MEMORY_PROBE_COST;
+	rc->countrange += c->rangeseek + counts * c->nsrc * LION_MEMORY_PROBE_COST;
 	rc->whole += c->random_pages * random_page_cost + c->descent_cost +
 		c->lookup_cost + c->rangesrc_cost;
 	rc->pages += c->seq_pages + c->probed_pages + c->recheck_pages;
