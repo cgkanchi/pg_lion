@@ -1001,6 +1001,8 @@ typedef struct LionState
 	Oid			collation;
 	FmgrInfo	hashproc;		/* opclass support proc 1, or the key type's
 								 * default hash opclass proc */
+	bool		imagehash;		/* hashproc is lion_image_hash(): the key
+								 * type has a btree class and no hash one */
 	FmgrInfo	eqproc;			/* strategy-1 operator's function, or the key
 								 * type's default equality */
 

@@ -377,6 +377,83 @@ lion_proc_inval_callback(Datum arg, LionSysCacheId cacheid, uint32 hashvalue)
 }
 
 /*
+ * The hash of a multi-key column whose key type has a default btree opclass
+ * and no hash one (money, bit, varbit, tsvector, tsquery as array_ops
+ * elements; DESIGN.md §17, "Key type resolution").  Equal keys must hash
+ * alike, and nothing else is asked of it: no entry stores its hash, and the
+ * directory of such a column is ordered by the btree comparison, which the
+ * hash only breaks ties of.  Where the btree class says equal values are
+ * stored identically (its equalimage proc) the hash is that of the stored
+ * image, as datum_image_eq() compares it; otherwise it is 0 for every key,
+ * which is consistent with any equality and leaves the comparison and the
+ * equality to tell keys apart.
+ */
+typedef struct LionImageHash
+{
+	int16		typlen;
+	bool		typbyval;
+	bool		image;
+} LionImageHash;
+
+static Datum
+lion_image_hash(PG_FUNCTION_ARGS)
+{
+	LionImageHash *h = (LionImageHash *) fcinfo->flinfo->fn_extra;
+	Datum		key = PG_GETARG_DATUM(0);
+	uint32		result;
+
+	if (!h->image)
+		PG_RETURN_UINT32(0);
+	if (h->typbyval)
+		result = hash_bytes((const unsigned char *) &key, sizeof(Datum));
+	else if (h->typlen == -1)
+	{
+		struct varlena *v = PG_DETOAST_DATUM_PACKED(key);
+
+		result = hash_bytes((const unsigned char *) VARDATA_ANY(v),
+							(int) VARSIZE_ANY_EXHDR(v));
+		if ((Pointer) v != DatumGetPointer(key))
+			pfree(v);
+	}
+	else if (h->typlen == -2)
+		result = hash_bytes((const unsigned char *) DatumGetCString(key),
+							(int) strlen(DatumGetCString(key)));
+	else
+		result = hash_bytes((const unsigned char *) DatumGetPointer(key),
+							h->typlen);
+	PG_RETURN_UINT32(result);
+}
+
+/*
+ * Set up state's hash as lion_image_hash() for its key type, whose default
+ * btree class is typentry's.
+ */
+static void
+lion_use_image_hash(LionState *state, TypeCacheEntry *typentry,
+					MemoryContext cxt)
+{
+	LionImageHash *h = MemoryContextAllocZero(cxt, sizeof(LionImageHash));
+	Oid			proc;
+
+	h->typlen = state->typlen;
+	h->typbyval = state->typbyval;
+	proc = get_opfamily_proc(typentry->btree_opf, typentry->btree_opintype,
+							 typentry->btree_opintype, BTEQUALIMAGE_PROC);
+	h->image = OidIsValid(proc) &&
+		DatumGetBool(OidFunctionCall1Coll(proc, state->collation,
+										  ObjectIdGetDatum(typentry->btree_opintype)));
+
+	MemSet(&state->hashproc, 0, sizeof(FmgrInfo));
+	state->hashproc.fn_addr = lion_image_hash;
+	state->hashproc.fn_oid = InvalidOid;
+	state->hashproc.fn_nargs = 1;
+	state->hashproc.fn_strict = true;
+	state->hashproc.fn_extra = h;
+	state->hashproc.fn_mcxt = cxt;
+	state->imagehash = true;
+}
+
+/*
  * Fill in the state of ONE key column of index (DESIGN.md §24).  attno is
  * 1-based and names an index column, not a heap attribute.
  */
@@ -453,8 +530,12 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 	 * polymorphic multi-key class cannot name a single function for the key
 	 * type (array_ops indexes anyelement), so its hash comes from the key
 	 * type's default hash opclass, the way GIN resolves its comparison
-	 * function in initGinState().
+	 * function in initGinState() - or, for a type with a default btree class
+	 * and no hash one, lion_image_hash(), which the btree comparison orders
+	 * the column by (checked below).  A type with neither cannot be indexed,
+	 * as GIN cannot index it either.
 	 */
+	state->imagehash = false;
 	if (OidIsValid(index_getprocid(index, attno, LION_HASH_PROC)))
 		fmgr_info_copy(&state->hashproc,
 					   index_getprocinfo(index, attno, LION_HASH_PROC), cxt);
@@ -463,15 +544,22 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 		TypeCacheEntry *typentry;
 
 		Assert(state->multikey);
-		typentry = lookup_type_cache(state->typid, TYPECACHE_HASH_PROC_FINFO);
-		if (!OidIsValid(typentry->hash_proc_finfo.fn_oid))
+		typentry = lookup_type_cache(state->typid,
+									 TYPECACHE_HASH_PROC_FINFO |
+									 TYPECACHE_CMP_PROC_FINFO |
+									 TYPECACHE_BTREE_OPFAMILY);
+		if (OidIsValid(typentry->hash_proc_finfo.fn_oid))
+			fmgr_info_copy(&state->hashproc, &typentry->hash_proc_finfo, cxt);
+		else if (OidIsValid(typentry->btree_opf) &&
+				 OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+			lion_use_image_hash(state, typentry, cxt);
+		else
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_FUNCTION),
-					 errmsg("could not identify a hash function for type %s",
+					 errmsg("could not identify a hash or comparison function for type %s",
 							format_type_be(state->typid)),
-					 errdetail("Index \"%s\" extracts keys of that type.",
+					 errdetail("Index \"%s\" extracts keys of that type, which has neither a default hash operator class nor a default btree operator class.",
 							   RelationGetRelationName(index))));
-		fmgr_info_copy(&state->hashproc, &typentry->hash_proc_finfo, cxt);
 	}
 
 	/*
@@ -638,6 +726,19 @@ lion_fill_column_state(Relation index, LionState *state, AttrNumber attno,
 					 errhint("REINDEX the index.")));
 		state->ordered = stored;
 	}
+
+	/*
+	 * A key type hashed by lion_image_hash() is told apart by its btree
+	 * comparison, which has to order the column: in hash order, keys that
+	 * all hash to 0 would be one run to scan.
+	 */
+	if (state->imagehash && !state->ordered)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("could not identify a hash function for type %s",
+						format_type_be(state->typid)),
+				 errdetail("Index \"%s\" extracts keys of that type, which has no default hash operator class, and its default btree operator class cannot order the index.",
+						   RelationGetRelationName(index))));
 }
 
 /*

@@ -4898,7 +4898,17 @@ descriptor is the same answer for every class, needs no polymorphism handling of
   because lexemes are byte strings and GIN's own `gin_cmp_tslexeme()` compares them bytewise.
 - Hash: support proc 1 when the opclass has one, else the key type's default hash opclass through
   `lookup_type_cache(TYPECACHE_HASH_PROC_FINFO)` - which is how GIN's `initGinState()` resolves its
-  comparison function for a polymorphic key type.  ERROR when the type has no hash opclass.
+  comparison function for a polymorphic key type.  A key type with a default btree opclass and no
+  hash one - money, bit, varbit, tsvector, tsquery, all of which GIN's array_ops takes - is hashed
+  by `lion_image_hash()` (`LionState.imagehash`): the hash of the stored image (`hash_bytes()` over
+  what `datum_image_eq()` compares) where the btree class's equalimage proc says equal values are
+  stored alike (money, bit, varbit), and 0 for every key where it does not (tsvector, tsquery). A
+  hash only has to agree with equality: no entry stores one, and such a column is ORDERED by the
+  btree comparison (rule 2 of §21 holds: its equality is the btree class's), which the hash only
+  breaks ties of, so a constant costs nothing there; the dedup of a row's keys and the facet table
+  fall back on the comparison and the equality the same way.  A column that should come out
+  unordered all the same is an ERROR, and so is a key type with neither class, as GIN needs a btree
+  one.
 - Equality: strategy 1 of the opfamily for a scalar opclass; for a multi-key one the key type's
   default equality (`TYPECACHE_EQ_OPR_FINFO`), because the family's strategies are about the indexed
   value and not about two keys.  The two always agree: a type's default hash opclass hashes what its
