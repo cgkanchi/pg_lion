@@ -50,7 +50,10 @@ import psycopg
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import knn_dbpedia as K  # noqa: E402
 
-LO = ['SET enable_sort = off', 'SET enable_indexscan = off']
+# LionOrdered: enable_indexscan would disable it with the lionvec index's
+# own scan, which the margin marks it down against instead
+LO = ['SET enable_sort = off', 'SET pg_lion.enable_plain_scan = off',
+      'SET pg_lion.pushdown_margin = 1000']
 EXACT_OFF = ['SET pg_lion.vector_exact_rows = 0', 'SET pg_lion.vector_exact_per_partition = 0']
 # kind: (filter, settings)
 KINDS = {

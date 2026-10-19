@@ -2670,6 +2670,15 @@ lion_vacuum_delete_entries(LionVacState *vs, Buffer buf, LionVacEntry *ents,
 		}
 	}
 
+	/*
+	 * SERIALIZABLE (DESIGN.md §9): a CHAIN entry's readers locked its root,
+	 * and once the entry is gone an insert of its key checks the leaf, so the
+	 * root's predicate locks move to the leaf - before any record opens,
+	 * while the leaf is still held.
+	 */
+	for (i = 0; i < nfree; i++)
+		lion_predlock_move(vs->index, heads[i], BufferGetBlockNumber(buf));
+
 	if (ndel > 0)
 	{
 		int			end = ndel;

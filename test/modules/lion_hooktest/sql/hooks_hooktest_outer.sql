@@ -32,11 +32,13 @@ RESET pg_lion.enable_count_pushdown;
 -- queries above too (an ORDER BY of a lion column walks that column).
 SELECT lion_hooktest_reset();
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
 SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 SET pg_lion.enable_ordered_scan = off;
 SELECT v FROM hk WHERE k = 3 ORDER BY v LIMIT 5;
 RESET pg_lion.enable_ordered_scan;

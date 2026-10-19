@@ -499,7 +499,17 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * them; and LION_MAX_ENTRY_SIZE, which leaves room for the largest pivot,
  * shrank, so an INLINE entry a version 10 build wrote may be larger than a
  * page now leaves room for.  Opening a version 10 index is an ERROR whose
- * hint asks for REINDEX.  Every index this build writes is version 11.
+ * hint asks for REINDEX.
+ *
+ * Version 12 begins EVERY internal directory page with a minus-infinity
+ * downlink, where version 11 did so only on the leftmost page of a level
+ * (DESIGN.md §21, "Height").  A version 11 directory may have keyed first
+ * downlinks and any height, which is what version 12 rules out, so opening
+ * one is an ERROR whose hint asks for REINDEX.  Version 12 also has the pages
+ * VACUUM takes out of the tree and hands out again - HALF_DEAD and DELETED
+ * directory pages (§21, "Page deletion"), UNLINKED posting leaves (§22,
+ * "Empty leaves") - and the count of them still waiting on the meta page
+ * (§18, "Reuse").  Every index this build writes is version 12.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
@@ -507,6 +517,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V9			9	/* varbyte sparse segments (§13) */
 #define LION_VERSION_V10		10	/* compact entry tuples (§21) */
 #define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
+#define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
 
 /* May the index of this meta page hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta) \
@@ -779,9 +790,12 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
  * The largest key, in bytes as stored (a varlena with its 4-byte header).  A
  * tsvector lexeme is at most 2047 bytes (ts_type.h's MAXSTRLEN), so a key of
  * this size holds every lexeme of up to 2043; the longer ones are hashed by
- * tsvector_ops (lion_lexeme_key(), DESIGN.md §17 "Long lexemes"), and keys
- * of jsonb_contains_ops past it by that class (§42.1).  Any other key past it
- * is an ERROR.
+ * tsvector_ops (lion_lexeme_key(), DESIGN.md §17 "Long lexemes"), as are the
+ * longer text and bytea elements of array_ops, and keys of
+ * jsonb_contains_ops past it by that class (§42.1).  Any other varlena key
+ * past it is stored compressed, as a btree index tuple stores a long value
+ * (lion_key_prepare(), §4 "Long keys"), and is an ERROR only when even that
+ * does not fit.
  */
 #define LION_MAX_KEY_SIZE		2047
 #define LION_DEFAULT_INLINE_LIMIT 4096
@@ -884,6 +898,37 @@ lion_pivot_kindflags(uint16 flags)
 #define LION_NONLEAF_FILLFACTOR	70
 #define LION_MIN_DOWNLINKS		3
 #define LION_ABS_MIN_DOWNLINKS	2
+
+/*
+ * The tallest directory a meta page may record (its `height`, the root's
+ * level, 0 for a root that is a leaf); a taller one is damage.
+ *
+ * No INSERT reaches it short of more than 2^31 leaves made over the index's
+ * life, whatever the keys and their order (DESIGN.md §21, "Height").  Every
+ * internal page's FIRST downlink is minus infinity - a header and no key, its
+ * lower bound being its left sibling's high key - so an internal page split
+ * has the room for two downlinks on each half even when every key is
+ * LION_MAX_KEY_SIZE (lion_dir_choose_split()), and so does the build
+ * (lion_build_level_add()), which may leave ONE on the rightmost page of a
+ * level; and a root has two when it is made, by a root split or as the one
+ * page of the build's top level over a level of at least two.  A page with
+ * two downlinks takes a third without splitting, so a split cuts four or more.
+ * VACUUM takes downlinks out (lion_dir_delete.c) and may leave a page with
+ * one, so what is counted is the pages MADE at a level: with Φ the sum over
+ * the level's pages of max(downlinks - 2, 0), a downlink added raises Φ by at
+ * most one, a split lowers it by two, a downlink or page taken out never
+ * raises it, a root split adds a term of 0 and the build terms of
+ * downlinks - 2 but for one page.  Φ >= 0 then gives 2M <= A + 1 for the M
+ * pages made at a level and the A downlinks ever added to it, and each of
+ * those names a page made at the level below.  A directory of height h has
+ * therefore had at least 2^(k-1) + 1 pages made at level h - k for k >= 1,
+ * 2^(h-1) + 1 leaves and 2^h + h pages in all.  A relation has fewer than
+ * 2^32 blocks, so without page deletion h <= 31; with it the pages are used
+ * again, and 32 levels take more than 2^31 leaves made, a leaf split for
+ * every half page of entries added.  lion_dir_split() refuses a root split
+ * that would make the directory 32 levels tall before it writes anything.
+ */
+#define LION_MAX_DIR_HEIGHT		31
 
 typedef struct LionOptions
 {
@@ -1027,6 +1072,8 @@ typedef struct LionState
 	Oid			collation;
 	FmgrInfo	hashproc;		/* opclass support proc 1, or the key type's
 								 * default hash opclass proc */
+	bool		imagehash;		/* hashproc is lion_image_hash(): the key
+								 * type has a btree class and no hash one */
 	FmgrInfo	eqproc;			/* strategy-1 operator's function, or the key
 								 * type's default equality */
 
@@ -1086,6 +1133,7 @@ typedef struct LionState
 struct LionIndexState
 {
 	LionMetaPageData meta;		/* copy of the meta page */
+	Oid			indexrelid;		/* the index, for its name in an ERROR */
 	int			ncolumns;		/* key columns, 1 .. INDEX_MAX_KEYS (§24) */
 	LionState  *cols;			/* [ncolumns]; cols[i] is key column i + 1 */
 
@@ -1136,7 +1184,11 @@ lion_index_row_column(const LionIndexState *ix)
  * comparisons of DESIGN.md §28, in btree's order, which an ORDERED scalar
  * class has beside its proc 4, and 10 is `<>` (§35), which it has beside
  * them: every entry but one, a range with a hole in it.  11 .. 16 are
- * jsonb_contains_ops' (DESIGN.md §42, §43), which are multi-key too.
+ * jsonb_contains_ops' (DESIGN.md §42, §43), which are multi-key too.  17 is
+ * array `=`, which the keys only bound - the rows holding every element of
+ * the query, rechecked - and 18 tsvector's `@@@`, `@@` under its deprecated
+ * name, which a scan takes as 5 (LION_STRAT_CANONICAL()); a bitmap scan is
+ * all that answers either, as for GIN.
  */
 #define LION_STRAT_EQUAL			1
 #define LION_STRAT_CONTAINS		2	/* anyarray @> anyarray */
@@ -1154,7 +1206,13 @@ lion_index_row_column(const LionIndexState *ix)
 #define LION_STRAT_JSONB_EXISTS_ALL	14	/* jsonb ?& text[] */
 #define LION_STRAT_JSONPATH_EXISTS	15	/* jsonb @? jsonpath (§43) */
 #define LION_STRAT_JSONPATH_MATCH	16	/* jsonb @@ jsonpath */
-#define LION_NSTRATEGIES			16
+#define LION_STRAT_ARRAY_EQUAL	17	/* anyarray = anyarray (§17) */
+#define LION_STRAT_MATCH_OLD		18	/* tsvector @@@ tsquery, which is @@ */
+#define LION_NSTRATEGIES			18
+
+/* a strategy as the scan answers it: `@@@` is `@@` */
+#define LION_STRAT_CANONICAL(s) \
+	((s) == LION_STRAT_MATCH_OLD ? LION_STRAT_MATCH : (s))
 
 /* a multi-key strategy (§17) */
 #define LION_STRAT_IS_MULTI(s) \
@@ -1345,6 +1403,24 @@ extern int	lion_lexeme_prefix_max(void);
 extern Datum lion_tsvector_extract_value(PG_FUNCTION_ARGS);
 extern Datum lion_tsvector_extract_query(PG_FUNCTION_ARGS);
 
+/*
+ * array_ops' keys (DESIGN.md §17, "Long elements"): a text, varchar or bytea
+ * element longer than LION_LEXEME_KEY_MAX bytes is filed under a hashed key
+ * as a long lexeme is, and a key of LION_LEXEME_KEY_MAX bytes is ambiguous.
+ */
+extern Datum lion_array_extract_value(PG_FUNCTION_ARGS);
+extern Datum lion_array_extract_query(PG_FUNCTION_ARGS);
+
+/*
+ * Whether a key of the column may stand for values other than itself - a
+ * hashed key of a long lexeme or array element, or a value spelled like one -
+ * and the values of a heap row's value that are filed under such a key
+ * (lion_index_facets(), which shows them in its place).
+ */
+extern bool lion_key_is_ambiguous(const LionState *state, Datum key);
+extern int	lion_ambiguous_values(LionState *state, Datum value, Datum key,
+								  Datum **values);
+
 /* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
 extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
 /* ... its extractValue, and one of its keys as text (lion_index_facets()) */
@@ -1451,6 +1527,8 @@ extern void lion_check_table_am(Relation heap);	/* ERROR if not supported */
 /* Key handling */
 extern uint32 lion_hash_key(LionState *state, Datum key);
 extern Size lion_key_datum_size(LionState *state, Datum key);	/* bytes needed to store the key */
+extern Datum lion_key_prepare(LionState *state, Datum key, Relation heap,
+							  ItemPointer tid);	/* the key as stored; ERROR if too long */
 extern void lion_store_key(LionState *state, Datum key, char *dest);
 extern Datum lion_fetch_key(LionState *state, const char *src);
 
@@ -1619,6 +1697,13 @@ lion_page_first_data(Page page)
 	return LionPageIsRightmost(page) ? FirstOffsetNumber :
 		OffsetNumberNext(FirstOffsetNumber);
 }
+
+/*
+ * The first data item of a directory page that carries a key: past the
+ * minus-infinity downlink every internal page begins with (DESIGN.md §21).
+ * One past the last item when there is none.
+ */
+extern OffsetNumber lion_dir_first_keyed(Page page);
 
 extern void lion_entry_size_error(Page page, ItemId iid);
 
@@ -2313,12 +2398,14 @@ extern void lion_meta_count_bulkdelete(Relation index,
  * search whose opfamily has no cross-type ordering function (support proc 4)
  * cannot descend at all and falls back to a walk of every leaf, which is
  * correct and slow; the default opclasses of pg_lion all carry one.
+ * *movedright, when given, is lion_dir_find()'s.
  */
 extern bool lion_find_entry_ext(Relation index, LionState *state, int lockmode,
 							   Datum key, uint32 hash,
 							   FmgrInfo *eqproc, FmgrInfo *cmpproc,
 							   Oid collation,
-							   Buffer *buf, OffsetNumber *offnum);
+							   Buffer *buf, OffsetNumber *offnum,
+							   bool *movedright);
 
 /*
  * May this transaction use index for a query under snapshot?  Requires
@@ -2340,9 +2427,10 @@ extern void lion_check_old_snapshot(Relation index, Snapshot snapshot);
  * Direct readers of a lion index (lion_reader.c): what a function handed an
  * index by name, or a node reading one without index_beginscan(), owes the
  * caller.  LION_READ_ROWS for anything that returns or counts rows, which
- * vets the index for the snapshot, refuses row-level security and takes the
- * predicate lock; LION_READ_STATS for index-wide statistics only, which
- * refuses row-level security too.
+ * vets the index for the snapshot and refuses row-level security;
+ * LION_READ_STATS for index-wide statistics only, which refuses row-level
+ * security too.  Predicate locks are not the policy's: every lookup and walk
+ * takes them on what it reads (below).
  */
 typedef enum LionReadPolicy
 {
@@ -2353,9 +2441,29 @@ typedef enum LionReadPolicy
 extern Relation lion_reader_open(Oid indexoid, LionReadPolicy policy,
 								 Snapshot snapshot, const char *action,
 								 Relation *heap);
+extern bool lion_is_partitioned_index(Oid relid);
+extern void lion_refuse_partitioned_index(Oid relid);
 extern void lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
 							const char *action);
-extern void lion_reader_lock(Relation index, Snapshot snapshot);
+
+/*
+ * SERIALIZABLE predicate locks (lion_reader.c, DESIGN.md §9): what a reader
+ * takes on the pages it reads, and what an insert checks before it changes
+ * an entry.  All of them do nothing outside a SERIALIZABLE transaction.
+ */
+extern void lion_reader_lock_page(Relation index, BlockNumber blkno);
+extern void lion_reader_lock_entry(Relation index, BlockNumber leaf,
+								   const LionEntryTuple *entry);
+extern void lion_reader_lock_absent(Relation index, Buffer buf,
+									bool movedright);
+extern void lion_reader_lock_leaf(Relation index, Buffer buf,
+								  AttrNumber attno);
+extern void lion_writer_check(Relation index, Buffer leafbuf,
+							  OffsetNumber off, bool found);
+extern void lion_predlock_copy(Relation index, BlockNumber from,
+							   BlockNumber to);
+extern void lion_predlock_move(Relation index, BlockNumber from,
+							   BlockNumber to);
 
 
 /* ---------- additive helpers (wave 2, insert/vacuum/verify) ---------- */

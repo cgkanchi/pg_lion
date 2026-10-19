@@ -25,7 +25,7 @@ setup
 teardown { DROP TABLE r; }
 
 session s1
-setup { SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; SET enable_indexonlyscan = off; SET enable_sort = off; }
+setup { SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; SET enable_indexonlyscan = off; SET enable_sort = off; }
 step s1_tids { SELECT ctid, id, k, c FROM r WHERE id < 100 ORDER BY id; }
 step s1_plan { EXPLAIN (COSTS OFF) SELECT id, k FROM r WHERE c = 1 ORDER BY k; }
 step s1_begin { BEGIN; }

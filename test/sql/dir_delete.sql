@@ -5,6 +5,7 @@
 SET client_min_messages = warning;
 
 CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
 
 /*
  * Keys of 600 bytes: a dozen to a leaf and a dozen downlinks to an internal
@@ -74,6 +75,23 @@ LANGUAGE sql AS $$
 		   leaf_pages, internal_pages, deleted_pages
 	  FROM lion_index_stats('dd_k')
 $$;
+/*
+ * The internal pages of the directory that are not the rightmost of their
+ * level, by how many downlinks they hold: their items but the high key.
+ */
+CREATE FUNCTION dd_downlinks(OUT level int, OUT downlinks int, OUT pages bigint)
+RETURNS SETOF record LANGUAGE sql AS $$
+	SELECT get_byte(r, s + 24) + 256 * get_byte(r, s + 25), (h.lower - 24) / 4 - 1,
+		   count(*)
+	  FROM generate_series(1, (pg_relation_size('dd_k') / 8192)::int - 1) b,
+		   LATERAL get_raw_page('dd_k', b) r,
+		   LATERAL (SELECT special AS s, lower FROM page_header(r)) h
+	 -- DIR and not DELETED, with a right link
+	 WHERE (get_byte(r, s + 26) + 256 * get_byte(r, s + 27)) & (16 | 8) = 16
+	   AND get_byte(r, s) + get_byte(r, s + 1) + get_byte(r, s + 2) + get_byte(r, s + 3) < 4 * 255
+	 GROUP BY 1, 2
+$$;
+
 SELECT dd_note('built');
 SELECT directory_height, leaf_pages, internal_pages, deleted_pages
   FROM lion_index_stats('dd_k');
@@ -97,12 +115,17 @@ SELECT * FROM lion_index_verify('dd_k');
 SELECT * FROM dd_check();
 
 -- ---------- 2. a run in the middle goes ----------
+-- A parent whose children all empty keeps its last one, empty: that
+-- downlink is the parent's only one, and the parent's own downlink is the
+-- last on the page above it, so neither goes.  An internal page of one
+-- downlink is what a deletion may leave (DESIGN.md §21, "Height").
 DELETE FROM dd WHERE id BETWEEN 4000 AND 4999;
 DELETE FROM dd_ref WHERE id BETWEEN 4000 AND 4999;
 VACUUM dd;
 SELECT dd_note('middle');
 SELECT s.leaves < o.leaves AS leaves_went, s.deleted > o.deleted AS pages_deleted
   FROM dd_size s, dd_size o WHERE s.step = 'middle' AND o.step = 'oldest half';
+SELECT pages AS one_downlink FROM dd_downlinks() WHERE level > 0 AND downlinks = 1;
 SELECT * FROM lion_index_verify('dd_k');
 SELECT * FROM dd_check();
 
@@ -110,10 +133,9 @@ SELECT * FROM dd_check();
 -- A transaction id is spent first, so that the deleted pages' safexid is
 -- behind every snapshot when the inserts look for pages (nbtree's rule): the
 -- index does not grow, and fewer of its pages are free.  Keys 4999 down to
--- 4900 go first, to the first leaf of a page whose range now begins further
--- left than its first downlink's key: that leaf splits again and again, and
--- each separator goes right after that downlink, also once the page is full
--- and splits itself.
+-- 4900 go first, into the range the run left: they go under the page of one
+-- downlink, whose leaf splits again and again, and the page takes their
+-- separators after its minus-infinity downlink and splits itself.
 SELECT txid_current() IS NOT NULL AS spent;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(4999, 4900, -1) i;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(6001, 8000) i;
@@ -124,6 +146,7 @@ INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(4000, 4499) i;
 SELECT dd_note('reinserted');
 SELECT s.pages = m.pages AS no_growth, s.deleted < m.deleted AS reused
   FROM dd_size s, dd_size m WHERE s.step = 'reinserted' AND m.step = 'middle';
+SELECT min(downlinks) AS fewest_downlinks FROM dd_downlinks() WHERE level > 0;
 SELECT * FROM lion_index_verify('dd_k');
 SELECT * FROM dd_check();
 
@@ -154,4 +177,5 @@ SELECT * FROM lion_index_verify('dd_k');
 SELECT * FROM dd_check();
 
 DROP TABLE dd, dd_ref, dd_size;
-DROP FUNCTION dd_check(), dd_same(text), dd_key(int), dd_note(text);
+DROP FUNCTION dd_check(), dd_same(text), dd_key(int), dd_note(text),
+	dd_downlinks();

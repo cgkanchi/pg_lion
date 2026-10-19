@@ -50,8 +50,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
@@ -64,8 +63,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE cs_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM cs_on' INTO nrows;
@@ -88,8 +86,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		-- 18 prints each window's definition under a WindowAgg
 		CONTINUE WHEN ln ~ '^\s*Window: ';
@@ -97,8 +94,7 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 END $$;
 
 -- ---- expressions over the counts ----
