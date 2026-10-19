@@ -6257,8 +6257,8 @@ and a `leftlink` (24 → 32 bytes after MAXALIGN, which is why every item on eve
 version has to be bumped). Leaf pages hold LionEntryTuple items in key order, exactly as bucket
 pages did; internal pages hold downlink pivots, LionEntryTuple-shaped with LION_ENTRY_DOWNLINK and
 the child block in the header's last word, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
-is its high key (LION_ENTRY_HIGHKEY, key only), and the leftmost page of every level begins with a
-LION_ENTRY_MINUSINF downlink that compares below everything. Reserved NULL and EMPTY entries sort
+is its high key (LION_ENTRY_HIGHKEY, key only), and every internal page begins with a
+LION_ENTRY_MINUSINF downlink, with no key, that compares below everything ("Height" below). Reserved NULL and EMPTY entries sort
 first (NULL < EMPTY < value) via a kind prefix in the comparison, not in the stored key, so they
 live on the leftmost leaf and are reached by the ordinary descent. Multi-key classes: the key type
 is the STORAGE type (§17), which is what is compared.
@@ -6341,9 +6341,11 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 11 (`LION_VERSION_V11`): these entry tuples, with keys of up to 2047 bytes
-(§4). An index of an older version is refused with the REINDEX hint: its entries would be read at
-the wrong offsets, or its long jsonb keys looked for in the wrong form.
+The format is version 12 (`LION_VERSION_V12`): these entry tuples, with keys of up to 2047 bytes
+(§4), under internal pages that each begin with a minus-infinity downlink ("Height" below). An
+index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
+offsets, its long jsonb keys looked for in the wrong form, or (version 11) its directory may be of
+any height.
 
 ### The order
 
@@ -6706,6 +6708,63 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
 - **Ordered iteration**: leftmost leaf, then right links, SHARE lock one page at a time, pin held
   while an INLINE set from that page is being counted exactly as the bucket walk did.
 
+### Height
+
+**Every internal page begins with a key-less minus-infinity downlink** (format version 12), as
+nbtree's first data item on an internal page has no key. The key that downlink would carry is the
+page's lower bound, which the page's left sibling holds as its high key and the parent as the
+downlink to the page; a descent that reached the page has a key at or above it, so the first child
+is the one to take for anything below the second downlink, which is what `lion_page_downlink()`
+did anyway. A split of an internal page writes the right half's first downlink without its key -
+the key goes up as the separator, and is the left half's new high key - and so does the build.
+Finishing a split, and verify's confirmation of a page its walk did not reach, search for a key the
+page holds, which on an internal page is its second downlink's (`lion_dir_first_keyed()`).
+
+What it buys is room. A pivot of a LION_MAX_KEY_SIZE key costs P = 2068 bytes of a page's 8136, so
+an internal page holds a high key and three downlinks only when one of them has no key. With every
+downlink a full pivot a non-rightmost internal page holds two, a split of three makes halves of one
+and two, and pages of one downlink take over the directory: 25,000 hashed tsvector lexemes
+inserted in md5 order make 50,383 internal pages over 16,533 leaves and a directory 36 levels
+tall.
+
+**The rule, and the bound it gives.** An internal page split leaves at least
+`LION_ABS_MIN_DOWNLINKS` = 2 downlinks on each half (`lion_dir_choose_split()`), and such a cut
+always exists. With m the minus-infinity downlink's 20 bytes, m + 3P fits a page, so a page with
+two downlinks and a high key takes a third without splitting: a split has n >= 4 items, the new one
+included. The left half at cut k costs L(k) = s(0) + ... + s(k) (items up to k, and a high key
+copied from item k, which costs what item k does), rising in k; the right half R(k) = m + s(k+1) +
+... + s(n-1) + the old high key, falling. L(2) and R(n-2) are at most m + 2P; take the largest
+k <= n - 2 whose left half fits: if it is n - 2 both fit, and otherwise L(k+1) is over the page,
+and since the page held everything but the new item, R(k) < m + s(new) + s(k+1) <= m + 2P. The
+build gives every internal page two downlinks too, but may leave one on the rightmost page of a
+level; a root has two. Downlinks are never removed. So a directory of height h has at least
+2^(k-1) + 1 pages at level h - k, 2^h + h pages in all, and as a relation has fewer than 2^32 blocks,
+h <= 31 = `LION_MAX_DIR_HEIGHT`. The meta page check refuses a taller one as damage, and a root
+split that would pass it refuses itself before it writes anything - unreachable on a sound index,
+where it can only mean the pages it stands on are damaged. verify() checks the page rule: every
+internal page's first downlink is minus infinity, and each but the rightmost of its level has two.
+
+The leaves are not bounded the same way and need not be: a leaf holds a high key and two entries of
+maximum size, so random inserts leave some 1.5 entries a leaf, and the leaves only add to the
+count the height is bounded by.
+
+Measured (25,000 rows of `to_tsvector('simple', md5(g::text) || repeat('x', 2013))`, inserted one
+statement at a time into an empty index; and one jsonb document of 20,000 top-level keys of 2,000
+characters):
+
+| | height | leaves | internal | size | time |
+|---|---|---|---|---|---|
+| tsvector, 4,000 rows | 9 | 2,628 | 1,924 | 36 MB | 1.3 s |
+| tsvector, 25,000 rows | 11 | 16,533 | 12,090 | 224 MB | 8.2 s |
+| tsvector, 25,000 rows, REINDEX | 9 | 12,504 | 6,256 | 147 MB | 1.9 s |
+| jsonb document | 11 | 21,962 | 14,465 | 285 MB | 4.3 s |
+
+With every downlink keyed the same inserts made heights 24 and 36 (79 and 523 MB), and the REINDEX
+height 13 (195 MB).
+
+GIN holds the same documents in a few MB because it compresses its index tuples, which repeat a
+character 2,000 times here; that is a question of key size (§4), not of the directory's shape.
+
 ### Offsets are not names any more
 
 The hash directory only ever APPENDED to a bucket page, so `(page, offset)` named an entry for its
@@ -6794,6 +6853,8 @@ gets a single leaf that is also the root.
 `LION_NONLEAF_FILLFACTOR` = 70, nbtree's own separate non-leaf fill, and takes at least
 `LION_ABS_MIN_DOWNLINKS` = 2 downlinks whatever the fill target says (it aims for 3 and settles for
 2 when the keys are too large - three LION_MAX_KEY_SIZE pivots plus a high key do not fit a block).
+Each internal page's first downlink is written as minus infinity and counted at its own size, as an
+INSERT's split writes it ("Height").
 Without that floor, `fillfactor = 10` and 512-byte keys leave ONE downlink on an internal page,
 every level is then as large as the one below it, and `lion_build_finish_dir()` climbs for ever
 without reaching a root. It now also checks the invariant it relies on - each level strictly smaller
