@@ -4991,10 +4991,9 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	{
 		/*
 		 * The walk reads the lion index without index_beginscan(), as the
-		 * set does: a relation predicate lock first (§30.5), and the heap
-		 * fetch state of an index scan for what it meets.
+		 * set does, and needs the heap fetch state of an index scan for what
+		 * it meets; its leaves are predicate-locked as it reads them (§9).
 		 */
-		lion_reader_lock(st->ordidx, estate->es_snapshot);
 #if PG_VERSION_NUM >= 200000
 #elif PG_VERSION_NUM >= 190000
 		st->fetch = table_index_fetch_begin(node->ss.ss_currentRelation,
@@ -5005,9 +5004,8 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	}
 
 	/*
-	 * Every lion index, and a relation predicate lock on each before any
-	 * lookup (DESIGN.md §30.5; the AM has no ampredlocks, and the node reads
-	 * it without index_beginscan()).
+	 * Every lion index; what the node reads of each is predicate-locked as
+	 * it is read (DESIGN.md §9).
 	 */
 	for (i = 0; i < st->nleaves; i++)
 	{
@@ -5017,7 +5015,6 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		ExecIndexBuildScanKeys(&node->ss.ps, leaf->index, leaf->quals, false,
 							   &leaf->keys, &leaf->nkeys,
 							   &leaf->rtkeys, &leaf->nrtkeys, NULL, NULL);
-		lion_reader_lock(leaf->index, estate->es_snapshot);
 	}
 
 	/* which Params a rescan has to rebuild the set for */

@@ -841,6 +841,20 @@ nearest-neighbour query is then planned as a sort, under every `pg_lion.vector_p
 scan or SQL count that reaches one anyway fails with an error rather than return a different answer
 than the snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
 
+Under SERIALIZABLE a lion index takes page-level predicate locks, as GIN does (DESIGN.md §9,
+"SERIALIZABLE"): a read of a key locks the root of its posting tree when its rows have one, and
+otherwise the directory leaf that holds the key, or would hold it; a range, a `GROUP BY` or a
+walk of a column locks every leaf it reads and those roots of the keys on it. An
+insert checks the page that stands for its key. So SERIALIZABLE transactions that read some keys
+and insert others do not fail each other: only keys without a posting tree of their own (a set
+still under `inline_limit`) that share a directory leaf conflict, as keys on one B-tree page do. A
+lookup that has to search beyond one leaf for an absent key (its hash collides with keys on the
+next) locks the whole index. The aggregates over keys (DESIGN.md §37) read every row, so they lock
+the table, as a sequential scan does. Rows the heap visits are locked as for any index scan; a read
+of more rows than `max_pred_locks_per_relation` allows locks the whole table instead, as it would
+through a B-tree. A `lionvec` index locks the whole index: any insert into it conflicts with every
+SERIALIZABLE read of it.
+
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
 It has no search operators, no bitmap or index-only scans and no INCLUDE columns, scans in
 parallel only without a filter (above), and indexes a single column of pgvector's `vector` or

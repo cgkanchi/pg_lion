@@ -1873,6 +1873,10 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	rblk = BufferGetBlockNumber(rbuf);
 	lion_entry_set_head(sep, rblk);
 
+	/* SERIALIZABLE: the leaf's predicate locks cover both halves (§9) */
+	if (isleaf)
+		lion_predlock_copy(index, pblk, rblk);
+
 	if (isroot)
 		newroot = lion_alloc_page(index, heaprel, true);
 

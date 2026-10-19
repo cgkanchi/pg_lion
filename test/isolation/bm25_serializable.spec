@@ -1,8 +1,8 @@
 # Two SERIALIZABLE transactions each rank an absent term, then each insert a
-# row with it.  Ranking reads the index under the relation-level predicate
-# lock index_beginscan() takes for an AM without ampredlocks, so the second
-# commit must fail with a serialization failure, as it does for an ordinary
-# index scan - both through lion_bm25() and through the LionBm25 scan.
+# row with it.  Ranking predicate-locks the leaf where the term's entry would
+# be (DESIGN.md §9), which the insert checks, so the second commit must fail
+# with a serialization failure, as it does for an ordinary index scan - both
+# through lion_bm25() and through the LionBm25 scan.
 
 setup
 {
