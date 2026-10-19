@@ -30,10 +30,11 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 /*
  * lbs_check() runs q with one kind of scan - 'bitmap', 'plain' (an Index
- * Scan) or 'count' (the LionCount pushdown, every other scan disabled) - and
- * again as a sequential scan with the pushdown off, and compares the two as
- * multisets.  It says whether the scan asked for was really used, and the
- * answer: its rows when there are four or fewer, else how many.
+ * Scan) or 'count' (the LionCount pushdown, every other scan of the table
+ * disabled and the pushdown taken at any price) - and again as a sequential
+ * scan with the pushdown off, and compares the two as multisets.  It says
+ * whether the scan asked for was really used, and the answer: its rows when
+ * there are four or fewer, else how many.
  */
 CREATE FUNCTION lbs_check(q text, how text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -47,8 +48,11 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', (how = 'bitmap')::text, true);
-	PERFORM set_config('enable_indexscan', (how = 'plain')::text, true);
-	PERFORM set_config('enable_indexonlyscan', (how = 'plain')::text, true);
+	PERFORM set_config('enable_indexscan', (how <> 'bitmap')::text, true);
+	PERFORM set_config('enable_indexonlyscan', (how <> 'bitmap')::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (how = 'plain')::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin',
+					   CASE how WHEN 'count' THEN '1000' ELSE '1' END, true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', (how = 'count')::text, true);
 	want := CASE how WHEN 'bitmap' THEN 'Bitmap Index Scan'
 					 WHEN 'plain' THEN 'Index (Only )?Scan using'
@@ -69,6 +73,8 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*), string_agg(r, '' '' ORDER BY r) FROM lbs_on'

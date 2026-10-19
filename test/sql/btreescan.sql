@@ -567,7 +567,9 @@ COMMIT;
 --     not offered, with core's scans enabled or disabled (the plan's text
 --     varies between majors, so only the node's presence is printed); a
 --     partial lion index walked whole, with no clauses of its own, adds its
---     predicate's selectivity and is offered.
+--     predicate's selectivity and is offered.  Before 18 the OR is no clause
+--     of the btree's, so the lion index's restricts the walk and the pair is
+--     offered, and forced where lion's paths are.
 CREATE TABLE bso (id int, k int, c int, flag bool) WITH (autovacuum_enabled = off);
 INSERT INTO bso SELECT i, i % 1000, i % 10, i % 3 = 0 FROM generate_series(1, 30000) i;
 CREATE INDEX bso_k ON bso (k) INCLUDE (id, c);
@@ -579,13 +581,19 @@ SELECT lion_bs_node('SELECT id, k FROM bso WHERE k IN (1, 7)');
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k BETWEEN 10 AND 20');
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
 SET pg_lion.pushdown_margin = 1000;
-SELECT lion_bs_node('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
+SELECT lion_bs_node('SELECT id, k FROM bso WHERE k = 1 OR k = 7') =
+	   CASE WHEN current_setting('server_version_num')::int >= 180000
+			THEN 'no Lion node' ELSE 'LionBtreeScan' END
+	   AS or_as_the_major_matches_it;
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k IN (1, 7)');
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500');
 EXPLAIN (COSTS OFF) SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
 RESET pg_lion.pushdown_margin;
-SELECT lion_bs('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
+SELECT lion_bs('SELECT id, k FROM bso WHERE k = 1 OR k = 7') =
+	   CASE WHEN current_setting('server_version_num')::int >= 180000
+			THEN 'no node, 60 rows' ELSE 'LionBtreeScan index only, 60 rows' END
+	   AS or_as_the_major_matches_it;
 SELECT lion_bs('SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500');
 DROP TABLE bso;
 
