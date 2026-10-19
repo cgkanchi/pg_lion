@@ -148,8 +148,9 @@ DECLARE r int[];
 BEGIN
 	PERFORM set_config('enable_seqscan', CASE WHEN mode = 'seq' THEN 'on' ELSE 'off' END, true);
 	PERFORM set_config('enable_bitmapscan', CASE WHEN mode IN ('bitmap','count') THEN 'on' ELSE 'off' END, true);
-	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count') THEN 'on' ELSE 'off' END, true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count','literal') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexonlyscan', CASE WHEN mode IN ('count','literal') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (mode <> 'literal')::text, true);
 	IF mode = 'count' THEN
 		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE tsv @@ $1', tab) INTO r USING q;
 	ELSIF mode = 'literal' THEN
@@ -343,12 +344,12 @@ CREATE FUNCTION tl_bm_scan(qt text, k int) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE q tsquery := tl_q(qt); sql text; l text; scanned bool := false; a int[]; b int[];
 BEGIN
 	sql := format('SELECT id FROM tl_lp WHERE tsv @@ %L ORDER BY lion_bm25_score(tsv, %L, ''tl_lp_i'') DESC, ctid LIMIT %s', q, q, k);
-	SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
+	SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
 	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || sql LOOP
 		IF l LIKE '%LionBm25%' THEN scanned := true; END IF;
 	END LOOP;
 	EXECUTE format('SELECT array_agg(id) FROM (%s) x', sql) INTO a;
-	RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+	RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
 	SET LOCAL pg_lion.enable_bm25_scan = off;
 	EXECUTE format('SELECT array_agg(id) FROM (%s) x', sql) INTO b;
 	RETURN CASE WHEN NOT scanned THEN 'not scanned' WHEN a IS DISTINCT FROM b THEN 'differ' ELSE 'same' END;

@@ -52,7 +52,7 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)', ''),
 	('LionCount, a residual clause beside a FILTER',
 	 'SELECT count(*) FILTER (WHERE j = 2), count(*) FROM nc WHERE k = 3 AND o % 7 = 1', 'int4mod(int4,int4)',
-	 'enable_seqscan enable_bitmapscan enable_indexscan'),
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
 	('LionCount, an expression column filtered',
 	 'SELECT count(*) FROM nc WHERE nc_bucket(j) = 1', 'nc_bucket(int4)', ''),
 	('LionCount, an expression column grouped',
@@ -68,7 +68,7 @@ INSERT INTO nc_nodes VALUES
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
 	('LionJoinAgg, grouping sets',
 	 'SELECT k, j, sum(j), count(*) FROM nc GROUP BY ROLLUP (k, j)', 'sum(int4)',
-	 'enable_seqscan enable_bitmapscan enable_indexscan enable_indexonlyscan'),
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
 	('LionSemiJoin',
 	 'SELECT d.pk FROM ncd d WHERE EXISTS (SELECT 1 FROM nc WHERE nc.k = d.pk AND nc.j = 3)',
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
@@ -77,15 +77,15 @@ INSERT INTO nc_nodes VALUES
 	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
 	('LionOrdered',
 	 'SELECT id FROM nc WHERE k = 3 ORDER BY o LIMIT 5', 'int4eq(int4,int4)',
-	 'enable_sort enable_seqscan enable_bitmapscan enable_indexscan'),
+	 'enable_sort enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
 	('LionBtreeScan',
 	 'SELECT id, o FROM nc WHERE o BETWEEN 100 AND 400 AND k = 3', 'int4eq(int4,int4)',
-	 'enable_seqscan enable_bitmapscan enable_indexscan'),
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
 	('LionBm25',
 	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'') FROM nc WHERE d @@ ''w1 & w3''
 	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'') DESC LIMIT 5',
 	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8)',
-	 'enable_seqscan enable_bitmapscan enable_indexscan');
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan');
 
 -- lion's paths on and the core settings in force off, or the other way round
 CREATE FUNCTION nc_paths(force text, lion boolean) RETURNS void
@@ -101,6 +101,10 @@ BEGIN
 	FOREACH g IN ARRAY string_to_array(force, ' ') LOOP
 		PERFORM set_config(g, CASE WHEN lion THEN 'off' ELSE 'on' END, true);
 	END LOOP;
+	-- core's index scans stay on, as they disable lion's scans too: lion's
+	-- paths are marked down against them instead
+	PERFORM set_config('pg_lion.pushdown_margin',
+					   CASE WHEN lion AND force LIKE '%enable_plain_scan%' THEN '1000' ELSE '1' END, true);
 END $$;
 
 CREATE FUNCTION nc_rows(q text) RETURNS text

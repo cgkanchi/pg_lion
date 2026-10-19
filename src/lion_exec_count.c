@@ -16,6 +16,7 @@
 #include "lion_customscan.h"
 
 #include "access/visibilitymap.h"
+#include "pgstat.h"
 #include "utils/numeric.h"
 
 static int64 lion_walk_count(LionCountScanState *st, LionCountSource *sources,
@@ -1089,14 +1090,20 @@ lion_count_runs(LionCountScanState *st, bool sum)
 			lion_open_relation(st, p);
 		for (r = 0; r < st->nrun; r++)
 		{
+			int64		n;
+
 			lion_select_run(st, r);
 			lion_locate_where(st);
 			if (!sum ||
 				(r > 0 && !lion_plan_flag(st, LION_FLAG_RANGE) &&
 				 lion_run_has_plain_source(st)))
-				st->runcount[r] += lion_count_relation(st);
+				n = lion_count_relation(st);
 			else
-				st->runcount[r] += lion_sumall_relation(st);
+				n = lion_sumall_relation(st);
+			st->runcount[r] += n;
+			/* a partition's rows are its indexes' (lion_count_report_reads()) */
+			if (p >= 0)
+				st->statrows += n;
 			lion_release_where(st);
 		}
 		lion_select_run(st, 0);
@@ -3280,6 +3287,7 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 	MemoryContext oldcxt;
 	bool		defer = false;
 	bool		ok = true;
+	int64		nrows = 0;
 	int			i;
 
 	for (i = 0; batch != NULL && i < wg->nagg; i++)
@@ -3309,6 +3317,7 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 			}
 			isnull = LionEntryIsNullKey(entry);
 			key = isnull ? (Datum) 0 : lion_entry_key(es.state, entry);
+			nrows += (int64) lion_entry_ntids(entry);
 			if (!defer)
 				lion_wagg_add(st, c, key, isnull, (int64) lion_entry_ntids(entry));
 			else if (lion_entry_ntids(entry) > 0 &&
@@ -3340,11 +3349,16 @@ lion_wagg_walk(LionCountScanState *st, int c, LionWBatch *batch)
 			rows = lion_node_count(st, 1, &src, false);
 			lion_posting_set_release(&ps);
 			lion_wagg_add(st, c, key, isnull, rows);
+			nrows += rows;
 		}
 		wg->entries++;
 		MemoryContextSwitchTo(oldcxt);
 	}
 	lion_entry_scan_end(&es);
+
+	/* a walk of the index, and the rows its entries hold (pg_stat_user_indexes) */
+	pgstat_count_index_scan(wc->idx);
+	pgstat_count_index_tuples(wc->idx, nrows);
 	return ok;
 }
 

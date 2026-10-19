@@ -49,12 +49,12 @@ DECLARE
 BEGIN
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	SET LOCAL enable_indexscan = off;
+	SET LOCAL pg_lion.enable_plain_scan = off;
 	IF NOT bs_scanned(sql) THEN RETURN 'not scanned'; END IF;
 	EXECUTE 'CREATE TEMP TABLE bs_got AS ' || sql;
 	RESET enable_seqscan;
 	RESET enable_bitmapscan;
-	RESET enable_indexscan;
+	RESET pg_lion.enable_plain_scan;
 	SET LOCAL pg_lion.enable_bm25_scan = off;
 	EXECUTE 'CREATE TEMP TABLE bs_ref AS ' || bs_sql(q, w, k, extra, k1, b, ', ctid');
 	RESET pg_lion.enable_bm25_scan;

@@ -406,13 +406,13 @@ SELECT lion_insum(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s
 -- hash aggregate 15.6 and 20, but core prices hashing a row at a fraction of
 -- what it costs and the model chooses the aggregate - DESIGN.md §10.)
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_incmp(format('SELECT k, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1 GROUP BY k',
 						lion_inlist(0, 999, 100000)));
 SELECT lion_incmp(format('SELECT lo, count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) GROUP BY lo',
 						lion_inlist(0, 999, 100000)));
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ANDed with another clause: the merge, not the sum
 SELECT lion_incmp(format('SELECT count(*) FROM lion_inbig WHERE k = ANY (''%s''::int[]) AND lo = 1',

@@ -33,7 +33,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
@@ -50,6 +50,7 @@ BEGIN
 	EXECUTE format('CREATE TEMP TABLE lion_a_seq AS %s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_a_idx' INTO nrows;
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_a_idx EXCEPT ALL SELECT * FROM lion_a_seq) a)'
@@ -70,12 +71,12 @@ DECLARE
 	ln text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 END $$;
 
 -- ---- the table ---------------------------------------------------------
