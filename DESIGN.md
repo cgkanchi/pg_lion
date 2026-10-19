@@ -1948,6 +1948,10 @@ Planner integration
     indexcollations[i] - of the KEY COLUMN that indexes the clause's column (§24) - equals that
     collation, because the index hashed and compared keys under its own collation and the count
     never rechecks the predicate. Checked per partition.
+  - **Partial indexes** (2026-10-19, §45): the lookups read whole indexes only, except in an
+    attempt made for a partial index whose predicate the restrictions imply, which they then try
+    first; the restrictions the predicate implies are left out, and the count is held to the
+    predicate's rows (§45.1) or the attempt declined.
   - GROUP BY is empty, or exactly one plain Var of the rel with a lion index - or two of them,
     which §20 answers as a nested loop over the two indexes' entries, applying every rule of this
     section per column. Since §24 the two may be two KEY COLUMNS of ONE multicolumn index, which is
@@ -4487,6 +4491,11 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
   partition fallback, because the node produces one result set.
 - No live partitions (everything pruned) adds no path at all: the planner's own dummy-rel handling
   gives the right answer.
+- Partial indexes (2026-10-19, §45): each leaf has its own candidates, proved with its partition
+  constraint beside the restrictions, and reads its own in an attempt - a partial index made on the
+  parent is one per leaf. A restriction is left out only where every leaf's index implies it, and
+  each leaf's count is held to its own index's rows; a leaf with no candidate reads whole indexes
+  and leaves nothing out. EXPLAIN lists the leaves' partial indexes (`Partial Indexes`).
 - One CustomPath per query - added to the grouped rel directly, or, for a GROUP BY, as the subpath
   of the Finalize Agg that is added instead (below). custom_private gains one member: LION_PRIV_PARTS, a
   list of one OidList per partition (heap Oid, driving index Oid or InvalidOid, then one index Oid
@@ -5838,9 +5847,10 @@ estimates.  An index whose key columns are all multi-key files a row under any n
 the EMPTY entry included (§17), and nothing short of their union counts its rows, so it reports
 the heap's row count instead, exact when the heap's is - `ginvacuumcleanup()`'s answer, and wrong
 for a partial index the same way. `tuples_removed` stays a count of postings, as GIN's is. ambuild
-still reports the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or
-the first VACUUM that removes something, replaces them (not done: a row count per build
-participant).
+reported the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or the
+first VACUUM that removes something, replaced them; since 2026-10-19 it reports the rows it added,
+each participant's summed (`lion_spool_nrows()`), so that a partial index is sized by its rows
+from the start (§45.3).
 
 **The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
 container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of
@@ -9253,7 +9263,9 @@ shared buffers, and only in hot standby.
 ## 26. `count(DISTINCT k)` in the pushdown (v1, implemented)
 
 Formerly the §23 backlog item of the same name. Two shapes, with `k` - and `g` - scalar key columns
-of lion indexes (any column of a multicolumn one, §24):
+of lion indexes (any column of a multicolumn one, §24; since 2026-10-19 of a partial index too, in
+an attempt for it, §45: the walk of `k`'s entries holds the count to its rows - the uniqueness
+proof below still asks for a whole btree index):
 
 1. `SELECT count(DISTINCT k) FROM t [WHERE <pushdown quals>]`
 2. `SELECT g, count(DISTINCT k) FROM t [WHERE <pushdown quals>] GROUP BY g`
@@ -9578,7 +9590,11 @@ semi- or anti-joined to it ("A dimension that is a join"); on 2026-09-29, a run 
 filters and collects them part way through once probing has cost what collecting would ("Probed,
 then collected"), the semi and anti join offered as a join path of its own, whose rows are the
 outer side's ("The semi and anti join as a join path"), and a GROUP BY of a fact column, each key
-counted once per group of it ("Grouped by a fact column"). The shape is the star-schema aggregate
+counted once per group of it ("Grouped by a fact column"); on 2026-10-19, a partial lion index on
+the fact table whose predicate the fact's restrictions imply (§45): read for the FK lookups, the
+fact group or the fact filters, with the restrictions it implies left out, when the key's lookup,
+the fact group's entries or a fact filter read from it hold every key's count to its rows
+(`lion_fkjoin_setup()`). The shape is the star-schema aggregate
 
     SELECT d.attr, count(*)
     FROM fact f JOIN dim d ON f.fk = d.pk
@@ -18538,7 +18554,9 @@ planner takes the column with the fewest entries (`lion_count_all_driver()`, by 
 column whose own `IS NOT NULL` is a clause when it is no dearer, since its NULL entry is then
 skipped and its clause dropped (§14). A scalar, whole, non-expression index's column only
 (`lion_find_roaring_index()`): a multi-key column's entries overlap and miss the rows with no keys,
-a partial index holds only its predicate's rows. A partitioned table's candidates are its first
+a partial index holds only its predicate's rows - all the count needs once the query implies the
+predicate, so in an attempt for a partial index (§45) its columns are preferred, and their walk
+holds the count to its rows. A partitioned table's candidates are its first
 live leaf's, which `lion_collect_targets()` then asks of every partition.
 
 The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS` (shape 19): no
@@ -20260,7 +20278,8 @@ expression such an index holds as a column of its own, an **expression column**,
 
 ### Matching (`lion_vcol_collect()`, `lion_vcol_subst()`, lion_plan_match.c)
 
-- **Which expressions**: those of the table's valid, non-partial lion indexes, under a scalar
+- **Which expressions**: those of the table's valid, non-partial lion indexes - and, in an attempt
+  for a partial index (§45), that index's - under a scalar
   opclass, deduplicated, at most `LION_MAX_VCOLS` (64), collected when the pushdown is tried on one
   table that is not partitioned. A multi-key opclass over an expression (`to_tsvector(...)`) is not
   one: its entries are keys, not row values. Nor is a binary-coercible cast of a column, `(v::text)`
@@ -23990,3 +24009,244 @@ the same TOAST pages nothing either (§44.7, "Exact path pricing").
   chunk page, after the scan - 22 of the exact path's 1,631 pages from the disk, whose chunk pages
   it has just read. The scan has every one of the values in hand; handing them to the projection
   would need the planner's help (a target list naming the scan's distance), not the index's.
+
+## 45. Partial indexes in the count pushdown (2026-10-19)
+
+Every lookup the count planner made skipped partial lion indexes: `lion_find_roaring_index()` and
+`lion_match_index()` took the first valid, NON-PARTIAL index on a column. A workload whose queries
+all carry the same few dense filters - three boolean or low-cardinality columns that keep most of
+the table, beside the filters and the GROUP BY that change from query to query - gained nothing
+from a partial index on those filters, `CREATE INDEX ... USING lion (g, c1, c2) WHERE f1 AND f2 =
+'a' AND f3 = 'n'`, whose sets hold only the rows the defaults keep: the count read the whole index
+and intersected the defaults' sets, each nearly the table, into every count. Now a count whose
+restrictions imply a partial lion index's predicate may read that index and leave out the
+restrictions the predicate implies, as core leaves them out of a partial index scan's
+`indrestrictinfo` - wherever every row the count can reach is one the predicate holds for.
+lion_plan_partial.c holds the rule; the planner's lookups, the cost and EXPLAIN take the index as
+they take any.
+
+### 45.1 Held to the predicate's rows
+
+Let Ω be the rows a partial index P holds: the table's rows its predicate is TRUE for. A set read
+from P for a clause c holds the rows of Ω that c selects - it agrees with c inside Ω and is empty
+outside it - and a restriction left out because the predicate implies it is TRUE inside Ω. Inside
+Ω the count therefore computes the query exactly. It goes wrong only by counting a row OUTSIDE Ω,
+where nothing it read from P says anything, and that happens wherever the rows a count adds up do
+not come from one of P's sets:
+
+- the restrictions are left out and the rest is read from a whole index: `WHERE f1 AND f2 = 'a'
+  AND f3 = 'n' AND y = 2`, P on the three without `y`: `y = 2` from the whole index counts every
+  row with y = 2;
+- a set of P's is subtracted, not intersected: `a = 1 AND x <> 3` with P `WHERE x IS NOT NULL`
+  reading `x`. `<>` is the rows of the other sources less `x = 3` and less the NULL entry (§35);
+  P has no NULL entry, so the rows with a = 1 and x NULL - for which `x <> 3` is NULL - are
+  counted;
+- the count of every row (§14, §35) or a complement (§35, "Complements in an OR") taken from a
+  whole index;
+- a multi-key query known only at run time (§17), which may turn out to narrow nothing, and a
+  count with nothing that narrows is the heap scan of `lion_count_scan_filtered()`: every row.
+
+So the rule, checked per relation counted - the table, or each leaf partition with its own
+partial index - and per RUN of the count (the WHERE's, run 0, and each filtered count's, §10
+"Filtered counts"): a run that reads P, or any run at all when restrictions were left out, must be
+HELD to Ω by one of
+
+- **P's entries driving it**: a driving column read from P - a GROUP BY column's walk (§10, §20),
+  the decoded walk's columns (§34: a row outside Ω has no value in P's column and is in no
+  combination), the column a `count(DISTINCT)` walks (§26), the column a sum over every row walks
+  (§14, §35), the FK-side join's fact group (§27). Every count of the run is ANDed with one of P's
+  entries, which hold Ω's rows only;
+- **a positive clause of the run read from P**, outside any OR: an equality (the FK-side join's
+  lookup of a key among them, §27), an IN list, `IS NULL`
+  (P's NULL entry holds Ω's NULL rows), a range taken as a source (§32) - each a set ANDed into
+  every count of the run;
+- **an OR** with no complement leaf, each of whose arms the partition keeps has such a leaf.
+
+Never a multi-key clause (above), a negated one - `<>`, `IS NOT NULL`, `IS DISTINCT FROM`, a
+`NOT` of a multi-key query - which subtracts, or an OR with a complement arm, which counts rows
+outside a set. A clause the partition's bounds leave out (§16) reads no index there and holds
+nothing. And a sum over every row drives a filtered count's run only when the run has no source
+of its own: one that has (an equality, a list, `IS NULL`, an OR of no range) is counted as an
+intersection, not by the walk (`lion_count_runs()`, `lion_run_has_plain_source()`), and needs a
+hold of its own.
+
+`lion_partial_anchored()` checks it once the targets are collected (`lion_count_path_targets()`,
+`lion_fkjoin_setup()`); false declines the attempt, and the plan made with whole indexes stands.
+An attempt that reads no partial index and leaves nothing out is declined too: it is that plan
+again. The rule is a planning rule only: the executor counts what the plan names, as it always
+did.
+
+### 45.2 Planning: one attempt per candidate
+
+- **Candidates** (`lion_partial_find()`): for each relation counted, its valid partial lion
+  indexes (not hypothetical: they have no entries) whose predicate its restrictions imply -
+  `predicate_implied_by(indpred, baserestrictinfo, false)`, core's own proof
+  (`check_index_predicates()`), with, for a leaf partition, its partition constraint, which every
+  row of it satisfies. Join clauses prove nothing about the rows a count reads. The smallest first,
+  by the index's rows.
+- **The attempts** (`lion_try_count_path()`): the count path is planned with whole indexes, as
+  before, and then once for each rank up to `LION_PARTIAL_TRIES` (3): each relation reads its
+  rank'th candidate, or whole indexes alone where it has none at that rank. `add_path()` keeps the
+  cheapest; on an exact tie the whole-index plan, made first, stays.
+- **The scope** (`lion_partial_enter()`, `lion_partial_leave()`, left in a `PG_FINALLY` as the
+  expression columns' scope is, §41): `lion_find_roaring_index()` and `lion_match_index()` try the
+  relation's scope index first and then whole indexes; no other partial index is read.
+  `lion_vcol_collect()` takes the scope index's expressions too, so a partial expression index
+  answers its expression (`exprindex.sql`).
+- **Leaving restrictions out** (`lion_partial_drops()`, in `lion_count_path_where()` before a
+  clause is numbered, so nothing downstream sees it): a restriction is left out when every relation
+  counted has a scope index whose predicate implies it (mapped onto each partition's columns), it
+  holds no mutable function and no subquery (core keeps those in `indrestrictinfo` too), and it
+  names no column the query prints outside its aggregates - the target list and HAVING - other
+  than a GROUP BY column: a column a restriction pins is printed from the key the index stored
+  (§10), which needs the restriction. A restriction left out is not a source, is not priced, and
+  EXPLAIN lists it. Only the WHERE's restrictions: a `FILTER` condition is never left out.
+- **count(col)** (`lion_count_path_pred_nonnull()`): a column the predicate proves non-NULL
+  (`col IS NOT NULL` implied) counts every row, as a NOT NULL column does (§10): the query implies
+  the predicate, so every row the count reaches has the column.
+- **The sum over every row** (§14, §35): `lion_count_all_driver()` prefers a column of the scope
+  index, so that the walk holds the count; among those, as before, the fewest entries.
+
+### 45.3 What the change leaves as it was (the audit)
+
+- **Every "every row"**: the count of every row and the sum over all of a column's entries (§14,
+  §35) hold the count only when P drives them; the NULL entry and `IS NULL` read from P hold it
+  (Ω's NULL rows); negated sources and complements (§35), `<>` among them, never hold it, whatever
+  index they read; a `count(DISTINCT)`'s existence tests (§26) are driven by its column's entries,
+  and held when that column is P's; residual clauses (§10) are tested on the heap rows the other
+  sources select, which are Ω's once the run is held. Each case is in `countpartial.sql`.
+- **Uniqueness proofs** stay non-partial: `count(DISTINCT pk)` as `count(*)` (§26) and the FK-side
+  join's dimension key (§27) still need a whole unique btree index.
+- **The visibility interlock** (§9): a partial lion index's entries are written and removed by the
+  same paths as a whole one's, and a TID from it is judged visible the same way. A HOT update
+  cannot move a row into or out of Ω behind the index's back: lion is not a summarizing access
+  method, so the columns of its predicate block HOT (`RelationGetIndexAttrBitmap()`), and a
+  visible version reached through a P's TID satisfies the predicate.
+- **Top k** (§36): an entry's TID count still bounds its group's count: the rows counted are in
+  the entry.
+- **reltuples** (§18): the one fix. ambuild reported the postings it wrote - one a key column, one
+  an element - as `index_tuples`, so a partial index's `reltuples`, which the planner sizes it by
+  (`estimate_rel_size()`), was a multiple of its rows until the first VACUUM or ANALYZE. The build
+  now reports the rows it added (`lion_spool_nrows()`), serial and parallel, as VACUUM does.
+- **Estimates**: n_distinct from the directory (§33), the selectivity hooks and the facet counts
+  (§7) still read whole indexes only: a partial index's keys are not the column's.
+- **EXECUTE** (§10, "Privileges"): `lion_replaced_functions()` walks every restriction, left out or
+  not, so a function the query calls is still checked.
+- **Generic plans**: a Param proves no predicate that needs a constant, so a generic plan of `st =
+  $1` reads the whole index; a strict clause on a Param does prove `col IS NOT NULL`, for every
+  value of the Param, and `x > $1` may read a partial index `WHERE x IS NOT NULL`.
+
+### 45.4 Cost
+
+The model prices a partial index by its own sizes (lion_plan_cost.c):
+
+- `lion_index_rows()`: the rows the index holds - the table's for a whole index; for a partial one
+  `idx->tuples` (its `reltuples`, rows since 45.3), or the table's rows times the predicate's
+  selectivity where it has none yet, as core prices a partial index scan;
+- a clause's set (`lion_cost_set_clause()`): its members are the index's rows times the clause's
+  share of them, `sel(pred AND clause) / sel(pred)` (`lion_index_clause_share()`), and its
+  containers and pages follow from those;
+- a group's rows in the walk, the pairs of two GROUP BY columns and the decoded walk's columns:
+  the index's rows over the column's entries.
+
+What the model gains is the work the plan no longer does: the restrictions left out are not
+sources, and the sets left are smaller. There is no bias toward the partial index beyond that.
+
+### 45.5 The plan and EXPLAIN
+
+custom_private member 22, `LION_PRIV_PARTIAL` (shape 27): NIL, or a list of two - the OIDs of the
+partial indexes the count reads, and the restrictions left out, deparsed, as String nodes. TLKINDS
+moves to 23, the members are 24, the magic is 0x5242491b; the codec checks the list's shape and
+its OIDs. Only EXPLAIN reads it: the targets name their indexes, partial or not, as before.
+
+EXPLAIN names a partial index among the `Lion Indexes` as it names any (`pc_p1.a (a = 3)`), prints
+the restrictions left out under `Implied by Index Predicate`, and for a partitioned table, whose
+`Lion Indexes` line names no index, the leaves' partial indexes under `Partial Indexes`:
+
+```
+ Custom Scan (LionCount)
+   Lion Indexes: pc_p1.g (g), pc_p1.b (b = 3)
+   Implied by Index Predicate: act, (st = 'on'::text), (kind = 'k0'::text)
+   Group Key: g
+```
+
+`pg_lion.enable_count_partial` (on) turns the attempts off: the count reads whole indexes only.
+
+### 45.6 Measured
+
+4,000,000 rows of a synthetic table (`f1` boolean, true in 93% of rows; `f2`, `'a'` in 90%; `f3`,
+`'n'` in 92%; together 77%), `g` of 50 values, `c1` of 10, `c2` of 1,000, `c3` of 5; a whole index
+`(f1, f2, f3, g, c1, c2, c3)` and a partial one `(g, c1, c2, c3) WHERE f1 AND f2 = 'a' AND f3 = 'n'`
+(51 and 36 MB), `VACUUM (FREEZE, ANALYZE)`, no parallel workers, the release build, warm cache;
+the best of seven `EXPLAIN ANALYZE` runs, every query with the three defaults in its WHERE:
+
+| query (beside the defaults)                     | whole index: containers, ms | partial index: containers, ms | chosen  |
+|-------------------------------------------------|-----------------------------|-------------------------------|---------|
+| `count(*) ... AND c1 = 3`                       | 1,840, 0.47                 | 460, 0.20                     | partial |
+| `count(*) ... AND c1 = 3 AND c3 = 2`            | 2,300, 0.57                 | 920, 0.49                     | partial |
+| `count(*) ... AND c2 IN (5, 50, 500)`           | 2,760, 0.48                 | 1,380, 0.07                   | partial |
+| `count(*) ... AND c2 < 100`                     | 183,922, 27.9               | 45,935, 2.4                   | partial |
+| `g, count(*) ... GROUP BY g`                    | 25,300, 5.8                 | 23,000, 3.0                   | partial |
+| `g, count(*) ... AND c1 = 3 GROUP BY g`         | 25,760, 7.0                 | 24,380, 5.7                   | partial |
+| `c1, c3, count(*) ... GROUP BY c1, c3`          | 8,740, 28.9                 | 6,900, 22.3                   | partial |
+| `count(DISTINCT c2) ... AND c1 = 3`             | 9,272, 3.0                  | 4,732, 1.7                    | partial |
+| three counts, two `FILTER`s                     | 5,060, 1.3                  | 3,220, 0.85                   | partial |
+| `count(*)` (the defaults alone)                 | 1,380, 0.33                 | 2,300, 0.54                   | partial |
+| `count(*) ... AND c1 <> 3`                      | 1,840, 0.44                 | 4,600, 2.4                    | partial |
+
+With a third of the heap's pages not all-visible (10,000 rows updated), where both plans recheck
+the same rows in the heap: `c1 = 3` 7.4 against 7.1 ms, the `IN` list 1.7 against 1.5, `GROUP BY
+g` 110 against 89, the range 79 against 43.
+
+With two parallel workers allowed, the whole index's GROUP BY runs in parallel (§10, "A GROUP BY
+in parallel") and the partial index's does not (45.8): `GROUP BY g` 10.7 ms against 3.1 serially,
+with `c1 = 3` 11.3 against 9.9, with `c1 = 3 AND c3 = 2` 11.2 against 8.5, and the partial plan is
+still chosen.
+
+The last two rows are the model's, not the index's: the count of every row of P is a sum over the
+fewest-entry column's entries (`c3`'s five, 2,300 containers), which the model prices at a third of
+intersecting the three dense sets (1,380) though it took 1.6 times as long; and the subtraction of
+a `<>` from each of those entries is not priced at all - nor is it over a whole index, where
+`count(*) WHERE c1 <> 3` costs what `count(*)` costs (§35) - so the partial plan, which subtracts
+per entry, is taken where the whole index's one merge is five times faster. Both are listed under
+45.8.
+
+### 45.7 Tests
+
+`test/sql/countpartial.sql` compares every query, as a multiset both ways round, with a sequential
+scan with the pushdown off, on random data with deleted rows and rows moved into and out of the
+predicates on pages the visibility map no longer vouches for, and prints the custom scans, the
+indexes read and the restrictions left out: a predicate the restrictions match, one stronger
+restrictions imply (`x > 20` under `WHERE x > 10`) and one they do not; a predicate on indexed
+columns and on a column no index has; a predicate that is a `<>`, implied by an IN list; NULLs,
+`<>`, `IS DISTINCT FROM`, `NOT IN`, complement ORs, ORs across the partial and the whole index, a
+multi-key clause; GROUP BY one, two and three columns (the decoded walk mixing the partial and
+the whole index), by the predicate's own column, by a column a restriction pins (printed and
+not), HAVING, the top k, `coalesce`, `SELECT DISTINCT`; filtered counts beside a sum over every
+row; `count(col)` the predicate proves non-NULL; `count(DISTINCT)`; residual clauses; generic and
+custom plans of prepared statements; the FK-side join, inner, outer, semi and anti, with the
+partial index on the fact side and a partial lion index on the dimension; a partitioned table
+with partial indexes on the parent and one on a single partition; EXPLAIN, and the setting off.
+`exprindex.sql`: a partial expression index whose predicate the query implies answers, one whose
+predicate it does not imply declines.
+
+### 45.8 Not done
+
+- **One partial index a relation an attempt**, three attempts at most: two partial indexes are
+  never read in one count (one for the GROUP BY column, another for a clause), nor a partial index
+  beyond the third smallest a relation has.
+- **`FILTER` conditions are never left out**, only the WHERE's restrictions.
+- **The FK-side join's dimension** is an ordinary plan (§27), whose scans read a partial index as
+  core plans them (`LionOrdered` over `pcd_region` in the test); the rule above applies to the fact
+  side.
+- **Uniqueness proofs** (45.3).
+- **The cost of a sum over a partial index's entries** (45.6): the count of every row, and a `<>`
+  subtracted per entry, the second unpriced for whole indexes too. A GROUP BY whose WHERE is left
+  with a single source after the restrictions go is priced as a merge per group rather than one
+  collection of the WHERE (§10, "WHERE Sets Collected"); on 30,000 rows that prices the whole
+  index's four-source WHERE, collected once, below the partial index's one set, which on four
+  million rows it no longer does.
+- **A parallel GROUP BY** (§10) needs a WHERE that is collected - two sources or more, or a union
+  - and a positive one: a partial index that leaves one source or none after the restrictions go
+  is counted serially, against the whole index's parallel plan (45.6).
+- **Estimates** still come from the table's statistics (45.3).

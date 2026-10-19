@@ -1570,6 +1570,13 @@ extern PGDLLIMPORT bool lion_enable_decoded_walk;
 extern PGDLLIMPORT bool lion_enable_count_residual;
 
 /*
+ * Whether the count pushdown may read a partial lion index whose predicate
+ * the query implies, leaving out the restrictions that predicate implies
+ * (DESIGN.md §45).  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_count_partial;
+
+/*
  * Whether a GROUP BY ordered by its count under a LIMIT may count only the
  * groups the entries' own counts leave in the running (DESIGN.md §36).  A
  * planner switch.
