@@ -424,11 +424,12 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				LionColStats *cs;
 
 				/*
-				 * A DELETED page (DESIGN.md §18) holds nothing and is waiting
-				 * in the free space map to be handed out again; it is neither
-				 * a container page nor free space of one.
+				 * A DELETED page (DESIGN.md §18), or a leaf VACUUM took out of
+				 * its posting set (§22, "Empty leaves"), holds nothing and is
+				 * waiting to be handed out again; it is neither a container
+				 * page nor free space of one.
 				 */
-				if (LionPageIsDeleted(page))
+				if (LionPageIsDeleted(page) || LionPageIsUnlinked(page))
 				{
 					st->deleted_pages++;
 					UnlockReleaseBuffer(buf);

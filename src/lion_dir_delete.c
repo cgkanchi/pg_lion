@@ -496,7 +496,7 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 	lion_wal_op(xstate, p, LION_OP_DELETE, OffsetNumberNext(poff), 0, NULL, 0);
 	p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_STD);
 	lion_dirdel_rewrite(xstate, p, &halfdead, minf, minfsz);
-	lion_wal_finish(xstate, LION_XLOG_DIR_DELETE);
+	lion_wal_finish(xstate, LION_XLOG_UNLINK);
 
 	UnlockReleaseBuffer(pbuf);
 	pfree(retarget);
@@ -732,7 +732,7 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		LionPageGetOpaque(p)->owner_head = nextchild;
 		lion_wal_log_special(xstate, p);
 	}
-	lion_wal_finish(xstate, LION_XLOG_DIR_DELETE);
+	lion_wal_finish(xstate, LION_XLOG_UNLINK);
 
 	pfree(minf);
 	if (rfirst != NULL)

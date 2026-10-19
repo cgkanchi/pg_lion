@@ -341,6 +341,17 @@ typedef struct LionVacEntryRef
 	OffsetNumber off;
 } LionVacEntryRef;
 
+/*
+ * A posting leaf pass 2 left empty, and the leaf its walk came to it from
+ * (InvalidBlockNumber for the first): what lion_vacuum_unlink_empties() works
+ * through.
+ */
+typedef struct LionVacEmpty
+{
+	BlockNumber prev;
+	BlockNumber blk;
+} LionVacEmpty;
+
 /* Argument of the lion_container_remove_if() predicate. */
 typedef struct LionVacPred
 {
@@ -398,6 +409,11 @@ static void lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk,
 								 BlockNumber *nextp);
 static void lion_vacuum_delete_entries(LionVacState *vs, Buffer buf,
 									  LionVacEntry *ents, int nents);
+static void lion_vacuum_unlink_empties(LionVacState *vs,
+									   LionVacEntryRef *ref,
+									   const LionVacEntry *ent,
+									   const LionVacEmpty *empties,
+									   int nempty);
 static void lion_vacuum_chain(LionVacState *vs, Buffer entrybuf,
 							 LionVacEntry *ent);
 static BlockNumber lion_vacuum_descend(LionVacState *vs,
@@ -406,7 +422,8 @@ static BlockNumber lion_vacuum_container_page(LionVacState *vs,
 											 LionVacEntryRef *ref,
 											 const LionVacEntry *ent,
 											 BlockNumber blk,
-											 LionRightWalk *walk);
+											 LionRightWalk *walk,
+											 bool *emptyp);
 static BlockNumber lion_vacuum_filter_page(LionVacState *vs, Buffer buf,
 										  LionVacWork *w,
 										  const LionVacEntry *ent);
@@ -426,6 +443,10 @@ static void lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk);
 static bool lion_vac_may_write(Relation index);
 static bool lion_vac_may_count(Relation index, LionIndexState *ix);
 static void lion_vacuum_count_keys(IndexVacuumInfo *info);
+static uint32 lion_vac_pending_get(Relation index);
+static void lion_vac_pending_put(Relation index, uint32 npending);
+static bool lion_vacuum_recycle(IndexVacuumInfo *info, BlockNumber *ndeleted,
+								BlockNumber *nfree);
 
 /*
  * The predicate handed to lion_container_remove_if(): map the container
@@ -664,6 +685,15 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	stats->pages_deleted = (BlockNumber) vs.pages_deleted;
 	stats->pages_free = (BlockNumber) vs.pages_free;
 
+	/*
+	 * The pages out of the index's trees that are not reusable yet, for the
+	 * VACUUM after this one to decide whether it reads the index for them
+	 * when it calls no ambulkdelete (lionvacuumcleanup()).
+	 */
+	if (lion_vac_may_write(index))
+		lion_vac_pending_put(index,
+							 (uint32) Max(vs.pages_deleted - vs.pages_free, 0));
+
 	lion_vac_tick(&vs.prof.total, started);
 	elog(DEBUG1, "lion vacuum \"%s\": total %.1f ms (cleanup-lock wait %.1f, filter %.1f, apply %.1f, inline %.1f); "
 		 "pages %ld visited / %ld changed / %ld freed, %ld records, items %ld rewritten / %ld deleted, %ld regrown, entries %ld rewritten / %ld deleted",
@@ -688,6 +718,10 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 IndexBulkDeleteResult *
 lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 {
+	bool		recycled = false;
+	BlockNumber ndeleted = 0;
+	BlockNumber nfree = 0;
+
 	/*
 	 * The distinct keys of each key column, for the planner (DESIGN.md §33).
 	 * A VACUUM that called ambulkdelete has counted them already, on the walk
@@ -701,6 +735,22 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 	if (info->analyze_only)
 		return stats;
+
+	/*
+	 * A VACUUM that called no ambulkdelete still hands out the pages an
+	 * earlier one took out of the index's trees and could not hand out yet,
+	 * when they are many: nbtree's _bt_vacuum_needs_cleanup() rule, more
+	 * than a twentieth of the index (DESIGN.md §18, "Reuse").
+	 */
+	if (stats == NULL && info->heaprel != NULL &&
+		lion_vac_may_write(info->index))
+	{
+		uint32		pending = lion_vac_pending_get(info->index);
+
+		if (pending > 0 &&
+			pending > RelationGetNumberOfBlocks(info->index) / 20)
+			recycled = lion_vacuum_recycle(info, &ndeleted, &nfree);
+	}
 
 	/*
 	 * Make the pages ambulkdelete recorded as free visible to the upper
@@ -740,7 +790,111 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 			info->num_heap_tuples : 0;
 	}
 
+	if (recycled)
+	{
+		stats->pages_deleted = ndeleted;
+		stats->pages_free = nfree;
+	}
+
 	return stats;
+}
+
+/*
+ * nbtree's btm_last_cleanup_num_delpages (DESIGN.md §18, "Reuse"): the pages
+ * out of the index's trees - DELETED, or UNLINKED posting leaves - that were
+ * not reusable yet when the last ambulkdelete ended.  The meta page keeps it
+ * in its special area's maxckey, which nothing else uses on that page; an
+ * index that never had it reads 0, "none".
+ */
+static uint32
+lion_vac_pending_get(Relation index)
+{
+	Buffer		buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	Page		page;
+	uint32		pending = 0;
+
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	if (!PageIsNew(page) && PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+		LionPageIsMeta(page))
+		pending = LionPageGetOpaque(page)->maxckey;
+	UnlockReleaseBuffer(buf);
+	return pending;
+}
+
+static void
+lion_vac_pending_put(Relation index, uint32 npending)
+{
+	Buffer		buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	Page		page;
+	LionWalState *xstate;
+
+	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buf);
+	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsMeta(page) || LionPageGetOpaque(page)->maxckey == npending)
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+
+	xstate = lion_wal_begin(index);
+	page = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+	LionPageGetOpaque(page)->maxckey = npending;
+	lion_wal_log_special(xstate, page);
+	lion_wal_finish(xstate, LION_XLOG_META);
+	UnlockReleaseBuffer(buf);
+}
+
+/*
+ * The recycling half of the sweep, for a VACUUM that called no ambulkdelete:
+ * every block is read, and the pages out of the index's trees that no scan
+ * can still hold a link to go to the free space map - nbtree's btvacuumscan()
+ * run for the same reason.  Nothing is written but the count of those still
+ * waiting.  True when it ran.
+ */
+static bool
+lion_vacuum_recycle(IndexVacuumInfo *info, BlockNumber *ndeleted,
+					BlockNumber *nfree)
+{
+	Relation	index = info->index;
+	BlockNumber nblocks = RelationGetNumberOfBlocks(index);
+	BlockNumber blk;
+
+	*ndeleted = 0;
+	*nfree = 0;
+	for (blk = 1; blk < nblocks; blk++)
+	{
+		Buffer		buf;
+		Page		page;
+		bool		out;
+
+		lion_vacuum_delay_point();
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL,
+								 info->strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		out = !PageIsNew(page) &&
+			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+			(LionPageIsDeleted(page) ||
+			 (LionPageIsContainer(page) && LionPageIsUnlinked(page) &&
+			  PageGetMaxOffsetNumber(page) == 0));
+		if (out)
+		{
+			(*ndeleted)++;
+			if (GlobalVisCheckRemovableFullXid(info->heaprel,
+											   lion_page_get_safexid(page)))
+			{
+				RecordFreeIndexPage(index, blk);
+				(*nfree)++;
+			}
+		}
+		UnlockReleaseBuffer(buf);
+	}
+
+	lion_vac_pending_put(index, *ndeleted - *nfree);
+	return true;
 }
 
 /*
@@ -1802,9 +1956,13 @@ static void
 lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 {
 	BlockNumber blk;
+	BlockNumber prev = InvalidBlockNumber;
 	LionVacEntryRef ref;
 	LionEntryTuple *entry;
 	LionRightWalk walk;
+	LionVacEmpty *empties = NULL;
+	int			nempty = 0;
+	int			maxempty = 0;
 
 	/*
 	 * DESIGN.md §22: the entry's head block is the ROOT of the posting tree,
@@ -1832,7 +1990,34 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
 	{
-		blk = lion_vacuum_container_page(vs, &ref, ent, blk, &walk);
+		bool		empty;
+		BlockNumber next;
+
+		next = lion_vacuum_container_page(vs, &ref, ent, blk, &walk, &empty);
+
+		/*
+		 * A leaf the walk leaves empty is a candidate for the unlinking
+		 * below, with the leaf the walk came to it from.  A root push-down
+		 * starts the walk again at the leftmost leaf (walk.steps back at 0),
+		 * which no leaf comes before.
+		 */
+		if (empty)
+		{
+			if (nempty >= maxempty)
+			{
+				maxempty = Max(maxempty * 2, 16);
+				empties = (empties == NULL) ?
+					(LionVacEmpty *) palloc(sizeof(LionVacEmpty) * maxempty) :
+					(LionVacEmpty *) repalloc(empties,
+											  sizeof(LionVacEmpty) * maxempty);
+			}
+			empties[nempty].prev = prev;
+			empties[nempty].blk = blk;
+			nempty++;
+		}
+		prev = (BlockNumberIsValid(next) && walk.steps == 0) ?
+			InvalidBlockNumber : blk;
+		blk = next;
 
 		lion_vacuum_delay_point();
 	}
@@ -1845,6 +2030,15 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
 		ent->posroot = lion_entry_posext(entry)->pos_root;
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
+
+	/*
+	 * The leaves left empty leave the set (DESIGN.md §22, "Empty leaves"),
+	 * unless the whole set goes with its entry in the final step.
+	 */
+	if (nempty > 0 && !ent->maydelete && lion_vac_may_write(vs->index))
+		lion_vacuum_unlink_empties(vs, &ref, ent, empties, nempty);
+	if (empties != NULL)
+		pfree(empties);
 	ReleaseBuffer(ref.buf);
 
 	/*
@@ -1854,6 +2048,62 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	 */
 	if (BlockNumberIsValid(ent->posroot))
 		lion_vacuum_postree(vs, ent->posroot);
+}
+
+/*
+ * Take the leaves pass 2 left empty out of ent's posting set while the key
+ * lives on (lion_posting_delete.c, DESIGN.md §22, "Empty leaves"), left to
+ * right.  Each one is a window of its own with the entry's directory leaf
+ * held EXCLUSIVE - every writer of the set holds it (rule 2) - so that an
+ * insert waits for one leaf at a time, not for the run.  ref is the entry's
+ * leaf, pinned and not locked.  A leaf that may not go now stays, empty;
+ * one that went is DELETED for the leak sweep's purposes and goes to the
+ * free space map from a later VACUUM's sweep, once no scan can still hold a
+ * link to it.
+ */
+static void
+lion_vacuum_unlink_empties(LionVacState *vs, LionVacEntryRef *ref,
+						   const LionVacEntry *ent, const LionVacEmpty *empties,
+						   int nempty)
+{
+	BlockNumber lasthint = InvalidBlockNumber;
+	bool		lastgone = false;
+	int			i;
+
+	for (i = 0; i < nempty; i++)
+	{
+		BlockNumber hint = empties[i].prev;
+		bool		unlinked;
+
+		/*
+		 * Where to look for the leaf's left neighbour from: the leaf the walk
+		 * came from, unless that went a moment ago, and then where it was
+		 * looked for.  Only a hint: lion_posting_unlink_leaf() starts at the
+		 * leftmost leaf when it is not one.
+		 */
+		if (i > 0 && lastgone && hint == empties[i - 1].blk)
+			hint = lasthint;
+
+		lion_vac_ref_lock(vs, ref, ent, BUFFER_LOCK_EXCLUSIVE);
+		unlinked = lion_posting_unlink_leaf(vs->index, ent->owner, ent->head,
+											hint, empties[i].blk);
+		LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+
+		if (unlinked)
+		{
+			BlockNumber blk = empties[i].blk;
+
+			vs->pages_newly_deleted++;
+			vs->prof.records++;
+			/* the sweep counts it, and recycles it once it may */
+			if (blk < vs->nblocks)
+				vs->visited[blk / 8] &= (uint8) ~(1 << (blk % 8));
+		}
+		lasthint = hint;
+		lastgone = unlinked;
+
+		lion_vacuum_delay_point();
+	}
 }
 
 /*
@@ -2702,7 +2952,8 @@ lion_vac_children_deleted(LionVacState *vs, Page page)
 }
 
 /*
- * May the next allocation take this DELETED page already?  The rule
+ * May the next allocation take this DELETED page, or UNLINKED posting leaf,
+ * already?  The rule
  * lion_alloc_page() applies, nbtree's: its safexid is behind every snapshot.
  * Without the heap relation there is no horizon to test against, and the page
  * is counted as free but not as reusable.
@@ -2853,6 +3104,32 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			/*
+			 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of
+			 * its set, and handed out again once no scan can still hold a link
+			 * to it.  It goes to the free space map now, as a DELETED page
+			 * does, and lion_alloc_page() takes it once its transaction id
+			 * says so; until then it stays as it is, an empty leaf that a
+			 * reader with an old link walks through.  One that holds items is
+			 * not ours to reason about: verify() reports it.
+			 */
+			if (LionPageIsUnlinked(page))
+			{
+				bool		empty = PageGetMaxOffsetNumber(page) == 0;
+				bool		reusable = empty && lion_vac_page_reusable(vs, page);
+
+				UnlockReleaseBuffer(buf);
+				if (empty)
+					vs->pages_deleted++;
+				if (reusable)
+				{
+					RecordFreeIndexPage(vs->index, blk);
+					vs->pages_free++;
+				}
+				lion_vac_visit(vs, blk);
+				continue;
+			}
+
+			/*
 			 * A page of a position tree (DESIGN.md §17).  Pass 2 marked every
 			 * page of every live tree it walked, so an unvisited one belongs
 			 * to a tree made or grown since - whose root is live - or to one
@@ -2961,7 +3238,7 @@ lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 static BlockNumber
 lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 						  const LionVacEntry *ent, BlockNumber blk,
-						  LionRightWalk *walk)
+						  LionRightWalk *walk, bool *emptyp)
 {
 	Buffer		buf;
 	BlockNumber next;
@@ -2974,6 +3251,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 
 	oldcxt = MemoryContextSwitchTo(vs->pagecxt);
 
+	*emptyp = false;
 	buf = ReadBuffer(vs->index, blk);
 
 	for (;;)
@@ -3025,6 +3303,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 			 * may hold a copy of containers a split has since moved right,
 			 * onto a page this VACUUM is about to clean (DESIGN.md §11, §25).
 			 */
+			*emptyp = (PageGetMaxOffsetNumber(BufferGetPage(buf)) == 0);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			lion_wal_visit(vs->index, blk);
 			break;
@@ -3055,6 +3334,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 			INSTR_TIME_SET_CURRENT(t0);
 			lion_vacuum_apply_page(vs, ref, buf, &w, &grown, &ngrown);
 			lion_vac_tick(&vs->prof.apply, t0);
+			*emptyp = (PageGetMaxOffsetNumber(BufferGetPage(buf)) == 0);
 			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			break;
@@ -3116,6 +3396,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 				lion_vacuum_apply_page(vs, ref, buf, &w, &grown, &ngrown);
 				lion_vac_tick(&vs->prof.apply, t0);
 			}
+			*emptyp = (PageGetMaxOffsetNumber(BufferGetPage(buf)) == 0);
 			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			if (w.nwork == 0 && w.ndel == 0)

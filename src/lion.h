@@ -46,6 +46,10 @@
 #define LION_PAGE_HALF_DEAD	0x0100	/* an emptied directory LEAF whose
 									 * downlink is gone and which is being
 									 * unlinked (§21, "Page deletion") */
+#define LION_PAGE_UNLINKED	0x0200	/* an emptied posting LEAF VACUUM took
+									 * out of its set: still the set's page
+									 * and linked right, nothing links to it
+									 * (§22, "Empty leaves") */
 
 /* The three page KINDS; exactly one of them is set on every page. */
 #define LION_PAGE_KINDS \
@@ -78,6 +82,16 @@
  * and a DELETED directory page keeps its safexid in minckey (the low half)
  * and maxckey (the high half), since its body still holds the high key every
  * reader that lands on it reads (lion_dir_page_safexid()).
+ *
+ * The meta page keeps in maxckey the pages out of the index's trees that the
+ * last ambulkdelete could not hand out yet, nbtree's
+ * btm_last_cleanup_num_delpages (lionvacuumcleanup(), DESIGN.md §18,
+ * "Reuse"); an index written before it reads 0 there, which means none.
+ *
+ * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves") keeps in leftlink
+ * the low half of the transaction id from which on no scan can still hold a
+ * link to it (lion_page_get_safexid()); a posting leaf leaves leftlink unused
+ * otherwise.
  *
  * `level` and `leftlink` belong to the entry directory (DESIGN.md §21): the
  * leaves are level 0 and the root is level `height`, and every directory page
@@ -119,6 +133,7 @@ typedef LionPageOpaqueData *LionPageOpaque;
 #define LionPageIsLeaf(page)		LionPageIsBucket(page)
 #define LionPageIsRoot(page)		((LionPageGetOpaque(page)->flags & LION_PAGE_ROOT) != 0)
 #define LionPageIsHalfDead(page)	((LionPageGetOpaque(page)->flags & LION_PAGE_HALF_DEAD) != 0)
+#define LionPageIsUnlinked(page)	((LionPageGetOpaque(page)->flags & LION_PAGE_UNLINKED) != 0)
 #define LionPageIncompleteSplit(page) \
 	((LionPageGetOpaque(page)->flags & LION_PAGE_INCOMPLETE_SPLIT) != 0)
 #define LionPageIsRightmost(page) \
@@ -1922,6 +1937,18 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
  */
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
 										uint32 ckey, uint16 level);
+
+/*
+ * Take the empty leaf blk out of the posting set (hash, head) while the key
+ * lives on (lion_posting_delete.c, DESIGN.md §22, "Empty leaves"): its left
+ * neighbour's right link and its parent's downlink go to its right sibling,
+ * and it is flagged LION_PAGE_UNLINKED, for a later VACUUM to recycle.  The
+ * caller holds the key's directory leaf EXCLUSIVE; hint is a leaf it saw left
+ * of blk, or InvalidBlockNumber.  False when the leaf may not go now.
+ */
+extern bool lion_posting_unlink_leaf(Relation index, uint32 hash,
+									 BlockNumber head, BlockNumber hint,
+									 BlockNumber blk);
 
 /* The leftmost leaf, where every sequential walk of a posting set starts. */
 extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,

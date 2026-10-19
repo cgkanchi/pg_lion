@@ -1644,8 +1644,8 @@ lion_identify(uint8 info)
 			return "ENTRY";
 		case LION_XLOG_VACUUM_VISIT:
 			return "VACUUM_VISIT";
-		case LION_XLOG_DIR_DELETE:
-			return "DIR_DELETE";
+		case LION_XLOG_UNLINK:
+			return "UNLINK";
 		case LION_XLOG_REUSE:
 			return "REUSE";
 		default:

@@ -781,9 +781,9 @@ access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a l
 lion index's own ordered column walked, §30), no index-only scans of a lion index
 that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
 query come from a covering B-tree instead, §40), no INCLUDE columns, no
-parallel scan (a parallel build is supported from PostgreSQL 17), and no reclaim of the
-emptied pages of a key's posting tree while the key still has rows (they go with the key). VACUUM
-reclaims the directory leaves it empties, as a B-tree does. Inserts serialise on the directory
+parallel scan (a parallel build is supported from PostgreSQL 17). VACUUM reclaims the pages it
+empties, as a B-tree does: directory leaves, and the leaves of a key's posting tree while the key
+still has rows; the internal pages of a posting tree go with its key. Inserts serialise on the directory
 leaf that holds the key; see the measured
 [write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
