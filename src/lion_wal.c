@@ -36,6 +36,7 @@
  */
 #include "postgres.h"
 
+#include "access/nbtxlog.h"
 #include "access/rmgr.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -46,6 +47,8 @@
 #include "miscadmin.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/standby.h"
+#include "utils/rel.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "access/xact.h"
@@ -249,6 +252,71 @@ lion_wal_removal_end(void)
 {
 	lion_wal_removal = false;
 	lion_wal_removal_buf = InvalidBuffer;
+}
+
+/* ---------------------------------------------------------------------
+ * Page reuse: the recovery conflict
+ * --------------------------------------------------------------------- */
+
+/*
+ * A DELETED page is about to be used again (lion_alloc_page()).  Its safexid
+ * kept it from that on the primary until no snapshot could still hold a link
+ * to it, but a standby's queries are not in that test, so replay of this
+ * record cancels the ones whose snapshots are older than the safexid -
+ * _bt_allocbuf()'s XLOG_BTREE_REUSE_PAGE.  A directory reader that went on to
+ * a reused page would read another range of keys as if it were the one it
+ * left (DESIGN.md §21, "Page deletion").
+ *
+ * An rmgr-mode index writes LION_XLOG_REUSE.  A generic-mode index has no
+ * record of its own, so it writes nbtree's: that record names the relation and
+ * the horizon and changes no page, and its redo is exactly the conflict -
+ * which is also what an rmgr-mode index on a server without the resource
+ * manager writes, since nothing may be inserted under an id the server does
+ * not know (lion_rmgr_id).  The record is not inside any other, so it may be
+ * written here, before the caller's record begins.
+ */
+void
+lion_wal_log_reuse(Relation index, Relation heaprel, BlockNumber blk,
+				   FullTransactionId horizon)
+{
+	bool		catalog;
+
+	if (!RelationNeedsWAL(index) || !XLogStandbyInfoActive())
+		return;
+
+	catalog = heaprel != NULL && RelationIsAccessibleInLogicalDecoding(heaprel);
+
+	if (lion_wal_mode(index) == LION_WAL_MODE_RMGR && lion_rmgr_is_registered)
+	{
+		xl_lion_header hdr;
+		xl_lion_reuse xlrec;
+
+		memset(&hdr, 0, sizeof(hdr));
+		memset(&xlrec, 0, sizeof(xlrec));
+		xlrec.locator = index->rd_locator;
+		xlrec.block = blk;
+		xlrec.horizon = horizon;
+		xlrec.isCatalogRel = catalog;
+
+		XLogBeginInsert();
+		XLogRegisterData(&hdr, (uint32) SizeOfLionHeader);
+		XLogRegisterData(&xlrec, (uint32) SizeOfLionReuse);
+		(void) XLogInsert((RmgrId) lion_rmgr_id, LION_XLOG_REUSE);
+	}
+	else
+	{
+		xl_btree_reuse_page xlrec;
+
+		memset(&xlrec, 0, sizeof(xlrec));
+		xlrec.locator = index->rd_locator;
+		xlrec.block = blk;
+		xlrec.snapshotConflictHorizon = horizon;
+		xlrec.isCatalogRel = catalog;
+
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, (uint32) SizeOfBtreeReusePage);
+		(void) XLogInsert(RM_BTREE_ID, XLOG_BTREE_REUSE_PAGE);
+	}
 }
 
 /* ---------------------------------------------------------------------
@@ -1297,12 +1365,29 @@ lion_redo(XLogReaderState *record)
 	int			maxblk = XLogRecMaxBlockId(record);
 	int			i;
 
-	if (info > LION_XLOG_VACUUM_VISIT || (info & 0x0F) != 0)
+	if (info > LION_XLOG_LAST || (info & 0x0F) != 0)
 		elog(PANIC, "pg_lion: unknown record type %u", info);
 
 	if (XLogRecGetDataLen(record) < SizeOfLionHeader)
 		elog(PANIC, "pg_lion: record has no header");
 	memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
+
+	/* A page taken again: the recovery conflict, and nothing else. */
+	if (info == LION_XLOG_REUSE)
+	{
+		xl_lion_reuse xlrec;
+
+		if (XLogRecGetDataLen(record) < SizeOfLionHeader + SizeOfLionReuse)
+			elog(PANIC, "pg_lion: truncated REUSE record");
+		memset(&xlrec, 0, sizeof(xlrec));
+		memcpy(&xlrec, XLogRecGetData(record) + SizeOfLionHeader,
+			   SizeOfLionReuse);
+		if (InHotStandby)
+			ResolveRecoveryConflictWithSnapshotFullXid(xlrec.horizon,
+													   xlrec.isCatalogRel,
+													   xlrec.locator);
+		return;
+	}
 
 	/*
 	 * The barrier first, before any block of this record is locked (see
@@ -1449,6 +1534,27 @@ lion_desc(StringInfo buf, XLogReaderState *record)
 	}
 	memcpy(&hdr, XLogRecGetData(record), SizeOfLionHeader);
 
+	if ((XLogRecGetInfo(record) & ~XLR_INFO_MASK) == LION_XLOG_REUSE)
+	{
+		xl_lion_reuse xlrec;
+
+		if (XLogRecGetDataLen(record) < SizeOfLionHeader + SizeOfLionReuse)
+		{
+			appendStringInfoString(buf, "(truncated)");
+			return;
+		}
+		memset(&xlrec, 0, sizeof(xlrec));
+		memcpy(&xlrec, XLogRecGetData(record) + SizeOfLionHeader,
+			   SizeOfLionReuse);
+		appendStringInfo(buf, "rel %u/%u/%u, blk %u, horizon %u:%u, catalog %d",
+						 xlrec.locator.spcOid, xlrec.locator.dbOid,
+						 xlrec.locator.relNumber, xlrec.block,
+						 EpochFromFullTransactionId(xlrec.horizon),
+						 XidFromFullTransactionId(xlrec.horizon),
+						 xlrec.isCatalogRel ? 1 : 0);
+		return;
+	}
+
 	appendStringInfo(buf, "init %u, cleanup %u", hdr.initmask, hdr.cleanupmask);
 	if (hdr.nvisit > 0)
 	{
@@ -1538,6 +1644,10 @@ lion_identify(uint8 info)
 			return "ENTRY";
 		case LION_XLOG_VACUUM_VISIT:
 			return "VACUUM_VISIT";
+		case LION_XLOG_DIR_DELETE:
+			return "DIR_DELETE";
+		case LION_XLOG_REUSE:
+			return "REUSE";
 		default:
 			return NULL;
 	}

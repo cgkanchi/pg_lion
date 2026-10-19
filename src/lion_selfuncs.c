@@ -451,10 +451,11 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
  * (lion_dir_step_right()) or left (lion_dir_step_left()); a leaf that split
  * meanwhile moved entries only to a new page on its right, which going right
  * reads and going left passes by - entries already examined, and ones
- * inserted since, which is as good an end for an estimate.  A leaf VACUUM
- * emptied stays linked (DESIGN.md §18) and is read like any other: an end
- * whose last LION_PROBE_LEAVES leaves hold no live key, which is what deleting
- * the newest rows in bulk leaves, is given up on.
+ * inserted since, which is as good an end for an estimate.  A leaf whose
+ * entries are all dead is read like any other, and so is one VACUUM emptied
+ * and has not taken out of the tree yet (DESIGN.md §21, "Page deletion"): an
+ * end whose last LION_PROBE_LEAVES leaves hold no live key, which is what
+ * deleting the newest rows in bulk leaves until VACUUM, is given up on.
  *
  * *settled is whether the answer holds until the index or its table changes
  * (lion_probe_miss_note()): an end found, a bound reached, or the column's

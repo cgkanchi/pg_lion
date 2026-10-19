@@ -650,8 +650,9 @@ extern bool lion_probe_find(Relation index, LionState *state, LionProbe *probe,
  * the next lookup reads the leaf again by its block number.
  *
  * A key sorted after the last one is on that leaf, or to its right: a
- * directory page never changes level and is never freed, and splits move keys
- * only rightwards (DESIGN.md §21, "Readers").  The walk stays on the leaf
+ * directory page keeps its level and is not reused while the walk's snapshot
+ * lasts, and splits and page deletions move keys only rightwards (DESIGN.md
+ * §21, "Readers" and "Page deletion").  The walk stays on the leaf
  * while the key is below the high key it copied from it, steps to the right
  * sibling while the keys come that close together, and descends from the root
  * for a key further away, so a batch whose keys are dense reads each leaf once

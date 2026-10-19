@@ -316,6 +316,19 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 			maxoff = PageGetMaxOffsetNumber(page);
 
+			/*
+			 * A DELETED directory page (DESIGN.md §21, "Page deletion") is out
+			 * of the tree and waiting to be handed out again, as a DELETED
+			 * container page is.
+			 */
+			if ((LionPageIsDir(page) || LionPageIsBucket(page)) &&
+				LionPageIsDeleted(page))
+			{
+				st->deleted_pages++;
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
+
 			if (LionPageIsDir(page))
 			{
 				st->internal_pages++;

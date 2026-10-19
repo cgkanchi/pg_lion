@@ -108,6 +108,10 @@ lion_page_get_safexid(Page page)
 {
 	Assert(LionPageIsDeleted(page));
 
+	/* A directory page keeps it in its special area (DESIGN.md §21). */
+	if ((LionPageGetOpaque(page)->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR)) != 0)
+		return lion_dir_page_safexid(page);
+
 	if (((PageHeader) page)->pd_lower <
 		SizeOfPageHeaderData + (int) sizeof(LionDeletedPageData))
 		return FirstNormalFullTransactionId;	/* corrupt: never recyclable */
@@ -154,11 +158,11 @@ lion_page_recyclable(Page page, Relation heaprel)
  * free space map and the relation is extended instead - which also keeps this
  * loop from spinning on a block the map keeps offering.
  *
- * Note what is NOT here: nbtree writes an XLOG_BTREE_REUSE_PAGE record so
- * that replay can cancel a standby query that might still hold a link to the
- * block.  Generic WAL cannot raise a recovery conflict, so a standby reader
- * is protected by the owner check in the page's special area instead
- * (DESIGN.md §18).
+ * A DELETED page that is taken is announced to a standby first, as
+ * _bt_allocbuf() announces one: replay of that record cancels the standby
+ * queries whose snapshots are older than the page's safexid, which are the
+ * ones that may still hold a link to it (lion_wal_log_reuse()).  On the
+ * primary the safexid test itself keeps such a scan safe.
  */
 Buffer
 lion_alloc_page(Relation index, Relation heaprel, bool reuse)
@@ -173,8 +177,15 @@ lion_alloc_page(Relation index, Relation heaprel, bool reuse)
 
 			if (ConditionalLockBuffer(buf))
 			{
-				if (lion_page_recyclable(BufferGetPage(buf), heaprel))
+				Page		page = BufferGetPage(buf);
+
+				if (lion_page_recyclable(page, heaprel))
+				{
+					if (!PageIsNew(page))
+						lion_wal_log_reuse(index, heaprel, blkno,
+										   lion_page_get_safexid(page));
 					return buf;
+				}
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			}
 

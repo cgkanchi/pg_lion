@@ -251,8 +251,10 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
  * it lands on is the first one whose proc 4 is not below the bound.  The walk
  * that starts there re-reads the leaf with nothing held in between, which is
  * safe for the reason every resumed entry scan is: a split moves entries only
- * rightwards, onto a page the walk has yet to reach, and a directory leaf is
- * never unlinked (§21).
+ * rightwards, onto a page the walk has yet to reach, and a leaf VACUUM takes
+ * out of the tree meanwhile keeps its right link, has a MINUS INFINITY high
+ * key and is not reused while the scan's snapshot lasts (§21, "Page
+ * deletion").
  *
  * The item is what puts the landings of SEVERAL bounds in order
  * (lion_cmp_entries(), the directory order itself), which is how a walk finds

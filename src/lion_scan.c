@@ -5043,10 +5043,11 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
  * (lion_range_last_leaf()) and goes to each leaf's LEFT sibling
  * (lion_dir_step_left(): the page whose right link is this one, found from
  * the left link by walking right, since the page the link names may have
- * split).  Neither misses an entry a snapshot taken before the walk began can
- * see: such an entry was in the index then, a split only ever moves entries
- * to a new page right of the one it splits, and no directory page is ever
- * unlinked (§21).  When the left neighbour of a leaf already copied splits,
+ * split, or skipping pages deleted since).  Neither misses an entry a snapshot
+ * taken before the walk began can see: such an entry was in the index then, a
+ * split only ever moves entries to a new page right of the one it splits, and
+ * a directory page is unlinked only once it holds no entry (§21, "Page
+ * deletion").  When the left neighbour of a leaf already copied splits,
  * its upper half goes to the new page, whose right link is that leaf: the
  * page the descending walk reads next.  Entries inserted after the walk began
  * are for rows no older snapshot sees.
@@ -5083,15 +5084,14 @@ lion_order_next_value(LionOrderWalk *w)
 
 				/*
 				 * A leaf with a left link has a left sibling whose right link
-				 * names it, found however far it split (§21): not finding one
-				 * is damage, not the end of the column.
+				 * names it, found however far it split, and not finding one
+				 * is an ERROR there (§21).  None is left when the pages left
+				 * of this one have been deleted since the copy was taken
+				 * ("Page deletion"), which they were only once they held no
+				 * entry at all: the end of the walk.
 				 */
 				if (!BufferIsValid(buf))
-					ereport(ERROR,
-							(errcode(ERRCODE_INDEX_CORRUPTED),
-							 errmsg("lion index \"%s\": no left sibling of directory leaf %u",
-									RelationGetRelationName(w->index), w->blk),
-							 errhint("REINDEX the index.")));
+					return false;
 
 				/*
 				 * A step along the level like any other, counted as the
