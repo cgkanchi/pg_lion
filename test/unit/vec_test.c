@@ -49,7 +49,11 @@
  *		made of their places and their checks, and the LOC pages a scan's
  *		members choose, against models;
  *	  - the exact path's price of the pages it reads in order: a bitmap heap
- *		scan's, as costsize.c prices it, bounded by the rows and the pages.
+ *		scan's, as costsize.c prices it, bounded by the rows and the pages;
+ *	  - the partitions a build makes and wants, and the sample they take:
+ *		the rule's figures, a sample of every row never short, a short one
+ *		short for every larger table, and the maintenance_work_mem a build's
+ *		error names enough where a kilobyte less is not.
  *
  *	  Every array is an exact-size heap allocation, which `make unit
  *	  SANITIZE=1` checks to the byte.  Exit status is 0 only if every check
@@ -2928,6 +2932,125 @@ test_subsample(void)
 	free(slot);
 }
 
+/* ---------- the partitions a build makes, and its sample ---------- */
+
+/*
+ * lionvec_parts() and what the build rests on (DESIGN.md §44.3, §44.8): the
+ * rule's figures - one partition below 10,000 rows, 8 sqrt(n) above, at most
+ * a sixteenth of the sample, the option's count at most the sample's rows,
+ * LIONVEC_MAX_PARTS past 1.07 billion rows - and the reservoir's at the
+ * figures DESIGN.md quotes.  A reservoir of every row is never short, and
+ * the cap of 2^24 rows takes no partition away.  With smax fixed, short
+ * stays short as the rows grow, for every count of rows to 200,000 and
+ * then every 0.05% to 4 billion: the first pass fails at the first row that
+ * makes it so, sure that the table's rows would too.  And the
+ * maintenance_work_mem the error names (lionvec_parts_sample(),
+ * lionvec_sample_mem()) makes the partitions wanted, and a kilobyte less
+ * does not, but where any sample makes them: the one partition of a table
+ * under 10,000 rows, or of an option of 1.
+ */
+static void
+test_partitions(void)
+{
+	static const int asks[] = {0, 1, 2, 20, 600, 5000, 30000, LIONVEC_MAX_PARTS};
+	static const int64 smaxes[] = {1, 16, 340, 481, 3971, 7710, 21788, 348617,
+	1 << 22, LIONVEC_SAMPLE_MAX};
+	static const int dimsps[] = {64, 128, 576, 1536, 8128};
+	static const double rows[] = {1, 15, 16, 17, 9999, 10000, 10001, 16383,
+		16384, 28941, 28943, 40000, 1e6, 7.4e6, 1e8, 1e9, 1.08e9, 4e9};
+	bool		every = true;
+	bool		capfree = true;
+	bool		stays = true;
+	bool		enough = true;
+	bool		less = true;
+	int			ai;
+	int			si;
+	int			di;
+	int			ri;
+
+	cur_phase = "partitions";
+	CHECK(lionvec_parts(0, 0.0, 0) == 0 && lionvec_parts(0, 5.0, 0) == 0 &&
+		  lionvec_parts(20, 0.0, 0) == 0 && lionvec_parts(0, 1.0, 1) == 1 &&
+		  lionvec_parts(0, 9999.0, 9999) == 1 && lionvec_parts(0, 9999.0, 1) == 1 &&
+		  lionvec_parts(0, 10000.0, 10000) == 625 &&
+		  lionvec_parts(0, 16384.0, 16384) == 1024 &&
+		  lionvec_parts(0, 1e6, 1000000) == 8000 &&
+		  lionvec_parts(0, 1e6, 21788) == 1361 &&
+		  lionvec_parts(0, 1e9, LIONVEC_SAMPLE_MAX) == 252982 &&
+		  lionvec_parts(0, 4e9, LIONVEC_SAMPLE_MAX) == LIONVEC_MAX_PARTS &&
+		  lionvec_parts(500, 300.0, 300) == 300 &&
+		  lionvec_parts(30000, 40000.0, 21788) == 21788 &&
+		  lionvec_parts(30000, 40000.0, 40000) == 30000,
+		  "the partitions are not the rule's");
+	CHECK(lionvec_sample_max(65536, 1536) == 21788 &&
+		  lionvec_sample_max(1048576, 1536) == 348617 &&
+		  lionvec_sample_max(64, 64) == 481 &&
+		  lionvec_sample_max(0, 1536) == 1 &&
+		  lionvec_sample_max(INT64CONST(54525952), 1536) == LIONVEC_SAMPLE_MAX &&
+		  lionvec_sample_max(PG_INT32_MAX, 64) == LIONVEC_SAMPLE_MAX,
+		  "the reservoir is not what half of maintenance_work_mem holds, to its cap");
+	/* a billion rows: 252,982 partitions, 4,047,712 sample rows, 11,890 MB */
+	CHECK(lionvec_parts_wanted(0, 1e9) == 252982 &&
+		  lionvec_parts_sample(0, 252982) == 4047712 &&
+		  lionvec_parts_sample(30000, 30000) == 30000 &&
+		  lionvec_sample_mem(4047712, 1536) == 12174759 &&
+		  lionvec_parts_short(0, 1e9, 21788) &&
+		  lionvec_parts_short(0, 40000.0, 21788) &&
+		  !lionvec_parts_short(0, 28000.0, 21788) &&
+		  !lionvec_parts_short(0, 1e6, 348617) &&
+		  lionvec_parts_short(30000, 40000.0, 21788) &&
+		  !lionvec_parts_short(30000, 21788.0, 21788),
+		  "a billion rows' or the reproduction's figures are not DESIGN.md's");
+
+	for (ai = 0; ai < (int) lengthof(asks); ai++)
+	{
+		int			ask = asks[ai];
+
+		for (ri = 0; ri < (int) lengthof(rows); ri++)
+		{
+			double		n = rows[ri];
+			int			w = lionvec_parts_wanted(ask, n);
+
+			every &= w == lionvec_parts(ask, n, (int64) n) &&
+				!lionvec_parts_short(ask, n, (int64) n);
+			capfree &= n < LIONVEC_SAMPLE_MAX ||
+				w == lionvec_parts(ask, n, (int64) LIONVEC_SAMPLE_MAX);
+			for (di = 0; di < (int) lengthof(dimsps); di++)
+			{
+				int64		need = lionvec_parts_sample(ask, w);
+				int64		mem = lionvec_sample_mem(need, dimsps[di]);
+
+				enough &= !lionvec_parts_short(ask, n,
+											   lionvec_sample_max(mem, dimsps[di]));
+				/* a reservoir is a row at least: one row's is any */
+				if (need > 1 && (ask > 0 || n >= LIONVEC_MIN_AUTO_ROWS))
+					less &= lionvec_parts_short(ask, n,
+												lionvec_sample_max(mem - 1, dimsps[di]));
+			}
+		}
+		for (si = 0; si < (int) lengthof(smaxes); si++)
+		{
+			int64		smax = smaxes[si];
+			bool		was = false;
+			double		n;
+
+			for (n = 1.0; n <= 4e9; n = n < 200000.0 ? n + 1.0 : floor(n * 1.0005))
+			{
+				bool		now = lionvec_parts_short(ask, n, smax);
+
+				stays &= now || !was;
+				every &= !now || n > (double) smax;
+				was = now;
+			}
+		}
+	}
+	CHECK(every, "a sample of every row makes fewer partitions than the rows want");
+	CHECK(capfree, "the reservoir's cap takes a partition away");
+	CHECK(stays, "more rows than a short sample's are not short too");
+	CHECK(enough, "the maintenance_work_mem named does not make the partitions wanted");
+	CHECK(less, "a kilobyte less than the maintenance_work_mem named makes them too");
+}
+
 /* k centroids' codes, of which sub holds those idx[0 .. n) names, in that order */
 static void
 cent_codes_sub(CentCodes *sub, const CentCodes *cc, const int *idx, int n)
@@ -3971,6 +4094,7 @@ main(void)
 	test_prefetch();
 	test_locator();
 	test_costs();
+	test_partitions();
 
 	printf("vec_test: %ld checks, %ld failed\n", nchecks, nfail);
 	return nfail == 0 ? 0 : 1;
