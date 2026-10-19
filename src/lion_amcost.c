@@ -100,6 +100,7 @@ lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 	MemoryContext oldcxt;
 	bool		full;
 
+	strategy = LION_STRAT_CANONICAL(strategy);	/* `@@@` is `@@` */
 	proc = get_opfamily_proc(index->opfamily[col], index->opcintype[col],
 							 index->opcintype[col], LION_EXTRACTQUERY_PROC);
 	if (!OidIsValid(proc))

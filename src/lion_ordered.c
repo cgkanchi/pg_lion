@@ -1925,9 +1925,9 @@ lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid opcintype,
 /*
  * The restriction clauses a lion column's walk can decide once per ENTRY
  * rather than once per row (DESIGN.md §30.11, "A filter on the walked
- * column"): those that read no column but the walked one and call nothing
- * volatile, on an index whose stored keys are the rows' own values byte for
- * byte (lion_index_can_emit_value()).  Every row of an entry then holds one
+ * column"): those that read no column but the walked one and are immutable,
+ * on an index whose stored keys are the rows' own values byte for byte
+ * (lion_index_can_emit_value()).  Every row of an entry then holds one
  * value, so a clause is true of all of them or of none, and the first
  * visible row the walk fetches of an entry decides for the entry: one that
  * fails takes the rest of the entry with it, unread.  The clause is only
@@ -1935,6 +1935,13 @@ lo_walk_clause(RestrictInfo *rinfo, Var *var, Oid opfamily, Oid opcintype,
  * on a stored key alone, which may be a dead row's, and could make a function
  * fail that the query never calls on it (`1 / k` with k = 0 only in a
  * deleted row).  It stays in the node's filter as well.
+ *
+ * Immutable, not merely non-volatile: a stable function may look at how a
+ * row stores its value rather than at the value - pg_column_size(),
+ * pg_column_compression(), pg_column_toast_chunk_id() differ between two
+ * rows of one value, one compressed or toasted and one not - and the first
+ * row would then decide wrongly for the others.  An immutable function sees
+ * the value only, and the value is one image for the whole entry.
  */
 static List *
 lo_walk_value_rinfos(RelOptInfo *rel, IndexOptInfo *idx, int c, Var *var,
@@ -1953,7 +1960,7 @@ lo_walk_value_rinfos(RelOptInfo *rel, IndexOptInfo *idx, int c, Var *var,
 		if (rinfo->pseudoconstant || list_member_ptr(walkrinfos, rinfo) ||
 			!bms_equal(rinfo->clause_relids, rel->relids))
 			continue;
-		if (contain_volatile_functions((Node *) rinfo->clause) ||
+		if (contain_mutable_functions((Node *) rinfo->clause) ||
 			contain_subplans((Node *) rinfo->clause))
 			continue;
 		pull_varattnos((Node *) rinfo->clause, rel->relid, &attrs);

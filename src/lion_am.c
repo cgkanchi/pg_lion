@@ -903,7 +903,9 @@ lionvalidate(Oid opclassoid)
 		 * could be answered from them).
 		 */
 		stratok = multikey ?
-			LION_STRAT_IS_MULTI(oprform->amopstrategy) :
+			(LION_STRAT_IS_MULTI(oprform->amopstrategy) ||
+			 oprform->amopstrategy == LION_STRAT_ARRAY_EQUAL ||
+			 oprform->amopstrategy == LION_STRAT_MATCH_OLD) :
 			(oprform->amopstrategy == LION_STRAT_EQUAL ||
 			 LION_STRAT_IS_WALK(oprform->amopstrategy));
 
