@@ -51,6 +51,8 @@ lion_node_members(const LionKeyNode *node, const LionPostingSet *sets)
 		return 0;
 	if (node->kind == LION_KN_KEY)
 		return sets[node->keyno].found ? (double) sets[node->keyno].ntids : 0;
+	if (node->kind == LION_KN_ANDNOT)
+		return lion_node_members(node->args[0], sets);	/* what it subtracts from */
 	for (i = 0; i < node->nargs; i++)
 	{
 		double		c = lion_node_members(node->args[i], sets);
@@ -342,6 +344,8 @@ lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
 	int			firstpins = 0;
 	bool		allpinned = true;
 	bool		anypinned = false;
+	bool		pinned0 = true;
+	int			pins0 = 0;
 	int			i;
 
 	check_stack_depth();
@@ -385,6 +389,11 @@ lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
 		summem += cp->mem;
 		maxmem = Max(maxmem, cp->mem);
 		sumpins += cp->pins;
+		if (i == 0)
+		{
+			pinned0 = cp->pinned;
+			pins0 = cp->pins;
+		}
 		if (cp->pinned)
 		{
 			anypinned = true;
@@ -423,6 +432,29 @@ lion_plan_node(LionNodePlan *p, const LionKeyNode *node,
 			/* which children contributed is not known in advance: all */
 			p->pinned = allpinned;
 		}
+		return;
+	}
+
+	if (node->kind == LION_KN_ANDNOT)
+	{
+		/*
+		 * Every member of the result is a member of the first child's
+		 * container at the key it stands at, so that child's pin is the
+		 * node's (DESIGN.md §9), and only that child need keep one: the others
+		 * only take members away.  Within the budget they keep theirs as
+		 * every cursor of the node does - what a plain scan's stream under a
+		 * non-MVCC snapshot is built with (budget NULL) - and past it they
+		 * let go, as a trimmed AND's other children do.
+		 */
+		p->mem = summem;
+		p->pinned = pinned0;
+		if (budget != NULL && !droppins && sumpins > budget->pins)
+		{
+			p->keep = 0;
+			p->pins = pins0;
+		}
+		else
+			p->pins = sumpins;
 		return;
 	}
 
@@ -967,6 +999,26 @@ lion_ecursor_init_ex(LionExprCursor *c, const LionNodePlan *plan,
 	{
 		Assert(node->kind == LION_KN_OR);
 		lion_wide_init(c, sets, nsets, cx);
+	}
+	else if (node->kind == LION_KN_ANDNOT)
+	{
+		/*
+		 * The first child is built as the node is built - raw when the node
+		 * is - and never lazy: the node asks for its container at every key
+		 * it stands at.  The others are only ever subtracted from it, raw,
+		 * each sought to the first child's keys when it is there to subtract
+		 * (lion_ecursor_build()).
+		 */
+		Assert(node->nargs >= 2 && plan->nsub == node->nargs);
+		c->nsub = node->nargs;
+		c->sub = (LionExprCursor *) palloc0(sizeof(LionExprCursor) * c->nsub);
+		for (i = 0; i < c->nsub; i++)
+			lion_ecursor_init_ex(&c->sub[i], &plan->sub[i], sets, nsets, cx,
+								 droppins ||
+								 (plan->keep != LION_KEEP_ALL && plan->keep != i),
+								 (i == 0) ? raw : true, false);
+		c->acc[0] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+		c->acc[1] = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	}
 	else if (node->kind == LION_KN_POSFILTER)
 	{
@@ -1847,6 +1899,54 @@ lion_ecursor_build(LionExprCursor *c)
 		return;
 	}
 
+	if (c->kind == LION_KN_ANDNOT)
+	{
+		LionExprCursor *pos = &c->sub[0];
+
+		/*
+		 * The first child's next container that keeps a member once every
+		 * other child's container at its key - each sought there, forward
+		 * only - is taken out of it: `col IS NOT NULL` as the column's NULL
+		 * entry subtracted, which reads that entry only at the keys the
+		 * first child stands at (DESIGN.md §14, §29.2).  A key left empty is
+		 * passed over, as the leapfrog abandons a key: nothing of it reaches
+		 * the visibility map, and the first child, which stands at it with
+		 * its pin, is the one that moves on (§9).
+		 */
+		while (pos->valid)
+		{
+			const LionContainer *res = lion_ecursor_container(pos);
+			int			k;
+
+			for (k = 1; k < c->nsub && lion_container_cardinality(res) > 0; k++)
+			{
+				LionExprCursor *neg = &c->sub[k];
+
+				if (neg->valid && neg->ckey < pos->ckey)
+					lion_ecursor_seek(neg, pos->ckey);
+				if (!neg->valid || neg->ckey != pos->ckey)
+					continue;	/* nothing to take away at this key */
+				lion_container_andnot_raw(res, lion_ecursor_container(neg),
+										  c->acc[w]);
+				res = c->acc[w];
+				w ^= 1;
+			}
+			if (lion_container_cardinality(res) > 0)
+			{
+				/* optimized for a caller that keeps it, as an AND's is */
+				if (!c->raw && (res == c->acc[0] || res == c->acc[1]))
+					lion_container_optimize((LionContainer *) res);
+				c->cur = res;
+				c->ckey = pos->ckey;
+				c->valid = true;
+				return;
+			}
+			lion_ecursor_next(pos);
+			CHECK_FOR_INTERRUPTS();
+		}
+		return;
+	}
+
 	Assert(c->kind == LION_KN_AND);
 
 	/*
@@ -1949,6 +2049,8 @@ lion_ecursor_next(LionExprCursor *c)
 			break;
 
 		case LION_KN_POSFILTER:
+		case LION_KN_ANDNOT:
+			/* the one child whose members it hands out */
 			lion_ecursor_next(&c->sub[0]);
 			break;
 	}
@@ -2025,6 +2127,8 @@ lion_ecursor_seek(LionExprCursor *c, uint32 target)
 			break;
 
 		case LION_KN_POSFILTER:
+		case LION_KN_ANDNOT:
+			/* an ANDNOT's others are sought where it lands (build) */
 			lion_ecursor_seek(&c->sub[0], target);
 			break;
 	}
@@ -2145,6 +2249,10 @@ lion_source_satisfiable(const LionKeyNode *node, const LionPostingSet *sets)
 					return true;
 			}
 			return false;
+
+		case LION_KN_ANDNOT:
+			/* what it takes away is not known until it is read */
+			return lion_source_satisfiable(node->args[0], sets);
 	}
 
 	return false;

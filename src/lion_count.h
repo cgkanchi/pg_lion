@@ -1641,6 +1641,30 @@ typedef struct LionAndCost
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
 							  Node **clauses, double isect, LionAndCost *out);
+
+/*
+ * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
+ * §14, §29.2): its NULL entry taken away from that answer, or - canwalk, and
+ * LION_NOTNULL_WALK_MARGIN times cheaper - the column's other entries walked
+ * beside it, as the executor chooses (lion_scan_notnull_walks(),
+ * lion_scan.c); *walks says which.  *pages is what it reads of the index.
+ * lion_null_entry_pages() is the NULL entry's size both of them weigh.
+ */
+#define LION_NOTNULL_WALK_MARGIN	2.0
+
+extern Cost lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel,
+							  IndexOptInfo *idx, AttrNumber col, Node *clause,
+							  double rows, double ndistinct, bool canwalk,
+							  double *pages, bool *walks);
+extern double lion_null_entry_pages(double members, double containers,
+									double others);
+
+/*
+ * The index quals of a lion IndexPath a plain scan's source - and so a
+ * LionOrdered set - leaves to the recheck (lion_amcost.c).
+ */
+extern List *lion_path_rechecked_quals(PlannerInfo *root, IndexPath *path);
+
 extern double lion_containers_for(double heap_pages, double members);
 extern double lion_index_column_posting_share(PlannerInfo *root,
 											  RelOptInfo *rel,

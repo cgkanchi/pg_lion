@@ -1167,6 +1167,159 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 
 /*
+ * About how many posting pages a set of `rows` rows over `containers`
+ * container keys fills, as lion_source_set_pages() counts a located one: two
+ * bytes a member up to a bitset a container, and a header each.
+ */
+static double
+lion_set_pages_for(double rows, double containers)
+{
+	return (Min(2.0 * rows, (double) LION_BITSET_BYTES * containers) +
+			(double) LION_CONTAINER_HDRSZ * containers) / BLCKSZ;
+}
+
+/*
+ * About how many posting pages a column's NULL entry of `members` rows over
+ * `containers` container keys fills, `others` being the rows of the column's
+ * other entries (DESIGN.md §14).  lion_set_pages_for() and
+ * lion_source_set_pages() price a set at two bytes a member up to a bitset a
+ * container, which is right for the sparse sets they are used for and far
+ * off for a set that holds nearly every row at its keys - the NULL entry of a
+ * column that is mostly NULL, the one worth walking past - which takes the
+ * smallest form a container has (§38): a RUN, of a run a heap block and one
+ * more for each of the other rows there, which break them, or a NARROW only
+ * as wide as a block's rows reach, its offsets packed from the first.  The
+ * NULL entry of a column NULL on 29 rows in 30, at 44 rows a block, is a
+ * NARROW of 520 bytes a container where the bitset is 4104.  Rounded up, and
+ * a page at least, as lion_source_set_pages() rounds.
+ */
+double
+lion_null_entry_pages(double members, double containers, double others)
+{
+	double		per;
+	double		rest;
+	double		runs;
+	double		width;
+	double		bytes;
+
+	if (members < 1.0 || containers < 1.0)
+		return 0.0;
+	per = members / containers;
+	rest = Max(others, 0.0) / containers;
+	runs = Min(per, (double) LION_BLOCKS_PER_CONTAINER + rest);
+	/* a block's rows, packed from its first offset, 64 offsets a word */
+	width = ceil((per + rest) / (double) LION_BLOCKS_PER_CONTAINER / 64.0);
+	bytes = Min(2.0 * per, (double) LION_BITSET_BYTES);
+	bytes = Min(bytes, (double) sizeof(uint16) + (double) sizeof(LionRun) * runs);
+	if (width <= (double) LION_NARROW_MAX_WIDTH)
+		bytes = Min(bytes, (double) LION_WIDTH_BYTES(1) * Max(width, 1.0));
+	return Max(1.0, ceil(containers * (bytes + (double) LION_CONTAINER_HDRSZ) /
+						 (double) BLCKSZ));
+}
+
+/*
+ * `col IS NOT NULL` beside quals that answer (DESIGN.md §14, §29.2), whose
+ * answer holds `rows` rows: what the scan pays for it, and *walks says how it
+ * pays.
+ *
+ * Its column's NULL entry is TAKEN AWAY from that answer: located - a
+ * directory leaf and a descent, as `IS NULL` locates it
+ * (lion_cost_set_clause()) - and sought to each container key the answer
+ * has, as an AND's other sources are sought: the posting pages those seeks
+ * reach (lion_cost_set_pages()) of the entry in the form it takes
+ * (lion_null_entry_pages()), a probe each (LION_PROBE_COST), and at each
+ * key the entry holds rows at, the answer's members there taken out
+ * (LION_CONTAINER_COST, and LION_AND_MEMBER_COST a member).  An entry of no
+ * row is located and nothing more.
+ *
+ * Or, where canwalk says the scan has a walk's place free - sets beside it
+ * and no range, nor a list too long to locate at once - the column's other
+ * entries are WALKED, as a range is beside the sets, when that reads
+ * LION_NOTNULL_WALK_MARGIN times less than the NULL entry: the executor's
+ * choice (lion_scan_notnull_walks()), made here from the statistics - the
+ * NULL entry's pages from the column's null fraction, in the form it takes
+ * (lion_null_entry_pages()), and the walk's from its ndistinct entries of
+ * the other rows: a descent to the column's first leaf, an entry small
+ * enough to be INLINE (LION_DEFAULT_INLINE_LIMIT) its bytes of the leaves
+ * and any other its pages, a page at least - once per window
+ * (lion_walk_window()) of as many container keys as the NULL entry has, as
+ * the executor counts them.  The walk is priced as those pages read in order
+ * and a descent an entry.
+ *
+ * *pages gets what it reads of the index.
+ */
+Cost
+lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+				  AttrNumber col, Node *clause, double rows,
+				  double ndistinct, bool canwalk, double *pages, bool *walks)
+{
+	Node	   *bare = IsA(clause, RestrictInfo) ?
+		(Node *) ((RestrictInfo *) clause)->clause : clause;
+	NullTest   *isnull;
+	LionSetClause sc;
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		probes;
+	double		hits;
+	double		seqpages = 0;
+	double		probedpages = 0;
+	double		others;
+	double		nullpages;
+	Cost		cost;
+
+	*pages = 0;
+	*walks = false;
+	if (!IsA(bare, NullTest))
+		return 0.0;
+	isnull = (NullTest *) copyObject(bare);
+	isnull->nulltesttype = IS_NULL;
+	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, &sc);
+
+	/* the lookup, whichever way it is answered */
+	cost = sc.randompages * random_page_cost + sc.descent;
+	*pages = sc.randompages;
+	if (sc.members < 1.0 || rows < 1.0)
+		return cost;
+	others = Max(tuples - sc.members, 0.0);
+	nullpages = lion_null_entry_pages(sc.members, sc.containers, others);
+
+	if (canwalk)
+	{
+		double		entries = Max(1.0, Min(ndistinct, Max(others, 1.0)));
+		double		perentry = others / entries;
+		double		entrypages = lion_set_pages_for(perentry,
+													lion_containers_for(heap_pages,
+																		perentry));
+		double		walk = 1.0 + entries *
+			((entrypages * BLCKSZ <= (double) LION_DEFAULT_INLINE_LIMIT) ?
+			 entrypages : Max(1.0, entrypages));
+		double		windows = Max(1.0, ceil(sc.containers /
+										  (double) lion_walk_window()));
+
+		if (nullpages > 1.0 &&
+			walk * LION_NOTNULL_WALK_MARGIN * windows <= nullpages)
+		{
+			*walks = true;
+			*pages += walk * windows;
+			return cost + walk * windows * seq_page_cost +
+				entries * windows * LION_DESCENT_COST;
+		}
+	}
+
+	/* the NULL entry, in the form it takes, sought to the answer's keys */
+	probes = lion_containers_for(heap_pages, rows);
+	hits = Min(probes, sc.containers);
+	sc.pages = Min(sc.pages, nullpages);
+	cost += lion_cost_set_pages(root, rel, &sc, false, probes, &seqpages,
+								&probedpages, NULL);
+	*pages += probedpages;
+	cost += probes * LION_PROBE_COST +
+		hits * (LION_CONTAINER_COST +
+				LION_AND_MEMBER_COST * Min(rows / probes, LION_MEMBER_CAP));
+	return cost;
+}
+
+/*
  * Does an IN list's source take the disjoint-sum short-circuit of DESIGN.md
  * §15, and does it drive the groups?  Both questions are about the SHAPE of
  * the query and are answered here so that the price matches what the executor

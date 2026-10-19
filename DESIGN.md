@@ -713,10 +713,11 @@ SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does diffe
 1. Descend the directory with SHARE locks to the leaf that holds the search key's entry - the probe
    resolved once per scan key type, which is also how a cross-type key is handled (§21
    `lion_probe_init()`/`lion_probe_find()`) - holding one page at a time and moving right past a
-   concurrent split. `IS NULL` descends to the column's reserved NULL entry; `IS NOT NULL` and the
-   multi-key fallback walk the column's whole run of leaves instead, and a range the part of it
-   between its bounds (§28), copying each leaf into backend-local memory and releasing it before its
-   entries are emitted.
+   concurrent split. `IS NULL` descends to the column's reserved NULL entry; `IS NOT NULL` that
+   nothing else answers and the multi-key fallback walk the column's whole run of leaves instead
+   (beside quals that answer, `IS NOT NULL` is the NULL entry taken away, step 5), and a range the
+   part of it between its bounds (§28), copying each leaf into backend-local memory and releasing it
+   before its entries are emitted.
 2. On finding the entry: INLINE → copy the payload out, release the leaf, emit. CHAIN → copy the
    entry out and release the leaf BEFORE any posting page is pinned (the reader half of §11's
    deadlock rule), then descend the posting tree from `head` to its leftmost leaf and walk the leaves
@@ -742,8 +743,10 @@ SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does diffe
    their trees, a column's with each other exactly as with the other columns' (§24), so the bitmap
    holds the rows the quals select together (`lion_scan_choose()`). What is not a set tree is one
    WALK per column, taken only by a column without sets: its range (every range key of the column
-   at once, or an `op ANY (array)` with a range strategy, §28), else `IS NOT NULL`, which beside
-   anything that answers is dropped too. A range beside its column's sets is left out - the recheck
+   at once, or an `op ANY (array)` with a range strategy, §28), else `IS NOT NULL`, which is walked
+   only when nothing else answers: beside anything that answers, its column's NULL entry is taken
+   away from their answer, or its column walked beside them where that reads less - exact either
+   way (§14, "`IS NOT NULL` in the scans"). A range beside its column's sets is left out - the recheck
    tests it per row of the sets, where the walk would read every entry it holds - and so is a qual
    the sets cannot express (a multi-key query in mode ALL, §17); the scan then passes recheck =
    true to tbm_add_tuples() for every TID, so the bitmap heap scan re-applies the original quals.
@@ -754,7 +757,9 @@ SCAN (`lion_scan.c`, amgetbitmap; §29 says what the plain index scan does diffe
    the version before 2026-09-28, which answered ONE qual per column - the most selective-looking,
    ranked equality, list, range, null test - and left the others to the recheck: two overlaps on
    one array column read the sets of one and handed the heap every row of it to throw away (a
-   benchmark, 2026-09-28). `test/sql/samecolumn_scan.sql`.)*
+   benchmark, 2026-09-28). `test/sql/samecolumn_scan.sql`.)* *(Deviation, 2026-10-19: `IS NOT
+   NULL` beside anything that answers was dropped here too, and the heap handed every row of the
+   others' answer to test for a NULL; §14.)*
 
 VACUUM (`lion_vacuum.c`, ambulkdelete)
 1. Walk the directory leaves left to right from the leftmost one, each in the two passes §11 sets
@@ -3668,9 +3673,10 @@ without one as corruption (keylen 0 is not a legal key length).
 Build: the tuplesort's key column may be NULL (hash 0 for NULLs; both passes group by the isnull
 flag first, then by key). *(Since §24 "Build" there is no sort: a NULL row's code is appended to the
 column's reserved NULL entry directly.)* Insert: NULL → the null entry (created on first use). Scan:
-`amsearchnulls = true`; SK_SEARCHNULL returns the null entry's set; SK_SEARCHNOTNULL returns every
-other entry (a full walk of the index, correct but expensive; the cost model prices it as the whole
-index). Stats gain `null_tids`. verify checks there is at most one null entry, that it is in bucket
+`amsearchnulls = true`; SK_SEARCHNULL returns the null entry's set; SK_SEARCHNOTNULL alone returns
+every other entry (a full walk of the index, correct but expensive; the cost model prices it as the
+whole index), and beside other quals takes the null entry away from their answer ("`IS NOT NULL` in
+the scans", below). Stats gain `null_tids`. verify checks there is at most one null entry, that it is in bucket
 0 with keylen 0, and that no entry carries unknown flag bits.
 
 Count pushdown as built. The second and third bullets deviate from the sketch this section started
@@ -3696,6 +3702,91 @@ as, both to keep the buffer-pin budget of §9 bounded:
 - count(col) is answered when col is declared NOT NULL, or is the group column (count(*) for a real
   group, 0 for the NULL group), or a clause pins it with a strict operator or `IS NOT NULL`
   (count(*)), or a clause says `col IS NULL` (0). The attnotnull requirement of §10 is gone.
+
+### `IS NOT NULL` in the scans (2026-10-19)
+
+Every lion scan builds its rows from its quals the same way (§5 SCAN step 5, §29.2,
+`lion_scan_choose()`): the bitmap scan (`lion_getbitmap_choice()`: `lion_emit_columns()`, or
+`lion_emit_intersect()` beside a range), the plain scan's source (`lion_source_build()`, §29.3),
+and LionOrdered's and LionBtreeScan's sets, which are built from that source (`lion_source_open()`,
+§30.4) or probed lazily (`lo_probe_node()`). Until this date `col IS NOT NULL` was ANSWERED by them
+only when nothing else answered - a walk of every entry of its column but the NULL one - and beside
+anything that did it was DROPPED (`lion_scan_col_tree()` had no tree for it; `lion_source_build()`
+set the recheck "next to anything that answers"; `lo_lazy_ok()` refused it): the bitmap heap scan
+rechecked every row of the others' answer, the plain scan set `xs_recheck`, and the sets of §30 and
+§40 were reported inexact, so that the index-only walk fetched every candidate's heap tuple to
+recheck it. Beside a strict qual of its own column it was, and is, IMPLIED, neither answered nor
+rechecked: the strict qual never selects a NULL. On a private workload's shape - about 3M rows, a
+lion index on four columns, three equalities and `IS NOT NULL` on a column NULL on half the rows
+with 50,000 values, read by LionOrdered's index-only walk of a covering btree under a merge
+anti-join - the set was rechecked: 1,414,286 heap fetches for 705,998 rows, 708,288 of them thrown
+away by the recheck, 1.58M buffers, 5.4 s cold and 0.6 to 1.4 s warm. Now the set is exact: no
+heap fetch, 154k buffers, 0.9 s on the first run after a restart and 0.11 to 0.13 s warm.
+
+The count pushdown answered it exactly all along, as a NEGATED source (above), and the scans now
+do the same. Every row the index holds is under exactly one of a column's NULL entry and its other
+entries, so a row of the other quals' answer has a value in the column exactly when the NULL entry
+does not hold it: `IS NOT NULL` beside them is their answer LESS the NULL entry. A node of the
+shared evaluator, `LION_KN_ANDNOT` (lion_expr.c), is its first child's members less every other
+child's. Over the AND of the other quals' trees and the NULL entries of every `IS NOT NULL` column
+(`lion_scan_and()`), it seeks each NULL entry forward to the container key the AND stands at and
+takes it out there (`lion_container_andnot_raw()`), so a NULL entry is read only where the answer
+has rows, as a leapfrog's other sources are (§22), and a key left empty is passed over. Only the
+first child stands at the keys the node hands out, so its pin is the node's (§9) and the others,
+subtracted raw, keep theirs only within the budget. The node is the scans' (the count keeps its
+negated sources) and sits at the top of a tree: over the SETS' AND and the entry-by-entry WALK's,
+over a WINDOW's rest and each LIST batch's (§29.3), over the bitmap scan's intersection, batched or
+not, and over a lone range's collected union. A UNION (§29.3) takes the OR of the NULL entries as
+one stream sought forward to each container key it hands out (`lion_source_union_next()`).
+LionOrdered's lazy set (§30.4) takes `IS NOT NULL` as a NEGATED probe key: the leaf's other keys
+are ANDed at the probed key and the NULL entries taken out of that; a leaf of nothing but `IS NOT
+NULL` keys is built, not lazy, having nothing to take them out of.
+
+Alone, the first `IS NOT NULL` is walked - every entry of its column but the NULL one, a multi-key
+column's as a UNION - and the NULL entries of any others are taken away from that walk. The
+bitmap scan walks a lone one itself (`lion_emit_all_keys()`) and runs the plain scan's source into
+the bitmap for more than one, or for one beside quals none of which the sets express
+(`lion_emit_source()`).
+
+**Multi-key columns.** A multi-key column keeps a NULL value in its NULL entry and a value with no
+key - an empty array, an empty tsvector, `'{}'::jsonb` - in its EMPTY entry (§17); the two are
+mutually exclusive, and every other row is under its keys. `IS NOT NULL` is true of an empty value,
+so it is every row the index holds but the NULL entry's, as for a scalar column: the same
+subtraction, and the EMPTY entry is no part of it. Alone, it is the UNION of every entry but the NULL
+one, the EMPTY entry included, which is now exact: the UNION had been rechecked for the mode-ALL
+queries it also reads (§17), and now is only for those.
+
+**Walking instead** (`lion_scan_notnull_walks()`). Where a column is mostly NULL with a few values,
+walking its other entries beside the other quals' sets - as a range is walked, an unbounded one -
+reads less of the index than its NULL entry, and the scan walks: on a scalar column (a multi-key
+column's walk would repeat rows), beside sets, with no range or long list already taking the walk's
+place, when the walk - a descent, the column's directory leaves, an INLINE entry being its share of
+one and a CHAIN entry its posting pages, once per window (§29.3) - reads `LION_NOTNULL_WALK_MARGIN`
+(2) times less than the NULL entry. The NULL entry's pages are those of the form it takes
+(`lion_null_entry_pages()`): the model the scans size sets by, two bytes a member and a bitset at
+most, prices a NULL entry that holds nearly every row at its keys - the one worth walking past - as
+the bitsets it is not; it is RUNs, a run a heap block and one more for each other row there, or a
+NARROW as wide as a block's rows (§38). A column NULL on 29 rows in 30 at 44 rows a block takes
+520 bytes a container, not 4104, and the first cut, which priced it as bitsets, walked its three
+values beside `b = 5` over 60,000 rows and read 11 index buffers where taking the NULL entry away
+reads 7 (9 with the choice's own lookup). The other rows are the index's `reltuples` less the NULL
+entry's; an index without `reltuples` is held to the bitset bound. The choice reads the directory
+alone - the NULL entry's header, and the column's leaves only when the NULL entry is large enough
+for a walk to win at all - and says what it chose at DEBUG1. A walk pays on a large heap: a heap of
+72 container keys (36 MB at fillfactor 10), its column NULL on 399 rows in 400 and its two values
+INLINE, walks.
+
+**Concurrency.** Under an MVCC snapshot a NULL entry read at another moment than the sets it is
+taken from changes nothing (§9): a row whose insert the snapshot sees is in every entry it belongs
+to, and a row it does not see is not returned whichever entry holds it. A non-MVCC scan (§29.5)
+could meet a row being inserted in the other quals' entries before its insert reaches the NULL
+entry, so such a scan with a NULL entry to take away sets `xs_recheck`.
+
+**Pricing.** `lioncostestimate()` charges the subtraction, or the walk, as the scan chooses it
+(`lion_cost_notnull()`, §29.11), and no longer marks the plain scan rechecked for it. §40.3's
+index-only walk prices the quals its set still leaves to the recheck as the heap fetches they cause.
+
+Tests: `test/sql/scan_notnull.sql` (§29.12).
 
 ## 15. IN lists and ScalarArrayOp (v1, implemented)
 
@@ -4979,6 +5070,12 @@ entry but the NULL one - the EMPTY entry included - with recheck = true (`lion_e
 is the function `IS NOT NULL` already used); KEYS locates one posting set per key and hands the tree
 to the shared evaluator, emitting the result containers with recheck = false.
 
+`col IS NOT NULL` on a multi-key column is NOT a query of the opclass: an empty array or tsvector,
+whose row is in the EMPTY entry, is not NULL, so the rows it selects are every row the index holds
+but the NULL entry's, as on a scalar column (§14, "`IS NOT NULL` in the scans", 2026-10-19): the
+NULL entry taken away from the other quals' answer, or alone the union of every other entry, the
+EMPTY one included - exact either way.
+
 **The scan reuses the count cursors.**  `lion_sets_iterate()` (lion_expr.c) walks
 (tree over located posting sets) in ascending container-key order and calls back per container; the
 scan's callback is `lion_container_to_tbm()`.  The alternative - one TIDBitmap per key combined with
@@ -5005,7 +5102,8 @@ phrase form **68.6 against 31.8**. So `lioncostestimate` now asks, before callin
   rechecked - or when it is walked for `IS NOT NULL`, and the first column decides when no column
   selects (the ranking of ONE qual per column, a plain operator first, went with the scan that
   answered one);
-- `col IS NOT NULL` walks every entry (§14), and so does a multi-key query the extraction above
+- `col IS NOT NULL` with nothing else to answer walks every entry (§14; beside quals that answer
+  it is the NULL entry taken away from their answer), and so does a multi-key query the extraction above
   answers with LION_QMODE_ALL - which it is asked at plan time, with the clause's own strategy, the
   same way the count pushdown asks;
 - a multi-key query whose value is not a plan-time Const is costed as ALL, because the MODE follows
@@ -13987,9 +14085,11 @@ Both entry points begin with the same choice of the quals to answer (§5 SCAN st
 `lion_scan_choose()`: EVERY set qual of every key column - an equality, a list, `IS NULL`, a
 multi-key query - is a set tree, all of them ANDed, several of one column as well as those of
 several columns; a column without one is WALKED, for its range (all its range keys at once, or
-`op ANY (array)` with a range strategy) or else its `IS NOT NULL`. A range beside its column's sets
-is left to the heap recheck, `IS NOT NULL` beside a strict qual of its column is implied by it, and
-`IS NULL` beside either selects nothing. The set trees (`lion_scan_col_tree()`: an equality is a
+`op ANY (array)` with a range strategy) or else its `IS NOT NULL` - which beside anything that
+answers is no walk but its column's NULL entry taken away from the answer, or its column walked
+where that reads less (§14, "`IS NOT NULL` in the scans"). A range beside its column's sets is left
+to the heap recheck, `IS NOT NULL` beside a strict qual of its column is implied by it, and `IS
+NULL` beside either selects nothing. The set trees (`lion_scan_col_tree()`: an equality is a
 leaf, an IN list an OR over its located sets, `IS NULL` the reserved NULL entry, a multi-key query
 its extracted tree, §17) are built by the same function for both paths. What differs is only how
 the answer is delivered: into a TIDBitmap, or as a stream the executor pulls one TID at a time.
@@ -14012,7 +14112,8 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   IN list is the OR of its sets - a union by container key - so the TIDs come out in HEAP order,
   each exactly once, and the heap is visited in physical order, one pass.
   Equality, IN, `IS NULL`, multicolumn ANDs, several quals of one column and multi-key queries
-  (arrays, tsvector) in mode KEYS all take this shape.
+  (arrays, tsvector) in mode KEYS all take this shape, and `IS NOT NULL` beside them: the NULL
+  entries of its columns taken away from the AND by an AND-NOT node over it (§14).
 - **WALK**: one scalar column is walked for its range (§28, including `op ANY (array)`), an
   `IS NOT NULL` that nothing else answers, or the scan has no key at all (a partial index whose
   predicate the query implies, §24, which walks column 1 with its NULL entry). The column's
@@ -14030,9 +14131,11 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   window of the others, the second ANDed with that - is not one stream. An `op ANY (array)` range
   walks to the widest element (§28) when the column orders the elements; an UNORDERED column walks
   ONCE, testing each entry against every element's range (the bitmap path walks once per element
-  and lets the bitmap absorb the overlap, which a stream cannot). `IS NOT NULL` next to any column
-  that answers - a set tree, a range, a long list - is dropped and rechecked, as the bitmap path
-  drops it; it walks only alone.
+  and lets the bitmap absorb the overlap, which a stream cannot). `IS NOT NULL` walks only alone,
+  the NULL entries of any other `IS NOT NULL` columns taken away from each walked entry; next to
+  anything that answers - a set tree, a range, a long list - its NULL entry is taken away from that
+  answer instead, or, beside sets alone, its column is walked as a range is when that reads less
+  (§14). *(Until 2026-10-19 it was dropped there and rechecked, as the bitmap path dropped it.)*
   *(Deviation from this section's first version, where `IS NOT NULL` always drove a walk: every
   entry of its column ANDed with the other columns' stream - `a IS NOT NULL AND b = 5` over a
   million unique `a` took 4.37M buffer hits and 1.8 s against the bitmap scan's 19 ms, while the
@@ -14074,11 +14177,15 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   much larger table did not finish in 60 s (2026-09-27): an always-true range over about two
   thousand keys beside four sets. `test/sql/plaincost.sql` §3.)*
 - **LIST**: an IN list on a scalar column longer than a batch (§29.4) is located and streamed a
-  batch at a time, each batch the SETS shape with the other columns' trees ANDed in. It outranks a
-  walk, which is then left to the recheck, and a second long list is left to the recheck too.
+  batch at a time, each batch the SETS shape with the other columns' trees ANDed in and the NULL
+  entries of `IS NOT NULL` columns taken away. It outranks a walk, which is then left to the
+  recheck, and a second long list is left to the recheck too.
 - **UNION**: a MULTI-KEY column would have to be read whole - `IS NOT NULL`, a query in mode ALL
-  (§17) with nothing else expressible, or a no-key scan whose first column is multi-key. A row is
-  under several entries of such a column, so walking them would return it several times. The
+  (§17) with nothing else expressible, or a no-key scan whose first column is multi-key - or a
+  scalar column's walk, a range or a lone `IS NOT NULL`, is long beside nothing but the NULL
+  entries of `IS NOT NULL` columns, which it would restart for each entry (2026-10-19): the
+  union of the entries the walk selects, its ranges applied. A row is
+  under several entries of a multi-key column, so walking them would return it several times. The
   scan streams the exact UNION of the column's entries instead, a WINDOW of container keys at a
   time: every entry is sought to the window's first key and read to its end, and ORed into one
   bitset image per container key of the window; the next window starts at the smallest key any
@@ -14090,7 +14197,11 @@ A plain scan is a *source* of TIDs, opened on the scan keys at the first `amgett
   which with the WINDOW's is where this scan may exceed a tiny `work_mem`. The floor is a
   setting so that the regression suite can cross window boundaries on a table of a few megabytes
   (`test/sql/indexscan.sql` §10 and §11 lower it to 64 kB: 16 keys, or 8 containers); it is a
-  testing knob more than a tuning one. Always rechecked (the quals of mode ALL need it). Correct
+  testing knob more than a tuning one. The NULL entries of `IS NOT NULL` columns beside it are one
+  stream, sought forward to each container key the union hands out and taken away there (§14).
+  Rechecked for a query in mode ALL, which needs it, and for a scan that keeps its pins (§29.5),
+  which reads copies; exact otherwise. *(Always rechecked until 2026-10-19, when `IS NOT NULL` on
+  a multi-key column, which the UNION answers exactly, became an answered qual.)* Correct
   and expensive, which is what the cost model already says about these quals;
   `lioncostestimate()` also charges each window past the first another read of the index (the
   IndexPath is shared with the bitmap scan, which is overcharged by that, only on a heap past
@@ -14338,8 +14449,9 @@ Then `xs_recheck` is set, for every TID of the scan, when any of these holds; ot
 are exact:
 
 - a qual was not answered: a range beside its column's sets (§29.2), a second WALK column or long
-  list, a multi-key column in mode ALL or an `IS NOT NULL` next to another column that does answer
-  (dropped, as in the bitmap path; `IS NOT NULL` is then the recheck of a null test per row);
+  list, or a multi-key column in mode ALL (dropped, as in the bitmap path). `IS NOT NULL` is
+  always answered (§14); until 2026-10-19 one next to another column that answered was dropped
+  here and rechecked;
 - a MULTI-KEY column's query in mode ALL (strategies 2 .. 5, §17: a prefix, a NOT, weights, a NULL
   key, INCLUDE_EMPTY, `<@`, too many keys): every row, rechecked. A query in mode KEYS is exact on
   the plain path as it is on the bitmap path, which has always passed it through unrechecked: both
@@ -14351,11 +14463,12 @@ are exact:
   per fetched row costs nothing next to the fetch. §40's index-only mode broke that ground: a set
   reported inexact made the node fetch every member's heap tuple for the recheck, for a filter the
   index had answered exactly.)*
-- the UNION shape (§29.3), always;
-- a non-MVCC scan with a NOPIN set (§29.5).
+- the UNION shape (§29.3) for a query in mode ALL, or in a scan that keeps its pins;
+- a non-MVCC scan with a NOPIN set (§29.5), or with a NULL entry to take away (§14).
 
 A range is exact (the walk applies every bound of the column, as a WALK or a WINDOW), an IN list
-is exact (a union of whole entries), `IS NULL` and a walked `IS NOT NULL` are exact, and so is a
+is exact (a union of whole entries), `IS NULL` is exact, `IS NOT NULL` walked or its NULL entry
+taken away is exact, and so is a
 cross-type or binary-coerced equality (§21's probe). A collation the index cannot answer never
 reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
 
@@ -15470,6 +15583,25 @@ On that million-row table with nothing disabled: the 2000-, 200000- and 400000-r
 a smaller table and shows the plain scan reading within twice the bitmap scan's buffers, where it
 read 36 to 390 times as many.
 
+**`IS NOT NULL` beside quals that answer** (2026-10-19, `lion_cost_notnull()`,
+`lion_cost_notnull_quals()`). Taken away rather than dropped (§14), it reads its column's NULL
+entry, and `genericcostestimate()`, which prorates the index by the selectivity of every qual
+together, prices what the scan returns and none of that. Each `IS NOT NULL` beside quals that
+answer is now charged its lookup (a directory leaf and a descent, as `IS NULL` locates it) and the
+NULL entry sought to the container keys of the others' answer - `rel->tuples` times the path's
+selectivity without the `IS NOT NULL` quals' - as an AND's other sources are sought: the posting
+pages those seeks reach, of the entry in the form it takes (`lion_null_entry_pages()`), a probe
+each, and the answer's members taken out at each key the entry has. Or, where the executor's
+choice would walk the column (`lion_scan_notnull_walks()`: a scalar column, beside sets with no
+range or long list), the walk, made from the statistics as the executor makes it from the
+directory: the NULL entry from the null fraction, the walk from the column's `ndistinct` entries
+of the other rows, an entry small enough to be INLINE (`LION_DEFAULT_INLINE_LIMIT`) its bytes of
+the leaves and any other its pages, once per window. A lone `IS NOT NULL` walks its column, which
+the full walk's price already covers. The plain scan no longer counts as rechecking for it
+(`lion_plain_scan_shape()`), and `lion_path_rechecked_quals()` names what a plain scan's source
+does leave to the recheck, for §40.3. `indexscan.sql`'s plan pins, `a IS NOT NULL AND b = 5`'s
+plain scan among them, are unchanged.
+
 **One process against several** (2026-09-28). Pricing a scan in heap order as the bitmap heap scan
 of the same pages compares one process with one process. A benchmark found the planner taking the
 plain scan where the other side was a PARALLEL bitmap heap scan: large results from a large table,
@@ -15556,8 +15688,9 @@ set by the test, and long lists with duplicates, NULLs, citext spellings, a rang
 column beside them, at 32 values a batch; a multi-key union across windows at the least
 `pg_lion.scan_window_floor`; ranges and `IS NOT NULL` beside other columns' sets (§11: one-row
 INLINE entries, sparse segments and posting trees walked in WINDOWs, one window and several,
-`< ANY`, a short walk, empty sides, a dropped `IS NOT NULL` with the rows its recheck removes, a
-dirty heap and after VACUUM), the plain scan's buffers within twice the bitmap scan's, the window's
+`< ANY`, a short walk, empty sides, an `IS NOT NULL` whose NULL entry is taken away - until
+2026-10-19 a dropped one with the rows its recheck removed - a dirty heap and after VACUUM), the
+plain scan's buffers within twice the bitmap scan's, the window's
 memory, and three plan choices; index-only scans of no-column queries (a column's walk, a
 partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
 exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
@@ -15630,6 +15763,24 @@ queries with two set quals on one column - now charged their merge on a one-colu
 (`lion_set_merge_cost()`; `lion_cost_set_and()` since, §29.11) - force their scan or are counts,
 which the dearer scan leaves to the pushdown, and the qual evaluation per row a plain scan saves
 on an implied `IS NOT NULL` is far below any margin a pinned plan has.
+
+`test/sql/scan_notnull.sql` (2026-10-19, §14 "`IS NOT NULL` in the scans") runs 26 queries,
+each through the bitmap scan, the plain scan and LionBtreeScan or LionOrdered over a covering
+btree (index-only), against a sequential scan's answer, on 60,000 rows: `IS NOT NULL` beside an
+equality, an IN list, a range and a range beside an equality; two and three of them beside a set
+and alone; on a column without NULLs; implied by an IN list of its own column and contradicted by
+`IS NULL`; as `<> ANY` of two values (§35); on a column NULL on 29 rows in 30; on three multi-key
+columns (`text[]`, `tsvector`, `jsonb`), each with NULL and empty values, beside a scalar equality
+and a multi-key query, two and three alone, and beside a mode-ALL `<@`, the one qual still
+rechecked. Every answer is the sequential scan's, no recheck removes a row but the mode-ALL query's,
+and every node's set is exact. Then LionOrdered in heap mode and under LIMITs (the lazy set), lists
+longer than a batch at 64 kB of work_mem, windows at the least `pg_lion.scan_window_floor`, the
+walk-or-subtract choice at DEBUG1 - the 60,000-row table's columns subtract, a heap of 72
+container keys whose column is NULL on 399 rows in 400 walks, both through every scan - three
+plans with nothing disabled, a dirty heap (rows moved into and out of NULL entries and EMPTY
+entries, rows deleted), the same after VACUUM, and EXPLAIN ANALYZE of a heap-mode and an
+index-only node: exact sets, the index-only one fetching no heap row. `indexscan.sql`'s `a IS NOT
+NULL AND b = 5` no longer reports rows removed by its recheck.
 
 `test/sql/isectprobe.sql` (2026-09-28, §29.11 "One price for the AND of sets" and "Correlated
 sets"), on 100,000 rows in 50 hidden groups that take turns row by row, sampled whole so the
@@ -16055,7 +16206,9 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
 - **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
   sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
   finds its rows in the first few hundred container keys needs the set at those keys only. When
-  every leaf's keys are set trees (an equality or a list on a scalar column: `lo_lazy_ok()`; a
+  every leaf's keys are set trees (an equality or a list on a scalar column, and beside one any
+  column's `IS NOT NULL`, whose NULL entry the probe takes away from the leaf's AND, §14 - since
+  2026-10-19: `lo_lazy_ok()`; a
   range is a walk of entries, a multi-key query may need every row, and a list longer than a
   plain scan opens at once, `lion_scan_list_batch()`, is read a batch at a time - a stream holds
   a cursor for each of its sets), the set is LAZY instead: each leaf key's
@@ -20013,7 +20166,16 @@ scan over it where only the wide `(k) INCLUDE (...)` B-tree covers the columns, 
 index's own scan for a filter of three in a thousand (§40.7, "the plan choice"). The recheck
 from the heap (§40.4) is not priced: an inexact source is not knowable at plan
 time, and the fetches it costs are bounded by the members - the bound heap mode pays for every
-member. The planner also hands the executor the entries the walk is expected to visit,
+member. *(Since 2026-10-19 a qual the set leaves to the recheck at PLAN time is priced: the lion
+access's IndexPaths are asked what a plain scan's source of them leaves (`lo_rechecked_quals()`,
+`lion_path_rechecked_quals()`; a BitmapOr's arms are not followed), the set's members become the
+CANDIDATES, the rows of the quals it does answer, and every candidate the walk meets is charged
+its recheck and - in heap mode, and index-only when the btree does not return a column the lion
+qual reads (`LO_FLAG_HEAPRECHECK`) - its heap fetch, all-visible or not, since the recheck reads
+the tuple before the visibility map is asked. `IS NOT NULL` used to be such a qual (§14): priced
+by its members, such a set chose an index-only walk that fetched 1.41M heap rows to throw half of
+them away. A set made lossy by a lossy qual at run time stays unpriced.)* The planner also hands
+the executor the entries the walk is expected to visit,
 `indexselectivity × rel->tuples`, for the switch's density gate (§40.4; `LO_PRIV_EXPECTED`, a
 float8 Const in `custom_private`, 0 when the ordered path is a lion column's walk).
 
@@ -20233,8 +20395,9 @@ with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `ta
   far end, under a LIMIT the early ones do not satisfy (a residual filter removes them, say), keep
   `distinct` at the uniform rate while the walk crosses the empty middle, so the gate never opens
   and the walk goes to the end where heap mode's rule would have switched.
-- **The recheck from the heap is unpriced** (§40.3): an inexact source is unknown at plan
-  time; its fetches are bounded by the members, every one of which heap mode fetches.
+- **The recheck from the heap is unpriced** (§40.3) for a source made inexact at run time (a
+  lossy qual, a non-MVCC snapshot); its fetches are bounded by the members, every one of which
+  heap mode fetches. A qual the set leaves to the recheck at plan time is priced since 2026-10-19.
 - **Pending CI on 20.** `index_beginscan()`'s third argument and the `IndexScanDesc` fields the
   index-only walk reads (`xs_want_itup`, `xs_itup`, `xs_itupdesc`, `xs_hitup`) are taken as 16 to
   19 have them; an index-only walk whose `xs_want_itup` went unhonoured errors with "no index
