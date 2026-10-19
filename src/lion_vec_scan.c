@@ -86,7 +86,11 @@
  * pg_lion.vector_exact_per_partition members a partition if that is more
  * (lionvec_exact_limit()), computes every member's distance from the heap
  * and returns them in order (lv_exact()); of more, it does all of the above
- * over the members alone.
+ * over the members alone.  A scan under a filter instead (LionOrdered's
+ * other flavour, lion_vec_restrict_filter(), §44.6) probes as an unfiltered
+ * scan does, and tests each row's heap tuple where it fetches its exact
+ * distance, dropping one that fails there, never returned; its walks test
+ * each row they would return.
  *
  *-------------------------------------------------------------------------
  */
@@ -350,6 +354,17 @@ typedef struct LvScanOpaque
 	LionContainer *const *rconts;
 	int			rpos;			/* the last key found */
 
+	/*
+	 * ... or a filter, tested on the heap tuple of each row fetched for its
+	 * exact distance or returned by a walk (lion_vec_restrict_filter();
+	 * DESIGN.md §44.6, "Filter at the fetch"); NULL for none
+	 */
+	ExprState  *filter;
+	ExprContext *fcxt;
+	double		fmembers;		/* the rows the planner expects it to keep */
+	double		ffrac;			/* ... their share of its rows (lv_start()) */
+	int64		nfilteredall;	/* rows it removed, in every scan (EXPLAIN) */
+
 	/* the queues, and the probes' bookkeeping */
 	LvHeap		rows;
 	LvHeap		parts;
@@ -492,6 +507,7 @@ typedef struct LvScanOpaque
 	int64		nplacefail;		/* ... and reads by place that fell back */
 	int64		nlocpages;		/* LOC pages read */
 	int64		nchecked;		/* rows read by place checked at return */
+	int64		nfiltered;		/* rows the filter removed */
 } LvScanOpaque;
 
 /* ----------------------------------------------------------------
@@ -1154,6 +1170,8 @@ lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 		elog(ERROR, "lionvec: a parallel scan is restricted");
 	if (n < 0 || (n > 0 && (keys == NULL || conts == NULL)))
 		elog(ERROR, "lionvec: malformed restriction");
+	if (so->filter != NULL)
+		elog(ERROR, "lionvec: a scan is restricted to a set and a filter");
 	/* lv_key_search() bisects: one pass over the keys is cheap next to a scan */
 	for (i = 1; i < n; i++)
 	{
@@ -1165,6 +1183,50 @@ lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 	so->rkeys = keys;
 	so->rconts = conts;
 	so->rpos = 0;
+}
+
+/*
+ * The filter's restriction (lion_vec.h; DESIGN.md §44.6, "Filter at the
+ * fetch"): no set, so no CODE page is skipped and every row a probe reads
+ * is estimated, and a row is a member once its heap tuple passes the
+ * filter, at its exact distance's fetch (lv_fetch_distance()) or as a walk
+ * returns it (lv_walk_filter()).  Never the exact path (lv_start()), which
+ * needs the members' list.
+ */
+void
+lion_vec_restrict_filter(IndexScanDesc scan, ExprState *filter,
+						 ExprContext *econtext, double members)
+{
+	LvScanOpaque *so;
+
+	if (!lion_vec_relation(scan->indexRelation))
+		elog(ERROR, "lionvec: \"%s\" is not a lionvec index",
+			 RelationGetRelationName(scan->indexRelation));
+	so = (LvScanOpaque *) scan->opaque;
+	if (so->phase != LV_START)
+		elog(ERROR, "lionvec: a scan is restricted after it has started");
+	/* LionOrdered, which alone restricts a scan, runs it serially (§44.6) */
+	Assert(scan->parallel_scan == NULL);
+	if (scan->parallel_scan != NULL)
+		elog(ERROR, "lionvec: a parallel scan is restricted");
+	if (filter == NULL || econtext == NULL)
+		elog(ERROR, "lionvec: malformed restriction");
+	if (so->restricted)
+		elog(ERROR, "lionvec: a scan is restricted to a set and a filter");
+	if (isnan(members) || members < 0.0)
+		elog(ERROR, "lionvec: malformed restriction");
+	so->filter = filter;
+	so->fcxt = econtext;
+	so->fmembers = members;
+}
+
+int64
+lion_vec_filter_removed(IndexScanDesc scan)
+{
+	if (!lion_vec_relation(scan->indexRelation))
+		elog(ERROR, "lionvec: \"%s\" is not a lionvec index",
+			 RelationGetRelationName(scan->indexRelation));
+	return ((LvScanOpaque *) scan->opaque)->nfilteredall;
 }
 
 /*
@@ -1286,6 +1348,7 @@ lionvecbeginscan(Relation index, int nkeys, int norderbys)
 									 ALLOCSET_DEFAULT_SIZES);
 	so->phase = LV_START;
 	so->limit = -1;
+	so->ffrac = 1.0;
 	so->wtids = MemoryContextAlloc(cxt, sizeof(ItemPointerData) * MaxOffsetNumber);
 	scan->opaque = so;
 	if (norderbys > 0)
@@ -1310,7 +1373,8 @@ lionvecbeginscan(Relation index, int nkeys, int norderbys)
  * sending its own line ("A parallel scan").  A scan that read vectors by
  * their places in TOAST (DESIGN.md §44.13) names how many, the LOC pages it
  * read for them, the reads that fell back to the heap, and the TOAST pages
- * it asked for.
+ * it asked for.  A scan under a filter (lion_vec_restrict_filter()) names
+ * the rows the filter removed.
  */
 static void
 lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
@@ -1355,6 +1419,9 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 				 ", " INT64_FORMAT " TOAST pages prefetched (" INT64_FORMAT
 				 " not in shared buffers)",
 				 so->task.nasked, so->task.nmissing);
+	if (so->filter != NULL)
+		snprintf(more + strlen(more), sizeof(more) - strlen(more),
+				 ", " INT64_FORMAT " removed by the filter", so->nfiltered);
 	if (so->npasses > 0)
 		elog(DEBUG1, "lionvec scan of \"%s\": " INT64_FORMAT " partitions probed, "
 			 INT64_FORMAT " passes, " INT64_FORMAT " candidates, "
@@ -1381,6 +1448,7 @@ lv_debug_stats(IndexScanDesc scan, LvScanOpaque *so)
 	so->npauses = so->ncopies = 0;
 	so->nclaimed = so->ntaken = 0;
 	so->nplaced = so->nplacefail = so->nlocpages = so->nchecked = 0;
+	so->nfiltered = 0;
 	so->iask.nasked = so->iask.nmissing = 0;
 	so->hask.nasked = so->hask.nmissing = 0;
 	so->task.nasked = so->task.nmissing = 0;
@@ -1410,6 +1478,10 @@ lionvecrescan(IndexScanDesc scan, ScanKey keys, int nkeys, ScanKey orderbys,
 	so->rn = 0;
 	so->rkeys = NULL;
 	so->rconts = NULL;
+	so->filter = NULL;
+	so->fcxt = NULL;
+	so->fmembers = 0.0;
+	so->ffrac = 1.0;
 	memset(&so->rows, 0, sizeof(LvHeap));
 	memset(&so->parts, 0, sizeof(LvHeap));
 	so->phead = NULL;
@@ -1564,11 +1636,40 @@ lv_slot_distance(IndexScanDesc scan, LvScanOpaque *so, double *dist)
 }
 
 /*
+ * Does the row in so->slot, the version of it the scan sees, pass the
+ * scan's filter (lion_vec_restrict_filter())?  Counted when it does not.
+ * The slot is the caller's to clear.  The filter's ExprContext is the
+ * node's, which reads its Params through it, so its scan tuple is put back
+ * as it was.
+ */
+static bool
+lv_filter_ok(LvScanOpaque *so)
+{
+	ExprContext *econtext = so->fcxt;
+	TupleTableSlot *save = econtext->ecxt_scantuple;
+	bool		ok;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = so->slot;
+	ok = ExecQual(so->filter, econtext);
+	econtext->ecxt_scantuple = save;
+	if (!ok)
+	{
+		so->nfiltered++;
+		so->nfilteredall++;
+	}
+	return ok;
+}
+
+/*
  * The distance of the row from the heap, with the operator's own function,
  * so that it is exactly the distance the query's ORDER BY computes; false if
  * no version of the row is visible to the scan's snapshot.  Every version of
  * a HOT chain has the same vector, as the index's column is not one a HOT
- * update can change.
+ * update can change.  Under a filter, false too for a row whose visible
+ * version fails it: a row that is not a member, found where its tuple is in
+ * hand anyway, and dropped as a set drops its non-members (DESIGN.md §44.6,
+ * "Filter at the fetch").
  */
 static bool
 lv_fetch_distance(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
@@ -1579,7 +1680,31 @@ lv_fetch_distance(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
 	so->nfetched++;
 	if (!found)
 		return false;
+	if (so->filter != NULL && !lv_filter_ok(so))
+	{
+		ExecClearTuple(so->slot);
+		return false;
+	}
 	return lv_slot_distance(scan, so, dist);
+}
+
+/*
+ * A walk's row under a filter: returned only if a version of it is visible
+ * and passes the filter.  A restricted walk hands out its members' TIDs
+ * unread and the node skips one not visible; here the tuple is read to be
+ * tested, and one not visible is skipped at once.
+ */
+static bool
+lv_walk_filter(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid)
+{
+	bool		ok;
+
+	so->nfetched++;
+	if (!lv_heap_fetch(scan, so, tid))
+		return false;
+	ok = lv_filter_ok(so);
+	ExecClearTuple(so->slot);
+	return ok;
 }
 
 /* ----------------------------------------------------------------
@@ -1701,6 +1826,10 @@ lv_check_placed(IndexScanDesc scan, LvScanOpaque *so, ItemPointer tid,
  * relation is opened once, locked as a detoast locks it, which keeps it
  * from being truncated or rewritten while the transaction lasts, so its
  * blocks counted now bound every place read.
+ * A scan under a filter reads none by place: the rows it reranks are each
+ * fetched from the heap for the filter's test, and their vectors come with
+ * the tuple, as the heap path detoasts them (lv_fetch_distance()); and it
+ * has no exact path.
  */
 static void
 lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
@@ -1714,7 +1843,7 @@ lv_start_toast(IndexScanDesc scan, LvScanOpaque *so)
 	so->tpf = 0;
 	so->ttried = so->tfailed = 0;
 	lion_ask_reset(&so->task);
-	if (!lionvec_toast_direct ||
+	if (!lionvec_toast_direct || so->filter != NULL ||
 		(so->meta.flags & LIONVEC_META_LOCATOR) == 0 ||
 		heap == NULL || heap->rd_tableam != GetHeapamTableAmRoutine() ||
 		!OidIsValid(heap->rd_rel->reltoastrelid) ||
@@ -2666,6 +2795,15 @@ lv_margin(LvScanOpaque *so)
  * L's 100, and members come a few to a partition, so the same patience
  * took DBpedia's 1% filter from 0.969 of the ten nearest to 0.939 at the
  * default margin; twice it, 0.961, with 368 partitions probed against 530.
+ *
+ * Under a filter (lion_vec_restrict_filter()) the probes cannot tell the
+ * members, and score every row: `members` is the index's rows, and the unit
+ * LV_PATIENCE_RESTRICTED times the unfiltered one, sqrt(n) rows.  The
+ * restricted scan's unit is 2 members / (2 sqrt(n)) members, counted among
+ * members only; among rows, of which a share sel = members / n are members,
+ * that is 2 members / (2 sqrt(n)) / sel = sqrt(n) rows.  So the same
+ * patience pauses after the same rows scored in expectation, with no
+ * estimate of the members (2026-10-18).
  */
 #define LV_PATIENCE_RESTRICTED	2.0
 
@@ -2676,7 +2814,7 @@ lv_patience_unit(const LvScanOpaque *so, double members)
 
 	if (so->spill)
 		members *= 2.0;
-	if (so->restricted)
+	if (so->restricted || so->filter != NULL)
 		members *= LV_PATIENCE_RESTRICTED;
 	return Max(members / parts, 1.0);
 }
@@ -3858,13 +3996,15 @@ lv_readahead_begin(IndexScanDesc scan, LvScanOpaque *so, int mode, int pins)
  * streams"): each relation's tablespace's effective_io_concurrency pages, to
  * LIONVEC_PREFETCH_MAX, while pg_lion.vector_prefetch is not off; the
  * heap's only if it is the heap access method's, whose TIDs name its blocks,
- * and its vectors are not in TOAST (lionvec_vector_inline()).  0 reads nothing
- * ahead.  Through streams, each holds twice its relation's pages ahead in
- * pins, and at least LION_READAHEAD_MIN_PINS - those it reads ahead, and
- * those a read out of their order pulled from it first - to an
- * LV_RA_SHARE'th of the backend's fair share of shared_buffers, reading
- * half as many pages ahead where that is less; with fewer than
- * LION_READAHEAD_MIN_PINS, and on 16, the scan asks the kernel instead.
+ * and its vectors are not in TOAST (lionvec_vector_inline()) or the scan is
+ * under a filter, which reads the heap tuple of every row it reranks
+ * (lion_vec_restrict_filter()).  0 reads nothing ahead.  Through streams,
+ * each holds twice its relation's pages ahead in pins, and at least
+ * LION_READAHEAD_MIN_PINS - those it reads ahead, and those a read out of
+ * their order pulled from it first - to an LV_RA_SHARE'th of the backend's
+ * fair share of shared_buffers, reading half as many pages ahead where
+ * that is less; with fewer than LION_READAHEAD_MIN_PINS, and on 16, the
+ * scan asks the kernel instead.
  */
 static void
 lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
@@ -3885,7 +4025,8 @@ lv_start_prefetch(IndexScanDesc scan, LvScanOpaque *so)
 		so->ipf = Min(get_tablespace_io_concurrency(index->rd_rel->reltablespace),
 					  LIONVEC_PREFETCH_MAX);
 		if (heap != NULL && heap->rd_tableam == GetHeapamTableAmRoutine() &&
-			lionvec_vector_inline(index, heap, so->info->dims, so->info->half))
+			(so->filter != NULL ||
+			 lionvec_vector_inline(index, heap, so->info->dims, so->info->half)))
 		{
 			so->hpf = Min(get_tablespace_io_concurrency(heap->rd_rel->reltablespace),
 						  LIONVEC_PREFETCH_MAX);
@@ -3934,6 +4075,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	double		tuples;
 	double		members;
 	double		qnorm = 0.0;
+	int			capl;
 	int			i;
 
 	if (scan->xs_snapshot == InvalidSnapshot ||
@@ -3971,7 +4113,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->nblocks = RelationGetNumberOfBlocks(index);
 	so->lastdist = so->lastkey = -INFINITY;
 	so->shared = lv_shared(scan);
-	Assert(so->shared == NULL || !so->restricted);
+	Assert(so->shared == NULL || (!so->restricted && so->filter == NULL));
 	lv_start_prefetch(scan, so);
 
 	/* no order to give: every row, chain by chain */
@@ -4041,10 +4183,18 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	lionvec_query_init(&so->q, so->metric, so->info->mean, x, lionvec_epsilon);
 	lv_start_toast(scan, so);
 
-	/* how many rows the scan is of */
+	/*
+	 * How many rows the scan is of: under a filter every row, whose members
+	 * are known only as each is fetched, so that it probes whatever the
+	 * filter keeps (lv_patience_unit()); and the share of them the planner
+	 * expects the filter to keep, which sizes L (below)
+	 */
 	tuples = index->rd_rel->reltuples > 0 ? index->rd_rel->reltuples :
 		so->meta.ntuples;
 	members = tuples;
+	if (so->filter != NULL)
+		so->ffrac = so->fmembers > 0.0 ?
+			Min(1.0, Max(so->fmembers, 1.0) / Max(tuples, 1.0)) : 1.0;
 	if (so->restricted)
 	{
 		BlockNumber hblocks = RelationGetNumberOfBlocks(scan->heapRelation);
@@ -4089,9 +4239,32 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	 * REST as before.
 	 */
 	so->batch = lionvec_batch;
+	capl = Max(so->batch, lv_cap(so) / 8);
 	if (so->limit > so->batch)
-		so->batch = (int) Min(so->limit,
-							  (int64) Max(so->batch, lv_cap(so) / 8));
+		so->batch = (int) Min(so->limit, (int64) capl);
+
+	/*
+	 * Under a filter, tau is of every row the probes score, members or not,
+	 * which only their fetches tell apart: L rows within it hold some frac L
+	 * members, and a LIMIT of L members needed REST after REST, each probing
+	 * every chain again.  So L is the rows that many members come to, as the
+	 * planner expects the filter to keep frac of the index's rows
+	 * (lion_vec_restrict_filter()), to the same eighth of work_mem.  On
+	 * 300,000 clustered 64-dimensional vectors a LIMIT 100 under a 10%
+	 * filter made 2 passes and read 1,613 pages a query with L 100 rows,
+	 * and 1 pass and 1,190 pages with L 1,000; under a 1% filter 4.0 passes
+	 * and 8,148 pages, and 1 and 3,560; as many partitions probed (1,010
+	 * and 3,030) for as many of the hundred nearest (0.9994 against 0.9992
+	 * and 0.9998).  The tiers stay rows (2026-10-18): sized
+	 * so too, to hold the members of the restricted scan's, a LIMIT 10 under
+	 * a 10% filter of 300,000 uniformly random vectors probed 1,672
+	 * partitions a query for 0.996 of the ten nearest, in 2.5 times the
+	 * time; with tiers of rows 661, and 0.910, as the restricted scan's 721
+	 * and 0.924.
+	 */
+	if (so->filter != NULL && so->ffrac < 1.0)
+		so->batch = (int) Min(ceil(so->batch / so->ffrac),
+							  Max((double) so->batch, (double) capl));
 	lv_reset_rows(so);
 	lv_read_parts(scan, so);
 
@@ -4286,6 +4459,9 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 						lv_next_phase(scan, so);
 						break;
 					}
+					/* a member only (lion_vec_restrict_filter()) */
+					if (so->filter != NULL && !lv_walk_filter(scan, so, &tid))
+						break;
 					scan->xs_heaptid = tid;
 					scan->xs_recheck = false;
 					scan->xs_recheckorderby = false;

@@ -21440,6 +21440,107 @@ dimensions (format 1) the planner chose a sort of the lion bitmap scan's rows fo
 1% of them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most
 rows pass and the set costs more than the rows it saves.
 
+**Filter at the fetch (2026-10-18).** At wide filters the set is the floor. On the 50M-row benchmark
+(a lion index on a unique double `WITH (summaries = auto)`) every margin cost 850 to 1,050 ms at
+10%, of which the scan's own work was small - 21 to 1,040 probes, 11 rows fetched, where the
+unfiltered scan takes 6 to 40 ms - and the rest scaled with the filter: 845 ms at 10%, 260 at 3%, 89
+at 1%, about 170 ns a member. A range's summary bucket holds rows from nearly every container key of
+the heap, so the source hands the set about a container a member, each copied (`lo_set_push()`),
+sorted and ORed (`lo_set_finish()`): 5M pieces at 10%. Nothing in the query needs the set: the scan
+tests the membership of a few thousand candidates. So LionOrdered has a second flavour over a
+lionvec order (`LO_FLAG_KNNFILTER`): it builds no set, compiles the lion side's original clauses
+(`LO_EXPR_LIONQUAL`, the qual a set's recheck would test) and hands them, with an `ExprContext` of
+its own for their Params, to the scan after every `index_rescan()` (`lion_vec_restrict_filter()`).
+The scan tests them where it has the row's heap tuple anyway, at the fetch of its exact distance
+(`lv_fetch_distance()`, from `lv_rerank()`); a row that fails is dropped there (`lv_mark_done()`),
+counted, and never returned, as the set drops a non-member before its estimate - so the pause's
+count, `passret` and the frontier `lastdist` see members only, and a `LIMIT` is never left short.
+The walks of NULL and zero vectors fetch and test each row they would return (`lv_walk_filter()`).
+The filter is evaluated on the scan's own slot, of the table access method's type, which the node
+checks is its scan slot's type, the qual having been compiled for that slot. The node does not test
+the clauses again (no lion recheck); a clause of the vector column's own (`v IS NOT NULL`) stays its
+`Filter`. EXPLAIN says `Lion Filter:` where the set's plan says `Lion Cond:`, names no lion index,
+and under ANALYZE counts `Rows Removed by Lion Filter`, over every rescan as the node's other
+counters are.
+
+Against the restricted scan of the same members it differs in what the members' list allowed:
+- **every row a probe reads is estimated**, no CODE page skipped, and the frontier's rows are
+  refined and fetched whether or not they are members: about 1 / frac as many refines and fetches
+  for a filter keeping frac of the rows. On 300,000 rows of 64 dimensions a LIMIT 10 under a 10%
+  filter refined 600 rows and fetched 163 where the restricted scan refined 60 and fetched 16, in
+  500 well-separated clusters; 47,636 and 133 against 5,048 and 13 on uniformly random vectors.
+- **tau and the tiers are of every row scored**, members or not, since a probe cannot tell them
+  apart, and so is the patience: its unit is `LV_PATIENCE_RESTRICTED` times the unfiltered one,
+  sqrt(n) rows. The restricted scan's is 2 members / (2 sqrt(n)), counted among members only; among
+  rows, of which a share sel = members / n are members, that is sqrt(n) rows, so the same patience
+  pauses after as many rows scored, in expectation, with no estimate of the members. A tier of K
+  rows holds about frac K members, and its pause ends past its bound, having returned them, and the
+  next tier is still the least past the members returned; on uniformly random vectors, which make a
+  scan probe far, a LIMIT 10 under a 10% filter probed 661 partitions for 0.910 of the ten nearest,
+  the restricted scan 721 for 0.924. Tiers sized to hold the members (K / frac rows) probed 1,672
+  for 0.996, in 2.5 times the time, and tiers sized so with the restricted scan's unit 386 for
+  0.802.
+- **L holds the members** the query takes (`pg_lion.vector_batch`, or the LIMIT when more) at the
+  planner's estimate of the filter's share (`LO_PRIV_EXPECTED` under `LO_FLAG_KNNFILTER`: the rows
+  it expects the lion qual to keep): L / frac rows, to the same eighth of `work_mem`. With L rows,
+  tau is the L-th row's bound, past which a LIMIT of L members needed REST after REST: on 300,000
+  clustered vectors a LIMIT 100 under a 1% filter made 4.0 passes reading 8,148 pages a query, with
+  L / frac rows one pass and 3,560, for the same partitions probed and as many of its rows.
+- **never the exact path**, which needs the members' list: where it would be taken, the set is
+  small, and `add_path()` takes it; **no read by place** from TOAST (§44.13), the heap tuple being
+  fetched for the test anyway and its vector detoasted from it, the heap's blocks read ahead as for
+  inline vectors; and **no early stop** of the node, which has no member count to stop at.
+
+The planner offers both flavours for each lion side (`lo_set_rel_pathlist()`) and `add_path()` keeps
+the cheaper (§44.7); `pg_lion.vector_restrict` (§44.8) pins either. A set that would not fit
+`hash_mem`, which the node refuses to plan, leaves the filter's, which needs none. At
+`pg_lion.vector_patience = 0` the two return the same rows: a member is returned in either only once
+every partition and every row bound nearer than its distance has been worked, which the non-members
+in the filter's queue change the order of, not the set.
+
+Measured on 2,000,000 rows of 64 dimensions in 2,000 clusters (`id`, a uniform `u` double under a
+lion index `WITH (summaries = auto)`, `v` under lionvec), a LIMIT 10 for each of 100 query vectors,
+warm, pgvector's functions at COST 100; mean and median ms, and the plans' costs:
+
+| u < | sort (exact) | set | filter | auto plans | set's cost | filter's cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| 30% | 316.9 | 28.8, 27.5 | 2.11, 2.08 | the filter, 2.14 | 31,918 | 5,163 |
+| 10% | 154.6 | 11.9, 11.4 | 2.40, 2.36 | the filter, 2.79 | 13,194 | 11,311 |
+| 5% | | 7.65, 7.44 | 2.84, 2.66 | the set, 8.09 | 8,869 | 19,940 |
+| 3% | 68.6 | 5.69, 5.16 | 2.90, 2.88 | the set, 5.63 | 7,350 | 31,494 |
+| 2% | | 5.52, 4.82 | 7.00, 3.11 | | | |
+| 1% | 22.2 | 14.0, 4.43 | 117.9, 4.57 | the set, 14.7 | 6,659 | 88,630 |
+
+Both found all of the ten nearest for every query at every filter, and at 30, 10, 3 and 1% the same
+ten rows, at the default patience and at 0. Down to 3% both probed 5.7 partitions a query; the
+filter fetched 71, 175 and 453 rows a query at 30, 10 and 3%, removing 50, 157 and 439 of them, the
+set 21, 18 and 14. Under 1% the queries split: about half answered from the clusters near them, as
+above, and half probing far. Over all 100 the filter probed 548 partitions a query and estimated
+88,435 candidates, the set 295 and 375; at patience 0 both probed 548, so the set's patience saved
+half the probes and the filter's none, though it paused more (1.54 times a query to 0.39) - probably
+as a tier of ten rows holds 0.1 members, so that the scan pauses tier after tier on its way to its
+tenth member, each pause after a patience of its own. The filter's slowest tenth took 365 ms, the
+set's 31. The planner keeps the set there, and the filter from 10% up; between, from 3% to 8%, the
+set it keeps is 2 to 3 times slower (§44.7).
+
+Measured and left out: testing the filter at the refine instead, a heap fetch for every row before
+its REFINE item is read, so that a non-member is never refined. On 300,000 vectors of 64 dimensions,
+inline, it was 10 to 15% slower on uniformly random vectors, and on clustered ones 7% slower under
+a 30% filter and 28% faster under 3%; on 60,000 of 1,536 dimensions in TOAST, where a refine
+detoasts, the median query went from 1.30 to 0.85 ms under a 10% filter and from 92.7 to 55.9 ms
+under 3%, and was mixed under 30% - on a machine busy with an index build, so to within some 10%.
+The inline loss, and heap fetches at the refine with none of the read-ahead the fetches of the
+exact distances have, left it out; a scan whose vectors are in TOAST may want it.
+
+Not done. The filter could take any restriction clause, not only those a lion index answers: it is
+evaluated on the heap tuple, so a clause no lion index answers would be a member test like the
+others, and the query `pg_lion.vector_postfilter`'s default fails today (below) would be the
+restricted scan's. Its price needs a selectivity for clauses no lion index answers, and the rule
+needs the scan to test them all, the node's `Filter` none. And a set that degrades at run time
+(`hash_mem`, §30.4), or one over a lossy lion clause, could hand the scan the same filter for the
+rows of its inexact containers, so that the scan, not the node's recheck, drops their
+non-members, closing the gap noted below, where the recheck filters members the scan has returned.
+
 **Post-filtering (2026-10-16).** A lionvec scan under a `Filter` is another search than the
 restricted scan, not the same one with the rejected rows left out. The scan ends a pause, and moves
 the frontier behind which it skips a late row, on the rows it *returns* (`lionvecgettuple()`:
@@ -21591,6 +21692,39 @@ further hundred rows, measured at 115,000 rows, not 0.06 of one); there the filt
 LionOrdered's or a sort's with no constant changed. `LIONVEC_DEEPER_PAUSED` still prices an
 unfiltered scan's deeper batches, and the plain scan under `allow`.
 
+**The set's pieces** (2026-10-18). Until then `lo_cost_knn()` priced the set as `lo_cost()` does for
+a B-tree's walk (§30.3): the lion access's own cost - a summary entry a bucket - and
+`cpu_operator_cost` a container key, nothing a member, so the 50M-row benchmark's 10% set, 1,220
+summary entries and 260,417 keys built in 845 ms, cost 650. Both now add the pieces the set copies,
+sorts and ORs (`lo_set_pieces()`): each leaf's source hands the set a container for each entry it
+reads at each container key that entry's rows reach, so they cost
+
+    min(members, entries x keys) x LO_PROBE_TUPLES x cpu_tuple_cost
+
+with `entries` from `lion_cost_path_entries()` (lion_amcost.c, summed over a BitmapAnd's or
+BitmapOr's leaves): for a key column's range, `lion_cost_ranges_entries()`'s - a summary a bucket it
+covers whole, and the keys at its ends, or without summaries every key between its bounds; for an
+equality list longer than a batch (`lion_scan_list_batch()`), a LIST source, its elements; else one;
+a leaf's most of any column. `LO_PROBE_TUPLES` (2) `cpu_tuple_cost`s is the walk's 170 ns an entry,
+which the 50M build's 5M pieces came to (845 ms); at 5M rows the same filter's 500,000 members took
+44 to 48 ms, 1.36 members a piece, 90 ns a member. A 10% equality on a column the heap is ordered by
+brings a piece a key; a range over a unique column a piece a member.
+
+**The filter at the fetch** (2026-10-18; §44.6). Its flavour of the node (`lo_cost_knn_filter()`)
+has no lookup and no copy; the lion access only says how many members there are
+(`cost_bitmap_tree_node()`'s selectivity times the rows). Its start-up is `lion_vec_filter_cost()`,
+`lionvec_startup_cost()` with `filtered`: the probe share of the restricted scan of those members
+(the same partitions hold the same nearest members), so the same partitions and CODE pages; never
+the exact path; every walked row's estimate (`LIONVEC_ROW_OPS`, not the members' share of them); and
+the batch's refines and fetches over frac, at most the rows walked, each also testing the lion qual
+(`cost_qual_eval()`). Its run part is every row's random page, index tuple and qual, and a tuple a
+member: per row returned, 1 / frac of the set's. So the set's price grows with the members, the
+filter's with the rows a member costs, and they cross where 2 x `cpu_tuple_cost` a member meets (1 /
+frac - 1) x the batch's refines and fetches - at the defaults, for a LIMIT 10 on the 2M-row bench
+of §44.6, between 8% (the set 11,331, the filter 13,634) and 10% (13,194 and 11,311), where the
+filter was faster from 3% and, in the mean, slower at 2% and 1%: the model puts each of its
+fetches at two random pages, which warm cost far less, and the set's pieces at their warm cost.
+
 **A parallel scan** (2026-10-16; §44.4). `cost_index()` asks `lionveccostestimate()` for the
 index's cost before it counts the path's workers, and of the result divides only its own CPU part
 by the parallel divisor, so a partial path came out at about the serial scan's price.
@@ -21631,12 +21765,14 @@ could have lost to; LionOrdered's paths are serial.
 - `pg_lion.vector_patience` (int, 0 to 1,000,000, default 30): how many units of rows a scan
   scores without one entering the nearest rows it is after (its tier, §44.4) before it pauses, a
   unit `sqrt(n) / 2` rows, n the build's, the rows an average partition would hold in `2 sqrt(n)`
-  partitions - under a lion filter twice that share of the members - whatever the partitions'
-  number, and `margin / 6` times as many past a margin of 6; 0 never pauses, and
-  then a filter's scan probes far more than the costs assume (§44.7). Smaller pauses sooner,
-  probing fewer partitions and missing more rows. 30 is where the 975,000-row benchmark's tail
-  ended, in its `2 sqrt(n)` partitions, where a unit is a partition's rows: at a margin of 3, 30
-  and 40 gave the same recall (0.979), 40 a 95th percentile a third longer.
+  partitions - under a lion filter twice that share of the members, or under its filter at the
+  fetch, which scores every row, twice that of the rows, as many rows in expectation (§44.6,
+  "Filter at the fetch") - whatever the partitions' number, and `margin / 6` times as many past a
+  margin of 6; 0 never pauses, and then a filter's scan probes far more than the costs assume
+  (§44.7). Smaller pauses sooner, probing fewer partitions and missing more rows. 30 is where the
+  975,000-row benchmark's tail ended, in its `2 sqrt(n)` partitions, where a unit is a partition's
+  rows: at a margin of 3, 30 and 40 gave the same recall (0.979), 40 a 95th percentile a third
+  longer.
 - `pg_lion.vector_exact_rows` (int, 0 to 100,000,000, default 2,000): how many members a lion filter
   may admit for the scan to compute every member's distance from the heap, exactly, instead of
   probing (§44.6), whatever the partitions; 0 leaves the choice to
@@ -21691,6 +21827,15 @@ could have lost to; LionOrdered's paths are serial.
   index's own, of the vector column alone (`v IS NOT NULL`, a distance bound; 2026-10-17), are no
   filter here. A table with row-level security lionvec refuses under every value (§44.6,
   "Row-level security").
+- `pg_lion.vector_restrict` (enum, `auto`, `set` or `filter`, default `auto`; 2026-10-18): how
+  LionOrdered restricts a lionvec scan to the rows its lion filter keeps (§44.6, "Filter at the
+  fetch"). `set`: by lion's set of them, built before the scan's first row, the scan reading and
+  scoring only its members - the only way before 2026-10-18, and planned and run as then. `filter`:
+  by no set, the scan testing the lion clauses on the heap tuple of each row it fetches for its
+  exact distance, dropping one that fails; never the exact path. `auto`: both offered, at their
+  prices (§44.7), and the cheaper planned - the filter's under wide filters, where the set costs
+  more than the rows it saves, and wherever the set would not fit `hash_mem`. For comparing the
+  two, and for the tests that pin either.
 - `pg_lion.vector_prefetch` (enum, `off`, `fadvise` or `stream`, default `stream` from 17 and
   `fadvise` on 16; 2026-10-17, a boolean from 2026-10-16, whose `on`, the default, and `off` it
   still takes): how a scan reads ahead the pages it will read next (§44.4, "Prefetch" and "Read
@@ -22584,7 +22729,20 @@ faster from the disk and the same warm, and the inline table's queries took main
   each metric, at the margin of 100 and at the defaults, before and after DELETE and VACUUM under
   the filter. The ordinary plan is the node off under `exact` (since 2026-10-17, when the default
   `error` would fail it), a sort of the filter's rows; so it is in vector_half.sql and
-  vector_limit.sql.
+  vector_limit.sql. The filter at the fetch (§44.6, 2026-10-18): every test above it is the set's,
+  pinned with `pg_lion.vector_restrict = set`; then the two flavours return the same rows - the
+  distances in order, and the rows - for each metric, the eight filters and four LIMITs, and the
+  zero and NULL queries, whose walks test each row; the two plans, `Lion Cond` with its lion
+  indexes and `Lion Filter` with none, the vector column's own clause in the node's `Filter`, and
+  which auto plans for a 1% and a 90% filter; `Rows Removed by Lion Filter` under EXPLAIN ANALYZE,
+  of a probing scan and of a zero query's walks; a generic plan's Params; a correlated subquery
+  and a LATERAL subquery under a nested loop, rescanning the node, against the sort; the default
+  margin's recall under filters of 9,000 and 3,000 members; a scan pausing at once filling a
+  LIMIT 2000 in order; each member once, at the margin of 100 and at the defaults; the DEBUG1 line
+  of a 200-member filter, which the set answers exactly and the filter probes for; and, at a
+  `work_mem` the set would not fit, the set's plan refused and auto planning the filter.
+  vector_half.sql's exact path at `pg_lion.vector_exact_rows = 5000` is pinned to the set too,
+  where auto plans the filter.
 - **vector_limit.sql** (2026-10-16): the restricted scan told its query's LIMIT (§44.4, "A known
   LIMIT"), over vector_filter.sql's 10,000 rows in 50 partitions at the margin of 100, where every
   partition comes before every row, and a patience of one unit, so that each tier pauses as soon
