@@ -16,9 +16,11 @@
 -- rows wants one a row, which a sample of every row makes: neither fails.
 --
 -- At 8 dimensions a sample row is 68 bytes (64 padded dimensions and a
--- scale), so maintenance_work_mem's least, 64kB, holds 481 rows: 16 each for
--- 30 partitions.  A table of 10,000 rows wants 625 (a sixteenth of them, 8
--- sqrt(n) being 800), 10,000 sample rows, 1,329kB.
+-- scale), so a maintenance_work_mem of 1MB, the least PostgreSQL 16 takes,
+-- holds 7,710 rows: 16 each for 481 partitions.  A table of 10,000 rows
+-- wants 625 (a sixteenth of them, 8 sqrt(n) being 800), 10,000 sample rows,
+-- 1,329kB.  At 2,000 dimensions, padded to 2,048, a sample row is 2,052
+-- bytes, and 1MB holds 255 of them.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -30,10 +32,11 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 SET max_parallel_maintenance_workers = 0;
 
-CREATE FUNCTION bs_vec(i bigint) RETURNS vector LANGUAGE sql IMMUTABLE AS $$
+CREATE FUNCTION bs_vec(i bigint, d int DEFAULT 8) RETURNS vector
+LANGUAGE sql IMMUTABLE AS $$
 	SELECT array_agg(((hashint8extended(i * 100 + j, 11) % 100000)::float8
 					  / 100000.0)::real ORDER BY j)::vector
-	  FROM generate_series(1, 8) j
+	  FROM generate_series(1, d) j
 $$;
 -- the partitions on an index's meta page (a little-endian server's)
 CREATE FUNCTION bs_parts(idx regclass) RETURNS bigint LANGUAGE sql AS $$
@@ -58,10 +61,14 @@ CREATE TABLE bs20 (id int, v vector(8)) WITH (autovacuum_enabled = off);
 INSERT INTO bs20 SELECT i, bs_vec(i) FROM generate_series(1, 20000) i;
 CREATE TABLE bs1k (id int, v vector(8)) WITH (autovacuum_enabled = off);
 INSERT INTO bs1k SELECT i, bs_vec(i) FROM generate_series(1, 1000) i;
+-- in line, one row a heap page, whichever TOAST pointer a major version has
+CREATE TABLE bsw (id int, v vector(2000)) WITH (autovacuum_enabled = off);
+ALTER TABLE bsw ALTER v SET STORAGE PLAIN;
+INSERT INTO bsw SELECT i, bs_vec(i, 2000) FROM generate_series(1, 400) i;
 
--- the default, error: the sample of 481 rows has them for 30 partitions of
--- the 625 that 10,000 rows want; the 10,000th row, the last, makes it so
-SET maintenance_work_mem = '64kB';
+-- the default, error: the sample of 7,710 rows has them for 481 partitions
+-- of the 625 that 10,000 rows want; the 10,000th row, the last, makes it so
+SET maintenance_work_mem = '1MB';
 \set VERBOSITY default
 CREATE INDEX bs10_v ON bs10 USING lionvec (v);
 \set VERBOSITY terse
@@ -80,15 +87,15 @@ SELECT bs_parts('bs10_v') AS partitions;
 DROP INDEX bs10_v;
 
 -- 20,000 rows want 1,131 partitions: the build fails at the 10,000th row of
--- 20,000, the first with which the rows so far want more than 30, before
+-- 20,000, the first with which the rows so far want more than 481, before
 -- the rest of the first pass, k-means and the second, and reckons the rest
-SET maintenance_work_mem = '64kB';
+SET maintenance_work_mem = '1MB';
 \set VERBOSITY default
 CREATE INDEX bs20_v ON bs20 USING lionvec (bs_counted(v));
 \set VERBOSITY terse
 SELECT last_value AS rows_read FROM bs_read;
 
--- allow: the 30 partitions, with a NOTICE of the table's own count; at
+-- allow: the 481 partitions, with a NOTICE of the table's own count; at
 -- the default again a REINDEX fails, and leaves the index as it was
 SET pg_lion.vector_build_sample = allow;
 \set VERBOSITY default
@@ -103,7 +110,7 @@ DROP INDEX bs20_v;
 
 -- a parallel build reads the first pass in the leader alone, so it fails
 -- there too, before a worker starts; under allow it makes the serial
--- build's 30
+-- build's 481
 ALTER TABLE bs20 SET (parallel_workers = 2);
 SET max_parallel_maintenance_workers = 2;
 CREATE INDEX bs20_v ON bs20 USING lionvec (v);
@@ -115,19 +122,19 @@ RESET max_parallel_maintenance_workers;
 ALTER TABLE bs20 RESET (parallel_workers);
 DROP INDEX bs20_v;
 
--- the partitions option: 600 of 1,000 rows, one sample row each, of which
--- the reservoir holds 481; the 482nd row makes it short
+-- the partitions option: 300 of 400 rows of 2,000 dimensions, one sample
+-- row each, of which the reservoir holds 255; the 256th row makes it short
 \set VERBOSITY default
-CREATE INDEX bs1k_v ON bs1k USING lionvec (v) WITH (partitions = 600);
+CREATE INDEX bsw_v ON bsw USING lionvec (v) WITH (partitions = 300);
 \set VERBOSITY terse
 SET pg_lion.vector_build_sample = allow;
-CREATE INDEX bs1k_v ON bs1k USING lionvec (v) WITH (partitions = 600);
-SELECT bs_parts('bs1k_v') AS partitions;
+CREATE INDEX bsw_v ON bsw USING lionvec (v) WITH (partitions = 300);
+SELECT bs_parts('bsw_v') AS partitions;
 RESET pg_lion.vector_build_sample;
-SET maintenance_work_mem = '1MB';
-REINDEX INDEX bs1k_v;
-SELECT bs_parts('bs1k_v') AS partitions;
-DROP INDEX bs1k_v;
+SET maintenance_work_mem = '2MB';
+REINDEX INDEX bsw_v;
+SELECT bs_parts('bsw_v') AS partitions;
+DROP INDEX bsw_v;
 -- more partitions than the table has rows, from a sample of every row: as
 -- many as the rows, which no memory setting changes, and no error
 CREATE INDEX bs1k_v ON bs1k USING lionvec (v) WITH (partitions = 2000);
@@ -135,15 +142,15 @@ SELECT bs_parts('bs1k_v') AS partitions;
 DROP INDEX bs1k_v;
 
 -- fewer than 10,000 rows: one partition, whatever the sample holds of them
-SET maintenance_work_mem = '64kB';
+SET maintenance_work_mem = '1MB';
 CREATE INDEX bs10_v ON bs10 USING lionvec (v) WHERE id < 10000;
 SELECT bs_parts('bs10_v') AS partitions;
 DROP INDEX bs10_v;
 
 SET pg_lion.vector_build_sample = maybe;
 RESET maintenance_work_mem;
-DROP TABLE bs10, bs20, bs1k;
+DROP TABLE bs10, bs20, bs1k, bsw;
 DROP FUNCTION bs_counted(vector);
 DROP SEQUENCE bs_read;
 DROP FUNCTION bs_parts(regclass);
-DROP FUNCTION bs_vec(bigint);
+DROP FUNCTION bs_vec(bigint, int);

@@ -22915,27 +22915,30 @@ faster from the disk and the same warm, and the inline table's queries took main
   index built, then the parent's row-level security enabled, a query of the parent and one of the
   partition failing, and a new index on the partition refused. At `allow`: the vector scan with a
   Filter, LionOrdered with one, and their rows the sort's.
-- **vector_build_sample.sql** (2026-10-19): `pg_lion.vector_build_sample` (§44.8), at 8
-  dimensions, where `maintenance_work_mem`'s least, 64kB, holds 481 sample rows, 16 each for 30
-  partitions, and the partitions are read off the meta page (pageinspect). 10,000 rows want 625:
-  the build fails, at its last row, with the DETAIL and the HINT's 2MB; at 2MB, and at the
-  unrounded 1,329kB, it makes 625, and at 1,328kB a REINDEX fails, its sample having rows for
-  624, and leaves the 625. 20,000 rows want 1,131: the build fails at the 10,000th row, the
-  first that makes the sample short, which an index expression counting its calls through a
-  sequence shows, reckoning the 20,000 as 19,894; under `allow` it makes 30, with the NOTICE of
-  the 20,000 counted, and at `error` again a REINDEX fails and leaves them, the index still
-  answering. The same with the table's `parallel_workers` at 2: the error, and under `allow` 30.
-  The `partitions` option of 600 over 1,000 rows fails at the 482nd row, makes 481 under `allow`
-  and 600 at the hint's 1MB; an option of 2,000 over the 1,000, from a sample of every row, makes
-  1,000 and does not fail, nor does a table of 9,999 rows, of one partition, at 64kB; and the
-  setting refuses any other value. In test/unit/vec_test.c: `lionvec_parts()` at the rule's
-  figures, the reservoir's at §44.3's (21,788 rows at 64 MB and 1536 dimensions, 348,617 at
-  1 GB, the cap from 52 GB) and a billion rows' (252,982 partitions, 4,047,712 sample rows,
-  12,174,759 kB); and for options of 0 to 262,144, reservoirs of 1 to 2^24 rows and every count
-  of rows to 200,000 and every 0.05% from there to 4 billion, that a sample of every row is never
-  short, that the cap takes no partition away, that short stays short as the rows grow, and that
-  the `maintenance_work_mem` the error names makes the partitions wanted, at 64 to 8,128
-  dimensions, where a kilobyte less does not.
+- **vector_build_sample.sql** (2026-10-19): `pg_lion.vector_build_sample` (§44.8), at 8 dimensions
+  and a `maintenance_work_mem` of 1MB, PostgreSQL 16's least, which holds 7,710 sample rows, 16 each
+  for 481 partitions; the partitions are read off the meta page (pageinspect), and no setting is
+  below 1MB, so every major version runs the same. 10,000 rows want 625: the build fails, at its
+  last row, with the DETAIL and the HINT's 2MB; at 2MB, and at the unrounded 1,329kB, it makes 625,
+  and at 1,328kB a REINDEX fails, its sample having rows for 624, and leaves the 625. 20,000 rows
+  want 1,131: the build fails at the 10,000th row, the first that makes the sample short, which an
+  index expression counting its calls through a sequence shows, reckoning the 20,000 as 19,894;
+  under `allow` it makes 481, with the NOTICE of the 20,000 counted, and at `error` again a REINDEX
+  fails and leaves them, the index still answering. The same with the table's `parallel_workers` at
+  2: the error, and under `allow` 481. The `partitions` option of 300 over 400 rows of 2,000
+  dimensions, whose 1MB holds 255 (stored in line, a row a heap page, so the 400 are reckoned
+  exactly), fails at the 256th row, makes 255 under `allow` and 300 at the hint's 2MB - 2,000
+  dimensions so that k-means over a sample that small is quick, where at 8 an option over 10,000
+  rows took 5.6 s for its 7,710 partitions under `allow` and 5.4 s for 8,000 at 2MB; an option of
+  2,000 over 1,000 rows, from a sample of every row, makes 1,000 and does not fail, nor does a table
+  of 9,999 rows, of one partition, at 1MB; and the setting refuses any other value. In
+  test/unit/vec_test.c: `lionvec_parts()` at the rule's figures, the reservoir's at §44.3's (21,788
+  rows at 64 MB and 1536 dimensions, 348,617 at 1 GB, the cap from 52 GB) and a billion rows'
+  (252,982 partitions, 4,047,712 sample rows, 12,174,759 kB); and for options of 0 to 262,144,
+  reservoirs of 1 to 2^24 rows and every count of rows to 200,000 and every 0.05% from there to 4
+  billion, that a sample of every row is never short, that the cap takes no partition away, that
+  short stays short as the rows grow, and that the `maintenance_work_mem` the error names makes the
+  partitions wanted, at 64 to 8,128 dimensions, where a kilobyte less does not.
 - **test/isolation/lionvec_insert_window.spec** (an injection point build, PostgreSQL 17 and on;
   2026-10-15, after a review found lionvec's concurrency untested): an insert parked after its
   REFINE record (`lionvec-insert-refined`), and after its CODE record before its copy's
