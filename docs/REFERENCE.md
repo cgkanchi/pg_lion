@@ -174,9 +174,10 @@ positions, and leaving it out then is an error that names the candidates:
 
 `col` is the column's name in the index, as `\d doc_text_idx` lists it under Column: for a plain
 column the table column's name when the index was built, and for an expression the name CREATE
-INDEX gave it, such as `to_tsvector`, then `to_tsvector1` for a second one. A name the index does
-not have, or a column that does not store positions, is an error; `col => NULL` is the same as
-leaving it out. A NULL in any other argument gives no rows (`lion_bm25_score()`: NULL).
+INDEX gave it, which differs between PostgreSQL versions: `to_tsvector`, then `to_tsvector1` for a
+second one, on PostgreSQL 19. A name the index does not have, or a column that does not store
+positions, is an error; `col => NULL` is the same as leaving it out. A NULL in any other argument
+gives no rows (`lion_bm25_score()`: NULL).
 
 `lion_bm25_score(tsv, query, index [, k1, b, col])` is the same score for one row, from its
 tsvector and the statistics of the index column `col` names. Ordered by it, with a `WHERE` that
