@@ -69,8 +69,8 @@
  * its extraction functions for.  They are NOT ours: GIN numbers the array
  * operators 1 &&, 2 @>, 3 <@, 4 =, and tsvector's @@ is its strategy 1, while
  * the roaring AM numbers every class from one scheme (1 =, 2 @>, 3 &&, 4 <@,
- * 5 @@) so that a scalar and a multi-key opclass can share a validator and a
- * scan.
+ * 5 @@, 17 array =) so that a scalar and a multi-key opclass can share a
+ * validator and a scan.
  *
  * The strategy argument of support function 3 therefore has to be translated
  * before the call, because the function reading it is GIN's.  This is part of
@@ -85,6 +85,7 @@
 #define LION_GIN_OVERLAP		1
 #define LION_GIN_CONTAINS	2
 #define LION_GIN_CONTAINED	3
+#define LION_GIN_EQUAL		4
 #define LION_GIN_TSMATCH		1	/* tsvector_ops: @@ is GIN strategy 1 */
 
 static StrategyNumber
@@ -98,7 +99,10 @@ lion_gin_strategy(StrategyNumber strategy)
 			return LION_GIN_OVERLAP;
 		case LION_STRAT_CONTAINED:
 			return LION_GIN_CONTAINED;
+		case LION_STRAT_ARRAY_EQUAL:
+			return LION_GIN_EQUAL;
 		case LION_STRAT_MATCH:
+		case LION_STRAT_MATCH_OLD:
 			return LION_GIN_TSMATCH;
 
 			/*
@@ -699,6 +703,7 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 
 	memset(q, 0, sizeof(LionQuery));
 
+	strategy = LION_STRAT_CANONICAL(strategy);
 	lion_call_extractquery(state, query, strategy, &raw);
 	nkeys = raw.nkeys;
 	keys = raw.keys;
@@ -770,6 +775,16 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 			 * when it has NO key outside the query array, which the index
 			 * cannot tell - and ginqueryarrayextract() says so with
 			 * INCLUDE_EMPTY, so this is unreachable.  Fall back anyway.
+			 */
+			q->tree = NULL;
+			break;
+
+		case LION_STRAT_ARRAY_EQUAL:
+
+			/*
+			 * Array `=` is never exact from the keys: they say which
+			 * elements a row has, not how many, in what order or in what
+			 * shape.  Only the superset (below) answers it, rechecked.
 			 */
 			q->tree = NULL;
 			break;
@@ -1196,6 +1211,7 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 
 	memset(q, 0, sizeof(LionQuery));
 
+	strategy = LION_STRAT_CANONICAL(strategy);
 	lion_call_extractquery(state, query, strategy, &raw);
 
 	if (raw.searchMode == LION_SEARCH_MODE_LOSSY)
@@ -1219,6 +1235,18 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 
 	switch (strategy)
 	{
+		case LION_STRAT_ARRAY_EQUAL:
+
+			/*
+			 * `a = q` holds only where a has every element of q - the AND of
+			 * their sets, as for `@>` - and the recheck decides the rest:
+			 * the count of each element, the order, the dimensions and their
+			 * lower bounds.  A NULL element is left out of the AND, as array
+			 * equality matches NULL with NULL; an empty q is
+			 * ginqueryarrayextract()'s INCLUDE_EMPTY, every row, above.
+			 */
+			lossy = true;
+			/* FALLTHROUGH */
 		case LION_STRAT_CONTAINS:
 		case LION_STRAT_JSONB_CONTAINS:
 		case LION_STRAT_JSONB_EXISTS:

@@ -133,13 +133,15 @@ answer
     tags @> '{a,b}'    the intersection of the elements' posting sets, exact
     tags && '{a,b}'    their union, exact
     tags <@ '{a,b}'    every indexed row, rechecked in the heap
-    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact
+    tags =  '{a,b}'    the rows holding every element, rechecked in the heap
+    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact (also as `@@@`)
 
 Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two lists on a scalar
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column.
+combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
+index scans only, as GIN answers them.
 
 A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
 is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
@@ -183,7 +185,8 @@ sorting every match:
      LIMIT 10;
 
 The scan is offered when the query and index are constants and every row the `WHERE`'s tsquery can
-match has one of the scored lexemes - the usual case of the same query in both places. Other
+match has one of the scored lexemes - the same query in both places, or a narrower one such as
+`WHERE d.tsv @@ 'cat & black'` under a score of `'cat'`. Other
 `WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
 else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
 

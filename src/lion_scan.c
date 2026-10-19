@@ -281,8 +281,17 @@ lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	lion_scan_reset(so);
 
 	if (scankey && scan->numberOfKeys > 0)
+	{
+		int			i;
+
 		memcpy(scan->keyData, scankey,
 			   scan->numberOfKeys * sizeof(ScanKeyData));
+
+		/* `@@@` is `@@` (LION_STRAT_MATCH_OLD), and answered as `@@` */
+		for (i = 0; i < scan->numberOfKeys; i++)
+			scan->keyData[i].sk_strategy =
+				LION_STRAT_CANONICAL(scan->keyData[i].sk_strategy);
+	}
 }
 
 void
