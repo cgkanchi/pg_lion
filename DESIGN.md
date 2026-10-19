@@ -5354,18 +5354,38 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   every TID of the posting set has positions.
 - **Build**: the spool hands each row's positions for a key to a sink (`lion_posbuild.c`) that
   appends them to that key's own stream, found by a hash table on the key's bytes.  The heap scan
-  delivers a key's rows in TID order, so nothing is sorted, except each heap page's members as
-  they are read back (a heap-only tuple comes under its chain's root offset).  The streams get a
-  quarter of `maintenance_work_mem`; past that every stream is written to one temporary file, the
-  key keeping where its parts went.  `lion_build.c` takes a key's positions (file parts in order,
-  then memory) as it writes the key's entry, into the entry's chunk or into a position tree
-  written bottom up through the bulk writer - up to 16 leaves held back and written as a chain
-  whose first leaf is at the head's block, and a root over them only once a 17th is needed.  A 225k-row build takes about 1.5x as long as one
-  without positions (it was 10x with a tuplesort, plus a quadratic append into the chunk).
-  A parallel build gives each participant a sink of its own, writing to the build's shared
-  fileset; at the end of its scan a participant writes everything out with a directory of its
-  keys' parts, the leader reads every directory into its own table, and taking a key merges its
-  participants' parts by heap block, which a parallel heap scan never splits between two.
+  delivers a key's rows in TID order, so no stream is sorted, except each heap page's members as
+  they are read back (a heap-only tuple comes under its chain's root offset).  The positions get
+  half of `maintenance_work_mem` and the spool the other half (§24, never less than 64kB each),
+  and the half counts everything the scan keeps for them: the streams, the keys and the table
+  that finds them.  Past it the keys are sorted into the order the build writes entries in - the
+  column, then the key's comparison - and written with their streams to a logical tape as one
+  RUN (a record a key: its bytes, then its stream in chunks of whole members of up to 8kB), and
+  all of it is forgotten, the table of keys too.  So the scan holds the budget and no more however
+  many keys the column has and however many runs it writes; the runs are LEVELS, as an LSM tree's
+  are: a spill adds a run of level 0, and `maxorder` runs of one level (as many as one merge reads,
+  their buffers taking half the budget) are merged into one of the next, so the runs held are
+  fewer than `maxorder` a level and every byte is copied once a level.  The runs merged always
+  follow one another, so a key's records stay in the order the scan wrote them.
+  `lion_build.c` takes a key's positions as it writes the key's entry, and it writes the entries
+  in the runs' order, so the runs are merged k-way as it goes, each read front to back - the
+  newest merged into fewer first until one merge reads them all - and a key's positions are its
+  records, oldest first; without a run the keys are sorted in memory and read there.  They go
+  into the entry's chunk or into a position tree written bottom up through the bulk writer - up
+  to 16 leaves held back and written as a chain whose first leaf is at the head's block, and a
+  root over them only once a 17th is needed.  A 225k-row build takes about 1.5x as long as one
+  without positions (it was 10x with a tuplesort, plus a quadratic append into the chunk).  A
+  parallel build gives each participant a sink of its own in its share of the memory; at the end
+  of its scan a participant merges its runs and what it has in memory into one, written to a file
+  of the build's shared fileset, and the leader merges those files as a serial build merges its
+  runs, a key's records by heap block, which a parallel heap scan never splits between two
+  participants.  The index is the same one, page for page, whatever the memory and the workers
+  (`test/sql/buildspill.sql` compares the builds at the least `maintenance_work_mem`, a hundred
+  runs and more, serially and in parallel, with the one built in memory).  Measured on 1M
+  generated documents (45M lexeme occurrences over 300,000 words, Zipf-like; assert-enabled build,
+  a busy 4-core machine): at `maintenance_work_mem` 1MB 6,832 runs, merged into one 1,366 times,
+  the positions holding at most 0.6 MB while scanning and 0.9 MB while writing, 76 s; at 64MB 36
+  runs, 32 MB and 3 MB, 58 s; two workers at 64MB, 32 s; the same index every time.
 - **Tested** by `test/sql/positions.sql`, which compares what the index stores with `unnest()` of
   the rows after inserts, an UPDATE, deletes with VACUUM, a key emptied and refilled, a REINDEX,
   and a REINDEX at 1MB over heap-only tuples (spilled streams, page disorder).
@@ -8296,7 +8316,8 @@ measured below, whose timestamps are all distinct keys.)
 
 **Memory is one budget for all the key columns**, not an even share each: a boolean column costs a
 few bytes a row and a column of unique keys the most, and each takes what it needs. The budget is
-maintenance_work_mem (divided between the participants of a parallel build), and it counts what the
+maintenance_work_mem (divided between the participants of a parallel build), less the half that
+the positions of a column that stores them take (§17, "Stored positions"), and it counts what the
 columns' entries take, not the empty table and first block every column has whatever the budget -
 counting those made a 64kB budget on a wide index spill every column at every heap page. It is
 checked when the scan moves to the next heap page and after every 1024 keys (`LION_CHECK_KEYS`), since

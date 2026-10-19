@@ -86,11 +86,14 @@ typedef struct LionPageWriter
 typedef struct LionPosBuild LionPosBuild;
 extern LionPosBuild *lion_posbuild_begin(Relation index, LionIndexState *ix,
 										 int workmem);
+/* What it takes of workmem: the spool has the rest. */
+extern Size lion_posbuild_budget(const LionPosBuild *pb);
 /*
- * A parallel build: each participant's sink writes to files of the build's
- * shared fileset, under its file number (begin_shared), and exports them when
- * its scan is done; the leader's own LionPosBuild imports every participant's
- * (lion_posbuild_import()) before it writes the index.
+ * A parallel build: each participant's sink spills to a tape set of its own
+ * and, when its scan is done, merges everything into one file of the build's
+ * shared fileset, under its file number (begin_shared, export); the leader's
+ * own LionPosBuild merges every participant's (lion_posbuild_import()) as it
+ * writes the index.
  */
 extern LionPosBuild *lion_posbuild_begin_shared(Relation index,
 												LionIndexState *ix, int workmem,
