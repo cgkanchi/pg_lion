@@ -885,7 +885,7 @@ the last key had been hashed; the sorted build keeps one open page per level.
     amcanhash = false                amconsistentequality = true   amconsistentordering = false
     amcanbackward = false            amcanunique = false       amcanmulticol = false
     amoptionalkey = false            amsearcharray = true      amsearchnulls = true
-    amstorage = true (§17)           amclusterable = false     ampredlocks = false
+    amstorage = true (§17)           amclusterable = false     ampredlocks = true (§9)
     amcanparallel = false            amcanbuildparallel = true (17+, §24)   amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
     amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
@@ -1278,8 +1278,8 @@ call that looks like an index read. The values are evaluated once, before anythi
 index, with a flag that admits a multi-key column for this caller only (its EXECUTE check is then
 on the element type's equality, the function `GROUP BY e` would call), and every index the filter
 uses goes through `lion_reader_vet()`: row-level security, an unpopulated materialized view, an
-index the snapshot may not use, the PostgreSQL 16 `old_snapshot_threshold` guard and the
-SERIALIZABLE predicate lock. The filter's columns need SELECT and its operators' functions EXECUTE
+index the snapshot may not use and the PostgreSQL 16 `old_snapshot_threshold` guard; its lookups
+take the predicate locks of §9, "SERIALIZABLE". The filter's columns need SELECT and its operators' functions EXECUTE
 (`lion_check_functions_walker()`), as the query's would. `reader_contracts.sql`,
 `reader_checkxmin.spec` and `reader_serializable.spec` list both forms, filtered and not.
 
@@ -1484,10 +1484,9 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
 - **Table access method.** Everything here reads the heap's visibility map; the SQL functions
   refuse, and the CustomScan declines, a table whose table AM is not the heap, which ambuild has
   already refused to index (§2).
-- **SERIALIZABLE.** index_beginscan() takes a relation-level predicate lock on any index whose AM
-  has no ampredlocks; the count reads indexes without a scan, so it takes PredicateLockRelation on
-  every index it opens, before any lookup, so that absent keys are covered. Without it two
-  serializable transactions could each count an absent key, insert it, and both commit.
+- **SERIALIZABLE.** The count's lookups and walks predicate-lock the index pages that stand for the
+  keys they read, absent ones included ("SERIALIZABLE" below), and the blocks it counts from the
+  visibility map are page-locked in the heap, as an index-only scan locks them.
 - **Hot standby.** The pin interlock relies on ambulkdelete taking cleanup locks, and what replay
   takes depends on which resource manager wrote the record (§25).
   *Generic WAL*: replay takes only exclusive locks, so on a standby a reader's pin does not stop
@@ -1731,9 +1730,9 @@ that is missing the row it still sees).
 
 An index scan the executor starts through `index_beginscan()` gets four guarantees from PostgreSQL:
 the planner offers only an index the snapshot may use, row-level security is applied above it,
-`index_beginscan()` takes a relation-level predicate lock for an AM without `ampredlocks`, and the
-executor refuses an unpopulated materialized view. lion reads its indexes without a scan in two
-kinds of places, and `lion_reader.c` is where each gets what is missing:
+and the executor refuses an unpopulated materialized view (the fourth, the predicate locks, every
+reader takes the same way: "SERIALIZABLE" below). lion reads its indexes without a scan in two kinds
+of places, and `lion_reader.c` is where each gets what is missing:
 
 - **Functions handed an index by name** (the count functions, `lion_bm25()`) call
   `lion_reader_vet()`, or `lion_reader_open()`, which opens the index and table and then vets
@@ -1741,8 +1740,7 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   to the caller (the policies cannot be evaluated without reading the rows; the same query through
   the planner applies them, since lion's custom paths decline relations with security quals),
   and an index `lion_index_usable()` rejects for the snapshot. It also applies the PostgreSQL 16
-  `old_snapshot_threshold` guard, and takes the predicate lock before the first read so a
-  SERIALIZABLE read that finds nothing still conflicts with a later insert. `lion_reader_open()`
+  `old_snapshot_threshold` guard. `lion_reader_open()`
   takes a policy: `LION_READ_ROWS` for anything that returns or counts rows, which vets, and
   `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, and checks
   privileges and row-level security only. The statistics count every row, hidden ones included, so
@@ -1750,8 +1748,7 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   policies - would tell whether hidden rows hold a lexeme, and how many. It also refuses a
   partial index: both its callers rank over the whole table, and a partial index's walk would
   miss the rows its predicate leaves out while its N, df and avgdl described only the rest.
-- **Custom scan nodes**, whose index the planner vetted, call `lion_reader_lock()` for the
-  predicate lock on each lion index they read.
+- **Custom scan nodes**, whose index the planner vetted, need none of it.
 
 Privileges beyond SELECT on the table (per-column grants, EXECUTE on the functions a count stands
 for) depend on what the call stands for and stay with the caller (`lion_count_open_indexes()`).
@@ -1770,6 +1767,54 @@ function revoked from PUBLIC (a role without it, plain EXPLAIN, a generic plan m
 it, SECURITY DEFINER functions) against the ordinary plan, and
 `test/modules/lion_hooktest/sql/exec_hook.sql` runs the same list under an object access hook that
 refuses the function (`make hookcheck`). A new node adds a line to both.
+
+### SERIALIZABLE
+
+The handler sets `ampredlocks`, and the locks are page locks, as GIN's are: what a read depends on
+is where it found each key it looked for, or where the key would have been, and the reader locks
+the page that stands for that (`lion_reader.c`, which every reader goes through, the AM's own scans
+included):
+
+- an INLINE entry, or no entry at all: the directory leaf that holds it, or would;
+- a CHAIN entry: its posting tree's root, which stays at its block for the life of the set (a root
+  split pushes down, §22), so a lock on it stands for the key alone;
+- a walk (a range, a `GROUP BY`, `IS NOT NULL`, an ordered walk, the fk join's
+  groups): every leaf it reads, which covers every key an insert could put between the ones it saw,
+  and the root of every CHAIN entry of its column on them.
+
+Each lock is taken while the leaf the entry or the gap was read from is share-locked, before the
+reader believes anything the entry's header says (a set with no rows is skipped, a top-k is cut by
+the counts). An insert checks the one page that stands for its key - the leaf for a new or an
+INLINE entry, the root for a CHAIN one; a summary insert (§32) its bucket's, and the leaf too when
+it rekeys or adds a bucket - with `CheckForSerializableConflictIn()`, while it holds that leaf
+exclusive and before it changes anything (`lion_writer_check()`). It keeps the leaf until its TID
+is in the set. So either the insert comes first and the reader meets its TID, whose heap visit
+tells SSI of the conflict (a block counted from the visibility map is never one an uncommitted
+insert has touched), or the reader's lock is there when the insert looks.
+
+The locks follow the keys. A directory leaf split copies the leaf's locks to its new right sibling
+(`lion_dir_split()`, `PredicateLockPageSplit()`); the spill of an INLINE set copies its leaf's
+locks to the new root (`lion_entry_spill_pos()`), as GIN's `createPostingTree()` does; and VACUUM,
+deleting an empty CHAIN entry, moves its root's locks to the leaf (`lion_vacuum_delete_entries()`,
+`PredicateLockPageCombine()`), where an insert of the key will now look. Directory leaves are never
+deleted (§21), and posting-tree pages other than the root carry no locks. A deletion of directory
+leaves would have to move their locks to the right sibling, as nbtree does.
+
+Two cases lock the whole index: a lookup of an absent key that followed a run of colliding hashes
+onto the next leaf (an insert of the key starts from a leaf to the left of where the lookup ended),
+and the cross-type fallback of `lion_dir_find()`, which reads every leaf. The aggregates over keys
+(§37) lock the heap instead, as the sequential scan they stand for does; that also covers every
+insert, and is one lock where the index's would be every leaf and root. BM25's N and df are read
+under the same locks as the entries they come from (the empty key's entry, the lexemes'), so a
+ranking conflicts with every insert of a document, as its scores depend on N and avgdl. A
+`lionvec` index (§44) has no `ampredlocks` and core locks it whole.
+
+Locks the planner's estimates or `lion_verify()` take in a SERIALIZABLE transaction can only add
+false conflicts. `test/isolation/serializable_keys.spec` is the write skew through every reader,
+which must fail, against inserts of keys the reads did not touch, which must commit, for CHAIN keys
+that share one leaf and INLINE keys on leaves of their own; `serializable_moves.spec` moves the key
+between the read and the insert by each of the three transfers above; `reader_serializable.spec`
+has every reader's absent key.
 
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
@@ -5481,10 +5526,10 @@ direct count functions do, a table with row-level security enabled (it cannot ap
 and so does `lion_bm25_score()`: N, df and avgdl count the hidden rows, so under a policy any
 score, even one of a made-up document, would tell whether hidden rows hold a lexeme and how many.
 The index `lion_index_usable()` rejects for the snapshot (an `indcheckxmin` index built
-over a broken HOT chain holds the newest version only, which no heap recheck can repair). Before
-reading it takes the relation-level predicate lock on the index that `index_beginscan()` takes for
-an AM without `ampredlocks`, as the LionBm25 scan does too, so a SERIALIZABLE search that finds
-nothing still conflicts with a later insert of what it looked for.
+over a broken HOT chain holds the newest version only, which no heap recheck can repair). Its
+lookups - the empty key's, each lexeme's, found or not - take the predicate locks of §9,
+"SERIALIZABLE", as the LionBm25 scan's do, so a SERIALIZABLE search that finds nothing still
+conflicts with a later insert of what it looked for.
 
 **MaxScore** (Turtle and Flood) prunes the merge. A lexeme adds less than `idf * (k1 + 1)` to any
 row, since `tf / (tf + norm) < 1`; with the lexemes in ascending order of that maximum, the first
@@ -9680,8 +9725,8 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   §15 applies to that lookup as to every single lookup (a NOPIN set is re-located, or covered by
   another source, by the count itself), and no argument of §9, §11 or §15 changes: the fk set is to
   this node what one group's set is to §15's GROUP BY driver. The visibility cache is shared
-  across dimension rows as it is across groups, and the fk index takes the
-  `PredicateLockRelation()` every index the node opens takes.
+  across dimension rows as it is across groups, and each fk lookup takes the predicate locks of
+  §9, "SERIALIZABLE", as every lookup does.
 - **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
   is counted for a dimension row exactly when both are visible to it - which is the join.
 - **The WHERE sets' pins are held across the child** - until the node returns its first row. The
@@ -15877,9 +15922,8 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   Scan's do), and initialises two recheck quals with `ExecInitQual()`: the `lionqual` and the
   ordered index's original clauses. The scan slot is a buffer heap tuple slot. A non-MVCC snapshot
   is an internal error: every snapshot a SELECT's executor runs under is MVCC, and §30.5's
-  argument needs one. Under SERIALIZABLE it takes `PredicateLockRelation()` on every lion index
-  before any lookup (§9, "SERIALIZABLE": the AM has no `ampredlocks`, and the node reads it
-  without `index_beginscan()`).
+  argument needs one. Under SERIALIZABLE its lion lookups and walks take the page locks of §9,
+  "SERIALIZABLE", as every reader's do.
 - **The set is built at the first fetch after a start or a rescan** - or started lazily, below -
   not in BeginCustomScan: an exec Param is set by a nested loop after the node is initialised.
   Each lion leaf evaluates its
@@ -16201,10 +16245,10 @@ ordinary plan returns, in the same order.
 - **Non-MVCC snapshots** are refused (§30.4). **Hot standby**: nothing here reads the visibility
   map or relies on a pin, so a standby needs nothing an Index Scan does not.
 - **SERIALIZABLE.** The btree walk takes its own page predicate locks; each heap fetch takes a
-  tuple lock (`heap_hot_search_buffer()`); and the node takes a relation predicate lock on every
-  lion index it builds M from. A concurrent write that would change the answer inserts into a lion
-  index (a new matching row, or a non-HOT update that makes a skipped row match: a conflict with
-  the relation lock), or writes a row the node returned (its tuple lock), or inserts into a btree
+  tuple lock (`heap_hot_search_buffer()`); and the lion lookups M is built from lock the pages that
+  stand for their keys (§9, "SERIALIZABLE"). A concurrent write that would change the answer
+  inserts into a lion index (a new matching row, or a non-HOT update that makes a skipped row
+  match: a conflict with the page lock of its key), or writes a row the node returned (its tuple lock), or inserts into a btree
   page the walk read. A skipped non-member that is deleted, or updated and still does not match,
   does not change the answer; the ordinary plan's tuple lock on it is a false positive the node
   does not reproduce. test/isolation/ordered_serializable.spec is the write-skew case.
@@ -18676,9 +18720,9 @@ So is every walk during recovery, where a standby's snapshot holds nothing back 
 
 **What the walk locks.** It reads every row of the table, so it takes the predicate lock a
 sequential scan takes, `PredicateLockRelation()` on the heap, on every run and before the first
-look. The relation locks the node takes on the indexes it reads (§9, "SERIALIZABLE") do not
-stand in for it: they see every insert, since the sum over every row reads a whole index of the
-table, which every insert reaches, but a DELETE reaches no index. The counted walk's page locks
+look. Locks on the index pages it reads (§9, "SERIALIZABLE") would not stand in for it: they would
+see every insert, since the sum over every row reads a whole index of the table, which every insert
+reaches, but a DELETE reaches no index. The counted walk's page locks
 (§9) saw it; the walk from the entries' counts visits no heap page and took none.
 
 **An expression of the key waits for a look.** Giving an entry to its aggregates evaluates their
@@ -19958,7 +20002,7 @@ ordered ones.
   path has no sort keys and never switches, as a path whose pathkeys were not plain columns never
   did; the planner priced the full walk.
 - **Unchanged**: the lazy set, the early stop, the spill, rescans with changed Params, the
-  relation predicate locks on the lion indexes.
+  predicate locks of the lion lookups.
 
 ### 40.5 Correctness
 

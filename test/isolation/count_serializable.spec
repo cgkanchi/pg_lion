@@ -1,8 +1,8 @@
 # Two SERIALIZABLE transactions each count an absent key through the roaring
-# count paths, then each insert that key.  Reading the index takes a
-# relation-level predicate lock (as index_beginscan() would for an AM without
-# ampredlocks), so the second commit must fail with a serialization failure,
-# exactly as it does for the ordinary plan.
+# count paths, then each insert that key.  The lookup predicate-locks the leaf
+# where the key would be (DESIGN.md §9), which the insert checks, so the
+# second commit must fail with a serialization failure, exactly as it does
+# for the ordinary plan.
 setup
 {
     CREATE EXTENSION IF NOT EXISTS pg_lion;

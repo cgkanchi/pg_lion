@@ -1594,6 +1594,14 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 				kind = lion_entry_kind(e);
 		}
 
+		/*
+		 * SERIALIZABLE (DESIGN.md §9): the summary the row goes into, and the
+		 * leaf as well when its key or the run of summaries changes - or a
+		 * new open bucket is made - below.
+		 */
+		if (kind >= 0)
+			lion_writer_check(index, buf, off, true);
+
 		if (kind == LION_KIND_SUMMARY)
 		{
 			/* lion_dir_search_first() found its key at or above ours. */
@@ -1621,12 +1629,17 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 				else
 					lion_insert_chain(index, heaprel, buf, off, ckey, lo, NULL);
 			}
-			else if (lion_entry_ntids(e) >= (uint64) bucket_tids)
-				lion_summary_close_last(index, heaprel, state, buf, off, key,
-										hash, ckey, lo);
 			else
-				done = lion_summary_rekey_insert(index, heaprel, state, buf,
-												 off, key, hash, ckey, lo);
+			{
+				lion_writer_check(index, buf, off, false);
+				if (lion_entry_ntids(e) >= (uint64) bucket_tids)
+					lion_summary_close_last(index, heaprel, state, buf, off,
+											key, hash, ckey, lo);
+				else
+					done = lion_summary_rekey_insert(index, heaprel, state,
+													 buf, off, key, hash,
+													 ckey, lo);
+			}
 			UnlockReleaseBuffer(buf);
 			if (done)
 				return;
@@ -1695,6 +1708,7 @@ lion_summary_insert(Relation index, Relation heaprel, LionState *state,
 				}
 			}
 
+			lion_writer_check(index, buf, off, false);
 			last = lion_summary_make_last(state, key, hash, ckey, lo, &size);
 			lion_dir_add_entry(index, heaprel, ix, &buf, off, movedright,
 							   last, size);
@@ -1740,6 +1754,9 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	 */
 	found = lion_dir_find(index, heaprel, state->ix, &sk, BUFFER_LOCK_EXCLUSIVE,
 						  true, &leafbuf, &entryoff, &movedright);
+
+	/* SERIALIZABLE: the page that stands for the key (DESIGN.md §9) */
+	lion_writer_check(index, leafbuf, entryoff, found);
 
 	if (!found)
 		lion_insert_new_entry(index, heaprel, state, &leafbuf, entryoff,

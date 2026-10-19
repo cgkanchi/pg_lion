@@ -538,11 +538,14 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
 	if (!lion_find_null_entry(index, col, BUFFER_LOCK_SHARE,
 							 &entrybuf, &entryoff))
 	{
+		lion_reader_lock_absent(index, entrybuf, false);	/* §9 */
 		if (BufferIsValid(entrybuf))
 			UnlockReleaseBuffer(entrybuf);
 		return 0;
 	}
 
+	lion_reader_lock_entry(index, BufferGetBlockNumber(entrybuf),
+						   lion_page_entry(BufferGetPage(entrybuf), entryoff));
 	return lion_emit_entry(index, entrybuf, entryoff, tbm, recheck);
 }
 
@@ -742,6 +745,8 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 				elog(ERROR, "lion index: block %u is not a directory leaf",
 					 w->nextblk);
 			}
+			/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
+			lion_reader_lock_leaf(w->index, buf, (AttrNumber) w->col->attno);
 			memcpy(cpage, page, BLCKSZ);
 			if (w->keeppin)
 			{
@@ -5021,6 +5026,8 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
 	if (!LionPageIsLeaf(page))
 		elog(ERROR, "lion index \"%s\": block %u is not a directory leaf",
 			 RelationGetRelationName(w->index), BufferGetBlockNumber(buf));
+	/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
+	lion_reader_lock_leaf(w->index, buf, w->attno);
 	memcpy(cpage, page, BLCKSZ);
 	lion_dir_pages_read++;
 	w->leaves++;
@@ -5190,9 +5197,13 @@ lion_order_null_entry(LionOrderWalk *w)
 		Page		page = BufferGetPage(buf);
 		ItemId		iid = PageGetItemId(page, off);
 
+		lion_reader_lock_entry(w->index, BufferGetBlockNumber(buf),
+							   lion_entry_at(page, iid));
 		lion_order_take_entry(w, lion_entry_at(page, iid),
 							  ItemIdGetLength(iid));
 	}
+	else
+		lion_reader_lock_absent(w->index, buf, false);	/* §9 */
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
 	return found;

@@ -682,12 +682,11 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	lion_check_aggregate_execute(F_COUNT_);
 
 	/*
-	 * Row-level security, snapshot eligibility and the predicate lock, as
-	 * for every direct reader (lion_reader_vet()).  The snapshot is known by
-	 * now, which is why this is the last thing done before the lookup; the
-	 * lock is taken before looking, so that an absent key is covered too:
-	 * otherwise two SERIALIZABLE transactions could each count an absent
-	 * key, insert it, and both commit.
+	 * Row-level security and snapshot eligibility, as for every direct
+	 * reader (lion_reader_vet()).  The snapshot is known by now, which is why
+	 * this is the last thing done before the lookup; the lookup itself
+	 * predicate-locks the entry, or the gap where an absent key would be
+	 * (DESIGN.md §9).
 	 */
 	for (i = 0; i < nidx; i++)
 		lion_reader_vet(call->heap, call->index[i], snapshot, "count");

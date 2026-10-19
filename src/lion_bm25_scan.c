@@ -637,13 +637,6 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	lion_check_table_am(node->ss.ss_currentRelation);
 	st->heapslot = table_slot_create(node->ss.ss_currentRelation,
 									 &estate->es_tupleTable);
-
-	/*
-	 * The relation-level predicate lock index_beginscan() takes for an AM
-	 * without ampredlocks, before the index is read, so that a SERIALIZABLE
-	 * search that finds nothing is covered too.
-	 */
-	lion_reader_lock(st->index, estate->es_snapshot);
 	st->valid = lion_bm25_prepare(st->index, st->query, st->k1, st->b, &st->q);
 }
 
