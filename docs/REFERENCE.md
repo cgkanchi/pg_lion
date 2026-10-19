@@ -553,8 +553,12 @@ working around a bad choice:
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
   own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
-  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most. Off,
-  Lion prices its paths from the planner's estimate.
+  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most: the
+  containers of the clause with the fewest rows, chosen among its own - every one, where they are
+  few, which makes the measure an exact count - so that a table loaded in batches is measured as
+  well as one whose rows are mixed ("A sample of the driver's own rows"). A sample that meets none
+  of the AND's rows lowers the estimate only as far as it can rule out, not to one row ("What a
+  sample can rule out"). Off, Lion prices its paths from the planner's estimate.
 - `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
   filters correct the planner's row estimate for that table as well, so that joins above it are
   sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
@@ -665,7 +669,12 @@ the sequential scan the same way: the covering walk's marked-up price must beat 
 scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
 access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
-is a generic plan's parameter (priced at its dearest already). PostgreSQL's `enable_*` settings and Lion's
+is a generic plan's parameter (priced at its dearest already). A plain count of one table is
+always priced below an aggregate over the access method's own plain or bitmap scan that reads
+every set the count reads - every condition of the `WHERE` an index condition of the index the
+count reads it from - since that scan does the count's work and fetches every row besides: past
+the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
+same sets"). PostgreSQL's `enable_*` settings and Lion's
 switches above still force a plan either way.
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in

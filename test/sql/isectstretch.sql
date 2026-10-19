@@ -1,0 +1,237 @@
+-- The intersection probe on a heap loaded in batches (DESIGN.md §29.11, "A
+-- sample of the driver's own rows" and "What a sample can rule out"), and a
+-- count against the access method's own scan of its sets (DESIGN.md §39,
+-- "The AM's own scan of the same sets").
+--
+-- The heap is loaded batch by batch: a source, then a wave of it, each
+-- batch's rows in the order of a kind.  A wave's rows lie in one stretch
+-- of two or three container keys a source, with the other waves'
+-- stretches between, and a stretch begins with the first kind's rows.  The
+-- probe used to sample the driver - the clause of fewest rows - at its first
+-- container in each stratum of the heap's container keys: of a driver in
+-- stretches, nearly always the first container of a stretch, whatever the
+-- stratum, and so a batch's first rows.  The AND of a wave and the last
+-- kind met no row there, was measured empty, and estimated at one row - and
+-- the rows correction made it the relation's.  The probe now samples the
+-- driver's containers by their rank among its own, rules out those another
+-- clause has no container at, and counts the AND where what is left is few;
+-- and a sample that meets no row lowers an estimate only as far as it can
+-- rule out.
+--
+-- ANALYZE samples the whole table, so its statistics - and the plans - are
+-- the same on every run.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+
+-- 4 sources by 12 waves, source-major, a batch of 4,000 rows each - about
+-- two of the heap's container keys of 64 pages - in kind order: 'a' 45%, 'b'
+-- 25%, 'c' 11%, 'd' 19%.  tag holds a value for the even sources only, and
+-- flag for the sources not divisible by 3.
+CREATE TABLE istr (src int NOT NULL, wave int NOT NULL, kind text NOT NULL,
+				   tag text, flag int, n int NOT NULL)
+	WITH (fillfactor = 20, autovacuum_enabled = off);
+INSERT INTO istr
+SELECT s, v,
+	   CASE WHEN j < 1800 THEN 'a' WHEN j < 2800 THEN 'b'
+			WHEN j < 3240 THEN 'c' ELSE 'd' END,
+	   CASE WHEN s % 2 = 0 THEN (ARRAY['x', 'y', 'u'])[(j / 7) % 3 + 1] END,
+	   CASE WHEN s % 3 <> 0 THEN j % 3 END,
+	   j
+  FROM generate_series(1, 4) s, generate_series(1, 12) v,
+	   generate_series(0, 3999) j
+ ORDER BY s, v, j;
+CREATE INDEX istr_i ON istr USING lion (src, wave, kind, tag, flag);
+VACUUM (FREEZE, ANALYZE) istr;
+-- 93 container keys on a 64-bit build
+SELECT pg_relation_size('istr') / 8192 / 64 BETWEEN 64 AND 128 AS container_keys;
+
+/*
+ * istr_rows() is the row estimate of the Bitmap Index Scan of istr_i that
+ * answers q - amcostestimate()'s selectivity, lion's own estimate - with the
+ * probe on or off; istr_relrows() the relation's (a sequential scan's rows,
+ * which the rows correction sets from the probe).
+ */
+CREATE FUNCTION istr_rows(q text, probe boolean) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+	r	bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_intersection_probe',
+					   CASE WHEN probe THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	r := (regexp_match(j::text, '"Node Type": "Bitmap Index Scan",[^}]*"Index Name": "istr_i",[^}]*"Plan Rows": (\d+)'))[1];
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_intersection_probe', 'on', true);
+	RETURN r;
+END $$;
+
+CREATE FUNCTION istr_relrows(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN (j->0->'Plan'->>'Plan Rows')::bigint;
+END $$;
+
+/* The rows q returns, read by a sequential scan: the reference answer. */
+CREATE FUNCTION istr_actual(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	n	bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'SELECT count(*) FROM (' || q || ') s' INTO n;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN n;
+END $$;
+
+-- ---------- 1. the estimates ----------
+-- Every conjunction below but the last two holds rows, and core's product
+-- of its clauses' selectivities is within a factor of three of them - the
+-- columns are independent over the table - so the probe, which measures
+-- them, leaves core's estimate as it is.  The sample of old met none of the
+-- AND's rows in conjunctions 2 and 4, measured them empty and estimated them
+-- at one row, and a few in 3, five times short: the driver, wave's rows, lies
+-- in four stretches of the heap, and every one sampled was a batch's first
+-- container, whose rows are of kind 'a' only.
+-- 5, 6: a tag only the even sources have, beside its source, a wave and
+--    a flag; the probe rules out the containers of the other sources, and
+--    counts what is left.
+-- 7, 8: a source and a tag it never has: empty, and counted so - one row.
+CREATE TABLE istr_q (n int, q text);
+INSERT INTO istr_q VALUES
+	(1, $$SELECT n FROM istr WHERE wave = 5 AND kind = 'd'$$),
+	(2, $$SELECT n FROM istr WHERE src = 4 AND wave = 11 AND kind = 'd'$$),
+	(3, $$SELECT n FROM istr WHERE wave = 5 AND kind = 'd' AND flag = 1$$),
+	(4, $$SELECT n FROM istr WHERE src = 2 AND wave = 5 AND kind = 'd' AND flag IN (0, 1)$$),
+	(5, $$SELECT n FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag IN (0, 1)$$),
+	(6, $$SELECT n FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1$$),
+	(7, $$SELECT n FROM istr WHERE src = 3 AND tag = 'x'$$),
+	(8, $$SELECT n FROM istr WHERE src = 1 AND wave = 5 AND tag = 'u'$$);
+SELECT n, istr_actual(q) AS actual, istr_rows(q, true) AS probed,
+	   istr_rows(q, false) AS unprobed, istr_relrows(q) AS relation
+  FROM istr_q ORDER BY n;
+-- within a factor of three of the rows, and the relation's rows the same
+SELECT n, istr_rows(q, true) BETWEEN istr_actual(q) / 3 AND istr_actual(q) * 3
+			AS probed_within_3x,
+	   istr_relrows(q) = istr_rows(q, true) AS relation_agrees
+  FROM istr_q WHERE n <= 6 ORDER BY n;
+
+-- ---------- 2. the count against its own scan ----------
+/* Is q's plan, with nothing disabled, the count pushdown? */
+CREATE FUNCTION istr_pushed(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln	text;
+	res	boolean := false;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			res := true;
+		END IF;
+	END LOOP;
+	RETURN res;
+END $$;
+
+/*
+ * ... with the count's own price made `share` of the cost of core's plan of
+ * q: the access method's scan of the same sets, which fetches each row the
+ * count only counts, feeding an Aggregate.  The count's own price is had with
+ * the index scans off, where nothing of core's reads the sets; it is set to
+ * that share by pg_lion.agg_rate, the rate a count is priced at against an
+ * aggregate (DESIGN.md §39).  NULL where either plan is not what it should be.
+ */
+CREATE FUNCTION istr_pushed_at(q text, share float8) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	j		json;
+	own		float8;
+	scan	float8;
+	res		boolean;
+BEGIN
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	IF j->0->'Plan'->>'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
+		RETURN NULL;
+	END IF;
+	own := (j->0->'Plan'->>'Total Cost')::float8;
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF j->0->'Plan'->>'Node Type' <> 'Aggregate' OR
+	   j->0->'Plan'->'Plans'->0->>'Node Type' NOT IN ('Index Scan', 'Bitmap Heap Scan') THEN
+		RETURN NULL;
+	END IF;
+	scan := (j->0->'Plan'->>'Total Cost')::float8;
+
+	PERFORM set_config('pg_lion.agg_rate', (share * scan / own)::text, true);
+	res := istr_pushed(q);
+	PERFORM set_config('pg_lion.agg_rate', '1', true);
+	RETURN res;
+END $$;
+
+-- The four clauses of conjunction 6, counted: the count, with the probe and
+-- without it.
+SELECT istr_pushed(q) AS probed
+  FROM (VALUES ($$SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1$$)) v(q);
+SET pg_lion.enable_intersection_probe = off;
+SELECT istr_pushed(q) AS unprobed
+  FROM (VALUES ($$SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1$$)) v(q);
+RESET pg_lion.enable_intersection_probe;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1;
+
+-- The count reads the sets the scan reads, and the scan fetches every row
+-- besides: whatever either is priced at, the count is priced below the scan,
+-- past add_path()'s fuzz of 1%.  Within it, the Aggregate over the scan,
+-- parallel safe, won the tie against the count, which is not: a private
+-- workload's count, priced 0.8% below the scan, went to the scan, and so did
+-- the counts here priced 0.5% below it, at it and at twice it.  Parallel
+-- plans are allowed, as by default, or no path would be parallel safe.
+SET max_parallel_workers_per_gather = 2;
+SELECT n, istr_pushed_at(c, 0.995) AS within_fuzz, istr_pushed_at(c, 1.0) AS tie,
+	   istr_pushed_at(c, 2.0) AS twice
+  FROM (SELECT n, replace(q, 'SELECT n FROM', 'SELECT count(*) FROM') AS c
+		  FROM istr_q WHERE n IN (2, 6)) s
+ ORDER BY n;
+RESET max_parallel_workers_per_gather;
+
+-- and the counts are the sequential scan's
+SELECT n, (SELECT count(*) FROM istr WHERE src = 4 AND wave = 11 AND kind = 'd') AS pushed,
+	   istr_actual(q) AS actual
+  FROM istr_q WHERE n = 2;
+SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1;
+SELECT count(*) FROM istr WHERE src = 3 AND tag = 'x';
+
+DROP TABLE istr, istr_q;
+DROP FUNCTION istr_rows(text, boolean), istr_relrows(text),
+	istr_actual(text), istr_pushed(text), istr_pushed_at(text, float8);
+RESET default_statistics_target;
