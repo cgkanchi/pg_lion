@@ -3436,6 +3436,82 @@ lion_container_range_cardinality(const LionContainer *c, uint16 lo_start, uint16
 	}
 }
 
+uint32
+lion_container_places(const LionContainer *c)
+{
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			return array_card(c);
+		case LION_CT_BITSET:
+		case LION_CT_NARROW:
+			return (uint32) LION_WIDTH_WORDS(lion_container_width(c)) * 64;
+		case LION_CT_RUN:
+			return Min((uint32) c->cardinality, (uint32) LION_CONTAINER_RANGE);
+		default:
+			Assert(false);
+			return 0;
+	}
+}
+
+uint32
+lion_container_place(const LionContainer *c, uint16 lo)
+{
+	uint32		places = lion_container_places(c);
+	uint32		place;
+
+	Assert((uint32) lo <= LION_LO_MAX);
+	if (places == 0)
+		return 0;
+	switch (c->type)
+	{
+		case LION_CT_ARRAY:
+			place = array_lower_bound(array_cdata(c), array_card(c), lo);
+			break;
+		case LION_CT_BITSET:
+		case LION_CT_NARROW:
+			{
+				uint32		k = lion_container_width(c);
+				uint32		m = (uint32) (lo & LION_LO_MASK);
+
+				place = bitmap_holds(m, k) ? bitmap_bit(m, k) : places - 1;
+				break;
+			}
+		case LION_CT_RUN:
+			place = (lo == 0) ? 0 :
+				lion_container_range_cardinality(c, 0, (uint16) (lo - 1));
+			break;
+		default:
+			Assert(false);
+			place = 0;
+			break;
+	}
+	/* only a damaged container's member can be past them */
+	return Min(place, places - 1);
+}
+
+uint32
+lion_container_to_places(const LionContainer *c, uint16 *out, uint32 *places)
+{
+	uint32		n = lion_container_to_array(c, out);
+	uint32		last = lion_container_places(c);
+	uint32		i;
+
+	last = (last == 0) ? 0 : last - 1;
+	if (is_bitmap(c))
+	{
+		for (i = 0; i < n; i++)
+			places[i] = lion_container_place(c, out[i]);
+	}
+	else
+	{
+		/* the i-th member in ascending order has i below it */
+		for (i = 0; i < n; i++)
+			places[i] = Min(i, last);
+	}
+	return n;
+}
+
 /*
  * remove_range() the representation-independent way: through a BITSET, which
  * the removal then shrinks to an ARRAY if it can.  For a RUN whose split

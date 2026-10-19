@@ -15,14 +15,15 @@
  *
  *	  The file is the caller's.  The arena asks for it to be extended, zero
  *	  filled and allocated on disk, through `extend`, and for its descriptor
- *	  through `fd`, and maps what was extended, shared, so that the kernel
- *	  writes the pages to the file and takes them back under memory
- *	  pressure, which is the spill: a page is in memory while the page cache
- *	  keeps it, and no setting of the server's counts it.  Zero filling
- *	  through the caller is what makes the pages exist before they are
- *	  mapped - a page allocated on a full disk at the first write to it would
- *	  end the process with SIGBUS - and what lets the caller's file layer
- *	  count the bytes (temp_file_limit, log_temp_files).
+ *	  through `fd`, and maps what was extended, shared (POSIX mmap(), which
+ *	  the arena needs), so that the kernel writes the pages to the file and
+ *	  takes them back under memory pressure, which is the spill: a page is
+ *	  in memory while the page cache keeps it, and no setting of the
+ *	  server's counts it.  Zero filling through the caller is what makes the
+ *	  pages exist before they are mapped - a page allocated on a full disk
+ *	  at the first write to it would end the process with SIGBUS - and what
+ *	  lets the caller's file layer count the bytes (temp_file_limit,
+ *	  log_temp_files).
  *
  *	  No palloc, no elog: the struct and the regions' array are the
  *	  caller's, a failure comes back as NULL with errno set, and the file is
@@ -107,9 +108,6 @@ lion_arena_class_size(int cls)
 		return LION_ARENA_SMALL_MAX;
 	return (Size) 16 << (cls - 1);
 }
-
-/* Whether this platform can map a file at all (not on Windows). */
-extern bool lion_arena_available(void);
 
 /*
  * Set up an arena over no regions yet, with room for maxregions of them in

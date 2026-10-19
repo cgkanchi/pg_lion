@@ -261,6 +261,26 @@ extern void lion_container_iterate(const LionContainer *c, lion_lo_callback cb, 
 extern uint32 lion_container_to_array(const LionContainer *c, uint16 *out);
 
 /*
+ * PLACES: a container's members numbered within 0 .. places(c) - 1, a place
+ * a member, for a caller that keeps a bit a member - LionOrdered's walk,
+ * which marks the members it has met (DESIGN.md §30.4, "Stopping early").  A
+ * bitmap's place for lo is lo's bit in it, so its places are its bits
+ * (LION_WIDTH_WORDS() of its width, times 64: as many bits as its payload
+ * has) and a place is found at no cost; an ARRAY's or a RUN's is lo's rank
+ * among its members, so its places are its members, a place found by a
+ * binary search of the ARRAY or a pass over the RUN's runs below lo.
+ * place() of a non-member is some place.  to_places() is to_array() with
+ * every member's place beside it, in places[], which must hold
+ * LION_CONTAINER_RANGE of them; for an ARRAY or a RUN that is its index.
+ * Of a damaged container every place is still below places(c) - 0 when that
+ * is 0 - and two members may share one.
+ */
+extern uint32 lion_container_places(const LionContainer *c);
+extern uint32 lion_container_place(const LionContainer *c, uint16 lo);
+extern uint32 lion_container_to_places(const LionContainer *c, uint16 *out,
+									   uint32 *places);
+
+/*
  * Remove every member for which pred() returns true (VACUUM).  Returns the
  * number removed.  Enforces the size invariant; the caller should then call
  * lion_container_optimize() and delete the container if cardinality == 0.

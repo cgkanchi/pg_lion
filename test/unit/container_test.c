@@ -309,6 +309,8 @@ build_narrow_direct(CBuf *b, const Ref *r, uint32 k)
 static uint16 scratch_array[LION_CONTAINER_RANGE];
 static uint16 scratch_iter[LION_CONTAINER_RANGE];
 static uint64 scratch_img[LION_BITSET_WORDS];
+static uint32 scratch_places[LION_CONTAINER_RANGE];
+static uint64 scratch_seen[LION_BITSET_WORDS];
 
 /* Every bit block_mask() may set: the LION_BLOCKS_PER_CONTAINER blocks. */
 #define TEST_BLOCK_BITS	(~UINT64CONST(0) >> (64 - LION_BLOCKS_PER_CONTAINER))
@@ -451,6 +453,48 @@ verify_full(const LionContainer *c, const Ref *r)
 	CHECK(bad == 0, "or_into_bitset() ORs exactly the members into the image");
 	CHECK(lion_container_block_mask(c) == expect_blocks,
 		  "block_mask() names exactly the blocks with members");
+
+	/*
+	 * Places: as many as a bitmap's bits or the members of an ARRAY or a
+	 * RUN, a member's its bit or its rank, no two members' the same, and
+	 * to_places() the members of to_array() with place()'s places.
+	 */
+	{
+		uint32		np = lion_container_places(c);
+		uint32		expect_np = r->card;
+		bool		bitmap = (c->type == LION_CT_BITSET ||
+							  c->type == LION_CT_NARROW);
+
+		if (bitmap)
+			expect_np = (uint32) LION_WIDTH_WORDS(lion_container_width(c)) * 64;
+		CHECK(np == expect_np,
+			  "places() is a bitmap's bits, an ARRAY's or a RUN's members");
+		n = lion_container_to_places(c, scratch_iter, scratch_places);
+		CHECK(n == r->card, "to_places() count");
+		memset(scratch_seen, 0, sizeof(scratch_seen));
+		bad = 0;
+		for (i = 0; i < n; i++)
+		{
+			uint32		p = scratch_places[i];
+			uint16		lo = scratch_iter[i];
+
+			if (lo != scratch_array[i] || p >= np ||
+				(scratch_seen[p >> 6] >> (p & 63)) & 1)
+			{
+				bad++;
+				continue;
+			}
+			scratch_seen[p >> 6] |= UINT64CONST(1) << (p & 63);
+			if (lion_container_place(c, lo) != p)
+				bad++;
+			if (!bitmap && p != i)
+				bad++;
+			if (bitmap && p != test_narrow_bit(lo, lion_container_width(c)))
+				bad++;
+		}
+		CHECK(bad == 0,
+			  "to_places() and place(): a place a member, its bit or its rank");
+	}
 
 	/* the size must be exactly what the representation implies */
 	switch (c->type)
@@ -1463,6 +1507,78 @@ test_remove_if(void)
  *						ranges over every type
  * ----------------------------------------------------------------
  */
+
+/*
+ * Places by hand, one container of each kind: an ARRAY's and a RUN's are the
+ * ranks of their members, a NARROW's and a BITSET's the bits of their
+ * members, and an empty container has none.  verify_full() checks them on
+ * every container the other tests build, and damage_exercise() on damaged
+ * ones.
+ */
+static void
+test_places(void)
+{
+	uint32		bit;
+
+	phase("places");
+
+	ref_init(&ref_a);
+	ref_add(&ref_a, 3);
+	ref_add(&ref_a, 70);
+	ref_add(&ref_a, LION_CONTAINER_RANGE - 1);
+	build_by_append(&buf_a, &ref_a);
+	CHECK(buf_a.c.type == LION_CT_ARRAY, "three members: an ARRAY");
+	CHECK(lion_container_places(&buf_a.c) == 3, "an ARRAY's places are its members");
+	CHECK(lion_container_place(&buf_a.c, 3) == 0 &&
+		  lion_container_place(&buf_a.c, 70) == 1 &&
+		  lion_container_place(&buf_a.c, LION_CONTAINER_RANGE - 1) == 2,
+		  "an ARRAY member's place is its rank");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* two runs: 10 .. 19 and 100 .. 104 */
+	ref_init(&ref_a);
+	for (bit = 10; bit < 20; bit++)
+		ref_add(&ref_a, bit);
+	for (bit = 100; bit < 105; bit++)
+		ref_add(&ref_a, bit);
+	build_run_direct(&buf_a, &ref_a);
+	CHECK(lion_container_places(&buf_a.c) == 15, "a RUN's places are its members");
+	CHECK(lion_container_place(&buf_a.c, 10) == 0 &&
+		  lion_container_place(&buf_a.c, 19) == 9 &&
+		  lion_container_place(&buf_a.c, 100) == 10 &&
+		  lion_container_place(&buf_a.c, 102) == 12,
+		  "a RUN member's place is its rank, across runs");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* a NARROW of width 1: offset 5 of the container's third block */
+	ref_init(&ref_a);
+	ref_add(&ref_a, (2U << LION_OFFSET_BITS) + 5);
+	ref_add(&ref_a, 7);
+	build_narrow_direct(&buf_a, &ref_a, 1);
+	CHECK(lion_container_places(&buf_a.c) == LION_BLOCKS_PER_CONTAINER * 64,
+		  "a NARROW of width 1 has a place a bit: 64 a block");
+	CHECK(lion_container_place(&buf_a.c, (2U << LION_OFFSET_BITS) + 5) == 2 * 64 + 5 &&
+		  lion_container_place(&buf_a.c, 7) == 7,
+		  "a NARROW member's place is its bit");
+	verify_full(&buf_a.c, &ref_a);
+
+	/* ... and the same members in a BITSET: the member itself */
+	lion_container_to_bitset(&buf_a.c);
+	CHECK(buf_a.c.type == LION_CT_BITSET, "to_bitset() forces a BITSET");
+	CHECK(lion_container_places(&buf_a.c) == LION_CONTAINER_RANGE,
+		  "a BITSET has a place a member it can hold");
+	CHECK(lion_container_place(&buf_a.c, (2U << LION_OFFSET_BITS) + 5) ==
+		  (2U << LION_OFFSET_BITS) + 5,
+		  "a BITSET member's place is the member");
+	verify_full(&buf_a.c, &ref_a);
+
+	ref_init(&ref_a);
+	lion_container_init(&buf_a.c, TEST_CKEY);
+	CHECK(lion_container_places(&buf_a.c) == 0 &&
+		  lion_container_place(&buf_a.c, 12345) == 0,
+		  "an empty container has no places, and place() says 0");
+	verify_full(&buf_a.c, &ref_a);
+}
 
 static void
 test_ranges(void)
@@ -3147,6 +3263,7 @@ static LionContainer *dmg_b;
 static LionContainer *dmg_dst;
 static LionContainer *dmg_work;
 static uint16 *dmg_out;
+static uint32 *dmg_places;
 static uint64 *dmg_img;			/* LION_BITSET_BYTES */
 
 /*
@@ -3203,6 +3320,27 @@ damage_exercise(const LionContainer *c, const LionContainer *other)
 	CHECK(bad == 0, "damaged: to_array() writes only lo values in range");
 	CHECK(guard_ok(dmg_out, LION_CONTAINER_RANGE * sizeof(uint16)),
 		  "damaged: to_array() stays inside its 32768-entry output");
+
+	/* places: every one below places() (0 when that is 0), at most 32768 */
+	{
+		uint32		np = lion_container_places(c);
+		uint32		top = Max(np, 1);
+		uint32		m;
+
+		CHECK(np <= LION_CONTAINER_RANGE, "damaged: places() is at most 32768");
+		CHECK(lion_container_place(c, (uint16) lo) < top,
+			  "damaged: place() is below places()");
+		m = lion_container_to_places(c, dmg_out, dmg_places);
+		CHECK(m == n, "damaged: to_places() and to_array() agree on the count");
+		bad = 0;
+		for (i = 0; i < m && i < LION_CONTAINER_RANGE; i++)
+			if (dmg_places[i] >= top ||
+				lion_container_place(c, dmg_out[i]) >= top)
+				bad++;
+		CHECK(bad == 0, "damaged: to_places() and place() give places below places()");
+		CHECK(guard_ok(dmg_places, LION_CONTAINER_RANGE * sizeof(uint32)),
+			  "damaged: to_places() stays inside its 32768-entry output");
+	}
 
 	(void) lion_container_and_cardinality(c, other);
 	(void) lion_container_and_cardinality(other, c);
@@ -6759,6 +6897,7 @@ main(void)
 	test_append_matches_add();
 
 	test_remove_if();
+	test_places();
 	test_ranges();
 	test_setops();
 	test_setops_special();
@@ -6779,6 +6918,7 @@ main(void)
 	dmg_dst = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	dmg_work = exact_alloc(LION_CONTAINER_MAX_SIZE);
 	dmg_out = exact_alloc(LION_CONTAINER_RANGE * sizeof(uint16));
+	dmg_places = exact_alloc(LION_CONTAINER_RANGE * sizeof(uint32));
 	dmg_img = exact_alloc(LION_BITSET_BYTES);
 	rng_seed(UINT64CONST(0x5EED3000));
 	test_damaged_reported();
