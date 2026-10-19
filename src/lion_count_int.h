@@ -398,6 +398,8 @@ typedef struct LionMatSet
 	uint32		dirlen;			/* keys dir[] covers */
 	bool		collected;		/* every item a container, one a key: an
 								 * intersection lion_sources_collect() made */
+	MemoryContext unioncxt;		/* a range's union in memory: the context
+								 * its containers are in, or NULL */
 
 	/*
 	 * A participant's view of a copy in dynamic shared memory

@@ -258,8 +258,10 @@ lion_join_child_next(LionCountScanState *st)
  * (LION_FKJOIN_PROBE_PAGE_COST) and the unions built at a key
  * (LION_UNION_KEY_COST) - less the count against a copy the key would have
  * made instead, set up (LION_FKJOIN_COPY_COUNT_COST) and looked up at the
- * key's own containers (LION_FKJOIN_COPY_PROBE_COST).  What both ways share
- * - the key's own set read and counted - is in neither.
+ * key's own containers (LION_FKJOIN_COPY_PROBE_COST), and, for a copy that
+ * would spill, read back from its file there, a container at a time
+ * (LION_SPILL_READ_COST, lion_join_copy_price()).  What both ways share - the
+ * key's own set read and counted - is in neither.
  *
  * A count can come out cheaper probed than against a copy - a key of one
  * container over filters small enough to be in memory - and the account
@@ -307,7 +309,8 @@ lion_join_count_key(LionCountScanState *st)
 			mem * LION_MEMORY_PROBE_COST +
 			(double) pages * LION_FKJOIN_PROBE_PAGE_COST +
 			(double) (st->stats.unions_built - unions) * LION_UNION_KEY_COST -
-			key * LION_FKJOIN_COPY_PROBE_COST;
+			key * LION_FKJOIN_COPY_PROBE_COST -
+			((*js->copypagesp > 0) ? key * LION_SPILL_READ_COST : 0.0);
 		*js->rentp = Max(*js->rentp + rent, 0.0);
 		(*js->probedp)++;
 	}
@@ -338,15 +341,15 @@ lion_join_count_key(LionCountScanState *st)
  * the two ways chosen in hindsight would have; a run that never reaches the
  * price was right to probe.
  *
- * Only where a copy can be made and is expected to fit: a hash join's
- * memory (get_hash_memory_limit()), what a plan that collects is given - or
- * over a partitioned fact what the leaves' copies before it left of it -
- * and never on a hot standby, which makes no copy.  A copy that turns out
- * larger than expected spills, as a planned one does.  The copy is taken
- * after the query's snapshot, and is only ever counted beside a located fk
- * set, which is all "Why a stale copy is safe" asks of it; the filters were
- * located in this run, and the collection reads them as a planned one does,
- * pinning nothing.  In a parallel plan each participant keeps its own
+ * Only where a copy can be made, and never on a hot standby, which makes
+ * none.  It is given a hash join's memory (get_hash_memory_limit()), what a
+ * plan that collects is given - or over a partitioned fact what the leaves'
+ * copies before it left of it - and spills past it, as a planned one does;
+ * one expected to spill is priced so, the counts against it included.  The
+ * copy is taken after the query's snapshot, and is only ever counted beside
+ * a located fk set, which is all "Why a stale copy is safe" asks of it; the
+ * filters were located in this run, and the collection reads them as a
+ * planned one does, pinning nothing.  In a parallel plan each participant keeps its own
  * account and makes its own copy, as the leader of a plan run without its
  * workers does: a probing plan has sized no shared copy, and the
  * participants reach the price at keys of their own.  Each run - each
@@ -365,8 +368,10 @@ lion_join_switch_reset(LionCountScanState *st)
 	js->rent = 0;
 	js->buy = -1;
 	js->probed = 0;
+	js->copypages = 0;
 	js->rentp = &js->rent;
 	js->probedp = &js->probed;
+	js->copypagesp = &js->copypages;
 	if (js->part.leaf != NULL)
 	{
 		for (p = 0; p < st->npart; p++)
@@ -374,6 +379,7 @@ lion_join_switch_reset(LionCountScanState *st)
 			js->part.leaf[p].rent = 0;
 			js->part.leaf[p].buy = -1;
 			js->part.leaf[p].probed = 0;
+			js->part.leaf[p].copypages = 0;
 		}
 	}
 }
@@ -438,8 +444,8 @@ lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
 
 /*
  * What collecting the located fact filters would cost now, in the planner's
- * units - 0 when no copy of them can be made, or the copy is not expected to
- * fit in `budget` bytes (DESIGN.md §27, "Probed, then collected").  From the
+ * units - 0 when no copy of them can be made (DESIGN.md §27, "Probed, then
+ * collected").  From the
  * sets as they were located, which carry their rows and containers: every
  * container of every set read once (LION_CONTAINER_COST), the posting pages
  * a set on pages of its own takes, a page visited each (LION_DESCENT_COST),
@@ -448,12 +454,16 @@ lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
  * copy made (LION_FKJOIN_COPY_CONTAINER_COST).  The copy's size is the
  * planner's formula (lion_cost_fkjoin_rel()) over the rows the filters'
  * product leaves, taken as independent - its containers at most the fewest
- * any source has.  What cannot be collected is what lion_join_collect_into()
- * refuses: a range too large to collect (§32), filters that only subtract,
- * a list located a batch at a time.
+ * any source has.  One past `budget` bytes spills to a temporary file
+ * (lion_sources_collect()): its pages written once, as the planner prices
+ * it, and *pages is how many there are, which says a count against it reads
+ * its lookups back from the file (lion_join_count_key()); 0 for a copy that
+ * fits.  What cannot
+ * be collected is what lion_join_collect_into() refuses: filters that only
+ * subtract, a list located a batch at a time.
  */
 static double
-lion_join_copy_price(LionCountScanState *st, Size budget)
+lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 {
 	BlockNumber blocks;
 	double		ckeys;
@@ -468,6 +478,7 @@ lion_join_copy_price(LionCountScanState *st, Size budget)
 	int			k;
 	int			j;
 
+	*pages = 0;
 	if (st->wheremissing || st->nitem == 0 || RecoveryInProgress())
 		return 0;
 
@@ -484,9 +495,11 @@ lion_join_copy_price(LionCountScanState *st, Size budget)
 		double		keys;
 		double		setmembers = 0;
 
+		/* a join's ranges are collected, never walked (lion_locate_range()) */
+		Assert(src->rangewalk == NULL);
 		if (src->negated)
 			continue;
-		if (src->rangewalk != NULL || src->nsets == 0)
+		if (src->nsets == 0)
 		{
 			pfree(srcmembers);
 			return 0;
@@ -533,12 +546,16 @@ lion_join_copy_price(LionCountScanState *st, Size budget)
 
 	copyrows = tuples * Min(frac, 1.0);
 	copykeys = Max(Min(copykeys, copyrows), 1.0);
-	bytes = copykeys * (LION_CONTAINER_HDRSZ + sizeof(LionContainer *) +
-						Min(2.0 * copyrows / copykeys,
-							(double) LION_BITSET_BYTES));
-	if (bytes > (double) budget)
-		return 0;
+	bytes = copykeys * (sizeof(LionContainer *) +
+						Min(LION_CONTAINER_HDRSZ + 2.0 * copyrows / copykeys,
+							lion_container_max_bytes(tuples,
+													 (double) blocks)));
 	cost += copykeys * LION_FKJOIN_COPY_CONTAINER_COST;
+	if (bytes > (double) budget)
+	{
+		*pages = ceil(bytes / BLCKSZ);
+		cost += *pages * seq_page_cost;
+	}
 	return Max(cost, 1e-6);
 }
 
@@ -635,14 +652,12 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 		return;
 
 	/*
-	 * A range taken as a source that was too large to collect on its own
-	 * (DESIGN.md §32) is not a set to collect either; the counts walk it.
+	 * A range taken as a source (DESIGN.md §32) is a collected set, in memory
+	 * or in a file, and is read as any: the join's plans never walk one
+	 * (lion_locate_range()).
 	 */
 	for (k = 0; k < st->nitem; k++)
-	{
-		if (st->sources[k + 1].rangewalk != NULL)
-			return;
-	}
+		Assert(st->sources[k + 1].rangewalk == NULL);
 
 	/*
 	 * The budget is a hash join's (get_hash_memory_limit(): work_mem times
@@ -751,8 +766,9 @@ lion_join_collect(LionCountScanState *st)
  * collect them now, if probing has cost what collecting them would (DESIGN.md
  * §27, "Probed, then collected"; lion_join_switch_reset()).  The price is
  * taken once, from the sets as they were located, at the first count that
- * probes them; a run whose filters cannot be collected, or whose copy would
- * not fit, stops asking.  The walk of the fk index lets go of its leaf while
+ * probes them - a copy that would not fit the memory spilled, and read from
+ * its file by the counts after it - and a run whose filters cannot be
+ * collected stops asking.  The walk of the fk index lets go of its leaf while
  * the copy is made, as it does before a row goes up, and reads it again by
  * its block number for the next key.
  */
@@ -764,7 +780,8 @@ lion_join_maybe_switch(LionCountScanState *st)
 	if (!js->mayswitch || js->filtered)
 		return;
 	if (js->buy < 0)
-		js->buy = lion_join_copy_price(st, get_hash_memory_limit());
+		js->buy = lion_join_copy_price(st, get_hash_memory_limit(),
+									   &js->copypages);
 	if (js->buy <= 0)
 	{
 		js->mayswitch = false;
@@ -790,7 +807,7 @@ lion_join_maybe_switch(LionCountScanState *st)
  * partitioned fact table"): each leaf keeps an account of its own, and its
  * copy, once made, is its copy for the rest of the run, as a planned one is -
  * within what the copies of the leaves before it left of a hash table's
- * memory.
+ * memory, and past that in a temporary file.
  */
 static void
 lion_join_part_maybe_switch(LionCountScanState *st, int p)
@@ -807,14 +824,12 @@ lion_join_part_maybe_switch(LionCountScanState *st, int p)
 	held = MemoryContextMemAllocated(js->part.cxt, true);
 	budget = (held < limit) ? limit - held : 0;
 	if (jp->buy < 0)
-		jp->buy = lion_join_copy_price(st, budget);
+		jp->buy = lion_join_copy_price(st, budget, &jp->copypages);
 	if (jp->buy <= 0 || jp->rent < jp->buy)
 		return;
 
-	/* the leaves' copies so far may have taken what it had */
+	/* made once: the leaf asks no more */
 	jp->buy = 0;
-	if (lion_join_copy_price(st, budget) <= 0)
-		return;
 	lion_lookup_walk_pause(&js->batch.walker);
 	lion_join_collect_into(st, &jp->filter, jp->cxt, NULL, &jp->viewshared,
 						   budget, true);
@@ -1527,6 +1542,7 @@ lion_join_part_open(LionCountScanState *st, int p)
 	 */
 	js->rentp = &jp->rent;
 	js->probedp = &jp->probed;
+	js->copypagesp = &jp->copypages;
 	if (jp->collected)
 	{
 		int64		dirpages = lion_dir_pages_read;
@@ -1579,6 +1595,7 @@ lion_join_part_close(LionCountScanState *st)
 	memset(js->sources, 0, sizeof(js->sources));
 	js->rentp = &js->rent;
 	js->probedp = &js->probed;
+	js->copypagesp = &js->copypages;
 	lion_close_relation(st);
 	MemoryContextReset(js->part.visitcxt);
 }
