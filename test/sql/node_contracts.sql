@@ -197,6 +197,7 @@ DECLARE
 	answer text;
 	a text;
 	b text;
+	g text;
 BEGIN
 	SELECT * INTO STRICT n FROM nc_nodes WHERE node = name;
 	PERFORM nc_paths(n.force, true);
@@ -255,6 +256,16 @@ BEGIN
 	PERFORM set_config('role', 'none', true);
 	EXECUTE format('REVOKE EXECUTE ON FUNCTION %s FROM lion_nc_yes', n.fn);
 	EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO PUBLIC', n.fn);
+
+	-- every node's calls share one transaction: the next node's ordinary plan
+	-- starts from the settings this one found
+	FOREACH g IN ARRAY string_to_array(n.force, ' ') ||
+			ARRAY['pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin',
+				  'pg_lion.enable_ordered_scan', 'pg_lion.enable_btree_scan',
+				  'pg_lion.enable_bm25_scan', 'pg_lion.pushdown_margin',
+				  'plan_cache_mode'] LOOP
+		EXECUTE 'RESET ' || g;
+	END LOOP;
 END $$;
 
 SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
