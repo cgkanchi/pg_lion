@@ -613,9 +613,9 @@ INSERT INTO lis_w_q VALUES
 	('SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 999'),	-- b selects nothing
 	('SELECT c FROM lis_w WHERE a > 5000000 AND b = 5'),	-- the range selects nothing
 	('SELECT c FROM lis_w WHERE a BETWEEN 1 AND 150000 AND d BETWEEN 5 AND 50 AND b = 4'),	-- d left to the recheck
-	('SELECT c FROM lis_w WHERE a IS NOT NULL AND b = 5'),	-- dropped, rechecked
+	('SELECT c FROM lis_w WHERE a IS NOT NULL AND b = 5'),	-- a's NULL entry taken away
 	('SELECT c FROM lis_w WHERE a IS NOT NULL AND b > 45'),	-- the range walks
-	('SELECT c FROM lis_w WHERE a IS NOT NULL AND d IS NOT NULL'),	-- one walks, one rechecked
+	('SELECT c FROM lis_w WHERE a IS NOT NULL AND d IS NOT NULL'),	-- one walks, less the other's NULL entry
 	('SELECT c FROM lis_w WHERE a IS NOT NULL');
 SELECT lion_iq(q) FROM lis_w_q;
 SET pg_lion.scan_window_floor = '64kB';
@@ -623,7 +623,8 @@ SET work_mem = '64kB';
 SELECT lion_iq(q) FROM lis_w_q;
 RESET work_mem;
 RESET pg_lion.scan_window_floor;
--- a NULL a is not a row of `a IS NOT NULL`: the heap recheck removes them
+-- a NULL a is not a row of `a IS NOT NULL`: a's NULL entry is taken away
+-- from b's set, and the heap recheck has nothing to remove (DESIGN.md §14)
 SELECT lion_ir('SELECT c FROM lis_w WHERE a IS NOT NULL AND b = 5');
 SELECT lion_ir('SELECT c FROM lis_w WHERE a BETWEEN 1000 AND 150000 AND b = 5');
 -- a plain scan reads about what the bitmap scan does, where it used to read
@@ -653,9 +654,9 @@ COMMIT;
 -- plain scan, which now reads what the bitmap scan reads; a range of nearly
 -- every a pays for its own walk (DESIGN.md §29.11) where it was prorated by
 -- b's selectivity too, and goes to the sequential scan rather than to a
--- bitmap scan half as slow again; `a IS NOT NULL AND b = 5` is priced by b
--- alone, and its plain scan, b's rows in heap order with a rechecked, goes
--- ahead of the bitmap scan that reads the same pages (1.5 ms against 1.7)
+-- bitmap scan half as slow again; `a IS NOT NULL AND b = 5` is priced as
+-- b's set less a's NULL entry, and its plain scan, those rows in heap order,
+-- goes ahead of the bitmap scan that reads the same pages
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 5000 AND b = 5');
 SELECT lion_top('SELECT sum(c) FROM lis_w WHERE a BETWEEN 1000 AND 190000 AND b = 5');

@@ -29,14 +29,17 @@
  * leapfrog (lion_leapfrog(), DESIGN.md §29.11): the tree of fewest rows
  * drives, whatever the order of the index's columns, the others are sought
  * to its keys fewest first, and a key is given up at the first tree that
- * rules it out.  A qual
- * the sets cannot express (`IS NOT NULL`, a multi-key query that needs the
- * whole index) is dropped and the TIDs are marked for recheck, which is
- * always correct: the bitmap heap scan re-applies the original quals.  A
- * range column is a walk and not a set; its entries are ANDed with the other
- * columns' answer a container at a time (lion_emit_intersect()), and on a
- * column with summaries (DESIGN.md §32) the walk reads the summaries of the
- * buckets the range covers whole.
+ * rules it out.  `col IS NOT NULL` beside them is their answer less the
+ * column's NULL entry - every row the index holds is under exactly one of a
+ * column's NULL entry and its other entries (§14, §17) - an AND-NOT node of
+ * the tree (LION_KN_ANDNOT), unless the column is cheaper walked
+ * (lion_scan_notnull_walks()): exact either way.  A qual the sets cannot
+ * express (a multi-key query that needs the whole index) is dropped and the
+ * TIDs are marked for recheck, which is always correct: the bitmap heap scan
+ * re-applies the original quals.  A range column is a walk and not a set; its
+ * entries are ANDed with the other columns' answer a container at a time
+ * (lion_emit_intersect()), and on a column with summaries (DESIGN.md §32) the
+ * walk reads the summaries of the buckets the range covers whole.
  *
  * A multi-key opclass (DESIGN.md §17) answers `@>`, `&&`, `<@` and `@@`
  * instead.  The query is handed to the opclass's extractQuery function, which
@@ -123,6 +126,11 @@ typedef struct LionScanOpaqueData
 typedef LionScanOpaqueData *LionScanOpaque;
 
 static void lion_source_release(struct LionSource *src);
+static struct LionSource *lion_source_build(LionScanOpaque so, bool keeppins,
+											MemoryContext parent);
+static int64 lion_emit_source(LionScanOpaque so, TIDBitmap *tbm);
+static bool lion_scan_notnull_walks(Relation index, LionState *col,
+									const LionPostingSet *nullset);
 static void lion_source_entry_set(Relation index, LionEntryTuple *entry,
 								  Size itemlen, MemoryContext cxt,
 								  LionPostingSet *ps);
@@ -1387,6 +1395,35 @@ lion_scan_op(LionKeyNodeKind kind, LionKeyNode **args, int nargs)
 }
 
 /*
+ * The AND of a scan's set trees, args[0 .. nargs - 1], less what negs[0 ..
+ * nnegs - 1] hold: the NULL entries of the columns an `IS NOT NULL` is on,
+ * taken away from what the others select (lion_scan_col_tree(); DESIGN.md
+ * §14, §29.2).  An LION_KN_ANDNOT node over the AND, which reads each NULL
+ * entry only at the container keys the AND holds members at
+ * (lion_ecursor_build()); just the AND without any.  There has to be
+ * something to take them away from: nargs >= 1.
+ */
+static LionKeyNode *
+lion_scan_and(LionKeyNode **args, int nargs, LionKeyNode **negs, int nnegs)
+{
+	LionKeyNode *n;
+	int			i;
+
+	Assert(nargs >= 1);
+	if (nnegs == 0)
+		return lion_scan_op(LION_KN_AND, args, nargs);
+
+	n = (LionKeyNode *) palloc0(sizeof(LionKeyNode));
+	n->kind = LION_KN_ANDNOT;
+	n->nargs = nnegs + 1;
+	n->args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * n->nargs);
+	n->args[0] = lion_scan_op(LION_KN_AND, args, nargs);
+	for (i = 0; i < nnegs; i++)
+		n->args[i + 1] = negs[i];
+	return n;
+}
+
+/*
  * Renumber a tree lion_extract_query() built over keys 0 .. n-1 so that its
  * leaves name sets at base .. base + n - 1 of the shared array.
  */
@@ -1556,8 +1593,9 @@ lion_bitmap_long_list(LionScanOpaque so, ScanKey *keys, int nkeys)
  * (lion_emit_columns(), lion_emit_intersect()): in batchcxt, which is reset
  * first, the sets - the other trees' nrest, copied, and then the batch's,
  * whose pins are let go at once (the bitmap heap scan visits every TID) -
- * and the tree over them, the other trees ANDed with the batch's union.  A
- * bitmap is a set, so the union over the batches of (batch AND rest) is
+ * and the tree over them, the other trees ANDed with the batch's union, less
+ * the NULL entries of the `IS NOT NULL` columns (restnegs, lion_scan_and()).
+ * A bitmap is a set, so the union over the batches of (batch AND rest) is
  * (list AND rest): the answer of the list located whole.  A batch none of
  * whose values has an entry selects nothing and is passed over.  False past
  * the end of the list.  The caller releases the batch's sets, [nrest ..
@@ -1567,6 +1605,7 @@ static bool
 lion_bitmap_list_batch(Relation index, LionScanList *l, MemoryContext batchcxt,
 					   int nrest, const LionPostingSet *rest,
 					   LionKeyNode **restargs, int nrestargs,
+					   LionKeyNode **restnegs, int nrestnegs,
 					   LionPostingSet **sets, int *nsets, LionKeyNode **tree)
 {
 	int			batch = lion_array_batch_size();
@@ -1612,7 +1651,7 @@ lion_bitmap_list_batch(Relation index, LionScanList *l, MemoryContext batchcxt,
 
 		*sets = all;
 		*nsets = nrest + nb;
-		*tree = lion_scan_op(LION_KN_AND, args, nrestargs + 1);
+		*tree = lion_scan_and(args, nrestargs + 1, restnegs, nrestnegs);
 		MemoryContextSwitchTo(oldcxt);
 		return true;
 	}
@@ -1622,14 +1661,26 @@ lion_bitmap_list_batch(Relation index, LionScanList *l, MemoryContext batchcxt,
  * The set tree of ONE column's scan key, with its sets appended to *acc.
  *
  * Returns NULL and leaves *ok false when the qual cannot be expressed as a
- * tree over posting sets at all (`IS NOT NULL`, a multi-key query that needs
- * every row): the caller then drops the qual and rechecks.  *nomatch means
- * the qual selects nothing whatsoever, which settles the entire scan.
+ * tree over posting sets at all (a multi-key query that needs every row,
+ * `IS NOT NULL` for a caller that passes no `negated`): the caller then drops
+ * the qual and rechecks.  *nomatch means the qual selects nothing whatsoever,
+ * which settles the entire scan.
+ *
+ * `col IS NOT NULL` is the complement of the column's NULL entry, which is no
+ * set the evaluator can build on its own - but beside a set to take it away
+ * from it is exactly that entry SUBTRACTED (DESIGN.md §14, §29.2): every row
+ * the index holds is under exactly one of the column's NULL entry and its
+ * other entries (the EMPTY one of a multi-key column among them, §17), so a
+ * row of the other quals' answer has a value in the column exactly when the
+ * NULL entry does not hold it.  A caller that can subtract passes `negated`,
+ * and is handed the NULL entry's leaf with *negated set, for the AND of its
+ * trees to take away (lion_scan_and()) - or NULL with *negated set and *ok
+ * true when the column has no NULL entry, which takes nothing away.
  */
 static LionKeyNode *
 lion_scan_col_tree(Relation index, LionState *col,
 				  ScanKey skey, LionScanSets *acc, bool *ok, bool *nomatch,
-				  bool *lossy, bool posok)
+				  bool *lossy, bool posok, bool *negated)
 {
 	AttrNumber	attno = (AttrNumber) col->attno;
 
@@ -1637,6 +1688,8 @@ lion_scan_col_tree(Relation index, LionState *col,
 	*nomatch = false;
 	if (lossy != NULL)
 		*lossy = false;
+	if (negated != NULL)
+		*negated = false;
 
 	/* The null tests carry no strategy number and must be tested first. */
 	if ((skey->sk_flags & SK_SEARCHNULL) != 0)
@@ -1649,9 +1702,23 @@ lion_scan_col_tree(Relation index, LionState *col,
 	}
 	if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
 	{
-		/* The complement of a set is not a set the evaluator can build. */
-		*ok = false;
-		return NULL;
+		int			base;
+
+		if (negated == NULL)
+		{
+			*ok = false;		/* no AND to take it away from */
+			return NULL;
+		}
+		*negated = true;
+
+		/*
+		 * A set not found stays in acc, released with the others, as an
+		 * `IS NULL` key's does; it has nothing to take away.
+		 */
+		base = lion_sets_reserve(acc, 1);
+		if (!lion_posting_set_lookup_null_col(index, attno, &acc->sets[base]))
+			return NULL;
+		return lion_scan_leaf(base);
 	}
 
 	/* `col = NULL` (or a NULL array) is never true. */
@@ -1863,7 +1930,7 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
 	acc.sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) * acc.maxsets);
 
 	node = lion_scan_col_tree(index, col, skey, &acc, &ok, nomatch, NULL,
-							  false);
+							  false, NULL);
 
 	*nsets = acc.nsets;
 	*sets = acc.sets;
@@ -1875,8 +1942,11 @@ lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
  * Answer a scan of SEVERAL set quals, of one key column or of several:
  * intersect their set trees (DESIGN.md §24).  Any qual that cannot be
  * expressed is dropped and *recheck is set, which is correct because the
- * bitmap heap scan re-applies the original quals.  Returns -1 when NOTHING
- * could be expressed, so the caller falls back to a single-qual answer.
+ * bitmap heap scan re-applies the original quals.  `IS NOT NULL` is answered
+ * exactly: its column's NULL entry is taken away from the intersection
+ * (lion_scan_and(); DESIGN.md §14).  Returns -1 when NOTHING could be
+ * expressed to take it away from, so the caller falls back to an answer of
+ * its own.
  *
  * A list too long to locate at once (lion_bitmap_long_list()) is not one of
  * the trees: the others are located, and the list is then located a batch
@@ -1891,12 +1961,14 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 {
 	LionScanSets acc;
 	LionKeyNode **args;
+	LionKeyNode **negs;
 	LionQueryEmitState es;
 	LionScanList list;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 	int			listkey;
 	int			nargs = 0;
+	int			nnegs = 0;
 	int			i;
 	int			j;
 
@@ -1909,6 +1981,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nkeys);
+	negs = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * nkeys);
 	listkey = lion_bitmap_long_list(so, keys, nkeys);
 
 	for (i = 0; i < nkeys; i++)
@@ -1918,12 +1991,20 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		nomatch;
 		bool		lossy;
+		bool		negated;
 
 		if (i == listkey)
 			continue;			/* located below, a batch at a time */
 
 		node = lion_scan_col_tree(so->index, col, keys[i], &acc, &ok, &nomatch,
-								  &lossy, false);
+								  &lossy, false, &negated);
+		if (negated)
+		{
+			/* `IS NOT NULL`: its NULL entry, if any, taken away below */
+			if (node != NULL)
+				negs[nnegs++] = node;
+			continue;
+		}
 
 		if (nomatch)
 		{
@@ -1945,8 +2026,9 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 	}
 
 	/*
-	 * Nothing expressible; or a long list of NULLs only, which selects
-	 * nothing, so the intersection does not either.
+	 * Nothing expressible to take the NULL entries away from; or a long list
+	 * of NULLs only, which selects nothing, so the intersection does not
+	 * either.
 	 */
 	if ((nargs == 0 && listkey < 0) ||
 		(listkey >= 0 &&
@@ -1976,7 +2058,7 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 
 	if (listkey < 0)
 		(void) lion_sets_iterate(acc.nsets, acc.sets,
-								 lion_scan_op(LION_KN_AND, args, nargs),
+								 lion_scan_and(args, nargs, negs, nnegs),
 								 lion_query_emit_cb, &es);
 	else
 	{
@@ -1992,8 +2074,8 @@ lion_emit_columns(LionScanOpaque so, ScanKey *keys,
 		batchcxt = AllocSetContextCreate(cxt, "lion index scan list batch",
 										 ALLOCSET_DEFAULT_SIZES);
 		while (lion_bitmap_list_batch(so->index, &list, batchcxt, acc.nsets,
-									  acc.sets, args, nargs, &bsets, &nbsets,
-									  &tree))
+									  acc.sets, args, nargs, negs, nnegs,
+									  &bsets, &nbsets, &tree))
 		{
 			MemoryContextSwitchTo(batchcxt);
 			(void) lion_sets_iterate(nbsets, bsets, tree, lion_query_emit_cb,
@@ -2384,6 +2466,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	MemoryContext oldcxt;
 	LionScanSets acc;
 	LionKeyNode **args;
+	LionKeyNode **negs;
 	LionScanRangeCol *rc;
 	LionRangeWindow w;
 	LionSetStream *st;
@@ -2392,6 +2475,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	bool		nomatch = false;
 	int			listkey;
 	int			nargs = 0;
+	int			nnegs = 0;
 	int			first = 0;
 	int64		ntids;
 	int			i;
@@ -2406,6 +2490,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	acc.nsets = 0;
 	acc.sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * acc.maxsets);
 	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (nkeys + 1));
+	negs = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * Max(nkeys, 1));
 	listkey = lion_bitmap_long_list(so, keys, nkeys);
 
 	/*
@@ -2435,14 +2520,22 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		bool		ok;
 		bool		none;
 		bool		lossy;
+		bool		negated;
 
 		if (i == listkey)
 			continue;			/* located below, a batch at a time */
 
 		node = lion_scan_col_tree(so->index,
 								  lion_column(so->ix, keys[i]->sk_attno),
-								  keys[i], &acc, &ok, &none, &lossy, false);
-		if (none)
+								  keys[i], &acc, &ok, &none, &lossy, false,
+								  &negated);
+		if (negated)
+		{
+			/* `IS NOT NULL`: its NULL entry, if any, taken away below */
+			if (node != NULL)
+				negs[nnegs++] = node;
+		}
+		else if (none)
 			nomatch = true;
 		else if (!ok || node == NULL)
 			so->recheck = true; /* the heap scan re-applies this qual */
@@ -2459,7 +2552,7 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		!lion_scan_list_begin(so->index, keys[listkey], &list))
 		nomatch = true;
 
-	if (!nomatch && nargs == 0 && listkey < 0 && nrange == 1)
+	if (!nomatch && nargs == 0 && nnegs == 0 && listkey < 0 && nrange == 1)
 	{
 		/* Nothing beside the range could be expressed: the range alone. */
 		ScanKey		skey = rangekeys[0];
@@ -2484,7 +2577,9 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		 * that cannot order the elements of `col < ANY (array)` has a range
 		 * per element, and their union is collected as the one set, in the
 		 * one window's memory (lion_ranges_collect()): a set each, each with
-		 * all of that memory, was an array's worth of it at once.
+		 * all of that memory, was an array's worth of it at once.  A range
+		 * beside nothing but `IS NOT NULL` of other columns is collected too,
+		 * for their NULL entries to be taken away from (below).
 		 */
 		LionRange **live = (LionRange **)
 			palloc(sizeof(LionRange *) * Max(rc[0].nranges, 1));
@@ -2557,10 +2652,29 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 	w.entrycxt = AllocSetContextCreate(cxt, "lion index range entry",
 									   ALLOCSET_DEFAULT_SIZES);
 
-	if (listkey < 0)
+	if (listkey < 0 && first == nrange)
+	{
+		LionQueryEmitState es;
+
+		/*
+		 * The one range, collected, less the NULL entries of the `IS NOT
+		 * NULL` columns beside it: no walk is left to AND it with.
+		 */
+		Assert(nnegs > 0 && nargs == 1);
+		es.tbm = tbm;
+		es.recheck = so->recheck;
+		es.ntids = 0;
+		es.posfilter = NULL;
+		es.keep = NULL;
+		(void) lion_sets_iterate(acc.nsets, acc.sets,
+								 lion_scan_and(args, nargs, negs, nnegs),
+								 lion_query_emit_cb, &es);
+		w.ntids = es.ntids;
+	}
+	else if (listkey < 0)
 	{
 		st = lion_stream_begin_bounded(acc.nsets, acc.sets,
-									   lion_scan_op(LION_KN_AND, args, nargs));
+									   lion_scan_and(args, nargs, negs, nnegs));
 		lion_rwin_run(&w, so, st, rc, first, nrange, budget);
 		lion_stream_end(st);
 	}
@@ -2579,8 +2693,8 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 		batchcxt = AllocSetContextCreate(cxt, "lion index scan list batch",
 										 ALLOCSET_DEFAULT_SIZES);
 		while (lion_bitmap_list_batch(index, &list, batchcxt, acc.nsets,
-									  acc.sets, args, nargs, &bsets, &nbsets,
-									  &tree))
+									  acc.sets, args, nargs, negs, nnegs,
+									  &bsets, &nbsets, &tree))
 		{
 			MemoryContextSwitchTo(batchcxt);
 			st = lion_stream_begin_bounded(nbsets, bsets, tree);
@@ -2618,7 +2732,11 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
  *	  (§28), beside which a second one and the column's plain range keys are
  *	  left to the recheck, as they were when it outranked them;
  *	- else a range, every `<`, `<=`, `>=` and `>` of the column at once;
- *	- else `IS NOT NULL`, every entry but the NULL one (§14).
+ *	- else `IS NOT NULL`, every entry but the NULL one (§14) - which is
+ *	  walked only when it is the scan's one walk and nothing else answers,
+ *	  or beside sets when that is cheaper (lion_scan_notnull_walks()):
+ *	  otherwise the NULL entry is TAKEN AWAY from the others' answer, the
+ *	  sets' or another column's walk, which is as exact.
  *
  * A column with a set tree is not walked at all: its range keys are left to
  * the recheck, which tests one bound per row of the sets, where the walk
@@ -2783,8 +2901,9 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 	 * not a set tree at all - its answer is a union of however many entries
 	 * the range holds (DESIGN.md §28), `col < ANY (array)` included - so its
 	 * walk is ANDed with the others' stream a container at a time
-	 * (lion_emit_intersect()).  `IS NOT NULL` goes with the sets, which drop
-	 * it: beside anything that answers, it is only rechecked.
+	 * (lion_emit_intersect()).  `IS NOT NULL` goes with the sets, which take
+	 * its column's NULL entry away from what the others select (DESIGN.md
+	 * §14): exact, and no walk of the column.
 	 */
 	if (ch->nsets + ch->nwalks > 1)
 	{
@@ -2792,7 +2911,38 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 		ScanKey		rangekeys[INDEX_MAX_KEYS];
 		int			n = 0;
 		int			nrange = 0;
+		int			walknotnull = -1;
+		bool		haverange = false;
 		int64		ntids;
+
+		/*
+		 * Beside sets and no range, an `IS NOT NULL` whose column is cheaper
+		 * walked than its NULL entry taken away is walked as a range is, an
+		 * unbounded one (lion_scan_notnull_walks(), lion_scan_col_ranges()).
+		 */
+		for (i = 0; i < ncols; i++)
+		{
+			if (ch->walk[i] != NULL &&
+				(ch->walk[i]->sk_flags & SK_SEARCHNOTNULL) == 0)
+				haverange = true;
+		}
+		if (ch->nsets > 0 && !haverange)
+		{
+			for (i = 0; i < ncols && walknotnull < 0; i++)
+			{
+				LionState  *wcol = lion_column(so->ix, (AttrNumber) (i + 1));
+				LionPostingSet ns;
+
+				if (ch->walk[i] == NULL || wcol->multikey)
+					continue;
+				if (lion_posting_set_lookup_null_col(index,
+													 (AttrNumber) wcol->attno,
+													 &ns) &&
+					lion_scan_notnull_walks(index, wcol, &ns))
+					walknotnull = i;
+				lion_posting_set_release(&ns);
+			}
+		}
 
 		keys = (ScanKey *) palloc(sizeof(ScanKey) * (ch->nsets + ncols));
 		for (i = 0; i < ch->nsets; i++)
@@ -2801,7 +2951,8 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 		{
 			if (ch->walk[i] == NULL)
 				continue;
-			if ((ch->walk[i]->sk_flags & SK_SEARCHNOTNULL) != 0)
+			if ((ch->walk[i]->sk_flags & SK_SEARCHNOTNULL) != 0 &&
+				i != walknotnull)
 				keys[n++] = ch->walk[i];
 			else
 				rangekeys[nrange++] = ch->walk[i];
@@ -2814,6 +2965,18 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 		pfree(keys);
 		if (ntids >= 0)
 			return ntids;
+
+		/*
+		 * Nothing was expressible to take an `IS NOT NULL` away from: the
+		 * plain scan's source walks one such column, exactly, less the
+		 * others' NULL entries.
+		 */
+		for (i = 0; i < ncols; i++)
+		{
+			if (ch->walk[i] != NULL &&
+				(ch->walk[i]->sk_flags & SK_SEARCHNOTNULL) != 0)
+				return lion_emit_source(so, tbm);
+		}
 
 		/* Nothing was expressible: answer the first column and recheck. */
 		so->recheck = true;
@@ -3114,6 +3277,8 @@ struct LionSource
 								 * sets[nsets] for the entry) */
 	LionKeyNode **restargs;		/* LIST: the other columns' trees */
 	int			nrestargs;
+	LionKeyNode **restnegs;		/* LIST: the NULL entries taken away */
+	int			nrestnegs;
 	LionSetStream *stream;		/* the current one */
 
 	/* WALK, and WINDOW's walk of each window */
@@ -3146,9 +3311,15 @@ struct LionSource
 	LionPostingSet *bsets;		/* the batch's sets, in entrycxt */
 	int			nbsets;
 
-	/* UNION: a window of container keys, ORed from every entry */
+	/*
+	 * UNION: a window of container keys, ORed from every entry of a column -
+	 * or every entry the ranges[] of a WALK hold - with the NULL entries of
+	 * the `IS NOT NULL` columns beside it taken away (negstream over sets[])
+	 */
 	AttrNumber	unionattno;
 	bool		withnull;
+	LionSetStream *negstream;	/* the OR of those NULL entries, or NULL */
+	LionContainer *nbuf;		/* what is left of a container once they go */
 	int			uwidth;			/* container keys per window */
 	uint64	  **uimg;			/* [uwidth] bitset images, made on first use */
 	bool	   *utouched;		/* [uwidth] */
@@ -3490,6 +3661,127 @@ lion_source_walk_is_long(LionSource *src, LionState *col)
 }
 
 /*
+ * `col IS NOT NULL` beside quals that answer (DESIGN.md §14, §29.2): is it
+ * cheaper to WALK the column's entries but its NULL one, as a range is walked
+ * beside them, than to take its NULL entry away?  The subtraction reads the
+ * NULL entry at the container keys the other quals' answer has - all of it,
+ * for an answer spread over the heap - and the walk reads every other entry
+ * of the column, once per window of that answer (§29.3, lion_walk_window()):
+ * its directory leaves, an INLINE entry being its share of one, and a CHAIN
+ * entry's posting pages, a page at least for its descent.  The walk has to
+ * be LION_NOTNULL_WALK_MARGIN times cheaper than the subtraction
+ * (lion_count.h), and it is counted from the directory leaves alone - each
+ * entry's size is in its header - no further than that.
+ *
+ * The NULL entry is the one located for the scan, its rows and container
+ * keys in its header.  Its pages are those of the form it takes
+ * (lion_null_entry_pages()): a NULL entry that holds nearly every row at its
+ * keys, the one worth walking past, is RUNs or a NARROW, far smaller than
+ * the two bytes a member, a bitset a container at most, that
+ * lion_source_set_pages() bounds a set by - and that bound it is held to
+ * when the index has no row count (pg_class.reltuples) to tell the other
+ * rows by.  An entry whose pages say no walk is cheaper never walks the
+ * column's leaves at all.  lioncostestimate() makes the same choice from the
+ * column's statistics (lion_cost_notnull()).
+ */
+static bool
+lion_scan_notnull_walks(Relation index, LionState *col,
+						const LionPostingSet *nullset)
+{
+	LionPostingSet ns = *nullset;
+	LionLeafWalk w;
+	LionEntryTuple *entry;
+	Size		itemlen;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	double		rows = (double) RelationGetForm(index)->reltuples;
+	double		nullpages;
+	double		windows;
+	double		limit;
+	double		walk = 1.0;		/* the descent to the column's first leaf */
+	bool		walks = false;
+
+	if (!nullset->found)
+		return false;
+	nullpages = lion_source_set_pages(&ns);
+	if (rows >= 0.0)
+		nullpages = Min(nullpages,
+						lion_null_entry_pages((double) ns.ntids,
+											  (double) ns.ncontainers,
+											  rows - (double) ns.ntids));
+	windows = Max(1.0, ceil((double) nullset->ncontainers /
+							(double) lion_walk_window()));
+	limit = nullpages / (LION_NOTNULL_WALK_MARGIN * windows);
+
+	/* past the limit with any entry the column has: not walked to see */
+	if (walk < limit)
+	{
+		cxt = AllocSetContextCreate(CurrentMemoryContext,
+									"lion index scan IS NOT NULL",
+									ALLOCSET_SMALL_SIZES);
+		oldcxt = MemoryContextSwitchTo(cxt);
+		lion_walk_begin(&w, index, col, false, NULL, 0, false);
+		while (walk <= limit &&
+			   (entry = lion_walk_next(&w, &itemlen)) != NULL)
+		{
+			LionPostingSet ps;
+
+			lion_source_entry_set(index, entry, itemlen, cxt, &ps);
+			if (ps.is_inline)
+				walk += (double) itemlen / (double) BLCKSZ;
+			else
+				walk += Max(1.0, lion_source_set_pages(&ps));
+		}
+		lion_walk_end(&w);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextDelete(cxt);
+		walks = (walk <= limit);
+	}
+	elog(DEBUG1, "lion index \"%s\": IS NOT NULL of key column %d %s",
+		 RelationGetRelationName(index), (int) col->attno,
+		 walks ? "walks the column's other entries" :
+		 "takes the NULL entry away");
+	return walks;
+}
+
+/*
+ * Make src a UNION (§29.3) of the entries of key column col (0-based): every
+ * one but the NULL entry, unless withnull, and only those src->ranges select
+ * when it has some (a WALK too long to restart other sets for, below) - with
+ * the OR of negs[], NULL entries over src->sets, taken away from each
+ * container (lion_source_union_next()).  all: the union stands for a
+ * multi-key query that needs every row (mode ALL, §17), a superset the
+ * recheck narrows.  Otherwise it is exact (§29.6) - but a scan that must
+ * hold the page of each batch (§29.5) gets copies out of many pages and no
+ * pin from it, so its TIDs are rechecked, as they always were.
+ */
+static void
+lion_source_union_begin(LionSource *src, int col, bool withnull,
+						LionKeyNode **negs, int nnegs, bool all)
+{
+	src->shape = LION_SRC_UNION;
+	if (all || src->keeppins)
+		src->recheck = true;
+	src->unionattno = (AttrNumber) (col + 1);
+	src->withnull = withnull;
+	src->uwidth = lion_union_window();
+	src->uimg = (uint64 **) palloc0(sizeof(uint64 *) * src->uwidth);
+	src->utouched = (bool *) palloc0(sizeof(bool) * src->uwidth);
+	src->uemit = src->uwidth;
+	src->ufirst = true;
+	src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	src->walkcxt = AllocSetContextCreate(src->cxt, "lion index scan union walk",
+										 ALLOCSET_SMALL_SIZES);
+	if (nnegs > 0)
+	{
+		src->negstream = lion_stream_begin(src->nsets, src->sets,
+										   lion_scan_op(LION_KN_OR, negs, nnegs),
+										   false);
+		src->nbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	}
+}
+
+/*
  * Build the source for so->keys (DESIGN.md §29.3).  Every set is located -
  * every directory lock taken - before any posting page is pinned, which is
  * the reader side of the §11 deadlock rule; a LIST locates each batch before
@@ -3504,11 +3796,15 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	LionScanChoice ch;
 	LionScanSets acc;
 	LionKeyNode **args;
+	LionKeyNode **negs;
 	int			nargs = 0;
+	int			nnegs = 0;
 	int			walkcol = -1;
-	int			notnullcol = -1;
+	int			notnull[INDEX_MAX_KEYS];
+	int			nnotnull = 0;
 	ScanKey		listkey = NULL;
 	int			unioncol = -1;
+	bool		unionall = false;
 	bool		withnull = false;
 	bool		nomatch = false;
 	int			ncols = so->ix->ncolumns;
@@ -3544,6 +3840,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		 * multi-key and a walk would repeat rows.
 		 */
 		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *));
+		negs = NULL;
 		withnull = true;
 		if (lion_column(so->ix, 1)->multikey)
 			unioncol = 0;
@@ -3559,6 +3856,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 
 		/* one tree per set qual, and one more slot for a WALK's entry */
 		args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * (ch.nsets + 1));
+		negs = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * ncols);
 
 		/*
 		 * The set quals, every one of every column: a set tree each, ANDed
@@ -3583,13 +3881,15 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 				node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
 										  &lossy,
 										  !keeppins &&
-										  (skey->sk_flags & SK_SEARCHARRAY) != 0);
+										  (skey->sk_flags & SK_SEARCHARRAY) != 0,
+										  NULL);
 				if (none)
 					nomatch = true;
 				else if (!ok)
 				{
 					/* mode ALL: every row; the first such column, as below */
 					src->recheck = true;
+					unionall = true;
 					if (unioncol < 0 || skey->sk_attno - 1 < unioncol)
 						unioncol = skey->sk_attno - 1;
 				}
@@ -3644,7 +3944,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 					 (int) skey->sk_strategy);
 
 			node = lion_scan_col_tree(so->index, col, skey, &acc, &ok, &none,
-									  NULL, false);
+									  NULL, false, NULL);
 			if (none)
 				nomatch = true;
 			else
@@ -3667,19 +3967,17 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			if (skey == NULL)
 				continue;
 
+			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
+			{
+				notnull[nnotnull++] = i;	/* any kind of column: below */
+				continue;
+			}
 			if (lion_column(so->ix, (AttrNumber) (i + 1))->multikey)
 			{
 				src->recheck = true;
+				unionall = true;
 				if (unioncol < 0 || i < unioncol)
 					unioncol = i;
-				continue;
-			}
-			if ((skey->sk_flags & SK_SEARCHNOTNULL) != 0)
-			{
-				if (notnullcol < 0)
-					notnullcol = i;
-				else
-					src->recheck = true;	/* a second one is not answered */
 				continue;
 			}
 			if (walkcol < 0)
@@ -3701,24 +3999,84 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		}
 
 		/*
-		 * `IS NOT NULL` the same way: dropped and rechecked next to anything
-		 * that answers - the bitmap path drops it too, and the cost model
-		 * prices such a scan by the other columns' selectivity - and walked
-		 * only when nothing does.  It used to drive a WALK whenever it was
-		 * there, every entry of its column ANDed with the other columns'
-		 * stream, restarted per entry: `a IS NOT NULL AND b = 5` over a
-		 * million unique a took 4.37M buffer hits and 1.8 s against the
-		 * bitmap's 19 ms (2026-09-25 review).
+		 * `IS NOT NULL` is answered EXACTLY (DESIGN.md §14, §29.2): every row
+		 * the index holds is under exactly one of its column's NULL entry and
+		 * its other entries - a multi-key column's EMPTY entry among them
+		 * (§17) - so beside anything that answers, the column's NULL entry is
+		 * taken away from the answer (lion_scan_and()), read only at the
+		 * container keys the answer has.  It used to be dropped there and
+		 * left to the recheck, every row of the other quals' answer fetched
+		 * from the heap to be thrown away when its column was NULL; and
+		 * before that it drove a WALK of its column beside the other
+		 * columns' stream, restarted per entry: `a IS NOT NULL AND b = 5`
+		 * over a million unique a took 4.37M buffer hits and 1.8 s against
+		 * the bitmap's 19 ms (2026-09-25 review).
+		 *
+		 * When nothing else answers, the first one is walked - every entry of
+		 * its column but the NULL one; a multi-key column's as a union, a
+		 * walk would repeat rows - and the others' NULL entries are taken
+		 * away from that.
 		 */
-		if (notnullcol >= 0)
+		if (nnotnull > 0 && nargs == 0 && listkey == NULL && walkcol < 0)
 		{
-			if (nargs > 0 || walkcol >= 0 || listkey != NULL)
-				src->recheck = true;
+			int			c = notnull[0];
+
+			if (lion_column(so->ix, (AttrNumber) (c + 1))->multikey)
+			{
+				unioncol = c;
+				unionall = false;	/* a mode-ALL union beside it is dropped */
+			}
 			else
-				walkcol = notnullcol;
+				walkcol = c;
+			notnull[0] = -1;
+		}
+		for (i = 0; i < nnotnull && !nomatch; i++)
+		{
+			LionState  *col;
+			LionPostingSet ns;
+			int			base;
+
+			if (notnull[i] < 0)
+				continue;		/* the driver */
+			col = lion_column(so->ix, (AttrNumber) (notnull[i] + 1));
+			if (!lion_posting_set_lookup_null_col(so->index,
+												  (AttrNumber) col->attno, &ns))
+			{
+				lion_posting_set_release(&ns);
+				continue;		/* no NULL entry: nothing to take away */
+			}
+
+			/*
+			 * ... unless walking the rest of the column is the cheaper way,
+			 * beside sets, where the walk's slot is free: it is then walked
+			 * as a range would be, a WINDOW or entry by entry (below).
+			 */
+			if (nargs > 0 && walkcol < 0 && listkey == NULL &&
+				!col->multikey &&
+				lion_scan_notnull_walks(so->index, col, &ns))
+			{
+				lion_posting_set_release(&ns);
+				walkcol = notnull[i];
+				continue;
+			}
+			base = lion_sets_reserve(&acc, 1);
+			acc.sets[base] = ns;
+			negs[nnegs++] = lion_scan_leaf(base);
 		}
 		if (unioncol >= 0 && (nargs > 0 || walkcol >= 0 || listkey != NULL))
+		{
 			unioncol = -1;
+			unionall = false;
+		}
+
+		/*
+		 * Under a non-MVCC snapshot a row being inserted can be seen in the
+		 * other quals' entries before it reaches the NULL entry its insert
+		 * adds it to as well: the heap says what it holds (§29.5, §29.6).
+		 * An MVCC snapshot never sees such a row at all.
+		 */
+		if (nnegs > 0 && keeppins)
+			src->recheck = true;
 	}
 
 	if (!nomatch && walkcol >= 0 && !withnull)
@@ -3735,31 +4093,16 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		!lion_scan_list_begin(so->index, listkey, &src->list))
 		nomatch = true;			/* a list of NULLs only */
 
-	if (nomatch || unioncol >= 0)
+	if (nomatch || (unioncol >= 0 && nnegs == 0))
 	{
 		for (i = 0; i < acc.nsets; i++)
 			lion_posting_set_release(&acc.sets[i]);
+		acc.nsets = 0;
 	}
 
 	if (nomatch)
 	{
 		src->shape = LION_SRC_NONE;
-		MemoryContextSwitchTo(oldcxt);
-		return src;
-	}
-
-	if (unioncol >= 0)
-	{
-		src->shape = LION_SRC_UNION;
-		src->recheck = true;
-		src->unionattno = (AttrNumber) (unioncol + 1);
-		src->withnull = withnull;
-		src->uwidth = lion_union_window();
-		src->uimg = (uint64 **) palloc0(sizeof(uint64 *) * src->uwidth);
-		src->utouched = (bool *) palloc0(sizeof(bool) * src->uwidth);
-		src->uemit = src->uwidth;
-		src->ufirst = true;
-		src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 		MemoryContextSwitchTo(oldcxt);
 		return src;
 	}
@@ -3781,53 +4124,72 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 			src->recheck = true;
 	}
 
-	if (listkey != NULL)
+	if (unioncol >= 0)
+		lion_source_union_begin(src, unioncol, withnull, negs, nnegs,
+								unionall);
+	else if (listkey != NULL)
 	{
 		src->shape = LION_SRC_LIST;
 		src->restargs = args;
 		src->nrestargs = nargs;
+		src->restnegs = negs;
+		src->nrestnegs = nnegs;
 	}
 	else if (walkcol < 0)
 	{
 		src->shape = LION_SRC_SETS;
-		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
+		src->tree = lion_scan_and(args, nargs, negs, nnegs);
 		src->stream = lion_stream_begin(src->nsets, src->sets, src->tree,
 										keeppins);
 	}
-	else if (nargs > 0 && !keeppins &&
+	else if (nargs + nnegs > 0 && !keeppins &&
 			 lion_source_walk_is_long(src,
 									  lion_column(so->ix, (AttrNumber) (walkcol + 1))))
 	{
 		/*
-		 * A long walk beside the other columns' sets: their ONE stream, and
-		 * the walk ORed into windows of it (§29.3).  Only without pins - a
-		 * window copies containers out of many pages, as the UNION does, so
-		 * a scan that must hold the page of each batch (§29.5) keeps the
+		 * A long walk beside other sets: restarting their stream for every
+		 * entry would read more than they hold.  Beside quals that answer,
+		 * their ONE stream, and the walk ORed into windows of it (§29.3);
+		 * beside nothing but NULL entries to take away, the walk as a union
+		 * of its entries, a window of container keys at a time, with the NULL
+		 * entries taken away from each (lion_source_union_next()).  Only
+		 * without pins - a window copies containers out of many pages, so a
+		 * scan that must hold the page of each batch (§29.5) keeps the
 		 * entry-by-entry WALK, whose pins are the ones it needs.
 		 */
-		src->shape = LION_SRC_WINDOW;
-		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
-		src->ix = so->ix;
-		src->walkattno = (AttrNumber) (walkcol + 1);
-		src->reststream = lion_stream_begin(src->nsets, src->sets, src->tree,
-											false);
-		src->wwidth = lion_walk_window();
-		src->wkeys = (uint32 *) palloc(sizeof(uint32) * src->wwidth);
-		src->wrest = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
-		src->wwalk = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
-		src->wtouched = (bool *) palloc0(sizeof(bool) * src->wwidth);
-		src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-		src->ibuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-		src->walkcxt = AllocSetContextCreate(cxt, "lion index scan window",
-											 ALLOCSET_SMALL_SIZES);
+		if (nargs == 0)
+			lion_source_union_begin(src, walkcol, false, negs, nnegs, false);
+		else
+		{
+			src->shape = LION_SRC_WINDOW;
+			src->tree = lion_scan_and(args, nargs, negs, nnegs);
+			src->ix = so->ix;
+			src->walkattno = (AttrNumber) (walkcol + 1);
+			src->reststream = lion_stream_begin(src->nsets, src->sets,
+												src->tree, false);
+			src->wwidth = lion_walk_window();
+			src->wkeys = (uint32 *) palloc(sizeof(uint32) * src->wwidth);
+			src->wrest = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
+			src->wwalk = (uint64 **) palloc0(sizeof(uint64 *) * src->wwidth);
+			src->wtouched = (bool *) palloc0(sizeof(bool) * src->wwidth);
+			src->cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			src->ibuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			src->walkcxt = AllocSetContextCreate(cxt, "lion index scan window",
+												 ALLOCSET_SMALL_SIZES);
+		}
 	}
 	else
 	{
 		LionState  *col = lion_column(so->ix, (AttrNumber) (walkcol + 1));
 
+		/*
+		 * Entry by entry: each walked entry is a set of its own, ANDed with
+		 * the other quals' sets and with the NULL entries of the `IS NOT
+		 * NULL` columns taken away.
+		 */
 		src->shape = LION_SRC_WALK;
 		args[nargs++] = lion_scan_leaf(src->nsets);
-		src->tree = lion_scan_op(LION_KN_AND, args, nargs);
+		src->tree = lion_scan_and(args, nargs, negs, nnegs);
 		src->ix = so->ix;
 		src->walkattno = (AttrNumber) col->attno;
 		lion_walk_begin(&src->walk, so->index, col, withnull, src->ranges,
@@ -3941,8 +4303,9 @@ lion_source_list_batch(LionSource *src)
 		args[src->nrestargs] = lion_scan_op(LION_KN_OR, leaves, nb);
 
 		src->stream = lion_stream_begin(src->nsets + nb, all,
-										lion_scan_op(LION_KN_AND, args,
-													 src->nrestargs + 1),
+										lion_scan_and(args, src->nrestargs + 1,
+													  src->restnegs,
+													  src->nrestnegs),
 										src->keeppins);
 		MemoryContextSwitchTo(oldcxt);
 		return true;
@@ -3962,6 +4325,7 @@ static bool
 lion_source_union_window(LionSource *src)
 {
 	LionIndexState *ix;
+	LionState  *col;
 	LionLeafWalk w;
 	LionEntryTuple *entry;
 	Size		itemlen;
@@ -3969,6 +4333,7 @@ lion_source_union_window(LionSource *src)
 	uint64		next = PG_UINT64_MAX;
 	uint64		end;
 	MemoryContext oldcxt;
+	int			r;
 
 	if (src->udone)
 		return false;
@@ -3981,11 +4346,18 @@ lion_source_union_window(LionSource *src)
 	src->ufirst = false;
 	end = src->ustart + (uint64) src->uwidth;
 
-	/* The state is looked up per window: see lion_source_next(). */
+	/*
+	 * The state is looked up per window, and the ranges re-pointed at it:
+	 * see lion_source_next().
+	 */
 	ix = lion_get_index_state(src->index);
-	oldcxt = MemoryContextSwitchTo(src->cxt);
-	lion_walk_begin(&w, src->index, lion_column(ix, src->unionattno),
-					src->withnull, NULL, 0, false);
+	col = lion_column(ix, src->unionattno);
+	for (r = 0; r < src->nranges; r++)
+		src->ranges[r].state = col;
+	MemoryContextReset(src->walkcxt);
+	oldcxt = MemoryContextSwitchTo(src->walkcxt);
+	lion_walk_begin(&w, src->index, col, src->withnull, src->ranges,
+					src->nranges, false);
 	MemoryContextSwitchTo(oldcxt);
 
 	while ((entry = lion_walk_next(&w, &itemlen)) != NULL)
@@ -4023,13 +4395,18 @@ lion_source_union_window(LionSource *src)
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_walk_end(&w);
-	pfree(w.copy);
 
 	src->unext = havenext ? next : PG_UINT64_MAX;
 	src->uemit = 0;
 	return true;
 }
 
+/*
+ * The UNION's next container, with the NULL entries of the `IS NOT NULL`
+ * columns beside it taken away: their OR is one stream, sought forward to
+ * each container key the union hands out, so it reads them only at those
+ * keys - the scan's ANDNOT node (lion_scan_and()) in the union's terms.
+ */
 static const LionContainer *
 lion_source_union_next(LionSource *src)
 {
@@ -4039,12 +4416,26 @@ lion_source_union_next(LionSource *src)
 		{
 			int			k = src->uemit++;
 			uint64	   *w = src->uimg[k];
+			uint32		ckey = (uint32) (src->ustart + k);
 
 			if (!src->utouched[k])
 				continue;
 			src->utouched[k] = false;
-			lion_bits_to_container(w, (uint32) (src->ustart + k), src->cbuf);
+			lion_bits_to_container(w, ckey, src->cbuf);
 			memset(w, 0, LION_BITSET_BYTES);
+			if (src->cbuf->cardinality > 0 && src->negstream != NULL)
+			{
+				const LionContainer *neg = lion_stream_at(src->negstream,
+														  ckey);
+
+				if (neg != NULL && neg->ckey == ckey)
+				{
+					lion_container_andnot(src->cbuf, neg, src->nbuf);
+					if (src->nbuf->cardinality > 0)
+						return src->nbuf;
+					continue;
+				}
+			}
 			if (src->cbuf->cardinality > 0)
 				return src->cbuf;
 		}
@@ -4412,6 +4803,9 @@ lion_source_release(LionSource *src)
 	if (src->reststream != NULL)
 		lion_stream_end(src->reststream);
 	src->reststream = NULL;
+	if (src->negstream != NULL)
+		lion_stream_end(src->negstream);
+	src->negstream = NULL;
 	if (src->shape == LION_SRC_WALK)
 		lion_walk_end(&src->walk);
 	for (i = 0; i < src->nsets; i++)
@@ -4441,6 +4835,32 @@ lion_source_next(LionSource *src)
 		CHECK_FOR_INTERRUPTS();
 	}
 	return NULL;
+}
+
+/*
+ * The bitmap scan of quals whose `IS NOT NULL` has nothing to be taken away
+ * from - two of them, or one beside quals the sets cannot express: the plain
+ * scan's source of the same keys (lion_source_build(), §29.3), which walks
+ * one such column and takes the others' NULL entries away from it, pulled
+ * container by container into the bitmap.  It keeps no pin: the bitmap heap
+ * scan visits every TID.
+ */
+static int64
+lion_emit_source(LionScanOpaque so, TIDBitmap *tbm)
+{
+	LionSource *src = lion_source_build(so, false, CurrentMemoryContext);
+	const LionContainer *c;
+	int64		ntids = 0;
+
+	so->recheck = src->recheck;
+	while ((c = lion_source_next(src)) != NULL)
+	{
+		ntids += lion_container_to_tbm(c, tbm, so->recheck);
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_source_release(src);
+	MemoryContextDelete(src->cxt);
+	return ntids;
 }
 
 LionSource *
