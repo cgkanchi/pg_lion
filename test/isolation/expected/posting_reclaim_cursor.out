@@ -1,0 +1,95 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s2_leaves s1_begin s2_vacuum s2_shape s2_insert s2_size s2_verify s1_fetch s1_tail s1_commit s2_count s2_vacuum s2_reuse s2_verify
+step s2_leaves: 
+	SELECT container_pages AS leaves, deleted_pages AS unlinked
+	  FROM lion_index_stats('prc_k');
+
+leaves|unlinked
+------+--------
+    68|       0
+(1 row)
+
+step s1_begin: 
+	BEGIN;
+	DECLARE c CURSOR FOR SELECT id FROM prc WHERE k = 1;
+	MOVE 14999 FROM c;
+
+step s2_vacuum: VACUUM prc;
+step s2_shape: 
+	SELECT container_pages AS leaves, deleted_pages AS unlinked
+	  FROM lion_index_stats('prc_k');
+
+leaves|unlinked
+------+--------
+    40|      28
+(1 row)
+
+step s2_insert: 
+	INSERT INTO prc SELECT g, g % 4 FROM generate_series(300001, 420000) g;
+
+step s2_size: 
+	SELECT container_pages AS leaves, deleted_pages AS still_unlinked
+	  FROM lion_index_stats('prc_k');
+
+leaves|still_unlinked
+------+--------------
+    68|            28
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('prc_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s1_fetch: FETCH 3 FROM c;
+    id
+------
+ 59997
+180001
+180005
+(3 rows)
+
+step s1_tail: MOVE 14990 FROM c; FETCH 10 FROM c;
+    id
+------
+239969
+239973
+239977
+239981
+239985
+239989
+239993
+239997
+(8 rows)
+
+step s1_commit: COMMIT;
+step s2_count: 
+	SELECT k, count(*) FROM prc WHERE k IN (0, 1, 2, 3) GROUP BY k ORDER BY k;
+
+k|count
+-+-----
+0|60000
+1|60000
+2|60000
+3|60000
+(4 rows)
+
+step s2_vacuum: VACUUM prc;
+step s2_reuse: 
+	INSERT INTO prc SELECT g, g % 4 FROM generate_series(500001, 620000) g;
+	SELECT container_pages AS leaves, deleted_pages AS unlinked
+	  FROM lion_index_stats('prc_k');
+
+leaves|unlinked
+------+--------
+   100|       0
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('prc_k', true) AS verify;
+verify
+------
+      
+(1 row)
+

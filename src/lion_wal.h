@@ -80,7 +80,7 @@
 #define LION_XLOG_PAGE_DELETED		0xA0	/* a page handed to the FSM */
 #define LION_XLOG_ENTRY				0xB0	/* entry add/replace/delete */
 #define LION_XLOG_VACUUM_VISIT		0xC0	/* cleanup-lock barrier, no change */
-#define LION_XLOG_DIR_DELETE		0xD0	/* directory page deletion (§21) */
+#define LION_XLOG_UNLINK			0xD0	/* a page out of its tree (§21, §22) */
 #define LION_XLOG_REUSE				0xE0	/* a DELETED page taken again */
 #define LION_XLOG_LAST				LION_XLOG_REUSE
 

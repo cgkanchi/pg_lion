@@ -241,13 +241,18 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 	/*
 	 * Container and directory pages carry the DELETED bit once they are freed
 	 * (DESIGN.md §18, §21), the meta page never; only a directory leaf is ever
-	 * HALF_DEAD.
+	 * HALF_DEAD, and only a posting leaf UNLINKED (§22).
 	 */
 	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags == LION_PAGE_META)
 		lion_corrupt("lion index \"%s\": block %u is marked deleted but is the meta page",
 					RelationGetRelationName(vs->index), blk);
 	if ((opaque->flags & LION_PAGE_HALF_DEAD) != 0 && flags != LION_PAGE_BUCKET)
 		lion_corrupt("lion index \"%s\": block %u is marked half-dead but is not a directory leaf",
+					RelationGetRelationName(vs->index), blk);
+	if ((opaque->flags & LION_PAGE_UNLINKED) != 0 &&
+		(flags != LION_PAGE_CONTAINER || opaque->level != 0 ||
+		 (opaque->flags & LION_PAGE_POSITIONS) != 0))
+		lion_corrupt("lion index \"%s\": block %u is marked unlinked but is not a posting leaf",
 					RelationGetRelationName(vs->index), blk);
 
 	if (flags != kind)
@@ -708,6 +713,14 @@ lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 	 */
 	if (LionPageIsDeleted(page))
 		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
+					RelationGetRelationName(vs->index), blk, eoff, eblk);
+
+	/*
+	 * DESIGN.md §22, "Empty leaves": a leaf VACUUM took out of the set is
+	 * linked to by nothing of it, and will be handed out again.
+	 */
+	if (LionPageIsUnlinked(page))
+		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but was taken out of the posting set",
 					RelationGetRelationName(vs->index), blk, eoff, eblk);
 
 	if (opaque->owner_head != lion_entry_head(entry) ||

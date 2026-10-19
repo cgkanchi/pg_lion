@@ -796,9 +796,10 @@ VACUUM (`lion_vacuum.c`, ambulkdelete)
    per page; update min/max. A root that an insert pushed down under the walk - VACUUM finds an
    internal page where it expected a leaf - makes it descend again. Every page record also carries
    the updated entry (ncontainers/ntids), applied as deltas to the entry as it stands, so a crash
-   cannot desynchronise the counters. Empty leaves and internal pages stay in the tree; an entry
-   whose ntids reaches 0 is DELETED, and its whole posting tree freed bottom up, in a final step for
-   its leaf (§18). A page VACUUM cleanup-locked without writing to it joins the standby barrier of
+   cannot desynchronise the counters. A leaf the walk leaves empty is then taken out of the set
+   while the key lives on (§22, "Empty leaves"); internal pages stay in the tree; an entry whose
+   ntids reaches 0 is DELETED, and its whole posting tree freed bottom up, in a final step for its
+   leaf (§18). A page VACUUM cleanup-locked without writing to it joins the standby barrier of
    §25.
 3. Report stats: num_pages, num_index_tuples = the ROWS the index holds (§18, "Statistics": Σ
    ntids over the entries of its first scalar key column, the heap's row count when it has none),
@@ -5747,9 +5748,9 @@ this chain and is empty, mark it LION_PAGE_DELETED, store `safexid = ReadNextFul
 the page body (as nbtree's BTDeletedPageData), WAL-log, and RecordFreeIndexPage().  Step 2 runs with
 the bucket page unlocked, because VACUUM never waits for a page while holding another LWLock (§11).
 A crash between (1) and (2) leaks pages, which is harmless: they are unreferenced and the sweep
-below finds them (test/recovery/run.sh phase 1b puts the crash exactly there).  Mid-chain unlinking
-of empty pages of a live key is NOT part of this version (documented limitation: a key whose oldest
-pages empty out keeps them until REINDEX).
+below finds them (test/recovery/run.sh phase 1b puts the crash exactly there).  The leaves of a
+LIVE key's set that VACUUM empties are taken out of the set one at a time and recycled the same
+way (§22, "Empty leaves").
 
 **Reuse.** *(§22 adds one thing to the sweep below: a leaked posting set's ROOT is an INTERNAL page
 with downlinks on it, not an empty one, so the sweep runs in ROUNDS - an unreferenced internal
@@ -5760,18 +5761,23 @@ then is full of the items a split just put there. verify() reports such a page a
 it is, with a WARNING.)*
 
 `lion_new_buffer()`/`lion_alloc_page()` (§25 split the second out of `lion_new_buffer_xl()`) first try GetFreeIndexPage(): take the page with
-ConditionalLockBuffer; it is reusable only if it is all-zero or LION_PAGE_DELETED with
-GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
+ConditionalLockBuffer; it is reusable only if it is all-zero, or LION_PAGE_DELETED - or an UNLINKED
+posting leaf (§22, "Empty leaves") - with GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
 a link to it is running); otherwise re-record it in the FSM and extend the relation (which also keeps
 the loop from spinning on a block the map keeps offering).  heaprel comes from `heapRel` in aminsert
 and `info->heaprel` in VACUUM; a NULL heaprel means "never recycle", which is what ambuildempty
 wants.  ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum().  Leak recovery:
 ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
 walked, every container page it reached from a live entry, and every page it freed - and sweeps the
-rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, and an
+rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, an UNLINKED
+posting leaf (§22, "Empty leaves") goes there once it is reusable, and an
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
-below).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
+below).  The pages the sweep leaves out of the index's trees that are not reusable yet are counted
+on the meta page (the special area's `maxckey`, nbtree's `btm_last_cleanup_num_delpages`), and a
+VACUUM that calls no ambulkdelete reads every block of the index for them when they are more than
+a twentieth of it, nbtree's `_bt_vacuum_needs_cleanup()` rule, recording the ones that are
+reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
 those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
 page it reads passes the cost-based delay first, as every page the walk reads does (since the
 2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
@@ -5795,8 +5801,9 @@ ADDED UP over the calls as nbtree does it, and the other two describe the index 
 it - the sweep counts them afresh every time, the earlier calls' pages among them - with a page
 reusable when it is all-zero, or DELETED with its safexid behind every snapshot, which is exactly
 lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: "30 newly
-deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all still
-reports none of them, §5 step 4: counting them would mean reading every page of the index.)
+deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all reports
+them only when it reads the index for the pages an earlier one could not hand out yet, above;
+otherwise counting them would mean reading every page of the index.)
 
 **Statistics** (2026-09-27 review).  `num_index_tuples` becomes the index's `pg_class.reltuples`
 whenever it is not marked estimated, and the planner reads that as ROWS - a partial index's size
@@ -7064,8 +7071,8 @@ names must be the top of a subtree being deleted: a chain of single downlinks do
 leaf whose `owner_head` names it. The pages of such a subtree bound nothing - their range is the
 right sibling's already - so their high keys are compared with nothing.
 
-**Not done:** the empty pages of a LIVE key's posting tree are not unlinked (§18); they go when the
-key does.
+The empty leaves of a LIVE key's posting set go too, by a protocol of one record each (§22, "Empty
+leaves").
 
 ### Locking summary
 
@@ -7229,9 +7236,8 @@ Operations.
   `test/isolation/count_root_pushdown_race.spec`.)* Internal pages are never empty while the set
   lives, so the leak sweep leaves them alone. Freeing a whole set frees its internal pages too,
   bottom up, under ConditionalLockBufferForCleanup like the leaves; a set with no internal level is
-  its chain, freed from the head. Internal pages are never
-  deleted while the set lives (documented limitation), and neither are empty leaves - both wait for
-  the whole set to go, as §18 already said of mid-chain pages.
+  its chain, freed from the head. Internal pages are not deleted while the set lives; a leaf the
+  walk leaves empty is taken out of the set once the walk is over ("Empty leaves" below).
   A root that is pushed down while VACUUM is walking it: VACUUM finds a page that is no longer a
   leaf, and descends again. That is safe for the reason §11's split hole is safe - the cleanup lock
   it holds on the old root waited for every pin on the page those containers came from, so no
@@ -7356,6 +7362,57 @@ Operations.
   because a table that is updated at all writes inside its containers sooner or later, and the
   room costs about a tenth more posting pages at build where its absence costs a split of nearly
   every leaf under the first wave. Measured below ("Posting leaves with room, measured").
+
+### Empty leaves
+
+A key that keeps getting rows while its oldest ones are deleted empties the LOW end of its posting
+set: the leaves of its oldest TIDs. VACUUM takes a leaf it leaves empty out of the set while the key
+lives on (`lion_posting_delete.c`), so that readers do not walk it and its block goes back to the
+free space map. It is nbtree's page deletion cut down to what a posting set needs - one record per
+leaf, because a set's internal pages stay.
+
+- **What goes.** Pass 2 notes every leaf its walk leaves empty, with the leaf it came from. When the
+  walk of the set is over - and unless the whole set goes with its entry in the final step (§18) -
+  each one is taken out in a window of its own with the key's directory leaf held EXCLUSIVE, which
+  every writer of the set holds too (rule 2), so the set cannot change shape meanwhile and an insert
+  waits for one leaf at a time. Never taken out: the root (a set without an internal level has its
+  first leaf as its root); the rightmost leaf, whose range has no right sibling to go to and which is
+  the entry's `tail`; a leaf whose split, or whose left neighbour's split, never finished; and in a
+  tree, a leaf whose downlink is its parent's last, whose range would have to go to a page under
+  another parent. Such a leaf stays, empty, and the key's next rows in its range go into it.
+- **The record.** L's left neighbour (found from the leaf the walk came from, or from the leftmost
+  leaf after a root push-down; there is none for a tree's leftmost leaf) gets L's right link. In the
+  parent, found from where the neighbour's last key routes, L's downlink is pointed at L's right
+  sibling R and R's own downlink - the next one on the page - is deleted: R takes L's range over,
+  with L's separator as its lower bound, as nbtree's right sibling does. L itself is flagged
+  LION_PAGE_UNLINKED and keeps everything else: its kind, level, owner stamps, right link and empty
+  body. Its `leftlink`, which a posting leaf does not otherwise use, holds the low half of the next
+  transaction id (`lion_page_get_safexid()` puts the epoch back as the one that places it at or below
+  the next transaction id). One record of up to three blocks, `UNLINK` in rmgr mode (§25), in both
+  WAL modes an ordinary change of three live pages.
+- **Readers.** Nothing in them changed. A reader that held a link to L - the right link of a leaf it
+  copied (§29.5), or a downlink it is about to follow - lands on an empty leaf of its own set, and
+  empty leaves were always walked past: maxckey 0 is below every key, so a descent moves right, and
+  a walk finds no item and follows the right link to R, which is where L's range went. Items only
+  ever moved right, and still do.
+- **Reuse.** A sweep (§18, "Reuse") that finds L unvisited and UNLINKED records it in the free space
+  map once its transaction id is behind every snapshot, nbtree's rule - not before, because
+  `lion_alloc_page()` tries one page of the map before it extends the index, and a map full of
+  pages it may not take yet made the index grow. The VACUUM that took L out is usually too early
+  for that, and the next one records it, with or without rows to remove (§18, "Reuse"). The
+  allocation that takes it checks the horizon again and announces the reuse to a standby first
+  (§25), whose queries may hold a link for longer. Until then the page is exactly what it was, an
+  empty leaf, on a standby as on the primary. `lion_index_stats()` counts it among the
+  `deleted_pages`.
+- **verify()** reports an UNLINKED page reached from a live entry, and one that is not an empty
+  posting leaf; an unreferenced empty one is a free page, as a DELETED one is.
+
+Measured on four keys of 100,000 rows each (`g % 4`), twelve rounds of deleting the oldest 100,000
+rows, VACUUM, inserting 100,000 new ones and VACUUM, the heap reusing its space: a bitmap scan of
+one key reads 25 index pages after the last round where it read 36 without the unlinking, and the
+index settles at 154 pages from the fifth round on, where it settled at 142 - the leaves a round
+takes out wait one round for the horizon, while the rows that refill their range arrive in the same
+round.
 
 ### The sets without an internal level, measured
 
@@ -8636,17 +8693,24 @@ image.
                                    `pg_lion.vacuum_barrier_ranges` (1024)
                                    ranges with no removal record to carry
                                    them.
-    DIR_DELETE      0xD0  2-4      A directory page deletion (§21, "Page
-                                   deletion").  Stage 1: the parent's
-                                   rewritten downlink and DELETE of the next,
-                                   and the leaf as INIT + ADD of its MINUS
-                                   INFINITY high key, HALF_DEAD.  Stage 2: the
-                                   left and right siblings' SPECIAL (and the
-                                   right one's first downlink made MINUS
-                                   INFINITY when the page was the leftmost of
-                                   its level), the page as INIT + ADD, DELETED
-                                   with the safexid, and the leaf's SPECIAL.
-    REUSE           0xE0  0        A DELETED page about to be used again: the
+    UNLINK          0xD0  2-4      A page taken out of its tree.  A directory
+                                   page deletion (§21, "Page deletion"):
+                                   stage 1, the parent's rewritten downlink
+                                   and DELETE of the next, and the leaf as
+                                   INIT + ADD of its MINUS INFINITY high key,
+                                   HALF_DEAD; stage 2, the left and right
+                                   siblings' SPECIAL (and the right one's
+                                   first downlink made MINUS INFINITY when the
+                                   page was the leftmost of its level), the
+                                   page as INIT + ADD, DELETED with the
+                                   safexid, and the leaf's SPECIAL.  An empty
+                                   posting leaf (§22, "Empty leaves"): the left
+                                   neighbour's SPECIAL, the leaf's SPECIAL,
+                                   UNLINKED with its transaction id, and in a
+                                   tree the parent's rewritten downlink and
+                                   DELETE of the next.
+    REUSE           0xE0  0        A DELETED page, or UNLINKED posting leaf,
+                                   about to be used again: the
                                    RelFileLocator, the block and its safexid,
                                    no registered block.  Redo resolves the
                                    recovery conflict with that horizon, as
@@ -14301,11 +14365,15 @@ posting-tree root of each CHAIN set, a directory leaf image with its right link,
    key's set: a cursor that follows its stale right link or descends from its stale root lands on
    a page that is DELETED or claims another owner, and ends the set there - the owner check every
    cursor already makes (`lion_page_owns()`, §18). Ending there is right because VACUUM deletes an
-   entry only once its set holds no TID at all. Pages of a LIVE set are never freed (§18: only a
-   whole set is), so a set that still has a visible row never loses a page under the scan. (While
-   an MVCC snapshot is registered, the freed pages cannot even be handed out again:
-   `lion_alloc_page()` takes a DELETED page only once its `safexid` is older than every snapshot,
-   §18. The owner check is what the argument rests on; the horizon is a second fence.)
+   entry only once its set holds no TID at all. (While an MVCC snapshot is registered, the freed
+   pages cannot even be handed out again: `lion_alloc_page()` takes a DELETED page only once its
+   `safexid` is older than every snapshot, §18. The owner check is what the argument rests on; the
+   horizon is a second fence.)
+   A LIVE set loses only the leaves VACUUM emptied (§22, "Empty leaves"): such a leaf is taken out
+   of the set but stays an empty leaf of it, with the right link it had, so a cursor that follows a
+   stale link to it walks through it to the leaf that took its range over. Here the horizon is
+   what the argument rests on: the leaf is not handed out again while the scan's snapshot lasts
+   (test/isolation/posting_reclaim_cursor.spec).
 8. *The directory leaf under a paused WALK splits, or loses entries to VACUUM*: the walk holds an
    image of the leaf and its right link, exactly as the bitmap walk does between leaves (§21
    "Ordered iteration", §28): entries moved right are in the image and are not visited again on

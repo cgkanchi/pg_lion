@@ -631,9 +631,9 @@ SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1000 AND 10000');
 (1 row)
 
 SELECT lion_sm('SELECT count(*) FROM lion_sm WHERE u BETWEEN 1990 AND 9010 AND g = 3');
-            lion_sm             
---------------------------------
- complement, summaries 458: (3)
+         lion_sm          
+--------------------------
+ inside, summaries 0: (3)
 (1 row)
 
 -- ... and every row of a column: every summary goes but the open one, which

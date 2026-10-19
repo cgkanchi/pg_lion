@@ -1036,6 +1036,21 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	 * whatever the page holds (lion_vacuum_free_postree()).  A root is its
 	 * tree's identity and is live until then.
 	 */
+	/*
+	 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves") is out of its
+	 * set on purpose and waits for VACUUM to hand it out again, as a DELETED
+	 * page does.  Nothing writes to it after that, so one with items is
+	 * damage.
+	 */
+	if (LionPageIsUnlinked(page))
+	{
+		if (!LionPageIsPostingLeaf(page) || PageGetMaxOffsetNumber(page) != 0)
+			lion_corrupt("lion index \"%s\": block %u was taken out of a posting set but is not an empty leaf",
+						RelationGetRelationName(vs->index), blk);
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_FREE;
+	}
+
 	if ((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) != 0)
 	{
 		BlockNumber root = LionPageGetOpaque(page)->owner_head;
