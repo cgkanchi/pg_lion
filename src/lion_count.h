@@ -1035,6 +1035,14 @@ extern void lion_range_spill_set(struct LionMatSet *mat, Size *held);
  */
 typedef struct LionRangeProbe LionRangeProbe;
 
+/*
+ * lion_range_probe_fits() is the same memory test asked of an F of `rows`
+ * rows over `containers` container keys before anything is collected - one
+ * of F's sources, which bounds what the probe copies - by the executor
+ * before it tries, and by the planner before it prices a walk probed.
+ */
+extern bool lion_range_probe_fits(double rows, double containers,
+								  Size maxbytes);
 extern LionRangeProbe *lion_range_probe_begin(Relation heap, Snapshot snapshot,
 											  int nsources,
 											  LionCountSource *sources,

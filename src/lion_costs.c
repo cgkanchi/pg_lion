@@ -157,7 +157,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each entry of a lion range walk counted on its own"},
 	{"pg_lion.range_union_entry_cost", &lion_range_union_entry_cost, 12.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each small entry of a lion summed range counted with the rest of its leaf"},
-	{"pg_lion.probe_step_cost", &lion_probe_step_cost, 2.0, LION_OP,
+	{"pg_lion.probe_step_cost", &lion_probe_step_cost, 10.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each container of a set a lion summed range probes"},
 	{"pg_lion.range_fold_cost", &lion_range_fold_cost, 420.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each fold or merge of a lion range collected as a source into a container of its union that is not a bitset"},

@@ -448,6 +448,12 @@ keys; `auto` gives them only to the columns whose keys are small next to a bucke
 values), which is where ranges are slow.  Every insert into a summarized column also updates its
 bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
 are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
+A count over a range beside other conditions counts each bucket's set against them until those
+counts have visited twice the containers the conditions' smallest set holds, then collects the
+conditions once and steps the remaining buckets at their keys (`Range Walks Probed` in
+`EXPLAIN ANALYZE`) - when a copy of that smallest set fits `work_mem`; otherwise it counts every
+bucket.  The planner prices whichever the count will do, so a larger `work_mem` can make such a
+count the cheaper plan.
 A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
 g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk -
 within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by the table's ranges:
@@ -619,7 +625,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
-| `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `probe_step_cost` | 10 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
 | `spill_read_cost` | 27 | `cpu_operator_cost` | a container a count reads back from a set spilled to a temporary file: a range collected as a source, the FK-side join's copy of its fact filters |
 | `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
