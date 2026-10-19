@@ -31,12 +31,14 @@ DROP TABLE plk;
 
 -- ---------------------------------------------------------------------
 -- 2. A sweep: key lengths near the limit (2044 and up are hashed to the
---    maximum key size), one to several positions a row, store_positions on
---    and off, inline_limit at its default and below, and rows added in
---    batches of every size - each batch in a subtransaction, so a failure
---    is counted and the sweep goes on, as an application retrying would
---    (the index keeps what a failed insert changed).  Every row has to go
---    in, and the index has to answer for all of them, phrases included.
+--    maximum key size; 2046 is the longest word to_tsvector() keeps on every
+--    minor release, as some drop one of 2047 bytes), one to several
+--    positions a row, store_positions on and off, inline_limit at its
+--    default and below, and rows added in batches of every size - each
+--    batch in a subtransaction, so a failure is counted and the sweep goes
+--    on, as an application retrying would (the index keeps what a failed
+--    insert changed).  Every row has to go in, and the index has to answer
+--    for all of them, phrases included.
 -- ---------------------------------------------------------------------
 CREATE TABLE plk_result (
 	klen int, npos int, positions bool, inline_limit int,
@@ -45,7 +47,7 @@ CREATE TABLE plk_result (
 DO $$
 DECLARE
 	klens int[] := ARRAY[1880, 1910, 1935, 1950, 2000, 2020, 2040, 2043,
-						 2044, 2047];
+						 2044, 2046];
 	klen int;
 	npos int;
 	pos bool;
