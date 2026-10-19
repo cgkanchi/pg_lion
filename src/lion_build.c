@@ -2021,6 +2021,20 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
  * --------------------------------------------------------------------- */
 
 /*
+ * What the spool may use of workmem kB: what the positions of a column that
+ * stores them do not take (lion_posbuild_budget()), so that the two stay
+ * within it together.
+ */
+static Size
+lion_build_spool_memory(const LionPosBuild *posbuild, int workmem)
+{
+	Size		total = (Size) workmem * 1024;
+	Size		positions = lion_posbuild_budget(posbuild);
+
+	return (total > positions) ? total - positions : 0;
+}
+
+/*
  * table_index_build_scan() callback, serial and parallel alike: arg is this
  * process's spool, which does everything (lion_spool.c).
  */
@@ -2257,10 +2271,10 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	double		reltuples;
 
 	(void) lion_build_index_state(index, &ix, cxt);
-	spool = lion_spool_begin(&ix, (Size) memkb * 1024, &shared->fileset,
-							 filenum);
 	posbuild = lion_posbuild_begin_shared(index, &ix, memkb, &shared->fileset,
 										  filenum);
+	spool = lion_spool_begin(&ix, lion_build_spool_memory(posbuild, memkb),
+							 &shared->fileset, filenum);
 	if (posbuild != NULL)
 		lion_spool_set_possink(spool, lion_posbuild_sink, posbuild);
 
@@ -2471,7 +2485,8 @@ lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
 	bs->reader = lion_spool_reader_begin(&bs->ix, &shared->fileset,
 										 leader->nparticipants, filenums,
 										 shares,
-										 (Size) maintenance_work_mem * 1024);
+										 lion_build_spool_memory(bs->posbuild,
+																 maintenance_work_mem));
 	if (bs->posbuild != NULL)
 		lion_posbuild_import(bs->posbuild, &shared->fileset,
 							 leader->nparticipants, filenums);
@@ -2647,8 +2662,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	/*
 	 * A column that stores positions (DESIGN.md §17) keeps them on the side
-	 * (lion_posbuild.c); in a parallel build each participant keeps its own
-	 * and the leader reads them all once the scan is done.
+	 * (lion_posbuild.c), in a share of maintenance_work_mem the spool does
+	 * without; in a parallel build each participant keeps its own, in that
+	 * share of its own, and the leader merges them all once the scan is done.
 	 */
 	posbuild = lion_posbuild_begin(index, &bs.ix, maintenance_work_mem);
 	bs.posbuild = posbuild;
@@ -2666,7 +2682,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	else
 #endif
 	{
-		bs.spool = lion_spool_begin(&bs.ix, (Size) maintenance_work_mem * 1024,
+		bs.spool = lion_spool_begin(&bs.ix,
+									lion_build_spool_memory(posbuild,
+															maintenance_work_mem),
 									NULL, -1);
 		if (posbuild != NULL)
 			lion_spool_set_possink(bs.spool, lion_posbuild_sink, posbuild);
