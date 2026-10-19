@@ -42,9 +42,15 @@ A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE e
 partition, and counts each group against that one set, so the filters' index pages are read once
 rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
-to a temporary file past it. The groups are then counted against it up to a few hundred at a time,
-in one pass over its containers for all of them (`Group Batches` in `EXPLAIN ANALYZE`). With
-parallel query enabled (`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
+to a temporary file past it. A range on another column (`... WHERE created_at >= $1 GROUP BY
+country`, with `summaries = on` on its index) is one such filter, collected from the summaries and
+past the memory into a temporary file too - a table's ranges share the memory, and one that does
+not fit what the others left sends those to files first; where there are only a few counts to
+make - a `count(DISTINCT)`'s tests, which stop at a row - the planner may walk it at each instead,
+when that is the cheaper (`Range Sources Walked` in `EXPLAIN ANALYZE`). The groups are then
+counted against it up to a few hundred at a time, in one pass over its containers for all of them
+(`Group Batches` in `EXPLAIN ANALYZE`). With parallel query enabled
+(`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
 run in parallel: the workers divide the table's blocks into ranges, each collects the filters of
 its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
 the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
@@ -224,8 +230,9 @@ once per process into memory bounded like a hash join's (`work_mem` × `hash_mem
 that the copy spills to a temporary file, as a hash join's table would. Where the planner expects
 few dimension rows it may instead probe the fact filters at each dimension row's count; a run that
 meets far more rows, or far heavier keys, than it expected keeps an account of what probing has cost
-and collects the filters part way through once that reaches what collecting them costs, if the copy
-is expected to fit that memory (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
+and collects the filters part way through once that reaches what collecting them costs - a copy
+expected not to fit that memory priced as spilled, its pages written once and read back by the
+counts after it (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
 `Fact Filters: probed, then collected`, `Fact Filter Switches` and `Fact Filter Keys Probed`, the
 keys counted by probing before each switch). Their values may be
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter

@@ -194,11 +194,12 @@ lion_compl_count(LionCountScanState *st, LionCountSource *sources,
 /*
  * Every count the node makes, and every existence test (`exists`: 1 or 0),
  * goes through here: the AND of sources, as lion_count_sources_cached()
- * counts it - once any range taken as a source that was too large to collect
- * (LionCountSource.rangewalk; DESIGN.md §32) has been expanded.  Such a range
- * is the union of the disjoint sets a walk of it hands out, so the count is
- * the SUM of the counts of those sets, each ANDed with the other sources in
- * its place (lion_walk_count()); the counts of the pieces come back through
+ * counts it - once any range taken as a source that was too large to collect,
+ * where the plan walks those (LionCountSource.rangewalk, LION_FLAG_RANGEWALK;
+ * DESIGN.md §32), has been expanded.  Such a range is the union of the
+ * disjoint sets a walk of it hands out, so the count is the SUM of the counts
+ * of those sets, each ANDed with the other sources in its place
+ * (lion_walk_count()); the counts of the pieces come back through
  * here and expand the next such range, if there is one.
  */
 int64
@@ -1117,12 +1118,13 @@ lion_count_runs(LionCountScanState *st, bool sum)
  * are, as lion_group_count() weighs them: worked out once per relation, from
  * the hints of the sets lion_locate_where() located once per relation.
  *
- * A range still to be walked - one too large to collect (DESIGN.md §32) - is
- * no item here: every count walks it beside the collected set, as the planner
- * priced it.  A NEGATED item is one to combine when it has a set to subtract,
- * and nothing when it has none (`IS NOT NULL` over a column without NULLs, a
- * multi-key query no key narrows); the collection needs a POSITIVE item to
- * start from, and a WHERE without one is never collected.
+ * A range still to be walked - one too large to collect, which the plan walks
+ * (DESIGN.md §32) - is no item here: every count walks it beside the
+ * collected set, as the planner priced it.  A NEGATED item is one to combine
+ * when it has a set to subtract, and nothing when it has none (`IS NOT NULL`
+ * over a column without NULLs, a multi-key query no key narrows); the
+ * collection needs a POSITIVE item to start from, and a WHERE without one is
+ * never collected.
  *
  * The REACH of a set is the container keys its rows can lie at: its rows, up
  * to the relation's container keys.  A merge reads about that many containers

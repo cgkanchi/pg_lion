@@ -1095,9 +1095,9 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 							   es);
 
 	/*
-	 * The ranges taken as sources (DESIGN.md §32): collected into memory,
-	 * or - too large for it - summed over their walk at every count they
-	 * are part of.  Again only when there were any.
+	 * The ranges taken as sources (DESIGN.md §32): collected, or - too large
+	 * for the memory, where the plan walks those - summed over their walk at
+	 * every count they are part of.  Again only when there were any.
 	 */
 	if (st->rangesrc_collected > 0)
 		ExplainPropertyInteger("Range Sources Collected", NULL,
@@ -1106,8 +1106,7 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Range Sources Walked", NULL,
 							   st->rangesrc_walked, es);
 	/*
-	 * ... and of the collected, those spilled to a file: an OR's leaf, or a
-	 * range beside the decoded walk
+	 * ... and of the collected, those spilled to a file, past the memory
 	 */
 	if (st->rangesrc_spilled > 0)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,

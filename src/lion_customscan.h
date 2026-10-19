@@ -605,6 +605,16 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_NOTMULTI	9	/* NOT (col @> / && / @@ const), §35 */
 
 /*
+ * ORed into a RANGESRC clause's kind in the plan's CLAUSEKINDS: the first
+ * bound of a range the planner priced walked at every count where it does
+ * not fit the memory left (LION_FLAG_RANGEWALK, LionCountPrivClause.walk).
+ * Every other range of such a plan is collected, in windows past the memory,
+ * as in any other: a range the planner expected to fit is never walked
+ * because it did not, at a price nobody made.
+ */
+#define LION_CLAUSE_WALK		0x100
+
+/*
  * A RANGE clause is neither: it is not a source of the count at all, but a
  * bound on the entry walk that drives it (DESIGN.md §28), so it is never
  * located, never merged and never priced as a lookup.  A RANGESRC clause is a
@@ -847,6 +857,29 @@ typedef struct LionVColScope
 								 LION_BLOCKS_PER_CONTAINER * 2 * sizeof(uint16))
 
 /*
+ * What a collected set spilled to a temporary file keeps in memory for each
+ * of its containers (LionSpillEnt: where it is, its key and its size), which
+ * a range's spilled union holds of what the relation's ranges share
+ * (lion_cost_range_source()).
+ */
+#define LION_SPILL_ENTRY_BYTES	16.0
+
+/*
+ * ... and what reading one of its containers back costs, a count at a time:
+ * a seek of the file and a read of the container into the cursor's buffer
+ * (lion_spill_read()), which the file's buffer serves when the container
+ * before it was on the same page.  Timed on the assert-enabled build over
+ * the FK-side join's copy of 1.5M rows of 3M, spilled at a 64 kB work_mem,
+ * against the same copy in memory: 2.49M containers read back, from 830,000
+ * pages of the file, in 580 ms more - 233 ns a container on a build that
+ * counts against the copy in memory at 287 units a millisecond, 135 ns at
+ * the reference's 500 (DESIGN.md §10).  Every count that reads a spilled
+ * set pays it for each container it seeks: the FK-side join's copy of its
+ * filters (§27), a range taken as a source (§32).
+ */
+#define LION_SPILL_READ_COST	(lion_spill_read_cost * cpu_operator_cost)
+
+/*
  * THE MERGE'S CPU (DESIGN.md §10, "The units"), which lion_merge_cpu_cost()
  * charges wherever posting sets are counted or intersected - the count
  * pushdown's AND, each group of a GROUP BY and each pair of two, and the AND a
@@ -1000,6 +1033,13 @@ typedef struct LionVColScope
 										 * tuple (DESIGN.md §10, "Residual
 										 * clauses"), in custom_exprs after
 										 * the aggregates' arguments */
+#define LION_FLAG_RANGEWALK		0x40	/* the ranges taken as sources
+										 * whose clause says so
+										 * (LION_CLAUSE_WALK) are walked at
+										 * every count where they do not fit
+										 * the memory left, not collected in
+										 * windows (DESIGN.md §32, "Too large
+										 * to collect") */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -1299,6 +1339,7 @@ typedef struct LionVColScope
 typedef struct LionClauseState
 {
 	int			kind;			/* LION_CLAUSE_* */
+	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;			/* the HEAP column (the parent's, with §16's
@@ -1392,16 +1433,17 @@ typedef struct LionSourceItem
 } LionSourceItem;
 
 /*
- * A range taken as a source that was too large to collect into memory
- * (DESIGN.md §32, "A range as a source"): what LionCountSource.rangewalk
- * points at, and what lion_node_count() expands into the sets a walk of the
- * range hands out.
+ * A range taken as a source that was too large to collect into memory, in a
+ * plan that walks those (DESIGN.md §32, "A range as a source";
+ * LION_FLAG_RANGEWALK): what LionCountSource.rangewalk points at, and what
+ * lion_node_count() expands into the sets a walk of the range hands out.
  */
 typedef struct LionRangeSource
 {
 	Relation	index;
 	AttrNumber	col;			/* its KEY COLUMN in index */
 	LionRange	range;
+	bool		walk;			/* one of its bounds is LION_CLAUSE_WALK */
 } LionRangeSource;
 
 /*
@@ -1502,12 +1544,15 @@ typedef struct LionJoinPart
 	/*
 	 * Probed, then collected (DESIGN.md §27): what probing its filters has
 	 * cost so far this run, and what collecting them would - estimated at
-	 * its first turn, -1 before, and 0 where no copy of them can be made or
-	 * would fit - and the keys counted by probing them.
+	 * its first turn, -1 before, and 0 where no copy of them can be made -
+	 * and the keys counted by probing them; and the pages of the copy,
+	 * where it would spill to a temporary file, which every count against
+	 * it would read from there.
 	 */
 	double		rent;
 	double		buy;
 	int64		probed;
+	double		copypages;
 } LionJoinPart;
 
 /*
@@ -1956,13 +2001,16 @@ typedef struct LionJoinWorkerSums
  * them has cost this run - rent, in the planner's units, from what the
  * counts read (lion_join_count_key()) - and collects them once it reaches
  * what collecting would cost, buy (lion_join_copy_price(), from the located
- * sets; -1 until they are priced, 0 where no copy of them can be made or
- * would fit).  mayswitch says this run may still switch; probed counts its
+ * sets; -1 until they are priced, 0 where no copy of them can be made).  A
+ * copy that would not fit the memory spills to a temporary file, and its
+ * pages - copypages, 0 for one that fits or before the price - are what a
+ * count against it would read there, which the account holds against
+ * probing.  mayswitch says this run may still switch; probed counts its
  * keys counted by probing.  A partitioned fact table keeps the same account
- * per leaf (LionJoinPart), rentp pointing at the one of the leaf whose turn
- * it is.  switches and switchkeys are what EXPLAIN ANALYZE reports: the
- * copies made by switching, and the keys probed before each, summed over
- * the runs and the leaves.
+ * per leaf (LionJoinPart), rentp and copypagesp pointing at the ones of the
+ * leaf whose turn it is.  switches and switchkeys are what EXPLAIN ANALYZE
+ * reports: the copies made by switching, and the keys probed before each,
+ * summed over the runs and the leaves.
  *
  * Where a key's time goes: the rows the child returned, the posting-tree
  * pages the keys' counts read (lion_posting_pages_read over each count) and
@@ -2022,8 +2070,10 @@ typedef struct LionJoinState
 	double		rent;
 	double		buy;
 	int64		probed;
+	double		copypages;
 	double	   *rentp;
 	int64	   *probedp;
+	double	   *copypagesp;
 	int64		switches;
 	int64		switchkeys;
 
@@ -2085,6 +2135,7 @@ typedef struct LionCountPrivClause
 	AttrNumber	attno;			/* the PARENT's */
 	Oid			opno;			/* InvalidOid for a null test */
 	int			filter;			/* FILTERS: 0, or its filtered count's */
+	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
 } LionCountPrivClause;
 
 /* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
@@ -2296,14 +2347,18 @@ typedef struct LionCountScanState
 
 	/*
 	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"): how
-	 * many were collected into memory, how many were too large and were
-	 * summed over their walk at every count instead, and what the collected
-	 * ones hold - all of them within one hash table's memory.
+	 * many were collected, and of those how many spilled to a temporary file;
+	 * how many were too large and were summed over their walk at every count
+	 * instead, in a plan that walks those; and what the collected ones hold -
+	 * all of them within one hash table's memory - and which of them are in
+	 * it (rangesrc_mem, their LionMatSets, in wherecxt), for one that does not
+	 * fit what they left to send to files (lion_locate_range()).
 	 */
 	int64		rangesrc_collected;
 	int64		rangesrc_walked;
 	int64		rangesrc_spilled;	/* of the collected: in a temporary file */
 	Size		rangesrc_held;
+	List	   *rangesrc_mem;
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -3147,18 +3202,34 @@ extern Selectivity lion_rel_clauses_selectivity(PlannerInfo *root,
 												RelOptInfo *rel,
 												List *clauses);
 /*
- * What becomes of a range taken as a source that does not fit in memory
- * (lion_cost_range_source()): walked at every count, priced out (an OR's
- * leaf), or collected in windows into a temporary file (the decoded walk's
- * WHERE, DESIGN.md §34).
+ * What the ranges taken as sources of one relation hold of the hash table's
+ * memory they share, as the executor accounts it (lion_locate_range()): held
+ * all told, and of it inmem, what the ranges collected in memory take - which
+ * a range that does not fit what they left sends to files of their own, to
+ * hold inmemspill there.
  */
-#define LION_RANGESRC_WALK		0
-#define LION_RANGESRC_ORLEAF	1
-#define LION_RANGESRC_SPILL		2
+typedef struct LionRangeMem
+{
+	double		held;
+	double		inmem;
+	double		inmemspill;
+} LionRangeMem;
+
+/*
+ * A range taken as a source (lion_cost_range_source()), collected within what
+ * the relation's ranges before it left of a hash table's memory (*mem) or in
+ * windows into a temporary file past it, which *spills says; *evicts says
+ * that the ranges in memory before it went to files to make room for it.
+ * Where `attempt` is given, *attempt is what trying to collect one that does
+ * not fit costs, for a count that may walk it at every count instead
+ * (LION_FLAG_RANGEWALK).
+ */
+extern double lion_container_max_bytes(double tuples, double pages);
 extern Cost lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
 								   List *bounds, Selectivity sel,
-								   double counts, int large);
+								   LionRangeMem *mem, bool *spills,
+								   bool *evicts, Cost *attempt);
 extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
@@ -3171,12 +3242,26 @@ extern void lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath,
 								List *wherekinds, List *ors, double entries,
 								double drivefrac, double cand,
 								double candrows, double outrows);
+/*
+ * What walking the ranges too large to collect at every count would save
+ * over collecting them in windows, summed over the relations and runs a
+ * plan counts (lion_cost_count_path()), and the clauses it would walk: the
+ * first bound of each range, a clause of the WHERE, which the plan marks
+ * LION_CLAUSE_WALK where it takes the saving (LION_FLAG_RANGEWALK).
+ */
+typedef struct LionWalkSave
+{
+	Cost		save;
+	List	   *clauses;
+} LionWalkSave;
+
 extern void lion_cost_count_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, List *whereclauses,
 								 List *wherekinds, List *ors, double numgroups,
 								 double outer_entries, double inner_entries,
 								 double outrows, int distinct, int ranged,
-								 double drivefrac, LionRangeCost *rc);
+								 double drivefrac, LionRangeCost *rc,
+								 LionWalkSave *walksave);
 extern void lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath,
 								  List *targets, List *whereclauses,
 								  List *wherekinds, List *ors, int ncol,

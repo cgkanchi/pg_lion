@@ -1115,6 +1115,7 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		LionClauseState *cl = &st->clause[i];
 
 		cl->kind = priv->clause[i].kind;
+		cl->walk = priv->clause[i].walk;
 		cl->idxoid = priv->clause[i].idxoid;
 		cl->attno = priv->clause[i].attno;
 		cl->opno = priv->clause[i].opno;

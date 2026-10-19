@@ -4,10 +4,10 @@
 -- `g, count(*) ... WHERE <range on k> GROUP BY g`, a range beside a sum over
 -- another range, a range as an OR's arm and a range among the fact filters of
 -- an FK-side join: the rows whose key lies in the range are one source of the
--- count, collected into memory once - summaries and all - or, when they do
--- not fit in a hash table's memory, summed over the walk of the range at
--- every count.  Every answer is checked against the same query with the
--- pushdown off.
+-- count, collected once - summaries and all - into memory, or past a hash
+-- table's memory into a temporary file; or, where the counts are few enough
+-- that it is the cheaper, summed over the walk of the range at each.  Every
+-- answer is checked against the same query with the pushdown off.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -20,7 +20,8 @@ SET max_parallel_workers_per_gather = 0;
 /*
  * lion_src() runs q with the pushdown forced (every other scan and join
  * disabled) and again with the pushdown off and the planner left alone, and
- * compares the answers as multisets.  It reports how the node took its ranges.
+ * compares the answers as multisets.  It reports how the node took its ranges:
+ * how many it collected, and of those spilled, and how many it walked.
  */
 CREATE FUNCTION lion_src(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -46,6 +47,7 @@ BEGIN
 		how := 'not pushed down';
 	ELSE
 		how := 'collected ' || coalesce(node ->> 'Range Sources Collected', '0') ||
+			coalesce(' (spilled ' || (node ->> 'Range Sources Spilled') || ')', '') ||
 			', walked ' || coalesce(node ->> 'Range Sources Walked', '0');
 		IF node ->> 'Range Evaluation' IS NOT NULL THEN
 			how := how || ', ' || (node ->> 'Range Evaluation');
@@ -182,15 +184,18 @@ SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE (r < 100 OR k > 790) AND 
 SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE u < 100 OR a = 3');
 SELECT lion_src('SELECT count(*) FROM lion_src_t WHERE (k >= 5 AND k < 9 AND a = 1) OR a = 2');
 
--- ---------- 4. too large for a hash table's memory: walked at every count ----------
+-- ---------- 4. too large for a hash table's memory: spilled, or walked ----------
 -- A range over half of the rows of a column in no order is a NARROW of
 -- width 2 (DESIGN.md §38), a kilobyte, at each container key of the heap,
 -- and 360,000 rows 65 to a page are some ninety of them: more than the 64 kB
 -- of work_mem's floor.  (The pad puts the rows just past the 63 offsets of
 -- a NARROW of width 1, which makes a NARROW the largest for the rows it
 -- holds.)  a takes each value for two rows in turn, so that a range of it
--- is RUNs of a few hundred bytes a key, which are collected beside a walked
--- range of r.
+-- is RUNs of a few hundred bytes a key, which are collected beside a range
+-- of r.  That one is collected in windows into a temporary file (DESIGN.md
+-- §32, "Too large to collect") and read as any collected set - unless the
+-- counts are few enough that walking it at each is the cheaper, which the
+-- planner prices: the existence tests below walk it.
 CREATE TABLE lion_src_w (u int NOT NULL, r int NOT NULL, g int NOT NULL,
 						 a int NOT NULL, pad text);
 INSERT INTO lion_src_w
@@ -205,10 +210,10 @@ SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r < 524288 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_w WHERE r >= 300000 AND r < 800000 AND a < 20 GROUP BY g');
--- the complement of a walked range, and its inside
+-- beside a summed range, taken inside or as its complement
 SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u >= 100 AND r BETWEEN 1000 AND 1040000');
 SELECT lion_src('SELECT count(*) FROM lion_src_w WHERE u BETWEEN 100 AND 340000 AND r > 524288 AND g = 3');
--- existence tests over a walked range
+-- existence tests, which walk the range, each to its first row
 SELECT lion_src('SELECT count(DISTINCT a) FROM lion_src_w WHERE r < 524288');
 SELECT lion_src('SELECT g, count(DISTINCT a) FROM lion_src_w WHERE r > 500000 GROUP BY g');
 -- dirty
