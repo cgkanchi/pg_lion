@@ -2264,11 +2264,11 @@ lion_join_group_turn(LionCountScanState *st, int p)
 
 	/*
 	 * The groups are the entries of the column's index here, its key column
-	 * derived from the index as it was opened (DESIGN.md §24), and the index
-	 * predicate-locked as every index the node reads is (lion_open_relation()).
-	 * It is open with the relation's others for the life of the node
-	 * (lion_open_relation() for a plain table, lion_open_parts() for a
-	 * partition), and stays open after the turn.
+	 * derived from the index as it was opened (DESIGN.md §24); the leaves it
+	 * walks are predicate-locked as it reads them (DESIGN.md §9).  It is open
+	 * with the relation's others for the life of the node (lion_open_relation()
+	 * for a plain table, lion_open_parts() for a partition), and stays open
+	 * after the turn.
 	 */
 	Assert(fgidx != NULL);
 
@@ -2276,7 +2276,6 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	if (js->unite)
 		lion_join_unite_keys(st, walked);
 
-	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap,
 													 st->plan.heapoid,

@@ -50,8 +50,9 @@
  * next four times as many, ranked below the last of them.
  *
  * Like an ordinary scan of the index, the function refuses a table with
- * row-level security and an index the snapshot cannot use, and takes the
- * index's predicate lock before reading (lion_reader_open()).
+ * row-level security and an index the snapshot cannot use
+ * (lion_reader_open()); the entries it reads, and the gaps where a lexeme
+ * has none, are predicate-locked (DESIGN.md §9).
  *
  *-------------------------------------------------------------------------
  */
@@ -201,23 +202,32 @@ lion_bm25_open(Relation index, LionState *col, Datum key, bool countsonly)
 	return cur;
 }
 
-/* The rows filed under key: its entry's ntids, 0 when it has none. */
+/*
+ * The rows filed under key: its entry's ntids, 0 when it has none.  The
+ * entry, or the gap, is predicate-locked (DESIGN.md §9): a count of 0 is
+ * how a search learns that no row can score.
+ */
 static uint64
 lion_bm25_ntids(Relation index, LionState *col, Datum key)
 {
 	uint64		ntids = 0;
 	Buffer		buf = InvalidBuffer;
 	OffsetNumber off;
+	bool		moved = false;
 
-	if (lion_find_entry(index, col, BUFFER_LOCK_SHARE, key,
-						lion_hash_key(col, key), &buf, &off))
+	if (lion_find_entry_ext(index, col, BUFFER_LOCK_SHARE, key,
+							lion_hash_key(col, key), NULL, NULL, InvalidOid,
+							&buf, &off, &moved))
 	{
 		Page		page = BufferGetPage(buf);
+		BlockNumber blkno = BufferGetBlockNumber(buf);
+		LionEntryTuple *e = lion_page_entry_fetch(index, page, blkno, off);
 
-		ntids = lion_entry_ntids(lion_page_entry_fetch(index, page,
-													   BufferGetBlockNumber(buf),
-													   off));
+		lion_reader_lock_entry(index, blkno, e);
+		ntids = lion_entry_ntids(e);
 	}
+	else
+		lion_reader_lock_absent(index, buf, moved);
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
 	return ntids;

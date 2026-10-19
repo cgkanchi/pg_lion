@@ -3378,10 +3378,11 @@ lion_wagg_reset(LionCountScanState *st)
  * The walk reads every row of the table, so it takes the predicate lock a
  * sequential scan takes, on the whole heap, before it reads anything.  The
  * walk from the entries' counts visits no heap page, so it takes no page lock
- * either, and the relation lock lion_open_relation() takes on the node's own
- * index sees an insert but not a DELETE, which reaches no index: without it,
- * two SERIALIZABLE transactions could each read a sum, each delete a row the
- * other's sum counted, and both commit.
+ * either, and the locks on the index pages it reads (DESIGN.md §9) see an
+ * insert but not a DELETE, which reaches no index: without it, two
+ * SERIALIZABLE transactions could each read a sum, each delete a row the
+ * other's sum counted, and both commit.  It is also the cheaper lock: one
+ * relation lock, where the index pages are every leaf and every root.
  *
  * The entries' own counts are the rows when every heap page is all-visible
  * before the first header is read and after the last, the heap has as many

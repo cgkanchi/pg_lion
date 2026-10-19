@@ -603,37 +603,6 @@ lion_open_relation(LionCountScanState *st, int p)
 	}
 
 	/*
-	 * index_beginscan() would take a relation-level predicate lock on each of
-	 * these (the AM has no ampredlocks); we read them without a scan, so take
-	 * it here, before any lookup, so that absent keys are covered as well.
-	 * Without it two SERIALIZABLE transactions could each count an absent
-	 * key, insert it, and both commit.
-	 */
-	{
-		Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
-
-		for (i = 0; i < st->nclause; i++)
-		{
-			if (st->clause[i].idx != NULL)
-				lion_reader_lock(st->clause[i].idx, snapshot);
-		}
-		if (st->groupidx != NULL)
-			lion_reader_lock(st->groupidx, snapshot);
-		if (st->groupidx2 != NULL)
-			lion_reader_lock(st->groupidx2, snapshot);
-		if (st->decode != NULL)
-		{
-			int			c;
-
-			for (c = 0; c < st->decode->ncol; c++)
-			{
-				if (st->decode->idx[c] != NULL)
-					lion_reader_lock(st->decode->idx[c], snapshot);
-			}
-		}
-	}
-
-	/*
 	 * A two-column GROUP BY reads the inner index's keys once for this
 	 * relation (DESIGN.md §20); the sets themselves are located per pair,
 	 * because each one holds a buffer pin.
