@@ -6,11 +6,15 @@ step s1_plans:
 	SET enable_bitmapscan = off;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	SET enable_indexonlyscan = off;
 	EXPLAIN (COSTS OFF) SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
+	RESET pg_lion.enable_plain_scan;
+	RESET pg_lion.pushdown_margin;
 	RESET enable_bitmapscan;
 	RESET enable_indexonlyscan;
+	SET enable_indexscan = off;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
 	RESET enable_indexscan;
@@ -279,8 +283,8 @@ ERROR:  could not serialize access due to read/write dependencies among transact
 starting permutation: s1_begin s2_begin s1_ord s2_ord s1_other s2_other s1_commit s2_commit
 step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
 step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
-step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
 id
 --
@@ -289,8 +293,8 @@ id
 21
 (3 rows)
 
-step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 125 ORDER BY id LIMIT 3;
    id
 -----
@@ -307,8 +311,8 @@ step s2_commit: COMMIT;
 starting permutation: s1_begin s2_begin s1_ord s2_ord s1_skew s2_skew s1_commit s2_commit
 step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
 step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
-step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
 id
 --
@@ -317,8 +321,8 @@ id
 21
 (3 rows)
 
-step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 125 ORDER BY id LIMIT 3;
    id
 -----

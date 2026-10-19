@@ -45,8 +45,8 @@ step s1_count	{ SELECT count(*) FROM sk WHERE c = 1; }
 step s1_func	{ SELECT lion_index_count('sk_c', 1); }
 step s1_idx		{ SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 1; }
 step s1_bmp		{ SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 1; }
-step s1_ord		{ SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s1_ord		{ SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3; }
 step s1_semi	{ SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
 				  SET LOCAL enable_nestloop = off;
@@ -67,11 +67,15 @@ step s1_plans
 	SET enable_bitmapscan = off;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	SET enable_indexonlyscan = off;
 	EXPLAIN (COSTS OFF) SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
+	RESET pg_lion.enable_plain_scan;
+	RESET pg_lion.pushdown_margin;
 	RESET enable_bitmapscan;
 	RESET enable_indexonlyscan;
+	SET enable_indexscan = off;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
 	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
 	RESET enable_indexscan;
@@ -96,8 +100,8 @@ step s2_count	{ SELECT count(*) FROM sk WHERE c = 125; }
 step s2_func	{ SELECT lion_index_count('sk_c', 125); }
 step s2_idx		{ SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 125; }
 step s2_bmp		{ SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 125; }
-step s2_ord		{ SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
-				  SET LOCAL enable_indexonlyscan = off;
+step s2_ord		{ SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
 				  SELECT id FROM sk WHERE c = 125 ORDER BY id LIMIT 3; }
 step s2_semi	{ SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
 				  SET LOCAL enable_nestloop = off;

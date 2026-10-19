@@ -576,9 +576,11 @@ def methods(kind, sel):
     m = []
     # The planner's own plans, and the index's own paths too, since under a
     # filter the planner may sort the lion bitmap scan's rows by distance
-    # instead: for lionvec LionOrdered (enable_sort and enable_indexscan
-    # off), which under the 1% filter computes every member's distance, for
-    # HNSW its iterative scan (enable_sort off).
+    # instead: for lionvec LionOrdered (enable_sort and the AM's plain scans
+    # off, pg_lion.pushdown_margin at 1000 against the lionvec index's own
+    # scan: enable_indexscan would disable LionOrdered too), which under the
+    # 1% filter computes every member's distance, for HNSW its iterative scan
+    # (enable_sort off).
     if kind == 'lionvec':
         for patience in PATIENCE:
             for margin in MARGINS:
@@ -589,7 +591,8 @@ def methods(kind, sel):
                 m.append((f'lionvec margin={margin} patience={patience}', sql(kind, sel), st))
                 if sel < 1.0:
                     m.append((f'lionvec margin={margin} patience={patience} LionOrdered', sql(kind, sel),
-                              st + ['SET enable_sort = off', 'SET enable_indexscan = off']))
+                              st + ['SET enable_sort = off', 'SET pg_lion.enable_plain_scan = off',
+                                    'SET pg_lion.pushdown_margin = 1000']))
     elif kind == 'hnsw':
         for ef in EFS:
             s = [f'SET hnsw.ef_search = {ef}']
@@ -706,7 +709,8 @@ def exact(name):
     conn = connect()
     cost_distances(conn)
     prewarm(conn, idx)
-    lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
+    lo = ['SET enable_sort = off', 'SET pg_lion.enable_plain_scan = off',
+          'SET pg_lion.pushdown_margin = 1000']
     # every filter's members, up to 30% of the rows, on the exact path; and
     # none, by either threshold (a build without the second has the first)
     every = max(200000, len(rows))
@@ -758,7 +762,8 @@ def cold(name='cold'):
     X = np.load(os.path.join(CACHE, 'X.npy'), mmap_mode='r')
     qidx = np.load(os.path.join(CACHE, 'qidx.npy'))
     Q = np.asarray(X[qidx[:nq]])
-    lo = ['SET enable_sort = off', 'SET enable_indexscan = off']
+    lo = ['SET enable_sort = off', 'SET pg_lion.enable_plain_scan = off',
+          'SET pg_lion.pushdown_margin = 1000']
     probes = [int(x) for x in os.environ.get('KNN_COLD_VCHORD', '').split(',') if x]
     lists = [int(x) for x in os.environ.get('KNN_COLD_DISKANN', '').split(',') if x]
     kinds = os.environ.get('KNN_COLD_KINDS', 'lionvec,hnsw,vchord,diskann').split(',')

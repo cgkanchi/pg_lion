@@ -186,7 +186,8 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_sort', 'off', true);
-	PERFORM set_config('enable_indexscan', (NOT exact)::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (NOT exact)::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin', CASE WHEN exact THEN '1000' ELSE '1' END, true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -230,7 +231,8 @@ SELECT tc_poke('tc_v', l.blk, l.pos + 12, tc_le32(1000000))
 SELECT tc_cmp(:'qe', true) AS exact;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 -- prepared, and run once, at the settings above, so that its DEBUG1 run
 -- parses and plans nothing: what a parse looks up can grow a catalog
@@ -243,7 +245,8 @@ RESET client_min_messages;
 DEALLOCATE tc_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 REINDEX INDEX tc_v;
 
@@ -255,7 +258,8 @@ SELECT tc_poke('tc_v', l.blk, l.pos + 12, substring(o.run FROM 1 FOR 4))
 SELECT tc_cmp(:'qe', true) AS exact;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 PREPARE tc_scan AS SELECT count(*) FROM (SELECT id FROM tc WHERE cat = 3 ORDER BY v <-> tc_vec(13, 1536)) s;
 EXECUTE tc_scan;
@@ -265,7 +269,8 @@ RESET client_min_messages;
 DEALLOCATE tc_scan;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 REINDEX INDEX tc_v;
 
