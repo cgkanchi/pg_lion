@@ -329,22 +329,15 @@ above, counting its patience in matching rows. The exact answer is priced as the
 sort of the lion bitmap scan's rows, which is exact too, and planned unless the sort is priced at
 less than 1 / 1.2 of it: with the vectors in TOAST, which the node reads by their places, the node
 by a wide margin; with them in the rows, where the two read the same pages, the node too (DESIGN.md
-§44.7, "Exact path pricing"). Under a wide filter,
-where building the set costs more than the rows it saves (about 170 ns a matching row, 845 ms for
-5 million), `LionOrdered` builds none: the scan reads partitions as an unfiltered one does and tests
-the `WHERE` on the table row of each row it fetches for its exact distance, dropping one that fails,
-so it still returns matching rows only (`Lion Filter:` in `EXPLAIN` where the set's plan says `Lion
-Cond:`, and `Rows Removed by Lion Filter` under `EXPLAIN ANALYZE`). The planner prices both and
-takes the cheaper; `pg_lion.vector_restrict` (below) pins either (DESIGN.md §44.6, "Filter at the
-fetch"). A `WHERE` clause no lion index answers - a column without one, `id > 0` - is never applied
-to the rows the `lionvec` scan returns: the scan pauses and skips late rows by the rows it returns,
-not by those a `Filter` keeps, so the answer would depend on the plan (DESIGN.md §44.6,
-"Post-filtering"). By default such a query fails when it is planned (`pg_lion.vector_postfilter`,
-below, whose `exact` plans it as a sort of the filter's rows instead); for an approximate answer,
-filter the nearest rows of a subquery, which the planner never pushes a clause into past its
-`LIMIT` (a clause of the vector column alone, `embedding IS NOT NULL` or a distance bound such as
-`embedding <=> $1 < 0.3`, is the exception: it filters the scan's rows, NULL vectors coming last
-and the bound rejecting rows by the distance they come in):
+§44.7, "Exact path pricing"). A `WHERE` clause no lion index answers - a column without one,
+`id > 0` - is never applied to the rows the `lionvec` scan returns: the scan pauses and skips late
+rows by the rows it returns, not by those a `Filter` keeps, so the answer would depend on the plan
+(DESIGN.md §44.6, "Post-filtering"). By default such a query fails when it is planned
+(`pg_lion.vector_postfilter`, below, whose `exact` plans it as a sort of the filter's rows instead);
+for an approximate answer, filter the nearest rows of a subquery, which the planner never pushes a
+clause into past its `LIMIT` (a clause of the vector column alone, `embedding IS NOT NULL` or a
+distance bound such as `embedding <=> $1 < 0.3`, is the exception: it filters the scan's rows, NULL
+vectors coming last and the bound rejecting rows by the distance they come in):
 
     SELECT id FROM (SELECT id, note, embedding <=> $1 AS d FROM items WHERE category = 3
                     ORDER BY d LIMIT 1000) s
@@ -695,16 +688,6 @@ its rows outgrows `hash_mem` (`work_mem` times `hash_mem_multiplier`), which onl
 `LIMIT`, or a large one, over rows its codes cannot tell apart reaches. `error` fails the query;
 `stop` ends the scan with a NOTICE, the rows it returned being in order, each once, and the
 nearest it found (DESIGN.md §44.4).
-
-`pg_lion.vector_restrict` (`auto`, `set` or `filter`): how `LionOrdered` restricts a `lionvec` scan
-to the rows a lion filter keeps. `set` builds lion's set of them before the scan's first row and
-the scan reads and scores only those, exact under `pg_lion.vector_exact_rows` (the only way before
-2026-10-18); `filter` builds none, and the scan scores every row it reads and tests the filter on
-the table row of each it fetches for its exact distance, dropping one that fails - about ten
-fetches for each matching row it needs under a 10% filter - and is never exact; `auto`, the
-default, prices both and plans the cheaper, which is the filter's under wide filters, and wherever
-the set would not fit `hash_mem`. With `pg_lion.vector_patience` at 0 the two return the same rows
-(DESIGN.md §44.6, "Filter at the fetch", §44.7).
 
 `pg_lion.vector_postfilter` (`error`, `exact` or `allow`): whether a plan may apply a `WHERE` clause
 to the rows a `lionvec` scan returns, after the scan (DESIGN.md §44.6, "Post-filtering"). Such a

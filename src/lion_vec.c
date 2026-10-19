@@ -5091,22 +5091,11 @@ lionvec_exact_cost(PlannerInfo *root, IndexPath *path, double n, bool placed,
  * index's rows.  *ranking is the centroids' part, which every participant
  * of a parallel scan pays (lion_vec_parallel_cost()); none for the members
  * alone.  *fetch is the page a row costs when it is returned, a random heap
- * page unless the exact path read it before its first row.  *fetched is
- * the rows fetched before the first: the batch's, or every member's on the
- * exact path.
- *
- * A scan under a filter (`filtered`; DESIGN.md §44.6, "Filter at the
- * fetch") of `members` of the rows probes as the restricted scan of them
- * does - the same partitions hold the same nearest members - but tells its
- * members only from their heap tuples: it never takes the exact path, it
- * estimates every row it walks, and it refines and fetches 1 / frac rows
- * for each of the batch's members, no more than it walks.  *fetched is
- * then those rows, which the filter is tested on.
+ * page unless the exact path read it before its first row.
  */
 static Cost
 lionvec_startup_cost(PlannerInfo *root, IndexPath *path, double members,
-					 bool filtered, double *codepages, Cost *ranking,
-					 Cost *fetch, double *fetched)
+					 double *codepages, Cost *ranking, Cost *fetch)
 {
 	IndexOptInfo *index = path->indexinfo;
 	double		tuples = Max(index->tuples, 1.0);
@@ -5123,17 +5112,15 @@ lionvec_startup_cost(PlannerInfo *root, IndexPath *path, double members,
 	double		spc_random;
 	double		spc_seq;
 	double		batch = Min((double) lionvec_batch, Max(members, 1.0));
-	double		scored;
 
 	get_tablespace_page_costs(index->rel->reltablespace, &spc_random, &spc_seq);
 	*fetch = spc_random;
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
 
-	if (!filtered && frac < 1.0 && members <= lionvec_exact_limit(nparts))
+	if (frac < 1.0 && members <= lionvec_exact_limit(nparts))
 	{
 		*codepages = 0.0;
 		*ranking = 0.0;
-		*fetched = Max(members, 1.0);
 		return lionvec_exact_cost(root, path, members, placed, fetch);
 	}
 
@@ -5148,20 +5135,13 @@ lionvec_startup_cost(PlannerInfo *root, IndexPath *path, double members,
 		share = Min(1.0, share * LIONVEC_SPILL_PROBES);
 	read = Max(1.0, pages * share);
 	walked = tuples * items * share;
-	scored = walked * frac;
-	*fetched = batch;
-	if (filtered)
-	{
-		scored = walked;
-		*fetched = Min(batch / Max(frac, 1e-9), walked);
-	}
 	*codepages = read;
 	*ranking = nparts * LIONVEC_ROW_OPS * cpu_operator_cost;
 	return *ranking +
 		Max(1.0, nparts * share) * spc_random + read * spc_seq +
 		walked * cpu_index_tuple_cost * 0.1 +
-		scored * LIONVEC_ROW_OPS * cpu_operator_cost +
-		*fetched * 2.0 * (spc_random + cpu_index_tuple_cost);
+		walked * frac * LIONVEC_ROW_OPS * cpu_operator_cost +
+		batch * 2.0 * (spc_random + cpu_index_tuple_cost);
 }
 
 bool
@@ -5176,22 +5156,9 @@ lion_vec_scan_cost(PlannerInfo *root, IndexPath *path, double members,
 {
 	double		codepages;
 	Cost		ranking;
-	double		fetched;
 
-	return lionvec_startup_cost(root, path, members, false, &codepages,
-								&ranking, fetch, &fetched);
-}
-
-Cost
-lion_vec_filter_cost(PlannerInfo *root, IndexPath *path, double members,
-					 double *fetched)
-{
-	double		codepages;
-	Cost		ranking;
-	Cost		fetch;
-
-	return lionvec_startup_cost(root, path, members, true, &codepages,
-								&ranking, &fetch, fetched);
+	return lionvec_startup_cost(root, path, members, &codepages, &ranking,
+								fetch);
 }
 
 /*
@@ -5216,11 +5183,10 @@ lionvec_order_cost(PlannerInfo *root, IndexPath *path, Cost *startup,
 	double		spc_random;
 	double		spc_seq;
 	Cost		fetch;
-	double		fetched;
 
 	get_tablespace_page_costs(index->reltablespace, &spc_random, &spc_seq);
-	*startup = lionvec_startup_cost(root, path, index->tuples, false, pages,
-									ranking, &fetch, &fetched);
+	*startup = lionvec_startup_cost(root, path, index->tuples, pages, ranking,
+									&fetch);
 	deeper = lionvec_patience > 0 ? LIONVEC_DEEPER_PAUSED : LIONVEC_DEEPER;
 	*total = *startup +
 		Max(index->tuples, 1.0) *
