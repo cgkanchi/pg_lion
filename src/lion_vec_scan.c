@@ -1155,10 +1155,12 @@ lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 	if (n < 0 || (n > 0 && (keys == NULL || conts == NULL)))
 		elog(ERROR, "lionvec: malformed restriction");
 	/* lv_key_search() bisects: one pass over the keys is cheap next to a scan */
-	for (i = 1; i < n; i++)
+	for (i = 0; i < n; i++)
 	{
-		if (keys[i] <= keys[i - 1])
+		if (i > 0 && keys[i] <= keys[i - 1])
 			elog(ERROR, "lionvec: restriction keys out of order");
+		if (conts[i] == NULL)
+			elog(ERROR, "lionvec: a restriction key without its container");
 	}
 	so->restricted = true;
 	so->rn = n;
@@ -1238,32 +1240,18 @@ lv_member(LvScanOpaque *so, ItemPointer tid)
 			return false;
 		so->rpos = i;
 	}
-	return so->rconts[so->rpos] == NULL ||
-		lion_container_contains(so->rconts[so->rpos], lion_code_lo(code));
+	return lion_container_contains(so->rconts[so->rpos], lion_code_lo(code));
 }
 
-/*
- * How many rows the restriction admits: its containers' members, a NULL
- * container counting as its blocks' share of the table's rows, perblock a
- * block.  *whole says whether any container was NULL.
- */
+/* How many rows the restriction admits: its containers' members. */
 static double
-lv_members(const LvScanOpaque *so, double perblock, bool *whole)
+lv_members(const LvScanOpaque *so)
 {
 	double		n = 0.0;
 	int			k;
 
-	*whole = false;
 	for (k = 0; k < so->rn; k++)
-	{
-		if (so->rconts[k] == NULL)
-		{
-			*whole = true;
-			n += perblock * LION_BLOCKS_PER_CONTAINER;
-		}
-		else
-			n += lion_container_cardinality(so->rconts[k]);
-	}
+		n += lion_container_cardinality(so->rconts[k]);
 	return n;
 }
 
@@ -4046,17 +4034,13 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	members = tuples;
 	if (so->restricted)
 	{
-		BlockNumber hblocks = RelationGetNumberOfBlocks(scan->heapRelation);
-		bool		whole;
-
 		/*
 		 * Few members, or few a partition (lionvec_exact_limit(), which the
 		 * planner's cost asks of the same meta page's count): every one's
-		 * distance from the heap.  A NULL container's blocks are counted,
-		 * not known, so a degraded set always probes.
+		 * distance from the heap.
 		 */
-		members = lv_members(so, hblocks > 0 ? tuples / hblocks : 0.0, &whole);
-		if (!whole && members <= lionvec_exact_limit((double) so->meta.nparts))
+		members = lv_members(so);
+		if (members <= lionvec_exact_limit((double) so->meta.nparts))
 		{
 			lv_exact(scan, so);
 			MemoryContextSwitchTo(old);

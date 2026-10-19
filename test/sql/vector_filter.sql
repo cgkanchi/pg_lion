@@ -215,9 +215,10 @@ EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 7 OR cat = 4 ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
 RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
 
--- a set that outgrows hash_mem at run time degrades to its container keys,
--- and every member is rechecked (DESIGN.md §30.4): planned at 64MB (a
--- generic plan keeps it), run at 64kB.  Half of vfn's 400,000 rows, 65 to a
+-- a set that outgrows hash_mem at run time spills to a temporary file
+-- mapped into memory, and the scan probes it there, exact (DESIGN.md
+-- §30.4, "Spilling"): planned at 64MB (a generic plan keeps it) and at
+-- 64kB, run at 64kB.  Half of vfn's 400,000 rows, 65 to a
 -- page, is 97 containers of about 1 kB each, as ordered.sql's lon is.  (20
 -- partitions: the 1,264 a table this size gets take minutes to build in
 -- three dimensions, where plane 1 rules out few centroids.)
@@ -233,8 +234,9 @@ SELECT i, ((hashint8extended(i::bigint, 11) & 9223372036854775807) % 2)::int,
 CREATE INDEX vfn_l2 ON vfn USING lionvec (v) WITH (partitions = 20);
 CREATE INDEX vfn_c2 ON vfn USING lion (c2);
 VACUUM (FREEZE, ANALYZE) vfn;
--- planned at 64kB, the set would not fit, and is no plan: the query fails
--- (pg_lion.vector_postfilter's default)
+-- planned at 64kB, the set is expected to spill, which is priced, not
+-- refused: the node is the plan (before the spill the query failed here,
+-- under pg_lion.vector_postfilter's default)
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;

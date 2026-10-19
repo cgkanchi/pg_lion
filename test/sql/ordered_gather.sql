@@ -68,6 +68,30 @@ BEGIN
 				  coalesce(array_length(a, 1), 0));
 END $$;
 
+-- og_temp() says whether the node's EXPLAIN (ANALYZE, BUFFERS) counts
+-- temporary blocks written: the set's spill, or no spill.
+CREATE FUNCTION og_temp(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	written text := 'no temp blocks written';
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF ln ~ 'temp written=[1-9]' THEN
+			written := 'temp blocks written';
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	RETURN written;
+END $$;
+
 CREATE FUNCTION og_run(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -140,28 +164,49 @@ SELECT * FROM og_run($$SELECT id FROM ogn WHERE tags && ARRAY['t1', 's2'] ORDER 
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 AND g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 20000');
 SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 AND g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
 
--- 7. At a 64 kB hash_mem the keys of 3. outgrow it while they are gathered
---    (planned at the default, as a generic plan the planner would not make
---    at 64 kB): the set degrades to its keys, and every member is rechecked.
---    The keys of 1. fit, a container each.
-SET plan_cache_mode = force_generic_plan;
-PREPARE og_big AS SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000;
-SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
-EXPLAIN (COSTS OFF) EXECUTE og_big;
-RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+-- 7. At a 64 kB hash_mem the keys of 3. outgrow it while they are gathered:
+--    the set spills to a temporary file mapped into memory (DESIGN.md
+--    §30.4, "Spilling") and stays exact, nothing rechecked, the same rows.
+--    The keys of 1. fit, a container each, and spill nothing.
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
-SELECT * FROM og_run('EXECUTE og_big');
-SELECT og_cmp('EXECUTE og_big',
-			  'SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
+SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.03 ORDER BY k, id');
 SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.03 ORDER BY k, id LIMIT 5');
+--    the pieces of a RUN source, a BITSET a key, spilled
+SELECT og_cmp('SELECT id, k FROM ogn WHERE g BETWEEN 10 AND 40 ORDER BY k DESC, id DESC LIMIT 20000');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
+--    two gathered leaves, each spilled, ORed in the file (an AND would be
+--    planned as the g leaf's set and a Filter)
+SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 20000');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
+--    the spill goes through the server's temporary files: temp_file_limit
+--    stops it, and EXPLAIN (BUFFERS) counts its blocks written
+SET temp_file_limit = '512kB';
+SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 20000');
+RESET temp_file_limit;
+SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
+SELECT og_temp('SELECT id FROM ogn WHERE u < 0.03 ORDER BY k, id LIMIT 5');
+--    a rescan with another Param builds the set again, in the same file
+SELECT og_cmp($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
+			   LATERAL (SELECT id FROM ogn WHERE u >= o.lo AND u < o.lo + 0.5
+			   ORDER BY k, id LIMIT 3) x$$);
+SELECT * FROM og_run($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
+			   LATERAL (SELECT id FROM ogn WHERE u >= o.lo AND u < o.lo + 0.5
+			   ORDER BY k, id LIMIT 3) x$$);
+--    what the set keeps in memory stays within hash_mem, read while a
+--    cursor is paused after the build (as ordered.sql's section 16 reads it)
+BEGIN;
+SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
+SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+DECLARE og_cur CURSOR FOR SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id;
+FETCH 2 FROM og_cur;
+SELECT used_bytes <= 65536 AS within_hash_mem
+  FROM pg_backend_memory_contexts WHERE name = 'LionOrdered set';
+COMMIT;
 RESET hash_mem_multiplier;
 RESET work_mem;
-DEALLOCATE og_big;
-RESET plan_cache_mode;
 DROP TABLE ogn;
 
 -- og: 16,640 rows of 2 kB, four a heap page, 65 container keys: the
@@ -189,4 +234,5 @@ SELECT * FROM og_run('SELECT id FROM og WHERE u >= 0.99 ORDER BY k DESC, id DESC
 DROP TABLE og;
 
 DROP FUNCTION og_cmp(text, text);
+DROP FUNCTION og_temp(text);
 DROP FUNCTION og_run(text);
