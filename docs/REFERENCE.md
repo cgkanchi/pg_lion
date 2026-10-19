@@ -122,7 +122,8 @@ of text), are rejected, except tsvector lexemes and jsonb keys, which are hashed
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
-`array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
+`array_ops` (any array whose element type has a default hash or btree operator class, as GIN's
+needs a btree one) and `tsvector_ops` index one row under many keys, reusing GIN's own
 extraction functions (for tsvector through wrappers that hash lexemes too long to be keys), and
 answer
 

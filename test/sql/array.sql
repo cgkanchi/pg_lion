@@ -350,7 +350,8 @@ SELECT count(*) FROM lion_arr_part WHERE tags @> '{t5,t2}';
 DROP TABLE lion_arr_part;
 
 -- ---- element types the keys cannot be made from ------------------------
--- The element type needs a hash opclass, and says so when it has none.
+-- The element type needs a default hash or btree opclass, as GIN needs a
+-- btree one, and says so when it has neither.
 CREATE TABLE lion_arr_odd (p point[], m int[][], d tarr);
 CREATE INDEX ON lion_arr_odd USING lion (p);
 
@@ -365,6 +366,57 @@ SELECT lion_arrcmp($$SELECT m FROM lion_arr_odd WHERE m @> '{1}'$$);
 SELECT lion_arrcmp($$SELECT m FROM lion_arr_odd WHERE m @> '{{1,2}}'$$);
 SELECT lion_arrcmp($$SELECT d FROM lion_arr_odd WHERE d @> '{b}'$$);
 DROP TABLE lion_arr_odd;
+
+-- ---- element types with a btree opclass and no hash one ---------------
+-- money, bit, varbit, tsvector and tsquery: the btree comparison orders the
+-- column, and the hash is the stored image's where the btree class says
+-- equal values are stored alike, 0 otherwise (DESIGN.md §17).
+CREATE TABLE lion_arr_bt (id int, m money[], b bit(3)[], vb varbit[],
+						  tv tsvector[], tq tsquery[]);
+INSERT INTO lion_arr_bt SELECT g,
+	ARRAY[(g % 7)::numeric::money, (g % 11)::numeric::money],
+	ARRAY[(g % 8)::bit(3), ((g + 1) % 8)::bit(3)],
+	ARRAY[((g % 5)::bit(4))::varbit, repeat('1', g % 3 + 1)::varbit],
+	ARRAY[to_tsvector('simple', 'w' || (g % 6) || ' x' || (g % 4)),
+		  to_tsvector('simple', 'y' || (g % 3))],
+	ARRAY[('w' || (g % 6))::tsquery, ('x' || (g % 4) || ' & y1')::tsquery]
+  FROM generate_series(1, 2000) g;
+INSERT INTO lion_arr_bt VALUES (0, '{}', '{}', NULL, '{}', ARRAY[NULL]::tsquery[]);
+CREATE INDEX lion_arr_bt_m ON lion_arr_bt USING lion (m);
+CREATE INDEX lion_arr_bt_b ON lion_arr_bt USING lion (b);
+CREATE INDEX lion_arr_bt_vb ON lion_arr_bt USING lion (vb);
+CREATE INDEX lion_arr_bt_tv ON lion_arr_bt USING lion (tv);
+CREATE INDEX lion_arr_bt_tq ON lion_arr_bt USING lion (tq);
+-- inserted after the build, and deleted, as well as built
+INSERT INTO lion_arr_bt SELECT 3000 + g,
+	ARRAY[(g % 3)::numeric::money], ARRAY[(g % 2)::bit(3)],
+	ARRAY[B'101'::varbit], ARRAY[to_tsvector('simple', 'w1')], ARRAY['w1'::tsquery]
+  FROM generate_series(1, 200) g;
+DELETE FROM lion_arr_bt WHERE id % 10 = 0;
+VACUUM ANALYZE lion_arr_bt;
+SELECT attno, ordered, entries FROM lion_index_stats('lion_arr_bt_m');
+SELECT lion_index_verify(i, true)
+  FROM unnest(ARRAY['lion_arr_bt_m', 'lion_arr_bt_b', 'lion_arr_bt_vb', 'lion_arr_bt_tv',
+					'lion_arr_bt_tq']::regclass[]) i;
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE m @> ARRAY[3::numeric::money]$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_bt WHERE m @> ARRAY[3::numeric::money, 5::numeric::money]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE m && ARRAY[0::numeric::money, 10::numeric::money]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE m <@ ARRAY[0::numeric::money, 1::numeric::money, 2::numeric::money]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE b @> ARRAY[B'101']$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_bt WHERE b && ARRAY[B'101', B'000']$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE b <@ ARRAY[B'000', B'001']$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE vb @> ARRAY[B'11'::varbit]$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_bt WHERE vb && ARRAY[B'0011'::varbit, B'101'::varbit]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE vb <@ ARRAY[B'0011'::varbit, B'1'::varbit, B'11'::varbit]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE tv @> ARRAY[to_tsvector('simple', 'y1')]$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_bt WHERE tv && ARRAY[to_tsvector('simple', 'w1 x1'), to_tsvector('simple', 'y2')]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE tv <@ ARRAY[to_tsvector('simple', 'w1'), to_tsvector('simple', 'y0')]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE tq @> ARRAY['w2'::tsquery]$$);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_bt WHERE tq && ARRAY['w2'::tsquery, 'x1 & y1'::tsquery]$$);
+SELECT lion_arrcmp($$SELECT id FROM lion_arr_bt WHERE tq <@ ARRAY['w1'::tsquery]$$);
+SELECT * FROM lion_index_facets('lion_arr_bt_m', 3);
+SELECT * FROM lion_index_facets('lion_arr_bt_tq', 2);
+DROP TABLE lion_arr_bt;
 
 -- ---- costing the ALL-mode fallback (2026-09-21 follow-up review) -------
 /*
