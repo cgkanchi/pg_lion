@@ -136,7 +136,8 @@ LANGUAGE sql AS $$
 $$;
 
 /*
- * snn_explain() prints what EXPLAIN ANALYZE says of the node's lion side.
+ * snn_explain() prints what EXPLAIN ANALYZE says of the node's lion side,
+ * its actual rows without the two decimals PostgreSQL 18 prints.
  */
 CREATE FUNCTION snn_explain(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
@@ -145,7 +146,8 @@ DECLARE
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(Custom Scan|Ordered By|Index:|Lion Cond|Heap Fetches|Lion Set:|Recheck)' THEN
-			RETURN NEXT regexp_replace(ln, '\d+ containers', 'N containers');
+			RETURN NEXT regexp_replace(regexp_replace(ln, '\d+ containers', 'N containers'),
+									   'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
 		END IF;
 	END LOOP;
 END $$;

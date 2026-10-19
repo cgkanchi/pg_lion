@@ -136,7 +136,8 @@ LANGUAGE sql AS $$
 	  FROM unnest(ARRAY['bitmap', 'plain', 'node']) how
 $$;
 /*
- * snn_explain() prints what EXPLAIN ANALYZE says of the node's lion side.
+ * snn_explain() prints what EXPLAIN ANALYZE says of the node's lion side,
+ * its actual rows without the two decimals PostgreSQL 18 prints.
  */
 CREATE FUNCTION snn_explain(q text) RETURNS SETOF text
 LANGUAGE plpgsql AS $$
@@ -145,7 +146,8 @@ DECLARE
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(Custom Scan|Ordered By|Index:|Lion Cond|Heap Fetches|Lion Set:|Recheck)' THEN
-			RETURN NEXT regexp_replace(ln, '\d+ containers', 'N containers');
+			RETURN NEXT regexp_replace(regexp_replace(ln, '\d+ containers', 'N containers'),
+									   'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
 		END IF;
 	END LOOP;
 END $$;
@@ -761,7 +763,7 @@ SET pg_lion.enable_count_pushdown = off;
 SELECT snn_explain('SELECT id, a FROM snn WHERE a IS NOT NULL AND b = 5 AND c IS NOT NULL ORDER BY id');
                           snn_explain                           
 ----------------------------------------------------------------
- Custom Scan (LionOrdered) on snn (actual rows=111.00 loops=1)
+ Custom Scan (LionOrdered) on snn (actual rows=111 loops=1)
    Ordered By: snn_pkey
    Lion Cond: ((a IS NOT NULL) AND (b = 5) AND (c IS NOT NULL))
    Heap Fetches: 111
@@ -771,7 +773,7 @@ SELECT snn_explain('SELECT id, a FROM snn WHERE a IS NOT NULL AND b = 5 AND c IS
 SELECT snn_explain('SELECT id, a FROM snn WHERE a IS NOT NULL AND b IN (2, 3)');
                             snn_explain                            
 -------------------------------------------------------------------
- Custom Scan (LionBtreeScan) on snn (actual rows=3849.00 loops=1)
+ Custom Scan (LionBtreeScan) on snn (actual rows=3849 loops=1)
    Index: snn_bt (index only)
    Lion Cond: ((a IS NOT NULL) AND (b = ANY ('{2,3}'::integer[])))
    Heap Fetches: 0
