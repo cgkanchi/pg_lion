@@ -16142,16 +16142,32 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   non-members), and none it has returned is (those were met); rows with equal sort keys may come
   in any order, which is all the pathkeys promise. The switch needs the pathkeys to be plain
   columns of the relation - an expression index's order would evaluate its functions where the
-  ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6) - and gives up,
-  letting the walk go on, if the rows do not fit in `work_mem`. It need not fetch them all to
-  know: once it has tried `LO_SWITCH_SAMPLE` (1,024) members, the rows they gave, scaled to every
-  member not met, foretell whether the rest fit, members in TID order being a fair sample of them.
-  Without that, a switch at PostgreSQL's default 4 MB fetched some 19,000 rows of a 20,000-member
-  set before it found they did not fit, and ran slower than no switch at all (106.7 ms against
-  87 ms, a synthetic 2M-row table, index-only); now it gives up after 1,024 and runs as no switch
-  does (83 ms against 84; with heap fetches, 56 against 59). EXPLAIN ANALYZE says `Switched to Fetch and Sort:
-  S of N scans, M members fetched`, and `Fetch and Sort Given Up: G scans, M members fetched` for
-  the scans that gave up. A rescan starts afresh.
+  ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6). Its sort is a
+  `tuplesort` of each row's sort keys and its heap tuple whole - the TID it goes by and the header
+  too, so that a row comes out as the walk would have handed it out, its system columns with it -
+  in `work_mem` and past it in temporary files, as a Sort node's is: the switch comes at the same
+  entry and fetches the same members whatever `work_mem` is, and never leaves the walk to go on.
+  When nothing between the node and its query level's `LIMIT` can drop a row the node returns or
+  read one past the rows the `LIMIT` takes, those rows bound the sort (`lo_limit()`,
+  `LO_PRIV_LIMIT`): a constant `LIMIT` and `OFFSET` (the planner's `limit_tuples` is only an
+  estimate of a Param), not `WITH TIES`, which reads the rows tied with the last; no row marks,
+  whose LockRows skips a row it cannot lock; one relation; no filter of the node's own, whose
+  rejects the Limit does not count; and the query's order the node's, so that no Sort or
+  Incremental Sort above it reads on. A partition's walk under a MergeAppend or an Append is
+  bounded too: neither reads more of a child than the rows it returns. The bounded sort keeps, of
+  those rows, the ones the walk has not returned yet, in a heap (`top-N heapsort`, a few kB for
+  `LIMIT 10`); any other sorts every row the switch keeps. The planner prices the walk (§30.3) and
+  not the switch, which is the executor's bound on a walk the model misjudged, there whatever the
+  settings: nothing in the price counts on it. On 3M rows of 135 bytes whose 10,000 members lie at
+  the far end of the order (`c = 299 ORDER BY k LIMIT 10`, heap mode, a filter correlated with the
+  order), the switch comes after 320,000 entries at every `work_mem`: 16 to 20 ms at 64 MB, 4 MB,
+  1 MB and 64 kB, the ten rows kept in 27 kB, and with a filter of the node's own, which unbounds
+  the sort, 17 to 25 ms, 1.5 MB on disk below 4 MB; walking on to the end of the index instead,
+  2,990,010 entries, takes 80 ms (98 with the filter). EXPLAIN ANALYZE says `Switched to Fetch and
+  Sort: S of N scans, M members fetched` and, for the last switch's sort as a Sort node shows its
+  own, `Fetch and Sort Method` (`top-N heapsort`, `quicksort`, `external merge`), `Fetch and Sort
+  Space Used: K kB` and `Fetch and Sort Space Type` (`Memory`, `Disk`). A rescan starts afresh, its
+  sort ended with its files.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
@@ -16241,7 +16257,9 @@ the set is not exact or something was removed), and `Lion Set: N containers, exa
 rechecked[, spilled S kB][, B builds]`, the kB those of the arena the set was built past
 `hash_mem` in (§30.4, "Spilling"), the builds counted when rescans rebuilt it (a LATERAL subquery
 whose lion filter takes the outer row's value: one per outer row). A node that never ran (`LIMIT
-0`, an untaken branch) built no set and prints neither of the last two.
+0`, an untaken branch) built no set and prints neither of the last two. A node whose scans switched
+to fetch and sort adds `Switched to Fetch and Sort` and its last sort's method, space used and
+space type (§30.4, "When the walk is not paying").
 
 ### 30.8 Declined in v1, and why
 
@@ -16303,6 +16321,13 @@ values at a 64 kB hash_mem, whose set must stay exact, and whose `LionOrdered se
 read while a cursor is paused after the build, must hold no more than hash_mem; and `g = 5 ORDER BY
 k` over a btree on `(g, k)` and a lion index on `g`, where the plan must not be the node (§30.3),
 beside `g = 5 AND h = 3 ... LIMIT 10`, where it still is.
+`test/sql/ordered_switch.sql` switches at a 64 kB `work_mem` that the members' rows do not fit in,
+each query compared in order with the ordinary plan: the sort bounded, in memory, under a `LIMIT`,
+with an `OFFSET`, backward and with system columns in the rows; on disk, unbounded, with no `LIMIT`
+and under one it may not keep to - a filter of the node's own, `WITH TIES`, `FOR UPDATE`, an order
+sorted again above the node, a `LIMIT $1` of a generic plan; a LATERAL rescan that switches twice
+in three scans; two partitions under a MergeAppend; and the walk's rows, then the sort's, through a
+cursor too.
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
 

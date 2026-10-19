@@ -1,6 +1,6 @@
 -- Every transition of a LionOrdered scan (DESIGN.md §30.4), forced and
--- named: EXPLAIN ANALYZE says why a lazy set was built, when the switch to
--- fetch-and-sort gave up, when a scan stopped counting the members it met,
+-- named: EXPLAIN ANALYZE says why a lazy set was built, how the switch to
+-- fetch-and-sort sorted, when a scan stopped counting the members it met,
 -- and when the early stop ended a walk.  Each run's rows are compared, in
 -- order, with the same query with the node off.
 --
@@ -34,8 +34,9 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
 			used := true;
-		ELSIF ln ~ '(Index Entries Walked|Lion Set:|Switched|Given Up|Not Counting|Stopped Early)' THEN
-			RETURN NEXT btrim(ln);
+		ELSIF ln ~ '(Index Entries Walked|Lion Set:|Switched|Fetch and Sort (Method|Space Type)|Not Counting|Stopped Early)' THEN
+			-- one external sort or another, as the major's tuplesort runs it
+			RETURN NEXT btrim(regexp_replace(ln, 'external (sort|merge)', 'external'));
 		END IF;
 	END LOOP;
 	IF NOT used THEN
@@ -142,14 +143,15 @@ SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
 SELECT otr_same('EXECUTE otr_pad(3, 0, 200003)',
 	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
 
--- 7. ... and gives up when the members' rows do not fit in work_mem, while
---    hash_mem still holds the visited bitmaps: the walk goes on to the end.
---    In 64kB the rows kept pass work_mem before 1,024 members are fetched;
---    in 256kB the first 1,024 foretell that the 2,738 would not fit, and the
---    rest are not fetched
+-- 7. ... and when the members' rows do not fit in work_mem, its sort goes
+--    to disk, as a Sort node's does, and the switch comes at the same
+--    entry: 2,738 rows of some 100 bytes in 64kB and in 256kB, none of
+--    them left to the walk's remaining 190,000 entries
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 8;
 SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
+SELECT otr_same('EXECUTE otr_pad(3, 0, 200003)',
+	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
 SET work_mem = '256kB';
 SET hash_mem_multiplier = 2;
 SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
