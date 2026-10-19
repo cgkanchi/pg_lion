@@ -54,7 +54,21 @@ counted against it up to a few hundred at a time, in one pass over its container
 run in parallel: the workers divide the table's blocks into ranges, each collects the filters of
 its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
 the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
-ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
+ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel"). A `GROUP BY coalesce(col, c)` divides the
+same way.
+
+A count without a `GROUP BY` (`SELECT count(*) FROM events WHERE event_type = 'purchase' AND
+...`, with `count(col)`s, filtered counts, OR lists, `IN` lists, ranges or a text search) runs in
+parallel the same way when the planner finds it cheaper: each process counts the ranges it
+claims, as the serial count counts the whole table, and a `Finalize Aggregate` adds the partial
+counts and applies any `HAVING` (DESIGN.md §10, "A count in parallel"). The workers are what a
+parallel scan of the pages the count reads would get, up to `max_parallel_workers_per_gather`,
+or the table's `parallel_workers`; a table under about 16 MB is one range, and counted serially.
+A `count(DISTINCT)`, an aggregate of a column's values such as
+`sum(col)`, a partitioned table and a join stay serial. Starting the workers takes a few
+milliseconds, which `parallel_setup_cost` (1000) may price low: a count the planner overprices can
+go parallel and take longer, a count of 2 ms taking 8 in the measurements of that section, and a
+higher `parallel_setup_cost` keeps such counts serial.
 
 A `GROUP BY` of three or more indexed columns (`SELECT country, event_type, device, count(*)
 FROM events GROUP BY country, event_type, device`), or of two with more than a few combinations,

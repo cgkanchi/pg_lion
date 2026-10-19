@@ -1042,6 +1042,12 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 {
 	StringInfoData buf;
 
+	/* ... a parallel count's workers' among them (DESIGN.md §10) */
+	int64		workersummaries = (st->ranged != NULL) ?
+		st->ranged->workersummaries : 0;
+	int64		workerrangeprobed = (st->ranged != NULL) ?
+		st->ranged->workerrangeprobed : 0;
+
 	/*
 	 * How the range bounding a sum was evaluated (DESIGN.md §28, "The
 	 * complement"): from the entries it selects ("inside"), from the ones
@@ -1082,17 +1088,18 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	 * they cover, among the Posting Sets Summed.  Only when there were
 	 * any, so that an index without summaries prints what it always did.
 	 */
-	if (st->summaries > 0)
-		ExplainPropertyInteger("Summaries Summed", NULL, st->summaries, es);
+	if (st->summaries + workersummaries > 0)
+		ExplainPropertyInteger("Summaries Summed", NULL,
+							   st->summaries + workersummaries, es);
 
 	/*
 	 * Of those sums, the walks that were probed at the other sources'
 	 * rows rather than counted a set at a time (DESIGN.md §32, "Summed
 	 * ranges: dense and probed").  Only when there were any.
 	 */
-	if (st->rangeprobed > 0)
-		ExplainPropertyInteger("Range Walks Probed", NULL, st->rangeprobed,
-							   es);
+	if (st->rangeprobed + workerrangeprobed > 0)
+		ExplainPropertyInteger("Range Walks Probed", NULL,
+							   st->rangeprobed + workerrangeprobed, es);
 
 	/*
 	 * The ranges taken as sources (DESIGN.md §32): collected, or - too large
@@ -1195,7 +1202,8 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * counted (DESIGN.md §10, "A GROUP BY in parallel"), the leader's and
 	 * its workers' - each range a WHERE collected and a walk of the
 	 * entries - which is every range of the cut, whichever participants
-	 * took them.
+	 * took them; of a parallel count (§10, "A count in parallel"), each
+	 * range of each run's count.
 	 */
 	if (rs != NULL)
 		ExplainPropertyInteger("Key Ranges", NULL,
@@ -1206,8 +1214,11 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * (DESIGN.md §15, "A list too long to locate at once").  Only when
 	 * there were any.
 	 */
-	if (st->lbatch != NULL && st->lbatch->batches > 0)
-		ExplainPropertyInteger("List Batches", NULL, st->lbatch->batches, es);
+	if (st->lbatch != NULL &&
+		st->lbatch->batches + (rs != NULL ? rs->workerlistbatches : 0) > 0)
+		ExplainPropertyInteger("List Batches", NULL,
+							   st->lbatch->batches +
+							   (rs != NULL ? rs->workerlistbatches : 0), es);
 
 	/*
 	 * The existence (or count) tests a count(DISTINCT k) made: one per

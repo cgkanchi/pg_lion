@@ -69,7 +69,8 @@
 /*
  * The fewest container keys a range covers when the executor cuts them,
  * pg_lion.parallel_range_keys: a range seeks every source to its first key,
- * and a parallel GROUP BY walks every group's entry again for each.  A testing
+ * a parallel GROUP BY walks every group's entry again for each, and a
+ * parallel count's sum over a column's entries every entry.  A testing
  * knob rather than a tuning one - the regression suite lowers it to cut a
  * table of a few megabytes into several ranges - so the planner prices the
  * ranges of the default width, LION_PARALLEL_RANGE_KEYS, whatever it is set
@@ -85,7 +86,8 @@ int			lion_parallel_range_keys = LION_PARALLEL_RANGE_KEYS;
  * are cut from, which lion_key_range() divides among them as evenly as whole
  * keys go - no range is empty.  The last one is open-ended.  The shared
  * copy's chunks are these ranges, and so are the ranges a parallel GROUP BY
- * counts its groups over (DESIGN.md §10, "A GROUP BY in parallel").
+ * counts its groups over and a parallel count its runs (DESIGN.md §10, "A
+ * GROUP BY in parallel", "A count in parallel").
  */
 int
 lion_key_ranges(BlockNumber heapblocks, int participants, int minkeys,

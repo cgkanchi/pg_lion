@@ -502,14 +502,15 @@ lion_count_container(LionCountCtx *cx, const LionContainer *c,
 }
 
 /*
- * Is ckey past the chunk a collection is making (LionCollect.ranged)?  Never
- * for a count, or a collection of the whole intersection.
+ * Is ckey past the window the count or collection is confined to
+ * (LionCountCtx.windowed): the chunk a collection is making
+ * (LionCollect.ranged), or the range of a parallel count (DESIGN.md §10, "A
+ * count in parallel")?  Never for a count, or a collection, of every key.
  */
 static inline bool
-lion_collect_past(const LionCountCtx *cx, uint32 ckey)
+lion_window_past(const LionCountCtx *cx, uint32 ckey)
 {
-	return cx->collect != NULL && cx->collect->ranged &&
-		(uint64) ckey >= cx->collect->hi;
+	return cx->windowed && (uint64) ckey >= cx->winhi;
 }
 
 /*
@@ -592,13 +593,13 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		}
 	}
 
-	/* a chunk of a collection (ranged): from its first key, up to its end */
-	lion_cursor_init_at(&cur, ps, cx, false,
-						(cx->collect != NULL && cx->collect->ranged) ?
-						cx->collect->lo : 0, NULL);
+	/* a window - a chunk of a collection, a range of a parallel count: from
+	 * its first key, up to its end */
+	lion_cursor_init_at(&cur, ps, cx, false, cx->windowed ? cx->winlo : 0,
+						NULL);
 	while (cur.valid)
 	{
-		if (lion_collect_past(cx, cur.cur->ckey))
+		if (lion_window_past(cx, cur.cur->ckey))
 			break;
 		lion_count_container_vm(cx, cur.cur);
 		lion_cursor_next(&cur);
@@ -1040,23 +1041,46 @@ lion_recheck_heap_filtered(LionCountCtx *cx)
 
 int64
 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
-						 LionRowFilter *filter, LionCountStats *stats)
+						 LionRowFilter *filter, LionCountStats *stats,
+						 uint32 lo, uint64 hi)
 {
 	TableScanDesc scan;
 	HeapTuple	tuple;
 	BlockNumber lastblk = InvalidBlockNumber;
+	bool		windowed = (lo > 0 || hi < LION_KEYS_END);
 	int64		count = 0;
 
 	if (filter == NULL || filter->heap != heap)
 		elog(ERROR, "lion index count: a heap scan without its row filter");
+	if ((uint64) lo >= hi)
+		elog(ERROR, "lion index count: a heap scan of an empty window of keys");
 
 	/*
 	 * An ordinary sequential scan under the count's snapshot: it takes the
 	 * relation's predicate lock under SERIALIZABLE and prunes on access as
 	 * any scan does.  table_beginscan_strat() rather than table_beginscan(),
-	 * whose arguments changed in PostgreSQL 19; these are its defaults.
+	 * whose arguments changed in PostgreSQL 19; these are its defaults - but
+	 * for a window of keys (a range of a parallel count, DESIGN.md §10, "A
+	 * count in parallel"), whose scan reads that window's blocks alone, in
+	 * order from its first: no synchronized start, which would begin it
+	 * somewhere else in the heap (heap_setscanlimits() wants none).  The
+	 * last window has no end, and takes every block from its first on.
 	 */
-	scan = table_beginscan_strat(heap, snapshot, 0, NULL, true, true);
+	scan = table_beginscan_strat(heap, snapshot, 0, NULL, true, !windowed);
+	if (windowed)
+	{
+		BlockNumber nblocks = ((HeapScanDesc) scan)->rs_nblocks;
+		uint64		first = (uint64) lo * LION_BLOCKS_PER_CONTAINER;
+		uint64		end = Min(hi * LION_BLOCKS_PER_CONTAINER, (uint64) nblocks);
+
+		if (first >= end)
+		{
+			table_endscan(scan);
+			return 0;
+		}
+		heap_setscanlimits(scan, (BlockNumber) first,
+						   (BlockNumber) (end - first));
+	}
 	while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
 		BlockNumber blk = ItemPointerGetBlockNumber(&tuple->t_self);
@@ -1230,10 +1254,16 @@ lion_run_merge_copy(LionCountCtx *cx, LionCountSource *drvsrc,
 		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
 
 	lion_ecursor_init(&drv, drvplan, drvsrc->sets, drvsrc->nsets, cx, false);
+
+	/* a window begins the driver at its first key and ends the merge (§10) */
+	if (cx->windowed && cx->winlo > 0)
+		lion_ecursor_seek(&drv, cx->winlo);
 	while (drv.valid)
 	{
 		uint32		key;
 
+		if (lion_window_past(cx, drv.ckey))
+			break;
 		cx->stats.copy_seeks++;
 		idx = lion_mat_seek(mat, idx, drv.ckey);
 		if (idx >= mat->ncontainers)
@@ -1390,18 +1420,20 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 							  lion_leapfrog_lazy(plans[i]->node)));
 
 	/*
-	 * A chunk of a shared copy (LionCollect.ranged) begins at its first key:
-	 * the positive sources are sought there - a collection holds no pin, so
-	 * nothing they pass over carries an answer - and the merge ends where the
-	 * chunk does (`hi`, below).  The negated ones are sought when they are
+	 * A window - a chunk of a shared copy (LionCollect.ranged), a range of a
+	 * parallel count (DESIGN.md §10, "A count in parallel") - begins at its
+	 * first key: the positive sources are sought there, and the merge ends
+	 * where the window does (`hi`, below).  Nothing they pass over is
+	 * counted or copied, so nothing of it needs an answer from the map
+	 * under their pins (§9).  The negated ones are sought when they are
 	 * needed, as always.
 	 */
-	if (cx->collect != NULL && cx->collect->ranged && cx->collect->lo > 0)
+	if (cx->windowed && cx->winlo > 0)
 	{
 		for (i = 0; i < nsources; i++)
 		{
 			if (!sources[i].negated)
-				lion_ecursor_seek(&cursors[i], cx->collect->lo);
+				lion_ecursor_seek(&cursors[i], cx->winlo);
 		}
 	}
 
@@ -1415,8 +1447,7 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	for (i = 0; i < nsources; i++)
 		cursors[i].advance = false;
 	cursors[driver].advance = true;
-	hi = (cx->collect != NULL && cx->collect->ranged) ?
-		cx->collect->hi : LION_WIDE_END;
+	hi = cx->windowed ? Min(cx->winhi, LION_WIDE_END) : LION_WIDE_END;
 
 	/*
 	 * Merge the sources by container key.  Containers are stored in ascending
@@ -1441,8 +1472,8 @@ lion_run_merge(LionCountCtx *cx, int nsources, LionCountSource *sources,
 		 * seeks was made first and the intersection looked at afterwards,
 		 * which read a dense source's leaf at every container key the driver
 		 * produced, including the ones where the selective sources had
-		 * already ruled the key out.  A chunk of a collection ends at its last
-		 * key (lion_collect_past()).
+		 * already ruled the key out.  A window ends at its last key
+		 * (lion_window_past()).
 		 */
 		acc = lion_leapfrog(cursors, probeord, nprobe, work, &w, hi,
 							&cx->stats, &maxckey);
@@ -2563,6 +2594,25 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	cx.collect = collect;
 	if (collect != NULL)
 		cx.droppins = true;
+
+	/*
+	 * The window of container keys the count is confined to: a chunk of a
+	 * collection's (LionCollect.ranged), or a range of a parallel count
+	 * (lion_vis_cache_set_window(), DESIGN.md §10, "A count in parallel").
+	 * The ranges of a cut cover every key once, and what the intersection
+	 * holds at a key is what its sources hold there, so the counts of the
+	 * ranges add up to the count of every key - each one an ordinary count,
+	 * under the pins and the map ordering of §9, of the containers at its
+	 * keys.
+	 */
+	if (collect != NULL)
+	{
+		cx.windowed = collect->ranged;
+		cx.winlo = collect->ranged ? collect->lo : 0;
+		cx.winhi = collect->ranged ? collect->hi : LION_KEYS_END;
+	}
+	else
+		cx.windowed = lion_vis_cache_window(cache, &cx.winlo, &cx.winhi);
 
 	/*
 	 * The count's own key set, when source slot 0 is one (a group's set, an

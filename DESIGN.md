@@ -2548,8 +2548,15 @@ parallel-aware one below a Gather and core's Finalize HashAggregate:
   nothing at run time and turn into a negated source, and a WHERE of negated sources alone has
   nothing to collect by range - and no range taken as a source; a grouping core can hash and
   aggregates it can split, and the table, the target and the clause values parallel-safe. Not a
-  partitioned table, `GROUP BY coalesce()`, two GROUP BY columns, count(DISTINCT), an IN list that
-  drives the groups, and not during recovery, where the WHERE is never collected. A parallel-aware
+  partitioned table, two GROUP BY columns, count(DISTINCT), an IN list that drives the groups, and
+  not during recovery, where the WHERE is never collected. `GROUP BY coalesce(col, c)` divides too
+  (2026-10-19): its group of c is the NULL entry's rows and those of the entry the grouping
+  equality finds equal to c, which the serial walk adds up as it meets them (`LionCoalState`);
+  in a range each of the two goes up as a partial row of the value c itself
+  (`lion_next_group_ranged()`), and the Finalize Agg, which groups by `coalesce(col, c)`, adds
+  them to each other and to the group's rows of other ranges like any partial rows of one key -
+  the classes of one index being disjoint, no other entry is c's. A group of c with no row
+  visible in any range has no partial row, and so no row, as serially. A parallel-aware
   node run without the Gather's shared memory (a Gather that cannot use parallel mode sets none up)
   is the only participant and counts every group whole, the serial walk.
 - **Workers.** What a parallel scan of the grouping column's posting pages would get
@@ -2608,10 +2615,169 @@ serial node with none or with the table's `parallel_workers` at 0 - and, at rang
 table of fourteen keys, cut into twelve ranges for three participants), the answers of filters, a
 negated filter and the NULL entry as one, an IN list, an OR across columns, multi-key queries, a
 filter in two ranges of the twelve and groups that lie in one range or two, the NULL group, counts of
-columns, a printed filter column, a HAVING, an ORDER BY with LIMIT, the leader alone with no worker
+columns, a printed filter column, a HAVING, an ORDER BY with LIMIT, `GROUP BY coalesce(col, c)`
+with c a key of the column or none, the leader alone with no worker
 started, SERIALIZABLE, a generic plan's parameters and a heap the map cannot vouch for - each against
 the same query run serially and with the pushdown off - and the ranges, collections and batches the
 participants counted.
+
+### A count in parallel (2026-10-19)
+
+The GROUP BY above divides by container key because a count is a sum over any cut of the heap's
+keys; so does the node of ONE row - the count of a WHERE, or a sum over a column's entries (§14),
+with filtered counts, `count(col)`s, residual clauses, OR lists and ranges beside it. It is offered,
+besides the serial node, as a parallel-aware one below a Gather and core's Finalize Aggregate,
+which adds the participants' partial counts up and applies the HAVING:
+
+    Finalize Aggregate
+      ->  Gather
+            Workers Planned: 2
+            ->  Parallel Custom Scan (LionCount)
+                  Lion Indexes: t_f.f1 (f1 = 1), t_f.f2 (f2 = 0), ...
+                  Count Filter 1: t_s (s = 3)
+
+- **Chunks** (`lion_count_ranged()`). The heap's container keys are cut into ranges when the
+  Gather sets up its shared memory, exactly as for a GROUP BY (`lion_key_ranges()`: four for each
+  participant, at most 64, no fewer than `pg_lion.parallel_range_keys` keys a range), and the
+  work into one chunk for each range of each RUN - the WHERE's count and each filtered count's
+  (`nrun`, "Filtered counts"). Each participant claims the next chunk nobody has from the shared
+  counter, chunk c being range `c % nranges` of run `c / nranges`, and counts that run at the keys
+  of that range alone (`lion_count_range()`). The counter only grows, so a participant meets the
+  runs in order: it locates a run's WHERE once, at its first chunk of the run, and releases it
+  before it locates the next, as the serial node does (`lion_count_runs()`). Its counts go into
+  `runcount` - the row's filtered counts are read from there as they are serially - and the
+  partial row is emitted once the counter has run out.
+- **A window of keys.** Each count of a chunk is the serial count, its cursors confined to the
+  range [lo, hi): the range is set on the visibility cache every count of the node is handed
+  (`lion_vis_cache_set_window()`, cleared after the chunk and by a rescan), and the count context
+  reads it from there (`LionCountCtx.windowed`), so no caller of the count changes. The merge seeks
+  its positive cursors to lo - nothing passed over is counted - and stops at hi
+  (`lion_count_one_set()`, `lion_run_merge()`, the copy's `lion_run_merge_copy()`, the multi-key
+  evaluator's `lion_wide_fill()`); a range walked at every count (§32) collects the keys of the
+  window alone (`lion_range_probe_begin()` over `lion_sources_collect_range()`); and the heap scan
+  of a WHERE nothing narrows (§17, "A query known only at run time") reads the window's blocks
+  (`heap_setscanlimits()`, no synchronized scan). A grouped or decoded walk refuses a window; it is
+  never handed one. A run with an IN list too long to locate at once ("A list too long to locate
+  at once") is cut by its batches instead: range `sub` counts the batches b with `b % nranges ==
+  sub`, at every key - a window would locate every batch again for each range - and the list's
+  count is the sum of its batches' for the reason that section gives.
+- **Why it is exact (§9).** The ranges of a cut cover every container key once - the last has no
+  end, for a heap that has grown since - and a row lies at exactly one key, its block's. Every
+  count the node makes is a count of rows: the merge of its sources, the disjoint sum of a list
+  (§15), a walk's sum over entries (§14), a complement OR's two counts (§35), a range walked at
+  every count, a probed walk's final count (§28), the heap scan of a WHERE nothing narrows; each
+  identity they rest on - the entries of a scalar column are disjoint, `|F ∧ (P ∨ ¬M)| = |F ∧ ¬M|
+  + |F ∧ M ∧ P|` - holds of the rows at any set of keys as it holds of all of them, so the
+  ranges' counts add up to the serial node's. Each is an ordinary count of the containers at its
+  keys: the containers in between are put to the visibility map before the page they came from is
+  let go, under the pins the serial count holds; what the map does not vouch for - and every row
+  a residual clause tests - goes to the heap under the leader's snapshot, which every worker runs
+  under, the row filter (§17, residual clauses) tested there as serially; and SERIALIZABLE's
+  predicate locks are taken as the serial count takes them, in whichever participant. A
+  participant's sets are its own, located under its own pins. Run without the Gather's shared memory, the node is the only
+  participant and counts every run whole.
+- **When** (`lion_count_path_add()`, and `lion_count_priv_check()`'s "malformed parallel count"):
+  no GROUP BY, or one folded away (a sum over the column's entries, §14); one table, not a
+  partitioned one, and not the FK-side join, which is parallel its own way (§27); not a
+  count(DISTINCT), whose values may have rows in two ranges and which core cannot split anyway;
+  not the aggregates over keys (`sum(k)`, `min(k)`, §37), which have no partial form here; not a GROUP BY a WHERE equality folds to a constant
+  (`LION_FLAG_SINGLEGROUP`), whose row is missing when no row matches, which a plain Finalize
+  Aggregate cannot leave out; not during recovery; and aggregates core can split, the table, the
+  target and the clause values parallel-safe. Everything else the serial node takes is taken:
+  filtered counts, residual clauses, complement ORs, ORs across columns, IN lists, multi-key
+  queries literal or known at run time, ranges as sources or bounding the sum, `count(col)`, a
+  HAVING and expressions over the counts.
+- **Workers.** What a parallel scan of the pages the count reads would get
+  (`compute_parallel_worker()` over `LionRangeCost.pages`: the WHERE's posting and recheck pages
+  and the walk's, as the serial price has them), capped by `max_parallel_workers_per_gather`; the
+  table's `parallel_workers` decides alone. A count that reads a page or two gets none. A range is
+  counted by one participant, so a heap the executor would cut into one range - fewer than 32
+  keys, about 2,000 pages, at the default `pg_lion.parallel_range_keys`, read here as it is set -
+  gets no parallel count at all, and the divisor below is never more than the ranges.
+- **Cost**, one participant's (`lion_add_parallel_count_path()`): its share (core's
+  `get_parallel_divisor()` rule) of the serial node's price before its HAVING, but for what every participant pays whole (`LionRangeCost.whole`: the
+  lookups that locate the WHERE, and the ranges taken as sources it collects); that whole; and
+  what each of its share of the chunks pays again (`countrange`, every run's, summed by
+  `lion_count_rel_range_price()`): every set of the WHERE sought to the range's first key, a
+  descent of `LION_RANGE_DESCENT_PAGES` and a `LION_PROBE_COST` a set (a range source's copy at
+  `LION_MEMORY_PROBE_COST`), and a walk's entries counted again, each sought there, with the
+  walk's pages read again; plus a `cpu_tuple_cost` for its row. The Gather prices its rows and
+  `parallel_setup_cost`, core's Finalize Aggregate its own work. Both terms are in the node's
+  units (`lion_units_price()`).
+- **EXPLAIN ANALYZE** prints `Key Ranges`, the chunks counted - the ranges times the runs - and
+  the workers' `List Batches`, `Summaries Summed` and `Range Walks Probed` are summed into the
+  leader's (`LionJoinShared`).
+
+**Measured** on the release build (PostgreSQL 18.6 at -O2 without assertions, the library at -O2),
+on four cores other sessions' work shared (a one-minute load of 1.6 to 2.0 throughout),
+`shared_buffers` 2 GB with everything resident, `pg_lion.parallel_range_keys` at its default: a
+synthetic table of 4,000,000 rows on 58,788 pages (919 container keys) - nine filters of two to
+four values in one multicolumn lion index, an `int[]` of three keys of 2,000, a tsvector of four
+words of 120. Medians of 21 runs (15 for the dirty heap), the settings' order rotated round by
+round, `EXPLAIN (ANALYZE, TIMING OFF)`'s execution time; plans and costs the planner's own, every
+parallel one the node below a Finalize Aggregate:
+
+| count, heap all-visible | serial | 2 workers | 3 workers | cost: serial, 2, 3 |
+|---|---|---|---|---|
+| 9-source AND, `f1 = 1 AND ... AND f9 = 1` (870 rows) | 2.2 ms | 10.9 | 7.7 | 4,471; 2,885; 2,466 |
+| ... three of the nine IN lists (20,800 rows) | 4.4 | 7.5 | 10.9 | 8,181; 4,442; 3,674 |
+| `tags && '{0, ..., 199}'`, 200 keys (1.08M rows) | 30.7 | 15.0 | 13.7 | 5,702; 3,779; 3,256 |
+| the same array from a subquery (an InitPlan) | 5,898 (seq scan) | 19.9 | 15.6 (two planned) | 108,892; 46,431; 46,431 |
+| tsquery, eight ORs of ANDs (§17) | 4.3 | serial | serial | 245 |
+
+| count, 1% of rows updated, 69% of pages not all-visible | serial | 2 workers | 3 workers | cost: serial, 2, 3 |
+|---|---|---|---|---|
+| 9-source AND | 3.7 ms | 6.4 | 9.1 | 5,726; 3,408; 2,871 |
+| ... three of the nine IN lists | 13.0 | 13.3 | 16.0 | 22,711; 10,496; 8,361 |
+| `tags && '{0, ..., 199}'` | 89.2 | 54.5 | 56.7 | 56,281; 24,853; 19,572 |
+| tsquery, eight ORs of ANDs | 15.8 | 14.2 | 16.3 | 21,976; 10,162; 8,095 |
+
+The counts of tens of milliseconds gain - the wide overlap 2.0 to 2.2 times on the clean heap, 1.6
+on the dirty one, where 800,000 TIDs go to the heap - and the third worker adds little on four shared
+cores. The leader alone (`max_parallel_workers = 0`) counted the overlap's twelve ranges in 96 ms
+against the serial node's 97: a range costs next to nothing over its share there. The InitPlan's
+array is a value the serial price cannot estimate (§17), priced as the ordinary plan's work, so the
+serial node lost to the sequential scan by a hair and the parallel one won by its divisor - an
+accident of that price. The counts of a few milliseconds LOSE: the 9-source AND goes parallel and
+takes 7.7 to 10.9 ms for 2.2, because the serial node is priced at 4,471 units for 2.2 ms - 2,000
+units a millisecond against the 500 the model is fitted to ("The units") - and a worker's start,
+about 2 ms here and more under load, is more than the whole count: with `parallel_setup_cost` and `parallel_tuple_cost` at 0
+it takes 3.6 ms with two workers and 3.8 with three, against 1.6 serially in the same runs. The
+tsquery's serial price, 245, keeps it serial; made parallel the same way it takes 5.3 and 5.6 ms
+against 4.3. The parallel GROUP BY has the same exposure ("A GROUP BY in parallel"): a serial price
+that overstates a short count by more than `parallel_setup_cost` sends it parallel. What would fix
+it is the serial price of an AND of many dense sources, not this path's.
+
+`test/sql/countparallel.sql` checks the plans - the node below a Gather with two workers and one,
+the serial node with none or with the table's `parallel_workers` at 0, a HAVING the Finalize
+Aggregate's - and, at ranges of one key (fourteen keys cut into twelve ranges), the answers of
+ANDs, the NULL entry, negated sources, IN lists alone and ANDed, ORs across columns and with a
+complement arm, multi-key queries, filtered counts, `count(col)`, a residual clause, a filter in one
+range of the twelve, sums over every entry, over every non-NULL one and bounded by a range, ranges
+as sources, a HAVING, the leader alone, SERIALIZABLE, a generic plan's parameters (a runtime
+tsquery among them, and one no key narrows, read from the heap a range at a time), an InitPlan's
+value, a list of 5,000
+values located in batches, and a heap the map cannot vouch for - each against the same query run
+serially and with the pushdown off - and the chunks, batches and skipped heap blocks the
+participants counted. `test/isolation/count_parallel.spec` runs a REPEATABLE READ snapshot's
+parallel count against updates, deletes, inserts and VACUUM, and two SERIALIZABLE parallel counts
+whose inserts conflict.
+
+**Not done: count(DISTINCT k) in parallel.** Investigated, and left serial. Its count is
+not a sum over the heap's keys: a value with rows in two ranges is one value, so the ranges'
+partial answers do not add up, and core will not split a DISTINCT aggregate either (no
+`GROUPING_CAN_PARTIAL_AGG`). Two divisions were weighed. By key ranges, as here, each range would
+emit the values with a visible row there and core would count the distinct ones over the Gather:
+every entry is then tested once per range, up to `nranges` times the serial walk's tests, and as
+many rows go through the Gather - worst exactly where the walk is long, with many values. By
+ENTRIES, each participant would take a share of k's entry walk and test each of its entries over
+every key, exactly the serial test (§26, so §9 unchanged), the shares' counts then adding up since
+the entries of a scalar column are disjoint; but the entry walk has no parallel division yet (a
+shared cursor over the directory's leaves, or key bounds cut from it when the Gather sets up), and
+the plan would have to turn the query's `count(DISTINCT k)` into a partial count the Finalize
+Aggregate adds up, which core does not do for a DISTINCT aggregate. That is the shape to build if
+it is wanted: the existence tests, the IN-list driver and the grouped form (§26 shape 2, by the
+outer column's entries) all divide by entries.
 
 ### The units (2026-09-27, release build)
 
@@ -3148,6 +3314,12 @@ sequential plan in `test/sql/countcombos.sql`:
   filters, no residual clause (a fact clause no posting set answers declines the join) and no
   filtered count. A folded dimension's own filters are its child's, core's; what the node adds for
   it is an IN list, a positive clause like any other.
+- **The parallel GROUP BY** ("A GROUP BY in parallel") takes none of them: its WHERE is collected
+  range by range, and a count against the copy has no second set to subtract or row to test. **The
+  parallel count** ("A count in parallel", 2026-10-19) takes all three: a filtered count's run is
+  cut into the same ranges as the WHERE's, a residual clause is tested on every row the counts of
+  a range are handed, and a complement OR's two counts are made in each range, the identity
+  holding of the rows at any keys.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 

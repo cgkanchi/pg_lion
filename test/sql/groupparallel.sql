@@ -136,6 +136,9 @@ SET max_parallel_workers_per_gather = 2;
 ALTER TABLE lgp SET (parallel_workers = 0);
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g;
 ALTER TABLE lgp RESET (parallel_workers);
+-- GROUP BY coalesce(g, c): the partial rows of the NULL entry and of c's go
+-- up as c's, and the Finalize Agg adds them together
+EXPLAIN (COSTS OFF) SELECT coalesce(g, 5), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5);
 
 -- ---------- 2. the answers ----------
 -- filters, the NULL group among the groups
@@ -160,6 +163,15 @@ SELECT lgp_check('SELECT g, count(g), count(b), count(*) FROM lgp WHERE a = 1 AN
 SELECT lgp_check('SELECT g, a, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g, a');
 SELECT lgp_check('SELECT k, count(*) FROM lgp WHERE a = 1 AND b GROUP BY k HAVING count(*) > 90');
 SELECT lgp_check('SELECT k, count(*) FROM lgp WHERE a = 1 AND b GROUP BY k ORDER BY count(*) DESC, k LIMIT 5');
+-- GROUP BY coalesce(g, c): a c no row has, a c some rows have, a column
+-- without NULLs, a filter in two ranges, a HAVING, an ORDER BY and LIMIT
+SELECT lgp_check('SELECT coalesce(g, -1), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, -1)');
+SELECT lgp_check('SELECT coalesce(g, 5), count(*), count(b) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5)');
+SELECT lgp_check('SELECT coalesce(k, 3), count(*) FROM lgp WHERE a = 2 AND NOT b GROUP BY coalesce(k, 3)');
+SELECT lgp_check('SELECT coalesce(g, 7), count(*) FROM lgp WHERE s = 3 AND a = 1 GROUP BY coalesce(g, 7)');
+SELECT lgp_check('SELECT coalesce(g, 5) AS g5, count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5) HAVING count(*) > 280');
+SELECT lgp_check('SELECT coalesce(g, 5), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5) ORDER BY count(*) DESC, 1 LIMIT 3');
+SELECT coalesce(g, 5) AS g5, count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5) HAVING coalesce(g, 5) IN (4, 5, 6) ORDER BY 1;
 -- the leader alone, when no worker starts: the same ranges, the same answers
 SET max_parallel_workers = 0;
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g');
@@ -204,16 +216,17 @@ RESET plan_cache_mode;
 UPDATE lgp SET a = (a + 1) % 4 WHERE id % 10 = 0;
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g');
 SELECT lgp_check('SELECT k, count(*) FROM lgp WHERE a IN (1, 3) AND NOT b GROUP BY k');
+SELECT lgp_check('SELECT coalesce(g, 5), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, 5)');
 VACUUM lgp;
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g');
 
 -- ---------- 6. the shapes that stay serial ----------
--- two group columns, GROUP BY coalesce, count(DISTINCT), an IN list that
--- drives the groups, no WHERE, a WHERE of one set the counts copy anyway
+-- two group columns, count(DISTINCT), an IN list that drives the groups -
+-- coalesced or not - no WHERE, a WHERE of one set the counts copy anyway
 SELECT lgp_check('SELECT g, k, count(*) FROM lgp WHERE a = 1 AND b GROUP BY g, k');
-SELECT lgp_check('SELECT coalesce(g, -1), count(*) FROM lgp WHERE a = 1 AND b GROUP BY coalesce(g, -1)');
 SELECT lgp_check('SELECT g, count(DISTINCT k) FROM lgp WHERE a = 1 AND b GROUP BY g');
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE g IN (1, 2, 3) AND a = 1 AND b GROUP BY g');
+SELECT lgp_check('SELECT coalesce(g, 2), count(*) FROM lgp WHERE g IN (1, 2, 3) AND a = 1 AND b GROUP BY coalesce(g, 2)');
 SELECT lgp_check('SELECT g, count(*) FROM lgp GROUP BY g');
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 GROUP BY g');
 

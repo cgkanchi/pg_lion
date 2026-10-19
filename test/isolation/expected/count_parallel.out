@@ -1,0 +1,133 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_plan s1_rr s1_count s1_plain s2_update s2_delete s2_insert s1_count s1_plain s3_count s3_plain s3_vacuum s1_plan s1_count s1_plain s3_count s3_plain s1_commit s1_count s1_plain
+step s1_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM cpar WHERE a = 1 AND b;
+QUERY PLAN                                                           
+---------------------------------------------------------------------
+Finalize Aggregate                                                   
+  ->  Gather                                                         
+        Workers Planned: 2                                           
+        ->  Parallel Custom Scan (LionCount)                         
+              Lion Indexes: cpar_abk.b (b = true), cpar_abk.a (a = 1)
+(5 rows)
+
+step s1_rr: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+4224
+(1 row)
+
+step s1_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 4224
+(1 row)
+
+step s2_update: UPDATE cpar SET b = NOT b WHERE id % 9 = 0;
+step s2_delete: DELETE FROM cpar WHERE a = 1 AND id % 13 = 0;
+step s2_insert: INSERT INTO cpar SELECT 50000 + i, 1, true, i % 50, 'z'
+					FROM generate_series(1, 3000) i;
+step s1_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+4224
+(1 row)
+
+step s1_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 4224
+(1 row)
+
+step s3_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+7098
+(1 row)
+
+step s3_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 7098
+(1 row)
+
+step s3_vacuum: VACUUM cpar;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM cpar WHERE a = 1 AND b;
+QUERY PLAN                                                           
+---------------------------------------------------------------------
+Finalize Aggregate                                                   
+  ->  Gather                                                         
+        Workers Planned: 2                                           
+        ->  Parallel Custom Scan (LionCount)                         
+              Lion Indexes: cpar_abk.b (b = true), cpar_abk.a (a = 1)
+(5 rows)
+
+step s1_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+4224
+(1 row)
+
+step s1_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 4224
+(1 row)
+
+step s3_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+7098
+(1 row)
+
+step s3_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 7098
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+7098
+(1 row)
+
+step s1_plain: SELECT cpar_plain() AS plain;
+plain
+-----
+ 7098
+(1 row)
+
+
+starting permutation: s1_ser s2_ser s1_plan s1_count s2_count s1_insert s2_insert1 s1_commit s2_commit
+step s1_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_ser: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT count(*) FROM cpar WHERE a = 1 AND b;
+QUERY PLAN                                                           
+---------------------------------------------------------------------
+Finalize Aggregate                                                   
+  ->  Gather                                                         
+        Workers Planned: 2                                           
+        ->  Parallel Custom Scan (LionCount)                         
+              Lion Indexes: cpar_abk.b (b = true), cpar_abk.a (a = 1)
+(5 rows)
+
+step s1_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+4224
+(1 row)
+
+step s2_count: SELECT count(*) AS lion FROM cpar WHERE a = 1 AND b;
+lion
+----
+4224
+(1 row)
+
+step s1_insert: INSERT INTO cpar VALUES (100001, 1, true, 7, 'y');
+step s2_insert1: INSERT INTO cpar VALUES (100002, 1, true, 8, 'y');
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
