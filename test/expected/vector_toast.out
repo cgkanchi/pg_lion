@@ -1261,8 +1261,10 @@ DROP TABLE ttu;
 --    TOAST, where until 2026-10-18 a random page a member and another a
 --    row returned kept the sort the plan; with the same rows inline, or
 --    read from the heap, the two plans read the same pages and are priced
---    within a tenth of each other.  pgvector's l2_distance() at COST 100,
---    as lionvec's documentation asks (§44.11), for this transaction alone.
+--    alike, the node's price leaned by 1.2 (LIONVEC_EXACT_LEAN, 2026-10-19),
+--    so that it is the plan inline too.  pgvector's l2_distance() at COST
+--    100, as lionvec's documentation asks (§44.11), for this transaction
+--    alone.
 -- ---------------------------------------------------------------------
 SELECT setseed(0.25);
  setseed 
@@ -1370,6 +1372,21 @@ SELECT tt_price(q, true) AS node, tt_price(q, false) AS sort,
 	   tt_price(replace(q, 'ttc', 'ttc_in'), true) AS node_in,
 	   tt_price(replace(q, 'ttc', 'ttc_in'), false) AS sort_in
   FROM (VALUES ('SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10')) q(q) \gset
+-- inline: the node too, leaned
+PREPARE ttc_qi(vector) AS
+	SELECT id FROM ttc_in WHERE s = 3 ORDER BY v <-> $1 LIMIT 10;
+EXPLAIN (COSTS OFF) EXECUTE ttc_qi(tt_vec(-1, 1536));
+                QUERY PLAN                 
+-------------------------------------------
+ Limit
+   ->  Custom Scan (LionOrdered) on ttc_in
+         Ordered By: ttc_in_v
+         Order By: (v <-> $1)
+         Lion Cond: (s = 3)
+         Lion Indexes: ttc_in_s
+(6 rows)
+
+DEALLOCATE ttc_qi;
 -- read from the heap, the vectors' TOAST pages unpriced as the sort's are
 SET LOCAL pg_lion.vector_toast_direct = off;
 SELECT tt_price('SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10',
@@ -1377,11 +1394,11 @@ SELECT tt_price('SELECT id FROM ttc WHERE s = 3 ORDER BY v <-> tt_vec(-1, 1536) 
 RESET pg_lion.vector_toast_direct;
 ROLLBACK;
 SELECT :node < 0.8 * :sort AS "in TOAST, the exact path the cheaper",
-	   abs(:heap / :sort - 1) < 0.1 AS "from the heap, as the sort",
-	   abs(:node_in / :sort_in - 1) < 0.1 AS "inline, as the sort";
- in TOAST, the exact path the cheaper | from the heap, as the sort | inline, as the sort 
---------------------------------------+----------------------------+---------------------
- t                                    | t                          | t
+	   abs(1.2 * :heap / :sort - 1) < 0.1 AS "from the heap, as the sort, leaned",
+	   abs(1.2 * :node_in / :sort_in - 1) < 0.1 AS "inline, as the sort, leaned";
+ in TOAST, the exact path the cheaper | from the heap, as the sort, leaned | inline, as the sort, leaned 
+--------------------------------------+------------------------------------+-----------------------------
+ t                                    | t                                  | t
 (1 row)
 
 DROP TABLE ttc, ttc_in;

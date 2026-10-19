@@ -1209,8 +1209,9 @@ RESET pg_lion.vector_exact_per_partition;
 -- from the heap, each heap page once, as the bitmap scan reads them, where
 -- until 2026-10-18 every member cost a random page: 1,200 members (s < 60)
 -- lie on some 850 of vfb's 1,482 pages, and a random page each priced the
--- node at 2.6 times the sort.  At l2_distance()'s COST 100 (DESIGN.md
--- §44.11), for this transaction alone.
+-- node at 2.6 times the sort; leaned by 1.2 (LIONVEC_EXACT_LEAN,
+-- 2026-10-19), the node is the plan.  At l2_distance()'s COST 100
+-- (DESIGN.md §44.11), for this transaction alone.
 CREATE FUNCTION vfb_price(node boolean) RETURNS float8 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -1242,9 +1243,9 @@ BEGIN
 END $$;
 BEGIN;
 ALTER FUNCTION l2_distance(vector, vector) COST 100;
-SELECT abs(vfb_price(true) / vfb_price(false) - 1) < 0.1 AS "priced as the sort";
- priced as the sort 
---------------------
+SELECT abs(1.2 * vfb_price(true) / vfb_price(false) - 1) < 0.1 AS "priced as the sort, leaned";
+ priced as the sort, leaned 
+----------------------------
  t
 (1 row)
 
