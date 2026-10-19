@@ -55,7 +55,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.memory_probe_cost             | 30      | 30       | user    | real
  pg_lion.plain_fetch_row_cost          | 1       | 1        | user    | real
  pg_lion.probe_cost                    | 40      | 40       | user    | real
- pg_lion.probe_step_cost               | 2       | 2        | user    | real
+ pg_lion.probe_step_cost               | 10      | 10       | user    | real
  pg_lion.range_entry_cost              | 40      | 40       | user    | real
  pg_lion.range_fold_cost               | 420     | 420      | user    | real
  pg_lion.range_union_entry_cost        | 12      | 12       | user    | real
