@@ -15834,29 +15834,40 @@ than overruns (§30.4).
   §29.8; an MVCC reader holds no pin, §29.5), and copies every container it produces into a
   `LionTidSet`: a sorted array of (container key, container copy), searched by binary search and
   tested with `lion_container_contains()`. A SETS or UNION source arrives in ascending container
-  key (`lion_source_sorted()`); a WALK (a range) or a LIST (a long IN list) arrives entry by entry
-  or batch by batch - one PIECE per container key each entry or batch touches, so a range over
-  400,000 distinct values brings 400,000 one-TID pieces for 34 keys - and its pieces are sorted and
-  those of equal keys ORed (**merging the pieces**, below) whenever the directory is full (from
-  1,024 entries on; it then doubles until it has room for 32 pieces an entry the merge left, or its
-  slots alone would take `hash_mem`), before their bytes would degrade the set (once there are at
-  least as many pieces as merged entries), and when the source is complete. A merge sorts only the
-  pieces since the last one, by key and slot packed into a word, and merges them with the entries
-  that one left, which are in order. The sort is a merge of the ascending runs the pieces already
-  lie in (`lo_merge_slots()`): a source hands them out entry by entry or bucket by bucket, each in
-  key order, so a summary's few buckets make a few long runs, which take a pass or two, and a range
-  over unique values, runs of a piece or two, costs a merge sort.
-  **Merging the pieces.** The pieces of a key that hold `LO_MERGE_DIRECT_MAX` members or fewer
-  together - `LION_WIDTH_ARRAY_CARD(1)`, 256 at 8K, an ARRAY as large as the narrowest NARROW, so
-  that the union is always an ARRAY or a RUN - are merged member by member
-  (`lion_container_or_merge()`): each piece's members are set in a two-level bitmap, the words of an
-  image of the key and a summary bit for each word, and read back in order, which sorts them and
-  drops the repeats without a comparison, and the ARRAY that leaves is optimized. Only the words a
-  member falls in are touched - the first member of a word assigns it - so nothing of 4 KB is
-  cleared or scanned, and the result is byte for byte the container the image makes, since
-  `lion_container_optimize()`'s choice is a function of the members alone. A key of more members,
-  or one whose pieces yield more than `LION_ARRAY_MAX_CARD` values (a damaged header), is ORed
-  into one bitset image and turned into a container (`lion_bits_to_container()`).
+  key (`lion_source_sorted()`) and its containers go straight in; a WALK (a range) or a LIST (a
+  long IN list) arrives entry by entry or batch by batch - one PIECE per container key each entry
+  or batch touches, so a range over 400,000 distinct values brings 400,000 one-TID pieces for 34
+  keys - and its pieces are GATHERED by key (**gathering the pieces**, below), the keys taken into
+  the set in order once the source is complete.
+  **Gathering the pieces.** A container key is a heap block / 64, a small integer, so the gather
+  (`LoGather`) is a table of the keys in chunks of 64 slots, a chunk made when a key of its is
+  first met (4 KB, and a bit a key met beside it), a cache line a key: the key's container so far,
+  in the set's memory context, and room for 27 members not in it yet. A piece of up to 27 members
+  is copied into the room; when the room would overflow, or a piece brings more than it holds, the
+  room's members and the piece are FLUSHED into the container (`lo_gather_flush()`), a new one
+  taking the old one's place, charged against `hash_mem` as the set's are:
+  - while the key has at most `LO_MERGE_DIRECT_MAX` members together - `LION_WIDTH_ARRAY_CARD(1)`,
+    256 at 8K, an ARRAY as large as the narrowest NARROW, so that the union is always an ARRAY or
+    a RUN - they are merged member by member (`lion_container_or_merge()`): each part's members
+    are set in a two-level bitmap, the words of an image of the key and a summary bit for each
+    word, and read back in order, which sorts them and drops the repeats (a multi-key column's
+    entries bring a row once per key of it that matches) without a comparison, and the ARRAY that
+    leaves is optimized. Only the words a member falls in are touched - the first member of a word
+    assigns it - so nothing of 4 KB is cleared or scanned, and the result is byte for byte the
+    container an image makes, since `lion_container_optimize()`'s choice is a function of the
+    members alone;
+  - past that the container, the room and the piece are ORed into one bitset image, which is
+    turned into the smallest container (`lion_bits_to_container()`) - the way of a damaged piece
+    too, whose header hides more values than an ARRAY holds;
+  - and once the key has more members than an ARRAY holds the container is kept as a BITSET,
+    whose bits the flushes set in place, no image and no new container, and which the finish
+    makes the smallest container.
+  When the source is done (`lo_gather_finish()`) the keys come out of the table ascending for
+  nothing: each key's room is flushed, a BITSET optimized, and the container, the set's own
+  already, appended; the chunks go as their keys are done. So a piece costs its slot's cache line
+  and the copy of its members, a key whose members come one at a time a flush per 27 of them, and
+  the gather holds about what the set will - a chunk per 64 keys met and a container a key - at
+  every moment, which is what lets a set that fits `hash_mem` be built within it.
   A BitmapAnd is the container-wise AND of its children's sets,
   a BitmapOr their OR; a leaf that selects nothing is an empty set. No lossy page exists anywhere in this:
   every member is a TID some entry held (§29.6).
@@ -15889,6 +15900,19 @@ than overruns (§30.4).
   slots, a quicksort, the largest part of a merge: 16% of the query at `u < 1.0`, whose 45,000
   pieces come in 25 runs, which the quicksort took 2.4 ms over and a merge of the runs takes 0.34
   (measured apart); the query then took 9.1 ms, and the set build 69% of it.)*
+  *(Reworked 2026-10-19, the 50M-row vector benchmark: the pieces were kept as they came, a copy
+  and a directory entry each, and the directory sorted by key and its pieces ORed whenever it
+  filled - every key a piece had come for since the last time, nearly every key for the pieces of
+  a range - so a 10% range over a unique double with summaries, 5M pieces of one member for
+  260,417 keys, built its set in 845 ms, 170 ns a piece, as long as the restricted lionvec scan
+  took under the filter; on 2M rows of ten a page, 198,000 pieces for 3,125 keys took 245 ns each,
+  70 of them the source's, 40 the copy, 64 the sort and 70 the four merges. Gathered, the 2M
+  table's 198,000 pieces take 105 ns each, 70 of them the source's: the 10% range's set is built in
+  21 ms against 55, the 3% range's in 5 against 12, the 30% range's 594,000 pieces in 81 against
+  155; with summaries of 4,096 rows, 17 ms against 29 at 10%, and without summaries, an entry a
+  value, 74 against 113. At 64 kB of hash_mem the sets that were exact still are, the gather
+  holding a chunk and the containers it has made and no more. The 50M table is to be measured
+  again.)*
 - **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
   lion index clause was lossy and the set did not degrade. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
@@ -15897,8 +15921,8 @@ than overruns (§30.4).
 - **Degrading.** The set counts its bytes; when they would exceed `get_hash_memory_limit()` it
   frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
   member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
-  key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, its unmerged
-  pieces: up to 32 a key, as long as their slots fit in `hash_mem`, or 1,024, above); the answer
+  key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, the gather's
+  keys met: a bit each, in chunks of 64); the answer
   stays exact because every fetched member is now rechecked; the node walks on as a slower filter.
 - **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
   sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
@@ -21617,20 +21641,24 @@ unfiltered scan's deeper batches, and the plain scan under `allow`.
 **The set's pieces** (2026-10-18). Until then `lo_cost_knn()` priced the set as `lo_cost()` does for
 a B-tree's walk (§30.3): the lion access's own cost - a summary entry a bucket - and
 `cpu_operator_cost` a container key, nothing a member, so the 50M-row benchmark's 10% set, 1,220
-summary entries and 260,417 keys built in 845 ms, cost 650. Both now add the pieces the set copies,
-sorts and ORs (`lo_set_pieces()`): each leaf's source hands the set a container for each entry it
-reads at each container key that entry's rows reach, so they cost
+summary entries and 260,417 keys built in 845 ms, cost 650. Both now add the pieces the set gathers
+(`lo_set_pieces()`): each leaf's source hands the set a container for each entry it reads at each
+container key that entry's rows reach, so they cost
 
-    min(members, entries x keys) x LO_PROBE_TUPLES x cpu_tuple_cost
+    min(members, entries x keys) x LO_PIECE_TUPLES x cpu_tuple_cost
 
 with `entries` from `lion_cost_path_entries()` (lion_amcost.c, summed over a BitmapAnd's or
 BitmapOr's leaves): for a key column's range, `lion_cost_ranges_entries()`'s - a summary a bucket it
 covers whole, and the keys at its ends, or without summaries every key between its bounds; for an
 equality list longer than a batch (`lion_scan_list_batch()`), a LIST source, its elements; else one;
-a leaf's most of any column. `LO_PROBE_TUPLES` (2) `cpu_tuple_cost`s is the walk's 170 ns an entry,
-which the 50M build's 5M pieces came to (845 ms); at 5M rows the same filter's 500,000 members took
-44 to 48 ms, 1.36 members a piece, 90 ns a member. A 10% equality on a column the heap is ordered by
-brings a piece a key; a range over a unique column a piece a member.
+a leaf's most of any column. A 10% equality on a column the heap is ordered by brings a piece a key;
+a range over a unique column a piece a member. A piece was first `LO_PROBE_TUPLES` (2)
+`cpu_tuple_cost`s, the walk's 170 ns an entry, which the 50M build's 5M pieces came to (845 ms); at
+5M rows the same filter's 500,000 members took 44 to 48 ms, 1.36 members a piece, 90 ns a member.
+Since the pieces are gathered by key (2026-10-19, §30.4) the 2M emulation's take 105 ns each where
+they took 278, so a piece is `LO_PIECE_TUPLES` (1) `cpu_tuple_cost`, 85 ns on the walk's scale: a
+little under the measurement, where a tie should fall, the set's answer being the one that does not
+move with the plan. To be measured again at 50M rows.
 
 **Exact path pricing (2026-10-18).** Under the default `pg_lion.vector_postfilter` the exact
 path's one competitor is core's sort of the lion bitmap scan's rows under the LIMIT, and it was

@@ -515,98 +515,91 @@ typedef struct LionTidSet
 {
 	int			n;
 	int			cap;
-	int			nmerged;		/* entries the last lo_set_finish() left */
-	uint32	   *keys;
+	uint32	   *keys;			/* strictly ascending */
 	LionContainer **conts;
-	bool		sorted;			/* keys strictly ascending */
 } LionTidSet;
 
 /* Bytes of directory charged per container key, on top of the container. */
 #define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4))
 
 /*
- * A directory of pieces (lo_set_push()) is merged when it is full only from
- * this size on: below it the pieces cost less than the merges would.
- */
-#define LO_MERGE_MIN		1024
-
-/*
- * After a merge the directory has room for this many pieces for each entry
- * the merge left, doubling until it does: a merge costs about as much for
- * each key it rewrites as for this many pieces (lo_set_push()).
- */
-#define LO_MERGE_ROOM		32
-
-/*
- * A key's pieces are merged member by member, not through a bitset image,
- * when they hold this many members or fewer together (lo_set_finish()):
- * LION_WIDTH_ARRAY_CARD(1), 256 at 8K, an ARRAY as large as the narrowest
- * NARROW, so that what the merge leaves is always an ARRAY or a RUN.  Below
- * it the merge won at every shape measured, 2 to 64 pieces of members in any
- * block at any offset: 0.9 us against the image's 1.6 for 4 pieces of 256
- * together, at the worst, and from 30 times faster for a few members.  Past
- * it a union the image makes a NARROW of had to become one from the merge's
- * ARRAY, which took 2.5 to 10 us against the image's 1 to 3 (2026-10-17).
+ * A flush of a key's gathered members (lo_gather_flush()) merges them
+ * member by member, not through a bitset image, while the key has this
+ * many or fewer together: LION_WIDTH_ARRAY_CARD(1), 256 at 8K, an ARRAY as
+ * large as the narrowest NARROW, so that what the merge leaves is always an
+ * ARRAY or a RUN.  Below it the merge won at every shape measured, 2 to 64
+ * pieces of members in any block at any offset: 0.9 us against the image's
+ * 1.6 for 4 pieces of 256 together, at the worst, and from 30 times faster
+ * for a few members.  Past it a union the image makes a NARROW of had to
+ * become one from the merge's ARRAY, which took 2.5 to 10 us against the
+ * image's 1 to 3 (2026-10-17).
  */
 #define LO_MERGE_DIRECT_MAX	((uint32) LION_WIDTH_ARRAY_CARD(1))
 
 /*
- * The pieces' slots sorted by key, then slot - (key << 32 | slot), each
- * value distinct - for lo_set_finish(): src[0 .. n - 1] are merged, a pair of
- * ascending runs at a time, into dst and back, until one run is left, and
- * the buffer that holds it is returned (src or dst).  A source hands its
- * pieces out entry by entry or bucket by bucket, each in ascending key, so
- * they come as a few long runs - one a summary bucket or entry that
- * contributed, 4 at u < 0.1 on DBpedia's 115,000 rows, 25 at u < 1.0 - and
- * this takes a pass or a few; a run of one or two pieces, a range over
- * unique values, costs a merge sort.  A quicksort of the slots
- * (sort_template.h) took 180 us for 6,000 pieces in 4 runs, where this takes
- * 17, 2.4 ms for 45,000 in 25 against 0.34, and 174 us against 109 for runs
- * of two (2026-10-17): it was 4.7% of the u < 0.1 query, the most of a merge
- * once the keys were merged member by member.
+ * A leaf's pieces gathered by container key as its source hands them out
+ * (lo_build_leaf(); DESIGN.md §30.4, "Gathering the pieces").  A WALK (a
+ * range) or a LIST (a long IN list) source hands out a container key once
+ * per entry or per batch (§29.3), so a range over a unique column brings
+ * about a piece a member, in entry order: 5M pieces of one member each for
+ * the 260,417 keys of a 10% range over 50M rows with summaries.  A
+ * container key is a heap block / LION_BLOCKS_PER_CONTAINER, a small
+ * integer, so the gather is a table of the keys, in chunks of
+ * LO_GATHER_CHUNK_KEYS slots made when a key of theirs is first met, a
+ * cache line a key: the key's container so far, in the set's memory
+ * context, and room for LO_GATHER_INLINE members not in it yet.  A piece of
+ * a few members goes into that room, and when the room is full, or a piece
+ * brings more, the room and the piece go into the container
+ * (lo_gather_flush()): merged member by member while the key has at most
+ * LO_MERGE_DIRECT_MAX members (lion_container_or_merge()), through a bitset
+ * image past that, and straight into the container's bits once the key has
+ * more members than an ARRAY holds, when the container is kept as a BITSET
+ * and optimized at the end.  When the source is done the keys are taken into
+ * the set in order, which the table gives for nothing (lo_gather_finish()).
+ * So a piece costs its slot's cache line and the copy of its members, a key
+ * whose members come one at a time costs a flush per LO_GATHER_INLINE of
+ * them, and the gather holds about what the set will: a chunk per 64 keys
+ * met, and a container a key.
+ *
+ * Until 2026-10-19 every piece was kept as it came, a copy and a directory
+ * entry each, and the directory was sorted by key and its pieces ORed
+ * whenever it filled, which rewrote every key a piece had come for since
+ * the last time - nearly every key, for the pieces of a range: on 2M rows
+ * of ten a heap page (3,125 keys) a 10% range over a unique column with
+ * summaries of 64 rows, 198,000 pieces of one member, took 245 ns a piece
+ * before the node's first row, 70 of them the source's, 40 the copy, 64 the
+ * sort and 70 the four merges, each of nearly every key; at 50M rows the
+ * same filter's 5M pieces took 845 ms, 170 ns each.  Gathered, the 2M
+ * table's 198,000 pieces take 105 ns each, 70 of them the source's: the
+ * 10% range's set in 21 ms against 55, the 3% range's in 5 against 12 and
+ * the 30% range's, 594,000 pieces, in 81 against 155; with summaries of
+ * 4,096 rows 17 ms against 29 at 10%, and without summaries, an entry a
+ * value, 74 against 113 (2026-10-19, the least of 7 runs each).
  */
-static uint64 *
-lo_merge_slots(uint64 *src, uint64 *dst, int n)
+#define LO_GATHER_CHUNK_KEYS	64
+#define LO_GATHER_INLINE		((64 - sizeof(LionContainer *) - sizeof(uint16)) / sizeof(uint16))
+
+typedef struct LoGatherSlot
 {
-	for (;;)
-	{
-		int			s = 0;
-		int			m = 1;
+	LionContainer *c;			/* the key's members so far (setcxt), or NULL */
+	uint16		n;				/* members in vals[] not in c yet */
+	uint16		vals[LO_GATHER_INLINE];
+} LoGatherSlot;
 
-		while (m < n && src[m] > src[m - 1])
-			m++;
-		if (m >= n)
-			return src;
-		while (s < n)
-		{
-			int			e = (m < n) ? m + 1 : m;
-			int			a = s;
-			int			b = m;
-			int			d = s;
+StaticAssertDecl(sizeof(LoGatherSlot) == 64, "a gather slot is a cache line");
 
-			/* the run [s, m) and the one after it, [m, e) */
-			while (e < n && src[e] > src[e - 1])
-				e++;
-			while (a < m && b < e)
-				dst[d++] = (src[b] < src[a]) ? src[b++] : src[a++];
-			while (a < m)
-				dst[d++] = src[a++];
-			while (b < e)
-				dst[d++] = src[b++];
+#define LO_GATHER_CHUNK_BYTES	(sizeof(LoGatherSlot) * LO_GATHER_CHUNK_KEYS)
 
-			s = e;
-			m = (s < n) ? s + 1 : s;
-			while (m < n && src[m] > src[m - 1])
-				m++;
-		}
-		{
-			uint64	   *swap = src;
-
-			src = dst;
-			dst = swap;
-		}
-	}
-}
+typedef struct LoGather
+{
+	LoGatherSlot **chunks;		/* chunk k holds keys 64k .. 64k + 63; NULL until one is met */
+	uint64	   *touched;		/* a bit a key met, by chunk */
+	uint32		nchunks;		/* the room in chunks[] and touched[] */
+	uint32		maxchunk;		/* one past the highest chunk a key was met in */
+	uint64	   *img;			/* scratch: a bitset image of one key */
+	LionContainer *out;			/* scratch: LION_CONTAINER_MAX_SIZE bytes */
+	LionContainer *pend;		/* scratch: a slot's pending members as an ARRAY */
+} LoGather;
 
 /* ---------------------------------------------------------------------
  * Executor state
@@ -1311,29 +1304,35 @@ lo_lion_entries(PlannerInfo *root, Path *lion)
 }
 
 /*
- * What copying the lion side's answer into the set costs, beyond its
+ * What taking the lion side's answer into the set costs, beyond its
  * lookups and a cpu_operator_cost a container key (DESIGN.md §30.3, §44.7):
  * each leaf's source hands the set a container for each entry it reads at
- * each container key that entry's rows reach, and each is copied
- * (lo_set_push()) and then sorted by key and ORed into the set
- * (lo_set_finish()).  A range over a unique column brings about a piece a
- * member: its summaries' buckets each hold rows from nearly every key of the
- * heap.  So the pieces are min(members, entries x keys) - a 10% equality on
- * a column the heap is ordered by brings a piece a key, the same filter as a
- * range over a unique column one a member - each at LO_PROBE_TUPLES
- * cpu_tuple_costs, the walk's 170 ns an entry: at 50M rows a 10% range on a
- * unique double with summaries built 5M pieces in 845 ms, 170 ns each; at
- * 5M rows the same filter's 500,000 members, 1.36 a piece, took 44 to 48
- * ms, 90 ns a member.  Before 2026-10-18 nothing was charged for them, and
- * that 10% filter's set at 50M rows was priced as its 1,220 summary entries
- * and 260,417 keys alone: 650 for 845 ms.
+ * each container key that entry's rows reach, and each is gathered into its
+ * key's (lo_gather_push()).  A range over a unique column brings about a
+ * piece a member: its summaries' buckets each hold rows from nearly every
+ * key of the heap.  So the pieces are min(members, entries x keys) - a 10%
+ * equality on a column the heap is ordered by brings a piece a key, the
+ * same filter as a range over a unique column one a member - each at
+ * LO_PIECE_TUPLES cpu_tuple_costs.  Before 2026-10-18 nothing was charged
+ * for them, and a 10% range on a unique double with summaries at 50M rows,
+ * whose set of 5M pieces took 845 ms, was priced as its 1,220 summary
+ * entries and 260,417 keys alone: 650 for 845 ms.  Then LO_PROBE_TUPLES,
+ * the walk's 170 ns an entry, which those pieces came to (at 5M rows the
+ * same filter's 500,000 members, 1.36 a piece, took 44 to 48 ms, 90 ns a
+ * member); gathered (2026-10-19, LoGather), the 2M emulation's pieces went
+ * from 278 ns each to 105, so a piece is now one cpu_tuple_cost, 85 ns on
+ * the walk's scale, a little under the measurement, which is where a tie
+ * should fall (the set's answer does not move with the plan).  To be
+ * measured again at 50M rows.
  */
+#define LO_PIECE_TUPLES		1
+
 static Cost
 lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
 {
 	double		pieces = Min(members, lo_lion_entries(root, lion) * ncont);
 
-	return pieces * LO_PROBE_TUPLES * cpu_tuple_cost;
+	return pieces * LO_PIECE_TUPLES * cpu_tuple_cost;
 }
 
 /*
@@ -3483,7 +3482,6 @@ lo_set_new(LionOrderedState *st)
 	set->cap = 16;
 	set->keys = (uint32 *) palloc(sizeof(uint32) * set->cap);
 	set->conts = (LionContainer **) palloc(sizeof(LionContainer *) * set->cap);
-	set->sorted = true;
 	st->live = lappend(st->live, set);
 	MemoryContextSwitchTo(oldcxt);
 	return set;
@@ -3538,250 +3536,424 @@ lo_degrade(LionOrderedState *st)
 	st->exact = false;
 }
 
-static void lo_set_finish(LionOrderedState *st, LionTidSet *set);
+/*
+ * Append (ckey, c) to the set, in ascending key: a sorted source's
+ * containers come so (lion_source_sorted()), a leaf's gathered keys are
+ * taken in order (lo_gather_finish()), and lo_set_combine()'s come merged
+ * from two sets in order.  c is the set's own, in setcxt and charged, or
+ * NULL when the set is degraded.
+ */
+static void
+lo_set_append(LionOrderedState *st, LionTidSet *set, uint32 ckey,
+			  LionContainer *c)
+{
+	Assert(set->n == 0 || ckey > set->keys[set->n - 1]);
+	Assert(c == NULL || !st->degraded);
+	if (set->n == set->cap)
+	{
+		set->cap *= 2;
+		set->keys = (uint32 *) repalloc_huge(set->keys,
+											 sizeof(uint32) * set->cap);
+		set->conts = (LionContainer **)
+			repalloc_huge(set->conts, sizeof(LionContainer *) * set->cap);
+	}
+	st->bytes += LO_ENTRY_BYTES;
+	set->keys[set->n] = ckey;
+	set->conts[set->n] = c;
+	set->n++;
+}
 
 /*
- * Append (ckey, a copy of c, or nothing when degraded).
- *
- * A WALK or a LIST source hands out a container key once per ENTRY or per
- * batch, not once (§29.3): a range over 400,000 distinct values brings
- * 400,000 one-TID pieces for 34 container keys.  The first version merged the
- * pieces only when the source was done, so every piece held a directory entry
- * and a container copy until then - the set degraded although its merged
- * form was a hundredth of hash_mem, and once degraded its directory went on
- * growing one entry per piece, past any bound (52 MB at a 1 MB hash_mem for a
- * range over 4M values; 2026-09-25 second review).  The pieces are merged
- * whenever the directory is full - it then doubles until it has room for
- * LO_MERGE_ROOM pieces an entry the merge left, or its slots alone would
- * take hash_mem - and before their bytes would degrade the set, once there
- * are at least as many pieces as merged entries; only a set whose merged
- * form does not fit degrades (§30.4).
- *
- * A merge rewrites every key a piece came for - a bitset image of each - and
- * the pieces of a range come for nearly every key.  The directory used to
- * double only while it stayed more than half full, which kept a merge to as
- * many pieces as keys: a range over 100,000 of a million unique values, 223
- * keys, merged every 800 pieces, and the merges were half of LionOrdered's
- * 130 ms before its first row (2026-10-16).
+ * Append (ckey, a copy of c, or nothing when degraded): a set that would
+ * outgrow hash_mem degrades (lo_degrade()) rather than take the copy.
  */
 static void
 lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 			const LionContainer *c)
 {
-	Size		size = (c != NULL && !st->degraded) ? lion_container_size(c) : 0;
+	LionContainer *copy = NULL;
 
-	if (set->n == set->cap)
-	{
-		int			cap = set->cap;
-		bool		merged = false;
-
-		if (!set->sorted && set->cap >= LO_MERGE_MIN)
-		{
-			lo_set_finish(st, set);
-			merged = true;
-		}
-		while (set->n > cap / 2 ||
-			   (merged &&
-				(double) (cap - set->n) < (double) LO_MERGE_ROOM * set->n &&
-				(double) cap * 2.0 * LO_ENTRY_BYTES <= (double) st->limit))
-			cap *= 2;
-		if (cap != set->cap)
-		{
-			set->cap = cap;
-			set->keys = (uint32 *) repalloc_huge(set->keys,
-												 sizeof(uint32) * set->cap);
-			set->conts = (LionContainer **)
-				repalloc_huge(set->conts, sizeof(LionContainer *) * set->cap);
-		}
-	}
-	if (size > 0 && !set->sorted &&
-		st->bytes + LO_ENTRY_BYTES + size > st->limit &&
-		set->n - set->nmerged >= set->nmerged)
-		lo_set_finish(st, set);
-
-	if (set->n > 0 && ckey <= set->keys[set->n - 1])
-		set->sorted = false;
-	st->bytes += LO_ENTRY_BYTES;
-	set->keys[set->n] = ckey;
-	set->conts[set->n] = NULL;
 	if (c != NULL && !st->degraded)
 	{
-		if (st->bytes + size > st->limit)
+		Size		size = lion_container_size(c);
+
+		if (st->bytes + LO_ENTRY_BYTES + size > st->limit)
 			lo_degrade(st);
 		else
 		{
-			LionContainer *copy = (LionContainer *)
-				MemoryContextAlloc(st->setcxt, size);
-
+			copy = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
 			memcpy(copy, c, size);
 			st->bytes += size;
-			set->conts[set->n] = copy;
 		}
 	}
-	set->n++;
+	lo_set_append(st, set, ckey, copy);
 }
 
 /*
- * A WALK or LIST source's containers came entry by entry (§29.3): sort them
- * by key and OR the containers of equal keys into one - when the source is
- * done, and whenever lo_set_push() finds the pieces piling up.  The pieces of
- * one key are ORed into a bitset image and turned into a container once:
- * ORing them pairwise cost a pass over the growing container per piece, 4.2 s
- * for a range over 250,000 distinct values against 0.2 s for the lion bitmap
- * scan of the same range (2026-09-25 second review).
- *
- * The entries the last merge left, [0, nmerged), are in order already: only
- * the pieces after them are sorted, by key and slot packed into a word
- * (lo_merge_slots()), and the two runs merged.  A sort of every slot through
- * a comparator that read the keys was most of what a merge cost (2026-10-16).
- *
- * A key whose pieces hold LO_MERGE_DIRECT_MAX members or fewer together is
- * merged member by member instead (lion_container_or_merge()), which is what
- * the image would have made, byte for byte.  A summary's buckets and entries
- * each cover every heap block of a column spread evenly over the table, so a
- * filter brings a few pieces of a few members to every container key: 3.5
- * pieces of 6.5 members at u < 0.1 on DBpedia's 115,000 rows of one row a
- * heap page, 1,800 keys, and at u < 1.0 25 pieces of 64.  The image cost
- * 8 KB of passes a key whatever it held - a 4 KB clear, then the count, the
- * runs and the members of optimize() over the 4 KB of a BITSET - and the
- * merges were 36% of a 9.7 ms query at u < 0.1, a cost of the keys, not of
- * the members (2026-10-17).  The merge of the members costs 40 ns for 3
- * pieces of 6 members against the image's 1.2 us, and 0.2 us for 25 of 64
- * against 1.4; the query took 9.5 -> 6.6 ms at u < 0.1, and 14.3 -> 11.6 at
- * u < 1.0.
+ * OR c into the set's last container, whose key it has: a sorted source
+ * is not expected to name a key twice, but a set must hold each key once
+ * (lo_set_find()), so one that does is taken in rather than refused.
  */
 static void
-lo_set_finish(LionOrderedState *st, LionTidSet *set)
+lo_set_or_last(LionOrderedState *st, LionTidSet *set, const LionContainer *c)
 {
-	int		   *order;
-	uint64	   *packed;
-	uint64	   *spare;
-	uint64	   *sorted;
-	uint32	   *keys;
-	LionContainer **conts;
-	const LionContainer **group;
+	LionContainer *last = set->conts[set->n - 1];
 	uint64	   *img;
 	LionContainer *out;
-	int			npieces;
-	int			a;
-	int			b;
-	int			n = 0;
-	int			i;
+	Size		size;
 
-	if (set->sorted || set->n < 2)
-	{
-		set->sorted = true;
-		set->nmerged = set->n;
+	Assert(set->n > 0 && c->ckey == set->keys[set->n - 1]);
+	if (st->degraded || last == NULL)
 		return;
-	}
-
-	Assert(set->nmerged >= 0 && set->nmerged <= set->n);
-	npieces = set->n - set->nmerged;
-	packed = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
-											   sizeof(uint64) * Max(npieces, 1));
-	spare = (uint64 *) MemoryContextAllocHuge(st->buildcxt,
-											  sizeof(uint64) * Max(npieces, 1));
-	for (i = 0; i < npieces; i++)
-		packed[i] = ((uint64) set->keys[set->nmerged + i] << 32) |
-			(uint64) (uint32) (set->nmerged + i);
-	sorted = lo_merge_slots(packed, spare, npieces);
-
-	/* the merged entries before the pieces at an equal key, as by slot */
-	order = (int *) MemoryContextAllocHuge(st->buildcxt, sizeof(int) * set->n);
-	a = 0;
-	b = 0;
-	for (i = 0; i < set->n; i++)
-	{
-		if (b >= npieces ||
-			(a < set->nmerged && set->keys[a] <= (uint32) (sorted[b] >> 32)))
-			order[i] = a++;
-		else
-			order[i] = (int) (uint32) sorted[b++];
-	}
-	pfree(packed);
-	pfree(spare);
-
-	keys = (uint32 *) MemoryContextAllocHuge(st->setcxt,
-											 sizeof(uint32) * set->cap);
-	conts = (LionContainer **)
-		MemoryContextAllocHuge(st->setcxt, sizeof(LionContainer *) * set->cap);
-	group = (const LionContainer **)
-		MemoryContextAllocHuge(st->buildcxt,
-							   sizeof(LionContainer *) * set->n);
-	img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
+	img = (uint64 *) MemoryContextAllocZero(st->buildcxt, LION_BITSET_BYTES);
 	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
-
-	for (i = 0; i < set->n;)
+	lion_container_or_into_bitset(last, img);
+	lion_container_or_into_bitset(c, img);
+	lion_bits_to_container(img, c->ckey, out);
+	size = lion_container_size(out);
+	st->bytes -= lion_container_size(last);
+	pfree(last);
+	set->conts[set->n - 1] = NULL;
+	if (st->bytes + size > st->limit)
+		lo_degrade(st);
+	else
 	{
-		uint32		key = set->keys[order[i]];
-		int			j = i + 1;
+		LionContainer *copy = (LionContainer *)
+			MemoryContextAlloc(st->setcxt, size);
 
-		while (j < set->n && set->keys[order[j]] == key)
-			j++;
-
-		if (j == i + 1 || st->degraded)
-		{
-			/* one container (or only keys): moved as it is */
-			conts[n] = set->conts[order[i]];
-			set->conts[order[i]] = NULL;
-		}
-		else
-		{
-			int			m;
-			uint32		members = 0;
-			Size		size;
-
-			/* summed only until past the bound: a key may have many pieces */
-			for (m = i; m < j && members <= LO_MERGE_DIRECT_MAX; m++)
-				members += set->conts[order[m]]->cardinality;
-			if (members <= LO_MERGE_DIRECT_MAX)
-			{
-				for (m = i; m < j; m++)
-					group[m - i] = set->conts[order[m]];
-			}
-			if (members > LO_MERGE_DIRECT_MAX ||
-				!lion_container_or_merge(group, (uint32) (j - i), key, out))
-			{
-				memset(img, 0, LION_BITSET_BYTES);
-				for (m = i; m < j; m++)
-					lion_container_or_into_bitset(set->conts[order[m]], img);
-				lion_bits_to_container(img, key, out);
-			}
-			size = lion_container_size(out);
-			conts[n] = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
-			memcpy(conts[n], out, size);
-			st->bytes += size;
-		}
-		keys[n] = key;
-		n++;
-		i = j;
+		memcpy(copy, out, size);
+		st->bytes += size;
+		set->conts[set->n - 1] = copy;
 	}
-
-	/* what was merged away */
-	for (i = 0; i < set->n; i++)
-	{
-		if (set->conts[i] != NULL)
-		{
-			st->bytes -= lion_container_size(set->conts[i]);
-			pfree(set->conts[i]);
-		}
-	}
-	st->bytes -= (set->n - n) * LO_ENTRY_BYTES;
-	pfree(set->keys);
-	pfree(set->conts);
-	pfree(order);
-	pfree(group);
 	pfree(img);
 	pfree(out);
-	set->keys = keys;
-	set->conts = conts;
-	set->n = n;
-	set->nmerged = n;
-	set->sorted = true;
+}
 
-	if (!st->degraded && st->bytes > st->limit)
-		lo_degrade(st);
+/* ---------------------------------------------------------------------
+ * Gathering a leaf's pieces (LoGather)
+ * --------------------------------------------------------------------- */
+
+/*
+ * The chunks a gather has room for at first, a pointer and a word each: the
+ * room doubles as keys need, a few times for the largest heap.
+ */
+#define LO_GATHER_FIRST_CHUNKS	1
+
+static LoGather *
+lo_gather_new(LionOrderedState *st)
+{
+	LoGather   *g = (LoGather *) MemoryContextAlloc(st->buildcxt,
+													sizeof(LoGather));
+
+	g->nchunks = LO_GATHER_FIRST_CHUNKS;
+	g->maxchunk = 0;
+	g->chunks = (LoGatherSlot **)
+		MemoryContextAllocZero(st->buildcxt,
+							   sizeof(LoGatherSlot *) * g->nchunks);
+	g->touched = (uint64 *) MemoryContextAllocZero(st->buildcxt,
+												   sizeof(uint64) * g->nchunks);
+	g->img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
+	g->out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
+												  LION_CONTAINER_MAX_SIZE);
+	g->pend = (LionContainer *)
+		MemoryContextAlloc(st->buildcxt,
+						   LION_CONTAINER_HDRSZ +
+						   sizeof(uint16) * LO_GATHER_INLINE);
+	st->bytes += (sizeof(LoGatherSlot *) + sizeof(uint64)) * g->nchunks;
+	return g;
+}
+
+/*
+ * Drop every key's members, and the chunks that held them; the keys met
+ * stay (touched[]): the set outgrew hash_mem, and from here on a key means
+ * all of its heap blocks (lo_degrade()).
+ */
+static void
+lo_gather_degrade(LionOrderedState *st, LoGather *g)
+{
+	uint32		k;
+	uint32		i;
+
+	lo_degrade(st);
+	for (k = 0; k < g->maxchunk; k++)
+	{
+		LoGatherSlot *slots = g->chunks[k];
+
+		if (slots == NULL)
+			continue;
+		for (i = 0; i < LO_GATHER_CHUNK_KEYS; i++)
+		{
+			if (slots[i].c != NULL)
+			{
+				st->bytes -= lion_container_size(slots[i].c);
+				pfree(slots[i].c);
+			}
+		}
+		st->bytes -= LO_GATHER_CHUNK_BYTES;
+		pfree(slots);
+		g->chunks[k] = NULL;
+	}
+}
+
+/*
+ * Room for `need` more bytes: charged, or the set degraded (then there is
+ * none, and false comes back).
+ */
+static bool
+lo_gather_charge(LionOrderedState *st, LoGather *g, Size need)
+{
+	if (st->bytes + need > st->limit)
+	{
+		lo_gather_degrade(st, g);
+		return false;
+	}
+	st->bytes += need;
+	return true;
+}
+
+/* Set the pending members of slot in a bitset image; how many were new. */
+static uint32
+lo_gather_set_bits(const LoGatherSlot *slot, uint64 *w)
+{
+	uint32		added = 0;
+	uint32		i;
+
+	for (i = 0; i < slot->n; i++)
+	{
+		uint32		lo = (uint32) slot->vals[i] & LION_LO_MASK;
+		uint64		bit = UINT64CONST(1) << (lo & 63);
+
+		if ((w[lo >> 6] & bit) == 0)
+		{
+			w[lo >> 6] |= bit;
+			added++;
+		}
+	}
+	return added;
+}
+
+/*
+ * The slot's pending members, and the piece c when there is one, into the
+ * container of ckey the slot holds (which it may not yet): a new one takes
+ * the old one's place, charged; false when the set degraded instead, and
+ * the slot's members are gone.
+ */
+static bool
+lo_gather_flush(LionOrderedState *st, LoGather *g, LoGatherSlot *slot,
+				uint32 ckey, const LionContainer *c)
+{
+	LionContainer *old = slot->c;
+	uint32		total = (old != NULL ? old->cardinality : 0) + slot->n +
+		(c != NULL ? c->cardinality : 0);
+	LionContainer *out = g->out;
+	LionContainer *copy;
+	bool		merged = false;
+	Size		size;
+
+	Assert(!st->degraded);
+	Assert(slot->n > 0 || c != NULL);
+
+	if (old != NULL && old->type == LION_CT_BITSET)
+	{
+		/* a dense key, kept as a BITSET: its bits are set in place */
+		uint32		added = lo_gather_set_bits(slot, LION_BITSET_DATA(old));
+
+		old->cardinality = (uint16) Min((uint32) old->cardinality + added,
+										(uint32) LION_CONTAINER_RANGE);
+		if (c != NULL)
+			lion_container_or_inplace(old, c);
+		slot->n = 0;
+		return true;
+	}
+
+	if (total <= LO_MERGE_DIRECT_MAX)
+	{
+		/* a few members: merged member by member */
+		const LionContainer *parts[3];
+		uint32		np = 0;
+
+		if (old != NULL)
+			parts[np++] = old;
+		if (slot->n > 0)
+		{
+			lion_container_init(g->pend, ckey);
+			memcpy(LION_ARRAY_DATA(g->pend), slot->vals,
+				   sizeof(uint16) * slot->n);
+			g->pend->cardinality = slot->n;
+			parts[np++] = g->pend;
+		}
+		if (c != NULL)
+			parts[np++] = c;
+		/* false only for a damaged header: then through the image */
+		merged = lion_container_or_merge(parts, np, ckey, out);
+	}
+	if (!merged)
+	{
+		uint64	   *img = g->img;
+		uint32		card;
+
+		memset(img, 0, LION_BITSET_BYTES);
+		if (old != NULL)
+			lion_container_or_into_bitset(old, img);
+		(void) lo_gather_set_bits(slot, img);
+		if (c != NULL)
+			lion_container_or_into_bitset(c, img);
+		lion_bits_to_container(img, ckey, out);
+		card = out->cardinality;
+		if (card > LION_ARRAY_MAX_CARD && out->type != LION_CT_BITSET)
+		{
+			/*
+			 * More members than an ARRAY holds: from here on the container
+			 * is a BITSET, whose bits the next flushes set in place, and
+			 * lo_gather_finish() optimizes it.
+			 */
+			lion_container_bitset_init(out, ckey);
+			memcpy(LION_BITSET_DATA(out), img, LION_BITSET_BYTES);
+			out->cardinality = (uint16) card;
+		}
+	}
+	size = lion_container_size(out);
+	slot->n = 0;
+	if (old != NULL)
+	{
+		st->bytes -= lion_container_size(old);
+		pfree(old);
+		slot->c = NULL;
+	}
+	if (!lo_gather_charge(st, g, size))
+		return false;
+	copy = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
+	memcpy(copy, out, size);
+	slot->c = copy;
+	return true;
+}
+
+/* Take the members of piece c, a container of key c->ckey. */
+static void
+lo_gather_push(LionOrderedState *st, LoGather *g, const LionContainer *c)
+{
+	uint32		chunk = c->ckey / LO_GATHER_CHUNK_KEYS;
+	uint32		i = c->ckey % LO_GATHER_CHUNK_KEYS;
+	LoGatherSlot *slot;
+
+	if (chunk >= g->nchunks)
+	{
+		uint32		n = g->nchunks;
+
+		if (c->ckey > MaxBlockNumber / LION_BLOCKS_PER_CONTAINER)
+			elog(ERROR, "lion: container key %u is beyond any heap block",
+				 c->ckey);
+		while (n <= chunk)
+			n *= 2;
+		g->chunks = (LoGatherSlot **) repalloc(g->chunks,
+											   sizeof(LoGatherSlot *) * n);
+		memset(g->chunks + g->nchunks, 0,
+			   sizeof(LoGatherSlot *) * (n - g->nchunks));
+		g->touched = (uint64 *) repalloc(g->touched, sizeof(uint64) * n);
+		memset(g->touched + g->nchunks, 0,
+			   sizeof(uint64) * (n - g->nchunks));
+		st->bytes += (sizeof(LoGatherSlot *) + sizeof(uint64)) *
+			(n - g->nchunks);
+		g->nchunks = n;
+		if (!st->degraded && st->bytes > st->limit)
+			lo_gather_degrade(st, g);
+	}
+	g->touched[chunk] |= UINT64CONST(1) << i;
+	if (chunk >= g->maxchunk)
+		g->maxchunk = chunk + 1;
+	if (st->degraded)
+		return;					/* the keys alone: every member rechecked */
+
+	if (g->chunks[chunk] == NULL)
+	{
+		if (!lo_gather_charge(st, g, LO_GATHER_CHUNK_BYTES))
+			return;
+		g->chunks[chunk] = (LoGatherSlot *)
+			MemoryContextAllocZero(st->buildcxt, LO_GATHER_CHUNK_BYTES);
+	}
+	slot = &g->chunks[chunk][i];
+	if (c->type == LION_CT_ARRAY && c->cardinality <= LO_GATHER_INLINE)
+	{
+		uint32		card = c->cardinality;
+
+		if (slot->n + card > LO_GATHER_INLINE &&
+			!lo_gather_flush(st, g, slot, c->ckey, NULL))
+			return;
+		memcpy(slot->vals + slot->n, LION_ARRAY_DATA(c),
+			   sizeof(uint16) * card);
+		slot->n += card;
+	}
+	else
+		(void) lo_gather_flush(st, g, slot, c->ckey, c);
+}
+
+/*
+ * The gathered keys into the set, in ascending key, each key's members as
+ * one container: the pending members flushed, a BITSET optimized.  The
+ * chunks go as their keys are done.
+ */
+static void
+lo_gather_finish(LionOrderedState *st, LoGather *g, LionTidSet *set)
+{
+	uint32		k;
+
+	for (k = 0; k < g->maxchunk; k++)
+	{
+		uint64		bits = g->touched[k];
+
+		while (bits != 0)
+		{
+			uint32		i = (uint32) pg_rightmost_one_pos64(bits);
+			uint32		ckey = k * LO_GATHER_CHUNK_KEYS + i;
+			LionContainer *c = NULL;
+
+			bits &= bits - 1;
+			CHECK_FOR_INTERRUPTS();
+			if (!st->degraded)
+			{
+				LoGatherSlot *slot = &g->chunks[k][i];
+
+				Assert(slot->n > 0 || slot->c != NULL);
+				if (slot->n == 0 || lo_gather_flush(st, g, slot, ckey, NULL))
+				{
+					c = slot->c;
+					slot->c = NULL;
+					if (c->type == LION_CT_BITSET)
+					{
+						/* a dense key's working form: the smallest now */
+						Size		size;
+						LionContainer *copy;
+
+						lion_bits_to_container(LION_BITSET_DATA(c), ckey,
+											   g->out);
+						size = lion_container_size(g->out);
+						copy = (LionContainer *)
+							MemoryContextAlloc(st->setcxt, size);
+						memcpy(copy, g->out, size);
+						st->bytes -= lion_container_size(c);
+						st->bytes += size;
+						pfree(c);
+						c = copy;
+					}
+				}
+			}
+			lo_set_append(st, set, ckey, c);
+		}
+		if (g->chunks[k] != NULL)
+		{
+			st->bytes -= LO_GATHER_CHUNK_BYTES;
+			pfree(g->chunks[k]);
+			g->chunks[k] = NULL;
+		}
+	}
+	st->bytes -= (sizeof(LoGatherSlot *) + sizeof(uint64)) * g->nchunks;
+	pfree(g->chunks);
+	pfree(g->touched);
+	pfree(g->img);
+	pfree(g->out);
+	pfree(g->pend);
+	pfree(g);
 }
 
 /* a AND b, or a OR b, of two sorted sets; both are consumed. */
@@ -3869,6 +4041,11 @@ lo_set_find(const LionTidSet *set, ItemPointer tid)
  * Building the set (DESIGN.md §30.4)
  * --------------------------------------------------------------------- */
 
+/*
+ * A leaf's set from its source: a sorted source's containers straight into
+ * the set, one a key in ascending key (§29.3); a WALK's or a LIST's, which
+ * come entry by entry or batch by batch, gathered by key first (LoGather).
+ */
 static LionTidSet *
 lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 {
@@ -3881,14 +4058,35 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 	pgstat_count_index_scan(leaf->index);
 	if (!lion_source_exact(src))
 		st->exact = false;
-	while ((c = lion_source_next(src)) != NULL)
+	if (lion_source_sorted(src))
 	{
-		CHECK_FOR_INTERRUPTS();
-		if (c->cardinality > 0)
-			lo_set_push(st, set, c->ckey, c);
+		while ((c = lion_source_next(src)) != NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (c->cardinality == 0)
+				continue;
+			if (set->n > 0 && c->ckey == set->keys[set->n - 1])
+				lo_set_or_last(st, set, c);
+			else if (set->n > 0 && c->ckey < set->keys[set->n - 1])
+				elog(ERROR, "lion: a sorted source handed out container key %u after %u",
+					 c->ckey, set->keys[set->n - 1]);
+			else
+				lo_set_push(st, set, c->ckey, c);
+		}
+	}
+	else
+	{
+		LoGather   *g = lo_gather_new(st);
+
+		while ((c = lion_source_next(src)) != NULL)
+		{
+			CHECK_FOR_INTERRUPTS();
+			if (c->cardinality > 0)
+				lo_gather_push(st, g, c);
+		}
+		lo_gather_finish(st, g, set);
 	}
 	lion_source_close(src);
-	lo_set_finish(st, set);
 	return set;
 }
 
