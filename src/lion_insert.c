@@ -1854,6 +1854,10 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			else
 				nkeys = lion_extract_value(state, values[c], &keys);
 
+			/* every key checked before any is written (DESIGN.md §4) */
+			for (i = 0; i < nkeys; i++)
+				keys[i] = lion_key_prepare(state, keys[i], heapRel, ht_ctid);
+
 			if (nkeys == 0)
 				lion_insert_one(index, heapRel, state, (Datum) 0,
 							   LION_ENTRY_EMPTYKEY, ckey, lo, NULL);
@@ -1868,9 +1872,8 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		}
 		else
 		{
-			key = values[c];
-			if (!state->typbyval && state->typlen == -1)
-				key = PointerGetDatum(PG_DETOAST_DATUM(key));
+			/* stored as it is, or compressed when long (DESIGN.md §4) */
+			key = lion_key_prepare(state, values[c], heapRel, ht_ctid);
 
 			lion_insert_one(index, heapRel, state, key, 0, ckey, lo, NULL);
 

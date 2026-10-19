@@ -761,9 +761,12 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
  * The largest key, in bytes as stored (a varlena with its 4-byte header).  A
  * tsvector lexeme is at most 2047 bytes (ts_type.h's MAXSTRLEN), so a key of
  * this size holds every lexeme of up to 2043; the longer ones are hashed by
- * tsvector_ops (lion_lexeme_key(), DESIGN.md §17 "Long lexemes"), and keys
- * of jsonb_contains_ops past it by that class (§42.1).  Any other key past it
- * is an ERROR.
+ * tsvector_ops (lion_lexeme_key(), DESIGN.md §17 "Long lexemes"), as are the
+ * longer text and bytea elements of array_ops, and keys of
+ * jsonb_contains_ops past it by that class (§42.1).  Any other varlena key
+ * past it is stored compressed, as a btree index tuple stores a long value
+ * (lion_key_prepare(), §4 "Long keys"), and is an ERROR only when even that
+ * does not fit.
  */
 #define LION_MAX_KEY_SIZE		2047
 #define LION_DEFAULT_INLINE_LIMIT 4096
@@ -1089,6 +1092,7 @@ typedef struct LionState
 struct LionIndexState
 {
 	LionMetaPageData meta;		/* copy of the meta page */
+	Oid			indexrelid;		/* the index, for its name in an ERROR */
 	int			ncolumns;		/* key columns, 1 .. INDEX_MAX_KEYS (§24) */
 	LionState  *cols;			/* [ncolumns]; cols[i] is key column i + 1 */
 
@@ -1348,6 +1352,24 @@ extern int	lion_lexeme_prefix_max(void);
 extern Datum lion_tsvector_extract_value(PG_FUNCTION_ARGS);
 extern Datum lion_tsvector_extract_query(PG_FUNCTION_ARGS);
 
+/*
+ * array_ops' keys (DESIGN.md §17, "Long elements"): a text, varchar or bytea
+ * element longer than LION_LEXEME_KEY_MAX bytes is filed under a hashed key
+ * as a long lexeme is, and a key of LION_LEXEME_KEY_MAX bytes is ambiguous.
+ */
+extern Datum lion_array_extract_value(PG_FUNCTION_ARGS);
+extern Datum lion_array_extract_query(PG_FUNCTION_ARGS);
+
+/*
+ * Whether a key of the column may stand for values other than itself - a
+ * hashed key of a long lexeme or array element, or a value spelled like one -
+ * and the values of a heap row's value that are filed under such a key
+ * (lion_index_facets(), which shows them in its place).
+ */
+extern bool lion_key_is_ambiguous(const LionState *state, Datum key);
+extern int	lion_ambiguous_values(LionState *state, Datum value, Datum key,
+								  Datum **values);
+
 /* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
 extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
 /* ... its extractValue, and one of its keys as text (lion_index_facets()) */
@@ -1454,6 +1476,8 @@ extern void lion_check_table_am(Relation heap);	/* ERROR if not supported */
 /* Key handling */
 extern uint32 lion_hash_key(LionState *state, Datum key);
 extern Size lion_key_datum_size(LionState *state, Datum key);	/* bytes needed to store the key */
+extern Datum lion_key_prepare(LionState *state, Datum key, Relation heap,
+							  ItemPointer tid);	/* the key as stored; ERROR if too long */
 extern void lion_store_key(LionState *state, Datum key, char *dest);
 extern Datum lion_fetch_key(LionState *state, const char *src);
 

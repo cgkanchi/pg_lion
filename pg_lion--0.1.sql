@@ -459,9 +459,9 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING lion AS
  *
  * One indexed value contributes many keys.  The extraction is GIN's: support
  * function 2 is extractValue and 3 is extractQuery, with GIN's own
- * signatures, so `ginarrayextract` and friends are named here directly, and
- * tsvector_ops names two functions that call GIN's and file a lexeme too long
- * to be a key under a hash of it.  What is NOT reused is GIN's consistent
+ * signatures, and array_ops and tsvector_ops name functions that call GIN's
+ * (`ginarrayextract` and friends) and file an element or a lexeme too long to
+ * be a key under a hash of it.  What is NOT reused is GIN's consistent
  * function - a roaring scan combines whole posting sets instead of testing
  * one row at a time - so the strategy numbers and what they mean are the
  * roaring AM's own:
@@ -477,12 +477,23 @@ CREATE OPERATOR CLASS enum_ops DEFAULT FOR TYPE anyenum USING lion AS
  * gin_cmp_tslexeme() does too.
  * --------------------------------------------------------------------- */
 
+/*
+ * Support functions 2 and 3 are ginarrayextract() and ginqueryarrayextract()
+ * with each text, varchar or bytea element longer than 2043 bytes, which no
+ * key can hold, replaced by its first bytes and its SHA-256 (DESIGN.md §17,
+ * "Long elements"); a query that names one is rechecked.
+ */
+CREATE FUNCTION lion_array_extract_value(anyarray, internal, internal)
+	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+CREATE FUNCTION lion_array_extract_query(anyarray, internal, int2, internal, internal, internal, internal)
+	RETURNS internal AS 'MODULE_PATHNAME' LANGUAGE C IMMUTABLE STRICT PARALLEL SAFE;
+
 CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
 	OPERATOR	2	@> (anyarray, anyarray),
 	OPERATOR	3	&& (anyarray, anyarray),
 	OPERATOR	4	<@ (anyarray, anyarray),
-	FUNCTION	2	ginarrayextract(anyarray, internal, internal),
-	FUNCTION	3	ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
+	FUNCTION	2	lion_array_extract_value(anyarray, internal, internal),
+	FUNCTION	3	lion_array_extract_query(anyarray, internal, int2, internal, internal, internal, internal),
 	STORAGE		anyelement;
 
 /*
