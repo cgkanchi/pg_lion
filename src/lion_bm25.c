@@ -66,6 +66,7 @@
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "pgstat.h"
 #include "tsearch/ts_type.h"
 #include "tsearch/ts_utils.h"
 #include "utils/hsearch.h"
@@ -832,6 +833,15 @@ lion_bm25(PG_FUNCTION_ARGS)
 	}
 
 out:
+	/*
+	 * A scan of the index (pg_stat_user_indexes): the rows its walks gave,
+	 * and those found in the heap and returned, as an index scan counts the
+	 * ones it fetches.
+	 */
+	pgstat_count_index_scan(index);
+	pgstat_count_index_tuples(index, seen);
+	if (emitted > 0 && pgstat_should_count_relation(index))
+		index->pgstat_info->counts.tuples_fetched += emitted;
 	index_close(index, AccessShareLock);
 	table_close(heap, AccessShareLock);
 	return (Datum) 0;
@@ -900,6 +910,8 @@ lion_bm25_score(PG_FUNCTION_ARGS)
 		old = MemoryContextSwitchTo(cache->cxt);
 		index = lion_reader_open(indexoid, LION_READ_STATS, NULL, "score",
 								 NULL);
+		/* a read of the index's statistics, once per call site and query */
+		pgstat_count_index_scan(index);
 		cache->valid = lion_bm25_prepare(index, query, k1, b, &cache->q);
 		cache->q.index = NULL;
 		cache->q.col = NULL;

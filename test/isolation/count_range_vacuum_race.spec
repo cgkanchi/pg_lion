@@ -86,7 +86,8 @@ setup
 	SET pg_lion.enable_count_pushdown = on;
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-count-containers-pinned', 'wait');
 }

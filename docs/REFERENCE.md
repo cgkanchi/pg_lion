@@ -565,7 +565,8 @@ working around a bad choice:
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
-  also take away B-tree index scans. The count pushdown and `LionOrdered` still use Lion indexes.
+  also take away B-tree index scans and every Lion path below. The count pushdown and `LionOrdered`
+  still use Lion indexes.
 - `pg_lion.enable_intersection_probe`: let Lion measure, at plan time, how many rows the AND of
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
@@ -585,6 +586,21 @@ working around a bad choice:
   expression), while the table holds within a factor of 2 of the rows the count was taken over, and
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
+
+PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
+stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`
+before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` on 18 shows it
+`Disabled: true` when it is. Lion's own switches above still take a path out altogether.
+
+| PostgreSQL setting | the Lion paths it disables |
+|---|---|
+| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
+| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin` and `LionAntiJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled |
+| `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
+
+`LionOrdered`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan does, and so answer to
+`enable_indexscan` alone. To have the planner prefer Lion's paths without disabling PostgreSQL's,
+set `pg_lion.pushdown_margin` above 1 (below).
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
@@ -661,9 +677,11 @@ is decided before, in its own units. Set a rate to 1 to price Lion as fitted aga
 plan; `SET client_min_messages = debug2` logs which kind each path was priced against, at which
 rate and margin. A plan forced with PostgreSQL's `enable_*` settings, with nothing of PostgreSQL's
 left enabled to compete with, is priced in Lion's own units. To read Lion's own cost units a
-millisecond when calibrating the cost settings above, force its plans that way, or set every rate
-below to 1. `bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the
-planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
+millisecond when calibrating the cost settings above, force its plans that way - `enable_seqscan`
+and `enable_bitmapscan` off, and `pg_lion.enable_plain_scan`, which leave Lion's paths enabled, on
+a table with no other index - or set every rate below to 1. `bench/calib/matrix.py` measures each
+kind of plan's units a millisecond, and the planner's mispicks, on synthetic tables (DESIGN.md §39,
+"The matrix").
 
 | `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
 |---|---|---|
@@ -673,16 +691,20 @@ planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `mergejoin_rate` | 1.0 | a merge join |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
 
-`pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
-custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`) must be
-priced at to be chosen. Set below 1, its own price is divided by it, so a near tie goes to
-PostgreSQL's plan, and its cost in `EXPLAIN` is marked up by it. It tips `LionBtreeScan` against
+`pg_lion.pushdown_margin` (1, no margin; 0.01 to 1000): the share of the cheapest competing plan's
+cost a Lion custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`,
+`LionBtreeScan`) must be priced at to be chosen. Its own price is divided by it: set below 1, a near
+tie goes to PostgreSQL's plan, and its cost in `EXPLAIN` is marked up by it; set above 1, a Lion
+path is chosen up to that many times dearer than PostgreSQL's plan, and at 1000 wherever it is
+offered, which forces Lion's paths without disabling PostgreSQL's (above), and marks its cost in
+`EXPLAIN` down. It tips `LionBtreeScan` against
 the sequential scan the same way: the covering walk's marked-up price must beat the sequential
 scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
 access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
-is a generic plan's parameter (priced at its dearest already). PostgreSQL's `enable_*` settings and Lion's
-switches above still force a plan either way.
+is a generic plan's parameter (priced at its dearest already). A path disabled by PostgreSQL's
+`enable_*` settings (above) loses to an enabled one, and Lion's switches leave theirs out, whatever
+the margin.
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
 standard deviations (DESIGN.md §44.8). A row of the partitions a scan reads is missed only when its
@@ -825,6 +847,30 @@ them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and So
 ANALYZE`). In index-only mode the switch is also held back while the walk meets members at the rate
 a uniform spread predicts, since there it would read heap pages the walk never touches (DESIGN.md
 §40.4). A large value keeps a walk from switching at all.
+
+## Monitoring
+
+Lion's custom scans and SQL functions keep PostgreSQL's index usage statistics, `pg_stat_user_indexes`
+and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "Statistics"):
+
+- `idx_scan` and `last_idx_scan`: a scan of each index a node or function reads, each time it reads
+  it, a rescan with another parameter included: `LionCount` in all its forms, `LionSemiJoin`,
+  `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`, `LionBm25`, `lion_index_count()`,
+  `lion_index_count_any()`, `lion_index_count_group_stats()`, `lion_index_facets()`, `lion_bm25()`,
+  and `lion_bm25_score()`, which reads the index's statistics once a query. The B-tree that
+  `LionOrdered` or `LionBtreeScan` walks is counted by PostgreSQL, as its own scans are. A
+  partitioned table's partitions count their own indexes.
+- `idx_tup_read`: the rows an index gave. A count credits each index it read with the rows it
+  counted (a `count(DISTINCT)` with the distinct values, `lion_index_facets()` with the rows of the
+  keys it counted), a semi or anti join with the rows it returns; `LionOrdered` and `LionBtreeScan` credit the
+  members of the set they built from each Lion index and the entries a walk of a Lion column read,
+  `LionBm25` and `lion_bm25()` the entries of the query's words they took.
+- `idx_tup_fetch`: the table rows an index scan fetched itself - `LionOrdered`'s walk of a Lion
+  column, the rows `LionBm25` and `lion_bm25()` return - on the index and the table; and, on the
+  table only, as a bitmap heap scan's are, the rows a count rechecked on pages not all-visible or
+  for a residual clause, and those `LionOrdered` fetched by its set's TIDs.
+- In `pg_stat_user_tables`, a table's `idx_scan` is the sum of its indexes', and its
+  `idx_tup_fetch` adds its own fetches to theirs; no Lion node counts a `seq_scan`.
 
 ## Known limitations
 

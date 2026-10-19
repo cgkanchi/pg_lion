@@ -1388,6 +1388,7 @@ extern void lion_count_open_indexes(Snapshot snapshot, int nidx,
 									AttrNumber wantcol, bool multikey_ok,
 									LionCountCall *call);
 extern void lion_count_sql_close(LionCountCall *call);
+extern void lion_count_sql_report(LionCountCall *call, int64 rows);
 
 /*
  * EXECUTE on every function an expression calls, as the executor asks it

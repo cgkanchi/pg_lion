@@ -2322,6 +2322,14 @@ lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
 	cp->custom_paths = NIL;
 	cp->custom_private = priv;
 	cp->methods = methods;
+
+	/*
+	 * A walk of an index, as an index scan or an index-only scan is: core's
+	 * enable_indexscan disables it, and enable_indexonlyscan has taken the
+	 * index-only modes away already (lo_index_only()), as indxpath.c takes
+	 * core's.
+	 */
+	lion_path_core_switches(&cp->path, LION_CORE_INDEXSCAN);
 	add_path(rel, &cp->path);
 }
 
@@ -4105,6 +4113,7 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 	LionTidSet *set = lo_set_new(st);
 	LionSource *src;
 	const LionContainer *c;
+	int64		ntids = 0;
 
 	src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, false,
 						   st->buildcxt);
@@ -4118,6 +4127,7 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 			CHECK_FOR_INTERRUPTS();
 			if (c->cardinality == 0)
 				continue;
+			ntids += c->cardinality;
 			if (set->n > 0 && c->ckey == set->keys[set->n - 1])
 				lo_set_or_last(st, set, c);
 			else if (set->n > 0 && c->ckey < set->keys[set->n - 1])
@@ -4134,12 +4144,15 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 		while ((c = lion_source_next(src)) != NULL)
 		{
 			CHECK_FOR_INTERRUPTS();
+			ntids += c->cardinality;
 			if (c->cardinality > 0)
 				lo_gather_push(st, g, c);
 		}
 		lo_gather_finish(st, g, set);
 	}
 	lion_source_close(src);
+	/* the TIDs the index gave, as a bitmap index scan counts them */
+	pgstat_count_index_tuples(leaf->index, ntids);
 	return set;
 }
 
@@ -4490,6 +4503,7 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 
 			if (c == NULL)
 				return NULL;
+			pgstat_count_index_tuples(leaf->index, c->cardinality);
 			if (acc == NULL)
 			{
 				acc = lo_probe_copy(st, c);
@@ -5046,8 +5060,13 @@ static ItemPointer
 lo_next_tid(LionOrderedState *st)
 {
 	if (st->lionwalk)
-		return lion_order_walk_next(st->owalk, &st->walktid) ?
-			&st->walktid : NULL;
+	{
+		if (!lion_order_walk_next(st->owalk, &st->walktid))
+			return NULL;
+		/* the btree's are counted by index_getnext_tid(), as for any scan */
+		pgstat_count_index_tuples(st->ordidx, 1);
+		return &st->walktid;
+	}
 #if PG_VERSION_NUM >= 200000
 	if (!tableam_index_getnext_tid(st->scan, st->dir))
 		return NULL;
@@ -5099,18 +5118,22 @@ lo_fetch_walk(LionOrderedState *st, TupleTableSlot *slot)
 	Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
 	ItemPointerData tid = st->walktid;
 	bool		all_dead = false;
+	bool		found;
 #if PG_VERSION_NUM >= 200000
 	Relation	heap = st->css.ss.ss_currentRelation;
 
-	if (!table_fetch_tid(heap, &tid, snapshot, &all_dead))
-		return false;
-	return table_tuple_fetch_row_version(heap, &tid, snapshot, slot);
+	found = table_fetch_tid(heap, &tid, snapshot, &all_dead) &&
+		table_tuple_fetch_row_version(heap, &tid, snapshot, slot);
 #else
 	bool		call_again = false;
 
-	return table_index_fetch_tuple(st->fetch, &tid, snapshot, slot,
-								   &call_again, &all_dead);
+	found = table_index_fetch_tuple(st->fetch, &tid, snapshot, slot,
+									&call_again, &all_dead);
 #endif
+	/* as index_fetch_heap() counts the rows an index scan fetches */
+	if (found)
+		pgstat_count_heap_fetch(st->ordidx);
+	return found;
 }
 
 static bool
@@ -5495,6 +5518,8 @@ lo_switch(LionOrderedState *st)
 			if (!lion_table_fetch_tid(heap, &tid, snapshot, &all_dead) ||
 				!table_tuple_fetch_row_version(heap, &tid, snapshot, fslot))
 				continue;
+			/* rows fetched by the set's TIDs, as a bitmap heap scan's are */
+			pgstat_count_heap_fetch(heap);
 			if (!st->indexonly)
 				st->fetched++;
 			if (fslot != slot)
