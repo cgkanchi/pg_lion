@@ -317,9 +317,6 @@ SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE tag =
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 SET pg_lion.vector_exact_rows = 5000;
--- (by the set: the exact path is the set's, and here the filter at the
--- fetch, which has none and probes all 20 partitions, is the cheaper)
-SET pg_lion.vector_restrict = set;
 SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM hv WHERE cat <> 5
@@ -330,7 +327,6 @@ RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
 SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE cat <> 5
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
-RESET pg_lion.vector_restrict;
 RESET pg_lion.vector_exact_rows;
 RESET pg_lion.vector_exact_per_partition;
 
