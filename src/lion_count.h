@@ -450,12 +450,13 @@ typedef struct LionCountSource
 	/*
 	 * A RANGE on a column that does not drive the count, taken as a source
 	 * (DESIGN.md §32, "A range as a source") that was too large to collect
-	 * into memory: the rows whose key lies in the range, which the caller
-	 * counts as the SUM over the sets a walk of the range hands out - disjoint
-	 * entries and summaries of one scalar column - each ANDed with the other
-	 * sources in its place.  The count functions below never take one; the
-	 * count pushdown, which defines the structure, expands it before it calls
-	 * them (lion_node_count()).
+	 * into memory, in a plan that walks those (LION_FLAG_RANGEWALK) rather
+	 * than collect them in windows: the rows whose key lies in the range,
+	 * which the caller counts as the SUM over the sets a walk of the range
+	 * hands out - disjoint entries and summaries of one scalar column - each
+	 * ANDed with the other sources in its place.  The count functions below
+	 * never take one; the count pushdown, which defines the structure,
+	 * expands it before it calls them (lion_node_count()).
 	 */
 	struct LionRangeSource *rangewalk;
 
@@ -953,6 +954,14 @@ extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
 #define LION_RANGE_UNION_PEND_MIN	32
 
 /*
+ * The least memory a window of a range collected into a temporary file has
+ * (lion_range_collect()), whatever is left of the caller's: several bitsets,
+ * so that a window always keeps some keys and gets on - and what the planner
+ * sizes the windows by when less is left (lion_cost_range_source()).
+ */
+#define LION_RANGE_WINDOW_MIN		(32 * 1024)
+
+/*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, collected in memory.  Like a
@@ -980,6 +989,15 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
 								Size maxbytes, bool spill, LionPostingSet *out,
 								Size *held, bool *spilled, int64 *nsets,
 								int64 *nsummaries);
+
+/*
+ * Send a range's set collected in memory to a temporary file of its own, in
+ * place - every copy of the LionPostingSet that names it reads it there from
+ * then on - and give back the memory its union took: *held, what the
+ * relation's ranges hold, loses what the set took and gains what it holds
+ * now, which is what a set collected in windows holds (lion_range_collect()).
+ */
+extern void lion_range_spill_set(struct LionMatSet *mat, Size *held);
 
 /*
  * A summed range PROBED at the rows of the other sources F (DESIGN.md §32,

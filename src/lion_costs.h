@@ -50,6 +50,7 @@ extern PGDLLIMPORT double lion_range_entry_cost;
 extern PGDLLIMPORT double lion_range_union_entry_cost;
 extern PGDLLIMPORT double lion_probe_step_cost;
 extern PGDLLIMPORT double lion_range_fold_cost;
+extern PGDLLIMPORT double lion_spill_read_cost;
 
 /* The FK-side join (§27) */
 extern PGDLLIMPORT double lion_fkjoin_count_cost;

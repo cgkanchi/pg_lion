@@ -431,7 +431,11 @@ values), which is where ranges are slow.  Every insert into a summarized column 
 bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
 are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
 A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
-g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
+g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk -
+within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by the table's ranges:
+one that does not fit what the others left sends those to temporary files first) and past it in
+windows into a temporary file (`Range Sources Spilled` in `EXPLAIN ANALYZE`), or, where there are
+few counts and the planner finds it cheaper, walked again at each (`Range Sources Walked`).
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -594,6 +598,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
 | `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
+| `spill_read_cost` | 27 | `cpu_operator_cost` | a container a count reads back from a set spilled to a temporary file: a range collected as a source, the FK-side join's copy of its fact filters |
 | `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
 | `fkjoin_row_cost` | 20 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 10 | `cpu_operator_cost` | a probe of such a count into a fact filter |
