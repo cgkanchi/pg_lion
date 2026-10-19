@@ -287,9 +287,10 @@ SELECT lion_ord('SELECT id, k FROM lo WHERE c200 = 16 AND c2 = 0 ORDER BY k, id 
 SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 50');
 ANALYZE lo;
 
--- 10. A set that outgrows hash_mem at run time degrades to container keys
---     and rechecks every member: planned at 64MB (a generic plan keeps it),
---     run at 64kB.  Half of lo's rows, 49 to a page, is 32 NARROWs of
+-- 10. A set that outgrows hash_mem at run time spills to a temporary file
+--     mapped into memory and stays exact (DESIGN.md §30.4, "Spilling"):
+--     planned at 64MB (a generic plan keeps it), run at 64kB; a sorted
+--     source's containers.  Half of lo's rows, 49 to a page, is 32 NARROWs of
 --     width 1 (DESIGN.md §38), 17 kB, which 64kB holds; half of lon's 400000
 --     rows, 65 to a page, is 97 NARROWs of width 2, 1 kB each, which it
 --     does not.  (The pad puts the rows just past the 63 offsets of a
@@ -315,7 +316,7 @@ RESET enable_seqscan; RESET enable_bitmapscan;
 RESET enable_indexscan; RESET enable_indexonlyscan;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
--- the set built, as it always was before the lazy one (§30.4): it degrades
+-- the set built, as it always was before the lazy one (§30.4): it spills
 SET pg_lion.enable_lazy_set = off;
 SELECT * FROM lion_ord_run('EXECUTE lo_big(1)');
 SELECT lion_ord('EXECUTE lo_big(1)',
