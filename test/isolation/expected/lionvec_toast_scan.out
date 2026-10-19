@@ -98,7 +98,7 @@ rows|distinct_rows|new_rows
 (1 row)
 
 
-starting permutation: s1_open s2_delete s2_vacuum s2_insert s1_drain s1_check s3_whole
+starting permutation: s1_open s2_delete s2_vacuum s2_insert s1_drain s1_check s1_commit s3_whole
 injection_points_set_local
 --------------------------
                           
@@ -138,15 +138,15 @@ step s1_check:
 	  FROM lvt_got g
 	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvt_vec(-3, 0.2), id) AS n, id
 			  FROM lvt) s USING (n);
-	COMMIT;
 
-s1: DEBUG:  lionvec scan of "lvt_v": 4 partitions probed, 2 passes, 979 candidates, 698 refined, 698 fetched, 600 returned, 0 skipped out of order, 0 bounds missed, 74 pages read, 0 pauses, 979 copies skipped, 600 read by place (0 locator pages, 0 not), 604 checked
-s1: DEBUG:  lionvec scan of "lvt_v": 698 members fetched, 600 returned, 600 read by place (0 locator pages, 0 not), 604 checked
 rows|distinct_rows|sort_order|deleted_since
 ----+-------------+----------+-------------
  600|          600|t         |           86
 (1 row)
 
+s1: DEBUG:  lionvec scan of "lvt_v": 4 partitions probed, 2 passes, 979 candidates, 698 refined, 698 fetched, 600 returned, 0 skipped out of order, 0 bounds missed, 74 pages read, 0 pauses, 979 copies skipped, 600 read by place (0 locator pages, 0 not), 604 checked
+s1: DEBUG:  lionvec scan of "lvt_v": 698 members fetched, 600 returned, 600 read by place (0 locator pages, 0 not), 604 checked
+step s1_commit: COMMIT;
 step s3_whole: 
 	SELECT count(*) AS rows, count(DISTINCT id) AS distinct_rows,
 		   count(*) FILTER (WHERE id > 5000) AS new_rows
