@@ -70,8 +70,11 @@ Optionally, preload the library to get lion's own WAL format, which makes insert
 shared_preload_libraries = 'pg_lion'
 ```
 
-Indexes work either way. See [Reloptions → `wal_mode`](docs/REFERENCE.md#reloptions) for the
-details and the one thing to know before you turn it on.
+Indexes work either way, but an index built while the library is preloaded is written in Lion's
+format from then on, and needs the preload for as long as it exists: without it, inserts and
+updates into its table fail, and so does VACUUM (autovacuum too), so dead rows pile up. To stop
+preloading it, first REINDEX each such index with `wal_mode = generic`. See
+[Reloptions → `wal_mode`](docs/REFERENCE.md#reloptions) for the details.
 
 ## A quick tour
 

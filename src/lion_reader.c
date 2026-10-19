@@ -58,6 +58,7 @@
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include "lion.h"
 #include "lion_count.h"
@@ -134,6 +135,7 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_TABLE),
 				 errmsg("relation with OID %u does not exist", indexoid)));
+	lion_refuse_partitioned_index(indexoid);
 	if (get_rel_relkind(indexoid) != RELKIND_INDEX)
 		ereport(ERROR,
 				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -385,4 +387,65 @@ lion_writer_check(Relation index, Buffer leafbuf, OffsetNumber off,
 			target = lion_entry_head(entry);
 	}
 	CheckForSerializableConflictIn(index, NULL, target);
+}
+
+/*
+ * The name of relid when it is a partitioned index, palloc'd, and NULL
+ * otherwise; *islion says whether it is a lion one.  Such an index is only
+ * the definition its partitions' indexes are made from: it has no storage,
+ * and every function that reads an index reads one partition's.
+ */
+static char *
+lion_partitioned_index_name(Oid relid, bool *islion)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	char	   *name = NULL;
+
+	*islion = false;
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+
+		if (form->relkind == RELKIND_PARTITIONED_INDEX)
+		{
+			name = pstrdup(NameStr(form->relname));
+			*islion = form->relam == lion_get_am_oid();
+		}
+		ReleaseSysCache(tp);
+	}
+	return name;
+}
+
+/* Is relid a partitioned lion index (above)? */
+bool
+lion_is_partitioned_index(Oid relid)
+{
+	bool		islion;
+
+	return lion_partitioned_index_name(relid, &islion) != NULL && islion;
+}
+
+/*
+ * ERROR when relid is a partitioned index (above), saying what it is: left
+ * to the checks for an index, one would be called "not an index", which \d
+ * contradicts.  One of another method is not a lion index, as its
+ * partitions' indexes are not.
+ */
+void
+lion_refuse_partitioned_index(Oid relid)
+{
+	bool		islion;
+	char	   *name = lion_partitioned_index_name(relid, &islion);
+
+	if (name == NULL)
+		return;
+	if (!islion)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("index \"%s\" is not a lion index", name)));
+	ereport(ERROR,
+			(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+			 errmsg("\"%s\" is a partitioned index", name),
+			 errdetail("A partitioned index has no storage: each partition's index holds the entries of its rows."),
+			 errhint("Pass the index of one of its partitions.")));
 }

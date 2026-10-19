@@ -1087,7 +1087,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
         -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
-    (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
+    (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
 
@@ -1689,27 +1689,44 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
      partition. `lion_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
      for tests: same entry scan, one count per group, one cache.
 
-SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
-whose keys are of two unrelated polymorphic types because each is compared with its own index's
-column and the two columns need not share a type. Both open the heap via IndexGetRelation with
-AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
+SQL surface for tests: `lion_index_count(idx regclass, key "any") RETURNS bigint` and
+`lion_index_count(idx1 regclass, key1 "any", idx2 regclass, key2 "any") RETURNS bigint`, whose
+keys are each compared with its own index's column, and the two columns need not share a type. The
+keys are `"any"`, not polymorphic, so that an untyped literal arrives as one (`unknown`, which a
+polymorphic argument refuses), as it would in `col = 'abc'`. Both open the heap via IndexGetRelation
+with AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
 SELECT.
-**The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
-review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
-DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
-indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
+**The key is taken as `col = key` would take it.** A key whose own type the column's opclass takes
+is looked up as that type (`lion_count_key_type()`, below). Any other key is first CONVERTED as the
+query converts it (`lion_count_coerce_key()`): the parser's own `make_op()` (`make_scalar_array_op()`
+for `lion_index_count_any()`'s `col = ANY (keys)`) resolves the operator named as the index's
+equality is named - `=`, or a class's own `====` - for (the column's type, the key's type) and
+coerces the key to its input, an untyped literal through the column's input function, `1` to numeric
+on a numeric column, a numeric `0.1` to float8 on a float4 one; the coercion is evaluated once, its
+cast functions checked for EXECUTE as the executor checks the query's. The count is made only where
+the operator the parser picked is the index's equality - strategy 1 of the key column's family with
+the column's type on its left - and the column reaches it unconverted, relabelled at most. Then the
+count is the query's: `f4 = 0.1` is `float4 = float8`, which no float4 value satisfies, and the
+count is 0 as the query is, where rounding the key to float4 would have counted the rows of 0.1::float4.
+Otherwise the query compares something the index does not hold - `intcol = 1.5` is `numeric =
+numeric` on `intcol::numeric`, `bpcharcol = 'x'::text` is `text = text` on the column cast by
+rtrim1() - and the count is an ERROR whose hint says to cast the key to the column's type, never a
+number made another way (1.5 cast to integer would count the rows of 2). A key no operator takes is
+refused as the query would refuse it.
+*The key's own type* is resolved by `lion_count_key_type()` (2026-09-25 review; before it the key had
+to BE the index's opcintype or have a cross-type member, so enum_ops, a DEFAULT class, could not be
+counted at all and neither could a varchar key on the varchar column it indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
 the column's actual type and nothing else: a different enum would pass for "an enum", and its OIDs
 mean nothing to this column (the DETAIL names the column's type, not anyenum). Otherwise the key is
 of the class's own type, or of a type the family has a strategy-1 member for with it (int8 on int4:
 `int48eq`, which §21's probe resolves further), or - lacking one - BINARY-coercible to the class's
 type where the parser makes that coercion itself: its `=` for (column type, key type) must be the
 class's own (opcintype, opcintype) operator reached without a cast function (`compatible_oper()`),
-as for varchar on text_ops, which the parser relabels to call `texteq`. A cast function is never
-taken (§21), and a coercion merely existing is not enough: text is binary-coercible to bpchar, but
-`bpcharcol = 'x '::text` is `text = text` on the column cast by rtrim1(), and matches none of the
-rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
-the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
+as for varchar on text_ops, which the parser relabels to call `texteq`. A coercion merely existing
+is not enough: text is binary-coercible to bpchar, but `bpcharcol = 'x '::text` is `text = text` on
+the column cast by rtrim1(), and matches none of the rows bpchar's own equality would count. A key
+of any other type goes through the conversion above. The resolved type is what the lookup is made as
+and what the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
 `lion_index_count_any()` resolves its array's element type the same way.
 **So is its collation** (`lion_count_check_collation()`, 2026-09-28 review; the functions used to
 look every key up under the index's collation whatever the call said). The index hashed and
@@ -1744,15 +1761,11 @@ nothing changed. A key taken from a column brings that column's collation and is
 `test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
 and is skipped without them (`countcoll_1.out`), as it is on CI's source builds;
 `test/sql/countcoll_default.sql` the default collation's key, likewise.
-**A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
-STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
-argument - a NULL constant folds the call away when the query is planned - so no count is made,
-nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding
-what a keyless count checks, and the query it would stand for does not settle it: the planner folds
-`col = NULL` to a constant-false filter, so that query reads no index, calls no equality and never
-asks whether a materialized view is populated.
-A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
-0; a NULL array is a NULL argument.
+**A NULL key counts 0**, as `count(*) WHERE col = NULL` does: the functions are not STRICT. The
+key's type is resolved and every check a key gets is made - the index, the type, the collation, the
+privileges - and then no lookup: `col = NULL` selects no row. A NULL index names no index and
+answers NULL. A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY
+(...)`, and counts 0, and so does a NULL array.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
 entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized
@@ -4919,7 +4932,7 @@ segments, VACUUM, the visibility-map interlock - is unchanged.
     proc 3   GIN extractQuery(query, &nkeys, strategy, &pmatch, &extra_data, &nullFlags,
                               &searchMode) -> Datum *keys
 
-    strategies   1 =      2 @>      3 &&      4 <@      5 @@
+    strategies   1 =      2 @>      3 &&      4 <@      5 @@      17 array =      18 @@@
 
 The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
 
@@ -4927,12 +4940,14 @@ The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
         OPERATOR 2 @> (anyarray, anyarray),
         OPERATOR 3 && (anyarray, anyarray),
         OPERATOR 4 <@ (anyarray, anyarray),
+        OPERATOR 17 = (anyarray, anyarray),
         FUNCTION 2 ginarrayextract(anyarray, internal, internal),
         FUNCTION 3 ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
         STORAGE  anyelement;
 
     CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
         OPERATOR 5 @@ (tsvector, tsquery),
+        OPERATOR 18 @@@ (tsvector, tsquery),
         FUNCTION 1 hashtext(text),
         FUNCTION 2 lion_tsvector_extract_value(tsvector, internal, internal),
         FUNCTION 3 lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal),
@@ -4957,15 +4972,27 @@ Two consequences of borrowing GIN's functions, both binding on any future multi-
   extraction answers for the wrong operator and returns INCLUDE_EMPTY, which only costs a rechecking
   full scan - so it is one function with one switch.
 
+Array `=` (strategy 17) and `@@@` (18) are there because GIN's classes have them, so a query that
+uses them can use the index.  `a = q` holds only where a has every element of q, so it is the AND of
+those elements' posting sets, as for `@>`, and the bitmap heap scan's recheck decides the rest - how
+often each element occurs, their order, the dimensions and lower bounds; a NULL element of q is left
+out of the AND, and an empty q is every row (ginqueryarrayextract()'s INCLUDE_EMPTY).  It is never
+exact, so `lion_extract_query()` gives it no tree and only the superset answers it.  `@@@` is `@@`
+under its deprecated name: `LION_STRAT_CANONICAL()` turns 18 into 5 at rescan and wherever a
+strategy reaches the extraction.  Neither is in `LION_STRAT_IS_MULTI()`, so the count pushdown,
+facets and the planner's probe decline them and the AM's bitmap and index scans answer them, as GIN's
+do.
+
 `lionvalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
 (T) -> int4, strategy 1 only, every operator's types hashable by the family).  An opclass is
 multi-key iff the family has proc 2 for (opcintype, opcintype); then procs 2 and 3 must have GIN's
-signatures, every operator's strategy must be in {2,3,4,5}, and proc 1 is required unless
+signatures, every operator's strategy must be a multi-key one (2 to 5, jsonb's 11 to 16, 17 or 18),
+and proc 1 is required unless
 `opckeytype` is polymorphic.  The "every type an operator mentions must be hashable" rule does not
 apply to a multi-key family, whose operators mention anyarray and tsquery and whose hashing is of
 keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing but equality
-operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
-is never asked about two members of the same roaring family that disagree.
+operators and a multi-key one at most one, array_ops' `=`, so `equality_ops_are_compatible()` is
+never asked about two members of the same roaring family that disagree.
 
 ### Key type resolution (`lion_fill_state`, lion_state.c)
 
@@ -4983,7 +5010,17 @@ descriptor is the same answer for every class, needs no polymorphism handling of
   because lexemes are byte strings and GIN's own `gin_cmp_tslexeme()` compares them bytewise.
 - Hash: support proc 1 when the opclass has one, else the key type's default hash opclass through
   `lookup_type_cache(TYPECACHE_HASH_PROC_FINFO)` - which is how GIN's `initGinState()` resolves its
-  comparison function for a polymorphic key type.  ERROR when the type has no hash opclass.
+  comparison function for a polymorphic key type.  A key type with a default btree opclass and no
+  hash one - money, bit, varbit, tsvector, tsquery, all of which GIN's array_ops takes - is hashed
+  by `lion_image_hash()` (`LionState.imagehash`): the hash of the stored image (`hash_bytes()` over
+  what `datum_image_eq()` compares) where the btree class's equalimage proc says equal values are
+  stored alike (money, bit, varbit), and 0 for every key where it does not (tsvector, tsquery). A
+  hash only has to agree with equality: no entry stores one, and such a column is ORDERED by the
+  btree comparison (rule 2 of §21 holds: its equality is the btree class's), which the hash only
+  breaks ties of, so a constant costs nothing there; the dedup of a row's keys and the facet table
+  fall back on the comparison and the equality the same way.  A column that should come out
+  unordered all the same is an ERROR, and so is a key type with neither class, as GIN needs a btree
+  one.
 - Equality: strategy 1 of the opfamily for a scalar opclass; for a multi-key one the key type's
   default equality (`TYPECACHE_EQ_OPR_FINFO`), because the family's strategies are about the indexed
   value and not about two keys.  The two always agree: a type's default hash opclass hashes what its
@@ -5615,15 +5652,14 @@ float from either, bit for bit, as an incremental sort over the scan's order nee
 `LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
 whose query's first pathkey is `lion_bm25_score(col, Const, Const, Const, Const) DESC`, the index a
 lion index on that table storing positions for `col`. The order is claimed only when the walk's
-candidates hold every row the scan may return, so a restriction `col @@ q2` must be there with:
-
-- q2's lexemes not under a NOT all among the scored query's, and no prefix in q2;
-- an empty document not matching q2.
-
-A tsquery is monotone in its operands once its NOTs are pushed down to them, so a row with none of
-q2's positive lexemes evaluates no higher than the empty document, and fails q2. Every row that
-passes therefore has a scored lexeme and is a candidate. The usual query has the same q in both
-places.
+candidates hold every row the scan may return, so a restriction `col @@ q2` must be there that no
+document without the scored lexemes matches. `lion_bm25_where_covered()` evaluates q2 with
+`TS_execute()` in ternary logic: each scored lexeme is absent, and every other operand - another
+lexeme, a prefix - is unknown. q2 is covered when the answer is no whatever the unknowns are, NOTs
+and phrases included. Every row that passes it therefore has a scored lexeme and is a candidate.
+The usual query has the same q in both places, or a narrower q2: `'w1 & w2'`, `'w1 & !w9'` or
+`'w9 <-> w1'` under a score of `'w1'`. Not `'w1 | w2'`, `'w9 & !w1'` or a bare prefix, which a row
+without `w1` can match.
 
 The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 16, or 64 when the
 LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and
@@ -9083,6 +9119,12 @@ insert no record at all, so that nothing about them needs the manager
 (2026-09-27 review: they used to be refused all the same). REINDEX is what
 changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
+
+A VACUUM that has dead entries to remove from such an index is a write too, and stops at its first
+one with the same error - autovacuum included, every time it comes back to the table, so the table's
+dead rows accumulate while the error shows only in the server log. The hint names both ways out:
+the preload, or REINDEX with `wal_mode = generic` (which `auto` also gives on a server without the
+preload). `test/recovery/run.sh` phase 1f checks the insert, the VACUUM and the REINDEX.
 
 **VACUUM is the one path that could write without `lion_wal_begin()`**
 (2026-09-25 review): the standby barrier's stand-alone VACUUM_VISIT record is
@@ -18654,7 +18696,7 @@ and 16 buffers. Any other filter on the walked column alone - `s LIKE 'p1%'`, `l
 `k % 7 = 3`, `n IS NULL OR n > 4` - is decided once per ENTRY (`lo_walk_value_rinfos()`): when the
 index's stored keys are the rows' own values byte for byte (`lion_index_can_emit_value()`, the
 value-representation rule of §10), every row of an entry holds one value, so a clause that reads
-no other column and calls nothing volatile is true of all of them or of none. The first VISIBLE row
+no other column and is immutable is true of all of them or of none. The first VISIBLE row
 the walk fetches of an entry decides for the entry; one that fails takes the rest of it with it,
 unread (`lion_order_walk_skip_entry()`). EXPLAIN shows the clauses as `Filter per Value` and ANALYZE
 counts `Lion Keys Filtered`; they stay in the node's filter too.
@@ -18664,7 +18706,10 @@ DEAD row's, so a function the query never calls on a visible row would be called
 3` with `k = 0` only in deleted rows raised a division by zero the ordinary plan does not. Only
 leakproof functions promise not to, and those are the comparisons the walk's bounds answer already.
 And over a type whose equal values may differ - numeric's 1.0 and 1.00 are one entry - the
-representative is not every row's value, which the image rule excludes. The price
+representative is not every row's value, which the image rule excludes. Non-volatile is not enough
+either: a stable function may read how a row stores its value rather than the value, and
+`pg_column_size(s) > 1000`, `pg_column_compression(s) IS NULL` differ between two rows of one value,
+one compressed and one not, so the first row would decide wrongly for the rest. Hence immutable. The price
 (`lo_cost_walk()`): of the entries the filter rejects, the walk reads the TIDs up to the first
 member and fetches it; of the rest, everything.
 

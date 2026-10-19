@@ -21,16 +21,22 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_posting_root(idx, key)               a key's posting-set head block (the root, or the first leaf), for tests
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
-and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
+and take the key as `col = key` takes it: the same operator, and the key converted as the query
+converts it - an untyped literal (`lion_index_count('idx', 'abc')`, `lion_index_count_any('idx',
+'{1,2}')`) as the column's type, `1` to numeric on a numeric column, `0.1` to float8 on a float4 one
+(where, as in the query, no float4 value equals it). Where the query would convert the column
+instead - `intcol = 1.5` compares `intcol::numeric` - the count is an error that says to cast the
+key to the column's type. A NULL key, or a NULL array, counts 0, as `col = NULL` selects no row; a
+NULL index answers NULL. The counts ask for what the query would: SELECT on the table or its indexed columns, and no row-level security in
 force for the caller.  A count under a collation the index does not compare in is an error, never
 a different number; on a column of a nondeterministic collation that includes a key of the default
 collation - a literal's, which the call cannot tell from an explicit `COLLATE "default"` - so there
 the key names the column's collation (`'abc'::text COLLATE case_insensitive`).  They take one INDEX, and an index belongs to one table, so they count that
 table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
 count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
-`FROM parent` includes them.  A partitioned table's index has no storage and is refused
-(`"..." is not an index`); pass a partition's own index, or write the `SELECT count(*)` against the
-partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
+`FROM parent` includes them.  A partitioned table's index has no storage and is refused, as by
+every function here (below); pass a partition's own index, or write the `SELECT count(*)` against
+the partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
 attempted for an old-style inheritance parent without `ONLY`, whose children need not even share
 its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
@@ -45,6 +51,12 @@ no page while it waits for another that replay may hold, and is exact only while
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
 table's owner (DESIGN.md §7).
+
+Each of these functions reads one index's storage, and the index of a partitioned table has none:
+each partition's index holds the entries of that partition's rows. `lion_index_stats()` returns no
+rows for it, so a query over every lion index in `pg_class` goes on to the partitions' own; every
+other function is an error, `"..." is a partitioned index`, with a hint to pass a partition's index.
+A `lion_index_verify()` over every lion index takes those whose `relkind` is `'i'`.
 
 ### Facet counts (DESIGN.md §7, "Facet counts")
 
@@ -130,7 +142,8 @@ bytea array elements and `jsonb_contains_ops` keys are hashed instead and never 
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
-`array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
+`array_ops` (any array whose element type has a default hash or btree operator class, as GIN's
+needs a btree one) and `tsvector_ops` index one row under many keys, reusing GIN's own
 extraction functions (through wrappers that hash elements and lexemes too long to be keys), and
 answer
 
@@ -140,13 +153,15 @@ answer
     tags @> '{a,b}'    the intersection of the elements' posting sets, exact
     tags && '{a,b}'    their union, exact
     tags <@ '{a,b}'    every indexed row, rechecked in the heap
-    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact
+    tags =  '{a,b}'    the rows holding every element, rechecked in the heap
+    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact (also as `@@@`)
 
 Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two lists on a scalar
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column.
+combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
+index scans only, as GIN answers them.
 
 A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
 is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
@@ -190,7 +205,8 @@ sorting every match:
      LIMIT 10;
 
 The scan is offered when the query and index are constants and every row the `WHERE`'s tsquery can
-match has one of the scored lexemes - the usual case of the same query in both places. Other
+match has one of the scored lexemes - the same query in both places, or a narrower one such as
+`WHERE d.tsv @@ 'cat & black'` under a score of `'cat'`. Other
 `WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
 else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
 
@@ -451,6 +467,24 @@ or temporary one writes no WAL and is written anywhere), which needs
     shared_preload_libraries = 'pg_lion'      # and a restart
     # optional: pg_lion.rmgr_id = 170         # the id to register under
 
+So once an index is built in rmgr mode, `pg_lion` has to stay in `shared_preload_libraries`. On a
+server started without it, INSERT, UPDATE and COPY into the index's table fail, and so does every
+VACUUM that has dead rows to remove from the index - autovacuum included, which reports the error
+only in the server log while the table's dead rows (`n_dead_tup`) accumulate. Reads, DELETE and
+DROP INDEX still work. The error's hint names both ways out: preload the library again and restart,
+or rebuild the index in generic mode. To stop preloading the library, rebuild every rmgr-mode index
+first, while it is still preloaded:
+
+    SELECT c.oid::regclass, lion_index_wal_mode(c.oid)
+      FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+     WHERE a.amname = 'lion' AND c.relkind = 'i';
+
+    ALTER INDEX idx SET (wal_mode = generic);
+    REINDEX INDEX idx;
+
+A REINDEX or TRUNCATE on a server without the preload rebuilds an index left at `auto` in generic
+mode, and it stays generic when the library is preloaded again, until the next REINDEX there.
+
 `pg_lion.rmgr_id` defaults to 170, the id reserved for pg_lion on the
 [list of custom resource managers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers#List_of_Custom_Rmgrs).
 Two extensions that take the same id cannot be loaded together, so change it only to move out of
@@ -493,7 +527,9 @@ working around a bad choice:
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`. A filter on the walked column
   alone (`WHERE s LIKE 'p1%' ORDER BY s`) is decided for a whole key by its first visible row, and
-  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35). When the B-tree holds
+  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35), when the filter is
+  immutable and equal values of the type are stored identically; any other filter is evaluated row
+  by row. When the B-tree holds
   every column the query reads, the rows' values come from its index tuples and the heap is read
   only for pages not all-visible (`Ordered By: <index> (index only)`, DESIGN.md §40); off, no order
   is claimed and the covering walks below are the only ones left.

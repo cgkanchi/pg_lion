@@ -10,6 +10,9 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_operator.h"
+#include "utils/regproc.h"
+
 #include "lion_count_int.h"
 
 PG_FUNCTION_INFO_V1(lion_index_count);
@@ -168,10 +171,9 @@ lion_count_no_relation(Oid relid)
 
 /*
  * The type a SQL count's key is looked up as: what `col = key` in the query
- * the count stands for would compare it as, or an ERROR where that query
- * would find no operator.  The function's argument is polymorphic, so its
- * type is whatever the caller wrote, and it has to be brought to one of the
- * column's opclass members by the rules the parser would apply:
+ * the count stands for would compare it as, where the key's own type is one
+ * the column's opclass takes - InvalidOid otherwise, or an ERROR with
+ * missing_ok false.  The rules are those the parser applies:
  *
  *	- a domain is its base type, as it is to operator resolution;
  *	- a class declared on a POLYMORPHIC type (enum_ops, FOR TYPE anyenum)
@@ -187,17 +189,15 @@ lion_count_no_relation(Oid relid)
  *	  varchar to text - where the parser makes it with `col = key` too:
  *	  there is no `text = varchar`, so it relabels the key and calls the
  *	  class's own `text = text`.  The bytes are the same, so the key is then
- *	  simply one of the column's own values.  A cast FUNCTION is not taken,
- *	  for §21's reason (implicit does not mean lossless), and neither is a
- *	  coercion the parser would not make (bpchar and text, below).
+ *	  simply one of the column's own values.  Not a coercion the parser
+ *	  would not make (bpchar and text, below).
  *
- * This is the whole of the key type check: until 2026-09-25 it compared the
- * key with rd_opcintype exactly, so enum_ops, a DEFAULT class, could never be
- * counted at all ("the index is on type anyenum" for the column's own enum),
- * and neither could a varchar key on the varchar column it indexes.
+ * A key of any other type is first converted as the query would convert it
+ * (lion_count_coerce_key()), and its new type then resolved here.
  */
 static Oid
-lion_count_key_type(Relation index, AttrNumber col, Oid keytype)
+lion_count_key_type(Relation index, AttrNumber col, Oid keytype,
+					bool missing_ok)
 {
 	LionState  *state = lion_index_column_state(index, col);
 	Oid			opfamily = index->rd_opfamily[col - 1];
@@ -240,6 +240,8 @@ lion_count_key_type(Relation index, AttrNumber col, Oid keytype)
 		}
 	}
 
+	if (missing_ok)
+		return InvalidOid;
 	ereport(ERROR,
 			(errcode(ERRCODE_DATATYPE_MISMATCH),
 			 errmsg("type %s cannot be compared with index \"%s\"",
@@ -273,20 +275,33 @@ lion_count_arg_collation(FunctionCallInfo fcinfo, int argnum)
 }
 
 /*
- * The collation key column col's own values bring to `col = key`: the table
- * column's, or its expression's when the column is an expression.  The
- * index's may be another - `(c COLLATE "x")` keeps c, and compares under x.
+ * Key column col as `col = key` reads it: the table column - its type, type
+ * modifier and collation - or its expression when the column is one.  The
+ * index's collation may be another - `(c COLLATE "x")` keeps c, and compares
+ * under x - and so may its key type (varchar under text_ops).  A
+ * CaseTestExpr, as a placeholder of that type for the parser to resolve an
+ * operator over (lion_count_coerce_key()).
  */
-static Oid
-lion_count_column_collation(Relation heap, Relation index, AttrNumber col)
+static CaseTestExpr *
+lion_count_column(Relation heap, Relation index, AttrNumber col)
 {
 	AttrNumber	attnum = index->rd_index->indkey.values[col - 1];
+	CaseTestExpr *colexpr = makeNode(CaseTestExpr);
 	List	   *exprs;
+	Node	   *expr;
 	int			nth = 0;
 	int			c;
 
 	if (attnum != 0)
-		return TupleDescAttr(RelationGetDescr(heap), attnum - 1)->attcollation;
+	{
+		Form_pg_attribute attr = TupleDescAttr(RelationGetDescr(heap),
+											   attnum - 1);
+
+		colexpr->typeId = attr->atttypid;
+		colexpr->typeMod = attr->atttypmod;
+		colexpr->collation = attr->attcollation;
+		return colexpr;
+	}
 
 	for (c = 0; c < col - 1; c++)
 	{
@@ -297,7 +312,163 @@ lion_count_column_collation(Relation heap, Relation index, AttrNumber col)
 	if (nth >= list_length(exprs))
 		elog(ERROR, "index \"%s\" has too few expressions",
 			 RelationGetRelationName(index));
-	return exprCollation((Node *) list_nth(exprs, nth));
+	expr = (Node *) list_nth(exprs, nth);
+	colexpr->typeId = exprType(expr);
+	colexpr->typeMod = exprTypmod(expr);
+	colexpr->collation = exprCollation(expr);
+	return colexpr;
+}
+
+/*
+ * Bring a SQL count's key to what `col = key` - `col = ANY (keys)` for an
+ * array - compares it as, by the parser's own rules: make_op() resolves the
+ * operator for (the column's type, the key's type) and coerces the key to
+ * its input type as the query would, an untyped literal through the
+ * column's input function, 1 to numeric on a numeric column, a numeric 0.1
+ * to float8 on a float4 one (`float4 = float8`, which no float4 value
+ * satisfies, so neither does the count).  The count is the query's only
+ * where the operator it picks is the index's equality, strategy 1 of the
+ * key column's family with the column's own type on the left, and the
+ * column reaches it unconverted - relabelled at most, varchar to text.
+ * Otherwise the query compares something the index does not hold, and the
+ * count is refused rather than made another way: `intcol = 1.5` compares
+ * the column cast to numeric, and the key cast to integer would count the
+ * rows of 2.  And no operator at all is the error the query would raise.
+ * The operator's name is that of the index's own equality, `=` for every
+ * class lion ships, or a class's own (`col ==== key` for a class whose
+ * strategy 1 is `====`), qualified by its schema.
+ *
+ * The key is converted here, once, by evaluating the coercion: the cast
+ * functions are checked for EXECUTE first, as the executor checks those of
+ * the query.  A NULL key resolves its type all the same, and stays NULL.
+ */
+static void
+lion_count_coerce_key(Relation heap, Relation index, AttrNumber col,
+					  LionCountKey *key)
+{
+	CaseTestExpr *colexpr = lion_count_column(heap, index, col);
+	Oid			opfamily = index->rd_opfamily[col - 1];
+	Oid			opcintype = index->rd_opcintype[col - 1];
+	Oid			eqop = get_opfamily_member(opfamily, opcintype, opcintype,
+										   LION_STRAT_EQUAL);
+	List	   *opname;
+	ParseState *pstate;
+	Oid			righttype = key->type;
+	Operator	tup;
+	Const	   *keyexpr;
+	Expr	   *clause;
+	List	   *args;
+	Node	   *left;
+	Node	   *right;
+	Oid			opno;
+	int			strategy;
+	Oid			oplefttype;
+	Oid			oprighttype;
+	int16		typlen;
+	bool		typbyval;
+
+	tup = SearchSysCache1(OPEROID, ObjectIdGetDatum(eqop));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "missing equality operator for type %u in opfamily %u",
+			 opcintype, opfamily);
+	opname = list_make2(makeString(get_namespace_name(((Form_pg_operator) GETSTRUCT(tup))->oprnamespace)),
+						makeString(pstrdup(NameStr(((Form_pg_operator) GETSTRUCT(tup))->oprname))));
+	ReleaseSysCache(tup);
+	pstate = make_parsestate(NULL);
+
+	/*
+	 * Looked up quietly first, so that a key no `=` takes is refused with
+	 * this function's own error, naming the index; make_scalar_array_op()
+	 * looks the operator up by the array's element type, or as unknown for
+	 * an untyped literal.
+	 */
+	if (key->array && righttype != UNKNOWNOID)
+	{
+		righttype = get_base_element_type(righttype);
+		if (!OidIsValid(righttype))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("the keys of a count through index \"%s\" must be an array, not type %s",
+							RelationGetRelationName(index),
+							format_type_be(key->type))));
+	}
+	tup = oper(pstate, opname, colexpr->typeId, righttype, true, -1);
+	if (tup == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type %s cannot be compared with index \"%s\"",
+						format_type_be(righttype),
+						RelationGetRelationName(index)),
+				 errdetail("The index is on type %s.",
+						   format_type_be(colexpr->typeId))));
+	ReleaseSysCache(tup);
+
+	get_typlenbyval(key->type, &typlen, &typbyval);
+	keyexpr = makeConst(key->type, -1, InvalidOid, typlen, key->value,
+						key->isnull, typbyval);
+	if (key->array)
+		clause = make_scalar_array_op(pstate, opname, true, (Node *) colexpr,
+									  (Node *) keyexpr, -1);
+	else
+		clause = make_op(pstate, opname, (Node *) colexpr, (Node *) keyexpr,
+						 NULL, -1);
+	free_parsestate(pstate);
+
+	if (IsA(clause, OpExpr))
+	{
+		opno = ((OpExpr *) clause)->opno;
+		args = ((OpExpr *) clause)->args;
+	}
+	else if (IsA(clause, ScalarArrayOpExpr))
+	{
+		opno = ((ScalarArrayOpExpr *) clause)->opno;
+		args = ((ScalarArrayOpExpr *) clause)->args;
+	}
+	else
+		elog(ERROR, "unexpected node type %d for a count's `=`",
+			 (int) nodeTag(clause));
+	left = (Node *) linitial(args);
+	right = (Node *) lsecond(args);
+	while (IsA(left, RelabelType))
+		left = (Node *) ((RelabelType *) left)->arg;
+
+	strategy = get_op_opfamily_strategy(opno, opfamily);
+	if (strategy != 0)
+		get_op_opfamily_properties(opno, opfamily, false, &strategy,
+								   &oplefttype, &oprighttype);
+	if (left != (Node *) colexpr || strategy != LION_STRAT_EQUAL ||
+		oplefttype != opcintype)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("type %s cannot be compared with index \"%s\"",
+						format_type_be(righttype),
+						RelationGetRelationName(index)),
+				 errdetail("`col %s key` would compare them with operator %s, which is not the equality of the index's type %s.",
+						   strVal(llast(opname)), format_operator(opno),
+						   format_type_be(lion_column_type(lion_index_column_state(index, col),
+														   opcintype))),
+				 errhint("Cast the key to type %s.",
+						 format_type_be(colexpr->typeId))));
+
+	(void) lion_check_functions_walker(right, NULL);
+	if (!key->isnull)
+	{
+		if (!IsA(right, Const))
+			right = (Node *) evaluate_expr((Expr *) right, exprType(right),
+										   exprTypmod(right),
+										   exprCollation(right));
+		if (!IsA(right, Const))
+			elog(ERROR, "a count's key did not evaluate to a constant");
+		key->value = ((Const *) right)->constvalue;
+		key->isnull = ((Const *) right)->constisnull;
+	}
+	key->type = exprType(right);
+	if (key->array)
+	{
+		key->type = get_base_element_type(key->type);
+		if (!OidIsValid(key->type))
+			elog(ERROR, "a count's keys are not an array");
+	}
 }
 
 /*
@@ -335,7 +506,7 @@ lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
 	if (!OidIsValid(idxcoll))
 		return;					/* the key type is not collatable */
 	if (!OidIsValid(collation) || collation == DEFAULT_COLLATION_OID)
-		collation = lion_count_column_collation(heap, index, col);
+		collation = lion_count_column(heap, index, col)->collation;
 	if (!OidIsValid(collation))
 		return;
 	if (collation == idxcoll)
@@ -370,16 +541,16 @@ lion_count_check_collation(Relation heap, Relation index, AttrNumber col,
 /*
  * Open and vet the indexes of one SQL count: relkind, access method, key
  * type, collation, privileges, row-level security and snapshot eligibility.
- * keytype and keycoll may be NULL, which means the caller has no search key
- * at all (the grouped form below, which walks every entry instead of looking
- * one up); keycoll[i] is the collation key i brings
+ * keys may be NULL, which means the caller has no search key at all (the
+ * grouped form below, which walks every entry instead of looking one up);
+ * otherwise each is brought to what `col = key` compares
+ * (lion_count_coerce_key()), and keys[i].coll is the collation key i brings
  * (lion_count_arg_collation()).
  */
 void
 lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
-					   const Oid *keytype, const Oid *keycoll,
-					   AttrNumber wantcol, bool multikey_ok,
-					   LionCountCall *call)
+					   LionCountKey *keys, AttrNumber wantcol,
+					   bool multikey_ok, LionCountCall *call)
 {
 	Oid			heapoid = InvalidOid;
 	char	   *heapname;
@@ -393,6 +564,7 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	for (i = 0; i < 2; i++)
 	{
 		call->index[i] = NULL;
+		call->key[i] = (Datum) 0;
 		call->keytype[i] = InvalidOid;
 	}
 
@@ -407,11 +579,9 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 		char		relkind = get_rel_relkind(idxoid[i]);
 		Oid			hoid;
 
-		if (keytype != NULL)
-			call->keytype[i] = keytype[i];
-
 		if (idxname == NULL || relkind == '\0')
 			lion_count_no_relation(idxoid[i]);
+		lion_refuse_partitioned_index(idxoid[i]);
 		if (relkind != RELKIND_INDEX)
 			ereport(ERROR,
 					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
@@ -491,17 +661,6 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 							RelationGetRelationName(index), wantcol)));
 
 		/*
-		 * The key's type, resolved the way `col = key` would resolve it
-		 * (lion_count_key_type()); what lion_probe_init() is handed from here
-		 * on, and what the EXECUTE check below names the equality by.
-		 * Raising the errors here keeps them out of the middle of the count.
-		 */
-		if (OidIsValid(call->keytype[i]))
-			call->keytype[i] = lion_count_key_type(index,
-												   (wantcol == 0) ? 1 : wantcol,
-												   call->keytype[i]);
-
-		/*
 		 * A multi-key opclass (DESIGN.md §17) stores one entry per extracted
 		 * key, so its entries are not column values: a search key of the
 		 * column's own type - a whole tsvector - is not what any entry holds,
@@ -526,8 +685,37 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 								col, RelationGetRelationName(index)),
 						 errhint("lion_index_facets() counts the rows under each key of such a column.")));
 
+			/*
+			 * The key's type, resolved the way `col = key` would resolve it
+			 * (lion_count_key_type()), or the key first brought to what
+			 * `col = key` compares (lion_count_coerce_key()): what
+			 * lion_probe_init() is handed from here on, and what the EXECUTE
+			 * check below names the equality by.  Raising the errors here
+			 * keeps them out of the middle of the count.
+			 */
+			if (keys != NULL)
+			{
+				Oid			keytype = keys[i].type;
+
+				if (keys[i].array && keytype != UNKNOWNOID)
+					keytype = get_base_element_type(keytype);
+				if (OidIsValid(keytype) && keytype != UNKNOWNOID)
+					call->keytype[i] = lion_count_key_type(index, col,
+														   keytype, true);
+				if (OidIsValid(call->keytype[i]))
+					keys[i].type = keytype;
+				else
+				{
+					lion_count_coerce_key(call->heap, index, col, &keys[i]);
+					call->keytype[i] = lion_count_key_type(index, col,
+														   keys[i].type,
+														   false);
+				}
+				call->key[i] = keys[i].value;
+			}
+
 			lion_count_check_collation(call->heap, index, col,
-									   (keycoll != NULL) ? keycoll[i] :
+									   (keys != NULL) ? keys[i].coll :
 									   InvalidOid);
 		}
 	}
@@ -693,36 +881,50 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 }
 
 /*
+ * A SQL count's search key, argument argnum, as the call passed it: its type
+ * as written - "any" takes an untyped literal as unknown, which
+ * lion_count_coerce_key() reads through the column's input function as
+ * `col = 'x'` does - its collation and its value, NULL included.
+ */
+static void
+lion_count_arg_key(FunctionCallInfo fcinfo, int argnum, bool array,
+				   LionCountKey *key)
+{
+	key->type = get_fn_expr_argtype(fcinfo->flinfo, argnum);
+	if (!OidIsValid(key->type))
+		elog(ERROR, "could not determine the type of the search key");
+	key->coll = lion_count_arg_collation(fcinfo, argnum);
+	key->isnull = PG_ARGISNULL(argnum);
+	key->value = key->isnull ? (Datum) 0 : PG_GETARG_DATUM(argnum);
+	key->array = array;
+}
+
+/*
  * The same for the lion_index_count(idx, key [, idx2, key2]) functions,
- * whose arguments alternate index and key.
+ * whose arguments alternate index and key.  *anynull says whether a key is
+ * NULL, which `col = NULL` selects no row for: the count is then 0, made
+ * after the same checks as any other.
  */
 static void
 lion_count_sql_open(FunctionCallInfo fcinfo, int nkeys, Snapshot snapshot,
-				   LionCountCall *call)
+				   LionCountCall *call, bool *anynull)
 {
 	Oid			idxoid[2];
-	Oid			keytype[2];
-	Oid			keycoll[2];
-	Datum		key[2];
+	LionCountKey keys[2];
 	int			i;
 
 	Assert(nkeys >= 1 && nkeys <= 2);
 
+	*anynull = false;
 	for (i = 0; i < nkeys; i++)
 	{
 		idxoid[i] = PG_GETARG_OID(2 * i);
-		key[i] = PG_GETARG_DATUM(2 * i + 1);
-		keytype[i] = get_fn_expr_argtype(fcinfo->flinfo, 2 * i + 1);
-		if (!OidIsValid(keytype[i]))
-			elog(ERROR, "could not determine the type of the search key");
-		keycoll[i] = lion_count_arg_collation(fcinfo, 2 * i + 1);
+		lion_count_arg_key(fcinfo, 2 * i + 1, false, &keys[i]);
+		if (keys[i].isnull)
+			*anynull = true;
 	}
 
-	lion_count_open_indexes(snapshot, nkeys, idxoid, keytype, keycoll, 0,
-						   false, call);
-
-	for (i = 0; i < nkeys; i++)
-		call->key[i] = key[i];
+	lion_count_open_indexes(snapshot, nkeys, idxoid, keys, 0, false, call);
 }
 
 void
@@ -744,30 +946,40 @@ lion_count_sql(FunctionCallInfo fcinfo, int nkeys, LionCountStats *stats)
 {
 	LionCountCall call;
 	Snapshot	snapshot;
-	int64		result;
+	bool		anynull;
+	int64		result = 0;
 
 	snapshot = GetActiveSnapshot();
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
-	lion_count_sql_open(fcinfo, nkeys, snapshot, &call);
+	lion_count_sql_open(fcinfo, nkeys, snapshot, &call, &anynull);
 
-	result = lion_count_keys(call.heap, snapshot, nkeys, call.index,
-							call.key, call.keytype, stats);
+	if (!anynull)
+		result = lion_count_keys(call.heap, snapshot, nkeys, call.index,
+								call.key, call.keytype, stats);
 
 	lion_count_sql_close(&call);
 	return result;
 }
 
+/*
+ * The functions are not STRICT, so that a NULL key counts 0, as `col = NULL`
+ * does; a NULL index names no index, and answers NULL.
+ */
 Datum
 lion_index_count(PG_FUNCTION_ARGS)
 {
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 	PG_RETURN_INT64(lion_count_sql(fcinfo, 1, NULL));
 }
 
 Datum
 lion_index_count2(PG_FUNCTION_ARGS)
 {
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(2))
+		PG_RETURN_NULL();
 	PG_RETURN_INT64(lion_count_sql(fcinfo, 2, NULL));
 }
 
@@ -780,6 +992,8 @@ lion_index_count_stats(PG_FUNCTION_ARGS)
 	bool		nulls[5] = {false, false, false, false, false};
 	int64		count;
 
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		elog(ERROR, "return type must be a row type");
 	tupdesc = BlessTupleDesc(tupdesc);
@@ -906,10 +1120,10 @@ lion_count_any_batched(LionCountCall *call, Snapshot snapshot, int nelems,
 Datum
 lion_index_count_any(PG_FUNCTION_ARGS)
 {
-	Oid			idxoid = PG_GETARG_OID(0);
-	ArrayType  *arr = PG_GETARG_ARRAYTYPE_P(1);
-	Oid			elemtype = ARR_ELEMTYPE(arr);
-	Oid			keycoll;
+	Oid			idxoid;
+	ArrayType  *arr;
+	Oid			elemtype;
+	LionCountKey keys;
 	LionCountCall call;
 	LionCountSource src;
 	LionPostingSet *sets;
@@ -929,9 +1143,20 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	if (snapshot == NULL)
 		elog(ERROR, "lion index count requires an active snapshot");
 
-	keycoll = lion_count_arg_collation(fcinfo, 1);
-	lion_count_open_indexes(snapshot, 1, &idxoid, &elemtype, &keycoll, 0,
-						   false, &call);
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	idxoid = PG_GETARG_OID(0);
+	lion_count_arg_key(fcinfo, 1, true, &keys);
+	lion_count_open_indexes(snapshot, 1, &idxoid, &keys, 0, false, &call);
+
+	/* `col = ANY (NULL)` selects no row */
+	if (keys.isnull)
+	{
+		lion_count_sql_close(&call);
+		PG_RETURN_INT64(0);
+	}
+	arr = DatumGetArrayTypeP(keys.value);
+	elemtype = ARR_ELEMTYPE(arr);
 
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
@@ -1042,7 +1267,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 						idxname, attno)));
 	}
 
-	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, NULL, attno, false,
+	lion_count_open_indexes(snapshot, 1, &idxoid, NULL, attno, false,
 						   &call);
 
 	memset(&stats, 0, sizeof(stats));
