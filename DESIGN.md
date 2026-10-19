@@ -8929,6 +8929,12 @@ insert no record at all, so that nothing about them needs the manager
 changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
 
+A VACUUM that has dead entries to remove from such an index is a write too, and stops at its first
+one with the same error - autovacuum included, every time it comes back to the table, so the table's
+dead rows accumulate while the error shows only in the server log. The hint names both ways out:
+the preload, or REINDEX with `wal_mode = generic` (which `auto` also gives on a server without the
+preload). `test/recovery/run.sh` phase 1f checks the insert, the VACUUM and the REINDEX.
+
 **VACUUM is the one path that could write without `lion_wal_begin()`**
 (2026-09-25 review): the standby barrier's stand-alone VACUUM_VISIT record is
 inserted by `lion_wal_visit_flush()` directly, and `lion_wal_visit()` looked at
