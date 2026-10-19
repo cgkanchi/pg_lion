@@ -23,8 +23,9 @@ typedef struct LionBm25Cand
 } LionBm25Cand;
 
 /*
- * A query made ready to rank against one index: its lexemes, each one's
- * idf, and the order in which a score adds them up - ascending by the most
+ * A query made ready to rank against one index: its lexemes - as the keys
+ * the index files them under, lion_lexeme_key() - each one's idf, and the
+ * order in which a score adds them up - ascending by the most
  * a lexeme can add, which both the walk and lion_bm25_score_row() follow
  * from the end, so a row gets the same score bit for bit from either.
  */

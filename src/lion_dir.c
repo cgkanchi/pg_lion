@@ -1494,8 +1494,8 @@ typedef struct LionDirItem
  * The two walk-backs can pull in OPPOSITE directions, and then there is no cut
  * at all: an 8 KiB page holding two ~4000-byte entries under a short high key
  * has room for neither half once a 6000-byte entry is inserted between them
- * (the largest entry is 6088 bytes and the largest pivot 2036, so one item
- * plus one pivot is 8128 and two items plus a pivot is not).  That is reported
+ * (the largest entry is 6056 bytes and the largest pivot 2068, so one item
+ * plus one pivot is 8124 and two items plus a pivot is not).  That is reported
  * with *ok = false rather than as an error: the caller then splits the page as
  * it STANDS - which always has a cut, because k = 1 puts one item plus its
  * high key on the left and a suffix of what the page already held plus its old
@@ -1505,8 +1505,9 @@ typedef struct LionDirItem
  *
  * *(This replaces an error branch, reported by the 2026-09-22 review of §21.
  * With today's size caps the shape is in fact unreachable - a fresh entry is
- * at most 2052 bytes on a page and a replacement grows by at most a few dozen,
- * and either way a cut exists - but that rests on three independent constants
+ * its key and one row's container, a little over 2 kB at most on a page, and
+ * a replacement grows by at most a few dozen, and either way a cut exists -
+ * but that rests on three independent constants
  * (LION_MAX_ENTRY_SIZE, LION_MAX_PIVOT_SIZE and how much one insert can add),
  * and none of them should be load-bearing for whether an INSERT errors out.
  * DESIGN.md §21 "Split" carries the arithmetic.)*

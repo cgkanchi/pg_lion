@@ -464,15 +464,23 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * payload packed right after the key (lion_entryfmt.h) - and it stamps the
  * pages of a posting tree with a hash of the key's bytes instead of the
  * key's hash.  So version 9 is no longer read either: opening one is an
- * ERROR whose hint asks for REINDEX.  Every index this build writes is
- * version 10, and whether it has summaries or NARROW items is said as
- * version 9 said it.
+ * ERROR whose hint asks for REINDEX.  Whether an index has summaries or
+ * NARROW items is said as version 9 said it.
+ *
+ * Version 11 raises LION_MAX_KEY_SIZE from 2000 to 2047 bytes.  A version 10
+ * index of jsonb_contains_ops (§42) holds as hashes the keys of 2001 to 2047
+ * bytes that this build stores as they are, and so would not be found under
+ * them; and LION_MAX_ENTRY_SIZE, which leaves room for the largest pivot,
+ * shrank, so an INLINE entry a version 10 build wrote may be larger than a
+ * page now leaves room for.  Opening a version 10 index is an ERROR whose
+ * hint asks for REINDEX.  Every index this build writes is version 11.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
 #define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
 #define LION_VERSION_V9			9	/* varbyte sparse segments (§13) */
 #define LION_VERSION_V10		10	/* compact entry tuples (§21) */
+#define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
 
 /* May the index of this meta page hold NARROW items (§38)? */
 #define LION_META_ALLOWS_NARROW(meta) \
@@ -741,7 +749,15 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 /* Kinds whose order compares keys (the others are one entry per column). */
 #define LION_KIND_HAS_KEY(k)	((k) == LION_KIND_VALUE || (k) == LION_KIND_SUMMARY)
 
-#define LION_MAX_KEY_SIZE		2000
+/*
+ * The largest key, in bytes as stored (a varlena with its 4-byte header).  A
+ * tsvector lexeme is at most 2047 bytes (ts_type.h's MAXSTRLEN), so a key of
+ * this size holds every lexeme of up to 2043; the longer ones are hashed by
+ * tsvector_ops (lion_lexeme_key(), DESIGN.md §17 "Long lexemes"), and keys
+ * of jsonb_contains_ops past it by that class (§42.1).  Any other key past it
+ * is an ERROR.
+ */
+#define LION_MAX_KEY_SIZE		2047
 #define LION_DEFAULT_INLINE_LIMIT 4096
 #define LION_MIN_INLINE_LIMIT	64
 #define LION_MAX_INLINE_LIMIT	4096
@@ -836,7 +852,7 @@ lion_pivot_kindflags(uint16 flags)
  * it, so the bottom-up build never reaches a root at all.  nbtree keeps a
  * separate BTREE_NONLEAF_FILLFACTOR of 70 for exactly this reason, and a hard
  * minimum on top of it, because a page's fill target says nothing about how
- * large one item is: three 2000-byte pivots plus a high key do not fit a
+ * large one item is: three 2047-byte pivots plus a high key do not fit a
  * block, so the floor that can always be honoured is two.
  */
 #define LION_NONLEAF_FILLFACTOR	70
@@ -1285,6 +1301,23 @@ extern void lion_extract_query_superset(LionState *state, Relation index,
 extern LionKeyNode *lion_keynode_leaf(int keyno);
 extern LionKeyNode *lion_keynode_op(LionKeyNodeKind kind, LionKeyNode **args,
 									int nargs);
+
+/*
+ * tsvector_ops' keys (DESIGN.md §17, "Long lexemes"): a lexeme of up to
+ * LION_LEXEME_KEY_MAX bytes is its own key, and a longer one is filed under
+ * a key of exactly that many - its first bytes, up to LION_LEXEME_KEY_KEEP of
+ * them, then '#', then its SHA-256 in hex.  A key of that length is
+ * ambiguous, and a query that names one is rechecked.
+ * lion_lexeme_prefix_max() is the longest prefix every hashed key keeps.
+ */
+#define LION_LEXEME_KEY_MAX		(LION_MAX_KEY_SIZE - VARHDRSZ)	/* 2043 */
+#define LION_LEXEME_KEY_HASH	64	/* SHA-256 in hex */
+#define LION_LEXEME_KEY_KEEP	(LION_LEXEME_KEY_MAX - LION_LEXEME_KEY_HASH - 1)
+
+extern text *lion_lexeme_key(const char *lex, int len, bool *ambiguous);
+extern int	lion_lexeme_prefix_max(void);
+extern Datum lion_tsvector_extract_value(PG_FUNCTION_ARGS);
+extern Datum lion_tsvector_extract_query(PG_FUNCTION_ARGS);
 
 /* jsonb_contains_ops' extractQuery (lion_jsonb.c), which hands over a tree */
 extern Datum lion_jsonb_extract_query(PG_FUNCTION_ARGS);
