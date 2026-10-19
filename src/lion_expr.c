@@ -93,7 +93,7 @@ lion_leapfrog_order(const double *est, int n, int *order)
  * It winds cur[order[0 .. n-1]] forward to the next container key at which
  * every one of them has a container and their AND holds a member, and
  * returns that AND, its key in *key; NULL once one of them runs out, or the
- * key reaches `hi` (a chunk of a collection, LionCollect.ranged).
+ * key reaches `hi` (the end of a window, LionCountCtx.windowed).
  *
  * order[0] is the DRIVER, the cursor with the fewest members, and the others
  * follow in ascending members.  The driver is the only one that ever steps
@@ -582,15 +582,16 @@ lion_wide_image(LionWideOr *w, uint32 key)
 }
 
 /*
- * Where a windowed union's keys end: past every key, or where the chunk a
- * collection is making ends (LionCollect.ranged) - no window reads its
- * children past that, and the union is over there.
+ * Where a windowed union's keys end: past every key, or where the window the
+ * count or collection is confined to ends (LionCountCtx.windowed: the chunk a
+ * collection is making, a range of a parallel count) - no window of the
+ * union reads its children past that, and the union is over there.
  */
 static inline uint64
 lion_wide_last(const LionWideOr *w)
 {
-	if (w->cx->collect != NULL && w->cx->collect->ranged)
-		return Min(w->cx->collect->hi, LION_WIDE_END);
+	if (w->cx->windowed)
+		return Min(w->cx->winhi, LION_WIDE_END);
 	return LION_WIDE_END;
 }
 
@@ -672,9 +673,8 @@ lion_wide_init(LionExprCursor *c, LionPostingSet *sets, int nsets,
 	w->out = (LionContainer *) MemoryContextAlloc(cxt, LION_CONTAINER_MAX_SIZE);
 	c->wide = w;
 
-	/* the first window: a collection's chunk starts at its own first key */
-	lion_wide_fill(c, (cx->collect != NULL && cx->collect->ranged) ?
-				   cx->collect->lo : 0);
+	/* the first window: a confined count's starts at its own first key */
+	lion_wide_fill(c, cx->windowed ? cx->winlo : 0);
 }
 
 /* Stand on the first non-empty image at or after pos, filling as needed. */

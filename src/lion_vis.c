@@ -215,6 +215,9 @@ lion_vis_cache_create(MemoryContext parent)
 	cache->scratchbusy = false;
 	cache->vmbuf = InvalidBuffer;
 	cache->vmrelid = InvalidOid;
+	cache->windowed = false;
+	cache->winlo = 0;
+	cache->winhi = LION_KEYS_END;
 	return cache;
 }
 
@@ -273,6 +276,65 @@ lion_vis_cache_set_filter(LionVisCache *cache, LionRowFilter *filter)
 		return;
 	}
 	cache->filter = filter;
+}
+
+/*
+ * Confine every count handed the cache to the container keys lo up to, not
+ * including, hi - one range of a parallel count's cut (DESIGN.md §10, "A
+ * count in parallel") - or, lifted, to none.  The ranges share no heap block,
+ * so what the counts of the last one resolved is of no use to the next: the
+ * entries go, and the counting of counts starts again, so that a window
+ * counted once records nothing (lion_vis_cache_prepare()), exactly as a
+ * one-shot count does, and one counted several times over - the runs of
+ * filtered counts, a walk's entries - reuses its pages as the serial node
+ * does.  The relation, the snapshot and the map page stay.
+ */
+static void
+lion_vis_cache_window_reset(LionVisCache *cache)
+{
+	cache->ht = NULL;
+	MemoryContextReset(cache->cxt);
+	cache->ncounts = 0;
+	cache->full = false;
+}
+
+void
+lion_vis_cache_set_window(LionVisCache *cache, uint32 lo, uint64 hi)
+{
+	if (cache == NULL)
+		elog(ERROR, "lion index count: a window of keys needs a visibility cache");
+	if ((uint64) lo >= hi || hi > LION_KEYS_END)
+		elog(ERROR, "lion index count: an empty window of keys, %u to " UINT64_FORMAT,
+			 lo, hi);
+	lion_vis_cache_window_reset(cache);
+	cache->windowed = true;
+	cache->winlo = lo;
+	cache->winhi = hi;
+}
+
+void
+lion_vis_cache_clear_window(LionVisCache *cache)
+{
+	if (cache == NULL || !cache->windowed)
+		return;
+	lion_vis_cache_window_reset(cache);
+	cache->windowed = false;
+	cache->winlo = 0;
+	cache->winhi = LION_KEYS_END;
+}
+
+bool
+lion_vis_cache_window(const LionVisCache *cache, uint32 *lo, uint64 *hi)
+{
+	if (cache == NULL || !cache->windowed)
+	{
+		*lo = 0;
+		*hi = LION_KEYS_END;
+		return false;
+	}
+	*lo = cache->winlo;
+	*hi = cache->winhi;
+	return true;
 }
 
 /*

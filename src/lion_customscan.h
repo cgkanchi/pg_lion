@@ -1655,7 +1655,9 @@ typedef struct LionCoalState
  * them in, with their hashes, which lion_count_batched() locates and counts a
  * batch at a time.  The values live in wherecxt, and item, val, hash and nval
  * go with it when the relation's WHERE is released.  batches is how many
- * batches were counted, for EXPLAIN ANALYZE.
+ * batches were counted, for EXPLAIN ANALYZE.  A count takes the batches b
+ * with b % nparts == part: all of them (0 of 1), but in a range of a parallel
+ * count, which takes its part of them whole (lion_count_ranged()).
  */
 typedef struct LionListBatch
 {
@@ -1665,6 +1667,8 @@ typedef struct LionListBatch
 	Datum	   *val;
 	uint32	   *hash;
 	int64		batches;
+	int			part;
+	int			nparts;
 } LionListBatch;
 
 /*
@@ -1778,6 +1782,11 @@ typedef struct LionWaggState
  * between them, and ranges how many this participant counted, which EXPLAIN
  * ANALYZE reports with the workers' (workerranges, and the workers'
  * collections and batches beside it).
+ *
+ * A parallel count of one row (§10, "A count in parallel") keeps the same
+ * state: ranges is then the chunks it counted - a range of keys of one run -
+ * and the workers' list batches, summaries summed and probed walks come back
+ * beside the rest.
  */
 typedef struct LionRangedState
 {
@@ -1789,6 +1798,9 @@ typedef struct LionRangedState
 	int64		workerwherespilled;
 	int64		workergroupbatches;
 	int64		workergroupsbatched;
+	int64		workerlistbatches;
+	int64		workersummaries;
+	int64		workerrangeprobed;
 } LionRangedState;
 
 /*
@@ -2755,7 +2767,7 @@ lion_st_lbatch(LionCountScanState *st)
 	return st->lbatch;
 }
 
-/* A parallel GROUP BY's ranges, which only a parallel non-join has (§10) */
+/* A parallel GROUP BY's or count's ranges: a parallel non-join's (§10) */
 static inline LionRangedState *
 lion_st_ranged(LionCountScanState *st)
 {
@@ -2806,7 +2818,9 @@ lion_st_join(LionCountScanState *st)
  * state here too: nextchunk is then the next range of container keys nobody
  * has claimed, of nranges ranges cut from ckeys keys (lion_key_ranges()), and
  * ranges, wherecollected, wherespilled, groupbatches and groupsbatched its
- * workers' counters, summed.
+ * workers' counters, summed.  So does a parallel count of one row (§10, "A
+ * count in parallel"), whose chunks are nranges for each of its runs, and
+ * whose workers sum their listbatches, summaries and rangeprobed here too.
  */
 typedef struct LionJoinShared
 {
@@ -2833,6 +2847,9 @@ typedef struct LionJoinShared
 	int64		groupbatches;
 	int64		groupsbatched;
 	int64		factgroupcounts;
+	int64		listbatches;
+	int64		summaries;
+	int64		rangeprobed;
 	pg_atomic_uint32 nextchunk;
 	int			participants;
 	int			nranges;
@@ -3008,11 +3025,21 @@ typedef struct LionDriveInfo
  * of container keys a participant counts pays again of it (perrange): the
  * entry walk from its first entry, each group's set decoded, set up and sought
  * to the range's first key, and each WHERE source sought there.
+ *
+ * And what a parallel count of one row (§10, "A count in parallel") needs:
+ * what each of its ranges pays again (countrange) - every set of its WHERE
+ * sought to the range's first key, and a walk's entries counted again, each
+ * sought there too - what every participant pays whole (whole) - the WHERE's
+ * lookups, and the ranges taken as sources it collects - and the pages the
+ * count reads (pages), which decide its workers.
  */
 typedef struct LionRangeCost
 {
 	bool		batched;
 	Cost		perrange;
+	Cost		countrange;
+	Cost		whole;
+	double		pages;
 } LionRangeCost;
 
 /*
@@ -3397,6 +3424,7 @@ extern int64 lion_node_count(LionCountScanState *st, int nsource,
 extern int64 lion_count_relation(LionCountScanState *st);
 extern int64 lion_sumall_relation(LionCountScanState *st);
 extern int64 lion_count_runs(LionCountScanState *st, bool sum);
+extern int64 lion_count_ranged(LionCountScanState *st, bool sum);
 extern TupleTableSlot *lion_next_group_ranged(LionCountScanState *st,
 											  bool *exhausted);
 extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);

@@ -289,6 +289,22 @@ lion_row_filter_heap(const LionRowFilter *filter)
 extern void lion_vis_cache_set_filter(LionVisCache *cache,
 									  LionRowFilter *filter);
 
+/*
+ * A WINDOW of container keys (DESIGN.md §10, "A count in parallel"): every
+ * count handed `cache` afterwards - lion_count_sources_cached() and every
+ * count the node makes through it, a range probe's collection, the heap scan
+ * of lion_count_heap_filtered() when it is given the window - counts only
+ * the rows at container keys lo up to, not including, hi, which is one range
+ * of lion_key_ranges()' cut.  Lifted with lion_vis_cache_clear_window(); a
+ * reset leaves it where it is.  lion_vis_cache_window() says whether one is
+ * set, and where; with none, *lo is 0 and *hi LION_KEYS_END.
+ */
+extern void lion_vis_cache_set_window(LionVisCache *cache, uint32 lo,
+									  uint64 hi);
+extern void lion_vis_cache_clear_window(LionVisCache *cache);
+extern bool lion_vis_cache_window(const LionVisCache *cache, uint32 *lo,
+								  uint64 *hi);
+
 /* Does the row pass?  tuple is a heap tuple of filter->heap. */
 extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
 
@@ -296,11 +312,14 @@ extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
  * The rows of `heap` visible to snapshot that pass filter, by a sequential
  * scan: what the count pushdown falls back to when a filtered clause was its
  * only source and there is no candidate set to recheck (DESIGN.md §17).  The
- * rows scanned are counted as rechecked in stats.
+ * rows scanned are counted as rechecked in stats.  Only the blocks of
+ * container keys lo up to, not including, hi are read: 0 and LION_KEYS_END
+ * for the whole heap, a window's otherwise (lion_vis_cache_set_window()).
  */
 extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 									  LionRowFilter *filter,
-									  LionCountStats *stats);
+									  LionCountStats *stats,
+									  uint32 lo, uint64 hi);
 
 /*
  * A located posting set: everything the counting code needs in order to
@@ -1010,7 +1029,9 @@ extern void lion_range_spill_set(struct LionMatSet *mat, Size *held);
  * lion_range_probe_begin() returns NULL when it cannot be taken: F has no
  * positive source, holds a range still to be walked (rangewalk), has no
  * positive source that carries the §9 interlock, or would not fit maxbytes
- * with the marks.  F must stay located until lion_range_probe_end().
+ * with the marks.  F must stay located until lion_range_probe_end().  lo and
+ * hi are the window of container keys the final count is confined to
+ * (lion_vis_cache_window()): F is copied at those keys alone.
  */
 typedef struct LionRangeProbe LionRangeProbe;
 
@@ -1018,7 +1039,8 @@ extern LionRangeProbe *lion_range_probe_begin(Relation heap, Snapshot snapshot,
 											  int nsources,
 											  LionCountSource *sources,
 											  Size maxbytes,
-											  LionCountStats *stats);
+											  LionCountStats *stats,
+											  uint32 lo, uint64 hi);
 extern void lion_range_probe_add(LionRangeProbe *rp, LionPostingSet *set);
 extern int64 lion_range_probe_count(LionRangeProbe *rp, Relation heap,
 									Snapshot snapshot, LionCountStats *stats,
