@@ -1270,6 +1270,20 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 		elog(ERROR, "lion index: failed to add container to build page");
 }
 
+/* The posting set has outgrown the entry tuple: move it to pages. */
+static void
+lion_builder_to_pages(LionBuildState *bs, LionBuilder *b)
+{
+	Size		off = 0;
+	Size		used = b->inlineused;
+
+	Assert(!b->spilled);
+	b->spilled = true;
+	b->inlineused = 0;
+	while (lion_inline_fetch(b->inlinebuf, used, &off, b->cbuf) > 0)
+		lion_builder_spill(bs, b, b->cbuf);
+}
+
 static void
 lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 {
@@ -1299,16 +1313,7 @@ lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 			return;
 		}
 
-		/* The posting set has outgrown the entry tuple: move it to pages. */
-		{
-			Size		off = 0;
-			Size		used = b->inlineused;
-
-			b->spilled = true;
-			b->inlineused = 0;
-			while (lion_inline_fetch(b->inlinebuf, used, &off, b->cbuf) > 0)
-				lion_builder_spill(bs, b, b->cbuf);
-		}
+		lion_builder_to_pages(bs, b);
 	}
 
 	lion_builder_spill(bs, b, c);
@@ -1492,6 +1497,17 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 
 	lion_builder_finish_group(bs, b);
 	lion_builder_close_segment(bs, b);
+
+	/*
+	 * A key's positions are known only once its codes are in (DESIGN.md
+	 * §17), and what they leave of the entry with them: the posting set goes
+	 * to pages if it does not fit beside them.
+	 */
+	if (!b->spilled && b->inlineused > b->inlinemax)
+	{
+		Assert(b->haspos);
+		lion_builder_to_pages(bs, b);
+	}
 
 	if (b->spilled)
 	{
@@ -2021,20 +2037,6 @@ lion_sum_finish(LionBuildState *bs, LionSumBuild *sum)
  * --------------------------------------------------------------------- */
 
 /*
- * What the spool may use of workmem kB: what the positions of a column that
- * stores them do not take (lion_posbuild_budget()), so that the two stay
- * within it together.
- */
-static Size
-lion_build_spool_memory(const LionPosBuild *posbuild, int workmem)
-{
-	Size		total = (Size) workmem * 1024;
-	Size		positions = lion_posbuild_budget(posbuild);
-
-	return (total > positions) ? total - positions : 0;
-}
-
-/*
  * table_index_build_scan() callback, serial and parallel alike: arg is this
  * process's spool, which does everything (lion_spool.c).
  */
@@ -2065,6 +2067,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	int			which;
 	int			i;
 	bool		sumkey;
+	bool		haspos;
 
 	/*
 	 * A summarized column's values go into its current summary bucket as well
@@ -2087,23 +2090,51 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 
 	/*
 	 * A key of a column that stores positions (DESIGN.md §17): its positions
-	 * are taken from the side (lion_posbuild.c).  Ones that fit a chunk
-	 * travel with the entry, and an INLINE posting set then has to leave
-	 * them room; a tree means a CHAIN entry.
+	 * come with its codes, and go to lion_posbuild.c as they come.
 	 */
-	if (bs->curpos && lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE)
+	haspos = (bs->curpos &&
+			  lion_spool_group_entry(group, 0)->kind == LION_KIND_VALUE);
+	if (haspos)
 	{
-		const LionSpoolEntry *e = lion_spool_group_entry(group, 0);
-		LionContainer *chunk;
-
 		if (n != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("lion index \"%s\": keys that compare equal but differ cannot store positions",
 							RelationGetRelationName(bs->index))));
 		b[0]->haspos = true;
-		lion_posbuild_take(bs->posbuild, e->key, b[0]->owner, &bs->pw, &chunk,
-						   &b[0]->posroot, &b[0]->posmembers);
+		lion_posbuild_key_begin(bs->posbuild, &bs->pw, b[0]->owner);
+	}
+
+	while (lion_spool_group_next(group, &which, &code))
+	{
+		lion_builder_add(bs, b[which], code);
+		if (haspos)
+		{
+			LionKeyPositions kp;
+
+			lion_spool_group_positions(group, &kp);
+			lion_posbuild_key_add(bs->posbuild, code, &kp);
+		}
+		if (sumkey)
+		{
+			lion_sum_add(bs->sum, code);
+			bs->sum->ntids++;
+		}
+		if ((++ncodes & 0xFFFF) == 0)
+			CHECK_FOR_INTERRUPTS();
+	}
+
+	/*
+	 * Positions that fit a chunk travel with the entry, and an INLINE posting
+	 * set then has to leave them room (lion_builder_flush()); a tree means a
+	 * CHAIN entry.
+	 */
+	if (haspos)
+	{
+		LionContainer *chunk;
+
+		lion_posbuild_key_end(bs->posbuild, &chunk, &b[0]->posroot,
+							  &b[0]->posmembers);
 		if (chunk != NULL)
 		{
 			Size		poslen = lion_poschunk_size(chunk);
@@ -2121,18 +2152,6 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 		}
 		else
 			b[0]->inlinemax = 0;
-	}
-
-	while (lion_spool_group_next(group, &which, &code))
-	{
-		lion_builder_add(bs, b[which], code);
-		if (sumkey)
-		{
-			lion_sum_add(bs->sum, code);
-			bs->sum->ntids++;
-		}
-		if ((++ncodes & 0xFFFF) == 0)
-			CHECK_FOR_INTERRUPTS();
 	}
 
 	lion_flush_builders(bs);
@@ -2265,18 +2284,13 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	MemoryContext oldctx = MemoryContextSwitchTo(cxt);
 	LionIndexState ix;
 	LionSpool  *spool;
-	LionPosBuild *posbuild;
 	IndexInfo  *indexInfo;
 	TableScanDesc scan;
 	double		reltuples;
 
 	(void) lion_build_index_state(index, &ix, cxt);
-	posbuild = lion_posbuild_begin_shared(index, &ix, memkb, &shared->fileset,
-										  filenum);
-	spool = lion_spool_begin(&ix, lion_build_spool_memory(posbuild, memkb),
-							 &shared->fileset, filenum);
-	if (posbuild != NULL)
-		lion_spool_set_possink(spool, lion_posbuild_sink, posbuild);
+	spool = lion_spool_begin(&ix, (Size) memkb * 1024, &shared->fileset,
+							 filenum);
 
 	indexInfo = BuildIndexInfo(index);
 	indexInfo->ii_Concurrent = shared->isconcurrent;
@@ -2286,11 +2300,6 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 									   lion_build_callback, spool, scan);
 
 	lion_spool_export(spool, &tapes[filenum]);
-	if (posbuild != NULL)
-	{
-		lion_posbuild_export(posbuild);
-		lion_posbuild_end(posbuild);
-	}
 
 	SpinLockAcquire(&shared->mutex);
 	shared->nparticipantsdone++;
@@ -2485,11 +2494,7 @@ lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
 	bs->reader = lion_spool_reader_begin(&bs->ix, &shared->fileset,
 										 leader->nparticipants, filenums,
 										 shares,
-										 lion_build_spool_memory(bs->posbuild,
-																 maintenance_work_mem));
-	if (bs->posbuild != NULL)
-		lion_posbuild_import(bs->posbuild, &shared->fileset,
-							 leader->nparticipants, filenums);
+										 (Size) maintenance_work_mem * 1024);
 	return reltuples;
 }
 
@@ -2661,12 +2666,10 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * parallel_workers, and 32MB of maintenance_work_mem per participant.
 	 */
 	/*
-	 * A column that stores positions (DESIGN.md §17) keeps them on the side
-	 * (lion_posbuild.c), in a share of maintenance_work_mem the spool does
-	 * without; in a parallel build each participant keeps its own, in that
-	 * share of its own, and the leader merges them all once the scan is done.
+	 * A column that stores positions (DESIGN.md §17) keeps them in the spool
+	 * with its codes, and the write below hands them to lion_posbuild.c.
 	 */
-	posbuild = lion_posbuild_begin(index, &bs.ix, maintenance_work_mem);
+	posbuild = lion_posbuild_begin(index, &bs.ix);
 	bs.posbuild = posbuild;
 	bs.pw.arg = &bs;
 	bs.pw.alloc = lion_build_pw_alloc;
@@ -2682,12 +2685,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	else
 #endif
 	{
-		bs.spool = lion_spool_begin(&bs.ix,
-									lion_build_spool_memory(posbuild,
-															maintenance_work_mem),
+		bs.spool = lion_spool_begin(&bs.ix, (Size) maintenance_work_mem * 1024,
 									NULL, -1);
-		if (posbuild != NULL)
-			lion_spool_set_possink(bs.spool, lion_posbuild_sink, posbuild);
 
 		/*
 		 * No synchronized scan: TIDs in ascending order is what lets the spool
@@ -2733,7 +2732,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		 * they take comes out of the spool's maintenance_work_mem, not on top
 		 * of it.
 		 */
-		bs.curpos = lion_posbuild_column(posbuild, c);
+		bs.curpos = bs.cur->positions;
 		bs.sum = lion_sum_begin(&bs, bs.cur);
 		sumreserve = (bs.sum != NULL) ? LION_SUM_MEMORY : 0;
 		if (bs.reader != NULL)
@@ -2747,7 +2746,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 			lion_sum_finish(&bs, bs.sum);
 			bs.sum = NULL;
 		}
-		lion_posbuild_column_done(posbuild, c);
 		bs.curpos = false;
 	}
 	bs.cur = NULL;
