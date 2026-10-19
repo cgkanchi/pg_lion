@@ -15,6 +15,8 @@
 
 #include "lion_count_int.h"
 
+#include "pgstat.h"
+
 PG_FUNCTION_INFO_V1(lion_index_count);
 PG_FUNCTION_INFO_V1(lion_index_count2);
 PG_FUNCTION_INFO_V1(lion_index_count_stats);
@@ -941,6 +943,28 @@ lion_count_sql_close(LionCountCall *call)
 		table_close(call->heap, AccessShareLock);
 }
 
+/*
+ * The index-usage statistics of one call (pg_stat_user_indexes; REFERENCE.md,
+ * "Monitoring"): a scan of each index it read, once however often it is
+ * named, and the rows it counted as each one's idx_tup_read - as a scan of
+ * an index for each call, the way a nested loop's inner index scan is
+ * counted for each outer row.
+ */
+void
+lion_count_sql_report(LionCountCall *call, int64 rows)
+{
+	int			i;
+
+	for (i = 0; i < call->nkeys; i++)
+	{
+		if (call->index[i] == NULL ||
+			(i == 1 && call->index[0] == call->index[1]))
+			continue;
+		pgstat_count_index_scan(call->index[i]);
+		pgstat_count_index_tuples(call->index[i], rows);
+	}
+}
+
 static int64
 lion_count_sql(FunctionCallInfo fcinfo, int nkeys, LionCountStats *stats)
 {
@@ -959,6 +983,7 @@ lion_count_sql(FunctionCallInfo fcinfo, int nkeys, LionCountStats *stats)
 		result = lion_count_keys(call.heap, snapshot, nkeys, call.index,
 								call.key, call.keytype, stats);
 
+	lion_count_sql_report(&call, result);
 	lion_count_sql_close(&call);
 	return result;
 }
@@ -1171,6 +1196,7 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	{
 		count = lion_count_any_batched(&call, snapshot, nelems, elems, nulls,
 									   elmbyval, elmlen);
+		lion_count_sql_report(&call, count);
 		lion_count_sql_close(&call);
 		PG_RETURN_INT64(count);
 	}
@@ -1203,6 +1229,7 @@ lion_index_count_any(PG_FUNCTION_ARGS)
 	pfree(elems);
 	pfree(nulls);
 
+	lion_count_sql_report(&call, count);
 	lion_count_sql_close(&call);
 
 	PG_RETURN_INT64(count);
@@ -1317,6 +1344,7 @@ lion_index_count_group_stats(PG_FUNCTION_ARGS)
 	lion_entry_scan_end(&es);
 	lion_vis_cache_destroy(cache);
 	MemoryContextDelete(percxt);
+	lion_count_sql_report(&call, total);
 	lion_count_sql_close(&call);
 
 	values[0] = Int64GetDatum(groups);

@@ -23,7 +23,7 @@ teardown
 	DROP TABLE rc;
 }
 session s1
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_count	{ SELECT lion_index_count('rc_k', 99); }
 step s1_count2	{ SELECT lion_index_count('rc_k', 99, 'rc_j', 99); }
@@ -40,7 +40,7 @@ step s1_insert	{ INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secre
 step s1_commit	{ COMMIT; }
 
 session s2
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_count	{ SELECT lion_index_count('rc_k', 99); }
 step s2_count2	{ SELECT lion_index_count('rc_k', 99, 'rc_j', 99); }

@@ -18,7 +18,7 @@ teardown
 }
 
 session s1
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_func	{ SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10); }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id FROM bm_ser WHERE d @@ 'secret'
@@ -29,7 +29,7 @@ step s1_insert	{ INSERT INTO bm_ser VALUES (-1, to_tsvector('simple', 'secret on
 step s1_commit	{ COMMIT; }
 
 session s2
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_func	{ SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10); }
 step s2_scan	{ SELECT id FROM bm_ser WHERE d @@ 'secret'

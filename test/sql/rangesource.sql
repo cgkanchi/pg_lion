@@ -33,8 +33,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_nestloop', 'off', true);
@@ -62,8 +61,7 @@ BEGIN
 	EXECUTE format('SELECT coalesce(string_agg(s::text, '' '' ORDER BY s::text), ''(none)'') FROM (%s) s', q)
 		INTO want;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	IF got IS DISTINCT FROM want THEN
@@ -84,8 +82,7 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_srcp AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_srcp(' || args || ')' LOOP
@@ -104,8 +101,7 @@ BEGIN
 		INTO want;
 	EXECUTE 'DEALLOCATE lion_srcp';
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('plan_cache_mode', 'auto', true);
 
@@ -275,14 +271,12 @@ SELECT lion_src('SELECT count(*) FROM lion_src_fact f JOIN lion_src_dim d ON f.f
 -- EXPLAIN names the range with every bound
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lion_src_t WHERE u > 100 AND u <= 900 AND r < 15000 GROUP BY g;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_src_t WHERE (u < 100 OR a = 3) AND g = 2;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---------- 9. what collecting a range costs (DESIGN.md §32, 2026-09-29) ----------
 -- The FK-side join collects a range among its fact filters once, and its

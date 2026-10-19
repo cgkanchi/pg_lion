@@ -63,6 +63,7 @@
 
 #include "access/skey.h"
 #include "executor/executor.h"
+#include "pgstat.h"
 #include "parser/parse_clause.h"
 #include "parser/parse_collate.h"
 #include "parser/parse_node.h"
@@ -138,6 +139,7 @@ typedef struct LionFacetRun
 	LionCountStats stats;
 	double		share;			/* of the table's rows the filter keeps */
 	int64		fetched;		/* rows read from the heap */
+	int64		rows;			/* rows counted under the keys kept */
 	bool		heapread;		/* the keys were read from the filter's rows */
 	int64		walked;			/* entry headers read */
 	int64		counted;		/* keys counted */
@@ -699,6 +701,34 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
 	return true;
 }
 
+/*
+ * The index-usage statistics of a run (pg_stat_user_indexes; REFERENCE.md,
+ * "Monitoring"): a scan of the column's index and of each index the filter
+ * read, the rows counted as each one's idx_tup_read, and the rows read from
+ * the heap by the filter's TIDs as the table's, as a bitmap heap scan
+ * counts its own.
+ */
+static void
+lion_facets_report(LionFacetRun *run, LionFacetFilter *ff)
+{
+	ListCell   *lc;
+
+	pgstat_count_index_scan(run->index);
+	pgstat_count_index_tuples(run->index, run->rows);
+	foreach(lc, ff->indexes)
+	{
+		Relation	index = (Relation) lfirst(lc);
+
+		if (index == run->index ||
+			!list_member_oid(ff->vetted, RelationGetRelid(index)))
+			continue;
+		pgstat_count_index_scan(index);
+		pgstat_count_index_tuples(index, run->rows);
+	}
+	if (run->fetched > 0 && pgstat_should_count_relation(run->heap))
+		run->heap->pgstat_info->counts.tuples_fetched += run->fetched;
+}
+
 static void
 lion_facets_filter_end(LionFacetFilter *ff)
 {
@@ -903,6 +933,7 @@ lion_facets_keep(LionFacetRun *run, LionFacetKey *k, int64 count)
 		lion_facets_key_free(run, k);
 		return;
 	}
+	run->rows += count;
 	if (run->nres >= run->maxres)
 	{
 		/*
@@ -1828,6 +1859,7 @@ lion_index_facets(PG_FUNCTION_ARGS)
 							 nulls);
 	}
 
+	lion_facets_report(&run, &ff);
 	lion_facets_filter_end(&ff);
 	if (run.hascopy)
 		lion_posting_set_release(&run.copy);

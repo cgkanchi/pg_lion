@@ -89,7 +89,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			RETURN true;
@@ -115,7 +115,7 @@ VACUUM (FREEZE, ANALYZE) xd;
 -- the plans name the expression
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM xd WHERE doc->>'s' IN ('a', 'b') AND (doc->>'n')::int > 3;
 EXPLAIN (COSTS OFF) SELECT doc->>'s', doc->'o'->>'t', count(*) FROM xd GROUP BY 1, 2;
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT doc->>'s') FROM xd WHERE c = 1;
@@ -209,7 +209,7 @@ GRANT EXECUTE ON FUNCTION xd_bucket(int) TO PUBLIC;
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE xd, xq, xpart, xpt;
 DROP FUNCTION xq_rows(text, boolean);
 DROP FUNCTION xq_planned(text);
