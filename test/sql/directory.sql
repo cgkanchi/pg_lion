@@ -266,14 +266,14 @@ INSERT INTO lion_bigkey SELECT 'k' || lpad(i::text, 7, '0')
 -- one long key right behind a short one, at every distance from a page
 -- boundary: the gaps between them are 1, 2, 3, ... keys
 INSERT INTO lion_bigkey
-	SELECT 'k' || lpad(i::text, 7, '0') || repeat('x', 1970)
+	SELECT 'k' || lpad(i::text, 7, '0') || repeat('x', 2035)
 	FROM generate_series(1, 150) t, LATERAL (SELECT (t * (t + 1) / 2) AS i) s;
 CREATE INDEX lion_bigkey_k ON lion_bigkey USING lion (k);
 SELECT lion_index_verify('lion_bigkey_k', true);
 CREATE INDEX lion_bigkey_k100 ON lion_bigkey USING lion (k)
 	WITH (fillfactor = 100);
 SELECT lion_index_verify('lion_bigkey_k100', true);
-SELECT count(*) FROM lion_bigkey WHERE k = 'k0000105' || repeat('x', 1970);
+SELECT count(*) FROM lion_bigkey WHERE k = 'k0000105' || repeat('x', 2035);
 DROP TABLE lion_bigkey;
 
 -- ---------------------------------------------------------------------
@@ -942,41 +942,46 @@ DROP FUNCTION lion_bpx_eq_text(bpchar, text);
 -- 19. A long key whose posting set is just under inline_limit.
 --
 -- An entry is its header, its key and its INLINE payload, and must fit in
--- LION_MAX_ENTRY_SIZE.  With a 2000-byte key, a payload inside inline_limit
+-- LION_MAX_ENTRY_SIZE.  With a 2047-byte key, a payload inside inline_limit
 -- does not always fit next to it: the insert path spilled such a set onto a
 -- container page, but ambuild kept it INLINE and then failed to make the
 -- entry.  Any role that could INSERT could so make REINDEX, VACUUM FULL,
 -- CLUSTER and a restore of the index fail for good.  The key below is the
 -- largest a text key can be, and rows of it go in one at a time until the
--- insert path spills the set, which happens a few bytes short of
+-- insert path spills the set, which happens about 100 bytes short of
 -- inline_limit.
 -- ---------------------------------------------------------------------
-CREATE TABLE lion_bigset (id int NOT NULL, g int NOT NULL, k text NOT NULL);
+-- Two rows a page, the key kept in the row as it is: compressed, hundreds
+-- would share a page and the set would never grow this large, and at three a
+-- page the build writes it in fewer bytes than the inserts did.
+CREATE TABLE lion_bigset (id int NOT NULL, g int NOT NULL, k text NOT NULL)
+	WITH (fillfactor = 60);
+ALTER TABLE lion_bigset ALTER k SET STORAGE PLAIN;
 CREATE INDEX lion_bigset_k ON lion_bigset USING lion (k);
 CREATE INDEX lion_bigset_gk ON lion_bigset USING lion (g, k);
-INSERT INTO lion_bigset SELECT i, 0, repeat('y', 1996)
-	FROM generate_series(1, 3800) i;
+INSERT INTO lion_bigset SELECT i, 0, repeat('y', 2043)
+	FROM generate_series(1, 1800) i;
 DO $$
 BEGIN
-	FOR n IN 3801 .. 4400 LOOP
-		INSERT INTO lion_bigset VALUES (n, 0, repeat('y', 1996));
-		EXIT WHEN lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL;
+	FOR n IN 1801 .. 2400 LOOP
+		INSERT INTO lion_bigset VALUES (n, 0, repeat('y', 2043));
+		EXIT WHEN lion_index_posting_root('lion_bigset_k', repeat('y', 2043)) IS NOT NULL;
 	END LOOP;
 END $$;
 -- the inserts spilled it ...
-SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 2043)) IS NOT NULL
 	AS spilled_by_insert;
 -- ... and every rebuild has to be able to write it again
 REINDEX INDEX lion_bigset_k;
 SELECT lion_index_verify('lion_bigset_k', true);
-SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 1996)) IS NOT NULL
+SELECT lion_index_posting_root('lion_bigset_k', repeat('y', 2043)) IS NOT NULL
 	AS spilled_by_build;
 REINDEX INDEX lion_bigset_gk;
 SELECT lion_index_verify('lion_bigset_gk', true);
 VACUUM FULL lion_bigset;
 SELECT lion_index_verify('lion_bigset_k', true);
 SELECT lion_index_verify('lion_bigset_gk', true);
-SELECT lion_index_count('lion_bigset_k', repeat('y', 1996)) = count(*) AS n_exact
+SELECT lion_index_count('lion_bigset_k', repeat('y', 2043)) = count(*) AS n_exact
   FROM lion_bigset;
 -- the sizes around the one above, each built from scratch
 DO $$

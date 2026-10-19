@@ -215,7 +215,7 @@ SELECT c.opcname, c.opcdefault FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcme
 -- and jsonpath from the index, but not `=` on whole documents or a
 -- count(DISTINCT) of them, which a multi-key column cannot; jsonb_ops, named,
 -- still does, and a GROUP BY doc is answered as before.  (Without the three
--- documents above whose whole value is a key longer than 2000 bytes, which
+-- documents above whose whole value is a key longer than 2047 bytes, which
 -- jsonb_ops refuses.)
 CREATE TABLE jz_d AS SELECT * FROM jz WHERE id < 9100;
 CREATE INDEX jz_d_i ON jz_d USING lion (doc);
