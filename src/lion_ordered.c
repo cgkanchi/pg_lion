@@ -64,6 +64,7 @@
 #include "commands/explain_format.h"
 #endif
 #include "executor/executor.h"
+#include "executor/instrument.h"
 #include "executor/nodeIndexscan.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
@@ -82,6 +83,7 @@
 #include "parser/parsetree.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/predicate.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
@@ -94,6 +96,7 @@
 #include "utils/sortsupport.h"
 #include "utils/spccache.h"
 #include "utils/typcache.h"
+#include "utils/wait_event.h"
 
 #include "lion.h"
 #include "lion_compat.h"
@@ -101,6 +104,7 @@
 #include "lion_costs.h"
 #include "lion_customscan.h"
 #include "lion_vec.h"
+#include "lion_arena.h"
 
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
@@ -507,9 +511,9 @@ lo_priv_encode(const LoPriv *p)
  * --------------------------------------------------------------------- */
 
 /*
- * A set of heap TIDs as containers (§3) sorted by container key.  A NULL
- * container means "every TID of this key's 64 heap blocks": what the set
- * degrades to when it outgrows hash_mem (DESIGN.md §30.4).
+ * A set of heap TIDs as containers (§3) sorted by container key, one a key,
+ * none of them NULL.  Its memory is lo_set_alloc()'s: within hash_mem, or
+ * spilled (DESIGN.md §30.4, "Spilling").
  */
 typedef struct LionTidSet
 {
@@ -519,7 +523,11 @@ typedef struct LionTidSet
 	LionContainer **conts;
 } LionTidSet;
 
-/* Bytes of directory charged per container key, on top of the container. */
+/*
+ * Bytes of directory the planner counts per container key, on top of the
+ * container (§30.3): keys[] and conts[] grow by doubling, so about a third
+ * over their entries.
+ */
 #define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4))
 
 /*
@@ -581,7 +589,7 @@ typedef struct LionTidSet
 
 typedef struct LoGatherSlot
 {
-	LionContainer *c;			/* the key's members so far (setcxt), or NULL */
+	LionContainer *c;			/* the key's members so far (the set's), or NULL */
 	uint16		n;				/* members in vals[] not in c yet */
 	uint16		vals[LO_GATHER_INLINE];
 } LoGatherSlot;
@@ -758,11 +766,15 @@ typedef struct LionOrderedState
 	MemoryContext buildcxt;		/* sources while building */
 	LionTidSet *set;			/* NULL: not built for this scan yet */
 	List	   *live;			/* sets alive during a build */
-	Size		bytes;
-	Size		limit;
-	bool		degraded;
+	Size		bytes;			/* the set's memory, in setcxt and buildcxt */
+	Size		limit;			/* ... within which it stays: hash_mem */
+	bool		spilled;		/* this build's set outgrew it: in the arena */
+	LionArena  *arena;			/* the set past hash_mem (§30.4, "Spilling") */
+	File		arenafile;		/* its temporary file, once needed */
+	MemoryContextCallback arenacb;	/* unmaps it with the query's memory */
+	Size		spillbytes;		/* EXPLAIN: arena bytes the last build took */
 	bool		exact;
-	uint64		members;		/* members of the set, when not degraded */
+	uint64		members;		/* members of the set */
 
 	/*
 	 * ... or the set evaluated only at the container keys the walk meets
@@ -1165,7 +1177,7 @@ lo_pred_implied(IndexOptInfo *idx, List *lionqual)
  * qual when a lion index clause is lossy at plan time - every member is then
  * rechecked, and a walk that read the heap for each would be heap mode under
  * another name.  A lion qual that is not lossy is rechecked only when its set
- * turns out inexact or degraded at run time, and then from the heap tuple
+ * turns out inexact at run time, and then from the heap tuple
  * where the btree lacks its columns (§40.4), so its Vars are not required.  A
  * system column (ctid, which a row mark adds) or a whole-row Var is among
  * the Vars as one no index returns.
@@ -1336,6 +1348,44 @@ lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
 }
 
 /*
+ * The bytes the set is expected to take (DESIGN.md §30.3): a directory
+ * entry and a container header a key, and two bytes a member up to a
+ * BITSET a key.
+ */
+static double
+lo_set_bytes(double members, double ncont)
+{
+	return ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+}
+
+/*
+ * What a set past hash_mem (get_hash_memory_limit()) costs beyond its build
+ * (§30.4, "Spilling"): the bytes past it go to a temporary file, each page
+ * of it written as zeros when the file is extended, faulted in and written
+ * again as the set's bytes land in it.  Measured on the 2M emulation at a
+ * 64 kB hash_mem against the default (2026-10-19, the least of 10 runs,
+ * twice): the 10% range's set, 1.3 MB spilled, 20.9 and 21.0 ms against
+ * 20.1 and 20.6; the 30% range's, 3.1 MB, 84.3 and 89.5 against 82.9 and
+ * 86.9; the 90% range's, 6.2 MB, 259.7 and 244.6 against 253.0 and 248.7 -
+ * about 5 us a page of BLCKSZ where the runs differ at all, 60
+ * cpu_tuple_cost on the walk's scale (LO_PIECE_TUPLES), and that is the
+ * price: 0.00015 a member, next to the piece's 0.01.
+ */
+#define LO_SPILL_PAGE_TUPLES	60
+
+static Cost
+lo_spill_cost(double setbytes)
+{
+	double		limit = (double) get_hash_memory_limit();
+
+	if (setbytes <= limit)
+		return 0.0;
+	return ceil((setbytes - limit) / BLCKSZ) * LO_SPILL_PAGE_TUPLES *
+		cpu_tuple_cost;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
@@ -1344,7 +1394,7 @@ lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, Cost *startup_p, Cost *total_p, double *setbytes)
+		bool indexonly, Cost *startup_p, Cost *total_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1370,12 +1420,11 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 	members = clamp_row_est(sel * tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
-	*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
-		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
-	/* the lookups, and the copy of their answer into the set */
+	/* the lookups, the copy of their answer into the set, and its spill */
 	startup = lioncost + ncont * cpu_operator_cost +
-		lo_set_pieces(root, lion, members, ncont);
+		lo_set_pieces(root, lion, members, ncont) +
+		lo_spill_cost(lo_set_bytes(members, ncont));
 
 	/* the walk: the ordered index's own cost, and the probe of each entry */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
@@ -1504,8 +1553,7 @@ lo_knn_path(IndexPath *ipath)
  */
 static void
 lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-			List *residual, double rows, Cost *startup_p, Cost *total_p,
-			double *setbytes)
+			List *residual, double rows, Cost *startup_p, Cost *total_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1521,11 +1569,10 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 	members = clamp_row_est(sel * tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
-	*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
-		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
 
 	startup = lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
+		lo_spill_cost(lo_set_bytes(members, ncont)) +
 		lion_vec_scan_cost(root, ord, members, &fetch);
 
 	run = members * (fetch + cpu_index_tuple_cost + cpu_operator_cost +
@@ -2071,7 +2118,7 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 static void
 lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 			 List *lionqual, List *residual, double rows, Cost *startup_p,
-			 Cost *total_p, double *setbytes)
+			 Cost *total_p)
 {
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
@@ -2126,7 +2173,6 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 
 	/* the descent to where the walk starts */
 	startup = 2.0 * random_page_cost;
-	*setbytes = 0.0;
 	if (lion != NULL)
 	{
 		Cost		lioncost;
@@ -2138,9 +2184,8 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
 		members = clamp_row_est(sel * tuples);
 		ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
-		*setbytes = ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
-			Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
-		startup += lioncost + ncont * cpu_operator_cost;
+		startup += lioncost + ncont * cpu_operator_cost +
+			lo_spill_cost(lo_set_bytes(members, ncont));
 
 		/*
 		 * What the set selects among the rows walked: not what the walked
@@ -2301,8 +2346,7 @@ typedef enum LoKnnWhy
 {
 	LO_KNN_NONE,				/* nothing in the way but the clauses */
 	LO_KNN_DISABLED,			/* pg_lion.enable_ordered_scan is off */
-	LO_KNN_RELATION,			/* not a relation the node scans (§30.1) */
-	LO_KNN_MEMORY				/* the set would not fit (§30.3) */
+	LO_KNN_RELATION				/* not a relation the node scans (§30.1) */
 } LoKnnWhy;
 
 /*
@@ -2778,8 +2822,6 @@ lo_knn_error(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					   table, clauses.data) :
 			 knn->why == LO_KNN_DISABLED ?
 			 errdetail("pg_lion.enable_ordered_scan is off, so LionOrdered cannot restrict the scan to the rows that pass the filter.") :
-			 knn->why == LO_KNN_MEMORY ?
-			 errdetail("Lion's set of the rows that pass the filter would not fit in hash_mem (work_mem times hash_mem_multiplier), so LionOrdered cannot restrict the scan to them.") :
 			 errdetail("LionOrdered, which restricts the scan to the rows that pass a filter, does not scan \"%s\" in this query.",
 					   table),
 			 errhint("Filter the first rows of a nearest-neighbour subquery instead, which makes the approximation explicit: SELECT ... FROM (SELECT ..., <distance> AS d FROM %s [WHERE <clauses lion indexes answer>] ORDER BY d LIMIT 1000) s WHERE <the other clauses> ORDER BY d LIMIT 10.  For an exact answer, a sort of the rows that pass the filter, set pg_lion.vector_postfilter to exact; to filter the rows the scan returns, set it to allow.",
@@ -2806,7 +2848,6 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	Bitmapset  *targetattrs = NULL;
 	ListCell   *lc;
 	ListCell   *lc2;
-	Size		limit;
 	double		rows;
 
 	if (!lion_enable_ordered_scan)
@@ -2922,8 +2963,6 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		}
 	}
 
-	limit = get_hash_memory_limit();
-
 	/*
 	 * The rows the node returns, as lion's estimates see them: core's, times
 	 * what the intersection probe measured of the set clauses among the
@@ -2984,7 +3023,6 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			bool		indexonly;
 			Cost		startup;
 			Cost		total;
-			double		setbytes;
 
 			if (lo_knn_path(ord))
 			{
@@ -3000,12 +3038,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					continue;
 				/* a lionvec index returns no values: heap mode (§44.6) */
 				lo_cost_knn(root, rel, ord, lion, residual, rows,
-							&startup, &total, &setbytes);
-				if (setbytes > (double) limit)
-				{
-					lo_knn_why(knn, LO_KNN_MEMORY);
-					continue;
-				}
+							&startup, &total);
 				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
 							list_make3(ord, lion, NIL), rows, startup, total);
 				knn->offered++;
@@ -3019,9 +3052,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 													  lionqual, lossy),
 									  &iocols);
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, &startup, &total, &setbytes);
-			if (setbytes > (double) limit)
-				continue;		/* the set would not fit (§30.3) */
+					indexonly, &startup, &total);
 			lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
 						list_make3(ord, lion, iocols), rows, startup, total);
 		}
@@ -3066,7 +3097,6 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			List	   *iocols;
 			Cost		startup;
 			Cost		total;
-			double		setbytes;
 
 			if (!lo_lion_adds(lion, ipath->indexclauses))
 				continue;
@@ -3080,9 +3110,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, &startup, &total, &setbytes);
-			if (setbytes > (double) limit)
-				continue;		/* the set would not fit (§30.3) */
+					rows, true, &startup, &total);
 			lo_add_path(rel, pathkeys != NIL ?
 						&lo_path_methods : &lo_btree_path_methods,
 						pathkeys, list_make3(ipath, lion, iocols),
@@ -3117,13 +3145,10 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 											   lionrinfos, lionqual);
 			Cost		startup;
 			Cost		total;
-			double		setbytes;
 			List	   *priv;
 
 			lo_cost_walk(root, rel, w, lion, lionqual, residual, rows,
-						 &startup, &total, &setbytes);
-			if (setbytes > (double) limit)
-				continue;		/* the set would not fit (§30.3) */
+						 &startup, &total);
 			priv = list_make5(walkinfo, w->index, w->rinfos, w->quals,
 							  list_make1(w->var));
 			priv = lappend(priv, lion);
@@ -3420,8 +3445,8 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
 	/*
-	 * Index-only mode: does the lion recheck of an inexact or degraded set
-	 * need the heap tuple, the btree lacking a column of the lion qual (§40.4)?
+	 * Index-only mode: does the lion recheck of an inexact set need the
+	 * heap tuple, the btree lacking a column of the lion qual (§40.4)?
 	 */
 	if (iocols != NIL)
 	{
@@ -3470,122 +3495,236 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 }
 
 /* ---------------------------------------------------------------------
+ * The set's memory (DESIGN.md §30.4, "Spilling")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Regions the arena may map: with each doubling the file to 64 MB, 1,024 of
+ * them hold a set of 64 GB, a container for every key of a heap of 2^32
+ * blocks and then some.
+ */
+#define LO_ARENA_REGIONS		1024
+
+/* The arena's file is extended this much at a write. */
+#define LO_ARENA_ZERO_BYTES		(64 * 1024)
+
+/*
+ * The arena asks for its file to be longer: written through fd.c, zeros,
+ * so that temp_file_limit, log_temp_files and the temp-file statistics see
+ * the bytes as they see a sort's, and so that every byte mapped is on disk
+ * before the first write to its page - a page the disk had no room for
+ * would end the backend with SIGBUS at that write.
+ */
+static bool
+lo_arena_extend(void *arg, Size from, Size to)
+{
+	LionOrderedState *st = (LionOrderedState *) arg;
+	static const char zeros[LO_ARENA_ZERO_BYTES];
+	Size		off = from;
+
+	while (off < to)
+	{
+		Size		n = Min((Size) LO_ARENA_ZERO_BYTES, to - off);
+		int			w = FileWrite(st->arenafile, zeros, n, (off_t) off,
+								  WAIT_EVENT_BUFFILE_WRITE);
+
+		if (w <= 0)
+		{
+			if (w == 0)
+				errno = ENOSPC;
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not write to temporary file of LionOrdered's set: %m")));
+		}
+		off += (Size) w;
+	}
+	pgBufferUsage.temp_blks_written += (to - from) / BLCKSZ;
+	return true;
+}
+
+/* ... and for its descriptor, opened again if fd.c closed it meanwhile. */
+static int
+lo_arena_fd(void *arg)
+{
+	LionOrderedState *st = (LionOrderedState *) arg;
+
+	if (FileSize(st->arenafile) < 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not access temporary file of LionOrdered's set: %m")));
+	return FileGetRawDesc(st->arenafile);
+}
+
+/*
+ * The mappings go with the query's memory, however the query ends; the file
+ * with its resource owner, as a sort's would, unless lo_end() closed it.
+ */
+static void
+lo_arena_release_cb(void *arg)
+{
+	LionOrderedState *st = (LionOrderedState *) arg;
+
+	if (st->arena != NULL)
+		lion_arena_release(st->arena);
+}
+
+/*
+ * This build's set has outgrown hash_mem: from here on it lives in the
+ * arena, over a temporary file, which the first spill of the node sets up.
+ */
+static void
+lo_spill_begin(LionOrderedState *st)
+{
+	if (st->arena == NULL)
+	{
+		EState	   *estate = st->css.ss.ps.state;
+		MemoryContext oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+		LionArena  *arena = (LionArena *) palloc0(sizeof(LionArena));
+		LionArenaRegion *regions = (LionArenaRegion *)
+			palloc(sizeof(LionArenaRegion) * LO_ARENA_REGIONS);
+
+		MemoryContextSwitchTo(oldcxt);
+		if (!lion_arena_available())
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("LionOrdered's set of the rows that pass the filter does not fit in hash_mem, and this platform cannot spill it to a temporary file"),
+					 errhint("Raise work_mem or hash_mem_multiplier.")));
+		lion_arena_init(arena, regions, LO_ARENA_REGIONS, lo_arena_extend,
+						lo_arena_fd, st);
+		/* registered before anything is mapped: it finds nothing to undo */
+		st->arenacb.func = lo_arena_release_cb;
+		st->arenacb.arg = st;
+		MemoryContextRegisterResetCallback(estate->es_query_cxt, &st->arenacb);
+		st->arenafile = OpenTemporaryFile(false);
+		st->arena = arena;
+	}
+	st->spilled = true;
+}
+
+/*
+ * The set's memory: in cxt, charged against hash_mem, while the charge
+ * stays within it; past that, for the rest of this build, in the arena,
+ * which hash_mem does not count (DESIGN.md §30.4, "Spilling").
+ */
+static void *
+lo_set_alloc(LionOrderedState *st, MemoryContext cxt, Size size)
+{
+	void	   *p;
+
+	if (!st->spilled)
+	{
+		if (st->bytes + size <= st->limit)
+		{
+			st->bytes += size;
+			return MemoryContextAllocExtended(cxt, size, MCXT_ALLOC_HUGE);
+		}
+		lo_spill_begin(st);
+	}
+	p = lion_arena_alloc(st->arena, size);
+	if (p == NULL)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not spill LionOrdered's set to a temporary file: %m")));
+	return p;
+}
+
+/* Give back `size` bytes lo_set_alloc() handed out, wherever they are. */
+static void
+lo_set_free(LionOrderedState *st, void *p, Size size)
+{
+	if (st->arena != NULL && lion_arena_contains(st->arena, p))
+		lion_arena_free(st->arena, p, size);
+	else
+	{
+		Assert(st->bytes >= size);
+		st->bytes -= size;
+		pfree(p);
+	}
+}
+
+/* A block of newsize bytes with the first oldsize bytes of p, p given back. */
+static void *
+lo_set_grow(LionOrderedState *st, MemoryContext cxt, void *p, Size oldsize,
+			Size newsize)
+{
+	void	   *q = lo_set_alloc(st, cxt, newsize);
+
+	memcpy(q, p, oldsize);
+	lo_set_free(st, p, oldsize);
+	return q;
+}
+
+/* ---------------------------------------------------------------------
  * The TID set
  * --------------------------------------------------------------------- */
 
 static LionTidSet *
 lo_set_new(LionOrderedState *st)
 {
-	MemoryContext oldcxt = MemoryContextSwitchTo(st->setcxt);
-	LionTidSet *set = (LionTidSet *) palloc0(sizeof(LionTidSet));
+	LionTidSet *set = (LionTidSet *) MemoryContextAllocZero(st->setcxt,
+															sizeof(LionTidSet));
 
 	set->cap = 16;
-	set->keys = (uint32 *) palloc(sizeof(uint32) * set->cap);
-	set->conts = (LionContainer **) palloc(sizeof(LionContainer *) * set->cap);
+	set->keys = (uint32 *) lo_set_alloc(st, st->setcxt,
+										sizeof(uint32) * set->cap);
+	set->conts = (LionContainer **)
+		lo_set_alloc(st, st->setcxt, sizeof(LionContainer *) * set->cap);
 	st->live = lappend(st->live, set);
-	MemoryContextSwitchTo(oldcxt);
 	return set;
 }
 
 static void
-lo_set_free(LionOrderedState *st, LionTidSet *set)
+lo_set_drop(LionOrderedState *st, LionTidSet *set)
 {
 	int			i;
 
 	for (i = 0; i < set->n; i++)
-	{
-		if (set->conts[i] != NULL)
-		{
-			st->bytes -= lion_container_size(set->conts[i]);
-			pfree(set->conts[i]);
-		}
-	}
-	st->bytes -= set->n * LO_ENTRY_BYTES;
-	pfree(set->keys);
-	pfree(set->conts);
+		lo_set_free(st, set->conts[i], lion_container_size(set->conts[i]));
+	lo_set_free(st, set->keys, sizeof(uint32) * set->cap);
+	lo_set_free(st, set->conts, sizeof(LionContainer *) * set->cap);
 	st->live = list_delete_ptr(st->live, set);
 	pfree(set);
-}
-
-/*
- * The set outgrew hash_mem: keep the container KEYS of every live set and
- * drop their containers.  From here on every key means "all of its heap
- * blocks", and every fetched member is rechecked (DESIGN.md §30.4).
- */
-static void
-lo_degrade(LionOrderedState *st)
-{
-	ListCell   *lc;
-
-	foreach(lc, st->live)
-	{
-		LionTidSet *set = (LionTidSet *) lfirst(lc);
-		int			i;
-
-		for (i = 0; i < set->n; i++)
-		{
-			if (set->conts[i] != NULL)
-			{
-				st->bytes -= lion_container_size(set->conts[i]);
-				pfree(set->conts[i]);
-				set->conts[i] = NULL;
-			}
-		}
-	}
-	st->degraded = true;
-	st->exact = false;
 }
 
 /*
  * Append (ckey, c) to the set, in ascending key: a sorted source's
  * containers come so (lion_source_sorted()), a leaf's gathered keys are
  * taken in order (lo_gather_finish()), and lo_set_combine()'s come merged
- * from two sets in order.  c is the set's own, in setcxt and charged, or
- * NULL when the set is degraded.
+ * from two sets in order.  c is the set's own, from lo_set_alloc().
  */
 static void
 lo_set_append(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 			  LionContainer *c)
 {
 	Assert(set->n == 0 || ckey > set->keys[set->n - 1]);
-	Assert(c == NULL || !st->degraded);
+	Assert(c != NULL);
 	if (set->n == set->cap)
 	{
-		set->cap *= 2;
-		set->keys = (uint32 *) repalloc_huge(set->keys,
-											 sizeof(uint32) * set->cap);
+		int			cap = set->cap * 2;
+
+		set->keys = (uint32 *) lo_set_grow(st, st->setcxt, set->keys,
+										   sizeof(uint32) * set->cap,
+										   sizeof(uint32) * cap);
 		set->conts = (LionContainer **)
-			repalloc_huge(set->conts, sizeof(LionContainer *) * set->cap);
+			lo_set_grow(st, st->setcxt, set->conts,
+						sizeof(LionContainer *) * set->cap,
+						sizeof(LionContainer *) * cap);
+		set->cap = cap;
 	}
-	st->bytes += LO_ENTRY_BYTES;
 	set->keys[set->n] = ckey;
 	set->conts[set->n] = c;
 	set->n++;
 }
 
-/*
- * Append (ckey, a copy of c, or nothing when degraded): a set that would
- * outgrow hash_mem degrades (lo_degrade()) rather than take the copy.
- */
+/* Append (ckey, a copy of c). */
 static void
 lo_set_push(LionOrderedState *st, LionTidSet *set, uint32 ckey,
 			const LionContainer *c)
 {
-	LionContainer *copy = NULL;
+	Size		size = lion_container_size(c);
+	LionContainer *copy = (LionContainer *) lo_set_alloc(st, st->setcxt, size);
 
-	if (c != NULL && !st->degraded)
-	{
-		Size		size = lion_container_size(c);
-
-		if (st->bytes + LO_ENTRY_BYTES + size > st->limit)
-			lo_degrade(st);
-		else
-		{
-			copy = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
-			memcpy(copy, c, size);
-			st->bytes += size;
-		}
-	}
+	memcpy(copy, c, size);
 	lo_set_append(st, set, ckey, copy);
 }
 
@@ -3600,11 +3739,10 @@ lo_set_or_last(LionOrderedState *st, LionTidSet *set, const LionContainer *c)
 	LionContainer *last = set->conts[set->n - 1];
 	uint64	   *img;
 	LionContainer *out;
+	LionContainer *copy;
 	Size		size;
 
 	Assert(set->n > 0 && c->ckey == set->keys[set->n - 1]);
-	if (st->degraded || last == NULL)
-		return;
 	img = (uint64 *) MemoryContextAllocZero(st->buildcxt, LION_BITSET_BYTES);
 	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 											   LION_CONTAINER_MAX_SIZE);
@@ -3612,20 +3750,10 @@ lo_set_or_last(LionOrderedState *st, LionTidSet *set, const LionContainer *c)
 	lion_container_or_into_bitset(c, img);
 	lion_bits_to_container(img, c->ckey, out);
 	size = lion_container_size(out);
-	st->bytes -= lion_container_size(last);
-	pfree(last);
-	set->conts[set->n - 1] = NULL;
-	if (st->bytes + size > st->limit)
-		lo_degrade(st);
-	else
-	{
-		LionContainer *copy = (LionContainer *)
-			MemoryContextAlloc(st->setcxt, size);
-
-		memcpy(copy, out, size);
-		st->bytes += size;
-		set->conts[set->n - 1] = copy;
-	}
+	lo_set_free(st, last, lion_container_size(last));
+	copy = (LionContainer *) lo_set_alloc(st, st->setcxt, size);
+	memcpy(copy, out, size);
+	set->conts[set->n - 1] = copy;
 	pfree(img);
 	pfree(out);
 }
@@ -3649,10 +3777,11 @@ lo_gather_new(LionOrderedState *st)
 	g->nchunks = LO_GATHER_FIRST_CHUNKS;
 	g->maxchunk = 0;
 	g->chunks = (LoGatherSlot **)
-		MemoryContextAllocZero(st->buildcxt,
-							   sizeof(LoGatherSlot *) * g->nchunks);
-	g->touched = (uint64 *) MemoryContextAllocZero(st->buildcxt,
-												   sizeof(uint64) * g->nchunks);
+		lo_set_alloc(st, st->buildcxt, sizeof(LoGatherSlot *) * g->nchunks);
+	memset(g->chunks, 0, sizeof(LoGatherSlot *) * g->nchunks);
+	g->touched = (uint64 *) lo_set_alloc(st, st->buildcxt,
+										 sizeof(uint64) * g->nchunks);
+	memset(g->touched, 0, sizeof(uint64) * g->nchunks);
 	g->img = (uint64 *) MemoryContextAlloc(st->buildcxt, LION_BITSET_BYTES);
 	g->out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
 												  LION_CONTAINER_MAX_SIZE);
@@ -3660,56 +3789,7 @@ lo_gather_new(LionOrderedState *st)
 		MemoryContextAlloc(st->buildcxt,
 						   LION_CONTAINER_HDRSZ +
 						   sizeof(uint16) * LO_GATHER_INLINE);
-	st->bytes += (sizeof(LoGatherSlot *) + sizeof(uint64)) * g->nchunks;
 	return g;
-}
-
-/*
- * Drop every key's members, and the chunks that held them; the keys met
- * stay (touched[]): the set outgrew hash_mem, and from here on a key means
- * all of its heap blocks (lo_degrade()).
- */
-static void
-lo_gather_degrade(LionOrderedState *st, LoGather *g)
-{
-	uint32		k;
-	uint32		i;
-
-	lo_degrade(st);
-	for (k = 0; k < g->maxchunk; k++)
-	{
-		LoGatherSlot *slots = g->chunks[k];
-
-		if (slots == NULL)
-			continue;
-		for (i = 0; i < LO_GATHER_CHUNK_KEYS; i++)
-		{
-			if (slots[i].c != NULL)
-			{
-				st->bytes -= lion_container_size(slots[i].c);
-				pfree(slots[i].c);
-			}
-		}
-		st->bytes -= LO_GATHER_CHUNK_BYTES;
-		pfree(slots);
-		g->chunks[k] = NULL;
-	}
-}
-
-/*
- * Room for `need` more bytes: charged, or the set degraded (then there is
- * none, and false comes back).
- */
-static bool
-lo_gather_charge(LionOrderedState *st, LoGather *g, Size need)
-{
-	if (st->bytes + need > st->limit)
-	{
-		lo_gather_degrade(st, g);
-		return false;
-	}
-	st->bytes += need;
-	return true;
 }
 
 /* Set the pending members of slot in a bitset image; how many were new. */
@@ -3736,10 +3816,9 @@ lo_gather_set_bits(const LoGatherSlot *slot, uint64 *w)
 /*
  * The slot's pending members, and the piece c when there is one, into the
  * container of ckey the slot holds (which it may not yet): a new one takes
- * the old one's place, charged; false when the set degraded instead, and
- * the slot's members are gone.
+ * the old one's place.
  */
-static bool
+static void
 lo_gather_flush(LionOrderedState *st, LoGather *g, LoGatherSlot *slot,
 				uint32 ckey, const LionContainer *c)
 {
@@ -3751,7 +3830,6 @@ lo_gather_flush(LionOrderedState *st, LoGather *g, LoGatherSlot *slot,
 	bool		merged = false;
 	Size		size;
 
-	Assert(!st->degraded);
 	Assert(slot->n > 0 || c != NULL);
 
 	if (old != NULL && old->type == LION_CT_BITSET)
@@ -3764,7 +3842,7 @@ lo_gather_flush(LionOrderedState *st, LoGather *g, LoGatherSlot *slot,
 		if (c != NULL)
 			lion_container_or_inplace(old, c);
 		slot->n = 0;
-		return true;
+		return;
 	}
 
 	if (total <= LO_MERGE_DIRECT_MAX)
@@ -3817,16 +3895,12 @@ lo_gather_flush(LionOrderedState *st, LoGather *g, LoGatherSlot *slot,
 	slot->n = 0;
 	if (old != NULL)
 	{
-		st->bytes -= lion_container_size(old);
-		pfree(old);
+		lo_set_free(st, old, lion_container_size(old));
 		slot->c = NULL;
 	}
-	if (!lo_gather_charge(st, g, size))
-		return false;
-	copy = (LionContainer *) MemoryContextAlloc(st->setcxt, size);
+	copy = (LionContainer *) lo_set_alloc(st, st->setcxt, size);
 	memcpy(copy, out, size);
 	slot->c = copy;
-	return true;
 }
 
 /* Take the members of piece c, a container of key c->ckey. */
@@ -3846,46 +3920,42 @@ lo_gather_push(LionOrderedState *st, LoGather *g, const LionContainer *c)
 				 c->ckey);
 		while (n <= chunk)
 			n *= 2;
-		g->chunks = (LoGatherSlot **) repalloc(g->chunks,
-											   sizeof(LoGatherSlot *) * n);
+		g->chunks = (LoGatherSlot **)
+			lo_set_grow(st, st->buildcxt, g->chunks,
+						sizeof(LoGatherSlot *) * g->nchunks,
+						sizeof(LoGatherSlot *) * n);
 		memset(g->chunks + g->nchunks, 0,
 			   sizeof(LoGatherSlot *) * (n - g->nchunks));
-		g->touched = (uint64 *) repalloc(g->touched, sizeof(uint64) * n);
+		g->touched = (uint64 *) lo_set_grow(st, st->buildcxt, g->touched,
+											sizeof(uint64) * g->nchunks,
+											sizeof(uint64) * n);
 		memset(g->touched + g->nchunks, 0,
 			   sizeof(uint64) * (n - g->nchunks));
-		st->bytes += (sizeof(LoGatherSlot *) + sizeof(uint64)) *
-			(n - g->nchunks);
 		g->nchunks = n;
-		if (!st->degraded && st->bytes > st->limit)
-			lo_gather_degrade(st, g);
 	}
 	g->touched[chunk] |= UINT64CONST(1) << i;
 	if (chunk >= g->maxchunk)
 		g->maxchunk = chunk + 1;
-	if (st->degraded)
-		return;					/* the keys alone: every member rechecked */
 
 	if (g->chunks[chunk] == NULL)
 	{
-		if (!lo_gather_charge(st, g, LO_GATHER_CHUNK_BYTES))
-			return;
 		g->chunks[chunk] = (LoGatherSlot *)
-			MemoryContextAllocZero(st->buildcxt, LO_GATHER_CHUNK_BYTES);
+			lo_set_alloc(st, st->buildcxt, LO_GATHER_CHUNK_BYTES);
+		memset(g->chunks[chunk], 0, LO_GATHER_CHUNK_BYTES);
 	}
 	slot = &g->chunks[chunk][i];
 	if (c->type == LION_CT_ARRAY && c->cardinality <= LO_GATHER_INLINE)
 	{
 		uint32		card = c->cardinality;
 
-		if (slot->n + card > LO_GATHER_INLINE &&
-			!lo_gather_flush(st, g, slot, c->ckey, NULL))
-			return;
+		if (slot->n + card > LO_GATHER_INLINE)
+			lo_gather_flush(st, g, slot, c->ckey, NULL);
 		memcpy(slot->vals + slot->n, LION_ARRAY_DATA(c),
 			   sizeof(uint16) * card);
 		slot->n += card;
 	}
 	else
-		(void) lo_gather_flush(st, g, slot, c->ckey, c);
+		lo_gather_flush(st, g, slot, c->ckey, c);
 }
 
 /*
@@ -3906,50 +3976,39 @@ lo_gather_finish(LionOrderedState *st, LoGather *g, LionTidSet *set)
 		{
 			uint32		i = (uint32) pg_rightmost_one_pos64(bits);
 			uint32		ckey = k * LO_GATHER_CHUNK_KEYS + i;
-			LionContainer *c = NULL;
+			LoGatherSlot *slot = &g->chunks[k][i];
+			LionContainer *c;
 
 			bits &= bits - 1;
 			CHECK_FOR_INTERRUPTS();
-			if (!st->degraded)
+			Assert(slot->n > 0 || slot->c != NULL);
+			if (slot->n > 0)
+				lo_gather_flush(st, g, slot, ckey, NULL);
+			c = slot->c;
+			slot->c = NULL;
+			if (c->type == LION_CT_BITSET)
 			{
-				LoGatherSlot *slot = &g->chunks[k][i];
+				/* a dense key's working form: the smallest now */
+				Size		size;
+				LionContainer *copy;
 
-				Assert(slot->n > 0 || slot->c != NULL);
-				if (slot->n == 0 || lo_gather_flush(st, g, slot, ckey, NULL))
-				{
-					c = slot->c;
-					slot->c = NULL;
-					if (c->type == LION_CT_BITSET)
-					{
-						/* a dense key's working form: the smallest now */
-						Size		size;
-						LionContainer *copy;
-
-						lion_bits_to_container(LION_BITSET_DATA(c), ckey,
-											   g->out);
-						size = lion_container_size(g->out);
-						copy = (LionContainer *)
-							MemoryContextAlloc(st->setcxt, size);
-						memcpy(copy, g->out, size);
-						st->bytes -= lion_container_size(c);
-						st->bytes += size;
-						pfree(c);
-						c = copy;
-					}
-				}
+				lion_bits_to_container(LION_BITSET_DATA(c), ckey, g->out);
+				size = lion_container_size(g->out);
+				copy = (LionContainer *) lo_set_alloc(st, st->setcxt, size);
+				memcpy(copy, g->out, size);
+				lo_set_free(st, c, lion_container_size(c));
+				c = copy;
 			}
 			lo_set_append(st, set, ckey, c);
 		}
 		if (g->chunks[k] != NULL)
 		{
-			st->bytes -= LO_GATHER_CHUNK_BYTES;
-			pfree(g->chunks[k]);
+			lo_set_free(st, g->chunks[k], LO_GATHER_CHUNK_BYTES);
 			g->chunks[k] = NULL;
 		}
 	}
-	st->bytes -= (sizeof(LoGatherSlot *) + sizeof(uint64)) * g->nchunks;
-	pfree(g->chunks);
-	pfree(g->touched);
+	lo_set_free(st, g->chunks, sizeof(LoGatherSlot *) * g->nchunks);
+	lo_set_free(st, g->touched, sizeof(uint64) * g->nchunks);
 	pfree(g->img);
 	pfree(g->out);
 	pfree(g->pend);
@@ -3988,27 +4047,15 @@ lo_set_combine(LionOrderedState *st, LionTidSet *a, LionTidSet *b, bool isand)
 		}
 
 		/* the same key in both */
-		if (st->degraded || a->conts[i] == NULL || b->conts[j] == NULL)
-		{
-			/*
-			 * Only a degraded set has keys without containers, and then the
-			 * result keeps the key: "every TID of these blocks may be one".
-			 */
-			if (!isand || (a->conts[i] == NULL && b->conts[j] == NULL))
-				lo_set_push(st, r, a->keys[i], NULL);
-			else
-				lo_set_push(st, r, a->keys[i],
-							a->conts[i] != NULL ? a->conts[i] : b->conts[j]);
-		}
-		else if ((isand ? lion_container_and(a->conts[i], b->conts[j], buf) :
-				  lion_container_or(a->conts[i], b->conts[j], buf)) > 0)
+		if ((isand ? lion_container_and(a->conts[i], b->conts[j], buf) :
+			 lion_container_or(a->conts[i], b->conts[j], buf)) > 0)
 			lo_set_push(st, r, a->keys[i], buf);
 		i++;
 		j++;
 	}
 	pfree(buf);
-	lo_set_free(st, a);
-	lo_set_free(st, b);
+	lo_set_drop(st, a);
+	lo_set_drop(st, b);
 	return r;
 }
 
@@ -4026,9 +4073,8 @@ lo_set_find(const LionTidSet *set, ItemPointer tid)
 		int			mid = lo + (hi - lo) / 2;
 
 		if (set->keys[mid] == ckey)
-			return (set->conts[mid] == NULL ||
-					lion_container_contains(set->conts[mid],
-											lion_code_lo(code))) ? mid : -1;
+			return lion_container_contains(set->conts[mid],
+										   lion_code_lo(code)) ? mid : -1;
 		if (set->keys[mid] < ckey)
 			lo = mid + 1;
 		else
@@ -4132,9 +4178,11 @@ lo_build_set(LionOrderedState *st)
 	int			i;
 
 	MemoryContextReset(st->setcxt);
+	if (st->arena != NULL)
+		lion_arena_reset(st->arena);
 	st->live = NIL;
 	st->bytes = 0;
-	st->degraded = false;
+	st->spilled = false;
 	st->exact = !st->lossyqual;
 	st->limit = get_hash_memory_limit();
 
@@ -4145,10 +4193,8 @@ lo_build_set(LionOrderedState *st)
 	st->ncont = st->set->n;
 	st->members = 0;
 	for (i = 0; i < st->set->n; i++)
-	{
-		if (st->set->conts[i] != NULL)
-			st->members += st->set->conts[i]->cardinality;
-	}
+		st->members += st->set->conts[i]->cardinality;
+	st->spillbytes = st->spilled ? lion_arena_used(st->arena) : 0;
 	st->builds++;
 }
 
@@ -4610,7 +4656,7 @@ lo_lazy_convert(LionOrderedState *st)
 	lo_lazy_end(st);
 
 	lo_build_set(st);
-	if (!st->degraded && st->set->n > 0)
+	if (st->set->n > 0)
 	{
 		visited = (uint64 **) MemoryContextAllocZero(st->scancxt,
 													 sizeof(uint64 *) * st->set->n);
@@ -4841,6 +4887,8 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->setcxt = AllocSetContextCreate(estate->es_query_cxt,
 									   "LionOrdered set",
 									   ALLOCSET_DEFAULT_SIZES);
+	st->arena = NULL;
+	st->arenafile = -1;
 	st->buildcxt = AllocSetContextCreate(estate->es_query_cxt,
 										 "LionOrdered build",
 										 ALLOCSET_DEFAULT_SIZES);
@@ -5138,7 +5186,7 @@ lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
 }
 
 /*
- * The lion recheck of a row the walk met, when the set is inexact or degraded
+ * The lion recheck of a row the walk met, when the set is inexact
  * (DESIGN.md §30.4): on the scan slot, as every recheck is - or, in index-only
  * mode over a btree that lacks a column of the lion qual (§40.4), on the heap
  * tuple, fetched now into the node's table slot if the visibility test did
@@ -5605,12 +5653,12 @@ lo_next(ScanState *ss)
 				lo_lazy_convert(st);
 			}
 		}
-		counted = !st->noset && !st->lazy && !st->degraded && !st->novisit;
+		counted = !st->noset && !st->lazy && !st->novisit;
 
 		/*
 		 * Every member met: nothing further along can be one (§30.4,
 		 * "Stopping early").  A member counts once however often the walk
-		 * meets its TID; not knowable once the set has degraded.
+		 * meets its TID.
 		 */
 		if (counted && st->distinct >= st->members)
 		{
@@ -5830,6 +5878,14 @@ lo_end(CustomScanState *node)
 	st->setcxt = NULL;
 	st->buildcxt = NULL;
 	st->set = NULL;
+	if (st->arena != NULL)
+	{
+		/* the mappings first: the file is unlinked as it is closed */
+		lion_arena_release(st->arena);
+		FileClose(st->arenafile);
+		st->arenafile = -1;
+		st->arena = NULL;
+	}
 }
 
 /* ---------------------------------------------------------------------
@@ -5949,8 +6005,10 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 		{
 			resetStringInfo(&buf);
 			appendStringInfo(&buf, "%d containers, %s", st->ncont,
-							 st->degraded ? "degraded" :
 							 st->exact ? "exact" : "rechecked");
+			if (st->spillbytes > 0)
+				appendStringInfo(&buf, ", spilled %zu kB",
+								 (st->spillbytes + 1023) / 1024);
 			if (st->builds > 1)
 				appendStringInfo(&buf, ", %llu builds",
 								 (unsigned long long) st->builds);

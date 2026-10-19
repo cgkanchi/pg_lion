@@ -176,7 +176,7 @@ BEGIN
 		IF ln ~ '(Ordered By|Index):' THEN
 			RETURN NEXT btrim(ln);
 		ELSIF ln ~ 'Lion Set:' THEN
-			RETURN NEXT 'Lion Set: ' || substring(ln from '(exact|rechecked|degraded)');
+			RETURN NEXT 'Lion Set: ' || substring(ln from '(exact|rechecked)');
 		ELSIF ln ~ '(Heap Fetches|Rows Removed by Lion Recheck)' THEN
 			RETURN NEXT substring(ln from '(Heap Fetches|Rows Removed by Lion Recheck)') ||
 						CASE WHEN ln ~ ': 0$' THEN ': 0' ELSE ': > 0' END;
@@ -380,7 +380,7 @@ SELECT * FROM lion_bs_plan('SELECT id, k, x FROM bs WHERE k BETWEEN 1000 AND 900
 -- 13. A btree that lacks the lion filter's columns covers the query all the
 --     same (DESIGN.md §40.1): an exact set - a multi-key AND or OR of whole
 --     keys included (§29.6) - needs no recheck, and a set that turns out
---     inexact or degraded at run time is rechecked on the heap tuple,
+--     inexact at run time is rechecked on the heap tuple,
 --     fetched for that alone and counted.  Lion marks no clause lossy at
 --     plan time, so a tsquery prefix or NOT - a superset, rechecked on every
 --     member - walks index-only too, reading the heap for each member as
@@ -413,9 +413,9 @@ ROLLBACK;
 -- (few pages with dead items) would leave their dead items, and those pages
 -- not all-visible, so the index cleanup is forced
 VACUUM (FREEZE, INDEX_CLEANUP ON) bs;
--- a set that outgrows hash_mem at run time degrades to container keys and
--- rechecks every member (ordered.sql, section 10: the table that does, its
--- plan made at 64MB and kept, run at 64kB)
+-- a set that outgrows hash_mem at run time spills and stays exact: nothing
+-- is rechecked, and the heap is not read (ordered.sql, section 10: the
+-- table that does, its plan made at 64MB and kept, run at 64kB)
 CREATE TABLE bsd (id int PRIMARY KEY, k int, c2 int, pad text)
 	WITH (autovacuum_enabled = off);
 INSERT INTO bsd

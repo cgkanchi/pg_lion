@@ -596,9 +596,8 @@ extern bool lion_vec_relation(Relation index);
 /*
  * ... and restrict a lionvec scan, after its
  * rescan and before its first tuple, to the members of a set of heap TIDs -
- * n container keys in ascending order and their containers, a NULL
- * container meaning every TID of that key's heap blocks.  The arrays must
- * outlive the scan, or the next rescan.
+ * n container keys in ascending order and their containers.  The arrays
+ * and the containers must outlive the scan, or the next rescan.
  */
 extern void lion_vec_restrict(IndexScanDesc scan, int n, const uint32 *keys,
 							  LionContainer *const *conts);

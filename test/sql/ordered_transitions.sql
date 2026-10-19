@@ -120,8 +120,7 @@ SELECT * FROM otr_run('EXECUTE otr_id(3, 0, 7)');
 SELECT otr_same('EXECUTE otr_id(3, 0, 7)',
 	'SELECT id FROM otr WHERE a = 3 AND b = 4 ORDER BY id % 8, id LIMIT 3000');
 
--- 4. ... and the set built then degrades to its container keys, every
---    member rechecked
+-- 4. ... and the set built then spills past hash_mem, exact still
 SELECT * FROM otr_run('EXECUTE otr_or(1, 0, 7)');
 SELECT otr_same('EXECUTE otr_or(1, 0, 7)',
 	'SELECT id FROM otr WHERE (b = 1 OR a = 2) ORDER BY id % 8, id LIMIT 90000');

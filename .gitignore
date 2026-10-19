@@ -16,6 +16,7 @@ test/unit/entry_test
 test/unit/vec_test
 test/unit/vec_test_nosimd
 test/unit/readahead_test
+test/unit/arena_test
 __pycache__/
 *.pyc
 .deps/

@@ -15857,12 +15857,17 @@ would, it fetches and sorts those. The same query now takes 2.8 ms: 80,000 entri
 2,500 members fetched and sorted (§30.10). Still 3.5x the bitmap plan's time - the cost of not
 knowing - but no longer 50x.
 
-**Memory ceiling.** The set is the answer's containers (§3): at most 4 kB per 64 heap blocks and
+**Memory.** The set is the answer's containers (§3): at most 4 kB per 64 heap blocks and
 about 2 bytes per member for a sparse answer, plus 16 bytes of directory per container - some
-12 MB for half of 100M rows. It has to fit in `hash_mem` (`get_hash_memory_limit()`, `work_mem x
-hash_mem_multiplier`, what core allows one node's in-memory hash table), and the planner does not
-offer a path whose estimate exceeds it. The estimate can be wrong, so the executor DEGRADES rather
-than overruns (§30.4).
+12 MB for half of 100M rows, 200 to 300 MB for a tenth of a billion. It is built in `hash_mem`
+(`get_hash_memory_limit()`, `work_mem x hash_mem_multiplier`, what core allows one node's
+in-memory hash table), and past that in a temporary file mapped into memory (§30.4, "Spilling"),
+which the planner prices (`lo_spill_cost()`: the pages the estimate puts past `hash_mem`, at 60
+`cpu_tuple_cost` each, the 5 us a page measured) and never refuses. *(Until 2026-10-19 the
+planner offered no path whose estimate exceeded `hash_mem`, and a set that outgrew it at run time
+DEGRADED to its container keys, every member rechecked: at a billion rows every wide filter's set
+is past the default `hash_mem`, and a refused plan there is the query failing under
+`pg_lion.vector_postfilter`'s default.)*
 
 ### 30.4 Execution
 
@@ -15961,17 +15966,41 @@ than overruns (§30.4).
   value, 74 against 113. At 64 kB of hash_mem the sets that were exact still are, the gather
   holding a chunk and the containers it has made and no more. The 50M table is to be measured
   again.)*
-- **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true, no
-  lion index clause was lossy and the set did not degrade. Then every member satisfies the
+- **Exact, or rechecked.** The set is EXACT when every leaf's `lion_source_exact()` is true and
+  no lion index clause was lossy. Then every member satisfies the
   `lionqual` and nothing is rechecked; otherwise every fetched member is tested against the
   `lionqual` (the multi-key strategies of §17, a range beside its column's sets, §29.6), and one
   that fails counts as removed by the lion recheck.
-- **Degrading.** The set counts its bytes; when they would exceed `get_hash_memory_limit()` it
-  frees every container and keeps only their KEYS - "every TID of these 64 heap blocks may be a
-  member" -, marks itself inexact, and carries on that way. Memory is then 16 bytes per container
-  key, at most one per 64 heap blocks (and, while a WALK or LIST leaf is being read, the gather's
-  keys met: a bit each, in chunks of 64); the answer
-  stays exact because every fetched member is now rechecked; the node walks on as a slower filter.
+- **Spilling** (2026-10-19). The set's memory - its containers, the gather's chunks, the
+  directory - comes from `lo_set_alloc()`, which counts its bytes against `get_hash_memory_limit()`
+  and, at the first byte past it, moves the rest of the build into an ARENA (`lion_arena.c`): a
+  temporary file of the backend's (`OpenTemporaryFile()`, in `pgsql_tmp`, gone with the query or
+  the transaction) mapped into memory in regions, the first of a megabyte, each next one doubling
+  the file to 64 MB, from which blocks are handed out in size classes - the powers of two from 16
+  bytes, and one class for the largest container - with a free list a class, so that a container
+  that grows by a few members at each flush goes back to the block it just left. A block never
+  moves, so the set's containers are probed through plain pointers wherever they are
+  (`lo_set_find()`, the lionvec scan's `lv_member()`), and what was built in memory before the
+  spill stays there: the memory the node holds is at most `hash_mem` and the file holds the rest,
+  in the page cache while the kernel keeps it there and on disk when it does not, which is the
+  spill. The file is extended through fd.c, written as zeros before a region is mapped (so that
+  `temp_file_limit` stops it, `log_temp_files` and `pg_stat_database` count it, EXPLAIN (BUFFERS)
+  shows its blocks as `temp written`, and every page exists on disk before the first write to
+  it: a page a full disk could not allocate at that write would end the backend with SIGBUS),
+  and the mappings go with the query's memory context, the file with its resource owner, however
+  the query ends. A rescan that rebuilds the set reuses the file. The set stays exact, and the
+  answer does not depend on `work_mem`; EXPLAIN ANALYZE says `spilled N kB`. The arena is not
+  §27's `LionSpill`, which writes a collected set's containers to a BufFile in key order to be read
+  back one at a time: this set is probed at random, by every TID the walk or the scan meets. Cost:
+  about 5 us a page of 8 kB on the 2M emulation (a 64 kB `hash_mem` against the default: the 10%
+  range's set, 1.3 MB spilled, 20.9 ms against 20.1; the 30% range's, 3.1 MB, 84.3 against 82.9;
+  the 90% range's, 6.2 MB, within the noise of 250), the price in §30.3. Not on Windows, which has
+  no `mmap()`: there a set past `hash_mem` is an error asking for more `work_mem`. The visited
+  bitmaps of the walk (below, "Stopping early") still live within `hash_mem`; past it the walk
+  only stops counting. *(Before this the set DEGRADED past `hash_mem`: it freed every container
+  and kept the keys - "every TID of these 64 heap blocks may be a member" -, rechecking every
+  fetched member, and the planner refused a path whose estimate exceeded `hash_mem`; the test
+  tables for that at 64 kB, ordered.sql's lon and vector_filter.sql's vfn, now spill.)*
 - **The set, lazily** (2026-09-30). Building the set reads every container of every leaf's
   sets, over the whole table, before the walk hands out its first TID - and a `LIMIT` walk that
   finds its rows in the first few hundred container keys needs the set at those keys only. When
@@ -16051,7 +16080,7 @@ than overruns (§30.4).
   starts, so that each key costs a probe of that set alone while the budget counts all three.
   The planner still prices the set as built (§30.3): the lazy set makes the node cheaper than
   its estimate, never dearer by more than the build. `pg_lion.enable_lazy_set` (on) turns it
-  off, for comparing the two and for the tests of the build (a set that degrades).
+  off, for comparing the two and for the tests of the build (a set that spills).
   `test/sql/ordered_lists.sql`. Measured on a release PostgreSQL 18, 5M rows of a 3 GB heap,
   `long IN (2 of 20) AND here IN (2 of 50) AND we IN (2 of 30) ORDER BY here LIMIT 50` (§30.11,
   "Lists"): the set of `long` and `we` built is 5,989 containers read before the first row, 8.0 ms
@@ -16073,7 +16102,7 @@ than overruns (§30.4).
   index's original clauses), then handed to `ExecScan()`, which applies the filter and projects.
   A set with nothing in it ends the scan before the walk starts.
 - **Stopping early.** Once the walk has met as many DISTINCT members as the set holds (its
-  cardinality, known unless it degraded) it stops: nothing further along can be one. The walk
+  cardinality) it stops: nothing further along can be one. The walk
   remembers which members it has met - one 4 kB bitmap per container key it touches, in a per-scan
   context, within `hash_mem` (past that it stops tracking and simply walks on, neither stopping
   early nor switching; EXPLAIN ANALYZE counts such scans as `Scans Not Counting Members`) - and
@@ -16208,10 +16237,11 @@ ordinary plan returns, in the same order.
 
 and with ANALYZE `Index Entries Walked`, `Lion Set Hits` (walked entries that were members),
 `Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck` (printed when
-the set is not exact or something was removed), and `Lion Set: N containers, exact | rechecked |
-degraded[, B builds]`, the builds counted when rescans rebuilt it (a LATERAL subquery whose lion
-filter takes the outer row's value: one per outer row). A node that never ran (`LIMIT 0`, an
-untaken branch) built no set and prints neither of the last two.
+the set is not exact or something was removed), and `Lion Set: N containers, exact |
+rechecked[, spilled S kB][, B builds]`, the kB those of the arena the set was built past
+`hash_mem` in (§30.4, "Spilling"), the builds counted when rescans rebuilt it (a LATERAL subquery
+whose lion filter takes the outer row's value: one per outer row). A node that never ran (`LIMIT
+0`, an untaken branch) built no set and prints neither of the last two.
 
 ### 30.8 Declined in v1, and why
 
@@ -16251,7 +16281,7 @@ expression index, OFFSET and LIMIT, no LIMIT, a LIMIT beyond the match count, an
 filter on the btree column itself, a residual filter, Params under a generic plan, a LATERAL
 subquery rescanned with exec Params per outer row, cursors (FETCH forward; a SCROLL cursor over a
 Material fetching backward), a dirty heap (updates, deletes, HOT updates) and the same after
-VACUUM, a degraded set at a tiny `work_mem`; the declines (RLS, the GUC off, no lion-answerable
+VACUUM, a set spilled at a tiny `work_mem`; the declines (RLS, the GUC off, no lion-answerable
 clause); EXECUTE revoked (the node and the ordinary plan give the same error, security_exec.sql's
 pattern); and the plan choice with nothing disabled - the node for a selective lion filter with
 `ORDER BY` a btree column `LIMIT 10`, core's ordered btree scan for an unselective filter, and no
@@ -19760,8 +19790,8 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   clause is lossy at plan time (`IndexClause.lossy`), so that every member would need the recheck
   and heap mode is the honest plan - in the lion qual. The lion filter's columns are otherwise NOT
   required, where core's `check_index_only()` would ask for every restriction clause's: whether a
-  set needs rechecking is a run-time property (an inexact source, a set that degraded under
-  `hash_mem`), and a member of such a set the B-tree cannot recheck is rechecked on its heap
+  set needs rechecking is a run-time property (an inexact source), and a member of such a set
+  the B-tree cannot recheck is rechecked on its heap
   tuple, fetched for that alone (§40.4) - heap mode, the alternative, fetches every member's. So
   `(created_at) INCLUDE (id, title)` under `WHERE tags @> '{t}'` is covered. Lion's planner marks
   no clause lossy today (a tsquery prefix, NOT or weight widens the set to a superset the executor
@@ -19835,7 +19865,7 @@ which is right: on `btreescan.sql`'s 100,000 rows, whose heap is six times the c
 the covering walk is chosen over the bitmap scan for a filter of a tenth of the rows, the bitmap
 scan over it where only the wide `(k) INCLUDE (...)` B-tree covers the columns, and the lion
 index's own scan for a filter of three in a thousand (§40.7, "the plan choice"). The recheck
-from the heap (§40.4) is not priced: an inexact source or a degraded set is not knowable at plan
+from the heap (§40.4) is not priced: an inexact source is not knowable at plan
 time, and the fetches it costs are bounded by the members - the bound heap mode pays for every
 member. The planner also hands the executor the entries the walk is expected to visit,
 `indexselectivity × rel->tuples`, for the switch's density gate (§40.4; `LO_PRIV_EXPECTED`, a
@@ -19893,7 +19923,7 @@ ordered ones.
   twice is skipped before any of this.
 - **The rechecks.** `ordrecheck` under `xs_recheck` and EvalPlanQual's `lo_recheck` evaluate on
   the scan slot as before; coverage guarantees the columns are there. So does `lionrecheck`, for
-  an inexact or degraded set, when the B-tree holds the lion qual's columns. When it does not
+  an inexact set, when the B-tree holds the lion qual's columns. When it does not
   (`LO_FLAG_HEAPRECHECK`, decided at plan time from the lion qual's Vars against the mapping;
   `st->lionheaprecheck`), the member is rechecked on its heap tuple (`lo_lion_recheck()`): fetched
   now into the table AM's slot if the visibility test did not fetch it already - counted as a heap
@@ -19927,7 +19957,7 @@ ordered ones.
   heap visits count in `Heap Fetches` in index-only mode as the walk's do (§40.6). An unordered
   path has no sort keys and never switches, as a path whose pathkeys were not plain columns never
   did; the planner priced the full walk.
-- **Unchanged**: the lazy set, the early stop, degradation, rescans with changed Params, the
+- **Unchanged**: the lazy set, the early stop, the spill, rescans with changed Params, the
   relation predicate locks on the lion indexes.
 
 ### 40.5 Correctness
@@ -19993,7 +20023,7 @@ Scan's.
 index-only mode (heap mode prints as before, so no existing output changes), and a `LionBtreeScan`
 names the index it walks under `Index`, with the same qual and counter lines. Under ANALYZE, `Heap
 Fetches` counts in index-only mode the heap visits: the members whose page the visibility map did
-not call all-visible, the members an inexact or degraded set had rechecked on their heap tuple
+not call all-visible, the members an inexact set had rechecked on their heap tuple
 (§40.4) and the fetch-and-sort switch's, visible or not, as core's Index Only Scan counts its
 visits (in heap mode, as before, the members with a visible version); `Heap Fetches: 0` on a
 vacuumed table under an exact set, or an inexact one the B-tree can recheck.
@@ -20017,9 +20047,9 @@ subqueries rescanned with the outer value in the lion filter and in the B-tree's
 B-trees, with the predicate column covered and not; the expression B-tree (the order, no values);
 each setting off; and the plan choice with nothing disabled. Then a B-tree lacking the lion
 filter's columns (§40.1): an exact set (`Heap Fetches: 0`), an inexact one (each member fetched
-for its recheck), rows not all-visible on an inexact set (fetched once), a set that degrades under
+for its recheck), rows not all-visible on an inexact set (fetched once), a set that spills past
 `hash_mem` through a kept plan (as ordered.sql's section 10 does, on a 400,000-row table of its
-own: `Lion Set: degraded`, heap fetches and rows removed, the numbers filtered out) and tsquery
+own: `Lion Set: exact`, no heap fetch and nothing removed) and tsquery
 prefix and NOT filters (supersets, rechecked from the heap); the switch in index-only mode
 (§40.4): the far-end shape switches and matches the ordinary plan, a large
 `pg_lion.ordered_switch_ratio` keeps it walking, the uniform GROUP BY walk and a uniform backward
@@ -20057,9 +20087,8 @@ with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `ta
   far end, under a LIMIT the early ones do not satisfy (a residual filter removes them, say), keep
   `distinct` at the uniform rate while the walk crosses the empty middle, so the gate never opens
   and the walk goes to the end where heap mode's rule would have switched.
-- **The recheck from the heap is unpriced** (§40.3): an inexact source or a degraded set is
-  unknown at plan time; its fetches are bounded by the members, every one of which heap mode
-  fetches.
+- **The recheck from the heap is unpriced** (§40.3): an inexact source is unknown at plan
+  time; its fetches are bounded by the members, every one of which heap mode fetches.
 - **Pending CI on 20.** `index_beginscan()`'s third argument and the `IndexScanDesc` fields the
   index-only walk reads (`xs_want_itup`, `xs_itup`, `xs_itupdesc`, `xs_hitup`) are taken as 16 to
   19 have them; an index-only walk whose `xs_want_itup` went unhonoured errors with "no index
@@ -21453,10 +21482,10 @@ relation as a B-tree's is. The plan differs from §30's in four places:
   keeps no tier of its pause below them, and makes them L when they are more, to an eighth of
   `work_mem`'s rows (§44.4, "A known LIMIT"). They say where to pause and what to gather, not how
   many rows to return: a residual filter or a join that takes fewer rows than the scan returns
-  gets more, from probing resumed, and REST. The scan counts the members (a degraded
-  container, NULL, as its 64 blocks' share of the table's rows) and then does one of two things:
+  gets more, from probing resumed, and REST. The scan counts the members and then does one of
+  two things:
   - **No more than `pg_lion.vector_exact_rows` (2,000) members, or than
-    `pg_lion.vector_exact_per_partition` (1.5) a partition if that is more, none degraded**
+    `pg_lion.vector_exact_per_partition` (1.5) a partition if that is more**
     (`lionvec_exact_limit()`): it fetches every member
     from the heap, computes its distance with the operator's function, sorts them (NaN last, then
     by TID) and returns them in order (`lv_exact()`), reading no CODE page. A member not visible,
@@ -21477,9 +21506,10 @@ relation as a B-tree's is. The plan differs from §30's in four places:
     row not a member before it is estimated; a refine, a fetch and a return happen only for
     members.
 
-  A degraded set (§30.4, `hash_mem` exceeded) has NULL containers, meaning every TID of that key's
-  blocks; the scan takes them all, and the node rechecks the lion clauses on the heap row, as it
-  does for a B-tree (`Rows Removed by Lion Recheck`).
+  A set past `hash_mem` is in the node's arena (§30.4, "Spilling"), a mapped temporary file,
+  and the scan probes it there as it probes one in memory: the containers are the same, at
+  addresses that do not move. *(Until 2026-10-19 such a set had degraded to NULL containers,
+  meaning every TID of that key's blocks, which the scan took whole and the node rechecked.)*
 - **No fetch-and-sort switch**: the pathkeys are a distance, not columns a sort could take over.
 - **No values from the index**: heap mode always.
 
@@ -21580,7 +21610,7 @@ The planner pushes no clause below a LIMIT, so the inner scan is unfiltered or r
 LionOrdered, and how far it reads, 1,000 rows here, is the query's to say. `allow` plans as before:
 the plain scan with a Filter and LionOrdered with one compete on cost, which is what the planner
 chose from 60% above and at 10% and 3% in §44.7 and §44.9. What the rule does not reach: a set
-that degrades at run time (`hash_mem`) or a lossy lion clause has its rows rechecked by the node,
+with a lossy lion clause has its rows rechecked by the node,
 which filters members the scan returned; a join's clause filters an ordered scan of one side
 (a nested loop over it) and is no restriction of that relation; and a distance bound few rows pass
 leaves a LIMIT unfilled, so the scan reads on to its end, as pgvector's do.
@@ -22782,8 +22812,8 @@ faster from the disk and the same warm, and the inline table's queries took main
   partitions - the filters of up to `pg_lion.vector_exact_rows` members by their exact distances, the others probing;
   far, zero and NULL queries; a prepared statement's generic plan; a correlated subquery
   rescanning the node; the plan of an OR of two lion indexes' clauses, its set built from both; a
-  degraded set (400,000 rows of 3 dimensions in 20 partitions, `hash_mem` 64kB) and its recheck,
-  and planned at 64kB, where the set would not fit, no plan and the query failing; a filter of 200
+  spilled set (400,000 rows of 3 dimensions in 20 partitions, `hash_mem` 64kB), exact, the same
+  ten rows, and planned at 64kB, where the spill is priced and the node is the plan; a filter of 200
   members reading less than a quarter of the index blocks one of 4,000 does, by
   `pg_statio_user_indexes`, and each threshold moving it, by the DEBUG1 line
   and the blocks: `pg_lion.vector_exact_per_partition` alone (`pg_lion.vector_exact_rows` 0) has

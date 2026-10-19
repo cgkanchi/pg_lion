@@ -34,7 +34,7 @@ OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
-       src/lion_costs.o $(VEC_OBJS) $(READAHEAD_OBJS)
+       src/lion_costs.o src/lion_arena.o $(VEC_OBJS) $(READAHEAD_OBJS)
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
 
 EXTENSION = pg_lion pg_lion_citext pg_lion_vector
@@ -129,7 +129,7 @@ UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
     test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-    test/unit/readahead_test: .lion-force-unit
+    test/unit/readahead_test test/unit/arena_test: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -176,10 +176,16 @@ test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec
 test/unit/readahead_test: test/unit/readahead_test.c src/lion_readahead_ring.c src/lion_readahead_ring.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/readahead_test.c src/lion_readahead_ring.c $(UNIT_LDFLAGS)
 
+# The arena a LionOrdered set spills to (DESIGN.md §30.4, "Spilling"): the
+# size classes, the free lists, the regions over a temporary file, reset and
+# release, against a shadow model.
+test/unit/arena_test: test/unit/arena_test.c src/lion_arena.c src/lion_arena.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/arena_test.c src/lion_arena.c $(UNIT_LDFLAGS)
+
 .PHONY: unit
 unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
       test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-      test/unit/readahead_test
+      test/unit/readahead_test test/unit/arena_test
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
@@ -189,6 +195,7 @@ unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_
 	./test/unit/vec_test
 	./test/unit/vec_test_nosimd
 	./test/unit/readahead_test
+	./test/unit/arena_test
 
 # Header dependencies, made by the compiler: each object's .d file lists every
 # header its source includes, so no hand-kept list can miss one and leave a
