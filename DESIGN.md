@@ -14643,17 +14643,23 @@ AND for its own estimates.
 
 - **What.** The probe locates each clause's sets as a scan locates them (`lion_scankey_sets()`,
   §29.2's per-column trees), takes the source of the fewest rows as the driver, and reads it a
-  container at a time: the heap's container keys in strata, and the driver's first container in each
+  container at a time. Since 2026-10-19 it samples the driver's containers by their rank among its
+  own ("A sample of the driver's own rows", below): a driver of a few posting leaves is walked, the
+  containers some other source has no container at are ruled out, and the rest are counted - every
+  one ANDed - or sampled every n/32-th; a single larger set is sampled at its posting tree's
+  separators. A driver neither ranks - a list or a multi-key query of many sets - is read as every
+  driver was before: the heap's container keys in strata, and the driver's first container in each
   (`lion_stream_at()`), so that the sample spreads over the heap - every container of a heap of no
-  more container keys than strata. At each it ANDs the other sources' containers at that key, the
-  sources of fewer rows first, and stops at the first that has none. A sample counts for its
+  more container keys than strata. At each container sampled it ANDs the other sources' containers
+  at that key, the sources of fewer rows first, and stops at the first that has none. A sample counts for its
   stratum's width, and the strata still ahead widen when the samples so far, at what they have cost,
   would overrun the probe's budget, so that the sample covers the heap whatever the seeks cost
   (`lion_isect_pass()`); a driver found in fewer than `LION_ISECT_MIN_KEYS` strata - rows in one
   stretch of the heap, as a hidden attribute that follows the order the rows came in lays them out -
   is sampled again, in strata of that stretch. The share of the driver's rows that survive, times
   the driver's rows, is the conjunction's rows: the sets' exact count for one set or an IN list's
-  disjoint entries, core's estimate for a multi-key query of several keys, whose sets overlap.
+  disjoint entries, core's estimate for a multi-key query of several keys, whose sets overlap - or,
+  for a driver walked, the walk's own count of the rows its sets hold.
 - **Where it can matter.** Two or more set clauses of one lion index with a value to look up at
   plan time - an equality, an IN list of at most `LION_ISECT_MAX_SETS` values, `IS NULL`, a
   multi-key query, each with a constant (a Param has none); since 2026-09-28 in their canonical
@@ -14672,7 +14678,10 @@ AND for its own estimates.
 - **What it corrects.** A factor on core's estimate of the same clauses, applied when the probe
   finds it `LION_ISECT_ERROR` (3) times off or more, either way: less is within what ANALYZE's
   per-column estimates and the sample leave of an independent conjunction, and would move plans on
-  noise. It applies to lion's OWN estimates: the selectivity `lioncostestimate()` returns for a
+  noise. Since 2026-10-19 a sample lowers an estimate no further than what it can rule out, and one
+  that met the AND in fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows
+  it met ("What a sample can rule out", below); a count - every container of the driver ANDed -
+  stands as it is. It applies to lion's OWN estimates: the selectivity `lioncostestimate()` returns for a
   plain or bitmap path - the Bitmap Index Scan's rows, the heap side of both paths, LionOrdered's
   lion side (§30.3) - and the rows the count pushdown's recheck is priced for
   (`lion_probe_rel_rows()`, the relation's restriction clauses on the lion index that answers most
@@ -14707,7 +14716,10 @@ AND for its own estimates.
   (cached beside the endpoint probe's ends, per `PlannerGlobal`). The budget is checked before each
   clause is located and each sample taken, so a probe overruns it by one IN list's lookups or one
   sample's seeks at most: a planner run accesses about 1,000 buffers at worst, the scale of a few
-  endpoint probes (100 heap pages and 100 leaves an end, §28).
+  endpoint probes (100 heap pages and 100 leaves an end, §28). Since 2026-10-19 the sample by rank
+  reads inside the same budget: a driver's walk at most `LION_ISECT_WALK_PAGES` (32) buffers, the
+  other sources' presence walks 32 each, a posting tree's separators at most
+  `LION_ISECT_SEPARATOR_PAGES` (33) pages ("A sample of the driver's own rows", below).
 
   Measured on PostgreSQL 16 (2026-09-28: `EXPLAIN (BUFFERS)`'s planning buffers with the probe on
   and off, and each probe's own count). The five-clause count of `isectprobe.sql` plans with 79
@@ -14759,6 +14771,12 @@ once the paths are built - and it is made to the paths too:
 about 20 rows for 1,000, are estimated within a factor of two at the scan and at a join and semi
 join of 3,000 rows above it, and fifty times short without the correction; an independent pair is
 left exactly as it was, and with the probe off nothing changes.
+
+*(2026-10-19: the correction carries what the probe measures, mistakes included. On a private
+workload's table loaded in batches, a sample that met none of a conjunction's 9.2M rows measured it
+empty, and the table was sized at one row for every plan above it. The probe now samples the
+driver's own containers and lowers no estimate further than its sample can rule out ("A sample of
+the driver's own rows", "What a sample can rule out", below); the correction is as it was.)*
 
 **An OR of equalities is its IN list** (2026-09-28, `lion_or_as_array()`, `lion_canonical_clause()`).
 A benchmark wrote one wide filter two ways, each multi-value column as `a = x OR a = y` and as `a IN
@@ -14889,7 +14907,11 @@ estimate at 22 rows for 3,835 - and the probe, as it was, gave up on them:
   conjunction counts as not measured - while one that lowers it stands as it always did, and a
   sample of every container of the heap is a count, not a sample. The stretched table's narrower
   conjunctions keep the error a stratified sample of such a heap has: five of the clauses at 66,233
-  rows for 11,385, four at 82,389 for 16,279 (93,000 on 991c315).
+  rows for 11,385, four at 82,389 for 16,279 (93,000 on 991c315). *(2026-10-19: fewer than three
+  such containers now raise the estimate as far as the rows they kept, which are there whatever
+  the rest is, and no further; and a driver whose containers the probe can rank is sampled by rank
+  among its own, or counted, rather than in the heap's strata - "A sample of the driver's own
+  rows" and "What a sample can rule out", below.)*
 
 After: the twenty sets are measured in 352 buffers (412 on a cold cache), eight samples, at 4,091
 rows for 3,835; the repro's filter widened to thirty-two sets (lists of 8, 8, 6 and 4) in 542 (602
@@ -14930,6 +14952,115 @@ members from the same estimate, and with the probe off, core's product put the f
 11,700 rows at 3,509, predicted a switch that does not happen, and sent the page to the btree walk
 with a heap filter - 202 ms against 40 for LionOrdered. The switch bounds what a wrong bet costs,
 and the model does not second-guess it.
+
+**A sample of the driver's own rows** (2026-10-19, `lion_isect_by_rank()`, `lion_isect_walk()`,
+`lion_isect_presence()`, `lion_posting_separators()`). A private workload's table is loaded in
+batches - a source, then a wave of it, each batch's rows in the order of a kind column. A
+conjunction of a wave and a kind, 9.2M rows, was estimated at one row with the probe on (6.6M
+with it off), and so was every conjunction of those two and one more equality; the rows correction
+made the one row the table's ("The relation's rows", above), and every plan above it was built for
+it.
+
+Reproduced on 1.5M rows loaded in 300 batches of 5,000 - a source column of 12 values by a wave
+column of 25, source-major - each batch's rows in the order of a kind of four values (45, 25, 11
+and 19% of them), so that a batch is two or three of the heap's 734 container keys; two tag columns
+hold values for some sources only, NULL for the rest. `wave = 5 AND kind = <the last kind>`
+holds 11,400 rows, and the probe measured none of them and estimated one (core: 11,556). The
+driver, the wave's 60,000 rows, lies in twelve stretches of two or three containers, sixty keys
+apart, and the probe sampled the driver's FIRST container at or past the first key of each of 32
+strata of the heap's keys: a stratum that begins between two stretches - nearly every one - samples
+the first container of the next stretch, which is a batch's start, whose rows are the first kind's
+alone. The strata after it began past the stretch, the second pass "in strata of that stretch"
+began at the same first container, and no container sampled held a row of the last kind: the AND
+was measured empty. It is the inspection paradox of a systematic sample whose units are not the
+population's - strata of the heap's keys, where the population is the driver's containers - and the
+more the driver's rows cluster, the worse it is: the same pairs on a heap whose hidden groups follow
+the load came out within 26%, two or three containers holding a row of the AND, and on one where
+the groups take turns row by row, exact.
+
+So the probe samples the driver's containers by their rank among the driver's own, whatever the
+heap between them:
+
+- **A driver of a few posting leaves is walked** (`lion_isect_walk()`): its own stream, read once,
+  its non-empty containers' keys and members kept - at most `LION_ISECT_WALK_PAGES` (32) buffers
+  and `LION_ISECT_WALK_KEYS` (8,192) containers, about what its samples' seeks would read anyway.
+  The other sources are then walked along those keys as the merge seeks them, the fewest rows first
+  (`lion_isect_presence()`, at most 32 buffers a source): a key some source has no container at
+  holds no row of the AND and is ruled out, not sampled. What is left - on a batched heap, the
+  stretches where every source's batch lies, which is what the private workload's tags present for
+  some sources only come to - is counted when it is no more containers than the other sources'
+  sets can be sought at within the probe's seeks (`LION_ISECT_KEYS`, or `LION_ISECT_SEEKS` over
+  the other sources' sets where that is more): every one ANDed, the AND's exact count. More are
+  sampled every n/32-th, from the middle of the first n/32, each standing for its share of the
+  containers left and those for their share of the driver's rows. The driver's rows are then the
+  walk's count of them, where they were core's estimate for a multi-key query.
+- **A single set of more is ranked by its posting tree** (`lion_posting_separators()`): the
+  separators of its root and, while they are fewer than the samples and within
+  `LION_ISECT_SEPARATOR_PAGES` (33) pages, of the level below. A posting tree splits its pages by
+  bytes, so the separators of a level are about equal-byte quantiles of the set; the sample is the
+  driver's container at 32 of them, spread evenly, and since a page's first container is met in
+  proportion to its size, as a boundary between equal parts of a sequence falls in an item in
+  proportion to the item's length, each is weighted by the inverse of its bytes (and a line
+  pointer's). No presence walk here: the budget would not cover one.
+- **What neither ranks** - an IN list or a multi-key query of more sets than a walk reads - is
+  sampled in strata of the heap's keys, as before.
+
+Measured on PostgreSQL 18 (lion's own estimate, the Bitmap Index Scan's rows, with the probe's own
+count beside it where that differs; the buffers each probe accessed, from its `DEBUG2` line) on the
+batched heap above, on 1.2M rows in 100 hidden groups that take turns row by row (uniform, 138
+container keys), and on the same rows loaded group by group (clustered), 21, 13 and 13
+conjunctions:
+
+| heap, conjunctions | before | now | buffers a probe, before / now |
+|---|---|---|---|
+| batched: a wave and a kind, with a third clause or not | 1 for 11,400 (twice), 950 and 2,856 | core's 11,115 to 11,639, 925 and 1,489: the probe counts 11,400, 950 and 2,856, within `LION_ISECT_ERROR` of core, which stands | 40 to 65 / 46 to 120 |
+| batched: a source, a wave, a tag and a list | core's 202 for 3,334 (one container held the AND) | 3,327 (counted) | 48 / 68 |
+| batched: the same with a tag present for some sources only | | 1,192 for 1,192 (core 374), 715 for 714 (core 194) | 67 to 78 |
+| batched: a source and a tag it never has | 1 | 1 (counted) | 40 / 41 to 49 |
+| batched: a column of four values in the odd waves only, beside a kind (a driver of over 100,000 rows: its separators) | the probe's measure within 32% | within 5% (core's, within `LION_ISECT_ERROR`, stands) | 57 to 146 / 57 to 162 |
+| uniform | the probe's measure within 0.2%; an empty AND, 1 | within 0.1%; an empty AND, 13 ("What a sample can rule out") | 33 to 212 / 51 to 211 |
+| clustered | the probe's measure within 26% (1 to 12 containers held a row of the AND) | exact: every one counted | 19 to 66 / 19 to 143 |
+
+A probe that runs out of its budget gives up as before, and the walks are inside it
+(`lion_isect_spent()` before each container): a run's probes still access at most
+`LION_ISECT_RUN_BUFFERS` and one sample's seeks. Planning a four-clause count of the batched heap
+takes 0.12 ms against 0.05 without the probe, every page in shared buffers.
+
+**What a sample can rule out** (2026-10-19, `lion_isect_take()`, `lion_isect_upper()`,
+`lion_isect_factor_run()`). A sample that met no row of the AND measured it empty, and an empty AND
+is estimated at one row: the last step of the batched heap's 11,400 rows becoming one. Thirty-two
+containers can rule out only so much, and the rows of one container are no independent draws: on a
+heap loaded in batches a container holds one stretch of rows, and a source absent from it is absent
+whatever the AND holds elsewhere. So the sample counts its evidence in units:
+
+- a container some source has no container at is **one** unit - it says the AND skips one stretch,
+  no more;
+- a container where every source has members is as many units as the driver has members on the
+  heap blocks every source has members on, and one at least: rows side by side on one page, where
+  the AND's absence is a fact about rows, not about which stretch the sample met.
+
+The AND's share of the driver's rows is at most the Poisson's 95% upper limit of the rows of the
+AND met over the units - Wilson and Hilferty's form, `(h + 1)(1 - 1/9(h + 1) + 1.645/3 sqrt(h +
+1))^3`, 2.97 for none (the rule of three), 4.73 for one, within 1% of the exact limit from there on
+- and an estimate is lowered no further than that limit times the driver's rows. A count - every
+container of the driver ANDed, or every container of the heap - is no sample, and stands exactly as
+it is: an AND it finds empty is still one row. Which keeps the empty and the tiny ANDs:
+
+- on the batched heap a source and a tag only other sources have is counted - the presence walk
+  rules out every container - and stays at one row, as the clustered heap's empty pairs do;
+- on the uniform heap, whose groups share every page, an empty pair met no row in thousands of
+  units: 13 rows of 1.2M, not 1, where core said 4,728 to 11,451;
+- and a sample that meets the AND in fewer than `LION_ISECT_MIN_HITS` (3) containers, which raised
+  nothing ("What a few containers can say", above), raises the estimate as far as the rows it met -
+  they are there, whatever the rest is - and no further: before the presence walk counted it, the
+  batched heap's four clauses went from core's 187 to 1,319 to 1,968 for 3,334.
+
+`test/sql/isectstretch.sql` pins both on 192,000 rows of the batched shape, four sources by twelve
+waves in 93 container keys, sampled whole by ANALYZE: three conjunctions the sample of old
+estimated at 1, 1 and 161 rows for 760, 507 and 759 now within a factor of three, the relation's
+rows with them; a tag only some sources have counted with the probe's presence walk; a source and a
+tag it never has, and one more such, still one row; and the count of four clauses chosen with the
+probe and without it (DESIGN.md §39, "The AM's own scan of the same sets").
 
 **The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
 sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.
@@ -19445,8 +19576,9 @@ three prices carry no such error, and are offered at no margin whatever it is se
   next to no price, and a partition scanned another way at a price that counts keeps the margin -
   under the nodes that pass its rows up), for a count: that price is
   `lioncostestimate()`'s, lion's model with lion's errors, and a margin would only tilt a choice
-  between two of lion's plans. At 0.8 three counts of the regression suite went from the node to
-  such a scan: `corrupt_walk.sql`'s, 3.9 ms against the node's 1.75; `indexscan.sql`'s clustered
+  between two of lion's plans - and where that scan reads every set the count reads, the count is
+  priced below it whatever the margin ("The AM's own scan of the same sets", below). At 0.8 three
+  counts of the regression suite went from the node to such a scan: `corrupt_walk.sql`'s, 3.9 ms against the node's 1.75; `indexscan.sql`'s clustered
   value, 0.19 against 0.06; `unlogged.sql`'s, a tie. LionOrdered keeps its margin against one
   (`lion_units_margin_for()`): what it is chosen over is an ordered btree scan or a Sort under a
   LIMIT, not the cheapest scan of its relation, which under a lion filter often is the AM's bitmap
@@ -19489,6 +19621,46 @@ the default is 1; the setting stays, with the exemptions above, for a site whose
 otherwise. A margin above 1 - lion favoured - would have taken three more of the seven (the first
 three rows), and the setting stops at 1: on 39 queries that would be a fit, not the correction of a
 known bias.
+
+### The AM's own scan of the same sets (2026-10-19)
+
+A private workload's four-clause count went to an Aggregate over a plain scan of the same lion
+index, priced 491,708, where the count was priced 487,598: 0.8% below it, inside `add_path()`'s fuzz
+of 1%, where two paths of the same pathkeys and parameterization are kept by parallel safety first.
+The Aggregate over the scan is parallel safe; `LionCount` is not (it counts the whole relation, so
+it may not run inside a worker), and lost the tie. The scan's heap side was priced from the
+conjunction's estimate, 2,734 rows for 131,778 ("A sample of the driver's own rows", §29.11): a
+fair estimate would have priced the scan far above the count, and a worse one below it.
+
+Neither the estimate nor the margin is the point: such a scan does what the count does and more. A
+plain or bitmap scan of a lion index whose index clauses are every restriction of the relation,
+each read from the index the count reads it from, reads the sets the count reads, ANDed the same
+way (§29.11, "The AND, as the count makes it"), and then fetches every row it finds from the heap,
+where the count tests the visibility map and fetches only the rows of pages that are not
+all-visible. Whatever the rows are estimated at - and both prices take the rows from the same
+estimate - the count is the cheaper plan. So `lion_count_path_add()` prices the count below the
+cheapest such path of the upper rel (`lion_count_ownscan_cost()`), by `LION_COUNT_OWNSCAN_EDGE`
+(1.02): past the fuzz, so that `add_path()` keeps the count on cost and never comes to the tie. The
+count's own price stands where it is lower; `DEBUG2` prints both.
+
+Only where the dominance is plain:
+
+- the count: one table's plain count - no GROUP BY, DISTINCT, range, filtered count, HAVING, top k,
+  FK-side join, partitions, residual clause, complement or negated clause, or multi-key query known
+  only at run time - its WHERE answered by the sets alone, each restriction of the relation read
+  from one index;
+- the path: an Aggregate, plain and whole (not partial, no HAVING), over projections only, of an
+  unparameterized plain or bitmap scan of the relation - a bitmap's tree of quals ANDs only, no
+  BitmapOr - whose index paths are all lion's, with every index clause one of the relation's
+  restrictions read from the index the count reads it from, and every restriction such a clause:
+  nothing of the WHERE left to a heap filter, which would make the scan read fewer sets than the
+  count;
+- not a parallel plan: a Gather over a parallel bitmap scan divides the heap's side among the
+  workers, which the serial count does not, and keeps its price; nor a path an `enable_*` setting
+  disabled, which loses whatever its cost.
+
+`test/sql/isectstretch.sql` pins it with the count's own price set, by `pg_lion.agg_rate`, to 0.995,
+1 and 2 times the scan's: before, the scan's Aggregate won all three; now the count does.
 
 ### Resident index pages: §22's third rung
 
