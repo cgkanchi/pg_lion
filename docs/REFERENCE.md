@@ -374,7 +374,9 @@ queries are answered from the index and BM25 ranking works (see "Multi-key colum
 about twice the index's size. `auto` stores them when a key column's operator class can
 (`tsvector_ops`) and builds an index with no such column without them; `on` on such an index is an
 error; `off` leaves them out. Read at build time, like `summaries`: `ALTER INDEX ... SET` changes
-nothing until a `REINDEX`.
+nothing until a `REINDEX`. The build keeps the positions in half of `maintenance_work_mem` (the
+rest is for the posting sets) and writes them to temporary files past it, so the index is the same
+at any setting; more memory only writes less.
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
 `posting_fillfactor` (10 .. 100, default 90): how full the build packs a posting-tree leaf, the
 container pages a key's posting set lives on once it outgrows its entry (DESIGN.md §22). At 100 a
