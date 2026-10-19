@@ -793,9 +793,13 @@ through its table row and the TOAST index, as before; it is there to compare.
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
-ANALYZE`). In index-only mode the switch is also held back while the walk meets members at the rate
-a uniform spread predicts, since there it would read heap pages the walk never touches (DESIGN.md
-§40.4). A large value keeps a walk from switching at all.
+ANALYZE`). The sort is a Sort node's: past `work_mem` it goes to disk, and under a constant `LIMIT`
+that nothing between the node and it can drop a row from, it keeps only the rows the `LIMIT` takes
+(`Fetch and Sort Method`, `Fetch and Sort Space Used` and `Fetch and Sort Space Type` in `EXPLAIN
+ANALYZE`), so whether and where a walk switches does not depend on `work_mem`. In index-only mode
+the switch is also held back while the walk meets members at the rate a uniform spread predicts,
+since there it would read heap pages the walk never touches (DESIGN.md §40.4). A large value keeps
+a walk from switching at all.
 
 ## Known limitations
 

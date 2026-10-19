@@ -17,9 +17,7 @@
 
 #include <errno.h>
 #include <string.h>
-#ifndef WIN32
 #include <sys/mman.h>
-#endif
 
 #include "lion_arena.h"
 
@@ -28,16 +26,6 @@ StaticAssertDecl(LION_ARENA_ALIGN >= sizeof(void *), "a block holds a pointer");
 StaticAssertDecl(LION_ARENA_SMALL_MAX % LION_ARENA_ALIGN == 0,
 				 "the small class is aligned");
 StaticAssertDecl(LION_ARENA_GRAIN % 4096 == 0, "a region is whole pages");
-
-bool
-lion_arena_available(void)
-{
-#ifdef WIN32
-	return false;
-#else
-	return true;
-#endif
-}
 
 void
 lion_arena_init(LionArena *a, LionArenaRegion *regions, int maxregions,
@@ -90,10 +78,6 @@ lion_arena_contains(const LionArena *a, const void *p)
 static int
 lion_arena_add_region(LionArena *a, Size need)
 {
-#ifdef WIN32
-	errno = ENOSYS;
-	return -1;
-#else
 	Size		size;
 	void	   *base;
 	int			i;
@@ -124,7 +108,6 @@ lion_arena_add_region(LionArena *a, Size need)
 	/* the next region doubles the file, to LION_ARENA_REGION_MAX */
 	a->nextsize = Min(a->filesize, LION_ARENA_REGION_MAX);
 	return i;
-#endif
 }
 
 void *
@@ -200,12 +183,10 @@ lion_arena_reset(LionArena *a)
 void
 lion_arena_release(LionArena *a)
 {
-#ifndef WIN32
 	int			i;
 
 	for (i = 0; i < a->nregions; i++)
 		(void) munmap(a->regions[i].base, a->regions[i].size);
-#endif
 	a->nregions = 0;
 	a->cur = -1;
 	a->filesize = 0;

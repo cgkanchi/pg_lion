@@ -15883,8 +15883,10 @@ about 2 bytes per member for a sparse answer, plus 16 bytes of directory per con
 12 MB for half of 100M rows, 200 to 300 MB for a tenth of a billion. It is built in `hash_mem`
 (`get_hash_memory_limit()`, `work_mem x hash_mem_multiplier`, what core allows one node's
 in-memory hash table), and past that in a temporary file mapped into memory (§30.4, "Spilling"),
-which the planner prices (`lo_spill_cost()`: the pages the estimate puts past `hash_mem`, at 60
-`cpu_tuple_cost` each, the 5 us a page measured) and never refuses. *(Until 2026-10-19 the
+with the walk's visited bits, about a bit a member and eight bytes a key (§30.4, "Stopping
+early"), which the planner counts in the set's size and prices (`lo_spill_cost()`: the pages
+the estimate puts past `hash_mem`, at 60 `cpu_tuple_cost` each, the 5 us a page measured) and
+never refuses. *(Until 2026-10-19 the
 planner offered no path whose estimate exceeded `hash_mem`, and a set that outgrew it at run time
 DEGRADED to its container keys, every member rechecked: at a billion rows every wide filter's set
 is past the default `hash_mem`, and a refused plan there is the query failing under
@@ -16015,10 +16017,11 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   back one at a time: this set is probed at random, by every TID the walk or the scan meets. Cost:
   about 5 us a page of 8 kB on the 2M emulation (a 64 kB `hash_mem` against the default: the 10%
   range's set, 1.3 MB spilled, 20.9 ms against 20.1; the 30% range's, 3.1 MB, 84.3 against 82.9;
-  the 90% range's, 6.2 MB, within the noise of 250), the price in §30.3. Not on Windows, which has
-  no `mmap()`: there a set past `hash_mem` is an error asking for more `work_mem`. The visited
-  bitmaps of the walk (below, "Stopping early") still live within `hash_mem`; past it the walk
-  only stops counting. *(Before this the set DEGRADED past `hash_mem`: it freed every container
+  the 90% range's, 6.2 MB, within the noise of 250), the price in §30.3. The arena maps its file
+  with POSIX `mmap()`, which it needs: pg_lion builds where there is one. The walk's visited
+  bits (below, "Stopping early") come from `lo_set_alloc()` too, charged against `hash_mem` with
+  the set and in the arena past it, so neither the early stop nor the switch depends on
+  `work_mem` either. *(Before this the set DEGRADED past `hash_mem`: it freed every container
   and kept the keys - "every TID of these 64 heap blocks may be a member" -, rechecking every
   fetched member, and the planner refused a path whose estimate exceeded `hash_mem`; the test
   tables for that at 64 kB, ordered.sql's lon and vector_filter.sql's vfn, now spill.)*
@@ -16034,8 +16037,8 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   up in a memo of container keys (a simplehash, `lo_memo`); a key met for the first time is
   evaluated there - each key's stream sought to it (`lion_stream_at()`, the leapfrog seek of §22),
   the leaf's keys ANDed and the tree's ANDs and ORs applied to those containers - and remembered,
-  members or none, with the members this scan met (the 4 kB bitmap of "Stopping early", in the
-  per-scan context). A stream only goes forward; a probe behind where it stands starts it again
+  members or none, with the members this scan met (a 4 kB bitmap, in the per-scan context; the
+  memo is held to half of `hash_mem` below). A stream only goes forward; a probe behind where it stands starts it again
   over the same located sets, which a walk in heap order (the TIDs of one entry, a btree
   correlated with the heap) rarely does and one in random order does at nearly every key.
   So the set is BUILT, as above, once the probes have cost what the build would - one unit of
@@ -16062,8 +16065,10 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   against 10.7. A lion column's walk goes back only between entries (the `here IN (...)` walk of
   §30.11 "Lists" probed 468 keys, none behind the one before, and stays lazy), and a btree
   correlated with the heap seldom goes back. The build takes over what the
-  walk met (`lo_lazy_convert()`): each memo key's bitmap goes to its container's slot, so the
-  members already returned count as met and the switch does not fetch them again. A small set,
+  walk met (`lo_lazy_convert()`): each memo key's bitmap is read into the walk's visited bits
+  ("Stopping early"), a bit for each member there the built set still has, so the members
+  already returned count as met and the switch does not fetch them again; a key the built set
+  has no member at any more lost only TIDs a VACUUM removed, dead to every snapshot. A small set,
   whose build is cheap, is built at once, before the walk has cost more than a few dozen probes:
   the worst case costs about twice the build. And the set starts lazily only where the planner
   expects the walk to stop short: the node alone in its query under a `LIMIT` (with its
@@ -16124,11 +16129,26 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   A set with nothing in it ends the scan before the walk starts.
 - **Stopping early.** Once the walk has met as many DISTINCT members as the set holds (its
   cardinality) it stops: nothing further along can be one. The walk
-  remembers which members it has met - one 4 kB bitmap per container key it touches, in a per-scan
-  context, within `hash_mem` (past that it stops tracking and simply walks on, neither stopping
-  early nor switching; EXPLAIN ANALYZE counts such scans as `Scans Not Counting Members`) - and
-  a member counts once however often the walk meets its TID. `Scans Stopped Early` counts the
-  scans the stop ended.
+  remembers which members it has met, a bit a member's PLACE (`lion_container_place()`): an
+  ARRAY's or a RUN's member's place is its rank among the container's members, found by a binary
+  search or a pass over the runs before it, and a bitmap's is its bit in the bitmap, found at no
+  cost, the bitmap's places being its bits. The set's keys' places follow one another
+  (`places[]`, eight bytes a key, made with the set), and the bits come in chunks of 32,768 (4 kB),
+  each made as the walk first meets a member of its places, so that a `LIMIT` walk that meets a
+  few members clears a few chunks; they are `lo_set_alloc()`'s, within `hash_mem` with the set and
+  past it in the arena ("Spilling"), and the walk counts at every `work_mem`. They take an eighth
+  of a byte a member of an ARRAY or a RUN, a sixteenth of the ARRAY at most, and as much as a
+  bitmap takes for a bitmap's: never more than the set and a bit a member. A 4 kB bitmap for each
+  container key the walk touches, its member's bit its offset in the key, would take 4 kB for a
+  key of three members: on a 1B-row table of ten rows a page, 1.6M keys, 6.4 GB for a walk that
+  meets a member at each, where a bit a member is 1.25 MB for a 1% filter. A member counts once
+  however often the walk meets its TID. `Scans Stopped Early` counts the scans the stop ended.
+  On 3M rows whose 3,000 members (one row in 1,000, at every one of the set's 809 keys) lie in the
+  first quarter of the order, the walk stops after 752,001 entries at 64 MB, 4 MB, 1 MB and
+  64 kB of `work_mem` alike (32 to 34 ms, the best of seven runs); 4 kB a key, 3.2 MB, would not
+  fit in 1 MB's `hash_mem`, and a walk that stopped counting there reads all 3,000,000 entries
+  (116 ms).
+  `test/sql/ordered_transitions.sql` counts at 64 kB, with the bits spilled while the set is not.
   *(Fixed 2026-09-25: the first version counted every meeting, on the premise that a btree
   returns each TID once. Within one scan it returns each INDEX TUPLE once, but under an MVCC
   snapshot the paused walk holds no pin (nbtree's `dropPin`, and lion's §29.5), so while a
@@ -16163,16 +16183,32 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   non-members), and none it has returned is (those were met); rows with equal sort keys may come
   in any order, which is all the pathkeys promise. The switch needs the pathkeys to be plain
   columns of the relation - an expression index's order would evaluate its functions where the
-  ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6) - and gives up,
-  letting the walk go on, if the rows do not fit in `work_mem`. It need not fetch them all to
-  know: once it has tried `LO_SWITCH_SAMPLE` (1,024) members, the rows they gave, scaled to every
-  member not met, foretell whether the rest fit, members in TID order being a fair sample of them.
-  Without that, a switch at PostgreSQL's default 4 MB fetched some 19,000 rows of a 20,000-member
-  set before it found they did not fit, and ran slower than no switch at all (106.7 ms against
-  87 ms, a synthetic 2M-row table, index-only); now it gives up after 1,024 and runs as no switch
-  does (83 ms against 84; with heap fetches, 56 against 59). EXPLAIN ANALYZE says `Switched to Fetch and Sort:
-  S of N scans, M members fetched`, and `Fetch and Sort Given Up: G scans, M members fetched` for
-  the scans that gave up. A rescan starts afresh.
+  ordinary plan calls none, which a revoked EXECUTE could tell apart (§30.6). Its sort is a
+  `tuplesort` of each row's sort keys and its heap tuple whole - the TID it goes by and the header
+  too, so that a row comes out as the walk would have handed it out, its system columns with it -
+  in `work_mem` and past it in temporary files, as a Sort node's is: the switch comes at the same
+  entry and fetches the same members whatever `work_mem` is, and never leaves the walk to go on.
+  When nothing between the node and its query level's `LIMIT` can drop a row the node returns or
+  read one past the rows the `LIMIT` takes, those rows bound the sort (`lo_limit()`,
+  `LO_PRIV_LIMIT`): a constant `LIMIT` and `OFFSET` (the planner's `limit_tuples` is only an
+  estimate of a Param), not `WITH TIES`, which reads the rows tied with the last; no row marks,
+  whose LockRows skips a row it cannot lock; one relation; no filter of the node's own, whose
+  rejects the Limit does not count; and the query's order the node's, so that no Sort or
+  Incremental Sort above it reads on. A partition's walk under a MergeAppend or an Append is
+  bounded too: neither reads more of a child than the rows it returns. The bounded sort keeps, of
+  those rows, the ones the walk has not returned yet, in a heap (`top-N heapsort`, a few kB for
+  `LIMIT 10`); any other sorts every row the switch keeps. The planner prices the walk (§30.3) and
+  not the switch, which is the executor's bound on a walk the model misjudged, there whatever the
+  settings: nothing in the price counts on it. On 3M rows of 135 bytes whose 10,000 members lie at
+  the far end of the order (`c = 299 ORDER BY k LIMIT 10`, heap mode, a filter correlated with the
+  order), the switch comes after 320,000 entries at every `work_mem`: 16 to 20 ms at 64 MB, 4 MB,
+  1 MB and 64 kB, the ten rows kept in 27 kB, and with a filter of the node's own, which unbounds
+  the sort, 17 to 25 ms, 1.5 MB on disk below 4 MB; walking on to the end of the index instead,
+  2,990,010 entries, takes 80 ms (98 with the filter). EXPLAIN ANALYZE says `Switched to Fetch and
+  Sort: S of N scans, M members fetched` and, for the last switch's sort as a Sort node shows its
+  own, `Fetch and Sort Method` (`top-N heapsort`, `quicksort`, `external merge`), `Fetch and Sort
+  Space Used: K kB` and `Fetch and Sort Space Type` (`Memory`, `Disk`). A rescan starts afresh, its
+  sort ended with its files.
 - **EvalPlanQual** (`SELECT ... FOR UPDATE` over the node): the recheck method tests the
   substituted row against the `lionqual` and the ordered index's original clauses, as an Index
   Scan's `IndexRecheck()` does; `ExecScan()` applies the filter.
@@ -16260,9 +16296,11 @@ and with ANALYZE `Index Entries Walked`, `Lion Set Hits` (walked entries that we
 `Heap Fetches` (members with a visible version), `Rows Removed by Lion Recheck` (printed when
 the set is not exact or something was removed), and `Lion Set: N containers, exact |
 rechecked[, spilled S kB][, B builds]`, the kB those of the arena the set was built past
-`hash_mem` in (§30.4, "Spilling"), the builds counted when rescans rebuilt it (a LATERAL subquery
+`hash_mem` in, and its walks' visited bits with it (§30.4, "Spilling"), the builds counted when rescans rebuilt it (a LATERAL subquery
 whose lion filter takes the outer row's value: one per outer row). A node that never ran (`LIMIT
-0`, an untaken branch) built no set and prints neither of the last two.
+0`, an untaken branch) built no set and prints neither of the last two. A node whose scans switched
+to fetch and sort adds `Switched to Fetch and Sort` and its last sort's method, space used and
+space type (§30.4, "When the walk is not paying").
 
 ### 30.8 Declined in v1, and why
 
@@ -16324,6 +16362,13 @@ values at a 64 kB hash_mem, whose set must stay exact, and whose `LionOrdered se
 read while a cursor is paused after the build, must hold no more than hash_mem; and `g = 5 ORDER BY
 k` over a btree on `(g, k)` and a lion index on `g`, where the plan must not be the node (§30.3),
 beside `g = 5 AND h = 3 ... LIMIT 10`, where it still is.
+`test/sql/ordered_switch.sql` switches at a 64 kB `work_mem` that the members' rows do not fit in,
+each query compared in order with the ordinary plan: the sort bounded, in memory, under a `LIMIT`,
+with an `OFFSET`, backward and with system columns in the rows; on disk, unbounded, with no `LIMIT`
+and under one it may not keep to - a filter of the node's own, `WITH TIES`, `FOR UPDATE`, an order
+sorted again above the node, a `LIMIT $1` of a generic plan; a LATERAL rescan that switches twice
+in three scans; two partitions under a MergeAppend; and the walk's rows, then the sort's, through a
+cursor too.
 `make hookcheck`'s companion module chains `set_rel_pathlist_hook` too and checks, in both load
 orders, whether the LionOrdered path is in the rel when the previous hook returns (§23).
 

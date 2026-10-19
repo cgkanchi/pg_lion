@@ -275,7 +275,7 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 2000
  Index Entries Walked: 39994
  Lion Set Hits: 20000
  Heap Fetches: 20000
- Lion Set: 72 containers, exact, spilled 500 kB
+ Lion Set: 72 containers, exact, spilled 572 kB
 (5 rows)
 
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.03 ORDER BY k, id');
@@ -308,7 +308,7 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE g BETWEEN 10 AND 40 ORDER BY k, i
  Index Entries Walked: 8
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 23 containers, exact, spilled 44 kB
+ Lion Set: 23 containers, exact, spilled 56 kB
 (5 rows)
 
 --    two gathered leaves, each spilled, ORed in the file (an AND would be
@@ -326,7 +326,7 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 OR
  Index Entries Walked: 6
  Lion Set Hits: 5
  Heap Fetches: 5
- Lion Set: 72 containers, exact, spilled 625 kB
+ Lion Set: 72 containers, exact, spilled 637 kB
 (5 rows)
 
 --    the spill goes through the server's temporary files: temp_file_limit
@@ -372,7 +372,7 @@ SELECT * FROM og_run($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
  Index Entries Walked: 14
  Lion Set Hits: 6
  Heap Fetches: 6
- Lion Set: 72 containers, exact, spilled 500 kB, 2 builds
+ Lion Set: 72 containers, exact, spilled 512 kB, 2 builds
 (5 rows)
 
 --    what the set keeps in memory stays within hash_mem, read while a

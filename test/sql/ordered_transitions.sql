@@ -1,8 +1,9 @@
 -- Every transition of a LionOrdered scan (DESIGN.md §30.4), forced and
--- named: EXPLAIN ANALYZE says why a lazy set was built, when the switch to
--- fetch-and-sort gave up, when a scan stopped counting the members it met,
--- and when the early stop ended a walk.  Each run's rows are compared, in
--- order, with the same query with the node off.
+-- named: EXPLAIN ANALYZE says why a lazy set was built, how the switch to
+-- fetch-and-sort sorted, and when the early stop ended a walk - at every
+-- work_mem, the walk's record of the members it met spilling with the set
+-- past hash_mem.  Each run's rows are compared, in order, with the same
+-- query with the node off.
 --
 -- Not forced here: building a lazy set because the switch could be due by
 -- the set's recorded member count: ordered.sql forces that (case 15).
@@ -34,8 +35,9 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
 			used := true;
-		ELSIF ln ~ '(Index Entries Walked|Lion Set:|Switched|Given Up|Not Counting|Stopped Early)' THEN
-			RETURN NEXT btrim(ln);
+		ELSIF ln ~ '(Index Entries Walked|Lion Set:|Switched|Fetch and Sort (Method|Space Type)|Stopped Early)' THEN
+			-- one external sort or another, as the major's tuplesort runs it
+			RETURN NEXT btrim(regexp_replace(ln, 'external (sort|merge)', 'external'));
 		END IF;
 	END LOOP;
 	IF NOT used THEN
@@ -44,13 +46,15 @@ BEGIN
 END $$;
 
 -- q's rows in order against the same query with the node off and sorting on
+-- (a hash of the hash so far and the row: 100,000 rows in a string grown a
+-- row at a time would be copied 100,000 times)
 CREATE FUNCTION otr_rows(q text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE r record; acc text := '';
 BEGIN
 	FOR r IN EXECUTE q LOOP
-		acc := acc || r::text || ',';
+		acc := md5(acc || r::text);
 	END LOOP;
-	RETURN md5(acc);
+	RETURN acc;
 END $$;
 CREATE FUNCTION otr_same(q text, ordinary text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -112,21 +116,23 @@ SELECT otr_same('EXECUTE otr_all(3, 1, 200000)',
 RESET pg_lion.ordered_switch_ratio;
 
 -- 3. ... because the memo, a member bitmap per key met, outgrew half of
---    hash_mem; built in 64kB, the set's visited bitmaps do not fit either,
---    so the scan stops counting members: no early stop, no switch
+--    hash_mem; built in 64kB, the set takes over what the memo met, a bit a
+--    member, and the walk goes on counting: the early stop ends it at the
+--    last member
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT * FROM otr_run('EXECUTE otr_id(3, 0, 7)');
 SELECT otr_same('EXECUTE otr_id(3, 0, 7)',
 	'SELECT id FROM otr WHERE a = 3 AND b = 4 ORDER BY id % 8, id LIMIT 3000');
 
--- 4. ... and the set built then spills past hash_mem, exact still
+-- 4. ... and the set built then spills past hash_mem, exact still, the
+--    walk's bits with it
 SELECT * FROM otr_run('EXECUTE otr_or(1, 0, 7)');
 SELECT otr_same('EXECUTE otr_or(1, 0, 7)',
 	'SELECT id FROM otr WHERE (b = 1 OR a = 2) ORDER BY id % 8, id LIMIT 90000');
 
--- 5. Built from the start, the set's visited bitmaps over hash_mem: the
---    scan stops counting members as the walk meets them
+-- 5. Built from the start, in 64kB: the walk counts the members it meets
+--    in a bit each, and the early stop ends it at the last
 SET pg_lion.enable_lazy_set = off;
 SELECT * FROM otr_run('EXECUTE otr_id(3, 0, 7)');
 SELECT otr_same('EXECUTE otr_id(3, 0, 7)',
@@ -142,16 +148,16 @@ SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
 SELECT otr_same('EXECUTE otr_pad(3, 0, 200003)',
 	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
 
--- 7. ... and gives up when the members' rows do not fit in work_mem, while
---    hash_mem still holds the visited bitmaps: the walk goes on to the end.
---    In 64kB the rows kept pass work_mem before 1,024 members are fetched;
---    in 256kB the first 1,024 foretell that the 2,738 would not fit, and the
---    rest are not fetched
+-- 7. ... and when the members' rows do not fit in work_mem, its sort goes
+--    to disk, as a Sort node's does, and the switch comes at the same
+--    entry: 2,738 rows of some 100 bytes in 64kB and in 256kB, none of
+--    them left to the walk's remaining 190,000 entries
 SET work_mem = '64kB';
-SET hash_mem_multiplier = 8;
+SET hash_mem_multiplier = 1;
 SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
+SELECT otr_same('EXECUTE otr_pad(3, 0, 200003)',
+	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
 SET work_mem = '256kB';
-SET hash_mem_multiplier = 2;
 SELECT * FROM otr_run('EXECUTE otr_pad(3, 0, 200003)');
 SELECT otr_same('EXECUTE otr_pad(3, 0, 200003)',
 	'SELECT id, k, pad FROM otr WHERE a = 3 AND b = 4 ORDER BY k, id');
@@ -192,6 +198,34 @@ SELECT * FROM otr_run('SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDE
 SELECT otr_same('SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDER BY o, id LIMIT 10',
 	'SELECT id FROM otr_h WHERE a = 1 AND b = 1 AND c = 1 ORDER BY o, id LIMIT 10');
 DROP TABLE otr_h;
+
+-- 10. The walk's bits past hash_mem while the set is within it: g's members,
+--     every other row, are dense enough for bitmaps, whose places are their
+--     bits, as many bytes as the set; the bits that do not fit in 64kB spill
+--     to the set's file, and the walk still counts every member it meets.
+--     They come first in k's order, so the early stop ends the walk half way
+--     through the index, as it does at the default work_mem
+CREATE TABLE otr_v (id int, k int, g int, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO otr_v SELECT i, CASE WHEN i % 2 = 0 THEN i ELSE 1000000 + i END,
+	   (i % 2 = 0)::int, repeat('x', 40)
+  FROM generate_series(1, 200000) i;
+CREATE INDEX otr_v_l ON otr_v USING lion (g);
+CREATE INDEX otr_v_k ON otr_v (k);
+VACUUM (FREEZE, ANALYZE) otr_v;
+SET pg_lion.ordered_switch_ratio = 1000000;
+SET pg_lion.enable_lazy_set = off;
+SELECT * FROM otr_run('SELECT id FROM otr_v WHERE g = 1 ORDER BY k');
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT * FROM otr_run('SELECT id FROM otr_v WHERE g = 1 ORDER BY k');
+SELECT otr_same('SELECT id FROM otr_v WHERE g = 1 ORDER BY k',
+	'SELECT id FROM otr_v WHERE g = 1 ORDER BY k');
+RESET hash_mem_multiplier;
+RESET work_mem;
+RESET pg_lion.enable_lazy_set;
+RESET pg_lion.ordered_switch_ratio;
+DROP TABLE otr_v;
 
 RESET plan_cache_mode;
 RESET enable_sort;
