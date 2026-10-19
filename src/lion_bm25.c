@@ -110,9 +110,10 @@ typedef struct LionBm25Stats
 static HTAB *lion_bm25_stats_cache = NULL;
 
 /*
- * The lexemes of query that count: every operand not under a NOT, once.
- * A prefix operand names no one key: it is refused, or with prefix given,
- * reported there.
+ * The keys of the lexemes of query that count: every operand not under a
+ * NOT, once, as lion_lexeme_key() files it - a long lexeme under its hashed
+ * key.  A prefix operand names no one key: it is refused, or with prefix
+ * given, reported there.
  */
 static void
 lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
@@ -139,8 +140,8 @@ lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
 					 errmsg("lion_bm25 cannot rank a prefix lexeme")));
 		if (negated)
 			return;
-		lex = cstring_to_text_with_len(GETOPERAND(query) + op->distance,
-									   op->length);
+		lex = lion_lexeme_key(GETOPERAND(query) + op->distance, op->length,
+							  NULL);
 		foreach(lc, *out)
 		{
 			text	   *t = (text *) lfirst(lc);
@@ -543,6 +544,60 @@ lion_bm25_sort(LionBm25Cand *cands, int64 n)
 }
 
 /*
+ * The lexeme of doc filed under key, the way the extraction files them, or
+ * -1: the lexeme itself, found by a binary search, for a key shorter than
+ * LION_LEXEME_KEY_MAX; for one of that length, which is ambiguous (DESIGN.md
+ * §17, "Long lexemes"), the first lexeme in the tsvector's order whose key
+ * it is, since the extraction keeps the first of two lexemes with one key
+ * and the positions that came with it.
+ */
+static int
+lion_bm25_doc_lexeme(TSVector doc, const text *key)
+{
+	WordEntry  *we = ARRPTR(doc);
+	char	   *str = STRPTR(doc);
+	Size		klen = VARSIZE_ANY_EXHDR(key);
+	int			lo = 0;
+	int			hi = doc->size;
+	int			i;
+
+	if (klen >= LION_LEXEME_KEY_MAX)
+	{
+		for (i = 0; i < doc->size; i++)
+		{
+			text	   *k;
+			bool		same;
+
+			if (we[i].len < LION_LEXEME_KEY_MAX)
+				continue;
+			k = lion_lexeme_key(str + we[i].pos, we[i].len, NULL);
+			same = VARSIZE_ANY_EXHDR(k) == klen &&
+				memcmp(VARDATA_ANY(k), VARDATA_ANY(key), klen) == 0;
+			pfree(k);
+			if (same)
+				return i;
+		}
+		return -1;
+	}
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		int32		c = tsCompareString(VARDATA_ANY(key), (int) klen,
+										str + we[mid].pos, we[mid].len,
+										false);
+
+		if (c == 0)
+			return mid;
+		if (c < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return -1;
+}
+
+/*
  * The score of one row from its tsvector, as the walk would give it: the
  * same tf (a stripped lexeme once), the same length (every occurrence of
  * every lexeme but an empty one, capped at 65535) and the same order of
@@ -552,7 +607,6 @@ double
 lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
 {
 	WordEntry  *we = ARRPTR(doc);
-	char	   *str = STRPTR(doc);
 	uint32		dl = 0;
 	double		norm;
 	double		score = 0;
@@ -566,31 +620,15 @@ lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
 
 	for (t = q->nterms - 1; t >= 0; t--)
 	{
-		text	   *lex = q->lexemes[q->order[t]];
-		int			lo = 0;
-		int			hi = doc->size;
+		int			e = lion_bm25_doc_lexeme(doc, q->lexemes[q->order[t]]);
 
-		while (lo < hi)
+		if (e >= 0)
 		{
-			int			mid = lo + (hi - lo) / 2;
-			int32		c = tsCompareString(VARDATA_ANY(lex),
-											VARSIZE_ANY_EXHDR(lex),
-											str + we[mid].pos, we[mid].len,
-											false);
+			double		tf = we[e].haspos ?
+				(double) Max(POSDATALEN(doc, &we[e]), 1) : 1.0;
 
-			if (c == 0)
-			{
-				double		tf = we[mid].haspos ?
-					(double) Max(POSDATALEN(doc, &we[mid]), 1) : 1.0;
-
-				score += lion_bm25_tf_score(q->idfs[q->order[t]], tf, q->k1,
-											norm);
-				break;
-			}
-			if (c < 0)
-				hi = mid;
-			else
-				lo = mid + 1;
+			score += lion_bm25_tf_score(q->idfs[q->order[t]], tf, q->k1,
+										norm);
 		}
 	}
 	return score;

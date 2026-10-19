@@ -692,11 +692,12 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 
 DROP TABLE lion_di_s;
 -- ---------- 11. an index of an older format version ----------
--- An index with its meta page's version (at byte 28) made 9, the format
--- before the compact entry tuples of DESIGN.md §21, and then 8, the one
--- before the varbyte sparse segments of §13: its entries or its segments
--- would be read as the wrong bytes, so lion_index_verify() reports it and a
--- reader refuses it, asking for a REINDEX - which makes it whole again.
+-- An index with its meta page's version (at byte 28) made 10, the format
+-- before keys of up to 2047 bytes (DESIGN.md §4), then 9, the one before the
+-- compact entry tuples of §21, and then 8, the one before the varbyte sparse
+-- segments of §13: its keys, entries or segments would be read wrongly, so
+-- lion_index_verify() reports it and a reader refuses it, asking for a
+-- REINDEX - which makes it whole again.
 CREATE FUNCTION lion_di_hint(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -718,7 +719,31 @@ SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-      10
+      11
+(1 row)
+
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(10));
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+                      lion_di_try                       
+--------------------------------------------------------
+ XX002: index "lion_di_old_i" is not a valid lion index
+(1 row)
+
+SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
+                                 lion_di_hint                                 
+------------------------------------------------------------------------------
+ XX002: REINDEX the index: its on-disk format predates this build of pg_lion.
+(1 row)
+
+SELECT lion_di_evict('lion_di_old_i');
+ lion_di_evict 
+---------------
+ 
 (1 row)
 
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(9));
@@ -767,7 +792,7 @@ REINDEX INDEX lion_di_old_i;
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-      10
+      11
 (1 row)
 
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
