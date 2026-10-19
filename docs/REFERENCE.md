@@ -111,12 +111,14 @@ One default operator class per type, reusing the hash access method's hash funct
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
 `oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
-pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2000 bytes are rejected.
+pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2047 bytes, counting a 4-byte length header (2043 bytes
+of text), are rejected, except tsvector lexemes and jsonb keys, which are hashed (below).
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
 `array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
-extraction functions, and answer
+extraction functions (for tsvector through wrappers that hash lexemes too long to be keys), and
+answer
 
     CREATE INDEX ON doc USING lion (tags);       -- text[], int[], ...
     CREATE INDEX ON doc USING lion (tsv);        -- tsvector, with positions
@@ -178,6 +180,11 @@ match has one of the scored lexemes - the usual case of the same query in both p
 `WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
 else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
 
+A lexeme of up to 2043 bytes is a key as it is. A longer one (tsvector allows 2047) is stored as its
+first bytes and its SHA-256, and a query that names a lexeme of 2043 bytes or more has every
+candidate rechecked in the heap, so the answer stays exact; a prefix `foo:*` longer than about 1975
+bytes is not expanded, and every row is rechecked.
+
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
 other elements, the phrase's lexemes, `a`), then rechecked, in counts and scans alike. `<@`, `@> '{}'` and a bare `!a` fall back to scanning
@@ -221,7 +228,7 @@ root, the root's type, and one per top-level key, string element or string scala
     doc @? '$.a ? (@.b > 1)'   the keys under a.b (a range only requires the path), rechecked
 
 Numbers compare by value (`1`, `1.0` and `1e0` are one key) and strings by their bytes, as jsonb
-equality does. A key longer than 2000 bytes is stored as its SHA-256, and a query that needs one is
+equality does. A key longer than 2047 bytes is stored as its SHA-256, and a query that needs one is
 rechecked. Counts are pushed down, the rechecked queries with each candidate checked in the heap,
 except `?& '{}'`, which stays with the ordinary plan. `<@` is not indexed.
 
