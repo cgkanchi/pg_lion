@@ -145,8 +145,12 @@ step s1_check	{
 	  FROM lvt_got g
 	  JOIN (SELECT row_number() OVER (ORDER BY v <-> lvt_vec(-3, 0.2), id) AS n, id
 			  FROM lvt) s USING (n);
-	COMMIT;
 }
+# The cursor's scan ends, and says what it did, when the COMMIT drops it: a
+# step of its own, so that its DEBUG lines come after s1_check's rows
+# whenever they reach isolationtester, not before them when they share a
+# read with the rows and after when they do not.
+step s1_commit	{ COMMIT; }
 
 # The writer: rows deleted after the scan's snapshot; the TOAST relation
 # vacuumed alone, or the whole table; new rows near the query, into the
@@ -198,4 +202,4 @@ permutation s1_park s1_scan s2_delete s2_vacuum_toast s2_insert s3_wake s1_got s
 
 # A cursor of the probed path parked with places queued: rows deleted, the
 # table vacuumed, its REFINE items, heap TIDs and TOAST space taken again.
-permutation s1_open s2_delete s2_vacuum s2_insert s1_drain s1_check s3_whole
+permutation s1_open s2_delete s2_vacuum s2_insert s1_drain s1_check s1_commit s3_whole
