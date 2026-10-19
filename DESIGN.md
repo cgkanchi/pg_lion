@@ -18464,7 +18464,7 @@ and 16 buffers. Any other filter on the walked column alone - `s LIKE 'p1%'`, `l
 `k % 7 = 3`, `n IS NULL OR n > 4` - is decided once per ENTRY (`lo_walk_value_rinfos()`): when the
 index's stored keys are the rows' own values byte for byte (`lion_index_can_emit_value()`, the
 value-representation rule of §10), every row of an entry holds one value, so a clause that reads
-no other column and calls nothing volatile is true of all of them or of none. The first VISIBLE row
+no other column and is immutable is true of all of them or of none. The first VISIBLE row
 the walk fetches of an entry decides for the entry; one that fails takes the rest of it with it,
 unread (`lion_order_walk_skip_entry()`). EXPLAIN shows the clauses as `Filter per Value` and ANALYZE
 counts `Lion Keys Filtered`; they stay in the node's filter too.
@@ -18474,7 +18474,10 @@ DEAD row's, so a function the query never calls on a visible row would be called
 3` with `k = 0` only in deleted rows raised a division by zero the ordinary plan does not. Only
 leakproof functions promise not to, and those are the comparisons the walk's bounds answer already.
 And over a type whose equal values may differ - numeric's 1.0 and 1.00 are one entry - the
-representative is not every row's value, which the image rule excludes. The price
+representative is not every row's value, which the image rule excludes. Non-volatile is not enough
+either: a stable function may read how a row stores its value rather than the value, and
+`pg_column_size(s) > 1000`, `pg_column_compression(s) IS NULL` differ between two rows of one value,
+one compressed and one not, so the first row would decide wrongly for the rest. Hence immutable. The price
 (`lo_cost_walk()`): of the entries the filter rejects, the walk reads the TIDs up to the first
 member and fetches it; of the rest, everything.
 

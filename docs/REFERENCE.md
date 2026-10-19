@@ -476,7 +476,9 @@ working around a bad choice:
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`. A filter on the walked column
   alone (`WHERE s LIKE 'p1%' ORDER BY s`) is decided for a whole key by its first visible row, and
-  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35). When the B-tree holds
+  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35), when the filter is
+  immutable and equal values of the type are stored identically; any other filter is evaluated row
+  by row. When the B-tree holds
   every column the query reads, the rows' values come from its index tuples and the heap is read
   only for pages not all-visible (`Ordered By: <index> (index only)`, DESIGN.md §40); off, no order
   is claimed and the covering walks below are the only ones left.
