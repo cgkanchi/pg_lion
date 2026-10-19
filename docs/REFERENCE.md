@@ -78,7 +78,9 @@ count functions' are, after deletes and updates VACUUM has not yet cleaned up in
   `$."a".type() == "array"` or `"object"` (a container at a path), `? "k"` (what `?` finds: a
   top-level object key, a string element of a top-level array, a raw scalar string),
   `$.type() == "object"` or `"array"` (the document's own kind), and `sha256:<hex>` for a key too
-  long to store, which was hashed.
+  long to store, which was hashed. A tsvector lexeme or an array element too long to be a key is
+  shown as itself, with its own count, as `ts_stat()` and `GROUP BY e` show it: the rows of its
+  hashed key are read from the heap to tell it from the others the key may stand for.
 - **The filter** is a WHERE condition over the index's table, written as in a query and analysed
   like one, made only of what Lion indexes answer exactly as posting sets: `AND` and `OR` of
   `col = value`, `col IN (...)` or `= ANY (array)`, and `col IS NULL` on a column some valid,
@@ -111,13 +113,25 @@ One default operator class per type, reusing the hash access method's hash funct
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
 `oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
-pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2047 bytes, counting a 4-byte length header (2043 bytes
-of text), are rejected, except tsvector lexemes and jsonb keys, which are hashed (below).
+pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type.
+
+**Long keys.** A key is at most 2047 bytes as stored, counting a 4-byte length header (2043 bytes of
+text). A longer value is stored compressed, as a btree index stores it, so a value of any length
+whose compressed form fits is a key - `repeat('abc', 20000)`, a `char(2500)` column's blank-padded
+values, a 5000-digit numeric, a `jsonb_ops` document of a few kilobytes - and answers every query
+exactly as a short one does. A value that is still over 2047 bytes compressed (incompressible text
+of 2044 bytes or more, say) is an error naming the index and the row:
+
+    ERROR:  index key size 2564 exceeds lion maximum 2047 for index "t_v_idx"
+    DETAIL:  Index row references tuple (0,4) in relation "t".
+
+where btree's limit, on the compressed size too, is 2704 bytes. tsvector lexemes, text, varchar and
+bytea array elements and `jsonb_contains_ops` keys are hashed instead and never fail (below).
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
 `array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
-extraction functions (for tsvector through wrappers that hash lexemes too long to be keys), and
+extraction functions (through wrappers that hash elements and lexemes too long to be keys), and
 answer
 
     CREATE INDEX ON doc USING lion (tags);       -- text[], int[], ...
@@ -183,7 +197,10 @@ else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan 
 A lexeme of up to 2043 bytes is a key as it is. A longer one (tsvector allows 2047) is stored as its
 first bytes and its SHA-256, and a query that names a lexeme of 2043 bytes or more has every
 candidate rechecked in the heap, so the answer stays exact; a prefix `foo:*` longer than about 1975
-bytes is not expanded, and every row is rechecked.
+bytes is not expanded, and every row is rechecked. A `text`, `varchar` or `bytea` array element
+(under a deterministic collation) is filed the same way, at any length: one of 2043 bytes or more in
+a query is rechecked. An element of another type longer than 2047 bytes is stored compressed, and is
+an error only if that does not fit, as a GIN index tuple that does not fit is.
 
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
