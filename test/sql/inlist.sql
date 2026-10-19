@@ -278,7 +278,7 @@ SELECT lion_anycmp('lion_in_n', 'lion_in', 'n', '''{1,2,3,4,5,6}''::int[]');
 -- the same errors the single-key count raises
 SELECT lion_index_count_any('lion_in_a', '{1}'::text[]);
 SELECT lion_index_count_any('lion_in', '{1}'::int[]);
-SELECT lion_index_count_any('lion_in_a', NULL::int[]) IS NULL AS null_array;
+SELECT lion_index_count_any('lion_in_a', NULL::int[]) AS null_array;
 
 -- ---- an empty table ----------------------------------------------------
 CREATE TABLE lion_in_empty (k int NOT NULL);

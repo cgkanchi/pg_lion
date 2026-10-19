@@ -710,10 +710,10 @@ SELECT lion_index_count_any('lion_in_a', '{1}'::text[]);
 ERROR:  type text cannot be compared with index "lion_in_a"
 SELECT lion_index_count_any('lion_in', '{1}'::int[]);
 ERROR:  "lion_in" is not an index
-SELECT lion_index_count_any('lion_in_a', NULL::int[]) IS NULL AS null_array;
+SELECT lion_index_count_any('lion_in_a', NULL::int[]) AS null_array;
  null_array 
 ------------
- t
+          0
 (1 row)
 
 -- ---- an empty table ----------------------------------------------------

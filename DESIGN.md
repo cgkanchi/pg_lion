@@ -1047,7 +1047,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
         -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
-    (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
+    (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
 
@@ -1637,27 +1637,44 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
      partition. `lion_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
      for tests: same entry scan, one count per group, one cache.
 
-SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
-whose keys are of two unrelated polymorphic types because each is compared with its own index's
-column and the two columns need not share a type. Both open the heap via IndexGetRelation with
-AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
+SQL surface for tests: `lion_index_count(idx regclass, key "any") RETURNS bigint` and
+`lion_index_count(idx1 regclass, key1 "any", idx2 regclass, key2 "any") RETURNS bigint`, whose
+keys are each compared with its own index's column, and the two columns need not share a type. The
+keys are `"any"`, not polymorphic, so that an untyped literal arrives as one (`unknown`, which a
+polymorphic argument refuses), as it would in `col = 'abc'`. Both open the heap via IndexGetRelation
+with AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
 SELECT.
-**The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
-review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
-DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
-indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
+**The key is taken as `col = key` would take it.** A key whose own type the column's opclass takes
+is looked up as that type (`lion_count_key_type()`, below). Any other key is first CONVERTED as the
+query converts it (`lion_count_coerce_key()`): the parser's own `make_op()` (`make_scalar_array_op()`
+for `lion_index_count_any()`'s `col = ANY (keys)`) resolves the operator named as the index's
+equality is named - `=`, or a class's own `====` - for (the column's type, the key's type) and
+coerces the key to its input, an untyped literal through the column's input function, `1` to numeric
+on a numeric column, a numeric `0.1` to float8 on a float4 one; the coercion is evaluated once, its
+cast functions checked for EXECUTE as the executor checks the query's. The count is made only where
+the operator the parser picked is the index's equality - strategy 1 of the key column's family with
+the column's type on its left - and the column reaches it unconverted, relabelled at most. Then the
+count is the query's: `f4 = 0.1` is `float4 = float8`, which no float4 value satisfies, and the
+count is 0 as the query is, where rounding the key to float4 would have counted the rows of 0.1::float4.
+Otherwise the query compares something the index does not hold - `intcol = 1.5` is `numeric =
+numeric` on `intcol::numeric`, `bpcharcol = 'x'::text` is `text = text` on the column cast by
+rtrim1() - and the count is an ERROR whose hint says to cast the key to the column's type, never a
+number made another way (1.5 cast to integer would count the rows of 2). A key no operator takes is
+refused as the query would refuse it.
+*The key's own type* is resolved by `lion_count_key_type()` (2026-09-25 review; before it the key had
+to BE the index's opcintype or have a cross-type member, so enum_ops, a DEFAULT class, could not be
+counted at all and neither could a varchar key on the varchar column it indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
 the column's actual type and nothing else: a different enum would pass for "an enum", and its OIDs
 mean nothing to this column (the DETAIL names the column's type, not anyenum). Otherwise the key is
 of the class's own type, or of a type the family has a strategy-1 member for with it (int8 on int4:
 `int48eq`, which §21's probe resolves further), or - lacking one - BINARY-coercible to the class's
 type where the parser makes that coercion itself: its `=` for (column type, key type) must be the
 class's own (opcintype, opcintype) operator reached without a cast function (`compatible_oper()`),
-as for varchar on text_ops, which the parser relabels to call `texteq`. A cast function is never
-taken (§21), and a coercion merely existing is not enough: text is binary-coercible to bpchar, but
-`bpcharcol = 'x '::text` is `text = text` on the column cast by rtrim1(), and matches none of the
-rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
-the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
+as for varchar on text_ops, which the parser relabels to call `texteq`. A coercion merely existing
+is not enough: text is binary-coercible to bpchar, but `bpcharcol = 'x '::text` is `text = text` on
+the column cast by rtrim1(), and matches none of the rows bpchar's own equality would count. A key
+of any other type goes through the conversion above. The resolved type is what the lookup is made as
+and what the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
 `lion_index_count_any()` resolves its array's element type the same way.
 **So is its collation** (`lion_count_check_collation()`, 2026-09-28 review; the functions used to
 look every key up under the index's collation whatever the call said). The index hashed and
@@ -1692,15 +1709,11 @@ nothing changed. A key taken from a column brings that column's collation and is
 `test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
 and is skipped without them (`countcoll_1.out`), as it is on CI's source builds;
 `test/sql/countcoll_default.sql` the default collation's key, likewise.
-**A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
-STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
-argument - a NULL constant folds the call away when the query is planned - so no count is made,
-nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding
-what a keyless count checks, and the query it would stand for does not settle it: the planner folds
-`col = NULL` to a constant-false filter, so that query reads no index, calls no equality and never
-asks whether a materialized view is populated.
-A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
-0; a NULL array is a NULL argument.
+**A NULL key counts 0**, as `count(*) WHERE col = NULL` does: the functions are not STRICT. The
+key's type is resolved and every check a key gets is made - the index, the type, the collation, the
+privileges - and then no lookup: `col = NULL` selects no row. A NULL index names no index and
+answers NULL. A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY
+(...)`, and counts 0, and so does a NULL array.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
 entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized
