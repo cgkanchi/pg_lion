@@ -2554,7 +2554,13 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 
 	if (!nomatch && nargs == 0 && nnegs == 0 && listkey < 0 && nrange == 1)
 	{
-		/* Nothing beside the range could be expressed: the range alone. */
+		/*
+		 * Nothing beside the range could be expressed: the range alone.  The
+		 * heap re-applies the quals that could not be, which set the recheck;
+		 * an `IS NOT NULL` of a column with no NULL entry took nothing away
+		 * and set none, and with nothing else beside it the range alone is
+		 * the exact answer.
+		 */
 		ScanKey		skey = rangekeys[0];
 		LionState  *col = lion_column(so->ix, skey->sk_attno);
 
@@ -2562,7 +2568,6 @@ lion_emit_intersect(LionScanOpaque so, ScanKey *keys,
 			lion_posting_set_release(&acc.sets[i]);
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);
-		Assert(so->recheck);
 		if ((skey->sk_flags & SK_SEARCHARRAY) == 0)
 			return lion_emit_range(so, col, tbm);
 		return lion_emit_array_range(so, col, skey, tbm);
