@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "pgstat.h"
+
 #include "lion_customscan.h"
 
 static const CustomExecMethods lion_join_agg_exec_methods = {
@@ -1209,6 +1211,13 @@ lion_join_lookup_ent(LionCountScanState *st, const LionJoinEnt *ent,
 	js->batch.lastfound = found;
 	js->batch.lastcount = count;
 
+	/*
+	 * A partition's rows, which go up only once every partition has had the
+	 * batch, are its indexes' while it is open (lion_count_report_reads())
+	 */
+	if (part >= 0)
+		st->statrows += count;
+
 	/* probed so far, and collected from here on if that pays */
 	if (part < 0)
 		lion_join_maybe_switch(st);
@@ -2264,11 +2273,11 @@ lion_join_group_turn(LionCountScanState *st, int p)
 
 	/*
 	 * The groups are the entries of the column's index here, its key column
-	 * derived from the index as it was opened (DESIGN.md §24), and the index
-	 * predicate-locked as every index the node reads is (lion_open_relation()).
-	 * It is open with the relation's others for the life of the node
-	 * (lion_open_relation() for a plain table, lion_open_parts() for a
-	 * partition), and stays open after the turn.
+	 * derived from the index as it was opened (DESIGN.md §24); the leaves it
+	 * walks are predicate-locked as it reads them (DESIGN.md §9).  It is open
+	 * with the relation's others for the life of the node (lion_open_relation()
+	 * for a plain table, lion_open_parts() for a partition), and stays open
+	 * after the turn.
 	 */
 	Assert(fgidx != NULL);
 
@@ -2276,7 +2285,9 @@ lion_join_group_turn(LionCountScanState *st, int p)
 	if (js->unite)
 		lion_join_unite_keys(st, walked);
 
-	lion_reader_lock(fgidx, st->css.ss.ps.state->es_snapshot);
+	/* a partition's turn is a scan of its index (lion_count_report_reads()) */
+	if (p >= 0)
+		pgstat_count_index_scan(fgidx);
 	fgidxcol = lion_index_col_for(fgidx,
 								  lion_heap_attno_in(st->heap,
 													 st->plan.heapoid,

@@ -101,10 +101,12 @@ DECLARE
 BEGIN
 	EXECUTE format('CREATE TEMP TABLE olw_on AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE olw_off AS SELECT s::text AS r FROM (%s) s', q);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM olw_on EXCEPT ALL SELECT * FROM olw_off) a)'
@@ -127,13 +129,15 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_intersection_probe',
 					   CASE WHEN probe THEN 'on' ELSE 'off' END, true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_sort', 'off', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) SELECT id FROM olw WHERE ' || q ||
 		' ORDER BY id LIMIT 10' INTO j;
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('pg_lion.enable_intersection_probe', 'on', true);
@@ -168,7 +172,8 @@ SELECT split_part(olw_plan('SELECT count(*) FROM olw WHERE ' || q), E'\n', 1) AS
 -- and the same with the probe off
 SET pg_lion.enable_intersection_probe = off;
 SET enable_seqscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_bitmapscan = off;
 SELECT a.n, olw_cost('SELECT count(*) FROM olw WHERE ' || a.q) =
 			olw_cost('SELECT count(*) FROM olw WHERE ' || b.q) AS same_cost
@@ -182,7 +187,8 @@ SELECT a.n, olw_cost('SELECT count(*) FROM olw WHERE ' || a.q) =
 (3 rows)
 
 RESET enable_seqscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_intersection_probe;
 -- ---------- 2. the probe measures both forms of the wide filter ----------

@@ -227,8 +227,11 @@ SELECT lion_ktc($$lion_index_count_any('lion_kt_v_k', '{3, 4}'::lion_kt_big8[])$
 				$$FROM lion_kt_v WHERE k = ANY ('{3, 4}'::lion_kt_big8[])$$);
 SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varchar)$$,
 				$$FROM lion_kt_v WHERE k = 3 AND v = 'v3'$$);
--- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
-SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
+-- a cast function on the KEY is taken where `col = key` takes it: `t =
+-- 'v3 '::bpchar` is `text = text` with the key cast by rtrim1(); one on the
+-- column is not, and there is no `int4 = varchar` at all
+SELECT lion_ktc($$lion_index_count('lion_kt_v_t', 'v3 '::bpchar)$$,
+				$$FROM lion_kt_v WHERE t = 'v3 '::bpchar$$);
 SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
 -- and a binary coercion only where `col = key` makes it.  text is binary-
 -- coercible to bpchar, but `c = 'x '::text` resolves to `text = text` with

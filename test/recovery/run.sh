@@ -1339,9 +1339,12 @@ phase1e() {
 # An UNLOGGED rmgr-mode index rides along: it writes no WAL at all, so the
 # server without the manager must let it be written - inserted into and
 # vacuumed - where it used to refuse every write with the preload hint
-# (lion_wal_begin(), 2026-09-27 review).
+# (lion_wal_begin(), 2026-09-27 review).  A LOGGED rmgr-mode index built with
+# wal_mode = auto must still refuse an insert, and a VACUUM with dead rows to
+# remove from it, with a hint naming both the preload and a REINDEX in
+# generic mode - and that REINDEX must make it writable again.
 phase1f() {
-	local before after custom off
+	local before after custom off out
 	log ""
 	log "=== phase 1f: VACUUM of an rmgr-mode index on a server without the manager ==="
 
@@ -1364,7 +1367,13 @@ phase1f() {
 		INSERT INTO lion_norm_u SELECT i, i % 500 FROM generate_series(1, 20000) i;
 		CREATE INDEX lion_norm_u_k ON lion_norm_u USING lion (k)
 			WITH (wal_mode = rmgr, inline_limit = 64);
+		DROP TABLE IF EXISTS lion_norm_w;
+		CREATE TABLE lion_norm_w (id int NOT NULL, k int NOT NULL);
+		INSERT INTO lion_norm_w SELECT i, i % 50 FROM generate_series(1, 20000) i;
+		CREATE INDEX lion_norm_w_k ON lion_norm_w USING lion (k);
 	SQL
+	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_w_k'::regclass)")" = rmgr ] ||
+		die "phase 1f: the index built under the preload with wal_mode = auto is not in rmgr mode"
 	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_k'::regclass)")" = rmgr ] ||
 		die "phase 1f: the partial index was not built in rmgr mode"
 	[ "$(psql_p -tAc "select lion_index_wal_mode('lion_norm_u_k'::regclass)")" = rmgr ] ||
@@ -1418,6 +1427,30 @@ phase1f() {
 	[ "$custom" = 0 ] ||
 		die "phase 1f: the VACUUM wrote $custom record(s) of a resource manager this server does not have"
 
+	# A logged rmgr-mode index, without the manager: an insert and a VACUUM
+	# with dead rows to remove from it both fail, with a hint that names the
+	# preload and REINDEX in generic mode; that REINDEX makes it writable.
+	out=$(psql_p -c "INSERT INTO lion_norm_w VALUES (0, 1)" 2>&1) &&
+		die "phase 1f: an insert into an rmgr-mode index succeeded without the manager"
+	grep -q 'HINT:.*shared_preload_libraries.*REINDEX the index to rebuild it with wal_mode = generic' <<<"$out" ||
+		die "phase 1f: the insert's error has no hint naming both fixes: $out"
+	psql_p -c "DELETE FROM lion_norm_w WHERE id % 2 = 0" >>"$RUNLOG" 2>&1 ||
+		die "phase 1f: the delete from lion_norm_w failed"
+	out=$(psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_norm_w" 2>&1) &&
+		die "phase 1f: a VACUUM of an rmgr-mode index with dead rows succeeded without the manager"
+	grep -q 'HINT:.*shared_preload_libraries.*REINDEX the index to rebuild it with wal_mode = generic' <<<"$out" ||
+		die "phase 1f: the VACUUM's error has no hint naming both fixes: $out"
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: lion_norm_w was not writable after REINDEX in generic mode"
+		ALTER INDEX lion_norm_w_k SET (wal_mode = generic);
+		REINDEX INDEX lion_norm_w_k;
+		INSERT INTO lion_norm_w VALUES (0, 1);
+		VACUUM (INDEX_CLEANUP ON) lion_norm_w;
+	SQL
+	run_check "phase 1f reindexed" psql_p \
+		"select lion_index_wal_mode('lion_norm_w_k') = 'generic', 'REINDEX rebuilt it in generic mode'
+		 union all
+		 select lion_index_count('lion_norm_w_k', 1) = 401, 'it counts the 401 rows of k = 1'"
+
 	# And recovery goes through that range.
 	crash_immediate
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
@@ -1436,11 +1469,12 @@ phase1f() {
 		die "phase 1f: could not stop the primary"
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
-	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u" >>"$RUNLOG" 2>&1
+	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u, lion_norm_w" >>"$RUNLOG" 2>&1
 
 	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
 	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
 	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
+	SUMMARY+=("phase1f            a logged one refused insert and VACUUM with the hint, until REINDEXed generic")
 }
 
 # ------------------------------------------------------------- phase 1g

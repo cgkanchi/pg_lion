@@ -11,8 +11,15 @@
  *	- Every non-rightmost page's FIRST item is its high key, a key-only pivot
  *	  tuple that is strictly greater than every key on the page and at most
  *	  every key to its right.  Internal pages hold downlink pivots whose
- *	  `head` is the child block; the leftmost downlink of the leftmost page of
- *	  each level is flagged MINUSINF and compares below everything.
+ *	  `head` is the child block.  The FIRST downlink of every internal page
+ *	  is flagged MINUSINF and carries no key, as nbtree's first data item on
+ *	  an internal page has none: the page's lower bound is its left
+ *	  sibling's high key (on the leftmost page of a level, minus infinity
+ *	  itself), and the separator of that child is the downlink to the page
+ *	  in the parent.  What it buys is room - with keys of LION_MAX_KEY_SIZE
+ *	  an internal page holds a high key and three downlinks rather than two,
+ *	  which is what lets every split leave two on each half and bounds the
+ *	  height (LION_MAX_DIR_HEIGHT).
  *
  *	- A descent NEVER holds a parent lock while acquiring a child lock.  This
  *	  is not an optimisation but the reason the protocol has no deadlock: a
@@ -152,8 +159,8 @@ lion_dir_check_page(Relation index, Page page, BlockNumber blk)
  * page's own.  A directory page never changes level (DESIGN.md §21: a root
  * split keeps the old root as the left half, at its level), and a DELETED one
  * keeps its level until no scan can hold a link to it any more (§21, "Page
- * deletion"), so anything else is a link to the wrong page - and a downlink to the
- * page itself or to one above it would send a descent round for ever.
+ * deletion"), so anything else is a link to the wrong page - and a downlink
+ * to the page itself or to one above it would send a descent round for ever.
  * `expected` is an int because a leaf's children would be at level -1.
  */
 static inline void
@@ -489,19 +496,27 @@ lion_page_downlink(Page page, const LionSearchKey *sk)
 	OffsetNumber off = lion_page_binsrch_ext(page, sk, true);
 
 	/*
-	 * The leftmost downlink of a page stands for the page's lower bound,
-	 * whatever key it carries: the leftmost page of a level carries a
-	 * MINUSINF one, and every other page's first separator was its lower
-	 * bound when it was made - a page deletion can lower the bound since
-	 * (DESIGN.md §21, "Page deletion"), never raise it.  Every key a descent
-	 * brings here that sorts below the second separator belongs to the first
-	 * child, and the binary search, which may compare that key with the
-	 * first separator only once the second sorts above it, answers the first
-	 * child for it either way.
+	 * The leftmost downlink of a page compares below every key: it is the
+	 * MINUSINF one every internal page begins with.  Taking the leftmost child
+	 * when that somehow does not hold is conservative rather than wrong: the
+	 * search then lands left of its key and the move-right rule walks to it.
 	 */
 	if (off <= first)
 		return first;
 	return OffsetNumberPrev(off);
+}
+
+OffsetNumber
+lion_dir_first_keyed(Page page)
+{
+	OffsetNumber off = lion_page_first_data(page);
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	while (off <= maxoff &&
+		   (!ItemIdIsUsed(PageGetItemId(page, off)) ||
+			LionEntryIsMinusInf(lion_page_item(page, off))))
+		off = OffsetNumberNext(off);
+	return off;
 }
 
 /* ---------------------------------------------------------------------
@@ -1564,6 +1579,11 @@ typedef struct LionDirItem
 	Size		pivot;			/* what a pivot copy of its key would cost */
 } LionDirItem;
 
+/* The room lion_dir_choose_split() proves an internal split has. */
+StaticAssertDecl(MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData) +
+				 3 * LION_MAX_PIVOT_SIZE <= LION_PAGE_CAPACITY,
+				 "an internal directory page holds its minus-infinity downlink, two more downlinks and a high key");
+
 /*
  * Where to cut the item list.  Aim at half the bytes, then pull the cut
  * towards whichever side does not fit: the left half has to hold its new high
@@ -1589,19 +1609,52 @@ typedef struct LionDirItem
  * (LION_MAX_ENTRY_SIZE, LION_MAX_PIVOT_SIZE and how much one insert can add),
  * and none of them should be load-bearing for whether an INSERT errors out.
  * DESIGN.md §21 "Split" carries the arithmetic.)*
+ *
+ * An INTERNAL page (minfneed > 0) is cut differently in two ways.  The item
+ * at the cut becomes the right half's first downlink, which is minus infinity
+ * (the file header), so on the right it costs minfneed rather than its own
+ * size; and each half keeps at least LION_ABS_MIN_DOWNLINKS downlinks, which
+ * is what bounds the directory's height (LION_MAX_DIR_HEIGHT).  Such a cut
+ * always exists.  The page begins with a minus-infinity downlink, of m =
+ * minfneed bytes, and a pivot costs at most P = LION_MAX_PIVOT_SIZE; m + 3P is
+ * less than LION_PAGE_CAPACITY, so a page holding that downlink, one more and
+ * a high key takes a third without splitting, and a split has n >= 4 items
+ * (the new one included).  With s(i) the cost of item
+ * i, a downlink's pivot copy costs what it does, so the left half at cut k
+ * costs L(k) = s(0) + ... + s(k), rising with k, and the right one R(k) = m +
+ * s(k+1) + ... + s(n-1) + the old high key, falling.  L(2) and R(n - 2) are at
+ * most m + 2P each, so take the largest k <= n - 2 whose left half fits: if
+ * it is n - 2 both fit, and otherwise L(k + 1) exceeds the page, and since the
+ * page held everything but the new item, R(k) < m + s(new) + s(k + 1) <= m +
+ * 2P.  The walks below find a cut whenever one exists, because L rises and R
+ * falls; so *ok is never false for an internal page.
  */
 static int
 lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append,
-					  bool *ok)
+					  Size minfneed, bool *ok)
 {
 	Size		budget = LION_PAGE_CAPACITY;
 	Size	   *prefix;			/* prefix[i] = bytes of items[0 .. i) */
 	Size		total;
+	bool		internal = (minfneed > 0);
+	int			lo = internal ? LION_ABS_MIN_DOWNLINKS : 1;
+	int			hi = internal ? nitems - LION_ABS_MIN_DOWNLINKS : nitems - 1;
 	int			k;
 	int			i;
 
+#define LION_SPLIT_LEFT(k)	(prefix[k] + items[k].pivot)
+#define LION_SPLIT_RIGHT(k) \
+	(internal ? minfneed + (total - prefix[(k) + 1]) + oldhk : \
+	 (total - prefix[k]) + oldhk)
+
 	Assert(nitems >= 2);
 	*ok = true;
+	if (lo > hi)
+	{
+		/* an internal page with too few downlinks to split: damage */
+		*ok = false;
+		return 1;
+	}
 
 	prefix = (Size *) palloc(sizeof(Size) * (nitems + 1));
 	prefix[0] = 0;
@@ -1616,31 +1669,32 @@ lion_dir_choose_split(LionDirItem *items, int nitems, Size oldhk, bool append,
 	 * left page now needs, which is a handful of items and not half of them:
 	 * without that walk-back the cut is rejected outright (the page is full,
 	 * which is why it is being split) and an ascending build lands at 50%.
+	 * On an internal page the right half takes two downlinks, not one.
 	 */
 	if (append)
-		k = nitems - 1;
+		k = hi;
 	else
 	{
-		for (k = 1; k < nitems; k++)
+		for (k = lo; k < hi; k++)
 		{
 			if (prefix[k] * 2 >= total)
 				break;
 		}
-		if (k >= nitems)
-			k = nitems - 1;
 	}
 
-	while (k > 1 && prefix[k] + items[k].pivot > budget)
+	while (k > lo && LION_SPLIT_LEFT(k) > budget)
 		k--;
-	while (k < nitems - 1 && (total - prefix[k]) + oldhk > budget)
+	while (k < hi && LION_SPLIT_RIGHT(k) > budget)
 		k++;
 
-	if (prefix[k] + items[k].pivot > budget ||
-		(total - prefix[k]) + oldhk > budget)
+	if (LION_SPLIT_LEFT(k) > budget || LION_SPLIT_RIGHT(k) > budget)
 		*ok = false;
 
+#undef LION_SPLIT_LEFT
+#undef LION_SPLIT_RIGHT
+
 	pfree(prefix);
-	Assert(k >= 1 && k < nitems);
+	Assert(k >= lo && k <= hi);
 	return k;
 }
 
@@ -1725,6 +1779,9 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	Buffer		newroot = InvalidBuffer;
 	LionEntryTuple *minf = NULL;
 	Size		minfsz = 0;
+	LionEntryTuple *rminf = NULL;
+	Size		rminfsz = 0;
+	Size		minfneed = 0;
 	BlockNumber rblk;
 	bool		append;
 	bool		cutok;
@@ -1735,6 +1792,18 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\": root page %u has a right sibling",
 						RelationGetRelationName(index), pblk)));
+
+	/*
+	 * A root split adds a level, and no sound directory gets this tall
+	 * (LION_MAX_DIR_HEIGHT): refuse it here, before anything is written,
+	 * rather than record a height every later reader refuses.
+	 */
+	if (isroot && (uint32) level + 1 > LION_MAX_DIR_HEIGHT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": a root split would make the directory %u levels tall",
+						RelationGetRelationName(index), (uint32) level + 1),
+				 errhint("REINDEX the index.")));
 
 	/*
 	 * Both pages are rebuilt from the items as their line pointers give them,
@@ -1797,9 +1866,31 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		elog(ERROR, "lion index \"%s\": block %u cannot hold a single item of %zu bytes",
 			 RelationGetRelationName(index), pblk, newsize);
 
+	/*
+	 * An internal page's halves both begin with a minus-infinity downlink:
+	 * the left one keeps the one it has, and the right one's first downlink
+	 * loses its key, which goes up as the separator instead.
+	 */
+	if (!isleaf)
+	{
+		if (unlikely(!LionEntryIsMinusInf(items[0].item)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("lion index \"%s\": the first downlink of internal page %u is not minus infinity",
+							RelationGetRelationName(index), pblk)));
+		minfneed = items[0].need;
+	}
+
 	append = newitem != NULL && !BlockNumberIsValid(oldright) && !replace &&
 		off > maxoff;
-	firstright = lion_dir_choose_split(items, nitems, oldhkneed, append, &cutok);
+	firstright = lion_dir_choose_split(items, nitems, oldhkneed, append,
+									   minfneed, &cutok);
+
+	if (!cutok && !isleaf)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": internal page %u has no cut that leaves two downlinks on each half",
+						RelationGetRelationName(index), pblk)));
 
 	if (!cutok)
 	{
@@ -1824,6 +1915,14 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 							 InvalidBlockNumber, &lefthksz);
 	sep = lion_make_pivot(items[firstright].item, LION_ENTRY_DOWNLINK,
 						  InvalidBlockNumber, &sepsz);
+	if (!isleaf)
+	{
+		rminf = lion_make_pivot(NULL, LION_ENTRY_DOWNLINK,
+								lion_entry_head(items[firstright].item),
+								&rminfsz);
+		items[firstright].item = rminf;
+		items[firstright].size = rminfsz;
+	}
 
 	/*
 	 * The minus-infinity downlink of a new root is built HERE rather than
@@ -1848,6 +1947,10 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	rbuf = lion_alloc_page(index, heaprel, true);
 	rblk = BufferGetBlockNumber(rbuf);
 	lion_entry_set_head(sep, rblk);
+
+	/* SERIALIZABLE: the leaf's predicate locks cover both halves (§9) */
+	if (isleaf)
+		lion_predlock_copy(index, pblk, rblk);
 
 	if (isroot)
 		newroot = lion_alloc_page(index, heaprel, true);
@@ -1966,6 +2069,8 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		UnlockReleaseBuffer(newroot);
 		UnlockReleaseBuffer(rbuf);
 		pfree(minf);
+		if (rminf != NULL)
+			pfree(rminf);
 		pfree(sep);
 		pfree(lefthk);
 		pfree(items);
@@ -1993,6 +2098,8 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	if (BufferIsValid(qbuf))
 		UnlockReleaseBuffer(qbuf);
 	UnlockReleaseBuffer(rbuf);
+	if (rminf != NULL)
+		pfree(rminf);
 	pfree(sep);
 	pfree(lefthk);
 	pfree(items);
@@ -2007,27 +2114,6 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 	LION_INJECTION_POINT("lion-dir-split-incomplete");
 
 	lion_dir_finish_split(index, heaprel, ix, buf);
-}
-
-/*
- * Where an item with key sk goes on page.  On an internal page that is never
- * in front of the first downlink, which stands for the page's lower bound
- * whatever key it carries: a page deletion lowers the bound of the page right
- * of the one it takes out, and the key then sorts above separators that came
- * after it (DESIGN.md §21, "Page deletion").  A binary search would put such
- * a separator before it, and send the keys between the bound and that
- * separator to the wrong child.
- */
-static OffsetNumber
-lion_dir_place_off(Page page, const LionSearchKey *sk)
-{
-	OffsetNumber off = lion_dir_binsrch(page, sk);
-	OffsetNumber first = lion_page_first_data(page);
-
-	if (!LionPageIsLeaf(page) && off <= first &&
-		first <= PageGetMaxOffsetNumber(page))
-		off = OffsetNumberNext(first);
-	return off;
 }
 
 /*
@@ -2064,14 +2150,14 @@ lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
 		lion_dir_check_page(index, BufferGetPage(rbuf), next);
 		lion_dir_check_level(index, BufferGetPage(rbuf), next,
 							 LionPageGetOpaque(page)->level);
-		roff = lion_dir_place_off(BufferGetPage(rbuf), &sk);
+		roff = lion_dir_binsrch(BufferGetPage(rbuf), &sk);
 		lion_dir_place(index, heaprel, ix, rbuf, roff, replace, item, size);
 		UnlockReleaseBuffer(rbuf);
 		return;
 	}
 
 	lion_dir_place(index, heaprel, ix, buf,
-				   lion_dir_place_off(page, &sk), replace, item, size);
+				   lion_dir_binsrch(page, &sk), replace, item, size);
 }
 
 /*
@@ -2135,7 +2221,7 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 	BlockNumber pblk = BufferGetBlockNumber(pbuf);
 	BlockNumber rblk = LionPageGetOpaque(ppage)->rightlink;
 	uint16		level = LionPageGetOpaque(ppage)->level;
-	OffsetNumber first = lion_page_first_data(ppage);
+	OffsetNumber first;
 	LionSearchKey sk;
 	LionSearchKey *skp = NULL;
 	LionEntryTuple *sep;
@@ -2160,9 +2246,11 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 	/*
 	 * A key that routes to THIS page, for finding its downlink: any key it
 	 * holds will do, because an exact search key routes to the page that holds
-	 * it.  An empty page (VACUUM removed everything) has none, and then the
-	 * parent level is scanned from its leftmost page instead.
+	 * it - which on an internal page is not its first downlink, the
+	 * minus-infinity one.  An empty page (VACUUM removed everything) has none,
+	 * and then the parent level is scanned from its leftmost page instead.
 	 */
+	first = lion_dir_first_keyed(ppage);
 	if (first <= PageGetMaxOffsetNumber(ppage))
 	{
 		lion_search_key_exact(ix, &sk, lion_page_item(ppage, first));

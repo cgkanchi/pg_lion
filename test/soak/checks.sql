@@ -119,8 +119,10 @@ BEGIN
 	IF random() < 0.2 THEN g := g || 'pg_lion.enable_tree_probe=off'::text; END IF;
 	IF random() < 0.2 THEN g := g || 'pg_lion.enable_plain_scan=off'::text; END IF;
 	IF random() < 0.3 THEN
-		-- leave the pushdown and LionOrdered nothing to lose to
-		g := g || ARRAY['enable_bitmapscan=off', 'enable_indexscan=off', 'enable_indexonlyscan=off'];
+		-- leave the pushdown and LionOrdered nothing to lose to: core's index
+		-- scan settings would disable them too, so the margin marks them down
+		g := g || ARRAY['enable_bitmapscan=off', 'pg_lion.enable_plain_scan=off',
+						'pg_lion.pushdown_margin=1000'];
 	ELSIF random() < 0.15 THEN
 		g := g || 'enable_bitmapscan=off'::text;
 	END IF;
@@ -141,7 +143,7 @@ BEGIN
 	-- they always are.  No answer may depend on it.
 	IF current_setting('pg_lion.pushdown_margin', true) IS NOT NULL THEN
 		IF random() < 0.4 THEN
-			g := g || ('pg_lion.pushdown_margin=' || soak.pick('{0.01,0.1,0.5,0.99,1}'));
+			g := g || ('pg_lion.pushdown_margin=' || soak.pick('{0.01,0.1,0.5,0.99,1,1000}'));
 		END IF;
 		FOREACH r IN ARRAY '{hashagg,agg,hashjoin,mergejoin,bitmap}'::text[] LOOP
 			IF random() < 0.25 THEN

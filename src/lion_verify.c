@@ -338,10 +338,13 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 	{
 		/*
 		 * A plain 4-byte header, as lion_store_key() writes it: a short one
-		 * is no longer accepted either, because no reader does.
+		 * is no longer accepted either, because no reader does.  Or a
+		 * compressed one, for a key too long to store plain (DESIGN.md §4,
+		 * "Long keys"), which lion_key_is_valid() checks as the readers do.
 		 */
-		if (keylen < VARHDRSZ || !VARATT_IS_4B_U(key) ||
-			VARSIZE(key) != keylen)
+		if (keylen < VARHDRSZ ||
+			(VARATT_IS_4B_U(key) ? VARSIZE(key) != keylen :
+			 !lion_key_is_valid(state, key, keylen)))
 			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed varlena key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
@@ -2237,6 +2240,8 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.showvalues = superuser();
 	vs.concurrent = !inrecovery;
 
+	/* before its table is locked: a partitioned index has one too */
+	lion_refuse_partitioned_index(relid);
 	heapoid = IndexGetRelation(relid, true);
 	if (!OidIsValid(heapoid))
 	{

@@ -542,7 +542,8 @@ lion_handler(PG_FUNCTION_ARGS)
 		/* multi-key opclasses store the KEY type, not the column type (§17) */
 		.amstorage = true,
 		.amclusterable = false,
-		.ampredlocks = false,
+		/* page-level SERIALIZABLE locks, taken by lion_reader.c (§9) */
+		.ampredlocks = true,
 		.amcanparallel = false,
 #if PG_VERSION_NUM >= 170000
 		/* DESIGN.md §24, "Build"; 16 builds only btree indexes in parallel */
@@ -902,7 +903,9 @@ lionvalidate(Oid opclassoid)
 		 * could be answered from them).
 		 */
 		stratok = multikey ?
-			LION_STRAT_IS_MULTI(oprform->amopstrategy) :
+			(LION_STRAT_IS_MULTI(oprform->amopstrategy) ||
+			 oprform->amopstrategy == LION_STRAT_ARRAY_EQUAL ||
+			 oprform->amopstrategy == LION_STRAT_MATCH_OLD) :
 			(oprform->amopstrategy == LION_STRAT_EQUAL ||
 			 LION_STRAT_IS_WALK(oprform->amopstrategy));
 

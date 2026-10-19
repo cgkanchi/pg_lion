@@ -16,9 +16,13 @@
  *	page of the chain of only children above it (the "top parent") leaves the
  *	page above that - by pointing the downlink at the right sibling of the
  *	subtree instead and deleting that sibling's own downlink, so the sibling
- *	takes over the subtree's key range.  The leaf's high key becomes a
- *	MINUS INFINITY pivot, and its owner_head names the next page of the
- *	subtree to unlink.  One record: the parent and the leaf.
+ *	takes over the subtree's key range.  When the subtree's downlink is the
+ *	parent's first, the key-less minus-infinity one every internal page
+ *	begins with, it stays key-less, and the sibling's range begins at the
+ *	parent's lower bound.  A parent of two downlinks is left with one, which
+ *	the height bound allows for (LION_MAX_DIR_HEIGHT).  The leaf's high key
+ *	becomes a MINUS INFINITY pivot, and its owner_head names the next page
+ *	of the subtree to unlink.  One record: the parent and the leaf.
  *
  *	Stage 2 unlinks the subtree's pages from their levels one at a time, top
  *	parent first and the leaf last: each one's left and right siblings are
@@ -75,7 +79,6 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/predicate.h"
 #include "utils/rel.h"
 
 #include "lion.h"
@@ -479,12 +482,12 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 
 	/*
 	 * The leaf's range goes to its right sibling, and so do the predicate
-	 * locks SERIALIZABLE readers took on it, a key there or a gap for one:
-	 * a later insert in the range checks the sibling.  nbtree does this in
-	 * _bt_mark_page_halfdead(), before its critical section, as here.
+	 * locks SERIALIZABLE readers took on it, a key there or a gap for one
+	 * (DESIGN.md §9): a later insert in the range checks the sibling.  nbtree
+	 * does this in _bt_mark_page_halfdead(), before its critical section, as
+	 * here.
 	 */
-	PredicateLockPageCombine(index, leafblk,
-							 LionPageGetOpaque(leaf)->rightlink);
+	lion_predlock_move(index, leafblk, LionPageGetOpaque(leaf)->rightlink);
 
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
@@ -530,9 +533,6 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 	Page		rpage;
 	LionEntryTuple *minf;
 	Size		minfsz;
-	LionEntryTuple *rfirst = NULL;
-	Size		rfirstsz = 0;
-	OffsetNumber rfirstoff = InvalidOffsetNumber;
 	LionPageOpaqueData deleted;
 	FullTransactionId safexid;
 	LionWalState *xstate;
@@ -671,21 +671,6 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		goto out;
 	}
 
-	/*
-	 * The leftmost page of an internal level starts with a MINUS INFINITY
-	 * downlink (DESIGN.md §21).  When the target is that page, its right
-	 * sibling becomes it, and its first downlink becomes one.
-	 */
-	if (!BufferIsValid(lbuf) && level > 0)
-	{
-		rfirstoff = lion_page_first_data(rpage);
-		if (rfirstoff > PageGetMaxOffsetNumber(rpage))
-			goto out;
-		rfirst = lion_make_pivot(NULL, LION_ENTRY_DOWNLINK,
-								 lion_entry_head(lion_page_entry(rpage, rfirstoff)),
-								 &rfirstsz);
-	}
-
 	minf = lion_make_pivot(NULL, LION_ENTRY_HIGHKEY, InvalidBlockNumber,
 						   &minfsz);
 
@@ -718,13 +703,6 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 	lion_dirdel_rewrite(xstate, p, &deleted, minf, minfsz);
 	p = lion_wal_register_buffer(xstate, rbuf, LION_WALBUF_STD);
 	LionPageGetOpaque(p)->leftlink = leftsib;
-	if (rfirst != NULL)
-	{
-		lion_wal_save_item(xstate, p, rfirstoff);
-		if (!PageIndexTupleOverwrite(p, rfirstoff, (Item) rfirst, rfirstsz))
-			elog(PANIC, "lion index: could not rewrite a downlink in place");
-		lion_wal_op_replace(xstate, p, rfirstoff, rfirst, rfirstsz);
-	}
 	lion_wal_log_special(xstate, p);
 	if (target != leafblk)
 	{
@@ -735,8 +713,6 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 	lion_wal_finish(xstate, LION_XLOG_UNLINK);
 
 	pfree(minf);
-	if (rfirst != NULL)
-		pfree(rfirst);
 	ok = true;
 	*done = (target == leafblk);
 

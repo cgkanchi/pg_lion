@@ -26,7 +26,8 @@ entry deletion and page recycling in §18)
 - Multi-column indexes, INCLUDE columns, ordered scans, `amgettuple` (arrived in §29), parallel build
   (arrived in §24, "Build") and scan,
   fine-grained write concurrency (inserts serialize on the directory leaf that holds the key, §21),
-  key sizes above LION_MAX_KEY_SIZE (§4; tsvector and jsonb keys past it are hashed, §17 and §42.1).
+  key sizes above LION_MAX_KEY_SIZE (§4; longer varlena keys are stored compressed, §4 "Long keys",
+  and tsvector, text array and jsonb keys past it are hashed, §17 and §42.1).
 
 ## 2. TID encoding
 
@@ -386,14 +387,53 @@ layout, which has a short header for INLINE entries and a longer one for CHAIN e
 
 Key data is stored with datumCopy semantics, except that a by-value type is stored at its own width
 (`typlen` bytes); fixed-length by-reference types as typlen bytes; varlena as a detoasted,
-4-byte-header varlena; cstring as strlen+1 bytes. Keys larger than LION_MAX_KEY_SIZE = 2047 bytes,
-the 4-byte header included, are an ERROR, except where an opclass files a longer one under a hash:
-tsvector_ops a lexeme of more than 2043 bytes (§17, "Long lexemes"), jsonb_contains_ops any key
-past the limit (§42.1). *(The limit was 2000 bytes until format version 11, which a tsvector lexeme
+4-byte-header varlena, or a compressed one when that is too long (below); cstring as strlen+1
+bytes. Keys larger than LION_MAX_KEY_SIZE = 2047 bytes, the 4-byte header included, are an ERROR,
+except where an opclass files a longer one under a hash: tsvector_ops a lexeme of more than 2043
+bytes (§17, "Long lexemes"), array_ops a text, varchar or bytea element of more than 2043 bytes
+(§17, "Long elements"), jsonb_contains_ops any key past the limit (§42.1). *(The limit was 2000 bytes until format version 11, which a tsvector lexeme
 of up to 2047 bytes passes; a version 10 index is refused, since its jsonb keys of 2001 to 2047
 bytes are hashes that this build would look for whole.)* Entry lookup compares the key's hash, computed from the key and never stored, then
 calls the opclass equality operator's function (strategy 1 of the opfamily, looked up once per
 relation and cached in `rd_amcache`) with the index collation.
+
+### Long keys
+
+btree stores a long value compressed (`index_form_tuple()` compresses a varlena past
+`TOAST_INDEX_TARGET`) and checks its ~2704-byte limit against the compressed size, so it takes a
+value of any length that compresses well enough: `repeat('abc', 20000)` in 699 bytes, a `char(2500)`
+of `'code1'` and its blanks in a few dozen, a 5000-digit numeric in 49. A lion key that a plain
+4-byte header would put past `LION_MAX_KEY_SIZE` is stored the same way, COMPRESSED
+(`lion_key_form()`, lion_state.c): an inline compressed varlena, which every function of the type
+detoasts as it detoasts a heap value, so the key compares, hashes, prints and is emitted (GROUP BY,
+min/max, LionOrdered) as the value it is. Nothing else in the index looks at a key's bytes as the
+value: an entry is found by the opclass's comparison and equality, and the bytewise tail of the
+order (§21) and the owner stamps (§18) only need the stored bytes to be the entry's own.
+
+- A key that fits plain is stored plain, as before, so an index of short keys is unchanged.
+- One that arrives compressed (inline in the heap) and fits as it is is stored as it came, pglz or
+  lz4; any other is compressed with pglz, asked only to fit - not to save the quarter TOAST asks of
+  a heap value - and to give up as soon as its output passes the limit, so an incompressible value
+  of a megabyte costs a couple of kilobytes of work. Two equal values may therefore be stored in
+  different bytes, which the directory already allows (citext's 'Alice' and 'alice' are one entry).
+- A stored compressed key is checked like any other (§21, "Readers"): an inline compressed header
+  whose length is the key's, a method this build knows, and a raw length past the limit, since no
+  shorter key is ever compressed.
+- A value still over the limit compressed is the ERROR btree raises, worded alike, naming the index
+  and, from an insert or a build, the heap row (`lion_key_prepare()`, which the insert and the build
+  call on every key before they write anything): `index key size N exceeds lion maximum 2047 for
+  index "..."`, `Index row references tuple (b,o) in relation "..."`. btree's limit is about 650
+  bytes larger; an incompressible value between the two is the one value btree takes that lion
+  does not (below).
+- **Not done: incompressible ordered keys past the limit.** The pivot of an internal page is a key,
+  and three of them and a high key must fit a page (§21, "Split"), which is what sets the limit. A
+  hashed key - a prefix and a hash, rechecked - keeps neither the type's order nor its value, so
+  for an ordered scalar column it would have to live in an order of its own (a kind after VALUE),
+  every range and the ordered walks (LionOrdered, GROUP BY, count(DISTINCT), min/max, the
+  aggregates over keys, the semi and FK joins, the summaries) would have to merge it in from the
+  heap or decline at run time once the index held one, and the planner would have to cost that. A
+  multi-key column needs none of it: its keys are only ever looked up, which is why text array
+  elements are hashed (§17, "Long elements") and scalar keys are not.
 
 INLINE entries hold their containers in the entry tuple while the payload is ≤ `inline_limit`
 bytes (reloption, default 4096 = LION_MAX_INLINE_LIMIT). When an insert would exceed that, the entry
@@ -886,7 +926,7 @@ the last key had been hashed; the sorted build keeps one open page per level.
     amcanhash = false                amconsistentequality = true   amconsistentordering = false
     amcanbackward = false            amcanunique = false       amcanmulticol = false
     amoptionalkey = false            amsearcharray = true      amsearchnulls = true
-    amstorage = true (§17)           amclusterable = false     ampredlocks = false
+    amstorage = true (§17)           amclusterable = false     ampredlocks = true (§9)
     amcanparallel = false            amcanbuildparallel = true (17+, §24)   amcaninclude = false
     amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
     amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
@@ -1048,7 +1088,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
         -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
-    (phase 2) lion_index_count(regclass, key anyelement) RETURNS bigint
+    (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
 
@@ -1279,8 +1319,8 @@ call that looks like an index read. The values are evaluated once, before anythi
 index, with a flag that admits a multi-key column for this caller only (its EXECUTE check is then
 on the element type's equality, the function `GROUP BY e` would call), and every index the filter
 uses goes through `lion_reader_vet()`: row-level security, an unpopulated materialized view, an
-index the snapshot may not use, the PostgreSQL 16 `old_snapshot_threshold` guard and the
-SERIALIZABLE predicate lock. The filter's columns need SELECT and its operators' functions EXECUTE
+index the snapshot may not use and the PostgreSQL 16 `old_snapshot_threshold` guard; its lookups
+take the predicate locks of §9, "SERIALIZABLE". The filter's columns need SELECT and its operators' functions EXECUTE
 (`lion_check_functions_walker()`), as the query's would. `reader_contracts.sql`,
 `reader_checkxmin.spec` and `reader_serializable.spec` list both forms, filtered and not.
 
@@ -1310,6 +1350,19 @@ members share their indexed values. Only for a plain column of a non-partial ind
 would have to be evaluated, and a partial index's rows are not all of the filter's. 5 is the ratio
 of a key counted in a batch (some 5 µs) to a row fetched and taken apart (some 1 µs), measured on
 the table below.
+
+**Hashed keys.** A key of 2043 bytes of a tsvector column, or of a text, varchar or bytea array
+column, may be the hashed key of longer lexemes or elements and a lexeme or element spelled like it
+(§17, "Long lexemes", "Long elements"), and its rows are all of theirs; `ts_stat()` and `GROUP BY e`
+show each with its own rows. So when such a key is counted (`lion_facets_keep_key()`), its rows that
+the filter keeps - its set ANDed with the filter's copy, or with the filter's own sets on a standby
+- are fetched under the snapshot as the selective filter's are, and each is counted under every
+lexeme or element of its own value that is filed under the key (`lion_ambiguous_values()`, which
+runs GIN's extraction without the hashing), the value being the index column's, an expression's
+too (`FormIndexDatum()`). The same rows the key's count counts, so each count is exact and none is
+larger than the key's bound: the top k's stop rule holds as it is. The selective filter's own read
+does the same for a row's hashed keys. Keys of `jsonb_contains_ops` past the limit keep no value to
+show and still print as `sha256:<hex>`.
 
 DEBUG1 reports each call: entries read, keys counted, whether the column was walked whole, rows
 read from the heap.
@@ -1485,10 +1538,9 @@ test/sql/security.sql and test/isolation/count_serializable.spec):
 - **Table access method.** Everything here reads the heap's visibility map; the SQL functions
   refuse, and the CustomScan declines, a table whose table AM is not the heap, which ambuild has
   already refused to index (§2).
-- **SERIALIZABLE.** index_beginscan() takes a relation-level predicate lock on any index whose AM
-  has no ampredlocks; the count reads indexes without a scan, so it takes PredicateLockRelation on
-  every index it opens, before any lookup, so that absent keys are covered. Without it two
-  serializable transactions could each count an absent key, insert it, and both commit.
+- **SERIALIZABLE.** The count's lookups and walks predicate-lock the index pages that stand for the
+  keys they read, absent ones included ("SERIALIZABLE" below), and the blocks it counts from the
+  visibility map are page-locked in the heap, as an index-only scan locks them.
 - **Hot standby.** The pin interlock relies on ambulkdelete taking cleanup locks, and what replay
   takes depends on which resource manager wrote the record (§25).
   *Generic WAL*: replay takes only exclusive locks, so on a standby a reader's pin does not stop
@@ -1638,27 +1690,44 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
      partition. `lion_index_count_group_stats(idx, use_cache)` is the SQL image of that driver,
      for tests: same entry scan, one count per group, one cache.
 
-SQL surface for tests: `lion_index_count(idx regclass, key anyelement) RETURNS bigint` and
-`lion_index_count(idx1 regclass, key1 anyelement, idx2 regclass, key2 anycompatible) RETURNS bigint`,
-whose keys are of two unrelated polymorphic types because each is compared with its own index's
-column and the two columns need not share a type. Both open the heap via IndexGetRelation with
-AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
+SQL surface for tests: `lion_index_count(idx regclass, key "any") RETURNS bigint` and
+`lion_index_count(idx1 regclass, key1 "any", idx2 regclass, key2 "any") RETURNS bigint`, whose
+keys are each compared with its own index's column, and the two columns need not share a type. The
+keys are `"any"`, not polymorphic, so that an untyped literal arrives as one (`unknown`, which a
+polymorphic argument refuses), as it would in `col = 'abc'`. Both open the heap via IndexGetRelation
+with AccessShareLock, use GetActiveSnapshot(), and must return exactly `count(*)` of the equivalent
 SELECT.
-**The key's type is resolved as `col = key` would resolve it** (`lion_count_key_type()`, 2026-09-25
-review; before it the key had to BE the index's opcintype or have a cross-type member, so enum_ops, a
-DEFAULT class, could not be counted at all and neither could a varchar key on the varchar column it
-indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
+**The key is taken as `col = key` would take it.** A key whose own type the column's opclass takes
+is looked up as that type (`lion_count_key_type()`, below). Any other key is first CONVERTED as the
+query converts it (`lion_count_coerce_key()`): the parser's own `make_op()` (`make_scalar_array_op()`
+for `lion_index_count_any()`'s `col = ANY (keys)`) resolves the operator named as the index's
+equality is named - `=`, or a class's own `====` - for (the column's type, the key's type) and
+coerces the key to its input, an untyped literal through the column's input function, `1` to numeric
+on a numeric column, a numeric `0.1` to float8 on a float4 one; the coercion is evaluated once, its
+cast functions checked for EXECUTE as the executor checks the query's. The count is made only where
+the operator the parser picked is the index's equality - strategy 1 of the key column's family with
+the column's type on its left - and the column reaches it unconverted, relabelled at most. Then the
+count is the query's: `f4 = 0.1` is `float4 = float8`, which no float4 value satisfies, and the
+count is 0 as the query is, where rounding the key to float4 would have counted the rows of 0.1::float4.
+Otherwise the query compares something the index does not hold - `intcol = 1.5` is `numeric =
+numeric` on `intcol::numeric`, `bpcharcol = 'x'::text` is `text = text` on the column cast by
+rtrim1() - and the count is an ERROR whose hint says to cast the key to the column's type, never a
+number made another way (1.5 cast to integer would count the rows of 2). A key no operator takes is
+refused as the query would refuse it.
+*The key's own type* is resolved by `lion_count_key_type()` (2026-09-25 review; before it the key had
+to BE the index's opcintype or have a cross-type member, so enum_ops, a DEFAULT class, could not be
+counted at all and neither could a varchar key on the varchar column it indexes). A domain is its base type. For a class on a POLYMORPHIC type (enum_ops) the key must be of
 the column's actual type and nothing else: a different enum would pass for "an enum", and its OIDs
 mean nothing to this column (the DETAIL names the column's type, not anyenum). Otherwise the key is
 of the class's own type, or of a type the family has a strategy-1 member for with it (int8 on int4:
 `int48eq`, which §21's probe resolves further), or - lacking one - BINARY-coercible to the class's
 type where the parser makes that coercion itself: its `=` for (column type, key type) must be the
 class's own (opcintype, opcintype) operator reached without a cast function (`compatible_oper()`),
-as for varchar on text_ops, which the parser relabels to call `texteq`. A cast function is never
-taken (§21), and a coercion merely existing is not enough: text is binary-coercible to bpchar, but
-`bpcharcol = 'x '::text` is `text = text` on the column cast by rtrim1(), and matches none of the
-rows bpchar's own equality would count. The resolved type is what the lookup is made as and what
-the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
+as for varchar on text_ops, which the parser relabels to call `texteq`. A coercion merely existing
+is not enough: text is binary-coercible to bpchar, but `bpcharcol = 'x '::text` is `text = text` on
+the column cast by rtrim1(), and matches none of the rows bpchar's own equality would count. A key
+of any other type goes through the conversion above. The resolved type is what the lookup is made as
+and what the EXECUTE check names the equality by (enum_eq, texteq; test/sql/security_exec.sql).
 `lion_index_count_any()` resolves its array's element type the same way.
 **So is its collation** (`lion_count_check_collation()`, 2026-09-28 review; the functions used to
 look every key up under the index's collation whatever the call said). The index hashed and
@@ -1693,15 +1762,11 @@ nothing changed. A key taken from a column brings that column's collation and is
 `test/sql/countcoll.sql` covers both halves; the nondeterministic one needs ICU and a UTF8 database
 and is skipped without them (`countcoll_1.out`), as it is on CI's source builds;
 `test/sql/countcoll_default.sql` the default collation's key, likewise.
-**A NULL argument answers NULL**, where `count(*) WHERE col = NULL` answers 0: the functions are
-STRICT, deliberately (2026-09-25 review, kept). PostgreSQL never calls a STRICT function with a NULL
-argument - a NULL constant folds the call away when the query is planned - so no count is made,
-nothing is locked or checked, and NULL says exactly that. Answering 0 instead would mean deciding
-what a keyless count checks, and the query it would stand for does not settle it: the planner folds
-`col = NULL` to a constant-false filter, so that query reads no index, calls no equality and never
-asks whether a materialized view is populated.
-A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY (...)`, and counts
-0; a NULL array is a NULL argument.
+**A NULL key counts 0**, as `count(*) WHERE col = NULL` does: the functions are not STRICT. The
+key's type is resolved and every check a key gets is made - the index, the type, the collation, the
+privileges - and then no lookup: `col = NULL` selects no row. A NULL index names no index and
+answers NULL. A NULL ELEMENT of `lion_index_count_any()`'s array selects nothing, as in `= ANY
+(...)`, and counts 0, and so does a NULL array.
 They, `lion_index_count_any()` and `lion_index_count_group_stats()` refuse a MULTI-KEY column (§17):
 its entries are extracted keys, not column values, so a whole tsvector as the search key matched no
 entry's meaning and used to be hashed and compared as if it did. All of them refuse a materialized
@@ -1732,9 +1797,9 @@ that is missing the row it still sees).
 
 An index scan the executor starts through `index_beginscan()` gets four guarantees from PostgreSQL:
 the planner offers only an index the snapshot may use, row-level security is applied above it,
-`index_beginscan()` takes a relation-level predicate lock for an AM without `ampredlocks`, and the
-executor refuses an unpopulated materialized view. lion reads its indexes without a scan in two
-kinds of places, and `lion_reader.c` is where each gets what is missing:
+and the executor refuses an unpopulated materialized view (the fourth, the predicate locks, every
+reader takes the same way: "SERIALIZABLE" below). lion reads its indexes without a scan in two kinds
+of places, and `lion_reader.c` is where each gets what is missing:
 
 - **Functions handed an index by name** (the count functions, `lion_bm25()`) call
   `lion_reader_vet()`, or `lion_reader_open()`, which opens the index and table and then vets
@@ -1742,8 +1807,7 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   to the caller (the policies cannot be evaluated without reading the rows; the same query through
   the planner applies them, since lion's custom paths decline relations with security quals),
   and an index `lion_index_usable()` rejects for the snapshot. It also applies the PostgreSQL 16
-  `old_snapshot_threshold` guard, and takes the predicate lock before the first read so a
-  SERIALIZABLE read that finds nothing still conflicts with a later insert. `lion_reader_open()`
+  `old_snapshot_threshold` guard. `lion_reader_open()`
   takes a policy: `LION_READ_ROWS` for anything that returns or counts rows, which vets, and
   `LION_READ_STATS` for `lion_bm25_score()`, which reads only N, df and avgdl, and checks
   privileges and row-level security only. The statistics count every row, hidden ones included, so
@@ -1751,8 +1815,7 @@ kinds of places, and `lion_reader.c` is where each gets what is missing:
   policies - would tell whether hidden rows hold a lexeme, and how many. It also refuses a
   partial index: both its callers rank over the whole table, and a partial index's walk would
   miss the rows its predicate leaves out while its N, df and avgdl described only the rest.
-- **Custom scan nodes**, whose index the planner vetted, call `lion_reader_lock()` for the
-  predicate lock on each lion index they read.
+- **Custom scan nodes**, whose index the planner vetted, need none of it.
 
 Privileges beyond SELECT on the table (per-column grants, EXECUTE on the functions a count stands
 for) depend on what the call stands for and stay with the caller (`lion_count_open_indexes()`).
@@ -1771,6 +1834,54 @@ function revoked from PUBLIC (a role without it, plain EXPLAIN, a generic plan m
 it, SECURITY DEFINER functions) against the ordinary plan, and
 `test/modules/lion_hooktest/sql/exec_hook.sql` runs the same list under an object access hook that
 refuses the function (`make hookcheck`). A new node adds a line to both.
+
+### SERIALIZABLE
+
+The handler sets `ampredlocks`, and the locks are page locks, as GIN's are: what a read depends on
+is where it found each key it looked for, or where the key would have been, and the reader locks
+the page that stands for that (`lion_reader.c`, which every reader goes through, the AM's own scans
+included):
+
+- an INLINE entry, or no entry at all: the directory leaf that holds it, or would;
+- a CHAIN entry: its posting tree's root, which stays at its block for the life of the set (a root
+  split pushes down, §22), so a lock on it stands for the key alone;
+- a walk (a range, a `GROUP BY`, `IS NOT NULL`, an ordered walk, the fk join's
+  groups): every leaf it reads, which covers every key an insert could put between the ones it saw,
+  and the root of every CHAIN entry of its column on them.
+
+Each lock is taken while the leaf the entry or the gap was read from is share-locked, before the
+reader believes anything the entry's header says (a set with no rows is skipped, a top-k is cut by
+the counts). An insert checks the one page that stands for its key - the leaf for a new or an
+INLINE entry, the root for a CHAIN one; a summary insert (§32) its bucket's, and the leaf too when
+it rekeys or adds a bucket - with `CheckForSerializableConflictIn()`, while it holds that leaf
+exclusive and before it changes anything (`lion_writer_check()`). It keeps the leaf until its TID
+is in the set. So either the insert comes first and the reader meets its TID, whose heap visit
+tells SSI of the conflict (a block counted from the visibility map is never one an uncommitted
+insert has touched), or the reader's lock is there when the insert looks.
+
+The locks follow the keys. A directory leaf split copies the leaf's locks to its new right sibling
+(`lion_dir_split()`, `PredicateLockPageSplit()`); the spill of an INLINE set copies its leaf's
+locks to the new root (`lion_entry_spill_pos()`), as GIN's `createPostingTree()` does; and VACUUM,
+deleting an empty CHAIN entry, moves its root's locks to the leaf (`lion_vacuum_delete_entries()`,
+`PredicateLockPageCombine()`), where an insert of the key will now look. Directory leaves are never
+deleted (§21), and posting-tree pages other than the root carry no locks. A deletion of directory
+leaves would have to move their locks to the right sibling, as nbtree does.
+
+Two cases lock the whole index: a lookup of an absent key that followed a run of colliding hashes
+onto the next leaf (an insert of the key starts from a leaf to the left of where the lookup ended),
+and the cross-type fallback of `lion_dir_find()`, which reads every leaf. The aggregates over keys
+(§37) lock the heap instead, as the sequential scan they stand for does; that also covers every
+insert, and is one lock where the index's would be every leaf and root. BM25's N and df are read
+under the same locks as the entries they come from (the empty key's entry, the lexemes'), so a
+ranking conflicts with every insert of a document, as its scores depend on N and avgdl. A
+`lionvec` index (§44) has no `ampredlocks` and core locks it whole.
+
+Locks the planner's estimates or `lion_verify()` take in a SERIALIZABLE transaction can only add
+false conflicts. `test/isolation/serializable_keys.spec` is the write skew through every reader,
+which must fail, against inserts of keys the reads did not touch, which must commit, for CHAIN keys
+that share one leaf and INLINE keys on leaves of their own; `serializable_moves.spec` moves the key
+between the read and the insert by each of the three transfers above; `reader_serializable.spec`
+has every reader's absent key.
 
 ## 10. Phase 2b: CustomScan for `count(*) [GROUP BY k] FROM t WHERE k1 = c1 AND ...` (`lion_plan_*.c`, `lion_exec_*.c`)
 
@@ -4823,7 +4934,7 @@ segments, VACUUM, the visibility-map interlock - is unchanged.
     proc 3   GIN extractQuery(query, &nkeys, strategy, &pmatch, &extra_data, &nullFlags,
                               &searchMode) -> Datum *keys
 
-    strategies   1 =      2 @>      3 &&      4 <@      5 @@
+    strategies   1 =      2 @>      3 &&      4 <@      5 @@      17 array =      18 @@@
 
 The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
 
@@ -4831,12 +4942,14 @@ The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
         OPERATOR 2 @> (anyarray, anyarray),
         OPERATOR 3 && (anyarray, anyarray),
         OPERATOR 4 <@ (anyarray, anyarray),
+        OPERATOR 17 = (anyarray, anyarray),
         FUNCTION 2 ginarrayextract(anyarray, internal, internal),
         FUNCTION 3 ginqueryarrayextract(anyarray, internal, int2, internal, internal, internal, internal),
         STORAGE  anyelement;
 
     CREATE OPERATOR CLASS tsvector_ops DEFAULT FOR TYPE tsvector USING lion AS
         OPERATOR 5 @@ (tsvector, tsquery),
+        OPERATOR 18 @@@ (tsvector, tsquery),
         FUNCTION 1 hashtext(text),
         FUNCTION 2 lion_tsvector_extract_value(tsvector, internal, internal),
         FUNCTION 3 lion_tsvector_extract_query(tsvector, internal, int2, internal, internal, internal, internal),
@@ -4861,15 +4974,27 @@ Two consequences of borrowing GIN's functions, both binding on any future multi-
   extraction answers for the wrong operator and returns INCLUDE_EMPTY, which only costs a rechecking
   full scan - so it is one function with one switch.
 
+Array `=` (strategy 17) and `@@@` (18) are there because GIN's classes have them, so a query that
+uses them can use the index.  `a = q` holds only where a has every element of q, so it is the AND of
+those elements' posting sets, as for `@>`, and the bitmap heap scan's recheck decides the rest - how
+often each element occurs, their order, the dimensions and lower bounds; a NULL element of q is left
+out of the AND, and an empty q is every row (ginqueryarrayextract()'s INCLUDE_EMPTY).  It is never
+exact, so `lion_extract_query()` gives it no tree and only the superset answers it.  `@@@` is `@@`
+under its deprecated name: `LION_STRAT_CANONICAL()` turns 18 into 5 at rescan and wherever a
+strategy reaches the extraction.  Neither is in `LION_STRAT_IS_MULTI()`, so the count pushdown,
+facets and the planner's probe decline them and the AM's bitmap and index scans answer them, as GIN's
+do.
+
 `lionvalidate` has two shapes.  A scalar opclass is checked exactly as before (proc 1 with signature
 (T) -> int4, strategy 1 only, every operator's types hashable by the family).  An opclass is
 multi-key iff the family has proc 2 for (opcintype, opcintype); then procs 2 and 3 must have GIN's
-signatures, every operator's strategy must be in {2,3,4,5}, and proc 1 is required unless
+signatures, every operator's strategy must be a multi-key one (2 to 5, jsonb's 11 to 16, 17 or 18),
+and proc 1 is required unless
 `opckeytype` is polymorphic.  The "every type an operator mentions must be hashable" rule does not
 apply to a multi-key family, whose operators mention anyarray and tsquery and whose hashing is of
 keys.  `amconsistentequality` stays true: a scalar roaring family holds nothing but equality
-operators and a multi-key one holds no equality operator at all, so `equality_ops_are_compatible()`
-is never asked about two members of the same roaring family that disagree.
+operators and a multi-key one at most one, array_ops' `=`, so `equality_ops_are_compatible()` is
+never asked about two members of the same roaring family that disagree.
 
 ### Key type resolution (`lion_fill_state`, lion_state.c)
 
@@ -4887,7 +5012,17 @@ descriptor is the same answer for every class, needs no polymorphism handling of
   because lexemes are byte strings and GIN's own `gin_cmp_tslexeme()` compares them bytewise.
 - Hash: support proc 1 when the opclass has one, else the key type's default hash opclass through
   `lookup_type_cache(TYPECACHE_HASH_PROC_FINFO)` - which is how GIN's `initGinState()` resolves its
-  comparison function for a polymorphic key type.  ERROR when the type has no hash opclass.
+  comparison function for a polymorphic key type.  A key type with a default btree opclass and no
+  hash one - money, bit, varbit, tsvector, tsquery, all of which GIN's array_ops takes - is hashed
+  by `lion_image_hash()` (`LionState.imagehash`): the hash of the stored image (`hash_bytes()` over
+  what `datum_image_eq()` compares) where the btree class's equalimage proc says equal values are
+  stored alike (money, bit, varbit), and 0 for every key where it does not (tsvector, tsquery). A
+  hash only has to agree with equality: no entry stores one, and such a column is ORDERED by the
+  btree comparison (rule 2 of §21 holds: its equality is the btree class's), which the hash only
+  breaks ties of, so a constant costs nothing there; the dedup of a row's keys and the facet table
+  fall back on the comparison and the equality the same way.  A column that should come out
+  unordered all the same is an ERROR, and so is a key type with neither class, as GIN needs a btree
+  one.
 - Equality: strategy 1 of the opfamily for a scalar opclass; for a multi-key one the key type's
   default equality (`TYPECACHE_EQ_OPR_FINFO`), because the family's strategies are about the indexed
   value and not about two keys.  The two always agree: a type's default hash opclass hashes what its
@@ -5343,7 +5478,12 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   CHAIN entry points at its position tree (`pos_root`).  Reserved entries never store positions.
 - **Insert** writes a row's positions before its TID (W1): in the INLINE entry's one record, or
   into the position tree before the posting set.  An INLINE entry that outgrows itself spills
-  both, the new position head written in the spill's last record with the entry.
+  both, the new position head written in the spill's last record with the entry.  "Outgrows" is
+  judged on the payload at its own length plus the chunk, against `lion_inline_max()` - which
+  next to a long key is LION_MAX_ENTRY_SIZE less the key, not `inline_limit` - and the entry is
+  then written with whatever growth slack (§4) still fits beside the chunk, none if none does:
+  the area the last rewrite gave the payload is kept only while it does, since an entry built at
+  that area beside a grown chunk can be over LION_MAX_ENTRY_SIZE although the payload itself fits.
 - **VACUUM** takes a TID's positions out after the TID (V1), and asks the callback about every
   member (V2).  INLINE: the chunk is filtered in the same rewrite as the payload.  CHAIN: after
   the posting set's leaves, every leaf of the position tree is filtered under an EXCLUSIVE lock
@@ -5483,10 +5623,10 @@ direct count functions do, a table with row-level security enabled (it cannot ap
 and so does `lion_bm25_score()`: N, df and avgdl count the hidden rows, so under a policy any
 score, even one of a made-up document, would tell whether hidden rows hold a lexeme and how many.
 The index `lion_index_usable()` rejects for the snapshot (an `indcheckxmin` index built
-over a broken HOT chain holds the newest version only, which no heap recheck can repair). Before
-reading it takes the relation-level predicate lock on the index that `index_beginscan()` takes for
-an AM without `ampredlocks`, as the LionBm25 scan does too, so a SERIALIZABLE search that finds
-nothing still conflicts with a later insert of what it looked for.
+over a broken HOT chain holds the newest version only, which no heap recheck can repair). Its
+lookups - the empty key's, each lexeme's, found or not - take the predicate locks of §9,
+"SERIALIZABLE", as the LionBm25 scan's do, so a SERIALIZABLE search that finds nothing still
+conflicts with a later insert of what it looked for.
 
 **MaxScore** (Turtle and Flood) prunes the merge. A lexeme adds less than `idf * (k1 + 1)` to any
 row, since `tf / (tf + norm) < 1`; with the lexemes in ascending order of that maximum, the first
@@ -5514,15 +5654,14 @@ float from either, bit for bit, as an incremental sort over the scan's order nee
 `LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
 whose query's first pathkey is `lion_bm25_score(col, Const, Const, Const, Const) DESC`, the index a
 lion index on that table storing positions for `col`. The order is claimed only when the walk's
-candidates hold every row the scan may return, so a restriction `col @@ q2` must be there with:
-
-- q2's lexemes not under a NOT all among the scored query's, and no prefix in q2;
-- an empty document not matching q2.
-
-A tsquery is monotone in its operands once its NOTs are pushed down to them, so a row with none of
-q2's positive lexemes evaluates no higher than the empty document, and fails q2. Every row that
-passes therefore has a scored lexeme and is a candidate. The usual query has the same q in both
-places.
+candidates hold every row the scan may return, so a restriction `col @@ q2` must be there that no
+document without the scored lexemes matches. `lion_bm25_where_covered()` evaluates q2 with
+`TS_execute()` in ternary logic: each scored lexeme is absent, and every other operand - another
+lexeme, a prefix - is unknown. q2 is covered when the answer is no whatever the unknowns are, NOTs
+and phrases included. Every row that passes it therefore has a scored lexeme and is a candidate.
+The usual query has the same q in both places, or a narrower q2: `'w1 & w2'`, `'w1 & !w9'` or
+`'w9 <-> w1'` under a score of `'w1'`. Not `'w1 | w2'`, `'w9 & !w1'` or a bare prefix, which a row
+without `w1` can match.
 
 The scan asks the walk for the best `L` rows: the planner's `limit_tuples` plus 16, or 64 when the
 LIMIT is not known. It fetches them best first under the scan's snapshot, following HOT chains, and
@@ -5581,7 +5720,7 @@ extractValue and extractQuery wrappers and in the ranking:
 - A lexeme of up to `LION_LEXEME_KEY_MAX` = 2043 bytes is its own key.
 - A longer one is filed under a key of exactly 2043 bytes: its first bytes, as many whole characters
   as fit in `LION_LEXEME_KEY_KEEP` = 1978, then `#` up to byte 1979, then the 64 hex digits of the
-  SHA-256 of the whole lexeme. Facets show it as that text.
+  SHA-256 of the whole lexeme. Facets show the lexeme itself (§7, "Facet counts").
 - **Exactness.** A 2043-byte key is ambiguous: it is a 2043-byte lexeme or the key of a longer one,
   and a 2043-byte lexeme can be spelled like another's key. So the extractQuery wrapper turns a
   query that names one into `LION_SEARCH_MODE_LOSSY`: every candidate is rechecked in the heap (the
@@ -5600,8 +5739,8 @@ extractValue and extractQuery wrappers and in the ranking:
   agree with the index. A lexeme that shares its key with no other scores as itself. Two lexemes of
   one row with one key count as one term with the positions of the first in the tsvector's order,
   which is the one the extraction keeps; the row's length counts both.
-- **Other keys** are not hashed: an array element, a scalar key or any other opclass's key past
-  `LION_MAX_KEY_SIZE` is still an ERROR.
+- **Other keys**: array_ops hashes long text, varchar and bytea elements the same way ("Long
+  elements" below); a scalar key past `LION_MAX_KEY_SIZE` is stored compressed (§4, "Long keys").
 
 `test/sql/tsvector_long.sql`: lexemes of 1990 to 2047 bytes (the 2047-byte ones through binary
 COPY), long ones that share their first 2030 bytes, multibyte ones, and a 2043-byte lexeme spelled
@@ -5609,6 +5748,31 @@ like another's key; AND, OR, NOT, phrases, weights and prefixes at and past the 
 keeps; bitmap, index, count and literal paths with and without positions against a sequential
 scan and GIN; BM25 against SQL and the LionBm25 scan against sorting; writes, VACUUM, REINDEX and
 verify; a scalar and an array key past the limit.
+
+### Long elements (2026-10-19)
+
+GIN takes an array element of any length whose compressed index tuple fits in ~2712 bytes. array_ops
+names `lion_array_extract_value()` and `lion_array_extract_query()`, which call `ginarrayextract()`
+and `ginqueryarrayextract()` and treat an element as tsvector_ops treats a lexeme: one of more than
+2043 bytes is filed under `lion_long_key()` of it - its first bytes, `#`, its SHA-256 in hex, 2043
+bytes in all - and a query that names an element of 2043 bytes or more is
+`LION_SEARCH_MODE_LOSSY`, every candidate rechecked, with the same planner behaviour as a long
+lexeme. So a long element is never an error, where GIN's limit applies to the compressed one.
+
+Only for an element type whose equality is equality of its bytes, so that a hash of the bytes is
+the same for two equal elements: text and varchar under a deterministic collation (the column's,
+as the extraction is called with it), and bytea, whose first bytes are cut anywhere rather than at
+a character. A hashed key is the type's own value - the directory calls the type's comparison and
+hash on it - and is equal only to a value spelled the same, which is 2043 bytes long and so
+rechecked as well. An element of any other type (numeric, citext, jsonb, ...) is a key as it is or,
+past the limit, compressed (§4, "Long keys"), and an ERROR when that does not fit, as GIN's is. The
+decision depends on the element's raw length alone, never on how well it compresses, so an insert
+and a query always agree on whether an element is hashed.
+
+`lion_index_facets()` shows a hashed key's elements, each with its own rows (§7, "Facet counts").
+`test/sql/long_keys.sql`: text, varchar and bytea elements of 2042 to 100000 bytes, multibyte and
+incompressible ones and one spelled like another's key, under `@>`, `&&` and `<@`, bitmap and count
+paths against a sequential scan and GIN, before and after writes, and the facets.
 
 ### Cardinality guard
 
@@ -6260,8 +6424,8 @@ and a `leftlink` (24 → 32 bytes after MAXALIGN, which is why every item on eve
 version has to be bumped). Leaf pages hold LionEntryTuple items in key order, exactly as bucket
 pages did; internal pages hold downlink pivots, LionEntryTuple-shaped with LION_ENTRY_DOWNLINK and
 the child block in the header's last word, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
-is its high key (LION_ENTRY_HIGHKEY, key only), and the leftmost page of every level begins with a
-LION_ENTRY_MINUSINF downlink that compares below everything. Reserved NULL and EMPTY entries sort
+is its high key (LION_ENTRY_HIGHKEY, key only), and every internal page begins with a
+LION_ENTRY_MINUSINF downlink, with no key, that compares below everything ("Height" below). Reserved NULL and EMPTY entries sort
 first (NULL < EMPTY < value) via a kind prefix in the comparison, not in the stored key, so they
 live on the leftmost leaf and are reached by the ordinary descent. Multi-key classes: the key type
 is the STORAGE type (§17), which is what is compared.
@@ -6344,9 +6508,12 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 11 (`LION_VERSION_V11`): these entry tuples, with keys of up to 2047 bytes
-(§4). An index of an older version is refused with the REINDEX hint: its entries would be read at
-the wrong offsets, or its long jsonb keys looked for in the wrong form.
+The format is version 12 (`LION_VERSION_V12`): these entry tuples, with keys of up to 2047 bytes
+(§4), under internal pages that each begin with a minus-infinity downlink ("Height" below), and
+the pages VACUUM takes out and hands out again ("Page deletion" below, §22 "Empty leaves"). An
+index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
+offsets, its long jsonb keys looked for in the wrong form, or (version 11) its directory may be of
+any height.
 
 ### The order
 
@@ -6709,6 +6876,79 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
 - **Ordered iteration**: leftmost leaf, then right links, SHARE lock one page at a time, pin held
   while an INLINE set from that page is being counted exactly as the bucket walk did.
 
+### Height
+
+**Every internal page begins with a key-less minus-infinity downlink** (format version 12), as
+nbtree's first data item on an internal page has no key. The key that downlink would carry is the
+page's lower bound, which the page's left sibling holds as its high key and the parent as the
+downlink to the page; a descent that reached the page has a key at or above it, so the first child
+is the one to take for anything below the second downlink, which is what `lion_page_downlink()`
+did anyway. A split of an internal page writes the right half's first downlink without its key -
+the key goes up as the separator, and is the left half's new high key - and so does the build.
+Finishing a split, and verify's confirmation of a page its walk did not reach, search for a key the
+page holds, which on an internal page is its second downlink's (`lion_dir_first_keyed()`).
+
+What it buys is room. A pivot of a LION_MAX_KEY_SIZE key costs P = 2068 bytes of a page's 8136, so
+an internal page holds a high key and three downlinks only when one of them has no key. With every
+downlink a full pivot a non-rightmost internal page holds two, a split of three makes halves of one
+and two, and pages of one downlink take over the directory: 25,000 hashed tsvector lexemes
+inserted in md5 order make 50,383 internal pages over 16,533 leaves and a directory 36 levels
+tall.
+
+**The rule, and the bound it gives.** An internal page split leaves at least
+`LION_ABS_MIN_DOWNLINKS` = 2 downlinks on each half (`lion_dir_choose_split()`), and such a cut
+always exists. With m the minus-infinity downlink's 20 bytes, m + 3P fits a page, so a page with
+two downlinks and a high key takes a third without splitting: a split has n >= 4 items, the new one
+included. The left half at cut k costs L(k) = s(0) + ... + s(k) (items up to k, and a high key
+copied from item k, which costs what item k does), rising in k; the right half R(k) = m + s(k+1) +
+... + s(n-1) + the old high key, falling. L(2) and R(n-2) are at most m + 2P; take the largest
+k <= n - 2 whose left half fits: if it is n - 2 both fit, and otherwise L(k+1) is over the page,
+and since the page held everything but the new item, R(k) < m + s(new) + s(k+1) <= m + 2P. The
+build gives every internal page two downlinks too, but may leave one on the rightmost page of a
+level; a root has two when it is made.
+
+VACUUM takes downlinks out ("Page deletion"), which can leave a page with one, so the bound counts
+the pages MADE at a level - by a split, a root split or the build - rather than the pages there now.
+For one level let Φ be the sum over its pages of max(d - 2, 0), d a page's downlinks. A downlink
+added without a split raises Φ by at most one; one added by a split lowers it by one (the page had
+n - 1 >= 3, a term of n - 3, and its halves have terms adding up to n - 4); a downlink taken out,
+or a page of one going, never raises it; a root split makes a page of two, a term of 0; the build
+makes pages of terms d - 2, but for the rightmost of the level, which may have one downlink. Φ
+starts at 0 and never goes below it, so A + 1 >= 2M, with A the downlinks ever added to the level
+and M the pages made at it. Each downlink added names a page made at the level below, and each such
+page gets one, so every level has had at least 2M - 1 pages made where the level above it had M,
+and the level below the root at least two. A directory of height h has had at least 2^(k-1) + 1
+pages made at level h - k, and at least 2^(h-1) + 1 leaves.
+
+Without page deletion every page made is still there, and as a relation has fewer than 2^32 blocks,
+h <= 31 = `LION_MAX_DIR_HEIGHT`. With it pages are used again, and 32 levels take more than 2^31
+leaves made over the index's life - a leaf split for every half page of entries added, some 8 TB of
+them. The meta page check refuses a taller directory as damage, and a root split that would pass
+it refuses itself before it writes anything, with a hint to REINDEX, which builds the directory
+anew at the height its keys need. verify() checks the page rule: every internal page's first
+downlink is minus infinity, and it has a downlink.
+
+The leaves are not bounded the same way and need not be: a leaf holds a high key and two entries of
+maximum size, so random inserts leave some 1.5 entries a leaf, and the leaves only add to the
+count the height is bounded by.
+
+Measured (25,000 rows of `to_tsvector('simple', md5(g::text) || repeat('x', 2013))`, inserted one
+statement at a time into an empty index; and one jsonb document of 20,000 top-level keys of 2,000
+characters):
+
+| | height | leaves | internal | size | time |
+|---|---|---|---|---|---|
+| tsvector, 4,000 rows | 9 | 2,628 | 1,924 | 36 MB | 1.3 s |
+| tsvector, 25,000 rows | 11 | 16,533 | 12,090 | 224 MB | 8.2 s |
+| tsvector, 25,000 rows, REINDEX | 9 | 12,504 | 6,256 | 147 MB | 1.9 s |
+| jsonb document | 11 | 21,962 | 14,465 | 285 MB | 4.3 s |
+
+With every downlink keyed the same inserts made heights 24 and 36 (79 and 523 MB), and the REINDEX
+height 13 (195 MB).
+
+GIN holds the same documents in a few MB because it compresses its index tuples, which repeat a
+character 2,000 times here; that is a question of key size (§4), not of the directory's shape.
+
 ### Offsets are not names any more
 
 The hash directory only ever APPENDED to a bucket page, so `(page, offset)` named an entry for its
@@ -6797,6 +7037,8 @@ gets a single leaf that is also the root.
 `LION_NONLEAF_FILLFACTOR` = 70, nbtree's own separate non-leaf fill, and takes at least
 `LION_ABS_MIN_DOWNLINKS` = 2 downlinks whatever the fill target says (it aims for 3 and settles for
 2 when the keys are too large - three LION_MAX_KEY_SIZE pivots plus a high key do not fit a block).
+Each internal page's first downlink is written as minus infinity and counted at its own size, as an
+INSERT's split writes it ("Height").
 Without that floor, `fillfactor = 10` and 512-byte keys leave ONE downlink on an internal page,
 every level is then as large as the one below it, and `lion_build_finish_dir()` climbs for ever
 without reaching a root. It now also checks the invariant it relies on - each level strictly smaller
@@ -6929,8 +7171,10 @@ two damaged bytes of a text key, `01 01` - the header of an INDIRECT TOAST point
 descent that compared against it detoast through whatever the page held, a SIGSEGV (2026-09-29
 review). A stored key has exactly one form, the one `lion_store_key()` writes: `typlen` bytes
 for a by-value type and for a fixed-length one, a plain 4-byte varlena header whose length is
-the key's (`PG_DETOAST_DATUM()` gives every stored key one), a cstring whose only NUL is its last
-byte, and at most `LION_MAX_KEY_SIZE` bytes in any case. So every key that comes off a page is
+the key's (`PG_DETOAST_DATUM()` gives every stored key one) - or, for a key too long for that, an
+inline compressed header of a method this build knows whose raw length is past the limit (§4,
+"Long keys") - a cstring whose only NUL is its last byte, and at most `LION_MAX_KEY_SIZE` bytes in
+any case. So every key that comes off a page is
 checked for that form before any opclass function sees it (`lion_entry_key()`, `lion_check_key()`,
 lion_state.c) - in the descent's comparisons, the prefix-run scans, the entry and summary walks, the
 posting sets' stored keys that LionOrdered and the GROUP BY counts emit, the planner's probes and
@@ -7020,9 +7264,8 @@ names the top, the next page to unlink (InvalidBlockNumber when the leaf is the 
 **Stage 2**, one record per page, the top first and the leaf last. The page is unlinked from its
 left and right siblings and marked `LION_PAGE_DELETED`. It keeps its kind, level and links and a
 single MINUS INFINITY high key, and holds its `safexid`, `ReadNextFullTransactionId()` at that
-moment, in `minckey` (low half) and `maxckey` (high half). When it was the leftmost page of an
-internal level, its right sibling's first downlink becomes MINUS INFINITY in the same record. The
-leaf's `owner_head` moves down to the next page. A META record then lowers `dirpages` by the pages
+moment, in `minckey` (low half) and `maxckey` (high half). The leaf's `owner_head` moves down to
+the next page. A META record then lowers `dirpages` by the pages
 that went: the meta page comes after the parent in a split's lock order, so it is not in the
 records above.
 
@@ -7033,14 +7276,17 @@ without comparing a key - to the leftmost page of a level - step past DELETED pa
 (`lion_dir_past_deleted()`), and the walk to the left (`lion_dir_step_left()`, nbtree's
 `_bt_walk_left()`) skips them and takes the page whose right link names the page it came from.
 
-**The first downlink** of an internal page stands for the page's lower bound, whatever key it
-carries. That key is the bound the page had when the downlink was made, and stage 1 lowers the
-bound of the page right of a subtree: the key is at or above the bound, and the separators added
-after it, and its child's keys, may sort below it. The binary search answers the first child for
-every key below the second separator either way, and no separator is ever placed in front of the
-first downlink (`lion_dir_place_off()`). verify() compares what follows the first downlink, and the
-first child, with the bound - the left neighbour's high key - and the first downlink's key only with
-that bound.
+**The first downlink** of an internal page has no key ("Height"), so stage 1 changes no key when it
+lowers the bound of the page right of a subtree. When the subtree's downlink is its parent's first,
+the minus-infinity one, it stays key-less and names the right sibling, whose range then begins at
+the parent's lower bound; otherwise the sibling's range begins at the separator the subtree had.
+At an internal level the sibling's own first downlink is minus infinity already, so unlinking the
+leftmost page of a level rewrites no item of it.
+
+**What a deletion leaves of its parent** is one downlink fewer, and a parent of two then has one.
+A page of one downlink does not split before it has gained two more, so it does not weaken the
+bound of "Height", which counts the pages made over the directory's life; when its last child
+empties, the page goes with it, as a subtree of single downlinks.
 
 **Reuse.** VACUUM's sweep hands a DELETED directory page to the free space map, and
 `lion_alloc_page()` takes it once its `safexid` is older than every snapshot, nbtree's rule: a scan
@@ -7062,11 +7308,12 @@ the parents upwards one at a time, as a split's ascent does; stage 2 holds the l
 the left sibling, the page and its right sibling, left to right at the page's level, as a split
 does. Neither waits for a lock below a page it holds, and neither ever ERRORs on what a concurrent
 writer did: a page that is not as expected leaves the leaf for a later VACUUM. Before stage 1 the
-leaf's predicate locks move to its right sibling (`PredicateLockPageCombine()`), which takes over
+leaf's predicate locks move to its right sibling (`lion_predlock_move()`, §9), which takes over
 the range they cover.
 
 **verify()** accepts a DELETED page only outside the levels it walks, and a HALF_DEAD page only as
-an empty leaf, not rightmost, with a MINUS INFINITY high key. A page of a level that no downlink
+an empty leaf, not rightmost, with a MINUS INFINITY high key. An internal page needs one downlink,
+not two. A page of a level that no downlink
 names must be the top of a subtree being deleted: a chain of single downlinks down to a HALF_DEAD
 leaf whose `owner_head` names it. The pages of such a subtree bound nothing - their range is the
 right sibling's already - so their high keys are compared with nothing.
@@ -9061,6 +9308,12 @@ insert no record at all, so that nothing about them needs the manager
 changes an index's mode.
 `lion_index_wal_mode(idx)` reports it.
 
+A VACUUM that has dead entries to remove from such an index is a write too, and stops at its first
+one with the same error - autovacuum included, every time it comes back to the table, so the table's
+dead rows accumulate while the error shows only in the server log. The hint names both ways out:
+the preload, or REINDEX with `wal_mode = generic` (which `auto` also gives on a server without the
+preload). `test/recovery/run.sh` phase 1f checks the insert, the VACUUM and the REINDEX.
+
 **VACUUM is the one path that could write without `lion_wal_begin()`**
 (2026-09-25 review): the standby barrier's stand-alone VACUUM_VISIT record is
 inserted by `lion_wal_visit_flush()` directly, and `lion_wal_visit()` looked at
@@ -9697,8 +9950,9 @@ replanned after its unique index and then its NOT NULL are dropped; and a partit
 per-partition unique indexes over repeating values, then a primary key. Every query there runs
 with LionOrdered (§30) switched off beside core's scans, and so does `group_coalesce.sql`: a btree
 on the DISTINCT or GROUP BY column gives core an aggregate over LionOrdered's presorted rows, which
-`enable_indexscan` does not disable, and which is the cheaper plan for a walk over a column with an
-entry per row (`count(DISTINCT u)` of a nullable unique `u`, `GROUP BY u`). From 17 core counts an
+`enable_indexscan` disables as it disables core's index scans (§39, "Core's switches"), so that it
+still competes wherever core's other scans are switched off too, and which is the cheaper plan for a
+walk over a column with an entry per row (`count(DISTINCT u)` of a nullable unique `u`, `GROUP BY u`). From 17 core counts an
 index on ANY grouping or DISTINCT key as useful for grouping, not only one on the leading key, so
 the same queries meet that competitor more often there than on 16. Left on, it decides the plan by
 cost and says nothing about whether the node was built; the first CI run of the test tripped over
@@ -9848,8 +10102,8 @@ lookup answers that clause exactly when the clause is one the pushdown already a
   §15 applies to that lookup as to every single lookup (a NOPIN set is re-located, or covered by
   another source, by the count itself), and no argument of §9, §11 or §15 changes: the fk set is to
   this node what one group's set is to §15's GROUP BY driver. The visibility cache is shared
-  across dimension rows as it is across groups, and the fk index takes the
-  `PredicateLockRelation()` every index the node opens takes.
+  across dimension rows as it is across groups, and each fk lookup takes the predicate locks of
+  §9, "SERIALIZABLE", as every lookup does.
 - **One snapshot for both sides.** The child and the count both read `es_snapshot`, so a fact row
   is counted for a dimension row exactly when both are visible to it - which is the join.
 - **The WHERE sets' pins are held across the child** - until the node returns its first row. The
@@ -14500,6 +14754,24 @@ reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
   trees) - the executor never has to iterate the elements with rescans.
 - `pgstat_count_index_scan()` and, on 18+, `instrument->nsearches` are counted once per source
   opened, i.e. once per rescan, as btree counts one per primitive scan.
+- **Statistics.** The custom nodes and the SQL functions keep `pg_stat_user_indexes` and
+  `pg_stat_user_tables` as the scans above do, so that an index lion reads never shows as unused.
+  A scan of an index (`pgstat_count_index_scan()`, which sets `last_idx_scan` too) is counted once
+  per scan and per rescan of each index read: LionCount (`lion_count_report_reads()`, as a run's
+  relation closes or the node rescans, from the relation's `statread` and `statrows`), the FK-side
+  joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
+  is counted by core's own scan under them), LionBm25 and the lionvec scan once per scan, and the
+  SQL functions once per call - `lion_bm25_score()` once a query, when it reads the index's
+  statistics into its cache. `idx_tup_read` counts what the index gave: a count's rows counted
+  (the distinct values of a `count(DISTINCT)`, the rows of the keys `lion_index_facets()` counted),
+  credited to each index of the count, since every one of them answered for each; a semi or anti
+  join's rows returned; the members of LionOrdered's sets and the entries of its walks of a lion
+  column; the entries of BM25's walks. `idx_tup_fetch` (`pgstat_count_heap_fetch()`) counts the rows
+  a node fetched by the index's order itself - a walk of a lion column, the rows BM25 returns - and
+  the rows fetched by a set's TIDs or rechecked in the heap by a count go to the table alone, as a
+  bitmap heap scan's do (`tuples_fetched` of the heap relation's `pgstat_info`). No node counts a
+  sequential scan. test/sql/index_usage.sql reads the deltas of every path after
+  `pg_stat_force_next_flush()`.
 - `amendscan` does everything `amrescan` does and frees the contexts. An ERROR in the middle of a
   scan leaves pins to the resource owner, which releases them, and the list pin budget is zeroed
   at the end of the transaction (§15).
@@ -16052,9 +16324,8 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   Scan's do), and initialises two recheck quals with `ExecInitQual()`: the `lionqual` and the
   ordered index's original clauses. The scan slot is a buffer heap tuple slot. A non-MVCC snapshot
   is an internal error: every snapshot a SELECT's executor runs under is MVCC, and §30.5's
-  argument needs one. Under SERIALIZABLE it takes `PredicateLockRelation()` on every lion index
-  before any lookup (§9, "SERIALIZABLE": the AM has no `ampredlocks`, and the node reads it
-  without `index_beginscan()`).
+  argument needs one. Under SERIALIZABLE its lion lookups and walks take the page locks of §9,
+  "SERIALIZABLE", as every reader's do.
 - **The set is built at the first fetch after a start or a rescan** - or started lazily, below -
   not in BeginCustomScan: an exec Param is set by a nested loop after the node is initialised.
   Each lion leaf evaluates its
@@ -16376,10 +16647,10 @@ ordinary plan returns, in the same order.
 - **Non-MVCC snapshots** are refused (§30.4). **Hot standby**: nothing here reads the visibility
   map or relies on a pin, so a standby needs nothing an Index Scan does not.
 - **SERIALIZABLE.** The btree walk takes its own page predicate locks; each heap fetch takes a
-  tuple lock (`heap_hot_search_buffer()`); and the node takes a relation predicate lock on every
-  lion index it builds M from. A concurrent write that would change the answer inserts into a lion
-  index (a new matching row, or a non-HOT update that makes a skipped row match: a conflict with
-  the relation lock), or writes a row the node returned (its tuple lock), or inserts into a btree
+  tuple lock (`heap_hot_search_buffer()`); and the lion lookups M is built from lock the pages that
+  stand for their keys (§9, "SERIALIZABLE"). A concurrent write that would change the answer
+  inserts into a lion index (a new matching row, or a non-HOT update that makes a skipped row
+  match: a conflict with the page lock of its key), or writes a row the node returned (its tuple lock), or inserts into a btree
   page the walk read. A skipped non-member that is deleted, or updated and still does not match,
   does not change the answer; the ordinary plan's tuple lock on it is a false positive the node
   does not reproduce. test/isolation/ordered_serializable.spec is the write-skew case.
@@ -16975,8 +17246,9 @@ what the defaults are fitted to:
   path well above the competitor's ratio is overpriced, and well below it underpriced, which is
   the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
   *(Since §39 a lion path's cost is in its competitor's units, and over a margin if one is set:
-  force its plans with core's `enable_*` settings, or set every `pg_lion.*_rate` and
-  `pg_lion.pushdown_margin` to 1, to read lion's own, and calibrate the rates themselves against
+  force its plans with core's `enable_*` settings and `pg_lion.enable_plain_scan` on a table
+  with no other index, or set every `pg_lion.*_rate` and `pg_lion.pushdown_margin` to 1, to read
+  lion's own, and calibrate the rates themselves against
   core's plans the same way.)*
 - Which setting to move is the one whose term dominates the path's price, read against the
   node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
@@ -18639,7 +18911,7 @@ and 16 buffers. Any other filter on the walked column alone - `s LIKE 'p1%'`, `l
 `k % 7 = 3`, `n IS NULL OR n > 4` - is decided once per ENTRY (`lo_walk_value_rinfos()`): when the
 index's stored keys are the rows' own values byte for byte (`lion_index_can_emit_value()`, the
 value-representation rule of §10), every row of an entry holds one value, so a clause that reads
-no other column and calls nothing volatile is true of all of them or of none. The first VISIBLE row
+no other column and is immutable is true of all of them or of none. The first VISIBLE row
 the walk fetches of an entry decides for the entry; one that fails takes the rest of it with it,
 unread (`lion_order_walk_skip_entry()`). EXPLAIN shows the clauses as `Filter per Value` and ANALYZE
 counts `Lion Keys Filtered`; they stay in the node's filter too.
@@ -18649,7 +18921,10 @@ DEAD row's, so a function the query never calls on a visible row would be called
 3` with `k = 0` only in deleted rows raised a division by zero the ordinary plan does not. Only
 leakproof functions promise not to, and those are the comparisons the walk's bounds answer already.
 And over a type whose equal values may differ - numeric's 1.0 and 1.00 are one entry - the
-representative is not every row's value, which the image rule excludes. The price
+representative is not every row's value, which the image rule excludes. Non-volatile is not enough
+either: a stable function may read how a row stores its value rather than the value, and
+`pg_column_size(s) > 1000`, `pg_column_compression(s) IS NULL` differ between two rows of one value,
+one compressed and one not, so the first row would decide wrongly for the rest. Hence immutable. The price
 (`lo_cost_walk()`): of the entries the filter rejects, the walk reads the TIDs up to the first
 member and fetches it; of the rest, everything.
 
@@ -18851,9 +19126,9 @@ So is every walk during recovery, where a standby's snapshot holds nothing back 
 
 **What the walk locks.** It reads every row of the table, so it takes the predicate lock a
 sequential scan takes, `PredicateLockRelation()` on the heap, on every run and before the first
-look. The relation locks the node takes on the indexes it reads (§9, "SERIALIZABLE") do not
-stand in for it: they see every insert, since the sum over every row reads a whole index of the
-table, which every insert reaches, but a DELETE reaches no index. The counted walk's page locks
+look. Locks on the index pages it reads (§9, "SERIALIZABLE") would not stand in for it: they would
+see every insert, since the sum over every row reads a whole index of the table, which every insert
+reaches, but a DELETE reaches no index. The counted walk's page locks
 (§9) saw it; the walk from the entries' counts visits no heap page and took none.
 
 **An expression of the key waits for a look.** Giving an entry to its aggregates evaluates their
@@ -19436,7 +19711,7 @@ margin.
 
 ### The margin
 
-`pg_lion.pushdown_margin`, default **1**, no margin. Set below 1, a lion custom path's own price, in
+`pg_lion.pushdown_margin`, default **1**, no margin, range 0.01 to 1000. Set below 1, a lion custom path's own price, in
 its competitor's units, is divided by the margin before the path is offered to `add_path()`, so that
 a lion path is chosen only where its price comes to at most that share of the best core plan's - at
 0.8, a near tie within 25% goes to core. It applies to every lion custom path - LionCount (serial,
@@ -19459,9 +19734,9 @@ paths meet their competitors later:
   would lose every LIMIT; declined only by dominance, the margin would never apply to it.
 
 A divided price carries the margin into every comparison it is in, whenever and wherever that is
-made, and forcing a plan works as it did: core's `enable_*` settings disable core's paths
-(`disabled_nodes` on PostgreSQL 18, `disable_cost` before it), which lose to an enabled lion path
-whatever its price, and `pg_lion.enable_*` leave lion's out. What it costs is that a lion path's
+made, and a disabled path still loses to an enabled one whatever the margin: core's `enable_*`
+settings disable core's paths and lion's alike ("Core's switches", below), and `pg_lion.enable_*`
+leave lion's out. What it costs is that a lion path's
 cost in EXPLAIN is its price over the margin, where one is set.
 
 **Not where it hedges nothing.** The margin is a hedge against the error of lion's price alone;
@@ -19516,8 +19791,43 @@ three wins go to core at 0.9 or 0.8, and the loss only at 0.6, the three wins lo
 had the fewest mispicks and the least time lost of the sweep in both runs ("The matrix", below). So
 the default is 1; the setting stays, with the exemptions above, for a site whose own matrix says
 otherwise. A margin above 1 - lion favoured - would have taken three more of the seven (the first
-three rows), and the setting stops at 1: on 39 queries that would be a fit, not the correction of a
-known bias.
+three rows), and the default stays at 1: on 39 queries that would be a fit, not the correction of a
+known bias. Above 1 the setting is a lever for tests and calibration: at 1000 it hands a lion path
+every comparison with an enabled core plan of the competitor's kind, which is how a test forces one
+over core's index scans: `enable_indexscan` cannot switch those off without disabling the lion
+paths too (below).
+
+### Core's switches (`lion_path_core_switches()`)
+
+Each lion custom path stands in for an index scan, and core's `enable_indexscan`,
+`enable_indexonlyscan` and `enable_bitmapscan` are what a user turns off to keep index scans out of
+a plan. So the first two disable the lion paths that do an index scan's or an index-only scan's
+work, by core's own mechanism: the path is kept and marked, `disabled_nodes` incremented on
+PostgreSQL 18 and later, `disable_cost` added to its startup and total cost before 18, so that it
+loses to any enabled path and still wins where every path left is disabled, as core's do. Removing
+it instead would leave a query whose every other path is disabled without a plan of lion's, which
+core's disabled paths never do. The mapping follows what the node reads:
+
+- **Index-only** (`LION_CORE_INDEXONLY`, disabled when `enable_indexscan` or `enable_indexonlyscan`
+  is off, as core's index-only scan is): LionCount in every form (serial, parallel, grouped,
+  partitioned, the FK-side join's count) and LionSemiJoin and LionAntiJoin answer from the index
+  alone - the heap is read only to recheck a row, as an index-only scan reads it for a page not all
+  visible.
+- **Index** (`LION_CORE_INDEXSCAN`, disabled when `enable_indexscan` is off, as core's plain index
+  scan is): LionOrdered (over a B-tree, or walking a lion or lionvec column), LionBtreeScan and
+  LionBm25 return the table's rows in an index's order or by an index's TIDs. LionOrdered and
+  LionBtreeScan in index-only mode are, as before, not offered with `enable_indexonlyscan` off
+  (§40.1); their heap mode stays.
+- **`enable_bitmapscan`** disables nothing of lion's: no custom node builds a TID bitmap for a heap
+  scan of core's, and the AM's own bitmap scans are core's paths, which the setting already
+  disables.
+
+The disabled mark goes on the node's own cost, outside the margin and the competitor's units: the
+price is divided by the margin first, then marked, so that no margin turns a disabled path into an
+enabled one. `pg_lion.enable_*` are unchanged and still leave a lion path out altogether. To force a
+lion path, a test switches off what it competes with that is not an index scan (`enable_seqscan`,
+`enable_bitmapscan`, `pg_lion.enable_plain_scan` for the AM's own plain scans) and sets
+`pg_lion.pushdown_margin` to 1000 for the core index scans it leaves on.
 
 ### Resident index pages: §22's third rung
 
@@ -20020,8 +20330,9 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   ordered paths and the lion columns' walks of §30.11, and with it off the unordered paths claim no
   order whatever core found useful - a `LionOrdered` must not appear with its switch off - and are
   all `LionBtreeScan`s; `pg_lion.enable_btree_scan` (bool, default on) gates the unordered paths.
-  Core's `enable_indexscan` leaves both alone, as it left `LionOrdered` alone: the node is priced
-  from `indextotalcost`, which carries no `disable_cost`.
+  Core's `enable_indexscan` disables both, as it disables the B-tree's own index scans (§39,
+  "Core's switches"): the path is kept and marked disabled after it is priced, since its price
+  comes from `indextotalcost`, which carries no `disable_cost`.
 - **Partitions**: as §30.11, each leaf is scanned like a table under core's Append or MergeAppend.
 
 ### 40.3 Cost (`lo_cost()`, index-only)
@@ -20133,7 +20444,7 @@ ordered ones.
   path has no sort keys and never switches, as a path whose pathkeys were not plain columns never
   did; the planner priced the full walk.
 - **Unchanged**: the lazy set, the early stop, the spill, rescans with changed Params, the
-  relation predicate locks on the lion indexes.
+  predicate locks of the lion lookups.
 
 ### 40.5 Correctness
 
@@ -21879,8 +22190,9 @@ there went from LionOrdered probing (warm, 0.964 of the ten nearest in 8.7 and 9
 margin) to the plain scan (0.960 in 16.9 ms, 0.957 in 10.8 ms), where LionOrdered, forced, is exact
 in 4.2 and 7.8 ms and the sort exact in 2.9 and 4.6. The cost follows the scan, as it must for the
 planner to compare what will run; what is wrong is the plain scan's price, which the follow-up's
-problem 1 is to fix. Until then `enable_indexscan = off` with `enable_sort = off` takes LionOrdered,
-and `enable_indexscan = off` alone the sort, both exact there.
+problem 1 is to fix. Until then `pg_lion.enable_plain_scan = off` with `enable_sort = off` and
+`pg_lion.pushdown_margin = 1000` takes LionOrdered, and `pg_lion.enable_plain_scan = off` alone the
+sort, both exact there (`enable_indexscan = off` disables LionOrdered with the plain scan, §39).
 **2026-10-16**: under a restriction the plain scan is no longer a candidate (§44.6,
 "Post-filtering"), so the comparison of it with LionOrdered that this charge decides arises only
 under `pg_lion.vector_postfilter = allow`. On the 1M-row DBpedia set, at `random_page_cost` 1.1,
@@ -22580,7 +22892,8 @@ medians of three and two), the same index.
 `KNN_EXACT_SELS` and `KNN_EXACT_MARGINS`, on main's build at 1c85107). DBpedia's 115,186 rows as
 above, the vectors inline (`KNN_INLINE`: a row a heap page), the index of 2,715 partitions spilling,
 every relation in 2 GB of shared buffers; 200 queries, LIMIT 10, through LionOrdered
-(`enable_sort` and `enable_indexscan` off), its exact path with `pg_lion.vector_exact_rows` past
+(`enable_sort` off and the lionvec index's own scan out of the way, as `knn_dbpedia.py`'s `lo`
+settings put it - §39, "Core's switches"), its exact path with `pg_lion.vector_exact_rows` past
 every filter, its probes with it at 0 and the default patience. The server's median time, the
 median of three runs' (two other builds shared the 4 cores), and the 95th percentile; recall and
 pages, the same in every run. Probed at the default margin, at the margin nearest 0.98 of the ten

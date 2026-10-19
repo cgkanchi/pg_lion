@@ -201,6 +201,49 @@ SELECT c.relname AS partition, count(*) AS roaring_indexes
 SELECT lion_index_verify('lion_part_p1_a_idx', true);
 SELECT lion_index_verify('lion_part_p2d_n_idx', true);
 
+-- ---- the functions, handed the partitioned index -----------------------
+-- It has no storage.  lion_index_stats() describes none; every other
+-- function says what it is, and that a partition's index is what to pass.
+\set VERBOSITY default
+SELECT * FROM lion_index_stats('lion_part_a');
+SELECT lion_index_verify('lion_part_a');
+SELECT lion_index_wal_mode('lion_part_a');
+SELECT lion_index_posting_root('lion_part_a', 3);
+SELECT lion_index_count('lion_part_a', 3);
+SELECT lion_index_count('lion_part_p1_a_idx', 3, 'lion_part_b', 2);
+SELECT lion_index_count_any('lion_part_a', '{3,4}');
+SELECT * FROM lion_index_count_stats('lion_part_a', 3);
+SELECT * FROM lion_index_count_group_stats('lion_part_a');
+SELECT * FROM lion_index_facets('lion_part_a', 3);
+\set VERBOSITY terse
+CREATE TABLE lion_part_ts (id int, k int, d tsvector) PARTITION BY RANGE (k);
+CREATE TABLE lion_part_ts1 PARTITION OF lion_part_ts FOR VALUES FROM (0) TO (10);
+INSERT INTO lion_part_ts SELECT i, i % 10, to_tsvector('simple', 'w' || (i % 7))
+  FROM generate_series(1, 100) i;
+CREATE INDEX lion_part_ts_d ON lion_part_ts USING lion (d);
+CREATE INDEX lion_part_ts_k ON lion_part_ts USING btree (k);
+SELECT * FROM lion_bm25('lion_part_ts_d', 'w1', 3);
+SELECT lion_bm25_score(d, 'w1', 'lion_part_ts_d') FROM lion_part_ts LIMIT 1;
+-- the index of a partition is read as any other
+SELECT count(*) FROM lion_bm25((SELECT indexrelid FROM pg_index
+								 WHERE indrelid = 'lion_part_ts1'::regclass
+								   AND indexrelid::regclass::text LIKE '%_d_idx'), 'w1', 3);
+-- a partitioned index of another method is not a lion index
+SELECT lion_index_count('lion_part_ts_k', 3);
+SELECT lion_index_wal_mode('lion_part_ts_k');
+DROP TABLE lion_part_ts;
+-- a check of every lion index, in a lateral join: the partitioned ones
+-- have no stats rows, and verify takes the indexes with storage
+SELECT count(*) AS stats_rows
+  FROM pg_class c, lion_index_stats(c.oid) s
+ WHERE c.relam = (SELECT oid FROM pg_am WHERE amname = 'lion')
+   AND c.relname LIKE 'lion_part%';
+SELECT c.relname, lion_index_verify(c.oid)
+  FROM pg_class c
+ WHERE c.relam = (SELECT oid FROM pg_am WHERE amname = 'lion')
+   AND c.relname LIKE 'lion_part%' AND c.relkind = 'i'
+ ORDER BY 1;
+
 -- ---- plans --------------------------------------------------------------
 SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE a = 3');
 SELECT lion_pplan('SELECT count(*) FROM lion_part WHERE a = 3 AND b = 2');
@@ -383,14 +426,14 @@ SELECT lion_pp('SELECT a, count(*) FROM lion_parte GROUP BY a');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_pplan('SELECT count(*) FROM lion_parte WHERE a = 1');
 SELECT lion_pplan('SELECT a, count(*) FROM lion_parte GROUP BY a');
 SELECT count(*) FROM lion_parte WHERE a = 1;
 SELECT a, count(*) FROM lion_parte GROUP BY a;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE lion_parte;
 
 -- ---- partial aggregates, finalized (and spilled) by core -------------------
@@ -415,7 +458,7 @@ CREATE INDEX lion_pbig_k ON lion_pbig USING lion (k);
 VACUUM (FREEZE, ANALYZE) lion_pbig;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET hash_mem_multiplier = 1.0;
 SET work_mem = '64kB';			-- 5000 groups do not fit: the finalize spills
 SELECT lion_pplan('SELECT g, count(*) FROM lion_pbig GROUP BY g');
@@ -453,7 +496,7 @@ RESET work_mem;
 RESET hash_mem_multiplier;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SELECT count(*) FROM (SELECT g, count(*) FROM lion_pbig GROUP BY g) s;
 DROP TABLE lion_pbig;
 

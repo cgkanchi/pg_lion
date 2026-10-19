@@ -104,6 +104,7 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "pgstat.h"
 #include "port/pg_bitutils.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
@@ -4125,7 +4126,11 @@ lionvecgettuple(IndexScanDesc scan, ScanDirection dir)
 	if (dir != ForwardScanDirection)
 		elog(ERROR, "lionvec only scans forward");
 	if (so->phase == LV_START)
+	{
+		/* a scan, once per scan or rescan, as every index AM counts one */
+		pgstat_count_index_scan(scan->indexRelation);
 		lv_start(scan, so);
+	}
 
 	for (;;)
 	{

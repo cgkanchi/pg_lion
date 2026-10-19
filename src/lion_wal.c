@@ -487,7 +487,7 @@ lion_wal_begin(Relation index)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("lion index \"%s\" was built for the pg_lion WAL resource manager, which this server has not registered",
 						RelationGetRelationName(index)),
-				 errdetail("The index can be read, but not written, without the resource manager."),
+				 errdetail("Without the resource manager the index can be read but not written: inserts, updates and the VACUUM that removes its dead entries fail."),
 				 errhint("Add \"pg_lion\" to shared_preload_libraries and restart, or REINDEX the index to rebuild it with wal_mode = generic.")));
 
 	lion_wal_open = true;

@@ -1,0 +1,637 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plans
+step s1_plans: 
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM sk WHERE c = 1;
+	SET enable_bitmapscan = off;
+	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
+	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
+	SET enable_indexonlyscan = off;
+	EXPLAIN (COSTS OFF) SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
+	RESET pg_lion.enable_plain_scan;
+	RESET pg_lion.pushdown_margin;
+	RESET enable_bitmapscan;
+	RESET enable_indexonlyscan;
+	SET enable_indexscan = off;
+	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE c = 1;
+	EXPLAIN (COSTS OFF) SELECT sum(id) FROM sk WHERE k = 1;
+	RESET enable_indexscan;
+	SET enable_hashjoin = off;
+	SET enable_mergejoin = off;
+	SET enable_nestloop = off;
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM skd WHERE pk BETWEEN 1 AND 2
+	  AND EXISTS (SELECT 1 FROM sk WHERE sk.c = skd.pk);
+	RESET enable_hashjoin;
+	RESET enable_mergejoin;
+	RESET enable_nestloop;
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM sk WHERE c BETWEEN 1 AND 3;
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM sk WHERE c IN (1, 3);
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM sk WHERE k = 1;
+	EXPLAIN (COSTS OFF) SELECT count(*) FROM sk WHERE k BETWEEN 1 AND 3;
+
+QUERY PLAN                  
+----------------------------
+Custom Scan (LionCount)     
+  Lion Indexes: sk_c (c = 1)
+(2 rows)
+
+QUERY PLAN                       
+---------------------------------
+Aggregate                        
+  ->  Index Scan using sk_c on sk
+        Index Cond: (c = 1)      
+(3 rows)
+
+QUERY PLAN                       
+---------------------------------
+Aggregate                        
+  ->  Index Scan using sk_k on sk
+        Index Cond: (k = 1)      
+(3 rows)
+
+QUERY PLAN                           
+-------------------------------------
+Limit                                
+  ->  Custom Scan (LionOrdered) on sk
+        Ordered By: sk_id            
+        Lion Cond: (c = 1)           
+        Lion Indexes: sk_c           
+(5 rows)
+
+QUERY PLAN                           
+-------------------------------------
+Aggregate                            
+  ->  Bitmap Heap Scan on sk         
+        Recheck Cond: (c = 1)        
+        ->  Bitmap Index Scan on sk_c
+              Index Cond: (c = 1)    
+(5 rows)
+
+QUERY PLAN                           
+-------------------------------------
+Aggregate                            
+  ->  Bitmap Heap Scan on sk         
+        Recheck Cond: (k = 1)        
+        ->  Bitmap Index Scan on sk_k
+              Index Cond: (k = 1)    
+(5 rows)
+
+QUERY PLAN                                               
+---------------------------------------------------------
+Aggregate                                                
+  ->  Custom Scan (LionSemiJoin)                         
+        Lion Indexes: sk_c (c = skd.pk)                  
+        Join Rows: the outer rows with a match           
+        ->  Bitmap Heap Scan on skd                      
+              Recheck Cond: ((pk >= 1) AND (pk <= 2))    
+              ->  Bitmap Index Scan on skd_pkey          
+                    Index Cond: ((pk >= 1) AND (pk <= 2))
+(8 rows)
+
+QUERY PLAN                              
+----------------------------------------
+Custom Scan (LionCount)                 
+  Lion Indexes: sk_c (c >= 1 AND c <= 3)
+(2 rows)
+
+QUERY PLAN                                        
+--------------------------------------------------
+Aggregate                                         
+  ->  Index Scan using sk_c on sk                 
+        Index Cond: (c = ANY ('{1,3}'::integer[]))
+(3 rows)
+
+QUERY PLAN                  
+----------------------------
+Custom Scan (LionCount)     
+  Lion Indexes: sk_k (k = 1)
+(2 rows)
+
+QUERY PLAN                              
+----------------------------------------
+Custom Scan (LionCount)                 
+  Lion Indexes: sk_k (k >= 1 AND k <= 3)
+(2 rows)
+
+
+starting permutation: s1_begin s2_begin s1_count s2_count s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_count: SELECT count(*) FROM sk WHERE c = 1;
+count
+-----
+  400
+(1 row)
+
+step s2_count: SELECT count(*) FROM sk WHERE c = 125;
+count
+-----
+  400
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_count s2_count s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_count: SELECT count(*) FROM sk WHERE c = 1;
+count
+-----
+  400
+(1 row)
+
+step s2_count: SELECT count(*) FROM sk WHERE c = 125;
+count
+-----
+  400
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_func s2_func s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_func: SELECT lion_index_count('sk_c', 1);
+lion_index_count
+----------------
+             400
+(1 row)
+
+step s2_func: SELECT lion_index_count('sk_c', 125);
+lion_index_count
+----------------
+             400
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_func s2_func s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_func: SELECT lion_index_count('sk_c', 1);
+lion_index_count
+----------------
+             400
+(1 row)
+
+step s2_func: SELECT lion_index_count('sk_c', 125);
+lion_index_count
+----------------
+             400
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_idx s2_idx s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_idx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 1;
+   sum
+------
+798400
+(1 row)
+
+step s2_idx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 125;
+     sum
+--------
+20000000
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_idx s2_idx s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_idx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 1;
+   sum
+------
+798400
+(1 row)
+
+step s2_idx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE c = 125;
+     sum
+--------
+20000000
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_bmp s2_bmp s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_bmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 1;
+   sum
+------
+798400
+(1 row)
+
+step s2_bmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 125;
+     sum
+--------
+20000000
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_bmp s2_bmp s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_bmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 1;
+   sum
+------
+798400
+(1 row)
+
+step s2_bmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE c = 125;
+     sum
+--------
+20000000
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_ord s2_ord s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
+				  SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
+id
+--
+ 1
+11
+21
+(3 rows)
+
+step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
+				  SELECT id FROM sk WHERE c = 125 ORDER BY id LIMIT 3;
+   id
+-----
+48005
+48015
+48025
+(3 rows)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_ord s2_ord s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
+				  SELECT id FROM sk WHERE c = 1 ORDER BY id LIMIT 3;
+id
+--
+ 1
+11
+21
+(3 rows)
+
+step s2_ord: SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
+				  SET LOCAL pg_lion.pushdown_margin = 1000; SET LOCAL enable_indexonlyscan = off;
+				  SELECT id FROM sk WHERE c = 125 ORDER BY id LIMIT 3;
+   id
+-----
+48005
+48015
+48025
+(3 rows)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_semi s2_semi s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_semi: SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+				  SET LOCAL enable_nestloop = off;
+				  SELECT count(*) FROM skd WHERE pk BETWEEN 1 AND 2
+				    AND EXISTS (SELECT 1 FROM sk WHERE sk.c = skd.pk);
+count
+-----
+    2
+(1 row)
+
+step s2_semi: SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+				  SET LOCAL enable_nestloop = off;
+				  SELECT count(*) FROM skd WHERE pk BETWEEN 125 AND 126
+				    AND EXISTS (SELECT 1 FROM sk WHERE sk.c = skd.pk);
+count
+-----
+    2
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_semi s2_semi s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_semi: SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+				  SET LOCAL enable_nestloop = off;
+				  SELECT count(*) FROM skd WHERE pk BETWEEN 1 AND 2
+				    AND EXISTS (SELECT 1 FROM sk WHERE sk.c = skd.pk);
+count
+-----
+    2
+(1 row)
+
+step s2_semi: SET LOCAL enable_hashjoin = off; SET LOCAL enable_mergejoin = off;
+				  SET LOCAL enable_nestloop = off;
+				  SELECT count(*) FROM skd WHERE pk BETWEEN 125 AND 126
+				    AND EXISTS (SELECT 1 FROM sk WHERE sk.c = skd.pk);
+count
+-----
+    2
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_range s2_range s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_range: SELECT count(*) FROM sk WHERE c BETWEEN 1 AND 3;
+count
+-----
+ 1200
+(1 row)
+
+step s2_range: SELECT count(*) FROM sk WHERE c BETWEEN 125 AND 127;
+count
+-----
+ 1200
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_range s2_range s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_range: SELECT count(*) FROM sk WHERE c BETWEEN 1 AND 3;
+count
+-----
+ 1200
+(1 row)
+
+step s2_range: SELECT count(*) FROM sk WHERE c BETWEEN 125 AND 127;
+count
+-----
+ 1200
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_in s2_in s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_in: SELECT count(*) FROM sk WHERE c IN (1, 3);
+count
+-----
+  800
+(1 row)
+
+step s2_in: SELECT count(*) FROM sk WHERE c IN (125, 127);
+count
+-----
+  800
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_in s2_in s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_in: SELECT count(*) FROM sk WHERE c IN (1, 3);
+count
+-----
+  800
+(1 row)
+
+step s2_in: SELECT count(*) FROM sk WHERE c IN (125, 127);
+count
+-----
+  800
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_kcount s2_kcount s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kcount: SELECT count(*) FROM sk WHERE k = 1;
+count
+-----
+   20
+(1 row)
+
+step s2_kcount: SELECT count(*) FROM sk WHERE k = 2500;
+count
+-----
+   20
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_kcount s2_kcount s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kcount: SELECT count(*) FROM sk WHERE k = 1;
+count
+-----
+   20
+(1 row)
+
+step s2_kcount: SELECT count(*) FROM sk WHERE k = 2500;
+count
+-----
+   20
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_kidx s2_kidx s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kidx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE k = 1;
+   sum
+------
+950020
+(1 row)
+
+step s2_kidx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE k = 2500;
+    sum
+-------
+1000000
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_kidx s2_kidx s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kidx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE k = 1;
+   sum
+------
+950020
+(1 row)
+
+step s2_kidx: SET LOCAL enable_bitmapscan = off; SELECT sum(id) FROM sk WHERE k = 2500;
+    sum
+-------
+1000000
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_kbmp s2_kbmp s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kbmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE k = 1;
+   sum
+------
+950020
+(1 row)
+
+step s2_kbmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE k = 2500;
+    sum
+-------
+1000000
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_kbmp s2_kbmp s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_kbmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE k = 1;
+   sum
+------
+950020
+(1 row)
+
+step s2_kbmp: SET LOCAL enable_indexscan = off; SELECT sum(id) FROM sk WHERE k = 2500;
+    sum
+-------
+1000000
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_krange s2_krange s1_other s2_other s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_krange: SELECT count(*) FROM sk WHERE k BETWEEN 1 AND 3;
+count
+-----
+   60
+(1 row)
+
+step s2_krange: SELECT count(*) FROM sk WHERE k BETWEEN 2500 AND 2502;
+count
+-----
+   60
+(1 row)
+
+step s1_other: INSERT INTO sk VALUES (200001, 200, 4000);
+step s2_other: INSERT INTO sk VALUES (200002, 60, 1000);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+
+starting permutation: s1_begin s2_begin s1_krange s2_krange s1_skew s2_skew s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_krange: SELECT count(*) FROM sk WHERE k BETWEEN 1 AND 3;
+count
+-----
+   60
+(1 row)
+
+step s2_krange: SELECT count(*) FROM sk WHERE k BETWEEN 2500 AND 2502;
+count
+-----
+   60
+(1 row)
+
+step s1_skew: INSERT INTO sk VALUES (200001, 125, 2500);
+step s2_skew: INSERT INTO sk VALUES (200002, 1, 1);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions

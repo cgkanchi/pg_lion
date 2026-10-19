@@ -330,7 +330,6 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		LionEntryTuple *prevkey = NULL;
 		LionEntryTuple *firstkey = NULL;
 		LionEntryTuple *highkey = NULL;
-		bool		firstdown;
 		bool		dying;
 
 		lion_verify_visit(vs, blk, "the directory");
@@ -414,6 +413,23 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			lion_corrupt("lion index \"%s\": rightmost directory page %u carries a high key",
 						RelationGetRelationName(vs->index), blk);
 
+		/*
+		 * Every internal page begins with a minus-infinity downlink
+		 * (LION_MAX_DIR_HEIGHT).  A split leaves two downlinks on each half,
+		 * but a page deletion takes one out of its parent and may leave it
+		 * one (§21, "Page deletion"), never none.
+		 */
+		if (!isleaf)
+		{
+			if (firstdata > maxoff)
+				lion_corrupt("lion index \"%s\": internal page %u has no downlink",
+							RelationGetRelationName(vs->index), blk);
+			if (!ItemIdIsUsed(PageGetItemId(page, firstdata)) ||
+				!LionEntryIsMinusInf(lion_page_entry(page, firstdata)))
+				lion_corrupt("lion index \"%s\": the first downlink of internal page %u is not minus infinity",
+							RelationGetRelationName(vs->index), blk);
+		}
+
 		for (off = firstdata; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
@@ -431,36 +447,17 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 							RelationGetRelationName(vs->index), off, blk,
 							isleaf ? "" : "not ");
 
-			/*
-			 * Strictly increasing within the page (DESIGN.md §21) - and above
-			 * the page's lower bound, the left neighbour's high key, where
-			 * the first downlink of an internal page leaves nothing to
-			 * compare with.
-			 */
+			/* Strictly increasing within the page (DESIGN.md §21). */
 			if (prevkey != NULL &&
 				lion_cmp_entries(vs->ix, prevkey, item) >= 0)
 				lion_corrupt_reindex("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
 									RelationGetRelationName(vs->index), off, blk);
-			if (prevkey == NULL && firstkey != NULL && prevhigh != NULL &&
-				lion_cmp_entries(vs->ix, prevhigh, item) >= 0)
-				lion_corrupt_reindex("lion index \"%s\": item %u of directory page %u does not sort after the high key of the page left of it",
-									RelationGetRelationName(vs->index), off, blk);
 
 			/*
-			 * The first downlink of an internal page stands for the page's
-			 * lower bound, whatever key it carries: it is the key the bound
-			 * had when the downlink was made, and a page deletion lowers the
-			 * bound of the page right of the one it takes out (§21, "Page
-			 * deletion").  So that key sorts at or above the bound, and that
-			 * is all: separators that came after it may sort below it, and
-			 * the child's own keys too.  What bounds that child is the bound,
-			 * which is what its downlink is matched with below - nothing, on
-			 * the page right of a leftmost one that is being deleted, whose
-			 * bound is MINUS INFINITY until stage 2 says so.
+			 * The page's first KEY: on an internal page, past its
+			 * minus-infinity downlink, whose key is this page's lower bound.
 			 */
-			firstdown = (!isleaf && firstkey == NULL &&
-						 !LionEntryIsMinusInf(item));
-			if (firstkey == NULL)
+			if (firstkey == NULL && !LionEntryIsMinusInf(item))
 			{
 				firstkey = lion_verify_copy_item(page, off);
 				if (prevhigh != NULL &&
@@ -470,7 +467,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			}
 			if (prevkey != NULL)
 				pfree(prevkey);
-			prevkey = firstdown ? NULL : lion_verify_copy_item(page, off);
+			prevkey = lion_verify_copy_item(page, off);
 
 			if (isleaf)
 			{
@@ -479,9 +476,16 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			}
 			else
 			{
+				/*
+				 * The separator of the child of a minus-infinity downlink is
+				 * this page's lower bound: the high key of the page to its
+				 * left, which the walk has just read, or minus infinity
+				 * itself on the leftmost page of the level.
+				 */
 				if (children != NULL)
 					lion_verify_level_add(children, lion_entry_head(item),
-										  firstdown ? prevhigh :
+										  LionEntryIsMinusInf(item) &&
+										  prevhigh != NULL ? prevhigh :
 										  lion_verify_copy_item(page, off),
 										  NULL, false, false);
 			}
@@ -813,13 +817,9 @@ lion_verify_directory(LionVerifyState *vs)
 
 					if (j == 0)
 					{
-						if (sep == NULL || !LionEntryIsMinusInf(sep))
+						if (!LionEntryIsMinusInf(sep))
 							lion_corrupt("lion index \"%s\": the first downlink of level %u is not minus infinity",
 										RelationGetRelationName(vs->index), i);
-					}
-					else if (sep == NULL)
-					{
-						/* bounded by nothing: see lion_verify_walk_level() */
 					}
 					else if (LionEntryIsMinusInf(sep))
 						lion_corrupt("lion index \"%s\": downlink %d of level %u is minus infinity",
@@ -862,7 +862,6 @@ lion_verify_directory(LionVerifyState *vs)
 				 */
 				if (!dying && !below->dying[p] && j < children.npages &&
 					below->highkey[p] != NULL &&
-					children.firstkey[j] != NULL &&
 					lion_cmp_entries(vs->ix, below->highkey[p],
 									 children.firstkey[j]) > 0)
 					lion_corrupt_reindex("lion index \"%s\": the high key of block %u sorts after the separator of its right sibling",
@@ -902,10 +901,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V11)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V12)
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V11);
+					meta->version, LION_MAGIC, LION_VERSION_V12);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))

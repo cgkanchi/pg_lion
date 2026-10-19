@@ -168,17 +168,17 @@ SELECT lion_rw_link('lion_rw_di', lion_rw_leaf('lion_rw_di', 3),
 SET enable_seqscan = off;
 -- LionCount of a range: the walk of its entries (LionEntryScan)
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
 SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_d WHERE k > 10 GROUP BY k');
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 -- the scans: the walk of the range's leaves (LionLeafWalk)
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
 RESET enable_bitmapscan;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_count_pushdown;
 -- LionOrdered: the ordered walk rightwards, and leftwards, where finding a
 -- leaf's left sibling walks right from its left link (lion_dir_step_left())
@@ -209,10 +209,10 @@ SELECT lion_rw_link('lion_rw_si', lion_rw_leaf('lion_rw_si', 1),
 					lion_rw_leaf('lion_rw_si', 1));
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_s GROUP BY k');
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SELECT lion_rw_run('SELECT * FROM lion_rw_s WHERE k < 2');
 VACUUM (INDEX_CLEANUP ON) lion_rw_s;
 RESET enable_seqscan;
@@ -235,9 +235,9 @@ SET enable_seqscan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
 SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
 SET pg_lion.enable_count_pushdown = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SET enable_bitmapscan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
 RESET enable_bitmapscan;
@@ -265,9 +265,9 @@ SET enable_seqscan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
 SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
 SET pg_lion.enable_count_pushdown = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_count_pushdown;
 RESET enable_seqscan;
 DROP INDEX lion_rw_pi;

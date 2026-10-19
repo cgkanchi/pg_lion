@@ -31,6 +31,7 @@
  */
 #include "postgres.h"
 
+#include "access/detoast.h"
 #include "access/gin.h"
 #include "access/stratnum.h"
 #include "catalog/pg_collation.h"
@@ -43,6 +44,7 @@
 #include "tsearch/ts_utils.h"
 #include "utils/fmgroids.h"
 #include "utils/pg_crc.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
@@ -69,8 +71,8 @@
  * its extraction functions for.  They are NOT ours: GIN numbers the array
  * operators 1 &&, 2 @>, 3 <@, 4 =, and tsvector's @@ is its strategy 1, while
  * the roaring AM numbers every class from one scheme (1 =, 2 @>, 3 &&, 4 <@,
- * 5 @@) so that a scalar and a multi-key opclass can share a validator and a
- * scan.
+ * 5 @@, 17 array =) so that a scalar and a multi-key opclass can share a
+ * validator and a scan.
  *
  * The strategy argument of support function 3 therefore has to be translated
  * before the call, because the function reading it is GIN's.  This is part of
@@ -85,6 +87,7 @@
 #define LION_GIN_OVERLAP		1
 #define LION_GIN_CONTAINS	2
 #define LION_GIN_CONTAINED	3
+#define LION_GIN_EQUAL		4
 #define LION_GIN_TSMATCH		1	/* tsvector_ops: @@ is GIN strategy 1 */
 
 static StrategyNumber
@@ -98,7 +101,10 @@ lion_gin_strategy(StrategyNumber strategy)
 			return LION_GIN_OVERLAP;
 		case LION_STRAT_CONTAINED:
 			return LION_GIN_CONTAINED;
+		case LION_STRAT_ARRAY_EQUAL:
+			return LION_GIN_EQUAL;
 		case LION_STRAT_MATCH:
+		case LION_STRAT_MATCH_OLD:
 			return LION_GIN_TSMATCH;
 
 			/*
@@ -699,6 +705,7 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 
 	memset(q, 0, sizeof(LionQuery));
 
+	strategy = LION_STRAT_CANONICAL(strategy);
 	lion_call_extractquery(state, query, strategy, &raw);
 	nkeys = raw.nkeys;
 	keys = raw.keys;
@@ -770,6 +777,16 @@ lion_extract_query(LionState *state, Datum query, StrategyNumber strategy,
 			 * when it has NO key outside the query array, which the index
 			 * cannot tell - and ginqueryarrayextract() says so with
 			 * INCLUDE_EMPTY, so this is unreachable.  Fall back anyway.
+			 */
+			q->tree = NULL;
+			break;
+
+		case LION_STRAT_ARRAY_EQUAL:
+
+			/*
+			 * Array `=` is never exact from the keys: they say which
+			 * elements a row has, not how many, in what order or in what
+			 * shape.  Only the superset (below) answers it, rechecked.
 			 */
 			q->tree = NULL;
 			break;
@@ -1196,6 +1213,7 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 
 	memset(q, 0, sizeof(LionQuery));
 
+	strategy = LION_STRAT_CANONICAL(strategy);
 	lion_call_extractquery(state, query, strategy, &raw);
 
 	if (raw.searchMode == LION_SEARCH_MODE_LOSSY)
@@ -1219,6 +1237,18 @@ lion_extract_query_superset(LionState *state, Relation index, Datum query,
 
 	switch (strategy)
 	{
+		case LION_STRAT_ARRAY_EQUAL:
+
+			/*
+			 * `a = q` holds only where a has every element of q - the AND of
+			 * their sets, as for `@>` - and the recheck decides the rest:
+			 * the count of each element, the order, the dimensions and their
+			 * lower bounds.  A NULL element is left out of the AND, as array
+			 * equality matches NULL with NULL; an empty q is
+			 * ginqueryarrayextract()'s INCLUDE_EMPTY, every row, above.
+			 */
+			lossy = true;
+			/* FALLTHROUGH */
 		case LION_STRAT_CONTAINS:
 		case LION_STRAT_JSONB_CONTAINS:
 		case LION_STRAT_JSONB_EXISTS:
@@ -1494,8 +1524,25 @@ StaticAssertDecl(LION_LEXEME_KEY_KEEP > 0,
  * hashed key of a long one.  *ambiguous, when given, says whether the key is
  * LION_LEXEME_KEY_MAX bytes long, which a hashed one always is.
  */
+static text *lion_long_key(const char *lex, int len, bool chars);
+
 text *
 lion_lexeme_key(const char *lex, int len, bool *ambiguous)
+{
+	if (ambiguous != NULL)
+		*ambiguous = len >= LION_LEXEME_KEY_MAX;
+	if (len <= LION_LEXEME_KEY_MAX)
+		return cstring_to_text_with_len(lex, len);
+	return lion_long_key(lex, len, true);
+}
+
+/*
+ * The hashed key of lex[0 .. len), longer than LION_LEXEME_KEY_MAX: its first
+ * bytes - whole characters of the database's encoding when chars, as a text
+ * is cut, and any bytes for a bytea - then '#', then the SHA-256 in hex.
+ */
+static text *
+lion_long_key(const char *lex, int len, bool chars)
 {
 	static const char hexdigit[] = "0123456789abcdef";
 	pg_cryptohash_ctx *ctx;
@@ -1505,10 +1552,7 @@ lion_lexeme_key(const char *lex, int len, bool *ambiguous)
 	int			keep;
 	int			i;
 
-	if (ambiguous != NULL)
-		*ambiguous = len >= LION_LEXEME_KEY_MAX;
-	if (len <= LION_LEXEME_KEY_MAX)
-		return cstring_to_text_with_len(lex, len);
+	Assert(len > LION_LEXEME_KEY_MAX);
 
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (pg_cryptohash_init(ctx) < 0 ||
@@ -1521,7 +1565,8 @@ lion_lexeme_key(const char *lex, int len, bool *ambiguous)
 	key = (text *) palloc(VARHDRSZ + LION_LEXEME_KEY_MAX);
 	SET_VARSIZE(key, VARHDRSZ + LION_LEXEME_KEY_MAX);
 	p = VARDATA(key);
-	keep = pg_mbcliplen(lex, len, LION_LEXEME_KEY_KEEP);
+	keep = chars ? pg_mbcliplen(lex, len, LION_LEXEME_KEY_KEEP) :
+		LION_LEXEME_KEY_KEEP;
 	memcpy(p, lex, keep);
 	memset(p + keep, '#',
 		   LION_LEXEME_KEY_MAX - LION_LEXEME_KEY_HASH - keep);
@@ -1616,6 +1661,209 @@ lion_tsvector_extract_query(PG_FUNCTION_ARGS)
 			*searchMode = LION_SEARCH_MODE_LOSSY;
 	}
 	PG_RETURN_POINTER(keys);
+}
+
+/* ---------------------------------------------------------------------
+ * Long array elements (DESIGN.md §17, "Long elements")
+ * --------------------------------------------------------------------- */
+
+/*
+ * array_ops files a long element as tsvector_ops files a long lexeme: an
+ * element of more than LION_LEXEME_KEY_MAX bytes under lion_long_key(), and
+ * a query that names an element of LION_LEXEME_KEY_MAX bytes or more with
+ * LION_SEARCH_MODE_LOSSY, so that its rows are rechecked.  GIN takes an
+ * element of any length whose compressed index tuple fits, and so does this,
+ * for the element types it can do it for: those whose equality is equality of
+ * their bytes, so that a hash of the bytes is the same for two equal elements
+ * - text and varchar under a deterministic collation, and bytea.  A hashed key
+ * is made of the element's first bytes, '#' and hex digits, which no other
+ * value of these types equals unless it is spelled the same; and it is a
+ * valid value of the type, as the comparison and hash functions the
+ * directory calls on it require.  An element of any other type, too long
+ * even compressed, is an ERROR (lion_key_prepare()).
+ */
+static bool
+lion_array_hashes_type(Oid elemtype, Oid collation)
+{
+	Oid			base = getBaseType(elemtype);
+
+	if (base == BYTEAOID)
+		return true;
+	if (base != TEXTOID && base != VARCHAROID)
+		return false;
+	return !OidIsValid(collation) || get_collation_isdeterministic(collation);
+}
+
+PG_FUNCTION_INFO_V1(lion_array_extract_value);
+PG_FUNCTION_INFO_V1(lion_array_extract_query);
+
+/*
+ * lion_array_extract_value(anyarray, internal, internal) returns internal:
+ * ginarrayextract()'s keys, with each element too long to be a key replaced
+ * by its hashed key.
+ */
+Datum
+lion_array_extract_value(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
+	bool	  **nulls = (bool **) PG_GETARG_POINTER(2);
+	Datum	   *keys;
+	bool		chars;
+	int32		i;
+
+	keys = (Datum *) DatumGetPointer(DirectFunctionCall3Coll(ginarrayextract,
+															 PG_GET_COLLATION(),
+															 PointerGetDatum(array),
+															 PG_GETARG_DATUM(1),
+															 PG_GETARG_DATUM(2)));
+	if (keys == NULL ||
+		!lion_array_hashes_type(ARR_ELEMTYPE(array), PG_GET_COLLATION()))
+		PG_RETURN_POINTER(keys);
+	chars = getBaseType(ARR_ELEMTYPE(array)) != BYTEAOID;
+	for (i = 0; i < *nentries; i++)
+	{
+		struct varlena *v;
+
+		if (*nulls != NULL && (*nulls)[i])
+			continue;
+		v = (struct varlena *) DatumGetPointer(keys[i]);
+		if (VARSIZE_ANY_EXHDR(v) > LION_LEXEME_KEY_MAX)
+			keys[i] = PointerGetDatum(lion_long_key(VARDATA_ANY(v),
+													VARSIZE_ANY_EXHDR(v),
+													chars));
+	}
+	PG_RETURN_POINTER(keys);
+}
+
+/*
+ * lion_array_extract_query(anyarray, internal, int2, internal, internal,
+ * internal, internal) returns internal: ginqueryarrayextract()'s keys, with
+ * each long element replaced by its key, and LION_SEARCH_MODE_LOSSY where one
+ * of them is ambiguous and the query was to be answered from its keys.
+ */
+Datum
+lion_array_extract_query(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(0);
+	int32	   *nentries = (int32 *) PG_GETARG_POINTER(1);
+	bool	  **nulls = (bool **) PG_GETARG_POINTER(5);
+	int32	   *searchMode = (int32 *) PG_GETARG_POINTER(6);
+	Datum	   *keys;
+	bool		chars;
+	int32		i;
+
+	keys = (Datum *) DatumGetPointer(DirectFunctionCall7Coll(ginqueryarrayextract,
+															 PG_GET_COLLATION(),
+															 PointerGetDatum(array),
+															 PG_GETARG_DATUM(1),
+															 PG_GETARG_DATUM(2),
+															 PG_GETARG_DATUM(3),
+															 PG_GETARG_DATUM(4),
+															 PG_GETARG_DATUM(5),
+															 PG_GETARG_DATUM(6)));
+	if (keys == NULL ||
+		!lion_array_hashes_type(ARR_ELEMTYPE(array), PG_GET_COLLATION()))
+		PG_RETURN_POINTER(keys);
+	chars = getBaseType(ARR_ELEMTYPE(array)) != BYTEAOID;
+	for (i = 0; i < *nentries; i++)
+	{
+		struct varlena *v;
+
+		if (*nulls != NULL && (*nulls)[i])
+			continue;
+		v = (struct varlena *) DatumGetPointer(keys[i]);
+		if (VARSIZE_ANY_EXHDR(v) < LION_LEXEME_KEY_MAX)
+			continue;
+		if (VARSIZE_ANY_EXHDR(v) > LION_LEXEME_KEY_MAX)
+			keys[i] = PointerGetDatum(lion_long_key(VARDATA_ANY(v),
+													VARSIZE_ANY_EXHDR(v),
+													chars));
+		if (*searchMode == GIN_SEARCH_MODE_DEFAULT)
+			*searchMode = LION_SEARCH_MODE_LOSSY;
+	}
+	PG_RETURN_POINTER(keys);
+}
+
+/*
+ * Is key one that may stand for values other than itself: a key of
+ * LION_LEXEME_KEY_MAX bytes of a column whose long lexemes or elements are
+ * hashed (above)?
+ */
+bool
+lion_key_is_ambiguous(const LionState *state, Datum key)
+{
+	if (!state->multikey ||
+		!(state->extractvalue.fn_addr == lion_tsvector_extract_value ||
+		  (state->extractvalue.fn_addr == lion_array_extract_value &&
+		   lion_array_hashes_type(state->typid, state->collation))))
+		return false;
+	return toast_raw_datum_size(key) == VARHDRSZ + LION_LEXEME_KEY_MAX;
+}
+
+/*
+ * The distinct lexemes or elements of value, a tsvector or an array of a
+ * column lion_key_is_ambiguous() says key is ambiguous in, that are filed
+ * under key: the one spelled as key, and every longer one whose hashed key it
+ * is.  palloc'd in *values; their number is returned.
+ */
+int
+lion_ambiguous_values(LionState *state, Datum value, Datum key, Datum **values)
+{
+	bool		tsv = state->extractvalue.fn_addr == lion_tsvector_extract_value;
+	bool		chars = !tsv ? getBaseType(state->typid) != BYTEAOID : true;
+	struct varlena *k = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(key));
+	Datum	   *raw;
+	Datum	   *out;
+	int32		nraw = 0;
+	bool	   *nulls = NULL;
+	int			n = 0;
+	int			i;
+	int			j;
+
+	*values = NULL;
+	if (VARSIZE_ANY_EXHDR(k) != LION_LEXEME_KEY_MAX)
+		return 0;
+	raw = (Datum *) DatumGetPointer(DirectFunctionCall3Coll(tsv ? gin_extract_tsvector :
+															ginarrayextract,
+															state->collation,
+															value,
+															PointerGetDatum(&nraw),
+															PointerGetDatum(&nulls)));
+	if (raw == NULL || nraw <= 0)
+		return 0;
+	out = (Datum *) palloc(sizeof(Datum) * nraw);
+	for (i = 0; i < nraw; i++)
+	{
+		struct varlena *v;
+		const char *spelled;
+		int			len;
+		bool		dup = false;
+
+		if (nulls != NULL && nulls[i])
+			continue;
+		v = pg_detoast_datum_packed((struct varlena *) DatumGetPointer(raw[i]));
+		len = VARSIZE_ANY_EXHDR(v);
+		if (len < LION_LEXEME_KEY_MAX)
+			continue;
+		spelled = (len == LION_LEXEME_KEY_MAX) ? VARDATA_ANY(v) :
+			VARDATA(lion_long_key(VARDATA_ANY(v), len, chars));
+		if (memcmp(spelled, VARDATA_ANY(k), LION_LEXEME_KEY_MAX) != 0)
+			continue;
+
+		/* an array may repeat an element; a row holds it once */
+		for (j = 0; j < n && !dup; j++)
+		{
+			struct varlena *w = (struct varlena *) DatumGetPointer(out[j]);
+
+			dup = (int) VARSIZE_ANY_EXHDR(w) == len &&
+				memcmp(VARDATA_ANY(w), VARDATA_ANY(v), len) == 0;
+		}
+		if (!dup)
+			out[n++] = PointerGetDatum(v);
+	}
+	*values = out;
+	return n;
 }
 
 /*
