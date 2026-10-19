@@ -623,13 +623,17 @@ typedef struct LoGather
  * One scan key of a leaf, for the lazy set: its posting sets, located once
  * and let go of (no pin is held between rows, §30.5), the tree over them
  * (lion_scankey_sets()), and a stream of that tree's containers which is only
- * ever sought forward - started again when a probe is behind it.
+ * ever sought forward - started again when a probe is behind it.  A NEGATED
+ * key is `col IS NOT NULL`: its set is the column's NULL entry, taken away
+ * from what the leaf's other keys select (DESIGN.md §14, §30.4).
  */
 typedef struct LoProbeKey
 {
 	int			nsets;
 	LionPostingSet *sets;
-	LionKeyNode *tree;			/* NULL: the key selects nothing */
+	LionKeyNode *tree;			/* NULL: the key selects nothing - or, when
+								 * negated, takes nothing away */
+	bool		negated;
 	MemoryContext cxt;			/* the stream's */
 	LionSetStream *stream;		/* NULL until the first probe */
 	uint32		last;			/* the container key last sought */
@@ -1408,10 +1412,43 @@ lo_spill_cost(double setbytes)
 }
 
 /*
+ * The quals of a lion access its set leaves to the recheck: what the plain
+ * scan's source of each of its IndexPaths leaves (lion_path_rechecked_quals(),
+ * lion_amcost.c), through a BitmapAnd.  A BitmapOr's arms are not followed:
+ * what one of them leaves is no share of the OR's rows.
+ */
+static List *
+lo_rechecked_quals(PlannerInfo *root, Path *lion)
+{
+	List	   *quals = NIL;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+		return lion_path_rechecked_quals(root, (IndexPath *) lion);
+	if (IsA(lion, BitmapAndPath))
+	{
+		foreach(lc, ((BitmapAndPath *) lion)->bitmapquals)
+			quals = list_concat(quals,
+								lo_rechecked_quals(root, (Path *) lfirst(lc)));
+	}
+	return quals;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
  * members' heap I/O is only the share of pages not all-visible.
+ *
+ * A qual the set leaves to the recheck (lo_rechecked_quals()) makes it hold
+ * more than the members: the CANDIDATES, the rows of the quals it answers,
+ * each of which the walk meets is rechecked - from the heap tuple in heap
+ * mode, where every one is fetched, and in index-only mode when the btree
+ * does not return a column the lion qual reads (lo_plan_path()'s
+ * LO_FLAG_HEAPRECHECK), where every one is fetched too, all-visible or not:
+ * the recheck reads the tuple before the visibility map is asked.  Priced as
+ * the members it was, such a set chose an index-only walk that fetched a
+ * million heap rows to throw half of them away (§40.8).
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
@@ -1429,6 +1466,12 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		ncont;
 	double		walked;
 	double		fetched;
+	double		candidates;
+	double		heapfetched;
+	Selectivity candsel;
+	List	   *rechecked;
+	QualCost	rqcost;
+	bool		heaprecheck = false;
 	double		spc_random;
 	double		spc_seq;
 	double		max_io;
@@ -1440,7 +1483,32 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	Cost		run;
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
-	members = clamp_row_est(sel * tuples);
+
+	/* the set's members: the candidates, when it leaves quals to the recheck */
+	candsel = sel;
+	rechecked = lo_rechecked_quals(root, lion);
+	rqcost.startup = 0;
+	rqcost.per_tuple = 0;
+	if (rechecked != NIL)
+	{
+		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
+												  JOIN_INNER, NULL);
+
+		if (rsel > 0)
+			candsel = Min(sel / rsel, 1.0);
+		cost_qual_eval(&rqcost, lionqual, root);
+		if (indexonly)
+		{
+			Bitmapset  *lionattrs = NULL;
+			List	   *cols;
+
+			pull_varattnos((Node *) lionqual, rel->relid, &lionattrs);
+			heaprecheck = !bms_is_subset(lionattrs,
+										 lo_returned_attrs(ord->indexinfo,
+														   &cols));
+		}
+	}
+	members = clamp_row_est(candsel * tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
 	/* the lookups, the copy of their answer into the set, and its spill */
@@ -1510,6 +1578,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 			selwalk = Min(sel / both, 1.0);
 	}
 	fetched = clamp_row_est(walked * selwalk);
+	candidates = clamp_row_est(walked * Min(selwalk * candsel / sel, 1.0));
+	heapfetched = (!indexonly || heaprecheck) ? candidates : fetched;
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	{
 		Cost		s;
@@ -1520,10 +1590,10 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
 									   &ipages);
 	}
-	max_io = index_pages_fetched(fetched, rel->pages,
+	max_io = index_pages_fetched(heapfetched, rel->pages,
 								 (double) ord->indexinfo->pages, root);
-	pages_corr = ceil(Min(fetched, walked / tuples * pages));
-	if (indexonly)
+	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
+	if (indexonly && !heaprecheck)
 	{
 		/*
 		 * Only the pages the visibility map does not call all-visible are
@@ -1532,15 +1602,18 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		 */
 		max_io = ceil(max_io * (1.0 - rel->allvisfrac));
 		pages_corr = ceil(pages_corr * (1.0 - rel->allvisfrac));
-		run += fetched * cpu_operator_cost;
 	}
+	if (indexonly)
+		run += fetched * cpu_operator_cost;
 	max_io *= spc_random;
 	min_io = (pages_corr > 0) ? spc_random + (pages_corr - 1) * spc_seq : 0;
 	run += max_io + corr * corr * (min_io - max_io);
 
 	cost_qual_eval(&qcost, residual, root);
-	startup += qcost.startup + rel->reltarget->cost.startup;
-	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
+	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
+	run += heapfetched * cpu_tuple_cost +
+		candidates * rqcost.per_tuple +
+		fetched * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
@@ -4277,7 +4350,8 @@ lo_build_set(LionOrderedState *st)
 
 /*
  * Can every key of every leaf be sought in: a set tree - an equality or a
- * list - on a scalar column?  A range is a walk of entries, and a multi-key
+ * list - on a scalar column, or `IS NOT NULL` beside one, its column's NULL
+ * entry taken away from it?  A range is a walk of entries, and a multi-key
  * column's query may need every row; those leaves are only ever built.
  */
 static bool
@@ -4291,6 +4365,7 @@ lo_lazy_ok(LionOrderedState *st)
 	for (i = 0; i < st->nleaves; i++)
 	{
 		LoLeaf	   *leaf = &st->leaves[i];
+		bool		positive = false;
 
 		if (leaf->nkeys == 0)
 			return false;
@@ -4300,11 +4375,17 @@ lo_lazy_ok(LionOrderedState *st)
 			LionState  *col = lion_index_column_state(leaf->index,
 													  sk->sk_attno);
 
+			if ((sk->sk_flags & (SK_SEARCHNOTNULL | SK_ROW_HEADER)) ==
+				SK_SEARCHNOTNULL)
+				continue;		/* any column's: its NULL entry, subtracted */
 			if (col->multikey || sk->sk_strategy != LION_STRAT_EQUAL ||
 				(sk->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
 								 SK_ROW_HEADER)) != 0)
 				return false;
+			positive = true;
 		}
+		if (!positive)
+			return false;		/* nothing to take a NULL entry away from */
 	}
 	return true;
 }
@@ -4356,7 +4437,8 @@ lo_lazy_empty(LoNode *node)
 	{
 		for (i = 0; i < node->leaf->nkeys; i++)
 		{
-			if (node->leaf->pkeys[i].tree == NULL)
+			if (node->leaf->pkeys[i].tree == NULL &&
+				!node->leaf->pkeys[i].negated)
 				return true;
 		}
 		return false;
@@ -4388,15 +4470,20 @@ lo_lazy_members(LoNode *node)
 
 	if (node->kind == LO_NODE_LEAF)
 	{
+		bool		first = true;
+
 		for (i = 0; i < node->leaf->nkeys; i++)
 		{
 			LoProbeKey *pk = &node->leaf->pkeys[i];
 			double		m = 0.0;
 
+			if (pk->negated)
+				continue;		/* it only takes members away */
 			if (pk->tree != NULL)
 				for (s = 0; s < pk->nsets; s++)
 					m += (double) pk->sets[s].ntids;
-			n = (i == 0) ? m : Min(n, m);
+			n = first ? m : Min(n, m);
+			first = false;
 		}
 		return n;
 	}
@@ -4456,8 +4543,36 @@ lo_lazy_begin(LionOrderedState *st)
 					return false;
 				}
 			}
-			ok = lion_scankey_sets(leaf->index, sk, &pk->nsets, &pk->sets,
-								   &pk->tree, &nomatch);
+			if ((sk->sk_flags & SK_SEARCHNOTNULL) != 0)
+			{
+				bool		implied = false;
+				int			o;
+
+				/*
+				 * Its column's NULL entry, to take away (lo_probe_node()) -
+				 * unless an equality of its column is beside it, which never
+				 * selects a NULL (lo_lazy_ok(): every other key of the leaf is
+				 * one), and there is nothing to take away.
+				 */
+				for (o = 0; o < leaf->nkeys && !implied; o++)
+					implied = (o != k &&
+							   leaf->keys[o].sk_attno == sk->sk_attno &&
+							   (leaf->keys[o].sk_flags & SK_SEARCHNOTNULL) == 0);
+				pk->negated = true;
+				pk->nsets = 1;
+				pk->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+				if (!implied &&
+					lion_posting_set_lookup_null_col(leaf->index,
+													 sk->sk_attno,
+													 &pk->sets[0]))
+					pk->tree = lion_keynode_leaf(0);
+				else
+					pk->tree = NULL;
+				ok = true;
+			}
+			else
+				ok = lion_scankey_sets(leaf->index, sk, &pk->nsets, &pk->sets,
+									   &pk->tree, &nomatch);
 			for (s = 0; s < pk->nsets; s++)
 			{
 				lion_posting_set_unpin(&pk->sets[s]);
@@ -4549,11 +4664,15 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 	{
 		LoLeaf	   *leaf = node->leaf;
 
+		/* the keys that select, ANDed ... */
 		for (i = 0; i < leaf->nkeys; i++)
 		{
-			const LionContainer *c = lo_probe_at(st, &leaf->pkeys[i], ckey);
+			const LionContainer *c;
 			LionContainer *r;
 
+			if (leaf->pkeys[i].negated)
+				continue;
+			c = lo_probe_at(st, &leaf->pkeys[i], ckey);
 			if (c == NULL)
 				return NULL;
 			if (acc == NULL)
@@ -4564,6 +4683,25 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 			r = (LionContainer *) MemoryContextAlloc(st->probecxt,
 													 LION_CONTAINER_MAX_SIZE);
 			if (lion_container_and(acc, c, r) == 0)
+				return NULL;
+			acc = r;
+		}
+		Assert(acc != NULL);	/* lo_lazy_ok(): a leaf has one */
+
+		/* ... less the NULL entries of its `IS NOT NULL` keys */
+		for (i = 0; i < leaf->nkeys; i++)
+		{
+			const LionContainer *c;
+			LionContainer *r;
+
+			if (!leaf->pkeys[i].negated)
+				continue;
+			c = lo_probe_at(st, &leaf->pkeys[i], ckey);
+			if (c == NULL)
+				continue;		/* nothing to take away at this key */
+			r = (LionContainer *) MemoryContextAlloc(st->probecxt,
+													 LION_CONTAINER_MAX_SIZE);
+			if (lion_container_andnot(acc, c, r) == 0)
 				return NULL;
 			acc = r;
 		}

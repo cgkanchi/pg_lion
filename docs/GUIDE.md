@@ -395,7 +395,10 @@ multi-key column (`tags @> ...`), a column behind a high-cardinality key, ANDs a
 independent indexes. The B-tree must hold, as key or `INCLUDE` columns, every column the query
 reads - its target and the `WHERE` clauses the node still tests itself - but not the Lion-filtered
 columns: a set that turns out inexact at run time is rechecked on the heap tuple, fetched for that
-alone (`Heap Fetches` counts those too).
+alone (`Heap Fetches` counts those too). A set is inexact when the query has a condition Lion can
+only bound (`tags <@ ...`, a phrase query): `Lion Set: ..., rechecked` in `EXPLAIN ANALYZE`.
+`col IS NULL` and `col IS NOT NULL` never make it so - beside any other condition the column's
+NULL rows are taken out of the set, or kept, exactly (DESIGN.md §14).
 
 ```sql
 CREATE INDEX docs_created_cov ON docs (created_at) INCLUDE (id, title);

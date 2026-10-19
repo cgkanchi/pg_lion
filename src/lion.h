@@ -1197,9 +1197,13 @@ typedef enum LionKeyNodeKind
 	LION_KN_KEY = 0,
 	LION_KN_AND,
 	LION_KN_OR,
-	LION_KN_POSFILTER			/* its one child's members, those of them a
+	LION_KN_POSFILTER,			/* its one child's members, those of them a
 								 * tsquery matches by the stored positions
 								 * (lion_posfilter.c); the count's only */
+	LION_KN_ANDNOT				/* its first child's members less every other
+								 * child's: `col IS NOT NULL` beside other
+								 * quals, the column's NULL entry subtracted
+								 * (DESIGN.md §14, §29.2); the scans' only */
 } LionKeyNodeKind;
 
 /*

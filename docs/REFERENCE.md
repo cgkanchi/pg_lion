@@ -851,7 +851,11 @@ a walk from switching at all.
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
-scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
+scans and plain index scans (`amgettuple`, DESIGN.md §29). `col IS NULL` and `col IS NOT NULL` are
+answered exactly beside any of them, in these scans and in the sets of `LionOrdered` and
+`LionBtreeScan`: `IS NOT NULL` takes the column's NULL rows out of what the other conditions select
+(an empty array, tsvector or jsonb is not NULL), and leaves nothing to the heap recheck (DESIGN.md
+§14). There are no ordered scans of the
 access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
 lion index's own ordered column walked, §30), no index-only scans of a lion index
 that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
