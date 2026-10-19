@@ -35,7 +35,7 @@
 #define LION_PAGE_META		0x0001
 #define LION_PAGE_BUCKET		0x0002	/* directory LEAF page (DESIGN.md §21) */
 #define LION_PAGE_CONTAINER	0x0004
-#define LION_PAGE_DELETED	0x0008	/* freed container page, DESIGN.md §18 */
+#define LION_PAGE_DELETED	0x0008	/* freed page, DESIGN.md §18 and §21 */
 #define LION_PAGE_DIR		0x0010	/* directory INTERNAL page (§21) */
 #define LION_PAGE_ROOT		0x0020	/* ... and it is the current root (§21) */
 #define LION_PAGE_INCOMPLETE_SPLIT 0x0040	/* its right sibling has no
@@ -43,6 +43,9 @@
 #define LION_PAGE_POSITIONS	0x0080	/* a CONTAINER page of a key's position
 									 * tree, holding position chunks
 									 * (lion_positions.h), never containers */
+#define LION_PAGE_HALF_DEAD	0x0100	/* an emptied directory LEAF whose
+									 * downlink is gone and which is being
+									 * unlinked (§21, "Page deletion") */
 
 /* The three page KINDS; exactly one of them is set on every page. */
 #define LION_PAGE_KINDS \
@@ -69,7 +72,12 @@
  * entry in hand, and what verify() uses to prove a chain belongs to its key.
  *
  * Directory and meta pages leave both at their empty values (0 and
- * InvalidBlockNumber).
+ * InvalidBlockNumber), with two exceptions that page deletion makes
+ * (DESIGN.md §21, "Page deletion"): a HALF_DEAD leaf keeps in owner_head the
+ * next page of its subtree to unlink (InvalidBlockNumber: the leaf itself),
+ * and a DELETED directory page keeps its safexid in minckey (the low half)
+ * and maxckey (the high half), since its body still holds the high key every
+ * reader that lands on it reads (lion_dir_page_safexid()).
  *
  * `level` and `leftlink` belong to the entry directory (DESIGN.md §21): the
  * leaves are level 0 and the root is level `height`, and every directory page
@@ -110,6 +118,7 @@ typedef LionPageOpaqueData *LionPageOpaque;
 #define LionPageIsDir(page)		((LionPageGetOpaque(page)->flags & LION_PAGE_DIR) != 0)
 #define LionPageIsLeaf(page)		LionPageIsBucket(page)
 #define LionPageIsRoot(page)		((LionPageGetOpaque(page)->flags & LION_PAGE_ROOT) != 0)
+#define LionPageIsHalfDead(page)	((LionPageGetOpaque(page)->flags & LION_PAGE_HALF_DEAD) != 0)
 #define LionPageIncompleteSplit(page) \
 	((LionPageGetOpaque(page)->flags & LION_PAGE_INCOMPLETE_SPLIT) != 0)
 #define LionPageIsRightmost(page) \
@@ -132,9 +141,11 @@ StaticAssertDecl(MAXALIGN(LION_CONTAINER_MAX_SIZE) + sizeof(ItemIdData) <= LION_
 				 "pg_lion: a BITSET container does not fit on a page of this BLCKSZ");
 
 /*
- * The body of a DELETED page: the transaction id from which on no scan can
- * still hold a link to it, exactly as nbtree's BTDeletedPageData (see
+ * The body of a DELETED container page: the transaction id from which on no
+ * scan can still hold a link to it, exactly as nbtree's BTDeletedPageData (see
  * BTPageIsRecyclable() in access/nbtree.h).  Nothing else is left on the page.
+ * A DELETED directory page keeps its safexid in the special area instead
+ * (above).
  */
 typedef struct LionDeletedPageData
 {
@@ -1658,8 +1669,9 @@ typedef struct LionDirParent
  * page it went through in *parent - and starts there, instead of at the root,
  * when parent->blk is valid.  The caller vouches that sk does not sort below
  * any key that page had when it was recorded: a page's lower bound never
- * moves, so sk's leaf is below it or below a page to its right, which the
- * descent moves right to as it always does.
+ * rises, and a page deleted since passes its range to the right (DESIGN.md
+ * §21, "Page deletion"), so sk's leaf is below it or below a page to its
+ * right, which the descent moves right to as it always does.
  */
 extern Buffer lion_dir_search_from(Relation index, LionIndexState *ix,
 								   const LionSearchKey *sk,
@@ -1731,6 +1743,44 @@ extern void lion_dir_place(Relation index, Relation heaprel, LionIndexState *ix,
 /* Delete the items at the given ascending offsets in one record. */
 extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
 						   int noffs);
+
+/*
+ * Page deletion (lion_dir_delete.c, DESIGN.md §21, "Page deletion").
+ *
+ * lion_dir_delete_page() is VACUUM's last step on the directory leaf leafblk:
+ * when the leaf is empty it takes it out of the tree - with the internal pages
+ * above it that have no other child - or it finishes doing so for a leaf an
+ * earlier VACUUM left HALF_DEAD.  Nothing may be held on entry, and the
+ * return value is the number of pages it marked DELETED.
+ *
+ * lion_dir_past_deleted() hands back buf, a directory page locked in
+ * lockmode, or - when that page is DELETED - the first page to its right that
+ * is not, for the walks that take a downlink without comparing a key with the
+ * page's high key.
+ */
+extern int	lion_dir_delete_page(Relation index, LionIndexState *ix,
+								 BlockNumber leafblk);
+extern Buffer lion_dir_past_deleted(Relation index, Buffer buf, int lockmode);
+
+/* The safexid a DELETED directory page keeps in its special area. */
+static inline FullTransactionId
+lion_dir_page_safexid(Page page)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+
+	return FullTransactionIdFromU64(((uint64) opaque->maxckey << 32) |
+									(uint64) opaque->minckey);
+}
+
+static inline void
+lion_dir_page_set_safexid(Page page, FullTransactionId safexid)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+	uint64		x = U64FromFullTransactionId(safexid);
+
+	opaque->minckey = (uint32) x;
+	opaque->maxckey = (uint32) (x >> 32);
+}
 
 /*
  * Build an entry tuple in palloc'd memory; *size receives its total length.

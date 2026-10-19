@@ -1597,7 +1597,10 @@ lion_lookup_walk_restart(LionLookupWalk *walk)
  *	  to a page on its right, and the walk moves right as a descent does;
  *	- at or above it, while the keys have been close: the leaf that was its
  *	  right sibling.  That page's lower bound was the high key just passed, and
- *	  a lower bound never moves, so the key is there or further right - even if
+ *	  a lower bound never rises - a page deletion lowers it, and a page that
+ *	  is deleted itself passes its range to the right, which a move right
+ *	  follows (DESIGN.md §21, "Page deletion") - so the key is there or
+ *	  further right - even if
  *	  the last leaf has split and has a new right sibling in between, which then
  *	  holds only keys below that bound.  At most maxsteps pages further right;
  *	- otherwise, or past those: a descent from the root.  A descent that lands

@@ -14,7 +14,8 @@
  *	  left to right from the leftmost one, then each posting tree top-down
  *	  from its ROOT to its leftmost leaf and then its leaves left to right).
  *	  Internal directory pages are NOT cleanup-locked, and need not be: they
- *	  hold no TIDs and a directory page never changes level, so no reader can
+ *	  hold no TIDs and a directory page never changes level while a reader can
+ *	  hold a link to it (DESIGN.md §21, "Page deletion"), so no reader can
  *	  be holding a container copy that came from one (DESIGN.md §11, §21).
  *	  The pages of a posting tree's descent ARE, because a posting set's root
  *	  is a leaf while the set has no internal level and stops being one when
@@ -1652,6 +1653,25 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 
 	ReleaseBuffer(buf);
 
+	/*
+	 * A leaf left with no entry at all leaves the directory (DESIGN.md §21,
+	 * "Page deletion"), and one an earlier VACUUM left HALF_DEAD is finished.
+	 * Its right link, which the walk continues at, is the one it had: a
+	 * deleted page keeps it.  The pages go to the free space map in the sweep
+	 * at the end, which finds them DELETED and unvisited.
+	 */
+	if (lion_vac_may_write(vs->index))
+	{
+		int			ndeleted = lion_dir_delete_page(vs->index, vs->ix, blk);
+
+		if (ndeleted > 0)
+		{
+			vs->pages_newly_deleted += ndeleted;
+			if (blk < vs->nblocks)
+				vs->visited[blk / 8] &= (uint8) ~(1 << (blk % 8));
+		}
+	}
+
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(vs->bucketcxt);
 }
@@ -2807,12 +2827,17 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
 				LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
-				!LionPageIsContainer(page))
+				(!LionPageIsContainer(page) && !LionPageIsDeleted(page)))
 			{
 				UnlockReleaseBuffer(buf);
 				continue;		/* not ours to reason about */
 			}
 
+			/*
+			 * A DELETED page: a container page a free left behind, or a
+			 * directory page deletion unlinked (DESIGN.md §21), which no walk
+			 * reaches either.
+			 */
 			if (LionPageIsDeleted(page))
 			{
 				bool		reusable = lion_vac_page_reusable(vs, page);

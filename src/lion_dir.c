@@ -150,8 +150,9 @@ lion_dir_check_page(Relation index, Page page, BlockNumber blk)
  * A page reached through a link is at the level the link promises: a
  * downlink's child one below the page that holds it, a right sibling at the
  * page's own.  A directory page never changes level (DESIGN.md §21: a root
- * split keeps the old root as the left half, at its level) and is never
- * freed, so anything else is a link to the wrong page - and a downlink to the
+ * split keeps the old root as the left half, at its level), and a DELETED one
+ * keeps its level until no scan can hold a link to it any more (§21, "Page
+ * deletion"), so anything else is a link to the wrong page - and a downlink to the
  * page itself or to one above it would send a descent round for ever.
  * `expected` is an int because a leaf's children would be at level -1.
  */
@@ -246,10 +247,12 @@ lion_dir_step_right(Relation index, Buffer buf, int lockmode,
 /*
  * A leaf a reader remembered by its block number, read and locked SHARE again
  * (DESIGN.md §27, "Lookups in key order").  A directory page never changes
- * level and is never freed, and a split moves keys only rightwards, so the
+ * level, is not reused while the reader's snapshot lasts (§21, "Page
+ * deletion"), and a split or a deletion moves keys only rightwards, so the
  * page is still a leaf and still holds every key at or above the lower bound
  * it had when it was remembered - or has passed it to a page on its right,
- * which the caller reaches by moving right as a descent does.  The caller
+ * which the caller reaches by moving right as a descent does: a DELETED or
+ * HALF_DEAD leaf's high key is MINUS INFINITY.  The caller
  * holds no content lock, so interrupts are checked first, with none held.
  */
 Buffer
@@ -486,12 +489,15 @@ lion_page_downlink(Page page, const LionSearchKey *sk)
 	OffsetNumber off = lion_page_binsrch_ext(page, sk, true);
 
 	/*
-	 * Normally the leftmost downlink of a page compares below every key - the
-	 * leftmost page of a level carries a MINUSINF one, and every other page's
-	 * first separator is its own lower bound, so a descent that reached it has
-	 * a key at or above that separator.  Taking the leftmost child when that
-	 * somehow does not hold is conservative rather than wrong: the search then
-	 * lands left of its key and the move-right rule walks to it.
+	 * The leftmost downlink of a page stands for the page's lower bound,
+	 * whatever key it carries: the leftmost page of a level carries a
+	 * MINUSINF one, and every other page's first separator was its lower
+	 * bound when it was made - a page deletion can lower the bound since
+	 * (DESIGN.md §21, "Page deletion"), never raise it.  Every key a descent
+	 * brings here that sorts below the second separator belongs to the first
+	 * child, and the binary search, which may compare that key with the
+	 * first separator only once the second sorts above it, answers the first
+	 * child for it either way.
 	 */
 	if (off <= first)
 		return first;
@@ -635,6 +641,8 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
+		/* the first downlink was taken without a key: §21, "Page deletion" */
+		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
 	}
 }
 
@@ -690,7 +698,10 @@ lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
 
 	if (parent != NULL && BlockNumberIsValid(parent->blk))
 	{
-		/* below the root: a level-1 page, which no page ever stops being */
+		/*
+		 * below the root: a level-1 page, which it stays while the reader's
+		 * snapshot lasts, DELETED or not (DESIGN.md §21, "Page deletion")
+		 */
 		BlockNumber start = parent->blk;
 
 		buf = lion_dir_readbuf(index, start);
@@ -1312,51 +1323,118 @@ lion_dir_value_end(Relation index, LionState *col, OffsetNumber *offp)
  * or when the sibling could not be found in `maxsteps` pages.
  *
  * The left link names the page that was left of this one when it was last
- * set, and that page may have split since: a split only moves entries right,
- * onto a new page linked immediately right of the one it splits, and no
- * directory page is ever unlinked (DESIGN.md §21), so the page now left of
- * this one is reached by walking right from the one the link names until a
- * page's right link is this page - nbtree's _bt_walk_left() without page
- * deletion.  The walk is bounded by maxsteps for a caller that only estimates
- * and can give up, and for every caller by the size of the index, like any
- * walk right (lion.h); nothing is held between the two pages, as in
- * lion_dir_step_right().
+ * set, and that page may have split since - a split only moves entries right,
+ * onto a new page linked immediately right of the one it splits - or been
+ * deleted (DESIGN.md §21, "Page deletion").  So this is nbtree's
+ * _bt_walk_left(): walk right from the page the link names until a page that
+ * is not DELETED has this page as its right link.  After a few pages without
+ * it, or at a DELETED page that links to this one, this page is read again:
+ * its left link has changed by then, and the walk starts over from the new
+ * one; or this page has itself been deleted, and the walk steps left from the
+ * first page to its right that is not, which took its key range over.  A
+ * left link that has not changed is walked from without the few-pages bound.
+ * InvalidBuffer means there is no page left of this one (any more), or that
+ * maxsteps pages were walked, a bound for a caller that only estimates and
+ * can give up; a sibling that a walk to the right end of the level does not
+ * find is damage, and an ERROR.  Every walk is also bounded by the size of
+ * the index, like any walk right (lion.h); nothing is held between two pages,
+ * as in lion_dir_step_right().
  */
+#define LION_STEP_LEFT_RECHECK	4
+
+static void
+lion_dir_no_left_sibling(Relation index, BlockNumber blk)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": no left sibling of directory page %u",
+					RelationGetRelationName(index), blk),
+			 errhint("REINDEX the index.")));
+}
+
 Buffer
 lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 {
-	Page		page = BufferGetPage(buf);
-	BlockNumber cur = BufferGetBlockNumber(buf);
-	BlockNumber left = LionPageGetOpaque(page)->leftlink;
-	int			level = LionPageGetOpaque(page)->level;
-	Buffer		lbuf;
-	int			steps;
-	LionRightWalk walk;
+	int			level = LionPageGetOpaque(BufferGetPage(buf))->level;
+	int			steps = 0;
+	bool		bounded = true;
 
-	UnlockReleaseBuffer(buf);
-	if (!BlockNumberIsValid(left) || left == cur)
-		return InvalidBuffer;
-
-	CHECK_FOR_INTERRUPTS();
-	lbuf = lion_dir_readbuf(index, left);
-	LockBuffer(lbuf, BUFFER_LOCK_SHARE);
-	lion_dir_check_page(index, BufferGetPage(lbuf), left);
-	lion_dir_check_level(index, BufferGetPage(lbuf), left, level);
-
-	lion_rightwalk_init(&walk);
-	for (steps = 0;; steps++)
+	for (;;)
 	{
-		Page		lpage = BufferGetPage(lbuf);
+		Page		page;
+		BlockNumber cur;
+		BlockNumber left;
+		Buffer		lbuf;
+		int			tries;
+		bool		linked = false;
+		LionRightWalk walk;
 
-		if (LionPageGetOpaque(lpage)->rightlink == cur)
-			return lbuf;
-		if (LionPageIsRightmost(lpage) || steps >= maxsteps)
-			break;
-		lbuf = lion_dir_step_right(index, lbuf, BUFFER_LOCK_SHARE, &walk);
+		/* a page deleted under the walk: its range went right */
+		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		cur = BufferGetBlockNumber(buf);
+		left = LionPageGetOpaque(page)->leftlink;
+		UnlockReleaseBuffer(buf);
+		if (!BlockNumberIsValid(left) || left == cur)
+			return InvalidBuffer;
+
+		CHECK_FOR_INTERRUPTS();
+		lbuf = lion_dir_readbuf(index, left);
+		LockBuffer(lbuf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(lbuf), left);
+		lion_dir_check_level(index, BufferGetPage(lbuf), left, level);
+
+		lion_rightwalk_init(&walk);
+		for (tries = 0;; tries++)
+		{
+			Page		lpage = BufferGetPage(lbuf);
+
+			if (LionPageGetOpaque(lpage)->rightlink == cur)
+			{
+				if (!LionPageIsDeleted(lpage))
+					return lbuf;
+				linked = true;
+				break;
+			}
+			if (LionPageIsRightmost(lpage))
+			{
+				if (!bounded)
+				{
+					UnlockReleaseBuffer(lbuf);
+					lion_dir_no_left_sibling(index, cur);
+				}
+				break;
+			}
+			if (steps >= maxsteps)
+			{
+				UnlockReleaseBuffer(lbuf);
+				return InvalidBuffer;
+			}
+			if (bounded && tries >= LION_STEP_LEFT_RECHECK)
+				break;
+			lbuf = lion_dir_step_right(index, lbuf, BUFFER_LOCK_SHARE, &walk);
+			steps++;
+		}
+		UnlockReleaseBuffer(lbuf);
+
+		/* This page again: deleted, or linked to a new left sibling? */
+		CHECK_FOR_INTERRUPTS();
+		buf = lion_dir_readbuf(index, cur);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(buf), cur);
+		lion_dir_check_level(index, BufferGetPage(buf), cur, level);
+		page = BufferGetPage(buf);
+		if (!LionPageIsDeleted(page) &&
+			LionPageGetOpaque(page)->leftlink == left)
+		{
+			if (linked || !bounded)
+			{
+				UnlockReleaseBuffer(buf);
+				lion_dir_no_left_sibling(index, cur);
+			}
+			bounded = false;
+		}
 	}
-
-	UnlockReleaseBuffer(lbuf);
-	return InvalidBuffer;
 }
 
 /* ---------------------------------------------------------------------
@@ -1932,6 +2010,27 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 }
 
 /*
+ * Where an item with key sk goes on page.  On an internal page that is never
+ * in front of the first downlink, which stands for the page's lower bound
+ * whatever key it carries: a page deletion lowers the bound of the page right
+ * of the one it takes out, and the key then sorts above separators that came
+ * after it (DESIGN.md §21, "Page deletion").  A binary search would put such
+ * a separator before it, and send the keys between the bound and that
+ * separator to the wrong child.
+ */
+static OffsetNumber
+lion_dir_place_off(Page page, const LionSearchKey *sk)
+{
+	OffsetNumber off = lion_dir_binsrch(page, sk);
+	OffsetNumber first = lion_page_first_data(page);
+
+	if (!LionPageIsLeaf(page) && off <= first &&
+		first <= PageGetMaxOffsetNumber(page))
+		off = OffsetNumberNext(first);
+	return off;
+}
+
+/*
  * Place an item again after the page it belonged on was split without it.
  *
  * buf is the LEFT half, held EXCLUSIVE, and stays so; the item goes there or
@@ -1965,14 +2064,14 @@ lion_dir_place_again(Relation index, Relation heaprel, LionIndexState *ix,
 		lion_dir_check_page(index, BufferGetPage(rbuf), next);
 		lion_dir_check_level(index, BufferGetPage(rbuf), next,
 							 LionPageGetOpaque(page)->level);
-		roff = lion_dir_binsrch(BufferGetPage(rbuf), &sk);
+		roff = lion_dir_place_off(BufferGetPage(rbuf), &sk);
 		lion_dir_place(index, heaprel, ix, rbuf, roff, replace, item, size);
 		UnlockReleaseBuffer(rbuf);
 		return;
 	}
 
 	lion_dir_place(index, heaprel, ix, buf,
-				   lion_dir_binsrch(page, &sk), replace, item, size);
+				   lion_dir_place_off(page, &sk), replace, item, size);
 }
 
 /*
@@ -2157,6 +2256,8 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
+		if (sk == NULL)
+			buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
 	}
 
 	/*

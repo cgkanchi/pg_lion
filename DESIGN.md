@@ -3162,9 +3162,10 @@ order, and VACUUM still walks exactly that list — it only has to DESCEND to th
 instead of starting at the entry's `head`, which is the tree's root.
 
 **Internal DIRECTORY pages are not cleanup-locked, and need not be** (§21): they hold downlinks and
-separator keys and no TIDs at all, and a directory page never changes level - a root split keeps
-the old root as the left half at its own level - so no reader can be holding a container copy that
-came from one. The directory leaves are exactly the pages that used to be bucket pages, and VACUUM
+separator keys and no TIDs at all, and a directory page never changes level while a scan can hold a
+link to it - a root split keeps the old root as the left half at its own level, and a deleted page
+is reused only once no scan can (§21, "Page deletion") - so no reader can be holding a container
+copy that came from one. The directory leaves are exactly the pages that used to be bucket pages, and VACUUM
 treats them the same way. **A posting tree's descent IS cleanup-locked, root first** (§22, and a
 deviation from this section's first version, which said internal posting pages "need not be"
 either): a posting set's root is a LEAF for as long as the set fits one page, a reader that copied
@@ -6696,8 +6697,8 @@ Readers, below, for how a LIST of cross-type values is sorted.)*
   `PageIndexTupleDeleteNoCompact` of §18 existed to keep entry offsets stable for readers parked on
   a page; a sorted directory cannot offer that anyway - an insert in the middle of a leaf shifts
   every offset after it - so the readers changed instead, below, and the compaction reclaims the line
-  pointers.)* An empty leaf is NOT unlinked in this version (leaf deletion needs nbtree's half-dead
-  protocol; documented limitation, and the pages are few).
+  pointers.)* A leaf VACUUM empties is then taken out of the tree, and its page used again ("Page
+  deletion", below).
 - **Ordered iteration**: leftmost leaf, then right links, SHARE lock one page at a time, pin held
   while an INLINE set from that page is being counted exactly as the bucket walk did.
 
@@ -6892,8 +6893,9 @@ reads and at the cost of a comparison each, only what it would otherwise follow 
   page with no data items made `lion_page_downlink()` answer one past maxoff, and the descent read a
   line pointer past pd_lower;
 - a page reached through a downlink is exactly one level below the page holding it, and a right
-  sibling is at the page's own level (`lion_dir_check_level()`). A directory page never changes level
-  and is never freed, so this is exact rather than a heuristic, and it is what makes a descent
+  sibling is at the page's own level (`lion_dir_check_level()`). A directory page keeps its level
+  until it is reused, which waits until no scan can hold a link to it ("Page deletion", below), so
+  this is exact rather than a heuristic, and it is what makes a descent
   terminate: a downlink to the page itself, or to one above it, used to send it round for ever;
 - a non-rightmost page has the high key every reader takes as its first item without looking;
 - the parent's right sibling that `lion_dir_downlink_present()` reads during a split repair is a
@@ -6987,6 +6989,84 @@ when the relcache reads it back. `max_bucket_pages`, `nbuckets` and `bucket_page
 §17 cardinality guard's insert-side estimate becomes "the entries on this leaf times the number of
 leaves" instead of "the entries in this bucket times the bucket count"; both are crude by design.
 
+### Page deletion
+
+VACUUM takes a directory leaf it has emptied out of the tree, together with the internal pages
+above it that have no other child, and the pages are used again: a table whose oldest rows are
+deleted settles at a steady size, and a walk to the low end of a column reads live keys rather than
+a chain of empty leaves. The protocol is nbtree's (`_bt_pagedel()`), in `lion_dir_delete.c`;
+`lion_vacuum_leaf_page()` calls it on each leaf it has finished with.
+
+**What goes.** A leaf with no items but its high key that is neither the root nor the rightmost
+leaf, and is not flagged INCOMPLETE_SPLIT. With it go the pages above it that have one downlink,
+up to the highest such page, the TOP of the subtree that goes. The subtree's downlink must not be
+the last on its parent, and the downlink after it must name the top's right sibling; otherwise the
+leaf stays, empty and linked, for a later VACUUM. The root and the rightmost page of every level are
+never deleted, so the directory never loses a level.
+
+**Stage 1**, one record holding the parent and the leaf. The subtree's downlink is pointed at the
+top's right sibling, and the downlink after it, that sibling's own, is deleted: the right sibling
+takes the subtree's range over, and its lower bound moves down to the subtree's. The leaf is marked
+`LION_PAGE_HALF_DEAD` and rewritten to hold a single MINUS INFINITY high key, and its `owner_head`
+names the top, the next page to unlink (InvalidBlockNumber when the leaf is the whole subtree).
+
+**Stage 2**, one record per page, the top first and the leaf last. The page is unlinked from its
+left and right siblings and marked `LION_PAGE_DELETED`. It keeps its kind, level and links and a
+single MINUS INFINITY high key, and holds its `safexid`, `ReadNextFullTransactionId()` at that
+moment, in `minckey` (low half) and `maxckey` (high half). When it was the leftmost page of an
+internal level, its right sibling's first downlink becomes MINUS INFINITY in the same record. The
+leaf's `owner_head` moves down to the next page. A META record then lowers `dirpages` by the pages
+that went: the meta page comes after the parent in a split's lock order, so it is not in the
+records above.
+
+**Readers** need almost nothing new, because every page that leaves the tree has a MINUS INFINITY
+high key: a descent that reaches it through a downlink it read before, or a walk through a link it
+read before, moves right, to the page that took its range over. The descents that follow a downlink
+without comparing a key - to the leftmost page of a level - step past DELETED pages by hand
+(`lion_dir_past_deleted()`), and the walk to the left (`lion_dir_step_left()`, nbtree's
+`_bt_walk_left()`) skips them and takes the page whose right link names the page it came from.
+
+**The first downlink** of an internal page stands for the page's lower bound, whatever key it
+carries. That key is the bound the page had when the downlink was made, and stage 1 lowers the
+bound of the page right of a subtree: the key is at or above the bound, and the separators added
+after it, and its child's keys, may sort below it. The binary search answers the first child for
+every key below the second separator either way, and no separator is ever placed in front of the
+first downlink (`lion_dir_place_off()`). verify() compares what follows the first downlink, and the
+first child, with the bound - the left neighbour's high key - and the first downlink's key only with
+that bound.
+
+**Reuse.** VACUUM's sweep hands a DELETED directory page to the free space map, and
+`lion_alloc_page()` takes it once its `safexid` is older than every snapshot, nbtree's rule: a scan
+that can still hold a link to the page began before the page was unlinked. Every reader that keeps
+a block number across pages - the ordered walks (§30), the lookups in key order (§27), a paused
+walk of §29 - holds a snapshot while it does. Taking such a page first writes a recovery conflict
+for the standby, whose queries can hold the same links: REUSE in rmgr mode (§25), nbtree's
+`XLOG_BTREE_REUSE_PAGE` in generic mode, whose redo is the same conflict and nothing else.
+
+**An interrupted deletion** - an ERROR or a crash between the records - leaves a HALF_DEAD leaf
+linked in its level with no downlink, and possibly some of its subtree still to unlink above it.
+Readers move past it, inserts into its old range go to its right sibling, verify() accepts it
+(below), and the next VACUUM finishes the deletion when it meets the leaf.
+`test/isolation/dir_page_delete.spec` stops VACUUM after each stage.
+
+**Locking.** One VACUUM at a time works on an index, so two deletions never meet, and verify(),
+which takes the same lock, never sees one in progress. Stage 1 holds the leaf EXCLUSIVE and locks
+the parents upwards one at a time, as a split's ascent does; stage 2 holds the leaf and then locks
+the left sibling, the page and its right sibling, left to right at the page's level, as a split
+does. Neither waits for a lock below a page it holds, and neither ever ERRORs on what a concurrent
+writer did: a page that is not as expected leaves the leaf for a later VACUUM. Before stage 1 the
+leaf's predicate locks move to its right sibling (`PredicateLockPageCombine()`), which takes over
+the range they cover.
+
+**verify()** accepts a DELETED page only outside the levels it walks, and a HALF_DEAD page only as
+an empty leaf, not rightmost, with a MINUS INFINITY high key. A page of a level that no downlink
+names must be the top of a subtree being deleted: a chain of single downlinks down to a HALF_DEAD
+leaf whose `owner_head` names it. The pages of such a subtree bound nothing - their range is the
+right sibling's already - so their high keys are compared with nothing.
+
+**Not done:** the empty pages of a LIVE key's posting tree are not unlinked (§18); they go when the
+key does.
+
 ### Locking summary
 
 Directory pages: nbtree's rules - no coupling downwards, move right when the high key no longer
@@ -7019,7 +7099,7 @@ the ordering checks alone only catch byte-identical twins (`directory.sql` §13)
 
 ### Not done in this version
 
-Leaf deletion and page reclaim for an empty leaf (nbtree's half-dead protocol); a backward scan
+A backward scan
 (`leftlink` exists on DIRECTORY pages and verify() checks it, but nothing reads it yet - a future
 `amgettuple` will; §22 turned out not to need it, and posting pages therefore keep no left link at
 all); parallel build (done since, §24 "Build"); and online deduplication of a prefix run that
@@ -8556,6 +8636,24 @@ image.
                                    `pg_lion.vacuum_barrier_ranges` (1024)
                                    ranges with no removal record to carry
                                    them.
+    DIR_DELETE      0xD0  2-4      A directory page deletion (§21, "Page
+                                   deletion").  Stage 1: the parent's
+                                   rewritten downlink and DELETE of the next,
+                                   and the leaf as INIT + ADD of its MINUS
+                                   INFINITY high key, HALF_DEAD.  Stage 2: the
+                                   left and right siblings' SPECIAL (and the
+                                   right one's first downlink made MINUS
+                                   INFINITY when the page was the leftmost of
+                                   its level), the page as INIT + ADD, DELETED
+                                   with the safexid, and the leaf's SPECIAL.
+    REUSE           0xE0  0        A DELETED page about to be used again: the
+                                   RelFileLocator, the block and its safexid,
+                                   no registered block.  Redo resolves the
+                                   recovery conflict with that horizon, as
+                                   nbtree's XLOG_BTREE_REUSE_PAGE does, which
+                                   is what generic mode writes instead.
+                                   Written only when the standby needs it
+                                   (`XLogStandbyInfoActive()`).
 
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
 ADDMANY, REPLACE, DELTA, SPLICE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX,
@@ -8860,6 +8958,12 @@ meta page's `bulkdeletes`, which tells them on a primary that a bulk delete
 finished under the walk, is replayed all the same - it rides in the META
 record's NDISTINCT operation, which redo copies whole - so a promoted standby
 and a recovered primary carry the number the primary had.
+
+A standby query can hold a link to a directory page the primary deletes (§21, "Page deletion")
+just as a primary scan can, and the primary's safexid test does not see the standby's snapshots.
+The record that hands the page out again carries the safexid as a conflict horizon - REUSE, or in
+generic mode nbtree's REUSE_PAGE - and its replay cancels the standby queries older than it, unless
+`hot_standby_feedback` has kept the primary from reusing the page in the first place.
 
 ### Registration and migration (implemented)
 
@@ -10614,8 +10718,9 @@ hash breaking ties, and abbreviation is given up as `tuplesort` gives it up when
 keys apart. The order is the one the probe's comparison gives, so nothing below changes; a type
 with no sort support is sorted by calling the comparison as before.
 
-**Why the place may be kept.** A directory page never changes level and is never freed, and a split
-moves keys only rightwards (§21, "Readers"), so a page's lower bound never moves. A key that sorts
+**Why the place may be kept.** A directory page keeps its level and is not reused while the walk's
+snapshot lasts, and splits and page deletions move keys only rightwards (§21, "Readers" and "Page
+deletion"), so a page's lower bound never rises. A key that sorts
 at or after the last one is therefore on the remembered leaf or to its right. The remembered right
 sibling's lower bound is the high key the walk copied, so a key at or above that is on the sibling
 or to its right - even when the leaf has split meanwhile and has a new right sibling in between,
@@ -13662,7 +13767,7 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   no key lands on the first VALUE entry (`lion_dir_value_start()`), and one to (attno, the first kind
   after VALUE) just past the last (`lion_dir_value_end()`), whichever key column of the index it is.
   The walk goes on from there, a leaf at a time, to the right or through the left links
-  (`lion_dir_step_left()`, nbtree's `_bt_walk_left()` without page deletion), copying each leaf's
+  (`lion_dir_step_left()`, nbtree's `_bt_walk_left()`), copying each leaf's
   entries under its share lock and testing them with none held. A row is live when the visibility
   map vouches for its page or `SnapshotNonVacuumable` accepts it, core's test: a key whose rows are
   all deleted is not an end, and one whose rows are recently dead or uncommitted is. Only an ordered
@@ -13671,11 +13776,12 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
 - **Bounded, as core's is.** `LION_PROBE_HEAP_PAGES` (100, core's `VISITED_PAGES_LIMIT`) heap pages
   without a live row, `LION_PROBE_HEAP_TIDS` (10,000) TIDs without one, or `LION_PROBE_LEAVES` (100)
   directory leaves, and the probe gives up and the histogram's own end stands. The leaves bound
-  matters where core's does not: a directory leaf is never unlinked (§18), so deleting a column's
-  newest keys and vacuuming leaves their leaves empty and linked, where a btree would have deleted
-  its pages. An index that grew by inserts holds about 34 one-row keys of a column to a leaf, so the
-  10,000 newest keys deleted are past the bound and 1,000 are not (`test/sql/rangeprobe.sql` §3 shows
-  both). The TIDs bound is there because core's probe asks about a dead TID once - it marks the btree
+  matters where core's does not: until VACUUM, the entries of a column's deleted newest keys stay,
+  each with its dead rows, where a btree marks its entries dead as the probe meets them. An index
+  that grew by inserts holds about 34 one-row keys of a column to a leaf, so the 10,000 newest keys
+  deleted are past the bound and 1,000 are not; VACUUM then takes the entries and their leaves out
+  (§21, "Page deletion"), and the probe reads the live end again (`test/sql/rangeprobe.sql` §3 shows
+  all three). The TIDs bound is there because core's probe asks about a dead TID once - it marks the btree
   entry dead (`kill_prior_tuple`) and the next plan skips it - where a posting set has nothing to
   mark, so every plan until VACUUM asks about the same dead rows again, and 100 pages of small rows
   hold up to 29,100 of them; 10,000 is those pages at 100 rows a page. Each TID used to be asked
@@ -14204,8 +14310,9 @@ posting-tree root of each CHAIN set, a directory leaf image with its right link,
    image of the leaf and its right link, exactly as the bitmap walk does between leaves (§21
    "Ordered iteration", §28): entries moved right are in the image and are not visited again on
    the new page; a deleted entry had an empty set; an entry inserted after the image was taken is
-   case 3. Directory leaves are never unlinked or freed (§21), so the right link always names a
-   leaf.
+   case 3. A leaf VACUUM unlinks meanwhile (§21, "Page deletion") is still a leaf, with a MINUS
+   INFINITY high key and the right link it had, and it is not reused while the scan's snapshot
+   lasts: the right link always names a leaf, and from a deleted one the walk moves right.
 9. *The scan's own INLINE copies taken at locate time* (SETS: every set is located at the first
    call) are cases 1 to 3 again.
 

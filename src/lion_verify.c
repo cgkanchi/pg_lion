@@ -238,12 +238,17 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
 
-	/* Only a container page may ever carry the DELETED bit (DESIGN.md §18). */
-	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags != LION_PAGE_CONTAINER)
-		lion_corrupt("lion index \"%s\": block %u is marked deleted but is a %s page",
-					RelationGetRelationName(vs->index), blk,
-					flags == LION_PAGE_META ? "meta" :
-					flags == LION_PAGE_DIR ? "directory" : "leaf");
+	/*
+	 * Container and directory pages carry the DELETED bit once they are freed
+	 * (DESIGN.md §18, §21), the meta page never; only a directory leaf is ever
+	 * HALF_DEAD.
+	 */
+	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags == LION_PAGE_META)
+		lion_corrupt("lion index \"%s\": block %u is marked deleted but is the meta page",
+					RelationGetRelationName(vs->index), blk);
+	if ((opaque->flags & LION_PAGE_HALF_DEAD) != 0 && flags != LION_PAGE_BUCKET)
+		lion_corrupt("lion index \"%s\": block %u is marked half-dead but is not a directory leaf",
+					RelationGetRelationName(vs->index), blk);
 
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
