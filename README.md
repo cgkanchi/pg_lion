@@ -229,9 +229,7 @@ nothing nearer. Like HNSW's, the answer is approximate: on 975,000 1536-dimensio
 embeddings a query reads 4% of the rows (9 MB) and returns 98% of the true ten nearest in 7.9 ms,
 about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100);
 `pg_lion.vector_margin` and `pg_lion.vector_patience` trade one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the
-matching rows (or, under a wide filter, where gathering them first would cost more than they save,
-tests the `WHERE` on each row as it reads its exact distance: `pg_lion.vector_restrict`), so a
-filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
+matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98%
 recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with
 iterative scans, and a filter of up to 2,000 rows (`pg_lion.vector_exact_rows`), or of up to 1.5
 rows a partition (`pg_lion.vector_exact_per_partition`), is answered exactly.
