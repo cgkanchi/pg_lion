@@ -22697,7 +22697,8 @@ medians of three and two), the same index.
 `KNN_EXACT_SELS` and `KNN_EXACT_MARGINS`, on main's build at 1c85107). DBpedia's 115,186 rows as
 above, the vectors inline (`KNN_INLINE`: a row a heap page), the index of 2,715 partitions spilling,
 every relation in 2 GB of shared buffers; 200 queries, LIMIT 10, through LionOrdered
-(`enable_sort` and `enable_indexscan` off), its exact path with `pg_lion.vector_exact_rows` past
+(`enable_sort` off and the lionvec index's own scan out of the way, as `knn_dbpedia.py`'s `lo`
+settings put it - §39, "Core's switches"), its exact path with `pg_lion.vector_exact_rows` past
 every filter, its probes with it at 0 and the default patience. The server's median time, the
 median of three runs' (two other builds shared the 4 cores), and the 95th percentile; recall and
 pages, the same in every run. Probed at the default margin, at the margin nearest 0.98 of the ten

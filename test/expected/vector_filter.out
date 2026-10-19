@@ -53,7 +53,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -70,7 +71,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
@@ -108,7 +110,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
@@ -119,7 +122,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 END $$;
@@ -298,7 +302,8 @@ SELECT vf_ord('SELECT id, v <-> (SELECT v FROM vf WHERE id = 211) AS d FROM vf
 PREPARE vfp(int, vector) AS
 	SELECT id, v <-> $2 AS d FROM vf WHERE tag = $1 ORDER BY v <-> $2 LIMIT 10;
 SET plan_cache_mode = force_generic_plan;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) EXECUTE vfp(3, vf_vec(1, 24));
               QUERY PLAN               
 ---------------------------------------
@@ -310,7 +315,8 @@ EXPLAIN (COSTS OFF) EXECUTE vfp(3, vf_vec(1, 24));
          Lion Indexes: vf_tag
 (6 rows)
 
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 -- what the node did: the vector scan returns members only
 SELECT * FROM vf_run('EXECUTE vfp(3, vf_vec(1, 24))');
                              vf_run                             
@@ -356,7 +362,8 @@ SELECT vf_ord('SELECT q.id, (SELECT sum(id) FROM (SELECT id FROM vf
 (1 row)
 
 -- the set of a filter two lion indexes answer, built from both
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vf WHERE tag = 7 OR cat = 4 ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
                                                                                                                    QUERY PLAN                                                                                                                   
@@ -369,7 +376,8 @@ SELECT id FROM vf WHERE tag = 7 OR cat = 4 ORDER BY v <-> vf_vec(1, 24) LIMIT 5;
          Lion Indexes: vf_tag, vf_cat
 (6 rows)
 
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 -- a set that outgrows hash_mem at run time spills to a temporary file
 -- mapped into memory, and the scan probes it there, exact (DESIGN.md
 -- §30.4, "Spilling"): planned at 64MB (a generic plan keeps it) and at
@@ -394,7 +402,8 @@ VACUUM (FREEZE, ANALYZE) vfn;
 -- under pg_lion.vector_postfilter's default)
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF)
 SELECT id FROM vfn WHERE c2 = 1 ORDER BY v <-> '[0.5,-0.25,0.125]' LIMIT 10;
                       QUERY PLAN                       
@@ -407,7 +416,8 @@ SELECT id FROM vfn WHERE c2 = 1 ORDER BY v <-> '[0.5,-0.25,0.125]' LIMIT 10;
          Lion Indexes: vfn_c2
 (6 rows)
 
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 RESET hash_mem_multiplier;
 RESET work_mem;
 SET work_mem = '64MB';
@@ -415,7 +425,8 @@ SET plan_cache_mode = force_generic_plan;
 PREPARE vfd(int) AS
 	SELECT id, v <-> '[0.5,-0.25,0.125]' AS d FROM vfn WHERE c2 = $1
 	 ORDER BY v <-> '[0.5,-0.25,0.125]' LIMIT 10;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) EXECUTE vfd(1);
                       QUERY PLAN                       
 -------------------------------------------------------
@@ -427,7 +438,8 @@ EXPLAIN (COSTS OFF) EXECUTE vfd(1);
          Lion Indexes: vfn_c2
 (6 rows)
 
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 -- (three dimensions are plane 1's worst case: it rules out few rows, and a
@@ -492,7 +504,8 @@ $$ SELECT idx_blks_hit + idx_blks_read FROM pg_statio_user_indexes
 	WHERE indexrelname = 'vfb_l2' $$;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SELECT pg_stat_force_next_flush();
  pg_stat_force_next_flush 
 --------------------------
@@ -637,7 +650,8 @@ RESET pg_lion.vector_exact_rows;
 RESET pg_lion.vector_exact_per_partition;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT :b1 - :b0 > 0 AS "read some", 4 * (:b1 - :b0) < :b2 - :b1 AS "read few";
  read some | read few 
 -----------+----------
@@ -660,7 +674,8 @@ SELECT 4 * (:b1 - :b0) < :b4 - :b3 AS "probed at 0", 4 * (:b6 - :b5) < :b2 - :b1
 SET pg_lion.vector_exact_rows = 0;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 -- (with no prefetch, whose counts the line would add: vector_scan_parallel)
 SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
@@ -740,7 +755,8 @@ SELECT pg_stat_clear_snapshot();
 SELECT vfb_blks() AS b9 \gset
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT 4 * (:b1 - :b0) < :b8 - :b7 AS "probed at 9.99", 4 * (:b1 - :b0) < :b9 - :b8 AS "probed at 0";
  probed at 9.99 | probed at 0 
 ----------------+-------------
@@ -773,7 +789,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN SELECT id FROM vfb WHERE s < 200
 					   ORDER BY v <-> vf_vec(7, 64) LIMIT 10' LOOP
 		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
@@ -872,13 +888,17 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO a;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	EXECUTE 'SELECT array_agg(id) FROM (' || q || ') s' INTO b;
@@ -916,7 +936,8 @@ SET pg_lion.vector_margin = 100;
 SET pg_lion.vector_patience = 4;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 SELECT count(*) AS "through the node"
   FROM vf_run('SELECT id FROM vf WHERE cat <> 5 ORDER BY v <-> vf_vec(4, 24) LIMIT 2000') ln
@@ -937,7 +958,8 @@ SELECT cardinality(a) AS n, a = (SELECT array_agg(x ORDER BY x) FROM unnest(a) x
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 SET pg_lion.vector_patience = 0;
 /*
@@ -958,14 +980,16 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_sort', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		used := used OR ln ~ 'Custom Scan \(LionOrdered\)';
 	END LOOP;
 	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
 		q || ') s' INTO a;
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.vector_postfilter', 'allow', true);
 	EXECUTE 'SELECT format(''%s rows, %s distinct'', count(*), count(DISTINCT id)) FROM (' ||
