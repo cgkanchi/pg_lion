@@ -34,9 +34,9 @@ collation - a literal's, which the call cannot tell from an explicit `COLLATE "d
 the key names the column's collation (`'abc'::text COLLATE case_insensitive`).  They take one INDEX, and an index belongs to one table, so they count that
 table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
 count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
-`FROM parent` includes them.  A partitioned table's index has no storage and is refused
-(`"..." is not an index`); pass a partition's own index, or write the `SELECT count(*)` against the
-partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
+`FROM parent` includes them.  A partitioned table's index has no storage and is refused, as by
+every function here (below); pass a partition's own index, or write the `SELECT count(*)` against
+the partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
 attempted for an old-style inheritance parent without `ONLY`, whose children need not even share
 its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
@@ -51,6 +51,12 @@ no page while it waits for another that replay may hold, and is exact only while
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
 table's owner (DESIGN.md §7).
+
+Each of these functions reads one index's storage, and the index of a partitioned table has none:
+each partition's index holds the entries of that partition's rows. `lion_index_stats()` returns no
+rows for it, so a query over every lion index in `pg_class` goes on to the partitions' own; every
+other function is an error, `"..." is a partitioned index`, with a hint to pass a partition's index.
+A `lion_index_verify()` over every lion index takes those whose `relkind` is `'i'`.
 
 ### Facet counts (DESIGN.md §7, "Facet counts")
 

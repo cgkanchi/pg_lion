@@ -2288,6 +2288,8 @@ typedef enum LionReadPolicy
 extern Relation lion_reader_open(Oid indexoid, LionReadPolicy policy,
 								 Snapshot snapshot, const char *action,
 								 Relation *heap);
+extern bool lion_is_partitioned_index(Oid relid);
+extern void lion_refuse_partitioned_index(Oid relid);
 extern void lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
 							const char *action);
 extern void lion_reader_lock(Relation index, Snapshot snapshot);
