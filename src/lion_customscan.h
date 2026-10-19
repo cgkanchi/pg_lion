@@ -767,20 +767,27 @@ typedef struct LionVColScope
 /*
  * One container of a set a summed walk PROBES at the other sources' rows
  * (DESIGN.md §32, "Summed ranges: dense and probed"): the cursor's step to it
- * or past it - a sparse segment's pair skipped, an item fetched - and the
- * search for its key among the probe's.  No visibility map, no merge and no
- * count set up per set, which is what LION_CONTAINER_COST and the per-entry
- * constants above are mostly made of: a quarter of LION_CONTAINER_COST,
- * derived from what the step leaves out rather than measured.  The members a
- * probed container marks are charged LION_AND_MEMBER_COST each, the probe's
- * as a set of LION_RANGE_UNION_ENTRY_COST.
+ * or past it - a sparse segment's pair decoded, an item fetched - the search
+ * for its key among the probe's, and its member looked up in the copy's
+ * container to be marked.  No visibility map, no merge and no count set up
+ * per set.  Measured on the release build (2026-10-19) over a 20M-row heap,
+ * windows of 30, 90 and 180 days over a near-unique timestamp scattered over
+ * it with summaries of 4,096 rows, probed from the start beside an equality
+ * and a multi-key overlap of a million rows: 58 ns a container of the
+ * summaries the walk read, the slope over 1.5M to 5.0M of them (the walk
+ * alone counted them at 27 ns).  The first fit, a quarter of
+ * LION_CONTAINER_COST derived from what the step leaves out, was a fifth of
+ * that.  The members a probed container marks are charged
+ * LION_AND_MEMBER_COST each, which with this comes to 55 ns, the probe's as a
+ * set of LION_RANGE_UNION_ENTRY_COST.
  */
 #define LION_PROBE_STEP_COST	(lion_probe_step_cost * cpu_operator_cost)
 
 /*
- * ... and when a walk turns to probing: once it has handed out this many
- * times the rows of the other sources' smallest positive one
- * (lion_sum_probe_due()), which the cost model predicts the same way.
+ * ... and when a walk turns to probing: once its counts have visited this
+ * many times as many containers as the other sources' smallest positive one
+ * can lie at (lion_sum_probe_due()), which the cost model predicts the same
+ * way.
  */
 #define LION_PROBE_SWITCH	2.0
 

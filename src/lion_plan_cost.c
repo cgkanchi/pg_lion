@@ -1417,7 +1417,55 @@ typedef struct LionSumModel
 	double		keysper;		/* keys of k in one bucket */
 	double		persum;			/* one summary's count: fixed + containers */
 	double		sumpages;		/* ... and the pages it reads */
+	double		conts;			/* the container keys one summary has */
+	double		leafper;		/* its entry's share of a directory leaf */
 } LionSumModel;
+
+/*
+ * F's sources as one set of a summed walk is counted beside them
+ * (lion_cost_range_set_count()): the rows of each and the container keys
+ * they lie at, and whether the count reads it from a copy in memory - slot 0
+ * is the set's own, filled in for each set priced.
+ */
+typedef struct LionSumSources
+{
+	int			n;				/* F's sources, the set's slot not counted */
+	double	   *rows;			/* [n + 1] */
+	double	   *conts;			/* [n + 1] */
+	bool	   *inmem;			/* [n + 1] */
+	double		tuples;
+} LionSumSources;
+
+/*
+ * What counting one set of the walk - `rows` rows at `conts` container keys,
+ * an entry or a bucket's summary - beside F's sources costs (DESIGN.md §28,
+ * §32): their merge, priced as every AND of sets is
+ * (lion_merge_cpu_cost_sets()).  The source with the fewest rows drives - the
+ * set, as a rule, at its own container keys - and the next is sought at each
+ * of them; the ones after that only at the keys the AND so far still has
+ * rows at.  A set of a few rows at nearly every key - a summary of a column
+ * scattered over the heap - therefore pays one seek a container for F's
+ * first source and next to nothing for the others, and a seek on posting
+ * pages (LION_PROBE_COST) unless the source is copied into memory on its
+ * second use (DESIGN.md §9), which a large one never is.
+ */
+static void
+lion_cost_range_sources_free(LionSumSources *f)
+{
+	pfree(f->rows);
+	pfree(f->conts);
+	pfree(f->inmem);
+}
+
+static Cost
+lion_cost_range_set_count(double rows, double conts, LionSumSources *f)
+{
+	f->rows[0] = Max(rows, 1.0);
+	f->conts[0] = Max(conts, 1.0);
+	f->inmem[0] = false;
+	return lion_merge_cpu_cost_sets(f->n + 1, f->rows, f->conts, NULL, NULL,
+									NULL, f->inmem, f->tuples, 1.0, NULL);
+}
 
 /*
  * What one side of a summed range walk costs (DESIGN.md §28, §32): nkeys
@@ -1432,11 +1480,18 @@ typedef struct LionSumModel
  *
  * *counts is how many counts the side makes - entries and summaries - which
  * is what the heap recheck is spread over; *pages is what it reads.
+ * *racepages, when it is asked for, is what the leaf-by-leaf race that
+ * picks the side reads of it (lion_range_choose_on()): the leaves of its
+ * entries - which, for keys of a few rows, hold their sets - and each whole
+ * bucket's summary entry, but not the summary's posting pages, which only
+ * the count reads.  Before 2026-10-19 the race was charged the summaries'
+ * pages twice over, a third of the price of a 90-day window over a
+ * near-unique timestamp.
  */
 static Cost
 lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
 					 double perentry, double pageper, double *counts,
-					 double *pages)
+					 double *pages, double *racepages)
 {
 	double		whole = 0.0;
 	double		edgekeys;
@@ -1448,12 +1503,16 @@ lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
 	{
 		*counts = nkeys;
 		*pages = nkeys * pageper;
+		if (racepages != NULL)
+			*racepages = *pages;
 		return nkeys * (perentry + pageper * seq_page_cost);
 	}
 
 	edgekeys = Max(0.0, nkeys - whole * sum->keysper);
 	*counts = edgekeys + whole;
 	*pages = edgekeys * pageper + whole * sum->sumpages;
+	if (racepages != NULL)
+		*racepages = edgekeys * pageper + whole * sum->leafper;
 	cost = edgekeys * (perentry + pageper * seq_page_cost) +
 		whole * (sum->persum + sum->sumpages * seq_page_cost);
 
@@ -1465,39 +1524,62 @@ lion_cost_range_side(double nkeys, double nedges, const LionSumModel *sum,
  * The same side beside the other sources F when the executor may PROBE it
  * (DESIGN.md §32, "Summed ranges: dense and probed"): `probe` and
  * `probeentry` are what a summary and an entry cost probed rather than
- * counted, siderows the rows the side holds and frows F's.  A walk that uses
- * summaries turns to probing once it has handed out LION_PROBE_SWITCH times
- * F's rows (lion_sum_probe_due()); the sets before that are counted as they
- * always were, those after it probed, and F is counted twice more - once
- * collected, once ANDed with what the probe marked - which is `fcount` each.
- * Without a whole bucket, or when the side never gets that far, it is
- * lion_cost_range_side()'s.  *counts is the counts the heap recheck is spread
- * over: the ones before the switch, and the probe's one.
+ * counted, `entryconts` the container keys of one entry, and `fconts` those
+ * F's smallest source can lie at.  The walk turns to probing once its counts
+ * have visited LION_PROBE_SWITCH times as many containers as that
+ * (lion_sum_probe_due()), a count visiting a container of the set and one of
+ * F at each key of whichever of the two has fewer; the sets before that are
+ * counted as they always were, those after it probed, and the probe costs
+ * `probeover` on top - F collected, and what the probe marked built and
+ * counted with F.  Without a whole bucket, or when the side's counts never
+ * visit that much, it is lion_cost_range_side()'s.  *counts is the counts
+ * the heap recheck is spread over: the ones before the switch, and the
+ * probe's one.
+ *
+ * The planner is only ever asked this when the probe will fit
+ * (lion_range_probe_fits(), lion_cost_range_sum()); before 2026-10-19 it
+ * asked whether F's rows at two bytes each fit work_mem, which a probe also
+ * needs the containers, the marks and the count's set for, and priced a walk
+ * probed at a work_mem the executor then counted every set at.  The switch
+ * was at twice F's ROWS too, which the executor reached half way through a
+ * window over a scattered column.
  */
 static Cost
 lion_cost_range_side_probed(double nkeys, double nedges,
 							const LionSumModel *sum, const LionSumModel *probe,
 							double perentry, double probeentry,
-							double pageper, double siderows, double frows,
-							Cost fcount, double *counts, double *pages)
+							double pageper, double entryconts, double fconts,
+							Cost probeover, double *counts, double *pages,
+							double *racepages)
 {
 	Cost		counted = lion_cost_range_side(nkeys, nedges, sum, perentry,
-											   pageper, counts, pages);
+											   pageper, counts, pages,
+											   racepages);
 	Cost		probed;
 	double		pcounts;
 	double		ppages;
+	double		whole;
+	double		edgekeys;
+	double		merged;
 	double		before;
 
-	if (sum == NULL || probe == NULL ||
-		nkeys / sum->keysper - 0.5 * nedges < 1.0 ||
-		siderows < LION_PROBE_SWITCH * frows)
+	if (sum == NULL || probe == NULL)
+		return counted;
+	whole = nkeys / sum->keysper - 0.5 * nedges;
+	if (whole < 1.0)
+		return counted;
+	edgekeys = Max(0.0, nkeys - whole * sum->keysper);
+	fconts = Max(fconts, 1.0);
+	merged = 2.0 * (edgekeys * Min(entryconts, fconts) +
+					whole * Min(sum->conts, fconts));
+	if (merged <= LION_PROBE_SWITCH * fconts)
 		return counted;
 
 	probed = lion_cost_range_side(nkeys, nedges, probe, probeentry, pageper,
-								  &pcounts, &ppages);
-	before = Min(1.0, LION_PROBE_SWITCH * frows / Max(siderows, 1.0));
+								  &pcounts, &ppages, NULL);
+	before = LION_PROBE_SWITCH * fconts / merged;
 	*counts = before * *counts + 1.0;
-	return before * counted + (1.0 - before) * probed + 2.0 * fcount;
+	return before * counted + (1.0 - before) * probed + probeover;
 }
 
 static Cost
@@ -1528,10 +1610,17 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	double		fcont = lion_containers_for(heap_pages, frows);
 	double		fm = Min(frows / Max(fcont, 1.0), LION_MEMBER_CAP);
 	double		m = Min(rowsper / Max(percont, 1.0), LION_MEMBER_CAP);
-	double		steps;
 	double		perentry;
 	double		probeentry = 0.0;
+	double		leafper;
+	double		minrows = -1.0;
+	double		minconts = 0.0;
+	double		matbytes = 0.0;
 	Cost		fcount;
+	Cost		probeover = 0.0;
+	LionSumSources f;
+	ListCell   *lc2;
+	int			k;
 	int			nsrc = list_length(ors);
 	int			nplain = list_length(ors);
 	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
@@ -1549,8 +1638,10 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	LionSumShape shape;
 	double		incounts;
 	double		inpages;
+	double		inrace;
 	double		outcounts;
 	double		outpages;
+	double		outrace;
 	double		setcounts;
 	double		setpages;
 	Cost		inside;
@@ -1575,7 +1666,6 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		}
 		ci++;
 	}
-	pfree(orgrp);
 	if (given != NULL)
 	{
 		frows = Max(Min(given->rows, tuples), 1.0);
@@ -1583,6 +1673,87 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		fm = Min(frows / Max(fcont, 1.0), LION_MEMBER_CAP);
 		nsrc = given->nsrc;
 		nplain = given->nplain;
+	}
+
+	/*
+	 * Each of those sources' rows and container keys, for the merges that
+	 * count the walk's sets with them (lion_cost_range_set_count()): a
+	 * clause's own selectivity, and an OR restriction's at most the sum over
+	 * its arms of the fewest rows any leaf of the arm has.  Given F, each is
+	 * taken at F's rows, which is all that is known of them.  A source is
+	 * read from a copy in memory when the count copies it on its second use,
+	 * as it does a set that is small enough and fits what work_mem has left
+	 * (DESIGN.md §9, lion_count_sources_cached()).
+	 */
+	f.n = nsrc;
+	f.tuples = tuples;
+	f.rows = (double *) palloc0(sizeof(double) * (nsrc + 1));
+	f.conts = (double *) palloc0(sizeof(double) * (nsrc + 1));
+	f.inmem = (bool *) palloc0(sizeof(bool) * (nsrc + 1));
+	k = 1;
+	if (given != NULL)
+	{
+		for (k = 1; k <= nsrc; k++)
+			f.rows[k] = frows;
+	}
+	else
+	{
+		ci = 0;
+		forboth(lc, whereclauses, lc2, wherekinds)
+		{
+			if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc2)) && orgrp[ci] < 0 &&
+				k <= nsrc)
+				f.rows[k++] = tuples *
+					clause_selectivity(root, lion_vcol_unvar(lfirst(lc)), 0,
+									   JOIN_INNER, NULL);
+			ci++;
+		}
+		foreach(lc, ors)
+		{
+			List	   *one = (List *) lfirst(lc);
+			int			leaf = linitial_int(one);
+			int			narms = lsecond_int(one);
+			double		rows = 0.0;
+			int			a;
+
+			for (a = 0; a < narms; a++)
+			{
+				int			nleaves = list_nth_int(one, 2 + a);
+				double		armrows = tuples;
+				int			j;
+
+				for (j = 0; j < nleaves; j++, leaf++)
+					if (leaf < list_length(whereclauses))
+						armrows = Min(armrows, tuples *
+									  clause_selectivity(root,
+														 lion_vcol_unvar(list_nth(whereclauses, leaf)),
+														 0, JOIN_INNER, NULL));
+				rows += armrows;
+			}
+			if (k <= nsrc)
+				f.rows[k++] = Min(rows, tuples);
+		}
+	}
+	pfree(orgrp);
+	for (k = 1; k <= nsrc; k++)
+	{
+		f.rows[k] = Min(Max(f.rows[k], 1.0), tuples);
+		f.conts[k] = lion_containers_for(heap_pages, f.rows[k]);
+		if (!(f.conts[k] > LION_MATERIALIZE_MAX_CONTAINERS &&
+			  f.rows[k] > LION_MATERIALIZE_MAX_BYTES / sizeof(uint16)) &&
+			matbytes + f.rows[k] * sizeof(uint16) +
+			f.conts[k] * (LION_CONTAINER_HDRSZ + 2 * sizeof(void *)) <=
+			(double) work_mem * 1024.0)
+		{
+			f.inmem[k] = true;
+			matbytes += f.rows[k] * sizeof(uint16) +
+				f.conts[k] * (LION_CONTAINER_HDRSZ + 2 * sizeof(void *));
+		}
+		if (minrows < 0.0 || f.rows[k] < minrows)
+		{
+			minrows = f.rows[k];
+			minconts = f.conts[k];
+		}
 	}
 
 	/* One count of F: its containers, each of its sources probed at them. */
@@ -1600,24 +1771,24 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	index_close(indexrel, AccessShareLock);
 
 	/*
-	 * One entry: its fixed cost, and its containers' key steps against every
-	 * source of F.  Small ones are counted a leaf at a time.
+	 * One entry: its fixed cost, and its merge with F's sources.  Small ones
+	 * are counted a leaf at a time.  Before 2026-10-19 every source was
+	 * charged a seek in memory at every container key of the entry, which
+	 * for a summary of a few rows at thousands of keys was twice what the
+	 * merge does: the second source is sought only where the first left a
+	 * row, and a source of a million rows is never copied into memory.
 	 */
-	{
-		double		keys = (nsrc > 0) ? Min(percont, fcont) : percont;
-
-		/*
-		 * the driver's containers, and each of F's sources probed at them -
-		 * in memory, where a walk copies them on their second use (§9)
-		 */
-		steps = keys * (LION_CONTAINER_COST + LION_MEMBER_COST * m) +
-			keys * nsrc * (LION_MEMORY_PROBE_COST + LION_AND_MEMBER_COST * m);
-	}
 	perentry = ((percont <= (double) LION_SUM_UNION_MAX_ITEMS) ?
-				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) + steps;
+				LION_RANGE_UNION_ENTRY_COST : LION_RANGE_ENTRY_COST) +
+		lion_cost_range_set_count(rowsper, percont, &f);
 
-	/* The leaves under one entry: its share of the column's pages. */
+	/*
+	 * The leaves under one entry: its share of the column's pages - and of
+	 * the directory's, which is what the race reads of a summary's entry.
+	 */
 	pageper = Max(1.0, (double) groupidx->pages *
+				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
+	leafper = Max(1.0, lion_index_dir_pages(groupidx, NULL) *
 				  lion_index_column_share(root, rel, groupidx, groupcol)) / nd;
 
 	/*
@@ -1652,7 +1823,6 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		double		sinorder;
 		double		sc;
 		double		sm;
-		double		skeys;
 
 		if (realrows > 2.0 * bucketrows)
 			bucketrows = realrows;
@@ -1660,47 +1830,60 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		sinorder = Max(1.0, bucketrows * ckeys / tuples);
 		sc = sscattered + (sinorder - sscattered) * corr * corr;
 		sm = Min(bucketrows / Max(sc, 1.0), LION_MEMBER_CAP);
-		skeys = (nsrc > 0) ? Min(sc, fcont) : sc;
 
 		summodel.keysper = Max(1.0, bucketrows / rowsper);
 
-		/* the summary's containers, and F's sources probed at them, as above */
+		/* the summary's merge with F's sources, as an entry's above */
 		summodel.persum = LION_RANGE_ENTRY_COST +
-			skeys * (LION_CONTAINER_COST + LION_MEMBER_COST * sm) +
-			skeys * nsrc * (LION_MEMORY_PROBE_COST + LION_AND_MEMBER_COST * sm);
+			lion_cost_range_set_count(bucketrows, sc, &f);
 		summodel.sumpages = Max(1.0, summodel.keysper * pageper *
 								Min(1.0, sc / (summodel.keysper * percont)));
+		summodel.conts = sc;
+		summodel.leafper = leafper;
 		sum = &summodel;
 
 		/*
 		 * ... and PROBED at F's rows instead (DESIGN.md §32, "Summed ranges:
 		 * dense and probed"), which the executor turns to part of the way
-		 * through a side that holds more rows than F, when F has a source
-		 * that carries a pin and a copy of it fits work_mem
-		 * (lion_sum_probe_due()): each summary and each entry a set with no
-		 * count of its own, its containers stepped over at
-		 * LION_PROBE_STEP_COST and the ones at F's keys marked against F's
-		 * members, the fewer of the two sides' per container.
+		 * through a side whose counts merge more than F has, when F has a
+		 * source that carries a pin and the probe fits work_mem - the test
+		 * the executor makes of F's smallest source before it collects
+		 * anything (lion_range_probe_fits(), lion_sum_probe_init()), asked
+		 * here of the same source's estimate: each summary and each entry a
+		 * set with no count of its own, stepped at the keys it shares with
+		 * F's copy - the fewer of the two - at LION_PROBE_STEP_COST, and the
+		 * members there marked against F's, the fewer of the two sides' per
+		 * container.  On top: F collected, which merges its sources as a
+		 * count would, and what the probe marked built and counted with F.
 		 */
-		if (collect == NULL && nplain > 0 &&
-			frows * 2.0 * sizeof(uint16) <= (double) work_mem * 1024.0)
+		if (collect == NULL && nplain > 0 && minrows >= 0.0 &&
+			lion_range_probe_fits(minrows, minconts, (Size) work_mem * 1024))
 		{
 			probemodel = summodel;
 			probemodel.persum = LION_RANGE_UNION_ENTRY_COST +
-				sc * LION_PROBE_STEP_COST +
-				Min(sc, fcont) * LION_AND_MEMBER_COST * Min(sm, fm);
+				Min(sc, fcont) * (LION_PROBE_STEP_COST +
+								  LION_AND_MEMBER_COST * Min(sm, fm));
 			probeentry = LION_RANGE_UNION_ENTRY_COST +
-				percont * LION_PROBE_STEP_COST +
-				Min(percont, fcont) * LION_AND_MEMBER_COST * Min(m, fm);
+				Min(percont, fcont) * (LION_PROBE_STEP_COST +
+									   LION_AND_MEMBER_COST * Min(m, fm));
 			probe = &probemodel;
+			probeover = lion_merge_cpu_cost_sets(nsrc, &f.rows[1], &f.conts[1],
+												 NULL, NULL, NULL, NULL,
+												 tuples, 1.0, NULL) +
+				fcont * (LION_CONTAINER_COST + LION_MEMBER_COST * fm) +
+				lion_cost_range_set_count(matching,
+										  lion_containers_for(heap_pages,
+															  matching),
+										  &f);
 		}
 	}
 
 	inside = lion_cost_range_side_probed(nin,
 										 (collect != NULL) ? collect->sides : 2.0,
 										 sum, probe, perentry,
-										 probeentry, pageper, tuples * sel,
-										 frows, fcount, &incounts, &inpages);
+										 probeentry, pageper, percont,
+										 minconts, probeover, &incounts,
+										 &inpages, &inrace);
 
 	/*
 	 * A range collected as a source (DESIGN.md §32) reads the same walk and
@@ -1724,6 +1907,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 		collect->bucketrows = (whole > 0.0) ?
 			rowsper * sum->keysper : 0.0;
 		collect->corr = corr;
+		lion_cost_range_sources_free(&f);
 		return inside;
 	}
 	inside += lion_range_recheck(root, rel, matching * dirtyfrac, incounts,
@@ -1733,7 +1917,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	if (sets != NULL || (given != NULL && given->exists))
 	{
 		(void) lion_cost_range_side(nin, 2.0, sum, perentry, pageper,
-									&setcounts, &setpages);
+									&setcounts, &setpages, NULL);
 		if (sets != NULL)
 		{
 			sets->counts = Max(setcounts, 1.0);
@@ -1743,7 +1927,10 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 
 		/* ... until one has a row, for an existence test */
 		if (given != NULL && given->exists)
+		{
+			lion_cost_range_sources_free(&f);
 			return inside * lion_exists_fraction(setcounts, frows * sel);
+		}
 	}
 
 	/*
@@ -1759,7 +1946,10 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * count at its inside - what it costs at most.
 	 */
 	if (nplain == 0 || !ordered)
+	{
+		lion_cost_range_sources_free(&f);
 		return inside;
+	}
 
 	/*
 	 * The complement: the entries outside - a run at each end of the column,
@@ -1768,9 +1958,9 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * candidates on top of the outside entries' for the recheck.
 	 */
 	outside = lion_cost_range_side_probed(nout, 2.0, sum, probe, perentry,
-										  probeentry, pageper, nout * rowsper,
-										  frows, fcount, &outcounts,
-										  &outpages) +
+										  probeentry, pageper, percont,
+										  minconts, probeover, &outcounts,
+										  &outpages, &outrace) +
 		fcount + random_page_cost +
 		lion_range_recheck(root, rel, frows * (2.0 - sel) * dirtyfrac,
 						   Max(outcounts, 1.0), corr);
@@ -1779,15 +1969,19 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	if (sets != NULL && outside < inside)
 	{
 		(void) lion_cost_range_side(nout, 2.0, sum, perentry, pageper,
-									&setcounts, &setpages);
+									&setcounts, &setpages, NULL);
 		sets->counts = setcounts + 1.0;
 		sets->rows = nout * rowsper / Max(setcounts, 1.0);
 		sets->outside = true;
 	}
 
-	/* ... and the leaf-by-leaf race that picks the side, counting only. */
+	/*
+	 * ... and the leaf-by-leaf race that picks the side, counting only: the
+	 * leaves of the smaller side, twice (lion_cost_range_side()).
+	 */
+	lion_cost_range_sources_free(&f);
 	return Min(inside, outside) +
-		2.0 * Min(inpages, outpages) * seq_page_cost;
+		2.0 * Min(inrace, outrace) * seq_page_cost;
 }
 
 /*
