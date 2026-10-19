@@ -4905,6 +4905,18 @@ lionvecvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 #define LIONVEC_ROW_OPS			2.0
 
 /*
+ * How far the exact path is preferred to the sort it competes with
+ * (lionvec_exact_cost(); DESIGN.md §44.7, "Exact path pricing"): its
+ * start-up divided by this, so that it is planned wherever its price is
+ * within 1.2 times the sort's.  The maintainer's preference (2026-10-19):
+ * at the margins the exact path over a sort that runs about as fast, up to
+ * 1.2 times its time - no sort, no hash_mem, the rows in order from the
+ * first - where inline the two were near-ties the planner's 1% fuzz
+ * decided.
+ */
+#define LIONVEC_EXACT_LEAN		1.2
+
+/*
  * The share of an index's rows a scan reads before its first row, of C
  * partitions, its rows filtered to a share sel: LIONVEC_PROBE_SHARE
  * C^(-1/3), and, filtered, sel^(-LIONVEC_PROBE_SEL) times as much - the k-th
@@ -5026,6 +5038,9 @@ lionvec_code_pages(Oid indexoid, double pages, double *perpage,
  *   bitmap heap scan reads the same rows' pages, where until 2026-10-18
  *   every member was a random page, however few pages they lay on; and
  *   nothing more when a row is returned (*fetch 0), its page read then.
+ *
+ * The whole divided by LIONVEC_EXACT_LEAN, the exact path preferred up to
+ * 1.2 times the sort's price (2026-10-19).
  */
 static Cost
 lionvec_exact_cost(PlannerInfo *root, IndexPath *path, double n, bool placed,
@@ -5061,7 +5076,7 @@ lionvec_exact_cost(PlannerInfo *root, IndexPath *path, double n, bool placed,
 									   spc_random, spc_seq);
 		*fetch = 0.0;
 	}
-	return cost;
+	return cost / LIONVEC_EXACT_LEAN;
 }
 
 /*

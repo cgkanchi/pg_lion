@@ -460,9 +460,10 @@ to `pg_lion.vector_exact_rows` rows (2,000), or to `pg_lion.vector_exact_per_par
 for each of the index's partitions if that is more, is answered exactly, from every member's
 distance; a larger one by reading partitions as above, its patience counted in matching rows. For
 a filter of a few thousand rows the planner weighs that exact answer against a sort of the Lion
-bitmap scan's rows, exact too, priced alike: with the vectors in TOAST, which the node reads by
-their places, it takes the node, and with them in the rows, where the two read the same pages,
-either. With the distance functions left at pgvector's cost of 1 it may choose that sort for larger
+bitmap scan's rows, exact too, priced alike and the node preferred up to 1.2 times the sort's
+price: with the vectors in TOAST, which the node reads by their places, it takes the node by a wide
+margin, and with them in the rows, where the two read the same pages, the node too. With the
+distance functions left at pgvector's cost of 1 it may choose that sort for larger
 filters as well, where the node is several times faster (pgvector's vectors are stored out of line,
 so the planner sees a small column and a nearly free function); it did on the benchmark until
 scans paused, and the `ALTER FUNCTION`s above keep it from doing so. `pg_dump` does not keep them,

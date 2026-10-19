@@ -21786,15 +21786,15 @@ restarted, the OS's page cache kept):
 | TOAST | 1% | 966 | 3,952.69 | 675.19 | 1,186.02 | sort | LionOrdered | 2.43 / 5.11 | 12.87 / 19.38 |
 | TOAST | 3% | 2,885 | 11,712.34 | 1,238.59 | 1,754.46 | sort | LionOrdered | 5.62 / 15.38 | 27.32 / 45.07 |
 | TOAST | 10% (probing) | 9,990 | 2,139.91 | 2,139.91 | 3,975.46 | LionOrdered | LionOrdered | 10.82 / 49.42 | 37.12 / 116.44 |
-| inline | 0.3% | 310 | 1,298.50 | 1,284.22 | 1,288.27 | LionOrdered | sort | 0.65 / 0.58 | 3.00 / 2.63 |
-| inline | 1% | 1,034 | 4,228.78 | 4,114.14 | 4,133.83 | sort | sort | 1.75 / 1.83 | 8.34 / 11.19 |
-| inline | 3% | 3,020 | 12,267.29 | 11,266.11 | 11,332.36 | sort | sort | 3.98 / 5.37 | 23.96 / 24.83 |
+| inline | 0.3% | 310 | 1,298.50 | 1,284.22 | 1,288.27 | LionOrdered | sort, then LionOrdered leaned | 0.65 / 0.58 | 3.00 / 2.63 |
+| inline | 1% | 1,034 | 4,228.78 | 4,114.14 | 4,133.83 | sort | sort, then LionOrdered leaned | 1.75 / 1.83 | 8.34 / 11.19 |
+| inline | 3% | 3,020 | 12,267.29 | 11,266.11 | 11,332.36 | sort | sort, then LionOrdered leaned | 3.98 / 5.37 | 23.96 / 24.83 |
 | inline | 10% (probing) | 10,143 | 2,157.84 | 2,157.84 | 32,814.98 | LionOrdered | LionOrdered | 13.00 / 17.83 | 52.30 / 90.16 |
 
 In TOAST the exact path is now the plan wherever it is taken, 2.0 to 2.7 times faster than the sort
 warm and 1.3 to 1.65 times cold. Inline the two plans read the same heap pages and are priced within
-1% of each other, near enough for the planner's 1% fuzz to decide: the sort, as before at 1% and 3%,
-and now at 0.3%, running in 0.88 to 1.35 times the node's time. At `random_page_cost` 1.1 the node
+1% of each other, near enough for the planner's 1% fuzz to decide (the sort, as before at 1% and 3%,
+and at 0.3%, running in 0.88 to 1.35 times the node's time) until the lean below. At `random_page_cost` 1.1 the node
 is the plan at all six (in TOAST 305.83, 628.79 and 1,163.19 against the sort's 346.50, 914.17 and
 1,708.06; inline
 429.48, 1,415.34 and 4,072.35 against 433.53, 1,435.04 and 4,138.60). The benchmark's vectors are
@@ -21807,6 +21807,18 @@ the plan there and runs in 0.06 ms against the node's 0.16, a tenth of a millise
 own start that no price follows. vector_filter.sql's 1,200 members on some 850 of vfb's 1,482
 inline pages cost the node 1,781.98 against the sort's 1,807.57, where they cost 4,761.08, the two
 running alike.
+
+**Leaned (2026-10-19).** The exact path's start-up is then divided by `LIONVEC_EXACT_LEAN`, 1.2:
+it is planned wherever its price is within 1.2 times the sort's, the maintainer's preference for
+the exact path at the margins over a sort that runs about as fast - no sort, no `hash_mem`, the rows
+in order from the first - where the near-ties above went to the sort. On the 100,000 rows above the
+node is now the plan at all six exact-path cases: in TOAST 406.33, 575.83 and 1,056.07 against the
+sort's 679.31, 1,186.02 and 1,754.46; inline 1,072.75, 3,435.52 and 9,407.94 against 1,288.27,
+4,133.83 and 11,332.36, where it runs in 1.12, 0.96 and 0.74 times the sort's time warm. On
+vector_toast.sql's 3,000 rows the inline node costs 104.76 against the sort's 123.55 and is the
+plan, 0.16 ms against the sort's 0.06, the tenth of a millisecond above; vfb's 1,200 members cost
+the node 1,484.98 against the sort's 1,807.57. The probing branches are not leaned: the sort's
+competitor there is priced on its own terms (above), and the exact path alone was the near-tie.
 
 **A parallel scan** (2026-10-16; §44.4). `cost_index()` asks `lionveccostestimate()` for the
 index's cost before it counts the path's workers, and of the result divides only its own CPU part
@@ -22807,8 +22819,8 @@ faster from the disk and the same warm, and the inline table's queries took main
   the 200, half a member a partition of 400, exact at its default and probing at 0, and the 4,000,
   ten a partition, exact at 10 and probing at 9.99, in the same order either way; LionOrdered's
   start-up priced under it as under `pg_lion.vector_exact_rows`, not as the probes, and (2026-10-18)
-  from the heap within a tenth of the sort's price, its members' heap pages priced as the bitmap
-  scan's (§44.7, "Exact path pricing"); the setting's range; inserts, deletes and VACUUM under the
+  from the heap within a tenth of 1 / 1.2 of the sort's price (the lean of 2026-10-19), its
+  members' heap pages priced as the bitmap scan's (§44.7, "Exact path pricing"); the setting's range; inserts, deletes and VACUUM under the
   filter; the default margin's recall for each metric under a filter of 9,000 members (rows of mixed
   lengths, which an inner product ranked unlifted got 0.6 of, §44.4); a restricted scan pausing
   at once (a patience of 1) still filling a LIMIT 2000 of its 9,000 members, in order, through the
@@ -23727,8 +23739,8 @@ the same TOAST pages nothing either (§44.7, "Exact path pricing").
   a parallel build's locator the same as a serial one's, page for page; indexes that keep none (short
   vectors, `toast_tuple_target`), and an unlogged table's init fork. Then (2026-10-18) 3,000 rows
   with a kilobyte of text each under a 1% filter: LionOrdered's exact path, reading by place, the
-  plan in TOAST (§44.7, "Exact path pricing"), and priced within a tenth of the sort reading from
-  the heap (`pg_lion.vector_toast_direct` off) and inline.
+  plan in TOAST (§44.7, "Exact path pricing"), and priced within a tenth of 1 / 1.2 of the sort (the lean of 2026-10-19)
+  reading from the heap (`pg_lion.vector_toast_direct` off) and inline, where it is the plan too.
 - Regression, `vector_toast_corrupt.sql` (17 on, `pg_buffercache_evict()`): pages damaged on disk -
   a LOC entry's run past the TOAST relation's end, on another value's page, at a line pointer the
   page lacks, naming a value no row stores: each falls back; a LOC entry naming another row's value

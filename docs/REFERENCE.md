@@ -326,9 +326,10 @@ so a `LIMIT` is never left short. A set of up to `pg_lion.vector_exact_rows` row
 up to `pg_lion.vector_exact_per_partition` (1.5) rows for each of the index's partitions if that
 is more, is answered exactly, from every member's distance; a larger one by reading partitions as
 above, counting its patience in matching rows. The exact answer is priced as the planner prices a
-sort of the lion bitmap scan's rows, which is exact too, and the cheaper is planned: with the
-vectors in TOAST, which the node reads by their places, the node; with them in the rows, where the
-two read the same pages, either (DESIGN.md §44.7, "Exact path pricing"). Under a wide filter,
+sort of the lion bitmap scan's rows, which is exact too, and planned unless the sort is priced at
+less than 1 / 1.2 of it: with the vectors in TOAST, which the node reads by their places, the node
+by a wide margin; with them in the rows, where the two read the same pages, the node too (DESIGN.md
+§44.7, "Exact path pricing"). Under a wide filter,
 where building the set costs more than the rows it saves (about 170 ns a matching row, 845 ms for
 5 million), `LionOrdered` builds none: the scan reads partitions as an unfiltered one does and tests
 the `WHERE` on the table row of each row it fetches for its exact distance, dropping one that fails,
