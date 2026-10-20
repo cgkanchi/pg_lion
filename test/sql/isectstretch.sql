@@ -173,10 +173,10 @@ DECLARE
 	scan	float8;
 	res		boolean;
 BEGIN
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	IF j->0->'Plan'->>'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
 		RETURN NULL;

@@ -497,7 +497,8 @@ lion_entry_alloc_size(Size payoff, Size paylen, Size inline_limit, Size maxsize)
 bool
 lion_find_entry_ext(Relation index, LionState *state, int lockmode, Datum key,
 				   uint32 hash, FmgrInfo *eqproc, FmgrInfo *cmpproc,
-				   Oid collation, Buffer *buf, OffsetNumber *offnum)
+				   Oid collation, Buffer *buf, OffsetNumber *offnum,
+				   bool *movedright)
 {
 	LionSearchKey sk;
 
@@ -510,7 +511,7 @@ lion_find_entry_ext(Relation index, LionState *state, int lockmode, Datum key,
 	}
 
 	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
-						 buf, offnum, NULL);
+						 buf, offnum, movedright);
 }
 
 bool
@@ -518,7 +519,7 @@ lion_find_entry(Relation index, LionState *state, int lockmode, Datum key,
 			   uint32 hash, Buffer *buf, OffsetNumber *offnum)
 {
 	return lion_find_entry_ext(index, state, lockmode, key, hash, NULL, NULL,
-							  InvalidOid, buf, offnum);
+							  InvalidOid, buf, offnum, NULL);
 }
 
 /*

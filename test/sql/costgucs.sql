@@ -126,7 +126,7 @@ SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 	   lcg_cost(q, s, '100', sw) > lcg_cost(q, s, NULL, sw) AS raised_dearer
   FROM (VALUES ('SELECT g, count(*) FROM lcg GROUP BY g',
 				'pg_lion.entry_count_cost',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off}'::text[])) v(q, s, sw);
+				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
 SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.entry_count_cost', NULL);
 SELECT lcg_plan('SELECT g, count(*) FROM lcg GROUP BY g', 'pg_lion.entry_count_cost', '5000');
 
@@ -148,7 +148,7 @@ SELECT lcg_cost(q, s, '0', sw) < lcg_cost(q, s, NULL, sw) AS lowered_cheaper,
 	   lcg_cost(q, s, '100000', sw) > lcg_cost(q, s, NULL, sw) AS raised_dearer
   FROM (VALUES ('SELECT x, count(*) FROM lcf WHERE fk < 1000 GROUP BY x',
 				'pg_lion.range_fold_cost',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_indexscan, off, enable_indexonlyscan, off}'::text[])) v(q, s, sw);
+				'{enable_seqscan, off, enable_bitmapscan, off, pg_lion.enable_plain_scan, off}'::text[])) v(q, s, sw);
 
 -- ---------- 3. a SET LOCAL ends with its transaction ----------
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') AS before \gset

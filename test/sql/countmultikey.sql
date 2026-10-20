@@ -55,8 +55,7 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', how, true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
@@ -95,8 +94,7 @@ BEGIN
 		EXECUTE 'DEALLOCATE lion_mk_off';
 	END IF;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_mk_r_on' INTO nrows;
@@ -239,8 +237,7 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1', '''w1 <-> x1'''
 -- What EXPLAIN prints: the parameter as core prints it, in both plans.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 PREPARE lion_mk_e(text[], tsquery) AS
 	SELECT g, count(*) FROM lion_mk_t WHERE tags @> $1 AND tsv @@ $2 GROUP BY g;
 SET plan_cache_mode = force_generic_plan;
@@ -251,8 +248,7 @@ RESET plan_cache_mode;
 DEALLOCATE lion_mk_e;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---- 4. stable expressions ------------------------------------------------
 -- evaluated once per scan, and anew by every execution of a cached plan
@@ -264,8 +260,7 @@ SELECT lion_mk($$SELECT g, count(*) FROM lion_mk_t WHERE tsv @@ to_tsquery('simp
 SET plan_cache_mode = force_generic_plan;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 PREPARE lion_mk_s1 AS SELECT count(*) FROM lion_mk_t
 	WHERE tags @> string_to_array(current_setting('lion_mk.tags'), ',')::text[];
 PREPARE lion_mk_s2 AS SELECT count(*) FROM lion_mk_t
@@ -285,8 +280,7 @@ EXECUTE lion_mk_s2;
 RESET plan_cache_mode;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 SET pg_lion.enable_count_pushdown = off;
 SELECT count(*) FROM lion_mk_t WHERE tags @> '{t1,t8}';
 SELECT count(*) FROM lion_mk_t WHERE tsv @@ 'w1 <-> x1';
@@ -304,8 +298,7 @@ DEALLOCATE lion_mk_s2;
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF)
 SELECT v.n, s.c FROM (VALUES (1, '{t1}'::text[]), (2, '{}'), (3, '{t1,NULL}'), (4, NULL)) v(n, a),
 	 LATERAL (SELECT count(*) AS c FROM lion_mk_t WHERE tags @> v.a) s;
@@ -317,8 +310,7 @@ SELECT v.n, s.c FROM (VALUES (1, '{t1}'::text[]), (2, '{}'), (3, '{t1,NULL}'), (
 RESET pg_lion.enable_count_pushdown;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---- 5. what the cost model picks, with nothing disabled -------------------
 -- A value it cannot estimate is priced as the shape that needs the most
@@ -348,8 +340,7 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	EXECUTE 'PREPARE lion_mk_pc AS ' || q;
 	EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE lion_mk_pc(' || args || ')' INTO p;
 	EXECUTE 'DEALLOCATE lion_mk_pc';

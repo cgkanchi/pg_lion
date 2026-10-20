@@ -13,6 +13,7 @@
 
 #include "lion_count_int.h"
 
+#include "pgstat.h"
 #if PG_VERSION_NUM >= 170000
 #include "storage/read_stream.h"
 #endif
@@ -1137,6 +1138,13 @@ lion_recheck_heap(LionCountCtx *cx)
 		visible = lion_recheck_heap_am(cx);
 
 	cx->stats.tids_rechecked += cx->ntids;
+
+	/*
+	 * The rows the heap gave, as a bitmap heap scan counts the ones it
+	 * returns: the table's tuples fetched (pg_stat_user_tables.idx_tup_fetch).
+	 */
+	if (visible > 0)
+		lion_pgstat_count_fetches(cx->heap, visible);
 	return visible;
 }
 

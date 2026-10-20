@@ -1,0 +1,391 @@
+-- Page deletion in the entry directory (DESIGN.md §21, "Page deletion"):
+-- VACUUM takes the leaves it empties out of the tree, with the internal pages
+-- above them that have no other child, and the pages are used again.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+/*
+ * Keys of 600 bytes: a dozen to a leaf and a dozen downlinks to an internal
+ * page, so 6,000 of them make a directory of four levels.  The key right
+ * after key 3700, with 'hot' appended, has 5,000 rows and a posting tree of
+ * its own.  dd_ref holds the same rows and no index: it is what every answer
+ * is compared with.
+ */
+CREATE FUNCTION dd_key(i int) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$ SELECT 'k' || lpad(i::text, 599, '0') $$;
+CREATE TABLE dd (id int, k text) WITH (autovacuum_enabled = off);
+ALTER TABLE dd ALTER k SET STORAGE PLAIN;
+CREATE TABLE dd_ref (id int, k text) WITH (autovacuum_enabled = off);
+INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(1, 6000) i;
+INSERT INTO dd SELECT 100000 + i, dd_key(3700) || 'hot' FROM generate_series(1, 5000) i;
+INSERT INTO dd_ref SELECT * FROM dd;
+CREATE INDEX dd_k ON dd USING lion (k);
+ANALYZE dd;
+/* q's answer on dd through the index, and on dd_ref, and whether they agree. */
+CREATE FUNCTION dd_same(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	a text;
+	b text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_sort', 'off', true);
+	EXECUTE format('SELECT string_agg(x::text, %L) FROM (%s) s(x)', ',',
+				   format(q, 'dd')) INTO a;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_sort', 'on', true);
+	EXECUTE format('SELECT string_agg(x::text, %L) FROM (%s) s(x)', ',',
+				   format(q, 'dd_ref')) INTO b;
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH index=%s reference=%s', a, b);
+	END IF;
+	RETURN 'ok ' || coalesce(left(a, 24), '<none>');
+END $$;
+-- The queries every step checks: the ends, both directions of an ordered
+-- walk, counts over ranges, lookups of keys that are gone and keys that are
+-- not, and the key with a posting tree.
+CREATE FUNCTION dd_check() RETURNS SETOF text
+LANGUAGE sql AS $$
+	SELECT dd_same('SELECT min(k) FROM %I')
+	UNION ALL SELECT dd_same('SELECT max(k) FROM %I')
+	UNION ALL SELECT dd_same('SELECT id FROM (SELECT id FROM %I ORDER BY k LIMIT 3) t')
+	UNION ALL SELECT dd_same('SELECT id FROM (SELECT id FROM %I ORDER BY k DESC LIMIT 3) t')
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k < ' || quote_literal(dd_key(2500)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k >= ' || quote_literal(dd_key(3500)) ||
+							 ' AND k < ' || quote_literal(dd_key(5200)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(10)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(4321)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(5999)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(4903)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(4998)))
+	UNION ALL SELECT dd_same('SELECT count(*) FROM %I WHERE k = ' || quote_literal(dd_key(3700) || 'hot'))
+$$;
+CREATE TABLE dd_size (step text, pages bigint, leaves bigint, internal bigint,
+					  deleted bigint);
+CREATE FUNCTION dd_note(step text) RETURNS void
+LANGUAGE sql AS $$
+	INSERT INTO dd_size
+	SELECT step, pg_relation_size('dd_k') / current_setting('block_size')::int,
+		   leaf_pages, internal_pages, deleted_pages
+	  FROM lion_index_stats('dd_k')
+$$;
+/*
+ * The internal pages of the directory that are not the rightmost of their
+ * level, by how many downlinks they hold: their items but the high key.
+ */
+CREATE FUNCTION dd_downlinks(OUT level int, OUT downlinks int, OUT pages bigint)
+RETURNS SETOF record LANGUAGE sql AS $$
+	SELECT get_byte(r, s + 24) + 256 * get_byte(r, s + 25), (h.lower - 24) / 4 - 1,
+		   count(*)
+	  FROM generate_series(1, (pg_relation_size('dd_k') / 8192)::int - 1) b,
+		   LATERAL get_raw_page('dd_k', b) r,
+		   LATERAL (SELECT special AS s, lower FROM page_header(r)) h
+	 -- DIR and not DELETED, with a right link
+	 WHERE (get_byte(r, s + 26) + 256 * get_byte(r, s + 27)) & (16 | 8) = 16
+	   AND get_byte(r, s) + get_byte(r, s + 1) + get_byte(r, s + 2) + get_byte(r, s + 3) < 4 * 255
+	 GROUP BY 1, 2
+$$;
+SELECT dd_note('built');
+ dd_note 
+---------
+ 
+(1 row)
+
+SELECT directory_height, leaf_pages, internal_pages, deleted_pages
+  FROM lion_index_stats('dd_k');
+ directory_height | leaf_pages | internal_pages | deleted_pages 
+------------------+------------+----------------+---------------
+                3 |        546 |             69 |             0
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 1,2,3
+ ok 6000,5999,5998
+ ok 2499
+ ok 6700
+ ok 1
+ ok 1
+ ok 1
+ ok 1
+ ok 1
+ ok 5000
+(12 rows)
+
+-- ---------- 1. the oldest half goes ----------
+-- Every leaf of keys 1 .. 3000 empties, the leftmost among them, and so do
+-- the internal pages above them that have no other key left under them.
+-- What stays is the last child of a parent that keeps others, and the
+-- rightmost page of each level.
+DELETE FROM dd WHERE id <= 3000;
+DELETE FROM dd_ref WHERE id <= 3000;
+VACUUM dd;
+SELECT dd_note('oldest half');
+ dd_note 
+---------
+ 
+(1 row)
+
+SELECT s.leaves < b.leaves / 2 + 20 AS leaves_went,
+	   s.internal < b.internal AS internal_went,
+	   s.deleted > b.leaves / 3 AS pages_deleted,
+	   s.pages = b.pages AS same_size
+  FROM dd_size s, dd_size b WHERE s.step = 'oldest half' AND b.step = 'built';
+ leaves_went | internal_went | pages_deleted | same_size 
+-------------+---------------+---------------+-----------
+ t           | t             | t             | t
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 3001,3002,3003
+ ok 6000,5999,5998
+ ok 0
+ ok 6700
+ ok 0
+ ok 1
+ ok 1
+ ok 1
+ ok 1
+ ok 5000
+(12 rows)
+
+-- ---------- 2. a run in the middle goes ----------
+-- A parent whose children all empty keeps its last one, empty: that
+-- downlink is the parent's only one, and the parent's own downlink is the
+-- last on the page above it, so neither goes.  An internal page of one
+-- downlink is what a deletion may leave (DESIGN.md §21, "Height").
+DELETE FROM dd WHERE id BETWEEN 4000 AND 4999;
+DELETE FROM dd_ref WHERE id BETWEEN 4000 AND 4999;
+VACUUM dd;
+SELECT dd_note('middle');
+ dd_note 
+---------
+ 
+(1 row)
+
+SELECT s.leaves < o.leaves AS leaves_went, s.deleted > o.deleted AS pages_deleted
+  FROM dd_size s, dd_size o WHERE s.step = 'middle' AND o.step = 'oldest half';
+ leaves_went | pages_deleted 
+-------------+---------------
+ t           | t
+(1 row)
+
+SELECT pages AS one_downlink FROM dd_downlinks() WHERE level > 0 AND downlinks = 1;
+ one_downlink 
+--------------
+            1
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 3001,3002,3003
+ ok 6000,5999,5998
+ ok 0
+ ok 5700
+ ok 0
+ ok 0
+ ok 1
+ ok 0
+ ok 0
+ ok 5000
+(12 rows)
+
+-- ---------- 3. new keys use the pages again ----------
+-- A transaction id is spent first, so that the deleted pages' safexid is
+-- behind every snapshot when the inserts look for pages (nbtree's rule): the
+-- index does not grow, and fewer of its pages are free.  Keys 4999 down to
+-- 4900 go first, into the range the run left: they go under the page of one
+-- downlink, whose leaf splits again and again, and the page takes their
+-- separators after its minus-infinity downlink and splits itself.
+SELECT txid_current() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(4999, 4900, -1) i;
+INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(6001, 8000) i;
+INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(4000, 4499) i;
+INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(4999, 4900, -1) i;
+INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(6001, 8000) i;
+INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(4000, 4499) i;
+SELECT dd_note('reinserted');
+ dd_note 
+---------
+ 
+(1 row)
+
+SELECT s.pages = m.pages AS no_growth, s.deleted < m.deleted AS reused
+  FROM dd_size s, dd_size m WHERE s.step = 'reinserted' AND m.step = 'middle';
+ no_growth | reused 
+-----------+--------
+ t         | t
+(1 row)
+
+SELECT min(downlinks) AS fewest_downlinks FROM dd_downlinks() WHERE level > 0;
+ fewest_downlinks 
+------------------
+                6
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 3001,3002,3003
+ ok 8000,7999,7998
+ ok 0
+ ok 6300
+ ok 0
+ ok 1
+ ok 1
+ ok 1
+ ok 1
+ ok 5000
+(12 rows)
+
+-- ---------- 4. the posting tree's key goes, then everything ----------
+DELETE FROM dd WHERE k = dd_key(3700) || 'hot';
+DELETE FROM dd_ref WHERE k = dd_key(3700) || 'hot';
+VACUUM dd;
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 3001,3002,3003
+ ok 8000,7999,7998
+ ok 0
+ ok 1300
+ ok 0
+ ok 1
+ ok 1
+ ok 1
+ ok 1
+ ok 0
+(12 rows)
+
+DELETE FROM dd;
+DELETE FROM dd_ref;
+VACUUM dd;
+SELECT dd_note('empty');
+ dd_note 
+---------
+ 
+(1 row)
+
+-- what is left is the root and the rightmost page of each level below it
+SELECT directory_height, leaf_pages, internal_pages, entries
+  FROM lion_index_stats('dd_k');
+ directory_height | leaf_pages | internal_pages | entries 
+------------------+------------+----------------+---------
+                3 |          1 |              3 |       0
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+ dd_check  
+-----------
+ ok <none>
+ ok <none>
+ ok <none>
+ ok <none>
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+(12 rows)
+
+-- ---------- 5. and grows again ----------
+SELECT txid_current() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(1, 3000) i;
+INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(1, 3000) i;
+SELECT dd_note('refilled');
+ dd_note 
+---------
+ 
+(1 row)
+
+SELECT s.pages = e.pages AS no_growth
+  FROM dd_size s, dd_size e WHERE s.step = 'refilled' AND e.step = 'empty';
+ no_growth 
+-----------
+ t
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_k');
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT * FROM dd_check();
+          dd_check           
+-----------------------------
+ ok k00000000000000000000000
+ ok k00000000000000000000000
+ ok 1,2,3
+ ok 3000,2999,2998
+ ok 2499
+ ok 0
+ ok 1
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+ ok 0
+(12 rows)
+
+DROP TABLE dd, dd_ref, dd_size;
+DROP FUNCTION dd_check(), dd_same(text), dd_key(int), dd_note(text),
+	dd_downlinks();

@@ -39,8 +39,9 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', (how = 'bitmap')::text, true);
-	PERFORM set_config('enable_indexscan', (how = 'plain')::text, true);
-	PERFORM set_config('enable_indexonlyscan', (how = 'plain')::text, true);
+	PERFORM set_config('enable_indexscan', (how IN ('plain', 'count'))::text, true);
+	PERFORM set_config('enable_indexonlyscan', (how IN ('plain', 'count'))::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (how = 'plain')::text, true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', (how = 'count')::text, true);
 	want := CASE how WHEN 'bitmap' THEN 'Bitmap Index Scan'
 					 WHEN 'plain' THEN 'Index (Only )?Scan using'
@@ -61,6 +62,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_nq_on' INTO nrows;
@@ -284,8 +286,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrdered\)' THEN
 			used := true;
@@ -296,8 +297,7 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	FOR r IN EXECUTE q LOOP
 		b := b || r::text;
@@ -349,14 +349,41 @@ CREATE INDEX lion_ne_m_m ON lion_ne_m USING lion (m);
 VACUUM (FREEZE, ANALYZE) lion_ne_m;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT * FROM lion_nplan($$SELECT m, id FROM lion_ne_m WHERE m::text LIKE '%.00' ORDER BY m LIMIT 5$$);
 SELECT count(*) FROM (SELECT m, id FROM lion_ne_m WHERE m::text LIKE '%.00' ORDER BY m LIMIT 700) s
  WHERE m::text LIKE '%.00';
+-- ... nor over float8's -0 and 0 or interval's '1 mon' and '30 days', equal
+-- and printed differently
+CREATE TABLE lion_ne_r (id int PRIMARY KEY, f float8, iv interval) WITH (autovacuum_enabled = off);
+INSERT INTO lion_ne_r SELECT i, CASE i % 4 WHEN 0 THEN '-0'::float8 WHEN 1 THEN 0 ELSE i % 3 END,
+  CASE i % 4 WHEN 0 THEN interval '1 mon' WHEN 1 THEN interval '30 days' ELSE make_interval(days => i % 3) END
+  FROM generate_series(1, 2000) i;
+CREATE INDEX lion_ne_r_f ON lion_ne_r USING lion (f);
+CREATE INDEX lion_ne_r_iv ON lion_ne_r USING lion (iv);
+VACUUM (FREEZE, ANALYZE) lion_ne_r;
+SELECT * FROM lion_nplan($$SELECT f, id FROM lion_ne_r WHERE f::text = '-0' ORDER BY f LIMIT 5$$);
+SELECT count(*) FROM (SELECT f, id FROM lion_ne_r WHERE f::text = '-0' ORDER BY f LIMIT 700) s;
+SELECT * FROM lion_nplan($$SELECT iv, id FROM lion_ne_r WHERE extract(month FROM iv) = 1 ORDER BY iv LIMIT 5$$);
+SELECT count(*) FROM (SELECT iv, id FROM lion_ne_r WHERE extract(month FROM iv) = 1 ORDER BY iv LIMIT 700) s;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-DROP TABLE lion_ne_z, lion_ne_m;
+RESET pg_lion.enable_plain_scan;
+-- ... nor for a filter that is merely stable: pg_column_size() and
+-- pg_column_compression() read how a row stores its value, and one value
+-- stored compressed in some rows and plain in others is still one entry
+CREATE TABLE lion_ne_t (id int PRIMARY KEY, s text) WITH (autovacuum_enabled = off);
+INSERT INTO lion_ne_t SELECT i, 'k' || lpad(i::text, 5, '0') FROM generate_series(1, 2000) i;
+INSERT INTO lion_ne_t SELECT 100000 + i, repeat('ab', 1020) FROM generate_series(1, 3) i;
+ALTER TABLE lion_ne_t ALTER COLUMN s SET STORAGE PLAIN;
+INSERT INTO lion_ne_t SELECT 200000 + i, repeat('ab', 1020) FROM generate_series(1, 3) i;
+CREATE INDEX lion_ne_t_s ON lion_ne_t USING lion (s);
+VACUUM (FREEZE, ANALYZE) lion_ne_t;
+SELECT lion_no($$SELECT id FROM lion_ne_t WHERE pg_column_size(s) > 1000 ORDER BY s, id LIMIT 10$$);
+SELECT lion_no($$SELECT id FROM lion_ne_t WHERE pg_column_compression(s) IS NULL ORDER BY s DESC, id LIMIT 3$$);
+SELECT * FROM lion_nplan($$SELECT id FROM lion_ne_t WHERE pg_column_size(s) > 1000 ORDER BY s LIMIT 10$$);
+SELECT id FROM lion_ne_t WHERE pg_column_size(s) > 1000 ORDER BY s, id LIMIT 10;
+DROP TABLE lion_ne_z, lion_ne_m, lion_ne_r, lion_ne_t;
 
 DROP FUNCTION lion_no(text);
 DROP FUNCTION lion_nrun(text);

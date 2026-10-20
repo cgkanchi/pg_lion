@@ -34,7 +34,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -48,7 +49,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
@@ -76,7 +78,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ 'temp written=[1-9]' THEN
@@ -85,7 +88,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	RETURN written;
 END $$;
@@ -96,7 +100,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(LionOrdered|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by|Switched)' THEN
@@ -105,7 +110,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 END $$;
 -- ogn: 400,000 narrow rows, 88 a heap page, so a container key of 64 pages
@@ -178,13 +184,13 @@ SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k DESC, id DESC LIMI
  LionOrdered, 20000 rows
 (1 row)
 
-SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 1000');
                 og_run                
 --------------------------------------
  ->  Custom Scan (LionOrdered) on ogn
- Index Entries Walked: 6
- Lion Set Hits: 5
- Heap Fetches: 5
+ Index Entries Walked: 2014
+ Lion Set Hits: 1000
+ Heap Fetches: 1000
  Lion Set: 72 containers, exact
 (5 rows)
 
@@ -319,14 +325,14 @@ SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER 
  LionOrdered, 20000 rows
 (1 row)
 
-SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 1000');
                      og_run                     
 ------------------------------------------------
  ->  Custom Scan (LionOrdered) on ogn
- Index Entries Walked: 6
- Lion Set Hits: 5
- Heap Fetches: 5
- Lion Set: 72 containers, exact, spilled 637 kB
+ Index Entries Walked: 1524
+ Lion Set Hits: 1000
+ Heap Fetches: 1000
+ Lion Set: 72 containers, exact, spilled 689 kB
 (5 rows)
 
 --    the spill goes through the server's temporary files: temp_file_limit
@@ -342,7 +348,7 @@ EXCEPTION WHEN OTHERS THEN
 END $$;
 NOTICE:  53400: temporary file size exceeds temp_file_limit (512kB)
 RESET temp_file_limit;
-SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
+SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 1000');
        og_temp       
 ---------------------
  temp blocks written
@@ -379,7 +385,8 @@ SELECT * FROM og_run($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
 --    cursor is paused after the build (as ordered.sql's section 16 reads it)
 BEGIN;
 SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 DECLARE og_cur CURSOR FOR SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id;
 FETCH 2 FROM og_cur;
   id   

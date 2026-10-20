@@ -84,8 +84,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	IF nojoins THEN
 		PERFORM set_config('enable_hashjoin', 'off', true);
 		PERFORM set_config('enable_mergejoin', 'off', true);
@@ -124,8 +123,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE cp_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM cp_on' INTO nrows;
@@ -785,15 +783,15 @@ SELECT cp_q($$SELECT d.region, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE 
 (1 row)
 
 SELECT cp_q($$SELECT d.region, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE f.act AND f.st = 'on' AND f.kind = 'k0' AND d.active GROUP BY d.region$$, true);
-                                             cp_q                                             
-----------------------------------------------------------------------------------------------
- LionCount + LionOrdered [pc_p1] implied: act, (st = 'on'::text), (kind = 'k0'::text), 4 rows
+                                      cp_q                                      
+--------------------------------------------------------------------------------
+ LionCount [pc_p1] implied: act, (st = 'on'::text), (kind = 'k0'::text), 4 rows
 (1 row)
 
 SELECT cp_q($$SELECT d.region, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE f.act AND f.st = 'on' AND f.kind = 'k0' AND d.active AND d.region = 'r1' GROUP BY d.region$$, true);
-                                             cp_q                                             
-----------------------------------------------------------------------------------------------
- LionCount + LionOrdered [pc_p1] implied: act, (st = 'on'::text), (kind = 'k0'::text), 1 rows
+                                      cp_q                                      
+--------------------------------------------------------------------------------
+ LionCount [pc_p1] implied: act, (st = 'on'::text), (kind = 'k0'::text), 1 rows
 (1 row)
 
 SELECT cp_q($$SELECT d.region, f.g, count(*) FROM pc f JOIN pcd d ON f.a = d.k WHERE f.act AND f.st = 'on' AND f.kind = 'k0' GROUP BY d.region, f.g$$, true);

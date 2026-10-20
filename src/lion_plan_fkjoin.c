@@ -1388,6 +1388,9 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 #endif
 	}
 
+	/* the fact side is answered from its indexes alone (lion_count_path_add()) */
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
+
 	input = &cpath->path;
 	inrows = rows;
 	if (partial)
@@ -2453,6 +2456,8 @@ lion_add_semijoin_path(PlannerInfo *root, const LionFkJoin *fj,
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = child->disabled_nodes;
 #endif
+	/* ... and so is a semi or anti join's (lion_count_path_add()) */
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
 
 	/*
 	 * It projects, as core's joins do: a target list other than the join

@@ -2387,6 +2387,7 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);
 			for (i = 0; i < nkeys; i++)
 			{
+				keys[i] = lion_key_prepare(cs, keys[i], NULL, tid);
 				lion_acc_add(sp, col, keys[i], code,
 							 kpos != NULL ? &kpos[i] : NULL);
 				/* one row can have any number of them */
@@ -2400,14 +2401,13 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 
 			/*
 			 * An out-of-line or compressed value is expanded once here rather
-			 * than by every function it meets.  A short header is left as it
-			 * is: the hash and equality functions take it as it comes, and
-			 * lion_store_key() gives a new key its full header.
+			 * than by every function it meets - or, past what a key holds
+			 * plain, put in the compressed form it is stored in
+			 * (lion_key_prepare(), DESIGN.md §4 "Long keys").  A short header
+			 * is left as it is: the hash and equality functions take it as it
+			 * comes, and lion_store_key() gives a new key its full header.
 			 */
-			if (cs->typlen == -1 &&
-				(VARATT_IS_EXTERNAL(DatumGetPointer(key)) ||
-				 VARATT_IS_COMPRESSED(DatumGetPointer(key))))
-				key = PointerGetDatum(PG_DETOAST_DATUM(key));
+			key = lion_key_prepare(cs, key, NULL, tid);
 
 			lion_acc_add(sp, col, key, code, NULL);
 		}

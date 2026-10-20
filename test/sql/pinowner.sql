@@ -95,7 +95,7 @@ END $$;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 
 -- ---------- a failed subtransaction gives its charges back ----------
 -- thirty neighbouring keys under an OR: a leaf or two, within the budget, so
@@ -166,7 +166,7 @@ SELECT lion_po_cmp($$SELECT count(*) FROM lion_po WHERE tags && (SELECT array_ag
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP FUNCTION lion_po_fail(int);
 DROP FUNCTION lion_po_cmp(text);
 DROP FUNCTION lion_po_src(text);

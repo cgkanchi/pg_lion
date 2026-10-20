@@ -22,7 +22,9 @@ CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
 -- Every live container page of an index, from its special area: its right
--- link, the set it belongs to (owner_head), its level and its flags.
+-- link, the set it belongs to (owner_head), its level and its flags.  A leaf
+-- VACUUM took out of its set (UNLINKED, DESIGN.md §22 "Empty leaves") is not
+-- one.
 CREATE FUNCTION ft_pages(idx regclass,
 	OUT blk int, OUT rightlink bigint, OUT owner bigint, OUT level int, OUT flags int)
 RETURNS SETOF record LANGUAGE sql AS $$
@@ -36,8 +38,8 @@ RETURNS SETOF record LANGUAGE sql AS $$
 	  FROM generate_series(1, (pg_relation_size(idx) / 8192)::int - 1) b,
 		   LATERAL get_raw_page(idx::text, b) r,
 		   LATERAL (SELECT special AS s FROM page_header(r)) h
-	 -- CONTAINER and not DELETED
-	 WHERE (get_byte(r, s + 26) + 256 * get_byte(r, s + 27)) & 12 = 4
+	 -- CONTAINER, not DELETED and not UNLINKED
+	 WHERE (get_byte(r, s + 26) + 256 * get_byte(r, s + 27)) & (4 | 8 | 512) = 4
 $$;
 
 -- One set's shape: its leaves and internal pages, whether its head is a leaf
@@ -176,8 +178,8 @@ SELECT * FROM ft_counts();
 -- ---------------------------------------------------------------------
 
 -- The first half of every big key's rows, and all of k = 2's but one: the
--- leaves at the front of each chain, the head among them, are left empty,
--- and stay in the chain.
+-- leaves at the front of each set are left empty.  A flat set's head stays;
+-- the other empty leaves leave their sets.
 WITH m AS (SELECT k, percentile_disc(0.5) WITHIN GROUP (ORDER BY id) AS mid
 			 FROM ft WHERE k IN (3, 4, 5) GROUP BY k)
 DELETE FROM ft USING m WHERE ft.k = m.k AND ft.id < m.mid;

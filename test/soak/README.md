@@ -190,7 +190,8 @@ counts, GROUP BYs, count(DISTINCT), the top k, a multi-key column, a
 partitioned table, the FK-side, semi and anti joins, LATERAL joins,
 LionOrdered, six of them as generic plans - each planned under 13 settings
 from the defaults to every rate and the margin at their bounds, with core's
-joins, aggregates or scans all off, and in parallel, and each answer compared
+joins or aggregates all off, with core's sequential and bitmap scans and the
+AM's plain scans off, and in parallel, and each answer compared
 with the same query's with lion's paths off.  It prints every plan's lion
 node and cost and a verdict line; a differing answer or a cost that is not
 finite fails.  A build without the settings skips it.

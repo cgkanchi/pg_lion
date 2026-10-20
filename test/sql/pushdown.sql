@@ -102,8 +102,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
 	IF p -> 0 -> 'Plan' ->> 'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
@@ -597,7 +596,7 @@ SELECT lion_pd('SELECT v, count(*) FROM lion_pdn WHERE v = 1.000 GROUP BY v');
  */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 -- (and no Sort, so that core's own plan for the refused grouping is the same
 -- whether disabled paths are counted, as in 18, or priced, as in 16 and 17)
 SET enable_sort = off;
@@ -607,7 +606,7 @@ SELECT lion_plans('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 SELECT lion_pd('SELECT count(*) FROM lion_pdn WHERE v = 1.000');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SELECT v, count(*) FROM lion_pdn GROUP BY v ORDER BY v;
 
 -- ---- bpchar: an equalimage function that is not enough -----------------
@@ -629,7 +628,7 @@ INSERT INTO lion_pdb VALUES ('a', 1);
 ANALYZE lion_pdb;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdb GROUP BY c');
 SELECT lion_pd('SELECT c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY c');
 SELECT lion_pd('SELECT k, c, count(*) FROM lion_pdb WHERE c = ''a'' GROUP BY k, c');
@@ -660,7 +659,7 @@ SELECT f, i FROM (SELECT f, count(*) FROM lion_pdf GROUP BY f) a,
 	(SELECT i, count(*) FROM lion_pdf GROUP BY i) b;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---- an unpopulated materialized view --------------------------------
 /*
@@ -676,7 +675,7 @@ CREATE INDEX lion_pdm_k ON lion_pdm USING lion (k);
 CREATE INDEX lion_pdm_j ON lion_pdm USING lion (j);
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT k, count(*) FROM lion_pdm GROUP BY k;
 SELECT k, count(*) FROM lion_pdm GROUP BY k;
 SELECT count(*) FROM lion_pdm WHERE k = 1;
@@ -694,7 +693,7 @@ SELECT lion_pd('SELECT count(*) FROM lion_pdm WHERE k = 1');
 SELECT lion_pd('SELECT j, count(DISTINCT k) FROM lion_pdm GROUP BY j');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP MATERIALIZED VIEW lion_pdm;
 DROP TABLE lion_pdf;
 DROP TABLE lion_pdb;
@@ -1160,8 +1159,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
@@ -1179,7 +1177,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	EXECUTE q INTO noff;
 	IF non IS DISTINCT FROM noff THEN
 		RETURN format('MISMATCH: node %s, ordinary plan %s', non, noff);
@@ -1253,7 +1251,7 @@ CREATE INDEX lion_pdk_h ON lion_pdk USING lion (h);
 VACUUM (FREEZE, ANALYZE) lion_pdk;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF)
 SELECT k, count(*) FROM lion_pdk
  WHERE k = ANY ('{5,17,3,150,42,99,1,120}'::int8[]) AND h IN (1, 2)
@@ -1273,7 +1271,7 @@ SELECT lion_pd($$SELECT k, count(*) FROM lion_pdk
 				GROUP BY k$$);
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE lion_pdk;
 DROP OPERATOR FAMILY lion_pdk_fam USING lion;
 /*
