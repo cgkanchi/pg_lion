@@ -1987,7 +1987,9 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
  * filter's columns, a primary key under a filter on others, is walked whole
  * by the node all the same, the filter answered by the set and the columns
  * the node must produce decided per pair (§40.1).  A partial btree only where
- * the query implies its predicate, as core takes one.
+ * the query implies its predicate, as core takes one.  Not when core built a
+ * path of it that is none of these - a BitmapOr of its scans for an OR of its
+ * column's equalities, on 16 and 17 - which reads its matches alone.
  */
 static List *
 lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
@@ -2013,7 +2015,7 @@ lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
 		if (!list_member_ptr(result, ipath))
 			result = lappend(result, ipath);
 	}
-	if (result == NIL && (idx->indpred == NIL || idx->predOK))
+	if (scratch->pathlist == NIL && (idx->indpred == NIL || idx->predOK))
 		result = lappend(result,
 						 create_index_path(root, idx, NIL, NIL, NIL, NIL,
 										   ForwardScanDirection, true, NULL,
@@ -2886,61 +2888,45 @@ lo_rinfos_in(List *a, List *b)
 }
 
 /*
- * The lion side of a lionvec order that answers every restriction clause a
- * lion index can (DESIGN.md §44.6, "Post-filtering"), when none of core's
- * accesses `cands` does: core builds the accesses a bitmap scan would use,
- * and leaves out of a BitmapAnd an index whose bitmap costs more than the
- * rows it saves the heap scan (choose_bitmap_and()) - `tag < 50` beside
- * `cat IN (1, 2)` - since a Filter takes such a clause cheaply.  A lionvec
- * scan's Filter is what may not happen here, so the set is ANDed from the
- * access that leaves the fewest clauses and then, while a clause is left,
- * the access that answers most of the ones left, among core's and those of
- * each lion index alone (whose paths the others cannot have pruned).  The
- * price decides as for any lion side (lo_cost_knn()): a clause that keeps
- * most rows makes a set costly to build.
- *
- * The clauses of the lionvec index vidx's own (lo_knn_own()) need no
- * answer: the node's Filter may apply them.
- *
- * NULL when an access in cands answers every clause already, or when some
- * clause no lion access answers (or, which should not happen, their AND
- * leaves one); *left is then those clauses, which a plan must filter.
+ * The accesses a cover is ANDed from (lo_cover_and()): core's, cands, and
+ * those core builds for each lion index alone, whose paths the others cannot
+ * have pruned; *residuals their residuals (lo_lion_residual()), in order.
+ */
+static List *
+lo_cover_pool(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
+			  Oid lionam, List **residuals)
+{
+	List	   *pool = list_copy(cands);
+	ListCell   *lc;
+
+	foreach(lc, lionidx)
+		pool = list_concat(pool, lo_lion_accesses(root, rel,
+												  list_make1(lfirst(lc)),
+												  NIL, lionam));
+	*residuals = NIL;
+	foreach(lc, pool)
+		*residuals = lappend(*residuals,
+							 lo_lion_residual(rel, (Path *) lfirst(lc)));
+	return pool;
+}
+
+/*
+ * The access of pool that answers every clause of rest, or the BitmapAnd of
+ * those that do: the access that leaves the fewest of them and then, while a
+ * clause is left, the one that answers most of the ones left.  NULL when no
+ * AND of them answers all; *left is then the clauses none answers.
  */
 static Path *
-lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
-			 Oid lionam, IndexOptInfo *vidx, List **left)
+lo_cover_and(PlannerInfo *root, RelOptInfo *rel, List *pool,
+			 List *residuals, List *rest, List **left)
 {
-	List	   *pool = NIL;
-	List	   *residuals = NIL;
 	List	   *chosen = NIL;
 	List	   *quals = NIL;
-	List	   *rest = NIL;
 	Path	   *best = NULL;
 	ListCell   *lc;
 	ListCell   *lc2;
 
 	*left = NIL;
-	foreach(lc, rel->baserestrictinfo)
-		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
-			rest = lappend(rest, lfirst(lc));
-	rest = lo_knn_others(rest, vidx);
-	if (rest == NIL)
-		return NULL;			/* the scan's own clauses alone */
-	foreach(lc, cands)
-		if (lo_knn_others(lo_lion_residual(rel, (Path *) lfirst(lc)),
-						  vidx) == NIL)
-			return NULL;		/* the pairing has it already */
-
-	/* core's accesses, and each lion index's alone */
-	pool = list_copy(cands);
-	foreach(lc, lionidx)
-		pool = list_concat(pool, lo_lion_accesses(root, rel,
-												  list_make1(lfirst(lc)),
-												  NIL, lionam));
-	foreach(lc, pool)
-		residuals = lappend(residuals, lo_lion_residual(rel, (Path *) lfirst(lc)));
-
-	/* greedily, the access that answers most of the clauses left */
 	for (;;)
 	{
 		int			most = 0;
@@ -2985,7 +2971,55 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 		else
 			quals = lappend(quals, p);
 	}
-	best = (Path *) create_bitmap_and_path(root, rel, quals);
+	return (Path *) create_bitmap_and_path(root, rel, quals);
+}
+
+/*
+ * The lion side of a lionvec order that answers every restriction clause a
+ * lion index can (DESIGN.md §44.6, "Post-filtering"), when none of core's
+ * accesses `cands` does: core builds the accesses a bitmap scan would use,
+ * and leaves out of a BitmapAnd an index whose bitmap costs more than the
+ * rows it saves the heap scan (choose_bitmap_and()) - `tag < 50` beside
+ * `cat IN (1, 2)` - since a Filter takes such a clause cheaply.  A lionvec
+ * scan's Filter is what may not happen here, so the set is ANDed from the
+ * accesses that answer them (lo_cover_and()), among core's and those of
+ * each lion index alone (lo_cover_pool()).  The price decides as for any
+ * lion side (lo_cost_knn()): a clause that keeps most rows makes a set
+ * costly to build.
+ *
+ * The clauses of the lionvec index vidx's own (lo_knn_own()) need no
+ * answer: the node's Filter may apply them.
+ *
+ * NULL when an access in cands answers every clause already, or when some
+ * clause no lion access answers (or, which should not happen, their AND
+ * leaves one); *left is then those clauses, which a plan must filter.
+ */
+static Path *
+lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
+			 Oid lionam, IndexOptInfo *vidx, List **left)
+{
+	List	   *pool;
+	List	   *residuals;
+	List	   *rest = NIL;
+	Path	   *best;
+	ListCell   *lc;
+
+	*left = NIL;
+	foreach(lc, rel->baserestrictinfo)
+		if (!lfirst_node(RestrictInfo, lc)->pseudoconstant)
+			rest = lappend(rest, lfirst(lc));
+	rest = lo_knn_others(rest, vidx);
+	if (rest == NIL)
+		return NULL;			/* the scan's own clauses alone */
+	foreach(lc, cands)
+		if (lo_knn_others(lo_lion_residual(rel, (Path *) lfirst(lc)),
+						  vidx) == NIL)
+			return NULL;		/* the pairing has it already */
+
+	pool = lo_cover_pool(root, rel, cands, lionidx, lionam, &residuals);
+	best = lo_cover_and(root, rel, pool, residuals, rest, left);
+	if (best == NULL)
+		return NULL;
 
 	/*
 	 * Its residual should be none, being no larger than any of theirs: a
@@ -3003,6 +3037,88 @@ lo_knn_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
 		return NULL;
 	}
 	return best;
+}
+
+/* Does every access in cands leave one of the clauses want to its Filter? */
+static bool
+lo_cover_wanted(RelOptInfo *rel, List *cands, List *want)
+{
+	ListCell   *lc;
+
+	if (want == NIL)
+		return false;
+	foreach(lc, cands)
+		if (lo_rinfos_in(want, lo_lion_residual(rel, (Path *) lfirst(lc))) == NIL)
+			return false;
+	return true;
+}
+
+/*
+ * The lion side of a btree walk that answers every restriction clause a lion
+ * access answers (DESIGN.md §40.2, "A clause core's AND leaves out"), when
+ * none of core's accesses `cands` does.  Core leaves out of a BitmapAnd a
+ * clause that keeps most rows (lo_knn_cover()) - `b IN (1, 2)` of three
+ * values beside `a IN (1, 2)` of twenty - since its bitmap heap scan's
+ * Filter tests the clause on the heap tuple it fetches anyway.  A covering
+ * btree's walk fetches none, but a clause its set leaves, of a column the
+ * btree does not hold, would make it fetch every member's: no index-only
+ * walk is offered, and the query goes to the heap.  So beside core's
+ * accesses, the AND of those that answer them all (lo_cover_and()), for the
+ * walks it makes index-only; the price decides, as a clause that keeps most
+ * rows makes a set costly to build, and a btree holding its column takes it
+ * from the index tuple more cheaply.  A walk in heap mode reads the tuple
+ * for its values and keeps core's accesses.
+ *
+ * The clauses wanted are those whose columns a lion index's key has
+ * (lo_knn_own()) and some lion access answers: one none answers is the
+ * Filter's whatever the set.  NULL when an access in cands answers all of
+ * them already.
+ */
+static Path *
+lo_lion_cover(PlannerInfo *root, RelOptInfo *rel, List *cands, List *lionidx,
+			  Oid lionam)
+{
+	List	   *want = NIL;
+	List	   *answered = NIL;
+	List	   *pool;
+	List	   *residuals;
+	List	   *left;
+	ListCell   *lc;
+	ListCell   *lc2;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (rinfo->pseudoconstant)
+			continue;
+		foreach(lc2, lionidx)
+		{
+			if (lo_knn_own((IndexOptInfo *) lfirst(lc2), rinfo))
+			{
+				want = lappend(want, rinfo);
+				break;
+			}
+		}
+	}
+	if (!lo_cover_wanted(rel, cands, want))
+		return NULL;
+
+	pool = lo_cover_pool(root, rel, cands, lionidx, lionam, &residuals);
+	foreach(lc, want)
+	{
+		foreach(lc2, residuals)
+		{
+			if (!list_member_ptr((List *) lfirst(lc2), lfirst(lc)))
+			{
+				answered = lappend(answered, lfirst(lc));
+				break;
+			}
+		}
+	}
+	if (!lo_cover_wanted(rel, cands, answered))
+		return NULL;
+	return lo_cover_and(root, rel, pool, residuals, answered, &left);
 }
 
 /*
@@ -3122,6 +3238,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	List	   *lionidx = NIL;
 	List	   *cands = NIL;
 	List	   *knncands;
+	Path	   *lioncover = NULL;
 	List	   *walks = NIL;
 	Bitmapset  *targetattrs = NULL;
 	ListCell   *lc;
@@ -3284,6 +3401,16 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		}
 	}
 
+	/*
+	 * And the AND that answers each clause a lion access answers, when none
+	 * of core's accesses does (lo_lion_cover()), for the walks it lets read
+	 * no heap tuple: index-only ones.
+	 */
+	if (cands != NIL)
+		lioncover = lo_lion_cover(root, rel, cands, lionidx, lionam);
+	if (lioncover != NULL)
+		cands = lappend(list_copy(cands), lioncover);
+
 	foreach(lc, ordpaths)
 	{
 		IndexPath  *ord = (IndexPath *) lfirst(lc);
@@ -3331,6 +3458,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 													  ord->indexclauses,
 													  lionqual, lossy),
 									  &iocols);
+			if (lion == lioncover && !indexonly)
+				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
 					indexonly, NULL, &startup, &total);
 			lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,

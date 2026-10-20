@@ -153,7 +153,9 @@ END $$;
 
 /*
  * bp_plan() prints q's plan, every core scan but the index-only one disabled,
- * without the lines whose contents vary between majors.
+ * without the lines whose contents vary between majors - and with the lion
+ * indexes, and the clauses of an AND of their accesses, sorted: core orders
+ * a BitmapAnd's arms by their costs, which tie differently on 16 and 17.
  */
 CREATE FUNCTION bp_plan(q text) RETURNS SETOF text
 LANGUAGE plpgsql
@@ -162,11 +164,26 @@ SET enable_indexscan = off SET enable_tidscan = off
 AS $$
 DECLARE
 	ln text;
+	head text;
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers)' THEN
-			RETURN NEXT ln;
+		IF ln ~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers)' THEN
+			CONTINUE;
 		END IF;
+		head := substring(ln from '^(\s*Lion Indexes: )');
+		IF head IS NOT NULL THEN
+			ln := head || (SELECT string_agg(x, ', ' ORDER BY x)
+							 FROM unnest(string_to_array(substr(ln, length(head) + 1), ', ')) x);
+		END IF;
+		head := substring(ln from '^(\s*Lion Cond: )\(\(.*\) AND \(.*\)\)$');
+		IF head IS NOT NULL AND ln !~ ' OR ' THEN
+			ln := head || '((' ||
+				(SELECT string_agg(x, ') AND (' ORDER BY x)
+				   FROM unnest(string_to_array(substr(ln, length(head) + 3,
+													  length(ln) - length(head) - 4),
+											   ') AND (')) x) || '))';
+		END IF;
+		RETURN NEXT ln;
 	END LOOP;
 END $$;
 
@@ -253,12 +270,14 @@ END $$;
 SELECT * FROM bp_plan('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT * FROM bp_plan('SELECT id FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id');
 SELECT * FROM bp_plan('SELECT id FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id DESC');
-SELECT * FROM bp_plan('SELECT id, length(payload) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id');
+SELECT * FROM bp_plan('SELECT id, length(payload) FROM bp WHERE c20 = 3 ORDER BY id');
 
 -- 2. The answers against the ordinary plan: ANDs, ORs and IN lists of lion
 --    filters, multi-key ones, a B-tree qual beside them, aggregates and a
 --    GROUP BY, the orders of a Gather Merge both ways, a LIMIT, an empty
---    answer, heap mode.
+--    answer, heap mode.  `c2 = 1` beside `c20 IN (3, 4)` keeps half the rows
+--    and core's AND leaves it out; the walk's set answers it too (DESIGN.md
+--    §40.2, "A clause core's AND leaves out"), so the walk is index only.
 SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT bp_cmp('SELECT k, x FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
@@ -272,14 +291,14 @@ SELECT bp_cmp('SELECT id FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER B
 SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 AND c20 IN (3, 4) ORDER BY k', true);
 SELECT bp_cmp('SELECT id FROM bp WHERE c20 = 3 ORDER BY id LIMIT 7', true);
 SELECT bp_cmp('SELECT id FROM bp WHERE c20 = -1');
-SELECT bp_cmp('SELECT id, length(payload) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id', true);
+SELECT bp_cmp('SELECT id, length(payload) FROM bp WHERE c20 = 3 ORDER BY id', true);
 
 -- 3. The counters on a table VACUUM has left all-visible: the members met,
 --    no heap fetch, the set built once and shared.
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
 SELECT bp_same('SELECT id FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id');
-SELECT bp_same('SELECT id, length(payload) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id');
+SELECT bp_same('SELECT id, length(payload) FROM bp WHERE c20 = 3 ORDER BY id');
 
 -- 4. Pages not all-visible: rows inserted in this transaction, then updated
 --    (HOT and not) and deleted rows before VACUUM.  Every participant tests
@@ -304,11 +323,11 @@ SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY['
 SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
 SELECT bp_cmp('SELECT k, x FROM bp WHERE c20 IN (3, 4) AND tags @> ARRAY[''t3''] ORDER BY k', true);
 SELECT bp_cmp('SELECT grp, count(*), sum(x) FROM bp WHERE tags @> ARRAY[''u5''] GROUP BY grp');
-SELECT bp_cmp('SELECT id, length(payload) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id', true);
+SELECT bp_cmp('SELECT id, length(payload) FROM bp WHERE c20 = 3 ORDER BY id', true);
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
 SELECT bp_same('SELECT k, x FROM bp WHERE c20 IN (3, 4) AND tags @> ARRAY[''t3''] ORDER BY k');
-SELECT bp_same('SELECT id, length(payload) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3''] ORDER BY id');
+SELECT bp_same('SELECT id, length(payload) FROM bp WHERE c20 = 3 ORDER BY id');
 VACUUM (FREEZE, ANALYZE) bp;
 SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
@@ -409,10 +428,12 @@ RESET enable_nestloop;
 --     below a parallel LionCount; for the inner join, the semi join and the
 --     anti join.  bp_fk() runs q with the joins disabled, so that the count
 --     pushdown is the plan, names its node and the dimension's path below
---     it, and compares the answers with the ordinary plan's.  The dimension's
---     heap is twenty times its primary key, and the walk is chosen over a
---     bitmap scan of the heap with nothing else disabled: at random_page_cost
---     4, and at 1, a heap page costing what an index page does.
+--     it, and compares the answers with the ordinary plan's; bp_fk_heap()
+--     shows that walk reads none of the dimension's heap while the
+--     visibility map calls its pages all-visible.  The dimension's heap is
+--     twenty times its primary key, and the walk is chosen over a bitmap
+--     scan of the heap with nothing else disabled: at random_page_cost 4,
+--     and at 1, a heap page costing what an index page does.
 SET pg_lion.enable_count_pushdown = on;
 SET pg_lion.enable_semijoin = off;
 CREATE TABLE bpd (
@@ -476,16 +497,45 @@ BEGIN
 	RETURN format('%s%s, %s rows', node, child, coalesce(array_length(a, 1), 0));
 END $$;
 
+/*
+ * bp_fk_heap() runs q under EXPLAIN ANALYZE with the joins disabled and names
+ * the walk of the dimension below the count and its heap fetches: none when
+ * the visibility map calls the dimension's pages all-visible, the key and the
+ * grouped column read from the B-tree alone.
+ */
+CREATE FUNCTION bp_fk_heap(q text) RETURNS text
+LANGUAGE plpgsql
+SET enable_hashjoin = off SET enable_mergejoin = off SET enable_nestloop = off
+AS $$
+DECLARE
+	ln text;
+	walk text := 'no walk';
+	fetched text := 'not counted';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(Lion(Ordered|BtreeScan)\)' THEN
+			walk := btrim(regexp_replace(ln, '^\s*->\s*(.*) on .*$', '\1'));
+		ELSIF walk <> 'no walk' AND ln ~ '^\s*Heap Fetches:' THEN
+			fetched := CASE WHEN ln ~ ': 0$' THEN 'none' ELSE 'some' END;
+		END IF;
+	END LOOP;
+	RETURN format('%s, heap fetches %s', walk, fetched);
+END $$;
+
 SET max_parallel_workers_per_gather = 0;
 SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND NOT EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SELECT bp_fk('SELECT d.attr, count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 GROUP BY d.attr');
+SELECT bp_fk_heap('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
+SELECT bp_fk_heap('SELECT d.attr, count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 GROUP BY d.attr');
 SET max_parallel_workers_per_gather = 2;
 SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND NOT EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SELECT bp_fk('SELECT d.attr, count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 GROUP BY d.attr');
+SELECT bp_fk_heap('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
+SELECT bp_fk_heap('SELECT count(*) FROM bpd d WHERE d.region = 1 AND NOT EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SET random_page_cost = 1;
 SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 SET max_parallel_workers_per_gather = 0;
@@ -496,10 +546,23 @@ RESET random_page_cost;
 UPDATE bpd SET pad = 'u' WHERE id % 17 = 0;
 DELETE FROM bpd WHERE id % 19 = 0;
 SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
+SELECT bp_fk_heap('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 SET max_parallel_workers_per_gather = 2;
 SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND NOT EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
+SELECT bp_fk_heap('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 RESET pg_lion.enable_semijoin;
 SET pg_lion.enable_count_pushdown = off;
 DROP TABLE bpf, bpd;
 DROP TABLE bp;
+DROP FUNCTION bp_fk_heap(text);
+DROP FUNCTION bp_fk(text);
+DROP FUNCTION bp_same(text);
+DROP FUNCTION bp_serial_counters(text);
+DROP FUNCTION bp_counters(text);
+DROP FUNCTION bp_plan(text);
+DROP FUNCTION bp_cmp(text, boolean);
+DROP FUNCTION bp_ordinary(text);
+DROP FUNCTION bp_node(text);
+DROP FUNCTION bp_rows(text);
+DROP FUNCTION bp_wrapped(text);

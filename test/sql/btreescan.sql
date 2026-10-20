@@ -566,6 +566,46 @@ SELECT lion_bs('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
 SELECT lion_bs('SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500');
 DROP TABLE bso;
 
+-- 18. A clause core's AND leaves out (DESIGN.md §40.2): beside
+--     `c20 IN (1, 2)`, `c3 IN (0, 1)` keeps two thirds of the rows, and core
+--     leaves it out of its BitmapAnd for the bitmap heap scan's Filter to
+--     test on the heap tuple; a walk of `(k) INCLUDE (id)`, which lacks c3,
+--     would have to fetch every member's tuple to test it.  So the AND of
+--     both lion accesses is offered too, and the walk is index only - with
+--     nothing disabled for the aggregate, over the heap scan, and ordered, a
+--     btree filter beside it, an OR spelling the IN list, a `<>` that keeps
+--     nearly every row.  The price decides: for the first 50 in order, the
+--     walk over core's smaller set, fetching the few members' tuples, is the
+--     cheaper.  A walk that reads the heap anyway - a column the btree lacks
+--     in the target - keeps core's access, and a clause no lion access
+--     answers is the Filter's whatever the set.
+CREATE TABLE bsc (id int, k int, c3 int, c20 int, payload text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO bsc
+SELECT i, (i * 7919) % 60011, (hashint4(i) & 1023) % 3,
+	   (hashint4(i + 1) & 1023) % 20, repeat('p', 400)
+  FROM generate_series(1, 60000) i;
+CREATE INDEX bsc_k ON bsc (k) INCLUDE (id);
+CREATE INDEX bsc_c3 ON bsc USING lion (c3);
+CREATE INDEX bsc_c20 ON bsc USING lion (c20);
+VACUUM (FREEZE, ANALYZE) bsc;
+SELECT * FROM lion_bs_plan('SELECT sum(id) FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1)');
+SELECT * FROM lion_bs_run('SELECT sum(id) FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1)');
+SELECT lion_bs('SELECT id FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1)');
+SELECT lion_bs('SELECT sum(id), count(*) FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1)');
+SELECT lion_bs('SELECT id, k FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) ORDER BY k LIMIT 50', true);
+SELECT lion_bs('SELECT id, k FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) ORDER BY k DESC', true);
+SELECT lion_bs('SELECT id FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) AND k % 7 = 1');
+SELECT lion_bs('SELECT id, k FROM bsc WHERE c20 IN (1, 2) AND (c3 = 0 OR c3 = 1) ORDER BY k', true);
+SELECT lion_bs('SELECT id FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) AND c20 <> 9');
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+EXPLAIN (COSTS OFF) SELECT id, k, c3 FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) ORDER BY k;
+EXPLAIN (COSTS OFF) SELECT id, k FROM bsc WHERE c20 IN (1, 2) AND c3 + 0 = 1 ORDER BY k;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+SELECT lion_bs('SELECT id, k, c3 FROM bsc WHERE c20 IN (1, 2) AND c3 IN (0, 1) ORDER BY k', true);
+SELECT lion_bs('SELECT id, k FROM bsc WHERE c20 IN (1, 2) AND c3 + 0 = 1 ORDER BY k', true);
+DROP TABLE bsc;
+
 DROP TABLE bs;
 DROP FUNCTION lion_bs(text, boolean, text);
 DROP FUNCTION lion_bs_plan(text);
