@@ -13331,6 +13331,27 @@ tested against the fact's posting sets, and this one, with the fact's rows as th
 dimension's primary key as the B-tree; the cost model chooses. The suites of the FK-side join that
 pin its plans turn this one off.
 
+Measured (2026-10-20, PostgreSQL 18, a synthetic table of 3M rows of some 240 bytes - 710 MB - whose
+key has 1M values of three rows each scattered over the heap, a B-tree on the key and a lion index
+on the WHERE's column; warm, best of 7 runs - of 5 for the larger inner sides - on a machine other
+work kept busy; core's plan a parallel hash anti join with up to two workers):
+
+| WHERE | inner keys | LionCount | core's plan | the model's choice |
+|---|---|---|---|---|
+| a half | 2 | 15 ms | 181 ms | LionCount, parallel |
+| a half | 2,000 | 26 ms | 172 ms | LionCount, parallel |
+| a twentieth | 2 | 2.4 ms | 137 ms | LionCount |
+| a twentieth | 2,000 | 12 ms | 139 ms | LionCount |
+| a half | 20,000 | 149 ms | 240 ms | core |
+| a twentieth | 20,000 | 128 ms | 152 ms | core |
+| a half | 200,000 | 1,463 ms | 391 ms | core |
+| a twentieth | 200,000 | 1,215 ms | 184 ms | core |
+
+LionCount's times in the last four rows are with core's joins turned off. The model leaves the inner
+side to core somewhere between 2,000 and 20,000 keys, where the node is still a little faster on a
+warm cache: its heap fetches are priced at the random page cost, as core prices its own index
+scans.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
