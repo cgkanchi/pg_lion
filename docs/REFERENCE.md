@@ -392,8 +392,8 @@ rows are fetched from (`min_parallel_table_scan_size`), or the table's `parallel
 `max_parallel_workers_per_gather`; at the default `parallel_setup_cost` the serial scan is cheaper,
 and on DBpedia's 115,386 rows the serial scan was 4 to 8 times faster than the parallel ones.
 Under `pg_lion.vector_postfilter` `error` (the default) or `exact` a partial path that a `Filter`
-would follow is removed as the serial one is, and `LionOrdered` is never parallel, so a filtered
-query runs in one process; under `allow` the parallel scan with a `Filter` is a plan like the
+would follow is removed as the serial one is, and `LionOrdered` over a distance order is never
+parallel, so a filtered query runs in one process; under `allow` the parallel scan with a `Filter` is a plan like the
 serial one.
 
 ## Reloptions
@@ -527,7 +527,39 @@ working around a bad choice:
   on `(grp) INCLUDE (x, tags)`): the values come from the index tuples, the heap is read only for
   pages not all-visible, and the planner prices the whole walk against the bitmap scan (DESIGN.md
   §40). EXPLAIN names the index it walks `Index: <index> (index only)`. `enable_indexonlyscan =
-  off` takes these walks away too, and the index-only mode of the ordered ones.
+  off` takes these walks away too, and the index-only mode of the ordered ones. A B-tree that
+  holds none of the filter's columns - a primary key under a Lion filter on others - is walked
+  whole all the same. The walk's set answers every condition a Lion index answers, one that
+  PostgreSQL's bitmap AND leaves to its heap `Filter` because it keeps most rows included (`b IN
+  (1, 2)` of three values beside `a IN (...)`): EXPLAIN lists it under `Lion Cond`, and the heap is
+  not read for it (DESIGN.md §40.2, "A clause core's AND leaves out"); the planner prices that
+  larger set against walks of the smaller sets PostgreSQL chose, which read the heap.
+- Parallel walks: when the table may be read in parallel, `LionBtreeScan` and the B-tree walks of
+  `LionOrdered` are also offered as partial paths (DESIGN.md §40.9): `Parallel Custom Scan
+  (LionBtreeScan)` below a `Gather` - under partial aggregates, and on either side of a parallel
+  hash join or below an anti join - and `Parallel Custom Scan (LionOrdered)` below a `Gather
+  Merge`. The processes share the B-tree's parallel scan, each taking whole leaf pages of it, and
+  one Lion set: the first to need it builds it while the others wait (wait event
+  `LionOrderedSetBuild` on PostgreSQL 17 and later, `Extension` on 16) and they read it from
+  shared memory; a set larger than `work_mem` × `hash_mem_multiplier` for each process planned is
+  built by each for itself. Each process tests visibility and rechecks as the serial walk does.
+  The price is PostgreSQL's for a parallel index scan: the per-row work divided among the
+  processes, the set, the B-tree's own cost and the heap pages not; the workers come from the
+  B-tree's pages (`min_parallel_index_scan_size`), and the heap pages a walk in heap mode fetches
+  (`min_parallel_table_scan_size`), or the table's `parallel_workers`, up to
+  `max_parallel_workers_per_gather`. A parallel walk builds its set before it walks
+  (`pg_lion.enable_lazy_set` does not apply) and never switches to fetch and sort. Under `EXPLAIN
+  ANALYZE` its counters are summed over the processes, and `Lion Set: ..., shared` says they read
+  one copy; a walk that is not parallel itself but ran only in a worker (under
+  `debug_parallel_query`, or as the inner side of a join a worker ran) prints no counters. A
+  walk of a Lion index's own column and an order by distance stay serial.
+  `pg_lion.enable_shared_set` (on): off, each process builds the set for itself, for comparing the
+  two.
+- The FK-side join (DESIGN.md §27) reads its dimension through whatever plan is cheapest for the
+  dimension's rows, so a walk of a B-tree holding the dimension's key (and any column grouped by)
+  is its dimension side where it beats a bitmap scan of the dimension's heap, serially and in
+  parallel: `Custom Scan (LionCount)` over `Custom Scan (LionOrdered)` or `(LionBtreeScan)`,
+  `(index only)` (DESIGN.md §27, "The dimension from a B-tree").
 - `pg_lion.enable_ordered_scan` also covers `LionOrdered` over a `lionvec` index's order by
   distance (`ORDER BY embedding <=> $1`), filtered by a Lion set (DESIGN.md §44.6); EXPLAIN shows
   the distance as `Order By`. Off, a filtered nearest-neighbour query fails under

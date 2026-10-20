@@ -13163,6 +13163,46 @@ VACUUM - deletes and updates in the fact, the dimension and the folded table, wh
 and out of its filter, and new rows with NULL and new keys. `node_contracts.sql` and
 `exec_hook.sql` check the folded join's operator, `int48eq`, refused as the ordinary plan refuses it.
 
+### The dimension from a B-tree (2026-10-20)
+
+The node's child is core's: the dimension rel's cheapest total path, or its cheapest partial path
+below a Gather ("Parallel"), priced by whoever built it. A B-tree that holds the columns the join
+needs of the dimension - its key, and a column grouped by - walked through
+lion's set of the dimension's filter, index-only, is such a path (§40.2: a `LionBtreeScan`, or a
+`LionOrdered` where core found the key's order useful), and its partial form a partial path
+(§40.9), so the node takes it wherever it is the cheapest, with no code of its own: the dimension
+rows come from the B-tree's index tuples, and its heap is read only for pages the visibility map
+does not call all-visible. Where the dimension's walk must be a whole path below a Gather - the
+forward semi join over a non-unique key unique-ifies the whole plan ("Forward semi joins over a
+non-unique key") - the serial walk is `parallel_safe` with the relation (§40.2).
+
+**Why it is chosen, and not because of cold reads.** The walk is priced in pages it touches and
+entries it probes (§40.3): the B-tree's pages and a probe per entry, against a bitmap heap scan's
+heap pages and per-row work. When the dimension's filter keeps a large share of its rows the
+bitmap scan reads nearly every heap page, which `cost_bitmap_heap_scan()` prices toward
+`seq_page_cost`, not `random_page_cost`; a heap many times the B-tree then outweighs the B-tree
+whatever the I/O constants say. On the synthetic table of §40.9 (3,000,000 rows, a 142,858-page
+heap and an 8,228-page primary key) as the dimension of a 6,000,000-row fact, filtered to a third
+of its rows, the walk of the primary key is priced at 133,974 against the bitmap heap scan's
+161,392 at `random_page_cost` 4, and at 108,765 against 160,867 at 1.0, a random page priced as a
+sequential one: chosen at both. test/sql/btreescan_parallel.sql pins the choice at 4 and at 1 on
+a dimension whose heap is twenty times its primary key.
+
+**Measured** (2026-10-20, PostgreSQL 18.6 release build, four cores shared with other work, warm;
+medians of five): `count(*)` of the fact (a filter keeping a tenth of its rows) joined to that
+dimension's third, 1,000,110 rows, the node forced with core's joins off, the dimension read by a
+bitmap heap scan (the walks off) against the walk:
+
+| join | serial, heap | serial, walk | 2 workers, heap | 2 workers, walk |
+|---|---|---|---|---|
+| inner | 1,639 ms | 1,018 | 968 | 788 |
+| forward semi (`f WHERE EXISTS (d ...)`) | 1,574 | 1,022 | 1,004 | 621 |
+| semi (`d WHERE EXISTS (f ...)`) | 1,919 | 1,443 | 1,305 | 780 |
+| anti (`d WHERE NOT EXISTS (f ...)`) | 1,913 | 1,297 | 1,173 | 758 |
+
+With nothing disabled the inner join's plan is core's hash join, over the same walk: 824 ms
+serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two workers.
+
 ### Declined in v1, and why
 
 - **A non-unique dimension key in an inner join** (above: a scope and costing decision, not a
@@ -16555,8 +16595,8 @@ qualifying relation the hook runs after core has built the relation's paths, and
    keeps whichever of them is not dominated in start-up or total cost at those pathkeys. The path
    carries the ordered path's `pathkeys`, `rows` = lion's estimate of the relation's rows
    (`lion_probe_rel_rows()`, §30.3), `param_info = NULL`,
-   `pathtarget = rel->reltarget`, `parallel_safe = false` and
-   `flags = CUSTOMPATH_SUPPORT_PROJECTION`: no backward scan (a SCROLL cursor gets a Material),
+   `pathtarget = rel->reltarget`, `parallel_safe` the relation's `consider_parallel` (a partial
+   path of the same pair besides, §40.9) and `flags = CUSTOMPATH_SUPPORT_PROJECTION`: no backward scan (a SCROLL cursor gets a Material),
    no mark/restore (a merge join restores through a Material).
 4. **Which clauses the node still evaluates** is decided the way `create_bitmap_scan_plan()`
    decides it. The lion side's ORIGINAL qual, `lionqual`: the clauses of the leaves' index
@@ -17101,8 +17141,8 @@ space type (§30.4, "When the walk is not paying").
 - **Parameterized paths** (the node as the inner side of a nested loop with `t.x = outer.y` pushed
   into it): an inner side needs no order, so an ordered filter scan has nothing to offer there.
   Params inside a subquery (LATERAL, correlated) are ordinary Params and ARE supported (§30.4).
-- **Parallel scans** (`parallel_safe = false`), **backward scans**, **mark/restore**: the shape
-  needs none of them; core adds a Material where a caller does.
+- **Backward scans**, **mark/restore**: the shape needs neither; core adds a Material where a
+  caller does. A parallel walk is §40.9's.
 - **RowCompareExpr index quals** on the ordered index (`(a, b) > (1, 2)`): the executor's key
   substitution handles one key column per clause, and such a path is skipped.
 - **Ordered indexes other than btree**: §30.4's early stop and switch rest on btree's behaviour.
@@ -20942,7 +20982,13 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   a path with quals may lose to another index's. Core builds, for that index, the paths with its
   matching quals - with pathkeys where the query finds them useful, without otherwise - a backward
   one where that order is useful, and the no-qual one; an IndexPath that `add_path()` dropped for a
-  bitmap scan of the same index is taken from that scan's one-leaf `bitmapqual`. Each resulting
+  bitmap scan of the same index is taken from that scan's one-leaf `bitmapqual`. Core builds the
+  no-qual path only where its order is useful or the index alone answers the query
+  (`check_index_only()`, every restriction clause's columns among its own), which a B-tree lacking
+  the lion filter's columns - a primary key under a lion filter on other columns - never does; when
+  core built no path of the index at all, `lo_btree_paths()` builds that walk of the whole index
+  itself (`create_index_path()` with no clauses; a partial B-tree only where the query implies its
+  predicate), and the pair decides coverage as for any other. Each resulting
   IndexPath - a B-tree, not hypothetical, `param_info == NULL`, no ORDER BY operators,
   `lo_indexpath_ok()` - whose twin is not among the ordered paths (the same index, direction and
   pathkeys: offered above already) is paired with each lion access from `lo_lion_accesses()`, as
@@ -20965,6 +21011,35 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   all `LionBtreeScan`s; `pg_lion.enable_btree_scan` (bool, default on) gates the unordered paths.
   Core's `enable_indexscan` leaves both alone, as it left `LionOrdered` alone: the node is priced
   from `indextotalcost`, which carries no `disable_cost`.
+- **A clause core's AND leaves out** (`lo_lion_cover()`). The lion accesses are core's bitmap
+  paths, and `choose_bitmap_and()` leaves out of a BitmapAnd an index whose bitmap costs more than
+  the heap fetches it saves - `c3 IN (0, 1)`, two thirds of the rows, beside `c20 IN (1, 2)` -
+  since the bitmap heap scan's Filter tests such a clause on the tuple it fetches anyway. Paired
+  with such an access, a walk of a B-tree that lacks the clause's column has the clause in its
+  residual, needs the column, and is not covered: no index-only walk was offered, and the query
+  went to the heap (a bitmap heap scan of every member of `c20 IN (1, 2)`). So when every one of
+  core's accesses leaves one of the clauses a lion access answers - those whose columns a lion
+  index's key has (`lo_knn_own()`) and some access of the pool answers - the AND that answers all
+  of them is added to the accesses: built from core's and those of each lion index alone, greedily
+  (`lo_cover_pool()`, `lo_cover_and()`), as §44.6's post-filter builds a lionvec order's. It is
+  paired only where it makes the walk index-only - every unordered path, and an ordered one whose
+  B-tree then covers; a walk in heap mode reads every member's tuple for its values anyway, and
+  keeps core's accesses, whose sets are the cheaper to build. The price decides between the
+  pairs: a clause that keeps most rows makes a set costly to build (on a 60,000-row table the
+  `c3` set is 40,000 members), and under `ORDER BY k LIMIT 50` the walk over core's smaller set,
+  fetching the few members' tuples, is the cheaper; for the aggregate the index-only walk is
+  chosen over the heap. A clause no lion access answers (`c3 + 0 = 1`) is the Filter's whatever
+  the set. On a synthetic 3,000,000-row table of 340-byte rows (a 1.1 GB heap, a 64 MB primary
+  key), `SELECT sum(id) ... WHERE a IN (<10 of 20 values>) AND b IN (<2 of 3>)` took a bitmap heap
+  scan of `a`'s half of the rows with `b` in its Filter, 1,049 ms (median of five, warm; 687 ms
+  parallel); it now walks the primary key index-only over the AND, 307 ms serially and 202 ms
+  with two workers.
+- **Partial paths** (§40.9): each pair is offered a second time as a partial path when the walk
+  may be divided among a parallel plan's participants (`lo_parallel_ok()`), and every serial
+  walk is `parallel_safe` when the relation is (`rel->consider_parallel`): whole, it may run in a
+  worker - the inner side of a join a worker runs, or below a non-unique semi join's
+  unique-ification (§27, "Forward semi joins over a non-unique key"), which takes a whole path
+  under a Gather.
 - **Partitions**: as §30.11, each leaf is scanned like a table under core's Append or MergeAppend.
 
 ### 40.3 Cost (`lo_cost()`, index-only)
@@ -21187,7 +21262,13 @@ on a table with a dropped column (the mapping with a gap); `ctid`, `tableoid` an
 (heap mode), both settings off (no node), a SCROLL cursor fetched backward; and the pairs that add
 nothing (§40.2) - `k = 1 OR k = 7` with a lion index on `k` and a B-tree leading with it, with
 core's scans on and off: no node, its presence alone printed since the plan's text differs between
-majors - against a partial lion index walked whole, which is offered.
+majors - against a partial lion index walked whole, which is offered; and a clause core's AND leaves
+out (§40.2), on a 60,000-row table of its own: the AND's index-only walk chosen for the aggregate
+with nothing disabled, `Heap Fetches: 0`, the answers of the aggregate, ordered walks both ways, a
+B-tree filter beside the AND, the OR spelling of the IN list and a `<>` keeping nearly every row;
+a LIMIT 50 in order that takes core's smaller set in heap mode; a column the B-tree lacks in the
+target (heap mode, core's access) and a clause no lion access answers (the Filter's).
+test/sql/btreescan_parallel.sql is §40.9's.
 test/isolation/btreescan_serializable.spec is §40.5's write skew, and passes only with the page
 lock; a step shows the read ran index-only with `Heap Fetches: 0`, so the conflict is the page
 lock's.
@@ -21227,8 +21308,155 @@ with a filter; the two-filter LIMIT 10 2.5 to 2.9 ms against 5.2 to 7.5; the `ta
   a membership test, about half of the 170 ns an entry (§40.3); a directory indexed by container key
   would find the container in O(1), and a bitset container's test is O(1) already where an array
   container's is a second binary search. The price above would then come down with it.
-- **Expression columns** returning a value for a matching expression of the target; **parallel**
-  walks (`parallel_safe = false`, as §30).
+- **Expression columns** returning a value for a matching expression of the target.
+- **The lazy set, the switch and the early stop in a parallel walk** (§40.9): the first two are
+  off, the third is each participant's own and rarely fires.
+- **Other heap reads a B-tree could spare.** The count pushdown's residual clauses (§10, "Residual
+  clauses") are tested on each candidate's heap row even where a B-tree holds the clause's column;
+  the plan competes on price with an aggregate over the walk, which wins where the heap reads cost
+  more (on the synthetic table of §40.2, `count(*) ... WHERE b = 1 AND id % 7 = 3` ran in 252 ms
+  over the walk against 800 ms for the pushdown's rechecks, medians of five). A partial B-tree's
+  predicate column must be among its columns (§40.1) because the switch rechecks the predicate; an
+  unordered or parallel walk never switches and could drop the clause. Reads by TID - the plain
+  and bitmap scans of lion indexes, `lion_index_facets()`'s read of a few rows' keys, a BM25 scan -
+  have no B-tree to turn to, since a B-tree is not searched by TID.
+
+
+### 40.9 Parallel walks (2026-10-20)
+
+A walk of a B-tree probed against lion's set ran in one process. It is now offered as a partial
+path besides: the participants of a Gather or a Gather Merge share core's parallel scan of the
+B-tree, which hands each of them whole leaf pages in the walk's direction, as a Parallel Index Only
+Scan's participants get theirs, and the set, built once.
+
+    Finalize Aggregate
+      ->  Gather
+            Workers Planned: 2
+            ->  Partial Aggregate
+                  ->  Parallel Custom Scan (LionBtreeScan) on t
+                        Index: t_pkey (index only)
+                        Lion Cond: ((a = ANY ('{0,1}'::integer[])) AND (b = ANY ('{0,1}'::integer[])))
+                        Lion Indexes: t_a, t_b
+
+    Gather Merge
+      ->  Parallel Custom Scan (LionOrdered) on t
+            Ordered By: t_k (index only)
+            Lion Cond: (c = 3)
+            Lion Indexes: t_c
+
+- **What qualifies** (`lo_parallel_ok()`): the relation may be read in a worker
+  (`rel->consider_parallel`: its restriction clauses, which the node evaluates, and its target are
+  parallel-safe, and it is not a temporary table), and the B-tree's access method has a parallel
+  scan (`amcanparallel`). The lion column walks of §30.11 and a lionvec order (§44, which has a
+  parallel scan of its own) are not divided. Every pair of §40.2, heap mode and index-only, ordered
+  and not, is offered once more through `add_partial_path()`, its rows a participant's; core then
+  builds the Gather and the Gather Merge above it, the partial aggregates, the parallel hash joins
+  with the walk on either side, and the parallel anti joins - §40.2's unordered paths are what these
+  needed. A whole walk is `parallel_safe` with the relation, so that a worker may run it too.
+- **Cost** (`lo_cost()` with `workers`), as `cost_index()` prices a parallel index scan: the
+  workers are `compute_parallel_worker()`'s for the B-tree's pages and - in heap mode, or where the
+  set's members are rechecked on the heap tuple - the heap pages the fetches read, an index-only
+  walk's left out as core leaves an Index Only Scan's; the per-row CPU - the probe of each entry
+  walked, the visibility map's test, the quals and the target - is divided by core's parallel
+  divisor; the lion lookups and the set (the start-up), the B-tree's own cost and the heap's pages
+  are each participant's whole. The partial path's rows are divided likewise.
+- **The set, built once** (`lo_shared_set()`). A `LoShared` in the Gather's dynamic shared memory,
+  the B-tree's parallel scan descriptor after it, holds the set's state. The first participant to
+  need the set builds it, as the serial node does, and when it fits the room a Parallel Hash's
+  table would have - `get_hash_memory_limit()` for each participant planned, the leader among them
+  - copies it into the query's DSA as one image (`lo_set_publish()`: the container keys, each
+  container's offset, the containers, and whether the set is exact); the others sleep on a
+  condition variable while it is built (the wait event `LionOrderedSetBuild` on 17 and later, the
+  generic `Extension` on 16) and then read its containers where they are (`lo_set_attach()`), each
+  with a directory and the walk's visited bits of its own. A set larger than that is built by each
+  participant for itself, spilling as the serial node's does (§30.4), and so is every set under
+  `pg_lion.enable_shared_set = off`. A builder's error ends the query: the leader rethrows it at its
+  next interrupt check, which its wait makes, and its abort ends every worker.
+- **What a participant does with an entry** is the serial node's, on the entries it is handed: the
+  probe, the visibility map's test in index-only mode with a heap fetch for a page it does not call
+  all-visible, the rechecks - the B-tree's under `xs_recheck`, and an inexact set's on the index
+  tuple or, under `LO_FLAG_HEAPRECHECK`, on the heap tuple fetched for it (§40.4) - and the page's
+  or the tuple's predicate lock.
+- **Not in a parallel walk**: the lazy set (§30.4) - one set serves every participant, and each
+  would reach other ranges first - and the fetch-and-sort switch, whose fetch of the members left
+  would need every participant's; a parallel walk keeps the B-tree's order to its end, which a
+  Gather Merge needs of each participant anyway. The early stop (§30.4, "Stopping early") is each
+  participant's: it counts the members it met against the set's, which a participant meets all of
+  only when the others met none, so it rarely fires; a count shared among them would need the
+  met-before bits shared too.
+- **Rescans.** Before a Gather's workers are launched again (`ReInitializeDSM`), the B-tree's
+  parallel scan starts over (`index_parallelrescan()`) and the set's shared copy is freed, the
+  leader's view of it let go first, to be built again by the next run, whose parameters may be
+  others. A Gather Merge that a LIMIT shut down and that is rescanned initialises its memory afresh.
+- **EXPLAIN** names the node `Parallel Custom Scan (LionBtreeScan)` or `(LionOrdered)`. Under
+  ANALYZE the counters are the leader's own and the workers' sums, which each worker adds as it
+  shuts down and the leader takes as it does (a LIMIT that stops the Gather early leaves the
+  workers' out, as §27's parallel node does); `Lion Set` shows the set as the leader had it, or its
+  last builder when the leader took no part, `shared` when the participants read one copy. A walk
+  that is not parallel-aware but ran in a worker only - under `debug_parallel_query`, or the inner
+  side of a join a worker ran - prints no counters: they stayed in the worker, since a
+  CustomScan's DSM hooks are called for a parallel-aware node alone, and the leader's zeros would
+  mislead.
+
+**Visibility.** §40.5's argument is per TID and holds in every participant. The snapshot is the
+leader's, which every worker restores. The visibility map's bit is tested for each member after
+the entry was read under the leaf page's lock, as in the serial walk, by whichever participant was
+handed that page; the participant keeps its pin on the leaf while it tests the map
+(`xs_want_itup`, nbtree's `dropPin` rule, which a parallel scan follows as a serial one does), so
+VACUUM cannot free the heap slots the page's TIDs name until it has moved on. The set is built
+after the query's snapshot was taken, as the serial node builds it, by whichever participant
+builds it: §30.5's argument for a recycled TID rests on that order, not on the builder. Every
+participant that reads the set reads the same members and exactness, and rechecks as the serial
+node would. Under SERIALIZABLE the predicate locks a worker takes are the leader's transaction's
+(core's parallel SSI): the lion indexes' relation locks are taken by whoever builds the set, and
+each participant takes the heap page lock of each row it returns without a heap visit.
+test/isolation/btreescan_parallel_serializable.spec is §40.5's write skew read by parallel walks,
+and must end in a serialization failure.
+
+**Tests.** test/sql/btreescan_parallel.sql, on a synthetic 40,000-row table whose heap is several
+times its B-trees, with every parallel cost at 0: each query run as CREATE TABLE AS - a plpgsql
+cursor never runs in parallel - through the partial walk below its Gather or Gather Merge and
+through the ordinary plan (the walks off, sequential scans only, serially), the answers compared in
+order under an ORDER BY and as multisets otherwise, the node, its mode and the Gather named; and
+the counters of each parallel walk, summed, against the serial walk's (the lazy set and the switch
+off, a serial run first so that both meet the same index entries killed by an earlier heap fetch):
+the members met, the heap fetches, the rows the recheck removed. ANDs, ORs, IN lists and
+multi-key filters, a B-tree qual beside them, aggregates and a GROUP BY, both orders, a LIMIT, an
+empty answer and heap mode; a vacuumed table (no heap fetch, the set built once and shared); rows
+inserted in the transaction, HOT, INCLUDE-column, lion-column and key updates and deletes before
+VACUUM, fetched by every participant; sets made inexact by a tsquery NOT, rechecked on the heap
+tuple in every participant; the set each participant's own (`pg_lion.enable_shared_set = off`),
+and shared at `hash_mem`'s least; rescans of a Gather on a nested loop's inner side and of a
+Gather Merge a LIMIT shut down, a generic plan's and an initplan's parameter in the lion filter;
+the leader taking no part;
+the walk on either side of a parallel hash join and below an anti join; and §27's FK-side count
+over the walk of its dimension, serially and as a parallel LionCount, for the inner, semi and anti
+joins and a GROUP BY of a column the B-tree includes, chosen over the dimension's bitmap heap scan
+at `random_page_cost` 4 and 1 and with the dimension's pages not all-visible.
+
+**Measured** (2026-10-20, PostgreSQL 18.6 release build, a VM of four cores shared with other work,
+`shared_buffers` 1 GB, warm; medians of five unless said). A synthetic table of 3,000,000 rows of
+340 bytes - a 1.1 GB heap, 142,858 pages, and a 64 MB primary key of 8,228 pages - with lion
+indexes on `a` (20 values), `b` (3) and `h` (2); `SELECT sum(id) ... WHERE <filter>`, the walk of
+the primary key forced (every core scan off) and the plan without the walks:
+
+| filter | walk, serial | 2 workers | 3 workers | without the walks |
+|---|---|---|---|---|
+| `h = 1` (50%) | 239 ms | 177 | 136 | 749 (bitmap heap scan); 244 (parallel sequential scan, 2 workers) |
+| `a = 3` (5%) | 184 | 150 | 119 | 124 (the lion index's scan) |
+
+The walk is CPU-bound - 60 to 80 ns an entry, the probe and the row - and divides less well than
+its entries: 1.2 to 1.4 times faster on two workers and 1.5 to 1.8 on three, the set built before
+the walk and the four cores busy. Planned with nothing disabled, the 50% filter takes the walk, parallel at two
+workers; the 5% one takes it serially as well, warm the slower by 35 ms, the heap's pages priced
+as reads (§40.3, "Warm and cold").
+
+The set shared against one per participant, under `pg_lion.enable_shared_set`, for §40.2's `a IN
+(<10 of 20 values>) AND b IN (<2 of 3>)`, a set of 2,233 containers that takes 26 to 32 ms to
+build: 192 ms shared against 214 each its own on two workers, 152 against 197 on three (medians of
+seven). Built in every participant at once, the set costs the same time on idle cores but as many
+times the CPU and memory, which on four busy ones shows; shared, it is built once and held once.
+So it is shared, and each builds its own only when it would not fit.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 
