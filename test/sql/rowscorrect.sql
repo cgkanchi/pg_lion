@@ -88,6 +88,35 @@ SELECT lrc_est(q, true, node) = lrc_est(q, false, node) AS unchanged
   FROM lrc_q WHERE n = 1;
 RESET pg_lion.enable_intersection_probe;
 
+-- A parameterized scan of lrc, a nested loop's inner side: its rows are
+-- the filters with the join clause ANDed in, and take the probe's factor
+-- before they are clamped to one row and capped at the relation's rows.
+-- 5: a lookup on lrc's primary key returns a row at most, and is estimated
+--    at one with the correction as without it: core's product is a small
+--    fraction of a row, and that fraction times the probe's factor is still
+--    one.
+-- 6: a lookup on p, which h does not decide, returns a seventh of the
+--    filters' rows, and is estimated at about that with the correction and
+--    at one row without it.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+INSERT INTO lrc_q VALUES
+	(5, $$SELECT r.id FROM lrc_f f JOIN lrc r ON r.id = f.rid WHERE f.id = 10 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11$$, 'lrc'),
+	(6, $$SELECT r.id FROM lrc_f f JOIN lrc r ON r.p = f.v WHERE f.id = 1 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11$$, 'lrc');
+EXPLAIN (COSTS OFF)
+SELECT r.id FROM lrc_f f JOIN lrc r ON r.id = f.rid
+ WHERE f.id = 10 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+EXPLAIN (COSTS OFF)
+SELECT r.id FROM lrc_f f JOIN lrc r ON r.p = f.v
+ WHERE f.id = 1 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+SELECT n, lrc_actual(q) AS actual,
+	   CASE WHEN n = 5 THEN lrc_est(q, true, node) END AS corrected,
+	   lrc_est(q, true, node) BETWEEN lrc_actual(q) / 2 AND lrc_actual(q) * 2 AS corrected_within_2x,
+	   lrc_est(q, false, node) AS uncorrected
+  FROM lrc_q WHERE n IN (5, 6) ORDER BY n;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
 -- The answers do not depend on it.
 SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
  WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
