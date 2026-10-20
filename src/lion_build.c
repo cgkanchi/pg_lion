@@ -14,12 +14,16 @@
  * either inline in the entry tuple or as a chain of container pages, in
  * exactly the order the directory wants them in.
  *
- * A PARALLEL build (amcanbuildparallel, PostgreSQL 17 and later) is nbtree's
- * shape: the workers and the leader share one parallel heap scan, each fills
- * a spool of its own and exports it as one tape, and the leader merges the
- * tapes and does the same single pass as a serial build.  The merge orders
- * every key's codes whichever participant read them, so the index is the one
- * a serial build writes, page for page.
+ * A PARALLEL build (amcanbuildparallel, PostgreSQL 17 and later) scans as
+ * nbtree's does: the workers and the leader share one parallel heap scan,
+ * each fills a spool of its own and exports it as a tape per key column.  The
+ * write is then split by column, which share no keys: the workers write the
+ * columns after the first, each to a file of its own, while the leader
+ * writes the first, and the leader then writes each further column in turn,
+ * by replaying a worker's file or by itself.  The merge orders every key's
+ * codes whichever participant read them, and the replay gives every block
+ * the number a serial build gives it, so the index is the one a serial build
+ * writes, page for page.
  *
  * The directory itself is built bottom-up in that same pass, nbtree's
  * _bt_buildadd shape: one open page per level, filled to `fillfactor` percent
@@ -424,6 +428,7 @@ typedef struct LionSumBuild
 	double		ntids;
 	int64		nbuckets;
 	BufFile    *file;
+	int			sharekb;		/* LION_SUM_SHARE_KB() of the writer's memory */
 } LionSumBuild;
 
 /*
@@ -482,13 +487,20 @@ typedef struct LionBuildState
 
 	MemoryContext buildctx;		/* lives for the whole build */
 	MemoryContext tmpctx;		/* reset per key group */
+	int			memkb;			/* what writing a column may use, in kB */
 
 	/*
 	 * Page writing (see the file header): one bulk writer for the whole
 	 * build, blocks handed out by a counter instead of by extending the
 	 * relation, and the bucket pages kept in memory until pass 2 is over.
+	 *
+	 * A parallel worker that writes a column has no bulk writer and no
+	 * directory: its pages and its entries go to colout instead, numbered by
+	 * its own counter, for the leader to renumber and write (see "Columns
+	 * written by the workers" below).
 	 */
 	BulkWriteState *bulk;
+	BufFile    *colout;
 	BlockNumber nblocks;		/* blocks handed out so far */
 	LionBuildLevel *leaf;		/* the bottom of the directory */
 	int64		ndirpages;
@@ -546,14 +558,37 @@ lion_build_alloc_block(LionBuildState *bs)
 static void lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 								const LionEntryTuple *item, Size size);
 
+/* What a worker writing a column writes (see "Columns written by ..."). */
+#define LION_COLREC_PAGE	1
+#define LION_COLREC_ENTRY	2
+#define LION_COLREC_END		3
+
+static void lion_build_colout_page(LionBuildState *bs, BlockNumber blk,
+								   BulkWriteBuffer buf);
+
 static BulkWriteBuffer
 lion_build_get_page(LionBuildState *bs, uint16 flags)
 {
-	BulkWriteBuffer buf = smgr_bulk_get_buf(bs->bulk);
+	BulkWriteBuffer buf;
 
+	if (bs->colout != NULL)
+		buf = (BulkWriteBuffer) MemoryContextAllocAligned(bs->buildctx, BLCKSZ,
+														  PG_IO_ALIGN_SIZE, 0);
+	else
+		buf = smgr_bulk_get_buf(bs->bulk);
 	lion_init_page((Page) buf->data, flags);
 
 	return buf;
+}
+
+/* A finished page of a posting or position tree, which buf now belongs to. */
+static void
+lion_build_put_page(LionBuildState *bs, BlockNumber blk, BulkWriteBuffer buf)
+{
+	if (bs->colout != NULL)
+		lion_build_colout_page(bs, blk, buf);
+	else
+		smgr_bulk_write(bs->bulk, blk, buf, true);
 }
 
 /* The page writer lion_posbuild.c writes position trees through. */
@@ -575,8 +610,7 @@ lion_build_pw_get(void *arg, Page *page, uint16 flags)
 static void
 lion_build_pw_put(void *arg, BlockNumber blk, void *handle)
 {
-	smgr_bulk_write(((LionBuildState *) arg)->bulk, blk,
-					(BulkWriteBuffer) handle, true);
+	lion_build_put_page((LionBuildState *) arg, blk, (BulkWriteBuffer) handle);
 }
 
 /*
@@ -840,10 +874,23 @@ lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 	lv->used += need;
 }
 
-/* One entry tuple, in directory order. */
+static void lion_build_colout_record(LionBuildState *bs, uint32 kind,
+									 uint32 arg, const void *data, Size len);
+
+/*
+ * One entry tuple, in directory order; a worker writing a column hands it to
+ * the leader instead (see "Columns written by the workers").
+ */
 static void
 lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 {
+	if (bs->colout != NULL)
+	{
+		lion_build_colout_record(bs, LION_COLREC_ENTRY, (uint32) size, entry,
+								 size);
+		return;
+	}
+
 	lion_build_level_add(bs, bs->leaf, entry, size);
 	/* the keys, for the §17 guard; a summary (§32) is not one */
 	if (!LionEntryIsSummary(entry))
@@ -893,6 +940,232 @@ lion_build_finish_dir(LionBuildState *bs)
 				 lv->level, lv->npages + (lv->nitems > 0 ? 1 : 0), below);
 	}
 }
+
+/* ---------------------------------------------------------------------
+ * Columns written by the workers (DESIGN.md §24, "Parallel build")
+ *
+ * A worker writes a column with the builders a serial build uses, into a file
+ * instead of the index: it numbers blocks by a counter of its own from 0,
+ * each finished page goes to the file with its number, and so does each
+ * entry, which a serial build would add to the directory there and then.
+ * Every record says how many blocks the worker had handed out by then.
+ *
+ * The leader replays the file when the column's turn comes.  A serial build
+ * hands out a column's posting and position tree blocks from its one
+ * counter, interleaved with the directory pages the column's entries open as
+ * they are added; so at each record the leader first gives the worker's
+ * blocks handed out since the last one the next numbers of its own counter,
+ * and only then adds the entry, which opens directory pages just where a
+ * serial build opens them.  Every block gets the number a serial build gives
+ * it, and once the block references in the pages and entries are renumbered
+ * the pages are a serial build's too.
+ *
+ * There are few references to renumber, because a worker writes only the
+ * pages of posting and position trees (DESIGN.md §22, §17): a page's
+ * rightlink, its owner stamp (the tree's root) and an internal page's
+ * downlinks, and an entry's head, tail and position tree root.
+ * --------------------------------------------------------------------- */
+
+typedef struct LionColRecord
+{
+	uint32		kind;			/* LION_COLREC_* */
+	BlockNumber nblocks;		/* blocks the worker had handed out */
+	uint32		arg;			/* PAGE: its block; ENTRY: its size */
+} LionColRecord;
+
+static void
+lion_build_colout_record(LionBuildState *bs, uint32 kind, uint32 arg,
+						 const void *data, Size len)
+{
+	LionColRecord rec;
+
+	rec.kind = kind;
+	rec.nblocks = bs->nblocks;
+	rec.arg = arg;
+	BufFileWrite(bs->colout, &rec, sizeof(rec));
+	if (len > 0)
+		BufFileWrite(bs->colout, data, len);
+}
+
+static void
+lion_build_colout_page(LionBuildState *bs, BlockNumber blk,
+					   BulkWriteBuffer buf)
+{
+	lion_build_colout_record(bs, LION_COLREC_PAGE, blk, buf->data, BLCKSZ);
+	pfree(buf);
+}
+
+#if PG_VERSION_NUM >= 170000
+
+/*
+ * The leader's numbers for a worker's blocks: runs of consecutive blocks,
+ * each starting at `from` of the worker's and `to` of the index's, broken
+ * wherever the directory took blocks in between.
+ */
+typedef struct LionBlockRun
+{
+	BlockNumber from;
+	BlockNumber to;
+} LionBlockRun;
+
+typedef struct LionBlockMap
+{
+	LionBlockRun *runs;
+	int			nruns;
+	int			maxruns;
+	BlockNumber mapped;			/* the worker's blocks numbered so far */
+} LionBlockMap;
+
+/* Number the worker's blocks up to nblocks with the leader's next ones. */
+static void
+lion_blockmap_extend(LionBuildState *bs, LionBlockMap *map,
+					 BlockNumber nblocks)
+{
+	LionBlockRun *last = (map->nruns > 0) ? &map->runs[map->nruns - 1] : NULL;
+
+	if (nblocks < map->mapped)
+		elog(ERROR, "lion index build: a column's record says %u blocks after %u",
+			 nblocks, map->mapped);
+	if (nblocks == map->mapped)
+		return;
+
+	if (last == NULL || last->to + (map->mapped - last->from) != bs->nblocks)
+	{
+		if (map->nruns >= map->maxruns)
+		{
+			map->maxruns = Max(64, map->maxruns * 2);
+			map->runs = (map->runs == NULL) ?
+				MemoryContextAlloc(bs->buildctx,
+								   sizeof(LionBlockRun) * map->maxruns) :
+				repalloc(map->runs, sizeof(LionBlockRun) * map->maxruns);
+		}
+		map->runs[map->nruns].from = map->mapped;
+		map->runs[map->nruns].to = bs->nblocks;
+		map->nruns++;
+	}
+	bs->nblocks += nblocks - map->mapped;
+	map->mapped = nblocks;
+}
+
+static BlockNumber
+lion_blockmap_get(const LionBlockMap *map, BlockNumber blk)
+{
+	int			lo = 0;
+	int			hi = map->nruns - 1;
+
+	if (!BlockNumberIsValid(blk))
+		return blk;
+	if (blk >= map->mapped)
+		elog(ERROR, "lion index build: a column refers to block %u of %u",
+			 blk, map->mapped);
+
+	/* the last run that starts at or before blk; the first starts at 0 */
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo + 1) / 2;
+
+		if (map->runs[mid].from <= blk)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	return map->runs[lo].to + (blk - map->runs[lo].from);
+}
+
+static void
+lion_build_renumber_page(Page page, const LionBlockMap *map)
+{
+	LionPageOpaque opaque;
+
+	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		!LionPageIsContainer(page))
+		elog(ERROR, "lion index build: a worker wrote a page that is not a container page");
+	opaque = LionPageGetOpaque(page);
+	opaque->rightlink = lion_blockmap_get(map, opaque->rightlink);
+	opaque->leftlink = lion_blockmap_get(map, opaque->leftlink);
+	opaque->owner_head = lion_blockmap_get(map, opaque->owner_head);
+
+	/* an internal page of a posting or position tree: its downlinks */
+	if (opaque->level > 0)
+	{
+		OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+		OffsetNumber off;
+
+		for (off = FirstOffsetNumber; off <= maxoff; off++)
+		{
+			LionPostingPivot *pivot = (LionPostingPivot *)
+				PageGetItem(page, PageGetItemId(page, off));
+
+			pivot->child = lion_blockmap_get(map, pivot->child);
+		}
+	}
+}
+
+static void
+lion_build_renumber_entry(LionEntryTuple *e, const LionBlockMap *map)
+{
+	if (lion_entry_is_chain(e))
+	{
+		lion_entry_set_head(e, lion_blockmap_get(map, lion_entry_head(e)));
+		lion_entry_set_tail(e, lion_blockmap_get(map, lion_entry_tail(e)));
+	}
+	if ((e->flags & LION_ENTRY_POSITIONS) != 0)
+	{
+		LionEntryPosExt *x = (LionEntryPosExt *)
+			((char *) e + LionEntryExtOffset(e));
+
+		x->pos_root = lion_blockmap_get(map, x->pos_root);
+	}
+}
+
+/* Write a column a worker wrote to file, in the place a serial build would. */
+static void
+lion_build_replay_column(LionBuildState *bs, BufFile *file)
+{
+	LionBlockMap map;
+	LionEntryTuple *entry = (LionEntryTuple *)
+		MemoryContextAlloc(bs->buildctx, BLCKSZ);
+
+	memset(&map, 0, sizeof(map));
+	for (;;)
+	{
+		LionColRecord rec;
+
+		CHECK_FOR_INTERRUPTS();
+		BufFileReadExact(file, &rec, sizeof(rec));
+		lion_blockmap_extend(bs, &map, rec.nblocks);
+
+		if (rec.kind == LION_COLREC_ENTRY)
+		{
+			if (rec.arg < sizeof(LionEntryTuple) || rec.arg > BLCKSZ)
+				elog(ERROR, "lion index build: a column's entry of %u bytes",
+					 rec.arg);
+			BufFileReadExact(file, entry, rec.arg);
+			lion_build_renumber_entry(entry, &map);
+			lion_build_add_entry(bs, entry, rec.arg);
+		}
+		else if (rec.kind == LION_COLREC_PAGE)
+		{
+			BulkWriteBuffer buf = smgr_bulk_get_buf(bs->bulk);
+
+			BufFileReadExact(file, buf->data, BLCKSZ);
+			lion_build_renumber_page((Page) buf->data, &map);
+			smgr_bulk_write(bs->bulk, lion_blockmap_get(&map, rec.arg), buf,
+							true);
+		}
+		else if (rec.kind == LION_COLREC_END)
+			break;
+		else
+			elog(ERROR, "lion index build: a column's record of kind %u",
+				 rec.kind);
+	}
+
+	pfree(entry);
+	if (map.runs != NULL)
+		pfree(map.runs);
+}
+
+#endif							/* PG_VERSION_NUM >= 170000 */
 
 /* ---------------------------------------------------------------------
  * Posting set builders
@@ -1046,7 +1319,7 @@ lion_post_level_flush(LionBuildState *bs, LionBuilder *b, LionPostLevel *lv,
 			elog(ERROR, "lion index: failed to place a posting downlink");
 	}
 
-	smgr_bulk_write(bs->bulk, thisblk, buf, true);
+	lion_build_put_page(bs, thisblk, buf);
 
 	if (isroot)
 		b->height = lv->level;
@@ -1110,7 +1383,7 @@ lion_builder_start_tree(LionBuildState *bs, LionBuilder *b)
 		lion_page_set_owner(leaf, b->owner, b->head);
 		lion_post_level_add(bs, b, b->plevel, LionPageGetOpaque(leaf)->minckey,
 							b->heldblk[i]);
-		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+		lion_build_put_page(bs, b->heldblk[i], b->held[i]);
 	}
 	b->nheld = 0;
 }
@@ -1122,7 +1395,7 @@ lion_builder_write_held(LionBuildState *bs, LionBuilder *b)
 	int			i;
 
 	for (i = 0; i < b->nheld; i++)
-		smgr_bulk_write(bs->bulk, b->heldblk[i], b->held[i], true);
+		lion_build_put_page(bs, b->heldblk[i], b->held[i]);
 	b->nheld = 0;
 }
 
@@ -1256,7 +1529,7 @@ lion_builder_spill(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 			lion_post_level_add(bs, b, b->plevel,
 								LionPageGetOpaque(img)->minckey, b->curblk);
 			/* the page is final: hand the image itself to the bulk writer */
-			smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+			lion_build_put_page(bs, b->curblk, b->pagebuf);
 		}
 
 		b->curblk = next;
@@ -1521,7 +1794,7 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 								LionPageGetOpaque(img)->minckey, b->curblk);
 		else
 			lion_builder_write_held(bs, b);
-		smgr_bulk_write(bs->bulk, b->curblk, b->pagebuf, true);
+		lion_build_put_page(bs, b->curblk, b->pagebuf);
 		b->pagebuf = NULL;
 		b->haspage = false;
 
@@ -1673,14 +1946,16 @@ typedef struct LionSumBucketHdr
 } LionSumBucketHdr;
 
 /*
- * What a column's summaries take of maintenance_work_mem while its values are
- * written: LION_SUM_SHARE_KB for the codes of the bucket being collected and,
- * once a bucket outgrows that, as much for the tuplesort that takes them over
- * (lion_sum_add()).  The two meet only while the codes move from one to the
- * other, and the spool leaves the summaries both (lionbuild()).
+ * What a column's summaries take of the memory of the process writing the
+ * column - maintenance_work_mem, or its share in a parallel build - while its
+ * values are written: an eighth for the codes of the bucket being collected
+ * and, once a bucket outgrows that, as much for the tuplesort that takes them
+ * over (lion_sum_add()).  The two meet only while the codes move from one to
+ * the other, and the spool leaves the summaries both (lion_build_column()).
+ * How the codes are held does not change what is written.
  */
-#define LION_SUM_SHARE_KB	Max(maintenance_work_mem / 8, 64)
-#define LION_SUM_MEMORY		((Size) LION_SUM_SHARE_KB * 1024 * 2)
+#define LION_SUM_SHARE_KB(memkb)	Max((memkb) / 8, 64)
+#define LION_SUM_MEMORY(memkb)	((Size) LION_SUM_SHARE_KB(memkb) * 1024 * 2)
 
 /*
  * Does the key column being written get summaries?  Only an ordered scalar
@@ -1710,11 +1985,12 @@ lion_sum_begin(LionBuildState *bs, LionState *col)
 	/*
 	 * A bucket is normally summary_tids codes and a key's worth more, which
 	 * is a few hundred kilobytes.  One key can be far larger than that - a
-	 * column of few keys with summaries = on - and past LION_SUM_SHARE_KB
-	 * kilobytes of codes the rest of such a bucket is sorted by a tuplesort of
-	 * as much, which spills, and the array goes (lion_sum_add()).
+	 * column of few keys with summaries = on - and past sharekb kilobytes of
+	 * codes the rest of such a bucket is sorted by a tuplesort of as much,
+	 * which spills, and the array goes (lion_sum_add()).
 	 */
-	sum->maxcodes = (int64) LION_SUM_SHARE_KB * 1024 / (int64) sizeof(uint64);
+	sum->sharekb = LION_SUM_SHARE_KB(bs->memkb);
+	sum->maxcodes = (int64) sum->sharekb * 1024 / (int64) sizeof(uint64);
 	sum->sorted = true;
 	sum->lastrawcap = 64;
 	sum->lastraw = (char *) MemoryContextAlloc(sum->cxt, sum->lastrawcap);
@@ -1755,7 +2031,7 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 
 			sum->sort = tuplesort_begin_datum(INT8OID, Int8LessOperator,
 											  InvalidOid, false,
-											  LION_SUM_SHARE_KB, NULL,
+											  sum->sharekb, NULL,
 											  TUPLESORT_NONE);
 			MemoryContextSwitchTo(old);
 			for (i = 0; i < sum->ncodes; i++)
@@ -1781,8 +2057,8 @@ lion_sum_add(LionSumBuild *sum, uint64 code)
 }
 
 /*
- * The sort of a bucket's array of codes, which is up to LION_SUM_SHARE_KB
- * kilobytes of them - millions at a large maintenance_work_mem - and so has to
+ * The sort of a bucket's array of codes, which is up to sharekb kilobytes
+ * of them - millions at a large maintenance_work_mem - and so has to
  * answer a cancel: the template checks for interrupts as it partitions, where
  * qsort() with a comparison function did not check at all.
  */
@@ -2202,17 +2478,175 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	return inline_limit;
 }
 
+/*
+ * Everything a process writing columns needs, the leader of a parallel build
+ * and its workers alike: the options, the budgets, the key columns' state,
+ * the builders and the positions' builder.  memkb is what writing a column
+ * may take.
+ */
+static void
+lion_build_state_init(LionBuildState *bs, Relation index, int memkb)
+{
+	LionOptions *opts = (LionOptions *) index->rd_options;
+	int			ncols;
+
+	memset(bs, 0, sizeof(LionBuildState));
+	bs->index = index;
+	bs->indtuples = 0;
+	bs->memkb = memkb;
+	bs->fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
+	bs->posting_fillfactor = opts ? opts->posting_fillfactor :
+		LION_DEFAULT_POSTING_FILLFACTOR;
+	switch (opts ? opts->build_slack : LION_DEFAULT_BUILD_SLACK)
+	{
+		case LION_SLACKOPT_ON:
+			bs->slack = true;
+			break;
+		case LION_SLACKOPT_OFF:
+			bs->slack = false;
+			break;
+		default:
+
+			/*
+			 * AUTO: where a moved item costs the most.  A generic-WAL record
+			 * is a byte diff of the page, so the first insert into an item
+			 * written at its exact size - which moves every item stored
+			 * below it - logs all of them; a resource-manager record logs the
+			 * item's own change whether or not others move (DESIGN.md §4).
+			 * A parallel worker takes the leader's decision instead
+			 * (lion_parallel_write_columns()).
+			 */
+			bs->slack = (lion_wal_mode_for_build(index) == LION_WAL_MODE_GENERIC);
+			break;
+	}
+	bs->slackbuf = NULL;
+	bs->max_entries = lion_max_entries(index);
+	bs->root = InvalidBlockNumber;
+	bs->height = 0;
+	bs->sumopt = opts ? opts->summaries : LION_SUMOPT_OFF;
+	bs->sumtids = opts ? (uint32) opts->summary_tids : LION_DEFAULT_SUMMARY_TIDS;
+	bs->sum = NULL;
+	bs->summary_cols = 0;
+	bs->nsummaries = 0;
+
+	/*
+	 * How full a directory page is packed (DESIGN.md §21).  A LEAF needs no
+	 * floor: lion_build_level_add() accepts the FIRST item of a page whatever
+	 * the budget says, and one entry plus the high key a split would give it
+	 * always fits a page by construction (LION_MAX_ENTRY_SIZE).  An INTERNAL
+	 * page keeps its own fill - `fillfactor` is about leaving room for later
+	 * inserts into the leaves - and a floor of two downlinks, without which a
+	 * low fillfactor makes every level as large as the one below and the build
+	 * never reaches a root.
+	 */
+	bs->leafbudget = Max(LION_PAGE_CAPACITY * (Size) bs->fillfactor / 100, 1);
+	bs->dirbudget = LION_PAGE_CAPACITY * (Size) LION_NONLEAF_FILLFACTOR / 100;
+
+	/*
+	 * And a posting-tree leaf (DESIGN.md §22, "Bulk build").  At 100 this is
+	 * the whole page, and the test in lion_builder_spill() is then exactly
+	 * "the next item does not fit".
+	 */
+	bs->postbudget = LION_PAGE_CAPACITY * (Size) bs->posting_fillfactor / 100;
+
+	bs->buildctx = AllocSetContextCreate(CurrentMemoryContext,
+										 "lion index build",
+										 ALLOCSET_DEFAULT_SIZES);
+	/*
+	 * A key's builders take four buffers of up to a container each; a first
+	 * block that holds them all keeps the reset after every key from handing
+	 * blocks back to malloc and asking for them again.
+	 */
+	bs->tmpctx = AllocSetContextCreate(bs->buildctx,
+									   "lion index build temporary",
+									   0, 64 * 1024, ALLOCSET_DEFAULT_MAXSIZE);
+
+	bs->inline_limit = lion_build_index_state(index, &bs->ix, bs->buildctx);
+	ncols = bs->ix.ncolumns;
+	bs->nvalues = (uint64 *) MemoryContextAllocZero(bs->buildctx,
+													sizeof(uint64) * ncols);
+	bs->rows = 0;
+	bs->rowcol = lion_index_row_column(&bs->ix);
+
+	bs->maxbuilders = 8;
+	bs->builders = (LionBuilder **) MemoryContextAlloc(bs->buildctx,
+													  sizeof(LionBuilder *) * bs->maxbuilders);
+	bs->nbuilders = 0;
+	bs->cur = NULL;
+
+	/*
+	 * A column that stores positions (DESIGN.md §17) keeps them in the spool
+	 * with its codes, and the write hands them to lion_posbuild.c.
+	 */
+	bs->posbuild = lion_posbuild_begin(index, &bs->ix);
+	bs->pw.arg = bs;
+	bs->pw.alloc = lion_build_pw_alloc;
+	bs->pw.get = lion_build_pw_get;
+	bs->pw.put = lion_build_pw_put;
+}
+
+static void
+lion_build_state_end(LionBuildState *bs)
+{
+	lion_posbuild_end(bs->posbuild);
+	MemoryContextDelete(bs->buildctx);
+}
+
+/*
+ * Write column c from what feeds it: the serial build's spool, or the reader
+ * over the participants' tapes of it.
+ */
+static void
+lion_build_column(LionBuildState *bs, int c)
+{
+	Size		sumreserve;
+
+	bs->cur = &bs->ix.cols[c];
+
+	/*
+	 * A column's summaries (DESIGN.md §32) are collected while its values are
+	 * written and written after them, which is where they sort.  What they
+	 * take comes out of the spool's budget, not on top of it.
+	 */
+	bs->curpos = bs->cur->positions;
+	bs->sum = lion_sum_begin(bs, bs->cur);
+	sumreserve = (bs->sum != NULL) ? LION_SUM_MEMORY(bs->memkb) : 0;
+	if (bs->reader != NULL)
+		lion_spool_reader_emit(bs->reader, lion_build_emit, bs, sumreserve);
+	else
+		lion_spool_emit_column(bs->spool, c, lion_build_emit, bs, sumreserve);
+	if (bs->sum != NULL)
+	{
+		lion_sum_finish(bs, bs->sum);
+		bs->sum = NULL;
+	}
+	bs->curpos = false;
+	bs->cur = NULL;
+}
+
 /* ---------------------------------------------------------------------
  * Parallel build (PostgreSQL 17 and later: amcanbuildparallel)
  *
- * nbtree's and GIN's shape.  The leader sets up a parallel heap scan, a
- * shared fileset and room for one TapeShare per participant, launches the
- * workers and takes part itself; each participant scans its share of the
- * heap into a spool of its own, with maintenance_work_mem divided between
- * them, and exports it as one tape (lion_spool_export()).  Once all of them
- * are done, the leader merges the tapes a column at a time and writes the
- * index exactly as a serial build does, with one bulk writer - the write pass
- * stays serial, as nbtree's does.
+ * nbtree's and GIN's shape for the scan.  The leader sets up a parallel heap
+ * scan and a shared fileset, launches the workers and takes part itself; each
+ * participant scans its share of the heap into a spool of its own, with
+ * maintenance_work_mem divided between them, and exports one tape per key
+ * column (lion_spool_export()).
+ *
+ * The write is split by column, since no two columns share a key: once every
+ * participant's tapes are there, the workers take the columns one by one,
+ * the largest left first, each merging the participants' tapes of it and
+ * writing it to a file of its own ("Columns written by the workers", above).
+ * The leader writes each column in turn: itself, straight into the index,
+ * when no worker has taken it, or else by replaying the worker's file once
+ * it is done.  The directory, the meta page and the one bulk writer stay the
+ * leader's, and the index is the one a serial build writes, page for page.
+ *
+ * Replaying a column costs the leader its directory and its page writes,
+ * which a worker cannot take off it, so two columns are the leader's own: the
+ * first, which it can start on at once, and a column at least as large as
+ * all the others together, whose replay would cost more than the workers
+ * save on the rest (lion_parallel_own_column()).
  *
  * The scan is told not to synchronize (see lion_spool.c): the heap AM's
  * parallel scan decides that when it is initialized, from the table's size,
@@ -2226,6 +2660,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 #define PARALLEL_KEY_QUERY_TEXT		UINT64CONST(0xC100000000000003)
 #define PARALLEL_KEY_WAL_USAGE		UINT64CONST(0xC100000000000004)
 #define PARALLEL_KEY_BUFFER_USAGE	UINT64CONST(0xC100000000000005)
+#define PARALLEL_KEY_LION_COLUMNS	UINT64CONST(0xC100000000000006)
 
 typedef struct LionBuildShared
 {
@@ -2235,16 +2670,23 @@ typedef struct LionBuildShared
 	bool		isconcurrent;
 	int			nrequested;		/* workers asked for, plus the leader */
 	int			leaderfile;		/* the leader's file number */
+	int			ncols;			/* key columns */
+	bool		slack;			/* the build's growth slack (DESIGN.md §4) */
 	uint64		queryid;
 	SharedFileSet fileset;
 
-	/* Participants report here when their tape is ready. */
+	/* Participants report here when their tapes are ready. */
 	ConditionVariable workersdonecv;
 	slock_t		mutex;
+	int			nparticipants;	/* workers launched plus the leader, or 0
+								 * until the leader knows */
 	int			nparticipantsdone;
 	double		reltuples;
 	double		indtuples;
 	bool		brokenhotchain;
+
+	/* The write (LionBuildColumn says which column is whose). */
+	ConditionVariable coldonecv;	/* a worker finished a column */
 
 	/*
 	 * ParallelTableScanDescData follows, BUFFERALIGNed as shm_toc_allocate()
@@ -2255,12 +2697,30 @@ typedef struct LionBuildShared
 #define ParallelTableScanFromLionBuildShared(shared) \
 	((ParallelTableScanDesc) ((char *) (shared) + BUFFERALIGN(sizeof(LionBuildShared))))
 
+/*
+ * A column of the write, under the mutex: its size, whether someone has taken
+ * it, and of one a worker took, what its writing set that the meta page says.
+ */
+typedef struct LionBuildColumn
+{
+	int64		blocks;			/* the participants' tapes of it, together */
+	bool		taken;
+	bool		done;			/* the worker's file is complete */
+	bool		wrote_narrow;
+	bool		summarized;
+	int64		nsummaries;
+} LionBuildColumn;
+
 typedef struct LionBuildLeader
 {
 	ParallelContext *pcxt;
 	int			nparticipants;	/* workers launched, plus the leader */
 	LionBuildShared *shared;
-	TapeShare  *tapes;			/* by file number: workers', then leader's */
+	TapeShare  *tapes;			/* participant p's tape of column c at
+								 * p * ncols + c, by file number */
+	LionBuildColumn *columns;
+	int			owncol;			/* lion_parallel_own_column() */
+	int			nreplayed;		/* columns a worker wrote */
 	Snapshot	snapshot;
 	WalUsage   *walusage;
 	BufferUsage *bufferusage;
@@ -2269,14 +2729,29 @@ typedef struct LionBuildLeader
 extern PGDLLEXPORT void lion_parallel_build_main(dsm_segment *seg,
 												 shm_toc *toc);
 
+/* The file of participant p's tape of column c. */
+static inline int
+lion_parallel_colfile(const LionBuildShared *shared, int p, int c)
+{
+	return p * shared->ncols + c;
+}
+
+/* The file a worker writes column c to. */
+static void
+lion_parallel_colname(char *name, int c)
+{
+	snprintf(name, MAXPGPATH, "lion.column.%d", c);
+}
+
 /*
- * One participant's part, the leader's included: scan its share of the heap
- * into a spool, export the spool to the tape of its file number, and report.
+ * One participant's part of the scan, the leader's included: scan its share
+ * of the heap into a spool, export the spool to its tapes, and report.
  */
 static void
 lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
-							 Relation heap, Relation index, int filenum,
-							 int memkb, bool progress)
+							 LionBuildColumn *columns, Relation heap,
+							 Relation index, int filenum, int memkb,
+							 bool progress)
 {
 	MemoryContext cxt = AllocSetContextCreate(CurrentMemoryContext,
 											  "lion parallel build",
@@ -2287,10 +2762,12 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	IndexInfo  *indexInfo;
 	TableScanDesc scan;
 	double		reltuples;
+	int64	   *blocks;
+	int			c;
 
 	(void) lion_build_index_state(index, &ix, cxt);
 	spool = lion_spool_begin(&ix, (Size) memkb * 1024, &shared->fileset,
-							 filenum);
+							 lion_parallel_colfile(shared, filenum, 0));
 
 	indexInfo = BuildIndexInfo(index);
 	indexInfo->ii_Concurrent = shared->isconcurrent;
@@ -2299,20 +2776,256 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	reltuples = table_index_build_scan(heap, index, indexInfo, true, progress,
 									   lion_build_callback, spool, scan);
 
-	lion_spool_export(spool, &tapes[filenum]);
+	blocks = palloc(sizeof(int64) * shared->ncols);
+	lion_spool_export(spool, &tapes[filenum * shared->ncols], blocks);
 
 	SpinLockAcquire(&shared->mutex);
+	for (c = 0; c < shared->ncols; c++)
+		columns[c].blocks += blocks[c];
 	shared->nparticipantsdone++;
 	shared->reltuples += reltuples;
 	shared->indtuples += lion_spool_nrows(spool);
 	if (indexInfo->ii_BrokenHotChain)
 		shared->brokenhotchain = true;
 	SpinLockRelease(&shared->mutex);
-	ConditionVariableSignal(&shared->workersdonecv);
+	ConditionVariableBroadcast(&shared->workersdonecv);
 
 	lion_spool_end(spool);
 	MemoryContextSwitchTo(oldctx);
 	MemoryContextDelete(cxt);
+}
+
+/* Wait for every participant's tapes; returns how many participants. */
+static int
+lion_parallel_wait_scan(LionBuildShared *shared)
+{
+	int			n;
+
+	for (;;)
+	{
+		SpinLockAcquire(&shared->mutex);
+		n = shared->nparticipants;
+		if (n > 0 && shared->nparticipantsdone == n)
+		{
+			SpinLockRelease(&shared->mutex);
+			break;
+		}
+		SpinLockRelease(&shared->mutex);
+		ConditionVariableSleep(&shared->workersdonecv,
+							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+	}
+	ConditionVariableCancelSleep();
+	return n;
+}
+
+/*
+ * The reader over the participants' tapes of column c: the workers' files are
+ * numbered from 0, the leader's comes after, and the merge reads them in that
+ * order.
+ */
+static LionSpoolReader *
+lion_parallel_reader(LionBuildShared *shared, TapeShare *tapes,
+					 LionIndexState *ix, int c, int nparticipants,
+					 Size membytes)
+{
+	int		   *filenums = palloc(sizeof(int) * nparticipants);
+	TapeShare  *shares = palloc(sizeof(TapeShare) * nparticipants);
+	LionSpoolReader *rd;
+	int			i;
+
+	for (i = 0; i < nparticipants; i++)
+	{
+		int			p = (i < nparticipants - 1) ? i : shared->leaderfile;
+
+		filenums[i] = lion_parallel_colfile(shared, p, c);
+		shares[i] = tapes[p * shared->ncols + c];
+	}
+	rd = lion_spool_reader_begin(ix, c, &shared->fileset, nparticipants,
+								 filenums, shares, membytes);
+	pfree(filenums);
+	pfree(shares);
+	return rd;
+}
+
+/*
+ * The column the leader keeps for itself besides the first: the largest, when
+ * it is at least as large as all the others together, or else none (0).  A
+ * worker writing such a column would leave the leader replaying it after the
+ * others are long written; the leader writing it itself starts on it as soon
+ * as the columns before it are in.  Every participant works it out from the
+ * same sizes, which are final once the scan is over.
+ */
+static int
+lion_parallel_own_column(LionBuildShared *shared, LionBuildColumn *columns)
+{
+	int64		total = 0;
+	int			best = 0;
+	int			c;
+
+	SpinLockAcquire(&shared->mutex);
+	for (c = 0; c < shared->ncols; c++)
+	{
+		total += columns[c].blocks;
+		if (columns[c].blocks > columns[best].blocks)
+			best = c;
+	}
+	if (columns[best].blocks * 2 < total)
+		best = 0;
+	SpinLockRelease(&shared->mutex);
+	return best;
+}
+
+/*
+ * A worker's next column: the largest that is neither taken nor the
+ * leader's, or -1 when none is left.
+ */
+static int
+lion_parallel_claim_column(LionBuildShared *shared, LionBuildColumn *columns,
+						   int owncol)
+{
+	int			best = -1;
+	int			c;
+
+	SpinLockAcquire(&shared->mutex);
+	for (c = 1; c < shared->ncols; c++)
+	{
+		if (c == owncol || columns[c].taken)
+			continue;
+		if (best < 0 || columns[c].blocks > columns[best].blocks)
+			best = c;
+	}
+	if (best >= 0)
+		columns[best].taken = true;
+	SpinLockRelease(&shared->mutex);
+	return best;
+}
+
+/*
+ * A worker's part of the write: take a column nobody has, write it to its
+ * file, and say so, until no column is left.  memkb is the worker's share of
+ * maintenance_work_mem, as for the scan.
+ */
+static void
+lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
+							TapeShare *tapes, Relation index, int memkb)
+{
+	LionBuildState bs;
+	bool		started = false;
+	int			nparticipants;
+	int			owncol;
+
+	/* an index of one column is the leader's alone */
+	if (shared->ncols == 1)
+		return;
+	nparticipants = lion_parallel_wait_scan(shared);
+	owncol = lion_parallel_own_column(shared, columns);
+
+	for (;;)
+	{
+		char		name[MAXPGPATH];
+		int			c = lion_parallel_claim_column(shared, columns, owncol);
+
+		if (c < 0)
+			break;
+
+		if (!started)
+		{
+			lion_build_state_init(&bs, index, memkb);
+			bs.slack = shared->slack;
+			started = true;
+		}
+
+		/* each column counts its own blocks, from 0 */
+		bs.nblocks = 0;
+		bs.wrote_narrow = false;
+		bs.summary_cols = 0;
+		bs.nsummaries = 0;
+		lion_parallel_colname(name, c);
+		bs.colout = BufFileCreateFileSet(&shared->fileset.fs, name);
+		bs.reader = lion_parallel_reader(shared, tapes, &bs.ix, c,
+										 nparticipants, (Size) memkb * 1024);
+		lion_build_column(&bs, c);
+		lion_spool_reader_end(bs.reader);
+		bs.reader = NULL;
+		lion_build_colout_record(&bs, LION_COLREC_END, 0, NULL, 0);
+		BufFileClose(bs.colout);
+		bs.colout = NULL;
+
+		SpinLockAcquire(&shared->mutex);
+		columns[c].wrote_narrow = bs.wrote_narrow;
+		columns[c].summarized = (bs.summary_cols != 0);
+		columns[c].nsummaries = bs.nsummaries;
+		columns[c].done = true;
+		SpinLockRelease(&shared->mutex);
+		ConditionVariableBroadcast(&shared->coldonecv);
+	}
+
+	if (started)
+		lion_build_state_end(&bs);
+}
+
+/*
+ * The leader's turn at column c: true when the leader is to write it itself,
+ * because it is one of its own or nobody has taken it; false when a worker
+ * has, and the leader is to replay it.  *alone says whether every worker is
+ * done meanwhile: the columns before c are in, and every one after it that
+ * is not the leader's own is written already.
+ */
+static bool
+lion_parallel_take_column(LionBuildLeader *leader, int c, bool *alone)
+{
+	LionBuildShared *shared = leader->shared;
+	LionBuildColumn *col = &leader->columns[c];
+	bool		mine;
+	int			i;
+
+	SpinLockAcquire(&shared->mutex);
+	mine = (c == 0 || c == leader->owncol || !col->taken);
+	col->taken = true;
+	*alone = true;
+	for (i = c + 1; i < shared->ncols; i++)
+	{
+		if (i != leader->owncol && !leader->columns[i].done)
+			*alone = false;
+	}
+	SpinLockRelease(&shared->mutex);
+	return mine;
+}
+
+/* Wait for the worker that took column c, and write what it wrote. */
+static void
+lion_parallel_replay_column(LionBuildState *bs, int c)
+{
+	LionBuildLeader *leader = bs->leader;
+	LionBuildShared *shared = leader->shared;
+	LionBuildColumn *col = &leader->columns[c];
+	char		name[MAXPGPATH];
+	BufFile    *file;
+	bool		done;
+
+	for (;;)
+	{
+		SpinLockAcquire(&shared->mutex);
+		done = col->done;
+		SpinLockRelease(&shared->mutex);
+		if (done)
+			break;
+		ConditionVariableSleep(&shared->coldonecv, WAIT_EVENT_PARALLEL_FINISH);
+	}
+	ConditionVariableCancelSleep();
+
+	lion_parallel_colname(name, c);
+	file = BufFileOpenFileSet(&shared->fileset.fs, name, O_RDONLY, false);
+	lion_build_replay_column(bs, file);
+	BufFileClose(file);
+	BufFileDeleteFileSet(&shared->fileset.fs, name, false);
+	leader->nreplayed++;
+
+	if (col->wrote_narrow)
+		bs->wrote_narrow = true;
+	if (col->summarized)
+		bs->summary_cols |= ((uint32) 1) << (bs->ix.cols[c].attno - 1);
+	bs->nsummaries += col->nsummaries;
 }
 
 static void
@@ -2343,8 +3056,11 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	Snapshot	snapshot;
 	Size		estshared;
 	Size		esttapes;
+	Size		estcolumns;
 	LionBuildShared *shared;
 	TapeShare  *tapes;
+	LionBuildColumn *columns;
+	int			ncols = bs->ix.ncolumns;
 	int			querylen = 0;
 
 	EnterParallelMode();
@@ -2362,10 +3078,12 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 
 	estshared = add_size(BUFFERALIGN(sizeof(LionBuildShared)),
 						 table_parallelscan_estimate(heap, snapshot));
-	esttapes = mul_size(sizeof(TapeShare), request + 1);
+	esttapes = mul_size(sizeof(TapeShare), mul_size(request + 1, ncols));
+	estcolumns = mul_size(sizeof(LionBuildColumn), ncols);
 	shm_toc_estimate_chunk(&pcxt->estimator, estshared);
 	shm_toc_estimate_chunk(&pcxt->estimator, esttapes);
-	shm_toc_estimate_keys(&pcxt->estimator, 2);
+	shm_toc_estimate_chunk(&pcxt->estimator, estcolumns);
+	shm_toc_estimate_keys(&pcxt->estimator, 3);
 	shm_toc_estimate_chunk(&pcxt->estimator,
 						   mul_size(sizeof(WalUsage), pcxt->nworkers));
 	shm_toc_estimate_chunk(&pcxt->estimator,
@@ -2394,14 +3112,18 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	shared->isconcurrent = isconcurrent;
 	shared->nrequested = request + 1;
 	shared->leaderfile = request;
+	shared->ncols = ncols;
+	shared->slack = bs->slack;
 	shared->queryid = pgstat_get_my_query_id();
 	SharedFileSetInit(&shared->fileset, pcxt->seg);
 	ConditionVariableInit(&shared->workersdonecv);
 	SpinLockInit(&shared->mutex);
+	shared->nparticipants = 0;
 	shared->nparticipantsdone = 0;
 	shared->reltuples = 0.0;
 	shared->indtuples = 0.0;
 	shared->brokenhotchain = false;
+	ConditionVariableInit(&shared->coldonecv);
 	table_parallelscan_initialize(heap,
 								  ParallelTableScanFromLionBuildShared(shared),
 								  snapshot);
@@ -2409,9 +3131,12 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 
 	tapes = (TapeShare *) shm_toc_allocate(pcxt->toc, esttapes);
 	memset(tapes, 0, esttapes);
+	columns = (LionBuildColumn *) shm_toc_allocate(pcxt->toc, estcolumns);
+	memset(columns, 0, estcolumns);
 
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LION_SHARED, shared);
 	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LION_TAPES, tapes);
+	shm_toc_insert(pcxt->toc, PARALLEL_KEY_LION_COLUMNS, columns);
 	if (debug_query_string)
 	{
 		char	   *sharedquery = shm_toc_allocate(pcxt->toc, querylen + 1);
@@ -2431,6 +3156,7 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	leader->nparticipants = pcxt->nworkers_launched + 1;
 	leader->shared = shared;
 	leader->tapes = tapes;
+	leader->columns = columns;
 	leader->snapshot = snapshot;
 
 	if (pcxt->nworkers_launched == 0)
@@ -2440,8 +3166,14 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	}
 	bs->leader = leader;
 
+	/* the workers wait for every participant before they write a column */
+	SpinLockAcquire(&shared->mutex);
+	shared->nparticipants = leader->nparticipants;
+	SpinLockRelease(&shared->mutex);
+	ConditionVariableBroadcast(&shared->workersdonecv);
+
 	/* The leader takes part as a worker does, on the file after theirs. */
-	lion_parallel_scan_and_spool(shared, tapes, heap, index,
+	lion_parallel_scan_and_spool(shared, tapes, columns, heap, index,
 								 shared->leaderfile,
 								 maintenance_work_mem / leader->nparticipants,
 								 true);
@@ -2451,50 +3183,24 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 }
 
 /*
- * Wait for every participant's tape, and open the leader's reader over them.
- * Returns the number of heap tuples the scan saw.
+ * Wait for every participant's tapes.  Returns the number of heap tuples the
+ * scan saw.
  */
 static double
 lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
 {
-	LionBuildLeader *leader = bs->leader;
-	LionBuildShared *shared = leader->shared;
+	LionBuildShared *shared = bs->leader->shared;
 	double		reltuples;
-	int		   *filenums;
-	TapeShare  *shares;
-	int			i;
 
-	for (;;)
-	{
-		SpinLockAcquire(&shared->mutex);
-		if (shared->nparticipantsdone == leader->nparticipants)
-		{
-			reltuples = shared->reltuples;
-			bs->indtuples = shared->indtuples;
-			if (shared->brokenhotchain)
-				*brokenhotchain = true;
-			SpinLockRelease(&shared->mutex);
-			break;
-		}
-		SpinLockRelease(&shared->mutex);
-		ConditionVariableSleep(&shared->workersdonecv,
-							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
-	}
-	ConditionVariableCancelSleep();
+	(void) lion_parallel_wait_scan(shared);
+	bs->leader->owncol = lion_parallel_own_column(shared, bs->leader->columns);
+	SpinLockAcquire(&shared->mutex);
+	reltuples = shared->reltuples;
+	bs->indtuples = shared->indtuples;
+	if (shared->brokenhotchain)
+		*brokenhotchain = true;
+	SpinLockRelease(&shared->mutex);
 
-	/* the workers' files are numbered from 0, the leader's comes after */
-	filenums = palloc(sizeof(int) * leader->nparticipants);
-	shares = palloc(sizeof(TapeShare) * leader->nparticipants);
-	for (i = 0; i < leader->nparticipants; i++)
-	{
-		filenums[i] = (i < leader->pcxt->nworkers_launched) ? i :
-			shared->leaderfile;
-		shares[i] = leader->tapes[filenums[i]];
-	}
-	bs->reader = lion_spool_reader_begin(&bs->ix, &shared->fileset,
-										 leader->nparticipants, filenums,
-										 shares,
-										 (Size) maintenance_work_mem * 1024);
 	return reltuples;
 }
 
@@ -2506,18 +3212,21 @@ lion_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 {
 	LionBuildShared *shared;
 	TapeShare  *tapes;
+	LionBuildColumn *columns;
 	Relation	heap;
 	Relation	index;
 	LOCKMODE	heaplock;
 	LOCKMODE	indexlock;
 	WalUsage   *walusage;
 	BufferUsage *bufferusage;
+	int			memkb;
 
 	debug_query_string = shm_toc_lookup(toc, PARALLEL_KEY_QUERY_TEXT, true);
 	pgstat_report_activity(STATE_RUNNING, debug_query_string);
 
 	shared = shm_toc_lookup(toc, PARALLEL_KEY_LION_SHARED, false);
 	tapes = shm_toc_lookup(toc, PARALLEL_KEY_LION_TAPES, false);
+	columns = shm_toc_lookup(toc, PARALLEL_KEY_LION_COLUMNS, false);
 
 	/* the lock modes index.c took for the leader */
 	if (!shared->isconcurrent)
@@ -2538,10 +3247,10 @@ lion_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 	SharedFileSetAttach(&shared->fileset, seg);
 	InstrStartParallelQuery();
 
-	lion_parallel_scan_and_spool(shared, tapes, heap, index,
-								 ParallelWorkerNumber,
-								 maintenance_work_mem / shared->nrequested,
-								 false);
+	memkb = maintenance_work_mem / shared->nrequested;
+	lion_parallel_scan_and_spool(shared, tapes, columns, heap, index,
+								 ParallelWorkerNumber, memkb, false);
+	lion_parallel_write_columns(shared, columns, tapes, index, memkb);
 
 	bufferusage = shm_toc_lookup(toc, PARALLEL_KEY_BUFFER_USAGE, false);
 	walusage = shm_toc_lookup(toc, PARALLEL_KEY_WAL_USAGE, false);
@@ -2559,11 +3268,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
 	LionBuildState bs;
-	LionOptions *opts = (LionOptions *) index->rd_options;
 	double		reltuples;
 	BulkWriteBuffer metabuf;
-	Size		sumreserve;
-	LionPosBuild *posbuild;
 	int			ncols;
 	int			c;
 
@@ -2578,86 +3284,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
 
-	memset(&bs, 0, sizeof(bs));
-	bs.index = index;
-	bs.indtuples = 0;
-	bs.fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
-	bs.posting_fillfactor = opts ? opts->posting_fillfactor :
-		LION_DEFAULT_POSTING_FILLFACTOR;
-	switch (opts ? opts->build_slack : LION_DEFAULT_BUILD_SLACK)
-	{
-		case LION_SLACKOPT_ON:
-			bs.slack = true;
-			break;
-		case LION_SLACKOPT_OFF:
-			bs.slack = false;
-			break;
-		default:
-
-			/*
-			 * AUTO: where a moved item costs the most.  A generic-WAL record
-			 * is a byte diff of the page, so the first insert into an item
-			 * written at its exact size - which moves every item stored
-			 * below it - logs all of them; a resource-manager record logs the
-			 * item's own change whether or not others move (DESIGN.md §4).
-			 */
-			bs.slack = (lion_wal_mode_for_build(index) == LION_WAL_MODE_GENERIC);
-			break;
-	}
-	bs.slackbuf = NULL;
-	bs.max_entries = lion_max_entries(index);
-	bs.root = InvalidBlockNumber;
-	bs.height = 0;
-	bs.sumopt = opts ? opts->summaries : LION_SUMOPT_OFF;
-	bs.sumtids = opts ? (uint32) opts->summary_tids : LION_DEFAULT_SUMMARY_TIDS;
-	bs.sum = NULL;
-	bs.summary_cols = 0;
-	bs.nsummaries = 0;
-
-	/*
-	 * How full a directory page is packed (DESIGN.md §21).  A LEAF needs no
-	 * floor: lion_build_level_add() accepts the FIRST item of a page whatever
-	 * the budget says, and one entry plus the high key a split would give it
-	 * always fits a page by construction (LION_MAX_ENTRY_SIZE).  An INTERNAL
-	 * page keeps its own fill - `fillfactor` is about leaving room for later
-	 * inserts into the leaves - and a floor of two downlinks, without which a
-	 * low fillfactor makes every level as large as the one below and the build
-	 * never reaches a root.
-	 */
-	bs.leafbudget = Max(LION_PAGE_CAPACITY * (Size) bs.fillfactor / 100, 1);
-	bs.dirbudget = LION_PAGE_CAPACITY * (Size) LION_NONLEAF_FILLFACTOR / 100;
-
-	/*
-	 * And a posting-tree leaf (DESIGN.md §22, "Bulk build").  At 100 this is
-	 * the whole page, and the test in lion_builder_spill() is then exactly
-	 * "the next item does not fit".
-	 */
-	bs.postbudget = LION_PAGE_CAPACITY * (Size) bs.posting_fillfactor / 100;
-
-	bs.buildctx = AllocSetContextCreate(CurrentMemoryContext,
-										"lion index build",
-										ALLOCSET_DEFAULT_SIZES);
-	/*
-	 * A key's builders take four buffers of up to a container each; a first
-	 * block that holds them all keeps the reset after every key from handing
-	 * blocks back to malloc and asking for them again.
-	 */
-	bs.tmpctx = AllocSetContextCreate(bs.buildctx,
-									  "lion index build temporary",
-									  0, 64 * 1024, ALLOCSET_DEFAULT_MAXSIZE);
-
-	bs.inline_limit = lion_build_index_state(index, &bs.ix, bs.buildctx);
+	lion_build_state_init(&bs, index, maintenance_work_mem);
 	ncols = bs.ix.ncolumns;
-	bs.nvalues = (uint64 *) MemoryContextAllocZero(bs.buildctx,
-												   sizeof(uint64) * ncols);
-	bs.rows = 0;
-	bs.rowcol = lion_index_row_column(&bs.ix);
-
-	bs.maxbuilders = 8;
-	bs.builders = (LionBuilder **) MemoryContextAlloc(bs.buildctx,
-													 sizeof(LionBuilder *) * bs.maxbuilders);
-	bs.nbuilders = 0;
-	bs.cur = NULL;
 
 	/*
 	 * The scan.  Core asks for workers only where the AM can take them
@@ -2665,17 +3293,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * allows them: max_parallel_maintenance_workers, the table's
 	 * parallel_workers, and 32MB of maintenance_work_mem per participant.
 	 */
-	/*
-	 * A column that stores positions (DESIGN.md §17) keeps them in the spool
-	 * with its codes, and the write below hands them to lion_posbuild.c.
-	 */
-	posbuild = lion_posbuild_begin(index, &bs.ix);
-	bs.posbuild = posbuild;
-	bs.pw.arg = &bs;
-	bs.pw.alloc = lion_build_pw_alloc;
-	bs.pw.get = lion_build_pw_get;
-	bs.pw.put = lion_build_pw_put;
-
 #if PG_VERSION_NUM >= 170000
 	if (indexInfo->ii_ParallelWorkers > 0)
 		lion_begin_parallel(&bs, heap, index, indexInfo->ii_Concurrent,
@@ -2721,34 +3338,40 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * Column by column, in attno order: the directory order leads with the
 	 * key column (DESIGN.md §24), so the columns' entry runs laid end to end
 	 * are already sorted and the level builder needs no notion of columns.
+	 * In a parallel build a worker may have written a column already, and
+	 * the leader then replays it; a column it writes itself it gives its
+	 * share of maintenance_work_mem while a worker may still be writing one,
+	 * and all of it once none can.
 	 */
 	for (c = 0; c < ncols; c++)
 	{
-		bs.cur = &bs.ix.cols[c];
-
-		/*
-		 * A column's summaries (DESIGN.md §32) are collected while its values
-		 * are written and written after them, which is where they sort.  What
-		 * they take comes out of the spool's maintenance_work_mem, not on top
-		 * of it.
-		 */
-		bs.curpos = bs.cur->positions;
-		bs.sum = lion_sum_begin(&bs, bs.cur);
-		sumreserve = (bs.sum != NULL) ? LION_SUM_MEMORY : 0;
-		if (bs.reader != NULL)
-			lion_spool_reader_emit_column(bs.reader, c, lion_build_emit, &bs,
-										  sumreserve);
-		else
-			lion_spool_emit_column(bs.spool, c, lion_build_emit, &bs,
-								   sumreserve);
-		if (bs.sum != NULL)
+#if PG_VERSION_NUM >= 170000
+		if (bs.leader != NULL)
 		{
-			lion_sum_finish(&bs, bs.sum);
-			bs.sum = NULL;
+			bool		alone;
+
+			if (!lion_parallel_take_column(bs.leader, c, &alone))
+			{
+				lion_parallel_replay_column(&bs, c);
+				continue;
+			}
+			bs.memkb = alone ? maintenance_work_mem :
+				maintenance_work_mem / bs.leader->nparticipants;
+			bs.reader = lion_parallel_reader(bs.leader->shared,
+											 bs.leader->tapes, &bs.ix, c,
+											 bs.leader->nparticipants,
+											 (Size) bs.memkb * 1024);
 		}
-		bs.curpos = false;
+#endif
+		lion_build_column(&bs, c);
+#if PG_VERSION_NUM >= 170000
+		if (bs.reader != NULL)
+		{
+			lion_spool_reader_end(bs.reader);
+			bs.reader = NULL;
+		}
+#endif
 	}
-	bs.cur = NULL;
 
 	lion_build_finish_dir(&bs);
 
@@ -2786,6 +3409,11 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (bs.spool != NULL)
 		elog(DEBUG2, "lion index \"%s\": %d runs spilled",
 			 RelationGetRelationName(index), lion_spool_nruns(bs.spool));
+#if PG_VERSION_NUM >= 170000
+	if (bs.leader != NULL)
+		elog(DEBUG2, "lion index \"%s\": %d of %d key columns written by workers",
+			 RelationGetRelationName(index), bs.leader->nreplayed, ncols);
+#endif
 
 	/*
 	 * Cardinality guard (DESIGN.md §17).  At build time the count is exact -
@@ -2797,14 +3425,11 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	if (bs.spool != NULL)
 		lion_spool_end(bs.spool);
-	lion_posbuild_end(posbuild);
 #if PG_VERSION_NUM >= 170000
-	if (bs.reader != NULL)
-		lion_spool_reader_end(bs.reader);
 	if (bs.leader != NULL)
 		lion_end_parallel(bs.leader);
 #endif
-	MemoryContextDelete(bs.buildctx);
+	lion_build_state_end(&bs);
 
 	/*
 	 * The index's tuples are its ROWS, as VACUUM reports them (DESIGN.md §18,
