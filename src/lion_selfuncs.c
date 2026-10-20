@@ -1460,8 +1460,8 @@ lion_canonical_clause(Node *clause)
  * with freq(v) what core's eqsel() takes for `k = v`: v's frequency among the
  * most common values, or the average of the others.  Core estimates each
  * `k <> v` alone as 1 - freq(v) - nullfrac and multiplies them, which takes
- * the NULLs away once a clause: thirteen of them over a column 35% NULL came
- * out at 3,444 rows of 1,000,000 for 593,593.  scalararraysel() sums `<> ALL`
+ * the NULLs away once a clause: thirteen of them over a column 35% NULL come
+ * out at 3,452 rows of 1,000,000 for 593,523.  scalararraysel() sums `<> ALL`
  * the same way, its disjoint form `1 - sum(freq(v) + nullfrac)`, and where
  * that comes out below zero - two values of a column more than half NULL -
  * falls back to the product.
