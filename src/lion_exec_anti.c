@@ -436,7 +436,8 @@ lion_anti_collect(LionCountScanState *st)
 		{
 			bool		isnull;
 
-			keys[k] = ExecEvalExpr(as->keystate[k], econtext, &isnull);
+			keys[k] = ExecEvalExprSwitchContext(as->keystate[k], econtext,
+												&isnull);
 			if (isnull)
 			{
 				anynull = true;
@@ -653,11 +654,15 @@ lion_anti_lookup(LionCountScanState *st)
 				Datum		key[2];
 				bool		isnull[2];
 				int			g;
+				MemoryContext oldcxt;
 
+				/* what hashing a key allocates goes with the row's tests */
+				oldcxt = MemoryContextSwitchTo(as->econtext->ecxt_per_tuple_memory);
 				for (g = 0; g < as->ngroup; g++)
 					key[g] = slot_getattr(as->heapslot, as->groupattno[g],
 										  &isnull[g]);
 				lion_anti_group_of(as, key, isnull, true)->n++;
+				MemoryContextSwitchTo(oldcxt);
 			}
 		}
 	}
