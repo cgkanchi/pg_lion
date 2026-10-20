@@ -264,8 +264,12 @@ SELECT * FROM lca_explain('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AN
    ->  Seq Scan on lca_skip s
 (8 rows)
 
-SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')');
-                      lca_explain                       
+-- (the child's own plan, a join of two tables with every join method
+-- disabled, is whichever the release makes: only its top is shown)
+SELECT regexp_replace(ln, '(Nested Loop|Hash Join|Merge Join)', 'a join') AS ln
+  FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')') AS ln
+ WHERE ln !~ '^\s{8}';
+                           ln                           
 --------------------------------------------------------
  Custom Scan (LionCount)
    Lion Indexes: lca_rows_x (x = 3)
@@ -273,13 +277,8 @@ SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT
    Join Rows: the rows counted, less those with a match
    Join Lookup Index: lca_rows_k
    Join Cond: (s.a = k)
-   ->  Nested Loop
-         Join Filter: (s.a = t.a)
-         ->  Seq Scan on lca_skip s
-         ->  Materialize
-               ->  Seq Scan on lca_tag t
-                     Filter: (tag = 'on'::text)
-(12 rows)
+   ->  a join
+(7 rows)
 
 -- the counters: the child's rows, the distinct keys, the rows found, and those subtracted
 SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)',
