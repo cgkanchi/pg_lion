@@ -597,6 +597,12 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 			}
 			break;
 
+		case LION_MODE_CELLS:
+			/* serial, or by ranges of keys (lion_next_cells()) */
+			Assert(st->decode != NULL && st->cells != NULL &&
+				   !lion_plan_flag(st, LION_FLAG_SUMALL));
+			break;
+
 		case LION_MODE_GROUP:
 		case LION_MODE_GROUP2:
 		case LION_MODE_GROUP_DISTINCT:

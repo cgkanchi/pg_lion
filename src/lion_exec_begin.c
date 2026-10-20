@@ -633,6 +633,9 @@ lion_open_relation(LionCountScanState *st, int p)
 		}
 	}
 
+	/* the indexes of a count by cells' dimensions (DESIGN.md §10) */
+	lion_cells_open(st);
+
 	/*
 	 * A two-column GROUP BY reads the inner index's keys once for this
 	 * relation (DESIGN.md §20); the sets themselves are located per pair,
@@ -672,7 +675,8 @@ lion_close_relation(LionCountScanState *st)
 			index_close(st->fg->idx, AccessShareLock);
 		st->fg->idx = NULL;
 	}
-	if (st->decode != NULL)		/* ... and so is the decoded walk */
+	lion_cells_close(st);		/* ... and so is a count by cells */
+	if (st->decode != NULL)		/* ... and the decoded walk */
 	{
 		LionDecodeRun *dr = st->decode;
 		int			c;
@@ -1904,6 +1908,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_run_state(st, cscan, estate);
 	lion_begin_contexts(st, estate);
 	lion_begin_decoded_walk(st, priv, estate);
+	lion_begin_cells(st, priv, estate);
 	st->viscache = lion_vis_cache_create(estate->es_query_cxt);
 	st->writtenrels = lion_statement_written_rels(estate);
 	lion_begin_join_child(st, node, cscan, estate, eflags);

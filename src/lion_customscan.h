@@ -241,6 +241,16 @@
 #define LION_TL_IS_RESID(kind)		((kind) > 0x40000000 && (kind) < 0x40010000)
 #define LION_TL_RESID_ATTNO(kind)	((AttrNumber) ((kind) - 0x40000000))
 
+/*
+ * A predicate of a count by cells (DESIGN.md §10, "Counts by cells"):
+ * LION_TL_CELLPRED(i) is the truth of the plan's i'th predicate in the cell
+ * the row stands for - true, false or NULL - which the plan's projection
+ * computes the GROUP BY's expressions from.  Above the residual columns.
+ */
+#define LION_TL_CELLPRED(i)			(0x50000000 + (i))
+#define LION_TL_IS_CELLPRED(kind)	((kind) >= 0x50000000 && (kind) < 0x60000000)
+#define LION_TL_CELLPRED_NO(kind)	((kind) - 0x50000000)
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -1237,7 +1247,19 @@ typedef struct LionVColScope
  *		EXPLAIN prints them ("Implied by Index Predicate") - deparsed when
  *		the plan is made, as member 13's are.  Empty when every index read
  *		is a whole one
- *	23	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	23	List, or empty: the cells a count by cells counts (DESIGN.md §10,
+ *		"Counts by cells"; LION_FLAG_DECODE with one walked column, the
+ *		driver of member 15): an IntList {dimensions, predicates, the
+ *		dimension the driver's entries are, or -1}; a List per dimension -
+ *		an IntList {kind, attnum, outcomes, the NULL's outcome, leaves}, an
+ *		OidList {index, equality, collation}, a List of the Consts with an
+ *		outcome other than 0 and an IntList of those outcomes, an OidList of
+ *		each multi-key leaf's operator and a List of its query Const; and
+ *		an IntList per predicate {dimension, kind, leaf, then its truth in
+ *		each outcome}.  In the PATH's list only, a List of the predicates'
+ *		expressions and a List of the WHERE clauses over them, which
+ *		lion_plan_custom_path() makes LION_TL_CELLPRED columns and the qual
+ *	24	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1263,7 +1285,8 @@ typedef struct LionVColScope
 #define LION_PRIV_FILTERS	20
 #define LION_PRIV_RESID		21
 #define LION_PRIV_PARTIAL	22
-#define LION_PRIV_TLKINDS	23
+#define LION_PRIV_CELLS		23
+#define LION_PRIV_TLKINDS	24
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1364,6 +1387,10 @@ typedef struct LionVColScope
  * partial indexes, whose predicates imply WHERE clauses the plan leaves out
  * (DESIGN.md §45), which an older build would have printed nothing of.
  *
+ * Shape 28 added the CELLS member (23) in front of the target-list kinds,
+ * and the LION_TL_CELLPRED columns: counts by cells (DESIGN.md §10, "Counts
+ * by cells"), whose one walked column groups nothing.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1376,8 +1403,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491b
-#define LION_PRIV_NMEMBERS	24
+#define LION_PRIV_MAGIC		0x5242491c
+#define LION_PRIV_NMEMBERS	25
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2181,7 +2208,8 @@ typedef enum LionCountMode
 	LION_MODE_GROUP_RANGED,		/* a parallel GROUP BY (§10), or GROUP's
 								 * walk without the shared memory */
 	LION_MODE_JOIN,				/* the FK-side join (§27) */
-	LION_MODE_JOIN_FACTGROUP	/* ... grouped by a fact column */
+	LION_MODE_JOIN_FACTGROUP,	/* ... grouped by a fact column */
+	LION_MODE_CELLS				/* counts by cells (§10), serial or not */
 } LionCountMode;
 
 /*
@@ -2249,6 +2277,104 @@ typedef struct LionCountPrivWAgg
 	Oid			aggfnoid;		/* LION_WAGG_EXTREME: the aggregate ... */
 	Oid			collation;		/* ... and its collation */
 } LionCountPrivWAgg;
+
+/*
+ * Counts by cells (DESIGN.md §10, "Counts by cells"): CELLS's dimensions and
+ * predicates.  A dimension is one column the predicates are of, and its
+ * OUTCOMES the classes of its rows the predicates cannot tell apart: a
+ * scalar column's values - each of the predicates' constants, any other
+ * value, NULL - grouped by the truths they give every predicate, outcome 0
+ * being any other value's; a multi-key column's leaves true of a row, as
+ * bits, and NULL past them.  A cell is an outcome of every dimension.
+ */
+#define LION_CELLDIM_SCALAR		0
+#define LION_CELLDIM_MULTI		1
+
+#define LION_CELLPRED_TABLE		0	/* scalar: truth[outcome] */
+#define LION_CELLPRED_BIT		1	/* multi-key: leaf `bit` */
+#define LION_CELLPRED_NONE		2	/* multi-key: a query no key narrows */
+#define LION_CELLPRED_NULLS		3	/* multi-key: truth[0] of a value,
+									 * truth[1] of NULL */
+
+#define LION_TRUTH_FALSE		0
+#define LION_TRUTH_TRUE			1
+#define LION_TRUTH_NULL			2
+
+/* The most of each a plan has (lion_plan_cells.c) */
+#define LION_CELLS_MAX_DIMS		32
+#define LION_CELLS_MAX_PREDS	128
+#define LION_CELLS_MAX_BITS		10	/* a multi-key column's leaves */
+#define LION_CELLS_MAX_VALUES	1024	/* a scalar column's constants */
+#define LION_CELLS_MAX_KEYS		63	/* a multi-key column's keys, all leaves */
+
+typedef struct LionCellsDimPriv
+{
+	int			kind;			/* LION_CELLDIM_* */
+	AttrNumber	attno;
+	Oid			idxoid;			/* its labels', or the driver's walk */
+	int			radix;			/* outcomes */
+	int			nullout;		/* NULL's */
+	/* SCALAR */
+	Oid			eqop;			/* the values' equality, (T, T) */
+	Oid			collation;
+	int			nval;			/* the values with an outcome other than 0 */
+	List	   *vals;			/* ... their Consts */
+	int		   *valout;			/* ... and outcomes */
+	/* MULTI: radix is 2^nbit + 1, nullout 2^nbit */
+	int			nbit;
+	Oid			bitop[LION_CELLS_MAX_BITS];
+	Const	   *bitquery[LION_CELLS_MAX_BITS];
+} LionCellsDimPriv;
+
+typedef struct LionCellsPredPriv
+{
+	int			dim;
+	int			kind;			/* LION_CELLPRED_* */
+	int			bit;			/* BIT */
+	uint8	   *truth;			/* TABLE: radix truths, NULLS: two */
+} LionCellsPredPriv;
+
+/*
+ * A count by cells (DESIGN.md §10, "Counts by cells"), as it runs: the
+ * plan's dimensions and predicates, each dimension's index and its weight in
+ * a cell's code (the dimensions' outcomes are the digits of a mixed radix,
+ * the last the least significant), the labels located for the relation, and
+ * the cell that goes up - its outcomes, and each predicate's truth in it
+ * (LION_TRUTH_*), which lion_emit_keys() prints for the LION_TL_CELLPRED
+ * columns.  The driver's walk and the tally are the decoded walk's
+ * (LionDecodeRun, of one column).
+ */
+typedef struct LionCellsRun
+{
+	int			ndim;
+	int			npred;
+	int			drv;			/* the driver's dimension, or -1 */
+	const LionCellsDimPriv *dimpriv;
+	const LionCellsPredPriv *pred;
+	Relation   *idx;			/* a dimension's index; the driver's is the
+								 * walk's */
+	AttrNumber *idxcol;
+	int		   *radix;
+	LionCellDim *dims;
+	uint64		ncells;
+
+	/* the labels, located once a run, unpinned */
+	bool		located;
+	MemoryContext labelcxt;
+	int			nlabel;
+	LionCellLabel *labels;
+	LionPostingSet *labelsets;
+	PGAlignedBlock *images;
+
+	/* the driver's equality, which tells its entries' outcomes */
+	FmgrInfo	drveq;
+	bool		hasdrveq;
+	uint64	   *drvadd;			/* each value of the chunk's part of a code */
+
+	/* the cell that goes up */
+	int		   *outs;
+	uint8	   *truth;
+} LionCellsRun;
 
 /*
  * The whole list.  Lists and nodes point into the plan, which outlives
@@ -2321,6 +2447,15 @@ typedef struct LionCountPriv
 	int			nfilter;		/* FILTERS (§10), or 0 */
 	List	   *filterexprs;	/* ... each one's expression: PATH stage only */
 
+	/* CELLS (§10, "Counts by cells"), or ncelldim 0 */
+	int			ncelldim;
+	LionCellsDimPriv *celldim;
+	int			ncellpred;
+	LionCellsPredPriv *cellpred;
+	int			celldrv;		/* the driver's dimension, or -1 */
+	List	   *cellexprs;		/* the predicates: PATH stage only */
+	List	   *cellquals;		/* the WHERE over them: PATH stage only */
+
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
 
@@ -2364,6 +2499,14 @@ typedef struct LionCountScanState
 	 * other shape.
 	 */
 	struct LionDecodeRun *decode;
+
+	/*
+	 * Counts by cells (DESIGN.md §10, "Counts by cells"): the dimensions'
+	 * indexes, their labels and the tally of the cells, beside the decoded
+	 * walk of the one column that drives them (decode).  NULL for every other
+	 * shape.
+	 */
+	struct LionCellsRun *cells;
 
 	/*
 	 * count(DISTINCT k) (DESIGN.md §26).  plan.distattno is k, or 0.  Without
@@ -3144,6 +3287,9 @@ extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  Oid extractquery, Oid exprcoll,
 									  bool positions, AttrNumber *colp);
 extern bool lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col);
+extern LionQueryMode lion_multikey_literal_mode(IndexOptInfo *idx,
+												AttrNumber col, Oid opno,
+												Const *con);
 extern BoolExpr *lion_boolean_not_test(Node *clause);
 extern List *lion_or_arms(Node *clause);
 extern List *lion_all_as_and(Node *clause);
@@ -3171,6 +3317,49 @@ extern List *lion_vcol_refs(Node *node);
 extern List *lion_vcol_refs_with(Node *node, List *vcols);
 extern bool lion_index_col_is_vcol(Relation index, int col, Node *vcol);
 extern char *lion_vcol_name(Oid relid, Node *vcol);
+
+/*
+ * lion_plan_cells.c: what the planner makes of the predicates of a count by
+ * cells (DESIGN.md §10, "Counts by cells") - each dimension's column, the
+ * index it is read from and the outcomes of its rows, each predicate's
+ * truths, and the driver.
+ */
+typedef struct LionCellsDimPlan
+{
+	LionCellsDimPriv priv;
+	Var		   *var;
+	IndexOptInfo *idx;
+	AttrNumber	col;			/* the key column of idx */
+	double		entries;		/* the column's distinct values */
+	double	   *valsel;			/* SCALAR: each labelled value's share */
+	double		nullsel;		/* ... and NULL's */
+	double		bitsel[LION_CELLS_MAX_BITS];	/* MULTI: each leaf's */
+	double		bitkeys[LION_CELLS_MAX_BITS];	/* ... and its keys */
+	Node	   *bitclause[LION_CELLS_MAX_BITS];
+} LionCellsDimPlan;
+
+typedef struct LionCellsPlan
+{
+	int			ndim;
+	LionCellsDimPlan *dims;
+	int			npred;
+	LionCellsPredPriv *preds;
+	List	   *predexprs;		/* the predicates, by number */
+	double		ncells;			/* the product of the radixes */
+	int			drv;			/* the dimension that drives, or -1 */
+	Var		   *drvvar;			/* the column that does */
+	double		drventries;		/* ... and its entries */
+} LionCellsPlan;
+
+extern bool lion_cells_shape_ok(PlannerInfo *root, RelOptInfo *rel,
+								Index rti, Node *expr);
+extern LionCellsPlan *lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel,
+										 Index rti, List *exprs);
+extern bool lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
+									 LionCellsPlan *cp, Var *fallback,
+									 double fallbackentries);
+extern void lion_cells_fill_priv(const LionCellsPlan *cp, LionCountPriv *p,
+								 List *cellquals);
 
 /* lion_plan_partition.c */
 extern Var *lion_child_var(PlannerInfo *root, Index childrelid,
@@ -3372,6 +3561,13 @@ extern void lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath,
 								  double outrows);
 extern double lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col,
 								  Node *clause);
+struct LionCellsPlan;
+extern void lion_cost_cells_path(PlannerInfo *root, CustomPath *cpath,
+								 List *targets, List *whereclauses,
+								 List *wherekinds, List *ors,
+								 const struct LionCellsPlan *cp,
+								 double whererows, double outrows,
+								 Cost *perrange);
 extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  List *whereidx, List *wherecol,
 							  List *whereclauses, List *wherekinds, List *ors,
@@ -3517,6 +3713,24 @@ extern void lion_wagg_run(LionCountScanState *st);
 extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
 extern void lion_decode_reset(LionCountScanState *st);
+extern bool lion_decode_fill(LionCountScanState *st, int c, bool restart);
+extern void lion_decode_caps(LionCountScanState *st);
+extern bool lion_decode_where(LionCountScanState *st);
+extern bool lion_where_collect_range(LionCountScanState *st, uint32 lo,
+									 uint64 hi);
+
+/* lion_exec_cells.c */
+extern void lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
+							 EState *estate);
+extern void lion_cells_open(LionCountScanState *st);
+extern void lion_cells_close(LionCountScanState *st);
+extern void lion_cells_reset(LionCountScanState *st);
+extern TupleTableSlot *lion_next_cells(LionCountScanState *st,
+									   bool *exhausted);
+extern const char *lion_explain_col(Oid idxoid, AttrNumber heapattno,
+									bool multikey, List *vcols);
+extern void lion_explain_cells(LionCountScanState *st, List *ancestors,
+							   ExplainState *es);
 
 /* lion_exec_run.c */
 extern void lion_pause_run(LionCountScanState *st);
