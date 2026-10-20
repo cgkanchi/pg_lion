@@ -21,9 +21,9 @@ SELECT lion_hooktest_priv_decode('path') AS nclause;
 
 -- the shape marker, and the plan's number of members
 SELECT lion_hooktest_priv_decode('magic');
-ERROR:  LionCount: unrecognized custom_private shape (24 members)
+ERROR:  LionCount: unrecognized custom_private shape (25 members)
 SELECT lion_hooktest_priv_decode('path at plan');
-ERROR:  LionCount: unrecognized custom_private shape (23 members)
+ERROR:  LionCount: unrecognized custom_private shape (24 members)
 -- a member's node type, and its length against the number of clauses
 SELECT lion_hooktest_priv_decode('oids as ints');
 ERROR:  LionCount: malformed OIDS member of custom_private
@@ -54,3 +54,11 @@ ERROR:  LionCount: a distinct count without its column
 -- a dimension folded into a fact filter whose IN list is the join key's
 SELECT lion_hooktest_priv_decode('join filter on its key');
 ERROR:  LionCount: malformed join
+-- the anti join over a small inner side without the child it reads, with no
+-- key to look up, and a column of its inner side in a plan without one
+SELECT lion_hooktest_priv_decode('anti join without its child');
+ERROR:  LionCount: malformed anti join
+SELECT lion_hooktest_priv_decode('anti join of no key');
+ERROR:  LionCount: malformed ANTI member of custom_private
+SELECT lion_hooktest_priv_decode('inner column without an anti join');
+ERROR:  LionCount: an inner column without an anti join

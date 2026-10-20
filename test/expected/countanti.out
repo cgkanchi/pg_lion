@@ -1,0 +1,890 @@
+-- The anti join over a small inner side (DESIGN.md §27, "The anti join over
+-- a small inner side"):
+--
+--   SELECT count(*) FROM rows r WHERE <r's clauses>
+--     AND NOT EXISTS (SELECT 1 FROM skip s WHERE s.a = r.k ... <s's filters>)
+--
+-- is the count of r's WHERE less the rows of it some row of s matches.  The
+-- node runs s as its child, looks each distinct key of its rows up in a
+-- B-tree on r.k under the query's snapshot, tests every row found on the
+-- join clauses and r's own clauses, and subtracts the ones that pass - from
+-- the one row of a count, or from each group of a GROUP BY.  Every answer is
+-- checked against the same query with the pushdown off, as a multiset in
+-- both directions.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET default_statistics_target = 1000;
+/*
+ * lca() runs a query through the pushdown - every join method disabled, so
+ * that core has no plan the node must beat on price - and again with the
+ * pushdown off and sequential scans only, so that the reference reads no
+ * lion posting set and no B-tree, and compares the two.  It says whether the
+ * node was used.
+ */
+CREATE FUNCTION lca(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'pushed down, parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
+			how := 'pushed down';
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lca_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lca_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lca_off' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (TABLE lca_on EXCEPT ALL TABLE lca_off) a)'
+			' + (SELECT count(*) FROM (TABLE lca_off EXCEPT ALL TABLE lca_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lca_on, lca_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+/* The answer itself, through the pushdown, joins disabled. */
+CREATE FUNCTION lca_val(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	RETURN QUERY EXECUTE format('SELECT s::text FROM (%s) s', q);
+END $$;
+/* Which plan the cost model picks, with nothing disabled. */
+CREATE FUNCTION lca_pick(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			RETURN 'pushed down';
+		END IF;
+	END LOOP;
+	RETURN 'not pushed down';
+END $$;
+/*
+ * A generic prepared plan, which keeps $n a Param, against the same with the
+ * pushdown off.
+ */
+CREATE FUNCTION lca_prep(q text, args text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	EXECUTE 'PREPARE lca_p_on AS ' || q;
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lca_p_on(' || args || ')' LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE lca_on AS EXECUTE lca_p_on(%s)', args);
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'PREPARE lca_p_off AS ' || q;
+	EXECUTE format('CREATE TEMP TABLE lca_off AS EXECUTE lca_p_off(%s)', args);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	EXECUTE 'DEALLOCATE lca_p_on';
+	EXECUTE 'DEALLOCATE lca_p_off';
+
+	EXECUTE 'SELECT count(*) FROM lca_off' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (TABLE lca_on EXCEPT ALL TABLE lca_off) a)'
+			' + (SELECT count(*) FROM (TABLE lca_off EXCEPT ALL TABLE lca_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lca_on, lca_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows);
+END $$;
+/* The anti join's counters in EXPLAIN ANALYZE, joins disabled. */
+CREATE FUNCTION lca_counters(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	out text := '';
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(split_part(ln, ':', 1)) IN ('Join Child Rows', 'Join Keys Looked Up',
+											 'Join Rows Fetched', 'Join Rows Subtracted') THEN
+			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END ||
+				regexp_replace(btrim(ln), '^Join ', '');
+		END IF;
+	END LOOP;
+	RETURN out;
+END $$;
+/*
+ * EXPLAIN, joins disabled, in a form every supported release prints the same
+ * way: no "Disabled: true" lines, and no ".00" on a row count.
+ */
+CREATE FUNCTION lca_explain(q text, opts text DEFAULT 'COSTS OFF') RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (' || opts || ') ' || q LOOP
+		CONTINUE WHEN l ~ '^\s*Disabled: true$';
+		RETURN NEXT regexp_replace(l, 'rows=(\d+)\.00 ', 'rows=\1 ', 'g');
+	END LOOP;
+END $$;
+/*
+ * The table counted: 20000 rows.  k has 400 values, some 50 rows each, and
+ * NULL on every 37th row; kn is k without the NULLs, declared NOT NULL, and
+ * kd the same as a numeric of two decimals; g has
+ * 6 values and NULLs, y 7 and NULLs; z is 99 on exactly the rows of k = 5,
+ * and 0..2 elsewhere; x has 10 values, for a WHERE of a tenth or a half.  pad
+ * makes the rows a few to a page.  k, kn and kd have B-trees; x, g, z and (g, y)
+ * lion indexes, and k one too, for count(k).
+ */
+CREATE TABLE lca_rows (
+	id		int		PRIMARY KEY,
+	k		int,
+	kn		int		NOT NULL,
+	kd		numeric,
+	g		int,
+	y		int,
+	z		int		NOT NULL,
+	x		int		NOT NULL,
+	pad		text	NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO lca_rows
+SELECT i,
+	   CASE WHEN i % 37 = 0 THEN NULL ELSE i % 400 END,
+	   i % 400,
+	   (i % 400)::numeric(6, 2),
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE i % 6 END,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE i % 7 END,
+	   CASE WHEN i % 400 = 5 AND i % 37 <> 0 THEN 99 ELSE i % 3 END,
+	   (i / 400) % 10,
+	   repeat('p', 60)
+FROM generate_series(1, 20000) i;
+CREATE INDEX lca_rows_k ON lca_rows (k);
+CREATE INDEX lca_rows_kn ON lca_rows (kn);
+CREATE INDEX lca_rows_kd ON lca_rows (kd);
+CREATE INDEX lca_rows_x ON lca_rows USING lion (x);
+CREATE INDEX lca_rows_g ON lca_rows USING lion (g);
+CREATE INDEX lca_rows_z ON lca_rows USING lion (z);
+CREATE INDEX lca_rows_gy ON lca_rows USING lion (g, y);
+CREATE INDEX lca_rows_kl ON lca_rows USING lion (k);
+/*
+ * The inner side: a few keys - two rows of key 2, a pair whose a and b
+ * differ, NULL in a and in b, the key of the rows of z = 99, keys of no row
+ * of lca_rows, and two rows of another f.  c is a as int8.
+ */
+CREATE TABLE lca_skip (a int, b int, c int8, f int NOT NULL);
+INSERT INTO lca_skip VALUES
+	(1, 1, 1, 0), (2, 2, 2, 0), (2, 2, 2, 0), (3, 4, 3, 0),
+	(NULL, 6, NULL, 0), (6, NULL, 6, 0), (5, 5, 5, 0),
+	(450, 450, 450, 0), (-1, -1, -1, 0),
+	(7, 7, 7, 1), (8, 8, 8, 1);
+-- numeric keys, equal ones among them in other spellings
+CREATE TABLE lca_num (d numeric);
+INSERT INTO lca_num VALUES (1.0), (1.00), (1), (2.000), (2.5), (NULL);
+-- a second inner table, joined to the first inside the NOT EXISTS
+CREATE TABLE lca_tag (a int, tag text);
+INSERT INTO lca_tag VALUES (1, 'on'), (2, 'off'), (5, 'on'), (7, 'on'), (450, 'on');
+VACUUM (FREEZE, ANALYZE) lca_rows, lca_skip, lca_num, lca_tag;
+-- ---------- 1. the plans ----------
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+                      lca_explain                       
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lca_rows_x (x = 3)
+   Join Type: Anti
+   Join Rows: the rows counted, less those with a match
+   Join Lookup Index: lca_rows_k
+   Join Cond: (s.a = k)
+   ->  Seq Scan on lca_skip s
+         Filter: (f = 0)
+(8 rows)
+
+-- a GROUP BY, the two-clause form over one column, and an inner side that is a join
+SELECT * FROM lca_explain('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g');
+                      lca_explain                       
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lca_rows_gy.g (g), lca_rows_x (x < 5)
+   Join Type: Anti
+   Join Rows: the rows counted, less those with a match
+   Join Lookup Index: lca_rows_k
+   Join Cond: ((s.a = k) AND (s.b = k))
+   Group Key: g
+   ->  Seq Scan on lca_skip s
+(8 rows)
+
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')');
+                      lca_explain                       
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lca_rows_x (x = 3)
+   Join Type: Anti
+   Join Rows: the rows counted, less those with a match
+   Join Lookup Index: lca_rows_k
+   Join Cond: (s.a = k)
+   ->  Nested Loop
+         Join Filter: (s.a = t.a)
+         ->  Seq Scan on lca_skip s
+         ->  Materialize
+               ->  Seq Scan on lca_tag t
+                     Filter: (tag = 'on'::text)
+(12 rows)
+
+-- the counters: the child's rows, the distinct keys, the rows found, and those subtracted
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)',
+						  'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+	WHERE ln ~ '(Custom Scan|Join|Seq Scan|Filter)';
+                           ln                           
+--------------------------------------------------------
+ Custom Scan (LionCount) (actual rows=1 loops=1)
+   Join Type: Anti
+   Join Rows: the rows counted, less those with a match
+   Join Lookup Index: lca_rows_k
+   Join Cond: (s.a = k)
+   Join Child Rows: 9
+   Join Keys Looked Up: 7
+   Join Rows Fetched: 243
+   Join Rows Subtracted: 24
+   ->  Seq Scan on lca_skip s (actual rows=9 loops=1)
+         Filter: (f = 0)
+         Rows Removed by Filter: 2
+(12 rows)
+
+-- a GUC turns it off
+SET pg_lion.enable_count_anti = off;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+RESET pg_lion.enable_count_anti;
+-- ---------- 2. the answers ----------
+-- a WHERE of a half and of a tenth
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT * FROM lca_val('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+ lca_val 
+---------
+ (1976)
+(1 row)
+
+-- every row of the inner side, NULL keys and duplicates among them
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+                                lca_counters                                
+----------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 9, Rows Fetched: 340, Rows Subtracted: 170
+(1 row)
+
+-- an empty inner side subtracts nothing
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 42)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 42)');
+                             lca_counters                              
+-----------------------------------------------------------------------
+ Child Rows: 0, Keys Looked Up: 0, Rows Fetched: 0, Rows Subtracted: 0
+(1 row)
+
+-- inner keys of no row, or of rows the WHERE leaves out, subtract nothing
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.a IN (450, -1))');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.g = 1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+                              lca_counters                               
+-------------------------------------------------------------------------
+ Child Rows: 9, Keys Looked Up: 7, Rows Fetched: 243, Rows Subtracted: 4
+(1 row)
+
+-- a WHERE with no row left after the subtraction
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- the two-clause form over one column: only the inner rows whose a and b agree
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+                                lca_counters                                
+----------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 8, Rows Fetched: 243, Rows Subtracted: 122
+(1 row)
+
+-- a clause of both sides beside the key, a key of an inner expression, a cross-type key
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b <> r.g)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE r.k = s.a + 1)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.c = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- equal keys of other bytes find the same rows, subtracted once
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_num n WHERE n.d = r.kd)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_num n WHERE n.d = r.kd)');
+                               lca_counters                               
+--------------------------------------------------------------------------
+ Child Rows: 6, Keys Looked Up: 5, Rows Fetched: 200, Rows Subtracted: 50
+(1 row)
+
+-- a clause of the counted table alone inside the NOT EXISTS belongs to the join
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND r.g = 2)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND r.g = 2) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+-- an inner side that is a join
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- a WHERE the residual clauses complete (DESIGN.md §10)
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- count(1), count of a key declared NOT NULL, count(k) of a nullable one, count(DISTINCT) of a unique column
+SELECT lca('SELECT count(1) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(r.kn) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.kn)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(r.k) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.b = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(DISTINCT r.id) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*), count(r.id) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- ---------- 3. GROUP BY ----------
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lca('SELECT r.g, r.y, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g, r.y');
+         lca          
+----------------------
+ pushed down, 56 rows
+(1 row)
+
+-- the group of z = 99 is the rows of key 5: it drops to nothing and is no row
+SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+SELECT * FROM lca_val('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z ORDER BY r.z');
+ lca_val  
+----------
+ (0,3274)
+ (1,3278)
+ (2,3278)
+(3 rows)
+
+SELECT * FROM lca_val('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.a <> 5) GROUP BY r.z ORDER BY r.z');
+ lca_val  
+----------
+ (0,3274)
+ (1,3278)
+ (2,3278)
+ (99,24)
+(4 rows)
+
+-- ... and so is a GROUP BY the planner folds to that one group
+SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+         lca         
+---------------------
+ pushed down, 0 rows
+(1 row)
+
+-- the HAVING sees the counts less the rows subtracted
+SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0) GROUP BY r.z HAVING count(*) > 2650');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- ---------- 4. the B-tree ----------
+-- none on the column: core's plan
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.y)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a multicolumn B-tree with the key's column first, by one scan key and by two
+DROP INDEX lca_rows_k;
+CREATE INDEX lca_rows_ky ON lca_rows (k, y);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)') AS ln
+	WHERE ln ~ 'Lookup Index';
+                ln                
+----------------------------------
+   Join Lookup Index: lca_rows_ky
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+                               lca_counters                               
+--------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 8, Rows Fetched: 29, Rows Subtracted: 14
+(1 row)
+
+-- ... but not one whose first column no key is of
+DROP INDEX lca_rows_ky;
+CREATE INDEX lca_rows_yk ON lca_rows (y, k);
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+DROP INDEX lca_rows_yk;
+CREATE INDEX lca_rows_k ON lca_rows (k);
+ANALYZE lca_rows;
+-- ---------- 5. a dirty heap: deletes and updates, before and after VACUUM ----------
+DELETE FROM lca_rows WHERE k = 1 AND x < 3;
+UPDATE lca_rows SET k = 2 WHERE k = 3 AND x = 3;
+UPDATE lca_rows SET x = 3 WHERE k = 5 AND x = 4;
+UPDATE lca_rows SET k = NULL WHERE k = 6 AND x = 1;
+UPDATE lca_rows SET pad = repeat('q', 60) WHERE k = 2 AND x = 2;
+INSERT INTO lca_rows (id, k, kn, kd, g, y, z, x, pad)
+SELECT 20000 + i, 1, 1, 1, 1, 1, 1, 3, 'n' FROM generate_series(1, 7) i;
+UPDATE lca_skip SET a = 3 WHERE a = 6;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lca('SELECT r.z, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.z');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- rows deleted and updated in this very transaction
+BEGIN;
+DELETE FROM lca_rows WHERE k = 2 AND x = 0;
+UPDATE lca_rows SET k = 1 WHERE k = 7 AND x = 3;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+ROLLBACK;
+VACUUM (FREEZE, ANALYZE) lca_rows, lca_skip;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+-- ---------- 6. parameters: a generic plan, and a correlated rescan ----------
+SELECT lca_prep('SELECT count(*) FROM lca_rows r WHERE r.x = $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = $2)', '3, 0');
+      lca_prep       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_prep('SELECT count(*) FROM lca_rows r WHERE r.x = $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = $2)', '3, 42');
+      lca_prep       
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_prep('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a + $2 = r.k) GROUP BY r.g', '5, 1');
+      lca_prep       
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lca('SELECT o.v, o.w, (SELECT count(*) FROM lca_rows r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = o.w)) FROM (VALUES (1, 0), (3, 0), (3, 1), (4, 42), (3, 0)) o(v, w)');
+         lca         
+---------------------
+ pushed down, 5 rows
+(1 row)
+
+SELECT * FROM lca_val('SELECT o.v, o.w, (SELECT count(*) FROM lca_rows r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = o.w)) FROM (VALUES (1, 0), (3, 0), (3, 1), (4, 42), (3, 0)) o(v, w)');
+   lca_val   
+-------------
+ (1,0,1981)
+ (3,0,1981)
+ (3,1,2002)
+ (4,42,1995)
+ (3,0,1981)
+(5 rows)
+
+-- ---------- 7. parallel: the count divided, the subtraction made once ----------
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+                            lca_explain                             
+--------------------------------------------------------------------
+ Finalize Aggregate
+   ->  Gather
+         Workers Planned: 1
+         ->  Parallel Custom Scan (LionCount)
+               Lion Indexes: lca_rows_x (x = 3)
+               Join Type: Anti
+               Join Rows: the rows counted, less those with a match
+               Join Lookup Index: lca_rows_k
+               Join Cond: (s.a = k)
+               ->  Seq Scan on lca_skip s
+(10 rows)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+              lca              
+-------------------------------
+ pushed down, parallel, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+              lca              
+-------------------------------
+ pushed down, parallel, 1 rows
+(1 row)
+
+-- one participant ran the child and made the lookups: the serial node's counters
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+                               lca_counters                                
+---------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 8, Rows Fetched: 283, Rows Subtracted: 41
+(1 row)
+
+SET max_parallel_workers_per_gather = 0;
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+                               lca_counters                                
+---------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 8, Rows Fetched: 283, Rows Subtracted: 41
+(1 row)
+
+SET max_parallel_workers_per_gather = 2;
+-- ... rescanned under a correlated subquery
+SELECT lca('SELECT o.v, (SELECT count(*) FROM lca_rows r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)) FROM (VALUES (3), (1), (3)) o(v)');
+         lca         
+---------------------
+ pushed down, 3 rows
+(1 row)
+
+-- ... and without the leader taking part: a worker subtracts, or the leader
+-- when none starts
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lca_par AS SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+SELECT ln FROM lca_explain('EXECUTE lca_par') AS ln WHERE ln ~ 'Parallel';
+                      ln                      
+----------------------------------------------
+         ->  Parallel Custom Scan (LionCount)
+(1 row)
+
+SET parallel_leader_participation = off;
+CREATE TEMP TABLE lca_par_on AS EXECUTE lca_par;
+RESET parallel_leader_participation;
+DEALLOCATE lca_par;
+RESET plan_cache_mode;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SELECT (TABLE lca_par_on) = count(*) AS same_count
+  FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+ same_count 
+------------
+ t
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lca_par_on;
+-- the GROUP BY stays serial
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+-- ---------- 8. what is left to core ----------
+-- the cost model takes the node for a few keys of a row or so each ...
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id)');
+  lca_pick   
+-------------
+ pushed down
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+-- ... and not for an inner side of thousands of keys, one a row
+CREATE TABLE lca_many (a int NOT NULL);
+INSERT INTO lca_many SELECT i * 2 FROM generate_series(1, 10000) i;
+VACUUM (ANALYZE) lca_many;
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many m WHERE m.a = r.id)');
+    lca_pick     
+-----------------
+ not pushed down
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many m WHERE m.a = r.id)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+DROP TABLE lca_many;
+-- a LEFT JOIN ... IS NULL, and a NOT IN over a nullable column
+SELECT lca('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.k NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a WHERE clause nothing answers: no lion index, and residual clauses off
+SET pg_lion.enable_count_residual = off;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+RESET pg_lion.enable_count_residual;
+-- a NOT EXISTS beside a second table in the FROM
+SELECT lca('SELECT count(*) FROM lca_rows r, lca_tag t WHERE r.id = t.a AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- a correlation by no equality
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a < r.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- row-level security on the table counted
+CREATE ROLE lca_reader;
+GRANT SELECT ON lca_rows, lca_skip TO lca_reader;
+ALTER TABLE lca_rows ENABLE ROW LEVEL SECURITY;
+CREATE POLICY lca_rows_some ON lca_rows FOR SELECT TO lca_reader USING (g = 1);
+SET ROLE lca_reader;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+RESET ROLE;
+ALTER TABLE lca_rows DISABLE ROW LEVEL SECURITY;
+DROP POLICY lca_rows_some ON lca_rows;
+REVOKE ALL ON lca_rows, lca_skip FROM lca_reader;
+DROP ROLE lca_reader;
+-- a partitioned table counted
+CREATE TABLE lca_parts (id int NOT NULL, k int, x int NOT NULL) PARTITION BY RANGE (id);
+CREATE TABLE lca_parts_1 PARTITION OF lca_parts FOR VALUES FROM (0) TO (5000);
+CREATE TABLE lca_parts_2 PARTITION OF lca_parts FOR VALUES FROM (5000) TO (10000);
+INSERT INTO lca_parts SELECT i, i % 100, i % 10 FROM generate_series(0, 9999) i;
+CREATE INDEX lca_parts_k ON lca_parts (k);
+CREATE INDEX lca_parts_x ON lca_parts USING lion (x);
+VACUUM (ANALYZE) lca_parts;
+SELECT lca('SELECT count(*) FROM lca_parts p WHERE p.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = p.k)');
+           lca           
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+DROP TABLE lca_parts;
+DROP TABLE lca_rows, lca_skip, lca_num, lca_tag;
+DROP FUNCTION lca(text);
+DROP FUNCTION lca_val(text);
+DROP FUNCTION lca_pick(text);
+DROP FUNCTION lca_prep(text, text);
+DROP FUNCTION lca_counters(text);
+DROP FUNCTION lca_explain(text, text);

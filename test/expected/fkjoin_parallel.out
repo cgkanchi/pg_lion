@@ -18,6 +18,11 @@ SET synchronous_commit = on;
 -- own Agg, and no enable_*join setting disables it: it is off here, and tested
 -- - the upper node over it included - in fkjoin_semipath.sql.
 SET pg_lion.enable_semijoin = off;
+-- A reverse anti join is also the anti join over a small inner side, the
+-- fact's rows its inner side and the dimension's primary key its B-tree
+-- (DESIGN.md §27, "The anti join over a small inner side"): off here, so that
+-- the plans pinned are the FK-side join's, and tested in countanti.sql.
+SET pg_lion.enable_count_anti = off;
 SET default_statistics_target = 1000;
 -- parallel plans at any size, and the workers doing the counting whenever
 -- they start (without them the leader counts alone: the same answers)

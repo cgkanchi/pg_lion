@@ -120,6 +120,32 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * The child of a parallel count's anti join over a small inner side
+ * (DESIGN.md §27): the inner side's cheapest path a worker may run, which
+ * the serial node's - a Gather, say - need not be.  Unparameterized, and not
+ * a partial one: the participant that subtracts runs it whole.  NULL when
+ * the inner side has none.
+ */
+static Path *
+lion_anti_parallel_child(RelOptInfo *innerrel)
+{
+	Path	   *best = NULL;
+	ListCell   *lc;
+
+	foreach(lc, innerrel->pathlist)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+
+		if (!path->parallel_safe || path->parallel_aware ||
+			path->param_info != NULL)
+			continue;
+		if (best == NULL || compare_path_costs(path, best, TOTAL_COST) < 0)
+			best = path;
+	}
+	return best;
+}
+
+/*
  * A PARALLEL COUNT (DESIGN.md §10, "A count in parallel"): the node of one
  * row - the count of a WHERE, or a sum over a column's entries, with any
  * filtered counts beside it - made parallel-aware, its partial counts under a
@@ -142,12 +168,16 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
  * again (rc->countrange, every run's: each set sought to the range, a walk's
  * entries counted again), plus a cpu_tuple_cost for its one row.  The Gather
  * prices its rows and set-up, core's Finalize Agg its own work.
+ *
+ * The anti join over a small inner side (DESIGN.md §27) is subtracted by one
+ * participant: its child and `once` - its lookups and the child's price - are
+ * the partial node's, undivided.
  */
 static void
 lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 							 RelOptInfo *output_rel, CustomPath *serial,
 							 Cost serialrun, const LionRangeCost *rc,
-							 List *having)
+							 List *having, Path *child, Cost once)
 {
 	PathTarget *partialtarget;
 	CustomPath *cpath;
@@ -197,13 +227,14 @@ lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->path.pathkeys = NIL;
 	cpath->path.rows = 1;
 	cpath->path.total_cost = share / divisor + rc->whole +
-		((double) nranges / divisor) * rc->countrange + cpu_tuple_cost;
+		((double) nranges / divisor) * rc->countrange + cpu_tuple_cost +
+		once;
 	cpath->path.startup_cost = cpath->path.total_cost;
 #if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = 0;
+	cpath->path.disabled_nodes = (child != NULL) ? child->disabled_nodes : 0;
 #endif
 	cpath->flags = serial->flags;
-	cpath->custom_paths = NIL;
+	cpath->custom_paths = (child != NULL) ? list_make1(child) : NIL;
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -270,6 +301,11 @@ typedef struct LionCountPathBuild
 	RelOptInfo *output_rel;
 	GroupPathExtraData *extra;
 	const LionFkJoin *fj;
+	const LionSmallAnti *anti;	/* the anti join over a small inner side
+								 * (§27), or NULL */
+	List	   *antiextra;		/* ... the clauses the count adds to the
+								 * WHERE, which its lookups test too */
+	LionAntiPlan antiplan;		/* ... its B-tree and the lookups' price */
 	Query	   *parse;
 	RangeTblEntry *rte;
 	Index		rti;
@@ -518,6 +554,10 @@ lion_count_path_query(LionCountPathBuild *cx)
 	if (fj != NULL)
 		cx->input_rel = fj->factrel;
 
+	/* ... and the anti join over a small inner side its outer table's */
+	if (cx->anti != NULL)
+		cx->input_rel = cx->anti->outerrel;
+
 	return true;
 }
 
@@ -547,6 +587,10 @@ lion_count_path_rel(LionCountPathBuild *cx)
 		return false;
 	if (IS_DUMMY_REL(input_rel))
 		return false;			/* the planner has already proved it empty */
+
+	/* the anti join's lookups are of one table's B-tree (§27) */
+	if (cx->rte->inh && cx->anti != NULL)
+		return false;
 
 	if (cx->rte->inh)
 	{
@@ -1962,6 +2006,9 @@ lion_count_path_countcol(LionCountPathBuild *cx)
 	cx->rinfono++;
 	cx->rinfoclauses = lappend(cx->rinfoclauses,
 							   lion_vcol_unvar((Node *) nt));
+
+	/* a row the anti join's lookups find is counted only with it (§27) */
+	cx->antiextra = lappend(cx->antiextra, lion_vcol_unvar((Node *) nt));
 	return lion_count_path_where_leaf(cx, NULL, (Node *) nt);
 }
 
@@ -3189,7 +3236,8 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	ListCell   *lc;
 
 	cx->topkn = 0;
-	if (!lion_enable_topk || cx->fj != NULL || cx->ngroup != 1 ||
+	if (!lion_enable_topk || cx->fj != NULL || cx->anti != NULL ||
+		cx->ngroup != 1 ||
 		cx->nfilter > 0 ||
 		cx->decode || cx->partitioned || cx->sumall || cx->singlegroup ||
 		cx->distvar != NULL || cx->groupcoal != NULL || cx->having != NIL ||
@@ -3469,6 +3517,94 @@ lion_count_path_fill(LionCountPathBuild *cx)
 }
 
 /*
+ * THE ANTI JOIN OVER A SMALL INNER SIDE (DESIGN.md §27): the count planned so
+ * far is the outer table's, of its WHERE; the query's is that count less the
+ * rows some row of the inner side matches, which the node finds by looking
+ * the inner side's keys up in a B-tree of the table (lion_anti_choose()) and
+ * subtracts from the one row, or from each row's group.  Fills the plan's
+ * ANTI member and antiplan, or declines.
+ *
+ * What it is made for is a count of one plain table, ungrouped or grouped by
+ * one or two of its columns, each of whose rows it can find the group of:
+ * not partitions, the decoded walk, a count(DISTINCT) walked, the aggregates
+ * over keys, a top k, filtered counts, a coalesce group or expression columns
+ * (whose expressions setrefs.c could take for the join clauses' own), and
+ * grouping columns it can hash under their equalities.
+ *
+ * Every row a key finds is tested on every join clause and on each of the
+ * table's restrictions - and the clauses the count adds to its WHERE (the
+ * `col IS NOT NULL` of a count(col)): a row the count does not count is not
+ * one to subtract.
+ */
+static bool
+lion_count_path_anti(LionCountPathBuild *cx)
+{
+	const LionSmallAnti *anti = cx->anti;
+	LionCountPriv *p = &cx->priv;
+	LionCountPrivAnti *a = &p->anti;
+	List	   *restrictions = NIL;
+	List	   *keyexprs = NIL;
+	ListCell   *lc;
+	int			g;
+	int			k;
+
+	if (anti == NULL)
+		return true;
+	if (cx->partitioned || cx->decode || cx->distvar != NULL ||
+		cx->wattnos != NIL || cx->topkn > 0 || cx->nfilter > 0 ||
+		cx->groupcoal != NULL || cx->partialtarget != NULL ||
+		cx->ngroup > 2 || p->vcols != NIL || p->ngroupn > 0)
+		return false;
+	for (g = 0; g < cx->ngroup; g++)
+	{
+		Oid			lhash;
+		Oid			rhash;
+
+		if (!get_op_hash_functions(cx->groupeqop[g], &lhash, &rhash) ||
+			!OidIsValid(lhash))
+			return false;
+	}
+
+	foreach(lc, cx->input_rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		restrictions = lappend(restrictions, rinfo->clause);
+	}
+	restrictions = list_concat(restrictions, cx->antiextra);
+	if (contain_subplans((Node *) restrictions) ||
+		contain_volatile_functions((Node *) restrictions))
+		return false;
+
+	if (!lion_anti_choose(cx->root, anti, restrictions, cx->ngroup,
+						  &cx->antiplan))
+		return false;
+
+	p->hasanti = true;
+	memset(a, 0, sizeof(LionCountPrivAnti));
+	a->flags = cx->antiplan.tids ? LION_ANTIFLAG_TIDS : 0;
+	a->idxoid = cx->antiplan.idx->indexoid;
+	a->nkey = cx->antiplan.nkey;
+	for (k = 0; k < a->nkey; k++)
+	{
+		a->keycol[k] = cx->antiplan.keycol[k];
+		a->keyop[k] = cx->antiplan.keyop[k];
+		a->keycoll[k] = cx->antiplan.keycoll[k];
+		keyexprs = lappend(keyexprs, cx->antiplan.keyexpr[k]);
+	}
+	a->njoin = list_length(anti->clauses);
+	a->nrestrict = list_length(restrictions);
+	for (g = 0; g < cx->ngroup; g++)
+	{
+		a->groupeq[g] = cx->groupeqop[g];
+		a->groupcoll[g] = cx->groupcoll[g];
+	}
+	a->exprs = list_concat(list_concat(keyexprs, list_copy(anti->clauses)),
+						   restrictions);
+	return true;
+}
+
+/*
  * The LionCount CustomPath itself: its target, the order its groups come in
  * and the plan it carries in custom_private.  Not priced yet.
  */
@@ -3559,7 +3695,10 @@ lion_count_path_make(LionCountPathBuild *cx)
 		}
 	}
 	cpath->flags = 0;
-	cpath->custom_paths = NIL;
+
+	/* the anti join's inner side is the node's child (§27) */
+	cpath->custom_paths = (cx->anti != NULL) ?
+		list_make1(cx->anti->innerpath) : NIL;
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -3819,7 +3958,8 @@ lion_count_ownscan_cost(LionCountPathBuild *cx)
 	ListCell   *lc;
 	int			i;
 
-	if (!OidIsValid(lionam) || cx->fj != NULL || cx->partitioned ||
+	if (!OidIsValid(lionam) || cx->fj != NULL || cx->anti != NULL ||
+		cx->partitioned ||
 		cx->ngroup != 0 || cx->singlegroup || cx->sumall || cx->decode ||
 		cx->distvar != NULL || cx->rangevar != NULL || cx->hasrangesrc ||
 		cx->nfilter != 0 || cx->residual != NIL || cx->topkn != 0 ||
@@ -3926,6 +4066,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionWalkSave walksave = {0};	/* ... and what walking them would
 									 * save */
 	Cost		serialrun;		/* the serial node's price, without HAVING */
+	Cost		antilookups = 0.0;	/* the anti join's lookups (§27) */
+	Path	   *antichild = NULL;	/* ... a parallel count's child */
 	LionUnits	units;			/* the competitor's (§39) */
 
 	lion_units_for(root, output_rel, &units);
@@ -4030,6 +4172,24 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	serialrun = cpath->path.total_cost;
 
 	/*
+	 * The anti join over a small inner side (DESIGN.md §27): its lookups, the
+	 * node's own work, converted as the count is; and its child, core's plan
+	 * in core's units, as an FK-side join's dimension is.  Both before the
+	 * first row, which comes once every key is looked up.
+	 */
+	if (cx->anti != NULL)
+	{
+		Path	   *child = cx->anti->innerpath;
+
+		antilookups = lion_units_price(&units, cx->antiplan.cost);
+		cpath->path.startup_cost += antilookups + child->total_cost;
+		cpath->path.total_cost += antilookups + child->total_cost;
+#if PG_VERSION_NUM >= 180000
+		cpath->path.disabled_nodes = child->disabled_nodes;
+#endif
+	}
+
+	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
 	 * lets a fraction of the groups through: the same accounting cost_agg()
 	 * does for an Agg's quals, so that the two plans stay comparable.  A
@@ -4110,7 +4270,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * adds together.  Before the serial path is added, which may free it.
 	 */
 	if (cx->ngroup == 1 && !cx->sumall && !cx->singlegroup &&
-		cx->nfilter == 0 &&
+		cx->nfilter == 0 && cx->anti == NULL &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
 		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
@@ -4133,17 +4293,27 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * the sum beside it - each range counted as the serial node counts the
 	 * whole.  Not a count(DISTINCT), the aggregates over keys, the FK-side
 	 * join or a partitioned table, which count in other ways, nor a group
-	 * folded to a constant, whose missing row partial counts cannot say.
+	 * folded to a constant, whose missing row partial counts cannot say.  The
+	 * anti join over a small inner side is one, its child and its lookups
+	 * the work of one participant (§27), when both may run in a worker.
 	 */
+	if (cx->anti != NULL &&
+		is_parallel_safe(root, (Node *) cx->priv.anti.exprs))
+		antichild = lion_anti_parallel_child(cx->anti->innerrel);
 	if (cx->ngroup == 0 && !cx->singlegroup && !cx->partitioned &&
 		cx->fj == NULL && cx->distvar == NULL && cx->wattnos == NIL &&
 		cx->topkn == 0 && !cx->decode && cx->groupcoal == NULL &&
 		input_rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
+		(cx->anti == NULL || antichild != NULL) &&
 		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
 		!RecoveryInProgress())
 		lion_add_parallel_count_path(root, input_rel, output_rel, cpath,
-									 serialrun, &rangeprice, cx->having);
+									 serialrun, &rangeprice, cx->having,
+									 antichild,
+									 (antichild != NULL) ?
+									 antilookups + antichild->total_cost :
+									 0.0);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -4161,6 +4331,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 {
 	return lion_enable_decoded_walk &&
 		cx->ngroup == 2 && !cx->decode && cx->fj == NULL &&
+		cx->anti == NULL &&
 		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
 		cx->ncompl == 0 && cx->residual == NIL &&
@@ -4242,13 +4413,15 @@ lion_try_count_path_partial(LionCountPathBuild *cx,
 static void
 lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						RelOptInfo *output_rel, GroupPathExtraData *extra,
-						const LionFkJoin *fj, bool distinctstage)
+						const LionFkJoin *fj, const LionSmallAnti *anti,
+						bool distinctstage)
 {
 	LionCountPathBuild cx;
 	LionPartialCands *cands;
 	int			rank;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
+	cx.anti = anti;
 	cx.distinctstage = distinctstage;
 
 	if (!lion_count_path_query(&cx))
@@ -4278,7 +4451,24 @@ lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 				   RelOptInfo *output_rel, GroupPathExtraData *extra,
 				   const LionFkJoin *fj)
 {
-	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, false);
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, fj, NULL,
+							false);
+}
+
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"): input_rel is the query's join rel, and `anti` what
+ * lion_fkjoin_recognize_small_anti() found of it.  The count is planned as
+ * the outer table's own, every phase unchanged, and lion_count_path_anti()
+ * adds the subtraction.
+ */
+void
+lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
+						 RelOptInfo *output_rel, GroupPathExtraData *extra,
+						 const LionSmallAnti *anti)
+{
+	lion_try_count_path_ext(root, input_rel, output_rel, extra, NULL, anti,
+							false);
 }
 
 /*
@@ -4323,7 +4513,7 @@ lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 	PG_TRY();
 	{
 		lion_try_count_path_ext(root, input_rel, output_rel, &extra, NULL,
-								true);
+								NULL, true);
 	}
 	PG_FINALLY();
 	{
@@ -4371,6 +4561,8 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	lion_count_path_estimate(&cx);
 	lion_count_path_topk(&cx);
 	lion_count_path_fill(&cx);
+	if (!lion_count_path_anti(&cx))
+		return;
 	cpath = lion_count_path_make(&cx);
 	lion_count_path_add(&cx, cpath);
 
