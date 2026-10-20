@@ -114,6 +114,7 @@
 bool		lion_enable_ordered_scan = true;
 bool		lion_enable_btree_scan = true;
 bool		lion_enable_lazy_set = true;
+static bool lion_enable_shared_set = true;
 static double lion_ordered_switch_ratio = 32.0;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 
@@ -932,7 +933,12 @@ typedef struct LionOrderedState
 	uint64		published;		/* sets this participant shared */
 	uint64		attaches;		/* views this participant took of one */
 
-	/* EXPLAIN ANALYZE */
+	/*
+	 * EXPLAIN ANALYZE.  `ran`: this process ran the node.  A serial node that
+	 * did not, while its instrumentation says it ran, ran in a worker
+	 * (§40.9), and its counters stayed there.
+	 */
+	bool		ran;
 	uint64		walked;
 	uint64		hits;
 	uint64		fetched;
@@ -6353,6 +6359,8 @@ lo_next(ScanState *ss)
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 	ExprContext *econtext = ss->ps.ps_ExprContext;
 
+	st->ran = true;
+
 	/*
 	 * The set: lazily, evaluated only where the walk goes, when its keys
 	 * can be sought (§30.4, "The set, lazily"); built otherwise - by one
@@ -6744,7 +6752,8 @@ lo_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 /*
  * The leader sets the struct up, before the workers are launched.  The set's
  * room is a Parallel Hash's: a hash table's memory for each participant the
- * plan was made for, the leader among them.
+ * plan was made for, the leader among them - none with
+ * pg_lion.enable_shared_set off.
  */
 static void
 lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
@@ -6759,7 +6768,8 @@ lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	ConditionVariableInit(&sh->setcv);
 	sh->setstate = LO_SHSET_NONE;
 	sh->setimage = InvalidDsaPointer;
-	sh->setroom = (Size) Min(room, (double) (SIZE_MAX / 2));
+	sh->setroom = lion_enable_shared_set ?
+		(Size) Min(room, (double) (SIZE_MAX / 2)) : 0;
 	sh->pscanoff = MAXALIGN(sizeof(LoShared));
 	lo_pscan_initialize(st, node->ss.ps.state->es_snapshot, pcxt->nworkers,
 						(ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
@@ -7008,7 +7018,17 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (buf.len > 0)
 		ExplainPropertyText("Lion Indexes", buf.data, es);
 
-	if (es->analyze && st->parallel)
+	/*
+	 * A serial node below a Gather that only workers ran - under
+	 * debug_parallel_query, or the inner side of a join a worker ran - has
+	 * its counters in those workers, which do not hand them back as a
+	 * parallel walk's do (§40.9): none are shown rather than this process's
+	 * zeros.  Its rows and loops are core's, summed over the workers.
+	 */
+	if (es->analyze && !st->parallel && !st->ran &&
+		node->ss.ps.instrument != NULL && node->ss.ps.instrument->nloops > 0)
+		;
+	else if (es->analyze && st->parallel)
 		lo_explain_parallel(st, &buf, es);
 	else if (es->analyze)
 	{
@@ -7131,6 +7151,21 @@ lion_ordered_init(void)
 							 "Lets LionOrdered evaluate its lion set only at the container keys its walk meets.",
 							 "Off, the set is built for the whole table before the walk starts.",
 							 &lion_enable_lazy_set,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §40.9: off, each participant of a parallel walk builds the
+	 * set for itself, as it does when the set is too large to share - for
+	 * comparing the two, and for the tests of that fallback, which a set of a
+	 * regression test's size never reaches.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_shared_set",
+							 "Lets the participants of a parallel LionOrdered or LionBtreeScan share one lion set.",
+							 "Off, each participant builds the set for itself.",
+							 &lion_enable_shared_set,
 							 true,
 							 PGC_USERSET,
 							 0,
