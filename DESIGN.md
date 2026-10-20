@@ -15663,7 +15663,15 @@ AND for its own estimates.
   of the conjunction stands (`lion_isect_part_factor()`), or core's estimate where it measured
   none, as it does when the heap has outgrown `rel->pages` twice over. At most
   `LION_ISECT_RUN_PROBES` (8) probes a planner run, and each conjunction measured once in it
-  (cached beside the endpoint probe's ends, per `PlannerGlobal`). The budget is checked before each
+  (cached beside the endpoint probe's ends, per `PlannerGlobal`) - once for its table: the cache
+  matches a conjunction's clauses by the table's columns, and every lion index of the table that
+  answers the same clauses takes the one measurement, whichever asked first (`LionIsect`). The
+  share of the rows an AND keeps is the heap's, and each index holds the same TIDs. Measured once an
+  index, a table of three lion indexes would spend three probes a conjunction, the run's eight would
+  run out at the third conjunction's third index, and that index's path would keep core's product -
+  one row for 1,280 on `isectwide.sql`'s table - under a relation of the probe's rows
+  (`lion_isect_rel_factor()` takes them from the index with the most set clauses), and be taken for
+  the price that gives it. The budget is checked before each
   clause is located and each sample taken, so a probe overruns it by one IN list's lookups or one
   sample's seeks at most: a planner run accesses 3,072 buffers and that much more at worst, the
   scale of a dozen endpoint probes (100 heap pages and 100 leaves an end, §28). The sample by rank
@@ -15836,7 +15844,7 @@ estimate at 22 rows for 3,835 - and the probe, as it was, gave up on them:
   relation's own - every set clause of its restriction clauses the index answers, the AND the count
   makes and a scan of every clause makes - is, when it is another (`lion_isect_factor_run()`).
 - **What a conjunction the run could not measure is.** Core's product, as before, unless the run
-  measured others on the same index: then between the largest of them that is a part of it and the
+  measured others of the same table: then between the largest of them that is a part of it and the
   smallest it is a part of, geometrically in the number of clauses (`lion_isect_part_factor()`). On
   16 the repro's five clauses beside the four lists measured a factor of 3.1, all nine 186, and the
   five with one of the lists 9.1, where this says 8.6.
@@ -16092,8 +16100,10 @@ product stands: 1 to 2,735 rows for 5,407 to 11,327.
 
 `test/sql/isectwide.sql` pins it: the conjunctions above within a factor of three of their rows,
 the relation's rows with them, where core's product is ten times short or more; the 41 sets
-measured without the widest list, the 21 by the prefix the sample met often; and the planning of
-the 31 sets, and of the twelve conjunctions in one statement, within the run's budget.
+measured without the widest list, the 21 by the prefix the sample met often; the planning of the
+31 sets, and of the twelve conjunctions in one statement, within the run's budget; and, with three
+lion indexes of the same columns, three conjunctions of 32 sets in one statement each estimated at
+its relation's rows by the Bitmap Index Scan of whichever index the plan takes.
 
 **The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
 sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.
