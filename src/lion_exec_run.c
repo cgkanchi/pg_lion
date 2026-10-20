@@ -459,6 +459,23 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		return lion_exec_partitioned(st);
 
 	/*
+	 * ---- a parallel count (DESIGN.md §10, "A count in parallel") ----
+	 *
+	 * A node of one row under a Gather: this participant's partial count -
+	 * and each filtered count's beside it - of the ranges of keys it claims,
+	 * one partial row, which the Finalize Agg above adds to the others'.
+	 */
+	if (st->ranged != NULL &&
+		(st->mode == LION_MODE_COUNT || st->mode == LION_MODE_SUM))
+	{
+		int64		total;
+
+		st->done = true;
+		total = lion_count_ranged(st, st->mode == LION_MODE_SUM);
+		return lion_emit_tuple(st, (Datum) 0, true, (Datum) 0, true, total);
+	}
+
+	/*
 	 * ---- filtered counts (DESIGN.md §10, "Filtered counts") ----
 	 *
 	 * A node of one row counts every run before its row; the groups of a
@@ -769,7 +786,10 @@ lion_reset_run(LionCountScanState *st)
 		MemoryContextReset(st->keycxt);
 
 	if (st->viscache != NULL)
+	{
 		lion_vis_cache_reset(st->viscache);
+		lion_vis_cache_clear_window(st->viscache);
+	}
 
 	/*
 	 * The clause values go too: a rescan of a parameterised inner side has to
@@ -851,10 +871,11 @@ lion_rescan_custom_scan(CustomScanState *node)
  * of the dimension rows from the parallel-aware child and locates the fact
  * filters for itself.
  *
- * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") keeps the same
- * struct, with no copy after it: the ranges of container keys its participants
- * claim one at a time, and the sums of their counters.  A node that is
- * neither, or one run without a Gather, never gets here.
+ * A parallel GROUP BY or count (DESIGN.md §10, "A GROUP BY in parallel", "A
+ * count in parallel") keeps the same struct, with no copy after it: the
+ * ranges of container keys its participants claim one at a time - a count's
+ * once for each of its runs - and the sums of their counters.  A node that is
+ * none of these, or one run without a Gather, never gets here.
  */
 Size
 lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
@@ -918,9 +939,9 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	lion_list_pin_participants(shared->participants);
 
 	/*
-	 * A parallel GROUP BY's ranges: a few for each participant the plan was
-	 * made for, whether they all start or not - the ones that do claim the
-	 * ranges of the ones that do not.
+	 * A parallel GROUP BY's or count's ranges: a few for each participant the
+	 * plan was made for, whether they all start or not - the ones that do
+	 * claim the ranges of the ones that do not.
 	 */
 	if (st->ranged != NULL)
 		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
@@ -982,7 +1003,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
  * they are the whole execution's, as the leader's own counters are.  The runs
  * of distinct keys a forward semi join's participants claim start again from
  * the first, since the rescan's keys are sorted again (and may be others), and
- * so do a parallel GROUP BY's ranges of keys.
+ * so do a parallel GROUP BY's or count's ranges of keys.
  * No participant is running: the Gather has shut the workers down, and the
  * leader's own node claims nothing before the Gather launches them again.
  *
@@ -1005,7 +1026,7 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->sorted = 0;
 	SpinLockRelease(&shared->mutex);
 
-	/* a parallel GROUP BY's ranges, cut again over the heap as it is now */
+	/* a parallel GROUP BY's or count's ranges, cut again over the heap now */
 	if (st->ranged != NULL)
 		shared->nranges = lion_key_ranges(RelationGetNumberOfBlocks(st->heap),
 										  shared->participants,
@@ -1160,6 +1181,10 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->dirpages += st->dirpages;
 		if (rs != NULL)
 			shared->ranges += rs->ranges;
+		if (st->lbatch != NULL)
+			shared->listbatches += st->lbatch->batches;
+		shared->summaries += st->summaries;
+		shared->rangeprobed += st->rangeprobed;
 		shared->wherecollected += st->wherecollected;
 		shared->wherespilled += st->wherespilled;
 		shared->groupbatches += st->groupbatches;
@@ -1200,6 +1225,9 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		rs->workerwherespilled = shared->wherespilled;
 		rs->workergroupbatches = shared->groupbatches;
 		rs->workergroupsbatched = shared->groupsbatched;
+		rs->workerlistbatches = shared->listbatches;
+		rs->workersummaries = shared->summaries;
+		rs->workerrangeprobed = shared->rangeprobed;
 	}
 	if (st->fg != NULL)
 		st->fg->workergroupcounts = shared->factgroupcounts;

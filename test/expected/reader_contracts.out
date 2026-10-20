@@ -31,7 +31,9 @@ INSERT INTO rcon_readers VALUES
 	('lion_index_count_stats',       $$SELECT count FROM lion_index_count_stats('%1$s_k', 3)$$),
 	('lion_index_count_group_stats', $$SELECT count(*) FROM lion_index_count_group_stats('%1$s_k')$$),
 	('lion_bm25',                    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10)$$),
+	('lion_bm25, a named column',    $$SELECT count(*) FROM lion_bm25('%1$s_d', 'secret', 10, col => 'd')$$),
 	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$),
+	('lion_bm25_score, a named column', $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d', col => 'd') > 0$$),
 	('lion_index_facets',            $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_d', 3)$$),
 	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$);
 -- what each reader says for the relation rel: its answer, or its error
@@ -44,18 +46,20 @@ EXCEPTION WHEN OTHERS THEN
 	RETURN SQLERRM;
 END $$;
 SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
-             name             |         rcon_try          
-------------------------------+---------------------------
- lion_bm25                    | 10
- lion_bm25_score              | true
- lion_index_count             | 300
- lion_index_count, two keys   | 43
- lion_index_count_any         | 600
- lion_index_count_group_stats | 1
- lion_index_count_stats       | 300
- lion_index_facets            | secret:1000 w0:300 w1:300
- lion_index_facets, filtered  | 3:15 5:15 0:14
-(9 rows)
+              name               |         rcon_try          
+---------------------------------+---------------------------
+ lion_bm25                       | 10
+ lion_bm25, a named column       | 10
+ lion_bm25_score                 | true
+ lion_bm25_score, a named column | true
+ lion_index_count                | 300
+ lion_index_count, two keys      | 43
+ lion_index_count_any            | 600
+ lion_index_count_group_stats    | 1
+ lion_index_count_stats          | 300
+ lion_index_facets               | secret:1000 w0:300 w1:300
+ lion_index_facets, filtered     | 3:15 5:15 0:14
+(11 rows)
 
 -- sql's rows with lion's paths allowed and with all of them off
 CREATE FUNCTION rcon_same(sql text) RETURNS text LANGUAGE plpgsql AS $$
@@ -77,18 +81,20 @@ ALTER TABLE rcon ENABLE ROW LEVEL SECURITY;
 CREATE POLICY rcon_hide ON rcon FOR SELECT USING (NOT d @@ 'secret');
 SET ROLE rcon_reader;
 SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
-             name             |                                         rcon_try                                          
-------------------------------+-------------------------------------------------------------------------------------------
- lion_bm25                    | cannot rank through index "rcon_d" because row-level security is enabled on table "rcon"
- lion_bm25_score              | cannot score through index "rcon_d" because row-level security is enabled on table "rcon"
- lion_index_count             | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
- lion_index_count, two keys   | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
- lion_index_count_any         | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
- lion_index_count_group_stats | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
- lion_index_count_stats       | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
- lion_index_facets            | cannot count through index "rcon_d" because row-level security is enabled on table "rcon"
- lion_index_facets, filtered  | cannot count through index "rcon_j" because row-level security is enabled on table "rcon"
-(9 rows)
+              name               |                                         rcon_try                                          
+---------------------------------+-------------------------------------------------------------------------------------------
+ lion_bm25                       | cannot rank through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_bm25, a named column       | cannot rank through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_bm25_score                 | cannot score through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_bm25_score, a named column | cannot score through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_index_count                | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
+ lion_index_count, two keys      | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
+ lion_index_count_any            | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
+ lion_index_count_group_stats    | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
+ lion_index_count_stats          | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
+ lion_index_facets               | cannot count through index "rcon_d" because row-level security is enabled on table "rcon"
+ lion_index_facets, filtered     | cannot count through index "rcon_j" because row-level security is enabled on table "rcon"
+(11 rows)
 
 -- the planner's paths apply the policy: the same rows as seq scan
 SELECT rcon_same($$SELECT count(*) FROM rcon WHERE k = 3$$);
@@ -125,18 +131,20 @@ ALTER TABLE rcon DISABLE ROW LEVEL SECURITY;
 REVOKE EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) FROM PUBLIC;
 SET ROLE rcon_reader;
 SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
-             name             |               rcon_try                
-------------------------------+---------------------------------------
- lion_bm25                    | 10
- lion_bm25_score              | true
- lion_index_count             | permission denied for function int4eq
- lion_index_count, two keys   | permission denied for function int4eq
- lion_index_count_any         | permission denied for function int4eq
- lion_index_count_group_stats | permission denied for function int4eq
- lion_index_count_stats       | permission denied for function int4eq
- lion_index_facets            | permission denied for function texteq
- lion_index_facets, filtered  | permission denied for function int4eq
-(9 rows)
+              name               |               rcon_try                
+---------------------------------+---------------------------------------
+ lion_bm25                       | 10
+ lion_bm25, a named column       | 10
+ lion_bm25_score                 | true
+ lion_bm25_score, a named column | true
+ lion_index_count                | permission denied for function int4eq
+ lion_index_count, two keys      | permission denied for function int4eq
+ lion_index_count_any            | permission denied for function int4eq
+ lion_index_count_group_stats    | permission denied for function int4eq
+ lion_index_count_stats          | permission denied for function int4eq
+ lion_index_facets               | permission denied for function texteq
+ lion_index_facets, filtered     | permission denied for function int4eq
+(11 rows)
 
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) TO PUBLIC;
@@ -145,18 +153,20 @@ GRANT EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) TO PUBLIC;
 UPDATE pg_index SET indisvalid = false
  WHERE indexrelid IN ('rcon_k'::regclass, 'rcon_j'::regclass, 'rcon_d'::regclass);
 SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
-             name             |                              rcon_try                              
-------------------------------+--------------------------------------------------------------------
- lion_bm25                    | cannot rank through index "rcon_d" because the index is not valid
- lion_bm25_score              | cannot score through index "rcon_d" because the index is not valid
- lion_index_count             | cannot count through index "rcon_k" because the index is not valid
- lion_index_count, two keys   | cannot count through index "rcon_k" because the index is not valid
- lion_index_count_any         | cannot count through index "rcon_k" because the index is not valid
- lion_index_count_group_stats | cannot count through index "rcon_k" because the index is not valid
- lion_index_count_stats       | cannot count through index "rcon_k" because the index is not valid
- lion_index_facets            | cannot count through index "rcon_d" because the index is not valid
- lion_index_facets, filtered  | cannot count through index "rcon_j" because the index is not valid
-(9 rows)
+              name               |                              rcon_try                              
+---------------------------------+--------------------------------------------------------------------
+ lion_bm25                       | cannot rank through index "rcon_d" because the index is not valid
+ lion_bm25, a named column       | cannot rank through index "rcon_d" because the index is not valid
+ lion_bm25_score                 | cannot score through index "rcon_d" because the index is not valid
+ lion_bm25_score, a named column | cannot score through index "rcon_d" because the index is not valid
+ lion_index_count                | cannot count through index "rcon_k" because the index is not valid
+ lion_index_count, two keys      | cannot count through index "rcon_k" because the index is not valid
+ lion_index_count_any            | cannot count through index "rcon_k" because the index is not valid
+ lion_index_count_group_stats    | cannot count through index "rcon_k" because the index is not valid
+ lion_index_count_stats          | cannot count through index "rcon_k" because the index is not valid
+ lion_index_facets               | cannot count through index "rcon_d" because the index is not valid
+ lion_index_facets, filtered     | cannot count through index "rcon_j" because the index is not valid
+(11 rows)
 
 UPDATE pg_index SET indisvalid = true
  WHERE indexrelid IN ('rcon_k'::regclass, 'rcon_j'::regclass, 'rcon_d'::regclass);
@@ -166,18 +176,20 @@ CREATE INDEX rcon_mv_k ON rcon_mv USING lion (k);
 CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j);
 CREATE INDEX rcon_mv_d ON rcon_mv USING lion (d) WITH (store_positions = true);
 SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
-             name             |                      rcon_try                      
-------------------------------+----------------------------------------------------
- lion_bm25                    | materialized view "rcon_mv" has not been populated
- lion_bm25_score              | false
- lion_index_count             | materialized view "rcon_mv" has not been populated
- lion_index_count, two keys   | materialized view "rcon_mv" has not been populated
- lion_index_count_any         | materialized view "rcon_mv" has not been populated
- lion_index_count_group_stats | materialized view "rcon_mv" has not been populated
- lion_index_count_stats       | materialized view "rcon_mv" has not been populated
- lion_index_facets            | materialized view "rcon_mv" has not been populated
- lion_index_facets, filtered  | materialized view "rcon_mv" has not been populated
-(9 rows)
+              name               |                      rcon_try                      
+---------------------------------+----------------------------------------------------
+ lion_bm25                       | materialized view "rcon_mv" has not been populated
+ lion_bm25, a named column       | materialized view "rcon_mv" has not been populated
+ lion_bm25_score                 | false
+ lion_bm25_score, a named column | false
+ lion_index_count                | materialized view "rcon_mv" has not been populated
+ lion_index_count, two keys      | materialized view "rcon_mv" has not been populated
+ lion_index_count_any            | materialized view "rcon_mv" has not been populated
+ lion_index_count_group_stats    | materialized view "rcon_mv" has not been populated
+ lion_index_count_stats          | materialized view "rcon_mv" has not been populated
+ lion_index_facets               | materialized view "rcon_mv" has not been populated
+ lion_index_facets, filtered     | materialized view "rcon_mv" has not been populated
+(11 rows)
 
 DROP MATERIALIZED VIEW rcon_mv;
 DROP FUNCTION rcon_same(text);

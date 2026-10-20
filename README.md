@@ -198,7 +198,8 @@ SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
 The planner turns this into a `LionBm25` scan, which finds the top rows from the index and skips
 rows that can't make the cut, instead of scoring and sorting every match. `lion_bm25(index, query, k)`
 returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's
-BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable).
+BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable). An index on several tsvector columns ranks each one
+by its own statistics; name it with `col => 'body'`.
 
 ### Nearest neighbours
 
@@ -289,6 +290,10 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
 - A `lionvec` query under a `WHERE` that no lion index answers fails by default
   (`pg_lion.vector_postfilter`); `SET pg_lion.vector_postfilter = exact` plans it as an exact sort
   instead.
+- A `lionvec` build chooses its partitions from a sample of what half of `maintenance_work_mem`
+  holds, so a large table needs it large (376 MB for a million rows of 1536 dimensions, 12 GB for a
+  billion); given too little, the build fails early, naming the setting it needs
+  (`pg_lion.vector_build_sample`; `allow` builds fewer partitions instead).
 - `lionvec` does not support row-level security: it builds no index on a table that has it
   enabled, or on a partition of one, and a query such an index could order fails.
 - jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating

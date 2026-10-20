@@ -7,8 +7,8 @@ SQL functions, key types, multi-key operators, index options, settings and known
 Ordinary SQL is the interface - the planner uses the index and the `LionCount` pushdown on its own -
 and these functions are for testing, diagnostics and the occasional direct count:
 
-    lion_bm25(idx, query, k [, k1, b])              the k best rows by BM25, best first (an index with positions)
-    lion_bm25_score(tsv, query, idx [, k1, b])      one row's BM25 score; ORDER BY it for the LionBm25 scan
+    lion_bm25(idx, query, k [, k1, b, col])         the k best rows by BM25, best first (an index with positions)
+    lion_bm25_score(tsv, query, idx [, k1, b, col]) one row's BM25 score; ORDER BY it for the LionBm25 scan
     lion_index_count(idx, key)                      count(*) WHERE col = key, through one index
     lion_index_count(idx1, key1, idx2, key2)        ... AND col2 = key2, two indexes on one table
     lion_index_count_any(idx, keys)                 count(*) WHERE col = ANY (keys)
@@ -173,7 +173,7 @@ a weight or a NOT, and is not used for ranking, can leave them out:
 
     CREATE INDEX ON doc USING lion (tsv) WITH (store_positions = off);
 
-An index with positions also ranks. `lion_bm25(index, query, k [, k1, b])` returns the `k` rows
+An index with positions also ranks. `lion_bm25(index, query, k [, k1, b, col])` returns the `k` rows
 with the highest BM25 score for the query's lexemes, best first, scored entirely from the index
 (term frequencies, document frequencies and each row's length, which the index keeps under its own
 key); the heap is read only to check that the rows returned are visible. Join on `ctid` for the rows:
@@ -193,10 +193,25 @@ are skipped (MaxScore), so a very common lexeme next to rarer ones costs little.
 security applies to the caller: the statistics count every row, so a score would reveal what the
 hidden rows hold.
 
-`lion_bm25_score(tsv, query, index [, k1, b])` is the same score for one row, from its tsvector and
-the index's statistics. Ordered by it, with a `WHERE` that matches on the same column, the planner
-returns the rows best first straight from the index (a `LionBm25` scan) instead of scoring and
-sorting every match:
+An index on several `tsvector` columns ranks each of them on its own. Every column that stores
+positions keeps statistics of its own, so a column ranks exactly as an index on that column alone
+would, and `col` says which one; it is needed only when more than one column of the index stores
+positions, and leaving it out then is an error that names the candidates:
+
+    CREATE INDEX doc_text_idx ON doc USING lion (title, body, lang);
+    SELECT * FROM lion_bm25('doc_text_idx', 'cat | dog', 10, col => 'body');
+
+`col` is the column's name in the index, as `\d doc_text_idx` lists it under Column: for a plain
+column the table column's name when the index was built, and for an expression the name CREATE
+INDEX gave it, which differs between PostgreSQL versions: `to_tsvector`, then `to_tsvector1` for a
+second one, on PostgreSQL 19. A name the index does not have, or a column that does not store
+positions, is an error; `col => NULL` is the same as leaving it out. A NULL in any other argument
+gives no rows (`lion_bm25_score()`: NULL).
+
+`lion_bm25_score(tsv, query, index [, k1, b, col])` is the same score for one row, from its
+tsvector and the statistics of the index column `col` names. Ordered by it, with a `WHERE` that
+matches on the same column, the planner returns the rows best first straight from the index (a
+`LionBm25` scan) instead of scoring and sorting every match:
 
     SELECT d.*, lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') AS score
       FROM doc d
@@ -204,11 +219,14 @@ sorting every match:
      ORDER BY lion_bm25_score(d.tsv, 'cat | dog', 'doc_tsv_idx') DESC
      LIMIT 10;
 
-The scan is offered when the query and index are constants and every row the `WHERE`'s tsquery can
-match has one of the scored lexemes - the same query in both places, or a narrower one such as
-`WHERE d.tsv @@ 'cat & black'` under a score of `'cat'`. Other
-`WHERE` clauses filter its rows, and a second sort key is an incremental sort above it. Anywhere
-else, the function scores row by row. `pg_lion.enable_bm25_scan` turns the scan off.
+The scan is offered when the query, index and `col` are constants, the tsvector scored is the
+column the function ranks - `d.body` in `lion_bm25_score(d.body, q, 'doc_text_idx', col =>
+'body')`, a plain column, not an expression - and every row the `WHERE`'s tsquery can match has
+one of the scored lexemes: the same query in both places, or a narrower one such as
+`WHERE d.tsv @@ 'cat & black'` under a score of `'cat'`. Other `WHERE` clauses filter its rows, and
+a second sort key is an incremental sort above it. Elsewhere - another tsvector scored against a
+column's statistics included - the function scores row by row; either way the rows and scores are
+the function's. `pg_lion.enable_bm25_scan` turns the scan off.
 
 A lexeme of up to 2043 bytes is a key as it is. A longer one (tsvector allows 2047) is stored as its
 first bytes and its SHA-256, and a query that names a lexeme of 2043 bytes or more has every
@@ -323,17 +341,29 @@ NaN, as a sort puts them.
 
 `partitions` (0 to 262,144) sets how many partitions the build makes; 0, the default, makes one
 for a table of fewer than 10,000 rows and eight times the square root of the rows' count for a
-larger (8,000 for a million rows), but never more than a sixteenth of the rows the build samples.
-The build samples as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
-row, at most 16.8 million rows, 25.8 GB) and runs k-means over at most 128 of them a partition
-(never fewer than 65,536 rows): the
-default 64 MB holds about 21,800 rows of 1536 dimensions, so at most 1,361 partitions; a million
-rows need 376 MB for their 8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a
-billion rows' 252,982 need 12.5 GB. More partitions make a scan score fewer rows and rank more
-centroids, and make the build slower (it grows with the rows times the square root of the
-partitions); they leave the
-pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting takes
-effect at the next `REINDEX`.
+larger (8,000 for a million rows, never more than a sixteenth of the rows). The build chooses them
+from a sample of as many rows as half of `maintenance_work_mem` holds (1.5 KB a 1536-dimension
+row, at most 16.8 million rows, 25.8 GB), at least 16 sample rows a partition it chooses and one a
+partition `partitions` asks for, and runs k-means over at most 128 of them a partition (never
+fewer than 65,536 rows): the default 64 MB holds about 21,800 rows of 1536 dimensions, enough for
+1,361 partitions, which a table of 28,986 rows outgrows; a million rows need 376 MB for their
+8,000, 1 GB gives k-means 44 rows a partition and 3.2 GB the 128, and a billion rows' 252,982 need
+12.5 GB. A build whose sample is too small for the partitions its rows want, or for those
+`partitions` asks (up to the table's rows), fails as soon as its first pass has read enough rows
+to know it, before the rest of the build, naming the `maintenance_work_mem` that would be enough
+(for the rows the table holds, reckoned from the part read so far - "About"):
+
+    ERROR:  lionvec index "items_emb" wants 252982 partitions, and its sample has rows for 1361
+    DETAIL:  About 1000000000 rows with a vector want 252982 partitions of at least 16 sample rows each, and half of maintenance_work_mem (64MB) holds a sample of 21788 rows of 1536 dimensions.
+    HINT:  Set maintenance_work_mem to at least 11890MB, or set pg_lion.vector_build_sample to allow to build 1361 partitions.
+
+`SET pg_lion.vector_build_sample = allow` builds the fewer partitions instead, with a NOTICE
+(below). A table of fewer than 10,000 rows, which has one partition, builds at any
+`maintenance_work_mem`, and a `partitions` larger than the table's rows wants one a row, which a
+sample of every row makes. More partitions make a scan score fewer rows and rank more centroids,
+and make the build slower (it grows with the rows times the square root of the partitions); they
+leave the pause where it was, as `pg_lion.vector_patience` counts rows, not partitions. The setting
+takes effect at the next `REINDEX`.
 
     CREATE INDEX ON items USING lionvec (embedding vector_cosine_ops) WITH (spill = off);
 
@@ -407,7 +437,9 @@ queries are answered from the index and BM25 ranking works (see "Multi-key colum
 about twice the index's size. `auto` stores them when a key column's operator class can
 (`tsvector_ops`) and builds an index with no such column without them; `on` on such an index is an
 error; `off` leaves them out. Read at build time, like `summaries`: `ALTER INDEX ... SET` changes
-nothing until a `REINDEX`.
+nothing until a `REINDEX`. The build sorts the positions with the posting sets, in the same
+`maintenance_work_mem`, and writes them to temporary files with them past it, so the index is the
+same at any setting; more memory only writes less.
 `fillfactor` (10 .. 100, default 90): how full the build packs a directory leaf.
 `posting_fillfactor` (10 .. 100, default 90): how full the build packs a posting-tree leaf, the
 container pages a key's posting set lives on once it outgrows its entry (DESIGN.md §22). At 100 a
@@ -449,8 +481,18 @@ keys; `auto` gives them only to the columns whose keys are small next to a bucke
 values), which is where ranges are slow.  Every insert into a summarized column also updates its
 bucket's set.  `summary_tids` (16 .. 16777216, default 4096) is the rows a bucket closes at.  Both
 are read at build time: `ALTER INDEX ... SET (summaries = ...)` takes effect at the next REINDEX.
+A count over a range beside other conditions counts each bucket's set against them until those
+counts have visited twice the containers the conditions' smallest set holds, then collects the
+conditions once and steps the remaining buckets at their keys (`Range Walks Probed` in
+`EXPLAIN ANALYZE`) - when a copy of that smallest set fits `work_mem`; otherwise it counts every
+bucket.  The planner prices whichever the count will do, so a larger `work_mem` can make such a
+count the cheaper plan.
 A range on a column that does not drive a count (`g, count(*) ... WHERE ts >= $1 GROUP BY
-g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk.
+g`, a range in an OR, a join's fact filter) is answered too, collected once from the same walk -
+within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by the table's ranges:
+one that does not fit what the others left sends those to temporary files first) and past it in
+windows into a temporary file (`Range Sources Spilled` in `EXPLAIN ANALYZE`), or, where there are
+few counts and the planner finds it cheaper, walked again at each (`Range Sources Walked`).
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the
@@ -551,6 +593,14 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_count_partial`: let the count pushdown read a partial Lion index whose predicate
+  the query's `WHERE` implies - `CREATE INDEX ... USING lion (g, c) WHERE f AND s = 'a'` for a
+  query with `WHERE f AND s = 'a' AND c = 3` - leaving out the clauses the predicate implies, as a
+  partial index scan does (DESIGN.md §45). It is used only where every row the count can reach is
+  one of the index's: a clause read from it that selects rows (`=`, `IN`, `IS NULL`, a range), or
+  its entries walked for a `GROUP BY`, a `count(DISTINCT)` or the count of every row. EXPLAIN lists
+  the index among the `Lion Indexes` (`Partial Indexes` on a partitioned table) and the clauses
+  left out under `Implied by Index Predicate`. Off, the pushdown reads whole Lion indexes only.
 - `pg_lion.enable_count_residual`: let the count pushdown take a `WHERE` clause no Lion index
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
   the heap row of each row the others select (DESIGN.md §10, "Residual clauses"). Off, such a count
@@ -559,9 +609,9 @@ working around a bad choice:
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
   catch up (DESIGN.md §36). Off, every group is counted.
-- `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(col, query, index)
-  DESC` with a `WHERE col @@ ...` it covers: the rows best first from the index's BM25 walk
-  (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
+- `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(tsv, query, index
+  [, ...]) DESC` with a `WHERE tsv @@ ...` it covers: the rows best first from the index's BM25
+  walk (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
@@ -571,8 +621,12 @@ working around a bad choice:
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
   own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
-  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most. Off,
-  Lion prices its paths from the planner's estimate.
+  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most: the
+  containers of the clause with the fewest rows, chosen among its own - every one, where they are
+  few, which makes the measure an exact count - so that a table loaded in batches is measured as
+  well as one whose rows are mixed ("A sample of the driver's own rows"). A sample that meets none
+  of the AND's rows lowers the estimate only as far as it can rule out, not to one row ("What a
+  sample can rule out"). Off, Lion prices its paths from the planner's estimate.
 - `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
   filters correct the planner's row estimate for that table as well, so that joins above it are
   sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
@@ -604,8 +658,9 @@ set `pg_lion.pushdown_margin` above 1 (below).
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
-fewest container keys - of 64 heap blocks each - a range of a parallel count covers when it runs
-(DESIGN.md §10, "A GROUP BY in parallel"; the planner prices the default),
+fewest container keys - of 64 heap blocks each - a range of a parallel count or `GROUP BY`
+covers when it runs (DESIGN.md §10, "A GROUP BY in parallel" and "A count in parallel"; the
+planner prices the default),
 `pg_lion.enable_union_probe` (on), whether an AND of posting sets may look its few rows up in the
 containers of an `IN` list's or a multi-key query's union rather than build the union (DESIGN.md
 §29.11, "Unions probed"; the answers are the same either way; `EXPLAIN ANALYZE` of a count prints
@@ -647,8 +702,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
 | `range_entry_cost` | 40 | `cpu_tuple_cost` | an entry of a range walk counted on its own |
 | `range_union_entry_cost` | 12 | `cpu_tuple_cost` | a small entry of a summed range, counted with its leaf |
-| `probe_step_cost` | 2.0 | `cpu_operator_cost` | a container of a set a summed range probes |
+| `probe_step_cost` | 10 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
+| `spill_read_cost` | 27 | `cpu_operator_cost` | a container a count reads back from a set spilled to a temporary file: a range collected as a source, the FK-side join's copy of its fact filters |
 | `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
 | `fkjoin_row_cost` | 20 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 10 | `cpu_operator_cost` | a probe of such a count into a fact filter |
@@ -702,9 +758,13 @@ the sequential scan the same way: the covering walk's marked-up price must beat 
 scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
 access method's own scan of a Lion index (both prices Lion's), and to a count whose multi-key query
-is a generic plan's parameter (priced at its dearest already). A path disabled by PostgreSQL's
-`enable_*` settings (above) loses to an enabled one, and Lion's switches leave theirs out, whatever
-the margin.
+is a generic plan's parameter (priced at its dearest already). A plain count of one table is
+always priced below an aggregate over the access method's own plain or bitmap scan that reads
+every set the count reads - every condition of the `WHERE` an index condition of the index the
+count reads it from - since that scan does the count's work and fetches every row besides: past
+the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
+same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
+and Lion's switches leave theirs out, whatever the margin or price.
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
 standard deviations (DESIGN.md §44.8). A row of the partitions a scan reads is missed only when its
@@ -790,6 +850,16 @@ of the scan's rows, and one of the vector column alone (`embedding IS NOT NULL`,
 filters them under every value; any other is a filter, a key's `id = 5` too. A table with
 row-level security `lionvec` refuses under every value (below).
 
+`pg_lion.vector_build_sample` (`error`, or `allow`): what a `lionvec` build does when half of
+`maintenance_work_mem` holds too small a sample of the rows for the partitions it wants - fewer
+than a sample of every row would give (above, and DESIGN.md §44.8). `error`, the default, fails the
+build in its first pass, as soon as the rows it has read want more partitions than the sample has
+rows for - before k-means and the second pass, and for a parallel build before its workers start -
+naming the partitions wanted, those the sample has rows for, and the `maintenance_work_mem` that
+would hold enough, rounded up to a megabyte. `allow` builds the partitions the sample has rows for,
+with a NOTICE that names the same. The partitions decide which rows a scan reads, so its answers,
+which is why a memory setting does not change them unseen; a `REINDEX` reads the setting again.
+
 `pg_lion.vector_parallel_scan` (`off`): whether the planner may scan a `lionvec` index in parallel
 (above, and DESIGN.md §44.4, "A parallel scan"). Off, a `lionvec` order gets no partial path at all,
 whatever core's parallel settings say: on every query measured the parallel scan was slower than
@@ -844,9 +914,13 @@ through its table row and the TOAST index, as before; it is there to compare.
 `pg_lion.ordered_switch_ratio` (32, 1 to 1,000,000): how many B-tree entries `LionOrdered` walks per
 member it has not met yet before it stops walking, fetches the members left in TID order and sorts
 them (DESIGN.md §30.4, "When the walk is not paying"; `Switched to Fetch and Sort` in `EXPLAIN
-ANALYZE`). In index-only mode the switch is also held back while the walk meets members at the rate
-a uniform spread predicts, since there it would read heap pages the walk never touches (DESIGN.md
-§40.4). A large value keeps a walk from switching at all.
+ANALYZE`). The sort is a Sort node's: past `work_mem` it goes to disk, and under a constant `LIMIT`
+that nothing between the node and it can drop a row from, it keeps only the rows the `LIMIT` takes
+(`Fetch and Sort Method`, `Fetch and Sort Space Used` and `Fetch and Sort Space Type` in `EXPLAIN
+ANALYZE`), so whether and where a walk switches does not depend on `work_mem`. In index-only mode
+the switch is also held back while the walk meets members at the rate a uniform spread predicts,
+since there it would read heap pages the walk never touches (DESIGN.md §40.4). A large value keeps
+a walk from switching at all.
 
 ## Monitoring
 
@@ -875,7 +949,11 @@ and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
-scans and plain index scans (`amgettuple`, DESIGN.md §29). There are no ordered scans of the
+scans and plain index scans (`amgettuple`, DESIGN.md §29). `col IS NULL` and `col IS NOT NULL` are
+answered exactly beside any of them, in these scans and in the sets of `LionOrdered` and
+`LionBtreeScan`: `IS NOT NULL` takes the column's NULL rows out of what the other conditions select
+(an empty array, tsvector or jsonb is not NULL), and leaves nothing to the heap recheck (DESIGN.md
+§14). There are no ordered scans of the
 access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a lion filter, or a
 lion index's own ordered column walked, §30), no index-only scans of a lion index
 that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
@@ -904,7 +982,9 @@ lists of more than 1000 values are left to the ordinary plan, a multi-key index 
 `GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values; `USING lion (doc)`
 on `jsonb` is one, and `doc jsonb_ops` the index for `=` and `count(DISTINCT doc)` on whole
 documents), and the cost model inherits the
-stale `relallvisible` blind spot of index-only scans.
+stale `relallvisible` blind spot of index-only scans. A partial Lion index is read by the count
+pushdown only when the query's `WHERE` implies its predicate, one per table or partition in a plan,
+and never for a uniqueness proof, the facet counts or the planner's estimates (DESIGN.md §45).
 On a hot standby a GENERIC-mode index's count paths recheck every candidate TID in the heap instead
 of trusting the visibility map, because generic WAL replay does not take the cleanup locks the pin
 interlock relies on; they stay correct there but are no longer O(1) per container.  Index-only
@@ -964,7 +1044,9 @@ from PostgreSQL 16, for a table of 10,000 rows or more or one whose `parallel_wo
 and 36 s with three workers on four cores, where comparing each row with every centroid took
 292 s and 85 s. A parallel build holds its sample, up to half of `maintenance_work_mem`,
 and the centroids in dynamic shared memory, which Docker limits to 64 MB unless given
-`--shm-size`.
+`--shm-size`. A build whose `maintenance_work_mem` holds too small a sample for its partitions
+fails (`pg_lion.vector_build_sample`, above), `pg_restore`'s and `reindexdb`'s too, which run at
+the server's setting unless told otherwise (`PGOPTIONS='-c maintenance_work_mem=12GB'`).
 Each returned row is fetched from the heap twice, once for its distance and once by the executor.
 A small `work_mem` with a large `LIMIT` makes a scan read its partitions several times (`SET
 client_min_messages = debug1` shows the passes). What a scan remembers of the rows it has read is

@@ -3,12 +3,24 @@
  * lion_bm25_scan.c
  *		LionBm25: a CustomScan for
  *
- *			SELECT ... FROM t WHERE col @@ q2 [AND ...]
- *			ORDER BY lion_bm25_score(col, q, 'idx') DESC [LIMIT n]
+ *			SELECT ... FROM t WHERE doc @@ q2 [AND ...]
+ *			ORDER BY lion_bm25_score(doc, q, 'idx' [, k1, b, col]) DESC
+ *			[LIMIT n]
  *
  *		that returns the rows best first straight from the walk lion_bm25()
  *		makes (lion_bm25.c, DESIGN.md §17 "Ranking"), instead of fetching
  *		every row the WHERE matches, scoring each and sorting them.
+ *
+ * The walk ranks the key column of idx that lion_bm25_score() itself takes
+ * from col (lion_bm25_column()): the one named, or with col NULL the one
+ * column that stores positions.  The scan is offered only when doc is the
+ * table column that key column indexes, so that the walk's score of each
+ * row is the one the function computes from it.  Where doc is anything else
+ * - another column, an expression, a key column other than the one named -
+ * the function scores a tsvector the walk does not read, and where col does
+ * not settle one column, the function raises an error the scan must not
+ * hide; both are left to the ordinary plan, which calls the function for
+ * each row.
  *
  * The order is only claimed when the walk's candidates hold every row the
  * scan may return: rows the WHERE keeps all match q2, and the walk reads the
@@ -83,11 +95,11 @@ bool		lion_enable_bm25_scan = true;
 static set_rel_pathlist_hook_type lion_bm25_prev_set_rel_pathlist_hook = NULL;
 
 /*
- * custom_private: the index, the query, k1, b and the first L, as Consts, in
- * that order.  lion_bm25_priv_decode() is its one reader and
- * lion_bm25_priv_encode() its one writer.
+ * custom_private: the index, the query, k1, b, the first L and the key
+ * column ranked, as Consts, in that order.  lion_bm25_priv_decode() is its
+ * one reader and lion_bm25_priv_encode() its one writer.
  */
-#define LION_BM25_PRIV_LEN	5
+#define LION_BM25_PRIV_LEN	6
 
 typedef struct LionBm25Priv
 {
@@ -96,6 +108,7 @@ typedef struct LionBm25Priv
 	double		k1;
 	double		b;
 	int64		firstL;
+	int32		attno;			/* the index's key column, 1-based */
 } LionBm25Priv;
 
 typedef struct LionBm25ScanState
@@ -184,25 +197,28 @@ lion_bm25_priv_decode(List *priv, LionBm25Priv *out)
 	out->k1 = DatumGetFloat8(lion_bm25_priv_const(priv, 2, FLOAT8OID));
 	out->b = DatumGetFloat8(lion_bm25_priv_const(priv, 3, FLOAT8OID));
 	out->firstL = DatumGetInt64(lion_bm25_priv_const(priv, 4, INT8OID));
+	out->attno = DatumGetInt32(lion_bm25_priv_const(priv, 5, INT4OID));
 }
 
 /* lion_bm25_priv_encode() without its check */
 static List *
 lion_bm25_priv_build(const LionBm25Priv *p)
 {
-	return list_make5(makeConst(REGCLASSOID, -1, InvalidOid, sizeof(Oid),
-								ObjectIdGetDatum(p->indexoid), false, true),
-					  makeConst(TSQUERYOID, -1, InvalidOid, -1,
-								p->query, false, false),
-					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
-								Float8GetDatum(p->k1), false,
-								FLOAT8PASSBYVAL),
-					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
-								Float8GetDatum(p->b), false,
-								FLOAT8PASSBYVAL),
-					  makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
-								Int64GetDatum(p->firstL), false,
-								FLOAT8PASSBYVAL));
+	return lappend(list_make5(makeConst(REGCLASSOID, -1, InvalidOid, sizeof(Oid),
+										ObjectIdGetDatum(p->indexoid), false, true),
+							  makeConst(TSQUERYOID, -1, InvalidOid, -1,
+										p->query, false, false),
+							  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+										Float8GetDatum(p->k1), false,
+										FLOAT8PASSBYVAL),
+							  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+										Float8GetDatum(p->b), false,
+										FLOAT8PASSBYVAL),
+							  makeConst(INT8OID, -1, InvalidOid, sizeof(int64),
+										Int64GetDatum(p->firstL), false,
+										FLOAT8PASSBYVAL)),
+				   makeConst(INT4OID, -1, InvalidOid, sizeof(int32),
+							 Int32GetDatum(p->attno), false, true));
 }
 
 /*
@@ -262,6 +278,21 @@ lion_bm25_const(Node *n, Oid type)
 	return (Const *) n;
 }
 
+/*
+ * The score's col: false unless it is a Const name; *colname is NULL when
+ * the Const is (the index's one column that stores positions).
+ */
+static bool
+lion_bm25_col_const(Node *n, const char **colname)
+{
+	n = lion_bm25_strip(n);
+	if (n == NULL || !IsA(n, Const) || ((Const *) n)->consttype != NAMEOID)
+		return false;
+	*colname = ((Const *) n)->constisnull ? NULL :
+		NameStr(*DatumGetName(((Const *) n)->constvalue));
+	return true;
+}
+
 /* Is e a call of lion_bm25_score()? */
 static bool
 lion_bm25_is_score(Expr *e)
@@ -272,7 +303,8 @@ lion_bm25_is_score(Expr *e)
 	if (e == NULL || !IsA(e, FuncExpr))
 		return false;
 	f = (FuncExpr *) e;
-	if (f->funcresulttype != FLOAT8OID || list_length(f->args) != 5)
+	if (f->funcresulttype != FLOAT8OID ||
+		list_length(f->args) != LION_BM25_SCORE_NARGS)
 		return false;
 	fmgr_info(f->funcid, &fi);
 	return fi.fn_addr == lion_bm25_score;
@@ -356,15 +388,34 @@ lion_bm25_where_covered(TSQuery where, List *qlexemes)
 					   lion_bm25_without_q);
 }
 
-/* The rows the walk would read for query: its lexemes' rows, added up. */
+/*
+ * The key column of index indexoid that lion_bm25_score() would rank with
+ * col colname, or InvalidAttrNumber where it would raise an error.
+ */
+static AttrNumber
+lion_bm25_score_column(Oid indexoid, const char *colname)
+{
+	Relation	index = index_open(indexoid, AccessShareLock);
+	AttrNumber	attno;
+
+	attno = lion_bm25_column(index, lion_get_index_state(index), colname,
+							 true);
+	index_close(index, AccessShareLock);
+	return attno;
+}
+
+/*
+ * The rows the walk would read for query in column attno: its lexemes' rows,
+ * added up.
+ */
 static double
-lion_bm25_candidates(Oid indexoid, TSQuery query)
+lion_bm25_candidates(Oid indexoid, AttrNumber attno, TSQuery query)
 {
 	Relation	index = index_open(indexoid, AccessShareLock);
 	LionBm25Query q;
 	double		n = 0;
 
-	if (lion_bm25_prepare(index, query, 1.2, 0.75, &q))
+	if (lion_bm25_prepare(index, attno, query, 1.2, 0.75, &q))
 		n = (double) q.ncodes;
 	index_close(index, AccessShareLock);
 	return n;
@@ -381,6 +432,8 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	Const	   *cindex;
 	Const	   *ck1;
 	Const	   *cb;
+	const char *colname;
+	AttrNumber	attno;
 	IndexOptInfo *idx = NULL;
 	TSQuery		query;
 	bool		prefix;
@@ -415,7 +468,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (lion_old_snapshot_threshold_active())
 		return;
 
-	/* ORDER BY lion_bm25_score(col, const, const, const, const) DESC */
+	/* ORDER BY lion_bm25_score(doc, const, const, const, const, const) DESC */
 	pk = linitial_node(PathKey, root->query_pathkeys);
 #if PG_VERSION_NUM >= 180000
 	desc = (pk->pk_cmptype == COMPARE_GT);
@@ -433,10 +486,13 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	ck1 = lion_bm25_const(lfourth(score->args), FLOAT8OID);
 	cb = lion_bm25_const(list_nth(score->args, 4), FLOAT8OID);
 	if (var == NULL || cquery == NULL || cindex == NULL || ck1 == NULL ||
-		cb == NULL)
+		cb == NULL || !lion_bm25_col_const(list_nth(score->args, 5), &colname))
 		return;
 
-	/* the index: lion, on rel, storing positions for exactly that column */
+	/*
+	 * The index: lion, on rel, and the key column the function would rank
+	 * (the header) indexing exactly that column.
+	 */
 	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *i = (IndexOptInfo *) lfirst(lc);
@@ -450,17 +506,10 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	if (idx == NULL || idx->relam != lion_get_am_oid() || idx->hypothetical ||
 		idx->indpred != NIL)
 		return;
-	{
-		int			c;
-		bool		ok = false;
-
-		for (c = 0; c < idx->nkeycolumns; c++)
-			if (idx->indexkeys[c] == var->varattno &&
-				lion_index_stores_positions(idx, (AttrNumber) (c + 1)))
-				ok = true;
-		if (!ok)
-			return;
-	}
+	attno = lion_bm25_score_column(idx->indexoid, colname);
+	if (attno == InvalidAttrNumber || attno > idx->nkeycolumns ||
+		idx->indexkeys[attno - 1] != var->varattno)
+		return;
 
 	/* the score's lexemes, and a WHERE on the column they cover */
 	query = DatumGetTSQuery(cquery->constvalue);
@@ -504,7 +553,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * skips some - for an index tuple and an operator's CPU each; then each
 	 * row costs a heap fetch, a random page at worst, and the WHERE.
 	 */
-	ncand = lion_bm25_candidates(idx->indexoid, query);
+	ncand = lion_bm25_candidates(idx->indexoid, attno, query);
 	rows = Max(rel->rows, 1.0);
 	firstL = (root->limit_tuples > 0 && root->limit_tuples < 1e9) ?
 		(int64) root->limit_tuples + 16 : 64;
@@ -531,6 +580,7 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	priv.k1 = DatumGetFloat8(ck1->constvalue);
 	priv.b = DatumGetFloat8(cb->constvalue);
 	priv.firstL = firstL;
+	priv.attno = attno;
 	cp->custom_private = lion_bm25_priv_encode(&priv);
 	cp->methods = &lion_bm25_path_methods;
 	/* a walk of the index that fetches each row, as an index scan is */
@@ -648,7 +698,8 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	lion_check_table_am(node->ss.ss_currentRelation);
 	st->heapslot = table_slot_create(node->ss.ss_currentRelation,
 									 &estate->es_tupleTable);
-	st->valid = lion_bm25_prepare(st->index, st->query, st->k1, st->b, &st->q);
+	st->valid = lion_bm25_prepare(st->index, (AttrNumber) priv.attno,
+								  st->query, st->k1, st->b, &st->q);
 }
 
 /* The scan tuple of the row in heapslot, whose score is score. */

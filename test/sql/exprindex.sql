@@ -132,8 +132,10 @@ RESET plan_cache_mode;
 DEALLOCATE xp;
 
 -- declined, and answered by the ordinary plan: an expression the index does
--- not hold (another collation, another field), a partial expression index, a
--- multi-key opclass over an expression, and a partitioned table
+-- not hold (another collation, another field), a partial expression index
+-- whose predicate the query does not imply, a multi-key opclass over an
+-- expression, and a partitioned table.  A partial expression index whose
+-- predicate it does imply answers (DESIGN.md §45).
 SELECT xq_planned($$SELECT count(*) FROM xd WHERE doc->>'zz' = 'a'$$) AS other_field;
 SELECT xq_planned($$SELECT (doc->>'s') COLLATE "C", count(*) FROM xd GROUP BY 1$$) AS other_collation;
 CREATE TABLE xpart (id int, doc jsonb);
@@ -142,6 +144,9 @@ CREATE INDEX xpart_s ON xpart USING lion ((doc->>'s')) WHERE id > 100;
 CREATE INDEX xpart_v ON xpart USING lion ((to_tsvector('simple', coalesce(doc->>'s', ''))));
 VACUUM ANALYZE xpart;
 SELECT xq_planned($$SELECT count(*) FROM xpart WHERE doc->>'s' = 'a' AND id > 100$$) AS partial_index;
+SELECT xq_rows($$SELECT count(*) FROM xpart WHERE doc->>'s' = 'a' AND id > 100$$, true) =
+	   xq_rows($$SELECT count(*) FROM xpart WHERE doc->>'s' = 'a' AND id > 100$$, false) AS partial_same;
+SELECT xq_planned($$SELECT count(*) FROM xpart WHERE doc->>'s' = 'a' AND id > 50$$) AS partial_not_implied;
 SELECT xq_planned($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$) AS multikey;
 SELECT xq_rows($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$, true) =
 	   xq_rows($$SELECT count(*) FROM xpart WHERE to_tsvector('simple', coalesce(doc->>'s', '')) @@ 'a'$$, false) AS multikey_same;

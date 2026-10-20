@@ -289,6 +289,22 @@ lion_row_filter_heap(const LionRowFilter *filter)
 extern void lion_vis_cache_set_filter(LionVisCache *cache,
 									  LionRowFilter *filter);
 
+/*
+ * A WINDOW of container keys (DESIGN.md §10, "A count in parallel"): every
+ * count handed `cache` afterwards - lion_count_sources_cached() and every
+ * count the node makes through it, a range probe's collection, the heap scan
+ * of lion_count_heap_filtered() when it is given the window - counts only
+ * the rows at container keys lo up to, not including, hi, which is one range
+ * of lion_key_ranges()' cut.  Lifted with lion_vis_cache_clear_window(); a
+ * reset leaves it where it is.  lion_vis_cache_window() says whether one is
+ * set, and where; with none, *lo is 0 and *hi LION_KEYS_END.
+ */
+extern void lion_vis_cache_set_window(LionVisCache *cache, uint32 lo,
+									  uint64 hi);
+extern void lion_vis_cache_clear_window(LionVisCache *cache);
+extern bool lion_vis_cache_window(const LionVisCache *cache, uint32 *lo,
+								  uint64 *hi);
+
 /* Does the row pass?  tuple is a heap tuple of filter->heap. */
 extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
 
@@ -296,11 +312,14 @@ extern bool lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple);
  * The rows of `heap` visible to snapshot that pass filter, by a sequential
  * scan: what the count pushdown falls back to when a filtered clause was its
  * only source and there is no candidate set to recheck (DESIGN.md §17).  The
- * rows scanned are counted as rechecked in stats.
+ * rows scanned are counted as rechecked in stats.  Only the blocks of
+ * container keys lo up to, not including, hi are read: 0 and LION_KEYS_END
+ * for the whole heap, a window's otherwise (lion_vis_cache_set_window()).
  */
 extern int64 lion_count_heap_filtered(Relation heap, Snapshot snapshot,
 									  LionRowFilter *filter,
-									  LionCountStats *stats);
+									  LionCountStats *stats,
+									  uint32 lo, uint64 hi);
 
 /*
  * A located posting set: everything the counting code needs in order to
@@ -450,12 +469,13 @@ typedef struct LionCountSource
 	/*
 	 * A RANGE on a column that does not drive the count, taken as a source
 	 * (DESIGN.md §32, "A range as a source") that was too large to collect
-	 * into memory: the rows whose key lies in the range, which the caller
-	 * counts as the SUM over the sets a walk of the range hands out - disjoint
-	 * entries and summaries of one scalar column - each ANDed with the other
-	 * sources in its place.  The count functions below never take one; the
-	 * count pushdown, which defines the structure, expands it before it calls
-	 * them (lion_node_count()).
+	 * into memory, in a plan that walks those (LION_FLAG_RANGEWALK) rather
+	 * than collect them in windows: the rows whose key lies in the range,
+	 * which the caller counts as the SUM over the sets a walk of the range
+	 * hands out - disjoint entries and summaries of one scalar column - each
+	 * ANDed with the other sources in its place.  The count functions below
+	 * never take one; the count pushdown, which defines the structure,
+	 * expands it before it calls them (lion_node_count()).
 	 */
 	struct LionRangeSource *rangewalk;
 
@@ -954,6 +974,14 @@ extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
 #define LION_RANGE_UNION_PEND_MIN	32
 
 /*
+ * The least memory a window of a range collected into a temporary file has
+ * (lion_range_collect()), whatever is left of the caller's: several bitsets,
+ * so that a window always keeps some keys and gets on - and what the planner
+ * sizes the windows by when less is left (lion_cost_range_source()).
+ */
+#define LION_RANGE_WINDOW_MIN		(32 * 1024)
+
+/*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, collected in memory.  Like a
@@ -983,6 +1011,15 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
 								int64 *nsummaries);
 
 /*
+ * Send a range's set collected in memory to a temporary file of its own, in
+ * place - every copy of the LionPostingSet that names it reads it there from
+ * then on - and give back the memory its union took: *held, what the
+ * relation's ranges hold, loses what the set took and gains what it holds
+ * now, which is what a set collected in windows holds (lion_range_collect()).
+ */
+extern void lion_range_spill_set(struct LionMatSet *mat, Size *held);
+
+/*
  * A summed range PROBED at the rows of the other sources F (DESIGN.md §32,
  * "Summed ranges: dense and probed"): F is collected once, every set a walk
  * of the range hands out is read only at F's container keys and marked
@@ -993,15 +1030,26 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
  * lion_range_probe_begin() returns NULL when it cannot be taken: F has no
  * positive source, holds a range still to be walked (rangewalk), has no
  * positive source that carries the §9 interlock, or would not fit maxbytes
- * with the marks.  F must stay located until lion_range_probe_end().
+ * with the marks.  F must stay located until lion_range_probe_end().  lo and
+ * hi are the window of container keys the final count is confined to
+ * (lion_vis_cache_window()): F is copied at those keys alone.
  */
 typedef struct LionRangeProbe LionRangeProbe;
 
+/*
+ * lion_range_probe_fits() is the same memory test asked of an F of `rows`
+ * rows over `containers` container keys before anything is collected - one
+ * of F's sources, which bounds what the probe copies - by the executor
+ * before it tries, and by the planner before it prices a walk probed.
+ */
+extern bool lion_range_probe_fits(double rows, double containers,
+								  Size maxbytes);
 extern LionRangeProbe *lion_range_probe_begin(Relation heap, Snapshot snapshot,
 											  int nsources,
 											  LionCountSource *sources,
 											  Size maxbytes,
-											  LionCountStats *stats);
+											  LionCountStats *stats,
+											  uint32 lo, uint64 hi);
 extern void lion_range_probe_add(LionRangeProbe *rp, LionPostingSet *set);
 extern int64 lion_range_probe_count(LionRangeProbe *rp, Relation heap,
 									Snapshot snapshot, LionCountStats *stats,
@@ -1553,6 +1601,13 @@ extern PGDLLIMPORT bool lion_enable_decoded_walk;
 extern PGDLLIMPORT bool lion_enable_count_residual;
 
 /*
+ * Whether the count pushdown may read a partial lion index whose predicate
+ * the query implies, leaving out the restrictions that predicate implies
+ * (DESIGN.md §45).  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_count_partial;
+
+/*
  * Whether a GROUP BY ordered by its count under a LIMIT may count only the
  * groups the entries' own counts leave in the running (DESIGN.md §36).  A
  * planner switch.
@@ -1624,6 +1679,30 @@ typedef struct LionAndCost
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
 							  Node **clauses, double isect, LionAndCost *out);
+
+/*
+ * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
+ * §14, §29.2): its NULL entry taken away from that answer, or - canwalk, and
+ * LION_NOTNULL_WALK_MARGIN times cheaper - the column's other entries walked
+ * beside it, as the executor chooses (lion_scan_notnull_walks(),
+ * lion_scan.c); *walks says which.  *pages is what it reads of the index.
+ * lion_null_entry_pages() is the NULL entry's size both of them weigh.
+ */
+#define LION_NOTNULL_WALK_MARGIN	2.0
+
+extern Cost lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel,
+							  IndexOptInfo *idx, AttrNumber col, Node *clause,
+							  double rows, double ndistinct, bool canwalk,
+							  double *pages, bool *walks);
+extern double lion_null_entry_pages(double members, double containers,
+									double others);
+
+/*
+ * The index quals of a lion IndexPath a plain scan's source - and so a
+ * LionOrdered set - leaves to the recheck (lion_amcost.c).
+ */
+extern List *lion_path_rechecked_quals(PlannerInfo *root, IndexPath *path);
+
 extern double lion_containers_for(double heap_pages, double members);
 extern double lion_index_column_posting_share(PlannerInfo *root,
 											  RelOptInfo *rel,

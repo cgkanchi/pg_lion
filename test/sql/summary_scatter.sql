@@ -3,10 +3,12 @@
 --
 -- The keys below are a permutation of the row number, so each bucket's
 -- summary has a member or two at nearly every container key of the heap.  A
--- sum over such a range beside a clause with fewer rows is PROBED once its
--- walk has handed out twice that clause's rows: the rest of its sets are read
--- only at the clause's container keys, and the rows they hold among the
--- clause's are counted once.  A range taken as a source is collected into a
+-- sum over such a range beside another clause is PROBED once its walk has
+-- come to its summaries and its counts have visited twice as many containers
+-- as that clause has (2026-10-19; it used to wait until the walk had handed
+-- out twice the clause's rows): the rest of its sets are read only at the
+-- clause's container keys, and the rows they hold among the clause's are
+-- counted once.  A range taken as a source is collected into a
 -- union that grows in place.  Every count is checked against a sequential
 -- scan with the pushdown off (same); probed is EXPLAIN ANALYZE's "Range Walks
 -- Probed", collected its "Range Sources Collected".
@@ -83,11 +85,13 @@ VACUUM (FREEZE, ANALYZE) lion_sc;
 SELECT summary_tids = ntids AS covers, summary_pages > 0 AS chained
   FROM lion_index_stats('lion_sc_ts');
 
--- ---------- 1. sums: probed beside a clause with fewer rows ----------
--- Alone, within a bucket, or beside a clause with more rows than the walk
--- hands out, the sets are counted one by one as before.  s = 7 has 31 rows,
--- c = 7 and c = 3 1000, g = 3 4286; the complement's walks below and above
--- the range are probed on their own.
+-- ---------- 1. sums: probed beside another clause ----------
+-- Alone, or within a bucket - no summary to walk - the sets are counted one
+-- by one as before.  s = 7 has 31 rows at as many container keys, c = 7 and
+-- c = 3 1000 in a run of the heap at one or two, g = 3 4286 at all of them:
+-- a walk over summaries visits twice that many within its first few, and
+-- probes the rest; the complement's walks below and above the range are
+-- probed on their own.
 CREATE TABLE lion_sc_q (n int, q text);
 INSERT INTO lion_sc_q VALUES
 	(1, 'k BETWEEN 1000 AND 1300'),

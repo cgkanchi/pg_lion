@@ -226,7 +226,8 @@ lion_reader_open(Oid indexoid, LionReadPolicy policy, Snapshot snapshot,
  * locks to its new right sibling (lion_dir_split()), the spill of an INLINE
  * set copies its leaf's to the new root (lion_entry_spill_pos()), and VACUUM
  * moves a deleted CHAIN entry's root locks to its leaf
- * (lion_vacuum_delete_entries()).  A directory leaf is never deleted (§21).
+ * (lion_vacuum_delete_entries()) and a deleted directory leaf's to its right
+ * sibling, which takes its range over (lion_dir_delete.c).
  *
  * Outside a SERIALIZABLE transaction all of this does nothing, and the
  * predicate-lock manager itself returns at once for a transaction that needs

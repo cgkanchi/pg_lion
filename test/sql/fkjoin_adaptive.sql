@@ -28,7 +28,7 @@ SET pg_lion.enable_semijoin = off;
  * disabled, so that the node is EXERCISED, and again with the pushdown off
  * and sequential scans only, and compares the two as multisets; it says
  * whether the node ran and, from its EXPLAIN ANALYZE, how many times it
- * switched to a copy of the fact filters.
+ * switched to a copy of the fact filters, and whether a copy spilled.
  */
 CREATE FUNCTION lion_aj_node(q text) RETURNS jsonb
 LANGUAGE plpgsql AS $$
@@ -68,7 +68,9 @@ BEGIN
 			CASE WHEN par THEN (CASE WHEN sw > 0 THEN ', switched' ELSE ', probed' END)
 				 WHEN sw > 0 THEN format(', switched %s after %s keys', sw,
 										 node->>'Fact Filter Keys Probed')
-				 ELSE ', probed' END;
+				 ELSE ', probed' END ||
+			CASE WHEN coalesce((node->>'Fact Filter Copies Spilled')::bigint, 0) > 0
+				 THEN ', spilled' ELSE '' END;
 	END IF;
 
 	PERFORM set_config('enable_hashjoin', 'off', true);
@@ -226,8 +228,10 @@ SELECT lion_aj($$
 	WHERE d.h1 AND d.h2 AND f.doc @@ '(da | db | dc) & (dd | de)'$$);
 RESET pg_lion.enable_filter_switch;
 
--- 5. A copy that would not fit a hash table's memory is not made: at 64 kB
--- the run probes to its end.
+-- 5. A copy expected not to fit a hash table's memory is priced as spilled
+-- to a temporary file - written once, and read back by every count after it
+-- (lion_join_copy_price()) - and made where that pays, as any other: at
+-- 64 kB the run switches as it does with the memory, a little later.
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SELECT lion_aj($$

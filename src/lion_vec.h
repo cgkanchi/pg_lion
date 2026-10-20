@@ -359,19 +359,6 @@ lionvec_chain_step(Relation index, uint64 *visited, BlockNumber *nblocks)
  */
 #define LIONVEC_MARGIN_DEFAULT	3.0
 /*
- * The most partitions an index has, as the `partitions` option asks or the
- * build chooses: 2^18, what 8 sqrt(n) comes to at 2^30 rows, a little past a
- * billion, where the build's own choice stops growing (lion_vec.c; its
- * sample of at most 2^24 rows, at 16 a partition at the least, would allow
- * 2^20).  With regions (DESIGN.md §44.3) k-means and the second pass cost
- * about sqrt(C) estimates a row, not C, and an insert reads the sqrt(C)
- * regions and its beam's partitions, so that this many is a long build and
- * not an impossible one.  No partition's number is held in fewer than 32
- * bits.
- */
-#define LIONVEC_MAX_PARTS		262144
-
-/*
  * A scan stops probing once it has scored this many units of rows without
  * one entering its batch's L least upper bounds, until it has returned the
  * rows it holds; a unit is sqrt(n) / 2 rows, n the build's, the rows an
@@ -428,6 +415,20 @@ typedef enum LionVecPostfilter
 } LionVecPostfilter;
 
 /*
+ * What a build does when its sample, what half of maintenance_work_mem
+ * holds, has rows for fewer partitions than the table's rows want
+ * (lion_vec_math.h, lionvec_parts_short(); lion_vec.c,
+ * lionvec_build_report_short(); DESIGN.md §44.8):
+ * pg_lion.vector_build_sample's values.
+ */
+typedef enum LionVecBuildSample
+{
+	LIONVEC_BUILD_SAMPLE_ERROR,	/* fail the build (the default) */
+	LIONVEC_BUILD_SAMPLE_ALLOW	/* make the partitions the sample has rows
+								 * for, with a NOTICE */
+} LionVecBuildSample;
+
+/*
  * The most pages a scan asks for ahead of its reads, at each place it reads
  * from, whatever effective_io_concurrency says (lion_vec_scan.c,
  * lv_start_prefetch(); DESIGN.md §44.4, "Prefetch"): at 200 a look ahead
@@ -444,6 +445,7 @@ extern int	lionvec_exact_rows;
 extern double lionvec_exact_per_part;
 extern int	lionvec_overflow;
 extern int	lionvec_postfilter;
+extern int	lionvec_build_sample;
 extern int	lionvec_prefetch;	/* LION_READAHEAD_* (lion_readahead.h) */
 extern bool lionvec_toast_direct;
 extern bool lionvec_parallel_scan;

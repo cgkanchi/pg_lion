@@ -902,6 +902,158 @@ restart:
 	}
 }
 
+/*
+ * The most separators lion_posting_separators() collects: a level of up to
+ * LION_ISECT_KEYS pages' worth below a root (DESIGN.md §29.11), far more than
+ * any page holds, and a bound on what a damaged page's line pointers can ask
+ * for.
+ */
+#define LION_POSTING_MAX_SEPARATORS	65536
+
+/*
+ * Append the downlinks of internal posting page blk - its separators, each
+ * no lower than floor, and its children - to *seps and *kids, which hold *n
+ * of *cap; false when that would pass LION_POSTING_MAX_SEPARATORS.
+ */
+static bool
+lion_posting_collect_pivots(Relation index, Page page, BlockNumber blk,
+							uint32 floor, uint32 **seps, BlockNumber **kids,
+							int *n, int *cap)
+{
+	OffsetNumber off;
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	for (off = lion_posting_first_data(page); off <= maxoff;
+		 off = OffsetNumberNext(off))
+	{
+		uint32		sep = lion_posting_pivot_at(index, page, blk, off)->ckey;
+		BlockNumber child = lion_posting_downlink(index, page, blk, off);
+
+		if (*n >= LION_POSTING_MAX_SEPARATORS)
+			return false;
+		if (*n >= *cap)
+		{
+			*cap = Min(*cap * 2, LION_POSTING_MAX_SEPARATORS);
+			*seps = (uint32 *) repalloc(*seps, sizeof(uint32) * *cap);
+			*kids = (BlockNumber *) repalloc(*kids, sizeof(BlockNumber) * *cap);
+		}
+		(*seps)[*n] = Max(sep, floor);
+		(*kids)[*n] = child;
+		(*n)++;
+	}
+	return true;
+}
+
+uint32 *
+lion_posting_separators(Relation index, BlockNumber head, int want,
+						int maxpages, int *nsep, int *level, int *pages)
+{
+	Buffer		buf;
+	Page		page;
+	uint32	   *seps;
+	BlockNumber *kids;
+	int			n = 0;
+	int			cap = 64;
+	int			lvl;
+
+	*nsep = 0;
+	*level = 0;
+	*pages = 0;
+
+	buf = lion_posting_getbuf(index, head, head, BUFFER_LOCK_SHARE, false);
+	if (!BufferIsValid(buf))
+		return NULL;
+	(*pages)++;
+	page = BufferGetPage(buf);
+	lvl = LionPageGetOpaque(page)->level;
+
+	/*
+	 * A head that is a leaf is a tree with no internal level, which has no
+	 * separators; one at a level no descent would believe is left to the
+	 * descents to refuse.
+	 */
+	if (lvl == 0 || lvl > LION_POSTING_MAX_HEIGHT ||
+		LionPageIncompleteSplit(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return NULL;
+	}
+
+	seps = (uint32 *) palloc(sizeof(uint32) * cap);
+	kids = (BlockNumber *) palloc(sizeof(BlockNumber) * cap);
+	if (!lion_posting_collect_pivots(index, page, head, 0, &seps, &kids, &n,
+									 &cap))
+		n = 0;
+	UnlockReleaseBuffer(buf);
+
+	/*
+	 * Too few to stratify by: the level below, read whole - every child, in
+	 * key order, one page at a time and nothing held between two of them.
+	 * A child split since its parent was read keeps the right half's keys
+	 * from this list, which only makes the strata there coarser; a child
+	 * that is not a page of the set, or not one level down (only VACUUM
+	 * frees a page, and only the root changes level), ends the expansion
+	 * with the level above.
+	 */
+	while (lvl > 1 && n > 0 && n < want && *pages + n <= maxpages)
+	{
+		uint32	   *nseps;
+		BlockNumber *nkids;
+		int			m = 0;
+		int			ncap = Max(cap, 64);
+		bool		whole = true;
+		int			i;
+
+		nseps = (uint32 *) palloc(sizeof(uint32) * ncap);
+		nkids = (BlockNumber *) palloc(sizeof(BlockNumber) * ncap);
+		for (i = 0; i < n && whole; i++)
+		{
+			Buffer		cbuf;
+			Page		cpage;
+
+			CHECK_FOR_INTERRUPTS();
+			cbuf = lion_posting_getbuf(index, kids[i], head,
+									   BUFFER_LOCK_SHARE, false);
+			(*pages)++;
+			if (!BufferIsValid(cbuf))
+			{
+				whole = false;
+				break;
+			}
+			cpage = BufferGetPage(cbuf);
+			if ((int) LionPageGetOpaque(cpage)->level != lvl - 1 ||
+				!LionPageIsPostingInternal(cpage) ||
+				!lion_posting_collect_pivots(index, cpage, kids[i], seps[i],
+											 &nseps, &nkids, &m, &ncap))
+				whole = false;
+			UnlockReleaseBuffer(cbuf);
+		}
+		if (!whole || m == 0)
+		{
+			pfree(nseps);
+			pfree(nkids);
+			break;
+		}
+		pfree(seps);
+		pfree(kids);
+		seps = nseps;
+		kids = nkids;
+		n = m;
+		cap = ncap;
+		lvl--;
+	}
+	pfree(kids);
+
+	if (n == 0)
+	{
+		pfree(seps);
+		return NULL;
+	}
+	*nsep = n;
+	*level = lvl;
+	return seps;
+}
+
 BlockNumber
 lion_posting_leftmost_leaf(Relation index, uint32 hash, BlockNumber head)
 {

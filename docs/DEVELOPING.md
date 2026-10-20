@@ -5,7 +5,8 @@ Building, testing and finding your way around the source. Section numbers (§) r
 ## Supported versions and CI
 
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
-`src/lion_compat.h`.  CI (`.github/workflows/ci.yml`) builds and tests every one of those majors on
+`src/lion_compat.h`.  It needs a POSIX `mmap()`: LionOrdered's set, past `hash_mem`, lives in a
+temporary file mapped into memory (`src/lion_arena.c`, DESIGN.md §30.4, "Spilling").  CI (`.github/workflows/ci.yml`) builds and tests every one of those majors on
 each push - 16 to 19 as the PGDG packages, 19 and master also built from source with assertions and
 injection points - and on every one of them runs the unit tests (as built, and under ASan and
 UBSan), the SQL regression files in `test/sql` and the isolation specs in `test/isolation` in both

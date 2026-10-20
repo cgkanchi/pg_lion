@@ -446,9 +446,9 @@ SET hash_mem_multiplier = 1;
 -- pass the size of work_mem would be one of many)
 SET pg_lion.vector_batch = 20000;
 SELECT * FROM vf_run('EXECUTE vfd(1)') WHERE vf_run ~ 'Lion Set:|Recheck';
-                        vf_run                         
--------------------------------------------------------
-         Lion Set: 97 containers, exact, spilled 71 kB
+                         vf_run                         
+--------------------------------------------------------
+         Lion Set: 97 containers, exact, spilled 108 kB
 (1 row)
 
 SELECT vf_ord('EXECUTE vfd(1)',

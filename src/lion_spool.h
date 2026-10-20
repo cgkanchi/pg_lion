@@ -51,6 +51,15 @@ extern bool lion_spool_group_next(LionSpoolGroup *group, int *entry,
 								  uint64 *code);
 
 /*
+ * A column that stores positions (DESIGN.md §17) keeps each row's positions
+ * for a key with the row's code, through every spill and merge: these are the
+ * ones of the code lion_spool_group_next() handed out last, valid until it is
+ * called again.
+ */
+extern void lion_spool_group_positions(const LionSpoolGroup *group,
+									   LionKeyPositions *kp);
+
+/*
  * membytes is what the accumulators of all the columns may use together.  A
  * parallel participant passes the build's shared fileset and a file number no
  * other participant uses; a serial build passes NULL and spills to a private
@@ -60,20 +69,16 @@ extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes,
 								   SharedFileSet *fileset, int filenum);
 extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
-/*
- * Where a column that stores positions (DESIGN.md §17) sends each key's
- * positions in a row (lion_posbuild.c).
- */
-typedef void (*LionSpoolPosSink) (void *arg, int col, Datum key, uint64 code,
-								  const LionKeyPositions *kp);
-extern void lion_spool_set_possink(LionSpool *spool, LionSpoolPosSink sink,
-								   void *arg);
 extern double lion_spool_ntids(const LionSpool *spool);
+extern double lion_spool_nrows(const LionSpool *spool);
 
 /*
  * The build's positions (lion_posbuild.c): NULL from begin when no column
- * stores any.  A LionPageWriter is how it writes position trees: through
- * the build's own block counter and bulk writer (lion_build.c).
+ * stores any.  The build hands it each key's members in code order, as the
+ * spool's merge gives them, and gets back one chunk when they fit one, or
+ * else the root of a position tree written as they came.  A LionPageWriter
+ * is how it writes position trees: through the build's own block counter and
+ * bulk writer (lion_build.c).
  */
 typedef struct LionPageWriter
 {
@@ -84,31 +89,16 @@ typedef struct LionPageWriter
 } LionPageWriter;
 
 typedef struct LionPosBuild LionPosBuild;
-extern LionPosBuild *lion_posbuild_begin(Relation index, LionIndexState *ix,
-										 int workmem);
-/*
- * A parallel build: each participant's sink writes to files of the build's
- * shared fileset, under its file number (begin_shared), and exports them when
- * its scan is done; the leader's own LionPosBuild imports every participant's
- * (lion_posbuild_import()) before it writes the index.
- */
-extern LionPosBuild *lion_posbuild_begin_shared(Relation index,
-												LionIndexState *ix, int workmem,
-												SharedFileSet *fileset,
-												int filenum);
-extern void lion_posbuild_export(LionPosBuild *pb);
-extern void lion_posbuild_import(LionPosBuild *pb, SharedFileSet *fileset,
-								 int nparticipants, const int *filenums);
-extern void lion_posbuild_sink(void *arg, int col, Datum key, uint64 code,
-							   const LionKeyPositions *kp);
-extern bool lion_posbuild_column(LionPosBuild *pb, int col);
-extern void lion_posbuild_take(LionPosBuild *pb, Datum key, uint32 hash,
-							   const LionPageWriter *w, LionContainer **chunk,
-							   BlockNumber *root, uint64 *nmembers);
+extern LionPosBuild *lion_posbuild_begin(Relation index, LionIndexState *ix);
+extern void lion_posbuild_key_begin(LionPosBuild *pb, const LionPageWriter *w,
+									uint32 hash);
+extern void lion_posbuild_key_add(LionPosBuild *pb, uint64 code,
+								  const LionKeyPositions *kp);
+extern void lion_posbuild_key_end(LionPosBuild *pb, LionContainer **chunk,
+								  BlockNumber *root, uint64 *nmembers);
 extern BlockNumber lion_posbuild_chunk_tree(const LionPageWriter *w,
 											uint32 hash,
 											const LionContainer *chunk);
-extern void lion_posbuild_column_done(LionPosBuild *pb, int col);
 extern void lion_posbuild_end(LionPosBuild *pb);
 extern int	lion_spool_nruns(const LionSpool *spool);
 

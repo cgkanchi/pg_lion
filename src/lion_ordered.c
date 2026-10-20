@@ -93,8 +93,8 @@
 #include "utils/ruleutils.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
-#include "utils/sortsupport.h"
 #include "utils/spccache.h"
+#include "utils/tuplesort.h"
 #include "utils/typcache.h"
 #include "utils/wait_event.h"
 
@@ -145,8 +145,10 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *	LO_PRIV_LIMIT	an int8 Const: a lionvec order's (LO_FLAG_KNN), the rows
  *					its query level's LIMIT takes, OFFSET included, which the
  *					vector scan pauses by (lion_vec_scan_limit(), DESIGN.md
- *					§44.4, §44.6); -1 when the planner did not know them,
- *					and for every other plan
+ *					§44.4, §44.6), or -1 when the planner did not know them;
+ *					a btree's or a lion column's walk, the same rows when
+ *					they bound what the node returns (lo_limit()), which
+ *					bound the fetch-and-sort switch's sort (§30.4), or -1
  *
  * and custom_exprs holds six lists:
  *
@@ -191,12 +193,6 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  */
 #define LO_SWITCH_RATIO		32
 #define LO_SWITCH_MIN_WALK	10000
-
-/*
- * The members the switch fetches before it judges whether the rest will fit
- * in work_mem from the rows they gave (lo_switch()).
- */
-#define LO_SWITCH_SAMPLE	1024
 #define LO_SWITCH_DENSITY	0.5
 
 /*
@@ -437,8 +433,7 @@ lo_priv_decode(List *priv, LoPriv *out)
 		c->constisnull)
 		elog(ERROR, "LionOrdered: malformed LIMIT");
 	out->limit = DatumGetInt64(c->constvalue);
-	if (out->limit != -1 &&
-		(out->limit <= 0 || (out->flags & LO_FLAG_KNN) == 0))
+	if (out->limit != -1 && out->limit <= 0)
 		elog(ERROR, "LionOrdered: malformed LIMIT " INT64_FORMAT, out->limit);
 }
 
@@ -526,9 +521,20 @@ typedef struct LionTidSet
 /*
  * Bytes of directory the planner counts per container key, on top of the
  * container (§30.3): keys[] and conts[] grow by doubling, so about a third
- * over their entries.
+ * over their entries; and the key's first place (LionOrderedState.places).
  */
-#define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4))
+#define LO_ENTRY_BYTES		((Size) (sizeof(uint32) + sizeof(LionContainer *) + 4 + \
+									 sizeof(uint64)))
+
+/*
+ * The walk's visited bits (DESIGN.md §30.4, "Stopping early"), a bit a place
+ * of the set's members (lion_container_places()), come in chunks of this
+ * many, each made when the walk first meets a member of its places: a
+ * LIMIT walk that meets a few members clears a few chunks, not a bit for
+ * every member of the set.
+ */
+#define LO_VISITED_BITS		((uint64) LION_CONTAINER_RANGE)
+#define LO_VISITED_BYTES	((Size) (LO_VISITED_BITS / 8))
 
 /*
  * A flush of a key's gathered members (lo_gather_flush()) merges them
@@ -617,13 +623,17 @@ typedef struct LoGather
  * One scan key of a leaf, for the lazy set: its posting sets, located once
  * and let go of (no pin is held between rows, §30.5), the tree over them
  * (lion_scankey_sets()), and a stream of that tree's containers which is only
- * ever sought forward - started again when a probe is behind it.
+ * ever sought forward - started again when a probe is behind it.  A NEGATED
+ * key is `col IS NOT NULL`: its set is the column's NULL entry, taken away
+ * from what the leaf's other keys select (DESIGN.md §14, §30.4).
  */
 typedef struct LoProbeKey
 {
 	int			nsets;
 	LionPostingSet *sets;
-	LionKeyNode *tree;			/* NULL: the key selects nothing */
+	LionKeyNode *tree;			/* NULL: the key selects nothing - or, when
+								 * negated, takes nothing away */
+	bool		negated;
 	MemoryContext cxt;			/* the stream's */
 	LionSetStream *stream;		/* NULL until the first probe */
 	uint32		last;			/* the container key last sought */
@@ -671,14 +681,6 @@ typedef struct LoMemoEnt
 #define SH_DECLARE
 #define SH_DEFINE
 #include "lib/simplehash.h"
-
-/* A member fetched by the fetch-and-sort switch, with its sort keys. */
-typedef struct LoSortRow
-{
-	HeapTuple	tup;
-	Datum	   *vals;
-	bool	   *nulls;
-} LoSortRow;
 
 typedef struct LionOrderedState
 {
@@ -772,9 +774,11 @@ typedef struct LionOrderedState
 	LionArena  *arena;			/* the set past hash_mem (§30.4, "Spilling") */
 	File		arenafile;		/* its temporary file, once needed */
 	MemoryContextCallback arenacb;	/* unmaps it with the query's memory */
-	Size		spillbytes;		/* EXPLAIN: arena bytes the last build took */
+	Size		spillbytes;		/* EXPLAIN: arena bytes the last build and its
+								 * walks' visited bits took */
 	bool		exact;
 	uint64		members;		/* members of the set */
+	uint64	   *places;			/* [set->n + 1]: the places before each key */
 
 	/*
 	 * ... or the set evaluated only at the container keys the walk meets
@@ -798,27 +802,46 @@ typedef struct LionOrderedState
 	uint64		lazywhy[LO_LAZY_NWHY];	/* ... and why it was built, per build */
 
 	/*
-	 * This scan's walk (DESIGN.md §30.4): which members it has met, one
-	 * bitmap per container key touched, so that a member counts once however
-	 * often the walk meets its TID; and the fetch-and-sort switch.
+	 * This scan's walk (DESIGN.md §30.4): which members it has met, a bit a
+	 * place (places[] above), so that a member counts once however often the
+	 * walk meets its TID - the bits in chunks of LO_VISITED_BITS,
+	 * lo_set_alloc()'s as the set's memory is, within hash_mem and past it in
+	 * the arena; and the fetch-and-sort switch.
 	 */
 	MemoryContext scancxt;		/* reset per scan */
-	uint64	  **visited;		/* [set->n], NULL until touched */
-	Size		visitedbytes;
-	bool		novisit;		/* over budget: no early stop, no switch */
+	uint64	  **visited;		/* [nvisited], NULL until a member is met */
+	uint64		nvisited;		/* chunks */
 	uint64		distinct;		/* members met in this scan */
 	uint64		scanwalked;		/* entries walked in this scan */
-	int			nsort;			/* sort keys; 0: the walk never switches */
+	uint64		scanreturned;	/* rows this scan returned */
 	double		switchratio;	/* entries walked a member's fetch is worth */
 	double		expectwalk;		/* entries the planner expects the walk to visit */
-	AttrNumber *sortattnos;
-	SortSupport sortkeys;
-	bool		noswitch;		/* the switch gave up for this scan */
-	bool		sorting;		/* switched: returning srt[] */
-	MemoryContext sortcxt;		/* srt[] and its tuples, under scancxt */
-	struct LoSortRow *srt;
-	int			nsrt;
-	int			srtpos;
+
+	/*
+	 * The switch's sort (lo_switch()): a tuplesort of the members' rows, each
+	 * its sort keys - the relation's columns sortattnos[], by the pathkeys'
+	 * operators, collations and NULLS placement - and then its heap tuple's
+	 * bytes, which come out as they went in.  At most `bound` rows a scan,
+	 * the walk's included, when the plan knows that is all it can be asked
+	 * for (LO_PRIV_LIMIT); -1 otherwise.
+	 */
+	int			nsort;			/* sort keys; 0: the walk never switches */
+	AttrNumber *sortattnos;		/* [nsort] */
+	AttrNumber *sortcols;		/* [nsort] the sort tuple's: 1 .. nsort */
+	Oid		   *sortops;
+	Oid		   *sortcolls;
+	bool	   *sortnullsfirst;
+	int64		bound;
+	TupleDesc	sortdesc;		/* the keys, then the row (text) */
+	TupleTableSlot *sortin;		/* a row into the sort (virtual) */
+	TupleTableSlot *sortout;	/* ... and out of it (minimal) */
+	bool		sorting;		/* switched: returning the sort's rows */
+	MemoryContext sortcxt;		/* the sort and its scratch, under scancxt */
+	Tuplesortstate *sortstate;
+	char	   *sortitem;		/* scratch: a row's bytes, into the sort */
+	Size		sortitemcap;
+	HeapTuple	sortrow;		/* scratch: a row out of it */
+	Size		sortrowcap;
 
 	/* EXPLAIN ANALYZE */
 	uint64		walked;
@@ -830,10 +853,9 @@ typedef struct LionOrderedState
 	uint64		scans;			/* walks started */
 	uint64		switches;		/* scans that switched */
 	uint64		sortfetched;	/* members fetched by the switch */
+	bool		sorted;			/* sortstats are the last switch's */
+	TuplesortInstrumentation sortstats;
 	uint64		earlystops;		/* scans the early stop ended */
-	uint64		givenup;		/* scans whose switch gave up on work_mem */
-	uint64		givenupfetched;	/* members those switches fetched */
-	uint64		uncounted;		/* scans that stopped counting members */
 } LionOrderedState;
 
 static Plan *lo_plan_path(PlannerInfo *root, RelOptInfo *rel,
@@ -845,6 +867,7 @@ static TupleTableSlot *lo_exec(CustomScanState *node);
 static void lo_end(CustomScanState *node);
 static void lo_rescan(CustomScanState *node);
 static void lo_scan_reset(LionOrderedState *st);
+static bool lo_mark_place(LionOrderedState *st, int idx, uint32 place);
 static void lo_explain(CustomScanState *node, List *ancestors,
 					   ExplainState *es);
 
@@ -1350,13 +1373,16 @@ lo_set_pieces(PlannerInfo *root, Path *lion, double members, double ncont)
 /*
  * The bytes the set is expected to take (DESIGN.md §30.3): a directory
  * entry and a container header a key, and two bytes a member up to a
- * BITSET a key.
+ * BITSET a key; and the walk's visited bits, a bit a place, counted as a
+ * bit a member - an ARRAY's or a RUN's places are its members, a bitmap's
+ * its bits, as many bytes as the bitmap itself takes.
  */
 static double
 lo_set_bytes(double members, double ncont)
 {
 	return ncont * (LION_CONTAINER_HDRSZ + LO_ENTRY_BYTES) +
-		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES);
+		Min(members * sizeof(uint16), ncont * LION_BITSET_BYTES) +
+		members / 8.0;
 }
 
 /*
@@ -1386,10 +1412,43 @@ lo_spill_cost(double setbytes)
 }
 
 /*
+ * The quals of a lion access its set leaves to the recheck: what the plain
+ * scan's source of each of its IndexPaths leaves (lion_path_rechecked_quals(),
+ * lion_amcost.c), through a BitmapAnd.  A BitmapOr's arms are not followed:
+ * what one of them leaves is no share of the OR's rows.
+ */
+static List *
+lo_rechecked_quals(PlannerInfo *root, Path *lion)
+{
+	List	   *quals = NIL;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+		return lion_path_rechecked_quals(root, (IndexPath *) lion);
+	if (IsA(lion, BitmapAndPath))
+	{
+		foreach(lc, ((BitmapAndPath *) lion)->bitmapquals)
+			quals = list_concat(quals,
+								lo_rechecked_quals(root, (Path *) lfirst(lc)));
+	}
+	return quals;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
  * members' heap I/O is only the share of pages not all-visible.
+ *
+ * A qual the set leaves to the recheck (lo_rechecked_quals()) makes it hold
+ * more than the members: the CANDIDATES, the rows of the quals it answers,
+ * each of which the walk meets is rechecked - from the heap tuple in heap
+ * mode, where every one is fetched, and in index-only mode when the btree
+ * does not return a column the lion qual reads (lo_plan_path()'s
+ * LO_FLAG_HEAPRECHECK), where every one is fetched too, all-visible or not:
+ * the recheck reads the tuple before the visibility map is asked.  Priced as
+ * the members it was, such a set chose an index-only walk that fetched a
+ * million heap rows to throw half of them away (§40.8).
  */
 static void
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
@@ -1407,6 +1466,12 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		ncont;
 	double		walked;
 	double		fetched;
+	double		candidates;
+	double		heapfetched;
+	Selectivity candsel;
+	List	   *rechecked;
+	QualCost	rqcost;
+	bool		heaprecheck = false;
 	double		spc_random;
 	double		spc_seq;
 	double		max_io;
@@ -1418,7 +1483,32 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	Cost		run;
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
-	members = clamp_row_est(sel * tuples);
+
+	/* the set's members: the candidates, when it leaves quals to the recheck */
+	candsel = sel;
+	rechecked = lo_rechecked_quals(root, lion);
+	rqcost.startup = 0;
+	rqcost.per_tuple = 0;
+	if (rechecked != NIL)
+	{
+		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
+												  JOIN_INNER, NULL);
+
+		if (rsel > 0)
+			candsel = Min(sel / rsel, 1.0);
+		cost_qual_eval(&rqcost, lionqual, root);
+		if (indexonly)
+		{
+			Bitmapset  *lionattrs = NULL;
+			List	   *cols;
+
+			pull_varattnos((Node *) lionqual, rel->relid, &lionattrs);
+			heaprecheck = !bms_is_subset(lionattrs,
+										 lo_returned_attrs(ord->indexinfo,
+														   &cols));
+		}
+	}
+	members = clamp_row_est(candsel * tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
 	/* the lookups, the copy of their answer into the set, and its spill */
@@ -1488,6 +1578,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 			selwalk = Min(sel / both, 1.0);
 	}
 	fetched = clamp_row_est(walked * selwalk);
+	candidates = clamp_row_est(walked * Min(selwalk * candsel / sel, 1.0));
+	heapfetched = (!indexonly || heaprecheck) ? candidates : fetched;
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	{
 		Cost		s;
@@ -1498,10 +1590,10 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
 									   &ipages);
 	}
-	max_io = index_pages_fetched(fetched, rel->pages,
+	max_io = index_pages_fetched(heapfetched, rel->pages,
 								 (double) ord->indexinfo->pages, root);
-	pages_corr = ceil(Min(fetched, walked / tuples * pages));
-	if (indexonly)
+	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
+	if (indexonly && !heaprecheck)
 	{
 		/*
 		 * Only the pages the visibility map does not call all-visible are
@@ -1510,15 +1602,18 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		 */
 		max_io = ceil(max_io * (1.0 - rel->allvisfrac));
 		pages_corr = ceil(pages_corr * (1.0 - rel->allvisfrac));
-		run += fetched * cpu_operator_cost;
 	}
+	if (indexonly)
+		run += fetched * cpu_operator_cost;
 	max_io *= spc_random;
 	min_io = (pages_corr > 0) ? spc_random + (pages_corr - 1) * spc_seq : 0;
 	run += max_io + corr * corr * (min_io - max_io);
 
 	cost_qual_eval(&qcost, residual, root);
-	startup += qcost.startup + rel->reltarget->cost.startup;
-	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
+	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
+	run += heapfetched * cpu_tuple_cost +
+		candidates * rqcost.per_tuple +
+		fetched * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
@@ -3308,6 +3403,40 @@ lo_sort_keys(RelOptInfo *rel, List *pathkeys, LoPriv *p)
 	p->hassort = true;
 }
 
+/*
+ * The most rows a scan of the node can be asked for, or -1 (LO_PRIV_LIMIT):
+ * the rows its query level's LIMIT takes, OFFSET included, when nothing
+ * between the node and that Limit can drop a row the node returns or read
+ * one past them, for the fetch-and-sort switch's sort keeps no more than
+ * that (DESIGN.md §30.4).  So the LIMIT and the OFFSET are constants -
+ * root->limit_tuples is an estimate, a guess at a Param or a stable
+ * function - and not WITH TIES, which takes the rows tied with the last one
+ * too; the query level has no grouping, aggregate, DISTINCT, window or
+ * set-returning function, or limit_tuples is -1, and no other relation, nor
+ * row marks, whose LockRows skips a row it cannot lock; the node has no
+ * filter of its own, whose rejects the Limit does not count; and the node's
+ * order is the query's, so that no Sort or Incremental Sort above it reads
+ * past the rows it returns.  A partition's walk is under a MergeAppend or an
+ * Append, which reads no more of one child than it returns.
+ */
+static int64
+lo_limit(PlannerInfo *root, CustomPath *path, List *filter)
+{
+	Query	   *parse = root->parse;
+
+	if (root->limit_tuples <= 0 ||
+		parse->limitCount == NULL || !IsA(parse->limitCount, Const) ||
+		(parse->limitOffset != NULL && !IsA(parse->limitOffset, Const)) ||
+		parse->limitOption == LIMIT_OPTION_WITH_TIES ||
+		parse->rowMarks != NIL || root->rowMarks != NIL ||
+		bms_membership(root->all_baserels) != BMS_SINGLETON ||
+		filter != NIL ||
+		!pathkeys_contained_in(root->sort_pathkeys, path->path.pathkeys))
+		return -1;
+	return root->limit_tuples >= (double) PG_INT64_MAX ?
+		PG_INT64_MAX : (int64) ceil(root->limit_tuples);
+}
+
 static Plan *
 lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			 List *tlist, List *clauses, List *custom_plans)
@@ -3460,6 +3589,15 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
 	/*
+	 * The most rows a scan of the node can be asked for, which bound the
+	 * fetch-and-sort switch's sort (§30.4); a lionvec order's LIMIT is its
+	 * scan's pause, above, and never switches.
+	 */
+	if ((flags & LO_FLAG_KNN) == 0)
+		limit = lo_limit(root, best_path,
+						 extract_actual_clauses(residual, false));
+
+	/*
 	 * Index-only mode: does the lion recheck of an inexact set need the
 	 * heap tuple, the btree lacking a column of the lion qual (§40.4)?
 	 */
@@ -3599,11 +3737,6 @@ lo_spill_begin(LionOrderedState *st)
 			palloc(sizeof(LionArenaRegion) * LO_ARENA_REGIONS);
 
 		MemoryContextSwitchTo(oldcxt);
-		if (!lion_arena_available())
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("LionOrdered's set of the rows that pass the filter does not fit in hash_mem, and this platform cannot spill it to a temporary file"),
-					 errhint("Raise work_mem or hash_mem_multiplier.")));
 		lion_arena_init(arena, regions, LO_ARENA_REGIONS, lo_arena_extend,
 						lo_arena_fd, st);
 		/* registered before anything is mapped: it finds nothing to undo */
@@ -4197,6 +4330,8 @@ lo_build_set(LionOrderedState *st)
 {
 	int			i;
 
+	/* the walk's visited bits are given back before (lo_scan_reset()) */
+	Assert(st->visited == NULL);
 	MemoryContextReset(st->setcxt);
 	if (st->arena != NULL)
 		lion_arena_reset(st->arena);
@@ -4210,10 +4345,21 @@ lo_build_set(LionOrderedState *st)
 	st->set = lo_build_node(st, st->tree);
 	MemoryContextReset(st->buildcxt);
 
+	/*
+	 * The members, and the places of the walk's visited bits before each key
+	 * (§30.4, "Stopping early"): at most LION_CONTAINER_RANGE a key.
+	 */
 	st->ncont = st->set->n;
 	st->members = 0;
+	st->places = (uint64 *) lo_set_alloc(st, st->setcxt,
+										 sizeof(uint64) * ((Size) st->set->n + 1));
+	st->places[0] = 0;
 	for (i = 0; i < st->set->n; i++)
+	{
 		st->members += st->set->conts[i]->cardinality;
+		st->places[i + 1] = st->places[i] +
+			lion_container_places(st->set->conts[i]);
+	}
 	st->spillbytes = st->spilled ? lion_arena_used(st->arena) : 0;
 	st->builds++;
 }
@@ -4224,7 +4370,8 @@ lo_build_set(LionOrderedState *st)
 
 /*
  * Can every key of every leaf be sought in: a set tree - an equality or a
- * list - on a scalar column?  A range is a walk of entries, and a multi-key
+ * list - on a scalar column, or `IS NOT NULL` beside one, its column's NULL
+ * entry taken away from it?  A range is a walk of entries, and a multi-key
  * column's query may need every row; those leaves are only ever built.
  */
 static bool
@@ -4238,6 +4385,7 @@ lo_lazy_ok(LionOrderedState *st)
 	for (i = 0; i < st->nleaves; i++)
 	{
 		LoLeaf	   *leaf = &st->leaves[i];
+		bool		positive = false;
 
 		if (leaf->nkeys == 0)
 			return false;
@@ -4247,11 +4395,17 @@ lo_lazy_ok(LionOrderedState *st)
 			LionState  *col = lion_index_column_state(leaf->index,
 													  sk->sk_attno);
 
+			if ((sk->sk_flags & (SK_SEARCHNOTNULL | SK_ROW_HEADER)) ==
+				SK_SEARCHNOTNULL)
+				continue;		/* any column's: its NULL entry, subtracted */
 			if (col->multikey || sk->sk_strategy != LION_STRAT_EQUAL ||
 				(sk->sk_flags & (SK_SEARCHNULL | SK_SEARCHNOTNULL |
 								 SK_ROW_HEADER)) != 0)
 				return false;
+			positive = true;
 		}
+		if (!positive)
+			return false;		/* nothing to take a NULL entry away from */
 	}
 	return true;
 }
@@ -4303,7 +4457,8 @@ lo_lazy_empty(LoNode *node)
 	{
 		for (i = 0; i < node->leaf->nkeys; i++)
 		{
-			if (node->leaf->pkeys[i].tree == NULL)
+			if (node->leaf->pkeys[i].tree == NULL &&
+				!node->leaf->pkeys[i].negated)
 				return true;
 		}
 		return false;
@@ -4335,15 +4490,20 @@ lo_lazy_members(LoNode *node)
 
 	if (node->kind == LO_NODE_LEAF)
 	{
+		bool		first = true;
+
 		for (i = 0; i < node->leaf->nkeys; i++)
 		{
 			LoProbeKey *pk = &node->leaf->pkeys[i];
 			double		m = 0.0;
 
+			if (pk->negated)
+				continue;		/* it only takes members away */
 			if (pk->tree != NULL)
 				for (s = 0; s < pk->nsets; s++)
 					m += (double) pk->sets[s].ntids;
-			n = (i == 0) ? m : Min(n, m);
+			n = first ? m : Min(n, m);
+			first = false;
 		}
 		return n;
 	}
@@ -4403,8 +4563,36 @@ lo_lazy_begin(LionOrderedState *st)
 					return false;
 				}
 			}
-			ok = lion_scankey_sets(leaf->index, sk, &pk->nsets, &pk->sets,
-								   &pk->tree, &nomatch);
+			if ((sk->sk_flags & SK_SEARCHNOTNULL) != 0)
+			{
+				bool		implied = false;
+				int			o;
+
+				/*
+				 * Its column's NULL entry, to take away (lo_probe_node()) -
+				 * unless an equality of its column is beside it, which never
+				 * selects a NULL (lo_lazy_ok(): every other key of the leaf is
+				 * one), and there is nothing to take away.
+				 */
+				for (o = 0; o < leaf->nkeys && !implied; o++)
+					implied = (o != k &&
+							   leaf->keys[o].sk_attno == sk->sk_attno &&
+							   (leaf->keys[o].sk_flags & SK_SEARCHNOTNULL) == 0);
+				pk->negated = true;
+				pk->nsets = 1;
+				pk->sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));
+				if (!implied &&
+					lion_posting_set_lookup_null_col(leaf->index,
+													 sk->sk_attno,
+													 &pk->sets[0]))
+					pk->tree = lion_keynode_leaf(0);
+				else
+					pk->tree = NULL;
+				ok = true;
+			}
+			else
+				ok = lion_scankey_sets(leaf->index, sk, &pk->nsets, &pk->sets,
+									   &pk->tree, &nomatch);
 			for (s = 0; s < pk->nsets; s++)
 			{
 				lion_posting_set_unpin(&pk->sets[s]);
@@ -4496,11 +4684,15 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 	{
 		LoLeaf	   *leaf = node->leaf;
 
+		/* the keys that select, ANDed ... */
 		for (i = 0; i < leaf->nkeys; i++)
 		{
-			const LionContainer *c = lo_probe_at(st, &leaf->pkeys[i], ckey);
+			const LionContainer *c;
 			LionContainer *r;
 
+			if (leaf->pkeys[i].negated)
+				continue;
+			c = lo_probe_at(st, &leaf->pkeys[i], ckey);
 			if (c == NULL)
 				return NULL;
 			pgstat_count_index_tuples(leaf->index, c->cardinality);
@@ -4512,6 +4704,25 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 			r = (LionContainer *) MemoryContextAlloc(st->probecxt,
 													 LION_CONTAINER_MAX_SIZE);
 			if (lion_container_and(acc, c, r) == 0)
+				return NULL;
+			acc = r;
+		}
+		Assert(acc != NULL);	/* lo_lazy_ok(): a leaf has one */
+
+		/* ... less the NULL entries of its `IS NOT NULL` keys */
+		for (i = 0; i < leaf->nkeys; i++)
+		{
+			const LionContainer *c;
+			LionContainer *r;
+
+			if (!leaf->pkeys[i].negated)
+				continue;
+			c = lo_probe_at(st, &leaf->pkeys[i], ckey);
+			if (c == NULL)
+				continue;		/* nothing to take away at this key */
+			r = (LionContainer *) MemoryContextAlloc(st->probecxt,
+													 LION_CONTAINER_MAX_SIZE);
+			if (lion_container_andnot(acc, c, r) == 0)
 				return NULL;
 			acc = r;
 		}
@@ -4642,12 +4853,12 @@ lo_set_key_index(const LionTidSet *set, uint32 ckey)
  * the walk met and marked, which the built set no longer has.  Carried over,
  * those would let the count of members met reach the set's members while
  * live members were still ahead, and the early stop would end the scan before
- * them.  Should a whole container key be missing, the scan stops counting
- * (novisit) rather than let the switch fetch it again.
+ * them.  A key the built set has no member at any more lost only such TIDs,
+ * which no snapshot sees and the switch does not fetch.
  *
  * The lazy set goes first: the build evaluates the leaves' run-time keys
  * again, and the values the lazy sets were located from go with them.  What
- * the walk met lives in scancxt, and outlives it.
+ * the walk met lives in scancxt, and is let go as it is handed over.
  */
 static void
 lo_lazy_convert(LionOrderedState *st)
@@ -4657,9 +4868,8 @@ lo_lazy_convert(LionOrderedState *st)
 	uint32	   *mkeys;
 	uint64	  **mvisited;
 	int			nmet = 0;
-	uint64	  **visited = NULL;
-	uint64	   *img = NULL;
-	bool		lost = false;
+	uint16	   *los = NULL;
+	uint32	   *places = NULL;
 	int			i;
 
 	mkeys = (uint32 *) MemoryContextAlloc(st->scancxt,
@@ -4677,41 +4887,38 @@ lo_lazy_convert(LionOrderedState *st)
 	lo_lazy_end(st);
 
 	lo_build_set(st);
-	if (st->set->n > 0)
-	{
-		visited = (uint64 **) MemoryContextAllocZero(st->scancxt,
-													 sizeof(uint64 *) * st->set->n);
-		img = (uint64 *) palloc(LION_BITSET_BYTES);
-	}
 	st->distinct = 0;
+	if (nmet > 0 && st->set->n > 0)
+	{
+		los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+		places = (uint32 *) palloc(sizeof(uint32) * LION_CONTAINER_RANGE);
+	}
 	for (i = 0; i < nmet; i++)
 	{
-		int			idx = (visited != NULL) ?
+		int			idx = (los != NULL) ?
 			lo_set_key_index(st->set, mkeys[i]) : -1;
-		int			w;
-
-		if (idx < 0)
-		{
-			lost = true;
-			continue;
-		}
-		visited[idx] = mvisited[i];
-		st->visitedbytes += LION_BITSET_BYTES;
 
 		/* the members met at this key that the built set still has */
-		memset(img, 0, LION_BITSET_BYTES);
-		lion_container_or_into_bitset(st->set->conts[idx], img);
-		for (w = 0; w < LION_BITSET_WORDS; w++)
-			img[w] &= mvisited[i][w];
-		st->distinct += lion_container_image_cardinality(img);
+		if (idx >= 0)
+		{
+			uint32		n = lion_container_to_places(st->set->conts[idx],
+													 los, places);
+			uint32		j;
+
+			for (j = 0; j < n; j++)
+			{
+				if ((mvisited[i][los[j] >> 6] &
+					 (UINT64CONST(1) << (los[j] & 63))) != 0 &&
+					lo_mark_place(st, idx, places[j]))
+					st->distinct++;
+			}
+		}
+		pfree(mvisited[i]);
 	}
-	st->visited = visited;
-	if (img != NULL)
-		pfree(img);
-	if (lost && !st->novisit)
+	if (los != NULL)
 	{
-		st->novisit = true;
-		st->uncounted++;
+		pfree(los);
+		pfree(places);
 	}
 	pfree(mkeys);
 	pfree(mvisited);
@@ -4922,24 +5129,42 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 											"LionOrdered walk",
 											ALLOCSET_DEFAULT_SIZES);
 
-	/* the fetch-and-sort switch's sort keys (§30.4), when there are any */
-	if (priv.hassort)
+	/*
+	 * The fetch-and-sort switch's sort (§30.4), when the order has keys to
+	 * sort by: its tuples are the keys, as the relation's columns are, and
+	 * then the row's bytes; the rows a scan can be asked for at most bound
+	 * it (LO_PRIV_LIMIT, a lionvec order's pause, which never switches).
+	 */
+	st->bound = st->knn ? -1 : priv.limit;
+	if (priv.hassort && priv.nsort > 0)
 	{
+		TupleDesc	reldesc = RelationGetDescr(node->ss.ss_currentRelation);
+
 		st->nsort = priv.nsort;
 		st->sortattnos = priv.sortattno;
-		st->sortkeys = (SortSupport) palloc0(sizeof(SortSupportData) *
-											 Max(st->nsort, 1));
+		st->sortops = priv.sortop;
+		st->sortcolls = priv.sortcoll;
+		st->sortnullsfirst = priv.nullsfirst;
+		st->sortcols = (AttrNumber *) palloc(sizeof(AttrNumber) * st->nsort);
+		st->sortdesc = CreateTemplateTupleDesc(st->nsort + 1);
 		for (i = 0; i < st->nsort; i++)
 		{
-			SortSupport ssup = &st->sortkeys[i];
+			AttrNumber	attno = st->sortattnos[i];
 
-			ssup->ssup_cxt = CurrentMemoryContext;
-			ssup->ssup_collation = priv.sortcoll[i];
-			ssup->ssup_nulls_first = priv.nullsfirst[i];
-			ssup->ssup_attno = st->sortattnos[i];
-			ssup->abbreviate = false;
-			PrepareSortSupportFromOrderingOp(priv.sortop[i], ssup);
+			if (attno < 1 || attno > reldesc->natts ||
+				TupleDescAttr(reldesc, attno - 1)->attisdropped)
+				elog(ERROR, "LionOrdered: malformed sort key %d", (int) attno);
+			TupleDescCopyEntry(st->sortdesc, (AttrNumber) (i + 1), reldesc,
+							   attno);
+			st->sortcols[i] = (AttrNumber) (i + 1);
 		}
+		TupleDescInitBuiltinEntry(st->sortdesc, (AttrNumber) (st->nsort + 1),
+								  "row", TEXTOID, -1, 0);
+		TupleDescFinalize(st->sortdesc);
+		st->sortin = ExecInitExtraTupleSlot(estate, st->sortdesc,
+											&TTSOpsVirtual);
+		st->sortout = ExecInitExtraTupleSlot(estate, st->sortdesc,
+											 &TTSOpsMinimalTuple);
 	}
 
 	/* the switch's terms (§30.4, §40.4): the setting, and the planner's walk */
@@ -5335,6 +5560,21 @@ lo_start_walk(LionOrderedState *st)
 	st->done = false;
 }
 
+/*
+ * End the switch's sort, if this scan made one: its memory, under sortcxt,
+ * and its temporary files, which its resource owner would otherwise keep to
+ * the end of the query.
+ */
+static void
+lo_sort_end(LionOrderedState *st)
+{
+	if (st->sortout != NULL)
+		ExecClearTuple(st->sortout);
+	if (st->sortstate != NULL)
+		tuplesort_end(st->sortstate);
+	st->sortstate = NULL;
+}
+
 /* Forget this scan's walk: what it met, and a switch it made. */
 static void
 lo_scan_reset(LionOrderedState *st)
@@ -5353,82 +5593,122 @@ lo_scan_reset(LionOrderedState *st)
 			e->visited = NULL;
 		}
 	}
+
+	/* the visited bits, back to where lo_set_alloc() took them from */
+	if (st->visited != NULL)
+	{
+		uint64		i;
+
+		for (i = 0; i < st->nvisited; i++)
+		{
+			if (st->visited[i] != NULL)
+				lo_set_free(st, st->visited[i], LO_VISITED_BYTES);
+		}
+		lo_set_free(st, st->visited, sizeof(uint64 *) * st->nvisited);
+	}
+	st->visited = NULL;
+	st->nvisited = 0;
+
+	/* the switch's sort, and its files, before the memory it lives in */
+	lo_sort_end(st);
 	if (st->scancxt != NULL)
 		MemoryContextReset(st->scancxt);
-	st->visited = NULL;
-	st->visitedbytes = 0;
-	st->novisit = false;
 	st->distinct = 0;
 	st->scanwalked = 0;
-	st->noswitch = false;
+	st->scanreturned = 0;
 	st->sorting = false;
 	st->sortcxt = NULL;
-	st->srt = NULL;
-	st->nsrt = 0;
-	st->srtpos = 0;
-}
-
-static inline bool
-lo_visited(LionOrderedState *st, int idx, uint16 lo)
-{
-	return st->visited != NULL && st->visited[idx] != NULL &&
-		(st->visited[idx][lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0;
+	st->sortitem = NULL;
+	st->sortitemcap = 0;
+	st->sortrow = NULL;
+	st->sortrowcap = 0;
 }
 
 /*
- * Note that this scan's walk met member tid (in container idx), and say
- * whether it is the first time (DESIGN.md §30.4, "Stopping early").  One
- * bitmap per container key the walk touches, within hash_mem; past that the
- * scan stops tracking - and with it no longer stops early or switches - and
- * every meeting counts as a first, which is harmless: a TID met twice is a
- * recycled slot, never visible to the snapshot.
+ * Has this scan's walk met the member at `place` of the set's key idx
+ * (DESIGN.md §30.4, "Stopping early")?  A place past the key's - only a
+ * damaged container has a member there - never has been.
+ */
+static inline bool
+lo_visited(LionOrderedState *st, int idx, uint32 place)
+{
+	uint64		p;
+	uint64	   *chunk;
+
+	if (st->visited == NULL ||
+		(uint64) place >= st->places[idx + 1] - st->places[idx])
+		return false;
+	p = st->places[idx] + place;
+	Assert(p / LO_VISITED_BITS < st->nvisited);
+	chunk = st->visited[p / LO_VISITED_BITS];
+	return chunk != NULL &&
+		(chunk[(p % LO_VISITED_BITS) >> 6] & (UINT64CONST(1) << (p & 63))) != 0;
+}
+
+/*
+ * Note that this scan's walk met the member at `place` of the set's key idx,
+ * and say whether it is the first time (DESIGN.md §30.4, "Stopping early").
+ * The bits are the set's places, a chunk of LO_VISITED_BITS made, cleared,
+ * when the walk first meets a member of its places, through lo_set_alloc():
+ * within hash_mem with the set, and past it in the arena, so the walk
+ * counts whatever work_mem is.  A place past the key's - only a damaged
+ * container has a member there - is a first meeting every time, and marks
+ * nothing.
+ */
+static bool
+lo_mark_place(LionOrderedState *st, int idx, uint32 place)
+{
+	uint64		p;
+	uint64		c;
+	uint64	   *w;
+	uint64		bit;
+
+	if ((uint64) place >= st->places[idx + 1] - st->places[idx])
+		return true;
+	p = st->places[idx] + place;
+	if (st->visited == NULL)
+	{
+		uint64		total = st->places[st->set->n];
+		uint64		n = (total + LO_VISITED_BITS - 1) / LO_VISITED_BITS;
+
+		if (n > (uint64) (MaxAllocHugeSize / sizeof(uint64 *)))
+			elog(ERROR, "LionOrdered: %llu places of members to mark",
+				 (unsigned long long) total);
+		st->visited = (uint64 **)
+			lo_set_alloc(st, st->scancxt, sizeof(uint64 *) * (Size) n);
+		memset(st->visited, 0, sizeof(uint64 *) * (Size) n);
+		st->nvisited = n;
+	}
+	c = p / LO_VISITED_BITS;
+	Assert(c < st->nvisited);
+	if (st->visited[c] == NULL)
+	{
+		st->visited[c] = (uint64 *) lo_set_alloc(st, st->scancxt,
+												 LO_VISITED_BYTES);
+		memset(st->visited[c], 0, LO_VISITED_BYTES);
+		/* EXPLAIN's spill: the set's, and its walks' bits past hash_mem */
+		if (st->spilled)
+			st->spillbytes = Max(st->spillbytes, lion_arena_used(st->arena));
+	}
+	w = &st->visited[c][(p % LO_VISITED_BITS) >> 6];
+	bit = UINT64CONST(1) << (p & 63);
+	if ((*w & bit) != 0)
+		return false;
+	*w |= bit;
+	return true;
+}
+
+/*
+ * lo_mark_place() for member tid of the set's key idx.  A TID met twice is
+ * a recycled slot, never visible to the snapshot (§30.4).
  */
 static bool
 lo_mark(LionOrderedState *st, int idx, ItemPointer tid)
 {
 	uint16		lo = lion_code_lo(lion_tid_to_code(tid));
 
-	if (st->novisit)
-		return true;
-	if (st->visited == NULL)
-		st->visited = (uint64 **)
-			MemoryContextAllocZero(st->scancxt, sizeof(uint64 *) * st->set->n);
-	if (st->visited[idx] == NULL)
-	{
-		if (st->visitedbytes + LION_BITSET_BYTES > get_hash_memory_limit())
-		{
-			st->novisit = true;
-			st->uncounted++;
-			return true;
-		}
-		st->visited[idx] = (uint64 *)
-			MemoryContextAllocZero(st->scancxt, LION_BITSET_BYTES);
-		st->visitedbytes += LION_BITSET_BYTES;
-	}
-	if (lo_visited(st, idx, lo))
-		return false;
-	st->visited[idx][lo >> 6] |= UINT64CONST(1) << (lo & 63);
-	return true;
-}
-
-static int
-lo_cmp_rows(const void *a, const void *b, void *arg)
-{
-	const LoSortRow *ra = (const LoSortRow *) a;
-	const LoSortRow *rb = (const LoSortRow *) b;
-	LionOrderedState *st = (LionOrderedState *) arg;
-	int			i;
-
-	for (i = 0; i < st->nsort; i++)
-	{
-		int			c = ApplySortComparator(ra->vals[i], ra->nulls[i],
-											rb->vals[i], rb->nulls[i],
-											&st->sortkeys[i]);
-
-		if (c != 0)
-			return c;
-	}
-	return 0;
+	return lo_mark_place(st, idx,
+						 lion_container_place(st->set->conts[idx], lo));
 }
 
 /*
@@ -5446,7 +5726,7 @@ lo_cmp_rows(const void *a, const void *b, void *arg)
 static bool
 lo_switch_due(LionOrderedState *st, double members)
 {
-	if (st->nsort == 0 || st->noswitch || st->scanwalked < LO_SWITCH_MIN_WALK)
+	if (st->nsort == 0 || st->scanwalked < LO_SWITCH_MIN_WALK)
 		return false;
 	if ((double) st->scanwalked <
 		st->switchratio * (members - (double) st->distinct))
@@ -5459,59 +5739,111 @@ lo_switch_due(LionOrderedState *st, double members)
 }
 
 /*
+ * A row into the switch's sort: its sort keys, and its heap tuple's bytes
+ * behind the TID it goes by - the header too, so that what comes out is the
+ * tuple as it was fetched, its system columns with it, as the walk would
+ * have handed it out.  In index-only mode the slot is virtual and its tuple
+ * is formed from its values (§40.4).
+ */
+static void
+lo_sort_put(LionOrderedState *st, TupleTableSlot *slot, ItemPointer tid)
+{
+	HeapTuple	tup;
+	bool		shouldfree;
+	Size		need;
+	int			k;
+
+	tup = ExecFetchSlotHeapTuple(slot, false, &shouldfree);
+	need = VARHDRSZ + sizeof(ItemPointerData) + (Size) tup->t_len;
+	if (need > MaxAllocSize)
+		elog(ERROR, "LionOrdered: a row of %u bytes for the switch's sort",
+			 tup->t_len);
+	if (need > st->sortitemcap)
+	{
+		Size		cap = Max(need, (Size) BLCKSZ);
+
+		if (st->sortitem != NULL)
+			pfree(st->sortitem);
+		st->sortitem = (char *) MemoryContextAlloc(st->sortcxt, cap);
+		st->sortitemcap = cap;
+	}
+	SET_VARSIZE(st->sortitem, need);
+	memcpy(VARDATA(st->sortitem), tid, sizeof(ItemPointerData));
+	memcpy(VARDATA(st->sortitem) + sizeof(ItemPointerData), tup->t_data,
+		   tup->t_len);
+
+	ExecClearTuple(st->sortin);
+	for (k = 0; k < st->nsort; k++)
+		st->sortin->tts_values[k] = slot_getattr(slot, st->sortattnos[k],
+												 &st->sortin->tts_isnull[k]);
+	st->sortin->tts_values[st->nsort] = PointerGetDatum(st->sortitem);
+	st->sortin->tts_isnull[st->nsort] = false;
+	ExecStoreVirtualTuple(st->sortin);
+	tuplesort_puttupleslot(st->sortstate, st->sortin);
+	ExecClearTuple(st->sortin);
+	if (shouldfree)
+		heap_freetuple(tup);
+}
+
+/*
  * The fetch-and-sort switch (DESIGN.md §30.4, "When the walk is not paying"):
  * fetch every member this scan's walk has not met, keep the visible ones that
  * pass the lion recheck (for an inexact set) and the ordered index's own
  * clauses (they did not come through the index), and sort them by the
  * pathkeys.  Every row the walk has not returned yet is among them - a
  * visible member's index entry lies where the walk has not been - and none
- * it has returned is.  Gives up, and lets the walk go on, if the rows do not
- * fit in work_mem.
+ * it has returned is.  The sort is a tuplesort, in work_mem and past it on
+ * disk, as a Sort node's is; when the plan knows the most rows the scan can
+ * be asked for (`bound`), it keeps only as many as are left of them, the
+ * walk's rows counted, in a heap of those.  It never gives up: the rows
+ * that do not fit in memory spill, and the walk is not left to go on.
  */
-static bool
+static void
 lo_switch(LionOrderedState *st)
 {
 	Relation	heap = st->css.ss.ss_currentRelation;
-	TupleDesc	desc = RelationGetDescr(heap);
 	Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
 	TupleTableSlot *slot = st->css.ss.ss_ScanTupleSlot;
 	/* the heap tuple lands in the table AM's slot, then in the scan slot */
 	TupleTableSlot *fslot = st->indexonly ? st->tabslot : slot;
 	ExprContext *econtext = st->css.ss.ps.ps_ExprContext;
-	Size		budget = (Size) work_mem * 1024;
-	Size		used = 0;
-	double		unmet = (double) (st->members - st->distinct);
-	uint64		tried = 0;
-	int			cap = 64;
 	uint16	   *los;
+	uint32	   *places;
 	MemoryContext oldcxt;
 	int			i;
 
+	Assert(st->nsort > 0 && st->sortstate == NULL);
 	st->sortcxt = AllocSetContextCreate(st->scancxt, "LionOrdered sort",
 										ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(st->sortcxt);
+	st->sortstate = tuplesort_begin_heap(st->sortdesc, st->nsort,
+										 st->sortcols, st->sortops,
+										 st->sortcolls, st->sortnullsfirst,
+										 work_mem, NULL,
+										 TUPLESORT_ALLOWBOUNDED);
+	if (st->bound > 0 && (uint64) st->bound > st->scanreturned)
+		tuplesort_set_bound(st->sortstate,
+							st->bound - (int64) st->scanreturned);
 	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
-	st->srt = (LoSortRow *) palloc(sizeof(LoSortRow) * cap);
-	st->nsrt = 0;
+	places = (uint32 *) palloc(sizeof(uint32) * LION_CONTAINER_RANGE);
+	MemoryContextSwitchTo(oldcxt);
 
 	for (i = 0; i < st->set->n; i++)
 	{
-		uint32		n = lion_container_to_array(st->set->conts[i], los);
+		uint32		n = lion_container_to_places(st->set->conts[i], los,
+												 places);
 		uint32		j;
 
 		for (j = 0; j < n; j++)
 		{
 			ItemPointerData tid;
 			bool		all_dead = false;
-			LoSortRow  *row;
-			int			k;
 
-			if (lo_visited(st, i, los[j]))
+			if (lo_visited(st, i, places[j]))
 				continue;
 			CHECK_FOR_INTERRUPTS();
 			lion_code_to_tid(lion_make_code(st->set->keys[i], los[j]), &tid);
 			st->sortfetched++;
-			tried++;
 			/* a heap visit counts as the walk counts them in that mode (§40.6) */
 			if (st->indexonly)
 				st->fetched++;
@@ -5537,73 +5869,75 @@ lo_switch(LionOrderedState *st)
 			}
 			if (!ExecQual(st->ordrecheck, econtext))
 				continue;
-
-			if (st->nsrt == cap)
-			{
-				cap *= 2;
-				st->srt = (LoSortRow *) repalloc(st->srt, sizeof(LoSortRow) * cap);
-			}
-			row = &st->srt[st->nsrt++];
-			row->tup = ExecCopySlotHeapTuple(slot);
-			/* a virtual slot's copy has no TID of its own: the row's (§40.4) */
-			row->tup->t_self = tid;
-			row->vals = (Datum *) palloc(sizeof(Datum) * st->nsort);
-			row->nulls = (bool *) palloc(sizeof(bool) * st->nsort);
-			for (k = 0; k < st->nsort; k++)
-				row->vals[k] = heap_getattr(row->tup, st->sortattnos[k], desc,
-											&row->nulls[k]);
-			used += HEAPTUPLESIZE + row->tup->t_len +
-				st->nsort * (sizeof(Datum) + sizeof(bool)) + sizeof(LoSortRow);
-
-			/*
-			 * Too big to sort here: the walk goes on (§30.4).  Known once
-			 * the rows kept pass work_mem, or foreseen as soon as the
-			 * members tried are enough to go by: the rows so far, scaled
-			 * to every member not met, members fetched in TID order being
-			 * a fair sample of them.  A switch that would fail at the end
-			 * fetches a part of what it would have, not all of it.
-			 */
-			if (used > budget ||
-				(tried >= LO_SWITCH_SAMPLE &&
-				 (double) used * unmet / (double) tried > (double) budget))
-			{
-				MemoryContextSwitchTo(oldcxt);
-				MemoryContextDelete(st->sortcxt);
-				st->sortcxt = NULL;
-				st->srt = NULL;
-				st->nsrt = 0;
-				st->noswitch = true;
-				st->givenup++;
-				st->givenupfetched += tried;
-				ExecClearTuple(slot);
-				return false;
-			}
+			lo_sort_put(st, slot, &tid);
 		}
 	}
-	MemoryContextSwitchTo(oldcxt);
 	ExecClearTuple(slot);
+	pfree(los);
+	pfree(places);
 
-	qsort_arg(st->srt, st->nsrt, sizeof(LoSortRow), lo_cmp_rows, st);
+	tuplesort_performsort(st->sortstate);
+	tuplesort_get_stats(st->sortstate, &st->sortstats);
+	st->sorted = true;
 	st->sorting = true;
-	st->srtpos = 0;
 	st->switches++;
-	return true;
 }
 
+/*
+ * The switch's next row, as the walk would have handed it out: its heap
+ * tuple, the TID it goes by, in the scan slot.
+ */
 static TupleTableSlot *
 lo_sort_next(LionOrderedState *st, TupleTableSlot *slot)
 {
+	Oid			relid = RelationGetRelid(st->css.ss.ss_currentRelation);
 	HeapTuple	tup;
+	Datum		d;
+	bool		isnull;
+	const char *item;
+	Size		len;
+	Size		tlen;
 
-	if (st->srtpos >= st->nsrt)
+	if (!tuplesort_gettupleslot(st->sortstate, true, false, st->sortout, NULL))
 	{
 		st->done = true;
 		return ExecClearTuple(slot);
 	}
-	tup = st->srt[st->srtpos++].tup;
+	d = slot_getattr(st->sortout, st->nsort + 1, &isnull);
+	len = isnull ? 0 : VARSIZE_ANY_EXHDR(DatumGetPointer(d));
+	if (len < sizeof(ItemPointerData) + SizeofHeapTupleHeader)
+		elog(ERROR, "LionOrdered: a row of %zu bytes out of the switch's sort",
+			 len);
+	item = VARDATA_ANY(DatumGetPointer(d));
+	tlen = len - sizeof(ItemPointerData);
+
+	/* in memory of its own, MAXALIGNed, as a heap tuple's header must be */
+	if (HEAPTUPLESIZE + tlen > st->sortrowcap)
+	{
+		Size		cap = Max(HEAPTUPLESIZE + tlen, (Size) BLCKSZ);
+
+		if (st->sortrow != NULL)
+			pfree(st->sortrow);
+		st->sortrow = (HeapTuple) MemoryContextAlloc(st->sortcxt, cap);
+		st->sortrowcap = cap;
+	}
+	tup = st->sortrow;
+	tup->t_data = (HeapTupleHeader) ((char *) tup + HEAPTUPLESIZE);
+	memcpy(&tup->t_self, item, sizeof(ItemPointerData));
+	memcpy(tup->t_data, item + sizeof(ItemPointerData), tlen);
+	tup->t_len = (uint32) tlen;
+	tup->t_tableOid = relid;
+
+	/*
+	 * A buffer slot copies the tuple; a virtual one (§40.4) points into it,
+	 * and is given a copy of its own, as the next row overwrites it.
+	 */
 	ExecForceStoreHeapTuple(tup, slot, false);
+	if (st->indexonly)
+		ExecMaterializeSlot(slot);
 	slot->tts_tid = tup->t_self;
-	slot->tts_tableOid = RelationGetRelid(st->css.ss.ss_currentRelation);
+	slot->tts_tableOid = relid;
+	st->scanreturned++;
 	return slot;
 }
 
@@ -5682,7 +6016,7 @@ lo_next(ScanState *ss)
 				lo_lazy_convert(st);
 			}
 		}
-		counted = !st->noset && !st->lazy && !st->novisit;
+		counted = !st->noset && !st->lazy;
 
 		/*
 		 * Every member met: nothing further along can be one (§30.4,
@@ -5700,9 +6034,11 @@ lo_next(ScanState *ss)
 		 * fetch and sort those instead (§30.4, "When the walk is not
 		 * paying").
 		 */
-		if (counted && lo_switch_due(st, (double) st->members) &&
-			lo_switch(st))
+		if (counted && lo_switch_due(st, (double) st->members))
+		{
+			lo_switch(st);
 			return lo_sort_next(st, slot);
+		}
 
 		tid = lo_next_tid(st);
 		if (tid == NULL)
@@ -5795,6 +6131,7 @@ lo_next(ScanState *ss)
 			PredicateLockPage(ss->ss_currentRelation,
 							  ItemPointerGetBlockNumber(&st->scan->xs_heaptid),
 							  ss->ps.state->es_snapshot);
+		st->scanreturned++;
 		return slot;
 	}
 	st->done = true;
@@ -5875,6 +6212,7 @@ lo_end(CustomScanState *node)
 		ExecClearTuple(st->tabslot);
 	if (st->owalk != NULL)
 		lo_walk_end(st);
+	lo_sort_end(st);
 #if PG_VERSION_NUM < 200000
 	if (st->fetch != NULL)
 		table_index_fetch_end(st->fetch);
@@ -6081,17 +6419,18 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							 (unsigned long long) st->sortfetched);
 			ExplainPropertyText("Switched to Fetch and Sort", buf.data, es);
 		}
-		if (st->givenup > 0)
+		if (st->sorted)
 		{
-			resetStringInfo(&buf);
-			appendStringInfo(&buf, "%llu scans, %llu members fetched",
-							 (unsigned long long) st->givenup,
-							 (unsigned long long) st->givenupfetched);
-			ExplainPropertyText("Fetch and Sort Given Up", buf.data, es);
+			/* the last switch's sort, as a Sort node shows its last run's */
+			ExplainPropertyText("Fetch and Sort Method",
+								tuplesort_method_name(st->sortstats.sortMethod),
+								es);
+			ExplainPropertyInteger("Fetch and Sort Space Used", "kB",
+								   st->sortstats.spaceUsed, es);
+			ExplainPropertyText("Fetch and Sort Space Type",
+								tuplesort_space_type_name(st->sortstats.spaceType),
+								es);
 		}
-		if (st->uncounted > 0)
-			ExplainPropertyInteger("Scans Not Counting Members", NULL,
-								   (int64) st->uncounted, es);
 		if (st->earlystops > 0)
 			ExplainPropertyInteger("Scans Stopped Early", NULL,
 								   (int64) st->earlystops, es);

@@ -345,6 +345,144 @@ typedef struct LionVecSample
 extern void lionvec_sample_row(const LionVecSample *s, int i, float *x);
 
 /*
+ * The most partitions an index has, as the `partitions` option asks or the
+ * build chooses: 2^18, what 8 sqrt(n) comes to at 2^30 rows, a little past a
+ * billion, where the build's own choice stops growing (lionvec_parts(); its
+ * sample of at most 2^24 rows, at 16 a partition at the least, would allow
+ * 2^20).  With regions (DESIGN.md §44.3) k-means and the second pass cost
+ * about sqrt(C) estimates a row, not C, and an insert reads the sqrt(C)
+ * regions and its beam's partitions, so that this many is a long build and
+ * not an impossible one.  No partition's number is held in fewer than 32
+ * bits.
+ */
+#define LIONVEC_MAX_PARTS		262144
+
+/*
+ * The build's sample (lion_vec.c, DESIGN.md §44.3): a reservoir of as many
+ * rows as half of maintenance_work_mem holds, each its 8-bit codes and its
+ * scale, dimsp + 4 bytes, 1,540 at 1536 dimensions; and never more than
+ * LIONVEC_SAMPLE_MAX rows, 64 a partition at LIONVEC_MAX_PARTS, half of
+ * what k-means is given a partition at most (LIONVEC_SAMPLE_PER_PART_MAX),
+ * 25.8 GB at 1536 dimensions, which a maintenance_work_mem of 52 GB
+ * reaches.
+ */
+#define LIONVEC_SAMPLE_MAX		(1 << 24)
+#define LIONVEC_SAMPLE_ROW_SIZE(dimsp)	((int64) (dimsp) + (int64) sizeof(float))
+
+/*
+ * The rows the reservoir holds at a maintenance_work_mem of mem kilobytes,
+ * half of it, of dimsp dimensions: at most LIONVEC_SAMPLE_MAX, and at
+ * least one.
+ */
+static inline int
+lionvec_sample_max(int64 mem, int dimsp)
+{
+	int64		rows = mem * 512 / LIONVEC_SAMPLE_ROW_SIZE(dimsp);
+
+	return (int) Max(Min(rows, (int64) LIONVEC_SAMPLE_MAX), 1);
+}
+
+/*
+ * ... and the least maintenance_work_mem, in kilobytes, at which it holds
+ * rows rows of dimsp dimensions, rows being 1 to LIONVEC_SAMPLE_MAX.
+ */
+static inline int64
+lionvec_sample_mem(int64 rows, int dimsp)
+{
+	return (rows * LIONVEC_SAMPLE_ROW_SIZE(dimsp) + 511) / 512;
+}
+
+/*
+ * The partitions the build chooses by itself: one for a table of fewer
+ * than LIONVEC_MIN_AUTO_ROWS rows, and LIONVEC_PARTS_PER_ROOT times the
+ * square root of the rows for a larger, no more than the sample has
+ * LIONVEC_SAMPLE_PER_PART rows for.  8 sqrt(n) is 8,000 for a million rows,
+ * where it was 2 sqrt(n): partitions a quarter the size read 1.55 to 1.78
+ * times fewer rows for the same recall in the numpy model of DBpedia's
+ * text-embedding-3-large rows, and 1.5 times fewer CODE pages for 0.95 of
+ * the true ten on an index of 115,186 of them - no faster there, where
+ * ranking four times the centroids costs what the pages save (DESIGN.md
+ * §44.3, §44.9).  The build's time grows with the partitions.
+ */
+#define LIONVEC_SAMPLE_PER_PART	16
+#define LIONVEC_MIN_AUTO_ROWS	10000
+#define LIONVEC_PARTS_PER_ROOT	8.0
+
+/*
+ * How many partitions the build makes of nrows rows with a vector, its
+ * reservoir holding sampled of them: asked, the index's `partitions`
+ * option, when that is set (above 0), or else as above.  Never more than
+ * the sample's rows nor LIONVEC_MAX_PARTS, and none without a row.
+ */
+static inline int
+lionvec_parts(int asked, double nrows, int64 sampled)
+{
+	double		want;
+
+	if (nrows < 1.0 || sampled < 1)
+		return 0;
+	if (asked > 0)
+		want = asked;
+	else if (nrows < LIONVEC_MIN_AUTO_ROWS)
+		want = 1.0;
+	else
+		want = Min(LIONVEC_PARTS_PER_ROOT * sqrt(nrows),
+				   Max(1.0, floor((double) sampled / LIONVEC_SAMPLE_PER_PART)));
+	want = Min(want, (double) sampled);
+	return (int) Max(1.0, Min(want, (double) LIONVEC_MAX_PARTS));
+}
+
+/*
+ * The partitions the build wants of nrows rows: lionvec_parts() of a sample
+ * of every row.  The reservoir stops at LIONVEC_SAMPLE_MAX rows, which have
+ * LIONVEC_SAMPLE_PER_PART rows for more partitions than LIONVEC_MAX_PARTS
+ * (below), so that the cap takes none away: a build makes fewer partitions
+ * than this only where maintenance_work_mem holds fewer rows than the
+ * table has (lionvec_parts_short(), below; DESIGN.md §44.8).  Past
+ * 1.07 billion rows LIONVEC_MAX_PARTS is all the build wants, whatever the
+ * memory.
+ */
+static inline int
+lionvec_parts_wanted(int asked, double nrows)
+{
+	return lionvec_parts(asked, nrows,
+						 nrows < (double) LIONVEC_SAMPLE_MAX ? (int64) nrows :
+						 (int64) LIONVEC_SAMPLE_MAX);
+}
+
+StaticAssertDecl((int64) LIONVEC_SAMPLE_PER_PART * LIONVEC_MAX_PARTS <= LIONVEC_SAMPLE_MAX,
+				 "lionvec: the reservoir's cap takes no partition away");
+
+/*
+ * The least sample in which nparts partitions are made: LIONVEC_SAMPLE_PER_PART
+ * rows each when the build chooses them, and one each when the option asks
+ * for them.  For nparts the partitions some table wants
+ * (lionvec_parts_wanted()), a reservoir of these rows makes them, and a
+ * reservoir of one row fewer does not, but for a table of fewer than
+ * LIONVEC_MIN_AUTO_ROWS rows, whose one partition any sample makes.
+ */
+static inline int64
+lionvec_parts_sample(int asked, int nparts)
+{
+	return asked > 0 ? (int64) nparts : (int64) nparts * LIONVEC_SAMPLE_PER_PART;
+}
+
+/*
+ * Whether a reservoir of at most smax rows makes fewer partitions of nrows
+ * rows than they want: never when it holds every row, nrows <= smax.  With
+ * smax fixed it stays true as nrows grows, once it is - the partitions made
+ * stop at what smax rows allow, and those wanted only grow - which the
+ * build's first pass rests on, failing at the first row that makes it true
+ * (lion_vec.c), and the unit tests check.
+ */
+static inline bool
+lionvec_parts_short(int asked, double nrows, int64 smax)
+{
+	return nrows > (double) smax &&
+		lionvec_parts(asked, nrows, smax) < lionvec_parts_wanted(asked, nrows);
+}
+
+/*
  * The sample k-means is given (lion_vec.c, DESIGN.md §44.3) is at most a
  * fixed number of rows a partition of the reservoir's, which may hold many
  * more: m of the slots [0, n), 0 <= m <= n, chosen uniformly at random by a
