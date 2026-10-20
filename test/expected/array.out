@@ -370,9 +370,9 @@ SELECT lion_arrcmp($$SELECT id FROM lion_arr WHERE tags IS NOT NULL$$);
 (1 row)
 
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags IS NULL$$);
-    lion_arrcmp     
---------------------
- index scan, 1 rows
+     lion_arrcmp     
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ---- array = (the rows holding every element, rechecked) -------------
@@ -898,9 +898,9 @@ SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
 (1 row)
 
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a IS NULL$$);
-    lion_arrcmp     
---------------------
- index scan, 1 rows
+     lion_arrcmp     
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- The third key-less entry, NULLELEMS (arrays whose elements are all NULL),

@@ -163,6 +163,29 @@ select together (DESIGN.md §5, SCAN step 5).
 combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
 index scans only, as GIN answers them.
 
+Whether an array is empty is answered from an `array_ops` index too, which keeps a column's NULL
+arrays, its empty ones and the rest apart (DESIGN.md §17, "Non-empty arrays"). `count(*)` pushes
+down, with no heap visit:
+
+    cardinality(tags) > 0           also >= 1, <> 0; array_length(tags, 1) IS NOT NULL, > 0,
+                                    >= 1, >= 0; array_ndims(tags) > 0; tags <> '{}'
+    tags IS DISTINCT FROM '{}'      also cardinality(tags) IS DISTINCT FROM 0 (NULLs included)
+    tags = '{}'                     also cardinality(tags) = 0, < 1
+    array_length(tags, 1) IS NULL   also coalesce(cardinality(tags), 0) = 0 (NULLs included)
+    tags IS NULL, tags IS NOT NULL  also cardinality(tags) IS NULL, cardinality(tags) >= 0
+
+in any combination on one column (`tags IS NOT NULL AND array_length(tags, 1) > 0`), either way
+round, with integer constants of any width, and under `NOT`, `IS TRUE`, `IS NOT FALSE` and the
+like; in the `WHERE`, a `FILTER`, an `OR`, beside a `GROUP BY`. An array has an element whatever its
+dimensions and lower bounds, and when its elements are all NULL (`'{NULL}'`). Left to the heap, as
+a filter: a test some non-empty arrays pass and others fail (`array_length(tags, 1) > 1`,
+`array_ndims(tags) = 1`, `array_lower(tags, 1) = 1`), a dimension other than 1, a bound that is a
+parameter, and, beside a multi-key query known only at run time, one that NULLs pass. The planner
+estimates the rows from the column's statistics, where it would otherwise take these as functions
+it knows nothing of. Bitmap and index scans cannot use them: PostgreSQL hands an index no function
+of a column, nor `<>`, so only `tags = '{}'` reaches one (answered as every row, rechecked) and
+`IS [NOT] NULL` (exact).
+
 A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
 is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
 (`a & !b`, `a <-> !b`) are answered exactly from the index: bitmap and index scans need no recheck,

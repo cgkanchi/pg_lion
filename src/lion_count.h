@@ -1809,6 +1809,26 @@ extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
  */
 extern Node *lion_or_as_array(Node *clause);
 extern Node *lion_canonical_clause(Node *clause);
+
+/*
+ * A predicate on one array column that is true of every row of each of the
+ * three classes a lion array column's entries tell apart, or of none
+ * (DESIGN.md §17, "Non-empty arrays"): the column NULL, an array with no
+ * element, and one with an element (lion_plan_nonempty.c).
+ */
+typedef struct LionNonEmpty
+{
+	Var		   *var;			/* the column */
+	bool		isnull;			/* selects the rows whose column is NULL */
+	bool		isempty;		/* ... whose array has no element */
+	bool		nonempty;		/* ... whose array has one or more */
+} LionNonEmpty;
+
+extern bool lion_nonempty_test(Node *clause, LionNonEmpty *ne);
+extern Node *lion_nonempty_clause(const LionNonEmpty *ne);
+extern bool lion_nonempty_index(IndexOptInfo *idx, AttrNumber col);
+extern List *lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses,
+									   bool *changed);
 #if PG_VERSION_NUM < 180000
 
 /*

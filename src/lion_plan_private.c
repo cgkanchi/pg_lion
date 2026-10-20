@@ -124,7 +124,7 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 		cl->idxoid = list_nth_oid(oids, 3 + i);
 		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(ops, i);
-		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_NOTMULTI)
+		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_MAXKIND)
 			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
 		if (cl->walk && cl->kind != LION_CLAUSE_RANGESRC)
 			elog(ERROR, "LionCount: a clause of kind %d walked", cl->kind);

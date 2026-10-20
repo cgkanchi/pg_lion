@@ -3715,13 +3715,18 @@ lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 
 /*
  * rel's restriction clauses as lion's estimates take them: an OR of
- * equalities as the IN list it spells (lion_or_as_array()), every other
- * clause as it is; and whether any of them differs from core's.
+ * equalities as the IN list it spells (lion_or_as_array()), the tests of
+ * whether a lion-indexed array is empty on each column as the one clause of
+ * whole-array statistics they come to together (lion_nonempty_rel_clauses(),
+ * DESIGN.md §17 "Non-empty arrays"), every other clause as it is; and
+ * whether any of them differs from core's.
  */
 static List *
 lion_rel_canonical_clauses(RelOptInfo *rel, bool *changed)
 {
 	List	   *result = NIL;
+	List	   *nonempty;
+	bool		nechanged;
 	ListCell   *lc;
 
 	*changed = false;
@@ -3739,7 +3744,11 @@ lion_rel_canonical_clauses(RelOptInfo *rel, bool *changed)
 		else
 			result = lappend(result, rinfo);
 	}
-	return result;
+	nonempty = lion_nonempty_rel_clauses(rel, result, &nechanged);
+	list_free(result);
+	if (nechanged)
+		*changed = true;
+	return nonempty;
 }
 
 /*
@@ -3885,6 +3894,19 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 }
 
 /*
+ * Does rel test whether a lion-indexed array is empty in a way core estimates
+ * otherwise than lion does (lion_nonempty_rel_clauses())?
+ */
+static bool
+lion_nonempty_rel_changes(RelOptInfo *rel)
+{
+	bool		changed;
+
+	list_free(lion_nonempty_rel_clauses(rel, rel->baserestrictinfo, &changed));
+	return changed;
+}
+
+/*
  * set_rel_pathlist_hook, first: rel's row count as the intersection probe
  * measures its restriction clauses (DESIGN.md §29.11, "The relation's rows").
  * Where the probe found the AND of the set clauses of one lion index at least
@@ -3897,6 +3919,12 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
  * ParamPathInfo's are the same restriction clauses with its join clauses
  * ANDed in, and take the same factor.  Joins are sized from rel->rows after
  * this, and the paths and Gathers built from here on read it.
+ *
+ * The same goes for the tests of whether a lion-indexed array is empty
+ * (DESIGN.md §17, "Non-empty arrays"), which core estimates one at a time
+ * from no statistics at all - `array_length(a, 1) IS NOT NULL` at 0.995 and
+ * `cardinality(a) > 0` at a third, multiplied when both are there - and lion
+ * as the one whole-array comparison they come to (lion_probe_rel_rows()).
  *
  * Only a plain relation of its own: an inheritance parent's rows are its
  * children's sum, made before any child's paths are built, and a child's
@@ -3911,10 +3939,13 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
-	if (!lion_enable_rows_correction || !lion_enable_intersection_probe ||
+	if (!lion_enable_rows_correction ||
 		root->glob == NULL || rel->reloptkind != RELOPT_BASEREL ||
-		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL ||
-		lion_isect_rel_factor(root, rel) == 1.0)
+		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL)
+		return;
+	if (!lion_nonempty_rel_changes(rel) &&
+		(!lion_enable_intersection_probe ||
+		 lion_isect_rel_factor(root, rel) == 1.0))
 		return;
 
 	newrows = lion_probe_rel_rows(root, rel);

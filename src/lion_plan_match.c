@@ -681,6 +681,13 @@ lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
  * different function might not.  An OR's leaf the posting sets only bound
  * (`positions`) needs a column that stores positions, which decide it.
  *
+ * A null test is answered by a column's NULL entry, which a multi-key column
+ * has as a scalar one does (DESIGN.md §14, §17): by a scalar column, and by
+ * a multi-key one where no index has the column as a scalar one
+ * (LION_CLAUSE_ANY_COLUMN()).  Whether an array is empty (§17, "Non-empty
+ * arrays") is answered by a column of lion's array_ops alone
+ * (lion_nonempty_index()).
+ *
  * Every partition is checked separately, because nothing stops one of them
  * from carrying a lion index built with a different opclass.  Inside the
  * scope of a partial index (DESIGN.md §45) that index answers the clause
@@ -690,13 +697,36 @@ static bool lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind,
 							   Oid opno, Oid cmptype, StrategyNumber strategy,
 							   Oid extractquery, Oid exprcoll,
 							   bool positions);
+static IndexOptInfo *lion_match_index_of(RelOptInfo *rel, AttrNumber attno,
+										 bool multikey, int kind, Oid opno,
+										 Oid cmptype, StrategyNumber strategy,
+										 Oid extractquery, Oid exprcoll,
+										 bool positions, AttrNumber *colp);
 
 IndexOptInfo *
 lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
 				Oid exprcoll, bool positions, AttrNumber *colp)
 {
-	bool		multikey = LION_CLAUSE_IS_MULTI(kind);
+	IndexOptInfo *idx;
+
+	idx = lion_match_index_of(rel, attno, LION_CLAUSE_IS_MULTI(kind), kind,
+							  opno, cmptype, strategy, extractquery, exprcoll,
+							  positions, colp);
+	if (idx == NULL && LION_CLAUSE_ANY_COLUMN(kind))
+		idx = lion_match_index_of(rel, attno, true, kind, opno, cmptype,
+								  strategy, extractquery, exprcoll,
+								  positions, colp);
+	return idx;
+}
+
+/* ... with an index column of the kind asked (lion_index_key_col()). */
+static IndexOptInfo *
+lion_match_index_of(RelOptInfo *rel, AttrNumber attno, bool multikey,
+					int kind, Oid opno, Oid cmptype, StrategyNumber strategy,
+					Oid extractquery, Oid exprcoll, bool positions,
+					AttrNumber *colp)
+{
 	IndexOptInfo *part = lion_partial_index_of(rel);
 	Node	   *vcol;
 	AttrNumber	col = 0;
@@ -744,6 +774,23 @@ lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
 	if (OidIsValid(exprcoll) && OidIsValid(idx->indexcollations[i]) &&
 		idx->indexcollations[i] != exprcoll)
 		return false;
+
+	/*
+	 * Whether an array is empty (DESIGN.md §17, "Non-empty arrays") is read
+	 * off the reserved entries, which only lion's array_ops fills in the
+	 * order it needs: an index column that is not one may file a non-empty
+	 * array under EMPTY.
+	 */
+	if (kind == LION_CLAUSE_RESERVED || kind == LION_CLAUSE_NOTRESERVED)
+		return lion_nonempty_index(idx, col);
+
+	/*
+	 * A null test answered by a multi-key column (lion_match_index()) asks
+	 * nothing of its opclass: every NULL the column holds is in its NULL
+	 * entry, whatever the opclass extracts from the other values.
+	 */
+	if (LION_CLAUSE_ANY_COLUMN(kind))
+		return true;
 
 	if (multikey)
 	{
@@ -1448,7 +1495,19 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 	if (clause == NULL)
 		return false;
 
-	if (lion_boolean_eq_test(clause, &boolvar, &boolval))
+	if (lion_nonempty_leaf(clause, out))
+	{
+		/*
+		 * Whether an array is empty (DESIGN.md §17, "Non-empty arrays"):
+		 * `cardinality(tags) > 0`, `array_length(tags, 1) IS NOT NULL`,
+		 * `tags <> '{}'` and the other spellings lion_nonempty_leaf() takes,
+		 * each the rows of the column's reserved entries or the rows outside
+		 * them.  The second is a negated source, as `IS NOT NULL` is.
+		 */
+		if (!allow_negated && LION_CLAUSE_IS_NEGATED(out->kind))
+			return false;
+	}
+	else if (lion_boolean_eq_test(clause, &boolvar, &boolval))
 	{
 		/*
 		 * A boolean column by itself (lion_boolean_eq_test()): the equality
