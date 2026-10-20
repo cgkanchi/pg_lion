@@ -44,15 +44,19 @@
 
 name: CI
 
+# Pull requests, and pushes to main, run automatically; any other branch runs
+# only when started by hand (workflow_dispatch), so parallel branches don't
+# queue the runners.
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push to the same branch or pull request supersedes a run still in
+# A newer push to the same pull request or branch supersedes a run still in
 # progress, which is cancelled; every commit that reaches main runs in full.
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
