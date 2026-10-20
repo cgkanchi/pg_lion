@@ -19,6 +19,10 @@ static LionQueryMode lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col,
 											 Node *clause, double *nkeys);
 static Cost lion_range_recheck(PlannerInfo *root, RelOptInfo *rel,
 							   double tids, double entries, double corr);
+static double lion_bitmap_width(double tuples, double heap_pages);
+static double lion_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
+										IndexOptInfo *idx, AttrNumber col,
+										double *colbytes);
 
 /*
  * Cost the pushdown (DESIGN.md section 10).
@@ -237,23 +241,59 @@ lion_index_column_share(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
  * pages where they hold a tenth of it, and `status = 'val2'` - a million
  * rows over every container key - was priced at 16 for a 1 ms count.
  *
- * So each column is weighed by the bytes its sets take: nd entries of N / nd
- * rows each, which lie in Min(container keys, N / nd) containers of a header
- * each (16 bytes with its line pointer) and two bytes a member up to a
- * bitset's 4 kB, or about six bytes a row where the rows are too few a
- * container for one (a sparse segment, §13).  On that 110 MB index the
- * estimate comes to 114 MB, the 2,000-value column 44% of it.
+ * So each column is weighed by the bytes its sets take (lion_set_bytes()):
+ * nd entries of N / nd rows each, which lie in Min(container keys, N / nd)
+ * containers.  On that 110 MB index the estimate comes to 114 MB, the
+ * 2,000-value column 44% of it.
  */
 double
 lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, AttrNumber col)
 {
-	double		tuples = Max(rel->tuples, 1.0);
+	return lion_column_posting_share(root, rel, idx, col, NULL);
+}
+
+/*
+ * The bytes the posting sets of `members` rows of rel in `containers`
+ * containers take (DESIGN.md §13, §24, §38): a header each (16 bytes with its
+ * line pointer) and two bytes a member, up to a bitset's 4 kB - or, past 256
+ * k members, a NARROW of k words a block, 512 k bytes, where the heap's rows
+ * take k words (lion_bitmap_width()): the smallest of them, which is what a
+ * build writes (lion_container_optimize()) - or about six bytes a row where
+ * the rows are too few a container for one (a sparse segment, §13).  A dense
+ * set of a built index weighed as ARRAYs is given up to three times the pages
+ * it takes.
+ */
+static double
+lion_set_bytes(RelOptInfo *rel, double members, double containers)
+{
+	double		cap = (double) LION_WIDTH_BYTES(1) *
+		lion_bitmap_width(rel->tuples, (double) rel->pages);
+
+	members = Max(members, 0.0);
+	containers = Max(containers, 1.0);
+	if (members / containers <= 2.0)
+		return members * 3.0;
+	return containers * LION_CONTAINER_ITEM_BYTES +
+		Min(2.0 * members, containers * cap);
+}
+
+/*
+ * ... and, into *colbytes when it is not NULL, the bytes of the column's sets
+ * the share is of, or 0 where the shares are not known.
+ */
+static double
+lion_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
+						  IndexOptInfo *idx, AttrNumber col, double *colbytes)
+{
+	double		tuples = lion_index_rows(root, rel, idx);
 	double		ckeys = Max((double) rel->pages / LION_BLOCKS_PER_CONTAINER, 1.0);
 	double		total = 0;
 	double		mine = 0;
 	int			i;
 
+	if (colbytes != NULL)
+		*colbytes = 0.0;
 	if (!lion_index_shares_known(root, rel, idx))
 		return 1.0;
 
@@ -261,18 +301,12 @@ lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 	{
 		double		nd = lion_index_column_nd(root, rel, idx, i);
 		double		rows;
-		double		conts;
 		double		bytes;
 
 		if (nd < 0.0)
 			return 1.0 / (double) idx->nkeycolumns;
 		rows = tuples / nd;
-		conts = Min(ckeys, rows);
-		if (rows / conts <= 2.0)
-			bytes = nd * rows * 3.0;
-		else
-			bytes = nd * (conts * 16.0 +
-						  Min(2.0 * rows, conts * (double) LION_BITSET_BYTES));
+		bytes = nd * lion_set_bytes(rel, rows, Min(ckeys, rows));
 		total += bytes;
 		if (i == col - 1)
 			mine = bytes;
@@ -281,7 +315,62 @@ lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 	if (total <= 0.0 || mine <= 0.0)
 		return 1.0 / (double) idx->nkeycolumns;
 
+	if (colbytes != NULL)
+		*colbytes = mine;
 	return Min(mine / total, 1.0);
+}
+
+/*
+ * The posting pages of a set of `members` rows in `containers` containers of
+ * key column col of lion index idx: its share of the column's container pages
+ * by the bytes it takes of the column's (lion_set_bytes()) - not by its rows,
+ * since a bitmap container takes its bytes however many of them it holds:
+ * shared out by rows, the tenth of a two-value column was given a ninth of
+ * the pages its other value was, where the two have as many.  By its rows
+ * where the column's shares are not known.
+ */
+static double
+lion_column_set_pages(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					  AttrNumber col, double members, double containers)
+{
+	double		colbytes;
+	double		colpages = ((double) idx->pages - 1.0 -
+							lion_index_dir_pages(idx, NULL)) *
+		lion_column_posting_share(root, rel, idx, col, &colbytes);
+	double		share;
+
+	colpages = Max(colpages, 0.0);
+	if (colbytes > 0.0)
+		share = lion_set_bytes(rel, members, containers) / colbytes;
+	else
+		share = Max(members, 0.0) / lion_index_rows(root, rel, idx);
+	return Max(colpages * Min(share, 1.0), 1.0);
+}
+
+/*
+ * The pages a walk of key column col of lion index idx reads (DESIGN.md §24),
+ * a GROUP BY's or a sum's over its entries: the column's entries, its share
+ * of the directory by entries (lion_index_column_share()) - which, into
+ * *entrypages when it is not NULL, is what a walk that begins again reads
+ * again - and every set under them, its share of the container pages by the
+ * bytes they take (lion_column_posting_share()).  Split by entries alone, as
+ * the directory is, the sets of a column of five entries beside one of a
+ * thousand were given half a percent of a partial index's pages where they
+ * fill a ninth of them, 500 pages (§45.6).
+ */
+static double
+lion_column_walk_pages(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					   AttrNumber col, double *entrypages)
+{
+	double		dirpages = lion_index_dir_pages(idx, NULL);
+	double		conpages = Max((double) idx->pages - 1.0 - dirpages, 0.0);
+	double		entries = dirpages *
+		lion_index_column_share(root, rel, idx, col);
+
+	if (entrypages != NULL)
+		*entrypages = entries;
+	return entries + conpages *
+		lion_column_posting_share(root, rel, idx, col, NULL);
 }
 
 /*
@@ -553,17 +642,113 @@ lion_merge_ops(double heap_pages, double members, double nkeys)
 }
 
 /*
+ * THE WIDTH OF A BITMAP CONTAINER of a heap of `tuples` rows on `heap_pages`
+ * pages (DESIGN.md §38): the words of each heap block it takes, k, the
+ * fewest whose 64 offsets a word cover the rows its pages hold - the average,
+ * which rows of one width fill every page to - and a BITSET's full width past
+ * a NARROW's widest.
+ */
+static double
+lion_bitmap_width(double tuples, double heap_pages)
+{
+	double		k = ceil(Max(tuples, 1.0) / Max(heap_pages, 1.0) / 64.0);
+
+	if (k > (double) LION_NARROW_MAX_WIDTH)
+		return (double) LION_BITSET_WIDTH;
+	return Max(k, 1.0);
+}
+
+/*
+ * ARE A SET'S CONTAINERS BITMAPS (DESIGN.md §10, "Dense sources"; §38)?  Its
+ * `members` lie in `containers` containers on `pages` posting pages, of a
+ * heap whose bitmaps are `width` words a block (lion_bitmap_width()); the
+ * words one of its containers has, or 0 for an ARRAY.
+ *
+ * What a container is does not follow from its members alone.  One a build or
+ * a VACUUM writes is the smallest that holds them (lion_container_optimize()):
+ * an ARRAY of up to 256 k members, and above that a NARROW of width k, 512 k
+ * bytes.  One an insert grows stays an ARRAY up to 2,048 members and becomes a
+ * BITSET past them.  So a set of more than 256 k members a container is a
+ * NARROW in an index built over its table and an ARRAY or a BITSET in one its
+ * rows were inserted into - and the two cost the merge an order of magnitude
+ * apart: nine dense sets ANDed took 1.3 ms built and 9.5 ms inserted.
+ *
+ * The set's pages, its share of its column's by bytes
+ * (lion_column_set_pages()), say which where the two sizes are far enough
+ * apart to tell: a build fills its posting pages to
+ * LION_DEFAULT_POSTING_FILLFACTOR, and the bytes a container of the set takes
+ * of them are taken for whichever of the two sizes they are nearer by ratio -
+ * the share is an estimate that may be off by a third.  Where the two are
+ * less than LION_BUILT_SIZE_RATIO apart, a set of up to about 384 k members,
+ * the pages cannot tell: four ARRAYs of a thousand members fill a page as
+ * four NARROWs of three words a block do.  The set is then taken as built, as
+ * a build and every VACUUM that rewrites a container leave it - priced as
+ * inserted, a fifth of a 4M-row heap ANDed with three dense sets cost 7,700
+ * units a millisecond.  With no pages to go by (`pages` 0) the set is taken
+ * as inserted, the dearer of the two.
+ */
+static double
+lion_set_bitmap_words(double members, double containers, double pages,
+					  double width)
+{
+	double		mu = Max(members, 0.0) / Max(containers, 1.0);
+	double		words = (double) LION_WIDTH_WORDS(1) * width;
+	double		grownwords = (mu > (double) LION_ARRAY_MAX_CARD) ?
+		(double) LION_BITSET_WORDS : 0.0;
+	double		built;
+	double		grown;
+	double		bytes;
+
+	if (mu <= (double) LION_WIDTH_ARRAY_CARD(1) * width)
+		return 0.0;				/* an ARRAY is no larger: it is one */
+	if (pages <= 0.0)
+		return grownwords;
+
+	/* the two sizes, with the header and line pointer a container takes */
+	built = (double) LION_WIDTH_BYTES(1) * width + LION_CONTAINER_ITEM_BYTES;
+	grown = ((grownwords > 0.0) ? (double) LION_BITSET_BYTES : 2.0 * mu) +
+		LION_CONTAINER_ITEM_BYTES;
+	if (grown < LION_BUILT_SIZE_RATIO * built)
+		return words;
+
+	bytes = pages * BLCKSZ / Max(containers, 1.0) *
+		(LION_DEFAULT_POSTING_FILLFACTOR / 100.0);
+	return (bytes * bytes < built * grown) ? words : grownwords;
+}
+
+/*
+ * What reading a container of `mu` members costs past the container itself
+ * (LION_CONTAINER_COST): the visibility map's block mask built from its
+ * members, LION_MEMBER_COST each up to LION_MEMBER_CAP - or, for a bitmap of
+ * `words` words (lion_set_bitmap_words()), one pass over them.
+ */
+static Cost
+lion_container_members_cost(double mu, double words)
+{
+	if (words > 0.0)
+		return words * LION_BITMAP_WORD_COST;
+	return LION_MEMBER_COST * Min(Max(mu, 0.0), LION_MEMBER_CAP);
+}
+
+/*
  * What a merge that counts the AND of `nsrc` sources costs in CPU (DESIGN.md
- * §10, "The units"; §22, §25): members[i] rows lying in containers[i]
- * containers (a union's are its sets' together), of a table of `tuples` rows.
+ * §10, "The units", "Dense sources"; §22, §25): members[i] rows lying in
+ * containers[i] containers (a union's are its sets' together), of a table of
+ * `tuples` rows; words[i] the words of source i's containers where they are
+ * bitmaps, 0 for ARRAYs (lion_set_bitmap_words()), all ARRAYs with words
+ * NULL.
  *
  * The source with the fewest members drives: each of its containers is read
- * and counted (LION_CONTAINER_COST, and LION_MEMBER_COST a member, up to a
- * bitset's worth).  At each of its container keys the others are sought in
- * ascending order of members, a probe each (LION_PROBE_COST, or
+ * and counted (LION_CONTAINER_COST, and lion_container_members_cost(): its
+ * members, or a bitmap's words).  At each of its container keys the others
+ * are sought in ascending order of members, a probe each (LION_PROBE_COST, or
  * LION_MEMORY_PROBE_COST for a source inmem[] says is a copy in memory) that
- * ANDs the running intersection's members with what it finds
- * (LION_AND_MEMBER_COST).
+ * ANDs the running intersection with what it finds: LION_AND_MEMBER_COST a
+ * member of the intersection where both are ARRAYs; LION_BITMAP_MEMBER_COST
+ * a member of whichever of the two is an ARRAY where the other is a bitmap,
+ * a bit tested; and, where both are bitmaps, LION_BITMAP_WORD_COST a word of
+ * the narrower, one kernel pass that leaves a bitmap behind
+ * (lion_container_and_raw()).
  * A key is abandoned as soon as the intersection empties (§25), so the k'th
  * source is sought only at the keys where the ones before it left a row: at
  * 1 - exp(-lambda) of them, lambda the rows the intersection is expected to
@@ -589,11 +774,11 @@ lion_merge_ops(double heap_pages, double members, double nkeys)
  */
 double
 lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
-					const bool *inmem, double tuples, double isect,
-					double *probes)
+					const double *words, const bool *inmem, double tuples,
+					double isect, double *probes)
 {
 	return lion_merge_cpu_cost_sets(nsrc, members, containers, NULL, NULL,
-									NULL, inmem, tuples, isect, probes);
+									NULL, words, inmem, tuples, isect, probes);
 }
 
 /*
@@ -609,7 +794,7 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
  *	- A union that DRIVES reads every container of its sets, and builds their
  *	  union at each of its keys: LION_UNION_KEY_COST a key and
  *	  LION_UNION_MEMBER_COST a member, the bitset image cleared, filled and
- *	  counted (lion_or_hot_raw()).
+ *	  counted (lion_or_hot_raw()) - a bitmap ORed in a pass over its words.
  *	- A union that is SOUGHT seeks each of its sets that has a container at or
  *	  before the key, and no more of them than its sets have containers: a
  *	  probe each (LION_PROBE_COST) for a set on posting pages of its own, and
@@ -621,10 +806,21 @@ lion_merge_cpu_cost(int nsrc, const double *members, const double *containers,
  *	  way at each key, as lion_or_probe_pays() chooses: the union built and
  *	  ANDed (LION_UNION_KEY_COST, and LION_UNION_MEMBER_COST each of its
  *	  members at the key and each of the intersection's, a bit set and a bit
- *	  tested in its image), or the intersection's members looked up in each
- *	  of its sets' containers there, LION_AND_MEMBER_COST a member a
- *	  container.  An intersection of more members than an ARRAY holds is
- *	  never probed.
+ *	  tested in its image - a bitmap's words passed over instead), or the
+ *	  intersection's members looked up in each of its sets' containers there,
+ *	  LION_AND_MEMBER_COST a member a container (LION_BITMAP_MEMBER_COST a
+ *	  bitmap), which leaves an ARRAY.  An intersection of more members than
+ *	  an ARRAY holds is never probed.
+ *
+ * A SEEK THAT STAYS ON ITS PAGE (DESIGN.md §22).  A source's seeks move it
+ * forward through its posting leaves, never back, so no more of them than
+ * the leaves it has - setpages[i] - can be to a key on another leaf, a
+ * descent or a step right (LION_PROBE_COST); the others find the key on the
+ * leaf the source stands on, the cursor's step to the item that holds it
+ * (LION_PROBE_STEP_COST).  Every seek of a dense set the driver meets at
+ * every key is that: priced as a descent, nine dense sets ANDed were charged
+ * 210 ns a seek where they take 60 to 85.  With setpages NULL every seek is
+ * priced as one that leaves its page.
  *
  * Fitted on the release build of PostgreSQL 18 (2026-09-28, a heap of 70
  * rows a block, 8M rows, lists of 2 to 32 values and `&&` of 3 and 6 keys
@@ -637,17 +833,18 @@ double
 lion_merge_cpu_cost_sets(int nsrc, const double *members,
 						 const double *containers, const double *nsets,
 						 const double *setcontainers, const double *setpages,
-						 const bool *inmem, double tuples, double isect,
-						 double *probes)
+						 const double *words, const bool *inmem, double tuples,
+						 double isect, double *probes)
 {
 	int		   *order;
 	int			i;
 	int			k;
 	double		keys;
 	double		lambda;
+	double		accw;			/* the intersection's words, 0 for an ARRAY */
 	double		alive = 1.0;
 	double		share = 1.0;
-	double		cost;
+	double		cost = 0.0;
 
 	if (nsrc <= 0)
 		return 0.0;
@@ -665,15 +862,34 @@ lion_merge_cpu_cost_sets(int nsrc, const double *members,
 
 	keys = Max(containers[order[0]], 1.0);
 	lambda = Max(members[order[0]], 0.0) / keys;
-	cost = keys * (LION_CONTAINER_COST +
-				   LION_MEMBER_COST * Min(lambda, LION_MEMBER_CAP));
+	accw = (words != NULL) ? Max(words[order[0]], 0.0) : 0.0;
 	if (nsets != NULL && nsets[order[0]] > 1.0)
 	{
+		double		hot = Max(setcontainers[order[0]] / keys, 1.0);
+
 		/* a driving union: its sets' other containers, and its union built */
 		cost += Max(setcontainers[order[0]] - keys, 0.0) * LION_CONTAINER_COST;
-		cost += keys * LION_UNION_KEY_COST +
-			Max(members[order[0]], 0.0) * LION_UNION_MEMBER_COST;
+		cost += keys * LION_UNION_KEY_COST;
+		if (accw > 0.0)
+			cost += Max(setcontainers[order[0]], keys) * accw *
+				LION_BITMAP_WORD_COST;
+		else
+			cost += Max(members[order[0]], 0.0) * LION_UNION_MEMBER_COST;
+
+		/*
+		 * ... into a bitset image where its sets meet, unless it is a few
+		 * ARRAYs' members folded (lion_or_hot_raw()): the AND takes the image
+		 * as the bitmap it is.  Its members ANDed one by one instead, an IN
+		 * list of three values ANDed with three dense sets cost 2,800 units a
+		 * millisecond.
+		 */
+		if (hot >= 2.0 &&
+			(accw > 0.0 || lambda > (double) LION_OR_FOLD_MEMBERS ||
+			 hot >= (double) LION_OR_BITSET_MIN))
+			accw = (double) LION_BITSET_WORDS;
 	}
+	cost += keys * (LION_CONTAINER_COST +
+					lion_container_members_cost(lambda, accw));
 	if (probes != NULL)
 		probes[order[0]] = 0.0;
 	if (nsrc > 1 && isect > 0.0 && isect != 1.0)
@@ -683,9 +899,10 @@ lion_merge_cpu_cost_sets(int nsrc, const double *members,
 	{
 		int			j = order[k];
 		double		sought = keys * alive;
-		Cost		seek = (inmem != NULL && inmem[j]) ?
-			LION_MEMORY_PROBE_COST : LION_PROBE_COST;
+		bool		copied = (inmem != NULL && inmem[j]);
+		Cost		seek = copied ? LION_MEMORY_PROBE_COST : LION_PROBE_COST;
 		double		lam = Min(lambda, LION_MEMBER_CAP);
+		double		wj = (words != NULL) ? Max(words[j], 0.0) : 0.0;
 
 		if (nsets != NULL && nsets[j] > 1.0)
 		{
@@ -694,21 +911,54 @@ lion_merge_cpu_cost_sets(int nsrc, const double *members,
 			double		hot = Max(setcontainers[j] / ukeys, 1.0);
 			double		mu = Max(members[j], 0.0) / ukeys;
 			Cost		built = LION_UNION_KEY_COST +
-				LION_UNION_MEMBER_COST * (mu + lam);
-			Cost		probed = LION_AND_MEMBER_COST * lam * hot;
-
+				((wj > 0.0) ? hot * wj * LION_BITMAP_WORD_COST :
+				 LION_UNION_MEMBER_COST * mu) +
+				((accw > 0.0) ? accw * LION_BITMAP_WORD_COST :
+				 LION_UNION_MEMBER_COST * lam);
+			Cost		probed = ((wj > 0.0) ? LION_BITMAP_MEMBER_COST :
+									  LION_AND_MEMBER_COST) * lam * hot;
 			double		chain = Min(setpages[j] / nsets[j], 1.0);
+			double		seeks = Min(sought * nsets[j],
+									Max(setcontainers[j], sought));
+			double		away = Min(seeks, Max(setpages[j], 1.0));
 
-			cost += Min(sought * nsets[j], Max(setcontainers[j], sought)) *
-				(LION_CONTAINER_COST +
-				 (seek - LION_CONTAINER_COST) * Max(chain, 0.0));
-			cost += sought * ((lambda > (double) LION_ARRAY_MAX_CARD) ?
-							  built : Min(built, probed));
+			cost += away * (LION_CONTAINER_COST +
+							(seek - LION_CONTAINER_COST) * Max(chain, 0.0)) +
+				(seeks - away) * LION_PROBE_STEP_COST;
+			if (lambda > (double) LION_ARRAY_MAX_CARD || built <= probed)
+				cost += sought * built;
+			else
+			{
+				cost += sought * probed;
+				accw = 0.0;
+			}
 		}
 		else
 		{
-			cost += sought * seek;
-			cost += sought * LION_AND_MEMBER_COST * lam;
+			double		away = (setpages != NULL && !copied) ?
+				Min(sought, Max(setpages[j], 1.0)) : sought;
+
+			cost += away * seek + (sought - away) * LION_PROBE_STEP_COST;
+			if (accw > 0.0 && wj > 0.0)
+			{
+				/* two bitmaps: a pass over the narrower one's words */
+				accw = Min(accw, wj);
+				cost += sought * accw * LION_BITMAP_WORD_COST;
+			}
+			else if (accw > 0.0 || wj > 0.0)
+			{
+				/* an ARRAY and a bitmap: a bit tested a member of the ARRAY */
+				cost += sought * LION_BITMAP_MEMBER_COST *
+					((accw > 0.0) ?
+					 Min(Max(members[j], 0.0) / Max(containers[j], 1.0),
+						 LION_MEMBER_CAP) : lam);
+				accw = 0.0;
+			}
+			else
+			{
+				/* two ARRAYs: the intersection's members merged */
+				cost += sought * LION_AND_MEMBER_COST * lam;
+			}
 		}
 		if (probes != NULL)
 			probes[j] = sought;
@@ -843,6 +1093,8 @@ lion_index_page_cost(PlannerInfo *root, double idxpages, Cost device)
  *				a multi-key `&&`'s keys (lion_merge_cpu_cost_sets()); 1 for a
  *				set of its own
  *	setcontainers	... and the containers those lie in together
+ *	words		the words of a container of its sets where those are bitmaps,
+ *				0 for ARRAYs (lion_set_bitmap_words())
  */
 typedef struct LionSetClause
 {
@@ -862,6 +1114,7 @@ typedef struct LionSetClause
 	Cost		descent;
 	Cost		readall;
 	double		unionops;
+	double		words;
 } LionSetClause;
 
 
@@ -876,6 +1129,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		dirpages;
 	double		height = 0;
 	double		container_pages;
+	double		setpages;
 	double		nkeys = 1.0;
 	double		sel;
 	double		itup;
@@ -939,6 +1193,18 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 #endif
 	}
 
+	/*
+	 * Its rows lie in this many containers (lion_key_containers()), whose
+	 * bytes are its share of the column's container pages
+	 * (lion_column_set_pages()).
+	 */
+	sc->members = itup * psel;
+	sc->containers = nkeys * lion_key_containers(root, rel, idx, col,
+												 sc->members / nkeys);
+	setpages = Min(lion_column_set_pages(root, rel, idx, col, sc->members,
+										 sc->containers),
+				   Max(container_pages, 1.0));
+
 	if (nkeys > 1.0)
 	{
 		/*
@@ -975,7 +1241,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 */
 		sc->descent = nkeys * LION_DESCENT_COST *
 			(1.0 + height * Min(1.0, dirpages / nkeys));
-		sc->pages = Min(Max(nkeys, container_pages * psel), container_pages);
+		sc->pages = Min(Max(nkeys, setpages), container_pages);
 	}
 	else
 	{
@@ -988,7 +1254,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 */
 		sc->randompages = 1.0;
 		sc->descent = (height + 1.0) * LION_DESCENT_COST;
-		sc->pages = Max(1.0, container_pages * psel);
+		sc->pages = Max(1.0, setpages);
 	}
 
 	/*
@@ -1003,17 +1269,6 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	sc->height = lion_posting_height(sc->leaves);
 	sc->idxpages = Max((double) idx->pages, 1.0);
 
-	/*
-	 * Its rows lie in this many containers, and reading every one of them -
-	 * what a union is built of (§15, §19), or a sum adds up - costs the
-	 * merge's price of a container the driver reads (lion_merge_cpu_cost()).
-	 */
-	sc->members = itup * psel;
-	sc->containers = nkeys * lion_key_containers(root, rel, idx, col,
-												 sc->members / nkeys);
-	sc->readall = sc->containers *
-		(LION_CONTAINER_COST +
-		 LION_MEMBER_COST * Min(sc->members / sc->containers, LION_MEMBER_CAP));
 	if (nkeys > 1.0)
 		sc->unionops = lion_merge_ops(heap_pages, sc->members, nkeys);
 
@@ -1039,6 +1294,22 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 									sc->members / mkeys);
 		}
 	}
+
+	/*
+	 * What its containers are, bitmaps or ARRAYs, as the bytes its pages give
+	 * one of them say (lion_set_bitmap_words()); and what reading every one
+	 * of them costs - what a union is built of (§15, §19), or a sum adds up -
+	 * at the merge's price of a container the driver reads
+	 * (lion_merge_cpu_cost()).
+	 */
+	sc->words = lion_set_bitmap_words(sc->members, sc->setcontainers,
+									  sc->pages,
+									  lion_bitmap_width(rel->tuples,
+														heap_pages));
+	sc->readall = sc->containers *
+		(LION_CONTAINER_COST +
+		 lion_container_members_cost(sc->members / sc->containers,
+									 sc->words));
 }
 
 /*
@@ -1151,6 +1422,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	double	   *nsets;
 	double	   *setcontainers;
 	double	   *setpages;
+	double	   *words;
 	double	   *probes;
 	double		ckeys = Max((double) rel->pages / LION_BLOCKS_PER_CONTAINER,
 							1.0);
@@ -1172,6 +1444,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	nsets = (double *) palloc(sizeof(double) * n);
 	setcontainers = (double *) palloc(sizeof(double) * n);
 	setpages = (double *) palloc(sizeof(double) * n);
+	words = (double *) palloc(sizeof(double) * n);
 	probes = (double *) palloc0(sizeof(double) * n);
 
 	for (i = 0; i < n; i++)
@@ -1187,6 +1460,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 		nsets[i] = sc[i].nsets;
 		setcontainers[i] = sc[i].setcontainers;
 		setpages[i] = sc[i].pages;
+		words[i] = sc[i].words;
 		if (driver < 0 || members[i] < members[driver])
 			driver = i;
 	}
@@ -1199,7 +1473,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	randompages = lion_cost_leaf_pages(n, idxs, sc);
 	out->leafpages += randompages;
 	out->cpu += lion_merge_cpu_cost_sets(n, members, containers, nsets,
-										 setcontainers, setpages, NULL,
+										 setcontainers, setpages, words, NULL,
 										 Max(rel->tuples, 1.0), isect, probes);
 
 	for (i = 0; i < n; i++)
@@ -1218,6 +1492,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 	pfree(nsets);
 	pfree(setcontainers);
 	pfree(setpages);
+	pfree(words);
 	pfree(probes);
 
 	return out->leafcost + out->setcost + out->cpu;
@@ -1676,7 +1951,8 @@ lion_cost_range_set_count(double rows, double conts, LionSumSources *f)
 	f->conts[0] = Max(conts, 1.0);
 	f->inmem[0] = false;
 	return lion_merge_cpu_cost_sets(f->n + 1, f->rows, f->conts, NULL, NULL,
-									NULL, f->inmem, f->tuples, 1.0, NULL);
+									NULL, NULL, f->inmem, f->tuples, 1.0,
+									NULL);
 }
 
 /*
@@ -2080,7 +2356,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 									   LION_AND_MEMBER_COST * Min(m, fm));
 			probe = &probemodel;
 			probeover = lion_merge_cpu_cost_sets(nsrc, &f.rows[1], &f.conts[1],
-												 NULL, NULL, NULL, NULL,
+												 NULL, NULL, NULL, NULL, NULL,
 												 tuples, 1.0, NULL) +
 				fcont * (LION_CONTAINER_COST + LION_MEMBER_COST * fm) +
 				lion_cost_range_set_count(matching,
@@ -2825,7 +3101,18 @@ typedef struct LionCountRelCost
 	double	   *srcnsets;		/* the sets an AND meets it as the union of */
 	double	   *srcsetcont;		/* ... and the containers they lie in */
 	double	   *srcsetpages;	/* ... and the posting pages they fill */
+	double	   *srcwords;		/* ... the words of a container of theirs
+								 * where all are bitmaps, else 0 (or -1
+								 * before the first) */
 	double	   *srcprobes;		/* how often each is sought */
+
+	/* the negated sources, which the merges subtract (DESIGN.md §14, §35) */
+	int			nneg;
+	int		   *negclause;		/* each one's clause, whose set clauseset
+								 * has */
+	int		   *clauseneg;		/* ... and each clause's negated source, or
+								 * -1 */
+	double	   *negprobes;		/* how often each is sought */
 
 	/* the groups */
 	bool		groupdrive;		/* §15: the IN list is the GROUP BY driver */
@@ -2849,6 +3136,8 @@ typedef struct LionCountRelCost
 static void
 lion_count_rel_alloc(LionCountRelCost *c)
 {
+	int			i;
+
 	c->clausesel = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->clauseset = (LionSetClause *) palloc0(sizeof(LionSetClause) *
 											 Max(c->nclause, 1));
@@ -2867,9 +3156,33 @@ lion_count_rel_alloc(LionCountRelCost *c)
 	c->srcsetcont = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->srcsetpages = (double *) palloc0(sizeof(double) *
 										Max(c->nclause, 1));
+	c->srcwords = (double *) palloc(sizeof(double) * Max(c->nclause, 1));
+	for (i = 0; i < Max(c->nclause, 1); i++)
+		c->srcwords[i] = -1.0;
 	c->srcprobes = (double *) palloc0(sizeof(double) *
 									  (Max(c->nclause, 1) + 2));
+	c->negclause = (int *) palloc0(sizeof(int) * Max(c->nclause, 1));
+	c->clauseneg = (int *) palloc(sizeof(int) * Max(c->nclause, 1));
+	for (i = 0; i < Max(c->nclause, 1); i++)
+		c->clauseneg[i] = -1;
+	c->negprobes = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->orgrp = lion_or_group_map(c->ors, c->nclause);
+}
+
+/*
+ * Source s of the AND takes a clause whose containers are `words` words
+ * (lion_set_bitmap_words()): a source is bitmaps only while every clause of it
+ * is.
+ */
+static void
+lion_count_rel_src_words(LionCountRelCost *c, int s, double words)
+{
+	if (c->srcwords[s] < 0.0)
+		c->srcwords[s] = words;
+	else if (c->srcwords[s] > 0.0 && words > 0.0)
+		c->srcwords[s] = Max(c->srcwords[s], words);
+	else
+		c->srcwords[s] = 0.0;
 }
 
 /*
@@ -2975,6 +3288,7 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	c->srcsets[c->clausesrc[c->ci - 1]] += 1.0;
 	c->srcnsets[c->clausesrc[c->ci - 1]] += 1.0;
 	c->srcsetcont[c->clausesrc[c->ci - 1]] += clc;
+	lion_count_rel_src_words(c, c->clausesrc[c->ci - 1], 0.0);
 	if (c->orgrp[c->ci - 1] >= 0)
 		c->srcunion[c->clausesrc[c->ci - 1]] = true;
 }
@@ -3040,6 +3354,7 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 		c->srcnsets[c->clausesrc[c->ci - 1]] += sc->nsets;
 		c->srcsetcont[c->clausesrc[c->ci - 1]] += sc->setcontainers;
 		c->srcsetpages[c->clausesrc[c->ci - 1]] += sc->pages;
+		lion_count_rel_src_words(c, c->clausesrc[c->ci - 1], sc->words);
 		if (c->orgrp[c->ci - 1] >= 0 || nkeys > 1.0)
 			c->srcunion[c->clausesrc[c->ci - 1]] = true;
 	}
@@ -3092,6 +3407,151 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 }
 
 /*
+ * The words of a container of a set of `members` rows in `containers`
+ * containers of key column col of idx - a group's own set, a negated
+ * clause's - or 0 for ARRAYs (lion_set_bitmap_words()), from its share of
+ * the column's container pages (lion_column_set_pages()).
+ */
+static double
+lion_column_set_words(LionCountRelCost *c, IndexOptInfo *idx, AttrNumber col,
+					  double members, double containers)
+{
+	return lion_set_bitmap_words(members, containers,
+								 lion_column_set_pages(c->root, c->rel, idx,
+													   col, members,
+													   containers),
+								 lion_bitmap_width(c->tuples, c->heap_pages));
+}
+
+/*
+ * A NEGATED clause (DESIGN.md §14, §35): the set it subtracts - its column's
+ * NULL entry for `IS NOT NULL`, c's entry and the NULL one for `<>`, c's for
+ * `IS DISTINCT FROM`, a multi-key query's sets and the NULL entry for its
+ * NOT - located as any clause's are, a directory leaf and a descent, and
+ * priced as one set of the rows the clause rejects, which the merges subtract
+ * (lion_count_rel_subtract()).  c->ci is the clause's position, and is left
+ * past it.  The walk's own `IS NOT NULL` is no source: the walk leaves its
+ * column's NULL entry out instead (lion_locate_where()).
+ */
+static void
+lion_count_rel_negated(LionCountRelCost *c, IndexOptInfo *idx,
+					   AttrNumber col, Node *clause, int kind)
+{
+	LionSetClause *sc = &c->clauseset[c->ci];
+	Node	   *bare = IsA(clause, RestrictInfo) ?
+		(Node *) ((RestrictInfo *) clause)->clause : clause;
+	double		height = 0;
+	double		rejected;
+
+	if (kind == LION_CLAUSE_NOTNULL && c->groupidx != NULL &&
+		idx->indexoid == c->groupidx->indexoid && col == c->groupcol)
+	{
+		c->ci++;
+		return;
+	}
+
+	memset(sc, 0, sizeof(*sc));
+	sc->sel = clause_selectivity(c->root, lion_vcol_unvar(clause), 0,
+								 JOIN_INNER, NULL);
+	rejected = Max(1.0 - lion_index_clause_share(c->root, idx,
+												 lion_vcol_unvar(bare),
+												 sc->sel), 0.0);
+	(void) lion_index_dir_pages(idx, &height);
+	sc->nkeys = 1.0;
+	sc->nsets = 1.0;
+	sc->members = lion_index_rows(c->root, c->rel, idx) * rejected;
+	sc->containers = lion_key_containers(c->root, c->rel, idx, col,
+										 sc->members);
+	sc->setcontainers = sc->containers;
+	sc->pages = lion_column_set_pages(c->root, c->rel, idx, col,
+									  sc->members, sc->containers);
+	sc->leaves = sc->pages;
+	sc->height = lion_posting_height(sc->leaves);
+	sc->idxpages = Max((double) idx->pages, 1.0);
+	sc->randompages = 1.0;
+	sc->descent = (height + 1.0) * LION_DESCENT_COST;
+	sc->words = lion_column_set_words(c, idx, col, sc->members,
+									  sc->containers);
+	c->descent_cost += sc->descent;
+	c->clauseindex[c->ci] = idx;
+	c->clauseneg[c->ci] = c->nneg;
+	c->negclause[c->nneg++] = c->ci;
+	c->ci++;
+}
+
+/*
+ * What subtracting the negated sources (DESIGN.md §14, §35) costs a merge
+ * whose positive sources leave rows at `keys` container keys, `mu` members
+ * at each, in bitmaps of `accw` words or, with accw 0, ARRAYs - `times` such
+ * merges.  At those keys each negated source is sought where it is behind,
+ * no more often than it has containers: a step on the leaf it stands on, a
+ * probe where the step leaves it, as the merge seeks its sources
+ * (lion_merge_cpu_cost_sets()), or a probe of its copy in memory where
+ * `inmem` (§9).  Where it has a container its members are taken out of the
+ * intersection (lion_container_andnot_raw()): a pass over the
+ * intersection's words where both are bitmaps; its words and a bit cleared
+ * each of the source's members (LION_BITMAP_MEMBER_COST) where only the
+ * intersection is a bitmap; a bit tested each of the intersection's members
+ * where only the source is; LION_AND_MEMBER_COST each of them where both are
+ * ARRAYs.  The seeks are added to c->negprobes, for the pages they read.
+ * Unpriced, `count(*) WHERE c1 <> 3` cost what `count(*)` does, and a partial
+ * index whose sum takes the set out of each of five entries was chosen at
+ * 2.4 ms over the whole index's one merge at 0.44 (§45.6).
+ */
+static Cost
+lion_count_rel_subtract(LionCountRelCost *c, double keys, double mu,
+						double accw, bool inmem, double times)
+{
+	double		ckeys = Max(c->heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	Cost		cost = 0;
+	int			k;
+
+	keys = Max(keys, 1.0);
+	for (k = 0; k < c->nneg; k++)
+	{
+		const LionSetClause *sc = &c->clauseset[c->negclause[k]];
+		double		seeks = Min(keys, Max(sc->containers, 1.0));
+		double		hits = keys * Min(sc->containers / ckeys, 1.0);
+		double		away = inmem ? seeks : Min(seeks, Max(sc->pages, 1.0));
+		Cost		andnot;
+
+		if (accw > 0.0 && sc->words > 0.0)
+			andnot = accw * LION_BITMAP_WORD_COST;
+		else if (accw > 0.0)
+			andnot = accw * LION_BITMAP_WORD_COST + LION_BITMAP_MEMBER_COST *
+				Min(sc->members / Max(sc->containers, 1.0), LION_MEMBER_CAP);
+		else
+			andnot = ((sc->words > 0.0) ? LION_BITMAP_MEMBER_COST :
+					  LION_AND_MEMBER_COST) *
+				Min(Max(mu, 0.0), LION_MEMBER_CAP);
+		cost += away * (inmem ? LION_MEMORY_PROBE_COST : LION_PROBE_COST) +
+			(seeks - away) * LION_PROBE_STEP_COST + hits * andnot;
+		c->negprobes[k] += seeks * times;
+	}
+	return cost * times;
+}
+
+/*
+ * The words of the bitmaps the intersection of the AND's positive sources
+ * leaves, with a group's own sets of `ngroup` words among them, or 0 where
+ * any of them is an ARRAY.
+ */
+static double
+lion_count_rel_and_words(LionCountRelCost *c, int ngroup, const double *gwords)
+{
+	double		accw = -1.0;
+	int			s;
+
+	for (s = 0; s < c->nsrc; s++)
+		accw = (accw < 0.0) ? Max(c->srcwords[s], 0.0) :
+			Min(accw, Max(c->srcwords[s], 0.0));
+	for (s = 0; s < ngroup; s++)
+		accw = (accw < 0.0) ? Max(gwords[s], 0.0) :
+			Min(accw, Max(gwords[s], 0.0));
+	return Max(accw, 0.0);
+}
+
+/*
  * Number the sources of the AND, and price the WHERE clauses' lookups clause
  * by clause.
  */
@@ -3126,10 +3586,16 @@ lion_count_rel_clauses(LionCountRelCost *c)
 		if (!LION_CLAUSE_IS_POSITIVE(lfirst_int(lc3)))
 		{
 			/*
-			 * `IS NOT NULL` selects no rows of its own; it has been left out
-			 * of this estimate since before partitions existed.
+			 * A negated clause selects no rows of its own: it subtracts
+			 * (lion_count_rel_negated()).  As an OR's leaf it is a complement
+			 * arm's, which lion_cost_count_rel() prices as two counts.
 			 */
-			c->ci++;
+			if (LION_CLAUSE_IS_NEGATED(lfirst_int(lc3)) && idx != NULL &&
+				c->orgrp[c->ci] < 0)
+				lion_count_rel_negated(c, idx, (AttrNumber) lfirst_int(lc4),
+									   clause, lfirst_int(lc3));
+			else
+				c->ci++;
 			continue;
 		}
 
@@ -3280,7 +3746,7 @@ lion_count_rel_driver(LionCountRelCost *c)
  */
 static void
 lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
-						  double gm)
+						  double *words, double gm)
 {
 	/*
 	 * THE GROUPS OF THE WALK, COUNTED TOGETHER (DESIGN.md §10).
@@ -3303,28 +3769,35 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
 	 */
 	double		wkeys = lion_containers_for(c->heap_pages, c->matching);
 	double		batch = Min(c->walked, (double) LION_GROUP_BATCH_MAX);
+	double		copyw = -1.0;	/* the copy's words: its sources' AND */
 	double		visits;
 	double		collect;
 	double		per;
 	int			s;
 
 	for (s = 0; s < c->nsrc; s++)
+	{
 		wkeys = Min(wkeys, keys[s]);
+		copyw = (copyw < 0.0) ? words[s] : Min(copyw, words[s]);
+	}
 	wkeys = Max(wkeys, 1.0);
 	visits = Min(keys[c->nsrc], wkeys);
 
-	collect = lion_merge_cpu_cost(c->nsrc, mem, keys, NULL, c->tuples,
-								  lion_probe_rel_factor(c->root, c->rel),
-								  c->srcprobes) +
+	collect = lion_merge_cpu_cost_sets(c->nsrc, mem, keys, NULL, NULL,
+									   c->srcsetpages, words, NULL, c->tuples,
+									   lion_probe_rel_factor(c->root, c->rel),
+									   c->srcprobes) +
+		lion_count_rel_subtract(c, wkeys, c->matching / wkeys,
+								Max(copyw, 0.0), false, 1.0) +
 		wkeys * LION_FKJOIN_COPY_CONTAINER_COST;
 	per = visits * (LION_CONTAINER_COST +
-					LION_MEMBER_COST *
-					Min(gm / Max(keys[c->nsrc], 1.0), LION_MEMBER_CAP) +
+					lion_container_members_cost(gm / Max(keys[c->nsrc], 1.0),
+												words[c->nsrc]) +
 					log2(Max(batch, 2.0)) * cpu_operator_cost);
 	c->merge_cpu = collect + c->walked * per +
 		ceil(c->walked / batch) * wkeys *
-		(LION_CONTAINER_COST + LION_MEMBER_COST *
-		 Min(c->matching / wkeys, LION_MEMBER_CAP));
+		(LION_CONTAINER_COST +
+		 lion_container_members_cost(c->matching / wkeys, Max(copyw, 0.0)));
 	c->whereonce = true;
 
 	/*
@@ -3353,7 +3826,8 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
  */
 static void
 lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
-						  bool *inmem, double gm, double unionsets)
+						  double *words, bool *inmem, double gm,
+						  double unionsets)
 {
 	double		per;
 	double		share = 1.0;
@@ -3383,14 +3857,23 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 		lion_cost_where_collected(c->nsrc, c->srcmembers, c->srccontainers,
 								  c->srcunion))
 	{
-		lion_count_rel_where_once(c, mem, keys, gm);
+		lion_count_rel_where_once(c, mem, keys, words, gm);
 	}
 	else
 	{
-		per = lion_merge_cpu_cost(c->nsrc + 1, mem, keys, inmem, c->tuples,
-								  1.0, c->srcprobes) +
+		/* each group's merge, less the negated sources (§9: in memory) */
+		double		rows = c->matching / Max(c->walked, 1.0);
+		double		gkeys = Min(lion_containers_for(c->heap_pages, rows),
+								Max(keys[c->nsrc], 1.0));
+
+		per = lion_merge_cpu_cost(c->nsrc + 1, mem, keys, words, inmem,
+								  c->tuples, 1.0, c->srcprobes) +
 			unionsets * LION_UNION_SET_COST;
-		c->merge_cpu = c->walked * per * share;
+		c->merge_cpu = c->walked * per * share +
+			lion_count_rel_subtract(c, gkeys, rows / gkeys,
+									lion_count_rel_and_words(c, 1,
+															 &words[c->nsrc]),
+									true, c->walked * share);
 	}
 
 	/*
@@ -3410,7 +3893,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
  */
 static void
 lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
-						   bool *inmem, double unionsets)
+						   double *words, bool *inmem, double unionsets)
 {
 	/*
 	 * A second GROUP BY column (DESIGN.md §20): every (outer, inner)
@@ -3424,6 +3907,7 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 	double		oe = Max(c->outer_entries, 1.0);
 	double		ie = Max(c->inner_entries, 1.0);
 	double		per;
+	double		pkeys;
 	double		share = 1.0;
 	int			s;
 
@@ -3433,6 +3917,9 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 	mem[c->nsrc + 1] = lion_index_rows(c->root, c->rel, c->groupidx2) / ie;
 	keys[c->nsrc + 1] = lion_key_containers(c->root, c->rel, c->groupidx2,
 											c->groupcol2, mem[c->nsrc + 1]);
+	words[c->nsrc + 1] = lion_column_set_words(c, c->groupidx2, c->groupcol2,
+											   mem[c->nsrc + 1],
+											   keys[c->nsrc + 1]);
 
 	/*
 	 * The (g, k) pair test of a count(DISTINCT k) (DESIGN.md §26) stops at
@@ -3460,11 +3947,17 @@ lion_count_rel_two_columns(LionCountRelCost *c, double *mem, double *keys,
 				drvkeys = Min(drvkeys, keys[s]);
 		share = lion_exists_fraction(drvkeys, c->matching / (oe * ie));
 	}
-	per = lion_merge_cpu_cost(c->nsrc + 2, mem, keys, inmem, c->tuples,
-							  1.0, c->srcprobes) +
+	per = lion_merge_cpu_cost(c->nsrc + 2, mem, keys, words, inmem,
+							  c->tuples, 1.0, c->srcprobes) +
 		unionsets * LION_UNION_SET_COST;
 	c->walked = oe * ie;
-	c->merge_cpu = c->walked * per * share;
+	pkeys = Min(lion_containers_for(c->heap_pages, c->matching / c->walked),
+				Max(Min(keys[c->nsrc], keys[c->nsrc + 1]), 1.0));
+	c->merge_cpu = c->walked * per * share +
+		lion_count_rel_subtract(c, pkeys, c->matching / c->walked / pkeys,
+								lion_count_rel_and_words(c, 2,
+														 &words[c->nsrc]),
+								true, c->walked * share);
 	c->countrows = c->tuples / c->walked;
 	c->countkeys = Min(keys[c->nsrc], keys[c->nsrc + 1]);
 }
@@ -3478,6 +3971,7 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 {
 	double	   *mem = (double *) palloc(sizeof(double) * (c->nsrc + 2));
 	double	   *keys = (double *) palloc(sizeof(double) * (c->nsrc + 2));
+	double	   *words = (double *) palloc0(sizeof(double) * (c->nsrc + 2));
 	bool	   *inmem = (bool *) palloc0(sizeof(bool) * (c->nsrc + 2));
 	double		unionsets = 0;
 	double		gnd = -1.0;
@@ -3493,6 +3987,7 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 	{
 		mem[s] = c->srcmembers[s];
 		keys[s] = c->srccontainers[s];
+		words[s] = Max(c->srcwords[s], 0.0);
 		inmem[s] = true;
 	}
 
@@ -3532,6 +4027,8 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 	mem[c->nsrc] = gm;
 	keys[c->nsrc] = lion_key_containers(c->root, c->rel, c->groupidx,
 										c->groupcol, gm);
+	words[c->nsrc] = lion_column_set_words(c, c->groupidx, c->groupcol, gm,
+										   keys[c->nsrc]);
 	c->countrows = gm;
 	c->countkeys = keys[c->nsrc];
 
@@ -3545,11 +4042,12 @@ lion_count_rel_group_merge(LionCountRelCost *c)
 			unionsets += c->srcsets[s];
 
 	if (c->groupidx2 == NULL)
-		lion_count_rel_one_column(c, mem, keys, inmem, gm, unionsets);
+		lion_count_rel_one_column(c, mem, keys, words, inmem, gm, unionsets);
 	else
-		lion_count_rel_two_columns(c, mem, keys, inmem, unionsets);
+		lion_count_rel_two_columns(c, mem, keys, words, inmem, unionsets);
 	pfree(mem);
 	pfree(keys);
+	pfree(words);
 	pfree(inmem);
 }
 
@@ -3591,7 +4089,7 @@ lion_count_rel_merge(LionCountRelCost *c)
 		c->merge_cpu = lion_merge_cpu_cost_sets(c->nsrc, c->srcmembers,
 												c->srccontainers, c->srcnsets,
 												c->srcsetcont, c->srcsetpages,
-												NULL, c->tuples,
+												c->srcwords, NULL, c->tuples,
 												lion_probe_rel_factor(c->root,
 																	  c->rel),
 												c->srcprobes);
@@ -3600,6 +4098,17 @@ lion_count_rel_merge(LionCountRelCost *c)
 	}
 	else if (c->groupidx != NULL && !c->rangesum)
 		lion_count_rel_group_merge(c);
+
+	/* ... less the negated sources, at the keys the AND leaves */
+	if (c->groupidx == NULL && !c->rangesum && c->nsrc > 0 && c->nneg > 0)
+	{
+		double		keys = lion_containers_for(c->heap_pages, c->matching);
+
+		c->merge_cpu += lion_count_rel_subtract(c, keys, c->matching / keys,
+												lion_count_rel_and_words(c, 0,
+																		 NULL),
+												false, 1.0);
+	}
 }
 
 /*
@@ -3655,9 +4164,10 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 
 	/*
 	 * Walked: the driver, a group's own list, and what a range's entries are
-	 * ANDed with; everything else sought (lion_cost_set_pages()).  A negated
-	 * clause has nothing to read.  The single-key lookups' directory leaves,
-	 * one a lookup and no more of an index than it has (lion_cost_leaf_pages()).
+	 * ANDed with; everything else sought (lion_cost_set_pages()), a negated
+	 * source where the merges subtract it (lion_count_rel_subtract()).  The
+	 * single-key lookups' directory leaves, one a lookup and no more of an
+	 * index than it has (lion_cost_leaf_pages()).
 	 */
 	for (i = 0; i < c->nclause; i++)
 	{
@@ -3665,6 +4175,17 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 							c->clausesrc[i] == c->driver ||
 							c->rangesum);
 
+		if (c->clauseneg[i] >= 0)
+		{
+			/* a negated source, sought where the merges subtract it */
+			c->probe_cost += lion_cost_set_pages(c->root, c->rel,
+												 &c->clauseset[i], false,
+												 c->negprobes[c->clauseneg[i]],
+												 &c->seq_pages,
+												 &c->probed_pages,
+												 &c->seq_cost);
+			continue;
+		}
 		c->probe_cost += lion_cost_set_pages(c->root, c->rel,
 											 &c->clauseset[i], walk,
 											 walk ? 0.0 :
@@ -3687,7 +4208,11 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 	pfree(c->srcnsets);
 	pfree(c->srcsetcont);
 	pfree(c->srcsetpages);
+	pfree(c->srcwords);
 	pfree(c->srcprobes);
+	pfree(c->negclause);
+	pfree(c->clauseneg);
+	pfree(c->negprobes);
 }
 
 /*
@@ -3708,24 +4233,30 @@ lion_count_rel_entry_scan(LionCountRelCost *c)
 		/*
 		 * The entry scan walks ONE key column's entries and stops at the first
 		 * entry of the next (DESIGN.md §24), so what it reads of a multicolumn
-		 * index is that column's share of it and not the whole relation - and
-		 * a range bounds the walk to drivefrac of those (§28), the share of
-		 * the column's entries it selects.
+		 * index is that column's share of it and not the whole relation
+		 * (lion_column_walk_pages()) - and a range bounds the walk to
+		 * drivefrac of those (§28), the share of the column's entries it
+		 * selects.  A range of a parallel GROUP BY walks the entries again,
+		 * and reads its own share of their sets, which the walk's price
+		 * divided among the participants is: the directory's share alone is
+		 * read again.  Charged the column's sets again a range, the parallel
+		 * plan of a 40M-row GROUP BY was priced above the serial one it ran
+		 * in half the time of.
 		 */
-		double		entrypages = Max(1.0, (double) c->groupidx->pages *
-									 lion_index_column_share(c->root, c->rel,
-															 c->groupidx,
-															 c->groupcol) *
-									 c->drivefrac);
+		Cost		page = lion_index_page_cost(c->root,
+												(double) c->groupidx->pages,
+												seq_page_cost);
+		double		entrypages;
+		double		walkpages = Max(1.0, c->drivefrac *
+									lion_column_walk_pages(c->root, c->rel,
+														   c->groupidx,
+														   c->groupcol,
+														   &entrypages));
 
-		Cost		entryprice = entrypages *
-			lion_index_page_cost(c->root, (double) c->groupidx->pages,
-								 seq_page_cost);
-
-		c->seq_pages += entrypages;
-		c->seq_cost += entryprice;
+		c->seq_pages += walkpages;
+		c->seq_cost += walkpages * page;
 		if (c->rc != NULL && c->rc->batched)
-			c->rc->perrange += entryprice;
+			c->rc->perrange += Max(1.0, c->drivefrac * entrypages) * page;
 
 		/*
 		 * Beside a second GROUP BY column a count(DISTINCT k) tests each
@@ -3786,10 +4317,11 @@ lion_count_rel_pair_cost(LionCountRelCost *c)
 		double		cinner = lion_containers_for(c->heap_pages,
 												 c->tuples / ie);
 
-		double		innerpages = Max(1.0, (double) c->groupidx2->pages *
-									 lion_index_column_share(c->root, c->rel,
-															 c->groupidx2,
-															 c->groupcol2));
+		double		innerpages = Max(1.0,
+									 lion_column_walk_pages(c->root, c->rel,
+															c->groupidx2,
+															c->groupcol2,
+															NULL));
 
 		c->seq_pages += innerpages;
 		c->seq_cost += innerpages *
@@ -5042,11 +5574,18 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
 
 /*
  * The rows a count's residual clauses are tested on: those the restriction
- * selects without them, which is what the node fetches.
+ * selects without them, which is what the node fetches - and, where the count
+ * reads a partial index (DESIGN.md §45), of those only the rows its predicate
+ * holds for, which are all its sets have: each predicate clause the others
+ * do not already imply is a restriction of the rows fetched.  Without it a
+ * partial index `WHERE w > 5` under `w > 7 AND b = 4` was priced as fetching
+ * every row with b = 4, as the whole index is, and the two plans tied where
+ * the partial one fetches 40% of the rows and runs in half the time.
  */
 double
 lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
 {
+	IndexOptInfo *pidx = lion_partial_index_of(rel);
 	List	   *others = NIL;
 	ListCell   *lc;
 	double		rows;
@@ -5057,6 +5596,19 @@ lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
 
 		if (!list_member_ptr(residual, rinfo->clause))
 			others = lappend(others, rinfo);
+	}
+	if (pidx != NULL)
+	{
+		List	   *extra = NIL;
+
+		foreach(lc, pidx->indpred)
+		{
+			Node	   *pred = (Node *) lfirst(lc);
+
+			if (!predicate_implied_by(list_make1(pred), others, false))
+				extra = lappend(extra, pred);
+		}
+		others = list_concat(others, extra);
 	}
 	rows = clamp_row_est(Max(rel->tuples, 1.0) *
 						 clauselist_selectivity(root, others, rel->relid,

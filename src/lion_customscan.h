@@ -927,6 +927,41 @@ typedef struct LionVColScope
 #define LION_AND_MEMBER_COST	(lion_and_member_cost * cpu_operator_cost)
 
 /*
+ * THE MERGE OVER BITMAPS (DESIGN.md §10, "Dense sources"; §38).  A NARROW of
+ * k words a heap block, or a BITSET, is ANDed, united, subtracted and counted
+ * by one pass of a whole-bitmap kernel (§3, "Whole-bitset kernels") whatever
+ * it holds, where the costs above are an ARRAY's, a member at a time:
+ *
+ *	BITMAP_WORD		each word of the pass - of the narrower of two bitmaps
+ *					ANDed, and of a bitmap read and counted: 0.27 to 0.36 ns
+ *					a word ANDed for NARROWs of one to four words a block
+ *					(23 to 70 ns a container), 0.34 ns counted into the
+ *					visibility mask at two words and more;
+ *	BITMAP_MEMBER	each member of an ARRAY looked up in a bitmap, ANDed or
+ *					subtracted: one bit tested, 0.86 to 0.93 ns, against 1.5
+ *					an ARRAY member costs merged with another ARRAY.
+ *
+ * Measured on the release build of PostgreSQL 18 (2026-10-20) over the
+ * containers of heaps of 58, 120 and 226 rows a block, and checked whole on
+ * a 4M-row heap of 58 rows a block: nine dense sets built as NARROWs, ANDed,
+ * 1.24 ms priced at 609 units (492 a millisecond), where LION_AND_MEMBER_COST
+ * a member of them, which is a merge's of ARRAYs, had priced it at 4,266; and
+ * an ARRAY of 200 members a container ANDed with a NARROW at 440 ns a key.
+ */
+#define LION_BITMAP_WORD_COST	(lion_bitmap_word_cost * cpu_operator_cost)
+#define LION_BITMAP_MEMBER_COST	(lion_bitmap_member_cost * cpu_operator_cost)
+
+/*
+ * ... and what tells the containers of a set apart as a build's or an
+ * insert's (lion_set_bitmap_words()): the bytes a container takes of a
+ * posting page past its members - its header and line pointer, as
+ * lion_index_column_posting_share() weighs a column's sets - and how far
+ * apart the two sizes have to be for the set's pages to say which it is.
+ */
+#define LION_CONTAINER_ITEM_BYTES	16.0
+#define LION_BUILT_SIZE_RATIO		1.5
+
+/*
  * THE UNION OF A LIST'S SETS AT ONE KEY (DESIGN.md §29.11, "Unions probed"),
  * where the leapfrog builds it (lion_or_hot_raw(), lion_merge_cpu_cost_sets()):
  * a bitset image cleared, its members set in it and counted, UNION_KEY a

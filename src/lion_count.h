@@ -30,20 +30,27 @@
  * --------------------------------------------------------------------- */
 
 /*
- * Two thresholds of the k-way union that the COST MODEL has to know as well as
- * the executor, so that a path is priced as the path it will take (DESIGN.md
- * §15).  The arguments for the numbers are where they are used, in
- * lion_expr.c's lion_ecursor_build() for the first and lion_count.c's
- * lion_sum_is_cheaper() for both.
+ * Three thresholds of the k-way union that the COST MODEL has to know as well
+ * as the executor, so that a path is priced as the path it will take
+ * (DESIGN.md §15).  The arguments for the numbers are where they are used, in
+ * lion_expr.c's lion_ecursor_build() and lion_or_hot_raw() for the first two
+ * and lion_count.c's lion_sum_is_cheaper() for the first and the last.
  *
  *	LION_OR_BITSET_MIN		containers at one container key above which an OR
  *							node accumulates them in a bitset image instead of
  *							folding them pairwise.
+ *	LION_OR_FOLD_MEMBERS	... and the members of ARRAYs together up to which
+ *							a count's union is folded pairwise: past them it
+ *							is that image, whatever the containers
+ *							(lion_merge_cpu_cost_sets() ANDs it as a bitmap).
  *	LION_SUM_MAX_DENSITY	rows per container key in one entry up to which the
  *							disjoint sum is cheaper than the union.
  */
 #ifndef LION_OR_BITSET_MIN
 #define LION_OR_BITSET_MIN	32
+#endif
+#ifndef LION_OR_FOLD_MEMBERS
+#define LION_OR_FOLD_MEMBERS	128
 #endif
 #ifndef LION_SUM_MAX_DENSITY
 #define LION_SUM_MAX_DENSITY	4
@@ -1640,13 +1647,15 @@ extern void lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
  * correlation with the heap order less ANALYZE's tie-break (lion_amcost.c).
  */
 extern double lion_merge_cpu_cost(int nsrc, const double *members,
-								  const double *containers, const bool *inmem,
+								  const double *containers,
+								  const double *words, const bool *inmem,
 								  double tuples, double isect, double *probes);
 extern double lion_merge_cpu_cost_sets(int nsrc, const double *members,
 									   const double *containers,
 									   const double *nsets,
 									   const double *setcontainers,
 									   const double *setpages,
+									   const double *words,
 									   const bool *inmem, double tuples,
 									   double isect, double *probes);
 
