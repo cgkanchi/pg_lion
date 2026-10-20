@@ -720,7 +720,7 @@ SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-      12
+      13
 (1 row)
 
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(11));
@@ -793,7 +793,7 @@ REINDEX INDEX lion_di_old_i;
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
  version 
 ---------
-      12
+      13
 (1 row)
 
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);

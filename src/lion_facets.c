@@ -1378,7 +1378,8 @@ lion_facets_next_entry(LionFacetRun *run, LionEntryScan *es,
 		if (entry == NULL)
 			return false;
 		run->walked++;
-		if (LionEntryIsEmptyKey(entry) || lion_entry_ntids(entry) == 0 ||
+		if (LionEntryIsEmptyKey(entry) || LionEntryIsNullElems(entry) ||
+			lion_entry_ntids(entry) == 0 ||
 			(LionEntryIsNullKey(entry) && run->state->multikey))
 			continue;
 		k->isnull = LionEntryIsNullKey(entry);
@@ -1492,7 +1493,8 @@ lion_facets_heap_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
 	else if (run->state->multikey)
 	{
 		Datum	   *keys;
-		int			nkeys = lion_extract_value(run->state, value, &keys);
+		int			nkeys = lion_extract_value(run->state, value, &keys,
+											   NULL);
 		int			j;
 
 		for (j = 0; j < nkeys; j++)
@@ -1558,7 +1560,8 @@ lion_facets_nentries(LionFacetRun *run)
 	while ((entry = lion_entry_scan_next_copy(&es, &itemlen)) != NULL)
 	{
 		run->walked++;
-		if (!LionEntryIsEmptyKey(entry) && lion_entry_ntids(entry) > 0 &&
+		if (!LionEntryIsEmptyKey(entry) && !LionEntryIsNullElems(entry) &&
+			lion_entry_ntids(entry) > 0 &&
 			!(LionEntryIsNullKey(entry) && run->state->multikey))
 			n++;
 	}

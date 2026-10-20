@@ -107,7 +107,7 @@
 #include "lion_count.h"
 
 
-#define LION_STATS_NCOLS		30
+#define LION_STATS_NCOLS		31
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -160,6 +160,7 @@ typedef struct LionVerifyState
 	/* per key column (DESIGN.md §24): at most one of each, per column */
 	int64		nnullentries[INDEX_MAX_KEYS];
 	int64		nemptyentries[INDEX_MAX_KEYS];
+	int64		nnullelemsentries[INDEX_MAX_KEYS];
 	int64		nlastsummaries[INDEX_MAX_KEYS];	/* §32: at most one */
 	uint16		lastattno;		/* attno of the last leaf entry seen */
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */

@@ -35,7 +35,8 @@ typedef struct LionSpoolGroup LionSpoolGroup;
 
 typedef struct LionSpoolEntry
 {
-	int			kind;			/* LION_KIND_NULL, _EMPTY or _VALUE */
+	int			kind;			/* LION_KIND_NULL, _EMPTY, _NULLELEMS or
+								 * _VALUE */
 	uint32		hash;			/* LION_NULLKEY_HASH for a reserved kind */
 	Datum		key;			/* lion_fetch_key() of raw; 0 when reserved */
 	const char *raw;			/* the key's stored bytes (lion_store_key()) */

@@ -82,6 +82,7 @@ typedef struct LionColStats
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
 	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
+	int64		nullelem_tids;	/* ... and of the NULLELEMS one (§17) */
 	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
 	int64		posting_internal_pages; /* ... and the pages above them */
 	int64		container_bytes;	/* logical bytes of every item */
@@ -404,6 +405,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						cs->null_tids += (int64) lion_entry_ntids(entry);
 					if (LionEntryIsEmptyKey(entry))
 						cs->empty_tids += (int64) lion_entry_ntids(entry);
+					if (LionEntryIsNullElems(entry))
+						cs->nullelem_tids += (int64) lion_entry_ntids(entry);
 
 					if ((entry->flags & LION_ENTRY_INLINE) != 0)
 					{
@@ -609,6 +612,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		else
 			nulls[28] = true;
 		values[29] = Int64GetDatum(cs->by_type[LION_CT_NARROW]);
+		values[30] = Int64GetDatum(cs->nullelem_tids);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));
