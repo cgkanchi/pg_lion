@@ -47,6 +47,7 @@
 
 #include "access/genam.h"
 #include "access/itup.h"
+#include "access/parallel.h"
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -83,9 +84,12 @@
 #include "parser/parsetree.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
+#include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/predicate.h"
+#include "storage/spin.h"
 #include "utils/builtins.h"
+#include "utils/dsa.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -682,6 +686,72 @@ typedef struct LoMemoEnt
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+/*
+ * A parallel walk (DESIGN.md §40.9).  The participants of a parallel-aware
+ * plan share the btree's parallel scan, which hands each of them leaf pages
+ * of its own, and the lion set, which the first of them to need it builds
+ * while the others wait: into the query's DSA when it fits the room a
+ * Parallel Hash's table would have - a hash table's memory for each
+ * participant planned - and each reads it there (LO_SHSET_SHARED); and
+ * otherwise each builds its own, as the serial node does (LO_SHSET_OWN).
+ * EXPLAIN ANALYZE's counters are summed here too.  The struct lives in the
+ * Gather's dynamic shared memory, the btree's parallel scan descriptor
+ * after it.
+ */
+#define LO_SHSET_NONE		0	/* nobody has started the set */
+#define LO_SHSET_BUILDING	1	/* a participant is building it */
+#define LO_SHSET_SHARED		2	/* ... and has put it in the DSA */
+#define LO_SHSET_OWN		3	/* ... and kept it: each builds its own */
+
+/* What EXPLAIN ANALYZE adds up over a parallel walk's participants */
+typedef struct LoCounts
+{
+	uint64		walked;
+	uint64		hits;
+	uint64		fetched;
+	uint64		removed;
+	uint64		builds;
+	uint64		published;		/* builds put into the DSA for all */
+	uint64		earlystops;
+} LoCounts;
+
+typedef struct LoShared
+{
+	slock_t		mutex;
+	LoCounts	sums;			/* the workers', each added as it shuts down */
+
+	/* the set, and what its last builder saw of it */
+	int			setstate;		/* LO_SHSET_* */
+	ConditionVariable setcv;	/* broadcast as setstate leaves BUILDING */
+	dsa_pointer setimage;		/* LO_SHSET_SHARED: a LoSetImage */
+	Size		setroom;		/* the most of the DSA it may take */
+	int			ncont;
+	bool		exact;
+	Size		spillbytes;
+
+	Size		pscanoff;		/* where the btree's parallel scan is */
+} LoShared;
+
+/*
+ * The set in the DSA, one allocation (lo_set_publish()): its container keys,
+ * where each container is from the image's start, and the containers, each
+ * at a MAXALIGNed offset.
+ */
+typedef struct LoSetImage
+{
+	int			n;
+	bool		exact;
+} LoSetImage;
+
+#define LO_IMAGE_KEYS(img) \
+	((uint32 *) ((char *) (img) + MAXALIGN(sizeof(LoSetImage))))
+#define LO_IMAGE_OFFS(img) \
+	((Size *) ((char *) LO_IMAGE_KEYS(img) + \
+			   MAXALIGN(sizeof(uint32) * (Size) (img)->n)))
+#define LO_IMAGE_HEAD(n) \
+	(MAXALIGN(sizeof(LoSetImage)) + MAXALIGN(sizeof(uint32) * (Size) (n)) + \
+	 MAXALIGN(sizeof(Size) * (Size) (n)))
+
 typedef struct LionOrderedState
 {
 	CustomScanState css;
@@ -843,6 +913,25 @@ typedef struct LionOrderedState
 	HeapTuple	sortrow;		/* scratch: a row out of it */
 	Size		sortrowcap;
 
+	/*
+	 * A parallel walk (DESIGN.md §40.9): the shared struct, once the Gather
+	 * has set it up; whether the set is a view of its shared copy; and - in
+	 * the leader - the workers' counters, taken from the sums as it shuts
+	 * down, with how much of the sums it has taken already, and the set as
+	 * its builder saw it, for a leader that never had one.
+	 */
+	bool		parallel;		/* the plan is parallel-aware */
+	LoShared   *shared;
+	bool		setview;
+	bool		counted;		/* a worker's counters are in the sums */
+	LoCounts	wsums;
+	LoCounts	wseen;
+	int			wncont;
+	bool		wexact;
+	Size		wspill;
+	uint64		published;		/* sets this participant shared */
+	uint64		attaches;		/* views this participant took of one */
+
 	/* EXPLAIN ANALYZE */
 	uint64		walked;
 	uint64		hits;
@@ -870,6 +959,14 @@ static void lo_scan_reset(LionOrderedState *st);
 static bool lo_mark_place(LionOrderedState *st, int idx, uint32 place);
 static void lo_explain(CustomScanState *node, List *ancestors,
 					   ExplainState *es);
+static Size lo_estimate_dsm(CustomScanState *node, ParallelContext *pcxt);
+static void lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+							  void *coordinate);
+static void lo_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+								void *coordinate);
+static void lo_initialize_worker(CustomScanState *node, shm_toc *toc,
+								 void *coordinate);
+static void lo_shutdown(CustomScanState *node);
 
 static const CustomPathMethods lo_path_methods = {
 	.CustomName = "LionOrdered",
@@ -901,6 +998,11 @@ static const CustomExecMethods lo_exec_methods = {
 	.ExecCustomScan = lo_exec,
 	.EndCustomScan = lo_end,
 	.ReScanCustomScan = lo_rescan,
+	.EstimateDSMCustomScan = lo_estimate_dsm,
+	.InitializeDSMCustomScan = lo_initialize_dsm,
+	.ReInitializeDSMCustomScan = lo_reinitialize_dsm,
+	.InitializeWorkerCustomScan = lo_initialize_worker,
+	.ShutdownCustomScan = lo_shutdown,
 	.ExplainCustomScan = lo_explain,
 };
 
@@ -1449,11 +1551,22 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
  * the recheck reads the tuple before the visibility map is asked.  Priced as
  * the members it was, such a set chose an index-only walk that fetched a
  * million heap rows to throw half of them away (§40.8).
+ *
+ * With `workers` not NULL the price is a PARTIAL path's (DESIGN.md §40.9),
+ * as cost_index() prices a parallel index scan: *workers is what
+ * compute_parallel_worker() gives the btree's pages - and, in heap mode, the
+ * heap pages the members' fetches read, as core counts them for a parallel
+ * Index Scan; an index-only walk's are left out, as core leaves an Index Only
+ * Scan's out - and the per-row CPU, the probe of each entry walked among it,
+ * is divided among the participants.  The lion lookups and the set, built
+ * once for all of them, the btree's own cost and the heap's pages are each
+ * participant's whole, as core leaves the index and the heap undivided.
+ * Returns false when no worker would be given.
  */
-static void
+static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, Cost *startup_p, Cost *total_p)
+		bool indexonly, int *workers, Cost *startup_p, Cost *total_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1478,9 +1591,11 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		min_io;
 	double		pages_corr;
 	double		corr = 0.0;
+	double		ipages = 0.0;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
+	Cost		cpu;
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 
@@ -1516,10 +1631,13 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		lo_set_pieces(root, lion, members, ncont) +
 		lo_spill_cost(lo_set_bytes(members, ncont));
 
-	/* the walk: the ordered index's own cost, and the probe of each entry */
+	/*
+	 * the walk: the ordered index's own cost, and the probe of each entry -
+	 * CPU, which a parallel walk divides
+	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-	run = ord->indextotalcost +
-		walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
+	run = ord->indextotalcost;
+	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
 	 * The members' heap fetches, priced as cost_index() prices them: of the
@@ -1585,7 +1703,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Cost		s;
 		Cost		t;
 		Selectivity isel;
-		double		ipages;
 
 		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
 									   &ipages);
@@ -1603,21 +1720,41 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		max_io = ceil(max_io * (1.0 - rel->allvisfrac));
 		pages_corr = ceil(pages_corr * (1.0 - rel->allvisfrac));
 	}
+
+	/*
+	 * A partial path's workers, as cost_index() gives a parallel index
+	 * scan's: from the btree's pages, and the heap pages the fetches read
+	 * at random unless the walk is index-only.
+	 */
+	if (workers != NULL)
+	{
+		*workers = compute_parallel_worker(rel,
+										   (indexonly && !heaprecheck) ?
+										   -1 : max_io,
+										   ipages,
+										   max_parallel_workers_per_gather);
+		if (*workers <= 0)
+			return false;
+	}
 	if (indexonly)
-		run += fetched * cpu_operator_cost;
+		cpu += fetched * cpu_operator_cost;
 	max_io *= spc_random;
 	min_io = (pages_corr > 0) ? spc_random + (pages_corr - 1) * spc_seq : 0;
 	run += max_io + corr * corr * (min_io - max_io);
 
 	cost_qual_eval(&qcost, residual, root);
 	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
-	run += heapfetched * cpu_tuple_cost +
+	cpu += heapfetched * cpu_tuple_cost +
 		candidates * rqcost.per_tuple +
 		fetched * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
+	if (workers != NULL)
+		cpu /= lion_parallel_divisor(*workers);
+	run += cpu;
 
 	*startup_p = startup;
 	*total_p = startup + run;
+	return true;
 }
 
 /*
@@ -1836,6 +1973,15 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
  * an index-only scan, loses to the sequential scan and never reaches the
  * path list.  One add_path() still dropped for a bitmap scan of the same
  * index is taken from that scan's one-leaf bitmapqual.
+ *
+ * And the walk of the whole index when core built no path of it at all: it
+ * builds one without index clauses only when its order is useful or the
+ * index alone answers the query - every column of the restriction clauses
+ * among its own (check_index_only()) - and a btree that lacks the lion
+ * filter's columns, a primary key under a filter on others, is walked whole
+ * by the node all the same, the filter answered by the set and the columns
+ * the node must produce decided per pair (§40.1).  A partial btree only where
+ * the query implies its predicate, as core takes one.
  */
 static List *
 lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
@@ -1861,6 +2007,11 @@ lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
 		if (!list_member_ptr(result, ipath))
 			result = lappend(result, ipath);
 	}
+	if (result == NIL && (idx->indpred == NIL || idx->predOK))
+		result = lappend(result,
+						 create_index_path(root, idx, NIL, NIL, NIL, NIL,
+										   ForwardScanDirection, true, NULL,
+										   1.0, false));
 	return result;
 }
 
@@ -2388,21 +2539,30 @@ static double lo_margin = 1.0;
  * walks, a Sort over another path, a LIMIT's fraction of either - it is
  * taken only by that margin.  Its competitors are the relation's scans, which
  * are lion's reference units already: it has no rate.
+ *
+ * A btree's walk may run in a worker when the relation may be read in one
+ * (`parallel_safe`, DESIGN.md §40.9): whole, as the inner side of a join a
+ * worker runs, say; and with `workers` above zero it is a PARTIAL path, a
+ * parallel-aware walk whose participants share the btree's pages, offered
+ * to add_partial_path() with its rows a participant's.
  */
 static void
 lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
-			List *priv, double rows, Cost startup, Cost total)
+			List *priv, double rows, Cost startup, Cost total,
+			bool parallel_safe, int workers)
 {
 	CustomPath *cp = makeNode(CustomPath);
 
+	Assert(workers == 0 || parallel_safe);
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = rel;
 	cp->path.pathtarget = rel->reltarget;
 	cp->path.param_info = NULL;
-	cp->path.parallel_aware = false;
-	cp->path.parallel_safe = false;
-	cp->path.parallel_workers = 0;
-	cp->path.rows = rows;
+	cp->path.parallel_aware = (workers > 0);
+	cp->path.parallel_safe = parallel_safe;
+	cp->path.parallel_workers = workers;
+	cp->path.rows = (workers > 0) ?
+		clamp_row_est(rows / lion_parallel_divisor(workers)) : rows;
 	cp->path.startup_cost = startup / lo_margin;
 	cp->path.total_cost = total / lo_margin;
 	cp->path.pathkeys = pathkeys;
@@ -2410,7 +2570,24 @@ lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
 	cp->custom_paths = NIL;
 	cp->custom_private = priv;
 	cp->methods = methods;
-	add_path(rel, &cp->path);
+	if (workers > 0)
+		add_partial_path(rel, &cp->path);
+	else
+		add_path(rel, &cp->path);
+}
+
+/*
+ * May a walk of this btree be divided among the participants of a parallel
+ * plan (DESIGN.md §40.9)?  The relation may be read in a worker - its
+ * restriction clauses, which the node evaluates, and its target are
+ * parallel-safe, and it is not a temporary table - and the btree has a
+ * parallel scan, which hands each participant leaf pages of its own.
+ */
+static bool
+lo_parallel_ok(RelOptInfo *rel, IndexPath *ord)
+{
+	return rel->consider_parallel && ord->indexinfo->amcanparallel &&
+		max_parallel_workers_per_gather > 0;
 }
 
 /* ---------------------------------------------------------------------
@@ -3116,6 +3293,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 											   lionrinfos, lionqual);
 			List	   *iocols = NIL;
 			bool		indexonly;
+			int			workers;
 			Cost		startup;
 			Cost		total;
 
@@ -3135,7 +3313,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				lo_cost_knn(root, rel, ord, lion, residual, rows,
 							&startup, &total);
 				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
-							list_make3(ord, lion, NIL), rows, startup, total);
+							list_make3(ord, lion, NIL), rows, startup, total,
+							false, 0);
 				knn->offered++;
 				continue;
 			}
@@ -3147,9 +3326,18 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 													  lionqual, lossy),
 									  &iocols);
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, &startup, &total);
+					indexonly, NULL, &startup, &total);
 			lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
-						list_make3(ord, lion, iocols), rows, startup, total);
+						list_make3(ord, lion, iocols), rows, startup, total,
+						rel->consider_parallel, 0);
+
+			/* ... and its walk divided among a parallel plan's participants */
+			if (lo_parallel_ok(rel, ord) &&
+				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
+						rows, indexonly, &workers, &startup, &total))
+				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
+							list_make3(ord, lion, iocols), rows, startup,
+							total, true, workers);
 		}
 	}
 
@@ -3190,6 +3378,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			List	   *lionqual;
 			List	   *residual;
 			List	   *iocols;
+			int			workers;
 			Cost		startup;
 			Cost		total;
 
@@ -3205,11 +3394,20 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, &startup, &total);
+					rows, true, NULL, &startup, &total);
 			lo_add_path(rel, pathkeys != NIL ?
 						&lo_path_methods : &lo_btree_path_methods,
 						pathkeys, list_make3(ipath, lion, iocols),
-						rows, startup, total);
+						rows, startup, total, rel->consider_parallel, 0);
+
+			/* ... and its walk divided among a parallel plan's participants */
+			if (lo_parallel_ok(rel, ipath) &&
+				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
+						rows, true, &workers, &startup, &total))
+				lo_add_path(rel, pathkeys != NIL ?
+							&lo_path_methods : &lo_btree_path_methods,
+							pathkeys, list_make3(ipath, lion, iocols),
+							rows, startup, total, true, workers);
 		}
 	}
 
@@ -3249,7 +3447,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			priv = lappend(priv, lion);
 			priv = lappend(priv, w->vrinfos);
 			lo_add_path(rel, &lo_path_methods, list_make1(w->pathkey), priv,
-						rows, startup, total);
+						rows, startup, total, false, 0);
 		}
 	}
 }
@@ -3550,8 +3748,12 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	/*
 	 * The set lazily only for a walk expected to stop short (§30.4): the
 	 * share of its walk a LIMIT on the node alone lets it go, and the entries
-	 * that comes to.
+	 * that comes to.  A parallel walk's set is built at once, for every
+	 * participant (§40.9).
 	 */
+	if (best_path->path.parallel_aware)
+		flags |= LO_FLAG_BUILD;
+	else
 	{
 		double		share = 1.0;
 
@@ -3576,9 +3778,10 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	/*
 	 * The most rows a scan of the node can be asked for, which bound the
 	 * fetch-and-sort switch's sort (§30.4); a lionvec order's LIMIT is its
-	 * scan's pause, above, and never switches.
+	 * scan's pause, above, and never switches, nor does a parallel walk,
+	 * which has no sort keys (below).
 	 */
-	if ((flags & LO_FLAG_KNN) == 0)
+	if ((flags & LO_FLAG_KNN) == 0 && !best_path->path.parallel_aware)
 		limit = lo_limit(root, best_path,
 						 extract_actual_clauses(residual, false));
 
@@ -3621,7 +3824,20 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	priv.ordcols = ordcols;
 	priv.tree = tree;
 	priv.leaves = leaves;
-	lo_sort_keys(rel, best_path->path.pathkeys, &priv);
+
+	/*
+	 * The fetch-and-sort switch's keys - none for a parallel walk, which
+	 * never switches: a participant has met only its share of the members,
+	 * and the members it has not met are the other participants' rows
+	 * (DESIGN.md §40.9).
+	 */
+	if (best_path->path.parallel_aware)
+	{
+		priv.hassort = false;
+		priv.nsort = 0;
+	}
+	else
+		lo_sort_keys(rel, best_path->path.pathkeys, &priv);
 	priv.iocols = iocols;
 	priv.expected = expected;
 	priv.limit = limit;
@@ -4305,30 +4521,32 @@ lo_leaf_keys(LionOrderedState *st)
 	}
 }
 
+/* Let go of the set's memory, before a build or a view of a shared copy. */
 static void
-lo_build_set(LionOrderedState *st)
+lo_set_reset(LionOrderedState *st)
 {
-	int			i;
-
 	/* the walk's visited bits are given back before (lo_scan_reset()) */
 	Assert(st->visited == NULL);
 	MemoryContextReset(st->setcxt);
 	if (st->arena != NULL)
 		lion_arena_reset(st->arena);
+	st->set = NULL;
+	st->setview = false;
 	st->live = NIL;
 	st->bytes = 0;
 	st->spilled = false;
-	st->exact = !st->lossyqual;
 	st->limit = get_hash_memory_limit();
+}
 
-	lo_leaf_keys(st);
-	st->set = lo_build_node(st, st->tree);
-	MemoryContextReset(st->buildcxt);
+/*
+ * The members of the set, and the places of the walk's visited bits before
+ * each key (§30.4, "Stopping early"): at most LION_CONTAINER_RANGE a key.
+ */
+static void
+lo_set_places(LionOrderedState *st)
+{
+	int			i;
 
-	/*
-	 * The members, and the places of the walk's visited bits before each key
-	 * (§30.4, "Stopping early"): at most LION_CONTAINER_RANGE a key.
-	 */
 	st->ncont = st->set->n;
 	st->members = 0;
 	st->places = (uint64 *) lo_set_alloc(st, st->setcxt,
@@ -4340,8 +4558,185 @@ lo_build_set(LionOrderedState *st)
 		st->places[i + 1] = st->places[i] +
 			lion_container_places(st->set->conts[i]);
 	}
+}
+
+static void
+lo_build_set(LionOrderedState *st)
+{
+	lo_set_reset(st);
+	st->exact = !st->lossyqual;
+
+	lo_leaf_keys(st);
+	st->set = lo_build_node(st, st->tree);
+	MemoryContextReset(st->buildcxt);
+
+	lo_set_places(st);
 	st->spillbytes = st->spilled ? lion_arena_used(st->arena) : 0;
 	st->builds++;
+}
+
+/* ---------------------------------------------------------------------
+ * The set shared by a parallel walk's participants (DESIGN.md §40.9)
+ * --------------------------------------------------------------------- */
+
+/* The wait for the set's builder, as pg_stat_activity names it. */
+static uint32
+lo_set_wait_event(void)
+{
+#if PG_VERSION_NUM >= 170000
+	static uint32 event = 0;
+
+	if (event == 0)
+		event = WaitEventExtensionNew("LionOrderedSetBuild");
+	return event;
+#else
+	return PG_WAIT_EXTENSION;
+#endif
+}
+
+/*
+ * The set just built, copied into the DSA as one LoSetImage, or
+ * InvalidDsaPointer when it would take more than `room` - or more than the
+ * DSA will give.
+ */
+static dsa_pointer
+lo_set_publish(LionOrderedState *st, dsa_area *dsa, Size room)
+{
+	LionTidSet *set = st->set;
+	Size		total = LO_IMAGE_HEAD(set->n);
+	dsa_pointer p;
+	LoSetImage *img;
+	Size	   *offs;
+	Size		off;
+	int			i;
+
+	for (i = 0; i < set->n; i++)
+		total += MAXALIGN(lion_container_size(set->conts[i]));
+	if (total > room)
+		return InvalidDsaPointer;
+	p = dsa_allocate_extended(dsa, total, DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
+	if (!DsaPointerIsValid(p))
+		return InvalidDsaPointer;
+
+	img = (LoSetImage *) dsa_get_address(dsa, p);
+	img->n = set->n;
+	img->exact = st->exact;
+	if (set->n > 0)
+		memcpy(LO_IMAGE_KEYS(img), set->keys, sizeof(uint32) * (Size) set->n);
+	offs = LO_IMAGE_OFFS(img);
+	off = LO_IMAGE_HEAD(set->n);
+	for (i = 0; i < set->n; i++)
+	{
+		Size		size = lion_container_size(set->conts[i]);
+
+		if ((i & 1023) == 0)
+			CHECK_FOR_INTERRUPTS();
+		memcpy((char *) img + off, set->conts[i], size);
+		offs[i] = off;
+		off += MAXALIGN(size);
+	}
+	Assert(off == total);
+	return p;
+}
+
+/*
+ * The set as a view of its shared copy: the keys and the containers read
+ * where they are in the DSA, the directory of where each is and the walk's
+ * places this participant's own.
+ */
+static void
+lo_set_attach(LionOrderedState *st, LoSetImage *img)
+{
+	LionTidSet *set;
+	Size	   *offs = LO_IMAGE_OFFS(img);
+	int			i;
+
+	lo_set_reset(st);
+	set = (LionTidSet *) MemoryContextAllocZero(st->setcxt, sizeof(LionTidSet));
+	set->n = img->n;
+	set->cap = img->n;
+	set->keys = LO_IMAGE_KEYS(img);
+	set->conts = (LionContainer **)
+		lo_set_alloc(st, st->setcxt,
+					 sizeof(LionContainer *) * (Size) Max(img->n, 1));
+	for (i = 0; i < img->n; i++)
+		set->conts[i] = (LionContainer *) ((char *) img + offs[i]);
+	st->set = set;
+	st->setview = true;
+	st->exact = img->exact;
+	lo_set_places(st);
+	st->spillbytes = 0;
+	st->attaches++;
+}
+
+/*
+ * The set of a parallel walk (DESIGN.md §40.9): the first participant to need
+ * it builds it, as the serial node does, and puts it into the DSA when it
+ * fits the room; the others wait for it there and read it, or build their
+ * own when it did not fit.  A builder's error ends the query, the waiters'
+ * sleep with it: the leader rethrows a worker's error at its next interrupt
+ * check, which the wait makes, and its abort ends every worker.
+ */
+static void
+lo_shared_set(LionOrderedState *st)
+{
+	LoShared   *sh = st->shared;
+	dsa_area   *dsa = st->css.ss.ps.state->es_query_dsa;
+	dsa_pointer p;
+	int			state;
+
+	SpinLockAcquire(&sh->mutex);
+	state = sh->setstate;
+	if (state == LO_SHSET_NONE)
+		sh->setstate = LO_SHSET_BUILDING;
+	p = sh->setimage;
+	SpinLockRelease(&sh->mutex);
+
+	if (state == LO_SHSET_NONE)
+	{
+		lo_build_set(st);
+		p = (dsa != NULL) ? lo_set_publish(st, dsa, sh->setroom) :
+			InvalidDsaPointer;
+		SpinLockAcquire(&sh->mutex);
+		sh->setimage = p;
+		sh->setstate = DsaPointerIsValid(p) ? LO_SHSET_SHARED : LO_SHSET_OWN;
+		sh->ncont = st->ncont;
+		sh->exact = st->exact;
+		sh->spillbytes = Max(sh->spillbytes, st->spillbytes);
+		SpinLockRelease(&sh->mutex);
+		ConditionVariableBroadcast(&sh->setcv);
+
+		/* its own copy goes: it reads the shared one, as the others do */
+		if (DsaPointerIsValid(p))
+		{
+			Size		spill = st->spillbytes;
+
+			lo_set_attach(st, (LoSetImage *) dsa_get_address(dsa, p));
+			st->spillbytes = spill;
+			st->published++;
+		}
+		return;
+	}
+
+	if (state == LO_SHSET_BUILDING)
+	{
+		ConditionVariablePrepareToSleep(&sh->setcv);
+		for (;;)
+		{
+			SpinLockAcquire(&sh->mutex);
+			state = sh->setstate;
+			p = sh->setimage;
+			SpinLockRelease(&sh->mutex);
+			if (state != LO_SHSET_BUILDING)
+				break;
+			ConditionVariableSleep(&sh->setcv, lo_set_wait_event());
+		}
+		ConditionVariableCancelSleep();
+	}
+	if (state == LO_SHSET_SHARED && dsa != NULL)
+		lo_set_attach(st, (LoSetImage *) dsa_get_address(dsa, p));
+	else
+		lo_build_set(st);
 }
 
 /* ---------------------------------------------------------------------
@@ -5049,6 +5444,16 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		 !ScanDirectionIsForward(st->dir) || tree == NIL) :
 		orderbys != NIL)
 		elog(ERROR, "LionOrdered: malformed order by distance");
+
+	/*
+	 * A parallel walk (DESIGN.md §40.9) is a btree's, over a set built at
+	 * once, and has no sort keys: it never switches.
+	 */
+	st->parallel = cscan->scan.plan.parallel_aware;
+	if (st->parallel &&
+		(st->lionwalk || st->knn || tree == NIL ||
+		 (priv.flags & LO_FLAG_BUILD) == 0 || priv.nsort > 0))
+		elog(ERROR, "LionOrdered: malformed parallel walk");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -5950,11 +6355,18 @@ lo_next(ScanState *ss)
 
 	/*
 	 * The set: lazily, evaluated only where the walk goes, when its keys
-	 * can be sought (§30.4, "The set, lazily"); built otherwise.
+	 * can be sought (§30.4, "The set, lazily"); built otherwise - by one
+	 * participant of a parallel walk for all of them, when the Gather has
+	 * set one up (§40.9).
 	 */
 	if (st->set == NULL && !st->noset && !st->lazy &&
 		!(st->lazyok && lo_lazy_begin(st)))
-		lo_build_set(st);
+	{
+		if (st->shared != NULL)
+			lo_shared_set(st);
+		else
+			lo_build_set(st);
+	}
 	if (!st->started)
 		lo_start_walk(st);
 
@@ -6227,6 +6639,239 @@ lo_end(CustomScanState *node)
 }
 
 /* ---------------------------------------------------------------------
+ * A parallel walk (DESIGN.md §40.9)
+ *
+ * The btree's parallel scan is core's: the descriptor in the Gather's
+ * dynamic shared memory, initialised by the leader and joined by every
+ * participant, hands each of them whole leaf pages, in the walk's direction,
+ * as a Parallel Index Only Scan's participants get theirs.  What a
+ * participant does with an entry - the probe, the visibility map, the heap
+ * fetch of a page it does not call all-visible, the rechecks, the page's
+ * predicate lock - is the serial node's, on the entries it is handed.
+ * --------------------------------------------------------------------- */
+
+/* The btree's parallel scan descriptor, as each major sizes it. */
+static Size
+lo_pscan_estimate(LionOrderedState *st, Snapshot snapshot, int nworkers)
+{
+#if PG_VERSION_NUM >= 190000
+	return index_parallelscan_estimate(st->ordidx, st->nokeys, st->nobkeys,
+									   snapshot);
+#elif PG_VERSION_NUM >= 180000
+	return index_parallelscan_estimate(st->ordidx, st->nokeys, st->nobkeys,
+									   snapshot, false, true, nworkers);
+#elif PG_VERSION_NUM >= 170000
+	return index_parallelscan_estimate(st->ordidx, st->nokeys, st->nobkeys,
+									   snapshot);
+#else
+	return index_parallelscan_estimate(st->ordidx, snapshot);
+#endif
+}
+
+/* ... initialises it, in the leader ... */
+static void
+lo_pscan_initialize(LionOrderedState *st, Snapshot snapshot, int nworkers,
+					ParallelIndexScanDesc pscan)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+
+#if PG_VERSION_NUM >= 190000 || PG_VERSION_NUM < 180000
+	index_parallelscan_initialize(heap, st->ordidx, snapshot, pscan);
+#else
+	SharedIndexScanInstrumentation *sharedinfo = NULL;
+
+	index_parallelscan_initialize(heap, st->ordidx, snapshot, false, true,
+								  nworkers, &sharedinfo, pscan);
+#endif
+}
+
+/* ... and joins it, in every participant */
+static IndexScanDesc
+lo_pscan_begin(LionOrderedState *st, ParallelIndexScanDesc pscan)
+{
+	Relation	heap = st->css.ss.ss_currentRelation;
+
+#if PG_VERSION_NUM >= 200000
+	return index_beginscan_parallel(heap, st->ordidx, false, NULL, st->nokeys,
+									st->nobkeys, pscan, SO_NONE);
+#elif PG_VERSION_NUM >= 190000
+	return index_beginscan_parallel(heap, st->ordidx, NULL, st->nokeys,
+									st->nobkeys, pscan, SO_NONE);
+#elif PG_VERSION_NUM >= 180000
+	return index_beginscan_parallel(heap, st->ordidx, NULL, st->nokeys,
+									st->nobkeys, pscan);
+#else
+	return index_beginscan_parallel(heap, st->ordidx, st->nokeys,
+									st->nobkeys, pscan);
+#endif
+}
+
+/*
+ * A participant joins the shared struct: the btree's parallel scan, in place
+ * of a scan of its own - or of the scan of an earlier Gather run's memory,
+ * which the leader has when the Gather was shut down and started again (a
+ * LIMIT, then a rescan) - and the set, which an earlier run's view of
+ * cannot be read any more.
+ */
+static void
+lo_parallel_attach(LionOrderedState *st, LoShared *sh)
+{
+	if (st->setview)
+	{
+		st->set = NULL;
+		st->setview = false;
+	}
+	if (st->scan != NULL)
+		index_endscan(st->scan);
+	st->scan = lo_pscan_begin(st,
+							  (ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
+	/* index-only mode reads the index tuples (§40.4), as core's does */
+	st->scan->xs_want_itup = st->indexonly;
+	st->shared = sh;
+	st->counted = false;
+}
+
+static Size
+lo_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+
+	return add_size(MAXALIGN(sizeof(LoShared)),
+					lo_pscan_estimate(st, node->ss.ps.state->es_snapshot,
+									  pcxt->nworkers));
+}
+
+/*
+ * The leader sets the struct up, before the workers are launched.  The set's
+ * room is a Parallel Hash's: a hash table's memory for each participant the
+ * plan was made for, the leader among them.
+ */
+static void
+lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+				  void *coordinate)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	LoShared   *sh = (LoShared *) coordinate;
+	double		room = (double) get_hash_memory_limit() * (pcxt->nworkers + 1);
+
+	memset(sh, 0, sizeof(LoShared));
+	SpinLockInit(&sh->mutex);
+	ConditionVariableInit(&sh->setcv);
+	sh->setstate = LO_SHSET_NONE;
+	sh->setimage = InvalidDsaPointer;
+	sh->setroom = (Size) Min(room, (double) (SIZE_MAX / 2));
+	sh->pscanoff = MAXALIGN(sizeof(LoShared));
+	lo_pscan_initialize(st, node->ss.ps.state->es_snapshot, pcxt->nworkers,
+						(ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
+	memset(&st->wseen, 0, sizeof(LoCounts));
+	lo_parallel_attach(st, sh);
+}
+
+/*
+ * Before the workers are launched again, for a rescan of the Gather: the
+ * btree's parallel scan starts over, and the set is built again by the next
+ * run, whose parameters may be others - its shared copy freed, and the
+ * leader's view of it let go first: the rescan of the leader's own node may
+ * come after this (ExecReScanGather()).  The sums are kept: they are the
+ * whole execution's, as the leader's own counters are.  No participant is
+ * running.
+ */
+static void
+lo_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
+					void *coordinate)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	LoShared   *sh = (LoShared *) coordinate;
+	dsa_area   *dsa = node->ss.ps.state->es_query_dsa;
+
+	st->shared = sh;
+	if (st->setview)
+	{
+		st->set = NULL;
+		st->setview = false;
+	}
+	if (DsaPointerIsValid(sh->setimage) && dsa != NULL)
+		dsa_free(dsa, sh->setimage);
+	sh->setimage = InvalidDsaPointer;
+	sh->setstate = LO_SHSET_NONE;
+	index_parallelrescan(st->scan);
+}
+
+static void
+lo_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
+{
+	lo_parallel_attach((LionOrderedState *) node, (LoShared *) coordinate);
+}
+
+/* a += b - c, counter by counter */
+static void
+lo_counts_add(LoCounts *a, const LoCounts *b, const LoCounts *c)
+{
+	a->walked += b->walked - c->walked;
+	a->hits += b->hits - c->hits;
+	a->fetched += b->fetched - c->fetched;
+	a->removed += b->removed - c->removed;
+	a->builds += b->builds - c->builds;
+	a->published += b->published - c->published;
+	a->earlystops += b->earlystops - c->earlystops;
+}
+
+/*
+ * The end of a participant's execution.  A worker adds its counters to the
+ * sums, once.  The leader takes what the sums gained since it last took them
+ * - its ExecShutdownNode() reaches this node before the Gather above it
+ * detaches the memory, and after the Gather has read every worker's last
+ * row unless a LIMIT stopped it, which leaves the workers' counters out of
+ * EXPLAIN and nothing else (as §27's parallel node does) - and lets go of
+ * its view of the shared set, whose memory goes next.
+ */
+static void
+lo_shutdown(CustomScanState *node)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+	LoShared   *sh = st->shared;
+	LoCounts	mine;
+	LoCounts	zero;
+	LoCounts	sums;
+
+	if (sh == NULL)
+		return;
+	memset(&zero, 0, sizeof(LoCounts));
+	if (IsParallelWorker())
+	{
+		if (st->counted)
+			return;
+		mine.walked = st->walked;
+		mine.hits = st->hits;
+		mine.fetched = st->fetched;
+		mine.removed = st->removed;
+		mine.builds = st->builds;
+		mine.published = st->published;
+		mine.earlystops = st->earlystops;
+		SpinLockAcquire(&sh->mutex);
+		lo_counts_add(&sh->sums, &mine, &zero);
+		SpinLockRelease(&sh->mutex);
+		st->counted = true;
+		return;
+	}
+
+	SpinLockAcquire(&sh->mutex);
+	sums = sh->sums;
+	st->wncont = sh->ncont;
+	st->wexact = sh->exact;
+	st->wspill = Max(st->wspill, sh->spillbytes);
+	SpinLockRelease(&sh->mutex);
+	lo_counts_add(&st->wsums, &sums, &st->wseen);
+	st->wseen = sums;
+	if (st->setview)
+	{
+		st->set = NULL;
+		st->setview = false;
+	}
+	st->shared = NULL;
+}
+
+/* ---------------------------------------------------------------------
  * EXPLAIN (DESIGN.md §30.7)
  * --------------------------------------------------------------------- */
 
@@ -6244,6 +6889,56 @@ lo_explain_qual(CustomScanState *node, List *qual, const char *label,
 	str = deparse_expression((Node *) make_ands_explicit(qual), context,
 							 lion_explain_useprefix(es), false);
 	ExplainPropertyText(label, str, es);
+}
+
+/*
+ * A parallel walk's counters under ANALYZE (DESIGN.md §40.9): the leader's
+ * own and the workers' sums, which it took as it shut down; and the set as
+ * the leader had it, or as its last builder saw it when the leader never
+ * had one (parallel_leader_participation off) - "shared" when the
+ * participants read one copy of it, and the builds of all of them.  A
+ * parallel walk has no lazy set, no switch and no lion column walk.
+ */
+static void
+lo_explain_parallel(LionOrderedState *st, StringInfo buf, ExplainState *es)
+{
+	LoCounts	t = st->wsums;
+	bool		hadset = (st->builds > 0 || st->attaches > 0);
+	int			ncont = hadset ? st->ncont : st->wncont;
+	bool		exact = hadset ? st->exact : st->wexact;
+	Size		spill = Max(st->spillbytes, st->wspill);
+
+	t.walked += st->walked;
+	t.hits += st->hits;
+	t.fetched += st->fetched;
+	t.removed += st->removed;
+	t.builds += st->builds;
+	t.published += st->published;
+	t.earlystops += st->earlystops;
+
+	ExplainPropertyInteger("Index Entries Walked", NULL, (int64) t.walked, es);
+	ExplainPropertyInteger("Lion Set Hits", NULL, (int64) t.hits, es);
+	ExplainPropertyInteger("Heap Fetches", NULL, (int64) t.fetched, es);
+	if (t.removed > 0 || (t.builds > 0 && !exact))
+		ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
+							   (int64) t.removed, es);
+	if (t.builds > 0)
+	{
+		resetStringInfo(buf);
+		appendStringInfo(buf, "%d containers, %s", ncont,
+						 exact ? "exact" : "rechecked");
+		if (spill > 0)
+			appendStringInfo(buf, ", spilled %zu kB", (spill + 1023) / 1024);
+		if (t.published > 0)
+			appendStringInfoString(buf, ", shared");
+		if (t.builds > 1)
+			appendStringInfo(buf, ", %llu builds",
+							 (unsigned long long) t.builds);
+		ExplainPropertyText("Lion Set", buf->data, es);
+	}
+	if (t.earlystops > 0)
+		ExplainPropertyInteger("Scans Stopped Early", NULL,
+							   (int64) t.earlystops, es);
 }
 
 static void
@@ -6313,7 +7008,9 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	if (buf.len > 0)
 		ExplainPropertyText("Lion Indexes", buf.data, es);
 
-	if (es->analyze)
+	if (es->analyze && st->parallel)
+		lo_explain_parallel(st, &buf, es);
+	else if (es->analyze)
 	{
 		ExplainPropertyInteger("Index Entries Walked", NULL,
 							   (int64) st->walked, es);
