@@ -2109,7 +2109,10 @@ Planner integration
     up to a bitset's 4 kB, three bytes a row where the rows are too few a container for one
     (`lion_index_column_posting_share()`). Split by entries, the three values of a status column
     beside a 2,000-value column got 0.14% of a 110 MB index's pages where they hold a tenth of it,
-    and `status = 'val2'` - a million rows at every container key - was priced at 16 for 1 ms.)*
+    and `status = 'val2'` - a million rows at every container key - was priced at 16 for 1 ms.
+    Since 2026-10-20 a dense set is weighed as the NARROW a build writes, a set's pages are its
+    share of its column's by the same bytes, and a walk's are the column's share of the directory
+    by entries and of the container pages by bytes - "Dense sources" below.)*
   - **the merge's CPU** (`lion_merge_cpu_cost()`, "The units" below, since 2026-09-27): each
     container the driving source reads and counts, `LION_CONTAINER_COST` and `LION_MEMBER_COST` a
     member up to a bitset's worth; each probe of another source at the driver's container keys,
@@ -2124,7 +2127,9 @@ Planner integration
     (`LION_LIST_GROUP_COST` for a group of an IN list that drives them), and each set of a union
     source rebuilt at every count, `LION_UNION_SET_COST`. Before, every container was two
     cpu_operator_cost whatever it held, members and probes were free, and a group was charged the
-    containers of its share of the WHERE's rows rather than of its own set;
+    containers of its share of the WHERE's rows rather than of its own set. Since 2026-10-20 a
+    bitmap container is priced by its words, an ARRAY looked up in one by a bit a member, and a
+    seek that stays on its leaf as a step ("Dense sources" below);
   - **the union of an IN list**, cpu_operator_cost × members × log2(nelems): a merge of k sets costs
     that per member however it is organised (§15 builds the k-way one), and a single-key clause with
     k = 1 pays nothing for a merge it does not make;
@@ -2574,11 +2579,12 @@ parallel-aware one below a Gather and core's Finalize HashAggregate:
 - **Cost**, one participant's: the serial node's price before its HAVING divided among the
   participants (`get_parallel_divisor()`'s rule), since the collection, the groups' containers and
   the pages they lie on all divide by key; plus, for its share of the ranges, what each range pays
-  again - the entry walk, and for each group and each WHERE source a descent to the range's first
-  key: `LION_ENTRY_COUNT_COST` and `LION_PROBE_COST` a group, `LION_PROBE_COST` a source, a page
-  each (`LION_RANGE_DESCENT_PAGES`); plus a `cpu_tuple_cost` a partial row, a group's per range it
-  has rows in. The Gather prices its rows and `parallel_setup_cost`, core's Finalize Agg its own
-  work.
+  again - the entry walk, the column's share of the directory and not its sets, whose pages each
+  range reads its own share of ("Dense sources"), and for each group and each WHERE source a
+  descent to the range's first key: `LION_ENTRY_COUNT_COST` and `LION_PROBE_COST` a group,
+  `LION_PROBE_COST` a source, a page each (`LION_RANGE_DESCENT_PAGES`); plus a `cpu_tuple_cost` a
+  partial row, a group's per range it has rows in. The Gather prices its rows and
+  `parallel_setup_cost`, core's Finalize Agg its own work.
 
 Two things the ranges made worth doing in the walk itself, serial or not. A group's cursor now
 begins at the copy's first key (`lion_cursor_init_at()`: a CHAIN set's first leaf comes from a
@@ -2747,15 +2753,18 @@ cores. The leader alone (`max_parallel_workers = 0`) counted the overlap's twelv
 against the serial node's 97: a range costs next to nothing over its share there. The InitPlan's
 array is a value the serial price cannot estimate (§17), priced as the ordinary plan's work, so the
 serial node lost to the sequential scan by a hair and the parallel one won by its divisor - an
-accident of that price. The counts of a few milliseconds LOSE: the 9-source AND goes parallel and
-takes 7.7 to 10.9 ms for 2.2, because the serial node is priced at 4,471 units for 2.2 ms - 2,000
-units a millisecond against the 500 the model is fitted to ("The units") - and a worker's start,
-about 2 ms here and more under load, is more than the whole count: with `parallel_setup_cost` and `parallel_tuple_cost` at 0
-it takes 3.6 ms with two workers and 3.8 with three, against 1.6 serially in the same runs. The
-tsquery's serial price, 245, keeps it serial; made parallel the same way it takes 5.3 and 5.6 ms
-against 4.3. The parallel GROUP BY has the same exposure ("A GROUP BY in parallel"): a serial price
-that overstates a short count by more than `parallel_setup_cost` sends it parallel. What would fix
-it is the serial price of an AND of many dense sources, not this path's.
+accident of that price. The counts of a few milliseconds lost in these runs: the 9-source AND went
+parallel and took 7.7 to 10.9 ms for 2.2, because the serial node was priced at 4,471 units for
+2.2 ms - 2,000 units a millisecond against the 500 the model is fitted to ("The units") - and a
+worker's start, about 2 ms here and more under load, is more than the whole count: with
+`parallel_setup_cost` and `parallel_tuple_cost` at 0 it took 3.6 ms with two workers and 3.8 with
+three, against 1.6 serially in the same runs. The tsquery's serial price, 245, kept it serial; made
+parallel the same way it took 5.3 and 5.6 ms against 4.3. The parallel GROUP BY had the same
+exposure ("A GROUP BY in parallel"): a serial price that overstates a short count by more than
+`parallel_setup_cost` sends it parallel. The serial price of an AND of dense sources was what was
+wrong, not this path's, and is fixed ("Dense sources" below): the 9-source AND is priced at 620
+units for 1.2 ms and the three IN lists at 1,024 for 3.0 ms, both serial at every worker count, and
+over 40M rows they and the GROUP BYs of 9 to 33 ms still go parallel and gain 1.4 to 2.6 times.
 
 `test/sql/countparallel.sql` checks the plans - the node below a Gather with two workers and one,
 the serial node with none or with the table's `parallel_workers` at 0, a HAVING the Finalize
@@ -2861,6 +2870,8 @@ probed pages):
 | `LION_AND_MEMBER_COST` | 0.8 `cpu_operator_cost` | 4 to 5 ns | a member of the running intersection ANDed with what a probe found |
 | `LION_UNION_KEY_COST` (2026-09-28) | 30 `cpu_operator_cost` | 150 ns | the union of a list's containers built at a key: a bitset image cleared and counted (§29.11, "Unions probed") |
 | `LION_UNION_MEMBER_COST` (2026-09-28) | 0.25 `cpu_operator_cost` | 1.2 to 1.5 ns | a member set in that image, or of the intersection tested against it |
+| `LION_BITMAP_WORD_COST` (2026-10-20) | 0.07 `cpu_operator_cost` | 0.27 to 0.36 ns | a word of a bitmap container passed over, ANDed, united, subtracted or counted ("Dense sources") |
+| `LION_BITMAP_MEMBER_COST` (2026-10-20) | 0.2 `cpu_operator_cost` | 0.86 to 0.93 ns | a member of an ARRAY looked up in a bitmap container ("Dense sources") |
 
 The k'th source is sought only at the keys the first k - 1 left a row at, `1 - exp(-lambda)` of
 them (§25's early exit, which was never priced). Median residual 27%. Re-costing the 35 counts
@@ -2891,6 +2902,148 @@ correlation (`lion_key_containers()`: one a row when scattered, their share of t
 stored in value order, interpolated by the correlation's square): a GROUP BY over 365 days of a
 table loaded in date order cost 4,650 for 0.6 ms when every day was taken to be scattered, and
 costs 317.
+
+### Dense sources (2026-10-20)
+
+The serial price of an AND of many dense sources was about four times its time. That sent short
+counts parallel ("A count in parallel": the 9-source AND, priced 4,471 for 2.2 ms, took 7.7 to
+10.9 ms there) and chose a partial index's sum over a whole index's merge that ran faster (§45.6).
+On a table of that section's shape - 4,000,000 rows on 68,966 pages (58 a block), 1,078 container
+keys, the release build, warm - `f1 = 1 AND ... AND f9 = 1` was priced at 4,266 units for 1.21 ms,
+3,519 units a millisecond. About 4,000 of them were the merge's (`lion_merge_cpu_cost_sets()`): 397
+for the driver's containers (`f8 = 1`, 928 rows a key), 836 for the other eight sought at every
+key at a `LION_PROBE_COST` each, and 2,773 for `LION_AND_MEMBER_COST` a member of the running
+intersection at each of those seeks - 928 members, then 232, 77, 26 and on down. Both terms are an
+ARRAY's: two sorted lists of members merged, and a seek that descends to its key. Neither is what
+these sets are.
+
+- **What a container is.** A build or a VACUUM writes each container as the smallest that holds it
+  (`lion_container_optimize()`): an ARRAY of up to 256 k members, and past them a NARROW of width
+  k (§38), 512 k bytes - k the words a heap block takes, one at 58 rows a block. An insert grows an
+  ARRAY to 2,048 members and a BITSET past them. The merge ANDs two bitmaps in one pass of the
+  narrower's words whatever they hold (`lion_container_and_raw()`), and looks an ARRAY's members up
+  in a bitmap a bit each: the nine sets take 1.2 ms built and 8.8 ms inserted, and are priced at 620
+  and 4,742 units. The price follows the containers (`lion_set_bitmap_words()`). A set of more than
+  256 k members a container is taken as NARROWs where its pages say so: the bytes a container takes
+  of the set's posting pages (below) nearer by ratio to a NARROW's than to the ARRAY's or BITSET's
+  an insert grows - or the two sizes less than `LION_BUILT_SIZE_RATIO` (1.5) apart, where the pages
+  cannot tell and the set is taken as built, as a build and every VACUUM that rewrites a container
+  leave it. Two new
+  constants, from the containers of heaps of 58, 120 and 226 rows a block:
+
+  | constant | value | measured | what |
+  |---|---|---|---|
+  | `LION_BITMAP_WORD_COST` (`pg_lion.bitmap_word_cost`) | 0.07 `cpu_operator_cost` | 0.27 to 0.36 ns | a word of a bitmap passed over: two NARROWs ANDed in 23, 38 to 43 and 69 ns at one, two and four words a block; a bitmap counted into the visibility mask, 0.34 ns a word |
+  | `LION_BITMAP_MEMBER_COST` (`pg_lion.bitmap_member_cost`) | 0.2 `cpu_operator_cost` | 0.86 to 0.93 ns | a member of an ARRAY looked up in a bitmap, to AND or subtract the two; two ARRAYs merged take 1.5 ns a member, `LION_AND_MEMBER_COST` |
+
+  The driver's container is read and counted at `LION_CONTAINER_COST` and a pass over its words
+  (`lion_container_members_cost()`); a source sought ANDs the running intersection with what it
+  finds in a pass over the narrower bitmap's words, a bit tested a member of whichever of the two
+  is an ARRAY where the other is a bitmap, or `LION_AND_MEMBER_COST` a member where both are
+  ARRAYs - and the intersection stays a bitmap as long as both are.
+- **A seek that stays on its leaf** (§22). A source's seeks move it forward through its posting
+  leaves, never back, so no more of them than the leaves it has can find their key on another
+  leaf. The rest step to the item that holds it on the leaf the cursor stands on,
+  `LION_PROBE_STEP_COST` (10 `cpu_operator_cost`; 60 to 85 ns in this AND). Priced as descents,
+  `LION_PROBE_COST`, each was charged 210 ns.
+- **Pages by bytes.** A set's posting pages are its share of its column's container pages by the
+  bytes it takes (`lion_set_bytes()`, `lion_column_set_pages()`), not by its rows: a bitmap
+  container takes its bytes however many members it holds, and by rows the tenth of a two-value
+  column was given a ninth of the pages its other value was where the two have as many. A
+  column's own share of the index weighs a dense set as the NARROW a build writes
+  (`lion_index_column_posting_share()`). The pages a walk of a column reads - a GROUP BY's, a
+  sum's over its entries (§14), the inner column of two (§20) - are its share of the directory by
+  entries and its share of the container pages by bytes (`lion_column_walk_pages()`). Split by
+  entries alone, the five dense entries of a partial index's column beside a column of a thousand
+  were given half a percent of the index's pages, where they fill a ninth of them (§45.6). A range
+  of a parallel GROUP BY ("A GROUP BY in parallel") walks the entries again but reads only its
+  own share of their sets, so the directory's share is what each range pays again. Charged the
+  column's whole sets again each range, the 40M-row GROUP BYs below were priced higher in
+  parallel than serially, though they ran in half the time.
+- **A driving union** - an IN list or a multi-key `&&`, the source with the fewest rows - is built
+  into a bitset image at each key its sets meet at (`lion_or_hot_raw()`), unless it is a few
+  ARRAYs' members folded pairwise (`LION_OR_FOLD_MEMBERS`, 128, now in lion_count.h beside
+  `LION_OR_BITSET_MIN`), and the AND takes the image as the bitmap it is. ANDed member by member
+  instead, an IN list of three values ANDed with three dense sets was priced at 3,082 units a
+  millisecond.
+- **Negated sources** - `IS NOT NULL`, `<>`, `IS DISTINCT FROM`, a multi-key NOT (§14, §35) -
+  are located as any clause is and priced where the merges subtract them
+  (`lion_count_rel_negated()`, `lion_count_rel_subtract()`). Each is sought at the keys the AND
+  leaves, a step or a probe, and taken out of the intersection by what the two are: a pass over
+  the intersection's words where both are bitmaps, a bit cleared for each of the source's members
+  where only the intersection is, a bit tested for each of the intersection's members where only
+  the source is. Unpriced, `count(*) WHERE c1 <> 3` cost what `count(*)` cost, and a partial index
+  that subtracts per entry was chosen at 1.7 ms over the whole index's one merge at 0.38 (§45.6).
+- **A filtered run over a sum of every row** ("Filtered counts", §35) that has a source of its own
+  that selects rows - an equality, a list, `IS NULL`, an OR - is counted as that source's
+  intersection with the rest (`lion_run_count()`), and is priced as one
+  (`lion_count_run_plain()`), not as the sum.
+- **Residual rows over a partial index** (§45). The rows a residual clause is tested on are those
+  the restrictions select within the index's predicate: each predicate clause the restrictions do
+  not imply restricts the rows fetched (`lion_residual_rows()`). Without it, an index `WHERE w > 5`
+  read under `w > 7 AND b = 4` was priced as fetching every row with b = 4, as the whole index
+  does, where it fetches 40% of them in half the time.
+
+**Measured** on the release build, warm, on four cores other work shared; medians of 21 runs (11
+for the 200-key overlap and the GROUP BYs over 4M rows) of `EXPLAIN (ANALYZE, TIMING OFF)`, the
+plans and prices the planner's own with `max_parallel_workers_per_gather` at 0, 2 and 3, "before"
+the library without this change. The 4,000,000 rows above:
+
+| 4M rows | before: price; serial; 2 and 3 workers | now |
+|---|---|---|
+| 9-source AND, `f1 = 1 AND ... AND f9 = 1` | 4,266; 1.21 ms; parallel, 3.59 and 3.11 ms | 620; 1.20 ms; serial |
+| ... three of the nine IN lists | 5,826; 2.97 ms; parallel, 3.89 and 3.91 ms | 1,024; 3.08 ms; serial |
+| `tags && '{0, ..., 199}'` | 5,780; 13.3 ms; parallel, 11.6 and 11.0 ms | 5,552; 14.5 ms; parallel, 11.1 and 9.5 ms |
+| tsquery, eight ORs of ANDs | 29; 2.5 ms; serial | the same |
+| `f8, count(*) ... WHERE f1 = 1 AND ... AND f5 = 1 GROUP BY f8` | 7,997; 3.05 ms; parallel, 3.82 and 3.82 ms | 644; 3.02 ms; serial |
+| `f9, count(*) ... WHERE f1 = 1 AND f6 = 1 GROUP BY f9` | 3,618; 1.54 ms; parallel, 3.21 and 3.29 ms | 356; 1.50 ms; serial |
+| `f8, count(*) ... WHERE tags && '{1,2,3}' AND f1 = 1 GROUP BY f8` | 1,993; 0.96 ms; serial | 448; 0.94 ms; serial |
+
+The same table at 40,000,000 rows, 689,656 pages (5.4 GB), 10,776 container keys, its nine
+filters' index 156 MB:
+
+| 40M rows | before: price; serial; 2 and 3 workers | now |
+|---|---|---|
+| 9-source AND | 44,184; 11.9 ms; parallel, 7.55 and 6.44 ms | 7,489; 11.8 ms; parallel, 7.38 and 6.65 ms |
+| ... three of the nine IN lists | 61,533; 32.1 ms; parallel, 16.3 and 15.2 ms | 12,581; 33.3 ms; parallel, 17.0 and 14.0 ms |
+| `tags && '{0, ..., 199}'` | 62,082; 133 ms; parallel, 53.7 and 41.4 ms | 59,672; 135 ms; parallel, 53.2 and 47.0 ms |
+| tsquery, eight ORs of ANDs | 269; 25 ms; serial | the same |
+| `f8 ... GROUP BY f8`, five filters | 81,687; 33.1 ms; parallel, 16.6 and 13.1 ms | 7,611; 33.2 ms; parallel, 16.3 and 13.0 ms |
+| `f9 ... GROUP BY f9`, two filters | 36,815; 15.5 ms; parallel, 9.30 and 8.37 ms | 4,173; 15.6 ms; parallel, 8.54 and 7.40 ms |
+| `f8 ... GROUP BY f8`, the overlap and a filter | 20,778; 9.87 ms; parallel, 7.15 and 6.00 ms | 5,245; 9.44 ms; parallel, 7.22 and 6.52 ms |
+
+The counts of a millisecond or a few stay serial now, where they went parallel and took two to
+three times as long; the counts and GROUP BYs of 10 ms and more over 40M rows still go parallel,
+and gain 1.4 to 2.6 times. The AND is priced at 518 to 633 units a millisecond at both scales.
+ARRAY sets ANDed with dense ones - the whole index of §45.6, 4M rows of 157 a block, its `g` and
+`c2` sets ARRAYs and its three dense ones NARROWs of three words a block:
+
+| `count(*) FROM pp WHERE ...` | before: price; ms; units a ms | now |
+|---|---|---|
+| `g = 5 AND f1` | 351; 0.216; 1,626 | 139; 0.208; 666 |
+| `g = 5 AND f1 AND f2 = 'a' AND f3 = 'n'` | 910; 0.582; 1,564 | 306; 0.576; 531 |
+| `c2 = 7 AND f1 AND f2 = 'a' AND f3 = 'n'` | 467; 0.295; 1,583 | 168; 0.299; 562 |
+| `g IN (1, 2, 3) AND f1 AND f2 = 'a' AND f3 = 'n'` | 2,093; 0.679; 3,082 | 457; 0.684; 668 |
+| `c2 < 20 AND f1 AND f2 = 'a' AND f3 = 'n'` (a summed range) | 3,443; 4.61; 746 | 3,229; 4.74; 682 |
+
+**Not done.** A GROUP BY's own work is priced below its time: the GROUP BYs with dense filters
+above at 210 to 280 units a millisecond, and the same over the index grown by inserts at 260 to
+300 (110 with a single filter), as they were before. The WHERE collected for the groups ("The
+WHERE sets, collected once") costs about twice its count, the first group is counted by the merge
+that collects it, and each group after it takes 450 to 550 ns a key against the 70 it is priced
+at: the batch's own work - a step, the copy's image narrowed to the group's width, the block mask
+of the result - is not in the model.
+A summed range's counts and a range taken as a source (§32), and the FK-side join's sets (§27),
+still price a container's members at `LION_MEMBER_COST`, whatever the container; complement ORs
+and summed ranges leave their negations unpriced; and a tsquery of many keys is priced far below
+its time (269 units for 25 ms above, §17).
+
+`test/sql/costdense.sql` checks it on 60,000 rows indexed twice, built and grown by inserts: the
+containers each has, the same AND cheaper built than inserted, each in its own units - a member
+ANDed priced ten times as dear moves the inserted AND's price alone, a word of a bitmap the built
+one's alone, a step on the leaf the built one's - an IN list that drives the AND priced as the
+bitmap image it is built into, and a `<>` beside the AND subtracted, priced, and dearer where a
+seek leaves its page; every count against a sequential scan with the pushdown off.
 
 ### Shapes rewritten to the node's counts (2026-10-11)
 
@@ -24877,18 +25030,42 @@ With a third of the heap's pages not all-visible (10,000 rows updated), where bo
 the same rows in the heap: `c1 = 3` 7.4 against 7.1 ms, the `IN` list 1.7 against 1.5, `GROUP BY
 g` 110 against 89, the range 79 against 43.
 
-With two parallel workers allowed, the whole index's GROUP BY runs in parallel (§10, "A GROUP BY
-in parallel") and the partial index's does not (45.8): `GROUP BY g` 10.7 ms against 3.1 serially,
-with `c1 = 3` 11.3 against 9.9, with `c1 = 3 AND c3 = 2` 11.2 against 8.5, and the partial plan is
-still chosen.
+The last two rows were the model's, not the index's: the count of every row of P is a sum over the
+fewest-entry column's entries (`c3`'s five, 2,300 containers), which the model priced at a third
+of intersecting the three dense sets (1,380) though it took 1.6 times as long; and the subtraction
+of a `<>` from each of those entries was not priced at all - nor over a whole index, where
+`count(*) WHERE c1 <> 3` cost what `count(*)` costs (§35) - so the partial plan, which subtracts
+per entry, was taken where the whole index's one merge is five times faster. Both are priced now
+(§10, "Dense sources": the sum's pages by the bytes its sets take, the AND of dense sets by their
+words, negated sources where the merges subtract them), and the whole index is taken for both.
+Measured again on a table of the same shape (4M rows on 25,478 pages, 399 container keys; the two
+indexes 42 and 35 MB), medians of nine runs, the plans chosen by the library before that change
+and after it; the times are the plans' as they are now:
 
-The last two rows are the model's, not the index's: the count of every row of P is a sum over the
-fewest-entry column's entries (`c3`'s five, 2,300 containers), which the model prices at a third of
-intersecting the three dense sets (1,380) though it took 1.6 times as long; and the subtraction of
-a `<>` from each of those entries is not priced at all - nor is it over a whole index, where
-`count(*) WHERE c1 <> 3` costs what `count(*)` costs (§35) - so the partial plan, which subtracts
-per entry, is taken where the whole index's one merge is five times faster. Both are listed under
-45.8.
+| query (beside the defaults)                     | whole index, ms | partial index, ms | chosen before | chosen now |
+|-------------------------------------------------|-----------------|-------------------|---------------|------------|
+| `count(*) ... AND c1 = 3`                       | 0.42            | 0.16              | partial       | partial    |
+| `count(*) ... AND c1 = 3 AND c3 = 2`            | 0.47            | 0.33              | partial       | partial    |
+| `count(*) ... AND c2 IN (5, 50, 500)`           | 0.41            | 0.06              | partial       | partial    |
+| `count(*) ... AND c2 < 100`                     | 22.6            | 2.1               | partial       | partial    |
+| `g, count(*) ... GROUP BY g`                    | 5.5             | 2.9               | partial       | partial    |
+| `g, count(*) ... AND c1 = 3 GROUP BY g`         | 6.4             | 4.9               | partial       | partial    |
+| `c1, c3, count(*) ... GROUP BY c1, c3`          | 11.1            | 15.3              | partial       | partial    |
+| `count(DISTINCT c2) ... AND c1 = 3`             | 3.0             | 1.6               | partial       | partial    |
+| three counts, two `FILTER`s                     | 0.96            | 0.66              | partial       | partial    |
+| `count(*)` (the defaults alone)                 | 0.30            | 0.47              | partial       | whole      |
+| `count(*) ... AND c1 <> 3`                      | 0.40            | 1.60              | partial       | whole      |
+| `count(*) ... AND c2 <> 7 AND c1 <> 3`          | 0.49            | 1.90              | partial       | whole      |
+
+The GROUP BY of two columns keeps the partial index, which is now the slower of the two: the whole
+index's plan of it took 30.4 ms before and takes 11.1, the partial index's 24.1 and 15.3 (45.8).
+
+With two parallel workers allowed, the whole index's GROUP BY with `c1 = 3` runs in parallel (§10,
+"A GROUP BY in parallel") and the partial index's does not (45.8), and the partial plan is still
+chosen: 6.0 ms against 5.1 serially on the second table, and as much with `c1 = 3 AND c3 = 2`.
+`GROUP BY g` alone, whose whole-index plan went parallel and took 10.7 ms against 3.1 on the
+first, stays serial over both indexes now that its serial price no longer overstates it (§10,
+"Dense sources"): 5.9 ms against 3.0.
 
 ### 45.7 Tests
 
@@ -24905,7 +25082,9 @@ not), HAVING, the top k, `coalesce`, `SELECT DISTINCT`; filtered counts beside a
 row; `count(col)` the predicate proves non-NULL; `count(DISTINCT)`; residual clauses; generic and
 custom plans of prepared statements; the FK-side join, inner, outer, semi and anti, with the
 partial index on the fact side and a partial lion index on the dimension; a partitioned table
-with partial indexes on the parent and one on a single partition; EXPLAIN, and the setting off.
+with partial indexes on the parent and one on a single partition; EXPLAIN, and the setting off;
+and, with the whole index dropped, the partial index's sums over every row and its subtractions
+from every entry, which the model leaves to the whole index's merge where there is one (45.6).
 `exprindex.sql`: a partial expression index whose predicate the query implies answers, one whose
 predicate it does not imply declines.
 
@@ -24919,12 +25098,15 @@ predicate it does not imply declines.
   core plans them (`LionOrdered` over `pcd_region` in the test); the rule above applies to the fact
   side.
 - **Uniqueness proofs** (45.3).
-- **The cost of a sum over a partial index's entries** (45.6): the count of every row, and a `<>`
-  subtracted per entry, the second unpriced for whole indexes too. A GROUP BY whose WHERE is left
-  with a single source after the restrictions go is priced as a merge per group rather than one
-  collection of the WHERE (§10, "WHERE Sets Collected"); on 30,000 rows that prices the whole
-  index's four-source WHERE, collected once, below the partial index's one set, which on four
-  million rows it no longer does.
+- **A GROUP BY whose WHERE is left with a single source** after the restrictions go is priced as a
+  merge per group rather than one collection of the WHERE (§10, "WHERE Sets Collected"); on 30,000
+  rows that prices the whole index's four-source WHERE, collected once, below the partial index's
+  one set, which on four million rows it no longer does.
+- **The GROUP BY of two columns** (45.6) over the partial index is priced at 1,438 units for
+  15.3 ms, 94 a millisecond, and the whole index's at 3,687 for 11.1: a GROUP BY's own work is
+  priced below its time (§10, "Dense sources"), the pairs' most; and `c1`'s 774 rows a container
+  key lie just past the 768 above which a build writes a NARROW of three words a block rather than
+  an ARRAY, so 1,700 of its 3,990 containers are ARRAYs, which the model takes for NARROWs.
 - **A parallel GROUP BY** (§10) needs a WHERE that is collected - two sources or more, or a union
   - and a positive one: a partial index that leaves one source or none after the restrictions go
   is counted serially, against the whole index's parallel plan (45.6).

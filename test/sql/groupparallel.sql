@@ -153,9 +153,14 @@ SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE (a = 1 OR s = 4) AND b GROUP
 SELECT lgp_check($$SELECT g, count(*) FROM lgp WHERE tags && '{2, 5}' AND a = 0 GROUP BY g$$);
 SELECT lgp_check($$SELECT k, count(*) FROM lgp WHERE tags && '{1, 12}' AND b GROUP BY k$$);
 -- a filter that lies in two ranges of the twelve, and a group column whose
--- groups each lie in one or two: most ranges are counted without a row
+-- groups each lie in one or two: most ranges are counted without a row.  The
+-- second, twelve groups of a key or two against the WHERE collected once,
+-- is 45 us serially, and stays serial; containers priced dear divide it.
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE s = 3 AND a = 1 GROUP BY g');
 SELECT lgp_check('SELECT s, count(*) FROM lgp WHERE a = 1 AND b GROUP BY s');
+SET pg_lion.container_cost = 1000;
+SELECT lgp_check('SELECT s, count(*) FROM lgp WHERE a = 1 AND b GROUP BY s');
+RESET pg_lion.container_cost;
 -- a filter with no entry: no row
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 9 AND b GROUP BY g');
 -- counts of columns, a printed filter column, a HAVING, an ORDER BY and LIMIT

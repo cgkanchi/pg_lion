@@ -333,12 +333,16 @@ BEGIN
 	RETURN total / ((total - hashing) + hashing / r);
 END $$;
 -- over the whole table the hashing is most of the time, and the rate low;
--- over a selective WHERE it is almost none of it, and the rate near 1
+-- over a selective WHERE it is almost none of it, and the rate near 1 -
+-- priced so to a part in 2,000, as near as the costs EXPLAIN rounds to a
+-- hundredth of a unit, the node's and core's, tell it for a price of 70
 SELECT n, lcr_lion(q, sw) AS plan, lcr_hashrate(q, sw, 0.1) < 0.6 AS hashing_bound,
 	   lcr_hashrate(q, sw, 0.1) > 0.9 AS input_bound,
 	   bool_and(abs(lcr_cost(q, sw || ARRAY['pg_lion.hashagg_rate', r::text]) -
 					lcr_cost(q, sw || '{pg_lion.hashagg_rate, 1}'::text[]) *
-					lcr_hashrate(q, sw, r)) < 0.01) AS priced_so
+					lcr_hashrate(q, sw, r)) <
+				0.0005 * lcr_cost(q, sw || '{pg_lion.hashagg_rate, 1}'::text[]))
+		AS priced_so
   FROM (VALUES ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
 				'{enable_sort, off}'::text[]),
 			   ('group, filtered', 'SELECT g20, count(*) FROM lcr WHERE g200 = 17 GROUP BY g20',
