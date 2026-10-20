@@ -1720,7 +1720,7 @@ lion_neq_run_clause(PlannerInfo *root, int varRelid, LionNeqClause *nc,
 	saop->useOr = false;
 	saop->inputcollid = f->collid;
 	saop->args = list_make2(copyObject(f->expr),
-							makeConst(arraytype, -1, InvalidOid, -1,
+							makeConst(arraytype, -1, f->collid, -1,
 									  PointerGetDatum(construct_md_array(values, NULL,
 																		 1, dims, lbs,
 																		 f->elemtype,
