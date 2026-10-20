@@ -289,8 +289,17 @@ lionrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	lion_scan_reset(so);
 
 	if (scankey && scan->numberOfKeys > 0)
+	{
+		int			i;
+
 		memcpy(scan->keyData, scankey,
 			   scan->numberOfKeys * sizeof(ScanKeyData));
+
+		/* `@@@` is `@@` (LION_STRAT_MATCH_OLD), and answered as `@@` */
+		for (i = 0; i < scan->numberOfKeys; i++)
+			scan->keyData[i].sk_strategy =
+				LION_STRAT_CANONICAL(scan->keyData[i].sk_strategy);
+	}
 }
 
 void
@@ -546,11 +555,14 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
 	if (!lion_find_null_entry(index, col, BUFFER_LOCK_SHARE,
 							 &entrybuf, &entryoff))
 	{
+		lion_reader_lock_absent(index, entrybuf, false);	/* §9 */
 		if (BufferIsValid(entrybuf))
 			UnlockReleaseBuffer(entrybuf);
 		return 0;
 	}
 
+	lion_reader_lock_entry(index, BufferGetBlockNumber(entrybuf),
+						   lion_page_entry(BufferGetPage(entrybuf), entryoff));
 	return lion_emit_entry(index, entrybuf, entryoff, tbm, recheck);
 }
 
@@ -750,6 +762,8 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 				elog(ERROR, "lion index: block %u is not a directory leaf",
 					 w->nextblk);
 			}
+			/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
+			lion_reader_lock_leaf(w->index, buf, (AttrNumber) w->col->attno);
 			memcpy(cpage, page, BLCKSZ);
 			if (w->keeppin)
 			{
@@ -5446,6 +5460,8 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
 	if (!LionPageIsLeaf(page))
 		elog(ERROR, "lion index \"%s\": block %u is not a directory leaf",
 			 RelationGetRelationName(w->index), BufferGetBlockNumber(buf));
+	/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
+	lion_reader_lock_leaf(w->index, buf, w->attno);
 	memcpy(cpage, page, BLCKSZ);
 	lion_dir_pages_read++;
 	w->leaves++;
@@ -5468,10 +5484,11 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
  * (lion_range_last_leaf()) and goes to each leaf's LEFT sibling
  * (lion_dir_step_left(): the page whose right link is this one, found from
  * the left link by walking right, since the page the link names may have
- * split).  Neither misses an entry a snapshot taken before the walk began can
- * see: such an entry was in the index then, a split only ever moves entries
- * to a new page right of the one it splits, and no directory page is ever
- * unlinked (§21).  When the left neighbour of a leaf already copied splits,
+ * split, or skipping pages deleted since).  Neither misses an entry a snapshot
+ * taken before the walk began can see: such an entry was in the index then, a
+ * split only ever moves entries to a new page right of the one it splits, and
+ * a directory page is unlinked only once it holds no entry (§21, "Page
+ * deletion").  When the left neighbour of a leaf already copied splits,
  * its upper half goes to the new page, whose right link is that leaf: the
  * page the descending walk reads next.  Entries inserted after the walk began
  * are for rows no older snapshot sees.
@@ -5508,15 +5525,14 @@ lion_order_next_value(LionOrderWalk *w)
 
 				/*
 				 * A leaf with a left link has a left sibling whose right link
-				 * names it, found however far it split (§21): not finding one
-				 * is damage, not the end of the column.
+				 * names it, found however far it split, and not finding one
+				 * is an ERROR there (§21).  None is left when the pages left
+				 * of this one have been deleted since the copy was taken
+				 * ("Page deletion"), which they were only once they held no
+				 * entry at all: the end of the walk.
 				 */
 				if (!BufferIsValid(buf))
-					ereport(ERROR,
-							(errcode(ERRCODE_INDEX_CORRUPTED),
-							 errmsg("lion index \"%s\": no left sibling of directory leaf %u",
-									RelationGetRelationName(w->index), w->blk),
-							 errhint("REINDEX the index.")));
+					return false;
 
 				/*
 				 * A step along the level like any other, counted as the
@@ -5615,9 +5631,13 @@ lion_order_null_entry(LionOrderWalk *w)
 		Page		page = BufferGetPage(buf);
 		ItemId		iid = PageGetItemId(page, off);
 
+		lion_reader_lock_entry(w->index, BufferGetBlockNumber(buf),
+							   lion_entry_at(page, iid));
 		lion_order_take_entry(w, lion_entry_at(page, iid),
 							  ItemIdGetLength(iid));
 	}
+	else
+		lion_reader_lock_absent(w->index, buf, false);	/* §9 */
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
 	return found;

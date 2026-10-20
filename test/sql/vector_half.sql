@@ -125,7 +125,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -142,7 +143,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
@@ -285,9 +287,11 @@ RESET enable_sort;
 PREPARE hv_f(int, halfvec) AS
 	SELECT id FROM hv WHERE tag = $1 ORDER BY v <=> $2 LIMIT 10;
 SET plan_cache_mode = force_generic_plan;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) EXECUTE hv_f(3, :'q7');
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 RESET plan_cache_mode;
 DEALLOCATE hv_f;
 SELECT op, f, k,
@@ -304,26 +308,30 @@ SELECT op, f, k,
 -- probes (pg_lion.vector_exact_per_partition 0 too: its 38 members are 1.9
 -- a partition of the 20, near its 1.5), and at 5,000 a filter of 3,294
 -- members is exact; the order is the same either way
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 -- (with no prefetch, whose counts the line would add: vector_scan_parallel)
 SET pg_lion.vector_prefetch = off;
 SET client_min_messages = debug1;
 SELECT id FROM hv WHERE tag = 3 ORDER BY v <-> hv_vec(4, 40) LIMIT 3;
 RESET client_min_messages;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 SET pg_lion.vector_exact_rows = 0;
 SET pg_lion.vector_exact_per_partition = 0;
 SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE tag = 3
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;
 SET pg_lion.vector_exact_rows = 5000;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 SET client_min_messages = debug1;
 SELECT count(*) FROM (SELECT id FROM hv WHERE cat <> 5
 					   ORDER BY v <=> hv_vec(4, 40) LIMIT 10) s;
 RESET client_min_messages;
 RESET pg_lion.vector_prefetch;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 SELECT op, hv_ord(format('SELECT id, v %s hv_vec(4, 40) AS d FROM hv WHERE cat <> 5
 						  ORDER BY v %s hv_vec(4, 40) LIMIT 10', op, op)) AS result
   FROM (VALUES ('<->'), ('<#>'), ('<=>')) o(op) ORDER BY op;

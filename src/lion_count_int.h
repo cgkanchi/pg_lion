@@ -1384,17 +1384,36 @@ typedef struct LionCountCall
 } LionCountCall;
 
 /*
+ * One search key of a SQL count, as the call passed it: the argument's type
+ * as written (unknown for an untyped literal), the collation it brings, its
+ * value, and whether it is the array of `col = ANY (keys)`.
+ * lion_count_open_indexes() brings it to what `col = key` compares - value
+ * and type, an array's element type for `array` - and copies that into the
+ * LionCountCall.
+ */
+typedef struct LionCountKey
+{
+	Oid			type;
+	Oid			coll;
+	Datum		value;
+	bool		isnull;
+	bool		array;
+} LionCountKey;
+
+/*
  * Open and vet the nidx indexes idxoid[] of one SQL count: relkind, access
  * method, key type, collation, privileges, EXECUTE on what the query the
  * count stands for calls, row-level security and snapshot eligibility.
- * multikey_ok lets key column wantcol be a multi-key one (lion_facets.c);
- * every count of column values refuses it.
+ * keys is NULL for a count with no search key.  multikey_ok lets key column
+ * wantcol be a multi-key one (lion_facets.c); every count of column values
+ * refuses it.
  */
 extern void lion_count_open_indexes(Snapshot snapshot, int nidx,
-									const Oid *idxoid, const Oid *keytype,
-									const Oid *keycoll, AttrNumber wantcol,
-									bool multikey_ok, LionCountCall *call);
+									const Oid *idxoid, LionCountKey *keys,
+									AttrNumber wantcol, bool multikey_ok,
+									LionCountCall *call);
 extern void lion_count_sql_close(LionCountCall *call);
+extern void lion_count_sql_report(LionCountCall *call, int64 rows);
 
 /*
  * EXECUTE on every function an expression calls, as the executor asks it

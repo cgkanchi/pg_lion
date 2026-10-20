@@ -71,8 +71,8 @@ setup
 	SET max_parallel_workers_per_gather = 0;
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
-	SET enable_indexonlyscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	TRUNCATE cpv_got;
 }
 step s1_group	{

@@ -279,7 +279,8 @@ lion_probe_hash(LionState *state, LionProbe *probe, Datum key)
  * Locate the entry of one value through a resolved probe: lion_dir_find()
  * with the search key lion_probe_init() decided on.  On true *buf is the leaf
  * locked in lockmode and *off the entry; on false *buf may be a locked leaf
- * or InvalidBuffer, and the caller releases it when it is valid.
+ * or InvalidBuffer, and the caller releases it when it is valid.  A reader's
+ * lookup: the entry, or where it would be, is predicate-locked (§9).
  */
 bool
 lion_probe_find(Relation index, LionState *state, LionProbe *probe,
@@ -287,13 +288,21 @@ lion_probe_find(Relation index, LionState *state, LionProbe *probe,
 {
 	LionSearchKey sk;
 	uint32		hash;
+	bool		moved;
+	bool		found;
 
 	value = lion_probe_value(probe, value);
 	hash = lion_probe_hash(state, probe, value);
 	lion_probe_search_key(state, probe, value, hash, &sk);
 
-	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
-						 buf, off, NULL);
+	found = lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
+						  buf, off, &moved);
+	if (found)
+		lion_reader_lock_entry(index, BufferGetBlockNumber(*buf),
+							   lion_page_entry(BufferGetPage(*buf), *off));
+	else
+		lion_reader_lock_absent(index, *buf, moved);
+	return found;
 }
 
 
@@ -404,6 +413,13 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 		ps->head = lion_entry_head(entry);
 		*keeppin = false;
 	}
+
+	/*
+	 * SERIALIZABLE (§9): the set is the reader's now.  A copy taken under the
+	 * leaf's lock was locked there already (lion_entry_scan_fill()); this is
+	 * then the same lock again, which costs a lookup.
+	 */
+	lion_reader_lock_entry(index, blkno, entry);
 }
 
 /*
@@ -606,6 +622,7 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 	LionSearchKey sk;
 	Buffer		buf;
 	OffsetNumber off;
+	bool		moved;
 
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -618,8 +635,9 @@ lion_posting_set_locate(Relation index, LionState *state, LionProbe *probe,
 	lion_probe_search_key(state, probe, key, hash, &sk);
 
 	if (!lion_dir_find(index, NULL, state->ix, &sk, BUFFER_LOCK_SHARE, false,
-					   &buf, &off, NULL))
+					   &buf, &off, &moved))
 	{
+		lion_reader_lock_absent(index, buf, moved);
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);
 		return false;
@@ -1198,7 +1216,7 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 			}
 			located = lion_dir_find(index, NULL, state->ix, &sk,
 									BUFFER_LOCK_SHARE, false, &buf, &off,
-									NULL);
+									&lastmoved);
 		}
 		else
 		{
@@ -1247,6 +1265,10 @@ lion_posting_set_lookup_many_col(Relation index, AttrNumber attno, Oid keytype,
 			located = lion_dir_scan_run(index, &sk, BUFFER_LOCK_SHARE,
 										&buf, &off, &lastmoved);
 		}
+
+		/* SERIALIZABLE (§9): where an absent value would be */
+		if (!located)
+			lion_reader_lock_absent(index, buf, lastmoved);
 
 		if (located)
 		{
@@ -1597,7 +1619,10 @@ lion_lookup_walk_restart(LionLookupWalk *walk)
  *	  to a page on its right, and the walk moves right as a descent does;
  *	- at or above it, while the keys have been close: the leaf that was its
  *	  right sibling.  That page's lower bound was the high key just passed, and
- *	  a lower bound never moves, so the key is there or further right - even if
+ *	  a lower bound never rises - a page deletion lowers it, and a page that
+ *	  is deleted itself passes its range to the right, which a move right
+ *	  follows (DESIGN.md §21, "Page deletion") - so the key is there or
+ *	  further right - even if
  *	  the last leaf has split and has a new right sibling in between, which then
  *	  holds only keys below that bound.  At most maxsteps pages further right;
  *	- otherwise, or past those: a descent from the root.  A descent that lands
@@ -1649,8 +1674,9 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 		 * as the single lookup locates it - a descent, or the leaf walk.
 		 */
 		if (!lion_dir_find(index, NULL, walk->state->ix, &sk,
-						   BUFFER_LOCK_SHARE, false, &buf, &off, NULL))
+						   BUFFER_LOCK_SHARE, false, &buf, &off, &moved))
 		{
+			lion_reader_lock_absent(index, buf, moved);
 			if (BufferIsValid(buf))
 				UnlockReleaseBuffer(buf);
 			return false;
@@ -1776,6 +1802,8 @@ lion_lookup_walk_find(LionLookupWalk *walk, Datum key, uint32 hash,
 			ps->pinbuf = buf;
 		}
 	}
+	else
+		lion_reader_lock_absent(index, buf, moved);	/* §9 */
 
 	if (moved)
 	{
@@ -1849,6 +1877,8 @@ lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 
 	if (!lion_find_null_entry(index, state, BUFFER_LOCK_SHARE, &buf, &off))
 	{
+		/* one entry of its kind per column: no run to move right through */
+		lion_reader_lock_absent(index, buf, false);
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);
 		return false;

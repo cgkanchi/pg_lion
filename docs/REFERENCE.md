@@ -21,16 +21,22 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_posting_root(idx, key)               a key's posting-set head block (the root, or the first leaf), for tests
 
 The counts answer exactly what the equivalent `SELECT count(*)` answers under the same snapshot,
-and ask for what it would: SELECT on the table or its indexed columns, and no row-level security in
+and take the key as `col = key` takes it: the same operator, and the key converted as the query
+converts it - an untyped literal (`lion_index_count('idx', 'abc')`, `lion_index_count_any('idx',
+'{1,2}')`) as the column's type, `1` to numeric on a numeric column, `0.1` to float8 on a float4 one
+(where, as in the query, no float4 value equals it). Where the query would convert the column
+instead - `intcol = 1.5` compares `intcol::numeric` - the count is an error that says to cast the
+key to the column's type. A NULL key, or a NULL array, counts 0, as `col = NULL` selects no row; a
+NULL index answers NULL. The counts ask for what the query would: SELECT on the table or its indexed columns, and no row-level security in
 force for the caller.  A count under a collation the index does not compare in is an error, never
 a different number; on a column of a nondeterministic collation that includes a key of the default
 collation - a literal's, which the call cannot tell from an explicit `COLLATE "default"` - so there
 the key names the column's collation (`'abc'::text COLLATE case_insensitive`).  They take one INDEX, and an index belongs to one table, so they count that
 table's own rows and nothing else.  On an inheritance parent that is the parent's rows alone - the
 count of `SELECT count(*) FROM ONLY parent WHERE ...`, never the children's, even though a plain
-`FROM parent` includes them.  A partitioned table's index has no storage and is refused
-(`"..." is not an index`); pass a partition's own index, or write the `SELECT count(*)` against the
-partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
+`FROM parent` includes them.  A partitioned table's index has no storage and is refused, as by
+every function here (below); pass a partition's own index, or write the `SELECT count(*)` against
+the partitioned table and let the pushdown count every partition (DESIGN.md §16).  The pushdown is not
 attempted for an old-style inheritance parent without `ONLY`, whose children need not even share
 its columns: that query takes the ordinary plan.  The four diagnostic functions below the counts
 are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats()` is granted to
@@ -45,6 +51,12 @@ no page while it waits for another that replay may hold, and is exact only while
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
 table's owner (DESIGN.md §7).
+
+Each of these functions reads one index's storage, and the index of a partitioned table has none:
+each partition's index holds the entries of that partition's rows. `lion_index_stats()` returns no
+rows for it, so a query over every lion index in `pg_class` goes on to the partitions' own; every
+other function is an error, `"..." is a partitioned index`, with a hint to pass a partition's index.
+A `lion_index_verify()` over every lion index takes those whose `relkind` is `'i'`.
 
 ### Facet counts (DESIGN.md §7, "Facet counts")
 
@@ -78,7 +90,9 @@ count functions' are, after deletes and updates VACUUM has not yet cleaned up in
   `$."a".type() == "array"` or `"object"` (a container at a path), `? "k"` (what `?` finds: a
   top-level object key, a string element of a top-level array, a raw scalar string),
   `$.type() == "object"` or `"array"` (the document's own kind), and `sha256:<hex>` for a key too
-  long to store, which was hashed.
+  long to store, which was hashed. A tsvector lexeme or an array element too long to be a key is
+  shown as itself, with its own count, as `ts_stat()` and `GROUP BY e` show it: the rows of its
+  hashed key are read from the heap to tell it from the others the key may stand for.
 - **The filter** is a WHERE condition over the index's table, written as in a query and analysed
   like one, made only of what Lion indexes answer exactly as posting sets: `AND` and `OR` of
   `col = value`, `col IN (...)` or `= ANY (array)`, and `col IS NULL` on a column some valid,
@@ -111,13 +125,26 @@ One default operator class per type, reusing the hash access method's hash funct
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
 `oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
-pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type. Keys over 2047 bytes, counting a 4-byte length header (2043 bytes
-of text), are rejected, except tsvector lexemes and jsonb keys, which are hashed (below).
+pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type.
+
+**Long keys.** A key is at most 2047 bytes as stored, counting a 4-byte length header (2043 bytes of
+text). A longer value is stored compressed, as a btree index stores it, so a value of any length
+whose compressed form fits is a key - `repeat('abc', 20000)`, a `char(2500)` column's blank-padded
+values, a 5000-digit numeric, a `jsonb_ops` document of a few kilobytes - and answers every query
+exactly as a short one does. A value that is still over 2047 bytes compressed (incompressible text
+of 2044 bytes or more, say) is an error naming the index and the row:
+
+    ERROR:  index key size 2564 exceeds lion maximum 2047 for index "t_v_idx"
+    DETAIL:  Index row references tuple (0,4) in relation "t".
+
+where btree's limit, on the compressed size too, is 2704 bytes. tsvector lexemes, text, varchar and
+bytea array elements and `jsonb_contains_ops` keys are hashed instead and never fail (below).
 
 ## Multi-key columns: arrays and tsvector (DESIGN.md §17)
 
-`array_ops` (any array type) and `tsvector_ops` index one row under many keys, reusing GIN's own
-extraction functions (for tsvector through wrappers that hash lexemes too long to be keys), and
+`array_ops` (any array whose element type has a default hash or btree operator class, as GIN's
+needs a btree one) and `tsvector_ops` index one row under many keys, reusing GIN's own
+extraction functions (through wrappers that hash elements and lexemes too long to be keys), and
 answer
 
     CREATE INDEX ON doc USING lion (tags);       -- text[], int[], ...
@@ -126,13 +153,15 @@ answer
     tags @> '{a,b}'    the intersection of the elements' posting sets, exact
     tags && '{a,b}'    their union, exact
     tags <@ '{a,b}'    every indexed row, rechecked in the heap
-    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact
+    tags =  '{a,b}'    the rows holding every element, rechecked in the heap
+    tsv  @@ 'a & (b | c)'   an AND/OR tree over the lexemes, exact (also as `@@@`)
 
 Several such quals on one column (`tags && '{a}' AND tags && '{b}'`), like two lists on a scalar
 column, are ANDed in the index, as quals on several columns are, so the heap gets only the rows they
 select together (DESIGN.md §5, SCAN step 5).
 `count(*)` over `@>`, `&&` and an AND/OR tsquery is pushed down like any other clause, and can be
-combined with a `GROUP BY` on a scalar roaring column.
+combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
+index scans only, as GIN answers them.
 
 A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
 is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
@@ -193,15 +222,19 @@ matches on the same column, the planner returns the rows best first straight fro
 The scan is offered when the query, index and `col` are constants, the tsvector scored is the
 column the function ranks - `d.body` in `lion_bm25_score(d.body, q, 'doc_text_idx', col =>
 'body')`, a plain column, not an expression - and every row the `WHERE`'s tsquery can match has
-one of the scored lexemes, the usual case of the same query in both places. Other `WHERE` clauses
-filter its rows, and a second sort key is an incremental sort above it. Elsewhere - another
-tsvector scored against a column's statistics included - the function scores row by row; either
-way the rows and scores are the function's. `pg_lion.enable_bm25_scan` turns the scan off.
+one of the scored lexemes: the same query in both places, or a narrower one such as
+`WHERE d.tsv @@ 'cat & black'` under a score of `'cat'`. Other `WHERE` clauses filter its rows, and
+a second sort key is an incremental sort above it. Elsewhere - another tsvector scored against a
+column's statistics included - the function scores row by row; either way the rows and scores are
+the function's. `pg_lion.enable_bm25_scan` turns the scan off.
 
 A lexeme of up to 2043 bytes is a key as it is. A longer one (tsvector allows 2047) is stored as its
 first bytes and its SHA-256, and a query that names a lexeme of 2043 bytes or more has every
 candidate rechecked in the heap, so the answer stays exact; a prefix `foo:*` longer than about 1975
-bytes is not expanded, and every row is rechecked.
+bytes is not expanded, and every row is rechecked. A `text`, `varchar` or `bytea` array element
+(under a deterministic collation) is filed the same way, at any length: one of 2043 bytes or more in
+a query is rechecked. An element of another type longer than 2047 bytes is stored compressed, and is
+an error only if that does not fit, as a GIN index tuple that does not fit is.
 
 Without positions, everything a plain AND/OR of key sets cannot express is rechecked in the heap. A
 NULL element and a tsquery phrase, weight or `a & !b` are answered from the rows of their keys (the
@@ -476,6 +509,24 @@ or temporary one writes no WAL and is written anywhere), which needs
     shared_preload_libraries = 'pg_lion'      # and a restart
     # optional: pg_lion.rmgr_id = 170         # the id to register under
 
+So once an index is built in rmgr mode, `pg_lion` has to stay in `shared_preload_libraries`. On a
+server started without it, INSERT, UPDATE and COPY into the index's table fail, and so does every
+VACUUM that has dead rows to remove from the index - autovacuum included, which reports the error
+only in the server log while the table's dead rows (`n_dead_tup`) accumulate. Reads, DELETE and
+DROP INDEX still work. The error's hint names both ways out: preload the library again and restart,
+or rebuild the index in generic mode. To stop preloading the library, rebuild every rmgr-mode index
+first, while it is still preloaded:
+
+    SELECT c.oid::regclass, lion_index_wal_mode(c.oid)
+      FROM pg_class c JOIN pg_am a ON a.oid = c.relam
+     WHERE a.amname = 'lion' AND c.relkind = 'i';
+
+    ALTER INDEX idx SET (wal_mode = generic);
+    REINDEX INDEX idx;
+
+A REINDEX or TRUNCATE on a server without the preload rebuilds an index left at `auto` in generic
+mode, and it stays generic when the library is preloaded again, until the next REINDEX there.
+
 `pg_lion.rmgr_id` defaults to 170, the id reserved for pg_lion on the
 [list of custom resource managers](https://wiki.postgresql.org/wiki/CustomWALResourceManagers#List_of_Custom_Rmgrs).
 Two extensions that take the same id cannot be loaded together, so change it only to move out of
@@ -518,7 +569,9 @@ working around a bad choice:
   the clauses themselves; on a table, or on each partition of one (DESIGN.md §30, §30.11). EXPLAIN
   names a column's walk `Ordered By: <index> (<column>[, backward])`. A filter on the walked column
   alone (`WHERE s LIKE 'p1%' ORDER BY s`) is decided for a whole key by its first visible row, and
-  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35). When the B-tree holds
+  a key that fails is skipped unread (`Filter per Value`, DESIGN.md §35), when the filter is
+  immutable and equal values of the type are stored identically; any other filter is evaluated row
+  by row. When the B-tree holds
   every column the query reads, the rows' values come from its index tuples and the heap is read
   only for pages not all-visible (`Ordered By: <index> (index only)`, DESIGN.md §40); off, no order
   is claimed and the covering walks below are the only ones left.
@@ -576,7 +629,8 @@ working around a bad choice:
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
-  also take away B-tree index scans. The count pushdown and `LionOrdered` still use Lion indexes.
+  also take away B-tree index scans and every Lion path below. The count pushdown and `LionOrdered`
+  still use Lion indexes.
 - `pg_lion.enable_intersection_probe`: let Lion measure, at plan time, how many rows the AND of
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
@@ -603,6 +657,21 @@ working around a bad choice:
   expression), while the table holds within a factor of 2 of the rows the count was taken over, and
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
+
+PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
+stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`
+before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` on 18 shows it
+`Disabled: true` when it is. Lion's own switches above still take a path out altogether.
+
+| PostgreSQL setting | the Lion paths it disables |
+|---|---|
+| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
+| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin` and `LionAntiJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled |
+| `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
+
+`LionOrdered`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan does, and so answer to
+`enable_indexscan` alone. To have the planner prefer Lion's paths without disabling PostgreSQL's,
+set `pg_lion.pushdown_margin` above 1 (below).
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the
@@ -683,9 +752,11 @@ is decided before, in its own units. Set a rate to 1 to price Lion as fitted aga
 plan; `SET client_min_messages = debug2` logs which kind each path was priced against, at which
 rate and margin. A plan forced with PostgreSQL's `enable_*` settings, with nothing of PostgreSQL's
 left enabled to compete with, is priced in Lion's own units. To read Lion's own cost units a
-millisecond when calibrating the cost settings above, force its plans that way, or set every rate
-below to 1. `bench/calib/matrix.py` measures each kind of plan's units a millisecond, and the
-planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
+millisecond when calibrating the cost settings above, force its plans that way - `enable_seqscan`
+and `enable_bitmapscan` off, and `pg_lion.enable_plain_scan`, which leave Lion's paths enabled, on
+a table with no other index - or set every rate below to 1. `bench/calib/matrix.py` measures each
+kind of plan's units a millisecond, and the planner's mispicks, on synthetic tables (DESIGN.md §39,
+"The matrix").
 
 | `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
 |---|---|---|
@@ -695,10 +766,13 @@ planner's mispicks, on synthetic tables (DESIGN.md §39, "The matrix").
 | `mergejoin_rate` | 1.0 | a merge join |
 | `bitmap_rate` | 1.0 | a bitmap heap scan |
 
-`pg_lion.pushdown_margin` (1, no margin): the share of the cheapest competing plan's cost a Lion
-custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`) must be
-priced at to be chosen. Set below 1, its own price is divided by it, so a near tie goes to
-PostgreSQL's plan, and its cost in `EXPLAIN` is marked up by it. It tips `LionBtreeScan` against
+`pg_lion.pushdown_margin` (1, no margin; 0.01 to 1000): the share of the cheapest competing plan's
+cost a Lion custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`,
+`LionBtreeScan`) must be priced at to be chosen. Its own price is divided by it: set below 1, a near
+tie goes to PostgreSQL's plan, and its cost in `EXPLAIN` is marked up by it; set above 1, a Lion
+path is chosen up to that many times dearer than PostgreSQL's plan, and at 1000 wherever it is
+offered, which forces Lion's paths without disabling PostgreSQL's (above), and marks its cost in
+`EXPLAIN` down. It tips `LionBtreeScan` against
 the sequential scan the same way: the covering walk's marked-up price must beat the sequential
 scan's for the walk to be kept. It is not applied where it hedges nothing: to a plan
 forced with nothing of PostgreSQL's left enabled, to a count whose cheapest competitor is the
@@ -708,8 +782,8 @@ always priced below an aggregate over the access method's own plain or bitmap sc
 every set the count reads - every condition of the `WHERE` an index condition of the index the
 count reads it from - since that scan does the count's work and fetches every row besides: past
 the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
-same sets"). PostgreSQL's `enable_*` settings and Lion's
-switches above still force a plan either way.
+same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
+and Lion's switches leave theirs out, whatever the margin or price.
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
 standard deviations (DESIGN.md §44.8). A row of the partitions a scan reads is missed only when its
@@ -867,6 +941,30 @@ the switch is also held back while the walk meets members at the rate a uniform 
 since there it would read heap pages the walk never touches (DESIGN.md §40.4). A large value keeps
 a walk from switching at all.
 
+## Monitoring
+
+Lion's custom scans and SQL functions keep PostgreSQL's index usage statistics, `pg_stat_user_indexes`
+and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "Statistics"):
+
+- `idx_scan` and `last_idx_scan`: a scan of each index a node or function reads, each time it reads
+  it, a rescan with another parameter included: `LionCount` in all its forms, `LionSemiJoin`,
+  `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`, `LionBm25`, `lion_index_count()`,
+  `lion_index_count_any()`, `lion_index_count_group_stats()`, `lion_index_facets()`, `lion_bm25()`,
+  and `lion_bm25_score()`, which reads the index's statistics once a query. The B-tree that
+  `LionOrdered` or `LionBtreeScan` walks is counted by PostgreSQL, as its own scans are. A
+  partitioned table's partitions count their own indexes.
+- `idx_tup_read`: the rows an index gave. A count credits each index it read with the rows it
+  counted (a `count(DISTINCT)` with the distinct values, `lion_index_facets()` with the rows of the
+  keys it counted), a semi or anti join with the rows it returns; `LionOrdered` and `LionBtreeScan` credit the
+  members of the set they built from each Lion index and the entries a walk of a Lion column read,
+  `LionBm25` and `lion_bm25()` the entries of the query's words they took.
+- `idx_tup_fetch`: the table rows an index scan fetched itself - `LionOrdered`'s walk of a Lion
+  column, the rows `LionBm25` and `lion_bm25()` return - on the index and the table; and, on the
+  table only, as a bitmap heap scan's are, the rows a count rechecked on pages not all-visible or
+  for a residual clause, and those `LionOrdered` fetched by its set's TIDs.
+- In `pg_stat_user_tables`, a table's `idx_scan` is the sum of its indexes', and its
+  `idx_tup_fetch` adds its own fetches to theirs; no Lion node counts a `seq_scan`.
+
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
@@ -879,8 +977,9 @@ access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a l
 lion index's own ordered column walked, §30), no index-only scans of a lion index
 that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
 query come from a covering B-tree instead, §40), no INCLUDE columns, no
-parallel scan (a parallel build is supported from PostgreSQL 17), no reclaim of an emptied directory leaf or of an emptied posting-tree leaf
-(both wait for the whole set or the whole index to go). Inserts serialise on the directory
+parallel scan (a parallel build is supported from PostgreSQL 17). VACUUM reclaims the pages it
+empties, as a B-tree does: directory leaves, and the leaves of a key's posting tree while the key
+still has rows; the internal pages of a posting tree go with its key. Inserts serialise on the directory
 leaf that holds the key; see the measured
 [write costs](BENCHMARKS.md#size-build-and-writes-5m-rows-all-seven-indexes). Count pushdown supports constants, parameters
 and stable expressions such as `now() - interval '30 days'` or `current_date - 30` (evaluated once
@@ -923,6 +1022,20 @@ the planner prices them out and declines the count pushdown and `LionOrdered` - 
 nearest-neighbour query is then planned as a sort, under every `pg_lion.vector_postfilter` - and a
 scan or SQL count that reaches one anyway fails with an error rather than return a different answer
 than the snapshot's (DESIGN.md §9).  Inserts and VACUUM work as usual.
+
+Under SERIALIZABLE a lion index takes page-level predicate locks, as GIN does (DESIGN.md §9,
+"SERIALIZABLE"): a read of a key locks the root of its posting tree when its rows have one, and
+otherwise the directory leaf that holds the key, or would hold it; a range, a `GROUP BY` or a
+walk of a column locks every leaf it reads and those roots of the keys on it. An
+insert checks the page that stands for its key. So SERIALIZABLE transactions that read some keys
+and insert others do not fail each other: only keys without a posting tree of their own (a set
+still under `inline_limit`) that share a directory leaf conflict, as keys on one B-tree page do. A
+lookup that has to search beyond one leaf for an absent key (its hash collides with keys on the
+next) locks the whole index. The aggregates over keys (DESIGN.md §37) read every row, so they lock
+the table, as a sequential scan does. Rows the heap visits are locked as for any index scan; a read
+of more rows than `max_pred_locks_per_relation` allows locks the whole table instead, as it would
+through a B-tree. A `lionvec` index locks the whole index: any insert into it conflicts with every
+SERIALIZABLE read of it.
 
 A `lionvec` index (DESIGN.md §44) answers only an `ORDER BY` of its own distance operator, forward.
 It has no search operators, no bitmap or index-only scans and no INCLUDE columns, scans in

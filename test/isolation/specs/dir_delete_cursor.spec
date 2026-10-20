@@ -1,0 +1,1 @@
+../dir_delete_cursor.spec

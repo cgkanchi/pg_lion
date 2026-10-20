@@ -1,0 +1,221 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_halfdead s1_vacuum s2_shape s2_verify s2_read s2_insert s2_read s2_verify s1_detach_halfdead s1_vacuum s2_shape s2_verify s2_read
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_halfdead: SELECT injection_points_attach('lion-dir-delete-halfdead', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM dpd;
+ERROR:  error triggered for injection point lion-dir-delete-halfdead
+step s2_shape: 
+	SELECT deleted_pages = 0 AS none_deleted, deleted_pages >= 30 AS all_deleted
+	  FROM lion_index_stats('dpd_k');
+
+none_deleted|all_deleted
+------------+-----------
+t           |f          
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3    |down_from_403|key_5|key_100
+-----+---------+-----------+-------------+-----+-------
+ 0401|       49|401,402,403|402,401      |    0|      0
+(1 row)
+
+step s2_insert: 
+	INSERT INTO dpd VALUES (5, dpd_key(5)), (100, dpd_key(100)),
+						   (399, dpd_key(399));
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3  |down_from_403    |key_5|key_100
+-----+---------+---------+-----------------+-----+-------
+ 0005|       52|5,100,399|402,401,399,100,5|    1|      1
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s1_detach_halfdead: SELECT injection_points_detach('lion-dir-delete-halfdead');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM dpd;
+step s2_shape: 
+	SELECT deleted_pages = 0 AS none_deleted, deleted_pages >= 30 AS all_deleted
+	  FROM lion_index_stats('dpd_k');
+
+none_deleted|all_deleted
+------------+-----------
+f           |t          
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3  |down_from_403    |key_5|key_100
+-----+---------+---------+-----------------+-----+-------
+ 0005|       52|5,100,399|402,401,399,100,5|    1|      1
+(1 row)
+
+
+starting permutation: s1_unlinked s1_vacuum s2_shape s2_verify s2_read s2_insert s2_read s2_verify s1_detach_unlinked s1_vacuum s2_shape s2_verify s2_read
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_unlinked: SELECT injection_points_attach('lion-dir-delete-unlinked', 'error');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM dpd;
+ERROR:  error triggered for injection point lion-dir-delete-unlinked
+step s2_shape: 
+	SELECT deleted_pages = 0 AS none_deleted, deleted_pages >= 30 AS all_deleted
+	  FROM lion_index_stats('dpd_k');
+
+none_deleted|all_deleted
+------------+-----------
+f           |f          
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3    |down_from_403|key_5|key_100
+-----+---------+-----------+-------------+-----+-------
+ 0401|       49|401,402,403|402,401      |    0|      0
+(1 row)
+
+step s2_insert: 
+	INSERT INTO dpd VALUES (5, dpd_key(5)), (100, dpd_key(100)),
+						   (399, dpd_key(399));
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3  |down_from_403    |key_5|key_100
+-----+---------+---------+-----------------+-----+-------
+ 0005|       52|5,100,399|402,401,399,100,5|    1|      1
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s1_detach_unlinked: SELECT injection_points_detach('lion-dir-delete-unlinked');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step s1_vacuum: VACUUM dpd;
+step s2_shape: 
+	SELECT deleted_pages = 0 AS none_deleted, deleted_pages >= 30 AS all_deleted
+	  FROM lion_index_stats('dpd_k');
+
+none_deleted|all_deleted
+------------+-----------
+f           |t          
+(1 row)
+
+step s2_verify: SELECT lion_index_verify('dpd_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s2_read: 
+	SELECT right(min(k), 4) AS min_k,
+		   (SELECT count(*) FROM dpd WHERE k < dpd_key(450)) AS below_450,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd ORDER BY k LIMIT 3) t) AS first_3,
+		   (SELECT string_agg(id::text, ',')
+			  FROM (SELECT id FROM dpd WHERE k < dpd_key(403) ORDER BY k DESC) t) AS down_from_403,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(5)) AS key_5,
+		   (SELECT count(*) FROM dpd WHERE k = dpd_key(100)) AS key_100
+	  FROM dpd;
+
+min_k|below_450|first_3  |down_from_403    |key_5|key_100
+-----+---------+---------+-----------------+-----+-------
+ 0005|       52|5,100,399|402,401,399,100,5|    1|      1
+(1 row)
+

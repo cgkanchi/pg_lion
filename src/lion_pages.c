@@ -106,7 +106,34 @@ lion_page_set_deleted(Page page, FullTransactionId safexid)
 FullTransactionId
 lion_page_get_safexid(Page page)
 {
-	Assert(LionPageIsDeleted(page));
+	Assert(LionPageIsDeleted(page) || LionPageIsUnlinked(page));
+
+	/*
+	 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves") keeps only the
+	 * low half, in leftlink: its body is an empty page every reader that
+	 * lands on it walks through.  The epoch is the one that puts it at or
+	 * below the next transaction id, which is exact for as long as the page
+	 * is younger than 2^32 transactions and later than the truth - never
+	 * recycled too early - when it is older.
+	 */
+	if (!LionPageIsDeleted(page))
+	{
+		FullTransactionId next = ReadNextFullTransactionId();
+		TransactionId xid = (TransactionId) LionPageGetOpaque(page)->leftlink;
+		uint32		epoch = EpochFromFullTransactionId(next);
+
+		if (xid > XidFromFullTransactionId(next))
+		{
+			if (epoch == 0)
+				return next;	/* corrupt: not recyclable before next */
+			epoch--;
+		}
+		return FullTransactionIdFromEpochAndXid(epoch, xid);
+	}
+
+	/* A directory page keeps it in its special area (DESIGN.md §21). */
+	if ((LionPageGetOpaque(page)->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR)) != 0)
+		return lion_dir_page_safexid(page);
 
 	if (((PageHeader) page)->pd_lower <
 		SizeOfPageHeaderData + (int) sizeof(LionDeletedPageData))
@@ -118,9 +145,10 @@ lion_page_get_safexid(Page page)
 /*
  * Is the page at hand one the index may hand out again?
  *
- * The nbtree rule (BTPageIsRecyclable): the page must be DELETED and its
- * safexid must be old enough that no transaction which could still hold a
- * link to it is running.  heaprel is what GlobalVisCheckRemovableFullXid()
+ * The nbtree rule (BTPageIsRecyclable): the page must be DELETED - or an
+ * UNLINKED posting leaf, which is one that readers may still walk through
+ * (DESIGN.md §22) - and its safexid must be old enough that no transaction
+ * which could still hold a link to it is running.  heaprel is what GlobalVisCheckRemovableFullXid()
  * needs to compute that horizon.
  */
 static bool
@@ -133,7 +161,9 @@ lion_page_recyclable(Page page, Relation heaprel)
 	if (PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
 		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
 		return false;
-	if (!LionPageIsDeleted(page))
+	if (!LionPageIsDeleted(page) &&
+		!(LionPageIsContainer(page) && LionPageIsUnlinked(page) &&
+		  PageGetMaxOffsetNumber(page) == 0))
 		return false;
 
 	return GlobalVisCheckRemovableFullXid(heaprel, lion_page_get_safexid(page));
@@ -154,11 +184,12 @@ lion_page_recyclable(Page page, Relation heaprel)
  * free space map and the relation is extended instead - which also keeps this
  * loop from spinning on a block the map keeps offering.
  *
- * Note what is NOT here: nbtree writes an XLOG_BTREE_REUSE_PAGE record so
- * that replay can cancel a standby query that might still hold a link to the
- * block.  Generic WAL cannot raise a recovery conflict, so a standby reader
- * is protected by the owner check in the page's special area instead
- * (DESIGN.md §18).
+ * A DELETED page (or UNLINKED posting leaf) that is taken is announced to a
+ * standby first, as _bt_allocbuf() announces one: replay of that record
+ * cancels the standby queries whose snapshots are older than the page's
+ * safexid, which are the ones that may still hold a link to it
+ * (lion_wal_log_reuse()).  On the primary the safexid test itself keeps such
+ * a scan safe.
  */
 Buffer
 lion_alloc_page(Relation index, Relation heaprel, bool reuse)
@@ -173,8 +204,15 @@ lion_alloc_page(Relation index, Relation heaprel, bool reuse)
 
 			if (ConditionalLockBuffer(buf))
 			{
-				if (lion_page_recyclable(BufferGetPage(buf), heaprel))
+				Page		page = BufferGetPage(buf);
+
+				if (lion_page_recyclable(page, heaprel))
+				{
+					if (!PageIsNew(page))
+						lion_wal_log_reuse(index, heaprel, blkno,
+										   lion_page_get_safexid(page));
 					return buf;
+				}
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 			}
 
@@ -192,8 +230,8 @@ lion_alloc_page(Relation index, Relation heaprel, bool reuse)
  *
  * Nothing was written to it, so there is nothing to log and nothing to undo:
  * the block is either all-zero (it came from extending the relation) or still
- * the DELETED page the free space map offered, and both are exactly what
- * lion_alloc_page() accepts.  Recording it in the map hands it to the next
+ * the DELETED page, or UNLINKED posting leaf, the free space map offered, and
+ * both are exactly what lion_alloc_page() accepts.  Recording it in the map hands it to the next
  * allocation, so a split that turns out to need one page instead of two costs
  * a page once and never again.
  *

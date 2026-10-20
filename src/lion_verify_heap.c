@@ -221,7 +221,13 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 				/* a page nothing has checked yet: vouch for its items first */
 				for (i = FirstOffsetNumber; i <= maxoff; i++)
 					(void) lion_verify_dir_item(vs, blk, page, (OffsetNumber) i);
-				if (ItemIdIsUsed(PageGetItemId(page, first)))
+
+				/*
+				 * Its first KEY: an internal page's first downlink is minus
+				 * infinity, which a search lands on the leftmost page with.
+				 */
+				first = lion_dir_first_keyed(page);
+				if (first <= maxoff && ItemIdIsUsed(PageGetItemId(page, first)))
 				{
 					u->first = lion_verify_copy_item(page, first);
 					ok = true;

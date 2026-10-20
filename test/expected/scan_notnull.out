@@ -64,8 +64,9 @@ SELECT count(*) FILTER (WHERE tags = '{}') AS empty_tags,
 
 /*
  * snn_run() runs q one way - 'bitmap', 'plain' (an Index Scan), or 'node'
- * (LionOrdered or LionBtreeScan, every core scan but the btree's index-only
- * one disabled) - and through a sequential scan, compares the answers, in
+ * (LionOrdered or LionBtreeScan, the AM's own scans disabled and lion's
+ * paths preferred by pg_lion.pushdown_margin) - and through a sequential
+ * scan, compares the answers, in
  * order when `ordered` and as multisets otherwise, and says which scan ran and
  * what its recheck did: the rows the heap recheck of the index quals threw
  * away (only ever there when the scan left a qual to it), and for the nodes
@@ -85,15 +86,20 @@ DECLARE
 		ELSE format('SELECT array_agg(r::text ORDER BY r::text) FROM (%s) r', q) END;
 	a text[];
 	b text[];
+	margin text := current_setting('pg_lion.pushdown_margin');
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', (how = 'bitmap')::text, true);
-	PERFORM set_config('enable_indexscan', (how = 'plain')::text, true);
+	PERFORM set_config('enable_indexscan', (how <> 'bitmap')::text, true);
 	PERFORM set_config('enable_indexonlyscan', (how = 'node')::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (how = 'plain')::text, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', (how = 'node')::text, true);
 	PERFORM set_config('pg_lion.enable_btree_scan', (how = 'node')::text, true);
+	IF how = 'node' THEN
+		PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	END IF;
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || wq LOOP
 		IF node IS NULL AND ln ~ '(Bitmap Index Scan on|Index Scan using|Index Only Scan using|Custom Scan \(Lion\w+\)|Seq Scan on)' THEN
 			node := substring(ln from '(Bitmap Index Scan on \S+|Index Scan using \S+|Index Only Scan using \S+|Custom Scan \(Lion\w+\)|Seq Scan on \S+)');
@@ -111,11 +117,13 @@ BEGIN
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', margin, true);
 	EXECUTE wq INTO b;
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
@@ -758,7 +766,8 @@ SELECT snn_all('SELECT id, a FROM snn WHERE a IS NOT NULL AND b = 5 ORDER BY id'
 -- and the index-only walk fetches none
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET pg_lion.enable_count_pushdown = off;
 SELECT snn_explain('SELECT id, a FROM snn WHERE a IS NOT NULL AND b = 5 AND c IS NOT NULL ORDER BY id');
                           snn_explain                           
@@ -782,7 +791,8 @@ SELECT snn_explain('SELECT id, a FROM snn WHERE a IS NOT NULL AND b IN (2, 3)');
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE snn, snn_q;
 DROP FUNCTION snn_run(text, text, boolean), snn_all(text, boolean),

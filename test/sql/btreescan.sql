@@ -81,7 +81,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(Lion(Ordered|BtreeScan)\)' THEN
@@ -96,7 +97,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
@@ -146,7 +148,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(LionOrdered|LionBtreeScan|Ordered By:|Index:|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by|Switched)' THEN
 			RETURN NEXT btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
@@ -154,7 +157,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 END $$;
 
 /*
@@ -171,7 +175,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(Ordered By|Index):' THEN
 			RETURN NEXT btrim(ln);
@@ -187,7 +192,8 @@ BEGIN
 	RETURN NEXT CASE WHEN switched THEN 'Switched to Fetch and Sort' ELSE 'no switch' END;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 END $$;
 /*
  * lion_bs_node() names the node the plan uses with nothing disabled, if any.
@@ -208,13 +214,15 @@ END $$;
 -- 1. The plans, as EXPLAIN shows them: a covered btree qual with a lion
 --    filter, returning INCLUDE columns, with and without an ORDER BY; the
 --    same query reading a column the btree lacks walks in heap mode.
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT id, k, grp, x FROM bs WHERE k BETWEEN 1000 AND 3000 AND c200 = 17;
 EXPLAIN (COSTS OFF) SELECT id, k, grp, x FROM bs WHERE k BETWEEN 1000 AND 3000 AND c200 = 17 ORDER BY k;
 EXPLAIN (COSTS OFF) SELECT id, k, grp, x FROM bs WHERE c200 = 17 AND c20 = 3 ORDER BY k DESC LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT id, k, grp, x, payload FROM bs WHERE k BETWEEN 1000 AND 3000 AND c200 = 17 ORDER BY k;
 EXPLAIN (COSTS OFF) SELECT sum(x), max(x) FROM bs WHERE tags @> ARRAY['t3'];
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 
 -- 2. The answers against the ordinary plan: a covered `=` and ranges with a
 --    lion filter, IN lists on either side, a name column (a cstring in the
@@ -279,13 +287,16 @@ ANALYZE bs;
 
 -- 6. Row locks: a row mark needs the row's ctid, which no index returns, so
 --    the walk is heap mode and EvalPlanQual rechecks a heap tuple.
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 5 FOR UPDATE;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT lion_bs('SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 5 FOR UPDATE', true);
 
 -- 7. Cursors, fetched in pieces, in both modes.
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) DECLARE bs_c CURSOR FOR SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 8;
 EXPLAIN (COSTS OFF) DECLARE bs_h CURSOR FOR SELECT id, k, left(payload, 8) FROM bs WHERE c200 = 17 ORDER BY k LIMIT 8;
 BEGIN;
@@ -297,7 +308,8 @@ FETCH 2 FROM bs_c;
 FETCH ALL FROM bs_c;
 FETCH ALL FROM bs_h;
 COMMIT;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 
 -- 8. Params: a generic plan; a LATERAL subquery rescanned with the outer
 --    row's value in the lion filter (the set is rebuilt per outer row) and
@@ -325,10 +337,12 @@ SELECT * FROM lion_bs_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990)
 -- 9. A partial btree: its predicate's clause stays in the filter, so the
 --    predicate column must be covered too - it is in bs_part and not in
 --    bs_part_nf, whose walk is heap mode.
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT id, k, x FROM bs WHERE flag AND c200 = 17 ORDER BY k LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT id, x FROM bs WHERE flag AND c200 = 17 ORDER BY x LIMIT 10;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT lion_bs('SELECT id, k, x FROM bs WHERE flag AND c200 = 17 ORDER BY k LIMIT 10', true);
 SELECT lion_bs('SELECT id, x FROM bs WHERE flag AND c200 = 17 ORDER BY x LIMIT 10', true);
 SELECT lion_bs('SELECT id, x FROM bs WHERE flag AND c200 = 17 AND x < 100');
@@ -385,10 +399,12 @@ SELECT * FROM lion_bs_plan('SELECT id, k, x FROM bs WHERE k BETWEEN 1000 AND 900
 --     plan time, so a tsquery prefix or NOT - a superset, rechecked on every
 --     member - walks index-only too, reading the heap for each member as
 --     heap mode would.
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10;
 EXPLAIN (COSTS OFF) SELECT id, k, x FROM bs WHERE tags @> ARRAY['t3'] ORDER BY k LIMIT 10;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 -- an exact set: the heap is not read
 SELECT lion_bs('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10', true);
 SELECT * FROM lion_bs_run('SELECT grp, x FROM bs WHERE c200 = 17 ORDER BY grp LIMIT 10');
@@ -427,9 +443,11 @@ CREATE INDEX bsd_k ON bsd (k) INCLUDE (id);
 CREATE INDEX bsd_c2 ON bsd USING lion (c2);
 VACUUM (FREEZE, ANALYZE) bsd;
 PREPARE bs_deg AS SELECT id, k FROM bsd WHERE c2 = 1 ORDER BY k LIMIT 20;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) EXECUTE bs_deg;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 SET pg_lion.enable_lazy_set = off;
@@ -507,10 +525,12 @@ ALTER TABLE bsn DROP COLUMN dropme;
 CREATE INDEX bsn_grp ON bsn (grp DESC NULLS FIRST, id) INCLUDE (x, nm);
 CREATE INDEX bsn_c ON bsn USING lion (c);
 VACUUM (FREEZE, ANALYZE) bsn;
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) SELECT grp, x, nm FROM bsn WHERE c = 1 ORDER BY grp DESC NULLS FIRST, id LIMIT 12;
 SELECT grp, x, nm FROM bsn WHERE c = 1 ORDER BY grp DESC NULLS FIRST, id LIMIT 6;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT lion_bs('SELECT grp, x, nm FROM bsn WHERE c = 1 ORDER BY grp DESC NULLS FIRST, id LIMIT 12', true);
 SELECT lion_bs('SELECT grp, x, nm FROM bsn WHERE c = 1 ORDER BY grp NULLS LAST, id DESC LIMIT 12', true);
 SELECT lion_bs('SELECT id, x, nm FROM bsn WHERE c = 1 AND grp IS NULL');
@@ -533,7 +553,8 @@ RESET pg_lion.enable_ordered_scan;
 RESET pg_lion.enable_btree_scan;
 BEGIN;
 SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 DECLARE bs_s SCROLL CURSOR FOR SELECT id, k, x FROM bs WHERE c200 = 17 ORDER BY k LIMIT 8;
 FETCH 5 FROM bs_s;
 FETCH BACKWARD 3 FROM bs_s;
@@ -546,7 +567,9 @@ COMMIT;
 --     not offered, with core's scans enabled or disabled (the plan's text
 --     varies between majors, so only the node's presence is printed); a
 --     partial lion index walked whole, with no clauses of its own, adds its
---     predicate's selectivity and is offered.
+--     predicate's selectivity and is offered.  Before 18 the OR is no clause
+--     of the btree's, so the lion index's restricts the walk and the pair is
+--     offered, and forced where lion's paths are.
 CREATE TABLE bso (id int, k int, c int, flag bool) WITH (autovacuum_enabled = off);
 INSERT INTO bso SELECT i, i % 1000, i % 10, i % 3 = 0 FROM generate_series(1, 30000) i;
 CREATE INDEX bso_k ON bso (k) INCLUDE (id, c);
@@ -556,13 +579,21 @@ VACUUM (FREEZE, ANALYZE) bso;
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k IN (1, 7)');
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k BETWEEN 10 AND 20');
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
-SELECT lion_bs_node('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
+SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
+SELECT lion_bs_node('SELECT id, k FROM bso WHERE k = 1 OR k = 7') =
+	   CASE WHEN current_setting('server_version_num')::int >= 180000
+			THEN 'no Lion node' ELSE 'LionBtreeScan' END
+	   AS or_as_the_major_matches_it;
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE k IN (1, 7)');
 SELECT lion_bs_node('SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500');
 EXPLAIN (COSTS OFF) SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
-SELECT lion_bs('SELECT id, k FROM bso WHERE k = 1 OR k = 7');
+RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
+SELECT lion_bs('SELECT id, k FROM bso WHERE k = 1 OR k = 7') =
+	   CASE WHEN current_setting('server_version_num')::int >= 180000
+			THEN 'no node, 60 rows' ELSE 'LionBtreeScan index only, 60 rows' END
+	   AS or_as_the_major_matches_it;
 SELECT lion_bs('SELECT id, k FROM bso WHERE flag AND k BETWEEN 10 AND 500');
 DROP TABLE bso;
 

@@ -1,8 +1,8 @@
 # Two SERIALIZABLE transactions each rank an absent term, then each insert a
-# row with it.  Ranking reads the index under the relation-level predicate
-# lock index_beginscan() takes for an AM without ampredlocks, so the second
-# commit must fail with a serialization failure, as it does for an ordinary
-# index scan - both through lion_bm25() and through the LionBm25 scan.
+# row with it.  Ranking predicate-locks the leaf where the term's entry would
+# be (DESIGN.md §9), which the insert checks, so the second commit must fail
+# with a serialization failure, as it does for an ordinary index scan - both
+# through lion_bm25() and through the LionBm25 scan.
 
 setup
 {
@@ -18,7 +18,7 @@ teardown
 }
 
 session s1
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_func	{ SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10); }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id FROM bm_ser WHERE d @@ 'secret'
@@ -29,7 +29,7 @@ step s1_insert	{ INSERT INTO bm_ser VALUES (-1, to_tsvector('simple', 'secret on
 step s1_commit	{ COMMIT; }
 
 session s2
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_func	{ SELECT count(*) FROM lion_bm25('bm_ser_d', 'secret', 10); }
 step s2_scan	{ SELECT id FROM bm_ser WHERE d @@ 'secret'

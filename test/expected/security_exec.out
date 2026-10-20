@@ -612,7 +612,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionBm25)%' THEN
 			scanned := true;
@@ -661,7 +661,7 @@ SELECT lion_exb('SELECT id FROM lion_exb WHERE d @@ ''w1 & w3 & w4''
 -- plain EXPLAIN initialises the plan, which asks for the privilege too
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET ROLE lion_exec_other;
 EXPLAIN (COSTS OFF) SELECT id FROM lion_exb WHERE d @@ 'w1 & w3 & w4'
 	ORDER BY lion_bm25_score(d, 'w1 & w3 & w4', 'lion_exb_d') DESC LIMIT 5;
@@ -703,7 +703,7 @@ DEALLOCATE lion_exb_q;
 RESET plan_cache_mode;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 REVOKE EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) FROM lion_exec_user;
 GRANT EXECUTE ON FUNCTION lion_bm25_score(tsvector, tsquery, regclass, float8, float8, name) TO PUBLIC;
 -- granted again: every role, and the same rows as the ordinary plan

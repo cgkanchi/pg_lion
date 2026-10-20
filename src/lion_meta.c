@@ -61,7 +61,7 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta = LionPageGetMeta(page);
 	memset(meta, 0, sizeof(LionMetaPageData));
 	meta->magic = LION_MAGIC;
-	meta->version = LION_VERSION_V11;
+	meta->version = LION_VERSION_V12;
 	meta->offset_bits = LION_OFFSET_BITS;
 	meta->container_bits = LION_CONTAINER_BITS;
 	meta->unused_nbuckets = 0;
@@ -301,15 +301,15 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X, expected %08X.",
 						   meta->magic, LION_MAGIC)));
-	if (meta->version != LION_VERSION_V11)
+	if (meta->version != LION_VERSION_V12)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
 						   meta->magic, meta->version, LION_MAGIC,
-						   LION_VERSION_V11),
-				 meta->version < LION_VERSION_V11 ?
+						   LION_VERSION_V12),
+				 meta->version < LION_VERSION_V12 ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
 
@@ -357,11 +357,12 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	 * What the build recorded from its reloptions, within the bounds the
 	 * reloptions enforce: an inline_limit past the page would have inserts
 	 * build entries no page can hold, and a height past what block numbers
-	 * allow is damage, not a tall tree.
+	 * allow is damage, not a tall tree (LION_MAX_DIR_HEIGHT says why no
+	 * sound directory reaches it).
 	 */
 	if (meta->inline_limit < LION_MIN_INLINE_LIMIT ||
 		meta->inline_limit > LION_MAX_INLINE_LIMIT ||
-		meta->height > 32)
+		meta->height > LION_MAX_DIR_HEIGHT)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
@@ -419,7 +420,7 @@ void
 lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 						   uint32 bucket_tids)
 {
-	meta->version = LION_VERSION_V11;
+	meta->version = LION_VERSION_V12;
 	if (cols == 0)
 	{
 		meta->summary_cols = 0;
