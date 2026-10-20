@@ -161,6 +161,20 @@ lion_ordering_op_is_gt(Oid gtopr, Oid *opfamily, Oid *opcintype)
 #endif
 
 /*
+ * The next row of an index scan, into slot.  20 moved the fetch of an index
+ * scan's rows into the table AM: genam.h's index_getnext_slot() is tableam.h's
+ * table_index_getnext_slot(), which dispatches through the scan's
+ * xs_getnext_slot; the arguments and the answer are the same.
+ */
+#if PG_VERSION_NUM >= 200000
+#define lion_index_getnext_slot(scan, direction, slot) \
+	table_index_getnext_slot(scan, direction, slot)
+#else
+#define lion_index_getnext_slot(scan, direction, slot) \
+	index_getnext_slot(scan, direction, slot)
+#endif
+
+/*
  * The same question of many TIDs of one relation in a row, the planner's
  * endpoint probe's (DESIGN.md §28).  16-19's table_index_fetch_tuple_check()
  * creates a fetch state and a slot for every TID it is asked about and drops
