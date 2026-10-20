@@ -249,7 +249,11 @@ VACUUM (FREEZE, ANALYZE) lca_rows, lca_skip, lca_num, lca_tag;
 SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
 -- a GROUP BY, the two-clause form over one column, and an inner side that is a join
 SELECT * FROM lca_explain('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g');
-SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')');
+-- (the child's own plan, a join of two tables with every join method
+-- disabled, is whichever the release makes: only its top is shown)
+SELECT regexp_replace(ln, '(Nested Loop|Hash Join|Merge Join)', 'a join') AS ln
+  FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag t ON t.a = s.a WHERE s.a = r.k AND t.tag = ''on'')') AS ln
+ WHERE ln !~ '^\s{8}';
 -- the counters: the child's rows, the distinct keys, the rows found, and those subtracted
 SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)',
 						  'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
