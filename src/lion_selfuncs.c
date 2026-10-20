@@ -3884,6 +3884,71 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 }
 
 /*
+ * A parameterized scan's rows as get_parameterized_baserel_size() computes
+ * them - rel's restriction clauses with ppi's join clauses ANDed in, taken as
+ * independent of them - with the restriction clauses as lion_probe_rel_rows()
+ * takes them (canon, lion_rel_canonical_clauses()), times the factor the
+ * probe found of them, clamped, and no more than rel's corrected rows.
+ *
+ * The factor applies before the rows are clamped to one, as in
+ * lion_probe_rel_rows(): a lookup on a unique key is a small fraction of a
+ * row in core's product, which core clamps to one, and that one row times the
+ * factor would be as many rows, which no unique key returns.
+ */
+static double
+lion_param_rows(PlannerInfo *root, RelOptInfo *rel, ParamPathInfo *ppi,
+				List *canon, double factor, double relrows)
+{
+	List	   *allclauses = list_concat_copy(ppi->ppi_clauses, canon);
+	double		rows;
+
+	rows = rel->tuples * clauselist_selectivity(root, allclauses, rel->relid,
+												JOIN_INNER, NULL);
+	list_free(allclauses);
+	rows = clamp_row_est(rows * factor);
+	return Min(rows, relrows);
+}
+
+/*
+ * The rows of each of paths as lion_correct_rel_rows() corrects rel's: an
+ * unparameterized path's by ratio, the correction of rel->rows; a
+ * parameterized one's by its ParamPathInfo's, from the rows that holds to
+ * ppirows[i] for the i-th of ppilist, so that a path whose rows are its
+ * ParamPathInfo's (cost_index() and the like; divided among a partial path's
+ * workers) still agrees with it.  A ParamPathInfo not in ppilist is not
+ * corrected, nor is its path.
+ */
+static void
+lion_correct_path_rows(List *paths, List *ppilist, const double *ppirows,
+					   double ratio)
+{
+	ListCell   *lc;
+
+	foreach(lc, paths)
+	{
+		Path	   *path = (Path *) lfirst(lc);
+		double		r = ratio;
+
+		if (path->param_info != NULL)
+		{
+			ListCell   *lc2;
+
+			r = 1.0;
+			foreach(lc2, ppilist)
+			{
+				if (lfirst(lc2) == path->param_info)
+				{
+					r = ppirows[foreach_current_index(lc2)] /
+						Max(path->param_info->ppi_rows, 1.0);
+					break;
+				}
+			}
+		}
+		path->rows = clamp_row_est(path->rows * r);
+	}
+}
+
+/*
  * set_rel_pathlist_hook, first: rel's row count as the intersection probe
  * measures its restriction clauses (DESIGN.md §29.11, "The relation's rows").
  * Where the probe found the AND of the set clauses of one lion index at least
@@ -3892,10 +3957,11 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
  * measured - and so do the rows of every path already built for rel, which
  * were core's: an unparameterized path's rows are rel->rows (divided among a
  * partial path's workers), and its cost does not depend on them, each scan
- * pricing its own clauses' selectivity; a parameterized path's rows and its
- * ParamPathInfo's are the same restriction clauses with its join clauses
- * ANDed in, and take the same factor.  Joins are sized from rel->rows after
- * this, and the paths and Gathers built from here on read it.
+ * pricing its own clauses' selectivity; a parameterized path's rows are its
+ * ParamPathInfo's, the same restriction clauses with its join clauses ANDed
+ * in, which take the same factor (lion_param_rows()).  Joins are sized from
+ * rel->rows after this, and the paths and Gathers built from here on read
+ * it.
  *
  * Only a plain relation of its own: an inheritance parent's rows are its
  * children's sum, made before any child's paths are built, and a child's
@@ -3906,14 +3972,20 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	double		oldrows = rel->rows;
 	double		newrows;
+	double		factor;
 	double		ratio;
+	double	   *ppirows;
+	List	   *canon;
+	bool		changed;
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
 	if (!lion_enable_rows_correction || !lion_enable_intersection_probe ||
 		root->glob == NULL || rel->reloptkind != RELOPT_BASEREL ||
-		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL ||
-		lion_isect_rel_factor(root, rel) == 1.0)
+		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL)
+		return;
+	factor = lion_isect_rel_factor(root, rel);
+	if (factor == 1.0)
 		return;
 
 	newrows = lion_probe_rel_rows(root, rel);
@@ -3921,16 +3993,24 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return;
 	ratio = newrows / Max(oldrows, 1.0);
 
-	rel->rows = newrows;
-	foreach(lc, rel->pathlist)
-		((Path *) lfirst(lc))->rows =
-			clamp_row_est(((Path *) lfirst(lc))->rows * ratio);
-	foreach(lc, rel->partial_pathlist)
-		((Path *) lfirst(lc))->rows =
-			clamp_row_est(((Path *) lfirst(lc))->rows * ratio);
+	/* every ParamPathInfo's rows anew, before any of them changes */
+	ppirows = (double *) palloc(sizeof(double) *
+								Max(list_length(rel->ppilist), 1));
+	canon = lion_rel_canonical_clauses(rel, &changed);
 	foreach(lc, rel->ppilist)
-		((ParamPathInfo *) lfirst(lc))->ppi_rows =
-			clamp_row_est(((ParamPathInfo *) lfirst(lc))->ppi_rows * ratio);
+		ppirows[foreach_current_index(lc)] =
+			lion_param_rows(root, rel, lfirst_node(ParamPathInfo, lc), canon,
+							factor, newrows);
+	list_free(canon);
+
+	rel->rows = newrows;
+	lion_correct_path_rows(rel->pathlist, rel->ppilist, ppirows, ratio);
+	lion_correct_path_rows(rel->partial_pathlist, rel->ppilist, ppirows,
+						   ratio);
+	foreach(lc, rel->ppilist)
+		lfirst_node(ParamPathInfo, lc)->ppi_rows =
+			ppirows[foreach_current_index(lc)];
+	pfree(ppirows);
 
 	/* lion_probe_rel_rows() reads it as it is from here on */
 	oldcxt = MemoryContextSwitchTo(lion_probe_cache_for(root)->cxt);
