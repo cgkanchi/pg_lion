@@ -8129,7 +8129,8 @@ every scan shape against a sequential scan on an enum column, a list longer than
     if any spec is skipped, rmgr run with `wal_consistency_checking`; and a dist job (validate,
     `make dist`, build and test from the zip). Each server job runs unit, installcheck and
     installcheck-rmgr through `./dev.sh` with `LION_SOCK`/`LION_PORT`. Checked with actionlint
-    1.7.7 and shellcheck 0.10; it runs on every push and pull request.
+    1.7.7 and shellcheck 0.10; it runs on pull requests, pushes to main,
+    and by hand (`workflow_dispatch`) on any branch.
   - `pg_upgrade`: works across majors, and found a preload bug (§23 addendum below).
   - The WAL resource manager id: 170, reserved for pg_lion on
     https://wiki.postgresql.org/wiki/CustomWALResourceManagers, is `pg_lion.rmgr_id`'s default
