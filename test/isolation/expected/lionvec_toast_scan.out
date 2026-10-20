@@ -14,7 +14,8 @@ injection_points_attach
 
 step s1_scan: 
 	BEGIN ISOLATION LEVEL REPEATABLE READ;
-	SET LOCAL enable_indexscan = off;
+	SET LOCAL pg_lion.enable_plain_scan = off;
+	SET LOCAL pg_lion.pushdown_margin = 1000;
 	SET LOCAL client_min_messages = debug1;
 	INSERT INTO lvt_got (id)
 	SELECT id FROM (SELECT id FROM lvt WHERE cat = 3 ORDER BY v <-> lvt_vec(-3, 0.2)) s;

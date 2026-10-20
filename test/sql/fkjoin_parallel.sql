@@ -255,14 +255,13 @@ RESET debug_parallel_query;
 ALTER TABLE lion_pd SET (parallel_workers = 2);
 
 -- ---- 4. rescans: the Gather started again for every outer row ------------------
--- (index scans off: a nested loop semi join over lion_pf_fk is cheaper than the
--- node here, and it is the node's rescans this is about)
+-- (the AM's plain scans off: a nested loop semi join over lion_pf_fk is cheaper
+-- than the node here, and it is the node's rescans this is about)
 SET enable_material = off;
 SET enable_memoize = off;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g;
 RESET enable_hashjoin;
@@ -276,8 +275,7 @@ SELECT lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT
 	   lion_pj_counter('SELECT g, s.c FROM generate_series(2690, 2700, 2) g LEFT JOIN (SELECT count(*) AS c FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)) s ON s.c > g', 'Fact Filter Copy Chunks') AS chunks;
 RESET enable_material;
 RESET enable_memoize;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 
 -- ---- 5. a generic plan's parameters, evaluated in every participant ------------

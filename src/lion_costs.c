@@ -309,7 +309,7 @@ lion_costs_init(void)
 							 "The price of a LionCount, LionSemiJoin, LionAntiJoin or LionOrdered path is divided by it (DESIGN.md §39); 1 is no margin.",
 							 &lion_pushdown_margin,
 							 1.0,
-							 0.01, 1.0,
+							 0.01, 1000.0,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
 							 NULL, NULL, NULL);

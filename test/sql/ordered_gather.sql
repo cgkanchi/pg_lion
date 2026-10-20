@@ -35,7 +35,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -49,7 +50,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
@@ -78,7 +80,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ 'temp written=[1-9]' THEN
@@ -87,7 +90,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	RETURN written;
 END $$;
@@ -99,7 +103,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(LionOrdered|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by|Switched)' THEN
@@ -108,7 +113,8 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 END $$;
 
@@ -147,7 +153,7 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.1 ORDER BY k, id LIMIT 5');
 -- 3. More a key (2,800) than an ARRAY holds: a BITSET whose bits the
 --    flushes set in place, made the smallest container at the end.
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 ORDER BY k DESC, id DESC LIMIT 20000');
-SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 1000');
 
 -- 4. Pieces of hundreds of members, RUNs: each goes into the container
 --    with the room's members, and a key of many is a BITSET.
@@ -180,7 +186,7 @@ SELECT * FROM og_run('SELECT id FROM ogn WHERE g BETWEEN 10 AND 40 ORDER BY k, i
 --    two gathered leaves, each spilled, ORed in the file (an AND would be
 --    planned as the g leaf's set and a Filter)
 SELECT og_cmp('SELECT id, k FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 20000');
-SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 5');
+SELECT * FROM og_run('SELECT id FROM ogn WHERE u < 0.5 OR g BETWEEN 10 AND 40 ORDER BY k, id LIMIT 1000');
 --    the spill goes through the server's temporary files: temp_file_limit
 --    stops it (caught here, the GUC's name unquoted: PostgreSQL 17 quotes
 --    it in the message), and EXPLAIN (BUFFERS) counts its blocks written
@@ -193,7 +199,7 @@ EXCEPTION WHEN OTHERS THEN
 	RAISE NOTICE '%: %', SQLSTATE, replace(SQLERRM, '"', '');
 END $$;
 RESET temp_file_limit;
-SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 5');
+SELECT og_temp('SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id LIMIT 1000');
 SELECT og_temp('SELECT id FROM ogn WHERE u < 0.03 ORDER BY k, id LIMIT 5');
 --    a rescan with another Param builds the set again, in the same file
 SELECT og_cmp($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
@@ -206,7 +212,8 @@ SELECT * FROM og_run($$SELECT o.lo, x.id FROM (VALUES (0.0), (0.45)) o(lo),
 --    cursor is paused after the build (as ordered.sql's section 16 reads it)
 BEGIN;
 SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 DECLARE og_cur CURSOR FOR SELECT id FROM ogn WHERE u < 0.5 ORDER BY k, id;
 FETCH 2 FROM og_cur;
 SELECT used_bytes <= 65536 AS within_hash_mem

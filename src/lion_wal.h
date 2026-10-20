@@ -43,7 +43,9 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/transam.h"
 #include "access/xlog_internal.h"
+#include "storage/relfilelocator.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
 #include "utils/relcache.h"
@@ -78,6 +80,26 @@
 #define LION_XLOG_PAGE_DELETED		0xA0	/* a page handed to the FSM */
 #define LION_XLOG_ENTRY				0xB0	/* entry add/replace/delete */
 #define LION_XLOG_VACUUM_VISIT		0xC0	/* cleanup-lock barrier, no change */
+#define LION_XLOG_UNLINK			0xD0	/* a page out of its tree (§21, §22) */
+#define LION_XLOG_REUSE				0xE0	/* a DELETED page taken again */
+#define LION_XLOG_LAST				LION_XLOG_REUSE
+
+/*
+ * LION_XLOG_REUSE has no registered block.  Its main data is the header and
+ * this, and its redo raises a recovery conflict with the standby queries
+ * whose snapshots may still hold a link to the page - nbtree's
+ * XLOG_BTREE_REUSE_PAGE, which a generic-mode index writes instead
+ * (lion_wal_log_reuse()).
+ */
+typedef struct xl_lion_reuse
+{
+	RelFileLocator locator;
+	BlockNumber block;
+	FullTransactionId horizon;	/* the page's safexid */
+	bool		isCatalogRel;
+} xl_lion_reuse;
+
+#define SizeOfLionReuse	(offsetof(xl_lion_reuse, isCatalogRel) + sizeof(bool))
 
 /* ---------- the per-block operation stream ---------- */
 
@@ -297,6 +319,14 @@ extern void lion_wal_abort(LionWalState *state);
  * cleanup lock on that page throughout) and not of the operation.
  */
 extern void lion_wal_removal_begin(Buffer also);
+
+/*
+ * Tell a standby that the DELETED page blk, whose safexid is horizon, is about
+ * to be used again (lion_alloc_page()).  Writes nothing when no standby can be
+ * reading: an index that needs no WAL, or wal_level minimal.
+ */
+extern void lion_wal_log_reuse(Relation index, Relation heaprel,
+							   BlockNumber blk, FullTransactionId horizon);
 extern void lion_wal_removal_end(void);
 
 /*

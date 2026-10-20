@@ -44,8 +44,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
@@ -63,8 +62,7 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	EXECUTE 'CREATE TEMP TABLE lmb_off AS ' || q;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	SELECT count(*) INTO nrows FROM lmb_off;
 	SELECT (SELECT count(*) FROM (TABLE lmb_on EXCEPT ALL TABLE lmb_off) x) +
@@ -251,7 +249,7 @@ DECLARE
 	c text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || s LOOP
 		pushed := pushed OR ln LIKE '%Custom Scan (LionCount)%';
 	END LOOP;
@@ -262,7 +260,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO c;
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	RETURN CASE WHEN NOT pushed THEN 'NOT PUSHED DOWN'
 				WHEN a IS DISTINCT FROM c THEN 'pushdown DIFFERENT: ' || a || ' against ' || c

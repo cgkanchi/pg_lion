@@ -126,8 +126,9 @@ RESET pg_lion.enable_count_pushdown;
 
 -- ---------- 3. an end whose rows are deleted is not an end ----------
 -- The newest 1,000 rows go.  Their entries stay until VACUUM, and once it has
--- run their leaves stay, empty and linked (DESIGN.md §18).  Either way the
--- probe steps over them to the live end, 2026-01-21 03:20, which is where
+-- run the leaves they emptied leave the directory (DESIGN.md §21, "Page
+-- deletion").  Either way the probe steps over them to the live end,
+-- 2026-01-21 03:20, which is where
 -- core finds it with a btree: lion's estimate from the directory alone and
 -- core's from the btree are the same number, before VACUUM and after.  Each
 -- lion estimate is taken right after the btree's, with the btree dropped in
@@ -150,14 +151,20 @@ CREATE INDEX lpr_bt ON lpr (ts);
 SELECT lpr_note('vacuumed, btree', NULL);
 DROP INDEX lpr_bt;
 SELECT lpr_note('vacuumed, lion', 'lpr_lion');
--- 15,000 more, and their leaves - an index that grew by inserts holds a few
--- dozen of its keys to a leaf - are more than the probe reads
--- (LION_PROBE_LEAVES): it gives up, and the histogram's own end stands, as
--- it does for core's probe when that gives up.
+-- 15,000 more.  Until VACUUM their entries stay, holding rows no snapshot
+-- sees, and their leaves - an index that grew by inserts holds a few dozen of
+-- its keys to a leaf - are more than the probe reads (LION_PROBE_LEAVES): it
+-- gives up, and the histogram's own end stands, as it does for core's probe
+-- when that gives up.  VACUUM takes the entries and their leaves out, and the
+-- probe finds the live end again where core finds it with a btree.
 DELETE FROM lpr WHERE id > 14000;
-VACUUM lpr;
 SELECT lpr_note('too many, lion', 'lpr_lion');
 SELECT lpr_note('too many, core', NULL);
+VACUUM lpr;
+CREATE INDEX lpr_bt ON lpr (ts);
+SELECT lpr_note('reclaimed, btree', NULL);
+DROP INDEX lpr_bt;
+SELECT lpr_note('reclaimed, lion', 'lpr_lion');
 SELECT (SELECT est FROM lpr_est WHERE step = 'deleted, lion') =
 	   (SELECT est FROM lpr_est WHERE step = 'deleted, btree') AS deleted_as_btree,
 	   (SELECT est FROM lpr_est WHERE step = 'vacuumed, lion') =
@@ -165,7 +172,9 @@ SELECT (SELECT est FROM lpr_est WHERE step = 'deleted, lion') =
 	   (SELECT est FROM lpr_est WHERE step = 'vacuumed, lion') >
 	   10 * (SELECT est FROM lpr_est WHERE step = 'histogram') AS probed,
 	   (SELECT est FROM lpr_est WHERE step = 'too many, lion') =
-	   (SELECT est FROM lpr_est WHERE step = 'too many, core') AS given_up;
+	   (SELECT est FROM lpr_est WHERE step = 'too many, core') AS given_up,
+	   (SELECT est FROM lpr_est WHERE step = 'reclaimed, lion') =
+	   (SELECT est FROM lpr_est WHERE step = 'reclaimed, btree') AS reclaimed_as_btree;
 SELECT count(*) FROM lpr WHERE ts >= '2026-01-10';
 
 -- ---------- 4. what is not probed ----------

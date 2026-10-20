@@ -84,14 +84,13 @@ lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 /*
  * The relation is opened (lion_open_relation()): each dimension's index but
  * the driver's, which the walk has opened, its key column found in the index
- * as it is (DESIGN.md §24), and read under the same predicate lock as every
- * index the node reads.
+ * as it is (DESIGN.md §24).  Under SERIALIZABLE each label's lookup locks the
+ * page that stands for its key, found or not (DESIGN.md §9).
  */
 void
 lion_cells_open(LionCountScanState *st)
 {
 	LionCellsRun *cr = st->cells;
-	Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
 	int			d;
 
 	if (cr == NULL)
@@ -109,7 +108,6 @@ lion_cells_open(LionCountScanState *st)
 												  pv->attno),
 							   pv->kind == LION_CELLDIM_MULTI,
 							   st->plan.vcols);
-		lion_reader_lock(cr->idx[d], snapshot);
 	}
 }
 

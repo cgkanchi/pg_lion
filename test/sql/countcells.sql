@@ -79,8 +79,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ '^\s*Cells: ' THEN
@@ -93,11 +92,14 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE lcc_on AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lcc_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	SELECT count(*) INTO nrows FROM lcc_off;
 	SELECT (SELECT count(*) FROM (TABLE lcc_on EXCEPT ALL TABLE lcc_off) x) +
@@ -186,8 +188,7 @@ SELECT id, n, k, s, f, g, score,
 -- of an outcome each (1-3, 4-5, 6-7, another value, NULL)
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT * FROM lion_explain_norm($$
 SELECT CASE WHEN k IN (1, 2, 3) THEN 'a' WHEN k = 4 OR k = 5 THEN 'b'
 			WHEN k IS NULL THEN 'n' ELSE 'c' END AS t, count(*)
@@ -200,8 +201,7 @@ SELECT * FROM lcc_plan(
 	'SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = ''high''') AS p("QUERY PLAN");
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---------- 2. the tier and the score ----------
 SELECT q, lcc_check(q) FROM (VALUES

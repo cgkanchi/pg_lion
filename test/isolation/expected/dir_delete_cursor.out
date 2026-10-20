@@ -1,0 +1,73 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plan s1_begin s1_up1 s1_down1 s2_vacuum s2_shape s2_insert s1_up s1_down s1_commit s2_verify s2_count
+step s1_plan: EXPLAIN (COSTS OFF) SELECT id FROM ddc ORDER BY k;
+QUERY PLAN                         
+-----------------------------------
+Custom Scan (LionOrdered) on ddc   
+  Ordered By: ddc_k (k, nulls last)
+(2 rows)
+
+step s1_begin: 
+	BEGIN;
+	DECLARE up CURSOR FOR SELECT id FROM ddc ORDER BY k;
+	DECLARE down CURSOR FOR SELECT id FROM ddc ORDER BY k DESC;
+	MOVE 99 FROM up;
+	MOVE 99 FROM down;
+
+step s1_up1: FETCH 1 FROM up;
+ id
+---
+100
+(1 row)
+
+step s1_down1: FETCH 1 FROM down;
+  id
+----
+1901
+(1 row)
+
+step s2_vacuum: VACUUM ddc;
+step s2_shape: 
+	SELECT deleted_pages > 150 AS pages_deleted, leaf_pages < 40 AS few_leaves
+	  FROM lion_index_stats('ddc_k');
+
+pages_deleted|few_leaves
+-------------+----------
+t            |t         
+(1 row)
+
+step s2_insert: 
+	INSERT INTO ddc SELECT i, ddc_key(i) FROM generate_series(101, 300) i;
+
+step s1_up: FETCH 3 FROM up;
+  id
+----
+1901
+1902
+1903
+(3 rows)
+
+step s1_down: FETCH 3 FROM down;
+ id
+---
+100
+ 99
+ 98
+(3 rows)
+
+step s1_commit: COMMIT;
+step s2_verify: SELECT lion_index_verify('ddc_k', true) AS verify;
+verify
+------
+      
+(1 row)
+
+step s2_count: 
+	SELECT count(*) AS rows, min(id) AS lo, max(id) AS hi FROM ddc;
+
+rows|lo|  hi
+----+--+----
+ 400| 1|2000
+(1 row)
+

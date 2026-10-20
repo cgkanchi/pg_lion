@@ -61,7 +61,8 @@ setup
 	SET pg_lion.enable_count_pushdown = on;
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-entry-scan-resumed', 'wait');
 }
@@ -74,7 +75,8 @@ setup
 	SET pg_lion.enable_count_pushdown = on;
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 	SELECT injection_points_set_local();
 	SELECT injection_points_attach('lion-entry-scan-leaf', 'wait');
 }
@@ -144,7 +146,8 @@ setup
 {
 	SET enable_seqscan = off;
 	SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off;
+	SET pg_lion.pushdown_margin = 1000;
 }
 step s3_prep	{ VACUUM (FREEZE, ANALYZE) rsr; }
 step s3_how		{

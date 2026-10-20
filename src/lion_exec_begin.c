@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "pgstat.h"
+
 #include "lion_customscan.h"
 #include "lion_plan_private.h"
 
@@ -551,6 +553,10 @@ lion_open_relation(LionCountScanState *st, int p)
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
 
+	/* a partition is made the one counted only to be read */
+	st->statread = (part != NULL);
+	st->statrows = 0;
+
 	for (i = 0; i < st->nclause; i++)
 	{
 		if (st->clause[i].idx == NULL)
@@ -602,37 +608,6 @@ lion_open_relation(LionCountScanState *st, int p)
 		}
 	}
 
-	/*
-	 * index_beginscan() would take a relation-level predicate lock on each of
-	 * these (the AM has no ampredlocks); we read them without a scan, so take
-	 * it here, before any lookup, so that absent keys are covered as well.
-	 * Without it two SERIALIZABLE transactions could each count an absent
-	 * key, insert it, and both commit.
-	 */
-	{
-		Snapshot	snapshot = st->css.ss.ps.state->es_snapshot;
-
-		for (i = 0; i < st->nclause; i++)
-		{
-			if (st->clause[i].idx != NULL)
-				lion_reader_lock(st->clause[i].idx, snapshot);
-		}
-		if (st->groupidx != NULL)
-			lion_reader_lock(st->groupidx, snapshot);
-		if (st->groupidx2 != NULL)
-			lion_reader_lock(st->groupidx2, snapshot);
-		if (st->decode != NULL)
-		{
-			int			c;
-
-			for (c = 0; c < st->decode->ncol; c++)
-			{
-				if (st->decode->idx[c] != NULL)
-					lion_reader_lock(st->decode->idx[c], snapshot);
-			}
-		}
-	}
-
 	/* the indexes of a count by cells' dimensions (DESIGN.md §10) */
 	lion_cells_open(st);
 
@@ -643,6 +618,57 @@ lion_open_relation(LionCountScanState *st, int p)
 	 */
 	if (st->groupidx2 != NULL)
 		lion_load_inner_keys(st);
+}
+
+/* One index of lion_count_report_reads(), once however often it is named. */
+static void
+lion_count_report_index(List **seen, Relation index, int64 rows)
+{
+	if (index == NULL || list_member_oid(*seen, RelationGetRelid(index)))
+		return;
+	*seen = lappend_oid(*seen, RelationGetRelid(index));
+	pgstat_count_index_scan(index);
+	pgstat_count_index_tuples(index, rows);
+}
+
+/*
+ * The index-usage statistics of the relation being counted
+ * (pg_stat_user_indexes; REFERENCE.md, "Monitoring"), once it has been read
+ * since it was made the one counted or last reported: one scan of each of
+ * its indexes, and the rows counted since as each one's idx_tup_read - as
+ * core counts an index scan, once per scan or rescan that reads, and the
+ * entries it returns.  Called when the relation's turn ends
+ * (lion_close_relation()) and when the node is rescanned or ended
+ * (lion_reset_run()).
+ */
+void
+lion_count_report_reads(LionCountScanState *st)
+{
+	List	   *seen = NIL;
+	int64		rows = st->statrows;
+	int			i;
+
+	if (!st->statread)
+		return;
+	st->statread = false;
+	st->statrows = 0;
+	for (i = 0; i < st->nclause; i++)
+		lion_count_report_index(&seen, st->clause[i].idx, rows);
+	lion_count_report_index(&seen, st->groupidx, rows);
+	lion_count_report_index(&seen, st->groupidx2, rows);
+	if (st->fg != NULL)			/* a partition's: lion_join_group_turn() */
+		lion_count_report_index(&seen, st->fg->idx, rows);
+	if (st->decode != NULL)
+	{
+		for (i = 0; i < st->decode->ncol; i++)
+			lion_count_report_index(&seen, st->decode->idx[i], rows);
+	}
+	if (st->cells != NULL)		/* the driver's is the decoded walk's */
+	{
+		for (i = 0; i < st->cells->ndim; i++)
+			lion_count_report_index(&seen, st->cells->idx[i], rows);
+	}
+	list_free(seen);
 }
 
 /*
@@ -657,6 +683,8 @@ lion_close_relation(LionCountScanState *st)
 {
 	bool		own = (st->npart == 0); /* the relations are closed here */
 	int			i;
+
+	lion_count_report_reads(st);
 
 	/* the counts' map page is this relation's */
 	lion_vis_cache_release_vm(st->viscache);

@@ -327,7 +327,8 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_sort', 'off', true);
-	PERFORM set_config('enable_indexscan', (NOT exact)::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (NOT exact)::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin', CASE WHEN exact THEN '1000' ELSE '1' END, true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -409,14 +410,16 @@ SELECT * FROM tt_all('tt', 1536);
 SET pg_lion.vector_prefetch = off;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 -- each query prepared, and run once, at the settings it is planned under,
 -- so that its DEBUG1 runs parse and plan nothing: what a parse looks up
 -- can grow a catalog cache, whose rehash DEBUG1 reports too
 PREPARE tt_x AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat = 3 ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
 EXECUTE tt_x;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 PREPARE tt_p AS SELECT count(*) FROM (SELECT id FROM tt ORDER BY v <-> tt_vec(-1, 1536) LIMIT 10) s;
 EXECUTE tt_p;
 SET client_min_messages = debug1;
@@ -492,20 +495,23 @@ ROLLBACK;
 SET pg_lion.vector_prefetch = off;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 EXECUTE tt_x;
 SET client_min_messages = debug1;
 EXECUTE tt_x;
 RESET client_min_messages;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 
 -- ... and once its chunks' inserter is known to have aborted (hinted, by
 -- a scan of the TOAST relation), they are no longer read: each falls back
 -- to its heap row, which is not there
 SELECT reltoastrelid::regclass AS tt_toast FROM pg_class WHERE oid = 'tt'::regclass \gset
 SELECT count(*) > 0 AS "chunks" FROM :tt_toast;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXECUTE tt_x;
 SET client_min_messages = debug1;
 EXECUTE tt_x;
@@ -514,7 +520,8 @@ DEALLOCATE tt_x;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 SELECT tt_check('tt_v');
 SELECT * FROM tt_all('tt', 1536);
@@ -545,7 +552,8 @@ SELECT * FROM tt_all('tt', 1536);
 SET pg_lion.vector_prefetch = off;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 PREPARE tt_c AS SELECT count(*) FROM (SELECT id FROM tt WHERE cat IN (1, 2, 3, 4, 5) ORDER BY v <-> tt_vec(-1, 1536)) s;
 EXECUTE tt_c;
@@ -556,7 +564,8 @@ DEALLOCATE tt_c;
 RESET pg_lion.vector_prefetch;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 
 -- VACUUM of the table: the entries of the rows gone go with their CODE
