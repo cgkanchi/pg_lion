@@ -4374,8 +4374,10 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 	divisor = lion_parallel_divisor(workers);
 	nranges = lion_key_ranges(rel->pages, workers + 1,
 							  LION_PARALLEL_RANGE_KEYS, &ckeys);
-	totalrows = clamp_row_est(Min(cx->outrows * (workers + 1),
-								  Max(cx->cellwhererows, cx->outrows)));
+	totalrows = clamp_row_est((workers + 1) *
+							  lion_cells_nonempty(cx->cellplan,
+												  cx->cellwhererows /
+												  (workers + 1)));
 	rows = clamp_row_est(totalrows / divisor);
 
 	cpath = makeNode(CustomPath);
@@ -4550,8 +4552,8 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 
 	/*
 	 * The rows the WHERE's sets select - the clauses over predicates test
-	 * cells - and a partial row a cell with rows at most, under the
-	 * Finalize Agg; the groups at most the cells.
+	 * cells - and a partial row a cell they are in (lion_cells_nonempty()),
+	 * under the Finalize Agg; the groups at most those cells.
 	 */
 	foreach(lc, rel->baserestrictinfo)
 	{
@@ -4564,11 +4566,11 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 									 clauselist_selectivity(root, quals,
 															cx.rti,
 															JOIN_INNER, NULL));
-	cx.outrows = clamp_row_est(Min(cp->ncells, cx.cellwhererows));
+	cx.outrows = clamp_row_est(lion_cells_nonempty(cp, cx.cellwhererows));
 	cx.numgroups = (cx.cellexprs != NIL) ?
 		clamp_row_est(Min(estimate_num_groups(root, cx.cellexprs,
 											  cx.cellwhererows, NULL, NULL),
-						  cp->ncells)) : 1.0;
+						  cx.outrows)) : 1.0;
 	cx.partialtarget = lion_make_partial_target(root,
 												cx.output_rel->reltarget,
 												cx.having);

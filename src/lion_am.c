@@ -461,7 +461,7 @@ _PG_init(void)
 							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
 							"A plan with more is left to the ordinary plan.",
 							&lion_count_cells_max,
-							1048576,
+							134217728,
 							2,
 							INT_MAX,
 							PGC_USERSET,
