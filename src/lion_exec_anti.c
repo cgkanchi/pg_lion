@@ -632,7 +632,8 @@ lion_anti_lookup(LionCountScanState *st)
 			as->scankeys[k].sk_argument = e->keys[k];
 		index_rescan(scan, as->scankeys, as->nkey, NULL, 0);
 		as->lookups++;
-		while (index_getnext_slot(scan, ForwardScanDirection, as->heapslot))
+		while (lion_index_getnext_slot(scan, ForwardScanDirection,
+									   as->heapslot))
 		{
 			bool		found;
 
