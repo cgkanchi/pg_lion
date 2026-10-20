@@ -15752,7 +15752,11 @@ once the paths are built - and it is made to the paths too:
 
 - `rel->rows` becomes `lion_probe_rel_rows()` - core's estimate of the restriction clauses with the
   probed AND in place of core's product - where the probe found that AND `LION_ISECT_ERROR` times
-  off (`lion_isect_rel_factor()` other than 1); elsewhere nothing changes.
+  off (`lion_isect_rel_factor()` other than 1), and wherever lion's estimates take the restriction
+  clauses in another form than core's (`lion_rel_canonical_changes()`): an OR of equalities as its
+  IN list ("An OR of equalities is its IN list", below), a run of `<>` on one column as one
+  exclusion ("A run of `<>` is one exclusion", below) - with the probe's factor or without it, the
+  probe on or off, of a relation one of whose indexes is lion's. Elsewhere nothing changes.
 - Every path already built takes the same ratio on its rows. An unparameterized scan's rows are
   `rel->rows` (a partial path's divided among its workers) and its cost does not depend on them -
   a sequential scan's on the tuples it reads, an index or bitmap scan's on its own clauses'
@@ -15800,10 +15804,10 @@ posting sets, 3,835 rows):
 
 1. **Core's selectivity.** Core estimates the OR as though its arms could overlap, `1 - (1 - s1)(1 -
    s2)`, and the list as the disjoint entries they are, `s1 + s2`: 15 rows against 22 for the same
-   filter. `rel->rows` is core's and stays so; lion's own estimate of the relation's rows
-   (`lion_probe_rel_rows()`) is now computed as `set_baserel_size_estimates()` computes it, from the
-   list in the OR's place (`lion_rel_canonical_clauses()`), and so is the probe's estimate of the
-   conjunction it measures.
+   filter. lion's own estimate of the relation's rows (`lion_probe_rel_rows()`) is computed as
+   `set_baserel_size_estimates()` computes it, from the list in the OR's place
+   (`lion_rel_canonical_clauses()`), and so is the probe's estimate of the conjunction it measures;
+   and `rel->rows` is corrected to the same estimate ("The relation's rows", above).
 2. **The probe.** `lion_isect_scankey()` took an equality, a list, `IS NULL` and a multi-key query,
    no OR - and no boolean column by itself, which is how `flag = false` reaches the restriction
    clauses (`NOT flag`) while the index path is handed `flag = false`. So the count's rows
@@ -15874,6 +15878,73 @@ filter holds, where without the probe they are core's product, a hundred times s
 answer - the count, the rows, a GROUP BY, a page - the sequential scan's, for those and for five
 ORs that are no list. On 991c315 the plans and costs differ, the count is the OR's union, and
 LionOrdered is priced for core's product in both forms.
+
+**A run of `<>` is one exclusion** (2026-10-20, `lion_neq_runs()`, `lion_canonical_clause_list()`,
+`lion_cost_canonical_sel()`). A private workload filters a column with a high null fraction by 13
+to 80 exclusions - `col <> 'x' AND col <> 'y' AND ...` - and core's estimate of them sized the
+table at a 460th of its rows; the nested loop over another table's B-tree chosen for that took
+643 s for a count. Core estimates `k <> v` as `1 - freq(v) - nullfrac` (neqsel(): eqsel()'s
+estimate of `k = v`, less the NULLs, which no `<>` keeps) and a conjunction as the product of its
+clauses, so the NULLs are taken away once a clause. `k <> ALL (array)` - `NOT IN` - fares no
+better: scalararraysel() sums it as disjoint, `1 - sum(freq(v) + nullfrac)`, and once that is below
+zero - two values of a column half NULL - falls back to the same product. On a synthetic table
+(PostgreSQL 18, 1,000,000 rows, a text column 35% NULL over 150 values):
+
+| filter | core | lion | actual |
+|---|---|---|---|
+| 13 `<>` | 3,452 | 594,741 | 593,523 |
+| 80 `<>` | 1 | 303,577 | 303,087 |
+| `NOT IN` of the same 80 values | 1 | 303,577 | 303,087 |
+
+The rows of two values are disjoint, and a NULL is neither, so the share of the rows a run keeps is
+`1 - nullfrac - sum of freq(v)` over its distinct values, freq(v) being what eqsel() takes for `k =
+v` - its frequency among the most common values, or the average of the others - and nullfrac the
+one neqsel() reads. That is what lion's estimates take:
+
+- **Which clauses.** In a list of clauses of one relation, every `expr <> Const`, either way round
+  (commuted, so that expr is on the left), and every `expr <> ALL (array Const)` whose operator
+  core estimates with neqsel(), over an expression that holds a column and calls nothing volatile;
+  those with one expression, operator, input collation and constant type are a run, `NOT IN` and
+  `<>` alike. A NULL constant and an array with a NULL element are not taken (no row passes them,
+  which is core's estimate), nor an empty array (every row), nor a Param: a generic plan's run is
+  core's.
+- **One clause.** The run is ONE clause of the list, in its first clause's place: `expr <> ALL` of
+  its distinct values, a RestrictInfo whose cached selectivity (`norm_selec`, `outer_selec`) is the
+  share above (`lion_neq_run_clause()`, `lion_neq_run_sel()`, which asks var_eq_const() what
+  neqsel() asks it). clause_selectivity() returns a RestrictInfo's cached selectivity before it
+  looks at the clause, so every estimate that reads the list through clauselist_selectivity()
+  takes the share, and multiplies it with the other clauses as core multiplies any clause it has
+  nothing to combine with. Extended statistics on the column and another (`CREATE STATISTICS ...
+  (mcv)`) still see the clause, and may estimate it with them.
+- **Distinct values.** A value written twice, or two that the type's equality calls one (`'Red'` and
+  `'red'` under citext, or under a nondeterministic collation), are one most common value to
+  eqsel(), and are counted once: the values are sorted with the comparison of their type's default
+  btree class under the clauses' collation and told apart by it, which requires that class's family
+  to hold the run's equality, so that two values the comparison calls equal are equal to the
+  operator. A type without one keeps core's estimate, and so does a run of one value, which core
+  estimates exactly.
+- **Where.** `lion_canonical_clause_list()` is the form lion's estimates take a list of clauses in:
+  each OR of equalities as its IN list ("An OR of equalities is its IN list", above), then each run
+  as its exclusion. The relation's restriction clauses in that form (`lion_rel_canonical_clauses()`)
+  give the rows lion_probe_rel_rows() computes - the count pushdown's recheck, LionOrdered's rows -
+  and each parameterized path's (`lion_param_rows()`), and `rel->rows` is corrected to them wherever
+  they differ from core's ("The relation's rows", above). An index path's quals in that form give
+  its selectivity (`lion_cost_canonical_sel()`, in `lioncostestimate()`): genericcostestimate()'s
+  selectivity is scaled by lion's estimate of the quals over core's, which leaves a partial index's
+  predicate's share as it was, and the index tuples and the pages prorated by them are computed
+  again from it as genericcostestimate() computes them, so that the heap side of the plain and the
+  bitmap path, and LionOrdered's lion side, follow. A `NOT IN` is no index qual (core matches an
+  `op ANY` only, §35); the run of the index's `<>` quals is.
+- **What it leaves.** The answers: the clause is an estimate's, which no plan holds; the count
+  pushdown counts a run exactly, as negated sources (§35). The intersection probe measures set
+  clauses only, and a run beside them is taken as independent of them, as core takes any clause the
+  probe has no value for.
+
+Measuring a run in the intersection probe was considered and not done. The run's own estimate is
+exact from the statistics; what the probe would add is how the run correlates with the set
+clauses beside it, which would need its AND to subtract the values' sets and the NULL entry's at
+each container it samples - the count's negated sources (§35) - where it ANDs positive streams from
+a driver; and a run with no set clause beside it has no driver to sample.
 
 **Wide filters** (2026-09-28). The probe exists for the correlated filters core's product
 underestimates, and the wider such a filter, the more it is off. On the repro the twenty sets
@@ -16932,6 +17003,21 @@ and on 991c315 every plan, cost and row check of it fails and every answer passe
 expected output moved on 16, 17, 18 or 19, in either WAL mode: the suite's ORs are across columns
 or not of constants, its probed conjunctions fit the old budget, and the merge's correction moves
 no pinned plan.
+
+`test/sql/neqrun.sql` (2026-10-20, §29.11 "A run of `<>` is one exclusion"), on 100,000 rows: a
+text column 35% NULL over 150 values, ten of them common, an integer column half NULL whose 2,000
+values are each as common as the others, so that none is a most common value, and a citext column.
+Seven filters - thirteen `<>`, the same values as a NOT IN and as a mix of both with values
+repeated and a clause commuted, forty `<>`, a NOT IN of eighty values, a NOT IN of sixty values of
+the integer column, and the thirteen beside an equality on an independent column - are each
+estimated within twice their rows at the scan and at a join above it, and a hundred times short or
+more without the correction; the three spellings of one filter are one estimate, with the probe on
+and off. A nested loop's inner scan of the run, lion's bitmap index scan and LionOrdered are within
+twice their rows, LionOrdered's with the correction off too. One value, one value twice, two
+columns of a value each, a NOT IN holding NULL, `<> ALL` of no value, a generic plan's Params and a
+table without a lion index keep core's estimate exactly; three spellings of one citext value are
+counted once; and every answer - the count, the rows, a GROUP BY, a page - is the sequential
+scan's. No other expected output moved on 16, 17, 18 or 19.
 
 `test/sql/scanand.sql` (2026-09-28, §29.11 "The AND, as the count makes it"), on 120,000 rows in 60
 hidden groups that take turns over the heap, two dense columns first in the index and
@@ -19950,7 +20036,8 @@ whose key compares equal to c and bounds the walk on neither side. So:
 - **The price** (`lioncostestimate()`): a walk with holes reads the keys of its RANGE - n_distinct
   times the other bounds' selectivity - less the holes, and no summaries
   (`lion_cost_ranges_entries()`). Priced by its selectivity, `SearchPhrase <> ''` was 13% of
-  477,418 keys where the walk reads all but one.
+  477,418 keys where the walk reads all but one. The rows a run of `<>` on one column keeps are
+  estimated as the one exclusion it is (§29.11, "A run of `<>` is one exclusion").
 
 ### The count: a negated source
 
