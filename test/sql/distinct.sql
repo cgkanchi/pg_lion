@@ -32,8 +32,7 @@ BEGIN
 	IF force THEN
 		PERFORM set_config('enable_seqscan', 'off', true);
 		PERFORM set_config('enable_bitmapscan', 'off', true);
-		PERFORM set_config('enable_indexscan', 'off', true);
-		PERFORM set_config('enable_indexonlyscan', 'off', true);
+		PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	END IF;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -52,6 +51,7 @@ BEGIN
 	EXECUTE format('CREATE TEMP TABLE lion_dc_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
@@ -100,7 +100,7 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);	-- only the pushdown is left (§29)
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);	-- only the pushdown is left (§29)
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_dcp_on AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_dcp_on(' || args || ')' LOOP
@@ -115,7 +115,7 @@ BEGIN
 	EXECUTE 'PREPARE lion_dcp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_dc_off AS EXECUTE lion_dcp_off(%s)', args);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_dcp_on';
 	EXECUTE 'DEALLOCATE lion_dcp_off';

@@ -238,12 +238,22 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
 					RelationGetRelationName(vs->index), blk, opaque->flags);
 
-	/* Only a container page may ever carry the DELETED bit (DESIGN.md §18). */
-	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags != LION_PAGE_CONTAINER)
-		lion_corrupt("lion index \"%s\": block %u is marked deleted but is a %s page",
-					RelationGetRelationName(vs->index), blk,
-					flags == LION_PAGE_META ? "meta" :
-					flags == LION_PAGE_DIR ? "directory" : "leaf");
+	/*
+	 * Container and directory pages carry the DELETED bit once they are freed
+	 * (DESIGN.md §18, §21), the meta page never; only a directory leaf is ever
+	 * HALF_DEAD, and only a posting leaf UNLINKED (§22).
+	 */
+	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags == LION_PAGE_META)
+		lion_corrupt("lion index \"%s\": block %u is marked deleted but is the meta page",
+					RelationGetRelationName(vs->index), blk);
+	if ((opaque->flags & LION_PAGE_HALF_DEAD) != 0 && flags != LION_PAGE_BUCKET)
+		lion_corrupt("lion index \"%s\": block %u is marked half-dead but is not a directory leaf",
+					RelationGetRelationName(vs->index), blk);
+	if ((opaque->flags & LION_PAGE_UNLINKED) != 0 &&
+		(flags != LION_PAGE_CONTAINER || opaque->level != 0 ||
+		 (opaque->flags & LION_PAGE_POSITIONS) != 0))
+		lion_corrupt("lion index \"%s\": block %u is marked unlinked but is not a posting leaf",
+					RelationGetRelationName(vs->index), blk);
 
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
@@ -328,10 +338,13 @@ lion_verify_keylen(LionVerifyState *vs, LionState *state, BlockNumber blk,
 	{
 		/*
 		 * A plain 4-byte header, as lion_store_key() writes it: a short one
-		 * is no longer accepted either, because no reader does.
+		 * is no longer accepted either, because no reader does.  Or a
+		 * compressed one, for a key too long to store plain (DESIGN.md §4,
+		 * "Long keys"), which lion_key_is_valid() checks as the readers do.
 		 */
-		if (keylen < VARHDRSZ || !VARATT_IS_4B_U(key) ||
-			VARSIZE(key) != keylen)
+		if (keylen < VARHDRSZ ||
+			(VARATT_IS_4B_U(key) ? VARSIZE(key) != keylen :
+			 !lion_key_is_valid(state, key, keylen)))
 			lion_corrupt("lion index \"%s\": entry %u on block %u has a malformed varlena key of %zu bytes",
 						RelationGetRelationName(vs->index), off, blk, keylen);
 	}
@@ -703,6 +716,14 @@ lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 	 */
 	if (LionPageIsDeleted(page))
 		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
+					RelationGetRelationName(vs->index), blk, eoff, eblk);
+
+	/*
+	 * DESIGN.md §22, "Empty leaves": a leaf VACUUM took out of the set is
+	 * linked to by nothing of it, and will be handed out again.
+	 */
+	if (LionPageIsUnlinked(page))
+		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but was taken out of the posting set",
 					RelationGetRelationName(vs->index), blk, eoff, eblk);
 
 	if (opaque->owner_head != lion_entry_head(entry) ||
@@ -2219,6 +2240,8 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.showvalues = superuser();
 	vs.concurrent = !inrecovery;
 
+	/* before its table is locked: a partitioned index has one too */
+	lion_refuse_partitioned_index(relid);
 	heapoid = IndexGetRelation(relid, true);
 	if (!OidIsValid(heapoid))
 	{

@@ -40,8 +40,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Group Strategy: Decoded' THEN
@@ -59,8 +58,7 @@ BEGIN
 	EXECUTE 'CREATE TEMP TABLE lgd_on AS ' || q;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE 'CREATE TEMP TABLE lgd_off AS ' || q;
 	SELECT count(*) INTO nrows FROM lgd_off;
@@ -97,15 +95,13 @@ VACUUM (FREEZE, ANALYZE) lgd;
 -- with the index it is read from.
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT a, b, c, count(*) FROM lgd GROUP BY a, b, c;
 EXPLAIN (COSTS OFF) SELECT a, g, f, count(*) FROM lgd GROUP BY a, g, f;
 EXPLAIN (COSTS OFF) SELECT a, b, c, count(*) FROM lgd WHERE d > 50 GROUP BY a, b, c;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- Three, four and five columns; the NULL group of c, and count(c), which is
 -- 0 there; the columns in any order in the GROUP BY and the target list.
@@ -189,8 +185,7 @@ PREPARE lgdm_p(int[]) AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> $
 PREPARE lgdm_q(int[]) AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> $1 AND c <> 2 GROUP BY a, b, c;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) EXECUTE lgdm_p('{}');
 CREATE TEMP TABLE lgdm_p1 AS EXECUTE lgdm_p('{}');
 CREATE TEMP TABLE lgdm_p2 AS EXECUTE lgdm_p('{4, 12}');
@@ -198,8 +193,7 @@ CREATE TEMP TABLE lgdm_q1 AS EXECUTE lgdm_q('{}');
 CREATE TEMP TABLE lgdm_q2 AS EXECUTE lgdm_q('{4, 12}');
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 SET pg_lion.enable_count_pushdown = off;
 CREATE TEMP TABLE lgdm_s1 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{}' GROUP BY a, b, c;
 CREATE TEMP TABLE lgdm_s2 AS SELECT a, b, c, count(*) AS n FROM lgdm WHERE tags @> '{4, 12}' GROUP BY a, b, c;
@@ -249,8 +243,7 @@ SELECT lgd_check('SELECT a, b, c, count(*) AS n FROM lgd WHERE e GROUP BY a, b, 
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SET LOCAL enable_seqscan = off;
 SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off;
-SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
 SELECT count(*) AS groups FROM (SELECT a, b, c, count(*) FROM lgd WHERE e GROUP BY a, b, c) s;
 SELECT count(*) > 0 AS heap_locked FROM pg_locks
  WHERE locktype IN ('page', 'relation') AND relation = 'lgd'::regclass

@@ -2706,6 +2706,16 @@ typedef struct LionCountScanState
 	int64		dirpages;
 
 	/*
+	 * The index-usage statistics of the relation being counted
+	 * (pg_stat_user_indexes): statread says it has been read since it was
+	 * made the one counted or last reported, and statrows are the rows
+	 * counted from it since - what lion_count_report_reads() counts as one
+	 * scan of each of its indexes and their idx_tup_read.
+	 */
+	bool		statread;
+	int64		statrows;
+
+	/*
 	 * The FK-side join (DESIGN.md §27): its plan's flags, its child, its
 	 * keys' counters, its fact filters' copy, what it sorts and batches, a
 	 * partitioned fact table's turns, the shared copy of a parallel plan and
@@ -3263,7 +3273,18 @@ typedef struct LionUnits
 	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
 } LionUnits;
 
+/*
+ * The core access a lion path stands for, as far as core's enable_* settings
+ * go (lion_path_core_switches())
+ */
+typedef enum LionCoreScan
+{
+	LION_CORE_INDEXSCAN,		/* walks an index and reads the rows */
+	LION_CORE_INDEXONLY			/* answers from the index alone */
+} LionCoreScan;
+
 /* lion_plan_units.c */
+extern void lion_path_core_switches(Path *path, LionCoreScan scan);
 extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
@@ -3470,6 +3491,7 @@ extern void lion_clause_window(LionCountScanState *st, int clauseno,
 							   int *first, int *n);
 extern void lion_close_relation(LionCountScanState *st);
 extern void lion_close_parts(LionCountScanState *st);
+extern void lion_count_report_reads(LionCountScanState *st);
 extern void lion_begin_custom_scan(CustomScanState *node, EState *estate,
 								   int eflags);
 

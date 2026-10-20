@@ -78,7 +78,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -92,7 +93,8 @@ BEGIN
 
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
@@ -139,7 +141,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
 		IF ln ~ '(LionOrdered|Index Entries Walked|Lion Set|Heap Fetches|Rows Removed by|Switched)' THEN
@@ -148,17 +151,20 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 END $$;
 
 -- 1. The plan, as EXPLAIN shows it: the btree it walks, what lion answers.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 SELECT * FROM lion_ord_plan('SELECT id FROM lo WHERE c200 = 17 AND c2 = 1 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_plan('SELECT id FROM lo WHERE c200 = 17 AND k > 50000 AND length(payload) = 32 ORDER BY k DESC, id DESC LIMIT 10');
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 
 -- 2. Every kind of lion filter, ORDER BY k [DESC] [NULLS FIRST] LIMIT n.
 SELECT lion_ord('SELECT id, k FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 10');
@@ -247,7 +253,8 @@ SELECT * FROM lion_ord_run('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIM
 
 -- 8. Cursors: forward, a SCROLL cursor (a Material under it), NO SCROLL.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) DECLARE lo_c SCROLL CURSOR FOR SELECT id, k FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 8;
 BEGIN;
 DECLARE lo_c CURSOR FOR SELECT id, k FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 8;
@@ -265,7 +272,8 @@ FETCH ALL FROM lo_c;
 FETCH FIRST FROM lo_c;
 COMMIT;
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 SELECT lion_ord('SELECT id, k FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 8');
 
 -- 9. A dirty heap - lion-indexed columns updated (not HOT), the order column
@@ -310,10 +318,12 @@ VACUUM (FREEZE, ANALYZE) lon;
 SET plan_cache_mode = force_generic_plan;
 PREPARE lo_big(int) AS SELECT id, k FROM lon WHERE c2 = $1 ORDER BY k, id LIMIT 20;
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 EXPLAIN (COSTS OFF) EXECUTE lo_big(1);
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
 -- the set built, as it always was before the lazy one (§30.4): it spills
@@ -345,14 +355,16 @@ SELECT * FROM lion_ord_plan('SELECT id, payload FROM lo WHERE c20 IN (1, 2, 3) O
 
 -- 12. Declines: the GUC off, no clause lion answers, a TABLESAMPLE, RLS.
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET pg_lion.enable_ordered_scan = off;
 SELECT * FROM lion_ord_plan('SELECT id FROM lo WHERE c200 = 17 ORDER BY k, id LIMIT 10');
 RESET pg_lion.enable_ordered_scan;
 SELECT * FROM lion_ord_plan('SELECT id FROM lo WHERE length(payload) = 32 ORDER BY k, id LIMIT 10');
 SELECT * FROM lion_ord_plan('SELECT id FROM lo TABLESAMPLE SYSTEM (50) REPEATABLE (1) WHERE c200 = 17 ORDER BY k, id LIMIT 10');
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 
 CREATE ROLE lion_ord_user;
 CREATE TABLE lo_rls (id int PRIMARY KEY, k int, c int, tenant text);
@@ -365,11 +377,13 @@ ALTER TABLE lo_rls ENABLE ROW LEVEL SECURITY;
 CREATE POLICY lo_rls_t1 ON lo_rls FOR SELECT TO lion_ord_user USING (tenant = 't1');
 SET ROLE lion_ord_user;
 SET enable_seqscan = off; SET enable_bitmapscan = off;
-SET enable_indexscan = off; SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off; SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 SELECT * FROM lion_ord_plan('SELECT id FROM lo_rls WHERE c = 7 ORDER BY k, id LIMIT 5');
 SELECT id, tenant FROM lo_rls WHERE c = 7 ORDER BY k, id LIMIT 5;
 RESET enable_seqscan; RESET enable_bitmapscan;
-RESET enable_indexscan; RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan; RESET enable_indexonlyscan;
+RESET pg_lion.pushdown_margin;
 RESET ROLE;
 -- the owner is not subject to the policy, so the node plans for it
 SELECT lion_ord('SELECT id, tenant FROM lo_rls WHERE c = 7 ORDER BY k, id LIMIT 5');
@@ -388,7 +402,8 @@ BEGIN
 	IF ordered THEN
 		PERFORM set_config('enable_seqscan', 'off', true);
 		PERFORM set_config('enable_bitmapscan', 'off', true);
-		PERFORM set_config('enable_indexscan', 'off', true);
+		PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+		PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 		PERFORM set_config('enable_indexonlyscan', 'off', true);
 	END IF;
 	BEGIN
@@ -398,7 +413,8 @@ BEGIN
 	END;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
 	RETURN r;
@@ -437,9 +453,11 @@ VACUUM (FREEZE, ANALYZE) orb;
 -- about.  At the defaults the node takes a = 3 alone for its lion side - the
 -- cheaper and, measured, the faster of the two - a few cost units below the
 -- ordered btree scan, which is too close to pin.
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SELECT * FROM lion_ord_plan('SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 SELECT count(*) FILTER (WHERE a <> 3) AS wrong, count(*)
   FROM (SELECT * FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50) s;
 SELECT lion_ord('SELECT id, k FROM orb WHERE a = 3 AND (b = 5 OR c = 7) ORDER BY k LIMIT 50');
@@ -491,7 +509,8 @@ SELECT * FROM lion_ord_run('SELECT id FROM lcor WHERE h2 = 1 ORDER BY k3 DESC, i
 -- a paused cursor that switches, and a rescan
 BEGIN;
 SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 DECLARE lcor_cur CURSOR FOR SELECT id FROM lcor WHERE h = 1 ORDER BY k;
 FETCH 4 FROM lcor_cur;
 FETCH 2 FROM lcor_cur;
@@ -521,7 +540,8 @@ SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 15000 ORDER BY k,
 SELECT lion_ord('SELECT id, k FROM lwalk WHERE u BETWEEN 1 AND 20000 AND u % 3 = 0 ORDER BY k DESC, id DESC');
 BEGIN;
 SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off;
-SET LOCAL enable_indexscan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off; SET LOCAL enable_indexonlyscan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 DECLARE lwalk_cur CURSOR FOR SELECT id FROM lwalk WHERE u BETWEEN 1 AND 20000 ORDER BY k, id;
 FETCH 2 FROM lwalk_cur;
 SELECT used_bytes <= 65536 AS within_hash_mem

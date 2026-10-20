@@ -174,7 +174,7 @@ SELECT lion_rw_link('lion_rw_di', lion_rw_leaf('lion_rw_di', 3),
 SET enable_seqscan = off;
 -- LionCount of a range: the walk of its entries (LionEntryScan)
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
                                          lion_rw_run                                         
 ---------------------------------------------------------------------------------------------
@@ -187,7 +187,7 @@ SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_d WHERE k > 10 GROUP BY k');
  LionCount: XX002: lion index "lion_rw_di": the right links from block N go round in a cycle
 (1 row)
 
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 -- the scans: the walk of the range's leaves (LionLeafWalk)
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
@@ -197,14 +197,14 @@ SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
 (1 row)
 
 RESET enable_bitmapscan;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_d WHERE k > 10');
                                              lion_rw_run                                             
 -----------------------------------------------------------------------------------------------------
  Bitmap Index Scan: XX002: lion index "lion_rw_di": the right links from block N go round in a cycle
 (1 row)
 
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_count_pushdown;
 -- LionOrdered: the ordered walk rightwards, and leftwards, where finding a
 -- leaf's left sibling walks right from its left link (lion_dir_step_left())
@@ -260,7 +260,7 @@ SELECT lion_rw_link('lion_rw_si', lion_rw_leaf('lion_rw_si', 1),
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_s GROUP BY k');
                                        lion_rw_run                                        
 ------------------------------------------------------------------------------------------
@@ -268,7 +268,7 @@ SELECT lion_rw_run('SELECT k, count(*) FROM lion_rw_s GROUP BY k');
 (1 row)
 
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SELECT lion_rw_run('SELECT * FROM lion_rw_s WHERE k < 2');
                                        lion_rw_run                                       
 -----------------------------------------------------------------------------------------
@@ -316,14 +316,14 @@ SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
 (1 row)
 
 SET pg_lion.enable_count_pushdown = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
                                              lion_rw_run                                             
 -----------------------------------------------------------------------------------------------------
  Bitmap Index Scan: XX002: lion index "lion_rw_pi": the right links from block N go round in a cycle
 (1 row)
 
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 SET enable_bitmapscan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
                                          lion_rw_run                                          
@@ -396,14 +396,14 @@ SELECT lion_rw_run($$SELECT lion_index_count('lion_rw_pi', 1)$$);
 (1 row)
 
 SET pg_lion.enable_count_pushdown = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT lion_rw_run('SELECT count(*) FROM lion_rw_p WHERE p = 1');
                                           lion_rw_run                                          
 -----------------------------------------------------------------------------------------------
  Bitmap Index Scan: XX002: lion index "lion_rw_pi": the right link of block N is the meta page
 (1 row)
 
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 RESET pg_lion.enable_count_pushdown;
 RESET enable_seqscan;
 DROP INDEX lion_rw_pi;

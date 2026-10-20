@@ -168,14 +168,14 @@ DECLARE
 BEGIN
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	SET LOCAL enable_indexscan = off;
+	SET LOCAL pg_lion.enable_plain_scan = off;
 	IF NOT bc_scanned(sql) THEN RETURN 'not scanned'; END IF;
 	IF NOT bc_scanned(bc_sql(doc, q, ref, NULL, k, '')) THEN RETURN 'ref not scanned'; END IF;
 	EXECUTE 'CREATE TEMP TABLE bc_got AS ' || sql;
 	EXECUTE 'CREATE TEMP TABLE bc_one AS ' || bc_sql(doc, q, ref, NULL, k, '');
 	RESET enable_seqscan;
 	RESET enable_bitmapscan;
-	RESET enable_indexscan;
+	RESET pg_lion.enable_plain_scan;
 	SET LOCAL pg_lion.enable_bm25_scan = off;
 	EXECUTE 'CREATE TEMP TABLE bc_ref AS ' || bc_sql(doc, q, 'bc_all', col, k, ', ctid');
 	RESET pg_lion.enable_bm25_scan;
@@ -191,7 +191,7 @@ END $$;
 
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF)
 SELECT id FROM bc_docs WHERE title @@ 'w1 | w5'
  ORDER BY lion_bm25_score(title, 'w1 | w5', 'bc_all', col => 'title') DESC LIMIT 10;
@@ -200,7 +200,7 @@ SELECT id, lion_bm25_score(body, 'w1 | w5', 'bc_all', col => 'body') FROM bc_doc
  ORDER BY lion_bm25_score(body, 'w1 | w5', 'bc_all', col => 'body') DESC LIMIT 10;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 SELECT bc_scan_same('title', 'w1 | w5', 'title', 'bc_title', 10);
 SELECT bc_scan_same('body', 'w1 | w5', 'body', 'bc_body', 10);
@@ -227,7 +227,7 @@ SELECT bc_scanned(bc_sql('title', 'w1', 'bc_all', 'title', 10, '')) AS title_by_
 -- col a parameter: a generic plan cannot tell the column, a custom one can
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 PREPARE bc_p(name) AS SELECT row_number() OVER () AS r, id, s FROM
 	(SELECT id, lion_bm25_score(title, 'w1', 'bc_all', col => $1) AS s FROM bc_docs
 	  WHERE title @@ 'w1'
@@ -246,7 +246,7 @@ DEALLOCATE bc_p;
 DROP TABLE bc_generic, bc_custom;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 -- and so the rows of each are the function's, row by row
 SELECT * FROM (SELECT id FROM bc_docs WHERE title @@ 'w1'

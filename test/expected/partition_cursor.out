@@ -59,7 +59,7 @@ CREATE INDEX lion_pc2_g ON lion_pc2 USING lion (g);
 CREATE INDEX lion_pc3_g ON lion_pc3 USING lion (g);
 VACUUM (FREEZE, ANALYZE) lion_pc;
 SET enable_seqscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
 SET pg_lion.enable_ordered_scan = off;
 -- ---- 1. a correlated count, rescanned for each x ---------------------------------

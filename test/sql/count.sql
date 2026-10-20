@@ -597,13 +597,67 @@ SELECT lion_index_count('lion_cnt_elig_k', 1);
 SELECT lion_index_verify('lion_cnt_elig_k', true);
 DROP TABLE lion_cnt_elig;
 
--- NULL arguments: STRICT, so NULL - no count is made - where the SELECT
--- `WHERE c10 = NULL` answers 0; kept deliberately (DESIGN.md section 9, "SQL
--- surface")
-SELECT lion_index_count('lion_cnt_c10', NULL::int4) IS NULL AS null_key;
+-- NULL arguments: a NULL key counts 0, as `WHERE c10 = NULL` does, after
+-- the same checks as any key; a NULL index names none, and answers NULL
+SELECT lion_index_count('lion_cnt_c10', NULL::int4) AS null_key,
+	   (SELECT count(*) FROM lion_cnt WHERE c10 = NULL::int4) AS query;
+SELECT lion_index_count('lion_cnt_c10', NULL) AS null_literal;
 SELECT lion_index_count(NULL, 0) IS NULL AS null_index;
-SELECT lion_index_count('lion_cnt_c10', 1, 'lion_cnt_m7', NULL::int4) IS NULL AS null_key2;
-SELECT count IS NULL AS null_stats FROM lion_index_count_stats('lion_cnt_c10', NULL::int4);
+SELECT lion_index_count('lion_cnt_c10', 1, 'lion_cnt_m7', NULL::int4) AS null_key2;
+SELECT * FROM lion_index_count_stats('lion_cnt_c10', NULL::int4);
+SELECT lion_index_count('lion_cnt_c10', NULL::text);
+
+-- The key is taken as `col = key` takes it: the parser's operator, and the
+-- key coerced to its input as the query would coerce it (DESIGN.md section 9,
+-- "SQL surface").  Each count beside the query it stands for.
+CREATE TABLE lion_cnt_cast (n numeric, f4 float4, i int4, t text, b char(4));
+INSERT INTO lion_cnt_cast
+SELECT g % 10, (g % 10) / 10.0, g % 10, 't' || (g % 10), 'b' || (g % 3)
+  FROM generate_series(1, 1000) g;
+CREATE INDEX lion_cnt_cast_n ON lion_cnt_cast USING lion (n);
+CREATE INDEX lion_cnt_cast_f4 ON lion_cnt_cast USING lion (f4);
+CREATE INDEX lion_cnt_cast_i ON lion_cnt_cast USING lion (i);
+CREATE INDEX lion_cnt_cast_t ON lion_cnt_cast USING lion (t);
+CREATE INDEX lion_cnt_cast_b ON lion_cnt_cast USING lion (b);
+VACUUM ANALYZE lion_cnt_cast;
+-- an int key on a numeric column: `n = 1` casts the key to numeric
+SELECT lion_index_count('lion_cnt_cast_n', 1) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE n = 1) AS query;
+SELECT lion_index_count_any('lion_cnt_cast_n', ARRAY[1, 2]) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE n = ANY (ARRAY[1, 2])) AS query;
+-- a numeric key on a float4 column: `f4 = 0.1` is `float4 = float8`, which
+-- no float4 value satisfies, and `f4 = 0.5` is exact in both
+SELECT lion_index_count('lion_cnt_cast_f4', 0.1) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.1) AS query;
+SELECT lion_index_count('lion_cnt_cast_f4', 0.5) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.5) AS query;
+SELECT lion_index_count('lion_cnt_cast_f4', 0.1::float4) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.1::float4) AS query;
+-- untyped literals take the column's type, as in the query
+SELECT lion_index_count('lion_cnt_cast_f4', '0.1') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = '0.1') AS query;
+SELECT lion_index_count('lion_cnt_cast_i', '3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = '3') AS query;
+SELECT lion_index_count('lion_cnt_cast_t', 't3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE t = 't3') AS query;
+SELECT lion_index_count('lion_cnt_cast_b', 'b1  ') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE b = 'b1  ') AS query;
+SELECT lion_index_count('lion_cnt_cast_i', 3, 'lion_cnt_cast_t', 't3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = 3 AND t = 't3') AS query;
+SELECT lion_index_count_any('lion_cnt_cast_i', '{3,4,NULL}') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = ANY ('{3,4,NULL}')) AS query;
+SELECT lion_index_count_any('lion_cnt_cast_i', NULL::int[]) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = ANY (NULL::int[])) AS query;
+-- where the query would cast the COLUMN, no count is made: `i = 1.5` is
+-- `numeric = numeric` on i::numeric, and 1.5 cast to integer would count
+-- the rows of 2
+\set VERBOSITY default
+SELECT lion_index_count('lion_cnt_cast_i', 1.5);
+SELECT lion_index_count('lion_cnt_cast_b', 'b1'::text);
+\set VERBOSITY terse
+SELECT lion_index_count('lion_cnt_cast_i', 'x');
+SELECT lion_index_count_any('lion_cnt_cast_i', 3);
+DROP TABLE lion_cnt_cast;
 
 DROP TABLE lion_cnt_other;
 DROP TABLE lion_cnt_hot;
