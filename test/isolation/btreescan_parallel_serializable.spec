@@ -48,7 +48,7 @@ session s1
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 	SET pg_lion.enable_count_pushdown = off;
 	SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0;
 	SET parallel_tuple_cost = 0; SET min_parallel_index_scan_size = 0;
@@ -64,7 +64,7 @@ session s2
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 	SET pg_lion.enable_count_pushdown = off;
 	SET max_parallel_workers_per_gather = 2; SET parallel_setup_cost = 0;
 	SET parallel_tuple_cost = 0; SET min_parallel_index_scan_size = 0;

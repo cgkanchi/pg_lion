@@ -723,8 +723,10 @@ restart:
 			 * A READER may be standing on a leaf a concurrent split has moved
 			 * its container key off; the items only ever go to a page
 			 * immediately to the right, so walking right until the page can
-			 * hold ckey finds them.  Empty leaves - VACUUM leaves them in the
-			 * chain - have maxckey 0 and are walked past for the same reason.
+			 * hold ckey finds them.  Empty leaves have maxckey 0 and are
+			 * walked past for the same reason: one VACUUM left in the chain,
+			 * and one it took out of the set since the parent was read, whose
+			 * range went to its right sibling (DESIGN.md §22, "Empty leaves").
 			 *
 			 * A WRITER never does this: writers of one key serialise on the
 			 * entry's directory leaf (see the file header), so no split can be

@@ -667,6 +667,22 @@ lion_build_item_need(Size size)
 }
 
 /*
+ * What a page of this level holding the first n of its open items costs,
+ * of `used` bytes counted at their own sizes.  An internal page writes its
+ * first downlink as minus infinity, with no key (DESIGN.md §21, "Height"),
+ * so that one costs a key-less header rather than what was counted for it.
+ */
+static inline Size
+lion_build_level_used(const LionBuildLevel *lv, Size used, int n)
+{
+	if (lv->level == 0 || n == 0)
+		return used;
+	return used - lion_build_item_need(lv->sizes[0]) +
+		lion_build_item_need(lion_entry_payoff_for(LION_ENTRY_DOWNLINK |
+												   LION_ENTRY_MINUSINF, 0));
+}
+
+/*
  * Write the open page of one level and start the next.  hkey is the key of
  * the item that did not fit - the first key of the page to the right, and
  * therefore this page's high key - or NULL when this is the last page of the
@@ -704,18 +720,22 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 	if (hksrc != NULL)
 	{
 		hkneed = lion_build_pivot_need(hksrc);
-		while (nkeep > 1 && keepused + hkneed > LION_PAGE_CAPACITY)
+		while (nkeep > 1 &&
+			   lion_build_level_used(lv, keepused, nkeep) + hkneed >
+			   LION_PAGE_CAPACITY)
 		{
 			nkeep--;
 			keepused -= lion_build_item_need(lv->sizes[nkeep]);
 			hksrc = (const LionEntryTuple *) lv->items[nkeep];
 			hkneed = lion_build_pivot_need(hksrc);
 		}
-		if (keepused + hkneed > LION_PAGE_CAPACITY)
+		if (lion_build_level_used(lv, keepused, nkeep) + hkneed >
+			LION_PAGE_CAPACITY)
 			elog(ERROR, "lion index: a directory page cannot hold one item of %zu bytes and its high key",
 				 lv->sizes[0]);
 	}
-	Assert(keepused + hkneed <= LION_PAGE_CAPACITY);
+	Assert(lion_build_level_used(lv, keepused, nkeep) + hkneed <=
+		   LION_PAGE_CAPACITY);
 	/*
 	 * Every internal page but the last of its level carries at least two
 	 * downlinks, which is what makes the level strictly smaller than the one
@@ -750,9 +770,28 @@ lion_build_level_flush(LionBuildState *bs, LionBuildLevel *lv,
 
 	for (i = 0; i < nkeep; i++)
 	{
-		if (PageAddItemExtended(page, lv->items[i], lv->sizes[i],
+		const char *item = lv->items[i];
+		Size		itemsz = lv->sizes[i];
+
+		/*
+		 * The first downlink of an internal page is minus infinity: its key
+		 * is this page's lower bound, which the downlink to this page that
+		 * is handed up below carries instead.
+		 */
+		pivot = NULL;
+		if (lv->level > 0 && i == 0)
+		{
+			pivot = lion_make_pivot(NULL, LION_ENTRY_DOWNLINK,
+									lion_entry_head((const LionEntryTuple *) item),
+									&pivotsz);
+			item = (const char *) pivot;
+			itemsz = pivotsz;
+		}
+		if (PageAddItemExtended(page, item, itemsz,
 								InvalidOffsetNumber, 0) == InvalidOffsetNumber)
 			elog(ERROR, "lion index: failed to place a directory item");
+		if (pivot != NULL)
+			pfree(pivot);
 	}
 
 	smgr_bulk_write(bs->bulk, thisblk, buf, true);
@@ -847,13 +886,17 @@ lion_build_level_add(LionBuildState *bs, LionBuildLevel *lv,
 	 * page this item lands on can still be too full for it; each flush writes
 	 * at least one item out, so this settles.
 	 */
-	while (lv->nitems > 0 && lv->used + need + hkneed > budget &&
+	while (lv->nitems > 0 &&
+		   lion_build_level_used(lv, lv->used, lv->nitems) + need + hkneed > budget &&
 		   (lv->nitems >= minitems ||
-			lv->used + need + hkneed > LION_PAGE_CAPACITY) &&
+			lion_build_level_used(lv, lv->used, lv->nitems) + need + hkneed >
+			LION_PAGE_CAPACITY) &&
 		   !lion_build_leaf_crosses(lv, need, hkneed, budget))
 		lion_build_level_flush(bs, lv, item, false);
 
-	Assert(lv->nitems == 0 || lv->used + need <= LION_PAGE_CAPACITY);
+	Assert(lv->nitems == 0 ||
+		   lion_build_level_used(lv, lv->used, lv->nitems) + need <=
+		   LION_PAGE_CAPACITY);
 
 	if (lv->nitems >= lv->maxitems)
 	{
@@ -2465,7 +2508,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
-	meta.version = LION_VERSION_V11;
+	meta.version = LION_VERSION_V12;
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;

@@ -105,8 +105,9 @@ DECLARE r int[];
 BEGIN
 	PERFORM set_config('enable_seqscan', CASE WHEN mode = 'seq' THEN 'on' ELSE 'off' END, true);
 	PERFORM set_config('enable_bitmapscan', CASE WHEN mode IN ('bitmap','count') THEN 'on' ELSE 'off' END, true);
-	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count') THEN 'on' ELSE 'off' END, true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_indexscan', CASE WHEN mode IN ('index','count','literal') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('enable_indexonlyscan', CASE WHEN mode IN ('count','literal') THEN 'on' ELSE 'off' END, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (mode <> 'literal')::text, true);
 	IF mode = 'count' THEN
 		EXECUTE format('SELECT ARRAY[count(*)::int] FROM %I WHERE tsv @@ $1', tab) INTO r USING q;
 	ELSIF mode = 'literal' THEN
@@ -240,12 +241,12 @@ CREATE FUNCTION tl_bm_scan(qt text, k int) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE q tsquery := tl_q(qt); sql text; l text; scanned bool := false; a int[]; b int[];
 BEGIN
 	sql := format('SELECT id FROM tl_lp WHERE tsv @@ %L ORDER BY lion_bm25_score(tsv, %L, ''tl_lp_i'') DESC, ctid LIMIT %s', q, q, k);
-	SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexscan = off;
+	SET LOCAL enable_seqscan = off; SET LOCAL enable_bitmapscan = off; SET LOCAL pg_lion.enable_plain_scan = off;
 	FOR l IN EXECUTE 'EXPLAIN (COSTS OFF) ' || sql LOOP
 		IF l LIKE '%LionBm25%' THEN scanned := true; END IF;
 	END LOOP;
 	EXECUTE format('SELECT array_agg(id) FROM (%s) x', sql) INTO a;
-	RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+	RESET enable_seqscan; RESET enable_bitmapscan; RESET pg_lion.enable_plain_scan;
 	SET LOCAL pg_lion.enable_bm25_scan = off;
 	EXECUTE format('SELECT array_agg(id) FROM (%s) x', sql) INTO b;
 	RETURN CASE WHEN NOT scanned THEN 'not scanned' WHEN a IS DISTINCT FROM b THEN 'differ' ELSE 'same' END;
@@ -285,21 +286,32 @@ REINDEX INDEX tl_l_i; REINDEX INDEX tl_lp_i;
 SELECT * FROM tl_check(ARRAY(SELECT q FROM tl_queries) || ARRAY['{n1}', '{n2}', '{n1}:A']);
 SELECT lion_index_verify('tl_l_i', true), lion_index_verify('tl_lp_i', true);
 
--- the index holds each word under its key: none longer than 2043 bytes
-SELECT count(*) FILTER (WHERE octet_length(key) > 2043) AS too_long,
-	   count(*) FILTER (WHERE octet_length(key) = 2043) AS at_limit,
-	   (SELECT count(*) FROM tl_w WHERE tl_key(w) NOT IN
+-- the index holds each word under its key, and facets show each word, the
+-- hashed ones and hx too, with ts_stat()'s ndoc
+SELECT (SELECT count(*) FROM tl_w WHERE octet_length(w) > 2043) AS hashed,
+	   count(*) FILTER (WHERE octet_length(key) > 2043) AS shown_long,
+	   (SELECT count(*) FROM tl_w WHERE w NOT IN
 		   (SELECT key FROM lion_index_facets('tl_l_i', 1000))) AS missing
   FROM lion_index_facets('tl_l_i', 1000);
+SELECT count(*) AS words, count(*) FILTER (WHERE f.count IS DISTINCT FROM s.ndoc) AS differ
+  FROM ts_stat('SELECT tsv FROM tl_l') s FULL JOIN lion_index_facets('tl_l_i') f ON f.key = s.word;
+SELECT count(*) AS words, count(*) FILTER (WHERE f.count IS DISTINCT FROM s.ndoc) AS differ
+  FROM ts_stat('SELECT tsv FROM tl_lp') s FULL JOIN lion_index_facets('tl_lp_i') f ON f.key = s.word;
 
--- other keys are not hashed: one of more than 2047 bytes is an error
+-- a scalar key of more than 2047 bytes is stored compressed, and an array
+-- element hashed; an incompressible scalar one is an error
 CREATE TABLE tl_t (t text, a text[]);
 CREATE INDEX tl_t_t ON tl_t USING lion (t);
 CREATE INDEX tl_t_a ON tl_t USING lion (a);
 INSERT INTO tl_t VALUES (repeat('x', 2043), ARRAY[repeat('y', 2043)]);
 INSERT INTO tl_t VALUES (repeat('x', 2044), NULL);
 INSERT INTO tl_t VALUES (NULL, ARRAY[repeat('y', 2044)]);
+INSERT INTO tl_t SELECT string_agg(md5(g::text), ''), NULL FROM generate_series(1, 70) g;
+SET enable_seqscan = off;
 SELECT count(*) FROM tl_t WHERE t = repeat('x', 2043);
+SELECT count(*) FROM tl_t WHERE t = repeat('x', 2044);
+SELECT count(*) FROM tl_t WHERE a @> ARRAY[repeat('y', 2044)];
+RESET enable_seqscan;
 
 DROP TABLE tl, tl_g, tl_l, tl_lp, tl_w, tl_wq, tl_new, tl_queries, tl_t;
 DROP FUNCTION tl_copy_in(text, text, text), tl_send(text[], int[]), tl_sub(text), tl_q(text),

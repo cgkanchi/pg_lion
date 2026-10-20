@@ -351,6 +351,7 @@ lion_poscursor_init(Relation index, LionState *col, Datum key,
 	Buffer		buf = InvalidBuffer;
 	OffsetNumber off;
 	bool		ok = true;
+	bool		moved;
 
 	memset(cur, 0, sizeof(LionPosCursor));
 	cur->root = InvalidBlockNumber;
@@ -358,11 +359,13 @@ lion_poscursor_init(Relation index, LionState *col, Datum key,
 	cur->rightlink = InvalidBlockNumber;
 
 	key = PointerGetDatum(PG_DETOAST_DATUM(key));
-	if (!lion_find_entry(index, col, BUFFER_LOCK_SHARE, key,
-						 lion_hash_key(col, key), &buf, &off))
+	if (!lion_find_entry_ext(index, col, BUFFER_LOCK_SHARE, key,
+							 lion_hash_key(col, key), NULL, NULL, InvalidOid,
+							 &buf, &off, &moved))
 	{
 		/* no row has the lexeme */
 		cur->absent = true;
+		lion_reader_lock_absent(index, buf, moved);	/* DESIGN.md §9 */
 	}
 	else
 	{
@@ -371,6 +374,11 @@ lion_poscursor_init(Relation index, LionState *col, Datum key,
 		LionEntryTuple *e = lion_page_entry_fetch(index, page, blkno, off);
 		const LionEntryPosExt *x = lion_entry_posext(e);
 
+		/*
+		 * The rows of the lexeme are what a ranking reads (and a phrase
+		 * filter, the positions of rows its sets already hold): §9.
+		 */
+		lion_reader_lock_entry(index, blkno, e);
 		if (x == NULL)
 			ok = false;
 		else if ((e->flags & LION_ENTRY_CHAIN) != 0)

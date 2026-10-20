@@ -32,12 +32,16 @@ typedef struct LionVerifyLevel
 	LionEntryTuple **firstkey;	/* first data item of each page, or NULL */
 	LionEntryTuple **highkey;	/* its high key, or NULL when rightmost */
 	bool	   *incomplete;		/* flagged LION_PAGE_INCOMPLETE_SPLIT */
+	bool	   *dying;			/* in a subtree being deleted (§21) */
 } LionVerifyLevel;
+
+static bool lion_verify_dir_chain(LionVerifyState *vs, BlockNumber blk,
+								  uint16 level, BlockNumber *ownerp);
 
 static void
 lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 					 LionEntryTuple *firstkey, LionEntryTuple *highkey,
-					 bool incomplete)
+					 bool incomplete, bool dying)
 {
 	if (lvl->npages >= lvl->maxpages)
 	{
@@ -50,6 +54,7 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 			lvl->firstkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->highkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->incomplete = (bool *) palloc(sizeof(bool) * lvl->maxpages);
+			lvl->dying = (bool *) palloc(sizeof(bool) * lvl->maxpages);
 		}
 		else
 		{
@@ -61,12 +66,15 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 														sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->incomplete = (bool *) repalloc(lvl->incomplete,
 												sizeof(bool) * lvl->maxpages);
+			lvl->dying = (bool *) repalloc(lvl->dying,
+										   sizeof(bool) * lvl->maxpages);
 		}
 	}
 	lvl->blocks[lvl->npages] = blk;
 	lvl->firstkey[lvl->npages] = firstkey;
 	lvl->highkey[lvl->npages] = highkey;
 	lvl->incomplete[lvl->npages] = incomplete;
+	lvl->dying[lvl->npages] = dying;
 	lvl->npages++;
 }
 
@@ -322,6 +330,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		LionEntryTuple *prevkey = NULL;
 		LionEntryTuple *firstkey = NULL;
 		LionEntryTuple *highkey = NULL;
+		bool		dying;
 
 		lion_verify_visit(vs, blk, "the directory");
 		lion_verify_copy_page(vs, blk, kind, page);
@@ -339,6 +348,25 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
 						RelationGetRelationName(vs->index), blk, opaque->level,
 						level);
+
+		/*
+		 * Page deletion (DESIGN.md §21) unlinks a page from both of its
+		 * siblings in the record that marks it DELETED, so no level walk
+		 * reaches one; a HALF_DEAD leaf is still linked, empty, with a MINUS
+		 * INFINITY high key.
+		 */
+		if (LionPageIsDeleted(page))
+			lion_corrupt("lion index \"%s\": deleted directory page %u is still linked into level %u",
+						RelationGetRelationName(vs->index), blk, level);
+		if (LionPageIsHalfDead(page) &&
+			(LionPageIsRightmost(page) || LionPageIsRoot(page) ||
+			 PageGetMaxOffsetNumber(page) != FirstOffsetNumber ||
+			 !ItemIdIsUsed(PageGetItemId(page, FirstOffsetNumber)) ||
+			 !LionEntryIsMinusInf(lion_verify_dir_item(vs, blk, page,
+													   FirstOffsetNumber))))
+			lion_corrupt("lion index \"%s\": half-dead directory leaf %u is not an empty page with a minus infinity high key",
+						RelationGetRelationName(vs->index), blk);
+
 		if (opaque->leftlink != prev)
 			lion_verify_leftlink(vs, blk, level, kind, prev, opaque->leftlink);
 		lion_verify_root_flag(vs, blk, level, LionPageIsRoot(page));
@@ -385,6 +413,23 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			lion_corrupt("lion index \"%s\": rightmost directory page %u carries a high key",
 						RelationGetRelationName(vs->index), blk);
 
+		/*
+		 * Every internal page begins with a minus-infinity downlink
+		 * (LION_MAX_DIR_HEIGHT).  A split leaves two downlinks on each half,
+		 * but a page deletion takes one out of its parent and may leave it
+		 * one (§21, "Page deletion"), never none.
+		 */
+		if (!isleaf)
+		{
+			if (firstdata > maxoff)
+				lion_corrupt("lion index \"%s\": internal page %u has no downlink",
+							RelationGetRelationName(vs->index), blk);
+			if (!ItemIdIsUsed(PageGetItemId(page, firstdata)) ||
+				!LionEntryIsMinusInf(lion_page_entry(page, firstdata)))
+				lion_corrupt("lion index \"%s\": the first downlink of internal page %u is not minus infinity",
+							RelationGetRelationName(vs->index), blk);
+		}
+
 		for (off = firstdata; off <= maxoff; off++)
 		{
 			ItemId		iid = PageGetItemId(page, off);
@@ -408,7 +453,11 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 				lion_corrupt_reindex("lion index \"%s\": item %u of directory page %u does not sort after the one before it",
 									RelationGetRelationName(vs->index), off, blk);
 
-			if (firstkey == NULL)
+			/*
+			 * The page's first KEY: on an internal page, past its
+			 * minus-infinity downlink, whose key is this page's lower bound.
+			 */
+			if (firstkey == NULL && !LionEntryIsMinusInf(item))
 			{
 				firstkey = lion_verify_copy_item(page, off);
 				if (prevhigh != NULL &&
@@ -427,10 +476,18 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			}
 			else
 			{
+				/*
+				 * The separator of the child of a minus-infinity downlink is
+				 * this page's lower bound: the high key of the page to its
+				 * left, which the walk has just read, or minus infinity
+				 * itself on the leftmost page of the level.
+				 */
 				if (children != NULL)
 					lion_verify_level_add(children, lion_entry_head(item),
+										  LionEntryIsMinusInf(item) &&
+										  prevhigh != NULL ? prevhigh :
 										  lion_verify_copy_item(page, off),
-										  NULL, false);
+										  NULL, false, false);
 			}
 
 			CHECK_FOR_INTERRUPTS();
@@ -443,11 +500,24 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		if (prevkey != NULL)
 			pfree(prevkey);
 
+		/*
+		 * A page of a subtree that is being deleted bounds nothing: its range
+		 * already belongs to the page right of the subtree's top, and keys
+		 * below its high key are added to the pages right of it (§21, "Page
+		 * deletion").  It is the HALF_DEAD leaf, or an internal page with one
+		 * downlink above it.
+		 */
+		dying = LionPageIsHalfDead(page) ||
+			(!isleaf && firstdata == maxoff &&
+			 lion_verify_dir_chain(vs, blk, level, NULL));
+
 		lion_verify_level_add(out, blk, firstkey, highkey,
-							  LionPageIncompleteSplit(page));
+							  LionPageIncompleteSplit(page), dying);
 
 		prev = blk;
-		prevhigh = highkey;		/* owned by *out; not freed here */
+		/* owned by *out; not freed here */
+		if (!dying)
+			prevhigh = highkey;
 		blk = opaque->rightlink;
 
 		CHECK_FOR_INTERRUPTS();
@@ -499,7 +569,8 @@ lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
 
 		if (lion_verify_has_block(sorted, below->npages, b))
 		{
-			lion_verify_level_add(seen, b, children->firstkey[j], NULL, false);
+			lion_verify_level_add(seen, b, children->firstkey[j], NULL, false,
+								  false);
 			/* the candidates since the last reached page lie before this one */
 			for (; pending < vs->ncands; pending++)
 				vs->cands[pending].right = b;
@@ -553,6 +624,76 @@ lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
 }
 
 /*
+ * Is blk, a page of `level`, in a subtree being deleted (DESIGN.md §21, "Page
+ * deletion")?  The subtree is a chain of pages of one downlink each down to a
+ * HALF_DEAD leaf, whose owner_head is *ownerp (when ownerp is not NULL).
+ * Neither stage of a deletion runs beside the check, which VACUUM's lock
+ * excludes.
+ */
+static bool
+lion_verify_dir_chain(LionVerifyState *vs, BlockNumber blk, uint16 level,
+					  BlockNumber *ownerp)
+{
+	BlockNumber cur = blk;
+	int			l = level;
+
+	for (;;)
+	{
+		Buffer		buf;
+		Page		page;
+		OffsetNumber first;
+		LionEntryTuple *down;
+
+		page = lion_verify_read_page(vs, cur,
+									 l == 0 ? LION_PAGE_BUCKET : LION_PAGE_DIR,
+									 &buf);
+		if (LionPageGetOpaque(page)->level != l)
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		if (l == 0)
+		{
+			bool		dying = LionPageIsHalfDead(page);
+
+			if (ownerp != NULL)
+				*ownerp = LionPageGetOpaque(page)->owner_head;
+			UnlockReleaseBuffer(buf);
+			return dying;
+		}
+
+		first = lion_page_first_data(page);
+		down = (first == PageGetMaxOffsetNumber(page)) ?
+			lion_verify_dir_item(vs, cur, page, first) : NULL;
+		if (down == NULL || !LionEntryIsDownlink(down))
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		cur = lion_entry_head(down);
+		UnlockReleaseBuffer(buf);
+		l--;
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/*
+ * Is blk, a page of `level` that no downlink names, the top of a subtree
+ * being deleted?  Stage 1 took that downlink out, and the HALF_DEAD leaf's
+ * owner_head names the top - InvalidBlockNumber when the leaf is the whole
+ * subtree.
+ */
+static bool
+lion_verify_dir_dying(LionVerifyState *vs, BlockNumber blk, uint16 level)
+{
+	BlockNumber top;
+
+	if (!lion_verify_dir_chain(vs, blk, level, &top))
+		return false;
+	return level == 0 ? !BlockNumberIsValid(top) : top == blk;
+}
+
+/*
  * Check the whole directory: every level, and every level against the one
  * below it.  The levels are walked from the leaves up, which is what lets a
  * split made between two walks show up as nothing worse than a downlink to a
@@ -585,6 +726,34 @@ lion_verify_directory(LionVerifyState *vs)
 				lion_corrupt("lion index \"%s\": the leftmost page %u is at level %u, expected %u",
 							RelationGetRelationName(vs->index), blk,
 							LionPageGetOpaque(page)->level, level);
+
+			/*
+			 * The first downlink leads to the leftmost page of the level -
+			 * unless that page heads a subtree being deleted (DESIGN.md §21,
+			 * "Page deletion"), whose downlink is gone while it is still
+			 * linked into its level: the level starts at its left end.
+			 */
+			{
+				BlockNumber steps = 0;
+
+				while (BlockNumberIsValid(LionPageGetOpaque(page)->leftlink))
+				{
+					BlockNumber left = LionPageGetOpaque(page)->leftlink;
+
+					UnlockReleaseBuffer(buf);
+					if (left == blk || ++steps > vs->nblocks)
+						lion_corrupt("lion index \"%s\": the left links of level %u go round a cycle",
+									RelationGetRelationName(vs->index), level);
+					blk = left;
+					page = lion_verify_read_page(vs, blk,
+												 level == 0 ? LION_PAGE_BUCKET :
+												 LION_PAGE_DIR, &buf);
+					if (LionPageGetOpaque(page)->level != level)
+						lion_corrupt("lion index \"%s\": directory page %u is at level %u, expected %u",
+									RelationGetRelationName(vs->index), blk,
+									LionPageGetOpaque(page)->level, level);
+				}
+			}
 			leftmost[level] = blk;
 			if (level > 0)
 			{
@@ -640,6 +809,8 @@ lion_verify_directory(LionVerifyState *vs)
 			j = 0;
 			for (p = 0; p < below->npages; p++)
 			{
+				bool		dying = false;
+
 				if (j < children.npages && children.blocks[j] == below->blocks[p])
 				{
 					LionEntryTuple *sep = children.firstkey[j];
@@ -665,6 +836,16 @@ lion_verify_directory(LionVerifyState *vs)
 				{
 					/* the right half of an unfinished split: no downlink yet */
 				}
+				else if (lion_verify_dir_dying(vs, below->blocks[p], i - 1))
+				{
+					/*
+					 * The top of a subtree being deleted (DESIGN.md §21,
+					 * "Page deletion"): its downlink went in stage 1, and its
+					 * right sibling's separator now bounds the range it had,
+					 * so its high key is not compared with that either.
+					 */
+					dying = true;
+				}
 				else if (j < children.npages)
 					lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the next page of level %u is block %u",
 								RelationGetRelationName(vs->index), j, i,
@@ -676,9 +857,10 @@ lion_verify_directory(LionVerifyState *vs)
 
 				/*
 				 * A child's high key was the next separator when the split
-				 * made them; later splits of the child only lower it.
+				 * made them; later splits of the child only lower it.  One in
+				 * a subtree being deleted bounds nothing any more.
 				 */
-				if (j < children.npages &&
+				if (!dying && !below->dying[p] && j < children.npages &&
 					below->highkey[p] != NULL &&
 					lion_cmp_entries(vs->ix, below->highkey[p],
 									 children.firstkey[j]) > 0)
@@ -719,10 +901,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V11)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V12)
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V11);
+					meta->version, LION_MAGIC, LION_VERSION_V12);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
@@ -853,6 +1035,21 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	 * whatever the page holds (lion_vacuum_free_postree()).  A root is its
 	 * tree's identity and is live until then.
 	 */
+	/*
+	 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves") is out of its
+	 * set on purpose and waits for VACUUM to hand it out again, as a DELETED
+	 * page does.  Nothing writes to it after that, so one with items is
+	 * damage.
+	 */
+	if (LionPageIsUnlinked(page))
+	{
+		if (!LionPageIsPostingLeaf(page) || PageGetMaxOffsetNumber(page) != 0)
+			lion_corrupt("lion index \"%s\": block %u was taken out of a posting set but is not an empty leaf",
+						RelationGetRelationName(vs->index), blk);
+		UnlockReleaseBuffer(buf);
+		return LION_UNREF_FREE;
+	}
+
 	if ((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) != 0)
 	{
 		BlockNumber root = LionPageGetOpaque(page)->owner_head;

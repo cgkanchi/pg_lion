@@ -51,7 +51,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_sort', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		used := used OR ln ~ 'Custom Scan \(LionOrdered\)';
@@ -64,6 +65,9 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('pg_lion.vector_postfilter', 'exact', true);
 	FOR r IN EXECUTE coalesce(ordinary, q) LOOP
 		b := b || r.id;
@@ -139,13 +143,15 @@ RESET plan_cache_mode;
 DEALLOCATE vlp;
 
 -- a subquery's own LIMIT, under an aggregate that has none
-SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off;
+SET enable_seqscan = off; SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 SET enable_sort = off;
 SET client_min_messages = debug1;
 SELECT count(*), count(DISTINCT id)
   FROM (SELECT id FROM vl WHERE cat <> 5 ORDER BY v <-> vl_vec(77, 24) LIMIT 100) s;
 RESET client_min_messages;
-RESET enable_seqscan; RESET enable_bitmapscan; RESET enable_indexscan;
+RESET enable_seqscan; RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan; RESET pg_lion.pushdown_margin;
 RESET enable_sort;
 
 RESET pg_lion.vector_margin;

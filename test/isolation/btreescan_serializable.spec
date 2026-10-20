@@ -48,7 +48,7 @@ session s1
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id, k FROM bss WHERE c = 1 ORDER BY k, id LIMIT 3; }
@@ -61,7 +61,7 @@ session s2
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000;
 }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_read	{ SELECT id, k FROM bss WHERE c = 2 ORDER BY k, id LIMIT 3; }

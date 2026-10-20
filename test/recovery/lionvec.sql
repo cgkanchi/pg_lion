@@ -269,7 +269,12 @@ BEGIN
 	PERFORM set_config('enable_seqscan', (how = 'sort')::text, true);
 	PERFORM set_config('enable_sort', (how = 'sort')::text, true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', (how = 'probed')::text, true);
+	-- LionOrdered forced against the lionvec index's own scan by the margin:
+	-- enable_indexscan would disable it too
+	PERFORM set_config('enable_indexscan', (how <> 'sort')::text, true);
+	PERFORM set_config('pg_lion.enable_plain_scan', (how <> 'exact')::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin',
+					   CASE how WHEN 'exact' THEN '1000' ELSE '1' END, true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', (how = 'exact')::text, true);
 	-- the sort's filtered queries are exact; a lionvec scan they would filter
 	-- is otherwise an error (pg_lion.vector_postfilter)

@@ -1,0 +1,119 @@
+-- Stored positions next to a long key (DESIGN.md §17, "Stored positions").
+--
+-- An INLINE entry that stores positions carries its posting set in a payload
+-- area - with the growth slack an insert gives it - and its position chunk
+-- after that.  Next to a key of some 2 kB the binding limit on the two
+-- together is LION_MAX_ENTRY_SIZE, not inline_limit, and an insert that found
+-- the grown payload still inside the area it had kept that area, slack and
+-- all, while the chunk grew past what was left: the entry came out a byte or
+-- more over the limit and the INSERT failed ("lion index entry of 6057 bytes
+-- is too large for a directory leaf") instead of the entry spilling.  The
+-- index was not damaged, but the entry stayed exactly that full, so every
+-- later insert of the key failed too, rolled back or not, until VACUUM.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+
+-- ---------------------------------------------------------------------
+-- 1. One 2000-byte lexeme in 2000 rows.
+-- ---------------------------------------------------------------------
+CREATE TABLE plk (id int, tsv tsvector) WITH (autovacuum_enabled = off);
+CREATE INDEX plk_tsv ON plk USING lion (tsv);
+INSERT INTO plk SELECT i, to_tsvector('simple', repeat('a', 2000))
+	FROM generate_series(1, 2000) i;
+INSERT INTO plk VALUES (0, to_tsvector('simple', 'hello ' || repeat('a', 2000)));
+SELECT lion_index_verify('plk_tsv');
+SELECT count(*) FROM plk WHERE tsv @@ to_tsquery('simple', repeat('a', 2000));
+SELECT count(*) FROM plk WHERE tsv @@ to_tsquery('simple', 'hello <-> ' || repeat('a', 2000));
+DROP TABLE plk;
+
+-- ---------------------------------------------------------------------
+-- 2. A sweep: key lengths near the limit (2044 and up are hashed to the
+--    maximum key size; 2046 is the longest word to_tsvector() keeps on every
+--    minor release, as some drop one of 2047 bytes), one to several
+--    positions a row, store_positions on and off, inline_limit at its
+--    default and below, and rows added in batches of every size - each
+--    batch in a subtransaction, so a failure is counted and the sweep goes
+--    on, as an application retrying would (the index keeps what a failed
+--    insert changed).  Every row has to go in, and the index has to answer
+--    for all of them, phrases included.
+-- ---------------------------------------------------------------------
+CREATE TABLE plk_result (
+	klen int, npos int, positions bool, inline_limit int,
+	rows_in int, failures int, verify text, found bigint, phrase bigint);
+
+DO $$
+DECLARE
+	klens int[] := ARRAY[1880, 1910, 1935, 1950, 2000, 2020, 2040, 2043,
+						 2044, 2046];
+	klen int;
+	npos int;
+	pos bool;
+	lim int;
+	w text;
+	done int;
+	batch int;
+	fails int;
+	c int := 0;
+BEGIN
+	PERFORM setseed(0.4242);
+	FOREACH klen IN ARRAY klens LOOP
+		FOREACH pos IN ARRAY ARRAY[true, false] LOOP
+			c := c + 1;
+			npos := 1 + (c % 3);
+			lim := CASE WHEN (c / 2) % 2 = 1 THEN 1024 ELSE 4096 END;
+			w := repeat(chr(97 + c % 26), klen);
+			EXECUTE 'CREATE TABLE plk_t (id int, tsv tsvector) WITH (autovacuum_enabled = off)';
+			EXECUTE format('CREATE INDEX plk_t_i ON plk_t USING lion (tsv) WITH (store_positions = %s, inline_limit = %s)',
+						   CASE WHEN pos THEN 'on' ELSE 'off' END, lim);
+			done := 0;
+			fails := 0;
+			WHILE done < 1600 LOOP
+				batch := 1 + floor(random() * 300)::int;
+				BEGIN
+					INSERT INTO plk_t SELECT done + g,
+						to_tsvector('simple', repeat(w || ' ', 1 + (done + g) % npos) ||
+									'tail' || ((done + g) % 7))
+						FROM generate_series(1, batch) g;
+					done := done + batch;
+				EXCEPTION WHEN others THEN
+					fails := fails + 1;
+					EXIT WHEN fails > 3;
+				END;
+			END LOOP;
+			INSERT INTO plk_result
+				SELECT klen, npos, pos, lim, done, fails,
+					   (SELECT lion_index_verify('plk_t_i')::text),
+					   (SELECT count(*) FROM plk_t
+						 WHERE tsv @@ to_tsquery('simple', w)),
+					   (SELECT count(*) FROM plk_t
+						 WHERE tsv @@ to_tsquery('simple', w || ' <-> ' || w));
+			EXECUTE 'DROP TABLE plk_t';
+		END LOOP;
+	END LOOP;
+END
+$$;
+
+-- Every batch went in, the index finds every row, and the phrase finds the
+-- rows with the word twice in a row - which npos says how many there are of.
+SELECT klen, positions, inline_limit, failures, verify,
+	   found = rows_in AS all_found,
+	   phrase = (SELECT count(*) FROM generate_series(1, rows_in) i
+				  WHERE i % npos > 0) AS phrase_ok
+	FROM plk_result ORDER BY klen, positions;
+
+-- ---------------------------------------------------------------------
+-- 3. Many positions a row: the chunk outgrows the entry early, and the
+--    first rows decide.
+-- ---------------------------------------------------------------------
+CREATE TABLE plk_many (id int, tsv tsvector) WITH (autovacuum_enabled = off);
+CREATE INDEX plk_many_i ON plk_many USING lion (tsv);
+INSERT INTO plk_many SELECT i, to_tsvector('simple', repeat(repeat('m', 2040) || ' ', 300))
+	FROM generate_series(1, 300) i;
+SELECT lion_index_verify('plk_many_i');
+SELECT count(*) FROM plk_many
+	WHERE tsv @@ to_tsquery('simple', repeat('m', 2040) || ' <-> ' || repeat('m', 2040));
+
+DROP TABLE plk_result, plk_many;

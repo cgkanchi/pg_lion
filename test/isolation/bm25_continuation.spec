@@ -38,7 +38,7 @@ teardown
 }
 
 session s1
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id FROM bm_cont WHERE d @@ 'hit'
 					ORDER BY lion_bm25_score(d, 'hit', 'bm_cont_d') DESC; }

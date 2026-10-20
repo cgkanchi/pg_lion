@@ -1,12 +1,11 @@
 # The contract every reader of a lion index keeps under SERIALIZABLE (DESIGN.md
-# §9, "Direct readers"): it takes the relation-level predicate lock
-# index_beginscan() takes for an AM without ampredlocks, before it reads, so
-# a read that finds nothing still conflicts with a later insert of what it
-# looked for.  Two transactions each read an absent key through the same
+# §9, "SERIALIZABLE"): a lookup that finds nothing predicate-locks the leaf
+# where the key would be, so it still conflicts with a later insert of what
+# it looked for.  Two transactions each read an absent key through the same
 # reader, each insert it, and the second commit must fail, as it does for an
-# ordinary index scan.  One permutation per reader: the SQL functions
-# (lion_reader_vet()) and the custom scans (lion_reader_lock()).  A new
-# reader gets a step pair and a permutation here.
+# ordinary index scan.  One permutation per reader: the SQL functions and the
+# custom scans.  A new reader gets a step pair and a permutation here;
+# serializable_keys.spec has the readers of keys that exist.
 
 setup
 {
@@ -24,7 +23,7 @@ teardown
 	DROP TABLE rc;
 }
 session s1
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_count	{ SELECT lion_index_count('rc_k', 99); }
 step s1_count2	{ SELECT lion_index_count('rc_k', 99, 'rc_j', 99); }
@@ -41,7 +40,7 @@ step s1_insert	{ INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secre
 step s1_commit	{ COMMIT; }
 
 session s2
-setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_count	{ SELECT lion_index_count('rc_k', 99); }
 step s2_count2	{ SELECT lion_index_count('rc_k', 99, 'rc_j', 99); }
