@@ -34,8 +34,8 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Bitmap Index Scan%' THEN
@@ -48,8 +48,8 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lion_rq_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_rq_on' INTO nrows;
@@ -80,8 +80,8 @@ BEGIN
 	IF force THEN
 		PERFORM set_config('enable_seqscan', 'off', true);
 		PERFORM set_config('enable_bitmapscan', 'off', true);
-		PERFORM set_config('enable_indexscan', 'off', true);
-		PERFORM set_config('enable_indexonlyscan', 'off', true);
+		PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+		PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	END IF;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
@@ -99,6 +99,8 @@ BEGIN
 	EXECUTE format('CREATE TEMP TABLE lion_rc_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
@@ -214,7 +216,9 @@ SELECT o.amopstrategy, count(DISTINCT c.opcname) AS classes
            14 |       1
            15 |       1
            16 |       1
-(16 rows)
+           17 |       1
+           18 |       1
+(18 rows)
 
 SELECT c.opcname
   FROM pg_opclass c
@@ -1589,7 +1593,8 @@ SELECT lion_rq('SELECT id FROM lion_rm WHERE a >= ANY (''{48, NULL}'') AND b = 3
 -- model and the plain scan took it as answered.  Nothing is removed now.
 BEGIN;
 SET LOCAL enable_seqscan = off;
-SET LOCAL enable_indexscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 SET LOCAL pg_lion.enable_count_pushdown = off;
 SELECT l FROM lion_explain_norm('SELECT id FROM lion_rm WHERE a < ANY (''{-40, -45}'') AND b = 3',
 								'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l
@@ -2037,7 +2042,8 @@ SELECT lion_rc('SELECT count(*) FROM lion_rp WHERE uq BETWEEN ''2024-01-01 01:00
 BEGIN;
 DROP INDEX lion_rp_uq_bt;
 SET LOCAL enable_seqscan = off;
-SET LOCAL enable_indexscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+SET LOCAL pg_lion.pushdown_margin = 1000;
 SELECT regexp_replace(l, 'rows=(\d+)(\.00)? ', 'rows=\1 ') AS line
   FROM lion_explain_norm('SELECT id FROM lion_rp WHERE uq <= ANY (ARRAY(SELECT timestamp ''2024-01-01 01:00'' + g * interval ''1 second'' FROM generate_series(1, 200) g))',
 						 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS l

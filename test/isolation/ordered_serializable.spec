@@ -1,8 +1,8 @@
 # Two SERIALIZABLE transactions each read through a LionOrdered scan
 # (DESIGN.md §30) - the first rows, in btree order, of the rows lion says
 # have c = 1 (or c = 2) - and then each insert a row the OTHER one's read
-# would have returned first.  The node takes a relation predicate lock on the
-# lion index it builds its set from, the btree walk takes its page locks, and
+# would have returned first.  The lion lookup locks the pages that stand for
+# the key it read (DESIGN.md §9), the btree walk takes its page locks, and
 # every fetched row its tuple lock, so this write skew must end in a
 # serialization failure, as it does for the ordinary plan.
 
@@ -24,7 +24,7 @@ session s1
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off; SET enable_indexonlyscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; SET enable_indexonlyscan = off;
 }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id FROM os WHERE c = 1 ORDER BY k, id LIMIT 3; }
@@ -36,7 +36,7 @@ session s2
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off; SET enable_indexonlyscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; SET enable_indexonlyscan = off;
 }
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_read	{ SELECT id, k FROM os WHERE c = 2 ORDER BY k, id LIMIT 3; }

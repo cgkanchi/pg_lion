@@ -22,7 +22,10 @@ PG_FUNCTION_INFO_V1(lion_index_wal_mode);
 Relation
 lion_open_index(Oid relid, LOCKMODE lockmode)
 {
-	Relation	index = index_open(relid, lockmode);
+	Relation	index;
+
+	lion_refuse_partitioned_index(relid);
+	index = index_open(relid, lockmode);
 
 	if (index->rd_rel->relkind != RELKIND_INDEX ||
 		index->rd_indam == NULL ||
@@ -266,6 +269,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 			elog(ERROR, "return type must be a row type");
 		funcctx->tuple_desc = BlessTupleDesc(tupdesc);
 
+		/*
+		 * A partitioned index has no storage, so nothing to describe: no
+		 * rows, as pg_relation_size() says 0 of it, and a query over every
+		 * lion index in pg_class goes on to its partitions' indexes.
+		 */
+		if (lion_is_partitioned_index(relid))
+		{
+			MemoryContextSwitchTo(oldcxt);
+			SRF_RETURN_DONE(funcctx);
+		}
+
 		index = lion_open_index(relid, AccessShareLock);
 		ix = lion_get_index_state(index);
 
@@ -315,6 +329,19 @@ lion_index_stats(PG_FUNCTION_ARGS)
 			}
 
 			maxoff = PageGetMaxOffsetNumber(page);
+
+			/*
+			 * A DELETED directory page (DESIGN.md §21, "Page deletion") is out
+			 * of the tree and waiting to be handed out again, as a DELETED
+			 * container page is.
+			 */
+			if ((LionPageIsDir(page) || LionPageIsBucket(page)) &&
+				LionPageIsDeleted(page))
+			{
+				st->deleted_pages++;
+				UnlockReleaseBuffer(buf);
+				continue;
+			}
 
 			if (LionPageIsDir(page))
 			{
@@ -411,11 +438,12 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				LionColStats *cs;
 
 				/*
-				 * A DELETED page (DESIGN.md §18) holds nothing and is waiting
-				 * in the free space map to be handed out again; it is neither
-				 * a container page nor free space of one.
+				 * A DELETED page (DESIGN.md §18), or a leaf VACUUM took out of
+				 * its posting set (§22, "Empty leaves"), holds nothing and is
+				 * waiting to be handed out again; it is neither a container
+				 * page nor free space of one.
 				 */
-				if (LionPageIsDeleted(page))
+				if (LionPageIsDeleted(page) || LionPageIsUnlinked(page))
 				{
 					st->deleted_pages++;
 					UnlockReleaseBuffer(buf);

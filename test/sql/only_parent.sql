@@ -33,8 +33,10 @@ VACUUM (FREEZE, ANALYZE) op_child;
 VACUUM (FREEZE, ANALYZE) op_dim;
 
 /*
- * The lion nodes of a query's plan with core's scans and joins disabled, so
- * that lion's paths are taken wherever they are offered, and whether the rows
+ * The lion nodes of a query's plan with core's sequential and bitmap scans and
+ * joins disabled, the AM's plain scans off and the margin marking lion's paths
+ * down against core's index scans, so that lion's paths are taken wherever
+ * they are offered, and whether the rows
  * equal those of the ordinary plan with every lion path off.
  */
 CREATE FUNCTION op_lion(q text) RETURNS text
@@ -45,8 +47,8 @@ DECLARE
 	same boolean;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
@@ -58,8 +60,8 @@ BEGIN
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE op_a AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_hashjoin', 'on', true);
 	PERFORM set_config('enable_mergejoin', 'on', true);

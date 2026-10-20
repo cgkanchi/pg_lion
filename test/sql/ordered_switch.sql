@@ -72,7 +72,9 @@ BEGIN
 	SET LOCAL enable_sort = on;
 	SET LOCAL enable_seqscan = on;
 	SET LOCAL enable_bitmapscan = on;
-	SET LOCAL enable_indexscan = on;
+	SET LOCAL pg_lion.enable_plain_scan = on;
+	SET LOCAL enable_indexonlyscan = on;
+	SET LOCAL pg_lion.pushdown_margin = 1;
 	b := osw_rows(q);
 	RETURN CASE WHEN a = b THEN 'same, ' || split_part(a, ' ', 1) || ' rows'
 		   ELSE 'differ: ' || a || ' against ' || b END;
@@ -83,7 +85,9 @@ END $$;
 SET enable_sort = off;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET enable_indexonlyscan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET pg_lion.ordered_switch_ratio = 1;
 SET work_mem = '64kB';
 
@@ -158,7 +162,9 @@ COMMIT;
 
 RESET work_mem;
 RESET pg_lion.ordered_switch_ratio;
-RESET enable_indexscan;
+RESET pg_lion.pushdown_margin;
+RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 RESET enable_seqscan;
 RESET enable_sort;

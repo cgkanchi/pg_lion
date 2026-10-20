@@ -64,7 +64,7 @@ session s1
 setup
 {
 	SET enable_seqscan = off; SET enable_bitmapscan = off;
-	SET enable_indexscan = off; SET enable_indexonlyscan = off;
+	SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; SET enable_indexonlyscan = off;
 }
 step s1_begin	{ BEGIN; }
 step s1_plan	{ EXPLAIN (COSTS OFF) SELECT id, k FROM oc WHERE c = 3 ORDER BY k, id; }

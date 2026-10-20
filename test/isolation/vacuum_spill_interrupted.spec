@@ -62,9 +62,9 @@ step s1_vacuum	{ VACUUM vsi; }
 step s1_detach	{ SELECT injection_points_detach('lion-spill-leaves-written'); }
 step s1_verify	{ SELECT lion_index_verify('vsi_k', true) AS verify; }
 step s1_count	{
-	SET enable_seqscan = off; SET enable_indexscan = off;
+	SET enable_seqscan = off; SET pg_lion.enable_plain_scan = off;
 	SELECT count(*) AS through_the_index FROM vsi WHERE k = 0;
-	RESET enable_seqscan; RESET enable_indexscan;
+	RESET enable_seqscan; RESET pg_lion.enable_plain_scan;
 }
 
 permutation
