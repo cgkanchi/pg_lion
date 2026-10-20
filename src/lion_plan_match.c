@@ -11,6 +11,15 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
+#include "catalog/pg_type.h"
+#include "nodes/miscnodes.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/json.h"
+#include "utils/lsyscache.h"
+
 #include "lion_customscan.h"
 
 /*
@@ -1453,6 +1462,103 @@ lion_or_arms(Node *clause)
 }
 
 /*
+ * `(doc ->> 'k') = 'v'` as the `doc @> '{"k": "v"}'` it is the same test as
+ * (DESIGN.md §42.6), or NULL when clause is not one or the two could differ.
+ * `->>` gives the text of the field's value: a string's own characters, a
+ * number's digits, `true` or `false`, a container's JSON text, and NULL for
+ * a JSON null, a missing key and a document that is no object.  The containment holds exactly where the
+ * document is an object whose field k is the string v.  So the two agree on
+ * every row - NULL counting as false, as in a WHERE or a FILTER - when v is
+ * the text of no number (numeric_in() refuses it), of neither boolean, and of
+ * no container (it starts with neither `{` nor `[`), and when `=` is texteq()
+ * under a deterministic collation, which compares the characters themselves.
+ * The key and v must be constants; the rewritten clause compares the same
+ * expression, relabels and all, with the operator of pg_catalog.
+ */
+static Node *
+lion_jsonb_field_eq(Node *clause)
+{
+	OpExpr	   *op;
+	OpExpr	   *field = NULL;
+	Const	   *val = NULL;
+	Const	   *key;
+	Node	   *a;
+	Node	   *b;
+	char	   *keystr;
+	char	   *valstr;
+	Oid			containsop;
+	Datum		num;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	StringInfoData buf;
+
+	if (clause == NULL || !IsA(clause, OpExpr))
+		return NULL;
+	op = (OpExpr *) clause;
+	if (list_length(op->args) != 2 || op->opretset)
+		return NULL;
+	set_opfuncid(op);
+	if (op->opfuncid != F_TEXTEQ || !OidIsValid(op->inputcollid) ||
+		!get_collation_isdeterministic(op->inputcollid))
+		return NULL;
+
+	a = lion_strip((Node *) linitial(op->args));
+	b = lion_strip((Node *) lsecond(op->args));
+	if (a != NULL && IsA(a, OpExpr) && b != NULL && IsA(b, Const))
+	{
+		field = (OpExpr *) a;
+		val = (Const *) b;
+	}
+	else if (b != NULL && IsA(b, OpExpr) && a != NULL && IsA(a, Const))
+	{
+		field = (OpExpr *) b;
+		val = (Const *) a;
+	}
+	if (field == NULL || val->constisnull ||
+		(val->consttype != TEXTOID && val->consttype != VARCHAROID))
+		return NULL;
+
+	set_opfuncid(field);
+	if (field->opfuncid != F_JSONB_OBJECT_FIELD_TEXT ||
+		list_length(field->args) != 2)
+		return NULL;
+	key = (Const *) lion_strip((Node *) lsecond(field->args));
+	if (key == NULL || !IsA(key, Const) || key->constisnull ||
+		(key->consttype != TEXTOID && key->consttype != VARCHAROID))
+		return NULL;
+
+	/* v is the text of no number, boolean or container */
+	valstr = TextDatumGetCString(val->constvalue);
+	if (valstr[0] == '{' || valstr[0] == '[' ||
+		strcmp(valstr, "true") == 0 || strcmp(valstr, "false") == 0 ||
+		DirectInputFunctionCallSafe(numeric_in, valstr, InvalidOid, -1,
+									(Node *) &escontext, &num))
+		return NULL;
+
+	containsop = OpernameGetOprid(list_make2(makeString("pg_catalog"),
+											 makeString("@>")),
+								  JSONBOID, JSONBOID);
+	if (!OidIsValid(containsop) || get_opcode(containsop) != F_JSONB_CONTAINS)
+		return NULL;
+
+	keystr = TextDatumGetCString(key->constvalue);
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '{');
+	escape_json(&buf, keystr);
+	appendStringInfoString(&buf, ": ");
+	escape_json(&buf, valstr);
+	appendStringInfoChar(&buf, '}');
+
+	return (Node *) make_opclause(containsop, BOOLOID, false,
+								  (Expr *) copyObject(linitial(field->args)),
+								  (Expr *) makeConst(JSONBOID, -1, InvalidOid,
+													 -1,
+													 DirectFunctionCall1(jsonb_in,
+																		 CStringGetDatum(buf.data)),
+													 false, false),
+								  InvalidOid, InvalidOid);
+}
+
+/*
  * Is this clause one the posting sets can answer, and on a plain column of
  * rti?  Fills *out and returns true, or returns false and leaves the caller
  * to decline the whole query.
@@ -1485,6 +1591,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 {
 	Var		   *boolvar;
 	bool		boolval;
+	Node	   *rewritten;
 
 	memset(out, 0, sizeof(LionLeafInfo));
 	out->opno = InvalidOid;
@@ -1495,6 +1602,21 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 	if (clause == NULL)
 		return false;
 
+	if ((rewritten = lion_jsonb_field_eq(clause)) != NULL)
+	{
+		/*
+		 * `(doc ->> 'k') = 'v'` (lion_jsonb_field_eq()): the containment it
+		 * is, analysed as one, whose clause the cost model and the plan see
+		 * in its place.
+		 */
+		if (!lion_analyze_leaf(root, rewritten, rti, allow_negated,
+							   allow_range, allow_recheck, out))
+			return false;
+		if (out->kind != LION_CLAUSE_MULTI || out->costclause != NULL)
+			return false;
+		out->costclause = rewritten;
+		return true;
+	}
 	if (lion_nonempty_leaf(clause, out))
 	{
 		/*

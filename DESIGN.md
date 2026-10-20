@@ -22016,7 +22016,41 @@ parameter, against a sequential scan, GIN jsonb_ops and jsonb_path_ops, before a
 and deletes; fixed edge cases; keys over 2000 bytes; the plans. Disabling the lossy answer makes it
 fail.
 
-### 42.6 Not done
+### 42.6 A field equal to a string (2026-10-20)
+
+`(doc ->> 'k') = 'v'` is the usual spelling of "field k is v", and no operator of the class: the
+count pushdown left it to the heap in a WHERE, and declined a count with it in a FILTER, whose
+conditions have to be answered from posting sets (§10, "Filtered counts").  It is the same test as
+`doc @> '{"k": "v"}'` when v is a string no other JSON value prints as.  `->>` gives the text of
+the field's value: a string's own characters, a number's digits, `true` or `false`, a container's
+JSON text, and NULL for a JSON null, for a missing key and for a document that is no object; the
+containment holds exactly where the document is an object whose field k is the string v (`{"k":
+["v"]}` and `[{"k": "v"}]` contain no such field, and their `->>` is no `v` either).  So the two
+agree on every row, NULL counting as false as it does in a WHERE and a FILTER, when:
+
+- `=` is texteq() under a deterministic collation, which compares the characters themselves;
+- the key and v are constants (text or varchar), so that v can be looked at when planning;
+- v is the text of no number - numeric_in() refuses it, which also turns away `NaN`, `Infinity`
+  and padded digits, though no JSON number prints as those -, is neither `true` nor `false`, and
+  starts with neither `{` nor `[`, as every container's text does.
+
+`lion_jsonb_field_eq()` (lion_plan_match.c) builds the containment - the same expression as `->>`'s
+operand, pg_catalog's `@>`, and v as a JSON string under the key, escaped by escape_json() - and
+`lion_analyze_leaf()` analyses that in the clause's place, as the multi-key clause the posting sets
+answer exactly (§42.2: one `L` key, whose array marks keep `{"k": ["v"]}` apart); the plan and its
+EXPLAIN show the containment.  Not under a `NOT`, whose `->>` is NULL where the containment is
+false, and not as `<>`, which the planner makes of `NOT (... = ...)`.  A value that is a parameter,
+`IN (...)`, `doc -> 'k' = '"v"'` and a nondeterministic collation stay the heap's.  The estimate is
+core's, of the `->>` expression.  An expression index on `(doc ->> 'k')` is an expression column
+first (§41), and answers the clause as one.
+
+Tests: `jsonb_fieldeq.sql`: documents whose field is the string, a number, a boolean, null, an
+array or object holding the string, strings that print like those, other cases and padding,
+escapes in the key and the value, top-level arrays and scalars, nested fields, NULL documents;
+every spelling taken and every one declined, in a WHERE, a FILTER with `doc IS NOT NULL AND doc ?
+'k'` beside it, an OR, a GROUP BY and a generic plan, against the pushdown off.
+
+### 42.7 Not done
 
 - **Multi-leaf array elements exactly**: store each leaf's outermost array-element ordinal as a
   per-(key, row) payload, as positions are (§17), and keep candidates with an ordinal all the

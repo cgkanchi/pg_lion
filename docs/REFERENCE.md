@@ -301,6 +301,13 @@ root, the root's type, and one per top-level key, string element or string scala
     doc @@ '$.a[*].b == 1'     the keys under a.b with the value 1, rechecked
     doc @? '$.a ? (@.b > 1)'   the keys under a.b (a range only requires the path), rechecked
 
+The count pushdown also takes `(doc ->> 'k') = 'v'` as `doc @> '{"k": "v"}'`, the same test
+when v is a string constant that is not the text of a number, of `true` or `false`, or of an object
+or array (it starts with neither `{` nor `[`), compared under a deterministic collation: in a
+`WHERE` it is answered from the index instead of the heap, and in a `FILTER` it no longer sends the
+count to the ordinary plan. `->>` compared with a parameter, a number's text and the like stay with
+the heap (DESIGN.md §42.6).
+
 Numbers compare by value (`1`, `1.0` and `1e0` are one key) and strings by their bytes, as jsonb
 equality does. A key longer than 2047 bytes is stored as its SHA-256, and a query that needs one is
 rechecked. Counts are pushed down, the rechecked queries with each candidate checked in the heap,
