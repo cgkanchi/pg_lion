@@ -379,13 +379,19 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	/*
 	 * lion_fetch_key() points into the page for by-reference types, so copy
 	 * the key out while the buffer is still locked.  The reserved NULL entry
-	 * (DESIGN.md §14) has no key bytes to copy.
+	 * (DESIGN.md §14) has no key bytes to copy, and the EMPTY and NULLELEMS
+	 * entries (§17) no key at all.
 	 */
 	ps->keyisnull = LionEntryIsNullKey(entry);
 	if (ps->keyisnull)
 	{
 		ps->storedkey = (Datum) 0;
 		ps->hasstoredkey = true;
+	}
+	else if (LionEntryIsReserved(entry))
+	{
+		ps->storedkey = (Datum) 0;
+		ps->hasstoredkey = false;
 	}
 	else
 	{
@@ -1863,6 +1869,18 @@ bool
 lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 								LionPostingSet *ps)
 {
+	return lion_posting_set_lookup_reserved_col(index, attno,
+												LION_ENTRY_NULLKEY, ps);
+}
+
+/*
+ * ... and for any reserved entry of the column: the NULL one, or a multi-key
+ * column's EMPTY or NULLELEMS one (DESIGN.md §17), named by its flag.
+ */
+bool
+lion_posting_set_lookup_reserved_col(Relation index, AttrNumber attno,
+									 uint16 reservedflag, LionPostingSet *ps)
+{
 	LionState   *state = lion_index_column_state(index, attno);
 	Buffer		buf;
 	OffsetNumber off;
@@ -1875,7 +1893,8 @@ lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 	ps->entryblk = InvalidBlockNumber;
 	ps->entryoff = InvalidOffsetNumber;
 
-	if (!lion_find_null_entry(index, state, BUFFER_LOCK_SHARE, &buf, &off))
+	if (!lion_find_reserved_entry(index, state, BUFFER_LOCK_SHARE,
+								  reservedflag, &buf, &off))
 	{
 		/* one entry of its kind per column: no run to move right through */
 		lion_reader_lock_absent(index, buf, false);

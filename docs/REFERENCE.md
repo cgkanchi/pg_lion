@@ -543,9 +543,11 @@ key type with no btree opclass, whose entries are then in a complete but arbitra
 column's entries, its containers by kind, its sparse segments, its posting trees' internal pages
 and tallest height (a set of up to 16 leaves has no internal level, DESIGN.md §22), `null_tids`,
 the number of rows whose key in that column is NULL, and `empty_tids`,
-the number of rows a multi-key opclass extracted no key from, `ndistinct`, the distinct keys
-the planner is given for the column (DESIGN.md §33; NULL where none is recorded), and, last,
-`narrow_containers`, the column's NARROW containers (DESIGN.md §38).  `slack_bytes` and
+the number of rows a multi-key opclass extracted no key from (an array with no elements, a tsvector
+with no lexemes), `ndistinct`, the distinct keys
+the planner is given for the column (DESIGN.md §33; NULL where none is recorded),
+`narrow_containers`, the column's NARROW containers (DESIGN.md §38), and, last, `nullelem_tids`,
+the number of rows whose array has elements and all of them NULL (DESIGN.md §17).  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the

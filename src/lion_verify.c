@@ -425,14 +425,15 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 							 LionEntryIsHighKey(item) ? "high key" : "downlink",
 							 off, blk, item->attno);
 
-	if (kind == LION_KIND_NULL || kind == LION_KIND_EMPTY)
+	if (LION_KIND_IS_RESERVED(kind))
 	{
-		/* the NULL and EMPTY entries, or pivots made from them (§14, §17) */
+		/* the reserved entries, or pivots made from them (§14, §17) */
 		if (item->keylen != 0)
 			lion_corrupt("lion index \"%s\": %s item %u on block %u has a key of %u bytes",
 						RelationGetRelationName(vs->index),
-						kind == LION_KIND_NULL ? "null" : "empty", off, blk,
-						item->keylen);
+						kind == LION_KIND_NULL ? "null" :
+						kind == LION_KIND_EMPTY ? "empty" : "null-elements",
+						off, blk, item->keylen);
 		return item;
 	}
 
@@ -2026,9 +2027,10 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						entry->attno);
 	}
 
-	if ((entry->flags & LION_ENTRY_RESERVED) == LION_ENTRY_RESERVED)
-		lion_corrupt("lion index \"%s\": entry %u on block %u is both the null and the empty entry",
-					RelationGetRelationName(vs->index), off, blk);
+	if (pg_popcount32((uint32) (entry->flags & LION_ENTRY_RESERVED)) > 1)
+		lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, which name two reserved entries",
+					RelationGetRelationName(vs->index), off, blk,
+					entry->flags);
 
 	if (LionEntryIsReserved(entry))
 	{
@@ -2037,27 +2039,30 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		 * each per key column at most - a second one would
 		 * split its rows between two entries that no reader looks for twice.
 		 */
-		const char *what = LionEntryIsNullKey(entry) ? "null" : "empty";
+		const char *what = LionEntryIsNullKey(entry) ? "null" :
+			LionEntryIsEmptyKey(entry) ? "empty" : "null-elements";
+		int64	   *seen = LionEntryIsNullKey(entry) ? vs->nnullentries :
+			LionEntryIsEmptyKey(entry) ? vs->nemptyentries :
+			vs->nnullelemsentries;
 
 		if (entry->keylen != 0)
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u has a key of %u bytes",
 						RelationGetRelationName(vs->index), what, off, blk,
 						entry->keylen);
-		if (LionEntryIsNullKey(entry) ?
-			(++vs->nnullentries[entry->attno - 1] > 1) :
-			(++vs->nemptyentries[entry->attno - 1] > 1))
+		if (++seen[entry->attno - 1] > 1)
 			lion_corrupt("lion index \"%s\": entry %u on block %u is a second %s entry for key column %u",
 						RelationGetRelationName(vs->index), off, blk, what,
 						entry->attno);
 
 		/*
-		 * Only a multi-key opclass ever writes an empty entry; finding one in
-		 * a scalar index means the two flag bits have been confused
-		 * somewhere.
+		 * Only a multi-key opclass ever writes an empty or a null-elements
+		 * entry; finding one in a scalar index means the flag bits have been
+		 * confused somewhere.
 		 */
-		if (LionEntryIsEmptyKey(entry) && !state->multikey)
-			lion_corrupt("lion index \"%s\": entry %u on block %u is an empty-key entry, but the operator class of key column %u extracts no keys",
+		if (!LionEntryIsNullKey(entry) && !state->multikey)
+			lion_corrupt("lion index \"%s\": entry %u on block %u is an %s entry, but the operator class of key column %u extracts no keys",
 						RelationGetRelationName(vs->index), off, blk,
+						LionEntryIsEmptyKey(entry) ? "empty-key" : "null-elements",
 						entry->attno);
 	}
 	else

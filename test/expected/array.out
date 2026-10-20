@@ -133,17 +133,20 @@ SELECT lion_index_verify('lion_arr_nums', true);
 (1 row)
 
 -- 40 tag entries + 13 + 3 overlap; the NULL array is one entry, the empty
--- array another.  empty_tids counts the rows no key was extracted from.
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
- entries | null_tids | empty_tids 
----------+-----------+------------
-      42 |         1 |          1
+-- array another.  empty_tids counts the rows with no element at all, and
+-- nullelem_tids the rows whose every element is NULL (none yet).
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_tags');
+ entries | null_tids | empty_tids | nullelem_tids 
+---------+-----------+------------+---------------
+      42 |         1 |          1 |             0
 (1 row)
 
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_nums');
- entries | null_tids | empty_tids 
----------+-----------+------------
-      13 |         1 |          1
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_nums');
+ entries | null_tids | empty_tids | nullelem_tids 
+---------+-----------+------------+---------------
+      13 |         1 |          1 |             0
 (1 row)
 
 -- lion_index_count() is a single-key function: a multi-key index has no
@@ -662,10 +665,12 @@ SELECT lion_index_verify('lion_arr_nums', true);
  
 (1 row)
 
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
- entries | null_tids | empty_tids 
----------+-----------+------------
-      45 |         1 |          3
+-- '{}' joined the EMPTY entry, '{NULL}' started the NULLELEMS one
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_tags');
+ entries | null_tids | empty_tids | nullelem_tids 
+---------+-----------+------------+---------------
+      46 |         1 |          2 |             1
 (1 row)
 
 -- a dirty heap: the count has to visit it
@@ -893,6 +898,78 @@ SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
 (1 row)
 
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a IS NULL$$);
+    lion_arrcmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+-- The third key-less entry, NULLELEMS (arrays whose elements are all NULL),
+-- spills and keeps its identity the same way: on INSERT ...
+INSERT INTO lion_arr_res
+SELECT i, CASE WHEN i % 4 = 0 THEN ARRAY[NULL]::int[]
+			   WHEN i % 4 = 2 THEN ARRAY[NULL, NULL]::int[]
+			   ELSE '{3}'::int[] END
+  FROM generate_series(30001, 34000) i;
+SELECT entries, null_tids, empty_tids, nullelem_tids,
+	   container_pages > 0 AS spilled
+  FROM lion_index_stats('lion_arr_res_a');
+ entries | null_tids | empty_tids | nullelem_tids | spilled 
+---------+-----------+------------+---------------+---------
+       6 |      2001 |       5001 |          2000 | t
+(1 row)
+
+INSERT INTO lion_arr_res VALUES (40001, '{NULL}'), (40002, '{{NULL},{NULL}}');
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_res_a');
+ entries | null_tids | empty_tids | nullelem_tids 
+---------+-----------+------------+---------------
+       6 |      2001 |       5001 |          2002
+(1 row)
+
+SELECT lion_index_verify('lion_arr_res_a', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res WHERE a @> '{}'$$);
+    lion_arrcmp     
+--------------------
+ index scan, 1 rows
+(1 row)
+
+-- ... and in VACUUM
+INSERT INTO lion_arr_res2
+SELECT i, ARRAY[NULL]::int[] FROM generate_series(30001, 40000) i;
+DELETE FROM lion_arr_res2 WHERE id > 30000 AND id % 2 = 0;
+VACUUM (FREEZE) lion_arr_res2;
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_res2_a');
+ entries | null_tids | empty_tids | nullelem_tids 
+---------+-----------+------------+---------------
+       4 |      5001 |       5001 |          5000
+(1 row)
+
+SELECT lion_index_verify('lion_arr_res2_a', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+INSERT INTO lion_arr_res2 VALUES (40001, '{NULL}');
+SELECT entries, nullelem_tids FROM lion_index_stats('lion_arr_res2_a');
+ entries | nullelem_tids 
+---------+---------------
+       4 |          5001
+(1 row)
+
+SELECT lion_index_verify('lion_arr_res2_a', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
     lion_arrcmp     
 --------------------
  index scan, 1 rows

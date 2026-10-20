@@ -503,7 +503,9 @@ typedef struct LionCountSource
 /*
  * Locate the posting set of the rows whose key column `attno` is NULL: that
  * column's reserved entry (DESIGN.md §14, §24).  Returns false when the
- * column holds no NULLs.
+ * column holds no NULLs.  lion_posting_set_lookup_reserved_col() locates any
+ * reserved entry of the column, named by its flag: the NULL one, or a
+ * multi-key column's EMPTY or NULLELEMS one (§17).
  *
  * Every lookup below names an INDEX COLUMN, 1-based, exactly as a ScanKey's
  * sk_attno and an IndexOptInfo's indexkeys[i] + 1 do.  The wrappers without
@@ -511,6 +513,10 @@ typedef struct LionCountSource
  */
 extern bool lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 											LionPostingSet *ps);
+extern bool lion_posting_set_lookup_reserved_col(Relation index,
+												 AttrNumber attno,
+												 uint16 reservedflag,
+												 LionPostingSet *ps);
 
 static inline bool
 lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)

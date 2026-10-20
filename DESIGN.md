@@ -972,7 +972,7 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT posting_internal_pages bigint, OUT max_posting_height int,
         OUT inline_slack_bytes bigint, OUT summary_entries bigint, OUT summary_tids bigint,
         OUT summary_bytes bigint, OUT summary_pages bigint, OUT ndistinct bigint,
-        OUT narrow_containers bigint)
+        OUT narrow_containers bigint, OUT nullelem_tids bigint)
         RETURNS SETOF record
         -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
         -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
@@ -995,7 +995,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- ndistinct is the column's distinct keys as the meta page records them for the planner
         -- (§33) - the last build's, VACUUM's or ANALYZE's count, not this walk's - and NULL for a
         -- column with none (a multi-key one, or an index nothing has counted since before §33);
-        -- narrow_containers is the NARROW containers of §38, last so the others keep their places
+        -- narrow_containers is the NARROW containers of §38, last so the others keep their places,
+        -- and nullelem_tids the member count of the reserved NULLELEMS entry (§17), the rows whose
+        -- value had elements and all of them NULL
     lion_index_posting_root(regclass, key anyelement) RETURNS bigint
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
@@ -1005,8 +1007,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- one lexeme and look up no entry at all.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
-        -- never below the column of the entry before it, §24), at most one reserved NULL and one
-        -- reserved EMPTY entry PER COLUMN, page ids/flags, meta values, entry flags,
+        -- never below the column of the entry before it, §24), at most one reserved NULL, one
+        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids/flags, meta values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container and that every member is a heap tuple - an offset 1 ..
         -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
@@ -5465,6 +5467,21 @@ are mutually exclusive and verify() says so.  `lion_find_entry_ext()` skips both
 Like the NULL entry it keeps its flag through a spill, whether the spill happens on insert or inside
 VACUUM (§4, §14); test/sql/array.sql and test/sql/tsvector.sql take both transitions.
 
+A third key-less entry, NULLELEMS (flag `LION_ENTRY_NULLELEMS`, hash 0, keylen 0), holds the rows
+whose extraction returned keys that are ALL NULL - `'{NULL}'`, `'{NULL,NULL}'`,
+`'{{NULL},{NULL}}'` - which are under no key either, since NULL keys are dropped ("Build and
+insert" below).  Keeping them out of the EMPTY entry makes that entry exactly the values with no
+element at all, which is what lets the non-emptiness predicates of "Non-empty arrays" below be
+answered from the entries: a row is in exactly one of NULL (the value is NULL), EMPTY (it has no
+element), NULLELEMS or the value entries of its non-NULL elements.  Only `ginarrayextract()` returns
+NULL keys among the opclasses lion ships; a tsvector, a jsonb value and a range never reach the
+entry.  `lion_extract_value()` reports which reserved entry a key-less value belongs to, and the
+build, insert, VACUUM and verify(heapallindexed) all take it from there.  The three sort
+NULL < EMPTY < NULLELEMS < value.  The entry is part of format version 13 (`LION_VERSION_V13`); an
+index of another version is refused with the REINDEX hint, as after every format change.
+
+`lion_index_stats()` reports the entry's members in `nullelem_tids`.
+
 The meta page version is NOT bumped.  A version 2 index built with a scalar opclass has no empty
 entry and needs none - only a multi-key opclass ever writes one, and those did not exist before this
 wave - so no existing index answers anything wrongly, which is the test §14 set for a version bump.
@@ -5486,7 +5503,8 @@ which is exactly the visibility the heap already gives: the inserting transactio
 so no snapshot that can see the row can run before the last of them is written.
 
 Extraction (`lion_extract_value()`, lion_multikey.c) drops NULL keys and duplicates.  A row whose array
-holds a NULL element is indexed under its other elements; nothing ever looks for a NULL key, because
+holds a NULL element is indexed under its other elements, and one with no other element in the
+NULLELEMS entry; nothing ever looks for a NULL key, because
 a query with one falls back to a rechecking scan.  Duplicates must go, or `lion_container_add()` would
 report "already indexed" and leave `ntids` wrong.  The dedupe hashes every key once and sorts the
 keys by (hash, the key type's btree order when it has one, §21), so the only candidates for equality
@@ -5500,11 +5518,12 @@ there a run is quadratic in the keys that genuinely collide, which the built-in 
 keep small.
 
 `ntids` therefore counts (key, row) pairs, and so does `IndexBuildResult.index_tuples`.  A row with
-no keys contributes one pair, in the EMPTY entry.  **VACUUM is unchanged**: its callback is per TID
+no keys contributes one pair, in the EMPTY or the NULLELEMS entry.  **VACUUM is unchanged**: its callback is per TID
 and a TID is removed from every entry that holds it.
 
 verify(heapallindexed) extracts each heap row's keys with the same function the build uses and checks
-that the TID is present under every one of them, or in the EMPTY entry when there are none.
+that the TID is present under every one of them, or in the EMPTY or NULLELEMS entry its value
+belongs to when there are none.
 
 ### Queries (`lion_extract_query()`, lion_multikey.c)
 
@@ -6967,7 +6986,7 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 12 (`LION_VERSION_V12`): these entry tuples, with keys of up to 2047 bytes
+The format is version 13 (`LION_VERSION_V13`, the NULLELEMS entry of §17): these entry tuples, with keys of up to 2047 bytes
 (§4), under internal pages that each begin with a minus-infinity downlink ("Height" below), and
 the pages VACUUM takes out and hands out again ("Page deletion" below, §22 "Empty leaves"). An
 index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
@@ -6976,7 +6995,7 @@ any height.
 
 ### The order
 
-    KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < VALUE), then proc 4 under the column's
+    KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < NULLELEMS < VALUE), then proc 4 under the column's
     collation, then the hash (computed from the key, "Entry tuples" above), then a bytewise
     comparison of the stored datum
 
@@ -8985,8 +9004,8 @@ relation-wide ones (the directory's shape, free and deleted pages) are repeated 
 container page is attributed to a column through its owner_head stamp (§18) and the attno of the
 entry that owns that head, accumulated per posting set and folded in at the end; a single-column
 index skips that and attributes everything to column 1. **verify()** checks the attno of every entry
-(in range, never below the entry before it), at most one reserved NULL and one reserved EMPTY entry
-per column, and - with heapallindexed - every heap row under every key of every column.
+(in range, never below the entry before it), at most one reserved NULL, one EMPTY and one NULLELEMS
+entry per column, and - with heapallindexed - every heap row under every key of every column.
 
 **Scans (amgetbitmap)**: the scan keys arrive with `sk_attno`; each key resolves to its column, every
 set qual of every column is answered (§5 SCAN step 5: several on one column are ANDed like the

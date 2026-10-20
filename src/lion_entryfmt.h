@@ -112,7 +112,16 @@
  */
 #define LION_ENTRY_ALIGNKEY	0x0400
 
-#define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)
+/*
+ * The third reserved entry of a multi-key column (DESIGN.md §17): the rows
+ * whose value the opclass extracted keys from, every one of them NULL - an
+ * array of NULLs, `{NULL}` or `{{NULL},{NULL}}` - where the EMPTY entry holds
+ * the values it extracted nothing from at all, an array with no elements.
+ */
+#define LION_ENTRY_NULLELEMS	0x0800
+
+#define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY | \
+							 LION_ENTRY_NULLELEMS)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
  * The flags that make an entry's KIND, which a pivot copied from it keeps -

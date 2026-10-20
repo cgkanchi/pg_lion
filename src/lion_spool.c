@@ -156,7 +156,8 @@ typedef struct LionAccEntry
 {
 	Datum		key;
 	uint32		hash;
-	uint8		kind;			/* LION_KIND_NULL, _EMPTY or _VALUE */
+	uint8		kind;			/* LION_KIND_NULL, _EMPTY, _NULLELEMS or
+								 * _VALUE */
 	bool		unsorted;		/* a code arrived below the one before it */
 	Size		keylen;			/* lion_key_datum_size(), 0 when reserved */
 	uint64		mincode;
@@ -195,13 +196,23 @@ static inline bool lion_acc_equal(struct LionAccCol *col,
 #define SH_DEFINE
 #include "lib/simplehash.h"
 
+/*
+ * The reserved entries a column may have (DESIGN.md §14, §17): the NULL, the
+ * EMPTY and the NULLELEMS entry, in directory order, at kind - LION_KIND_NULL.
+ */
+#define LION_ACC_NRESERVED	3
+StaticAssertDecl(LION_KIND_EMPTY == LION_KIND_NULL + 1 &&
+				 LION_KIND_NULLELEMS == LION_KIND_NULL + 2,
+				 "the reserved kinds are consecutive, in directory order");
+
 /* One key column's accumulator, and the runs it has spilled. */
 typedef struct LionAccCol
 {
 	LionState  *state;
 	MemoryContext cxt;			/* the table, the entries, keys and codes */
 	lionacc_hash *table;		/* the VALUE entries */
-	LionAccEntry *reserved[2];	/* the NULL and the EMPTY entry, if any */
+	LionAccEntry *reserved[LION_ACC_NRESERVED];	/* the reserved entries, if
+												 * any */
 	char	   *arena;
 	Size		arenafree;
 	Size		arenablock;		/* the size of an arena block */
@@ -531,7 +542,7 @@ lion_acc_reset(LionAccCol *col)
 {
 	MemoryContextReset(col->cxt);
 	col->table = lionacc_create(col->cxt, 256, col);
-	col->reserved[0] = col->reserved[1] = NULL;
+	memset(col->reserved, 0, sizeof(col->reserved));
 	col->arena = NULL;
 	col->arenafree = 0;
 	col->nentries = 0;
@@ -705,8 +716,9 @@ lion_acc_add(LionSpool *sp, LionAccCol *col, Datum key, uint64 code,
 static void
 lion_acc_add_reserved(LionSpool *sp, LionAccCol *col, int kind, uint64 code)
 {
-	int			i = (kind == LION_KIND_NULL) ? 0 : 1;
+	int			i = kind - LION_KIND_NULL;
 
+	Assert(LION_KIND_IS_RESERVED(kind));
 	if (col->reserved[i] == NULL)
 		col->reserved[i] = lion_acc_new_entry(col, kind, (Datum) 0,
 											  LION_NULLKEY_HASH, code, NULL);
@@ -768,7 +780,7 @@ lion_sortitem_cmp(const void *a, const void *b, void *arg)
 
 /*
  * A column's entries in directory order: the NULL entry, the EMPTY entry,
- * then the values.  *flagsp gets LION_RUN_TIED for every value whose
+ * the NULLELEMS entry, then the values.  *flagsp gets LION_RUN_TIED for every value whose
  * successor ties with it on the prefix, or NULL when none does.
  *
  * An ordered column sorts through the key type's SortSupport, abbreviated
@@ -792,16 +804,18 @@ lion_acc_sorted(LionAccCol *col, uint8 **flagsp, int *np)
 	int64		i;
 
 	/* *np, and the runs written from these items, count in an int */
-	if (col->nentries > (int64) (MaxAllocHugeSize / sizeof(LionSortItem)) - 2 ||
-		nvals > INT_MAX - 2)
+	if (col->nentries > (int64) (MaxAllocHugeSize / sizeof(LionSortItem)) -
+		LION_ACC_NRESERVED ||
+		nvals > INT_MAX - LION_ACC_NRESERVED)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("lion index build: too many distinct keys in one column"),
 				 errdetail("A column can have at most %d distinct keys in memory at once.",
-						   INT_MAX - 2)));
+						   INT_MAX - LION_ACC_NRESERVED)));
 	items = MemoryContextAllocHuge(CurrentMemoryContext,
-								   sizeof(LionSortItem) * (nvals + 2));
-	for (i = 0; i < 2; i++)
+								   sizeof(LionSortItem) *
+								   (nvals + LION_ACC_NRESERVED));
+	for (i = 0; i < LION_ACC_NRESERVED; i++)
 	{
 		if (col->reserved[i] != NULL)
 		{
@@ -1384,8 +1398,7 @@ lion_cursor_next_record(LionRunCursor *c)
 		c->eos = true;
 		return;
 	}
-	if ((h.kind != LION_KIND_NULL && h.kind != LION_KIND_EMPTY &&
-		 h.kind != LION_KIND_VALUE) ||
+	if ((!LION_KIND_IS_RESERVED(h.kind) && h.kind != LION_KIND_VALUE) ||
 		(h.kind == LION_KIND_VALUE) != (h.keylen > 0) ||
 		h.keylen > LION_MAX_KEY_SIZE)
 		elog(ERROR, "lion index build: malformed record in a spilled run");
@@ -2361,10 +2374,13 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			/*
 			 * DESIGN.md §17: one row, many keys.  A row the opclass extracts
 			 * nothing from - an empty array, a tsvector with no lexemes -
-			 * goes into the reserved EMPTY entry, so that a scan that has to
-			 * look at every indexed row (`tags @> '{}'`) can still find it.
+			 * goes into the reserved EMPTY entry, and one it extracts only
+			 * NULL keys from - an array of NULLs - into the NULLELEMS entry,
+			 * so that a scan that has to look at every indexed row (`tags @>
+			 * '{}'`) can still find it.
 			 */
 			Datum	   *keys;
+			uint16		nokey;
 			int			nkeys;
 			int			i;
 
@@ -2376,15 +2392,17 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			 */
 			if (cs->positions)
 			{
-				nkeys = lion_extract_value_pos(cs, values[c], &keys, &kpos);
+				nkeys = lion_extract_value_pos(cs, values[c], &keys, &kpos,
+											   &nokey);
 				if (nkeys > 0 && kpos == NULL)
 					elog(ERROR, "lion index build: a column that stores positions extracted keys without them");
 			}
 			else
-				nkeys = lion_extract_value(cs, values[c], &keys);
+				nkeys = lion_extract_value(cs, values[c], &keys, &nokey);
 
 			if (nkeys == 0)
-				lion_acc_add_reserved(sp, col, LION_KIND_EMPTY, code);
+				lion_acc_add_reserved(sp, col, lion_reserved_kind(nokey),
+									  code);
 			for (i = 0; i < nkeys; i++)
 			{
 				keys[i] = lion_key_prepare(cs, keys[i], NULL, tid);

@@ -582,6 +582,7 @@ lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
 			 errdetail("Key column %u of the tuple is %s.", state->attno,
 					   (reservedflag == LION_ENTRY_NULLKEY) ? "NULL" :
 					   (reservedflag == LION_ENTRY_EMPTYKEY) ? "absent" :
+					   (reservedflag == LION_ENTRY_NULLELEMS) ? "only NULL elements" :
 					   OidOutputFunctionCall(vs->keyoutfunc, key))));
 }
 
@@ -618,19 +619,21 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 		{
 			/*
 			 * DESIGN.md §17: the row has to be present under EVERY key its
-			 * value extracts to, and in the reserved EMPTY entry when it
-			 * extracts to none.  Extracting here rather than trusting the
-			 * index is the whole point of the check: it is the same call the
-			 * build and the insert make, so a row that is missing under one
-			 * of several keys is found.
+			 * value extracts to, and in the reserved entry the extraction
+			 * names when it extracts to none - the EMPTY one, or the
+			 * NULLELEMS one for keys that are all NULL.  Extracting here
+			 * rather than trusting the index is the whole point of the check:
+			 * it is the same call the build and the insert make, so a row
+			 * that is missing under one of several keys is found.
 			 */
 			Datum	   *keys;
-			int			nkeys = lion_extract_value(state, values[c], &keys);
+			uint16		nokey;
+			int			nkeys = lion_extract_value(state, values[c], &keys,
+												   &nokey);
 			int			i;
 
 			if (nkeys == 0)
-				lion_verify_one_key(vs, state, tid, (Datum) 0,
-								   LION_ENTRY_EMPTYKEY, code);
+				lion_verify_one_key(vs, state, tid, (Datum) 0, nokey, code);
 			for (i = 0; i < nkeys; i++)
 				lion_verify_one_key(vs, state, tid, keys[i], 0, code);
 		}
