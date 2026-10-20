@@ -312,6 +312,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §27, "The anti join over a small inner side": whether the
+	 * planner may count one table's rows with no match in a NOT EXISTS over
+	 * a small inner side as the table's count less the rows the inner side's
+	 * keys find in a B-tree of it.  pg_lion.enable_count_pushdown switches it
+	 * off as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_anti",
+							 "Enables lion's count of one table less the rows a NOT EXISTS over a small inner side matches.",
+							 "Off, such an anti join is left to the planner's own join methods; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_count_anti,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §29.11, "Plain scans switched off": whether the planner may
 	 * scan a lion index with a plain or an index-only scan.  Off, it plans
 	 * lion indexes as it plans GIN's, for bitmap scans only, where

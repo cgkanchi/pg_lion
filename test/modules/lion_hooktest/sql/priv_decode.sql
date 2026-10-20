@@ -36,3 +36,8 @@ SELECT lion_hooktest_priv_decode('aggregate without aggregates');
 SELECT lion_hooktest_priv_decode('distinct count without its column');
 -- a dimension folded into a fact filter whose IN list is the join key's
 SELECT lion_hooktest_priv_decode('join filter on its key');
+-- the anti join over a small inner side without the child it reads, with no
+-- key to look up, and a column of its inner side in a plan without one
+SELECT lion_hooktest_priv_decode('anti join without its child');
+SELECT lion_hooktest_priv_decode('anti join of no key');
+SELECT lion_hooktest_priv_decode('inner column without an anti join');

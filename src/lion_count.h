@@ -1635,6 +1635,12 @@ extern void lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 extern PGDLLIMPORT bool lion_enable_semijoin;
 extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
 
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"): pg_lion.enable_count_anti.
+ */
+extern PGDLLIMPORT bool lion_enable_count_anti;
+
 extern void lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *outerrel, RelOptInfo *innerrel,
 								   JoinType jointype,

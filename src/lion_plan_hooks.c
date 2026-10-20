@@ -24,6 +24,7 @@ bool		lion_enable_count_residual = true;
 bool		lion_enable_count_partial = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
 bool		lion_enable_semijoin = true;
+bool		lion_enable_count_anti = true;
 set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook = NULL;
 
 const CustomPathMethods lion_count_path_methods = {
@@ -94,6 +95,39 @@ lion_try_upper_path(PlannerInfo *root, UpperRelationKind stage,
 	}
 }
 
+/*
+ * One table's count less the rows a NOT EXISTS over a small inner side
+ * matches (DESIGN.md §27, "The anti join over a small inner side"), when
+ * joinrel is that anti join: its WHERE priced, as a base relation's is, with
+ * the ends the directory holds.
+ */
+static void
+lion_try_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
+					RelOptInfo *output_rel, GroupPathExtraData *extra)
+{
+	LionSmallAnti anti;
+	RelOptInfo *outer;
+
+	if (!lion_enable_count_anti ||
+		!lion_fkjoin_recognize_small_anti(root, joinrel, &anti))
+		return;
+	outer = anti.outerrel;
+	if (!lion_probe_begin(root, outer, outer->baserestrictinfo))
+	{
+		lion_try_count_anti_path(root, joinrel, output_rel, extra, &anti);
+		return;
+	}
+	PG_TRY();
+	{
+		lion_try_count_anti_path(root, joinrel, output_rel, extra, &anti);
+	}
+	PG_FINALLY();
+	{
+		lion_probe_end();
+	}
+	PG_END_TRY();
+}
+
 void
 lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 					   RelOptInfo *input_rel, RelOptInfo *output_rel,
@@ -150,6 +184,8 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 		for (i = 0; i < nfj; i++)
 			lion_try_count_path(root, input_rel, output_rel,
 							   (GroupPathExtraData *) extra, &fj[i]);
+		lion_try_small_anti(root, input_rel, output_rel,
+							(GroupPathExtraData *) extra);
 		lion_units_unpin();
 		return;
 	}
@@ -960,11 +996,64 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		list_free(vars);
 	}
 
+	/*
+	 * The columns the anti join over a small inner side reads (DESIGN.md
+	 * §27, "The anti join over a small inner side"), each once: the table's
+	 * as the residual clauses' are, a column the target list prints already
+	 * or a LION_TL_RESID one, and the inner side's as LION_TL_ANTI columns
+	 * of its child's target list, which the node fills from each child row.
+	 * Its keys' values, join clauses and restrictions then read them.
+	 */
+	if (priv.hasanti)
+	{
+		Plan	   *child;
+		List	   *vars;
+
+		if (list_length(custom_plans) != 1 ||
+			list_length(best_path->custom_paths) != 1)
+			elog(ERROR, "LionCount: an anti join needs one child plan");
+		child = (Plan *) linitial(custom_plans);
+		vars = pull_var_clause((Node *) priv.anti.exprs, 0);
+		foreach(lc, vars)
+		{
+			Var		   *var = (Var *) lfirst(lc);
+			ListCell   *l2;
+			bool		dup = false;
+			bool		outer;
+
+			if (!IsA(var, Var) || var->varattno <= 0)
+				elog(ERROR, "LionCount: an anti join reads more than columns");
+			outer = (var->varno == (int) priv.scanrelid);
+			foreach(l2, ctlist)
+			{
+				Node	   *e = (Node *) ((TargetEntry *) lfirst(l2))->expr;
+
+				if (outer ? (IsA(e, Var) && ((Var *) e)->varno == var->varno &&
+							 ((Var *) e)->varattno == var->varattno) :
+					equal(e, var))
+				{
+					dup = true;
+					break;
+				}
+			}
+			if (dup)
+				continue;
+			ctlist = lappend(ctlist,
+							 makeTargetEntry((Expr *) copyObject(var),
+											 list_length(ctlist) + 1,
+											 NULL, true));
+			kinds = lappend_int(kinds, outer ?
+								LION_TL_RESID(var->varattno) :
+								LION_TL_ANTI(lion_child_resno(child, var)));
+		}
+		list_free(vars);
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = having;
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
-	cscan->custom_plans = NIL;
+	cscan->custom_plans = priv.hasanti ? custom_plans : NIL;
 
 	/*
 	 * The clause values move from custom_private into custom_exprs, which is
@@ -998,6 +1087,14 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
 										  priv.resid);
 		priv.resid = NIL;
+	}
+
+	/* ... and the anti join's keys, join clauses and restrictions (§27) */
+	if (priv.hasanti)
+	{
+		cscan->custom_exprs = list_concat(list_copy(cscan->custom_exprs),
+										  priv.anti.exprs);
+		priv.anti.exprs = NIL;
 	}
 	lion_priv_set_tlkinds(&priv, kinds);
 

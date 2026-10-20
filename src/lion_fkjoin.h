@@ -128,6 +128,45 @@ typedef struct LionFkJoin
 } LionFkJoin;
 
 /*
+ * One key of the anti join over a small inner side (DESIGN.md §27, "The anti
+ * join over a small inner side"): a join clause `t.col op <inner expr>`, either
+ * way round - a strict operator between a plain column of the counted table
+ * and an expression of the inner side alone - which a B-tree on the column
+ * may look the inner side's values up by.
+ */
+typedef struct LionAntiKey
+{
+	OpExpr	   *clause;			/* the join clause, as the query has it */
+	Var		   *outervar;		/* the counted table's column */
+	Node	   *innerexpr;		/* the other operand */
+	bool		outerleft;		/* the column is the left operand */
+} LionAntiKey;
+
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"):
+ *
+ *		SELECT count(*) FROM t WHERE <t's own clauses>
+ *		  AND NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ... <s's filters>)
+ *
+ * whose rows are t's rows with no match: the count of t's WHERE, less the
+ * rows the inner side's rows match.  `outerrel` is t, the table counted;
+ * `innerrel` the NOT EXISTS's inner side, one table or a join of several,
+ * whose cheapest path is the node's child; `clauses` every join clause the
+ * anti join evaluates, a row of t matched when all of them hold for one inner
+ * row; `keys` those of them a B-tree on t may look a key up by.
+ */
+typedef struct LionSmallAnti
+{
+	RelOptInfo *joinrel;		/* the query's join rel */
+	RelOptInfo *outerrel;		/* the table counted */
+	RelOptInfo *innerrel;		/* the inner side, a base or a join rel */
+	Path	   *innerpath;		/* innerrel's cheapest total path */
+	List	   *clauses;		/* Expr: every join clause */
+	List	   *keys;			/* LionAntiKey: the clauses that are keys */
+} LionSmallAnti;
+
+/*
  * How many ways of taking joinrel apart qualify, one per table that may be the
  * fact - each way round of a join of two tables, and every fact of a joined
  * dimension, and with dimensions that only filter, each of them as the
@@ -156,6 +195,17 @@ extern bool lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
 									   JoinType jointype,
 									   JoinPathExtraData *extra,
 									   LionFkJoin *fj);
+
+/*
+ * Whether joinrel is the anti join over a small inner side (DESIGN.md §27,
+ * "The anti join over a small inner side"): one table, NOT EXISTS of a
+ * subquery correlated with it by at least one key, and nothing else.  Fills
+ * *out when it is.  Whether the table's own clauses can be counted, and
+ * whether a B-tree of it looks a key up, is the caller's to decide.
+ */
+extern bool lion_fkjoin_recognize_small_anti(PlannerInfo *root,
+											 RelOptInfo *joinrel,
+											 LionSmallAnti *out);
 
 /*
  * Whether rel's column attno is provably unique under the equality opno
