@@ -209,7 +209,9 @@ off` turns this off.
 
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
-side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
+side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan, or,
+where a B-tree holds the dimension's key, a Lion-filtered walk of that B-tree that reads no heap,
+below), and for
 each dimension row the node looks the key up in the fact's FK index and counts, or for `EXISTS` tests,
 that key's rows ANDed with the fact filters, which it collects once for the whole scan:
 
@@ -423,7 +425,12 @@ walks in heap mode under an `ORDER BY` and gets no unordered walk; `SELECT ... F
 UPDATE` needs the row's `ctid` and is heap mode too. The cost model chooses between the node, the
 B-tree's own scans and a bitmap scan of the Lion indexes; `pg_lion.enable_ordered_scan` and
 `pg_lion.enable_btree_scan` turn the two forms off, and `enable_indexonlyscan = off` turns the
-index-only mode off.
+index-only mode off. With parallel query enabled (`max_parallel_workers_per_gather`) the walk can
+be divided among the workers, each walking its share of the B-tree's leaf pages against one set
+they share: `Parallel Custom Scan (LionBtreeScan)` below a `Gather`, `Parallel Custom Scan
+(LionOrdered)` below a `Gather Merge` (DESIGN.md §40.9). The B-tree may be one that holds none of
+the filtered columns, such as the primary key of `SELECT sum(id) FROM t WHERE <Lion filter>`; it
+walks the whole index.
 
 ## Nearest neighbours: lionvec
 
@@ -662,8 +669,9 @@ four 3.7 times, finding a little more of the nearest rows for it (on DBpedia at 
 93.5% and 95% of the true ten against 92%); Gather Merge waits for every process's first row, the
 workers take about 10 ms to start, and they run on into their queues after the `LIMIT` has its
 rows. On DBpedia in memory the serial scan took 2.4 ms and the parallel ones 12 and 16; each
-query alone cold, 17 ms and 28 with two processes. A filtered query stays serial: `LionOrdered`,
-which a filter that lion indexes answer goes through, has no parallel plan, and under
+query alone cold, 17 ms and 28 with two processes. A filtered query stays serial: `LionOrdered`
+over the distance order, which a filter that lion indexes answer goes through, has no parallel
+plan, and under
 `pg_lion.vector_postfilter` `error`, the default, or `exact` no plan filters a parallel scan's rows
 either; under `allow` a parallel scan with a `Filter` is among the plans. Each process sends its
 own `DEBUG1` line, ending with the partitions another process probed and, in an index that spills,

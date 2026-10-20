@@ -95,6 +95,130 @@ SELECT lrc_est(q, true, node) = lrc_est(q, false, node) AS unchanged
 (1 row)
 
 RESET pg_lion.enable_intersection_probe;
+-- A parameterized scan of lrc, a nested loop's inner side: its rows are
+-- the filters with the join clause ANDed in, and take the probe's factor
+-- before they are clamped to one row and capped at the relation's rows.
+-- 5: a lookup on lrc's primary key returns a row at most, and is estimated
+--    at one with the correction as without it: core's product is a small
+--    fraction of a row, and that fraction times the probe's factor is still
+--    one.
+-- 6: a lookup on p, which h does not decide, returns a seventh of the
+--    filters' rows, and is estimated at about that with the correction and
+--    at one row without it.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+INSERT INTO lrc_q VALUES
+	(5, $$SELECT r.id FROM lrc_f f JOIN lrc r ON r.id = f.rid WHERE f.id = 10 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11$$, 'lrc'),
+	(6, $$SELECT r.id FROM lrc_f f JOIN lrc r ON r.p = f.v WHERE f.id = 1 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11$$, 'lrc');
+EXPLAIN (COSTS OFF)
+SELECT r.id FROM lrc_f f JOIN lrc r ON r.id = f.rid
+ WHERE f.id = 10 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Nested Loop
+   ->  Seq Scan on lrc_f f
+         Filter: (id = 10)
+   ->  Index Scan using lrc_pkey on lrc r
+         Index Cond: (id = f.rid)
+         Filter: ((c5 = 1) AND (c25 = 5) AND (c50 = 11))
+(6 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT r.id FROM lrc_f f JOIN lrc r ON r.p = f.v
+ WHERE f.id = 1 AND r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Nested Loop
+   ->  Seq Scan on lrc_f f
+         Filter: (id = 1)
+   ->  Index Scan using lrc_i on lrc r
+         Index Cond: ((c5 = 1) AND (c25 = 5) AND (c50 = 11) AND (p = f.v))
+(5 rows)
+
+SELECT n, lrc_actual(q) AS actual,
+	   CASE WHEN n = 5 THEN lrc_est(q, true, node) END AS corrected,
+	   lrc_est(q, true, node) BETWEEN lrc_actual(q) / 2 AND lrc_actual(q) * 2 AS corrected_within_2x,
+	   lrc_est(q, false, node) AS uncorrected
+  FROM lrc_q WHERE n IN (5, 6) ORDER BY n;
+ n | actual | corrected | corrected_within_2x | uncorrected 
+---+--------+-----------+---------------------+-------------
+ 5 |      1 |         1 | t                   |           1
+ 6 |    143 |           | t                   |           1
+(2 rows)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+-- The tests of whether a lion-indexed array is empty (DESIGN.md §17,
+-- "Non-empty arrays") correct the rows with no factor of the probe's: core
+-- takes `array_length(tags, 1) IS NOT NULL` at 0.995 and `cardinality(tags)
+-- > 0` at a third, and lion the two together as the share of the rows whose
+-- array has an element, nine in ten of lrc_a's.  A parameterized scan takes
+-- the same clauses (lion_param_rows()).
+-- 7: a lookup on g, a thirty-first of the rows, with that filter, as a nested
+--    loop's inner side;
+-- 8: the same with g a constant.  7 is estimated as 8 is, at about the rows
+--    both return, and both at about a third of them without the correction;
+--    with the probe off they are corrected all the same.
+CREATE TABLE lrc_a (id int PRIMARY KEY, g int NOT NULL, tags int[]);
+INSERT INTO lrc_a
+SELECT i, i % 31,
+	   CASE i % 20 WHEN 0 THEN NULL WHEN 1 THEN '{}' WHEN 2 THEN '{NULL}'
+		   ELSE ARRAY[i % 50, i % 7] END
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lrc_a_g ON lrc_a (g);
+CREATE INDEX lrc_a_tags ON lrc_a USING lion (tags);
+VACUUM (FREEZE, ANALYZE) lrc_a;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+-- an index scan, whose own rows lrc_est() reads, not a bitmap scan's
+SET enable_bitmapscan = off;
+INSERT INTO lrc_q VALUES
+	(7, $$SELECT r.id FROM lrc_f f JOIN lrc_a r ON r.g = f.v WHERE f.id = 1 AND array_length(r.tags, 1) IS NOT NULL AND cardinality(r.tags) > 0$$, 'lrc_a'),
+	(8, $$SELECT id FROM lrc_a WHERE g = 1 AND array_length(tags, 1) IS NOT NULL AND cardinality(tags) > 0$$, 'lrc_a');
+EXPLAIN (COSTS OFF)
+SELECT r.id FROM lrc_f f JOIN lrc_a r ON r.g = f.v
+ WHERE f.id = 1 AND array_length(r.tags, 1) IS NOT NULL AND cardinality(r.tags) > 0;
+                                    QUERY PLAN                                     
+-----------------------------------------------------------------------------------
+ Nested Loop
+   ->  Seq Scan on lrc_f f
+         Filter: (id = 1)
+   ->  Index Scan using lrc_a_g on lrc_a r
+         Index Cond: (g = f.v)
+         Filter: ((array_length(tags, 1) IS NOT NULL) AND (cardinality(tags) > 0))
+(6 rows)
+
+SELECT n, lrc_actual(q) AS actual,
+	   lrc_est(q, true, node) BETWEEN lrc_actual(q) * 0.9 AND lrc_actual(q) * 1.1 AS corrected_within_10pct,
+	   lrc_est(q, false, node) BETWEEN lrc_actual(q) / 2 AND lrc_actual(q) * 2 AS uncorrected_within_2x
+  FROM lrc_q WHERE n IN (7, 8) ORDER BY n;
+ n | actual | corrected_within_10pct | uncorrected_within_2x 
+---+--------+------------------------+-----------------------
+ 7 |    871 | t                      | f
+ 8 |    871 | t                      | f
+(2 rows)
+
+SELECT abs(p.e - c.e) <= 0.02 * c.e AS parameterized_as_constant
+  FROM (SELECT lrc_est(q, true, node) AS e FROM lrc_q WHERE n = 7) p,
+	   (SELECT lrc_est(q, true, node) AS e FROM lrc_q WHERE n = 8) c;
+ parameterized_as_constant 
+---------------------------
+ t
+(1 row)
+
+SET pg_lion.enable_intersection_probe = off;
+SELECT n, lrc_est(q, true, node) BETWEEN lrc_actual(q) * 0.9 AND lrc_actual(q) * 1.1 AS corrected_within_10pct
+  FROM lrc_q WHERE n IN (7, 8) ORDER BY n;
+ n | corrected_within_10pct 
+---+------------------------
+ 7 | t
+ 8 | t
+(2 rows)
+
+RESET pg_lion.enable_intersection_probe;
+RESET enable_bitmapscan;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
 -- The answers do not depend on it.
 SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
  WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;
@@ -112,6 +236,6 @@ SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
 (1 row)
 
 RESET pg_lion.enable_rows_correction;
-DROP TABLE lrc, lrc_f, lrc_q;
+DROP TABLE lrc, lrc_f, lrc_a, lrc_q;
 DROP FUNCTION lrc_est(text, boolean, text), lrc_actual(text);
 RESET default_statistics_target;
