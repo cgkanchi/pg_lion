@@ -1011,7 +1011,8 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 			int			npd = list_length(dim->preds);
 			int		   *out = (int *) palloc(sizeof(int) * nu);
 			int		   *rep = (int *) palloc(sizeof(int) * nu);
-			uint8	   *sig = (uint8 *) palloc(Max(npd, 1) * nu);
+			uint8	   *sig = (uint8 *) palloc(sizeof(uint8) *
+												 (Size) Max(npd, 1) * nu);
 			int			nout = 0;
 			bool		noother;
 			bool		nonull;
@@ -1031,7 +1032,8 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 					CellPred   *p = (CellPred *) list_nth(cx.preds,
 														   lfirst_int(lc));
 
-					sig[u * npd + k++] = (uint8) cells_eval(dim, p->expr, u);
+					sig[(Size) u * npd + k++] =
+						(uint8) cells_eval(dim, p->expr, u);
 				}
 			}
 
@@ -1059,7 +1061,8 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 					continue;
 				for (o = 0; o < nout; o++)
 				{
-					if (memcmp(&sig[u * npd], &sig[rep[o] * npd], npd) == 0)
+					if (memcmp(&sig[(Size) u * npd],
+							   &sig[(Size) rep[o] * npd], npd) == 0)
 						break;
 				}
 				if (o == nout)
@@ -1100,9 +1103,9 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 
 				pp->dim = d;
 				pp->kind = LION_CELLPRED_TABLE;
-				pp->truth = (uint8 *) palloc(nout);
+				pp->truth = (uint8 *) palloc(sizeof(uint8) * nout);
 				for (o = 0; o < nout; o++)
-					pp->truth[o] = sig[rep[o] * npd + k];
+					pp->truth[o] = sig[(Size) rep[o] * npd + k];
 				k++;
 			}
 		}
