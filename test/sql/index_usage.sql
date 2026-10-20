@@ -192,11 +192,15 @@ SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
 
 -- ---------- 4. core's scans of the same index, for comparison ----------
+-- (lion's walk of ius_c off, which at this margin would answer the count
+-- from the btree)
 RESET enable_bitmapscan;
 SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_btree_scan = off;
 SELECT * FROM ius_run('SELECT count(*) FROM ius WHERE a = 3');
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
+RESET pg_lion.enable_btree_scan;
 RESET pg_lion.enable_count_pushdown;
 SET enable_bitmapscan = off;
 
