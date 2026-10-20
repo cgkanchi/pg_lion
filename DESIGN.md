@@ -15757,19 +15757,32 @@ once the paths are built - and it is made to the paths too:
   `rel->rows` (a partial path's divided among its workers) and its cost does not depend on them -
   a sequential scan's on the tuples it reads, an index or bitmap scan's on its own clauses'
   selectivity - so the paths built before the hook and after it, the Gathers and the joins, all see
-  one relation. A parameterized path's rows, and its `ParamPathInfo`'s, are the same restriction
-  clauses with its join clauses ANDed in, taken as independent of them, and take the same ratio; a
-  `ParamPathInfo` first made after the hook (a reparameterization) has core's.
+  one relation. A parameterized path's rows are its `ParamPathInfo`'s (a partial path's divided
+  among its workers): the same restriction clauses with its join clauses ANDed in, taken as
+  independent of them. Each `ParamPathInfo`'s rows are computed again as
+  `get_parameterized_baserel_size()` computes them, with the restriction clauses as
+  `lion_probe_rel_rows()` takes them and the factor applied before the rows are clamped to one,
+  and no more than the corrected `rel->rows` (`lion_param_rows()`); each path takes the ratio of
+  its `ParamPathInfo`'s new rows to its old (`lion_correct_path_rows()`), so that it still agrees
+  with it. The ratio of `rel->rows` would not do: a lookup on a unique key is a small fraction of
+  a row in core's product, which core clamps to one, and one row times the factor is as many rows
+  as the factor - 125 for the nested loop's inner scan of the primary key in `rowscorrect.sql`,
+  which no unique key returns. A `ParamPathInfo` first made after the hook (a reparameterization)
+  has core's, which is no more than the corrected `rel->rows`.
 - `lion_probe_rel_rows()` then reads `rel->rows` as it is, rather than applying the factor twice;
   inside a probe scope it recomputes from the clauses, and applies it, as before. The factor
-  multiplies core's rows before they are rounded and clamped to one row ("Wide lists", below).
+  multiplies core's rows before they are rounded and clamped to one row ("Wide lists", below), for
+  `rel->rows` and a `ParamPathInfo`'s alike.
 - A plain relation of its own only: an inheritance parent's rows are its children's sum, added up
   before any child's paths are built, which a child's correction would not reach.
 
 `test/sql/rowscorrect.sql` pins it: three filters derived from one hidden group, whose product is
 about 20 rows for 1,000, are estimated within a factor of two at the scan and at a join and semi
 join of 3,000 rows above it, and fifty times short without the correction; an independent pair is
-left exactly as it was, and with the probe off nothing changes.
+left exactly as it was, and with the probe off nothing changes. Inside a nested loop, the same
+filters beside a lookup on the primary key are estimated at one row with the correction as without
+it, and beside a lookup on a column of seven values independent of the group at a seventh of the
+filters' rows, where core's product says one.
 
 *(2026-10-19: the correction carries what the probe measures, mistakes included. On a private
 workload's table loaded in batches, a sample that met none of a conjunction's 9.2M rows measured it
