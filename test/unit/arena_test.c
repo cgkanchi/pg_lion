@@ -245,7 +245,6 @@ test_blocks(void)
 	phase("blocks");
 	test_file_open(&tf);
 	lion_arena_init(&a, regions, NREGIONS, test_extend, test_fd, &tf);
-	CHECK(lion_arena_available(), "this platform maps files");
 	CHECK(a.nregions == 0 && a.filesize == 0, "an arena starts with no region");
 	CHECK(lion_arena_used(&a) == 0, "... and nothing used");
 	CHECK(!lion_arena_contains(&a, &onstack), "contains nothing yet");

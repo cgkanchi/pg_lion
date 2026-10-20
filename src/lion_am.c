@@ -420,6 +420,20 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §45: whether the count pushdown may read a partial lion index
+	 * whose predicate the query's restrictions imply, leaving out the
+	 * restrictions the predicate implies.  Off, it reads whole indexes only.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_partial",
+							 "Lets the count pushdown read a partial lion index whose predicate the query implies.",
+							 "Off, the count pushdown reads whole lion indexes only.",
+							 &lion_enable_count_partial,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_decoded_walk",
 							 "Lets the count pushdown count a GROUP BY of several lion-indexed columns by decoding each column's values key by key.",
 							 "Off, a GROUP BY of three or more columns goes to the ordinary plan and one of two to the nested loop of their entries.",

@@ -17,7 +17,8 @@
 /* Every LION_FLAG_* and LION_JOINFLAG_* bit this build knows. */
 #define LION_FLAG_ALL \
 	(LION_FLAG_SINGLEGROUP | LION_FLAG_SUMALL | LION_FLAG_GROUPIDX | \
-	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID)
+	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID | \
+	 LION_FLAG_RANGEWALK)
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
@@ -32,7 +33,7 @@ static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
 	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
-	"RESID",
+	"RESID", "PARTIAL",
 	"TLKINDS"
 };
 
@@ -59,6 +60,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_List,						/* VCOLS */
 	T_List,						/* FILTERS */
 	T_List,						/* RESID */
+	T_List,						/* PARTIAL */
 	T_IntList					/* TLKINDS */
 };
 
@@ -117,11 +119,15 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 		LionCountPrivClause *cl = &out->clause[i];
 
 		cl->kind = list_nth_int(ckinds, i);
+		cl->walk = (cl->kind & LION_CLAUSE_WALK) != 0;
+		cl->kind &= ~LION_CLAUSE_WALK;
 		cl->idxoid = list_nth_oid(oids, 3 + i);
 		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(ops, i);
 		if (cl->kind < LION_CLAUSE_EQ || cl->kind > LION_CLAUSE_NOTMULTI)
 			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
+		if (cl->walk && cl->kind != LION_CLAUSE_RANGESRC)
+			elog(ERROR, "LionCount: a clause of kind %d walked", cl->kind);
 	}
 }
 
@@ -500,6 +506,39 @@ lion_priv_decode_filters(List *priv, LionPrivStage stage, LionCountPriv *out)
 }
 
 /*
+ * The partial indexes the count reads (DESIGN.md §45): each a valid Oid,
+ * once, and the clauses their predicates imply, for EXPLAIN.
+ */
+static void
+lion_priv_decode_partial(List *priv, LionCountPriv *out)
+{
+	List	   *m = (List *) list_nth(priv, LION_PRIV_PARTIAL);
+	ListCell   *lc;
+
+	if (m == NIL)
+		return;
+	lion_priv_expect_length(m, LION_PRIV_PARTIAL, 2);
+	out->partialidx = (List *) linitial(m);
+	out->predimplied = (List *) lsecond(m);
+	if (out->partialidx == NIL || !IsA(out->partialidx, OidList) ||
+		!lion_priv_is(out->predimplied, T_List))
+		elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	foreach(lc, out->partialidx)
+	{
+		if (!OidIsValid(lfirst_oid(lc)) ||
+			list_member_oid(list_copy_head(out->partialidx,
+										   foreach_current_index(lc)),
+							lfirst_oid(lc)))
+			elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	}
+	foreach(lc, out->predimplied)
+	{
+		if (lfirst(lc) == NULL || !IsA(lfirst(lc), String))
+			elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
+	}
+}
+
+/*
  * Take custom_private apart into *out, checking as it goes that it is the
  * list this build writes at `stage` (lion_plan_private.h): the shape marker
  * and the number of members before anything else, then every member's node
@@ -672,6 +711,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	}
 
 	lion_priv_decode_filters(priv, stage, out);
+	lion_priv_decode_partial(priv, out);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
@@ -710,7 +750,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	{
 		oids = lappend_oid(oids, p->clause[i].idxoid);
 		ints = lappend_int(ints, (int) p->clause[i].attno);
-		ckinds = lappend_int(ckinds, p->clause[i].kind);
+		ckinds = lappend_int(ckinds, p->clause[i].kind |
+							 (p->clause[i].walk ? LION_CLAUSE_WALK : 0));
 		ops = lappend_oid(ops, p->clause[i].opno);
 	}
 	for (i = 0; i < p->npart; i++)
@@ -853,6 +894,10 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	}
 	priv = lappend(priv, m);
 	priv = lappend(priv, p->resid);
+
+	Assert(p->partialidx != NIL || p->predimplied == NIL);
+	priv = lappend(priv, (p->partialidx != NIL) ?
+				   list_make2(p->partialidx, p->predimplied) : NIL);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 	{
@@ -1062,7 +1107,9 @@ lion_count_priv_inner_attno(const LionCountPriv *p)
  * What the node does (LionCountMode), in the order the run has always asked:
  * a join before anything else, then no index to iterate, a count(DISTINCT k)
  * without a GROUP BY before a sum, and a parallel GROUP BY before the walks
- * of the serial one.  `parallel_aware` is the CustomScan's.
+ * of the serial one.  `parallel_aware` is the CustomScan's.  A parallel count
+ * of one row keeps its mode, a count or a sum, and is counted by ranges of
+ * keys (lion_count_ranged(), DESIGN.md §10, "A count in parallel").
  */
 LionCountMode
 lion_count_mode_of(const LionCountPriv *p, bool parallel_aware)
@@ -1104,6 +1151,14 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	bool		hasrange = (p->flags & LION_FLAG_RANGE) != 0;
 	bool		decode = (p->flags & LION_FLAG_DECODE) != 0;
 	int			jflags = p->hasjoin ? p->join.flags : 0;
+
+	/*
+	 * A parallel-aware node that is no join is a parallel GROUP BY or a
+	 * parallel count of one row (DESIGN.md §10, "A GROUP BY in parallel", "A
+	 * count in parallel"), told apart by its grouping column.
+	 */
+	bool		pgroup = parallel_aware && !p->hasjoin && p->groupattno != 0;
+	bool		pcount = parallel_aware && !p->hasjoin && p->groupattno == 0;
 	bool		joinunique = (jflags & LION_JOINFLAG_UNIQUE) != 0;
 	bool		joinrows = (jflags & LION_JOINFLAG_ROWS) != 0;
 	bool		joinsum = (jflags & LION_JOINFLAG_SUM) != 0;
@@ -1113,6 +1168,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	bool		joinunite = (jflags & LION_JOINFLAG_UNITE) != 0;
 	bool		joinleft = (jflags & LION_JOINFLAG_LEFT) != 0;
 	AttrNumber	driveattno;
+	int			walks;
 	int			i;
 	int			j;
 
@@ -1124,12 +1180,33 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * Residual clauses (DESIGN.md §10) are tested on the rows of one plain
 	 * table's counts: never beside a sum over entries that reads no row, the
 	 * decoded walk, a join, partitions or the ranges of a parallel GROUP BY,
-	 * none of which the planner offers with them.
+	 * none of which the planner offers with them.  The ranges of a parallel
+	 * count test them as its serial node does, each range on its own rows.
 	 */
 	if ((p->flags & LION_FLAG_RESID) != 0 &&
 		(sumall || decode || p->hasjoin || p->npart > 0 || p->nwcol > 0 ||
-		 parallel_aware))
+		 pgroup))
 		elog(ERROR, "LionCount: residual clauses in a shape that tests no row");
+
+	/*
+	 * Ranges too large to collect walked at every count (DESIGN.md §32, "Too
+	 * large to collect") are a choice of the count's own price: never the
+	 * decoded walk's, whose WHERE is one copy, a join's, the top k's or a
+	 * parallel GROUP BY's, none of which the planner prices that way.  A
+	 * parallel count walks them in each range as its serial node does.
+	 */
+	if ((p->flags & LION_FLAG_RANGEWALK) != 0 &&
+		(decode || p->hasjoin || p->topkn > 0 || pgroup))
+		elog(ERROR, "LionCount: ranges walked in a shape that collects them");
+
+	/* ... and the plan that walks some names them, and only it */
+	walks = 0;
+	for (i = 0; i < p->nclause; i++)
+		if (p->clause[i].walk)
+			walks++;
+	if ((walks > 0) != ((p->flags & LION_FLAG_RANGEWALK) != 0))
+		elog(ERROR, "LionCount: %d ranges walked in a plan %s",
+			 walks, (walks > 0) ? "that walks none" : "that walks some");
 
 	/*
 	 * The top k by count (DESIGN.md §36) is made of one grouping column
@@ -1278,15 +1355,29 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		elog(ERROR, "LionCount: malformed fact group");
 
 	/*
-	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
-	 * §10, "A GROUP BY in parallel"), which the planner offers for one shape
-	 * alone: one column's entries walked whole, over one table.
+	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") is
+	 * offered for one shape alone: one column's entries walked whole, over
+	 * one table, the column itself or coalesced with a constant.
 	 */
-	if (parallel_aware && !p->hasjoin &&
-		(!hasgroupidx || p->groupattno == 0 || p->groupattno2 != 0 ||
-		 sumall || singlegroup || p->coalconst != NULL ||
+	if (pgroup &&
+		(!hasgroupidx || p->groupattno2 != 0 ||
+		 sumall || singlegroup ||
 		 p->distattno != 0 || hasrange || p->npart > 0))
 		elog(ERROR, "LionCount: malformed parallel GROUP BY");
+
+	/*
+	 * ... and a parallel count (§10, "A count in parallel") for a count of
+	 * one row of one table: the merge of its WHERE (no index to walk) or a
+	 * sum over a column's entries, a range bounding it or not, with filtered
+	 * counts beside it or not - never a count(DISTINCT), the aggregates over
+	 * keys, a top k, the decoded walk or a group folded to a constant, whose
+	 * row the partial counts cannot say is missing.
+	 */
+	if (pcount &&
+		((hasgroupidx && !sumall) || p->groupattno2 != 0 ||
+		 singlegroup || p->coalconst != NULL || p->distattno != 0 ||
+		 p->npart > 0 || p->nwcol > 0 || p->topkn > 0 || decode))
+		elog(ERROR, "LionCount: malformed parallel count");
 
 	/*
 	 * The decoded walk (DESIGN.md §34) has its columns, the first the one
@@ -1326,7 +1417,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 			compl |= neg;
 			at += o->armlen[a];
 		}
-		if (compl && (decode || p->hasjoin || parallel_aware))
+		if (compl && (decode || p->hasjoin || pgroup))
 			elog(ERROR, "LionCount: an OR with a complement arm in a shape that counts once");
 	}
 
@@ -1362,9 +1453,10 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * filter at a time, each as a count of its own: the WHERE's clauses
 	 * first and then each filter's together, every filter with one at least,
 	 * an OR inside one of them, and no range among a filter's clauses, which
-	 * would bound the driving walk.  They are a count, a sum, or the groups
-	 * of a serial walk: no join, no count(DISTINCT), no aggregate over keys,
-	 * no top k, no ranges of a parallel GROUP BY, no coalesce group.
+	 * would bound the driving walk.  They are a count, a sum - serial, or
+	 * the ranges of a parallel count - or the groups of a serial walk: no
+	 * join, no count(DISTINCT), no aggregate over keys, no top k, no ranges
+	 * of a parallel GROUP BY, no coalesce group.
 	 */
 	{
 		int			last = 0;
@@ -1391,7 +1483,7 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		}
 		if (p->nfilter > 0 &&
 			(p->hasjoin || p->distattno != 0 || p->nwcol > 0 ||
-			 p->topkn > 0 || parallel_aware || p->coalconst != NULL))
+			 p->topkn > 0 || pgroup || p->coalconst != NULL))
 			elog(ERROR, "LionCount: malformed filtered counts");
 		for (i = 0; i < p->ntl; i++)
 		{

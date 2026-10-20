@@ -71,11 +71,11 @@ EXPLAIN (COSTS OFF) SELECT id FROM lion_ost WHERE g = 3 ORDER BY k LIMIT 3;
 EXPLAIN (COSTS OFF)
 SELECT id FROM lion_ost WHERE t @@ 'w3'::tsquery
  ORDER BY lion_bm25_score(t, 'w3'::tsquery, 'lion_ost_t') DESC LIMIT 3;
-                                                                QUERY PLAN                                                                 
--------------------------------------------------------------------------------------------------------------------------------------------
+                                                                      QUERY PLAN                                                                       
+-------------------------------------------------------------------------------------------------------------------------------------------------------
  Limit
    ->  Sort
-         Sort Key: (lion_bm25_score(t, '''w3'''::tsquery, 'lion_ost_t'::regclass, '1.2'::double precision, '0.75'::double precision)) DESC
+         Sort Key: (lion_bm25_score(t, '''w3'''::tsquery, 'lion_ost_t'::regclass, '1.2'::double precision, '0.75'::double precision, NULL::name)) DESC
          ->  Seq Scan on lion_ost
                Filter: (t @@ '''w3'''::tsquery)
 (5 rows)

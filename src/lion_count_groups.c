@@ -138,6 +138,14 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
+	/*
+	 * A window of keys (lion_vis_cache_set_window()) confines the counts of
+	 * a parallel count alone, never this walk's: refused rather than
+	 * counted past.
+	 */
+	if (cache != NULL && cache->windowed)
+		elog(ERROR, "lion index count: a grouped walk confined to a window of keys");
+
 	/* what lion_count_sources_run() sets up for one count, once for all */
 	memset(&base, 0, sizeof(base));
 	base.cxt = cxt;

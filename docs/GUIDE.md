@@ -42,13 +42,33 @@ A `GROUP BY` with several filters (`SELECT country, count(*) FROM events WHERE e
 partition, and counts each group against that one set, so the filters' index pages are read once
 rather than once per group; `EXPLAIN ANALYZE` prints `WHERE Sets Collected` when it did (DESIGN.md
 §10). The set stays within a hash table's memory (`work_mem` times `hash_mem_multiplier`) and goes
-to a temporary file past it. The groups are then counted against it up to a few hundred at a time,
-in one pass over its containers for all of them (`Group Batches` in `EXPLAIN ANALYZE`). With
-parallel query enabled (`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
+to a temporary file past it. A range on another column (`... WHERE created_at >= $1 GROUP BY
+country`, with `summaries = on` on its index) is one such filter, collected from the summaries and
+past the memory into a temporary file too - a table's ranges share the memory, and one that does
+not fit what the others left sends those to files first; where there are only a few counts to
+make - a `count(DISTINCT)`'s tests, which stop at a row - the planner may walk it at each instead,
+when that is the cheaper (`Range Sources Walked` in `EXPLAIN ANALYZE`). The groups are then
+counted against it up to a few hundred at a time, in one pass over its containers for all of them
+(`Group Batches` in `EXPLAIN ANALYZE`). With parallel query enabled
+(`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can
 run in parallel: the workers divide the table's blocks into ranges, each collects the filters of
 its ranges and counts every group there, and a `Finalize HashAggregate` above the `Gather` adds
 the groups' partial counts up (`Parallel Custom Scan (LionCount)`, `Key Ranges` in `EXPLAIN
-ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel").
+ANALYZE`; DESIGN.md §10, "A GROUP BY in parallel"). A `GROUP BY coalesce(col, c)` divides the
+same way.
+
+A count without a `GROUP BY` (`SELECT count(*) FROM events WHERE event_type = 'purchase' AND
+...`, with `count(col)`s, filtered counts, OR lists, `IN` lists, ranges or a text search) runs in
+parallel the same way when the planner finds it cheaper: each process counts the ranges it
+claims, as the serial count counts the whole table, and a `Finalize Aggregate` adds the partial
+counts and applies any `HAVING` (DESIGN.md §10, "A count in parallel"). The workers are what a
+parallel scan of the pages the count reads would get, up to `max_parallel_workers_per_gather`,
+or the table's `parallel_workers`; a table under about 16 MB is one range, and counted serially.
+A `count(DISTINCT)`, an aggregate of a column's values such as
+`sum(col)`, a partitioned table and a join stay serial. Starting the workers takes a few
+milliseconds, which `parallel_setup_cost` (1000) may price low: a count the planner overprices can
+go parallel and take longer, a count of 2 ms taking 8 in the measurements of that section, and a
+higher `parallel_setup_cost` keeps such counts serial.
 
 A `GROUP BY` of three or more indexed columns (`SELECT country, event_type, device, count(*)
 FROM events GROUP BY country, event_type, device`), or of two with more than a few combinations,
@@ -153,6 +173,40 @@ only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND t
 bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
 
+When every query of a workload carries the same few filters that keep most of the table - `WHERE
+active AND state = 'published' AND ...` - a partial index on them holds only those rows, and the
+count pushdown can read it (DESIGN.md §45):
+
+```sql
+CREATE INDEX events_current ON events USING lion (country, event_type, device)
+    WHERE active AND state = 'published';
+
+SELECT country, count(*) FROM events
+ WHERE active AND state = 'published' AND event_type = 'purchase' GROUP BY country;
+```
+
+```
+ Custom Scan (LionCount)
+   Lion Indexes: events_current.country (country), events_current.event_type (event_type = 'purchase'::text)
+   Implied by Index Predicate: active, (state = 'published'::text)
+   Group Key: country
+```
+
+The filters the predicate implies are left out of the count, as a partial index scan leaves them
+out (`Implied by Index Predicate`), and the other columns' sets are those of the predicate's rows
+alone, so there is less to read and nothing dense to intersect: on four million rows whose three
+default filters kept 77% of them, a count with one more filter took 0.2 ms against 0.47, a range
+2.4 ms against 28, and a `GROUP BY` 3.0 against 5.8. The query has to imply the predicate - a
+stronger condition does (`x > 20` under `WHERE x > 10`), a parameter of a generic plan usually
+does not - and the partial index is read only where every row the count reaches is one of its
+own: through a clause it answers that selects rows (`=`, `IN`, `IS NULL`, a range) or a walk of
+its entries (a `GROUP BY`, a `count(DISTINCT)`, the count of every row). A count that would have
+to take the rest from another index - `active AND state = 'published' AND region = 'eu'` with no
+`region` in the partial index - reads the whole index instead, and so does a query that leaves
+the predicate's filters out. A partial index made on a partitioned table is one per partition,
+and each partition reads its own (`Partial Indexes` in EXPLAIN). `pg_lion.enable_count_partial =
+off` turns this off.
+
 A count over a fact table joined to a filtered dimension (DESIGN.md §27) is pushed down too, when the
 fact's foreign-key column has a Lion index and its own filters are ones Lion answers: the dimension
 side runs as an ordinary plan (its own Lion index serves its filters through a bitmap scan), and for
@@ -224,8 +278,9 @@ once per process into memory bounded like a hash join's (`work_mem` × `hash_mem
 that the copy spills to a temporary file, as a hash join's table would. Where the planner expects
 few dimension rows it may instead probe the fact filters at each dimension row's count; a run that
 meets far more rows, or far heavier keys, than it expected keeps an account of what probing has cost
-and collects the filters part way through once that reaches what collecting them costs, if the copy
-is expected to fit that memory (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
+and collects the filters part way through once that reaches what collecting them costs - a copy
+expected not to fit that memory priced as spilled, its pages written once and read back by the
+counts after it (DESIGN.md §27, "Probed, then collected"; `EXPLAIN ANALYZE` prints
 `Fact Filters: probed, then collected`, `Fact Filter Switches` and `Fact Filter Keys Probed`, the
 keys counted by probing before each switch). Their values may be
 parameters and stable expressions as for a single table, an `IN` list whose array is a parameter
@@ -340,7 +395,10 @@ multi-key column (`tags @> ...`), a column behind a high-cardinality key, ANDs a
 independent indexes. The B-tree must hold, as key or `INCLUDE` columns, every column the query
 reads - its target and the `WHERE` clauses the node still tests itself - but not the Lion-filtered
 columns: a set that turns out inexact at run time is rechecked on the heap tuple, fetched for that
-alone (`Heap Fetches` counts those too).
+alone (`Heap Fetches` counts those too). A set is inexact when the query has a condition Lion can
+only bound (`tags <@ ...`, a phrase query): `Lion Set: ..., rechecked` in `EXPLAIN ANALYZE`.
+`col IS NULL` and `col IS NOT NULL` never make it so - beside any other condition the column's
+NULL rows are taken out of the set, or kept, exactly (DESIGN.md §14).
 
 ```sql
 CREATE INDEX docs_created_cov ON docs (created_at) INCLUDE (id, title);
@@ -452,6 +510,23 @@ its sample of the rows, up to half of `maintenance_work_mem`, in shared memory: 
 `/dev/shm` is 64 MB unless `--shm-size` says otherwise, give it at least that much, or the build
 stops with "could not resize shared memory segment"; `SET max_parallel_maintenance_workers = 0`
 builds alone.
+
+The partitions are chosen from that sample, half of `maintenance_work_mem`, at least 16 of its
+rows each, so a large table needs it large: 376 MB for a million rows of 1536 dimensions, 12 GB
+for a billion, where the default 64 MB is enough for 28,985 such rows. Given too little, the build
+stops early - as soon as it has read enough rows to know - with an error that says how many
+partitions it wants, how many the sample has rows for, and the setting that would be enough:
+
+```
+ERROR:  lionvec index "items_emb" wants 8000 partitions, and its sample has rows for 1361
+DETAIL:  About 1000000 rows with a vector want 8000 partitions of at least 16 sample rows each, and half of maintenance_work_mem (64MB) holds a sample of 21788 rows of 1536 dimensions.
+HINT:  Set maintenance_work_mem to at least 376MB, or set pg_lion.vector_build_sample to allow to build 1361 partitions.
+```
+
+Set it and build again, or `SET pg_lion.vector_build_sample = allow` to build the fewer, larger
+partitions, which make a scan read more rows for the same recall. A `pg_restore` or `reindexdb`
+builds at the server's `maintenance_work_mem` unless told otherwise:
+`PGOPTIONS='-c maintenance_work_mem=4GB' pg_restore ...`.
 
 The node builds the Lion set of the `WHERE`, and the vector scan scores only the members in the
 partitions it reads, so the `LIMIT` is filled from the matching rows whatever their share of the

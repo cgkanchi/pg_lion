@@ -121,6 +121,115 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 }
 
 /*
+ * A PARALLEL COUNT (DESIGN.md §10, "A count in parallel"): the node of one
+ * row - the count of a WHERE, or a sum over a column's entries, with any
+ * filtered counts beside it - made parallel-aware, its partial counts under a
+ * Gather and core's Finalize Aggregate, which adds them up and applies the
+ * HAVING the partial target leaves to it.  Its participants claim the
+ * heap's container keys a range at a time, as a parallel GROUP BY's do, and
+ * count each claimed range of each run whole (lion_count_ranged()).
+ *
+ * WORKERS: what a parallel scan of the pages the count reads - its sets, its
+ * walk and the heap, as the serial price has them (rc->pages) - would get,
+ * capped by max_parallel_workers_per_gather; a parallel_workers setting on
+ * the table decides alone, as for core's scans.  A heap the executor would
+ * cut into one range gets no parallel count: one participant would count it
+ * all, after the others had started for nothing.
+ *
+ * COST, one participant's: its share of the serial count (`serialrun`, the
+ * serial node's price before its HAVING) but for what every participant pays
+ * whole (rc->whole: the lookups that locate the WHERE, and the ranges taken
+ * as sources it collects), that whole, and what each range it counts pays
+ * again (rc->countrange, every run's: each set sought to the range, a walk's
+ * entries counted again), plus a cpu_tuple_cost for its one row.  The Gather
+ * prices its rows and set-up, core's Finalize Agg its own work.
+ */
+static void
+lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
+							 RelOptInfo *output_rel, CustomPath *serial,
+							 Cost serialrun, const LionRangeCost *rc,
+							 List *having)
+{
+	PathTarget *partialtarget;
+	CustomPath *cpath;
+	LionCountPriv priv;
+	Path	   *gather;
+	AggClauseCosts agg_final_costs;
+	double		divisor;
+	double		totalrows;
+	Cost		share;
+	uint32		ckeys;
+	int			workers;
+	int			nranges;
+	int			cut;
+
+	workers = compute_parallel_worker(rel, -1, Max(rc->pages, 1.0),
+									  max_parallel_workers_per_gather);
+	if (workers <= 0)
+		return;
+
+	/*
+	 * A range is counted by one participant, so the count divides among no
+	 * more participants than the executor will cut ranges - with
+	 * pg_lion.parallel_range_keys as it is, the one thing here that does not
+	 * price the default - and a heap of one range not at all.
+	 */
+	cut = lion_key_ranges(rel->pages, workers + 1, lion_parallel_range_keys,
+						  &ckeys);
+	if (cut < 2)
+		return;
+	divisor = Min(lion_parallel_divisor(workers), (double) cut);
+	nranges = lion_key_ranges(rel->pages, workers + 1,
+							  LION_PARALLEL_RANGE_KEYS, &ckeys);
+	share = Max(serialrun - rc->whole, 0.0);
+	totalrows = (double) (workers + 1);
+
+	partialtarget = lion_make_partial_target(root, output_rel->reltarget,
+											 having);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = partialtarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = true;
+	cpath->path.parallel_safe = true;
+	cpath->path.parallel_workers = workers;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = 1;
+	cpath->path.total_cost = share / divisor + rc->whole +
+		((double) nranges / divisor) * rc->countrange + cpu_tuple_cost;
+	cpath->path.startup_cost = cpath->path.total_cost;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->flags = serial->flags;
+	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	/* the serial node's plan, but for the HAVING, which is the Agg's here */
+	lion_count_priv_decode(serial->custom_private, LION_PRIV_STAGE_PATH,
+						   &priv);
+	priv.having = NIL;
+	cpath->custom_private = lion_count_priv_encode(&priv,
+												   LION_PRIV_STAGE_PATH);
+	cpath->methods = serial->methods;
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
+
+	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
+										 partialtarget, NULL, &totalrows);
+
+	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, gather,
+							 output_rel->reltarget,
+							 AGG_PLAIN, AGGSPLIT_FINAL_DESERIAL,
+							 NIL, having, &agg_final_costs, 1.0));
+}
+
+/*
  * Turn the RANGE clauses of every range column but `keep` (an index into
  * rangepos, or -1 for none) into bounds of ranges taken as sources
  * (DESIGN.md §32): LION_CLAUSE_RANGESRC in the clause lists, which is all the
@@ -1283,6 +1392,73 @@ lion_count_path_snapshot(const LionCountPathBuild *cx,
 	snap->rangepos = list_copy(cx->rangepos);
 }
 
+/*
+ * The columns of the relation counted that the output prints outside an
+ * aggregate, other than the GROUP BY's: the target list's and the HAVING's,
+ * as attnos offset by FirstLowInvalidHeapAttributeNumber (pull_varattnos()).
+ * A WHERE clause that pins one is what its printed value comes from (§10),
+ * so it is never left out for a partial index's predicate (DESIGN.md §45).
+ */
+static Bitmapset *
+lion_count_path_printed(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	List	   *exprs = list_copy(cx->output_rel->reltarget->exprs);
+	Bitmapset  *printed = NULL;
+	Bitmapset  *grouped = NULL;
+	List	   *vars;
+	ListCell   *lc;
+
+	exprs = list_concat(exprs, cx->having);
+	vars = pull_var_clause((Node *) exprs,
+						   PVC_INCLUDE_AGGREGATES |
+						   PVC_INCLUDE_WINDOWFUNCS |
+						   PVC_RECURSE_PLACEHOLDERS);
+	foreach(lc, vars)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (IsA(v, Var) && v->varno == (int) cx->rti && v->varlevelsup == 0)
+			printed = bms_add_member(printed,
+									 v->varattno -
+									 FirstLowInvalidHeapAttributeNumber);
+	}
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+
+		if (tle != NULL)
+			pull_varattnos((Node *) tle->expr, cx->rti, &grouped);
+	}
+	return bms_difference(printed, grouped);
+}
+
+/*
+ * Is restriction rinfo one the predicate of the partial index the count is
+ * planned with implies (lion_partial_drops(), DESIGN.md §45)?  It is then
+ * left out of the count, as core leaves it out of a partial index scan's
+ * indrestrictinfo, and EXPLAIN says so ("Implied by Index Predicate") - but
+ * not where it pins a column the output prints (`printed`).
+ */
+static bool
+lion_count_path_pred_drops(LionCountPathBuild *cx, RestrictInfo *rinfo,
+						   Bitmapset *printed)
+{
+	Bitmapset  *attnos = NULL;
+
+	if (!lion_partial_active())
+		return false;
+	pull_varattnos((Node *) rinfo->clause, cx->rti, &attnos);
+	if (bms_overlap(attnos, printed))
+		return false;
+	if (!lion_partial_drops(cx->root, cx->input_rel, (Node *) rinfo->clause))
+		return false;
+	lion_partial_note_drop(lion_deparse_rel_clause(cx->root, cx->rti,
+												   (Node *) rinfo->clause));
+	return true;
+}
+
 static bool
 lion_count_path_where(LionCountPathBuild *cx)
 {
@@ -1291,6 +1467,8 @@ lion_count_path_where(LionCountPathBuild *cx)
 	Index		rti = cx->rti;
 	ListCell   *lc;
 	LionCountPathBuild snap;
+	Bitmapset  *printed = lion_partial_active() ?
+		lion_count_path_printed(cx) : NULL;
 
 	/*
 	 * ---- every WHERE clause must be one the posting sets can answer ----
@@ -1313,6 +1491,10 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant)
 			return false;
+
+		/* TRUE wherever the count reads (DESIGN.md §45): left out */
+		if (lion_count_path_pred_drops(cx, rinfo, printed))
+			continue;
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
@@ -1683,6 +1865,46 @@ lion_count_path_distinct(LionCountPathBuild *cx)
 }
 
 /*
+ * The columns of count(col)s that the predicate of the partial index the
+ * count is planned with proves non-NULL (DESIGN.md §45), as nonnullattnos:
+ * the restrictions imply that predicate in every relation counted, so every
+ * row the query selects has col, and count(col) is the rows' count.  Before
+ * lion_count_path_countcol() and the target list's checks, which ask.
+ */
+static void
+lion_count_path_pred_nonnull(LionCountPathBuild *cx)
+{
+	ListCell   *lc;
+
+	if (!lion_partial_active())
+		return;
+	foreach(lc, cx->checkexprs)
+	{
+		Aggref	   *agg = (Aggref *) lfirst(lc);
+		Var		   *v;
+		NullTest   *nt;
+
+		if (!IsA(agg, Aggref) || agg->aggfnoid != F_COUNT_ANY ||
+			list_length(agg->args) != 1)
+			continue;
+		v = (Var *) lion_strip((Node *) ((TargetEntry *) linitial(agg->args))->expr);
+		if (v == NULL || !IsA(v, Var) || v->varno != (int) cx->rti ||
+			v->varlevelsup != 0 || v->varattno <= 0 ||
+			LION_ATTNO_IS_VCOL(v->varattno) ||
+			list_member_int(cx->nonnullattnos, (int) v->varattno))
+			continue;
+		nt = makeNode(NullTest);
+		nt->arg = (Expr *) copyObject(v);
+		nt->nulltesttype = IS_NOT_NULL;
+		nt->argisrow = false;
+		nt->location = -1;
+		if (lion_partial_drops(cx->root, cx->input_rel, (Node *) nt))
+			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+											(int) v->varattno);
+	}
+}
+
+/*
  * count(col) of a nullable column (DESIGN.md §10, "Shapes rewritten to the
  * node's counts"): without a GROUP BY, where every aggregate is count(col)
  * of that one column, it is count(*) of the rows the WHERE selects AND `col
@@ -1700,6 +1922,7 @@ lion_count_path_countcol(LionCountPathBuild *cx)
 	NullTest   *nt;
 	ListCell   *lc;
 
+	lion_count_path_pred_nonnull(cx);
 	if (cx->fj != NULL || cx->ngroup != 0 || cx->singlegroup ||
 		cx->groupcoal != NULL || cx->distvar != NULL)
 		return true;
@@ -2252,9 +2475,11 @@ lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel, AttrNumber *attnos,
  * and between them - the NULL entry included - hold every row of the table,
  * so the sum over them, less what the negated clauses subtract from each, is
  * the count; the column with the fewest entries is the cheapest walk.  Only a
- * column of a scalar, non-partial, non-expression index will do
- * (lion_find_roaring_index()): a multi-key column's entries overlap and miss
- * the rows with no keys, and a partial index holds only its predicate's rows.
+ * column of a scalar, non-expression index will do (lion_find_roaring_index()):
+ * a multi-key column's entries overlap and miss the rows with no keys, and a
+ * partial index holds only its predicate's rows - which is every row the
+ * count is to read when it is planned with that index (DESIGN.md §45), and
+ * then its columns come first.
  * A column with an `IS NOT NULL` of its own is preferred when it is no
  * dearer, since its NULL entry is then skipped and its clause dropped
  * (lion_locate_where()).  A partitioned table's candidates are those of its
@@ -2268,7 +2493,9 @@ lion_count_all_driver(LionCountPathBuild *cx)
 	int			natts = Max((int) rel->max_attr, 0);
 	AttrNumber *attnos = (AttrNumber *) palloc0(sizeof(AttrNumber) * Max(natts, 1));
 	RelOptInfo *leaf;
+	IndexOptInfo *part;
 	Var		   *best = NULL;
+	bool		bestpart = false;
 	double		bestentries = 0.0;
 	int			a;
 
@@ -2277,6 +2504,7 @@ lion_count_all_driver(LionCountPathBuild *cx)
 	leaf = lion_count_first_leaf(root, rel, attnos, natts);
 	if (leaf == NULL)
 		return NULL;
+	part = lion_partial_index_of(leaf);
 
 	for (a = 0; a < natts; a++)
 	{
@@ -2287,11 +2515,15 @@ lion_count_all_driver(LionCountPathBuild *cx)
 		VariableStatData vardata;
 		bool		isdefault;
 		double		entries;
+		IndexOptInfo *idx;
+		bool		inpart;
 
 		/* an indexed column is no dropped one, nor maps to none (§16) */
 		if (attnos[a] == 0 ||
-			lion_find_roaring_index(leaf, attnos[a], false, NULL) == NULL)
+			(idx = lion_find_roaring_index(leaf, attnos[a], false,
+										   NULL)) == NULL)
 			continue;
+		inpart = (part != NULL && idx == part);
 		get_atttypetypmodcoll(cx->rte->relid, (AttrNumber) (a + 1), &type,
 							  &typmod, &coll);
 		var = makeVar(cx->rti, (AttrNumber) (a + 1), type, typmod, coll, 0);
@@ -2304,9 +2536,16 @@ lion_count_all_driver(LionCountPathBuild *cx)
 			var->varattno == cx->notnullvar->varattno)
 			entries = Max(entries - 1.0, 1.0);
 
-		if (best == NULL || entries < bestentries)
+		/*
+		 * A column of the partial index the count is planned with first
+		 * (DESIGN.md §45): its entries are the predicate's rows, which is
+		 * what holds a count with restrictions left out to them.
+		 */
+		if (best == NULL || (inpart && !bestpart) ||
+			(inpart == bestpart && entries < bestentries))
 		{
 			best = var;
+			bestpart = inpart;
 			bestentries = entries;
 		}
 	}
@@ -2721,6 +2960,17 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		return false;
 	if (cx->targets == NIL)
 		return false;			/* everything was pruned: leave it to the planner */
+
+	/*
+	 * Planned with a partial index (DESIGN.md §45): every row the count can
+	 * reach has to be one of its predicate's.  A sum over every row with
+	 * nothing bounding its walk counts a filtered count's run that has a
+	 * source of its own by that source, and not by the walk.
+	 */
+	if (!lion_partial_anchored(cx->targets, cx->clauseinfos, cx->ors, ndrive,
+							   cx->sumall && cx->rangevar == NULL,
+							   cx->nfilter))
+		return false;
 	cx->first = (LionCountTarget *) linitial(cx->targets);
 	return true;
 }
@@ -3136,6 +3386,10 @@ lion_count_path_fill(LionCountPathBuild *cx)
 	}
 	p->implied = cx->impliedtexts;
 
+	/* the partial indexes read, and what their predicates imply (§45) */
+	p->partialidx = lion_partial_used();
+	p->predimplied = lion_partial_dropped();
+
 	/* the decoded walk's columns (DESIGN.md §34), in the order it takes them */
 	if (cx->decode)
 	{
@@ -3369,11 +3623,15 @@ lion_count_run_targets(LionCountPathBuild *cx, int r)
 /*
  * The node's own price for counting `targets`: its startup and total cost
  * and its rows set on cpath, in cost units of its own (lion_units_price()
- * makes them the competitor's).
+ * makes them the competitor's).  Every range source too large to collect is
+ * priced collected in windows; what walking them at every count would save
+ * instead is added to walksave, with the clauses that bound them, where the
+ * plan may walk them (lion_count_path_add()).
  */
 static void
 lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
-					  List *targets, LionRangeCost *rangeprice)
+					  List *targets, LionRangeCost *rangeprice,
+					  LionWalkSave *walksave)
 {
 	PlannerInfo *root = cx->root;
 
@@ -3387,8 +3645,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 		lion_cost_decode_path(root, cpath, targets, cx->whereclauses,
 							  cx->wherekinds, cx->ors, cx->ngroup,
 							  cx->groupest, cx->numgroups, cx->outrows);
-		rangeprice->batched = false;
-		rangeprice->perrange = 0;
+		memset(rangeprice, 0, sizeof(LionRangeCost));
 	}
 	else if (cx->topkn > 0)
 	{
@@ -3402,8 +3659,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							(cx->rangevar != NULL) ? cx->rangesel : 1.0,
 							(double) cx->topkcand, cx->topkrows,
 							Min(cx->outrows, (double) cx->topkcand));
-		rangeprice->batched = false;
-		rangeprice->perrange = 0;
+		memset(rangeprice, 0, sizeof(LionRangeCost));
 	}
 	else
 		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
@@ -3421,7 +3677,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							  LION_RANGED_SUMALL :
 							  LION_RANGED_NONE) :
 							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
-							 cx->rangesel, rangeprice);
+							 cx->rangesel, rangeprice, walksave);
 	/*
 	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
 	 * after - or, with no count in the target list, instead of - the sum over
@@ -3432,6 +3688,193 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							cx->wnaggs, cx->wcounts);
 }
 
+/*
+ * THE AM'S OWN SCAN OF THE COUNT'S SETS (DESIGN.md §39, "The AM's own scan
+ * of the same sets"): does a lion index path, ip, read only sets the count
+ * reads?  Every clause of it is one of the relation's restrictions the count
+ * reads from that same index (idxfor, by the restriction's position), each
+ * marked in covered.
+ */
+static bool
+lion_count_ownscan_reads(IndexPath *ip, RelOptInfo *rel, Oid lionam,
+						 IndexOptInfo **idxfor, bool *covered)
+{
+	ListCell   *lc;
+
+	if (ip->indexinfo == NULL || ip->indexinfo->relam != lionam ||
+		ip->path.parent != rel || ip->path.param_info != NULL)
+		return false;
+	foreach(lc, ip->indexclauses)
+	{
+		IndexClause *ic = (IndexClause *) lfirst(lc);
+		int			r = 0;
+		bool		found = false;
+		ListCell   *l2;
+
+		foreach(l2, rel->baserestrictinfo)
+		{
+			if ((RestrictInfo *) lfirst(l2) == ic->rinfo)
+			{
+				found = true;
+				break;
+			}
+			r++;
+		}
+		if (!found || idxfor[r] == NULL ||
+			idxfor[r]->indexoid != ip->indexinfo->indexoid)
+			return false;
+		covered[r] = true;
+	}
+	return true;
+}
+
+/* ... and the IndexPaths of a bitmap's tree of quals: ANDs of them only */
+static bool
+lion_count_ownscan_bitmap(Path *bitmapqual, RelOptInfo *rel, Oid lionam,
+						  IndexOptInfo **idxfor, bool *covered)
+{
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+		return lion_count_ownscan_reads((IndexPath *) bitmapqual, rel, lionam,
+										idxfor, covered);
+	if (!IsA(bitmapqual, BitmapAndPath))
+		return false;
+	foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
+	{
+		if (!lion_count_ownscan_bitmap((Path *) lfirst(lc), rel, lionam,
+									   idxfor, covered))
+			return false;
+	}
+	return true;
+}
+
+/*
+ * The cheapest of output_rel's paths that count the rows of a scan of the
+ * relation through the lion indexes the count reads - a plain Agg, under
+ * nothing that does not pass its row up, over a plain or bitmap scan whose
+ * index clauses are every restriction of the relation, each read from the
+ * index the count reads it from (lion_count_ownscan_reads()).  Such a scan
+ * reads every set the count reads, as the count reads them, and then
+ * fetches each row it finds from the heap, where the count tests the
+ * visibility map: whatever the rows, it does what the count does and more.
+ * Its total cost, or 0 when there is none, or the count is not one such a
+ * scan can be: one table's plain count, with no GROUP BY, range, filter,
+ * HAVING or residual clause, its WHERE answered by the sets alone.
+ *
+ * Not a parallel scan, under a Gather: it divides the heap's side among the
+ * workers, which the count, serial, does not, and its price is compared as
+ * it is.  Nor a path some enable_* setting disabled, which loses to the
+ * count whatever its cost.
+ */
+static Cost
+lion_count_ownscan_cost(LionCountPathBuild *cx)
+{
+	RelOptInfo *rel = cx->input_rel;
+	Oid			lionam = lion_get_am_oid();
+	int			nbase = list_length(rel->baserestrictinfo);
+	int			nclause = list_length(cx->clauseinfos);
+	IndexOptInfo **idxfor;
+	bool	   *covered;
+	Cost		best = 0.0;
+	ListCell   *lc;
+	int			i;
+
+	if (!OidIsValid(lionam) || cx->fj != NULL || cx->partitioned ||
+		cx->ngroup != 0 || cx->singlegroup || cx->sumall || cx->decode ||
+		cx->distvar != NULL || cx->rangevar != NULL || cx->hasrangesrc ||
+		cx->nfilter != 0 || cx->residual != NIL || cx->topkn != 0 ||
+		cx->wattnos != NIL || cx->partialtarget != NULL ||
+		cx->having != NIL || cx->ncompl != 0 || cx->runtimemulti ||
+		cx->newnegated || cx->first == NULL ||
+		list_length(cx->targets) != 1 ||
+		rel->reloptkind != RELOPT_BASEREL ||
+		nbase == 0 || nclause == 0 ||
+		list_length(cx->first->whereidx) != nclause)
+		return 0.0;
+
+	/* the index the count reads each restriction from: one, or none */
+	idxfor = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) * nbase);
+	covered = (bool *) palloc(sizeof(bool) * nbase);
+	i = 0;
+	foreach(lc, cx->clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+		IndexOptInfo *idx = (IndexOptInfo *) list_nth(cx->first->whereidx, i);
+
+		i++;
+		if (ci->rinfono < 0 || ci->rinfono >= nbase || idx == NULL ||
+			(idxfor[ci->rinfono] != NULL &&
+			 idxfor[ci->rinfono]->indexoid != idx->indexoid))
+		{
+			pfree(idxfor);
+			pfree(covered);
+			return 0.0;
+		}
+		idxfor[ci->rinfono] = idx;
+	}
+	for (i = 0; i < nbase; i++)
+	{
+		if (idxfor[i] == NULL)
+		{
+			pfree(idxfor);
+			pfree(covered);
+			return 0.0;
+		}
+	}
+
+	foreach(lc, cx->output_rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		AggPath    *agg;
+		Path	   *scan;
+		bool		reads;
+
+		if (p->param_info != NULL || !IsA(p, AggPath) ||
+			lion_path_has_lion(p))
+			continue;
+#if PG_VERSION_NUM >= 180000
+		if (p->disabled_nodes > 0)
+			continue;
+#endif
+		agg = (AggPath *) p;
+		if (agg->aggstrategy != AGG_PLAIN || agg->aggsplit != AGGSPLIT_SIMPLE ||
+			agg->groupClause != NIL || agg->qual != NIL)
+			continue;
+		scan = agg->subpath;
+		while (scan != NULL && IsA(scan, ProjectionPath))
+			scan = ((ProjectionPath *) scan)->subpath;
+		if (scan == NULL || scan->parent != rel || scan->param_info != NULL ||
+			scan->parallel_aware)
+			continue;
+
+		memset(covered, 0, sizeof(bool) * nbase);
+		if (IsA(scan, IndexPath))
+			reads = lion_count_ownscan_reads((IndexPath *) scan, rel, lionam,
+											 idxfor, covered);
+		else if (IsA(scan, BitmapHeapPath))
+			reads = lion_count_ownscan_bitmap(((BitmapHeapPath *) scan)->bitmapqual,
+											  rel, lionam, idxfor, covered);
+		else
+			reads = false;
+		for (i = 0; reads && i < nbase; i++)
+			reads = covered[i];
+		if (reads && (best <= 0.0 || p->total_cost < best))
+			best = p->total_cost;
+	}
+	pfree(idxfor);
+	pfree(covered);
+	return best;
+}
+
+/*
+ * How far below the AM's own scan of the same sets the count is priced: past
+ * the fuzz add_path() calls two costs the same within (1%, pathnode.c's
+ * STD_FUZZ_FACTOR), where the scan's Agg, parallel safe, would win the tie
+ * against the count, which is not.
+ */
+#define LION_COUNT_OWNSCAN_EDGE		1.02
+
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 {
@@ -3441,6 +3884,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	GroupPathExtraData *extra = cx->extra;
 	LionCountTarget *first = cx->first;
 	LionRangeCost rangeprice;	/* ... and what its ranges pay */
+	LionWalkSave walksave = {0};	/* ... and what walking them would
+									 * save */
 	Cost		serialrun;		/* the serial node's price, without HAVING */
 	LionUnits	units;			/* the competitor's (§39) */
 
@@ -3456,23 +3901,69 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * clauses priced into it.
 	 */
 	if (cx->nfilter == 0)
-		lion_count_path_price(cx, cpath, cx->targets, &rangeprice);
+		lion_count_path_price(cx, cpath, cx->targets, &rangeprice, &walksave);
 	else
 	{
 		Cost		startup = 0;
 		Cost		total = 0;
+		LionRangeCost runs = {0};	/* a parallel count's, over the runs */
 		int			r;
 
 		for (r = 0; r <= cx->nfilter; r++)
 		{
 			lion_count_path_price(cx, cpath, lion_count_run_targets(cx, r),
-								  &rangeprice);
+								  &rangeprice, &walksave);
 			startup += cpath->path.startup_cost;
 			total += cpath->path.total_cost;
+			runs.countrange += rangeprice.countrange;
+			runs.whole += rangeprice.whole;
+			runs.pages += rangeprice.pages;
 		}
 		cpath->path.startup_cost = startup;
 		cpath->path.total_cost = total;
+		rangeprice.countrange = runs.countrange;
+		rangeprice.whole = runs.whole;
+		rangeprice.pages = runs.pages;
 	}
+
+	/*
+	 * A range taken as a source too large for the memory (DESIGN.md §32,
+	 * "Too large to collect") is collected in windows into a temporary file,
+	 * or walked at every count it is part of: the first is what the price
+	 * takes, and the second is cheaper where there are few counts - one
+	 * count, a few groups - which the plan then says (LION_FLAG_RANGEWALK),
+	 * for all of the node's ranges at once, naming the clauses of those it
+	 * priced walked (LION_CLAUSE_WALK): only they are walked, where they do
+	 * not fit.  Not beside the decoded walk, whose WHERE is one copy, nor
+	 * the top k, whose price leaves it out, nor where the aggregates over
+	 * entries are all the node prices.
+	 */
+	if (walksave.save > 0 && !cx->decode && cx->topkn == 0 &&
+		(cx->wattnos == NIL || cx->wcounts))
+	{
+		bool		walks = false;
+		int			i;
+
+		for (i = 0; i < cx->priv.nclause; i++)
+		{
+			cx->priv.clause[i].walk =
+				cx->priv.clause[i].kind == LION_CLAUSE_RANGESRC &&
+				list_member_ptr(walksave.clauses,
+								list_nth(cx->whereclauses, i));
+			walks |= cx->priv.clause[i].walk;
+		}
+		if (walks)
+		{
+			cpath->path.total_cost -= walksave.save;
+			if (cpath->path.startup_cost > 0)
+				cpath->path.startup_cost = Max(cpath->path.startup_cost -
+											   walksave.save, 0.0);
+			cx->priv.flags |= LION_FLAG_RANGEWALK;
+			cpath->custom_private =
+				lion_count_priv_encode(&cx->priv, LION_PRIV_STAGE_PATH);
+		}
+	}
+	list_free(walksave.clauses);
 
 	/* the residual clauses' test of each row the others select (§10) */
 	if (cx->residual != NIL)
@@ -3493,6 +3984,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 												cpath->path.startup_cost);
 	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
 	rangeprice.perrange = lion_units_price(&units, rangeprice.perrange);
+	rangeprice.countrange = lion_units_price(&units, rangeprice.countrange);
+	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
 	serialrun = cpath->path.total_cost;
 
 	/*
@@ -3515,6 +4008,28 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 																cx->having,
 																0, JOIN_INNER,
 																NULL));
+	}
+
+	/*
+	 * Never at or within core's fuzz above the AM's own scan of the same sets
+	 * feeding an Agg (DESIGN.md §39, "The AM's own scan of the same sets"),
+	 * which does what the count does and fetches every row besides: whatever
+	 * the rows are estimated at, which price the scan's heap and the count's
+	 * visibility tests both, the count is the cheaper.
+	 */
+	{
+		Cost		ownscan = lion_count_ownscan_cost(cx);
+
+		if (ownscan > 0.0)
+			elog(DEBUG2, "lion: count priced %.2f against the AM's own scan of its sets at %.2f",
+				 cpath->path.total_cost, ownscan);
+		if (ownscan > 0.0 &&
+			cpath->path.total_cost * LION_COUNT_OWNSCAN_EDGE > ownscan)
+		{
+			cpath->path.total_cost = ownscan / LION_COUNT_OWNSCAN_EDGE;
+			cpath->path.startup_cost = Min(cpath->path.startup_cost,
+										   cpath->path.total_cost);
+		}
 	}
 
 	/*
@@ -3556,11 +4071,12 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * one grouping column walked whole, a WHERE that is collected - priced as
 	 * the groups of a walk counted together (rangeprice.batched), with a
 	 * source that is positive whatever its value, and no range taken as one -
-	 * and partial counts core can add up.  Before the serial path is added,
-	 * which may free it.
+	 * and partial counts core can add up.  A GROUP BY coalesce(col, c) is
+	 * one too: its two entries go up as partial rows of c, which the Agg
+	 * adds together.  Before the serial path is added, which may free it.
 	 */
 	if (cx->ngroup == 1 && !cx->sumall && !cx->singlegroup &&
-		cx->groupcoal == NULL && cx->nfilter == 0 &&
+		cx->nfilter == 0 &&
 		cx->distvar == NULL && cx->rangevar == NULL && !cx->hasrangesrc &&
 		cx->plainpositive && rangeprice.batched && cx->topkn == 0 &&
 		cx->groupdeps == NIL && cx->ncompl == 0 && cx->residual == NIL &&
@@ -3574,6 +4090,26 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 									 serialrun, &rangeprice,
 									 first->driveidx[0], first->drivecol[0],
 									 cx->having, cx->numgroups);
+
+	/*
+	 * ... and a count of one row of one table, divided among them the same
+	 * way (DESIGN.md §10, "A count in parallel"): the merge of its WHERE or a
+	 * sum over a column's entries, with whatever filtered counts, residual
+	 * clauses, complement ORs, ranges taken as sources or a range bounding
+	 * the sum beside it - each range counted as the serial node counts the
+	 * whole.  Not a count(DISTINCT), the aggregates over keys, the FK-side
+	 * join or a partitioned table, which count in other ways, nor a group
+	 * folded to a constant, whose missing row partial counts cannot say.
+	 */
+	if (cx->ngroup == 0 && !cx->singlegroup && !cx->partitioned &&
+		cx->fj == NULL && cx->distvar == NULL && cx->wattnos == NIL &&
+		cx->topkn == 0 && !cx->decode && cx->groupcoal == NULL &&
+		input_rel->consider_parallel && output_rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) cx->priv.consts) &&
+		extra != NULL && (extra->flags & GROUPING_CAN_PARTIAL_AGG) != 0 &&
+		!RecoveryInProgress())
+		lion_add_parallel_count_path(root, input_rel, output_rel, cpath,
+									 serialrun, &rangeprice, cx->having);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -3606,6 +4142,56 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 }
 
 /*
+ * The rest of lion_try_count_path() for one build: inside the scope of the
+ * relation's expression columns.  The expressions of the table's lion
+ * indexes are columns from here on (DESIGN.md §41): of one table, which no
+ * FK-side join reads.  A partition numbers its own Vars, and its indexes'
+ * expressions are its own, so a partitioned table has none.
+ */
+static void
+lion_try_count_path_vcols(LionCountPathBuild *cxp)
+{
+	LionCountPathBuild cx = *cxp;
+	LionVColScope saved;
+
+	if (cx.fj == NULL && !cx.partitioned)
+		cx.vcols = lion_vcol_collect(cx.input_rel);
+	saved = lion_vcol_enter(cx.vcols, cx.rti);
+	PG_TRY();
+	{
+		lion_try_count_path_scoped(&cx);
+	}
+	PG_FINALLY();
+	{
+		lion_vcol_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+/*
+ * One more build of lion_try_count_path(), with each relation's rank'th
+ * partial index (DESIGN.md §45), when one has any.
+ */
+static void
+lion_try_count_path_partial(LionCountPathBuild *cx,
+							const LionPartialCands *cands, int rank)
+{
+	void	   *saved;
+
+	if (!lion_partial_enter(cands, rank, &saved))
+		return;
+	PG_TRY();
+	{
+		lion_try_count_path_vcols(cx);
+	}
+	PG_FINALLY();
+	{
+		lion_partial_leave(saved);
+	}
+	PG_END_TRY();
+}
+
+/*
  * Decide whether count(*) over input_rel can be answered from roaring
  * posting sets and, if so, add a CustomPath to output_rel.  Every failed
  * check simply returns: the normal plan is always available.
@@ -3625,7 +4211,8 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 						const LionFkJoin *fj, bool distinctstage)
 {
 	LionCountPathBuild cx;
-	LionVColScope saved;
+	LionPartialCands *cands;
+	int			rank;
 
 	lion_count_path_init(&cx, root, input_rel, output_rel, extra, fj);
 	cx.distinctstage = distinctstage;
@@ -3635,24 +4222,21 @@ lion_try_count_path_ext(PlannerInfo *root, RelOptInfo *input_rel,
 	if (!lion_count_path_rel(&cx))
 		return;
 
+	/* with the relation's whole indexes */
+	lion_try_count_path_vcols(&cx);
+
 	/*
-	 * The expressions of the table's lion indexes are columns from here on
-	 * (DESIGN.md §41): of one table, which no FK-side join reads.  A
-	 * partition numbers its own Vars, and its indexes' expressions are its
-	 * own, so a partitioned table has none.
+	 * ... and once more with each partial index whose predicate the
+	 * restrictions imply (DESIGN.md §45), the smallest first: every lookup
+	 * tries that index first, the restrictions it implies are left out, and
+	 * the count is held to its rows.  add_path() keeps the cheapest.
 	 */
-	if (fj == NULL && !cx.partitioned)
-		cx.vcols = lion_vcol_collect(cx.input_rel);
-	saved = lion_vcol_enter(cx.vcols, cx.rti);
-	PG_TRY();
-	{
-		lion_try_count_path_scoped(&cx);
-	}
-	PG_FINALLY();
-	{
-		lion_vcol_leave(saved);
-	}
-	PG_END_TRY();
+	if (!lion_enable_count_partial)
+		return;
+	cands = lion_partial_find(root, cx.input_rel);
+	for (rank = 0; rank < Min(lion_partial_ncands(cands), LION_PARTIAL_TRIES);
+		 rank++)
+		lion_try_count_path_partial(&cx, cands, rank);
 }
 
 void

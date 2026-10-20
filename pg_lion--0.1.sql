@@ -563,25 +563,36 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS jsonb_contains_ops DEFAU
 /*
  * BM25 ranking (lion_bm25.c, DESIGN.md §17 "Ranking"): the k rows with the
  * highest Okapi BM25 score for the query's lexemes, best first, scored from
- * an index that stores positions (a tsvector column's, by default).  Join on
- * ctid for the rows:
+ * an index column that stores positions (a tsvector column's, by default).
+ * Join on ctid for the rows:
  *
  *   SELECT d.*, s.score
  *     FROM lion_bm25('doc_tsv_idx', to_tsquery('english', 'cat & dog'), 10) s
  *     JOIN doc d ON d.ctid = s.ctid
  *    ORDER BY s.score DESC;
+ *
+ * col names the index column to rank, as the index names it (`\d index`):
+ * needed when more than one of its columns stores positions, as in an index
+ * on (title, body):
+ *
+ *   SELECT * FROM lion_bm25('doc_text_idx', 'cat & dog', 10, col => 'body');
+ *
+ * Not STRICT, for col's NULL; a NULL in any other argument returns no rows.
  */
 CREATE FUNCTION lion_bm25(index regclass, query tsquery, k int,
 						  k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75,
+						  col name DEFAULT NULL,
 						  OUT ctid tid, OUT score float8)
 	RETURNS SETOF record
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED ROWS 10;
+	AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT VOLATILE
+	PARALLEL RESTRICTED ROWS 10;
 
 /*
  * The score lion_bm25() would give one row, from its tsvector and the
- * index's statistics.  Ordered by it, with the rows matching a query on the
- * same column, a LionBm25 scan returns them best first from the index
- * (lion_bm25_scan.c):
+ * statistics of the index column col (the one that stores positions when
+ * col is NULL).  Ordered by it, with the rows matching a query on the same
+ * column, a LionBm25 scan returns them best first from the index when doc
+ * is the column col indexes (lion_bm25_scan.c):
  *
  *   SELECT d.*, lion_bm25_score(d.tsv, 'cat & dog', 'doc_tsv_idx') AS score
  *     FROM doc d
@@ -593,11 +604,14 @@ CREATE FUNCTION lion_bm25(index regclass, query tsquery, k int,
  * call site, so two parallel workers that read them on either side of an
  * insert would score rows by different N, df and avgdl, and the merged order
  * would not be one ranking.  In the leader every row is scored by one read.
+ * Not STRICT, for col's NULL; a NULL in any other argument is a NULL score.
  */
 CREATE FUNCTION lion_bm25_score(doc tsvector, query tsquery, index regclass,
-								k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75)
+								k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75,
+								col name DEFAULT NULL)
 	RETURNS float8
-	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE PARALLEL RESTRICTED COST 10;
+	AS 'MODULE_PATHNAME' LANGUAGE C CALLED ON NULL INPUT STABLE
+	PARALLEL RESTRICTED COST 10;
 
 /* ---------------------------------------------------------------------
  * count functions (lion_count.c)

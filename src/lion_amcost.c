@@ -228,10 +228,11 @@ lion_cost_is_range(IndexOptInfo *index, int col, OpExpr *op)
  *	walk	for a column without sets: `op ANY (array)` with a range strategy
  *			(ONE walk to its widest element), else the column's plain range
  *			comparisons, which ranges lists and which are all one walk, else
- *			`IS NOT NULL`;
- *	ndropped	the quals left to the recheck: a column's range comparisons
- *			beside its sets, and a second array range or the plain range
- *			comparisons beside an array range;
+ *			`IS NOT NULL` - a walk only when nothing else answers, and
+ *			otherwise its NULL entry taken away (lion_cost_notnull());
+ *	ndropped	the quals left to the recheck, in dropped: a column's range
+ *			comparisons beside its sets, and a second array range or the
+ *			plain range comparisons beside an array range;
  *	nomatch	`IS NULL` beside a strict qual of the column or `IS NOT NULL`,
  *			which the scan answers with no row at all.
  *
@@ -247,6 +248,7 @@ typedef struct LionCostCol
 	List	   *ranges;			/* the plain range comparisons of the walk */
 	RestrictInfo *walk;			/* the array range, the first range
 								 * comparison, or `IS NOT NULL` */
+	List	   *dropped;		/* the ndropped quals */
 	int			nquals;			/* index quals on the column at all */
 	int			ndropped;
 	bool		nomatch;
@@ -258,6 +260,7 @@ lion_cost_col_quals(IndexPath *path, int c, LionCostCol *cc)
 	IndexOptInfo *index = path->indexinfo;
 	RestrictInfo *arrayrange = NULL;
 	RestrictInfo *notnull = NULL;
+	List	   *arrays = NIL;
 	int			narray = 0;
 	int			nisnull = 0;
 	int			nstrict = 0;
@@ -300,6 +303,8 @@ lion_cost_col_quals(IndexPath *path, int c, LionCostCol *cc)
 			{
 				if (arrayrange == NULL)
 					arrayrange = rinfo;
+				else
+					arrays = lappend(arrays, rinfo);
 				narray++;
 			}
 			else
@@ -314,13 +319,15 @@ lion_cost_col_quals(IndexPath *path, int c, LionCostCol *cc)
 	{
 		/* the recheck bounds the sets */
 		cc->ndropped = list_length(cc->ranges) + narray;
-		list_free(cc->ranges);
+		cc->dropped = list_concat(cc->ranges, arrays);
+		if (arrayrange != NULL)
+			cc->dropped = lappend(cc->dropped, arrayrange);
 		cc->ranges = NIL;
 	}
 	else if (arrayrange != NULL)
 	{
 		cc->ndropped = narray - 1 + list_length(cc->ranges);
-		list_free(cc->ranges);
+		cc->dropped = list_concat(cc->ranges, arrays);
 		cc->ranges = NIL;
 		cc->walk = arrayrange;
 	}
@@ -335,8 +342,10 @@ lion_cost_col_free(LionCostCol *cc)
 {
 	list_free(cc->sets);
 	list_free(cc->ranges);
+	list_free(cc->dropped);
 	cc->sets = NIL;
 	cc->ranges = NIL;
+	cc->dropped = NIL;
 }
 
 /*
@@ -600,6 +609,197 @@ lion_cost_col_ranges(IndexPath *path, int c)
 	}
 	lion_cost_col_free(&cc);
 	return ranges;
+}
+
+static double lion_cost_col_ndistinct(PlannerInfo *root, IndexOptInfo *index,
+									  int c);
+
+/*
+ * Is cl `col = ANY (array)` of more values than a plain scan locates at once
+ * (lion_scan_list_batch(), §29.4): a LIST source, which drives the scan a
+ * batch at a time?
+ */
+static bool
+lion_cost_is_long_list(PlannerInfo *root, IndexOptInfo *index, int c,
+					   Node *cl)
+{
+	ScalarArrayOpExpr *saop;
+
+	if (!IsA(cl, ScalarArrayOpExpr) || lion_index_is_multikey(index, c))
+		return false;
+	saop = (ScalarArrayOpExpr *) cl;
+	if (get_op_opfamily_strategy(saop->opno, index->opfamily[c]) !=
+		LION_STRAT_EQUAL)
+		return false;
+#if PG_VERSION_NUM >= 170000
+	return estimate_array_length(root, (Node *) lsecond(saop->args)) >
+		lion_scan_list_batch();
+#else
+	return estimate_array_length((Node *) lsecond(saop->args)) >
+		lion_scan_list_batch();
+#endif
+}
+
+/*
+ * The index quals of a lion IndexPath that a PLAIN scan of it leaves to the
+ * recheck (lion_source_build(), DESIGN.md §29.3, §29.6) - and so does a
+ * LionOrdered or LionBtreeScan set, which is built from the same source
+ * (lion_source_open(), §30.4): a column's ranges beside its sets and the
+ * array ranges its walk does not take (lion_cost_col_quals()), a walk beside
+ * a list too long to locate at once or beside another column's walk, a
+ * second such list, and a multi-key query that needs every row
+ * (lion_cost_qual_is_full()).  `IS NOT NULL` is never among them: it is
+ * answered, its NULL entry taken away or its column walked (§14).  NIL also
+ * when the scan selects nothing at all.  lo_cost() prices the heap fetches
+ * these quals leave behind (§40.3).
+ */
+List *
+lion_path_rechecked_quals(PlannerInfo *root, IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *quals = NIL;
+	List	   *firstwalk = NIL;
+	bool		haslist = false;
+	bool		haswalk = false;
+	int			c;
+
+	for (c = 0; c < index->nkeycolumns; c++)
+	{
+		LionCostCol cc;
+		ListCell   *lc;
+
+		lion_cost_col_quals(path, c, &cc);
+		if (cc.nomatch)
+		{
+			lion_cost_col_free(&cc);
+			list_free(quals);
+			return NIL;
+		}
+		quals = list_concat(quals, cc.dropped);
+		foreach(lc, cc.sets)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			bool		all;
+
+			if (lion_cost_qual_is_full(index, c, (Node *) rinfo->clause,
+									   &all))
+				quals = lappend(quals, rinfo);
+			else if (lion_cost_is_long_list(root, index, c,
+											(Node *) rinfo->clause))
+			{
+				if (haslist)
+					quals = lappend(quals, rinfo);	/* a second one */
+				haslist = true;
+			}
+		}
+		if (cc.walk != NULL && !IsA(cc.walk->clause, NullTest))
+		{
+			List	   *walk = (cc.ranges != NIL) ? list_copy(cc.ranges) :
+				list_make1(cc.walk);
+
+			if (haswalk)
+				quals = list_concat(quals, walk);	/* a second one */
+			else
+				firstwalk = walk;
+			haswalk = true;
+		}
+		lion_cost_col_free(&cc);
+	}
+	if (haslist && firstwalk != NIL)
+		quals = list_concat(quals, firstwalk);	/* the list drives */
+	return quals;
+}
+
+/*
+ * `IS NOT NULL` beside quals that answer (DESIGN.md §14, §29.2): what
+ * taking each one's NULL entry away from their answer costs, or walking its
+ * column beside them where that is cheaper (lion_cost_notnull()), as the
+ * scan does it (lion_source_build(), lion_getbitmap_choice()).  The answer's
+ * rows are the path's selectivity without the `IS NOT NULL` quals'.  With
+ * nothing else to answer, the first one walks its column whole, which the
+ * full walk's price covers (lion_scan_walks_whole_index()), its NULL entry
+ * and the others' among the index's pages; this adds nothing then.  *pages
+ * is what the subtractions read of the index.
+ */
+static Cost
+lion_cost_notnull_quals(PlannerInfo *root, IndexPath *path, Selectivity sel,
+						double *pages)
+{
+	IndexOptInfo *index = path->indexinfo;
+	RelOptInfo *rel = index->rel;
+	RestrictInfo *notnull[INDEX_MAX_KEYS];
+	int			cols[INDEX_MAX_KEYS];
+	int			n = 0;
+	bool		answers = false;
+	bool		walkfree = true;
+	bool		walked = false;
+	Selectivity nnsel = 1.0;
+	double		rows;
+	Cost		cost = 0.0;
+	int			c;
+	int			i;
+
+	*pages = 0.0;
+	if (index->nkeycolumns > INDEX_MAX_KEYS)
+		return 0.0;
+	for (c = 0; c < index->nkeycolumns; c++)
+	{
+		LionCostCol cc;
+		ListCell   *lc;
+
+		lion_cost_col_quals(path, c, &cc);
+		if (cc.nomatch)
+		{
+			lion_cost_col_free(&cc);
+			return 0.0;			/* the scan reads nothing */
+		}
+		foreach(lc, cc.sets)
+		{
+			Node	   *cl = (Node *) lfirst_node(RestrictInfo, lc)->clause;
+			bool		all;
+
+			if (lion_cost_qual_is_full(index, c, cl, &all))
+				continue;
+			answers = true;
+			if (lion_cost_is_long_list(root, index, c, cl))
+				walkfree = false;	/* a list drives: no walk beside it */
+		}
+		if (cc.walk != NULL && IsA(cc.walk->clause, NullTest))
+		{
+			notnull[n] = cc.walk;
+			cols[n] = c;
+			n++;
+		}
+		else if (cc.walk != NULL)
+		{
+			answers = true;
+			walkfree = false;	/* a range takes the walk's place */
+		}
+		lion_cost_col_free(&cc);
+	}
+	if (n == 0 || !answers)
+		return 0.0;
+
+	for (i = 0; i < n; i++)
+		nnsel *= clause_selectivity(root, (Node *) notnull[i], 0, JOIN_INNER,
+									NULL);
+	rows = Max(rel->tuples, 1.0) * ((nnsel > 0.0) ? Min(sel / nnsel, 1.0) : 1.0);
+
+	for (i = 0; i < n; i++)
+	{
+		double		pg;
+		bool		walks;
+
+		cost += lion_cost_notnull(root, rel, index, (AttrNumber) (cols[i] + 1),
+								  (Node *) notnull[i], rows,
+								  lion_cost_col_ndistinct(root, index, cols[i]),
+								  walkfree && !walked &&
+								  !lion_index_is_multikey(index, cols[i]),
+								  &pg, &walks);
+		*pages += pg;
+		walked |= walks;
+	}
+	return cost;
 }
 
 /*
@@ -1035,18 +1235,23 @@ lion_index_correlation(PlannerInfo *root, IndexPath *path)
  * Mirrors lion_source_build(): every set qual of every column is answered
  * (lion_cost_col_quals()); a long list outranks a walk; the first column
  * that walks a range walks, and a second one is rechecked; an `IS NOT NULL`
- * walks only when nothing else answers.  Beside another column's sets a
- * range is taken for a WINDOW, as lion_range_walk_cost() takes it: a walk
- * too short for one restarts the other columns' stream a few times at most
- * (lion_source_walk_is_long()), each restart in heap order.  No key at all
- * is a partial index read whole, by a walk of column 1 or, when that column
- * is multi-key, by a union.
+ * walks only when nothing else answers - the first one, and the others'
+ * NULL entries are taken away from it, a union in heap order when there are
+ * some (lion_source_union_begin()) - and is otherwise its NULL entry taken
+ * away (§14), which changes no shape but a range's: beside NULL entries
+ * alone, a long range walk is a union in heap order too.  Beside another
+ * column's sets a range is taken for a WINDOW, as lion_range_walk_cost()
+ * takes it: a walk too short for one restarts the other columns' stream a
+ * few times at most (lion_source_walk_is_long()), each restart in heap
+ * order.  No key at all is a partial index read whole, by a walk of column
+ * 1 or, when that column is multi-key, by a union.
  *
  * *rechecks says whether the scan sets xs_recheck (§29.6), and so evaluates
  * its index quals on every row it fetches: when it leaves a qual unanswered
  * (a range beside its column's sets, a second walk or long list, a walk
- * beside a list, an `IS NOT NULL` beside anything that answers), when it
- * answers a multi-key column, and for a UNION.
+ * beside a list), and when it answers a multi-key column with a query - a
+ * multi-key column's `IS NOT NULL` is answered exactly, as a scalar
+ * column's is.
  */
 #define LION_PLAIN_SORTED	0
 #define LION_PLAIN_WALK		1
@@ -1089,9 +1294,10 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 
 		/*
 		 * A column that selects nothing is the NONE source, and a multi-key
-		 * column a set tree or a UNION: all of them in heap order.
+		 * column's query a set tree or a UNION: all of them in heap order.
 		 */
-		if (cc.nomatch || lion_index_is_multikey(index, c))
+		if (cc.nomatch ||
+			(lion_index_is_multikey(index, c) && cc.sets != NIL))
 		{
 			nsets++;
 			if (!cc.nomatch)
@@ -1122,7 +1328,7 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 		if (cc.walk != NULL && IsA(cc.walk->clause, NullTest))
 		{
 			nnotnull++;
-			if (notnullcol < 0)
+			if (notnullcol < 0 && !lion_index_is_multikey(index, c))
 				notnullcol = c;
 		}
 		else if (cc.walk != NULL)
@@ -1135,8 +1341,7 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 	}
 
 	if (ndropped > 0 || nrangecols > 1 || nlists > 1 ||
-		(nlists > 0 && nrangecols > 0) || nnotnull > 1 ||
-		(nnotnull > 0 && (nsets > 0 || nlists > 0 || nrangecols > 0)))
+		(nlists > 0 && nrangecols > 0))
 		*rechecks = true;
 
 	if (!anychosen)
@@ -1149,12 +1354,22 @@ lion_plain_scan_shape(PlannerInfo *root, IndexPath *path, int *walkcol,
 		return LION_PLAIN_LIST;
 	if (nsets > 0)
 		return LION_PLAIN_SORTED;
-	if (rangecol >= 0 || notnullcol >= 0)
+	if (rangecol >= 0)
 	{
-		*walkcol = (rangecol >= 0) ? rangecol : notnullcol;
+		/*
+		 * Beside NULL entries to take away, as beside sets: a long walk is
+		 * then the union of the entries it selects, in heap order
+		 * (lion_source_build()).
+		 */
+		*walkcol = rangecol;
+		return (nnotnull > 0) ? LION_PLAIN_SORTED : LION_PLAIN_WALK;
+	}
+	if (nnotnull == 1 && notnullcol >= 0)
+	{
+		*walkcol = notnullcol;
 		return LION_PLAIN_WALK;
 	}
-	return LION_PLAIN_SORTED;
+	return LION_PLAIN_SORTED;	/* a union, the others' NULL entries off it */
 }
 
 /*
@@ -1749,6 +1964,23 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			extra * cpu_index_tuple_cost;
 		costs.numIndexPages += pages;
 		costs.numIndexTuples = walkrows;
+	}
+
+	/*
+	 * `IS NOT NULL` beside quals that answer: its NULL entry taken away from
+	 * their answer, or its column walked beside them where that is cheaper
+	 * (lion_cost_notnull_quals(), DESIGN.md §14).  genericcostestimate()
+	 * prorated the index by its selectivity with the others', which prices
+	 * what the scan returns but reads none of the NULL entry.
+	 */
+	if (!fullscan)
+	{
+		double		nnpages;
+
+		costs.indexTotalCost += lion_cost_notnull_quals(root, path,
+														costs.indexSelectivity,
+														&nnpages);
+		costs.numIndexPages += nnpages;
 	}
 
 	/*

@@ -7,8 +7,14 @@
 -- the one an in-memory build writes, page for page, holding exactly the
 -- heap's rows.
 --
--- UNLOGGED for the byte comparison, as in build.sql, and serial builds only:
--- 16 builds nothing else, and build.sql covers the parallel ones.
+-- Then the same for stored positions (DESIGN.md §17, "Stored positions"),
+-- which go through the spool with the codes, in many more runs than one
+-- merge reads, so that they are merged into fewer first; serially and in
+-- parallel.
+--
+-- UNLOGGED for the byte comparison, as in build.sql.  The codes' builds are
+-- serial only: 16 builds nothing else, and build.sql covers the parallel
+-- ones.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -86,4 +92,85 @@ SELECT s.attno, s.entries = h.keys AND s.ntids = h.pairs AS exact
 (3 rows)
 
 DROP TABLE lion_spill;
+-- Stored positions: two tsvector columns, so that a run holds the keys of
+-- both; a key in every row, keys of eight rows and of one, every tenth row a
+-- key of a few hundred bytes, longer the later in a run, and every 4000th row
+-- 2,000 keys, which end runs in the middle of a row.  HOT chains again,
+-- so that a heap page's members come out of order, and a run can end in the
+-- middle of the page.  At the least memory the positions' share is 64kB:
+-- dozens of runs, merged into fewer before the last merge, every key of the
+-- first column in most of them.  parallel_workers fixes the worker count
+-- whatever maintenance_work_mem says (plan_create_index_workers()); before
+-- 17 the "parallel" builds are serial ones.
+CREATE FUNCTION lion_spill_key_positions(regclass, text,
+	OUT tid tid, OUT positions int2[], OUT weights text[]) RETURNS SETOF record
+	AS '$libdir/pg_lion', 'lion_debug_key_positions' LANGUAGE C STRICT;
+CREATE UNLOGGED TABLE lion_spill_pos (id int, d tsvector, e tsvector, pad text)
+	WITH (fillfactor = 50, parallel_workers = 2);
+INSERT INTO lion_spill_pos
+SELECT g,
+	   setweight(to_tsvector('simple',
+			format('w%s k%s w%s x%s w%s', g % 7, g / 8, g % 7, g, g % 3) ||
+			CASE WHEN g % 10 = 0
+				 THEN ' ' || repeat('l', 30 + (g * 37) % 700) || g % 3
+				 ELSE '' END ||
+			CASE WHEN g % 4000 = 0
+				 THEN (SELECT string_agg(' y' || i, '') FROM generate_series(1, 2000) i)
+				 ELSE '' END), (ARRAY['A', 'B', 'C', 'D'])[1 + g % 4]::"char"),
+	   to_tsvector('simple', format('common v%s common', g % 1000)),
+	   'p'
+  FROM generate_series(1, 20000) g;
+UPDATE lion_spill_pos SET pad = pad || 'q' WHERE id % 3 = 0;
+UPDATE lion_spill_pos SET pad = pad || 'r' WHERE id % 4 = 0;
+CREATE FUNCTION lion_spill_pos_as(mem text, workers int) RETURNS text
+	LANGUAGE plpgsql AS $$
+BEGIN
+	PERFORM set_config('maintenance_work_mem', mem, true);
+	PERFORM set_config('max_parallel_maintenance_workers', workers::text, true);
+	REINDEX INDEX lion_spill_pos_i;
+	RETURN lion_spill_digest('lion_spill_pos_i');
+END $$;
+SET max_parallel_maintenance_workers = 0;
+CREATE INDEX lion_spill_pos_i ON lion_spill_pos USING lion (d, e);
+SELECT lion_spill_pos_as('256MB', 0) AS lion_spill_pos_in_memory \gset
+SELECT lion_spill_pos_as(:'lion_spill_least_mem', 0) = :'lion_spill_pos_in_memory'
+		AS spilled_same,
+	   lion_spill_pos_as('256MB', 2) = :'lion_spill_pos_in_memory'
+		AS parallel_same,
+	   lion_spill_pos_as(:'lion_spill_least_mem', 2) = :'lion_spill_pos_in_memory'
+		AS parallel_spilled_same;
+ spilled_same | parallel_same | parallel_spilled_same 
+--------------+---------------+-----------------------
+ t            | t             | t
+(1 row)
+
+RESET max_parallel_maintenance_workers;
+-- ... and holding the heap's positions: every row of a few keys of each
+-- kind of the first column, against unnest() of the rows (the last build was
+-- the parallel one at the least memory).  By heap block, as in positions.sql:
+-- the index has a HOT chain's row under its root's TID.
+SELECT lion_index_verify('lion_spill_pos_i', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+WITH k(lexeme) AS (VALUES ('w0'), ('w2'), ('k100'), ('x777'), ('y1999'),
+						  (repeat('l', 30 + (12340 * 37) % 700) || '1')),
+idx AS (SELECT k.lexeme, (p.tid::text::point)[0] AS blk, p.positions, p.weights
+		  FROM k, lion_spill_key_positions('lion_spill_pos_i', k.lexeme) p),
+heap AS (SELECT u.lexeme, (t.ctid::text::point)[0] AS blk, u.positions, u.weights
+		   FROM lion_spill_pos t, unnest(t.d) u
+		  WHERE u.lexeme IN (SELECT lexeme FROM k))
+SELECT (SELECT count(*) FROM heap) AS heap_rows,
+	   (SELECT count(*) FROM (SELECT * FROM idx EXCEPT ALL SELECT * FROM heap) x) AS only_index,
+	   (SELECT count(*) FROM (SELECT * FROM heap EXCEPT ALL SELECT * FROM idx) x) AS only_heap;
+ heap_rows | only_index | only_heap 
+-----------+------------+-----------
+     17165 |          0 |         0
+(1 row)
+
+DROP TABLE lion_spill_pos;
+DROP FUNCTION lion_spill_pos_as(text, int);
+DROP FUNCTION lion_spill_key_positions(regclass, text);
 DROP FUNCTION lion_spill_digest(regclass);

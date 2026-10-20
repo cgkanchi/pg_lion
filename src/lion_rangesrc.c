@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "lion_count_int.h"
 
 /*
@@ -89,12 +91,6 @@ typedef struct LionRangeUnion
 
 /* What one kept container costs beyond its chunk: its hash entry. */
 #define LION_RANGE_UNION_OVERHEAD	(sizeof(LionRangeUnionEnt) + 16)
-
-/*
- * The least memory a window has, whatever is left of the caller's: several
- * bitsets, so that a window always keeps some keys and gets on.
- */
-#define LION_RANGE_WINDOW_MIN		(32 * 1024)
 
 static int
 lion_ckey_cmp(const void *a, const void *b)
@@ -488,17 +484,19 @@ lion_range_union_sorted(LionRangeUnion *u, long *n)
  * union did at the peak (2026-09-28 review).
  *
  * One that does not fit fails - the caller walks the range at every count
- * instead - unless spill says it may not: an OR's leaf, which cannot be taken
- * apart that way and used to be collected whatever it took.  It is then
- * collected a WINDOW of container keys at a time into a temporary file
- * (LionSpill): a window keeps the keys from where the last one ended; when
- * its memory - maxbytes, and never below LION_RANGE_WINDOW_MIN - runs out it
- * gives back the upper half of its keys and ends where they began
- * (lion_range_union_evict()); at the end of the walk its containers go to
- * the file in key order, and the next window reads the range again from its
- * end.  Every window is a walk of the range, so a union n times the memory
- * costs about 2n walks; each is read after the snapshot like the first, and
- * the windows are disjoint ranges of TIDs, so the file holds each row once.
+ * instead, where its plan chose that - unless spill says it may not, which
+ * is every other caller's: a count whose plan collects its ranges, an OR's
+ * leaf, which cannot be taken apart that way, the decoded walk's WHERE and
+ * the FK-side join's fact filters.  It is then collected a WINDOW of
+ * container keys at a time into a temporary file (LionSpill): a window keeps
+ * the keys from where the last one ended; when its memory - maxbytes, and
+ * never below LION_RANGE_WINDOW_MIN - runs out it gives back the upper half
+ * of its keys and ends where they began (lion_range_union_evict()); at the
+ * end of the walk its containers go to the file in key order, and the next
+ * window reads the range again from its end.  Every window is a walk of the
+ * range, so a union n times the memory costs about 2n walks; each is read
+ * after the snapshot like the first, and the windows are disjoint ranges of
+ * TIDs, so the file holds each row once.
  * The set reads the file a container at a time; what it keeps in memory is
  * sixteen bytes a container key.
  */
@@ -630,6 +628,7 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 			hash_destroy(u.byckey);
 			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
 				MemoryContextMemAllocated(cxt, true);
+			mat->unioncxt = cxt;
 
 			out->found = true;
 			out->mat = mat;
@@ -672,6 +671,43 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 	*held = mat->held;
 	*spilled = true;
 	return true;
+}
+
+/*
+ * A range collected in memory, sent to a file to make room for one collected
+ * after it that does not fit what it left (lion_locate_range()).  Its
+ * containers are in key order, which is how a spill takes them, and they go
+ * to the file as they are; the set's entries are made where the set is, and
+ * the union's context, with every container in it, is deleted.
+ */
+void
+lion_range_spill_set(LionMatSet *mat, Size *held)
+{
+	LionSpill	sp;
+	LionMatSet *spilled;
+	Size		was;
+	int			i;
+
+	if (mat == NULL || mat->unioncxt == NULL || mat->containers == NULL ||
+		lion_mat_spills(mat) || mat->ncontainers <= 0)
+		elog(ERROR, "lion index: a range's set to spill is not one in memory");
+
+	was = mat->held;
+	PrepareTempTablespaces();
+	memset(&sp, 0, sizeof(sp));
+	lion_spill_begin(&sp, GetMemoryChunkContext(mat));
+	for (i = 0; i < mat->ncontainers; i++)
+		lion_spill_add(&sp, mat->containers[i]);
+	spilled = lion_spill_finish(&sp);
+
+	pfree(mat->containers);
+	MemoryContextDelete(mat->unioncxt);
+	*mat = *spilled;
+	pfree(spilled);
+	Assert(mat->unioncxt == NULL && lion_mat_spills(mat));
+
+	*held -= Min(*held, was);
+	*held += mat->held;
 }
 
 /* ---------------------------------------------------------------------
@@ -766,6 +802,63 @@ lion_ckey_gallop(const uint32 *keys, int n, int from, uint32 target)
 }
 
 /*
+ * Would a probe of an F of `rows` rows over `containers` container keys fit
+ * maxbytes (DESIGN.md §32, "Summed ranges: dense and probed")?  This is the
+ * test lion_range_probe_begin() makes once F is collected, taken before it
+ * is: the copy within half of maxbytes, as lion_collect_container() accounts
+ * it - each container at its MAXALIGNed size, a pointer and an offset - and
+ * the copy with the marks and the count's set within all of it, as
+ * lion_range_probe_begin() adds them up: an ARRAY's members again, a bit
+ * each and 16 bytes, two maximal containers for any other kind.
+ *
+ * Every container is taken at the average, as an ARRAY while that is no
+ * larger than the narrowest NARROW and at the most a container takes past
+ * that.  It is asked of the rows of one of F's sources - its smallest, which
+ * bounds the intersection the probe copies - and the most containers they can
+ * lie at, one a member and no more than the heap has keys
+ * (lion_containers_for()).  The intersection has no more containers and no
+ * more members in any of them, a container is optimized to the smallest form
+ * that holds its members, and while they are all ARRAYs, or all past them,
+ * more containers take more and an even spread adds up to the most.  It is
+ * no bound where the members lie unevenly about the ARRAY limit: the marks
+ * of a container past it take two maximal containers, 8,240 bytes, where an
+ * ARRAY of 256 members takes 568 of them.  Then lion_range_probe_begin()
+ * refuses the probe once F is collected, and the walk counts on, as it would
+ * have without this test.  The executor asks it before it collects anything
+ * (lion_sum_probe_init()), the planner before it prices a walk probed
+ * (lion_cost_range_sum()), the same question of the same numbers, so that a
+ * walk is priced probed when it will be.
+ */
+bool
+lion_range_probe_fits(double rows, double containers, Size maxbytes)
+{
+	double		n = Max(ceil(containers), 1.0);
+	double		card;
+	double		item;
+	double		marks;
+	double		copy;
+	double		need;
+
+	if (rows <= 0.0)
+		return true;			/* nothing to copy, nothing to mark */
+	card = Min(rows / n, (double) LION_CONTAINER_RANGE);
+	item = (double) LION_CONTAINER_HDRSZ + card * sizeof(uint16);
+	if (item <= (double) LION_NARROW_SIZE(1))
+		marks = item + 16.0 + ceil(card / 64.0) * sizeof(uint64);
+	else
+	{
+		item = Min(item, (double) LION_CONTAINER_MAX_SIZE);
+		marks = 2.0 * (LION_CONTAINER_MAX_SIZE + 16);
+	}
+	item = ceil(item / MAXIMUM_ALIGNOF) * MAXIMUM_ALIGNOF;
+
+	copy = sizeof(LionMatSet) +
+		n * (item + sizeof(LionContainer *) + sizeof(uint32));
+	need = copy + n * (marks + sizeof(uint32) + 2 * sizeof(void *));
+	return copy <= (double) (maxbytes / 2) && need <= (double) maxbytes;
+}
+
+/*
  * Begin a probed sum beside the sources F (sources[0 .. nsources - 1]): NULL
  * when it cannot be taken - F has no positive source, holds a range still to
  * be walked, has no positive source that would carry the §9 interlock, or its
@@ -777,7 +870,7 @@ lion_ckey_gallop(const uint32 *keys, int n, int from, uint32 target)
 LionRangeProbe *
 lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 					   LionCountSource *sources, Size maxbytes,
-					   LionCountStats *stats)
+					   LionCountStats *stats, uint32 lo, uint64 hi)
 {
 	LionRangeProbe *rp;
 	MemoryContext cxt;
@@ -852,9 +945,19 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 		return NULL;
 	}
 
-	/* F's rows, copied: half of the memory, the marks and the count the rest */
-	if (!lion_sources_collect(heap, snapshot, nsources, sources, maxbytes / 2,
-							  false, &rp->probe, &spilled, stats))
+	/*
+	 * F's rows, copied: half of the memory, the marks and the count the rest.
+	 * Of a window's keys alone, in a range of a parallel count (DESIGN.md
+	 * §10, "A count in parallel"), whose final count is confined to them: the
+	 * walk's sets are then read only at F's keys there.
+	 */
+	if (!((lo > 0 || hi < LION_KEYS_END) ?
+		  lion_sources_collect_range(heap, snapshot, nsources, sources,
+									 maxbytes / 2, false, lo, hi, &rp->probe,
+									 &spilled, stats) :
+		  lion_sources_collect(heap, snapshot, nsources, sources,
+							   maxbytes / 2, false, &rp->probe, &spilled,
+							   stats)))
 	{
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);

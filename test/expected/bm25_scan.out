@@ -221,12 +221,12 @@ RESET pg_lion.enable_bm25_scan;
 EXPLAIN (COSTS OFF)
 SELECT id FROM bs_docs WHERE d @@ 'w1'
  ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC, id LIMIT 10;
-                                                                  QUERY PLAN                                                                  
-----------------------------------------------------------------------------------------------------------------------------------------------
+                                                                        QUERY PLAN                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------
  Limit
    ->  Incremental Sort
-         Sort Key: (lion_bm25_score(d, '''w1'''::tsquery, 'bs_docs_d'::regclass, '1.2'::double precision, '0.75'::double precision)) DESC, id
-         Presorted Key: (lion_bm25_score(d, '''w1'''::tsquery, 'bs_docs_d'::regclass, '1.2'::double precision, '0.75'::double precision))
+         Sort Key: (lion_bm25_score(d, '''w1'''::tsquery, 'bs_docs_d'::regclass, '1.2'::double precision, '0.75'::double precision, NULL::name)) DESC, id
+         Presorted Key: (lion_bm25_score(d, '''w1'''::tsquery, 'bs_docs_d'::regclass, '1.2'::double precision, '0.75'::double precision, NULL::name))
          ->  Custom Scan (LionBm25) on bs_docs
                Filter: (d @@ '''w1'''::tsquery)
                Index: bs_docs_d
@@ -368,12 +368,12 @@ SELECT ctid = (SELECT ctid FROM bs_cur WHERE id = 1) AS ctid,
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT id, lion_bm25_score(d, 'w', 'bs_cur_d') FROM bs_cur WHERE d @@ 'w'
  ORDER BY lion_bm25_score(d, 'w', 'bs_cur_d') DESC LIMIT 1;
-                                                             QUERY PLAN                                                              
--------------------------------------------------------------------------------------------------------------------------------------
+                                                                   QUERY PLAN                                                                    
+-------------------------------------------------------------------------------------------------------------------------------------------------
  Limit
-   Output: id, (lion_bm25_score(d, '''w'''::tsquery, 'bs_cur_d'::regclass, '1.2'::double precision, '0.75'::double precision))
+   Output: id, (lion_bm25_score(d, '''w'''::tsquery, 'bs_cur_d'::regclass, '1.2'::double precision, '0.75'::double precision, NULL::name))
    ->  Custom Scan (LionBm25) on public.bs_cur
-         Output: id, (lion_bm25_score(d, '''w'''::tsquery, 'bs_cur_d'::regclass, '1.2'::double precision, '0.75'::double precision))
+         Output: id, (lion_bm25_score(d, '''w'''::tsquery, 'bs_cur_d'::regclass, '1.2'::double precision, '0.75'::double precision, NULL::name))
          Filter: (bs_cur.d @@ '''w'''::tsquery)
          Index: bs_cur_d
 (6 rows)

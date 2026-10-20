@@ -5,13 +5,15 @@
  *		"Ranking").
  *
  *			lion_bm25(index regclass, query tsquery, k int,
- *					  k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75)
+ *					  k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75,
+ *					  col name DEFAULT NULL)
  *			RETURNS TABLE (ctid tid, score float8)
  *
  * returns the k rows of the index's table with the highest Okapi BM25 score
- * for the query's lexemes, best first, each with the TID of its version the
- * caller's snapshot sees - so `JOIN t ON t.ctid = s.ctid` reads exactly those
- * rows.  Everything the score needs comes from the index:
+ * for the query's lexemes in key column col, best first, each with the TID
+ * of its version the caller's snapshot sees - so `JOIN t ON t.ctid = s.ctid`
+ * reads exactly those rows.  Everything the score needs comes from the
+ * index, from that column's entries alone:
  *
  *	tf(t, d)	the number of positions row d has under lexeme t, a stripped
  *				lexeme counting once: the npos of d's member in t's position
@@ -35,6 +37,17 @@
  * operators, phrase distances and weights do not change the score, so a
  * caller who wants only the rows that match the query as a whole adds the
  * `@@` itself.  A prefix lexeme is refused.
+ *
+ * col names the column as the index does, in its own pg_attribute: a plain
+ * column by the table column's name when the index was built, an expression
+ * by the name CREATE INDEX chose for it (to_tsvector, to_tsvector1, ... on
+ * PostgreSQL 19; the names differ between versions).
+ * NULL is the index's one column that stores positions, and an error when it
+ * has several (lion_bm25_column()).  Each column that stores positions has
+ * an empty key of its own, so N, df and avgdl are the column's, and a column
+ * ranks exactly as an index on it alone would.  The function is not STRICT,
+ * so that col can be NULL; a NULL in any other argument returns no rows, and
+ * makes lion_bm25_score() NULL, as STRICT would.
  *
  * The heap is read only for the rows returned: each candidate, best first,
  * is looked up under the caller's snapshot until k are visible.  Like df and
@@ -65,6 +78,7 @@
 #include "access/tableam.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "tsearch/ts_type.h"
@@ -99,10 +113,17 @@ typedef struct LionBm25Term
 	double		ub;
 } LionBm25Term;
 
-/* N and the sum of the lengths, per index, for this backend. */
+/* N and the sum of the lengths, per index column, for this backend. */
+typedef struct LionBm25StatsKey
+{
+	Oid			indexoid;
+	int32		attno;			/* the key column, 1-based; an int32, so that
+								 * the key has no padding to hash */
+} LionBm25StatsKey;
+
 typedef struct LionBm25Stats
 {
-	Oid			indexoid;		/* hash key */
+	LionBm25StatsKey key;		/* hash key */
 	RelFileNumber relnumber;	/* the index's storage they were read from */
 	uint64		ntids;			/* the empty key's ntids then */
 	int64		nrows;			/* its members */
@@ -243,15 +264,16 @@ lion_bm25_length(const LionPosMember *m)
 
 /*
  * N, the empty key's ntids, and avgdl: the mean length of the empty key's
- * members, walked from it, or this backend's last walk while the key's ntids
- * is within 1/64 of what it was then and the index has not been rebuilt.
- * False when no row has a lexeme.
+ * members, walked from it, or this backend's last walk of the column's key
+ * while its ntids is within 1/64 of what it was then and the index has not
+ * been rebuilt.  False when no row has a lexeme.
  */
 static bool
 lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 				int64 *nrows, double *avgdl)
 {
 	LionBm25Stats *st;
+	LionBm25StatsKey key;
 	uint64		ntids = lion_bm25_ntids(index, col, lenkey);
 	bool		found;
 
@@ -262,14 +284,17 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 	{
 		HASHCTL		ctl;
 
-		ctl.keysize = sizeof(Oid);
+		ctl.keysize = sizeof(LionBm25StatsKey);
 		ctl.entrysize = sizeof(LionBm25Stats);
 		lion_bm25_stats_cache = hash_create("lion bm25 statistics", 16, &ctl,
 											HASH_ELEM | HASH_BLOBS);
 	}
-	st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache,
-									   &RelationGetRelid(index), HASH_FIND,
-									   &found);
+	StaticAssertStmt(sizeof(LionBm25StatsKey) == sizeof(Oid) + sizeof(int32),
+					 "LionBm25StatsKey has padding");
+	key.indexoid = RelationGetRelid(index);
+	key.attno = col->attno;
+	st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache, &key,
+									   HASH_FIND, &found);
 	if (!found || st->relnumber != index->rd_locator.relNumber ||
 		(ntids > st->ntids ? ntids - st->ntids : st->ntids - ntids) >
 		st->ntids / 64)
@@ -295,8 +320,7 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 		 * that errors out (a cancel, a corrupt page) would leave an entry
 		 * never filled in, which the next call would read as statistics.
 		 */
-		st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache,
-										   &RelationGetRelid(index),
+		st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache, &key,
 										   HASH_ENTER, NULL);
 		st->relnumber = index->rd_locator.relNumber;
 		st->ntids = ntids;
@@ -391,32 +415,115 @@ lion_bm25_heap_add(LionBm25Cand *heap, int64 *n, int64 cap, const LionBm25Cand *
 	}
 }
 
-/* The key column of index that stores positions, 0-based. */
-int
-lion_bm25_column(Relation index, LionIndexState *ix)
+/* Does col store positions, for a tsvector: can it rank? */
+static inline bool
+lion_bm25_ranks(const LionState *col)
 {
-	int			found = -1;
+	return col->positions && col->typid == TEXTOID;
+}
+
+/*
+ * The columns of index that can rank, as a hint names them: "col => 'title'
+ * or col => 'body'"; NULL when there are none.
+ */
+static char *
+lion_bm25_column_names(Relation index, LionIndexState *ix)
+{
+	StringInfoData buf;
+	int			total = 0;
+	int			n = 0;
 	int			i;
 
 	for (i = 0; i < ix->ncolumns; i++)
+		if (lion_bm25_ranks(&ix->cols[i]))
+			total++;
+	if (total == 0)
+		return NULL;
+	initStringInfo(&buf);
+	for (i = 0; i < ix->ncolumns; i++)
 	{
-		if (!ix->cols[i].positions || ix->cols[i].typid != TEXTOID)
+		if (!lion_bm25_ranks(&ix->cols[i]))
 			continue;
-		if (found >= 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("lion index \"%s\" stores positions for more than one column",
-							RelationGetRelationName(index)),
-					 errhint("lion_bm25 needs an index with one tsvector column.")));
-		found = i;
+		if (n > 0)
+			appendStringInfoString(&buf, n == total - 1 ? " or " : ", ");
+		appendStringInfo(&buf, "col => %s",
+						 quote_literal_cstr(NameStr(TupleDescAttr(RelationGetDescr(index),
+																  i)->attname)));
+		n++;
 	}
-	if (found < 0)
+	return buf.data;
+}
+
+/*
+ * The key column of index that lion_bm25() and lion_bm25_score() rank,
+ * 1-based: the one colname names, as the index's own pg_attribute names its
+ * columns, or with colname NULL the one column that stores positions.  A
+ * colname the index has no column of, a column that does not store
+ * positions, an index with no such column, and colname NULL on an index with
+ * several are errors - or, with missing_ok, InvalidAttrNumber, for the
+ * planner, which leaves the error to the function.
+ */
+AttrNumber
+lion_bm25_column(Relation index, LionIndexState *ix, const char *colname,
+				 bool missing_ok)
+{
+	TupleDesc	desc = RelationGetDescr(index);
+	int			found = -1;
+	int			nranks = 0;
+	int			i;
+	char	   *names;
+
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		if (colname == NULL)
+		{
+			if (lion_bm25_ranks(&ix->cols[i]))
+			{
+				found = i;
+				nranks++;
+			}
+		}
+		else if (strcmp(NameStr(TupleDescAttr(desc, i)->attname), colname) == 0)
+		{
+			found = i;
+			break;
+		}
+	}
+	if (colname == NULL ? (nranks == 1) :
+		(found >= 0 && lion_bm25_ranks(&ix->cols[found])))
+		return (AttrNumber) (found + 1);
+	if (missing_ok)
+		return InvalidAttrNumber;
+
+	names = lion_bm25_column_names(index, ix);
+	if (colname != NULL && found < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("lion index \"%s\" has no column \"%s\"",
+						RelationGetRelationName(index), colname),
+				 names != NULL ?
+				 errhint("Name a column it stores positions for: %s.", names) :
+				 errhint("Build it on a tsvector column without store_positions = off.")));
+	if (colname != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("lion index \"%s\" does not store positions",
-						RelationGetRelationName(index)),
+				 errmsg("column \"%s\" of lion index \"%s\" does not store positions",
+						colname, RelationGetRelationName(index)),
+				 names != NULL ?
+				 errhint("Name a column it stores positions for: %s.", names) :
 				 errhint("Build it on a tsvector column without store_positions = off.")));
-	return found;
+	if (nranks > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_AMBIGUOUS_COLUMN),
+				 errmsg("lion index \"%s\" stores positions for more than one column",
+						RelationGetRelationName(index)),
+				 errhint("Name the column to rank: %s.", names)));
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("lion index \"%s\" does not store positions",
+					RelationGetRelationName(index)),
+			 errhint("Build it on a tsvector column without store_positions = off.")));
+	return InvalidAttrNumber;	/* keep the compiler quiet */
 }
 
 /*
@@ -478,13 +585,14 @@ lion_bm25_order_cmp(const void *a, const void *b)
 }
 
 /*
- * Make query ready to rank against index, which must be a lion index that
- * stores positions for one tsvector column.  False when no row can score:
- * no lexeme counts, no row has one, or none has any of the query's.
+ * Make query ready to rank against key column attno of index, a lion index,
+ * which lion_bm25_column() has chosen.  False when no row can score: no
+ * lexeme counts, no row has one in the column, or none has any of the
+ * query's.
  */
 bool
-lion_bm25_prepare(Relation index, TSQuery query, double k1, double b,
-				  LionBm25Query *q)
+lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query, double k1,
+				  double b, LionBm25Query *q)
 {
 	LionIndexState *ix = lion_get_index_state(index);
 	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
@@ -493,9 +601,13 @@ lion_bm25_prepare(Relation index, TSQuery query, double k1, double b,
 	int64		nrows;
 	int			t;
 
+	if (attno < 1 || attno > ix->ncolumns ||
+		!lion_bm25_ranks(&ix->cols[attno - 1]))
+		elog(ERROR, "column %d of lion index \"%s\" does not store positions",
+			 attno, RelationGetRelationName(index));
 	memset(q, 0, sizeof(LionBm25Query));
 	q->index = index;
-	q->col = &ix->cols[lion_bm25_column(index, ix)];
+	q->col = &ix->cols[attno - 1];
 	q->k1 = k1;
 	q->b = b;
 
@@ -769,14 +881,41 @@ lion_bm25_topk(const LionBm25Query *q, int64 L, const LionBm25Cand *after,
 	return nbest;
 }
 
+/*
+ * lion_bm25() and lion_bm25_score() both take five arguments and then col,
+ * and are STRICT in the five by hand: is any of them NULL?
+ */
+#define LION_BM25_COL_ARG	5
+
+static bool
+lion_bm25_args_null(FunctionCallInfo fcinfo)
+{
+	int			i;
+
+	for (i = 0; i < LION_BM25_COL_ARG; i++)
+		if (PG_ARGISNULL(i))
+			return true;
+	return false;
+}
+
+/* col: the column's name, or NULL for the one that stores positions */
+static const char *
+lion_bm25_colname(FunctionCallInfo fcinfo)
+{
+	if (PG_NARGS() <= LION_BM25_COL_ARG || PG_ARGISNULL(LION_BM25_COL_ARG))
+		return NULL;
+	return NameStr(*PG_GETARG_NAME(LION_BM25_COL_ARG));
+}
+
 Datum
 lion_bm25(PG_FUNCTION_ARGS)
 {
-	Oid			indexoid = PG_GETARG_OID(0);
-	TSQuery		query = PG_GETARG_TSQUERY(1);
-	int32		k = PG_GETARG_INT32(2);
-	double		k1 = PG_GETARG_FLOAT8(3);
-	double		b = PG_GETARG_FLOAT8(4);
+	Oid			indexoid;
+	TSQuery		query;
+	int32		k;
+	double		k1;
+	double		b;
+	const char *colname;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	Relation	heap;
 	Relation	index;
@@ -787,6 +926,18 @@ lion_bm25(PG_FUNCTION_ARGS)
 	int64		seen = 0;
 	Snapshot	snapshot;
 	int64		emitted = 0;
+
+	if (lion_bm25_args_null(fcinfo))
+	{
+		InitMaterializedSRF(fcinfo, 0);
+		return (Datum) 0;
+	}
+	indexoid = PG_GETARG_OID(0);
+	query = PG_GETARG_TSQUERY(1);
+	k = PG_GETARG_INT32(2);
+	k1 = PG_GETARG_FLOAT8(3);
+	b = PG_GETARG_FLOAT8(4);
+	colname = lion_bm25_colname(fcinfo);
 
 	if (k < 0)
 		ereport(ERROR,
@@ -801,7 +952,10 @@ lion_bm25(PG_FUNCTION_ARGS)
 		elog(ERROR, "lion_bm25 requires an active snapshot");
 	index = lion_reader_open(indexoid, LION_READ_ROWS, snapshot, "rank",
 							 &heap);
-	if (!lion_bm25_prepare(index, query, k1, b, &q) || k == 0)
+	if (!lion_bm25_prepare(index,
+						   lion_bm25_column(index, lion_get_index_state(index),
+											colname, false),
+						   query, k1, b, &q) || k == 0)
 		goto out;
 
 	/*
@@ -854,6 +1008,8 @@ typedef struct LionBm25ScoreCache
 	Oid			indexoid;
 	double		k1;
 	double		b;
+	bool		hascol;			/* col was given ... */
+	NameData	col;			/* ... as this */
 	TSQuery		query;			/* a copy */
 	bool		valid;			/* any row can score */
 	LionBm25Query q;
@@ -861,27 +1017,43 @@ typedef struct LionBm25ScoreCache
 
 /*
  * lion_bm25_score(doc tsvector, query tsquery, index regclass,
- *				   k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75) RETURNS float8
+ *				   k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75,
+ *				   col name DEFAULT NULL) RETURNS float8
  *
- * The BM25 score lion_bm25() would give a row whose tsvector is doc, with
- * the statistics of index, read once per call site and query.  Under
- * `ORDER BY lion_bm25_score(...) DESC`, a LionBm25 scan returns the rows in
- * that order from the index (lion_bm25_scan.c); anywhere else this scores
- * one row at a time.
+ * The BM25 score lion_bm25() would give a row whose column col holds doc,
+ * with the statistics of that column of index, read once per call site and
+ * query.  doc is whatever tsvector the caller passes: the score of the
+ * row's own column when it is that column, or of any other tsvector against
+ * the column's statistics.  Under `ORDER BY lion_bm25_score(...) DESC`, a
+ * LionBm25 scan returns the rows in that order from the index when doc is
+ * the column itself (lion_bm25_scan.c); anywhere else this scores one row at
+ * a time.
  */
 Datum
 lion_bm25_score(PG_FUNCTION_ARGS)
 {
-	TSVector	doc = PG_GETARG_TSVECTOR(0);
-	TSQuery		query = PG_GETARG_TSQUERY(1);
-	Oid			indexoid = PG_GETARG_OID(2);
-	double		k1 = PG_GETARG_FLOAT8(3);
-	double		b = PG_GETARG_FLOAT8(4);
+	TSVector	doc;
+	TSQuery		query;
+	Oid			indexoid;
+	double		k1;
+	double		b;
+	const char *colname;
 	LionBm25ScoreCache *cache = (LionBm25ScoreCache *) fcinfo->flinfo->fn_extra;
+
+	if (lion_bm25_args_null(fcinfo))
+		PG_RETURN_NULL();
+	doc = PG_GETARG_TSVECTOR(0);
+	query = PG_GETARG_TSQUERY(1);
+	indexoid = PG_GETARG_OID(2);
+	k1 = PG_GETARG_FLOAT8(3);
+	b = PG_GETARG_FLOAT8(4);
+	colname = lion_bm25_colname(fcinfo);
 
 	if (cache == NULL || cache->query == NULL ||
 		cache->indexoid != indexoid || cache->k1 != k1 ||
-		cache->b != b || VARSIZE(cache->query) != VARSIZE(query) ||
+		cache->b != b || cache->hascol != (colname != NULL) ||
+		(colname != NULL && strcmp(NameStr(cache->col), colname) != 0) ||
+		VARSIZE(cache->query) != VARSIZE(query) ||
 		memcmp(cache->query, query, VARSIZE(query)) != 0)
 	{
 		MemoryContext old;
@@ -912,13 +1084,21 @@ lion_bm25_score(PG_FUNCTION_ARGS)
 								 NULL);
 		/* a read of the index's statistics, once per call site and query */
 		pgstat_count_index_scan(index);
-		cache->valid = lion_bm25_prepare(index, query, k1, b, &cache->q);
+		cache->valid =
+			lion_bm25_prepare(index,
+							  lion_bm25_column(index,
+											   lion_get_index_state(index),
+											   colname, false),
+							  query, k1, b, &cache->q);
 		cache->q.index = NULL;
 		cache->q.col = NULL;
 		index_close(index, AccessShareLock);
 		cache->indexoid = indexoid;
 		cache->k1 = k1;
 		cache->b = b;
+		cache->hascol = (colname != NULL);
+		if (colname != NULL)
+			namestrcpy(&cache->col, colname);
 		cache->query = (TSQuery) palloc(VARSIZE(query));
 		memcpy(cache->query, query, VARSIZE(query));
 		MemoryContextSwitchTo(old);

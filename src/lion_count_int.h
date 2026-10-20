@@ -251,6 +251,19 @@ typedef struct LionCountCtx
 	struct LionCollect *collect;
 
 	/*
+	 * The container keys this count, or collection, is confined to: lo up
+	 * to, not including, hi.  A chunk of a collection (LionCollect.ranged)
+	 * or a range of a parallel count's cut (lion_vis_cache_set_window(),
+	 * DESIGN.md §10, "A count in parallel"); windowed false for every key.
+	 * Every path of the count reads it in the same three places: its
+	 * positive cursors begin at lo, the merge ends at hi, and a windowed
+	 * union reads no child past it.
+	 */
+	bool		windowed;
+	uint32		winlo;
+	uint64		winhi;
+
+	/*
 	 * The one set of source slot 0 - a group's, a join key's fk set - whose
 	 * containers stats.key_containers counts (DESIGN.md §27, "Where a key's
 	 * time goes"), or NULL.
@@ -398,6 +411,8 @@ typedef struct LionMatSet
 	uint32		dirlen;			/* keys dir[] covers */
 	bool		collected;		/* every item a container, one a key: an
 								 * intersection lion_sources_collect() made */
+	MemoryContext unioncxt;		/* a range's union in memory: the context
+								 * its containers are in, or NULL */
 
 	/*
 	 * A participant's view of a copy in dynamic shared memory
@@ -868,6 +883,16 @@ struct LionVisCache
 	 * relation it names; a reset leaves it alone.
 	 */
 	LionRowFilter *filter;
+
+	/*
+	 * The window of container keys every count of this node execution is
+	 * confined to (lion_vis_cache_set_window()), or windowed false.  It is
+	 * the caller's to set and to lift; a reset leaves it alone, as it leaves
+	 * the filter.
+	 */
+	bool		windowed;
+	uint32		winlo;
+	uint64		winhi;
 
 	/*
 	 * What one count of this node execution leaves the next (DESIGN.md §27,

@@ -407,6 +407,46 @@ lion_explain_partitions(LionCountScanState *st, ExplainState *es)
 }
 
 /*
+ * The partial indexes the count reads (DESIGN.md §45): a partitioned scan's,
+ * whose "Lion Indexes" name no index, on a line of their own; and for any
+ * scan the WHERE clauses their predicates imply, which the plan leaves out,
+ * as core leaves them out of a partial index scan.
+ */
+static void
+lion_explain_partial(LionCountScanState *st, ExplainState *es)
+{
+	StringInfoData buf;
+	ListCell   *lc;
+
+	if (st->plan.partialidx != NIL && st->npart > 0)
+	{
+		initStringInfo(&buf);
+		foreach(lc, st->plan.partialidx)
+		{
+			char	   *name = get_rel_name(lfirst_oid(lc));
+
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, name != NULL ? name : "?");
+		}
+		ExplainPropertyText("Partial Indexes", buf.data, es);
+		pfree(buf.data);
+	}
+	if (st->plan.predimplied != NIL)
+	{
+		initStringInfo(&buf);
+		foreach(lc, st->plan.predimplied)
+		{
+			if (buf.len > 0)
+				appendStringInfoString(&buf, ", ");
+			appendStringInfoString(&buf, strVal(lfirst(lc)));
+		}
+		ExplainPropertyText("Implied by Index Predicate", buf.data, es);
+		pfree(buf.data);
+	}
+}
+
+/*
  * The entry of "Lion Indexes" for the index whose entries drive the count
  * (LION_FLAG_GROUPIDX): the index, what is walked of it - a range's bounds,
  * the column or all of its keys - and the inner index of a pair walked, if
@@ -1042,6 +1082,12 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 {
 	StringInfoData buf;
 
+	/* ... a parallel count's workers' among them (DESIGN.md §10) */
+	int64		workersummaries = (st->ranged != NULL) ?
+		st->ranged->workersummaries : 0;
+	int64		workerrangeprobed = (st->ranged != NULL) ?
+		st->ranged->workerrangeprobed : 0;
+
 	/*
 	 * How the range bounding a sum was evaluated (DESIGN.md §28, "The
 	 * complement"): from the entries it selects ("inside"), from the ones
@@ -1082,22 +1128,23 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	 * they cover, among the Posting Sets Summed.  Only when there were
 	 * any, so that an index without summaries prints what it always did.
 	 */
-	if (st->summaries > 0)
-		ExplainPropertyInteger("Summaries Summed", NULL, st->summaries, es);
+	if (st->summaries + workersummaries > 0)
+		ExplainPropertyInteger("Summaries Summed", NULL,
+							   st->summaries + workersummaries, es);
 
 	/*
 	 * Of those sums, the walks that were probed at the other sources'
 	 * rows rather than counted a set at a time (DESIGN.md §32, "Summed
 	 * ranges: dense and probed").  Only when there were any.
 	 */
-	if (st->rangeprobed > 0)
-		ExplainPropertyInteger("Range Walks Probed", NULL, st->rangeprobed,
-							   es);
+	if (st->rangeprobed + workerrangeprobed > 0)
+		ExplainPropertyInteger("Range Walks Probed", NULL,
+							   st->rangeprobed + workerrangeprobed, es);
 
 	/*
-	 * The ranges taken as sources (DESIGN.md §32): collected into memory,
-	 * or - too large for it - summed over their walk at every count they
-	 * are part of.  Again only when there were any.
+	 * The ranges taken as sources (DESIGN.md §32): collected, or - too large
+	 * for the memory, where the plan walks those - summed over their walk at
+	 * every count they are part of.  Again only when there were any.
 	 */
 	if (st->rangesrc_collected > 0)
 		ExplainPropertyInteger("Range Sources Collected", NULL,
@@ -1106,8 +1153,7 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Range Sources Walked", NULL,
 							   st->rangesrc_walked, es);
 	/*
-	 * ... and of the collected, those spilled to a file: an OR's leaf, or a
-	 * range beside the decoded walk
+	 * ... and of the collected, those spilled to a file, past the memory
 	 */
 	if (st->rangesrc_spilled > 0)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,
@@ -1196,7 +1242,8 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * counted (DESIGN.md §10, "A GROUP BY in parallel"), the leader's and
 	 * its workers' - each range a WHERE collected and a walk of the
 	 * entries - which is every range of the cut, whichever participants
-	 * took them.
+	 * took them; of a parallel count (§10, "A count in parallel"), each
+	 * range of each run's count.
 	 */
 	if (rs != NULL)
 		ExplainPropertyInteger("Key Ranges", NULL,
@@ -1207,8 +1254,11 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * (DESIGN.md §15, "A list too long to locate at once").  Only when
 	 * there were any.
 	 */
-	if (st->lbatch != NULL && st->lbatch->batches > 0)
-		ExplainPropertyInteger("List Batches", NULL, st->lbatch->batches, es);
+	if (st->lbatch != NULL &&
+		st->lbatch->batches + (rs != NULL ? rs->workerlistbatches : 0) > 0)
+		ExplainPropertyInteger("List Batches", NULL,
+							   st->lbatch->batches +
+							   (rs != NULL ? rs->workerlistbatches : 0), es);
 
 	/*
 	 * The existence (or count) tests a count(DISTINCT k) made: one per
@@ -1492,6 +1542,7 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 		lion_explain_partitions(st, es);
 
 	lion_explain_indexes(st, ancestors, es);
+	lion_explain_partial(st, es);
 
 	/*
 	 * The residual clauses (DESIGN.md §10, "Residual clauses"), tested on the

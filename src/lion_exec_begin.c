@@ -799,6 +799,8 @@ lion_begin_list_batch(LionCountScanState *st, EState *estate)
 	lb = (LionListBatch *) MemoryContextAllocZero(estate->es_query_cxt,
 												  sizeof(LionListBatch));
 	lb->item = -1;
+	lb->part = 0;
+	lb->nparts = 1;				/* every batch, but in a parallel range */
 	st->lbatch = lb;
 }
 
@@ -1138,6 +1140,7 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 		LionClauseState *cl = &st->clause[i];
 
 		cl->kind = priv->clause[i].kind;
+		cl->walk = priv->clause[i].walk;
 		cl->idxoid = priv->clause[i].idxoid;
 		cl->attno = priv->clause[i].attno;
 		cl->opno = priv->clause[i].opno;
@@ -1495,8 +1498,8 @@ lion_begin_fact_group(LionCountScanState *st, const LionCountPriv *priv,
 }
 
 /*
- * What a run starts from, and the one shape of a parallel GROUP BY, whose
- * ranges are handed out as it runs.
+ * What a run starts from, and the state of a parallel GROUP BY or count,
+ * whose ranges are handed out as it runs.
  */
 static void
 lion_begin_run_state(LionCountScanState *st, CustomScan *cscan,
@@ -1509,8 +1512,9 @@ lion_begin_run_state(LionCountScanState *st, CustomScan *cscan,
 
 	/*
 	 * A parallel-aware node that is no join is a parallel GROUP BY (DESIGN.md
-	 * §10, "A GROUP BY in parallel"), which the planner offers for one shape
-	 * alone: one column's entries walked whole, over one table
+	 * §10, "A GROUP BY in parallel") - one column's entries walked whole,
+	 * over one table - or a parallel count of one row (§10, "A count in
+	 * parallel"), both counted by ranges of container keys
 	 * (lion_count_priv_check()).  Its state is there only then - in the
 	 * leader and in every worker, whose begin comes before the Gather's
 	 * shared memory is set up or attached to.
