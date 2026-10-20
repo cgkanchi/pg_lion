@@ -20,7 +20,7 @@
 /* One process's accumulator for every key column of one index. */
 typedef struct LionSpool LionSpool;
 
-/* The leader's view of the participants' output in a parallel build. */
+/* One column of the participants' output in a parallel build. */
 typedef struct LionSpoolReader LionSpoolReader;
 
 /*
@@ -61,12 +61,12 @@ extern void lion_spool_group_positions(const LionSpoolGroup *group,
 
 /*
  * membytes is what the accumulators of all the columns may use together.  A
- * parallel participant passes the build's shared fileset and a file number no
- * other participant uses; a serial build passes NULL and spills to a private
- * temporary file.
+ * parallel participant passes the build's shared fileset and the first of
+ * ncolumns file numbers no other participant uses, one per column; a serial
+ * build passes NULL and spills to private temporary files.
  */
 extern LionSpool *lion_spool_begin(LionIndexState *ix, Size membytes,
-								   SharedFileSet *fileset, int filenum);
+								   SharedFileSet *fileset, int firstfile);
 extern void lion_spool_add(LionSpool *spool, ItemPointer tid, Datum *values,
 						   bool *isnull);
 extern double lion_spool_ntids(const LionSpool *spool);
@@ -111,24 +111,29 @@ extern void lion_spool_emit_column(LionSpool *spool, int col,
 								   LionSpoolEmit emit, void *arg,
 								   Size reserve);
 
-/* Parallel participant: every column's entries, to one tape for the leader. */
-extern void lion_spool_export(LionSpool *spool, TapeShare *share);
+/*
+ * Parallel participant: each column's entries, to a tape of its own for
+ * whoever writes the column; column c's is in file firstfile + c, and
+ * blocks[c] is the file's size.
+ */
+extern void lion_spool_export(LionSpool *spool, TapeShare *shares,
+							  int64 *blocks);
 
 extern void lion_spool_end(LionSpool *spool);
 
 /*
- * Parallel leader: the participants' tapes, which filenums[] and shares[]
- * name, merged one column at a time in membytes, reserve as above.
+ * Parallel build: the participants' tapes of one column, which filenums[]
+ * and shares[] name, merged in membytes, reserve as above.
  */
-extern LionSpoolReader *lion_spool_reader_begin(LionIndexState *ix,
+extern LionSpoolReader *lion_spool_reader_begin(LionIndexState *ix, int col,
 												SharedFileSet *fileset,
 												int nparticipants,
 												const int *filenums,
 												TapeShare *shares,
 												Size membytes);
-extern void lion_spool_reader_emit_column(LionSpoolReader *reader, int col,
-										  LionSpoolEmit emit, void *arg,
-										  Size reserve);
+extern void lion_spool_reader_emit(LionSpoolReader *reader,
+								   LionSpoolEmit emit, void *arg,
+								   Size reserve);
 extern void lion_spool_reader_end(LionSpoolReader *reader);
 
 #endif							/* LION_SPOOL_H */
