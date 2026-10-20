@@ -118,8 +118,7 @@ VACUUM (FREEZE, ANALYZE) ip;
 /* Force the node wherever it has a path, so that every answer is its own. */
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 -- ---- implied by every partition counted ----------------------------------
 /*
  * kind = 'a' leaves the two sub-partitions of ip_a, whose own bounds are on
@@ -708,8 +707,7 @@ SELECT lion_ip($q$SELECT x, count(*) FROM ip WHERE ((kind = 'a' AND tags && '{x1
 
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 DROP TABLE ip;
 DROP FUNCTION lion_ip(text);
 DROP FUNCTION lion_ipplan(text);

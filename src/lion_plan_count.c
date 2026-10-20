@@ -103,6 +103,7 @@ lion_add_parallel_group_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_private = lion_count_priv_encode(&priv,
 												   LION_PRIV_STAGE_PATH);
 	cpath->methods = serial->methods;
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
 
 	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
 										 partialtarget, NULL, &totalrows);
@@ -245,6 +246,7 @@ lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 	cpath->custom_private = lion_count_priv_encode(&priv,
 												   LION_PRIV_STAGE_PATH);
 	cpath->methods = serial->methods;
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
 
 	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
 										 partialtarget, NULL, &totalrows);
@@ -4232,6 +4234,13 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 										   cpath->path.total_cost);
 		}
 	}
+
+	/*
+	 * The node answers from its indexes without reading the rows it counts,
+	 * as an index-only scan does: core's switches for those disable it (and
+	 * the parallel form below, which prices itself from serialrun).
+	 */
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
 
 	/*
 	 * A partitioned GROUP BY produces partial aggregates, so what goes into

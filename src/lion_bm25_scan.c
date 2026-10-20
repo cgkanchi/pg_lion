@@ -23,13 +23,13 @@
  * each row.
  *
  * The order is only claimed when the walk's candidates hold every row the
- * scan may return: rows the WHERE keeps all match q2, and a row that matches
- * q2 has one of q2's lexemes not under a NOT unless an empty document
- * matches q2 too - a tsquery is monotone in its operands once its NOTs are
- * pushed down to them.  So the scan is offered when q2 does not match an
- * empty document and every such lexeme of q2 is one of q's: a row with none
- * of q's lexemes scores 0 and would be missing from the walk, but such a row
- * fails the WHERE.  q2 is usually q itself.
+ * scan may return: rows the WHERE keeps all match q2, and the walk reads the
+ * rows that have one of q's lexemes.  So the scan is offered when no
+ * document without q's lexemes can match q2: q2 evaluated with each of q's
+ * lexemes absent and every other operand unknown comes out false
+ * (lion_bm25_where_covered()).  A row with none of q's lexemes scores 0 and
+ * would be missing from the walk, but such a row fails the WHERE.  q2 is
+ * usually q itself, or narrower: `tsv @@ 'w1 & w2'` under a score of 'w1'.
  *
  * The scan asks the walk for the best L rows - the LIMIT and 16 more when
  * the planner knows the LIMIT, else 64 - fetches them best first under the
@@ -73,6 +73,7 @@
 #include "optimizer/paths.h"
 #include "optimizer/prep.h"
 #include "optimizer/restrictinfo.h"
+#include "pgstat.h"
 #include "tsearch/ts_utils.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -126,6 +127,7 @@ typedef struct LionBm25ScanState
 	int64		L;				/* what the last walk was asked for; 0: none */
 	int64		seen;			/* the rows the walks have given, added up */
 	bool		last;			/* that walk was the last one */
+	bool		counted;		/* this scan is in pg_stat_user_indexes */
 	TupleTableSlot *heapslot;	/* the table's row, fetched */
 	int			natts;			/* the scan tuple's columns */
 	AttrNumber *attnos;			/* each one's table column; the score: none */
@@ -331,52 +333,59 @@ lion_bm25_order_score(PlannerInfo *root)
 	return NULL;
 }
 
-static TSTernaryValue
-lion_bm25_absent(void *arg, QueryOperand *val, ExecPhraseData *data)
+/* The WHERE's tsquery, and q's lexemes, for lion_bm25_without_q(). */
+typedef struct LionBm25Cover
 {
-	return TS_NO;
+	char	   *operands;
+	List	   *qlexemes;
+} LionBm25Cover;
+
+/*
+ * An operand of the WHERE's tsquery in a document that has none of q's
+ * lexemes: absent when it is filed under the key of one of them (a long
+ * lexeme under its hashed key, as qlexemes are), and unknown otherwise -
+ * another lexeme, or a prefix, which may stand for lexemes q does not have.
+ */
+static TSTernaryValue
+lion_bm25_without_q(void *arg, QueryOperand *val, ExecPhraseData *data)
+{
+	LionBm25Cover *cover = (LionBm25Cover *) arg;
+	text	   *w;
+	ListCell   *lc;
+
+	if (val->prefix)
+		return TS_MAYBE;
+	w = lion_lexeme_key(cover->operands + val->distance, val->length, NULL);
+	foreach(lc, cover->qlexemes)
+	{
+		text	   *t = (text *) lfirst(lc);
+
+		if (VARSIZE_ANY_EXHDR(t) == VARSIZE_ANY_EXHDR(w) &&
+			memcmp(VARDATA_ANY(t), VARDATA_ANY(w),
+				   VARSIZE_ANY_EXHDR(w)) == 0)
+			return TS_NO;
+	}
+	return TS_MAYBE;
 }
 
 /*
- * Does every row matching where have one of q's lexemes (the header)?  Its
- * lexemes not under a NOT all q's, no prefix among its operands, and an
- * empty document not matching it.
+ * Does every row matching where have one of q's lexemes (the header)?  The
+ * WHERE is evaluated in ternary logic over a document with none of them and
+ * anything else: TS_execute() is false only where the answer is no whatever
+ * the unknown operands are, NOT and phrases included.  An empty document is
+ * one such document, so a WHERE that matches it is not covered.
  */
 static bool
 lion_bm25_where_covered(TSQuery where, List *qlexemes)
 {
-	bool		prefix;
-	List	   *wl;
-	ListCell   *lc;
+	LionBm25Cover cover;
 
 	if (where->size == 0)
 		return false;
-	wl = lion_bm25_lexemes(where, &prefix);
-	if (prefix || wl == NIL)
-		return false;
-	foreach(lc, wl)
-	{
-		text	   *w = (text *) lfirst(lc);
-		ListCell   *lc2;
-		bool		found = false;
-
-		foreach(lc2, qlexemes)
-		{
-			text	   *t = (text *) lfirst(lc2);
-
-			if (VARSIZE_ANY_EXHDR(t) == VARSIZE_ANY_EXHDR(w) &&
-				memcmp(VARDATA_ANY(t), VARDATA_ANY(w),
-					   VARSIZE_ANY_EXHDR(w)) == 0)
-			{
-				found = true;
-				break;
-			}
-		}
-		if (!found)
-			return false;
-	}
-	return !TS_execute(GETQUERY(where), NULL, TS_EXEC_EMPTY,
-					   lion_bm25_absent);
+	cover.operands = GETOPERAND(where);
+	cover.qlexemes = qlexemes;
+	return !TS_execute(GETQUERY(where), &cover, TS_EXEC_EMPTY,
+					   lion_bm25_without_q);
 }
 
 /*
@@ -574,6 +583,8 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	priv.attno = attno;
 	cp->custom_private = lion_bm25_priv_encode(&priv);
 	cp->methods = &lion_bm25_path_methods;
+	/* a walk of the index that fetches each row, as an index scan is */
+	lion_path_core_switches(&cp->path, LION_CORE_INDEXSCAN);
 	add_path(rel, &cp->path);
 }
 
@@ -687,13 +698,6 @@ lion_bm25_begin(CustomScanState *node, EState *estate, int eflags)
 	lion_check_table_am(node->ss.ss_currentRelation);
 	st->heapslot = table_slot_create(node->ss.ss_currentRelation,
 									 &estate->es_tupleTable);
-
-	/*
-	 * The relation-level predicate lock index_beginscan() takes for an AM
-	 * without ampredlocks, before the index is read, so that a SERIALIZABLE
-	 * search that finds nothing is covered too.
-	 */
-	lion_reader_lock(st->index, estate->es_snapshot);
 	st->valid = lion_bm25_prepare(st->index, (AttrNumber) priv.attno,
 								  st->query, st->k1, st->b, &st->q);
 }
@@ -744,6 +748,13 @@ lion_bm25_next(ScanState *ss)
 	Snapshot	snapshot = ss->ps.state->es_snapshot;
 	TupleTableSlot *slot = ss->ss_ScanTupleSlot;
 
+	/* a scan of the index, once per scan or rescan, as core counts one */
+	if (!st->counted)
+	{
+		pgstat_count_index_scan(st->index);
+		st->counted = true;
+	}
+
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -758,6 +769,7 @@ lion_bm25_next(ScanState *ss)
 			if (!table_tuple_fetch_row_version(heap, &tid, snapshot,
 											   st->heapslot))
 				continue;
+			pgstat_count_heap_fetch(st->index);
 			return lion_bm25_store(st, c->score);
 		}
 		if (!st->valid || st->last)
@@ -782,6 +794,7 @@ lion_bm25_next(ScanState *ss)
 									   have_after ? &after : NULL, st->best);
 		}
 		lion_bm25_sort(st->best, st->nbest);
+		pgstat_count_index_tuples(st->index, st->nbest);
 		st->next = 0;
 		st->seen += st->nbest;
 		if (st->nbest < st->L)
@@ -825,6 +838,7 @@ lion_bm25_rescan(CustomScanState *node)
 	st->L = 0;
 	st->seen = 0;
 	st->last = false;
+	st->counted = false;
 }
 
 static void

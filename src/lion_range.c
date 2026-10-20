@@ -251,8 +251,10 @@ lion_range_fails_upper(LionRange *range, const LionEntryTuple *entry)
  * it lands on is the first one whose proc 4 is not below the bound.  The walk
  * that starts there re-reads the leaf with nothing held in between, which is
  * safe for the reason every resumed entry scan is: a split moves entries only
- * rightwards, onto a page the walk has yet to reach, and a directory leaf is
- * never unlinked (§21).
+ * rightwards, onto a page the walk has yet to reach, and a leaf VACUUM takes
+ * out of the tree meanwhile keeps its right link, has a MINUS INFINITY high
+ * key and is not reused while the scan's snapshot lasts (§21, "Page
+ * deletion").
  *
  * The item is what puts the landings of SEVERAL bounds in order
  * (lion_cmp_entries(), the directory order itself), which is how a walk finds
@@ -281,6 +283,14 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 
 	buf = lion_dir_search(index, NULL, range->state->ix, &sk,
 						  BUFFER_LOCK_SHARE, false, &off);
+
+	/*
+	 * SERIALIZABLE (§9): the leaf the bound lands on, and every leaf passed
+	 * over to the right of it, owns keys at the range's edge that an insert
+	 * could add, and the walk that starts at the leaf this returns may never
+	 * read them.
+	 */
+	lion_reader_lock_page(index, BufferGetBlockNumber(buf));
 	lion_rightwalk_init(&walk);
 	for (;;)
 	{
@@ -305,6 +315,7 @@ lion_range_landing(Relation index, LionRange *range, int bound, int kind,
 			break;
 		}
 		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
+		lion_reader_lock_page(index, BufferGetBlockNumber(buf));
 		off = lion_page_first_data(BufferGetPage(buf));
 	}
 	blk = BufferGetBlockNumber(buf);
@@ -1241,6 +1252,15 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 			 es->blkno);
 	}
 
+	/*
+	 * SERIALIZABLE (§9): a walk that takes entries locks every leaf it reads,
+	 * and (below) the root of every CHAIN entry it takes.  One that only
+	 * counts them, to choose a plan (lion_entry_scan_skip_leaf()), reads no
+	 * answer.
+	 */
+	if (copy)
+		lion_reader_lock_page(es->index, es->blkno);
+
 	if (es->resumekind >= 0)
 	{
 		/*
@@ -1330,6 +1350,13 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 			continue;
 		}
 		last = entry;
+
+		/*
+		 * Locked before the counters below are believed: an insert into an
+		 * empty CHAIN set checks its root.
+		 */
+		if (copy)
+			lion_reader_lock_entry(es->index, es->blkno, entry);
 
 		/*
 		 * An entry whose posting set is empty can never produce a group.

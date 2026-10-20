@@ -415,9 +415,16 @@ SELECT lion_ktc($$lion_index_count('lion_kt_v_k', 3, 'lion_kt_v_v', 'v3'::varcha
  ok 200
 (1 row)
 
--- a cast FUNCTION is not taken (§21): bpchar to text is rtrim1()
-SELECT lion_index_count('lion_kt_v_t', 'v3'::bpchar);
-ERROR:  type character cannot be compared with index "lion_kt_v_t"
+-- a cast function on the KEY is taken where `col = key` takes it: `t =
+-- 'v3 '::bpchar` is `text = text` with the key cast by rtrim1(); one on the
+-- column is not, and there is no `int4 = varchar` at all
+SELECT lion_ktc($$lion_index_count('lion_kt_v_t', 'v3 '::bpchar)$$,
+				$$FROM lion_kt_v WHERE t = 'v3 '::bpchar$$);
+ lion_ktc 
+----------
+ ok 200
+(1 row)
+
 SELECT lion_index_count('lion_kt_v_k', 'v3'::varchar);
 ERROR:  type character varying cannot be compared with index "lion_kt_v_k"
 -- and a binary coercion only where `col = key` makes it.  text is binary-

@@ -1749,6 +1749,10 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	 */
 	ResetExprContext(econtext);
 
+	/* rows counted from the relation's indexes (lion_count_report_reads()) */
+	if (st->heap != NULL)
+		st->statrows += count;
+
 	/*
 	 * The anti join over a small inner side (DESIGN.md §27): the count less
 	 * the rows of the group some inner row matches - and a group left with

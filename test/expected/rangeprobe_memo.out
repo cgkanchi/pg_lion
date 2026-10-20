@@ -4,8 +4,7 @@
 -- Core's probe marks the btree entries whose rows it finds dead, and the next
 -- plan skips them; a posting set has nothing to mark, so an end whose newest
 -- rows were deleted in bulk was walked to the probe's bounds - a hundred
--- directory leaves here - by every plan until the next VACUUM, and after it
--- too while the emptied leaves were more than the bound.  The probe now
+-- directory leaves here - by every plan until the next VACUUM.  The probe now
 -- remembers that it found nothing until the table or the index has changed.
 --
 -- 1500 rows analyzed, then 38,500 newer ones.  The index is on the one
@@ -58,11 +57,11 @@ VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_est (step text, est bigint);
 INSERT INTO lpm_est
 	SELECT 'probed', lpm_rows($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
--- The newest 25,000 keys go, and VACUUM empties their leaves, some 190: more
--- than the probe reads.  The first plan reads a hundred of them and gives up;
--- the next one reads none.
+-- The newest 25,000 keys go, some 190 leaves of them: more than the probe
+-- reads.  Until a VACUUM takes their entries and their leaves away the probe
+-- finds only dead rows there; the first plan reads a hundred leaves of them
+-- and gives up, and the next one reads none.
 DELETE FROM lpm WHERE id > 15000;
-VACUUM (FREEZE) lpm;
 CREATE TABLE lpm_io (step text, bufs bigint);
 INSERT INTO lpm_io
 	SELECT 'first', lpm_bufs($$SELECT * FROM lpm WHERE ts >= '2026-01-10'$$);
