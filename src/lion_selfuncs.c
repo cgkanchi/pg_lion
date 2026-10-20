@@ -1728,7 +1728,8 @@ lion_or_list_paths(PlannerInfo *root, RelOptInfo *rel, List *lionidx)
  *	  up, and what the run measured of a part of the conjunction stands
  *	  (lion_isect_part_factor()), or core's estimate where it measured none;
  *	  LION_ISECT_RUN_PROBES probes a planner run, each conjunction measured
- *	  once in it;
+ *	  once in it, by whichever lion index of its table answers it first
+ *	  (LionIsect);
  *	- a sample in which fewer than LION_ISECT_MIN_HITS containers kept a row
  *	  of the AND raises an estimate no further than the rows of it the sample
  *	  met, or than the longest part of the AND that enough containers did
@@ -1875,17 +1876,30 @@ bool		lion_enable_rows_correction = true;
 typedef struct LionIsectClause
 {
 	AttrNumber	col;			/* the index's key column, 1-based */
+	AttrNumber	attno;			/* ... its table's column, 0 for an
+								 * expression */
 	Node	   *clause;			/* as the caller has it */
 	ScanKeyData skey;			/* ... as the scan's key */
 	Selectivity sel;			/* core's selectivity of it */
 } LionIsectClause;
 
-/* A conjunction measured in this planner run, and what it came to. */
+/*
+ * A conjunction measured in this planner run, and what it came to.  It is the
+ * table's, not an index's: its clauses are matched by the table's columns, so
+ * that every lion index of the table that answers the same clauses takes the
+ * one measurement, whichever of them asked first - the share of the rows an
+ * AND keeps is the heap's, and each index holds the same TIDs.  Measured
+ * again for each index, the run's budget and its LION_ISECT_RUN_PROBES would
+ * run out on the second or the third, which would keep core's estimate: the
+ * relation's rows (lion_isect_rel_factor(), from one of its indexes) and the
+ * path of that index (lioncostestimate(), from its own) would disagree, and
+ * that path, priced for core's product, would be taken for it.
+ */
 typedef struct LionIsect
 {
-	Oid			indexoid;
+	Oid			relid;			/* the table */
 	int			n;
-	AttrNumber *cols;
+	AttrNumber *attnos;			/* the table's column of each clause */
 	Node	  **clauses;		/* bare, in the cache's memory */
 	double		factor;			/* core's estimate is multiplied by it */
 	bool		measured;		/* by a probe of its own, or taken from a
@@ -3000,16 +3014,19 @@ lion_isect_readable(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	return true;
 }
 
-/* Is the cached conjunction e this one: the same clauses, in any order? */
+/*
+ * Is the cached conjunction e this one: the same clauses of table relid, in
+ * any order, on any of its lion indexes?
+ */
 static bool
-lion_isect_same(LionIsect *e, IndexOptInfo *idx, int n, LionIsectClause *cl)
+lion_isect_same(LionIsect *e, Oid relid, int n, LionIsectClause *cl)
 {
 	bool	   *used;
 	bool		same = true;
 	int			i;
 	int			j;
 
-	if (e->indexoid != idx->indexoid || e->n != n)
+	if (e->relid != relid || e->n != n)
 		return false;
 	used = (bool *) palloc0(sizeof(bool) * n);
 	for (i = 0; i < n && same; i++)
@@ -3019,7 +3036,7 @@ lion_isect_same(LionIsect *e, IndexOptInfo *idx, int n, LionIsectClause *cl)
 		same = false;
 		for (j = 0; j < n && !same; j++)
 		{
-			if (!used[j] && e->cols[j] == cl[i].col &&
+			if (!used[j] && e->attnos[j] == cl[i].attno &&
 				equal(e->clauses[j], bare))
 				used[j] = same = true;
 		}
@@ -3028,7 +3045,7 @@ lion_isect_same(LionIsect *e, IndexOptInfo *idx, int n, LionIsectClause *cl)
 	return same;
 }
 
-/* Is every clause of e among the n clauses cl (on e's index)? */
+/* Is every clause of e among the n clauses cl (of e's table)? */
 static bool
 lion_isect_holds(LionIsect *e, int n, LionIsectClause *cl)
 {
@@ -3040,7 +3057,7 @@ lion_isect_holds(LionIsect *e, int n, LionIsectClause *cl)
 		bool		found = false;
 
 		for (i = 0; i < n && !found; i++)
-			found = (cl[i].col == e->cols[j] &&
+			found = (cl[i].attno == e->attnos[j] &&
 					 equal(lion_isect_bare(cl[i].clause), e->clauses[j]));
 		if (!found)
 			return false;
@@ -3060,7 +3077,7 @@ lion_isect_within(LionIsect *e, int n, LionIsectClause *cl)
 		bool		found = false;
 
 		for (j = 0; j < e->n && !found; j++)
-			found = (cl[i].col == e->cols[j] &&
+			found = (cl[i].attno == e->attnos[j] &&
 					 equal(lion_isect_bare(cl[i].clause), e->clauses[j]));
 		if (!found)
 			return false;
@@ -3070,20 +3087,20 @@ lion_isect_within(LionIsect *e, int n, LionIsectClause *cl)
 
 /*
  * What a conjunction the run could not measure is taken to be, from the ones
- * it did measure on the same index: between the largest of them that is a
- * part of it and the smallest it is a part of, geometrically in the number of
- * clauses - the factor that grows from the part's to the whole's as clauses
- * are added, each clause its share of it.  With a part only, the part's: its
- * other clauses independent of those, as core takes them and as the probe's
- * factor takes a range or a clause it has no value for (lion_isect_factor());
- * with a whole only, from 1 at one clause; with neither, 1.  A filter's
- * conjunction and the ones its paths answer share most of their clauses: on
- * the repro of DESIGN.md §29.11, "Wide filters", the five clauses beside four
- * lists measured 3.1, all nine 186, and the five with one list 9.1, where this
- * says 8.6.
+ * it did measure of the same table (relid), on any of its lion indexes:
+ * between the largest of them that is a part of it and the smallest it is a
+ * part of, geometrically in the number of clauses - the factor that grows
+ * from the part's to the whole's as clauses are added, each clause its share
+ * of it.  With a part only, the part's: its other clauses independent of
+ * those, as core takes them and as the probe's factor takes a range or a
+ * clause it has no value for (lion_isect_factor()); with a whole only, from 1
+ * at one clause; with neither, 1.  A filter's conjunction and the ones its
+ * paths answer share most of their clauses: on the repro of DESIGN.md
+ * §29.11, "Wide filters", the five clauses beside four lists measured 3.1,
+ * all nine 186, and the five with one list 9.1, where this says 8.6.
  */
 static double
-lion_isect_part_factor(LionProbeCache *cache, IndexOptInfo *idx, int n,
+lion_isect_part_factor(LionProbeCache *cache, Oid relid, int n,
 					   LionIsectClause *cl)
 {
 	LionIsect  *part = NULL;
@@ -3096,7 +3113,7 @@ lion_isect_part_factor(LionProbeCache *cache, IndexOptInfo *idx, int n,
 	{
 		LionIsect  *e = (LionIsect *) lfirst(lc);
 
-		if (!e->measured || e->indexoid != idx->indexoid)
+		if (!e->measured || e->relid != relid)
 			continue;
 		if (e->n < n && (part == NULL || e->n > part->n) &&
 			lion_isect_holds(e, n, cl))
@@ -3252,24 +3269,25 @@ lion_isect_core_sel(PlannerInfo *root, const LionIsectClause *cl,
 }
 
 /*
- * Remember a conjunction of this run - the n clauses cl[], bare copies in
- * the cache's memory - and what its estimate is to be multiplied by.
+ * Remember a conjunction of this run - the n clauses cl[] of table relid,
+ * bare copies in the cache's memory - and what its estimate is to be
+ * multiplied by.
  */
 static LionIsect *
-lion_isect_remember(LionProbeCache *cache, IndexOptInfo *idx, int n,
+lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
 					const LionIsectClause *cl, double factor, bool measured)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(cache->cxt);
 	LionIsect  *e = (LionIsect *) palloc(sizeof(LionIsect));
 	int			i;
 
-	e->indexoid = idx->indexoid;
+	e->relid = relid;
 	e->n = n;
-	e->cols = (AttrNumber *) palloc(sizeof(AttrNumber) * n);
+	e->attnos = (AttrNumber *) palloc(sizeof(AttrNumber) * n);
 	e->clauses = (Node **) palloc(sizeof(Node *) * n);
 	for (i = 0; i < n; i++)
 	{
-		e->cols[i] = cl[i].col;
+		e->attnos[i] = cl[i].attno;
 		e->clauses[i] = (Node *) copyObject(lion_isect_bare(cl[i].clause));
 	}
 	e->factor = factor;
@@ -3299,6 +3317,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				 LionProbeCache *cache, int ncl, LionIsectClause *cl,
 				 Selectivity coresel, Selectivity minsel)
 {
+	Oid			relid = planner_rt_fetch(rel->relid, root)->relid;
 	LionIsectClause *mcl = (LionIsectClause *) palloc(sizeof(LionIsectClause) * ncl);
 	bool	   *used = (bool *) palloc0(sizeof(bool) * ncl);
 	LionIsectResult res;
@@ -3327,7 +3346,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		/* nothing the run has left can measure: remembered as nothing */
 		pfree(mcl);
 		pfree(used);
-		return lion_isect_part_factor(cache, idx, ncl, cl);
+		return lion_isect_part_factor(cache, relid, ncl, cl);
 	}
 	cache->nisectprobes++;
 	measured = lion_isect_measure(rel, idx, m, mcl, left, used, &res);
@@ -3425,7 +3444,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			factor = probesel / msel;
 	}
 	else
-		factor = lion_isect_part_factor(cache, idx, ncl, cl);
+		factor = lion_isect_part_factor(cache, relid, ncl, cl);
 
 	elog(DEBUG2, "lion: intersection probe's factor for %d clauses: %.6g, %s%s; %d of them measured, core's estimate of those %.6g, the probe's %.6g",
 		 ncl, factor,
@@ -3436,7 +3455,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 measured ? nused : 0, measured ? msel : coresel,
 		 measured ? probesel : -1.0);
 
-	(void) lion_isect_remember(cache, idx, ncl, cl, factor,
+	(void) lion_isect_remember(cache, relid, ncl, cl, factor,
 							   measured && nused == ncl);
 
 	/* ... and the part measured, when it is not the whole */
@@ -3454,11 +3473,11 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		}
 		foreach(lc, cache->isects)
 		{
-			if (lion_isect_same((LionIsect *) lfirst(lc), idx, nused, pcl))
+			if (lion_isect_same((LionIsect *) lfirst(lc), relid, nused, pcl))
 				known = true;
 		}
 		if (!known)
-			(void) lion_isect_remember(cache, idx, nused, pcl, factor, true);
+			(void) lion_isect_remember(cache, relid, nused, pcl, factor, true);
 		pfree(pcl);
 	}
 	if (res.part != NULL)
@@ -3572,6 +3591,7 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			canon = list;
 		}
 		cl[ncl].col = cols[i];
+		cl[ncl].attno = idx->indexkeys[cols[i] - 1];
 		cl[ncl].clause = (canon == lion_isect_bare(clauses[i])) ?
 			clauses[i] : canon;
 		cl[ncl].sel = clause_selectivity(root, cl[ncl].clause, 0, JOIN_INNER,
@@ -3599,7 +3619,7 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	cache = lion_probe_cache_for(root);
 	foreach(lc, cache->isects)
 	{
-		if (lion_isect_same((LionIsect *) lfirst(lc), idx, ncl, cl))
+		if (lion_isect_same((LionIsect *) lfirst(lc), rte->relid, ncl, cl))
 		{
 			e = (LionIsect *) lfirst(lc);
 			break;
@@ -3620,7 +3640,8 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 										 relclauses, false);
 			foreach(lc, cache->isects)
 			{
-				if (lion_isect_same((LionIsect *) lfirst(lc), idx, ncl, cl))
+				if (lion_isect_same((LionIsect *) lfirst(lc), rte->relid,
+									ncl, cl))
 				{
 					e = (LionIsect *) lfirst(lc);
 					break;
@@ -3640,7 +3661,9 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 /*
  * The factor for rel's own restriction clauses: those of them that are set
  * clauses of ONE lion index - the one that has the most, two at least - as
- * the count pushdown ANDs them.
+ * the count pushdown ANDs them.  The measurement is the table's (LionIsect):
+ * the path of another lion index that answers the same clauses takes the
+ * same factor, and so agrees with rel->rows.
  */
 static double
 lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
