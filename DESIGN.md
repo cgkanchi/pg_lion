@@ -15178,17 +15178,17 @@ AND for its own estimates.
 - **What it corrects.** A factor on core's estimate of the same clauses, applied when the probe
   finds it `LION_ISECT_ERROR` (3) times off or more, either way: less is within what ANALYZE's
   per-column estimates and the sample leave of an independent conjunction, and would move plans on
-  noise. Since 2026-10-19 a sample lowers an estimate no further than what it can rule out, and one
-  that met the AND in fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows
-  it met ("What a sample can rule out", below); a count - every container of the driver ANDed -
-  stands as it is. It applies to lion's OWN estimates: the selectivity `lioncostestimate()` returns for a
-  plain or bitmap path - the Bitmap Index Scan's rows, the heap side of both paths, LionOrdered's
-  lion side (§30.3) - and the rows the count pushdown's recheck is priced for
-  (`lion_probe_rel_rows()`, the relation's restriction clauses on the lion index that answers most
-  of them), which since 2026-09-28 are also LionOrdered's rows (§30.3), and the merge's guess of
-  how often the AND's later sources are sought ("Wide filters", below). Whatever else a
-  conjunction holds - a range, a clause without a constant - is taken as independent of them, as
-  core takes it.
+  noise. A sample lowers an estimate no further than what it can rule out, and one that met the AND
+  in fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows it met, or than
+  the longest part of the AND that enough of them met says ("What a sample can rule out", "Wide
+  lists", below); a count - every container of the driver ANDed - stands as it is. It applies to
+  lion's OWN estimates: the selectivity `lioncostestimate()` returns for a plain or bitmap path -
+  the Bitmap Index Scan's rows, the heap side of both paths, LionOrdered's lion side (§30.3) - and
+  the rows the count pushdown's recheck is priced for (`lion_probe_rel_rows()`, the relation's
+  restriction clauses on the lion index that answers most of them), which since 2026-09-28 are
+  also LionOrdered's rows (§30.3), and the merge's guess of how often the AND's later sources are
+  sought ("Wide filters", below). Whatever else a conjunction holds - a range, a clause without a
+  constant - is taken as independent of them, as core takes it.
 - **What it leaves.** Every other path's estimate stays core's. `rel->rows` did too until
   2026-10-07, and is now corrected ("The relation's rows", below). Core's own answer to correlated
   columns applies to every path: `CREATE STATISTICS ... (dependencies, mcv)` on them corrects core's
@@ -15205,18 +15205,22 @@ AND for its own estimates.
   alike; a heap path fetches it too. What that misjudges is an AND whose rows were deleted in bulk
   and not yet vacuumed, which is measured as still there until VACUUM - where the endpoint probe,
   which stakes an estimate on one key at one end, must and does test liveness.
-- **Bounded.** At most `LION_ISECT_KEYS` (32) driver containers, fewer when the clauses locate
-  many sets - `LION_ISECT_SEEKS` (128) seeks of a set in all, each a descent of a posting tree or a
-  step to the next leaf - down to `LION_ISECT_MIN_KEYS` (8); at most `LION_ISECT_MAX_SETS` (32)
-  sets located; at most `LION_ISECT_RUN_BUFFERS` (1,024) buffer accesses a planner run
-  (`pgBufferUsage`), of which a probe may take what is left - until 2026-09-28 at most 256 a
-  probe, `LION_ISECT_BUFFERS`, "Wide filters" below - past which a probe gives up and core's
-  estimate stands, as it does when the heap has outgrown `rel->pages` twice over; at most
+- **Bounded.** `LION_ISECT_KEYS` (32) driver containers, however many sets the clauses locate, and
+  a probe that cannot afford `LION_ISECT_MIN_KEYS` (8) of them gives up; at most
+  `LION_ISECT_MAX_SETS` (32) sets sought at each, a conjunction of more measured without its widest
+  clauses ("Wide lists", below); and a budget of buffer accesses a planner run (`pgBufferUsage`,
+  `lion_isect_run_budget()`): `LION_ISECT_RUN_BUFFERS` (1,024), and beside it what 32 samples of
+  the widest conjunction the run measures cost at `LION_ISECT_SEEK_BUFFERS` (2) a seek of each of
+  its sets - 2,048 more for 32 sets. A probe may take what the run has left, the relation's own
+  conjunction first; a conjunction that what is left cannot afford eight samples of is measured
+  without its widest clauses, and past that the probe gives up and what the run measured of a part
+  of the conjunction stands (`lion_isect_part_factor()`), or core's estimate where it measured
+  none, as it does when the heap has outgrown `rel->pages` twice over. At most
   `LION_ISECT_RUN_PROBES` (8) probes a planner run, and each conjunction measured once in it
   (cached beside the endpoint probe's ends, per `PlannerGlobal`). The budget is checked before each
   clause is located and each sample taken, so a probe overruns it by one IN list's lookups or one
-  sample's seeks at most: a planner run accesses about 1,000 buffers at worst, the scale of a few
-  endpoint probes (100 heap pages and 100 leaves an end, §28). Since 2026-10-19 the sample by rank
+  sample's seeks at most: a planner run accesses 3,072 buffers and that much more at worst, the
+  scale of a dozen endpoint probes (100 heap pages and 100 leaves an end, §28). The sample by rank
   reads inside the same budget: a driver's walk at most `LION_ISECT_WALK_PAGES` (32) buffers, the
   other sources' presence walks 32 each, a posting tree's separators at most
   `LION_ISECT_SEPARATOR_PAGES` (33) pages ("A sample of the driver's own rows", below).
@@ -15233,7 +15237,7 @@ AND for its own estimates.
   are a small multiple of what it needs, a probe's budget is the dearest probe measured, and a run's
   four of them, where a query measures one or two conjunctions a relation. Planning rose from 0.12
   to 0.74 ms for the 2M-row count and from about 0.17 to 0.3 to 0.5 ms for the test's, every page in
-  shared buffers; on a cold cache the accesses are reads, about 1,000 a planner run at most.
+  shared buffers; on a cold cache the accesses are reads, as many as the run's budget at most.
 
 `test/sql/isectprobe.sql` pins it: five filters derived from one hidden group, whose product is
 two rows for 2,000, estimated at 2,000 with the probe and at 2 without it; a pair of independent
@@ -15263,7 +15267,8 @@ once the paths are built - and it is made to the paths too:
   clauses with its join clauses ANDed in, taken as independent of them, and take the same ratio; a
   `ParamPathInfo` first made after the hook (a reparameterization) has core's.
 - `lion_probe_rel_rows()` then reads `rel->rows` as it is, rather than applying the factor twice;
-  inside a probe scope it recomputes from the clauses, and applies it, as before.
+  inside a probe scope it recomputes from the clauses, and applies it, as before. The factor
+  multiplies core's rows before they are rounded and clamped to one row ("Wide lists", below).
 - A plain relation of its own only: an inheritance parent's rows are its children's sum, added up
   before any child's paths are built, which a child's correction would not reach.
 
@@ -15374,7 +15379,7 @@ estimate at 22 rows for 3,835 - and the probe, as it was, gave up on them:
 - **What a probe could spend.** 256 buffers a probe (`LION_ISECT_BUFFERS`): the locate's 22 (82 on
   a cold cache) and three or four samples, where `LION_ISECT_MIN_KEYS` is eight. The probe gave up
   after 204 to 213 buffers, or, where its strata widened to fit, took four samples and applied what
-  they said. A probe may now take what the run has left of `LION_ISECT_RUN_BUFFERS` (1,024), and
+  they said. A probe may now take what the run has left of its budget (`lion_isect_run_budget()`), and
   gives up as soon as it knows it cannot take `LION_ISECT_MIN_KEYS` samples - after its first -
   leaving what it has not spent to the run's other probes, where it used to read to its budget's end
   first; and it no longer applies a sample of fewer (four containers of a BitmapOr arm, none of which
@@ -15402,23 +15407,24 @@ estimate at 22 rows for 3,835 - and the probe, as it was, gave up on them:
   containers says little of how many there are: on the same table loaded group by group, so that
   each group's rows lie in a stretch of seven container keys, the twenty sets' eight containers met
   the two matching groups' stretches once, and that container stood for its stratum - 79,790 rows
-  for 3,608. The budget of old gave up before it could say so. Now fewer than
-  `LION_ISECT_MIN_HITS` (3) containers that keep a row of the AND raise no estimate - the
-  conjunction counts as not measured - while one that lowers it stands as it always did, and a
-  sample of every container of the heap is a count, not a sample. The stretched table's narrower
-  conjunctions keep the error a stratified sample of such a heap has: five of the clauses at 66,233
-  rows for 11,385, four at 82,389 for 16,279 (93,000 on 991c315). *(2026-10-19: fewer than three
-  such containers now raise the estimate as far as the rows they kept, which are there whatever
-  the rest is, and no further; and a driver whose containers the probe can rank is sampled by rank
-  among its own, or counted, rather than in the heap's strata - "A sample of the driver's own
-  rows" and "What a sample can rule out", below.)*
+  for 3,608. Fewer than `LION_ISECT_MIN_HITS` (3) containers that keep a row of the AND raise the
+  estimate as far as the rows they kept, which are there whatever the rest is, or as far as the
+  longest part of the AND that three of them or more kept a row of says, the rest taken as core
+  takes it and no more of the part's rows than the rows of the AND the sample met allow ("Wide
+  lists", below); one that lowers an estimate lowers it no further than the sample can rule out
+  ("What a sample can rule out", below), and a sample of every container of the heap is a count,
+  not a sample. A driver whose containers the probe can rank is sampled by rank among its own, or
+  counted, rather than in the heap's strata ("A sample of the driver's own rows", below). The
+  stretched table's narrower conjunctions keep the error a stratified sample of such a heap has:
+  five of the clauses at 66,233 rows for 11,385, four at 82,389 for 16,279 (93,000 on 991c315).
 
 After: the twenty sets are measured in 352 buffers (412 on a cold cache), eight samples, at 4,091
 rows for 3,835; the repro's filter widened to thirty-two sets (lists of 8, 8, 6 and 4) in 542 (602
 cold), at 10,570 rows for 10,183. Planning the twenty-set count takes 1.4 ms against 0.2 without the
 probe, every page in shared buffers. The worst case is the run's budget: a probe checks it before it
-locates each clause and before each sample, so a run accesses at most 1,024 buffers and one
-sample's seeks (65 for thirty-two sets) or one list's lookups more, and its eight probes at most.
+locates each clause and before each sample, so a run accesses at most its budget
+(`lion_isect_run_budget()`, up to 3,072 buffers, "Wide lists" below) and one sample's seeks (65
+for thirty-two sets) or one list's lookups more, and its eight probes at most.
 `test/sql/orlist.sql`'s wide filter, twenty sets over 400,000 rows, needs 301 to 326 - past the old
 budget of one probe.
 
@@ -15521,10 +15527,10 @@ conjunctions:
 | uniform | the probe's measure within 0.2%; an empty AND, 1 | within 0.1%; an empty AND, 13 ("What a sample can rule out") | 33 to 212 / 51 to 211 |
 | clustered | the probe's measure within 26% (1 to 12 containers held a row of the AND) | exact: every one counted | 19 to 66 / 19 to 143 |
 
-A probe that runs out of its budget gives up as before, and the walks are inside it
-(`lion_isect_spent()` before each container): a run's probes still access at most
-`LION_ISECT_RUN_BUFFERS` and one sample's seeks. Planning a four-clause count of the batched heap
-takes 0.12 ms against 0.05 without the probe, every page in shared buffers.
+A probe that runs out of its budget gives up, and the walks are inside it (`lion_isect_spent()`
+before each container): a run's probes access at most the run's budget and one sample's seeks.
+Planning a four-clause count of the batched heap takes 0.12 ms against 0.05 without the probe, every
+page in shared buffers.
 
 **What a sample can rule out** (2026-10-19, `lion_isect_take()`, `lion_isect_upper()`,
 `lion_isect_factor_run()`). A sample that met no row of the AND measured it empty, and an empty AND
@@ -15550,10 +15556,11 @@ it is: an AND it finds empty is still one row. Which keeps the empty and the tin
   rules out every container - and stays at one row, as the clustered heap's empty pairs do;
 - on the uniform heap, whose groups share every page, an empty pair met no row in thousands of
   units: 13 rows of 1.2M, not 1, where core said 4,728 to 11,451;
-- and a sample that meets the AND in fewer than `LION_ISECT_MIN_HITS` (3) containers, which raised
-  nothing ("What a few containers can say", above), raises the estimate as far as the rows it met -
-  they are there, whatever the rest is - and no further: before the presence walk counted it, the
-  batched heap's four clauses went from core's 187 to 1,319 to 1,968 for 3,334.
+- and a sample that meets the AND in fewer than `LION_ISECT_MIN_HITS` (3) containers ("What a few
+  containers can say", above) raises the estimate as far as the rows it met - they are there,
+  whatever the rest is - or as the longest part of the AND that enough containers met says ("Wide
+  lists", below), and no further than the sample can rule out: before the presence walk counted
+  it, the batched heap's four clauses went from core's 187 to 1,319 to 1,968 for 3,334.
 
 `test/sql/isectstretch.sql` pins both on 192,000 rows of the batched shape, four sources by twelve
 waves in 93 container keys, sampled whole by ANALYZE: three conjunctions the sample of old
@@ -15561,6 +15568,86 @@ estimated at 1, 1 and 161 rows for 760, 507 and 759 now within a factor of three
 rows with them; a tag only some sources have counted with the probe's presence walk; a source and a
 tag it never has, and one more such, still one row; and the count of four clauses chosen with the
 probe and without it (DESIGN.md §39, "The AM's own scan of the same sets").
+
+**Wide lists** (2026-10-20, `lion_isect_run_budget()`, `lion_isect_measured_part()`,
+`lion_isect_probe()`, `lion_isect_take()`). A filter of several multi-value IN lists on correlated
+columns is the widest conjunction the probe meets: every value of every list is a posting set the
+probe seeks at each container it samples, and the more columns such a filter names, the further
+core's product falls - to a fraction of a row while the filter holds thousands. What the probe does
+with one:
+
+- **The same sample, however many sets.** The probe takes `LION_ISECT_KEYS` (32) of the driver's
+  containers whatever the sets. The wider a filter of correlated columns, the smaller the share of
+  its driver's rows the AND keeps, and the fewer containers hold a row of it: a conjunction whose
+  rows narrow into a quarter of the heap as columns are added is met in about two of
+  `LION_ISECT_MIN_KEYS` (8) containers, too few to measure how many rows it holds, and in about
+  eight of 32. A probe that cannot afford eight samples gives up.
+- **A budget that grows with the sets** (`lion_isect_run_budget()`). A seek of a set at a sampled
+  container costs about two buffer accesses - the strata are many leaves apart, so each is a
+  descent of a two-level posting tree; 1.9 measured over a run, the locate and the driver's own
+  seeks included - so a run's budget is `LION_ISECT_RUN_BUFFERS` (1,024) beside 32 samples of the
+  widest conjunction the run measures at `LION_ISECT_SEEK_BUFFERS` (2) a seek of each of its sets:
+  1,216 for an equality and a list of two values, 3,072 for a conjunction of `LION_ISECT_MAX_SETS`
+  (32). The relation's own conjunction, measured first, then leaves the run's other probes about
+  1,024 whatever its width. A probe checks what the run has left before each clause it locates and
+  each sample, so a run overruns the budget by one sample's seeks or one list's lookups at most; the
+  strata ahead widen (`lion_isect_pass()`) and the ranks ahead thin (`lion_isect_sample_at()`,
+  every k-th of them, evenly) to keep a sample's worth of it to spare.
+- **What is too wide for a probe is measured without its widest clauses**
+  (`lion_isect_measured_part()`). A conjunction of more than 32 sets, or of more than what the run
+  has left affords eight samples of, is measured on the clauses of the fewest sets while their sets
+  fit, the more selective of two of as many first; the clauses left out are taken as independent
+  of the rest, as core takes them. The factor the probe finds for the part - its measure over
+  core's estimate of the part - is the conjunction's, and the part is remembered as measured as
+  well, which is what a wider conjunction of the run interpolates from (`lion_isect_part_factor()`).
+  A list of more than 32 values is never located for the probe (`lion_isect_scankey()`) and is taken
+  so too. Only a conjunction of which not two clauses fit is not measured: what the run measured of
+  its parts stands, or core's estimate.
+- **What a sample that met the AND in few containers says** (`lion_isect_take()`,
+  `lion_isect_probe()`). The AND is made source by source at each sampled container, the driver
+  first and then the sources of fewer rows, and what each prefix of the sources kept is counted
+  beside the whole's, at no seek more. When fewer than `LION_ISECT_MIN_HITS` (3) containers kept a
+  row of the whole AND, the longest prefix that three or more kept a row of is measured: its share
+  of the relation's rows, times the share of it that core's product of the rest of the clauses
+  keeps - and no more of the prefix's rows than the rows of the whole AND the sample met can have
+  come from, at 95% (`lion_isect_upper_count()`). The estimate is raised as far as that or the rows
+  of the AND the sample met, whichever is more, never past what the sample can rule out
+  (`lion_isect_upper()`) nor past the smallest clause's own; less than `LION_ISECT_ERROR` times
+  core's is no measure. A rest whose rows lie away from the prefix's - which core's product cannot
+  see either - raises nothing. An estimate is lowered no further than the sample can rule out
+  ("What a sample can rule out", above).
+- **The relation's rows** (`lion_probe_rel_rows()`). The factor multiplies core's rows before they
+  are rounded and clamped to one: where core's product is a fraction of a row, `rel->rows`, one,
+  times the factor measured against that fraction would be as many times too many.
+
+Measured on PostgreSQL 18 (release build; lion's own estimate, the Bitmap Index Scan's rows, with the
+probe on and off; the relation's rows; planning's buffer accesses with the probe on and off) on
+`test/sql/isectwide.sql`'s table, 160,000 rows in 119 container keys: a family of one row in sixteen,
+spread over the heap, shares the values of six columns' clauses, and the family's rows in the first
+quarter of the heap the values of three more:
+
+| conjunction | rows | core | probe | relation | buffers, on / off |
+|---|---|---|---|---|---|
+| six clauses, 20 sets: the family | 9,961 | 19 | 10,120 | 10,120 | 160 / 8 |
+| eight clauses, 28 sets: the family's rows in a quarter of the heap | 1,280 | 1 | 1,288 | 1,288 | 205 / 10 |
+| nine clauses, 31 sets: the same | 1,280 | 1 | 1,316 | 1,316 | 219 / 11 |
+| ten clauses, 41 sets: measured without a list of ten values | 652 | 1 | 656 | 656 | 220 / 12 |
+| seven clauses, 21 sets: the family's rows in under a twentieth of the heap, met in two containers | 360 | 11 | 365 | 365 | 183 / 9 |
+
+Twelve conjunctions of 32 sets in one statement plan in 1,827 accesses. On 12M rows in 8,000 hidden
+groups (5,514 container keys), nine columns each following its row's group nine times in ten,
+conjunctions of 6 to 32 sets came out within 16% of their rows where the groups take turns row by
+row, and within 15% where the AND narrows into a quarter of the heap as the filter widens; core's
+product was 1 to 3,482 rows for 5,540 to 69,370. Planning took 439 to 2,119 buffer accesses with
+the probe, 5 to 12 without it. Where the AND lies in fewer containers than the sample has strata -
+the same rows loaded group by group, a filter's few groups in a handful of the 5,514 containers, or
+in batches that put them in one hundredth of the heap - no sample of 32 meets it, and core's
+product stands: 1 to 2,735 rows for 5,407 to 11,327.
+
+`test/sql/isectwide.sql` pins it: the conjunctions above within a factor of three of their rows,
+the relation's rows with them, where core's product is ten times short or more; the 41 sets
+measured without the widest list, the 21 by the prefix the sample met often; and the planning of
+the 31 sets, and of the twelve conjunctions in one statement, within the run's budget.
 
 **The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
 sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.
