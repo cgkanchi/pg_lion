@@ -157,8 +157,9 @@ finish a half-applied two-pass bulkdelete. After every restart:
   recovery (the index may still hold TIDs of dead tuples), and exactly equal
   after a `VACUUM`. For the two multi-key indexes the expected total is the
   number of (key, row) pairs, with one pair for a row that extracted no keys.
-  `null_tids` and `empty_tids` are checked separately, because a reserved
-  entry that lost its flag would hide inside the `ntids` total.
+  `null_tids`, `empty_tids` and `nullelem_tids` are checked separately,
+  because a reserved entry that lost its flag would hide inside the `ntids`
+  total.
 
 **Phases 1b-1g, a crash or a restart at a chosen point.** Each builds a
 table of its own. 1b parks a VACUUM between the two steps of a whole-chain
