@@ -3360,6 +3360,7 @@ extern bool lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 									 double fallbackentries);
 extern void lion_cells_fill_priv(const LionCellsPlan *cp, LionCountPriv *p,
 								 List *cellquals);
+extern double lion_cells_nonempty(const LionCellsPlan *cp, double rows);
 
 /* lion_plan_partition.c */
 extern Var *lion_child_var(PlannerInfo *root, Index childrelid,

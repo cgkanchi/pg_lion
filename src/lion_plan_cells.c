@@ -929,6 +929,7 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 {
 	CellsCx		cx;
 	LionCellsPlan *cp;
+	Bitmapset  *notnull = lion_notnullattnums(root, rel);
 	ListCell   *lc;
 	int			d;
 	int			i;
@@ -1013,6 +1014,7 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 			uint8	   *sig = (uint8 *) palloc(Max(npd, 1) * nu);
 			int			nout = 0;
 			bool		noother;
+			bool		nonull;
 			int			u;
 			int			k;
 
@@ -1037,18 +1039,23 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 			 * Any other value's outcome is 0, then the rest as they come.  A
 			 * boolean column both of whose values are named has no other
 			 * value: its outcome 0 is its first value's, which then needs no
-			 * label either.
+			 * label either.  A column declared NOT NULL has no NULL, which
+			 * is then outcome 0 too.
 			 */
 			noother = dim->hasvalop && dim->valtype == BOOLOID && nval == 2;
+			nonull = bms_is_member(dim->var->varattno, notnull);
 			rep[nout] = noother ? 0 : nval;
 			out[nval] = nout++;
 			if (noother)
 				out[0] = 0;
+			if (nonull)
+				out[nval + 1] = 0;
 			for (u = 0; u < nu; u++)
 			{
 				int			o;
 
-				if (u == nval || (noother && u == 0))
+				if (u == nval || (noother && u == 0) ||
+					(nonull && u == nval + 1))
 					continue;
 				for (o = 0; o < nout; o++)
 				{
@@ -1135,6 +1142,137 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 	if (cp->ncells > (double) lion_count_cells_max)
 		return NULL;
 	return cp;
+}
+
+/*
+ * The cells of the WHERE's rows that hold a row, as the planner estimates
+ * them: each cell's share of the rows is the product of its outcomes'
+ * shares - a value's selectivity, NULL's, the patterns of a multi-key
+ * column's bits taken as independent - and a cell of share p holds one of
+ * `rows` rows with probability 1 - exp(-rows * p).  The cells are not
+ * enumerated: each dimension's outcomes, and the products so far, are kept
+ * as a histogram over log2 of their share (LION_CELLS_SHARE_BINS bins of
+ * half a power of two), each bin its cells and the sum of their shares,
+ * which multiplies out bin by bin.  At most the rows.
+ */
+#define LION_CELLS_SHARE_BINS	129
+
+typedef struct CellsShareHist
+{
+	double		n[LION_CELLS_SHARE_BINS];	/* cells */
+	double		sum[LION_CELLS_SHARE_BINS];	/* ... and their shares */
+} CellsShareHist;
+
+static int
+cells_share_bin(double p)
+{
+	int			b = (int) floor(-2.0 * log2(p));
+
+	return Max(0, Min(b, LION_CELLS_SHARE_BINS - 1));
+}
+
+static void
+cells_share_add(CellsShareHist *h, double n, double sum)
+{
+	int			b;
+
+	if (n <= 0 || sum <= 0)
+		return;
+	b = cells_share_bin(sum / n);
+	h->n[b] += n;
+	h->sum[b] += sum;
+}
+
+double
+lion_cells_nonempty(const LionCellsPlan *cp, double rows)
+{
+	CellsShareHist *acc;
+	CellsShareHist *dimh;
+	CellsShareHist *next;
+	double		cells = 0;
+	int			d;
+	int			i;
+	int			j;
+
+	if (rows <= 0)
+		return 0;
+	acc = (CellsShareHist *) palloc0(sizeof(CellsShareHist));
+	dimh = (CellsShareHist *) palloc(sizeof(CellsShareHist));
+	next = (CellsShareHist *) palloc(sizeof(CellsShareHist));
+	cells_share_add(acc, 1.0, 1.0);
+
+	for (d = 0; d < cp->ndim; d++)
+	{
+		const LionCellsDimPlan *dp = &cp->dims[d];
+		const LionCellsDimPriv *pv = &dp->priv;
+		double	   *share = (double *) palloc0(sizeof(double) * pv->radix);
+		int			o;
+
+		if (pv->kind == LION_CELLDIM_MULTI)
+		{
+			double		nonnull = Max(1.0 - dp->nullsel, 0.0);
+			int			m;
+
+			for (m = 0; m < (1 << pv->nbit); m++)
+			{
+				double		p = nonnull;
+				int			b;
+
+				for (b = 0; b < pv->nbit; b++)
+				{
+					double		q = (nonnull > 0) ?
+						Min(dp->bitsel[b] / nonnull, 1.0) : 0;
+
+					p *= (m & (1 << b)) ? q : 1.0 - q;
+				}
+				share[m] = p;
+			}
+			share[pv->nullout] = dp->nullsel;
+		}
+		else
+		{
+			double		rest = 1.0;
+
+			for (i = 0; i < pv->nval; i++)
+				share[pv->valout[i]] += dp->valsel[i];
+			if (pv->nullout != 0)
+				share[pv->nullout] += dp->nullsel;
+			for (o = 1; o < pv->radix; o++)
+				rest -= share[o];
+			share[0] = Max(rest, 0.0);
+		}
+
+		memset(dimh, 0, sizeof(CellsShareHist));
+		for (o = 0; o < pv->radix; o++)
+			cells_share_add(dimh, 1.0, Min(share[o], 1.0));
+		pfree(share);
+
+		memset(next, 0, sizeof(CellsShareHist));
+		for (i = 0; i < LION_CELLS_SHARE_BINS; i++)
+		{
+			if (acc->n[i] <= 0)
+				continue;
+			for (j = 0; j < LION_CELLS_SHARE_BINS; j++)
+			{
+				if (dimh->n[j] <= 0)
+					continue;
+				cells_share_add(next, acc->n[i] * dimh->n[j],
+								acc->sum[i] * dimh->sum[j]);
+			}
+		}
+		memcpy(acc, next, sizeof(CellsShareHist));
+	}
+
+	for (i = 0; i < LION_CELLS_SHARE_BINS; i++)
+	{
+		if (acc->n[i] > 0)
+			cells += acc->n[i] *
+				(1.0 - exp(-rows * acc->sum[i] / acc->n[i]));
+	}
+	pfree(acc);
+	pfree(dimh);
+	pfree(next);
+	return Min(Min(cells, cp->ncells), rows);
 }
 
 /*

@@ -3483,6 +3483,223 @@ sequential plan in `test/sql/countcombos.sql`:
   a range are handed, and a complement OR's two counts are made in each range, the identity
   holding of the rows at any keys.
 
+### Counts by cells (2026-10-20)
+
+A report that buckets rows by a score - `SELECT CASE WHEN score >= 70 THEN 'high' WHEN score >= 40
+THEN 'medium' WHEN score IS NOT NULL THEN 'low' ELSE 'none' END AS tier, count(*) FROM t WHERE ...
+GROUP BY 1`, the score a sum of CASEs over `c = 3`, `c IN (4, 5)`, `tags && '{1,2}'`, `s IS NULL`,
+`f`, rounded, the greater of two parts, and NULL outside a gate `CASE WHEN r = 'r1' OR r = 'r3'
+THEN ... END` - grouped by an expression no index holds, so it went to core, which fetched every row
+the WHERE selects to evaluate the CASE: a bitmap heap scan and a HashAggregate, seconds at a few
+million rows. But the expression reads its columns only through PREDICATES the posting sets decide
+for every row, so its value in a row is a function of the predicates' truths alone: the rows can be
+counted by CELL - one truth, true, false or NULL, of every distinct predicate - and the expression
+computed once a cell.
+
+**The predicates** (`lion_cells_analyze()`, lion_plan_cells.c). The GROUP BY's expressions, and the
+WHERE's clauses no posting set answers, are walked down to their predicates:
+
+- a SCALAR TREE: an AND, OR or NOT of leaves of one column - `c = v`, `c <> v`, `c IN (...)`, `c
+  NOT IN (...)`, `c IS [NOT] DISTINCT FROM v`, `c IS [NOT] NULL`, a boolean column by itself and
+  `IS [NOT] TRUE / FALSE / UNKNOWN` of one - its truth in a row a function of the row's value of the
+  column, the values compared by the equality of a scalar lion index on the column;
+- a MULTI-KEY LEAF: `c @> q`, `c && q` or `c @@ q` with a literal q that a multi-key lion index
+  answers exactly (§17): a tree of the query's keys, AND for `@>`, OR for `&&`, the tsquery's own
+  for `@@`; a query that selects no row (`c && '{}'`) is false, or NULL in a NULL row.
+
+The predicates are told apart by `equal()`. Anything else in the expressions - a column read
+outside a predicate, a range, a `CASE c WHEN ...` (whose WHEN tests a placeholder), a subquery, an
+aggregate, a mutable function, a set-returning one - declines the count; so does a tsquery with a
+NOT, a query a stored position would have to narrow (§17, "Stored positions"), and a GROUP BY that
+holds a bare column - that column's walk is the plain GROUP BY's, and a cell is no group of it.
+
+**Dimensions and outcomes.** The predicates are grouped by column into DIMENSIONS. A scalar
+column's rows are told apart by the values its predicates name: every value named, any other value
+and NULL, each with its SIGNATURE - the truth of each of the column's predicates in it, by SQL's
+three-valued logic (`cells_eval()`, the IN list's NULL element and empty list as
+ExecEvalScalarArrayOp has them) - and the values of one signature are one OUTCOME, any other
+value's being outcome 0. So fifteen equalities of one column in a CASE, which are mutually
+exclusive, are one dimension of sixteen outcomes and a NULL, not fifteen independent bits; `c IN
+(1, 2, 3)` beside `c IN (3, 4)` is four outcomes. A boolean both of whose values are named has no
+other value, and a column declared NOT NULL no NULL: either is outcome 0 too. A multi-key column's
+leaves are BITS, its outcome the set of leaves a row satisfies, or NULL: `2^bits + 1` outcomes, at
+most `LION_CELLS_MAX_BITS` (10) leaves and `LION_CELLS_MAX_KEYS` (63) keys among them; a null test
+of the column is a predicate of its NULL outcome.
+
+**The bound.** A cell is an outcome of every dimension, so the plan has at most the product of the
+dimensions' outcomes - the mixed radix the tally codes a cell in (§34) - and the planner declines
+more than `pg_lion.count_cells_max`, 2^27 = 134,217,728 by default. The product counts each column
+once whatever its predicates: the tier measured below - fifteen values of one column, eight
+overlaps of an array column and three more columns, two of them NOT NULL - is 2 x 17 x 257 x 3 x 2 =
+52,428 cells at most, and 7,000 to 13,000 with rows. The walk's time follows the cells with rows,
+not the product, and the price counts those; the default is where the measurements stop, just
+above the largest product measured, 125 million cells of five columns and ten overlaps over 3
+million rows, of which 700,000 had rows: the cells were still 5.8 to 8.6 times faster than core
+there, and their estimate of the cells with rows 6 % high. A product past it is a grouping finer
+than any measured, with ever fewer rows to a cell for the cells to share.
+
+**The walk** (`lion_count_cells()`, lion_count_decode.c) is the decoded walk of §34 with one
+column. One scalar dimension DRIVES (`lion_cells_choose_driver()`): its entries are walked a pass of
+`LION_GROUP_BATCH_MAX` at a time, located under their pins, and each entry's key is compared with
+the dimension's values by its equality - entry offsets are no names (§21) - to give the outcome
+every row of the entry has. The other dimensions are LABELS: a scalar column's sets of its named
+values with an outcome other than 0, and its NULL entry; a multi-key column's set of each key of
+its leaves, and its NULL entry. At each container key the WHERE's collected copy keeps rows at,
+the driver's containers are decoded into each row's code - its outcome times the dimension's weight
+in the radix - and each label's container there adds its weight to the code of each row it holds:
+a scalar dimension's labels are disjoint entries, so a row is in one at most; a multi-key one's
+keys are gathered into a mask a row first (a generation stamping each row's), and its leaves'
+trees evaluated over the mask - a table of the masks for sixteen keys or fewer - give the outcome.
+A row of no label has outcome 0. Then the map is asked about the key's blocks, and each row is
+counted under its code, or queued for the heap with it, as a decoded walk's under its combination;
+the tally is the decoded walk's, dense or a hash that spills. The driver is the scalar dimension
+that leaves the fewest label rows to read times its passes - a dimension of one entry a value reads
+nothing for itself - with no more than 16 passes and 65,536 comparisons of keys with values; where
+none will do (every dimension a multi-key one), any lion-indexed column of the table no dimension
+is drives (`lion_count_all_driver()`), all of its rows outcome 0.
+
+**The cells out.** The node's tuple holds the truth of each predicate - `LION_TL_CELLPRED(i)`
+columns of custom_scan_tlist, a boolean or NULL - and the cell's partial count. setrefs.c matches
+the plan's target list and qual against custom_scan_tlist top down by `equal()`, so the
+predicates inside the grouping expressions become references to those columns and the node's own
+projection computes the expressions from them, once a cell (`lion_next_cells()`); core's Finalize
+HashAggregate adds a group's cells up, and applies the HAVING. The expression's value is whatever
+the expression makes of the truths, of its own type - a numeric from `round()`, the tier's text -
+and a group no cell has rows of has no row. A WHERE clause over the predicates - `count(*) WHERE
+n < 50 AND <the tier> = 'high'` - is answered the same way: it is the node's qual, tested once a
+cell, and core's Finalize Aggregate adds up the cells it keeps. The predicates' functions are the
+node's to check EXECUTE on (`lion_expr_functions()`, §9 "Privileges"), since the projection
+reads their truths and never calls them.
+
+**Why it is exact (§9, §11).** It is the decoded walk's argument with labels for columns
+(`lion_count_groups_decode()`, and "The groups of a walk, counted together" above for the WHERE's
+copy). Every row counted is in exactly one pinned set of the driver, its entry of the driver's
+column located for the pass under the entry's pin, and the map is asked at a key once every driver
+cursor standing there has copied its container. The labels and the WHERE copy are read with no pin,
+after the snapshot was taken: a row the snapshot sees was in every index before its transaction
+committed, and is not removed from any while the snapshot sees it, so its labels are exactly its
+values' and keys' - its cell is its own. What a label lists that the snapshot does not see is a
+dead row whose TID the driver's container still holds - so VACUUM has not got past the driver's
+page, has not set the block all-visible, and the row goes to the heap, which does not show it - or
+one the driver no longer holds, which is in no pass. A row of a NOPIN set of the driver, of a set
+read from a copy, and every row in recovery go to the heap; so does a row whose code is past the
+tally's - only a dead TID in two entries of one column can make one - which the recheck raises an
+ERROR for if it finds it visible. Under SERIALIZABLE the blocks counted are predicate-locked page
+by page and each index read is locked as a relation, as the decoded walk's.
+
+**In parallel** ("A GROUP BY in parallel" above): the participants claim ranges of container keys
+from the shared counter, collect the WHERE of each range alone - or read every row of it without a
+WHERE - and count every pass of the driver there into one tally of their own, whose cells go up as
+partial rows at the end, under the Gather and the Finalize Agg. Each range is the serial walk over
+a copy of its keys, the driver's sets located afresh by the participant under its own pins and the
+labels read after the leader's snapshot, so the argument above holds in each; every row is in one
+range, counted by one participant.
+
+**The planner** (`lion_try_count_cells()`, lion_plan_count.c) runs first in each scoped build of a
+count (`lion_try_count_path_scoped()`), with phases of its own for the GROUP BY (every expression
+immutable, none a bare column, hashable; or none, with a WHERE clause over predicates), the outputs
+(the expressions and counts the node answers - `count(*)` and the `count(col)` forms already
+taken - and expressions over them; nothing else) and the strategy (the decoded walk's WHERE: one
+collected copy, every range a source, a positive clause to begin from, no complement OR, no
+residual clause, no filtered count). The WHERE phase is the count's own; with cells being built, a
+clause no posting set answers that is a function of predicates (`lion_cells_shape_ok()`) is taken
+as one over cells instead of declining. A plain table only, not a partition, an FK-side join, a
+DISTINCT, a partial index's build (§45), a hot standby, or beside an expression column (§41). The
+GROUP BY of a column is never one: its plan is the plain walk's, which the cells build leaves
+alone.
+
+**The price** (`lion_cost_cells_path()`): the driver's grouped count against the WHERE as
+`lion_cost_count_rel()` prices it, its containers decoded at the keys the WHERE's rows lie at; at
+those keys each label's containers, a step or a seek to the key each, a store per member - two for
+a multi-key column's, gathered first - and the posting pages they span, again in every pass; each
+of the WHERE's rows counted under its cell, a column read per labelled dimension, at the decoded
+walk's row costs; the qual over predicates once a cell; and a partial row per cell with rows, each
+projected. The cells with rows (`lion_cells_nonempty()`) are estimated from each outcome's share of
+the table - a value's selectivity, NULL's, a multi-key column's bit patterns from its leaves'
+selectivities taken as independent - a cell of share p holding one of n rows with probability
+`1 - exp(-n * p)`; the shares are multiplied out as histograms over their log2, half a power of two
+a bin, rather than cell by cell. In the units of the cheapest core path (§39) like every count.
+The parallel form is priced as a parallel GROUP BY's: each participant's share of the serial
+count, what each of its ranges pays again (the driver's walk begun anew and every label sought into
+the range in each pass), and its partial rows - the cells with rows of its share of the rows, one
+set a participant.
+
+**The plan.** custom_private member 23, `LION_PRIV_CELLS` (shape 28): each dimension's kind,
+column, index, outcomes, NULL's outcome, the values with their outcomes or the leaves' operators and
+queries; each predicate's dimension and its truth in each outcome - a table for a scalar
+dimension's, a bit for a leaf, the two truths of a null test of a multi-key column; and the driver's
+dimension, or -1. TLKINDS is member 24, the members 25, the magic 0x5242491c. At the path stage
+the member also carries the predicates and the clauses over them, which `lion_plan_custom_path()`
+makes custom_scan_tlist's columns and the plan's qual. `LION_FLAG_DECODE` with the driver as the
+one GROUPN column.
+
+**EXPLAIN** prints the driver among `Lion Indexes` as a grouping column's, `Group Strategy: Cells`,
+`Cell Columns` - each dimension's index and column - `Cell Predicates` in their order, and `Cells`,
+the bound; the clause over predicates is the node's `Filter`. Under ANALYZE: the decoded walk's
+`Decoded Passes`, `Decoded Keys`, `Decoded Rows`, `Decoded Rows Rechecked`, `Partial Rows` - the
+cells with rows - and, when it spilled, `Tally Spills`.
+
+    Finalize HashAggregate
+      Group Key: CASE WHEN (CASE WHEN ((r = 'r1'::text) OR ...
+      ->  Custom Scan (LionCount)
+            Lion Indexes: lcc_r (r), lcc_n (n < 50)
+            Group Strategy: Cells
+            Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), ...
+            Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), ...
+            Cells: 4050
+
+**Measured** (2026-10-20, PostgreSQL 18 release build, 4 CPUs shared with other work, warm, the
+heap all-visible, `work_mem` 64 MB; the median of 7 runs alternated with core's, back to back).
+3,000,000 synthetic rows of 908 MB, a lion index on each of six columns, 54 MB together: `c`, 20
+integers and 2 % NULL; `r`, 10 texts, NOT NULL; `g`, 20 integers, NOT NULL, the WHERE's; `f`, a
+boolean 5 % NULL; `s`, 6 texts and 10 % NULL; `tags`, two to four of 64 integers. The tier is
+`CASE WHEN score >= 40 THEN 'high' WHEN score >= 25 THEN 'medium' WHEN score IS NOT NULL THEN
+'low' ELSE 'none' END` over `CASE WHEN r = 'r1' OR r = 'r2' OR r = 'r5' THEN round(CASE WHEN c = 0
+THEN 40 ... END * 0.6 + <eight CASE WHEN tags && '{...}' THEN n ELSE 0 END> + GREATEST(CASE WHEN f
+THEN 6 ELSE 0 END, CASE WHEN s IS NULL THEN 2 ELSE 4 END)) END`, fifteen values of `c` named; the
+WHERE form is `count(*)` of the rows whose tier is `'high'`. Core's plan is the plan with
+`pg_lion.enable_count_cells` off, reading the heap; its counts are the same.
+
+| 3M rows, ms | `g IN (0, ..., 9)`, 50 %: cells; core | `g = 3`, 5 %: cells; core |
+|---|---|---|
+| tier, serial | 113; 2,209 | 54; 271 |
+| WHERE form, serial | 112; 2,040 | 54; 264 |
+| tier, 3 workers | 72; 970 | 39; 267 |
+| WHERE form, 3 workers | 70; 1,159 | 38; 246 |
+
+13,352 cells had rows at 50 %, 6,967 at 5 %, of the 52,428. The cells grow with the predicates,
+the time with the cells that have rows. Without a WHERE, the same table grouped by the predicates
+themselves - a CASE over each of the first columns' values as its own grouping expression, then up
+to ten overlaps of `tags` - and the same predicates summed into a tier of three groups:
+
+| product of outcomes | cells with rows (estimated) | GROUP BY of the predicates: cells; core | a tier of their sum: cells; core |
+|---|---|---|---|
+| 462 | 420 (420) | 33; 654 | 34; 1,040 |
+| 5,082 | 4,200 (4,200) | 40; 920 | 41; 1,644 |
+| 40,656 | 29,400 (29,400) | 61; 1,211 | 60; 1,989 |
+| 121,968 | 71,397 (87,847) | 94; 1,444 | 106; 2,264 |
+| 1,097,712 | 251,526 (275,216) | 252; 2,564 | 226; 3,738 |
+| 7,927,920 | 460,961 (491,383) | 601; 3,721 | 583; 5,425 |
+| 31,345,776 | 616,597 (649,675) | 763; 4,353 | 871; 6,254 |
+| 125,017,200 | 695,944 (739,345) | 868; 4,995 | 1,027; 8,852 |
+
+No tally spilled. A tier of four columns and up to ten overlaps under `g = 3` and under the ten
+values of `g`, products of 242 to 5,953,200, was planned by cells every time against core's plan:
+38 to 158 ms against 224 to 656 at 5 %, 68 to 219 against 1,212 to 4,119 at 50 %; the cells priced
+at 180 to 510 units a millisecond and core's plans at 170 to 670, the cells' price a seventh to a
+twelfth of core's. A GROUP BY of a column keeps the plain walk's plan: the cells build declines it
+before pricing anything.
+
+**Tests.** `test/sql/countcells.sql` compares every shape with the plan of the pushdown off on
+40,000 synthetic rows, as multisets: the tier over a score of every predicate kind, its score and
+both together, the WHERE form, a HAVING; exclusive and overlapping equalities, NOT IN and IS
+DISTINCT FROM with NULLs, booleans with and without NULLs, a value no row has, NULL and empty arrays
+and arrays with a NULL element, an overlap with the empty array, text searches, `round`,
+`GREATEST`, `LEAST` and `COALESCE` over NULLs; the declines - a column read outside a predicate, a
+volatile function, the bound exceeded; generic plans with Params in the WHERE; a rescan per outer
+row and SERIALIZABLE; deleted and updated rows before VACUUM, a transaction's own changes, and after
+VACUUM; and parallel plans, with rows the heap decides.
+
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
 ambulkdelete acquires a cleanup lock (an exclusive content lock that also waits for all other pins

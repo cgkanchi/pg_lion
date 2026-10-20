@@ -209,7 +209,7 @@ SELECT * FROM lcc_plan(
          Group Strategy: Cells
          Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
          Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
-         Cells: 6075
+         Cells: 4050
 (7 rows)
 
 -- a WHERE clause over predicates is the node's filter, tested once a cell
@@ -224,7 +224,7 @@ SELECT * FROM lcc_plan(
          Group Strategy: Cells
          Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
          Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
-         Cells: 6075
+         Cells: 4050
 (8 rows)
 
 RESET enable_seqscan;
@@ -247,16 +247,16 @@ SELECT q, lcc_check(q) FROM (VALUES
 ) v(q);
                                             q                                            |      lcc_check      
 -----------------------------------------------------------------------------------------+---------------------
- SELECT tier, count(*) FROM lcc_tiered GROUP BY tier                                     | 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier                        | 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE n >= 95 GROUP BY tier                       | 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE n = 7 AND g GROUP BY tier                   | 6075 cells, 4 rows
- SELECT score, count(*) FROM lcc_scored WHERE n < 50 GROUP BY score                      | 6075 cells, 55 rows
- SELECT score, tier, count(*) AS c FROM lcc_tiered GROUP BY score, tier                  | 6075 cells, 55 rows
- SELECT tier, count(*) AS c, count(n) AS cn FROM lcc_tiered WHERE n < 30 GROUP BY tier   | 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier HAVING count(*) > 2000 | 6075 cells, 3 rows
- SELECT tier, count(*) * 2 + 1 AS c FROM lcc_tiered GROUP BY tier                        | 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE n = 1000 GROUP BY tier                      | 6075 cells, 0 rows
+ SELECT tier, count(*) FROM lcc_tiered GROUP BY tier                                     | 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier                        | 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE n >= 95 GROUP BY tier                       | 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE n = 7 AND g GROUP BY tier                   | 4050 cells, 4 rows
+ SELECT score, count(*) FROM lcc_scored WHERE n < 50 GROUP BY score                      | 4050 cells, 55 rows
+ SELECT score, tier, count(*) AS c FROM lcc_tiered GROUP BY score, tier                  | 4050 cells, 55 rows
+ SELECT tier, count(*) AS c, count(n) AS cn FROM lcc_tiered WHERE n < 30 GROUP BY tier   | 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier HAVING count(*) > 2000 | 4050 cells, 3 rows
+ SELECT tier, count(*) * 2 + 1 AS c FROM lcc_tiered GROUP BY tier                        | 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE n = 1000 GROUP BY tier                      | 4050 cells, 0 rows
 (10 rows)
 
 -- ---------- 3. the predicates ----------
@@ -324,7 +324,7 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT (k = 1 AND k = 2) AS x, (NOT (k = 3 OR k IS NULL)) AS y, count(*) FROM lcc GROUP BY 1, 2               | 3 cells, 3 rows
  SELECT (s IS NULL) AS x, (s = 's1') AS y, (s IN ('s2', 's3')) AS z, count(*)                                 +| 4 cells, 4 rows
                  FROM lcc GROUP BY 1, 2, 3                                                                     | 
- SELECT NOT f AS x, NOT g AS y, count(*) FROM lcc GROUP BY 1, 2                                                | 9 cells, 6 rows
+ SELECT NOT f AS x, NOT g AS y, count(*) FROM lcc GROUP BY 1, 2                                                | 6 cells, 6 rows
  SELECT (f IS NOT TRUE) AS x, (f IS UNKNOWN) AS y, (f IS FALSE) AS z, count(*)                                +| 3 cells, 3 rows
                  FROM lcc GROUP BY 1, 2, 3                                                                     | 
  SELECT (f AND k = 1) AS x, (s = 's1' OR z = 2) AS y, count(*) FROM lcc GROUP BY 1, 2                          | 81 cells, 9 rows
@@ -343,7 +343,7 @@ SELECT q, lcc_check(q) FROM (VALUES
                           count(*) FROM lcc GROUP BY 1                                                         | 
  SELECT LEAST(CASE WHEN s = 's1' THEN 4 END, COALESCE(CASE WHEN tags && '{3}' THEN 2 END, 7)) AS v,           +| 9 cells, 3 rows
                           count(*) FROM lcc GROUP BY 1                                                         | 
- SELECT (CASE WHEN g THEN 1 ELSE 0 END + CASE WHEN f THEN 1 ELSE 0 END                                        +| 27 cells, 2 rows
+ SELECT (CASE WHEN g THEN 1 ELSE 0 END + CASE WHEN f THEN 1 ELSE 0 END                                        +| 18 cells, 2 rows
                            + CASE WHEN z = 1 THEN 1 ELSE 0 END) % 2 AS v, count(*) FROM lcc GROUP BY 1         | 
 (20 rows)
 
@@ -361,13 +361,13 @@ SELECT q, lcc_check(q) FROM (VALUES
 ) v(q);
                                          q                                          |     lcc_check      
 ------------------------------------------------------------------------------------+--------------------
- SELECT count(*) FROM lcc_tiered WHERE tier = 'high'                                | 6075 cells, 1 rows
- SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'medium'                   | 6075 cells, 1 rows
- SELECT count(*), count(n) FROM lcc_tiered WHERE n < 50 AND tier IN ('low', 'none') | 6075 cells, 1 rows
- SELECT count(*) FROM lcc_tiered WHERE n < 50 AND score > 40 AND tier <> 'high'     | 6075 cells, 1 rows
- SELECT count(*) FROM lcc WHERE n < 50 AND CASE WHEN k = 1 THEN f ELSE g END        | 27 cells, 1 rows
- SELECT count(*) FROM lcc_tiered WHERE n = 7 AND score > 1000                       | 6075 cells, 1 rows
- SELECT (s IS NULL) AS x, count(*) FROM lcc_tiered WHERE tier = 'low' GROUP BY 1    | 6075 cells, 2 rows
+ SELECT count(*) FROM lcc_tiered WHERE tier = 'high'                                | 4050 cells, 1 rows
+ SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'medium'                   | 4050 cells, 1 rows
+ SELECT count(*), count(n) FROM lcc_tiered WHERE n < 50 AND tier IN ('low', 'none') | 4050 cells, 1 rows
+ SELECT count(*) FROM lcc_tiered WHERE n < 50 AND score > 40 AND tier <> 'high'     | 4050 cells, 1 rows
+ SELECT count(*) FROM lcc WHERE n < 50 AND CASE WHEN k = 1 THEN f ELSE g END        | 18 cells, 1 rows
+ SELECT count(*) FROM lcc_tiered WHERE n = 7 AND score > 1000                       | 4050 cells, 1 rows
+ SELECT (s IS NULL) AS x, count(*) FROM lcc_tiered WHERE tier = 'low' GROUP BY 1    | 4050 cells, 2 rows
 (7 rows)
 
 -- ---------- 5. declined ----------
@@ -490,21 +490,21 @@ SELECT * FROM lcc_plan('EXECUTE lcc_p(50, ''s1'')') AS p("QUERY PLAN");
          Group Strategy: Cells
          Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
          Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
-         Cells: 6075
+         Cells: 4050
 (7 rows)
 
 SELECT lcc_check_exec('EXECUTE lcc_p(10, ''s1'')',
 	'SELECT tier, count(*) FROM lcc_tiered WHERE n < 10 AND s IS DISTINCT FROM ''s1'' GROUP BY tier');
          lcc_check_exec         
 --------------------------------
- 6075 cells over Params, 4 rows
+ 4050 cells over Params, 4 rows
 (1 row)
 
 SELECT lcc_check_exec('EXECUTE lcc_p(90, ''s4'')',
 	'SELECT tier, count(*) FROM lcc_tiered WHERE n < 90 AND s IS DISTINCT FROM ''s4'' GROUP BY tier');
          lcc_check_exec         
 --------------------------------
- 6075 cells over Params, 4 rows
+ 4050 cells over Params, 4 rows
 (1 row)
 
 DEALLOCATE lcc_p;
@@ -519,21 +519,21 @@ SELECT * FROM lcc_plan('EXECUTE lcc_w(3)') AS p("QUERY PLAN");
          Group Strategy: Cells
          Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
          Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
-         Cells: 6075
+         Cells: 4050
 (8 rows)
 
 SELECT lcc_check_exec('EXECUTE lcc_w(3)',
 	'SELECT count(*) FROM lcc_tiered WHERE n = 3 AND tier = ''medium''');
          lcc_check_exec         
 --------------------------------
- 6075 cells over Params, 1 rows
+ 4050 cells over Params, 1 rows
 (1 row)
 
 SELECT lcc_check_exec('EXECUTE lcc_w(4)',
 	'SELECT count(*) FROM lcc_tiered WHERE n = 4 AND tier = ''medium''');
          lcc_check_exec         
 --------------------------------
- 6075 cells over Params, 1 rows
+ 4050 cells over Params, 1 rows
 (1 row)
 
 DEALLOCATE lcc_w;
@@ -543,14 +543,14 @@ SELECT lcc_check('SELECT x, t.* FROM generate_series(3, 5) x,
 	LATERAL (SELECT tier, count(*) FROM lcc_tiered WHERE n = x GROUP BY tier) t');
       lcc_check      
 ---------------------
- 6075 cells, 10 rows
+ 4050 cells, 10 rows
 (1 row)
 
 BEGIN ISOLATION LEVEL SERIALIZABLE;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier');
      lcc_check      
 --------------------
- 6075 cells, 4 rows
+ 4050 cells, 4 rows
 (1 row)
 
 COMMIT;
@@ -570,10 +570,10 @@ SELECT q, lcc_check(q) FROM (VALUES
 ) v(q);
                                 q                                 |                  lcc_check                   
 ------------------------------------------------------------------+----------------------------------------------
- SELECT tier, count(*) FROM lcc_tiered GROUP BY tier              | 6075 cells, 4 rows, rows tested in the heap
- SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier | 6075 cells, 4 rows, rows tested in the heap
- SELECT score, count(*) FROM lcc_scored GROUP BY score            | 6075 cells, 88 rows, rows tested in the heap
- SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'high'   | 6075 cells, 1 rows, rows tested in the heap
+ SELECT tier, count(*) FROM lcc_tiered GROUP BY tier              | 4050 cells, 4 rows, rows tested in the heap
+ SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier | 4050 cells, 4 rows, rows tested in the heap
+ SELECT score, count(*) FROM lcc_scored GROUP BY score            | 4050 cells, 88 rows, rows tested in the heap
+ SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'high'   | 4050 cells, 1 rows, rows tested in the heap
 (4 rows)
 
 -- ... a transaction's own changes, and a row it updates twice
@@ -584,7 +584,7 @@ DELETE FROM lcc WHERE id % 37 = 0;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered GROUP BY tier');
                   lcc_check                  
 ---------------------------------------------
- 6075 cells, 4 rows, rows tested in the heap
+ 4050 cells, 4 rows, rows tested in the heap
 (1 row)
 
 ROLLBACK;
@@ -596,8 +596,8 @@ SELECT q, lcc_check(q) FROM (VALUES
 ) v(q);
                                q                                |     lcc_check      
 ----------------------------------------------------------------+--------------------
- SELECT tier, count(*) FROM lcc_tiered GROUP BY tier            | 6075 cells, 4 rows
- SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'high' | 6075 cells, 1 rows
+ SELECT tier, count(*) FROM lcc_tiered GROUP BY tier            | 4050 cells, 4 rows
+ SELECT count(*) FROM lcc_tiered WHERE n < 50 AND tier = 'high' | 4050 cells, 1 rows
 (2 rows)
 
 -- ---------- 8. in parallel ----------
@@ -621,7 +621,7 @@ SELECT * FROM lcc_plan(
                Group Strategy: Cells
                Cell Columns: lcc_r (r), lcc_ks.k (k), lcc_tags (tags), lcc_ks.s (s), lcc_fg.f (f), lcc_w (w), lcc_z (z)
                Cell Predicates: ((r = 'r1'::text) OR (r = 'r3'::text) OR (r = 'r4'::text)), (k = ANY ('{1,2,3}'::integer[])), (k = ANY ('{4,5}'::integer[])), ((k = 6) OR (k = 7)), (k IS NULL), (tags && '{1,2}'::integer[]), (tags && '{9,10}'::integer[]), (s = 's2'::text), (s IS NULL), f, (w @@ '''a1'' | ''a2'' & ''b3'''::tsquery), (z = 9)
-               Cells: 6075
+               Cells: 4050
 (9 rows)
 
 SELECT q, lcc_check(q) FROM (VALUES
@@ -632,10 +632,10 @@ SELECT q, lcc_check(q) FROM (VALUES
 ) v(q);
                                q                               |          lcc_check           
 ---------------------------------------------------------------+------------------------------
- SELECT tier, count(*) FROM lcc_tiered GROUP BY tier           | parallel 6075 cells, 4 rows
- SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier   | parallel 6075 cells, 4 rows
- SELECT score, count(*) FROM lcc_scored WHERE f GROUP BY score | parallel 6075 cells, 61 rows
- SELECT count(*) FROM lcc_tiered WHERE g AND tier = 'high'     | parallel 6075 cells, 1 rows
+ SELECT tier, count(*) FROM lcc_tiered GROUP BY tier           | parallel 4050 cells, 4 rows
+ SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier   | parallel 4050 cells, 4 rows
+ SELECT score, count(*) FROM lcc_scored WHERE f GROUP BY score | parallel 4050 cells, 61 rows
+ SELECT count(*) FROM lcc_tiered WHERE g AND tier = 'high'     | parallel 4050 cells, 1 rows
 (4 rows)
 
 -- ... with rows the heap is asked about
@@ -643,7 +643,7 @@ UPDATE lcc SET k = 3 WHERE id % 41 = 0;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
                       lcc_check                       
 ------------------------------------------------------
- parallel 6075 cells, 4 rows, rows tested in the heap
+ parallel 4050 cells, 4 rows, rows tested in the heap
 (1 row)
 
 RESET max_parallel_workers_per_gather;
