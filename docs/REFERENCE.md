@@ -567,12 +567,15 @@ working around a bad choice:
   two or more equality, `IN` or multi-key clauses on one Lion index really selects, when the
   planner's product of their selectivities may be far off - correlated filters - and price its
   own paths (its index scans and the count pushdown) from that (DESIGN.md §29.11, "Correlated
-  sets"). A bounded sample of the index, about 1,000 buffer accesses a planner run at most: the
-  containers of the clause with the fewest rows, chosen among its own - every one, where they are
-  few, which makes the measure an exact count - so that a table loaded in batches is measured as
-  well as one whose rows are mixed ("A sample of the driver's own rows"). A sample that meets none
-  of the AND's rows lowers the estimate only as far as it can rule out, not to one row ("What a
-  sample can rule out"). Off, Lion prices its paths from the planner's estimate.
+  sets"). A bounded sample of the index, 1,024 buffer accesses a planner run and 64 more for each
+  posting set of the widest filter it measures - an `IN` list's values each a set - up to 3,072
+  in all: the containers of the clause with the fewest rows, chosen among its own - every one,
+  where they are few, which makes the measure an exact count - so that a table loaded in batches
+  is measured as well as one whose rows are mixed ("A sample of the driver's own rows"). A sample
+  that meets none of the AND's rows lowers the estimate only as far as it can rule out, not to one
+  row ("What a sample can rule out"); a filter of more than 32 sets is measured without its widest
+  lists, which are taken as independent of the rest ("Wide lists"). Off, Lion prices its paths
+  from the planner's estimate.
 - `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
   filters correct the planner's row estimate for that table as well, so that joins above it are
   sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
