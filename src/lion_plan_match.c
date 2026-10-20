@@ -990,6 +990,34 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 }
 
 /*
+ * How the opclass of key column col of idx answers the literal multi-key
+ * query `col opno con` (lion_multikey_query_mode()), or LION_QMODE_ALL when
+ * it is no search of that opclass: what a count by cells asks of a leaf
+ * lion_analyze_leaf() does not take, whose rows are none - `tags && '{}'` -
+ * and whose truth is then false of every value (DESIGN.md §10, "Counts by
+ * cells").
+ */
+LionQueryMode
+lion_multikey_literal_mode(IndexOptInfo *idx, AttrNumber col, Oid opno,
+						   Const *con)
+{
+	int			strategy;
+	Oid			extractquery;
+
+	if (col < 1 || col > idx->nkeycolumns)
+		return LION_QMODE_ALL;
+	strategy = get_op_opfamily_strategy(opno, idx->opfamily[col - 1]);
+	extractquery = get_opfamily_proc(idx->opfamily[col - 1],
+									 idx->opcintype[col - 1],
+									 idx->opcintype[col - 1],
+									 LION_EXTRACTQUERY_PROC);
+	if (!LION_STRAT_IS_MULTI_SEARCH(strategy) || !OidIsValid(extractquery))
+		return LION_QMODE_ALL;
+	return lion_multikey_query_mode(extractquery, (StrategyNumber) strategy,
+									con, false);
+}
+
+/*
  * Extract a multi-key query at plan time and say whether the posting sets can
  * answer it exactly (DESIGN.md §17).  Only then is a LITERAL query pushed
  * down: an ALL-mode query would need every row rechecked against the heap,

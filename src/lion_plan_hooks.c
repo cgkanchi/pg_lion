@@ -19,6 +19,8 @@
 bool		lion_enable_count_pushdown = true;
 bool		lion_enable_filter_switch = true;
 bool		lion_enable_decoded_walk = true;
+bool		lion_enable_count_cells = true;
+int			lion_count_cells_max = 1048576;
 bool		lion_enable_topk = true;
 bool		lion_enable_count_residual = true;
 bool		lion_enable_count_partial = true;
@@ -680,6 +682,30 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	distattno = priv.distattno;
 
 	/*
+	 * A count by cells (DESIGN.md §10, "Counts by cells") groups by no
+	 * column: its driver's is walked, not emitted.  What it emits is the
+	 * truth of each predicate in a cell, first in custom_scan_tlist, which
+	 * setrefs.c matches the GROUP BY's expressions and the clauses over the
+	 * predicates against, top down, so that the node's projection computes
+	 * them from the truths and its qual tests them once a cell.
+	 */
+	if (priv.ncelldim > 0)
+	{
+		int			i = 0;
+
+		groupattno = groupattno2 = 0;
+		foreach(lc, priv.cellexprs)
+		{
+			ctlist = lappend(ctlist,
+							 makeTargetEntry((Expr *) copyObject(lfirst(lc)),
+											 list_length(ctlist) + 1,
+											 NULL, true));
+			kinds = lappend_int(kinds, LION_TL_CELLPRED(i));
+			i++;
+		}
+	}
+
+	/*
 	 * A leaf of an OR constrains no column of the result (DESIGN.md §19), so
 	 * it neither pins a value the target list may print nor makes a
 	 * `count(col)` zero: the other arms select rows it says nothing about.
@@ -722,10 +748,29 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		List	   *refs;
 		ListCell   *l2;
 
-		if (IsA(sexpr, Var) || IsA(sexpr, Aggref) ||
-			lion_plan_is_group_coalesce(sexpr, &priv))
+		if (IsA(sexpr, Aggref) ||
+			(priv.ncelldim == 0 &&
+			 (IsA(sexpr, Var) ||
+			  lion_plan_is_group_coalesce(sexpr, &priv))))
 		{
 			want = lappend(want, tle);
+			continue;
+		}
+
+		/* ... beside cells, its counts: its predicates are emitted above */
+		if (priv.ncelldim > 0)
+		{
+			refs = pull_var_clause((Node *) tle->expr,
+								   PVC_INCLUDE_AGGREGATES |
+								   PVC_RECURSE_PLACEHOLDERS);
+			foreach(l2, refs)
+			{
+				if (IsA(lfirst(l2), Aggref))
+					want = lappend(want,
+								   makeTargetEntry((Expr *) lfirst(l2),
+												   list_length(want) + 1,
+												   NULL, true));
+			}
 			continue;
 		}
 		refs = lion_vcol_refs_with((Node *) tle->expr, priv.vcols);
@@ -961,7 +1006,7 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	}
 
 	cscan->scan.plan.targetlist = tlist;
-	cscan->scan.plan.qual = having;
+	cscan->scan.plan.qual = list_concat_copy(having, priv.cellquals);
 	cscan->scan.scanrelid = 0;
 	cscan->flags = best_path->flags;
 	cscan->custom_plans = NIL;
@@ -978,6 +1023,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_exprs = priv.consts;
 	priv.consts = NIL;
 	priv.having = NIL;
+
+	/* the cells' expressions are custom_scan_tlist's and the qual's now */
+	priv.cellexprs = NIL;
+	priv.cellquals = NIL;
 
 	/* the filters' conditions numbered the target list, and are done */
 	priv.filterexprs = NIL;

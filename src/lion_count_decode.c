@@ -336,6 +336,15 @@ lion_decode_recheck_flush(LionDecodeRecheck *rc)
 	{
 		if (rc->vis[i])
 		{
+			/*
+			 * A code past the tally's is a row two entries of one column
+			 * label (lion_count_cells()), which no row the snapshot sees can
+			 * be: a heap TID is in one entry of a scalar index at a time.
+			 */
+			if (rc->codes[i] >= rc->tally->ncells)
+				elog(ERROR, "lion index count: a visible row (%u,%u) in two entries of one column",
+					 ItemPointerGetBlockNumber(&cx->tids[i]),
+					 ItemPointerGetOffsetNumber(&cx->tids[i]));
 			lion_decode_tally_add(rc->tally, rc->codes[i], 1);
 			rc->dstats->rows++;
 		}
@@ -880,6 +889,555 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 		if (BufferIsValid(ccx[c].vmbuf))
 			ReleaseBuffer(ccx[c].vmbuf);
 	}
+	if (BufferIsValid(base.vmbuf))
+	{
+		if (cache != NULL && !BufferIsValid(cache->vmbuf))
+		{
+			cache->vmbuf = base.vmbuf;
+			cache->vmrelid = RelationGetRelid(heap);
+		}
+		else
+			ReleaseBuffer(base.vmbuf);
+	}
+	dstats->spills += tally->nspills;
+	tally->nspills = 0;
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+}
+
+/* ---------------------------------------------------------------------
+ * Counts by cells
+ * --------------------------------------------------------------------- */
+
+/* Do the keys whose bits mask holds satisfy tree n, an AND and OR of keys? */
+static bool
+lion_cells_tree(const LionKeyNode *n, uint64 mask)
+{
+	int			i;
+
+	switch (n->kind)
+	{
+		case LION_KN_KEY:
+			Assert(n->keyno >= 0 && n->keyno < 63);
+			return (mask & (UINT64CONST(1) << n->keyno)) != 0;
+		case LION_KN_AND:
+			for (i = 0; i < n->nargs; i++)
+			{
+				if (!lion_cells_tree(n->args[i], mask))
+					return false;
+			}
+			return true;
+		case LION_KN_OR:
+			for (i = 0; i < n->nargs; i++)
+			{
+				if (lion_cells_tree(n->args[i], mask))
+					return true;
+			}
+			return false;
+		default:
+			elog(ERROR, "lion index count: a key tree of kind %d in a count by cells",
+				 (int) n->kind);
+	}
+	return false;					/* keep the compiler quiet */
+}
+
+/*
+ * The outcome of a row of multi-key dimension dim whose labels' bits are
+ * mask: NULL's, for a row of its NULL entry; otherwise the bit of each leaf
+ * whose key tree the row's keys satisfy - none for a row of no key, the
+ * EMPTY entry's among them.
+ */
+int
+lion_cells_outcome(const LionCellDim *dim, uint64 mask)
+{
+	int			out = 0;
+	int			b;
+
+	Assert(dim->multi);
+	if ((mask & LION_CELL_NULLBIT) != 0)
+		return dim->nullout;
+	if (dim->map != NULL)
+		return dim->map[mask];
+	for (b = 0; b < dim->nbit; b++)
+	{
+		if (lion_cells_tree(dim->trees[b], mask))
+			out |= 1 << b;
+	}
+	return out;
+}
+
+/*
+ * COUNTS BY CELLS (DESIGN.md §10, "Counts by cells"): the driver's sets in
+ * one pass of its decoded walk, every row of them the WHERE keeps labelled
+ * by the dimensions and counted under its cell's code.
+ *
+ * THE WALK is lion_count_groups_decode()'s with one column: the driver's
+ * cursors keep their pins and drive, the copy of the WHERE says which of
+ * their rows count, and the map is asked at a key once every driver cursor
+ * standing there has copied its container.  The labels take the place of the
+ * other columns: pinless cursors, each sought to the key and decoded there.
+ * A scalar dimension's labels are entries of one index, disjoint, so a row
+ * is in one of them at most and its outcome is added to its code as the
+ * label is decoded; a row in none has outcome 0, which adds nothing.  A
+ * multi-key dimension's row may be in several of its keys: their bits are
+ * gathered first, a generation stamping each row's, and the outcome they
+ * make is added after the dimension's last label.
+ *
+ * WHY IT IS EXACT is the decoded walk's argument (lion_count_groups_decode()),
+ * with labels for columns.  Every row counted is in exactly one pinned set of
+ * the driver - its entry of the driver's column, located for the pass under
+ * the entry's pin; and a row is labelled only by sets read after the snapshot
+ * was taken, which hold every row the snapshot sees that the label's value or
+ * key is that of: the row was in every index before its transaction
+ * committed, and it is not removed from any while the snapshot sees it.
+ * What a label lists that the snapshot does not see is a dead row, on a heap
+ * page VACUUM has not set all-visible while the driver's container still
+ * holds it (the decoded walk's argument again), so it goes to the heap and
+ * is not counted.  The rows of a NOPIN set of the driver, of one read from a
+ * copy, and every row in recovery or under a row filter go to the heap as
+ * well; so does a row whose code is past the tally's, which only a dead row
+ * in two entries of one column can have, and which the recheck refuses to
+ * find visible.
+ */
+void
+lion_count_cells(Relation heap, Snapshot snapshot,
+				 const LionDecodeCol *driver, const uint64 *drvadd,
+				 int ndim, const LionCellDim *dims,
+				 int nlabel, const LionCellLabel *labels,
+				 uint64 ncells, uint32 lokey, uint64 hikey,
+				 const LionPostingSet *where, LionDecodeTally *tally,
+				 LionCountStats *stats, LionDecodeStats *dstats,
+				 LionVisCache *cache, bool rel_read_only)
+{
+	const LionMatSet *mat = NULL;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionCountCtx base;
+	LionCountCtx dcx;
+	LionCountCtx lcx;
+	LionDecodeRecheck rc;
+	int			nd = driver->nsets;
+	int			ntotal = nd + nlabel;
+	LionSetCursor *cur;
+	int		   *curlab;
+	int		   *curval;
+	int			ncur = 0;
+	LionGroupEnt *heap0;
+	LionGroupEnt *heapr;
+	int			nheap0 = 0;
+	int			nheapr = 0;
+	int		   *hot;
+	bool	   *trust0;
+	uint64	   *present;
+	uint64	   *rows;
+	uint64	   *wimg;
+	uint16	   *members;
+	uint32	   *val0;
+	uint64	   *code;
+	uint64	   *acc;
+	uint32	   *gen;
+	uint16	   *touched;
+	uint32		curgen = 0;
+	LionContainer *buf = NULL;
+	uint32		firstkey = lokey;
+	int			idx = 0;
+	int			v;
+	int			i;
+
+	Assert(ndim >= 1);
+	Assert(tally->ncells == ncells);
+	if (where != NULL)
+	{
+		if (!where->found || where->mat == NULL ||
+			where->mat->ncontainers == 0)
+			return;				/* the WHERE selects nothing */
+		mat = where->mat;
+		Assert(mat->collected);
+		firstkey = Max(firstkey, lion_mat_key(mat, 0));
+	}
+	if (nd <= 0 || (uint64) firstkey >= hikey)
+		return;
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion index count by cells",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	if (cache != NULL && cache->windowed)
+		elog(ERROR, "lion index count: a count by cells confined to a window of keys");
+
+	/* lion_count_groups_decode()'s set-up, for one column and the labels */
+	memset(&base, 0, sizeof(base));
+	base.cxt = cxt;
+	base.heap = heap;
+	base.snapshot = snapshot;
+	base.vmbuf = InvalidBuffer;
+	if (cache != NULL && BufferIsValid(cache->vmbuf))
+	{
+		if (cache->vmrelid == RelationGetRelid(heap))
+		{
+			base.vmbuf = cache->vmbuf;
+			cache->vmbuf = InvalidBuffer;
+			cache->vmrelid = InvalidOid;
+		}
+		else
+			lion_vis_cache_release_vm(cache);
+	}
+	base.serializable = IsolationIsSerializable();
+	base.in_recovery = RecoveryInProgress();
+	base.rel_read_only = rel_read_only;
+	base.raw = true;
+	base.tids_sorted = true;
+	lion_vis_cache_begin(cache, heap, snapshot);
+	base.cache = cache;
+	base.filter = (cache != NULL) ? cache->filter : NULL;
+	if (base.filter != NULL && base.filter->heap != heap)
+		elog(ERROR, "lion index count: a row filter for another relation");
+	base.batchmax = lion_recheck_budget_for(LION_DECODE_RECHECK_ENTRY);
+
+	memset(&rc, 0, sizeof(rc));
+	rc.cx = &base;
+	rc.tally = tally;
+	rc.dstats = dstats;
+
+	cur = (LionSetCursor *) palloc(sizeof(LionSetCursor) * ntotal);
+	curlab = (int *) palloc(sizeof(int) * ntotal);
+	curval = (int *) palloc(sizeof(int) * ntotal);
+	heap0 = (LionGroupEnt *) palloc(sizeof(LionGroupEnt) * ntotal);
+	heapr = (LionGroupEnt *) palloc(sizeof(LionGroupEnt) * ntotal);
+	hot = (int *) palloc(sizeof(int) * ntotal);
+	trust0 = (bool *) palloc(sizeof(bool) * nd);
+	present = (uint64 *) palloc(LION_BITSET_BYTES);
+	rows = (uint64 *) palloc(LION_BITSET_BYTES);
+	wimg = (uint64 *) palloc(LION_BITSET_BYTES);
+	members = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	val0 = (uint32 *) palloc(sizeof(uint32) * LION_CONTAINER_RANGE);
+	code = (uint64 *) palloc(sizeof(uint64) * LION_CONTAINER_RANGE);
+	acc = (uint64 *) palloc(sizeof(uint64) * LION_CONTAINER_RANGE);
+	gen = (uint32 *) palloc0(sizeof(uint32) * LION_CONTAINER_RANGE);
+	touched = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
+	if (mat != NULL && lion_mat_spills(mat))
+		buf = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
+
+	/* the driver's cursors keep their pins; the labels' let go of each page */
+	dcx = base;
+	dcx.vmbuf = InvalidBuffer;
+	dcx.droppins = false;
+	lcx = base;
+	lcx.vmbuf = InvalidBuffer;
+	lcx.droppins = true;
+	for (v = 0; v < nd; v++)
+	{
+		LionPostingSet *ps = &driver->sets[v];
+
+		trust0[v] = ps->found && !ps->nopin && ps->mat == NULL;
+		if (!ps->found)
+			continue;
+		lion_cursor_init_at(&cur[ncur], ps, &dcx, false, firstkey,
+							driver->images != NULL ? &driver->images[v] : NULL);
+		curlab[ncur] = -1;
+		curval[ncur] = v;
+		if (cur[ncur].valid)
+			lion_group_heap_push(heap0, &nheap0, cur[ncur].cur->ckey, ncur);
+		ncur++;
+	}
+	for (v = 0; v < nlabel; v++)
+	{
+		if (!labels[v].set->found)
+			continue;
+		Assert(v == 0 || labels[v].dim >= labels[v - 1].dim);
+		lion_cursor_init_at(&cur[ncur], labels[v].set, &lcx, true, firstkey,
+							labels[v].image);
+		curlab[ncur] = v;
+		curval[ncur] = -1;
+		if (cur[ncur].valid)
+			lion_group_heap_push(heapr, &nheapr, cur[ncur].cur->ckey, ncur);
+		ncur++;
+	}
+
+	while (nheap0 > 0)
+	{
+		uint32		key = heap0[0].ckey;
+		BlockNumber firstblk = lion_ckey_first_block(key);
+		const uint64 *wbits = NULL;
+		int			nhot0;
+		int			nhot = 0;
+		uint64		wanted = 0;
+		uint64		allvis;
+		uint64		counted = 0;
+		int			b;
+
+		if ((uint64) key >= hikey)
+			break;
+
+		/* the copy at or past the smallest key the driver stands at */
+		if (mat != NULL)
+		{
+			base.stats.copy_seeks++;
+			idx = lion_mat_seek(mat, idx, key);
+			if (idx >= mat->ncontainers)
+				break;
+			if (lion_mat_key(mat, idx) != key)
+			{
+				uint32		target = lion_mat_key(mat, idx);
+
+				while (nheap0 > 0 && heap0[0].ckey < target)
+				{
+					LionGroupEnt e = lion_group_heap_pop(heap0, &nheap0);
+
+					lion_cursor_seek(&cur[e.g], target);
+					if (cur[e.g].valid)
+						lion_group_heap_push(heap0, &nheap0,
+											 cur[e.g].cur->ckey, e.g);
+				}
+				CHECK_FOR_INTERRUPTS();
+				continue;
+			}
+		}
+
+		/* the driver's cursors at the key, and the labels sought to it */
+		while (nheap0 > 0 && heap0[0].ckey == key)
+			hot[nhot++] = lion_group_heap_pop(heap0, &nheap0).g;
+		nhot0 = nhot;
+		while (nheapr > 0 && heapr[0].ckey < key)
+		{
+			LionGroupEnt e = lion_group_heap_pop(heapr, &nheapr);
+
+			lion_cursor_seek(&cur[e.g], key);
+			if (cur[e.g].valid)
+				lion_group_heap_push(heapr, &nheapr, cur[e.g].cur->ckey, e.g);
+		}
+		while (nheapr > 0 && heapr[0].ckey == key)
+			hot[nhot++] = lion_group_heap_pop(heapr, &nheapr).g;
+
+		/* ... the labels in their order, so a dimension's come together */
+		for (i = nhot0 + 1; i < nhot; i++)
+		{
+			int			h = hot[i];
+			int			j;
+
+			for (j = i; j > nhot0 && curlab[hot[j - 1]] > curlab[h]; j--)
+				hot[j] = hot[j - 1];
+			hot[j] = h;
+		}
+
+		/* the driver: each row's value, its part of the code, and the rows */
+		memset(present, 0, LION_BITSET_BYTES);
+		for (i = 0; i < nhot0; i++)
+		{
+			int			k = hot[i];
+			uint32		n = lion_container_to_array(cur[k].cur, members);
+			uint64		add = drvadd[curval[k]];
+			uint32		j;
+
+			for (j = 0; j < n; j++)
+			{
+				uint16		lo = members[j];
+
+				val0[lo] = (uint32) curval[k];
+				code[lo] = add;
+				present[lo >> 6] |= UINT64CONST(1) << (lo & 63);
+			}
+		}
+
+		/* ... of them, the ones the WHERE keeps */
+		if (mat != NULL)
+		{
+			const LionContainer *w =
+				lion_count_posfilter(&base, lion_mat_container(&base, mat, idx, buf));
+
+			if (w->type == LION_CT_BITSET)
+				wbits = LION_BITSET_DATA(w);
+			else
+			{
+				memset(wimg, 0, LION_BITSET_BYTES);
+				lion_container_or_into_bitset(w, wimg);
+				wbits = wimg;
+			}
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+				rows[i] = present[i] & wbits[i];
+		}
+		else
+			memcpy(rows, present, LION_BITSET_BYTES);
+
+		/* the labels, a dimension at a time */
+		i = nhot0;
+		while (i < nhot)
+		{
+			int			d = labels[curlab[hot[i]]].dim;
+			const LionCellDim *dim = &dims[d];
+			int			end = i;
+
+			while (end < nhot && labels[curlab[hot[end]]].dim == d)
+				end++;
+			if (!dim->multi)
+			{
+				for (; i < end; i++)
+				{
+					int			k = hot[i];
+					uint64		add = labels[curlab[k]].bits * dim->weight;
+					uint32		n = lion_container_to_array(cur[k].cur, members);
+					uint32		j;
+
+					for (j = 0; j < n; j++)
+						code[members[j]] += add;
+				}
+			}
+			else
+			{
+				int			nt = 0;
+				int			t;
+
+				if (++curgen == 0)
+				{
+					memset(gen, 0, sizeof(uint32) * LION_CONTAINER_RANGE);
+					curgen = 1;
+				}
+				for (; i < end; i++)
+				{
+					int			k = hot[i];
+					uint64		bits = labels[curlab[k]].bits;
+					uint32		n = lion_container_to_array(cur[k].cur, members);
+					uint32		j;
+
+					for (j = 0; j < n; j++)
+					{
+						uint16		lo = members[j];
+
+						if (gen[lo] != curgen)
+						{
+							gen[lo] = curgen;
+							acc[lo] = 0;
+							touched[nt++] = lo;
+						}
+						acc[lo] |= bits;
+					}
+				}
+				for (t = 0; t < nt; t++)
+				{
+					uint16		lo = touched[t];
+
+					if ((rows[lo >> 6] & (UINT64CONST(1) << (lo & 63))) != 0)
+						code[lo] += (uint64) lion_cells_outcome(dim, acc[lo]) *
+							dim->weight;
+				}
+			}
+		}
+
+		/* the heap blocks the rows are on */
+		for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		{
+			const int	wpb = (1 << LION_OFFSET_BITS) / 64;
+			uint64		any = 0;
+			int			w;
+
+			for (w = b * wpb; w < (b + 1) * wpb; w++)
+				any |= rows[w];
+			if (any != 0)
+				wanted |= UINT64CONST(1) << b;
+		}
+
+		if (wanted != 0)
+		{
+			/* the map, once for the key, every driver container here copied */
+			LION_INJECTION_POINT("lion-count-containers-pinned");
+			if (base.in_recovery || lion_row_filter_heap(base.filter))
+				allvis = 0;
+			else
+			{
+				allvis = lion_vm_allvisible_mask(heap, firstblk, wanted,
+												 &base.vmbuf,
+												 &base.stats.vm_pins);
+				base.stats.vm_checks++;
+#ifdef LION_VM_MASK_CHECK
+				lion_vm_mask_check(heap, firstblk, wanted, allvis,
+								   &base.vmbuf);
+#endif
+			}
+
+			/* each row's cell, counted or sent to the heap */
+			for (i = 0; i < LION_BITSET_WORDS; i++)
+			{
+				uint64		bits = rows[i];
+
+				while (bits != 0)
+				{
+					uint32		lo = (uint32) (i * 64 +
+											   pg_rightmost_one_pos64(bits));
+					uint64		c = code[lo];
+					uint64		blkbit = UINT64CONST(1) << (lo >> LION_OFFSET_BITS);
+
+					bits &= bits - 1;
+					if (c >= ncells)
+						lion_decode_recheck_add(&rc, key, lo, ncells);
+					else if ((allvis & blkbit) != 0 && trust0[val0[lo]])
+					{
+						lion_decode_tally_add(tally, c, 1);
+						counted |= blkbit;
+						dstats->rows++;
+					}
+					else
+						lion_decode_recheck_add(&rc, key, lo, c);
+				}
+			}
+
+			/* the blocks counted from the map, locked as an index-only scan's */
+			if (base.serializable)
+			{
+				uint64		m = counted;
+
+				while (m != 0)
+				{
+					int			bb = pg_rightmost_one_pos64(m);
+
+					m &= m - 1;
+					PredicateLockPage(heap, firstblk + (BlockNumber) bb,
+									  snapshot);
+				}
+			}
+			base.stats.blocks_skipped_via_vm += pg_popcount64(counted);
+		}
+		dstats->keys++;
+
+		/* only now do the cursors here move on (§9), as the decoded walk's */
+		if (mat != NULL && idx + 1 >= mat->ncontainers)
+			break;
+		for (i = 0; i < nhot; i++)
+		{
+			int			k = hot[i];
+
+			if (mat != NULL && lion_mat_key(mat, idx + 1) != key + 1)
+				lion_cursor_seek(&cur[k], lion_mat_key(mat, idx + 1));
+			else
+				lion_cursor_next(&cur[k]);
+			if (cur[k].valid)
+			{
+				if (curlab[k] < 0)
+					lion_group_heap_push(heap0, &nheap0, cur[k].cur->ckey, k);
+				else
+					lion_group_heap_push(heapr, &nheapr, cur[k].cur->ckey, k);
+			}
+		}
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	for (i = 0; i < ncur; i++)
+		lion_cursor_close(&cur[i]);
+
+	/* no index page is pinned any more: the heap answers the rest */
+	lion_decode_recheck_flush(&rc);
+
+	if (stats != NULL)
+	{
+		lion_count_stats_add(stats, &base.stats);
+		lion_count_stats_add(stats, &dcx.stats);
+		lion_count_stats_add(stats, &lcx.stats);
+	}
+	if (BufferIsValid(dcx.vmbuf))
+		ReleaseBuffer(dcx.vmbuf);
+	if (BufferIsValid(lcx.vmbuf))
+		ReleaseBuffer(lcx.vmbuf);
 	if (BufferIsValid(base.vmbuf))
 	{
 		if (cache != NULL && !BufferIsValid(cache->vmbuf))
