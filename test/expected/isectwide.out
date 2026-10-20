@@ -232,7 +232,53 @@ SELECT sets, (SELECT count(*) FROM iw WHERE a = 1 AND b IN (1, 2) AND c = 1 AND 
    31 |    1280 |   1280
 (1 row)
 
-DROP TABLE iw, iw_q;
+-- ---------- 4. one table, several lion indexes ----------
+-- A conjunction is measured for its table, not for an index: every lion
+-- index of iw that answers it takes the one measurement, whichever asked
+-- first.  Three indexes of iw's columns, and three of the 32-set
+-- conjunctions in one statement: measured once an index, the run's eight
+-- probes would run out at the third conjunction's third index, whose path,
+-- priced for core's product of a fraction of a row, would be the cheapest,
+-- under a relation of the probe's rows.  Each conjunction's Bitmap Index
+-- Scan, whichever index it takes, is estimated at its Bitmap Heap Scan's
+-- rows, and both within a factor of three of the rows.
+CREATE INDEX iw_i2 ON iw USING lion (k, h, g, f, e, d, c, b, a, m, j);
+CREATE INDEX iw_i3 ON iw USING lion (j, m, a, b, c, d, e, f, g, h, k);
+CREATE FUNCTION iw_scans(q text, OUT heap_rows bigint, OUT index_rows bigint)
+RETURNS SETOF record LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN QUERY
+		SELECT (s->>'Plan Rows')::bigint, (s->'Plans'->0->>'Plan Rows')::bigint
+		  FROM jsonb_path_query(j::jsonb,
+				'$.** ? (@."Node Type" == "Bitmap Heap Scan")') s;
+END $$;
+CREATE TABLE iw_k AS
+SELECT n, replace(q, 'k IN (1, 2, 3)', format('k IN (1, 2, 3, %s)', 4 + n)) AS q
+  FROM iw_q, generate_series(0, 2) n WHERE sets = 31;
+SELECT b.n + 1 AS conjunction, iw_actual(b.q) AS actual,
+	   s.index_rows = s.heap_rows AS index_agrees,
+	   s.heap_rows BETWEEN iw_actual(b.q) / 3 AND iw_actual(b.q) * 3 AS within_3x
+  FROM iw_k b
+  JOIN iw_scans((SELECT string_agg(format('(%s)', q), ' UNION ALL ' ORDER BY n)
+				   FROM iw_k)) WITH ORDINALITY s ON s.ordinality = b.n + 1
+ ORDER BY b.n;
+ conjunction | actual | index_agrees | within_3x 
+-------------+--------+--------------+-----------
+           1 |   1280 | t            | t
+           2 |   1280 | t            | t
+           3 |   1280 | t            | t
+(3 rows)
+
+DROP TABLE iw, iw_q, iw_k;
 DROP FUNCTION iw_rows(text, boolean), iw_relrows(text), iw_actual(text),
-	iw_planbuf(text, boolean);
+	iw_planbuf(text, boolean), iw_scans(text);
 RESET default_statistics_target;

@@ -1,0 +1,1 @@
+../btreescan_parallel_serializable.spec
