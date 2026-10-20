@@ -8666,10 +8666,10 @@ leading with the key still pays: a C or ICU collation gets abbreviated keys ther
 workers only for btree). nbtree's and GIN's shape: the leader sets up a parallel heap scan, a shared
 fileset and one TapeShare per participant, launches the workers and takes part itself. Each
 participant scans its block chunks into an accumulator of its own, with maintenance_work_mem divided
-between them, spills as a serial build does, and at the end merges its runs into ONE tape holding a
-section per key column (`lion_spool_export()`). The leader waits for all of them, imports the tapes
-and merges them a column at a time exactly as a serial build merges its runs, then does the same
-single write pass with one bulk writer - the write pass stays serial, as nbtree's does. Workers get
+between them, spills as a serial build does, and at the end merges each key column's runs into ONE
+tape for that column (`lion_spool_export()`). A column's runs and its tape share a file of the
+shared fileset, so the tape re-uses the blocks the runs free as the merge reads them. The write that
+follows is split by column, since no two columns share a key (below). Workers get
 their own IndexInfo, so expression and partial indexes work, and report reltuples, index tuples and
 a broken HOT chain through shared memory; how many there are is plan_create_index_workers()'s
 decision (max_parallel_maintenance_workers, the table's `parallel_workers`, 32MB of
@@ -8679,6 +8679,51 @@ at 8kB, so that each container's codes come from one participant. The chunk size
 (`table_block_parallelscan_startblock_init()`), not something an index AM can set, and the merge's
 "stay on the smallest input" already costs one comparison per chunk; alignment would buy nothing
 measurable.)*
+
+**The write is split by column** (2026-10-20). Once every participant's tapes are there, the workers
+take the columns one by one, the largest left first (by the size of the participants' files of it),
+while the leader writes the first: whoever writes a column imports the participants' tapes of it and
+merges them as above, so merging, grouping codes into containers, posting and position trees and
+summaries all run in parallel. The directory, the meta page and the one bulk writer stay the
+leader's. A worker writes its column with the builders a serial build uses into a file of its own
+instead of the index: its blocks are numbered by a counter of its own from 0, each finished page
+goes to the file with its number, and so does each entry tuple, which a serial build would add to
+the directory there and then; every record says how many blocks the worker had handed out by then.
+The leader then takes each column in turn: one nobody has taken yet it writes itself, straight into
+the index, and one a worker took it REPLAYS once the worker is done. Two columns are the leader's
+own and no worker takes them: the first, which it can start on at once, and the largest when it is
+at least as large as all the others together - a worker writing that one would leave the leader
+replaying it long after the rest are written, at more than the workers saved on them, where the
+leader writing it itself starts on it as soon as the columns before it are in. At each record of the
+file it first gives the worker's blocks handed out since the last record the next numbers of its own
+counter, then adds the entry to the directory, which opens directory pages exactly where a serial
+build would - a serial build's counter interleaves a column's tree blocks with the directory pages
+its entries open, and nothing else - so every block gets the number a serial build gives it, and
+once the few block references a worker writes are renumbered (a tree page's rightlink, owner stamp
+and downlinks; an entry's head, tail and position tree root) the index is the serial build's, page
+for page, which the build tests check byte for byte. The leader's replay costs it the directory and
+the page writes, and their WAL: timed by hand, about an eighth of what the column cost the worker
+for a column of a few keys, about half for a column of a key a row, where the directory is most of
+the index. Memory: each process writing a column takes its share of maintenance_work_mem, and so do
+the column's summaries (an eighth of it, and as much again for the tuplesort a large bucket goes
+to); the leader takes all of it for a column it writes once no worker can still be writing one, as
+for an index of one column. The workers' files take temporary space up to the size of the columns
+they write, each deleted once the leader has replayed it.
+
+- **Measured** (PG 18.6, 4 cores, maintenance_work_mem 256MB, 3 workers, 3M synthetic rows, each
+  build the mean of two or three runs alternating with the build before the split):
+  - seven scalar columns of 10 to 2M keys (191MB index): 5,353 ms before, 4,340 ms after, 1.23x;
+  - sixteen scalar columns of 2 to 3M keys (354MB index): 8,549 ms before, 5,985 ms after, 1.43x;
+  - a tsvector column and the seven after it: 76.4 s before, 72.4 s after, 1.06x, the workers
+    writing the seven while the leader writes the tsvector column;
+  - the seven and a tsvector column after them (77.7 s before, 76.1 s after), and the tsvector
+    column alone (68.1 s, 69.2 s): no change beyond the runs' own spread of about 5%. The tsvector
+    column is most of the write, and one process writes it either way.
+- **Not done:** splitting one column by key range, which an index of one large column (a single
+  tsvector, say) would need to gain anything: the summaries are cut across the whole column and
+  would have to be stitched. Nor do the workers write their pages into the index themselves: the
+  bulk writer is one process's, and the block numbers are only known once the leader has replayed
+  the columns before.
 
 **The index is the one the sorted build wrote, page for page.** The same keys come out in the same
 order with the same codes and the same stored bytes, and the builders and the directory are
