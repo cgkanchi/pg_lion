@@ -141,11 +141,20 @@ def arm(*parts):
     return d
 
 
+# The margin the lion arm forces lion's paths with: core's enable_indexscan
+# and enable_indexonlyscan disable lion's paths with core's index scans
+# (DESIGN.md §39, "Core's switches"), so the arm leaves those on and divides
+# lion's price by this instead; plan_cost() takes the division back out.
+LION_FORCE_MARGIN = 1000.0
+
 ARMS = {
     'chosen': {},
-    # every core scan and join method disabled: what is left that is not is
+    # every core scan but the index scans, the AM's plain scans and every
+    # join method disabled, and the margin at LION_FORCE_MARGIN: what wins is
     # lion's path, where the query has one
-    'lion': arm(off(*SCANS), off(*JOINS), off('enable_tidscan')),
+    'lion': arm(off('enable_seqscan', 'enable_bitmapscan', 'enable_tidscan',
+                    'pg_lion.enable_plain_scan'), off(*JOINS),
+                {'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
     'core': arm(LION_OFF),
     'seq': arm(LION_OFF, off('enable_bitmapscan', 'enable_indexscan',
                              'enable_indexonlyscan')),
@@ -218,6 +227,10 @@ class Catalog:
         out = psql.run("SET client_min_messages = warning;\nLOAD 'pg_lion';\n"
                        "SELECT name FROM pg_settings WHERE name LIKE 'pg_lion.%';\n")
         self.lion_settings = set(out.split())
+        out = psql.run("SET client_min_messages = warning;\nLOAD 'pg_lion';\n"
+                       "SELECT max_val FROM pg_settings "
+                       "WHERE name = 'pg_lion.pushdown_margin';\n").strip()
+        self.margin_max = float(out) if out else None
         self.version = psql.run('SHOW server_version_num;\n').strip()
 
     def has(self, name):
@@ -305,15 +318,29 @@ def walk(n):
         yield from walk(k)
 
 
-def plan_cost(p):
+def lion_costs(n):
+    """The total costs of the topmost lion nodes of the plan tree n."""
+    if n['Node Type'] == 'Custom Scan' and \
+            n.get('Custom Plan Provider', '').startswith('Lion'):
+        return [float(n['Total Cost'])]
+    return [c for k in n.get('Plans', []) for c in lion_costs(k)]
+
+
+def plan_cost(p, scale=1.0):
+    """The plan's total cost; with a scale, as if its lion nodes' costs had
+    been that many times what they are (each node's cost is in its parents'
+    too)."""
     c = float(p['Plan']['Total Cost'])
     # disable_cost before PostgreSQL 18: a plan's own cost is what is left
     if c >= 1e10:
         c = c % 1e10
+    if scale != 1.0:
+        c += sum(x % 1e10 for x in lion_costs(p['Plan'])) * (scale - 1.0)
     return c
 
 
-def plan_all(psql, cat, base, q, arms):
+def plan_all(psql, cat, base, q, arms, scales=None):
+    """scales: {arm: the factor plan_cost() scales its lion nodes by}"""
     script = base
     for name, settings in arms.items():
         script += 'BEGIN;\n' + set_local(cat.usable(settings))
@@ -322,7 +349,9 @@ def plan_all(psql, cat, base, q, arms):
     res = {}
     for name in arms:
         p = json.loads(out[name][0])[0]
-        res[name] = (signature(p['Plan'], cat), plan_cost(p), kind(p['Plan'], cat))
+        res[name] = (signature(p['Plan'], cat),
+                     plan_cost(p, (scales or {}).get(name, 1.0)),
+                     kind(p['Plan'], cat))
     return res
 
 
@@ -403,7 +432,18 @@ def run(args):
         if pat and not pat.search(qid):
             continue
         arms = {n: arm(s, extra) for n, s in ARMS.items()}
-        planned = plan_all(psql, cat, base, q, arms)
+        # the lion arm's margin is its own, whatever --set says, and its
+        # lion nodes are priced back at the margin the other arms plan at;
+        # a build whose margin stops at 1 forces lion's paths with every
+        # core scan off, which does not disable them there
+        scales = {}
+        if cat.margin_max is not None and cat.margin_max >= LION_FORCE_MARGIN:
+            arms['lion'] = arm(arms['lion'], ARMS['lion'])
+            scales['lion'] = LION_FORCE_MARGIN / \
+                float(extra.get('pg_lion.pushdown_margin', 1))
+        else:
+            arms['lion'] = arm(off(*SCANS), off(*JOINS), off('enable_tidscan'), extra)
+        planned = plan_all(psql, cat, base, q, arms, scales)
         plans = {}
         info = {}
         for name, (sig, cost, k) in planned.items():

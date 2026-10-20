@@ -756,6 +756,14 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 	 */
 	rootbuf = lion_alloc_page(index, heaprel, false);
 	root = BufferGetBlockNumber(rootbuf);
+
+	/*
+	 * SERIALIZABLE (DESIGN.md §9): the set's readers locked the leaf, and
+	 * from now on its writers check the root, so the root takes the leaf's
+	 * predicate locks - as GIN's createPostingTree() does - here, before any
+	 * record opens, while the leaf is held exclusive.
+	 */
+	lion_predlock_copy(index, BufferGetBlockNumber(entrybuf), root);
 	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
 		posbuf = lion_alloc_page(index, heaprel, false);
 

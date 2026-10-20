@@ -36,7 +36,7 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_nestloop', 'off', true);
@@ -54,7 +54,7 @@ BEGIN
 	PERFORM set_config('enable_nestloop', 'on', true);
 	EXECUTE format('CREATE TEMP TABLE lion_sc_off AS %s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_sc_on' INTO nrows;
@@ -137,12 +137,12 @@ SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' AND 
 -- the counts themselves, through the same forced plans
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A';
 SELECT g, count(*) FROM lion_sc_t WHERE v === 'A' AND v = 'A' GROUP BY g ORDER BY g;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 /*
  * The same operator and the same value under two collations, which only the
@@ -170,7 +170,7 @@ SELECT lion_sc($$SELECT d.x, count(*) FROM lion_sc_t f JOIN lion_sc_d d ON f.g =
 SET plan_cache_mode = force_generic_plan;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 PREPARE lion_sc_p(text) AS SELECT count(*) FROM lion_sc_t WHERE v === $1 AND v = $1;
 SELECT lion_sc_pushed($$EXECUTE lion_sc_p('A')$$);
 EXECUTE lion_sc_p('A');
@@ -184,7 +184,7 @@ EXECUTE lion_sc_p('A', NULL);
 DEALLOCATE lion_sc_p;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 RESET plan_cache_mode;
 
 -- ---- two clauses the index does answer: both are sources ----------------
@@ -212,14 +212,14 @@ SELECT lion_sc($$SELECT w, count(*) FROM lion_sc_t WHERE w IN ('a', 'b') AND w I
 SELECT lion_sc($$SELECT w, count(*) FROM lion_sc_t WHERE w = 'a' AND w IN ('a', 'b') GROUP BY w$$);
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
 SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'a';
 EXPLAIN (COSTS OFF) SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w;
 SELECT w, count(*) FROM lion_sc_t WHERE w IN ('A', 'a', 'b') AND w IN ('a', 'b') GROUP BY w ORDER BY w;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---- the very same clause twice is still one source ----------------------
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND v === 'A'$$);
@@ -227,11 +227,11 @@ SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND 'A' === v$$)
 SELECT lion_sc($$SELECT count(*) FROM lion_sc_t WHERE w IN ('A', 'a') AND w IN ('A', 'a')$$);
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sc_t WHERE v === 'A' AND 'A' === v;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
+RESET pg_lion.enable_plain_scan;
 
 DROP TABLE lion_sc_d;
 DROP TABLE lion_sc_t;

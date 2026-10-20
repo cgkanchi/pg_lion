@@ -5,11 +5,13 @@
 -- leaf pages of the B-tree, and lion's set is built once, by the first
 -- participant that needs it, and read by all of them from the query's shared
 -- memory - or built by each for itself when it is too large to share.  Every
--- query below is run through the node (every core scan but the index-only
--- one disabled, and no B-tree here holds a lion filter's column) and through
--- the ordinary plan (lion's walks off, sequential scans only, serially), and
--- the answers are compared: in order under an ORDER BY, as multisets
--- otherwise.  The counters of a parallel walk are the sums of its
+-- query below is run through the node (sequential, bitmap and lion's plain
+-- scans disabled, lion's paths priced at a tenth, and no B-tree here holds a
+-- lion filter's column) and through the ordinary plan (lion's walks off,
+-- sequential scans only, serially), and the answers are compared: in order
+-- under an ORDER BY, as multisets otherwise.  At that price an ordered walk
+-- that returns most of the table is a serial one - a Gather Merge's merging
+-- is not discounted - so such results below are unordered.  The counters of a parallel walk are the sums of its
 -- participants', and are compared with the serial walk's.
 \set VERBOSITY terse
 SET client_min_messages = warning;
@@ -74,16 +76,17 @@ BEGIN
 	RETURN a;
 END $$;
 /*
- * bp_node() runs q through the node, every core scan but the index-only one
- * disabled, and names the plan's lion walks in plan order - parallel or not,
- * and their mode - what gathers them, and whether a parallel hash join is
- * among them.  bp_ordinary() runs q through the ordinary plan.  Their
- * settings end with them, inside a transaction block too.
+ * bp_node() runs q through the node, forced as the header says, and names
+ * the plan's lion walks in plan order - parallel or not, and their mode -
+ * what gathers them, and whether a parallel hash join is among them.
+ * bp_ordinary() runs q through the ordinary plan.  Their settings end with
+ * them, inside a transaction block too.
  */
 CREATE FUNCTION bp_node(q text, OUT walks text, OUT rows text[])
 LANGUAGE plpgsql
 SET enable_seqscan = off SET enable_bitmapscan = off
-SET enable_indexscan = off SET enable_tidscan = off
+SET pg_lion.enable_plain_scan = off SET pg_lion.pushdown_margin = 10
+SET enable_tidscan = off
 AS $$
 DECLARE
 	ln text;
@@ -146,15 +149,16 @@ BEGIN
 	RETURN format('%s, %s rows', n.walks, coalesce(array_length(a, 1), 0));
 END $$;
 /*
- * bp_plan() prints q's plan, every core scan but the index-only one disabled,
- * without the lines whose contents vary between majors - and with the lion
+ * bp_plan() prints q's plan, the node forced as the header says, without the
+ * lines whose contents vary between majors - and with the lion
  * indexes, and the clauses of an AND of their accesses, sorted: core orders
  * a BitmapAnd's arms by their costs, which tie differently on 16 and 17.
  */
 CREATE FUNCTION bp_plan(q text) RETURNS SETOF text
 LANGUAGE plpgsql
 SET enable_seqscan = off SET enable_bitmapscan = off
-SET enable_indexscan = off SET enable_tidscan = off
+SET pg_lion.enable_plain_scan = off SET pg_lion.pushdown_margin = 10
+SET enable_tidscan = off
 AS $$
 DECLARE
 	ln text;
@@ -193,7 +197,8 @@ END $$;
 CREATE FUNCTION bp_counters(q text) RETURNS jsonb
 LANGUAGE plpgsql
 SET enable_seqscan = off SET enable_bitmapscan = off
-SET enable_indexscan = off SET enable_tidscan = off
+SET pg_lion.enable_plain_scan = off SET pg_lion.pushdown_margin = 10
+SET enable_tidscan = off
 AS $$
 DECLARE
 	ln text;
@@ -543,10 +548,10 @@ SELECT bp_cmp($$SELECT id FROM bp WHERE tsv @@ '!w3'::tsquery$$);
  parallel LionBtreeScan index only under Gather, 38664 rows
 (1 row)
 
-SELECT bp_cmp($$SELECT k, x FROM bp WHERE tsv @@ '!w3 & !x2'::tsquery ORDER BY k$$, true);
-                             bp_cmp                             
-----------------------------------------------------------------
- parallel LionOrdered index only under Gather Merge, 33140 rows
+SELECT bp_cmp($$SELECT k, x FROM bp WHERE tsv @@ '!w3 & !x2'::tsquery$$);
+                           bp_cmp                           
+------------------------------------------------------------
+ parallel LionBtreeScan index only under Gather, 33140 rows
 (1 row)
 
 SELECT bp_same($$SELECT id FROM bp WHERE tsv @@ 'w3 & x5'::tsquery$$);
@@ -561,7 +566,7 @@ SELECT bp_same($$SELECT id FROM bp WHERE tsv @@ '!w3'::tsquery$$);
  hits 39748, heap fetches some, removed some, set rechecked, shared; the same serially
 (1 row)
 
-SELECT bp_same($$SELECT k, x FROM bp WHERE tsv @@ '!w3 & !x2'::tsquery ORDER BY k$$);
+SELECT bp_same($$SELECT k, x FROM bp WHERE tsv @@ '!w3 & !x2'::tsquery$$);
                                         bp_same                                        
 ---------------------------------------------------------------------------------------
  hits 39748, heap fetches some, removed some, set rechecked, shared; the same serially
@@ -592,10 +597,10 @@ SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
  parallel LionBtreeScan index only under Gather, 1 rows
 (1 row)
 
-SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3''] ORDER BY k', true);
-                             bp_cmp                             
-----------------------------------------------------------------
- parallel LionOrdered index only under Gather Merge, 22098 rows
+SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 AND c20 IN (3, 4) ORDER BY k', true);
+                            bp_cmp                             
+---------------------------------------------------------------
+ parallel LionOrdered index only under Gather Merge, 2050 rows
 (1 row)
 
 SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c2 = 1');
@@ -614,13 +619,13 @@ RESET pg_lion.enable_shared_set;
 -- at hash_mem's least, the set still fits the room of three
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
-SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3''] ORDER BY k', true);
-                             bp_cmp                             
-----------------------------------------------------------------
- parallel LionOrdered index only under Gather Merge, 22098 rows
+SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3'']');
+                           bp_cmp                           
+------------------------------------------------------------
+ parallel LionBtreeScan index only under Gather, 22098 rows
 (1 row)
 
-SELECT bp_same('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3''] ORDER BY k');
+SELECT bp_same('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3'']');
                                       bp_same                                      
 -----------------------------------------------------------------------------------
  hits 22098, heap fetches none, removed none, set exact, shared; the same serially

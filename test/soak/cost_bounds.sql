@@ -6,9 +6,12 @@
 -- as generic plans - each under 13 settings: the defaults, the margin at a
 -- hundredth, every rate at a thousandth, every rate at a thousand with the
 -- margin at a hundredth, resident index pages free or dear with
--- effective_cache_size at its extremes, core's joins, aggregates or scans
--- all off (which force lion's paths), parallel plans at both ends of the
--- rates, 64kB of work_mem, and lion's own switches off.  Each row is the
+-- effective_cache_size at its extremes, core's joins or aggregates all off
+-- (which force lion's paths), core's sequential and bitmap scans and the
+-- AM's plain scans off with the margin at a thousand (which force lion's
+-- paths over core's index scans, which enable_indexscan cannot switch off
+-- without disabling lion's), parallel plans at both ends of the rates, 64kB
+-- of work_mem, and lion's own switches off.  Each row is the
 -- plan's lion node, its estimated total cost, and whether its rows equal the
 -- same query's with lion's paths off and sequential scans only.  A cost that
 -- is NaN or infinite, or an answer that differs, is a failure; the last line
@@ -64,7 +67,7 @@ ANALYZE lct;
 CREATE OR REPLACE FUNCTION cm_set(sw text[]) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE n text; i int;
 BEGIN
-	FOREACH n IN ARRAY ARRAY['pg_lion.pushdown_margin', 'pg_lion.hashagg_rate', 'pg_lion.agg_rate',
+	FOREACH n IN ARRAY ARRAY['pg_lion.pushdown_margin', 'pg_lion.enable_plain_scan', 'pg_lion.hashagg_rate', 'pg_lion.agg_rate',
 		'pg_lion.hashjoin_rate', 'pg_lion.mergejoin_rate', 'pg_lion.bitmap_rate',
 		'pg_lion.resident_page_cost', 'effective_cache_size', 'work_mem',
 		'pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin', 'pg_lion.enable_ordered_scan',
@@ -151,7 +154,7 @@ INSERT INTO cm_s VALUES
  ('dear pages', '{pg_lion.resident_page_cost,1000000,effective_cache_size,8kB,pg_lion.pushdown_margin,0.01}'),
  ('joins off m.01', '{enable_hashjoin,off,enable_mergejoin,off,enable_nestloop,off,pg_lion.pushdown_margin,0.01,pg_lion.hashjoin_rate,1000,pg_lion.mergejoin_rate,1000}'),
  ('agg off m.01', '{enable_hashagg,off,enable_sort,off,pg_lion.pushdown_margin,0.01,pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000}'),
- ('scans off m.01', '{enable_seqscan,off,enable_indexscan,off,enable_indexonlyscan,off,enable_bitmapscan,off,pg_lion.pushdown_margin,0.01,pg_lion.agg_rate,1000,pg_lion.bitmap_rate,1000}'),
+ ('scans off m1000', '{enable_seqscan,off,enable_bitmapscan,off,pg_lion.enable_plain_scan,off,pg_lion.pushdown_margin,1000,pg_lion.agg_rate,1000,pg_lion.bitmap_rate,1000}'),
  ('par rates.001', '{max_parallel_workers_per_gather,4,parallel_setup_cost,0,parallel_tuple_cost,0,min_parallel_table_scan_size,0,min_parallel_index_scan_size,0,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001}'),
  ('par rates1000', '{max_parallel_workers_per_gather,4,parallel_setup_cost,0,parallel_tuple_cost,0,min_parallel_table_scan_size,0,min_parallel_index_scan_size,0,pg_lion.hashagg_rate,1000,pg_lion.agg_rate,1000,pg_lion.hashjoin_rate,1000,pg_lion.pushdown_margin,0.01}'),
  ('wm64k rates.001', '{work_mem,64kB,pg_lion.hashagg_rate,0.001,pg_lion.agg_rate,0.001,pg_lion.hashjoin_rate,0.001,pg_lion.bitmap_rate,0.001}'),

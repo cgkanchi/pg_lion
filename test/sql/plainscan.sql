@@ -100,12 +100,10 @@ LANGUAGE plpgsql AS $$
 DECLARE
 	used boolean;
 BEGIN
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_tidscan', 'off', true);
 	used := lpp_uses(q, 'Custom Scan \(LionOrdered\)');
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('enable_tidscan', 'on', true);
 	RETURN used;
 END $$;

@@ -22,14 +22,17 @@ SET synchronous_commit = on;
  * pushdown with no Distinct Key, "distinct walk" for one with, or "not pushed
  * down".
  *
- * "Every other scan" includes LionOrdered (DESIGN.md §30), which the core
- * switches do not disable: it walks a btree in order and filters by a lion
- * index, and this table has btrees on the very columns a DISTINCT or a GROUP
- * BY sorts by.  Core then offers an aggregate over its presorted rows, and
- * on 17 and later - where an index on any grouping or DISTINCT key counts as
- * useful for grouping, not only one on the leading key - for more queries
- * than on 16.  Left on, that plan wins on cost wherever it is cheaper and
- * says nothing about whether the node was built.
+ * Core's index scans are left on - enable_indexscan and enable_indexonlyscan
+ * disable the node too - and pg_lion.pushdown_margin marks lion's paths down
+ * against them instead.  "Every other scan" includes LionOrdered (DESIGN.md
+ * §30) and LionBtreeScan (§40), marked down alike: they walk a btree in
+ * order and filter by a lion index, and this table has btrees on the very
+ * columns a DISTINCT or a GROUP BY sorts by.  Core then offers an aggregate
+ * over their presorted rows, and on 17 and later - where an index on any
+ * grouping or DISTINCT key counts as useful for grouping, not only one on
+ * the leading key - for more queries than on 16.  Left on, that plan wins on
+ * cost wherever it is cheaper and says nothing about whether the node was
+ * built.
  */
 CREATE FUNCTION lion_uq(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -41,9 +44,10 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' AND how = 'not pushed down' THEN
@@ -58,9 +62,10 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	EXECUTE format('CREATE TEMP TABLE lion_uq_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'SELECT count(*) FROM lion_uq_on' INTO nrows;
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_uq_on EXCEPT ALL SELECT * FROM lion_uq_off) a)'
@@ -88,9 +93,10 @@ BEGIN
 	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'PREPARE lion_uqp_on AS ' || q;
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) EXECUTE lion_uqp_on(' || args || ')' LOOP
@@ -107,9 +113,10 @@ BEGIN
 	EXECUTE 'PREPARE lion_uqp_off AS ' || q;
 	EXECUTE format('CREATE TEMP TABLE lion_uq_off AS EXECUTE lion_uqp_off(%s)', args);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'DEALLOCATE lion_uqp_on';
 	EXECUTE 'DEALLOCATE lion_uqp_off';
@@ -208,15 +215,17 @@ SELECT lion_uq('SELECT count(DISTINCT id) FROM lion_uq');
 -- the EXPLAIN: a count, with no Distinct Key
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET pg_lion.enable_ordered_scan = off;
+SET pg_lion.enable_btree_scan = off;
 EXPLAIN (COSTS OFF) SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = 3 GROUP BY g;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET pg_lion.enable_ordered_scan;
+RESET pg_lion.enable_btree_scan;
 -- a parameter under a generic plan
 SELECT lion_uq_prep('SELECT g, count(DISTINCT id) FROM lion_uq WHERE a = $1 GROUP BY g', '3');
 SELECT lion_uq_prep('SELECT count(DISTINCT id) FROM lion_uq WHERE a = ANY ($1)', '''{1,5}''::int[]');
@@ -294,9 +303,10 @@ VACUUM ANALYZE lion_uqi;
 SET plan_cache_mode = force_generic_plan;
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.pushdown_margin = 1000;
 SET pg_lion.enable_ordered_scan = off;
+SET pg_lion.enable_btree_scan = off;
 PREPARE lion_uqi_q(int) AS
 	SELECT g, count(DISTINCT id) FROM lion_uqi WHERE a = $1 GROUP BY g ORDER BY g;
 EXECUTE lion_uqi_q(1);
@@ -321,9 +331,10 @@ DEALLOCATE lion_uqn_q;
 RESET plan_cache_mode;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.pushdown_margin;
 RESET pg_lion.enable_ordered_scan;
+RESET pg_lion.enable_btree_scan;
 DROP TABLE lion_uqi, lion_uqn;
 -- ---- 7. partitioned tables ------------------------------------------------
 /*

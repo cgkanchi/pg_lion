@@ -45,8 +45,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionCount\)' THEN
@@ -65,8 +64,7 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	EXECUTE format('CREATE TEMP TABLE lgw_off AS %s', coalesce(want, q));
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lgw_off' INTO nrows;
@@ -210,8 +208,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE 'CREATE TEMP TABLE lgw_on (r text)';
 	OPEN c FOR EXECUTE q;
@@ -232,8 +229,7 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	EXECUTE format('CREATE TEMP TABLE lgw_off AS SELECT s::text AS r FROM (%s) s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 
 	EXECUTE 'SELECT (SELECT count(*) FROM (TABLE lgw_on EXCEPT ALL TABLE lgw_off) x)'
@@ -272,8 +268,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	EXECUTE q;
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
@@ -284,8 +279,7 @@ BEGIN
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	RETURN res;
 END $$;
 SELECT lgw_bufs('SELECT g, count(*) FROM lgw WHERE (a = 1 OR b = 1) AND c = 1 GROUP BY g') AS grouped,
@@ -384,8 +378,7 @@ COMMIT;
 -- without NULLs needs no Sort
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 EXPLAIN (COSTS OFF)
 SELECT k, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY k ORDER BY k;
 SELECT count(*) AS groups, array_agg(k) = array_agg(k ORDER BY k) AS in_order
@@ -393,8 +386,7 @@ SELECT count(*) AS groups, array_agg(k) = array_agg(k ORDER BY k) AS in_order
 		 GROUP BY k ORDER BY k) s;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 -- a heap the map cannot vouch for: every group's rows go to the heap
 UPDATE lgw_b SET pad = pad || 'w' WHERE g % 7 = 3;
 DELETE FROM lgw_b WHERE g % 11 = 4;

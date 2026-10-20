@@ -69,6 +69,8 @@ lion_run_partition(LionCountScanState *st, int p)
 	else
 		count = lion_count_relation(st);
 
+	/* its rows are its indexes' (lion_count_report_reads()) */
+	st->statrows += count;
 	lion_release_where(st);
 	lion_close_relation(st);
 
@@ -314,6 +316,10 @@ lion_exec_custom_scan(CustomScanState *node)
 	LionCountScanState *st = (LionCountScanState *) node;
 	int64		dirbefore = lion_dir_pages_read;
 	TupleTableSlot *slot;
+
+	/* the relation is read now (lion_count_report_reads()) */
+	if (st->heap != NULL)
+		st->statread = true;
 
 	/*
 	 * One group per call, except that a group the HAVING rejects is not a
@@ -648,6 +654,9 @@ static void
 lion_reset_run(LionCountScanState *st)
 {
 	int			i;
+
+	/* the run that ends here read its relation's indexes */
+	lion_count_report_reads(st);
 
 	if (st->scanning)
 	{

@@ -1020,13 +1020,19 @@ SELECT lion_index_verify('lion_cnt_elig_k', true);
 (1 row)
 
 DROP TABLE lion_cnt_elig;
--- NULL arguments: STRICT, so NULL - no count is made - where the SELECT
--- `WHERE c10 = NULL` answers 0; kept deliberately (DESIGN.md section 9, "SQL
--- surface")
-SELECT lion_index_count('lion_cnt_c10', NULL::int4) IS NULL AS null_key;
- null_key 
-----------
- t
+-- NULL arguments: a NULL key counts 0, as `WHERE c10 = NULL` does, after
+-- the same checks as any key; a NULL index names none, and answers NULL
+SELECT lion_index_count('lion_cnt_c10', NULL::int4) AS null_key,
+	   (SELECT count(*) FROM lion_cnt WHERE c10 = NULL::int4) AS query;
+ null_key | query 
+----------+-------
+        0 |     0
+(1 row)
+
+SELECT lion_index_count('lion_cnt_c10', NULL) AS null_literal;
+ null_literal 
+--------------
+            0
 (1 row)
 
 SELECT lion_index_count(NULL, 0) IS NULL AS null_index;
@@ -1035,18 +1041,139 @@ SELECT lion_index_count(NULL, 0) IS NULL AS null_index;
  t
 (1 row)
 
-SELECT lion_index_count('lion_cnt_c10', 1, 'lion_cnt_m7', NULL::int4) IS NULL AS null_key2;
+SELECT lion_index_count('lion_cnt_c10', 1, 'lion_cnt_m7', NULL::int4) AS null_key2;
  null_key2 
 -----------
- t
+         0
 (1 row)
 
-SELECT count IS NULL AS null_stats FROM lion_index_count_stats('lion_cnt_c10', NULL::int4);
- null_stats 
-------------
- t
+SELECT * FROM lion_index_count_stats('lion_cnt_c10', NULL::int4);
+ count | blocks_skipped | tids_rechecked | blocks_rechecked | cache_hits 
+-------+----------------+----------------+------------------+------------
+     0 |              0 |              0 |                0 |          0
 (1 row)
 
+SELECT lion_index_count('lion_cnt_c10', NULL::text);
+ERROR:  type text cannot be compared with index "lion_cnt_c10"
+-- The key is taken as `col = key` takes it: the parser's operator, and the
+-- key coerced to its input as the query would coerce it (DESIGN.md section 9,
+-- "SQL surface").  Each count beside the query it stands for.
+CREATE TABLE lion_cnt_cast (n numeric, f4 float4, i int4, t text, b char(4));
+INSERT INTO lion_cnt_cast
+SELECT g % 10, (g % 10) / 10.0, g % 10, 't' || (g % 10), 'b' || (g % 3)
+  FROM generate_series(1, 1000) g;
+CREATE INDEX lion_cnt_cast_n ON lion_cnt_cast USING lion (n);
+CREATE INDEX lion_cnt_cast_f4 ON lion_cnt_cast USING lion (f4);
+CREATE INDEX lion_cnt_cast_i ON lion_cnt_cast USING lion (i);
+CREATE INDEX lion_cnt_cast_t ON lion_cnt_cast USING lion (t);
+CREATE INDEX lion_cnt_cast_b ON lion_cnt_cast USING lion (b);
+VACUUM ANALYZE lion_cnt_cast;
+-- an int key on a numeric column: `n = 1` casts the key to numeric
+SELECT lion_index_count('lion_cnt_cast_n', 1) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE n = 1) AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count_any('lion_cnt_cast_n', ARRAY[1, 2]) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE n = ANY (ARRAY[1, 2])) AS query;
+ count | query 
+-------+-------
+   200 |   200
+(1 row)
+
+-- a numeric key on a float4 column: `f4 = 0.1` is `float4 = float8`, which
+-- no float4 value satisfies, and `f4 = 0.5` is exact in both
+SELECT lion_index_count('lion_cnt_cast_f4', 0.1) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.1) AS query;
+ count | query 
+-------+-------
+     0 |     0
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_f4', 0.5) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.5) AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_f4', 0.1::float4) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = 0.1::float4) AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+-- untyped literals take the column's type, as in the query
+SELECT lion_index_count('lion_cnt_cast_f4', '0.1') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE f4 = '0.1') AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_i', '3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = '3') AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_t', 't3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE t = 't3') AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_b', 'b1  ') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE b = 'b1  ') AS query;
+ count | query 
+-------+-------
+   334 |   334
+(1 row)
+
+SELECT lion_index_count('lion_cnt_cast_i', 3, 'lion_cnt_cast_t', 't3') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = 3 AND t = 't3') AS query;
+ count | query 
+-------+-------
+   100 |   100
+(1 row)
+
+SELECT lion_index_count_any('lion_cnt_cast_i', '{3,4,NULL}') AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = ANY ('{3,4,NULL}')) AS query;
+ count | query 
+-------+-------
+   200 |   200
+(1 row)
+
+SELECT lion_index_count_any('lion_cnt_cast_i', NULL::int[]) AS count,
+	   (SELECT count(*) FROM lion_cnt_cast WHERE i = ANY (NULL::int[])) AS query;
+ count | query 
+-------+-------
+     0 |     0
+(1 row)
+
+-- where the query would cast the COLUMN, no count is made: `i = 1.5` is
+-- `numeric = numeric` on i::numeric, and 1.5 cast to integer would count
+-- the rows of 2
+\set VERBOSITY default
+SELECT lion_index_count('lion_cnt_cast_i', 1.5);
+ERROR:  type numeric cannot be compared with index "lion_cnt_cast_i"
+DETAIL:  `col = key` would compare them with operator =(numeric,numeric), which is not the equality of the index's type integer.
+HINT:  Cast the key to type integer.
+SELECT lion_index_count('lion_cnt_cast_b', 'b1'::text);
+ERROR:  type text cannot be compared with index "lion_cnt_cast_b"
+DETAIL:  `col = key` would compare them with operator =(text,text), which is not the equality of the index's type character.
+HINT:  Cast the key to type character.
+\set VERBOSITY terse
+SELECT lion_index_count('lion_cnt_cast_i', 'x');
+ERROR:  invalid input syntax for type integer: "x"
+SELECT lion_index_count_any('lion_cnt_cast_i', 3);
+ERROR:  the keys of a count through index "lion_cnt_cast_i" must be an array, not type integer
+DROP TABLE lion_cnt_cast;
 DROP TABLE lion_cnt_other;
 DROP TABLE lion_cnt_hot;
 DROP TABLE lion_cnt_tiny;

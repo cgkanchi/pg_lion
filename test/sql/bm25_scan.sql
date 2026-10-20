@@ -49,12 +49,12 @@ DECLARE
 BEGIN
 	SET LOCAL enable_seqscan = off;
 	SET LOCAL enable_bitmapscan = off;
-	SET LOCAL enable_indexscan = off;
+	SET LOCAL pg_lion.enable_plain_scan = off;
 	IF NOT bs_scanned(sql) THEN RETURN 'not scanned'; END IF;
 	EXECUTE 'CREATE TEMP TABLE bs_got AS ' || sql;
 	RESET enable_seqscan;
 	RESET enable_bitmapscan;
-	RESET enable_indexscan;
+	RESET pg_lion.enable_plain_scan;
 	SET LOCAL pg_lion.enable_bm25_scan = off;
 	EXECUTE 'CREATE TEMP TABLE bs_ref AS ' || bs_sql(q, w, k, extra, k1, b, ', ctid');
 	RESET pg_lion.enable_bm25_scan;
@@ -81,6 +81,12 @@ SELECT bs_same('w2', 'w2', 3000);					-- the stripped row too
 SET enable_sort = off;
 SELECT bs_same('w1 | t3', 'w1 | t3', 0);			-- no LIMIT: every row
 RESET enable_sort;
+-- a WHERE narrower than the score: every row it keeps has one of the
+-- score's lexemes, which is all the walk needs
+SELECT bs_same('w1', 'w1 & w7', 30);
+SELECT bs_same('w1 | w2', '(w1 | w2) & t3 & !w9', 20);
+SELECT bs_same('w2', 'w5 <-> w2', 10);
+SELECT bs_same('w1', 'w1 & w9:*', 10);
 
 -- not offered: ascending, no WHERE, a WHERE lexeme the score lacks, a WHERE
 -- an empty document matches, a prefix
@@ -94,6 +100,10 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ '!w9'
 	ORDER BY lion_bm25_score(d, 'w9', 'bs_docs_d') DESC LIMIT 10$$) AS empty_matches;
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1:*'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS prefix;
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 | w9 & w7'
+	ORDER BY lion_bm25_score(d, 'w7', 'bs_docs_d') DESC LIMIT 10$$) AS or_arm_without;
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w9 & !w1'
+	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS only_negated;
 SET pg_lion.enable_bm25_scan = off;
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS off;

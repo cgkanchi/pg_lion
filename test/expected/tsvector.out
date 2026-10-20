@@ -27,7 +27,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln LIKE '%Custom Scan (LionCount)%' THEN
 			node := 'pushed down';
@@ -44,6 +44,7 @@ BEGIN
 	EXECUTE format('CREATE TEMP TABLE lion_t_seq AS %s', q);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 
 	EXECUTE 'SELECT count(*) FROM lion_t_idx' INTO nrows;
 	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_t_idx EXCEPT ALL SELECT * FROM lion_t_seq) a)'
@@ -62,12 +63,12 @@ DECLARE
 	ln text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);	-- the bitmap path (§29)
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);	-- the bitmap path (§29)
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		RETURN NEXT ln;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 END $$;
 -- ---- the table ---------------------------------------------------------
 --
@@ -355,6 +356,41 @@ SELECT lion_tscmp($$SELECT id FROM lion_ts
      lion_tscmp      
 ---------------------
  index scan, 98 rows
+(1 row)
+
+-- `@@@` is `@@`
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'w1 & w2')$$);
+     lion_tscmp      
+---------------------
+ index scan, 12 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'alpha & !w1')$$);
+      lion_tscmp      
+----------------------
+ index scan, 502 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'bravo <-> charlie')$$);
+      lion_tscmp      
+----------------------
+ index scan, 600 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT id FROM lion_ts WHERE tsv @@@ to_tsquery('english', 'w1:*')$$);
+      lion_tscmp      
+----------------------
+ index scan, 527 rows
+(1 row)
+
+SELECT lion_tscmp($$SELECT count(*) FROM lion_ts
+				  WHERE tsv @@@ to_tsquery('english', 'w1 | w2')$$);
+     lion_tscmp     
+--------------------
+ index scan, 1 rows
 (1 row)
 
 -- NULL and empty tsvectors

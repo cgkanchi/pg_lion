@@ -1,8 +1,8 @@
 # Two SERIALIZABLE transactions each count an absent key through the roaring
-# count paths, then each insert that key.  Reading the index takes a
-# relation-level predicate lock (as index_beginscan() would for an AM without
-# ampredlocks), so the second commit must fail with a serialization failure,
-# exactly as it does for the ordinary plan.
+# count paths, then each insert that key.  The lookup predicate-locks the leaf
+# where the key would be (DESIGN.md §9), which the insert checks, so the
+# second commit must fail with a serialization failure, exactly as it does
+# for the ordinary plan.
 setup
 {
     CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -16,7 +16,7 @@ teardown
 }
 
 session s1
-setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s1_begin   { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s1_func    { SELECT lion_index_count('ser_k', 99); }
 step s1_plan    { EXPLAIN (COSTS OFF) SELECT count(*) FROM ser WHERE k = 99; }
@@ -25,7 +25,7 @@ step s1_insert  { INSERT INTO ser VALUES (99); }
 step s1_commit  { COMMIT; }
 
 session s2
-setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET enable_indexscan = off; }
+setup           { SET enable_seqscan = off; SET enable_bitmapscan = off; SET pg_lion.enable_plain_scan = off; SET pg_lion.pushdown_margin = 1000; }
 step s2_begin   { BEGIN ISOLATION LEVEL SERIALIZABLE; }
 step s2_func    { SELECT lion_index_count('ser_k', 99); }
 step s2_push    { SELECT count(*) FROM ser WHERE k = 99; }

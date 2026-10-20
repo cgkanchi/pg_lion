@@ -145,8 +145,7 @@ END $$;
 
 SET pg_lion.enable_count_pushdown = on;
 SET enable_bitmapscan = off;
-SET enable_indexscan = off;
-SET enable_indexonlyscan = off;
+SET pg_lion.enable_plain_scan = off;
 
 SELECT pt_containers('SELECT count(*) FROM pt_and WHERE dense = 1') AS c_dense \gset
 SELECT pt_containers('SELECT count(*) FROM pt_and WHERE clu = 3') AS c_clu \gset
@@ -178,8 +177,7 @@ SELECT count(*) AS mismatches FROM (
 	(SELECT clu, dense, count(*) FROM pt_and GROUP BY clu, dense)) d;
 
 RESET enable_bitmapscan;
-RESET enable_indexscan;
-RESET enable_indexonlyscan;
+RESET pg_lion.enable_plain_scan;
 
 -- ---------------------------------------------------------------------
 -- 4. VACUUM frees a whole multi-level set, and the pages come back
