@@ -185,9 +185,13 @@ SELECT lcp_check('SELECT count(*) * 2 + 1, count(*) - 5 FROM lcp WHERE a = 3');
 -- a residual clause no posting set answers, tested on each range's rows
 SELECT lcp_check('SELECT count(*) FROM lcp WHERE a = 1 AND b AND id % 7 = 0');
 -- a filter on s lies in one range of the twelve or two: most ranges count
--- nothing.  A value with no entry is no work to divide, and stays serial
--- (section 4 runs one in parallel all the same).
+-- nothing.  Its count of two bitmaps is 5 us serially, and stays serial, as
+-- a value with no entry does, which is no work to divide (section 4 runs
+-- one in parallel all the same); containers priced dear divide it.
 SELECT lcp_check('SELECT count(*) FROM lcp WHERE s = 3 AND a = 1');
+SET pg_lion.container_cost = 1000;
+SELECT lcp_check('SELECT count(*) FROM lcp WHERE s = 3 AND a = 1');
+RESET pg_lion.container_cost;
 SELECT lcp_check('SELECT count(*) FROM lcp WHERE a = 9 AND b');
 -- sums over entries: every row, every row with a value, a range bounding
 -- the sum, and ranges taken as sources beside it (§14, §28, §32)

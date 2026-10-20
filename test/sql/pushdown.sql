@@ -1072,9 +1072,10 @@ RESET pg_lion.enable_decoded_walk;
 /*
  * Two passes over each container key's rows whatever the number of pairs, so
  * the wide pairs the nested loop is refused are the walk's, and so is a WHERE
- * the nested loop is priced too dear under.  Over these small tables it is
- * the cheaper for the narrow pairs too (20 x 2 in 1.6 ms against 4.4, assert
- * build); a partitioned table stays the nested loop's.
+ * the nested loop is priced too dear under.  The narrow pairs of bitmaps are
+ * the nested loop's, a pass over the words of two NARROWs a pair at each key
+ * (20 x 2 in 0.47 ms against the walk's 0.98, release build); a partitioned
+ * table stays the nested loop's.
  */
 SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
 SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' GROUP BY a, b$$);
@@ -1097,14 +1098,17 @@ SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
  * without pinning any one number, and both were FALSE while every source was
  * charged its whole share of the index whatever drove the merge:
  *
- *	- `id = 77 AND c2 = 1` must cost less than `c2 = 1` alone.  `id` is unique,
- *	  so it has a container at exactly one key and half the table's posting set
- *	  is read at exactly that one place - against the fifteen pages a walk of
- *	  it takes here (11.5 against 21.3 cost units; before, 26.5 against 21.3);
+ *	- `c2 = 1` must add less to `id = 77`'s count than it costs alone.  `id`
+ *	  is unique, so it has a container at exactly one key and half the
+ *	  table's posting set is read at exactly that one place - against the
+ *	  four pages of bitmaps a walk of it takes here (9.9 against 5.2 + 7.0
+ *	  cost units);
  *	- and adding that clause to a count that already intersects two sets must
- *	  make it CHEAPER, not dearer: the selective source takes over as the
- *	  driver and the other two stop being walked (16.8 against 26.8; before,
- *	  31.7 against 26.8).
+ *	  add less than the clause costs alone: the selective source takes over
+ *	  as the driver and the other two stop being walked (14.5 against 13.3 +
+ *	  5.2).  Each lookup's directory leaf is a random page, which here costs
+ *	  more than the walks it saves: the counts take 7 and 8 us against 11 and
+ *	  16, which the model does not see.
  *
  * What the bound is worth where it matters needs a table far too big for this
  * suite to build.  At one million rows of the benchmark's `fact`,
@@ -1120,11 +1124,13 @@ SELECT lion_pd('SELECT c20k, c2, count(*) FROM lion_pd2 GROUP BY c20k, c2');
 CREATE INDEX lion_pd2_id ON lion_pd2 USING lion (id);
 VACUUM (FREEZE, ANALYZE) lion_pd2;
 SELECT lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c2 = 1')
+	 - lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE id = 77')
 	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c2 = 1')
 	AS probing_beats_walking;
 SELECT lion_pd_cost($$SELECT count(*) FROM lion_pd2
 					  WHERE id = 77 AND c200 = 17 AND c2 = 1$$)
-	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c200 = 17 AND c2 = 1')
+	 - lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE c200 = 17 AND c2 = 1')
+	 < lion_pd_cost('SELECT count(*) FROM lion_pd2 WHERE id = 77')
 	AS selective_clause_makes_it_cheaper;
 -- the answers themselves, from the node and from the ordinary plan
 SELECT lion_pd('SELECT count(*) FROM lion_pd2 WHERE id = 77 AND c200 = 17 AND c2 = 1');

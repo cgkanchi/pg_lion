@@ -879,9 +879,9 @@ lion_bits_to_container(const uint64 *w, uint32 ckey, LionContainer *dest)
  *	  the repro of §15's measurements.
  *
  * Which of the two the old rule took depended on the containers alone
- * (LION_OR_BITSET_MIN), which is still where a fold stops.
+ * (LION_OR_BITSET_MIN), which is still where a fold stops.  Both thresholds
+ * are lion_count.h's, which the cost model prices the union by.
  */
-#define LION_OR_FOLD_MEMBERS	128
 
 static const LionContainer *
 lion_or_hot_raw(LionExprCursor *c, uint32 ckey)

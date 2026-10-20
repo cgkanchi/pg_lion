@@ -1,0 +1,170 @@
+-- The price of an AND of dense sources (DESIGN.md §10, "Dense sources").
+--
+-- A build writes a container of a dense set as a NARROW bitmap, which the
+-- merge ANDs, counts and subtracts a word at a time whatever it holds; an
+-- insert grows an ARRAY instead, ANDed a member at a time.  The count's
+-- price follows what the containers are: the same rows ANDed are cheaper
+-- built than inserted, each priced in its own units - the built AND by
+-- pg_lion.bitmap_word_cost and not by and_member_cost, the inserted one the
+-- other way round - and its seeks that stay on their leaf by
+-- pg_lion.probe_step_cost.  An IN list that drives the AND is built into a
+-- bitset image and ANDed as one; and a `<>` beside the AND is subtracted at
+-- the keys it leaves, and priced.  Every count is checked against a
+-- sequential scan with the pushdown off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+-- a sample of every row: the statistics, and the plans, do not depend on it
+SET default_statistics_target = 1000;
+SET max_parallel_workers_per_gather = 0;
+
+/* The LionCount node's price of q, the node made to win. */
+CREATE FUNCTION lcd_cost(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	IF p -> 0 -> 'Plan' ->> 'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
+		RAISE EXCEPTION 'not the node: %', p -> 0 -> 'Plan' ->> 'Node Type';
+	END IF;
+	RETURN (p -> 0 -> 'Plan' ->> 'Total Cost')::float8;
+END $$;
+
+/* q's count by the node and by a sequential scan, which have to agree. */
+CREATE FUNCTION lcd_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	pushed bigint;
+	heap bigint;
+BEGIN
+	PERFORM lcd_cost(q);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	EXECUTE q INTO pushed;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE q INTO heap;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	IF pushed IS DISTINCT FROM heap THEN
+		RETURN format('MISMATCH: %s pushed down, %s from the heap', pushed, heap);
+	END IF;
+	RETURN format('%s rows', pushed);
+END $$;
+
+-- 60000 rows, about 40 to a page - a word of a NARROW a heap block - in 23
+-- container keys: f1 to f4 two values each, f5 and f6 three, g twenty, all
+-- placed at random.  lcd_b's index is built over its rows, lcd_i's grew as
+-- they were inserted.
+CREATE TABLE lcd_b (id int, f1 int, f2 int, f3 int, f4 int, f5 int, f6 int,
+					g int, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcd_b
+SELECT i, (hashint4(i) & 2147483647) % 2,
+	   (hashint4(i + 1000000) & 2147483647) % 2,
+	   (hashint4(i + 2000000) & 2147483647) % 2,
+	   (hashint4(i + 3000000) & 2147483647) % 2,
+	   (hashint4(i + 4000000) & 2147483647) % 3,
+	   (hashint4(i + 5000000) & 2147483647) % 3,
+	   (hashint4(i + 6000000) & 2147483647) % 20,
+	   repeat('x', 150)
+  FROM generate_series(1, 60000) i;
+CREATE TABLE lcd_i (LIKE lcd_b) WITH (autovacuum_enabled = off);
+CREATE INDEX lcd_i_f ON lcd_i USING lion (f1, f2, f3, f4, f5, f6, g);
+INSERT INTO lcd_i SELECT * FROM lcd_b ORDER BY id;
+CREATE INDEX lcd_b_f ON lcd_b USING lion (f1, f2, f3, f4, f5, f6, g);
+VACUUM (FREEZE, ANALYZE) lcd_b;
+VACUUM (FREEZE, ANALYZE) lcd_i;
+
+-- the filters' containers: NARROWs built, ARRAYs grown
+SELECT attno, narrow_containers > 0 AS narrow, array_containers > 0 AS arrays
+  FROM lion_index_stats('lcd_b_f') WHERE attno <= 6 ORDER BY attno;
+SELECT attno, narrow_containers > 0 AS narrow, array_containers > 0 AS arrays
+  FROM lion_index_stats('lcd_i_f') WHERE attno <= 6 ORDER BY attno;
+
+-- ---------- 1. the same AND, built and inserted ----------
+SELECT lcd_check('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
+SELECT lcd_check('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1')
+	 < lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1')
+	AS built_is_cheaper;
+
+-- each in its own units: a member ANDed priced ten times as dear moves the
+-- inserted AND alone, a word of a bitmap the built one alone, and a seek on
+-- the leaf it stands on the built one's, whose dense sets the driver meets
+-- at every key
+CREATE TEMP TABLE lcd_prices (setting text, built float8, inserted float8);
+INSERT INTO lcd_prices
+SELECT 'default',
+	   lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1'),
+	   lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
+SET pg_lion.and_member_cost = 8;
+INSERT INTO lcd_prices
+SELECT 'and_member_cost',
+	   lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1'),
+	   lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
+RESET pg_lion.and_member_cost;
+SET pg_lion.bitmap_word_cost = 0.7;
+INSERT INTO lcd_prices
+SELECT 'bitmap_word_cost',
+	   lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1'),
+	   lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
+RESET pg_lion.bitmap_word_cost;
+SET pg_lion.probe_step_cost = 100;
+INSERT INTO lcd_prices
+SELECT 'probe_step_cost',
+	   lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1'),
+	   NULL;
+RESET pg_lion.probe_step_cost;
+SELECT p.setting, p.built > d.built AS built_dearer,
+	   p.inserted > d.inserted AS inserted_dearer
+  FROM lcd_prices p, lcd_prices d
+ WHERE d.setting = 'default' AND p.setting <> 'default'
+ ORDER BY p.setting;
+
+-- ---------- 2. an IN list that drives the AND ----------
+-- three values of twenty, ORed into a bitset image at each key and ANDed
+-- with the dense sets a word at a time: a member ANDed is no part of it
+SELECT lcd_check('SELECT count(*) FROM lcd_b WHERE g IN (1, 2, 3) AND f1 = 1 AND f2 = 1 AND f3 = 1');
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE g IN (1, 2, 3) AND f1 = 1 AND f2 = 1 AND f3 = 1') AS cost \gset
+SET pg_lion.and_member_cost = 8;
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE g IN (1, 2, 3) AND f1 = 1 AND f2 = 1 AND f3 = 1') = :cost
+	AS image_anded_as_bitmap;
+RESET pg_lion.and_member_cost;
+
+-- ---------- 3. a `<>` subtracted, and priced ----------
+-- g's entry 3 and its NULL one taken out where the AND leaves rows: dearer
+-- than the AND alone, and by more where a seek leaves its page
+SELECT lcd_check('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND g <> 3');
+SELECT lcd_check('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND g IS DISTINCT FROM 3');
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND g <> 3')
+	 > lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1')
+	AS subtraction_priced;
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND g <> 3')
+	 - lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1') AS sub \gset
+SET pg_lion.probe_cost = 400;
+SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND g <> 3')
+	 - lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1') > :sub
+	AS subtraction_seeks_priced;
+RESET pg_lion.probe_cost;
+
+DROP TABLE lcd_b, lcd_i;
+DROP FUNCTION lcd_check(text);
+DROP FUNCTION lcd_cost(text);
