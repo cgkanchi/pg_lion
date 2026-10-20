@@ -239,7 +239,47 @@ SET client_min_messages = warning;
 RESET max_parallel_maintenance_workers;
 SELECT lion_index_verify('lion_build_unsafe_i', true);
 
-DROP TABLE lion_build, lion_build_coll;
+-- ---------------------------------------------------------------------
+-- 7. The write split by column (DESIGN.md §24, "Parallel build"): the
+--    workers write the columns after the first to files of their own,
+--    numbering the blocks themselves, and the leader renumbers them as it
+--    writes them.  So the columns after the first hold every kind of block
+--    reference there is - posting trees with internal pages, position
+--    trees, summaries and NARROW items - and the index has to come out the
+--    serial build's, page for page.  The first column, a key a row, keeps
+--    the leader busy while the workers take the next two.
+-- ---------------------------------------------------------------------
+
+CREATE UNLOGGED TABLE lion_build_split (id int, k int, s int, tv tsvector,
+										pad text)
+	WITH (fillfactor = 20, parallel_workers = 2);
+INSERT INTO lion_build_split
+SELECT g, g % 2, g / 50,
+	   to_tsvector('simple', format('every w%s every', g % 3)),
+	   repeat('p', 100)
+  FROM generate_series(1, 30000) g;
+CREATE INDEX lion_build_split_i ON lion_build_split USING lion (id, k, s, tv)
+	WITH (posting_fillfactor = 10, summaries = on, store_positions = on);
+SELECT lion_build_as('lion_build_split_i', '64MB', 0) AS lion_build_split_serial
+\gset
+SELECT lion_build_as('lion_build_split_i', '64MB', 2) =
+	   :'lion_build_split_serial' AS parallel_same,
+	   lion_build_as('lion_build_split_i', :'lion_build_least_mem', 2) =
+	   :'lion_build_split_serial' AS parallel_spilled_same;
+RESET maintenance_work_mem;
+RESET max_parallel_maintenance_workers;
+SELECT lion_index_verify('lion_build_split_i', true);
+SELECT attno, max_posting_height > 0 AS posting_trees,
+	   summary_entries > 0 AS summaries, narrow_containers > 0 AS narrow
+  FROM lion_index_stats('lion_build_split_i') ORDER BY attno;
+-- 'every' is in every row twice, so its positions are a tree
+SET enable_seqscan = off;
+SELECT count(*) FILTER (WHERE tv @@ 'w1 <-> every'::tsquery) AS w1_every,
+	   count(*) FILTER (WHERE tv @@ 'every <2> every'::tsquery) AS every_every
+  FROM lion_build_split WHERE tv @@ 'every'::tsquery;
+RESET enable_seqscan;
+
+DROP TABLE lion_build, lion_build_coll, lion_build_split;
 DROP TYPE lion_build_mood;
 DROP OPERATOR CLASS lion_build_xid_ops USING lion;
 DROP OPERATOR CLASS lion_build_lower_ops USING lion;
