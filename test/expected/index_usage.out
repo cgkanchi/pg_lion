@@ -370,8 +370,11 @@ SELECT * FROM ius_delta();
 (3 rows)
 
 -- ---------- 4. core's scans of the same index, for comparison ----------
+-- (lion's walk of ius_c off, which at this margin would answer the count
+-- from the btree)
 RESET enable_bitmapscan;
 SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_btree_scan = off;
 SELECT * FROM ius_run('SELECT count(*) FROM ius WHERE a = 3');
        node       | nrows 
 ------------------+-------
@@ -386,6 +389,7 @@ SELECT * FROM ius_delta();
  table ius |        0 |        1 |              |           300
 (2 rows)
 
+RESET pg_lion.enable_btree_scan;
 RESET pg_lion.enable_count_pushdown;
 SET enable_bitmapscan = off;
 -- ---------- 5. rows the heap is asked for ----------

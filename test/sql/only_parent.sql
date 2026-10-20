@@ -85,7 +85,9 @@ BEGIN
 		CASE WHEN same THEN ', same rows' ELSE ', DIFFERENT ROWS' END;
 END $$;
 
--- the count pushdown: the child, the parent alone, the parent with its children
+-- the count pushdown: the child, the parent alone, the parent with its
+-- children (whose Append takes lion's walk of the child's btree, the child
+-- planned as it is alone)
 SELECT op_lion('SELECT count(*) FROM op_child WHERE k = 1');
 SELECT op_lion('SELECT count(*) FROM ONLY op_parent WHERE k = 1');
 SELECT op_lion('SELECT count(*) FROM op_parent WHERE k = 1');
