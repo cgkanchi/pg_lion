@@ -1803,6 +1803,22 @@ extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
  */
 extern Node *lion_or_as_array(Node *clause);
 extern Node *lion_canonical_clause(Node *clause);
+
+/*
+ * Clauses - RestrictInfos or bare, of one relation, varRelid's when it is
+ * not 0 - as lion's estimates take them: each OR of equalities as its IN
+ * list, and each run of `<>` on one expression - `k <> 'a' AND k <> 'b'`,
+ * `k NOT IN ('a', 'b')` - as ONE clause whose cached selectivity is the
+ * disjoint 1 - nullfrac - sum of the distinct values' frequencies (DESIGN.md
+ * §29.11, "A run of `<>` is one exclusion"); *changed says whether any
+ * clause was taken so.  lion_canonical_quals_sel() is core's estimate of an
+ * index path's quals and lion's, where the two forms differ.
+ */
+extern List *lion_canonical_clause_list(PlannerInfo *root, int varRelid,
+										List *clauses, bool *changed);
+extern bool lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel,
+									 List *quals, Selectivity *coresel,
+									 Selectivity *lionsel);
 #if PG_VERSION_NUM < 180000
 
 /*
