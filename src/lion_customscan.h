@@ -603,6 +603,23 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_NE		7	/* col <> const, DESIGN.md §35 */
 #define LION_CLAUSE_DISTINCT	8	/* col IS DISTINCT FROM const, §35 */
 #define LION_CLAUSE_NOTMULTI	9	/* NOT (col @> / && / @@ const), §35 */
+#define LION_CLAUSE_RESERVED	10	/* cardinality(col) = 0 and the like: the
+									 * rows of an array column's reserved
+									 * entries, §17 "Non-empty arrays" */
+#define LION_CLAUSE_NOTRESERVED	11	/* cardinality(col) > 0 and the like:
+									 * every row outside them */
+#define LION_CLAUSE_MAXKIND		LION_CLAUSE_NOTRESERVED
+
+/*
+ * The value of a RESERVED or NOTRESERVED clause: an int4 Const, the reserved
+ * entries of the column it names, LION_ENTRY_EMPTYKEY always and
+ * LION_ENTRY_NULLKEY when the NULL entry is among them (DESIGN.md §17,
+ * "Non-empty arrays").  A mask of the NULL entry alone is `IS NULL` or `IS
+ * NOT NULL`, and is that clause.
+ */
+#define LION_RESERVED_MASK_OK(m) \
+	(((m) & LION_ENTRY_EMPTYKEY) != 0 && \
+	 ((m) & ~(LION_ENTRY_EMPTYKEY | LION_ENTRY_NULLKEY)) == 0)
 
 /*
  * ORed into a RANGESRC clause's kind in the plan's CLAUSEKINDS: the first
@@ -630,13 +647,14 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
  * is the complement of the sets it locates, which lion_locate_leaf() returns
  * as they are: `IS NOT NULL` the NULL entry's, `<>` c's entry and the NULL
  * one, `IS DISTINCT FROM c` c's entry alone (the NULL entry for a NULL c),
- * and `NOT (multi-key query)` the query's exact sets and the NULL entry.  As
- * a leaf of an OR such a clause is a complement arm's (§35, "Complements in
+ * `NOT (multi-key query)` the query's exact sets and the NULL entry, and
+ * NOTRESERVED the reserved entries its mask names (§17).  As a leaf of an OR such a clause is a complement arm's (§35, "Complements in
  * an OR").
  */
 #define LION_CLAUSE_IS_NEGATED(k) \
 	((k) == LION_CLAUSE_NOTNULL || (k) == LION_CLAUSE_NE || \
-	 (k) == LION_CLAUSE_DISTINCT || (k) == LION_CLAUSE_NOTMULTI)
+	 (k) == LION_CLAUSE_DISTINCT || (k) == LION_CLAUSE_NOTMULTI || \
+	 (k) == LION_CLAUSE_NOTRESERVED)
 
 /*
  * The ORs with a complement arm one query may have (DESIGN.md §35,
@@ -646,7 +664,18 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 
 /* Is the clause answered by a multi-key column (DESIGN.md §17)? */
 #define LION_CLAUSE_IS_MULTI(k) \
-	((k) == LION_CLAUSE_MULTI || (k) == LION_CLAUSE_NOTMULTI)
+	((k) == LION_CLAUSE_MULTI || (k) == LION_CLAUSE_NOTMULTI || \
+	 (k) == LION_CLAUSE_RESERVED || (k) == LION_CLAUSE_NOTRESERVED)
+
+/*
+ * ... or by either kind of column: a null test is answered by a column's NULL
+ * entry, which a multi-key column has as a scalar one does (§14, §17).  A
+ * scalar column is taken where there is one (lion_match_index()), and the
+ * executor resolves the index's key column the same way
+ * (lion_index_col_for_kind()).
+ */
+#define LION_CLAUSE_ANY_COLUMN(k) \
+	((k) == LION_CLAUSE_NULL || (k) == LION_CLAUSE_NOTNULL)
 
 /*
  * Which clause kinds pin their column to ONE value, so that a target list
@@ -3182,6 +3211,9 @@ extern List *lion_vcol_refs_with(Node *node, List *vcols);
 extern bool lion_index_col_is_vcol(Relation index, int col, Node *vcol);
 extern char *lion_vcol_name(Oid relid, Node *vcol);
 
+/* lion_plan_nonempty.c */
+extern bool lion_nonempty_leaf(Node *clause, LionLeafInfo *out);
+
 /* lion_plan_partition.c */
 extern Var *lion_child_var(PlannerInfo *root, Index childrelid,
 						   AttrNumber parentattno);
@@ -3483,6 +3515,9 @@ extern Plan *lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel,
 extern Node *lion_create_custom_scan_state(CustomScan *cscan);
 extern AttrNumber lion_index_col_for(Relation index, AttrNumber heapattno,
 									 bool multikey, List *vcols);
+extern AttrNumber lion_index_col_for_kind(Relation index,
+										  AttrNumber heapattno, int kind,
+										  List *vcols);
 extern AttrNumber lion_heap_attno_in(Relation heap, Oid parentoid,
 									 AttrNumber parentattno);
 extern void lion_open_relation(LionCountScanState *st, int p);

@@ -4192,9 +4192,10 @@ bitmap scan walks a lone one itself (`lion_emit_all_keys()`) and runs the plain 
 the bitmap for more than one, or for one beside quals none of which the sets express
 (`lion_emit_source()`).
 
-**Multi-key columns.** A multi-key column keeps a NULL value in its NULL entry and a value with no
-key - an empty array, an empty tsvector, `'{}'::jsonb` - in its EMPTY entry (§17); the two are
-mutually exclusive, and every other row is under its keys. `IS NOT NULL` is true of an empty value,
+**Multi-key columns.** A multi-key column keeps a NULL value in its NULL entry, a value with no
+key - an empty array, an empty tsvector, `'{}'::jsonb` - in its EMPTY entry, and an array whose
+elements are all NULL in its NULLELEMS entry (§17); the three are mutually exclusive, and every
+other row is under its keys. `IS NOT NULL` is true of an empty value,
 so it is every row the index holds but the NULL entry's, as for a scalar column: the same
 subtraction, and the EMPTY entry is no part of it. Alone, it is the UNION of every entry but the NULL
 one, the EMPTY entry included, which is now exact: the UNION had been rechecked for the mode-ALL
@@ -5692,8 +5693,10 @@ bail.
 - **A multi-key index can never DRIVE a count.**  Its entries are keys, not column values, so
   neither §10's GROUP BY (the groups would be lexemes) nor §14's sum-over-all (a row appears under
   each of its keys, so the sum of the entries is not the number of rows) is correct.
-  `lion_find_roaring_index()` takes a `multikey` flag and the driving lookup passes false, which makes
-  `count(*) WHERE tags IS NOT NULL` fall back to the ordinary plan.  GROUP BY on a scalar roaring
+  `lion_find_roaring_index()` takes a `multikey` flag and the driving lookup passes false, so
+  `count(*) WHERE tags IS NOT NULL` is driven by a scalar column's entries (§35, "Every row"), with
+  the multi-key column's NULL entry subtracted ("Non-empty arrays" below), and falls back to the
+  ordinary plan on a table with no scalar lion column.  GROUP BY on a scalar roaring
   column next to a multi-key WHERE clause is the supported and tested combination.
 - EXPLAIN prints the clause with its operator: `Lion Indexes: idx (tags @> {t5,t7})`,
   `idx (tsv @@ 'w1' & 'w2')`.
@@ -6251,6 +6254,110 @@ and a query always agree on whether an element is hashed.
 incompressible ones and one spelled like another's key, under `@>`, `&&` and `<@`, bitmap and count
 paths against a sequential scan and GIN, before and after writes, and the facets.
 
+### Non-empty arrays (2026-10-20)
+
+A filter that asks whether an array has an element - `array_length(tags, 1) IS NOT NULL`,
+`cardinality(tags) > 0`, `tags <> '{}'` - was a heap filter beside the count: a function of the
+column is no clause of any kind the pushdown knows, and `<>` is no operator of array_ops.  Every row
+of an array_ops column is in exactly one of three classes, which its entries tell apart since the
+NULLELEMS entry (above): the column is NULL (the NULL entry, §14), it has no element (the EMPTY
+entry), or it has one (NULLELEMS or the entries of its elements).  A predicate whose truth is the
+same for every row of a class is then a union of reserved entries or the complement of one, and is
+answered with no heap visit.
+
+**The classes, as PostgreSQL's arrays make them.**  An array with no element has no dimensions,
+however it was made: `'{}'`, `'{{},{}}'`, `array_fill(1, ARRAY[0])`, an empty slice, `trim_array()`
+and `array_remove()` down to nothing and `string_to_array('', ',')` all come out as the one empty
+array of `construct_empty_array()`, and the binary input makes one of any array with no element.
+Any other array has one to six dimensions of at least one element each, whatever its lower bounds
+and whether its elements are NULL.  So over (NULL, empty, has an element):
+
+    array_length(a, 1)                 NULL, NULL, >= 1
+    cardinality(a)                     NULL, 0,    >= 1
+    array_ndims(a)                     NULL, NULL, 1 .. 6
+    array_lower(a, 1), array_upper(a, 1)   NULL, NULL, any integer
+    a = '{}'                           NULL, true, false   (array_eq() compares the dimensions first)
+
+**Which predicates** (`lion_nonempty_test()`, lion_plan_nonempty.c).  Each clause is evaluated over
+the three classes, a class's answer being true, false, NULL for every row of it, or mixed; a clause
+with no mixed class is taken, and what it selects is the classes where it is true.  The values are
+those of the table: the integer functions above with the dimension the constant 1, and
+`coalesce()` of one with an integer constant; compared with an integer constant of any width by an
+operator of the integer btree family, either way round, or with `IS [NOT] DISTINCT FROM`, or tested
+`IS [NOT] NULL`; the column compared with an empty array constant by `=`, `<>` or `IS [NOT]
+DISTINCT FROM`; and any of these under `NOT` and `IS [NOT] TRUE / FALSE / UNKNOWN`.  A value over
+the rows with an element is a range (`>= 1`, 1 to 6, any integer), so `array_length(a, 1) >= 0` is
+true of them all and `array_length(a, 1) > 1` is mixed.  Declined, and left to the heap: a mixed
+class (`array_length(a, 1) = 1`, `array_ndims(a) = 1`, `array_lower(a, 1) = 1`, `tags <> '{1}'`); a
+dimension other than the constant 1 (`array_length(a, 2)` is NULL for a one-dimensional array with
+elements); a bound that is not a constant at plan time (the classes a parameter selects depend on
+its value); and a predicate true of every row or of none (`coalesce(cardinality(a), 0) >= 0`),
+which has nothing to read.
+
+**The count** (`lion_nonempty_leaf()`, first in `lion_analyze_leaf()`).  The classes a clause
+selects become one of two clause kinds, whose value is a mask of the column's reserved entries:
+
+- `LION_CLAUSE_RESERVED`, the rows of the EMPTY entry, or of it and the NULL entry - `a = '{}'`,
+  `cardinality(a) = 0`; `array_length(a, 1) IS NULL` - a positive source, located as the OR of
+  those entries' sets (`lion_locate_leaf()`), and a plain one for the one-set counts as an
+  equality's set is;
+- `LION_CLAUSE_NOTRESERVED`, every row outside the EMPTY entry, or outside it and the NULL entry -
+  `a IS DISTINCT FROM '{}'`; `cardinality(a) > 0`, `array_length(a, 1) IS NOT NULL AND
+  array_length(a, 1) >= 0` - a negated source subtracting their union, as `<>` subtracts its value's
+  entry and the NULL one (§35).
+- The NULL class alone, or every row but it, is `a IS NULL` or `a IS NOT NULL`
+  (`cardinality(a) IS NULL`, `cardinality(a) >= 0`), the NULL and NOTNULL kinds of §14, now taken on
+  a multi-key column too: from its NULL entry, when no index holds the column as a scalar one (a
+  whole-array class, below) to answer them instead (`LION_CLAUSE_ANY_COLUMN()`,
+  `lion_match_index()`, `lion_index_col_for_kind()` in the executor).
+
+The rows with an element alone are never read as a union - NULLELEMS and every element's entry,
+a row under each of its elements - only as what is left of the others.  Both kinds are multi-key
+kinds, resolved on the column's multi-key index, and only on one whose class extracts with
+`lion_array_extract_value()` or `ginarrayextract()` (`lion_nonempty_index()`), which is what files
+a NULL array, an empty one and one of NULL elements in three entries apart: a class of whole arrays,
+one key per row, has no EMPTY entry, and tsvector's and jsonb's classes extract other values.  Both
+are taken wherever their models are, under the same rules: beside positive clauses, under a GROUP
+BY and a count(DISTINCT), in a filtered count, on a partitioned table, as an arm of an OR (§19) and
+as a complement arm (§35), and beside nothing that selects rows, where the count of every row
+drives (§35).  `count(col)` reads the column as NOT NULL beside a RESERVED clause without the NULL
+entry and a NOTRESERVED one with it.  Beside a multi-key query known only at run time ("A query
+known only at run time" above), which may narrow nothing and leave the rows to the row filter, the
+row filter tests `NOT (NULL or EMPTY)` as `a <> '{}'` (array_ne() against the column type's empty
+array, `lion_filter_with_negated()`); a NOTRESERVED clause that NULLs pass is declined there, as
+`IS DISTINCT FROM` is.  Two copies of one NOTRESERVED clause - `array_length(a, 1) IS NOT NULL AND
+array_length(a, 1) >= 0` - are counted once.  EXPLAIN prints the classes in one spelling whatever
+the query's: `idx (cardinality(tags) > 0)`, `(cardinality(tags) IS DISTINCT FROM 0)`,
+`(cardinality(tags) = 0)`, `(coalesce(cardinality(tags), 0) = 0)`.
+
+**The estimates** (`lion_nonempty_rel_clauses()`, §29.11 "The relation's rows").  Core estimates
+each spelling as a function of the column, with no statistics of it: a null test at 0.995 or 0.005,
+an inequality at a third, multiplied with the others.  `array_length(a, 1) IS NOT NULL AND
+array_length(a, 1) >= 0` over a column with an element in 80% of its rows came out at a third of
+the rows, 2.4 times short, and `array_length(a, 1) IS NULL` at 0.5% where 19% were.  Lion's estimates
+take every such clause of one column of a lion array_ops index together, AND the classes each
+selects, and put in their place the one clause core estimates from the column's own statistics for
+the same rows (`lion_nonempty_clause()`): `a <> '{}'`, `a = '{}'`, `a IS DISTINCT FROM '{}'`,
+`NOT (a <> '{}')` (the empty array's share and the NULLs'), `a IS NULL`, `a IS NOT NULL`, or false.
+The relation's rows are corrected wherever this changes a clause, as wherever the intersection probe
+measures a correlation.
+
+**The scans.**  There is no route.  Core hands an index only the clauses whose operator is in the
+index's operator family, and null tests of its columns (`match_clause_to_indexcol()`): a function of
+the column never reaches the access method, nor does `<>`, which is no operator of array_ops.
+`a = '{}'` does, as array `=` (strategy 17), and is answered as every row with a recheck, as above;
+`a IS NULL` and `a IS NOT NULL` are answered exactly (§14).
+
+`test/sql/nonempty.sql` runs every spelling, the taken and the declined, against the pushdown off,
+as multisets both ways, over NULL arrays, empty ones, `'{NULL}'`, `'{NULL,NULL}'`,
+`'{{NULL},{NULL}}'`, two-dimensional ones and lower bounds of 0 and -3; beside GROUP BY, filtered
+counts, ORs and complement arms, `@>` and `&&` on the same and another column, a query known only
+at run time (with `'{}'`, the row filter's case), a text[] column under "C", a domain over int[],
+a multicolumn index, a partitioned table (one partition without the index declines), a whole-array
+class and a class of the user's over `ginarrayextract()`; after updates, deletes and inserts that
+move rows between the classes, before and after VACUUM; the plans; the rows estimated against core's
+and the truth; and what reaches the scans.
+
 ### Cardinality guard
 
 Reloption `max_entries` (int, default 0 = unlimited, ShareUpdateExclusiveLock).  Exceeding it is a
@@ -6270,7 +6377,8 @@ cannot tell); prefix, phrase and weighted tsqueries from the posting sets, excep
 rechecked in the heap (above); `col op ANY (...)` in the count pushdown (only
 in the bitmap scan); a query known only at run time under an OR (above);
 a multi-key index as the GROUP BY or sum-over-all driver;
-`lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out).
+`lion_index_count(idx, key)` on a multi-key index (it needs a strategy-1 operator and errors out);
+a test of whether an array is empty in a plain or bitmap scan ("Non-empty arrays" above).
 
 ### Measured (2026-09-20, 1M rows, 521 MB heap, all-visible, warm cache)
 
@@ -15736,6 +15844,11 @@ once the paths are built - and it is made to the paths too:
   multiplies core's rows before they are rounded and clamped to one row ("Wide lists", below).
 - A plain relation of its own only: an inheritance parent's rows are its children's sum, added up
   before any child's paths are built, which a child's correction would not reach.
+- It is made, too, where the relation tests whether a lion array_ops column is empty (§17,
+  "Non-empty arrays"): `lion_rel_canonical_clauses()` puts in place of every such clause of a
+  column the one clause core estimates from the column's statistics for the rows they select
+  together (`lion_nonempty_rel_clauses()`), where core estimates each spelling - a function of the
+  column - from none, and multiplies them.
 
 `test/sql/rowscorrect.sql` pins it: three filters derived from one hidden group, whose product is
 about 20 rows for 1,000, are estimated within a factor of two at the scan and at a join and semi
@@ -19958,7 +20071,9 @@ Two more negated kinds join `IS NOT NULL` and `<>`, each the union of entries it
   its complement would need a recheck. At run time the query is located as §17's; one that comes
   out other than exact is an error, not a wrong count.
 
-Both are taken wherever `<>` is, the count of every row above included.
+Both are taken wherever `<>` is, the count of every row above included.  So is §17's
+`LION_CLAUSE_NOTRESERVED` ("Non-empty arrays"), every row outside an array column's EMPTY entry, or
+outside it and the NULL entry: `cardinality(a) IS DISTINCT FROM 0`, `cardinality(a) > 0`.
 
 **Complements in an OR.** `n <> 17 OR n IS NULL`, `c200 = 17 OR c20 <> 3`: an OR whose arms are each
 all positive or all negated clauses. Let P be the union of the positive arms (a §19 tree, or no row

@@ -438,8 +438,9 @@ lion_partial_run_held(const LionCountTarget *t, List *clauseinfos, List *ors,
  * Does run r of target t have a source that selects rows by itself, so that
  * a sum over every row counts it as an intersection and not by the driving
  * walk (lion_run_has_plain_source(), lion_count_runs())?  Asked as the
- * executor asks it, of the clauses the run keeps: an equality, a list or
- * `IS NULL`, or an OR with no range among its leaves.
+ * executor asks it, of the clauses the run keeps: an equality, a list,
+ * `IS NULL` or the rows of an array column's reserved entries (§17), or an
+ * OR with no range among its leaves.
  */
 static bool
 lion_partial_run_plain(const LionCountTarget *t, List *clauseinfos, List *ors,
@@ -454,7 +455,7 @@ lion_partial_run_plain(const LionCountTarget *t, List *clauseinfos, List *ors,
 
 		if (lfirst(l2) != NULL && !ci->inor && lion_partial_in_run(ci, r) &&
 			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
-			 ci->kind == LION_CLAUSE_NULL))
+			 ci->kind == LION_CLAUSE_NULL || ci->kind == LION_CLAUSE_RESERVED))
 			return true;
 	}
 	foreach(l1, ors)

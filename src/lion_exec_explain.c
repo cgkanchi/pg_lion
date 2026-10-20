@@ -58,6 +58,33 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 		case LION_CLAUSE_NOTNULL:
 			appendStringInfo(buf, "%s IS NOT NULL", attname);
 			break;
+		case LION_CLAUSE_RESERVED:
+		case LION_CLAUSE_NOTRESERVED:
+			{
+				/*
+				 * Whether the array is empty (DESIGN.md §17, "Non-empty
+				 * arrays"), in one spelling for each set of rows, whichever
+				 * the query had: the rows of the EMPTY entry, with the NULL
+				 * one's or without, or every row outside them.
+				 */
+				int32		mask;
+				bool		withnull;
+
+				if (cl->con == NULL)
+					elog(ERROR, "LionCount: the reserved entries of a clause are no constant");
+				mask = DatumGetInt32(cl->con->constvalue);
+				withnull = (mask & LION_ENTRY_NULLKEY) != 0;
+				if (cl->kind == LION_CLAUSE_RESERVED)
+					appendStringInfo(buf, withnull ?
+									 "coalesce(cardinality(%s), 0) = 0" :
+									 "cardinality(%s) = 0", attname);
+				else
+					appendStringInfo(buf, withnull ?
+									 "cardinality(%s) > 0" :
+									 "cardinality(%s) IS DISTINCT FROM 0",
+									 attname);
+				break;
+			}
 		default:
 			{
 				List	   *context;
@@ -143,7 +170,7 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * the second's column.
  */
 static const char *
-lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
+lion_explain_col_kind(Oid idxoid, AttrNumber heapattno, int kind, List *vcols)
 {
 	Relation	idx;
 	AttrNumber	col;
@@ -159,7 +186,7 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 		return "";
 	}
 
-	col = lion_index_col_for(idx, heapattno, multikey, vcols);
+	col = lion_index_col_for_kind(idx, heapattno, kind, vcols);
 	name = psprintf(".%s",
 					NameStr(TupleDescAttr(RelationGetDescr(idx), col - 1)->attname));
 	index_close(idx, AccessShareLock);
@@ -167,12 +194,24 @@ lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 	return name;
 }
 
-/* ... for one clause, whose kind says which kind of column answers it. */
+/* ... for a column whose entries are read as values: a scalar one */
+static const char *
+lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
+{
+	return lion_explain_col_kind(idxoid, heapattno,
+								 multikey ? LION_CLAUSE_MULTI : LION_CLAUSE_EQ,
+								 vcols);
+}
+
+/*
+ * ... for one clause, whose kind says which kind of column answers it
+ * (lion_index_col_for_kind()).
+ */
 static const char *
 lion_explain_clause_col(LionCountScanState *st, const LionClauseState *cl)
 {
-	return lion_explain_col(cl->idxoid, cl->attno,
-							LION_CLAUSE_IS_MULTI(cl->kind), st->plan.vcols);
+	return lion_explain_col_kind(cl->idxoid, cl->attno, cl->kind,
+								 st->plan.vcols);
 }
 
 /* One arm of an OR, `len` leaves from leaf `at`: `((b = 2) AND (c = 3))`. */
