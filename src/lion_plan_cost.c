@@ -670,8 +670,8 @@ lion_bitmap_width(double tuples, double heap_pages)
  * bytes.  One an insert grows stays an ARRAY up to 2,048 members and becomes a
  * BITSET past them.  So a set of more than 256 k members a container is a
  * NARROW in an index built over its table and an ARRAY or a BITSET in one its
- * rows were inserted into - and the two cost the merge an order of magnitude
- * apart: nine dense sets ANDed took 1.3 ms built and 9.5 ms inserted.
+ * rows were inserted into - and the second costs the merge seven times the
+ * first: nine dense sets ANDed take 1.2 ms built and 8.8 ms inserted.
  *
  * The set's pages, its share of its column's by bytes
  * (lion_column_set_pages()), say which where the two sizes are far enough

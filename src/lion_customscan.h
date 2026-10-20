@@ -944,7 +944,7 @@ typedef struct LionVColScope
  * Measured on the release build of PostgreSQL 18 (2026-10-20) over the
  * containers of heaps of 58, 120 and 226 rows a block, and checked whole on
  * a 4M-row heap of 58 rows a block: nine dense sets built as NARROWs, ANDed,
- * 1.24 ms priced at 609 units (492 a millisecond), where LION_AND_MEMBER_COST
+ * 1.21 ms priced at 620 units (512 a millisecond), where LION_AND_MEMBER_COST
  * a member of them, which is a merge's of ARRAYs, had priced it at 4,266; and
  * an ARRAY of 200 members a container ANDed with a NARROW at 440 ns a key.
  */
