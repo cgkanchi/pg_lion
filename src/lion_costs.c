@@ -46,6 +46,8 @@ double		lion_member_cost;
 double		lion_probe_cost;
 double		lion_memory_probe_cost;
 double		lion_and_member_cost;
+double		lion_bitmap_word_cost;
+double		lion_bitmap_member_cost;
 double		lion_union_key_cost;
 double		lion_union_member_cost;
 double		lion_descent_cost;
@@ -127,6 +129,10 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of seeking a lion posting set copied into memory to a container key"},
 	{"pg_lion.and_member_cost", &lion_and_member_cost, 0.8, LION_OP,
 	 "Sets the planner's estimate of the cost of ANDing each member of a lion intersection with what a seek found, or of looking it up in a container of a union"},
+	{"pg_lion.bitmap_word_cost", &lion_bitmap_word_cost, 0.07, LION_OP,
+	 "Sets the planner's estimate of the cost of each word of a lion bitmap container passed over to AND, unite, subtract or count it"},
+	{"pg_lion.bitmap_member_cost", &lion_bitmap_member_cost, 0.2, LION_OP,
+	 "Sets the planner's estimate of the cost of looking each member of a lion array container up in a bitmap container, to AND or subtract the two"},
 	{"pg_lion.union_key_cost", &lion_union_key_cost, 30.0, LION_OP,
 	 "Sets the planner's estimate of the cost of building the union of a lion IN list's or multi-key query's containers at a container key"},
 	{"pg_lion.union_member_cost", &lion_union_member_cost, 0.25, LION_OP,

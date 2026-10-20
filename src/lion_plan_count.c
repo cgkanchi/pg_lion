@@ -3571,6 +3571,34 @@ lion_count_path_make(LionCountPathBuild *cx)
 }
 
 /*
+ * Does run r of filtered counts over a sum of every row (DESIGN.md §10,
+ * "Filtered counts"; §35) count an intersection instead of the sum - a
+ * filter's run with a source of its own that selects rows, an equality, a
+ * list, an `IS NULL` or an OR, as lion_run_count() decides at run time from
+ * the located sources?  Without a range bounding the walk.
+ */
+static bool
+lion_count_run_plain(LionCountPathBuild *cx, int r)
+{
+	ListCell   *lc;
+
+	if (r == 0 || !cx->sumall || cx->rangevar != NULL)
+		return false;
+	foreach(lc, cx->clauseinfos)
+	{
+		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
+
+		if (ci->filter != r || ci->incompl)
+			continue;
+		if (ci->inor ? ci->kind != LION_CLAUSE_RANGESRC :
+			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
+			 ci->kind == LION_CLAUSE_NULL))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Price the path and add it to output_rel: below core's Finalize Agg for a
  * partitioned GROUP BY, and otherwise as it is - after the parallel GROUP BY
  * made from it, where there is one.
@@ -3584,7 +3612,9 @@ lion_count_path_make(LionCountPathBuild *cx)
 /*
  * The relations to count as run r of filtered counts counts them (DESIGN.md
  * §10, "Filtered counts"): each target with every other filter's clauses
- * left out of it, as a partition leaves out what its bounds imply.
+ * left out of it, as a partition leaves out what its bounds imply - and with
+ * no walk driving it where the run is an intersection
+ * (lion_count_run_plain()).
  */
 static List *
 lion_count_run_targets(LionCountPathBuild *cx, int r)
@@ -3601,6 +3631,12 @@ lion_count_run_targets(LionCountPathBuild *cx, int r)
 		int			i = 0;
 
 		memcpy(rt, t, sizeof(LionCountTarget));
+		if (lion_count_run_plain(cx, r))
+		{
+			rt->driveidx[0] = NULL;
+			rt->drivecol[0] = 0;
+			rt->drivevar[0] = NULL;
+		}
 		rt->dropped = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
 		rt->ndropped = 0;
 		foreach(l2, cx->clauseinfos)
@@ -3629,7 +3665,7 @@ lion_count_run_targets(LionCountPathBuild *cx, int r)
 static void
 lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 					  List *targets, LionRangeCost *rangeprice,
-					  LionWalkSave *walksave)
+					  LionWalkSave *walksave, bool plain)
 {
 	PlannerInfo *root = cx->root;
 
@@ -3659,6 +3695,11 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 							Min(cx->outrows, (double) cx->topkcand));
 		memset(rangeprice, 0, sizeof(LionRangeCost));
 	}
+	else if (plain)
+		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
+							 cx->wherekinds, cx->ors, 1.0, 0, 0, cx->outrows,
+							 LION_DISTINCT_NONE, LION_RANGED_NONE, 1.0,
+							 rangeprice, walksave);
 	else
 		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
 							 cx->wherekinds, cx->ors,
@@ -3899,7 +3940,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * clauses priced into it.
 	 */
 	if (cx->nfilter == 0)
-		lion_count_path_price(cx, cpath, cx->targets, &rangeprice, &walksave);
+		lion_count_path_price(cx, cpath, cx->targets, &rangeprice, &walksave,
+							  false);
 	else
 	{
 		Cost		startup = 0;
@@ -3910,7 +3952,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		for (r = 0; r <= cx->nfilter; r++)
 		{
 			lion_count_path_price(cx, cpath, lion_count_run_targets(cx, r),
-								  &rangeprice, &walksave);
+								  &rangeprice, &walksave,
+								  lion_count_run_plain(cx, r));
 			startup += cpath->path.startup_cost;
 			total += cpath->path.total_cost;
 			runs.countrange += rangeprice.countrange;

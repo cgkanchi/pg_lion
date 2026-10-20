@@ -146,7 +146,9 @@ END $$;
 -- ---- the predicate exactly, implied by stronger clauses, or not implied ----
 
 -- (a) the dense defaults are the predicate: left out, and the count is a
--- sum over the partial index's entries, or its sets
+-- sum over the partial index's entries, or its sets - or, of every row, the
+-- whole index's AND of the three (below, with the whole index dropped, the
+-- partial index's sum)
 SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
 SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND a = 3$$);
 SELECT cp_q($$SELECT count(*) FROM pc WHERE kind = 'k0' AND st = 'on' AND act AND a IN (1, 4, 7) AND b = 2$$);
@@ -203,6 +205,23 @@ SELECT cp_q($$SELECT g, count(*) FROM pc WHERE x <> 3 GROUP BY g$$);
 -- a multi-key query may turn out to narrow nothing: never what holds the
 -- count, and with nothing else to, the partial index is not read
 SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND tags @> '{3}'$$);
+-- the sums over the partial index's entries that the counts of every row,
+-- `IS NOT NULL`, count(x) and the negations above leave to the whole
+-- index's one merge of the dense sets, which is faster (DESIGN.md §45.6) -
+-- each a subtraction from every entry, or a sum of them - and the IN list
+-- that implies a `<>` predicate, which the whole index answered as fast:
+-- with the whole index out of the way
+BEGIN;
+DROP INDEX pc_full;
+SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
+SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND x IS NOT NULL$$);
+SELECT cp_q($$SELECT count(x) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
+SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND a <> 3$$);
+SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND a IS DISTINCT FROM 3$$);
+SELECT cp_q($$SELECT count(*) FROM pc WHERE act AND st = 'on' AND kind = 'k0' AND a NOT IN (1, 2, 3)$$);
+SELECT cp_q($$SELECT count(*), count(*) FILTER (WHERE a <> 1) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
+SELECT cp_q($$SELECT g, count(*) FROM pc WHERE kind IN ('k1', 'k2') AND b = 3 GROUP BY g$$);
+ROLLBACK;
 
 -- ---- GROUP BY ----
 
@@ -235,8 +254,9 @@ SELECT cp_q($$SELECT DISTINCT a, g FROM pc WHERE act AND st = 'on' AND kind = 'k
 -- ---- filtered counts, and count(DISTINCT) ----
 
 -- a sum over every row counts a filter with a set of its own by that set:
--- the partial index's (a = 1) holds that run, the whole index's (y = 1)
--- does not, and the count is left to the whole indexes
+-- the partial index's (a = 1) holds that run, and is priced as that set
+-- read, not as a walk of the sum's entries; the whole index's (y = 1) does
+-- not, and the count is left to the whole indexes
 SELECT cp_q($$SELECT count(*), count(*) FILTER (WHERE a = 1), count(*) FILTER (WHERE b IN (1, 2)) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
 SELECT cp_q($$SELECT count(*), count(*) FILTER (WHERE y = 1) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);
 SELECT cp_q($$SELECT count(*), count(*) FILTER (WHERE a <> 1) FROM pc WHERE act AND st = 'on' AND kind = 'k0'$$);

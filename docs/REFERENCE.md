@@ -619,7 +619,9 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `member_cost` | 0.15 | `cpu_operator_cost` | a member of it, up to 1,024 a container |
 | `probe_cost` | 40 | `cpu_operator_cost` | a seek of a posting tree to a container key |
 | `memory_probe_cost` | 30 | `cpu_operator_cost` | the same into a set copied into memory |
-| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found, or looked up in a container of a union's |
+| `and_member_cost` | 0.8 | `cpu_operator_cost` | a member of an intersection ANDed with what a seek found, both arrays, or looked up in a container of a union's |
+| `bitmap_word_cost` | 0.07 | `cpu_operator_cost` | a word of a bitmap container passed over to AND, unite, subtract or count it |
+| `bitmap_member_cost` | 0.2 | `cpu_operator_cost` | a member of an array container looked up in a bitmap container, to AND or subtract the two |
 | `union_key_cost` | 30 | `cpu_operator_cost` | the union of an `IN` list's or a multi-key query's containers built at a container key |
 | `union_member_cost` | 0.25 | `cpu_operator_cost` | a member of such a union, or of the intersection ANDed with it |
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
