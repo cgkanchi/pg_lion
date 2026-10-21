@@ -145,7 +145,7 @@ static void lion_bm25_rescan(CustomScanState *node);
 static void lion_bm25_explain(CustomScanState *node, List *ancestors,
 							  ExplainState *es);
 
-static const CustomPathMethods lion_bm25_path_methods = {
+const CustomPathMethods lion_bm25_path_methods = {
 	.CustomName = "LionBm25",
 	.PlanCustomPath = lion_bm25_plan_path,
 };

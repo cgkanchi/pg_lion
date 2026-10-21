@@ -20795,11 +20795,13 @@ bytes (`lion_topk_excluded()`).
 
 The grouped rel's paths are read by nothing but the Sort and Limit when the query has no DISTINCT,
 window function, set-returning function, set operation or grouping sets, so a path that leaves out
-groups the Limit would cut answers the query. The shape is one grouping column of one table walked
-a group at a time - not an IN list driving the groups, a coalesce group, a count(DISTINCT), the
-decoded walk, a partitioned table's or a parallel plan's partial counts - with no HAVING, which
-could reject the groups the k were counted from. The first ORDER BY key is the group's count,
-descending: an aggregate the node answers as the group's rows (count(*), or count(col) of a column
+groups the Limit would cut answers the query. Nor does the path claim the key order a walk of the
+entries has (`lion_count_path_make()`): it emits its candidates largest bound first, for that Sort
+to order by their counts. The shape is one grouping column of one table walked a group at a
+time - not an IN list driving the groups, a coalesce group, a count(DISTINCT), the decoded walk, a
+partitioned table's or a parallel plan's partial counts - with no HAVING, which could reject the
+groups the k were counted from. The first ORDER BY key is the group's count, descending: an
+aggregate the node answers as the group's rows (count(*), or count(col) of a column
 no row of the group has NULL - not count(g) beside g's NULL group, which is 0 there), sorted by
 int8's `>` of the integer btree family. k is the LIMIT and the OFFSET, both constants, at most
 10,000; a LIMIT known only at run time is declined.
@@ -21413,9 +21415,12 @@ to, found when the planner hook that adds it starts:
   (`set_join_pathlist_hook` runs after core's paths for the join order and join type it is called
   for, and the ones before it). Of those, the cheapest (fewest disabled nodes, then total cost) that
   is not parameterized and has no lion custom path anywhere inside it (`lion_path_has_lion()`): an
-  Agg over a LionOrdered scan, or a hash join over a LionSemiJoin, is lion's plan as much as
-  core's. None - nothing of core's yet - prices at the reference, and so does a relation whose
-  every path of core's is disabled (`DISABLED`, below).
+  Agg over a LionOrdered or LionBtreeScan scan, or a hash join over a LionSemiJoin, is lion's plan
+  as much as core's. A path is lion's by its `CustomPathMethods`, which are the library's own -
+  every one of LionCount, LionSemiJoin, LionAntiJoin, LionJoinAgg, LionOrdered, LionBtreeScan and
+  LionBm25 - not by the name EXPLAIN prints, which another extension's path may carry. None -
+  nothing of core's yet - prices at the reference, and so does a relation whose every path of
+  core's is disabled (`DISABLED`, below).
 - **Once for each hook** (`lion_units_pin()`). `add_path()` frees the paths a new path dominates,
   so the core path the first lion path of a relation was priced against can be gone when the next
   is priced - the decoded walk after the nested loop of the same GROUP BY (§34), the parallel
@@ -26478,6 +26483,9 @@ hold of its own.
 
 `lion_partial_anchored()` checks it once the targets are collected (`lion_count_path_targets()`,
 `lion_fkjoin_setup()`); false declines the attempt, and the plan made with whole indexes stands.
+So does a relation counted that the scope holds no index for, when restrictions were left out:
+they are left out only where every relation of the scope has one, and that relation's rows outside
+the predicates would be counted.
 An attempt that reads no partial index and leaves nothing out is declined too: it is that plan
 again. The rule is a planning rule only: the executor counts what the plan names, as it always
 did.
