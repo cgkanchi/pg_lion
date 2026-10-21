@@ -70,7 +70,12 @@
 #include "parser/parse_relation.h"
 #include "parser/parser.h"
 #include "rewrite/rewriteManip.h"
+#include "catalog/pg_operator_d.h"
+#include "catalog/pg_type_d.h"
+#include "miscadmin.h"
+#include "utils/memutils.h"
 #include "utils/ruleutils.h"
+#include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
 #include "utils/varlena.h"
 
@@ -152,12 +157,28 @@ typedef struct LionFacetRun
 								 * lion_facets_row_value(); NULL until then */
 	IndexInfo  *indexinfo;
 
-	/* the keys counted, and a min-heap of the k largest counts */
+	/*
+	 * The keys counted, and a min-heap of the k largest counts.  resbytes is
+	 * what the copies of res's keys take; past work_mem, with res's own
+	 * slots, every key kept goes to sort instead (lion_facets_spill()), in
+	 * the output's order, which keyordered and sortop say: the column's btree
+	 * order where a `<` operator sorts with its comparison, the keys' bytes
+	 * otherwise.  sortcxt is reset around each key put there.
+	 */
 	LionFacetKey *res;
 	int			nres;
 	int			maxres;
+	Size		resbytes;
 	int64	   *heap_counts;
 	int			nheap;
+	bool		keyordered;
+	Oid			sortop;
+	FmgrInfo	outfn;			/* the key type's output function */
+	Tuplesortstate *sort;		/* NULL until res outgrows work_mem */
+	TupleDesc	sortdesc;
+	TupleTableSlot *sortslot;
+	MemoryContext sortcxt;
+	int64		sorted;			/* the keys put into sort */
 } LionFacetRun;
 
 /* ---------------------------------------------------------------------
@@ -749,16 +770,20 @@ lion_facets_filter_end(LionFacetFilter *ff)
 
 /*
  * Two keys in the column's order: its btree comparison, under the index's
- * collation, where the type has one, and the stored bytes otherwise.  The
- * NULL group last, as ORDER BY col puts it.
+ * collation, where the type has one that a `<` operator sorts with
+ * (run->keyordered), and the stored bytes otherwise - the order a tuplesort
+ * of the keys can be given too (lion_facets_spill()).  The NULL group last,
+ * as ORDER BY col puts it.
  */
 static int
-lion_facets_keycmp(LionState *state, const LionFacetKey *a,
+lion_facets_keycmp(LionFacetRun *run, const LionFacetKey *a,
 				   const LionFacetKey *b)
 {
+	LionState  *state = run->state;
+
 	if (a->isnull || b->isnull)
 		return (a->isnull ? 1 : 0) - (b->isnull ? 1 : 0);
-	if (state->ordered)
+	if (run->keyordered)
 		return DatumGetInt32(FunctionCall2Coll(&state->cmpproc,
 											   state->collation,
 											   a->key, b->key));
@@ -788,7 +813,7 @@ lion_facets_key_free(LionFacetRun *run, LionFacetKey *k)
 		pfree(DatumGetPointer(k->key));
 }
 
-static LionState *lion_facets_sort_state;
+static LionFacetRun *lion_facets_sort_run;
 
 /* larger counts first, then the keys in the column's order */
 static int
@@ -799,7 +824,7 @@ lion_facets_res_cmp(const void *a, const void *b)
 
 	if (x->count != y->count)
 		return (x->count > y->count) ? -1 : 1;
-	return lion_facets_keycmp(lion_facets_sort_state, x, y);
+	return lion_facets_keycmp(lion_facets_sort_run, x, y);
 }
 
 /* larger bounds first */
@@ -815,10 +840,173 @@ lion_facets_cand_cmp(const void *a, const void *b)
 static void
 lion_facets_sort(LionFacetRun *run)
 {
-	lion_facets_sort_state = run->state;
+	lion_facets_sort_run = run;
 	qsort(run->res, run->nres, sizeof(LionFacetKey), lion_facets_res_cmp);
-	lion_facets_sort_state = NULL;
+	lion_facets_sort_run = NULL;
 }
+
+/* What a kept key's copy in keycxt takes, beside its slot in res. */
+static Size
+lion_facets_key_bytes(LionFacetRun *run, const LionFacetKey *k)
+{
+	if (k->isnull || run->state->typbyval)
+		return 0;
+	return GetMemoryChunkSpace(DatumGetPointer(k->key));
+}
+
+/* The key as text: its type's output, or a jsonb_contains_ops path key's. */
+static text *
+lion_facets_key_text(LionFacetRun *run, Datum key, FmgrInfo *outfn)
+{
+	if (run->state->extractvalue.fn_addr == lion_jsonb_extract_value)
+		return cstring_to_text(lion_jsonb_key_out(DatumGetByteaPP(key)));
+	return cstring_to_text(OutputFunctionCall(outfn, key));
+}
+
+/*
+ * The key's stored bytes as a bytea, whose order (byteacmp(): the bytes, then
+ * the length) is lion_facets_keycmp()'s for a column not keyordered: a
+ * by-value key's Datum most significant byte first, a fixed-length one's
+ * bytes, a varlena's data and a cstring's characters.
+ */
+static Datum
+lion_facets_key_image(LionFacetRun *run, Datum key)
+{
+	LionState  *state = run->state;
+	const char *data;
+	Size		len;
+	char		be[sizeof(Datum)];
+	bytea	   *b;
+
+	if (state->typbyval)
+	{
+		uint64		v = (uint64) key;
+		int			i;
+
+		for (i = 0; i < (int) sizeof(Datum); i++)
+			be[i] = (char) (v >> (8 * (sizeof(Datum) - 1 - i)));
+		data = be;
+		len = sizeof(Datum);
+	}
+	else if (state->typlen > 0)
+	{
+		data = DatumGetPointer(key);
+		len = (Size) state->typlen;
+	}
+	else if (state->typlen == -1)
+	{
+		data = VARDATA_ANY(DatumGetPointer(key));
+		len = VARSIZE_ANY_EXHDR(DatumGetPointer(key));
+	}
+	else
+	{
+		data = DatumGetCString(key);
+		len = strlen(data);
+	}
+	if (len > MaxAllocSize - VARHDRSZ)
+		elog(ERROR, "lion index facets: a key of %zu bytes", len);
+	b = (bytea *) palloc(VARHDRSZ + len);
+	SET_VARSIZE(b, VARHDRSZ + len);
+	memcpy(VARDATA(b), data, len);
+	return PointerGetDatum(b);
+}
+
+/* A key counted, put into the sort, its copy freed. */
+static void
+lion_facets_sort_put(LionFacetRun *run, LionFacetKey *k)
+{
+	TupleTableSlot *slot = run->sortslot;
+	MemoryContext oldcxt = MemoryContextSwitchTo(run->sortcxt);
+
+	Assert(k->count > 0);
+	ExecClearTuple(slot);
+	slot->tts_values[0] = Int64GetDatum(-k->count);
+	slot->tts_isnull[0] = false;
+	slot->tts_isnull[1] = k->isnull;
+	slot->tts_isnull[2] = k->isnull;
+	if (!k->isnull)
+	{
+		slot->tts_values[1] = run->keyordered ? k->key :
+			lion_facets_key_image(run, k->key);
+		slot->tts_values[2] =
+			PointerGetDatum(lion_facets_key_text(run, k->key, &run->outfn));
+	}
+	ExecStoreVirtualTuple(slot);
+	tuplesort_puttupleslot(run->sort, slot);
+	ExecClearTuple(slot);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(run->sortcxt);
+	lion_facets_key_free(run, k);
+	run->sorted++;
+}
+
+/*
+ * The keys kept so far moved to a tuplesort, and every key kept from now on
+ * put there (lion_facets_keep()): what res and its keys would take past
+ * work_mem, which every key of a large column can (a k of NULL), sorted by
+ * count descending and then in lion_facets_keycmp()'s order - by the
+ * column's own `<` (run->sortop) where it is keyordered, by the key's bytes
+ * (lion_facets_key_image()) otherwise, the NULL group last - with the key's
+ * text beside it for the output.  The sort spills to temporary files as any
+ * tuplesort does, and a key's copy is freed once it is in the sort.
+ */
+static void
+lion_facets_spill(LionFacetRun *run)
+{
+	AttrNumber	attnums[2] = {1, 2};
+	Oid			sortops[2];
+	Oid			collations[2];
+	bool		nullsfirst[2] = {false, false};
+	Oid			keytype = run->keyordered ? run->state->typid : BYTEAOID;
+	int			i;
+
+	Assert(run->sort == NULL);
+	run->sortdesc = CreateTemplateTupleDesc(3);
+	TupleDescInitEntry(run->sortdesc, 1, "count", INT8OID, -1, 0);
+	TupleDescInitEntry(run->sortdesc, 2, "key", keytype, -1, 0);
+	TupleDescInitEntryCollation(run->sortdesc, 2,
+								run->keyordered ? run->state->collation :
+								InvalidOid);
+	TupleDescInitEntry(run->sortdesc, 3, "text", TEXTOID, -1, 0);
+	TupleDescFinalize(run->sortdesc);
+	/* the count negated, ascending: the largest first */
+	sortops[0] = Int8LessOperator;
+	sortops[1] = run->keyordered ? run->sortop : ByteaLessOperator;
+	collations[0] = InvalidOid;
+	collations[1] = run->keyordered ? run->state->collation : InvalidOid;
+	run->sort = tuplesort_begin_heap(run->sortdesc, 2, attnums, sortops,
+									 collations, nullsfirst, work_mem, NULL,
+									 TUPLESORT_NONE);
+	run->sortslot = MakeSingleTupleTableSlot(run->sortdesc, &TTSOpsVirtual);
+	run->sortcxt = AllocSetContextCreate(CurrentMemoryContext,
+										 "lion index facet sorted key",
+										 ALLOCSET_SMALL_SIZES);
+	for (i = 0; i < run->nres; i++)
+		lion_facets_sort_put(run, &run->res[i]);
+	run->nres = 0;
+	run->resbytes = 0;
+	run->maxres = 64;
+	run->res = (LionFacetKey *) repalloc_huge(run->res,
+											  sizeof(LionFacetKey) * run->maxres);
+}
+
+/* The sort, and every key in it, dropped: a top k begun again. */
+static void
+lion_facets_sort_end(LionFacetRun *run)
+{
+	if (run->sort == NULL)
+		return;
+	tuplesort_end(run->sort);
+	ExecDropSingleTupleTableSlot(run->sortslot);
+	FreeTupleDesc(run->sortdesc);
+	MemoryContextDelete(run->sortcxt);
+	run->sort = NULL;
+	run->sortslot = NULL;
+	run->sortdesc = NULL;
+	run->sortcxt = NULL;
+	run->sorted = 0;
+}
+
 
 /* The k-th largest count so far, in a min-heap of k (lion_topk_push()). */
 static void
@@ -934,42 +1122,69 @@ lion_facets_keep(LionFacetRun *run, LionFacetKey *k, int64 count)
 		return;
 	}
 	run->rows += count;
-	if (run->nres >= run->maxres)
-	{
-		/*
-		 * Past twice k, the keys after the k-th in the final order cannot be
-		 * in it: cut back to k, and free the rest.  The heap of the k largest
-		 * counts holds counts, not places in res, and is not touched.
-		 */
-		if (run->k >= 0 && run->nres >= 2 * run->k)
-		{
-			int			i;
-
-			lion_facets_sort(run);
-			for (i = (int) run->k; i < run->nres; i++)
-				lion_facets_key_free(run, &run->res[i]);
-			run->nres = (int) run->k;
-		}
-		else
-		{
-			run->maxres = run->maxres * 2;
-			run->res = (LionFacetKey *)
-				repalloc_huge(run->res, sizeof(LionFacetKey) * run->maxres);
-		}
-	}
-	run->res[run->nres] = *k;
-	run->res[run->nres].count = count;
-	run->nres++;
 	if (run->k >= 0)
 		lion_facets_heap_push(run, count);
+	k->count = count;
+
+	/*
+	 * Past twice k, the keys after the k-th in the final order cannot be in
+	 * it: cut back to k, and free the rest.  The heap of the k largest counts
+	 * holds counts, not places in res, and is not touched.
+	 */
+	if (run->sort == NULL && run->nres >= run->maxres &&
+		run->k >= 0 && run->nres >= 2 * run->k)
+	{
+		int			i;
+
+		lion_facets_sort(run);
+		for (i = (int) run->k; i < run->nres; i++)
+		{
+			run->resbytes -= lion_facets_key_bytes(run, &run->res[i]);
+			lion_facets_key_free(run, &run->res[i]);
+		}
+		run->nres = (int) run->k;
+	}
+
+	/*
+	 * ... and past work_mem - res's slots, grown if they must, and its keys'
+	 * copies - the keys go to the sort, which spills (lion_facets_spill()):
+	 * every key of a column with more of them than the memory holds, or a
+	 * top k too large for it.  res never has more slots than an int counts.
+	 */
+	if (run->sort == NULL)
+	{
+		Size		slots = (Size) run->maxres * (run->nres < run->maxres ? 1 : 2);
+
+		if (run->resbytes + lion_facets_key_bytes(run, k) +
+			sizeof(LionFacetKey) * slots > (Size) work_mem * 1024 ||
+			slots >= INT_MAX / 2)
+			lion_facets_spill(run);
+	}
+	if (run->sort != NULL)
+	{
+		lion_facets_sort_put(run, k);
+		return;
+	}
+	if (run->nres >= run->maxres)
+	{
+		run->maxres = run->maxres * 2;
+		run->res = (LionFacetKey *)
+			repalloc_huge(run->res, sizeof(LionFacetKey) * run->maxres);
+	}
+	run->res[run->nres] = *k;
+	run->resbytes += lion_facets_key_bytes(run, k);
+	run->nres++;
 }
 
 /* ---------------------------------------------------------------------
  * The rows of a set, read from the heap
  * --------------------------------------------------------------------- */
 
-/* What lion_facets_rows() hands each row it fetches to. */
-typedef void (*LionFacetRowFn) (LionFacetRun *run, TupleTableSlot *slot,
+/*
+ * What lion_facets_rows() hands each row it fetches to: false stops the
+ * fetching there.
+ */
+typedef bool (*LionFacetRowFn) (LionFacetRun *run, TupleTableSlot *slot,
 								void *arg);
 
 /*
@@ -977,9 +1192,9 @@ typedef void (*LionFacetRowFn) (LionFacetRun *run, TupleTableSlot *slot,
  * fetches it (table_index_fetch_tuple(): the HOT chain followed, the snapshot
  * applied, the predicate lock taken) and handed to fn in a context of its
  * own, which is reset around each: not percount, which a caller's counts may
- * still be in (lion_facets_count_keep()).
+ * still be in (lion_facets_count_keep()).  False when fn stopped it.
  */
-static void
+static bool
 lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
 				 void *arg)
 {
@@ -991,6 +1206,7 @@ lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
 	uint16	   *los;
 	MemoryContext rowcxt;
 	MemoryContext oldcxt;
+	bool		more = true;
 
 	los = (uint16 *) palloc(sizeof(uint16) * LION_CONTAINER_RANGE);
 	rowcxt = AllocSetContextCreate(CurrentMemoryContext,
@@ -1009,13 +1225,13 @@ lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
 #endif
 	slot = table_slot_create(run->heap, NULL);
 
-	while ((c = lion_stream_next(stream)) != NULL)
+	while (more && (c = lion_stream_next(stream)) != NULL)
 	{
 		uint32		n = lion_container_to_array(c, los);
 		uint32		i;
 
 		CHECK_FOR_INTERRUPTS();
-		for (i = 0; i < n; i++)
+		for (i = 0; i < n && more; i++)
 		{
 			ItemPointerData tid;
 			bool		all_dead = false;
@@ -1039,7 +1255,7 @@ lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
 
 			MemoryContextReset(rowcxt);
 			oldcxt = MemoryContextSwitchTo(rowcxt);
-			fn(run, slot, arg);
+			more = fn(run, slot, arg);
 			MemoryContextSwitchTo(oldcxt);
 		}
 	}
@@ -1050,6 +1266,7 @@ lion_facets_rows(LionFacetRun *run, LionSetStream *stream, LionFacetRowFn fn,
 #endif
 	pfree(los);
 	MemoryContextDelete(rowcxt);
+	return more;
 }
 
 /* The keys of the rows, as a hash table under the column's own equality. */
@@ -1182,7 +1399,7 @@ typedef struct LionFacetResolve
 	Datum		key;
 } LionFacetResolve;
 
-static void
+static bool
 lion_facets_resolve_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
 {
 	LionFacetResolve *r = (LionFacetResolve *) arg;
@@ -1193,10 +1410,11 @@ lion_facets_resolve_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
 	int			i;
 
 	if (isnull)
-		return;
+		return true;
 	n = lion_ambiguous_values(run->state, value, r->key, &values);
 	for (i = 0; i < n; i++)
 		lion_facets_heap_add(run, r->htab, values[i]);
+	return true;
 }
 
 /* A copy of tree with every key number moved up by off. */
@@ -1469,20 +1687,27 @@ lion_facets_heap_ok(LionFacetRun *run)
  * are exact without the visibility map.  The row's value is taken apart by
  * the index's own extraction, which drops NULL and repeated elements, and
  * grouped under the column's equality - the index's entries' classes.
+ *
+ * The table holds a key for every distinct key of those rows, which can be
+ * most of the column's: past hash_mem (get_hash_memory_limit()) it is given
+ * up, and false returned, for the caller to count by the keys instead - the
+ * same counts, which keep no more than work_mem of keys (lion_facets_keep()).
  */
 typedef struct LionFacetHeapRows
 {
 	HTAB	   *htab;
 	AttrNumber	heapatt;
 	int64		nullcount;
+	Size		base;			/* keycxt's size before the table */
 } LionFacetHeapRows;
 
-static void
+static bool
 lion_facets_heap_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
 {
 	LionFacetHeapRows *h = (LionFacetHeapRows *) arg;
 	bool		isnull;
 	Datum		value = slot_getattr(slot, h->heapatt, &isnull);
+	long		before = hash_get_num_entries(h->htab);
 
 	if (isnull)
 	{
@@ -1518,21 +1743,47 @@ lion_facets_heap_row(LionFacetRun *run, TupleTableSlot *slot, void *arg)
 	}
 	else
 		lion_facets_heap_add(run, h->htab, value);
+
+	/* the table and its keys' copies, measured when it has grown */
+	return hash_get_num_entries(h->htab) == before ||
+		MemoryContextMemAllocated(run->keycxt, true) - h->base <=
+		get_hash_memory_limit();
 }
 
-static void
+/*
+ * Every key of the filter's rows counted in a table (above), and kept; false,
+ * with nothing kept and the table freed, when it outgrew hash_mem.
+ */
+static bool
 lion_facets_heap(LionFacetRun *run)
 {
 	LionFacetHeapRows h;
 	LionSetStream *stream;
+	bool		done;
 
+	h.base = MemoryContextMemAllocated(run->keycxt, true);
 	h.htab = lion_facets_htab(run);
 	h.heapatt = run->index->rd_index->indkey.values[run->attno - 1];
 	h.nullcount = 0;
 
 	stream = lion_stream_begin(1, &run->copy, NULL, false);
-	lion_facets_rows(run, stream, lion_facets_heap_row, &h);
+	done = lion_facets_rows(run, stream, lion_facets_heap_row, &h);
 	lion_stream_end(stream);
+	if (!done)
+	{
+		HASH_SEQ_STATUS seq;
+		LionFacetHashEnt *ent;
+
+		hash_seq_init(&seq, h.htab);
+		while ((ent = (LionFacetHashEnt *) hash_seq_search(&seq)) != NULL)
+		{
+			if (!run->state->typbyval)
+				pfree(DatumGetPointer(ent->key));
+		}
+		hash_destroy(h.htab);
+		lion_facets_hash_state = NULL;
+		return false;
+	}
 
 	lion_facets_keep_htab(run, h.htab, 0);
 	if (h.nullcount > 0)
@@ -1545,6 +1796,7 @@ lion_facets_heap(LionFacetRun *run)
 		k.isnull = true;
 		lion_facets_keep(run, &k, h.nullcount);
 	}
+	return true;
 }
 
 /* How many entries of the column hold a key's rows: a walk of the headers. */
@@ -1650,8 +1902,12 @@ lion_facets_topk(LionFacetRun *run, int cap)
 				lion_facets_key_free(run, &cand[i]);
 			pfree(cand);
 			run->heapread = true;
-			lion_facets_heap(run);
-			return true;
+			if (lion_facets_heap(run))
+				return true;
+
+			/* past hash_mem: the column is walked instead */
+			run->heapread = false;
+			return false;
 		}
 	}
 
@@ -1692,15 +1948,6 @@ lion_facets_topk(LionFacetRun *run, int cap)
 	return maxout == 0;
 }
 
-/* The key as text: its type's output, or a jsonb_contains_ops path key's. */
-static text *
-lion_facets_key_text(LionFacetRun *run, Datum key, FmgrInfo *outfn)
-{
-	if (run->state->extractvalue.fn_addr == lion_jsonb_extract_value)
-		return cstring_to_text(lion_jsonb_key_out(DatumGetByteaPP(key)));
-	return cstring_to_text(OutputFunctionCall(outfn, key));
-}
-
 /*
  * lion_index_facets(idx regclass, k int DEFAULT NULL, filter text DEFAULT
  * NULL, attno int2 DEFAULT 1, OUT key text, OUT count bigint): the k keys of
@@ -1716,11 +1963,10 @@ lion_index_facets(PG_FUNCTION_ARGS)
 	LionFacetRun run;
 	LionFacetFilter ff;
 	LionCountCall call;
-	FmgrInfo	outfn;
 	Oid			outfunc;
 	bool		isvarlena;
 	bool		any = true;
-	int			nout;
+	int64		nout;
 	int			i;
 
 	InitMaterializedSRF(fcinfo, 0);
@@ -1776,6 +2022,10 @@ lion_index_facets(PG_FUNCTION_ARGS)
 									   ALLOCSET_DEFAULT_SIZES);
 	run.maxres = 64;
 	run.res = (LionFacetKey *) palloc(sizeof(LionFacetKey) * run.maxres);
+	run.sortop = run.state->ordered ? run.state->ltopr : InvalidOid;
+	run.keyordered = OidIsValid(run.sortop);
+	getTypeOutputInfo(run.state->typid, &outfunc, &isvarlena);
+	fmgr_info(outfunc, &run.outfn);
 	if (run.k >= 0)
 		run.heap_counts = (int64 *) palloc(sizeof(int64) * Max(run.k, 1));
 
@@ -1800,14 +2050,12 @@ lion_index_facets(PG_FUNCTION_ARGS)
 		if (run.k < 0)
 		{
 			/* every key: by the keys, or by the filter's rows when fewer */
-			if (lion_facets_heap_ok(&run) &&
+			run.heapread = lion_facets_heap_ok(&run) &&
 				(double) run.copy.ntids <
-				(double) lion_facets_nentries(&run) * LION_FACET_KEY_ROWS)
-			{
-				run.heapread = true;
+				(double) lion_facets_nentries(&run) * LION_FACET_KEY_ROWS &&
 				lion_facets_heap(&run);
-			}
-			else
+			/* ... and by the keys when the rows' keys outgrew hash_mem */
+			if (!run.heapread)
 				lion_facets_walk(&run);
 		}
 		else
@@ -1830,36 +2078,64 @@ lion_index_facets(PG_FUNCTION_ARGS)
 				for (i = 0; i < run.nres; i++)
 					lion_facets_key_free(&run, &run.res[i]);
 				run.nres = 0;
+				run.resbytes = 0;
 				run.nheap = 0;
+				lion_facets_sort_end(&run);
 				lion_facets_walk(&run);
 			}
 		}
 	}
 
-	elog(DEBUG1, "lion_index_facets(%s): %lld entries read, %lld keys counted%s, %lld rows read from the heap%s",
+	elog(DEBUG1, "lion_index_facets(%s): %lld entries read, %lld keys counted%s, %lld rows read from the heap%s, %lld keys sorted past work_mem",
 		 RelationGetRelationName(run.index), (long long) run.walked,
 		 (long long) run.counted, run.whole ? " (walked whole)" : "",
-		 (long long) run.fetched, run.heapread ? " (by the filter's rows)" : "");
+		 (long long) run.fetched, run.heapread ? " (by the filter's rows)" : "",
+		 (long long) run.sorted);
 
-	lion_facets_sort(&run);
-	nout = (run.limit >= 0) ? (int) Min((int64) run.nres, run.limit) :
-		run.nres;
-	getTypeOutputInfo(run.state->typid, &outfunc, &isvarlena);
-	fmgr_info(outfunc, &outfn);
-	for (i = 0; i < nout; i++)
+	nout = 0;
+	if (run.sort != NULL)
 	{
-		Datum		values[2];
-		bool		nulls[2] = {false, false};
+		/* the keys past work_mem, in the sort's order: count, then key */
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(run.sortdesc,
+														&TTSOpsMinimalTuple);
 
-		if (run.res[i].isnull)
-			nulls[0] = true;
-		else
-			values[0] = PointerGetDatum(lion_facets_key_text(&run,
-															 run.res[i].key,
-															 &outfn));
-		values[1] = Int64GetDatum(run.res[i].count);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
-							 nulls);
+		tuplesort_performsort(run.sort);
+		while ((run.limit < 0 || nout < run.limit) &&
+			   tuplesort_gettupleslot(run.sort, true, false, slot, NULL))
+		{
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+			bool		isnull;
+
+			values[0] = slot_getattr(slot, 3, &nulls[0]);
+			values[1] = Int64GetDatum(-DatumGetInt64(slot_getattr(slot, 1,
+																  &isnull)));
+			Assert(!isnull);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+			nout++;
+		}
+		ExecDropSingleTupleTableSlot(slot);
+		lion_facets_sort_end(&run);
+	}
+	else
+	{
+		lion_facets_sort(&run);
+		for (i = 0; i < run.nres && (run.limit < 0 || i < run.limit); i++)
+		{
+			Datum		values[2];
+			bool		nulls[2] = {false, false};
+
+			if (run.res[i].isnull)
+				nulls[0] = true;
+			else
+				values[0] = PointerGetDatum(lion_facets_key_text(&run,
+																 run.res[i].key,
+																 &run.outfn));
+			values[1] = Int64GetDatum(run.res[i].count);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+		}
 	}
 
 	lion_facets_report(&run, &ff);

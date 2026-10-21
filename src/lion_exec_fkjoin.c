@@ -177,6 +177,13 @@ lion_join_filter_of(const LionCountScanState *st, int clauseno)
  * the column's, the same Datum - and distinct, the column being unique; the
  * list's lookup drops a duplicate anyway (lion_locate_array()).
  *
+ * The planner folds a dimension expected to return no more keys than a count
+ * locates at once (lion_array_batch_size()), but an estimate can be wrong by
+ * any factor.  Past that many keys they go to a tuplestore instead
+ * (cl->valstore), which keeps work_mem of them and spills the rest to a
+ * temporary file, and the list is collected from it a batch at a time rather
+ * than located (lion_locate_list()).
+ *
  * The child runs under the query's snapshot, as the dimension's child does,
  * so its rows are the ones the join would have read.  It is a child of the
  * node's, initialised and ended with it and rescanned with it - and it runs
@@ -190,6 +197,7 @@ lion_join_filter_values(LionCountScanState *st)
 	LionJoinState *js = st->join;
 	MemoryContext valcxt = CurrentMemoryContext;
 	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
+	int			batch = lion_array_batch_size();
 	int			f;
 
 	for (f = 0; f < js->nfilter; f++)
@@ -197,8 +205,13 @@ lion_join_filter_values(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[js->filterclause[f]];
 		PlanState  *ps = js->filterps[f];
 		ArrayBuildState *astate;
+		bool		null = false;
 
-		astate = initArrayResult(cl->valtype, valcxt, false);
+		/* the reset of valcxt took the last run's, once it was ended */
+		Assert(cl->valstore == NULL);
+
+		/* a context of its own, given back whole when the keys move */
+		astate = initArrayResult(cl->valtype, valcxt, true);
 		for (;;)
 		{
 			TupleTableSlot *slot;
@@ -214,11 +227,36 @@ lion_join_filter_values(LionCountScanState *st)
 			key = slot_getattr(slot, js->filtercol[f], &isnull);
 			if (isnull)
 				continue;
-			/* copied into valcxt, a by-reference key too */
-			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
 			js->filterkeys++;
+			if (cl->valstore != NULL)
+			{
+				tuplestore_putvalues(cl->valstore, cl->valstoredesc, &key,
+									 &null);
+				continue;
+			}
+			/* copied into the array's context, a by-reference key too */
+			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
+			if (astate->nelems <= batch)
+				continue;
+
+			/*
+			 * More keys than are located at once: these and the rest to a
+			 * tuplestore of the key's type, its own copies taken, in valcxt.
+			 */
+			cl->valstoredesc = CreateTemplateTupleDesc(1);
+			TupleDescInitEntry(cl->valstoredesc, 1, "key", cl->valtype, -1, 0);
+			TupleDescFinalize(cl->valstoredesc);
+			cl->valstore = tuplestore_begin_heap(false, false, work_mem);
+			for (int i = 0; i < astate->nelems; i++)
+				tuplestore_putvalues(cl->valstore, cl->valstoredesc,
+									 &astate->dvalues[i], &null);
+			MemoryContextDelete(astate->mcontext);
+			astate = NULL;
 		}
-		cl->val = makeArrayResult(astate, valcxt);
+		if (cl->valstore != NULL)
+			cl->val = (Datum) 0;
+		else
+			cl->val = makeArrayResult(astate, valcxt);
 		cl->valisnull = false;
 	}
 }

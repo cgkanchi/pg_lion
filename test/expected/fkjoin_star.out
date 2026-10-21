@@ -443,5 +443,54 @@ SELECT lion_st_counter('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d 
               25
 (1 row)
 
-DROP TABLE lion_sf, lion_sd, lion_se, lion_sc, lion_sn, lion_sb, lion_sp;
+-- a folded table whose estimate is wrong by any factor: lion_sm's statistics
+-- say no row is flagged, and all 3,000 are.  Past the keys a count locates
+-- at once - a thousand at 64 kB - its keys go to a tuplestore, which spills
+-- past work_mem, and the IN list is collected from it a batch of keys at a
+-- time into one set; so in each leaf of the partitioned fact, and again at
+-- each rescan
+CREATE TABLE lion_sm (k int PRIMARY KEY, flag bool NOT NULL, tag text NOT NULL);
+INSERT INTO lion_sm SELECT i * 13, false, 't' || (i % 3) FROM generate_series(1, 3000) i;
+ANALYZE lion_sm;
+UPDATE lion_sm SET flag = true;
+CREATE INDEX lion_sp_id ON lion_sp USING lion (id);
+SET work_mem = '64kB';
+SELECT lion_st('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k WHERE m.flag GROUP BY d.region');
+            lion_st            
+-------------------------------
+ pushed down, 1 folded, 3 rows
+(1 row)
+
+SELECT lion_st_counter('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k WHERE m.flag GROUP BY d.region', 'Join Filter Keys');
+ lion_st_counter 
+-----------------
+            3000
+(1 row)
+
+SELECT lion_st_counter('SELECT d.region, count(*) FROM lion_sf f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k WHERE m.flag GROUP BY d.region', 'Lists Collected');
+ lion_st_counter 
+-----------------
+               1
+(1 row)
+
+SELECT lion_st('SELECT count(*) FROM lion_sf f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k JOIN lion_se e ON f.ek = e.k WHERE m.flag AND e.flag');
+            lion_st            
+-------------------------------
+ pushed down, 2 folded, 1 rows
+(1 row)
+
+SELECT lion_st('SELECT d.region, count(*) FROM lion_sp f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k WHERE m.flag GROUP BY d.region');
+            lion_st            
+-------------------------------
+ pushed down, 1 folded, 3 rows
+(1 row)
+
+SELECT lion_st('SELECT r.tag, (SELECT sum(c) FROM (SELECT d.region, count(*) AS c FROM lion_sf f JOIN lion_sd d ON f.fk = d.k JOIN lion_sm m ON f.id = m.k WHERE m.flag AND m.tag <> r.tag GROUP BY d.region) s) FROM (VALUES (''t0''), (''t2''), (''none'')) r(tag)');
+            lion_st            
+-------------------------------
+ pushed down, 1 folded, 3 rows
+(1 row)
+
+RESET work_mem;
+DROP TABLE lion_sf, lion_sd, lion_se, lion_sc, lion_sn, lion_sb, lion_sp, lion_sm;
 DROP FUNCTION lion_st(text), lion_st_explain(text), lion_st_counter(text, text);

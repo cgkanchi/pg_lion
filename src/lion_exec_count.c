@@ -54,11 +54,18 @@ lion_where_has_positive(LionCountScanState *st)
  * arrays of §17 as `col <> '{}'`, which there is no positive source to
  * subtract from, to be tested on each row the snapshot sees.  In the current
  * memory context.
+ *
+ * Those are the only negated clauses it tests, and only on a heap column:
+ * the planner takes no `IS DISTINCT FROM`, `NOT (multi-key)` or negated
+ * clause on an expression column (§41) beside a query known only at run
+ * time (lion_count_path_strategy()), and any other clause here is refused
+ * rather than tested as something it is not.
  */
 static LionRowFilter *
 lion_filter_with_negated(LionCountScanState *st)
 {
 	LionRowFilter *scan = (LionRowFilter *) palloc(sizeof(LionRowFilter));
+	int			natts = RelationGetDescr(st->heap)->natts;
 	int			k;
 
 	*scan = *st->filter;
@@ -73,9 +80,20 @@ lion_filter_with_negated(LionCountScanState *st)
 
 		if (st->item[k].orno >= 0 || !LION_CLAUSE_IS_NEGATED(cl->kind))
 			continue;
+		if (cl->kind != LION_CLAUSE_NOTNULL && cl->kind != LION_CLAUSE_NE &&
+			cl->kind != LION_CLAUSE_NOTRESERVED)
+			elog(ERROR, "LionCount: a negated clause of kind %d on index \"%s\" tested on a row",
+				 (int) cl->kind, RelationGetRelationName(cl->idx));
+		if (cl->idxcol < 1 || cl->idxcol > cl->idx->rd_index->indnatts)
+			elog(ERROR, "LionCount: column %d of index \"%s\" tested on a row",
+				 cl->idxcol, RelationGetRelationName(cl->idx));
+		Assert(scan->nclauses < st->filter->nclauses + st->nitem);
 		c = &scan->clauses[scan->nclauses++];
 		scan->nheap++;
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		if (c->attno < 1 || c->attno > natts)
+			elog(ERROR, "LionCount: an expression column of index \"%s\" tested on a row",
+				 RelationGetRelationName(cl->idx));
 		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL);
 		if (cl->kind == LION_CLAUSE_NOTRESERVED)
 		{
@@ -83,14 +101,13 @@ lion_filter_with_negated(LionCountScanState *st)
 			 * Every row outside the NULL and EMPTY entries (DESIGN.md §17,
 			 * "Non-empty arrays") is `col <> '{}'`: array_ne() against the
 			 * column's own empty array, which no element is compared with.
-			 * The planner takes no other mask, nor an expression column,
-			 * beside a query known only at run time.
+			 * The planner takes no other mask beside a query known only at
+			 * run time.
 			 */
-			Oid			elemtype = InvalidOid;
+			Oid			elemtype;
 
-			if (c->attno > 0 && c->attno <= RelationGetDescr(st->heap)->natts)
-				elemtype = get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
-																	  c->attno - 1)->atttypid));
+			elemtype = get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
+																  c->attno - 1)->atttypid));
 			if (cl->valisnull || !OidIsValid(elemtype) ||
 				DatumGetInt32(cl->val) !=
 				(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY))

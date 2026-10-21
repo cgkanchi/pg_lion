@@ -417,6 +417,8 @@ typedef struct LionCountPathBuild
 								 * query is known only at run time (§17) */
 	bool		newnegated;		/* an `IS DISTINCT FROM` or `NOT (multi-key)`
 								 * clause outside the ORs (§35) */
+	bool		exprnegated;	/* an `IS NOT NULL` or `<>` on an expression
+								 * column outside the ORs (§41) */
 	List	   *residual;		/* clauses no posting set answers, tested on
 								 * the heap (§10, "Residual clauses") */
 	int			nfilter;		/* filtered counts (§10): their conditions */
@@ -1296,11 +1298,23 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 				cx->notnullvar = leaf.var;
 			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
 											(int) leaf.var->varattno);
+
+			/*
+			 * On an expression column (§41) it is no heap column's test, which
+			 * is all the row filter of a WHERE with nothing else to take its
+			 * candidates from makes (lion_filter_with_negated()): not beside a
+			 * query known only at run time, as NOTRESERVED's below.
+			 */
+			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+				cx->exprnegated = true;
 			break;
 		case LION_CLAUSE_NE:
 			/* a strict operator: never true of NULL (DESIGN.md §35) */
 			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
 											(int) leaf.var->varattno);
+			/* ... and on an expression column, as `IS NOT NULL` above */
+			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+				cx->exprnegated = true;
 			break;
 		case LION_CLAUSE_NOTMULTI:
 			/* NOT of a strict operator: NULL, never true, of NULL (§35) */
@@ -1826,7 +1840,8 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 	 * combination declined, with the ordinary plan's answer.
 	 */
 	if (fj != NULL &&
-		(cx->ncompl > 0 || (cx->newnegated && cx->runtimemulti)))
+		(cx->ncompl > 0 ||
+		 ((cx->newnegated || cx->exprnegated) && cx->runtimemulti)))
 		return false;
 
 	/*
@@ -2601,7 +2616,8 @@ lion_count_path_filters(LionCountPathBuild *cx)
 	 */
 	if (cx->ncompl > 0 && cx->decode)
 		return false;
-	if ((cx->ncompl > 0 || cx->newnegated || cx->residual != NIL) &&
+	if ((cx->ncompl > 0 || cx->newnegated || cx->exprnegated ||
+		 cx->residual != NIL) &&
 		cx->runtimemulti)
 		return false;
 	return true;
@@ -2756,11 +2772,13 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 * known only at run time, which may turn out to narrow nothing and
 	 * leave the count with no source to take its rows from but the heap
 	 * (lion_count_scan_filtered()); the new negated clauses of §35 are not
-	 * among the tests that scan makes either.
+	 * among the tests that scan makes either, nor a negated clause on an
+	 * expression column (§41).
 	 */
 	if (cx->ncompl > 0 && cx->decode)
 		return false;
-	if ((cx->ncompl > 0 || cx->newnegated) && cx->runtimemulti)
+	if ((cx->ncompl > 0 || cx->newnegated || cx->exprnegated) &&
+		cx->runtimemulti)
 		return false;
 
 	/* Something has to drive the count. */
@@ -4642,7 +4660,7 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
 
 	if (cx->ncompl > 0 || cx->residual != NIL || cx->nfilter > 0)
 		return false;
-	if (cx->newnegated && cx->runtimemulti)
+	if ((cx->newnegated || cx->exprnegated) && cx->runtimemulti)
 		return false;
 	if (cx->rangevars != NIL)
 	{

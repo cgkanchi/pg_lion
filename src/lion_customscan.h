@@ -151,6 +151,7 @@
 #include "utils/selfuncs.h"
 #include "utils/spccache.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 #include "port/atomics.h"
@@ -1546,6 +1547,18 @@ typedef struct LionClauseState
 	Datum		val;
 	bool		valisnull;
 
+	/*
+	 * LION_CLAUSE_ARRAY of a dimension folded into a fact filter (DESIGN.md
+	 * §27, "A second dimension that only filters") with more keys than
+	 * lion_array_batch_size(): the keys in a tuplestore of valstoredesc's one
+	 * column, past work_mem in a temporary file, in place of val's array -
+	 * the list then collected rather than located (lion_locate_list()).
+	 * Made with the values in valcxt, and ended before that is reset
+	 * (lion_clause_values_free()).
+	 */
+	Tuplestorestate *valstore;
+	TupleDesc	valstoredesc;
+
 	StrategyNumber strategy;	/* LION_CLAUSE_MULTI: 2, 3 or 5 */
 
 	/*
@@ -2606,6 +2619,8 @@ typedef struct LionScanWorkerSums
 	int64		rangesrc_collected;
 	int64		rangesrc_walked;
 	int64		rangesrc_spilled;
+	int64		listsrc_collected;
+	int64		listsrc_spilled;
 	int64		wherecollected;
 	int64		wherespilled;
 	int64		groupbatches;
@@ -2723,6 +2738,18 @@ typedef struct LionCountScanState
 	int64		rangesrc_spilled;	/* of the collected: in a temporary file */
 	Size		rangesrc_held;
 	List	   *rangesrc_mem;
+
+	/*
+	 * ... and the IN lists too long to locate at once that a count which is
+	 * not one of the relation as one row collects the same way, within the
+	 * same memory (DESIGN.md §15, "A list too long to locate at once"):
+	 * how many, how many of them spilled, and those in memory (listsrc_mem,
+	 * in wherecxt), which lion_rangesrc_evict() sends to files as it does
+	 * the ranges'.
+	 */
+	int64		listsrc_collected;
+	int64		listsrc_spilled;
+	List	   *listsrc_mem;
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -4003,6 +4030,7 @@ extern TupleTableSlot *lion_next_join_row(LionCountScanState *st);
 
 /* lion_exec_locate.c */
 extern void lion_eval_clause_values(LionCountScanState *st);
+extern void lion_clause_values_free(LionCountScanState *st);
 extern LionKeyNode *lion_key_node(int keyno);
 extern LionKeyNode *lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args,
 								   int nargs);

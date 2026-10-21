@@ -213,6 +213,16 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tsv @@ $1 AND k IN (1, 2)',
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND tsv @@ $2 AND n IS NOT NULL', '''{}'', ''!w5''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND n IS NOT NULL', '''{}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND n IS NOT NULL', '''{t2}''');
+-- ... but not a null test or a <> on an index expression, which the scan
+-- cannot test on a heap column: the query is not pushed down when it is known
+-- only at run time, and is with a literal
+CREATE INDEX lion_mk_ne ON lion_mk_t USING lion ((n + 0));
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) IS NOT NULL', '''{}''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) <> 2', '''{}''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND tsv @@ $2 AND (n + 0) <> 2', '''{}'', ''!w5''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) <> 2', '''{t2}''');
+SELECT lion_mk($$SELECT count(*) FROM lion_mk_t WHERE tags @> '{t2}' AND (n + 0) <> 2$$);
+DROP INDEX lion_mk_ne;
 SELECT lion_mk('SELECT n, count(*) FROM lion_mk_t WHERE tags @> $1 GROUP BY n', '''{}''');
 SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags && $1 AND tsv @@ $2', '''{t3,NULL}'', ''w3 <-> x3''');
 -- the column itself counted: a strict operator leaves no NULL of it

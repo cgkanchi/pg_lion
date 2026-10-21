@@ -1217,6 +1217,20 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,
 							   st->rangesrc_spilled +
 							   st->worker.rangesrc_spilled, es);
+
+	/*
+	 * The IN lists too long to locate at once that were collected the same
+	 * way (DESIGN.md §15, "A list too long to locate at once"), and of those
+	 * the ones spilled.
+	 */
+	if (st->listsrc_collected + st->worker.listsrc_collected > 0)
+		ExplainPropertyInteger("Lists Collected", NULL,
+							   st->listsrc_collected +
+							   st->worker.listsrc_collected, es);
+	if (st->listsrc_spilled + st->worker.listsrc_spilled > 0)
+		ExplainPropertyInteger("Lists Spilled", NULL,
+							   st->listsrc_spilled +
+							   st->worker.listsrc_spilled, es);
 }
 
 /*
