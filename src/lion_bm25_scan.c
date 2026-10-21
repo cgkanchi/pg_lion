@@ -408,17 +408,15 @@ lion_bm25_score_column(Oid indexoid, const char *colname)
 
 /*
  * The rows the walk would read for query in column attno: its lexemes' rows,
- * added up.
+ * added up (lion_bm25_plan_ncodes(), which reads their entries and nothing
+ * else, and takes no predicate lock).
  */
 static double
 lion_bm25_candidates(Oid indexoid, AttrNumber attno, TSQuery query)
 {
 	Relation	index = index_open(indexoid, AccessShareLock);
-	LionBm25Query q;
-	double		n = 0;
+	double		n = lion_bm25_plan_ncodes(index, attno, query);
 
-	if (lion_bm25_prepare(index, attno, query, 1.2, 0.75, &q))
-		n = (double) q.ncodes;
 	index_close(index, AccessShareLock);
 	return n;
 }

@@ -531,22 +531,28 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
 	 * index grow a key: a brand new entry.
 	 *
-	 * The estimate used to be "entries on this bucket's chain times the bucket
-	 * count"; with the sorted directory of §21 there is no bucket to count and
-	 * the same order-of-magnitude estimate comes from the shape of the tree
-	 * instead - the entries on THIS leaf times the number of leaves, which is
-	 * the number of blocks the index has minus its internal pages, bounded
-	 * below by one.  Both are crude by design: counting the whole index for
-	 * every new key would read every leaf, and all this feeds is a warning.
+	 * An order-of-magnitude estimate from the shape of the directory (§21):
+	 * the entries on THIS leaf times the number of leaves.  The meta page
+	 * counts the directory's pages, and a directory of height h has at least
+	 * h internal ones, so the leaves are at most that count less h, and one at
+	 * least.  The index's other blocks are not leaves: they are the posting
+	 * trees' and position trees' pages and the free ones, and a column of a
+	 * few keys with many rows each is mostly those.  Crude by design:
+	 * counting the whole index for every new key would read every leaf, and
+	 * all this feeds is a warning.  The leaf is held: it comes before the meta
+	 * page in a split's lock order, which takes the meta page last.
 	 */
 	if (max_entries > 0)
 	{
 		Page		page = BufferGetPage(*leafbuf);
+		LionMetaPageData meta;
 		int64		perleaf = (int64) PageGetMaxOffsetNumber(page) + 1;
-		int64		nleaves = Max((int64) RelationGetNumberOfBlocks(index) - 1,
-								  1);
-		int64		estimate = perleaf * nleaves;
+		int64		nleaves;
+		int64		estimate;
 
+		lion_read_meta(index, &meta);
+		nleaves = Max((int64) meta.dirpages - (int64) meta.height, 1);
+		estimate = perleaf * nleaves;
 		if (estimate > (int64) max_entries)
 			lion_warn_max_entries(index, estimate);
 	}

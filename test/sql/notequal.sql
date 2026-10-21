@@ -180,6 +180,44 @@ SELECT lion_nq($$SELECT id FROM lion_ne WHERE n <> ANY ('{1,2}')$$, 'plain');
 SELECT lion_nq($$SELECT id FROM lion_ne WHERE k <> ANY ('{}')$$, 'bitmap');
 SELECT lion_nq($$SELECT id FROM lion_ne WHERE k <> ANY ('{3,3}'::int8[])$$, 'plain');
 SELECT lion_nq($$SELECT id FROM lion_ne WHERE c <> ANY ('{AB,ab}')$$, 'bitmap');
+-- A column laid out in hash order (DESIGN.md §21: its comparison has a
+-- SQL-standard body) has no comparison to tell the elements apart, and they
+-- are told apart by equality: the column's own for elements of its type, the
+-- family's int8 one for int8's.
+CREATE FUNCTION lion_ne_cmp4(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint4cmp($1, $2);
+CREATE FUNCTION lion_ne_cmp8(int8, int8) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint8cmp($1, $2);
+CREATE FUNCTION lion_ne_cmp48(int4, int8) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint48cmp($1, $2);
+CREATE OPERATOR FAMILY lion_ne_hfam USING lion;
+CREATE OPERATOR CLASS lion_ne_hops FOR TYPE int4 USING lion FAMILY lion_ne_hfam AS
+	OPERATOR 1 = (int4, int4),
+	OPERATOR 10 <> (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_ne_cmp4(int4, int4);
+ALTER OPERATOR FAMILY lion_ne_hfam USING lion ADD
+	OPERATOR 1 = (int8, int8),
+	OPERATOR 1 = (int4, int8),
+	OPERATOR 10 <> (int4, int8),
+	FUNCTION 1 (int8, int8) hashint8(int8),
+	FUNCTION 4 (int8, int8) lion_ne_cmp8(int8, int8),
+	FUNCTION 4 (int4, int8) lion_ne_cmp48(int4, int8);
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'lion_ne_hops';
+CREATE TABLE lion_ne_h (id int, n int) WITH (autovacuum_enabled = off);
+INSERT INTO lion_ne_h SELECT id, n FROM lion_ne;
+CREATE INDEX lion_ne_h_n ON lion_ne_h USING lion (n lion_ne_hops);
+VACUUM (FREEZE, ANALYZE) lion_ne_h;
+SELECT ordered FROM lion_index_stats('lion_ne_h_n');
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,2}')$$, 'bitmap');
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,1,NULL}')$$, 'plain');
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,2}'::int8[])$$, 'plain');
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,1}'::int8[])$$, 'bitmap');
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{NULL,5,1}'::int8[])$$, 'bitmap');
+DROP TABLE lion_ne_h;
+DROP OPERATOR FAMILY lion_ne_hfam USING lion;
+DROP FUNCTION lion_ne_cmp4(int4, int4), lion_ne_cmp8(int8, int8),
+	lion_ne_cmp48(int4, int8);
 SELECT * FROM lion_nplan($$SELECT id FROM lion_ne WHERE k <> 3 AND g = 1$$);
 
 -- 3. The count: `<>` subtracts c's entry and the NULL one.  With nothing

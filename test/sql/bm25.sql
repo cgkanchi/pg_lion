@@ -58,6 +58,7 @@ SELECT bm_same('w1', '{w1}', 20);
 SELECT bm_same('w1 & w7', '{w1,w7}', 50);
 SELECT bm_same('w3 | t4 | w12', '{w3,t4,w12}', 100);
 SELECT bm_same('w2 <-> w5 & !w9', '{w2,w5}', 30);	-- NOT terms do not score
+SELECT bm_same('w1 & !w7:*', '{w1}', 30);			-- nor a prefix under a NOT
 SELECT bm_same('w1:A & w2', '{w1,w2}', 30);			-- weights do not either
 SELECT bm_same('w4 | w8', '{w4,w8}', 40, 2.0, 0.3);
 SELECT bm_same('w4 | w8', '{w4,w8}', 40, 0.5, 1.0);
