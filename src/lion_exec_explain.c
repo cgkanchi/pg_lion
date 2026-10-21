@@ -195,7 +195,7 @@ lion_explain_col_kind(Oid idxoid, AttrNumber heapattno, int kind, List *vcols)
 }
 
 /* ... for a column whose entries are read as values: a scalar one */
-static const char *
+const char *
 lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 {
 	return lion_explain_col_kind(idxoid, heapattno,
@@ -946,6 +946,11 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
 		pfree(val);
+	}
+	else if (st->cells != NULL)
+	{
+		/* a count by cells (DESIGN.md §10, "Counts by cells") */
+		lion_explain_cells(st, ancestors, es);
 	}
 	else if (st->decode != NULL)
 	{

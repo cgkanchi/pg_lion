@@ -252,6 +252,33 @@ lion_hooktest_heapcopy_handler(PG_FUNCTION_ARGS)
 }
 
 /*
+ * The CELLS member a planner of this build makes for a count by cells of
+ * `oid = 1` alone (DESIGN.md §10, "Counts by cells"), at the plan stage: one
+ * scalar dimension of pg_class.oid, NOT NULL, its value outcome 1 and every
+ * other value outcome 0; one predicate, true in outcome 1 alone; no driver
+ * among the dimensions.
+ */
+static List *
+lion_hooktest_cells(void)
+{
+	List	   *dim;
+
+	dim = list_make5(list_make5_int(LION_CELLDIM_SCALAR, Anum_pg_class_oid,
+									2, 0, 0),
+					 list_make3_oid(ClassOidIndexId, (Oid) 607, InvalidOid),
+					 list_make1(makeConst(OIDOID, -1, InvalidOid,
+										  sizeof(Oid), ObjectIdGetDatum(1),
+										  false, true)),
+					 list_make1_int(1),
+					 NIL);
+	dim = lappend(dim, NIL);
+	return list_make3(list_make3_int(1, 1, -1), list_make1(dim),
+					  list_make1(list_make5_int(0, LION_CELLPRED_TABLE, 0,
+												LION_TRUTH_FALSE,
+												LION_TRUTH_TRUE)));
+}
+
+/*
  * pg_lion's decoder of a LionCount plan's custom_private, and the rules
  * between its members (lion_count_priv_decode() and lion_count_priv_check(),
  * src/lion_plan_private.h), handed a list a planner of this build would make
@@ -374,6 +401,51 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	else if (strcmp(variant, "distinct count without its column") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make1_int(LION_TL_COUNT_DISTINCT);
+	else if (strcmp(variant, "cells without the decoded walk") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = lion_hooktest_cells();
+	else if (strcmp(variant, "path cells at plan") == 0)
+	{
+		List	   *cells = lion_hooktest_cells();
+
+		cells = lappend(cells, NIL);	/* the predicates' expressions */
+		cells = lappend(cells, NIL);	/* ... and the WHERE over them */
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
+	}
+	else if (strcmp(variant, "cells header") == 0)
+	{
+		List	   *cells = lion_hooktest_cells();
+
+		linitial(cells) = list_make3_int(2, 1, -1);
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
+	}
+	else if (strcmp(variant, "cells value outcome") == 0)
+	{
+		List	   *cells = lion_hooktest_cells();
+		List	   *dim = (List *) linitial((List *) lsecond(cells));
+
+		lfirst(list_nth_cell(dim, 3)) = list_make1_int(2);
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
+	}
+	else if (strcmp(variant, "cells predicate dimension") == 0)
+	{
+		List	   *cells = lion_hooktest_cells();
+
+		lthird(cells) = list_make1(list_make5_int(1, LION_CELLPRED_TABLE, 0,
+												  LION_TRUTH_FALSE,
+												  LION_TRUTH_TRUE));
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
+	}
+	else if (strcmp(variant, "cells predicate truths") == 0)
+	{
+		List	   *cells = lion_hooktest_cells();
+
+		lthird(cells) = list_make1(list_make4_int(0, LION_CELLPRED_TABLE, 0,
+												  LION_TRUTH_TRUE));
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = cells;
+	}
+	else if (strcmp(variant, "cell predicate without cells") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make2_int(LION_TL_CELLPRED(0), LION_TL_COUNT);
 	else
 		elog(ERROR, "unknown variant \"%s\"", variant);
 

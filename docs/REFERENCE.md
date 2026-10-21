@@ -657,6 +657,43 @@ working around a bad choice:
   at each range of 64 heap blocks, which value of each column every row has (DESIGN.md §34): three
   or more columns, and two where that is cheaper than the nested loop over their entries. Off, a
   `GROUP BY` of three or more columns goes to the ordinary plan and one of two to the nested loop.
+- `pg_lion.enable_count_cells`: count a `GROUP BY` of expressions over predicates on Lion-indexed
+  columns by CELLS (DESIGN.md §10, "Counts by cells"): `SELECT CASE WHEN score >= 70 THEN 'high'
+  ... END AS tier, count(*) FROM t WHERE ... GROUP BY 1`, the score made of `CASE`s over `c = 3`,
+  `c IN (4, 5)`, `c IS NULL`, `f`, `tags && '{1,2}'`, `tsv @@ 'a | b'` and the like, with
+  arithmetic, `round`, `GREATEST`, `LEAST`, `COALESCE` and nested `CASE`s around them. A predicate
+  is an equality, `<>`, `IN`, `NOT IN` or `IS [NOT] DISTINCT FROM` with constants, or a null test,
+  of a column with a scalar Lion index, a boolean column and its `IS [NOT] TRUE / FALSE / UNKNOWN`, an `AND`, `OR` or
+  `NOT` of those on one column, or `@>`, `&&` or `@@` with a constant on a column with a multi-key
+  Lion index (at most 10 such leaves and 63 keys a column, no tsquery `!`). The rows the `WHERE`'s
+  Lion clauses select are counted by each predicate's truth - true, false or NULL, by SQL's rules -
+  and the expressions computed once for each such cell with rows, so a group's value is the
+  expression's own, of its type, and a group no row reaches has no row. A `WHERE` clause over such
+  an expression (`count(*) ... WHERE g = 3 AND <the tier> = 'high'`) is tested once a cell the
+  same way; a `HAVING` is applied to the groups above the node. The expressions must be immutable
+  and read their columns only through predicates; `count(*)` and the `count(col)` forms the
+  pushdown answers are counted. The `WHERE`, if there is one, needs a Lion clause that selects rows
+  (an equality, `IN`, a range or a multi-key query, not only `<>` or `IS NOT NULL`), as the decoded
+  walk of a `GROUP BY` does. A `GROUP BY` that holds a column by itself is the ordinary grouped
+  count, never cells. The plan is
+  declined when the cells - the product, over the predicates' columns, of the outcomes each column
+  can have (each value named, any other value, NULL; for a multi-key column each set of its leaves
+  a row can satisfy, or NULL) - exceed `pg_lion.count_cells_max` (134,217,728, at least 2). Runs
+  in parallel as a parallel `GROUP BY` does. Off, such a `GROUP BY` goes to the ordinary plan.
+  EXPLAIN shows `Group Strategy: Cells`, the columns of the predicates as `Cell Columns: <index>
+  (<column>), ...`, the predicates themselves as `Cell Predicates`, and the bound as `Cells`; a
+  `WHERE` clause over the predicates is the node's `Filter`; `EXPLAIN ANALYZE` adds the
+  decoded walk's `Decoded Passes`, `Decoded Keys`, `Decoded Rows` and `Decoded Rows Rechecked`,
+  `Partial Rows` - the cells with rows - and, when the tally outgrew `work_mem`, `Tally Spills`:
+
+      Finalize HashAggregate
+        Group Key: CASE WHEN ((k = ANY ('{1,2,3}'::integer[]))) THEN 'a'::text WHEN (((k = 4) OR (k = 5))) THEN 'b'::text WHEN ((k IS NULL)) THEN 'n'::text ELSE 'c'::text END
+        ->  Custom Scan (LionCount)
+              Lion Indexes: t_k (k), t_n (n < 50)
+              Group Strategy: Cells
+              Cell Columns: t_k (k)
+              Cell Predicates: (k = ANY ('{1,2,3}'::integer[])), ((k = 4) OR (k = 5)), (k IS NULL)
+              Cells: 4
 - `pg_lion.enable_count_partial`: let the count pushdown read a partial Lion index whose predicate
   the query's `WHERE` implies - `CREATE INDEX ... USING lion (g, c) WHERE f AND s = 'a'` for a
   query with `WHERE f AND s = 'a' AND c = 3` - leaving out the clauses the predicate implies, as a
@@ -694,10 +731,16 @@ working around a bad choice:
   row ("What a sample can rule out"); a filter of more than 32 sets is measured without its widest
   lists, which are taken as independent of the rest ("Wide lists"). Off, Lion prices its paths
   from the planner's estimate.
-- `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
-  filters correct the planner's row estimate for that table as well, so that joins above it are
-  sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
-  probe corrects Lion's own estimates only and the planner keeps its own row count.
+- `pg_lion.enable_rows_correction`: let Lion's estimate of a table's own filters correct the
+  planner's row estimate for that table as well, so that joins above it are sized for the rows its
+  filters really leave (DESIGN.md §29.11, "The relation's rows"): what the intersection probe
+  measures of them, and the forms Lion estimates them in where the planner's estimate is off
+  whatever the data - an OR of equalities on one column as the `IN` list it spells, and a run of
+  exclusions on one column, `k <> 'a' AND k <> 'b' ...` or `k NOT IN ('a', 'b', ...)`, as the one
+  exclusion it is: the rows that are not NULL and hold none of the values, where the planner takes
+  the NULLs away once for each value and comes out hundreds of times short on a column with many
+  NULLs ("A run of `<>` is one exclusion"). It applies to a table with a Lion index, with the probe
+  on or off. Off, those correct Lion's own estimates only and the planner keeps its own row count.
 - `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
   Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
   rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than

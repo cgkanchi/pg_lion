@@ -1753,6 +1753,62 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
 }
 
 /*
+ * The selectivity of the path's quals as lion's estimates take them
+ * (lion_canonical_quals_sel()): a run of `<>` on one column is the one
+ * exclusion it is, 1 - nullfrac - the values' frequencies, where core's
+ * product of each clause's 1 - freq - nullfrac takes the NULLs away once a
+ * clause (DESIGN.md §29.11, "A run of `<>` is one exclusion"); and the tests
+ * of whether an array is empty that reach an index, `a IS NOT NULL AND a =
+ * '{}'`, are the one clause they come to (DESIGN.md §17, "Non-empty
+ * arrays").  It is genericcostestimate()'s selectivity times lion's estimate
+ * of the quals over core's, which leaves a partial index's predicate's share
+ * as it was; the index tuples and the pages genericcostestimate() prorated
+ * by them are computed again from it, as genericcostestimate() computes
+ * them, and charged as it charges them (lion_generic_page_cost()).  The heap
+ * side of the path is priced from it, and it is the share the relation's
+ * rows are corrected to (lion_correct_rel_rows()).  A full walk's tuples and
+ * pages are the whole index's either way.
+ */
+static void
+lion_cost_canonical_sel(PlannerInfo *root, IndexPath *path, double loop_count,
+						bool fullscan, GenericCosts *costs)
+{
+	IndexOptInfo *index = path->indexinfo;
+	List	   *quals = get_quals_from_indexclauses(path->indexclauses);
+	Selectivity coresel;
+	Selectivity lionsel;
+	Selectivity sel;
+	double		tuples;
+	Cost		pagecost;
+
+	if (!lion_canonical_quals_sel(root, index->rel, quals, &coresel,
+								  &lionsel))
+		return;
+	/* the index predicate's share, which both leave as it is */
+	sel = (coresel > 0) ? costs->indexSelectivity * (lionsel / coresel) :
+		lionsel;
+	CLAMP_PROBABILITY(sel);
+	if (!fullscan)
+	{
+		tuples = rint(sel * index->rel->tuples /
+					  Max(costs->num_sa_scans, 1.0));
+		tuples = Max(Min(tuples, index->tuples), 1.0);
+		pagecost = lion_generic_page_cost(root, path, loop_count, costs);
+		costs->indexTotalCost += (tuples - costs->numIndexTuples) *
+			costs->num_sa_scans * cpu_index_tuple_cost;
+		costs->numIndexTuples = tuples;
+		costs->numIndexPages = (index->pages > 1 && index->tuples > 1) ?
+			ceil(tuples * index->pages / index->tuples) : 1.0;
+		costs->indexTotalCost += lion_generic_page_cost(root, path,
+														loop_count, costs) -
+			pagecost;
+		costs->indexTotalCost = Max(costs->indexTotalCost,
+									costs->indexStartupCost);
+	}
+	costs->indexSelectivity = sel;
+}
+
+/*
  * Cost estimate: the generic estimate, with four corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
  * rather than as the selective lookup its predicate's output selectivity
@@ -1827,6 +1883,8 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		cpu_operator_cost *
 		list_length(get_quals_from_indexclauses(path->indexclauses));
 	costs.indexTotalCost = Max(costs.indexTotalCost, costs.indexStartupCost);
+
+	lion_cost_canonical_sel(root, path, loop_count, fullscan, &costs);
 
 	if (fullscan)
 	{
