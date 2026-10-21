@@ -1358,6 +1358,16 @@ would have to be evaluated, and a partial index's rows are not all of the filter
 of a key counted in a batch (some 5 µs) to a row fetched and taken apart (some 1 µs), measured on
 the table below.
 
+**Memory.** The keys counted are kept until the output is sorted: a top k's twice k of them at
+most, and every one of them without a k. Past `work_mem` - the kept keys' slots and their copies -
+they go to a tuplesort instead (`lion_facets_spill()`), which spills to temporary files as any sort
+does: by the count negated, then by the key - the column's own `<` (`LionState.ltopr`) where the
+column is ordered, the key's bytes as a `bytea` otherwise (`lion_facets_key_image()`, the order
+`lion_facets_keycmp()` keeps), the NULL group last - with the key's text beside it for the output,
+which is cut at k there. The selective filter's hash table holds every distinct key of the filter's
+rows, which can be most of the column's: past `hash_mem` it is given up, and the keys are counted by
+their entries instead (`lion_facets_heap()` returns false) - the same counts, kept as above.
+
 **Hashed keys.** A key of 2043 bytes of a tsvector column, or of a text, varchar or bytea array
 column, may be the hashed key of longer lexemes or elements and a lexeme or element spelled like it
 (§17, "Long lexemes", "Long elements"), and its rows are all of theirs; `ts_stat()` and `GROUP BY e`
@@ -1372,7 +1382,7 @@ does the same for a row's hashed keys. Keys of `jsonb_contains_ops` past the lim
 show and still print as `sha256:<hex>`.
 
 DEBUG1 reports each call: entries read, keys counted, whether the column was walked whole, rows
-read from the heap.
+read from the heap, keys sorted past `work_mem`.
 
 **A planner shape** would let `SELECT e, count(*) FROM t, unnest(t.col) e WHERE ... GROUP BY e
 ORDER BY 2 DESC LIMIT k` reach this code without the function. It would need: recognising the

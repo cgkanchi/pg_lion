@@ -507,6 +507,107 @@ SELECT left(key, 12) AS key, length(key), count FROM lion_index_facets('lfac_wid
  00ac8ed3b432 |    259 |     1
 (3 rows)
 
+/*
+ * Past work_mem: every key, and a top k too large for it, kept in a sort
+ * that spills to a temporary file - the same counts in the same order - and
+ * the keys of a selective filter's rows, past hash_mem, counted by the keys
+ * instead.  DEBUG1 says how many keys went to the sort, here with every row's
+ * key read from the heap within hash_mem.
+ */
+SET work_mem = '64kB';
+SELECT count(*) AS checks, count(*) FILTER (WHERE result LIKE 'same%') AS same
+  FROM lfac_wide_all();
+ checks | same 
+--------+------
+     24 |   24
+(1 row)
+
+SELECT * FROM lfac_wide_all() WHERE result NOT LIKE 'same%';
+ filter | idx | k | result 
+--------+-----+---+--------
+(0 rows)
+
+SELECT f, lfac_check(idx, NULL, f,
+					 format('SELECT k, count(*) AS n FROM lfac_wide WHERE (%s) GROUP BY k', f))
+  FROM unnest(ARRAY['true', 'g = 1', 'g IN (1, 2)']) f,
+	   unnest(ARRAY['lfac_wide_k', 'lfac_wide_kx']) idx;
+      f      |   lfac_check    
+-------------+-----------------
+ true        | same, 5000 rows
+ g = 1       | same, 1250 rows
+ g IN (1, 2) | same, 2500 rows
+ true        | same, 5000 rows
+ g = 1       | same, 1250 rows
+ g IN (1, 2) | same, 2500 rows
+(6 rows)
+
+SET client_min_messages = debug1;
+SELECT count(*) FROM lion_index_facets('lfac_wide_k', NULL);
+DEBUG:  lion_index_facets(lfac_wide_k): 5000 entries read, 5000 keys counted, 0 rows read from the heap, 5000 keys sorted past work_mem
+ count 
+-------
+  5000
+(1 row)
+
+SET hash_mem_multiplier = 1000;
+SELECT count(*) FROM lion_index_facets('lfac_wide_k', NULL, 'g = 1');
+DEBUG:  lion_index_facets(lfac_wide_k): 5000 entries read, 0 keys counted, 1252 rows read from the heap (by the filter's rows), 1250 keys sorted past work_mem
+ count 
+-------
+  1250
+(1 row)
+
+RESET hash_mem_multiplier;
+RESET client_min_messages;
+RESET work_mem;
+-- ... and the same order for a key passed by value and for one of a type with
+-- no btree class (xid), whose ties the sort breaks by the key's bytes
+CREATE TABLE lfac_many (n int, x xid) WITH (autovacuum_enabled = off);
+INSERT INTO lfac_many
+SELECT i % 6000, (i % 5000)::text::xid FROM generate_series(1, 18000) i;
+CREATE INDEX lfac_many_n ON lfac_many USING lion (n);
+CREATE INDEX lfac_many_x ON lfac_many USING lion (x);
+CREATE FUNCTION lfac_small(idx text, k int) RETURNS text
+LANGUAGE plpgsql SET work_mem = '64MB' AS $$
+DECLARE
+	small text;
+	large text;
+	n int;
+BEGIN
+	SELECT string_agg(f.key || ':' || f.count, ' ' ORDER BY f.r) INTO large
+	  FROM lion_index_facets(idx::regclass, k) WITH ORDINALITY AS f(key, count, r);
+	SET LOCAL work_mem = '64kB';
+	SELECT string_agg(f.key || ':' || f.count, ' ' ORDER BY f.r), count(*) INTO small, n
+	  FROM lion_index_facets(idx::regclass, k) WITH ORDINALITY AS f(key, count, r);
+	IF small = large THEN
+		RETURN 'same, ' || n || ' rows';
+	END IF;
+	RETURN 'past work_mem: ' || left(small, 80) || ' | within: ' || left(large, 80);
+END $$;
+SELECT idx, k, lfac_small(idx, k)
+  FROM unnest(ARRAY['lfac_many_n', 'lfac_many_x']) idx,
+	   unnest(ARRAY[NULL, 4000]::int[]) k;
+     idx     |  k   |   lfac_small    
+-------------+------+-----------------
+ lfac_many_n |      | same, 6000 rows
+ lfac_many_n | 4000 | same, 4000 rows
+ lfac_many_x |      | same, 5000 rows
+ lfac_many_x | 4000 | same, 4000 rows
+(4 rows)
+
+SET work_mem = '64kB';
+SET client_min_messages = debug1;
+SELECT count(*) FROM lion_index_facets('lfac_many_x', NULL);
+DEBUG:  lion_index_facets(lfac_many_x): 5000 entries read, 5000 keys counted, 0 rows read from the heap, 5000 keys sorted past work_mem
+ count 
+-------
+  5000
+(1 row)
+
+RESET client_min_messages;
+RESET work_mem;
+DROP FUNCTION lfac_small(text, int);
+DROP TABLE lfac_many;
 -- a two-row key with no row left, and a seventh of the rows gone
 DELETE FROM lfac_wide WHERE id IN (1251, 6251) OR id % 7 = 0;
 SELECT count(*) AS checks, count(*) FILTER (WHERE result LIKE 'same%') AS same
