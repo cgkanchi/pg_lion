@@ -248,8 +248,9 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
 
 -- s.ov under the LEFT JOIN is computed by the scan of bs_docs (a
 -- PlaceHolderVar, NULL where no row matches), which so needs o's row: every
--- path of bs_docs is parameterized by o, and the LionBm25 path is not - with
--- every other scan disabled its plan was refused for the column of o
+-- path of bs_docs is parameterized by o, and the LionBm25 path is not: it is
+-- not offered, with every other scan disabled too, and the ordinary plan
+-- answers
 SET enable_seqscan = off;
 SET enable_bitmapscan = off;
 SET pg_lion.enable_plain_scan = off;
