@@ -1146,7 +1146,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- page's other words; its fourteenth a second page at the root's level, each flagged
         -- ROOT; and its fifteenth the body and the safexid of a DELETED container page and of a
         -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
-        -- put in its file.
+        -- put in its file. Each case builds the index it damages and sets every psql variable it
+        -- uses itself, from the file or from a twin; the shared tables and helpers come first.
+        -- The fifteenth's tablespace, a cluster-wide name, is named after the backend that runs
+        -- it.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
