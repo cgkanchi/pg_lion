@@ -2016,6 +2016,12 @@ extern void lion_warn_max_entries(Relation index, int64 nentries);
 extern int lion_max_entries(Relation index);
 
 /*
+ * The options of an index as a build reads them: copied out of the relcache
+ * entry at once, or the defaults where the index has none.
+ */
+extern void lion_build_options(Relation index, LionOptions *opts);
+
+/*
  * Replace the entry at (buf, offnum) with a new version (buf held EXCLUSIVE).
  * Handles size changes; if the new tuple cannot fit even after defragmenting
  * the page, returns false and changes nothing (caller must spill).
@@ -2852,7 +2858,8 @@ extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,
 										   LionKeyNode *child);
-extern void lion_settle_store_positions(Relation index, LionIndexState *ix);
+extern void lion_settle_store_positions(Relation index, LionIndexState *ix,
+										const LionOptions *opts);
 extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
 								Datum query, Oid collation);
 

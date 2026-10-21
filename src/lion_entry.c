@@ -604,6 +604,37 @@ lion_max_entries(Relation index)
 	return opts ? opts->max_entries : LION_DEFAULT_MAX_ENTRIES;
 }
 
+/*
+ * A build reads its options from this copy, never from rd_options itself.
+ * ALTER INDEX ... SET takes ShareUpdateExclusiveLock (lion_am.c), which the
+ * build of CREATE INDEX CONCURRENTLY - RowExclusiveLock on the index - does
+ * not wait for, and a backend that sees the change rebuilds the relcache
+ * entry, freeing rd_options and parsing it again: a pointer into it would be
+ * left dangling, and two reads of one option could differ.  So a build takes
+ * the copy before anything that could take a lock, and a parallel build's
+ * participants take the leader's (LionBuildShared), whatever their own
+ * relcache says by the time they start.
+ */
+void
+lion_build_options(Relation index, LionOptions *opts)
+{
+	if (index->rd_options != NULL)
+	{
+		memcpy(opts, index->rd_options, sizeof(LionOptions));
+		return;
+	}
+	memset(opts, 0, sizeof(LionOptions));
+	opts->inline_limit = LION_DEFAULT_INLINE_LIMIT;
+	opts->max_entries = LION_DEFAULT_MAX_ENTRIES;
+	opts->fillfactor = LION_DEFAULT_FILLFACTOR;
+	opts->posting_fillfactor = LION_DEFAULT_POSTING_FILLFACTOR;
+	opts->build_slack = LION_DEFAULT_BUILD_SLACK;
+	opts->wal_mode = LION_WALOPT_AUTO;
+	opts->summaries = LION_SUMOPT_OFF;
+	opts->summary_tids = LION_DEFAULT_SUMMARY_TIDS;
+	opts->store_positions = LION_POSOPT_AUTO;
+}
+
 void
 lion_warn_max_entries(Relation index, int64 nentries)
 {

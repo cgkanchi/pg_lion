@@ -462,6 +462,12 @@ serial one.
 ## Reloptions
 
 `store_positions` (`auto` | `on` | `off`, default `auto`; `true` and `false` are `on` and `off`): on
+Every option but `max_entries` is read by a build alone: what it decided is on the index's meta
+page or in the pages it wrote, and inserts, VACUUM and scans read that, so `ALTER INDEX ... SET`
+of one changes the index at its next `REINDEX` (or `REINDEX CONCURRENTLY`). Setting any of them
+takes `ShareUpdateExclusiveLock` on the index, as core's `fillfactor` of an index does, and blocks
+no scan or insert. `max_entries` applies to the next insert.
+
 a `tsvector` column, also store every lexeme's positions and weights, so phrase, weight and NOT
 queries are answered from the index and BM25 ranking works (see "Multi-key columns" above), at
 about twice the index's size. `auto` stores them when a key column's operator class can
@@ -497,7 +503,9 @@ backend when it has grown past that many distinct keys - counted exactly by a bu
 insert that adds a key as the entries on its directory leaf times the number of leaves - and never
 rejects a row.  For a multi-key column the keys are the extracted elements or lexemes.
 `inline_limit` (64 .. 4096 bytes, default 4096): how large a key's posting set may be before it
-moves out of its entry tuple onto container pages of its own.
+moves out of its entry tuple onto container pages of its own. The build records it on the meta
+page, and inserts and VACUUM keep to that: `ALTER INDEX ... SET (inline_limit = ...)` takes effect
+at the next REINDEX.
 `buckets` (0 .. 65536, default 0): accepted and ignored. It sized the hash directory of the
 first index formats, which a B-tree keyed by the index key replaced (DESIGN.md §21); that tree
 grows by splitting and has nothing to size, so an index built with any value is the index built
