@@ -1547,8 +1547,11 @@ extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
  * of the keys they cover (DESIGN.md §32): the entries are still pairwise
  * disjoint and still cover exactly the rows of the part.  On a column without
  * summaries, and for an unordered range, it is lion_entry_scan_begin_part().
- * The NULL entry never comes out of a walk that uses summaries; LION_WALK_ALL
- * is then every VALUE entry, which is what the sum over a column needs.
+ * The NULL entry never comes out of a walk that uses summaries - it is in no
+ * bucket - so LION_WALK_ALL is then every VALUE entry: the rows whose key is
+ * not NULL, which is what `k IS NOT NULL` sums.  A caller that sums every ROW
+ * of the column counts its NULL entry beside the walk (lion_sum_walk()), and
+ * can tell whether it must from es->usesum.
  */
 extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
 									 AttrNumber attno, LionRange *range,
@@ -1610,6 +1613,7 @@ lion_entry_scan_batch_left(const LionEntryScan *es)
  * pinned across that (VACUUM would wait for it), so the INLINE copies still
  * to come are dropped with their pin and the leaf is read again on the next
  * call, from the last entry handed out.  A batch of CHAIN copies is kept.
+ * Never a walk that uses summaries (see lion_entry_scan_pause()).
  */
 extern void lion_entry_scan_pause(LionEntryScan *es);
 extern void lion_entry_scan_end(LionEntryScan *es);

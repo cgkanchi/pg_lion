@@ -346,7 +346,8 @@ typedef struct LionCountPathBuild
 	List	   *targets;		/* LionCountTarget, one per counted relation */
 	LionCountTarget *first;
 	Var		   *notnullvar;		/* the first `IS NOT NULL` column */
-	Var		   *allvar;			/* a sum over every row drives by it (§35) */
+	Var		   *allvar;			/* a sum over all of a column's entries
+								 * drives by it (§14, §35) */
 	Var		   *rangevar;		/* the column the RANGE clauses bound (§28) */
 	List	   *rangeclauses;	/* ... and those clauses' RestrictInfos */
 	List	   *rangevars;		/* every column a range bounds (§28, §32) */
@@ -2840,7 +2841,10 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 		 * having one value per column or none - with the negated clauses
 		 * subtracted from each (lion_count_all_driver()).  Driven by the
 		 * first `IS NOT NULL` column, its own NULL entry is skipped and its
-		 * clause dropped; by any other, the plan names the column.
+		 * clause dropped (lion_locate_where()).  The plan names the column
+		 * whichever it is (LION_PRIV_ALLROWS): an `IS NOT NULL` among the
+		 * clauses may be an OR's leaf or a filtered count's, which says
+		 * nothing of the driver.
 		 */
 		Var		   *drive = lion_count_all_driver(cx);
 
@@ -2848,9 +2852,7 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 			return false;
 		cx->sumall = true;
 		cx->driveattno = drive->varattno;
-		if (cx->notnullvar == NULL ||
-			drive->varattno != cx->notnullvar->varattno)
-			cx->allvar = drive;
+		cx->allvar = drive;
 	}
 	/* A group folded to a constant can only have come from a WHERE key. */
 	if (cx->singlegroup && !cx->havepositive)
@@ -3019,8 +3021,8 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	{
 		/* §14's sum-over-all: one index, and it groups nothing. */
 		drive[0].attno = cx->driveattno;
-		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar :
-			(cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
+		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar : cx->allvar;
+		Assert(drive[0].var != NULL);
 		drive[0].collation = InvalidOid;
 		drive[0].eqop = InvalidOid;
 		drive[0].valueout = false;
@@ -3136,7 +3138,7 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	else if (cx->sumall)
 	{
 		/* Every entry of the driving index is visited, one group or not. */
-		Var		   *dv = (cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
+		Var		   *dv = cx->allvar;
 
 		Assert(dv != NULL);
 		cx->numgroups = estimate_num_groups(root,
@@ -3530,7 +3532,10 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		}
 	}
 
-	/* the column a sum over every row drives by (DESIGN.md §35) */
+	/*
+	 * the column a sum over all of a column's entries drives by, when no
+	 * range bounds the walk (DESIGN.md §14, §35)
+	 */
 	if (cx->allvar != NULL)
 		p->allattno = cx->allvar->varattno;
 
@@ -3794,8 +3799,10 @@ lion_count_path_make(LionCountPathBuild *cx)
  * Does run r of filtered counts over a sum of every row (DESIGN.md §10,
  * "Filtered counts"; §35) count an intersection instead of the sum - a
  * filter's run with a source of its own that selects rows, an equality, a
- * list, an `IS NULL` or an OR, as lion_run_count() decides at run time from
- * the located sources?  Without a range bounding the walk.
+ * list, an `IS NULL`, the rows of an array column's reserved entries (§17),
+ * or an OR with no range taken as a source among its leaves and no
+ * complement arm, as lion_run_has_plain_source() decides at run time from the
+ * located sources?  Without a range bounding the walk.
  */
 static bool
 lion_count_run_plain(LionCountPathBuild *cx, int r)
@@ -3808,11 +3815,34 @@ lion_count_run_plain(LionCountPathBuild *cx, int r)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 
+		if (ci->filter == r && !ci->inor &&
+			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
+			 ci->kind == LION_CLAUSE_NULL || ci->kind == LION_CLAUSE_RESERVED))
+			return true;
+	}
+	foreach(lc, cx->ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			nleaves = 0;
+		bool		range = false;
+		LionClauseInfo *ci;
+		int			a;
+		int			j;
+
+		ci = (LionClauseInfo *) list_nth(cx->clauseinfos, first);
 		if (ci->filter != r || ci->incompl)
 			continue;
-		if (ci->inor ? ci->kind != LION_CLAUSE_RANGESRC :
-			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
-			 ci->kind == LION_CLAUSE_NULL))
+		for (a = 0; a < narms; a++)
+			nleaves += list_nth_int(one, 2 + a);
+		for (j = first; j < first + nleaves; j++)
+		{
+			ci = (LionClauseInfo *) list_nth(cx->clauseinfos, j);
+			if (ci->kind == LION_CLAUSE_RANGESRC)
+				range = true;
+		}
+		if (!range)
 			return true;
 	}
 	return false;
