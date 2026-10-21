@@ -2427,6 +2427,21 @@ typedef struct LionCellsPredPriv
 } LionCellsPredPriv;
 
 /*
+ * A dimension's outcomes by the truths its predicates have in them, which
+ * tell a row's outcome from its truths (lion_cells_code_of()): each distinct
+ * tuple of those truths - npd of them (LION_TRUTH_*), in the order of preds
+ * - sorted by memcmp(), with the lowest outcome that has it.
+ */
+typedef struct LionCellsByTruth
+{
+	int			npd;			/* the dimension's predicates ... */
+	int		   *preds;			/* ... their numbers */
+	int			ntup;			/* the distinct tuples of their truths ... */
+	uint8	   *tups;			/* ... npd bytes each, sorted */
+	int		   *outs;			/* ... and each one's outcome */
+} LionCellsByTruth;
+
+/*
  * A count by cells (DESIGN.md §10, "Counts by cells"), as it runs: the
  * plan's dimensions and predicates, each dimension's index and its weight in
  * a cell's code (the dimensions' outcomes are the digits of a mixed radix,
@@ -2457,6 +2472,12 @@ typedef struct LionCellsRun
 	LionCellLabel *labels;
 	LionPostingSet *labelsets;
 	PGAlignedBlock *images;
+
+	/*
+	 * each dimension's outcomes by its predicates' truths, or NULL: made in
+	 * labelcxt for the first row the anti join takes away, once a run
+	 */
+	LionCellsByTruth *bytruth;
 
 	/* the driver's equality, which tells its entries' outcomes */
 	FmgrInfo	drveq;
@@ -4021,8 +4042,7 @@ extern void lion_cells_close(LionCountScanState *st);
 extern void lion_cells_reset(LionCountScanState *st);
 extern TupleTableSlot *lion_next_cells(LionCountScanState *st,
 									   bool *exhausted);
-extern uint64 lion_cells_code_of(const LionCellsRun *cr,
-								 const uint8 *truth);
+extern uint64 lion_cells_code_of(LionCellsRun *cr, const uint8 *truth);
 extern const char *lion_explain_col(Oid idxoid, AttrNumber heapattno,
 									bool multikey, List *vcols);
 extern void lion_explain_cells(LionCountScanState *st, List *ancestors,

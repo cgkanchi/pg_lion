@@ -14091,7 +14091,8 @@ also the expressions - the keys' inner values, the join clauses and the restrict
 points their columns at `custom_scan_tlist`: t's as a residual clause's are (`LION_TL_RESID`), the
 inner side's as `LION_TL_ANTI` entries naming their place in the child's target list. The plan check
 requires its one child and refuses it beside the FK-side join, partitions, the decoded walk of a
-GROUP BY's columns, a parallel GROUP BY and the other forms above. EXPLAIN prints, under the node's indexes:
+GROUP BY's columns, a parallel GROUP BY other than a count by cells' (below) and the other forms
+above. EXPLAIN prints, under the node's indexes:
 
     Join Type: Anti
     Join Rows: the rows counted, less those with a match
@@ -14160,6 +14161,20 @@ other value, which no row has; a multi-key dimension's outcome is the set of lea
 row, each leaf a predicate, or NULL, which every leaf is of. And there is one at least, the row's
 own, by the argument of §10 that the cells' truths are the predicates' over the row's values: a
 row in no outcome is an ERROR. The cell's code is the outcomes in the tally's mixed radix.
+
+The outcome is not searched for outcome by outcome, which would try each of a dimension's outcomes -
+up to 1,025 of a multi-key one and 1,026 of a scalar one - on its predicates, where the price below
+has a `cpu_operator_cost` a predicate. Once a run, for the first row taken away, each dimension's
+outcomes are put in a table by their truths (`lion_cells_bytruth()`): every outcome's tuple of its
+predicates' truths, a byte each, sorted, and of the outcomes that share a tuple the lowest, which
+the search in order would find first. A row's outcome is a binary search of the table for its own
+tuple, of no more tuples than the outcomes or 3 to the power of the predicates: at most two
+comparisons a predicate. The table is the plan's alone; it is made in the labels' memory, which the
+end of a run and a rescan reset (`lion_cells_reset()`), and made again by the next run that takes a
+row away. Measured (2026-10-21, PostgreSQL 18.6, medians of eleven alternated runs) on a synthetic
+table of 400,000 rows, 20,000 of them taken away, counted by ten leaves of an array column: the
+lookups took 54 ms searching outcome by outcome and 33 ms with the table, of a query of 77 and 56
+ms; with one leaf, 15 ms either way.
 
 **Where the predicates are read.** Every clause the subtraction tests is in `custom_exprs`, and
 setrefs.c replaces any subexpression of it `equal()` to a custom_scan_tlist entry with a reference

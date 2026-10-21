@@ -734,6 +734,61 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.a < 0) GROUP BY tier                                               | 4050 cells, 4 rows
 (12 rows)
 
+-- Many outcomes to a dimension, of which a row taken away has the one its
+-- truths are of, found in a table of the dimension's outcomes by their
+-- truths, made once a run (lion_cells_code_of()).  Ten leaves of tags - the
+-- most a column has, some of two keys - are 1,025 outcomes, NULL's among
+-- them; by n every row of four values of n is taken away, of every mask of
+-- tags, NULL arrays and arrays with a NULL element too; by id some thirty
+-- rows.  The WHERE form over the ten, and a rescan for each outer row,
+-- which makes the table again.
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10'),
+	('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.id) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10'),
+	('SELECT count(*) FROM lcc c WHERE CASE WHEN tags && ''{0}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{1,9}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{2}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{3,10}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{4}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{5,11}'' THEN 1 ELSE 0 END + CASE WHEN tags @> ''{6}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{7,12}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{8}'' THEN 1 ELSE 0 END + CASE WHEN tags @> ''{0,8}'' THEN 1 ELSE 0 END >= 2 AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n)'),
+	('SELECT x, t.* FROM (VALUES (30), (60), (30), (100)) v(x), LATERAL (SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE c.n < x AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) t')
+) v(q);
+                                                                                                                                                                                                                                                                                 q                                                                                                                                                                                                                                                                                  |      lcc_check       
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+----------------------
+ SELECT (tags && '{0}') AS t0, (tags && '{1,9}') AS t1, (tags && '{2}') AS t2, (tags && '{3,10}') AS t3, (tags && '{4}') AS t4, (tags && '{5,11}') AS t5, (tags @> '{6}') AS t6, (tags && '{7,12}') AS t7, (tags && '{8}') AS t8, (tags @> '{0,8}') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10                                                                                                                                                                                   | 1025 cells, 40 rows
+ SELECT (tags && '{0}') AS t0, (tags && '{1,9}') AS t1, (tags && '{2}') AS t2, (tags && '{3,10}') AS t3, (tags && '{4}') AS t4, (tags && '{5,11}') AS t5, (tags @> '{6}') AS t6, (tags && '{7,12}') AS t7, (tags && '{8}') AS t8, (tags @> '{0,8}') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.id) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10                                                                                                                                                                                  | 1025 cells, 40 rows
+ SELECT count(*) FROM lcc c WHERE CASE WHEN tags && '{0}' THEN 1 ELSE 0 END + CASE WHEN tags && '{1,9}' THEN 1 ELSE 0 END + CASE WHEN tags && '{2}' THEN 1 ELSE 0 END + CASE WHEN tags && '{3,10}' THEN 1 ELSE 0 END + CASE WHEN tags && '{4}' THEN 1 ELSE 0 END + CASE WHEN tags && '{5,11}' THEN 1 ELSE 0 END + CASE WHEN tags @> '{6}' THEN 1 ELSE 0 END + CASE WHEN tags && '{7,12}' THEN 1 ELSE 0 END + CASE WHEN tags && '{8}' THEN 1 ELSE 0 END + CASE WHEN tags @> '{0,8}' THEN 1 ELSE 0 END >= 2 AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) | 1025 cells, 1 rows
+ SELECT x, t.* FROM (VALUES (30), (60), (30), (100)) v(x), LATERAL (SELECT (tags && '{0}') AS t0, (tags && '{1,9}') AS t1, (tags && '{2}') AS t2, (tags && '{3,10}') AS t3, (tags && '{4}') AS t4, (tags && '{5,11}') AS t5, (tags @> '{6}') AS t6, (tags && '{7,12}') AS t7, (tags && '{8}') AS t8, (tags @> '{0,8}') AS t9, count(*) FROM lcc c WHERE c.n < x AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) t                                                                                                 | 1025 cells, 160 rows
+(4 rows)
+
+/*
+ * ... and the bits of a scalar column, ten IN lists of the values from 1 to
+ * 1,023 with each bit set: 1,023 constants, each an outcome of its own,
+ * beside another value's and, for k, NULL's.
+ */
+CREATE FUNCTION lcc_bits(c text) RETURNS text
+LANGUAGE sql AS $$
+SELECT string_agg(format('(%s IN (%s)) AS %s%s', c, l, c, j), ', ' ORDER BY j)
+  FROM (SELECT j, string_agg(v::text, ', ' ORDER BY v) AS l
+		  FROM generate_series(0, 9) j, generate_series(1, 1023) v
+		 WHERE v & (1 << j) <> 0 GROUP BY j) b
+$$;
+-- k's by n: rows taken from each of k's sixteen cells, NULL's too; n's by
+-- n, whose cells of those four values come to nothing, and by id, rows of
+-- some thirty values; and k's beside the ten leaves of tags, a code of two
+-- such dimensions
+SELECT c, lk, lcc_check(format('SELECT %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.%s) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+							   lcc_bits(c), lk))
+  FROM (VALUES ('k', 'n'), ('n', 'n'), ('n', 'id')) v(c, lk);
+ c | lk |      lcc_check       
+---+----+----------------------
+ k | n  | 1025 cells, 16 rows
+ n | n  | 1024 cells, 96 rows
+ n | id | 1024 cells, 100 rows
+(3 rows)
+
+SELECT lcc_check(format('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20',
+						lcc_bits('k')));
+        lcc_check        
+-------------------------
+ 1050625 cells, 640 rows
+(1 row)
+
 -- the rows changed: before VACUUM, in this very transaction, and after
 UPDATE lcc SET k = 1, tags = '{1}' WHERE id IN (523, 1046, 1569);
 UPDATE lcc SET f = NULL, z = 9 WHERE n = 7 AND id % 3 = 0;
@@ -791,6 +846,23 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT tier, count(*) FROM lcc_tiered t WHERE t.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier                 | parallel 4050 cells, 4 rows
 (4 rows)
 
+-- ... and many outcomes to a dimension: each participant makes the table of
+-- them for the rows it takes away
+SELECT lcc_check('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10');
+          lcc_check           
+------------------------------
+ parallel 1025 cells, 40 rows
+(1 row)
+
+SELECT c, lcc_check(format('SELECT %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+						   lcc_bits(c)))
+  FROM (VALUES ('k'), ('n')) v(c);
+ c |          lcc_check           
+---+------------------------------
+ k | parallel 1025 cells, 16 rows
+ n | parallel 1024 cells, 96 rows
+(2 rows)
+
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
@@ -805,6 +877,7 @@ DROP TABLE lcc_skip;
 DROP VIEW lcc_tiered;
 DROP VIEW lcc_scored;
 DROP TABLE lcc;
+DROP FUNCTION lcc_bits(text);
 DROP FUNCTION lcc_check(text);
 DROP FUNCTION lcc_check_exec(text, text);
 DROP FUNCTION lcc_plan(text);
