@@ -1228,7 +1228,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 	pred.callback = vs->callback;
 	pred.callback_state = vs->callback_state;
 
-	while ((csize = lion_inline_fetch(onpage, paylen, &cur, vs->cbuf)) > 0)
+	while ((csize = lion_inline_fetch(vs->index, blkno, off, onpage, paylen,
+									  &cur, vs->cbuf)) > 0)
 	{
 		uint32		r = lion_vac_filter_item(vs->cbuf, &pred);
 
@@ -1249,7 +1250,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 			building = true;
 			initStringInfo(&newpay);
 			while (pcur < prefix &&
-				   lion_inline_fetch(onpage, prefix, &pcur, vs->cbuf2) > 0)
+				   lion_inline_fetch(vs->index, blkno, off, onpage, prefix,
+									 &pcur, vs->cbuf2) > 0)
 				lion_vac_inline_append(vs, &newpay, vs->cbuf2, &ncontainers,
 									   &ntids);
 		}

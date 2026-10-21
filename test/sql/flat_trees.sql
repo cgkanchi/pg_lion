@@ -67,12 +67,15 @@ $$;
 
 -- An index's page counts as lion_index_stats() reports them, against the
 -- pages themselves, and lion_index_verify(), which raises on corruption and
--- returns nothing.
+-- returns nothing.  The pages of position trees (flag 128) are counted apart
+-- from the posting pages.
 CREATE FUNCTION ft_check(idx regclass, OUT stats_agree bool, OUT height int,
 	OUT verified bool)
 LANGUAGE sql AS $$
-	SELECT s.container_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level = 0)
-		   AND s.posting_internal_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level > 0),
+	SELECT s.container_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level = 0 AND flags & 128 = 0)
+		   AND s.posting_internal_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level > 0 AND flags & 128 = 0)
+		   AND s.position_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level = 0 AND flags & 128 <> 0)
+		   AND s.position_internal_pages = (SELECT count(*) FROM ft_pages(idx) WHERE level > 0 AND flags & 128 <> 0),
 		   s.max_posting_height,
 		   (SELECT true FROM lion_index_verify(idx, true))
 	  FROM lion_index_stats(idx) s

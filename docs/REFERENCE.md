@@ -43,10 +43,11 @@ are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats
 `pg_stat_scan_tables`.
 `lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
 CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the index, so INSERT,
-UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
-What a concurrent insert could make look wrong it checks again once the statements that were writing
-the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
-allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
+UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it;
+a relation that is not a lion index is refused before either is locked.  What a concurrent insert
+could make look wrong it checks again once the statements that were writing the index have ended,
+so it may wait for them - for as long as statement_timeout and lock_timeout allow - but never
+reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
 no page while it waits for another that replay may hold, and is exact only while replay leaves the
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
@@ -577,8 +578,11 @@ the number of rows whose key in that column is NULL, and `empty_tids`,
 the number of rows a multi-key opclass extracted no key from (an array with no elements, a tsvector
 with no lexemes), `ndistinct`, the distinct keys
 the planner is given for the column (DESIGN.md §33; NULL where none is recorded),
-`narrow_containers`, the column's NARROW containers (DESIGN.md §38), and, last, `nullelem_tids`,
-the number of rows whose array has elements and all of them NULL (DESIGN.md §17).  `slack_bytes` and
+`narrow_containers`, the column's NARROW containers (DESIGN.md §38), `nullelem_tids`,
+the number of rows whose array has elements and all of them NULL (DESIGN.md §17), and, last,
+`position_pages` and `position_internal_pages`, the leaves and the pages above them of the column's
+position trees (an index built with `store_positions`, DESIGN.md §17), which `container_pages`,
+`posting_internal_pages` and `max_posting_height` leave out.  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the

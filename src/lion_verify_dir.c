@@ -37,6 +37,9 @@ typedef struct LionVerifyLevel
 
 static bool lion_verify_dir_chain(LionVerifyState *vs, BlockNumber blk,
 								  uint16 level, BlockNumber *ownerp);
+static void lion_verify_dirpages(LionVerifyState *vs, uint64 walked);
+static void lion_verify_deleted(LionVerifyState *vs, BlockNumber blk,
+								Page page);
 
 static void
 lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
@@ -234,15 +237,39 @@ lion_verify_leftlink(LionVerifyState *vs, BlockNumber blk, uint16 level,
 }
 
 /*
- * A page at the height the meta page gave has no root flag.
+ * Has a root split made the directory taller since the meta page was read?
  *
- * On a sound index that is a root split made since the meta page was read:
- * it takes the flag off the old root, which stays at its block and level as
- * the left half, and names a new root one level up in the meta page, in one
- * record (DESIGN.md §21).  So a meta page that now says the directory is
- * taller settles it at once.  The new root and the old root's new sibling are
- * pages the walk may not reach; the reachability pass settles them.
+ * It takes the root flag off the old root, which stays at its block and level
+ * as the left half with the new sibling to its right, and names a new root
+ * one level up in the meta page, in one record (DESIGN.md §21).  So a meta
+ * page that now says the directory is taller settles what such a split does
+ * to the level the meta page called the root's.  The new root and the old
+ * root's new sibling are pages the walk may not reach; the reachability pass
+ * settles them.  Only writers running beside the check split anything.
  */
+static bool
+lion_verify_root_split(LionVerifyState *vs)
+{
+	Buffer		buf;
+	Page		page;
+
+	if (!vs->concurrent)
+		return false;
+
+	/* once the meta page has said so, it says so for every such page */
+	if (!vs->rootsplit)
+	{
+		page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META,
+									 &buf);
+		vs->rootsplit = LionPageGetMeta(page)->height > vs->height;
+		UnlockReleaseBuffer(buf);
+		if (vs->rootsplit)
+			vs->nrootsplits++;
+	}
+	return vs->rootsplit;
+}
+
+/* The root flag: on the page at the height the meta page gave, and no other. */
 static void
 lion_verify_root_flag(LionVerifyState *vs, BlockNumber blk, uint16 level,
 					  bool isroot)
@@ -250,28 +277,39 @@ lion_verify_root_flag(LionVerifyState *vs, BlockNumber blk, uint16 level,
 	if (isroot == (level == vs->height))
 		return;
 
-	if (!isroot && vs->concurrent)
-	{
-		Buffer		buf;
-		Page		page;
-
-		/* once the meta page has said so, it says so for every such page */
-		if (!vs->rootsplit)
-		{
-			page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META,
-										 &buf);
-			vs->rootsplit = LionPageGetMeta(page)->height > vs->height;
-			UnlockReleaseBuffer(buf);
-			if (vs->rootsplit)
-				vs->nrootsplits++;
-		}
-		if (vs->rootsplit)
-			return;
-	}
+	if (!isroot && lion_verify_root_split(vs))
+		return;
 
 	lion_corrupt("lion index \"%s\": directory page %u at level %u %s the root flag",
 				RelationGetRelationName(vs->index), blk, level,
 				isroot ? "should not have" : "should have");
+}
+
+/*
+ * The root is the only page of its level: a root split is one record that
+ * makes a new level above the two halves (DESIGN.md §21), so the level the
+ * meta page calls the root's never holds two pages - nor two pages flagged
+ * ROOT, which the root flag test alone lets by, and of which every writer
+ * that descends to one takes it for the whole directory's root.  The split of
+ * a root made since the meta page was read is what gives the old root a
+ * sibling on a sound index.
+ */
+static void
+lion_verify_root_alone(LionVerifyState *vs, BlockNumber blk, uint16 level,
+					   LionPageOpaque opaque)
+{
+	if (!BlockNumberIsValid(opaque->leftlink) &&
+		!BlockNumberIsValid(opaque->rightlink))
+		return;
+
+	if (lion_verify_root_split(vs))
+		return;
+
+	lion_corrupt("lion index \"%s\": directory page %u is at the root's level %u but has a %s link to block %u: the root is the only page of its level",
+				RelationGetRelationName(vs->index), blk, level,
+				BlockNumberIsValid(opaque->leftlink) ? "left" : "right",
+				BlockNumberIsValid(opaque->leftlink) ? opaque->leftlink :
+				opaque->rightlink);
 }
 
 /*
@@ -370,6 +408,8 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		if (opaque->leftlink != prev)
 			lion_verify_leftlink(vs, blk, level, kind, prev, opaque->leftlink);
 		lion_verify_root_flag(vs, blk, level, LionPageIsRoot(page));
+		if (level == vs->height)
+			lion_verify_root_alone(vs, blk, level, opaque);
 
 		/*
 		 * Exact: a split holds the page it flags EXCLUSIVE until it clears the
@@ -884,7 +924,43 @@ lion_verify_directory(LionVerifyState *vs)
 		LION_INJECTION_POINT("lion-verify-dir-level-walked");
 	}
 
+	{
+		uint64		walked = 0;
+
+		for (i = 0; i <= h; i++)
+			walked += (uint64) lvl[i].npages;
+		lion_verify_dirpages(vs, walked);
+	}
+
 	pfree(leftmost);
+}
+
+/*
+ * The meta page's count of directory pages, against the walked pages of
+ * every level.  A split adds its new pages to the count in the record that
+ * links them in, and page deletion - VACUUM's, which waits for the check -
+ * takes them off in a record of its own after the ones that unlink them
+ * (lion_dirdel_count()), so a crash, an ERROR or a cancel in between leaves
+ * the count high and nothing leaves it low: read after the walk, it is at
+ * least what the walk found, splits beside the check included.  On a standby
+ * the replay of a deletion can take off pages the walk counted, a report of
+ * the kind DESIGN.md §7 says to confirm with replay paused.  The count is
+ * the planner's (§21, lion_index_dir_pages()).
+ */
+static void
+lion_verify_dirpages(LionVerifyState *vs, uint64 walked)
+{
+	Buffer		buf;
+	Page		page;
+	uint32		dirpages;
+
+	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
+	dirpages = LionPageGetMeta(page)->dirpages;
+	UnlockReleaseBuffer(buf);
+
+	if ((uint64) dirpages < walked)
+		lion_corrupt("lion index \"%s\": meta page counts %u directory pages, but the directory has " UINT64_FORMAT,
+					RelationGetRelationName(vs->index), dirpages, walked);
 }
 
 /*
@@ -954,13 +1030,137 @@ lion_verify_meta(LionVerifyState *vs)
 					RelationGetRelationName(vs->index),
 					LionPageGetOpaque(page)->rightlink);
 
+	/*
+	 * The words every build writes one way (lion_init_metapage()) and nothing
+	 * changes after it.  A WAL mode the format does not have would be read as
+	 * generic by every writer (lion_wal_mode()), whatever the index was built
+	 * with.
+	 */
+	if (meta->unused_nbuckets != 0)
+		lion_corrupt("lion index \"%s\": meta page has %u in its unused bucket count, expected 0",
+					RelationGetRelationName(vs->index), meta->unused_nbuckets);
+	if (meta->wal_mode != LION_WAL_MODE_GENERIC &&
+		meta->wal_mode != LION_WAL_MODE_RMGR)
+		lion_corrupt("lion index \"%s\": meta page has wal_mode %u, expected %d (generic) or %d (rmgr)",
+					RelationGetRelationName(vs->index), meta->wal_mode,
+					LION_WAL_MODE_GENERIC, LION_WAL_MODE_RMGR);
+	if ((meta->order_flags & ~(uint32) (LION_META_ORDER_RECORDED |
+										LION_META_POSITIONS |
+										LION_META_NARROW)) != 0)
+		lion_corrupt("lion index \"%s\": meta page has order flags %08X, with bits the format does not have",
+					RelationGetRelationName(vs->index), meta->order_flags);
+
+	/*
+	 * Two counts of pages.  The directory's, which the planner prices a
+	 * lookup by (§21, lion_index_dir_pages()), is never below 1, nor below
+	 * the pages the walk finds (lion_verify_dirpages()), and has no bound
+	 * above: page deletion takes its pages off in a record after the ones
+	 * that unlink them, so a crash, an ERROR or a cancel in between leaves it
+	 * high for good - by blocks that may have become directory pages again
+	 * since.  The pages out of the index's trees that the last VACUUM could
+	 * not hand out yet (lion.h), which decide whether a VACUUM with nothing
+	 * to remove reads the whole index, are blocks one sweep counted once
+	 * each, so at most the pages there are besides this one.  The relation
+	 * may have grown since its length was taken.
+	 */
+	if (meta->dirpages < 1)
+		lion_corrupt("lion index \"%s\": meta page counts no directory pages, but the directory has at least its root",
+					RelationGetRelationName(vs->index));
+	if (LionPageGetOpaque(page)->maxckey >= vs->nblocks)
+		lion_verify_refresh_nblocks(vs);
+	if (LionPageGetOpaque(page)->maxckey >= vs->nblocks)
+		lion_corrupt("lion index \"%s\": meta page counts %u pages waiting to be reused, but the index has %u blocks besides it",
+					RelationGetRelationName(vs->index),
+					LionPageGetOpaque(page)->maxckey, vs->nblocks - 1);
+
 	vs->root = meta->root;
 	vs->height = meta->height;
 	vs->allows_narrow = LION_META_ALLOWS_NARROW(meta);
+	vs->inline_limit = meta->inline_limit;
 
 	UnlockReleaseBuffer(buf);
 }
 
+
+/*
+ * A DELETED page, under its SHARE lock: what freeing it left, and nothing
+ * else.
+ *
+ * A container page (lion_page_set_deleted()) is empty but for its safexid in
+ * the body, and keeps no right link or min/max.  A directory page (§21, "Page
+ * deletion") keeps its links, because a reader that lands on it moves right
+ * off it (lion_dir_past_deleted()), and its body is one MINUS INFINITY high
+ * key, which sends a reader that compares a key with it right as well: a real
+ * key there would let a search stop on a page that holds nothing.  It names
+ * no owner and is no root, half-dead page or split; its safexid is in the
+ * special area's minckey and maxckey.
+ *
+ * Either safexid is the next transaction id when the page was freed
+ * (ReadNextFullTransactionId()), so a normal one, and never one that is
+ * still to come - except that recovery from a crash may restart the counter
+ * a little below an id handed out but never logged, which is why the test
+ * leaves 2^31 of room, the distance at which a transaction id turns from the
+ * future into the past.  An id past that would keep the page from ever being
+ * reused; one before it cannot be told from the truth.
+ */
+static void
+lion_verify_deleted(LionVerifyState *vs, BlockNumber blk, Page page)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+	PageHeader	phdr = (PageHeader) page;
+	FullTransactionId safexid;
+	FullTransactionId next;
+	bool		isdir = (opaque->flags & (LION_PAGE_BUCKET | LION_PAGE_DIR)) != 0;
+
+	if (!isdir)
+	{
+		if (phdr->pd_lower != SizeOfPageHeaderData + sizeof(LionDeletedPageData) ||
+			phdr->pd_upper != phdr->pd_special)
+			lion_corrupt("lion index \"%s\": deleted container page %u has lower %u and upper %u, expected %zu and %u: the body of a freed page is its safexid alone",
+						RelationGetRelationName(vs->index), blk,
+						phdr->pd_lower, phdr->pd_upper,
+						SizeOfPageHeaderData + sizeof(LionDeletedPageData),
+						phdr->pd_special);
+		if (BlockNumberIsValid(opaque->rightlink) || opaque->minckey != 0 ||
+			opaque->maxckey != 0)
+			lion_corrupt("lion index \"%s\": deleted container page %u has right link %u and min/max %u/%u, expected none",
+						RelationGetRelationName(vs->index), blk,
+						opaque->rightlink, opaque->minckey, opaque->maxckey);
+		safexid = ((LionDeletedPageData *) PageGetContents(page))->safexid;
+	}
+	else
+	{
+		LionEntryTuple *hk = NULL;
+
+		if ((opaque->flags & ~(uint16) (LION_PAGE_KINDS | LION_PAGE_DELETED)) != 0 ||
+			opaque->owner_hash != 0 || BlockNumberIsValid(opaque->owner_head))
+			lion_corrupt("lion index \"%s\": deleted directory page %u has flags 0x%04X and owner %u at %u, expected its kind alone and no owner",
+						RelationGetRelationName(vs->index), blk, opaque->flags,
+						opaque->owner_hash, opaque->owner_head);
+		if (PageGetMaxOffsetNumber(page) == FirstOffsetNumber &&
+			ItemIdIsUsed(PageGetItemId(page, FirstOffsetNumber)))
+			hk = lion_verify_dir_item(vs, blk, page, FirstOffsetNumber);
+		if (hk == NULL || !LionEntryIsHighKey(hk) || !LionEntryIsMinusInf(hk))
+			lion_corrupt("lion index \"%s\": deleted directory page %u does not hold a minus infinity high key alone",
+						RelationGetRelationName(vs->index), blk);
+		if (!BlockNumberIsValid(opaque->rightlink) ||
+			!lion_verify_block_exists(vs, opaque->rightlink))
+			lion_corrupt("lion index \"%s\": deleted directory page %u has right link %u, but readers that land on it move right",
+						RelationGetRelationName(vs->index), blk,
+						opaque->rightlink);
+		safexid = lion_dir_page_safexid(page);
+	}
+
+	next = ReadNextFullTransactionId();
+	if (!FullTransactionIdIsNormal(safexid) ||
+		U64FromFullTransactionId(safexid) >=
+		U64FromFullTransactionId(next) + (UINT64CONST(1) << 31))
+		lion_corrupt("lion index \"%s\": deleted %s page %u may be reused from transaction " UINT64_FORMAT " on, which is no transaction a VACUUM could have freed it at; the next is " UINT64_FORMAT,
+					RelationGetRelationName(vs->index),
+					isdir ? "directory" : "container", blk,
+					U64FromFullTransactionId(safexid),
+					U64FromFullTransactionId(next));
+}
 
 /*
  * Classify blk, which no walk reached.
@@ -1015,10 +1215,12 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	/*
 	 * A DELETED page is the normal state of a freed one (DESIGN.md §18): it
 	 * is unreferenced on purpose, it is in the free space map, and the next
-	 * allocation whose safexid test it passes takes it.  Nothing to report.
+	 * allocation whose safexid test it passes takes it.  What it holds is
+	 * checked (lion_verify_deleted()); being unreferenced is not reported.
 	 */
 	if (LionPageIsDeleted(page))
 	{
+		lion_verify_deleted(vs, blk, page);
 		UnlockReleaseBuffer(buf);
 		return LION_UNREF_FREE;
 	}

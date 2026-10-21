@@ -2254,6 +2254,8 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	Size		itemsz = ItemIdGetLength(iid);
 	uint16		kind;
 	LionState  *state;
+	uint64	   *poscodes = NULL;	/* an INLINE entry's positions, by row */
+	uint32		nposcodes = 0;
 
 	if (itemsz < LION_ENTRY_SHORT_HDRSZ)
 		lion_corrupt("lion index \"%s\": entry %u on block %u is only %zu bytes",
@@ -2404,6 +2406,8 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		if (kind == LION_ENTRY_INLINE && x->pos_len > 0)
 		{
 			LionContainer *pc = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+			LionPosMember *m = (LionPosMember *) palloc(sizeof(LionPosMember));
+			LionPosIter it;
 
 			(void) lion_entry_inline_poschunk(vs->index, entry, itemsz, blk,
 											  off, pc);
@@ -2411,6 +2415,20 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 				lion_corrupt("lion index \"%s\": inline entry %u on block %u holds positions for %u rows, but " UINT64_FORMAT " TIDs",
 							RelationGetRelationName(vs->index), off, blk,
 							(unsigned) pc->cardinality, lion_entry_ntids(entry));
+
+			/*
+			 * As many rows as TIDs, and every TID has to be one of them,
+			 * which the payload's walk below looks up: positions kept for a
+			 * row the set does not hold leave a row it does hold without
+			 * any, and a phrase query then misses it.  The chunk has passed
+			 * lion_poschunk_check(), so its codes ascend and are at most
+			 * LION_POS_MAX_MEMBERS.
+			 */
+			poscodes = (uint64 *) palloc(sizeof(uint64) * Max(pc->cardinality, 1));
+			lion_poschunk_iter_init(&it, pc);
+			while (nposcodes < pc->cardinality && lion_poschunk_iter_next(&it, m))
+				poscodes[nposcodes++] = m->code;
+			pfree(m);
 			pfree(pc);
 		}
 	}
@@ -2424,20 +2442,65 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		uint32		prevckey = 0;
 		uint64		card = 0;
 		uint32		ncontainers = 0;
+		LionVerifyCover cv;
+		Size		limit;
 
 		if (BlockNumberIsValid(lion_entry_head(entry)) || BlockNumberIsValid(lion_entry_tail(entry)))
 			lion_corrupt("lion index \"%s\": inline entry %u on block %u has head %u and tail %u, expected none",
 						RelationGetRelationName(vs->index), off, blk,
 						lion_entry_head(entry), lion_entry_tail(entry));
 
-		while ((csize = lion_inline_fetch(LionEntryGetPayload(entry), paylen,
-										 &cur, vs->cbuf)) > 0)
+		cv.codes = poscodes;
+		cv.ncodes = nposcodes;
+		cv.missing = 0;
+		cv.first_missing = 0;
+		while ((csize = lion_inline_fetch(vs->index, blk, off,
+										  LionEntryGetPayload(entry), paylen,
+										  &cur, vs->cbuf)) > 0)
 		{
 			lion_verify_container(vs, blk, off, vs->cbuf, csize,
 								 &haveprev, &prevckey);
 			card += vs->cbuf->cardinality;
 			ncontainers++;
+			if (poscodes == NULL)
+				continue;
+			if (vs->cbuf->type == LION_CT_SPARSE)
+				lion_sparse_iterate(vs->cbuf, lion_verify_cover_pair, &cv);
+			else
+			{
+				cv.ckey = vs->cbuf->ckey;
+				lion_container_iterate(vs->cbuf, lion_verify_cover_lo, &cv);
+			}
 		}
+		if (cv.missing > 0)
+		{
+			ItemPointerData tid;
+
+			lion_code_to_tid(cv.first_missing, &tid);
+			lion_corrupt("lion index \"%s\": " UINT64_FORMAT " TIDs of inline entry %u on block %u have no positions, the first (%u,%u)",
+						RelationGetRelationName(vs->index), cv.missing, off,
+						blk, ItemPointerGetBlockNumber(&tid),
+						ItemPointerGetOffsetNumber(&tid));
+		}
+		if (poscodes != NULL)
+			pfree(poscodes);
+
+		/*
+		 * The items and the positions together are what inline_limit bounds
+		 * (DESIGN.md §4): ambuild, INSERT and VACUUM all spill a set past it
+		 * - or past what a long key leaves of the largest entry,
+		 * lion_inline_max() - onto pages, so that a rebuild can write again
+		 * whatever they wrote.  The growth slack is bounded on its own,
+		 * below.
+		 */
+		limit = lion_inline_max(Min(LionEntryPayloadOffset(entry),
+									(Size) LION_MAX_ENTRY_SIZE - 1),
+								(Size) vs->inline_limit);
+		if (cur + lion_entry_pos_len(entry, itemsz) > limit)
+			lion_corrupt("lion index \"%s\": inline entry %u on block %u holds %zu bytes of items and %zu of positions, past the %zu the meta page's inline_limit of %u leaves it",
+						RelationGetRelationName(vs->index), off, blk, cur,
+						lion_entry_pos_len(entry, itemsz), limit,
+						vs->inline_limit);
 
 		/*
 		 * Whatever is left is the payload's growth slack: the zeroed tail an
@@ -2505,8 +2568,9 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
  * lock.  The index's table is therefore looked up before either is locked,
  * and the lookup is repeated once both are held, because a concurrent DROP
  * INDEX and CREATE INDEX could have given the Oid to another index meanwhile.
- * A relation that is not an index has no table at all; opening it as one is
- * then what reports that.
+ * A relation that is not a lion index is told by its catalog row before
+ * anything is locked, and opening it as an index under AccessShareLock alone
+ * is what reports it: it takes neither lock, nor the owner's identity below.
  *
  * THE TABLE OWNER'S CODE RUNS AS THE TABLE OWNER.  With heapallindexed, the
  * heap scan evaluates the index's expressions and its predicate, and those
@@ -2554,11 +2618,21 @@ lion_index_verify(PG_FUNCTION_ARGS)
 
 	/* before its table is locked: a partitioned index has one too */
 	lion_refuse_partitioned_index(relid);
-	heapoid = IndexGetRelation(relid, true);
+
+	/*
+	 * Whether it is a lion index at all is asked of its catalog row before
+	 * anything is locked or the identity changes: the table of a btree index
+	 * would otherwise be locked against VACUUM, DDL and every other check of
+	 * it - and wait behind them - and its owner become the user, all to say
+	 * "not a lion index".  The row is read with no lock, which is why
+	 * lion_open_index() asks again once both locks are held.
+	 */
+	heapoid = lion_is_lion_index(relid) ? IndexGetRelation(relid, true) :
+		InvalidOid;
 	if (!OidIsValid(heapoid))
 	{
 		/*
-		 * Not an index: opening it as one raises the error that says so.
+		 * Opening it as a lion index raises the error that says what it is.
 		 * With AccessShareLock, because this is only to say that, and it
 		 * should not wait behind a VACUUM of the table to say it.
 		 */
