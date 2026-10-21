@@ -231,7 +231,37 @@ RETURNS int8 LANGUAGE sql AS $$
 	SELECT (get_byte(lp, 0) + (get_byte(lp, 1) & 127) * 256)::int8
 	  FROM lion_vfy_peek(idx, blk, 24 + 4 * (off - 1), 4) lp
 $$;
+-- the little-endian uint32 at pos of block blk, and the bytes of one
+CREATE FUNCTION lion_vfy_u32(idx regclass, blk int8, pos int8)
+RETURNS int8 LANGUAGE sql AS $$
+	SELECT get_byte(b, 0)::int8 + get_byte(b, 1)::int8 * 256 +
+		   get_byte(b, 2)::int8 * 65536 + get_byte(b, 3)::int8 * 16777216
+	  FROM lion_vfy_peek(idx, blk, pos, 4) b
+$$;
+CREATE FUNCTION lion_vfy_le32(x int8)
+RETURNS bytea LANGUAGE sql AS $$
+	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
+		   0, (x & 255)::int), 1, ((x >> 8) & 255)::int),
+		   2, ((x >> 16) & 255)::int), 3, ((x >> 24) & 255)::int)
+$$;
+-- A statement's SQLSTATE and message, or 'ok'.
+CREATE FUNCTION lion_vfy_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || SQLERRM;
+END $$;
+-- The special area is the last 32 bytes of a block: the right link first,
+-- then the left link, the min and the max at 8 and 12, the level and the
+-- flags the two uint16s at 24 and 26, the page id at 28.
+SELECT current_setting('block_size')::int8 - 32 AS special \gset
 
+/*
+ * The tables the cases below build their indexes on, and lion_vfy_badp's
+ * twin, which they read their posting set's layout from.  A case sets every
+ * psql variable it uses itself.
+ */
 CREATE TEMP TABLE lion_vfy_bad (k int4);
 INSERT INTO lion_vfy_bad SELECT i % 50 FROM generate_series(1, 20000) i;
 -- Two keys of more than 16 leaves each, so that each set has a root above
@@ -239,6 +269,11 @@ INSERT INTO lion_vfy_bad SELECT i % 50 FROM generate_series(1, 20000) i;
 -- onto a leaf.
 CREATE TEMP TABLE lion_vfy_badp (id int4, k int4);
 INSERT INTO lion_vfy_badp SELECT i, i % 2 FROM generate_series(1, 900000) i;
+CREATE INDEX lion_vfy_badp_twin ON lion_vfy_badp USING lion (k);
+-- 300 keys of 108 bytes: a directory of a root over six leaves
+CREATE TEMP TABLE lion_vfy_badd (k text);
+INSERT INTO lion_vfy_badd
+SELECT 'key' || lpad(i::text, 5, '0') || repeat('x', 100) FROM generate_series(1, 300) i;
 SET ignore_checksum_failure = on;
 
 -- (1) a line pointer that points past the page
@@ -271,7 +306,6 @@ SET client_min_messages = warning;
 
 -- (4) a posting-tree downlink to InvalidBlockNumber, which ReadBuffer() takes
 -- for P_NEW on 16 to 18: the check used to EXTEND the index it was checking
-CREATE INDEX lion_vfy_badp_twin ON lion_vfy_badp USING lion (k);
 SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
 SELECT max_posting_height FROM lion_index_stats('lion_vfy_badp_twin');
 CREATE INDEX lion_vfy_bad_child ON lion_vfy_badp USING lion (k);
@@ -285,6 +319,7 @@ SELECT pg_relation_size('lion_vfy_bad_child') = :size_before AS not_extended;
 
 -- (5) a container of no known type on a posting leaf: the root's first child
 CREATE INDEX lion_vfy_bad_type ON lion_vfy_badp USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
 SELECT get_byte(b, 0) + get_byte(b, 1) * 256 + get_byte(b, 2) * 65536 +
 	   get_byte(b, 3) * 16777216 AS leaf
   FROM lion_vfy_peek('lion_vfy_bad_type', :root,
@@ -302,25 +337,9 @@ SET client_min_messages = warning;
 -- the walk had passed its place - verify() lets INSERTs run beside it
 -- (DESIGN.md §7) - so it is a candidate, and it is the walk of the level
 -- again, after the wait for the writers in flight, that finds the downlink
--- pointing out of the level.  The special area is the last 32 bytes of a
--- block: the right link first, then the left link, the flags at 26.
-CREATE FUNCTION lion_vfy_u32(idx regclass, blk int8, pos int8)
-RETURNS int8 LANGUAGE sql AS $$
-	SELECT get_byte(b, 0)::int8 + get_byte(b, 1)::int8 * 256 +
-		   get_byte(b, 2)::int8 * 65536 + get_byte(b, 3)::int8 * 16777216
-	  FROM lion_vfy_peek(idx, blk, pos, 4) b
-$$;
-CREATE FUNCTION lion_vfy_le32(x int8)
-RETURNS bytea LANGUAGE sql AS $$
-	SELECT set_byte(set_byte(set_byte(set_byte('\x00000000'::bytea,
-		   0, (x & 255)::int), 1, ((x >> 8) & 255)::int),
-		   2, ((x >> 16) & 255)::int), 3, ((x >> 24) & 255)::int)
-$$;
-CREATE TEMP TABLE lion_vfy_badd (k text);
-INSERT INTO lion_vfy_badd
-SELECT 'key' || lpad(i::text, 5, '0') || repeat('x', 100) FROM generate_series(1, 300) i;
+-- pointing out of the level.  The first leaf is the directory leaf (flag 2)
+-- without a left link.
 CREATE INDEX lion_vfy_bad_link ON lion_vfy_badd USING lion (k);
-SELECT current_setting('block_size')::int8 - 32 AS special \gset
 SELECT b AS leaf1
   FROM generate_series(1, pg_relation_size('lion_vfy_bad_link') /
 					   current_setting('block_size')::int8 - 1) b
@@ -341,9 +360,9 @@ SET client_min_messages = warning;
 -- lose every row from that leaf on - the SQL count of key 0 finds the first
 -- leaf's rows of 450000 - and verify() must report it, with heapallindexed
 -- too, whose lookup goes through the tree code that does not look at the
--- flag.  The flags and the page id are the two uint16s at 26 and 28 of the
--- special area.
+-- flag.
 CREATE INDEX lion_vfy_bad_kind ON lion_vfy_badp USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
 SELECT lion_vfy_u32('lion_vfy_bad_kind', :root,
 					lion_vfy_item('lion_vfy_bad_kind', :root, 2) + 4) AS leaf \gset
 SELECT lion_vfy_u32('lion_vfy_bad_kind', :leaf, :special + 26) & 65535 AS flags;
@@ -358,8 +377,8 @@ SET client_min_messages = warning;
 
 -- (8) a flag no page of its kind carries: a bit no writer sets on a
 -- directory leaf, and ROOT - which only a directory page ever has - on a
--- posting leaf.  verify() must report each, though each page still has one
--- kind.
+-- posting leaf (the root's second child).  verify() must report each,
+-- though each page still has one kind.
 CREATE INDEX lion_vfy_bad_flag ON lion_vfy_bad USING lion (k);
 SELECT lion_vfy_poke('lion_vfy_bad_flag', 1, :special + 26,
 					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_flag', 1,
@@ -368,6 +387,9 @@ SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_flag');
 SET client_min_messages = warning;
 CREATE INDEX lion_vfy_bad_root ON lion_vfy_badp USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
+SELECT lion_vfy_u32('lion_vfy_bad_root', :root,
+					lion_vfy_item('lion_vfy_bad_root', :root, 2) + 4) AS leaf \gset
 SELECT lion_vfy_poke('lion_vfy_bad_root', :leaf, :special + 26,
 					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_root', :leaf,
 												:special + 26) | 32));
@@ -439,15 +461,6 @@ CREATE INDEX lion_vfy_badpos_two ON lion_vfy_badpos USING lion (id, d)
 SELECT attno, container_pages, posting_internal_pages, max_posting_height,
 	   position_pages, position_internal_pages
   FROM lion_index_stats('lion_vfy_badpos_two');
-
--- A statement's SQLSTATE and message, or 'ok'.
-CREATE FUNCTION lion_vfy_err(q text) RETURNS text LANGUAGE plpgsql AS $$
-BEGIN
-	EXECUTE q;
-	RETURN 'ok';
-EXCEPTION WHEN OTHERS THEN
-	RETURN SQLSTATE || ': ' || SQLERRM;
-END $$;
 
 -- (10) an INLINE payload whose first item has a type no item has: key 1's
 -- entry is the third item of block 1, its payload follows the 12-byte header
@@ -580,6 +593,11 @@ SET client_min_messages = warning;
 -- verify() only warns of.  A writer that splits any of these leaves takes it
 -- for the root of the directory.
 CREATE INDEX lion_vfy_bad_roots ON lion_vfy_badd USING lion (k);
+SELECT b AS leaf1
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_roots') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_roots', b, :special + 24) >> 16) & 2 = 2
+   AND lion_vfy_u32('lion_vfy_bad_roots', b, :special + 4) = 4294967295 \gset
 SELECT lion_vfy_u32('lion_vfy_bad_roots', 0, 44) AS oldroot,
 	   lion_vfy_u32('lion_vfy_bad_roots', 0, 48) AS oldheight \gset
 SELECT :oldheight AS height;
@@ -610,9 +628,13 @@ SET client_min_messages = warning;
 -- the special area), which a reader that lands on it moves right by; and its
 -- safexid (the uint32s at 8 and 12 of the special area) becomes 0, which
 -- every VACUUM would reuse at once.  The transaction ids are the cluster's.
-DROP TABLESPACE IF EXISTS lion_vfy_ts;	-- left by a run that stopped part-way
+-- A tablespace is the cluster's too: its name is this backend's, which no
+-- other run of the test has while this one runs, and one a run that stopped
+-- part-way left under it is dropped first.
+SELECT 'lion_vfy_ts_' || pg_backend_pid() AS ts \gset
+DROP TABLESPACE IF EXISTS :"ts";
 SET allow_in_place_tablespaces = on;
-CREATE TABLESPACE lion_vfy_ts LOCATION '';
+CREATE TABLESPACE :"ts" LOCATION '';
 RESET allow_in_place_tablespaces;
 CREATE TEMP TABLE lion_vfy_baddel (k text);
 INSERT INTO lion_vfy_baddel
@@ -626,10 +648,10 @@ CREATE INDEX lion_vfy_bad_deldxid ON lion_vfy_baddel USING lion (k) WITH (inline
 DELETE FROM lion_vfy_baddel WHERE k = 'big' OR k BETWEEN 'key00040' AND 'key00130';
 VACUUM lion_vfy_baddel;
 SELECT deleted_pages FROM lion_index_stats('lion_vfy_bad_delxid');
-ALTER INDEX lion_vfy_bad_delxid SET TABLESPACE lion_vfy_ts;
-ALTER INDEX lion_vfy_bad_dellow SET TABLESPACE lion_vfy_ts;
-ALTER INDEX lion_vfy_bad_dellink SET TABLESPACE lion_vfy_ts;
-ALTER INDEX lion_vfy_bad_deldxid SET TABLESPACE lion_vfy_ts;
+ALTER INDEX lion_vfy_bad_delxid SET TABLESPACE :"ts";
+ALTER INDEX lion_vfy_bad_dellow SET TABLESPACE :"ts";
+ALTER INDEX lion_vfy_bad_dellink SET TABLESPACE :"ts";
+ALTER INDEX lion_vfy_bad_deldxid SET TABLESPACE :"ts";
 SELECT min(b) FILTER (WHERE f & (4 | 8) = 12) AS delcont,
 	   min(b) FILTER (WHERE f & (2 | 8) = 10) AS deldir
   FROM (SELECT b, lion_vfy_u32('lion_vfy_bad_delxid', b, :special + 24) >> 16 AS f
@@ -652,7 +674,7 @@ SELECT regexp_replace(lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_deld
 					  '(transaction|is) [0-9]+', '\1 N', 'g') AS verify;
 SET client_min_messages = warning;
 DROP TABLE lion_vfy_baddel;
-DROP TABLESPACE lion_vfy_ts;
+DROP TABLESPACE :"ts";
 
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
