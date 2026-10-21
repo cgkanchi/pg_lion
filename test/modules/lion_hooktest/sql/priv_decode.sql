@@ -2,7 +2,8 @@
 -- and its check of the rules between members, handed lists no planner makes:
 -- each one a plan of one equality clause with one thing changed, which they
 -- must refuse rather than read at the wrong offsets.  The first two are the lists a planner does make, at the plan
--- and the path stage.
+-- and the path stage, and so are the counts by cells beside an anti join
+-- further down.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -53,3 +54,13 @@ SELECT lion_hooktest_priv_decode('cell predicate without cells');
 SELECT lion_hooktest_priv_decode('anti join without its child');
 SELECT lion_hooktest_priv_decode('anti join of no key');
 SELECT lion_hooktest_priv_decode('inner column without an anti join');
+-- a count by cells beside the anti join over a small inner side, serial and
+-- parallel, which a planner makes; the same with a GROUP BY column's
+-- equality the cells have no use for, the anti join beside a decoded walk
+-- of two columns, and a column of the table the anti join would read in a
+-- count by cells without one
+SELECT lion_hooktest_priv_decode('cells beside an anti join') AS nclause;
+SELECT lion_hooktest_priv_decode('parallel cells beside an anti join') AS nclause;
+SELECT lion_hooktest_priv_decode('cells beside an anti join with a grouping equality');
+SELECT lion_hooktest_priv_decode('anti join beside the decoded walk');
+SELECT lion_hooktest_priv_decode('table column of a count by cells without an anti join');

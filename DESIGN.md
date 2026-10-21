@@ -3722,9 +3722,9 @@ taken - and expressions over them; nothing else) and the strategy (the decoded w
 collected copy, every range a source, a positive clause to begin from, no complement OR, no
 residual clause, no filtered count). The WHERE phase is the count's own; with cells being built, a
 clause no posting set answers that is a function of predicates (`lion_cells_shape_ok()`) is taken
-as one over cells instead of declining. A plain table only, not a partition, an FK-side join, the
-table of an anti join over a small inner side (§27), a DISTINCT, a partial index's build (§45), a
-hot standby, or beside an expression column (§41). The GROUP BY of a column is never one: its plan
+as one over cells instead of declining. A plain table only, or the table an anti join over a small
+inner side counts (§27, "Counts by cells beside the anti join"); not a partition, an FK-side join,
+a DISTINCT, a partial index's build (§45), a hot standby, or beside an expression column (§41). The GROUP BY of a column is never one: its plan
 is the plain walk's, which the cells build leaves alone.
 
 **The price** (`lion_cost_cells_path()`): the driver's grouped count against the WHERE as
@@ -13967,11 +13967,13 @@ a clause of t alone inside the NOT EXISTS, which belongs to the join - are teste
 NULL, or the `IS NOT NULL` clause it adds, which the subtraction tests too: a row with a NULL `col`
 is in neither C nor M), a `count(DISTINCT col)` of a column proved unique (§26, "A unique column",
 which is that `count(col)`), and a GROUP BY of one or two of t's columns that LionCount groups by
-(§10, §20), with a HAVING, or folded by the planner to one group. Not: the decoded walk (§34) or
-a count by cells over it (§10, "Counts by cells"), a `count(DISTINCT)` walked, filtered counts,
-the aggregates over keys (§37), the top k (§36), a coalesce group, expression columns (§41), a
-partitioned or inheritance parent - each counts in a way the subtraction would have to follow, and
-none is needed by the query this is for.
+(§10, §20), with a HAVING, or folded by the planner to one group; and a count by cells (§10,
+"Counts by cells"), a GROUP BY of expressions over predicates or a WHERE over them, whose cells
+lose the rows found ("Counts by cells beside the anti join" below). Not: the decoded walk of a
+GROUP BY's columns (§34), a `count(DISTINCT)` walked, filtered counts, the aggregates over keys
+(§37), the top k (§36), a coalesce group, expression columns (§41), a partitioned or inheritance
+parent - each counts in a way the subtraction would have to follow, and none is needed by the query
+this is for.
 
 **Recognition** (`lion_fkjoin_recognize_small_anti()`, from the join rel `create_upper_paths_hook`
 is given at `UPPERREL_GROUP_AGG`, where §27's joins are recognised):
@@ -14040,7 +14042,8 @@ while the child runs. Reading the child, looking the keys up (the B-tree opened 
 `AccessShareLock`), testing each row found in a slot of the node's scan tuple - t's columns read
 from the heap tuple, the inner row's beside them - and adding it to the subtraction: one total for
 an ungrouped count, or, for a GROUP BY, each row's group (its grouping columns read from the heap
-tuple, hashed and compared with the grouping's own equality and hash function, under its collation).
+tuple, hashed and compared with the grouping's own equality and hash function, under its collation),
+or, beside a count by cells, the row's cell (below).
 `lion_emit_keys()` takes each row's subtraction off its count: a group left with none is no row, as
 a group with no rows to start with is not, and so is the one group of a GROUP BY the planner folded;
 a plain count's one row stays a row, of 0. A subtraction larger than the count is an error in a
@@ -14048,14 +14051,15 @@ serial plan, which the argument above rules out. A rescan makes the run again: t
 with the changed parameters core does not hand to `custom_ps`, and a parameter of t's WHERE or of
 the inner side's filters is the new one's.
 
-**Parallel.** The ungrouped count only, offered as §10's parallel count: the participants divide the
+**Parallel.** The ungrouped count, offered as §10's parallel count: the participants divide the
 count, and the participant that comes to the run first (an atomic flag in the node's shared memory,
 `antiowner`) makes it - runs the child, looks the keys up, and takes the whole subtraction off its
 partial count; the others take nothing off theirs, and the Finalize Aggregate adds them up. A partial
 count may go below zero. The child is the inner side's cheapest path a worker may run, unparameterized
 and not partial (the serial node's cheapest may be a Gather). Without a shared memory (none could be
 made) the participant subtracts. A rescan of the Gather clears the flag. EXPLAIN ANALYZE's counters
-are every participant's, summed.
+are every participant's, summed. A parallel count by cells subtracts in every participant (below).
+A GROUP BY of columns stays serial.
 
 **Cost.**
 
@@ -14084,8 +14088,8 @@ also the expressions - the keys' inner values, the join clauses and the restrict
 `lion_plan_custom_path()` appends to `custom_exprs` after the residual clauses, where setrefs.c
 points their columns at `custom_scan_tlist`: t's as a residual clause's are (`LION_TL_RESID`), the
 inner side's as `LION_TL_ANTI` entries naming their place in the child's target list. The plan check
-requires its one child and refuses it beside the FK-side join, partitions, the decoded walk and the
-other forms above. EXPLAIN prints, under the node's indexes:
+requires its one child and refuses it beside the FK-side join, partitions, the decoded walk of a
+GROUP BY's columns, a parallel GROUP BY and the other forms above. EXPLAIN prints, under the node's indexes:
 
     Join Type: Anti
     Join Rows: the rows counted, less those with a match
@@ -14123,6 +14127,106 @@ LionCount's times in the last four rows are with core's joins turned off. The mo
 side to core somewhere between 2,000 and 20,000 keys, where the node is still a little faster on a
 warm cache: its heap fetches are priced at the random page cost, as core prices its own index
 scans.
+
+### Counts by cells beside the anti join (2026-10-21)
+
+    SELECT CASE WHEN <score over predicates on t> >= 5 THEN 'high' ... END AS tier, count(*)
+      FROM t WHERE <clauses> AND NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)
+     GROUP BY tier
+
+is a count by cells (§10, "Counts by cells") of t's WHERE less the rows of it some row of s
+matches - and so is the WHERE form, `count(*)` of the rows whose tier is one. The rows of a group
+are the rows of the cells the group's expression maps to, so the anti join takes each row it finds
+from its CELL, and core's Finalize Aggregate adds up what is left.
+
+**What is computed.** With C and M as above, and `cell(r)` the cell of row r - the outcome of each
+dimension its value or keys are in:
+
+    count(c) = |{ r ∈ C : cell(r) = c }| - |{ r ∈ M : cell(r) = c }|
+
+The count by cells makes the first term, as ever; the lookups find M, as for any count, and each
+row of M is counted under its cell.
+
+**A row's cell** (`lion_cells_code_of()`, lion_exec_cells.c). Each predicate - the expression of its
+`LION_TL_CELLPRED` column of custom_scan_tlist - is evaluated on the heap tuple the lookup fetched
+(`lion_anti_cells_truths()`), NULL a truth of its own: the truths that, in the count, the labels
+give its cell. Of each dimension the row's outcome is the one in which every predicate of the
+dimension has the row's truth (`lion_cells_truth_in()`, the truth the node emits for a cell). There
+is one at most: a scalar dimension's outcomes are the classes of its values by their signatures, so
+two outcomes differ in some predicate's truth, but for a NOT NULL column's NULL and a boolean's
+other value, which no row has; a multi-key dimension's outcome is the set of leaves true of the
+row, each leaf a predicate, or NULL, which every leaf is of. And there is one at least, the row's
+own, by the argument of §10 that the cells' truths are the predicates' over the row's values: a
+row in no outcome is an ERROR. The cell's code is the outcomes in the tally's mixed radix.
+
+**Where the predicates are read.** Every clause the subtraction tests is in `custom_exprs`, and
+setrefs.c replaces any subexpression of it `equal()` to a custom_scan_tlist entry with a reference
+to it: a WHERE clause over predicates (the CASE of the WHERE form, which is one of t's
+restrictions) comes to read the predicates' `LION_TL_CELLPRED` columns, as the node's qual does.
+Those columns are no column of the table, so the node puts each predicate's truth, as a boolean or
+NULL, at its place in the slot it tests the row in, before the clauses run.
+
+**Why it is exact.** M's rows are rows of C (above), and each is in the count under the cell of its
+values and keys as the snapshot sees them (§10, "Why it is exact": a row the snapshot sees has
+labels that are exactly its values' and keys'); the lookup fetches that same version - a heap-only
+tuple through its chain - and its truths are of those values, by the expressions whose truths the
+cells stand for. So each row taken away is taken from the cell that counted it, and every cell
+loses exactly its rows of M.
+
+**Execution.** The run is the anti join's own, before the count's first row; each row of M is kept
+with its code and the container key its TID is in (`LionAntiCellRow`). The count then goes up cell
+by cell, and a cell may go up more than once where the tally spilled (§34): so a cell that loses
+rows is held back (`lion_anti_cells_hold()`) - every count the tally gives of it added up - until
+the tally has given everything, and goes up last with what is left of it
+(`lion_anti_cells_next()`); a cell left with none is no row, and one left with fewer than none is
+an ERROR, which the argument above rules out. The other cells go up as the tally gives them.
+
+**In parallel** (§10, "Counts by cells"). The participants count ranges of container keys, each
+into its own tally, so every participant makes the run - reads the child and looks the keys up -
+and takes away the rows of M whose TIDs are in the ranges it counts (`lion_anti_cells_range()`, at
+each range it claims; a heap-only tuple's TID is in its chain's block, the root's, which is what
+the index holds). Every row of M is in one range, counted by one participant, so each
+participant's partial count of a cell holds every row it takes from it, and the check above holds
+of a partial count too. The child is the inner side's cheapest path a worker
+may run, as for the parallel count. EXPLAIN ANALYZE's `Join Child Rows`, `Join Keys Looked Up` and
+`Join Rows Fetched` are every participant's, summed; `Join Rows Subtracted` is the serial node's.
+
+**Cost.** The count by cells' price, and beside it the anti join's: the lookups, with the
+predicates evaluated on each row found and a `cpu_operator_cost` a predicate to find its cell
+(`lion_anti_price()`'s `rowexprs`), converted as the node's own work, and the child's total cost,
+both before the first row. In parallel each participant pays both, undivided.
+
+**The plan.** Both members: CELLS (23) and ANTI (24), the ANTI member with no grouping equalities -
+the walked column groups nothing - and custom_scan_tlist's columns the predicates, the counts and
+the columns the anti join's clauses read (`LION_TL_RESID`, `LION_TL_ANTI`). The plan check takes
+the anti join beside the decoded walk and a parallel GROUP BY only as a count by cells', with no
+grouping equality, and a count by cells' columns of the table or the inner side only beside an
+anti join. EXPLAIN prints both, the anti join's lines first:
+
+    Finalize HashAggregate
+      Group Key: CASE WHEN ((((CASE WHEN ((x = 1)) THEN 3 ...
+      ->  Custom Scan (LionCount)
+            Lion Indexes: t_gy.g (g)
+            Join Type: Anti
+            Join Rows: the rows counted, less those with a match
+            Join Lookup Index: t_k
+            Join Cond: (s.a = k)
+            Group Strategy: Cells
+            Cell Columns: t_x (x), t_gy.g (g), t_z (z)
+            Cell Predicates: (x = 1), (x = ANY ('{2,3}'::integer[])), (g = ANY ('{2,3}'::integer[])), (g IS NULL), (z = 99)
+            Cells: 18
+            ->  Seq Scan on s
+
+**Correlated by two columns.** `s.a = t.k AND s.b = t.k` is recognised as for any count (above):
+both clauses are scan keys of the B-tree's column, an inner row whose `a` and `b` differ is an
+empty scan, and every row found is tested on both. A further inner column equal to the same outer
+key is, in effect, the inner filter `s.x = s.a`, and is tested so.
+
+**The decoded walk of a GROUP BY's columns** (§34) stays declined beside the anti join: it is the
+plan of a GROUP BY of two or more bare columns, not of the expressions over predicates the count by
+cells answers, and such a GROUP BY beside the anti join is the nested loop of §20, which the anti
+join takes already. Its groups would need the subtraction keyed by the combination of the columns'
+values the walk decodes - a third way of finding a row's group - for a shape nothing here asks for.
 
 ### The dimension from a B-tree (2026-10-20)
 

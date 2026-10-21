@@ -679,7 +679,8 @@ working around a bad choice:
   declined when the cells - the product, over the predicates' columns, of the outcomes each column
   can have (each value named, any other value, NULL; for a multi-key column each set of its leaves
   a row can satisfy, or NULL) - exceed `pg_lion.count_cells_max` (134,217,728, at least 2). Runs
-  in parallel as a parallel `GROUP BY` does. Off, such a `GROUP BY` goes to the ordinary plan.
+  in parallel as a parallel `GROUP BY` does, and beside a `NOT EXISTS` over a small inner side as
+  `pg_lion.enable_count_anti` says. Off, such a `GROUP BY` goes to the ordinary plan.
   EXPLAIN shows `Group Strategy: Cells`, the columns of the predicates as `Cell Columns: <index>
   (<column>), ...`, the predicates themselves as `Cell Predicates`, and the bound as `Cells`; a
   `WHERE` clause over the predicates is the node's `Filter`; `EXPLAIN ANALYZE` adds the
@@ -712,8 +713,10 @@ working around a bad choice:
   each distinct key of its rows up in a B-tree on `t.k` under the query's snapshot, and subtracts
   the rows found that pass the join's clauses and `t`'s own (DESIGN.md §27, "The anti join over a
   small inner side"). Also `count(1)`, a `count(col)` the pushdown answers, `count(DISTINCT)` of a
-  unique column, and a `GROUP BY` of `t`'s columns the pushdown groups by, a group that comes to
-  nothing left out; in parallel, the ungrouped count. It needs a B-tree whose first column is a key
+  unique column, a `GROUP BY` of `t`'s columns the pushdown groups by, a group that comes to
+  nothing left out, and a count by cells (`pg_lion.enable_count_cells`), each row found taken from
+  its cell by its predicates' truths (DESIGN.md §27, "Counts by cells beside the anti join"); in
+  parallel, the ungrouped count and the count by cells. It needs a B-tree whose first column is a key
   of the join; the cost model leaves a large inner side to the ordinary plan. EXPLAIN prints `Join
   Type: Anti`, `Join Rows: the rows counted, less those with a match`, `Join Lookup Index` and
   `Join Cond` above the inner side's plan, and under ANALYZE `Join Child Rows`, `Join Keys Looked
