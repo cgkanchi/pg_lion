@@ -243,16 +243,32 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 		return;
 	}
 
+	/*
+	 * The buffer doubles, up to what the copy may hold and no further: the
+	 * test above keeps used + sz within maxbytes, and a doubling past it
+	 * took up to twice the budget.  The budget is a hash join's memory
+	 * (work_mem times hash_mem_multiplier), which at a work_mem of a few
+	 * hundred megabytes is more than a plain allocation may be: the buffer
+	 * and the offsets are huge allocations, as a spill's entries are
+	 * (lion_spill_add()): the doubling of a copy past 512 MB is a gigabyte,
+	 * one byte more than MaxAllocSize (2026-10-20 review).
+	 */
 	oldcxt = MemoryContextSwitchTo(col->cxt);
-	while (col->used + sz > col->cap)
+	if (col->used + sz > col->cap)
 	{
-		col->cap *= 2;
-		col->buf = (char *) repalloc(col->buf, col->cap);
+		Size		cap = col->cap;
+
+		while (col->used + sz > cap)
+			cap *= 2;
+		cap = Max(Min(cap, col->maxbytes), col->used + sz);
+		col->buf = (char *) repalloc_huge(col->buf, cap);
+		col->cap = cap;
 	}
 	if (col->noffs >= col->offcap)
 	{
 		col->offcap *= 2;
-		col->offs = (Size *) repalloc(col->offs, sizeof(Size) * col->offcap);
+		col->offs = (Size *) repalloc_huge(col->offs,
+										   sizeof(Size) * col->offcap);
 	}
 	MemoryContextSwitchTo(oldcxt);
 
@@ -2202,7 +2218,8 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 		sizeof(LionContainer *) * Max(col.noffs, 1);
 	mat->buf = col.buf;
 	mat->containers = (LionContainer **)
-		palloc(sizeof(LionContainer *) * Max(col.noffs, 1));
+		palloc_extended(sizeof(LionContainer *) * Max(col.noffs, 1),
+						MCXT_ALLOC_HUGE);
 	for (i = 0; i < col.noffs; i++)
 		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
 	pfree(col.offs);

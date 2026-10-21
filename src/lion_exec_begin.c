@@ -120,9 +120,23 @@ lion_load_inner_keys(LionCountScanState *st)
 		MemoryContextSwitchTo(st->innercxt);
 		if (n >= cap)
 		{
+			/*
+			 * Huge allocations: what bounds the arrays is work_mem, and at a
+			 * work_mem past some 600 MB the keys of 67 million entries fit it
+			 * where their array's next doubling, a gigabyte, is more than a
+			 * plain allocation may be (2026-10-20 review).  Past what an int
+			 * counts they do not fit, whatever work_mem says.
+			 */
+			if (cap > INT_MAX / 2)
+			{
+				MemoryContextSwitchTo(oldcxt);
+				lion_posting_set_release(&ps);
+				full = true;
+				break;
+			}
 			cap *= 2;
-			keys = (Datum *) repalloc(keys, sizeof(Datum) * cap);
-			isnull = (bool *) repalloc(isnull, sizeof(bool) * cap);
+			keys = (Datum *) repalloc_huge(keys, sizeof(Datum) * cap);
+			isnull = (bool *) repalloc_huge(isnull, sizeof(bool) * cap);
 		}
 		isnull[n] = ps.keyisnull;
 		keys[n] = ps.keyisnull ? (Datum) 0 :
