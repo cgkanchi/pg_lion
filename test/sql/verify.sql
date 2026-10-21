@@ -373,8 +373,60 @@ SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_root');
 SET client_min_messages = warning;
 
+-- (9) a position tree with an internal level (DESIGN.md §17): 600 rows of 255
+-- positions each, twenty leaves of about two heap blocks each under a root.
+-- verify() read the first downlink of each level and nothing else of an
+-- internal page, so it passed a downlink to the wrong leaf (the third goes
+-- to the fourth leaf), a separator below what the leaf to its left holds (a
+-- reader of that block lands on the leaf to the right, and misses the left
+-- one's last chunk), and a leaf whose min - which a tree without an internal
+-- level is routed by - is not its first chunk's header.  The root is the one
+-- internal page of the tree: flag 128, level 1; the min is at 8 of the
+-- special area.
+CREATE TEMP TABLE lion_vfy_badpos (id int4, d tsvector);
+INSERT INTO lion_vfy_badpos
+SELECT i, (SELECT string_agg('many:' || p, ' ')
+			 FROM generate_series(1, 255) p)::tsvector
+  FROM generate_series(1, 600) i;
+CREATE INDEX lion_vfy_badpos_twin ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT b AS posroot
+  FROM generate_series(1, pg_relation_size('lion_vfy_badpos_twin') /
+						   current_setting('block_size')::int8 - 1) b
+ WHERE lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 26) & 128 <> 0
+   AND lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 24) & 65535 = 1 \gset
+SELECT lion_vfy_item('lion_vfy_badpos_twin', :posroot, 3) AS item3,
+	   lion_vfy_item('lion_vfy_badpos_twin', :posroot, 4) AS item4 \gset
+SELECT lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3) AS sep3,
+	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3 + 4) AS leaf3,
+	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item4 + 4) AS leaf4 \gset
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_badpos_twin', true);
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_poslink ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_poslink', :posroot, :item3 + 4,
+					 lion_vfy_le32(:leaf4));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_poslink');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_possep ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_possep', :posroot, :item3,
+					 lion_vfy_le32(:sep3 - 1));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_possep');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_posmin ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_posmin', :leaf3, :special + 8,
+					 lion_vfy_le32(:sep3 + 1));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_posmin');
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
-DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd;
+DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos;
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
 DROP FUNCTION lion_vfy_poke(regclass, int8, int8, bytea);
 DROP FUNCTION lion_vfy_item(regclass, int8, int);

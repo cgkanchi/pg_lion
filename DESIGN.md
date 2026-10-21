@@ -1101,6 +1101,8 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- seventh is a posting leaf flagged as a page of a position tree, which verify() passed,
         -- heapallindexed included, while the counts lost every row from that leaf on (2026-10-20
         -- review); heapallindexed now holds the leaf its lookup lands on to the readers' test.
+        -- Its ninth is a position tree's downlink, separator and leaf min (§17), which verify()
+        -- passed while it read nothing of a position tree's internal pages but the first downlink.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
@@ -6183,8 +6185,18 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   the tree - for a tree with no internal level, the chain to the right of the head - is freed
   afterwards whatever it holds, and the sweep (and verify) take an unreferenced position page
   whose head is gone for a leak.
-- **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
-  every TID of the posting set has positions.
+- **Verify** walks every position tree as it walks a posting set (§7, §22), and with the same
+  code: level by level from the leaves up, every page a position page of that tree stamped as
+  the entry's, every internal page's high key and separators, and every level's downlinks matched
+  with the pages of the level below. What differs is the keys: a leaf's separator is the header of
+  its first chunk (P3), no leaf's last member is above the separator of its right neighbour (at
+  it is fine), and an internal page's last separators may equal its high key, which an internal
+  split through a run of equal separators leaves. Every chunk, the members' order across the
+  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary, which holds
+  the entry's leaf for the walk, so is that every TID of the posting set has positions. On a
+  standby a walk that replay changed under it is repeated, as a posting set's is. It used to
+  read only the first downlink of each level (2026-10-20 review); verify.sql's ninth case damages
+  a downlink, a separator and a leaf's min of a tree with an internal level, which it passed.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every
