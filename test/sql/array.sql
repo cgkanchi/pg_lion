@@ -588,6 +588,19 @@ ALTER INDEX lion_arr_many_b SET (max_entries = 50);
 INSERT INTO lion_arr_many SELECT ARRAY['z' || i] FROM generate_series(1, 200) i;
 SELECT lion_index_verify('lion_arr_many_b', true);
 
+-- a column of a few keys with many rows each: the index's blocks are its
+-- posting trees', its directory one leaf, and a new key is the sixth entry
+-- of the index, not a cause to warn
+CREATE TABLE lion_arr_few (a int[]);
+INSERT INTO lion_arr_few SELECT ARRAY[i % 5] FROM generate_series(1, 500000) i;
+CREATE INDEX lion_arr_few_a ON lion_arr_few USING lion (a)
+	WITH (max_entries = 100);
+SELECT pg_relation_size('lion_arr_few_a') / 8192 > 20 AS many_blocks, entries
+  FROM lion_index_stats('lion_arr_few_a');
+INSERT INTO lion_arr_few VALUES (ARRAY[5]);
+SELECT entries FROM lion_index_stats('lion_arr_few_a');
+DROP TABLE lion_arr_few;
+
 DROP TABLE lion_arr_many;
 DROP TABLE lion_arr;
 DROP FUNCTION lion_arrcmp(text);

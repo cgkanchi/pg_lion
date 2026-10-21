@@ -1296,7 +1296,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 	pred.callback = vs->callback;
 	pred.callback_state = vs->callback_state;
 
-	while ((csize = lion_inline_fetch(onpage, paylen, &cur, vs->cbuf)) > 0)
+	while ((csize = lion_inline_fetch(vs->index, blkno, off, onpage, paylen,
+									  &cur, vs->cbuf)) > 0)
 	{
 		uint32		r = lion_vac_filter_item(vs->cbuf, &pred);
 
@@ -1317,7 +1318,8 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 			building = true;
 			initStringInfo(&newpay);
 			while (pcur < prefix &&
-				   lion_inline_fetch(onpage, prefix, &pcur, vs->cbuf2) > 0)
+				   lion_inline_fetch(vs->index, blkno, off, onpage, prefix,
+									 &pcur, vs->cbuf2) > 0)
 				lion_vac_inline_append(vs, &newpay, vs->cbuf2, &ncontainers,
 									   &ntids);
 		}
@@ -3428,7 +3430,7 @@ lion_vacuum_sweep(LionVacState *vs)
  * the page inside every window and its counters are only ever updated with
  * deltas.  The copy is written back in place, inside the record that changes
  * the set, so the entry has to be one of the size a CHAIN entry has
- * (lion_page_entry_fetch()).
+ * (lion_page_entry_fetch()), alone in its bytes (lion_page_check_alone()).
  */
 static LionEntryTuple *
 lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
@@ -3447,6 +3449,7 @@ lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 	if ((entry->flags & LION_ENTRY_CHAIN) == 0)
 		elog(ERROR, "lion index: entry %u on block %u is no longer a chain entry",
 			 entryoff, BufferGetBlockNumber(entrybuf));
+	lion_page_check_alone(index, page, BufferGetBlockNumber(entrybuf), entryoff);
 
 	return lion_entry_rebuild(entry, NULL, 0, size);
 }

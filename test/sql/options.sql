@@ -92,6 +92,21 @@ SELECT lion_index_verify('lion_opt_inl_d', true);
 SELECT lion_index_verify('lion_opt_inl_s', true);
 SELECT pg_relation_size('lion_opt_inl_d') < pg_relation_size('lion_opt_inl_s')
 	   AS inline_is_smaller;
+-- An option a build reads is set under ShareUpdateExclusiveLock, as core's
+-- fillfactor of an index is, which blocks no scan, and changes the index at
+-- its next REINDEX: the meta page keeps the limit the build recorded.
+BEGIN;
+ALTER INDEX lion_opt_inl_s SET (inline_limit = 4096);
+SELECT mode FROM pg_locks
+ WHERE locktype = 'relation' AND relation = 'lion_opt_inl_s'::regclass
+   AND pid = pg_backend_pid();
+COMMIT;
+SELECT entries, inline_entries, container_pages, containers, container_bytes
+  FROM lion_index_stats('lion_opt_inl_s');
+REINDEX INDEX lion_opt_inl_s;
+SELECT entries, inline_entries, container_pages, containers, container_bytes
+  FROM lion_index_stats('lion_opt_inl_s');
+SELECT lion_index_verify('lion_opt_inl_s', true);
 DROP TABLE lion_opt_inl;
 
 -- Multicolumn indexes are supported since DESIGN.md §24; test/sql/multicolumn.sql

@@ -87,6 +87,9 @@ typedef struct LionCountStats
 	int64		tids_rechecked; /* TIDs resolved by a heap recheck, cache hits
 								 * included */
 	int64		blocks_rechecked;	/* heap blocks pinned for those rechecks */
+	int64		tids_spilled;	/* ... and those of them that went through a
+								 * sort first: a count taken in passes, past
+								 * its recheck budget (DESIGN.md §9 step 5) */
 	int64		containers_visited; /* containers read from the indexes */
 
 	/*
@@ -155,10 +158,15 @@ typedef struct LionCountStats
 
 	/*
 	 * Candidates decided from stored positions (LionRowFilter.pos), and
-	 * those of them the query does not select.
+	 * those of them the query does not select; and what that took
+	 * (lion_posfilter_work()), the members sought and those decoded, which
+	 * an FK-side join that probes its filters is charged (DESIGN.md §27,
+	 * "Probed, then collected").
 	 */
 	int64		pos_checked;
 	int64		pos_removed;
+	int64		pos_seeks;
+	int64		pos_decoded;
 
 	/*
 	 * What a count's work is made of, container by container (DESIGN.md §27,
@@ -290,8 +298,9 @@ lion_row_filter_heap(const LionRowFilter *filter)
  * cache is the handle the count node already gives every count of one
  * execution; lion_vis_cache_reset() leaves the filter where it is, and a
  * count of another relation than filter->heap is an error.  A collection
- * (lion_sources_collect()) is never filtered: the superset it copies is
- * filtered when it is counted.
+ * (lion_sources_collect()) has no cache: it is handed the filter of the counts
+ * it is made for, applies its position filters to what it copies, and leaves
+ * the rest to those counts.
  */
 extern void lion_vis_cache_set_filter(LionVisCache *cache,
 									  LionRowFilter *filter);
@@ -835,13 +844,15 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
  * copy may only ever be counted beside a located set that carries the §9
  * interlock.  False when it would take more than maxbytes - unless spill
  * allows the copy to go on in a temporary file past them, and *spilled then
- * says whether it did.
+ * says whether it did.  filter, when not NULL, is the row filter the counts
+ * against the copy are made under: its position filters decide what is
+ * copied, and those counts do not apply them again.
  */
 extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 int nsources, LionCountSource *sources,
 								 Size maxbytes, bool spill,
-								 LionPostingSet *out, bool *spilled,
-								 LionCountStats *stats);
+								 LionRowFilter *filter, LionPostingSet *out,
+								 bool *spilled, LionCountStats *stats);
 
 /*
  * The heap's container keys cut into ranges for the participants of a
@@ -861,7 +872,8 @@ extern void lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo,
 						   uint64 *hi);
 extern bool lion_sources_collect_range(Relation heap, Snapshot snapshot,
 									   int nsources, LionCountSource *sources,
-									   Size maxbytes, bool spill, uint32 lo,
+									   Size maxbytes, bool spill,
+									   LionRowFilter *filter, uint32 lo,
 									   uint64 hi, LionPostingSet *out,
 									   bool *spilled, LionCountStats *stats);
 
@@ -1012,6 +1024,7 @@ extern void lion_shared_copy_reinit(LionSharedCopy *sc, struct dsa_area *area,
 extern void lion_shared_copy_collect(LionSharedCopy *sc, struct dsa_area *area,
 									 Relation heap, Snapshot snapshot,
 									 int nsources, LionCountSource *sources,
+									 LionRowFilter *filter,
 									 LionPostingSet *out, int *chunks,
 									 bool *built, bool *spilled,
 									 LionCountStats *stats);
@@ -1072,6 +1085,25 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
 								Size maxbytes, bool spill, LionPostingSet *out,
 								Size *held, bool *spilled, int64 *nsets,
 								int64 *nsummaries);
+
+/*
+ * The union of whatever sets walk hands lion_union_add(), of key column attno
+ * of index, collected as a range's is - in memory within maxbytes, or failed,
+ * or where spill allows a window of container keys at a time into a temporary
+ * file - and made a set the same way (lion_union_collect()).  walk is called
+ * once a window, first true for the first, and hands out the same sets each
+ * time; lion_union_add() is false once the union has failed and the walk is
+ * to stop.  Each set it is given stays the walk's to release.
+ */
+struct LionRangeUnion;
+typedef void (*LionUnionWalk) (Relation index, AttrNumber attno,
+							   struct LionRangeUnion *u, void *arg,
+							   bool first);
+extern bool lion_union_add(struct LionRangeUnion *u, LionPostingSet *ps);
+extern bool lion_union_collect(Relation index, AttrNumber attno,
+							   LionUnionWalk walk, void *arg, Size maxbytes,
+							   bool spill, LionPostingSet *out, Size *held,
+							   bool *spilled);
 
 /*
  * Send a range's set collected in memory to a temporary file of its own, in
@@ -1547,8 +1579,11 @@ extern void lion_entry_scan_begin_part(LionEntryScan *es, Relation index,
  * of the keys they cover (DESIGN.md §32): the entries are still pairwise
  * disjoint and still cover exactly the rows of the part.  On a column without
  * summaries, and for an unordered range, it is lion_entry_scan_begin_part().
- * The NULL entry never comes out of a walk that uses summaries; LION_WALK_ALL
- * is then every VALUE entry, which is what the sum over a column needs.
+ * The NULL entry never comes out of a walk that uses summaries - it is in no
+ * bucket - so LION_WALK_ALL is then every VALUE entry: the rows whose key is
+ * not NULL, which is what `k IS NOT NULL` sums.  A caller that sums every ROW
+ * of the column counts its NULL entry beside the walk (lion_sum_walk()), and
+ * can tell whether it must from es->usesum.
  */
 extern void lion_entry_scan_begin_sum(LionEntryScan *es, Relation index,
 									 AttrNumber attno, LionRange *range,
@@ -1610,6 +1645,7 @@ lion_entry_scan_batch_left(const LionEntryScan *es)
  * pinned across that (VACUUM would wait for it), so the INLINE copies still
  * to come are dropped with their pin and the leaf is read again on the next
  * call, from the last entry handed out.  A batch of CHAIN copies is kept.
+ * Never a walk that uses summaries (see lion_entry_scan_pause()).
  */
 extern void lion_entry_scan_pause(LionEntryScan *es);
 extern void lion_entry_scan_end(LionEntryScan *es);
@@ -1759,6 +1795,10 @@ typedef struct LionAndCost
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
 							  Node **clauses, double isect, LionAndCost *out);
+
+/* What an AM scan's position filters decode and decide (DESIGN.md §17). */
+extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
+									 double cand);
 
 /*
  * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md

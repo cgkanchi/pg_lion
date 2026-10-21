@@ -132,6 +132,11 @@ SELECT * FROM ius_delta();
 SELECT * FROM ius_run('SELECT a, count(*) FROM ius GROUP BY a');
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
+-- ... whose WHERE selects nothing: the WHERE's index, and not the group
+-- column's, which is never walked
+SELECT * FROM ius_run($$SELECT a, count(*) FROM ius WHERE d @@ 'w99' GROUP BY a$$);
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT * FROM ius_delta();
 -- a count(DISTINCT): the distinct values it counted
 SELECT * FROM ius_run('SELECT count(DISTINCT b) FROM ius WHERE a = 3');
 SELECT pg_stat_force_next_flush() AS f \gset
@@ -140,8 +145,13 @@ SELECT * FROM ius_delta();
 SELECT * FROM ius_run($$SELECT count(*) FROM ius WHERE d @@ 'w1 & w3'$$);
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
--- a residual clause, checked in the heap: the table's rows fetched
+-- a residual clause, checked in the heap: the table's rows fetched.  The
+-- aggregate over lion's walk of the covering btree is a plan of lion's too,
+-- which the margin does not mark the count down against, and cheaper: it is
+-- turned off here.
+SET pg_lion.enable_btree_scan = off;
 SELECT * FROM ius_run('SELECT count(*) FROM ius WHERE a = 3 AND c BETWEEN 100 AND 400');
+RESET pg_lion.enable_btree_scan;
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
 -- three rescans with another Param: three scans
@@ -165,6 +175,11 @@ SELECT * FROM ius_run('SELECT d.pk FROM ius_dim d WHERE NOT EXISTS (SELECT 1 FRO
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
 SELECT * FROM ius_run('SELECT d.name, count(*) FROM ius JOIN ius_dim d ON d.pk = ius.a WHERE ius.b = 3 GROUP BY d.name');
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT * FROM ius_delta();
+-- no dimension row: the fact filters' index, and not the fk index, which
+-- has no key to look up
+SELECT * FROM ius_run($$SELECT d.name, count(*) FROM ius JOIN ius_dim d ON d.pk = ius.a WHERE ius.b = 3 AND d.name = 'zz' GROUP BY d.name$$);
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
 RESET enable_hashjoin;

@@ -24,9 +24,9 @@ SET max_parallel_workers_per_gather = 0;
  * lion_rss() runs q with the pushdown forced (every other scan and join
  * disabled) and again with the pushdown off and the planner left alone, and
  * compares the answers as multisets.  It reports how the node took its
- * ranges - collected, and of those spilled, and walked - and, when it did,
- * that it collected the WHERE once and how the FK-side join took its fact
- * filters.
+ * ranges - collected, and of those spilled, and walked - and the IN lists it
+ * collected, and, when it did, that it collected the WHERE once and how the
+ * FK-side join took its fact filters.
  */
 CREATE FUNCTION lion_rss(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -52,6 +52,8 @@ BEGIN
 		how := 'collected ' || coalesce(node ->> 'Range Sources Collected', '0') ||
 			coalesce(' (spilled ' || (node ->> 'Range Sources Spilled') || ')', '') ||
 			', walked ' || coalesce(node ->> 'Range Sources Walked', '0') ||
+			coalesce(', lists collected ' || (node ->> 'Lists Collected') ||
+					 coalesce(' (spilled ' || (node ->> 'Lists Spilled') || ')', ''), '') ||
 			coalesce(', WHERE collected ' || (node ->> 'WHERE Sets Collected'), '') ||
 			coalesce(', filters ' || (node ->> 'Fact Filters'), '') ||
 			coalesce(', switched ' || (node ->> 'Fact Filter Switches'), '') ||
@@ -248,7 +250,30 @@ SELECT lion_rss_cost(q, 'pg_lion.spill_read_cost', '0') = lion_rss_cost(q) AS fi
 	WHERE f.r < 524288 AND f.s < 524288 GROUP BY d.attr')) v(q);
 SET work_mem = '64kB';
 
--- ---------- 5. dirty, and the same with the memory to hold it all ----------
+-- ---------- 5. an IN list too long to locate at once, collected and spilled ----------
+-- Past lion_array_batch_size() - a thousand values at 64 kB - a count that
+-- is not of the relation as one row collects the list's sets, a batch of
+-- values at a time, into one union as it collects a range, in the same
+-- memory: 1,500 of fk's 2,000 values are 270,000 rows in no order, a union
+-- far past 64 kB, spilled in windows.  Beside a range the two share the
+-- memory; a plain count takes the first long list a batch at a time and
+-- collects a second; the FK-side join collects a fact filter's list; the
+-- list on the grouping column drives the groups and is held whole.
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
+SELECT lion_rss('SELECT count(DISTINCT g) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i))');
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) AND r < 524288 GROUP BY g');
+SELECT lion_rss('SELECT count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i))
+	  AND u = ANY (array(SELECT i * 3 FROM generate_series(1, 90000) i))');
+SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
+	WHERE f.u = ANY (array(SELECT i * 3 FROM generate_series(1, 90000) i)) GROUP BY d.attr');
+SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY fk');
+
+-- ---------- 6. dirty, and the same with the memory to hold it all ----------
 UPDATE lion_rss_t SET a = a + 1 WHERE u % 50 = 0;
 DELETE FROM lion_rss_t WHERE u % 70 = 0;
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g');
@@ -256,10 +281,14 @@ SELECT lion_rss('SELECT h, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY h'
 SELECT lion_rss('SELECT count(DISTINCT a) FROM lion_rss_t WHERE r < 524288');
 SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
 	WHERE f.r < 524288 GROUP BY d.attr');
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
 RESET work_mem;
 RESET hash_mem_multiplier;
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g');
 SELECT lion_rss('SELECT h, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY h');
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
 SELECT lion_rss('SELECT count(DISTINCT a) FROM lion_rss_t WHERE r < 524288');
 SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
 	WHERE f.r < 524288 GROUP BY d.attr');

@@ -52,9 +52,9 @@
  * --------------------------------------------------------------------- */
 
 /*
- * Fetch the item (container or sparse segment) at *off of an INLINE payload
- * into the aligned buffer buf and advance *off past it.  Returns the item
- * size, or 0 when the payload has been consumed.
+ * The item (container or sparse segment) at *off of an INLINE payload: copy
+ * it into the aligned buffer buf, advance *off past it and return its size,
+ * or return 0 when the payload has been consumed.
  *
  * The payload may be followed by ZEROED SLACK: VACUUM writes a filtered
  * payload back into the bytes the entry already has rather than shrinking the
@@ -63,15 +63,25 @@
  * has type 0 - the five item kinds are 1 .. 5 - so a zero item header is an
  * unambiguous end marker and the payload needs no length of its own.  The
  * same goes for a tail shorter than one header.
+ *
+ * A PAYLOAD IS DATA, as a page item is (lion_page_item_fetch()): an item of
+ * no known type, a NARROW of no valid width, a size past the payload or the
+ * largest item, or an empty sparse segment is damage.  This returns 0 for it
+ * too, with *off left at the item, its header in buf and *damage saying what
+ * is wrong, for the caller to report - lion_inline_fetch(), which knows the
+ * entry the payload is from - or, in lion_index_stats(), to leave the rest
+ * of the payload out.  *damage is NULL otherwise.
  */
 Size
-lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *buf)
+lion_inline_next(const char *payload, Size paylen, Size *off,
+				 LionContainer *buf, const char **damage)
 {
 	Size		avail;
 	Size		peek;
 	Size		csize;
 
 	Assert(*off <= paylen);
+	*damage = NULL;
 	avail = paylen - *off;
 	if (avail < LION_CONTAINER_HDRSZ)
 		return 0;				/* end of the payload, or its zeroed slack */
@@ -88,24 +98,63 @@ lion_inline_fetch(const char *payload, Size paylen, Size *off, LionContainer *bu
 	if (buf->type == 0)
 		return 0;				/* the slack VACUUM left behind */
 	if (!lion_container_type_valid(buf->type) && buf->type != LION_CT_SPARSE)
-		elog(ERROR, "lion index: malformed inline item of type %u",
-			 buf->type);
+	{
+		*damage = "has a type that is no item kind";
+		return 0;
+	}
 	/* a NARROW's width sizes it (DESIGN.md §38) */
 	if (!lion_container_width_valid(buf))
-		elog(ERROR, "lion index: malformed inline NARROW of width %u",
-			 buf->flags);
+	{
+		*damage = "is a NARROW of a width the format does not have";
+		return 0;
+	}
 	csize = lion_item_size(buf);
 	if (csize < LION_CONTAINER_HDRSZ || csize > LION_CONTAINER_MAX_SIZE ||
 		csize > avail)
-		elog(ERROR, "lion index: malformed inline item");
+	{
+		*damage = "claims more bytes than an item has or the payload holds";
+		return 0;
+	}
 	/* never stored, and it has no last container key (lion_sparse.h) */
 	if (buf->type == LION_CT_SPARSE && buf->cardinality == 0)
-		elog(ERROR, "lion index: empty sparse segment in an inline payload");
+	{
+		*damage = "is an empty sparse segment";
+		return 0;
+	}
 
 	memcpy(buf, payload + *off, csize);
 	*off += csize;
 
 	return csize;
+}
+
+/*
+ * The ERROR for the damage lion_inline_next() found at byte off of the
+ * payload of entry eoff on block blk, with avail bytes of the payload left
+ * from there and the item's header in hdr.  A set put together in memory out
+ * of several entries' items has no one entry to name, and blk is then
+ * InvalidBlockNumber.
+ */
+void
+lion_inline_damaged(Relation index, BlockNumber blk, OffsetNumber eoff,
+					const char *damage, const LionContainer *hdr, Size off,
+					Size avail)
+{
+	if (!BlockNumberIsValid(blk))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": the item at byte %zu of a posting set read from it %s",
+						RelationGetRelationName(index), off, damage),
+				 errdetail("Its header gives type %u, flags %u and cardinality %u, with %zu bytes of the set left from it.",
+						   hdr->type, hdr->flags, (unsigned) hdr->cardinality,
+						   avail)));
+	ereport(ERROR,
+			(errcode(ERRCODE_INDEX_CORRUPTED),
+			 errmsg("lion index \"%s\": the item at byte %zu of the payload of entry %u on block %u %s",
+					RelationGetRelationName(index), off, eoff, blk, damage),
+			 errdetail("Its header gives type %u, flags %u and cardinality %u, with %zu bytes of the payload left from it.",
+					   hdr->type, hdr->flags, (unsigned) hdr->cardinality,
+					   avail)));
 }
 
 /*
@@ -602,6 +651,37 @@ lion_max_entries(Relation index)
 	LionOptions *opts = (LionOptions *) index->rd_options;
 
 	return opts ? opts->max_entries : LION_DEFAULT_MAX_ENTRIES;
+}
+
+/*
+ * A build reads its options from this copy, never from rd_options itself.
+ * ALTER INDEX ... SET takes ShareUpdateExclusiveLock (lion_am.c), which the
+ * build of CREATE INDEX CONCURRENTLY - RowExclusiveLock on the index - does
+ * not wait for, and a backend that sees the change rebuilds the relcache
+ * entry, freeing rd_options and parsing it again: a pointer into it would be
+ * left dangling, and two reads of one option could differ.  So a build takes
+ * the copy before anything that could take a lock, and a parallel build's
+ * participants take the leader's (LionBuildShared), whatever their own
+ * relcache says by the time they start.
+ */
+void
+lion_build_options(Relation index, LionOptions *opts)
+{
+	if (index->rd_options != NULL)
+	{
+		memcpy(opts, index->rd_options, sizeof(LionOptions));
+		return;
+	}
+	memset(opts, 0, sizeof(LionOptions));
+	opts->inline_limit = LION_DEFAULT_INLINE_LIMIT;
+	opts->max_entries = LION_DEFAULT_MAX_ENTRIES;
+	opts->fillfactor = LION_DEFAULT_FILLFACTOR;
+	opts->posting_fillfactor = LION_DEFAULT_POSTING_FILLFACTOR;
+	opts->build_slack = LION_DEFAULT_BUILD_SLACK;
+	opts->wal_mode = LION_WALOPT_AUTO;
+	opts->summaries = LION_SUMOPT_OFF;
+	opts->summary_tids = LION_DEFAULT_SUMMARY_TIDS;
+	opts->store_positions = LION_POSOPT_AUTO;
 }
 
 void

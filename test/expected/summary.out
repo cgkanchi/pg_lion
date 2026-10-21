@@ -967,6 +967,125 @@ SELECT lion_index_verify('lion_sm_ts_i', true);
  
 (1 row)
 
-DROP TABLE lion_sm, lion_sm_old, lion_sm_auto, lion_sm_empty, lion_sm_p, lion_sm_ts;
+-- ---------- 11. a count of every row driven by a summarized column ----------
+-- With nothing that selects rows the count is the sum over every entry of the
+-- column with the fewest (DESIGN.md §35) - k here, NULL in every tenth row.
+-- Its walk hands out summaries, which hold no NULL row, so k's NULL entry is
+-- counted beside them, unless k's own `IS NOT NULL` is what drops it; the
+-- same counts over a plain index on k, and over partitions that have
+-- summaries or not
+CREATE TABLE lion_sm_all (k int, g int);
+INSERT INTO lion_sm_all
+SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE (i * 7) % 300 END,
+	   CASE WHEN i % 4 = 1 THEN NULL ELSE i % 1009 END
+  FROM generate_series(1, 30000) i;
+CREATE INDEX lion_sm_all_k ON lion_sm_all USING lion (k)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_sm_all_g ON lion_sm_all USING lion (g);
+VACUUM (FREEZE, ANALYZE) lion_sm_all;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lion_sm_all WHERE g <> 7;
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lion_sm_all_k (all rows), lion_sm_all_g (g <> 7)
+(2 rows)
+
+RESET enable_seqscan;
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all');
+             lion_sm              
+----------------------------------
+ no range, summaries 270: (30000)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE g IS NOT NULL');
+             lion_sm              
+----------------------------------
+ no range, summaries 270: (22500)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE g <> 7');
+             lion_sm              
+----------------------------------
+ no range, summaries 270: (22477)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE k IS NOT NULL');
+             lion_sm              
+----------------------------------
+ no range, summaries 270: (27000)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE k <> 3');
+             lion_sm              
+----------------------------------
+ no range, summaries 270: (26900)
+(1 row)
+
+SELECT lion_sm('SELECT count(*), count(*) FILTER (WHERE k IS NOT NULL), count(*) FILTER (WHERE g <> 7 OR k <> 3) FROM lion_sm_all');
+                   lion_sm                    
+----------------------------------------------
+ no range, summaries 810: (30000,27000,29897)
+(1 row)
+
+DROP INDEX lion_sm_all_k;
+CREATE INDEX lion_sm_all_k ON lion_sm_all USING lion (k);
+VACUUM ANALYZE lion_sm_all;
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all');
+            lion_sm             
+--------------------------------
+ no range, summaries 0: (30000)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE g IS NOT NULL');
+            lion_sm             
+--------------------------------
+ no range, summaries 0: (22500)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE g <> 7');
+            lion_sm             
+--------------------------------
+ no range, summaries 0: (22477)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_all WHERE k IS NOT NULL');
+            lion_sm             
+--------------------------------
+ no range, summaries 0: (27000)
+(1 row)
+
+CREATE TABLE lion_sm_allp (k int, g int) PARTITION BY RANGE (g);
+CREATE TABLE lion_sm_allp1 PARTITION OF lion_sm_allp FOR VALUES FROM (MINVALUE) TO (500);
+CREATE TABLE lion_sm_allp2 PARTITION OF lion_sm_allp FOR VALUES FROM (500) TO (MAXVALUE);
+CREATE TABLE lion_sm_allp0 PARTITION OF lion_sm_allp DEFAULT;
+INSERT INTO lion_sm_allp SELECT k, g FROM lion_sm_all;
+CREATE INDEX lion_sm_allp1_k ON lion_sm_allp1 USING lion (k)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_sm_allp2_k ON lion_sm_allp2 USING lion (k);
+CREATE INDEX lion_sm_allp0_k ON lion_sm_allp0 USING lion (k)
+	WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lion_sm_allp_g ON lion_sm_allp USING lion (g);
+VACUUM (FREEZE, ANALYZE) lion_sm_allp;
+SELECT lion_sm('SELECT count(*) FROM lion_sm_allp');
+             lion_sm              
+----------------------------------
+ no range, summaries 173: (30000)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_allp WHERE g IS NOT NULL');
+             lion_sm              
+----------------------------------
+ no range, summaries 173: (22500)
+(1 row)
+
+SELECT lion_sm('SELECT count(*) FROM lion_sm_allp WHERE g <> 7');
+             lion_sm              
+----------------------------------
+ no range, summaries 173: (22477)
+(1 row)
+
+DROP TABLE lion_sm, lion_sm_old, lion_sm_auto, lion_sm_empty, lion_sm_p, lion_sm_ts,
+	lion_sm_all, lion_sm_allp;
 DROP FUNCTION lion_sm(text);
 DROP FUNCTION lion_sm_bitmap(text);

@@ -106,11 +106,19 @@ typedef struct LionScanOpaqueData
 								 * amrescan */
 
 	/*
-	 * The plain scan (liongettuple(), DESIGN.md §29).  The source is opened
-	 * by the first call after a rescan and lives in gtcxt, which amrescan
-	 * resets; the batch is the members of the container it last handed out,
-	 * as lo values of that container (lion_container_to_array()), turned into
-	 * a TID one at a time.
+	 * The bitmap scan's memory: every call of liongetbitmap() runs in it, and
+	 * it is reset when the call returns.  The bitmap itself is in its own
+	 * context (tbm_create()), and what outlives the call is in the scan's:
+	 * the keys in keycxt, the probes in so's own.
+	 */
+	MemoryContext bmcxt;
+
+	/*
+	 * The plain scan (liongettuple(), DESIGN.md §29).  Every call runs in
+	 * gtcxt, which amrescan resets; the source is opened in it by the first
+	 * call after a rescan.  The batch is the members of the container the
+	 * source last handed out, as lo values of that container
+	 * (lion_container_to_array()), turned into a TID one at a time.
 	 */
 	MemoryContext gtcxt;
 	struct LionSource *src;
@@ -132,7 +140,8 @@ static int64 lion_emit_source(LionScanOpaque so, TIDBitmap *tbm);
 static bool lion_scan_notnull_walks(Relation index, LionState *col,
 									const LionPostingSet *nullset);
 static void lion_source_entry_set(Relation index, LionEntryTuple *entry,
-								  Size itemlen, MemoryContext cxt,
+								  Size itemlen, BlockNumber blk,
+								  OffsetNumber off, MemoryContext cxt,
 								  LionPostingSet *ps);
 static bool lion_scan_col_ranges(LionScanOpaque so, LionState *col,
 								 ScanKey best, LionRange **rangesp,
@@ -225,17 +234,20 @@ lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm, bool recheck)
 }
 
 /*
- * Emit every item of an INLINE entry payload.  Those items are packed
- * without padding, so each one is copied into an aligned buffer first.
+ * Emit every item of the INLINE payload of entry eoff on block blk.  Those
+ * items are packed without padding, so each one is copied into an aligned
+ * buffer first.
  */
 static int64
-lion_emit_inline(const char *payload, Size paylen, TIDBitmap *tbm, bool recheck)
+lion_emit_inline(Relation index, BlockNumber blk, OffsetNumber eoff,
+				 const char *payload, Size paylen, TIDBitmap *tbm, bool recheck)
 {
 	int64		ntids = 0;
 	Size		off = 0;
 	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 
-	while (lion_inline_fetch(payload, paylen, &off, cbuf) > 0)
+	while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+							 cbuf) > 0)
 		ntids += lion_container_to_tbm(cbuf, tbm, recheck);
 
 	pfree(cbuf);
@@ -276,6 +288,8 @@ lion_scan_reset(LionScanOpaque so)
 	so->pos = 0;
 	if (so->gtcxt != NULL)
 		MemoryContextReset(so->gtcxt);
+	if (so->bmcxt != NULL)
+		MemoryContextReset(so->bmcxt);
 	if (so->keycxt != NULL)
 		MemoryContextReset(so->keycxt);
 }
@@ -312,6 +326,8 @@ lionendscan(IndexScanDesc scan)
 		lion_scan_reset(so);
 		if (so->gtcxt != NULL)
 			MemoryContextDelete(so->gtcxt);
+		if (so->bmcxt != NULL)
+			MemoryContextDelete(so->bmcxt);
 		if (so->keycxt != NULL)
 			MemoryContextDelete(so->keycxt);
 		if (so->lo != NULL)
@@ -422,6 +438,7 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 			   OffsetNumber entryoff, TIDBitmap *tbm, bool recheck)
 {
 	Page		page = BufferGetPage(entrybuf);
+	BlockNumber entryblk = BufferGetBlockNumber(entrybuf);
 	ItemId		iid = PageGetItemId(page, entryoff);
 	LionEntryTuple *entry = lion_entry_at(page, iid);
 	char	   *payload = NULL;
@@ -449,7 +466,8 @@ lion_emit_entry(Relation index, Buffer entrybuf,
 
 	if (payload != NULL)
 	{
-		ntids = lion_emit_inline(payload, paylen, tbm, recheck);
+		ntids = lion_emit_inline(index, entryblk, entryoff, payload, paylen,
+								 tbm, recheck);
 		pfree(payload);
 		return ntids;
 	}
@@ -646,6 +664,14 @@ typedef struct LionLeafWalk
 	OffsetNumber maxoff;
 	bool		done;
 	LionEntryScan *sum;			/* the summed walk above, or NULL */
+
+	/*
+	 * Where the entry lion_walk_next() handed out last was - its leaf and
+	 * offset - which is what damage in its payload is reported with
+	 * (lion_inline_fetch()).
+	 */
+	BlockNumber entblk;
+	OffsetNumber entoff;
 } LionLeafWalk;
 
 static void
@@ -720,6 +746,12 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			entry = lion_entry_scan_next_copy(w->sum, itemlen);
 		if (entry == NULL)
 			w->done = true;
+		else
+		{
+			/* the copy just handed out, and the leaf of its batch */
+			w->entblk = w->sum->batchblk;
+			w->entoff = w->sum->boff[w->sum->nextbatch - 1];
+		}
 		return entry;
 	}
 
@@ -753,7 +785,7 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			CHECK_FOR_INTERRUPTS();
 
 			buf = ReadBuffer(w->index, w->nextblk);
-			lion_dir_pages_read++;
+			lion_dir_count_read(w->index);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			if (!LionPageIsLeaf(page))
@@ -838,6 +870,8 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			}
 
 			*itemlen = ItemIdGetLength(iid);
+			w->entblk = w->curblk;
+			w->entoff = OffsetNumberPrev(w->off);
 			return entry;
 		}
 
@@ -845,6 +879,12 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 	}
 }
 
+/*
+ * The end of a walk, and of what it allocated: its leaf copy and the ranges'
+ * ends go with it, not with the caller's context - a bitmap scan of
+ * `op ANY (array)` whose elements have no order walks once for each of them
+ * in one call (lion_emit_array_range()).
+ */
 static void
 lion_walk_end(LionLeafWalk *w)
 {
@@ -857,6 +897,12 @@ lion_walk_end(LionLeafWalk *w)
 		pfree(w->sum);
 		w->sum = NULL;
 	}
+	if (w->copy != NULL)
+		pfree(w->copy);
+	w->copy = NULL;
+	if (w->ended != NULL)
+		pfree(w->ended);
+	w->ended = NULL;
 	w->done = true;
 	w->haspage = false;
 }
@@ -875,9 +921,10 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 	while ((entry = lion_walk_next(&w, &itemlen)) != NULL)
 	{
 		if ((entry->flags & LION_ENTRY_INLINE) != 0)
-			ntids += lion_emit_inline(LionEntryGetPayload(entry),
-									 LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
-									 tbm, recheck);
+			ntids += lion_emit_inline(index, w.entblk, w.entoff,
+									  LionEntryGetPayload(entry),
+									  LION_ENTRY_PAYLOAD_LEN(entry, itemlen),
+									  tbm, recheck);
 		else
 			ntids += lion_emit_chain(index, lion_entry_owner(entry), lion_entry_head(entry),
 									tbm, recheck);
@@ -886,7 +933,6 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 	}
 
 	lion_walk_end(&w);
-	pfree(w.copy);
 	return ntids;
 }
 
@@ -2257,7 +2303,7 @@ lion_rwin_item(LionRangeWindow *w, const LionContainer *c)
  */
 static void
 lion_rwin_entry(LionRangeWindow *w, Relation index, LionEntryTuple *entry,
-				Size itemlen)
+				Size itemlen, BlockNumber blk, OffsetNumber eoff)
 {
 	w->p = 0;
 	if ((entry->flags & LION_ENTRY_INLINE) != 0)
@@ -2266,7 +2312,8 @@ lion_rwin_entry(LionRangeWindow *w, Relation index, LionEntryTuple *entry,
 		Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
 		Size		off = 0;
 
-		while (lion_inline_fetch(payload, paylen, &off, w->ibuf) > 0)
+		while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+								 w->ibuf) > 0)
 		{
 			if (!lion_rwin_item(w, w->ibuf))
 				break;
@@ -2279,7 +2326,8 @@ lion_rwin_entry(LionRangeWindow *w, Relation index, LionEntryTuple *entry,
 		const LionContainer *c;
 		MemoryContext oldcxt = MemoryContextSwitchTo(w->entrycxt);
 
-		lion_source_entry_set(index, entry, itemlen, w->entrycxt, &ps);
+		lion_source_entry_set(index, entry, itemlen, blk, eoff, w->entrycxt,
+							  &ps);
 		st = lion_stream_begin(1, &ps, NULL, false);
 		lion_stream_seek(st, w->keys[0]);
 		while ((c = lion_stream_next(st)) != NULL)
@@ -2309,11 +2357,10 @@ lion_rwin_walk(LionRangeWindow *w, LionScanOpaque so, LionScanRangeCol *rc)
 					rc->ranges, rc->nranges, false);
 	while ((entry = lion_walk_next(&lw, &itemlen)) != NULL)
 	{
-		lion_rwin_entry(w, so->index, entry, itemlen);
+		lion_rwin_entry(w, so->index, entry, itemlen, lw.entblk, lw.entoff);
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_walk_end(&lw);
-	pfree(lw.copy);
 }
 
 /*
@@ -3049,6 +3096,35 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 }
 
 /*
+ * The equality two elements of `<> ANY` are told apart by where the probe
+ * has no comparison for them: the column's own, the opclass's strategy 1,
+ * for its own values (the probe made them so, coercing where it may), and
+ * for values of another type the family's strategy 1 for that type's pair -
+ * the equality the family's hash of that type agrees with, as its cross-type
+ * one does (lionvalidate() asks every type pair for one).
+ */
+static FmgrInfo *
+lion_ne_any_equality(Relation index, LionState *col, const LionProbe *probe,
+					 Oid keytype, FmgrInfo *finfo)
+{
+	Oid			opfamily = index->rd_opfamily[col->attno - 1];
+	Oid			eqopr;
+
+	if (!probe->crosstype)
+		return &col->eqproc;
+	eqopr = get_opfamily_member(opfamily, keytype, keytype, LION_STRAT_EQUAL);
+	if (!OidIsValid(eqopr))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("missing operator %d(%s,%s) in operator family \"%s\"",
+						LION_STRAT_EQUAL, format_type_be(keytype),
+						format_type_be(keytype),
+						get_opfamily_name(opfamily, false))));
+	fmgr_info(get_opcode(eqopr), finfo);
+	return finfo;
+}
+
+/*
  * `k <> ANY (array)` (DESIGN.md §35): amsearcharray hands the planner's
  * ScalarArrayOpExpr to us for every strategy of the family, `<>` included.  It
  * is true of a row whose k differs from SOME element: with two distinct
@@ -3059,9 +3135,12 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
  * classifies it: `IS NOT NULL`, the `<>` of the one element, or a `<>` of
  * NULL, which selects nothing as every strict key with a NULL value does.
  * The elements are told apart with the comparison the probe resolution gives
- * values of their type among themselves (the family's proc 4, which the
- * validator insists on beside `<>`), under the column's collation - two
- * values it calls equal are one value to the column's equality too.
+ * values of their type among themselves (the family's proc 4), under the
+ * column's collation - two values it calls equal are one value to the
+ * column's equality too.  A column whose directory is in hash order (§21) has
+ * no such comparison, whatever procs its family holds, and neither has a
+ * type the family orders against the column's but not against itself: there
+ * equality tells them apart (lion_ne_any_equality()).
  *
  * Returns keys itself when there is nothing to rewrite, and a copy in cxt
  * otherwise, whose values live there too.
@@ -3083,6 +3162,8 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 		bool	   *nulls;
 		int			nelems;
 		LionProbe	probe;
+		FmgrInfo	eqinfo;
+		FmgrInfo   *equal = NULL;	/* without a comparison, once needed */
 		int			i;
 
 		/*
@@ -3109,12 +3190,19 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 				ndistinct = 1;
 				continue;
 			}
-			if (!probe.hassort)
-				elog(ERROR, "lion index \"%s\": no comparison for the elements of `<> ANY`",
-					 RelationGetRelationName(index));
-			if (DatumGetInt32(FunctionCall2Coll(&probe.sortproc,
-												col->collation,
-												elems[i], one)) != 0)
+			if (probe.hassort)
+			{
+				if (DatumGetInt32(FunctionCall2Coll(&probe.sortproc,
+													col->collation,
+													elems[i], one)) != 0)
+					ndistinct = 2;
+				continue;
+			}
+			if (equal == NULL)
+				equal = lion_ne_any_equality(index, col, &probe,
+											 k->sk_subtype, &eqinfo);
+			if (!DatumGetBool(FunctionCall2Coll(equal, col->collation,
+												elems[i], one)))
 				ndistinct = 2;
 		}
 	}
@@ -3220,9 +3308,24 @@ int64
 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+	MemoryContext oldcxt;
+	int64		ntids;
 
 	/* Not under old_snapshot_threshold (DESIGN.md §9). */
 	lion_check_old_snapshot(scan->indexRelation, scan->xs_snapshot);
+
+	/*
+	 * The call's memory is its own (so->bmcxt), not the caller's: a bitmap
+	 * index scan is called in the executor's per-query context, and what the
+	 * build leaves behind - the walks' leaf copies and range bounds, the
+	 * located sets, the choice - would stay there until the query ends, a
+	 * little more on every rescan of a nested loop's inner side.
+	 */
+	if (so->bmcxt == NULL)
+		so->bmcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+										  "lion index scan bitmap",
+										  ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(so->bmcxt);
 
 	/*
 	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
@@ -3238,7 +3341,11 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		scan->instrument->nsearches++;
 #endif
 
-	return lion_getbitmap_so(so, tbm);
+	ntids = lion_getbitmap_so(so, tbm);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(so->bmcxt);
+	return ntids;
 }
 
 /* ---------------------------------------------------------------------
@@ -3745,7 +3852,8 @@ lion_scan_notnull_walks(Relation index, LionState *col,
 		{
 			LionPostingSet ps;
 
-			lion_source_entry_set(index, entry, itemlen, cxt, &ps);
+			lion_source_entry_set(index, entry, itemlen, w.entblk, w.entoff,
+								  cxt, &ps);
 			if (ps.is_inline)
 				walk += (double) itemlen / (double) BLCKSZ;
 			else
@@ -4219,10 +4327,14 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	return src;
 }
 
-/* A walked entry as a located set, without a lookup (§29.3). */
+/*
+ * A walked entry as a located set, without a lookup (§29.3).  It was entry
+ * off of leaf blk, which damage in its payload is reported with.
+ */
 static void
 lion_source_entry_set(Relation index, LionEntryTuple *entry, Size itemlen,
-					  MemoryContext cxt, LionPostingSet *ps)
+					  BlockNumber blk, OffsetNumber off, MemoryContext cxt,
+					  LionPostingSet *ps)
 {
 	memset(ps, 0, sizeof(LionPostingSet));
 	ps->index = index;
@@ -4231,8 +4343,8 @@ lion_source_entry_set(Relation index, LionEntryTuple *entry, Size itemlen,
 	ps->pinbuf = InvalidBuffer;
 	ps->ntids = lion_entry_ntids(entry);
 	ps->ncontainers = lion_entry_ncontainers(entry);
-	ps->entryblk = InvalidBlockNumber;
-	ps->entryoff = InvalidOffsetNumber;
+	ps->entryblk = blk;
+	ps->entryoff = off;
 	ps->keyisnull = LionEntryIsNullKey(entry);
 	ps->cxt = cxt;
 	if ((entry->flags & LION_ENTRY_INLINE) != 0)
@@ -4386,7 +4498,8 @@ lion_source_union_window(LionSource *src)
 		const LionContainer *c;
 
 		oldcxt = MemoryContextSwitchTo(src->entrycxt);
-		lion_source_entry_set(src->index, entry, itemlen, src->entrycxt, &ps);
+		lion_source_entry_set(src->index, entry, itemlen, w.entblk, w.entoff,
+							  src->entrycxt, &ps);
 		st = lion_stream_begin(1, &ps, NULL, false);
 		lion_stream_seek(st, (uint32) Min(src->ustart, (uint64) PG_UINT32_MAX));
 		while ((c = lion_stream_next(st)) != NULL)
@@ -4630,7 +4743,9 @@ lion_source_window(LionSource *src)
 			Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemlen);
 			Size		off = 0;
 
-			while (lion_inline_fetch(payload, paylen, &off, src->ibuf) > 0)
+			while (lion_inline_fetch(src->index, src->walk.entblk,
+									 src->walk.entoff, payload, paylen, &off,
+									 src->ibuf) > 0)
 			{
 				if (!lion_window_or_item(&pos, src->ibuf))
 					break;
@@ -4644,8 +4759,9 @@ lion_source_window(LionSource *src)
 			const LionContainer *c;
 
 			oldcxt = MemoryContextSwitchTo(src->entrycxt);
-			lion_source_entry_set(src->index, entry, itemlen, src->entrycxt,
-								  &ps);
+			lion_source_entry_set(src->index, entry, itemlen,
+								  src->walk.entblk, src->walk.entoff,
+								  src->entrycxt, &ps);
 			st = lion_stream_begin(1, &ps, NULL, false);
 			lion_stream_seek(st, first);
 			while ((c = lion_stream_next(st)) != NULL)
@@ -4795,6 +4911,7 @@ lion_source_next_raw(LionSource *src)
 				 * (§29.5).
 				 */
 				lion_source_entry_set(src->index, entry, itemlen,
+									  src->walk.entblk, src->walk.entoff,
 									  src->entrycxt, &src->sets[src->nsets]);
 
 				oldcxt = MemoryContextSwitchTo(src->entrycxt);
@@ -4924,20 +5041,10 @@ lion_source_close(LionSource *src)
 	pfree(so);
 }
 
-/*
- * amgettuple (DESIGN.md §29): the next TID of the source, one container's
- * members at a time.
- */
-bool
-liongettuple(IndexScanDesc scan, ScanDirection dir)
+/* The body of liongettuple(), below, which runs it in so->gtcxt. */
+static bool
+lion_scan_gettuple(IndexScanDesc scan, LionScanOpaque so)
 {
-	LionScanOpaque so = (LionScanOpaque) scan->opaque;
-
-	/* §29.1: lion is not ordered, so nothing asks for another direction. */
-	if (!ScanDirectionIsForward(dir))
-		elog(ERROR, "lion index \"%s\" cannot be scanned backward",
-			 RelationGetRelationName(scan->indexRelation));
-
 	if (so->src == NULL)
 	{
 		bool		droppin;
@@ -4959,10 +5066,6 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 			scan->instrument->nsearches++;
 #endif
 
-		if (so->gtcxt == NULL)
-			so->gtcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
-											  "lion index scan state",
-											  ALLOCSET_SMALL_SIZES);
 		if (so->lo == NULL)
 			so->lo = (uint16 *) MemoryContextAlloc(GetMemoryChunkContext(so),
 												   sizeof(uint16) * LION_CONTAINER_RANGE);
@@ -5094,6 +5197,35 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 	}
 }
 
+/*
+ * amgettuple (DESIGN.md §29): the next TID of the source, one container's
+ * members at a time (lion_scan_gettuple()), in so->gtcxt: whatever the
+ * source allocates as it goes stays the scan's until the next rescan, not
+ * the executor's per-query context's, which a nested loop's inner side
+ * rescanned for every outer row would otherwise fill.
+ */
+bool
+liongettuple(IndexScanDesc scan, ScanDirection dir)
+{
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+	MemoryContext oldcxt;
+	bool		found;
+
+	/* §29.1: lion is not ordered, so nothing asks for another direction. */
+	if (!ScanDirectionIsForward(dir))
+		elog(ERROR, "lion index \"%s\" cannot be scanned backward",
+			 RelationGetRelationName(scan->indexRelation));
+
+	if (so->gtcxt == NULL)
+		so->gtcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+										  "lion index scan state",
+										  ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(so->gtcxt);
+	found = lion_scan_gettuple(scan, so);
+	MemoryContextSwitchTo(oldcxt);
+	return found;
+}
+
 /* ---------------------------------------------------------------------
  * The ordered walk of one column (DESIGN.md §30.11)
  * --------------------------------------------------------------------- */
@@ -5147,6 +5279,8 @@ struct LionOrderWalk
 	PGAlignedBlock *ebuf;
 	LionEntryTuple *entry;		/* NULL: none */
 	Size		entrysz;
+	BlockNumber entryblk;		/* where it was, for a report of damage in */
+	OffsetNumber entryoff;		/* its payload (lion_inline_fetch()) */
 	Size		payoff;			/* INLINE: the next item of the payload */
 	bool		chainstarted;	/* CHAIN: its first posting leaf was read */
 	PGAlignedBlock *post;		/* CHAIN: the posting leaf being read, copied */
@@ -5436,13 +5570,19 @@ lion_order_walk_begin(Relation index, AttrNumber attno, ScanKey keys, int nkeys,
 	return w;
 }
 
-/* Take the entry into ebuf, as the one whose TIDs come next. */
+/*
+ * Take the entry, entry off of leaf blk, into ebuf, as the one whose TIDs
+ * come next.
+ */
 static void
-lion_order_take_entry(LionOrderWalk *w, const LionEntryTuple *entry, Size sz)
+lion_order_take_entry(LionOrderWalk *w, const LionEntryTuple *entry, Size sz,
+					  BlockNumber blk, OffsetNumber off)
 {
 	memcpy(w->ebuf->data, entry, sz);
 	w->entry = (LionEntryTuple *) w->ebuf->data;
 	w->entrysz = sz;
+	w->entryblk = blk;
+	w->entryoff = off;
 	w->payoff = 0;
 	w->chainstarted = false;
 	w->haspost = false;
@@ -5463,7 +5603,7 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
 	/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
 	lion_reader_lock_leaf(w->index, buf, w->attno);
 	memcpy(cpage, page, BLCKSZ);
-	lion_dir_pages_read++;
+	lion_dir_count_read(w->index);
 	w->leaves++;
 	w->blk = BufferGetBlockNumber(buf);
 	w->nextblk = LionPageIsRightmost(cpage) ? InvalidBlockNumber :
@@ -5559,7 +5699,8 @@ lion_order_next_value(LionOrderWalk *w)
 		while (w->backward ? (w->off >= w->firstoff) : (w->off <= w->maxoff))
 		{
 			Page		cpage = (Page) w->leaf->data;
-			ItemId		iid = PageGetItemId(cpage, (OffsetNumber) w->off);
+			OffsetNumber eoff = (OffsetNumber) w->off;
+			ItemId		iid = PageGetItemId(cpage, eoff);
 			LionEntryTuple *entry;
 			int			kind;
 			int			t;
@@ -5592,7 +5733,8 @@ lion_order_next_value(LionOrderWalk *w)
 			t = lion_range_test(&w->range, entry);
 			if (t == LION_RANGE_MATCH)
 			{
-				lion_order_take_entry(w, entry, ItemIdGetLength(iid));
+				lion_order_take_entry(w, entry, ItemIdGetLength(iid), w->blk,
+									  eoff);
 				return true;
 			}
 			if (!w->backward)
@@ -5634,7 +5776,8 @@ lion_order_null_entry(LionOrderWalk *w)
 		lion_reader_lock_entry(w->index, BufferGetBlockNumber(buf),
 							   lion_entry_at(page, iid));
 		lion_order_take_entry(w, lion_entry_at(page, iid),
-							  ItemIdGetLength(iid));
+							  ItemIdGetLength(iid), BufferGetBlockNumber(buf),
+							  off);
 	}
 	else
 		lion_reader_lock_absent(w->index, buf, false);	/* §9 */
@@ -5660,7 +5803,8 @@ lion_order_next_item(LionOrderWalk *w)
 	{
 		Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, w->entrysz);
 
-		if (lion_inline_fetch(LionEntryGetPayload(entry), paylen, &w->payoff,
+		if (lion_inline_fetch(w->index, w->entryblk, w->entryoff,
+							  LionEntryGetPayload(entry), paylen, &w->payoff,
 							  w->cbuf) == 0)
 			return false;
 		lion_order_expand(w, w->cbuf);

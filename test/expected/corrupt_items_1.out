@@ -18,6 +18,9 @@
 -- 9. An INLINE entry whose item ends between its key and the end of its
 --    positions extension, where the payload length wrapped around zero.
 -- 10. An index whose meta page says a format version before this build's.
+-- 11. A directory entry whose line pointer reaches into a CHAIN entry, which
+--     every record of an insert into that entry's posting set rewrites in
+--     place, by its own line pointer (lion_page_check_alone()).
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -361,6 +364,42 @@ SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 DROP INDEX lion_di_old_i;
 DROP FUNCTION lion_di_hint(text);
+-- ---------- 11. an entry whose line pointer reaches into a CHAIN entry ----------
+-- Key 7's posting set is a chain, as in 1, and its CHAIN entry shares a leaf
+-- with the entries of key 1 and of keys 100 to 149, five rows each.  The
+-- entry whose bytes end where key 7's begin has its line pointer stretched
+-- over the first 24 of them, which hold the counters (ntids is bytes 16 to
+-- 23).  Readers take the stretched entry: its key is where it was.  The
+-- insert of a row of key 7 rewrites the CHAIN entry, counters and all, in
+-- the record that adds the member, and is refused before that record
+-- begins.
+CREATE TABLE lion_di_c (k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lion_di_c
+	SELECT CASE WHEN i % 16 = 0 THEN 7 WHEN i < 250 THEN 100 + i % 50 ELSE 1 END
+	  FROM generate_series(0, 4 * 14464 - 1) i;
+CREATE INDEX lion_di_c_i ON lion_di_c USING lion (k);
+SELECT lion_di_evict('lion_di_c_i');
+-- the CHAIN entry of key 7, as in 8, and the entry right below it on the page
+SELECT blk AS lion_di_blk, o AS lion_di_off, it AS lion_di_at
+  FROM generate_series(0, (pg_relation_size('lion_di_c_i') / 8192 - 1)::int) blk,
+	   LATERAL lion_di_block('lion_di_c_i', blk) p,
+	   LATERAL generate_series(1, GREATEST(0, LEAST(200, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int))) o,
+	   LATERAL (SELECT lion_di_item(p, o) AS it) y
+ WHERE it BETWEEN 24 AND 8100 AND get_byte(p, it) & 2 = 2
+   AND get_byte(p, it + 2) = 4 AND get_byte(p, it + 3) = 0
+   AND substring(p FROM it + 29 FOR 4) = '\x07000000'::bytea \gset
+SELECT o AS lion_di_below, :lion_di_at - it + 24 AS lion_di_len
+  FROM lion_di_block('lion_di_c_i', :lion_di_blk) p,
+	   LATERAL generate_series(1, (((lion_di_u32(p, 12) & 65535) - 24) / 4)::int) o,
+	   LATERAL (SELECT lion_di_item(p, o) AS it) y
+ WHERE o <> :lion_di_off AND lion_di_lplen(p, o) > 0
+   AND it + ((lion_di_lplen(p, o) + 7) / 8) * 8 = :lion_di_at \gset
+SELECT lion_di_set_lplen('lion_di_c_i', :lion_di_blk, :lion_di_below, :lion_di_len);
+SELECT count(*) FROM lion_di_c WHERE k = 7;
+SELECT lion_di_try('INSERT INTO lion_di_c VALUES (7)');
+SELECT count(*) FROM lion_di_c WHERE k = 7;
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_c_i')$$);
+DROP TABLE lion_di_c;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

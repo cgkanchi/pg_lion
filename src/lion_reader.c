@@ -427,6 +427,29 @@ lion_is_partitioned_index(Oid relid)
 }
 
 /*
+ * Is relid an index of the lion access method, by its catalog row alone?  For
+ * a caller that must know before it locks anything (lion_index_verify()):
+ * the row is read with no lock on the relation, so the answer is the
+ * caller's to confirm once it holds one (lion_open_index()).
+ */
+bool
+lion_is_lion_index(Oid relid)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	bool		islion = false;
+
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+
+		islion = form->relkind == RELKIND_INDEX &&
+			form->relam == lion_get_am_oid();
+		ReleaseSysCache(tp);
+	}
+	return islion;
+}
+
+/*
  * ERROR when relid is a partitioned index (above), saying what it is: left
  * to the checks for an index, one would be called "not an index", which \d
  * contradicts.  One of another method is not a lion index, as its

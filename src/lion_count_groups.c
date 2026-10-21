@@ -182,6 +182,9 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 	if (base.filter != NULL && base.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
 
+	/* a copy decided from the positions as it was made decides nothing here */
+	base.posdone = mat->posfiltered;
+
 	/*
 	 * Each group's recheck queue takes its share of one count's budget, and
 	 * the shares add up to that budget.  The floor of one count's,

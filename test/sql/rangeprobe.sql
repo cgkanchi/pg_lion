@@ -192,6 +192,26 @@ EXECUTE lpr_p('2026-01-02 02:00');
 RESET plan_cache_mode;
 DEALLOCATE lpr_p;
 
+-- ---------- 5. an ordered index core does not read the ends from ----------
+-- Core reads a column's ends from a btree only where the histogram's own `<`
+-- orders it, under the histogram's collation: not text_pattern_ops, ordered
+-- by `~<~`, nor a btree under another collation.  Beside those lion's
+-- estimate reads the ends itself.
+CREATE TABLE lpr_t (id int, t text) WITH (autovacuum_enabled = off);
+ALTER TABLE lpr_t ALTER id SET STATISTICS 5, ALTER t SET STATISTICS 5;
+INSERT INTO lpr_t SELECT g, lpad(g::text, 6, '0') FROM generate_series(1, 1500) g;
+CREATE INDEX lpr_t_lion ON lpr_t USING lion (t);
+VACUUM (ANALYZE) lpr_t;
+INSERT INTO lpr_t SELECT g, lpad(g::text, 6, '0') FROM generate_series(1501, 30000) g;
+VACUUM (FREEZE) lpr_t;
+CREATE INDEX lpr_t_pattern ON lpr_t (t text_pattern_ops);
+CREATE INDEX lpr_t_c ON lpr_t (t COLLATE "C");
+SELECT count(*) AS actual,
+	   lpr_rows($$SELECT * FROM lpr_t WHERE t >= '002000'$$, NULL) < 100 AS core_below_100,
+	   lpr_rows($$SELECT * FROM lpr_t WHERE t >= '002000'$$, 'lpr_t_lion') > 3000 AS lion_above_3000
+  FROM lpr_t WHERE t >= '002000';
+DROP TABLE lpr_t;
+
 DROP TABLE lpr, lpr_est;
 DROP FUNCTION lpr_note(text, text);
 DROP FUNCTION lpr_rows(text, text);

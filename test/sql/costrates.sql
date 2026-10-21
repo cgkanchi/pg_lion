@@ -243,20 +243,20 @@ SELECT n, lcr_lion(q, sw) AS forced,
 				'{}'::text[], 'pg_lion.enable_ordered_scan')) v(n, q, sw, unforced, switch);
 
 -- and none where it hedges nothing: a plan core's enable_* settings force,
--- with nothing of core's left to compete (nor lion's walk of a B-tree, which
--- competes with the count as core's scans do), costs the same at every margin
--- and every rate (lion's own units, which its choices among its own forms
--- are made in).  LionOrdered is not forced so: the enable_indexscan that leaves
--- core no ordered index scan disables it too, and which of two disabled
--- plans wins is a matter of the major (disabled nodes from 18, disable_cost
--- before).
+-- with nothing of core's left to compete (the aggregate over lion's walk of
+-- the B-tree, a LionBtreeScan, is lion's own plan and no competitor), costs
+-- the same at every margin and every rate (lion's own units, which its
+-- choices among its own forms are made in).  LionOrdered is not forced so:
+-- the enable_indexscan that leaves core no ordered index scan disables it
+-- too, and which of two disabled plans wins is a matter of the major
+-- (disabled nodes from 18, disable_cost before).
 SELECT n, lcr_lion(q, sw) AS plan,
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 0.01}') =
 	   lcr_cost(q, sw || '{pg_lion.pushdown_margin, 1}') AS same_at_every_margin,
 	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
 	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate
   FROM (VALUES ('count, forced', 'SELECT count(*) FROM lcr WHERE g200 = 17 AND c2 = 1',
-				'{enable_seqscan, off, enable_bitmapscan, off, enable_tidscan, off, pg_lion.enable_plain_scan, off, pg_lion.enable_btree_scan, off}'::text[]),
+				'{enable_seqscan, off, enable_bitmapscan, off, enable_tidscan, off, pg_lion.enable_plain_scan, off}'::text[]),
 			   ('group, forced', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
 				'{enable_hashagg, off, enable_sort, off}'::text[]),
 			   ('semi, forced', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',

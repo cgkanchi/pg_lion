@@ -221,6 +221,12 @@ typedef struct LionFkJoinCost
 	Cost		walked;			/* ... or a walk of the leaves in key order */
 	Cost		probed;			/* the fact filters, probed by every count */
 	Cost		collected;		/* ... or collected once, and looked up */
+	Cost		posprobed;		/* the share of probed that is the position
+								 * filters, each count deciding its own */
+	Cost		poscollected;	/* ... of collected, decided once for the
+								 * copy */
+	double		posrows;		/* the rows the probing counts decide, all
+								 * told */
 	Cost		located;		/* the part of `other` locating the filters */
 	double		copybytes;		/* what the collected copy is expected to take */
 	double		copyheld;		/* ... and to hold of the memory: all of it,
@@ -312,6 +318,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double		copyckeys;
 	double		copybytes;
 	double		copypages;
+	double		posrows;
+	Cost		posprobed;
+	Cost		poscollected = 0;
 	LionRangeMem rangemem = {0};
 	List	   *rangeinmem = NIL;	/* the sources of the ranges in memory */
 	int			npositive = 0;
@@ -617,13 +626,29 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 														  heap_pages)));
 	copypages = ceil(copybytes / BLCKSZ);
 	probed += found * LION_FKJOIN_COUNT_COST;
+
+	/*
+	 * A fact filter decided from stored positions (lion_cost_posfilter()):
+	 * probed, by every count for the rows of its key the other filters
+	 * leave; collected, once for the copy, which holds only what it keeps
+	 * (lion_sources_collect()) - every row the filters select, decided in one
+	 * walk of the lexemes' members.
+	 */
+	posrows = Min(found * perkey, tuples) * wheresel * readshare;
+	posprobed = lion_cost_posfilter(root, rel, whereidx, wherecol,
+									whereclauses, wherekinds, ors, posrows,
+									found);
+	probed += posprobed;
 	if (npositive > 0)
 	{
 		bool		spills = (copybytes > copyroom);
 
+		poscollected = lion_cost_posfilter(root, rel, whereidx, wherecol,
+										   whereclauses, wherekinds, ors,
+										   filtered, 1.0);
 		collected += drive * LION_FKJOIN_COLLECT_CONTAINER_COST +
 			drive * (npositive - 1) * LION_FKJOIN_PROBE_COST +
-			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST;
+			copyckeys * LION_FKJOIN_COPY_CONTAINER_COST + poscollected;
 
 		/*
 		 * A copy past the memory it has SPILLS to a temporary file
@@ -635,7 +660,10 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 		/* ... made once, by all the participants of a parallel plan */
 		if (workers > 0)
+		{
 			collected /= lion_parallel_divisor(workers);
+			poscollected /= lion_parallel_divisor(workers);
+		}
 		collected += found * (LION_FKJOIN_COPY_COUNT_COST +
 							  Min(cfk, copyckeys) * readshare *
 							  (LION_FKJOIN_COPY_PROBE_COST +
@@ -674,6 +702,9 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	{
 		parts->probed = probed;
 		parts->collected = collected;
+		parts->posprobed = posprobed;
+		parts->poscollected = poscollected;
+		parts->posrows = posrows;
 		parts->located = located;
 	}
 
@@ -739,14 +770,25 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
  * group's rows each.  The sets read again used to be left out, which priced
  * 29 keys in 20 groups over 5M rows - 871,740 key containers read, and as
  * many of the groups' sought, in 437 ms - at 77.
+ *
+ * The position filters are not in `percount`: a copy of the filters has had
+ * them already, once (lion_sources_collect()), and the counts that probe the
+ * filters decide the key's rows group by group - as many rows as one count a
+ * key decides, in `groups` times the counts.  `posgroups` is what they cost
+ * so (lion_cost_posfilter()), and `parts` has what one count a key costs.
  */
 static Cost
 lion_cost_fkjoin_group_counts(const LionFkJoinCost *parts, double tuples,
-							  double groups, Cost percount)
+							  double groups, bool collect, Cost posgroups)
 {
+	Cost		percount;
+
 	if (groups <= 1.0)
 		return 0;
+	percount = collect ? parts->collected - parts->poscollected :
+		parts->probed - parts->posprobed;
 	return (groups - 1.0) * (percount + parts->fkread) +
+		(collect ? 0 : Max(posgroups - parts->posprobed, 0.0)) +
 		groups * parts->fkcontainers *
 		lion_fkjoin_probe_one(parts->heap_pages, tuples / groups, parts->cfk);
 }
@@ -878,13 +920,24 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		if (groups > 1.0)
 		{
 			Cost		perkey =
-				lion_cost_fkjoin_group_counts(&parts, tuples, groups,
-											  *collect ? parts.collected :
-											  parts.probed);
+				lion_cost_fkjoin_group_counts(&parts, tuples, groups, *collect,
+											  lion_cost_posfilter(root, rel,
+																  first->whereidx,
+																  first->wherecol,
+																  whereclauses,
+																  wherekinds,
+																  ors,
+																  parts.posrows,
+																  found * groups));
 
+			/* the union is a copy, and has the position filters once a batch */
 			if (mayunite)
 				united = parts.united - parts.fkread -
 					(*collect ? parts.collected : parts.probed) +
+					lion_cost_posfilter(root, rel, first->whereidx,
+										first->wherecol, whereclauses,
+										wherekinds, ors, parts.unitedrows,
+										batches) +
 					lion_cost_fkjoin_united_counts(&parts, tuples, groups,
 												   batches);
 			if (mayunite && united < perkey)
@@ -925,6 +978,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		bool		tcollect;
 		bool		twalk;
 		double		tgroups;
+		Cost		posgroups;
 
 		if (leafvar == NULL)
 			leafvar = fkvar;	/* lion_collect_targets() found the column */
@@ -958,8 +1012,13 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		 * its value counts each key there, probing its filters.  Its fk sets
 		 * are read by the union and not by counts.
 		 */
+		posgroups = (tgroups > 1.0) ?
+			lion_cost_posfilter(root, t->rel, tidx, tcol, tclauses, tkinds,
+								tors, parts.posrows, tfound * tgroups) : 0;
 		if (tgroups > 1.0)
 			united += parts.united - parts.fkread +
+				lion_cost_posfilter(root, t->rel, tidx, tcol, tclauses,
+									tkinds, tors, parts.unitedrows, batches) +
 				lion_cost_fkjoin_united_counts(&parts, tuples, tgroups,
 											   batches);
 		else
@@ -969,20 +1028,20 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		descents += parts.descents;
 		walked += parts.walked;
 		probed += parts.probed +
-			lion_cost_fkjoin_group_counts(&parts, tuples, tgroups, parts.probed);
+			lion_cost_fkjoin_group_counts(&parts, tuples, tgroups, false,
+										  posgroups);
 		located += parts.located;
 		if (parts.cancollect)
 		{
 			collected += parts.collected +
-				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups,
-											  parts.collected);
+				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups, true, 0);
 			copybytes += parts.copybytes;
 			copyheld += parts.copyheld;
 		}
 		else
 			collected += parts.probed +
-				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups,
-											  parts.probed);
+				lion_cost_fkjoin_group_counts(&parts, tuples, tgroups, false,
+											  posgroups);
 
 		reach = Min(tfound * tuples / nd, tuples);
 		other += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,

@@ -54,11 +54,18 @@ lion_where_has_positive(LionCountScanState *st)
  * arrays of §17 as `col <> '{}'`, which there is no positive source to
  * subtract from, to be tested on each row the snapshot sees.  In the current
  * memory context.
+ *
+ * Those are the only negated clauses it tests, and only on a heap column:
+ * the planner takes no `IS DISTINCT FROM`, `NOT (multi-key)` or negated
+ * clause on an expression column (§41) beside a query known only at run
+ * time (lion_count_path_strategy()), and any other clause here is refused
+ * rather than tested as something it is not.
  */
 static LionRowFilter *
 lion_filter_with_negated(LionCountScanState *st)
 {
 	LionRowFilter *scan = (LionRowFilter *) palloc(sizeof(LionRowFilter));
+	int			natts = RelationGetDescr(st->heap)->natts;
 	int			k;
 
 	*scan = *st->filter;
@@ -73,9 +80,20 @@ lion_filter_with_negated(LionCountScanState *st)
 
 		if (st->item[k].orno >= 0 || !LION_CLAUSE_IS_NEGATED(cl->kind))
 			continue;
+		if (cl->kind != LION_CLAUSE_NOTNULL && cl->kind != LION_CLAUSE_NE &&
+			cl->kind != LION_CLAUSE_NOTRESERVED)
+			elog(ERROR, "LionCount: a negated clause of kind %d on index \"%s\" tested on a row",
+				 (int) cl->kind, RelationGetRelationName(cl->idx));
+		if (cl->idxcol < 1 || cl->idxcol > cl->idx->rd_index->indnatts)
+			elog(ERROR, "LionCount: column %d of index \"%s\" tested on a row",
+				 cl->idxcol, RelationGetRelationName(cl->idx));
+		Assert(scan->nclauses < st->filter->nclauses + st->nitem);
 		c = &scan->clauses[scan->nclauses++];
 		scan->nheap++;
 		c->attno = cl->idx->rd_index->indkey.values[cl->idxcol - 1];
+		if (c->attno < 1 || c->attno > natts)
+			elog(ERROR, "LionCount: an expression column of index \"%s\" tested on a row",
+				 RelationGetRelationName(cl->idx));
 		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL);
 		if (cl->kind == LION_CLAUSE_NOTRESERVED)
 		{
@@ -83,14 +101,13 @@ lion_filter_with_negated(LionCountScanState *st)
 			 * Every row outside the NULL and EMPTY entries (DESIGN.md §17,
 			 * "Non-empty arrays") is `col <> '{}'`: array_ne() against the
 			 * column's own empty array, which no element is compared with.
-			 * The planner takes no other mask, nor an expression column,
-			 * beside a query known only at run time.
+			 * The planner takes no other mask beside a query known only at
+			 * run time.
 			 */
-			Oid			elemtype = InvalidOid;
+			Oid			elemtype;
 
-			if (c->attno > 0 && c->attno <= RelationGetDescr(st->heap)->natts)
-				elemtype = get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
-																	  c->attno - 1)->atttypid));
+			elemtype = get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
+																  c->attno - 1)->atttypid));
 			if (cl->valisnull || !OidIsValid(elemtype) ||
 				DatumGetInt32(cl->val) !=
 				(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY))
@@ -564,6 +581,48 @@ lion_sum_probe_finish(LionCountScanState *st, LionSumProbe *sp)
 }
 
 /*
+ * The rows of the driving column's NULL entry among sources[1 .. nsource - 1],
+ * for a sum over every row whose walk uses summaries (lion_sum_walk()): the
+ * NULL entry in the driver's slot, counted as one more set of the sum - one
+ * that is disjoint from every set the walk hands out, as the plain walk's
+ * NULL entry is - and the slot handed back as it was.  In a range of a
+ * parallel count it is counted at the range's keys alone, through the window
+ * every count of the node is confined to (lion_count_range()), so the ranges
+ * add its rows up once.  Located under a pin of its own (DESIGN.md §9), and
+ * under SERIALIZABLE the entry, or its absence, is locked as any lookup of it
+ * is: the summed walk never reads the leaf it lives on.
+ */
+static int64
+lion_sum_null_entry(LionCountScanState *st, LionCountSource *sources,
+					int nsource)
+{
+	LionCountSource saved = sources[0];
+	LionPostingSet nullset;
+	MemoryContext oldcxt;
+	int64		count = 0;
+
+	MemoryContextReset(st->pergroup);
+	oldcxt = MemoryContextSwitchTo(st->pergroup);
+	if (lion_posting_set_lookup_null_col(st->groupidx, st->groupidxcol,
+										 &nullset))
+	{
+		sources[0].nsets = 1;
+		sources[0].sets = &nullset;
+		sources[0].tree = NULL;
+		sources[0].negated = false;
+		sources[0].nomaterialize = false;
+		sources[0].disjoint = false;
+		count = lion_node_count(st, nsource, sources, false);
+		st->stats.sets_summed++;
+		sources[0] = saved;
+	}
+	lion_posting_set_release(&nullset);
+	MemoryContextSwitchTo(oldcxt);
+
+	return count;
+}
+
+/*
  * Sum the counts of the entries one walk of the driving column returns - all
  * of them (LION_WALK_ALL), or one part of a range's (LION_WALK_*) - each ANDed
  * with sources[1 .. nsource - 1]; sources[0] is the driver's slot, which is
@@ -585,6 +644,13 @@ lion_sum_probe_finish(LionCountScanState *st, LionSumProbe *sp)
  * holds one directory leaf pinned.  The WHERE sources are the relation's,
  * located once, and are materialized on their second use as for any GROUP BY;
  * the batch is then the positive source that carries the interlock.
+ *
+ * The walk over every entry (LION_WALK_ALL) hands out the column's NULL entry
+ * like any other, and the sum skips it when the driver's own `IS NOT NULL`
+ * was dropped (st->sumallitem): its rows are the ones that clause excludes.
+ * A walk that uses summaries hands out no NULL entry at all - it is in no
+ * bucket (lion_count.h) - so the sum over every row (DESIGN.md §35), which
+ * wants those rows, counts it beside the walk (lion_sum_null_entry()).
  */
 static int64
 lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
@@ -599,13 +665,22 @@ lion_sum_walk(LionCountScanState *st, LionCountSource *sources, int nsource,
 	/*
 	 * A sum only adds up what the walk hands out, so it may be handed the
 	 * column's SUMMARY entries in place of the keys they cover (DESIGN.md
-	 * §32): still disjoint sets, still exactly the rows of the part.
+	 * §32): still disjoint sets, still exactly the rows of a range's part,
+	 * and of every entry but the NULL one.
 	 */
 	lion_entry_scan_begin_sum(&st->escan, st->groupidx, st->groupidxcol,
 							  lion_plan_flag(st, LION_FLAG_RANGE) ?
 							  &st->range : NULL, part);
 	st->scanning = true;
 	lion_entry_scan_share_pin(&st->escan);
+
+	/*
+	 * ... which the sum over every row counts first, before the walk has read
+	 * a leaf: the walk holds nothing yet, and the probe below weighs the
+	 * walk's own counts (a range's parts hold no NULL key, §28).
+	 */
+	if (part == LION_WALK_ALL && st->escan.usesum && st->sumallitem < 0)
+		total += lion_sum_null_entry(st, sources, nsource);
 
 	/* One leaf's entries, which is at most what lion_range.c copies of one. */
 	sets = (LionPostingSet *) palloc(sizeof(LionPostingSet) *
@@ -1120,8 +1195,12 @@ lion_sumall_relation(LionCountScanState *st)
  * Does an item of the run being counted select rows and carry the §9
  * interlock whatever its value: a clause of an equality, a list or `IS
  * NULL`, or an OR none of whose leaves is a range taken as a source
- * (DESIGN.md §32)?  A multi-key clause is not counted on: its query may turn
- * out to narrow nothing (§17).
+ * (DESIGN.md §32) and none of whose arms is a complement?  An OR with a
+ * complement arm selects nothing by itself (§35, "Complements in an OR"):
+ * the rows outside M are every row but a few sets', which only a sum over
+ * every row can hand the count.  A multi-key clause is not counted on: its
+ * query may turn out to narrow nothing (§17).  The planner asks the same of
+ * the run's clauses (lion_count_run_plain(), lion_partial_run_plain()).
  */
 static bool
 lion_run_has_plain_source(LionCountScanState *st)
@@ -1137,6 +1216,8 @@ lion_run_has_plain_source(LionCountScanState *st)
 			const LionOrState *o = &st->ors[it->orno];
 			int			j;
 
+			if (o->compl)
+				continue;
 			for (j = 0; j < o->nleaves; j++)
 			{
 				if (st->clause[o->first + j].kind == LION_CLAUSE_RANGESRC)
@@ -1530,7 +1611,8 @@ lion_where_collect(LionCountScanState *st, LionCountSource *sources,
 	if (lion_sources_collect(st->heap, estate->es_snapshot, n, items,
 							 (st->rangesrc_held < limit) ?
 							 limit - st->rangesrc_held : 0,
-							 true, &st->wherecoll, &spilled, &st->stats))
+							 true, st->filter, &st->wherecoll, &spilled,
+							 &st->stats))
 	{
 		st->wcollected = true;
 		st->wherecollected++;
@@ -1748,8 +1830,8 @@ lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
 	}
 	ok = lion_sources_collect_range(st->heap, estate->es_snapshot, st->nitem,
 									items, get_hash_memory_limit(), true,
-									lo, hi, &st->wherecoll, &spilled,
-									&st->stats);
+									st->filter, lo, hi, &st->wherecoll,
+									&spilled, &st->stats);
 	MemoryContextSwitchTo(oldcxt);
 
 	if (!ok)

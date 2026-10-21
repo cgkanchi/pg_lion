@@ -400,6 +400,19 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 	return true;
 }
 
+/*
+ * One set a walk hands the union (lion_union_collect()): its containers ORed
+ * in at the window's keys.  False once the union has failed - a collection
+ * that may not spill, past its memory - when the walk is to stop.
+ */
+bool
+lion_union_add(LionRangeUnion *u, LionPostingSet *ps)
+{
+	if (!u->failed && ps->found)
+		(void) lion_sets_iterate(1, ps, NULL, lion_range_union_cb, u);
+	return !u->failed;
+}
+
 static int
 lion_range_union_cmp(const void *a, const void *b)
 {
@@ -425,8 +438,7 @@ lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
 	lion_entry_scan_begin_sum(&es, index, attno, range, LION_WALK_INSIDE);
 	while (!u->failed && lion_entry_scan_next(&es, &key, &ps))
 	{
-		if (ps.found)
-			(void) lion_sets_iterate(1, &ps, NULL, lion_range_union_cb, u);
+		(void) lion_union_add(u, &ps);
 		lion_posting_set_release(&ps);
 		if (nsets != NULL)
 			(*nsets)++;
@@ -509,6 +521,29 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 							   held, spilled, nsets, nsummaries);
 }
 
+/* The ranges a collection walks, and what its first window read. */
+typedef struct LionRangesWalk
+{
+	LionRange **ranges;
+	int			nranges;
+	int64	   *nsets;
+	int64	   *nsummaries;
+} LionRangesWalk;
+
+static void
+lion_ranges_walk(Relation index, AttrNumber attno, LionRangeUnion *u,
+				 void *arg, bool first)
+{
+	LionRangesWalk *w = (LionRangesWalk *) arg;
+	int			r;
+
+	/* the first window's walks are the ones that say what the ranges read */
+	for (r = 0; r < w->nranges && !u->failed; r++)
+		lion_range_union_walk(index, attno, w->ranges[r], u,
+							  first ? w->nsets : NULL,
+							  first ? w->nsummaries : NULL);
+}
+
 /*
  * The same for the UNION of several ranges of one column - the ranges of
  * `col < ANY (array)` on a column that cannot order the elements, one an
@@ -523,6 +558,35 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 					Size *held, bool *spilled, int64 *nsets,
 					int64 *nsummaries)
 {
+	LionRangesWalk w;
+
+	*nsets = 0;
+	*nsummaries = 0;
+	w.ranges = ranges;
+	w.nranges = nranges;
+	w.nsets = nsets;
+	w.nsummaries = nsummaries;
+	return lion_union_collect(index, attno, lion_ranges_walk, &w, maxbytes,
+							  spill, out, held, spilled);
+}
+
+/*
+ * The union of every set a walk hands it, of one key column of index, as one
+ * set: what lion_range_collect() builds of a range, built of whatever sets
+ * walk(index, attno, u, arg, first) gives lion_union_add() - a range's, or
+ * an IN list's too long to locate at once, a batch of its values at a time
+ * (lion_locate_list()).  The walk is made once a window, first for the first
+ * one, and must hand out the same sets each time, each set's pin its own to
+ * drop once the set is added; the union is in memory within maxbytes, or
+ * fails, or past it - where spill allows - a window of container keys at a
+ * time into a temporary file, as above.  The sets of one walk may overlap: a
+ * union takes a container key's members once whatever brought them.
+ */
+bool
+lion_union_collect(Relation index, AttrNumber attno, LionUnionWalk walk,
+				   void *arg, Size maxbytes, bool spill, LionPostingSet *out,
+				   Size *held, bool *spilled)
+{
 	LionRangeUnion u;
 	LionSpill	sp;
 	HASHCTL		ctl;
@@ -534,7 +598,6 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 	bool		windowed = false;
 	long		n;
 	long		i;
-	int			r;
 
 	memset(out, 0, sizeof(LionPostingSet));
 	out->pinbuf = InvalidBuffer;
@@ -546,8 +609,6 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 	out->entryoff = InvalidOffsetNumber;
 	*held = 0;
 	*spilled = false;
-	*nsets = 0;
-	*nsummaries = 0;
 	memset(&sp, 0, sizeof(sp));
 
 	/* the catalogs a spill's file needs, looked up before the walk starts */
@@ -563,7 +624,7 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 		 * put the chunk limit at 1 kB), so the union takes about what its
 		 * containers are.
 		 */
-		cxt = AllocSetContextCreate(CurrentMemoryContext, "lion range collect",
+		cxt = AllocSetContextCreate(CurrentMemoryContext, "lion union collect",
 									ALLOCSET_SMALL_SIZES);
 		memset(&u, 0, sizeof(u));
 		u.cxt = cxt;
@@ -582,11 +643,7 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 		u.byckey = hash_create("lion range union", 256, &ctl,
 							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
-		/* the first window's walks are the ones that say what the ranges read */
-		for (r = 0; r < nranges && !u.failed; r++)
-			lion_range_union_walk(index, attno, ranges[r], &u,
-								  windowed ? NULL : nsets,
-								  windowed ? NULL : nsummaries);
+		walk(index, attno, &u, arg, !windowed);
 
 		if (u.failed)
 		{
@@ -953,11 +1010,11 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	if (!((lo > 0 || hi < LION_KEYS_END) ?
 		  lion_sources_collect_range(heap, snapshot, nsources, sources,
-									 maxbytes / 2, false, lo, hi, &rp->probe,
-									 &spilled, stats) :
+									 maxbytes / 2, false, NULL, lo, hi,
+									 &rp->probe, &spilled, stats) :
 		  lion_sources_collect(heap, snapshot, nsources, sources,
-							   maxbytes / 2, false, &rp->probe, &spilled,
-							   stats)))
+							   maxbytes / 2, false, NULL, &rp->probe,
+							   &spilled, stats)))
 	{
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);

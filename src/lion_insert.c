@@ -340,8 +340,9 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
 }
 
 /*
- * Rebuild an INLINE payload with (ckey, lo) added, writing it to out, which
- * must have room for paylen + LION_CONTAINER_MAX_SIZE bytes (a container grows
+ * Rebuild the INLINE payload of entry eoff on block blk with (ckey, lo)
+ * added, writing it to out, which must have room for paylen +
+ * LION_CONTAINER_MAX_SIZE bytes (a container grows
  * by at most that much; a segment that takes the pair grows by at most two
  * varints, splitting one into three items adds two headers and a container,
  * and a new segment adds at most LION_SPARSE_SINGLETON_MAX bytes).
@@ -351,8 +352,9 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
  * number of items, which is -0 .. +2.
  */
 static Size
-lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
-			   char *out, int *ndelta)
+lion_inline_add(Relation index, BlockNumber blk, OffsetNumber eoff,
+				const char *payload, Size paylen, uint32 ckey, uint16 lo,
+				char *out, int *ndelta)
 {
 	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	LionSegWork	w;
@@ -374,7 +376,8 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	 * the item that covers the ckey or on the first item beyond it.
 	 */
 	off = 0;
-	while (lion_inline_fetch(payload, paylen, &off, cbuf) > 0)
+	while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+							 cbuf) > 0)
 	{
 		if (lion_item_covers(cbuf, ckey))
 		{
@@ -409,7 +412,8 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	/* Pass 2: copy the payload, replacing or inserting where pass 1 said. */
 	off = 0;
 	n = 0;
-	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	while ((csize = lion_inline_fetch(index, blk, eoff, payload, paylen,
+									  &off, cbuf)) > 0)
 	{
 		if (n == insertpos)
 		{
@@ -531,22 +535,28 @@ lion_insert_new_entry(Relation index, Relation heaprel, LionState *state,
 	 * Cardinality guard (DESIGN.md §17), on the one path that can make the
 	 * index grow a key: a brand new entry.
 	 *
-	 * The estimate used to be "entries on this bucket's chain times the bucket
-	 * count"; with the sorted directory of §21 there is no bucket to count and
-	 * the same order-of-magnitude estimate comes from the shape of the tree
-	 * instead - the entries on THIS leaf times the number of leaves, which is
-	 * the number of blocks the index has minus its internal pages, bounded
-	 * below by one.  Both are crude by design: counting the whole index for
-	 * every new key would read every leaf, and all this feeds is a warning.
+	 * An order-of-magnitude estimate from the shape of the directory (§21):
+	 * the entries on THIS leaf times the number of leaves.  The meta page
+	 * counts the directory's pages, and a directory of height h has at least
+	 * h internal ones, so the leaves are at most that count less h, and one at
+	 * least.  The index's other blocks are not leaves: they are the posting
+	 * trees' and position trees' pages and the free ones, and a column of a
+	 * few keys with many rows each is mostly those.  Crude by design:
+	 * counting the whole index for every new key would read every leaf, and
+	 * all this feeds is a warning.  The leaf is held: it comes before the meta
+	 * page in a split's lock order, which takes the meta page last.
 	 */
 	if (max_entries > 0)
 	{
 		Page		page = BufferGetPage(*leafbuf);
+		LionMetaPageData meta;
 		int64		perleaf = (int64) PageGetMaxOffsetNumber(page) + 1;
-		int64		nleaves = Max((int64) RelationGetNumberOfBlocks(index) - 1,
-								  1);
-		int64		estimate = perleaf * nleaves;
+		int64		nleaves;
+		int64		estimate;
 
+		lion_read_meta(index, &meta);
+		nleaves = Max((int64) meta.dirpages - (int64) meta.height, 1);
+		estimate = perleaf * nleaves;
 		if (estimate > (int64) max_entries)
 			lion_warn_max_entries(index, estimate);
 	}
@@ -701,7 +711,8 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	memcpy(oldpay, LionEntryGetPayload(entry), paylen);
 
 	newpay = (char *) palloc(paylen + LION_CONTAINER_MAX_SIZE);
-	newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+	newlen = lion_inline_add(index, BufferGetBlockNumber(entrybuf), entryoff,
+							 oldpay, paylen, ckey, lo, newpay, &ndelta);
 
 	if (newlen == 0)
 	{
@@ -1266,7 +1277,9 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 	/*
 	 * Every record below rewrites the entry in place, at the size it has,
 	 * inside the record (lion_put_entry()): it has to have the size a CHAIN
-	 * entry has, or that write fails there - a PANIC in rmgr mode.
+	 * entry has, or that write fails there - a PANIC in rmgr mode - and be
+	 * alone in its bytes (lion_page_check_alone(), below), or the write
+	 * overwrites the item that shares them, and logs it.
 	 */
 	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
 								  entryoff);
@@ -1289,6 +1302,7 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 		entry = lion_page_entry_fetch(index, page,
 									  BufferGetBlockNumber(entrybuf), entryoff);
 	}
+	lion_page_check_alone(index, page, BufferGetBlockNumber(entrybuf), entryoff);
 	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
 	Assert(esize == ItemIdGetLength(PageGetItemId(page, entryoff)));
 	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
@@ -1396,7 +1410,8 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 		uint64		added = 1;
 
 		memcpy(oldpay, (char *) e + payoff, paylen);
-		newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+		newlen = lion_inline_add(index, BufferGetBlockNumber(buf), off,
+								 oldpay, paylen, ckey, lo, newpay, &ndelta);
 		if (newlen == 0)
 		{
 			/* The row is in already; only the key is raised. */

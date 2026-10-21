@@ -381,6 +381,78 @@ SELECT count(*) FROM lnq WHERE k = 3 AND a NOT IN ('v1', 'v2', 'v3') AND a <> 'v
    Lion Indexes: lnq_l.a (a <> 'v1'::text), lnq_l.a (a <> 'v2'::text), lnq_l.a (a <> 'v3'::text), lnq_l.a (a <> 'v4'::text), lnq_l.k (k = 3)
 (2 rows)
 
+-- ---------- 8. a run past every row ----------
+-- 2,400 values of b, the even numbers - b's values are odd - and the same
+-- with one in twelve of them made odd: each value that is not a most common
+-- one is taken at the average of the others, 25 rows, as if it were in the
+-- column, and 2,400 of them add up to 60,000 rows, more than the 50,000 b is
+-- not NULL in.  The values are then taken as independent, as core takes `<>
+-- ALL` once its sum goes past every row, with the NULLs taken away once:
+-- thousands of rows, at the scan and at the join above it, where core's
+-- product - of 1 - freq - nullfrac a value - says one row.
+CREATE TABLE lnq_past (n int, w text);
+INSERT INTO lnq_past
+SELECT 1, 'b NOT IN (' || string_agg((v * 2)::text, ', ' ORDER BY v) || ')'
+  FROM generate_series(0, 2399) v
+UNION ALL
+SELECT 2, 'b NOT IN (' || string_agg((v * 2 + (v % 12 = 0)::int)::text, ', ' ORDER BY v) || ')'
+  FROM generate_series(0, 2399) v
+UNION ALL
+SELECT 3, string_agg(format('b <> %s', v * 2), ' AND ' ORDER BY v)
+  FROM generate_series(0, 2399) v;
+SELECT n, lnq_actual('SELECT id FROM lnq WHERE ' || w) AS actual,
+	   lnq_est('SELECT id FROM lnq WHERE ' || w, true)
+		BETWEEN lnq_actual('SELECT id FROM lnq WHERE ' || w) / 4
+			AND lnq_actual('SELECT id FROM lnq WHERE ' || w) AS within_4x,
+	   lnq_est('SELECT d.label FROM lnq r JOIN lnq_d d ON d.k = r.k WHERE r.' || replace(w, ' AND ', ' AND r.'), true)
+		BETWEEN lnq_actual('SELECT id FROM lnq WHERE ' || w) / 4
+			AND lnq_actual('SELECT id FROM lnq WHERE ' || w) AS join_within_4x,
+	   lnq_est('SELECT id FROM lnq WHERE ' || w, false) AS core
+  FROM lnq_past ORDER BY n;
+ n | actual | within_4x | join_within_4x | core 
+---+--------+-----------+----------------+------
+ 1 |  50000 | t         | t              |    1
+ 2 |  45825 | t         | t              |    1
+ 3 |  50000 | t         | t              |    1
+(3 rows)
+
+SELECT n, lnq_diff('SELECT count(*) FROM lnq WHERE ' || w) AS count_differs,
+	   lnq_diff('SELECT id FROM lnq WHERE ' || w) AS rows_differ
+  FROM lnq_past WHERE n IN (1, 2) ORDER BY n;
+ n | count_differs | rows_differ 
+---+---------------+-------------
+ 1 |             0 |           0
+ 2 |             0 |           0
+(2 rows)
+
+-- A table never analyzed: each value is taken at one over the default count
+-- of distinct values, 200, with no NULL, and 301 of them are past every row,
+-- where the estimate is core's.
+CREATE TABLE lnq_u (id int, b int) WITH (autovacuum_enabled = off);
+INSERT INTO lnq_u SELECT i, i % 1000 FROM generate_series(1, 100000) i;
+CREATE INDEX lnq_u_b ON lnq_u USING lion (b);
+SELECT count(*) AS stats FROM pg_stats WHERE tablename = 'lnq_u';
+ stats 
+-------
+     0
+(1 row)
+
+SELECT lnq_est(q, true) = lnq_est(q, false) AS core_estimate,
+	   lnq_est(q, true) > 10000 AS thousands
+  FROM (SELECT 'SELECT id FROM lnq_u WHERE b NOT IN (' ||
+			   string_agg(v::text, ', ' ORDER BY v) || ')' AS q
+		  FROM generate_series(0, 300) v
+		UNION ALL
+		SELECT 'SELECT id FROM lnq_u WHERE ' ||
+			   string_agg(format('b <> %s', v), ' AND ' ORDER BY v)
+		  FROM generate_series(0, 300) v) s;
+ core_estimate | thousands 
+---------------+-----------
+ t             | t
+ t             | t
+(2 rows)
+
+DROP TABLE lnq_past, lnq_u;
 DROP TABLE lnq, lnq_nl, lnq_d, lnq_q;
 DROP FUNCTION lnq_est(text, boolean, text), lnq_actual(text),
 	lnq_bitmap_rows(text), lnq_lo_rows(text, boolean), lnq_diff(text);
