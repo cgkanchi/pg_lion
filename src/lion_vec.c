@@ -2824,7 +2824,8 @@ lionvec_typmod_dims(Relation index, bool half)
  * whatever order the rows come in.  Then the leader sets up shared memory -
  * the sample, the arrays of LionVecBuildArrays, a parallel heap scan and a
  * shared sort - launches the workers, and posts them work, which the
- * leader takes part in:
+ * leader takes part in, whatever parallel_leader_participation says, as
+ * lion's build and core's own parallel builds do (lion_begin_parallel()):
  *
  *	KMEANS	each of k-means' iterations: the leader codes the centroids,
  *			regroups them into their regions if there are any
