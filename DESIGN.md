@@ -20654,15 +20654,16 @@ The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS`
 whichever column it is: the executor never looks for it among the clauses, where the first `IS NOT
 NULL` may be an OR's leaf or a filtered count's and say nothing of the driver. EXPLAIN prints the
 driver as `(all rows)`, or `(all keys)` when it is the column's own `IS NOT NULL` that drives.
+`count(*) WHERE k IS NOT NULL` over a column of many keys is now driven by one of few:
+`lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it was
+`lion_null_k (all keys)`.
 
 A summarized driver (§32) hands its summaries to the sum, and they hold no NULL row: its NULL entry
 is in no bucket. So the sum over every row counts that entry beside the walk, ANDed with the
 negated sources like any other entry, unless the column's own `IS NOT NULL` drops it
 (`lion_sum_walk()`, `lion_sum_null_entry()`); the lookup takes the entry's pin (§9) and, under
 SERIALIZABLE, locks the entry or its absence, since the summed walk never reads the leaf it lives
-on. `count(*) WHERE k IS NOT NULL` over a column of many keys is now
-driven by one of few: `lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it
-was `lion_null_k (all keys)`.
+on. summary.sql counts every row over a summarized driver with NULLs.
 
 ### Complements: `IS DISTINCT FROM`, `NOT` of a multi-key query, and an OR
 
