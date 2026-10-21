@@ -1008,7 +1008,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
         -- never below the column of the entry before it, §24), at most one reserved NULL, one
-        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids/flags, meta values, entry flags,
+        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids, page flags (exactly one kind, and no
+        -- bit that kind never carries: a page of a posting set is never flagged as one of a
+        -- position tree, which every reader of the set refuses, ending the set there), meta
+        -- values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container and that every member is a heap tuple - an offset 1 ..
         -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
@@ -1094,7 +1097,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- a count without the damaged item from lion_index_stats(), where the code before
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
-        -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
+        -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone. Its
+        -- seventh is a posting leaf flagged as a page of a position tree, which verify() passed,
+        -- heapallindexed included, while the counts lost every row from that leaf on (2026-10-20
+        -- review); heapallindexed now holds the leaf its lookup lands on to the readers' test.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)

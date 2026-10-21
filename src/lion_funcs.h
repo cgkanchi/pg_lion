@@ -288,6 +288,8 @@ extern bool lion_verify_has_block(const BlockNumber *sorted, int n,
 								  BlockNumber blk);
 extern void lion_verify_page_bounds(LionVerifyState *vs, BlockNumber blk,
 									Page page);
+extern uint16 lion_verify_page_flags(LionVerifyState *vs, BlockNumber blk,
+									 Page page);
 extern Page lion_verify_read_page(LionVerifyState *vs, BlockNumber blk,
 								  uint16 kind, Buffer *bufp);
 extern ItemId lion_verify_itemid(LionVerifyState *vs, BlockNumber blk,

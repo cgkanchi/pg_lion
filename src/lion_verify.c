@@ -189,6 +189,81 @@ lion_verify_page_bounds(LionVerifyState *vs, BlockNumber blk, Page page)
 					phdr->pd_lower, phdr->pd_upper, phdr->pd_special);
 }
 
+/*
+ * The flag bits a page of each kind may carry (lion.h): its kind, and the
+ * states a page of that kind goes through.  A directory page may be the
+ * root, the left half of an unfinished split, or freed, and only a leaf is
+ * ever HALF_DEAD (DESIGN.md §21).  A container page may be the left half of
+ * an unfinished split, freed, a page of a position tree (§17) rather than of
+ * a posting set, and - a posting leaf only - UNLINKED (§22).  The meta page
+ * is the meta page and nothing else.
+ */
+static uint16
+lion_verify_kind_flags(uint16 kind)
+{
+	switch (kind)
+	{
+		case LION_PAGE_META:
+			return LION_PAGE_META;
+		case LION_PAGE_BUCKET:
+			return LION_PAGE_BUCKET | LION_PAGE_ROOT |
+				LION_PAGE_INCOMPLETE_SPLIT | LION_PAGE_DELETED |
+				LION_PAGE_HALF_DEAD;
+		case LION_PAGE_DIR:
+			return LION_PAGE_DIR | LION_PAGE_ROOT |
+				LION_PAGE_INCOMPLETE_SPLIT | LION_PAGE_DELETED;
+		case LION_PAGE_CONTAINER:
+			return LION_PAGE_CONTAINER | LION_PAGE_INCOMPLETE_SPLIT |
+				LION_PAGE_DELETED | LION_PAGE_POSITIONS | LION_PAGE_UNLINKED;
+	}
+	return 0;
+}
+
+/*
+ * Check the flags of a page whose header and special area are known to be
+ * lion's, and return its kind: exactly one kind, no bit its kind never
+ * carries, and the one combination the bits alone do not rule out - UNLINKED
+ * on anything but a posting leaf.
+ *
+ * A bit outside its kind's set is one no writer sets, and it is not
+ * harmless: every reader of a posting set refuses a page flagged
+ * LION_PAGE_POSITIONS (lion_page_owns()) and ends the set there, while the
+ * tree code, which serves both kinds, does not look at the flag
+ * (lion_page_owns_tree()).  A posting leaf with that one bit set used to
+ * pass this check, and heapallindexed found its rows through the tree code,
+ * while the counts and the scans lost every row from that leaf on
+ * (2026-10-20 review).
+ */
+uint16
+lion_verify_page_flags(LionVerifyState *vs, BlockNumber blk, Page page)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+	uint16		kind = opaque->flags & LION_PAGE_KINDS;
+
+	if (kind != LION_PAGE_META && kind != LION_PAGE_BUCKET &&
+		kind != LION_PAGE_CONTAINER && kind != LION_PAGE_DIR)
+		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
+					RelationGetRelationName(vs->index), blk, opaque->flags);
+
+	if ((opaque->flags & ~lion_verify_kind_flags(kind)) != 0)
+		lion_corrupt("lion index \"%s\": block %u is a %s page with flags 0x%04X, which no %s page carries",
+					RelationGetRelationName(vs->index), blk,
+					kind == LION_PAGE_META ? "meta" :
+					kind == LION_PAGE_BUCKET ? "leaf" :
+					kind == LION_PAGE_DIR ? "directory" : "container",
+					opaque->flags,
+					kind == LION_PAGE_META ? "meta" :
+					kind == LION_PAGE_BUCKET ? "leaf" :
+					kind == LION_PAGE_DIR ? "directory" : "container");
+
+	if ((opaque->flags & LION_PAGE_UNLINKED) != 0 &&
+		(opaque->level != 0 || (opaque->flags & LION_PAGE_POSITIONS) != 0))
+		lion_corrupt("lion index \"%s\": block %u is marked unlinked but is not a posting leaf",
+					RelationGetRelationName(vs->index), blk);
+
+	return kind;
+}
+
 Page
 lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					 Buffer *bufp)
@@ -232,29 +307,7 @@ lion_verify_read_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
 					RelationGetRelationName(vs->index), blk,
 					opaque->page_id, LION_PAGE_ID);
 
-	flags = opaque->flags & LION_PAGE_KINDS;
-	if (flags != LION_PAGE_META && flags != LION_PAGE_BUCKET &&
-		flags != LION_PAGE_CONTAINER && flags != LION_PAGE_DIR)
-		lion_corrupt("lion index \"%s\": block %u has flags 0x%04X, expected exactly one page kind",
-					RelationGetRelationName(vs->index), blk, opaque->flags);
-
-	/*
-	 * Container and directory pages carry the DELETED bit once they are freed
-	 * (DESIGN.md §18, §21), the meta page never; only a directory leaf is ever
-	 * HALF_DEAD, and only a posting leaf UNLINKED (§22).
-	 */
-	if ((opaque->flags & LION_PAGE_DELETED) != 0 && flags == LION_PAGE_META)
-		lion_corrupt("lion index \"%s\": block %u is marked deleted but is the meta page",
-					RelationGetRelationName(vs->index), blk);
-	if ((opaque->flags & LION_PAGE_HALF_DEAD) != 0 && flags != LION_PAGE_BUCKET)
-		lion_corrupt("lion index \"%s\": block %u is marked half-dead but is not a directory leaf",
-					RelationGetRelationName(vs->index), blk);
-	if ((opaque->flags & LION_PAGE_UNLINKED) != 0 &&
-		(flags != LION_PAGE_CONTAINER || opaque->level != 0 ||
-		 (opaque->flags & LION_PAGE_POSITIONS) != 0))
-		lion_corrupt("lion index \"%s\": block %u is marked unlinked but is not a posting leaf",
-					RelationGetRelationName(vs->index), blk);
-
+	flags = lion_verify_page_flags(vs, blk, page);
 	if (flags != kind)
 		lion_corrupt("lion index \"%s\": block %u is a %s page, expected a %s page",
 					RelationGetRelationName(vs->index), blk,
@@ -733,6 +786,17 @@ lion_verify_posting_page(LionVerifyState *vs, BlockNumber blk,
 					RelationGetRelationName(vs->index), blk, eoff, eblk,
 					opaque->owner_hash, opaque->owner_head,
 					lion_entry_owner(entry), lion_entry_head(entry));
+
+	/*
+	 * ... and is a page of a posting set, not of a position tree (DESIGN.md
+	 * §17).  The owner stamp alone tells the two apart on every page a writer
+	 * made, a position tree being stamped with its own root, but a reader of
+	 * the set also refuses a page with the flag (lion_page_owns()) and ends
+	 * the set there: a damaged flag is as much a lost leaf as a damaged link.
+	 */
+	if ((opaque->flags & LION_PAGE_POSITIONS) != 0)
+		lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is flagged as a page of a position tree",
+					RelationGetRelationName(vs->index), blk, eoff, eblk);
 
 	if (opaque->level != level)
 	{
@@ -1807,9 +1871,8 @@ lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			int			plevel;
 
 			lion_verify_visit(vs, pblk, "a position tree page");
-			buf = ReadBuffer(vs->index, pblk);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			page = BufferGetPage(buf);
+			/* the header, the kind and the flags, as on every other page */
+			page = lion_verify_read_page(vs, pblk, LION_PAGE_CONTAINER, &buf);
 			if (!lion_page_owns_positions(page, root))
 				lion_corrupt("lion index \"%s\": block %u is not a page of the position tree at %u of entry %u on block %u",
 							RelationGetRelationName(vs->index), pblk, root,

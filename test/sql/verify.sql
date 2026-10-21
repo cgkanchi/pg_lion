@@ -335,6 +335,44 @@ SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_link');
 SET client_min_messages = warning;
 
+-- (7) a posting leaf flagged LION_PAGE_POSITIONS, as a page of a position
+-- tree: the root's second child, flags 0x0004 -> 0x0084.  Every reader of the
+-- set refuses such a page and ends the set there, so the counts and the scans
+-- lose every row from that leaf on - the SQL count of key 0 finds the first
+-- leaf's rows of 450000 - while verify(), even with heapallindexed, said the
+-- index was sound (2026-10-20 review).  The flags and the page id are the two
+-- uint16s at 26 and 28 of the special area.
+CREATE INDEX lion_vfy_bad_kind ON lion_vfy_badp USING lion (k);
+SELECT lion_vfy_u32('lion_vfy_bad_kind', :root,
+					lion_vfy_item('lion_vfy_bad_kind', :root, 2) + 4) AS leaf \gset
+SELECT lion_vfy_u32('lion_vfy_bad_kind', :leaf, :special + 26) & 65535 AS flags;
+SELECT lion_vfy_poke('lion_vfy_bad_kind', :leaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_kind', :leaf,
+												:special + 26) | 128));
+SET client_min_messages = error;
+SELECT lion_index_count('lion_vfy_bad_kind', 0) AS rows_of_key_0;
+SELECT lion_index_verify('lion_vfy_bad_kind');
+SELECT lion_index_verify('lion_vfy_bad_kind', true);
+SET client_min_messages = warning;
+
+-- (8) a flag no page of its kind carries: a bit no writer sets on a
+-- directory leaf, and ROOT - which only a directory page ever has - on a
+-- posting leaf.  verify() used to check only that a page has one kind.
+CREATE INDEX lion_vfy_bad_flag ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_flag', 1, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_flag', 1,
+												:special + 26) | 1024));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_flag');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_root ON lion_vfy_badp USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_root', :leaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_root', :leaf,
+												:special + 26) | 32));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_root');
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd;
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
