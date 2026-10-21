@@ -251,6 +251,68 @@ SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE (kind = 'a' AND tags && '{x1
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind = 'a' AND tags && '{x1}') OR (kind = 'b' AND tags && '{x3}')$q$);
 RESET enable_partition_pruning;
 
+-- ---- the value a stable expression has while the plan is made ------------
+/*
+ * An IN list over a stable expression is priced over the array the
+ * expression has at plan time, which a cached plan does not keep: it runs
+ * under every value the expression takes later, and the executor evaluates
+ * it each time.  So no partition's bounds refute an arm, or imply a leaf of
+ * one, on the strength of that estimate - in a generic plan made under
+ * lion_test.ks = '1' the arm k = ANY (...) is neither refuted in ipk_2 nor
+ * implied in ipk_1, and each partition answers it from its own index on k.
+ * lion_ipk() runs both prepared statements under another value and compares
+ * them with the query planned afresh with the pushdown off.
+ */
+CREATE TABLE ipk (id int, k int, b int) PARTITION BY LIST (k);
+CREATE TABLE ipk_1 PARTITION OF ipk FOR VALUES IN (1);
+CREATE TABLE ipk_2 PARTITION OF ipk FOR VALUES IN (2);
+INSERT INTO ipk SELECT i, 1 + i % 2, (i / 2) % 5 + 5 * (i % 2)
+  FROM generate_series(1, 4000) i;
+CREATE INDEX ipk_k ON ipk USING lion (k);
+CREATE INDEX ipk_b ON ipk USING lion (b);
+VACUUM (FREEZE, ANALYZE) ipk;
+CREATE FUNCTION lion_ipk(ks text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	arr text := $a$string_to_array(current_setting('lion_test.ks'), ',')::int[]$a$;
+	node_or bigint;
+	node_arm bigint;
+	plain_or bigint;
+	plain_arm bigint;
+BEGIN
+	PERFORM set_config('lion_test.ks', ks, false);
+	EXECUTE 'EXECUTE ipk_or' INTO node_or;
+	EXECUTE 'EXECUTE ipk_arm' INTO node_arm;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('SELECT count(*) FROM ipk WHERE k = ANY (%s) OR b = 5', arr)
+		INTO plain_or;
+	EXECUTE format('SELECT count(*) FROM ipk WHERE (k = ANY (%s) AND b = 4) OR b = 5', arr)
+		INTO plain_arm;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	RETURN format('ks %L: %s, %s (the ordinary plan %s, %s)%s', ks,
+				  node_or, node_arm, plain_or, plain_arm,
+				  CASE WHEN node_or <> plain_or OR node_arm <> plain_arm
+					   THEN ' MISMATCH' ELSE '' END);
+END $$;
+SET lion_test.ks = '1';
+SET plan_cache_mode = force_generic_plan;
+PREPARE ipk_or AS SELECT count(*) FROM ipk
+	WHERE k = ANY (string_to_array(current_setting('lion_test.ks'), ',')::int[]) OR b = 5;
+PREPARE ipk_arm AS SELECT count(*) FROM ipk
+	WHERE (k = ANY (string_to_array(current_setting('lion_test.ks'), ',')::int[]) AND b = 4) OR b = 5;
+SELECT lion_ipplan('EXECUTE ipk_or');
+SELECT lion_ipplan('EXECUTE ipk_arm');
+SELECT lion_ipk('1');
+SELECT lion_ipk('2');
+SELECT lion_ipk('1,2');
+SELECT lion_ipk('');
+RESET plan_cache_mode;
+DEALLOCATE ipk_or;
+DEALLOCATE ipk_arm;
+RESET lion_test.ks;
+DROP FUNCTION lion_ipk(text);
+DROP TABLE ipk;
+
 -- ---- NULLs and the default partition -------------------------------------
 /*
  * ip_n holds NULL as well as 'n', so neither `kind = 'n'` nor `kind IS NULL`

@@ -206,8 +206,9 @@ key); the heap is read only to check that the rows returned are visible. Join on
       JOIN doc d ON d.ctid = s.ctid
      ORDER BY s.score DESC;
 
-The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each
-counted once; lexemes under a NOT do not score, and operators, phrases and weights do not change
+The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default; `k1` any finite number from 0, `b`
+from 0 to 1) over the query's lexemes, each counted once; lexemes under a NOT do not score, and
+operators, phrases and weights do not change
 it, so add `WHERE d.tsv @@ query` to keep only rows that match the query as a whole. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`

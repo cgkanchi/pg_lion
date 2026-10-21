@@ -1362,11 +1362,13 @@ lion_count_priv_set_parts(LionCountPriv *p, List *targets, bool groupidx)
 /*
  * The heap column the driving index's entries belong to (DESIGN.md §24 needs
  * it to name that index's KEY COLUMN), or 0 when no index drives.  With a
- * GROUP BY it is the outer group column; a sum-over-all (§14) has none, and
- * its driver is the index of the FIRST `IS NOT NULL` clause - which is
- * exactly the clause the planner took its driving column from (`notnullvar`,
- * set at the first such leaf of the same list this array was built from, and
- * an OR leaf can never be one).
+ * GROUP BY it is the outer group column.  A sum over all of a column's
+ * entries groups nothing: when RANGE clauses bound its walk (§28) it is the
+ * column they bound, which they all name, and otherwise the column the plan
+ * names (ALLROWS) - §14's `IS NOT NULL` column or §35's column of every row.
+ * Never looked for among the clauses: an `IS NOT NULL` there may be an OR's
+ * leaf or a filtered count's, and the first of them need not be the
+ * driver's.
  */
 AttrNumber
 lion_count_priv_drive_attno(const LionCountPriv *p)
@@ -1376,28 +1378,26 @@ lion_count_priv_drive_attno(const LionCountPriv *p)
 
 	if ((p->flags & LION_FLAG_SUMALL) != 0)
 	{
-		/*
-		 * ... or, when the plan has RANGE clauses (DESIGN.md §28), the column
-		 * they bound, which is the one the planner drove the sum from: they
-		 * all name it.
-		 */
-		bool		hasrange = (p->flags & LION_FLAG_RANGE) != 0;
-		int			drivekind = hasrange ? LION_CLAUSE_RANGE :
-			LION_CLAUSE_NOTNULL;
-
 		driveattno = 0;
-		if (p->allattno != 0 && !hasrange)
-			driveattno = p->allattno;	/* the plan's (DESIGN.md §35) */
-		for (i = 0; i < p->nclause && driveattno == 0; i++)
+		if ((p->flags & LION_FLAG_RANGE) != 0)
 		{
-			if (p->clause[i].kind == drivekind)
+			for (i = 0; i < p->nclause; i++)
 			{
-				driveattno = p->clause[i].attno;
-				break;
+				if (p->clause[i].kind == LION_CLAUSE_RANGE)
+				{
+					driveattno = p->clause[i].attno;
+					break;
+				}
 			}
+			if (driveattno == 0)
+				elog(ERROR, "LionCount: a range-bounded sum without a range clause");
 		}
-		if (driveattno == 0)
-			elog(ERROR, "LionCount: sum-over-all without an IS NOT NULL or range clause");
+		else
+		{
+			driveattno = p->allattno;
+			if (driveattno == 0)
+				elog(ERROR, "LionCount: a sum over every entry that names no column");
+		}
 	}
 
 	/*
@@ -1495,9 +1495,15 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	int			i;
 	int			j;
 
-	/* a sum over every row (DESIGN.md §35) is a sum */
-	if (p->allattno != 0 && !sumall)
-		elog(ERROR, "LionCount: a column for every row without a sum");
+	/*
+	 * A sum over all of a column's entries (DESIGN.md §14, §35) names its
+	 * column, and only it does: a range-bounded sum's column is the range's
+	 * (lion_count_priv_drive_attno()).
+	 */
+	if (p->allattno != 0 && (!sumall || hasrange))
+		elog(ERROR, "LionCount: a column for every entry without a sum over them");
+	if (sumall && !hasrange && p->allattno == 0)
+		elog(ERROR, "LionCount: a sum over every entry that names no column");
 
 	/*
 	 * Residual clauses (DESIGN.md §10) are tested on the rows of one plain

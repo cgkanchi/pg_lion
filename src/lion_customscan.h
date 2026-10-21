@@ -1078,9 +1078,11 @@ typedef struct LionVColScope
 #define LION_RANGED_NONE	0
 #define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
 #define LION_RANGED_SUM		2	/* the sum over the range's entries */
-#define LION_RANGED_SUMALL	3	/* the sum over every entry, `k IS NOT NULL`
-								 * alone (§14): priced as a range over all of
-								 * k when k has summaries (§32) */
+#define LION_RANGED_SUMALL	3	/* the sum over every entry - `k IS NOT
+								 * NULL` alone (§14), or every row (§35) -
+								 * priced as a range over all of k with
+								 * nothing outside it when k has summaries
+								 * (§32) */
 
 /*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
@@ -2523,7 +2525,9 @@ typedef struct LionCountPriv
 	AttrNumber	groupn_attno[LION_MAX_GROUPCOLS];
 	Oid			groupn_idx[LION_MAX_GROUPCOLS];
 
-	AttrNumber	allattno;		/* ALLROWS (§35), or 0 */
+	AttrNumber	allattno;		/* ALLROWS: the column a sum over all of a
+								 * column's entries drives by when no range
+								 * bounds it (§14, §35), or 0 */
 
 	int64		topkn;			/* TOPK (§36), or 0 */
 	int			topkcand;
@@ -3396,6 +3400,11 @@ typedef struct LionClauseInfo
 								 * for a filter's clause */
 	int			filter;			/* 0, or the filtered count it is a clause of
 								 * (DESIGN.md §10, "Filtered counts") */
+	Node	   *clause;			/* the clause itself, or an exact rewrite of
+								 * it (LionLeafInfo.costexact) - never the
+								 * cost model's estimate of it: what a
+								 * partition's bounds may prove TRUE or
+								 * refute (lion_leaf_drops()) */
 } LionClauseInfo;
 
 /*
@@ -3406,7 +3415,7 @@ typedef struct LionClauseInfo
  * something other than the WHERE clauses drives the count, so that a
  * partition left with no clause that selects rows still has its rows counted.
  * The OR restrictions (§19) are there as the plan has them - `ors` over the
- * clause lists, and each leaf's own clause in `leafclauses` - so that a
+ * clause lists, each leaf's own clause in its LionClauseInfo - so that a
  * partition can leave out the arms its bounds refute ("OR arms the partition
  * bounds refute").
  */
@@ -3418,7 +3427,6 @@ typedef struct LionImply
 	List	   *skipped;		/* String: the clauses no posting set answers
 								 * that every partition implies, which are no
 								 * clauses of the plan (LION_PRIV_IMPLIED) */
-	List	   *leafclauses;	/* Expr, one per clause of the plan */
 	List	   *ors;			/* the plan's LION_PRIV_ORS */
 } LionImply;
 
@@ -3486,6 +3494,10 @@ typedef struct LionLeafInfo
 								 * or NULL for the query's own: `col = true`
 								 * for a bare boolean column, an IN list with
 								 * its array estimated */
+	bool		costexact;		/* ... and is the clause itself, rewritten
+								 * (`col = true`) - not one over an estimate
+								 * a cached plan's later runs need not see -
+								 * so that a proof may be made from it */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -3533,6 +3545,7 @@ extern void lion_append_clause(const LionLeafInfo *leaf, Node *clause,
 							   List **clauseinfos, List **whereclauses,
 							   List **whereconsts, List **wherekinds,
 							   List **whereopnos, List **whereinor);
+extern void lion_ors_check(List *ors, List *clauseinfos);
 extern bool *lion_or_leaf_map(List *ors, int nclause);
 extern int *lion_or_group_map(List *ors, int nclause);
 extern int *lion_rangesrc_leaders(List *whereidx, List *wherecol,

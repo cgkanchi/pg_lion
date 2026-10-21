@@ -75,6 +75,21 @@ SELECT bs_same('w3 | t4 | w12', 'w3 | t4 | w12', 100);
 SELECT bs_same('w2 <-> w5 & !w9', 'w2 <-> w5 & !w9', 30);
 SELECT bs_same('w1 | w2 | t7 | w30', 'w30', 5);	-- a WHERE on one of the lexemes
 SELECT bs_same('w4 | w8', 'w4 | w8', 40, 'true', 2.0, 0.3);
+-- a k1 near the largest double, where tf * (k1 + 1) and k1 * L overflowed
+-- and made every score of the scan infinite or NaN: they are finite
+SELECT bs_same('w1 & w2', 'w1 & w2', 10, 'true', 1e308);
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+	ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) DESC LIMIT 10$$) AS scanned;
+SELECT count(*) AS rows, count(*) FILTER (WHERE s IN ('Infinity', 'NaN')) AS not_finite
+  FROM (SELECT lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) AS s FROM bs_docs
+		 WHERE d @@ 'w1 & w2'
+		 ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) DESC LIMIT 10) x;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
 SELECT bs_same('w1 | w5', 'w1 | w5', 20, 'id % 7 = 0');	-- more walks for the filter
 SELECT bs_same('w6 & t0', 'w6 & t0', 5000);		-- more than there are
 SELECT bs_same('w2', 'w2', 3000);					-- the stripped row too
@@ -89,7 +104,8 @@ SELECT bs_same('w2', 'w5 <-> w2', 10);
 SELECT bs_same('w1', 'w1 & w9:*', 10);
 
 -- not offered: ascending, no WHERE, a WHERE lexeme the score lacks, a WHERE
--- an empty document matches, a prefix
+-- an empty document matches, a prefix, a k1 the function refuses (whose
+-- error the function raises, below), a relation with LATERAL references
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') LIMIT 10$$) AS asc;
 SELECT bs_scanned($$SELECT id FROM bs_docs
@@ -104,6 +120,26 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 | w9 & w7'
 	ORDER BY lion_bm25_score(d, 'w7', 'bs_docs_d') DESC LIMIT 10$$) AS or_arm_without;
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w9 & !w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS only_negated;
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+	ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 'Infinity') DESC LIMIT 3$$) AS infinite_k1;
+-- s.ov under the LEFT JOIN is computed by the scan of bs_docs (a
+-- PlaceHolderVar, NULL where no row matches), which so needs o's row: every
+-- path of bs_docs is parameterized by o, and the LionBm25 path is not: it is
+-- not offered, with every other scan disabled too, and the ordinary plan
+-- answers
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT bs_scanned($$SELECT o.v, s.id, s.ov FROM (VALUES (1), (2)) o(v)
+	LEFT JOIN LATERAL (SELECT id, d, o.v AS ov FROM bs_docs WHERE d @@ 'w1') s ON true
+	ORDER BY lion_bm25_score(s.d, 'w1', 'bs_docs_d') DESC, s.id, o.v LIMIT 4$$) AS lateral;
+SELECT o.v, s.id, s.ov, round(lion_bm25_score(s.d, 'w1', 'bs_docs_d')::numeric, 9) AS sc
+  FROM (VALUES (1), (2)) o(v)
+  LEFT JOIN LATERAL (SELECT id, d, o.v AS ov FROM bs_docs WHERE d @@ 'w1') s ON true
+ ORDER BY lion_bm25_score(s.d, 'w1', 'bs_docs_d') DESC, s.id, o.v LIMIT 4;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
 SET pg_lion.enable_bm25_scan = off;
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS off;
@@ -211,6 +247,8 @@ DROP TABLE bs_cur;
 -- errors
 SELECT lion_bm25_score(d, 'w1:*', 'bs_docs_d') FROM bs_docs LIMIT 1;
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_d', -1) FROM bs_docs LIMIT 1;
+SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+ ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 'Infinity') DESC LIMIT 3;
 CREATE INDEX bs_docs_plain ON bs_docs USING lion (d) WITH (store_positions = false);
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_plain') FROM bs_docs LIMIT 1;
 
