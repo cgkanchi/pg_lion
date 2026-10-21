@@ -4990,16 +4990,28 @@ size" where the ordinary plan answers. Two things now:
   the batch boundaries, with repeats, NULLs, values without an entry, two lists, a multi-key column, a
   range and two beside the list, on a dirty heap and past nine million elements, and the VmHWM of the
   300,000 values.
-- **Every other shape holds the list whole, in a huge allocation**, so that it answers at any length
-  the array itself can have instead of failing at nine million values. A GROUP BY, a count(DISTINCT)
-  and an FK-side join count the list many times over - batching it would locate it again for every
-  group - and a list under an OR is not a disjoint union.
+- **Every other count collects it** (`lion_locate_list()`). A GROUP BY, a count(DISTINCT) and an
+  FK-side join count the list many times over - batching it would locate it again for every group -
+  and a plain count's second long list is no batch of the first's. Such a list, a source of its own
+  and longer than `lion_array_batch_size()`, is located a batch of values at a time, and each
+  batch's sets are ORed into ONE union and released before the next batch is located: the list is
+  collected as a range taken as a source is (§32, "A range as a source"; `lion_union_collect()`), in
+  what is left of the hash table's memory the relation's ranges and lists share, and past it a
+  window of container keys at a time into a temporary file, each window a pass over the values. One
+  that does not fit what the sources collected before it left sends them to files, as a range does
+  (`lion_collect_within()`). A value in two batches is ORed in twice, which a union takes once. The
+  union is one pinless set, counted beside a source that carries the §9 interlock or rechecked in
+  the heap, as a list too wide for the open budget always was ("Bounded cursors"). EXPLAIN ANALYZE
+  prints `Lists Collected` and `Lists Spilled`. A list under an OR, which is no disjoint union and
+  whose leaves are not collected, and the list on the grouping column that drives the groups, which
+  needs each value's set, are held whole, in a huge allocation, so that they answer at any length
+  the array itself can have instead of failing at nine million values.
 
-What a batched count still holds per value is the values: the array, and a Datum and a hash each -
-what the executor's own `= ANY` holds, and core's B-tree scan of the same array deconstructs and
-sorts it just the same. A list that is not batched costs its sets' memory outside work_mem as
-before; the planner cannot see a parameter's length to decline it (the literal cap), and at run
-time there is no plan left to fall back to.
+What a batched or collected list still holds per value is the values: the array, and for a batched
+one a Datum and a hash each - what the executor's own `= ANY` holds, and core's B-tree scan of the
+same array deconstructs and sorts it just the same. A list held whole costs its sets' memory
+outside work_mem; the planner cannot see a parameter's length to decline it (the literal cap), and
+at run time there is no plan left to fall back to.
 
 Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 
@@ -13896,7 +13908,8 @@ path of `X`. Its clause is an ARRAY clause of the fact filters like any IN list 
 value the node makes at the start of each run (`lion_eval_clause_values()`,
 `lion_join_filter_values()`): the child is run whole, in the query's memory as every node is (its
 scan descriptor outlives the values' context), the key read from its column of each row, NULLs left
-out, the keys accumulated into an array in the values' context. From there it is an IN list among
+out, the keys accumulated into an array in the values' context (past the cap, a tuplestore: "Past
+the cap" below). From there it is an IN list among
 the fact filters: located, collected into the copy or probed, counted. A rescan rescans the children
 and collects the keys again, so a filter of `X`'s on an outer query's column is applied per outer
 row. The clause's expression in `custom_exprs` is a NULL constant of the key's type that nothing
@@ -13922,9 +13935,17 @@ the fact rel's own estimate does not include. The uniform fk is an assumption: k
 filters that hold most of the fact's rows make the plan cheaper than priced, never wrong.
 
 **Not taken**, as yet: parallel plans (a participant would run each folded table whole; with one
-the node is offered serial only); a folded table whose key set is a parameter's size past the cap
-by a misestimate is held whole, as a parameter's IN list in an FK-side join is ("A list too long to
-locate at once").
+the node is offered serial only).
+
+**Past the cap.** The cap is the planner's estimate, which can be wrong by any factor. A folded
+table that returns more keys than `lion_array_batch_size()` puts them in a tuplestore instead of the
+array (`LionClauseState.valstore`), which keeps work_mem of them and spills the rest to a temporary
+file, and the IN list is collected from it a batch of keys at a time into one set, as a parameter's
+long list is (§15, "A list too long to locate at once"; `lion_locate_list()`): in each leaf of a
+partitioned fact, and again at each rescan, the store ended before the values' context is reset
+(`lion_clause_values_free()`). A table of a million flagged keys whose statistics said none were,
+at work_mem 4MB on the assert build: some 287 MB of the backend's own memory held at the peak, where
+it is now 17 MB, in about the same 2.3 s.
 
 Measured (2026-10-11, 5M fact rows, a 220-row dimension of 10 groups, a 1,000-row filter table of
 which a third is flagged, best of 5, PostgreSQL's own plan with its parallel workers): the flagged
@@ -19205,7 +19226,9 @@ bytes a container key as a range collected in windows does), and it is collected
 freed - in memory, or in windows of nearly all of it. Left to what they left, a range that filled
 the memory to its last few kilobytes would make the next one cost a walk of it for every
 `LION_RANGE_WINDOW_MIN` of its union. The planner prices it so: the try, the files written and
-read, and every count's reads of them.
+read, and every count's reads of them. An IN list too long to locate at once is collected in the
+same memory and the same way (§15, "A list too long to locate at once"; `lion_collect_within()`),
+evicting and evicted alike; the planner, which cannot see a parameter's length, prices none of it.
 
 Such a range may instead be WALKED at every count it is part of (`LionCountSource.rangewalk`,
 `lion_node_count()`), where the plan says so (`LION_FLAG_RANGEWALK`): the rows of the range are

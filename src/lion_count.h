@@ -1074,6 +1074,25 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
 								int64 *nsummaries);
 
 /*
+ * The union of whatever sets walk hands lion_union_add(), of key column attno
+ * of index, collected as a range's is - in memory within maxbytes, or failed,
+ * or where spill allows a window of container keys at a time into a temporary
+ * file - and made a set the same way (lion_union_collect()).  walk is called
+ * once a window, first true for the first, and hands out the same sets each
+ * time; lion_union_add() is false once the union has failed and the walk is
+ * to stop.  Each set it is given stays the walk's to release.
+ */
+struct LionRangeUnion;
+typedef void (*LionUnionWalk) (Relation index, AttrNumber attno,
+							   struct LionRangeUnion *u, void *arg,
+							   bool first);
+extern bool lion_union_add(struct LionRangeUnion *u, LionPostingSet *ps);
+extern bool lion_union_collect(Relation index, AttrNumber attno,
+							   LionUnionWalk walk, void *arg, Size maxbytes,
+							   bool spill, LionPostingSet *out, Size *held,
+							   bool *spilled);
+
+/*
  * Send a range's set collected in memory to a temporary file of its own, in
  * place - every copy of the LionPostingSet that names it reads it there from
  * then on - and give back the memory its union took: *held, what the
