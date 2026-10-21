@@ -2893,9 +2893,18 @@ extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
  * behind EXPLAIN ANALYZE's "Directory Pages Read" (DESIGN.md §21).  It is a
  * plain process-local counter because every read of a leaf or an internal
  * page goes through one of a handful of places, and the count is only ever
- * used as a difference over a node's execution.
+ * used as a difference over a node's execution, or as a clock.
  */
 extern PGDLLIMPORT int64 lion_dir_pages_read;
+
+/*
+ * Every one of those reads goes through lion_dir_count_read(), which also
+ * marks the index read; lion_dir_read_since() says whether an index was read
+ * since the counter stood at a value - the index-usage statistics of a count
+ * (pg_stat_user_indexes), which report a scan of the indexes it read only.
+ */
+extern void lion_dir_count_read(Relation index);
+extern bool lion_dir_read_since(Oid indexoid, int64 since);
 
 /*
  * The same for the pages of POSTING TREES (DESIGN.md §22) the current backend

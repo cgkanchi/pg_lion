@@ -1963,13 +1963,11 @@ typedef struct LionWaggState
  * group of the entry walk against it, a partial row per group; the Finalize
  * Agg above adds a group's rows up.  range is the range being counted, -1
  * between them, and ranges how many this participant counted, which EXPLAIN
- * ANALYZE reports with the workers' (workerranges, and the workers'
- * collections and batches beside it).
+ * ANALYZE reports with the workers' (workerranges; their collections and
+ * batches are the scan's own counters, LionScanWorkerSums).
  *
  * A parallel count of one row (§10, "A count in parallel") keeps the same
- * state: ranges is then the chunks it counted - a range of keys of one run -
- * and the workers' list batches, summaries summed and probed walks come back
- * beside the rest.
+ * state: ranges is then the chunks it counted - a range of keys of one run.
  */
 typedef struct LionRangedState
 {
@@ -1977,13 +1975,6 @@ typedef struct LionRangedState
 	MemoryContext cxt;
 	int64		ranges;
 	int64		workerranges;
-	int64		workerwherecollected;
-	int64		workerwherespilled;
-	int64		workergroupbatches;
-	int64		workergroupsbatched;
-	int64		workerlistbatches;
-	int64		workersummaries;
-	int64		workerrangeprobed;
 } LionRangedState;
 
 /*
@@ -2596,6 +2587,35 @@ typedef struct LionCountPriv
 	List	   *resid;			/* RESID: PATH stage only */
 } LionCountPriv;
 
+/*
+ * What the workers of a parallel plan - a GROUP BY, a count or an FK-side join
+ * under a Gather - added up of the scan's own counters, which EXPLAIN ANALYZE
+ * prints beside the leader's (lion_shutdown_custom_scan()): every counter of
+ * the scan state a worker can move, so that none of them prints the leader's
+ * share alone - or nothing, where the leader takes no part.  The decoded
+ * walk's are a count by cells' (DESIGN.md §34, §10 "Counts by cells").  A
+ * join's own counters are LionJoinWorkerSums, the anti join's its state's.
+ */
+typedef struct LionScanWorkerSums
+{
+	LionCountStats stats;
+	int64		dirpages;
+	int64		rangeeval[3];
+	int64		summaries;
+	int64		rangeprobed;
+	int64		rangesrc_collected;
+	int64		rangesrc_walked;
+	int64		rangesrc_spilled;
+	int64		wherecollected;
+	int64		wherespilled;
+	int64		groupbatches;
+	int64		groupsbatched;
+	int64		listbatches;
+	int64		decodepasses;
+	int64		decoderowsup;
+	LionDecodeStats decode;
+} LionScanWorkerSums;
+
 typedef struct LionCountScanState
 {
 	CustomScanState css;
@@ -2982,12 +3002,15 @@ typedef struct LionCountScanState
 
 	/*
 	 * The index-usage statistics of the relation being counted
-	 * (pg_stat_user_indexes): statread says it has been read since it was
-	 * made the one counted or last reported, and statrows are the rows
-	 * counted from it since - what lion_count_report_reads() counts as one
-	 * scan of each of its indexes and their idx_tup_read.
+	 * (pg_stat_user_indexes): statopen says its indexes are open and not
+	 * yet reported for the last time, statsince is lion_dir_pages_read when
+	 * it was made the one counted or last reported, and statrows are the
+	 * rows counted from it since - what lion_count_report_reads() counts as
+	 * one scan, and the idx_tup_read, of each of its indexes whose directory
+	 * was read since (lion_dir_read_since()).
 	 */
-	bool		statread;
+	bool		statopen;
+	int64		statsince;
 	int64		statrows;
 
 	/*
@@ -2999,19 +3022,18 @@ typedef struct LionCountScanState
 	struct LionJoinState *join;
 
 	/*
-	 * A parallel FK-side join (DESIGN.md §27, "Parallel") or GROUP BY
-	 * (DESIGN.md §10, "A GROUP BY in parallel"): every participant adds what
-	 * EXPLAIN ANALYZE reports into shared, in the dynamic shared memory of
-	 * the Gather above it, when it shuts down - a worker once, which reported
-	 * says - and the leader copies the sums before that memory goes: the
-	 * scan's own counters into workerstats and workerdirpages, and a join's
-	 * or a ranged GROUP BY's into their own state.  shared is NULL outside a
-	 * parallel plan, and the sums zero.
+	 * A parallel FK-side join (DESIGN.md §27, "Parallel"), GROUP BY or count
+	 * (DESIGN.md §10, "A GROUP BY in parallel", "A count in parallel"): every
+	 * participant adds what EXPLAIN ANALYZE reports into shared, in the
+	 * dynamic shared memory of the Gather above it, when it shuts down - a
+	 * worker once, which reported says - and the leader copies the sums
+	 * before that memory goes: the scan's own counters into worker, and a
+	 * join's, a ranged node's ranges and the anti join's into their own
+	 * state.  shared is NULL outside a parallel plan, and the sums zero.
 	 */
 	struct LionJoinShared *shared;
 	bool		reported;
-	LionCountStats workerstats;
-	int64		workerdirpages;
+	LionScanWorkerSums worker;
 
 	/*
 	 * The anti join over a small inner side (DESIGN.md §27, "The anti join
@@ -3166,18 +3188,17 @@ lion_st_join(LionCountScanState *st)
  * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel") keeps its
  * state here too: nextchunk is then the next range of container keys nobody
  * has claimed, of nranges ranges cut from ckeys keys (lion_key_ranges()), and
- * ranges, wherecollected, wherespilled, groupbatches and groupsbatched its
- * workers' counters, summed.  So does a parallel count of one row (§10, "A
- * count in parallel"), whose chunks are nranges for each of its runs, and
- * whose workers sum their listbatches, summaries and rangeprobed here too.
+ * ranges its workers' count of them, summed.  So does a parallel count of
+ * one row (§10, "A count in parallel"), whose chunks are nranges for each of
+ * its runs.  Whatever the shape, scan is the sum of the workers' own scan
+ * counters (LionScanWorkerSums).
  */
 typedef struct LionJoinShared
 {
 	slock_t		mutex;
-	LionCountStats stats;
+	LionScanWorkerSums scan;
 	int64		lookups;
 	int64		missing;
-	int64		dirpages;
 	int64		filterrows;
 	int64		spilled;
 	int64		sorted;
@@ -3191,14 +3212,7 @@ typedef struct LionJoinShared
 	int64		switches;
 	int64		switchkeys;
 	int64		ranges;
-	int64		wherecollected;
-	int64		wherespilled;
-	int64		groupbatches;
-	int64		groupsbatched;
 	int64		factgroupcounts;
-	int64		listbatches;
-	int64		summaries;
-	int64		rangeprobed;
 	int64		antichildrows;	/* the anti join over a small inner side */
 	int64		antilookups;
 	int64		antifetched;
