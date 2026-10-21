@@ -662,10 +662,16 @@ working around a bad choice:
   row ("What a sample can rule out"); a filter of more than 32 sets is measured without its widest
   lists, which are taken as independent of the rest ("Wide lists"). Off, Lion prices its paths
   from the planner's estimate.
-- `pg_lion.enable_rows_correction`: let what the intersection probe measures of a table's own
-  filters correct the planner's row estimate for that table as well, so that joins above it are
-  sized for the rows its filters really leave (DESIGN.md §29.11, "The relation's rows"). Off, the
-  probe corrects Lion's own estimates only and the planner keeps its own row count.
+- `pg_lion.enable_rows_correction`: let Lion's estimate of a table's own filters correct the
+  planner's row estimate for that table as well, so that joins above it are sized for the rows its
+  filters really leave (DESIGN.md §29.11, "The relation's rows"): what the intersection probe
+  measures of them, and the forms Lion estimates them in where the planner's estimate is off
+  whatever the data - an OR of equalities on one column as the `IN` list it spells, and a run of
+  exclusions on one column, `k <> 'a' AND k <> 'b' ...` or `k NOT IN ('a', 'b', ...)`, as the one
+  exclusion it is: the rows that are not NULL and hold none of the values, where the planner takes
+  the NULLs away once for each value and comes out hundreds of times short on a column with many
+  NULLs ("A run of `<>` is one exclusion"). It applies to a table with a Lion index, with the probe
+  on or off. Off, those correct Lion's own estimates only and the planner keeps its own row count.
 - `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
   Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
   rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than
