@@ -9744,10 +9744,11 @@ leading with the key still pays: a C or ICU collation gets abbreviated keys ther
 
 **Parallel build** (PostgreSQL 17 and later, `amcanbuildparallel`; 16's `index_build()` asks for
 workers only for btree). nbtree's and GIN's shape: the leader sets up a parallel heap scan, a shared
-fileset and one TapeShare per participant, launches the workers and takes part itself. Each
-participant scans its block chunks into an accumulator of its own, with maintenance_work_mem divided
-between them, spills as a serial build does, and at the end merges each key column's runs into ONE
-tape for that column (`lion_spool_export()`). A column's runs and its tape share a file of the
+fileset and one TapeShare per participant, launches the workers and takes part itself - always, as
+nbtree's and GIN's leaders do: `parallel_leader_participation` is Gather's and Gather Merge's
+setting, and no parallel index build of core's reads it. Each participant scans its block chunks
+into an accumulator of its own, with maintenance_work_mem divided between them, spills as a serial
+build does, and at the end merges each key column's runs into ONE tape for that column (`lion_spool_export()`). A column's runs and its tape share a file of the
 shared fileset, so the tape re-uses the blocks the runs free as the merge reads them. The write that
 follows is split by column, since no two columns share a key (below). Workers get
 their own IndexInfo, so expression and partial indexes work, and report reltuples, index tuples and
