@@ -467,6 +467,14 @@ SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FR
              176
 (1 row)
 
+-- ... the scan's own among them: the range a worker took as a source of the
+-- fact filters (one per participant that located them, so only that it did)
+SELECT lion_pj_counter('SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x < 3 AND f.t = ''t3'' GROUP BY d.grp', 'Range Sources Collected') > 0 AS range_sources;
+ range_sources 
+---------------
+ t
+(1 row)
+
 -- ---- 3. the serial node in a worker (debug_parallel_query) ----------------------
 ALTER TABLE lion_pd SET (parallel_workers = 0);
 SET debug_parallel_query = on;

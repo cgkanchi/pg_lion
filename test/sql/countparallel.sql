@@ -83,7 +83,11 @@ BEGIN
 	RETURN format('%s, %s rows', how, nrows);
 END $$;
 
-/* The node's counters in EXPLAIN ANALYZE, as "Name: value, ...". */
+/*
+ * The node's counters in EXPLAIN ANALYZE, as "Name: value, ...".  Range
+ * sources are collected by each participant that counts a range, as many
+ * times as there are such participants: only their name is printed.
+ */
 CREATE FUNCTION lcp_counters(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -92,8 +96,12 @@ DECLARE
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF btrim(split_part(ln, ':', 1)) IN ('Key Ranges', 'List Batches',
-											 'Heap Blocks Skipped via VM') THEN
+											 'Heap Blocks Skipped via VM',
+											 'Range Evaluation') THEN
 			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END || btrim(ln);
+		ELSIF btrim(split_part(ln, ':', 1)) = 'Range Sources Collected' THEN
+			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END ||
+				btrim(split_part(ln, ':', 1));
 		END IF;
 	END LOOP;
 	RETURN out;
@@ -233,6 +241,14 @@ SELECT lcp_check('SELECT count(*) FROM lcp WHERE a = 1 AND b');
 SET pg_lion.parallel_range_keys = 7;
 SELECT lcp_counters('SELECT count(*) FROM lcp WHERE a = 1 AND b');
 SET pg_lion.parallel_range_keys = 1;
+-- a sum over a range, and a range taken as a source: the workers' counters
+-- with the leader's, and without it when it takes no part
+SELECT lcp_counters('SELECT count(*) FROM lcp WHERE k < 10 AND b');
+SELECT lcp_counters('SELECT count(*) FROM lcp WHERE k < 10 AND s < 5 AND b');
+SET parallel_leader_participation = off;
+SELECT lcp_counters('SELECT count(*) FROM lcp WHERE k < 10 AND b');
+SELECT lcp_counters('SELECT count(*) FROM lcp WHERE k < 10 AND s < 5 AND b');
+RESET parallel_leader_participation;
 
 -- ---------- 4. a generic plan's parameters, in every participant ----------
 SET plan_cache_mode = force_generic_plan;
