@@ -520,9 +520,6 @@ typedef struct LionBuildState
 	LionSumBuild *sum;			/* the column being written's, or NULL */
 	uint32		summary_cols;	/* the columns that got them */
 	int64		nsummaries;		/* summary entries written */
-
-	/* A NARROW item written, which lets VACUUM make NARROWs too (§38). */
-	bool		wrote_narrow;
 	/* the positions of the columns that store them (lion_posbuild.c) */
 	LionPosBuild *posbuild;
 	bool		curpos;			/* ... for the column being written */
@@ -1606,10 +1603,6 @@ static void
 lion_builder_emit(LionBuildState *bs, LionBuilder *b, LionContainer *c)
 {
 	Size		csize = lion_item_size(c);
-
-	/* every item the index gets comes this way, a summary's included */
-	if (c->type == LION_CT_NARROW)
-		bs->wrote_narrow = true;
 
 	/* A collecting summary builder puts its items aside (DESIGN.md §32). */
 	if (b->tofile != NULL)
@@ -2754,7 +2747,6 @@ typedef struct LionBuildColumn
 	int64		blocks;			/* the participants' tapes of it, together */
 	bool		taken;
 	bool		done;			/* the worker's file is complete */
-	bool		wrote_narrow;
 	bool		summarized;
 	int64		nsummaries;
 } LionBuildColumn;
@@ -2985,7 +2977,6 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 
 		/* each column counts its own blocks, from 0 */
 		bs.nblocks = 0;
-		bs.wrote_narrow = false;
 		bs.summary_cols = 0;
 		bs.nsummaries = 0;
 		lion_parallel_colname(name, c);
@@ -3000,7 +2991,6 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 		bs.colout = NULL;
 
 		SpinLockAcquire(&shared->mutex);
-		columns[c].wrote_narrow = bs.wrote_narrow;
 		columns[c].summarized = (bs.summary_cols != 0);
 		columns[c].nsummaries = bs.nsummaries;
 		columns[c].done = true;
@@ -3069,8 +3059,6 @@ lion_parallel_replay_column(LionBuildState *bs, int c)
 	BufFileDeleteFileSet(&shared->fileset.fs, name, false);
 	leader->nreplayed++;
 
-	if (col->wrote_narrow)
-		bs->wrote_narrow = true;
 	if (col->summarized)
 		bs->summary_cols |= ((uint32) 1) << (bs->ix.cols[c].attno - 1);
 	bs->nsummaries += col->nsummaries;
@@ -3435,9 +3423,6 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and which columns got summaries (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
-	/* ... and whether it has a NARROW item, which VACUUM may then add (§38). */
-	lion_meta_record_narrow(LionPageGetMeta((Page) metabuf->data),
-							bs.wrote_narrow);
 	/* ... and each column's distinct keys, for the planner (§33). */
 	{
 		LionMetaNdistinct nd;

@@ -132,11 +132,11 @@ Representation policy
   bitset - and the insert path does not optimize afterwards, so the bitset stayed, and a 4104-byte
   item cannot share an 8K page with another. The split already ended as an ARRAY, through a bitset;
   it now converts the same way the insert does.)*
-- `lion_container_optimize()` picks the smallest of the three representations - four with NARROW,
-  of the narrowest width that holds the members, which only it makes, and VACUUM only in a version
-  8 index (§38). It is called at bulk
-  build time for every container and by VACUUM after modifying a container. It is *not* called on
-  every insert (inserts only enforce the size invariant), matching CRoaring's runOptimize semantics.
+- `lion_container_optimize()` picks the smallest of the four representations, NARROW of the
+  narrowest width that holds the members (§38). It is called at bulk build time for every
+  container, by VACUUM after modifying a container, and by an insert for every container it writes
+  as a new item; an insert that adds the member in place (below) keeps the representation, so a
+  container grows by its slack between two of them.
   A NARROW given a member past its width widens to the narrowest width that holds it, and one
   shrunk to 256 members a word of its width (`LION_WIDTH_ARRAY_CARD(k)`) or fewer is an ARRAY.
 - Mutators operate on a caller-supplied buffer of LION_CONTAINER_MAX_SIZE bytes. Page code copies a
@@ -361,8 +361,7 @@ with summary posting sets, which records them in `summary_cols` and `summary_tid
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
 with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
 segments of delta varints. Version 10, §21: compact entry tuples. Version 11, below: keys of up to
-2047 bytes, which every index this build writes is and the only one it reads; whether there are summaries is `summary_cols`, and whether the
-build wrote a NARROW is the `LION_META_NARROW` bit of `order_flags`.)* Version 2 was the first that
+2047 bytes, which every index this build writes is and the only one it reads; whether there are summaries is `summary_cols`.)* Version 2 was the first that
 indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
 from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
 structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
@@ -2302,7 +2301,7 @@ Planner integration
     (`lion_index_column_posting_share()`). Split by entries, the three values of a status column
     beside a 2,000-value column got 0.14% of a 110 MB index's pages where they hold a tenth of it,
     and `status = 'val2'` - a million rows at every container key - was priced at 16 for 1 ms.
-    Since 2026-10-20 a dense set is weighed as the NARROW a build writes, a set's pages are its
+    Since 2026-10-20 a dense set is weighed as the NARROW the index writes, a set's pages are its
     share of its column's by the same bytes, and a walk's are the column's share of the directory
     by entries and of the container pages by bytes - "Dense sources" below.)*
   - **the merge's CPU** (`lion_merge_cpu_cost()`, "The units" below, since 2026-09-27): each
@@ -3113,19 +3112,16 @@ intersection at each of those seeks - 928 members, then 232, 77, 26 and on down.
 ARRAY's: two sorted lists of members merged, and a seek that descends to its key. Neither is what
 these sets are.
 
-- **What a container is.** A build or a VACUUM writes each container as the smallest that holds it
-  (`lion_container_optimize()`): an ARRAY of up to 256 k members, and past them a NARROW of width
-  k (§38), 512 k bytes - k the words a heap block takes, one at 58 rows a block. An insert grows an
-  ARRAY to 2,048 members and a BITSET past them. The merge ANDs two bitmaps in one pass of the
-  narrower's words whatever they hold (`lion_container_and_raw()`), and looks an ARRAY's members up
-  in a bitmap a bit each: the nine sets take 1.2 ms built and 8.8 ms inserted, and are priced at 620
-  and 4,742 units. The price follows the containers (`lion_set_bitmap_words()`). A set of more than
-  256 k members a container is taken as NARROWs where its pages say so: the bytes a container takes
-  of the set's posting pages (below) nearer by ratio to a NARROW's than to the ARRAY's or BITSET's
-  an insert grows - or the two sizes less than `LION_BUILT_SIZE_RATIO` (1.5) apart, where the pages
-  cannot tell and the set is taken as built, as a build and every VACUUM that rewrites a container
-  leave it. Two new
-  constants, from the containers of heaps of 58, 120 and 226 rows a block:
+- **What a container is.** A build, an insert that writes an item and a VACUUM write each
+  container as the smallest that holds it (`lion_container_optimize()`, §38): an ARRAY of up to
+  256 k members, and past them a NARROW of width k, 512 k bytes - k the words a heap block takes,
+  one at 58 rows a block; an ARRAY added to in place grows past that only by its slack, a few dozen
+  members. The merge ANDs two bitmaps in one pass of the narrower's words whatever they hold
+  (`lion_container_and_raw()`), and looks an ARRAY's members up in a bitmap a bit each: the nine
+  sets take 1.2 ms as NARROWs and 8.8 ms as ARRAYs of up to 2,048 members and BITSETs past them.
+  The price follows the containers (`lion_set_bitmap_words()`): a set of more than 256 k members a
+  container is taken as NARROWs, one of fewer as ARRAYs. Two new constants, from the containers of
+  heaps of 58, 120 and 226 rows a block:
 
   | constant | value | measured | what |
   |---|---|---|---|
@@ -3146,7 +3142,7 @@ these sets are.
   bytes it takes (`lion_set_bytes()`, `lion_column_set_pages()`), not by its rows: a bitmap
   container takes its bytes however many members it holds, and by rows the tenth of a two-value
   column was given a ninth of the pages its other value was where the two have as many. A
-  column's own share of the index weighs a dense set as the NARROW a build writes
+  column's own share of the index weighs a dense set as the NARROW it is
   (`lion_index_column_posting_share()`). The pages a walk of a column reads - a GROUP BY's, a
   sum's over its entries (§14), the inner column of two (§20) - are its share of the directory by
   entries and its share of the container pages by bytes (`lion_column_walk_pages()`). Split by
@@ -3235,11 +3231,11 @@ and summed ranges leave their negations unpriced; and a tsquery of many keys is 
 its time (269 units for 25 ms above, §17).
 
 `test/sql/costdense.sql` checks it on 60,000 rows indexed twice, built and grown by inserts: the
-containers each has, the same AND cheaper built than inserted, each in its own units - a member
-ANDed priced ten times as dear moves the inserted AND's price alone, a word of a bitmap the built
-one's alone, a step on the leaf the built one's - an IN list that drives the AND priced as the
-bitmap image it is built into, and a `<>` beside the AND subtracted, priced, and dearer where a
-seek leaves its page; every count against a sequential scan with the pushdown off.
+NARROWs each has, and the same AND over both priced in the same units - a member ANDed priced ten
+times as dear moves neither price, a word of a bitmap both, a step on the leaf both - an IN list
+that drives the AND priced as the bitmap image it is built into, and a `<>` beside the AND
+subtracted, priced, and dearer where a seek leaves its page; every count against a sequential scan
+with the pushdown off.
 
 ### Shapes rewritten to the node's counts (2026-10-11)
 
@@ -21443,12 +21439,14 @@ that the item has the bytes the width sizes before any of them reads it.
   ARRAY, then RUN, then NARROW, then BITSET. A NARROW is always smaller than a BITSET at 8K, so the
   build never writes a dense container as a BITSET any more; an ARRAY of up to 256 k members and a
   RUN of up to 128 k - 1 runs (a NARROW's bytes or fewer) stay what they are.
-  `lion_container_optimize_ext(c, false)` leaves NARROW out, which is what an index of an older
-  version gets. The build optimizes every container, so it writes NARROWs; VACUUM's re-optimize of
-  an item it changed allows one only in an index whose build wrote one (version 8, and since version
-  9 the meta page's `LION_META_NARROW`); inserts make none of anything else:
-  the promotion of a sparse segment's container key optimizes without NARROW, and an ARRAY that
-  reaches 2048 members becomes a BITSET as before.
+  Every container an index gets is optimized so: the build's, the one an insert writes as a new
+  item - a container key a sparse segment promotes, and a container it adds a member to that it
+  cannot take in place - and the one VACUUM's re-optimize writes for an item it changed. An insert
+  that adds the member in place ("Growth in place") keeps the kind, so an ARRAY grows past 256 k
+  members only by its slack, until the next insert that writes it anew makes it a NARROW: under
+  inserts, as at a build, a dense set's containers are NARROWs, not the ARRAYs of up to 2048
+  members and BITSETs past them that `add()` alone would leave. `lion_container_optimize_ext(c,
+  false)` leaves NARROW out; nothing in the write paths asks for that.
 - **Widening.** `add()` of a member at an offset of 64 k or more makes the NARROW the narrowest
   width that holds it (`lion_lo_width(lo)`), copying each block's k words to the start of its new
   ones; past `LION_NARROW_MAX_WIDTH` - an offset no heap tuple has, which only a made-up or damaged
@@ -21522,19 +21520,10 @@ image is, which is where the bytes are saved.
 ### Format version (lion.h, lion_meta.c)
 
 Version 8 is version 7 plus NARROW items, with or without summaries (`summary_cols` says, as in
-version 7), and its NARROW is the one above. A build writes it only when it emitted a NARROW
-(`lion_meta_record_narrow()`); VACUUM makes NARROWs only in an index that is already version 8;
-inserts make none. So an index of version 6 or 7 stays one until it is rebuilt, and stays readable
-by the builds before §38, which refuse 8 with the "not a valid lion index" ERROR and its REINDEX
-hint rather than reading a type 5 item as the damaged item it would be to them. Going back to such
-a build means a REINDEX of the version 8 indexes, under it, first.
-
-Version 9 (§13) re-encodes every sparse segment, so a build of it reads no older index, and every
-index it writes is 9. The rule above is kept, as a flag instead of a number: the build sets
-`LION_META_NARROW` in `order_flags` when it wrote a NARROW (`lion_meta_record_narrow()`), VACUUM
-makes NARROWs only in an index that has it (`LION_META_ALLOWS_NARROW()`), inserts make none, and
-`lion_index_verify()` reports a NARROW in an index without it, as it reported one in a version 6 or
-7 index.
+version 7), and its NARROW is the one above. Every version since reads and writes the same NARROW,
+and an index of this build's version may hold one wherever a container goes, whoever wrote it: the
+meta page records nothing about it. An older version is refused with the "not a valid lion index"
+ERROR and its REINDEX hint (lion.h).
 
 The first version's NARROWs had flags 0 and two words a block; this build reads flags 0 as no width
 it has, and refuses the item as above. No build of the first version was released, so nothing
@@ -21598,12 +21587,6 @@ bits a row became NARROW(2)s at 4.65, against GIN's 8.91) stands: those are NARR
 
 ### Not done
 
-- **Inserts make no NARROW of anything else** (they only widen one). A full ARRAY still becomes a
-  BITSET, and an index that grows by inserts keeps its BITSETs until VACUUM changes the item - in an
-  index whose build wrote a NARROW - or a REINDEX: an insert never pays for a re-optimize. An index
-  built on an empty table records no NARROW and stays so.
-- **An index whose build wrote no NARROW gets none without a REINDEX**, even where VACUUM could make
-  one.
 - **VACUUM narrows only the items it changed.** A NARROW whose widest members are deleted narrows
   when VACUUM takes them out, since it re-optimizes the item it rewrites; nothing narrows an item
   VACUUM has no dead rows in.
@@ -21632,14 +21615,18 @@ two-value columns are NARROWs of widths 1, 1, 2, 3, 3, 4 and 5; `lion_index_stat
 counts, GROUP BY, IN lists and `<>` over columns of several widths in one query, bitmap and plain
 scans, `lion_index_count()` and the count pushdown, every answer against a sequential scan; a
 table whose keys hold one band of offsets each, so that one index has NARROWs of four widths;
-inserts within a width, past it (UPDATEs that widen a NARROW from 1 to 4 a width at a time) and
-into new keys; DELETE and VACUUM that narrow back, make an ARRAY, and leave the BITSETs of an index
-whose build wrote no NARROW alone until a REINDEX; summaries, whose items widen and narrow back the same way; and
-`lion_index_verify()` throughout. `test/sql/bitset.sql` runs one set of queries over a table of
-136 rows a page (NARROW(3)), one of 226 (NARROW(4)) and an index without NARROWs of the same rows
-that inserts filled, whose dense containers are BITSETs: AND, OR, `<>`, GROUP BY, bitmap and plain
-scans, inserts that the bitmaps take in place and that grow ARRAYs into BITSETs, and an UPDATE, a
-DELETE and a VACUUM that shrink them. `test/sql/corrupt_items.sql` §7 writes widths 0, 6 and 2
+inserts within a width, past it (UPDATEs that widen a NARROW from 1 to 4 a width at a time), into
+new keys, where the ARRAY an insert writes past 256 k members is a NARROW and never a BITSET, and
+into the slots VACUUM emptied, three rounds of which leave the containers a build of the same rows
+writes, kind for kind and byte for byte; DELETE and VACUUM that narrow back, make an ARRAY, and
+narrow the NARROWs the inserts into an index built on an empty table wrote, as a REINDEX does;
+summaries, whose items widen and narrow back the same way; and `lion_index_verify()` throughout.
+`test/sql/bitset.sql` runs one set of queries over a table of 136 rows a page (NARROW(3)), one of
+226 (NARROW(4)) and the same rows inserted under an index built before them, whose inserts write
+the NARROW(4)s the build does: AND, OR, `<>`, GROUP BY, bitmap and plain scans, inserts that the
+bitmaps take in place and that make NARROWs of the ARRAYs they take past a NARROW's size, and an
+UPDATE, a DELETE and a VACUUM that shrink them; no index holds a BITSET, and the ones the set
+algebra makes of unions are its own. `test/sql/corrupt_items.sql` §6 writes widths 0, 6 and 2
 into a NARROW of width 1: readers refuse 0 and 6, verify() reports them, and width 2, which the
 item has no bytes for, is refused by both as an item too short.
 
@@ -21654,20 +21641,26 @@ them instead of 240,000; `summary_scatter.sql` keeps narrow rows and takes a lar
 permutation; `fkjoin_parallel.sql` sets `pg_lion.parallel_range_keys` so that its copies are still
 one chunk and three; `range_cost.sql` runs its 64 kB cases on `rcostw`, rcost's rows at some 25 a
 page over 63 container keys, and fills `rcostn`'s memory with 39 container keys of v = 0 NARROWs of
-width 3 where 15 of BITSETs did. The tests that grow a posting set until a leaf splits lost their
-splits, since a dense set is NARROWs of a few to a leaf that an insert within their width does not
-grow: `count_split_race.spec`, `verify_concurrent.spec`'s `vp` and the split case of
-`test/recovery/run.sh`'s phase 3 create their index before the rows, so that the inserts make it, of
-ARRAYs and BITSETs as before, and `posting_split_repair.spec` spreads the rows that were one dense
-key over 97 keys of small ARRAYs, so that its build writes no NARROW and VACUUM's filtering still
-grows a RUN into an ARRAY larger than the leaf's spare bytes, where it would make a NARROW of width
-4 that fits them. The other expected changes follow from smaller containers and change no answer: a
-switch to the empty copy one key later (`fkjoin_switch.sql`), a range summed from its complement
-(`rangesum.sql`) or with another mix of summaries (`summary.sql`), a union probed at keys where it
-was built (`unionprobe.sql`), posting trees on fewer blocks (`verify.sql`, `corrupt_walk.sql`,
-`gettuple_pause.spec`), and the stats of NARROWs where there were BITSETs (`scanand.sql`,
-`basic.sql`). The first version's changes to `treeprobe.sql` and `fkjoin_adaptive.sql` stand, and so
-does `count_split_race.spec`'s wider pad.
+width 3 where 15 of BITSETs did. The tests that grow a posting set until a leaf splits need leaves
+their inserts fill, and a dense set is NARROWs, a few to a leaf, that an insert within their width
+does not grow, whether the build or the inserts wrote them. Most build their index over their rows
+at `posting_fillfactor = 10`, which gives every container of more than some 800 bytes a leaf of its
+own, and then insert rows that go onto the set's last leaf, or into heap slots that VACUUM emptied
+in container keys a leaf's range already covers, until it splits: `flat_trees.sql`, `insert.sql`'s
+`lion_mid`, `walrecords.sql`'s `lion_wl`, `count_root_pushdown_race.spec`,
+`vacuum_retry_pushdown.spec`, `vacuum_regrow_pushdown.spec`, `verify_concurrent.spec`,
+`verify_incomplete_split.spec`, `posting_split_repair.spec`, and phases 1d and 1g and the push-down
+case of phase 3 in `test/recovery/run.sh`. `count_split_race.spec` and the split case of
+`test/recovery/run.sh`'s phase 3 build full leaves (`posting_fillfactor = 100`) of ARRAYs of 15 rows
+a page, which the inserts make NARROWs of twice their bytes. `posting_split_repair.spec` keeps key
+1's RUNs of five rows in sixty between 97 other keys, so that VACUUM's filtering grows a RUN into an
+ARRAY larger than the leaf's spare bytes. The other expected changes follow from smaller containers
+and change no answer: a switch to the empty copy one key later (`fkjoin_switch.sql`), a range summed
+from its complement (`rangesum.sql`) or with another mix of summaries (`summary.sql`), a union
+probed at keys where it was built (`unionprobe.sql`), posting trees on fewer blocks (`verify.sql`,
+`corrupt_walk.sql`, `gettuple_pause.spec`), and the stats of NARROWs where there were BITSETs
+(`scanand.sql`, `basic.sql`). The first version's changes to `treeprobe.sql` and
+`fkjoin_adaptive.sql` stand, and so does `count_split_race.spec`'s wider pad.
 
 ## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
 

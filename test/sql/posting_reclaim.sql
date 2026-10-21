@@ -8,15 +8,20 @@ CREATE EXTENSION IF NOT EXISTS pg_lion;
 
 /*
  * Four keys, every row of the table in one of them.  Inserted after the
- * index exists, 60,000 rows to a key fill some seventeen leaves of it, half
- * full as appends leave them, and each key's set is a tree of one internal
- * level.  pr_ref holds the same rows and no index: it is what every answer is
- * compared with.
+ * index exists, 190,000 rows to a key fill some eighteen leaves of it, three
+ * NARROW items of 2 kB to a leaf (DESIGN.md §38), and each key's set is a
+ * tree of one internal level.  pr_ref holds the same rows and no index: it
+ * is what every answer is compared with.
+ *
+ * Each VACUUM after a DELETE is a VACUUM (FREEZE): a plain one leaves the
+ * dead rows of a heap page it cannot have the cleanup lock of at once (one
+ * the checkpointer is writing out, say) to the next VACUUM, and the leaf that
+ * holds their TIDs with them.  An aggressive VACUUM waits for the lock.
  */
 CREATE TABLE pr (id int, k int) WITH (autovacuum_enabled = off);
 CREATE TABLE pr_ref (id int, k int) WITH (autovacuum_enabled = off);
 CREATE INDEX pr_k ON pr USING lion (k);
-INSERT INTO pr SELECT g, g % 4 FROM generate_series(1, 240000) g;
+INSERT INTO pr SELECT g, g % 4 FROM generate_series(1, 760000) g;
 INSERT INTO pr_ref SELECT * FROM pr;
 
 /* q's answer on pr through the index, and on pr_ref, and whether they agree. */
@@ -61,9 +66,9 @@ SELECT * FROM pr_check();
 --    that held them, which are each set's lowest, and takes every one of them
 --    out: each has a right sibling whose downlink is the next one on the
 --    root, the set's only internal page.
-DELETE FROM pr WHERE id <= 180000;
-DELETE FROM pr_ref WHERE id <= 180000;
-VACUUM pr;
+DELETE FROM pr WHERE id <= 570000;
+DELETE FROM pr_ref WHERE id <= 570000;
+VACUUM (FREEZE) pr;
 SELECT container_pages AS leaves, posting_internal_pages, max_posting_height,
 	   deleted_pages
   FROM lion_index_stats('pr_k');
@@ -76,8 +81,8 @@ SELECT * FROM pr_check();
 --    does, although it has no row to remove (DESIGN.md §18, "Reuse").
 SELECT txid_current() > 0 AS xid;
 VACUUM pr;
-INSERT INTO pr SELECT g, g % 4 FROM generate_series(240001, 420000) g;
-INSERT INTO pr_ref SELECT g, g % 4 FROM generate_series(240001, 420000) g;
+INSERT INTO pr SELECT g, g % 4 FROM generate_series(760001, 1330000) g;
+INSERT INTO pr_ref SELECT g, g % 4 FROM generate_series(760001, 1330000) g;
 SELECT pg_relation_size('pr_k') / 8192 <= :blocks AS not_grown,
 	   deleted_pages < 40 AS reused
   FROM lion_index_stats('pr_k');
@@ -87,15 +92,15 @@ SELECT * FROM pr_check();
 -- 3. A run in the middle of every key goes: its leaves leave the set between
 --    two that stay, and their key range goes to the leaf right of them.  Rows
 --    inserted into that range again are found.
-DELETE FROM pr WHERE id BETWEEN 250000 AND 330000;
-DELETE FROM pr_ref WHERE id BETWEEN 250000 AND 330000;
-VACUUM pr;
+DELETE FROM pr WHERE id BETWEEN 790000 AND 1045000;
+DELETE FROM pr_ref WHERE id BETWEEN 790000 AND 1045000;
+VACUUM (FREEZE) pr;
 SELECT deleted_pages >= 20 AS unlinked FROM lion_index_stats('pr_k');
 SELECT lion_index_verify('pr_k', true);
 SELECT * FROM pr_check();
 -- The heap's free space puts these rows at the TIDs the deleted ones had.
-INSERT INTO pr SELECT g, g % 4 FROM generate_series(500001, 510000) g;
-INSERT INTO pr_ref SELECT g, g % 4 FROM generate_series(500001, 510000) g;
+INSERT INTO pr SELECT g, g % 4 FROM generate_series(1500001, 1510000) g;
+INSERT INTO pr_ref SELECT g, g % 4 FROM generate_series(1500001, 1510000) g;
 SELECT lion_index_verify('pr_k', true);
 SELECT * FROM pr_check();
 
@@ -104,11 +109,11 @@ SELECT * FROM pr_check();
 --    between that VACUUM empties leave the chain.
 CREATE TABLE pf (id int, k int) WITH (autovacuum_enabled = off);
 CREATE INDEX pf_k ON pf USING lion (k);
-INSERT INTO pf SELECT g, g % 4 FROM generate_series(1, 60000) g;
+INSERT INTO pf SELECT g, g % 4 FROM generate_series(1, 180000) g;
 SELECT container_pages AS leaves, posting_internal_pages
   FROM lion_index_stats('pf_k');
-DELETE FROM pf WHERE id BETWEEN 15000 AND 45000;
-VACUUM pf;
+DELETE FROM pf WHERE id BETWEEN 45000 AND 135000;
+VACUUM (FREEZE) pf;
 SELECT container_pages AS leaves, posting_internal_pages,
 	   deleted_pages > 0 AS unlinked
   FROM lion_index_stats('pf_k');
@@ -123,7 +128,7 @@ RESET pg_lion.enable_count_pushdown;
 --    is taken out of it first.
 DELETE FROM pr WHERE k = 0;
 DELETE FROM pr_ref WHERE k = 0;
-VACUUM pr;
+VACUUM (FREEZE) pr;
 SELECT lion_index_verify('pr_k', true);
 SELECT * FROM pr_check();
 

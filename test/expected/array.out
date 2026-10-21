@@ -841,8 +841,8 @@ SELECT lion_arrcmp($$SELECT id FROM lion_arr_res WHERE a IS NULL AND id > 13990$
 /*
  * VACUUM performs the same transition: each key here is clustered, so the
  * build gives it a couple of run containers that fit in the entry tuple;
- * deleting every other row turns each of them into a bitset, and the entry no
- * longer fits inline, so ambulkdelete spills it while rewriting it
+ * deleting every other row turns each of them into a NARROW larger than the
+ * index's inline_limit, so ambulkdelete spills the entry while rewriting it
  * (test/sql/vacuum.sql does the same thing to ordinary keys).
  */
 CREATE TABLE lion_arr_res2 (id int NOT NULL, a int[]);
@@ -851,7 +851,7 @@ SELECT i, CASE WHEN i <= 10000 THEN '{}'::int[]
 			   WHEN i <= 20000 THEN NULL
 			   ELSE '{7}'::int[] END
   FROM generate_series(1, 30000) i;
-CREATE INDEX lion_arr_res2_a ON lion_arr_res2 USING lion (a);
+CREATE INDEX lion_arr_res2_a ON lion_arr_res2 USING lion (a) WITH (inline_limit = 1024);
 -- three INLINE entries: EMPTY, NULL and key 7, runs of clustered TIDs
 SELECT entries, inline_entries, run_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
@@ -864,12 +864,12 @@ SELECT entries, inline_entries, run_containers, null_tids, empty_tids,
 DELETE FROM lion_arr_res2 WHERE id % 2 = 0;
 VACUUM (FREEZE) lion_arr_res2;
 -- every entry has spilled during the VACUUM, reserved ones included
-SELECT entries, inline_entries, bitset_containers, null_tids, empty_tids,
+SELECT entries, inline_entries, narrow_containers, null_tids, empty_tids,
 	   container_pages > 0 AS spilled
   FROM lion_index_stats('lion_arr_res2_a');
- entries | inline_entries | bitset_containers | null_tids | empty_tids | spilled 
+ entries | inline_entries | narrow_containers | null_tids | empty_tids | spilled 
 ---------+----------------+-------------------+-----------+------------+---------
-       3 |              0 |                 3 |      5000 |       5000 | t
+       3 |              0 |                 4 |      5000 |       5000 | t
 (1 row)
 
 SELECT lion_index_verify('lion_arr_res2_a', true);

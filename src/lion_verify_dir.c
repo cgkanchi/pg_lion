@@ -1045,8 +1045,7 @@ lion_verify_meta(LionVerifyState *vs)
 					RelationGetRelationName(vs->index), meta->wal_mode,
 					LION_WAL_MODE_GENERIC, LION_WAL_MODE_RMGR);
 	if ((meta->order_flags & ~(uint32) (LION_META_ORDER_RECORDED |
-										LION_META_POSITIONS |
-										LION_META_NARROW)) != 0)
+										LION_META_POSITIONS)) != 0)
 		lion_corrupt("lion index \"%s\": meta page has order flags %08X, with bits the format does not have",
 					RelationGetRelationName(vs->index), meta->order_flags);
 
@@ -1075,7 +1074,6 @@ lion_verify_meta(LionVerifyState *vs)
 
 	vs->root = meta->root;
 	vs->height = meta->height;
-	vs->allows_narrow = LION_META_ALLOWS_NARROW(meta);
 	vs->inline_limit = meta->inline_limit;
 
 	UnlockReleaseBuffer(buf);

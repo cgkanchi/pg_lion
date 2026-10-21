@@ -406,17 +406,6 @@ lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix)
 	meta->order_ident = lion_order_ident(ix);
 }
 
-/*
- * Record on a meta page image whether the build wrote a NARROW item, which is
- * what lets VACUUM make NARROWs of the items it rewrites (§38).
- */
-void
-lion_meta_record_narrow(LionMetaPageData *meta, bool narrow)
-{
-	if (narrow)
-		meta->order_flags |= LION_META_NARROW;
-}
-
 void
 lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 						   uint32 bucket_tids)

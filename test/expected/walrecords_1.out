@@ -127,17 +127,21 @@ SELECT lion_index_verify('lion_wr_k', true);
  * What is pinned is the shape: the delta operation appears, and the records
  * that use it stay small.  How many there are depends on page fill, and a
  * rewrite that really does change most of the item (an ARRAY that turns into
- * a BITSET) still goes in whole, which is why the bound is on the records
+ * a NARROW) still goes in whole, which is why the bound is on the records
  * that carry a delta rather than on every ITEM_REPLACE.  A full-page image
  * is not part of what the record says, so it is subtracted: the first touch
  * of a page after a checkpoint carries one whatever the operation is.
+ * Sixteen keys keep every container an ARRAY, of some 900 members at most,
+ * which takes members in place until its slack is gone; four keys would make
+ * NARROWs (DESIGN.md §38), which take every member in place, and no
+ * container would be rewritten.
  */
 CREATE TABLE lion_wd (id int, k int);
 CREATE INDEX lion_wd_k ON lion_wd USING lion (k) WITH (inline_limit = 64);
-INSERT INTO lion_wd SELECT i, i % 4 FROM generate_series(1, 20000) i;
+INSERT INTO lion_wd SELECT i, i % 16 FROM generate_series(1, 20000) i;
 CHECKPOINT;
 SELECT pg_current_wal_lsn() AS lsn2 \gset
-INSERT INTO lion_wd SELECT i, i % 4 FROM generate_series(20001, 20400) i;
+INSERT INTO lion_wd SELECT i, i % 16 FROM generate_series(20001, 21600) i;
 SELECT pg_switch_wal() IS NOT NULL AS wal_switched_again;
  wal_switched_again 
 --------------------
@@ -197,16 +201,16 @@ SELECT lion_index_verify('lion_wi_k', true);
 
 /*
  * DOWNLINK (DESIGN.md §22).  A posting set has no internal level while it has
- * at most 16 leaves, and the sets above have fewer.  The split that makes a
- * 17th pushes the head down into a root over all of them, and every split
- * after that posts its new leaf's downlink there.  Wide rows put fewer rows
- * on a heap page, so that a leaf holds one dense container; the rows that
- * grow the sets past 16 leaves go in before the WAL is read, which is kept to
- * the splits after that.
+ * at most 16 leaves, and the sets above have fewer; past that it is a tree,
+ * and every split of a leaf posts its new leaf's downlink on the level above.
+ * The build makes the trees: it fills a leaf to posting_fillfactor, so at 10
+ * every container is a leaf of its own, and each of two keys over 1,231 heap
+ * pages has twenty.  The rows inserted after it fill the last leaves and split
+ * them, and the WAL read is kept to those inserts.
  */
 CREATE TABLE lion_wl (id int, k int, pad char(80));
-CREATE INDEX lion_wl_k ON lion_wl USING lion (k);
 INSERT INTO lion_wl SELECT i, i % 2, 'x' FROM generate_series(1, 80000) i;
+CREATE INDEX lion_wl_k ON lion_wl USING lion (k) WITH (posting_fillfactor = 10);
 SELECT max_posting_height, posting_internal_pages
   FROM lion_index_stats('lion_wl_k');
  max_posting_height | posting_internal_pages 
@@ -215,7 +219,7 @@ SELECT max_posting_height, posting_internal_pages
 (1 row)
 
 SELECT pg_current_wal_lsn() AS lsn6 \gset
-INSERT INTO lion_wl SELECT i, i % 2, 'x' FROM generate_series(80001, 90000) i;
+INSERT INTO lion_wl SELECT i, i % 2, 'x' FROM generate_series(80001, 160000) i;
 SELECT pg_switch_wal() IS NOT NULL AS wal_switched_four_times;
  wal_switched_four_times 
 -------------------------

@@ -233,11 +233,12 @@ extern void lion_container_append_sorted(LionContainer *c, uint16 lo);
  * tie going to the first of them (DESIGN.md §3, §38).  The NARROW considered
  * is the narrowest that holds every member (lion_container_min_width()),
  * when that is at most LION_NARROW_MAX_WIDTH, which is every set of heap
- * tuples: a BITSET is then never the smallest.  lion_container_optimize_ext()
- * with allow_narrow false leaves NARROW out, which is the choice for an index
- * whose format predates it (DESIGN.md §38, "Format"): what it makes is what
- * optimize() made before §38, and a NARROW handed to it comes out something
- * else.  The result is a function of the members and of allow_narrow alone.
+ * tuples: a BITSET is then never the smallest.  Every container an index
+ * gets is chosen so - by the build, by an insert that writes an item anew and
+ * by VACUUM's rewrite of an item it filtered.  lion_container_optimize_ext()
+ * with allow_narrow false leaves NARROW out, so that a NARROW handed to it
+ * comes out something else; nothing in the index's write paths asks for that.
+ * The result is a function of the members and of allow_narrow alone.
  */
 extern void lion_container_optimize(LionContainer *c);
 extern void lion_container_optimize_ext(LionContainer *c, bool allow_narrow);
