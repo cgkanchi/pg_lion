@@ -15714,10 +15714,15 @@ for a UNION the bitset images of its window (made on first use; up to 4 MB at th
 for a WINDOW two images per container of its window, the rest's and the walk's (up to 4 MB at the
 floor, `work_mem` above it), and the rest's one stream; and a long list's values, sorted. A
 posting set of any size is STREAMED container by container - a 5M-row entry is never
-materialized - and a walk of any width holds one entry's stream at a time. Memory lives in a
-per-scan context reset by `amrescan`, and a walk's per-entry cursors in a per-entry context reset
-before the next entry, so a nested-loop inner scan rescanned a million times and a range over a
-million entries both run in constant memory.
+materialized - and a walk of any width holds one entry's stream at a time. Every `amgettuple` call
+runs in a per-scan context that `amrescan` resets, and every `amgetbitmap` call in one of its own,
+reset as the call returns - not in the context the executor calls them in, its per-query one, which
+lasts as long as the query - so that what a call allocates as it goes, such as the buffer a
+posting-set cursor takes for the first sparse segment it meets, goes with the scan or with the
+call. A walk's leaf image and range ends go with the walk, and its per-entry cursors are in a
+per-entry context reset before the next entry. So a nested-loop inner scan rescanned a million
+times, plain or bitmap, and a range over a million entries both run in constant memory
+(`test/sql/indexscan.sql` §12).
 
 ### 29.5 Pins, and what a scan paused between calls may hold
 
@@ -16499,6 +16504,22 @@ one neqsel() reads. That is what lion's estimates take:
   to hold the run's equality, so that two values the comparison calls equal are equal to the
   operator. A type without one keeps core's estimate, and so does a run of one value, which core
   estimates exactly.
+- **Past every row.** The share stands while the frequencies add up to no more than the rows that
+  are not NULL. A value that is not a most common one is taken at the average of the others, as if
+  it were in the column, and a run of more such values than the column has - values mostly in no
+  row, `k NOT IN` a list of another table's keys - adds up to more than every row: 2,400 values of
+  a column half NULL whose 2,000 values have 25 rows each come to 60% of the rows, against the 50%
+  not NULL. There the values are taken as independent instead, as scalararraysel() takes `<> ALL`
+  once its sum goes past every row: the rows not NULL, times the product over the values of the
+  share of them each leaves, `1 - freq(v) / (1 - nullfrac)`, so that the NULLs are still taken
+  away once. That run keeps 50,000 rows and is estimated at 15,055; the share clamped to zero
+  would be one row, and core's product - of `1 - freq(v) - nullfrac` a value - is one row too. A
+  table never analyzed is no different: each value is taken at one over the default count of
+  distinct values, 200, with no NULL, so a run of more than 200 is past every row, and the
+  estimate is core's own, below the 200 and past it. Up to the rows not NULL means to the rounding
+  of the statistics' float4 frequencies: a run of every value a column has, all of them most
+  common ones, can come out past those rows by parts in 10^8, and up to 10^-6 past them
+  (`LION_NEQ_RUN_SLACK`) the share is zero - every row is left out.
 - **Where.** `lion_canonical_clause_list()` is the form lion's estimates take a list of clauses in:
   each OR of equalities as its IN list ("An OR of equalities is its IN list", above), then each run
   as its exclusion; `lion_canonical_rel_list()` then takes a relation's tests of whether a
@@ -17455,7 +17476,10 @@ INLINE entries, sparse segments and posting trees walked in WINDOWs, one window 
 2026-10-19 a dropped one with the rows its recheck removed - a dirty heap and after VACUUM), the
 plain scan's buffers within twice the bitmap scan's, the window's
 memory, and three plan choices; index-only scans of no-column queries (a column's walk, a
-partial index, a multi-key column's bitmap), clean and dirty. Existing tests whose helpers exist to
+partial index, a multi-key column's bitmap), clean and dirty; and nested loops whose inner plain or
+bitmap scan is rescanned 5,000 times through a cursor - keys whose sets meet a sparse segment after
+their first container, a list of them, ranges over a column with summaries and without - with the
+executor's memory of the cursor flat (§12). Existing tests whose helpers exist to
 exercise the BITMAP path, or to force the count pushdown by disabling every other scan, now disable
 plain index scans as well; the plan pins that changed are one-row multi-key lookups, which are now
 plain Index Scans. Isolation: `gettuple_pause.spec` (cursors - the pause the executor really makes,
@@ -17595,7 +17619,11 @@ twice their rows, LionOrdered's with the correction off too. One value, one valu
 columns of a value each, a NOT IN holding NULL, `<> ALL` of no value, a generic plan's Params and a
 table without a lion index keep core's estimate exactly; three spellings of one citext value are
 counted once; and every answer - the count, the rows, a GROUP BY, a page - is the sequential
-scan's. No other expected output moved on 16, 17, 18 or 19.
+scan's. No other expected output moved on 16, 17, 18 or 19. A run past every row: a NOT IN of
+2,400 values of the integer column, its even numbers, which it has none of, the same with one in
+twelve of them in it, and the first as `<>`, are within four times their rows at the scan and at a
+join above it, where core's estimate is one row; on a table never analyzed, a NOT IN of 301 values
+and the same as `<>` are estimated as core estimates them, in the thousands of rows.
 
 `test/sql/scanand.sql` (2026-09-28, §29.11 "The AND, as the count makes it"), on 120,000 rows in 60
 hidden groups that take turns over the heap, two dense columns first in the index and

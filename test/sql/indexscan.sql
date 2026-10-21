@@ -676,6 +676,103 @@ RESET pg_lion.scan_window_floor;
 DROP TABLE lis_w, lis_w_q;
 DROP FUNCTION lion_bufs(text, boolean);
 
+-- ---------- 12. an inner side rescanned thousands of times, in flat memory ----------
+-- A nested loop rescans its inner lion scan for every outer row, and the
+-- executor calls the scan in its per-query context, which lasts as long as
+-- the query: what a call leaves behind has to go with the scan's own memory,
+-- which the rescan resets, or with the call.  Each nested loop below runs
+-- through a cursor for 5,000 rescans of a plain or a bitmap scan - of keys
+-- whose sets meet a sparse segment after their first container, a list of
+-- two of them, a range over a column with summaries and over one without -
+-- and the executor's memory of the cursor does not grow.
+/*
+ * The executor's memory of the cursor named portal: the contexts named
+ * ExecutorState one level below the portal's own.  The statement that runs
+ * the cursor has one at that level too, which does not grow meanwhile.
+ */
+CREATE FUNCTION lion_executor_bytes(portal text) RETURNS bigint
+LANGUAGE sql AS $$
+SELECT sum(total_bytes)::bigint FROM pg_backend_memory_contexts
+ WHERE name = 'ExecutorState'
+   AND level = (SELECT level + 1 FROM pg_backend_memory_contexts
+				 WHERE name = 'PortalContext' AND ident = portal) $$;
+/*
+ * lion_rescans() opens q, a nested loop over lis_rs_o whose inner side is a
+ * lion scan of the given kind (plain or bitmap), as a cursor, and reports
+ * the scan and whether the executor's memory of the cursor grew from its
+ * 500th row to its 5500th - every outer row of them a rescan.
+ */
+CREATE FUNCTION lion_rescans(q text, kind text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used text := NULL;
+	c refcursor := 'lion_rescans';
+	before bigint;
+	grown bigint;
+BEGIN
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_material', 'off', true);
+	PERFORM set_config('enable_memoize', 'off', true);
+	PERFORM set_config(CASE kind WHEN 'plain' THEN 'enable_bitmapscan'
+						   ELSE 'enable_indexscan' END, 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) DECLARE x NO SCROLL CURSOR FOR ' || q LOOP
+		IF ln ~ '(Index Scan using|Bitmap Index Scan on) lis' AND used IS NULL THEN
+			used := substring(ln from '((Index Scan using|Bitmap Index Scan on) \S+)');
+		END IF;
+	END LOOP;
+	OPEN c NO SCROLL FOR EXECUTE q;
+	MOVE FORWARD 500 IN c;
+	before := lion_executor_bytes('lion_rescans');
+	MOVE FORWARD 5000 IN c;
+	grown := lion_executor_bytes('lion_rescans') - before;
+	CLOSE c;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_material', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN format('%s: %s', coalesce(used, 'no lion scan'),
+				  CASE WHEN grown < 32 * 1024 THEN 'flat'
+					   ELSE 'grew by ' || grown || ' bytes' END);
+END $$;
+CREATE TABLE lis_rs_o (x int);
+INSERT INTO lis_rs_o SELECT g % 50 FROM generate_series(1, 10000) g;
+ANALYZE lis_rs_o;
+-- Each of 50 keys: twenty rows in the first container, then one in each of
+-- ten more - a container is 64 heap blocks, 1400 rows at fillfactor 10 -
+-- a sparse segment after the first container of every key's set.
+CREATE TABLE lis_rs (id int, k int) WITH (fillfactor = 10);
+INSERT INTO lis_rs
+SELECT g, CASE WHEN g <= 1000 THEN g % 50 WHEN g % 28 = 0 THEN (g / 28) % 50 END
+  FROM generate_series(1, 15000) g;
+CREATE INDEX lis_rs_k ON lis_rs USING lion (k);
+VACUUM ANALYZE lis_rs;
+SELECT sparse_segments >= 50 AS sparse FROM lion_index_stats('lis_rs_k');
+-- ... and 200 keys of a hundred rows over summaries (DESIGN.md §32)
+CREATE TABLE lis_rsb (id int, k int);
+INSERT INTO lis_rsb SELECT g, g % 200 FROM generate_series(1, 20000) g;
+CREATE INDEX lis_rsb_k ON lis_rsb USING lion (k) WITH (summaries = on);
+VACUUM ANALYZE lis_rsb;
+SELECT summary_entries > 0 AS summarized FROM lion_index_stats('lis_rsb_k');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rs WHERE k = o.x) s', 'plain');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rs WHERE k IN (o.x, o.x + 1)) s', 'plain');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rsb WHERE k BETWEEN o.x AND o.x + 2) s', 'plain');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rs WHERE k = o.x) s', 'bitmap');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rs WHERE k BETWEEN o.x AND o.x + 1) s', 'bitmap');
+SELECT lion_rescans('SELECT s.* FROM lis_rs_o o, LATERAL (SELECT count(*) FROM lis_rsb WHERE k BETWEEN o.x AND o.x + 2) s', 'bitmap');
+-- the answers are the sequential scan's
+SELECT lion_iq('SELECT o.x, s.n FROM lis_rs_o o, LATERAL (SELECT count(*) n FROM lis_rs WHERE k IN (o.x, o.x + 1)) s WHERE o.x < 3');
+DROP TABLE lis_rs_o, lis_rs, lis_rsb;
+DROP FUNCTION lion_rescans(text, text);
+DROP FUNCTION lion_executor_bytes(text);
+
 DROP TABLE lis, lis_outer, lis_big, lis_f, lis_ex, lis_ex2, lis_ex3, lis_ex4;
 DROP FUNCTION lion_iq(text);
 DROP FUNCTION lion_ir(text);
