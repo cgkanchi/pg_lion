@@ -52,6 +52,13 @@
  * time.  Anything unexpected ends the attempt without an ERROR, leaving the
  * leaf as it is; lion_index_verify() is what reports damage.
  *
+ * Every page is read through the buffer access strategy VACUUM gives it
+ * (info->strategy), as its walk of the set reads them (lion_vacuum.c,
+ * lion_vac_read()).  VACUUM takes a set's empty leaves out after it has
+ * walked the whole set, and a leaf read again without the ring - the one
+ * taken out, its left neighbour, its parent - would stay in shared buffers,
+ * one for every leaf a VACUUM of a key's oldest rows takes out.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -70,7 +77,7 @@
  */
 static Buffer
 lion_pdel_leaf(Relation index, BlockNumber blk, uint32 hash, BlockNumber head,
-			   int mode)
+			   int mode, BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -79,7 +86,7 @@ lion_pdel_leaf(Relation index, BlockNumber blk, uint32 hash, BlockNumber head,
 		blk >= RelationGetNumberOfBlocks(index))
 		return InvalidBuffer;
 
-	buf = ReadBuffer(index, blk);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
 	LockBuffer(buf, mode);
 	page = BufferGetPage(buf);
 	if (!lion_page_owns_entry(page, hash, head) ||
@@ -98,7 +105,8 @@ lion_pdel_leaf(Relation index, BlockNumber blk, uint32 hash, BlockNumber head,
  */
 static BlockNumber
 lion_pdel_left_of(Relation index, uint32 hash, BlockNumber head,
-				  BlockNumber start, BlockNumber blk, bool *found)
+				  BlockNumber start, BlockNumber blk, bool *found,
+				  BufferAccessStrategy strategy)
 {
 	BlockNumber cur = start;
 	LionRightWalk walk;
@@ -114,7 +122,7 @@ lion_pdel_left_of(Relation index, uint32 hash, BlockNumber head,
 	for (;;)
 	{
 		Buffer		buf = lion_pdel_leaf(index, cur, hash, head,
-										 BUFFER_LOCK_SHARE);
+										 BUFFER_LOCK_SHARE, strategy);
 		BlockNumber next;
 
 		if (!BufferIsValid(buf))
@@ -142,12 +150,14 @@ lion_pdel_left_of(Relation index, uint32 hash, BlockNumber head,
  */
 static BlockNumber
 lion_pdel_find_parent(Relation index, uint32 hash, BlockNumber head,
-					  uint32 routekey, BlockNumber blk, OffsetNumber *offp)
+					  uint32 routekey, BlockNumber blk, OffsetNumber *offp,
+					  BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	LionRightWalk walk;
 
-	buf = lion_posting_search_level(index, head, routekey, 1, false);
+	buf = lion_posting_search_level_ext(index, head, routekey, 1, false,
+										strategy);
 	if (!BufferIsValid(buf))
 		return InvalidBlockNumber;
 
@@ -180,7 +190,8 @@ lion_pdel_find_parent(Relation index, uint32 hash, BlockNumber head,
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
 
-		buf = ReadBuffer(index, next);
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, next, RBM_NORMAL,
+								 strategy);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		if (!lion_page_owns_entry(BufferGetPage(buf), hash, head))
 			break;
@@ -192,7 +203,8 @@ lion_pdel_find_parent(Relation index, uint32 hash, BlockNumber head,
 
 bool
 lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
-						 BlockNumber hint, BlockNumber blk)
+						 BlockNumber hint, BlockNumber blk,
+						 BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	bool		flat;
@@ -216,7 +228,7 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 		return false;
 
 	/* Is the set flat - its head its first leaf - or a tree? */
-	buf = ReadBuffer(index, head);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, head, RBM_NORMAL, strategy);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	if (!lion_page_owns_entry(BufferGetPage(buf), hash, head))
 	{
@@ -235,7 +247,8 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 	 */
 	if (BlockNumberIsValid(hint))
 	{
-		buf = lion_pdel_leaf(index, hint, hash, head, BUFFER_LOCK_SHARE);
+		buf = lion_pdel_leaf(index, hint, hash, head, BUFFER_LOCK_SHARE,
+							 strategy);
 		if (BufferIsValid(buf))
 		{
 			start = hint;
@@ -243,10 +256,10 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 		}
 	}
 	if (!BlockNumberIsValid(start))
-		start = flat ? head : lion_posting_leftmost_leaf(index, hash, head);
+		start = flat ? head : lion_posting_leftmost_leaf(index, head, strategy);
 	if (!BlockNumberIsValid(start))
 		return false;
-	lf = lion_pdel_left_of(index, hash, head, start, blk, &found);
+	lf = lion_pdel_left_of(index, hash, head, start, blk, &found, strategy);
 	if (!found || (flat && !BlockNumberIsValid(lf)))
 		return false;
 
@@ -259,14 +272,16 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 	{
 		if (BlockNumberIsValid(lf))
 		{
-			buf = lion_pdel_leaf(index, lf, hash, head, BUFFER_LOCK_SHARE);
+			buf = lion_pdel_leaf(index, lf, hash, head, BUFFER_LOCK_SHARE,
+								 strategy);
 			if (!BufferIsValid(buf))
 				return false;
 			if (PageGetMaxOffsetNumber(BufferGetPage(buf)) >= FirstOffsetNumber)
 				routekey = LionPageGetOpaque(BufferGetPage(buf))->maxckey;
 			UnlockReleaseBuffer(buf);
 		}
-		pblk = lion_pdel_find_parent(index, hash, head, routekey, blk, &poff);
+		pblk = lion_pdel_find_parent(index, hash, head, routekey, blk, &poff,
+									 strategy);
 		if (!BlockNumberIsValid(pblk))
 			return false;
 	}
@@ -274,7 +289,8 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 	/* Left to right, then the parent; every check made again. */
 	if (BlockNumberIsValid(lf))
 	{
-		lfbuf = lion_pdel_leaf(index, lf, hash, head, BUFFER_LOCK_EXCLUSIVE);
+		lfbuf = lion_pdel_leaf(index, lf, hash, head, BUFFER_LOCK_EXCLUSIVE,
+							   strategy);
 		if (!BufferIsValid(lfbuf))
 			return false;
 		if (LionPageGetOpaque(BufferGetPage(lfbuf))->rightlink != blk ||
@@ -285,7 +301,8 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 		}
 	}
 
-	lbuf = lion_pdel_leaf(index, blk, hash, head, BUFFER_LOCK_EXCLUSIVE);
+	lbuf = lion_pdel_leaf(index, blk, hash, head, BUFFER_LOCK_EXCLUSIVE,
+						  strategy);
 	if (!BufferIsValid(lbuf))
 	{
 		if (BufferIsValid(lfbuf))
@@ -308,7 +325,8 @@ lion_posting_unlink_leaf(Relation index, uint32 hash, BlockNumber head,
 		Page		ppage;
 		OffsetNumber maxoff;
 
-		pbuf = ReadBuffer(index, pblk);
+		pbuf = ReadBufferExtended(index, MAIN_FORKNUM, pblk, RBM_NORMAL,
+								  strategy);
 		LockBuffer(pbuf, BUFFER_LOCK_EXCLUSIVE);
 		ppage = BufferGetPage(pbuf);
 		maxoff = PageGetMaxOffsetNumber(ppage);

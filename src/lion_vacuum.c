@@ -292,10 +292,15 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
  * sizes, which the heap's pages go through as well.  Without it every page of
  * the index the walk reads stays in shared buffers and pushes out what the
  * queries had there; with it a VACUUM of an index larger than the ring leaves
- * no more than the ring behind, as nbtree's btvacuumpage() does.  The pages
- * read by the code a VACUUM shares with the inserts - a split, a page
- * deletion, finding an entry again - are few, and are read without it, but
- * for the look lion_dir_delete_page() takes at every leaf the walk leaves.
+ * no more than the ring behind, as nbtree's btvacuumpage() does.  Taking
+ * pages out of the trees reads through it too - the directory's page
+ * deletion (lion_dir_delete_page()) and a posting set's empty leaves
+ * (lion_posting_unlink_leaf()) - for a VACUUM that empties a run of leaves
+ * reads every one of them again, with its siblings.  The pages read by the
+ * code a VACUUM shares with the inserts - a split of a page a container grew
+ * out of (lion_vacuum_regrow()), a spill, finding an entry again after an
+ * insert moved it - are few, and are read without it, as is the meta page,
+ * which every scan reads.
  */
 static inline Buffer
 lion_vac_read(LionVacState *vs, BlockNumber blk)
@@ -2174,7 +2179,8 @@ lion_vacuum_unlink_empties(LionVacState *vs, LionVacEntryRef *ref,
 
 		lion_vac_ref_lock(vs, ref, ent, BUFFER_LOCK_EXCLUSIVE);
 		unlinked = lion_posting_unlink_leaf(vs->index, ent->owner, ent->head,
-											hint, empties[i].blk);
+											hint, empties[i].blk,
+											vs->strategy);
 		LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 
 		if (unlinked)

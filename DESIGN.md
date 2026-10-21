@@ -6940,7 +6940,10 @@ index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_n
 rule, recording the ones that are reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
 those and nothing else.  Every page ambulkdelete's walk and its sweep read goes through VACUUM's
 ring of buffers (`info->strategy`, `lion_vac_read()`; `vacuum_buffer_usage_limit`), as nbtree's
-do, so a VACUUM leaves no more of the index in shared buffers than the ring holds.  It checks for
+do, and so does every page that taking pages out of the trees reads - a directory page deletion's
+leaf, siblings and parents (§21, "Page deletion") and an empty posting leaf's neighbour and parent
+(§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once a leaf - so a VACUUM
+leaves no more of the index in shared buffers than the ring holds, but the meta page.  It checks for
 interrupts at every block, with nothing locked, and each
 page it reads passes the cost-based delay first, as every page the walk reads does (since the
 2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
