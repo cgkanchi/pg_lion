@@ -1008,7 +1008,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
         -- never below the column of the entry before it, §24), at most one reserved NULL, one
-        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids/flags, meta values, entry flags,
+        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids, page flags (exactly one kind, and no
+        -- bit that kind never carries: a page of a posting set is never flagged as one of a
+        -- position tree, which every reader of the set refuses, ending the set there), meta
+        -- values, entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container and that every member is a heap tuple - an offset 1 ..
         -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
@@ -1094,7 +1097,12 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- a count without the damaged item from lion_index_stats(), where the code before
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
-        -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone.
+        -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone. Its
+        -- seventh is a posting leaf flagged as a page of a position tree: every reader of the set
+        -- stops there, so the counts lose every row from that leaf on, while a lookup through the
+        -- tree code, which does not look at the flag, still finds them - so heapallindexed holds
+        -- the leaf its lookup lands on to the readers' test. Its eighth is a flag bit no page of
+        -- its kind carries, and its ninth a position tree's downlink, separator and leaf min (§17).
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
@@ -1186,12 +1194,20 @@ Then each candidate is checked again by itself. A downlink's page has to be in t
 chain between the reached page whose downlink precedes it and the one whose downlink follows it,
 which a coupled walk between the two proves or disproves. A page nothing reached has to be where a
 search for its own first key lands: from the directory's root, stopped at the page's level
-(`lion_dir_search_level()`), or from its posting set's root (`lion_posting_search_level()`) - a root
-that was reached, or that an entry names. The roots are found through the entries in one walk of the
-leaves; that is needed for more than a spill's root, because a posting set's root always comes from
-the end of the relation (§18) while the pages it grows by may come out of the free space map, so a
-set created during the walk can leave unreached pages under a root nothing reached either (a first
-version reported "block 7 is not reachable from the meta page" about exactly that). A candidate the
+(`lion_dir_search_level()`), or from the root of its posting set or position tree (§17) - a root
+that was reached, or that an entry names. In a tree the search takes the route of what sorts just
+below the key (`lion_posting_search_level()` with `before`) and walks the level right from where it
+lands until it meets the page, or a page whose first key is above the page's: a position tree's keys
+are heap blocks, one block's rows can fill more than one leaf, and a leaf's first key is then its
+left neighbour's last, or the separator of a run of leaves (lion_postree.c), so a search for the key
+itself stops left of the page or goes past it. The roots are found through the entries in one walk of
+the leaves, posting roots and position roots both; that is needed for more than a spill's root,
+because either root always comes from the end of the relation (§18) while the pages its tree grows by
+may come out of the free space map, so a key created during the walk can leave unreached pages under
+a root nothing reached either (a first version reported "block 7 is not reachable from the meta page"
+about exactly that). test/isolation/verify_positions.spec has an INSERT make both kinds of unreached
+position page under a parked check: the tree of a new key, and a leaf an existing key's tree splits
+off. A candidate the
 recheck cannot settle is reported as the walk would have reported it: as a leak, with a WARNING, when
 it is a kind an interrupted writer leaves and the next VACUUM's sweep frees - an internal posting page
 among them - and as corruption otherwise.
@@ -6171,8 +6187,18 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   the tree - for a tree with no internal level, the chain to the right of the head - is freed
   afterwards whatever it holds, and the sweep (and verify) take an unreferenced position page
   whose head is gone for a leak.
-- **Verify** walks every position tree (chunks, order, levels) and, on a primary, checks that
-  every TID of the posting set has positions.
+- **Verify** walks every position tree as it walks a posting set (§7, §22), and with the same
+  code: level by level from the leaves up, every page a position page of that tree stamped as
+  the entry's, every internal page's high key and separators, and every level's downlinks matched
+  with the pages of the level below. What differs is the keys: a leaf's separator is the header of
+  its first chunk (P3), no leaf's last member is above the separator of its right neighbour (at
+  it is fine), and an internal page's last separators may equal its high key, which an internal
+  split through a run of equal separators leaves. Every chunk, the members' order across the
+  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary, which holds
+  the entry's leaf for the walk, so is that every TID of the posting set has positions. On a
+  standby a walk that replay changed under it is repeated, as a posting set's is. verify.sql's
+  ninth case damages a downlink, a separator and a leaf's min of a tree with an internal level,
+  and verify() must report each.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every
