@@ -1795,6 +1795,19 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 		}
 
 		/*
+		 * A predicate's truth in the cell going up (DESIGN.md §10, "Counts
+		 * by cells").
+		 */
+		if (LION_TL_IS_CELLPRED(kind))
+		{
+			uint8		t = st->cells->truth[LION_TL_CELLPRED_NO(kind)];
+
+			slot->tts_values[i] = BoolGetDatum(t == LION_TRUTH_TRUE);
+			slot->tts_isnull[i] = (t == LION_TRUTH_NULL);
+			continue;
+		}
+
+		/*
 		 * A dimension column of the FK-side join, from the child's row - of
 		 * which a summed join's one row has none: nothing reads its dimension
 		 * columns (LION_JOINFLAG_SUM).

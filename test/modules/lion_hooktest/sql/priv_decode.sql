@@ -36,6 +36,18 @@ SELECT lion_hooktest_priv_decode('aggregate without aggregates');
 SELECT lion_hooktest_priv_decode('distinct count without its column');
 -- a dimension folded into a fact filter whose IN list is the join key's
 SELECT lion_hooktest_priv_decode('join filter on its key');
+-- a count by cells: one that is no decoded walk, the path's member at plan
+-- time, a header that miscounts its dimensions, a value whose outcome is
+-- past the dimension's, a predicate of a dimension there is none of, one
+-- short of a truth for an outcome, and a cell's truth asked of a count with
+-- no cells
+SELECT lion_hooktest_priv_decode('cells without the decoded walk');
+SELECT lion_hooktest_priv_decode('path cells at plan');
+SELECT lion_hooktest_priv_decode('cells header');
+SELECT lion_hooktest_priv_decode('cells value outcome');
+SELECT lion_hooktest_priv_decode('cells predicate dimension');
+SELECT lion_hooktest_priv_decode('cells predicate truths');
+SELECT lion_hooktest_priv_decode('cell predicate without cells');
 -- the anti join over a small inner side without the child it reads, with no
 -- key to look up, and a column of its inner side in a plan without one
 SELECT lion_hooktest_priv_decode('anti join without its child');

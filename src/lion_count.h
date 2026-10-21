@@ -929,6 +929,56 @@ extern void lion_count_groups_decode(Relation heap, Snapshot snapshot,
 									 LionVisCache *cache, bool rel_read_only);
 
 /*
+ * COUNTS BY CELLS (DESIGN.md §10, "Counts by cells", lion_count_decode.c):
+ * the decoded walk of one column - the DRIVER, whose located sets in
+ * `driver` carry the §9 interlock as column 0's of a decoded pass do - with
+ * every row it keeps labelled instead of grouped.  A row's code is the
+ * driver's part of it (drvadd[v] for its value v) plus each dimension's
+ * outcome times the dimension's weight, the outcome read off the LABELS the
+ * row is in: pinless sets, a dimension's consecutive.  A scalar dimension's
+ * labels are entries of one column, disjoint, and the outcome is the one
+ * label's `bits`; a multi-key dimension's are its keys and its NULL entry,
+ * and the outcome is a function of the bits of those the row is in
+ * (lion_cells_outcome()).  Only container keys from lokey up to hikey are
+ * counted, of the copy `where` when there is one.  Every visible row is
+ * added to the tally under its code, which is below ncells.
+ */
+#define LION_CELL_NULLBIT	(UINT64CONST(1) << 63)
+
+typedef struct LionCellLabel
+{
+	LionPostingSet *set;		/* located, and unpinned */
+	PGAlignedBlock *image;		/* its cursor's page image */
+	int			dim;
+	uint64		bits;			/* SCALAR: its outcome; MULTI: its key's
+								 * bit, or LION_CELL_NULLBIT */
+} LionCellLabel;
+
+typedef struct LionCellDim
+{
+	bool		multi;
+	uint64		weight;			/* the outcome's place in a code */
+	/* MULTI */
+	int			nullout;		/* NULL's outcome */
+	int			nkeys;
+	int			nbit;
+	struct LionKeyNode **trees; /* each leaf's tree, over the keys' bits */
+	uint16	   *map;			/* the outcome of every mask of the keys, or
+								 * NULL to work each out */
+} LionCellDim;
+
+extern int	lion_cells_outcome(const LionCellDim *dim, uint64 mask);
+extern void lion_count_cells(Relation heap, Snapshot snapshot,
+							 const LionDecodeCol *driver, const uint64 *drvadd,
+							 int ndim, const LionCellDim *dims,
+							 int nlabel, const LionCellLabel *labels,
+							 uint64 ncells, uint32 lokey, uint64 hikey,
+							 const LionPostingSet *where,
+							 LionDecodeTally *tally, LionCountStats *stats,
+							 LionDecodeStats *dstats, LionVisCache *cache,
+							 bool rel_read_only);
+
+/*
  * The same intersection collected ONCE for all the participants of a parallel
  * plan, into its dynamic shared memory (DESIGN.md §27, "One copy per query"):
  * the participants divide its container keys into chunks and collect them
@@ -1601,6 +1651,15 @@ extern PGDLLIMPORT bool lion_enable_filter_switch;
 extern PGDLLIMPORT bool lion_enable_decoded_walk;
 
 /*
+ * Whether a GROUP BY of expressions over predicates on lion-indexed columns,
+ * or a WHERE clause no posting set answers that is one, may be counted by
+ * cells (DESIGN.md §10, "Counts by cells"), and how many cells a plan may
+ * have at most.  Planner settings.
+ */
+extern PGDLLIMPORT bool lion_enable_count_cells;
+extern PGDLLIMPORT int lion_count_cells_max;
+
+/*
  * Whether the count pushdown may test WHERE clauses no posting set answers
  * on the heap rows the others select (DESIGN.md §10, "Residual clauses").
  * A planner switch.
@@ -1809,6 +1868,22 @@ extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
  */
 extern Node *lion_or_as_array(Node *clause);
 extern Node *lion_canonical_clause(Node *clause);
+
+/*
+ * Clauses - RestrictInfos or bare, of one relation, varRelid's when it is
+ * not 0 - as lion's estimates take them: each OR of equalities as its IN
+ * list, and each run of `<>` on one expression - `k <> 'a' AND k <> 'b'`,
+ * `k NOT IN ('a', 'b')` - as ONE clause whose cached selectivity is the
+ * disjoint 1 - nullfrac - sum of the distinct values' frequencies (DESIGN.md
+ * §29.11, "A run of `<>` is one exclusion"); *changed says whether any
+ * clause was taken so.  lion_canonical_quals_sel() is core's estimate of an
+ * index path's quals and lion's, where the two forms differ.
+ */
+extern List *lion_canonical_clause_list(PlannerInfo *root, int varRelid,
+										List *clauses, bool *changed);
+extern bool lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel,
+									 List *quals, Selectivity *coresel,
+									 Selectivity *lionsel);
 #if PG_VERSION_NUM < 180000
 
 /*

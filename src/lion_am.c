@@ -460,6 +460,31 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §10, "Counts by cells": whether a GROUP BY of expressions over
+	 * predicates on lion-indexed columns may be counted by the cells the
+	 * predicates' truths make, and how many cells a plan may have.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_cells",
+							 "Lets the count pushdown count a GROUP BY of expressions over predicates on lion-indexed columns by the cells of the predicates' truths.",
+							 "Off, such a GROUP BY goes to the ordinary plan.",
+							 &lion_enable_count_cells,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("pg_lion.count_cells_max",
+							"The most cells a count by cells may have: the product of each predicate column's outcomes.",
+							"A plan with more is left to the ordinary plan.",
+							&lion_count_cells_max,
+							134217728,
+							2,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §36: whether a GROUP BY ordered by its count under a LIMIT
 	 * may count only the groups that can be among the first rows, found by
 	 * the entries' own counts.  Off, every group is counted.
