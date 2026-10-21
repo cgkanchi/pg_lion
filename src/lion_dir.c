@@ -57,6 +57,7 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/xact.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -73,10 +74,24 @@ int64		lion_dir_pages_read = 0;
  * The last directory read of each index this backend has read one of, as
  * the value lion_dir_pages_read had just after it: what the index-usage
  * statistics of a count ask (lion_dir_read_since()).  An entry is made the
- * first time an index's directory is read and kept for the life of the
- * backend - one per lion index it ever read, a few dozen bytes each - so
- * that an entry's address stays put and lastmark can keep the last one used:
- * consecutive reads are nearly always of one index, and pay a comparison.
+ * first time an index's directory is read, and its address stays put while
+ * the table does, so lastmark can keep the last one used: consecutive reads
+ * are nearly always of one index, and pay a comparison.
+ *
+ * A count asks only about reads since a moment of its own run, and no run
+ * outlives its transaction - a holdable cursor's, or a procedure's loop over
+ * a query that commits, is run to its end before the commit - so no mark is
+ * wanted once the transaction that made it is over.  The table is dropped at
+ * the end of a top-level transaction that leaves more than
+ * LION_DIR_MARKS_KEPT marks in it (lion_dir_marks_xact()), and with it the
+ * marks of the indexes dropped since: kept for the backend's life, it would
+ * hold one mark for every lion index the backend ever read, a temporary
+ * table's too, and grow without bound under one that makes and drops them.
+ * Up to LION_DIR_MARKS_KEPT, as many as it is made to hold, it is kept, so
+ * that a backend that reads a few indexes in every transaction does not make
+ * the table again in each.  A mark is a value of lion_dir_pages_read, which
+ * only grows, so one left from an earlier transaction is older than any
+ * moment a count asks about, and says the index was not read since.
  */
 typedef struct LionDirReadMark
 {
@@ -84,8 +99,11 @@ typedef struct LionDirReadMark
 	int64		last;
 } LionDirReadMark;
 
+#define LION_DIR_MARKS_KEPT		64
+
 static HTAB *lion_dir_marks = NULL;
 static LionDirReadMark *lion_dir_lastmark = NULL;
+static bool lion_dir_marks_cb = false;
 
 static Buffer lion_dir_find_parent(Relation index, Relation heaprel,
 								  LionIndexState *ix, const LionSearchKey *sk,
@@ -129,6 +147,34 @@ lion_dir_readbuf(Relation index, BlockNumber blk)
 }
 
 /*
+ * The end of a top-level transaction: the marks dropped, when there are more
+ * than LION_DIR_MARKS_KEPT of them (above).  A parallel worker's transaction
+ * ends with its own events, and its marks go the same way.
+ */
+static void
+lion_dir_marks_xact(XactEvent event, void *arg)
+{
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+		case XACT_EVENT_PREPARE:
+			if (lion_dir_marks != NULL &&
+				hash_get_num_entries(lion_dir_marks) > LION_DIR_MARKS_KEPT)
+			{
+				hash_destroy(lion_dir_marks);
+				lion_dir_marks = NULL;
+				lion_dir_lastmark = NULL;
+			}
+			break;
+		default:
+			break;
+	}
+}
+
+/*
  * A directory page of index read: counted in lion_dir_pages_read, and the
  * index marked read now (lion_dir_read_since()).  Every read of a leaf or an
  * internal page goes through here.  Inside a critical section - a write's
@@ -153,10 +199,16 @@ lion_dir_count_read(Relation index)
 
 		if (CritSectionCount > 0)
 			return;
+		if (!lion_dir_marks_cb)
+		{
+			RegisterXactCallback(lion_dir_marks_xact, NULL);
+			lion_dir_marks_cb = true;
+		}
 		ctl.keysize = sizeof(Oid);
 		ctl.entrysize = sizeof(LionDirReadMark);
 		ctl.hcxt = TopMemoryContext;
-		lion_dir_marks = hash_create("lion directory reads", 64, &ctl,
+		lion_dir_marks = hash_create("lion directory reads",
+									 LION_DIR_MARKS_KEPT, &ctl,
 									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 	}
 	lion_dir_lastmark = (LionDirReadMark *)
