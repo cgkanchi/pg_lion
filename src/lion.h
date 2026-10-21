@@ -2851,6 +2851,8 @@ extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
 												 const LionContainer *c);
 extern void lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
 								  int64 *nremoved);
+extern void lion_posfilter_work(const LionPosFilter *pf, int64 *nseeks,
+							   int64 *ndecoded);
 extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,

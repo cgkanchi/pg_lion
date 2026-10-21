@@ -41,6 +41,8 @@ extern PGDLLIMPORT double lion_descent_cost;
 extern PGDLLIMPORT double lion_union_set_cost;
 extern PGDLLIMPORT double lion_recheck_tid_cost;
 extern PGDLLIMPORT double lion_recheck_group_tid_cost;
+extern PGDLLIMPORT double lion_position_member_cost;
+extern PGDLLIMPORT double lion_position_check_cost;
 extern PGDLLIMPORT double lion_resident_page_cost;
 extern PGDLLIMPORT double lion_cold_page_cost;
 

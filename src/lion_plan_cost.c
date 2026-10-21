@@ -2973,19 +2973,20 @@ lion_range_recheck(PlannerInfo *root, RelOptInfo *rel, double tids,
 /*
  * Will a GROUP BY's WHERE be collected into one set (DESIGN.md §10, "The
  * WHERE sets, collected once")?  lion_where_describe()'s rule, from the
- * planner's sources: two or more, or one that is a union; a lone set only
- * where no count would keep a copy of it, being too large to materialize
+ * planner's sources: two or more, or one of several sets - a union, or a
+ * multi-key query of several keys (`many`); a lone set only where no count
+ * would keep a copy of it, being too large to materialize
  * (lion_posting_set_rewalked()).  Over groups that span the heap the
  * executor collects before the first group; over groups of a few rows, once
  * they have read as much as collecting reads, which prices about the same.
  */
 static bool
 lion_cost_where_collected(int nsrc, const double *members,
-						  const double *containers, const bool *isunion)
+						  const double *containers, const bool *many)
 {
 	if (nsrc <= 0)
 		return false;
-	if (nsrc > 1 || isunion[0])
+	if (nsrc > 1 || many[0])
 		return true;
 	return containers[0] > (double) LION_MATERIALIZE_MAX_CONTAINERS &&
 		members[0] > (double) (LION_MATERIALIZE_MAX_BYTES / sizeof(uint16));
@@ -3111,6 +3112,8 @@ typedef struct LionCountRelCost
 	double	   *srcmembers;		/* members of each AND source */
 	double	   *srccontainers;	/* and the containers they lie in */
 	bool	   *srcunion;		/* is it a union of several sets? */
+	bool	   *srcmany;		/* ... or several sets at all: a union, or a
+								 * multi-key query of several keys */
 	double	   *srcsets;		/* ... of how many */
 	double	   *srcnsets;		/* the sets an AND meets it as the union of */
 	double	   *srcsetcont;		/* ... and the containers they lie in */
@@ -3165,6 +3168,7 @@ lion_count_rel_alloc(LionCountRelCost *c)
 	c->srccontainers = (double *) palloc0(sizeof(double) *
 										  Max(c->nclause, 1));
 	c->srcunion = (bool *) palloc0(sizeof(bool) * Max(c->nclause, 1));
+	c->srcmany = (bool *) palloc0(sizeof(bool) * Max(c->nclause, 1));
 	c->srcsets = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->srcnsets = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->srcsetcont = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
@@ -3304,7 +3308,10 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	c->srcsetcont[c->clausesrc[c->ci - 1]] += clc;
 	lion_count_rel_src_words(c, c->clausesrc[c->ci - 1], 0.0);
 	if (c->orgrp[c->ci - 1] >= 0)
+	{
 		c->srcunion[c->clausesrc[c->ci - 1]] = true;
+		c->srcmany[c->clausesrc[c->ci - 1]] = true;
+	}
 }
 
 /*
@@ -3314,11 +3321,12 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
  */
 static void
 lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
-						  AttrNumber col, Node *clause)
+						  AttrNumber col, Node *clause, bool multikey)
 {
 	LionSetClause *sc = &c->clauseset[c->ci];
 	Selectivity sel;
 	double		nkeys;
+	double		qkeys = 1.0;
 
 	/*
 	 * The clause's sets, priced as every AND of them is priced
@@ -3371,6 +3379,19 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 		lion_count_rel_src_words(c, c->clausesrc[c->ci - 1], sc->words);
 		if (c->orgrp[c->ci - 1] >= 0 || nkeys > 1.0)
 			c->srcunion[c->clausesrc[c->ci - 1]] = true;
+
+		/*
+		 * ... and what the executor takes it for when it weighs collecting
+		 * the WHERE (lion_where_describe()): a set for each key it locates,
+		 * a multi-key query's ANDed as much as an IN list's are ORed.
+		 */
+		if (multikey)
+			(void) lion_multikey_cost_mode(idx, col,
+										   IsA(clause, RestrictInfo) ?
+										   (Node *) ((RestrictInfo *) clause)->clause :
+										   clause, &qkeys);
+		if (c->srcunion[c->clausesrc[c->ci - 1]] || qkeys > 1.0)
+			c->srcmany[c->clausesrc[c->ci - 1]] = true;
 	}
 
 	/*
@@ -3650,7 +3671,8 @@ lion_count_rel_clauses(LionCountRelCost *c)
 		}
 
 		lion_count_rel_set_clause(c, idx, (AttrNumber) lfirst_int(lc4),
-								  clause);
+								  clause,
+								  lfirst_int(lc3) == LION_CLAUSE_MULTI);
 	}
 }
 
@@ -3869,7 +3891,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 	if (c->distinct == LION_DISTINCT_NONE && !c->groupdrive &&
 		c->walked >= 2.0 && !c->nocollect &&
 		lion_cost_where_collected(c->nsrc, c->srcmembers, c->srccontainers,
-								  c->srcunion))
+								  c->srcmany))
 	{
 		lion_count_rel_where_once(c, mem, keys, words, gm);
 	}
@@ -4218,6 +4240,7 @@ lion_count_rel_set_pages(LionCountRelCost *c)
 	pfree(c->srcmembers);
 	pfree(c->srccontainers);
 	pfree(c->srcunion);
+	pfree(c->srcmany);
 	pfree(c->srcsets);
 	pfree(c->srcnsets);
 	pfree(c->srcsetcont);
@@ -4857,6 +4880,22 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	run += c.rangecost;
 	run += c.rangesrc_cost;
 	run += c.spillread;
+
+	/*
+	 * The WHERE's clauses decided from stored positions: once for every row
+	 * of the WHERE where it is collected, its copy decided as it is made
+	 * (lion_sources_collect()), and otherwise by each count for its own
+	 * candidates - a group's, an entry's of a sum over a range, a test's.
+	 */
+	if (c.whereonce)
+		run += lion_cost_posfilter(root, rel, whereidx, wherecol,
+								   whereclauses, wherekinds, ors, c.matching,
+								   1.0);
+	else
+		run += lion_cost_posfilter(root, rel, whereidx, wherecol,
+								   whereclauses, wherekinds, ors,
+								   c.matching * c.recheckshare,
+								   rangesum ? c.sumsets.counts : c.walked);
 
 	if (walksave != NULL && c.walkranges != NIL)
 	{
@@ -5855,9 +5894,10 @@ lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
  * at the clauses' own evaluation cost.  §10's recheck of the dirty pages is
  * still charged beside it by the caller; it is the smaller of the two.
  *
- * A superset decided from stored positions (lion_posfilter.c) reads no heap:
- * each candidate costs an operator call per key of the query, the cursors'
- * decoding, and nothing else is charged for it here.
+ * A superset decided from stored positions (lion_posfilter.c) reads no heap,
+ * and costs nothing here: what its filters cost depends on whether they are
+ * read once for a copy of the WHERE or by every count, which the caller
+ * knows, and prices with lion_cost_posfilter().
  */
 Cost
 lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
@@ -5868,7 +5908,6 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	double		cand = Max(matched, 1.0);
 	int		   *orgrp = lion_or_group_map(ors, list_length(whereclauses));
 	Cost		perrow = cpu_tuple_cost;
-	Cost		poscost = 0.0;	/* per candidate, the position filters' */
 	bool		any = false;
 	double		pages;
 	int			ci = 0;
@@ -5900,11 +5939,7 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		if (inor || (mode == LION_QMODE_LOSSY &&
 			lion_multikey_posexact((IndexOptInfo *) lfirst(lc1),
 								   (AttrNumber) lfirst_int(lc4), clause)))
-		{
-			if (mode == LION_QMODE_LOSSY)
-				poscost += nkeys * cpu_operator_cost;
 			continue;
-		}
 
 		any = true;
 		cost_qual_eval_node(&qual_cost, clause, root);
@@ -5916,11 +5951,135 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	}
 	pfree(orgrp);
 	if (!any)
-		return Min(cand, Max(ceiling, 1.0)) * Max(counts, 1.0) * poscost;
+		return 0;
 
 	cand = Min(cand, Max(ceiling, 1.0));
 	pages = Min(cand, heap_pages * Max(counts, 1.0));
 
 	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
-		cand * (perrow + Max(counts, 1.0) * poscost);
+		cand * perrow;
+}
+
+/*
+ * One clause's position filter, over `cand` candidates of `counts` counts
+ * (lion_cost_posfilter()): nothing unless it is a multi-key clause the sets
+ * only bound, decided from stored positions - every one under an OR
+ * (lion_match_index() takes no other there), one outside it when the index
+ * stores positions and the query can be followed through them.
+ *
+ * Every count's cursors begin again at their lexemes' first member, and seek
+ * to the count's candidates in order, decoding the members between
+ * (LION_POS_MEMBER_COST): at most every member of the lexeme, which a count
+ * whose candidates lie close together comes to, and LION_POS_SEEK_MEMBERS a
+ * candidate where they lie further apart than a chunk's members.  Each
+ * candidate is then decided at LION_POS_CHECK_COST a lexeme.  A lexeme's
+ * members are the rows that have it, taken from the clause's selectivity as
+ * the share of rows each of its nkeys lexemes would have to have for that to
+ * be their product, which is how the selectivity of a tsquery's AND and
+ * phrase is estimated: 0.56 for `foo <-> bar` of lexemes in 0.75 of the rows.
+ */
+static Cost
+lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
+						   IndexOptInfo *idx, AttrNumber col, Node *clause,
+						   bool inor, double cand, double counts)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		percount;
+	double		nkeys;
+	double		members;
+	Selectivity sel;
+
+	if (cand <= 0.0)
+		return 0;
+	if (lion_multikey_cost_mode(idx, col, clause, &nkeys) != LION_QMODE_LOSSY)
+		return 0;
+	if (!inor && !lion_multikey_posexact(idx, col, clause))
+		return 0;
+
+	/* a count that has no candidate seeks nothing */
+	counts = Min(Max(counts, 1.0), Max(cand, 1.0));
+	percount = cand / counts;
+
+	nkeys = Max(nkeys, 1.0);
+	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
+							 NULL);
+	members = tuples * pow(Min(Max(sel, 1e-10), 1.0), 1.0 / nkeys);
+	members = Max(members, percount);
+	return counts * nkeys *
+		Min(members, percount * LION_POS_SEEK_MEMBERS) * LION_POS_MEMBER_COST +
+		cand * nkeys * LION_POS_CHECK_COST;
+}
+
+/*
+ * The position filters (lion_posfilter.c, DESIGN.md §17 "Stored positions")
+ * of a count's WHERE, over `cand` candidates of `counts` counts: the copy of
+ * a WHERE that decides them as it is made is one count of every row it
+ * holds, and a count per group or per key of a join, of its own rows each.
+ */
+Cost
+lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
+					List *wherecol, List *whereclauses, List *wherekinds,
+					List *ors, double cand, double counts)
+{
+	int		   *orgrp;
+	Cost		cost = 0;
+	int			ci = 0;
+	ListCell   *lc1;
+	ListCell   *lc2;
+	ListCell   *lc3;
+	ListCell   *lc4;
+
+	if (cand <= 0.0)
+		return 0;
+
+	orgrp = lion_or_group_map(ors, list_length(whereclauses));
+	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
+	{
+		bool		inor = (orgrp[ci++] >= 0);
+
+		if (lfirst_int(lc3) != LION_CLAUSE_MULTI)
+			continue;
+		cost += lion_cost_posfilter_clause(root, rel,
+										   (IndexOptInfo *) lfirst(lc1),
+										   (AttrNumber) lfirst_int(lc4),
+										   (Node *) lfirst(lc2), inor,
+										   cand, counts);
+	}
+	pfree(orgrp);
+	return cost;
+}
+
+/*
+ * The position filters of one scan of the AM (lion_scan.c): a plain or bitmap
+ * scan puts the superset of each multi-key qual decided from stored positions
+ * through a filter of its own, its cursors begun again at every scan - each
+ * repetition of a nested loop's inner side - and sought to that scan's
+ * `cand` candidates.  A qual of `@@ ANY (array)` is not one
+ * lion_cost_posfilter_clause() takes and is charged nothing here: the plain
+ * scan rechecks it in the heap, and the bitmap scan decides each element as
+ * a query of its own.
+ */
+Cost
+lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path, double cand)
+{
+	IndexOptInfo *idx = path->indexinfo;
+	Cost		cost = 0;
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lq;
+
+		foreach(lq, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lq);
+
+			cost += lion_cost_posfilter_clause(root, idx->rel, idx,
+											   (AttrNumber) (iclause->indexcol + 1),
+											   (Node *) rinfo->clause, false,
+											   cand, 1.0);
+		}
+	}
+	return cost;
 }
