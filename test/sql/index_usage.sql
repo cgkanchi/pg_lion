@@ -145,8 +145,13 @@ SELECT * FROM ius_delta();
 SELECT * FROM ius_run($$SELECT count(*) FROM ius WHERE d @@ 'w1 & w3'$$);
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
--- a residual clause, checked in the heap: the table's rows fetched
+-- a residual clause, checked in the heap: the table's rows fetched.  The
+-- aggregate over lion's walk of the covering btree is a plan of lion's too,
+-- which the margin does not mark the count down against, and cheaper: it is
+-- turned off here.
+SET pg_lion.enable_btree_scan = off;
 SELECT * FROM ius_run('SELECT count(*) FROM ius WHERE a = 3 AND c BETWEEN 100 AND 400');
+RESET pg_lion.enable_btree_scan;
 SELECT pg_stat_force_next_flush() AS f \gset
 SELECT * FROM ius_delta();
 -- three rescans with another Param: three scans

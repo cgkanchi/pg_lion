@@ -3770,7 +3770,7 @@ lion_count_path_make(LionCountPathBuild *cx)
 	 * index that orders by the key type's own comparison is exactly what an
 	 * `ORDER BY <group col>` asks for - so the Sort above the node disappears.
 	 *
-	 * Four things disqualify it:
+	 * These disqualify it:
 	 *
 	 *	- two group columns: the nested loop of §20 emits (outer, inner) pairs,
 	 *	  which are sorted by the outer key alone and not by the pair;
@@ -3782,12 +3782,16 @@ lion_count_path_make(LionCountPathBuild *cx)
 	 *	- a NULLABLE group column, because the reserved NULL entry sorts
 	 *	  FIRST and `ORDER BY col` means NULLS LAST.  A column the planner
 	 *	  knows is NOT NULL has no NULL group to emit, so the two agree;
-	 *	- and GROUP BY coalesce(col, c) (DESIGN.md §10), whose group c the
-	 *	  walk holds back and emits after the last entry, wherever c sorts.
+	 *	- GROUP BY coalesce(col, c) (DESIGN.md §10), whose group c the
+	 *	  walk holds back and emits after the last entry, wherever c sorts;
+	 *	- and the top k by count (DESIGN.md §36), which emits the candidates
+	 *	  it counted largest bound first, for the Sort core puts above it to
+	 *	  order by their counts.  Only that Sort reads the path, so a key
+	 *	  order claimed would be used by nothing, but it is not the node's.
 	 */
 	cpath->path.pathkeys = NIL;
 	if (cx->ngroup == 1 && !cx->partitioned && !cx->sumall &&
-		cx->nfilter == 0 && !cx->cells &&
+		cx->nfilter == 0 && !cx->cells && cx->topkn == 0 &&
 		!cx->singlegroup &&
 		cx->groupcoal == NULL && cx->groupdeps == NIL &&
 		first->driveidx[0] != NULL &&

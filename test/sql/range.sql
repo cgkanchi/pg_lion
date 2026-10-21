@@ -83,6 +83,9 @@ BEGIN
 		PERFORM set_config('enable_seqscan', 'off', true);
 		PERFORM set_config('enable_bitmapscan', 'off', true);
 		PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+		-- lion's walk of a btree is lion's plan too, which the margin does
+		-- not mark the count down against
+		PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
 		PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	END IF;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
@@ -102,6 +105,7 @@ BEGIN
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
 	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
