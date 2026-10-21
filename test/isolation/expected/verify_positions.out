@@ -1,6 +1,6 @@
 Parsed test spec with 3 sessions
 
-starting permutation: s2_free s2_vacuum s2_xid s3_note_free s1_park_level s1_verify s3_at_level s2_new_key s3_wake_level s1_done s3_new_key
+starting permutation: s2_free s2_vacuum s2_xid s2_recycle s3_note_free s1_park_level s1_verify s3_at_level s2_new_key s3_wake_level s1_done s3_new_key
 injection_points_set_local
 --------------------------
                           
@@ -14,6 +14,7 @@ took_an_xid
 t          
 (1 row)
 
+step s2_recycle: VACUUM vt;
 step s3_note_free: 
 	CREATE TABLE v_free AS
 	SELECT deleted_pages FROM lion_index_stats('vt_d');
@@ -84,7 +85,7 @@ lion_index_verify
 (1 row)
 
 
-starting permutation: s2_free s2_vacuum s2_xid s3_note_free s1_park_level s1_verify s3_at_level s2_grow_key s3_wake_level s1_done s3_grown_key
+starting permutation: s2_free s2_vacuum s2_xid s2_recycle s3_note_free s1_park_level s1_verify s3_at_level s2_grow_key s3_wake_level s1_done s3_grown_key
 injection_points_set_local
 --------------------------
                           
@@ -98,6 +99,7 @@ took_an_xid
 t          
 (1 row)
 
+step s2_recycle: VACUUM vt;
 step s3_note_free: 
 	CREATE TABLE v_free AS
 	SELECT deleted_pages FROM lion_index_stats('vt_d');

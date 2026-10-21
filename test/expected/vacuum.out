@@ -686,11 +686,15 @@ SELECT lion_cmp('lion_free', 'k = 2');
  * had spill into them, so the free space map hands out what it holds and the
  * relation grows by less than the pages it gave back (it cannot be exactly
  * zero: a chain's HEAD page is the one page that is never recycled, so that
- * owner_head stays a chain identity a reader can trust).
+ * owner_head stays a chain identity a reader can trust).  The VACUUM that
+ * freed them could not hand them out yet - no transaction had started since
+ * - and the next one does, with no row to remove, once one has (DESIGN.md
+ * §18, "Reuse"): the CREATE TABLE is that transaction.
  */
 CREATE TEMP TABLE lion_free_size AS
 	SELECT pg_relation_size('lion_free_k') AS bytes,
 		   (SELECT deleted_pages FROM lion_index_stats('lion_free_k')) AS freed;
+VACUUM lion_free;
 INSERT INTO lion_free SELECT i, 4 + (i % 2) FROM generate_series(200001, 300000) i;
 SELECT entries,
 	   (SELECT deleted_pages FROM lion_index_stats('lion_free_k')) <

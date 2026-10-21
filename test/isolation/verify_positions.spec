@@ -84,6 +84,9 @@ step s2_free	{ DELETE FROM vt WHERE id > 100000; }
 # than leave its dead rows, and with them the trees (verify_concurrent.spec).
 step s2_vacuum	{ VACUUM (FREEZE) vt; }
 step s2_xid		{ SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid; }
+# The pages a VACUUM deletes go to the free space map only once no snapshot
+# can still reach them, which the next VACUUM settles (DESIGN.md §18).
+step s2_recycle	{ VACUUM vt; }
 step s2_new_key	{
 	INSERT INTO vt SELECT 200000 + i, to_tsvector('simple', 'fresh')
 	  FROM generate_series(1, 20000) i;
@@ -122,6 +125,7 @@ permutation
 	s2_free
 	s2_vacuum					# the fourth key's trees go to the free space map
 	s2_xid						# ... behind every snapshot from here on
+	s2_recycle					# ... and handed out by the next VACUUM
 	s3_note_free
 	s1_park_level
 	s1_verify(s3_wake_level)	# parks with the leaves walked
@@ -136,6 +140,7 @@ permutation
 	s2_free
 	s2_vacuum
 	s2_xid
+	s2_recycle
 	s3_note_free
 	s1_park_level
 	s1_verify(s3_wake_level)	# parks with the leaves walked

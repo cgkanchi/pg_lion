@@ -215,10 +215,11 @@ SELECT * FROM dd_check();
 
 -- ---------- 3. new keys use the pages again ----------
 -- A transaction id is spent first, so that the deleted pages' safexid is
--- behind every snapshot when the inserts look for pages (nbtree's rule): the
--- index does not grow, and fewer of its pages are free.  Keys 4999 down to
--- 4900 go first, into the range the run left: they go under the page of one
--- downlink, whose leaf splits again and again, and the page takes their
+-- behind every snapshot, and the VACUUM after it, which has no row to remove,
+-- hands them to the free space map (nbtree's rule, DESIGN.md §18, "Reuse"):
+-- the index does not grow, and fewer of its pages are free.  Keys 4999 down
+-- to 4900 go first, into the range the run left: they go under the page of
+-- one downlink, whose leaf splits again and again, and the page takes their
 -- separators after its minus-infinity downlink and splits itself.
 SELECT txid_current() IS NOT NULL AS spent;
  spent 
@@ -226,6 +227,7 @@ SELECT txid_current() IS NOT NULL AS spent;
  t
 (1 row)
 
+VACUUM dd;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(4999, 4900, -1) i;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(6001, 8000) i;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(4000, 4499) i;
@@ -348,6 +350,7 @@ SELECT txid_current() IS NOT NULL AS spent;
  t
 (1 row)
 
+VACUUM dd;
 INSERT INTO dd SELECT i, dd_key(i) FROM generate_series(1, 3000) i;
 INSERT INTO dd_ref SELECT i, dd_key(i) FROM generate_series(1, 3000) i;
 SELECT dd_note('refilled');
@@ -389,3 +392,143 @@ SELECT * FROM dd_check();
 DROP TABLE dd, dd_ref, dd_size;
 DROP FUNCTION dd_check(), dd_same(text), dd_key(int), dd_note(text),
 	dd_downlinks();
+-- ---------- 6. the free space map holds the pages it may hand out ----------
+-- VACUUM records a DELETED page in the map once no scan can still hold a
+-- link to it, and not before, and an allocation takes the pages the map
+-- offers until one may be taken (DESIGN.md §18, "Reuse").  Two VACUUMs, the
+-- first of which takes out leaves of the upper keys and the second leaves of
+-- the lower ones, below them in the index, leave free pages of two ages: the
+-- map holds the old ones only, the inserts after the second VACUUM take them
+-- and the index does not grow, and the young ones join the map with the next
+-- VACUUM.  A map that listed the young pages as well would offer them first,
+-- by block, to inserts that may not take them yet.
+CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
+/*
+ * The blocks idx's free space map lists, by what they are: free pages the
+ * next allocation may take - all-zero, or DELETED or an empty UNLINKED
+ * posting leaf with a safexid behind every snapshot (its transaction id
+ * before the oldest one this snapshot sees running) - free pages it may not
+ * take yet, and live pages.  A DELETED directory page keeps its safexid in
+ * its special area's minckey and maxckey, a DELETED container page in the
+ * eight bytes after the page header, and an UNLINKED leaf the low half in
+ * its leftlink (lion.h).
+ */
+CREATE FUNCTION dd_fsm(idx regclass, OUT reusable bigint, OUT waiting bigint,
+	OUT live bigint)
+LANGUAGE sql AS $$
+	WITH p AS (
+		SELECT h.lower = 0 AS new, fl, r, h.special AS s
+		  FROM pg_freespace(idx) f,
+			   LATERAL get_raw_page(idx::text, f.blkno::int) r,
+			   LATERAL page_header(r) h,
+			   LATERAL (SELECT CASE WHEN h.lower = 0 THEN 0
+								ELSE get_byte(r, h.special + 26) +
+									 256 * get_byte(r, h.special + 27) END) x(fl)
+		 WHERE f.avail > 0 AND f.blkno > 0),
+	x AS (
+		SELECT new, fl,
+			   CASE WHEN fl & 8 <> 0 AND fl & (2 | 16) <> 0 THEN
+						(SELECT sum(get_byte(r, s + 8 + i)::numeric * 256 ^ i)
+						   FROM generate_series(0, 7) i)
+					WHEN fl & 8 <> 0 THEN
+						(SELECT sum(get_byte(r, 24 + i)::numeric * 256 ^ i)
+						   FROM generate_series(0, 7) i)
+					WHEN fl & 4 <> 0 AND fl & 512 <> 0 THEN
+						(SELECT sum(get_byte(r, s + 4 + i)::numeric * 256 ^ i)
+						   FROM generate_series(0, 3) i)
+			   END AS safexid,
+			   (pg_snapshot_xmin(pg_current_snapshot())::text)::numeric AS xmin
+		  FROM p)
+	SELECT count(*) FILTER (WHERE new OR safexid < CASE WHEN fl & 8 <> 0 THEN xmin
+														ELSE xmin % 4294967296 END),
+		   count(*) FILTER (WHERE NOT new AND safexid >= CASE WHEN fl & 8 <> 0 THEN xmin
+															 ELSE xmin % 4294967296 END),
+		   count(*) FILTER (WHERE NOT new AND safexid IS NULL)
+	  FROM x
+$$;
+CREATE TABLE dd_fo (id int, k int) WITH (autovacuum_enabled = off);
+INSERT INTO dd_fo SELECT i, i FROM generate_series(1, 100000) i;
+CREATE INDEX dd_fo_k ON dd_fo USING lion (k);
+SELECT pg_relation_size('dd_fo_k') / current_setting('block_size')::int AS blocks \gset
+-- The upper keys go, then a transaction id is spent: their leaves are behind
+-- every snapshot.  Then the lower keys go: theirs are not.
+DELETE FROM dd_fo WHERE id BETWEEN 60001 AND 90000;
+VACUUM dd_fo;
+SELECT txid_current() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+DELETE FROM dd_fo WHERE id BETWEEN 10001 AND 40000;
+VACUUM dd_fo;
+SELECT deleted_pages > 250 AS pages_deleted FROM lion_index_stats('dd_fo_k');
+ pages_deleted 
+---------------
+ t
+(1 row)
+
+-- the map holds the upper leaves and none of the lower ones
+SELECT reusable > 100 AS holds_reusable, waiting, live FROM dd_fsm('dd_fo_k');
+ holds_reusable | waiting | live 
+----------------+---------+------
+ t              |       0 |    0
+(1 row)
+
+-- As many new keys as the upper half had: they take its leaves, and the
+-- index does not grow.
+INSERT INTO dd_fo SELECT i, i FROM generate_series(200001, 230000) i;
+SELECT pg_relation_size('dd_fo_k') / current_setting('block_size')::int = :blocks
+		   AS no_growth,
+	   deleted_pages < 200 AS reused
+  FROM lion_index_stats('dd_fo_k');
+ no_growth | reused 
+-----------+--------
+ t         | t
+(1 row)
+
+SELECT waiting, live FROM dd_fsm('dd_fo_k');
+ waiting | live 
+---------+------
+       0 |    0
+(1 row)
+
+-- The lower leaves go to the map with the next VACUUM, once a transaction has
+-- started since they were deleted, and new keys take them.
+SELECT txid_current() IS NOT NULL AS spent;
+ spent 
+-------
+ t
+(1 row)
+
+VACUUM dd_fo;
+SELECT reusable > 100 AS holds_reusable, waiting, live FROM dd_fsm('dd_fo_k');
+ holds_reusable | waiting | live 
+----------------+---------+------
+ t              |       0 |    0
+(1 row)
+
+INSERT INTO dd_fo SELECT i, i FROM generate_series(300001, 330000) i;
+SELECT pg_relation_size('dd_fo_k') / current_setting('block_size')::int = :blocks
+		   AS no_growth,
+	   deleted_pages < 100 AS reused
+  FROM lion_index_stats('dd_fo_k');
+ no_growth | reused 
+-----------+--------
+ t         | t
+(1 row)
+
+SELECT * FROM lion_index_verify('dd_fo_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT count(*) FROM dd_fo WHERE k BETWEEN 1 AND 400000;
+ count  
+--------
+ 100000
+(1 row)
+
+DROP TABLE dd_fo;
+DROP FUNCTION dd_fsm(regclass);
