@@ -702,9 +702,32 @@ SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_splitd')$$);
 SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_splitp')$$);
 SET client_min_messages = warning;
 
+-- (17) a position tree without positions for some TIDs of its posting set.
+-- 600 rows of 'alpha:5 beta:6', whose keys are CHAIN entries (inline_limit
+-- = 64) with a position tree of one leaf each: one chunk, a 10-byte header
+-- and the 600 rows' three bytes - the delta of the code (1), the count of
+-- positions (1), the position (20 for 'alpha': a position is stored shifted
+-- left by two, over its weight).  The first member's delta goes from 1 to
+-- 2, which moves every member one offset on and leaves the first row of
+-- each of the five heap blocks without positions.  verify() must report it.
+CREATE TEMP TABLE lion_vfy_badpc (id int4, d tsvector);
+INSERT INTO lion_vfy_badpc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+CREATE INDEX lion_vfy_bad_poscov ON lion_vfy_badpc USING lion (d)
+  WITH (store_positions = true, inline_limit = 64);
+SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_poscov', b, 1) AS item
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_poscov') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_poscov', b, :special + 24) >> 16) & 128 <> 0
+   AND lion_vfy_peek('lion_vfy_bad_poscov', b,
+					 lion_vfy_item('lion_vfy_bad_poscov', b, 1) + 10, 3) = '\x010114' \gset
+SELECT lion_vfy_poke('lion_vfy_bad_poscov', :posleaf, :item + 10, '\x02');
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_poscov');
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
-	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph;
+	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph, lion_vfy_badpc;
 DROP FUNCTION lion_vfy_meta(regclass, int8, bytea);
 DROP FUNCTION lion_vfy_err(text);
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);

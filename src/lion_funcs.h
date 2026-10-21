@@ -202,6 +202,9 @@ typedef struct LionVerifyState
 	int64		nsetretries;	/* ... thrown away because a writer got in */
 	int64		nsetholds;		/* ... made with the entry's leaf held */
 	int64		nsetuncompared;	/* sets a standby kept without their totals */
+	int64		nposwalks;		/* position-tree walks */
+	int64		nposretries;	/* ... thrown away because a writer got in */
+	int64		nposholds;		/* ... made with the entry's leaf held */
 	int			nwaits;			/* WaitForLockers() calls */
 } LionVerifyState;
 

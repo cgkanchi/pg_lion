@@ -1152,8 +1152,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- page's other words; its fourteenth a second page at the root's level, each flagged
         -- ROOT; its fifteenth the body and the safexid of a DELETED container page and of a
         -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
-        -- put in its file; and its sixteenth the unfinished-split flag on the rightmost page of a
-        -- directory level and of a posting set's. Each case builds the index it damages and sets every psql variable it
+        -- put in its file; its sixteenth the unfinished-split flag on the rightmost page of a
+        -- directory level and of a posting set's; and its seventeenth a position tree without
+        -- positions for TIDs of its set. Each case builds the index it damages and sets every psql variable it
         -- uses itself, from the file or from a twin; the shared tables and helpers come first.
         -- The fifteenth's tablespace, a cluster-wide name, is named after the backend that runs
         -- it.
@@ -1227,6 +1228,25 @@ with the leaf held SHARE throughout. That is the lock order every writer uses (d
 posting page) and keeps waiting only the writers of the keys on that one leaf, for one walk of one
 set; the 50-call stress run below needed it for 6 of its 70 set walks. It is a PRIMARY's last
 resort: replay does not use that lock order (§25), and a standby never makes that walk (below).
+
+**Position trees** (§17) are walked the same way, after their posting set: with nothing held, the
+entry read again, the walk kept when the entry reads the same. A writer holds the entry's leaf from
+its first record to its last, the row's positions among them (W1), and every INSERT that gets to its
+TID changes `ntids`. What the walk compares the tree with - at least as many members as TIDs, and
+every TID of the posting set among the members - needs one more step, because an INSERT that fails
+between its two writes leaves members and no TID, and the entry unchanged: a split it made of a leaf
+the walk had read can have moved members past the walk. So a kept walk is exact about what it found
+(the posting set it read is the entry's, unchanged, and no member leaves a tree while VACUUM is
+locked out) but not about what it missed: a walk that found every TID among the members is kept, and
+one that found a TID without positions, or too few members, is a suspicion, which a walk with the
+entry's leaf held SHARE settles - as is a tree that changed under three walks in a row. The
+comparison reads the two trees' leaves in step, a copy of one leaf of each and one member at a time,
+and keeps nothing else: collecting the members' codes to look the TIDs up in would cost 8 bytes a
+row, without bound. `test/isolation/verify_positions.spec` parks the check after each
+walk (`lion-verify-postree-walked`) and before each new one (`lion-verify-postree-rewalk`) while an
+INSERT changes the key, until the walk with the leaf held (`lion-verify-postree-held`, 'notice'). A
+standby walks a position tree until a walk gets to its end and compares nothing: it has no hold to
+settle a suspicion with.
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -1343,14 +1363,15 @@ on a directory page (`lion-verify-dir-page-read`), after a posting set's leaves
 behind it, split the page it stands on, split its root, split a posting leaf, push a posting root
 down, spill an INLINE entry, keep changing a set until it is walked with its leaf held
 (`lion-verify-set-held` with 'notice'; the check parks before each new walk of the set too, at
-`lion-verify-set-rewalk`), and take pages VACUUM freed for an existing set and for a new
-one; every time the check passes and the observer shows the change was made. It also shows VACUUM
+`lion-verify-set-rewalk`; verify_positions.spec does the same to a position tree), and take pages
+VACUUM freed for an existing set and for a new one; every time the check passes and the observer shows the change was made. It also shows VACUUM
 waiting for the check, the check waiting for a statement that holds the index open for writing and
 not for a transaction whose statement is over, and `LOCK TABLE; DROP INDEX` in another transaction
 going through while the check waits for the table. Each change is one the old AccessShareLock code
 reported as damage or would have; `verify.sql`'s sixth damage case is real damage that only the
 recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
-left links and root flags settled on the spot, and posting-set walks made, thrown away and held.
+left links and root flags settled on the spot, and posting-set and position-tree walks made, thrown
+away and held.
 
 ### Facet counts (`lion_facets.c`)
 
@@ -6348,11 +6369,14 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   its first chunk (P3), no leaf's last member is above the separator of its right neighbour (at
   it is fine), and an internal page's last separators may equal its high key, which an internal
   split through a run of equal separators leaves. Every chunk, the members' order across the
-  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary, which holds
-  the entry's leaf for the walk, so is that every TID of the posting set has positions. On a
-  standby a walk that replay changed under it is repeated, as a posting set's is. verify.sql's
-  ninth case damages a downlink, a separator and a leaf's min of a tree with an internal level,
-  and verify() must report each.
+  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary so is that
+  every TID of the posting set has positions, the two trees' leaves read in step and nothing
+  collected. The tree is walked with nothing held and kept when its entry reads the same before
+  and after, and a walk that finds a TID without positions is made again with the entry's leaf
+  held before it is reported (§7, "Position trees"). On a standby a walk that replay changed under
+  it is repeated, as a posting set's is, and nothing is compared. verify.sql's ninth case damages
+  a downlink, a separator and a leaf's min of a tree with an internal level, its seventeenth the
+  members of a tree, and verify() must report each.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every
