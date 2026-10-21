@@ -262,30 +262,52 @@ lion_add_parallel_count_path(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * Turn the RANGE clauses of every range column but `keep` (an index into
- * rangepos, or -1 for none) into bounds of ranges taken as sources
- * (DESIGN.md §32): LION_CLAUSE_RANGESRC in the clause lists, which is all the
- * executor goes by.
+ * rangevars and rangepos, or -1 for none) into bounds of ranges taken as
+ * sources (DESIGN.md §32): LION_CLAUSE_RANGESRC in the clause lists, which is
+ * all the executor goes by.
+ *
+ * Each position is written through, so it has to name a clause of the lists,
+ * and a RANGE clause of its own column (lion_count_path_where_leaf()).  One
+ * that does not is a position kept from a restriction whose clauses were
+ * taken back - the next clause appended is at it, or none is - and an error
+ * here, not a write past the lists or an equality made a range's bound.
  */
 static void
-lion_ranges_to_sources(List *rangepos, int keep, List *wherekinds,
-					   List *clauseinfos)
+lion_ranges_to_sources(List *rangevars, List *rangepos, int keep,
+					   List *wherekinds, List *clauseinfos)
 {
+	int			nclause = list_length(clauseinfos);
 	int			r = 0;
-	ListCell   *lc;
+	ListCell   *l1;
+	ListCell   *l2;
 
-	foreach(lc, rangepos)
+	if (list_length(rangevars) != list_length(rangepos) ||
+		list_length(wherekinds) != nclause)
+		elog(ERROR, "LionCount: the range lists are out of step with the clauses");
+	forboth(l1, rangevars, l2, rangepos)
 	{
+		AttrNumber	attno = ((Var *) lfirst(l1))->varattno;
 		ListCell   *lp;
 
 		if (r++ == keep)
 			continue;
-		foreach(lp, (List *) lfirst(lc))
+		foreach(lp, (List *) lfirst(l2))
 		{
 			int			pos = lfirst_int(lp);
+			ListCell   *kind;
+			LionClauseInfo *ci;
 
-			lfirst_int(list_nth_cell(wherekinds, pos)) = LION_CLAUSE_RANGESRC;
-			((LionClauseInfo *) list_nth(clauseinfos, pos))->kind =
-				LION_CLAUSE_RANGESRC;
+			if (pos < 0 || pos >= nclause)
+				elog(ERROR, "LionCount: a range bound at clause %d of %d",
+					 pos, nclause);
+			kind = list_nth_cell(wherekinds, pos);
+			ci = (LionClauseInfo *) list_nth(clauseinfos, pos);
+			if (lfirst_int(kind) != LION_CLAUSE_RANGE ||
+				ci->kind != LION_CLAUSE_RANGE || ci->attno != attno)
+				elog(ERROR, "LionCount: clause %d is no range bound of column %d",
+					 pos, (int) attno);
+			lfirst_int(kind) = LION_CLAUSE_RANGESRC;
+			ci->kind = LION_CLAUSE_RANGESRC;
 		}
 	}
 }
@@ -346,7 +368,8 @@ typedef struct LionCountPathBuild
 	List	   *targets;		/* LionCountTarget, one per counted relation */
 	LionCountTarget *first;
 	Var		   *notnullvar;		/* the first `IS NOT NULL` column */
-	Var		   *allvar;			/* a sum over every row drives by it (§35) */
+	Var		   *allvar;			/* a sum over all of a column's entries
+								 * drives by it (§14, §35) */
 	Var		   *rangevar;		/* the column the RANGE clauses bound (§28) */
 	List	   *rangeclauses;	/* ... and those clauses' RestrictInfos */
 	List	   *rangevars;		/* every column a range bounds (§28, §32) */
@@ -898,8 +921,10 @@ lion_count_path_noted(LionCountPathBuild *cx)
 
 /*
  * A WHERE restriction that is an OR (lion_count_path_where()), taken as one
- * source.  False when no posting set answers it, with the leaves of any arms
- * before the one that failed already appended to the clause lists.
+ * source.  False when no posting set answers it - an arm none answers, or a
+ * complement OR past the few there may be - with the leaves analysed by then
+ * appended to the clause lists and nothing else of cx changed; the caller
+ * takes the leaves back with the rest of the restriction's analysis.
  */
 static bool
 lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
@@ -999,20 +1024,26 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 		armlens = lappend_int(armlens, list_length(arm));
 	}
 
+	/*
+	 * An OR with a complement arm selects nothing by itself: the rows
+	 * outside M are what something else - a group, the sum over every row
+	 * (§35) - has to hand the count, so it is no positive source of the AND
+	 * and carries no pin for one.  Each such OR doubles the counts every
+	 * count becomes, so there may be a few of them at most - which is asked
+	 * before the OR is noted anywhere: one past them is a restriction no
+	 * posting set answers, residual, implied by every partition or the end
+	 * of the query, and an entry in `ors` left behind would make the clauses
+	 * appended after it its arms.
+	 */
+	if (compl && cx->ncompl >= LION_MAX_COMPL_ORS)
+		return false;
+
 	cx->ors = lappend(cx->ors,
 					  list_concat(list_make2_int(orfirst,
 												 list_length(armlens)),
 								  armlens));
 	if (thisrange)
 		cx->hasrangesrc = true;
-
-	/*
-	 * An OR with a complement arm selects nothing by itself: the rows
-	 * outside M are what something else - a group, the sum over every row
-	 * (§35) - has to hand the count, so it is no positive source of the AND
-	 * and carries no pin for one.  Each such OR doubles the counts every
-	 * count becomes, so there may be a few of them at most.
-	 */
 	if (compl)
 	{
 		ListCell   *lc;
@@ -1020,7 +1051,7 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 		for_each_from(lc, cx->clauseinfos, orfirst)
 			((LionClauseInfo *) lfirst(lc))->incompl = true;
 		cx->ncompl++;
-		return cx->ncompl <= LION_MAX_COMPL_ORS;
+		return true;
 	}
 	cx->havepositive = true;
 
@@ -1391,13 +1422,6 @@ lion_all_as_and(Node *clause)
 }
 
 /*
- * Every WHERE clause must be one the posting sets can answer, or, over a
- * partitioned table, one every partition's bounds imply.  Builds the clause
- * lists - whereattnos, clauseinfos, whereclauses, whereconsts, wherekinds,
- * whereopnos and whereinor, in step - with ors, the ranges per column
- * (rangevars, rangecls, rangepos) and what the clauses say of each column.
- */
-/*
  * May a WHERE clause no posting set answers be tested on the heap tuple of
  * each row the others select (DESIGN.md §10, "Residual clauses")?  Of one
  * plain table's count, not an FK-side join's: an expression over the
@@ -1465,15 +1489,24 @@ lion_where_indexed(LionCountPathBuild *cx, int from)
 }
 
 /*
- * What the analysis of one restriction may have added to cx, kept so that a
- * restriction that turns out to be residual leaves no trace of the leaves it
- * had appended: the struct, with its own copy of every list the analysis
- * appends to.
+ * What the analysis of one restriction may change in cx, kept so that a
+ * restriction no posting set answers - one that turns out to be residual,
+ * over a count by cells' predicates, or implied by every partition - leaves
+ * no trace of what it had taken already: the leaves of an OR's first arms,
+ * the bounds of a range, what they said of their columns.  The struct, with
+ * its own copy of every list the analysis appends to - and of the lists
+ * inside rangecls and rangepos, one per column, which
+ * lion_count_path_where_leaf() appends to in place: copies of the outer lists
+ * alone would share those with cx, and a bound taken back would stay in its
+ * column's at the position the next clause appended then has, or at one
+ * past the end of the lists.
  */
 static void
 lion_count_path_snapshot(const LionCountPathBuild *cx,
 						 LionCountPathBuild *snap)
 {
+	ListCell   *lc;
+
 	*snap = *cx;
 	snap->whereattnos = list_copy(cx->whereattnos);
 	snap->clauseinfos = list_copy(cx->clauseinfos);
@@ -1489,8 +1522,14 @@ lion_count_path_snapshot(const LionCountPathBuild *cx,
 	snap->nullattnos = list_copy(cx->nullattnos);
 	snap->valueattnos = list_copy(cx->valueattnos);
 	snap->rangevars = list_copy(cx->rangevars);
-	snap->rangecls = list_copy(cx->rangecls);
-	snap->rangepos = list_copy(cx->rangepos);
+	snap->rangecls = NIL;
+	foreach(lc, cx->rangecls)
+		snap->rangecls = lappend(snap->rangecls,
+								 list_copy((List *) lfirst(lc)));
+	snap->rangepos = NIL;
+	foreach(lc, cx->rangepos)
+		snap->rangepos = lappend(snap->rangepos,
+								 list_copy((List *) lfirst(lc)));
 }
 
 /*
@@ -1560,6 +1599,17 @@ lion_count_path_pred_drops(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	return true;
 }
 
+/*
+ * Every WHERE clause must be one the posting sets can answer, or, over a
+ * partitioned table, one every partition's bounds imply.  Builds the clause
+ * lists - whereattnos, clauseinfos, whereclauses, whereconsts, wherekinds,
+ * whereopnos and whereinor, in step - with ors, the ranges per column
+ * (rangevars, rangecls, rangepos) and what the clauses say of each column.
+ * A restriction no posting set answers that is residual, over a count by
+ * cells' predicates or implied by every partition is no clause of the lists,
+ * and whatever its analysis had noted of it is taken back
+ * (lion_count_path_snapshot()).
+ */
 static bool
 lion_count_path_where(LionCountPathBuild *cx)
 {
@@ -1599,9 +1649,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
-		if ((lion_enable_count_residual && !cx->partitioned &&
-			 cx->fj == NULL) || cx->cells)
-			lion_count_path_snapshot(cx, &snap);
+		lion_count_path_snapshot(cx, &snap);
 
 		/* a clause of an expression column is one of a column (§41) */
 		clause = lion_vcol_subst((Node *) rinfo->clause);
@@ -1721,25 +1769,29 @@ lion_count_path_where(LionCountPathBuild *cx)
 		/*
 		 * Otherwise that declines the query - unless every partition it
 		 * counts has bounds that imply the clause, when no row it counts can
-		 * fail it, and it is left out.  Whatever of it was taken already (the
-		 * first arms of an OR) goes too.
+		 * fail it, and it is left out.  Whatever of it was taken already
+		 * goes too, all of it: the first arms of an OR, and an OR the
+		 * posting sets answer but for being one complement OR too many,
+		 * whose entry in `ors` would otherwise make the clauses after it its
+		 * arms.
 		 */
 		if (!cx->partitioned ||
 			!lion_implied_everywhere(root, input_rel, input_rel,
 									 (Node *) rinfo->clause))
 			return false;
-		cx->impliedtexts =
-			lappend(cx->impliedtexts,
-					makeString(lion_deparse_rel_clause(root, rti,
-													   (Node *) rinfo->clause)));
-		cx->whereattnos = list_truncate(cx->whereattnos, startlen);
-		cx->clauseinfos = list_truncate(cx->clauseinfos, startlen);
-		cx->whereclauses = list_truncate(cx->whereclauses, startlen);
-		cx->whereconsts = list_truncate(cx->whereconsts, startlen);
-		cx->wherekinds = list_truncate(cx->wherekinds, startlen);
-		cx->whereopnos = list_truncate(cx->whereopnos, startlen);
-		cx->whereinor = list_truncate(cx->whereinor, startlen);
+		{
+			List	   *implied =
+				lappend(cx->impliedtexts,
+						makeString(lion_deparse_rel_clause(root, rti,
+														   (Node *) rinfo->clause)));
+
+			*cx = snap;
+			cx->impliedtexts = implied;
+		}
 	}
+
+	/* every phase after this one reads the ORs by the runs they name */
+	lion_ors_check(cx->ors, cx->clauseinfos);
 	return true;
 }
 
@@ -1784,8 +1836,8 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 	 */
 	if (fj != NULL && cx->rangevars != NIL)
 	{
-		lion_ranges_to_sources(cx->rangepos, -1, cx->wherekinds,
-							   cx->clauseinfos);
+		lion_ranges_to_sources(cx->rangevars, cx->rangepos, -1,
+							   cx->wherekinds, cx->clauseinfos);
 		cx->hasrangesrc = true;
 		cx->havepositive = true;
 	}
@@ -1803,7 +1855,6 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 		cx->imply.clauses = cx->rinfoclauses;
 		cx->imply.driven = true;
 		cx->imply.skipped = cx->impliedtexts;
-		cx->imply.leafclauses = cx->whereclauses;
 		cx->imply.ors = cx->ors;
 		if (fj->joinpath)
 			lion_try_semijoin_path(root, input_rel, fj, cx->whereattnos,
@@ -2523,6 +2574,9 @@ lion_count_path_filters(LionCountPathBuild *cx)
 		}
 	}
 
+	/* the filters' ORs follow the WHERE's, read by their runs as those are */
+	lion_ors_check(cx->ors, cx->clauseinfos);
+
 	cx->curfilter = 0;
 	cx->posattnos = posattnos;
 	cx->eqattnos = eqattnos;
@@ -2788,8 +2842,8 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 		}
 		if (list_length(cx->rangevars) > (best >= 0 ? 1 : 0))
 		{
-			lion_ranges_to_sources(cx->rangepos, best, cx->wherekinds,
-								   cx->clauseinfos);
+			lion_ranges_to_sources(cx->rangevars, cx->rangepos, best,
+								   cx->wherekinds, cx->clauseinfos);
 			cx->hasrangesrc = true;
 			cx->havepositive = true;
 		}
@@ -2840,7 +2894,10 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 		 * having one value per column or none - with the negated clauses
 		 * subtracted from each (lion_count_all_driver()).  Driven by the
 		 * first `IS NOT NULL` column, its own NULL entry is skipped and its
-		 * clause dropped; by any other, the plan names the column.
+		 * clause dropped (lion_locate_where()).  The plan names the column
+		 * whichever it is (LION_PRIV_ALLROWS): an `IS NOT NULL` among the
+		 * clauses may be an OR's leaf or a filtered count's, which says
+		 * nothing of the driver.
 		 */
 		Var		   *drive = lion_count_all_driver(cx);
 
@@ -2848,9 +2905,7 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 			return false;
 		cx->sumall = true;
 		cx->driveattno = drive->varattno;
-		if (cx->notnullvar == NULL ||
-			drive->varattno != cx->notnullvar->varattno)
-			cx->allvar = drive;
+		cx->allvar = drive;
 	}
 	/* A group folded to a constant can only have come from a WHERE key. */
 	if (cx->singlegroup && !cx->havepositive)
@@ -3019,8 +3074,8 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	{
 		/* §14's sum-over-all: one index, and it groups nothing. */
 		drive[0].attno = cx->driveattno;
-		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar :
-			(cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
+		drive[0].var = (cx->rangevar != NULL) ? cx->rangevar : cx->allvar;
+		Assert(drive[0].var != NULL);
 		drive[0].collation = InvalidOid;
 		drive[0].eqop = InvalidOid;
 		drive[0].valueout = false;
@@ -3077,7 +3132,6 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	cx->imply.clauses = cx->rinfoclauses;
 	cx->imply.driven = (ndrive > 0);
 	cx->imply.skipped = cx->impliedtexts;
-	cx->imply.leafclauses = cx->whereclauses;
 	cx->imply.ors = cx->ors;
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, cx->whereattnos,
 							 cx->clauseinfos,
@@ -3136,7 +3190,7 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 	else if (cx->sumall)
 	{
 		/* Every entry of the driving index is visited, one group or not. */
-		Var		   *dv = (cx->allvar != NULL) ? cx->allvar : cx->notnullvar;
+		Var		   *dv = cx->allvar;
 
 		Assert(dv != NULL);
 		cx->numgroups = estimate_num_groups(root,
@@ -3530,7 +3584,10 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		}
 	}
 
-	/* the column a sum over every row drives by (DESIGN.md §35) */
+	/*
+	 * the column a sum over all of a column's entries drives by, when no
+	 * range bounds the walk (DESIGN.md §14, §35)
+	 */
 	if (cx->allvar != NULL)
 		p->allattno = cx->allvar->varattno;
 
@@ -3794,8 +3851,10 @@ lion_count_path_make(LionCountPathBuild *cx)
  * Does run r of filtered counts over a sum of every row (DESIGN.md §10,
  * "Filtered counts"; §35) count an intersection instead of the sum - a
  * filter's run with a source of its own that selects rows, an equality, a
- * list, an `IS NULL` or an OR, as lion_run_count() decides at run time from
- * the located sources?  Without a range bounding the walk.
+ * list, an `IS NULL`, the rows of an array column's reserved entries (§17),
+ * or an OR with no range taken as a source among its leaves and no
+ * complement arm, as lion_run_has_plain_source() decides at run time from the
+ * located sources?  Without a range bounding the walk.
  */
 static bool
 lion_count_run_plain(LionCountPathBuild *cx, int r)
@@ -3808,11 +3867,34 @@ lion_count_run_plain(LionCountPathBuild *cx, int r)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
 
+		if (ci->filter == r && !ci->inor &&
+			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
+			 ci->kind == LION_CLAUSE_NULL || ci->kind == LION_CLAUSE_RESERVED))
+			return true;
+	}
+	foreach(lc, cx->ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first = linitial_int(one);
+		int			narms = lsecond_int(one);
+		int			nleaves = 0;
+		bool		range = false;
+		LionClauseInfo *ci;
+		int			a;
+		int			j;
+
+		ci = (LionClauseInfo *) list_nth(cx->clauseinfos, first);
 		if (ci->filter != r || ci->incompl)
 			continue;
-		if (ci->inor ? ci->kind != LION_CLAUSE_RANGESRC :
-			(ci->kind == LION_CLAUSE_EQ || ci->kind == LION_CLAUSE_ARRAY ||
-			 ci->kind == LION_CLAUSE_NULL))
+		for (a = 0; a < narms; a++)
+			nleaves += list_nth_int(one, 2 + a);
+		for (j = first; j < first + nleaves; j++)
+		{
+			ci = (LionClauseInfo *) list_nth(cx->clauseinfos, j);
+			if (ci->kind == LION_CLAUSE_RANGESRC)
+				range = true;
+		}
+		if (!range)
 			return true;
 	}
 	return false;
@@ -4560,8 +4642,8 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
 		return false;
 	if (cx->rangevars != NIL)
 	{
-		lion_ranges_to_sources(cx->rangepos, -1, cx->wherekinds,
-							   cx->clauseinfos);
+		lion_ranges_to_sources(cx->rangevars, cx->rangepos, -1,
+							   cx->wherekinds, cx->clauseinfos);
 		cx->hasrangesrc = true;
 		cx->havepositive = true;
 	}

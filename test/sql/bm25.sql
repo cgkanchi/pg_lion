@@ -22,7 +22,9 @@ CREATE INDEX bm_docs_d ON bm_docs USING lion (d) WITH (store_positions = true);
 VACUUM bm_docs;
 
 -- the reference: a row's length is its lexeme occurrences, a stripped
--- lexeme counted once; N and avgdl over the rows with a lexeme
+-- lexeme counted once; N and avgdl over the rows with a lexeme.  Each term,
+-- tf * (k1 + 1) / (tf + k1 * L), with its top and bottom divided by k1 + 1,
+-- so that a k1 near the largest double does not overflow it
 CREATE FUNCTION bm_ref(q text[], k int, k1 float8 DEFAULT 1.2, b float8 DEFAULT 0.75)
 RETURNS TABLE (id int, score float8) LANGUAGE sql AS $$
 WITH occ AS (SELECT t.id, t.ctid AS tid, u.lexeme,
@@ -31,8 +33,8 @@ WITH occ AS (SELECT t.id, t.ctid AS tid, u.lexeme,
 len AS (SELECT occ.id, sum(tf) AS dl FROM occ GROUP BY occ.id),
 st AS (SELECT count(*)::float8 AS n, avg(dl) AS avgdl FROM len),
 df AS (SELECT lexeme, count(*)::float8 AS df FROM occ WHERE lexeme = ANY (q) GROUP BY lexeme)
-SELECT occ.id, sum(ln(1 + (st.n - df.df + 0.5) / (df.df + 0.5)) * occ.tf * (k1 + 1) /
-				   (occ.tf + k1 * (1 - b + b * len.dl / st.avgdl))) AS s
+SELECT occ.id, sum(ln(1 + (st.n - df.df + 0.5) / (df.df + 0.5)) * occ.tf /
+				   (occ.tf / (k1 + 1) + k1 / (k1 + 1) * (1 - b + b * len.dl / st.avgdl))) AS s
   FROM occ JOIN df USING (lexeme) JOIN len USING (id), st
  GROUP BY occ.id, occ.tid ORDER BY s DESC, occ.tid LIMIT k $$;
 
@@ -66,6 +68,11 @@ SELECT bm_same('w1 | w2 | t7 | w30', '{w1,w2,t7,w30}', 5);
 SELECT bm_same('w0 | w1 | w9 | t3', '{w0,w1,w9,t3}', 1);
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 0, 0.75);	-- k1 = 0: tf ignored
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 3.0, 1.0);
+-- a k1 so large that tf * (k1 + 1) and k1 * L overflowed, and a term came
+-- out infinite or NaN: each is close to idf * tf / L now, as BM25's is when
+-- k1 grows; and the largest double
+SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 40, 1e308);
+SELECT bm_same('w4 | t5 | w30', '{w4,t5,w30}', 40, 1.7976931348623157e308, 1.0);
 -- the stripped row counts each lexeme once
 SELECT id, round(score::numeric, 6) FROM bm_lion('w2', 3000) WHERE id = 3001;
 -- a lexeme no row has, an empty query, a NOT alone, k = 0
@@ -108,6 +115,11 @@ SELECT bm_same('w1 | zz3150', '{w1,zz3150}', 40);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1:*', 10);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', -1);
 SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, -1);
+-- an infinite k1 made every score NaN; NaN is no k1 or b either
+SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, 'Infinity');
+SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, 'NaN');
+SELECT * FROM lion_bm25('bm_docs_d', 'w1', 10, 1.2, 'NaN');
+SELECT lion_bm25_score(d, 'w1', 'bm_docs_d', 'Infinity') FROM bm_docs LIMIT 1;
 CREATE INDEX bm_docs_plain ON bm_docs USING lion (d) WITH (store_positions = false);
 SELECT * FROM lion_bm25('bm_docs_plain', 'w1', 10);
 CREATE INDEX bm_docs_btree ON bm_docs (id);

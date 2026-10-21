@@ -2075,10 +2075,13 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
 /*
  * A reader's descent of the set rooted at head, stopped at `level`: the page
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
- * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
+ * With `before`, the route of what sorts just below ckey, as
+ * lion_posting_search_before() takes it.  For lion_index_verify() (DESIGN.md
+ * §7), as lion_dir_search_level() is.
  */
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
-										uint32 ckey, uint16 level);
+										uint32 ckey, uint16 level,
+										bool before);
 
 /*
  * Take the empty leaf blk out of the posting set (hash, head) while the key

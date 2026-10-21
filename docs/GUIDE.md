@@ -167,8 +167,9 @@ except a clause the partition's bounds imply. `kind = 'a'` over a table partitio
 once pruning has left only the `kind = 'a'` partitions (sub-partitions included), is true of every
 row they hold: it needs no index there and is left out of their counts, and `EXPLAIN` lists it
 under `Implied by Partition Bounds`. The proof is PostgreSQL's own, the one partial indexes use, so
-a partition that also takes NULLs, a default partition, or a generic plan's parameter implies
-only what that proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') OR
+a partition that also takes NULLs, a default partition, a generic plan's parameter or a stable
+expression (`current_setting(...)`, whose value a cached plan does not keep) implies only what that
+proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') OR
 (kind = 'b' AND tags && '{y}')` - is narrowed the same way: each partition leaves out the arms its
 bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
