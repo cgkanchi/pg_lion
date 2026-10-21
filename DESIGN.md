@@ -6233,14 +6233,20 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     row - decodes each member of its lexemes once, and one whose candidates lie further apart than
     a chunk holds decodes part of one at each: 1,105 members a seek, measured, of a chunk of
     1,339 of one position (`LION_POS_SEEK_MEMBERS`, 1,000).  Each member decoded is
-    `pg_lion.position_member_cost` (2 `cpu_operator_cost`), and each candidate
-    `pg_lion.position_check_cost` (3) a lexeme beyond that, `TS_execute()` and its callbacks:
-    14 ns and 21 ns on an assert build whose position-free counts run at 330 to 375 units a
-    millisecond.  A lexeme's members are the share of the rows that makes the clause's
-    selectivity their product.  The copy is priced once for its candidates, and every other
-    count for its own, its lexemes decoded up to them - which an FK-side join's probing counts,
-    their candidates a few of every part of the heap, pay at almost every one.  The heap recheck
-    (`lion_cost_recheck()`) charges such a clause nothing.
+    `pg_lion.position_member_cost` (1.8 `cpu_operator_cost`), and each candidate
+    `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its callbacks:
+    8.2 to 9.4 ns and 21.6 ns on the release build (§10, "The units"), at the reference's 5 ns a
+    `cpu_operator_cost`; the same counts without positions run there at 350 to 1,100 units a
+    millisecond, around the reference.  A lexeme's members are the share of the rows that makes
+    the clause's selectivity their product.  The copy is priced once for its candidates, and
+    every other count for its own, its lexemes decoded up to them - which an FK-side join's
+    probing counts, their candidates a few of every part of the heap, pay at almost every one.
+    The heap recheck (`lion_cost_recheck()`) charges such a clause nothing.  An AM scan, plain or
+    bitmap, is priced the same way once a scan (`lion_cost_scan_posfilter()`, from
+    `lioncostestimate()`): its cursors begin again at every scan, so a nested loop's inner scan
+    pays the seeks to its key's candidates at every repetition: a nested loop over 20 keys of a
+    dimension into the fact's lion index, 3,000 candidates 2,000 rows apart, takes 68 ms, against
+    19 ms for the FK-side join that collects the filter once.
   - **Under an OR** no recheck sees a leaf alone: the row passes when any arm holds, and the
     other arms are answered from posting sets.  A leaf the sets only bound is taken there when it
     is a literal an index that stores positions can follow (`lion_query_posexact()`;
