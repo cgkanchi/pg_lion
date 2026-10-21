@@ -3089,9 +3089,9 @@ these sets are.
   the source is. Unpriced, `count(*) WHERE c1 <> 3` cost what `count(*)` cost, and a partial index
   that subtracts per entry was chosen at 1.7 ms over the whole index's one merge at 0.38 (§45.6).
 - **A filtered run over a sum of every row** ("Filtered counts", §35) that has a source of its own
-  that selects rows - an equality, a list, `IS NULL`, an OR with no range and no complement arm -
-  is counted as that source's intersection with the rest (`lion_run_count()`), and is priced as one
-  (`lion_count_run_plain()`), not as the sum.
+  that selects rows - an equality, a list, `IS NULL`, an array column's reserved entries (§17), an
+  OR with no range and no complement arm - is counted as that source's intersection with the rest
+  (`lion_run_count()`), and is priced as one (`lion_count_run_plain()`), not as the sum.
 - **Residual rows over a partial index** (§45). The rows a residual clause is tested on are those
   the restrictions select within the index's predicate: each predicate clause the restrictions do
   not imply restricts the rows fetched (`lion_residual_rows()`). Without it, an index `WHERE w > 5`
@@ -3447,8 +3447,8 @@ the row filter, and a range source's other bounds are looked for in its own filt
   table's sum over its partitions) the runs' totals make the one row: a COUNT form prints run f's
   total, SUM prints NULL when run 0's is 0, SUMNULL when run f's is. Where the WHERE alone is
   summed over every row (§35), a filter's run with a pinned source of its own - an equality, a
-  list, a null test, or an OR with no range and no complement arm - is counted as a plain count
-  instead. An OR with a complement arm selects nothing by itself (§35, "Complements in an OR"), and
+  list, a null test, an array column's reserved entries (§17), or an OR with no range and no
+  complement arm - is counted as a plain count instead. An OR with a complement arm selects nothing by itself (§35, "Complements in an OR"), and
   a run whose only source it is is summed over every row as the WHERE's run is.
 - **With a GROUP BY** - one column, two (§20), the decoded walk (§34), on a table or a
   partitioned one - every run emits its groups as partial rows below core's Finalize HashAggregate:
