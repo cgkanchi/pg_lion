@@ -938,13 +938,14 @@ lion_verify_directory(LionVerifyState *vs)
 /*
  * The meta page's count of directory pages, against the walked pages of
  * every level.  A split adds its new pages to the count in the record that
- * links them in, and page deletion takes them off in a record of its own
- * after the one that unlinks them (lion_dirdel_count()), so a crash in
- * between leaves the count high and nothing leaves it low: read after the
- * walk, it is at least what the walk found, splits beside the check
- * included.  Nothing else takes a page out of the directory, and VACUUM,
- * which does, waits for the check.  The count is the planner's (§21,
- * lion_index_dir_pages()).
+ * links them in, and page deletion - VACUUM's, which waits for the check -
+ * takes them off in a record of its own after the ones that unlink them
+ * (lion_dirdel_count()), so a crash, an ERROR or a cancel in between leaves
+ * the count high and nothing leaves it low: read after the walk, it is at
+ * least what the walk found, splits beside the check included.  On a standby
+ * the replay of a deletion can take off pages the walk counted, a report of
+ * the kind DESIGN.md §7 says to confirm with replay paused.  The count is
+ * the planner's (§21, lion_index_dir_pages()).
  */
 static void
 lion_verify_dirpages(LionVerifyState *vs, uint64 walked)
@@ -1050,21 +1051,23 @@ lion_verify_meta(LionVerifyState *vs)
 					RelationGetRelationName(vs->index), meta->order_flags);
 
 	/*
-	 * Two counts of pages, each at most the pages there are besides this one:
-	 * the directory's pages, which the planner prices a lookup by (§21,
-	 * lion_index_dir_pages()) and which lion_verify_dirpages() bounds from
-	 * below once the directory is walked, and the pages out of the index's
-	 * trees that the last VACUUM could not hand out yet (lion.h), which
-	 * decides whether a VACUUM with nothing to remove reads the whole index.
-	 * The relation may have grown since its length was taken.
+	 * Two counts of pages.  The directory's, which the planner prices a
+	 * lookup by (§21, lion_index_dir_pages()), is never below 1, nor below
+	 * the pages the walk finds (lion_verify_dirpages()), and has no bound
+	 * above: page deletion takes its pages off in a record after the ones
+	 * that unlink them, so a crash, an ERROR or a cancel in between leaves it
+	 * high for good - by blocks that may have become directory pages again
+	 * since.  The pages out of the index's trees that the last VACUUM could
+	 * not hand out yet (lion.h), which decide whether a VACUUM with nothing
+	 * to remove reads the whole index, are blocks one sweep counted once
+	 * each, so at most the pages there are besides this one.  The relation
+	 * may have grown since its length was taken.
 	 */
-	if (meta->dirpages >= vs->nblocks ||
-		LionPageGetOpaque(page)->maxckey >= vs->nblocks)
+	if (meta->dirpages < 1)
+		lion_corrupt("lion index \"%s\": meta page counts no directory pages, but the directory has at least its root",
+					RelationGetRelationName(vs->index));
+	if (LionPageGetOpaque(page)->maxckey >= vs->nblocks)
 		lion_verify_refresh_nblocks(vs);
-	if (meta->dirpages < 1 || meta->dirpages >= vs->nblocks)
-		lion_corrupt("lion index \"%s\": meta page counts %u directory pages, but the index has %u blocks besides it",
-					RelationGetRelationName(vs->index), meta->dirpages,
-					vs->nblocks - 1);
 	if (LionPageGetOpaque(page)->maxckey >= vs->nblocks)
 		lion_corrupt("lion index \"%s\": meta page counts %u pages waiting to be reused, but the index has %u blocks besides it",
 					RelationGetRelationName(vs->index),

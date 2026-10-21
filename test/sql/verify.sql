@@ -546,10 +546,10 @@ SET client_min_messages = warning;
 -- (13) the meta page's other words, each in an index of its own: the unused
 -- bucket count (36, always 0), a WAL mode the format does not have (56), an
 -- order flag it does not have (bit 8 of 60), and its two counts of pages -
--- the directory's (52), which can be no page at all, more pages than the
--- index has, or fewer than the directory walk finds (lion_vfy_badd's has a
--- root and six leaves), and the pages the last VACUUM could not hand out
--- (12 of block 0's special area).
+-- the directory's (52), which can be no page at all or fewer than the
+-- directory walk finds (lion_vfy_badd's has a root and six leaves), and the
+-- pages the last VACUUM could not hand out (12 of block 0's special area),
+-- which can be no more than the index has.
 CREATE FUNCTION lion_vfy_meta(tbl regclass, pos int8, val bytea)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
@@ -567,7 +567,6 @@ SELECT what, lion_vfy_meta(tbl, pos, val) AS verify
 			   ('wal mode', 'lion_vfy_bad', 56, lion_vfy_le32(7)),
 			   ('order flags', 'lion_vfy_bad', 61, '\x01'::bytea),
 			   ('no directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(0)),
-			   ('too many directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(1000000)),
 			   ('too few directory pages', 'lion_vfy_badd', 52, lion_vfy_le32(2)),
 			   ('pages to reuse', 'lion_vfy_bad', :special + 12, lion_vfy_le32(1000000)))
 	   v(what, tbl, pos, val);

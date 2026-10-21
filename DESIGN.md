@@ -1019,9 +1019,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- bit that kind never carries: a page of a posting set is never flagged as one of a
         -- position tree, which every reader of the set refuses, ending the set there), meta
         -- values (every word the format has: its WAL mode, its order flags, the unused bucket
-        -- count of 0, and the count of directory pages - at least the pages the walk finds, which
-        -- is all a crash can leave it above - and of pages waiting for reuse, each below the
-        -- index's length), entry flags,
+        -- count of 0, the count of directory pages - at least the pages the walk finds, and with
+        -- no bound above, since a deletion whose count record a crash or a cancel lost leaves it
+        -- high - and the count of pages waiting for reuse, below the index's length), entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container and that every member is a heap tuple - an offset 1 ..
         -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
