@@ -396,6 +396,41 @@ SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND n IS NOT NUL
  LionCount, 1 rows, 0 rechecked, 0 removed
 (1 row)
 
+-- ... but not a null test or a <> on an index expression, which the scan
+-- cannot test on a heap column: the query is not pushed down when it is known
+-- only at run time, and is with a literal
+CREATE INDEX lion_mk_ne ON lion_mk_t USING lion ((n + 0));
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) IS NOT NULL', '''{}''');
+      lion_mk       
+--------------------
+ not pushed, 1 rows
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) <> 2', '''{}''');
+      lion_mk       
+--------------------
+ not pushed, 1 rows
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND tsv @@ $2 AND (n + 0) <> 2', '''{}'', ''!w5''');
+      lion_mk       
+--------------------
+ not pushed, 1 rows
+(1 row)
+
+SELECT lion_mk('SELECT count(*) FROM lion_mk_t WHERE tags @> $1 AND (n + 0) <> 2', '''{t2}''');
+      lion_mk       
+--------------------
+ not pushed, 1 rows
+(1 row)
+
+SELECT lion_mk($$SELECT count(*) FROM lion_mk_t WHERE tags @> '{t2}' AND (n + 0) <> 2$$);
+                  lion_mk                  
+-------------------------------------------
+ LionCount, 1 rows, 0 rechecked, 0 removed
+(1 row)
+
+DROP INDEX lion_mk_ne;
 SELECT lion_mk('SELECT n, count(*) FROM lion_mk_t WHERE tags @> $1 GROUP BY n', '''{}''');
                      lion_mk                     
 -------------------------------------------------

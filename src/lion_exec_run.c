@@ -819,6 +819,7 @@ lion_reset_run(LionCountScanState *st)
 		cl->xval = (Datum) 0;
 		cl->xvalown = false;
 	}
+	lion_clause_values_free(st);
 	if (st->valcxt != NULL)
 		MemoryContextReset(st->valcxt);
 
@@ -1139,6 +1140,8 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 	sums->rangesrc_collected += st->rangesrc_collected;
 	sums->rangesrc_walked += st->rangesrc_walked;
 	sums->rangesrc_spilled += st->rangesrc_spilled;
+	sums->listsrc_collected += st->listsrc_collected;
+	sums->listsrc_spilled += st->listsrc_spilled;
 	sums->wherecollected += st->wherecollected;
 	sums->wherespilled += st->wherespilled;
 	sums->groupbatches += st->groupbatches;
@@ -1358,6 +1361,7 @@ lion_end_custom_scan(CustomScanState *node)
 	}
 	if (st->valcxt != NULL)
 	{
+		lion_clause_values_free(st);
 		MemoryContextDelete(st->valcxt);
 		st->valcxt = NULL;
 	}
