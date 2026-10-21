@@ -170,9 +170,11 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
  * heap that many scans fetch, by index_pages_fetched() and the correlation of
  * the table's order with the index; the descent's comparisons and pages, the
  * index tuples read and their scan keys; and a cpu_tuple_cost and the clauses
- * for each row found.  Beside them, what the node does with the child's rows:
- * each one's keys evaluated and hashed, each distinct one kept.  The child's
- * own price is the caller's.
+ * for each row found, and the expressions it is evaluated on beside a count
+ * by cells (`rowexprs`, the predicates) with a cpu_operator_cost each to find
+ * its cell.  Beside them, what the node does with the child's rows: each
+ * one's keys evaluated and hashed, each distinct one kept.  The child's own
+ * price is the caller's.
  *
  * `lookups` is the distinct keys of the child's rows, as estimate_num_groups()
  * makes them of the inner side's key expressions, and the rows of one lookup
@@ -183,7 +185,7 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
  */
 static void
 lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions,
-				int ngroup, LionAntiPlan *plan)
+				int ngroup, List *rowexprs, LionAntiPlan *plan)
 {
 	RelOptInfo *rel = anti->outerrel;
 	IndexOptInfo *idx = plan->idx;
@@ -212,6 +214,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	Cost		cost;
 	QualCost	qual;
 	QualCost	keyeval;
+	QualCost	roweval;
 	int			k;
 
 	for (k = 0; k < plan->nkey; k++)
@@ -272,8 +275,14 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	if (plan->tids)
 		cost += fetched * cpu_operator_cost;
 
-	/* ... and its group found, to subtract it from */
+	/* ... and its group found, to subtract it from, or its cell */
 	cost += fetched * ngroup * cpu_operator_cost;
+	if (rowexprs != NIL)
+	{
+		cost_qual_eval(&roweval, rowexprs, root);
+		cost += roweval.startup + fetched *
+			(roweval.per_tuple + list_length(rowexprs) * cpu_operator_cost);
+	}
 
 	/* the child's rows: their keys evaluated, hashed and kept once */
 	cost_qual_eval(&keyeval, innerkeys, root);
@@ -296,11 +305,13 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
  * with an equality scan key on its first column at least
  * (lion_anti_index_keys()).  Of several, the one whose scan keys cover the
  * most columns, and of those the smallest: the fewest rows found that the
- * join clauses then reject, and the fewest pages.
+ * join clauses then reject, and the fewest pages.  `ngroup` and `rowexprs`
+ * are what a row found is subtracted from: its group's columns, or the
+ * predicates that tell its cell (lion_anti_price()).
  */
 bool
 lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions,
-				 int ngroup, LionAntiPlan *out)
+				 int ngroup, List *rowexprs, LionAntiPlan *out)
 {
 	RelOptInfo *rel = anti->outerrel;
 	LionAntiPlan best;
@@ -335,7 +346,7 @@ lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restriction
 		return false;
 
 	best.tids = lion_anti_needs_tids(&best);
-	lion_anti_price(root, anti, restrictions, ngroup, &best);
+	lion_anti_price(root, anti, restrictions, ngroup, rowexprs, &best);
 	*out = best;
 	return true;
 }

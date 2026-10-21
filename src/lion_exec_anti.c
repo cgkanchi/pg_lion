@@ -13,7 +13,10 @@
  *		counting the ones that pass: into one total for an ungrouped count,
  *		into each one's group for a GROUP BY.  Each row it emits then has its
  *		count less that (lion_anti_adjust(), from lion_emit_keys()), and a
- *		group that comes to nothing is no row.
+ *		group that comes to nothing is no row.  Beside a count by cells each
+ *		row that passes is kept with its cell, the predicates evaluated on
+ *		it, and the cells lose their rows as the tally gives them up
+ *		(lion_anti_cells_hold(), from lion_next_cells()).
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -46,6 +49,9 @@ lion_anti_nexprs(const LionCountPriv *priv)
  * one of the table's, read from each row a key finds at the attnum its place
  * in custom_scan_tlist names - a LION_TL_RESID column or one the target list
  * prints.  Positions in the scan tuple, which evalslot has the descriptor of.
+ * Beside a count by cells setrefs.c points a clause's copy of a predicate at
+ * the predicate's LION_TL_CELLPRED place, which holds its truth in the row
+ * (lion_anti_cells_truths()).
  */
 static void
 lion_anti_columns(LionAntiState *as, CustomScanState *node,
@@ -86,6 +92,12 @@ lion_anti_columns(LionAntiState *as, CustomScanState *node,
 			continue;
 
 		kind = priv->tlkind[pos];
+		if (LION_TL_IS_CELLPRED(kind))
+		{
+			if (priv->ncelldim == 0)
+				elog(ERROR, "LionCount: an anti join clause reads a cells predicate without cells");
+			continue;
+		}
 		if (LION_TL_IS_ANTI(kind))
 		{
 			Form_pg_attribute att = TupleDescAttr(desc, pos);
@@ -115,6 +127,7 @@ lion_anti_columns(LionAntiState *as, CustomScanState *node,
  * The GROUP BY columns a row found is subtracted from the group of: each
  * one's equality and hash function under its collation, as the plan's
  * grouping has them (LION_PRIV_ANTI), and its type's length and passing.
+ * None of a count by cells, whose walked column groups nothing.
  */
 static void
 lion_anti_groups(LionAntiState *as, const LionCountPriv *priv)
@@ -125,6 +138,8 @@ lion_anti_groups(LionAntiState *as, const LionCountPriv *priv)
 	attno[0] = priv->groupattno;
 	attno[1] = priv->groupattno2;
 	as->ngroup = 0;
+	if (priv->ncelldim > 0)
+		return;
 	for (g = 0; g < 2; g++)
 	{
 		Oid			eqop = priv->anti.groupeq[g];
@@ -148,11 +163,54 @@ lion_anti_groups(LionAntiState *as, const LionCountPriv *priv)
 }
 
 /*
+ * Beside a count by cells, each predicate ready to evaluate on a row a key
+ * finds: the expression of its LION_TL_CELLPRED place in custom_scan_tlist,
+ * over the table's columns, which reads them from the heap's own slot - no
+ * parent node, whose scan slot's form would let the expression skip
+ * deforming the tuple.
+ */
+static void
+lion_anti_cells_begin(LionAntiState *as, CustomScan *cscan,
+					  const LionCountPriv *priv)
+{
+	ListCell   *lc;
+	int			i = 0;
+	int			p;
+
+	as->cells = true;
+	as->npred = priv->ncellpred;
+	as->predstate = (ExprState **)
+		palloc0(sizeof(ExprState *) * Max(as->npred, 1));
+	as->predpos = (int *) palloc0(sizeof(int) * Max(as->npred, 1));
+	as->predtruth = (uint8 *) palloc0(sizeof(uint8) * Max(as->npred, 1));
+	foreach(lc, cscan->custom_scan_tlist)
+	{
+		TargetEntry *tle = (TargetEntry *) lfirst(lc);
+		int			kind = (i < priv->ntl) ? priv->tlkind[i] : 0;
+
+		if (LION_TL_IS_CELLPRED(kind))
+		{
+			p = LION_TL_CELLPRED_NO(kind);
+			if (p >= as->npred || as->predstate[p] != NULL)
+				elog(ERROR, "LionCount: cells predicate %d in the scan twice", p);
+			as->predstate[p] = ExecInitExpr(tle->expr, NULL);
+			as->predpos[p] = i;
+		}
+		i++;
+	}
+	for (p = 0; p < as->npred; p++)
+	{
+		if (as->predstate[p] == NULL)
+			elog(ERROR, "LionCount: cells predicate %d is no column of the scan", p);
+	}
+}
+
+/*
  * The anti join's state, from the plan's ANTI member and the expressions
  * after the residual clauses in custom_exprs: its child, initialized for
  * EXPLAIN too, which prints it under the node; its keys' values and clauses
- * ready to evaluate; and its run's memory.  The B-tree and the table's slot
- * are opened at the first run.
+ * ready to evaluate; beside a count by cells, its predicates; and its run's
+ * memory.  The B-tree and the table's slot are opened at the first run.
  */
 void
 lion_begin_anti(LionCountScanState *st, CustomScanState *node,
@@ -215,6 +273,12 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	ExecStoreVirtualTuple(as->evalslot);
 	as->econtext = CreateExprContext(estate);
 
+	if (priv->ncelldim > 0)
+	{
+		if (st->cells == NULL)
+			elog(ERROR, "LionCount: an anti join beside cells that do not run");
+		lion_anti_cells_begin(as, cscan, priv);
+	}
 	lion_anti_groups(as, priv);
 	as->cxt = AllocSetContextCreate(estate->es_query_cxt,
 									"LionCount anti join",
@@ -546,6 +610,35 @@ lion_anti_group_of(LionAntiState *as, const Datum *key, const bool *isnull,
 }
 
 /*
+ * Beside a count by cells, the truth of each predicate in the row in
+ * heapslot (LION_TRUTH_*), into predtruth - what tells the row's cell - and,
+ * as a boolean, into evalslot at the predicate's place, where a clause's
+ * copy of it reads it.
+ */
+static void
+lion_anti_cells_truths(LionAntiState *as)
+{
+	ExprContext *econtext = as->econtext;
+	TupleTableSlot *es = as->evalslot;
+	int			p;
+
+	ResetExprContext(econtext);
+	econtext->ecxt_scantuple = as->heapslot;
+	for (p = 0; p < as->npred; p++)
+	{
+		bool		isnull;
+		Datum		d = ExecEvalExprSwitchContext(as->predstate[p], econtext,
+												  &isnull);
+		bool		b = !isnull && DatumGetBool(d);
+
+		as->predtruth[p] = isnull ? LION_TRUTH_NULL :
+			(b ? LION_TRUTH_TRUE : LION_TRUTH_FALSE);
+		es->tts_values[as->predpos[p]] = BoolGetDatum(b);
+		es->tts_isnull[as->predpos[p]] = isnull;
+	}
+}
+
+/*
  * Does an inner row of the key match the row in heapslot?  The table's
  * columns go into evalslot once, each inner row's beside them in turn, and
  * the join clauses and the table's restrictions are tested over the two.
@@ -558,6 +651,8 @@ lion_anti_matches(LionAntiState *as, LionAntiKeyEnt *e)
 	LionAntiInner *in;
 	int			j;
 
+	if (as->cells)
+		lion_anti_cells_truths(as);
 	for (j = 0; j < as->nouter; j++)
 		es->tts_values[as->outerpos[j]] =
 			slot_getattr(as->heapslot, as->outerattno[j],
@@ -578,11 +673,46 @@ lion_anti_matches(LionAntiState *as, LionAntiKeyEnt *e)
 }
 
 /*
+ * A row taken away from a count by cells: its cell, of the truths
+ * lion_anti_matches() found, and the container key its TID is in - the
+ * range of a parallel count it is counted in, the TID of a heap-only tuple
+ * being in its chain's block, whose root the index has.  Of this
+ * participant once its range is known (lion_anti_cells_range()).
+ */
+static void
+lion_anti_cells_keep(LionCountScanState *st)
+{
+	LionAntiState *as = st->anti;
+	LionAntiCellRow *row;
+
+	if (as->ncellrows >= as->cellrowscap)
+	{
+		int			cap = (as->cellrowscap == 0) ? 64 : as->cellrowscap * 2;
+
+		if ((Size) cap > MaxAllocSize / sizeof(LionAntiCellRow))
+			elog(ERROR, "LionCount: too many rows for the anti join to take away");
+		as->cellrows = (as->cellrows == NULL) ?
+			(LionAntiCellRow *) MemoryContextAlloc(as->cxt,
+												   sizeof(LionAntiCellRow) * cap) :
+			(LionAntiCellRow *) repalloc(as->cellrows,
+										 sizeof(LionAntiCellRow) * cap);
+		as->cellrowscap = cap;
+	}
+	row = &as->cellrows[as->ncellrows++];
+	row->code = lion_cells_code_of(st->cells, as->predtruth);
+	row->ckey = lion_code_ckey((uint64)
+							   ItemPointerGetBlockNumber(&as->heapslot->tts_tid) <<
+							   LION_OFFSET_BITS);
+	row->mine = false;
+}
+
+/*
  * Each key looked up in the B-tree under the query's snapshot - the one the
  * count is made under, so that the rows found are rows the count counts
  * when they pass the restrictions (DESIGN.md §27, "Why the subtraction is
  * exact") - and each row found that a key's inner row matches subtracted:
- * from the total, or from its group.
+ * from the total, or from its group; or kept with its cell, beside a count
+ * by cells.
  */
 static void
 lion_anti_lookup(LionCountScanState *st)
@@ -647,9 +777,13 @@ lion_anti_lookup(LionCountScanState *st)
 			if (as->tids)
 				(void) hash_search(as->tidset, &as->heapslot->tts_tid,
 								   HASH_ENTER, &found);
-			as->subtracted++;
-			if (as->ngroup == 0)
+			if (as->cells)
+				lion_anti_cells_keep(st);
+			else if (as->ngroup == 0)
+			{
+				as->subtracted++;
 				as->total++;
+			}
 			else
 			{
 				Datum		key[2];
@@ -664,6 +798,7 @@ lion_anti_lookup(LionCountScanState *st)
 										  &isnull[g]);
 				lion_anti_group_of(as, key, isnull, true)->n++;
 				MemoryContextSwitchTo(oldcxt);
+				as->subtracted++;
 			}
 		}
 	}
@@ -683,7 +818,8 @@ lion_anti_lookup(LionCountScanState *st)
  * The run, once before the count's first row.  Of a parallel count the
  * participant that comes here first makes it, and the others subtract
  * nothing: their partial counts and its own add up to the count, less the
- * rows it found once.
+ * rows it found once.  Of a parallel count by cells every participant makes
+ * it, and takes away the rows of the ranges it counts.
  */
 void
 lion_anti_run(LionCountScanState *st)
@@ -694,7 +830,7 @@ lion_anti_run(LionCountScanState *st)
 		return;
 	as->ran = true;
 	as->total = 0;
-	if (st->shared != NULL &&
+	if (st->shared != NULL && !as->cells &&
 		pg_atomic_exchange_u32(&st->shared->antiowner, 1) != 0)
 	{
 		as->owner = false;
@@ -722,6 +858,9 @@ lion_anti_adjust(LionCountScanState *st, int nkeys, const Datum *keys,
 	LionAntiState *as = st->anti;
 	int64		n = 0;
 
+	/* a cell loses its rows as the tally gives it up (lion_next_cells()) */
+	if (as->cells)
+		return false;
 	if (as->owner)
 	{
 		if (as->ngroup == 0)
@@ -754,6 +893,146 @@ lion_anti_adjust(LionCountScanState *st, int nkeys, const Datum *keys,
 	return false;
 }
 
+/* ---------------------------------------------------------------------
+ * Beside a count by cells
+ * --------------------------------------------------------------------- */
+
+/*
+ * The container keys lo up to, not including, hi are counted by this
+ * participant - all of them, of a serial count: the rows taken away there
+ * are its own to take away.  Before the tally gives its first cell.
+ */
+void
+lion_anti_cells_range(LionCountScanState *st, uint32 lo, uint64 hi)
+{
+	LionAntiState *as = st->anti;
+	int			i;
+
+	if (!as->cells || as->heldready)
+		elog(ERROR, "LionCount: an anti join's range out of its count by cells");
+	for (i = 0; i < as->ncellrows; i++)
+	{
+		LionAntiCellRow *row = &as->cellrows[i];
+
+		if (!row->mine && row->ckey >= lo && (uint64) row->ckey < hi)
+		{
+			row->mine = true;
+			as->subtracted++;
+		}
+	}
+}
+
+static int
+lion_anti_cell_cmp(const void *a, const void *b)
+{
+	uint64		x = ((const LionAntiCell *) a)->code;
+	uint64		y = ((const LionAntiCell *) b)->code;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * The cells this participant's rows are of, each once with the rows it
+ * loses, in the order of their codes: made when the tally gives its first
+ * cell, every range counted.
+ */
+static void
+lion_anti_cells_ready(LionAntiState *as)
+{
+	int			n = 0;
+	int			i;
+
+	if (as->heldready)
+		return;
+	as->heldready = true;
+	for (i = 0; i < as->ncellrows; i++)
+	{
+		if (as->cellrows[i].mine)
+			n++;
+	}
+	as->held = (LionAntiCell *)
+		MemoryContextAllocZero(as->cxt, sizeof(LionAntiCell) * Max(n, 1));
+	for (i = 0; i < as->ncellrows; i++)
+	{
+		if (as->cellrows[i].mine)
+			as->held[as->nheld++].code = as->cellrows[i].code;
+	}
+	Assert(as->nheld == n);
+	if (n > 1)
+		qsort(as->held, n, sizeof(LionAntiCell), lion_anti_cell_cmp);
+
+	/* ... each code once, with the rows of it */
+	n = 0;
+	for (i = 0; i < as->nheld; i++)
+	{
+		if (n > 0 && as->held[n - 1].code == as->held[i].code)
+			as->held[n - 1].sub++;
+		else
+		{
+			as->held[n].code = as->held[i].code;
+			as->held[n].sub = 1;
+			as->held[n].held = 0;
+			n++;
+		}
+	}
+	as->nheld = n;
+	as->nextheld = 0;
+}
+
+/*
+ * A count the tally gives of cell `code`: held back, true, when the cell
+ * loses rows to the anti join - another count of it may follow, where the
+ * tally spilled, and the rows come off the cell's whole count.
+ */
+bool
+lion_anti_cells_hold(LionCountScanState *st, uint64 code, int64 count)
+{
+	LionAntiState *as = st->anti;
+	LionAntiCell key;
+	LionAntiCell *c;
+
+	lion_anti_cells_ready(as);
+	if (as->nheld == 0)
+		return false;
+	key.code = code;
+	c = (LionAntiCell *) bsearch(&key, as->held, as->nheld,
+								 sizeof(LionAntiCell), lion_anti_cell_cmp);
+	if (c == NULL)
+		return false;
+	c->held += count;
+	return true;
+}
+
+/*
+ * The tally given up, the next cell held back with rows left: its code and
+ * their number, false once there is none.  A cell that comes to nothing is
+ * no row.  A participant's every row taken away is a row of a range it
+ * counted, so a cell with fewer rows than it loses is a row taken away that
+ * the count did not count, which the node says rather than emit - of a
+ * parallel count too.
+ */
+bool
+lion_anti_cells_next(LionCountScanState *st, uint64 *code, int64 *count)
+{
+	LionAntiState *as = st->anti;
+
+	lion_anti_cells_ready(as);
+	while (as->nextheld < as->nheld)
+	{
+		LionAntiCell *c = &as->held[as->nextheld++];
+
+		if (c->held < c->sub)
+			elog(ERROR, "LionCount: the anti join took %lld rows from a cell of %lld",
+				 (long long) c->sub, (long long) c->held);
+		if (c->held == c->sub)
+			continue;
+		*code = c->code;
+		*count = c->held - c->sub;
+		return true;
+	}
+	return false;
+}
+
 /*
  * A rescan: the run is made again - the table's restrictions and the inner
  * side's rows may have other parameters - and the child starts over, by
@@ -779,6 +1058,13 @@ lion_anti_rescan(LionCountScanState *st, CustomScanState *node)
 	as->gnbuckets = 0;
 	as->ngroups = 0;
 	as->tidset = NULL;
+	as->cellrows = NULL;
+	as->ncellrows = 0;
+	as->cellrowscap = 0;
+	as->held = NULL;
+	as->nheld = 0;
+	as->nextheld = 0;
+	as->heldready = false;
 	MemoryContextReset(as->cxt);
 	ResetExprContext(as->econtext);
 	if (node->ss.ps.chgParam != NULL)
@@ -849,8 +1135,9 @@ lion_explain_anti(LionCountScanState *st, List *ancestors, ExplainState *es)
 /*
  * EXPLAIN ANALYZE's: the child's rows, the distinct keys looked up, the rows
  * the lookups found and those subtracted - every participant's, of which one
- * makes the run - and, with TIMING, the time reading the child and looking
- * the keys up took.
+ * makes the run, or each beside a count by cells, which subtracts the rows
+ * of its own ranges - and, with TIMING, the time reading the child and
+ * looking the keys up took.
  */
 void
 lion_explain_anti_counters(LionCountScanState *st, ExplainState *es)

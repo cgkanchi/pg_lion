@@ -555,6 +555,9 @@ lion_cells_run_ranged(LionCountScanState *st)
 		rs->ranges++;
 		rs->range = (int) r;
 		lion_key_range(shared->nranges, shared->ckeys, (int) r, &lo, &hi);
+		/* ... and the anti join's rows of it, which this one takes away */
+		if (st->anti != NULL)
+			lion_anti_cells_range(st, lo, hi);
 		lion_posting_set_release(&st->wherecoll);
 		st->wcollected = false;
 		MemoryContextReset(rs->cxt);
@@ -573,13 +576,12 @@ lion_cells_run_ranged(LionCountScanState *st)
 	st->wcollected = false;
 }
 
-/* The truth of predicate p in the cell whose outcomes are cr->outs */
+/* The truth of predicate p in outcome `out` of its dimension */
 static uint8
-lion_cells_truth(const LionCellsRun *cr, int p)
+lion_cells_truth_in(const LionCellsRun *cr, int p, int out)
 {
 	const LionCellsPredPriv *pp = &cr->pred[p];
 	const LionCellsDimPriv *pv = &cr->dimpriv[pp->dim];
-	int			out = cr->outs[pp->dim];
 
 	switch (pp->kind)
 	{
@@ -598,13 +600,73 @@ lion_cells_truth(const LionCellsRun *cr, int p)
 	return LION_TRUTH_NULL;		/* keep the compiler quiet */
 }
 
+/* ... and in the cell whose outcomes are cr->outs */
+static uint8
+lion_cells_truth(const LionCellsRun *cr, int p)
+{
+	return lion_cells_truth_in(cr, p, cr->outs[cr->pred[p].dim]);
+}
+
+/*
+ * The code of the cell a row is in whose predicates have the truths
+ * truth[] (LION_TRUTH_*) - of a row the anti join over a small inner side
+ * takes away (DESIGN.md §27, "Counts by cells beside the anti join"), its
+ * predicates evaluated on the heap's tuple.  Each dimension's outcome is the
+ * one in which every predicate of the dimension has the row's truth: one at
+ * most, since the outcomes are the classes of the rows the predicates tell
+ * apart - a scalar dimension's values by their truths, a multi-key one's by
+ * the leaves true of them, NULL by its own - and one at least, the row's
+ * own, which a row in no cell would contradict.
+ */
+uint64
+lion_cells_code_of(const LionCellsRun *cr, const uint8 *truth)
+{
+	int			preds[LION_CELLS_MAX_PREDS];
+	uint64		code = 0;
+	int			d;
+
+	if (cr->npred > LION_CELLS_MAX_PREDS)
+		elog(ERROR, "LionCount: %d predicates in a count by cells", cr->npred);
+	for (d = 0; d < cr->ndim; d++)
+	{
+		int			npd = 0;
+		int			o;
+		int			p;
+
+		for (p = 0; p < cr->npred; p++)
+		{
+			if (cr->pred[p].dim == d)
+				preds[npd++] = p;
+		}
+		for (o = 0; o < cr->radix[d]; o++)
+		{
+			int			i;
+
+			for (i = 0; i < npd; i++)
+			{
+				if (lion_cells_truth_in(cr, preds[i], o) != truth[preds[i]])
+					break;
+			}
+			if (i == npd)
+				break;
+		}
+		if (o == cr->radix[d])
+			elog(ERROR, "LionCount: a row of no outcome of cell column %d", d);
+		code += (uint64) o * cr->dims[d].weight;
+	}
+	return code;
+}
+
 /*
  * The next partial row of a count by cells: a cell with rows, its
  * predicates' truths and its count.  The whole count is made by the first
  * call, which holds no pin past it; the cells then go up one a call - more
  * than once a cell, where the tally spilled, which the Finalize Agg adds up
  * as it adds up the cells of one group.  A cell the plan's qual (the WHERE's
- * clauses over the predicates) rejects is consumed like any other.
+ * clauses over the predicates) rejects is consumed like any other.  Beside
+ * the anti join over a small inner side, a cell that loses rows to it is
+ * held back until the tally has given all of its counts, and goes up last
+ * with what is left of it (lion_anti_cells_hold()).
  */
 TupleTableSlot *
 lion_next_cells(LionCountScanState *st, bool *exhausted)
@@ -635,15 +697,27 @@ lion_next_cells(LionCountScanState *st, bool *exhausted)
 				elog(ERROR, "LionCount: the cells of a count by cells do not fit a code");
 			if (st->shared != NULL)
 				lion_cells_run_ranged(st);
-			else if (!lion_cells_run(st))
+			else
 			{
-				dr->finished = true;
-				continue;
+				/* every row the anti join takes away is this one's */
+				if (st->anti != NULL)
+					lion_anti_cells_range(st, 0, LION_KEYS_END);
+				if (!lion_cells_run(st) && st->anti == NULL)
+				{
+					dr->finished = true;
+					continue;
+				}
 			}
 			dr->emitting = true;
 		}
 
-		if (!lion_decode_tally_next(dr->tally, &code, &count))
+		if (lion_decode_tally_next(dr->tally, &code, &count))
+		{
+			/* a cell that loses rows to the anti join waits for the rest */
+			if (st->anti != NULL && lion_anti_cells_hold(st, code, count))
+				continue;
+		}
+		else if (st->anti == NULL || !lion_anti_cells_next(st, &code, &count))
 		{
 			dr->emitting = false;
 			lion_decode_tally_end(dr->tally);

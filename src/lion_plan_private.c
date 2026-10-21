@@ -1581,22 +1581,25 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 	/*
 	 * The anti join over a small inner side (DESIGN.md §27, "The anti join
-	 * over a small inner side") is a count of one plain table, ungrouped or
-	 * grouped by its own columns, less the rows its one child's rows match:
-	 * never the FK-side join, partitions, the decoded walk, a count(DISTINCT)
+	 * over a small inner side") is a count of one plain table, ungrouped,
+	 * grouped by its own columns or by cells, less the rows its one child's
+	 * rows match: never the FK-side join, partitions, a count(DISTINCT)
 	 * walked, the aggregates over keys, a top k, filtered counts, a coalesce
-	 * group or expression columns, and in parallel only as a count of one
-	 * row, whose subtraction one participant makes.  Its GROUP BY columns
-	 * have their equalities, and only they.  A plan without one has no child
-	 * but a join's.
+	 * group or expression columns.  Its GROUP BY columns have their
+	 * equalities, and only they; the decoded walk and a parallel GROUP BY are
+	 * a count by cells', whose walked column groups nothing.  A plan without
+	 * one has no child but a join's.
 	 */
 	if (p->hasanti &&
-		(p->hasjoin || ncustom_plans != 1 || p->npart > 0 || decode ||
+		(p->hasjoin || ncustom_plans != 1 || p->npart > 0 ||
 		 p->distattno != 0 || p->nwcol > 0 || p->topkn > 0 ||
 		 p->nfilter > 0 || p->coalconst != NULL || p->vcols != NIL ||
-		 p->ngroupn > 0 || pgroup ||
-		 (OidIsValid(p->anti.groupeq[0]) != (p->groupattno != 0)) ||
-		 (OidIsValid(p->anti.groupeq[1]) != (p->groupattno2 != 0))))
+		 (p->ncelldim > 0 ?
+		  (OidIsValid(p->anti.groupeq[0]) ||
+		   OidIsValid(p->anti.groupeq[1])) :
+		  (decode || p->ngroupn > 0 || pgroup ||
+		   (OidIsValid(p->anti.groupeq[0]) != (p->groupattno != 0)) ||
+		   (OidIsValid(p->anti.groupeq[1]) != (p->groupattno2 != 0))))))
 		elog(ERROR, "LionCount: malformed anti join");
 	if (!p->hasjoin && !p->hasanti && ncustom_plans != 0)
 		elog(ERROR, "LionCount: a child without a join");
@@ -1749,9 +1752,10 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 	 * of its driver, one table's, with no group of its own: what it emits is
 	 * the truth of each predicate in a cell and the cell's count, and nothing
 	 * else the target list could ask - a group key, a filtered count, an
-	 * aggregate over keys, a top k, a residual clause or a complement OR.
-	 * The driver is a dimension's column, or a column no predicate reads.  A
-	 * complement OR is refused for the decoded walk below.
+	 * aggregate over keys, a top k, a residual clause or a complement OR -
+	 * and, beside an anti join, the columns its clauses read, which nothing
+	 * prints.  The driver is a dimension's column, or a column no predicate
+	 * reads.  A complement OR is refused for the decoded walk below.
 	 */
 	if (p->ncelldim > 0)
 	{
@@ -1770,7 +1774,9 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 		if (LION_TL_IS_CELLPRED(kind) ? p->ncelldim == 0 :
 			(p->ncelldim > 0 &&
-			 kind != LION_TL_COUNT && kind != LION_TL_COUNT_ZERO))
+			 kind != LION_TL_COUNT && kind != LION_TL_COUNT_ZERO &&
+			 !(p->hasanti &&
+			   (LION_TL_IS_RESID(kind) || LION_TL_IS_ANTI(kind)))))
 			elog(ERROR, "LionCount: target list kind %d in a count %s cells",
 				 kind, (p->ncelldim > 0) ? "by" : "without");
 	}
