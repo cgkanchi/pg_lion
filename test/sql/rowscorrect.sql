@@ -162,6 +162,18 @@ RESET enable_bitmapscan;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 
+-- A relation proven empty has no rows, whatever the probe measures of its
+-- other clauses: constraint_exclusion = on refutes `id < 0 AND id > 10`, and
+-- the scan of lrc is estimated at none, as it is without the correction.
+-- 9: the filters of 1 with that contradiction.
+SET constraint_exclusion = on;
+INSERT INTO lrc_q VALUES
+	(9, $$SELECT id FROM lrc WHERE c5 = 1 AND c25 = 5 AND c50 = 11 AND id < 0 AND id > 10$$, NULL);
+SELECT n, lrc_actual(q) AS actual, lrc_est(q, true, node) AS corrected,
+	   lrc_est(q, false, node) AS uncorrected
+  FROM lrc_q WHERE n = 9;
+RESET constraint_exclusion;
+
 -- The answers do not depend on it.
 SELECT count(*), sum(f.v) FROM lrc_f f JOIN lrc r ON f.rid = r.id
  WHERE r.c5 = 1 AND r.c25 = 5 AND r.c50 = 11;

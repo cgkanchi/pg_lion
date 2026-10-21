@@ -803,19 +803,25 @@ restart:
  * InvalidBuffer when a page does not belong to the set (it was freed, which
  * only VACUUM does) or the set has no such level.
  *
+ * With `before` the route is that of what sorts just below ckey - the last
+ * separator strictly below it, and a move right only past a high key below
+ * it - which lands at or left of every page whose first key is ckey, where a
+ * run of equal separators would send the search without it to the last of
+ * them (lion_posting_search_before(), lion_postree.c).
+ *
  * lion_index_verify() is the caller (DESIGN.md §7).  A posting page its walk
  * did not reach may be one a writer of that key made after the walk of the
  * set was over, and a search for the page's own first container key landing
- * on it is the proof that it belongs to the tree.  A page at a level its link
- * does not promise starts the descent again, a bounded number of times, as in
- * lion_posting_search(), and then there is no answer; a leaf whose right link
- * leads above level 0 is the end of the set, as it is there.  The links and
- * pivots are checked as every descent checks them, so a damaged one is an
- * ERROR here too.
+ * on it, or left of it on its level, is the proof that it belongs to the
+ * tree.  A page at a level its link does not promise starts the descent
+ * again, a bounded number of times, as in lion_posting_search(), and then
+ * there is no answer; a leaf whose right link leads above level 0 is the end
+ * of the set, as it is there.  The links and pivots are checked as every
+ * descent checks them, so a damaged one is an ERROR here too.
  */
 Buffer
 lion_posting_search_level(Relation index, BlockNumber head, uint32 ckey,
-						  uint16 level)
+						  uint16 level, bool before)
 {
 	int			restarts = 0;
 	Buffer		buf;
@@ -847,7 +853,9 @@ restart:
 		plevel = LionPageGetOpaque(page)->level;
 
 		if (plevel > 0 && !LionPageIsRightmost(page) &&
-			lion_posting_highkey_at(index, page, blk)->ckey <= ckey)
+			(before ?
+			 lion_posting_highkey_at(index, page, blk)->ckey < ckey :
+			 lion_posting_highkey_at(index, page, blk)->ckey <= ckey))
 		{
 			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
 										  false, &walk);
@@ -884,7 +892,7 @@ restart:
 		child = lion_posting_downlink(index, page, blk,
 									  lion_posting_downlink_off(index, page,
 																blk, ckey,
-																false));
+																before));
 
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);

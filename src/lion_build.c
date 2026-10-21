@@ -449,6 +449,9 @@ struct LionBuildLeader;
 typedef struct LionBuildState
 {
 	Relation	index;
+	LionOptions opts;			/* the options, as the build began (or as the
+								 * leader of a parallel one read them) */
+	uint32		wal_mode;		/* LION_WAL_MODE_*, from opts */
 	LionIndexState ix;			/* every key column's state (DESIGN.md §24) */
 	uint32		inline_limit;
 	int			fillfactor;
@@ -1582,12 +1585,18 @@ lion_builder_to_pages(LionBuildState *bs, LionBuilder *b)
 {
 	Size		off = 0;
 	Size		used = b->inlineused;
+	const char *damage;
 
 	Assert(!b->spilled);
 	b->spilled = true;
 	b->inlineused = 0;
-	while (lion_inline_fetch(b->inlinebuf, used, &off, b->cbuf) > 0)
+	while (lion_inline_next(b->inlinebuf, used, &off, b->cbuf, &damage) > 0)
 		lion_builder_spill(bs, b, b->cbuf);
+
+	/* the build's own buffer, which only the build has written */
+	if (damage != NULL)
+		elog(ERROR, "lion index build: the item at byte %zu of a posting set being built %s",
+			 off, damage);
 }
 
 static void
@@ -2478,18 +2487,18 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 
 /*
  * Every key column's state, before the meta page exists: built from the
- * options directly, and deciding the order of each column from the catalog
- * (DESIGN.md §21), which every participant of a parallel build does the same
- * way.  Returns the inline limit.
+ * build's options (lion_build_options()), and deciding the order of each
+ * column from the catalog (DESIGN.md §21), which every participant of a
+ * parallel build does the same way.  Returns the inline limit.
  */
 static uint32
-lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
+lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt,
+					   const LionOptions *opts)
 {
-	LionOptions *opts = (LionOptions *) index->rd_options;
 	LionMetaPageData meta;
 	uint32		inline_limit;
 
-	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
+	inline_limit = (uint32) opts->inline_limit;
 
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
@@ -2499,34 +2508,35 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt)
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;
 	meta.root = InvalidBlockNumber;
-	if (opts == NULL || opts->store_positions != LION_POSOPT_OFF)
+	if (opts->store_positions != LION_POSOPT_OFF)
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, ix, &meta, cxt);
-	lion_settle_store_positions(index, ix);
+	lion_settle_store_positions(index, ix, opts);
 
 	return inline_limit;
 }
 
 /*
  * Everything a process writing columns needs, the leader of a parallel build
- * and its workers alike: the options, the budgets, the key columns' state,
- * the builders and the positions' builder.  memkb is what writing a column
- * may take.
+ * and its workers alike: the options (opts, the leader's for a worker), the
+ * budgets, the key columns' state, the builders and the positions' builder.
+ * memkb is what writing a column may take.
  */
 static void
-lion_build_state_init(LionBuildState *bs, Relation index, int memkb)
+lion_build_state_init(LionBuildState *bs, Relation index, int memkb,
+					  const LionOptions *opts)
 {
-	LionOptions *opts = (LionOptions *) index->rd_options;
 	int			ncols;
 
 	memset(bs, 0, sizeof(LionBuildState));
 	bs->index = index;
+	bs->opts = *opts;
+	bs->wal_mode = lion_wal_mode_for_build(index, opts);
 	bs->indtuples = 0;
 	bs->memkb = memkb;
-	bs->fillfactor = opts ? opts->fillfactor : LION_DEFAULT_FILLFACTOR;
-	bs->posting_fillfactor = opts ? opts->posting_fillfactor :
-		LION_DEFAULT_POSTING_FILLFACTOR;
-	switch (opts ? opts->build_slack : LION_DEFAULT_BUILD_SLACK)
+	bs->fillfactor = opts->fillfactor;
+	bs->posting_fillfactor = opts->posting_fillfactor;
+	switch (opts->build_slack)
 	{
 		case LION_SLACKOPT_ON:
 			bs->slack = true;
@@ -2545,15 +2555,15 @@ lion_build_state_init(LionBuildState *bs, Relation index, int memkb)
 			 * A parallel worker takes the leader's decision instead
 			 * (lion_parallel_write_columns()).
 			 */
-			bs->slack = (lion_wal_mode_for_build(index) == LION_WAL_MODE_GENERIC);
+			bs->slack = (bs->wal_mode == LION_WAL_MODE_GENERIC);
 			break;
 	}
 	bs->slackbuf = NULL;
-	bs->max_entries = lion_max_entries(index);
+	bs->max_entries = opts->max_entries;
 	bs->root = InvalidBlockNumber;
 	bs->height = 0;
-	bs->sumopt = opts ? opts->summaries : LION_SUMOPT_OFF;
-	bs->sumtids = opts ? (uint32) opts->summary_tids : LION_DEFAULT_SUMMARY_TIDS;
+	bs->sumopt = opts->summaries;
+	bs->sumtids = (uint32) opts->summary_tids;
 	bs->sum = NULL;
 	bs->summary_cols = 0;
 	bs->nsummaries = 0;
@@ -2590,7 +2600,8 @@ lion_build_state_init(LionBuildState *bs, Relation index, int memkb)
 									   "lion index build temporary",
 									   0, 64 * 1024, ALLOCSET_DEFAULT_MAXSIZE);
 
-	bs->inline_limit = lion_build_index_state(index, &bs->ix, bs->buildctx);
+	bs->inline_limit = lion_build_index_state(index, &bs->ix, bs->buildctx,
+											  opts);
 	ncols = bs->ix.ncolumns;
 	bs->nvalues = (uint64 *) MemoryContextAllocZero(bs->buildctx,
 													sizeof(uint64) * ncols);
@@ -2700,6 +2711,7 @@ typedef struct LionBuildShared
 	int			nrequested;		/* workers asked for, plus the leader */
 	int			leaderfile;		/* the leader's file number */
 	int			ncols;			/* key columns */
+	LionOptions opts;			/* the leader's (lion_build_options()) */
 	bool		slack;			/* the build's growth slack (DESIGN.md §4) */
 	uint64		queryid;
 	SharedFileSet fileset;
@@ -2793,7 +2805,7 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	int64	   *blocks;
 	int			c;
 
-	(void) lion_build_index_state(index, &ix, cxt);
+	(void) lion_build_index_state(index, &ix, cxt, &shared->opts);
 	spool = lion_spool_begin(&ix, (Size) memkb * 1024, &shared->fileset,
 							 lion_parallel_colfile(shared, filenum, 0));
 
@@ -2958,7 +2970,7 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 
 		if (!started)
 		{
-			lion_build_state_init(&bs, index, memkb);
+			lion_build_state_init(&bs, index, memkb, &shared->opts);
 			bs.slack = shared->slack;
 			started = true;
 		}
@@ -3137,6 +3149,7 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	shared->nrequested = request + 1;
 	shared->leaderfile = request;
 	shared->ncols = ncols;
+	shared->opts = bs->opts;
 	shared->slack = bs->slack;
 	shared->queryid = pgstat_get_my_query_id();
 	SharedFileSetInit(&shared->fileset, pcxt->seg);
@@ -3291,6 +3304,7 @@ IndexBuildResult *
 lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	IndexBuildResult *result;
+	LionOptions opts;
 	LionBuildState bs;
 	double		reltuples;
 	BulkWriteBuffer metabuf;
@@ -3308,7 +3322,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		elog(ERROR, "index \"%s\" already contains data",
 			 RelationGetRelationName(index));
 
-	lion_build_state_init(&bs, index, maintenance_work_mem);
+	lion_build_options(index, &opts);
+	lion_build_state_init(&bs, index, maintenance_work_mem, &opts);
 	ncols = bs.ix.ncolumns;
 
 	/*
@@ -3402,8 +3417,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	Assert(BlockNumberIsValid(bs.root));
 	metabuf = smgr_bulk_get_buf(bs.bulk);
 	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,
-					  bs.height, (uint32) bs.ndirpages,
-					  lion_wal_mode_for_build(index));
+					  bs.height, (uint32) bs.ndirpages, bs.wal_mode);
 	/* ... and the order the directory was just laid out in (§21). */
 	lion_meta_record_order(LionPageGetMeta((Page) metabuf->data), &bs.ix);
 	/* ... and which columns got summaries (§32). */

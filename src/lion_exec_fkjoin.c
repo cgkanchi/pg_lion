@@ -177,6 +177,13 @@ lion_join_filter_of(const LionCountScanState *st, int clauseno)
  * the column's, the same Datum - and distinct, the column being unique; the
  * list's lookup drops a duplicate anyway (lion_locate_array()).
  *
+ * The planner folds a dimension expected to return no more keys than a count
+ * locates at once (lion_array_batch_size()), but an estimate can be wrong by
+ * any factor.  Past that many keys they go to a tuplestore instead
+ * (cl->valstore), which keeps work_mem of them and spills the rest to a
+ * temporary file, and the list is collected from it a batch at a time rather
+ * than located (lion_locate_list()).
+ *
  * The child runs under the query's snapshot, as the dimension's child does,
  * so its rows are the ones the join would have read.  It is a child of the
  * node's, initialised and ended with it and rescanned with it - and it runs
@@ -190,6 +197,7 @@ lion_join_filter_values(LionCountScanState *st)
 	LionJoinState *js = st->join;
 	MemoryContext valcxt = CurrentMemoryContext;
 	MemoryContext querycxt = st->css.ss.ps.state->es_query_cxt;
+	int			batch = lion_array_batch_size();
 	int			f;
 
 	for (f = 0; f < js->nfilter; f++)
@@ -197,8 +205,13 @@ lion_join_filter_values(LionCountScanState *st)
 		LionClauseState *cl = &st->clause[js->filterclause[f]];
 		PlanState  *ps = js->filterps[f];
 		ArrayBuildState *astate;
+		bool		null = false;
 
-		astate = initArrayResult(cl->valtype, valcxt, false);
+		/* the reset of valcxt took the last run's, once it was ended */
+		Assert(cl->valstore == NULL);
+
+		/* a context of its own, given back whole when the keys move */
+		astate = initArrayResult(cl->valtype, valcxt, true);
 		for (;;)
 		{
 			TupleTableSlot *slot;
@@ -214,11 +227,36 @@ lion_join_filter_values(LionCountScanState *st)
 			key = slot_getattr(slot, js->filtercol[f], &isnull);
 			if (isnull)
 				continue;
-			/* copied into valcxt, a by-reference key too */
-			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
 			js->filterkeys++;
+			if (cl->valstore != NULL)
+			{
+				tuplestore_putvalues(cl->valstore, cl->valstoredesc, &key,
+									 &null);
+				continue;
+			}
+			/* copied into the array's context, a by-reference key too */
+			astate = accumArrayResult(astate, key, false, cl->valtype, valcxt);
+			if (astate->nelems <= batch)
+				continue;
+
+			/*
+			 * More keys than are located at once: these and the rest to a
+			 * tuplestore of the key's type, its own copies taken, in valcxt.
+			 */
+			cl->valstoredesc = CreateTemplateTupleDesc(1);
+			TupleDescInitEntry(cl->valstoredesc, 1, "key", cl->valtype, -1, 0);
+			TupleDescFinalize(cl->valstoredesc);
+			cl->valstore = tuplestore_begin_heap(false, false, work_mem);
+			for (int i = 0; i < astate->nelems; i++)
+				tuplestore_putvalues(cl->valstore, cl->valstoredesc,
+									 &astate->dvalues[i], &null);
+			MemoryContextDelete(astate->mcontext);
+			astate = NULL;
 		}
-		cl->val = makeArrayResult(astate, valcxt);
+		if (cl->valstore != NULL)
+			cl->val = (Datum) 0;
+		else
+			cl->val = makeArrayResult(astate, valcxt);
 		cl->valisnull = false;
 	}
 }
@@ -262,8 +300,12 @@ lion_join_child_next(LionCountScanState *st)
  * made instead, set up (LION_FKJOIN_COPY_COUNT_COST) and looked up at the
  * key's own containers (LION_FKJOIN_COPY_PROBE_COST), and, for a copy that
  * would spill, read back from its file there, a container at a time
- * (LION_SPILL_READ_COST, lion_join_copy_price()).  What both ways share - the
- * key's own set read and counted - is in neither.
+ * (LION_SPILL_READ_COST, lion_join_copy_price()).  A copy has been through
+ * the position filters already (lion_sources_collect()), so what the count
+ * did deciding candidates from stored positions is all probing's: each
+ * member sought under a lexeme (LION_POS_CHECK_COST) and each decoded on the
+ * way (LION_POS_MEMBER_COST).  What both ways share - the key's own set read
+ * and counted - is in neither.
  *
  * A count can come out cheaper probed than against a copy - a key of one
  * container over filters small enough to be in memory - and the account
@@ -280,6 +322,8 @@ lion_join_count_key(LionCountScanState *st)
 	int64		keyc = st->stats.key_containers;
 	int64		copyc = st->stats.copy_containers;
 	int64		unions = st->stats.unions_built;
+	int64		seeks = st->stats.pos_seeks;
+	int64		decoded = st->stats.pos_decoded;
 	int64		count;
 	bool		exists = (js->type != LION_JOIN_INNER ||
 						  (js->rows && !js->counts));
@@ -310,7 +354,9 @@ lion_join_count_key(LionCountScanState *st)
 			Max(filt, 0.0) * LION_FKJOIN_PROBE_COST +
 			mem * LION_MEMORY_PROBE_COST +
 			(double) pages * LION_FKJOIN_PROBE_PAGE_COST +
-			(double) (st->stats.unions_built - unions) * LION_UNION_KEY_COST -
+			(double) (st->stats.unions_built - unions) * LION_UNION_KEY_COST +
+			(double) (st->stats.pos_seeks - seeks) * LION_POS_CHECK_COST +
+			(double) (st->stats.pos_decoded - decoded) * LION_POS_MEMBER_COST -
 			key * LION_FKJOIN_COPY_PROBE_COST -
 			((*js->copypagesp > 0) ? key * LION_SPILL_READ_COST : 0.0);
 		*js->rentp = Max(*js->rentp + rent, 0.0);
@@ -460,7 +506,12 @@ lion_join_node_size(const LionKeyNode *node, const LionPostingSet *sets,
  * (lion_sources_collect()): its pages written once, as the planner prices
  * it, and *pages is how many there are, which says a count against it reads
  * its lookups back from the file (lion_join_count_key()); 0 for a copy that
- * fits.  What cannot
+ * fits.  A clause the row filter decides from stored positions
+ * (LionClauseState.posfilter) is decided as the copy is made, every row the
+ * copy would hold sought under each of its lexemes (LION_POS_CHECK_COST),
+ * and each lexeme's members decoded on the way - its set's rows, or
+ * LION_POS_SEEK_MEMBERS a candidate where the candidates are fewer
+ * (LION_POS_MEMBER_COST, lion_cost_posfilter()).  What cannot
  * be collected is what lion_join_collect_into() refuses: filters that only
  * subtract, a list located a batch at a time.
  */
@@ -476,6 +527,9 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 	double		bytes;
 	double		cost = 0;
 	double	   *srcmembers;
+	double		poskeys = 0;
+	double	   *posmembers;
+	int			nposmembers = 0;
 	bool		positive = false;
 	int			k;
 	int			j;
@@ -489,10 +543,16 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 	tuples = Max((double) st->heap->rd_rel->reltuples, 1.0);
 	copykeys = ckeys;
 	srcmembers = (double *) palloc0(sizeof(double) * (st->nitem + 1));
+	j = 0;
+	for (k = 1; k <= st->nitem; k++)
+		j += Max(st->sources[k].nsets, 0);
+	posmembers = (double *) palloc(sizeof(double) * Max(j, 1));
 
 	for (k = 1; k <= st->nitem; k++)
 	{
 		LionCountSource *src = &st->sources[k];
+		const LionSourceItem *item = &st->item[k - 1];
+		bool		decided;
 		double		members;
 		double		keys;
 		double		setmembers = 0;
@@ -504,9 +564,13 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 		if (src->nsets == 0)
 		{
 			pfree(srcmembers);
+			pfree(posmembers);
 			return 0;
 		}
 		positive = true;
+		Assert(item->clauseno >= 0 && item->clauseno < st->nclause);
+		decided = (item->orno < 0 && !item->rangesrc &&
+				   st->clause[item->clauseno].posfilter);
 
 		for (j = 0; j < src->nsets; j++)
 		{
@@ -516,6 +580,12 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 
 			if (!ps->found)
 				continue;
+			if (decided)
+			{
+				/* a lexeme of the clause the copy decides: its members */
+				posmembers[nposmembers++] = (double) ps->ntids;
+				poskeys += 1.0;
+			}
 			nc = Max((double) ps->ncontainers, 1.0);
 			setmembers += (double) ps->ntids;
 			cost += nc * LION_CONTAINER_COST;
@@ -544,9 +614,17 @@ lion_join_copy_price(LionCountScanState *st, Size budget, double *pages)
 	}
 	pfree(srcmembers);
 	if (!positive)
+	{
+		pfree(posmembers);
 		return 0;
+	}
 
 	copyrows = tuples * Min(frac, 1.0);
+	cost += copyrows * poskeys * LION_POS_CHECK_COST;
+	for (j = 0; j < nposmembers; j++)
+		cost += Min(posmembers[j], Max(copyrows, 1.0) * LION_POS_SEEK_MEMBERS) *
+			LION_POS_MEMBER_COST;
+	pfree(posmembers);
 	copykeys = Max(Min(copykeys, copyrows), 1.0);
 	bytes = copykeys * (sizeof(LionContainer *) +
 						Min(LION_CONTAINER_HDRSZ + 2.0 * copyrows / copykeys,
@@ -682,7 +760,7 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 		 */
 		lion_shared_copy_collect(shared, estate->es_query_dsa, st->heap,
 								 estate->es_snapshot, st->nitem,
-								 &st->sources[1], out, &chunks,
+								 &st->sources[1], st->filter, out, &chunks,
 								 &built, &spilled, &cstats);
 		*viewshared = true;
 		js->pcopy.chunks += chunks;
@@ -694,8 +772,8 @@ lion_join_collect_into(LionCountScanState *st, LionPostingSet *out,
 	}
 	else
 		ok = lion_sources_collect(st->heap, estate->es_snapshot, st->nitem,
-								  &st->sources[1], budget,
-								  true, out, &spilled, &cstats);
+								  &st->sources[1], budget, true, st->filter,
+								  out, &spilled, &cstats);
 	MemoryContextSwitchTo(oldcxt);
 	lion_join_clock(st, LION_JT_COLLECT, &t);
 
@@ -2129,7 +2207,7 @@ lion_join_unite_keys(LionCountScanState *st, bool walked)
 		oldcxt = MemoryContextSwitchTo(fg->unitecxt);
 		ok = lion_sources_collect(st->heap, estate->es_snapshot, nfilt + 1,
 								  src, held < copylimit ? copylimit - held : 0,
-								  true, &copy, &spilled, &cstats);
+								  true, st->filter, &copy, &spilled, &cstats);
 		MemoryContextSwitchTo(oldcxt);
 		lion_join_clock(st, LION_JT_COLLECT, &t);
 		cstats.copy_containers = 0;

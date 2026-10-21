@@ -317,10 +317,6 @@ lion_exec_custom_scan(CustomScanState *node)
 	int64		dirbefore = lion_dir_pages_read;
 	TupleTableSlot *slot;
 
-	/* the relation is read now (lion_count_report_reads()) */
-	if (st->heap != NULL)
-		st->statread = true;
-
 	/*
 	 * One group per call, except that a group the HAVING rejects is not a
 	 * result: keep going until one passes or the groups run out.
@@ -823,6 +819,7 @@ lion_reset_run(LionCountScanState *st)
 		cl->xval = (Datum) 0;
 		cl->xvalown = false;
 	}
+	lion_clause_values_free(st);
 	if (st->valcxt != NULL)
 		MemoryContextReset(st->valcxt);
 
@@ -1125,6 +1122,43 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 	}
 }
 
+/* A worker's own scan counters, added to the sums of all of them. */
+static void
+lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
+{
+	const LionDecodeRun *dr = st->decode;
+	int			i;
+
+	StaticAssertStmt(lengthof(sums->rangeeval) == lengthof(st->rangeeval),
+					 "a sum for every way of evaluating a range");
+	lion_count_stats_add(&sums->stats, &st->stats);
+	sums->dirpages += st->dirpages;
+	for (i = 0; i < (int) lengthof(sums->rangeeval); i++)
+		sums->rangeeval[i] += st->rangeeval[i];
+	sums->summaries += st->summaries;
+	sums->rangeprobed += st->rangeprobed;
+	sums->rangesrc_collected += st->rangesrc_collected;
+	sums->rangesrc_walked += st->rangesrc_walked;
+	sums->rangesrc_spilled += st->rangesrc_spilled;
+	sums->listsrc_collected += st->listsrc_collected;
+	sums->listsrc_spilled += st->listsrc_spilled;
+	sums->wherecollected += st->wherecollected;
+	sums->wherespilled += st->wherespilled;
+	sums->groupbatches += st->groupbatches;
+	sums->groupsbatched += st->groupsbatched;
+	if (st->lbatch != NULL)
+		sums->listbatches += st->lbatch->batches;
+	if (dr != NULL)
+	{
+		sums->decodepasses += dr->passes;
+		sums->decoderowsup += dr->rowsup;
+		sums->decode.keys += dr->stats.keys;
+		sums->decode.rows += dr->stats.rows;
+		sums->decode.rechecked += dr->stats.rechecked;
+		sums->decode.spills += dr->stats.spills;
+	}
+}
+
 /*
  * The end of a participant's execution.  A worker adds its counters to the
  * shared sums, once.  The leader takes a copy of them for EXPLAIN: its
@@ -1179,7 +1213,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		if (st->reported)
 			return;
 		SpinLockAcquire(&shared->mutex);
-		lion_count_stats_add(&shared->stats, &st->stats);
+		lion_scan_sums_add(&shared->scan, st);
 		if (js != NULL)
 		{
 			shared->lookups += js->lookups;
@@ -1197,17 +1231,8 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			shared->copies += js->pcopy.copies;
 			shared->copychunks += js->pcopy.chunks;
 		}
-		shared->dirpages += st->dirpages;
 		if (rs != NULL)
 			shared->ranges += rs->ranges;
-		if (st->lbatch != NULL)
-			shared->listbatches += st->lbatch->batches;
-		shared->summaries += st->summaries;
-		shared->rangeprobed += st->rangeprobed;
-		shared->wherecollected += st->wherecollected;
-		shared->wherespilled += st->wherespilled;
-		shared->groupbatches += st->groupbatches;
-		shared->groupsbatched += st->groupsbatched;
 		if (st->fg != NULL)
 			shared->factgroupcounts += st->fg->groupcounts;
 		if (st->anti != NULL)
@@ -1225,8 +1250,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	}
 
 	SpinLockAcquire(&shared->mutex);
-	st->workerstats = shared->stats;
-	st->workerdirpages = shared->dirpages;
+	st->worker = shared->scan;
 	if (js != NULL)
 	{
 		LionJoinWorkerSums *w = &js->worker;
@@ -1247,16 +1271,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			w->time[i] = shared->time[i];
 	}
 	if (rs != NULL)
-	{
 		rs->workerranges = shared->ranges;
-		rs->workerwherecollected = shared->wherecollected;
-		rs->workerwherespilled = shared->wherespilled;
-		rs->workergroupbatches = shared->groupbatches;
-		rs->workergroupsbatched = shared->groupsbatched;
-		rs->workerlistbatches = shared->listbatches;
-		rs->workersummaries = shared->summaries;
-		rs->workerrangeprobed = shared->rangeprobed;
-	}
 	if (st->fg != NULL)
 		st->fg->workergroupcounts = shared->factgroupcounts;
 	if (st->anti != NULL)
@@ -1346,6 +1361,7 @@ lion_end_custom_scan(CustomScanState *node)
 	}
 	if (st->valcxt != NULL)
 	{
+		lion_clause_values_free(st);
 		MemoryContextDelete(st->valcxt);
 		st->valcxt = NULL;
 	}

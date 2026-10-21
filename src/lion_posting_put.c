@@ -439,13 +439,17 @@ StaticAssertDecl(Min(LION_MAX_INLINE_LIMIT, LION_MAX_ENTRY_SIZE) / LION_CONTAINE
  * offset just past the last item an empty leaf takes, counted exactly as
  * PageAddItemExtended() packs them (MAXALIGNed, one line pointer each).
  * *more says whether an item follows, i.e. whether another leaf is needed.
+ * The payload is the one entry eoff on block blk had, which damage in it is
+ * reported with: lion_spill_count_leaves() reads all of it this way before
+ * the first record of a spill opens.
  *
  * A leaf always takes its first item - none is larger than
  * LION_CONTAINER_MAX_SIZE, which an empty page holds - so every call makes
  * progress.
  */
 static Size
-lion_spill_leaf_end(const char *payload, Size paylen, Size off,
+lion_spill_leaf_end(Relation index, BlockNumber blk, OffsetNumber eoff,
+					const char *payload, Size paylen, Size off,
 					LionContainer *cbuf, bool *more)
 {
 	Size		used = 0;
@@ -453,7 +457,8 @@ lion_spill_leaf_end(const char *payload, Size paylen, Size off,
 	Size		csize;
 
 	*more = false;
-	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	while ((csize = lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+									  cbuf)) > 0)
 	{
 		Size		need = MAXALIGN(csize) + sizeof(ItemIdData);
 
@@ -480,7 +485,8 @@ lion_spill_leaf_end(const char *payload, Size paylen, Size off,
  * so the two agree by construction.
  */
 static int
-lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
+lion_spill_count_leaves(Relation index, BlockNumber blk, OffsetNumber eoff,
+						const char *payload, Size paylen, LionContainer *cbuf)
 {
 	Size		off = 0;
 	bool		more = true;
@@ -488,7 +494,8 @@ lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
 
 	while (more)
 	{
-		off = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		off = lion_spill_leaf_end(index, blk, eoff, payload, paylen, off, cbuf,
+								  &more);
 		n++;
 	}
 
@@ -498,16 +505,18 @@ lion_spill_count_leaves(const char *payload, Size paylen, LionContainer *cbuf)
 /*
  * Put the items of payload[off, end) on a leaf the open record has just
  * initialised, log them, and set the leaf's minckey/maxckey.
- * lion_spill_leaf_end() chose `end` so that they fit, so a failure here is a
- * bug - a PANIC in rmgr mode, where the record is a critical section.
+ * lion_spill_leaf_end() read these items and chose `end` so that they fit,
+ * so a failure here is a bug - a PANIC in rmgr mode, where the record is a
+ * critical section.
  */
 static void
 lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 					 Size off, Size end, LionContainer *cbuf)
 {
 	Size		csize;
+	const char *damage;
 
-	while ((csize = lion_inline_fetch(payload, end, &off, cbuf)) > 0)
+	while ((csize = lion_inline_next(payload, end, &off, cbuf, &damage)) > 0)
 	{
 		OffsetNumber noff = PageAddItemExtended(page, cbuf, csize,
 												InvalidOffsetNumber, 0);
@@ -516,6 +525,9 @@ lion_spill_fill_leaf(LionWalState *xstate, Page page, const char *payload,
 			elog(ERROR, "lion index: failed to spill a container onto a new leaf");
 		lion_wal_op(xstate, page, LION_OP_ADD, noff, 0, cbuf, csize);
 	}
+	if (damage != NULL)
+		elog(ERROR, "lion index: the item at byte %zu of a spilled payload %s, though it was read before",
+			 off, damage);
 	lion_page_update_minmax(page);
 }
 
@@ -632,7 +644,8 @@ lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
 	lion_wal_finish(xstate, LION_XLOG_PAGE_INIT);
 
 	/* where the head's items end, and the second leaf, which follows it */
-	end0 = lion_spill_leaf_end(payload, paylen, 0, cbuf, &more);
+	end0 = lion_spill_leaf_end(index, BufferGetBlockNumber(entrybuf), entryoff,
+							   payload, paylen, 0, cbuf, &more);
 	if (!more)
 		elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
 			 RelationGetRelationName(index), paylen);
@@ -647,7 +660,8 @@ lion_spill_flat(Relation index, Relation heaprel, Buffer entrybuf,
 		Page		leafpage;
 		Size		end;
 
-		end = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		end = lion_spill_leaf_end(index, BufferGetBlockNumber(entrybuf),
+								  entryoff, payload, paylen, off, cbuf, &more);
 		if (more != (i + 1 < nleaves))
 			elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
 				 RelationGetRelationName(index), paylen);
@@ -738,7 +752,8 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 						  BufferGetBlockNumber(entrybuf), entryoff);
 
 	cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
-	nleaves = lion_spill_count_leaves(payload, paylen, cbuf);
+	nleaves = lion_spill_count_leaves(index, BufferGetBlockNumber(entrybuf),
+									  entryoff, payload, paylen, cbuf);
 
 	if (nleaves > LION_SPILL_MAX_LEAVES)
 		elog(ERROR, "lion index \"%s\": an inline payload of %zu bytes needs %d container pages, more than one root can link",
@@ -842,7 +857,8 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
 		Size		end;
 		bool		more;
 
-		end = lion_spill_leaf_end(payload, paylen, off, cbuf, &more);
+		end = lion_spill_leaf_end(index, BufferGetBlockNumber(entrybuf),
+								  entryoff, payload, paylen, off, cbuf, &more);
 		if (more != (i + 1 < nleaves))
 			elog(ERROR, "lion index \"%s\": a spilled payload of %zu bytes does not pack the way it was counted",
 				 RelationGetRelationName(index), paylen);

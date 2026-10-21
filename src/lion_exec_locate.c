@@ -36,6 +36,7 @@ lion_eval_clause_values(LionCountScanState *st)
 
 	st->valsdone = true;
 
+	lion_clause_values_free(st);
 	MemoryContextReset(st->valcxt);
 	oldcxt = MemoryContextSwitchTo(st->valcxt);
 
@@ -73,6 +74,29 @@ lion_eval_clause_values(LionCountScanState *st)
 		lion_join_filter_values(st);
 
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * End the tuplestores of the folded filters' keys (lion_join_filter_values())
+ * before valcxt, which they are in, is reset or deleted: a store that spilled
+ * has a temporary file open, which a reset would leave to the end of the
+ * transaction.
+ */
+void
+lion_clause_values_free(LionCountScanState *st)
+{
+	int			i;
+
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+
+		if (cl->valstore == NULL)
+			continue;
+		tuplestore_end(cl->valstore);
+		cl->valstore = NULL;
+		cl->valstoredesc = NULL;	/* in valcxt */
+	}
 }
 
 /* ---------------------------------------------------------------------
@@ -183,7 +207,9 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 	 * A parameter's array has no length cap (DESIGN.md §15), and past some
 	 * nine million values the sets pass the 1GB a plain allocation may have.
 	 * A plain count locates such a list a batch at a time instead
-	 * (lion_count_batched()); every other shape holds it whole.
+	 * (lion_count_batched()), and every other count collects one that is a
+	 * source of its own (lion_locate_list()); a list under an OR, and the one
+	 * that drives the groups, are held whole.
 	 */
 	*sets = (LionPostingSet *)
 		palloc_extended(sizeof(LionPostingSet) * Max(nelems, 1),
@@ -227,8 +253,9 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
  *
  * the terms being disjoint - lion_run_batches()'s argument, one level up.  A
  * GROUP BY, a count(DISTINCT) and an FK-side join count the list many times
- * over and hold it whole, as a list under an OR does, whose union is not a
- * disjoint one.  One list per relation is batched.
+ * over and collect it into one set instead (lion_locate_list()), and so does
+ * a plain count a second long list; a list under an OR, whose union is not a
+ * disjoint one, is held whole.  One list per relation is batched.
  *
  * The values are sorted as a lookup sorts them (lion_probe_sort()) and a
  * batch ends only where the hash changes: two values of one equality class
@@ -709,10 +736,10 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 }
 
 /*
- * Send the ranges collected in memory so far to files of their own
- * (lion_range_spill_set()), for one after them that does not fit what they
- * left (lion_locate_range()): each then holds what a range collected in
- * windows holds, and counts as spilled.
+ * Send the ranges and the lists collected in memory so far to files of their
+ * own (lion_range_spill_set()), for one after them that does not fit what
+ * they left (lion_collect_within()): each then holds what a range collected
+ * in windows holds, and counts as spilled.
  */
 static void
 lion_rangesrc_evict(LionCountScanState *st)
@@ -727,6 +754,84 @@ lion_rangesrc_evict(LionCountScanState *st)
 	}
 	list_free(st->rangesrc_mem);
 	st->rangesrc_mem = NIL;
+	foreach(lc, st->listsrc_mem)
+	{
+		lion_range_spill_set((struct LionMatSet *) lfirst(lc),
+							 &st->rangesrc_held);
+		st->listsrc_spilled++;
+	}
+	list_free(st->listsrc_mem);
+	st->listsrc_mem = NIL;
+}
+
+/*
+ * One collection of a source's union into *ps within budget, into a file
+ * past it where spill allows (lion_union_collect()): false when it does not
+ * fit and may not spill.
+ */
+typedef bool (*LionCollectFn) (void *arg, Size budget, bool spill,
+							   LionPostingSet *ps, Size *held, bool *spilled);
+
+/*
+ * Collect a source - a range's union, or a long list's - within what is left
+ * of the hash table's memory the relation's collected sources share
+ * (get_hash_memory_limit(), rangesrc_held), as lion_locate_range() says, and
+ * add it to those held in memory (*mem) when it is in memory.  A source that
+ * does not fit what the others left takes that memory back
+ * (lion_rangesrc_evict()) and is collected in what that frees, in windows if
+ * it must - unless it is walkable, when false says it is left to be walked.
+ */
+static bool
+lion_collect_within(LionCountScanState *st, LionCollectFn collect, void *arg,
+					bool walkable, LionPostingSet *ps, bool *spilled,
+					List **mem)
+{
+	Size		limit = get_hash_memory_limit();
+	Size		budget;
+	Size		held;
+	bool		collected;
+
+	budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
+	if (walkable || (st->rangesrc_mem == NIL && st->listsrc_mem == NIL))
+		collected = collect(arg, budget, !walkable, ps, &held, spilled);
+	else if (!(collected = collect(arg, budget, false, ps, &held, spilled)))
+	{
+		lion_rangesrc_evict(st);
+		budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
+		if (!collect(arg, budget, true, ps, &held, spilled))
+			elog(ERROR, "LionCount: a source to collect in windows refused");
+		collected = true;
+	}
+	if (!collected || !ps->found)
+		return collected;
+	st->rangesrc_held += held;
+	if (!*spilled)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
+
+		*mem = lappend(*mem, ps->mat);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	return true;
+}
+
+/* A range source's collection, and what its walk read. */
+typedef struct LionRangeCollect
+{
+	LionRangeSource *rs;
+	int64		nread;
+	int64		nsums;
+} LionRangeCollect;
+
+static bool
+lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
+					  Size *held, bool *spilled)
+{
+	LionRangeCollect *rc = (LionRangeCollect *) arg;
+
+	return lion_range_collect(rc->rs->index, rc->rs->col, &rc->rs->range,
+							  budget, spill, ps, held, spilled, &rc->nread,
+							  &rc->nsums);
 }
 
 /*
@@ -769,14 +874,9 @@ static LionKeyNode *
 lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 				  LionPostingSet **sets, int *nsets, bool *walked)
 {
-	Size		limit = get_hash_memory_limit();
-	Size		budget;
+	LionRangeCollect rc;
 	LionPostingSet ps;
-	Size		held;
-	bool		collected;
 	bool		spilled;
-	int64		nread;
-	int64		nsums;
 
 	*sets = NULL;
 	*nsets = 0;
@@ -785,23 +885,11 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	if (rs->range.empty)
 		return NULL;
 
-	budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-	if (walkable || st->rangesrc_mem == NIL)
-		collected = lion_range_collect(rs->index, rs->col, &rs->range, budget,
-									   !walkable, &ps, &held, &spilled,
-									   &nread, &nsums);
-	else if (!(collected = lion_range_collect(rs->index, rs->col, &rs->range,
-											  budget, false, &ps, &held,
-											  &spilled, &nread, &nsums)))
-	{
-		lion_rangesrc_evict(st);
-		budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-		if (!lion_range_collect(rs->index, rs->col, &rs->range, budget, true,
-								&ps, &held, &spilled, &nread, &nsums))
-			elog(ERROR, "LionCount: a range to collect in windows refused");
-		collected = true;
-	}
-	if (!collected)
+	rc.rs = rs;
+	rc.nread = 0;
+	rc.nsums = 0;
+	if (!lion_collect_within(st, lion_range_collect_fn, &rc, walkable, &ps,
+							 &spilled, &st->rangesrc_mem))
 	{
 		st->rangesrc_walked++;
 		*walked = true;
@@ -811,22 +899,219 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 	st->rangesrc_collected++;
 	if (spilled)
 		st->rangesrc_spilled++;
-	st->summaries += nsums;
+	st->summaries += rc.nsums;
 	if (!ps.found)
 		return NULL;
-	st->rangesrc_held += held;
-	if (!spilled)
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
-
-		st->rangesrc_mem = lappend(st->rangesrc_mem, ps.mat);
-		MemoryContextSwitchTo(oldcxt);
-	}
 
 	*sets = (LionPostingSet *) palloc(sizeof(LionPostingSet));
 	(*sets)[0] = ps;
 	*nsets = 1;
 	return lion_key_node(0);
+}
+
+/*
+ * An IN list collected (lion_locate_list()): its values - the array's, or the
+ * folded filter's keys in their tuplestore - a batch at a time, each batch's
+ * sets located at once and handed to the union.
+ */
+typedef struct LionListWalk
+{
+	Relation	index;
+	AttrNumber	attno;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	ArrayType  *arr;			/* the list's array, or */
+	Tuplestorestate *store;		/* the folded filter's keys */
+	TupleTableSlot *slot;		/* the store's */
+	int			batch;			/* values located at once */
+	Datum	   *vals;			/* room for a batch of them */
+	bool	   *nulls;
+	LionPostingSet *sets;		/* ... and of their sets */
+	MemoryContext batchcxt;		/* a batch's locates, reset after each */
+} LionListWalk;
+
+static void
+lion_list_walk(Relation index, AttrNumber attno, struct LionRangeUnion *u,
+			   void *arg, bool first)
+{
+	LionListWalk *w = (LionListWalk *) arg;
+	ArrayIterator it = NULL;
+	bool		more = true;
+	bool		done = false;
+
+	if (w->store != NULL)
+		tuplestore_rescan(w->store);
+	else
+		it = array_create_iterator(w->arr, 0, NULL);
+	while (more && !done)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(w->batchcxt);
+		int			n = 0;
+		int			nsets;
+		int			i;
+
+		while (n < w->batch)
+		{
+			Datum		v;
+			bool		isnull;
+
+			if (it != NULL)
+			{
+				if (!array_iterate(it, &v, &isnull))
+				{
+					done = true;
+					break;
+				}
+			}
+			else
+			{
+				if (!tuplestore_gettupleslot(w->store, true, false, w->slot))
+				{
+					done = true;
+					break;
+				}
+				v = slot_getattr(w->slot, 1, &isnull);
+				/* the store's tuple goes at its next read: a copy */
+				if (!isnull)
+					v = datumCopy(v, w->elmbyval, w->elmlen);
+			}
+			w->vals[n] = v;
+			w->nulls[n] = isnull;
+			n++;
+		}
+
+		/*
+		 * Duplicates of one batch are located once; one in two batches is
+		 * added twice, and a union takes its members once (above).
+		 */
+		nsets = (n > 0) ?
+			lion_posting_set_lookup_many_col(index, attno, w->elemtype, n,
+											 w->vals, w->nulls, w->sets,
+											 NULL) : 0;
+		Assert(nsets >= 0 && nsets <= n);
+		for (i = 0; i < nsets; i++)
+		{
+			if (more)
+				more = lion_union_add(u, &w->sets[i]);
+			lion_posting_set_release(&w->sets[i]);
+		}
+		/* a tuple read from the store's file is in batchcxt, the slot's */
+		if (w->slot != NULL)
+			ExecClearTuple(w->slot);
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextReset(w->batchcxt);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (it != NULL)
+		array_free_iterator(it);
+}
+
+static bool
+lion_list_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
+					 Size *held, bool *spilled)
+{
+	LionListWalk *w = (LionListWalk *) arg;
+
+	return lion_union_collect(w->index, w->attno, lion_list_walk, w, budget,
+							  spill, ps, held, spilled);
+}
+
+/*
+ * Locate an IN list that is a source of its own and too long to locate at
+ * once (DESIGN.md §15, "A list too long to locate at once") as ONE set: the
+ * union of its values' sets, collected as a range taken as a source is
+ * (lion_collect_within()) - within what is left of the hash table's memory
+ * the relation's collected sources share, and past it a window of container
+ * keys at a time into a temporary file, every window a pass over the values.
+ * The values are located lion_array_batch_size() at a time, each batch's sets
+ * ORed into the union and released before the next is located, so what the
+ * list holds besides its union is a batch of sets and the values themselves:
+ * the array, or a folded filter's keys in their tuplestore, which keeps
+ * work_mem of them (lion_join_filter_values()).
+ *
+ * A count of the relation as one row takes such a list a batch at a time
+ * instead (lion_array_batch_prepare()); this is every other count's - a GROUP
+ * BY, a count(DISTINCT), an FK-side join, which count the list many times
+ * over - and a second long list's.  Like a collected range the union is
+ * pinless and counted beside a set that carries the §9 interlock or with a
+ * recheck in the heap, as a list too wide for the open budget always was
+ * (DESIGN.md §15, "Bounded cursors").
+ *
+ * False, with nothing done, for a list no longer than a batch, which is
+ * located as ever (lion_locate_leaf()); otherwise the source's set and tree,
+ * the tree NULL when no value has a row.
+ */
+static bool
+lion_locate_list(LionCountScanState *st, LionClauseState *cl,
+				 LionPostingSet **sets, int *nsets, LionKeyNode **tree)
+{
+	LionListWalk w;
+	LionPostingSet ps;
+	bool		spilled;
+
+	*sets = NULL;
+	*nsets = 0;
+	*tree = NULL;
+	Assert(cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull);
+
+	memset(&w, 0, sizeof(w));
+	w.batch = lion_array_batch_size();
+	if (cl->valstore != NULL)
+	{
+		w.store = cl->valstore;
+		w.elemtype = cl->valtype;
+	}
+	else
+	{
+		w.arr = DatumGetArrayTypeP(cl->val);
+		if (ArrayGetNItems(ARR_NDIM(w.arr), ARR_DIMS(w.arr)) <= w.batch)
+		{
+			if ((Pointer) w.arr != DatumGetPointer(cl->val))
+				pfree(w.arr);
+			return false;
+		}
+		w.elemtype = ARR_ELEMTYPE(w.arr);
+	}
+	Assert(w.batch > 0);
+	get_typlenbyvalalign(w.elemtype, &w.elmlen, &w.elmbyval, &w.elmalign);
+	w.index = cl->idx;
+	w.attno = cl->idxcol;
+	w.vals = (Datum *) palloc(sizeof(Datum) * w.batch);
+	w.nulls = (bool *) palloc(sizeof(bool) * w.batch);
+	w.sets = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * w.batch,
+						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+	if (w.store != NULL)
+		w.slot = MakeSingleTupleTableSlot(cl->valstoredesc,
+										  &TTSOpsMinimalTuple);
+	w.batchcxt = AllocSetContextCreate(CurrentMemoryContext,
+									   "lion list batch",
+									   ALLOCSET_DEFAULT_SIZES);
+
+	(void) lion_collect_within(st, lion_list_collect_fn, &w, false, &ps,
+							   &spilled, &st->listsrc_mem);
+	st->listsrc_collected++;
+	if (spilled)
+		st->listsrc_spilled++;
+
+	MemoryContextDelete(w.batchcxt);
+	if (w.slot != NULL)
+		ExecDropSingleTupleTableSlot(w.slot);
+	pfree(w.sets);
+	pfree(w.nulls);
+	pfree(w.vals);
+	if (w.arr != NULL && (Pointer) w.arr != DatumGetPointer(cl->val))
+		pfree(w.arr);
+
+	if (!ps.found)
+		return true;
+	*sets = (LionPostingSet *) palloc(sizeof(LionPostingSet));
+	(*sets)[0] = ps;
+	*nsets = 1;
+	*tree = lion_key_node(0);
+	return true;
 }
 
 /*
@@ -1235,6 +1520,7 @@ lion_build_filter(LionCountScanState *st)
 	{
 		LionClauseState *cl = &st->clause[i];
 
+		cl->posfilter = false;
 		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] && cl->idx != NULL &&
 			lion_clause_in_run(st, i) &&
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
@@ -1288,7 +1574,10 @@ lion_build_filter(LionCountScanState *st)
 										  get_op_opfamily_strategy(cl->opno,
 																   cl->idx->rd_opfamily[cl->idxcol - 1]));
 			if (pf != NULL)
+			{
 				filter->pos[filter->npos++] = pf;
+				cl->posfilter = true;
+			}
 			else
 				filter->nheap++;
 		}
@@ -1352,6 +1641,37 @@ lion_build_filter(LionCountScanState *st)
 }
 
 /*
+ * The item whose IN list can drive the groups instead of the index's entry
+ * scan (DESIGN.md §15), as lion_locate_where() says below, or -1: what the
+ * plan and the relation's indexes say, known before anything is located.
+ */
+static int
+lion_ingroup_item(LionCountScanState *st)
+{
+	int			k;
+
+	if (!lion_plan_flag(st, LION_FLAG_GROUPIDX) || st->driveattno == 0 ||
+		st->innerattno != 0 || lion_plan_flag(st, LION_FLAG_SUMALL))
+		return -1;
+	for (k = 0; k < st->nitem; k++)
+	{
+		LionClauseState *cl;
+
+		if (st->item[k].orno >= 0)
+			continue;
+		cl = &st->clause[st->item[k].clauseno];
+		if (!(cl->kind == LION_CLAUSE_ARRAY ||
+			  (cl->kind == LION_CLAUSE_EQ && st->plan.distattno != 0)) ||
+			cl->attno != st->driveattno ||
+			cl->idxoid != st->plan.groupidxoid ||
+			cl->idxcol != st->groupidxcol)
+			continue;
+		return k;
+	}
+	return -1;
+}
+
+/*
  * Locate the posting sets of every WHERE clause of the relation the node is
  * counting.  They stay located until lion_release_where() - with partitions
  * for one partition's turn, with a plain table until the node is done - and
@@ -1366,6 +1686,7 @@ void
 lion_locate_where(LionCountScanState *st)
 {
 	MemoryContext oldcxt;
+	int			ingroup = lion_ingroup_item(st);
 	int			k;
 
 	/* what this locates may be pinned until the next pause unpins it */
@@ -1431,6 +1752,20 @@ lion_locate_where(LionCountScanState *st)
 			lion_array_batch_prepare(st, k, cl))
 		{
 			src->disjoint = true;
+			continue;
+		}
+
+		/*
+		 * ... and one in any other count - or a second one in that count, or
+		 * a folded filter's keys past as many - collected into one set a
+		 * batch at a time (lion_locate_list()).  Not the list that drives
+		 * the groups (below), which takes its values' sets one by one.
+		 */
+		if (cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull && k != ingroup &&
+			lion_locate_list(st, cl, &src->sets, &src->nsets, &src->tree))
+		{
+			if (src->tree == NULL)
+				st->wheremissing = true;
 			continue;
 		}
 
@@ -1534,30 +1869,11 @@ lion_locate_where(LionCountScanState *st)
 	 * The count(DISTINCT k) walk WITHOUT a GROUP BY is driven like a GROUP BY
 	 * k whose groups are summed (§26), and takes a list on k the same way -
 	 * and an equality on k as a list of one, which a GROUP BY never sees
-	 * (the planner folds the grouping column it pins).
+	 * (the planner folds the grouping column it pins).  Which item that is
+	 * was known before the WHERE was located (lion_ingroup_item()).
 	 */
-	st->ingroupitem = -1;
+	st->ingroupitem = ingroup;
 	st->ingroupset = 0;
-	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->driveattno != 0 &&
-		st->innerattno == 0 && !lion_plan_flag(st, LION_FLAG_SUMALL))
-	{
-		for (k = 0; k < st->nitem; k++)
-		{
-			LionClauseState *cl;
-
-			if (st->item[k].orno >= 0)
-				continue;
-			cl = &st->clause[st->item[k].clauseno];
-			if (!(cl->kind == LION_CLAUSE_ARRAY ||
-				  (cl->kind == LION_CLAUSE_EQ && st->plan.distattno != 0)) ||
-				cl->attno != st->driveattno ||
-				cl->idxoid != st->plan.groupidxoid ||
-				cl->idxcol != st->groupidxcol)
-				continue;
-			st->ingroupitem = k;
-			break;
-		}
-	}
 	st->ingroupleft = 0;
 	if (st->ingroupitem >= 0)
 	{
@@ -1657,6 +1973,7 @@ lion_release_where(LionCountScanState *st)
 	}
 	st->rangesrc_held = 0;
 	st->rangesrc_mem = NIL;		/* it lived in wherecxt too */
+	st->listsrc_mem = NIL;		/* and so did this */
 
 	/*
 	 * The collected WHERE (lion_group_count()): its file, if it spilled, is

@@ -1,0 +1,1 @@
+../verify_not_lion.spec

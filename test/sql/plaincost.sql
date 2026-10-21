@@ -176,6 +176,51 @@ SELECT count(*), sum(id) FROM lpc WHERE status >= 2;
 RESET enable_indexscan;
 RESET enable_seqscan;
 
+-- ---------- 5. a planner run inside another ----------
+-- What a plain path's correlation cannot carry is charged to it once it is
+-- built (section 1), kept meanwhile for the planner run.  A stable function
+-- in a clause is evaluated as the query is planned, and one that runs a
+-- query plans that in a run of its own - here as lion takes the OR of
+-- equalities for the IN list it spells (lion_rel_canonical_clauses()),
+-- after the plain path is priced and before it is charged.  The inner run
+-- keeps what it finds apart, and the outer one's plain path costs what it
+-- costs with a function in its place that returns the same and plans
+-- nothing.  (PostgreSQL 18 and later match the OR to the index column as the
+-- list; 16 and 17 leave an OR over a function to the filter, where the two
+-- are alike as well.)
+CREATE FUNCTION lpc_zero() RETURNS int
+LANGUAGE plpgsql STABLE COST 0.001 AS $$
+DECLARE
+	n	bigint;
+BEGIN
+	EXECUTE 'SELECT count(*) FROM lpc WHERE pc > 1000' INTO n;
+	RETURN 0;
+END $$;
+CREATE FUNCTION lpc_zero_quiet() RETURNS int
+LANGUAGE plpgsql STABLE COST 0.001 AS $$
+BEGIN
+	RETURN 0;
+END $$;
+/* The total cost of q's plain index scan of lpc. */
+CREATE FUNCTION lpc_icost(q text) RETURNS numeric
+LANGUAGE plpgsql AS $$
+DECLARE
+	j	json;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	RETURN (regexp_match(j::text, '"Node Type": "Index Scan",[^}]*"Total Cost": ([0-9.]+)'))[1];
+END $$;
+SET random_page_cost = 1.1;
+SELECT lpc_icost($$SELECT sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND (status = lpc_zero() OR status = 1)$$) =
+	   lpc_icost($$SELECT sum(id) FROM lpc WHERE status = 0 AND supp = 0 AND flag AND (status = lpc_zero_quiet() OR status = 1)$$) AS same_cost;
+RESET random_page_cost;
+DROP FUNCTION lpc_icost(text);
+DROP FUNCTION lpc_zero(), lpc_zero_quiet();
+
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lpc, lpc_q;
 DROP FUNCTION lpc_plan(text);

@@ -313,6 +313,80 @@ SELECT lion_nq($$SELECT id FROM lion_ne WHERE c <> ANY ('{AB,ab}')$$, 'bitmap');
  bitmap, 33333 rows
 (1 row)
 
+-- A column laid out in hash order (DESIGN.md §21: its comparison has a
+-- SQL-standard body) has no comparison to tell the elements apart, and they
+-- are told apart by equality: the column's own for elements of its type, the
+-- family's int8 one for int8's.
+CREATE FUNCTION lion_ne_cmp4(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint4cmp($1, $2);
+CREATE FUNCTION lion_ne_cmp8(int8, int8) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint8cmp($1, $2);
+CREATE FUNCTION lion_ne_cmp48(int4, int8) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
+	RETURN btint48cmp($1, $2);
+CREATE OPERATOR FAMILY lion_ne_hfam USING lion;
+CREATE OPERATOR CLASS lion_ne_hops FOR TYPE int4 USING lion FAMILY lion_ne_hfam AS
+	OPERATOR 1 = (int4, int4),
+	OPERATOR 10 <> (int4, int4),
+	FUNCTION 1 hashint4(int4),
+	FUNCTION 4 lion_ne_cmp4(int4, int4);
+ALTER OPERATOR FAMILY lion_ne_hfam USING lion ADD
+	OPERATOR 1 = (int8, int8),
+	OPERATOR 1 = (int4, int8),
+	OPERATOR 10 <> (int4, int8),
+	FUNCTION 1 (int8, int8) hashint8(int8),
+	FUNCTION 4 (int8, int8) lion_ne_cmp8(int8, int8),
+	FUNCTION 4 (int4, int8) lion_ne_cmp48(int4, int8);
+SELECT amvalidate(oid) FROM pg_opclass WHERE opcname = 'lion_ne_hops';
+ amvalidate 
+------------
+ t
+(1 row)
+
+CREATE TABLE lion_ne_h (id int, n int) WITH (autovacuum_enabled = off);
+INSERT INTO lion_ne_h SELECT id, n FROM lion_ne;
+CREATE INDEX lion_ne_h_n ON lion_ne_h USING lion (n lion_ne_hops);
+NOTICE:  key column 1 of lion index is laid out in hash order
+VACUUM (FREEZE, ANALYZE) lion_ne_h;
+SELECT ordered FROM lion_index_stats('lion_ne_h_n');
+ ordered 
+---------
+ f
+(1 row)
+
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,2}')$$, 'bitmap');
+      lion_nq       
+--------------------
+ bitmap, 92308 rows
+(1 row)
+
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,1,NULL}')$$, 'plain');
+      lion_nq      
+-------------------
+ plain, 79121 rows
+(1 row)
+
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,2}'::int8[])$$, 'plain');
+      lion_nq      
+-------------------
+ plain, 92308 rows
+(1 row)
+
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{1,1}'::int8[])$$, 'bitmap');
+      lion_nq       
+--------------------
+ bitmap, 79121 rows
+(1 row)
+
+SELECT lion_nq($$SELECT id FROM lion_ne_h WHERE n <> ANY ('{NULL,5,1}'::int8[])$$, 'bitmap');
+      lion_nq       
+--------------------
+ bitmap, 92308 rows
+(1 row)
+
+DROP TABLE lion_ne_h;
+DROP OPERATOR FAMILY lion_ne_hfam USING lion;
+DROP FUNCTION lion_ne_cmp4(int4, int4), lion_ne_cmp8(int8, int8),
+	lion_ne_cmp48(int4, int8);
 SELECT * FROM lion_nplan($$SELECT id FROM lion_ne WHERE k <> 3 AND g = 1$$);
              lion_nplan             
 ------------------------------------
@@ -560,6 +634,40 @@ SELECT lion_nq($$SELECT count(*) FROM lion_ne_x$$, 'count');
 (1 row)
 
 DROP TABLE lion_ne_x;
+-- The plan names the driving column whichever it is: c's own `IS NOT NULL`
+-- drives here - `(all keys)` - while the first `IS NOT NULL` among the
+-- clauses is an OR's leaf, or a filtered count's, which say nothing of it
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR s <> '') AND (k <> 3 OR n IS NULL) AND c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND g <> 1$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FILTER (WHERE n IS NOT NULL), count(*) FROM lion_ne WHERE c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$);
+                                                    lion_nplan                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+ Lion Indexes: lion_ne_c (all keys), lion_ne_n, lion_ne_k ((n IS NOT NULL) OR (k <> 3)), lion_ne_c (c IS NOT NULL)
+(2 rows)
+
 -- 5. A dirty heap: the counts recheck, and a partitioned table sums its
 --    partitions' own drivers.
 UPDATE lion_ne SET k = 3 WHERE id % 100 = 1;

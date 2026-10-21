@@ -47,7 +47,9 @@
  * between the scores shown would not be in the order they were ranked by.
  * The scan's tuple is the table's columns the plan needs, then the score.
  * A relation that is locked FOR UPDATE or the like is left to the ordinary
- * plan: EvalPlanQual hands a scan the table's row, not that tuple.
+ * plan: EvalPlanQual hands a scan the table's row, not that tuple.  So is
+ * one with LATERAL references, whose every path is parameterized by them,
+ * which the scan's is not.
  *
  *-------------------------------------------------------------------------
  */
@@ -145,7 +147,7 @@ static void lion_bm25_rescan(CustomScanState *node);
 static void lion_bm25_explain(CustomScanState *node, List *ancestors,
 							  ExplainState *es);
 
-static const CustomPathMethods lion_bm25_path_methods = {
+const CustomPathMethods lion_bm25_path_methods = {
 	.CustomName = "LionBm25",
 	.PlanCustomPath = lion_bm25_plan_path,
 };
@@ -406,17 +408,15 @@ lion_bm25_score_column(Oid indexoid, const char *colname)
 
 /*
  * The rows the walk would read for query in column attno: its lexemes' rows,
- * added up.
+ * added up (lion_bm25_plan_ncodes(), which reads their entries and nothing
+ * else, and takes no predicate lock).
  */
 static double
 lion_bm25_candidates(Oid indexoid, AttrNumber attno, TSQuery query)
 {
 	Relation	index = index_open(indexoid, AccessShareLock);
-	LionBm25Query q;
-	double		n = 0;
+	double		n = lion_bm25_plan_ncodes(index, attno, query);
 
-	if (lion_bm25_prepare(index, attno, query, 1.2, 0.75, &q))
-		n = (double) q.ncodes;
 	index_close(index, AccessShareLock);
 	return n;
 }
@@ -461,6 +461,17 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		rte->securityQuals != NIL || IS_DUMMY_REL(rel) ||
 		rel->indexlist == NIL)
 		return;
+
+	/*
+	 * The scan's path is unparameterized, and every path of a relation with
+	 * LATERAL references - a PlaceHolderVar it evaluates for a LATERAL
+	 * subquery pulled up from under an outer join - must be parameterized
+	 * by the relations they name: its plan would compute that value from a
+	 * column of another relation it does not scan.
+	 */
+	if (!bms_is_empty(rel->lateral_relids))
+		return;
+
 	if (root->parse->resultRelation == (int) rel->relid ||
 		bms_is_member((int) rel->relid, root->all_result_relids) ||
 		get_plan_rowmark(root->rowMarks, rti) != NULL)
@@ -516,13 +527,10 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	qlexemes = lion_bm25_lexemes(query, &prefix);
 	if (prefix || qlexemes == NIL)
 		return;
-	{
-		double		k1 = DatumGetFloat8(ck1->constvalue);
-		double		b = DatumGetFloat8(cb->constvalue);
-
-		if (!(k1 >= 0) || !(b >= 0 && b <= 1))
-			return;
-	}
+	/* parameters the function refuses: left to it, to raise its error */
+	if (!lion_bm25_params_ok(DatumGetFloat8(ck1->constvalue),
+							 DatumGetFloat8(cb->constvalue)))
+		return;
 	foreach(lc, rel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);

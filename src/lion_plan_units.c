@@ -53,21 +53,23 @@ static const char *const lion_competitor_names[] = {
 };
 
 /*
- * Is cp one of lion's own custom paths?  By the name custom scans are known
- * by (RegisterCustomScanMethods()): LionCount, LionSemiJoin, LionAntiJoin,
- * LionJoinAgg and LionOrdered.
+ * Is cp one of lion's own custom paths - LionCount, LionSemiJoin,
+ * LionAntiJoin, LionJoinAgg, LionOrdered, LionBtreeScan or LionBm25?  By its
+ * methods, which are this library's own: a name is only what EXPLAIN prints,
+ * and another extension's path may carry any.
  */
 static bool
 lion_custom_is_lion(const CustomPath *cp)
 {
-	const char *name = (cp->methods != NULL) ? cp->methods->CustomName : NULL;
+	const CustomPathMethods *m = cp->methods;
 
-	return name != NULL &&
-		(strcmp(name, "LionCount") == 0 ||
-		 strcmp(name, "LionSemiJoin") == 0 ||
-		 strcmp(name, "LionAntiJoin") == 0 ||
-		 strcmp(name, "LionJoinAgg") == 0 ||
-		 strcmp(name, "LionOrdered") == 0);
+	return m == &lion_count_path_methods ||
+		m == &lion_semijoin_path_methods ||
+		m == &lion_antijoin_path_methods ||
+		m == &lion_join_agg_path_methods ||
+		m == &lion_ordered_path_methods ||
+		m == &lion_btree_path_methods ||
+		m == &lion_bm25_path_methods;
 }
 
 /*
