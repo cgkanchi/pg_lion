@@ -206,9 +206,10 @@ key); the heap is read only to check that the rows returned are visible. Join on
       JOIN doc d ON d.ctid = s.ctid
      ORDER BY s.score DESC;
 
-The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each
-counted once; lexemes under a NOT do not score, and operators, phrases and weights do not change
-it, so add `WHERE d.tsv @@ query` to keep only rows that match the query as a whole. As in a search
+The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each counted
+once; lexemes under a NOT do not score, and operators, phrases and weights do not change it, so add
+`WHERE d.tsv @@ query` to keep only rows that match the query as a whole. A prefix lexeme (`foo:*`)
+cannot be ranked and is an error, except under a NOT, where it does not score either. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
 are skipped (MaxScore), so a very common lexeme next to rarer ones costs little. Like the counts,
@@ -461,13 +462,13 @@ serial one.
 
 ## Reloptions
 
-`store_positions` (`auto` | `on` | `off`, default `auto`; `true` and `false` are `on` and `off`): on
 Every option but `max_entries` is read by a build alone: what it decided is on the index's meta
 page or in the pages it wrote, and inserts, VACUUM and scans read that, so `ALTER INDEX ... SET`
 of one changes the index at its next `REINDEX` (or `REINDEX CONCURRENTLY`). Setting any of them
 takes `ShareUpdateExclusiveLock` on the index, as core's `fillfactor` of an index does, and blocks
 no scan or insert. `max_entries` applies to the next insert.
 
+`store_positions` (`auto` | `on` | `off`, default `auto`; `true` and `false` are `on` and `off`): on
 a `tsvector` column, also store every lexeme's positions and weights, so phrase, weight and NOT
 queries are answered from the index and BM25 ranking works (see "Multi-key columns" above), at
 about twice the index's size. `auto` stores them when a key column's operator class can
