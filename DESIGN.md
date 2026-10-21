@@ -3089,8 +3089,8 @@ these sets are.
   the source is. Unpriced, `count(*) WHERE c1 <> 3` cost what `count(*)` cost, and a partial index
   that subtracts per entry was chosen at 1.7 ms over the whole index's one merge at 0.38 (§45.6).
 - **A filtered run over a sum of every row** ("Filtered counts", §35) that has a source of its own
-  that selects rows - an equality, a list, `IS NULL`, an OR - is counted as that source's
-  intersection with the rest (`lion_run_count()`), and is priced as one
+  that selects rows - an equality, a list, `IS NULL`, an OR with no range and no complement arm -
+  is counted as that source's intersection with the rest (`lion_run_count()`), and is priced as one
   (`lion_count_run_plain()`), not as the sum.
 - **Residual rows over a partial index** (§45). The rows a residual clause is tested on are those
   the restrictions select within the index's predicate: each predicate clause the restrictions do
@@ -3447,7 +3447,9 @@ the row filter, and a range source's other bounds are looked for in its own filt
   table's sum over its partitions) the runs' totals make the one row: a COUNT form prints run f's
   total, SUM prints NULL when run 0's is 0, SUMNULL when run f's is. Where the WHERE alone is
   summed over every row (§35), a filter's run with a pinned source of its own - an equality, a
-  list, a null test, or an OR with no range - is counted as a plain count instead.
+  list, a null test, or an OR with no range and no complement arm - is counted as a plain count
+  instead. An OR with a complement arm selects nothing by itself (§35, "Complements in an OR"), and
+  a run whose only source it is is summed over every row as the WHERE's run is.
 - **With a GROUP BY** - one column, two (§20), the decoded walk (§34), on a table or a
   partitioned one - every run emits its groups as partial rows below core's Finalize HashAggregate:
   a row of run r holds run r's count in the columns of filter r, and in the others what adds
@@ -19586,8 +19588,10 @@ as the column's correlation says - merged with the other sources as any AND of s
 pages of the keys it stands for, scaled by the containers the union saves.
 `LION_SUMMARY_PHASE_DESCENTS` (2) charges the phases' own descents. Without a whole bucket, or
 without summaries, the model is §28's. The recheck is spread over the side's counts rather than its
-keys. The sum over every entry of a summarized column (`k IS NOT NULL` alone, §14) is priced as a
-range over all of it (`LION_RANGED_SUMALL`).
+keys. The sum over every entry of a summarized column (`k IS NOT NULL` alone, §14, or every row,
+§35) is priced as a range over all of it (`LION_RANGED_SUMALL`) with nothing outside it: the
+executor takes a side only of a range, so the inside is the whole price, beside a complement OR's
+positive arms too.
 
 Buckets hold `summary_tids` rows only when keys arrive in order. Keys that arrive in descending
 order all go into the first bucket (the open one, on an index built empty), and keys in no order
@@ -20646,9 +20650,17 @@ predicate, so in an attempt for a partial index (§45) its columns are preferred
 holds the count to its rows. A partitioned table's candidates are its first
 live leaf's, which `lion_collect_targets()` then asks of every partition.
 
-The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS` (shape 19): no
-clause names it. EXPLAIN prints the driver as `(all rows)`, or `(all keys)` when it is the column's
-own `IS NOT NULL` that drives. `count(*) WHERE k IS NOT NULL` over a column of many keys is now
+The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS` (shape 19),
+whichever column it is: the executor never looks for it among the clauses, where the first `IS NOT
+NULL` may be an OR's leaf or a filtered count's and say nothing of the driver. EXPLAIN prints the
+driver as `(all rows)`, or `(all keys)` when it is the column's own `IS NOT NULL` that drives.
+
+A summarized driver (§32) hands its summaries to the sum, and they hold no NULL row: its NULL entry
+is in no bucket. So the sum over every row counts that entry beside the walk, ANDed with the
+negated sources like any other entry, unless the column's own `IS NOT NULL` drops it
+(`lion_sum_walk()`, `lion_sum_null_entry()`); the lookup takes the entry's pin (§9) and, under
+SERIALIZABLE, locks the entry or its absence, since the summed walk never reads the leaf it lives
+on. `count(*) WHERE k IS NOT NULL` over a column of many keys is now
 driven by one of few: `lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it
 was `lion_null_k (all keys)`.
 
@@ -26472,9 +26484,9 @@ Never a multi-key clause (above), a negated one - `<>`, `IS NOT NULL`, `IS DISTI
 `NOT` of a multi-key query - which subtracts, or an OR with a complement arm, which counts rows
 outside a set. A clause the partition's bounds leave out (§16) reads no index there and holds
 nothing. And a sum over every row drives a filtered count's run only when the run has no source
-of its own: one that has (an equality, a list, `IS NULL`, an OR of no range) is counted as an
-intersection, not by the walk (`lion_count_runs()`, `lion_run_has_plain_source()`), and needs a
-hold of its own.
+of its own: one that has (an equality, a list, `IS NULL`, an OR of no range and no complement
+arm) is counted as an intersection, not by the walk (`lion_count_runs()`,
+`lion_run_has_plain_source()`), and needs a hold of its own.
 
 `lion_partial_anchored()` checks it once the targets are collected (`lion_count_path_targets()`,
 `lion_fkjoin_setup()`); false declines the attempt, and the plan made with whole indexes stands.

@@ -213,6 +213,17 @@ SELECT q, cc_q(q) FROM (VALUES
 	('SELECT a, b, count(*) FILTER (WHERE n IS DISTINCT FROM 3 OR t = ''v1''), count(*) FROM cc WHERE t IS NOT NULL GROUP BY a, b'),
 	('SELECT a, b, t, count(*) FILTER (WHERE b = 1 OR n <> 3), count(*) FROM cc GROUP BY a, b, t')
 ) v(q);
+-- beside a sum over every row (DESIGN.md §35): a filter whose only source is
+-- an OR with a complement arm selects nothing by itself, and is counted by
+-- the sum as the WHERE's run is, not as an intersection of its own
+SELECT cc_plan('SELECT count(*), count(*) FILTER (WHERE a <> 1 OR b <> 2) FROM cc');
+SELECT q, cc_q(q) FROM (VALUES
+	('SELECT count(*), count(*) FILTER (WHERE a <> 1 OR b <> 2) FROM cc'),
+	('SELECT count(*), count(*) FILTER (WHERE n <> 3 OR t = ''v1'') FROM cc'),
+	('SELECT count(*), count(*) FILTER (WHERE n IS DISTINCT FROM 3 OR a = 1), count(*) FILTER (WHERE b = 1) FROM cc'),
+	('SELECT count(*) FILTER (WHERE a <> 1 OR n IS NULL), count(*) FILTER (WHERE NOT (tags @> ''{t3}'') OR b = 4), count(*) FROM cc WHERE t <> ''v1'''),
+	('SELECT count(*) FILTER (WHERE (a <> 1 OR b <> 2) AND n IS NOT NULL), count(*) FROM cc WHERE n <> 3')
+) v(q);
 
 CREATE TABLE ccp (a int, n int, t text) PARTITION BY RANGE (a);
 CREATE TABLE ccp1 PARTITION OF ccp FOR VALUES FROM (0) TO (3);

@@ -1078,9 +1078,11 @@ typedef struct LionVColScope
 #define LION_RANGED_NONE	0
 #define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
 #define LION_RANGED_SUM		2	/* the sum over the range's entries */
-#define LION_RANGED_SUMALL	3	/* the sum over every entry, `k IS NOT NULL`
-								 * alone (§14): priced as a range over all of
-								 * k when k has summaries (§32) */
+#define LION_RANGED_SUMALL	3	/* the sum over every entry - `k IS NOT
+								 * NULL` alone (§14), or every row (§35) -
+								 * priced as a range over all of k with
+								 * nothing outside it when k has summaries
+								 * (§32) */
 
 /*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
@@ -2523,7 +2525,9 @@ typedef struct LionCountPriv
 	AttrNumber	groupn_attno[LION_MAX_GROUPCOLS];
 	Oid			groupn_idx[LION_MAX_GROUPCOLS];
 
-	AttrNumber	allattno;		/* ALLROWS (§35), or 0 */
+	AttrNumber	allattno;		/* ALLROWS: the column a sum over all of a
+								 * column's entries drives by when no range
+								 * bounds it (§14, §35), or 0 */
 
 	int64		topkn;			/* TOPK (§36), or 0 */
 	int			topkcand;
