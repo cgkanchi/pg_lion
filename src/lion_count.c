@@ -21,10 +21,13 @@
 static bool lion_exists_settled(LionCountCtx *cx);
 static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
 									  int nsources, LionCountSource *sources,
-									  Size maxbytes, bool spill, bool ranged,
+									  Size maxbytes, bool spill,
+									  LionRowFilter *filter, bool ranged,
 									  uint32 lo, uint64 hi,
 									  LionPostingSet *out, bool *spilled,
 									  LionCountStats *stats);
+static bool lion_sources_posfiltered(int nsources,
+									 const LionCountSource *sources);
 
 /* ---------------------------------------------------------------------
  * Counting one container
@@ -288,9 +291,20 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
 
-	/* A collection copies the container and asks nothing (DESIGN.md §27). */
+	/*
+	 * A collection copies the container and asks nothing (DESIGN.md §27) -
+	 * of what it holds, only the rows the position filters it was given keep
+	 * (LionCollect.filter): they are read at the collection, once for the
+	 * whole copy, rather than by each count against it.
+	 */
 	if (cx->collect != NULL)
 	{
+		if (cx->filter != NULL && cx->filter->npos > 0 && !cx->posdone)
+		{
+			c = lion_count_posfilter(cx, c);
+			if (lion_container_cardinality(c) == 0)
+				return;
+		}
 		lion_collect_container(cx->collect, c);
 		return;
 	}
@@ -354,7 +368,7 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 	 * pinned, as everything else about it is (the design note's R1 and R2).
 	 * The map's answer for the blocks that are left stands.
 	 */
-	if (cx->filter != NULL && cx->filter->npos > 0)
+	if (cx->filter != NULL && cx->filter->npos > 0 && !cx->posdone)
 	{
 		c = lion_count_posfilter(cx, c);
 		if (lion_container_cardinality(c) == 0)
@@ -434,20 +448,31 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
  * used again.  The walks that intersect a copy of the WHERE with many groups'
  * sets at once (lion_count_groups.c, lion_count_decode.c) filter the copy's
  * container here, once a key, and count the groups with
- * lion_row_filter_nopos().
+ * lion_row_filter_nopos().  c itself when they have been through it already
+ * (LionCountCtx.posdone): the copy's containers, filtered as it was made.
  */
 const LionContainer *
 lion_count_posfilter(LionCountCtx *cx, const LionContainer *c)
 {
 	int			i;
 
+	if (cx->posdone)
+		return c;
 	for (i = 0; cx->filter != NULL && i < cx->filter->npos; i++)
 	{
 		uint32		before = lion_container_cardinality(c);
+		int64		seeks0;
+		int64		decoded0;
+		int64		seeks;
+		int64		decoded;
 
+		lion_posfilter_work(cx->filter->pos[i], &seeks0, &decoded0);
 		c = lion_posfilter_apply(cx->filter->pos[i], c);
+		lion_posfilter_work(cx->filter->pos[i], &seeks, &decoded);
 		cx->stats.pos_checked += before;
 		cx->stats.pos_removed += before - lion_container_cardinality(c);
+		cx->stats.pos_seeks += seeks - seeks0;
+		cx->stats.pos_decoded += decoded - decoded0;
 	}
 	return c;
 }
@@ -2066,15 +2091,36 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * the sources, a union of all its sets built again for each of them.
  *
  * It returns false as well where no source has a found set to copy from.
+ *
+ * With a row filter - the one the counts against the copy are made under -
+ * its POSITION FILTERS (LionRowFilter.pos, DESIGN.md §17 "Stored positions")
+ * decide every container before it is copied, and the copy holds only the
+ * rows their queries match (LionMatSet.posfiltered).  A count against it
+ * then decides nothing from positions (LionCountCtx.posdone), rather than
+ * put the candidates of its own key through the filters again: the cursors
+ * begun again at the first member at every count, and a seek to each
+ * candidate decoding its chunk from the start, which for a dimension row of a
+ * few rows in every part of the heap is most of a chunk's members read for
+ * each of them.  Here the cursors walk the members once, forward, as the
+ * copy's keys ascend.  Reading the positions without the
+ * pins the containers came under is "Why reading positions at any moment of
+ * a scan is safe" (DESIGN.md §17): a row the snapshot sees keeps its TID,
+ * and its positions are its own, so it is decided as a count would decide
+ * it; a TID whose positions belong to a row no longer there, or to a row
+ * that took its place after the snapshot, is a row the snapshot does not
+ * see, which the copy may drop or keep - kept, it is the stale member of
+ * the argument above, which the counts' interlock and recheck take care of.
+ * The filter's clauses that only the heap can decide are left to the counts.
  */
 
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 					 LionCountSource *sources, Size maxbytes, bool spill,
-					 LionPostingSet *out, bool *spilled, LionCountStats *stats)
+					 LionRowFilter *filter, LionPostingSet *out,
+					 bool *spilled, LionCountStats *stats)
 {
 	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
-									 maxbytes, spill, false, 0, 0,
+									 maxbytes, spill, filter, false, 0, 0,
 									 out, spilled, stats);
 }
 
@@ -2090,21 +2136,23 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 bool
 lion_sources_collect_range(Relation heap, Snapshot snapshot, int nsources,
 						   LionCountSource *sources, Size maxbytes, bool spill,
-						   uint32 lo, uint64 hi, LionPostingSet *out,
-						   bool *spilled, LionCountStats *stats)
+						   LionRowFilter *filter, uint32 lo, uint64 hi,
+						   LionPostingSet *out, bool *spilled,
+						   LionCountStats *stats)
 {
 	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
-									 maxbytes, spill, true, lo, hi,
+									 maxbytes, spill, filter, true, lo, hi,
 									 out, spilled, stats);
 }
 
 static bool
 lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 						  LionCountSource *sources, Size maxbytes, bool spill,
-						  bool ranged, uint32 lo, uint64 hi,
-						  LionPostingSet *out, bool *spilled,
+						  LionRowFilter *filter, bool ranged, uint32 lo,
+						  uint64 hi, LionPostingSet *out, bool *spilled,
 						  LionCountStats *stats)
 {
+	bool		posfiltered = (filter != NULL && filter->npos > 0);
 	LionCollect col;
 	LionMatSet *mat;
 	Relation	index = NULL;
@@ -2141,11 +2189,14 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	col.ranged = ranged;
 	col.lo = lo;
 	col.hi = hi;
+	col.filter = posfiltered ? filter : NULL;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
 	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
 
+	if (filter != NULL && filter->heap != heap)
+		elog(ERROR, "lion index count: a row filter for another relation");
 	(void) lion_count_sources_run(heap, snapshot, nsources, sources, stats,
 								  NULL, false, false, &col);
 
@@ -2181,6 +2232,7 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 		/* ... and seek it by its keys, directly where they are dense */
 		lion_mat_index(mat, CurrentMemoryContext, 0);
 		mat->collected = true;
+		mat->posfiltered = posfiltered;
 		out->found = true;
 		out->mat = mat;
 		out->ntids = col.members;
@@ -2215,6 +2267,7 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	lion_mat_index(mat, CurrentMemoryContext,
 				   maxbytes > mat->held ? maxbytes - mat->held : 0);
 	mat->collected = true;
+	mat->posfiltered = posfiltered;
 
 	out->found = true;
 	out->mat = mat;
@@ -2224,6 +2277,29 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	return true;
 }
 
+
+/*
+ * Is one of the positive sources a copy whose containers went through the
+ * position filters as it was made (LionMatSet.posfiltered)?  A source of that
+ * one set alone: every candidate of the intersection is a member of it.
+ */
+static bool
+lion_sources_posfiltered(int nsources, const LionCountSource *sources)
+{
+	int			i;
+
+	for (i = 0; i < nsources; i++)
+	{
+		const LionPostingSet *ps;
+
+		if (sources[i].negated || sources[i].nsets != 1)
+			continue;
+		ps = &sources[i].sets[0];
+		if (ps->found && ps->mat != NULL && ps->mat->posfiltered)
+			return true;
+	}
+	return false;
+}
 
 int64
 lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
@@ -2641,12 +2717,20 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	/*
 	 * ... and the row filter the node asks of every count of this execution
 	 * (DESIGN.md §17, "A query known only at run time").  A collection has no
-	 * cache and is not filtered: it copies the superset, and the counts of
-	 * that copy are.
+	 * cache, and only the position filters of the counts it is made for
+	 * (LionCollect.filter): what they decide is decided once for the copy,
+	 * and a count of a source that is such a copy decides nothing from the
+	 * positions again (posdone).  The clauses only the heap can test are the
+	 * counts' to test.
 	 */
-	cx.filter = (cache != NULL) ? cache->filter : NULL;
+	if (collect != NULL)
+		cx.filter = collect->filter;
+	else
+		cx.filter = (cache != NULL) ? cache->filter : NULL;
 	if (cx.filter != NULL && cx.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
+	cx.posdone = (cx.filter != NULL && cx.filter->npos > 0 &&
+				  lion_sources_posfiltered(nsources, sources));
 
 	if (summed)
 	{
@@ -2769,6 +2853,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->rows_removed += src->rows_removed;
 	dst->pos_checked += src->pos_checked;
 	dst->pos_removed += src->pos_removed;
+	dst->pos_seeks += src->pos_seeks;
+	dst->pos_decoded += src->pos_decoded;
 	dst->key_containers += src->key_containers;
 	dst->copy_containers += src->copy_containers;
 	dst->copy_seeks += src->copy_seeks;
