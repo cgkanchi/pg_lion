@@ -20703,7 +20703,8 @@ leaf is no selecting clause of a partition's bounds (`lion_leaf_drops()`). At mo
 (`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. A complement OR, an `IS DISTINCT
 FROM` or a `NOT` beside a multi-key query whose value is known only at run time is declined: that
 query may narrow nothing and leave the heap scan of `lion_count_scan_filtered()` as the count, and
-that scan tests none of them. A complement in a filtered count's condition (§10, "Filtered counts")
+that scan tests none of them. So is an `IS NOT NULL` or `<>` on an expression column (§41): the scan
+tests those on a heap column only (`lion_filter_with_negated()`, which refuses any other). A complement in a filtered count's condition (§10, "Filtered counts")
 is counted by that filter's run alone, which carries the OR among its items, and answers to the same
 terms, checked again once the filters are analysed (`lion_count_path_filters()`).
 
