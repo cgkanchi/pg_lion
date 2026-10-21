@@ -1349,7 +1349,10 @@ phase1e() {
 # leaves it with entries deleted and the pages of their chains leaked.  The
 # VACUUM without the manager has nothing to remove from it and must go
 # through, leaving the leaks for a VACUUM with the manager, which in rmgr
-# mode frees them at the end of the phase.
+# mode frees them at the end of the phase.  That VACUUM is given dead rows
+# to remove: one with none calls no ambulkdelete, and only ambulkdelete's
+# walk sweeps the index for leaks (lionvacuumcleanup()), as only nbtree's
+# btvacuumscan() finds its half-dead pages.
 phase1f() {
 	local before after custom off out leak=0 leaked parked vacpid
 	log ""
@@ -1537,13 +1540,23 @@ phase1f() {
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
 
-	# With the manager back, the next VACUUM frees the leaks.
+	# With the manager back, the next VACUUM that walks the index frees the
+	# leaks.  The VACUUM without the manager took the dead rows the crash
+	# left in the heap, so this one is given 17 of its own to remove: without
+	# them it would call no ambulkdelete, whose walk is what sweeps for them.
 	if [ "$leak" = 1 ] && [ "$MODE" = rmgr ]; then
-		psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_norm_l" >>"$RUNLOG" 2>&1 ||
-			die "phase 1f: the VACUUM of lion_norm_l failed with the manager"
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the VACUUM of lion_norm_l failed with the manager"
+			SET synchronous_commit = on;
+			DELETE FROM lion_norm_l WHERE k = 4 AND id <= 100;
+			VACUUM (INDEX_CLEANUP ON) lion_norm_l;
+		SQL
 		[ "$(psql_p -c "SELECT lion_index_verify('lion_norm_l_k', true)" 2>&1 >>"$RUNLOG" |
 			grep -c 'unused and unreachable' || true)" = 0 ] ||
 			die "phase 1f: the VACUUM with the manager left pages of lion_norm_l leaked"
+		nu=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_norm_l where k = 4")
+		run_check "phase 1f leaks freed" psql_p \
+			"select lion_index_count('lion_norm_l_k', 4) = $nu and $nu = 19983,
+					'the index counts the 19983 rows of k = 4 left'"
 	fi
 	psql_p -c "DROP TABLE IF EXISTS lion_norm_l" >>"$RUNLOG" 2>&1
 	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u, lion_norm_w" >>"$RUNLOG" 2>&1

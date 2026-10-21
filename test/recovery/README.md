@@ -187,8 +187,10 @@ the server there and checks what comes back. Four more (DESIGN.md §18, §22,
   injection points, a second rmgr-mode index first gets phase 1b's crash
   under the manager, which leaves entries deleted and their chains' pages
   leaked; the VACUUM without the manager has nothing to remove from it and
-  must go through and leave the leaks, which a VACUUM with the manager frees
-  in rmgr mode. The primary is restarted in its `--mode` afterwards.
+  must go through and leave the leaks, which a VACUUM with the manager and
+  dead rows to remove frees in rmgr mode (a VACUUM without dead rows calls no
+  `ambulkdelete`, and only its walk sweeps for leaks). The primary is
+  restarted in its `--mode` afterwards.
 * **1g**, a crash between a PROMOTION and the split it was for. A posting
   set of up to 16 leaves has no internal level; the split that would make a
   17th leaf first pushes the head down under a root that links every leaf,
