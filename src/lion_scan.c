@@ -785,7 +785,7 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 			CHECK_FOR_INTERRUPTS();
 
 			buf = ReadBuffer(w->index, w->nextblk);
-			lion_dir_pages_read++;
+			lion_dir_count_read(w->index);
 			LockBuffer(buf, BUFFER_LOCK_SHARE);
 			page = BufferGetPage(buf);
 			if (!LionPageIsLeaf(page))
@@ -5562,7 +5562,7 @@ lion_order_read_leaf(LionOrderWalk *w, Buffer buf)
 	/* SERIALIZABLE: the leaf and its sets, read from the copy (§9) */
 	lion_reader_lock_leaf(w->index, buf, w->attno);
 	memcpy(cpage, page, BLCKSZ);
-	lion_dir_pages_read++;
+	lion_dir_count_read(w->index);
 	w->leaves++;
 	w->blk = BufferGetBlockNumber(buf);
 	w->nextblk = LionPageIsRightmost(cpage) ? InvalidBlockNumber :

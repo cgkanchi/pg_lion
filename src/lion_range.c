@@ -1249,7 +1249,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 	CHECK_FOR_INTERRUPTS();
 
 	buf = ReadBuffer(es->index, es->blkno);
-	lion_dir_pages_read++;
+	lion_dir_count_read(es->index);
 	es->nleaves++;
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
