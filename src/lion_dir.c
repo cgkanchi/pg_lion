@@ -60,12 +60,32 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
+#include "utils/hsearch.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 
 #include "lion.h"
 
 /* DESIGN.md §21: EXPLAIN ANALYZE's "Directory Pages Read". */
 int64		lion_dir_pages_read = 0;
+
+/*
+ * The last directory read of each index this backend has read one of, as
+ * the value lion_dir_pages_read had just after it: what the index-usage
+ * statistics of a count ask (lion_dir_read_since()).  An entry is made the
+ * first time an index's directory is read and kept for the life of the
+ * backend - one per lion index it ever read, a few dozen bytes each - so
+ * that an entry's address stays put and lastmark can keep the last one used:
+ * consecutive reads are nearly always of one index, and pay a comparison.
+ */
+typedef struct LionDirReadMark
+{
+	Oid			indexoid;		/* the hash key */
+	int64		last;
+} LionDirReadMark;
+
+static HTAB *lion_dir_marks = NULL;
+static LionDirReadMark *lion_dir_lastmark = NULL;
 
 static Buffer lion_dir_find_parent(Relation index, Relation heaprel,
 								  LionIndexState *ix, const LionSearchKey *sk,
@@ -104,8 +124,65 @@ lion_dir_readbuf(Relation index, BlockNumber blk)
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lion index \"%s\" links to an invalid block number",
 						RelationGetRelationName(index))));
-	lion_dir_pages_read++;
+	lion_dir_count_read(index);
 	return ReadBuffer(index, blk);
+}
+
+/*
+ * A directory page of index read: counted in lion_dir_pages_read, and the
+ * index marked read now (lion_dir_read_since()).  Every read of a leaf or an
+ * internal page goes through here.  Inside a critical section - a write's
+ * own reads, which no count asks about - an index not yet marked is left
+ * so, for its mark would be an allocation.
+ */
+void
+lion_dir_count_read(Relation index)
+{
+	Oid			indexoid = RelationGetRelid(index);
+
+	lion_dir_pages_read++;
+	if (likely(lion_dir_lastmark != NULL &&
+			   lion_dir_lastmark->indexoid == indexoid))
+	{
+		lion_dir_lastmark->last = lion_dir_pages_read;
+		return;
+	}
+	if (lion_dir_marks == NULL)
+	{
+		HASHCTL		ctl;
+
+		if (CritSectionCount > 0)
+			return;
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(LionDirReadMark);
+		ctl.hcxt = TopMemoryContext;
+		lion_dir_marks = hash_create("lion directory reads", 64, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	lion_dir_lastmark = (LionDirReadMark *)
+		hash_search(lion_dir_marks, &indexoid,
+					CritSectionCount > 0 ? HASH_FIND : HASH_ENTER, NULL);
+	if (lion_dir_lastmark != NULL)
+		lion_dir_lastmark->last = lion_dir_pages_read;
+}
+
+/*
+ * Whether a directory page of the index was read since lion_dir_pages_read
+ * stood at since: what a count reports as a scan of the index
+ * (lion_count_report_reads()).  Every read of an index's posting sets or
+ * entries starts in its directory - a descent to a key, a walk of the
+ * leaves - so an index whose directory was not read was not read.
+ */
+bool
+lion_dir_read_since(Oid indexoid, int64 since)
+{
+	LionDirReadMark *mark;
+
+	if (lion_dir_marks == NULL)
+		return false;
+	mark = (LionDirReadMark *) hash_search(lion_dir_marks, &indexoid,
+										   HASH_FIND, NULL);
+	return mark != NULL && mark->last > since;
 }
 
 static inline LionEntryTuple *

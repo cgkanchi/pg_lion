@@ -317,10 +317,6 @@ lion_exec_custom_scan(CustomScanState *node)
 	int64		dirbefore = lion_dir_pages_read;
 	TupleTableSlot *slot;
 
-	/* the relation is read now (lion_count_report_reads()) */
-	if (st->heap != NULL)
-		st->statread = true;
-
 	/*
 	 * One group per call, except that a group the HAVING rejects is not a
 	 * result: keep going until one passes or the groups run out.

@@ -587,8 +587,9 @@ lion_open_relation(LionCountScanState *st, int p)
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
 
-	/* a partition is made the one counted only to be read */
-	st->statread = (part != NULL);
+	/* the indexes read from here on are the ones reported */
+	st->statopen = true;
+	st->statsince = lion_dir_pages_read;
 	st->statrows = 0;
 
 	for (i = 0; i < st->nclause; i++)
@@ -654,53 +655,66 @@ lion_open_relation(LionCountScanState *st, int p)
 		lion_load_inner_keys(st);
 }
 
-/* One index of lion_count_report_reads(), once however often it is named. */
+/*
+ * One index of lion_count_report_reads(), once however often it is named,
+ * and only if its directory was read since since.
+ */
 static void
-lion_count_report_index(List **seen, Relation index, int64 rows)
+lion_count_report_index(List **seen, Relation index, int64 since, int64 rows)
 {
 	if (index == NULL || list_member_oid(*seen, RelationGetRelid(index)))
 		return;
 	*seen = lappend_oid(*seen, RelationGetRelid(index));
+	if (!lion_dir_read_since(RelationGetRelid(index), since))
+		return;
 	pgstat_count_index_scan(index);
 	pgstat_count_index_tuples(index, rows);
 }
 
 /*
  * The index-usage statistics of the relation being counted
- * (pg_stat_user_indexes; REFERENCE.md, "Monitoring"), once it has been read
- * since it was made the one counted or last reported: one scan of each of
- * its indexes, and the rows counted since as each one's idx_tup_read - as
+ * (pg_stat_user_indexes; REFERENCE.md, "Monitoring") since it was made the
+ * one counted or last reported: one scan of each of its indexes that was
+ * read since, and the rows counted since as each one's idx_tup_read - as
  * core counts an index scan, once per scan or rescan that reads, and the
- * entries it returns.  Called when the relation's turn ends
- * (lion_close_relation()) and when the node is rescanned or ended
- * (lion_reset_run()).
+ * entries it returns.  An index the node opened and never read - the
+ * driving index of a GROUP BY whose WHERE selects nothing, which is not
+ * walked; the fk index of a join no dimension row comes to; a parallel
+ * plan's in a participant that claimed nothing - is not counted, as core
+ * counts no scan of an index scan that never ran.  Read means a directory
+ * page of it read by this backend in the meantime (lion_dir_read_since()):
+ * every lion read starts there, and a node's own reads are the only ones in
+ * between but for a plan that reads the same index elsewhere at the same
+ * time.  Called when the relation's turn ends (lion_close_relation()) and
+ * when the node is rescanned or ended (lion_reset_run()).
  */
 void
 lion_count_report_reads(LionCountScanState *st)
 {
 	List	   *seen = NIL;
+	int64		since = st->statsince;
 	int64		rows = st->statrows;
 	int			i;
 
-	if (!st->statread)
+	if (!st->statopen)
 		return;
-	st->statread = false;
+	st->statsince = lion_dir_pages_read;
 	st->statrows = 0;
 	for (i = 0; i < st->nclause; i++)
-		lion_count_report_index(&seen, st->clause[i].idx, rows);
-	lion_count_report_index(&seen, st->groupidx, rows);
-	lion_count_report_index(&seen, st->groupidx2, rows);
+		lion_count_report_index(&seen, st->clause[i].idx, since, rows);
+	lion_count_report_index(&seen, st->groupidx, since, rows);
+	lion_count_report_index(&seen, st->groupidx2, since, rows);
 	if (st->fg != NULL)			/* a partition's: lion_join_group_turn() */
-		lion_count_report_index(&seen, st->fg->idx, rows);
+		lion_count_report_index(&seen, st->fg->idx, since, rows);
 	if (st->decode != NULL)
 	{
 		for (i = 0; i < st->decode->ncol; i++)
-			lion_count_report_index(&seen, st->decode->idx[i], rows);
+			lion_count_report_index(&seen, st->decode->idx[i], since, rows);
 	}
 	if (st->cells != NULL)		/* the driver's is the decoded walk's */
 	{
 		for (i = 0; i < st->cells->ndim; i++)
-			lion_count_report_index(&seen, st->cells->idx[i], rows);
+			lion_count_report_index(&seen, st->cells->idx[i], since, rows);
 	}
 	list_free(seen);
 }
@@ -719,6 +733,7 @@ lion_close_relation(LionCountScanState *st)
 	int			i;
 
 	lion_count_report_reads(st);
+	st->statopen = false;
 
 	/* the counts' map page is this relation's */
 	lion_vis_cache_release_vm(st->viscache);

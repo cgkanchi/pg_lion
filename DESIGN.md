@@ -15911,8 +15911,11 @@ reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
   `pg_stat_user_tables` as the scans above do, so that an index lion reads never shows as unused.
   A scan of an index (`pgstat_count_index_scan()`, which sets `last_idx_scan` too) is counted once
   per scan and per rescan of each index read: LionCount (`lion_count_report_reads()`, as a run's
-  relation closes or the node rescans, from the relation's `statread` and `statrows`), the FK-side
-  joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
+  relation closes or the node rescans: each of the relation's indexes whose directory was read
+  since, which `lion_dir_read_since()` answers from the mark every directory page read leaves,
+  `lion_dir_count_read()`, with the rows counted since, `statrows` - so an index opened and never
+  read, the group column of a GROUP BY whose WHERE selects nothing or the fk index of a join no
+  dimension row reaches, counts no scan), the FK-side joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
   is counted by core's own scan under them), LionBm25 and the lionvec scan once per scan, and the
   SQL functions once per call - `lion_bm25_score()` once a query, when it reads the index's
   statistics into its cache. `idx_tup_read` counts what the index gave: a count's rows counted

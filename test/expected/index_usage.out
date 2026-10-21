@@ -167,6 +167,22 @@ SELECT * FROM ius_delta();
  table ius |        0 |        1 |              |             0
 (2 rows)
 
+-- ... whose WHERE selects nothing: the WHERE's index, and not the group
+-- column's, which is never walked
+SELECT * FROM ius_run($$SELECT a, count(*) FROM ius WHERE d @@ 'w99' GROUP BY a$$);
+   node    | nrows 
+-----------+-------
+ LionCount |     0
+(1 row)
+
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT * FROM ius_delta();
+    rel    | seq_scan | idx_scan | idx_tup_read | idx_tup_fetch 
+-----------+----------+----------+--------------+---------------
+ ius_d     |          |        1 |            0 |             0
+ table ius |        0 |        1 |              |             0
+(2 rows)
+
 -- a count(DISTINCT): the distinct values it counted
 SELECT * FROM ius_run('SELECT count(DISTINCT b) FROM ius WHERE a = 3');
    node    | nrows 
@@ -300,6 +316,24 @@ SELECT * FROM ius_delta();
  table ius     |        0 |        2 |              |             0
  table ius_dim |        0 |        1 |              |            13
 (5 rows)
+
+-- no dimension row: the fact filters' index, and not the fk index, which
+-- has no key to look up
+SELECT * FROM ius_run($$SELECT d.name, count(*) FROM ius JOIN ius_dim d ON d.pk = ius.a WHERE ius.b = 3 AND d.name = 'zz' GROUP BY d.name$$);
+   node    | nrows 
+-----------+-------
+ LionCount |     0
+(1 row)
+
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT * FROM ius_delta();
+      rel      | seq_scan | idx_scan | idx_tup_read | idx_tup_fetch 
+---------------+----------+----------+--------------+---------------
+ ius_b         |          |        1 |            0 |             0
+ ius_dim_pkey  |          |        1 |           13 |            13
+ table ius     |        0 |        1 |              |             0
+ table ius_dim |        0 |        1 |              |            13
+(4 rows)
 
 RESET enable_hashjoin;
 RESET enable_mergejoin;
