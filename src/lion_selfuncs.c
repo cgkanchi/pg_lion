@@ -77,6 +77,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
@@ -89,6 +90,7 @@
 #include "utils/array.h"
 #include "utils/attoptcache.h"
 #include "utils/datum.h"
+#include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -1441,6 +1443,429 @@ lion_canonical_clause(Node *clause)
 									  (Expr *) makeBoolConst(val, false),
 									  InvalidOid, InvalidOid);
 	return clause;
+}
+
+/* ---------------------------------------------------------------------
+ * A run of `<>` is one exclusion (DESIGN.md §29.11, "A run of `<>` is one
+ * exclusion")
+ * --------------------------------------------------------------------- */
+
+/*
+ * `k <> 'a' AND k <> 'b' AND ...` and `k NOT IN ('a', 'b', ...)` - `k <> ALL
+ * ('{a,b,...}')` - keep the rows whose k is not NULL and is none of the
+ * values.  The values' rows are disjoint, so their share is
+ *
+ *	1 - nullfrac - sum of freq(v) over the distinct values v
+ *
+ * with freq(v) what core's eqsel() takes for `k = v`: v's frequency among the
+ * most common values, or the average of the others.  Core estimates each
+ * `k <> v` alone as 1 - freq(v) - nullfrac and multiplies them, which takes
+ * the NULLs away once a clause: thirteen of them over a column 35% NULL come
+ * out at 3,452 rows of 1,000,000 for 593,523.  scalararraysel() sums `<> ALL`
+ * the same way, its disjoint form `1 - sum(freq(v) + nullfrac)`, and where
+ * that comes out below zero - two values of a column more than half NULL -
+ * falls back to the product.
+ *
+ * So lion's estimates take every clause of the kind on one expression - each
+ * `expr <> Const`, either way round, and each `expr <> ALL (array)` of
+ * non-NULL constants, with one operator, input collation and constant type -
+ * as ONE clause: `expr <> ALL` of their distinct values, a RestrictInfo whose
+ * cached selectivity is the share above.  Every estimate that reads the
+ * clauses through clauselist_selectivity() - the relation's rows, a
+ * parameterized path's, an index path's selectivity - takes that share from
+ * the cache rather than core's product, and multiplies it with the others as
+ * core multiplies a clause it has nothing to combine with.
+ *
+ * What is taken is what core's own estimate of each clause reads: operators
+ * whose restriction estimator is neqsel(), whose negator is the equality
+ * eqsel() is asked about.  The values are told apart with the comparison of
+ * their type's default btree class - which must hold that equality, so that
+ * two values it calls equal are the one most common value eqsel() would find
+ * for each - under the clauses' collation; a type without one keeps core's
+ * estimate, as does a run of one value, which core estimates exactly.
+ */
+
+/* One clause of a run: its expression, operator, values. */
+typedef struct LionNeqClause
+{
+	Node	   *expr;			/* the side that is not the constant */
+	Oid			opno;			/* the `<>`, with expr on its left */
+	Oid			collid;			/* its input collation */
+	Oid			elemtype;		/* the constants' type */
+	int			nvalues;
+	Datum	   *values;
+	int			run;			/* its run's first clause, or -1 */
+} LionNeqClause;
+
+/* The comparison the values of a run are sorted and told apart with. */
+typedef struct LionNeqSort
+{
+	FmgrInfo   *cmp;
+	Oid			collid;
+} LionNeqSort;
+
+static int
+lion_neq_cmp(const void *a, const void *b, void *arg)
+{
+	LionNeqSort *s = (LionNeqSort *) arg;
+
+	return DatumGetInt32(FunctionCall2Coll(s->cmp, s->collid,
+										   *(const Datum *) a,
+										   *(const Datum *) b));
+}
+
+/*
+ * Is clause - a RestrictInfo or bare - `expr <> Const` (or `Const <> expr`,
+ * taken commuted) or `expr <> ALL (array Const)`, of an operator core
+ * estimates with neqsel(), over an expression of some column that calls
+ * nothing volatile?  Fills *nc, values and all.  A NULL constant, an array
+ * with a NULL element or none at all is not one: core estimates the first two
+ * at no row, which they are, and the third, true of every row, at all of
+ * them.
+ */
+static bool
+lion_neq_parse(Node *clause, LionNeqClause *nc)
+{
+	memset(nc, 0, sizeof(LionNeqClause));
+	nc->run = -1;
+	if (clause != NULL && IsA(clause, RestrictInfo))
+	{
+		if (((RestrictInfo *) clause)->pseudoconstant)
+			return false;
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	}
+	if (clause == NULL)
+		return false;
+
+	if (IsA(clause, OpExpr) && list_length(((OpExpr *) clause)->args) == 2)
+	{
+		OpExpr	   *op = (OpExpr *) clause;
+		Node	   *left = (Node *) linitial(op->args);
+		Node	   *right = (Node *) lsecond(op->args);
+		Const	   *con;
+
+		if (get_oprrest(op->opno) != F_NEQSEL)
+			return false;
+		if (IsA(right, Const) && !IsA(left, Const))
+		{
+			nc->expr = left;
+			nc->opno = op->opno;
+			con = (Const *) right;
+		}
+		else if (IsA(left, Const) && !IsA(right, Const))
+		{
+			nc->expr = right;
+			nc->opno = get_commutator(op->opno);
+			con = (Const *) left;
+		}
+		else
+			return false;
+		if (!OidIsValid(nc->opno) || con->constisnull)
+			return false;
+		nc->collid = op->inputcollid;
+		nc->elemtype = con->consttype;
+		nc->nvalues = 1;
+		nc->values = (Datum *) palloc(sizeof(Datum));
+		nc->values[0] = con->constvalue;
+	}
+	else if (IsA(clause, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+		Node	   *right;
+		ArrayType  *arr;
+		int16		typlen;
+		bool		typbyval;
+		char		typalign;
+		bool	   *nulls;
+		int			i;
+
+		if (saop->useOr || list_length(saop->args) != 2 ||
+			get_oprrest(saop->opno) != F_NEQSEL)
+			return false;
+		right = (Node *) lsecond(saop->args);
+		if (!IsA(right, Const) || ((Const *) right)->constisnull)
+			return false;
+		arr = DatumGetArrayTypeP(((Const *) right)->constvalue);
+		nc->elemtype = ARR_ELEMTYPE(arr);
+		get_typlenbyvalalign(nc->elemtype, &typlen, &typbyval, &typalign);
+		deconstruct_array(arr, nc->elemtype, typlen, typbyval, typalign,
+						  &nc->values, &nulls, &nc->nvalues);
+		for (i = 0; i < nc->nvalues; i++)
+		{
+			if (nulls[i])
+				return false;
+		}
+		pfree(nulls);
+		if (nc->nvalues == 0)
+			return false;
+		nc->expr = (Node *) linitial(saop->args);
+		nc->opno = saop->opno;
+		nc->collid = saop->inputcollid;
+	}
+	else
+		return false;
+
+	return contain_var_clause(nc->expr) &&
+		!contain_volatile_functions(nc->expr) &&
+		!contain_subplans(nc->expr);
+}
+
+/* Are a and b clauses of one run? */
+static bool
+lion_neq_same_run(const LionNeqClause *a, const LionNeqClause *b)
+{
+	return a->opno == b->opno && a->collid == b->collid &&
+		a->elemtype == b->elemtype && equal(a->expr, b->expr);
+}
+
+/*
+ * The share of rows whose expr is not NULL and none of the n distinct
+ * values: eqsel()'s own frequency of each, through var_eq_const() as
+ * neqsel() asks it, and the expression's null fraction, which neqsel()
+ * takes away once a clause.
+ */
+static Selectivity
+lion_neq_run_sel(PlannerInfo *root, int varRelid, Node *expr, Oid eqop,
+				 Oid collid, const Datum *values, int n)
+{
+	VariableStatData vardata;
+	double		sel = 1.0;
+	int			i;
+
+	examine_variable(root, expr, varRelid, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple))
+		sel -= ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+	for (i = 0; i < n; i++)
+		sel -= var_eq_const(&vardata, eqop, collid, values[i], false, true,
+							false);
+	ReleaseVariableStats(vardata);
+	CLAMP_PROBABILITY(sel);
+	return (Selectivity) sel;
+}
+
+/*
+ * The one clause a run stands for (above): `expr <> ALL` of the distinct
+ * values of its clauses nc[i] (nc[i].run == first), as a RestrictInfo with
+ * its selectivity cached, or NULL where it is left to core: a run of one
+ * value, a type whose values cannot be told apart, or one without an array
+ * type.
+ */
+static RestrictInfo *
+lion_neq_run_clause(PlannerInfo *root, int varRelid, LionNeqClause *nc,
+					int n, int first)
+{
+	LionNeqClause *f = &nc[first];
+	TypeCacheEntry *typentry;
+	Oid			eqop = get_negator(f->opno);
+	Oid			arraytype = get_array_type(f->elemtype);
+	LionNeqSort sort;
+	Datum	   *values;
+	int			nvalues = 0;
+	int			ndistinct;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	int			dims[1];
+	int			lbs[1] = {1};
+	ScalarArrayOpExpr *saop;
+	RestrictInfo *rinfo;
+	Selectivity sel;
+	int			i;
+	int			j;
+
+	for (i = first; i < n; i++)
+	{
+		if (nc[i].run == first)
+			nvalues += nc[i].nvalues;
+	}
+	if (nvalues < 2 || !OidIsValid(eqop) || !OidIsValid(arraytype))
+		return NULL;
+	typentry = lookup_type_cache(f->elemtype, TYPECACHE_BTREE_OPFAMILY |
+								 TYPECACHE_CMP_PROC_FINFO);
+	if (!OidIsValid(typentry->btree_opf) ||
+		!OidIsValid(typentry->cmp_proc_finfo.fn_oid) ||
+		!op_in_opfamily(eqop, typentry->btree_opf))
+		return NULL;
+
+	/* every value of the run, sorted, each once */
+	values = (Datum *) palloc(sizeof(Datum) * nvalues);
+	nvalues = 0;
+	for (i = first; i < n; i++)
+	{
+		if (nc[i].run != first)
+			continue;
+		for (j = 0; j < nc[i].nvalues; j++)
+			values[nvalues++] = nc[i].values[j];
+	}
+	sort.cmp = &typentry->cmp_proc_finfo;
+	sort.collid = f->collid;
+	qsort_arg(values, nvalues, sizeof(Datum), lion_neq_cmp, &sort);
+	ndistinct = 1;
+	for (i = 1; i < nvalues; i++)
+	{
+		if (lion_neq_cmp(&values[i], &values[ndistinct - 1], &sort) != 0)
+			values[ndistinct++] = values[i];
+	}
+
+	sel = lion_neq_run_sel(root, varRelid, f->expr, eqop, f->collid, values,
+						   ndistinct);
+
+	dims[0] = ndistinct;
+	get_typlenbyvalalign(f->elemtype, &typlen, &typbyval, &typalign);
+	saop = makeNode(ScalarArrayOpExpr);
+	saop->opno = f->opno;
+	saop->opfuncid = get_opcode(f->opno);
+	saop->hashfuncid = InvalidOid;
+	saop->negfuncid = InvalidOid;
+	saop->useOr = false;
+	saop->inputcollid = f->collid;
+	saop->args = list_make2(copyObject(f->expr),
+							makeConst(arraytype, -1, f->collid, -1,
+									  PointerGetDatum(construct_md_array(values, NULL,
+																		 1, dims, lbs,
+																		 f->elemtype,
+																		 typlen,
+																		 typbyval,
+																		 typalign)),
+									  false, false));
+	saop->location = -1;
+	pfree(values);
+
+	rinfo = make_simple_restrictinfo(root, (Expr *) saop);
+	rinfo->norm_selec = sel;
+	rinfo->outer_selec = sel;
+	return rinfo;
+}
+
+/*
+ * clauses - RestrictInfos or bare, of one relation, varRelid's when it is
+ * not 0 - with each run of `<>` (above) as the one clause it stands for, in
+ * the place of its first clause; and whether any run was taken so.  The
+ * list is a new one; the clauses are not copied.
+ */
+static List *
+lion_neq_runs(PlannerInfo *root, int varRelid, List *clauses, bool *changed)
+{
+	int			n = list_length(clauses);
+	LionNeqClause *nc;
+	RestrictInfo **runclause;
+	List	   *result = NIL;
+	ListCell   *lc;
+	int			i;
+	int			j;
+
+	*changed = false;
+	if (n < 1)
+		return list_copy(clauses);
+
+	nc = (LionNeqClause *) palloc(sizeof(LionNeqClause) * n);
+	runclause = (RestrictInfo **) palloc0(sizeof(RestrictInfo *) * n);
+	foreach(lc, clauses)
+	{
+		i = foreach_current_index(lc);
+		if (!lion_neq_parse((Node *) lfirst(lc), &nc[i]))
+			continue;
+		nc[i].run = i;
+		for (j = 0; j < i; j++)
+		{
+			if (nc[j].run == j && lion_neq_same_run(&nc[j], &nc[i]))
+			{
+				nc[i].run = j;
+				break;
+			}
+		}
+	}
+	for (i = 0; i < n; i++)
+	{
+		if (nc[i].run == i)
+			runclause[i] = lion_neq_run_clause(root, varRelid, nc, n, i);
+	}
+
+	foreach(lc, clauses)
+	{
+		int			r;
+
+		i = foreach_current_index(lc);
+		r = nc[i].run;
+		if (r < 0 || runclause[r] == NULL)
+			result = lappend(result, lfirst(lc));
+		else
+		{
+			if (r == i)
+				result = lappend(result, runclause[r]);
+			*changed = true;
+		}
+	}
+	pfree(nc);
+	pfree(runclause);
+	return result;
+}
+
+/*
+ * clauses - RestrictInfos or bare, of one relation, varRelid's when it is
+ * not 0 - as lion's estimates take them: an OR of equalities as the IN list
+ * it spells (lion_or_as_array()), a run of `<>` on one expression as the one
+ * exclusion it is (lion_neq_runs()), every other clause as it is; and
+ * whether any of them differs from the clauses given.  A pseudoconstant
+ * RestrictInfo is left as it is.
+ */
+List *
+lion_canonical_clause_list(PlannerInfo *root, int varRelid, List *clauses,
+						   bool *changed)
+{
+	List	   *lists = NIL;
+	List	   *result;
+	bool		neqchanged;
+	ListCell   *lc;
+
+	*changed = false;
+	foreach(lc, clauses)
+	{
+		Node	   *clause = (Node *) lfirst(lc);
+		Node	   *arr = (IsA(clause, RestrictInfo) &&
+						   ((RestrictInfo *) clause)->pseudoconstant) ? NULL :
+			lion_or_as_array(clause);
+
+		if (arr != NULL)
+		{
+			lists = lappend(lists, arr);
+			*changed = true;
+		}
+		else
+			lists = lappend(lists, clause);
+	}
+	result = lion_neq_runs(root, varRelid, lists, &neqchanged);
+	list_free(lists);
+	if (neqchanged)
+		*changed = true;
+	return result;
+}
+
+/*
+ * Core's estimate of quals - an index path's RestrictInfos, of rel - in
+ * *coresel and lion's, of their canonical form (lion_canonical_clause_list()),
+ * in *lionsel, when the two forms differ; false, and neither set, when they
+ * do not.
+ */
+bool
+lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel, List *quals,
+						 Selectivity *coresel, Selectivity *lionsel)
+{
+	List	   *canon;
+	bool		changed;
+
+	if (root == NULL || rel == NULL || rel->relid == 0 || quals == NIL)
+		return false;
+	canon = lion_canonical_clause_list(root, rel->relid, quals, &changed);
+	if (changed)
+	{
+		*coresel = clauselist_selectivity(root, quals, rel->relid, JOIN_INNER,
+										  NULL);
+		*lionsel = clauselist_selectivity(root, canon, rel->relid, JOIN_INNER,
+										  NULL);
+	}
+	list_free(canon);
+	return changed;
 }
 
 #if PG_VERSION_NUM < 180000
@@ -3738,31 +4163,15 @@ lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 
 /*
  * rel's restriction clauses as lion's estimates take them: an OR of
- * equalities as the IN list it spells (lion_or_as_array()), every other
- * clause as it is; and whether any of them differs from core's.
+ * equalities as the IN list it spells, a run of `<>` on one expression as
+ * the one exclusion it is (lion_canonical_clause_list()), every other clause
+ * as it is; and whether any of them differs from core's.
  */
 static List *
-lion_rel_canonical_clauses(RelOptInfo *rel, bool *changed)
+lion_rel_canonical_clauses(PlannerInfo *root, RelOptInfo *rel, bool *changed)
 {
-	List	   *result = NIL;
-	ListCell   *lc;
-
-	*changed = false;
-	foreach(lc, rel->baserestrictinfo)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-		Node	   *arr = rinfo->pseudoconstant ? NULL :
-			lion_or_as_array((Node *) rinfo);
-
-		if (arr != NULL)
-		{
-			result = lappend(result, arr);
-			*changed = true;
-		}
-		else
-			result = lappend(result, rinfo);
-	}
-	return result;
+	return lion_canonical_clause_list(root, rel->relid, rel->baserestrictinfo,
+									  changed);
 }
 
 /*
@@ -3778,8 +4187,10 @@ lion_rel_canonical_clauses(RelOptInfo *rel, bool *changed)
  * (lion_rel_canonical_clauses()): core estimates `k = 1 OR k = 7` as though
  * the arms could overlap, 1 - (1 - s1)(1 - s2), and the list as the disjoint
  * entries they are, s1 + s2, so the same filter came out with fewer rows
- * written as an OR.  The rows are then computed as set_baserel_size_estimates()
- * computes rel->rows, from the list.
+ * written as an OR.  So does a run of `<>` on one expression, as the one
+ * exclusion it is (lion_neq_runs()): core takes the NULLs away once a clause.
+ * The rows are then computed as set_baserel_size_estimates() computes
+ * rel->rows, from those clauses.
  *
  * The factor applies to core's rows before they are rounded and clamped to
  * one: a wide filter of correlated columns is where core's product comes out
@@ -3792,20 +4203,23 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 	LionProbeScope *scope;
 	double		rows = rel->rows;
 	double		factor;
-	List	   *canon = NIL;
-	bool		changed = false;
+	List	   *canon;
+	bool		changed;
 	bool		scoped = false;
 
 	if (root == NULL)
 		return rows;
-	canon = lion_rel_canonical_clauses(rel, &changed);
 	for (scope = lion_probe_scope; scope != NULL; scope = scope->outer)
 	{
 		if (scope->glob == root->glob && scope->rti == rel->relid)
 		{
 			if (scope->rows < 0)
+			{
+				canon = lion_rel_canonical_clauses(root, rel, &changed);
 				scope->rows = rel->tuples *
 					clauselist_selectivity(root, canon, 0, JOIN_INNER, NULL);
+				list_free(canon);
+			}
 			rows = scope->rows;
 			scoped = true;
 			break;
@@ -3814,15 +4228,16 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 	/* rel->rows already is what this would compute (lion_correct_rel_rows()) */
 	if (!scoped && lion_probe_cache.glob == root->glob &&
 		list_member_ptr(lion_probe_cache.rowsfixed, rel))
-	{
-		list_free(canon);
 		return clamp_row_est(rows);
-	}
 	factor = lion_isect_rel_factor(root, rel);
-	if (!scoped && (changed || factor != 1.0))
-		rows = rel->tuples * clauselist_selectivity(root, canon, 0,
-													JOIN_INNER, NULL);
-	list_free(canon);
+	if (!scoped)
+	{
+		canon = lion_rel_canonical_clauses(root, rel, &changed);
+		if (changed || factor != 1.0)
+			rows = rel->tuples * clauselist_selectivity(root, canon, 0,
+														JOIN_INNER, NULL);
+		list_free(canon);
+	}
 	return clamp_row_est(rows * factor);
 }
 
@@ -3908,6 +4323,31 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 }
 
 /*
+ * Do lion's estimates take rel's restriction clauses in another form than
+ * core's (lion_rel_canonical_clauses())?  Only for a relation lion indexes:
+ * the estimates of a table it has no index on are core's.
+ */
+static bool
+lion_rel_canonical_changes(PlannerInfo *root, RelOptInfo *rel)
+{
+	Oid			amoid = lion_get_am_oid();
+	bool		changed = false;
+	ListCell   *lc;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx->relam == amoid && !idx->hypothetical)
+		{
+			list_free(lion_rel_canonical_clauses(root, rel, &changed));
+			break;
+		}
+	}
+	return changed;
+}
+
+/*
  * A parameterized scan's rows as get_parameterized_baserel_size() computes
  * them - rel's restriction clauses with ppi's join clauses ANDed in, taken as
  * independent of them - with the restriction clauses as lion_probe_rel_rows()
@@ -3987,6 +4427,14 @@ lion_correct_path_rows(List *paths, List *ppilist, const double *ppirows,
  * rel->rows after this, and the paths and Gathers built from here on read
  * it.
  *
+ * The same goes wherever lion's estimates take the restriction clauses in
+ * another form than core's (lion_rel_canonical_changes()) - an OR of
+ * equalities as its IN list, a run of `<>` on one expression as the one
+ * exclusion it is (DESIGN.md §29.11, "A run of `<>` is one exclusion") -
+ * with the probe's factor or without it, the probe on or off: rel->rows is
+ * then core's estimate of those clauses (lion_probe_rel_rows(), and for a
+ * parameterized path lion_param_rows(), from the same clauses).
+ *
  * Only a plain relation of its own: an inheritance parent's rows are its
  * children's sum, made before any child's paths are built, and a child's
  * correction would not reach it.
@@ -4004,12 +4452,13 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
-	if (!lion_enable_rows_correction || !lion_enable_intersection_probe ||
+	if (!lion_enable_rows_correction ||
 		root->glob == NULL || rel->reloptkind != RELOPT_BASEREL ||
 		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL)
 		return;
+	/* 1.0 where the probe is off or found nothing to correct */
 	factor = lion_isect_rel_factor(root, rel);
-	if (factor == 1.0)
+	if (factor == 1.0 && !lion_rel_canonical_changes(root, rel))
 		return;
 
 	newrows = lion_probe_rel_rows(root, rel);
@@ -4020,7 +4469,7 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	/* every ParamPathInfo's rows anew, before any of them changes */
 	ppirows = (double *) palloc(sizeof(double) *
 								Max(list_length(rel->ppilist), 1));
-	canon = lion_rel_canonical_clauses(rel, &changed);
+	canon = lion_rel_canonical_clauses(root, rel, &changed);
 	foreach(lc, rel->ppilist)
 		ppirows[foreach_current_index(lc)] =
 			lion_param_rows(root, rel, lfirst_node(ParamPathInfo, lc), canon,
