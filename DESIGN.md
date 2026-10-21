@@ -20610,7 +20610,10 @@ whose key compares equal to c and bounds the walk on neither side. So:
   rewrites the key as the one it means before anything classifies it (`lion_scan_keys_rewrite()`):
   `IS NOT NULL`, the `<>` of the one element, or a `<>` of NULL. The elements are told apart with
   the probe's comparison of their type among themselves, under the column's collation, where two
-  values it calls equal are one value to the index too (`'AB'` and `'ab'` under citext).
+  values it calls equal are one value to the index too (`'AB'` and `'ab'` under citext). Where the
+  probe has none - a column in hash order (§21), an element type the family orders against the
+  column's but not against itself - equality tells them apart: the column's own for its type, the
+  family's strategy 1 for the element type's pair (`lion_ne_any_equality()`).
 - **The price** (`lioncostestimate()`): a walk with holes reads the keys of its RANGE - n_distinct
   times the other bounds' selectivity - less the holes, and no summaries
   (`lion_cost_ranges_entries()`). Priced by its selectivity, `SearchPhrase <> ''` was 13% of
