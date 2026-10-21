@@ -615,7 +615,9 @@ SELECT pg_relation_size('lion_vring_k') / 8192 > 400 AS large,
 	   lion_vring_cached() < 4 AS none_cached;
 DELETE FROM lion_vring WHERE i % 10 = 0;
 SET vacuum_buffer_usage_limit = '128kB';
-VACUUM lion_vring;
+-- FREEZE: the ntids below counts on every dead row going, and a plain VACUUM
+-- leaves those of a heap page it cannot have the cleanup lock of at once
+VACUUM (FREEZE) lion_vring;
 RESET vacuum_buffer_usage_limit;
 SELECT lion_vring_cached() <= 32 AS ringed;
 SELECT ntids = 180000 AS ntids_ok FROM lion_index_stats('lion_vring_k');

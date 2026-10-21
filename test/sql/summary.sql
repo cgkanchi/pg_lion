@@ -235,7 +235,10 @@ INSERT INTO lion_sm_open
 SELECT summary_entries, summary_tids, summary_pages > 4 AS leaves
   FROM lion_index_stats('lion_sm_open_k');
 DELETE FROM lion_sm_open;
-VACUUM lion_sm_open;
+-- FREEZE: a plain VACUUM leaves the dead rows of a heap page it cannot have
+-- the cleanup lock of at once (one the checkpointer is writing out, say) to
+-- the next VACUUM, and the leaf that holds their TIDs with them
+VACUUM (FREEZE) lion_sm_open;
 SELECT entries, summary_entries, summary_tids, summary_pages <= 2 AS emptied,
 	   deleted_pages > 0 AS freed
   FROM lion_index_stats('lion_sm_open_k');
