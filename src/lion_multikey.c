@@ -265,15 +265,22 @@ lion_hashpos_cmp(const void *a, const void *b, void *arg)
  *
  * Returns the number of distinct non-NULL keys and puts them in *keys, which
  * is palloc'd in the current context (NULL when there are none).  Zero means
- * the row belongs in the reserved EMPTY entry (DESIGN.md §17).
+ * the row belongs in a reserved entry, whose flag goes in *nokey when nokey
+ * is not NULL (DESIGN.md §17, "The reserved EMPTY entry"): the EMPTY entry
+ * when the function extracted nothing at all - an array with no elements, a
+ * tsvector with no lexemes - and the NULLELEMS entry when every key it
+ * extracted was NULL - an array of NULLs.  The two are told apart so that
+ * the EMPTY entry holds exactly the values with no elements, which is what
+ * `cardinality(a) = 0` and `array_length(a, 1) IS NULL` ask for.
  */
 static int lion_extract_internal(LionState *state, Datum value, Datum **keys,
-								 LionKeyPositions **pos);
+								 LionKeyPositions **pos, uint16 *nokey);
 
 int
-lion_extract_value(LionState *state, Datum value, Datum **keys)
+lion_extract_value(LionState *state, Datum value, Datum **keys,
+				   uint16 *nokey)
 {
-	return lion_extract_internal(state, value, keys, NULL);
+	return lion_extract_internal(state, value, keys, NULL, nokey);
 }
 
 /*
@@ -287,10 +294,10 @@ lion_extract_value(LionState *state, Datum value, Datum **keys)
  */
 int
 lion_extract_value_pos(LionState *state, Datum value, Datum **keys,
-					   LionKeyPositions **pos)
+					   LionKeyPositions **pos, uint16 *nokey)
 {
 	Assert(state->positions);
-	return lion_extract_internal(state, value, keys, pos);
+	return lion_extract_internal(state, value, keys, pos, nokey);
 }
 
 /*
@@ -306,7 +313,7 @@ lion_is_length_key(const LionState *state, Datum key)
 
 static int
 lion_extract_internal(LionState *state, Datum value, Datum **keys,
-					  LionKeyPositions **pos)
+					  LionKeyPositions **pos, uint16 *nokey)
 {
 	Datum	   *raw;
 	int32		nraw = 0;
@@ -334,6 +341,8 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 	*keys = NULL;
 	if (pos != NULL)
 		*pos = NULL;
+	if (nokey != NULL)
+		*nokey = LION_ENTRY_EMPTYKEY;
 	/*
 	 * extractValue set nraw through the pointer in a Datum, which a static
 	 * analyser does not follow: to it nraw is still 0 here.
@@ -368,6 +377,9 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 
 	if (nlive == 0)
 	{
+		/* keys, and every one of them NULL: `{NULL}`, `{{NULL},{NULL}}` */
+		if (nokey != NULL)
+			*nokey = LION_ENTRY_NULLELEMS;
 		pfree(ord);
 		return 0;
 	}

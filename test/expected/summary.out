@@ -685,7 +685,7 @@ VACUUM (FREEZE, ANALYZE) lion_sm_old;
 SELECT * FROM lion_sm_meta('lion_sm_old_u');
  version | summary_cols 
 ---------+--------------
-      12 |            0
+      13 |            0
 (1 row)
 
 SELECT attno, summary_entries FROM lion_index_stats('lion_sm_old_u');
@@ -728,7 +728,7 @@ REINDEX INDEX lion_sm_old_u;
 SELECT * FROM lion_sm_meta('lion_sm_old_u');
  version | summary_cols 
 ---------+--------------
-      12 |            2
+      13 |            2
 (1 row)
 
 SELECT attno, summary_entries > 0 AS has FROM lion_index_stats('lion_sm_old_u');
@@ -762,7 +762,7 @@ REINDEX INDEX lion_sm_old_u;
 SELECT * FROM lion_sm_meta('lion_sm_old_u');
  version | summary_cols 
 ---------+--------------
-      12 |            0
+      13 |            0
 (1 row)
 
 SELECT attno, summary_entries FROM lion_index_stats('lion_sm_old_u');

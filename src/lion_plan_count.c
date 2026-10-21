@@ -981,6 +981,7 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 			if (!(leaf.kind == LION_CLAUSE_EQ ||
 				  leaf.kind == LION_CLAUSE_ARRAY ||
 				  leaf.kind == LION_CLAUSE_NULL ||
+				  leaf.kind == LION_CLAUSE_RESERVED ||
 				  (leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
 				   IsA(leaf.val, Const))))
 				allplain = false;
@@ -1146,7 +1147,7 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 * every other positive clause stays one.
 	 */
 	if (leaf.kind == LION_CLAUSE_EQ || leaf.kind == LION_CLAUSE_ARRAY ||
-		leaf.kind == LION_CLAUSE_NULL ||
+		leaf.kind == LION_CLAUSE_NULL || leaf.kind == LION_CLAUSE_RESERVED ||
 		(leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
 		 IsA(leaf.val, Const)))
 		cx->plainpositive = true;
@@ -1229,6 +1230,29 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 										(int) leaf.var->varattno);
 	}
 
+	/*
+	 * The same NOTRESERVED clause again - `array_length(a, 1) IS NOT NULL
+	 * AND array_length(a, 1) >= 0` is one set of rows written twice
+	 * (DESIGN.md §17, "Non-empty arrays") - would subtract the same entries
+	 * twice, and is dropped as the same positive clause is above.
+	 */
+	if (leaf.kind == LION_CLAUSE_NOTRESERVED)
+	{
+		ListCell   *l1;
+		ListCell   *l2;
+		ListCell   *l3;
+
+		forthree(l1, cx->clauseinfos, l2, cx->whereconsts, l3, cx->whereinor)
+		{
+			LionClauseInfo *prev = (LionClauseInfo *) lfirst(l1);
+
+			if (lfirst_int(l3) == 0 && prev->kind == leaf.kind &&
+				prev->attno == leaf.var->varattno &&
+				prev->filter == cx->curfilter && equal(lfirst(l2), leaf.val))
+				return true;
+		}
+	}
+
 	switch (leaf.kind)
 	{
 		case LION_CLAUSE_EQ:
@@ -1266,6 +1290,32 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 		case LION_CLAUSE_NULL:
 			cx->nullattnos = lappend_int(cx->nullattnos,
 										 (int) leaf.var->varattno);
+			break;
+		case LION_CLAUSE_RESERVED:
+			/* the EMPTY entry alone: its rows are no NULLs (§17) */
+			if ((DatumGetInt32(((Const *) leaf.val)->constvalue) &
+				 LION_ENTRY_NULLKEY) == 0)
+				cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+												(int) leaf.var->varattno);
+			break;
+		case LION_CLAUSE_NOTRESERVED:
+
+			/*
+			 * Every row outside the reserved entries named (§17).  With the
+			 * NULL entry among them it is `col <> '{}'`, which the row filter
+			 * of a WHERE with nothing else to take its candidates from tests
+			 * on a heap column (lion_filter_with_negated()); without it NULLs
+			 * pass, and the filter tests nothing of the kind, as it tests
+			 * none of the new negated clauses of §35.
+			 */
+			if ((DatumGetInt32(((Const *) leaf.val)->constvalue) &
+				 LION_ENTRY_NULLKEY) != 0)
+				cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+												(int) leaf.var->varattno);
+			else
+				cx->newnegated = true;
+			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+				cx->newnegated = true;
 			break;
 	}
 

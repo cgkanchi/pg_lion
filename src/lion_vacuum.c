@@ -1485,9 +1485,8 @@ summary_gone:
 	}
 
 	{
-		uint16		pflags = (uint16) ((ent->kind == LION_KIND_NULL) ? LION_ENTRY_NULLKEY :
-									   (ent->kind == LION_KIND_EMPTY) ? LION_ENTRY_EMPTYKEY :
-									   0);
+		uint16		pflags = LION_KIND_IS_RESERVED(ent->kind) ?
+			lion_reserved_flag(ent->kind) : 0;
 
 		/* the key where an entry of its column has it (lion_entryfmt.h) */
 		if (ent->attno >= 1 && ent->attno <= vs->ix->ncolumns)

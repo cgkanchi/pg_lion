@@ -181,11 +181,12 @@ lion_make_entry(LionState *state, Datum key, uint16 flags,
 }
 
 /*
- * Build a reserved entry tuple: the NULL-key one (DESIGN.md §14) or the
- * no-key one a multi-key opclass needs for rows it extracts nothing from
- * (DESIGN.md §17).
+ * Build a reserved entry tuple: the NULL-key one (DESIGN.md §14), or one of
+ * the two a multi-key opclass needs for rows it extracts no key from - the
+ * EMPTY entry, nothing extracted at all, and the NULLELEMS one, only NULL
+ * keys (DESIGN.md §17).
  *
- * Neither has a key at all: keylen 0, hash 0, and the reservedflag bit, which
+ * None has a key at all: keylen 0, hash 0, and the reservedflag bit, which
  * is how every reader recognises them.  The payload is an ordinary INLINE
  * payload, so once such an entry exists the insert, VACUUM and count paths
  * treat it exactly like any other.
@@ -199,7 +200,8 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 	Size		total;
 
 	Assert(reservedflag == LION_ENTRY_NULLKEY ||
-		   reservedflag == LION_ENTRY_EMPTYKEY);
+		   reservedflag == LION_ENTRY_EMPTYKEY ||
+		   reservedflag == LION_ENTRY_NULLELEMS);
 	Assert(attno >= 1);
 
 	flags |= reservedflag;
@@ -523,9 +525,10 @@ lion_find_entry(Relation index, LionState *state, int lockmode, Datum key,
 }
 
 /*
- * Find a reserved entry (DESIGN.md §14 and §17).  Both sort before every real
- * key (LION_KIND_NULL and LION_KIND_EMPTY), so they live on the leftmost leaf
- * and are reached by the same descent as anything else.
+ * Find a reserved entry (DESIGN.md §14 and §17).  They sort before every
+ * real key of their column (LION_KIND_NULL, LION_KIND_EMPTY and
+ * LION_KIND_NULLELEMS), and are reached by the same descent as anything
+ * else.
  */
 bool
 lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
@@ -533,12 +536,7 @@ lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
 {
 	LionSearchKey sk;
 
-	Assert(reservedflag == LION_ENTRY_NULLKEY ||
-		   reservedflag == LION_ENTRY_EMPTYKEY);
-
-	lion_search_key_init(state, &sk,
-						 (reservedflag == LION_ENTRY_NULLKEY) ?
-						 LION_KIND_NULL : LION_KIND_EMPTY,
+	lion_search_key_init(state, &sk, lion_reserved_kind(reservedflag),
 						 (Datum) 0, LION_NULLKEY_HASH);
 
 	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,

@@ -11,6 +11,15 @@
  */
 #include "postgres.h"
 
+#include "catalog/namespace.h"
+#include "catalog/pg_type.h"
+#include "nodes/miscnodes.h"
+#include "utils/builtins.h"
+#include "utils/fmgroids.h"
+#include "utils/fmgrprotos.h"
+#include "utils/json.h"
+#include "utils/lsyscache.h"
+
 #include "lion_customscan.h"
 
 /*
@@ -681,6 +690,13 @@ lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col)
  * different function might not.  An OR's leaf the posting sets only bound
  * (`positions`) needs a column that stores positions, which decide it.
  *
+ * A null test is answered by a column's NULL entry, which a multi-key column
+ * has as a scalar one does (DESIGN.md §14, §17): by a scalar column, and by
+ * a multi-key one where no index has the column as a scalar one
+ * (LION_CLAUSE_ANY_COLUMN()).  Whether an array is empty (§17, "Non-empty
+ * arrays") is answered by a column of lion's array_ops alone
+ * (lion_nonempty_index()).
+ *
  * Every partition is checked separately, because nothing stops one of them
  * from carrying a lion index built with a different opclass.  Inside the
  * scope of a partial index (DESIGN.md §45) that index answers the clause
@@ -690,13 +706,36 @@ static bool lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind,
 							   Oid opno, Oid cmptype, StrategyNumber strategy,
 							   Oid extractquery, Oid exprcoll,
 							   bool positions);
+static IndexOptInfo *lion_match_index_of(RelOptInfo *rel, AttrNumber attno,
+										 bool multikey, int kind, Oid opno,
+										 Oid cmptype, StrategyNumber strategy,
+										 Oid extractquery, Oid exprcoll,
+										 bool positions, AttrNumber *colp);
 
 IndexOptInfo *
 lion_match_index(RelOptInfo *rel, AttrNumber attno, int kind, Oid opno,
 				Oid cmptype, StrategyNumber strategy, Oid extractquery,
 				Oid exprcoll, bool positions, AttrNumber *colp)
 {
-	bool		multikey = LION_CLAUSE_IS_MULTI(kind);
+	IndexOptInfo *idx;
+
+	idx = lion_match_index_of(rel, attno, LION_CLAUSE_IS_MULTI(kind), kind,
+							  opno, cmptype, strategy, extractquery, exprcoll,
+							  positions, colp);
+	if (idx == NULL && LION_CLAUSE_ANY_COLUMN(kind))
+		idx = lion_match_index_of(rel, attno, true, kind, opno, cmptype,
+								  strategy, extractquery, exprcoll,
+								  positions, colp);
+	return idx;
+}
+
+/* ... with an index column of the kind asked (lion_index_key_col()). */
+static IndexOptInfo *
+lion_match_index_of(RelOptInfo *rel, AttrNumber attno, bool multikey,
+					int kind, Oid opno, Oid cmptype, StrategyNumber strategy,
+					Oid extractquery, Oid exprcoll, bool positions,
+					AttrNumber *colp)
+{
 	IndexOptInfo *part = lion_partial_index_of(rel);
 	Node	   *vcol;
 	AttrNumber	col = 0;
@@ -744,6 +783,23 @@ lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
 	if (OidIsValid(exprcoll) && OidIsValid(idx->indexcollations[i]) &&
 		idx->indexcollations[i] != exprcoll)
 		return false;
+
+	/*
+	 * Whether an array is empty (DESIGN.md §17, "Non-empty arrays") is read
+	 * off the reserved entries, which only lion's array_ops fills in the
+	 * order it needs: an index column that is not one may file a non-empty
+	 * array under EMPTY.
+	 */
+	if (kind == LION_CLAUSE_RESERVED || kind == LION_CLAUSE_NOTRESERVED)
+		return lion_nonempty_index(idx, col);
+
+	/*
+	 * A null test answered by a multi-key column (lion_match_index()) asks
+	 * nothing of its opclass: every NULL the column holds is in its NULL
+	 * entry, whatever the opclass extracts from the other values.
+	 */
+	if (LION_CLAUSE_ANY_COLUMN(kind))
+		return true;
 
 	if (multikey)
 	{
@@ -1434,6 +1490,103 @@ lion_or_arms(Node *clause)
 }
 
 /*
+ * `(doc ->> 'k') = 'v'` as the `doc @> '{"k": "v"}'` it is the same test as
+ * (DESIGN.md §42.6), or NULL when clause is not one or the two could differ.
+ * `->>` gives the text of the field's value: a string's own characters, a
+ * number's digits, `true` or `false`, a container's JSON text, and NULL for
+ * a JSON null, a missing key and a document that is no object.  The containment holds exactly where the
+ * document is an object whose field k is the string v.  So the two agree on
+ * every row - NULL counting as false, as in a WHERE or a FILTER - when v is
+ * the text of no number (numeric_in() refuses it), of neither boolean, and of
+ * no container (it starts with neither `{` nor `[`), and when `=` is texteq()
+ * under a deterministic collation, which compares the characters themselves.
+ * The key and v must be constants; the rewritten clause compares the same
+ * expression, relabels and all, with the operator of pg_catalog.
+ */
+static Node *
+lion_jsonb_field_eq(Node *clause)
+{
+	OpExpr	   *op;
+	OpExpr	   *field = NULL;
+	Const	   *val = NULL;
+	Const	   *key;
+	Node	   *a;
+	Node	   *b;
+	char	   *keystr;
+	char	   *valstr;
+	Oid			containsop;
+	Datum		num;
+	ErrorSaveContext escontext = {T_ErrorSaveContext};
+	StringInfoData buf;
+
+	if (clause == NULL || !IsA(clause, OpExpr))
+		return NULL;
+	op = (OpExpr *) clause;
+	if (list_length(op->args) != 2 || op->opretset)
+		return NULL;
+	set_opfuncid(op);
+	if (op->opfuncid != F_TEXTEQ || !OidIsValid(op->inputcollid) ||
+		!get_collation_isdeterministic(op->inputcollid))
+		return NULL;
+
+	a = lion_strip((Node *) linitial(op->args));
+	b = lion_strip((Node *) lsecond(op->args));
+	if (a != NULL && IsA(a, OpExpr) && b != NULL && IsA(b, Const))
+	{
+		field = (OpExpr *) a;
+		val = (Const *) b;
+	}
+	else if (b != NULL && IsA(b, OpExpr) && a != NULL && IsA(a, Const))
+	{
+		field = (OpExpr *) b;
+		val = (Const *) a;
+	}
+	if (field == NULL || val->constisnull ||
+		(val->consttype != TEXTOID && val->consttype != VARCHAROID))
+		return NULL;
+
+	set_opfuncid(field);
+	if (field->opfuncid != F_JSONB_OBJECT_FIELD_TEXT ||
+		list_length(field->args) != 2)
+		return NULL;
+	key = (Const *) lion_strip((Node *) lsecond(field->args));
+	if (key == NULL || !IsA(key, Const) || key->constisnull ||
+		(key->consttype != TEXTOID && key->consttype != VARCHAROID))
+		return NULL;
+
+	/* v is the text of no number, boolean or container */
+	valstr = TextDatumGetCString(val->constvalue);
+	if (valstr[0] == '{' || valstr[0] == '[' ||
+		strcmp(valstr, "true") == 0 || strcmp(valstr, "false") == 0 ||
+		DirectInputFunctionCallSafe(numeric_in, valstr, InvalidOid, -1,
+									(Node *) &escontext, &num))
+		return NULL;
+
+	containsop = OpernameGetOprid(list_make2(makeString("pg_catalog"),
+											 makeString("@>")),
+								  JSONBOID, JSONBOID);
+	if (!OidIsValid(containsop) || get_opcode(containsop) != F_JSONB_CONTAINS)
+		return NULL;
+
+	keystr = TextDatumGetCString(key->constvalue);
+	initStringInfo(&buf);
+	appendStringInfoChar(&buf, '{');
+	escape_json(&buf, keystr);
+	appendStringInfoString(&buf, ": ");
+	escape_json(&buf, valstr);
+	appendStringInfoChar(&buf, '}');
+
+	return (Node *) make_opclause(containsop, BOOLOID, false,
+								  (Expr *) copyObject(linitial(field->args)),
+								  (Expr *) makeConst(JSONBOID, -1, InvalidOid,
+													 -1,
+													 DirectFunctionCall1(jsonb_in,
+																		 CStringGetDatum(buf.data)),
+													 false, false),
+								  InvalidOid, InvalidOid);
+}
+
+/*
  * Is this clause one the posting sets can answer, and on a plain column of
  * rti?  Fills *out and returns true, or returns false and leaves the caller
  * to decline the whole query.
@@ -1466,6 +1619,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 {
 	Var		   *boolvar;
 	bool		boolval;
+	Node	   *rewritten;
 
 	memset(out, 0, sizeof(LionLeafInfo));
 	out->opno = InvalidOid;
@@ -1476,7 +1630,34 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 	if (clause == NULL)
 		return false;
 
-	if (lion_boolean_eq_test(clause, &boolvar, &boolval))
+	if ((rewritten = lion_jsonb_field_eq(clause)) != NULL)
+	{
+		/*
+		 * `(doc ->> 'k') = 'v'` (lion_jsonb_field_eq()): the containment it
+		 * is, analysed as one, whose clause the cost model and the plan see
+		 * in its place.
+		 */
+		if (!lion_analyze_leaf(root, rewritten, rti, allow_negated,
+							   allow_range, allow_recheck, out))
+			return false;
+		if (out->kind != LION_CLAUSE_MULTI || out->costclause != NULL)
+			return false;
+		out->costclause = rewritten;
+		return true;
+	}
+	if (lion_nonempty_leaf(clause, out))
+	{
+		/*
+		 * Whether an array is empty (DESIGN.md §17, "Non-empty arrays"):
+		 * `cardinality(tags) > 0`, `array_length(tags, 1) IS NOT NULL`,
+		 * `tags <> '{}'` and the other spellings lion_nonempty_leaf() takes,
+		 * each the rows of the column's reserved entries or the rows outside
+		 * them.  The second is a negated source, as `IS NOT NULL` is.
+		 */
+		if (!allow_negated && LION_CLAUSE_IS_NEGATED(out->kind))
+			return false;
+	}
+	else if (lion_boolean_eq_test(clause, &boolvar, &boolval))
 	{
 		/*
 		 * A boolean column by itself (lion_boolean_eq_test()): the equality

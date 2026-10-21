@@ -384,7 +384,7 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 			list_make4_int(RelationRelationId, 0, 0, ClassOidIndexId);
 	else if (strcmp(variant, "clause kind") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_CLAUSEKINDS)) =
-			list_make1_int(LION_CLAUSE_NOTMULTI + 1);
+			list_make1_int(LION_CLAUSE_MAXKIND + 1);
 	else if (strcmp(variant, "path join at plan") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_JOIN)) =
 			list_make5_int(0, LION_JOIN_INNER, 0, 0, 0);

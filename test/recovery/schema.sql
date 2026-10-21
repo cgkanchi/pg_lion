@@ -455,9 +455,11 @@ BEGIN
 	RETURN NEXT;
 
 	/*
-	 * 3. the reserved NULL and EMPTY entries (sections 14 and 17).  Both are
-	 * key-less entries found by a flag, so a lost flag is invisible to the
-	 * ntids total above: count them separately.
+	 * 3. the reserved NULL, EMPTY and NULLELEMS entries (sections 14 and
+	 * 17).  Each is a key-less entry found by a flag, so a lost flag is
+	 * invisible to the ntids total above: count them separately.  EMPTY
+	 * holds the arrays with no element, NULLELEMS those whose elements are
+	 * all NULL.
 	 */
 	FOR r IN
 		SELECT * FROM (VALUES
@@ -469,7 +471,10 @@ BEGIN
 			 'select count(*) from lion_rec where arr is null'),
 			('lion_rec_arr empty_tids',
 			 'select empty_tids from lion_index_stats(''lion_rec_arr'')',
-			 'select count(*) from lion_rec where arr is not null and not exists '
+			 'select count(*) from lion_rec where cardinality(arr) = 0'),
+			('lion_rec_arr nullelem_tids',
+			 'select nullelem_tids from lion_index_stats(''lion_rec_arr'')',
+			 'select count(*) from lion_rec where cardinality(arr) > 0 and not exists '
 			 '(select 1 from unnest(arr) e where e is not null)'),
 			('lion_rec_tsv null_tids',
 			 'select null_tids from lion_index_stats(''lion_rec_tsv'')',
@@ -517,10 +522,18 @@ BEGIN
 
 	EXECUTE 'select empty_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
 		INTO got;
-	EXECUTE 'select count(*) from lion_rec where arr is not null and not exists '
-			'(select 1 from unnest(arr) e where e is not null)' INTO want;
+	EXECUTE 'select count(*) from lion_rec where cardinality(arr) = 0' INTO want;
 	ok := (got >= want) AND (NOT exact_ntids OR got = want);
 	detail := format('lion_rec_mc column 4 (arr) empty_tids = %s, heap wants %s%s',
+					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
+
+	EXECUTE 'select nullelem_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
+		INTO got;
+	EXECUTE 'select count(*) from lion_rec where cardinality(arr) > 0 and not exists '
+			'(select 1 from unnest(arr) e where e is not null)' INTO want;
+	ok := (got >= want) AND (NOT exact_ntids OR got = want);
+	detail := format('lion_rec_mc column 4 (arr) nullelem_tids = %s, heap wants %s%s',
 					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
 	RETURN NEXT;
 

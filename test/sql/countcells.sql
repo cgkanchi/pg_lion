@@ -254,6 +254,9 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT (tags && ''{1,2}'') AS x, (tags @> ''{3,9}'') AS y, count(*) FROM lcc GROUP BY 1, 2'),
 	('SELECT (tags && ''{1}'') AS x, (tags IS NULL) AS y, (tags && ''{}'') AS z, count(*)
 		FROM lcc GROUP BY 1, 2, 3'),
+	-- a null test alone of a column only a multi-key index has: a multi-key
+	-- dimension still, whose NULL entry is its rows'
+	('SELECT (tags IS NULL) AS x, (k = 1) AS y, count(*) FROM lcc GROUP BY 1, 2'),
 	('SELECT (tags && ''{0,1,2,3,4,5,6,7}'') AS x, (tags @> ''{8}'') AS y, (tags && ''{12}'') AS z,
 			 count(*) FROM lcc WHERE n < 60 GROUP BY 1, 2, 3'),
 	-- text search

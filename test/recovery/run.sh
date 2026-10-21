@@ -2689,7 +2689,7 @@ psql_p -c "VACUUM (ANALYZE, INDEX_CLEANUP ON) lion_rec" >>"$RUNLOG" 2>&1
 # recovery_evidence() can read it.
 psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
 log "-- index shapes after the load and before any crash"
-psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, leaf_pages, internal_pages, null_tids, empty_tids from lion_rec_indexes(), lion_index_stats(idx::regclass)" |
+psql_p -tA -F'|' -c "select idx, ntids, entries, inline_entries, containers, sparse_segments, container_pages, leaf_pages, internal_pages, null_tids, empty_tids, nullelem_tids from lion_rec_indexes(), lion_index_stats(idx::regclass)" |
 	tee -a "$RUNLOG"
 run_check "baseline" psql_p "select * from lion_rec_check(true, true)"
 log "-- baseline: $NCHECKS checks ok"

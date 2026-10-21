@@ -295,6 +295,9 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT (tags && ''{1,2}'') AS x, (tags @> ''{3,9}'') AS y, count(*) FROM lcc GROUP BY 1, 2'),
 	('SELECT (tags && ''{1}'') AS x, (tags IS NULL) AS y, (tags && ''{}'') AS z, count(*)
 		FROM lcc GROUP BY 1, 2, 3'),
+	-- a null test alone of a column only a multi-key index has: a multi-key
+	-- dimension still, whose NULL entry is its rows'
+	('SELECT (tags IS NULL) AS x, (k = 1) AS y, count(*) FROM lcc GROUP BY 1, 2'),
 	('SELECT (tags && ''{0,1,2,3,4,5,6,7}'') AS x, (tags @> ''{8}'') AS y, (tags && ''{12}'') AS z,
 			 count(*) FROM lcc WHERE n < 60 GROUP BY 1, 2, 3'),
 	-- text search
@@ -335,6 +338,7 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT (tags && '{1,2}') AS x, (tags @> '{3,9}') AS y, count(*) FROM lcc GROUP BY 1, 2                        | 5 cells, 4 rows
  SELECT (tags && '{1}') AS x, (tags IS NULL) AS y, (tags && '{}') AS z, count(*)                              +| 3 cells, 3 rows
                  FROM lcc GROUP BY 1, 2, 3                                                                     | 
+ SELECT (tags IS NULL) AS x, (k = 1) AS y, count(*) FROM lcc GROUP BY 1, 2                                     | 6 cells, 6 rows
  SELECT (tags && '{0,1,2,3,4,5,6,7}') AS x, (tags @> '{8}') AS y, (tags && '{12}') AS z,                      +| 9 cells, 5 rows
                           count(*) FROM lcc WHERE n < 60 GROUP BY 1, 2, 3                                      | 
  SELECT (w @@ 'a1 & b2'::tsquery) AS x, (w @@ 'a3 | (a4 & b1)'::tsquery) AS y, count(*)                       +| 5 cells, 4 rows
@@ -345,7 +349,7 @@ SELECT q, lcc_check(q) FROM (VALUES
                           count(*) FROM lcc GROUP BY 1                                                         | 
  SELECT (CASE WHEN g THEN 1 ELSE 0 END + CASE WHEN f THEN 1 ELSE 0 END                                        +| 18 cells, 2 rows
                            + CASE WHEN z = 1 THEN 1 ELSE 0 END) % 2 AS v, count(*) FROM lcc GROUP BY 1         | 
-(20 rows)
+(21 rows)
 
 -- ---------- 4. the WHERE form ----------
 SELECT q, lcc_check(q) FROM (VALUES

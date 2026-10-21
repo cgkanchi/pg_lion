@@ -223,7 +223,7 @@ SELECT q, cc_q(q) FROM (VALUES
  SELECT count(*) FROM cc WHERE n < 0 OR n <> 3                                                 | count, 1 rows
  SELECT count(*) FROM cc WHERE a IN (1, 2) OR n <> 3                                           | count, 1 rows
  SELECT count(*) FROM cc WHERE NOT (tags @> '{t3}') OR a = 1                                   | count, 1 rows
- SELECT count(*) FROM cc WHERE NOT (tags @> '{t3}') OR tags IS NULL                            | no count, 1 rows
+ SELECT count(*) FROM cc WHERE NOT (tags @> '{t3}') OR tags IS NULL                            | count, 1 rows
  SELECT count(*) FROM cc WHERE tags @> '{t2}' OR NOT (tags && '{t3,t4}')                       | count, 1 rows
  SELECT count(*) FROM cc WHERE b = 1 AND (n <> 3 OR t = 'v4')                                  | count, 1 rows
  SELECT count(*) FROM cc WHERE b = 1 AND (n <> 3 OR t = 'v4') AND (a <> 2 OR n IS NULL)        | count, 1 rows
