@@ -3677,15 +3677,19 @@ lion_count_path_fill(LionCountPathBuild *cx)
  * far is the outer table's, of its WHERE; the query's is that count less the
  * rows some row of the inner side matches, which the node finds by looking
  * the inner side's keys up in a B-tree of the table (lion_anti_choose()) and
- * subtracts from the one row, or from each row's group.  Fills the plan's
- * ANTI member and antiplan, or declines.
+ * subtracts from the one row, from each row's group, or from each row's cell
+ * of a count by cells (DESIGN.md §27, "Counts by cells beside the anti
+ * join"), the predicates evaluated on it.  Fills the plan's ANTI member and
+ * antiplan, or declines.
  *
- * What it is made for is a count of one plain table, ungrouped or grouped by
- * one or two of its columns, each of whose rows it can find the group of:
- * not partitions, the decoded walk, a count(DISTINCT) walked, the aggregates
- * over keys, a top k, filtered counts, a coalesce group or expression columns
- * (whose expressions setrefs.c could take for the join clauses' own), and
- * grouping columns it can hash under their equalities.
+ * What it is made for is a count of one plain table, ungrouped, grouped by
+ * one or two of its columns, each of whose rows it can find the group of, or
+ * by cells: not partitions, the decoded walk of a GROUP BY's columns, a
+ * count(DISTINCT) walked, the aggregates over keys, a top k, filtered counts,
+ * a coalesce group or expression columns (whose expressions setrefs.c could
+ * take for the join clauses' own), and grouping columns it can hash under
+ * their equalities.  The decoded walk a count by cells drives by groups
+ * nothing: its rows are the cells'.
  *
  * Every row a key finds is tested on every join clause and on each of the
  * table's restrictions - and the clauses the count adds to its WHERE (the
@@ -3700,18 +3704,24 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	LionCountPrivAnti *a = &p->anti;
 	List	   *restrictions = NIL;
 	List	   *keyexprs = NIL;
+	List	   *rowexprs = NIL;
 	ListCell   *lc;
+	int			ngroup = cx->cells ? 0 : cx->ngroup;
 	int			g;
 	int			k;
 
 	if (anti == NULL)
 		return true;
-	if (cx->partitioned || cx->decode || cx->distvar != NULL ||
+	if (cx->partitioned || cx->distvar != NULL ||
 		cx->wattnos != NIL || cx->topkn > 0 || cx->nfilter > 0 ||
-		cx->groupcoal != NULL || cx->partialtarget != NULL ||
-		cx->ngroup > 2 || p->vcols != NIL || p->ngroupn > 0)
+		cx->groupcoal != NULL || cx->ngroup > 2 || p->vcols != NIL)
 		return false;
-	for (g = 0; g < cx->ngroup; g++)
+	if (cx->cells ? (cx->cellplan == NULL || p->ncelldim == 0) :
+		(cx->decode || cx->partialtarget != NULL || p->ngroupn > 0))
+		return false;
+	if (cx->cells)
+		rowexprs = cx->cellplan->predexprs;
+	for (g = 0; g < ngroup; g++)
 	{
 		Oid			lhash;
 		Oid			rhash;
@@ -3732,7 +3742,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		contain_volatile_functions((Node *) restrictions))
 		return false;
 
-	if (!lion_anti_choose(cx->root, anti, restrictions, cx->ngroup,
+	if (!lion_anti_choose(cx->root, anti, restrictions, ngroup, rowexprs,
 						  &cx->antiplan))
 		return false;
 
@@ -3750,7 +3760,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	}
 	a->njoin = list_length(anti->clauses);
 	a->nrestrict = list_length(restrictions);
-	for (g = 0; g < cx->ngroup; g++)
+	for (g = 0; g < ngroup; g++)
 	{
 		a->groupeq[g] = cx->groupeqop[g];
 		a->groupcoll[g] = cx->groupcoll[g];
@@ -4548,9 +4558,9 @@ lion_cells_candidate_walker(Node *node, void *context)
  * The GROUP BY's expressions, none of them a bare column - whose groups are
  * the walk's own - on one plain table whose counts core may add up; or no
  * GROUP BY at all, when the WHERE has a clause the cells may test.  The
- * table is the query's only one: not the fact of an FK-side join, nor the
- * table an anti join over a small inner side counts (§27), whose rows the
- * cells would count without the ones the inner side's rows match.
+ * table is the query's only one, or the one an anti join over a small inner
+ * side counts (§27), whose rows found the cells lose
+ * (lion_count_path_anti()): not the fact of an FK-side join.
  */
 static bool
 lion_count_cells_group_by(LionCountPathBuild *cx)
@@ -4558,7 +4568,7 @@ lion_count_cells_group_by(LionCountPathBuild *cx)
 	PlannerInfo *root = cx->root;
 	ListCell   *lc;
 
-	if (cx->fj != NULL || cx->anti != NULL || cx->partitioned ||
+	if (cx->fj != NULL || cx->partitioned ||
 		cx->distinctstage || cx->extra == NULL ||
 		(cx->extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
 		RecoveryInProgress())
@@ -4684,12 +4694,16 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
  * tally of their own whose cells go up at the end.  WORKERS as for a
  * parallel scan of the heap, whose rows the count replaces reading; COST a
  * participant's share of the serial count and what each of its ranges pays
- * again (perrange), plus a cpu_tuple_cost a partial row.
+ * again (perrange), plus a cpu_tuple_cost a partial row.  Beside the anti
+ * join over a small inner side (§27) every participant runs `child` and
+ * looks its keys up, taking away the rows of the ranges it counts: `once`,
+ * their price, is each participant's whole, before its first row.
  */
 static void
 lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 							 Cost serialrun, Cost perrange,
-							 const AggClauseCosts *costs)
+							 const AggClauseCosts *costs, Path *child,
+							 Cost once)
 {
 	PlannerInfo *root = cx->root;
 	RelOptInfo *rel = cx->input_rel;
@@ -4727,14 +4741,14 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 	cpath->path.pathkeys = NIL;
 	cpath->path.rows = rows;
 	cpath->path.startup_cost = serialrun / divisor +
-		((double) nranges / divisor) * perrange;
+		((double) nranges / divisor) * perrange + once;
 	cpath->path.total_cost = cpath->path.startup_cost +
 		rows * cpu_tuple_cost;
 #if PG_VERSION_NUM >= 180000
-	cpath->path.disabled_nodes = 0;
+	cpath->path.disabled_nodes = (child != NULL) ? child->disabled_nodes : 0;
 #endif
 	cpath->flags = serial->flags;
-	cpath->custom_paths = NIL;
+	cpath->custom_paths = (child != NULL) ? list_make1(child) : NIL;
 #if PG_VERSION_NUM >= 170000
 	cpath->custom_restrictinfo = NIL;
 #endif
@@ -4760,7 +4774,9 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
  * one by the GROUP BY's expressions, or a plain one - and its parallel form
  * where the query may run in parallel.  The price is the node's own in the
  * units of the cheapest core path (DESIGN.md §39), the qual over the
- * predicates evaluated once a cell.
+ * predicates evaluated once a cell; beside the anti join over a small inner
+ * side (§27) its lookups, converted as the count is, and its child, core's
+ * plan in core's units, both before the first row.
  */
 static void
 lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
@@ -4772,6 +4788,8 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionUnits	units;
 	Cost		perrange = 0;
 	Cost		serialrun;
+	Cost		antilookups = 0.0;
+	Path	   *antichild = NULL;
 
 	lion_units_for(root, output_rel, &units);
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
@@ -4794,6 +4812,17 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
 	perrange = lion_units_price(&units, perrange);
 	serialrun = cpath->path.total_cost;
+	if (cx->anti != NULL)
+	{
+		Path	   *child = cx->anti->innerpath;
+
+		antilookups = lion_units_price(&units, cx->antiplan.cost);
+		cpath->path.startup_cost += antilookups + child->total_cost;
+		cpath->path.total_cost += antilookups + child->total_cost;
+#if PG_VERSION_NUM >= 180000
+		cpath->path.disabled_nodes = child->disabled_nodes;
+#endif
+	}
 
 	/* answered from the indexes alone: core's index-only switches apply */
 	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
@@ -4804,16 +4833,24 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	/*
 	 * ... in parallel first, add_path() may free the serial path: a WHERE
 	 * collected range by range, with a positive clause outside ORs and no
-	 * range taken as a source, or none at all.
+	 * range taken as a source, or none at all; and the anti join's child a
+	 * path a worker may run, its clauses ones it may evaluate.
 	 */
+	if (cx->anti != NULL &&
+		is_parallel_safe(root, (Node *) cx->priv.anti.exprs))
+		antichild = lion_anti_parallel_child(cx->anti->innerrel);
 	if (((cx->plainpositive && !cx->hasrangesrc) || cx->wherekinds == NIL) &&
 		rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
 		is_parallel_safe(root, (Node *) cx->cellplan->predexprs) &&
 		is_parallel_safe(root, (Node *) cx->cellquals) &&
-		is_parallel_safe(root, (Node *) cpath->path.pathtarget->exprs))
+		is_parallel_safe(root, (Node *) cpath->path.pathtarget->exprs) &&
+		(cx->anti == NULL || antichild != NULL))
 		lion_add_parallel_cells_path(cx, cpath, serialrun, perrange,
-									 &agg_final_costs);
+									 &agg_final_costs, antichild,
+									 (antichild != NULL) ?
+									 antilookups + antichild->total_cost :
+									 0.0);
 
 	add_path(output_rel, (Path *)
 			 create_agg_path(root, output_rel, &cpath->path,
@@ -4929,6 +4966,10 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 	foreach(lc, cp->predexprs)
 		cx.priv.exec_funcs = lion_expr_functions((Node *) lfirst(lc),
 												 cx.priv.exec_funcs);
+
+	/* ... and an anti join's rows found, each taken from its cell (§27) */
+	if (!lion_count_path_anti(&cx))
+		return;
 	cpath = lion_count_path_make(&cx);
 	lion_count_cells_add(&cx, cpath);
 }

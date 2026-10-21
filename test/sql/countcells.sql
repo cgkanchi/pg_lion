@@ -7,10 +7,11 @@
 -- truth (true, false or NULL) of every predicate, and computes the
 -- expressions once a cell from the cell's truths; core's Finalize Agg adds
 -- the cells of a group up.  A WHERE clause over such an expression is tested
--- once a cell the same way.  Every query below is checked against a
--- sequential scan with the pushdown off; lcc_check() says whether the cells
--- ran, how many cells the plan bounds them by, and whether rows went to the
--- heap.
+-- once a cell the same way, and the rows an anti join over a small inner
+-- side takes away come off their cells.  Every query below is checked
+-- against a sequential scan with the pushdown off; lcc_check() says whether
+-- the cells ran, how many cells the plan bounds them by, and whether rows
+-- went to the heap.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -447,9 +448,139 @@ RESET min_parallel_index_scan_size;
 RESET pg_lion.parallel_range_keys;
 SET max_parallel_workers_per_gather = 0;
 
+-- ---------- 9. beside an anti join over a small inner side ----------
+-- NOT EXISTS of a few rows of another table: the node looks their keys up
+-- in a B-tree and takes each row found from its cell, the predicates
+-- evaluated on it (DESIGN.md §27, "Counts by cells beside the anti join").
+-- By id, a row a key, and by n, 400 rows a key of every cell; keys of
+-- deleted rows and of none, NULL keys and duplicates.  Joins are disabled,
+-- so that core has no plan the node must beat on price.
+CREATE INDEX lcc_id ON lcc (id);
+CREATE INDEX lcc_nb ON lcc (n);
+CREATE TABLE lcc_skip (a int, b int);
+INSERT INTO lcc_skip
+SELECT i * 523, CASE WHEN i % 4 = 0 THEN 0 ELSE i * 523 END FROM generate_series(1, 30) i;
+INSERT INTO lcc_skip VALUES
+	(7, 7), (7, 7), (11, 11), (97, 97), (194, 194), (40001, 40001), (NULL, 3), (5, NULL), (-2, -2);
+VACUUM (ANALYZE) lcc, lcc_skip;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier') AS p("QUERY PLAN");
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.n < 50 AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT score, count(*) FROM lcc_scored t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY score'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier'),
+	('SELECT count(*) FROM lcc_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n)'),
+	('SELECT count(*), count(t.n) FROM lcc_tiered t WHERE t.n < 50 AND t.tier IN (''low'', ''none'') AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id)'),
+	-- multi-key columns: arrays NULL, empty and with a NULL element, and
+	-- text searches, by the rows of keys of n, each in every cell
+	('SELECT (tags && ''{1,2}'') AS x, (tags @> ''{3,9}'') AS y, (tags IS NULL) AS z, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3'),
+	('SELECT (w @@ ''a1 & b2''::tsquery) AS x, (k IS NULL) AS y, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2'),
+	('SELECT (f IS UNKNOWN) AS x, NOT g AS y, (s IN (''s2'', ''s3'')) AS z, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3'),
+	-- the correlation by two of the inner side's columns, each equal to the key
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n AND s.b = t.n) GROUP BY tier'),
+	-- keys of no row: nothing taken away
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.a < 0) GROUP BY tier')
+) v(q);
+-- Many outcomes to a dimension, of which a row taken away has the one its
+-- truths are of, found in a table of the dimension's outcomes by their
+-- truths, made once a run (lion_cells_code_of()).  Ten leaves of tags - the
+-- most a column has, some of two keys - are 1,025 outcomes, NULL's among
+-- them; by n every row of four values of n is taken away, of every mask of
+-- tags, NULL arrays and arrays with a NULL element too; by id some thirty
+-- rows.  The WHERE form over the ten, and a rescan for each outer row,
+-- which makes the table again.
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10'),
+	('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.id) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10'),
+	('SELECT count(*) FROM lcc c WHERE CASE WHEN tags && ''{0}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{1,9}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{2}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{3,10}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{4}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{5,11}'' THEN 1 ELSE 0 END + CASE WHEN tags @> ''{6}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{7,12}'' THEN 1 ELSE 0 END + CASE WHEN tags && ''{8}'' THEN 1 ELSE 0 END + CASE WHEN tags @> ''{0,8}'' THEN 1 ELSE 0 END >= 2 AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n)'),
+	('SELECT x, t.* FROM (VALUES (30), (60), (30), (100)) v(x), LATERAL (SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE c.n < x AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10) t')
+) v(q);
+/*
+ * ... and the bits of a scalar column, ten IN lists of the values from 1 to
+ * 1,023 with each bit set: 1,023 constants, each an outcome of its own,
+ * beside another value's and, for k, NULL's.
+ */
+CREATE FUNCTION lcc_bits(c text) RETURNS text
+LANGUAGE sql AS $$
+SELECT string_agg(format('(%s IN (%s)) AS %s%s', c, l, c, j), ', ' ORDER BY j)
+  FROM (SELECT j, string_agg(v::text, ', ' ORDER BY v) AS l
+		  FROM generate_series(0, 9) j, generate_series(1, 1023) v
+		 WHERE v & (1 << j) <> 0 GROUP BY j) b
+$$;
+-- k's by n: rows taken from each of k's sixteen cells, NULL's too; n's by
+-- n, whose cells of those four values come to nothing, and by id, rows of
+-- some thirty values; and k's beside the ten leaves of tags, a code of two
+-- such dimensions
+SELECT c, lk, lcc_check(format('SELECT %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.%s) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+							   lcc_bits(c), lk))
+  FROM (VALUES ('k', 'n'), ('n', 'n'), ('n', 'id')) v(c, lk);
+SELECT lcc_check(format('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20',
+						lcc_bits('k')));
+-- the rows changed: before VACUUM, in this very transaction, and after
+UPDATE lcc SET k = 1, tags = '{1}' WHERE id IN (523, 1046, 1569);
+UPDATE lcc SET f = NULL, z = 9 WHERE n = 7 AND id % 3 = 0;
+DELETE FROM lcc WHERE n = 11 AND id % 5 = 0;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier')
+) v(q);
+BEGIN;
+UPDATE lcc SET k = 2, s = NULL WHERE id IN (2092, 2615) OR (n = 7 AND id % 4 = 0);
+DELETE FROM lcc WHERE n = 11 AND id % 7 = 0;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier')
+) v(q);
+ROLLBACK;
+VACUUM lcc;
+SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier');
+-- in parallel: every participant looks the keys up, and takes away the rows
+-- of the ranges it counts
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier'),
+	('SELECT (tags && ''{1,2}'') AS x, (tags IS NULL) AS y, count(*) FROM lcc c WHERE c.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier')
+) v(q);
+-- ... and many outcomes to a dimension: each participant makes the table of
+-- them for the rows it takes away
+SELECT lcc_check('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (tags && ''{2}'') AS t2, (tags && ''{3,10}'') AS t3, (tags && ''{4}'') AS t4, (tags && ''{5,11}'') AS t5, (tags @> ''{6}'') AS t6, (tags && ''{7,12}'') AS t7, (tags && ''{8}'') AS t8, (tags @> ''{0,8}'') AS t9, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10');
+SELECT c, lcc_check(format('SELECT %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+						   lcc_bits(c)))
+  FROM (VALUES ('k'), ('n')) v(c);
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+SET max_parallel_workers_per_gather = 0;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP TABLE lcc_skip;
+
 DROP VIEW lcc_tiered;
 DROP VIEW lcc_scored;
 DROP TABLE lcc;
+DROP FUNCTION lcc_bits(text);
 DROP FUNCTION lcc_check(text);
 DROP FUNCTION lcc_check_exec(text, text);
 DROP FUNCTION lcc_plan(text);
