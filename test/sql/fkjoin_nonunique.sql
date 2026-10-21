@@ -364,7 +364,8 @@ SELECT lion_nj('SELECT sum(f.x) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_
 -- a second correlation
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = f.x)');
 -- the fact rows WITHOUT a qualifying dimension row: an anti join the other
--- way round, which the node does not count
+-- way round, which no count per key gives, and the anti join over a small
+-- inner side needs a B-tree on f.fk for (countanti.sql)
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE f.x = 3 AND NOT EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk AND d.attr = 1)');
 -- a fact filter the posting sets cannot answer
 SELECT lion_nj('SELECT count(*) FROM lion_nf f WHERE f.id < 100 AND EXISTS (SELECT 1 FROM lion_nd d WHERE d.k = f.fk)');

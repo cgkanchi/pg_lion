@@ -1798,6 +1798,25 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	if (st->heap != NULL)
 		st->statrows += count;
 
+	/*
+	 * The anti join over a small inner side (DESIGN.md §27): the count less
+	 * the rows of the group some inner row matches - and a group left with
+	 * none is no group, as one with none to start with is not.
+	 */
+	if (st->anti != NULL)
+	{
+		MemoryContext oldcxt =
+			MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+		bool		none = lion_anti_adjust(st, nkeys, keys, keyisnull, &count);
+
+		MemoryContextSwitchTo(oldcxt);
+		if (none)
+		{
+			st->filtered = true;
+			return NULL;
+		}
+	}
+
 	ExecClearTuple(slot);
 	for (i = 0; i < st->ntlist; i++)
 	{
@@ -1920,11 +1939,13 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					slot->tts_isnull[i] = a->resnull;
 					break;
 				}
-				if (LION_TL_IS_WKEY(kind) || LION_TL_IS_RESID(kind))
+				if (LION_TL_IS_WKEY(kind) || LION_TL_IS_RESID(kind) ||
+					LION_TL_IS_ANTI(kind))
 				{
 					/*
 					 * ... and the key its argument read, or a column a
-					 * residual clause read (§10), which nothing prints
+					 * residual clause read (§10) or the anti join's clauses
+					 * (§27), which nothing prints
 					 */
 					slot->tts_values[i] = (Datum) 0;
 					slot->tts_isnull[i] = true;

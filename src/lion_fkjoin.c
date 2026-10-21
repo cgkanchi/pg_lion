@@ -63,6 +63,15 @@
  *		plain semi or anti join, the fact alone its inner side, one fk
  *		equality its only clause, whatever the outer side is.
  *
+ *		And the anti join the other way round: `SELECT count(*) FROM t WHERE
+ *		... AND NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)`, whose rows
+ *		are the counted table's - its count less the rows some row of a small
+ *		inner side matches, looked up through a B-tree of t (DESIGN.md §27,
+ *		"The anti join over a small inner side").  What this file decides of
+ *		it is the shape: one table, one NOT EXISTS of everything else, and
+ *		the clauses between them, at least one a key
+ *		(lion_fkjoin_recognize_small_anti()).
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -72,6 +81,7 @@
 #include "catalog/pg_class.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pathnodes.h"
+#include "optimizer/clauses.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/paths.h"
@@ -1127,5 +1137,217 @@ lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
 	fj->joinrel = joinrel;
 	fj->uniqsortop = InvalidOid;
 	fj->joinpath = true;
+	return true;
+}
+
+/*
+ * Is `node` an expression of the inner side alone - Vars of `inner` and
+ * nothing of `outerrelid` - with no volatile function and no subquery, which
+ * the node may evaluate once per row of its child?
+ */
+static bool
+lion_anti_inner_expr(PlannerInfo *root, Node *node, Relids inner,
+					 int outerrelid)
+{
+	Relids		varnos = pull_varnos(root, node);
+
+	return !bms_is_empty(varnos) && bms_is_subset(varnos, inner) &&
+		!bms_is_member(outerrelid, varnos) &&
+		!contain_volatile_functions(node) && !contain_subplans(node);
+}
+
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"): joinrel is the whole FROM of a query over one table `t`
+ * with a NOT EXISTS correlated with it, and nothing else -
+ *
+ *	- the special join is the anti join core makes of a NOT EXISTS
+ *	  (lion_fkjoin_sublink_anti(): never one of `LEFT JOIN ... IS NULL`, nor
+ *	  of a NOT IN, which core leaves a subplan), its outer side t alone,
+ *	  minimal and syntactic, and its syntactic inner side every other table
+ *	  of the join; every other special join is inside that inner side - an
+ *	  EXISTS, a NOT EXISTS or an outer join of the subquery's own, which the
+ *	  child plans;
+ *	- t is a plain table or a materialized view (lion_fkjoin_rel_ok(), and
+ *	  not a partitioned table) and the inner side's tables have no LATERAL
+ *	  reference and no TABLESAMPLE (lion_fkjoin_member_ok());
+ *	- the inner side is a rel the join search built, not proved empty, whose
+ *	  cheapest path is unparameterized: the child, run once;
+ *	- every clause the anti join evaluates - an equivalence class's for the
+ *	  pair (none, for an outer join's clauses, which stay in t's joininfo), and
+ *	  t's joininfo clauses within the join, a clause of the subquery on t alone
+ *	  among them - reads plain columns of t and columns the inner side's rows
+ *	  carry, has no volatile function, subquery or pseudoconstant, and at
+ *	  least one of them is a key: a strict operator between a column of t and
+ *	  an expression of the inner side alone (LionAntiKey).
+ *
+ * A row of t is then a row of the join when no row of the inner side makes
+ * every clause true, and the count is t's count less the rows some inner row
+ * does: which rows those are is the caller's to find, by the keys.  A
+ * PlaceHolderVar, a pseudoconstant qual or a LATERAL reference anywhere
+ * declines, as for the FK-side join.
+ */
+bool
+lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
+								 LionSmallAnti *out)
+{
+	SpecialJoinInfo *anti = NULL;
+	RelOptInfo *outer;
+	RelOptInfo *inner;
+	Relids		tables;
+	Relids		innertables = NULL;
+	List	   *rinfos;
+	List	   *clauses = NIL;
+	List	   *keys = NIL;
+	int			outerrelid = -1;
+	int			innerrelid;
+	int			i;
+	ListCell   *lc;
+
+	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel))
+		return false;
+	if (root->placeholder_list != NIL)
+		return false;
+	if (root->hasPseudoConstantQuals || root->hasLateralRTEs)
+		return false;
+
+	/* ---- the anti join: t alone outside, every other table inside ---- */
+	tables = bms_difference(joinrel->relids, root->outer_join_rels);
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		lt;
+		Relids		rt;
+		int			x;
+
+		if (!lion_fkjoin_sublink_anti(root, sjinfo))
+			continue;
+		lt = bms_difference(sjinfo->syn_lefthand, root->outer_join_rels);
+		rt = bms_difference(sjinfo->syn_righthand, root->outer_join_rels);
+		if (!bms_get_singleton_member(lt, &x) ||
+			!bms_equal(bms_union(lt, rt), tables))
+			continue;
+		anti = sjinfo;
+		outerrelid = x;
+		innertables = rt;
+		break;
+	}
+	if (anti == NULL || bms_is_empty(innertables) ||
+		!bms_equal(anti->min_lefthand, anti->syn_lefthand))
+		return false;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (sjinfo == anti)
+			continue;
+		if (!bms_is_subset(sjinfo->syn_lefthand, anti->syn_righthand) ||
+			!bms_is_subset(sjinfo->syn_righthand, anti->syn_righthand))
+			return false;
+	}
+
+	/* ---- the table counted, and the inner side's tables ---- */
+	outer = root->simple_rel_array[outerrelid];
+	if (!lion_fkjoin_rel_ok(root, outer) || lion_fkjoin_is_parent(root, outer))
+		return false;
+	i = -1;
+	while ((i = bms_next_member(innertables, i)) >= 0)
+	{
+		if (!lion_fkjoin_member_ok(root, i))
+			return false;
+	}
+
+	/* ---- the inner side: the child ---- */
+	if (bms_get_singleton_member(innertables, &innerrelid) &&
+		bms_equal(anti->syn_righthand, innertables))
+		inner = root->simple_rel_array[innerrelid];
+	else
+		inner = find_join_rel(root, anti->syn_righthand);
+	if (inner == NULL || IS_DUMMY_REL(inner))
+		return false;
+	if (!bms_is_empty(inner->lateral_relids))
+		return false;
+	if (inner->cheapest_total_path == NULL ||
+		inner->cheapest_total_path->param_info != NULL)
+		return false;
+
+	/* ---- every clause of the anti join ---- */
+	rinfos = generate_join_implied_equalities(root, joinrel->relids,
+											  outer->relids, inner, NULL);
+	foreach(lc, outer->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+		if (bms_is_subset(ri->required_relids, joinrel->relids))
+			rinfos = list_append_unique_ptr(rinfos, ri);
+	}
+	foreach(lc, rinfos)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+		Node	   *clause;
+		List	   *vars;
+		ListCell   *lv;
+
+		if (!IsA(ri, RestrictInfo) || ri->pseudoconstant)
+			return false;
+		clause = (Node *) ri->clause;
+		if (contain_volatile_functions(clause) || contain_subplans(clause) ||
+			contain_agg_clause(clause) || contain_window_function(clause) ||
+			expression_returns_set(clause))
+			return false;
+
+		/* plain columns of t, and columns of the inner side's rows */
+		vars = pull_var_clause(clause, 0);
+		foreach(lv, vars)
+		{
+			Var		   *v = (Var *) lfirst(lv);
+
+			if (!IsA(v, Var) || v->varlevelsup != 0 || v->varattno <= 0)
+				return false;
+			if (v->varno == outerrelid)
+				continue;
+			if (!bms_is_member(v->varno, innertables) ||
+				!lion_fkjoin_target_has(inner->reltarget, v))
+				return false;
+		}
+		clauses = lappend(clauses, clause);
+
+		/* ... and the keys among them */
+		if (IsA(clause, OpExpr) &&
+			list_length(((OpExpr *) clause)->args) == 2 &&
+			op_strict(((OpExpr *) clause)->opno))
+		{
+			OpExpr	   *op = (OpExpr *) clause;
+
+			for (i = 0; i < 2; i++)
+			{
+				Node	   *side = lion_fkjoin_strip((Node *) list_nth(op->args, i));
+				Node	   *other = (Node *) list_nth(op->args, 1 - i);
+				LionAntiKey *key;
+
+				if (side == NULL || !IsA(side, Var) ||
+					((Var *) side)->varno != outerrelid ||
+					!lion_anti_inner_expr(root, other, innertables,
+										  outerrelid))
+					continue;
+				key = (LionAntiKey *) palloc0(sizeof(LionAntiKey));
+				key->clause = op;
+				key->outervar = (Var *) side;
+				key->innerexpr = other;
+				key->outerleft = (i == 0);
+				keys = lappend(keys, key);
+				break;
+			}
+		}
+	}
+	if (keys == NIL)
+		return false;
+
+	out->joinrel = joinrel;
+	out->outerrel = outer;
+	out->innerrel = inner;
+	out->innerpath = inner->cheapest_total_path;
+	out->clauses = clauses;
+	out->keys = keys;
 	return true;
 }
