@@ -572,6 +572,8 @@ lion_count_groups_decode(Relation heap, Snapshot snapshot, int ncol,
 	base.filter = (cache != NULL) ? cache->filter : NULL;
 	if (base.filter != NULL && base.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
+	/* a copy decided from the positions as it was made decides nothing here */
+	base.posdone = (mat != NULL && mat->posfiltered);
 	base.batchmax = lion_recheck_budget_for(LION_DECODE_RECHECK_ENTRY);
 
 	memset(&rc, 0, sizeof(rc));
@@ -1094,6 +1096,8 @@ lion_count_cells(Relation heap, Snapshot snapshot,
 	base.filter = (cache != NULL) ? cache->filter : NULL;
 	if (base.filter != NULL && base.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
+	/* a copy decided from the positions as it was made decides nothing here */
+	base.posdone = (mat != NULL && mat->posfiltered);
 	base.batchmax = lion_recheck_budget_for(LION_DECODE_RECHECK_ENTRY);
 
 	memset(&rc, 0, sizeof(rc));

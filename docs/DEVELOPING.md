@@ -66,13 +66,14 @@ replay, so turning it on for a primary that never replays proves nothing.
 
 `.local/pg` can be any PostgreSQL 16 or later install.  What the suites need from it:
 
-- **contrib: `citext`, `pageinspect`, `pg_buffercache` and `pg_walinspect`.**  The regression
-  suite creates all four.  Without `pageinspect` the `build`, `corrupt`, `corrupt_items`,
-  `corrupt_records` and `summary` files fail, without `pg_buffercache` the `corrupt`,
-  `corrupt_items`, `pinbudget` and `range` files and the `count_batch_race` and
-  `gettuple_pause` specs fail, without
+- **contrib: `citext`, `pageinspect`, `pg_buffercache`, `pg_freespacemap` and
+  `pg_walinspect`.**  The regression suite creates all five.  Without `pageinspect` the
+  `build`, `corrupt`, `corrupt_items`, `corrupt_records` and `summary` files
+  fail, without `pg_buffercache` the `corrupt`, `corrupt_items`, `pinbudget` and `range` files
+  and the `count_batch_race` and `gettuple_pause` specs fail, without `pg_freespacemap`
+  `dir_delete` fails, without
   `pg_walinspect` `walrecords` fails, and most files use `citext`.  `installcheck` checks for
-  all four before it starts and stops with one message if any is missing.  The PGDG packages
+  all five before it starts and stops with one message if any is missing.  The PGDG packages
   (`postgresql-N`) include contrib; a source build needs `make -C contrib install`.
 - **pgvector** 0.7 or later (for `halfvec`) for `vector.sql`, `vector_filter.sql`,
   `vector_half.sql` and the `lionvec_*` isolation specs, lionvec's files (DESIGN.md §44): the PGDG

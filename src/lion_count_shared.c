@@ -126,6 +126,9 @@ typedef struct LionCopyChunk
 	int			ncontainers;
 	uint64		members;
 	bool		spilled;
+	bool		posfiltered;	/* its containers went through the collecting
+								 * participant's position filters
+								 * (LionCollect.filter) */
 } LionCopyChunk;
 
 struct LionSharedCopy
@@ -285,7 +288,7 @@ lion_shared_copy_reinit(LionSharedCopy *sc, dsa_area *area,
 static void
 lion_copy_chunk(LionSharedCopy *sc, dsa_area *area, Relation heap,
 				Snapshot snapshot, int nsources, LionCountSource *sources,
-				int c, LionCountStats *stats)
+				LionRowFilter *filter, int c, LionCountStats *stats)
 {
 	LionCopyChunk *ch = &sc->chunk[c];
 	MemoryContext cxt;
@@ -309,6 +312,7 @@ lion_copy_chunk(LionSharedCopy *sc, dsa_area *area, Relation heap,
 	col.sp.name = name;
 	col.ranged = true;
 	lion_key_range(sc->nchunks, sc->ckeys, c, &col.lo, &col.hi);
+	col.filter = (filter != NULL && filter->npos > 0) ? filter : NULL;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
@@ -317,6 +321,7 @@ lion_copy_chunk(LionSharedCopy *sc, dsa_area *area, Relation heap,
 	(void) lion_count_sources_run(heap, snapshot, nsources, sources, stats,
 								  NULL, false, false, &col);
 	ch->members = col.members;
+	ch->posfiltered = (col.filter != NULL);
 
 	if (!col.spilled && col.noffs > 0)
 	{
@@ -528,6 +533,19 @@ lion_copy_view(LionSharedCopy *sc, dsa_area *area, Relation index,
 	mat->nchunks = sc->nchunks;
 	mat->chunkfirst = sc->chunkfirst;
 	mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n;
+
+	/*
+	 * Decided from positions as it was collected only when every chunk was:
+	 * each participant gave its chunks its own filters, which are the
+	 * query's, but a count of this view may skip them only if none is left
+	 * undecided (LionCountCtx.posdone).
+	 */
+	mat->posfiltered = (sc->nchunks > 0);
+	for (c = 0; c < sc->nchunks; c++)
+	{
+		if (!sc->chunk[c].posfiltered)
+			mat->posfiltered = false;
+	}
 	if (sc->nspilled > 0)
 	{
 		mat->files = (BufFile **) palloc0(sizeof(BufFile *) * sc->nchunks);
@@ -576,9 +594,9 @@ lion_copy_view(LionSharedCopy *sc, dsa_area *area, Relation index,
 void
 lion_shared_copy_collect(LionSharedCopy *sc, dsa_area *area, Relation heap,
 						 Snapshot snapshot, int nsources,
-						 LionCountSource *sources, LionPostingSet *out,
-						 int *chunks, bool *built, bool *spilled,
-						 LionCountStats *stats)
+						 LionCountSource *sources, LionRowFilter *filter,
+						 LionPostingSet *out, int *chunks, bool *built,
+						 bool *spilled, LionCountStats *stats)
 {
 	Relation	index = NULL;
 	int			phase;
@@ -611,7 +629,7 @@ lion_shared_copy_collect(LionSharedCopy *sc, dsa_area *area, Relation heap,
 			if (c >= (uint32) sc->nchunks)
 				break;
 			lion_copy_chunk(sc, area, heap, snapshot, nsources, sources,
-							(int) c, stats);
+							filter, (int) c, stats);
 			(*chunks)++;
 			CHECK_FOR_INTERRUPTS();
 		}

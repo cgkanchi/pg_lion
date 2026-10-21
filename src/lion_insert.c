@@ -340,8 +340,9 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
 }
 
 /*
- * Rebuild an INLINE payload with (ckey, lo) added, writing it to out, which
- * must have room for paylen + LION_CONTAINER_MAX_SIZE bytes (a container grows
+ * Rebuild the INLINE payload of entry eoff on block blk with (ckey, lo)
+ * added, writing it to out, which must have room for paylen +
+ * LION_CONTAINER_MAX_SIZE bytes (a container grows
  * by at most that much; a segment that takes the pair grows by at most two
  * varints, splitting one into three items adds two headers and a container,
  * and a new segment adds at most LION_SPARSE_SINGLETON_MAX bytes).
@@ -351,8 +352,9 @@ lion_put_singleton(char *dst, uint32 ckey, uint16 lo)
  * number of items, which is -0 .. +2.
  */
 static Size
-lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
-			   char *out, int *ndelta)
+lion_inline_add(Relation index, BlockNumber blk, OffsetNumber eoff,
+				const char *payload, Size paylen, uint32 ckey, uint16 lo,
+				char *out, int *ndelta)
 {
 	LionContainer *cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	LionSegWork	w;
@@ -374,7 +376,8 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	 * the item that covers the ckey or on the first item beyond it.
 	 */
 	off = 0;
-	while (lion_inline_fetch(payload, paylen, &off, cbuf) > 0)
+	while (lion_inline_fetch(index, blk, eoff, payload, paylen, &off,
+							 cbuf) > 0)
 	{
 		if (lion_item_covers(cbuf, ckey))
 		{
@@ -409,7 +412,8 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 	/* Pass 2: copy the payload, replacing or inserting where pass 1 said. */
 	off = 0;
 	n = 0;
-	while ((csize = lion_inline_fetch(payload, paylen, &off, cbuf)) > 0)
+	while ((csize = lion_inline_fetch(index, blk, eoff, payload, paylen,
+									  &off, cbuf)) > 0)
 	{
 		if (n == insertpos)
 		{
@@ -697,7 +701,8 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	memcpy(oldpay, LionEntryGetPayload(entry), paylen);
 
 	newpay = (char *) palloc(paylen + LION_CONTAINER_MAX_SIZE);
-	newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+	newlen = lion_inline_add(index, BufferGetBlockNumber(entrybuf), entryoff,
+							 oldpay, paylen, ckey, lo, newpay, &ndelta);
 
 	if (newlen == 0)
 	{
@@ -1383,7 +1388,8 @@ lion_summary_rekey_insert(Relation index, Relation heaprel, LionState *state,
 		uint64		added = 1;
 
 		memcpy(oldpay, (char *) e + payoff, paylen);
-		newlen = lion_inline_add(oldpay, paylen, ckey, lo, newpay, &ndelta);
+		newlen = lion_inline_add(index, BufferGetBlockNumber(buf), off,
+								 oldpay, paylen, ckey, lo, newpay, &ndelta);
 		if (newlen == 0)
 		{
 			/* The row is in already; only the key is raised. */

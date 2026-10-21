@@ -2162,10 +2162,15 @@ lion_ecursor_close(LionExprCursor *c)
 	{
 		int64		nchecked;
 		int64		nremoved;
+		int64		nseeks;
+		int64		ndecoded;
 
 		lion_posfilter_counts(c->pf, &nchecked, &nremoved);
+		lion_posfilter_work(c->pf, &nseeks, &ndecoded);
 		c->cx->stats.pos_checked += nchecked;
 		c->cx->stats.pos_removed += nremoved;
+		c->cx->stats.pos_seeks += nseeks;
+		c->cx->stats.pos_decoded += ndecoded;
 		lion_posfilter_end(c->pf);
 		c->pf = NULL;
 	}

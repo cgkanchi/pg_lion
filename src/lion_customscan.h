@@ -1074,13 +1074,44 @@ typedef struct LionVColScope
 #define LION_RECHECK_TID_COST	(lion_recheck_tid_cost * cpu_tuple_cost)
 #define LION_RECHECK_GROUP_TID_COST	(lion_recheck_group_tid_cost * cpu_tuple_cost)
 
+/*
+ * A candidate decided from stored positions (lion_posfilter.c, DESIGN.md §17
+ * "Stored positions"): each lexeme's cursor sought to it, a member decoded
+ * at a time (LION_POS_MEMBER_COST), and TS_execute() over what they found, a
+ * callback per lexeme and the candidate's memory reset after it
+ * (LION_POS_CHECK_COST a lexeme).  Fitted on the release build (DESIGN.md
+ * §10, "The units") to 400,000 rows of three or four lexemes, two of them in
+ * three rows of four, one position each, every page all-visible: a count of
+ * `foo <-> bar` decides its 300,000 candidates in 17.6 to 18.4 ms beyond
+ * what `foo & bar` takes, 600,000 members decoded; the FK-side joins that
+ * probe the filters - 200 counts deciding 30,000 candidates, decoding 1,105
+ * members a seek, and 400 counts deciding 112,500 at 300 a seek - take 8.2
+ * to 9.4 ns a member decoded.  At the reference's 5 ns a cpu_operator_cost
+ * (§10, "The reference") that is 1.8 of them, and the 21.6 ns a candidate
+ * spends a lexeme beyond its decoding is 4.3.
+ *
+ * A seek decodes a chunk's members from the first, or from where the cursor
+ * stood, up to the candidate's (lion_poscursor_seek()), skipping the chunks
+ * before it by their headers: a cursor that walks every member once - the
+ * candidates of one count, or a collection's, close together - decodes each
+ * member once, and one whose candidates lie further apart than a chunk
+ * decodes part of one at each, LION_POS_SEEK_MEMBERS on average: four
+ * fifths of a chunk of 1,339 members of one position, which a chunk of
+ * members of more positions holds fewer of.
+ */
+#define LION_POS_MEMBER_COST	(lion_position_member_cost * cpu_operator_cost)
+#define LION_POS_CHECK_COST		(lion_position_check_cost * cpu_operator_cost)
+#define LION_POS_SEEK_MEMBERS	1000.0
+
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
 #define LION_RANGED_WALK	1	/* a GROUP BY or count(DISTINCT) walk */
 #define LION_RANGED_SUM		2	/* the sum over the range's entries */
-#define LION_RANGED_SUMALL	3	/* the sum over every entry, `k IS NOT NULL`
-								 * alone (§14): priced as a range over all of
-								 * k when k has summaries (§32) */
+#define LION_RANGED_SUMALL	3	/* the sum over every entry - `k IS NOT
+								 * NULL` alone (§14), or every row (§35) -
+								 * priced as a range over all of k with
+								 * nothing outside it when k has summaries
+								 * (§32) */
 
 /*
  * A sum over a walk's entries counts them a LEAF at a time (DESIGN.md §28,
@@ -1523,8 +1554,11 @@ typedef struct LionClauseState
 	 * evaluates is extracted as a superset (lion_locate_multikey(), DESIGN.md
 	 * §17, "A query known only at run time"), and LOSSY and ALL then need
 	 * every candidate rechecked in the heap - ALL with no posting set at all.
+	 * posfilter says the current relation's row filter decides a LOSSY one
+	 * from stored positions instead (lion_build_filter()).
 	 */
 	LionQueryMode qmode;
+	bool		posfilter;
 
 	/*
 	 * LION_CLAUSE_MULTI: the query as this scan answers it, val with each
@@ -2514,7 +2548,9 @@ typedef struct LionCountPriv
 	AttrNumber	groupn_attno[LION_MAX_GROUPCOLS];
 	Oid			groupn_idx[LION_MAX_GROUPCOLS];
 
-	AttrNumber	allattno;		/* ALLROWS (§35), or 0 */
+	AttrNumber	allattno;		/* ALLROWS: the column a sum over all of a
+								 * column's entries drives by when no range
+								 * bounds it (§14, §35), or 0 */
 
 	int64		topkn;			/* TOPK (§36), or 0 */
 	int			topkcand;
@@ -3410,6 +3446,11 @@ typedef struct LionClauseInfo
 								 * for a filter's clause */
 	int			filter;			/* 0, or the filtered count it is a clause of
 								 * (DESIGN.md §10, "Filtered counts") */
+	Node	   *clause;			/* the clause itself, or an exact rewrite of
+								 * it (LionLeafInfo.costexact) - never the
+								 * cost model's estimate of it: what a
+								 * partition's bounds may prove TRUE or
+								 * refute (lion_leaf_drops()) */
 } LionClauseInfo;
 
 /*
@@ -3420,7 +3461,7 @@ typedef struct LionClauseInfo
  * something other than the WHERE clauses drives the count, so that a
  * partition left with no clause that selects rows still has its rows counted.
  * The OR restrictions (§19) are there as the plan has them - `ors` over the
- * clause lists, and each leaf's own clause in `leafclauses` - so that a
+ * clause lists, each leaf's own clause in its LionClauseInfo - so that a
  * partition can leave out the arms its bounds refute ("OR arms the partition
  * bounds refute").
  */
@@ -3432,7 +3473,6 @@ typedef struct LionImply
 	List	   *skipped;		/* String: the clauses no posting set answers
 								 * that every partition implies, which are no
 								 * clauses of the plan (LION_PRIV_IMPLIED) */
-	List	   *leafclauses;	/* Expr, one per clause of the plan */
 	List	   *ors;			/* the plan's LION_PRIV_ORS */
 } LionImply;
 
@@ -3500,6 +3540,10 @@ typedef struct LionLeafInfo
 								 * or NULL for the query's own: `col = true`
 								 * for a bare boolean column, an IN list with
 								 * its array estimated */
+	bool		costexact;		/* ... and is the clause itself, rewritten
+								 * (`col = true`) - not one over an estimate
+								 * a cached plan's later runs need not see -
+								 * so that a proof may be made from it */
 	Oid			opno;			/* 0 for a null test */
 	Oid			cmptype;		/* the type the column is compared with */
 	StrategyNumber strategy;	/* multi-key clauses only */
@@ -3547,6 +3591,7 @@ extern void lion_append_clause(const LionLeafInfo *leaf, Node *clause,
 							   List **clauseinfos, List **whereclauses,
 							   List **whereconsts, List **wherekinds,
 							   List **whereopnos, List **whereinor);
+extern void lion_ors_check(List *ors, List *clauseinfos);
 extern bool *lion_or_leaf_map(List *ors, int nclause);
 extern int *lion_or_group_map(List *ors, int nclause);
 extern int *lion_rangesrc_leaders(List *whereidx, List *wherecol,
@@ -3832,6 +3877,10 @@ extern Cost lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel,
 							  List *whereidx, List *wherecol,
 							  List *whereclauses, List *wherekinds, List *ors,
 							  double matched, double counts, double ceiling);
+extern Cost lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel,
+								List *whereidx, List *wherecol,
+								List *whereclauses, List *wherekinds,
+								List *ors, double cand, double counts);
 extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *rel,
 								 List *residual);
 extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,

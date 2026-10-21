@@ -13,18 +13,24 @@
 
 #include "lion_count_int.h"
 
+#include "catalog/pg_operator_d.h"
 #include "pgstat.h"
 #if PG_VERSION_NUM >= 170000
 #include "storage/read_stream.h"
 #endif
+#include "utils/tuplesort.h"
 
 static bool lion_exists_settled(LionCountCtx *cx);
+static void lion_recheck_spill(LionCountCtx *cx);
 static bool lion_sources_collect_keys(Relation heap, Snapshot snapshot,
 									  int nsources, LionCountSource *sources,
-									  Size maxbytes, bool spill, bool ranged,
+									  Size maxbytes, bool spill,
+									  LionRowFilter *filter, bool ranged,
 									  uint32 lo, uint64 hi,
 									  LionPostingSet *out, bool *spilled,
 									  LionCountStats *stats);
+static bool lion_sources_posfiltered(int nsources,
+									 const LionCountSource *sources);
 
 /* ---------------------------------------------------------------------
  * Counting one container
@@ -110,14 +116,34 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 	 * hundreds of queues of a grouped walk (lion_count_groups_copy()) each
 	 * took past their share (2026-10 review).  A list out of order has no
 	 * blocks to wait for, and is flushed when it is full.
+	 *
+	 * Neither holds for a count taken in passes (LionCountCtx.passes): every
+	 * pass begins at the first key again, so a block flushed now is a block
+	 * of the next pass too, and is read again then - once per flush, which
+	 * at 64 kB of work_mem would read every dirty page of the table about
+	 * three times over for an IN list of ten values.  Such a list is
+	 * spilled instead when it is full, and the passes go on into the
+	 * sort; the flush at the end of the count reads it back in order.
 	 */
-	if (cx->ntids > 0 &&
-		(cx->tids_sorted ?
+	if (cx->spill == NULL && cx->ntids > 0 &&
+		(cx->passes ? cx->ntids >= cx->batchmax :
+		 cx->tids_sorted ?
 		 (cx->ntids + LION_RECHECK_BLOCK_TIDS > cx->batchmax &&
 		  ItemPointerGetBlockNumber(&cx->tids[cx->ntids - 1]) !=
 		  ItemPointerGetBlockNumber(&tid)) :
 		 cx->ntids >= cx->batchmax))
-		lion_recheck_flush(cx);
+	{
+		if (cx->passes)
+			lion_recheck_spill(cx);
+		else
+			lion_recheck_flush(cx);
+	}
+	if (cx->spill != NULL)
+	{
+		tuplesort_putdatum(cx->spill, Int64GetDatum((int64) code), false);
+		cx->stats.tids_spilled++;
+		return;
+	}
 
 	if (cx->ntids >= cx->maxtids)
 	{
@@ -243,16 +269,32 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 		return;
 	}
 
+	/*
+	 * The buffer doubles, up to what the copy may hold and no further: the
+	 * test above keeps used + sz within maxbytes, and a doubling past it
+	 * took up to twice the budget.  The budget is a hash join's memory
+	 * (work_mem times hash_mem_multiplier), which at a work_mem of a few
+	 * hundred megabytes is more than a plain allocation may be: the buffer
+	 * and the offsets are huge allocations, as a spill's entries are
+	 * (lion_spill_add()): the doubling of a copy past 512 MB is a gigabyte,
+	 * one byte more than MaxAllocSize.
+	 */
 	oldcxt = MemoryContextSwitchTo(col->cxt);
-	while (col->used + sz > col->cap)
+	if (col->used + sz > col->cap)
 	{
-		col->cap *= 2;
-		col->buf = (char *) repalloc(col->buf, col->cap);
+		Size		cap = col->cap;
+
+		while (col->used + sz > cap)
+			cap *= 2;
+		cap = Max(Min(cap, col->maxbytes), col->used + sz);
+		col->buf = (char *) repalloc_huge(col->buf, cap);
+		col->cap = cap;
 	}
 	if (col->noffs >= col->offcap)
 	{
 		col->offcap *= 2;
-		col->offs = (Size *) repalloc(col->offs, sizeof(Size) * col->offcap);
+		col->offs = (Size *) repalloc_huge(col->offs,
+										   sizeof(Size) * col->offcap);
 	}
 	MemoryContextSwitchTo(oldcxt);
 
@@ -288,9 +330,20 @@ lion_count_container_vm(LionCountCtx *cx, const LionContainer *c)
 	uint64		members;		/* blocks of this container that have members */
 	uint64		allvis;			/* blocks marked all-visible in the VM */
 
-	/* A collection copies the container and asks nothing (DESIGN.md §27). */
+	/*
+	 * A collection copies the container and asks nothing (DESIGN.md §27) -
+	 * of what it holds, only the rows the position filters it was given keep
+	 * (LionCollect.filter): they are read at the collection, once for the
+	 * whole copy, rather than by each count against it.
+	 */
 	if (cx->collect != NULL)
 	{
+		if (cx->filter != NULL && cx->filter->npos > 0 && !cx->posdone)
+		{
+			c = lion_count_posfilter(cx, c);
+			if (lion_container_cardinality(c) == 0)
+				return;
+		}
 		lion_collect_container(cx->collect, c);
 		return;
 	}
@@ -354,7 +407,7 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
 	 * pinned, as everything else about it is (the design note's R1 and R2).
 	 * The map's answer for the blocks that are left stands.
 	 */
-	if (cx->filter != NULL && cx->filter->npos > 0)
+	if (cx->filter != NULL && cx->filter->npos > 0 && !cx->posdone)
 	{
 		c = lion_count_posfilter(cx, c);
 		if (lion_container_cardinality(c) == 0)
@@ -434,20 +487,31 @@ lion_count_container_masks(LionCountCtx *cx, const LionContainer *c,
  * used again.  The walks that intersect a copy of the WHERE with many groups'
  * sets at once (lion_count_groups.c, lion_count_decode.c) filter the copy's
  * container here, once a key, and count the groups with
- * lion_row_filter_nopos().
+ * lion_row_filter_nopos().  c itself when they have been through it already
+ * (LionCountCtx.posdone): the copy's containers, filtered as it was made.
  */
 const LionContainer *
 lion_count_posfilter(LionCountCtx *cx, const LionContainer *c)
 {
 	int			i;
 
+	if (cx->posdone)
+		return c;
 	for (i = 0; cx->filter != NULL && i < cx->filter->npos; i++)
 	{
 		uint32		before = lion_container_cardinality(c);
+		int64		seeks0;
+		int64		decoded0;
+		int64		seeks;
+		int64		decoded;
 
+		lion_posfilter_work(cx->filter->pos[i], &seeks0, &decoded0);
 		c = lion_posfilter_apply(cx->filter->pos[i], c);
+		lion_posfilter_work(cx->filter->pos[i], &seeks, &decoded);
 		cx->stats.pos_checked += before;
 		cx->stats.pos_removed += before - lion_container_cardinality(c);
+		cx->stats.pos_seeks += seeks - seeks0;
+		cx->stats.pos_decoded += decoded - decoded0;
 	}
 	return c;
 }
@@ -1172,13 +1236,82 @@ lion_recheck_visible(LionCountCtx *cx, bool *vis)
 }
 
 /*
+ * The list of a count taken in passes is full (LionCountCtx.passes): hand
+ * what it holds to a sort of the codes, which takes every TID after them too
+ * (lion_recheck_add()), and let the list go.  The sort is given work_mem, as
+ * a Sort node is, and past it writes sorted runs to temporary files, which it
+ * merges as it is read back.  It lives in the count's context, beside the
+ * list: the passes run in contexts of their own, reset between them.
+ *
+ * Nothing about the §9 argument moves: the visibility map was asked about
+ * every block these TIDs are on before they were queued, under the pins of
+ * the pages their containers came from, and a recheck needs no index pin at
+ * all (lion_recheck_add()) - so neither does one that waits in a sort until
+ * the passes are over.  It is the very recheck an unbounded list would have
+ * made at the end of the count, with the list on disk.
+ */
+static void
+lion_recheck_spill(LionCountCtx *cx)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(cx->cxt);
+	int			i;
+
+	Assert(cx->passes && cx->spill == NULL && cx->visout == NULL);
+	cx->spill = tuplesort_begin_datum(INT8OID, Int8LessOperator, InvalidOid,
+									  false, work_mem, NULL, TUPLESORT_NONE);
+	for (i = 0; i < cx->ntids; i++)
+		tuplesort_putdatum(cx->spill,
+						   Int64GetDatum((int64) lion_tid_to_code(&cx->tids[i])),
+						   false);
+	cx->stats.tids_spilled += cx->ntids;
+
+	/* the list's share of the memory is the sort's now */
+	pfree(cx->tids);
+	cx->tids = NULL;
+	cx->ntids = 0;
+	cx->maxtids = 0;
+	cx->tids_sorted = true;
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * Recheck the batch accumulated so far and empty the list.  Called from
  * lion_recheck_add() whenever the budget is reached (the safety argument is
  * there) and once more when the merge is over.
+ *
+ * A count taken in passes whose list was spilled (lion_recheck_spill()) only
+ * gets here when the passes are over, and reads the sort back now: in
+ * (block, offset) order, so the list it refills is flushed at heap block
+ * boundaries, as one merge's list is, and every block it names is read once.
+ * The list takes the least a batch takes, LION_RECHECK_MIN_BATCH, beside the
+ * sort's work_mem: in order, the size of a batch decides nothing about which
+ * blocks are read, only how often the recheck is called.
  */
 void
 lion_recheck_flush(LionCountCtx *cx)
 {
+	if (cx->spill != NULL)
+	{
+		Tuplesortstate *sort = cx->spill;
+		Datum		val;
+		bool		isnull;
+		int64		n = 0;
+
+		cx->spill = NULL;
+		cx->passes = false;
+		cx->batchmax = Min(cx->batchmax, LION_RECHECK_MIN_BATCH);
+		tuplesort_performsort(sort);
+		while (tuplesort_getdatum(sort, true, false, &val, &isnull, NULL))
+		{
+			Assert(!isnull);
+			lion_recheck_add(cx, (uint64) DatumGetInt64(val));
+			if ((++n & 0xFFFF) == 0)
+				CHECK_FOR_INTERRUPTS();
+		}
+		tuplesort_end(sort);
+		Assert(cx->tids_sorted);
+	}
+
 	if (cx->ntids == 0)
 		return;
 
@@ -1933,6 +2066,15 @@ lion_run_batches(LionCountCtx *cx, int nsources, LionCountSource *sources,
 	memcpy(pass, sources, sizeof(LionCountSource) * nsources);
 
 	/*
+	 * Each batch's merge yields every container key from the first again, so
+	 * a list of more than one batch is a count taken in passes, whose recheck
+	 * queue spills rather than flushes while there is a batch to come
+	 * (LionCountCtx.passes).  Not an existence test's, which rechecks after
+	 * every container until it is settled (§26).
+	 */
+	cx->passes = (!cx->exists && lion_batch_end(list, 0, budget) < list->nsets);
+
+	/*
 	 * Everything one pass builds - the batch's tree and plan, and every
 	 * cursor of the merge - lives here and is gone before the next pass.
 	 */
@@ -2066,15 +2208,36 @@ lion_exists_sources_cached(Relation heap, Snapshot snapshot, int nsources,
  * the sources, a union of all its sets built again for each of them.
  *
  * It returns false as well where no source has a found set to copy from.
+ *
+ * With a row filter - the one the counts against the copy are made under -
+ * its POSITION FILTERS (LionRowFilter.pos, DESIGN.md §17 "Stored positions")
+ * decide every container before it is copied, and the copy holds only the
+ * rows their queries match (LionMatSet.posfiltered).  A count against it
+ * then decides nothing from positions (LionCountCtx.posdone), rather than
+ * put the candidates of its own key through the filters again: the cursors
+ * begun again at the first member at every count, and a seek to each
+ * candidate decoding its chunk from the start, which for a dimension row of a
+ * few rows in every part of the heap is most of a chunk's members read for
+ * each of them.  Here the cursors walk the members once, forward, as the
+ * copy's keys ascend.  Reading the positions without the
+ * pins the containers came under is "Why reading positions at any moment of
+ * a scan is safe" (DESIGN.md §17): a row the snapshot sees keeps its TID,
+ * and its positions are its own, so it is decided as a count would decide
+ * it; a TID whose positions belong to a row no longer there, or to a row
+ * that took its place after the snapshot, is a row the snapshot does not
+ * see, which the copy may drop or keep - kept, it is the stale member of
+ * the argument above, which the counts' interlock and recheck take care of.
+ * The filter's clauses that only the heap can decide are left to the counts.
  */
 
 bool
 lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 					 LionCountSource *sources, Size maxbytes, bool spill,
-					 LionPostingSet *out, bool *spilled, LionCountStats *stats)
+					 LionRowFilter *filter, LionPostingSet *out,
+					 bool *spilled, LionCountStats *stats)
 {
 	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
-									 maxbytes, spill, false, 0, 0,
+									 maxbytes, spill, filter, false, 0, 0,
 									 out, spilled, stats);
 }
 
@@ -2090,21 +2253,23 @@ lion_sources_collect(Relation heap, Snapshot snapshot, int nsources,
 bool
 lion_sources_collect_range(Relation heap, Snapshot snapshot, int nsources,
 						   LionCountSource *sources, Size maxbytes, bool spill,
-						   uint32 lo, uint64 hi, LionPostingSet *out,
-						   bool *spilled, LionCountStats *stats)
+						   LionRowFilter *filter, uint32 lo, uint64 hi,
+						   LionPostingSet *out, bool *spilled,
+						   LionCountStats *stats)
 {
 	return lion_sources_collect_keys(heap, snapshot, nsources, sources,
-									 maxbytes, spill, true, lo, hi,
+									 maxbytes, spill, filter, true, lo, hi,
 									 out, spilled, stats);
 }
 
 static bool
 lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 						  LionCountSource *sources, Size maxbytes, bool spill,
-						  bool ranged, uint32 lo, uint64 hi,
-						  LionPostingSet *out, bool *spilled,
+						  LionRowFilter *filter, bool ranged, uint32 lo,
+						  uint64 hi, LionPostingSet *out, bool *spilled,
 						  LionCountStats *stats)
 {
+	bool		posfiltered = (filter != NULL && filter->npos > 0);
 	LionCollect col;
 	LionMatSet *mat;
 	Relation	index = NULL;
@@ -2141,11 +2306,14 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	col.ranged = ranged;
 	col.lo = lo;
 	col.hi = hi;
+	col.filter = posfiltered ? filter : NULL;
 	col.cap = 8192;
 	col.buf = (char *) palloc(col.cap);
 	col.offcap = 256;
 	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
 
+	if (filter != NULL && filter->heap != heap)
+		elog(ERROR, "lion index count: a row filter for another relation");
 	(void) lion_count_sources_run(heap, snapshot, nsources, sources, stats,
 								  NULL, false, false, &col);
 
@@ -2181,6 +2349,7 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 		/* ... and seek it by its keys, directly where they are dense */
 		lion_mat_index(mat, CurrentMemoryContext, 0);
 		mat->collected = true;
+		mat->posfiltered = posfiltered;
 		out->found = true;
 		out->mat = mat;
 		out->ntids = col.members;
@@ -2202,7 +2371,8 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 		sizeof(LionContainer *) * Max(col.noffs, 1);
 	mat->buf = col.buf;
 	mat->containers = (LionContainer **)
-		palloc(sizeof(LionContainer *) * Max(col.noffs, 1));
+		palloc_extended(sizeof(LionContainer *) * Max(col.noffs, 1),
+						MCXT_ALLOC_HUGE);
 	for (i = 0; i < col.noffs; i++)
 		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
 	pfree(col.offs);
@@ -2215,6 +2385,7 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	lion_mat_index(mat, CurrentMemoryContext,
 				   maxbytes > mat->held ? maxbytes - mat->held : 0);
 	mat->collected = true;
+	mat->posfiltered = posfiltered;
 
 	out->found = true;
 	out->mat = mat;
@@ -2224,6 +2395,29 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	return true;
 }
 
+
+/*
+ * Is one of the positive sources a copy whose containers went through the
+ * position filters as it was made (LionMatSet.posfiltered)?  A source of that
+ * one set alone: every candidate of the intersection is a member of it.
+ */
+static bool
+lion_sources_posfiltered(int nsources, const LionCountSource *sources)
+{
+	int			i;
+
+	for (i = 0; i < nsources; i++)
+	{
+		const LionPostingSet *ps;
+
+		if (sources[i].negated || sources[i].nsets != 1)
+			continue;
+		ps = &sources[i].sets[0];
+		if (ps->found && ps->mat != NULL && ps->mat->posfiltered)
+			return true;
+	}
+	return false;
+}
 
 int64
 lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
@@ -2641,12 +2835,20 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	/*
 	 * ... and the row filter the node asks of every count of this execution
 	 * (DESIGN.md §17, "A query known only at run time").  A collection has no
-	 * cache and is not filtered: it copies the superset, and the counts of
-	 * that copy are.
+	 * cache, and only the position filters of the counts it is made for
+	 * (LionCollect.filter): what they decide is decided once for the copy,
+	 * and a count of a source that is such a copy decides nothing from the
+	 * positions again (posdone).  The clauses only the heap can test are the
+	 * counts' to test.
 	 */
-	cx.filter = (cache != NULL) ? cache->filter : NULL;
+	if (collect != NULL)
+		cx.filter = collect->filter;
+	else
+		cx.filter = (cache != NULL) ? cache->filter : NULL;
 	if (cx.filter != NULL && cx.filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
+	cx.posdone = (cx.filter != NULL && cx.filter->npos > 0 &&
+				  lion_sources_posfiltered(nsources, sources));
 
 	if (summed)
 	{
@@ -2654,9 +2856,21 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		 * One pass per entry, each with the source reduced to that one set.
 		 * The passes share the recheck queue, the visibility-map pin and the
 		 * visibility cache, so a dirty heap page is still visited once for the
-		 * whole list and the batching of DESIGN.md §9 still bounds the memory.
+		 * whole list: the queue is not flushed while there is a pass to come,
+		 * but spilled once it is full (LionCountCtx.passes), and the memory
+		 * stays work_mem's.  An existence test is not taken in passes: it
+		 * rechecks container by container until it is settled (§26), and a
+		 * block of a later entry's may be read again then.
 		 */
 		MemoryContext setcxt;
+		int			nfound = 0;
+
+		for (j = 0; j < sources[0].nsets; j++)
+		{
+			if (sources[0].sets[j].found)
+				nfound++;
+		}
+		cx.passes = (nfound > 1 && !exists);
 
 		/*
 		 * One pass allocates a cursor, a staging buffer for the inline
@@ -2757,6 +2971,7 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->blocks_skipped_via_vm += src->blocks_skipped_via_vm;
 	dst->tids_rechecked += src->tids_rechecked;
 	dst->blocks_rechecked += src->blocks_rechecked;
+	dst->tids_spilled += src->tids_spilled;
 	dst->containers_visited += src->containers_visited;
 	dst->probes_avoided += src->probes_avoided;
 	dst->unions_built += src->unions_built;
@@ -2769,6 +2984,8 @@ lion_count_stats_add(LionCountStats *dst, const LionCountStats *src)
 	dst->rows_removed += src->rows_removed;
 	dst->pos_checked += src->pos_checked;
 	dst->pos_removed += src->pos_removed;
+	dst->pos_seeks += src->pos_seeks;
+	dst->pos_decoded += src->pos_decoded;
 	dst->key_containers += src->key_containers;
 	dst->copy_containers += src->copy_containers;
 	dst->copy_seeks += src->copy_seeks;

@@ -49,10 +49,11 @@ the control files and the library are there, and says so if the tree's
 
 Phases 1b-1e, 1g and 3 need the `injection_points` extension. On a server without
 it they are skipped - the log and the summary say which - and phases 1, 1f,
-2, 4 and 5 still run, phase 5 without its one case that parks an insert;
-`--phases "1 1f 2 4 5"` asks for exactly those (CI does, on the packaged 16-19
-servers). Phase 5 needs pgvector and `pageinspect`, and is skipped, with a
-line in the summary, without them. `INJECTION_POINTS=1` in the environment turns every
+1h, 2, 4 and 5 still run, phase 5 without its one case that parks an insert;
+`--phases "1 1f 1h 2 4 5"` asks for exactly those (CI does, on the packaged
+16-19 servers). Phase 5 needs pgvector and `pageinspect`, and is skipped, with a
+line in the summary, without them; phase 1h needs `pageinspect` and
+`pg_freespacemap`, and is skipped the same way. `INJECTION_POINTS=1` in the environment turns every
 such skip into a failure, so a server that should have injection points and
 does not cannot end in "ALL RECOVERY AND HOT-STANDBY CHECKS PASSED" having run
 none of those phases; CI's source-build jobs set it. `PGVECTOR=1` does the
@@ -161,11 +162,11 @@ finish a half-applied two-pass bulkdelete. After every restart:
   because a reserved entry that lost its flag would hide inside the `ntids`
   total.
 
-**Phases 1b-1g, a crash or a restart at a chosen point.** Each builds a
+**Phases 1b-1h, a crash or a restart at a chosen point.** Each builds a
 table of its own. 1b parks a VACUUM between the two steps of a whole-chain
 free (injection point `lion-vacuum-entries-deleted`), 1c and 1d an insert
 between a directory or posting-tree split and its downlink, and each crashes
-the server there and checks what comes back. Three more (DESIGN.md §18, §22,
+the server there and checks what comes back. Four more (DESIGN.md §18, §22,
 §25):
 
 * **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
@@ -192,6 +193,16 @@ the server there and checks what comes back. Three more (DESIGN.md §18, §22,
   back promoted with nothing flagged, verify() clean and both keys exact,
   the next inserts must split the full leaf as a tree's, and a second crash
   replays all of it.
+* **1h**, the free space map after a crash (DESIGN.md §18, "The free space
+  map holds only pages that may be handed out"). The map is not WAL-logged:
+  with data checksums each of its pages reaches the WAL as one image of its
+  first change after a checkpoint. A VACUUM records the pages a delete
+  freed, a checkpoint follows, inserts take those pages, and the server
+  dies, so recovery brings back map entries for pages in use again - the
+  phase fails if it brings back none, since nothing would be tested. The
+  next inserts are offered them, must refuse each without recording it
+  again, and leave the map with no entry on a page in use; verify() is
+  clean and the rows exact.
 
 1b and 1e also read the page counts `VACUUM (VERBOSE)` reports for the index
 (DESIGN.md §18, "Page counts"), which no SQL function can see: the pages

@@ -28,11 +28,15 @@ setup
 	CREATE INDEX sk_c ON sk USING lion (c) WITH (inline_limit = 64);
 	CREATE INDEX sk_k ON sk USING lion (k);
 	CREATE INDEX sk_id ON sk (id);
-	CREATE TABLE skd (pk int PRIMARY KEY);
+	CREATE TABLE skd (pk int PRIMARY KEY) WITH (autovacuum_enabled = off);
 	INSERT INTO skd SELECT g FROM generate_series(0, 249) g;
 }
 setup { VACUUM ANALYZE sk; }
-setup { VACUUM ANALYZE skd; }
+# Never VACUUMed, so its visibility map stays empty and the semijoin's outer
+# side plans as a bitmap scan whatever snapshots other backends hold: a
+# VACUUM marks its pages all-visible only when none is older than the insert,
+# and the plan would turn to an index-only scan when it can.
+setup { ANALYZE skd; }
 teardown
 {
 	DROP TABLE sk, skd;

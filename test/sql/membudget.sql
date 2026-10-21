@@ -221,7 +221,10 @@ SELECT name, m.held <= m.charged AS covered, m.charged < 2 * m.held AS close,
 -- ORed: two filters of the NOTs do not fit 1MB together, and are read as a
 -- windowed union, one filter open at a time; they fit 128MB.  (An OR of the
 -- long phrases is windowed at 128MB too where their sets' pins outgrow what
--- the lists leave of the pin budget.)
+-- the lists leave of the pin budget.)  The pushdown and the bitmap scan both
+-- price the long phrases' position filters at what deciding a candidate
+-- takes, a thousand lexemes of it, and the GROUP BY of two of them is a near
+-- tie: the pushdown's run has bitmap scans off.
 CREATE TEMP TABLE lmb_shapes AS
 SELECT format('SELECT count(*) FROM lmb_p WHERE d @@ %L::tsquery', q) AS s
   FROM lmb_q
@@ -249,11 +252,13 @@ DECLARE
 	c text;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
 	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || s LOOP
 		pushed := pushed OR ln LIKE '%Custom Scan (LionCount)%';
 	END LOOP;
 	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO a;
+	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE 'SELECT string_agg(x::text, '','' ORDER BY x::text) FROM (' || s || ') x' INTO b;
 	PERFORM set_config('enable_seqscan', 'on', true);

@@ -566,7 +566,7 @@ SET work_mem = '64kB';
 SELECT lgw_check('SELECT g, count(*) FROM lgw_b WHERE a = 1 AND b = 2 GROUP BY g');
                            lgw_check                           
 ---------------------------------------------------------------
- pushed down, collected 1, spilled 0, batches 20, several rows
+ pushed down, collected 1, spilled 0, batches 21, several rows
 (1 row)
 
 RESET work_mem;
