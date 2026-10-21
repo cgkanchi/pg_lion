@@ -339,9 +339,10 @@ SET client_min_messages = warning;
 -- tree: the root's second child, flags 0x0004 -> 0x0084.  Every reader of the
 -- set refuses such a page and ends the set there, so the counts and the scans
 -- lose every row from that leaf on - the SQL count of key 0 finds the first
--- leaf's rows of 450000 - while verify(), even with heapallindexed, said the
--- index was sound (2026-10-20 review).  The flags and the page id are the two
--- uint16s at 26 and 28 of the special area.
+-- leaf's rows of 450000 - and verify() must report it, with heapallindexed
+-- too, whose lookup goes through the tree code that does not look at the
+-- flag.  The flags and the page id are the two uint16s at 26 and 28 of the
+-- special area.
 CREATE INDEX lion_vfy_bad_kind ON lion_vfy_badp USING lion (k);
 SELECT lion_vfy_u32('lion_vfy_bad_kind', :root,
 					lion_vfy_item('lion_vfy_bad_kind', :root, 2) + 4) AS leaf \gset
@@ -357,7 +358,8 @@ SET client_min_messages = warning;
 
 -- (8) a flag no page of its kind carries: a bit no writer sets on a
 -- directory leaf, and ROOT - which only a directory page ever has - on a
--- posting leaf.  verify() used to check only that a page has one kind.
+-- posting leaf.  verify() must report each, though each page still has one
+-- kind.
 CREATE INDEX lion_vfy_bad_flag ON lion_vfy_bad USING lion (k);
 SELECT lion_vfy_poke('lion_vfy_bad_flag', 1, :special + 26,
 					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_flag', 1,
@@ -375,9 +377,8 @@ SET client_min_messages = warning;
 
 -- (9) a position tree with an internal level (DESIGN.md §17): 600 rows of 255
 -- positions each, twenty leaves of about two heap blocks each under a root.
--- verify() read the first downlink of each level and nothing else of an
--- internal page, so it passed a downlink to the wrong leaf (the third goes
--- to the fourth leaf), a separator below what the leaf to its left holds (a
+-- verify() must report a downlink to the wrong leaf (the third goes to the
+-- fourth leaf), a separator below what the leaf to its left holds (a
 -- reader of that block lands on the leaf to the right, and misses the left
 -- one's last chunk), and a leaf whose min - which a tree without an internal
 -- level is routed by - is not its first chunk's header.  The root is the one

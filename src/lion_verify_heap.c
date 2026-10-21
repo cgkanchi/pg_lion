@@ -126,9 +126,9 @@ lion_verify_recheck_downlink(LionVerifyState *vs, const LionVerifyCand *cand)
  * has not reached yet may move right in a split, but only onto a page the
  * walk still comes to, so it is seen.
  *
- * Only the posting root used to be looked for, and a key inserted during the
- * walk whose position tree took a leaf from the free space map was reported
- * as "block N is not reachable from the meta page" (2026-10-20 review).
+ * A key inserted during the walk has both roots out of the end of the
+ * relation, and its position tree can take leaves from the free space map:
+ * those leaves are settled only if its position root is found here.
  */
 static void
 lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
@@ -315,18 +315,17 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
  * right of the one it splits, so a page right of the one let go is still
  * right of it.
  *
- * A search for ckey itself used to have to land on blk, and in a position
- * tree it often does not (2026-10-20 review).  Its keys are heap blocks, and
- * one block's members can fill more than one leaf (lion_postree.c): a leaf's
- * first key is then its left neighbour's last, where the reader's walk right
- * along the leaves stops, and leaves can share a separator, where the
- * descent goes to the last of them.  A leaf an insert split off an existing
- * key's position tree while the check walked was reported as "block N is not
- * reachable from the meta page".  A posting set's container keys do not
- * repeat, but its separators can (a split whose halves are both empty by the
- * time it is repaired gives the right one the left one's, DESIGN.md §22),
- * and the walk costs it nothing: blk is the page the search lands on, or the
- * one after it.
+ * A search for ckey itself does not land on blk in a position tree whenever
+ * ckey repeats.  Its keys are heap blocks, and one block's members can fill
+ * more than one leaf (lion_postree.c): a leaf's first key is then its left
+ * neighbour's last, where a walk right along the leaves while their last key
+ * is below ckey stops - one leaf left of blk - and leaves can share a
+ * separator, where the descent goes to the last of them, right of blk.  Such
+ * a leaf is what an insert splits off an existing key's position tree.  A
+ * posting set's container keys do not repeat, but its separators can (a
+ * split whose halves are both empty by the time it is repaired gives the
+ * right one the left one's, DESIGN.md §22), and the walk costs it nothing:
+ * blk is the page the search lands on, or the one after it.
  */
 static bool
 lion_verify_on_level(LionVerifyState *vs, BlockNumber root, BlockNumber blk,

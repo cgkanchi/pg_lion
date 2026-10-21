@@ -7,19 +7,18 @@
 # makes behind the walk is a live page nothing reached, which the recheck
 # settles once the writers are done (verify_concurrent.spec has the rest of
 # that story) by finding its root and searching the tree for the page's
-# first key.  Two things in that went wrong for position trees, and verify()
-# reported a sound index as "block N is not reachable from the meta page"
-# (2026-10-20 review):
+# first key.  Two kinds of such page are particular to position trees, and
+# for each the check must come back clean rather than report "block N is not
+# reachable from the meta page":
 #
 #  * new_key: a key that did not exist when the walk passed.  The root of its
 #    position tree, like that of its posting set, is nothing the walk reached
-#    and has to be found through the entry that names it - which was looked
-#    for as a posting root only.
+#    and has to be found through the entry that names it, as a position root.
 #  * grown_key: an existing key's position tree, with no internal level,
 #    grows by leaves out of the free space map.  A position leaf starts at the
 #    heap block its left neighbour ends with when one block's rows straddle
-#    the two, and the search for the new leaf's first key stopped at that
-#    neighbour.
+#    the two, so a search for the new leaf's first key that walks right while
+#    a leaf's last key is below it stops at that neighbour, one leaf left.
 #
 # The table: three keys of 4,000 rows each, with three position leaves apiece,
 # and a fourth of 20,000 rows whose two trees are freed by a DELETE and
