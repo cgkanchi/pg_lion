@@ -91,6 +91,7 @@ typedef struct LionPosCursor
 								 * seek's code */
 	bool		countsonly;		/* m gets its code and npos, no positions */
 	LionPosMember m;
+	int64		ndecoded;		/* members decoded, rewinds and all */
 } LionPosCursor;
 
 /* A position tree cursor's pointers to the items of its leaf, as many as fit. */
@@ -148,6 +149,7 @@ struct LionPosFilter
 								 * the callback allocate; a child of hold */
 	int64		nchecked;
 	int64		nremoved;
+	int64		nseeks;			/* a candidate's member sought under a lexeme */
 };
 
 /* ---------------------------------------------------------------------
@@ -290,12 +292,30 @@ lion_poscursor_seek(Relation index, LionPosCursor *cur, uint64 code)
 
 	for (;;)
 	{
+		/*
+		 * The rest of the chunk the cursor reads is skipped undecoded, as the
+		 * chunks after it are below, when the next chunk's header is below
+		 * block: by (P2) none of its members reaches past that header.  A
+		 * cursor that stands where the last candidate was would otherwise
+		 * decode on to the end of the chunk before it skipped a single one -
+		 * half a chunk for every candidate, where the candidates are a few
+		 * rows of every part of the heap, as a count per key of a join or
+		 * per group takes them.
+		 */
+		if (cur->itvalid && cur->chunkno + 1 < cur->nchunks &&
+			cur->chunks[cur->chunkno + 1]->ckey < block)
+		{
+			cur->itvalid = false;
+			cur->chunkno++;
+		}
+
 		if (cur->itvalid)
 		{
 			while (cur->countsonly ?
 				   lion_poschunk_iter_next_npos(&cur->it, &cur->m) :
 				   lion_poschunk_iter_next(&cur->it, &cur->m))
 			{
+				cur->ndecoded++;
 				if (cur->m.code >= code)
 				{
 					cur->mvalid = true;
@@ -445,6 +465,7 @@ lion_posfilter_check(void *arg, QueryOperand *val, ExecPhraseData *data)
 
 	Assert(data == NULL || data->npos == 0);
 
+	pf->nseeks++;
 	if (!lion_poscursor_seek(pf->index, cur, pf->code))
 		return TS_NO;
 	m = &cur->m;
@@ -765,6 +786,23 @@ lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
 {
 	*nchecked = pf->nchecked;
 	*nremoved = pf->nremoved;
+}
+
+/*
+ * The work it took, which a join's probing counts are charged
+ * (lion_join_count_key()): the members sought, a candidate's under a lexeme
+ * each, and the members decoded getting to them.
+ */
+void
+lion_posfilter_work(const LionPosFilter *pf, int64 *nseeks, int64 *ndecoded)
+{
+	int64		n = 0;
+	int			k;
+
+	for (k = 0; k < pf->ncursors; k++)
+		n += pf->cursors[k].ndecoded;
+	*nseeks = pf->nseeks;
+	*ndecoded = n;
 }
 
 void

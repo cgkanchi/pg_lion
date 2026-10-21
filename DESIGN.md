@@ -2592,7 +2592,9 @@ collection split by ranges of container keys, and do now: "A GROUP BY in paralle
 ungrouped count is still serial.
 
 **Cost.** A grouped count whose WHERE the executor will collect (`lion_cost_where_collected()`, the
-rule of `lion_where_describe()` from the planner's sources) is priced as the collection - the WHERE
+rule of `lion_where_describe()` from the planner's sources: two or more, or one of several sets -
+a union, or a multi-key query of several keys, which the merge prices as one set) is priced as the
+collection - the WHERE
 sources' merge as an ungrouped count's (`lion_merge_cpu_cost()`), and a container of the copy
 written at each key it keeps (`LION_FKJOIN_COPY_CONTAINER_COST`, the same copy the FK-side join
 makes) - plus, per group, its containers at the keys the copy has, each `LION_CONTAINER_COST`,
@@ -6198,8 +6200,10 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 - **Queries** (`lion_posfilter.c`).  The posting sets give the candidates, as
   `lion_extract_query_superset()` already did for a recheck, and PostgreSQL's own `TS_execute()`
   decides each one from the stored positions: a cursor per lexeme the query names (those under a
-  NOT too) walks the key's members in TID order, skipping chunks by their headers, and the
-  callback is `checkclass_str()`'s over the candidate's member, stripped members included.  No
+  NOT too) walks the key's members in TID order, skipping chunks by their headers - the rest of
+  the chunk it stands in too, once the next chunk's header is below the candidate's block (P2) -
+  and the callback is `checkclass_str()`'s over the candidate's member, stripped members
+  included.  No
   member under a lexeme is a row without it (P ⊇ C).  So phrases at any distance, weights,
   `a & !b`, `a <-> !b` and ORs of them come out exactly what the heap's `@@` gives.  A query with
   a prefix lexeme is first expanded into the OR of its keys (see "Prefix lexemes" below).
@@ -6209,11 +6213,34 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   - The **count pushdown** puts every container through the filter before it asks the
     visibility map, while the container's pages are still pinned (R1, R2), so an all-visible
     page is counted without the heap.  EXPLAIN shows `Position Checks` and `Rows Removed by
-    Positions`.  This is for a clause ANDed with the rest of the WHERE, where the heap row filter
-    used to apply, and so for GROUP BY, count(DISTINCT) and the FK-side join too: the walks that
-    intersect a copy of the WHERE with many sets at once filter the copy's container once a key.
-    The cost model charges such a clause an operator call per key and candidate instead of the
-    heap recheck (`lion_cost_recheck()`).
+    Positions`.  This is for a clause ANDed with the rest of the WHERE, which the heap's row
+    filter would otherwise decide, and so for GROUP BY, count(DISTINCT) and the FK-side join too.
+  - **A copy is decided as it is made.**  A copy of the WHERE (§10, "The WHERE sets, collected
+    once") or of an FK-side join's fact filters (§27) is put through the filters as its
+    containers are copied (`lion_sources_collect()`, `LionCollect.filter`), a parallel plan's
+    shared copy chunk by chunk: every row of the superset the other sources leave is decided
+    once, and the copy holds only the rows the query selects.  The counts against it decide
+    nothing again (`LionMatSet.posfiltered`, `LionCountCtx.posdone`) - a join's thousands of keys,
+    a GROUP BY's groups.  A count that reads the filters' sets themselves - one that probes them,
+    or the WHERE of a walk that collects none - decides its own candidates, and its cursors start
+    again at their lexemes' first members.  Deciding positions at a moment of the scan's own
+    choosing is safe for the reason below ("Why reading positions at any moment of a scan is
+    safe"): a row the snapshot sees keeps its TID and its positions, and a TID that changes hands
+    in between is a row the snapshot does not see, which a copy may keep or drop as a stale copy
+    may (§27, "Why a stale copy is safe").
+  - **The price** (`lion_cost_posfilter()`).  A cursor decodes its chunk's members up to the
+    candidate's, so a count whose candidates lie close together - a copy's, a count of every
+    row - decodes each member of its lexemes once, and one whose candidates lie further apart than
+    a chunk holds decodes part of one at each: 1,105 members a seek, measured, of a chunk of
+    1,339 of one position (`LION_POS_SEEK_MEMBERS`, 1,000).  Each member decoded is
+    `pg_lion.position_member_cost` (2 `cpu_operator_cost`), and each candidate
+    `pg_lion.position_check_cost` (3) a lexeme beyond that, `TS_execute()` and its callbacks:
+    14 ns and 21 ns on an assert build whose position-free counts run at 330 to 375 units a
+    millisecond.  A lexeme's members are the share of the rows that makes the clause's
+    selectivity their product.  The copy is priced once for its candidates, and every other
+    count for its own, its lexemes decoded up to them - which an FK-side join's probing counts,
+    their candidates a few of every part of the heap, pay at almost every one.  The heap recheck
+    (`lion_cost_recheck()`) charges such a clause nothing.
   - **Under an OR** no recheck sees a leaf alone: the row passes when any arm holds, and the
     other arms are answered from posting sets.  A leaf the sets only bound is taken there when it
     is a literal an index that stores positions can follow (`lion_query_posexact()`;
@@ -13006,7 +13033,12 @@ plan make the same account, which the tests rely on. *(Since "The per-key terms,
 account is kept at the planner's own prices for the same operations - the probing count's set-up and
 its union sets, `LION_FKJOIN_PROBE_COST` a filter container sought and
 `LION_FKJOIN_PROBE_PAGE_COST` a posting page, less the count against the copy's set-up as well as
-its lookups - and never goes below nothing; the measurements below were made before.)*
+its lookups - and never goes below nothing; the measurements below were made before.)* A fact
+filter decided from stored positions (§17) is decided by each count that probes it and not by
+the counts against a copy, which was decided as it was made, so all that deciding it takes is
+probing's: each member a lexeme's cursor sought, at `LION_POS_CHECK_COST`, and each it decoded
+getting there, at `LION_POS_MEMBER_COST` (`pos_seeks` and `pos_decoded` of the count's
+statistics, `lion_posfilter_work()`).
 
 **The price** (`lion_join_copy_price()`), taken once, at the first count that probes, from the sets
 as they were located, which carry their rows and containers (`ntids`, `ncontainers`): every
@@ -13015,8 +13047,11 @@ pages a set on pages of its own takes (`LION_DESCENT_COST` each, its containers'
 room), each union's image at each of its keys and its members set in it (`LION_UNION_KEY_COST`,
 `LION_UNION_MEMBER_COST`), and the copy's containers made (`LION_FKJOIN_COPY_CONTAINER_COST`). The
 copy's size is the planner's formula over the rows the filters' product leaves, taken as
-independent, in no more containers than the sparsest filter has. No price - no switch - where no
-copy can be made: a hot standby, filters that only subtract, a list located a batch at a time. A
+independent, in no more containers than the sparsest filter has. A clause the row filter decides
+from stored positions (`LionClauseState.posfilter`) is decided as the copy is made: each row the
+product leaves sought under each of the clause's lexemes, and each lexeme's members decoded - its
+set's rows, at most `LION_POS_SEEK_MEMBERS` a row - at the planner's prices (§17, "The price").
+No price - no switch - where no copy can be made: a hot standby, filters that only subtract, a list located a batch at a time. A
 copy expected not to fit a hash join's memory (`get_hash_memory_limit()`, what a plan that collects
 is given) is priced as it will be made, SPILLED: its pages written once - and every count after the
 switch reads the containers it looks up back from the file, which the account takes off what each

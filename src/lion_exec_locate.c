@@ -1235,6 +1235,7 @@ lion_build_filter(LionCountScanState *st)
 	{
 		LionClauseState *cl = &st->clause[i];
 
+		cl->posfilter = false;
 		if (cl->kind == LION_CLAUSE_MULTI && !st->inor[i] && cl->idx != NULL &&
 			lion_clause_in_run(st, i) &&
 			(cl->qmode == LION_QMODE_LOSSY || cl->qmode == LION_QMODE_ALL))
@@ -1288,7 +1289,10 @@ lion_build_filter(LionCountScanState *st)
 										  get_op_opfamily_strategy(cl->opno,
 																   cl->idx->rd_opfamily[cl->idxcol - 1]));
 			if (pf != NULL)
+			{
 				filter->pos[filter->npos++] = pf;
+				cl->posfilter = true;
+			}
 			else
 				filter->nheap++;
 		}

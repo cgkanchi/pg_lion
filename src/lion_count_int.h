@@ -220,7 +220,12 @@ typedef struct LionCountCtx
 	 * A test every counted row must pass as well (DESIGN.md §17, "A query
 	 * known only at run time"), or NULL.  With one, the visibility map is not
 	 * asked at all: every candidate goes to the heap, where the row the
-	 * snapshot sees is tested (lion_recheck_heap_filtered()).
+	 * snapshot sees is tested (lion_recheck_heap_filtered()) - unless all it
+	 * holds is position filters (LionRowFilter.pos), which decide each
+	 * container before the map is asked, or posdone (below) says the copy
+	 * among the sources went through them already.  A collection's is its
+	 * LionCollect.filter: only the position filters, which it applies to the
+	 * containers it copies.
 	 */
 	LionRowFilter *filter;
 	int64		count;			/* members counted straight from the VM */
@@ -242,6 +247,15 @@ typedef struct LionCountCtx
 	 * row known to be visible.  lion_exists_settled() is the only reader.
 	 */
 	bool		exists;
+
+	/*
+	 * A source of the count is a copy whose containers went through filter's
+	 * position filters as it was made (LionMatSet.posfiltered): every
+	 * candidate is one of its members, decided already, and the count asks
+	 * nothing of the positions again - lion_count_posfilter() hands every
+	 * container back as it is.
+	 */
+	bool		posdone;
 
 	/*
 	 * Neither: the containers of the intersection are COPIED instead of
@@ -332,6 +346,15 @@ typedef struct LionCollect
 	LionSpill	sp;
 
 	/*
+	 * The row filter of the counts the copy is made for, or NULL: its position
+	 * filters (LionRowFilter.pos) decide every container before it is copied,
+	 * so that the copy holds only the rows their queries match and its counts
+	 * decide nothing from positions again (LionCountCtx.posdone).  Its other
+	 * clauses only the heap can test, and are left to those counts.
+	 */
+	LionRowFilter *filter;
+
+	/*
 	 * A chunk of the intersection only (ranged): its container keys from lo
 	 * up to, not including, hi - what one participant of a parallel plan
 	 * collects of a shared copy (LionSharedCopy), or of the WHERE of a
@@ -411,6 +434,9 @@ typedef struct LionMatSet
 	uint32		dirlen;			/* keys dir[] covers */
 	bool		collected;		/* every item a container, one a key: an
 								 * intersection lion_sources_collect() made */
+	bool		posfiltered;	/* ... whose containers went through the
+								 * position filters of the row filter it was
+								 * collected under (LionCollect.filter) */
 	MemoryContext unioncxt;		/* a range's union in memory: the context
 								 * its containers are in, or NULL */
 

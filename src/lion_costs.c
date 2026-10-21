@@ -54,6 +54,8 @@ double		lion_descent_cost;
 double		lion_union_set_cost;
 double		lion_recheck_tid_cost;
 double		lion_recheck_group_tid_cost;
+double		lion_position_member_cost;
+double		lion_position_check_cost;
 double		lion_resident_page_cost;
 double		lion_cold_page_cost;
 double		lion_entry_count_cost;
@@ -145,6 +147,10 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
 	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
+	{"pg_lion.position_member_cost", &lion_position_member_cost, 2.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each member of a lexeme's stored positions that a lion position filter decodes"},
+	{"pg_lion.position_check_cost", &lion_position_check_cost, 3.0, LION_OP,
+	 "Sets the planner's estimate of the cost of deciding a candidate row from stored positions, per lexeme of the query"},
 	{"pg_lion.resident_page_cost", &lion_resident_page_cost, 120.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each page of a resident lion index that a lion count reads"},
 
