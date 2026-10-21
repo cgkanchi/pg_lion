@@ -130,8 +130,8 @@ SELECT (SELECT ntids FROM lion_index_stats('lion_vac_k')) =
 /*
  * Rows, not postings.  A multicolumn index posts a row once per key column,
  * a multi-key one once per element, so their postings are a multiple of
- * their rows - and VACUUM used to report the postings, which ANALYZE then
- * overwrote with rows, and the next VACUUM with postings again.  Each index
+ * their rows - and were VACUUM to report the postings, ANALYZE would
+ * overwrite them with rows, and the next VACUUM with postings again.  Each index
  * here holds the rows the one-column index holds.  The multi-key index has
  * no scalar column to count them by and reports the heap's count, as GIN
  * does.

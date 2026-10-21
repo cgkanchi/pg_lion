@@ -651,9 +651,9 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * still agree, which is what the §11 interlock needs: a split of a leaf
 	 * moves entries only onto a brand new page immediately to its right, and
 	 * the walk has not passed that one yet.  A cycle of damaged right links
-	 * is an ERROR (lion.h), which fails this VACUUM - and each autovacuum of
-	 * the table, which used to go round the cycle for ever - as a damaged
-	 * nbtree does.
+	 * is an ERROR (lion.h), which fails this VACUUM and each autovacuum of
+	 * the table, as a damaged nbtree does, rather than go round the cycle for
+	 * ever.
 	 */
 	lion_rightwalk_init(&walk);
 	blk = lion_dir_leftmost_leaf(index, vs.ix);
@@ -729,9 +729,9 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * it has a scalar column to count them by.  num_index_tuples becomes the
 	 * index's pg_class.reltuples, which the planner reads as rows (a partial
 	 * index's size is estimate_rel_size()'s tuples per page of it) and which
-	 * ANALYZE rewrites with rows; the postings this used to report count a
-	 * row once per key column and once per element, and made plans flip
-	 * between the two.  Without a scalar column only the heap's row count is
+	 * ANALYZE rewrites with rows.  The postings would count a row once per
+	 * key column and once per element, and make plans flip between the two
+	 * counts.  Without a scalar column only the heap's row count is
 	 * known, as for GIN, and only the cleanup call is told whether that is
 	 * exact (lionvacuumcleanup()).
 	 */
@@ -827,7 +827,7 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
 
 	/*
 	 * Make the pages ambulkdelete recorded as free visible to the upper
-	 * levels of the free space map, so that lion_new_buffer() finds them
+	 * levels of the free space map, so that lion_alloc_page() finds them
 	 * (DESIGN.md §18).  This is what nbtree and every other index AM does
 	 * here, and it is cheap for an index that freed nothing.
 	 */
@@ -1386,13 +1386,14 @@ lion_vacuum_inline_filter(LionVacState *vs, Page page, BlockNumber blkno,
 
 	/*
 	 * It grew.  Removal can do that - a RUN that loses every other member
-	 * becomes a BITSET - so the entry may no longer fit the page, or may have
-	 * outgrown inline_limit - or, next to a long key, LION_MAX_ENTRY_SIZE,
-	 * which lion_inline_max() also bounds - and then its posting set spills
-	 * onto container pages as an insert's would, except that it may need
-	 * many of them: the payload is not bounded by inline_limit any more,
-	 * only by the number of items it had (lion_entry_spill()).  Try the
-	 * plain overwrite first; the spill is decided when that fails.
+	 * becomes a NARROW or a BITSET (DESIGN.md §38) - so the entry may no
+	 * longer fit the page, or may have outgrown inline_limit - or, next to a
+	 * long key, LION_MAX_ENTRY_SIZE, which lion_inline_max() also bounds -
+	 * and then its posting set spills onto container pages as an insert's
+	 * would, except that it may need many of them: the payload is bounded
+	 * not by inline_limit but by the number of items it had
+	 * (lion_entry_spill()).  Try the plain overwrite first; the spill is
+	 * decided when that fails.
 	 */
 	if (res->paylen <= inlinemax)
 	{
@@ -1794,13 +1795,13 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 		/*
 		 * A payload that outgrew its entry moves onto container pages, in
 		 * records of its own.  This is rare (it needs a RUN container to
-		 * turn into a BITSET while losing members), so it is not worth
+		 * turn into a bitmap while losing members), so it is not worth
 		 * batching, and lion_entry_spill() rewrites the entry itself.  It is
 		 * NOT small when it happens: a few kilobytes of RUN containers that
-		 * all turn into BITSETs need a leaf each, and the spill writes as
+		 * all turn into bitmaps need several leaves, and the spill writes as
 		 * many as it takes - a record per leaf, then the root and the entry
-		 * together - where it used to refuse more than four and so failed
-		 * this VACUUM, and every VACUUM after it (2026-09-25 review).
+		 * together - with no bound but the items it had: a bound would fail
+		 * this VACUUM, and every VACUUM after it.
 		 *
 		 * The payload it spills is the FILTERED one, so the rewrite of the
 		 * entry on this leaf is where this entry's dead TIDs leave the
@@ -2069,7 +2070,7 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 
 	/*
 	 * A cycle of damaged right links ends the walk in an ERROR (lion.h) and
-	 * fails the VACUUM, which used to go round it for ever.
+	 * fails the VACUUM, rather than go round it for ever.
 	 */
 	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
@@ -2995,7 +2996,7 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
  *	- a container LEAF nothing references whose root is not a live root of
  *	  its key (lion_posting_root_live()): what a multi-leaf spill that an
  *	  ERROR or a crash stopped before its last record leaves behind, full
- *	  leaves under a root that was never written (lion_entry_spill()).  It
+ *	  leaves under a root with no downlink (lion_entry_spill()).  It
  *	  becomes a DELETED page like the empty ones.
  *	- an INTERNAL posting page whose children are all DELETED pages (the
  *	  rounds of lion_vacuum_sweep()).
@@ -3275,15 +3276,14 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			/*
 			 * Interrupts are checked at the top of every block, with nothing
-			 * locked.  Nearly every block leaves the body by a `continue`, and
-			 * the check used to sit at the bottom, which only a full leaf of a
-			 * live set reached: a sweep of many free pages read and recorded
-			 * every one of them without answering a cancel, and the pass over
-			 * a healthy index, which skips every block, had no check at all.
-			 * A block the walk accounted for costs a bit test and the check;
-			 * one the sweep reads, and may write a record for, passes the
-			 * cost-based delay first, as every page the other passes read
-			 * does.
+			 * locked: nearly every block leaves the body by a `continue`, so
+			 * a check at the bottom would be reached only by a full leaf of a
+			 * live set, and a sweep of many free pages - or the pass over a
+			 * healthy index, which skips every block - would not answer a
+			 * cancel.  A block the walk accounted for costs a bit test and
+			 * the check; one the sweep reads, and may write a record for,
+			 * passes the cost-based delay first, as every page the other
+			 * passes read does.
 			 */
 			if (lion_vac_visited(vs, blk))
 			{

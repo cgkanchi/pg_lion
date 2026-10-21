@@ -119,10 +119,10 @@ SELECT lion_index_verify('lion_wr_k', true);
  * ITEM_REPLACE AS A DELTA (DESIGN.md §25).
  *
  * A container that has used up its growth slack is rewritten through the
- * general path.  That record used to carry the WHOLE rewritten item - 1.6 KB
- * for a dense ARRAY, which is what made the container path cost more WAL than
- * a generic byte diff of the same change - and now carries the byte ranges
- * that differ from what the page already holds.
+ * general path.  That record carries the byte ranges that differ from what
+ * the page already holds, not the whole rewritten item: 1.6 KB for a dense
+ * ARRAY, which would make the container path cost more WAL than a generic
+ * byte diff of the same change.
  *
  * What is pinned is the shape: the delta operation appears, and the records
  * that use it stay small.  How many there are depends on page fill, and a

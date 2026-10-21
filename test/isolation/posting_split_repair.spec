@@ -1,6 +1,7 @@
 # Posting-tree splits that never finished, met by the writers that do NOT
-# descend, and a root push-down cut short (DESIGN.md §22, the two addenda of
-# 2026-09-25).
+# descend, and a root push-down cut short (DESIGN.md §22, the addenda "an
+# unfinished split and the writers that do not descend" and "a root
+# push-down logs the counters its page holds").
 #
 # A leaf split is two records: the first splits the page, flags its left half
 # LION_PAGE_INCOMPLETE_SPLIT and - when the page was the set's last - makes the
@@ -8,23 +9,25 @@
 # into the parent.  A crash between them, or an ERROR (the parent insertion
 # may split the parent, which allocates a page, which can run out of disk),
 # leaves the flag set and the right half without a downlink.  A writer's
-# DESCENT finishes such a split when it meets it, and that used to be the only
-# repair - but two writers reach a leaf WITHOUT descending:
+# DESCENT finishes such a split when it meets it, and two writers reach a leaf
+# WITHOUT descending:
 #
-#  A. an APPEND, through the entry's `tail`.  Every later append went to the
-#     right half; when that filled, its own split looked for its downlink in
-#     the parent, found none, and failed with "no downlink for block N" - and
-#     so did every later split of the tail, because each one left the next
-#     tail without a downlink too.  An append-only table never took another
-#     row into that key.
+#  A. an APPEND, through the entry's `tail`, which names the right half.  When
+#     that fills, its own split finds no downlink for it in the parent, and
+#     neither would any later split of the tail, each of which leaves the next
+#     tail without a downlink too: an append-only table would never take
+#     another row into that key.  So an insert that may split the page takes
+#     the descent, which finishes the split on its way.
 #  B. VACUUM's REGROW, which walks the right links to the page a container
 #     that grew on filtering lives on.  On the right half, which has no
-#     downlink, its split failed the same way, and VACUUM never completed.
-#  C. the same on the flagged LEFT half, which it split again: an assertion
-#     failure in an assert build, and in a release build a new page between
-#     the two halves of the old split that took the downlink the old right
-#     half was waiting for, orphaning that half - and the containers on it,
-#     for every reader that seeks by container key.
+#     downlink, its split looks for the missing downlink to its left and
+#     finishes the split it finds there (lion_posting_adopt()), where it would
+#     otherwise fail the same way and VACUUM would never complete.
+#  C. the same on the flagged LEFT half, which it splits again: the split
+#     finishes the page's own unfinished split first, where it would
+#     otherwise put a new page between the two halves of the old split, take
+#     the downlink the old right half is waiting for and orphan that half -
+#     and the containers on it, for every reader that seeks by container key.
 #
 # And a push-down cut short.  A set of up to 16 leaves has no internal level
 # (DESIGN.md §22); the split that would make a 17th leaf first PROMOTES the
@@ -33,18 +36,20 @@
 #
 #  D. when the head is the page that overflows, the head's items go to the new
 #     child and the member is placed on that child, which is the child's own
-#     split, and can fail.  The push-down logged the entry with the counters
-#     the insert had already bumped, so an ERROR in between (injection point
-#     lion-posting-pushdown-child) left ntids one above what the containers
-#     hold: "claims 9241 TIDs, but its containers hold 9240".
-#  E. the same in VACUUM's regrow, with counters LOWERED by TIDs filtered out
-#     of a container that had not been written yet: 966 too few, and every
-#     later VACUUM subtracted them again.
+#     split, and can fail.  The push-down logs the entry as its page holds
+#     it, with only `tail` moved, and the counters travel with the split that
+#     places the items, so an ERROR in between (injection point
+#     lion-posting-pushdown-child) leaves the entry's ntids what its
+#     containers hold.
+#  E. the same in VACUUM's regrow, whose counters are LOWERED by the TIDs
+#     filtered out of a container it has not written yet: logged with the
+#     push-down, they would be too low by those TIDs, and every later VACUUM
+#     would subtract them again.
 #  F. when another leaf of the chain overflows - an append to the last one -
 #     the promotion leaves that leaf where it is, and its split follows as a
 #     split of a tree leaf.  An ERROR in between (lion-posting-promoted)
 #     leaves a root that links every leaf and the leaf full, which the next
-#     insert splits (test/recovery/run.sh phase 1e does it with a crash).
+#     insert splits (test/recovery/run.sh phase 1g does it with a crash).
 #
 # The splits are cut short with lion-posting-split-incomplete set to 'error'
 # inside a subtransaction, which leaves on disk exactly what a crash between

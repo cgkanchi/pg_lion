@@ -269,7 +269,8 @@ lion_posting_check_level(Relation index, Page page, BlockNumber blk,
  * blk a second time and wait for itself for ever, so it is refused before the
  * lock.  The pages checked are the page a walk steps from and every page the
  * enclosing split repairs hold (LionPostingHeld), however far up and sideways
- * the repair has recursed (DESIGN.md §22, 2026-09-28 addendum).
+ * the repair has recursed (DESIGN.md §22, addendum "a repair inside a
+ * repair").
  */
 static void
 lion_posting_held(Relation index, BlockNumber head, BlockNumber blk)
@@ -1115,9 +1116,9 @@ lion_posting_leftmost_leaf(Relation index, BlockNumber head,
 }
 
 /*
- * DESIGN.md §4 called this "the container page that owns ckey", and it was a
- * walk from the head; it is a descent now, and it is still the only place a
- * container key is turned into a block.  The caller holds the entry, so the
+ * "The container page that owns ckey" (DESIGN.md §4), found by a descent from
+ * the head: the only place a container key is turned into a block.  The
+ * caller holds the entry, so the
  * set cannot go away and anything unexpected is corruption.  `tail` is
  * accepted and unused: the append hint lives in the insert path, which takes
  * the tail page EXCLUSIVE directly (lion_insert_lock_chain_page()).
@@ -1171,9 +1172,8 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
  * places it, VACUUM's regrow subtracts the TIDs it filtered out), and they go
  * onto the child in a LATER record - the child's own split, which allocates
  * pages and can fail, or be cut short by a crash.  Logging the caller's
- * counters here would leave them claiming items that no page holds (the
- * 2026-09-25 review measured "claims 9241 TIDs, but its containers hold 9240"
- * after an ERROR at lion-posting-pushdown-child).  The push-down moves items
+ * counters here would leave them claiming items that no page holds after an
+ * ERROR at lion-posting-pushdown-child.  The push-down moves items
  * without changing them, so the counters on the page are exactly right for
  * the tree it leaves behind; the caller's copy gets the new `tail` too, and
  * its counters travel with the record that really places the items.
@@ -2362,10 +2362,9 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
  * which is every page the repair holds (LionPostingHeld).
  *
  * A child with no downlink at all is repaired rather than reported: see
- * lion_posting_adopt().  Before that repair existed, an append that took the
- * right half of an unfinished split through the append hint and then filled
- * it hit an ERROR here, and so did every later split of the tail, for good
- * (2026-09-25 review).
+ * lion_posting_adopt().  An ERROR here would fail every later split of the
+ * tail of a set whose right half of an unfinished split an append filled,
+ * for good.
  */
 static Buffer
 lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,

@@ -132,8 +132,8 @@ SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 3.0, 1.0);
  3 rows, 0 differ
 (1 row)
 
--- a k1 so large that tf * (k1 + 1) and k1 * L overflowed, and a term came
--- out infinite or NaN: each is close to idf * tf / L now, as BM25's is when
+-- a k1 so large that tf * (k1 + 1) and k1 * L would overflow, and a term
+-- come out infinite or NaN: each is close to idf * tf / L, as BM25's is when
 -- k1 grows; and the largest double
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 40, 1e308);
       bm_same      
