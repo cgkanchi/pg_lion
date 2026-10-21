@@ -553,9 +553,44 @@ lion_verify_recheck(LionVerifyState *vs)
  * heapallindexed
  * --------------------------------------------------------------------- */
 
+/* What a lookup of a heap tuple under one of its keys found. */
+typedef enum LionVerifyFound
+{
+	LION_VFOUND_ABSENT,			/* the TID is not under the key */
+	LION_VFOUND_PRESENT,		/* it is, with the positions it has to have */
+	LION_VFOUND_NOPOS,			/* it is, and the key has no positions for it */
+	LION_VFOUND_OTHERPOS		/* it is, with positions that are not its own */
+} LionVerifyFound;
+
+/*
+ * What a TID found under its key comes to, given expect, the member its row
+ * gives the key in a column that stores positions, and stored, the member
+ * the key holds for it when `have` says it holds one.  Both are in
+ * lion_posmember_from_key()'s form - positions ascending, no repeats - so
+ * the same positions with the same weights are the same bytes.
+ */
+static LionVerifyFound
+lion_verify_found_positions(const LionPosMember *expect, bool have,
+							const LionPosMember *stored)
+{
+	if (expect == NULL)
+		return LION_VFOUND_PRESENT;
+	if (!have)
+		return LION_VFOUND_NOPOS;
+	if (expect->npos != stored->npos ||
+		memcmp(expect->pos, stored->pos, sizeof(uint16) * expect->npos) != 0)
+		return LION_VFOUND_OTHERPOS;
+	return LION_VFOUND_PRESENT;
+}
+
 /*
  * Is (ckey, lo) present in the posting set of key, or of the reserved entry
- * named by reservedflag when there is one (DESIGN.md §14 and §17)?
+ * named by reservedflag when there is one (DESIGN.md §14 and §17)?  With
+ * expect, the member the tuple's value gives the key in a column that stores
+ * positions (lion_posmember_from_key(), as the build and the insert make it),
+ * the positions the key stores for the TID are compared with it too: the
+ * index has to hold the row's own positions under each of its keys, as the
+ * position filter decides a phrase from them alone (§17).
  *
  * A reader's lookup (DESIGN.md §5, SCAN): the entry is read under its leaf's
  * SHARE lock, and a CHAIN entry's leaf is let go before the posting tree is
@@ -568,18 +603,29 @@ lion_verify_recheck(LionVerifyState *vs)
  * this waited for the container page, for good.  A set can go away only once
  * it holds nothing any snapshot sees (§18), and VACUUM is locked out on a
  * primary anyway, so a set found gone holds no row this snapshot sees.
+ *
+ * The positions are looked up the same way: an INLINE entry's chunk under
+ * the leaf's lock, with the payload; a CHAIN entry's position tree once the
+ * leaf is let go, by a reader's lookup that moves right past a split too
+ * (lion_postree_fetch()).  A row this snapshot sees has its positions under
+ * every key for as long as the check runs: the insert wrote them before its
+ * TID (W1), and only VACUUM takes them out, after the TID (V1).  The lookup
+ * keeps one member and one chunk, in buffers made once for the whole scan,
+ * so the comparison costs a row nothing that grows with the index.
  */
-static bool
+static LionVerifyFound
 lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 					   uint16 reservedflag, uint32 hash, uint32 ckey,
-					   uint16 lo)
+					   uint16 lo, const LionPosMember *expect)
 {
 	Relation	index = vs->index;
 	Buffer		entrybuf;
 	OffsetNumber entryoff;
 	BlockNumber head = InvalidBlockNumber;
+	BlockNumber posroot = InvalidBlockNumber;
 	uint32		ehash = 0;
 	bool		present = false;
+	LionVerifyFound found = LION_VFOUND_ABSENT;
 
 	if ((reservedflag != 0) ?
 		lion_find_reserved_entry(index, state, BUFFER_LOCK_SHARE,
@@ -608,11 +654,29 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 				if (lion_item_first_ckey(vs->cbuf) > ckey)
 					break;
 			}
+
+			if (present)
+			{
+				bool		have = false;
+
+				/* ... and the entry's one chunk, copied out whole and checked */
+				if (expect != NULL &&
+					lion_entry_inline_poschunk(index, entry, ItemIdGetLength(iid),
+											   BufferGetBlockNumber(entrybuf),
+											   entryoff, vs->posbuf))
+					have = lion_poschunk_find(vs->posbuf, expect->code,
+											  vs->posm);
+				found = lion_verify_found_positions(expect, have, vs->posm);
+			}
 		}
 		else
 		{
+			const LionEntryPosExt *x = lion_entry_posext(entry);
+
 			head = lion_entry_head(entry);
 			ehash = lion_entry_owner(entry);
+			if (x != NULL)
+				posroot = x->pos_root;
 		}
 
 		UnlockReleaseBuffer(entrybuf);
@@ -630,7 +694,7 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 			Page		cpage = BufferGetPage(cbuf);
 			BlockNumber blk = BufferGetBlockNumber(cbuf);
 			OffsetNumber off;
-			bool		found;
+			bool		hit;
 
 			/*
 			 * The descent checks each page with the tree code's test, which
@@ -642,17 +706,53 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 			 */
 			if (lion_page_owns_entry(cpage, ehash, head))
 			{
-				off = lion_page_find_item(index, cpage, blk, ckey, &found);
-				if (found)
+				off = lion_page_find_item(index, cpage, blk, ckey, &hit);
+				if (hit)
 					present = lion_item_contains(lion_page_item_fetch(index, cpage,
 																	  blk, off),
 												ckey, lo);
 			}
 			UnlockReleaseBuffer(cbuf);
 		}
+
+		if (present)
+		{
+			bool		have = false;
+
+			if (expect != NULL && BlockNumberIsValid(posroot))
+				have = lion_postree_fetch(index, ehash, posroot, expect->code,
+										  vs->posm);
+			found = lion_verify_found_positions(expect, have, vs->posm);
+		}
 	}
 
-	return present;
+	return found;
+}
+
+/*
+ * A member's positions as a tsvector prints them - "3,7A" - for a message,
+ * or "none" for a member of a stripped tsvector's key.
+ */
+static char *
+lion_verify_format_positions(const LionPosMember *m)
+{
+	StringInfoData buf;
+	int			i;
+
+	if (m->npos == 0)
+		return pstrdup("none");
+	initStringInfo(&buf);
+	for (i = 0; i < m->npos; i++)
+	{
+		uint16		w = LION_POS_WEIGHT(m->pos[i]);
+
+		if (i > 0)
+			appendStringInfoChar(&buf, ',');
+		appendStringInfo(&buf, "%u", (unsigned) LION_POS_POS(m->pos[i]));
+		if (w != 0)
+			appendStringInfoChar(&buf, "DCBA"[w]);
+	}
+	return buf.data;
 }
 
 /*
@@ -661,15 +761,57 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
  */
 static void
 lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
-				   Datum key, uint16 reservedflag, uint64 code)
+				   Datum key, uint16 reservedflag, uint64 code,
+				   const LionPosMember *expect)
 {
 	uint32		hash = (reservedflag != 0) ? LION_NULLKEY_HASH :
 		lion_hash_key(state, key);
 	bool		typisvarlena;
+	LionVerifyFound found;
 
-	if (lion_verify_tid_present(vs, state, key, reservedflag, hash,
-							   lion_code_ckey(code), lion_code_lo(code)))
+	found = lion_verify_tid_present(vs, state, key, reservedflag, hash,
+									lion_code_ckey(code), lion_code_lo(code),
+									expect);
+	if (found == LION_VFOUND_PRESENT)
 		return;
+	if (found != LION_VFOUND_ABSENT)
+	{
+		const char *what = (found == LION_VFOUND_NOPOS) ? "no positions" :
+			"positions that are not its own";
+		const char *keystr;
+
+		/*
+		 * The positions are the row's text as much as the key is - a
+		 * lexeme's places in the document - so they go into the message on
+		 * the key value's terms (below).
+		 */
+		if (!vs->showvalues)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("heap tuple (%u,%u) from table \"%s\" has %s under one of its keys in \"%s\"",
+							ItemPointerGetBlockNumber(tid),
+							ItemPointerGetOffsetNumber(tid),
+							RelationGetRelationName(vs->heap), what,
+							RelationGetRelationName(vs->index)),
+					 errdetail("Key column %u of the tuple is not NULL.",
+							   state->attno)));
+
+		getTypeOutputInfo(state->typid, &vs->keyoutfunc, &typisvarlena);
+		keystr = lion_is_length_key(state, key) ? "the length key" :
+			psprintf("key \"%s\"", OidOutputFunctionCall(vs->keyoutfunc, key));
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("heap tuple (%u,%u) from table \"%s\" has %s under one of its keys in \"%s\"",
+						ItemPointerGetBlockNumber(tid),
+						ItemPointerGetOffsetNumber(tid),
+						RelationGetRelationName(vs->heap), what,
+						RelationGetRelationName(vs->index)),
+				 errdetail("Key column %u of the tuple has %s at positions %s, and the index stores %s for the tuple under it.",
+						   state->attno, keystr,
+						   lion_verify_format_positions(expect),
+						   (found == LION_VFOUND_NOPOS) ? "none" :
+						   lion_verify_format_positions(vs->posm))));
+	}
 
 	/*
 	 * The key's value goes into the message only for a superuser.  The
@@ -738,7 +880,7 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 		{
 			/* NULL values live in the column's reserved entry (§14). */
 			lion_verify_one_key(vs, state, tid, (Datum) 0,
-							   LION_ENTRY_NULLKEY, code);
+							   LION_ENTRY_NULLKEY, code, NULL);
 		}
 		else if (state->multikey)
 		{
@@ -753,15 +895,36 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 			 * that is missing under one of several keys is found.
 			 */
 			Datum	   *keys;
+			LionKeyPositions *kpos = NULL;
+			LionPosMember *pm = NULL;
 			uint16		nokey;
-			int			nkeys = lion_extract_value(state, values[c], &keys,
-												   &nokey);
+			int			nkeys;
 			int			i;
 
+			/*
+			 * ... and in a column that stores positions, with the positions
+			 * the value gives each key, which the same call yields: the
+			 * insert's and the build's (lion_insert.c, lion_build.c).  A
+			 * reserved entry stores none (§17).
+			 */
+			if (state->positions)
+			{
+				nkeys = lion_extract_value_pos(state, values[c], &keys, &kpos,
+											   &nokey);
+				pm = (LionPosMember *) palloc(sizeof(LionPosMember));
+			}
+			else
+				nkeys = lion_extract_value(state, values[c], &keys, &nokey);
+
 			if (nkeys == 0)
-				lion_verify_one_key(vs, state, tid, (Datum) 0, nokey, code);
+				lion_verify_one_key(vs, state, tid, (Datum) 0, nokey, code,
+								   NULL);
 			for (i = 0; i < nkeys; i++)
-				lion_verify_one_key(vs, state, tid, keys[i], 0, code);
+			{
+				if (pm != NULL)
+					lion_posmember_from_key(pm, code, &kpos[i]);
+				lion_verify_one_key(vs, state, tid, keys[i], 0, code, pm);
+			}
 		}
 		else
 		{
@@ -769,7 +932,7 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 			if (!state->typbyval && state->typlen == -1)
 				key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
-			lion_verify_one_key(vs, state, tid, key, 0, code);
+			lion_verify_one_key(vs, state, tid, key, 0, code, NULL);
 		}
 
 		CHECK_FOR_INTERRUPTS();
@@ -783,7 +946,9 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 
 /*
  * Scan the heap with a fresh MVCC snapshot and check that every visible tuple
- * is in the index, the way contrib/amcheck does for its heapallindexed check.
+ * is in the index, the way contrib/amcheck does for its heapallindexed check
+ * - with its own positions under each of its keys, in a column that stores
+ * them (lion_verify_tid_present()).
  */
 void
 lion_verify_heapallindexed(LionVerifyState *vs)
@@ -795,6 +960,10 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 	vs->heapcxt = AllocSetContextCreate(CurrentMemoryContext,
 										"lion index verify heap tuple",
 										ALLOCSET_DEFAULT_SIZES);
+
+	/* What the comparison of positions keeps, for the whole scan. */
+	vs->posbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
+	vs->posm = (LionPosMember *) palloc(sizeof(LionPosMember));
 
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 
@@ -839,4 +1008,8 @@ lion_verify_heapallindexed(LionVerifyState *vs)
 	UnregisterSnapshot(snapshot);
 	MemoryContextDelete(vs->heapcxt);
 	vs->heapcxt = NULL;
+	pfree(vs->posbuf);
+	pfree(vs->posm);
+	vs->posbuf = NULL;
+	vs->posm = NULL;
 }

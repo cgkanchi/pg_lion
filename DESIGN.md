@@ -1046,8 +1046,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- safexid less than 2^31 past the next transaction id (a crash's restart of the counter
         -- can leave one a little past it; one further on would keep the page from reuse); with
         -- heapallindexed, scans the heap with a fresh snapshot and checks that every visible
-        -- tuple's TID is present under its key in EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
-        -- snapshot may not use the index.
+        -- tuple's TID is present under its key in EVERY key column (§24) - and, in a column
+        -- that stores positions, that each of its keys holds the tuple's own positions for it,
+        -- the ones its value gives, position by position and weight by weight (§17) - refusing
+        -- (lion_index_usable(), §9) when this transaction's snapshot may not use the index.
         -- The heap scan evaluates the index's expressions and predicate, which are the table
         -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
         -- AS THE TABLE OWNER, inside a SECURITY_RESTRICTED_OPERATION, under a GUC nest level that
@@ -1153,11 +1155,13 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- ROOT; its fifteenth the body and the safexid of a DELETED container page and of a
         -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
         -- put in its file; its sixteenth the unfinished-split flag on the rightmost page of a
-        -- directory level and of a posting set's; and its seventeenth a position tree without
-        -- positions for TIDs of its set. Each case builds the index it damages and sets every psql variable it
-        -- uses itself, from the file or from a twin; the shared tables and helpers come first.
-        -- The fifteenth's tablespace, a cluster-wide name, is named after the backend that runs
-        -- it.
+        -- directory level and of a posting set's; its seventeenth a position tree without
+        -- positions for TIDs of its set; and its eighteenth positions that are not the row's
+        -- own, in an INLINE entry and in a position tree, which only heapallindexed finds. Each
+        -- case
+        -- builds the index it damages and sets every psql variable it uses itself, from the
+        -- file or from a twin; the shared tables and helpers come first. The fifteenth's
+        -- tablespace, a cluster-wide name, is named after the backend that runs it.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
@@ -1298,6 +1302,14 @@ descent hands back, locked, the leaf that holds the container key, moving right 
 only way an item moves - so the answer is the one a held leaf would give. *(Until the 2026-09-29
 review the lookup held the entry's leaf for its descent, which replay on a standby deadlocked
 against, §25.)* The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
+In a column that stores positions each row's positions under each key are looked up the same way -
+an INLINE entry's chunk under the leaf's lock, a position tree by a reader's lookup that moves right
+past a split (`lion_postree_fetch()`) - and compared with what `lion_extract_value_pos()` and
+`lion_posmember_from_key()` make of the row, the calls the build and the INSERT make. A visible row's
+positions cannot move under the check: they were written before its TID (W1), and only VACUUM takes
+them out. One member and one chunk are kept, for the whole scan, so the comparison adds nothing to
+the scan's memory that grows with the index. The TIDs alone would pass a row whose stored positions
+are not its own, which a phrase query decides from alone (verify.sql's eighteenth case).
 
 **What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
 nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
@@ -6374,9 +6386,11 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   collected. The tree is walked with nothing held and kept when its entry reads the same before
   and after, and a walk that finds a TID without positions is made again with the entry's leaf
   held before it is reported (§7, "Position trees"). On a standby a walk that replay changed under
-  it is repeated, as a posting set's is, and nothing is compared. verify.sql's ninth case damages
-  a downlink, a separator and a leaf's min of a tree with an internal level, its seventeenth the
-  members of a tree, and verify() must report each.
+  it is repeated, as a posting set's is, and nothing is compared. With heapallindexed every heap
+  row's positions under each of its keys are compared with the ones its value gives (§7).
+  verify.sql's ninth case damages a downlink, a separator and a leaf's min of a tree with an
+  internal level, its seventeenth the members of a tree, its eighteenth a row's positions (INLINE
+  and in a tree), and verify() must report each.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every

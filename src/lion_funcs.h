@@ -167,6 +167,8 @@ typedef struct LionVerifyState
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
 	Oid			keyoutfunc;		/* output function of the column being checked */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
+	LionContainer *posbuf;		/* ... an INLINE entry's positions chunk */
+	LionPosMember *posm;		/* ... a member the index stores */
 	int64		nheaptuples;
 	bool		showvalues;		/* the CALLER is a superuser; decided before
 								 * the switch to the table owner */

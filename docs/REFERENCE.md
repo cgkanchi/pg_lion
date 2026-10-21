@@ -50,8 +50,9 @@ so it may wait for them - for as long as statement_timeout and lock_timeout allo
 reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
 no page while it waits for another that replay may hold, and is exact only while replay leaves the
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
-its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
-table's owner (DESIGN.md §7).
+its totals were not compared.  With `heapallindexed` it checks that every row the heap shows is
+under each of its keys - with its own positions and weights, in an index that stores them - and
+evaluates the index's expressions as the table's owner (DESIGN.md §7).
 
 Each of these functions reads one index's storage, and the index of a partitioned table has none:
 each partition's index holds the entries of that partition's rows. `lion_index_stats()` returns no
