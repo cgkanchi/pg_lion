@@ -147,7 +147,7 @@ lion_pdel_find_parent(Relation index, uint32 hash, BlockNumber head,
 	Buffer		buf;
 	LionRightWalk walk;
 
-	buf = lion_posting_search_level(index, head, routekey, 1);
+	buf = lion_posting_search_level(index, head, routekey, 1, false);
 	if (!BufferIsValid(buf))
 		return InvalidBlockNumber;
 

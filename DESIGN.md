@@ -1192,12 +1192,20 @@ Then each candidate is checked again by itself. A downlink's page has to be in t
 chain between the reached page whose downlink precedes it and the one whose downlink follows it,
 which a coupled walk between the two proves or disproves. A page nothing reached has to be where a
 search for its own first key lands: from the directory's root, stopped at the page's level
-(`lion_dir_search_level()`), or from its posting set's root (`lion_posting_search_level()`) - a root
-that was reached, or that an entry names. The roots are found through the entries in one walk of the
-leaves; that is needed for more than a spill's root, because a posting set's root always comes from
-the end of the relation (§18) while the pages it grows by may come out of the free space map, so a
-set created during the walk can leave unreached pages under a root nothing reached either (a first
-version reported "block 7 is not reachable from the meta page" about exactly that). A candidate the
+(`lion_dir_search_level()`), or from the root of its posting set or position tree (§17) - a root
+that was reached, or that an entry names. In a tree the search takes the route of what sorts just
+below the key (`lion_posting_search_level()` with `before`) and walks the level right from where it
+lands until it meets the page, or a page whose first key is above the page's: a position tree's keys
+are heap blocks, one block's rows can fill more than one leaf, and a leaf's first key is then its
+left neighbour's last, or the separator of a run of leaves (lion_postree.c), so a search for the key
+itself stops left of the page or goes past it. The roots are found through the entries in one walk of
+the leaves, posting roots and position roots both; that is needed for more than a spill's root,
+because either root always comes from the end of the relation (§18) while the pages its tree grows by
+may come out of the free space map, so a key created during the walk can leave unreached pages under
+a root nothing reached either (a first version reported "block 7 is not reachable from the meta page"
+about exactly that, and until the 2026-10-20 review so did a key of a column storing positions,
+whose position root was not looked for, and a position leaf an existing key split off;
+test/isolation/verify_positions.spec makes both). A candidate the
 recheck cannot settle is reported as the walk would have reported it: as a leak, with a WARNING, when
 it is a kind an interrupted writer leaves and the next VACUUM's sweep frees - an internal posting page
 among them - and as corruption otherwise.
