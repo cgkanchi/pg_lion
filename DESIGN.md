@@ -1103,8 +1103,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- split flags two pages in a row, and each missing downlink is covered by the page to its
         -- own left. Such a page is bounded above by the next downlink's separator like any other.
         -- The flag with the downlink already in place (the directory clears the flag in a record
-        -- of its own) needs nothing. verify() used to warn and then report the missing downlink
-        -- as "level 1 has 4 downlinks but level 0 has 5 pages";
+        -- of its own) needs nothing. The flag is only ever on the LEFT half of a split, which
+        -- keeps its new right sibling while the flag lasts: neither page deletion nor VACUUM's
+        -- removal of an empty posting leaf takes a flagged page or the page right of one, and a
+        -- root split or push-down flags nothing. So the flag on the rightmost page of a level - a
+        -- root among them - or on a HALF_DEAD directory leaf IS damage, an ERROR: no INSERT can
+        -- finish such a split, and the first one that comes to it fails with "has no right
+        -- sibling to link" (verify.sql's sixteenth case), where a WARNING would leave the missing
+        -- downlink to surface as "level 1 has 4 downlinks but level 0 has 5 pages";
         -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
         -- split fail at their injection points and verifies both. On a primary the WARNING is
         -- exact even with writers running: a split holds the page it flags EXCLUSIVE from the
@@ -1144,9 +1150,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- TID it does not hold, which a phrase query through the index then misses a row for;
         -- its twelfth INLINE entries past the meta page's inline_limit; its thirteenth the meta
         -- page's other words; its fourteenth a second page at the root's level, each flagged
-        -- ROOT; and its fifteenth the body and the safexid of a DELETED container page and of a
+        -- ROOT; its fifteenth the body and the safexid of a DELETED container page and of a
         -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
-        -- put in its file. Each case builds the index it damages and sets every psql variable it
+        -- put in its file; and its sixteenth the unfinished-split flag on the rightmost page of a
+        -- directory level and of a posting set's. Each case builds the index it damages and sets every psql variable it
         -- uses itself, from the file or from a twin; the shared tables and helpers come first.
         -- The fifteenth's tablespace, a cluster-wide name, is named after the backend that runs
         -- it.
@@ -8466,7 +8473,8 @@ exactly the pages of the level below in that order (which is "every leaf reachab
 exactly once and the leaf right-link chain equals the in-order sequence"), the leftmost downlink of
 each level being minus infinity, each separator at or below its child's own first key, each child's
 high key at or below the next separator, and INCOMPLETE_SPLIT pages reported as a WARNING with the
-repair hint. At the leaf level it also checks that no two entries of one prefix run - the same
+repair hint - or as an ERROR when the page is the rightmost of its level or HALF_DEAD, where no split
+leaves the flag (§7). At the leaf level it also checks that no two entries of one prefix run - the same
 column, kind, comparison and hash, across page boundaries too - are equal under the opclass
 equality: two entries for one key would leave the rows of the one no lookup returns uncounted, and
 the ordering checks alone only catch byte-identical twins (`directory.sql` §13).
@@ -8970,7 +8978,7 @@ each level being minus infinity, every downlink of a level naming exactly the pa
 below in that order - which is the same statement as "the leaf right-link chain equals the in-order
 leaf sequence" - each separator at or below its child's own first container key, and each child's
 own upper bound below the next separator. INCOMPLETE_SPLIT pages are a WARNING with the repair hint,
-as §21's are. `lion_index_stats()` gains `posting_internal_pages` and `max_posting_height`;
+as §21's are, and an ERROR on the rightmost page of a level, which no split leaves flagged. `lion_index_stats()` gains `posting_internal_pages` and `max_posting_height`;
 `container_pages` counts leaves only. `lion_index_posting_root(idx, key)` is a test helper that
 returns one key's root block, which is how the regression test asserts that a root split did not
 move it.

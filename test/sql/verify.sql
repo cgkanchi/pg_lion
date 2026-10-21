@@ -676,6 +676,32 @@ SET client_min_messages = warning;
 DROP TABLE lion_vfy_baddel;
 DROP TABLESPACE :"ts";
 
+-- (16) an unfinished split's flag (64) where no split leaves one.  A split
+-- flags only the left half it splits off a page, and the flag stays with
+-- that page's right sibling: so never the rightmost page of a level - the
+-- last leaf of lion_vfy_badd's directory, the root of key 0's posting set.
+-- A WARNING would call each a split the next INSERT finishes, but that
+-- INSERT fails on the page, which has no sibling to post a downlink for, so
+-- verify() reports each.
+CREATE INDEX lion_vfy_bad_splitd ON lion_vfy_badd USING lion (k);
+SELECT b AS lastleaf
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_splitd') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_splitd', b, :special + 24) >> 16) & 2 = 2
+   AND lion_vfy_u32('lion_vfy_bad_splitd', b, :special) = 4294967295 \gset
+SELECT lion_vfy_poke('lion_vfy_bad_splitd', :lastleaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_splitd', :lastleaf,
+												:special + 26) | 64));
+CREATE INDEX lion_vfy_bad_splitp ON lion_vfy_badp USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_badp_twin', 0) AS root \gset
+SELECT lion_vfy_poke('lion_vfy_bad_splitp', :root, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_splitp', :root,
+												:special + 26) | 64));
+SET client_min_messages = error;
+SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_splitd')$$);
+SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_splitp')$$);
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
 	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph;
