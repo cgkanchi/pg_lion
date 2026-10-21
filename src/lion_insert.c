@@ -27,7 +27,8 @@
  * (lion_insert_container_inplace(), lion_insert_segment_inplace()) under the
  * same locks and in the same single record as the entry tuple.  Nothing else
  * on the page moves, so the WAL delta is a few bytes.  A BITSET container
- * always qualifies (4104 bytes whatever its cardinality); an ARRAY or RUN
+ * always qualifies (4104 bytes whatever its cardinality), and so does a
+ * NARROW for a member within its width (DESIGN.md §38); an ARRAY or RUN
  * container and a sparse segment qualify when the item has growth slack
  * inside it (DESIGN.md §4), which the general path leaves behind whenever it
  * writes an item on behalf of an insert.
@@ -35,7 +36,7 @@
  * An item is a container or a sparse segment (DESIGN.md §13), and which one
  * owns a ckey decides what the insert does:
  *
- *	- a container with that ckey: as before.
+ *	- a container with that ckey: the member goes into it.
  *	- a sparse segment whose range covers the ckey: the pair goes in, and if
  *	  that brings the ckey to LION_SPARSE_THRESHOLD members it is promoted to
  *	  a container of its own and the segment is split around it.  A segment
@@ -1243,18 +1244,17 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
  *
  * The leaf comes from the append hint when the hint qualifies, and then it is
  * used only for the in-place paths, which are what an appending key takes
- * nearly every time (a BITSET always, anything else while its item has growth
- * slack).  A member that needs the general path lets the tail go and DESCENDS
+ * nearly every time (a BITSET always, a NARROW for a member within its
+ * width, anything else while its item has growth slack).  A member that needs the general path lets the tail go and DESCENDS
  * to it, forwrite: the general path can split the page, and a page that is the
  * right half of an unfinished split must not be split before the split that
  * made it is finished (DESIGN.md §22), which is what the descent does on its
  * way down - it routes to the flagged left half, because the right half has
- * no downlink.  Before this, every append went to the tail, the flagged page
- * was never descended to, and the first split of the tail failed with "no
- * downlink" - and so did every later one, so an append-only table never took
- * another row into that key (2026-09-25 review).  lion_posting_find_parent()
- * repairs that case as well now; the descent is what makes it rare, and puts
- * the repair on the first general-path insert instead of on the tail's next
+ * no downlink.  Were every append to go to the tail, the flagged page would
+ * never be descended to, and the first split of the tail would find no
+ * downlink for it - and so would every later one.  lion_posting_find_parent()
+ * repairs that case as well; the descent is what makes it rare, and puts the
+ * repair on the first general-path insert instead of on the tail's next
  * split.
  *
  * The descent after a declined hint almost always lands on the tail again,

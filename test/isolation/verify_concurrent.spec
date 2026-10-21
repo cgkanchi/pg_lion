@@ -2,18 +2,17 @@
 #
 # verify() compares whole levels of the directory and of every posting tree
 # with each other and proves every block reachable, which a writer splitting
-# pages between two of its reads can make fail on a sound index.  Under
-# AccessShareLock and nothing else, a loop of inserts that split the directory
-# against a loop of verify() calls made it report
+# pages between two of its reads can make fail on a sound index: taken at
+# face value, a loop of inserts that split the directory against a loop of
+# verify() calls has it report
 #
 #	the directory points at block 733, but the index has only 732 blocks
 #
-# about an index that was fine (2026-09-25 review).  It then took ShareLock,
-# which kept every writer out while it ran.  It takes ShareUpdateExclusiveLock
-# now, as CREATE INDEX CONCURRENTLY does: INSERTs go on, VACUUM waits, and
-# every check a concurrent INSERT can make fail is settled on the spot, walked
-# again, or recorded as a candidate that is checked again once the writers
-# that were in flight are done.  Every permutation below parks verify() at an
+# about an index that is fine.  It takes ShareUpdateExclusiveLock, as CREATE
+# INDEX CONCURRENTLY does: INSERTs go on, VACUUM waits, and every check a
+# concurrent INSERT can make fail is settled on the spot, walked again, or
+# recorded as a candidate that is checked again once the writers that were in
+# flight are done.  Every permutation below parks verify() at an
 # injection point with nothing held, makes a writer change the index under it
 # in one of the ways an INSERT can, and requires the check to come back clean
 # - and the index to be what the writer made it, which the observer shows.
