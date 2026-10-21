@@ -222,10 +222,13 @@ typedef struct LionVerifyState
  */
 #define LION_VERIFY_STANDBY_WALKS	10
 
-/* What one walk of a posting set found (lion_verify_chain()). */
+/*
+ * What one walk of a posting set found (lion_verify_chain()), or of a
+ * position tree (lion_verify_postree()), whose leaves hold members.
+ */
 typedef struct LionVerifySetResult
 {
-	uint64		card;			/* TIDs its leaves hold */
+	uint64		card;			/* TIDs (members) its leaves hold */
 	uint32		ncontainers;	/* items its leaves hold */
 	BlockNumber last;			/* the last leaf of the right-link chain */
 	uint32		height;			/* its root's level */
@@ -288,6 +291,8 @@ extern bool lion_verify_has_block(const BlockNumber *sorted, int n,
 								  BlockNumber blk);
 extern void lion_verify_page_bounds(LionVerifyState *vs, BlockNumber blk,
 									Page page);
+extern uint16 lion_verify_page_flags(LionVerifyState *vs, BlockNumber blk,
+									 Page page);
 extern Page lion_verify_read_page(LionVerifyState *vs, BlockNumber blk,
 								  uint16 kind, Buffer *bufp);
 extern ItemId lion_verify_itemid(LionVerifyState *vs, BlockNumber blk,

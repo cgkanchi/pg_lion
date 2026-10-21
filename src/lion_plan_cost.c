@@ -1835,6 +1835,11 @@ lion_single_eq_var(RelOptInfo *rel, List *whereclauses, List *wherekinds)
  *	  entries' for the complement, the entries' for the range, each page
  *	  fetched at most twice (the per-entry revisits of DESIGN.md §28).
  *
+ * With `wholecol` the walk is every entry of k, and no range's (DESIGN.md §14,
+ * §35; LION_RANGED_SUMALL, `rangesel` 1): the inside alone, every row of the
+ * table spread over k's keys - the NULL entry's rows too, which a sum over
+ * every row counts beside the summaries as one more set (lion_sum_walk()).
+ *
  * With `given`, F is the one it says rather than the relation's clauses; an
  * existence test of it walks the inside alone, and only until a set has a
  * row (lion_walk_count()).  *sets, when it is given, is what the side taken
@@ -2073,7 +2078,8 @@ lion_cost_range_side_probed(double nkeys, double nedges,
 static Cost
 lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 					AttrNumber groupcol, Var *rangevar, Selectivity rangesel,
-					List *whereclauses, List *wherekinds, List *ors,
+					bool wholecol, List *whereclauses, List *wherekinds,
+					List *ors,
 					LionRangeWalk *collect, const LionSumF *given,
 					LionSumSets *sets)
 {
@@ -2423,6 +2429,14 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	}
 
 	/*
+	 * Nor with no range at all: the sum over every entry of the column
+	 * (`wholecol`, LION_RANGED_SUMALL) has nothing outside it, and the executor
+	 * asks for a side only of a range (lion_sumall_relation()).  Priced as a
+	 * range over all of k, whose complement is empty, a count beside a
+	 * complement OR's positive arms - a source of F that can drive - was the
+	 * one count of F that complement is, where the executor sums every
+	 * summary for it.
+	 *
 	 * No complement without a source of F that can drive |F - NULL(k)|, which
 	 * the executor asks of F before it steps the two sides at all
 	 * (lion_range_choose_on()): beside nothing but ranges taken as sources -
@@ -2434,7 +2448,7 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 	 * drive; it is taken as collected here all the same, which prices such a
 	 * count at its inside - what it costs at most.
 	 */
-	if (nplain == 0 || !ordered)
+	if (wholecol || nplain == 0 || !ordered)
 	{
 		lion_cost_range_sources_free(&f);
 		return inside;
@@ -2871,8 +2885,8 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	if (var == NULL)
 		return disable_cost;
 	w.sides = lion_range_sides(idx, col, bounds);
-	scan = lion_cost_range_sum(root, rel, idx, col, var, sel, NIL, NIL, NIL,
-							   &w, NULL, NULL);
+	scan = lion_cost_range_sum(root, rel, idx, col, var, sel, false, NIL,
+							   NIL, NIL, &w, NULL, NULL);
 	c2 = w.corr * w.corr;
 	ucont = conts + (runs - conts) * c2;
 	bytes += (runs * LION_RANGE_RUN_BYTES - bytes) * c2;
@@ -4578,7 +4592,8 @@ lion_count_rel_walks(LionCountRelCost *c, double counts, LionSumF *f)
 
 		walks += counts * lion_cost_range_sum(c->root, c->rel, wr->idx,
 											  wr->col, wr->var, wr->sel,
-											  NIL, NIL, NIL, NULL, f, &sets);
+											  false, NIL, NIL, NIL, NULL, f,
+											  &sets);
 		counts *= sets.counts;
 		f->rows = Max(1.0, f->rows * sets.rows / c->tuples);
 		f->nsrc++;
@@ -4742,7 +4757,10 @@ lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
  * count may walk such ranges at every count instead (LION_FLAG_RANGEWALK),
  * and what that would save over collecting them, which may come out below
  * nothing, is added to walksave->save (lion_count_rel_walk_save()), and the
- * first bound of each to walksave->clauses.
+ * first bound of each to walksave->clauses.  `rangesum` is LION_RANGED_SUM
+ * for a sum over the entries of rangevar's range and LION_RANGED_SUMALL for
+ * one over every entry of a summarized column, each of which prices its walk
+ * itself (lion_cost_range_sum()), and LION_RANGED_NONE otherwise.
  */
 static Cost
 lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
@@ -4753,7 +4771,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 						List *ors, double numgroups,
 						double outer_entries, double inner_entries,
 						int distinct, double drivefrac, Var *rangevar,
-						bool rangesum, LionRangeCost *rc, double topk,
+						int rangesum, LionRangeCost *rc, double topk,
 						double topkrows, bool nocollect, LionWalkSave *walksave)
 {
 	LionCountRelCost c;
@@ -4778,7 +4796,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	c.distinct = distinct;
 	c.drivefrac = drivefrac;
 	c.rangevar = rangevar;
-	c.rangesum = rangesum;
+	c.rangesum = (rangesum != LION_RANGED_NONE);
 	c.rc = rc;
 	c.walksave = walksave;
 	c.heap_pages = Max((double) rel->pages, 1.0);
@@ -4808,12 +4826,13 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	 * WHERE sources, located once and read once - materialized after their
 	 * first use - and the one row.
 	 */
-	if (rangesum)
+	if (c.rangesum)
 	{
 		c.rangecost = lion_cost_range_sum(root, rel, groupidx, groupcol,
-										  rangevar, drivefrac, whereclauses,
-										  wherekinds, ors, NULL, NULL,
-										  &c.sumsets);
+										  rangevar, drivefrac,
+										  rangesum == LION_RANGED_SUMALL,
+										  whereclauses, wherekinds, ors,
+										  NULL, NULL, &c.sumsets);
 		c.ingroups = 1.0;
 	}
 
@@ -4853,7 +4872,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	run += c.merge_ops * cpu_operator_cost;
 	run += c.recheck_pages * lion_heap_page_cost(root, rel, c.recheck_pages,
 												 c.heap_pages);
-	run += c.recheck_tids * ((groupidx != NULL && !rangesum) ?
+	run += c.recheck_tids * ((groupidx != NULL && !c.rangesum) ?
 							 LION_RECHECK_GROUP_TID_COST :
 							 LION_RECHECK_TID_COST);
 	run += c.ingroups * cpu_tuple_cost;
@@ -4917,7 +4936,7 @@ lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
 					List *ors, double numgroups,
 					double outer_entries, double inner_entries,
 					int distinct, double drivefrac, Var *rangevar,
-					bool rangesum, LionRangeCost *rc, double topk,
+					int rangesum, LionRangeCost *rc, double topk,
 					double topkrows, LionWalkSave *walksave)
 {
 	int			nclause = list_length(whereclauses);
@@ -5149,17 +5168,15 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		/*
 		 * The sum over every entry of a summarized column (DESIGN.md §32) is
 		 * the sum over its summaries: a range over all of it, and priced as
-		 * one.  Without summaries - in this relation: partitions differ - it
-		 * is the walk over every entry it always was.
+		 * one - with nothing outside it (lion_cost_range_sum()).  Without
+		 * summaries - in this relation: partitions differ - it is the walk
+		 * over every entry it always was.
 		 */
 		if (tranged == LION_RANGED_SUMALL)
 		{
 			if (t->driveidx[0] != NULL &&
 				lion_index_col_summarized(t->driveidx[0], t->drivecol[0]))
-			{
-				tranged = LION_RANGED_SUM;
 				tfrac = 1.0;
-			}
 			else
 				tranged = LION_RANGED_NONE;
 		}
@@ -5171,8 +5188,10 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 								  tidx, tcol, tclauses, tkinds, tors, numgroups,
 								  outer_entries, inner_entries, distinct,
 								  tfrac, rangevar,
-								  tranged == LION_RANGED_SUM && rangevar != NULL &&
-								  t->driveidx[0] != NULL,
+								  ((tranged == LION_RANGED_SUM ||
+									tranged == LION_RANGED_SUMALL) &&
+								   rangevar != NULL && t->driveidx[0] != NULL) ?
+								  tranged : LION_RANGED_NONE,
 								  list_length(targets) == 1 ? rc : NULL,
 								  0.0, 0.0, walksave);
 
@@ -5243,7 +5262,8 @@ lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	run = lion_cost_count_rel(root, t->rel, t->driveidx[0], t->drivecol[0],
 							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
 							  cand, cand, 0, LION_DISTINCT_NONE, drivefrac,
-							  NULL, false, NULL, cand, candrows, NULL);
+							  NULL, LION_RANGED_NONE, NULL, cand, candrows,
+							  NULL);
 	run += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, t->rel), cand,
 							 t->rel->tuples);
@@ -5303,8 +5323,9 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 		else
 			run += lion_cost_count_rel(root, rel, idx, col, NULL, 0,
 									   NIL, NIL, NIL, NIL, NIL, nd, nd, 0,
-									   LION_DISTINCT_NONE, 1.0, NULL, false,
-									   NULL, 0.0, 0.0, NULL);
+									   LION_DISTINCT_NONE, 1.0, NULL,
+									   LION_RANGED_NONE, NULL, 0.0, 0.0,
+									   NULL);
 	}
 
 	cpath->path.rows = 1.0;
@@ -5376,8 +5397,8 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
 							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
 							  groupest[0], groupest[0], 0,
-							  LION_DISTINCT_NONE, 1.0, NULL, false, NULL,
-							  0.0, 0.0, NULL);
+							  LION_DISTINCT_NONE, 1.0, NULL, LION_RANGED_NONE,
+							  NULL, 0.0, 0.0, NULL);
 	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, rel), groupest[0],
 							 rel->tuples);
@@ -5494,8 +5515,8 @@ lion_cost_cells_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
 							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
 							  drventries, drventries, 0,
-							  LION_DISTINCT_NONE, 1.0, NULL, false, &rc,
-							  0.0, 0.0, NULL);
+							  LION_DISTINCT_NONE, 1.0, NULL, LION_RANGED_NONE,
+							  &rc, 0.0, 0.0, NULL);
 	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
 							 lion_probe_rel_rows(root, rel), drventries,
 							 rel->tuples);

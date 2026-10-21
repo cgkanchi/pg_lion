@@ -520,7 +520,14 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 									 (Node *) list_nth(imply->clauses, r)) ? 1 : 0) : \
 	 implied[r])
 
-	/* The arms of each OR the bounds do not imply as a whole. */
+	/*
+	 * The arms of each OR the bounds do not imply as a whole.  Each leaf is
+	 * asked about as the query has it (LionClauseInfo.clause), never as the
+	 * cost model saw it: a plan cached under one value of a stable
+	 * expression runs under every other.  armdrop[] is written through each
+	 * OR's run of clauses, which lion_ors_check() holds to the lists.
+	 */
+	lion_ors_check(imply->ors, clauseinfos);
 	foreach(lc, imply->ors)
 	{
 		List	   *one = (List *) lfirst(lc);
@@ -542,7 +549,11 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 			int			nleft = 0;
 
 			for (j = at; j < at + len; j++)
-				arm = lappend(arm, list_nth(imply->leafclauses, j));
+			{
+				LionClauseInfo *ci = (LionClauseInfo *) list_nth(clauseinfos, j);
+
+				arm = lappend(arm, ci->clause);
+			}
 			if (lion_leaf_refutes(root, leaf, imply->toprel, partqual, arm))
 			{
 				for (j = at; j < at + len; j++)
@@ -557,7 +568,7 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 
 					if (ci->kind != LION_CLAUSE_RANGESRC &&
 						lion_leaf_implies(root, leaf, imply->toprel, partqual,
-										  (Node *) list_nth(imply->leafclauses, j)))
+										  ci->clause))
 						armdrop[j] = true;
 					else
 						nleft++;
