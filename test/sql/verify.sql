@@ -725,9 +725,51 @@ SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_poscov');
 SET client_min_messages = warning;
 
+-- (18) positions that are not the row's own, which only heapallindexed
+-- finds: every structure is sound, and a phrase query decided from them
+-- loses the row.  An INLINE entry's chunk, laid out as in (11): row 2's
+-- position under 'alpha', at 15 of the chunk, goes from 1 to 3 (4 -> 12).
+-- And a position tree laid out as in (17), where row 1's goes from 5 to 7.
+-- The message names the key and both positions to a superuser.
+CREATE TEMP TABLE lion_vfy_badhp (id int4, d tsvector);
+INSERT INTO lion_vfy_badhp
+VALUES (1, 'alpha:1 beta:2'), (2, 'alpha:1 beta:2'), (3, 'gamma:1');
+CREATE INDEX lion_vfy_bad_hpinl ON lion_vfy_badhp USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_item('lion_vfy_bad_hpinl', 1, 2) AS item,
+	   lion_vfy_u32('lion_vfy_bad_hpinl', 1, 24 + 4 * 1) >> 17 AS itemlen \gset
+SELECT lion_vfy_poke('lion_vfy_bad_hpinl', 1,
+					 :item + :itemlen -
+					 lion_vfy_u32('lion_vfy_bad_hpinl', 1, :item + 28) + 15,
+					 '\x0c');
+CREATE TEMP TABLE lion_vfy_badhc (id int4, d tsvector);
+INSERT INTO lion_vfy_badhc SELECT i, 'alpha:5 beta:6' FROM generate_series(1, 600) i;
+CREATE INDEX lion_vfy_bad_hpch ON lion_vfy_badhc USING lion (d)
+  WITH (store_positions = true, inline_limit = 64);
+SELECT b AS posleaf, lion_vfy_item('lion_vfy_bad_hpch', b, 1) AS item
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_hpch') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_hpch', b, :special + 24) >> 16) & 128 <> 0
+   AND lion_vfy_peek('lion_vfy_bad_hpch', b,
+					 lion_vfy_item('lion_vfy_bad_hpch', b, 1) + 10, 3) = '\x010114' \gset
+SELECT lion_vfy_poke('lion_vfy_bad_hpch', :posleaf, :item + 12, '\x1c');
+SET client_min_messages = error;
+SET enable_seqscan = off;
+SELECT id FROM lion_vfy_badhp WHERE d @@ 'alpha <-> beta';
+SELECT count(*) FROM lion_vfy_badhc WHERE d @@ 'alpha <-> beta';
+RESET enable_seqscan;
+SELECT lion_index_verify('lion_vfy_bad_hpinl');
+SELECT lion_index_verify('lion_vfy_bad_hpch');
+\set VERBOSITY default
+SELECT lion_index_verify('lion_vfy_bad_hpinl', true);
+SELECT lion_index_verify('lion_vfy_bad_hpch', true);
+\set VERBOSITY terse
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
-	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph, lion_vfy_badpc;
+	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph, lion_vfy_badpc,
+	lion_vfy_badhp, lion_vfy_badhc;
 DROP FUNCTION lion_vfy_meta(regclass, int8, bytea);
 DROP FUNCTION lion_vfy_err(text);
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
