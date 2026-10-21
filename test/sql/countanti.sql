@@ -506,6 +506,20 @@ SELECT lca('SELECT count(*) FROM lca_rows r WHERE COALESCE(r.g = 2 OR r.y = 3, t
 SELECT * FROM lca_val('SELECT (r.z = 99) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1 ORDER BY 1');
 SELECT lca('SELECT (r.z = 99) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.z = 99 THEN true END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+-- a column of many constants, the bits of k: ten IN lists of the values
+-- from 1 to 1,023 with each bit set, 1,025 outcomes with another value's and
+-- NULL's, each row's found from its truths (lion_cells_code_of()); the
+-- cells of the inner side's keys come to nothing
+CREATE TEMP TABLE lca_bits AS
+SELECT format('SELECT %s, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+			  string_agg(format('(r.k IN (%s)) AS b%s', l, j), ', ' ORDER BY j)) AS q
+  FROM (SELECT j, string_agg(v::text, ', ' ORDER BY v) AS l
+		  FROM generate_series(0, 9) j, generate_series(1, 1023) v
+		 WHERE v & (1 << j) <> 0 GROUP BY j) b;
+SELECT ln FROM lca_bits, lca_explain(q) AS ln WHERE ln ~ '^\s*(Group Strategy|Cell Columns|Cells):';
+SELECT lca(q) FROM lca_bits;
+SELECT lca_counters(q) FROM lca_bits;
+DROP TABLE lca_bits;
 -- the correlation by two of the inner side's columns, each equal to the
 -- key: only the inner rows whose a and b agree
 SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier') AS ln

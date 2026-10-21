@@ -132,8 +132,9 @@ lion_cells_close(LionCountScanState *st)
 
 /*
  * The run ends, or begins again for a rescan: the labels go, to be located
- * again by the next run.  The driver's walk and the tally are the decoded
- * walk's, which lion_decode_reset() resets.
+ * again by the next run, and the outcomes by truths with them, made again by
+ * the next run that needs them.  The driver's walk and the tally are the
+ * decoded walk's, which lion_decode_reset() resets.
  */
 void
 lion_cells_reset(LionCountScanState *st)
@@ -149,6 +150,7 @@ lion_cells_reset(LionCountScanState *st)
 	cr->labels = NULL;
 	cr->labelsets = NULL;
 	cr->images = NULL;
+	cr->bytruth = NULL;
 	cr->drvadd = NULL;
 	for (d = 0; d < cr->ndim; d++)
 	{
@@ -607,6 +609,137 @@ lion_cells_truth(const LionCellsRun *cr, int p)
 	return lion_cells_truth_in(cr, p, cr->outs[cr->pred[p].dim]);
 }
 
+/* The order of a dimension's outcomes by their truths: npd bytes each */
+typedef struct LionCellsTupSort
+{
+	const uint8 *tups;			/* every outcome's, in the outcomes' order */
+	int			npd;
+} LionCellsTupSort;
+
+static int
+lion_cells_tup_cmp(const void *a, const void *b, void *arg)
+{
+	const LionCellsTupSort *ts = (const LionCellsTupSort *) arg;
+	int			x = *(const int *) a;
+	int			y = *(const int *) b;
+	int			c = memcmp(ts->tups + (Size) x * ts->npd,
+						   ts->tups + (Size) y * ts->npd, ts->npd);
+
+	if (c != 0)
+		return c;
+	return (x > y) - (x < y);
+}
+
+/*
+ * Each dimension's outcomes by the truths its predicates have in them
+ * (LionCellsByTruth): every outcome's truths, lion_cells_truth_in()'s,
+ * sorted, and of the outcomes that share theirs only the lowest - the one a
+ * search of the outcomes in their order finds first.  A dimension no
+ * predicate reads has one tuple, the empty one, of outcome 0.  The table is
+ * the plan's alone, the same in every run; it is made once a run in the
+ * labels' memory, which lion_cells_reset() resets with the pointer.  It is a
+ * byte a predicate for each outcome - by the plan at most
+ * 2^LION_CELLS_MAX_BITS + 1 outcomes of a multi-key dimension and
+ * LION_CELLS_MAX_VALUES + 2 of a scalar one - and the radix is checked
+ * against the largest allocation all the same.
+ */
+static void
+lion_cells_bytruth(LionCellsRun *cr)
+{
+	MemoryContext oldcxt;
+	LionCellsByTruth *bt;
+	int			d;
+
+	if (cr->bytruth != NULL)
+		return;
+	oldcxt = MemoryContextSwitchTo(cr->labelcxt);
+	bt = (LionCellsByTruth *) palloc0(sizeof(LionCellsByTruth) *
+									  Max(cr->ndim, 1));
+	for (d = 0; d < cr->ndim; d++)
+	{
+		LionCellsByTruth *t = &bt[d];
+		int			radix = cr->radix[d];
+		Size		width;
+		uint8	   *all;
+		int		   *ord;
+		LionCellsTupSort ts;
+		int			o;
+		int			i;
+		int			p;
+
+		/* the dimension's predicates */
+		t->preds = (int *) palloc(sizeof(int) * Max(cr->npred, 1));
+		for (p = 0; p < cr->npred; p++)
+		{
+			if (cr->pred[p].dim == d)
+				t->preds[t->npd++] = p;
+		}
+		width = (Size) Max(t->npd, 1);
+		if (radix < 0 ||
+			(Size) radix > MaxAllocSize / Max(width, sizeof(int)))
+			elog(ERROR, "LionCount: %d outcomes of cell column %d", radix, d);
+
+		/* every outcome's truths, in the outcomes' order */
+		all = (uint8 *) palloc(width * Max(radix, 1));
+		for (o = 0; o < radix; o++)
+		{
+			for (i = 0; i < t->npd; i++)
+				all[(Size) o * t->npd + i] =
+					lion_cells_truth_in(cr, t->preds[i], o);
+		}
+
+		/* ... the outcomes in the order of their truths, the lowest first */
+		ord = (int *) palloc(sizeof(int) * Max(radix, 1));
+		for (o = 0; o < radix; o++)
+			ord[o] = o;
+		ts.tups = all;
+		ts.npd = t->npd;
+		qsort_arg(ord, radix, sizeof(int), lion_cells_tup_cmp, &ts);
+
+		/* ... and each tuple of truths once, with its lowest outcome */
+		t->tups = (uint8 *) palloc(width * Max(radix, 1));
+		t->outs = (int *) palloc(sizeof(int) * Max(radix, 1));
+		for (i = 0; i < radix; i++)
+		{
+			const uint8 *tup = all + (Size) ord[i] * t->npd;
+
+			if (t->ntup > 0 &&
+				memcmp(tup, t->tups + (Size) (t->ntup - 1) * t->npd,
+					   t->npd) == 0)
+				continue;
+			memcpy(t->tups + (Size) t->ntup * t->npd, tup, t->npd);
+			t->outs[t->ntup++] = ord[i];
+		}
+		pfree(all);
+		pfree(ord);
+		CHECK_FOR_INTERRUPTS();
+	}
+	MemoryContextSwitchTo(oldcxt);
+	cr->bytruth = bt;
+}
+
+/* The outcome whose truths are tup[], by a binary search; -1 if none is */
+static int
+lion_cells_bytruth_find(const LionCellsByTruth *t, const uint8 *tup)
+{
+	int			lo = 0;
+	int			hi = t->ntup;
+
+	while (lo < hi)
+	{
+		int			mid = lo + (hi - lo) / 2;
+		int			c = memcmp(tup, t->tups + (Size) mid * t->npd, t->npd);
+
+		if (c == 0)
+			return t->outs[mid];
+		if (c < 0)
+			hi = mid;
+		else
+			lo = mid + 1;
+	}
+	return -1;
+}
+
 /*
  * The code of the cell a row is in whose predicates have the truths
  * truth[] (LION_TRUTH_*) - of a row the anti join over a small inner side
@@ -616,41 +749,32 @@ lion_cells_truth(const LionCellsRun *cr, int p)
  * most, since the outcomes are the classes of the rows the predicates tell
  * apart - a scalar dimension's values by their truths, a multi-key one's by
  * the leaves true of them, NULL by its own - and one at least, the row's
- * own, which a row in no cell would contradict.
+ * own, which a row in no cell would contradict.  The outcome is found by a
+ * binary search of the dimension's outcomes by their truths
+ * (lion_cells_bytruth()), of no more tuples than the radix or 3^npd: at most
+ * two comparisons of npd bytes a predicate, which the lookups' price has as a
+ * cpu_operator_cost a predicate (lion_anti_price()).
  */
 uint64
-lion_cells_code_of(const LionCellsRun *cr, const uint8 *truth)
+lion_cells_code_of(LionCellsRun *cr, const uint8 *truth)
 {
-	int			preds[LION_CELLS_MAX_PREDS];
+	uint8		tup[LION_CELLS_MAX_PREDS];
 	uint64		code = 0;
 	int			d;
 
 	if (cr->npred > LION_CELLS_MAX_PREDS)
 		elog(ERROR, "LionCount: %d predicates in a count by cells", cr->npred);
+	lion_cells_bytruth(cr);
 	for (d = 0; d < cr->ndim; d++)
 	{
-		int			npd = 0;
+		const LionCellsByTruth *t = &cr->bytruth[d];
 		int			o;
-		int			p;
+		int			i;
 
-		for (p = 0; p < cr->npred; p++)
-		{
-			if (cr->pred[p].dim == d)
-				preds[npd++] = p;
-		}
-		for (o = 0; o < cr->radix[d]; o++)
-		{
-			int			i;
-
-			for (i = 0; i < npd; i++)
-			{
-				if (lion_cells_truth_in(cr, preds[i], o) != truth[preds[i]])
-					break;
-			}
-			if (i == npd)
-				break;
-		}
-		if (o == cr->radix[d])
+		for (i = 0; i < t->npd; i++)
+			tup[i] = truth[t->preds[i]];
+		o = lion_cells_bytruth_find(t, tup);
+		if (o < 0)
 			elog(ERROR, "LionCount: a row of no outcome of cell column %d", d);
 		code += (uint64) o * cr->dims[d].weight;
 	}
