@@ -427,15 +427,24 @@ SELECT format('SELECT cat, count(*) FROM pos_grouped '
 FROM pos_queries;
 -- core's GROUP BYs hash, over a scan whose @@ core charges far below its
 -- time, and a small one can come out the cheaper (DESIGN.md §39, "A hashed
--- aggregate's own rate"): hashing is off here, so that every shape is counted
+-- aggregate's own rate"); so can the sequential scan itself, its @@ an
+-- operator call a row, against a count whose position filters are priced at
+-- what decoding the positions takes (lion_cost_posfilter()), and a GROUP BY
+-- of a row or two is a near tie with a sort of the index's own scan.
+-- Hashing, sorts and sequential scans are off here, so that every shape is
+-- counted
 SET enable_hashagg = off;
+SET enable_seqscan = off;
+SET enable_sort = off;
 CREATE TEMP TABLE pos_or_pushed AS
 SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
-RESET enable_hashagg;
 SET work_mem = '64kB';
 CREATE TEMP TABLE pos_or_narrow AS
 SELECT s, (pos_or_count(s)).* FROM pos_or_shapes;
 RESET work_mem;
+RESET enable_hashagg;
+RESET enable_seqscan;
+RESET enable_sort;
 SET pg_lion.enable_count_pushdown = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;

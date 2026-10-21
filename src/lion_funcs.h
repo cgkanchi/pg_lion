@@ -107,7 +107,7 @@
 #include "lion_count.h"
 
 
-#define LION_STATS_NCOLS		31
+#define LION_STATS_NCOLS		33
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -157,6 +157,7 @@ typedef struct LionVerifyState
 	BlockNumber root;			/* the directory root, from the meta page */
 	uint32		height;
 	bool		allows_narrow;	/* ... and whether it may hold a NARROW (§38) */
+	uint32		inline_limit;	/* ... and the largest INLINE payload (§4) */
 	/* per key column (DESIGN.md §24): at most one of each, per column */
 	int64		nnullentries[INDEX_MAX_KEYS];
 	int64		nemptyentries[INDEX_MAX_KEYS];
@@ -222,10 +223,13 @@ typedef struct LionVerifyState
  */
 #define LION_VERIFY_STANDBY_WALKS	10
 
-/* What one walk of a posting set found (lion_verify_chain()). */
+/*
+ * What one walk of a posting set found (lion_verify_chain()), or of a
+ * position tree (lion_verify_postree()), whose leaves hold members.
+ */
 typedef struct LionVerifySetResult
 {
-	uint64		card;			/* TIDs its leaves hold */
+	uint64		card;			/* TIDs (members) its leaves hold */
 	uint32		ncontainers;	/* items its leaves hold */
 	BlockNumber last;			/* the last leaf of the right-link chain */
 	uint32		height;			/* its root's level */
@@ -288,6 +292,8 @@ extern bool lion_verify_has_block(const BlockNumber *sorted, int n,
 								  BlockNumber blk);
 extern void lion_verify_page_bounds(LionVerifyState *vs, BlockNumber blk,
 									Page page);
+extern uint16 lion_verify_page_flags(LionVerifyState *vs, BlockNumber blk,
+									 Page page);
 extern Page lion_verify_read_page(LionVerifyState *vs, BlockNumber blk,
 								  uint16 kind, Buffer *bufp);
 extern ItemId lion_verify_itemid(LionVerifyState *vs, BlockNumber blk,

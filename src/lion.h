@@ -2081,10 +2081,13 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
 /*
  * A reader's descent of the set rooted at head, stopped at `level`: the page
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
- * For lion_index_verify() (DESIGN.md §7), as lion_dir_search_level() is.
+ * With `before`, the route of what sorts just below ckey, as
+ * lion_posting_search_before() takes it.  For lion_index_verify() (DESIGN.md
+ * §7), as lion_dir_search_level() is.
  */
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
-										uint32 ckey, uint16 level);
+										uint32 ckey, uint16 level,
+										bool before);
 
 /*
  * Take the empty leaf blk out of the posting set (hash, head) while the key
@@ -2346,9 +2349,35 @@ extern int64 lion_container_to_tbm(const LionContainer *c, TIDBitmap *tbm,
  * past it, and returns its size; it returns 0 when the payload is exhausted.
  * Containers stored as page items are always MAXALIGNed by PageAddItem and
  * can be used in place.
+ *
+ * Damage in the payload is an ERROR naming the index and the entry - its
+ * block and offset, which a caller that copied the payload out of the page
+ * keeps for this - with ERRCODE_INDEX_CORRUPTED, as damage in a page item is
+ * (lion_page_item_fetch()).  lion_inline_next() is the same walk returning
+ * the damage instead, for lion_index_stats(), which skips what it cannot read
+ * (DESIGN.md §7), and for a payload the caller built itself.
  */
-extern Size lion_inline_fetch(const char *payload, Size paylen, Size *off,
-							 LionContainer *buf);
+extern Size lion_inline_next(const char *payload, Size paylen, Size *off,
+							 LionContainer *buf, const char **damage);
+pg_noreturn extern void lion_inline_damaged(Relation index, BlockNumber blk,
+											OffsetNumber eoff,
+											const char *damage,
+											const LionContainer *hdr,
+											Size off, Size avail);
+
+static inline Size
+lion_inline_fetch(Relation index, BlockNumber blk, OffsetNumber eoff,
+				  const char *payload, Size paylen, Size *off,
+				  LionContainer *buf)
+{
+	const char *damage;
+	Size		csize = lion_inline_next(payload, paylen, off, buf, &damage);
+
+	if (unlikely(damage != NULL))
+		lion_inline_damaged(index, blk, eoff, damage, buf, *off,
+							paylen - *off);
+	return csize;
+}
 
 /*
  * The positions extension of e, or NULL for an entry without one.  Entries
@@ -2524,6 +2553,7 @@ extern Relation lion_reader_open(Oid indexoid, LionReadPolicy policy,
 								 Snapshot snapshot, const char *action,
 								 Relation *heap);
 extern bool lion_is_partitioned_index(Oid relid);
+extern bool lion_is_lion_index(Oid relid);
 extern void lion_refuse_partitioned_index(Oid relid);
 extern void lion_reader_vet(Relation heap, Relation index, Snapshot snapshot,
 							const char *action);
@@ -2854,6 +2884,8 @@ extern const LionContainer *lion_posfilter_apply(LionPosFilter *pf,
 												 const LionContainer *c);
 extern void lion_posfilter_counts(const LionPosFilter *pf, int64 *nchecked,
 								  int64 *nremoved);
+extern void lion_posfilter_work(const LionPosFilter *pf, int64 *nseeks,
+							   int64 *ndecoded);
 extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,
@@ -2868,9 +2900,18 @@ extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,
  * behind EXPLAIN ANALYZE's "Directory Pages Read" (DESIGN.md §21).  It is a
  * plain process-local counter because every read of a leaf or an internal
  * page goes through one of a handful of places, and the count is only ever
- * used as a difference over a node's execution.
+ * used as a difference over a node's execution, or as a clock.
  */
 extern PGDLLIMPORT int64 lion_dir_pages_read;
+
+/*
+ * Every one of those reads goes through lion_dir_count_read(), which also
+ * marks the index read; lion_dir_read_since() says whether an index was read
+ * since the counter stood at a value - the index-usage statistics of a count
+ * (pg_stat_user_indexes), which report a scan of the indexes it read only.
+ */
+extern void lion_dir_count_read(Relation index);
+extern bool lion_dir_read_since(Oid indexoid, int64 since);
 
 /*
  * The same for the pages of POSTING TREES (DESIGN.md §22) the current backend

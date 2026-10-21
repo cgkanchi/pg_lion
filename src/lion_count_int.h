@@ -220,28 +220,61 @@ typedef struct LionCountCtx
 	 * A test every counted row must pass as well (DESIGN.md §17, "A query
 	 * known only at run time"), or NULL.  With one, the visibility map is not
 	 * asked at all: every candidate goes to the heap, where the row the
-	 * snapshot sees is tested (lion_recheck_heap_filtered()).
+	 * snapshot sees is tested (lion_recheck_heap_filtered()) - unless all it
+	 * holds is position filters (LionRowFilter.pos), which decide each
+	 * container before the map is asked, or posdone (below) says the copy
+	 * among the sources went through them already.  A collection's is its
+	 * LionCollect.filter: only the position filters, which it applies to the
+	 * containers it copies.
 	 */
 	LionRowFilter *filter;
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
 
-	/* TIDs on heap blocks that were not all-visible, in ascending order */
+	/*
+	 * TIDs on heap blocks that were not all-visible: in ascending order as
+	 * one merge produces them, out of it once a later pass of a count taken
+	 * in passes begins at the first key again (passes, below).
+	 */
 	ItemPointerData *tids;
 	int			ntids;
 	int			maxtids;
 	int			batchmax;		/* flush the list once it holds this many */
-	bool		tids_sorted;	/* they came out in order (they always do) */
+	bool		tids_sorted;	/* they came out in order */
+	bool		passes;			/* the count is taken in passes: spill,
+								 * below */
 	int64		recheck_count;	/* rows counted by the batches flushed so far */
 	bool	   *visout;			/* lion_recheck_visible(): where each TID's
 								 * answer goes, by its place in tids; NULL for
 								 * a count */
 
 	/*
+	 * The count is taken in PASSES that each yield the container keys from
+	 * the first again - the entries of a disjoint sum, the batches of a long
+	 * list (DESIGN.md §9 step 5, §15) - so the dirty heap blocks of one pass
+	 * are those of the next as well.  A list that fills up is then not
+	 * rechecked, which would read those blocks again in every later pass,
+	 * but spilled: its TIDs, and every one after them, go to a sort of their
+	 * codes in work_mem, which writes runs to temporary files past that, and
+	 * come back from it in order when the passes are over, every heap block
+	 * read once (lion_recheck_flush()).  tids_spilled counts them.
+	 */
+	struct Tuplesortstate *spill;
+
+	/*
 	 * An EXISTENCE test rather than a count (DESIGN.md §26): stop at the first
 	 * row known to be visible.  lion_exists_settled() is the only reader.
 	 */
 	bool		exists;
+
+	/*
+	 * A source of the count is a copy whose containers went through filter's
+	 * position filters as it was made (LionMatSet.posfiltered): every
+	 * candidate is one of its members, decided already, and the count asks
+	 * nothing of the positions again - lion_count_posfilter() hands every
+	 * container back as it is.
+	 */
+	bool		posdone;
 
 	/*
 	 * Neither: the containers of the intersection are COPIED instead of
@@ -332,6 +365,15 @@ typedef struct LionCollect
 	LionSpill	sp;
 
 	/*
+	 * The row filter of the counts the copy is made for, or NULL: its position
+	 * filters (LionRowFilter.pos) decide every container before it is copied,
+	 * so that the copy holds only the rows their queries match and its counts
+	 * decide nothing from positions again (LionCountCtx.posdone).  Its other
+	 * clauses only the heap can test, and are left to those counts.
+	 */
+	LionRowFilter *filter;
+
+	/*
 	 * A chunk of the intersection only (ranged): its container keys from lo
 	 * up to, not including, hi - what one participant of a parallel plan
 	 * collects of a shared copy (LionSharedCopy), or of the WHERE of a
@@ -411,6 +453,9 @@ typedef struct LionMatSet
 	uint32		dirlen;			/* keys dir[] covers */
 	bool		collected;		/* every item a container, one a key: an
 								 * intersection lion_sources_collect() made */
+	bool		posfiltered;	/* ... whose containers went through the
+								 * position filters of the row filter it was
+								 * collected under (LionCollect.filter) */
 	MemoryContext unioncxt;		/* a range's union in memory: the context
 								 * its containers are in, or NULL */
 

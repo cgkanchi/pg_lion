@@ -1,0 +1,16 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_lock s2_btree s2_table s2_lion s1_commit
+step s1_lock: BEGIN; LOCK TABLE vnl IN SHARE UPDATE EXCLUSIVE MODE;
+step s2_btree: SELECT lion_index_verify('vnl_bt');
+ERROR:  "vnl_bt" is not a lion index
+step s2_table: SELECT lion_index_verify('vnl');
+ERROR:  "vnl" is not an index
+step s2_lion: SELECT lion_index_verify('vnl_lion'); <waiting ...>
+step s1_commit: COMMIT;
+step s2_lion: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+

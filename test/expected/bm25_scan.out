@@ -105,6 +105,36 @@ SELECT bs_same('w4 | w8', 'w4 | w8', 40, 'true', 2.0, 0.3);
  40 rows, 0 differ
 (1 row)
 
+-- a k1 near the largest double, where tf * (k1 + 1) and k1 * L overflowed
+-- and made every score of the scan infinite or NaN: they are finite
+SELECT bs_same('w1 & w2', 'w1 & w2', 10, 'true', 1e308);
+      bs_same      
+-------------------
+ 10 rows, 0 differ
+(1 row)
+
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+	ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) DESC LIMIT 10$$) AS scanned;
+ scanned 
+---------
+ t
+(1 row)
+
+SELECT count(*) AS rows, count(*) FILTER (WHERE s IN ('Infinity', 'NaN')) AS not_finite
+  FROM (SELECT lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) AS s FROM bs_docs
+		 WHERE d @@ 'w1 & w2'
+		 ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 1e308) DESC LIMIT 10) x;
+ rows | not_finite 
+------+------------
+   10 |          0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
 SELECT bs_same('w1 | w5', 'w1 | w5', 20, 'id % 7 = 0');	-- more walks for the filter
       bs_same      
 -------------------
@@ -165,7 +195,8 @@ SELECT bs_same('w1 & !w7:*', 'w1 & !w7:*', 20);
 (1 row)
 
 -- not offered: ascending, no WHERE, a WHERE lexeme the score lacks, a WHERE
--- an empty document matches, a prefix
+-- an empty document matches, a prefix, a k1 the function refuses (whose
+-- error the function raises, below), a relation with LATERAL references
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') LIMIT 10$$) AS asc;
  asc 
@@ -215,6 +246,44 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w9 & !w1'
  f
 (1 row)
 
+SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+	ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 'Infinity') DESC LIMIT 3$$) AS infinite_k1;
+ infinite_k1 
+-------------
+ f
+(1 row)
+
+-- s.ov under the LEFT JOIN is computed by the scan of bs_docs (a
+-- PlaceHolderVar, NULL where no row matches), which so needs o's row: every
+-- path of bs_docs is parameterized by o, and the LionBm25 path is not: it is
+-- not offered, with every other scan disabled too, and the ordinary plan
+-- answers
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT bs_scanned($$SELECT o.v, s.id, s.ov FROM (VALUES (1), (2)) o(v)
+	LEFT JOIN LATERAL (SELECT id, d, o.v AS ov FROM bs_docs WHERE d @@ 'w1') s ON true
+	ORDER BY lion_bm25_score(s.d, 'w1', 'bs_docs_d') DESC, s.id, o.v LIMIT 4$$) AS lateral;
+ lateral 
+---------
+ f
+(1 row)
+
+SELECT o.v, s.id, s.ov, round(lion_bm25_score(s.d, 'w1', 'bs_docs_d')::numeric, 9) AS sc
+  FROM (VALUES (1), (2)) o(v)
+  LEFT JOIN LATERAL (SELECT id, d, o.v AS ov FROM bs_docs WHERE d @@ 'w1') s ON true
+ ORDER BY lion_bm25_score(s.d, 'w1', 'bs_docs_d') DESC, s.id, o.v LIMIT 4;
+ v | id  | ov |     sc      
+---+-----+----+-------------
+ 1 | 988 |  1 | 0.947834788
+ 2 | 988 |  2 | 0.947834788
+ 1 | 252 |  1 | 0.940699124
+ 2 | 252 |  2 | 0.940699124
+(4 rows)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
 SET pg_lion.enable_bm25_scan = off;
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 	ORDER BY lion_bm25_score(d, 'w1', 'bs_docs_d') DESC LIMIT 10$$) AS off;
@@ -424,7 +493,10 @@ DROP TABLE bs_cur;
 SELECT lion_bm25_score(d, 'w1:*', 'bs_docs_d') FROM bs_docs LIMIT 1;
 ERROR:  lion_bm25 cannot rank a prefix lexeme
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_d', -1) FROM bs_docs LIMIT 1;
-ERROR:  k1 must be at least 0 and b between 0 and 1
+ERROR:  k1 must be a finite number of at least 0 and b between 0 and 1
+SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
+ ORDER BY lion_bm25_score(d, 'w1 & w2', 'bs_docs_d', 'Infinity') DESC LIMIT 3;
+ERROR:  k1 must be a finite number of at least 0 and b between 0 and 1
 CREATE INDEX bs_docs_plain ON bs_docs USING lion (d) WITH (store_positions = false);
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_plain') FROM bs_docs LIMIT 1;
 ERROR:  lion index "bs_docs_plain" does not store positions

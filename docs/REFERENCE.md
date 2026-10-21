@@ -43,10 +43,11 @@ are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats
 `pg_stat_scan_tables`.
 `lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
 CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the index, so INSERT,
-UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it.
-What a concurrent insert could make look wrong it checks again once the statements that were writing
-the index have ended, so it may wait for them - for as long as statement_timeout and lock_timeout
-allow - but never reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
+UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it;
+a relation that is not a lion index is refused before either is locked.  What a concurrent insert
+could make look wrong it checks again once the statements that were writing the index have ended,
+so it may wait for them - for as long as statement_timeout and lock_timeout allow - but never
+reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
 no page while it waits for another that replay may hold, and is exact only while replay leaves the
 index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
 its totals were not compared.  With `heapallindexed` it evaluates the index's expressions as the
@@ -206,10 +207,11 @@ key); the heap is read only to check that the rows returned are visible. Join on
       JOIN doc d ON d.ctid = s.ctid
      ORDER BY s.score DESC;
 
-The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default) over the query's lexemes, each counted
-once; lexemes under a NOT do not score, and operators, phrases and weights do not change it, so add
-`WHERE d.tsv @@ query` to keep only rows that match the query as a whole. A prefix lexeme (`foo:*`)
-cannot be ranked and is an error, except under a NOT, where it does not score either. As in a search
+The score is Lucene's BM25 (`k1` 1.2 and `b` 0.75 by default; `k1` any finite number from 0, `b`
+from 0 to 1) over the query's lexemes, each counted once; lexemes under a NOT do not score, and
+operators, phrases and weights do not change it, so add `WHERE d.tsv @@ query` to keep only rows that
+match the query as a whole. A prefix lexeme (`foo:*`) cannot be ranked and is an error, except under a
+NOT, where it does not score either. As in a search
 engine, the statistics count deleted rows until VACUUM removes them, and a backend keeps the mean
 row length it read until the row count moves by more than 1/64. Rows that cannot reach the top `k`
 are skipped (MaxScore), so a very common lexeme next to rarer ones costs little. Like the counts,
@@ -585,8 +587,11 @@ the number of rows whose key in that column is NULL, and `empty_tids`,
 the number of rows a multi-key opclass extracted no key from (an array with no elements, a tsvector
 with no lexemes), `ndistinct`, the distinct keys
 the planner is given for the column (DESIGN.md §33; NULL where none is recorded),
-`narrow_containers`, the column's NARROW containers (DESIGN.md §38), and, last, `nullelem_tids`,
-the number of rows whose array has elements and all of them NULL (DESIGN.md §17).  `slack_bytes` and
+`narrow_containers`, the column's NARROW containers (DESIGN.md §38), `nullelem_tids`,
+the number of rows whose array has elements and all of them NULL (DESIGN.md §17), and, last,
+`position_pages` and `position_internal_pages`, the leaves and the pages above them of the column's
+position trees (an index built with `store_positions`, DESIGN.md §17), which `container_pages`,
+`posting_internal_pages` and `max_posting_height` leave out.  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the
@@ -830,6 +835,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `position_member_cost` | 1.8 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
+| `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
 | `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan competing with an FK-side join, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |

@@ -64,6 +64,7 @@
 
 #include <math.h>
 
+#include "access/amapi.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/tableam.h"
@@ -163,16 +164,89 @@ typedef struct LionEndpoint
 } LionEndpoint;
 
 /*
- * The ends read in one planner run.  A run is one PlannerGlobal, shared by
- * every PlannerInfo of the query; the cache lives in the memory that holds it
+ * WHAT ONE PLANNER RUN KEEPS.  A run is one PlannerGlobal, shared by every
+ * PlannerInfo of the query; what it keeps lives in the memory that holds it
  * and is forgotten when that memory is reset or deleted.  While it exists no
  * other PlannerGlobal can be at the same address, so a new run - even one
- * planned in the same memory - always starts a new cache.
+ * planned in the same memory - always starts anew.
+ *
+ * Runs nest: an estimate evaluates a stable function in the query, and a
+ * function that runs a query of its own plans it in a run of its own, inside
+ * the outer one's planning - between a plain path's noting its remainder and
+ * its paying it (lion_plain_note_remainder()), say.  So each live run keeps
+ * its own, on a list the innermost first, and the inner run's leaves the
+ * outer's as they were.
  */
+typedef struct LionRunCache
+{
+	PlannerGlobal *glob;		/* the run */
+	MemoryContext cxt;			/* the memory that holds it, and this */
+	struct LionRunCache **list; /* the list this is on */
+	struct LionRunCache *next;	/* the run it is nested in, or another */
+} LionRunCache;
+
+/* The run's memory is going: off the list with it. */
+static void
+lion_run_cache_forget(void *arg)
+{
+	LionRunCache *c = (LionRunCache *) arg;
+	LionRunCache **p;
+
+	for (p = c->list; *p != NULL; p = &(*p)->next)
+	{
+		if (*p == c)
+		{
+			*p = c->next;
+			break;
+		}
+	}
+}
+
+/* root's run's entry of *list, or NULL */
+static LionRunCache *
+lion_run_cache_find(LionRunCache *list, PlannerInfo *root)
+{
+	for (; list != NULL; list = list->next)
+	{
+		if (list->glob == root->glob)
+			return list;
+	}
+	return NULL;
+}
+
+/*
+ * root's run's entry of *list, of size bytes (a struct that begins with a
+ * LionRunCache), zeroed when it is new.
+ */
+static LionRunCache *
+lion_run_cache_for(LionRunCache **list, PlannerInfo *root, Size size)
+{
+	LionRunCache *c = lion_run_cache_find(*list, root);
+	MemoryContext cxt;
+	MemoryContextCallback *cb;
+
+	if (c != NULL)
+		return c;
+
+	Assert(size >= sizeof(LionRunCache));
+	cxt = GetMemoryChunkContext(root->glob);
+	c = (LionRunCache *) MemoryContextAllocZero(cxt, size);
+	cb = (MemoryContextCallback *) MemoryContextAlloc(cxt, sizeof(*cb));
+	c->glob = root->glob;
+	c->cxt = cxt;
+	c->list = list;
+	c->next = *list;
+	cb->func = lion_run_cache_forget;
+	cb->arg = c;
+	MemoryContextRegisterResetCallback(cxt, cb);
+	*list = c;
+	return c;
+}
+
+/* The ends read in one planner run, and the probes' other findings. */
 typedef struct LionProbeCache
 {
-	PlannerGlobal *glob;
-	MemoryContext cxt;
+	LionRunCache run;
 	List	   *ends;			/* LionEndpoint */
 	List	   *remainders;		/* LionPlainRemainder */
 	List	   *isects;			/* LionIsect: the intersection probe's */
@@ -183,39 +257,20 @@ typedef struct LionProbeCache
 	List	   *rowsfixed;		/* RelOptInfos whose rows the probe corrected */
 } LionProbeCache;
 
-static LionProbeCache lion_probe_cache;
-
-static void
-lion_probe_cache_reset(void *arg)
-{
-	if (lion_probe_cache.glob == (PlannerGlobal *) arg)
-		memset(&lion_probe_cache, 0, sizeof(lion_probe_cache));
-}
+static LionRunCache *lion_probe_caches = NULL;
 
 static LionProbeCache *
 lion_probe_cache_for(PlannerInfo *root)
 {
-	if (lion_probe_cache.glob != root->glob)
-	{
-		MemoryContext cxt = GetMemoryChunkContext(root->glob);
-		MemoryContextCallback *cb;
+	return (LionProbeCache *) lion_run_cache_for(&lion_probe_caches, root,
+												 sizeof(LionProbeCache));
+}
 
-		cb = (MemoryContextCallback *) MemoryContextAlloc(cxt, sizeof(*cb));
-		cb->func = lion_probe_cache_reset;
-		cb->arg = root->glob;
-		MemoryContextRegisterResetCallback(cxt, cb);
-
-		lion_probe_cache.glob = root->glob;
-		lion_probe_cache.cxt = cxt;
-		lion_probe_cache.ends = NIL;
-		lion_probe_cache.remainders = NIL;
-		lion_probe_cache.isects = NIL;
-		lion_probe_cache.rowsfixed = NIL;
-		lion_probe_cache.nisectprobes = 0;
-		lion_probe_cache.isectbuffers = 0;
-		lion_probe_cache.isectwidest = 0;
-	}
-	return &lion_probe_cache;
+/* ... or NULL where root's run has none yet */
+static LionProbeCache *
+lion_probe_cache_find(PlannerInfo *root)
+{
+	return (LionProbeCache *) lion_run_cache_find(lion_probe_caches, root);
 }
 
 /* ---------------------------------------------------------------------
@@ -391,15 +446,16 @@ lion_probe_member(uint16 lo, void *arg)
 }
 
 /*
- * Does the entry, a private copy of itemsz bytes, hold a row the probe
- * accepts?  Its members are read in heap order until one does, through a
- * stream of its one set that pins nothing between containers (DESIGN.md
- * §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set VACUUM has
- * freed since reads as empty (DESIGN.md §18).
+ * Does the entry, a private copy of itemsz bytes of entry off on leaf blk,
+ * hold a row the probe accepts?  Its members are read in heap order until one
+ * does, through a stream of its one set that pins nothing between containers
+ * (DESIGN.md §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set
+ * VACUUM has freed since reads as empty (DESIGN.md §18).
  */
 static bool
 lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
-					   LionEntryTuple *entry, Size itemsz)
+					   LionEntryTuple *entry, Size itemsz, BlockNumber blk,
+					   OffsetNumber off)
 {
 	LionPostingSet ps;
 	LionSetStream *st;
@@ -415,8 +471,8 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 	ps.pinbuf = InvalidBuffer;
 	ps.ntids = lion_entry_ntids(entry);
 	ps.ncontainers = lion_entry_ncontainers(entry);
-	ps.entryblk = InvalidBlockNumber;
-	ps.entryoff = InvalidOffsetNumber;
+	ps.entryblk = blk;
+	ps.entryoff = off;
 	ps.cxt = CurrentMemoryContext;
 	if ((entry->flags & LION_ENTRY_INLINE) != 0)
 	{
@@ -474,6 +530,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	char	   *copy = (char *) palloc(BLCKSZ);
 	LionEntryTuple **items;
 	Size	   *sizes;
+	OffsetNumber *offs;
 	int			maxitems;
 	OffsetNumber boundary;
 	Buffer		buf;
@@ -488,6 +545,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData)) + 1;
 	items = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * maxitems);
 	sizes = (Size *) palloc(sizeof(Size) * maxitems);
+	offs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxitems);
 
 	buf = last ? lion_dir_value_end(index, state, &boundary) :
 		lion_dir_value_start(index, state, &boundary);
@@ -554,6 +612,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			memcpy(dst, entry, sz);
 			items[n] = (LionEntryTuple *) dst;
 			sizes[n] = sz;
+			offs[n] = off;
 			n++;
 			dst += MAXALIGN(sz);
 		}
@@ -567,7 +626,8 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 		{
 			int			k = last ? n - 1 - i : i;
 
-			if (lion_probe_entry_alive(ph, index, items[k], sizes[k]))
+			if (lion_probe_entry_alive(ph, index, items[k], sizes[k], blkno,
+									   offs[k]))
 			{
 				*value = datumCopy(lion_entry_key(state, items[k]),
 								   state->typbyval, state->typlen);
@@ -604,6 +664,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 
 	pfree(items);
 	pfree(sizes);
+	pfree(offs);
 	pfree(copy);
 	return found;
 }
@@ -704,7 +765,7 @@ lion_probe_endpoint(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
 	}
 	if (ep == NULL)
 	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(cache->cxt);
+		MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 
 		ep = (LionEndpoint *) palloc0(sizeof(*ep));
 		ep->relid = rte->relid;
@@ -747,7 +808,7 @@ lion_probe_endpoint(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
 				lion_probe_miss_note(rel, idx, rte->relid, col, last);
 			if (found)
 			{
-				MemoryContextSwitchTo(cache->cxt);
+				MemoryContextSwitchTo(cache->run.cxt);
 				ep->value[end] = datumCopy(key, state->typbyval,
 										   state->typlen);
 				MemoryContextSwitchTo(probecxt);
@@ -812,23 +873,46 @@ lion_probe_ends_wanted(AttStatsSlot *sslot, FmgrInfo *opproc, Oid collation,
 }
 
 /*
- * Would core read this column's ends itself, from an ordered index that can
- * return its first column (get_actual_variable_range())?  Then every estimate
- * of the column is corrected already, lion's among them.
+ * Would core read this column's ends itself, for a histogram sorted by sortop
+ * under collation (get_actual_variable_range())?  Then every estimate of the
+ * column is corrected already, lion's among them.  Core's own tests of an
+ * index: ordered, whole, real, able to return its first column - which is the
+ * column, under the histogram's collation, in an order that sortop or its
+ * commutator is the `<` of.  A btree on the column under another collation,
+ * or text_pattern_ops under text's own `<`, is passed over by core, and the
+ * column is lion's to probe.
  */
 static bool
-lion_core_probes(RelOptInfo *rel, AttrNumber attno)
+lion_core_probes(RelOptInfo *rel, AttrNumber attno, Oid sortop, Oid collation)
 {
 	ListCell   *lc;
 
 	foreach(lc, rel->indexlist)
 	{
 		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			strategy;
 
-		if (idx->sortopfamily != NULL && idx->indpred == NIL &&
-			!idx->hypothetical && idx->canreturn[0] &&
-			idx->indexkeys[0] == attno)
+		if (idx->sortopfamily == NULL || idx->indpred != NIL ||
+			idx->hypothetical || !idx->canreturn[0] ||
+			idx->indexcollations[0] != collation ||
+			idx->indexkeys[0] != attno)
+			continue;
+		strategy = get_op_opfamily_strategy(sortop, idx->sortopfamily[0]);
+#if PG_VERSION_NUM >= 180000
+		switch (IndexAmTranslateStrategy(strategy, idx->relam,
+										 idx->sortopfamily[0], true))
+		{
+			case COMPARE_LT:
+			case COMPARE_GT:
+				return true;
+			default:
+				break;
+		}
+#else
+		if (strategy == BTLessStrategyNumber ||
+			strategy == BTGreaterStrategyNumber)
 			return true;
+#endif
 	}
 	return false;
 }
@@ -1105,7 +1189,9 @@ lion_probe_clause(PlannerInfo *root, RelOptInfo *rel, Node *clause,
 									   LION_STRAT_IS_LOWER(strategy),
 									   ((Const *) other)->constvalue,
 									   first, last);
-				if (*first || *last)
+				if ((*first || *last) &&
+					!lion_core_probes(rel, ((Var *) node)->varattno,
+									  sslot.staop, sslot.stacoll))
 					attno = ((Var *) node)->varattno;
 			}
 			free_attstatsslot(&sslot);
@@ -1163,7 +1249,7 @@ lion_probe_begin(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 		LionProbeAtt *att = NULL;
 		ListCell   *lc2;
 
-		if (attno == 0 || lion_core_probes(rel, attno))
+		if (attno == 0)
 			continue;
 		foreach(lc2, atts)
 		{
@@ -1623,22 +1709,60 @@ lion_neq_same_run(const LionNeqClause *a, const LionNeqClause *b)
  * values: eqsel()'s own frequency of each, through var_eq_const() as
  * neqsel() asks it, and the expression's null fraction, which neqsel()
  * takes away once a clause.
+ *
+ * The disjoint share, 1 - nullfrac - the sum of the frequencies, stands only
+ * while that sum is no more than the rows that are not NULL.  Past them, the
+ * frequencies cannot all be right: each value that is not a most common one
+ * is taken at the average of the others, as if it were in the column, and a
+ * run of more of them than the column has - values that are mostly in no row,
+ * `k NOT IN` a list of other keys - adds up to more than every row.  Clamped
+ * to 0, the share would be one row, and every join above it sized for one
+ * row where the run keeps 200,000.  So there, as scalararraysel() does for
+ * `<> ALL`, the values are taken as independent instead: the rows not NULL,
+ * times the product of each value's share of them left out.  Their share of
+ * the rows not NULL, not of every row, so that the NULLs are still taken
+ * away once - which scalararraysel()'s product, of neqsel()'s per value,
+ * does not.  A table never analyzed is no different: each value is taken at
+ * one over the default count of distinct values, with no NULL, and a run of
+ * more than that many is past every row.
+ *
+ * Up to the rows not NULL means to the rounding of the statistics: their
+ * frequencies are float4s, so a run of every value a column has - all of
+ * them most common ones - can come out past those rows by some parts in
+ * 10^8 alone (LION_NEQ_RUN_SLACK).  That is the disjoint share's 0: every
+ * row is left out.
  */
+#define LION_NEQ_RUN_SLACK	1e-6
+
 static Selectivity
 lion_neq_run_sel(PlannerInfo *root, int varRelid, Node *expr, Oid eqop,
 				 Oid collid, const Datum *values, int n)
 {
 	VariableStatData vardata;
-	double		sel = 1.0;
+	double		nullfrac = 0.0;
+	double		notnull;
+	double		disjoint;
+	double		independent = 1.0;
+	double		sel;
 	int			i;
 
 	examine_variable(root, expr, varRelid, &vardata);
 	if (HeapTupleIsValid(vardata.statsTuple))
-		sel -= ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+		nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+	CLAMP_PROBABILITY(nullfrac);
+	notnull = 1.0 - nullfrac;
+	disjoint = notnull;
 	for (i = 0; i < n; i++)
-		sel -= var_eq_const(&vardata, eqop, collid, values[i], false, true,
-							false);
+	{
+		double		freq = var_eq_const(&vardata, eqop, collid, values[i],
+										false, true, false);
+
+		disjoint -= freq;
+		if (notnull > 0)
+			independent *= 1.0 - Min(freq / notnull, 1.0);
+	}
 	ReleaseVariableStats(vardata);
+	sel = (disjoint >= -LION_NEQ_RUN_SLACK) ? disjoint : notnull * independent;
 	CLAMP_PROBABILITY(sel);
 	return (Selectivity) sel;
 }
@@ -3726,7 +3850,7 @@ static LionIsect *
 lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
 					const LionIsectClause *cl, double factor, bool measured)
 {
-	MemoryContext oldcxt = MemoryContextSwitchTo(cache->cxt);
+	MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	LionIsect  *e = (LionIsect *) palloc(sizeof(LionIsect));
 	int			i;
 
@@ -4229,6 +4353,7 @@ double
 lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 {
 	LionProbeScope *scope;
+	LionProbeCache *cache;
 	double		rows = rel->rows;
 	double		factor;
 	List	   *canon;
@@ -4254,8 +4379,8 @@ lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel)
 		}
 	}
 	/* rel->rows already is what this would compute (lion_correct_rel_rows()) */
-	if (!scoped && lion_probe_cache.glob == root->glob &&
-		list_member_ptr(lion_probe_cache.rowsfixed, rel))
+	if (!scoped && (cache = lion_probe_cache_find(root)) != NULL &&
+		list_member_ptr(cache->rowsfixed, rel))
 		return clamp_row_est(rows);
 	factor = lion_isect_rel_factor(root, rel);
 	if (!scoped)
@@ -4342,7 +4467,7 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 	if (root == NULL || root->glob == NULL || remainder <= 0)
 		return;
 	cache = lion_probe_cache_for(root);
-	oldcxt = MemoryContextSwitchTo(cache->cxt);
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	r = (LionPlainRemainder *) palloc(sizeof(LionPlainRemainder));
 	r->path = path;
 	r->remainder = remainder;
@@ -4469,7 +4594,9 @@ lion_correct_path_rows(List *paths, List *ppilist, const double *ppirows,
  *
  * Only a plain relation of its own: an inheritance parent's rows are its
  * children's sum, made before any child's paths are built, and a child's
- * correction would not reach it.
+ * correction would not reach it.  And not one proven empty: a dummy rel has
+ * no rows whatever its clauses say, and the joins above it are sized from
+ * that 0.
  */
 static void
 lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
@@ -4481,12 +4608,14 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	double	   *ppirows;
 	List	   *canon;
 	bool		changed;
+	LionProbeCache *cache;
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
 	if (!lion_enable_rows_correction ||
 		root->glob == NULL || rel->reloptkind != RELOPT_BASEREL ||
-		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL)
+		rte->rtekind != RTE_RELATION || rte->inh || rel->indexlist == NIL ||
+		IS_DUMMY_REL(rel))
 		return;
 	/* 1.0 where the probe is off or found nothing to correct */
 	factor = lion_isect_rel_factor(root, rel);
@@ -4518,8 +4647,9 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	pfree(ppirows);
 
 	/* lion_probe_rel_rows() reads it as it is from here on */
-	oldcxt = MemoryContextSwitchTo(lion_probe_cache_for(root)->cxt);
-	lion_probe_cache.rowsfixed = lappend(lion_probe_cache.rowsfixed, rel);
+	cache = lion_probe_cache_for(root);
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+	cache->rowsfixed = lappend(cache->rowsfixed, rel);
 	MemoryContextSwitchTo(oldcxt);
 }
 
@@ -4546,6 +4676,8 @@ static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							RangeTblEntry *rte)
 {
+	LionProbeCache *cache;
+
 	lion_correct_rel_rows(root, rel, rte);
 
 #if PG_VERSION_NUM < 180000
@@ -4557,7 +4689,8 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * lion path does.
 	 */
 	if (rel->reloptkind == RELOPT_BASEREL && rte->rtekind == RTE_RELATION &&
-		rel->indexlist != NIL && !lion_old_snapshot_threshold_active())
+		rel->indexlist != NIL && !IS_DUMMY_REL(rel) &&
+		!lion_old_snapshot_threshold_active())
 	{
 		Oid			amoid = lion_get_am_oid();
 		List	   *lionidx = NIL;
@@ -4576,8 +4709,8 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 #endif
 
-	if (root->glob != NULL && lion_probe_cache.glob == root->glob &&
-		lion_probe_cache.remainders != NIL)
+	if (root->glob != NULL && (cache = lion_probe_cache_find(root)) != NULL &&
+		cache->remainders != NIL)
 	{
 		List	   *repriced = NIL;
 		ListCell   *lc;
@@ -4591,7 +4724,7 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 			if (!IsA(p, IndexPath) || p->pathtype != T_IndexScan ||
 				p->param_info != NULL)
 				continue;
-			foreach(lc2, lion_probe_cache.remainders)
+			foreach(lc2, cache->remainders)
 			{
 				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
 
@@ -4716,43 +4849,27 @@ typedef struct LionNdistinctRow
 
 typedef struct LionNdistinctCache
 {
-	PlannerGlobal *glob;
-	MemoryContext cxt;
+	LionRunCache run;
 	Oid			amoid;			/* lion's, or InvalidOid without the AM */
 	List	   *indexes;		/* LionNdistinctIndex */
 	List	   *rows;			/* LionNdistinctRow */
 } LionNdistinctCache;
 
-static LionNdistinctCache lion_nd_cache;
-
-static void
-lion_nd_cache_reset(void *arg)
-{
-	if (lion_nd_cache.glob == (PlannerGlobal *) arg)
-		memset(&lion_nd_cache, 0, sizeof(lion_nd_cache));
-}
+static LionRunCache *lion_nd_caches = NULL;
 
 /* The cache of root's planner run, as lion_probe_cache_for() keeps its own. */
 static LionNdistinctCache *
 lion_nd_cache_for(PlannerInfo *root)
 {
-	if (lion_nd_cache.glob != root->glob)
+	LionRunCache *c = lion_run_cache_find(lion_nd_caches, root);
+
+	if (c == NULL)
 	{
-		MemoryContext cxt = GetMemoryChunkContext(root->glob);
-		MemoryContextCallback *cb;
-
-		cb = (MemoryContextCallback *) MemoryContextAlloc(cxt, sizeof(*cb));
-		cb->func = lion_nd_cache_reset;
-		cb->arg = root->glob;
-		MemoryContextRegisterResetCallback(cxt, cb);
-
-		lion_nd_cache.glob = root->glob;
-		lion_nd_cache.cxt = cxt;
-		lion_nd_cache.amoid = lion_get_am_oid();
-		lion_nd_cache.indexes = NIL;
-		lion_nd_cache.rows = NIL;
+		c = lion_run_cache_for(&lion_nd_caches, root,
+							   sizeof(LionNdistinctCache));
+		((LionNdistinctCache *) c)->amoid = lion_get_am_oid();
 	}
-	return &lion_nd_cache;
+	return (LionNdistinctCache *) c;
 }
 
 /* The copies belong to the planner run's memory, not to the caller. */
@@ -4780,7 +4897,7 @@ lion_nd_index(LionNdistinctCache *cache, Oid indexoid)
 			return ent;
 	}
 
-	oldcxt = MemoryContextSwitchTo(cache->cxt);
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	ent = (LionNdistinctIndex *) palloc0(sizeof(LionNdistinctIndex));
 	ent->indexoid = indexoid;
 	cache->indexes = lappend(cache->indexes, ent);
@@ -4816,7 +4933,7 @@ static LionNdistinctRow *
 lion_nd_remember(LionNdistinctCache *cache, Oid relid, AttrNumber attnum,
 				 HeapTuple stats, float4 stadistinct)
 {
-	MemoryContext oldcxt = MemoryContextSwitchTo(cache->cxt);
+	MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	LionNdistinctRow *row;
 
 	row = (LionNdistinctRow *) palloc(sizeof(LionNdistinctRow));

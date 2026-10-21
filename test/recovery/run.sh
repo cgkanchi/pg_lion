@@ -23,11 +23,11 @@
 #              Phase 2 then expects the standby to TRUST the visibility map,
 #              which is the property §25 buys.
 #   --phases   which phases to run, e.g. "3" or "2 3" (default: all of
-#              "1 1b 1c 1d 1e 1f 1g 2 3 4 5").  For development, and for a
-#              server without injection points, which can run only "1 1f 2 4
-#              5" (CI's packaged-server jobs do; phase 5 then leaves out its
-#              one case that needs them); `make recovery-check` always runs
-#              everything.
+#              "1 1b 1c 1d 1e 1f 1g 1h 2 3 4 5").  For development, and for a
+#              server without injection points, which can run only "1 1f 1h
+#              2 4 5" (CI's packaged-server jobs do; phase 5 then leaves out
+#              its one case that needs them); `make recovery-check` always
+#              runs everything.
 #   --conf     an extra postgresql.conf line for the primary (repeatable),
 #              appended last so it wins.  This is how
 #              wal_consistency_checking = 'pg_lion' is turned on:
@@ -137,7 +137,7 @@ REQUIRE_PGVECTOR=${PGVECTOR:-0}
 ITERS=8
 KEEP=0
 MODE=generic
-PHASES="1 1b 1c 1d 1e 1f 1g 2 3 4 5"
+PHASES="1 1b 1c 1d 1e 1f 1g 1h 2 3 4 5"
 EXTRA_CONF=()
 
 # Set by make_private_dirs(), which the main section calls once the arguments
@@ -1631,6 +1631,111 @@ phase1g() {
 	SUMMARY+=("phase1g            crash between a promotion and its split; the next insert split the leaf")
 }
 
+# ---------------------------------------------------------------- phase 1h
+
+# The index free space map is not WAL-logged (DESIGN.md §18, "The free space
+# map holds only pages that may be handed out"): with data checksums a change
+# to one of its pages is logged only as the full-page image of its first
+# change after a checkpoint, so a crash brings back entries for pages that
+# allocations had taken and that are in use again.  An allocation offered
+# one must refuse it and NOT record it again, or the entry outlives every
+# later VACUUM - which records only free pages and never clears an entry -
+# and every allocation pays for it.
+phase1h() {
+	local off ev live
+	log ""
+	log "=== phase 1h: free space map entries a crash left on pages in use ==="
+
+	if [ "$(psql_p -tAc "select count(*) from pg_available_extensions where name in ('pg_freespacemap', 'pageinspect')" 2>>"$RUNLOG" || true)" != 2 ]; then
+		log "phase 1h skipped: this server has no pg_freespacemap or no pageinspect"
+		SUMMARY+=("phase1h            skipped (no pg_freespacemap or no pageinspect)")
+		return 0
+	fi
+
+	# lion_fsm_live(idx): how many blocks the map lists as free that hold a
+	# page in use - neither all-zero, nor DELETED (flag 8), nor an UNLINKED
+	# posting leaf (512); the flags are the uint16 at offset 26 of the
+	# special area (lion_page.h).
+	#
+	# The fixture: 100000 unique keys, half of them deleted and vacuumed;
+	# the second VACUUM, after an xid has been spent, records the pages the
+	# first one freed.  The checkpoint after it is what makes the map's
+	# next changes reach the WAL as nothing but one image per map page.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1h: fixture failed"
+		SET synchronous_commit = on;
+		CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
+		CREATE EXTENSION IF NOT EXISTS pageinspect;
+		CREATE OR REPLACE FUNCTION lion_fsm_live(idx regclass) RETURNS bigint
+		LANGUAGE sql AS \$\$
+			SELECT count(*)
+			  FROM pg_freespace(idx) f,
+				   LATERAL get_raw_page(idx::text, f.blkno::int) r,
+				   LATERAL page_header(r) h
+			 WHERE f.avail > 0 AND f.blkno > 0 AND h.lower > 0
+			   AND (get_byte(r, h.special + 26) +
+					256 * get_byte(r, h.special + 27)) & (8 | 512) = 0
+		\$\$;
+		DROP TABLE IF EXISTS lion_fsm;
+		CREATE TABLE lion_fsm (id int, k int) WITH (autovacuum_enabled = off);
+		INSERT INTO lion_fsm SELECT i, i FROM generate_series(1, 100000) i;
+		CREATE INDEX lion_fsm_k ON lion_fsm USING lion (k);
+		DELETE FROM lion_fsm WHERE id BETWEEN 10001 AND 60000;
+		VACUUM lion_fsm;
+		SELECT txid_current();
+		VACUUM lion_fsm;
+		CHECKPOINT;
+	SQL
+	run_check "phase 1h before" psql_p \
+		"select (select count(*) from pg_freespace('lion_fsm_k') where avail > 0) > 100,
+				'the map holds the pages the delete freed'
+		 union all
+		 select lion_fsm_live('lion_fsm_k') = 0, 'and no page in use'"
+
+	# The inserts take the pages the map lists; their commit flushes the
+	# map pages' images, each with its first change only.
+	off=$(stat -c %s "$PRIMARY_LOG")
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1h: insert failed"
+		SET synchronous_commit = on;
+		INSERT INTO lion_fsm SELECT i, i FROM generate_series(200001, 250000) i;
+	SQL
+	crash_immediate
+	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
+	verify_node psql_p "$PRIMARY_DATA"
+	ev=$(recovery_evidence "$off")
+	GENERIC_TOTAL=$((GENERIC_TOTAL + ${ev#* }))
+
+	# The precondition: without it nothing below tests anything.
+	live=$(psql_p -tAc "select lion_fsm_live('lion_fsm_k')") ||
+		die "phase 1h: could not read the free space map"
+	[ "$live" -gt 0 ] ||
+		die "phase 1h: the crash left no map entry on a page in use: nothing was tested"
+
+	# Allocations are offered those pages, refuse each and drop its entry.
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1h: insert after the crash failed"
+		SET synchronous_commit = on;
+		INSERT INTO lion_fsm SELECT i, i FROM generate_series(300001, 330000) i;
+	SQL
+	run_check "phase 1h after" psql_p \
+		"select lion_fsm_live('lion_fsm_k') = 0,
+				format('the inserts dropped the %s entries on pages in use',
+					   $live)
+		 union all
+		 select true, 'verify() is clean'
+		   from (select lion_index_verify('lion_fsm_k', true)) v
+		 union all
+		 select (select count(*) from lion_fsm) = 130000 and
+				(select count(*) from lion_fsm where k between 200001 and 330000) = 80000,
+				'the rows answer exactly'
+		 union all
+		 select ntids = 130000, 'ntids agrees with the heap'
+		   from lion_index_stats('lion_fsm_k')"
+
+	psql_p -c "DROP TABLE lion_fsm; DROP FUNCTION lion_fsm_live(regclass)" >>"$RUNLOG" 2>&1
+
+	log "phase 1h: $live map entries the crash left on pages in use were dropped by the next allocations"
+	SUMMARY+=("phase1h            $live stale map entries after a crash; the next inserts dropped them")
+}
+
 # ---------------------------------------------------------------- phase 2
 
 basebackup_standby() {
@@ -2702,6 +2807,7 @@ want_phase 1d && phase1d
 want_phase 1e && phase1e
 want_phase 1f && phase1f
 want_phase 1g && phase1g
+want_phase 1h && phase1h
 want_phase 2 && phase2
 want_phase 3 && phase3
 want_phase 4 && phase4

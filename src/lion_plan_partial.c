@@ -440,7 +440,8 @@ lion_partial_run_held(const LionCountTarget *t, List *clauseinfos, List *ors,
  * walk (lion_run_has_plain_source(), lion_count_runs())?  Asked as the
  * executor asks it, of the clauses the run keeps: an equality, a list,
  * `IS NULL` or the rows of an array column's reserved entries (§17), or an
- * OR with no range among its leaves.
+ * OR with no range among its leaves and no complement arm (DESIGN.md §35,
+ * "Complements in an OR"), which selects nothing by itself.
  */
 static bool
 lion_partial_run_plain(const LionCountTarget *t, List *clauseinfos, List *ors,
@@ -470,7 +471,8 @@ lion_partial_run_plain(const LionCountTarget *t, List *clauseinfos, List *ors,
 		int			j;
 
 		if (!lion_partial_in_run((LionClauseInfo *) list_nth(clauseinfos,
-															 first), r))
+															 first), r) ||
+			((LionClauseInfo *) list_nth(clauseinfos, first))->incompl)
 			continue;
 		for (a = 0; a < narms; a++)
 			nleaves += list_nth_int(one, 2 + a);
@@ -529,8 +531,17 @@ lion_partial_anchored(List *targets, List *clauseinfos, List *ors,
 
 		if (p == NULL)
 		{
-			/* nothing is left out unless every relation has one */
+			/*
+			 * A relation with no partial index counts all its rows, which is
+			 * exact only where nothing was left out of the WHERE - and
+			 * lion_partial_drops() leaves a restriction out only when every
+			 * relation of the scope has one.  A relation counted here that
+			 * the scope does not know would have its rows outside the
+			 * predicate counted: the attempt is declined.
+			 */
 			Assert(s->dropped == NIL);
+			if (s->dropped != NIL)
+				return false;
 			continue;
 		}
 		for (d = 0; d < ndrive && d < LION_MAX_GROUPCOLS; d++)
