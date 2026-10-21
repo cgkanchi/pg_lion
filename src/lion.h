@@ -1908,7 +1908,8 @@ extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
  * when the leaf is empty it takes it out of the tree - with the internal pages
  * above it that have no other child - or it finishes doing so for a leaf an
  * earlier VACUUM left HALF_DEAD.  Nothing may be held on entry, and the
- * return value is the number of pages it marked DELETED.
+ * return value is the number of pages it marked DELETED.  strategy is
+ * VACUUM's (info->strategy), which the leaf is looked at through.
  *
  * lion_dir_past_deleted() hands back buf, a directory page locked in
  * lockmode, or - when that page is DELETED - the first page to its right that
@@ -1916,7 +1917,8 @@ extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
  * page's high key.
  */
 extern int	lion_dir_delete_page(Relation index, LionIndexState *ix,
-								 BlockNumber leafblk);
+								 BlockNumber leafblk,
+								 BufferAccessStrategy strategy);
 extern Buffer lion_dir_past_deleted(Relation index, Buffer buf, int lockmode);
 
 /* The safexid a DELETED directory page keeps in its special area. */

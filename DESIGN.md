@@ -933,7 +933,7 @@ the last key had been hashed; the sorted build keeps one open page per level.
     amoptionalkey = false            amsearcharray = true      amsearchnulls = true
     amstorage = true (§17)           amclusterable = false     ampredlocks = true (§9)
     amcanparallel = false            amcanbuildparallel = true (17+, §24)   amcaninclude = false
-    amusemaintenanceworkmem = true   amsummarizing = false     amkeytype = InvalidOid
+    amusemaintenanceworkmem = false (§18)   amsummarizing = false     amkeytype = InvalidOid
     amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL (§11, §18; cleanup stays with the leader)
     amgettuple = liongettuple (§29)  amgetbitmap = liongetbitmap    amcanreturn = NULL
     ammarkpos/amrestrpos = NULL      parallel scan callbacks = NULL
@@ -6768,7 +6768,10 @@ ones it did not record - are counted on the meta page (the special area's `maxck
 `btm_last_cleanup_num_delpages`), and a VACUUM that calls no ambulkdelete reads every block of the
 index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_needs_cleanup()`
 rule, recording the ones that are reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
-those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
+those and nothing else.  Every page ambulkdelete's walk and its sweep read goes through VACUUM's
+ring of buffers (`info->strategy`, `lion_vac_read()`; `vacuum_buffer_usage_limit`), as nbtree's
+do, so a VACUUM leaves no more of the index in shared buffers than the ring holds.  It checks for
+interrupts at every block, with nothing locked, and each
 page it reads passes the cost-based delay first, as every page the walk reads does (since the
 2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
 free pages neither answered a cancel nor paced its reads and records).  A page of a LIVE set is
@@ -10204,7 +10207,11 @@ flush refuses to insert without it. Visiting changes no page, so it is not
 refused the way a write is; the barrier is not needed either, because the only
 records it could ride on are rmgr-mode removals, which this server cannot
 write - a VACUUM that has something to remove from such an index still stops
-at its first write, with the hint. `test/recovery/run.sh` phase 1f vacuums an
+at its first write, with the hint. What one that has nothing to remove would
+write all the same - the meta page's counts, a directory leaf left empty or
+HALF_DEAD, a set's empty leaves, an entry an earlier VACUUM emptied and left,
+the leaks its sweep finds - it leaves alone (`lion_vac_may_write()`), for a
+VACUUM on a server with the manager. `test/recovery/run.sh` phase 1f vacuums an
 rmgr-mode partial index on a server restarted without the preload, then
 crashes it: no custom-manager record may be in the range, and recovery must
 succeed. Before that it inserts into and vacuums an UNLOGGED rmgr-mode index
@@ -19037,7 +19044,9 @@ the row (2026-09-28).
 Summaries are entries, so the bulk-delete pass removes dead TIDs from them as from a key's set, in
 the same chain order and under the same cleanup locks (§11), and an emptied summary is deleted as
 an emptied entry is (§18) - but never the open one, which stays, empty, with its key: still an upper
-bound of every key it can hold, and the next row above the closed buckets goes into it (step 3). A
+bound of every key it can hold, and the next row above the closed buckets goes into it (step 3).
+Since its entry stays, a CHAIN open bucket loses its empty leaves as a key's set that keeps rows
+does (§22, "Empty leaves"). A
 CHAIN summary is identified across a concurrent split by its root
 block (`lion_vac_entry_matches()`), and found again after one by descending to `(SUMMARY, key)` and
 walking right through the column's summaries (`lion_vac_ref_relocate()`), as a key's entry is found

@@ -605,7 +605,14 @@ lion_handler(PG_FUNCTION_ARGS)
 		.amcanbuildparallel = true,
 #endif
 		.amcaninclude = false,
-		.amusemaintenanceworkmem = true,
+		/*
+		 * ambulkdelete takes no share of maintenance_work_mem: what it keeps
+		 * is bounded by work_mem, as nbtree's is (DESIGN.md §18, "Reuse").
+		 * true would have a parallel VACUUM divide maintenance_work_mem
+		 * between this index and the ones that do use it - GIN's - for
+		 * nothing.
+		 */
+		.amusemaintenanceworkmem = false,
 		.amsummarizing = false,
 		/*
 		 * ambulkdelete may run in a parallel vacuum worker (DESIGN.md §11,
