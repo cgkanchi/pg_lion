@@ -6309,7 +6309,13 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
 
 `lion_bm25(index, query, k, k1, b, col)` (lion_bm25.c) ranks the rows of an index by one key column
 that stores positions, by Okapi BM25, in Lucene's form: `idf = ln(1 + (N - df + 0.5) / (df + 0.5))`
-and `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
+and `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme, for any finite `k1` of
+at least 0 and `b` between 0 and 1 (`lion_bm25_params_ok()`, which both functions and the LionBm25
+planner ask). Each term is computed with its top and bottom divided by `k1 + 1`, as `idf * tf / (tf /
+(k1 + 1) + k1 / (k1 + 1) * (1 - b + b * |d| / avgdl))`, which no finite `k1` overflows. Written as the
+first, a `k1` near 1e308 makes both infinite and the term infinite or NaN, and an infinite `k1`
+makes every term NaN; a NaN ranks below nothing, so once its heap is full a walk admits no other
+row, and the LionBm25 scan would return fewer rows than the sort of the same scores.
 
 - **tf** is the npos of the row's member under the lexeme, a stripped lexeme counting once, read
   from the position tree with a counts-only cursor that steps over the positions. **df** is the
@@ -6364,7 +6370,8 @@ lookups - the empty key's, each lexeme's, found or not - take the predicate lock
 conflicts with a later insert of what it looked for.
 
 **MaxScore** (Turtle and Flood) prunes the merge. A lexeme adds less than `idf * (k1 + 1)` to any
-row, since `tf / (tf + norm) < 1`; with the lexemes in ascending order of that maximum, the first
+row, since `tf / (tf + norm) < 1` (infinite for a `k1` near the largest double, which leaves every
+lexeme essential); with the lexemes in ascending order of that maximum, the first
 ones whose maxima sum to no more than the heap's worst score, once the heap is full, are
 non-essential: a row with none of the others cannot get in. Only the essential lexemes' members are
 candidates. The non-essential ones are sought for a candidate only, from the largest maximum down,
@@ -6422,7 +6429,11 @@ current user itself, every time it is initialised and under plain EXPLAIN too (�
 a count replaces"), so a cached plan answers a REVOKE or a SET ROLE as the ordinary plan does
 (test/sql/security_exec.sql). A relation locked
 `FOR UPDATE` or the like is left to the ordinary plan, since EvalPlanQual hands a scan the table's
-row rather than that tuple. Its startup cost is
+row rather than that tuple, and so is one with LATERAL references (`rel->lateral_relids`: a
+PlaceHolderVar it computes for a LATERAL subquery pulled up from under an outer join), every path of
+which is parameterized by the relations they name - the scan's is not, and its plan would compute
+that value from a column of a relation it does not scan. So are parameters the function refuses,
+whose error it raises. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
 time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
@@ -17725,7 +17736,12 @@ says `Ordered By: <index> (index only)`. The same walk is then also offered with
   `securityQuals` or any restriction clause with `security_level > 0` - exactly as LionCount
   declines them (§9, "Row-level security"): the ordinary plan applies them with core's
   leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so,
-  until 2026-09-29, were partitioned tables and their partitions (§30.8, §30.11).
+  until 2026-09-29, were partitioned tables and their partitions (§30.8, §30.11). So is a relation
+  with LATERAL references (`rel->lateral_relids`: a PlaceHolderVar it computes for a LATERAL
+  subquery pulled up from under an outer join, `la LEFT JOIN LATERAL (SELECT lb.id, la.x FROM lb
+  ...) ON true`): every path of it must be parameterized by the relations they name, and every path
+  the node builds is unparameterized - the btree path it builds for its ordered side where core
+  built none (§40.2) trips core's assertion that it names them (`get_baserel_parampathinfo()`).
 - **The WHERE.** The relation's restriction clauses, an implicit AND. Some of them are answered by
   lion indexes and the rest stay a heap-side filter. WHICH of them lion answers, and how, is not
   decided here but by core's own index matching: every shape the bitmap path supports - `=`, IN /
