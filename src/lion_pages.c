@@ -176,13 +176,24 @@ lion_page_recyclable(Page page, Relation heaprel)
  * The buffer comes back pinned and EXCLUSIVE, with an uninitialised page that
  * the caller must lion_init_page() inside its own WAL record.
  *
+ * The map holds only pages that were reusable when they went into it
+ * (DESIGN.md §18, "Reuse"): VACUUM records a DELETED page, or an UNLINKED
+ * posting leaf, once its safexid is behind every snapshot, and not before.
+ * So every block the map offers is taken unless it is not what the map says,
+ * and the loop asks for the next one until the map has none left - exactly
+ * _bt_allocbuf()'s.  GetFreeIndexPage() takes the block it hands out off the
+ * map, and a block refused here is NOT put back: it is either a page the map
+ * is wrong about - a live page a crash or a promotion left listed, because
+ * the map is not WAL-logged - which must leave it, or a free page some reader
+ * has locked, which the next VACUUM's sweep records again.  Putting refused
+ * blocks back would keep a stale entry in the map for good and have every
+ * allocation that meets it read a page, write the map and extend all the
+ * same.
+ *
  * Only a CONDITIONAL lock is ever taken on a recycled page, exactly as
  * _bt_allocbuf() does and for the same reason: this is called with other
  * pages of this index already locked (a split holds P, the bucket page, ...),
- * and buffer content locks have no deadlock detection.  A page that cannot be
- * locked, or that turns out not to be recyclable, is put straight back in the
- * free space map and the relation is extended instead - which also keeps this
- * loop from spinning on a block the map keeps offering.
+ * and buffer content locks have no deadlock detection.
  *
  * A DELETED page (or UNLINKED posting leaf) that is taken is announced to a
  * standby first, as _bt_allocbuf() announces one: replay of that record
@@ -194,30 +205,34 @@ lion_page_recyclable(Page page, Relation heaprel)
 Buffer
 lion_alloc_page(Relation index, Relation heaprel, bool reuse)
 {
-	if (reuse && heaprel != NULL)
+	while (reuse && heaprel != NULL)
 	{
 		BlockNumber blkno = GetFreeIndexPage(index);
+		Buffer		buf;
 
-		if (BlockNumberIsValid(blkno))
+		if (!BlockNumberIsValid(blkno))
+			break;				/* the map has nothing left: extend */
+
+		buf = ReadBuffer(index, blkno);
+		if (ConditionalLockBuffer(buf))
 		{
-			Buffer		buf = ReadBuffer(index, blkno);
+			Page		page = BufferGetPage(buf);
 
-			if (ConditionalLockBuffer(buf))
+			if (lion_page_recyclable(page, heaprel))
 			{
-				Page		page = BufferGetPage(buf);
-
-				if (lion_page_recyclable(page, heaprel))
-				{
-					if (!PageIsNew(page))
-						lion_wal_log_reuse(index, heaprel, blkno,
-										   lion_page_get_safexid(page));
-					return buf;
-				}
-				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				if (!PageIsNew(page))
+					lion_wal_log_reuse(index, heaprel, blkno,
+									   lion_page_get_safexid(page));
+				return buf;
 			}
-
-			/* Not ours to take now; leave it for the next allocation. */
-			RecordFreeIndexPage(index, blkno);
+			elog(DEBUG2, "lion index \"%s\": the free space map offered block %u, which is not reusable",
+				 RelationGetRelationName(index), blkno);
+			UnlockReleaseBuffer(buf);
+		}
+		else
+		{
+			elog(DEBUG2, "lion index \"%s\": the free space map offered block %u, which is locked",
+				 RelationGetRelationName(index), blkno);
 			ReleaseBuffer(buf);
 		}
 	}

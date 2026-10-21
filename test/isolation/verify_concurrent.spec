@@ -242,6 +242,9 @@ step s2_free_p		{ DELETE FROM vp WHERE k = 1; }
 # out left 33 of its rows behind and nothing freed (REL_19_STABLE, 2026-10-18).
 step s2_vacuum_p	{ VACUUM (FREEZE) vp; }
 step s2_xid			{ SELECT pg_current_xact_id() IS NOT NULL AS took_an_xid; }
+# The free space map gets a freed page once it is reusable (DESIGN.md §18,
+# "Reuse"): from the first VACUUM after the xid, as nbtree's.
+step s2_recycle_p	{ VACUUM vp; }
 step s2_vacuum_c	{ VACUUM vc; }
 step s2_lock		{ BEGIN; LOCK TABLE vc IN ACCESS EXCLUSIVE MODE; }
 step s2_drop		{ DROP INDEX vc_k; }
@@ -423,8 +426,9 @@ permutation
 
 permutation
 	s2_free_p
-	s2_vacuum_p					# k = 1's posting tree goes to the free space map
+	s2_vacuum_p					# k = 1's posting tree is freed
 	s2_xid						# ... behind every snapshot from here on
+	s2_recycle_p				# ... and goes to the free space map
 	s3_note_free
 	s1_park_level
 	s1_verify_p(s3_wake_level)	# parks with the leaves walked
@@ -438,6 +442,7 @@ permutation
 	s2_free_p
 	s2_vacuum_p
 	s2_xid
+	s2_recycle_p
 	s3_note_free
 	s1_park_level
 	s1_verify_p(s3_wake_level)	# parks with the leaves walked

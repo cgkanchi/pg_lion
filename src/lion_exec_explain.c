@@ -1033,6 +1033,17 @@ lion_explain_scan_counters(LionCountScanState *st, const LionCountStats *tot,
 						   tot->blocks_rechecked, es);
 
 	/*
+	 * The candidates of a count taken in passes - a disjoint sum, a list in
+	 * batches - that outgrew the recheck budget and were sorted, past
+	 * work_mem in temporary files, so that every dirty block was still read
+	 * once (DESIGN.md §9 step 5).  Printed only when there were some, as a
+	 * Sort prints its disk use only when it has any.
+	 */
+	if (tot->tids_spilled > 0)
+		ExplainPropertyInteger("Heap TIDs Spilled", NULL,
+							   tot->tids_spilled, es);
+
+	/*
 	 * Rows the heap recheck of a multi-key query turned away (DESIGN.md
 	 * §17, "A query known only at run time"): candidates of a superset
 	 * that the query, tested on the row, does not select.  Printed only

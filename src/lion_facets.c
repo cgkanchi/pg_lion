@@ -685,8 +685,8 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
 		bool		spilled;
 
 		if (lion_sources_collect(run->heap, run->snapshot, 1, &run->filtersrc,
-								 get_hash_memory_limit(), true, &run->copy,
-								 &spilled, &run->stats))
+								 get_hash_memory_limit(), true, NULL,
+								 &run->copy, &spilled, &run->stats))
 		{
 			int			i;
 

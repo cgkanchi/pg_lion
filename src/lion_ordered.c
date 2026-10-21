@@ -1857,6 +1857,19 @@ lo_rel_ok(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 		return false;
 
 	/*
+	 * Nothing it needs comes from outside it: a relation with LATERAL
+	 * references - a PlaceHolderVar it evaluates for a LATERAL subquery
+	 * pulled up from under an outer join, `la LEFT JOIN LATERAL (SELECT
+	 * lb.id, la.x FROM lb ...) ON true` - is scanned with a value of
+	 * another relation each time, so every path of it is parameterized by
+	 * at least those relations (get_baserel_parampathinfo() asserts it),
+	 * and every path the node builds - its own, and the btree paths it
+	 * builds as its ordered side - is unparameterized (§30.2).
+	 */
+	if (!bms_is_empty(rel->lateral_relids))
+		return false;
+
+	/*
 	 * Not the target of an UPDATE, DELETE or MERGE (reached through a merge
 	 * join's ordered input), nor a partition of one: v1 leaves those scans to
 	 * core (DESIGN.md §30.8).

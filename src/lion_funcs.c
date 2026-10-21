@@ -67,7 +67,9 @@ lion_open_index(Oid relid, LOCKMODE lockmode)
  * whichever order the block walk finds them, so a multicolumn index
  * accumulates per posting set in a hash keyed by the head block and adds the
  * totals up at the end.  A single-column index skips all of that: everything
- * it holds belongs to column 1.
+ * it holds belongs to column 1.  A page of a position tree (DESIGN.md §17)
+ * names the tree's root instead, which its entry's positions extension names
+ * too, and is counted apart from the posting pages: it holds no posting set.
  * --------------------------------------------------------------------- */
 
 /* Per-column counters. */
@@ -85,6 +87,8 @@ typedef struct LionColStats
 	int64		nullelem_tids;	/* ... and of the NULLELEMS one (§17) */
 	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
 	int64		posting_internal_pages; /* ... and the pages above them */
+	int64		position_pages; /* position-tree LEAVES (§17) */
+	int64		position_internal_pages;	/* ... and the pages above them */
 	int64		container_bytes;	/* logical bytes of every item */
 	int64		slack_bytes;	/* free bytes INSIDE items (DESIGN.md §4) */
 	int64		inline_slack_bytes; /* ... and inside INLINE payloads (§4) */
@@ -386,10 +390,12 @@ lion_index_stats(PG_FUNCTION_ARGS)
 																	   ItemIdGetLength(iid));
 							Size		cur = 0;
 							Size		csize;
+							const char *damage;
 
 							memset(&tmp, 0, sizeof(tmp));
-							while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
-															 paylen, &cur, cbuf)) > 0)
+							while ((csize = lion_inline_next(LionEntryGetPayload(entry),
+															 paylen, &cur, cbuf,
+															 &damage)) > 0)
 								lion_stats_item(&tmp, cbuf, csize);
 							cs->summary_bytes += tmp.container_bytes;
 						}
@@ -414,10 +420,19 @@ lion_index_stats(PG_FUNCTION_ARGS)
 																   ItemIdGetLength(iid));
 						Size		cur = 0;
 						Size		csize;
+						const char *damage;
 
 						cs->inline_entries++;
-						while ((csize = lion_inline_fetch(LionEntryGetPayload(entry),
-														 paylen, &cur, cbuf)) > 0)
+
+						/*
+						 * Damage in the payload ends the walk of it: the
+						 * items before it are counted, and what follows -
+						 * whose sizes the damaged one no longer tells - is
+						 * left out, as a damaged page item is (DESIGN.md §7).
+						 */
+						while ((csize = lion_inline_next(LionEntryGetPayload(entry),
+														 paylen, &cur, cbuf,
+														 &damage)) > 0)
 							lion_stats_item(cs, cbuf, csize);
 
 						/*
@@ -429,11 +444,22 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						 * It is reported apart from an item's own slack
 						 * because it is an entry's, not an item's.
 						 */
-						cs->inline_slack_bytes += (int64) (paylen - cur);
+						if (damage == NULL)
+							cs->inline_slack_bytes += (int64) (paylen - cur);
 					}
 					else
+					{
 						lion_stats_claim(st, lion_entry_head(entry), entry->attno,
 										 false);
+
+						/*
+						 * ... and its position tree's (DESIGN.md §17), whose
+						 * pages name the tree's root.
+						 */
+						if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
+							lion_stats_claim(st, lion_entry_posext(entry)->pos_root,
+											 entry->attno, false);
+					}
 				}
 			}
 			else if (LionPageIsContainer(page))
@@ -455,6 +481,22 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 				st->free_bytes += (int64) PageGetFreeSpace(page);
 				cs = lion_stats_bucket(st, LionPageGetOpaque(page)->owner_head);
+
+				/*
+				 * A page of a position tree (DESIGN.md §17) holds position
+				 * chunks or downlinks to them, and no posting set: it is
+				 * counted apart, and in neither max_posting_height nor
+				 * container_bytes.
+				 */
+				if ((LionPageGetOpaque(page)->flags & LION_PAGE_POSITIONS) != 0)
+				{
+					if (LionPageGetOpaque(page)->level > 0)
+						cs->position_internal_pages++;
+					else
+						cs->position_pages++;
+					UnlockReleaseBuffer(buf);
+					continue;
+				}
 
 				/*
 				 * An INTERNAL posting page (DESIGN.md §22) holds downlinks,
@@ -541,6 +583,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 				cs->sparse_members += ent->st.sparse_members;
 				cs->container_pages += ent->st.container_pages;
 				cs->posting_internal_pages += ent->st.posting_internal_pages;
+				cs->position_pages += ent->st.position_pages;
+				cs->position_internal_pages += ent->st.position_internal_pages;
 				cs->container_bytes += ent->st.container_bytes;
 				cs->slack_bytes += ent->st.slack_bytes;
 			}
@@ -613,6 +657,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 			nulls[28] = true;
 		values[29] = Int64GetDatum(cs->by_type[LION_CT_NARROW]);
 		values[30] = Int64GetDatum(cs->nullelem_tids);
+		values[31] = Int64GetDatum(cs->position_pages);
+		values[32] = Int64GetDatum(cs->position_internal_pages);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

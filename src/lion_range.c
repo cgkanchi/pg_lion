@@ -848,17 +848,25 @@ lion_entry_scan_plan_sum(LionEntryScan *es, Relation index, LionRange *range,
 	{
 		jblk = lion_range_side_leaf(index, range, part != LION_WALK_ABOVE,
 									LION_KIND_SUMMARY, &ej);
+		/* the landing's copy is the caller's context's: let go of it here */
 		if (!BlockNumberIsValid(jblk) || ej == NULL ||
 			LionEntryIsPivot(ej) || ej->attno != col->attno ||
 			lion_entry_kind(ej) != LION_KIND_SUMMARY)
+		{
+			if (ej != NULL)
+				pfree(ej);
 			return false;
+		}
 
 		/*
 		 * A range whose upper end is already below E_j's key ends inside E_j's
 		 * bucket: there is nothing whole to read.
 		 */
 		if (part == LION_WALK_INSIDE && !lion_scan_bucket_inside(es, ej))
+		{
+			pfree(ej);
 			return false;
+		}
 	}
 
 	es->usesum = true;
@@ -1611,12 +1619,24 @@ lion_entry_scan_skip_leaf(LionEntryScan *es)
  * batch - or, if VACUUM or a split has moved them meanwhile, from wherever
  * the key-based resume finds them.  A batch with nothing handed out yet (no
  * caller pauses there) keeps its pin rather than lose its position.
+ *
+ * A walk that uses summaries (DESIGN.md §32) is never paused, and could not
+ * be: where it resumes is its phase's as much as a key's.  The leaf read that
+ * ends a phase has already handed the walk over to the next one
+ * (lion_entry_scan_end_phase()) - and advanced sumprev past every summary it
+ * took, handed out or not - so a read of the leaf again would set up that
+ * phase first and drop the copies still to come.  Nothing needs it: the walks
+ * paused between rows are a GROUP BY's and the decoded walk's, which want
+ * keys, and every sum runs its walk to the end within one count.
  */
 void
 lion_entry_scan_pause(LionEntryScan *es)
 {
+	Assert(!es->usesum);
 	if (!BufferIsValid(es->batchbuf) || es->nextbatch == 0)
 		return;
+	if (unlikely(es->usesum))
+		elog(ERROR, "lion index: a walk that uses summaries cannot be paused");
 
 	ReleaseBuffer(es->batchbuf);
 	es->batchbuf = InvalidBuffer;

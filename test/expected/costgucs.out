@@ -56,6 +56,8 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.member_cost                   | 0.15    | 0.15     | user    | real
  pg_lion.memory_probe_cost             | 30      | 30       | user    | real
  pg_lion.plain_fetch_row_cost          | 1       | 1        | user    | real
+ pg_lion.position_check_cost           | 4.3     | 4.3      | user    | real
+ pg_lion.position_member_cost          | 1.8     | 1.8      | user    | real
  pg_lion.probe_cost                    | 40      | 40       | user    | real
  pg_lion.probe_step_cost               | 10      | 10       | user    | real
  pg_lion.range_entry_cost              | 40      | 40       | user    | real
@@ -69,7 +71,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.union_member_cost             | 0.25    | 0.25     | user    | real
  pg_lion.union_set_cost                | 100     | 100      | user    | real
  pg_lion.walk_pass_cost                | 5       | 5        | user    | real
-(42 rows)
+(44 rows)
 
 -- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
@@ -81,7 +83,7 @@ SELECT count(*) AS settings,
  WHERE name LIKE 'pg_lion.%\_cost';
  settings | from_zero | unbounded | custom_group | unit_named 
 ----------+-----------+-----------+--------------+------------
-       42 | t         | t         | t            | t
+       44 | t         | t         | t            | t
 (1 row)
 
 -- 50000 rows; a has 10 values and g 100, both placed at random, about 55

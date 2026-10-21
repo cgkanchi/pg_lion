@@ -391,15 +391,16 @@ lion_probe_member(uint16 lo, void *arg)
 }
 
 /*
- * Does the entry, a private copy of itemsz bytes, hold a row the probe
- * accepts?  Its members are read in heap order until one does, through a
- * stream of its one set that pins nothing between containers (DESIGN.md
- * §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set VACUUM has
- * freed since reads as empty (DESIGN.md §18).
+ * Does the entry, a private copy of itemsz bytes of entry off on leaf blk,
+ * hold a row the probe accepts?  Its members are read in heap order until one
+ * does, through a stream of its one set that pins nothing between containers
+ * (DESIGN.md §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set
+ * VACUUM has freed since reads as empty (DESIGN.md §18).
  */
 static bool
 lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
-					   LionEntryTuple *entry, Size itemsz)
+					   LionEntryTuple *entry, Size itemsz, BlockNumber blk,
+					   OffsetNumber off)
 {
 	LionPostingSet ps;
 	LionSetStream *st;
@@ -415,8 +416,8 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 	ps.pinbuf = InvalidBuffer;
 	ps.ntids = lion_entry_ntids(entry);
 	ps.ncontainers = lion_entry_ncontainers(entry);
-	ps.entryblk = InvalidBlockNumber;
-	ps.entryoff = InvalidOffsetNumber;
+	ps.entryblk = blk;
+	ps.entryoff = off;
 	ps.cxt = CurrentMemoryContext;
 	if ((entry->flags & LION_ENTRY_INLINE) != 0)
 	{
@@ -474,6 +475,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	char	   *copy = (char *) palloc(BLCKSZ);
 	LionEntryTuple **items;
 	Size	   *sizes;
+	OffsetNumber *offs;
 	int			maxitems;
 	OffsetNumber boundary;
 	Buffer		buf;
@@ -488,6 +490,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData)) + 1;
 	items = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * maxitems);
 	sizes = (Size *) palloc(sizeof(Size) * maxitems);
+	offs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxitems);
 
 	buf = last ? lion_dir_value_end(index, state, &boundary) :
 		lion_dir_value_start(index, state, &boundary);
@@ -554,6 +557,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			memcpy(dst, entry, sz);
 			items[n] = (LionEntryTuple *) dst;
 			sizes[n] = sz;
+			offs[n] = off;
 			n++;
 			dst += MAXALIGN(sz);
 		}
@@ -567,7 +571,8 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 		{
 			int			k = last ? n - 1 - i : i;
 
-			if (lion_probe_entry_alive(ph, index, items[k], sizes[k]))
+			if (lion_probe_entry_alive(ph, index, items[k], sizes[k], blkno,
+									   offs[k]))
 			{
 				*value = datumCopy(lion_entry_key(state, items[k]),
 								   state->typbyval, state->typlen);
@@ -604,6 +609,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 
 	pfree(items);
 	pfree(sizes);
+	pfree(offs);
 	pfree(copy);
 	return found;
 }
@@ -1623,22 +1629,60 @@ lion_neq_same_run(const LionNeqClause *a, const LionNeqClause *b)
  * values: eqsel()'s own frequency of each, through var_eq_const() as
  * neqsel() asks it, and the expression's null fraction, which neqsel()
  * takes away once a clause.
+ *
+ * The disjoint share, 1 - nullfrac - the sum of the frequencies, stands only
+ * while that sum is no more than the rows that are not NULL.  Past them, the
+ * frequencies cannot all be right: each value that is not a most common one
+ * is taken at the average of the others, as if it were in the column, and a
+ * run of more of them than the column has - values that are mostly in no row,
+ * `k NOT IN` a list of other keys - adds up to more than every row.  Clamped
+ * to 0, the share would be one row, and every join above it sized for one
+ * row where the run keeps 200,000.  So there, as scalararraysel() does for
+ * `<> ALL`, the values are taken as independent instead: the rows not NULL,
+ * times the product of each value's share of them left out.  Their share of
+ * the rows not NULL, not of every row, so that the NULLs are still taken
+ * away once - which scalararraysel()'s product, of neqsel()'s per value,
+ * does not.  A table never analyzed is no different: each value is taken at
+ * one over the default count of distinct values, with no NULL, and a run of
+ * more than that many is past every row.
+ *
+ * Up to the rows not NULL means to the rounding of the statistics: their
+ * frequencies are float4s, so a run of every value a column has - all of
+ * them most common ones - can come out past those rows by some parts in
+ * 10^8 alone (LION_NEQ_RUN_SLACK).  That is the disjoint share's 0: every
+ * row is left out.
  */
+#define LION_NEQ_RUN_SLACK	1e-6
+
 static Selectivity
 lion_neq_run_sel(PlannerInfo *root, int varRelid, Node *expr, Oid eqop,
 				 Oid collid, const Datum *values, int n)
 {
 	VariableStatData vardata;
-	double		sel = 1.0;
+	double		nullfrac = 0.0;
+	double		notnull;
+	double		disjoint;
+	double		independent = 1.0;
+	double		sel;
 	int			i;
 
 	examine_variable(root, expr, varRelid, &vardata);
 	if (HeapTupleIsValid(vardata.statsTuple))
-		sel -= ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+		nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+	CLAMP_PROBABILITY(nullfrac);
+	notnull = 1.0 - nullfrac;
+	disjoint = notnull;
 	for (i = 0; i < n; i++)
-		sel -= var_eq_const(&vardata, eqop, collid, values[i], false, true,
-							false);
+	{
+		double		freq = var_eq_const(&vardata, eqop, collid, values[i],
+										false, true, false);
+
+		disjoint -= freq;
+		if (notnull > 0)
+			independent *= 1.0 - Min(freq / notnull, 1.0);
+	}
 	ReleaseVariableStats(vardata);
+	sel = (disjoint >= -LION_NEQ_RUN_SLACK) ? disjoint : notnull * independent;
 	CLAMP_PROBABILITY(sel);
 	return (Selectivity) sel;
 }
