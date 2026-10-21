@@ -21,9 +21,9 @@ SELECT lion_hooktest_priv_decode('path') AS nclause;
 
 -- the shape marker, and the plan's number of members
 SELECT lion_hooktest_priv_decode('magic');
-ERROR:  LionCount: unrecognized custom_private shape (25 members)
+ERROR:  LionCount: unrecognized custom_private shape (26 members)
 SELECT lion_hooktest_priv_decode('path at plan');
-ERROR:  LionCount: unrecognized custom_private shape (24 members)
+ERROR:  LionCount: unrecognized custom_private shape (25 members)
 -- a member's node type, and its length against the number of clauses
 SELECT lion_hooktest_priv_decode('oids as ints');
 ERROR:  LionCount: malformed OIDS member of custom_private
@@ -54,6 +54,25 @@ ERROR:  LionCount: a distinct count without its column
 -- a dimension folded into a fact filter whose IN list is the join key's
 SELECT lion_hooktest_priv_decode('join filter on its key');
 ERROR:  LionCount: malformed join
+-- a count by cells: one that is no decoded walk, the path's member at plan
+-- time, a header that miscounts its dimensions, a value whose outcome is
+-- past the dimension's, a predicate of a dimension there is none of, one
+-- short of a truth for an outcome, and a cell's truth asked of a count with
+-- no cells
+SELECT lion_hooktest_priv_decode('cells without the decoded walk');
+ERROR:  LionCount: malformed count by cells
+SELECT lion_hooktest_priv_decode('path cells at plan');
+ERROR:  LionCount: custom_private member CELLS has length 5, not 3
+SELECT lion_hooktest_priv_decode('cells header');
+ERROR:  LionCount: malformed CELLS member of custom_private
+SELECT lion_hooktest_priv_decode('cells value outcome');
+ERROR:  LionCount: malformed cells dimension
+SELECT lion_hooktest_priv_decode('cells predicate dimension');
+ERROR:  LionCount: malformed cells predicate
+SELECT lion_hooktest_priv_decode('cells predicate truths');
+ERROR:  LionCount: malformed cells predicate
+SELECT lion_hooktest_priv_decode('cell predicate without cells');
+ERROR:  LionCount: unknown target list kind 1342177280
 -- the anti join over a small inner side without the child it reads, with no
 -- key to look up, and a column of its inner side in a plan without one
 SELECT lion_hooktest_priv_decode('anti join without its child');

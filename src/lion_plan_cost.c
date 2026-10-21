@@ -5398,6 +5398,160 @@ lion_cost_decode_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 }
 
 /*
+ * A COUNT BY CELLS (DESIGN.md §10, "Counts by cells"): the decoded walk of
+ * its driver, cp->drventries entries - the driver's sets against the WHERE
+ * as its grouped count walks them, decoded at every key the WHERE leaves
+ * rows at, as the first column of a decoded walk is priced - and, at those
+ * keys, the labels of every other dimension: a step or a seek to the key for
+ * each label with a container there, a store per member (two for a multi-key
+ * column's, whose bits are gathered first), and the posting pages they span,
+ * again in every pass of the driver.  Each of the WHERE's rows is then
+ * counted under its cell, as a decoded walk's under its combination, a
+ * column read per labelled dimension.
+ *
+ * whererows is what the WHERE's posting sets select - the clauses over the
+ * predicates test cells, not rows - and outrows the cells with rows: partial
+ * rows, each projected with the grouping expressions, all of them out once
+ * the count has run.  *perrange is what a range of a parallel count pays
+ * again: the driver's walk begun anew (the grouped count's price of it) and
+ * every label's cursor sought into the range in each pass.
+ */
+void
+lion_cost_cells_path(PlannerInfo *root, CustomPath *cpath, List *targets,
+					 List *whereclauses, List *wherekinds, List *ors,
+					 const LionCellsPlan *cp, double whererows,
+					 double outrows, Cost *perrange)
+{
+	LionCountTarget *t = (LionCountTarget *) linitial(targets);
+	RelOptInfo *rel = t->rel;
+	double		tuples = Max(rel->tuples, 1.0);
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		drventries = Max(cp->drventries, 1.0);
+	double		passes = Max(ceil(drventries / LION_GROUP_BATCH_MAX), 1.0);
+	double		keys;
+	double		keyfrac;
+	double		colrows;
+	double		nlabeldims = 0;
+	double		nlabels = 0;
+	Cost		labelkey = 0;
+	Cost		labelpages = 0;
+	Cost		run;
+	LionRangeCost rc;
+	List	   *tidx;
+	List	   *tcol;
+	List	   *tclauses;
+	List	   *tkinds;
+	List	   *tors;
+	int			d;
+
+	Assert(list_length(targets) == 1);
+	whererows = Max(Min(whererows, tuples), 1.0);
+	lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
+					  &tclauses, &tkinds, &tors, NULL);
+
+	/* the driver against the WHERE, as its own grouped count walks it */
+	memset(&rc, 0, sizeof(rc));
+	run = lion_cost_count_rel(root, rel, t->driveidx[0], t->drivecol[0],
+							  NULL, 0, tidx, tcol, tclauses, tkinds, tors,
+							  drventries, drventries, 0,
+							  LION_DISTINCT_NONE, 1.0, NULL, false, &rc,
+							  0.0, 0.0, NULL);
+	run += lion_cost_recheck(root, rel, tidx, tcol, tclauses, tkinds, tors,
+							 lion_probe_rel_rows(root, rel), drventries,
+							 rel->tuples);
+
+	/* the keys the WHERE's rows lie at, and the driver decoded at each */
+	keys = Max(nkeys * (1.0 - exp(-whererows / nkeys)), 1.0);
+	keyfrac = Min(keys / nkeys, 1.0);
+	colrows = lion_index_rows(root, rel, t->driveidx[0]) / nkeys;
+	run += keys * (colrows * LION_DECODE_MEMBER_COST +
+				   Min(drventries, Max(colrows, 1.0)) *
+				   LION_DECODE_CONTAINER_COST);
+
+	/* every other dimension's labels, at the same keys */
+	for (d = 0; d < cp->ndim; d++)
+	{
+		const LionCellsDimPlan *dp = &cp->dims[d];
+		const LionCellsDimPriv *pv = &dp->priv;
+		double		sel = 0;
+		double		n = 0;
+		double		rows;
+		double		perkey;
+		double		sets;
+		int			i;
+
+		if (d == cp->drv)
+			continue;
+		if (pv->kind == LION_CELLDIM_MULTI)
+		{
+			for (i = 0; i < pv->nbit; i++)
+			{
+				sel += dp->bitsel[i];
+				n += Max(dp->bitkeys[i], 1.0);
+			}
+			sel += dp->nullsel;
+			n += 1.0;
+		}
+		else
+		{
+			for (i = 0; i < pv->nval; i++)
+				sel += dp->valsel[i];
+			n = pv->nval;
+			if (pv->nullout != 0)
+			{
+				sel += dp->nullsel;
+				n += 1.0;
+			}
+		}
+		if (n <= 0)
+			continue;
+		nlabeldims += 1.0;
+		nlabels += n;
+		rows = Min(sel, n) * tuples;
+		perkey = rows / nkeys;
+		sets = n * (1.0 - exp(-perkey / n));
+		labelkey += perkey * LION_DECODE_MEMBER_COST *
+			((pv->kind == LION_CELLDIM_MULTI) ? 2.0 : 1.0) +
+			sets * (LION_DECODE_CONTAINER_COST +
+					LION_PROBE_COST * (1.0 - keyfrac));
+		if (dp->idx != NULL)
+			labelpages += (double) dp->idx->pages *
+				Min(rows / Max(lion_index_rows(root, rel, dp->idx), 1.0), 1.0) *
+				keyfrac * lion_index_page_cost(root, (double) dp->idx->pages,
+											   seq_page_cost);
+	}
+	run += (keys * labelkey + labelpages) * passes;
+
+	/* each of the WHERE's rows counted under its cell */
+	if (cp->ncells * sizeof(int64) * 4 <= (double) get_hash_memory_limit())
+		run += whererows * (LION_DECODE_ROW_COST +
+							nlabeldims * LION_DECODE_ROW_COL_COST +
+							((cp->ncells * sizeof(int64) >
+							  LION_DECODE_CACHE_BYTES) ?
+							 LION_DECODE_ROW_MISS_COST : 0.0));
+	else
+		run += whererows * (LION_DECODE_HASH_ROW_COST +
+							nlabeldims * LION_DECODE_ROW_COL_COST);
+
+	if (perrange != NULL)
+		*perrange = rc.perrange + nlabels * passes *
+			(LION_PROBE_COST +
+			 LION_RANGE_DESCENT_PAGES * lion_index_page_cost(root,
+															 (double) t->driveidx[0]->pages,
+															 seq_page_cost));
+
+	cpath->path.rows = outrows;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	/* the cells go up once the count has run */
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run +
+		outrows * (cpu_tuple_cost + cpath->path.pathtarget->cost.per_tuple);
+}
+
+/*
  * How a multi-key clause will be answered (DESIGN.md §17), and how many
  * posting sets its query is made of: the keys its extraction yields, which is
  * what a count merges at every container key it asks the clause about.

@@ -433,6 +433,11 @@ SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND N
 RESET pg_lion.enable_count_residual;
 -- a NOT EXISTS beside a second table in the FROM
 SELECT lca('SELECT count(*) FROM lca_rows r, lca_tag t WHERE r.id = t.a AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+-- a GROUP BY of expressions over predicates, and a WHERE over them, which a
+-- count by cells answers (DESIGN.md §10, "Counts by cells") of one table
+-- alone: no anti join's
+SELECT lca('SELECT CASE WHEN r.x = 1 THEN ''a'' WHEN r.x IN (2, 3) THEN ''b'' ELSE ''c'' END AS t, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.x = 1 THEN r.g = 2 ELSE r.g = 3 END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 -- a correlation by no equality
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a < r.k)');
 -- row-level security on the table counted

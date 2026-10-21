@@ -33,7 +33,7 @@ static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
 	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
-	"RESID", "PARTIAL", "ANTI",
+	"RESID", "PARTIAL", "CELLS", "ANTI",
 	"TLKINDS"
 };
 
@@ -61,6 +61,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_List,						/* FILTERS */
 	T_List,						/* RESID */
 	T_List,						/* PARTIAL */
+	T_List,						/* CELLS */
 	T_List,						/* ANTI */
 	T_IntList					/* TLKINDS */
 };
@@ -343,7 +344,9 @@ lion_priv_decode_fact_group(List *priv, LionCountPriv *out)
 
 /*
  * The columns of the decoded walk (DESIGN.md §34): an IntList of their
- * attnums and an OidList of their indexes, two to LION_MAX_GROUPCOLS.
+ * attnums and an OidList of their indexes, one to LION_MAX_GROUPCOLS - one
+ * only as the driver of a count by cells, which lion_count_priv_check()
+ * holds it to.
  */
 static void
 lion_priv_decode_groupn(List *priv, LionCountPriv *out)
@@ -361,7 +364,7 @@ lion_priv_decode_groupn(List *priv, LionCountPriv *out)
 		elog(ERROR, "LionCount: malformed decoded walk");
 	attnos = (List *) linitial(gn);
 	oids = (List *) lsecond(gn);
-	if (list_length(attnos) < 2 || list_length(attnos) > LION_MAX_GROUPCOLS ||
+	if (list_length(attnos) < 1 || list_length(attnos) > LION_MAX_GROUPCOLS ||
 		list_length(oids) != list_length(attnos))
 		elog(ERROR, "LionCount: malformed decoded walk");
 	out->ngroupn = list_length(attnos);
@@ -461,6 +464,8 @@ lion_priv_decode_tlkinds(List *priv, LionCountPriv *out)
 			!(kind >= 0 && kind < LION_TL_WHEREKEY + out->nclause) &&
 			!LION_TL_IS_WAGG(kind) && !LION_TL_IS_WKEY(kind) &&
 			!LION_TL_IS_RESID(kind) && !LION_TL_IS_ANTI(kind) &&
+			!(LION_TL_IS_CELLPRED(kind) &&
+			  LION_TL_CELLPRED_NO(kind) < out->ncellpred) &&
 			!(LION_TL_IS_FCOUNT(kind) &&
 			  LION_TL_FCOUNT_FILTER(kind) >= 1 &&
 			  LION_TL_FCOUNT_FILTER(kind) <= out->nfilter &&
@@ -537,6 +542,181 @@ lion_priv_decode_partial(List *priv, LionCountPriv *out)
 		if (lfirst(lc) == NULL || !IsA(lfirst(lc), String))
 			elog(ERROR, "LionCount: malformed PARTIAL member of custom_private");
 	}
+}
+
+/*
+ * The cells of a count by cells (DESIGN.md §10, "Counts by cells"): the
+ * header, each dimension and each predicate, every number in its range, and
+ * at the PATH stage the predicates' expressions and the WHERE over them.
+ */
+static void
+lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
+{
+	List	   *m = (List *) list_nth(priv, LION_PRIV_CELLS);
+	List	   *hdr;
+	List	   *dims;
+	List	   *preds;
+	int			d;
+	int			i;
+
+	if (m == NIL)
+		return;
+	lion_priv_expect_length(m, LION_PRIV_CELLS,
+							(stage == LION_PRIV_STAGE_PLAN) ? 3 : 5);
+	hdr = (List *) linitial(m);
+	dims = (List *) lsecond(m);
+	preds = (List *) lthird(m);
+	if (hdr == NIL || !IsA(hdr, IntList) || list_length(hdr) != 3 ||
+		dims == NIL || !IsA(dims, List) || preds == NIL || !IsA(preds, List))
+		elog(ERROR, "LionCount: malformed CELLS member of custom_private");
+	out->ncelldim = linitial_int(hdr);
+	out->ncellpred = lsecond_int(hdr);
+	out->celldrv = lthird_int(hdr);
+	if (out->ncelldim < 1 || out->ncelldim > LION_CELLS_MAX_DIMS ||
+		out->ncelldim != list_length(dims) ||
+		out->ncellpred < 1 || out->ncellpred > LION_CELLS_MAX_PREDS ||
+		out->ncellpred != list_length(preds) ||
+		out->celldrv < -1 || out->celldrv >= out->ncelldim)
+		elog(ERROR, "LionCount: malformed CELLS member of custom_private");
+
+	out->celldim = (LionCellsDimPriv *)
+		palloc0(sizeof(LionCellsDimPriv) * out->ncelldim);
+	for (d = 0; d < out->ncelldim; d++)
+	{
+		List	   *dm = (List *) list_nth(dims, d);
+		LionCellsDimPriv *dp = &out->celldim[d];
+		List	   *ints;
+		List	   *oids;
+		List	   *vals;
+		List	   *outs;
+		List	   *bitops;
+		List	   *bitqs;
+
+		if (dm == NIL || !IsA(dm, List) || list_length(dm) != 6)
+			elog(ERROR, "LionCount: malformed cells dimension");
+		ints = (List *) list_nth(dm, 0);
+		oids = (List *) list_nth(dm, 1);
+		vals = (List *) list_nth(dm, 2);
+		outs = (List *) list_nth(dm, 3);
+		bitops = (List *) list_nth(dm, 4);
+		bitqs = (List *) list_nth(dm, 5);
+		if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5 ||
+			oids == NIL || !IsA(oids, OidList) || list_length(oids) != 3 ||
+			!lion_priv_is(vals, T_List) || !lion_priv_is(outs, T_IntList) ||
+			list_length(vals) != list_length(outs) ||
+			!lion_priv_is(bitops, T_OidList) || !lion_priv_is(bitqs, T_List) ||
+			list_length(bitops) != list_length(bitqs))
+			elog(ERROR, "LionCount: malformed cells dimension");
+		dp->kind = list_nth_int(ints, 0);
+		dp->attno = (AttrNumber) list_nth_int(ints, 1);
+		dp->radix = list_nth_int(ints, 2);
+		dp->nullout = list_nth_int(ints, 3);
+		dp->nbit = list_nth_int(ints, 4);
+		dp->idxoid = list_nth_oid(oids, 0);
+		dp->eqop = list_nth_oid(oids, 1);
+		dp->collation = list_nth_oid(oids, 2);
+		dp->nval = list_length(vals);
+		dp->vals = vals;
+		dp->valout = (int *) palloc(sizeof(int) * Max(dp->nval, 1));
+		for (i = 0; i < dp->nval; i++)
+		{
+			Node	   *v = (Node *) list_nth(vals, i);
+
+			dp->valout[i] = list_nth_int(outs, i);
+			if (v == NULL || !IsA(v, Const) || ((Const *) v)->constisnull ||
+				dp->valout[i] <= 0 || dp->valout[i] >= dp->radix)
+				elog(ERROR, "LionCount: malformed cells dimension");
+		}
+		if (dp->attno <= 0 || !OidIsValid(dp->idxoid) || dp->radix < 1 ||
+			dp->nullout < 0 || dp->nullout >= dp->radix)
+			elog(ERROR, "LionCount: malformed cells dimension");
+		if (dp->kind == LION_CELLDIM_SCALAR)
+		{
+			if (dp->nbit != 0 || bitops != NIL ||
+				(dp->nval > 0 && !OidIsValid(dp->eqop)) ||
+				dp->nval > LION_CELLS_MAX_VALUES)
+				elog(ERROR, "LionCount: malformed cells dimension");
+		}
+		else if (dp->kind == LION_CELLDIM_MULTI)
+		{
+			if (dp->nbit < 0 || dp->nbit > LION_CELLS_MAX_BITS ||
+				list_length(bitops) != dp->nbit || dp->nval != 0 ||
+				dp->radix != (1 << dp->nbit) + 1 ||
+				dp->nullout != (1 << dp->nbit))
+				elog(ERROR, "LionCount: malformed cells dimension");
+			for (i = 0; i < dp->nbit; i++)
+			{
+				Node	   *q = (Node *) list_nth(bitqs, i);
+
+				dp->bitop[i] = list_nth_oid(bitops, i);
+				if (q == NULL || !IsA(q, Const) || ((Const *) q)->constisnull ||
+					!OidIsValid(dp->bitop[i]))
+					elog(ERROR, "LionCount: malformed cells dimension");
+				dp->bitquery[i] = (Const *) q;
+			}
+		}
+		else
+			elog(ERROR, "LionCount: malformed cells dimension");
+	}
+
+	out->cellpred = (LionCellsPredPriv *)
+		palloc0(sizeof(LionCellsPredPriv) * out->ncellpred);
+	for (i = 0; i < out->ncellpred; i++)
+	{
+		List	   *pm = (List *) list_nth(preds, i);
+		LionCellsPredPriv *pp = &out->cellpred[i];
+		const LionCellsDimPriv *dp;
+		int			ntruth;
+		int			o;
+
+		if (pm == NIL || !IsA(pm, IntList) || list_length(pm) < 3)
+			elog(ERROR, "LionCount: malformed cells predicate");
+		pp->dim = list_nth_int(pm, 0);
+		pp->kind = list_nth_int(pm, 1);
+		pp->bit = list_nth_int(pm, 2);
+		if (pp->dim < 0 || pp->dim >= out->ncelldim)
+			elog(ERROR, "LionCount: malformed cells predicate");
+		dp = &out->celldim[pp->dim];
+		switch (pp->kind)
+		{
+			case LION_CELLPRED_TABLE:
+				ntruth = (dp->kind == LION_CELLDIM_SCALAR) ? dp->radix : -1;
+				break;
+			case LION_CELLPRED_NULLS:
+				ntruth = (dp->kind == LION_CELLDIM_MULTI) ? 2 : -1;
+				break;
+			case LION_CELLPRED_BIT:
+				ntruth = (dp->kind == LION_CELLDIM_MULTI &&
+						  pp->bit >= 0 && pp->bit < dp->nbit) ? 0 : -1;
+				break;
+			case LION_CELLPRED_NONE:
+				ntruth = (dp->kind == LION_CELLDIM_MULTI) ? 0 : -1;
+				break;
+			default:
+				ntruth = -1;
+				break;
+		}
+		if (ntruth < 0 || list_length(pm) != 3 + ntruth)
+			elog(ERROR, "LionCount: malformed cells predicate");
+		pp->truth = (uint8 *) palloc(Max(ntruth, 1));
+		for (o = 0; o < ntruth; o++)
+		{
+			int			t = list_nth_int(pm, 3 + o);
+
+			if (t < LION_TRUTH_FALSE || t > LION_TRUTH_NULL)
+				elog(ERROR, "LionCount: malformed cells predicate");
+			pp->truth[o] = (uint8) t;
+		}
+	}
+
+	if (stage == LION_PRIV_STAGE_PLAN)
+		return;
+	out->cellexprs = (List *) lfourth(m);
+	out->cellquals = (List *) list_nth(m, 4);
+	if (!lion_priv_is(out->cellexprs, T_List) ||
+		list_length(out->cellexprs) != out->ncellpred ||
+		!lion_priv_is(out->cellquals, T_List))
+		elog(ERROR, "LionCount: malformed CELLS member of custom_private");
 }
 
 /*
@@ -773,6 +953,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 
 	lion_priv_decode_filters(priv, stage, out);
 	lion_priv_decode_partial(priv, out);
+	lion_priv_decode_cells(priv, stage, out);
 	lion_priv_decode_anti(priv, stage, out);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
@@ -803,7 +984,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		   (p->join.keyresno == 0 && p->nwagg == 0 && p->ntl == 0));
 	Assert(stage == LION_PRIV_STAGE_PATH ||
 		   (p->consts == NIL && p->having == NIL && p->resid == NIL &&
-			p->filterexprs == NIL && p->anti.exprs == NIL));
+			p->filterexprs == NIL && p->cellexprs == NIL &&
+			p->cellquals == NIL && p->anti.exprs == NIL));
 
 	oids = list_make3_oid(p->heapoid, p->groupidxoid, p->groupidxoid2);
 	ints = list_make4_int((int) p->scanrelid, (int) p->groupattno,
@@ -960,6 +1142,58 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	Assert(p->partialidx != NIL || p->predimplied == NIL);
 	priv = lappend(priv, (p->partialidx != NIL) ?
 				   list_make2(p->partialidx, p->predimplied) : NIL);
+
+	/* the cells (DESIGN.md §10): their expressions the PATH's alone */
+	m = NIL;
+	if (p->ncelldim > 0)
+	{
+		List	   *dims = NIL;
+		List	   *preds = NIL;
+
+		for (i = 0; i < p->ncelldim; i++)
+		{
+			const LionCellsDimPriv *dp = &p->celldim[i];
+			List	   *outs = NIL;
+			List	   *bitops = NIL;
+			List	   *bitqs = NIL;
+
+			for (j = 0; j < dp->nval; j++)
+				outs = lappend_int(outs, dp->valout[j]);
+			for (j = 0; j < dp->nbit; j++)
+			{
+				bitops = lappend_oid(bitops, dp->bitop[j]);
+				bitqs = lappend(bitqs, dp->bitquery[j]);
+			}
+			dims = lappend(dims,
+						   lappend(list_make5(list_make5_int(dp->kind,
+															 (int) dp->attno,
+															 dp->radix,
+															 dp->nullout,
+															 dp->nbit),
+											  list_make3_oid(dp->idxoid,
+															 dp->eqop,
+															 dp->collation),
+											  dp->vals, outs, bitops),
+								   bitqs));
+		}
+		for (i = 0; i < p->ncellpred; i++)
+		{
+			const LionCellsPredPriv *pp = &p->cellpred[i];
+			const LionCellsDimPriv *dp = &p->celldim[pp->dim];
+			List	   *one = list_make3_int(pp->dim, pp->kind, pp->bit);
+			int			ntruth = (pp->kind == LION_CELLPRED_TABLE) ?
+				dp->radix : (pp->kind == LION_CELLPRED_NULLS) ? 2 : 0;
+
+			for (j = 0; j < ntruth; j++)
+				one = lappend_int(one, (int) pp->truth[j]);
+			preds = lappend(preds, one);
+		}
+		m = list_make3(list_make3_int(p->ncelldim, p->ncellpred, p->celldrv),
+					   dims, preds);
+		if (stage == LION_PRIV_STAGE_PATH)
+			m = lappend(lappend(m, p->cellexprs), p->cellquals);
+	}
+	priv = lappend(priv, m);
 
 	/* the anti join's operators and collations are an OidList's */
 	m = NIL;
@@ -1209,6 +1443,8 @@ lion_count_mode_of(const LionCountPriv *p, bool parallel_aware)
 		return LION_MODE_DISTINCT;
 	if ((p->flags & LION_FLAG_SUMALL) != 0)
 		return LION_MODE_SUM;
+	if (p->ncelldim > 0)
+		return LION_MODE_CELLS;
 	if (parallel_aware)
 		return LION_MODE_GROUP_RANGED;
 	if ((p->flags & LION_FLAG_DECODE) != 0)
@@ -1495,15 +1731,49 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 	/*
 	 * The decoded walk (DESIGN.md §34) has its columns, the first the one
-	 * INTS names, and is the GROUP BY of one table alone.
+	 * INTS names, and is the GROUP BY of one table alone - two columns or
+	 * more, or the one driving a count by cells.
 	 */
 	if (decode != (p->ngroupn > 0))
 		elog(ERROR, "LionCount: malformed decoded walk");
 	if (decode &&
 		(p->groupattno != p->groupn_attno[0] || p->groupattno2 != 0 ||
 		 p->distattno != 0 || p->coalconst != NULL || sumall ||
-		 !hasgroupidx || hasrange || p->npart > 0 || p->hasjoin))
+		 !hasgroupidx || hasrange || p->npart > 0 || p->hasjoin ||
+		 p->groupidxoid != p->groupn_idx[0] ||
+		 (p->ngroupn < 2) != (p->ncelldim > 0)))
 		elog(ERROR, "LionCount: malformed decoded walk");
+
+	/*
+	 * A count by cells (DESIGN.md §10, "Counts by cells") is the decoded walk
+	 * of its driver, one table's, with no group of its own: what it emits is
+	 * the truth of each predicate in a cell and the cell's count, and nothing
+	 * else the target list could ask - a group key, a filtered count, an
+	 * aggregate over keys, a top k, a residual clause or a complement OR.
+	 * The driver is a dimension's column, or a column no predicate reads.  A
+	 * complement OR is refused for the decoded walk below.
+	 */
+	if (p->ncelldim > 0)
+	{
+		if (!decode || singlegroup || p->topkn > 0 || p->nwcol > 0 ||
+			p->nfilter > 0 || (p->flags & LION_FLAG_RESID) != 0 ||
+			p->vcols != NIL || p->partialidx != NIL ||
+			(p->celldrv >= 0 &&
+			 (p->celldim[p->celldrv].kind != LION_CELLDIM_SCALAR ||
+			  p->celldim[p->celldrv].attno != p->groupattno ||
+			  p->celldim[p->celldrv].idxoid != p->groupidxoid)))
+			elog(ERROR, "LionCount: malformed count by cells");
+	}
+	for (i = 0; i < p->ntl; i++)
+	{
+		int			kind = p->tlkind[i];
+
+		if (LION_TL_IS_CELLPRED(kind) ? p->ncelldim == 0 :
+			(p->ncelldim > 0 &&
+			 kind != LION_TL_COUNT && kind != LION_TL_COUNT_ZERO))
+			elog(ERROR, "LionCount: target list kind %d in a count %s cells",
+				 kind, (p->ncelldim > 0) ? "by" : "without");
+	}
 
 	/*
 	 * An arm of an OR selects (a positive clause in each leaf) or is a

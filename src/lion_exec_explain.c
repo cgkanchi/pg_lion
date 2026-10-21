@@ -142,7 +142,7 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
  * calls in one argument list would have overwritten, the first printing
  * the second's column.
  */
-static const char *
+const char *
 lion_explain_col(Oid idxoid, AttrNumber heapattno, bool multikey, List *vcols)
 {
 	Relation	idx;
@@ -907,6 +907,11 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		ExplainPropertyText("Group Key", buf.data, es);
 		pfree(buf.data);
 		pfree(val);
+	}
+	else if (st->cells != NULL)
+	{
+		/* a count by cells (DESIGN.md §10, "Counts by cells") */
+		lion_explain_cells(st, ancestors, es);
 	}
 	else if (st->decode != NULL)
 	{
