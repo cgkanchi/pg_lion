@@ -568,10 +568,12 @@ lion_sum_probe_finish(LionCountScanState *st, LionSumProbe *sp)
  * for a sum over every row whose walk uses summaries (lion_sum_walk()): the
  * NULL entry in the driver's slot, counted as one more set of the sum - one
  * that is disjoint from every set the walk hands out, as the plain walk's
- * NULL entry is - and the slot handed back as it was.  Located under a pin of
- * its own (DESIGN.md §9), and under SERIALIZABLE the entry, or its absence,
- * is locked as any lookup of it is: the summed walk never reads the leaf it
- * lives on.
+ * NULL entry is - and the slot handed back as it was.  In a range of a
+ * parallel count it is counted at the range's keys alone, through the window
+ * every count of the node is confined to (lion_count_range()), so the ranges
+ * add its rows up once.  Located under a pin of its own (DESIGN.md §9), and
+ * under SERIALIZABLE the entry, or its absence, is locked as any lookup of it
+ * is: the summed walk never reads the leaf it lives on.
  */
 static int64
 lion_sum_null_entry(LionCountScanState *st, LionCountSource *sources,

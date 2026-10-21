@@ -20663,7 +20663,9 @@ is in no bucket. So the sum over every row counts that entry beside the walk, AN
 negated sources like any other entry, unless the column's own `IS NOT NULL` drops it
 (`lion_sum_walk()`, `lion_sum_null_entry()`); the lookup takes the entry's pin (§9) and, under
 SERIALIZABLE, locks the entry or its absence, since the summed walk never reads the leaf it lives
-on. summary.sql counts every row over a summarized driver with NULLs.
+on. In a parallel count each range counts the entry at its own keys, as it counts every set
+(§10), so the ranges add its rows up once. summary.sql counts every row over a summarized driver
+with NULLs, and countparallel.sql does in parallel.
 
 ### Complements: `IS DISTINCT FROM`, `NOT` of a multi-key query, and an OR
 
