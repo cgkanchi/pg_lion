@@ -87,6 +87,9 @@ typedef struct LionCountStats
 	int64		tids_rechecked; /* TIDs resolved by a heap recheck, cache hits
 								 * included */
 	int64		blocks_rechecked;	/* heap blocks pinned for those rechecks */
+	int64		tids_spilled;	/* ... and those of them that went through a
+								 * sort first: a count taken in passes, past
+								 * its recheck budget (DESIGN.md §9 step 5) */
 	int64		containers_visited; /* containers read from the indexes */
 
 	/*
