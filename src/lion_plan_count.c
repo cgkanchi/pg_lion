@@ -3691,10 +3691,13 @@ lion_count_path_fill(LionCountPathBuild *cx)
  * their equalities.  The decoded walk a count by cells drives by groups
  * nothing: its rows are the cells'.
  *
- * Every row a key finds is tested on every join clause and on each of the
- * table's restrictions - and the clauses the count adds to its WHERE (the
- * `col IS NOT NULL` of a count(col)): a row the count does not count is not
- * one to subtract.
+ * Every row a key finds is tested on each of the table's restrictions - and
+ * the clauses the count adds to its WHERE (the `col IS NOT NULL` of a
+ * count(col)): a row the count does not count is not one to subtract - and,
+ * only if it passes them, on every join clause, the scan keys' first; each
+ * list in the order core would test it in (lion_anti_order_quals(),
+ * lion_anti_join_clauses()), so that no clause runs on a row core's plan
+ * would have rejected before it.
  */
 static bool
 lion_count_path_anti(LionCountPathBuild *cx)
@@ -3702,10 +3705,10 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	const LionSmallAnti *anti = cx->anti;
 	LionCountPriv *p = &cx->priv;
 	LionCountPrivAnti *a = &p->anti;
-	List	   *restrictions = NIL;
+	List	   *restrictions;
+	List	   *joinclauses;
 	List	   *keyexprs = NIL;
 	List	   *rowexprs = NIL;
-	ListCell   *lc;
 	int			ngroup = cx->cells ? 0 : cx->ngroup;
 	int			g;
 	int			k;
@@ -3731,13 +3734,9 @@ lion_count_path_anti(LionCountPathBuild *cx)
 			return false;
 	}
 
-	foreach(lc, cx->input_rel->baserestrictinfo)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-		restrictions = lappend(restrictions, rinfo->clause);
-	}
-	restrictions = list_concat(restrictions, cx->antiextra);
+	restrictions = list_concat_copy(cx->input_rel->baserestrictinfo,
+									cx->antiextra);
+	restrictions = lion_anti_order_quals(cx->root, restrictions);
 	if (contain_subplans((Node *) restrictions) ||
 		contain_volatile_functions((Node *) restrictions))
 		return false;
@@ -3745,6 +3744,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	if (!lion_anti_choose(cx->root, anti, restrictions, ngroup, rowexprs,
 						  &cx->antiplan))
 		return false;
+	joinclauses = lion_anti_join_clauses(cx->root, anti, &cx->antiplan);
 
 	p->hasanti = true;
 	memset(a, 0, sizeof(LionCountPrivAnti));
@@ -3758,15 +3758,14 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		a->keycoll[k] = cx->antiplan.keycoll[k];
 		keyexprs = lappend(keyexprs, cx->antiplan.keyexpr[k]);
 	}
-	a->njoin = list_length(anti->clauses);
+	a->njoin = list_length(joinclauses);
 	a->nrestrict = list_length(restrictions);
 	for (g = 0; g < ngroup; g++)
 	{
 		a->groupeq[g] = cx->groupeqop[g];
 		a->groupcoll[g] = cx->groupcoll[g];
 	}
-	a->exprs = list_concat(list_concat(keyexprs, list_copy(anti->clauses)),
-						   restrictions);
+	a->exprs = list_concat(list_concat(keyexprs, joinclauses), restrictions);
 	return true;
 }
 

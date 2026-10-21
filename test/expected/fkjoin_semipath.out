@@ -1177,6 +1177,18 @@ SELECT lion_sp('SELECT n.id FROM lion_sp_n n WHERE n.k NOT IN (SELECT f2.fk FROM
  not taken, 1576 rows
 (1 row)
 
+-- ... where with both sides never NULL, d.pk a primary key and f2.fk by its
+-- filter, 19 plans NOT IN as the anti join it then is, NOT EXISTS's, and the
+-- path is taken for it; 16 to 18 keep the hashed subplan.  Core's answer
+-- either way
+SELECT (l LIKE 'anti join path%') = (current_setting('server_version_num')::int >= 190000) AS as_the_release_plans,
+	   regexp_replace(l, '^(not taken|anti join path)', 'either plan') AS answer
+  FROM lion_sp('SELECT d.pk FROM lion_sp_d d WHERE d.pk NOT IN (SELECT f2.fk FROM lion_sp_f2 f2 WHERE f2.y = 5 AND f2.fk IS NOT NULL)') AS l;
+ as_the_release_plans |         answer         
+----------------------+------------------------
+ t                    | either plan, 1580 rows
+(1 row)
+
 -- the anti join of LEFT JOIN ... IS NULL, which has a range table entry of its own
 SELECT lion_sp('SELECT d.pk FROM lion_sp_d d LEFT JOIN lion_sp_f2 f2 ON f2.fk = d.pk AND f2.y = 5 WHERE f2.fk IS NULL');
        lion_sp        

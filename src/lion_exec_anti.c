@@ -8,15 +8,15 @@
  *		Before the count's first row the node reads its child whole, keeps
  *		each distinct inner row once under the values of its scan keys, looks
  *		each key up in a B-tree of the table under the query's snapshot, and
- *		tests every row found - the anti join's clauses over the row and an
- *		inner row of the key, and the table's own restrictions over the row -
- *		counting the ones that pass: into one total for an ungrouped count,
- *		into each one's group for a GROUP BY.  Each row it emits then has its
- *		count less that (lion_anti_adjust(), from lion_emit_keys()), and a
- *		group that comes to nothing is no row.  Beside a count by cells each
- *		row that passes is kept with its cell, the predicates evaluated on
- *		it, and the cells lose their rows as the tally gives them up
- *		(lion_anti_cells_hold(), from lion_next_cells()).
+ *		tests every row found - the table's own restrictions over the row, and
+ *		on a row that passes them the anti join's clauses over the row and an
+ *		inner row of the key - counting the ones that pass: into one total for
+ *		an ungrouped count, into each one's group for a GROUP BY.  Each row it
+ *		emits then has its count less that (lion_anti_adjust(), from
+ *		lion_emit_keys()), and a group that comes to nothing is no row.
+ *		Beside a count by cells each row that passes is kept with its cell,
+ *		the predicates evaluated on it, and the cells lose their rows as the
+ *		tally gives them up (lion_anti_cells_hold(), from lion_next_cells()).
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -221,7 +221,6 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	const LionCountPrivAnti *a = &priv->anti;
 	int			nexpr = lion_anti_nexprs(priv);
 	List	   *mine;
-	List	   *quals;
 	TupleDesc	desc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 	MemoryContext oldcxt;
 	int			i;
@@ -258,11 +257,17 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	}
 	as->joinexprs = list_copy_head(list_copy_tail(mine, a->nkey), a->njoin);
 	as->restrictexprs = list_copy_tail(mine, a->nkey + a->njoin);
-	quals = list_concat(list_copy(as->joinexprs), as->restrictexprs);
-	as->qual = ExecInitQual(quals, &node->ss.ps);
+	as->restrictqual = ExecInitQual(as->restrictexprs, &node->ss.ps);
+	as->joinqual = ExecInitQual(as->joinexprs, &node->ss.ps);
 
 	/* the columns they read, in a slot of the scan tuple's own shape */
 	lion_anti_columns(as, node, priv, mine);
+	for (i = 0; i < as->ninner; i++)
+	{
+		if (as->innerresno[i] >
+			list_length(((Plan *) linitial(cscan->custom_plans))->targetlist))
+			elog(ERROR, "LionCount: an anti join clause reads no column of its child");
+	}
 	as->evalslot = ExecInitExtraTupleSlot(estate, desc, &TTSOpsVirtual);
 	ExecClearTuple(as->evalslot);
 	for (i = 0; i < desc->natts; i++)
@@ -293,7 +298,11 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	st->anti = as;
 }
 
-/* The B-tree, its scan keys, and the table's slot: once, at the first run. */
+/*
+ * The B-tree, its scan keys, and the table's slot: once, at the first run.
+ * The plan's B-tree is one of the table's, and each scan key's column one of
+ * its key columns, or the plan is not this build's.
+ */
 static void
 lion_anti_open(LionCountScanState *st)
 {
@@ -305,14 +314,23 @@ lion_anti_open(LionCountScanState *st)
 		return;
 	oldcxt = MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
 	as->index = index_open(as->idxoid, AccessShareLock);
+	if (as->index->rd_rel->relam != BTREE_AM_OID ||
+		as->index->rd_index->indrelid != RelationGetRelid(st->heap))
+		elog(ERROR, "LionCount: index %u is no B-tree of the table counted",
+			 as->idxoid);
 	as->scankeys = (ScanKeyData *) palloc0(sizeof(ScanKeyData) * as->nkey);
 	for (k = 0; k < as->nkey; k++)
 	{
-		Oid			opfamily = as->index->rd_opfamily[as->keycol[k] - 1];
+		Oid			opfamily;
 		int			strategy;
 		Oid			lefttype;
 		Oid			righttype;
 
+		if (as->keycol[k] < 1 ||
+			as->keycol[k] > IndexRelationGetNumberOfKeyAttributes(as->index))
+			elog(ERROR, "LionCount: column %d is no key column of index %u",
+				 as->keycol[k], as->idxoid);
+		opfamily = as->index->rd_opfamily[as->keycol[k] - 1];
 		get_op_opfamily_properties(as->keyop[k], opfamily, false, &strategy,
 								   &lefttype, &righttype);
 		if (strategy != BTEqualStrategyNumber)
@@ -640,8 +658,17 @@ lion_anti_cells_truths(LionAntiState *as)
 
 /*
  * Does an inner row of the key match the row in heapslot?  The table's
- * columns go into evalslot once, each inner row's beside them in turn, and
- * the join clauses and the table's restrictions are tested over the two.
+ * columns go into evalslot once, and the table's restrictions are tested over
+ * them: a row they reject is no row the count counts, and no join clause is
+ * run on it - core's scan of the table rejects it before its join sees it.
+ * On a row that passes them, each inner row's columns go in beside the
+ * table's in turn, and the join clauses are tested over the two.  Each list
+ * is in the order core would test it in (lion_anti_order_quals()).
+ *
+ * Beside a count by cells the predicates' truths go in first, where the
+ * restrictions' copies of them read them: tests of a column against
+ * constants, which a lion index answers (lion_plan_cells.c), and which fail
+ * on no row.
  */
 static bool
 lion_anti_matches(LionAntiState *as, LionAntiKeyEnt *e)
@@ -658,6 +685,9 @@ lion_anti_matches(LionAntiState *as, LionAntiKeyEnt *e)
 			slot_getattr(as->heapslot, as->outerattno[j],
 						 &es->tts_isnull[as->outerpos[j]]);
 	econtext->ecxt_scantuple = es;
+	ResetExprContext(econtext);
+	if (!ExecQual(as->restrictqual, econtext))
+		return false;
 	for (in = e->inner; in != NULL; in = in->next)
 	{
 		for (j = 0; j < as->ninner; j++)
@@ -666,7 +696,7 @@ lion_anti_matches(LionAntiState *as, LionAntiKeyEnt *e)
 			es->tts_isnull[as->innerpos[j]] = in->isnull[j];
 		}
 		ResetExprContext(econtext);
-		if (ExecQual(as->qual, econtext))
+		if (ExecQual(as->joinqual, econtext))
 			return true;
 	}
 	return false;

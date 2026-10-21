@@ -260,7 +260,8 @@
  * Above the cells' predicates' range.
  */
 #define LION_TL_ANTI(resno)			(0x60000000 + (resno))
-#define LION_TL_IS_ANTI(kind)		((kind) > 0x60000000 && (kind) < 0x60010000)
+#define LION_TL_IS_ANTI(kind)		((kind) > 0x60000000 && \
+									 (kind) <= 0x60000000 + MaxAttrNumber)
 #define LION_TL_ANTI_RESNO(kind)	((AttrNumber) ((kind) - 0x60000000))
 
 /* ... and what each one computes */
@@ -1338,7 +1339,8 @@ typedef struct LionVColScope
  *		operator and collation of each of the two GROUP BY columns of member
  *		2 (InvalidOid where there is none); and, in the PATH's list only, a
  *		List of the scan keys' values - expressions of the inner side - then
- *		the join clauses, then the restrictions.  lion_plan_custom_path()
+ *		the join clauses, the scan keys' own first, then the restrictions,
+ *		each in the order the node tests them in.  lion_plan_custom_path()
  *		appends those to custom_exprs after the residual clauses, where
  *		setrefs.c points their columns at custom_scan_tlist - the table's at
  *		LION_TL_RESID columns or the ones the target list prints, the inner
@@ -1497,9 +1499,12 @@ typedef struct LionVColScope
 
 /*
  * The anti join over a small inner side (LION_PRIV_ANTI): its scan keys at
- * most, and its flag bits.
+ * most; its expressions - keys, join clauses and restrictions - at most, as
+ * many as a List holds, its cells one palloc'd array, which bounds each count
+ * the member carries and keeps their sum an int; and its flag bits.
  */
 #define LION_MAX_ANTI_KEYS	8
+#define LION_MAX_ANTI_EXPRS	((int) (MaxAllocSize / sizeof(ListCell)))
 #define LION_ANTIFLAG_TIDS	0x01	/* two lookups may find one row: the rows
 									 * matched are kept by TID, each counted
 									 * once */
@@ -3281,11 +3286,12 @@ typedef struct LionJoinShared
  * The run (lion_anti_run()) is made once, before the count's first row: it
  * reads the child whole, keeping each distinct inner row once under the
  * values of its scan keys (LionAntiKeyEnt), looks each key up, and tests every
- * row found - the join clauses and the table's restrictions, over the row's
- * columns and the inner row's - in evalslot, which has the node's scan tuple
- * descriptor: the table's columns at outerpos[], the inner side's at
- * innerpos[].  Of a parallel count one participant runs it, the one that
- * claims it first (LionJoinShared.antiowner), and the others subtract nothing.
+ * row found - the table's restrictions over the row's columns, then, if it
+ * passes them, the join clauses over those and each inner row's in turn - in
+ * evalslot, which has the node's scan tuple descriptor: the table's columns
+ * at outerpos[], the inner side's at innerpos[].  Of a parallel count one
+ * participant runs it, the one that claims it first
+ * (LionJoinShared.antiowner), and the others subtract nothing.
  *
  * Beside a count by cells (DESIGN.md §27, "Counts by cells beside the anti
  * join") the predicates are evaluated on each row found, their truths put at
@@ -3353,7 +3359,10 @@ typedef struct LionAntiState
 	int16	   *keylen;
 	bool	   *keybyval;
 
-	ExprState  *qual;			/* the join clauses and the restrictions */
+	ExprState  *restrictqual;	/* the table's restrictions, over a row
+								 * found */
+	ExprState  *joinqual;		/* ... and the join clauses, over it and an
+								 * inner row, if it passes them */
 	List	   *joinexprs;		/* ... for EXPLAIN */
 	List	   *restrictexprs;
 
@@ -4191,6 +4200,8 @@ typedef struct LionAntiPlan
 	Oid			keycoll[LION_MAX_ANTI_KEYS];
 	Node	   *keyexpr[LION_MAX_ANTI_KEYS];	/* the inner side's values */
 	Var		   *keyvar[LION_MAX_ANTI_KEYS];	/* ... and the table's columns */
+	OpExpr	   *keyclause[LION_MAX_ANTI_KEYS];	/* ... the join clauses they
+												 * are */
 	bool		tids;			/* LION_ANTIFLAG_TIDS */
 	double		lookups;		/* the distinct keys looked up */
 	double		fetched;		/* the rows the lookups find */
@@ -4200,6 +4211,10 @@ typedef struct LionAntiPlan
 extern bool lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti,
 							 List *restrictions, int ngroup, List *rowexprs,
 							 LionAntiPlan *out);
+extern List *lion_anti_order_quals(PlannerInfo *root, List *clauses);
+extern List *lion_anti_join_clauses(PlannerInfo *root,
+									const LionSmallAnti *anti,
+									const LionAntiPlan *plan);
 
 extern const CustomPathMethods lion_antijoin_path_methods;
 

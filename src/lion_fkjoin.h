@@ -153,8 +153,9 @@ typedef struct LionAntiKey
  * rows the inner side's rows match.  `outerrel` is t, the table counted;
  * `innerrel` the NOT EXISTS's inner side, one table or a join of several,
  * whose cheapest path is the node's child; `clauses` every join clause the
- * anti join evaluates, a row of t matched when all of them hold for one inner
- * row; `keys` those of them a B-tree on t may look a key up by.
+ * anti join evaluates, as the RestrictInfo core has it - a row of t matched
+ * when all of them hold for one inner row; `keys` those of them a B-tree on t
+ * may look a key up by.
  */
 typedef struct LionSmallAnti
 {
@@ -162,7 +163,7 @@ typedef struct LionSmallAnti
 	RelOptInfo *outerrel;		/* the table counted */
 	RelOptInfo *innerrel;		/* the inner side, a base or a join rel */
 	Path	   *innerpath;		/* innerrel's cheapest total path */
-	List	   *clauses;		/* Expr: every join clause */
+	List	   *clauses;		/* RestrictInfo: every join clause */
 	List	   *keys;			/* LionAntiKey: the clauses that are keys */
 } LionSmallAnti;
 
