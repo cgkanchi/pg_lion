@@ -20,14 +20,16 @@
 # its descent, internal ones included, so the reader's pin on the old root
 # stops it before it can reach the page the containers moved to.
 #
-# The numbers: k = 1 has 1000 rows, all in heap blocks 0..57, the first
-# container key, and then 30,000 more interleaved with 30,000 of k = 5, about
-# 14 leaves a key - every other row, and wide rows, so that each container is
-# a BITSET filling a leaf of its own (inline_limit = 64 keeps the sets off the
-# directory leaf).  s2_predel deletes 500 of the first 1000 and commits before
-# s1's snapshot, so the right answer for s1 is 30,500.  s2_grow adds 20,000
-# more k = 1 rows (interleaved with 20,000 of k = 5), which need more than 16
-# leaves and promote the set (max_posting_height goes from 0 to 1, the head
+# The numbers: k = 1 has 1000 rows, all in heap blocks 0..61, the first
+# container key, and then 30,000 more interleaved with 30,000 of k = 5, in
+# 985 heap blocks: 16 container keys.  The index is built on them at
+# posting_fillfactor 10, which makes every container a leaf of its own, so
+# each of the two sets has 16 leaves and no internal level (inline_limit = 64
+# keeps the sets off the directory leaf).  s2_predel deletes 500 of the first
+# 1000 and commits before s1's snapshot, so the right answer for s1 is
+# 30,500.  s2_grow adds 20,000 more k = 1 rows (interleaved with 20,000 of
+# k = 5): their containers fill the last leaf and split it, which needs a 17th
+# leaf and promotes the set (max_posting_height goes from 0 to 1, the head
 # block stays where it was); they commit after s1's snapshot and live on
 # pages VACUUM cannot mark all-visible while s1's snapshot holds the horizon
 # back, so they are rechecked and not counted.  A wrong interlock shows up as
@@ -40,9 +42,10 @@ setup
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE TABLE rpd (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x');
 	INSERT INTO rpd SELECT i, i % 4 FROM generate_series(1, 4000) i;
-	CREATE INDEX rpd_k ON rpd USING lion (k) WITH (inline_limit = 64);
 	INSERT INTO rpd SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 	  FROM generate_series(1, 60000) i;
+	CREATE INDEX rpd_k ON rpd USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
 
 	CREATE FUNCTION rpd_wait_for_vacuum() RETURNS boolean
 	LANGUAGE plpgsql AS $fn$
@@ -95,8 +98,9 @@ step s1_count	{ SELECT lion_index_count('rpd_k', 1); }
 session s2
 setup			{ SET pg_lion.enable_count_pushdown = off; SET synchronous_commit = on; }
 step s2_predel	{ DELETE FROM rpd WHERE k = 1 AND id <= 2000; }
-# Every other row, so that the new members are BITSET containers: consecutive
-# offsets would compress into a RUN a few bytes long and never fill a leaf.
+# Every other row, so that the new members are NARROW containers of 1,032
+# bytes: consecutive offsets would compress into a RUN a few bytes long, of
+# which the last leaf would take all.
 step s2_grow	{
 	INSERT INTO rpd SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 	  FROM generate_series(1, 40000) i;

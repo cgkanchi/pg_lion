@@ -12,13 +12,12 @@
 --    that compared against it crashed in detoast (lion_check_key()).
 -- 4. A member at heap offset 0, which lion_index_verify() passed.
 -- 5. A NARROW (DESIGN.md §38) whose cardinality is not its payload's.
--- 6. A NARROW in an index whose meta page records none.
--- 7. A NARROW of a width the build does not have, which sizes it.
--- 8. A directory entry whose key length claims more than its item holds.
--- 9. An entry whose TID count is less than what VACUUM removes from it.
--- 10. An INLINE entry whose item ends between its key and the end of its
---     positions extension, where the payload length wrapped around zero.
--- 11. An index whose meta page says a format version before this build's.
+-- 6. A NARROW of a width the build does not have, which sizes it.
+-- 7. A directory entry whose key length claims more than its item holds.
+-- 8. An entry whose TID count is less than what VACUUM removes from it.
+-- 9. An INLINE entry whose item ends between its key and the end of its
+--    positions extension, where the payload length wrapped around zero.
+-- 10. An index whose meta page says a format version before this build's.
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -202,7 +201,7 @@ DROP INDEX lion_di_i;
 -- blocks is a NARROW of width 1 and 1760 members, alone on its container
 -- page.  Every bit of a NARROW's payload is a member it may hold, so the
 -- cardinality in its header (bytes 4 and 5; the type is byte 6) is all there
--- is to damage but its width (section 7).  The readers bound what they do by
+-- is to damage but its width (section 6).  The readers bound what they do by
 -- the payload, not by the claim, and lion_index_verify() reports it.
 CREATE TABLE lion_di_n (k int NOT NULL, pad text);
 INSERT INTO lion_di_n
@@ -227,19 +226,7 @@ RESET pg_lion.enable_count_pushdown;
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP INDEX lion_di_n_i;
 
--- ---------- 6. a NARROW in an index whose meta page records none ----------
--- The same index with LION_META_NARROW (4) cleared in its meta page's
--- order_flags (at byte 60): VACUUM makes a NARROW only in an index whose
--- build wrote one, and inserts make none, so lion_index_verify() reports it.
-CREATE INDEX lion_di_n_i ON lion_di_n USING lion (k) WITH (inline_limit = 64);
-SELECT lion_di_evict('lion_di_n_i');
-SELECT lion_di_u32(lion_di_block('lion_di_n_i', 0), 60) & 4 AS narrow_flag;
-SELECT lion_di_poke('lion_di_n_i', 0, 60,
-					lion_di_le32(lion_di_u32(lion_di_block('lion_di_n_i', 0), 60) & ~4));
-SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
-DROP INDEX lion_di_n_i;
-
--- ---------- 7. a NARROW of a width the build does not have ----------
+-- ---------- 6. a NARROW of a width the build does not have ----------
 -- The container of section 5 with its width, its header's flags byte (byte
 -- 7), made 0 and then 6: the width sizes a NARROW, so the readers refuse
 -- one of a width outside 1 .. 5 before they read its payload, and
@@ -276,7 +263,7 @@ SELECT lion_di_try($$SELECT lion_index_count('lion_di_n_i', 1)$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_n_i')$$);
 DROP TABLE lion_di_n;
 
--- ---------- 8. a directory entry whose key length runs past its item ----------
+-- ---------- 7. a directory entry whose key length runs past its item ----------
 -- The entry the first probe of leaf 1 compares against claims a key of 65535
 -- bytes (keylen, bytes 2 and 3 of the entry).  Every comparison and key
 -- decode reads keylen bytes after the header, so readers check it against
@@ -294,7 +281,7 @@ SELECT lion_di_try($$SELECT t, count(*) FROM lion_di_t GROUP BY t ORDER BY t$$);
 SELECT lion_di_try($$INSERT INTO lion_di_t VALUES (md5('7'))$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_t_i')$$);
 DROP TABLE lion_di_t;
--- ---------- 9. an entry that counts fewer TIDs than VACUUM removes ----------
+-- ---------- 8. an entry that counts fewer TIDs than VACUUM removes ----------
 -- Key 7's CHAIN entry on its leaf says it has one TID (ntids, bytes 16 to 23 of
 -- the entry; its key, a by-value int4, is the 4 bytes after its 28-byte
 -- header).
@@ -321,7 +308,7 @@ VACUUM lion_di_v;
 \set VERBOSITY default
 DROP TABLE lion_di_v;
 
--- ---------- 10. an entry too short for its positions extension ----------
+-- ---------- 9. an entry too short for its positions extension ----------
 -- An INLINE entry of an index that stores positions (DESIGN.md §17): its
 -- 12-byte header, its key, the 8-byte positions extension at the next 4-byte
 -- boundary, and then its payload.  Its line pointer is cut to the end of its
@@ -353,7 +340,7 @@ SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
 
--- ---------- 11. an index of an older format version ----------
+-- ---------- 10. an index of an older format version ----------
 -- An index with its meta page's version (at byte 28) made 11, the format
 -- before every internal directory page began with a minus-infinity downlink
 -- (DESIGN.md §21, "Height"), then 9, the one before the compact entry tuples

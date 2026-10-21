@@ -15,10 +15,12 @@
 # and 1d): the pages stay as the first record left them, since an aborted
 # transaction does not undo index writes.  verify() must warn, and pass.
 #
-#  * the posting tree: two keys taking alternate TIDs of wide rows, so that
-#    each container is a dense bitset filling a leaf, and each set has more
-#    than the 16 leaves a set without an internal level may have (DESIGN.md
-#    §22): a tree, whose next leaf split posts a downlink;
+#  * the posting tree: two keys taking alternate TIDs of wide rows, built at
+#    posting_fillfactor 10, which makes every container a leaf of its own, so
+#    that each set has more than the 16 leaves a set without an internal
+#    level may have (DESIGN.md §22): a tree, whose next leaf split posts a
+#    downlink - the split of its last leaf, once the inserts' containers have
+#    filled it;
 #  * the directory: 200 keys of about a hundred bytes are a few leaves under
 #    a root, and new keys among them split a leaf that is not the root (a
 #    root split is atomic and never flagged).
@@ -29,8 +31,8 @@ setup
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE TABLE vis_p (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	  WITH (autovacuum_enabled = off);
-	CREATE INDEX vis_p_k ON vis_p USING lion (k);
 	INSERT INTO vis_p SELECT i, i % 2 FROM generate_series(1, 90000) i;
+	CREATE INDEX vis_p_k ON vis_p USING lion (k) WITH (posting_fillfactor = 10);
 	CREATE TABLE vis_d (k text NOT NULL) WITH (autovacuum_enabled = off);
 	INSERT INTO vis_d SELECT 'key-' || lpad((2 * i)::text, 90, '0')
 	  FROM generate_series(1, 200) i;

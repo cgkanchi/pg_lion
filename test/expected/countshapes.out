@@ -373,15 +373,12 @@ SELECT cs_plan('SELECT DISTINCT a FROM cs');
 (3 rows)
 
 SELECT cs_plan('SELECT a, b FROM cs GROUP BY 1, 2');
-                 cs_plan                  
-------------------------------------------
- Finalize HashAggregate
-   Group Key: a, b
-   ->  Custom Scan (LionCount)
-         Lion Indexes: cs_b (b), cs_a (a)
-         Group Key: b, a
-         Group Strategy: Decoded
-(6 rows)
+              cs_plan               
+------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: cs_b (b), cs_a (a)
+   Group Key: b, a
+(3 rows)
 
 SELECT cs_plan('SELECT DISTINCT a FROM cs ORDER BY a DESC');
             cs_plan             

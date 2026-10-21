@@ -285,20 +285,24 @@ SELECT lion_cmp('lion_spill', 'k = 42');
 (1 row)
 
 /*
- * ARRAY to BITSET growth: 40000 rows of two alternating keys cover about 178
- * heap blocks, so each key gets three container keys, the first with far
- * more than the 2048 members an array container can hold.  The keys have to
- * alternate: a key whose TIDs are consecutive ends up as a run container of
- * a handful of bytes and never reaches the array bound at all.
+ * ARRAY to NARROW growth: 40000 rows of two alternating keys cover about 178
+ * heap blocks, so each key gets three container keys, the first with some
+ * 7,000 members.  An insert writes every container it cannot add a member to
+ * in place as the smallest that holds it, as the build does (DESIGN.md §38):
+ * a NARROW once it has more than 256 members a word of its width, and never
+ * the BITSET an ARRAY grown alone would become.  The keys have to alternate: a
+ * key whose TIDs are consecutive ends up as a run container of a handful of
+ * bytes and never reaches the array bound at all.
  */
 CREATE TABLE lion_dense (i int4, k int4);
 CREATE INDEX lion_dense_k ON lion_dense USING lion (k);
 INSERT INTO lion_dense SELECT i, i % 2 FROM generate_series(1, 40000) i;
-SELECT bitset_containers > 0 AS has_bitset, sparse_segments, ntids
+SELECT narrow_containers > 0 AS has_narrow, bitset_containers, sparse_segments,
+	   ntids
   FROM lion_index_stats('lion_dense_k');
- has_bitset | sparse_segments | ntids 
-------------+-----------------+-------
- t          |               0 | 40000
+ has_narrow | bitset_containers | sparse_segments | ntids 
+------------+-------------------+-----------------+-------
+ t          |                 0 |               0 | 40000
 (1 row)
 
 SELECT lion_index_verify('lion_dense_k', true);
@@ -314,30 +318,32 @@ SELECT lion_cmp('lion_dense', 'k = 1');
 (1 row)
 
 /*
- * Inserts that land in the MIDDLE of a container chain, which is what makes
- * a container page split.
+ * Inserts that land in the MIDDLE of a posting tree, which is what makes a
+ * container page split, and that take the pages a freed posting set gave back.
  *
- * Key 2 is spread over the whole heap and every one of its containers is a
- * bitset, so its chain is one container per page with no room to spare.  Key
- * 1 owns the low heap blocks alone; deleting it and vacuuming frees those
- * blocks without touching key 2's chain.  The rows inserted afterwards go
- * into the freed low blocks and belong before everything key 2 already has,
- * so their containers have to be placed at the head of a full chain -- and
- * they grow to bitsets there, because key 3 is interleaved with them and
- * keeps their members from forming runs.
+ * The index is built after the rows go in, at posting_fillfactor 10, so that
+ * every container is a leaf of its own and both keys' posting sets are TREES
+ * (DESIGN.md §22): the entry's head is a root with downlinks, the leaves are
+ * the container pages.  Key 1 owns the low heap blocks alone and alternates
+ * with key 2 over the rest; deleting it and vacuuming frees those blocks and
+ * the whole of key 1's set without touching key 2's.  The rows inserted
+ * afterwards go into the freed low blocks and belong before everything key 2
+ * already has, so their containers go into key 2's first leaf until it is full
+ * and splits; key 3 is interleaved with them and keeps their members from
+ * forming runs.
  */
 CREATE TABLE lion_mid (i int4, k int4);
-CREATE INDEX lion_mid_k ON lion_mid USING lion (k) WITH (inline_limit = 64);
 INSERT INTO lion_mid
 SELECT i, CASE WHEN i <= 100000 THEN 1 ELSE 2 - (i % 2) END
-  FROM generate_series(1, 300000) i;
-CREATE TEMP TABLE lion_mid_before AS
-	SELECT container_pages FROM lion_index_stats('lion_mid_k');
-SELECT bitset_containers > 0 AS key2_has_bitsets
+  FROM generate_series(1, 360000) i;
+CREATE INDEX lion_mid_k ON lion_mid USING lion (k)
+	WITH (inline_limit = 64, posting_fillfactor = 10);
+SELECT posting_internal_pages > 0 AS has_internal_pages,
+	   max_posting_height = 1 AS two_levels
   FROM lion_index_stats('lion_mid_k');
- key2_has_bitsets 
-------------------
- t
+ has_internal_pages | two_levels 
+--------------------+------------
+ t                  | t
 (1 row)
 
 DELETE FROM lion_mid WHERE k = 1;
@@ -346,29 +352,48 @@ DELETE FROM lion_mid WHERE k = 1;
  * plain VACUUM skips pruning a heap page it cannot get a cleanup lock on -
  * one the checkpointer happens to be writing, say - and that page's dead
  * TIDs stay in the index.  An aggressive VACUUM waits for the lock instead.
+ *
+ * Key 1's posting set is empty after it, so its entry is deleted and its pages
+ * are freed (DESIGN.md §18).  A freed page goes into the free space map only
+ * once no snapshot can still be reading it, nbtree's rule: the xid spent here
+ * puts that behind every snapshot, and the second VACUUM records the pages.
  */
 VACUUM (FREEZE) lion_mid;
-INSERT INTO lion_mid SELECT i, 2 + (i % 2) FROM generate_series(300001, 400000) i;
-/*
- * Key 1's posting set is empty after the VACUUM, so its entry is deleted and
- * its whole chain is freed (DESIGN.md §18).  The pages the new containers
- * need therefore come back out of the free space map instead of extending the
- * relation: the index holds no MORE container pages than it did before, even
- * though the containers that go in do not fit where they belong and split the
- * pages they land on.
- */
-SELECT (SELECT container_pages FROM lion_index_stats('lion_mid_k')) <=
-	   (SELECT container_pages FROM lion_mid_before) AS pages_reused;
- pages_reused 
---------------
+SELECT txid_current() IS NOT NULL AS xid_spent;
+ xid_spent 
+-----------
  t
 (1 row)
 
+VACUUM lion_mid;
+CREATE TEMP TABLE lion_mid_before AS
+	SELECT deleted_pages, pg_relation_size('lion_mid_k') AS bytes
+	  FROM lion_index_stats('lion_mid_k');
+SELECT deleted_pages > 0 AS key1_freed FROM lion_mid_before;
+ key1_freed 
+------------
+ t
+(1 row)
+
+INSERT INTO lion_mid SELECT i, 2 + (i % 2) FROM generate_series(360001, 460000) i;
 /*
- * DESIGN.md §22: those posting sets are TREES - the entry's head is a root
- * with downlinks and the leaves are the container pages - so the inserts above
- * found their page by descending rather than by walking from the head, and the
- * whole shape survives verify().
+ * The pages the new containers need come back out of the free space map
+ * instead of extending the relation: the index has fewer deleted pages than
+ * it had, and it grew by one block at most, the root of key 3's new posting
+ * set, which comes from extending the relation by design (lion_entry_spill()).
+ */
+SELECT s.deleted_pages < b.deleted_pages AS freed_pages_taken,
+	   pg_relation_size('lion_mid_k') <=
+	   b.bytes + current_setting('block_size')::int8 AS grew_by_one_root_at_most
+  FROM lion_index_stats('lion_mid_k') s, lion_mid_before b;
+ freed_pages_taken | grew_by_one_root_at_most 
+-------------------+--------------------------
+ t                 | t
+(1 row)
+
+/*
+ * The inserts above found their page by descending key 2's tree rather than
+ * by walking from the head, and the whole shape survives verify().
  */
 SELECT posting_internal_pages > 0 AS has_internal_pages,
 	   max_posting_height = 1 AS two_levels
@@ -393,7 +418,7 @@ SELECT lion_index_verify('lion_mid_k', true);
 SELECT lion_cmp('lion_mid', 'k = 2');
     lion_cmp    
 ----------------
- ok 150000 rows
+ ok 180000 rows
 (1 row)
 
 SELECT lion_cmp('lion_mid', 'k = 3');
@@ -405,7 +430,7 @@ SELECT lion_cmp('lion_mid', 'k = 3');
 SELECT ntids FROM lion_index_stats('lion_mid_k');
  ntids  
 --------
- 200000
+ 230000
 (1 row)
 
 /*

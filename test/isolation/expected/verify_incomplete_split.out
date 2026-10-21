@@ -53,7 +53,7 @@ injection_points_detach
                        
 (1 row)
 
-s1: WARNING:  lion index "vis_p_k": posting page 46 has an unfinished split
+s1: WARNING:  lion index "vis_p_k": posting page 47 has an unfinished split
 DETAIL:  Its right sibling has no downlink in the parent yet.
 HINT:  The next INSERT into that key repairs it.
 step s1_verify_posting: 
@@ -65,7 +65,7 @@ lion_index_verify
                  
 (1 row)
 
-s1: WARNING:  lion index "vis_p_k": posting page 46 has an unfinished split
+s1: WARNING:  lion index "vis_p_k": posting page 47 has an unfinished split
 DETAIL:  Its right sibling has no downlink in the parent yet.
 HINT:  The next INSERT into that key repairs it.
 lion_index_verify

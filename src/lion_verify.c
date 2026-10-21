@@ -577,17 +577,6 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 	}
 
 	/*
-	 * DESIGN.md §38: a NARROW only in an index whose build wrote one
-	 * (LION_META_NARROW).  VACUUM makes one only in such an index, and
-	 * inserts only widen one that is there.  Its width is
-	 * lion_container_check()'s.  The flag is the one the meta page has now,
-	 * as lion_verify_meta() read it.
-	 */
-	if (c->type == LION_CT_NARROW && !vs->allows_narrow)
-		lion_corrupt("lion index \"%s\": container %u on block %u is a NARROW, which an index whose meta page records none cannot hold",
-					RelationGetRelationName(vs->index), off, blk);
-
-	/*
 	 * Its structure, and then its members as heap TIDs (DESIGN.md §2): a
 	 * member at offset 0 or past MaxHeapTuplesPerPage used to pass, and every
 	 * query that turned the key into TIDs failed on it.

@@ -10,10 +10,12 @@
 --
 --	lion_bs		136 rows to a page: its dense sets are NARROWs of width 3
 --	lion_bs4	226 rows to a page: NARROWs of width 4
---	lion_bs6	226 rows to a page, its indexes built before its rows: they
---				hold no NARROW and their meta pages record none, and an
---				insert makes an ARRAY it fills a BITSET - BITSETs, which a
---				build no longer makes of any heap's rows
+--	lion_bs6	226 rows to a page, its indexes built before its rows: the
+--				inserts write the NARROWs of width 4 a build writes
+--
+-- No index holds a BITSET: a NARROW is smaller than one for any heap's rows
+-- at 8K, and every write optimizes what it writes.  The BITSETs here are the
+-- set algebra's own, the unions it makes of bitmaps and other kinds.
 --
 -- lion_bs also has two columns, and a row number, the others do not have
 -- room for.  lion_index_stats() shows each index's containers by kind.
@@ -110,7 +112,7 @@ LANGUAGE sql AS $$
 $$;
 
 -- The kinds of the containers of a column on each table, and the bytes they
--- take: NARROWs of width 3 are 1544 each and of width 4 2056, BITSETs 4104.
+-- take: NARROWs of width 3 are 1544 each and of width 4 2056.
 CREATE FUNCTION lbs_mix_all(col text)
 RETURNS TABLE (tbl text, arrays int8, bitsets int8, runs int8, narrows int8,
 			   container_bytes int8)
@@ -133,8 +135,8 @@ $$;
  * 5000 values of twelve rows, a member or two at a key: sparse segments,
  * whose members an AND looks up one at a time.  lion_bs has seven container
  * keys and lion_bs4 five; lion_bs6 has three, and its indexes, made before
- * its rows, have BITSETs where a build makes NARROWs: an insert makes an
- * ARRAY it fills a BITSET, whatever else would be smaller.
+ * its rows, have the NARROWs a build makes: an insert writes the smallest
+ * container that holds its members.
  */
 CREATE TABLE lion_bs (id int NOT NULL, a int NOT NULL, b int NOT NULL,
 					  r int NOT NULL, s int NOT NULL, u int NOT NULL,
@@ -261,10 +263,11 @@ SELECT lbs_check('SELECT id FROM lion_bs WHERE s BETWEEN 3 AND 5 AND a = 1', 'bi
 
 -- ---------- 7. inserts ----------
 -- 10,000 rows more in each table.  The bitmaps of the last container key
--- take their members in place, and the ARRAYs the inserts take past 2048
--- members become BITSETs: lion_bs's a and b at the key after its last, and
--- its s = 0, every other row; lion_bs4's b at its last key, which the build
--- left ARRAYs; and lion_bs6's at its last key, as everywhere else in it.
+-- take their members in place, and the ARRAYs the inserts take past a
+-- NARROW's size become NARROWs: lion_bs's a and b at the key after its
+-- last, and its s = 0, every other row; lion_bs4's b at its last key, which
+-- the build left ARRAYs; and lion_bs6's at its last key, as everywhere else
+-- in it.
 INSERT INTO lion_bs
 SELECT i, i % 2, i % 3, (i / 40) % 4, CASE WHEN i % 2 = 0 THEN 0 ELSE i % 23 END,
 	   i % 5000, CASE WHEN i % 160 < 150 THEN 0 ELSE 1 + i % 5 END
@@ -288,8 +291,7 @@ SELECT lbs_check('SELECT id FROM lion_bs WHERE s = 0 AND a = 0', 'bitmap');
 -- The counts recheck the rows of the pages the map cannot vouch for.
 -- VACUUM takes the dead rows out of the bitmaps, and re-optimizes each it
 -- changed: a NARROW of the narrowest width, or an ARRAY again where that is
--- smaller, in the indexes whose build wrote a NARROW, and never a NARROW in
--- lion_bs6's.
+-- smaller.
 UPDATE lion_bs SET z = 1 WHERE id % 7 = 0;
 DELETE FROM lion_bs WHERE id % 10 IN (1, 3, 5, 7);
 UPDATE lion_bs4 SET z = 1 WHERE (ctid::text::point)[1]::int % 7 = 0;
