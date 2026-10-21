@@ -871,7 +871,19 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 	 * is exact on a primary.  A walk that may be repeated warns only once it
 	 * is kept, which lion_verify_chain_totals() does (lion_verify_postree(),
 	 * for a position tree).
+	 *
+	 * The flag is only ever on the LEFT half of a split, which the record
+	 * that sets it links to the split's new page, and which keeps that right
+	 * sibling while the flag lasts: VACUUM takes no empty leaf whose left
+	 * neighbour is flagged, nor a flagged one (§22, "Empty leaves"), and a
+	 * root pushed down flags nothing.  So a rightmost page with the flag - a
+	 * root above the leaves among them - is damage in any walk, not the
+	 * state the next INSERT repairs, which finds no sibling to post.
 	 */
+	if (LionPageIncompleteSplit(page) && LionPageIsRightmost(page))
+		lion_corrupt("lion index \"%s\": %s page %u of chain entry %u on block %u is flagged as an unfinished split, but it is the rightmost page of its level, which no split leaves flagged",
+					RelationGetRelationName(vs->index), tree->what, blk,
+					tree->eoff, tree->eblk);
 	if (LionPageIncompleteSplit(page))
 	{
 		if (exact)
