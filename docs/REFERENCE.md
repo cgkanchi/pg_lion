@@ -112,8 +112,11 @@ count functions' are, after deletes and updates VACUUM has not yet cleaned up in
   with the largest bounds are counted first and the rest only while one could still reach the
   k-th; the filter's sets are collected once and ANDed with each key's. When the filter keeps fewer
   rows than counting the keys would cost, the rows are read from the heap instead (a plain column of
-  a non-partial index only). `SET client_min_messages = debug1` shows the entries read, the keys
-  counted and the rows read.
+  a non-partial index only). The keys counted are held in `work_mem` and sorted in a tuplesort that
+  spills to temporary files past it, every key of a large column included; the keys of the filter's
+  rows are counted in `hash_mem`, and past it by the keys instead. `SET client_min_messages =
+  debug1` shows the entries read, the keys counted, the rows read and the keys sorted past
+  `work_mem`.
 - A partial index counts the rows it holds. An expression index's keys are the expression's.
 
 
