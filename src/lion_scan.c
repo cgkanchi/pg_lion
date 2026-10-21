@@ -3049,6 +3049,35 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
 }
 
 /*
+ * The equality two elements of `<> ANY` are told apart by where the probe
+ * has no comparison for them: the column's own, the opclass's strategy 1,
+ * for its own values (the probe made them so, coercing where it may), and
+ * for values of another type the family's strategy 1 for that type's pair -
+ * the equality the family's hash of that type agrees with, as its cross-type
+ * one does (lionvalidate() asks every type pair for one).
+ */
+static FmgrInfo *
+lion_ne_any_equality(Relation index, LionState *col, const LionProbe *probe,
+					 Oid keytype, FmgrInfo *finfo)
+{
+	Oid			opfamily = index->rd_opfamily[col->attno - 1];
+	Oid			eqopr;
+
+	if (!probe->crosstype)
+		return &col->eqproc;
+	eqopr = get_opfamily_member(opfamily, keytype, keytype, LION_STRAT_EQUAL);
+	if (!OidIsValid(eqopr))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				 errmsg("missing operator %d(%s,%s) in operator family \"%s\"",
+						LION_STRAT_EQUAL, format_type_be(keytype),
+						format_type_be(keytype),
+						get_opfamily_name(opfamily, false))));
+	fmgr_info(get_opcode(eqopr), finfo);
+	return finfo;
+}
+
+/*
  * `k <> ANY (array)` (DESIGN.md §35): amsearcharray hands the planner's
  * ScalarArrayOpExpr to us for every strategy of the family, `<>` included.  It
  * is true of a row whose k differs from SOME element: with two distinct
@@ -3059,9 +3088,12 @@ lion_getbitmap_choice(LionScanOpaque so, LionScanChoice *ch, TIDBitmap *tbm)
  * classifies it: `IS NOT NULL`, the `<>` of the one element, or a `<>` of
  * NULL, which selects nothing as every strict key with a NULL value does.
  * The elements are told apart with the comparison the probe resolution gives
- * values of their type among themselves (the family's proc 4, which the
- * validator insists on beside `<>`), under the column's collation - two
- * values it calls equal are one value to the column's equality too.
+ * values of their type among themselves (the family's proc 4), under the
+ * column's collation - two values it calls equal are one value to the
+ * column's equality too.  A column whose directory is in hash order (§21) has
+ * no such comparison, whatever procs its family holds, and neither has a
+ * type the family orders against the column's but not against itself: there
+ * equality tells them apart (lion_ne_any_equality()).
  *
  * Returns keys itself when there is nothing to rewrite, and a copy in cxt
  * otherwise, whose values live there too.
@@ -3083,6 +3115,8 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 		bool	   *nulls;
 		int			nelems;
 		LionProbe	probe;
+		FmgrInfo	eqinfo;
+		FmgrInfo   *equal = NULL;	/* without a comparison, once needed */
 		int			i;
 
 		/*
@@ -3109,12 +3143,19 @@ lion_scan_key_ne_any(Relation index, LionState *col, ScanKey k)
 				ndistinct = 1;
 				continue;
 			}
-			if (!probe.hassort)
-				elog(ERROR, "lion index \"%s\": no comparison for the elements of `<> ANY`",
-					 RelationGetRelationName(index));
-			if (DatumGetInt32(FunctionCall2Coll(&probe.sortproc,
-												col->collation,
-												elems[i], one)) != 0)
+			if (probe.hassort)
+			{
+				if (DatumGetInt32(FunctionCall2Coll(&probe.sortproc,
+													col->collation,
+													elems[i], one)) != 0)
+					ndistinct = 2;
+				continue;
+			}
+			if (equal == NULL)
+				equal = lion_ne_any_equality(index, col, &probe,
+											 k->sk_subtype, &eqinfo);
+			if (!DatumGetBool(FunctionCall2Coll(equal, col->collation,
+												elems[i], one)))
 				ndistinct = 2;
 		}
 	}
