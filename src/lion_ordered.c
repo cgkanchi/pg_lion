@@ -974,7 +974,7 @@ static void lo_initialize_worker(CustomScanState *node, shm_toc *toc,
 								 void *coordinate);
 static void lo_shutdown(CustomScanState *node);
 
-static const CustomPathMethods lo_path_methods = {
+const CustomPathMethods lion_ordered_path_methods = {
 	.CustomName = "LionOrdered",
 	.PlanCustomPath = lo_plan_path,
 };
@@ -988,7 +988,7 @@ static const CustomScanMethods lo_scan_methods = {
  * A btree's walk that claims no order (DESIGN.md §40): the same plan and the
  * same executor under a name that does not promise one.
  */
-static const CustomPathMethods lo_btree_path_methods = {
+const CustomPathMethods lion_btree_path_methods = {
 	.CustomName = "LionBtreeScan",
 	.PlanCustomPath = lo_plan_path,
 };
@@ -3460,9 +3460,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				/* a lionvec index returns no values: heap mode (§44.6) */
 				lo_cost_knn(root, rel, ord, lion, residual, rows,
 							&startup, &total);
-				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
-							list_make3(ord, lion, NIL), rows, startup, total,
-							false, 0);
+				lo_add_path(rel, &lion_ordered_path_methods,
+							ord->path.pathkeys, list_make3(ord, lion, NIL),
+							rows, startup, total, false, 0);
 				knn->offered++;
 				continue;
 			}
@@ -3477,7 +3477,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
 					indexonly, NULL, &startup, &total);
-			lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
+			lo_add_path(rel, &lion_ordered_path_methods, ord->path.pathkeys,
 						list_make3(ord, lion, iocols), rows, startup, total,
 						rel->consider_parallel, 0);
 
@@ -3485,9 +3485,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
 						rows, indexonly, &workers, &startup, &total))
-				lo_add_path(rel, &lo_path_methods, ord->path.pathkeys,
-							list_make3(ord, lion, iocols), rows, startup,
-							total, true, workers);
+				lo_add_path(rel, &lion_ordered_path_methods,
+							ord->path.pathkeys, list_make3(ord, lion, iocols),
+							rows, startup, total, true, workers);
 		}
 	}
 
@@ -3546,7 +3546,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 					rows, true, NULL, &startup, &total);
 			lo_add_path(rel, pathkeys != NIL ?
-						&lo_path_methods : &lo_btree_path_methods,
+						&lion_ordered_path_methods : &lion_btree_path_methods,
 						pathkeys, list_make3(ipath, lion, iocols),
 						rows, startup, total, rel->consider_parallel, 0);
 
@@ -3555,7 +3555,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 						rows, true, &workers, &startup, &total))
 				lo_add_path(rel, pathkeys != NIL ?
-							&lo_path_methods : &lo_btree_path_methods,
+							&lion_ordered_path_methods : &lion_btree_path_methods,
 							pathkeys, list_make3(ipath, lion, iocols),
 							rows, startup, total, true, workers);
 		}
@@ -3596,8 +3596,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							  list_make1(w->var));
 			priv = lappend(priv, lion);
 			priv = lappend(priv, w->vrinfos);
-			lo_add_path(rel, &lo_path_methods, list_make1(w->pathkey), priv,
-						rows, startup, total, false, 0);
+			lo_add_path(rel, &lion_ordered_path_methods,
+						list_make1(w->pathkey), priv, rows, startup, total,
+						false, 0);
 		}
 	}
 }
@@ -3992,7 +3993,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	priv.expected = expected;
 	priv.limit = limit;
 	cscan->custom_private = lo_priv_encode(&priv);
-	cscan->methods = (best_path->methods == &lo_btree_path_methods) ?
+	cscan->methods = (best_path->methods == &lion_btree_path_methods) ?
 		&lo_btree_scan_methods : &lo_scan_methods;
 
 	return &cscan->scan.plan;
