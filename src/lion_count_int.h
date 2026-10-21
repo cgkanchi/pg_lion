@@ -226,16 +226,35 @@ typedef struct LionCountCtx
 	int64		count;			/* members counted straight from the VM */
 	LionCountStats stats;
 
-	/* TIDs on heap blocks that were not all-visible, in ascending order */
+	/*
+	 * TIDs on heap blocks that were not all-visible: in ascending order as
+	 * one merge produces them, out of it once a later pass of a count taken
+	 * in passes begins at the first key again (passes, below).
+	 */
 	ItemPointerData *tids;
 	int			ntids;
 	int			maxtids;
 	int			batchmax;		/* flush the list once it holds this many */
-	bool		tids_sorted;	/* they came out in order (they always do) */
+	bool		tids_sorted;	/* they came out in order */
+	bool		passes;			/* the count is taken in passes: spill,
+								 * below */
 	int64		recheck_count;	/* rows counted by the batches flushed so far */
 	bool	   *visout;			/* lion_recheck_visible(): where each TID's
 								 * answer goes, by its place in tids; NULL for
 								 * a count */
+
+	/*
+	 * The count is taken in PASSES that each yield the container keys from
+	 * the first again - the entries of a disjoint sum, the batches of a long
+	 * list (DESIGN.md §9 step 5, §15) - so the dirty heap blocks of one pass
+	 * are those of the next as well.  A list that fills up is then not
+	 * rechecked, which would read those blocks again in every later pass,
+	 * but spilled: its TIDs, and every one after them, go to a sort of their
+	 * codes in work_mem, which writes runs to temporary files past that, and
+	 * come back from it in order when the passes are over, every heap block
+	 * read once (lion_recheck_flush()).  tids_spilled counts them.
+	 */
+	struct Tuplesortstate *spill;
 
 	/*
 	 * An EXISTENCE test rather than a count (DESIGN.md §26): stop at the first
