@@ -124,8 +124,8 @@ lion_load_inner_keys(LionCountScanState *st)
 			 * Huge allocations: what bounds the arrays is work_mem, and at a
 			 * work_mem past some 600 MB the keys of 67 million entries fit it
 			 * where their array's next doubling, a gigabyte, is more than a
-			 * plain allocation may be (2026-10-20 review).  Past what an int
-			 * counts they do not fit, whatever work_mem says.
+			 * plain allocation may be.  Past what an int counts they do not
+			 * fit, whatever work_mem says.
 			 */
 			if (cap > INT_MAX / 2)
 			{

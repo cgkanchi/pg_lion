@@ -117,9 +117,9 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 	 * Neither holds for a count taken in passes (LionCountCtx.passes): every
 	 * pass begins at the first key again, so a block flushed now is a block
 	 * of the next pass too, and is read again then - once per flush, which
-	 * at 64 kB of work_mem reads every dirty page of the table about three
-	 * times over for an IN list of ten values (2026-10-20 review).  Such a
-	 * list is spilled instead when it is full, and the passes go on into the
+	 * at 64 kB of work_mem would read every dirty page of the table about
+	 * three times over for an IN list of ten values.  Such a list is
+	 * spilled instead when it is full, and the passes go on into the
 	 * sort; the flush at the end of the count reads it back in order.
 	 */
 	if (cx->spill == NULL && cx->ntids > 0 &&
@@ -274,7 +274,7 @@ lion_collect_container(LionCollect *col, const LionContainer *c)
 	 * hundred megabytes is more than a plain allocation may be: the buffer
 	 * and the offsets are huge allocations, as a spill's entries are
 	 * (lion_spill_add()): the doubling of a copy past 512 MB is a gigabyte,
-	 * one byte more than MaxAllocSize (2026-10-20 review).
+	 * one byte more than MaxAllocSize.
 	 */
 	oldcxt = MemoryContextSwitchTo(col->cxt);
 	if (col->used + sz > col->cap)
