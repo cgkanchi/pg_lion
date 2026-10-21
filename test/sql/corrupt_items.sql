@@ -344,11 +344,14 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
 
 -- ---------- 10. an index of an older format version ----------
--- An index with its meta page's version (at byte 28) made 11, the format
--- before every internal directory page began with a minus-infinity downlink
--- (DESIGN.md §21, "Height"), then 9, the one before the compact entry tuples
--- of §21, and then 8, the one before the varbyte sparse segments of §13: its
--- directory may be taller than any this build writes, or its entries or
+-- An index with its meta page's version (at byte 28) made 13, the format
+-- before this one, which filed an empty array with dimensions in the EMPTY
+-- entry (DESIGN.md §17) and whose meta page could carry a flag for NARROW
+-- items (§38) that this one does not have, then 11, the format before
+-- every internal directory page began with a minus-infinity downlink (§21,
+-- "Height"), then 9, the one before the compact entry tuples of §21, and
+-- then 8, the one before the varbyte sparse segments of §13: its flags or
+-- its directory may be what this build never writes, or its entries or
 -- segments would be read wrongly, so lion_index_verify() reports it and a
 -- reader refuses it, asking for a REINDEX - which makes it whole again.
 CREATE FUNCTION lion_di_hint(q text) RETURNS text
@@ -365,6 +368,10 @@ END $$;
 CREATE INDEX lion_di_old_i ON lion_di USING lion (k);
 SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
+SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
+SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(11));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);

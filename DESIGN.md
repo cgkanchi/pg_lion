@@ -361,11 +361,14 @@ with summary posting sets, which records them in `summary_cols` and `summary_tid
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
 with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
 segments of delta varints. Version 10, §21: compact entry tuples. Version 11, below: keys of up to
-2047 bytes, which every index this build writes is and the only one it reads; whether there are summaries is `summary_cols`.)* Version 2 was the first that
-indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
-from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
-structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
-rather than a wrong answer.
+2047 bytes. Version 12, §21: key-less first downlinks. Version 13, §17: the NULLELEMS entry. Version
+14: the EMPTYDIM and EMPTYINNER entries (§17), and NARROW items wherever a container goes, with no
+meta page flag for them (§38) - which every index this build writes is and the only one it reads;
+whether there are summaries is `summary_cols`.)* Version 2 was the first that indexes NULL keys
+(§14); version 3 (§18) added owner_hash/owner_head, which grows the special area from 16 to 24 bytes
+and therefore moves every item on every page. An index of an older version is structurally readable
+by nothing in this code, so opening one is an ERROR that asks for a REINDEX rather than a wrong
+answer.
 
 **Superseded by §21 (format version 4).** Everything in the next two paragraphs - the bucket
 directory, `nbuckets`, `lion_bucket_of()` - is gone: the entry directory is a B-tree keyed by the
@@ -7615,12 +7618,14 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 14 (`LION_VERSION_V14`, the EMPTYDIM and EMPTYINNER entries of §17): these entry tuples, with keys of up to 2047 bytes
+The format is version 14 (`LION_VERSION_V14`: the EMPTYDIM and EMPTYINNER entries of §17, and
+NARROW items without a meta page flag, §38): these entry tuples, with keys of up to 2047 bytes
 (§4), under internal pages that each begin with a minus-infinity downlink ("Height" below), and
 the pages VACUUM takes out and hands out again ("Page deletion" below, §22 "Empty leaves"). An
 index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
-offsets, its long jsonb keys looked for in the wrong form, or (version 11) its directory may be of
-any height.
+offsets, its long jsonb keys looked for in the wrong form, (version 11) its directory may be of
+any height, or (version 13) its empty arrays with dimensions are in the EMPTY entry and its meta
+page may carry the NARROW flag this format does not have.
 
 ### The order
 
@@ -21968,10 +21973,12 @@ image is, which is where the bytes are saved.
 ### Format version (lion.h, lion_meta.c)
 
 Version 8 is version 7 plus NARROW items, with or without summaries (`summary_cols` says, as in
-version 7), and its NARROW is the one above. Every version since reads and writes the same NARROW,
-and an index of this build's version may hold one wherever a container goes, whoever wrote it: the
-meta page records nothing about it. An older version is refused with the "not a valid lion index"
-ERROR and its REINDEX hint (lion.h).
+version 7), and its NARROW is the one above. Every version since reads and writes the same NARROW.
+An index of version 14 may hold one wherever a container goes, whoever wrote it - the build, an
+INSERT or VACUUM - and its meta page records nothing about it: `order_flags` has no bit for it.
+Version 13 had one, 0x0004, set when the build had written a NARROW, and VACUUM made NARROWs only
+in such an index. An older version than 14 is refused with the "not a valid lion index" ERROR and
+its REINDEX hint (lion.h).
 
 The first version's NARROWs had flags 0 and two words a block; this build reads flags 0 as no width
 it has, and refuses the item as above. No build of the first version was released, so nothing
@@ -21982,8 +21989,7 @@ reads it in place: a REINDEX under this build rewrites such an index at the widt
 - `lion_index_verify()` checks a NARROW's width (1 .. `LION_NARROW_MAX_WIDTH`), that the item has
   the bytes its width sizes, its cardinality against its payload, its members' offsets against the
   heap block's line pointers like any container's ("narrow container member is not a heap tuple
-  offset" for a bit past the block's last), that every other container's flags are 0, and that the
-  version the meta page says now - read off the page, not the cached state - is 8 or more.
+  offset" for a bit past the block's last), and that every other container's flags are 0.
 - `lion_index_stats()` counts NARROWs of every width in `narrow_containers`, its last column, and
   in `containers`; its signature did not change, and there is no column per width.
 - EXPLAIN has no counter per container kind; `Containers Visited` counts NARROWs with the rest.
