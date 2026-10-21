@@ -6429,12 +6429,13 @@ row, and the LionBm25 scan would return fewer rows than the sort of the same sco
   The functions are declared CALLED ON NULL INPUT for col's NULL, and give no rows (a NULL score)
   for a NULL in any other argument, as STRICT would.
 
-The query's lexemes are its operands not under a NOT, once each; a prefix is refused. Candidates
-stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with the empty
-key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are sorted
-and fetched best first under the caller's snapshot, the TID following a HOT chain to the visible
-version, until `k` are visible; when dead rows leave fewer, the walk is made again for the next
-`4L`: the rows ranked strictly below the last one already tried, by (score, TID). A row's score
+The query's lexemes are its operands not under a NOT, once each; a prefix among them is refused, and
+one under a NOT scores nothing, as every operand there does (`'w1 & !w7:*'` ranks by `w1`).
+Candidates stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with
+the empty key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are
+sorted and fetched best first under the caller's snapshot, the TID following a HOT chain to the
+visible version, until `k` are visible; when dead rows leave fewer, the walk is made again for the
+next `4L`: the rows ranked strictly below the last one already tried, by (score, TID). A row's score
 depends only on its members and on the prepared query (N, df and avgdl are read once per call), so
 that is exactly where the last walk stopped. An offset into a bigger walk is not: a row inserted
 meanwhile, invisible to the snapshot but in the index, moves every row ranked below it down a place,
@@ -6523,7 +6524,10 @@ which is parameterized by the relations they name - the scan's is not, and its p
 that value from a column of a relation it does not scan. So are parameters the function refuses,
 whose error it raises. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
-time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
+time from the lexemes' entries alone, `lion_bm25_plan_ncodes()`: a plan reads no row's length for
+avgdl, which the price does not use, and takes none of a search's predicate locks, which a plan
+that is never run would leave behind in a SERIALIZABLE transaction). Each row then costs a random
+page, a tuple and the restrictions. Against a bitmap scan that
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
 ms for two mid-frequency words, 157 ms to 51 ms for two common ones, and 160 ms to 21 ms for one
 very common word with two rarer ones. A rare AND keeps the bitmap scan, which is the cheaper plan.
@@ -6727,10 +6731,12 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 
 - Build: exact.  Pass 1 has just counted the distinct keys, so the test is `ndistinct > max_entries`.
 - Insert: a running estimate, and only on the one path that can add a key - creating a new entry.
-  **The heuristic is `entries on this bucket's chain + 1, times the bucket count`.**  Hashes spread
-  keys evenly enough for the product to have the right order of magnitude, and the bucket chain is
-  already locked and about to be walked anyway, so the guard costs nothing on the hot path.  It is
-  deliberately crude: counting the whole index per new key would read every bucket page.
+  **The heuristic is `entries on this directory leaf + 1, times the leaves`** (§21), the leaves
+  being the meta page's count of directory pages less the directory's height, and one at least
+  (`lion_insert_new_entry()`).  The index's other blocks - posting and position trees, free pages -
+  hold no entries: a column of five keys with 100,000 rows each is 62 blocks and one leaf.  The
+  leaf is already locked, and the meta page comes after it in a split's lock order.  It is
+  deliberately crude: counting the whole index per new key would read every leaf.
 
 ### Not supported
 
@@ -9729,7 +9735,11 @@ take the columns one by one, the largest left first (by the size of the particip
 while the leader writes the first: whoever writes a column imports the participants' tapes of it and
 merges them as above, so merging, grouping codes into containers, posting and position trees and
 summaries all run in parallel. The directory, the meta page and the one bulk writer stay the
-leader's. A worker writes its column with the builders a serial build uses into a file of its own
+leader's, and so do the options: every participant scans and writes with the copy the leader took
+when the build began (`lion_build_options()`, in the shared state), not with its own relcache's,
+which an `ALTER INDEX ... SET` committed since - it does not wait for `CREATE INDEX CONCURRENTLY`,
+whose lock on the index is `RowExclusiveLock` - would have changed. A worker writes its column
+with the builders a serial build uses into a file of its own
 instead of the index: its blocks are numbered by a counter of its own from 0, each finished page
 goes to the file with its number, and so does each entry tuple, which a serial build would add to
 the directory there and then; every record says how many blocks the worker had handed out by then.
@@ -20822,7 +20832,10 @@ whose key compares equal to c and bounds the walk on neither side. So:
   rewrites the key as the one it means before anything classifies it (`lion_scan_keys_rewrite()`):
   `IS NOT NULL`, the `<>` of the one element, or a `<>` of NULL. The elements are told apart with
   the probe's comparison of their type among themselves, under the column's collation, where two
-  values it calls equal are one value to the index too (`'AB'` and `'ab'` under citext).
+  values it calls equal are one value to the index too (`'AB'` and `'ab'` under citext). Where the
+  probe has none - a column in hash order (§21), an element type the family orders against the
+  column's but not against itself - equality tells them apart: the column's own for its type, the
+  family's strategy 1 for the element type's pair (`lion_ne_any_equality()`).
 - **The price** (`lioncostestimate()`): a walk with holes reads the keys of its RANGE - n_distinct
   times the other bounds' selectivity - less the holes, and no summaries
   (`lion_cost_ranges_entries()`). Priced by its selectivity, `SearchPhrase <> ''` was 13% of

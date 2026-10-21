@@ -149,6 +149,19 @@ _PG_init(void)
 	lion_relopt_kind = add_reloption_kind();
 
 	/*
+	 * Every option but max_entries is read by a build alone, and what it
+	 * decided is on the meta page or in the pages it wrote: inserts, VACUUM
+	 * and scans read the meta page's inline_limit, wal_mode, summaries and
+	 * positions, never the option.  So ALTER INDEX ... SET of one changes the
+	 * index at its next REINDEX, and takes ShareUpdateExclusiveLock, as core's
+	 * fillfactor of an index does: it waits only for what rebuilds the index -
+	 * a REINDEX, a concurrent one - and another ALTER, and blocks no scan and
+	 * no insert.  A build whose lock does not conflict with it, CREATE INDEX
+	 * CONCURRENTLY's, reads a copy taken once, and its workers the leader's
+	 * (lion_build_options()).
+	 */
+
+	/*
 	 * `buckets` is accepted and ignored since format 4 (DESIGN.md §21): the
 	 * hash directory it sized is gone, and refusing the option outright would
 	 * break every CREATE INDEX script that sets it.  lionoptions() says so
@@ -157,11 +170,11 @@ _PG_init(void)
 	add_int_reloption(lion_relopt_kind, "buckets",
 					  "Ignored since format 4; the entry directory is a B-tree",
 					  0, 0, 65536,
-					  AccessExclusiveLock);
+					  ShareUpdateExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "fillfactor",
 					  "Percentage of a directory leaf ambuild fills",
 					  LION_DEFAULT_FILLFACTOR, LION_MIN_FILLFACTOR, 100,
-					  AccessExclusiveLock);
+					  ShareUpdateExclusiveLock);
 	/*
 	 * DESIGN.md §22, "Bulk build".  Read at build time only, like fillfactor:
 	 * it decides how much room the build leaves on the posting-tree leaves it
@@ -171,7 +184,7 @@ _PG_init(void)
 					  "Percentage of a posting-tree leaf ambuild fills",
 					  LION_DEFAULT_POSTING_FILLFACTOR,
 					  LION_MIN_POSTING_FILLFACTOR, 100,
-					  AccessExclusiveLock);
+					  ShareUpdateExclusiveLock);
 	/*
 	 * DESIGN.md §4, "Growth slack".  Read at build time only: it decides the
 	 * lengths the build writes items at, and an INSERT keeps whatever length
@@ -181,12 +194,12 @@ _PG_init(void)
 					   "Whether ambuild leaves insert growth room in INLINE entries and posting items",
 					   lion_build_slack_options, LION_DEFAULT_BUILD_SLACK,
 					   "Valid values are \"auto\", \"on\" and \"off\".",
-					   AccessExclusiveLock);
+					   ShareUpdateExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "inline_limit",
 					  "Maximum size in bytes of a posting set kept inside its entry tuple",
 					  LION_DEFAULT_INLINE_LIMIT, LION_MIN_INLINE_LIMIT,
 					  LION_MAX_INLINE_LIMIT,
-					  AccessExclusiveLock);
+					  ShareUpdateExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "max_entries",
 					  "Distinct keys above which the index warns once per backend (0 disables)",
 					  LION_DEFAULT_MAX_ENTRIES, 0, INT_MAX,
@@ -204,7 +217,7 @@ _PG_init(void)
 					   "Which WAL logger this index is built for",
 					   lion_wal_mode_options, LION_WALOPT_AUTO,
 					   "Valid values are \"auto\", \"generic\" and \"rmgr\".",
-					   AccessExclusiveLock);
+					   ShareUpdateExclusiveLock);
 
 	/*
 	 * DESIGN.md §32.  Summary posting sets make a range over many keys cost
@@ -220,12 +233,12 @@ _PG_init(void)
 					   "Which ordered key columns get summary posting sets",
 					   lion_summaries_options, LION_SUMOPT_OFF,
 					   "Valid values are \"off\", \"on\" and \"auto\".",
-					   AccessExclusiveLock);
+					   ShareUpdateExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "summary_tids",
 					  "Rows a summary posting set holds before the next one starts",
 					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
 					  LION_MAX_SUMMARY_TIDS,
-					  AccessExclusiveLock);
+					  ShareUpdateExclusiveLock);
 
 	/*
 	 * DESIGN.md §17, "Stored positions".  "auto" by default: a tsvector
@@ -241,7 +254,7 @@ _PG_init(void)
 					   "Store word positions for phrase, weight and NOT queries",
 					   lion_store_positions_options, LION_POSOPT_AUTO,
 					   "Valid values are \"auto\", \"on\", \"off\", \"true\" and \"false\".",
-					   AccessExclusiveLock);
+					   ShareUpdateExclusiveLock);
 
 	/*
 	 * The resource manager itself, which only registers while
@@ -1181,15 +1194,16 @@ lion_check_table_am(Relation heap)
 void
 lionbuildempty(Relation index)
 {
-	LionOptions *opts = (LionOptions *) index->rd_options;
+	LionOptions opts;
 	uint32		inline_limit;
 	uint32		wal_mode;
 	Buffer		buf;
 	LionMetaPageData meta;
 	LionIndexState ix;
 
-	inline_limit = opts ? (uint32) opts->inline_limit : LION_DEFAULT_INLINE_LIMIT;
-	wal_mode = lion_wal_mode_for_build(index);
+	lion_build_options(index, &opts);
+	inline_limit = (uint32) opts.inline_limit;
+	wal_mode = lion_wal_mode_for_build(index, &opts);
 
 	/*
 	 * The order an empty directory is in is the one every later insert will
@@ -1197,10 +1211,10 @@ lionbuildempty(Relation index)
 	 * the catalog, with a state no meta page has recorded anything in yet.
 	 */
 	memset(&meta, 0, sizeof(meta));
-	if (opts == NULL || opts->store_positions != LION_POSOPT_OFF)
+	if (opts.store_positions != LION_POSOPT_OFF)
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, &ix, &meta, CurrentMemoryContext);
-	lion_settle_store_positions(index, &ix);
+	lion_settle_store_positions(index, &ix, &opts);
 	lion_meta_record_order(&meta, &ix);	/* not in the critical section */
 
 	/*
@@ -1213,13 +1227,11 @@ lionbuildempty(Relation index)
 		uint32		cols = 0;
 		int			i;
 
-		if (opts != NULL && opts->summaries == LION_SUMOPT_ON)
+		if (opts.summaries == LION_SUMOPT_ON)
 			for (i = 0; i < ix.ncolumns; i++)
 				if (ix.cols[i].ordered && !ix.cols[i].multikey)
 					cols |= ((uint32) 1) << i;
-		lion_meta_record_summaries(&meta, cols,
-								   opts ? (uint32) opts->summary_tids :
-								   LION_DEFAULT_SUMMARY_TIDS);
+		lion_meta_record_summaries(&meta, cols, (uint32) opts.summary_tids);
 	}
 
 	/* Meta page, pointing at the one leaf that is also the root (§21). */

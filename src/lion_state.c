@@ -919,9 +919,9 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
  * store_positions = on on such an index is a mistake worth saying so about.
  */
 void
-lion_settle_store_positions(Relation index, LionIndexState *ix)
+lion_settle_store_positions(Relation index, LionIndexState *ix,
+							const LionOptions *opts)
 {
-	LionOptions *opts = (LionOptions *) index->rd_options;
 	int			i;
 
 	if ((ix->meta.order_flags & LION_META_POSITIONS) == 0)
@@ -929,7 +929,7 @@ lion_settle_store_positions(Relation index, LionIndexState *ix)
 	for (i = 0; i < ix->ncolumns; i++)
 		if (ix->cols[i].positions)
 			return;
-	if (opts == NULL || opts->store_positions != LION_POSOPT_ON)
+	if (opts->store_positions != LION_POSOPT_ON)
 	{
 		ix->meta.order_flags &= ~LION_META_POSITIONS;
 		return;

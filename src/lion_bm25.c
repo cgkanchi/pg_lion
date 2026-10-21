@@ -39,7 +39,8 @@
  * are its operands, each counted once, except those under a NOT; its
  * operators, phrase distances and weights do not change the score, so a
  * caller who wants only the rows that match the query as a whole adds the
- * `@@` itself.  A prefix lexeme is refused.
+ * `@@` itself.  A prefix lexeme is refused, unless it is under a NOT, where
+ * it scores nothing as every operand there does.
  *
  * col names the column as the index does, in its own pg_attribute: a plain
  * column by the table column's name when the index was built, an expression
@@ -138,8 +139,9 @@ static HTAB *lion_bm25_stats_cache = NULL;
 /*
  * The keys of the lexemes of query that count: every operand not under a
  * NOT, once, as lion_lexeme_key() files it - a long lexeme under its hashed
- * key.  A prefix operand names no one key: it is refused, or with prefix
- * given, reported there.
+ * key.  A prefix operand that counts names no one key: it is refused, or with
+ * prefix given, reported there.  One under a NOT counts for nothing, whatever
+ * keys it would stand for.
  */
 static void
 lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
@@ -155,6 +157,8 @@ lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
 		text	   *lex;
 		ListCell   *lc;
 
+		if (negated)
+			return;
 		if (op->prefix && prefix != NULL)
 		{
 			*prefix = true;
@@ -164,8 +168,6 @@ lion_bm25_terms_walk(TSQuery query, int i, bool negated, bool *prefix,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("lion_bm25 cannot rank a prefix lexeme")));
-		if (negated)
-			return;
 		lex = lion_lexeme_key(GETOPERAND(query) + op->distance, op->length,
 							  NULL);
 		foreach(lc, *out)
@@ -243,12 +245,13 @@ lion_bm25_open(Relation index, LionState *col, Datum key, bool countsonly)
 }
 
 /*
- * The rows filed under key: its entry's ntids, 0 when it has none.  The
- * entry, or the gap, is predicate-locked (DESIGN.md §9): a count of 0 is
- * how a search learns that no row can score.
+ * The rows filed under key: its entry's ntids, 0 when it has none.  With lock
+ * the entry, or the gap, is predicate-locked (DESIGN.md §9): a count of 0 is
+ * how a search learns that no row can score.  The planner's price of a walk
+ * is no read of the rows, and takes none (lion_bm25_plan_ncodes()).
  */
 static uint64
-lion_bm25_ntids(Relation index, LionState *col, Datum key)
+lion_bm25_ntids(Relation index, LionState *col, Datum key, bool lock)
 {
 	uint64		ntids = 0;
 	Buffer		buf = InvalidBuffer;
@@ -263,10 +266,11 @@ lion_bm25_ntids(Relation index, LionState *col, Datum key)
 		BlockNumber blkno = BufferGetBlockNumber(buf);
 		LionEntryTuple *e = lion_page_entry_fetch(index, page, blkno, off);
 
-		lion_reader_lock_entry(index, blkno, e);
+		if (lock)
+			lion_reader_lock_entry(index, blkno, e);
 		ntids = lion_entry_ntids(e);
 	}
-	else
+	else if (lock)
 		lion_reader_lock_absent(index, buf, moved);
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
@@ -292,7 +296,7 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 {
 	LionBm25Stats *st;
 	LionBm25StatsKey key;
-	uint64		ntids = lion_bm25_ntids(index, col, lenkey);
+	uint64		ntids = lion_bm25_ntids(index, col, lenkey, true);
 	bool		found;
 
 	if (ntids == 0)
@@ -659,7 +663,7 @@ lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query, double k1,
 	foreach(lc, lexemes)
 	{
 		uint64		df = lion_bm25_ntids(index, q->col,
-										 PointerGetDatum(lfirst(lc)));
+										 PointerGetDatum(lfirst(lc)), true);
 
 		q->ncodes += df;
 		df = Min(df, (uint64) nrows);
@@ -672,6 +676,34 @@ lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query, double k1,
 	lion_bm25_sort_idfs = q->idfs;
 	qsort(q->order, q->nterms, sizeof(int), lion_bm25_order_cmp);
 	return q->ncodes > 0;
+}
+
+/*
+ * The members a walk of query's lexemes in key column attno would read, for
+ * the planner's price of the LionBm25 scan (lion_bm25_scan.c): the lexemes'
+ * entries' ntids, added up.  Only that: lion_bm25_prepare() would also walk
+ * the empty key for avgdl when this backend has no statistics of the column
+ * yet - every row's length, for a price that does not use it - and take the
+ * predicate locks of a search, which planning is not.  0 where attno does
+ * not rank.
+ */
+double
+lion_bm25_plan_ncodes(Relation index, AttrNumber attno, TSQuery query)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	List	   *lexemes;
+	ListCell   *lc;
+	double		n = 0;
+
+	if (attno < 1 || attno > ix->ncolumns ||
+		!lion_bm25_ranks(&ix->cols[attno - 1]))
+		return 0;
+	lexemes = lion_bm25_lexemes(query, NULL);
+	foreach(lc, lexemes)
+		n += (double) lion_bm25_ntids(index, &ix->cols[attno - 1],
+									  PointerGetDatum(lfirst(lc)), false);
+	list_free_deep(lexemes);
+	return n;
 }
 
 /*

@@ -71,6 +71,12 @@ SELECT bm_same('w2 <-> w5 & !w9', '{w2,w5}', 30);	-- NOT terms do not score
  30 rows, 0 differ
 (1 row)
 
+SELECT bm_same('w1 & !w7:*', '{w1}', 30);			-- nor a prefix under a NOT
+      bm_same      
+-------------------
+ 30 rows, 0 differ
+(1 row)
+
 SELECT bm_same('w1:A & w2', '{w1,w2}', 30);			-- weights do not either
       bm_same      
 -------------------

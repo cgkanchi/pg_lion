@@ -54,6 +54,8 @@ extern AttrNumber lion_bm25_column(Relation index, LionIndexState *ix,
 extern List *lion_bm25_lexemes(TSQuery query, bool *prefix);
 extern bool lion_bm25_params_ok(double k1, double b);
 extern void lion_bm25_check_params(double k1, double b);
+extern double lion_bm25_plan_ncodes(Relation index, AttrNumber attno,
+									TSQuery query);
 extern bool lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query,
 							  double k1, double b, LionBm25Query *q);
 extern int64 lion_bm25_topk(const LionBm25Query *q, int64 L,
