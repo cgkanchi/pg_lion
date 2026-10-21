@@ -349,6 +349,71 @@ SELECT lion_cbcmp(format('SELECT count(*) FROM lion_cb WHERE tags && %L::int[]',
  pushed down, same answer
 (1 row)
 
+-- ---------- every dirty heap block read once, whatever the budget ----------
+/*
+ * A count taken in passes - the disjoint sum, an entry at a time (`x IN (1,
+ * 2)`), and a list beside another source, some thirty CHAIN sets a batch
+ * here (the list's thousand values are one batch of the node's, "List
+ * Batches") - yields the container keys from the first again in every pass,
+ * so the dirty blocks of one pass are those of the next.  A flush of its
+ * recheck list whenever it filled up would read again the blocks the passes
+ * after it read: at 64kB of work_mem the sum below read 8,573 heap blocks
+ * that way and the batches 1,518, where a work_mem holding every candidate
+ * read 4,286 and 1,458, each once (2026-10-20 review).  The full list of such
+ * a count is spilled to a sort and read back in order at the end, so the
+ * blocks are the same at both budgets, and no more than the heap has; "Heap
+ * TIDs Spilled" says the sort was used.  The DELETE dirties
+ * every page inside the transaction, where nothing it deletes can be pruned
+ * and no page set all-visible between the runs.
+ */
+CREATE FUNCTION lion_cb_rechecks(q text, OUT cnt bigint, OUT blocks bigint,
+								 OUT spilled bigint, OUT summed bigint)
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	blocks := 0;
+	spilled := 0;
+	summed := 0;
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF ln ~ '^\s*Heap Blocks Rechecked:' THEN
+			blocks := blocks + substring(ln FROM ':\s*(\d+)')::bigint;
+		ELSIF ln ~ '^\s*Heap TIDs Spilled:' THEN
+			spilled := spilled + substring(ln FROM ':\s*(\d+)')::bigint;
+		ELSIF ln ~ '^\s*Posting Sets Summed:' THEN
+			summed := summed + substring(ln FROM ':\s*(\d+)')::bigint;
+		END IF;
+	END LOOP;
+	EXECUTE q INTO cnt;
+END $$;
+BEGIN;
+SET LOCAL max_parallel_workers_per_gather = 0;
+DELETE FROM lion_cb WHERE id % 3 = 0;
+CREATE TEMP TABLE lion_cbr AS
+	SELECT 'sum' AS q, '64kB' AS budget, * FROM lion_cb_rechecks(
+		'SELECT count(*) FROM lion_cb WHERE x IN (1, 2)');
+INSERT INTO lion_cbr SELECT 'batches', '64kB', * FROM lion_cb_rechecks(
+	'SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(0, 999) g)) AND x IS NOT NULL');
+SET LOCAL work_mem = '32MB';
+INSERT INTO lion_cbr SELECT 'sum', '32MB', * FROM lion_cb_rechecks(
+	'SELECT count(*) FROM lion_cb WHERE x IN (1, 2)');
+INSERT INTO lion_cbr SELECT 'batches', '32MB', * FROM lion_cb_rechecks(
+	'SELECT count(*) FROM lion_cb WHERE k = ANY (array(SELECT g FROM generate_series(0, 999) g)) AND x IS NOT NULL');
+SELECT q, count(DISTINCT cnt) AS answers, count(DISTINCT blocks) AS block_visits,
+	   max(blocks) <= pg_relation_size('lion_cb') / current_setting('block_size')::int
+		   AS within_heap,
+	   bool_and(spilled > 0) FILTER (WHERE budget = '64kB') AS spilled_at_64kb,
+	   bool_and(spilled = 0) FILTER (WHERE budget = '32MB') AS in_memory_at_32mb,
+	   bool_or(summed > 0) AS summed
+  FROM lion_cbr GROUP BY q ORDER BY q;
+    q    | answers | block_visits | within_heap | spilled_at_64kb | in_memory_at_32mb | summed 
+---------+---------+--------------+-------------+-----------------+-------------------+--------
+ batches |       1 |            1 | t           | t               | t                 | f
+ sum     |       1 |            1 | t           | t               | t                 | t
+(2 rows)
+
+ROLLBACK;
+DROP FUNCTION lion_cb_rechecks(text);
 -- ---------- the copies a GROUP BY keeps of its WHERE sets ----------
 /*
  * From its second group on, a GROUP BY serves its WHERE sets from private
