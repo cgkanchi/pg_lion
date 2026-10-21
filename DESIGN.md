@@ -972,16 +972,19 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         OUT posting_internal_pages bigint, OUT max_posting_height int,
         OUT inline_slack_bytes bigint, OUT summary_entries bigint, OUT summary_tids bigint,
         OUT summary_bytes bigint, OUT summary_pages bigint, OUT ndistinct bigint,
-        OUT narrow_containers bigint, OUT nullelem_tids bigint)
+        OUT narrow_containers bigint, OUT nullelem_tids bigint, OUT position_pages bigint,
+        OUT position_internal_pages bigint)
         RETURNS SETOF record
         -- ONE ROW PER KEY COLUMN (§24), in attno order.  Counters that describe an entry or a
         -- posting set - entries, inline_entries, ntids, null_tids, empty_tids, the container and
-        -- sparse counts, container_bytes, slack_bytes, container_pages, posting_internal_pages -
-        -- are that column's own; counters that describe the RELATION - directory_height,
-        -- leaf_pages, internal_pages, free_bytes, deleted_pages, max_posting_height - are repeated
-        -- on every row, because one directory leaf holds whatever columns' entries land on it.
+        -- sparse counts, container_bytes, slack_bytes, container_pages, posting_internal_pages,
+        -- position_pages, position_internal_pages - are that column's own; counters that
+        -- describe the RELATION - directory_height, leaf_pages, internal_pages, free_bytes,
+        -- deleted_pages, max_posting_height - are repeated on every row, because one directory
+        -- leaf holds whatever columns' entries land on it.
         -- A container page IS attributed to its column, through the owner_head stamp of §18 and
-        -- the attno of the entry that owns that head.
+        -- the attno of the entry that owns that head - for a page of a position tree (§17), the
+        -- tree's root, which the entry's positions extension names.
         -- `ordered` is per column, and false means that column's key type has no btree opclass, so
         -- its entries are in a complete but arbitrary order;
         -- container counts include INLINE containers; free_bytes sums directory and container pages;
@@ -997,7 +1000,11 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- column with none (a multi-key one, or an index nothing has counted since before §33);
         -- narrow_containers is the NARROW containers of §38, last so the others keep their places,
         -- and nullelem_tids the member count of the reserved NULLELEMS entry (§17), the rows whose
-        -- value had elements and all of them NULL
+        -- value had elements and all of them NULL;
+        -- position_pages and position_internal_pages are the leaves and the internal pages of the
+        -- column's position trees (§17, "Stored positions"), which hold chunks of word positions
+        -- and no posting set: container_pages, posting_internal_pages, container_bytes and
+        -- max_posting_height leave them out
     lion_index_posting_root(regclass, key anyelement) RETURNS bigint
         -- the ROOT block of one key's posting tree, NULL when the key has no entry or its set is
         -- still INLINE.  For tests only: §22 requires the root block never to move, because it is
@@ -1011,12 +1018,23 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- EMPTY and one NULLELEMS entry PER COLUMN, page ids, page flags (exactly one kind, and no
         -- bit that kind never carries: a page of a posting set is never flagged as one of a
         -- position tree, which every reader of the set refuses, ending the set there), meta
-        -- values, entry flags,
+        -- values (every word the format has: its WAL mode, its order flags, the unused bucket
+        -- count of 0, the count of directory pages - at least the pages the walk finds, and with
+        -- no bound above, since a deletion whose count record a crash or a cancel lost leaves it
+        -- high - and the count of pages waiting for reuse, below the index's length), entry flags,
         -- ascending ckeys within pages and across rightlinks, min/max correctness, container_check
         -- on every container and that every member is a heap tuple - an offset 1 ..
         -- MaxHeapTuplesPerPage, a RUN inside one block (§2; a member at offset 0 used to pass,
         -- and every query of its key then failed) - no two items of a page overlapping, the
-        -- form of every stored key (§21, "Readers"), ntids/ncontainers sums; with
+        -- form of every stored key (§21, "Readers"), ntids/ncontainers sums, an INLINE entry's
+        -- positions (one row of them for each TID of its set, and none for a TID it does not
+        -- hold) and its items and positions together within the meta page's inline_limit (§4),
+        -- the root alone at its level (a root split makes the level above in one record, §21),
+        -- and every DELETED page as freeing it left it (§18, §21: a container page empty but for
+        -- its safexid, with no right link or min/max; a directory page with its right link, no
+        -- owner, no flag but its kind and DELETED, and one MINUS INFINITY high key) with a normal
+        -- safexid less than 2^31 past the next transaction id (a crash's restart of the counter
+        -- can leave one a little past it; one further on would keep the page from reuse); with
         -- heapallindexed, scans the heap with a fresh snapshot and checks that every visible
         -- tuple's TID is present under its key in EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
         -- snapshot may not use the index.
@@ -1028,7 +1046,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- REINDEX does. Run as the caller, a superuser verifying somebody else's table ran the
         -- owner's code with superuser rights. The table is locked BEFORE the index (and the
         -- index's table looked up again once both are held), the order DROP INDEX takes them in;
-        -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. Key
+        -- the other order deadlocked with `LOCK TABLE t; DROP INDEX t_k` in another session. A
+        -- relation that is not a lion index is told by its catalog row before either lock, and
+        -- refused under AccessShareLock alone: its table is not locked, nor its owner's identity
+        -- taken, to say so (test/isolation/verify_not_lion.spec). Key
         -- values appear in a "not indexed" report only when the CALLER is a superuser, which is
         -- decided before the switch: asked afterwards, superuser() answers for the owner.
         -- LOCKING: ShareUpdateExclusiveLock on the table, then on the index - the lock CREATE
@@ -1092,9 +1113,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- lion_index_stats(), granted to pg_stat_scan_tables, reports damage to nobody, so it
         -- skips the pages and items it cannot read safely instead: a header out of bounds, a line
         -- pointer outside the item space, an entry shorter than its key (whose payload length
-        -- used to underflow), an item of no known type. The regression suite writes each kind of
-        -- damage into a temporary index's file (verify.sql) and gets an ERROR from verify() and
-        -- a count without the damaged item from lion_index_stats(), where the code before
+        -- would underflow), an item of no known type, and an INLINE payload from its first
+        -- damaged item on, whose size no longer says where the next one starts. Every READER of
+        -- an INLINE payload - verify(), the counts, the scans, the ordered walks, INSERT and
+        -- VACUUM - reports such an item as INDEX_CORRUPTED with the entry's block and offset and
+        -- the item's place in the payload, and the copy of a posting set a count keeps in memory
+        -- (§10) reports an item out of order with the page it is on. The regression suite writes
+        -- each kind of damage into a temporary index's file (verify.sql) and gets an ERROR from
+        -- verify() and a count without the damaged item from lion_index_stats(), where the code before
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
         -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone. Its
@@ -1103,6 +1129,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- tree code, which does not look at the flag, still finds them - so heapallindexed holds
         -- the leaf its lookup lands on to the readers' test. Its eighth is a flag bit no page of
         -- its kind carries, and its ninth a position tree's downlink, separator and leaf min (§17).
+        -- Its tenth is an INLINE payload item of no type, which every reader reports with the
+        -- entry, and a copied set out of order; its eleventh an INLINE entry's positions for a
+        -- TID it does not hold, which a phrase query through the index then misses a row for;
+        -- its twelfth INLINE entries past the meta page's inline_limit; its thirteenth the meta
+        -- page's other words; its fourteenth a second page at the root's level, each flagged
+        -- ROOT; and its fifteenth the body and the safexid of a DELETED container page and of a
+        -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
+        -- put in its file.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
