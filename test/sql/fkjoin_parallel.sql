@@ -249,6 +249,9 @@ SELECT lion_pj('SELECT count(DISTINCT d.k) FROM lion_pdn d WHERE NOT EXISTS (SEL
 -- once, whichever participant it went to
 SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Looked Up');
 SELECT lion_pj_counter('SELECT count(*) FROM lion_pd d WHERE EXISTS (SELECT 1 FROM lion_pf f WHERE f.fk = d.pk AND f.x = 3)', 'Join Keys Without Entry');
+-- ... the scan's own among them: the range a worker took as a source of the
+-- fact filters (one per participant that located them, so only that it did)
+SELECT lion_pj_counter('SELECT d.grp, count(*) FROM lion_pf f JOIN lion_pd d ON d.pk = f.fk WHERE f.x < 3 AND f.t = ''t3'' GROUP BY d.grp', 'Range Sources Collected') > 0 AS range_sources;
 
 -- ---- 3. the serial node in a worker (debug_parallel_query) ----------------------
 ALTER TABLE lion_pd SET (parallel_workers = 0);

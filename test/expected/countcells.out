@@ -642,7 +642,7 @@ SELECT q, lcc_check(q) FROM (VALUES
  SELECT count(*) FROM lcc_tiered WHERE g AND tier = 'high'     | parallel 4050 cells, 1 rows
 (4 rows)
 
--- ... with rows the heap is asked about
+-- ... with rows the heap is asked about, whichever participants ask
 UPDATE lcc SET k = 3 WHERE id % 41 = 0;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
                       lcc_check                       
@@ -650,6 +650,14 @@ SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
  parallel 4050 cells, 4 rows, rows tested in the heap
 (1 row)
 
+SET parallel_leader_participation = off;
+SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
+                      lcc_check                       
+------------------------------------------------------
+ parallel 4050 cells, 4 rows, rows tested in the heap
+(1 row)
+
+RESET parallel_leader_participation;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

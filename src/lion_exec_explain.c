@@ -1113,24 +1113,23 @@ lion_explain_scan_counters(LionCountScanState *st, const LionCountStats *tot,
 	 * values live on plus one descent, not a descent per value.
 	 */
 	ExplainPropertyInteger("Directory Pages Read", NULL,
-						   st->dirpages + st->workerdirpages, es);
+						   st->dirpages + st->worker.dirpages, es);
 }
 
 /*
  * EXPLAIN ANALYZE's counters of ranges and sums: how the range bounding a
  * sum was evaluated, the summaries and walks it used, and the ranges taken
- * as sources.
+ * as sources - the leader's and, under a Gather, its workers' (st->worker).
  */
 static void
 lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 {
 	StringInfoData buf;
+	int64		eval[lengthof(st->rangeeval)];
+	int			k;
 
-	/* ... a parallel count's workers' among them (DESIGN.md §10) */
-	int64		workersummaries = (st->ranged != NULL) ?
-		st->ranged->workersummaries : 0;
-	int64		workerrangeprobed = (st->ranged != NULL) ?
-		st->ranged->workerrangeprobed : 0;
+	for (k = 0; k < (int) lengthof(eval); k++)
+		eval[k] = st->rangeeval[k] + st->worker.rangeeval[k];
 
 	/*
 	 * How the range bounding a sum was evaluated (DESIGN.md §28, "The
@@ -1145,22 +1144,22 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		static const char *const evalname[] = {"inside", "complement",
 		"full domain"};
 		int			kinds = 0;
-		int			k;
 
+		StaticAssertDecl(lengthof(evalname) == lengthof(eval),
+						 "a name for every way of evaluating a range");
 		initStringInfo(&buf);
 		for (k = 0; k < (int) lengthof(evalname); k++)
-			if (st->rangeeval[k] > 0)
+			if (eval[k] > 0)
 				kinds++;
 		for (k = 0; k < (int) lengthof(evalname); k++)
 		{
-			if (st->rangeeval[k] == 0)
+			if (eval[k] == 0)
 				continue;
 			if (buf.len > 0)
 				appendStringInfoString(&buf, ", ");
 			appendStringInfoString(&buf, evalname[k]);
 			if (kinds > 1)
-				appendStringInfo(&buf, " %lld",
-								 (long long) st->rangeeval[k]);
+				appendStringInfo(&buf, " %lld", (long long) eval[k]);
 		}
 		if (buf.len > 0)
 			ExplainPropertyText("Range Evaluation", buf.data, es);
@@ -1172,63 +1171,54 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	 * they cover, among the Posting Sets Summed.  Only when there were
 	 * any, so that an index without summaries prints what it always did.
 	 */
-	if (st->summaries + workersummaries > 0)
+	if (st->summaries + st->worker.summaries > 0)
 		ExplainPropertyInteger("Summaries Summed", NULL,
-							   st->summaries + workersummaries, es);
+							   st->summaries + st->worker.summaries, es);
 
 	/*
 	 * Of those sums, the walks that were probed at the other sources'
 	 * rows rather than counted a set at a time (DESIGN.md §32, "Summed
 	 * ranges: dense and probed").  Only when there were any.
 	 */
-	if (st->rangeprobed + workerrangeprobed > 0)
+	if (st->rangeprobed + st->worker.rangeprobed > 0)
 		ExplainPropertyInteger("Range Walks Probed", NULL,
-							   st->rangeprobed + workerrangeprobed, es);
+							   st->rangeprobed + st->worker.rangeprobed, es);
 
 	/*
 	 * The ranges taken as sources (DESIGN.md §32): collected, or - too large
 	 * for the memory, where the plan walks those - summed over their walk at
-	 * every count they are part of.  Again only when there were any.
+	 * every count they are part of.  Again only when there were any.  Each
+	 * participant of a parallel count collects its own (DESIGN.md §10, "A
+	 * count in parallel").
 	 */
-	if (st->rangesrc_collected > 0)
+	if (st->rangesrc_collected + st->worker.rangesrc_collected > 0)
 		ExplainPropertyInteger("Range Sources Collected", NULL,
-							   st->rangesrc_collected, es);
-	if (st->rangesrc_walked > 0)
+							   st->rangesrc_collected +
+							   st->worker.rangesrc_collected, es);
+	if (st->rangesrc_walked + st->worker.rangesrc_walked > 0)
 		ExplainPropertyInteger("Range Sources Walked", NULL,
-							   st->rangesrc_walked, es);
+							   st->rangesrc_walked +
+							   st->worker.rangesrc_walked, es);
 	/*
 	 * ... and of the collected, those spilled to a file, past the memory
 	 */
-	if (st->rangesrc_spilled > 0)
+	if (st->rangesrc_spilled + st->worker.rangesrc_spilled > 0)
 		ExplainPropertyInteger("Range Sources Spilled", NULL,
-							   st->rangesrc_spilled, es);
+							   st->rangesrc_spilled +
+							   st->worker.rangesrc_spilled, es);
 }
 
 /*
  * EXPLAIN ANALYZE's counters of a GROUP BY's WHERE sets, batches and key
- * ranges, of an IN list's batches and of a count(DISTINCT)'s tests.
+ * ranges, of the decoded walk, of an IN list's batches and of a
+ * count(DISTINCT)'s tests - the leader's and, under a Gather, its workers'
+ * (st->worker).
  */
 static void
 lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 {
 	LionRangedState *rs = st->ranged;
-	int64		workerwherecollected = 0;
-	int64		workerwherespilled = 0;
-	int64		workergroupbatches = 0;
-	int64		workergroupsbatched = 0;
-
-	/*
-	 * A parallel GROUP BY's workers' counters (DESIGN.md §10, "A GROUP BY
-	 * in parallel"): it is the only node whose workers collect WHERE sets
-	 * or count groups in batches.
-	 */
-	if (rs != NULL)
-	{
-		workerwherecollected = rs->workerwherecollected;
-		workerwherespilled = rs->workerwherespilled;
-		workergroupbatches = rs->workergroupbatches;
-		workergroupsbatched = rs->workergroupsbatched;
-	}
+	const LionScanWorkerSums *w = &st->worker;
 
 	/*
 	 * The WHERE items of a GROUP BY collected into one set that the groups
@@ -1237,28 +1227,24 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * that did; and of those, the ones past a hash table's memory that
 	 * went to a temporary file.  Only when there were any.
 	 */
-	if (st->wherecollected + workerwherecollected > 0)
+	if (st->wherecollected + w->wherecollected > 0)
 		ExplainPropertyInteger("WHERE Sets Collected", NULL,
-							   st->wherecollected +
-							   workerwherecollected, es);
-	if (st->wherespilled + workerwherespilled > 0)
+							   st->wherecollected + w->wherecollected, es);
+	if (st->wherespilled + w->wherespilled > 0)
 		ExplainPropertyInteger("WHERE Sets Spilled", NULL,
-							   st->wherespilled + workerwherespilled,
-							   es);
+							   st->wherespilled + w->wherespilled, es);
 
 	/*
 	 * ... and the batches of groups counted together against it, in one
 	 * walk of container keys each (DESIGN.md §10, "The groups of a walk,
 	 * counted together").  Only when there were any.
 	 */
-	if (st->groupbatches + workergroupbatches > 0)
+	if (st->groupbatches + w->groupbatches > 0)
 	{
 		ExplainPropertyInteger("Group Batches", NULL,
-							   st->groupbatches + workergroupbatches,
-							   es);
+							   st->groupbatches + w->groupbatches, es);
 		ExplainPropertyInteger("Groups Counted in Batches", NULL,
-							   st->groupsbatched + workergroupsbatched,
-							   es);
+							   st->groupsbatched + w->groupsbatched, es);
 	}
 
 	/*
@@ -1267,18 +1253,23 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * or the heap - and those the heap was asked about, the partial rows it
 	 * handed up, and how often a pass's tally went to its temporary file.
 	 */
-	if (st->decode != NULL && st->decode->passes > 0)
+	if (st->decode != NULL && st->decode->passes + w->decodepasses > 0)
 	{
 		LionDecodeRun *dr = st->decode;
 
-		ExplainPropertyInteger("Decoded Passes", NULL, dr->passes, es);
-		ExplainPropertyInteger("Decoded Keys", NULL, dr->stats.keys, es);
-		ExplainPropertyInteger("Decoded Rows", NULL, dr->stats.rows, es);
+		ExplainPropertyInteger("Decoded Passes", NULL,
+							   dr->passes + w->decodepasses, es);
+		ExplainPropertyInteger("Decoded Keys", NULL,
+							   dr->stats.keys + w->decode.keys, es);
+		ExplainPropertyInteger("Decoded Rows", NULL,
+							   dr->stats.rows + w->decode.rows, es);
 		ExplainPropertyInteger("Decoded Rows Rechecked", NULL,
-							   dr->stats.rechecked, es);
-		ExplainPropertyInteger("Partial Rows", NULL, dr->rowsup, es);
-		if (dr->stats.spills > 0)
-			ExplainPropertyInteger("Tally Spills", NULL, dr->stats.spills, es);
+							   dr->stats.rechecked + w->decode.rechecked, es);
+		ExplainPropertyInteger("Partial Rows", NULL,
+							   dr->rowsup + w->decoderowsup, es);
+		if (dr->stats.spills + w->decode.spills > 0)
+			ExplainPropertyInteger("Tally Spills", NULL,
+								   dr->stats.spills + w->decode.spills, es);
 	}
 
 	/*
@@ -1298,11 +1289,9 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 	 * (DESIGN.md §15, "A list too long to locate at once").  Only when
 	 * there were any.
 	 */
-	if (st->lbatch != NULL &&
-		st->lbatch->batches + (rs != NULL ? rs->workerlistbatches : 0) > 0)
+	if (st->lbatch != NULL && st->lbatch->batches + w->listbatches > 0)
 		ExplainPropertyInteger("List Batches", NULL,
-							   st->lbatch->batches +
-							   (rs != NULL ? rs->workerlistbatches : 0), es);
+							   st->lbatch->batches + w->listbatches, es);
 
 	/*
 	 * The existence (or count) tests a count(DISTINCT k) made: one per
@@ -1550,13 +1539,12 @@ static void
 lion_explain_analyze(LionCountScanState *st, ExplainState *es)
 {
 	/*
-	 * The leader's own counters, plus - for a parallel FK-side join
-	 * (DESIGN.md §27, "Parallel") - what its workers added up
-	 * (lion_shutdown_custom_scan()).
+	 * The leader's own counters, plus - under a Gather - what its workers
+	 * added up (lion_shutdown_custom_scan()).
 	 */
 	LionCountStats tot = st->stats;
 
-	lion_count_stats_add(&tot, &st->workerstats);
+	lion_count_stats_add(&tot, &st->worker.stats);
 
 	lion_explain_scan_counters(st, &tot, es);
 	lion_explain_range_counters(st, es);

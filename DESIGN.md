@@ -2834,8 +2834,10 @@ which adds the participants' partial counts up and applies the HAVING:
   `parallel_setup_cost`, core's Finalize Aggregate its own work. Both terms are in the node's
   units (`lion_units_price()`).
 - **EXPLAIN ANALYZE** prints `Key Ranges`, the chunks counted - the ranges times the runs - and
-  the workers' `List Batches`, `Summaries Summed` and `Range Walks Probed` are summed into the
-  leader's (`LionJoinShared`).
+  every counter of the scan a worker moves is summed into the leader's (`LionScanWorkerSums` in
+  `LionJoinShared`), so that none of them prints the leader's share alone, or nothing where the
+  leader takes no part. A range source is collected by each participant that counts a range of
+  its run, so `Range Sources Collected` counts collections, not the sources of the query.
 
 **Measured** on the release build (PostgreSQL 18.6 at -O2 without assertions, the library at -O2),
 on four cores other sessions' work shared (a one-minute load of 1.6 to 2.0 throughout),
