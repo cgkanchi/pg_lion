@@ -596,5 +596,33 @@ SELECT lion_index_verify('lion_vacwide_n', true);
 SELECT lion_cmp('lion_vacwide', 'k = 0');
 SELECT lion_cmp('lion_vacwide', 'n IS NULL');
 
+-- VACUUM's buffer ring.  A VACUUM reads the index through the ring of
+-- buffers VACUUM gives it (vacuum_buffer_usage_limit), as it reads the heap,
+-- and leaves no more of the index in shared buffers than the ring holds.  The
+-- build writes the index past the buffer pool, so none of it is there to
+-- begin with; deleting one row in ten removes an entry from nearly every leaf
+-- and empties none.
+CREATE EXTENSION IF NOT EXISTS pg_buffercache;
+CREATE TABLE lion_vring (i int NOT NULL, k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lion_vring SELECT i, i FROM generate_series(1, 200000) i;
+CREATE INDEX lion_vring_k ON lion_vring USING lion (k);
+CREATE FUNCTION lion_vring_cached() RETURNS bigint LANGUAGE sql AS $$
+	SELECT count(*) FROM pg_buffercache
+	 WHERE relfilenode = pg_relation_filenode('lion_vring_k') AND relforknumber = 0
+	   AND reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
+$$;
+SELECT pg_relation_size('lion_vring_k') / 8192 > 400 AS large,
+	   lion_vring_cached() < 4 AS none_cached;
+DELETE FROM lion_vring WHERE i % 10 = 0;
+SET vacuum_buffer_usage_limit = '128kB';
+-- FREEZE: the ntids below counts on every dead row going, and a plain VACUUM
+-- leaves those of a heap page it cannot have the cleanup lock of at once
+VACUUM (FREEZE) lion_vring;
+RESET vacuum_buffer_usage_limit;
+SELECT lion_vring_cached() <= 32 AS ringed;
+SELECT ntids = 180000 AS ntids_ok FROM lion_index_stats('lion_vring_k');
+SELECT lion_index_verify('lion_vring_k', true);
+DROP FUNCTION lion_vring_cached();
+
 DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
-	lion_slacki, lion_vacpre, lion_vacbig, lion_vacwide;
+	lion_slacki, lion_vacpre, lion_vacbig, lion_vacwide, lion_vring;

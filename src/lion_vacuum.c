@@ -119,7 +119,10 @@
  *	  walking right under cleanup locks (rule 1) -- a concurrent insert, or the
  *	  re-placement of an earlier container, may have split the page and moved
  *	  this container right -- and re-reads and re-filters the container it
- *	  finds there.  Filtering is idempotent, so re-filtering costs nothing but
+ *	  finds there.  It takes the entry page as steps 3 and 4 do: tried with
+ *	  the page held, and when that is busy, waited for with nothing held and
+ *	  the page's cleanup lock tried under it.  Filtering is idempotent, so
+ *	  re-filtering costs nothing but
  *	  a callback call; reusing a copy taken in an earlier window would be
  *	  wrong, because an insert may have added a TID to it in the meantime.
  *	  Until that write happens the container still holds its dead TIDs, which
@@ -196,6 +199,7 @@ typedef struct LionVacState
 {
 	Relation	index;
 	Relation	heaprel;		/* what page reuse needs, may be NULL */
+	BufferAccessStrategy strategy;	/* info->strategy: lion_vac_read() */
 	LionIndexState *ix;
 	IndexBulkDeleteCallback callback;
 	void	   *callback_state;
@@ -280,6 +284,24 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
 {
 	return blk < vs->nblocks &&
 		(vs->visited[blk / 8] & (uint8) (1 << (blk % 8))) != 0;
+}
+
+/*
+ * Read a block of the index for this VACUUM, through the buffer access
+ * strategy VACUUM gives it (info->strategy): the ring vacuum_buffer_usage_limit
+ * sizes, which the heap's pages go through as well.  Without it every page of
+ * the index the walk reads stays in shared buffers and pushes out what the
+ * queries had there; with it a VACUUM of an index larger than the ring leaves
+ * no more than the ring behind, as nbtree's btvacuumpage() does.  The pages
+ * read by the code a VACUUM shares with the inserts - a split, a page
+ * deletion, finding an entry again - are few, and are read without it, but
+ * for the look lion_dir_delete_page() takes at every leaf the walk leaves.
+ */
+static inline Buffer
+lion_vac_read(LionVacState *vs, BlockNumber blk)
+{
+	return ReadBufferExtended(vs->index, MAIN_FORKNUM, blk, RBM_NORMAL,
+							  vs->strategy);
 }
 
 /*
@@ -569,6 +591,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	memset(&vs, 0, sizeof(vs));
 	vs.index = index;
 	vs.heaprel = info->heaprel;
+	vs.strategy = info->strategy;
 	vs.ix = lion_get_index_state(index);
 	vs.callback = callback;
 	vs.callback_state = callback_state;
@@ -1612,7 +1635,7 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 * entry that changes, and the lock is taken with nothing else held, so the
 	 * wait for concurrent readers' pins is interruptible.
 	 */
-	buf = ReadBuffer(vs->index, blk);
+	buf = lion_vac_read(vs, blk);
 	INSTR_TIME_SET_CURRENT(t0);
 	LockBufferForCleanup(buf);
 	lion_vac_tick(&vs->prof.cleanup_wait, t0);
@@ -1672,6 +1695,10 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 			}
 			else
 				ent->maydelete = (lion_entry_ntids(entry) == 0);
+
+			/* the open summary bucket stays, however empty (DESIGN.md §32) */
+			if (ent->kind == LION_KIND_SUMLAST)
+				ent->maydelete = false;
 
 			/*
 			 * An INLINE entry that is not about to be deleted is finished
@@ -1851,8 +1878,12 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 * empty, and free the chains they owned.  It comes last because
 	 * PageIndexMultiDelete() renumbers everything after a deleted entry, so
 	 * from here on no offset into this page means anything (DESIGN.md §18).
+	 * An entry this VACUUM emptied was emptied by a record, so an index that
+	 * may not be written here (lion_vac_may_write()) has none: what it can
+	 * hold is an entry an earlier VACUUM emptied and left, which stays until
+	 * the index may be written again, as the meta page's counts do.
 	 */
-	if (nmaydelete > 0)
+	if (nmaydelete > 0 && lion_vac_may_write(vs->index))
 		lion_vacuum_delete_entries(vs, buf, ents, nents);
 
 	ReleaseBuffer(buf);
@@ -1867,7 +1898,8 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 */
 	if (lion_vac_may_write(vs->index))
 	{
-		int			ndeleted = lion_dir_delete_page(vs->index, vs->ix, blk);
+		int			ndeleted = lion_dir_delete_page(vs->index, vs->ix, blk,
+													vs->strategy);
 
 		if (ndeleted > 0)
 		{
@@ -1923,7 +1955,7 @@ lion_vacuum_descend(LionVacState *vs, const LionVacEntry *ent)
 		BlockNumber child;
 		instr_time	t0;
 
-		buf = ReadBuffer(vs->index, blk);
+		buf = lion_vac_read(vs, blk);
 		INSTR_TIME_SET_CURRENT(t0);
 		LockBufferForCleanup(buf);
 		lion_vac_tick(&vs->prof.cleanup_wait, t0);
@@ -2077,7 +2109,16 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
 	lion_vac_ref_lock(vs, &ref, ent, BUFFER_LOCK_SHARE);
 	entry = lion_page_entry(BufferGetPage(ref.buf), ref.off);
 	lion_vac_count(vs, entry, lion_entry_ntids(entry));
-	ent->maydelete = (lion_entry_ntids(entry) == 0 && lion_entry_ncontainers(entry) == 0);
+
+	/*
+	 * Whether the final step deletes the entry, and its set with it.  Never a
+	 * column's OPEN summary bucket, however empty (DESIGN.md §32,
+	 * lion_vacuum_delete_entries()): its empty leaves leave the set below, as
+	 * any other entry's do, or no VACUUM would ever take them.
+	 */
+	ent->maydelete = (lion_entry_ntids(entry) == 0 &&
+					  lion_entry_ncontainers(entry) == 0 &&
+					  !LionEntryIsSumLast(entry));
 	if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
 		ent->posroot = lion_entry_posext(entry)->pos_root;
 	LockBuffer(ref.buf, BUFFER_LOCK_UNLOCK);
@@ -2295,7 +2336,7 @@ lion_vacuum_postree(LionVacState *vs, BlockNumber root)
 		/* down the leftmost path, every internal level walked and marked */
 		for (;;)
 		{
-			Buffer		buf = ReadBuffer(index, blk);
+			Buffer		buf = lion_vac_read(vs, blk);
 			Page		page;
 			BlockNumber child;
 			BlockNumber lblk;
@@ -2335,7 +2376,7 @@ lion_vacuum_postree(LionVacState *vs, BlockNumber root)
 			{
 				BlockNumber next;
 
-				buf = ReadBuffer(index, lblk);
+				buf = lion_vac_read(vs, lblk);
 				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				page = BufferGetPage(buf);
 				if (!lion_page_owns_positions(page, root))
@@ -2364,7 +2405,7 @@ lion_vacuum_postree(LionVacState *vs, BlockNumber root)
 		lion_rightwalk_init(&walk);
 		while (BlockNumberIsValid(blk))
 		{
-			Buffer		buf = ReadBuffer(index, blk);
+			Buffer		buf = lion_vac_read(vs, blk);
 			Page		page;
 			BlockNumber next;
 
@@ -2474,7 +2515,7 @@ lion_vac_postree_shape(LionVacState *vs, BlockNumber root, LionVacPosFree *pf)
 	pf->nlevels = 0;
 	while (BlockNumberIsValid(blk) && pf->nlevels <= LION_POSTING_MAX_HEIGHT)
 	{
-		Buffer		buf = ReadBuffer(vs->index, blk);
+		Buffer		buf = lion_vac_read(vs, blk);
 		Page		page;
 		BlockNumber child = InvalidBlockNumber;
 
@@ -2544,7 +2585,7 @@ lion_vac_delete_group(LionVacState *vs, Buffer buf, OffsetNumber *offs,
 		Assert(nroots < LION_WAL_MAX_BLOCKS - 1);
 		lion_vac_postree_shape(vs, root, &posfree[*nposfree]);
 		(*nposfree)++;
-		rootbufs[nroots] = ReadBuffer(vs->index, root);
+		rootbufs[nroots] = lion_vac_read(vs, root);
 
 		/*
 		 * This waits while holding the leaf's cleanup lock, which is safe by
@@ -2615,7 +2656,7 @@ lion_vacuum_free_postree(LionVacState *vs, const LionVacPosFree *pf)
 		lion_rightwalk_init(&walk);
 		while (BlockNumberIsValid(blk))
 		{
-			Buffer		buf = ReadBuffer(vs->index, blk);
+			Buffer		buf = lion_vac_read(vs, blk);
 			Page		page;
 			BlockNumber next;
 
@@ -2829,7 +2870,7 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 		Page		p;
 		FullTransactionId safexid;
 
-		buf = ReadBuffer(vs->index, blk);
+		buf = lion_vac_read(vs, blk);
 		if (!ConditionalLockBufferForCleanup(buf))
 		{
 			ReleaseBuffer(buf);
@@ -2898,7 +2939,7 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
 	 */
 	while (BlockNumberIsValid(blk) && nlevels <= LION_POSTING_MAX_HEIGHT)
 	{
-		Buffer		buf = ReadBuffer(vs->index, blk);
+		Buffer		buf = lion_vac_read(vs, blk);
 		Page		page;
 		BlockNumber child = InvalidBlockNumber;
 		uint16		level;
@@ -2993,7 +3034,7 @@ lion_vac_children_deleted(LionVacState *vs, Page page)
 		if (!BlockNumberIsValid(child) || child >= vs->nblocks)
 			return false;
 
-		cbuf = ReadBuffer(vs->index, child);
+		cbuf = lion_vac_read(vs, child);
 		if (!ConditionalLockBuffer(cbuf))
 		{
 			ReleaseBuffer(cbuf);
@@ -3138,7 +3179,7 @@ lion_vac_postree_root_live(LionVacState *vs, BlockNumber root)
 	if (!BlockNumberIsValid(root) || root == LION_METAPAGE_BLKNO ||
 		root >= RelationGetNumberOfBlocks(vs->index))
 		return false;
-	buf = ReadBuffer(vs->index, root);
+	buf = lion_vac_read(vs, root);
 	if (!ConditionalLockBuffer(buf))
 	{
 		ReleaseBuffer(buf);
@@ -3149,9 +3190,67 @@ lion_vac_postree_root_live(LionVacState *vs, BlockNumber root)
 	return live;
 }
 
+/*
+ * The sweep's case for a page out of the index's trees, which buf holds
+ * locked, SHARE or more: true, with buf released, when the page is one, and
+ * false, with buf still locked, when it is anything else.  *progress is set
+ * for a DELETED page, whose finding may let a leaked internal page go in the
+ * next round (lion_vac_children_deleted()).
+ */
+static bool
+lion_vac_sweep_out(LionVacState *vs, Buffer buf, BlockNumber blk,
+				   bool *progress)
+{
+	Page		page = BufferGetPage(buf);
+
+	if (PageIsNew(page) ||
+		PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
+		return false;
+
+	/*
+	 * A DELETED page: a container page a free left behind, or a directory
+	 * page deletion unlinked (DESIGN.md §21), which no walk reaches either.
+	 */
+	if (LionPageIsDeleted(page))
+	{
+		FullTransactionId safexid = lion_page_get_safexid(page);
+
+		UnlockReleaseBuffer(buf);
+		lion_vac_found_free(vs, blk, safexid);
+		*progress = true;
+		return true;
+	}
+
+	/*
+	 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of its
+	 * set, and handed out again once no scan can still hold a link to it, as
+	 * a DELETED page is; until then it stays as it is, an empty leaf that a
+	 * reader with an old link walks through.  One that holds items is not
+	 * ours to reason about: verify() reports it.
+	 */
+	if (LionPageIsContainer(page) && LionPageIsUnlinked(page))
+	{
+		if (PageGetMaxOffsetNumber(page) == 0)
+		{
+			FullTransactionId safexid = lion_page_get_safexid(page);
+
+			UnlockReleaseBuffer(buf);
+			lion_vac_found_free(vs, blk, safexid);
+			return true;
+		}
+		UnlockReleaseBuffer(buf);
+		lion_vac_visit(vs, blk);
+		return true;
+	}
+
+	return false;
+}
+
 static void
 lion_vacuum_sweep(LionVacState *vs)
 {
+	bool		maywrite = lion_vac_may_write(vs->index);
 	int			round;
 
 	/*
@@ -3191,7 +3290,23 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 			lion_vacuum_delay_point();
 
-			buf = ReadBuffer(vs->index, blk);
+			buf = lion_vac_read(vs, blk);
+
+			/*
+			 * A page out of the index's trees is only read, so a SHARE lock
+			 * does, as in lion_vacuum_recycle() and nbtree's btvacuumpage():
+			 * it holds no TIDs, and a pin on it stops nothing.  A cleanup
+			 * lock would miss every such page that the checkpointer or the
+			 * background writer has pinned to write it out, and the page
+			 * would wait for the next VACUUM to be recorded.  The wait for
+			 * the lock, with nothing else held, is for a writer of the page,
+			 * which holds it briefly.
+			 */
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			if (lion_vac_sweep_out(vs, buf, blk, &progress))
+				continue;
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
 			if (!ConditionalLockBufferForCleanup(buf))
 			{
 				ReleaseBuffer(buf);
@@ -3201,7 +3316,11 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			if (PageIsNew(page))
 			{
-				/* An extension whose WAL record never happened. */
+				/*
+				 * An extension whose WAL record never happened.  Under the
+				 * cleanup lock: the pin of a backend that has extended the
+				 * index and not yet locked the new page is what keeps it.
+				 */
 				UnlockReleaseBuffer(buf);
 				RecordFreeIndexPage(vs->index, blk);
 				lion_vac_visit(vs, blk);
@@ -3220,40 +3339,22 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			/*
-			 * A DELETED page: a container page a free left behind, or a
-			 * directory page deletion unlinked (DESIGN.md §21), which no walk
-			 * reaches either.
+			 * Out of the trees after all: only this VACUUM takes a page out,
+			 * so not since the look above, but it costs nothing to ask.
 			 */
-			if (LionPageIsDeleted(page))
-			{
-				FullTransactionId safexid = lion_page_get_safexid(page);
-
-				UnlockReleaseBuffer(buf);
-				lion_vac_found_free(vs, blk, safexid);
-				progress = true;
+			if (lion_vac_sweep_out(vs, buf, blk, &progress))
 				continue;
-			}
 
 			/*
-			 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of
-			 * its set, and handed out again once no scan can still hold a link
-			 * to it, as a DELETED page is; until then it stays as it is, an
-			 * empty leaf that a reader with an old link walks through.  One
-			 * that holds items is not ours to reason about: verify() reports
-			 * it.
+			 * Every case below frees the page, in a record, or leaves it.  In
+			 * an index that may not be written here (lion_vac_may_write())
+			 * the leaks stay leaks, for a VACUUM on a server that may write
+			 * them: this one has nothing to remove from the index, or it
+			 * would have stopped at its first record already.
 			 */
-			if (LionPageIsUnlinked(page))
+			if (!maywrite)
 			{
-				if (PageGetMaxOffsetNumber(page) == 0)
-				{
-					FullTransactionId safexid = lion_page_get_safexid(page);
-
-					UnlockReleaseBuffer(buf);
-					lion_vac_found_free(vs, blk, safexid);
-					continue;
-				}
 				UnlockReleaseBuffer(buf);
-				lion_vac_visit(vs, blk);
 				continue;
 			}
 
@@ -3381,7 +3482,7 @@ lion_vacuum_container_page(LionVacState *vs, LionVacEntryRef *ref,
 	oldcxt = MemoryContextSwitchTo(vs->pagecxt);
 
 	*emptyp = false;
-	buf = ReadBuffer(vs->index, blk);
+	buf = lion_vac_read(vs, blk);
 
 	for (;;)
 	{
@@ -3841,6 +3942,7 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 	OffsetNumber entryoff = InvalidOffsetNumber;
 	BlockNumber blk = startblk;
 	LionRightWalk walk;
+	bool		leaffirst = false;
 
 	lion_rightwalk_init(&walk);
 	for (;;)
@@ -3853,17 +3955,36 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		OffsetNumber off;
 		BlockNumber next;
 		bool		found;
+		bool		leafheld = false;
 		uint32		nremoved;
 		LionVacPred	pred;
 
-		buf = ReadBuffer(index, blk);
+		buf = lion_vac_read(vs, blk);
 
-		/* Rule 1: a cleanup lock on every page on the way, in chain order. */
-		LockBufferForCleanup(buf);
+		/*
+		 * Rule 1: a cleanup lock on every page on the way, in chain order.
+		 * After an insert was found holding the leaf (below), the leaf is
+		 * taken first and the page's cleanup lock only tried under it, as
+		 * lion_vacuum_container_page() does: with the leaf held no insert can
+		 * be on the page, so the try fails only while a reader pins it, and
+		 * then the page is waited for with nothing else held.
+		 */
+		if (leaffirst)
+		{
+			leaffirst = false;
+			lion_vac_ref_lock(vs, ref, ent, BUFFER_LOCK_EXCLUSIVE);
+			leafheld = ConditionalLockBufferForCleanup(buf);
+			if (!leafheld)
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+		}
+		if (!leafheld)
+			LockBufferForCleanup(buf);
 		lion_vac_visit(vs, blk);
 		page = BufferGetPage(buf);
 		if (!lion_page_owns_entry(page, ent->owner, ent->head))
 		{
+			if (leafheld)
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buf);
 			elog(ERROR, "lion index: block %u is not a container page of the chain at %u",
 				 blk, ent->head);
@@ -3872,6 +3993,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 		/* A root pushed down under us; start again at the leftmost leaf. */
 		if (!LionPageIsPostingLeaf(page))
 		{
+			if (leafheld)
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buf);
 			lion_wal_visit(index, blk);
 			blk = lion_vacuum_descend(vs, ent);
@@ -3893,6 +4016,8 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			 * ever removed by this vacuum, so it is still in the chain.  The
 			 * page it moved off joins the standby barrier (DESIGN.md §25).
 			 */
+			if (leafheld)
+				LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buf);
 			lion_wal_visit(index, blk);
 			if (!BlockNumberIsValid(next))
@@ -3904,19 +4029,27 @@ lion_vacuum_regrow(LionVacState *vs, LionVacEntryRef *ref,
 			continue;
 		}
 
+		/*
+		 * Test hook: the page is cleanup-locked and holds the container, the
+		 * leaf not yet tried (test/isolation/vacuum_regrow_pushdown.spec).
+		 */
+		if (!leafheld)
+			LION_INJECTION_POINT("lion-vacuum-regrow-locked");
+
 		/* Changing it needs the entry page as well, and never a wait here. */
 		entrybuf = ref->buf;
-		if (!ConditionalLockBuffer(entrybuf))
+		if (!leafheld && !ConditionalLockBuffer(entrybuf))
 		{
 			/*
-			 * An insert holds the leaf.  Let go of the container page, take
-			 * the leaf with nothing else held so that somebody makes progress,
-			 * and try this page again.
+			 * An insert holds the leaf, and waiting for it with the page held
+			 * would invert the lock order.  Let go of the page and take this
+			 * one again leaf first (above).  Taking the page first again
+			 * would leave the leaf free in between, and a steady stream of
+			 * inserts into any key of the leaf could keep this loop going for
+			 * as long as it lasts.
 			 */
-			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
-			ReleaseBuffer(buf);
-			lion_vac_ref_lock(vs, ref, ent, BUFFER_LOCK_EXCLUSIVE);
-			LockBuffer(ref->buf, BUFFER_LOCK_UNLOCK);
+			UnlockReleaseBuffer(buf);
+			leaffirst = true;
 			CHECK_FOR_INTERRUPTS();
 			continue;			/* start again at this same page */
 		}
