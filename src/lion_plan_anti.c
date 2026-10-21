@@ -178,7 +178,8 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
  *
  * `lookups` is the distinct keys of the child's rows, as estimate_num_groups()
  * makes them of the inner side's key expressions, and the rows of one lookup
- * the table's rows over the distinct values of its scan-key columns.  A large
+ * the table's rows over the distinct values of its scan-key columns in the
+ * whole table, whatever the restrictions leave of their rows.  A large
  * inner side is a price of many descents and many rows, which the ordinary
  * plan's one pass over the table undercuts: the cost model, and nothing else,
  * leaves it to core.
@@ -215,6 +216,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	QualCost	qual;
 	QualCost	keyeval;
 	QualCost	roweval;
+	ListCell   *lc;
 	int			k;
 
 	for (k = 0; k < plan->nkey; k++)
@@ -223,11 +225,21 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 		outerkeys = list_append_unique(outerkeys, plan->keyvar[k]);
 	}
 
-	/* the distinct keys of the child's rows, and the rows each finds */
+	/* the distinct keys of the child's rows */
 	lookups = estimate_num_groups(root, innerkeys, childrows, NULL, NULL);
 	lookups = clamp_row_est(Min(lookups, childrows));
-	values = estimate_num_groups(root, outerkeys, tuples, NULL, NULL);
-	perlookup = tuples / Max(values, 1.0);
+
+	/*
+	 * ... and the rows each finds: every row of its key in the table, which
+	 * the restrictions are tested on after, so the table's rows over its key
+	 * columns' distinct values in the whole table, each column's as
+	 * lion_fkjoin_fk_ndistinct() takes it - not estimate_num_groups()'s,
+	 * which scales them down to the rows the restrictions leave
+	 */
+	values = 1.0;
+	foreach(lc, outerkeys)
+		values *= lion_fkjoin_fk_ndistinct(root, rel, (Var *) lfirst(lc));
+	perlookup = tuples / Max(Min(values, tuples), 1.0);
 	fetched = Min(perlookup * lookups, tuples);
 
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);

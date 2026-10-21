@@ -14067,19 +14067,21 @@ A GROUP BY of columns stays serial.
       + lion_units_price(the lookups)          (converted, as the node's own work)
       + the child's total cost                 (core's plan, in core's units, as a dimension's)
 
-all of it before the first row. The lookups are priced as core prices an index scan repeated once per
-outer row of a nested loop (`cost_index()`, `btcostestimate()`): `lookups` = the inner key
+all of it before the first row. The lookups are priced as core prices an index scan repeated once
+per outer row of a nested loop (`cost_index()`, `btcostestimate()`): `lookups` = the inner key
 expressions' distinct values (`estimate_num_groups()`) over the child's rows, no more than the rows;
-each finds t's rows over the distinct values of its key columns; a descent costs
-`ceil(log2(index tuples)) * cpu_operator_cost` and `(height + 1) * 50 * cpu_operator_cost`; each
-index tuple read `cpu_index_tuple_cost` and a `cpu_operator_cost` per scan key; the index pages over
-every lookup by `index_pages_fetched()` at the random page cost; the heap pages between as many as
-the rows (no order) and a lookup's share of the table's pages (the index's order), as far between as
-the correlation squared puts them, at the random page cost; each row found a `cpu_tuple_cost` and the
-clauses it is tested on; a `cpu_operator_cost` a row for the TIDs and each grouping column; and each
-child row's keys evaluated and hashed. A large inner side is many descents and many rows, which the
-ordinary plan's one pass over t undercuts: the cost model, nothing else, leaves it to core. On
-PostgreSQL 18 the path carries the child's disabled nodes.
+each finds t's rows over the distinct values of its key columns in the whole table, each column's
+`n_distinct` as `lion_fkjoin_fk_ndistinct()` takes it - a lookup finds every row of its key, and the
+restrictions are tested after, where `estimate_num_groups()` would scale the values down to the rows
+the WHERE leaves; a descent costs `ceil(log2(index tuples)) * cpu_operator_cost` and `(height + 1) *
+50 * cpu_operator_cost`; each index tuple read `cpu_index_tuple_cost` and a `cpu_operator_cost` per
+scan key; the index pages over every lookup by `index_pages_fetched()` at the random page cost; the
+heap pages between as many as the rows (no order) and a lookup's share of the table's pages (the
+index's order), as far between as the correlation squared puts them, at the random page cost; each
+row found a `cpu_tuple_cost` and the clauses it is tested on; a `cpu_operator_cost` a row for the
+TIDs and each grouping column; and each child row's keys evaluated and hashed. A large inner side is
+many descents and many rows, which the ordinary plan's one pass over t undercuts: the cost model,
+nothing else, leaves it to core. On PostgreSQL 18 the path carries the child's disabled nodes.
 
 **The plan.** `custom_private` grows (shape 29) an `ANTI` member, 24, after the cells' (§10): the
 flags, the B-tree, its scan keys' columns, operators and collations, the number of keys, join
@@ -14181,15 +14183,15 @@ the tally has given everything, and goes up last with what is left of it
 (`lion_anti_cells_next()`); a cell left with none is no row, and one left with fewer than none is
 an ERROR, which the argument above rules out. The other cells go up as the tally gives them.
 
-**In parallel** (§10, "Counts by cells"). The participants count ranges of container keys, each
-into its own tally, so every participant makes the run - reads the child and looks the keys up -
-and takes away the rows of M whose TIDs are in the ranges it counts (`lion_anti_cells_range()`, at
-each range it claims; a heap-only tuple's TID is in its chain's block, the root's, which is what
-the index holds). Every row of M is in one range, counted by one participant, so each
-participant's partial count of a cell holds every row it takes from it, and the check above holds
-of a partial count too. The child is the inner side's cheapest path a worker
-may run, as for the parallel count. EXPLAIN ANALYZE's `Join Child Rows`, `Join Keys Looked Up` and
-`Join Rows Fetched` are every participant's, summed; `Join Rows Subtracted` is the serial node's.
+**In parallel** (§10, "Counts by cells"). The participants count ranges of container keys, each into
+its own tally, so every participant makes the run - reads the child and looks the keys up - and
+takes away the rows of M whose TIDs are in the ranges it counts (`lion_anti_cells_range()`, at each
+range it claims; a heap-only tuple's TID is in its chain's block, the root's, which is what the
+index holds). Every row of M is in one range, counted by one participant, so each participant's
+partial count of a cell holds every row it takes from it, and the check above holds of a partial
+count too. The child is the inner side's cheapest path a worker may run, as for the parallel count.
+EXPLAIN ANALYZE's `Join Child Rows`, `Join Keys Looked Up` and `Join Rows Fetched` are every
+participant's, summed; `Join Rows Subtracted` is the serial node's.
 
 **Cost.** The count by cells' price, and beside it the anti join's: the lookups, with the
 predicates evaluated on each row found and a `cpu_operator_cost` a predicate to find its cell
@@ -14227,6 +14229,38 @@ plan of a GROUP BY of two or more bare columns, not of the expressions over pred
 cells answers, and such a GROUP BY beside the anti join is the nested loop of §20, which the anti
 join takes already. Its groups would need the subtraction keyed by the combination of the columns'
 values the walk decodes - a third way of finding a row's group - for a shape nothing here asks for.
+
+**Measured** (2026-10-21, PostgreSQL 18.6 release build, a VM of four cores shared with other work,
+`shared_buffers` 1 GB, warm; medians of seven, alternated with core's plan). A synthetic table of
+3,000,000 rows of some 240 bytes - 756 MB, 96,775 pages - whose key has 950,555 values of about
+three rows each scattered over the heap, a B-tree on the key and lion indexes on the WHERE's column
+(10 values) and the three columns of the tier's predicates (50 values; 20 and NULLs; 20 and NULLs):
+the tier is a CASE over a score of three CASEs over seven predicates, 36 cells. The GROUP BY form
+counts a WHERE of half the table (1,500,824 rows), the WHERE form `tier = 'high'` within a tenth of
+it (441 of 299,650 rows); core's plan is a bitmap heap scan under a hash anti join, with up to two
+workers in the parallel rows. Planned with nothing disabled:
+
+| form | inner keys | serial: LionCount | core | 2 workers: LionCount | core |
+|---|---|---|---|---|---|
+| GROUP BY tier | 2 | 26 ms | 509 ms | 15 ms | 278 ms |
+| GROUP BY tier | 200 | 28 | 504 | 18 | 275 |
+| GROUP BY tier | 2,000 | 40 | 532 | 44 | 281 |
+| GROUP BY tier | 20,000 | 131 | 528 | 191 | 294 |
+| WHERE tier = 'high' | 2 | 19 | 146 | 12 | 127 |
+| WHERE tier = 'high' | 200 | 25 | 150 | 17 | 127 |
+| WHERE tier = 'high' | 2,000 | 35 | 147 | 38 | 126 |
+| WHERE tier = 'high' | 20,000 | core's plan, 147 | 147 | core's plan, 121 | 122 |
+
+The count is the node's whole time with a few keys; the lookups grow with the keys, 5 to 8 us a key
+and its three rows, and in parallel every participant makes them all, so from about 2,000 keys two
+workers gain nothing on one, and at 20,000 the GROUP BY form's lose 60 ms to it - three
+participants' lookups on four busy cores, which the price, each participant's lookups whole as its
+own, does not see. At 20,000 keys the WHERE form is left to core, where the node, forced, takes 108
+to 148 ms against its 145: its heap fetches are priced at the random page cost, as core prices its
+own index scans. The rows a lookup finds are priced from the key's `n_distinct` over the whole table
+(above): `estimate_num_groups()`, scaled down to the 1,479 rows the WHERE form's restrictions leave,
+would make them 2,030 a lookup where there are three, and leave the WHERE form to core from 200 keys
+on.
 
 ### The dimension from a B-tree (2026-10-20)
 
