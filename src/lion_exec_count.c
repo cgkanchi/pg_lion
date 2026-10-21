@@ -1723,7 +1723,7 @@ lion_group_batch_fill(LionCountScanState *st)
  * intersection anywhere.  A WHERE of negated sources alone has nothing to
  * collect, and the planner never makes a parallel GROUP BY of one.
  */
-static bool
+bool
 lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
 {
 	EState	   *estate = st->css.ss.ps.state;
@@ -2959,7 +2959,7 @@ lion_next_group_distinct(LionCountScanState *st, bool *exhausted)
  * again, with restart.  False when the walk has none left: the column is past
  * its last chunk.
  */
-static bool
+bool
 lion_decode_fill(LionCountScanState *st, int c, bool restart)
 {
 	LionDecodeRun *dr = st->decode;
@@ -3038,7 +3038,7 @@ lion_decode_advance(LionCountScanState *st)
  * page image for a CHAIN set - shared among them; and all of them so that
  * the combinations of a pass fit a code.
  */
-static void
+void
 lion_decode_caps(LionCountScanState *st)
 {
 	LionDecodeRun *dr = st->decode;
@@ -3142,14 +3142,13 @@ lion_decode_pass(LionCountScanState *st)
 }
 
 /*
- * The run begins: the WHERE collected, every column's first chunk read.
- * False when there is nothing to count at all.
+ * The WHERE of a decoded walk, read before any column is: collected into
+ * one copy, or - with no positive source - left to the row filter.  False
+ * when it selects nothing at all.
  */
-static bool
-lion_decode_start(LionCountScanState *st)
+bool
+lion_decode_where(LionCountScanState *st)
 {
-	LionDecodeRun *dr = st->decode;
-	int			c;
 	int			k;
 
 	if (RecoveryInProgress())
@@ -3192,7 +3191,21 @@ lion_decode_start(LionCountScanState *st)
 		if (!st->wcollected)
 			return false;
 	}
+	return true;
+}
 
+/*
+ * The run begins: the WHERE collected, every column's first chunk read.
+ * False when there is nothing to count at all.
+ */
+static bool
+lion_decode_start(LionCountScanState *st)
+{
+	LionDecodeRun *dr = st->decode;
+	int			c;
+
+	if (!lion_decode_where(st))
+		return false;
 	if (dr->cap[0] == 0)
 		lion_decode_caps(st);
 	for (c = 0; c < dr->ncol; c++)
@@ -3283,6 +3296,8 @@ lion_decode_reset(LionCountScanState *st)
 
 	if (dr == NULL)
 		return;
+	if (st->cells != NULL)
+		lion_cells_reset(st);
 	for (c = 0; c < dr->ncol; c++)
 	{
 		if (dr->scanning[c])
@@ -3875,6 +3890,9 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 		case LION_MODE_DECODE:
 			Assert(st->decode != NULL);
 			return lion_next_group_decode(st, exhausted);
+		case LION_MODE_CELLS:
+			Assert(st->decode != NULL && st->cells != NULL);
+			return lion_next_cells(st, exhausted);
 		case LION_MODE_GROUP_DISTINCT:
 			Assert(st->decode == NULL && st->plan.distattno != 0);
 			return lion_next_group_distinct(st, exhausted);
