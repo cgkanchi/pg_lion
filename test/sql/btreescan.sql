@@ -333,6 +333,13 @@ SELECT * FROM lion_bs_run('SELECT o.v, x.id FROM (VALUES (17), (18), (250), (3))
 				LATERAL (SELECT id FROM bs WHERE c200 = o.v ORDER BY k LIMIT 3) x');
 SELECT * FROM lion_bs_run('SELECT o.v, x.id FROM (VALUES (100), (50000), (99990)) o(v),
 				LATERAL (SELECT id FROM bs WHERE c200 = 17 AND k > o.v ORDER BY k LIMIT 3) x');
+--    A LATERAL subquery pulled up from under an outer join, whose x.ov the
+--    scan of bs computes (a PlaceHolderVar, NULL where no row matches): every
+--    path of bs is parameterized by o, and the node's are not, so it offers
+--    none - the btree path it built for its ordered side named no outer
+--    relation, and core's assertion that it named o aborted the backend.
+SELECT lion_bs('SELECT o.v, x.id, x.ov FROM (VALUES (17), (18)) o(v)
+				LEFT JOIN LATERAL (SELECT id, o.v AS ov FROM bs WHERE c200 = 17) x ON true');
 
 -- 9. A partial btree: its predicate's clause stays in the filter, so the
 --    predicate column must be covered too - it is in bs_part and not in
