@@ -136,6 +136,20 @@ SELECT q, cr_q(q) FROM (VALUES
 	('SELECT b, count(*) FROM cr WHERE a = 2 AND n >= -1 AND n < 3 AND id % 3 = 0 GROUP BY b')
 ) v(q);
 
+-- ---- a range bound that is residual beside its column's other bounds ----
+-- t < 'v5' COLLATE "POSIX" is a range on t that no index of t's collation
+-- answers: residual, and taken back from t's bounds, where t > 'v1' stays.
+-- Whatever clause follows it takes its place in the clause lists - an IN
+-- list, which is no bound of t's, a bound of the column the GROUP BY walks -
+-- or none does, when it is the last.
+SELECT cr_plan('SELECT b, count(*) FROM cr WHERE n > -3 AND a IN (1, 2) AND t > ''v1'' AND t < ''v5'' COLLATE "POSIX" GROUP BY b');
+SELECT cr_plan('SELECT n, count(*) FROM cr WHERE n > -3 AND t > ''v1'' AND t < ''v5'' COLLATE "POSIX" AND n < 4 AND a = 2 GROUP BY n');
+SELECT q, cr_q(q) FROM (VALUES
+	('SELECT b, count(*) FROM cr WHERE n > -3 AND t > ''v1'' AND t < ''v5'' COLLATE "POSIX" AND a IN (1, 2) GROUP BY b'),
+	('SELECT b, count(*) FROM cr WHERE n > -3 AND a IN (1, 2) AND t > ''v1'' AND t < ''v5'' COLLATE "POSIX" GROUP BY b'),
+	('SELECT n, count(*) FROM cr WHERE n > -3 AND t > ''v1'' AND t < ''v5'' COLLATE "POSIX" AND n < 4 AND a = 2 GROUP BY n')
+) v(q);
+
 -- ---- what is declined: nothing else to select the rows, a range summed
 -- over its entries, a volatile function, a subplan, a whole-row or system
 -- column, a partitioned table, and the switch ----

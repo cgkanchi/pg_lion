@@ -3510,7 +3510,12 @@ posting sets do not answer - or that only an index the table does not have would
 whole query) - is residual when `lion_residual_ok()` takes it: a plain table's count, not a
 partition's or an FK-side join's; Vars of the table's own user columns only (no system column, no
 whole row); nothing volatile, no subplan. Whatever the analysis had appended for it (the first
-arms of an OR) is undone from a snapshot of the build. The query is then taken only when the other
+arms of an OR, a range's bound) is undone from a snapshot of the build taken before it
+(`lion_count_path_snapshot()`): its own copy of every list the analysis appends to, the per-column
+lists of range bounds inside `rangecls` and `rangepos` included, which are appended to in place - a
+bound left in its column's list would name the position the next clause takes, or one past the end
+of the lists. A restriction every partition's bounds imply (§16) is taken back from the same
+snapshot. The query is then taken only when the other
 clauses SELECT rows - a positive clause, an OR of them or a range taken as a source (§32) - and the
 shape counts rows rather than entries: not a sum over every row's entries or a range's on the
 column it walks (§28, §35), §37's aggregates over keys, the decoded walk, the parallel GROUP BY, or
@@ -5501,8 +5506,9 @@ per kind ORed, counted and grouped by one and two columns, with a range beside i
 before and after VACUUM; an arm a sub-partition's bound refutes, whose range then no longer keeps
 the partition from carrying the pin; the two-value bound, which refutes one arm and answers the
 others from its own index; the default and the NULL partition declining the arm they do not decide;
-and, with plan-time pruning off, the partitions whose bounds refute every arm, which are not
-counted.
+with plan-time pruning off, the partitions whose bounds refute every arm, which are not counted;
+and a generic plan of an OR whose arm is an IN list over a stable expression, run under values other
+than the one it was planned under, where no partition refutes or implies the arm.
 
 ### OR arms the partition bounds refute (2026-09-28)
 
@@ -5525,7 +5531,14 @@ bounds do not imply as a whole, arm by arm:
   partition holds, so an arm it refutes in core's weak sense - `predicate_refuted_by(arm,
   constraint, true)`: the constraint TRUE, the arm FALSE or NULL - is not TRUE for any of them, and
   adds no row to the union. That is left out whether or not the partition has indexes for it. A
-  volatile function or a subquery keeps the arm, as it keeps a clause from being implied.
+  volatile function or a subquery keeps the arm, as it keeps a clause from being implied. The
+  proof is made from each leaf as the query has it (`LionClauseInfo.clause`), never from the
+  clause the cost model is handed: an IN list over a stable expression, `k = ANY
+  (string_to_array(current_setting('...'), ','))`, is priced over the array the expression has
+  while the plan is made, and a cached plan runs under every value it takes later: refuted or
+  implied on the strength of the estimate, the arm would be left out of a generic plan's
+  partitions whatever the setting then is. Only an exact rewrite (a bare boolean column's
+  `col = true`, `costexact`) stands in for the clause.
 - **In an arm it keeps, a leaf the bounds imply is left out of the arm's AND** - TRUE of every row
   - except a range, whose bounds are one source together (§32) and are kept. An arm all of whose
   leaves are implied is TRUE of every row, and so is the OR, which is then left out whole as an
@@ -14477,8 +14490,9 @@ sub-partition's bound implies. The counters: `Join Keys Looked Up` a key per par
 turn for an inner join, fewer for a semi join, and none in a partition whose filters select nothing;
 more than one batch at a `work_mem` of 64 kB with the answers unchanged; `Fact Filter Copies Shared`
 one per partition, and one per partition and run over three rescans of the Gather. A generic plan
-with a Param fact filter (a NULL one too) and a correlated subquery that rescans the node with a
-new fact filter; the declines (a partition without a lion index on fk, a key clause the default
+with a Param fact filter (a NULL one too), one whose OR has an arm on an IN list over a stable
+expression - planned under one value, run under another, and no arm refuted or implied by the
+first - and a correlated subquery that rescans the node with a new fact filter; the declines (a partition without a lion index on fk, a key clause the default
 partition's bound does not imply and no index of it answers, alone and among others, an old-style
 inheritance parent, partitionwise aggregation turned on); the model's
 choice with nothing disabled (the node for a few dimension rows against filters that leave many
@@ -20695,7 +20709,10 @@ sets as a second source hung off the OR's (`LionCountSource.compl`), which nothi
 than as a count declines an OR with a complement arm: the decoded walk (§34), the parallel GROUP BY,
 an FK-side join (§27), the range probe (§32), the WHERE collection and the sum probe. A complement
 leaf is no selecting clause of a partition's bounds (`lion_leaf_drops()`). At most three such ORs
-(`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. A complement OR, an `IS DISTINCT
+(`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. The cap is asked before the OR
+is noted anywhere, so a fourth is a restriction no posting set answers like any other - residual,
+or left out where every partition's bounds imply it - and leaves nothing behind in `ors` that would
+make the clauses after it its arms. A complement OR, an `IS DISTINCT
 FROM` or a `NOT` beside a multi-key query whose value is known only at run time is declined: that
 query may narrow nothing and leave the heap scan of `lion_count_scan_filtered()` as the count, and
 that scan tests none of them. A complement in a filtered count's condition (§10, "Filtered counts")
@@ -20749,7 +20766,8 @@ the deleted row it must not evaluate `100 / k` on, and the numeric column it mus
 in ORs - beside equalities, ranges and IN lists, under GROUP BY of one and two columns, HAVING, top k
 and count(DISTINCT) - each against the sequential plan on a table with NULLs, negative values, NULL
 and empty arrays, and deleted and updated rows; what is declined; generic plans with NULL parameters;
-a LATERAL rescan; a partitioned table. `node_contracts.sql` revokes `int4eq` under `IS DISTINCT
+a LATERAL rescan; a partitioned table, with a fourth complement OR its bounds imply.
+`node_contracts.sql` revokes `int4eq` under `IS DISTINCT
 FROM`, `int4ne` under a complement arm and `ts_match_vq` under `NOT`.
 
 ## 36. The top k of a GROUP BY ordered by its count (implemented 2026-09-30)
