@@ -1594,7 +1594,8 @@ lion_where_collect(LionCountScanState *st, LionCountSource *sources,
 	if (lion_sources_collect(st->heap, estate->es_snapshot, n, items,
 							 (st->rangesrc_held < limit) ?
 							 limit - st->rangesrc_held : 0,
-							 true, &st->wherecoll, &spilled, &st->stats))
+							 true, st->filter, &st->wherecoll, &spilled,
+							 &st->stats))
 	{
 		st->wcollected = true;
 		st->wherecollected++;
@@ -1812,8 +1813,8 @@ lion_where_collect_range(LionCountScanState *st, uint32 lo, uint64 hi)
 	}
 	ok = lion_sources_collect_range(st->heap, estate->es_snapshot, st->nitem,
 									items, get_hash_memory_limit(), true,
-									lo, hi, &st->wherecoll, &spilled,
-									&st->stats);
+									st->filter, lo, hi, &st->wherecoll,
+									&spilled, &st->stats);
 	MemoryContextSwitchTo(oldcxt);
 
 	if (!ok)

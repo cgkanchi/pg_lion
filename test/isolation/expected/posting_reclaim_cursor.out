@@ -1,6 +1,6 @@
 Parsed test spec with 2 sessions
 
-starting permutation: s2_leaves s1_begin s2_vacuum s2_shape s2_insert s2_size s2_verify s1_fetch s1_tail s1_commit s2_count s2_vacuum s2_reuse s2_verify
+starting permutation: s2_leaves s1_begin s2_checkpoint s2_vacuum s2_shape s2_insert s2_size s2_verify s1_fetch s1_tail s1_commit s2_count s2_vacuum s2_reuse s2_verify
 step s2_leaves: 
 	SELECT container_pages AS leaves, deleted_pages AS unlinked
 	  FROM lion_index_stats('prc_k');
@@ -15,6 +15,7 @@ step s1_begin:
 	DECLARE c CURSOR FOR SELECT id FROM prc WHERE k = 1;
 	MOVE 14999 FROM c;
 
+step s2_checkpoint: CHECKPOINT;
 step s2_vacuum: VACUUM prc;
 step s2_shape: 
 	SELECT container_pages AS leaves, deleted_pages AS unlinked

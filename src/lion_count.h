@@ -158,10 +158,15 @@ typedef struct LionCountStats
 
 	/*
 	 * Candidates decided from stored positions (LionRowFilter.pos), and
-	 * those of them the query does not select.
+	 * those of them the query does not select; and what that took
+	 * (lion_posfilter_work()), the members sought and those decoded, which
+	 * an FK-side join that probes its filters is charged (DESIGN.md §27,
+	 * "Probed, then collected").
 	 */
 	int64		pos_checked;
 	int64		pos_removed;
+	int64		pos_seeks;
+	int64		pos_decoded;
 
 	/*
 	 * What a count's work is made of, container by container (DESIGN.md §27,
@@ -293,8 +298,9 @@ lion_row_filter_heap(const LionRowFilter *filter)
  * cache is the handle the count node already gives every count of one
  * execution; lion_vis_cache_reset() leaves the filter where it is, and a
  * count of another relation than filter->heap is an error.  A collection
- * (lion_sources_collect()) is never filtered: the superset it copies is
- * filtered when it is counted.
+ * (lion_sources_collect()) has no cache: it is handed the filter of the counts
+ * it is made for, applies its position filters to what it copies, and leaves
+ * the rest to those counts.
  */
 extern void lion_vis_cache_set_filter(LionVisCache *cache,
 									  LionRowFilter *filter);
@@ -838,13 +844,15 @@ extern bool lion_exists_sources_cached(Relation heap, Snapshot snapshot,
  * copy may only ever be counted beside a located set that carries the §9
  * interlock.  False when it would take more than maxbytes - unless spill
  * allows the copy to go on in a temporary file past them, and *spilled then
- * says whether it did.
+ * says whether it did.  filter, when not NULL, is the row filter the counts
+ * against the copy are made under: its position filters decide what is
+ * copied, and those counts do not apply them again.
  */
 extern bool lion_sources_collect(Relation heap, Snapshot snapshot,
 								 int nsources, LionCountSource *sources,
 								 Size maxbytes, bool spill,
-								 LionPostingSet *out, bool *spilled,
-								 LionCountStats *stats);
+								 LionRowFilter *filter, LionPostingSet *out,
+								 bool *spilled, LionCountStats *stats);
 
 /*
  * The heap's container keys cut into ranges for the participants of a
@@ -864,7 +872,8 @@ extern void lion_key_range(int nranges, uint32 ckeys, int r, uint32 *lo,
 						   uint64 *hi);
 extern bool lion_sources_collect_range(Relation heap, Snapshot snapshot,
 									   int nsources, LionCountSource *sources,
-									   Size maxbytes, bool spill, uint32 lo,
+									   Size maxbytes, bool spill,
+									   LionRowFilter *filter, uint32 lo,
 									   uint64 hi, LionPostingSet *out,
 									   bool *spilled, LionCountStats *stats);
 
@@ -1015,6 +1024,7 @@ extern void lion_shared_copy_reinit(LionSharedCopy *sc, struct dsa_area *area,
 extern void lion_shared_copy_collect(LionSharedCopy *sc, struct dsa_area *area,
 									 Relation heap, Snapshot snapshot,
 									 int nsources, LionCountSource *sources,
+									 LionRowFilter *filter,
 									 LionPostingSet *out, int *chunks,
 									 bool *built, bool *spilled,
 									 LionCountStats *stats);
@@ -1766,6 +1776,10 @@ typedef struct LionAndCost
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
 							  Node **clauses, double isect, LionAndCost *out);
+
+/* What an AM scan's position filters decode and decide (DESIGN.md §17). */
+extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
+									 double cand);
 
 /*
  * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
