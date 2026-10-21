@@ -531,8 +531,17 @@ lion_partial_anchored(List *targets, List *clauseinfos, List *ors,
 
 		if (p == NULL)
 		{
-			/* nothing is left out unless every relation has one */
+			/*
+			 * A relation with no partial index counts all its rows, which is
+			 * exact only where nothing was left out of the WHERE - and
+			 * lion_partial_drops() leaves a restriction out only when every
+			 * relation of the scope has one.  A relation counted here that
+			 * the scope does not know would have its rows outside the
+			 * predicate counted: the attempt is declined.
+			 */
 			Assert(s->dropped == NIL);
+			if (s->dropped != NIL)
+				return false;
 			continue;
 		}
 		for (d = 0; d < ndrive && d < LION_MAX_GROUPCOLS; d++)

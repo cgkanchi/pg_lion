@@ -4115,6 +4115,11 @@ extern const CustomPathMethods lion_join_agg_path_methods;
 
 extern const CustomPathMethods lion_semijoin_path_methods;
 
+/* lion_ordered.c and lion_bm25_scan.c: their paths, for lion_path_has_lion() */
+extern const CustomPathMethods lion_ordered_path_methods;
+extern const CustomPathMethods lion_btree_path_methods;
+extern const CustomPathMethods lion_bm25_path_methods;
+
 /* lion_plan_hooks.c */
 extern bool		lion_enable_count_pushdown;
 extern bool		lion_enable_filter_switch;
