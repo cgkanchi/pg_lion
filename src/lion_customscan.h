@@ -2966,12 +2966,15 @@ typedef struct LionCountScanState
 
 	/*
 	 * The index-usage statistics of the relation being counted
-	 * (pg_stat_user_indexes): statread says it has been read since it was
-	 * made the one counted or last reported, and statrows are the rows
-	 * counted from it since - what lion_count_report_reads() counts as one
-	 * scan of each of its indexes and their idx_tup_read.
+	 * (pg_stat_user_indexes): statopen says its indexes are open and not
+	 * yet reported for the last time, statsince is lion_dir_pages_read when
+	 * it was made the one counted or last reported, and statrows are the
+	 * rows counted from it since - what lion_count_report_reads() counts as
+	 * one scan, and the idx_tup_read, of each of its indexes whose directory
+	 * was read since (lion_dir_read_since()).
 	 */
-	bool		statread;
+	bool		statopen;
+	int64		statsince;
 	int64		statrows;
 
 	/*
