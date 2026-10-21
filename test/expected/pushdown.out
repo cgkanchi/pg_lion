@@ -2771,20 +2771,17 @@ RESET pg_lion.enable_decoded_walk;
  * table stays the nested loop's.
  */
 SELECT lion_plans('SELECT a, b, count(*) FROM lion_pdt GROUP BY a, b');
-                      lion_plans                      
-------------------------------------------------------
+                   lion_plans                   
+------------------------------------------------
  -- on:
- Finalize HashAggregate
-   Group Key: a, b
-   ->  Custom Scan (LionCount)
-         Lion Indexes: lion_pdt_b (b), lion_pdt_a (a)
-         Group Key: b, a
-         Group Strategy: Decoded
+ Custom Scan (LionCount)
+   Lion Indexes: lion_pdt_b (b), lion_pdt_a (a)
+   Group Key: b, a
  -- off:
  HashAggregate
    Group Key: a, b
    ->  Seq Scan on lion_pdt
-(11 rows)
+(8 rows)
 
 SELECT lion_pd($$SELECT a, b, count(*) FROM lion_pdt WHERE c = 'c1' GROUP BY a, b$$);
        lion_pd        

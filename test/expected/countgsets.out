@@ -100,8 +100,8 @@ END $$;
 -- ---- the plans ----
 -- one rollup: the finest grouping sorted once
 SELECT gs_plan('SELECT a, b, count(*), GROUPING(a, b) FROM gs GROUP BY ROLLUP (a, b)');
-                          gs_plan                           
-------------------------------------------------------------
+                       gs_plan                        
+------------------------------------------------------
  Custom Scan (LionJoinAgg)
    ->  GroupAggregate
          Group Key: a, b
@@ -109,18 +109,15 @@ SELECT gs_plan('SELECT a, b, count(*), GROUPING(a, b) FROM gs GROUP BY ROLLUP (a
          Group Key: ()
          ->  Sort
                Sort Key: a, b
-               ->  Finalize HashAggregate
-                     Group Key: a, b
-                     ->  Custom Scan (LionCount)
-                           Lion Indexes: gs_b (b), gs_a (a)
-                           Group Key: b, a
-                           Group Strategy: Decoded
-(13 rows)
+               ->  Custom Scan (LionCount)
+                     Lion Indexes: gs_b (b), gs_a (a)
+                     Group Key: b, a
+(10 rows)
 
 -- a cube is two rollups, the second sorted by the Agg itself
 SELECT gs_plan('SELECT a, b, count(*) FROM gs GROUP BY CUBE (a, b)');
-                          gs_plan                           
-------------------------------------------------------------
+                       gs_plan                        
+------------------------------------------------------
  Custom Scan (LionJoinAgg)
    ->  GroupAggregate
          Group Key: a, b
@@ -130,20 +127,17 @@ SELECT gs_plan('SELECT a, b, count(*) FROM gs GROUP BY CUBE (a, b)');
            Group Key: b
          ->  Sort
                Sort Key: a, b
-               ->  Finalize HashAggregate
-                     Group Key: a, b
-                     ->  Custom Scan (LionCount)
-                           Lion Indexes: gs_b (b), gs_a (a)
-                           Group Key: b, a
-                           Group Strategy: Decoded
-(15 rows)
+               ->  Custom Scan (LionCount)
+                     Lion Indexes: gs_b (b), gs_a (a)
+                     Group Key: b, a
+(12 rows)
 
 -- a HAVING over the counts, and an ORDER BY and LIMIT over the sets, which
 -- the finest grouping is not cut to
 SELECT gs_plan('SELECT a, b, count(*) FROM gs WHERE c = 1 GROUP BY GROUPING SETS ((a), (b), ())
 				HAVING count(*) > 10 ORDER BY count(*) DESC, a, b LIMIT 4');
-                                       gs_plan                                        
---------------------------------------------------------------------------------------
+                                    gs_plan                                     
+--------------------------------------------------------------------------------
  Limit
    ->  Sort
          Sort Key: (count(*)) DESC, a, b
@@ -156,13 +150,10 @@ SELECT gs_plan('SELECT a, b, count(*) FROM gs WHERE c = 1 GROUP BY GROUPING SETS
                      Filter: (lion_join_count((count(*))) > 10)
                      ->  Sort
                            Sort Key: a
-                           ->  Finalize HashAggregate
-                                 Group Key: a, b
-                                 ->  Custom Scan (LionCount)
-                                       Lion Indexes: gs_b (b), gs_a (a), gs_c (c = 1)
-                                       Group Key: b, a
-                                       Group Strategy: Decoded
-(18 rows)
+                           ->  Custom Scan (LionCount)
+                                 Lion Indexes: gs_b (b), gs_a (a), gs_c (c = 1)
+                                 Group Key: b, a
+(15 rows)
 
 -- ---- answers, against the sequential plan ----
 SELECT q, gs_q(q) FROM (VALUES

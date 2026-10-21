@@ -1023,23 +1023,25 @@ phase1d() {
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
 		{ no_injection_points "phase 1d" "phase1d            skipped (no injection points)"; return 0; }
 
-	# Two keys taking alternate TIDs of wide rows, about 75 to a heap page, so
-	# each container key is a dense bitset that fills a leaf by itself, and
+	# Two keys taking alternate TIDs of wide rows, 65 to a heap page, built at
+	# posting_fillfactor 10, which makes every container a leaf of its own:
 	# each set has more than the 16 leaves a set without an internal level
-	# may have (DESIGN.md §22): a tree, whose leaf splits take two records.
-	# The index is created EMPTY, so every split really happens in aminsert.
+	# may have (DESIGN.md §22), a tree, whose leaf splits take two records.
+	# The split is aminsert's: the insert below fills the last leaf with
+	# containers and splits it.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_psplit;
 		CREATE TABLE lion_psplit (id int, k int NOT NULL,
 								  pad char(80) NOT NULL DEFAULT 'x');
-		CREATE INDEX lion_psplit_k ON lion_psplit USING lion (k);
 		INSERT INTO lion_psplit SELECT i, i % 2 FROM generate_series(1, 90000) i;
+		CREATE INDEX lion_psplit_k ON lion_psplit USING lion (k)
+			WITH (posting_fillfactor = 10);
 	SQL
 	psql_p -c "VACUUM (ANALYZE) lion_psplit" >>"$RUNLOG" 2>&1
 	before=$(psql_p -tAc "select container_pages from lion_index_stats('lion_psplit_k')")
-	[ "${before:-0}" -gt 2 ] ||
-		die "phase 1d: the fixture did not split a posting page at all"
+	[ "${before:-0}" -gt 32 ] ||
+		die "phase 1d: the fixture's posting sets have $before leaves, not a leaf a container"
 	[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('lion_psplit_k')")" = 1 ] ||
 		die "phase 1d: the fixture's posting sets are not trees"
 
@@ -1170,9 +1172,10 @@ phase1d() {
 
 # A crash in the middle of a MULTI-LEAF INLINE spill (DESIGN.md §18, "The
 # spill").  VACUUM's filtering turns one key's INLINE payload - eleven RUN
-# containers over 150,000 clustered rows - into ten BITSETs, which need a leaf
-# each: a set of no more than 16 leaves, which has no internal level and whose
-# first leaf is its head (DESIGN.md §22).  The spill logs the head first, as
+# containers over 150,000 clustered rows - into eleven NARROWs of 2,056 bytes
+# (DESIGN.md §38), three to a leaf: four leaves, a set of no more than 16
+# leaves, which has no internal level and whose first leaf is its head
+# (DESIGN.md §22).  The spill logs the head first, as
 # an internal page with no downlink, writes a record per other leaf, and dies
 # before its last record: the head, made the first leaf, together with the
 # rewritten entry.  Then:
@@ -1184,7 +1187,7 @@ phase1d() {
 #    leaves, which are FULL - the sweep used to free only empty unreferenced
 #    leaves, so these stayed leaked for good.  Its VERBOSE page counts
 #    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
-#    them: the nine orphans and the head their spill logged before them (with
+#    them: the three orphans and the head their spill logged before them (with
 #    no downlink) newly deleted, and never counted twice;
 #  * and a second crash replays that VACUUM, the whole multi-leaf spill
 #    included (under wal_consistency_checking when --conf asks for it).
@@ -1244,16 +1247,16 @@ phase1e() {
 	# INLINE entry it was, dead TIDs and all.
 	warn=$(psql_p -c "SELECT lion_index_verify('lion_mspill_k', true)" 2>&1 >>"$RUNLOG" |
 		grep -c 'unused and unreachable' || true)
-	[ "$warn" -ge 10 ] ||
-		die "phase 1e: $warn unreachable page(s) after the crash, expected the nine orphan leaves and their head"
+	[ "$warn" -ge 4 ] ||
+		die "phase 1e: $warn unreachable page(s) after the crash, expected the three orphan leaves and their head"
 	run_check "phase 1e post-crash" psql_p \
 		"select inline_entries = 1 and ntids = 150000,
 				format('the entry is still INLINE with every TID (%s entries INLINE, ntids %s)',
 					   inline_entries, ntids)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
-		 select container_pages = 9 and posting_internal_pages = 1,
-				format('the nine leaves and their head came back unreferenced (%s container pages, %s internal)',
+		 select container_pages = 3 and posting_internal_pages = 1,
+				format('the three leaves and their head came back unreferenced (%s container pages, %s internal)',
 					   container_pages, posting_internal_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
@@ -1264,15 +1267,15 @@ phase1e() {
 		>>"$RUNLOG" 2>&1 || true
 
 	# The next VACUUM spills the set and sweeps the orphans away, and says so:
-	# the nine orphans and their head - logged first, as an internal page with
+	# the three orphans and their head - logged first, as an internal page with
 	# no downlink, so that its block is never handed out again (DESIGN.md
 	# §18) - are what it newly deleted, and they are not reusable yet.  Any
 	# other free page is all-zero and reusable, so the two differences agree
 	# exactly unless a page is counted twice or a fresh one is called
 	# reusable.
 	vacuum_page_counts "phase 1e" lion_mspill lion_mspill_k
-	[ "$NEWLY" = 10 ] ||
-		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the nine orphan leaves and their head"
+	[ "$NEWLY" = 4 ] ||
+		die "phase 1e: VACUUM reported $NEWLY pages newly deleted, expected the three orphan leaves and their head"
 	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
 		die "phase 1e: VACUUM reported $CURRENT pages currently deleted and $REUSABLE reusable for $NEWLY newly deleted"
 
@@ -1281,12 +1284,12 @@ phase1e() {
 	[ "$warn" -le 1 ] ||
 		die "phase 1e: $warn page(s) are still leaked after the sweep"
 	run_check "phase 1e swept" psql_p \
-		"select inline_entries = 0 and posting_internal_pages = 0 and container_pages = 10,
+		"select inline_entries = 0 and posting_internal_pages = 0 and container_pages = 4,
 				format('spilled: %s INLINE, %s internal, %s leaves',
 					   inline_entries, posting_internal_pages, container_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
-		 select deleted_pages = 10, format('%s DELETED pages, the nine orphans and their head', deleted_pages)
+		 select deleted_pages = 4, format('%s DELETED pages, the three orphans and their head', deleted_pages)
 		   from lion_index_stats('lion_mspill_k')
 		 union all
 		 select ntids = (select count(*) from lion_mspill), 'ntids agrees with the heap'
@@ -1315,8 +1318,8 @@ phase1e() {
 
 	psql_p -c "DROP TABLE lion_mspill, lion_mspill_flush" >>"$RUNLOG" 2>&1
 
-	log "phase 1e: the crash left the entry INLINE and nine orphan leaves; the next VACUUM spilled it and freed them"
-	SUMMARY+=("phase1e            crash inside a 10-leaf spill; nothing lost, orphans swept")
+	log "phase 1e: the crash left the entry INLINE and three orphan leaves; the next VACUUM spilled it and freed them"
+	SUMMARY+=("phase1e            crash inside a 4-leaf spill; nothing lost, orphans swept")
 }
 
 # ------------------------------------------------------------- phase 1f
@@ -1598,17 +1601,18 @@ phase1g() {
 	psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1 ||
 		{ no_injection_points "phase 1g" "phase1g            skipped (no injection points)"; return 0; }
 
-	# Two keys on alternate wide rows, about 75 to a heap page, so that each
-	# container key is a dense bitset filling a leaf by itself: 60000 rows
-	# give each key 14 leaves and no internal level.  The index is created
-	# EMPTY, so every split happens in aminsert.
+	# Two keys on alternate wide rows, 65 to a heap page: 66000 rows are 16
+	# container keys, which a build at posting_fillfactor 10 makes a leaf
+	# each, so each key has 16 leaves and no internal level.  The insert below
+	# fills the last leaf with containers, and its split is the 17th.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1g: fixture failed"
 		SET synchronous_commit = on;
 		DROP TABLE IF EXISTS lion_promo;
 		CREATE TABLE lion_promo (id int, k int NOT NULL,
 								 pad char(80) NOT NULL DEFAULT 'x');
-		CREATE INDEX lion_promo_k ON lion_promo USING lion (k);
-		INSERT INTO lion_promo SELECT i, i % 2 FROM generate_series(1, 60000) i;
+		INSERT INTO lion_promo SELECT i, i % 2 FROM generate_series(1, 66000) i;
+		CREATE INDEX lion_promo_k ON lion_promo USING lion (k)
+			WITH (posting_fillfactor = 10);
 	SQL
 	[ "$(psql_p -tAc "select max_posting_height || '/' || posting_internal_pages from lion_index_stats('lion_promo_k')")" = "0/0" ] ||
 		die "phase 1g: the fixture's posting sets are not without an internal level"
@@ -1620,7 +1624,7 @@ phase1g() {
 	"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
 		-c "SET synchronous_commit = on;
 		    INSERT INTO lion_promo SELECT 100000 + i, i % 2
-		      FROM generate_series(1, 20000) i" >>"$RUNLOG" 2>&1 &
+		      FROM generate_series(1, 30000) i" >>"$RUNLOG" 2>&1 &
 	parked=$!
 
 	wait_true psql_p \
@@ -1687,11 +1691,11 @@ phase1g() {
 		 select true, 'verify() is clean after the inserts'
 		   from (select lion_index_verify('lion_promo_k', true)) v
 		 union all
-		 select (select count(*) from lion_promo where k = 0) = 40000,
-				'k = 0 answers 40000 rows'
+		 select (select count(*) from lion_promo where k = 0) = 43000,
+				'k = 0 answers 43000 rows'
 		 union all
-		 select (select count(*) from lion_promo where k = 1) = 40000,
-				'k = 1 answers 40000 rows'
+		 select (select count(*) from lion_promo where k = 1) = 43000,
+				'k = 1 answers 43000 rows'
 		 union all
 		 select ntids = (select count(*) from lion_promo), 'ntids agrees with the heap'
 		   from lion_index_stats('lion_promo_k')"
@@ -1711,9 +1715,9 @@ phase1g() {
 		"select true, 'verify'
 		   from (select lion_index_verify('lion_promo_k', true)) v
 		 union all
-		 select (select count(*) from lion_promo where k = 0) = 40000 and
-				(select count(*) from lion_promo where k = 1) = 40000,
-				'both keys answer 40000 rows after the replay'
+		 select (select count(*) from lion_promo where k = 0) = 43000 and
+				(select count(*) from lion_promo where k = 1) = 43000,
+				'both keys answer 43000 rows after the replay'
 		 union all
 		 select ntids = (select count(*) from lion_promo), 'ntids agrees with the heap'
 		   from lion_index_stats('lion_promo_k')"
@@ -2301,7 +2305,7 @@ phase2() {
 #             removes them there.  The pinned leaf itself has nothing left to
 #             remove, so the primary's VACUUM cleanup-locks it but writes no
 #             record for it.
-#   pushdown  the reader pins the HEAD of a posting set of 14 leaves with no
+#   pushdown  the reader pins the HEAD of a posting set of 16 leaves with no
 #             internal level, its first leaf; an insert needs a 17th leaf and
 #             pushes the head down (§22), so the containers move to a new
 #             child and the head becomes an internal page.
@@ -2421,27 +2425,30 @@ phase3() {
 		SET synchronous_commit = on;
 		CREATE EXTENSION IF NOT EXISTS injection_points;
 
-		-- split: several ~1 KB ARRAY containers per leaf (count_split_race.spec)
+		-- split: some thirty ARRAY containers on a full leaf
+		-- (count_split_race.spec)
 		DROP TABLE IF EXISTS pin_split;
-		-- 15 rows to a heap page: 480 members of a key in a container, an
-		-- ARRAY, which the split case's inserts grow.  The index is made
-		-- before the rows, so that the inserts make it, as ARRAYs: a build
-		-- would make each a NARROW of width 1 (DESIGN.md section 38), 520
-		-- bytes, which an insert below offset 64 sets bits in and never
-		-- grows, so no leaf would split.
+		-- 15 rows to a heap page, two of them k = 1's: 128 members of k = 1
+		-- in a container, a 264-byte ARRAY, which the split case's inserts
+		-- grow into a NARROW of width 1 (DESIGN.md section 38), 520 bytes.
+		-- The build packs the leaves full (posting_fillfactor 100): k = 1's
+		-- first leaf has 96 bytes to spare.
 		CREATE TABLE pin_split (id int, k int NOT NULL, pad char(480));
-		CREATE INDEX pin_split_k ON pin_split USING lion (k);
-		INSERT INTO pin_split SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
+		INSERT INTO pin_split SELECT i, CASE WHEN i % 15 IN (1, 8) THEN 1 ELSE 0 END, ''
+		  FROM generate_series(1, 38400) i;
+		CREATE INDEX pin_split_k ON pin_split USING lion (k) WITH (posting_fillfactor = 100);
 
 		-- pushdown: count_root_pushdown_race.spec's fixture.  k = 1's first
 		-- container on its head, and then wide rows, every other one k = 1,
-		-- which give it a BITSET a container key, 14 leaves in all
+		-- 16 container keys in all, which a build at posting_fillfactor 10
+		-- makes a leaf each: 16 leaves and no internal level
 		DROP TABLE IF EXISTS pin_push;
 		CREATE TABLE pin_push (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x');
 		INSERT INTO pin_push SELECT i, i % 4 FROM generate_series(1, 4000) i;
-		CREATE INDEX pin_push_k ON pin_push USING lion (k) WITH (inline_limit = 64);
 		INSERT INTO pin_push SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 		  FROM generate_series(1, 60000) i;
+		CREATE INDEX pin_push_k ON pin_push USING lion (k)
+			WITH (inline_limit = 64, posting_fillfactor = 10);
 
 		-- spill: k = 1 is 200 consecutive offsets of heap block 0, one RUN
 		-- container of a few bytes, INLINE; every other one deleted, it is a

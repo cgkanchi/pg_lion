@@ -134,15 +134,12 @@ EXPLAIN (COSTS OFF) SELECT count(*) FROM xd WHERE doc->>'s' IN ('a', 'b') AND (d
 (2 rows)
 
 EXPLAIN (COSTS OFF) SELECT doc->>'s', doc->'o'->>'t', count(*) FROM xd GROUP BY 1, 2;
-                                         QUERY PLAN                                          
----------------------------------------------------------------------------------------------
- Finalize HashAggregate
-   Group Key: ((doc ->> 's'::text)), (((doc -> 'o'::text) ->> 't'::text))
-   ->  Custom Scan (LionCount)
-         Lion Indexes: xd_t (((doc -> 'o'::text) ->> 't'::text)), xd_s ((doc ->> 's'::text))
-         Group Key: ((doc -> 'o'::text) ->> 't'::text), (doc ->> 's'::text)
-         Group Strategy: Decoded
-(6 rows)
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: xd_t (((doc -> 'o'::text) ->> 't'::text)), xd_s ((doc ->> 's'::text))
+   Group Key: ((doc -> 'o'::text) ->> 't'::text), (doc ->> 's'::text)
+(3 rows)
 
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT doc->>'s') FROM xd WHERE c = 1;
                         QUERY PLAN                        

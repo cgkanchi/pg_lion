@@ -373,13 +373,20 @@ SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
-SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
-SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
-SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+/*
+ * The WHERE carries a residual that every row passes.  A count that reads
+ * only its sets costs next to nothing beside the lookups, which every plan
+ * makes once, so dividing it would save a fraction of a cost unit and the
+ * plan would turn on rounding; one that reads its rows from the heap has
+ * something to divide.
+ */
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
 -- one participant ran the child and made the lookups: the serial node's counters
-SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 SET max_parallel_workers_per_gather = 0;
-SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 SET max_parallel_workers_per_gather = 2;
 -- ... rescanned under a correlated subquery
 SELECT lca('SELECT o.v, (SELECT count(*) FROM lca_rows r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)) FROM (VALUES (3), (1), (3)) o(v)');
@@ -389,7 +396,7 @@ SET plan_cache_mode = force_generic_plan;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
-PREPARE lca_par AS SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+PREPARE lca_par AS SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
 SELECT ln FROM lca_explain('EXECUTE lca_par') AS ln WHERE ln ~ 'Parallel';
 SET parallel_leader_participation = off;
 CREATE TEMP TABLE lca_par_on AS EXECUTE lca_par;
@@ -401,7 +408,7 @@ RESET enable_mergejoin;
 RESET enable_nestloop;
 SET pg_lion.enable_count_pushdown = off;
 SELECT (TABLE lca_par_on) = count(*) AS same_count
-  FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+  FROM lca_rows r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lca_par_on;
 -- the GROUP BY stays serial

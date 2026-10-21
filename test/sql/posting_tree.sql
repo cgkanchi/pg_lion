@@ -37,9 +37,10 @@ CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE TABLE pt_grow (id int, k int);
 CREATE INDEX pt_grow_k ON pt_grow USING lion (k);
 
--- Two keys taking alternate TIDs, so their containers are dense bitsets
--- rather than one long run: each container key then fills a leaf by itself.
-INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(1, 10000) i;
+-- Two keys taking alternate TIDs, so their containers are dense bitmaps
+-- rather than one long run: NARROW items of 2 kB (§38), three to a leaf.
+-- Three container keys of each are more than an entry holds inline.
+INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(1, 30000) i;
 
 SELECT container_pages, posting_internal_pages, max_posting_height
   FROM lion_index_stats('pt_grow_k');
@@ -50,7 +51,7 @@ SELECT lion_index_posting_root('pt_grow_k', 1) AS root1 \gset
 
 -- Grow both keys to several leaves: still no internal level, the head is the
 -- first leaf of a chain.
-INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(10001, 200000) i;
+INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(30001, 300000) i;
 
 SELECT container_pages > 10 AS many_leaves,
 	   container_pages <= 2 * 16 AS at_most_16_leaves_a_key,
@@ -62,7 +63,7 @@ SELECT lion_index_posting_root('pt_grow_k', 0) = :root0 AS head0_unchanged,
 SELECT lion_index_verify('pt_grow_k', true);
 
 -- ... and past 16 leaves, which needs a root.
-INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(200001, 300000) i;
+INSERT INTO pt_grow SELECT i, i % 2 FROM generate_series(300001, 750000) i;
 
 SELECT container_pages > 2 * 16 AS many_leaves,
 	   posting_internal_pages = 2 AS one_root_per_key,
@@ -202,9 +203,13 @@ SELECT count(*) FROM pt_grow WHERE k = 0;
 -- back.  (It cannot be exactly zero: the ROOT of a posting set is the one page
 -- that is never recycled, so that owner_head stays an identity a reader can
 -- trust - DESIGN.md §18.)
+-- They go to the free space map with the first VACUUM after a transaction
+-- id - this CREATE's - has been spent since they were freed (nbtree's rule,
+-- DESIGN.md §18, "Reuse").
 CREATE TEMP TABLE pt_free_size AS
 	SELECT pg_relation_size('pt_grow_k') AS bytes,
 		   (SELECT deleted_pages FROM lion_index_stats('pt_grow_k')) AS freed;
+VACUUM pt_grow;
 INSERT INTO pt_grow SELECT 2000000 + i, 0 FROM generate_series(1, 60000) i;
 SELECT (SELECT deleted_pages FROM lion_index_stats('pt_grow_k')) <
 	   (SELECT freed FROM pt_free_size) AS freed_pages_were_reused,
@@ -218,7 +223,8 @@ SELECT count(*) FROM pt_grow WHERE k = 0;
 -- 5. REINDEX equivalence
 -- ---------------------------------------------------------------------
 
-SELECT entries, ntids FROM lion_index_stats('pt_grow_k') \gset
+SELECT entries, ntids, container_pages AS leaves
+  FROM lion_index_stats('pt_grow_k') \gset
 REINDEX INDEX pt_grow_k;
 SELECT entries = :entries AS same_entries, ntids = :ntids AS same_ntids
   FROM lion_index_stats('pt_grow_k');
@@ -226,11 +232,11 @@ SELECT lion_index_verify('pt_grow_k', true);
 SELECT count(*) FROM pt_grow WHERE k = 0;
 SELECT count(*) FROM pt_grow WHERE k = 1;
 
--- a bulk build packs the containers tighter than the inserts left them -
--- three NARROW items (§38) to a leaf where the inserts had one BITSET - so
--- both sets fit 16 leaves again and are written without an internal level
+-- the build writes the items the inserts wrote - NARROW ones (§38) - packed
+-- to posting_fillfactor: no more leaves than the inserts left, and the same
+-- two levels
 SELECT max_posting_height, posting_internal_pages,
-	   container_pages <= 2 * 16 AS at_most_16_leaves_a_key
+	   container_pages <= :leaves AS no_more_leaves
   FROM lion_index_stats('pt_grow_k');
 
 DROP FUNCTION pt_containers(text);

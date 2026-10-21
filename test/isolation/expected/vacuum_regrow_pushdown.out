@@ -22,13 +22,13 @@ injection_points_attach
 (1 row)
 
 step s4_prep: VACUUM (FREEZE) rgp;
-step s2_delete: DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3);
+step s2_delete: DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 2 = 0;
 step s4_before: 
 	SELECT container_pages, posting_internal_pages FROM lion_index_stats('rgp_k');
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-             33|                     1
+             34|                     1
 (1 row)
 
 step s1_count: SELECT lion_index_count('rgp_k', 1); <waiting ...>
@@ -73,7 +73,7 @@ rgp_release
 step s1_count: <... completed>
 lion_index_count
 ----------------
-           42341
+           64928
 (1 row)
 
 step s4_after: 
@@ -81,7 +81,7 @@ step s4_after:
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-             34|                     2
+             35|                     2
 (1 row)
 
 step s4_count: 
@@ -90,7 +90,7 @@ step s4_count:
 
 count
 -----
-42341
+64928
 (1 row)
 
 step s4_verify: SELECT lion_index_verify('rgp_k', true);
@@ -122,18 +122,18 @@ injection_points_attach
 (1 row)
 
 step s4_prep: VACUUM (FREEZE) rgp;
-step s2_delete: DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3);
+step s2_delete: DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 2 = 0;
 step s4_before: 
 	SELECT container_pages, posting_internal_pages FROM lion_index_stats('rgp_k');
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-             33|                     1
+             34|                     1
 (1 row)
 
 step s5_vacuum: VACUUM (INDEX_CLEANUP ON) rgp; <waiting ...>
 step s6_insert: 
-	INSERT INTO rgp SELECT i, 2, repeat('x', 70)
+	INSERT INTO rgp SELECT i, CASE WHEN i % 2 = 0 THEN 2 ELSE 4 END, repeat('x', 70)
 	  FROM generate_series(200001, 240000) i;
  <waiting ...>
 step s7_parked: SELECT rgp_parked('lion-posting-split-incomplete') AS insert_holds_the_leaf;
@@ -169,7 +169,7 @@ step s4_after:
 
 container_pages|posting_internal_pages
 ---------------+----------------------
-             35|                     2
+             39|                     2
 (1 row)
 
 step s4_count: 
@@ -178,7 +178,7 @@ step s4_count:
 
 count
 -----
-42341
+64928
 (1 row)
 
 step s4_verify: SELECT lion_index_verify('rgp_k', true);

@@ -34,15 +34,15 @@
 #    settled by reading the meta page again.
 # Posting trees:
 #  * posting_split (vp: two keys on alternate wide rows, each set more than
-#    the 16 bitset leaves a set without an internal level may have, so a tree
-#    with a root): parked after one set's leaves are walked, an insert splits
-#    its last leaf.  The level above holds a downlink the leaf walk never saw,
+#    the 16 leaves a set without an internal level may have, so a tree with
+#    a root): parked after one set's leaves are walked, an insert splits its
+#    last leaf.  The level above holds a downlink the leaf walk never saw,
 #    and the entry's counters moved: the set is walked again.
-#  * pushdown (vq: three one-page sets, and one of 14 leaves and no level
+#  * pushdown (vq: three one-page sets, and one of 16 leaves and no level
 #    above them, DESIGN.md §22): parked after one of them is walked, an insert
-#    splits the leaves of the 14-leaf set until the next split would make a
-#    17th, which pushes its head down under a new root (the head keeps its
-#    block), and adds a key whose set spills and grows at once.  The first set
+#    fills the last leaf of the 16-leaf set and splits it, which makes a 17th
+#    and pushes its head down under a new root (the head keeps its block),
+#    and adds a key whose set spills and grows at once.  The first set
 #    is walked again; the new key's pages are candidates, and its head is
 #    found through its entry.
 #  * spill: parked after the leaves of vc, an existing INLINE entry spills to
@@ -100,23 +100,28 @@ setup
 	INSERT INTO vr SELECT 'key' || g FROM generate_series(1, 10) g;
 	CREATE INDEX vr_k ON vr USING lion (k) WITH (inline_limit = 64);
 
-	/* Made before the rows, so that the inserts make its sets, as BITSETs,
-	 * a leaf each: a build would make NARROWs of width 4 (DESIGN.md §38),
-	 * three to a leaf, whose last leaf the writers below do not split.  Wide
-	 * rows, about 75 to a heap page, give each set some 21 leaves. */
+	/* Wide rows, 65 to a heap page, give each set 22 container keys, which
+	 * a build at posting_fillfactor 10 makes a leaf each: a tree.  The rows
+	 * inserted after it fill each set's last leaf with six more NARROWs
+	 * (DESIGN.md §38) of 1,032 bytes, seven in all, so that the next
+	 * container that goes in splits it. */
 	CREATE TABLE vp (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	  WITH (autovacuum_enabled = off);
-	CREATE INDEX vp_k ON vp USING lion (k) WITH (inline_limit = 64);
 	INSERT INTO vp SELECT i, i % 2 FROM generate_series(1, 90000) i;
+	CREATE INDEX vp_k ON vp USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
+	INSERT INTO vp SELECT 1000000 + i, i % 2 FROM generate_series(1, 25000) i;
 
-	/* Keys 0 to 3 one page each from the build; then keys 0 and 7 on
-	 * alternate wide rows, 14 bitset leaves each. */
+	/* Keys 0 to 3 one page each; keys 0 and 7, on alternate wide rows after
+	 * them, 16 container keys each, which the build at posting_fillfactor 10
+	 * makes 16 leaves. */
 	CREATE TABLE vq (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	  WITH (autovacuum_enabled = off);
 	INSERT INTO vq SELECT i, i % 4 FROM generate_series(1, 4000) i;
-	CREATE INDEX vq_k ON vq USING lion (k) WITH (inline_limit = 64);
 	INSERT INTO vq SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 0 ELSE 7 END
 	  FROM generate_series(1, 60000) i;
+	CREATE INDEX vq_k ON vq USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
 
 	CREATE TABLE v_before AS
 	SELECT (SELECT leaf_pages FROM lion_index_stats('vc_k')) AS vc_leaves,
@@ -222,12 +227,14 @@ step s2_split_root	{
 	INSERT INTO vr SELECT 'root' || g || repeat('r', 200)
 	  FROM generate_series(1, 300) g;
 }
+# 2000 rows, some 35 heap pages: a RUN of a run a page, past inline_limit.
 step s2_spill		{
-	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 200);
+	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 2000);
 }
-# After s2_free_p and VACUUM the first 45000 rows take the heap slots k = 1
-# left, and set bits in leaves that are there; the rest split leaves.
-step s2_grow_p		{ INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 60000) i; }
+# After s2_free_p and VACUUM the first 57500 rows take the heap slots k = 1
+# left, and set bits in the NARROWs that are there; the rest go in at the end
+# of the heap, as RUNs, and split the last leaf.
+step s2_grow_p		{ INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 100000) i; }
 step s2_touch_p		{ INSERT INTO vp SELECT 200000 + i, 0 FROM generate_series(1, 100) i; }
 step s2_grow_new	{ INSERT INTO vp SELECT 100000 + i, 2 FROM generate_series(1, 30000) i; }
 step s2_push_q		{

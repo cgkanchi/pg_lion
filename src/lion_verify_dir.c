@@ -956,7 +956,6 @@ lion_verify_meta(LionVerifyState *vs)
 
 	vs->root = meta->root;
 	vs->height = meta->height;
-	vs->allows_narrow = LION_META_ALLOWS_NARROW(meta);
 
 	UnlockReleaseBuffer(buf);
 }

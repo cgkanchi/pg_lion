@@ -258,11 +258,11 @@ lion_index_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
  * containers take (DESIGN.md §13, §24, §38): a header each (16 bytes with its
  * line pointer) and two bytes a member, up to a bitset's 4 kB - or, past 256
  * k members, a NARROW of k words a block, 512 k bytes, where the heap's rows
- * take k words (lion_bitmap_width()): the smallest of them, which is what a
- * build writes (lion_container_optimize()) - or about six bytes a row where
- * the rows are too few a container for one (a sparse segment, §13).  A dense
- * set of a built index weighed as ARRAYs is given up to three times the pages
- * it takes.
+ * take k words (lion_bitmap_width()): the smallest of them, which is what
+ * every container of the index is (lion_container_optimize()) - or about six
+ * bytes a row where the rows are too few a container for one (a sparse
+ * segment, §13).  A dense set weighed as ARRAYs is given up to three times
+ * the pages it takes.
  */
 static double
 lion_set_bytes(RelOptInfo *rel, double members, double containers)
@@ -660,60 +660,27 @@ lion_bitmap_width(double tuples, double heap_pages)
 
 /*
  * ARE A SET'S CONTAINERS BITMAPS (DESIGN.md §10, "Dense sources"; §38)?  Its
- * `members` lie in `containers` containers on `pages` posting pages, of a
- * heap whose bitmaps are `width` words a block (lion_bitmap_width()); the
- * words one of its containers has, or 0 for an ARRAY.
+ * `members` lie in `containers` containers, of a heap whose bitmaps are
+ * `width` words a block (lion_bitmap_width()); the words one of its
+ * containers has, or 0 for an ARRAY.
  *
- * What a container is does not follow from its members alone.  One a build or
- * a VACUUM writes is the smallest that holds them (lion_container_optimize()):
- * an ARRAY of up to 256 k members, and above that a NARROW of width k, 512 k
- * bytes.  One an insert grows stays an ARRAY up to 2,048 members and becomes a
- * BITSET past them.  So a set of more than 256 k members a container is a
- * NARROW in an index built over its table and an ARRAY or a BITSET in one its
- * rows were inserted into - and the second costs the merge seven times the
- * first: nine dense sets ANDed take 1.2 ms built and 8.8 ms inserted.
- *
- * The set's pages, its share of its column's by bytes
- * (lion_column_set_pages()), say which where the two sizes are far enough
- * apart to tell: a build fills its posting pages to
- * LION_DEFAULT_POSTING_FILLFACTOR, and the bytes a container of the set takes
- * of them are taken for whichever of the two sizes they are nearer by ratio -
- * the share is an estimate that may be off by a third.  Where the two are
- * less than LION_BUILT_SIZE_RATIO apart, a set of up to about 384 k members,
- * the pages cannot tell: four ARRAYs of a thousand members fill a page as
- * four NARROWs of three words a block do.  The set is then taken as built, as
- * a build and every VACUUM that rewrites a container leave it - priced as
- * inserted, a fifth of a 4M-row heap ANDed with three dense sets cost 7,700
- * units a millisecond.  With no pages to go by (`pages` 0) the set is taken
- * as inserted, the dearer of the two.
+ * Every container an index gets is the smallest that holds its members
+ * (lion_container_optimize()) - the build's, the ones an insert writes anew
+ * and the ones VACUUM rewrites: an ARRAY of up to 256 k members, and above
+ * that a NARROW of width k, 512 k bytes.  An ARRAY grows past that in place
+ * only by its slack, a few dozen members.  So a set of more than 256 k
+ * members a container is NARROWs, which the merge ANDs a pass of words at a
+ * time - nine dense sets in 1.2 ms, where ARRAYs of the same members looked
+ * up in each other take 8.8.
  */
 static double
-lion_set_bitmap_words(double members, double containers, double pages,
-					  double width)
+lion_set_bitmap_words(double members, double containers, double width)
 {
 	double		mu = Max(members, 0.0) / Max(containers, 1.0);
-	double		words = (double) LION_WIDTH_WORDS(1) * width;
-	double		grownwords = (mu > (double) LION_ARRAY_MAX_CARD) ?
-		(double) LION_BITSET_WORDS : 0.0;
-	double		built;
-	double		grown;
-	double		bytes;
 
 	if (mu <= (double) LION_WIDTH_ARRAY_CARD(1) * width)
 		return 0.0;				/* an ARRAY is no larger: it is one */
-	if (pages <= 0.0)
-		return grownwords;
-
-	/* the two sizes, with the header and line pointer a container takes */
-	built = (double) LION_WIDTH_BYTES(1) * width + LION_CONTAINER_ITEM_BYTES;
-	grown = ((grownwords > 0.0) ? (double) LION_BITSET_BYTES : 2.0 * mu) +
-		LION_CONTAINER_ITEM_BYTES;
-	if (grown < LION_BUILT_SIZE_RATIO * built)
-		return words;
-
-	bytes = pages * BLCKSZ / Max(containers, 1.0) *
-		(LION_DEFAULT_POSTING_FILLFACTOR / 100.0);
-	return (bytes * bytes < built * grown) ? words : grownwords;
+	return (double) LION_WIDTH_WORDS(1) * width;
 }
 
 /*
@@ -1296,14 +1263,12 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	}
 
 	/*
-	 * What its containers are, bitmaps or ARRAYs, as the bytes its pages give
-	 * one of them say (lion_set_bitmap_words()); and what reading every one
-	 * of them costs - what a union is built of (§15, §19), or a sum adds up -
-	 * at the merge's price of a container the driver reads
-	 * (lion_merge_cpu_cost()).
+	 * What its containers are, bitmaps or ARRAYs, as their members say
+	 * (lion_set_bitmap_words()); and what reading every one of them costs -
+	 * what a union is built of (§15, §19), or a sum adds up - at the merge's
+	 * price of a container the driver reads (lion_merge_cpu_cost()).
 	 */
 	sc->words = lion_set_bitmap_words(sc->members, sc->setcontainers,
-									  sc->pages,
 									  lion_bitmap_width(rel->tuples,
 														heap_pages));
 	sc->readall = sc->containers *
@@ -3409,17 +3374,13 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 /*
  * The words of a container of a set of `members` rows in `containers`
  * containers of key column col of idx - a group's own set, a negated
- * clause's - or 0 for ARRAYs (lion_set_bitmap_words()), from its share of
- * the column's container pages (lion_column_set_pages()).
+ * clause's - or 0 for ARRAYs (lion_set_bitmap_words()).
  */
 static double
 lion_column_set_words(LionCountRelCost *c, IndexOptInfo *idx, AttrNumber col,
 					  double members, double containers)
 {
 	return lion_set_bitmap_words(members, containers,
-								 lion_column_set_pages(c->root, c->rel, idx,
-													   col, members,
-													   containers),
 								 lion_bitmap_width(c->tuples, c->heap_pages));
 }
 

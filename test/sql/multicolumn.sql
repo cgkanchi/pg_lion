@@ -528,12 +528,11 @@ EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcs WHERE a = 3 AND c = 'c1';
 EXPLAIN (COSTS OFF)
 SELECT a, count(*) FROM lion_mcp WHERE b = 2 GROUP BY a;
+-- two group columns by the nested loop, three by the decoded walk (§34)
 EXPLAIN (COSTS OFF)
 SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
-SET pg_lion.enable_decoded_walk = off;
 EXPLAIN (COSTS OFF)
-SELECT a, b, count(*) FROM lion_mcp GROUP BY a, b;
-RESET pg_lion.enable_decoded_walk;
+SELECT a, b, c, count(*) FROM lion_mcp GROUP BY a, b, c;
 -- an OR is one source over several columns of the one index (§19)
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM lion_mcp WHERE a = 3 OR b = 2;

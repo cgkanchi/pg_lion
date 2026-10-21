@@ -466,22 +466,15 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * whether there are summaries, and every page and item of a version 6 or 7
  * index reads as it did - and the number moves so that a build that
  * predates NARROW refuses an index that has one rather than reporting it
- * corrupt, or worse.  A build writes version 8 only when it has written a
- * NARROW item; VACUUM makes a NARROW only in a version 8 index, and an insert
- * makes one only of a NARROW, which it widens, so that an index of version 6
- * or 7 stays one, readable by the builds before this one, until it is
- * rebuilt.
+ * corrupt, or worse.
  *
  * Version 9 (DESIGN.md §13) stores a sparse segment's pairs as a stream of
  * delta varints instead of uint32 ckeys[] and uint16 los[], which
  * reinterprets every segment of every older index, so versions 6, 7 and 8
  * are no longer read: opening one is an ERROR whose hint asks for REINDEX.
  * Every index this build writes is version 9, whatever it holds: whether a
- * key column has summaries is what summary_cols says (§32), and whether the
- * index may hold NARROW items (§38) is the LION_META_NARROW bit of
- * order_flags, set when its build wrote one - the rule version 8 was, kept:
- * VACUUM makes a NARROW only in such an index, and inserts make none.  The
- * leaf-root posting trees share the number.
+ * key column has summaries is what summary_cols says (§32).  The leaf-root
+ * posting trees share the number.
  *
  * Version 10 (DESIGN.md §21, "Entry tuples") lays out every directory item
  * anew - a 12-byte header for an INLINE entry or a pivot and a 28-byte one
@@ -490,8 +483,8 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * payload packed right after the key (lion_entryfmt.h) - and it stamps the
  * pages of a posting tree with a hash of the key's bytes instead of the
  * key's hash.  So version 9 is no longer read either: opening one is an
- * ERROR whose hint asks for REINDEX.  Whether an index has summaries or
- * NARROW items is said as version 9 said it.
+ * ERROR whose hint asks for REINDEX.  Whether an index has summaries is said
+ * as version 9 said it.
  *
  * Version 11 raises LION_MAX_KEY_SIZE from 2000 to 2047 bytes.  A version 10
  * index of jsonb_contains_ops (§42) holds as hashes the keys of 2001 to 2047
@@ -527,10 +520,6 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
 #define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
 #define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
-
-/* May the index of this meta page hold NARROW items (§38)? */
-#define LION_META_ALLOWS_NARROW(meta) \
-	(((meta)->order_flags & LION_META_NARROW) != 0)
 
 typedef struct LionMetaPageData
 {
@@ -611,14 +600,6 @@ typedef struct LionMetaPageData
  * positions".  ALTER INDEX changes nothing until a REINDEX.
  */
 #define LION_META_POSITIONS			0x0002
-
-/*
- * The build wrote a NARROW item (DESIGN.md §38), so VACUUM may make NARROWs
- * of the items it rewrites; an index without it has none, and gets none
- * until it is rebuilt.  Version 8 said this with its number; since version
- * 9 (§13) it is said here, as LION_META_POSITIONS does for positions.
- */
-#define LION_META_NARROW			0x0004
 
 /* ordered_cols has one bit per key column. */
 StaticAssertDecl(INDEX_MAX_KEYS <= 32,
@@ -2435,12 +2416,6 @@ extern void lion_meta_record_order(LionMetaPageData *meta, LionIndexState *ix);
  */
 extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
-
-/*
- * ... and whether the build wrote a NARROW item (DESIGN.md §38), which sets
- * LION_META_NARROW.
- */
-extern void lion_meta_record_narrow(LionMetaPageData *meta, bool narrow);
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of

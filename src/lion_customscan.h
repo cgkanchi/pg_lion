@@ -1002,14 +1002,11 @@ typedef struct LionVColScope
 #define LION_BITMAP_MEMBER_COST	(lion_bitmap_member_cost * cpu_operator_cost)
 
 /*
- * ... and what tells the containers of a set apart as a build's or an
- * insert's (lion_set_bitmap_words()): the bytes a container takes of a
- * posting page past its members - its header and line pointer, as
- * lion_index_column_posting_share() weighs a column's sets - and how far
- * apart the two sizes have to be for the set's pages to say which it is.
+ * ... and the bytes a container takes of a posting page past its members:
+ * its header and line pointer, as lion_index_column_posting_share() weighs a
+ * column's sets.
  */
 #define LION_CONTAINER_ITEM_BYTES	16.0
-#define LION_BUILT_SIZE_RATIO		1.5
 
 /*
  * THE UNION OF A LIST'S SETS AT ONE KEY (DESIGN.md §29.11, "Unions probed"),

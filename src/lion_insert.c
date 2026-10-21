@@ -197,8 +197,8 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 		if (!lion_container_add(w->cont, lo))
 			elog(ERROR, "lion index: duplicate member in sparse segment for container key %u",
 				 ckey);
-		/* an insert makes no NARROW of anything else (DESIGN.md §38) */
-		lion_container_optimize_ext(w->cont, false);
+		/* the smallest that holds it, as the build's (DESIGN.md §38) */
+		lion_container_optimize(w->cont);
 
 		lion_sparse_split_at(w->seg, ckey, w->left, w->right);
 
@@ -237,7 +237,7 @@ lion_segment_add(LionSegWork *w, uint32 ckey, uint16 lo)
 
 		(void) lion_segwork_buf(&w->cont);
 		(void) lion_sparse_extract(w->seg, only, w->cont);
-		lion_container_optimize_ext(w->cont, false);
+		lion_container_optimize(w->cont);
 		Assert(w->seg->cardinality == 0);
 
 		lion_sparse_init(w->left, ckey);
@@ -443,13 +443,17 @@ lion_inline_add(const char *payload, Size paylen, uint32 ckey, uint16 lo,
 				continue;
 			}
 
-			/* A container with this very ckey. */
+			/*
+			 * A container with this very ckey, written back as the smallest
+			 * that holds it, as the build writes it (DESIGN.md §38).
+			 */
 			Assert(cbuf->ckey == ckey);
 			if (!lion_container_add(cbuf, lo))
 			{
 				pfree(cbuf);
 				return 0;		/* already indexed */
 			}
+			lion_container_optimize(cbuf);
 			csize = lion_container_size(cbuf);
 		}
 
@@ -1200,6 +1204,15 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 		memcpy(cbuf, PageGetItem(cpage, ciid), ItemIdGetLength(ciid));
 		if (!lion_container_add(cbuf, lo))
 			return true;		/* already indexed */
+
+		/*
+		 * The item is written anew, so as the smallest that holds its
+		 * members, as the build and VACUUM write theirs (DESIGN.md §38): an
+		 * ARRAY that a NARROW would be smaller than becomes one here, and
+		 * not a BITSET at 2048 members.  In place, between two of these, it
+		 * grows by the slack it was given (lion_item_alloc_size()).
+		 */
+		lion_container_optimize(cbuf);
 	}
 
 	lion_entry_set_ntids(ecopy, lion_entry_ntids(ecopy) + 1);

@@ -33,8 +33,10 @@
 # gone and verify() is clean.
 #
 # k = 1 has 1000 rows in the first container key and 30,000 more interleaved
-# with k = 5's, wide rows, so that each container is a BITSET filling a leaf
-# of its own: about 14 leaves a key, and s2_grow's 20,000 more go past 16.
+# with k = 5's, wide rows, in 985 heap blocks: 16 container keys.  The index
+# is built on them at posting_fillfactor 10, which makes every container a
+# leaf of its own, so each of the two sets has 16 leaves and no internal
+# level; s2_grow's 20,000 more fill the last leaf, and its split is the 17th.
 setup
 {
 	SET synchronous_commit = on;
@@ -42,9 +44,10 @@ setup
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	CREATE TABLE vrp (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x');
 	INSERT INTO vrp SELECT i, i % 4 FROM generate_series(1, 4000) i;
-	CREATE INDEX vrp_k ON vrp USING lion (k) WITH (inline_limit = 64);
 	INSERT INTO vrp SELECT 10000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 	  FROM generate_series(1, 60000) i;
+	CREATE INDEX vrp_k ON vrp USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
 	CREATE FUNCTION vrp_wait_for_insert() RETURNS boolean
 	LANGUAGE plpgsql AS $fn$
 	DECLARE
@@ -102,8 +105,9 @@ step s1_check	{
 session s2
 setup			{ SET synchronous_commit = on; }
 step s2_predel	{ DELETE FROM vrp WHERE k = 1 AND id <= 2000; }
-# Every other row, so the new members are BITSET containers that fill leaves
-# (consecutive offsets would compress into a short RUN).
+# Every other row, so the new members are NARROW containers of 1,032 bytes
+# that fill the last leaf (consecutive offsets would compress into a short
+# RUN).
 step s2_grow	{
 	INSERT INTO vrp SELECT 100000 + i, CASE WHEN i % 2 = 0 THEN 1 ELSE 5 END
 	  FROM generate_series(1, 40000) i;
