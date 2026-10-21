@@ -6294,12 +6294,13 @@ and `tf * (k1 + 1) / (tf + k1 * (1 - b + b * |d| / avgdl))` per query lexeme.
   The functions are declared CALLED ON NULL INPUT for col's NULL, and give no rows (a NULL score)
   for a NULL in any other argument, as STRICT would.
 
-The query's lexemes are its operands not under a NOT, once each; a prefix is refused. Candidates
-stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with the empty
-key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are sorted
-and fetched best first under the caller's snapshot, the TID following a HOT chain to the visible
-version, until `k` are visible; when dead rows leave fewer, the walk is made again for the next
-`4L`: the rows ranked strictly below the last one already tried, by (score, TID). A row's score
+The query's lexemes are its operands not under a NOT, once each; a prefix among them is refused, and
+one under a NOT scores nothing, as every operand there does (`'w1 & !w7:*'` ranks by `w1`).
+Candidates stream out of a merge of the lexemes' cursors in TID order, each scored as it comes, with
+the empty key's cursor moving forward beside them; a min-heap keeps the best `L = k + 16`. Those are
+sorted and fetched best first under the caller's snapshot, the TID following a HOT chain to the
+visible version, until `k` are visible; when dead rows leave fewer, the walk is made again for the
+next `4L`: the rows ranked strictly below the last one already tried, by (score, TID). A row's score
 depends only on its members and on the prepared query (N, df and avgdl are read once per call), so
 that is exactly where the last walk stopped. An offset into a bigger walk is not: a row inserted
 meanwhile, invisible to the snapshot but in the index, moves every row ranked below it down a place,
@@ -6383,7 +6384,10 @@ a count replaces"), so a cached plan answers a REVOKE or a SET ROLE as the ordin
 `FOR UPDATE` or the like is left to the ordinary plan, since EvalPlanQual hands a scan the table's
 row rather than that tuple. Its startup cost is
 two index tuples and two operators per member of the scored lexemes (their `ntids`, read at plan
-time). Each row then costs a random page, a tuple and the restrictions. Against a bitmap scan that
+time from the lexemes' entries alone, `lion_bm25_plan_ncodes()`: a plan reads no row's length for
+avgdl, which the price does not use, and takes none of a search's predicate locks, which a plan
+that is never run would leave behind in a SERIALIZABLE transaction). Each row then costs a random
+page, a tuple and the restrictions. Against a bitmap scan that
 fetches, scores and sorts every match, on the synthetic 500k-row benchmark (top 10): 120 ms to 20
 ms for two mid-frequency words, 157 ms to 51 ms for two common ones, and 160 ms to 21 ms for one
 very common word with two rarer ones. A rare AND keeps the bitmap scan, which is the cheaper plan.

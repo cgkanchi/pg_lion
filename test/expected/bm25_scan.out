@@ -157,6 +157,13 @@ SELECT bs_same('w1', 'w1 & w9:*', 10);
  10 rows, 0 differ
 (1 row)
 
+-- a prefix under a NOT scores nothing, as every operand there does
+SELECT bs_same('w1 & !w7:*', 'w1 & !w7:*', 20);
+      bs_same      
+-------------------
+ 20 rows, 0 differ
+(1 row)
+
 -- not offered: ascending, no WHERE, a WHERE lexeme the score lacks, a WHERE
 -- an empty document matches, a prefix
 SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
@@ -217,6 +224,29 @@ SELECT bs_scanned($$SELECT id FROM bs_docs WHERE d @@ 'w1'
 (1 row)
 
 RESET pg_lion.enable_bm25_scan;
+-- the plan reads the lexemes' entries for its price and takes none of a
+-- search's predicate locks, which a plan never run would leave behind
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+EXPLAIN (COSTS OFF)
+SELECT id FROM bs_docs WHERE d @@ 'w1 | w7'
+ ORDER BY lion_bm25_score(d, 'w1 | w7', 'bs_docs_d') DESC LIMIT 10;
+                    QUERY PLAN                     
+---------------------------------------------------
+ Limit
+   ->  Custom Scan (LionBm25) on bs_docs
+         Filter: (d @@ '''w1'' | ''w7'''::tsquery)
+         Index: bs_docs_d
+(4 rows)
+
+SELECT count(*) AS siread FROM pg_locks
+ WHERE mode = 'SIReadLock' AND relation = 'bs_docs_d'::regclass
+   AND pid = pg_backend_pid();
+ siread 
+--------
+      0
+(1 row)
+
+COMMIT;
 -- a second sort key: an incremental sort over the scan's order
 EXPLAIN (COSTS OFF)
 SELECT id FROM bs_docs WHERE d @@ 'w1'
