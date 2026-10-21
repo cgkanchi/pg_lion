@@ -211,20 +211,23 @@ typedef struct LionVerifyState
 } LionVerifyState;
 
 /*
- * How many times a posting set is walked with nothing held before the walk is
- * made with its entry's directory leaf held SHARE (lion_verify_set()).  Each
- * extra walk costs this backend a read of the set; the last one costs the
- * writers of that leaf's keys a wait for one read of it.
+ * How many times a posting set or a position tree is walked with nothing
+ * held before the walk is made with its entry's directory leaf held SHARE
+ * (lion_verify_set(), lion_verify_postree()).  Each extra walk costs this
+ * backend a read of the tree; the last one costs the writers of that leaf's
+ * keys a wait for one read of it.
  */
 #define LION_VERIFY_SET_ATTEMPTS	3
 
 /*
- * How many walks of a posting set a STANDBY makes before it gives up on
- * getting to the end of one (lion_verify_set()).  It never walks a set with
- * the entry's leaf held - replay takes the set's pages before the leaf
- * (DESIGN.md §25) - so after LION_VERIFY_SET_ATTEMPTS walks it keeps the next
- * one that reaches the end of the set, and only a root pushed down or an
- * upper level split under each walk keeps it from doing that.
+ * How many walks of a posting set or a position tree a STANDBY makes before
+ * it gives up on getting to the end of one (lion_verify_set(),
+ * lion_verify_postree()).  It never walks either with the entry's leaf held
+ * - replay takes the tree's pages before the leaf (DESIGN.md §25) - so after
+ * LION_VERIFY_SET_ATTEMPTS walks of a set it keeps the next one that reaches
+ * the end of the set, a position tree's first such walk, and only a root
+ * pushed down or an upper level split under each walk keeps it from doing
+ * that.
  */
 #define LION_VERIFY_STANDBY_WALKS	10
 
