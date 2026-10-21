@@ -1530,6 +1530,10 @@ lion_explain_analyze(LionCountScanState *st, ExplainState *es)
 	 */
 	if (st->join != NULL)
 		lion_explain_join_counters(st, &tot, es);
+
+	/* ... and the anti join over a small inner side's (DESIGN.md §27) */
+	if (st->anti != NULL)
+		lion_explain_anti_counters(st, es);
 }
 
 void
@@ -1583,6 +1587,14 @@ lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 	 */
 	if (st->join != NULL)
 		lion_explain_join(st, es);
+
+	/*
+	 * The anti join over a small inner side (DESIGN.md §27): the B-tree its
+	 * child's keys are looked up in, and the clauses each row found is
+	 * tested on.
+	 */
+	if (st->anti != NULL)
+		lion_explain_anti(st, ancestors, es);
 
 	lion_explain_group_keys(st, ancestors, es);
 
