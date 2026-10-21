@@ -106,11 +106,19 @@ typedef struct LionScanOpaqueData
 								 * amrescan */
 
 	/*
-	 * The plain scan (liongettuple(), DESIGN.md §29).  The source is opened
-	 * by the first call after a rescan and lives in gtcxt, which amrescan
-	 * resets; the batch is the members of the container it last handed out,
-	 * as lo values of that container (lion_container_to_array()), turned into
-	 * a TID one at a time.
+	 * The bitmap scan's memory: every call of liongetbitmap() runs in it, and
+	 * it is reset when the call returns.  The bitmap itself is in its own
+	 * context (tbm_create()), and what outlives the call is in the scan's:
+	 * the keys in keycxt, the probes in so's own.
+	 */
+	MemoryContext bmcxt;
+
+	/*
+	 * The plain scan (liongettuple(), DESIGN.md §29).  Every call runs in
+	 * gtcxt, which amrescan resets; the source is opened in it by the first
+	 * call after a rescan.  The batch is the members of the container the
+	 * source last handed out, as lo values of that container
+	 * (lion_container_to_array()), turned into a TID one at a time.
 	 */
 	MemoryContext gtcxt;
 	struct LionSource *src;
@@ -276,6 +284,8 @@ lion_scan_reset(LionScanOpaque so)
 	so->pos = 0;
 	if (so->gtcxt != NULL)
 		MemoryContextReset(so->gtcxt);
+	if (so->bmcxt != NULL)
+		MemoryContextReset(so->bmcxt);
 	if (so->keycxt != NULL)
 		MemoryContextReset(so->keycxt);
 }
@@ -312,6 +322,8 @@ lionendscan(IndexScanDesc scan)
 		lion_scan_reset(so);
 		if (so->gtcxt != NULL)
 			MemoryContextDelete(so->gtcxt);
+		if (so->bmcxt != NULL)
+			MemoryContextDelete(so->bmcxt);
 		if (so->keycxt != NULL)
 			MemoryContextDelete(so->keycxt);
 		if (so->lo != NULL)
@@ -845,6 +857,12 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 	}
 }
 
+/*
+ * The end of a walk, and of what it allocated: its leaf copy and the ranges'
+ * ends go with it, not with the caller's context - a bitmap scan of
+ * `op ANY (array)` whose elements have no order walks once for each of them
+ * in one call (lion_emit_array_range()).
+ */
 static void
 lion_walk_end(LionLeafWalk *w)
 {
@@ -857,6 +875,12 @@ lion_walk_end(LionLeafWalk *w)
 		pfree(w->sum);
 		w->sum = NULL;
 	}
+	if (w->copy != NULL)
+		pfree(w->copy);
+	w->copy = NULL;
+	if (w->ended != NULL)
+		pfree(w->ended);
+	w->ended = NULL;
 	w->done = true;
 	w->haspage = false;
 }
@@ -886,7 +910,6 @@ lion_emit_all_keys_ext(Relation index, LionState *col, TIDBitmap *tbm,
 	}
 
 	lion_walk_end(&w);
-	pfree(w.copy);
 	return ntids;
 }
 
@@ -2313,7 +2336,6 @@ lion_rwin_walk(LionRangeWindow *w, LionScanOpaque so, LionScanRangeCol *rc)
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_walk_end(&lw);
-	pfree(lw.copy);
 }
 
 /*
@@ -3220,9 +3242,24 @@ int64
 liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 {
 	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+	MemoryContext oldcxt;
+	int64		ntids;
 
 	/* Not under old_snapshot_threshold (DESIGN.md §9). */
 	lion_check_old_snapshot(scan->indexRelation, scan->xs_snapshot);
+
+	/*
+	 * The call's memory is its own (so->bmcxt), not the caller's: a bitmap
+	 * index scan is called in the executor's per-query context, and what the
+	 * build leaves behind - the walks' leaf copies and range bounds, the
+	 * located sets, the choice - would stay there until the query ends, a
+	 * little more on every rescan of a nested loop's inner side.
+	 */
+	if (so->bmcxt == NULL)
+		so->bmcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+										  "lion index scan bitmap",
+										  ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(so->bmcxt);
 
 	/*
 	 * Re-fetch the cached state: a relcache invalidation since ambeginscan
@@ -3238,7 +3275,11 @@ liongetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 		scan->instrument->nsearches++;
 #endif
 
-	return lion_getbitmap_so(so, tbm);
+	ntids = lion_getbitmap_so(so, tbm);
+
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(so->bmcxt);
+	return ntids;
 }
 
 /* ---------------------------------------------------------------------
@@ -4924,20 +4965,10 @@ lion_source_close(LionSource *src)
 	pfree(so);
 }
 
-/*
- * amgettuple (DESIGN.md §29): the next TID of the source, one container's
- * members at a time.
- */
-bool
-liongettuple(IndexScanDesc scan, ScanDirection dir)
+/* The body of liongettuple(), below, which runs it in so->gtcxt. */
+static bool
+lion_scan_gettuple(IndexScanDesc scan, LionScanOpaque so)
 {
-	LionScanOpaque so = (LionScanOpaque) scan->opaque;
-
-	/* §29.1: lion is not ordered, so nothing asks for another direction. */
-	if (!ScanDirectionIsForward(dir))
-		elog(ERROR, "lion index \"%s\" cannot be scanned backward",
-			 RelationGetRelationName(scan->indexRelation));
-
 	if (so->src == NULL)
 	{
 		bool		droppin;
@@ -4959,10 +4990,6 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 			scan->instrument->nsearches++;
 #endif
 
-		if (so->gtcxt == NULL)
-			so->gtcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
-											  "lion index scan state",
-											  ALLOCSET_SMALL_SIZES);
 		if (so->lo == NULL)
 			so->lo = (uint16 *) MemoryContextAlloc(GetMemoryChunkContext(so),
 												   sizeof(uint16) * LION_CONTAINER_RANGE);
@@ -5092,6 +5119,35 @@ liongettuple(IndexScanDesc scan, ScanDirection dir)
 		 */
 		LION_INJECTION_POINT("lion-gettuple-batch");
 	}
+}
+
+/*
+ * amgettuple (DESIGN.md §29): the next TID of the source, one container's
+ * members at a time (lion_scan_gettuple()), in so->gtcxt: whatever the
+ * source allocates as it goes stays the scan's until the next rescan, not
+ * the executor's per-query context's, which a nested loop's inner side
+ * rescanned for every outer row would otherwise fill.
+ */
+bool
+liongettuple(IndexScanDesc scan, ScanDirection dir)
+{
+	LionScanOpaque so = (LionScanOpaque) scan->opaque;
+	MemoryContext oldcxt;
+	bool		found;
+
+	/* §29.1: lion is not ordered, so nothing asks for another direction. */
+	if (!ScanDirectionIsForward(dir))
+		elog(ERROR, "lion index \"%s\" cannot be scanned backward",
+			 RelationGetRelationName(scan->indexRelation));
+
+	if (so->gtcxt == NULL)
+		so->gtcxt = AllocSetContextCreate(GetMemoryChunkContext(so),
+										  "lion index scan state",
+										  ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo(so->gtcxt);
+	found = lion_scan_gettuple(scan, so);
+	MemoryContextSwitchTo(oldcxt);
+	return found;
 }
 
 /* ---------------------------------------------------------------------

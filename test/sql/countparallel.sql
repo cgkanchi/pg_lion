@@ -83,16 +83,17 @@ BEGIN
 	RETURN format('%s, %s rows', how, nrows);
 END $$;
 
-/* The node's counters in EXPLAIN ANALYZE, as "Name: value, ...". */
-CREATE FUNCTION lcp_counters(q text) RETURNS text
+/* The node's counters in EXPLAIN ANALYZE named in names, as "Name: value". */
+CREATE FUNCTION lcp_counters(q text, names text[] DEFAULT
+							 '{Key Ranges, List Batches, Heap Blocks Skipped via VM}')
+RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
 	out text := '';
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
-		IF btrim(split_part(ln, ':', 1)) IN ('Key Ranges', 'List Batches',
-											 'Heap Blocks Skipped via VM') THEN
+		IF btrim(split_part(ln, ':', 1)) = ANY (names) THEN
 			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END || btrim(ln);
 		END IF;
 	END LOOP;
@@ -308,6 +309,38 @@ SELECT lcp_check('SELECT count(DISTINCT k) FROM lcp WHERE a = 1 AND b');
 SELECT lcp_check('SELECT sum(k), count(*) FROM lcp');
 SELECT lcp_check('SELECT a, count(*) FROM lcp WHERE a = 1 AND b GROUP BY a');
 
+-- ---------- 8. a summarized driver's NULL rows ----------
+-- a sum over every row whose driver has summaries (§32, §35): the walk hands
+-- out the summaries, which hold no NULL row, and the NULL entry is counted
+-- beside it - in each range, confined to the range's keys as every set the
+-- range counts is, so that the ranges add up to the serial count and not to
+-- the NULL rows once for each.  k is NULL in a tenth of the rows and g in a
+-- quarter; 500 pages, eight container keys, eight ranges.
+CREATE TABLE lcp_sm (k int, g int, pad text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcp_sm
+SELECT CASE WHEN h % 10 = 0 THEN NULL ELSE h % 300 END,
+	   CASE WHEN h % 4 = 1 THEN NULL ELSE (h / 7) % 1009 END, repeat('x', 30)
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 60000) i) r;
+CREATE INDEX lcp_sm_k ON lcp_sm USING lion (k) WITH (summaries = on, summary_tids = 64);
+CREATE INDEX lcp_sm_g ON lcp_sm USING lion (g);
+VACUUM (FREEZE, ANALYZE) lcp_sm;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lcp_sm WHERE g <> 7;
+SELECT lcp_check('SELECT count(*) FROM lcp_sm');
+SELECT lcp_check('SELECT count(*) FROM lcp_sm WHERE g IS NOT NULL');
+SELECT lcp_check('SELECT count(*) FROM lcp_sm WHERE g <> 7');
+SELECT lcp_check('SELECT count(*), count(*) FILTER (WHERE g <> 7) FROM lcp_sm');
+-- the column's own IS NOT NULL, which drops the NULL entry
+SELECT lcp_check('SELECT count(*) FROM lcp_sm WHERE k IS NOT NULL');
+-- 270 summaries and the NULL entry, summed in each range, and serially once
+SELECT lcp_counters('SELECT count(*) FROM lcp_sm WHERE g <> 7',
+					'{Key Ranges, Summaries Summed, Posting Sets Summed}');
+SET max_parallel_workers_per_gather = 0;
+SELECT lcp_counters('SELECT count(*) FROM lcp_sm WHERE g <> 7',
+					'{Key Ranges, Summaries Summed, Posting Sets Summed}');
+SET max_parallel_workers_per_gather = 2;
+DROP TABLE lcp_sm;
+
 DROP TABLE lcp;
 DROP FUNCTION lcp_check(text);
-DROP FUNCTION lcp_counters(text);
+DROP FUNCTION lcp_counters(text, text[]);
