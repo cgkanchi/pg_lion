@@ -68,14 +68,16 @@ SELECT entries, inline_entries, container_pages > 0 AS has_chains, ntids
 (1 row)
 
 -- Every other row of a dense, clustered key: the runs split into singletons,
--- which no longer fit inline, so the entries spill onto container pages.
+-- a NARROW bitmap of 1.5 kB a key (DESIGN.md §38) where a run took a few
+-- bytes, and the bucket page holds only a few of those: every entry but the
+-- first spills onto container pages.
 DELETE FROM lion_vac WHERE i % 2 = 0;
 VACUUM (FREEZE) lion_vac;
-SELECT entries, inline_entries, bitset_containers > 0 AS has_bitsets, ntids
+SELECT entries, inline_entries, narrow_containers > 0 AS has_narrow, ntids
   FROM lion_index_stats('lion_vac_k');
- entries | inline_entries | has_bitsets | ntids  
----------+----------------+-------------+--------
-      40 |              0 | t           | 100000
+ entries | inline_entries | has_narrow | ntids  
+---------+----------------+------------+--------
+      40 |              1 | t          | 100000
 (1 row)
 
 SELECT entries, ntids FROM lion_index_stats('lion_vac_t');
@@ -364,8 +366,8 @@ SELECT lion_cmp('lion_vac', 'k = 3');
  * Table 2.  Half the rows of each key, in runs of 20: the build turns them
  * into run containers of a few hundred runs, and deleting every other row
  * splits every run into singletons, so every container has to grow into a
- * bitset that no longer fits in its slot.  This is the container page split
- * path of ambulkdelete.
+ * NARROW bitmap (DESIGN.md §38) that no longer fits in its slot.  This is the
+ * container page split path of ambulkdelete.
  */
 CREATE TABLE lion_vacrun (i int4, k int4);
 INSERT INTO lion_vacrun
@@ -383,9 +385,9 @@ SELECT run_containers, ntids FROM lion_index_stats('lion_vacrun_k');
 
 DELETE FROM lion_vacrun WHERE i % 2 = 0;
 VACUUM (FREEZE) lion_vacrun;
-SELECT bitset_containers, run_containers, ntids
+SELECT narrow_containers, run_containers, ntids
   FROM lion_index_stats('lion_vacrun_k');
- bitset_containers | run_containers | ntids  
+ narrow_containers | run_containers | ntids  
 -------------------+----------------+--------
                 28 |              0 | 100000
 (1 row)
@@ -850,7 +852,7 @@ VACUUM lion_slackv;
 SELECT slack_bytes AS slack_after_build FROM lion_index_stats('lion_slackv_k');
  slack_after_build 
 -------------------
-              1856
+              4032
 (1 row)
 
 DELETE FROM lion_slackv WHERE i % 50 = 0;
@@ -1131,32 +1133,43 @@ SELECT lion_cmp('lion_vacpre', 'r = 55');
 
 /*
  * A filtered INLINE payload that grows past what a long key leaves of
- * LION_MAX_ENTRY_SIZE.  VACUUM kept a payload INLINE as long as it was within
- * inline_limit, and a 2000-byte key leaves a few bytes less than that: here
- * 4086 rows on 19 heap pages are one RUN container of 19 runs, and losing
- * every other row turns it into a 2043-member ARRAY, a 4094-byte payload
- * next to a 2012-byte header and key.  That VACUUM failed ("lion index entry
- * of 6106 bytes is too large"), and failed again every time: a role that can only
- * INSERT and DELETE could so stop the table's VACUUMs, and with them
- * relfrozenxid, for good.  The set spills onto a container page instead,
- * exactly as an INSERT would spill it.
+ * LION_MAX_ENTRY_SIZE, and not past inline_limit.  VACUUM has to test both
+ * (lion_inline_max()): an entry within inline_limit alone may be too large
+ * for its page, and a VACUUM that tried to write it would fail, and fail
+ * again every time - a role that can only INSERT and DELETE could so stop
+ * the table's VACUUMs, and with them relfrozenxid, for good.  A 2000-byte key
+ * leaves some 50 bytes less than inline_limit.  Here the rows of 73 heap
+ * pages are two RUN containers of a run each, and losing every other row
+ * turns them into a NARROW of 64 pages and an ARRAY of 1000 members (DESIGN.md
+ * §38): a 4064-byte payload next to a 2012-byte header and key.  The set
+ * spills onto a container page, exactly as an INSERT would spill it, and the
+ * same payload next to a short key stays INLINE.
  */
 CREATE TABLE lion_vacbig (i int4 NOT NULL);
-INSERT INTO lion_vacbig SELECT i FROM generate_series(1, 4086) i;
+INSERT INTO lion_vacbig SELECT i FROM generate_series(1, 16464) i;
 CREATE INDEX lion_vacbig_k ON lion_vacbig
 	USING lion ((lpad('', 1995, 'y') || (i * 0)::text));
+CREATE INDEX lion_vacbig_s ON lion_vacbig USING lion ((i * 0));
 SELECT inline_entries, run_containers, ntids FROM lion_index_stats('lion_vacbig_k');
  inline_entries | run_containers | ntids 
 ----------------+----------------+-------
-              1 |              1 |  4086
+              1 |              2 | 16464
 (1 row)
 
 DELETE FROM lion_vacbig WHERE i % 2 = 0;
 VACUUM (FREEZE) lion_vacbig;
-SELECT inline_entries, array_containers, ntids FROM lion_index_stats('lion_vacbig_k');
- inline_entries | array_containers | ntids 
-----------------+------------------+-------
-              0 |                1 |  2043
+SELECT inline_entries, narrow_containers, array_containers, ntids,
+	   container_bytes
+  FROM lion_index_stats('lion_vacbig_k');
+ inline_entries | narrow_containers | array_containers | ntids | container_bytes 
+----------------+-------------------+------------------+-------+-----------------
+              0 |                 1 |                1 |  8232 |            4064
+(1 row)
+
+SELECT inline_entries, container_bytes FROM lion_index_stats('lion_vacbig_s');
+ inline_entries | container_bytes 
+----------------+-----------------
+              1 |            4064
 (1 row)
 
 SELECT lion_index_verify('lion_vacbig_k', true);
@@ -1168,17 +1181,18 @@ SELECT lion_index_verify('lion_vacbig_k', true);
 SELECT lion_index_count('lion_vacbig_k', lpad('', 1995, 'y') || '0') AS n;
   n   
 ------
- 2043
+ 8232
 (1 row)
 
+DROP INDEX lion_vacbig_s;
 -- ... and the spilled set takes the next rows and VACUUMs like any other
-INSERT INTO lion_vacbig SELECT i FROM generate_series(4087, 4126) i;
+INSERT INTO lion_vacbig SELECT i FROM generate_series(16465, 16504) i;
 DELETE FROM lion_vacbig WHERE i % 3 = 0;
 VACUUM (FREEZE) lion_vacbig;
 SELECT inline_entries, ntids FROM lion_index_stats('lion_vacbig_k');
  inline_entries | ntids 
 ----------------+-------
-              0 |  1389
+              0 |  5515
 (1 row)
 
 SELECT lion_index_verify('lion_vacbig_k', true);
@@ -1189,41 +1203,41 @@ SELECT lion_index_verify('lion_vacbig_k', true);
 
 /*
  * A filtered INLINE payload that needs MANY leaves (DESIGN.md §5 VACUUM, §18;
- * lion_entry_spill()).  One key over 150,000 clustered rows is eleven RUN
+ * lion_entry_spill()).  One key over 200,000 clustered rows is fourteen RUN
  * containers of a few hundred bytes, INLINE; deleting every tenth row turns
- * ten of them into 4104-byte BITSETs, two of which never fit one page, so the
- * posting set VACUUM spills needs ten leaves - a chain headed by the first,
- * with no internal level above it (§22: at most 16 leaves have none).  The
- * spill refused more than four ("needs 10 container pages"), and since
- * nothing changes between two VACUUMs, every VACUUM of the table failed from
- * then on - autovacuum's and the anti-wraparound one's included.  The NULL
- * entry (§14) goes the same way and must stay the reserved entry it is.
+ * them into NARROW bitmaps of 2 kB (§38), three to a page, so the posting set
+ * VACUUM spills needs five leaves - a chain headed by the first, with no
+ * internal level above it (§22: at most 16 leaves have none).  A spill that
+ * took fewer pages than such a set needs would fail every VACUUM of the
+ * table, autovacuum's and the anti-wraparound one's included, since nothing
+ * changes between two of them.  The NULL entry (§14) goes the same way and
+ * must stay the reserved entry it is.
  */
 CREATE TABLE lion_vacwide (i int4 NOT NULL, k int4, n int4);
-INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(1, 150000) i;
+INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(1, 200000) i;
 CREATE INDEX lion_vacwide_k ON lion_vacwide USING lion (k);
 CREATE INDEX lion_vacwide_n ON lion_vacwide USING lion (n);
 SELECT entries, inline_entries, run_containers, ntids
   FROM lion_index_stats('lion_vacwide_k');
  entries | inline_entries | run_containers | ntids  
 ---------+----------------+----------------+--------
-       1 |              1 |             11 | 150000
+       1 |              1 |             14 | 200000
 (1 row)
 
 SELECT entries, inline_entries, null_tids FROM lion_index_stats('lion_vacwide_n');
  entries | inline_entries | null_tids 
 ---------+----------------+-----------
-       1 |              1 |    150000
+       1 |              1 |    200000
 (1 row)
 
 DELETE FROM lion_vacwide WHERE i % 10 = 3;
 VACUUM (FREEZE) lion_vacwide;
 SELECT entries, inline_entries, container_pages, posting_internal_pages,
-	   bitset_containers, ntids
+	   narrow_containers, ntids
   FROM lion_index_stats('lion_vacwide_k');
- entries | inline_entries | container_pages | posting_internal_pages | bitset_containers | ntids  
+ entries | inline_entries | container_pages | posting_internal_pages | narrow_containers | ntids  
 ---------+----------------+-----------------+------------------------+-------------------+--------
-       1 |              0 |              10 |                      0 |                10 | 135000
+       1 |              0 |               5 |                      0 |                14 | 180000
 (1 row)
 
 SELECT entries, inline_entries, container_pages, posting_internal_pages,
@@ -1231,7 +1245,7 @@ SELECT entries, inline_entries, container_pages, posting_internal_pages,
   FROM lion_index_stats('lion_vacwide_n');
  entries | inline_entries | container_pages | posting_internal_pages | null_tids 
 ---------+----------------+-----------------+------------------------+-----------
-       1 |              0 |              10 |                      0 |    135000
+       1 |              0 |               5 |                      0 |    180000
 (1 row)
 
 SELECT lion_index_verify('lion_vacwide_k', true);
@@ -1249,23 +1263,23 @@ SELECT lion_index_verify('lion_vacwide_n', true);
 SELECT lion_cmp('lion_vacwide', 'k = 0');
     lion_cmp    
 ----------------
- ok 135000 rows
+ ok 180000 rows
 (1 row)
 
 SELECT lion_cmp('lion_vacwide', 'n IS NULL');
     lion_cmp    
 ----------------
- ok 135000 rows
+ ok 180000 rows
 (1 row)
 
 SELECT lion_index_count('lion_vacwide_k', 0) AS n;
    n    
 --------
- 135000
+ 180000
 (1 row)
 
 -- ... and the tree it built takes new rows and VACUUMs like any other
-INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(150001, 152000) i;
+INSERT INTO lion_vacwide SELECT i, 0, NULL FROM generate_series(200001, 202000) i;
 DELETE FROM lion_vacwide WHERE i % 10 = 7;
 VACUUM (FREEZE) lion_vacwide;
 SELECT entries, inline_entries, ntids = (SELECT count(*) FROM lion_vacwide)
@@ -1298,13 +1312,13 @@ SELECT lion_index_verify('lion_vacwide_n', true);
 SELECT lion_cmp('lion_vacwide', 'k = 0');
     lion_cmp    
 ----------------
- ok 121800 rows
+ ok 161800 rows
 (1 row)
 
 SELECT lion_cmp('lion_vacwide', 'n IS NULL');
     lion_cmp    
 ----------------
- ok 121800 rows
+ ok 161800 rows
 (1 row)
 
 -- VACUUM's buffer ring.  A VACUUM reads the index through the ring of

@@ -260,7 +260,7 @@ v_parked
         
 (1 row)
 
-step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 60000) i;
+step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 100000) i;
 step s3_wake_set: 
 	SELECT injection_points_detach('lion-verify-set-leaves-walked');
 	SELECT injection_points_wakeup('lion-verify-set-leaves-walked');
@@ -295,7 +295,7 @@ step s3_posting:
 
 the_leaves_split|k0_rows
 ----------------+-------
-t               | 105000
+t               | 157500
 (1 row)
 
 lion_index_verify
@@ -391,7 +391,7 @@ v_parked
 (1 row)
 
 step s2_spill: 
-	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 200);
+	INSERT INTO vc SELECT 'key1' || repeat('x', 100) FROM generate_series(1, 2000);
 
 step s3_wake_level: 
 	SELECT injection_points_detach('lion-verify-dir-level-walked');
@@ -552,7 +552,7 @@ step s3_touched:
 
 k0_rows
 -------
-  45300
+  57800
 (1 row)
 
 lion_index_verify
@@ -600,7 +600,7 @@ v_parked
         
 (1 row)
 
-step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 60000) i;
+step s2_grow_p: INSERT INTO vp SELECT 100000 + i, 0 FROM generate_series(1, 100000) i;
 step s3_wake_level: 
 	SELECT injection_points_detach('lion-verify-dir-level-walked');
 	SELECT injection_points_wakeup('lion-verify-dir-level-walked');

@@ -182,10 +182,10 @@ setup			{ SET pg_lion.enable_count_pushdown = off; }
 step s2_pages	{
 	SELECT container_pages, max_posting_height FROM lion_index_stats('gp_k');
 }
-# Grow key 1's containers on the leaves the cursor has not reached, and on
-# the one it stands on: the new versions land on the pages of the old ones
-# (fillfactor 50).  Rolled back, so the answer does not change, but the
-# index entries stay and the leaves split.
+# Grow key 1's containers, which are all on the one leaf the cursor stands
+# on: the new versions land on the pages of the old ones (fillfactor 50).
+# Rolled back, so the answer does not change, but the index entries stay and
+# the leaf splits.
 step s2_grow	{
 	BEGIN;
 	UPDATE gp SET k = 1 WHERE k = 2 AND id <= 30000;

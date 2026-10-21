@@ -27,15 +27,16 @@
 # yet (DESIGN.md §22).  The DELETE takes the OTHER key's rows out
 # of the front of the heap, which leaves free line pointers on those pages
 # without touching k = 1's containers at all; the INSERT then puts k = 1 rows
-# into them, so exactly the container keys that leaf owns grow - here from 480
-# members to about 960 - until its eight arrays no longer fit and it splits.
+# into them, so exactly the container keys that leaf owns grow - here from 128
+# members to about 960, ARRAYs of 264 bytes that become NARROWs of 520
+# (DESIGN.md §38) - until the leaf, which the build packed full, no longer
+# holds them and splits.
 #
-# k = 1 has 50,000 rows and loses none of them, so s1 must answer 50,000
+# k = 1 has 5,120 rows and loses none of them, so s1 must answer 5,120
 # however the pages move under it; `container_pages` before and after shows
-# that they really did move (30 leaves become 37, and k = 1's set, past 16
-# leaves, is promoted on the way: its head is pushed down under the parked
-# reader too), and the unpushed count afterwards is 60,000, which is those
-# 50,000 plus the inserter's 10,000.
+# that they really did move (k = 1's two leaves become four), and the unpushed
+# count afterwards is 15,120, which is those 5,120 plus the inserter's 10,000.
+# A head pushed down under a parked reader is count_root_pushdown_race.spec's.
 
 setup
 {
@@ -43,15 +44,14 @@ setup
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 	/* The padding is what makes a container key hold few enough rows for a
-	 * leaf to carry SEVERAL containers: arrays of ~970 bytes, so that
-	 * growing them is what splits the page rather than one bitset per leaf.
-	 * 15 rows a page, 480 of k = 1's a key.  The index is made before the
-	 * rows, so that the inserts make it, as ARRAYs: a build would make each
-	 * a NARROW of width 1 (DESIGN.md §38), 520 bytes, which an insert below
-	 * offset 64 does not grow. */
+	 * leaf to carry SEVERAL containers: 15 rows a heap page, two of them
+	 * k = 1's, so that each of its containers is an ARRAY of 128 members,
+	 * 264 bytes, which the inserts below grow.  The build packs the leaves
+	 * full (posting_fillfactor 100), some thirty containers to the first. */
 	CREATE TABLE psr (id int, k int NOT NULL, pad char(480));
-	CREATE INDEX psr_k ON psr USING lion (k);
-	INSERT INTO psr SELECT i, i % 2, '' FROM generate_series(1, 100000) i;
+	INSERT INTO psr SELECT i, CASE WHEN i % 15 IN (1, 8) THEN 1 ELSE 0 END, ''
+	  FROM generate_series(1, 38400) i;
+	CREATE INDEX psr_k ON psr USING lion (k) WITH (posting_fillfactor = 100);
 }
 
 teardown
@@ -156,6 +156,6 @@ permutation
 	s3_parked				# ... and it really is parked there
 	s2_insert				# grows that leaf's containers until it splits
 	s2_wakeup				# releases s1, which finishes its walk
-	s1_plain				# the truth now: s1's 50,000 plus the new 10,000
+	s1_plain				# the truth now: s1's 5,120 plus the new 10,000
 	s3_split
 	s3_verify

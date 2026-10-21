@@ -21,7 +21,10 @@ chain
 f    
 (1 row)
 
-step s3_spill: INSERT INTO sm SELECT -g, 5000 FROM generate_series(1, 200) g;
+step s3_spill: 
+	INSERT INTO sm SELECT -g, CASE WHEN g % 2 = 0 THEN 5000 ELSE 5001 END
+	  FROM generate_series(1, 400) g;
+
 step s3_root: SELECT lion_index_posting_root('sm_k', 5000) IS NOT NULL AS chain;
 chain
 -----

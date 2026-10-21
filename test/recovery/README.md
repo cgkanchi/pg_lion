@@ -170,11 +170,11 @@ the server there and checks what comes back. Four more (DESIGN.md §18, §22,
 §25):
 
 * **1e**, a crash inside a MULTI-LEAF spill. VACUUM's filtering turns one
-  key's INLINE payload into ten BITSETs, a leaf each, a set with no internal
-  level whose first leaf is its head; the spill parks at
-  `lion-spill-leaves-written`, after its last leaf record and before the
+  key's INLINE payload into eleven NARROWs, three to a leaf, a set of four
+  leaves with no internal level whose first leaf is its head; the spill parks
+  at `lion-spill-leaves-written`, after its last leaf record and before the
   head and the entry, and the server dies. The entry must come back INLINE
-  with every TID, `lion_index_verify()` must call the nine other leaves and
+  with every TID, `lion_index_verify()` must call the three other leaves and
   the head a leak and not corruption, and the next VACUUM must spill the set
   and free the orphans in its sweep. A second crash replays that VACUUM.
 * **1f**, VACUUM of an rmgr-mode index on a server WITHOUT the resource
@@ -272,7 +272,7 @@ page and VACUUM them there:
   there. The primary's VACUUM cleanup-locks the pinned leaf but writes nothing
   for it. Runs with `pg_lion.vacuum_barrier_ranges = 1`, so the barrier goes
   out in stand-alone VACUUM_VISIT records.
-* **pushdown**: the reader pins the head of a posting set of 14 leaves with no
+* **pushdown**: the reader pins the head of a posting set of 16 leaves with no
   internal level; an insert needs a 17th leaf, pushes the head down, and the
   VACUUM cleans the child.
 * **spill**: the reader pins a directory leaf for an INLINE set; the VACUUM's

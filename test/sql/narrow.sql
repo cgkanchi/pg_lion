@@ -3,19 +3,18 @@
 -- A NARROW of width k is a bitmap of a container's 64 heap blocks, k words
 -- of each, for the offsets below 64 * k: 8 + 512 * k bytes against a
 -- BITSET's 4104, k being 1 .. 5 at 8K, where a heap page holds 291 tuples at
--- most.  The build and VACUUM's re-optimize choose the narrowest width that
--- holds a container's members, and the NARROW where it is smaller than an
--- ARRAY and a RUN - VACUUM only in an index whose meta page records a
--- NARROW (LION_META_NARROW), which a build sets only when it has written
--- one.  An insert makes no NARROW of anything else, and a member past a
+-- most.  The build, an insert that writes an item anew and VACUUM's
+-- re-optimize choose the narrowest width that holds a container's members,
+-- and the NARROW where it is smaller than an ARRAY and a RUN; an insert that
+-- adds a member in place keeps the item's kind, and a member past a
 -- NARROW's width widens it, to the narrowest width that holds the member.
 -- This file checks the format end to end, on tables of 35 to 272 rows a
--- page: what the build writes and what its meta page records, reads at
--- every width and of several widths in one query, inserts in place and
--- across a width, what VACUUM makes of each kind of index, summaries, and
--- that bitmap and plain scans, lion_index_count() and the count pushdown
--- agree with a sequential scan at every step.  The damaged NARROWs are in
--- corrupt_items.sql.
+-- page: what the build writes, reads at every width and of several widths
+-- in one query, inserts in place, into new items and across a width, an
+-- index whose rows are deleted and inserted again, what VACUUM makes of
+-- each kind of index, summaries, and that bitmap and plain scans,
+-- lion_index_count() and the count pushdown agree with a sequential scan at
+-- every step.  The damaged NARROWs are in corrupt_items.sql.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -123,13 +122,11 @@ LANGUAGE sql AS $$
 	  FROM lion_index_stats(idx)
 $$;
 
--- The format version, off the meta page, and whether it records a NARROW:
--- LionMetaPageData follows the 24-byte page header, with its version at +4
--- and order_flags, whose LION_META_NARROW is 4, at +36.
+-- The format version, off the meta page: LionMetaPageData follows the
+-- 24-byte page header, with its version at +4.
 CREATE FUNCTION lion_nr_version(idx regclass) RETURNS text
 LANGUAGE sql AS $$
-	SELECT (get_byte(p, 28) | (get_byte(p, 29) << 8))::text ||
-		   CASE WHEN get_byte(p, 60) & 4 <> 0 THEN ' narrow' ELSE '' END
+	SELECT (get_byte(p, 28) | (get_byte(p, 29) << 8))::text
 	  FROM get_raw_page(idx::text, 0) p
 $$;
 
@@ -156,8 +153,7 @@ END $$;
 -- are 35, 61, 97, 136, 185 and 226 to a page.  k has two values, some 32
 -- members a container per row a page: a NARROW of the narrowest width that
 -- holds the page's offsets, 1, 1, 2, 3, 3 and 4.  g has twenty, an ARRAY at
--- every width.  An index with a NARROW records one on its meta page, and
--- one without does not.
+-- every width.
 CREATE TABLE lion_nr_tabs (ord int, t text, pad text);
 INSERT INTO lion_nr_tabs VALUES
 	(1, 'lion_n35', repeat('x', 184)), (2, 'lion_n61', repeat('x', 92)),
@@ -304,8 +300,8 @@ SELECT lion_index_count('lion_nband_k', 1::int2, 'lion_nband_b', 2::int2) =
 -- ---------- 4. inserts ----------
 -- 64 pages more of lion_n61: the first 32 are in the last container key of
 -- the build, whose NARROWs take them in place, and the rest in a new one,
--- for each key an ARRAY of some 976 members, which a NARROW would be
--- smaller than: an insert makes no NARROW of anything else.
+-- for each key some 976 members, which the insert that writes its ARRAY past
+-- 256 makes the NARROW of width 1 the build would.
 INSERT INTO lion_n61
 	SELECT i, i % 2, i % 20, repeat('x', 92) FROM generate_series(61 * 160, 61 * 224 - 1) i;
 SELECT * FROM lion_nr_mix('lion_n61_k');
@@ -313,10 +309,11 @@ SELECT lion_nr_verify('lion_n61_k');
 SELECT lion_nr_cmp('lion_n61', 'k = 1');
 SELECT lion_nr_cmp('lion_n61', 'k = 0 AND g = 6');
 SELECT lion_nr_pd('SELECT k, count(*) FROM lion_n61 GROUP BY k');
--- ... and an ARRAY the inserts take past 2048 members becomes a BITSET, in an
--- index with NARROWs too: 96 pages more of lion_n226, the first 32 in the last
--- container key of the build and the rest a new one, where each key has 7232
--- rows.  The BITSETs and the NARROWs in one query.
+-- ... and of width 4 at 226 rows a page, where the ARRAY takes 1024 members
+-- before a NARROW is smaller: 96 pages more of lion_n226, the first 32 in
+-- the last container key of the build and the rest a new one, where each
+-- key has 7232 rows.  None of them is a BITSET, which an ARRAY of 2048
+-- members would be.
 INSERT INTO lion_n226
 	SELECT i, i % 2, i % 20, NULL FROM generate_series(226 * 160, 226 * 256 - 1) i;
 SELECT * FROM lion_nr_mix('lion_n226_k');
@@ -334,7 +331,7 @@ SELECT lion_nr_pd('SELECT count(*) FROM lion_n226 WHERE k = 1 AND g <> 5');
 -- of each key there to width 2, the next one those of the first 40 to
 -- 113 .. 168, width 3, and the last those of the first 20 to 169 .. 224,
 -- width 4.  The other container keys stay at width 1.  Each widening is an
--- insert's that the item cannot take in place, written as a BITSET's was.
+-- insert's that the item cannot take in place, which writes it anew.
 CREATE TABLE lion_nb (i int NOT NULL, k int2 NOT NULL)
 	WITH (fillfactor = 25, autovacuum_enabled = off);
 INSERT INTO lion_nb SELECT i, i % 2 FROM generate_series(0, 19999) i;
@@ -364,6 +361,39 @@ SELECT lion_nr_cmp('lion_nb', 'k IN (0, 1)');
 SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nb GROUP BY k');
 SELECT lion_nr_pd('SELECT count(*) FROM lion_nb WHERE k <> 0');
 
+-- Rows deleted from the front and as many inserted at the back, three
+-- times over, VACUUM between: 40000 rows of 226 to a page, k of eight
+-- values, some 1800 rows a container key each - a NARROW of width 4, 2056
+-- bytes, where an ARRAY takes 3608.  Each round's inserts fill the pages
+-- VACUUM emptied and write their keys' containers there anew, so the index
+-- ends with what a build over the same rows writes: the same containers,
+-- kind for kind and byte for byte.
+CREATE TABLE lion_nc (i int NOT NULL, k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lion_nc SELECT i, i % 8 FROM generate_series(1, 40000) i;
+CREATE INDEX lion_nc_k ON lion_nc USING lion (k);
+SELECT lion_nr_maxoff('lion_nc') AS maxoff;
+SELECT * FROM lion_nr_mix('lion_nc_k');
+DELETE FROM lion_nc WHERE i <= 10000;
+VACUUM lion_nc;
+INSERT INTO lion_nc SELECT i, i % 8 FROM generate_series(40001, 50000) i;
+DELETE FROM lion_nc WHERE i <= 20000;
+VACUUM lion_nc;
+INSERT INTO lion_nc SELECT i, i % 8 FROM generate_series(50001, 60000) i;
+DELETE FROM lion_nc WHERE i <= 30000;
+VACUUM lion_nc;
+INSERT INTO lion_nc SELECT i, i % 8 FROM generate_series(60001, 70000) i;
+SELECT * FROM lion_nr_mix('lion_nc_k');
+CREATE INDEX lion_nc_b ON lion_nc USING lion (k);
+SELECT (SELECT row(containers, arrays, bitsets, runs, narrows, container_bytes)
+		  FROM lion_nr_mix('lion_nc_k')) =
+	   (SELECT row(containers, arrays, bitsets, runs, narrows, container_bytes)
+		  FROM lion_nr_mix('lion_nc_b')) AS as_built;
+DROP INDEX lion_nc_b;
+SELECT lion_nr_verify('lion_nc_k');
+SELECT lion_nr_cmp('lion_nc', 'k = 3');
+SELECT lion_nr_cmp('lion_nc', 'k IN (1, 6)', 'plain');
+SELECT lion_nr_pd('SELECT k, count(*) FROM lion_nc GROUP BY k');
+
 -- ---------- 5. VACUUM ----------
 -- In an index with NARROWs VACUUM's re-optimize of an item it changed picks the
 -- narrowest width that holds what is left.  lion_nb's rows past offset 112
@@ -383,8 +413,8 @@ SELECT * FROM lion_nr_mix('lion_n185_k');
 SELECT lion_nr_verify('lion_n185_k');
 SELECT lion_nr_cmp('lion_n185', 'k = 1 AND g = 3');
 SELECT lion_nr_pd('SELECT k, count(*) FROM lion_n185 GROUP BY k');
--- the BITSETs section 4's inserts made in lion_n226, at its fourth
--- container key, each losing a few rows: NARROWs of width 4
+-- the NARROWs section 4's inserts made in lion_n226, at its fourth
+-- container key, each losing a few rows: NARROWs of width 4 still
 DELETE FROM lion_n226 WHERE i >= 226 * 192 AND i % 1000 IN (0, 1);
 VACUUM lion_n226;
 SELECT * FROM lion_nr_mix('lion_n226_k');
@@ -400,10 +430,9 @@ SELECT lion_nr_verify('lion_n97_k');
 SELECT lion_nr_cmp('lion_n97', 'k = 0');
 SELECT lion_nr_cmp('lion_n97', 'k = 0 OR g = 5');
 SELECT lion_nr_pd('SELECT k, count(*) FROM lion_n97 GROUP BY k');
--- An index built on an empty table writes no NARROW and its meta page records
--- none; its inserts make BITSETs of the ARRAYs they fill.  VACUUM never gives
--- it a NARROW, though its BITSETs hold nothing at 128 or above any more.
--- REINDEX is what makes them NARROWs, of width 2.
+-- An index built on an empty table gets its NARROWs from its inserts, of
+-- width 4 at 226 rows a page; VACUUM narrows them to width 2 once they hold
+-- nothing at 128 or above, and REINDEX makes the same.
 CREATE TABLE lion_nn (i int NOT NULL, k int2 NOT NULL) WITH (autovacuum_enabled = off);
 CREATE INDEX lion_nn_k ON lion_nn USING lion (k);
 INSERT INTO lion_nn SELECT i, i % 2 FROM generate_series(0, 39999) i;
@@ -468,8 +497,8 @@ SELECT lion_nr_cmp('lion_ns', 'v BETWEEN 10 AND 70');
 SELECT lion_nr_pd('SELECT count(*) FROM lion_ns WHERE v BETWEEN 10 AND 70');
 
 DROP TABLE lion_n35, lion_n61, lion_n97, lion_n136, lion_n185, lion_n226,
-	lion_n272, lion_nband, lion_nb, lion_nn, lion_ns, lion_nr_tabs, lion_nr_preds,
-	lion_nr_counts;
+	lion_n272, lion_nband, lion_nb, lion_nc, lion_nn, lion_ns, lion_nr_tabs,
+	lion_nr_preds, lion_nr_counts;
 DROP FUNCTION lion_nr_cmp(text, text, text);
 DROP FUNCTION lion_nr_pd(text);
 DROP FUNCTION lion_nr_mix(regclass);

@@ -7,7 +7,7 @@ step s2_leaves:
 
 leaves|unlinked
 ------+--------
-    68|       0
+    24|       0
 (1 row)
 
 step s1_begin: 
@@ -23,7 +23,7 @@ step s2_shape:
 
 leaves|unlinked
 ------+--------
-    40|      28
+    16|       8
 (1 row)
 
 step s2_insert: 
@@ -35,7 +35,7 @@ step s2_size:
 
 leaves|still_unlinked
 ------+--------------
-    68|            28
+    24|             8
 (1 row)
 
 step s2_verify: SELECT lion_index_verify('prc_k', true) AS verify;
@@ -85,7 +85,7 @@ step s2_reuse:
 
 leaves|unlinked
 ------+--------
-   100|       0
+    36|       0
 (1 row)
 
 step s2_verify: SELECT lion_index_verify('prc_k', true) AS verify;

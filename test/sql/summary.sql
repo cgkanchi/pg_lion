@@ -231,7 +231,7 @@ CREATE TABLE lion_sm_open (k int, pad char(200) NOT NULL DEFAULT 'x')
 CREATE INDEX lion_sm_open_k ON lion_sm_open USING lion (k)
 	WITH (summaries = on, summary_tids = 16777216);
 INSERT INTO lion_sm_open
-	SELECT CASE WHEN i % 2 = 0 THEN i END FROM generate_series(1, 60000) i;
+	SELECT CASE WHEN i % 2 = 0 THEN i END FROM generate_series(1, 200000) i;
 SELECT summary_entries, summary_tids, summary_pages > 4 AS leaves
   FROM lion_index_stats('lion_sm_open_k');
 DELETE FROM lion_sm_open;

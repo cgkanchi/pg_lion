@@ -156,7 +156,6 @@ typedef struct LionVerifyState
 	LionContainer *cbuf;			/* aligned container work buffer */
 	BlockNumber root;			/* the directory root, from the meta page */
 	uint32		height;
-	bool		allows_narrow;	/* ... and whether it may hold a NARROW (§38) */
 	uint32		inline_limit;	/* ... and the largest INLINE payload (§4) */
 	/* per key column (DESIGN.md §24): at most one of each, per column */
 	int64		nnullentries[INDEX_MAX_KEYS];

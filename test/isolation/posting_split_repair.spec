@@ -53,25 +53,24 @@
 # unfinished, counters equal to the containers - and the index must answer
 # what the heap answers.
 #
-# The fixture of B, C and D: key 1 holds a RUN of five rows in every thirty, so
-# each container key (64 heap blocks of 226 rows) is a ~1980-byte RUN and a
-# leaf bulk-built at posting_fillfactor 100 - set on the indexes, since the
-# default leaves room - holds four of them with 208 bytes to spare; key 3 is the row
-# in the middle of each gap.  Deleting key 3's rows in ONE container key's heap
-# blocks and vacuuming leaves free line pointers there and nowhere else, so
-# the rows inserted next all land in that container key and grow exactly the
-# RUN it owns - one new run of one member each - until its leaf splits.
+# The fixture of B, C and D: in heap blocks 0..511 (226 rows a block, 64
+# blocks a container key), key 1 holds a RUN of five rows in every sixty, so
+# each container key is a ~1 KB RUN of 241 runs; key 3 is the row in the
+# middle of each gap, and the other rows take 97 keys from 100 on.  Wide rows
+# after block 511, keys 1 and 2 on alternate rows, give key 1 a NARROW
+# (DESIGN.md §38) a container key, which the build at posting_fillfactor 10
+# makes a leaf each: 18 of them in B and C, a tree, and 14 in D.  At the build
+# key 1 has its RUN in container key 0 only - key 9 has its rows in keys 1..7
+# - so its first leaf takes every container key below 8; key 9's rows then go
+# and key 1's take their slots, by the same ids, and their RUNs go onto that
+# leaf: seven fill it, with some 900 bytes to spare, and the eighth gets a
+# leaf of its own.  In D that is 16 leaves and no internal level, and the head
+# is the first leaf, of RUNs.  Deleting key 3's rows in ONE container key's
+# heap blocks and vacuuming leaves free line pointers there and nowhere else,
+# so the rows inserted next all land in that container key and grow exactly
+# the RUN it owns - one new run of one member each - until its leaf splits.
 # Deleting the 2nd and 4th row of every run later turns a RUN into an ARRAY
-# half again as large (~2970 bytes), which is what sends VACUUM to regrow.
-# The other rows take 97 keys from 100 on, ARRAYs of some 120 members a
-# container key, so that the build writes no NARROW and the meta page
-# records none, so its VACUUM makes that ARRAY: in an index whose build wrote
-# a NARROW it would make a NARROW of width 4 (DESIGN.md §38), 2056 bytes,
-# which the leaf's spare bytes hold.  Rows inserted after the build, keys 1
-# and 2 on alternate rows, give key 1 a BITSET a container key, a leaf each
-# (an insert writes no NARROW, and the meta page keeps recording none): 16 of
-# them in B and C, a tree of 18 leaves, and 14 in D, a set of 16 leaves whose
-# head is the first leaf of RUNs.
+# of some 1,450 bytes, which is what sends VACUUM to regrow.
 
 setup
 {
@@ -79,57 +78,69 @@ setup
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
 
-	-- A: created empty, so every split comes from aminsert.  Wide rows,
-	-- about 75 to a heap page, make each container a BITSET a leaf long.
+	-- A: wide rows, 65 to a heap page, on 22 container keys, which a build
+	-- at posting_fillfactor 10 makes a leaf each: two trees.  The inserts'
+	-- NARROWs fill the last leaf, and its splits are aminsert's.
 	CREATE TABLE psr_app (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	  WITH (autovacuum_enabled = off);
-	CREATE INDEX psr_app_k ON psr_app USING lion (k);
+	INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 90000) i;
+	CREATE INDEX psr_app_k ON psr_app USING lion (k) WITH (posting_fillfactor = 10);
 
-	-- B and C: eight container keys, two leaves of four RUNs for key 1, and
-	-- sixteen leaves after them.
-	CREATE TABLE psr_right (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	-- B and C: eight container keys of RUNs, and 18 of wide rows after them.
+	CREATE TABLE psr_right (id int, k int NOT NULL, pad text)
+	  WITH (autovacuum_enabled = off);
 	INSERT INTO psr_right SELECT i,
-		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
+		CASE WHEN i % 60 < 5 THEN CASE WHEN i <= 14464 THEN 1 ELSE 9 END
+			 WHEN i % 60 = 30 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_right_k ON psr_right USING lion (k) WITH (posting_fillfactor = 100);
-	INSERT INTO psr_right SELECT i, 1 + i % 2
-	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
-	CREATE TABLE psr_left (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	INSERT INTO psr_right SELECT i, 1 + i % 2, repeat('x', 70)
+	  FROM generate_series(14464 * 8 + 1, 14464 * 8 + 86400) i;
+	CREATE INDEX psr_right_k ON psr_right USING lion (k) WITH (posting_fillfactor = 10);
+	DELETE FROM psr_right WHERE k = 9;
+	CREATE TABLE psr_left (id int, k int NOT NULL, pad text)
+	  WITH (autovacuum_enabled = off);
 	INSERT INTO psr_left SELECT i,
-		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
+		CASE WHEN i % 60 < 5 THEN CASE WHEN i <= 14464 THEN 1 ELSE 9 END
+			 WHEN i % 60 = 30 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_left_k ON psr_left USING lion (k) WITH (posting_fillfactor = 100);
-	INSERT INTO psr_left SELECT i, 1 + i % 2
-	  FROM generate_series(14464 * 8 + 1, 14464 * 24) i;
+	INSERT INTO psr_left SELECT i, 1 + i % 2, repeat('x', 70)
+	  FROM generate_series(14464 * 8 + 1, 14464 * 8 + 86400) i;
+	CREATE INDEX psr_left_k ON psr_left USING lion (k) WITH (posting_fillfactor = 10);
+	DELETE FROM psr_left WHERE k = 9;
 
-	-- D: the same with fourteen leaves after them: key 1 has 16 leaves and
-	-- no internal level, and its head is the first leaf of RUNs.
-	CREATE TABLE psr_push (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+	-- D: the same with 14 container keys of wide rows: key 1 has 16 leaves
+	-- and no internal level, and its head is the first leaf of RUNs.
+	CREATE TABLE psr_push (id int, k int NOT NULL, pad text)
+	  WITH (autovacuum_enabled = off);
 	INSERT INTO psr_push SELECT i,
-		CASE WHEN i % 30 < 5 THEN 1 WHEN i % 30 = 15 THEN 3 ELSE 100 + i % 97 END
+		CASE WHEN i % 60 < 5 THEN CASE WHEN i <= 14464 THEN 1 ELSE 9 END
+			 WHEN i % 60 = 30 THEN 3 ELSE 100 + i % 97 END
 	  FROM generate_series(1, 14464 * 8) i;
-	CREATE INDEX psr_push_k ON psr_push USING lion (k) WITH (posting_fillfactor = 100);
-	INSERT INTO psr_push SELECT i, 1 + i % 2
-	  FROM generate_series(14464 * 8 + 1, 14464 * 22) i;
+	INSERT INTO psr_push SELECT i, 1 + i % 2, repeat('x', 70)
+	  FROM generate_series(14464 * 8 + 1, 14464 * 8 + 67200) i;
+	CREATE INDEX psr_push_k ON psr_push USING lion (k) WITH (posting_fillfactor = 10);
+	DELETE FROM psr_push WHERE k = 9;
 
 	-- E: test/isolation/vacuum_regrow_pushdown.spec's fixture.  k = 1's
-	-- head holds a RUN in heap blocks 0..63 and two ~2.9 KB arrays, and 15
-	-- more leaves follow it.
+	-- head holds a RUN in heap blocks 0..63 and the three NARROWs that the
+	-- rows of k = 1 put into k = 3's slots after the build, and 15 more
+	-- leaves follow it.
 	CREATE TABLE psr_vpush (id int, k int NOT NULL, pad text)
 	  WITH (autovacuum_enabled = off);
-	CREATE INDEX psr_vpush_k ON psr_vpush USING lion (k) WITH (inline_limit = 64);
-	INSERT INTO psr_vpush SELECT i, CASE
-		WHEN i <= 14464 AND i % 30 < 5 THEN 1
-		WHEN i > 14464 AND i % 10 = 0 THEN 1
-		ELSE 2 END
-	  FROM generate_series(1, 43392) i;
+	INSERT INTO psr_vpush SELECT i, 1 FROM generate_series(1, 14464) i;
+	INSERT INTO psr_vpush SELECT i, 2 + i % 2 FROM generate_series(14465, 57856) i;
 	INSERT INTO psr_vpush SELECT i, 1 + i % 2, repeat('x', 70)
-	  FROM generate_series(43393, 119392) i;
+	  FROM generate_series(57857, 129856) i;
+	CREATE INDEX psr_vpush_k ON psr_vpush USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
+	DELETE FROM psr_vpush WHERE k = 3;
 
-	-- F: created empty, wide rows; the fill gives each key 14 leaves.
+	-- F: wide rows on 16 container keys, which a build at posting_fillfactor
+	-- 10 makes 16 leaves of each key.
 	CREATE TABLE psr_prom (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	  WITH (autovacuum_enabled = off);
-	CREATE INDEX psr_prom_k ON psr_prom USING lion (k);
+	INSERT INTO psr_prom SELECT i, i % 2 FROM generate_series(1, 66000) i;
+	CREATE INDEX psr_prom_k ON psr_prom USING lion (k) WITH (posting_fillfactor = 10);
 
 	/*
 	 * Insert key-1 rows one at a time, each in a subtransaction, until one of
@@ -186,6 +197,21 @@ setup
 	END $fn$;
 }
 
+# The slots key 9 (key 3 in E) left, which the rows of key 1 then take, by
+# the ids key 9 had.  VACUUM runs outside the transaction the first setup
+# block is.
+setup { VACUUM psr_right; }
+setup { VACUUM psr_left; }
+setup { VACUUM psr_push; }
+setup { VACUUM psr_vpush; }
+setup
+{
+	INSERT INTO psr_right SELECT i, 1 FROM generate_series(14465, 14464 * 8) i WHERE i % 60 < 5;
+	INSERT INTO psr_left SELECT i, 1 FROM generate_series(14465, 14464 * 8) i WHERE i % 60 < 5;
+	INSERT INTO psr_push SELECT i, 1 FROM generate_series(14465, 14464 * 8) i WHERE i % 60 < 5;
+	INSERT INTO psr_vpush SELECT 300000 + i, 1 FROM generate_series(1, 21696) i;
+}
+
 teardown
 {
 	DROP TABLE psr_app, psr_right, psr_left, psr_push, psr_vpush, psr_prom;
@@ -216,7 +242,6 @@ step promote_breaks	{ SELECT injection_points_attach('lion-posting-promoted', 'e
 step promote_works	{ SELECT injection_points_detach('lion-posting-promoted'); }
 
 # A. Appends after an unfinished split.
-step a_fill		{ INSERT INTO psr_app SELECT i, i % 2 FROM generate_series(1, 90000) i; }
 step a_cut		{ INSERT INTO psr_app SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i; }
 step a_append	{
 	INSERT INTO psr_app SELECT 200000 + i, i % 2 FROM generate_series(1, 20000) i;
@@ -230,7 +255,7 @@ step a_check	{
 
 # B. VACUUM's regrow on the RIGHT half, which has no downlink.  The rows go to
 # container key 0, the FIRST RUN of the first leaf, so the split moves the
-# RUNs of keys 1-3 onto the new page, and their growth overflows THAT page.
+# RUNs of keys 1-6 onto the new page, and their growth overflows THAT page.
 step b_holes	{ DELETE FROM psr_right WHERE k = 3 AND id <= 14464; }
 step b_vacuum_holes	{ VACUUM (INDEX_CLEANUP ON) psr_right; }
 step b_before	{ SELECT container_pages FROM lion_index_stats('psr_right_k'); }
@@ -240,8 +265,8 @@ step b_after_cut {
 	SELECT container_pages FROM lion_index_stats('psr_right_k');
 }
 step b_delete	{
-	DELETE FROM psr_right WHERE k = 1 AND id % 30 IN (1, 3)
-	   AND id BETWEEN 14464 + 1 AND 14464 * 4;
+	DELETE FROM psr_right WHERE k = 1 AND id % 60 IN (1, 3)
+	   AND id BETWEEN 14464 + 1 AND 14464 * 7;
 }
 step b_vacuum	{ VACUUM (INDEX_CLEANUP ON) psr_right; }
 step b_check	{
@@ -252,10 +277,10 @@ step b_check	{
 }
 
 # C. VACUUM's regrow on the flagged LEFT half.  The rows go to container key
-# 3, the LAST RUN of the first leaf, so the split moves nothing right: the
-# grown RUN gets a page of its own and the leaf keeps the RUNs of keys 0-2,
+# 6, the LAST RUN of the first leaf, so the split moves nothing right: the
+# grown RUN gets a page of its own and the leaf keeps the RUNs of keys 0-5,
 # whose growth on filtering then overflows it.
-step c_holes	{ DELETE FROM psr_left WHERE k = 3 AND id BETWEEN 14464 * 3 + 1 AND 14464 * 4; }
+step c_holes	{ DELETE FROM psr_left WHERE k = 3 AND id BETWEEN 14464 * 6 + 1 AND 14464 * 7; }
 step c_vacuum_holes	{ VACUUM (INDEX_CLEANUP ON) psr_left; }
 step c_before	{ SELECT container_pages FROM lion_index_stats('psr_left_k'); }
 step c_cut		{ SELECT psr_insert_until_error('psr_left'); }
@@ -263,7 +288,7 @@ step c_after_cut {
 	SELECT * FROM psr_landed('psr_left');
 	SELECT container_pages FROM lion_index_stats('psr_left_k');
 }
-step c_delete	{ DELETE FROM psr_left WHERE k = 1 AND id % 30 IN (1, 3) AND id <= 14464 * 3; }
+step c_delete	{ DELETE FROM psr_left WHERE k = 1 AND id % 60 IN (1, 3) AND id <= 14464 * 6; }
 step c_vacuum	{ VACUUM (INDEX_CLEANUP ON) psr_left; }
 step c_check	{
 	SELECT container_pages FROM lion_index_stats('psr_left_k');
@@ -294,7 +319,7 @@ step d_check	{
 # E. VACUUM's regrow push-down cut short: the child still holds the RUN with
 # its dead TIDs, and the entry must still count them.  The next VACUUM
 # removes them, and ntids then equals the heap's rows.
-step e_delete	{ DELETE FROM psr_vpush WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3); }
+step e_delete	{ DELETE FROM psr_vpush WHERE k = 1 AND id <= 14464 AND id % 2 = 0; }
 step e_cut		{ VACUUM (INDEX_CLEANUP ON) psr_vpush; }
 step e_after_cut {
 	SELECT posting_internal_pages FROM lion_index_stats('psr_vpush_k');
@@ -311,8 +336,7 @@ step e_check	{
 # F. A promotion cut short before the leaf that needed it is split.  Right
 # after it the head is a root over all 16 leaves, the last of them is full,
 # and nothing is flagged: the next insert splits that leaf as a tree's.
-step f_fill		{ INSERT INTO psr_prom SELECT i, i % 2 FROM generate_series(1, 60000) i; }
-step f_cut		{ INSERT INTO psr_prom SELECT 100000 + i, i % 2 FROM generate_series(1, 20000) i; }
+step f_cut		{ INSERT INTO psr_prom SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i; }
 step f_after_cut {
 	SELECT posting_internal_pages FROM lion_index_stats('psr_prom_k');
 	SELECT lion_index_verify('psr_prom_k');
@@ -325,11 +349,11 @@ step f_check	{
 }
 
 permutation
-	a_fill split_breaks a_cut split_works a_append a_check
+	split_breaks a_cut split_works a_append a_check
 	b_holes b_vacuum_holes b_before split_breaks b_cut split_works b_after_cut
 	b_delete b_vacuum b_check
 	c_holes c_vacuum_holes c_before split_breaks c_cut split_works c_after_cut
 	c_delete c_vacuum c_check
 	d_holes d_vacuum_holes push_breaks d_cut push_works d_after_cut d_more d_check
 	e_delete push_breaks e_cut push_works e_after_cut e_vacuum e_check
-	f_fill promote_breaks f_cut promote_works f_after_cut f_more f_check
+	promote_breaks f_cut promote_works f_after_cut f_more f_check

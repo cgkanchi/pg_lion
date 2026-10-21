@@ -1,12 +1,10 @@
 -- The price of an AND of dense sources (DESIGN.md §10, "Dense sources").
 --
--- A build writes a container of a dense set as a NARROW bitmap, which the
--- merge ANDs, counts and subtracts a word at a time whatever it holds; an
--- insert grows an ARRAY instead, ANDed a member at a time.  The count's
--- price follows what the containers are: the same rows ANDed are cheaper
--- built than inserted, each priced in its own units - the built AND by
--- pg_lion.bitmap_word_cost and not by and_member_cost, the inserted one the
--- other way round - and its seeks that stay on their leaf by
+-- A container of a dense set is a NARROW bitmap, built or inserted, which
+-- the merge ANDs, counts and subtracts a word at a time whatever it holds.
+-- The count's price follows what the containers are: the same rows ANDed,
+-- built or inserted, are priced by pg_lion.bitmap_word_cost and not by
+-- and_member_cost, and their seeks that stay on their leaf by
 -- pg_lion.probe_step_cost.  An IN list that drives the AND is built into a
 -- bitset image and ANDed as one; and a `<>` beside the AND is subtracted at
 -- the keys it leaves, and priced.  Every count is checked against a
@@ -69,7 +67,7 @@ END $$;
 -- 60000 rows, about 40 to a page - a word of a NARROW a heap block - in 23
 -- container keys: f1 to f4 two values each, f5 and f6 three, g twenty, all
 -- placed at random.  lcd_b's index is built over its rows, lcd_i's grew as
--- they were inserted.
+-- they were inserted, and writes the same containers.
 CREATE TABLE lcd_b (id int, f1 int, f2 int, f3 int, f4 int, f5 int, f6 int,
 					g int, pad text)
 	WITH (autovacuum_enabled = off);
@@ -89,29 +87,32 @@ INSERT INTO lcd_i SELECT * FROM lcd_b ORDER BY id;
 CREATE INDEX lcd_b_f ON lcd_b USING lion (f1, f2, f3, f4, f5, f6, g);
 VACUUM (FREEZE, ANALYZE) lcd_b;
 VACUUM (FREEZE, ANALYZE) lcd_i;
--- the filters' containers: NARROWs built, ARRAYs grown
-SELECT attno, narrow_containers > 0 AS narrow, array_containers > 0 AS arrays
+-- the filters' containers: NARROWs, built and grown, but for an ARRAY of
+-- f6's no larger than a NARROW, in both, and one of f5's in lcd_i that an
+-- insert in place took three members past a NARROW's size (520 bytes of
+-- width 1, against its 526)
+SELECT attno, containers, narrow_containers, array_containers
   FROM lion_index_stats('lcd_b_f') WHERE attno <= 6 ORDER BY attno;
- attno | narrow | arrays 
--------+--------+--------
-     1 | t      | f
-     2 | t      | f
-     3 | t      | f
-     4 | t      | f
-     5 | t      | f
-     6 | t      | t
+ attno | containers | narrow_containers | array_containers 
+-------+------------+-------------------+------------------
+     1 |         52 |                52 |                0
+     2 |         52 |                52 |                0
+     3 |         52 |                52 |                0
+     4 |         52 |                52 |                0
+     5 |         78 |                78 |                0
+     6 |         78 |                77 |                1
 (6 rows)
 
-SELECT attno, narrow_containers > 0 AS narrow, array_containers > 0 AS arrays
+SELECT attno, containers, narrow_containers, array_containers
   FROM lion_index_stats('lcd_i_f') WHERE attno <= 6 ORDER BY attno;
- attno | narrow | arrays 
--------+--------+--------
-     1 | f      | t
-     2 | f      | t
-     3 | f      | t
-     4 | f      | t
-     5 | f      | t
-     6 | f      | t
+ attno | containers | narrow_containers | array_containers 
+-------+------------+-------------------+------------------
+     1 |         52 |                52 |                0
+     2 |         52 |                52 |                0
+     3 |         52 |                52 |                0
+     4 |         52 |                52 |                0
+     5 |         78 |                77 |                1
+     6 |         78 |                77 |                1
 (6 rows)
 
 -- ---------- 1. the same AND, built and inserted ----------
@@ -127,18 +128,9 @@ SELECT lcd_check('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 
  415 rows
 (1 row)
 
-SELECT lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1')
-	 < lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1')
-	AS built_is_cheaper;
- built_is_cheaper 
-------------------
- t
-(1 row)
-
--- each in its own units: a member ANDed priced ten times as dear moves the
--- inserted AND alone, a word of a bitmap the built one alone, and a seek on
--- the leaf it stands on the built one's, whose dense sets the driver meets
--- at every key
+-- both in the same units: a member ANDed priced ten times as dear moves
+-- neither, a word of a bitmap both, and a seek on the leaf it stands on
+-- both, whose dense sets the driver meets at every key
 CREATE TEMP TABLE lcd_prices (setting text, built float8, inserted float8);
 INSERT INTO lcd_prices
 SELECT 'default',
@@ -160,7 +152,7 @@ SET pg_lion.probe_step_cost = 100;
 INSERT INTO lcd_prices
 SELECT 'probe_step_cost',
 	   lcd_cost('SELECT count(*) FROM lcd_b WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1'),
-	   NULL;
+	   lcd_cost('SELECT count(*) FROM lcd_i WHERE f1 = 1 AND f2 = 1 AND f3 = 1 AND f4 = 1 AND f5 = 1 AND f6 = 1');
 RESET pg_lion.probe_step_cost;
 SELECT p.setting, p.built > d.built AS built_dearer,
 	   p.inserted > d.inserted AS inserted_dearer
@@ -169,9 +161,9 @@ SELECT p.setting, p.built > d.built AS built_dearer,
  ORDER BY p.setting;
      setting      | built_dearer | inserted_dearer 
 ------------------+--------------+-----------------
- and_member_cost  | f            | t
- bitmap_word_cost | t            | f
- probe_step_cost  | t            | 
+ and_member_cost  | f            | f
+ bitmap_word_cost | t            | t
+ probe_step_cost  | t            | t
 (3 rows)
 
 -- ---------- 2. an IN list that drives the AND ----------

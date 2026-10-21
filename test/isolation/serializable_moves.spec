@@ -6,12 +6,15 @@
 # s2's insert would check a page s1 never locked and both would commit.
 #
 #   - spill: s3 inserts enough rows of 5000 to spill its INLINE entry into a
-#     posting tree, whose root an insert checks from then on.
+#     posting tree, whose root an insert checks from then on.  They go in on
+#     alternate rows, as an ARRAY: consecutive rows would make a RUN of a few
+#     bytes (DESIGN.md §38), which stays INLINE.
 #   - split: s3 inserts keys just below 5000 until its leaf splits, and 5000
 #     goes to the new right sibling.
 #   - vacuum: here the key is 3000, a CHAIN entry whose rows were deleted
 #     before s1 read it; s3's VACUUM deletes the empty entry and frees its
-#     root, and s2's insert then makes a new entry on the leaf.
+#     root, and s2's insert then makes a new entry on the leaf.  Its rows went
+#     in on alternate rows too.
 
 setup
 {
@@ -19,7 +22,8 @@ setup
 	CREATE TABLE sm (id int, k int NOT NULL);
 	INSERT INTO sm SELECT g, g * 10 FROM generate_series(1, 2000) g;
 	CREATE INDEX sm_k ON sm USING lion (k) WITH (inline_limit = 64);
-	INSERT INTO sm SELECT g, 3000 FROM generate_series(2001, 2200) g;
+	INSERT INTO sm SELECT g, CASE WHEN g % 2 = 0 THEN 3000 ELSE 3001 END
+	  FROM generate_series(2001, 2400) g;
 }
 setup { VACUUM ANALYZE sm; }
 teardown
@@ -44,7 +48,10 @@ step s2_insert3	{ INSERT INTO sm VALUES (-2, 3000); }
 step s2_commit	{ COMMIT; }
 
 session s3
-step s3_spill	{ INSERT INTO sm SELECT -g, 5000 FROM generate_series(1, 200) g; }
+step s3_spill	{
+	INSERT INTO sm SELECT -g, CASE WHEN g % 2 = 0 THEN 5000 ELSE 5001 END
+	  FROM generate_series(1, 400) g;
+}
 step s3_split	{ INSERT INTO sm SELECT -g, 5000 - g FROM generate_series(1, 4999) g
 				  WHERE g % 10 <> 0; }
 step s3_delete	{ DELETE FROM sm WHERE k = 3000; }

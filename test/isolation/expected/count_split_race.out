@@ -69,7 +69,7 @@ injection_points_detach
 step s1_count: <... completed>
 count
 -----
-50000
+ 5120
 (1 row)
 
 step s1_plain: 
@@ -79,7 +79,7 @@ step s1_plain:
 
 count
 -----
-60000
+15120
 (1 row)
 
 step s3_split: 

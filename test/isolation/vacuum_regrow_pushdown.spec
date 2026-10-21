@@ -1,9 +1,9 @@
 # VACUUM's REGROW pushing a posting set's head down while a count descends into
 # it (DESIGN.md §11, §18, §22).
 #
-# A container can GROW while VACUUM filters it: a RUN that loses the 2nd and
-# 4th member of every run of five turns into an ARRAY half again as large.
-# When the page it lives on has no room for that, VACUUM re-places it through
+# A container can GROW while VACUUM filters it: a RUN that loses every other
+# member of its runs turns into a NARROW (DESIGN.md §38) several times as
+# large.  When the page it lives on has no room for that, VACUUM re-places it through
 # the ordinary placement code (lion_vacuum_regrow), and when the page is the
 # HEAD of a posting set of 16 leaves with no internal level, placing it means
 # a 17th leaf and so a PUSH-DOWN (lion_posting_promote()): the head's items -
@@ -21,17 +21,21 @@
 # container is on it: the count's descent waits on the child's content lock
 # (reader_waits_on = a page lock) and copies the filtered container.  With
 # the window open the count instead copies the stale one and parks
-# (reader_waits_on = lion-count-containers-pinned), and answers 43,307 rows
-# for a snapshot that sees 42,341.
+# (reader_waits_on = lion-count-containers-pinned), and answers 72,160 rows
+# for a snapshot that sees 64,928.
 #
-# The fixture: k = 1's first leaf holds three containers - a RUN of ~480 runs
-# of five in heap blocks 0..63 and two ~2.9 KB ARRAYs in blocks 64..191 - with
-# k = 2 everywhere else.  Deleting the 2nd and 4th row of every run (966 rows,
-# dead to everyone before the count's snapshot) makes the RUN grow by ~900
-# bytes on filtering, which that page does not have.  Wide rows after block
-# 191, every other one k = 1, give each key a BITSET a container key, about a
-# leaf each, and k = 1 its 16th leaf: the set has no internal level until the
-# regrow needs one more.  k = 2, a leaf longer, has one already.
+# The fixture: k = 1's first leaf holds four containers - a RUN of one run of
+# 226 rows a heap block in blocks 0..63, 264 bytes, and three NARROWs of 2,056
+# bytes in blocks 64..255 - and 1,512 bytes to spare.  Deleting every other
+# row of the RUN (7,232 rows, dead to everyone before the count's snapshot)
+# makes it a NARROW too, 1,792 bytes larger, which that page does not have.
+# The index is built at posting_fillfactor 10, which makes every container a
+# leaf of its own, with no rows of k = 1 in blocks 64..255: its first leaf
+# then takes every container key below that of its second, and the three
+# NARROWs go in after the build, into the slots k = 3 leaves there.  Wide rows
+# after block 255, every other one k = 1, give each key a leaf a container
+# key, and k = 1 its 16th leaf: the set has no internal level until the
+# regrow needs one more.  k = 2, three leaves longer, has one already.
 #
 # The second permutation parks the regrow before it tries the directory leaf
 # of both keys' entries, and an insert into k = 2 parks in a leaf split with
@@ -43,15 +47,18 @@ setup
 	SET synchronous_commit = on;
 	CREATE EXTENSION IF NOT EXISTS pg_lion;
 	CREATE EXTENSION IF NOT EXISTS injection_points;
-	CREATE TABLE rgp (id int, k int NOT NULL, pad text);
-	CREATE INDEX rgp_k ON rgp USING lion (k) WITH (inline_limit = 64);
-	INSERT INTO rgp SELECT i, CASE
-		WHEN i <= 14464 AND i % 30 < 5 THEN 1
-		WHEN i > 14464 AND i % 10 = 0 THEN 1
-		ELSE 2 END
-	  FROM generate_series(1, 43392) i;
+	CREATE TABLE rgp (id int, k int NOT NULL, pad text)
+	  WITH (autovacuum_enabled = off);
+	-- heap blocks 0..63, 226 rows each: k = 1 alone
+	INSERT INTO rgp SELECT i, 1 FROM generate_series(1, 14464) i;
+	-- blocks 64..255: k = 2 and k = 3 on alternate rows
+	INSERT INTO rgp SELECT i, 2 + i % 2 FROM generate_series(14465, 57856) i;
+	-- blocks 256..1215, 75 wide rows each: k = 1 and k = 2 on alternate rows
 	INSERT INTO rgp SELECT i, 1 + i % 2, repeat('x', 70)
-	  FROM generate_series(43393, 119392) i;
+	  FROM generate_series(57857, 129856) i;
+	CREATE INDEX rgp_k ON rgp USING lion (k)
+		WITH (inline_limit = 64, posting_fillfactor = 10);
+	DELETE FROM rgp WHERE k = 3;
 
 	/*
 	 * Waits until the count is parked at the injection point `point`, or -
@@ -133,6 +140,12 @@ setup
 	END $fn$;
 }
 
+# The slots k = 3 left in blocks 64..255, which the rows of k = 1 below take:
+# its first leaf's three NARROWs.  (VACUUM runs in a setup block of its own,
+# outside the transaction the first one is.)
+setup { VACUUM rgp; }
+setup { INSERT INTO rgp SELECT 300000 + i, 1 FROM generate_series(1, 21696) i; }
+
 teardown
 {
 	DROP TABLE rgp;
@@ -167,7 +180,7 @@ step s1_count	{ SELECT lion_index_count('rgp_k', 1); }
 # The control session.
 session s2
 setup			{ SET synchronous_commit = on; }
-step s2_delete	{ DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 30 IN (1, 3); }
+step s2_delete	{ DELETE FROM rgp WHERE k = 1 AND id <= 14464 AND id % 2 = 0; }
 # One step, because the count may block on a page lock in between, which
 # isolationtester cannot see: release the count, wait until it has either
 # copied from the child (and parked again) or is waiting for the child's lock,
@@ -205,7 +218,10 @@ setup
 }
 step s5_vacuum	{ VACUUM (INDEX_CLEANUP ON) rgp; }
 
-# ... and an insert into k = 2's set, parked in a split with that leaf held.
+# ... and an insert into k = 2's set, parked in a split with that leaf held:
+# its new NARROWs, of 1,032 bytes on alternate rows with k = 4, fill k = 2's
+# last leaf and split it (consecutive rows would make RUNs of a few hundred
+# bytes, which the leaf would take all of).
 session s6
 setup
 {
@@ -214,7 +230,7 @@ setup
 	SELECT injection_points_attach('lion-posting-split-incomplete', 'wait');
 }
 step s6_insert	{
-	INSERT INTO rgp SELECT i, 2, repeat('x', 70)
+	INSERT INTO rgp SELECT i, CASE WHEN i % 2 = 0 THEN 2 ELSE 4 END, repeat('x', 70)
 	  FROM generate_series(200001, 240000) i;
 }
 
@@ -247,15 +263,15 @@ step s4_verify	{ SELECT lion_index_verify('rgp_k', true); }
 
 permutation
 	s4_prep						# all-visible heap
-	s2_delete					# 966 rows of the RUN container, dead to all
-	s4_before					# k = 1 on 16 leaves, k = 2 on 17 and a root
+	s2_delete					# 7,232 rows of the RUN container, dead to all
+	s4_before					# k = 1 on 16 leaves, k = 2 on 18 and a root
 	s1_count(s2_wake_pinned)	# copies the entry, parks before the descent
 	s3_vacuum(s2_wake_both)		# regrow pushes k = 1's head down, parks with
 								# the stale container on the child
 	s2_wake_both				# the count descends to the child and waits
 								# for its lock; the filtered container goes
 								# on; VACUUM ends
-	s2_wake_pinned				# the count consults the map: 42,341
+	s2_wake_pinned				# the count consults the map: 64,928
 	s4_after					# one more leaf and one more internal page
 	s4_count
 	s4_verify

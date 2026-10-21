@@ -85,13 +85,52 @@ $$;
 -- 1. Posting sets of every size, grown by inserts
 -- ---------------------------------------------------------------------
 
--- Wide rows, about 75 to a heap page, and the big keys on alternate rows:
--- each of their containers is a BITSET that fills a leaf by itself, so such
--- a set has a leaf for every 64 heap blocks it has rows in.  The index is
--- created empty: every page comes from aminsert.  k = 6 fills in between.
+-- Wide rows, 65 to a heap page, and the keys on alternate rows: each of
+-- their containers is a NARROW of two words a heap block (DESIGN.md §38),
+-- 1,032 bytes for the 64 heap blocks a container covers, and a leaf takes
+-- seven.  The index is built at posting_fillfactor 10, which makes every
+-- container a leaf of its own, so the sets start with a leaf for every 64
+-- heap blocks they have rows in and room on each; every change of shape
+-- after that is an insert's.  k = 6 fills in between.
 CREATE TABLE ft (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
 	WITH (autovacuum_enabled = off);
-CREATE INDEX ft_k ON ft USING lion (k) WITH (inline_limit = 64);
+
+-- Rows of `key` and of k = 6 on alternate rows, `n` at a time, at the end of
+-- the heap, until the rows of `key` are in `containers` container keys - the
+-- runs of 64 heap blocks a container covers - for the build to make a leaf
+-- of each.
+CREATE PROCEDURE ft_fill(key int, n int, containers int)
+LANGUAGE plpgsql AS $$
+DECLARE
+	next int := (SELECT coalesce(max(id), 0) + 1 FROM ft);
+	first int;
+	last int;
+BEGIN
+	FOR i IN 1 .. 2000 LOOP
+		INSERT INTO ft SELECT next + j, CASE WHEN j % 2 = 0 THEN key ELSE 6 END
+		  FROM generate_series(0, n - 1) j;
+		next := next + n;
+		IF first IS NULL THEN
+			SELECT min((ctid::text::point)[0])::int INTO first
+			  FROM ft WHERE ft.k = key;
+		END IF;
+		-- the last two heap blocks hold rows of key: a TID range scan of them
+		SELECT max((ctid::text::point)[0])::int INTO last
+		  FROM ft
+		 WHERE ctid >= format('(%s,0)', pg_relation_size('ft') / 8192 - 2)::tid
+		   AND ft.k = key;
+		EXIT WHEN last / 64 - first / 64 + 1 >= containers;
+	END LOOP;
+END $$;
+
+INSERT INTO ft SELECT i, 1 FROM generate_series(1, 3) i;
+INSERT INTO ft SELECT 100 + i, CASE WHEN i % 2 = 1 THEN 2 ELSE 6 END
+  FROM generate_series(1, 1000) i;
+CALL ft_fill(3, 2000, 4);
+CALL ft_fill(4, 2000, 16);
+CALL ft_fill(5, 2000, 20);
+CREATE INDEX ft_k ON ft USING lion (k)
+	WITH (inline_limit = 64, posting_fillfactor = 10);
 
 -- the size classes: k = 1 INLINE, k = 2 one leaf, k = 3 a few leaves, k = 4
 -- exactly 16 leaves, k = 5 a tree
@@ -131,9 +170,8 @@ BEGIN
 END $$;
 
 -- Rows of `key` and of k = 6 on alternate rows, `n` at a time, at the end of
--- the heap, until the set of `key` has `leaves` leaves - or, with leaves
--- NULL, until its shape changes at all.
-CREATE PROCEDURE ft_grow(key int, n int, leaves int DEFAULT NULL)
+-- the heap, until the shape of the set of `key` changes.
+CREATE PROCEDURE ft_grow(key int, n int)
 LANGUAGE plpgsql AS $$
 DECLARE
 	before text := (SELECT f::text FROM ft_report() f WHERE f.k = key);
@@ -143,19 +181,9 @@ BEGIN
 		INSERT INTO ft SELECT next + j, CASE WHEN j % 2 = 0 THEN key ELSE 6 END
 		  FROM generate_series(0, n - 1) j;
 		next := next + n;
-		IF leaves IS NOT NULL THEN
-			EXIT WHEN (SELECT f.leaves FROM ft_report() f WHERE f.k = key) >= leaves;
-		ELSE
-			EXIT WHEN (SELECT f::text FROM ft_report() f WHERE f.k = key) <> before;
-		END IF;
+		EXIT WHEN (SELECT f::text FROM ft_report() f WHERE f.k = key) <> before;
 	END LOOP;
 END $$;
-
-INSERT INTO ft SELECT i, 1 FROM generate_series(1, 3) i;
-INSERT INTO ft SELECT 100 + i, 2 FROM generate_series(1, 5000, 10) i;
-CALL ft_grow(3, 1000, 4);
-CALL ft_grow(4, 1000, 16);
-CALL ft_grow(5, 1000, 20);
 
 SELECT * FROM ft_report();
 SELECT * FROM ft_check('ft_k');
@@ -166,11 +194,11 @@ SELECT * FROM ft_counts();
 -- its head is now an internal page over 17 leaves, at the same block - and
 -- the tree grows by a leaf.
 SELECT lion_index_posting_root('ft_k', 4) AS head4 \gset
-CALL ft_grow(1, 50);
-CALL ft_grow(2, 50);
-CALL ft_grow(3, 50);
-CALL ft_grow(4, 50);
-CALL ft_grow(5, 50);
+CALL ft_grow(1, 500);
+CALL ft_grow(2, 500);
+CALL ft_grow(3, 500);
+CALL ft_grow(4, 500);
+CALL ft_grow(5, 500);
 SELECT * FROM ft_report();
 SELECT lion_index_posting_root('ft_k', 4) = :head4 AS promoted_head_kept_its_block;
 SELECT * FROM ft_check('ft_k');
@@ -181,8 +209,9 @@ SELECT * FROM ft_counts();
 -- ---------------------------------------------------------------------
 
 -- The first half of every big key's rows, and all of k = 2's but one: the
--- leaves at the front of each set are left empty.  A flat set's head stays;
--- the other empty leaves leave their sets.
+-- leaves at the front of each set are left empty.  A flat set's head stays,
+-- and so does a set's rightmost leaf, k = 2's second; the other empty leaves
+-- leave their sets.
 WITH m AS (SELECT k, percentile_disc(0.5) WITHIN GROUP (ORDER BY id) AS mid
 			 FROM ft WHERE k IN (3, 4, 5) GROUP BY k)
 DELETE FROM ft USING m WHERE ft.k = m.k AND ft.id < m.mid;
@@ -193,8 +222,8 @@ SELECT * FROM ft_check('ft_k');
 SELECT * FROM ft_counts();
 
 -- and the next inserts go on from there
-CALL ft_grow(3, 50);
-CALL ft_grow(4, 50);
+CALL ft_grow(3, 500);
+CALL ft_grow(4, 500);
 SELECT * FROM ft_check('ft_k');
 SELECT * FROM ft_counts();
 
@@ -210,8 +239,9 @@ SELECT * FROM ft_counts();
 -- ---------------------------------------------------------------------
 
 -- The build writes the leaves of a set of up to 16 as a chain from its head
--- and no root (it packs dense containers tighter than inserts do, as NARROWs,
--- DESIGN.md §38, so k = 5 is no longer a tree; verify.sql builds one).
+-- and no root, and puts a root over more.  The index is still at
+-- posting_fillfactor 10, a leaf to a container: k = 5's make 15 leaves, and
+-- k = 3's and k = 4's, from the rows below, 22 each.
 INSERT INTO ft SELECT 900000 + i, CASE WHEN i % 2 = 0 THEN 3 ELSE 4 END
   FROM generate_series(1, 30000) i;
 REINDEX INDEX ft_k;
