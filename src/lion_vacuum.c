@@ -3333,7 +3333,7 @@ lion_vacuum_sweep(LionVacState *vs)
  * the page inside every window and its counters are only ever updated with
  * deltas.  The copy is written back in place, inside the record that changes
  * the set, so the entry has to be one of the size a CHAIN entry has
- * (lion_page_entry_fetch()).
+ * (lion_page_entry_fetch()), alone in its bytes (lion_page_check_alone()).
  */
 static LionEntryTuple *
 lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
@@ -3352,6 +3352,7 @@ lion_vacuum_entry_copy(Relation index, Buffer entrybuf, OffsetNumber entryoff,
 	if ((entry->flags & LION_ENTRY_CHAIN) == 0)
 		elog(ERROR, "lion index: entry %u on block %u is no longer a chain entry",
 			 entryoff, BufferGetBlockNumber(entrybuf));
+	lion_page_check_alone(index, page, BufferGetBlockNumber(entrybuf), entryoff);
 
 	return lion_entry_rebuild(entry, NULL, 0, size);
 }

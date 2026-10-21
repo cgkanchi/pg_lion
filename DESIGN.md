@@ -223,8 +223,10 @@ rule, and a writer checks what its record is going to do before the record opens
 page inside the item space and no two overlapping (`lion_page_check_items()`, before a push-down,
 a split, VACUUM's filtering of a page and a directory split), the one item it overwrites or
 deletes in place alone in the bytes the page allots it (`lion_page_check_alone()`, before the
-in-place insert, a replacement and VACUUM's delete), and the directory entry a record rewrites a
-whole one, of exactly its size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
+in-place insert, a replacement and VACUUM's delete - and for the CHAIN entry that every record of
+its posting set's insert or VACUUM rewrites, before the first: `lion_insert_chain()`,
+`lion_vacuum_entry_copy()`), and the directory entry a record rewrites a whole one, of exactly its
+size when it is a CHAIN entry (`lion_page_entry_fetch()`). Each is an
 ERROR (INDEX_CORRUPTED), and verify() reports an overlap too. `test/sql/corrupt_items.sql`.
 
 The 2026-10-18 review's damaged pages added two checks to that list. The entry a record rewrites
