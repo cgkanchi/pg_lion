@@ -1801,6 +1801,13 @@ extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
 									 double cand);
 
 /*
+ * The collation a multi-key key column takes its queries apart under in the
+ * executor, which the planner's extractions of a literal use too
+ * (lion_plan_match.c).
+ */
+extern Oid	lion_index_extract_collation(IndexOptInfo *idx, AttrNumber col);
+
+/*
  * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
  * §14, §29.2): its NULL entry taken away from that answer, or - canwalk, and
  * LION_NOTNULL_WALK_MARGIN times cheaper - the column's other entries walked

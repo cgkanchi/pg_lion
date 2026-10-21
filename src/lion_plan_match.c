@@ -12,6 +12,7 @@
 #include "postgres.h"
 
 #include "catalog/namespace.h"
+#include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "nodes/miscnodes.h"
 #include "utils/builtins.h"
@@ -929,6 +930,28 @@ lion_op_roaring_strategy(Oid opno, Oid *opfamily, Oid *lefttype)
 }
 
 /*
+ * The collation key column col of idx extracts a multi-key query under in the
+ * executor (lion_fill_column_state()): the column's own, or C where a key
+ * type that is collatable has none from the index - a tsvector column's
+ * lexemes, whose index column is text while the tsvector is not collatable.
+ * What the planner extracts a literal under to price or match it.
+ */
+Oid
+lion_index_extract_collation(IndexOptInfo *idx, AttrNumber col)
+{
+	Oid			collation;
+
+	if (col < 1 || col > idx->nkeycolumns)
+		elog(ERROR, "lion index %u has no key column %d", idx->indexoid,
+			 (int) col);
+	collation = idx->indexcollations[col - 1];
+	if (!OidIsValid(collation) &&
+		type_is_collatable(get_atttype(idx->indexoid, col)))
+		collation = C_COLLATION_OID;
+	return collation;
+}
+
+/*
  * Does key column col of idx store positions (DESIGN.md §17)?  Its opclass
  * has support function 5 and the build stored them (store_positions = auto,
  * the default, or on), which only its meta page knows (LION_META_POSITIONS)
@@ -955,10 +978,11 @@ lion_index_stores_positions(IndexOptInfo *idx, AttrNumber col)
  * Could a lion opfamily that has opno, extractquery as its extractQuery and
  * stored positions decide the superset of `col opno con` exactly
  * (lion_query_posexact())?  Any one: lion_match_index() then takes only an
- * index of such a family.
+ * index of such a family.  The query is taken apart under collation, the
+ * clause's input collation (lion_multikey_query_mode()).
  */
 static bool
-lion_op_posexact(Oid opno, Oid extractquery, Const *con)
+lion_op_posexact(Oid opno, Oid extractquery, Const *con, Oid collation)
 {
 	Oid			amoid = lion_get_am_oid();
 	CatCList   *catlist;
@@ -977,7 +1001,7 @@ lion_op_posexact(Oid opno, Oid extractquery, Const *con)
 							  LION_EXTRACTQUERY_PROC) != extractquery)
 			continue;
 		result = lion_query_posexact(amop->amopfamily, amop->amoplefttype,
-									 opno, con->constvalue, con->constcollid);
+									 opno, con->constvalue, collation);
 	}
 	ReleaseSysCacheList(catlist);
 
@@ -989,10 +1013,22 @@ lion_op_posexact(Oid opno, Oid extractquery, Const *con)
  * lion_extract_query()'s mode for a literal, and with superset
  * lion_extract_query_superset()'s, which is what it asks of a query it only
  * has at run time (DESIGN.md §17, "A query known only at run time").
+ *
+ * The executor calls extractquery under the index column's collation
+ * (lion_fill_column_state()), and so must this, under `collation`: the
+ * clause's input collation where no index is chosen yet, which
+ * lion_match_index() holds equal to the index's own wherever the index has
+ * one (lion_index_answers()), and the index's where it is known
+ * (lion_multikey_literal_mode()).  The Const's own collation is no stand-in:
+ * `tags @> ARRAY['x']` over a column COLLATE "C" compares under C while its
+ * literal keeps the default collation, and an extraction may depend on the
+ * collation - lion_array_extract_query() hashes a long element only under a
+ * deterministic one (lion_array_hashes_type()), and answers a query with one
+ * as LOSSY.
  */
 static LionQueryMode
 lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
-						 Const *con, bool superset)
+						 Const *con, Oid collation, bool superset)
 {
 	FmgrInfo	flinfo;
 	LionQuery	q;
@@ -1007,11 +1043,7 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 
 	/*
 	 * lion_extract_query() wants an LionState, but only for the extractQuery
-	 * FmgrInfo and the collation; nothing here touches an index.  The
-	 * collation of a query is the clause's own, which for the collatable key
-	 * types the multi-key classes use (text lexemes, text array elements) is
-	 * what the extraction functions ignore anyway - they take the query
-	 * apart, they do not compare it.
+	 * FmgrInfo and the collation; nothing here touches an index.
 	 */
 	cxt = AllocSetContextCreate(CurrentMemoryContext,
 								"roaring count query extract",
@@ -1020,7 +1052,7 @@ lion_multikey_query_mode(Oid extractquery, StrategyNumber strategy,
 
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
-	state.collation = con->constcollid;
+	state.collation = collation;
 	fmgr_info(extractquery, &flinfo);
 	state.extractquery = flinfo;
 
@@ -1070,7 +1102,8 @@ lion_multikey_literal_mode(IndexOptInfo *idx, AttrNumber col, Oid opno,
 	if (!LION_STRAT_IS_MULTI_SEARCH(strategy) || !OidIsValid(extractquery))
 		return LION_QMODE_ALL;
 	return lion_multikey_query_mode(extractquery, (StrategyNumber) strategy,
-									con, false);
+									con, lion_index_extract_collation(idx, col),
+									false);
 }
 
 /*
@@ -1086,14 +1119,14 @@ lion_multikey_literal_mode(IndexOptInfo *idx, AttrNumber col, Oid opno,
 static bool
 lion_multikey_query_is_exact(Oid opfamily, Oid lefttype,
 							StrategyNumber strategy, Const *con,
-							Oid *extractquery)
+							Oid collation, Oid *extractquery)
 {
 	*extractquery = get_opfamily_proc(opfamily, lefttype, lefttype,
 									  LION_EXTRACTQUERY_PROC);
 	if (!OidIsValid(*extractquery))
 		return false;
 
-	return lion_multikey_query_mode(*extractquery, strategy, con,
+	return lion_multikey_query_mode(*extractquery, strategy, con, collation,
 									false) == LION_QMODE_KEYS;
 }
 
@@ -1848,6 +1881,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 				if (!lion_multikey_query_is_exact(opfamily, lefttype,
 												 out->strategy,
 												 (Const *) out->val,
+												 op->inputcollid,
 												 &out->extractquery))
 				{
 					/*
@@ -1862,6 +1896,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 						lion_multikey_query_mode(out->extractquery,
 												 out->strategy,
 												 (Const *) out->val,
+												 op->inputcollid,
 												 true) != LION_QMODE_LOSSY)
 						return false;
 
@@ -1874,7 +1909,8 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 					if (!allow_recheck)
 					{
 						if (!lion_op_posexact(op->opno, out->extractquery,
-											  (Const *) out->val))
+											  (Const *) out->val,
+											  op->inputcollid))
 							return false;
 						out->positions = true;
 					}
