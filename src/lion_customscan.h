@@ -1079,17 +1079,16 @@ typedef struct LionVColScope
  * "Stored positions"): each lexeme's cursor sought to it, a member decoded
  * at a time (LION_POS_MEMBER_COST), and TS_execute() over what they found, a
  * callback per lexeme and the candidate's memory reset after it
- * (LION_POS_CHECK_COST a lexeme).  Fitted on an assert build to 400,000
- * rows of three or four lexemes, two of them in three rows of four, one
- * position each: a count of `foo <-> bar` decides its 300,000 candidates in
- * 21 ms beyond what `foo & bar` takes, 600,000 members decoded; 2 to 30
- * counts of an FK-side join that probe the filters decide 200 to 8,800
- * candidates, decoding 1,105 members a seek, at 13.5 to 14 ns a member
- * decoded.  That build's LionCount paths without positions ran at
- * 330 to 375 units a millisecond where the reference is 500 (§10, "The
- * reference"), so 14 ns there is 10 ns at the reference, two
- * cpu_operator_cost, and the 42 ns a candidate spends beyond its two seeks'
- * decoding is three a lexeme.
+ * (LION_POS_CHECK_COST a lexeme).  Fitted on the release build (DESIGN.md
+ * §10, "The units") to 400,000 rows of three or four lexemes, two of them in
+ * three rows of four, one position each, every page all-visible: a count of
+ * `foo <-> bar` decides its 300,000 candidates in 17.6 to 18.4 ms beyond
+ * what `foo & bar` takes, 600,000 members decoded; the FK-side joins that
+ * probe the filters - 200 counts deciding 30,000 candidates, decoding 1,105
+ * members a seek, and 400 counts deciding 112,500 at 300 a seek - take 8.2
+ * to 9.4 ns a member decoded.  At the reference's 5 ns a cpu_operator_cost
+ * (§10, "The reference") that is 1.8 of them, and the 21.6 ns a candidate
+ * spends a lexeme beyond its decoding is 4.3.
  *
  * A seek decodes a chunk's members from the first, or from where the cursor
  * stood, up to the candidate's (lion_poscursor_seek()), skipping the chunks

@@ -1770,6 +1770,10 @@ extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
 							  Node **clauses, double isect, LionAndCost *out);
 
+/* What an AM scan's position filters decode and decide (DESIGN.md §17). */
+extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
+									 double cand);
+
 /*
  * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
  * §14, §29.2): its NULL entry taken away from that answer, or - canwalk, and

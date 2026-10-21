@@ -5940,12 +5940,11 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 }
 
 /*
- * The position filters (lion_posfilter.c, DESIGN.md §17 "Stored positions")
- * of the multi-key clauses decided from stored positions - a superset the
- * sets only bound, outside an OR or under one - over `cand` candidates of
- * `counts` counts: the copy of a WHERE that decides them as it is made is
- * one count of every row it holds, and a count per group or per key of a
- * join, of its own rows each.
+ * One clause's position filter, over `cand` candidates of `counts` counts
+ * (lion_cost_posfilter()): nothing unless it is a multi-key clause the sets
+ * only bound, decided from stored positions - every one under an OR
+ * (lion_match_index() takes no other there), one outside it when the index
+ * stores positions and the query can be followed through them.
  *
  * Every count's cursors begin again at their lexemes' first member, and seek
  * to the count's candidates in order, decoding the members between
@@ -5958,15 +5957,51 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
  * be their product, which is how the selectivity of a tsquery's AND and
  * phrase is estimated: 0.56 for `foo <-> bar` of lexemes in 0.75 of the rows.
  */
+static Cost
+lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
+						   IndexOptInfo *idx, AttrNumber col, Node *clause,
+						   bool inor, double cand, double counts)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		percount;
+	double		nkeys;
+	double		members;
+	Selectivity sel;
+
+	if (cand <= 0.0)
+		return 0;
+	if (lion_multikey_cost_mode(idx, col, clause, &nkeys) != LION_QMODE_LOSSY)
+		return 0;
+	if (!inor && !lion_multikey_posexact(idx, col, clause))
+		return 0;
+
+	/* a count that has no candidate seeks nothing */
+	counts = Min(Max(counts, 1.0), Max(cand, 1.0));
+	percount = cand / counts;
+
+	nkeys = Max(nkeys, 1.0);
+	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
+							 NULL);
+	members = tuples * pow(Min(Max(sel, 1e-10), 1.0), 1.0 / nkeys);
+	members = Max(members, percount);
+	return counts * nkeys *
+		Min(members, percount * LION_POS_SEEK_MEMBERS) * LION_POS_MEMBER_COST +
+		cand * nkeys * LION_POS_CHECK_COST;
+}
+
+/*
+ * The position filters (lion_posfilter.c, DESIGN.md §17 "Stored positions")
+ * of a count's WHERE, over `cand` candidates of `counts` counts: the copy of
+ * a WHERE that decides them as it is made is one count of every row it
+ * holds, and a count per group or per key of a join, of its own rows each.
+ */
 Cost
 lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 					List *wherecol, List *whereclauses, List *wherekinds,
 					List *ors, double cand, double counts)
 {
-	double		tuples = Max(rel->tuples, 1.0);
 	int		   *orgrp;
 	Cost		cost = 0;
-	double		percount;
 	int			ci = 0;
 	ListCell   *lc1;
 	ListCell   *lc2;
@@ -5976,39 +6011,54 @@ lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	if (cand <= 0.0)
 		return 0;
 
-	/* a count that has no candidate seeks nothing */
-	counts = Min(Max(counts, 1.0), Max(cand, 1.0));
-	percount = cand / counts;
-
 	orgrp = lion_or_group_map(ors, list_length(whereclauses));
 	forfour(lc1, whereidx, lc2, whereclauses, lc3, wherekinds, lc4, wherecol)
 	{
-		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc1);
-		AttrNumber	col = (AttrNumber) lfirst_int(lc4);
-		Node	   *clause = (Node *) lfirst(lc2);
 		bool		inor = (orgrp[ci++] >= 0);
-		double		nkeys;
-		double		members;
-		Selectivity sel;
 
 		if (lfirst_int(lc3) != LION_CLAUSE_MULTI)
 			continue;
-		if (lion_multikey_cost_mode(idx, col, clause, &nkeys) !=
-			LION_QMODE_LOSSY)
-			continue;
-		if (!inor && !lion_multikey_posexact(idx, col, clause))
-			continue;
-
-		nkeys = Max(nkeys, 1.0);
-		sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
-								 NULL);
-		members = tuples * pow(Min(Max(sel, 1e-10), 1.0), 1.0 / nkeys);
-		members = Max(members, percount);
-		cost += counts * nkeys *
-			Min(members, percount * LION_POS_SEEK_MEMBERS) *
-			LION_POS_MEMBER_COST +
-			cand * nkeys * LION_POS_CHECK_COST;
+		cost += lion_cost_posfilter_clause(root, rel,
+										   (IndexOptInfo *) lfirst(lc1),
+										   (AttrNumber) lfirst_int(lc4),
+										   (Node *) lfirst(lc2), inor,
+										   cand, counts);
 	}
 	pfree(orgrp);
+	return cost;
+}
+
+/*
+ * The position filters of one scan of the AM (lion_scan.c): a plain or bitmap
+ * scan puts the superset of each multi-key qual decided from stored positions
+ * through a filter of its own, its cursors begun again at every scan - each
+ * repetition of a nested loop's inner side - and sought to that scan's
+ * `cand` candidates.  A qual of `@@ ANY (array)` is not one
+ * lion_cost_posfilter_clause() takes and is charged nothing here: the plain
+ * scan rechecks it in the heap, and the bitmap scan decides each element as
+ * a query of its own.
+ */
+Cost
+lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path, double cand)
+{
+	IndexOptInfo *idx = path->indexinfo;
+	Cost		cost = 0;
+	ListCell   *lc;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = (IndexClause *) lfirst(lc);
+		ListCell   *lq;
+
+		foreach(lq, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lq);
+
+			cost += lion_cost_posfilter_clause(root, idx->rel, idx,
+											   (AttrNumber) (iclause->indexcol + 1),
+											   (Node *) rinfo->clause, false,
+											   cand, 1.0);
+		}
+	}
 	return cost;
 }

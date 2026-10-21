@@ -188,9 +188,38 @@ SELECT fp_run($q$SELECT count(*) FROM fp_fact f JOIN fp_dim d ON f.fk = d.pk
 	WHERE f.d @@ 'foo <-> bar'$q$);
                             fp_run                            
 --------------------------------------------------------------
- probed, then collected; 15225 checked, 10150 removed; 1 rows
+ probed, then collected; 15300 checked, 10200 removed; 1 rows
 (1 row)
 
 RESET pg_lion.fkjoin_collect_container_cost;
+-- An index scan decides its superset from positions too, its cursors begun
+-- again at every scan: the inner scan of a key's rows, repeated for each
+-- key, is priced with the seeks to them (lion_cost_scan_posfilter()) - both
+-- lexemes' 15,000 members decoded, at 1.8 cpu_operator_cost, and 56
+-- candidates estimated at 4.3 a lexeme - beyond the same scan of
+-- `foo & bar`, which the posting sets answer alone.
+CREATE FUNCTION fp_inner_cost(tq text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	e jsonb;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('EXPLAIN (FORMAT JSON) SELECT sum(c) FROM fp_dim d, '
+				   'LATERAL (SELECT count(*) AS c FROM fp_fact f '
+				   'WHERE f.fk = d.pk AND f.d @@ %L::tsquery) s '
+				   'WHERE d.pk <= 20', tq) INTO e;
+	RETURN jsonb_path_query_first(e,
+		'strict $.**?(@."Index Name" == "fp_fact_dfc")."Total Cost"')::float8;
+END $$;
+SELECT round((fp_inner_cost('foo <-> bar') -
+			  fp_inner_cost('foo & bar'))::numeric) AS phrase_inner_more;
+ phrase_inner_more 
+-------------------
+               136
+(1 row)
+
+DROP FUNCTION fp_inner_cost(text);
 DROP FUNCTION fp_run(text);
 DROP TABLE fp_fact, fp_dim;
