@@ -6716,7 +6716,8 @@ record; from here the chain is unreachable for new readers and inserts), then (2
 page, under ConditionalLockBufferForCleanup (skip the page on failure; it is merely leaked, and the
 walk stops because the rightlink cannot be read without the lock), check that the page still claims
 this chain and is empty, mark it LION_PAGE_DELETED, store `safexid = ReadNextFullTransactionId()` in
-the page body (as nbtree's BTDeletedPageData), WAL-log, and RecordFreeIndexPage().  Step 2 runs with
+the page body (as nbtree's BTDeletedPageData), WAL-log, and keep it for the free space map, which
+gets it once it is reusable ("Reuse" below).  Step 2 runs with
 the bucket page unlocked, because VACUUM never waits for a page while holding another LWLock (§11).
 A crash between (1) and (2) leaks pages, which is harmless: they are unreferenced and the sweep
 below finds them (test/recovery/run.sh phase 1b puts the crash exactly there).  The leaves of a
@@ -6731,24 +6732,42 @@ set was visited by pass 2 and is therefore never swept, and a page a concurrent 
 then is full of the items a split just put there. verify() reports such a page as the ordinary leak
 it is, with a WARNING.)*
 
-`lion_new_buffer()`/`lion_alloc_page()` (§25 split the second out of `lion_new_buffer_xl()`) first try GetFreeIndexPage(): take the page with
-ConditionalLockBuffer; it is reusable only if it is all-zero, or LION_PAGE_DELETED - or an UNLINKED
-posting leaf (§22, "Empty leaves") - with GlobalVisCheckRemovableFullXid(heaprel, safexid) true (the nbtree rule: no scan that could still hold
-a link to it is running); otherwise re-record it in the FSM and extend the relation (which also keeps
-the loop from spinning on a block the map keeps offering).  heaprel comes from `heapRel` in aminsert
-and `info->heaprel` in VACUUM; a NULL heaprel means "never recycle", which is what ambuildempty
-wants.  ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum().  Leak recovery:
+**The free space map holds only pages that may be handed out**, nbtree's rule since PostgreSQL
+14: a page out of the index's trees - LION_PAGE_DELETED, or an UNLINKED posting leaf (§22, "Empty
+leaves") - is recorded in it once GlobalVisCheckRemovableFullXid(heaprel, safexid) is true (no scan
+that could still hold a link to it is running), and not before.  `lion_new_buffer()`/`lion_alloc_page()`
+(§25 split the second out of `lion_new_buffer_xl()`) then take what the map offers, as
+`_bt_allocbuf()` does: GetFreeIndexPage() takes a block off the map, the page is locked with
+ConditionalLockBuffer and taken if it is all-zero or passes the same test, and otherwise the next
+block is asked for, until the map has none left and the relation is extended.  A block refused is
+not put back.  It is one the map is wrong about - the map is not WAL-logged, so a crash or a
+promotion can leave live pages listed, which must leave it - or a free page a reader holds locked,
+which the next VACUUM records again.  Recording a page before it is reusable would fill the map
+with blocks every allocation reads and refuses: the map offers them by block, so young pages in
+front of old ones would have the inserts after a VACUUM extend the index while the old ones wait,
+and under a long snapshot every allocation would read one.  heaprel comes from `heapRel` in aminsert and
+`info->heaprel` in VACUUM; a NULL heaprel means "never recycle", which is what ambuildempty wants.
+ambuild never reuses.  amvacuumcleanup calls IndexFreeSpaceMapVacuum().
+
+So a page VACUUM frees is handed out by the first VACUUM that finds it reusable.  That may be the
+same one: ambulkdelete keeps the pages it freed, and the ones its sweep found not reusable yet,
+with their safexids (bounded by work_mem, as nbtree's `_bt_pendingfsm_add()`; one past the bound
+waits for the next VACUUM), computes the horizon afresh at its end and records those that are
+reusable by then (`lion_vac_pending_record()`, nbtree's `_bt_pendingfsm_finalize()`) - a page
+freed early in a long VACUUM, beside short transactions, usually is.  A page freed with no
+transaction started since is not, and the next VACUUM records it, with or without rows to remove
+(below).  Leak recovery:
 ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
 walked, every container page it reached from a live entry, and every page it freed - and sweeps the
-rest at the end of ambulkdelete: a DELETED page or an all-zero page goes into the FSM, an UNLINKED
-posting leaf (§22, "Empty leaves") goes there once it is reusable, and an
+rest at the end of ambulkdelete: an all-zero page goes into the FSM, a DELETED page or an UNLINKED
+posting leaf goes there once it is reusable, and an
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
-below).  The pages the sweep leaves out of the index's trees that are not reusable yet are counted
-on the meta page (the special area's `maxckey`, nbtree's `btm_last_cleanup_num_delpages`), and a
-VACUUM that calls no ambulkdelete reads every block of the index for them when they are more than
-a twentieth of it, nbtree's `_bt_vacuum_needs_cleanup()` rule, recording the ones that are
-reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
+below).  The pages out of the index's trees that are not reusable at the end of ambulkdelete - the
+ones it did not record - are counted on the meta page (the special area's `maxckey`, nbtree's
+`btm_last_cleanup_num_delpages`), and a VACUUM that calls no ambulkdelete reads every block of the
+index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_needs_cleanup()`
+rule, recording the ones that are reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
 those and nothing else.  It checks for interrupts at every block, with nothing locked, and each
 page it reads passes the cost-based delay first, as every page the walk reads does (since the
 2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
@@ -8096,9 +8115,10 @@ A page of one downlink does not split before it has gained two more, so it does 
 bound of "Height", which counts the pages made over the directory's life; when its last child
 empties, the page goes with it, as a subtree of single downlinks.
 
-**Reuse.** VACUUM's sweep hands a DELETED directory page to the free space map, and
-`lion_alloc_page()` takes it once its `safexid` is older than every snapshot, nbtree's rule: a scan
-that can still hold a link to the page began before the page was unlinked. Every reader that keeps
+**Reuse.** VACUUM's sweep hands a DELETED directory page to the free space map once its `safexid`
+is older than every snapshot, and `lion_alloc_page()` checks it again before it takes it, nbtree's
+rule (§18, "Reuse"): a scan that can still hold a link to the page began before the page was
+unlinked. Every reader that keeps
 a block number across pages - the ordered walks (§30), the lookups in key order (§27), a paused
 walk of §29 - holds a snapshot while it does. Taking such a page first writes a recovery conflict
 for the standby, whose queries can hold the same links: REUSE in rmgr mode (§25), nbtree's
@@ -8451,10 +8471,9 @@ leaf, because a set's internal pages stay.
   a walk finds no item and follows the right link to R, which is where L's range went. Items only
   ever moved right, and still do.
 - **Reuse.** A sweep (§18, "Reuse") that finds L unvisited and UNLINKED records it in the free space
-  map once its transaction id is behind every snapshot, nbtree's rule - not before, because
-  `lion_alloc_page()` tries one page of the map before it extends the index, and a map full of
-  pages it may not take yet made the index grow. The VACUUM that took L out is usually too early
-  for that, and the next one records it, with or without rows to remove (§18, "Reuse"). The
+  map once its transaction id is behind every snapshot, nbtree's rule, as it records a DELETED
+  page. The VACUUM that took L out records it at its end when the horizon has passed it by then,
+  and the next one otherwise, with or without rows to remove (§18, "Reuse"). The
   allocation that takes it checks the horizon again and announces the reuse to a standby first
   (§25), whose queries may hold a link for longer. Until then the page is exactly what it was, an
   empty leaf, on a standby as on the primary. `lion_index_stats()` counts it among the
