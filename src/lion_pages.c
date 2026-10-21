@@ -880,7 +880,9 @@ lion_page_find_container(Relation index, Page page, BlockNumber blkno,
 /*
  * Write the caller's private copy of the entry tuple back into the record
  * that is changing the entry's containers.  An entry's size never changes
- * once it is a CHAIN entry, so this cannot fail.
+ * once it is a CHAIN entry, so this cannot fail; and the writers check, before
+ * any record opens, that the entry is alone in the bytes this overwrites
+ * (lion_insert_chain(), lion_vacuum_entry_copy(), lion_entry_spill*()).
  */
 void
 lion_put_entry(Relation index, LionWalState *xstate, Buffer entrybuf,

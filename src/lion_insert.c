@@ -1253,7 +1253,9 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 	/*
 	 * Every record below rewrites the entry in place, at the size it has,
 	 * inside the record (lion_put_entry()): it has to have the size a CHAIN
-	 * entry has, or that write fails there - a PANIC in rmgr mode.
+	 * entry has, or that write fails there - a PANIC in rmgr mode - and be
+	 * alone in its bytes (lion_page_check_alone(), below), or the write
+	 * overwrites the item that shares them, and logs it.
 	 */
 	entry = lion_page_entry_fetch(index, page, BufferGetBlockNumber(entrybuf),
 								  entryoff);
@@ -1276,6 +1278,7 @@ lion_insert_chain(Relation index, Relation heaprel, Buffer entrybuf,
 		entry = lion_page_entry_fetch(index, page,
 									  BufferGetBlockNumber(entrybuf), entryoff);
 	}
+	lion_page_check_alone(index, page, BufferGetBlockNumber(entrybuf), entryoff);
 	ecopy = lion_entry_rebuild(entry, NULL, 0, &esize);
 	Assert(esize == ItemIdGetLength(PageGetItemId(page, entryoff)));
 	Assert((ecopy->flags & LION_ENTRY_CHAIN) != 0);
