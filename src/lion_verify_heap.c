@@ -204,8 +204,9 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 		LionPageOpaque opaque = LionPageGetOpaque(page);
 		OffsetNumber maxoff;
 
-		/* a page nothing has checked yet: its header before its items */
+		/* a page nothing has checked yet: its header and flags first */
 		lion_verify_page_bounds(vs, blk, page);
+		(void) lion_verify_page_flags(vs, blk, page);
 		maxoff = PageGetMaxOffsetNumber(page);
 
 		u->level = opaque->level;
@@ -520,11 +521,22 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 			OffsetNumber off;
 			bool		found;
 
-			off = lion_page_find_item(index, cpage, blk, ckey, &found);
-			if (found)
-				present = lion_item_contains(lion_page_item_fetch(index, cpage,
-																  blk, off),
-											ckey, lo);
+			/*
+			 * The descent checks each page with the tree code's test, which
+			 * serves position trees too and so does not look at the
+			 * LION_PAGE_POSITIONS bit (lion_page_owns_tree()).  The leaf it
+			 * lands on is held to the test the readers of the set apply
+			 * (lion_page_owns_entry()), so that a TID counts as present only
+			 * where a count or a scan would find it.
+			 */
+			if (lion_page_owns_entry(cpage, ehash, head))
+			{
+				off = lion_page_find_item(index, cpage, blk, ckey, &found);
+				if (found)
+					present = lion_item_contains(lion_page_item_fetch(index, cpage,
+																	  blk, off),
+												ckey, lo);
+			}
 			UnlockReleaseBuffer(cbuf);
 		}
 	}
