@@ -368,9 +368,16 @@ typedef struct LionCountPathBuild
 	int			curfilter;		/* the filter being analysed, or 0 */
 	int			nwhere;			/* the WHERE's clauses, before the filters' */
 	bool		filterdecode;	/* every filter's run may be decoded (§34) */
+	bool		cells;			/* a count by cells (§10, "Counts by
+								 * cells") is being built */
+	List	   *cellexprs;		/* ... its GROUP BY's expressions */
+	List	   *cellquals;		/* ... the WHERE's clauses over predicates */
+	LionCellsPlan *cellplan;	/* ... its dimensions and driver */
+	double		cellwhererows;	/* ... and the rows the posting sets select */
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
+static void lion_try_count_cells(const LionCountPathBuild *cxp);
 static int	lion_count_path_filter_no(LionCountPathBuild *cx, Node *fexpr);
 
 /*
@@ -1498,7 +1505,8 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
-		if (lion_enable_count_residual && !cx->partitioned && cx->fj == NULL)
+		if ((lion_enable_count_residual && !cx->partitioned &&
+			 cx->fj == NULL) || cx->cells)
 			lion_count_path_snapshot(cx, &snap);
 
 		/* a clause of an expression column is one of a column (§41) */
@@ -1572,11 +1580,32 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
-		if (answered && lion_enable_count_residual && !cx->partitioned &&
-			cx->fj == NULL && !lion_where_indexed(cx, startlen))
+		if (answered &&
+			((lion_enable_count_residual && !cx->partitioned &&
+			  cx->fj == NULL) || cx->cells) &&
+			!lion_where_indexed(cx, startlen))
 			answered = false;
 		if (answered)
 			continue;
+
+		/*
+		 * Built as a count by cells (DESIGN.md §10, "Counts by cells"), a
+		 * clause no posting set answers is one over predicates the cells
+		 * tell apart - `CASE ... END = 'high'` - or none at all: tested once
+		 * a cell, by the plan's qual, and never on a row.
+		 */
+		if (cx->cells)
+		{
+			List	   *cellquals;
+
+			if (!lion_cells_shape_ok(root, input_rel, rti,
+									 (Node *) rinfo->clause))
+				return false;
+			cellquals = lappend(cx->cellquals, rinfo->clause);
+			*cx = snap;
+			cx->cellquals = cellquals;
+			continue;
+		}
 
 		/*
 		 * No posting set answers the clause.  On a plain table it may be
@@ -3515,7 +3544,7 @@ lion_count_path_make(LionCountPathBuild *cx)
 	 */
 	cpath->path.pathkeys = NIL;
 	if (cx->ngroup == 1 && !cx->partitioned && !cx->sumall &&
-		cx->nfilter == 0 &&
+		cx->nfilter == 0 && !cx->cells &&
 		!cx->singlegroup &&
 		cx->groupcoal == NULL && cx->groupdeps == NIL &&
 		first->driveidx[0] != NULL &&
@@ -4158,6 +4187,426 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 }
 
 /*
+ * COUNTS BY CELLS (DESIGN.md §10, "Counts by cells").
+ *
+ * A GROUP BY of expressions of the table's columns - `CASE WHEN score >= 70
+ * THEN 'high' ... END` over a score made of `col = c`, `tags && '{x}'`, `x
+ * IS NULL` and their like - groups each row by the truths of the predicates
+ * it is made of, as the plan's projection would compute it from them.  So
+ * the WHERE's rows are counted by CELL - a truth of every predicate, true,
+ * false or NULL - from the posting sets that decide each predicate in every
+ * row, and the expressions are computed once a cell, from the cell's truths,
+ * by the node's own projection: the predicates are the columns it emits
+ * (LION_TL_CELLPRED), each cell's partial count beside them, and core's
+ * Finalize Agg adds the cells of one group up.  A WHERE clause over the
+ * predicates - `... AND CASE ... END = 'high'` - is the node's qual, tested
+ * once a cell.
+ *
+ * The phases are the decoded walk's, of one column - the driver
+ * (lion_cells_choose_driver()) - with the GROUP BY, the outputs and the
+ * strategy of their own; lion_cells_analyze() finds the predicates and the
+ * cells they make, and declines more than pg_lion.count_cells_max of them.
+ */
+
+/* Does node compute a value from truths - CASE, GREATEST or LEAST, COALESCE? */
+static bool
+lion_cells_candidate_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, CaseExpr) || IsA(node, MinMaxExpr) ||
+		IsA(node, CoalesceExpr))
+		return true;
+	return expression_tree_walker(node, lion_cells_candidate_walker, context);
+}
+
+/*
+ * The GROUP BY's expressions, none of them a bare column - whose groups are
+ * the walk's own - on one plain table whose counts core may add up; or no
+ * GROUP BY at all, when the WHERE has a clause the cells may test.
+ */
+static bool
+lion_count_cells_group_by(LionCountPathBuild *cx)
+{
+	PlannerInfo *root = cx->root;
+	ListCell   *lc;
+
+	if (cx->fj != NULL || cx->partitioned || cx->distinctstage ||
+		cx->extra == NULL ||
+		(cx->extra->flags & GROUPING_CAN_PARTIAL_AGG) == 0 ||
+		RecoveryInProgress())
+		return false;
+	if (root->processed_groupClause == NIL)
+	{
+		ListCell   *lr;
+		bool		any = false;
+
+		/* a GROUP BY folded to one group has nothing to split */
+		if (cx->parse->groupClause != NIL)
+			return false;
+
+		/* the WHERE form: a clause with an expression no set answers */
+		foreach(lr, cx->input_rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) lfirst(lr);
+
+			if (IsA(rinfo, RestrictInfo) &&
+				lion_cells_candidate_walker((Node *) rinfo->clause, NULL) &&
+				lion_cells_shape_ok(root, cx->input_rel, cx->rti,
+									(Node *) rinfo->clause))
+				any = true;
+		}
+		return any;
+	}
+	if (!grouping_is_hashable(root->processed_groupClause))
+		return false;
+	foreach(lc, root->processed_groupClause)
+	{
+		SortGroupClause *sgc = (SortGroupClause *) lfirst(lc);
+		TargetEntry *tle = get_sortgroupclause_tle(sgc, root->processed_tlist);
+		Node	   *e;
+
+		if (tle == NULL)
+			return false;
+		e = (Node *) tle->expr;
+		if (lion_strip(e) == NULL || IsA(lion_strip(e), Var) ||
+			!lion_cells_shape_ok(root, cx->input_rel, cx->rti, e))
+			return false;
+		cx->cellexprs = lappend(cx->cellexprs, e);
+	}
+	return true;
+}
+
+/*
+ * The target list and the HAVING: the GROUP BY's expressions, and counts the
+ * node answers - count(*), and the count(col) of a column every row counted
+ * has non-NULL, or NULL - and expressions over them; no column outside the
+ * GROUP BY's expressions, which the cells do not keep.
+ */
+static bool
+lion_count_cells_outputs(LionCountPathBuild *cx)
+{
+	List	   *exprs = list_copy(cx->output_rel->reltarget->exprs);
+	bool		haveagg = false;
+	ListCell   *lc;
+
+	if (cx->having != NIL)
+		exprs = lappend(exprs, cx->having);
+	foreach(lc, exprs)
+	{
+		Node	   *node = (Node *) lfirst(lc);
+		List	   *vars;
+		ListCell   *lv;
+
+		if (list_member(cx->cellexprs, node))
+			continue;
+		if (contain_subplans(node) || contain_window_function(node))
+			return false;
+		vars = pull_var_clause(node, PVC_INCLUDE_AGGREGATES |
+							   PVC_INCLUDE_PLACEHOLDERS);
+		foreach(lv, vars)
+		{
+			Aggref	   *agg = (Aggref *) lfirst(lv);
+
+			if (!IsA(agg, Aggref) ||
+				agg->aggdistinct != NIL || agg->aggorder != NIL ||
+				agg->aggfilter != NULL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+				!lion_agg_is_count(cx->root, agg, cx->rti, cx->input_rel,
+								   NULL, 0, cx->nonnullattnos,
+								   cx->nullattnos))
+				return false;
+			haveagg = true;
+		}
+	}
+	return haveagg || cx->cellexprs != NIL;
+}
+
+/*
+ * The WHERE as the decoded walk reads it (lion_count_path_strategy()): one
+ * collected copy, every range in it a source, a positive clause to begin
+ * from, and no complement OR or residual clause.
+ */
+static bool
+lion_count_cells_strategy(LionCountPathBuild *cx)
+{
+	ListCell   *lc;
+
+	if (cx->ncompl > 0 || cx->residual != NIL || cx->nfilter > 0)
+		return false;
+	if (cx->newnegated && cx->runtimemulti)
+		return false;
+	if (cx->rangevars != NIL)
+	{
+		lion_ranges_to_sources(cx->rangepos, -1, cx->wherekinds,
+							   cx->clauseinfos);
+		cx->hasrangesrc = true;
+		cx->havepositive = true;
+	}
+	if (cx->wherekinds != NIL && !cx->havepositive)
+		return false;
+	foreach(lc, cx->clauseinfos)
+		((LionClauseInfo *) lfirst(lc))->valueout = false;
+	return true;
+}
+
+/*
+ * A PARALLEL COUNT BY CELLS: the serial node made parallel-aware below a
+ * Gather and the Finalize Agg, its participants claiming ranges of
+ * container keys as a parallel GROUP BY's do (DESIGN.md §10, "A GROUP BY in
+ * parallel") and counting every pass of the driver's walk in each, into one
+ * tally of their own whose cells go up at the end.  WORKERS as for a
+ * parallel scan of the heap, whose rows the count replaces reading; COST a
+ * participant's share of the serial count and what each of its ranges pays
+ * again (perrange), plus a cpu_tuple_cost a partial row.
+ */
+static void
+lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
+							 Cost serialrun, Cost perrange,
+							 const AggClauseCosts *costs)
+{
+	PlannerInfo *root = cx->root;
+	RelOptInfo *rel = cx->input_rel;
+	RelOptInfo *output_rel = cx->output_rel;
+	CustomPath *cpath;
+	Path	   *gather;
+	double		divisor;
+	double		rows;
+	double		totalrows;
+	uint32		ckeys;
+	int			workers;
+	int			nranges;
+
+	workers = compute_parallel_worker(rel, (double) rel->pages, -1,
+									  max_parallel_workers_per_gather);
+	if (workers <= 0)
+		return;
+	divisor = lion_parallel_divisor(workers);
+	nranges = lion_key_ranges(rel->pages, workers + 1,
+							  LION_PARALLEL_RANGE_KEYS, &ckeys);
+	totalrows = clamp_row_est((workers + 1) *
+							  lion_cells_nonempty(cx->cellplan,
+												  cx->cellwhererows /
+												  (workers + 1)));
+	rows = clamp_row_est(totalrows / divisor);
+
+	cpath = makeNode(CustomPath);
+	cpath->path.pathtype = T_CustomScan;
+	cpath->path.parent = output_rel;
+	cpath->path.pathtarget = serial->path.pathtarget;
+	cpath->path.param_info = NULL;
+	cpath->path.parallel_aware = true;
+	cpath->path.parallel_safe = true;
+	cpath->path.parallel_workers = workers;
+	cpath->path.pathkeys = NIL;
+	cpath->path.rows = rows;
+	cpath->path.startup_cost = serialrun / divisor +
+		((double) nranges / divisor) * perrange;
+	cpath->path.total_cost = cpath->path.startup_cost +
+		rows * cpu_tuple_cost;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->flags = serial->flags;
+	cpath->custom_paths = NIL;
+#if PG_VERSION_NUM >= 170000
+	cpath->custom_restrictinfo = NIL;
+#endif
+	cpath->custom_private = serial->custom_private;
+	cpath->methods = serial->methods;
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
+
+	gather = (Path *) create_gather_path(root, output_rel, &cpath->path,
+										 serial->path.pathtarget, NULL,
+										 &totalrows);
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, gather,
+							 output_rel->reltarget,
+							 (root->processed_groupClause != NIL) ?
+							 AGG_HASHED : AGG_PLAIN,
+							 AGGSPLIT_FINAL_DESERIAL,
+							 root->processed_groupClause,
+							 cx->having, costs, cx->numgroups));
+}
+
+/*
+ * Price the count by cells and add it, below core's Finalize Agg - a hashed
+ * one by the GROUP BY's expressions, or a plain one - and its parallel form
+ * where the query may run in parallel.  The price is the node's own in the
+ * units of the cheapest core path (DESIGN.md §39), the qual over the
+ * predicates evaluated once a cell.
+ */
+static void
+lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
+{
+	PlannerInfo *root = cx->root;
+	RelOptInfo *rel = cx->input_rel;
+	RelOptInfo *output_rel = cx->output_rel;
+	AggClauseCosts agg_final_costs;
+	LionUnits	units;
+	Cost		perrange = 0;
+	Cost		serialrun;
+
+	lion_units_for(root, output_rel, &units);
+	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
+								 cx->whereinor))
+		units.margin = 1.0;
+	lion_cost_cells_path(root, cpath, cx->targets, cx->whereclauses,
+						 cx->wherekinds, cx->ors, cx->cellplan,
+						 cx->cellwhererows, cx->outrows, &perrange);
+	if (cx->cellquals != NIL)
+	{
+		QualCost	qual_cost;
+
+		cost_qual_eval(&qual_cost, cx->cellquals, root);
+		cpath->path.startup_cost += qual_cost.startup;
+		cpath->path.total_cost += qual_cost.startup +
+			cx->outrows * qual_cost.per_tuple;
+	}
+	cpath->path.startup_cost = lion_units_price(&units,
+												cpath->path.startup_cost);
+	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
+	perrange = lion_units_price(&units, perrange);
+	serialrun = cpath->path.total_cost;
+
+	/* answered from the indexes alone: core's index-only switches apply */
+	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
+
+	MemSet(&agg_final_costs, 0, sizeof(agg_final_costs));
+	get_agg_clause_costs(root, AGGSPLIT_FINAL_DESERIAL, &agg_final_costs);
+
+	/*
+	 * ... in parallel first, add_path() may free the serial path: a WHERE
+	 * collected range by range, with a positive clause outside ORs and no
+	 * range taken as a source, or none at all.
+	 */
+	if (((cx->plainpositive && !cx->hasrangesrc) || cx->wherekinds == NIL) &&
+		rel->consider_parallel && output_rel->consider_parallel &&
+		is_parallel_safe(root, (Node *) cx->priv.consts) &&
+		is_parallel_safe(root, (Node *) cx->cellplan->predexprs) &&
+		is_parallel_safe(root, (Node *) cx->cellquals) &&
+		is_parallel_safe(root, (Node *) cpath->path.pathtarget->exprs))
+		lion_add_parallel_cells_path(cx, cpath, serialrun, perrange,
+									 &agg_final_costs);
+
+	add_path(output_rel, (Path *)
+			 create_agg_path(root, output_rel, &cpath->path,
+							 output_rel->reltarget,
+							 (root->processed_groupClause != NIL) ?
+							 AGG_HASHED : AGG_PLAIN,
+							 AGGSPLIT_FINAL_DESERIAL,
+							 root->processed_groupClause,
+							 cx->having, &agg_final_costs, cx->numgroups));
+}
+
+/*
+ * The build of a count by cells, from the start of the scoped phases
+ * (lion_try_count_path_scoped()): the GROUP BY's expressions, the WHERE with
+ * its clauses over predicates, the outputs, the strategy, the predicates and
+ * the driver - and then the decoded walk's targets, fill and path, of the
+ * driver's column alone.
+ */
+static void
+lion_try_count_cells(const LionCountPathBuild *cxp)
+{
+	LionCountPathBuild cx = *cxp;
+	PlannerInfo *root = cx.root;
+	RelOptInfo *rel = cx.input_rel;
+	LionCellsPlan *cp;
+	Var		   *fallback;
+	double		fbentries = 0;
+	List	   *quals = NIL;
+	CustomPath *cpath;
+	ListCell   *lc;
+
+	if (!lion_enable_count_cells || lion_partial_active())
+		return;
+	if (!lion_count_cells_group_by(&cx))
+		return;
+	cx.cells = true;
+	if (!lion_count_path_where(&cx))
+		return;
+	if (cx.cellexprs == NIL && cx.cellquals == NIL)
+		return;
+	if (!lion_count_cells_outputs(&cx))
+		return;
+	if (!lion_count_cells_strategy(&cx))
+		return;
+
+	/* the predicates, the cells they make, and the column that drives */
+	cp = lion_cells_analyze(root, rel, cx.rti,
+							list_concat_copy(cx.cellexprs, cx.cellquals));
+	if (cp == NULL)
+		return;
+	fallback = lion_count_all_driver(&cx);
+	if (fallback != NULL)
+		fbentries = estimate_num_groups(root, list_make1(fallback),
+										Max(rel->tuples, 1.0), NULL, NULL) +
+			1.0;
+	if (!lion_cells_choose_driver(root, rel, cp, fallback, fbentries))
+		return;
+
+	/* ... the decoded walk's one column, which groups nothing */
+	cx.groupvar[0] = cp->drvvar;
+	cx.groupattno[0] = cp->drvvar->varattno;
+	cx.groupeqop[0] = (cp->drv >= 0) ? cp->dims[cp->drv].priv.eqop : InvalidOid;
+	cx.groupcoll[0] = (cp->drv >= 0) ?
+		cp->dims[cp->drv].priv.collation : InvalidOid;
+	cx.groupvalueout[0] = false;
+	cx.ngroup = 1;
+	cx.decode = true;
+	cx.driveattno = cx.groupattno[0];
+	if (!lion_count_path_targets(&cx))
+		return;
+	if (list_length(cx.targets) != 1 || cx.first->driveidx[0] == NULL)
+		return;
+	if (cp->drv >= 0)
+		cp->dims[cp->drv].idx = cx.first->driveidx[0];
+	cx.cellplan = cp;
+
+	/*
+	 * The rows the WHERE's sets select - the clauses over predicates test
+	 * cells - and a partial row a cell they are in (lion_cells_nonempty()),
+	 * under the Finalize Agg; the groups at most those cells.
+	 */
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
+
+		if (!list_member_ptr(cx.cellquals, rinfo->clause))
+			quals = lappend(quals, rinfo);
+	}
+	cx.cellwhererows = clamp_row_est(Max(rel->tuples, 1.0) *
+									 clauselist_selectivity(root, quals,
+															cx.rti,
+															JOIN_INNER, NULL));
+	cx.outrows = clamp_row_est(lion_cells_nonempty(cp, cx.cellwhererows));
+	cx.numgroups = (cx.cellexprs != NIL) ?
+		clamp_row_est(Min(estimate_num_groups(root, cx.cellexprs,
+											  cx.cellwhererows, NULL, NULL),
+						  cx.outrows)) : 1.0;
+	cx.partialtarget = lion_make_partial_target(root,
+												cx.output_rel->reltarget,
+												cx.having);
+
+	lion_count_path_fill(&cx);
+	if (cx.priv.vcols != NIL)
+		return;					/* an expression column: not beside cells */
+	lion_cells_fill_priv(cp, &cx.priv, cx.cellquals);
+
+	/*
+	 * The predicates' functions, which core's plan would call computing the
+	 * GROUP BY's expressions and the node answers from posting sets
+	 * (lion_replaced_functions(); the clauses over them are the WHERE's,
+	 * there already).
+	 */
+	foreach(lc, cp->predexprs)
+		cx.priv.exec_funcs = lion_expr_functions((Node *) lfirst(lc),
+												 cx.priv.exec_funcs);
+	cpath = lion_count_path_make(&cx);
+	lion_count_cells_add(&cx, cpath);
+}
+
+/*
  * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
  * the decoded walk of §34 as well?  On the terms of three columns
  * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
@@ -4352,6 +4801,9 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 {
 	LionCountPathBuild cx = *cxp;
 	CustomPath *cpath;
+
+	/* a GROUP BY of expressions, or a WHERE over them, counted by cells */
+	lion_try_count_cells(cxp);
 
 	if (!lion_count_path_group_by(&cx))
 		return;
