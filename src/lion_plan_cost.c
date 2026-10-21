@@ -5648,7 +5648,8 @@ lion_multikey_cost_mode_ex(IndexOptInfo *idx, AttrNumber col, Node *clause,
 
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
-	state.collation = con->constcollid;
+	/* the executor's collation, not the literal's (lion_multikey_query_mode()) */
+	state.collation = lion_index_extract_collation(idx, col);
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
 
@@ -5734,7 +5735,7 @@ lion_multikey_posexact(IndexOptInfo *idx, AttrNumber col, Node *clause)
 
 	return lion_query_posexact(idx->opfamily[col - 1], idx->opcintype[col - 1],
 							   op->opno, ((Const *) arg)->constvalue,
-							   ((Const *) arg)->constcollid) &&
+							   lion_index_extract_collation(idx, col)) &&
 		lion_index_stores_positions(idx, col);
 }
 

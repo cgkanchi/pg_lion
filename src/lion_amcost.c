@@ -113,7 +113,9 @@ lion_query_is_full_scan(IndexOptInfo *index, int col, StrategyNumber strategy,
 
 	memset(&state, 0, sizeof(state));
 	state.multikey = true;
-	state.collation = index->indexcollations[col];
+	/* the executor's collation (lion_multikey_query_mode()) */
+	state.collation = lion_index_extract_collation(index,
+												   (AttrNumber) (col + 1));
 	fmgr_info(proc, &flinfo);
 	state.extractquery = flinfo;
 
