@@ -560,6 +560,40 @@ SELECT lion_nq($$SELECT count(*) FROM lion_ne_x$$, 'count');
 (1 row)
 
 DROP TABLE lion_ne_x;
+-- The plan names the driving column whichever it is: c's own `IS NOT NULL`
+-- drives here - `(all keys)` - while the first `IS NOT NULL` among the
+-- clauses is an OR's leaf, or a filtered count's, which say nothing of it
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR s <> '') AND (k <> 3 OR n IS NULL) AND c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND g <> 1$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT lion_nq($$SELECT count(*) FILTER (WHERE n IS NOT NULL), count(*) FROM lion_ne WHERE c IS NOT NULL$$, 'count');
+    lion_nq    
+---------------
+ count, 1 rows
+(1 row)
+
+SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$);
+                                                    lion_nplan                                                     
+-------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+ Lion Indexes: lion_ne_c (all keys), lion_ne_n, lion_ne_k ((n IS NOT NULL) OR (k <> 3)), lion_ne_c (c IS NOT NULL)
+(2 rows)
+
 -- 5. A dirty heap: the counts recheck, and a partitioned table sums its
 --    partitions' own drivers.
 UPDATE lion_ne SET k = 3 WHERE id % 100 = 1;
