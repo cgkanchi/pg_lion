@@ -335,8 +335,330 @@ SET client_min_messages = error;
 SELECT lion_index_verify('lion_vfy_bad_link');
 SET client_min_messages = warning;
 
+-- (7) a posting leaf flagged LION_PAGE_POSITIONS, as a page of a position
+-- tree: the root's second child, flags 0x0004 -> 0x0084.  Every reader of the
+-- set refuses such a page and ends the set there, so the counts and the scans
+-- lose every row from that leaf on - the SQL count of key 0 finds the first
+-- leaf's rows of 450000 - and verify() must report it, with heapallindexed
+-- too, whose lookup goes through the tree code that does not look at the
+-- flag.  The flags and the page id are the two uint16s at 26 and 28 of the
+-- special area.
+CREATE INDEX lion_vfy_bad_kind ON lion_vfy_badp USING lion (k);
+SELECT lion_vfy_u32('lion_vfy_bad_kind', :root,
+					lion_vfy_item('lion_vfy_bad_kind', :root, 2) + 4) AS leaf \gset
+SELECT lion_vfy_u32('lion_vfy_bad_kind', :leaf, :special + 26) & 65535 AS flags;
+SELECT lion_vfy_poke('lion_vfy_bad_kind', :leaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_kind', :leaf,
+												:special + 26) | 128));
+SET client_min_messages = error;
+SELECT lion_index_count('lion_vfy_bad_kind', 0) AS rows_of_key_0;
+SELECT lion_index_verify('lion_vfy_bad_kind');
+SELECT lion_index_verify('lion_vfy_bad_kind', true);
+SET client_min_messages = warning;
+
+-- (8) a flag no page of its kind carries: a bit no writer sets on a
+-- directory leaf, and ROOT - which only a directory page ever has - on a
+-- posting leaf.  verify() must report each, though each page still has one
+-- kind.
+CREATE INDEX lion_vfy_bad_flag ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_flag', 1, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_flag', 1,
+												:special + 26) | 1024));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_flag');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_root ON lion_vfy_badp USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_root', :leaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_root', :leaf,
+												:special + 26) | 32));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_root');
+SET client_min_messages = warning;
+
+-- (9) a position tree with an internal level (DESIGN.md §17): 600 rows of 255
+-- positions each, twenty leaves of about two heap blocks each under a root.
+-- verify() must report a downlink to the wrong leaf (the third goes to the
+-- fourth leaf), a separator below what the leaf to its left holds (a
+-- reader of that block lands on the leaf to the right, and misses the left
+-- one's last chunk), and a leaf whose min - which a tree without an internal
+-- level is routed by - is not its first chunk's header.  The root is the one
+-- internal page of the tree: flag 128, level 1; the min is at 8 of the
+-- special area.
+CREATE TEMP TABLE lion_vfy_badpos (id int4, d tsvector);
+INSERT INTO lion_vfy_badpos
+SELECT i, (SELECT string_agg('many:' || p, ' ')
+			 FROM generate_series(1, 255) p)::tsvector
+  FROM generate_series(1, 600) i;
+CREATE INDEX lion_vfy_badpos_twin ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT b AS posroot
+  FROM generate_series(1, pg_relation_size('lion_vfy_badpos_twin') /
+						   current_setting('block_size')::int8 - 1) b
+ WHERE lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 26) & 128 <> 0
+   AND lion_vfy_u32('lion_vfy_badpos_twin', b, :special + 24) & 65535 = 1 \gset
+SELECT lion_vfy_item('lion_vfy_badpos_twin', :posroot, 3) AS item3,
+	   lion_vfy_item('lion_vfy_badpos_twin', :posroot, 4) AS item4 \gset
+SELECT lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3) AS sep3,
+	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item3 + 4) AS leaf3,
+	   lion_vfy_u32('lion_vfy_badpos_twin', :posroot, :item4 + 4) AS leaf4 \gset
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_badpos_twin', true);
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_poslink ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_poslink', :posroot, :item3 + 4,
+					 lion_vfy_le32(:leaf4));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_poslink');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_possep ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_possep', :posroot, :item3,
+					 lion_vfy_le32(:sep3 - 1));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_possep');
+SET client_min_messages = warning;
+CREATE INDEX lion_vfy_bad_posmin ON lion_vfy_badpos USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_poke('lion_vfy_bad_posmin', :leaf3, :special + 8,
+					 lion_vfy_le32(:sep3 + 1));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_posmin');
+SET client_min_messages = warning;
+
+-- lion_index_stats() counts the pages of a position tree apart from the
+-- posting pages (DESIGN.md §7): 'many' is one CHAIN entry whose 600 TIDs fit
+-- one posting leaf, and its position tree is twenty leaves under a root.  In
+-- an index of two columns they are the tsvector column's, whose entry names
+-- the tree.
+SELECT container_pages, posting_internal_pages, max_posting_height,
+	   position_pages, position_internal_pages
+  FROM lion_index_stats('lion_vfy_badpos_twin');
+CREATE INDEX lion_vfy_badpos_two ON lion_vfy_badpos USING lion (id, d)
+  WITH (store_positions = true);
+SELECT attno, container_pages, posting_internal_pages, max_posting_height,
+	   position_pages, position_internal_pages
+  FROM lion_index_stats('lion_vfy_badpos_two');
+
+-- A statement's SQLSTATE and message, or 'ok'.
+CREATE FUNCTION lion_vfy_err(q text) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+	EXECUTE q;
+	RETURN 'ok';
+EXCEPTION WHEN OTHERS THEN
+	RETURN SQLSTATE || ': ' || SQLERRM;
+END $$;
+
+-- (10) an INLINE payload whose first item has a type no item has: key 1's
+-- entry is the third item of block 1, its payload follows the 12-byte header
+-- and the 4-byte key, and an item's type is the byte at 6 of its header.
+-- Every reader of the payload must raise INDEX_CORRUPTED (XX002) and say
+-- where - verify(), the count, the scans, the ordered walk - and
+-- lion_index_stats() leaves out what it cannot read: key 1's items, against
+-- a twin read and dropped first.
+CREATE TEMP TABLE lion_vfy_badi (k int4);
+INSERT INTO lion_vfy_badi SELECT i % 50 FROM generate_series(1, 20000) i;
+CREATE INDEX lion_vfy_badi_twin ON lion_vfy_badi USING lion (k);
+SELECT entries, containers + sparse_segments AS items, container_bytes
+  FROM lion_index_stats('lion_vfy_badi_twin');
+DROP INDEX lion_vfy_badi_twin;
+CREATE INDEX lion_vfy_bad_inl ON lion_vfy_badi USING lion (k);
+SELECT lion_vfy_poke('lion_vfy_bad_inl', 1,
+					 lion_vfy_item('lion_vfy_bad_inl', 1, 3) + 16 + 6, '\x7f');
+SET client_min_messages = error;
+SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_inl')$$);
+SELECT entries, containers + sparse_segments AS items, container_bytes
+  FROM lion_index_stats('lion_vfy_bad_inl');
+SELECT lion_vfy_err($$SELECT lion_index_count('lion_vfy_bad_inl', 1)$$);
+SET enable_seqscan = off;
+SELECT lion_vfy_err($$SELECT count(*) FROM lion_vfy_badi WHERE k = 1$$);
+SET pg_lion.enable_count_pushdown = off;
+SELECT lion_vfy_err($$SELECT count(*) FROM lion_vfy_badi WHERE k = 1$$);
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_vfy_err($$SELECT sum(k) FROM lion_vfy_badi WHERE k IN (1, 3)$$);
+SET enable_bitmapscan = off;
+SELECT lion_vfy_err($$SELECT k FROM lion_vfy_badi WHERE k <= 1 ORDER BY k LIMIT 600$$);
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+SET client_min_messages = warning;
+
+-- ... and a posting set copied into memory whose items are out of order: the
+-- GROUP BY count intersects key 0's set with every group, from a copy after
+-- the first (DESIGN.md §10).  The second item of the set's head gets the
+-- first one's container key, the uint32 at 0 of an item.  The copy must say
+-- where, as verify() does.
+CREATE TEMP TABLE lion_vfy_badm (k int4, g int4);
+INSERT INTO lion_vfy_badm SELECT i % 2, i % 5 FROM generate_series(1, 200000) i;
+CREATE INDEX lion_vfy_badm_g ON lion_vfy_badm USING lion (g);
+VACUUM (FREEZE, ANALYZE) lion_vfy_badm;
+CREATE INDEX lion_vfy_bad_mat ON lion_vfy_badm USING lion (k);
+SELECT lion_index_posting_root('lion_vfy_bad_mat', 0) AS head \gset
+SELECT lion_vfy_poke('lion_vfy_bad_mat', :head,
+					 lion_vfy_item('lion_vfy_bad_mat', :head, 2),
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_mat', :head,
+												lion_vfy_item('lion_vfy_bad_mat',
+															  :head, 1))));
+SET client_min_messages = error;
+SET pg_lion.enable_count_pushdown = on;
+SELECT lion_vfy_err($$SELECT g, count(*) FROM lion_vfy_badm WHERE k = 0 GROUP BY g$$);
+RESET pg_lion.enable_count_pushdown;
+SELECT lion_index_verify('lion_vfy_bad_mat');
+SET client_min_messages = warning;
+
+-- (11) the positions of an INLINE entry for a TID the entry does not hold.
+-- 'alpha' is the entry of rows 1 and 2, (0,1) and (0,2), the second item of
+-- block 1, and its positions are the last pos_len bytes of it - pos_len is
+-- the uint32 at 28, after the 12-byte header, the 9-byte key and pos_root -
+-- one chunk: an 8-byte header, its used bytes, then for each TID the delta
+-- of its code, its count of positions and the positions.  The second TID's
+-- delta, at 13 of the chunk, goes from 1 to 2: the chunk names (0,1) and
+-- (0,3), and a phrase query through the index loses row 2.  verify() must
+-- report it.
+CREATE TEMP TABLE lion_vfy_badph (id int4, d tsvector);
+INSERT INTO lion_vfy_badph
+VALUES (1, 'alpha:1 beta:2'), (2, 'alpha:1 beta:2'), (3, 'gamma:1');
+CREATE INDEX lion_vfy_bad_inlpos ON lion_vfy_badph USING lion (d)
+  WITH (store_positions = true);
+SELECT lion_vfy_item('lion_vfy_bad_inlpos', 1, 2) AS item,
+	   lion_vfy_u32('lion_vfy_bad_inlpos', 1, 24 + 4 * 1) >> 17 AS itemlen \gset
+SELECT lion_vfy_poke('lion_vfy_bad_inlpos', 1,
+					 :item + :itemlen -
+					 lion_vfy_u32('lion_vfy_bad_inlpos', 1, :item + 28) + 13,
+					 '\x02');
+SET client_min_messages = error;
+SET enable_seqscan = off;
+SELECT id FROM lion_vfy_badph WHERE d @@ 'alpha <-> beta';
+RESET enable_seqscan;
+SELECT lion_index_verify('lion_vfy_bad_inlpos');
+SET client_min_messages = warning;
+
+-- (12) INLINE entries past the meta page's inline_limit, the uint32 at 40 of
+-- block 0: each of the 50 keys holds 400 TIDs in about 800 bytes, which the
+-- build put INLINE under the limit of 4096.  At 64, every writer would have
+-- spilled them, and a rebuild would.
+CREATE INDEX lion_vfy_bad_limit ON lion_vfy_bad USING lion (k);
+SELECT lion_vfy_u32('lion_vfy_bad_limit', 0, 40) AS inline_limit;
+SELECT lion_vfy_poke('lion_vfy_bad_limit', 0, 40, lion_vfy_le32(64));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_limit');
+SET client_min_messages = warning;
+
+-- (13) the meta page's other words, each in an index of its own: the unused
+-- bucket count (36, always 0), a WAL mode the format does not have (56), an
+-- order flag it does not have (bit 8 of 60), and its two counts of pages -
+-- the directory's (52), which can be no page at all or fewer than the
+-- directory walk finds (lion_vfy_badd's has a root and six leaves), and the
+-- pages the last VACUUM could not hand out (12 of block 0's special area),
+-- which can be no more than the index has.
+CREATE FUNCTION lion_vfy_meta(tbl regclass, pos int8, val bytea)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	EXECUTE format('CREATE INDEX lion_vfy_bad_meta ON %s USING lion (k)', tbl);
+	PERFORM lion_vfy_poke('lion_vfy_bad_meta', 0, pos, val);
+	r := lion_vfy_err($q$SELECT lion_index_verify('lion_vfy_bad_meta')$q$);
+	DROP INDEX lion_vfy_bad_meta;
+	RETURN r;
+END $$;
+SET client_min_messages = error;
+SELECT what, lion_vfy_meta(tbl, pos, val) AS verify
+  FROM (VALUES ('unused bucket count', 'lion_vfy_bad'::regclass, 36, lion_vfy_le32(5)),
+			   ('wal mode', 'lion_vfy_bad', 56, lion_vfy_le32(7)),
+			   ('order flags', 'lion_vfy_bad', 61, '\x01'::bytea),
+			   ('no directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(0)),
+			   ('too few directory pages', 'lion_vfy_badd', 52, lion_vfy_le32(2)),
+			   ('pages to reuse', 'lion_vfy_bad', :special + 12, lion_vfy_le32(1000000)))
+	   v(what, tbl, pos, val);
+SET client_min_messages = warning;
+
+-- (14) a root that is not the only page of its level: lion_vfy_badd's
+-- directory is a root over six leaves, and the meta page (root at 44, height
+-- at 48) now names the first leaf as a root of height 0, with every leaf
+-- flagged ROOT (32), as the root flag check wants of the root's level.  The
+-- old root is zeroed - a page an interrupted allocation leaves, which
+-- verify() only warns of.  A writer that splits any of these leaves takes it
+-- for the root of the directory.
+CREATE INDEX lion_vfy_bad_roots ON lion_vfy_badd USING lion (k);
+SELECT lion_vfy_u32('lion_vfy_bad_roots', 0, 44) AS oldroot,
+	   lion_vfy_u32('lion_vfy_bad_roots', 0, 48) AS oldheight \gset
+SELECT :oldheight AS height;
+SELECT count(lion_vfy_poke('lion_vfy_bad_roots', b, :special + 26,
+						   lion_vfy_le32(lion_vfy_u32('lion_vfy_bad_roots', b,
+													  :special + 26) | 32)))
+	   AS leaves
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_roots') /
+						   current_setting('block_size')::int8 - 1) b
+ WHERE (lion_vfy_u32('lion_vfy_bad_roots', b, :special + 24) >> 16) & 2 = 2;
+SELECT lion_vfy_poke('lion_vfy_bad_roots', 0, 44,
+					 lion_vfy_le32(:leaf1) || lion_vfy_le32(0));
+SELECT lion_vfy_poke('lion_vfy_bad_roots', :oldroot, 0,
+					 decode(repeat('00', current_setting('block_size')::int), 'hex'));
+SET client_min_messages = error;
+SELECT lion_index_verify('lion_vfy_bad_roots');
+SET client_min_messages = warning;
+
+-- (15) DELETED pages (DESIGN.md §18, §21): what freeing a page leaves on it,
+-- and a safexid VACUUM could have given it.  Key 'big' is a CHAIN set of one
+-- container page (inline_limit = 64), and the 91 keys from key00040 on fill a
+-- directory leaf and more: VACUUM frees the set's page and deletes the leaf.
+-- A freed page is in no buffer this backend holds only once the index is
+-- moved, which copies the file: to an in-place tablespace.  Then a container
+-- page's safexid (the uint64 of its body, at 24) gets an epoch (at 28) and
+-- would never be reused; its pd_lower (the uint16 at 12) says the body holds
+-- more than the safexid; the leaf loses its right link (the uint32 at 0 of
+-- the special area), which a reader that lands on it moves right by; and its
+-- safexid (the uint32s at 8 and 12 of the special area) becomes 0, which
+-- every VACUUM would reuse at once.  The transaction ids are the cluster's.
+DROP TABLESPACE IF EXISTS lion_vfy_ts;	-- left by a run that stopped part-way
+SET allow_in_place_tablespaces = on;
+CREATE TABLESPACE lion_vfy_ts LOCATION '';
+RESET allow_in_place_tablespaces;
+CREATE TEMP TABLE lion_vfy_baddel (k text);
+INSERT INTO lion_vfy_baddel
+SELECT 'key' || lpad(i::text, 5, '0') || repeat('x', 100) FROM generate_series(1, 300) i;
+INSERT INTO lion_vfy_baddel
+SELECT CASE WHEN i % 2 = 0 THEN 'big' ELSE 'other' END FROM generate_series(1, 4000) i;
+CREATE INDEX lion_vfy_bad_delxid ON lion_vfy_baddel USING lion (k) WITH (inline_limit = 64);
+CREATE INDEX lion_vfy_bad_dellow ON lion_vfy_baddel USING lion (k) WITH (inline_limit = 64);
+CREATE INDEX lion_vfy_bad_dellink ON lion_vfy_baddel USING lion (k) WITH (inline_limit = 64);
+CREATE INDEX lion_vfy_bad_deldxid ON lion_vfy_baddel USING lion (k) WITH (inline_limit = 64);
+DELETE FROM lion_vfy_baddel WHERE k = 'big' OR k BETWEEN 'key00040' AND 'key00130';
+VACUUM lion_vfy_baddel;
+SELECT deleted_pages FROM lion_index_stats('lion_vfy_bad_delxid');
+ALTER INDEX lion_vfy_bad_delxid SET TABLESPACE lion_vfy_ts;
+ALTER INDEX lion_vfy_bad_dellow SET TABLESPACE lion_vfy_ts;
+ALTER INDEX lion_vfy_bad_dellink SET TABLESPACE lion_vfy_ts;
+ALTER INDEX lion_vfy_bad_deldxid SET TABLESPACE lion_vfy_ts;
+SELECT min(b) FILTER (WHERE f & (4 | 8) = 12) AS delcont,
+	   min(b) FILTER (WHERE f & (2 | 8) = 10) AS deldir
+  FROM (SELECT b, lion_vfy_u32('lion_vfy_bad_delxid', b, :special + 24) >> 16 AS f
+		  FROM generate_series(1, pg_relation_size('lion_vfy_bad_delxid') /
+								   current_setting('block_size')::int8 - 1) b) p \gset
+SELECT :delcont IS NOT NULL AS has_deleted_container,
+	   :deldir IS NOT NULL AS has_deleted_leaf;
+SELECT lion_vfy_poke('lion_vfy_bad_delxid', :delcont, 28, lion_vfy_le32(1));
+SELECT lion_vfy_poke('lion_vfy_bad_dellow', :delcont, 12, '\x24');
+SELECT lion_vfy_poke('lion_vfy_bad_dellink', :deldir, :special,
+					 lion_vfy_le32(4294967295));
+SELECT lion_vfy_poke('lion_vfy_bad_deldxid', :deldir, :special + 8,
+					 lion_vfy_le32(0) || lion_vfy_le32(0));
+SET client_min_messages = error;
+SELECT regexp_replace(lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_delxid')$$),
+					  '(transaction|is) [0-9]+', '\1 N', 'g') AS verify;
+SELECT lion_index_verify('lion_vfy_bad_dellow');
+SELECT lion_index_verify('lion_vfy_bad_dellink');
+SELECT regexp_replace(lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_deldxid')$$),
+					  '(transaction|is) [0-9]+', '\1 N', 'g') AS verify;
+SET client_min_messages = warning;
+DROP TABLE lion_vfy_baddel;
+DROP TABLESPACE lion_vfy_ts;
+
 RESET ignore_checksum_failure;
-DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd;
+DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
+	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph;
+DROP FUNCTION lion_vfy_meta(regclass, int8, bytea);
+DROP FUNCTION lion_vfy_err(text);
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
 DROP FUNCTION lion_vfy_poke(regclass, int8, int8, bytea);
 DROP FUNCTION lion_vfy_item(regclass, int8, int);

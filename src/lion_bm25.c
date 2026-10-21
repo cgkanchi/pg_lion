@@ -32,7 +32,10 @@
  *								(tf + k1 * (1 - b + b * |d| / avgdl))
  *		idf(t)   = ln(1 + (N - df + 0.5) / (df + 0.5))
  *
- * which is Lucene's BM25 (the "+ 1" keeps idf positive).  The query's lexemes
+ * which is Lucene's BM25 (the "+ 1" keeps idf positive), for any finite k1
+ * of at least 0 and b between 0 and 1 (lion_bm25_params_ok()).  Each term
+ * is computed with the top and the bottom of its quotient divided by k1 + 1
+ * (lion_bm25_tf_score()), which no finite k1 overflows.  The query's lexemes
  * are its operands, each counted once, except those under a NOT; its
  * operators, phrase distances and weights do not change the score, so a
  * caller who wants only the rows that match the query as a whole adds the
@@ -203,13 +206,28 @@ lion_bm25_lexemes(TSQuery query, bool *prefix)
 	return out;
 }
 
+/*
+ * Are k1 and b parameters a score can be computed with: k1 finite and at
+ * least 0, b between 0 and 1?  Neither may be NaN, which every comparison
+ * below is false for.  An infinite k1 makes every term infinity over
+ * infinity, a NaN, and a NaN score ranks below nothing: once a walk's heap
+ * is full it admits no other row, and the walk would return fewer rows than
+ * a sort of the same scores.  lion_bm25(), lion_bm25_score() and the
+ * planner of the LionBm25 scan all ask this.
+ */
+bool
+lion_bm25_params_ok(double k1, double b)
+{
+	return isfinite(k1) && k1 >= 0 && b >= 0 && b <= 1;
+}
+
 void
 lion_bm25_check_params(double k1, double b)
 {
-	if (!(k1 >= 0) || !(b >= 0 && b <= 1))
+	if (!lion_bm25_params_ok(k1, b))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("k1 must be at least 0 and b between 0 and 1")));
+				 errmsg("k1 must be a finite number of at least 0 and b between 0 and 1")));
 }
 
 static LionPosCursor *
@@ -558,18 +576,34 @@ lion_bm25_emit(ReturnSetInfo *rsinfo, Relation heap, Snapshot snapshot,
 	}
 }
 
-/* What tf occurrences of a lexeme of idf idf add to a row whose norm is norm. */
+/*
+ * What tf occurrences of a lexeme of idf idf add to a row whose norm is norm
+ * (lion_bm25_norm()): idf * tf * (k1 + 1) / (tf + k1 * L), L the row's
+ * length factor, computed as
+ *
+ *		idf * tf / (tf / (k1 + 1) + k1 / (k1 + 1) * L)
+ *
+ * The same quotient, its top and bottom divided by k1 + 1: written as the
+ * first, a large finite k1 - 1e308, say - makes both infinite and the term
+ * a NaN, as an infinite one would (lion_bm25_params_ok()).  In the second,
+ * k1 + 1 and k1 / (k1 + 1) are finite for every finite k1 of at least 0 and
+ * the bottom is above 0, tf being at least 1; and L is at least 1 / 65535,
+ * a length of at least 1 against a mean of at most 65535 (the lengths are
+ * capped there), so a term is below 2 * idf when k1 is below 1 and below
+ * 2 * idf * tf / L above it: finite for every k1 the functions take, and
+ * tending to idf * tf / L as k1 grows, as the first form does.
+ */
 static inline double
 lion_bm25_tf_score(double idf, double tf, double k1, double norm)
 {
-	return idf * tf * (k1 + 1.0) / (tf + norm);
+	return idf * tf / (tf / (k1 + 1.0) + norm);
 }
 
-/* k1 * (1 - b + b * |d| / avgdl) */
+/* k1 / (k1 + 1) * (1 - b + b * |d| / avgdl), lion_bm25_tf_score()'s norm */
 static inline double
 lion_bm25_norm(const LionBm25Query *q, double dl)
 {
-	return q->k1 * (1.0 - q->b + q->b * dl / q->avgdl);
+	return q->k1 / (q->k1 + 1.0) * (1.0 - q->b + q->b * dl / q->avgdl);
 }
 
 /* The order of a query's lexemes: by idf, then as the query has them. */
@@ -803,7 +837,9 @@ lion_bm25_score_row(const LionBm25Query *q, TSVector doc)
  *
  * A term adds less than idf * (k1 + 1) to any row, since tf / (tf + norm) is
  * below 1 (and at most 1 when k1 is 0); that, nudged up so a sum of maxima
- * rounded down cannot pass for a score, is its maximum.  Equal scores rank by
+ * rounded down cannot pass for a score, is its maximum.  For a k1 near the
+ * largest double it is infinite: then no term is ever non-essential, and
+ * every candidate is scored in full.  Equal scores rank by
  * TID and a candidate's TID is above every TID the heap holds, so a candidate
  * gets in only with a score above the heap's worst: at a bound no higher than
  * that, a row is not scored on.

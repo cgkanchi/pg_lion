@@ -1588,12 +1588,18 @@ lion_builder_to_pages(LionBuildState *bs, LionBuilder *b)
 {
 	Size		off = 0;
 	Size		used = b->inlineused;
+	const char *damage;
 
 	Assert(!b->spilled);
 	b->spilled = true;
 	b->inlineused = 0;
-	while (lion_inline_fetch(b->inlinebuf, used, &off, b->cbuf) > 0)
+	while (lion_inline_next(b->inlinebuf, used, &off, b->cbuf, &damage) > 0)
 		lion_builder_spill(bs, b, b->cbuf);
+
+	/* the build's own buffer, which only the build has written */
+	if (damage != NULL)
+		elog(ERROR, "lion index build: the item at byte %zu of a posting set being built %s",
+			 off, damage);
 }
 
 static void

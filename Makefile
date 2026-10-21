@@ -239,7 +239,7 @@ EXTRA_CLEAN += test/recovery/log
 LION_TEST_OPTIONS = -c work_mem=64MB -c maintenance_work_mem=1GB \
                     -c max_parallel_workers_per_gather=0 \
                     -c max_parallel_maintenance_workers=0 -c jit=off
-LION_TEST_EXTENSIONS = citext pageinspect pg_buffercache pg_walinspect
+LION_TEST_EXTENSIONS = citext pageinspect pg_buffercache pg_freespacemap pg_walinspect
 installcheck: export PGOPTIONS := $(PGOPTIONS) $(LION_TEST_OPTIONS)
 installcheck: lion-test-env
 .PHONY: lion-test-env

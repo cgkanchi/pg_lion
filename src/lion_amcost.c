@@ -1991,6 +1991,15 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			pfree(setcols);
 			pfree(setquals);
 		}
+
+		/*
+		 * A superset decided from stored positions is put through the
+		 * position filters at every scan, its cursors begun again and sought
+		 * to the scan's candidates (DESIGN.md §17, "The price") - a nested
+		 * loop's inner scan once a repetition.
+		 */
+		costs.indexTotalCost += lion_cost_scan_posfilter(root, path,
+														 costs.numIndexTuples);
 	}
 
 	/*

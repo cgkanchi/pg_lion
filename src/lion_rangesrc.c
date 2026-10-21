@@ -953,11 +953,11 @@ lion_range_probe_begin(Relation heap, Snapshot snapshot, int nsources,
 	 */
 	if (!((lo > 0 || hi < LION_KEYS_END) ?
 		  lion_sources_collect_range(heap, snapshot, nsources, sources,
-									 maxbytes / 2, false, lo, hi, &rp->probe,
-									 &spilled, stats) :
+									 maxbytes / 2, false, NULL, lo, hi,
+									 &rp->probe, &spilled, stats) :
 		  lion_sources_collect(heap, snapshot, nsources, sources,
-							   maxbytes / 2, false, &rp->probe, &spilled,
-							   stats)))
+							   maxbytes / 2, false, NULL, &rp->probe,
+							   &spilled, stats)))
 	{
 		MemoryContextSwitchTo(oldcxt);
 		MemoryContextDelete(cxt);

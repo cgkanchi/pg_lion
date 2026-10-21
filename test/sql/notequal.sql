@@ -288,6 +288,14 @@ SELECT lion_nq($$SELECT count(*) FROM lion_ne_x WHERE p <> 1$$, 'count');
 TRUNCATE lion_ne_x;
 SELECT lion_nq($$SELECT count(*) FROM lion_ne_x$$, 'count');
 DROP TABLE lion_ne_x;
+-- The plan names the driving column whichever it is: c's own `IS NOT NULL`
+-- drives here - `(all keys)` - while the first `IS NOT NULL` among the
+-- clauses is an OR's leaf, or a filtered count's, which say nothing of it
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$, 'count');
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR s <> '') AND (k <> 3 OR n IS NULL) AND c IS NOT NULL$$, 'count');
+SELECT lion_nq($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND g <> 1$$, 'count');
+SELECT lion_nq($$SELECT count(*) FILTER (WHERE n IS NOT NULL), count(*) FROM lion_ne WHERE c IS NOT NULL$$, 'count');
+SELECT * FROM lion_nplan($$SELECT count(*) FROM lion_ne WHERE (n IS NOT NULL OR k <> 3) AND c IS NOT NULL$$);
 
 -- 5. A dirty heap: the counts recheck, and a partitioned table sums its
 --    partitions' own drivers.

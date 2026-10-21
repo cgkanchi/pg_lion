@@ -13,6 +13,15 @@
 # Meanwhile 120,000 new rows go into the heap's free space, where the run
 # was, and need new leaves; the pages VACUUM took out are not among them
 # while the cursor's transaction lasts, and are once it has ended.
+#
+# The first VACUUM follows a checkpoint.  A plain VACUUM prunes a heap page
+# only if it can have its cleanup lock at once, and leaves the dead rows of a
+# page someone else has pinned to the next VACUUM ("tuples missed ... due to
+# cleanup lock contention"): their TIDs stay in the index, and so does the
+# leaf of each key that holds them.  The checkpointer and the background
+# writer pin a page while they write it out, and after a checkpoint there is
+# no page of the run left for them to write.  VACUUM (FREEZE), which waits for
+# the lock instead, would wait for ever on the heap page the cursor holds.
 
 setup
 {
@@ -50,6 +59,7 @@ setup
 	SET enable_seqscan = off;
 	SET pg_lion.enable_count_pushdown = off;
 }
+step s2_checkpoint	{ CHECKPOINT; }
 step s2_vacuum	{ VACUUM prc; }
 step s2_leaves	{
 	SELECT container_pages AS leaves, deleted_pages AS unlinked
@@ -79,6 +89,7 @@ step s2_reuse	{
 permutation
 	s2_leaves
 	s1_begin			# the cursor stands at id 59993
+	s2_checkpoint
 	s2_vacuum			# empties the leaves of the run and takes them out
 	s2_shape
 	s2_insert			# new leaves, and not those pages

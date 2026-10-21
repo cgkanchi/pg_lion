@@ -12,7 +12,7 @@
 
 #include "lion_count_int.h"
 
-static void lion_inline_skip(const char *payload, Size paylen, Size *off,
+static void lion_inline_skip(const LionPostingSet *set, Size *off,
 							 uint32 target, LionContainer *buf);
 
 /* ---------------------------------------------------------------------
@@ -82,8 +82,7 @@ lion_cursor_init_at(LionSetCursor *cur, const LionPostingSet *set,
 		cur->cbuf = (LionContainer *) palloc(lion_inline_stage_size(set->paylen));
 		cur->payoff = 0;
 		if (target > 0)
-			lion_inline_skip(set->payload, set->paylen, &cur->payoff, target,
-							 cur->cbuf);
+			lion_inline_skip(set, &cur->payoff, target, cur->cbuf);
 		/* borrowed, not owned: the LionPostingSet releases it */
 		cur->pinbuf = set->pinbuf;
 		cur->ownpin = false;
@@ -208,8 +207,9 @@ lion_cursor_next_item(LionSetCursor *cur)
 
 	if (cur->set->is_inline)
 	{
-		if (lion_inline_fetch(cur->set->payload, cur->set->paylen,
-							 &cur->payoff, cur->cbuf) == 0)
+		if (lion_inline_fetch(cur->set->index, cur->set->entryblk,
+							  cur->set->entryoff, cur->set->payload,
+							  cur->set->paylen, &cur->payoff, cur->cbuf) == 0)
 			return NULL;		/* payload exhausted; the set keeps its pin */
 		return cur->cbuf;
 	}
@@ -456,8 +456,8 @@ lion_cursor_next(LionSetCursor *cur)
 }
 
 /*
- * Skip a packed INLINE payload forward to the first item that can hold
- * `target`, leaving *off in front of it.
+ * Skip the packed INLINE payload of set forward to the first item that can
+ * hold `target`, leaving *off in front of it.
  *
  * DEVIATION from DESIGN.md §22, which said an INLINE set would seek by binary
  * search: an inline payload is a sequence of items packed without padding and
@@ -467,12 +467,13 @@ lion_cursor_next(LionSetCursor *cur)
  * would have to make that very pass to build itself.
  */
 static void
-lion_inline_skip(const char *payload, Size paylen, Size *off, uint32 target,
+lion_inline_skip(const LionPostingSet *set, Size *off, uint32 target,
 				 LionContainer *buf)
 {
 	Size		prev = *off;
 
-	while (lion_inline_fetch(payload, paylen, off, buf) > 0)
+	while (lion_inline_fetch(set->index, set->entryblk, set->entryoff,
+							 set->payload, set->paylen, off, buf) > 0)
 	{
 		if (lion_item_last_ckey(buf) >= target)
 		{
@@ -609,8 +610,7 @@ lion_cursor_seek(LionSetCursor *cur, uint32 target)
 		cur->matidx = lion_mat_seek(cur->set->mat, cur->matidx, target);
 	}
 	else if (cur->set->is_inline)
-		lion_inline_skip(cur->set->payload, cur->set->paylen, &cur->payoff,
-						 target, cur->cbuf);
+		lion_inline_skip(cur->set, &cur->payoff, target, cur->cbuf);
 	else
 		lion_cursor_seek_leaf(cur, target);
 

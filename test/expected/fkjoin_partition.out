@@ -696,6 +696,49 @@ SELECT (SELECT count(*) FROM (TABLE lion_xj_g1 EXCEPT ALL
 
 RESET pg_lion.enable_count_pushdown;
 DEALLOCATE lion_xj_q;
+/*
+ * A fact filter that is an OR with an arm on an IN list over a stable
+ * expression: the generic plan is made under lion_test.kinds = 'a', and no
+ * partition's bounds refute the arm, or imply its kind = ANY (...), by the
+ * value the expression has then (§16, "OR arms the partition bounds
+ * refute"), since the plan runs under 'b' as well.  The partitions with no
+ * index on kind then decline it, and the ordinary plan answers.
+ */
+SET lion_test.kinds = 'a';
+PREPARE lion_xj_s AS
+	SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk
+	 WHERE (f.kind = ANY (string_to_array(current_setting('lion_test.kinds'), ',')) AND f.x = 3)
+		OR f.tags && '{t1}'
+	 GROUP BY d.attr;
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SELECT lion_xj_plans('EXECUTE lion_xj_s') AS pushed_down;
+ pushed_down 
+-------------
+ f
+(1 row)
+
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET lion_test.kinds = 'b';
+CREATE TEMP TABLE lion_xj_s1 AS EXECUTE lion_xj_s;
+RESET plan_cache_mode;
+SET pg_lion.enable_count_pushdown = off;
+SELECT (SELECT count(*) FROM (TABLE lion_xj_s1 EXCEPT ALL
+		SELECT d.attr, count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk
+		 WHERE (f.kind = 'b' AND f.x = 3) OR f.tags && '{t1}' GROUP BY d.attr) a) AS diff,
+	   (SELECT count(*) FROM lion_xj_s1) AS groups;
+ diff | groups 
+------+--------
+    0 |      8
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE lion_xj_s;
+RESET lion_test.kinds;
 SET max_parallel_workers_per_gather = 2;
 -- a correlated subquery that rescans the node with a new fact filter
 SELECT lion_xj('SELECT v.x, (SELECT count(*) FROM lion_xf f JOIN lion_xd d ON f.fk = d.pk WHERE d.region = ''us'' AND f.kind IN (''a'', ''b'') AND f.x = v.x) FROM (VALUES (1), (4), (8)) v(x)');

@@ -75,7 +75,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 	int			noffs = 0;
 	int			offcap;
 	bool		ok = true;
-	bool		sorted = true;
+	uint32		prevlast = 0;	/* the last ckey of the item copied last */
 	int			i;
 	LionRightWalk walk;
 
@@ -162,6 +162,20 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 				offs = (Size *) repalloc(offs, sizeof(Size) * offcap);
 			}
 
+			/*
+			 * Chains are built and maintained in ascending ckey order, with
+			 * item ranges that never overlap (DESIGN.md §13); the merge would
+			 * silently under-count a copy that is not, which is worth one
+			 * comparison per item to rule out, where the item is known.
+			 */
+			if (noffs > 0 && lion_item_first_ckey(c) <= prevlast)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("lion index \"%s\": item %u on container page %u does not sort after the item before it in the posting set at %u",
+								RelationGetRelationName(ps->index), off, imgblk,
+								ps->head)));
+			prevlast = lion_item_last_ckey(c);
+
 			memcpy(buf + used, c, sz);
 			offs[noffs++] = used;
 			used += MAXALIGN(sz);
@@ -222,23 +236,7 @@ lion_posting_set_materialize(LionPostingSet *ps, Size maxbytes)
 		mat->containers = (LionContainer **)
 			palloc(sizeof(LionContainer *) * Max(noffs, 1));
 		for (i = 0; i < noffs; i++)
-		{
 			mat->containers[i] = (LionContainer *) (buf + offs[i]);
-			if (i > 0 &&
-				lion_item_first_ckey(mat->containers[i]) <=
-				lion_item_last_ckey(mat->containers[i - 1]))
-				sorted = false;
-		}
-
-		/*
-		 * Chains are built and maintained in ascending ckey order, with item
-		 * ranges that never overlap (DESIGN.md §13), so this never fires; the
-		 * merge would silently under-count if it ever did, which is worth one
-		 * comparison per item to rule out.
-		 */
-		if (!sorted)
-			elog(ERROR, "lion index: containers of \"%s\" are out of order",
-				 RelationGetRelationName(ps->index));
 
 		ps->mat = mat;
 	}
