@@ -48,3 +48,8 @@ SELECT lion_hooktest_priv_decode('cells value outcome');
 SELECT lion_hooktest_priv_decode('cells predicate dimension');
 SELECT lion_hooktest_priv_decode('cells predicate truths');
 SELECT lion_hooktest_priv_decode('cell predicate without cells');
+-- the anti join over a small inner side without the child it reads, with no
+-- key to look up, and a column of its inner side in a plan without one
+SELECT lion_hooktest_priv_decode('anti join without its child');
+SELECT lion_hooktest_priv_decode('anti join of no key');
+SELECT lion_hooktest_priv_decode('inner column without an anti join');

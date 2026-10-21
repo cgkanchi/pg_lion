@@ -436,6 +436,14 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 		lion_eval_clause_values(st);
 
 	/*
+	 * The anti join over a small inner side (DESIGN.md §27): its child read
+	 * and its keys looked up before the count holds a pin, once a run; what
+	 * the rows found subtract comes off the rows the count emits.
+	 */
+	if (st->anti != NULL)
+		lion_anti_run(st);
+
+	/*
 	 * ---- the FK-side join: one partial row per dimension row ----
 	 *
 	 * The join over a partitioned fact table takes each batch of keys to
@@ -865,6 +873,9 @@ lion_rescan_custom_scan(CustomScanState *node)
 				ExecReScan(js->filterps[i]);
 		}
 	}
+
+	/* the anti join's child, and its run made again (DESIGN.md §27) */
+	lion_anti_rescan(st, node);
 }
 
 /*
@@ -934,6 +945,7 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	SpinLockInit(&shared->mutex);
 	shared->filterrows = -1;
 	pg_atomic_init_u32(&shared->nextchunk, 0);
+	pg_atomic_init_u32(&shared->antiowner, 0);
 	st->shared = shared;
 
 	/*
@@ -1027,6 +1039,7 @@ lion_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	LionJoinState *js = st->join;
 
 	pg_atomic_write_u32(&shared->nextchunk, 0);
+	pg_atomic_write_u32(&shared->antiowner, 0);
 	SpinLockAcquire(&shared->mutex);
 	shared->sortedruns += shared->sorted;
 	shared->sorted = 0;
@@ -1197,6 +1210,15 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		shared->groupsbatched += st->groupsbatched;
 		if (st->fg != NULL)
 			shared->factgroupcounts += st->fg->groupcounts;
+		if (st->anti != NULL)
+		{
+			shared->antichildrows += st->anti->childrows;
+			shared->antilookups += st->anti->lookups;
+			shared->antifetched += st->anti->fetched;
+			shared->antisubtracted += st->anti->subtracted;
+			for (i = 0; i < 2; i++)
+				INSTR_TIME_ADD(shared->antitime[i], st->anti->time[i]);
+		}
 		SpinLockRelease(&shared->mutex);
 		st->reported = true;
 		return;
@@ -1237,6 +1259,15 @@ lion_shutdown_custom_scan(CustomScanState *node)
 	}
 	if (st->fg != NULL)
 		st->fg->workergroupcounts = shared->factgroupcounts;
+	if (st->anti != NULL)
+	{
+		st->anti->wchildrows = shared->antichildrows;
+		st->anti->wlookups = shared->antilookups;
+		st->anti->wfetched = shared->antifetched;
+		st->anti->wsubtracted = shared->antisubtracted;
+		for (i = 0; i < 2; i++)
+			st->anti->wtime[i] = shared->antitime[i];
+	}
 	SpinLockRelease(&shared->mutex);
 }
 
@@ -1250,6 +1281,8 @@ lion_end_custom_scan(CustomScanState *node)
 	/* the leader's share of the list pin budget is its whole again */
 	if (st->shared != NULL && !IsParallelWorker())
 		lion_list_pin_participants(1);
+
+	lion_anti_end(st);
 
 	if (st->join != NULL)
 	{

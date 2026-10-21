@@ -251,6 +251,17 @@
 #define LION_TL_IS_CELLPRED(kind)	((kind) >= 0x50000000 && (kind) < 0x60000000)
 #define LION_TL_CELLPRED_NO(kind)	((kind) - 0x50000000)
 
+/*
+ * A column of the anti join's inner side (DESIGN.md §27, "The anti join over
+ * a small inner side"): LION_TL_ANTI(resno) is the column at position `resno`
+ * of the child's target list, which the node reads from each child row to
+ * look its keys up and test its clauses, and which no row it emits prints.
+ * Above the cells' predicates' range.
+ */
+#define LION_TL_ANTI(resno)			(0x60000000 + (resno))
+#define LION_TL_IS_ANTI(kind)		((kind) > 0x60000000 && (kind) < 0x60010000)
+#define LION_TL_ANTI_RESNO(kind)	((AttrNumber) ((kind) - 0x60000000))
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -1259,7 +1270,22 @@ typedef struct LionVColScope
  *		each outcome}.  In the PATH's list only, a List of the predicates'
  *		expressions and a List of the WHERE clauses over them, which
  *		lion_plan_custom_path() makes LION_TL_CELLPRED columns and the qual
- *	24	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	24	List, or empty: the anti join over a small inner side (DESIGN.md
+ *		§27, "The anti join over a small inner side"), whose inner side is
+ *		the plan's one child: an IntList of its LION_ANTIFLAG_* bits, the
+ *		number of the B-tree's scan keys, of the join clauses and of the
+ *		table's restrictions it tests, and each scan key's column in the
+ *		B-tree; an OidList of the B-tree, each scan key's operator - the
+ *		table's column its left operand - and collation, and the equality
+ *		operator and collation of each of the two GROUP BY columns of member
+ *		2 (InvalidOid where there is none); and, in the PATH's list only, a
+ *		List of the scan keys' values - expressions of the inner side - then
+ *		the join clauses, then the restrictions.  lion_plan_custom_path()
+ *		appends those to custom_exprs after the residual clauses, where
+ *		setrefs.c points their columns at custom_scan_tlist - the table's at
+ *		LION_TL_RESID columns or the ones the target list prints, the inner
+ *		side's at LION_TL_ANTI ones - and leaves the list two members long
+ *	25	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1286,7 +1312,8 @@ typedef struct LionVColScope
 #define LION_PRIV_RESID		21
 #define LION_PRIV_PARTIAL	22
 #define LION_PRIV_CELLS		23
-#define LION_PRIV_TLKINDS	24
+#define LION_PRIV_ANTI		24
+#define LION_PRIV_TLKINDS	25
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1391,6 +1418,10 @@ typedef struct LionVColScope
  * and the LION_TL_CELLPRED columns: counts by cells (DESIGN.md §10, "Counts
  * by cells"), whose one walked column groups nothing.
  *
+ * Shape 29 added the ANTI member (24) in front of the target-list kinds, and
+ * the LION_TL_ANTI columns: the anti join over a small inner side (DESIGN.md
+ * §27), whose matched rows an older build would have counted.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1403,8 +1434,17 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491c
-#define LION_PRIV_NMEMBERS	25
+#define LION_PRIV_MAGIC		0x5242491d
+#define LION_PRIV_NMEMBERS	26
+
+/*
+ * The anti join over a small inner side (LION_PRIV_ANTI): its scan keys at
+ * most, and its flag bits.
+ */
+#define LION_MAX_ANTI_KEYS	8
+#define LION_ANTIFLAG_TIDS	0x01	/* two lookups may find one row: the rows
+									 * matched are kept by TID, each counted
+									 * once */
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2260,6 +2300,29 @@ typedef struct LionCountPrivJoin
 													 * PLAN stage */
 } LionCountPrivJoin;
 
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"): ANTI.  Its expressions are in custom_exprs at the PLAN
+ * stage, after the residual clauses, nkey + njoin + nrestrict of them.
+ */
+typedef struct LionCountPrivAnti
+{
+	int			flags;			/* LION_ANTIFLAG_* */
+	Oid			idxoid;			/* the B-tree the keys are looked up in */
+	int			nkey;			/* its scan keys */
+	AttrNumber	keycol[LION_MAX_ANTI_KEYS];	/* ... each one's column there */
+	Oid			keyop[LION_MAX_ANTI_KEYS];	/* ... operator, column on the
+											 * left */
+	Oid			keycoll[LION_MAX_ANTI_KEYS];	/* ... and collation */
+	int			njoin;			/* the join clauses */
+	int			nrestrict;		/* the table's restrictions, tested again on
+								 * each row a key finds */
+	Oid			groupeq[2];		/* the GROUP BY columns' equality operators */
+	Oid			groupcoll[2];	/* ... and collations */
+	List	   *exprs;			/* PATH stage only: the keys' values, the join
+								 * clauses and the restrictions */
+} LionCountPrivAnti;
+
 /* A column the aggregates of DESIGN.md §37 are taken over: WAGG's lists */
 typedef struct LionCountPrivWCol
 {
@@ -2455,6 +2518,10 @@ typedef struct LionCountPriv
 	int			celldrv;		/* the driver's dimension, or -1 */
 	List	   *cellexprs;		/* the predicates: PATH stage only */
 	List	   *cellquals;		/* the WHERE over them: PATH stage only */
+
+	bool		hasanti;		/* ANTI (§27, "The anti join over a small
+								 * inner side") */
+	LionCountPrivAnti anti;
 
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
@@ -2882,6 +2949,13 @@ typedef struct LionCountScanState
 	int64		workerdirpages;
 
 	/*
+	 * The anti join over a small inner side (DESIGN.md §27, "The anti join
+	 * over a small inner side"): its child, its lookups and what they
+	 * subtract, or NULL for every other shape.
+	 */
+	struct LionAntiState *anti;
+
+	/*
 	 * The FK-side join grouped by a fact column (DESIGN.md §27, "Grouped by a
 	 * fact column"), or NULL for every other shape (lion_st_fg()).
 	 */
@@ -3060,12 +3134,130 @@ typedef struct LionJoinShared
 	int64		listbatches;
 	int64		summaries;
 	int64		rangeprobed;
+	int64		antichildrows;	/* the anti join over a small inner side */
+	int64		antilookups;
+	int64		antifetched;
+	int64		antisubtracted;
+	instr_time	antitime[2];
+	pg_atomic_uint32 antiowner; /* ... and whether a participant has claimed
+								 * its subtraction */
 	pg_atomic_uint32 nextchunk;
 	int			participants;
 	int			nranges;
 	uint32		ckeys;
 	bool		copyready;		/* a LionSharedCopy follows this struct */
 } LionJoinShared;
+
+/*
+ * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
+ * small inner side"), as one participant runs it: its child, the inner rows'
+ * keys, the B-tree they are looked up in, and what the rows found subtract -
+ * from the one row of an ungrouped count, or from each group they are of.
+ *
+ * The run (lion_anti_run()) is made once, before the count's first row: it
+ * reads the child whole, keeping each distinct inner row once under the
+ * values of its scan keys (LionAntiKeyEnt), looks each key up, and tests every
+ * row found - the join clauses and the table's restrictions, over the row's
+ * columns and the inner row's - in evalslot, which has the node's scan tuple
+ * descriptor: the table's columns at outerpos[], the inner side's at
+ * innerpos[].  Of a parallel count one participant runs it, the one that
+ * claims it first (LionJoinShared.antiowner), and the others subtract nothing.
+ */
+typedef struct LionAntiInner
+{
+	struct LionAntiInner *next;
+	Datum	   *values;			/* the inner side's columns, ninner */
+	bool	   *isnull;
+} LionAntiInner;
+
+typedef struct LionAntiKeyEnt
+{
+	struct LionAntiKeyEnt *next;	/* in its bucket */
+	struct LionAntiKeyEnt *link;	/* in the order they were made */
+	uint32		hash;
+	Datum	   *keys;			/* the scan keys' values, none NULL */
+	LionAntiInner *inner;		/* the distinct inner rows of the keys */
+} LionAntiKeyEnt;
+
+typedef struct LionAntiGroup
+{
+	struct LionAntiGroup *next;
+	uint32		hash;
+	Datum		key[2];
+	bool		isnull[2];
+	int64		n;				/* the rows the group is to lose */
+} LionAntiGroup;
+
+typedef struct LionAntiState
+{
+	PlanState  *child;
+	Oid			idxoid;
+	Relation	index;			/* opened at the first run */
+	TupleTableSlot *heapslot;	/* ... and the table's slot for its rows */
+	bool		tids;			/* LION_ANTIFLAG_TIDS */
+
+	int			nkey;
+	ScanKeyData *scankeys;
+	AttrNumber *keycol;
+	Oid		   *keyop;
+	Oid		   *keycoll;
+	ExprState **keystate;		/* the keys' values, over a child row */
+	int16	   *keylen;
+	bool	   *keybyval;
+
+	ExprState  *qual;			/* the join clauses and the restrictions */
+	List	   *joinexprs;		/* ... for EXPLAIN */
+	List	   *restrictexprs;
+
+	TupleTableSlot *evalslot;
+	ExprContext *econtext;
+	int			ninner;
+	int		   *innerpos;
+	AttrNumber *innerresno;
+	int16	   *innerlen;
+	bool	   *innerbyval;
+	int			nouter;
+	int		   *outerpos;
+	AttrNumber *outerattno;
+
+	int			ngroup;			/* the GROUP BY columns: 0, 1 or 2 */
+	AttrNumber	groupattno[2];
+	FmgrInfo	groupeq[2];
+	FmgrInfo	grouphash[2];
+	Oid			groupcoll[2];
+	int16		grouplen[2];
+	bool		groupbyval[2];
+
+	MemoryContext cxt;			/* the run's: keys, inner rows, groups, TIDs */
+	bool		ran;
+	bool		owner;			/* this participant subtracts */
+	int64		total;			/* an ungrouped count's subtraction */
+
+	LionAntiKeyEnt **kbuckets;
+	int			knbuckets;
+	int64		nkeys;
+	LionAntiKeyEnt *kfirst;
+	LionAntiKeyEnt *klast;
+
+	LionAntiGroup **gbuckets;
+	int			gnbuckets;
+	int64		ngroups;
+
+	HTAB	   *tidset;
+
+	/* EXPLAIN ANALYZE's counters, and a parallel plan's workers' sums */
+	bool		timing;
+	int64		childrows;
+	int64		lookups;
+	int64		fetched;
+	int64		subtracted;
+	instr_time	time[2];		/* the child's rows, the lookups */
+	int64		wchildrows;
+	int64		wlookups;
+	int64		wfetched;
+	int64		wsubtracted;
+	instr_time	wtime[2];
+} LionAntiState;
 
 /*
  * The shared copy of the fact filters, right after the struct above - or,
@@ -3658,6 +3850,10 @@ extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
 								const LionFkJoin *fj);
 extern void lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
 								   RelOptInfo *output_rel);
+extern void lion_try_count_anti_path(PlannerInfo *root, RelOptInfo *input_rel,
+									 RelOptInfo *output_rel,
+									 GroupPathExtraData *extra,
+									 const LionSmallAnti *anti);
 
 /* lion_plan_gsets.c */
 extern void lion_try_gsets_path(PlannerInfo *root, RelOptInfo *input_rel,
@@ -3773,6 +3969,45 @@ extern void lion_end_custom_scan(CustomScanState *node);
 /* lion_exec_explain.c */
 extern void lion_explain_custom_scan(CustomScanState *node, List *ancestors,
 									 ExplainState *es);
+
+/* lion_exec_anti.c */
+extern void lion_begin_anti(LionCountScanState *st, CustomScanState *node,
+							CustomScan *cscan, const LionCountPriv *priv,
+							List *exprs, EState *estate, int eflags);
+extern int	lion_anti_nexprs(const LionCountPriv *priv);
+extern void lion_anti_run(LionCountScanState *st);
+extern bool lion_anti_adjust(LionCountScanState *st, int nkeys,
+							 const Datum *keys, const bool *keyisnull,
+							 int64 *count);
+extern void lion_anti_rescan(LionCountScanState *st, CustomScanState *node);
+extern void lion_anti_end(LionCountScanState *st);
+extern void lion_explain_anti(LionCountScanState *st, List *ancestors,
+							  ExplainState *es);
+extern void lion_explain_anti_counters(LionCountScanState *st,
+									   ExplainState *es);
+
+/*
+ * lion_plan_anti.c: the B-tree the anti join over a small inner side looks
+ * its keys up in, and the price of the lookups (DESIGN.md §27, "The anti join
+ * over a small inner side").
+ */
+typedef struct LionAntiPlan
+{
+	IndexOptInfo *idx;
+	int			nkey;
+	AttrNumber	keycol[LION_MAX_ANTI_KEYS];
+	Oid			keyop[LION_MAX_ANTI_KEYS];
+	Oid			keycoll[LION_MAX_ANTI_KEYS];
+	Node	   *keyexpr[LION_MAX_ANTI_KEYS];	/* the inner side's values */
+	Var		   *keyvar[LION_MAX_ANTI_KEYS];	/* ... and the table's columns */
+	bool		tids;			/* LION_ANTIFLAG_TIDS */
+	double		lookups;		/* the distinct keys looked up */
+	double		fetched;		/* the rows the lookups find */
+	Cost		cost;			/* the lookups' own price, the child's not */
+} LionAntiPlan;
+
+extern bool lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti,
+							 List *restrictions, int ngroup, LionAntiPlan *out);
 
 extern const CustomPathMethods lion_antijoin_path_methods;
 
