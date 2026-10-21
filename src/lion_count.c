@@ -611,6 +611,22 @@ lion_window_past(const LionCountCtx *cx, uint32 ckey)
  * posting tree's root, which a set keeps for the life of the index (§18),
  * and a page that no longer belongs to the set ends the walk.
  *
+ * A COLLECTED set (lion_sources_collect(), lion_union_collect()) has no chain
+ * to fall back on: it is the union of many entries' sets, or the intersection
+ * of several sources, copied into memory or a file, and nothing pins a page
+ * its TIDs came from.  It is counted beside a source that carries the
+ * interlock wherever the node can arrange one - the filtered count's run
+ * whose one source is an IN list too long to locate at once is a sum over
+ * the driving walk (lion_run_has_plain_source(); DESIGN.md §15, "A list too
+ * long to locate at once") - but a count handed one on its own is exact too:
+ * the map is asked nothing and every member goes to the heap recheck under
+ * the snapshot (LionCountCtx.novm), as the merge does for a count none of
+ * whose positive sources is pinned.  That is the copy's own argument
+ * (lion_sources_collect()): it was made after the snapshot was taken, so it
+ * lacks no row the snapshot sees, and a TID it still lists whose row VACUUM
+ * has since removed - and whose line pointer a later row may have taken - is
+ * a row no snapshot that old sees.
+ *
  * An existence test (DESIGN.md §26) stops after the first container that
  * settles it; the cursor has moved on by then, which is where the §9 ordering
  * says it may.
@@ -621,6 +637,7 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 	LionPostingSet fresh;
 	LionSetCursor cur;
 	bool		relocated = false;
+	bool		novm = cx->novm;
 
 	if (ps->nopin)
 	{
@@ -634,20 +651,16 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		Assert(ps->found && !ps->is_inline);
 
 		/*
-		 * A COLLECTED intersection (lion_sources_collect()) has no chain to
-		 * fall back on, and is only ever COUNTED beside a located set that
-		 * carries the interlock (DESIGN.md §27).  A collection is no count:
-		 * it asks the visibility map nothing and needs no pin
-		 * (lion_count_container_vm()), so it copies such a set as it stands.
-		 * That is what the FK-side join does when its one fact filter is a
-		 * range already collected into memory (§32): one source of one set,
-		 * the shape this function is the shortcut for.  It used to be refused
-		 * here, and the join's first row failed.
+		 * A COLLECTED set has no chain to fall back on (above).  A collection
+		 * of one asks the visibility map nothing and needs no pin
+		 * (lion_count_container_vm()), so it copies the set as it stands -
+		 * the FK-side join's, when its one fact filter is a range or a list
+		 * already collected (§32).  A count of one trusts no map.
 		 */
 		if (!BlockNumberIsValid(ps->head))
 		{
 			if (cx->collect == NULL)
-				elog(ERROR, "lion index: a collected posting set counted on its own");
+				cx->novm = true;
 		}
 		else
 		{
@@ -673,6 +686,7 @@ lion_count_one_set(LionCountCtx *cx, LionPostingSet *ps)
 		CHECK_FOR_INTERRUPTS();
 	}
 	lion_cursor_close(&cur);
+	cx->novm = novm;
 
 	if (relocated)
 		lion_posting_set_release(&fresh);
@@ -2773,7 +2787,9 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 	 * removed a TID the copies still list and set its heap page all-visible,
 	 * so the map is not asked at all and every candidate goes to the heap,
 	 * as on a standby.  The sum and the one-set count do not need this: they
-	 * locate a NOPIN set again, pinned, before they count it.
+	 * locate a NOPIN set again, pinned, before they count it - all but a
+	 * collected set, which has no entry to locate, and which the one-set
+	 * count reads the same way (lion_count_one_set()).
 	 *
 	 * The same goes for a union too wide for the open budget, which is read
 	 * without pins (lion_wide_fill()).  Whether any positive source carries

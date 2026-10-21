@@ -5077,11 +5077,19 @@ size" where the ordinary plan answers. Two things now:
   that does not fit what the sources collected before it left sends them to files, as a range does
   (`lion_collect_within()`). A value in two batches is ORed in twice, which a union takes once. The
   union is one pinless set, counted beside a source that carries the §9 interlock or rechecked in
-  the heap, as a list too wide for the open budget always was ("Bounded cursors"). EXPLAIN ANALYZE
-  prints `Lists Collected` and `Lists Spilled`. A list under an OR, which is no disjoint union and
-  whose leaves are not collected, and the list on the grouping column that drives the groups, which
-  needs each value's set, are held whole, in a huge allocation, so that they answer at any length
-  the array itself can have instead of failing at nine million values.
+  the heap, as a list too wide for the open budget always was ("Bounded cursors"). So a filtered
+  count's run whose one source that selects rows is the list - `count(*) FILTER (WHERE k = ANY
+  ($1))` in a node that sums every entry for its run 0 (§10, "Filtered counts"), which takes no
+  batches - is counted as a run whose source is a range taken as a source is: the sum over the
+  driving walk's entries, each ANDed with the union, the walk carrying the interlock
+  (`lion_run_has_plain_source()`). On its own the union would have nothing pinned beside it, and
+  every row of it would go to the heap (`lion_count_one_set()`): on an all-visible heap of 3 million
+  rows, 50,000 values spread over all of it took 72 to 79 ms that way, reading every heap page,
+  against 49 ms for the sum, which reads none. EXPLAIN ANALYZE prints `Lists Collected` and `Lists
+  Spilled`. A list under an OR, which is no disjoint union and whose leaves are not collected, and
+  the list on the grouping column that drives the groups, which needs each value's set, are held
+  whole, in a huge allocation, so that they answer at any length the array itself can have instead
+  of failing at nine million values.
 
 What a batched or collected list still holds per value is the values: the array, and for a batched
 one a Datum and a hash each - what the executor's own `= ANY` holds, and core's B-tree scan of the
@@ -11462,16 +11470,19 @@ not set that block all-visible, so the TID goes to the heap recheck and the snap
 copy cannot lack a row the snapshot sees: it is made after the snapshot was taken, and a visible
 row was in every index before its transaction committed. An fk set located over the pin budget
 (NOPIN, §15) carries no interlock, and then nothing does: the merge finds no pinned positive source
-and rechecks every candidate (`cx->novm`), as any count does. `lion_count_one_set()` refuses to
-COUNT a collected set on its own, which no caller does; it copies one for a collection, which asks
-the map nothing. That is the copy of fact filters that are one range already collected into memory
-(§32): one source of one set, which the one-set shortcut takes, and which it used to refuse as a
-count, failing the join before its first row (2026-09-28; `fkjoin_walk.sql` pins it with the range
-source's and the copy's counters). `test/isolation/fkjoin_vacuum_race.spec`
-proves it the way `count_distinct_vacuum_race.spec` proves the existence test: the copy lists
-fk = 0's dead rows, the first count parks at `lion-count-containers-pinned` with fk = 0's set
-pinned, the VACUUM that would remove those rows waits for the pin, and the answers - semi join and
-inner join - exclude fk = 0 and include the rows deleted after the snapshot.
+and rechecks every candidate (`cx->novm`), as any count does. `lion_count_one_set()` copies a
+collected set as it stands for a collection, which asks the map nothing: the copy of fact filters
+that are one range or one list already collected (§32), one source of one set, which the one-set
+shortcut takes (`fkjoin_walk.sql` pins it with the range source's and the copy's counters). It
+COUNTS one on its own as the merge counts a source nothing pinned carries: the map is asked nothing
+and every member is rechecked in the heap (`cx->novm`). The node arranges a carrier where it can -
+a filtered count's run whose one source is a collected list is a sum over the driving walk (§15, "A
+list too long to locate at once") - so that is the count's fallback, exact wherever it is reached.
+`test/isolation/fkjoin_vacuum_race.spec` proves it the way `count_distinct_vacuum_race.spec` proves
+the existence test: the copy lists fk = 0's dead rows, the first count parks at
+`lion-count-containers-pinned` with fk = 0's set pinned, the VACUUM that would remove those rows
+waits for the pin, and the answers - semi join and inner join - exclude fk = 0 and include the rows
+deleted after the snapshot.
 
 The choice between the copy and the probes is the cost model's, per path, and the plan carries it:
 the join member of `custom_private` became `{clause, kind of join, flags [, child column]}` with
@@ -12458,8 +12469,9 @@ path with the first two changes above. It cannot be had at that price:
 
 - As stated, it breaks §9. The accumulator is a collected set; once the keys' pins are gone,
   nothing carries the interlock for the TIDs it holds, and the copy is never counted beside
-  anything else - where a collected set is only ever counted beside a located set that carries
-  the interlock.
+  anything else - where a collected set is otherwise counted beside a located set that carries
+  the interlock, or on its own with every row rechecked in the heap, which is the very cost the
+  map is asked to spare.
 - Keeping the interlock by keeping the pins: every set in the accumulator would hold its pin
   until the AND - an INLINE set its directory leaf, a CHAIN set every leaf its cursor crossed,
   which the cursor lets go of now as it moves on. The pins are bounded by the list pin budget (at

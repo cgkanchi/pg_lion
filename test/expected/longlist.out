@@ -42,13 +42,15 @@ VACUUM ANALYZE lion_llp;
  * sorting and hashing are disabled too: a grouped plain plan then carries one
  * disable more than the node.  Before PostgreSQL 18 a disable is disable_cost
  * on the price, and add_path() takes two prices that both hold it once as
- * equal, which a plain plan's sorted output would win.
+ * equal, which a plain plan's sorted output would win.  The sequential scan
+ * runs serially, whatever max_parallel_workers_per_gather says.
  */
 CREATE FUNCTION lion_llcmp(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	l text;
 	pushed boolean := false;
+	par boolean := false;
 	batches bigint := 0;
 	lists bigint := 0;
 	a text;
@@ -63,6 +65,9 @@ BEGIN
 		IF l ~ 'Custom Scan \(LionCount\)' THEN
 			pushed := true;
 		END IF;
+		IF l ~ 'Parallel Custom Scan \(LionCount\)' THEN
+			par := true;
+		END IF;
 		IF l ~ 'List Batches: ' THEN
 			batches := batches + substring(l from 'List Batches: ([0-9]+)')::bigint;
 		END IF;
@@ -72,6 +77,7 @@ BEGIN
 	END LOOP;
 	EXECUTE 'SELECT array_agg(r ORDER BY r)::text FROM (' || q || ') r' INTO a;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_sort', 'on', true);
 	PERFORM set_config('enable_hashagg', 'on', true);
@@ -83,6 +89,8 @@ BEGIN
 		RETURN format('MISMATCH: %s against %s', left(a, 120), left(b, 120));
 	END IF;
 	RETURN CASE WHEN NOT pushed THEN 'not pushed down'
+				WHEN par AND lists > 0 THEN 'pushed down in parallel, collected'
+				WHEN par THEN 'pushed down in parallel'
 				WHEN batches > 1 AND lists > 0 THEN 'pushed down, in batches and collected'
 				WHEN batches > 1 THEN 'pushed down, in batches'
 				WHEN lists > 0 THEN 'pushed down, collected'
@@ -226,6 +234,75 @@ SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g
  pushed down, whole, same answer
 (1 row)
 
+-- a list that is the only source of a filtered count is collected too, and
+-- the filter's run is the sum over the walk that counts every row, ANDed with
+-- that one set, as a run whose source is a range is - alone, beside other
+-- filtered counts and a list of its own, in each form a filtered count takes,
+-- with all but a few values without an entry, in a GROUP BY and on a
+-- partitioned table
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+-- ... where the heap is all-visible the walk lets the map answer for every
+-- row of it, and none is rechecked in the heap
+CREATE FUNCTION lion_llrechecked(q text) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	n bigint := 0;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF l ~ 'Heap TIDs Rechecked: ' THEN
+			n := n + substring(l from 'Heap TIDs Rechecked: ([0-9]+)')::bigint;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	RETURN n;
+END $$;
+SELECT lion_llrechecked('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll');
+ lion_llrechecked 
+------------------
+                0
+(1 row)
+
+SELECT lion_llcmp($$SELECT count(*) FILTER (WHERE k = ANY (array(SELECT (g * 7) % 7000 FROM generate_series(0, 5999) g))), count(*) FILTER (WHERE x = 1), count(*) FILTER (WHERE t = ANY (array(SELECT 'v' || g FROM generate_series(0, 3999) g))), count(*) FROM lion_ll$$);
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT sum(CASE WHEN k = ANY (array(SELECT CASE WHEN g % 7 = 0 THEN NULL ELSE g END FROM generate_series(0, 3499) g)) THEN 1 ELSE 0 END), count(CASE WHEN k = ANY (array(SELECT g % 1500 FROM generate_series(0, 5999) g)) THEN 1 END) FROM lion_ll');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(4990, 7990) g))) FROM lion_ll');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT x, count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll GROUP BY x');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g))), count(*) FROM lion_llp');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
 -- a dirty heap
 UPDATE lion_ll SET x = (x + 1) % 3 WHERE k % 17 = 0;
 DELETE FROM lion_ll WHERE k % 19 = 0;
@@ -247,6 +324,102 @@ SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g
  pushed down, collected, same answer
 (1 row)
 
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))), count(*) FILTER (WHERE x = 1) FROM lion_ll');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+-- the filtered counts in parallel: each participant collects the list for
+-- the ranges of the filter's run it counts
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll');
+                   lion_llcmp                    
+-------------------------------------------------
+ pushed down in parallel, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))), count(*) FILTER (WHERE x = 1), count(*) FROM lion_ll');
+                   lion_llcmp                    
+-------------------------------------------------
+ pushed down in parallel, collected, same answer
+(1 row)
+
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+SET max_parallel_workers_per_gather = 0;
+/*
+ * A generic plan, the list its parameter: the planner knows nothing of its
+ * length, and the run collects it.  lion_llexec() runs the prepared statement
+ * with the array arr as the pushdown answers it and with a sequential scan,
+ * as lion_llcmp() does a query.
+ */
+CREATE FUNCTION lion_llexec(stmt text, arr int[]) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	pushed boolean := false;
+	lists bigint := 0;
+	a text;
+	b text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) EXECUTE %s(%L)', stmt, arr) LOOP
+		IF l ~ 'Custom Scan \(LionCount\)' THEN
+			pushed := true;
+		END IF;
+		IF l ~ 'Lists Collected: ' THEN
+			lists := lists + substring(l from 'Lists Collected: ([0-9]+)')::bigint;
+		END IF;
+	END LOOP;
+	EXECUTE format('EXECUTE %s(%L)', stmt, arr) INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	EXECUTE format('EXECUTE %s(%L)', stmt, arr) INTO b;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s against %s', a, b);
+	END IF;
+	RETURN CASE WHEN NOT pushed THEN 'not pushed down'
+				WHEN lists > 0 THEN 'pushed down, collected'
+				ELSE 'pushed down, whole' END || ', same answer: ' || a;
+END $$;
+SET plan_cache_mode = force_generic_plan;
+PREPARE lion_llq(int[]) AS
+	SELECT row(count(*) FILTER (WHERE k = ANY ($1)), count(*) FILTER (WHERE x = 1))::text FROM lion_ll;
+SELECT lion_llexec('lion_llq', array(SELECT g FROM generate_series(0, 2999) g));
+                    lion_llexec                     
+----------------------------------------------------
+ pushed down, collected, same answer: (34104,18944)
+(1 row)
+
+SELECT lion_llexec('lion_llq', array(SELECT g * 3 FROM generate_series(0, 1999) g));
+                    lion_llexec                     
+----------------------------------------------------
+ pushed down, collected, same answer: (18948,18944)
+(1 row)
+
+-- ... and one batch: located whole
+SELECT lion_llexec('lion_llq', array(SELECT g FROM generate_series(0, 999) g));
+                  lion_llexec                   
+------------------------------------------------
+ pushed down, whole, same answer: (11364,18944)
+(1 row)
+
+DEALLOCATE lion_llq;
+RESET plan_cache_mode;
 -- with the default work_mem the same list is one batch: located whole
 RESET work_mem;
 SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))');
@@ -255,6 +428,42 @@ SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FR
  pushed down, whole, same answer
 (1 row)
 
+-- and PostgreSQL's default work_mem, 4MB, has 16384 values a batch: one
+-- more is a list past one batch, and a filter of it alone is collected
+SET work_mem = '4MB';
+CREATE TABLE lion_llw (k int NOT NULL, x int NOT NULL);
+INSERT INTO lion_llw SELECT (i * 7) % 20000, i % 3 FROM generate_series(1, 4000) i;
+CREATE INDEX lion_llw_k ON lion_llw USING lion (k);
+CREATE INDEX lion_llw_x ON lion_llw USING lion (x);
+VACUUM ANALYZE lion_llw;
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16383) g))) FROM lion_llw');
+           lion_llcmp            
+---------------------------------
+ pushed down, whole, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))) FROM lion_llw');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))), count(*) FILTER (WHERE x = 1) FROM lion_llw');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+SELECT lion_llcmp('SELECT x, count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))) FROM lion_llw GROUP BY x');
+             lion_llcmp              
+-------------------------------------
+ pushed down, collected, same answer
+(1 row)
+
+RESET work_mem;
 DROP FUNCTION lion_llcmp(text);
+DROP FUNCTION lion_llexec(text, int[]);
+DROP FUNCTION lion_llrechecked(text);
 DROP TABLE lion_ll;
 DROP TABLE lion_llp;
+DROP TABLE lion_llw;
