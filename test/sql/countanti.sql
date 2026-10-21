@@ -8,9 +8,9 @@
 -- node runs s as its child, looks each distinct key of its rows up in a
 -- B-tree on r.k under the query's snapshot, tests every row found on the
 -- join clauses and r's own clauses, and subtracts the ones that pass - from
--- the one row of a count, or from each group of a GROUP BY.  Every answer is
--- checked against the same query with the pushdown off, as a multiset in
--- both directions.
+-- the one row of a count, from each group of a GROUP BY, or from each cell
+-- of a count by cells.  Every answer is checked against the same query with
+-- the pushdown off, as a multiset in both directions.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -440,11 +440,6 @@ SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND N
 RESET pg_lion.enable_count_residual;
 -- a NOT EXISTS beside a second table in the FROM
 SELECT lca('SELECT count(*) FROM lca_rows r, lca_tag t WHERE r.id = t.a AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
--- a GROUP BY of expressions over predicates, and a WHERE over them, which a
--- count by cells answers (DESIGN.md §10, "Counts by cells") of one table
--- alone: no anti join's
-SELECT lca('SELECT CASE WHEN r.x = 1 THEN ''a'' WHEN r.x IN (2, 3) THEN ''b'' ELSE ''c'' END AS t, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
-SELECT lca('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.x = 1 THEN r.g = 2 ELSE r.g = 3 END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 -- a correlation by no equality
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a < r.k)');
 -- row-level security on the table counted
@@ -469,6 +464,191 @@ CREATE INDEX lca_parts_x ON lca_parts USING lion (x);
 VACUUM (ANALYZE) lca_parts;
 SELECT lca('SELECT count(*) FROM lca_parts p WHERE p.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = p.k)');
 DROP TABLE lca_parts;
+
+-- ---------- 9. beside a count by cells ----------
+-- A GROUP BY of expressions over predicates, and a WHERE over them, counted
+-- by cells (DESIGN.md §10, "Counts by cells"): each row a key finds is
+-- taken from its cell, its predicates evaluated on it (DESIGN.md §27,
+-- "Counts by cells beside the anti join").  The score reads x, g - NULL on
+-- every 11th row - and z, which is 99 on the rows of key 5 alone; the rows
+-- of one key have every x, and g and y of several values.
+CREATE VIEW lca_scored AS
+SELECT r.*,
+	   CASE WHEN r.x = 1 THEN 3 WHEN r.x IN (2, 3) THEN 2 ELSE 0 END
+	   + CASE WHEN r.g IN (2, 3) THEN 2 WHEN r.g IS NULL THEN 1 ELSE 0 END
+	   + CASE WHEN r.z = 99 THEN 5 ELSE 0 END AS score
+  FROM lca_rows r;
+CREATE VIEW lca_tiered AS
+SELECT v.*,
+	   CASE WHEN v.score >= 5 THEN 'high' WHEN v.score >= 3 THEN 'mid'
+			WHEN v.score >= 1 THEN 'low' ELSE 'none' END AS tier
+  FROM lca_scored v;
+-- the plans: both strategies, the anti join's and the cells'
+SELECT * FROM lca_explain('SELECT CASE WHEN r.x = 1 THEN ''a'' WHEN r.x IN (2, 3) THEN ''b'' ELSE ''c'' END AS t, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.x = 1 THEN r.g = 2 ELSE r.g = 3 END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE t.y < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier') AS ln
+	WHERE ln !~ 'Group Key';
+-- the cost model takes the node, with nothing disabled
+SELECT lca_pick('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca_pick('SELECT tier, count(*) FROM lca_tiered t WHERE t.y < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = 0) GROUP BY tier');
+-- the answers: a GROUP BY of a CASE, of the tier and of the score, a WHERE
+-- over predicates, and both
+SELECT lca('SELECT CASE WHEN r.x = 1 THEN ''a'' WHEN r.x IN (2, 3) THEN ''b'' ELSE ''c'' END AS t, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.x = 1 THEN r.g = 2 ELSE r.g = 3 END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = 0) GROUP BY tier');
+SELECT lca('SELECT score, count(*) FROM lca_scored v WHERE v.y < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = v.k) GROUP BY score');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.y < 5 AND t.tier IN (''mid'', ''low'') AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+SELECT lca('SELECT (t.y IS NULL) AS u, count(*) FROM lca_tiered t WHERE t.tier <> ''none'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY 1');
+SELECT * FROM lca_val('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier ORDER BY tier');
+-- the counters: the rows found, each taken from its cell
+SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+-- NULL in a predicate's column: the truths of (g = 2) are true, false and
+-- NULL, of (y IS NULL) true and false, and the rows found are of all of them
+SELECT lca('SELECT (r.g = 2) AS u, (r.y IS NULL) AS v, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1, 2');
+SELECT * FROM lca_val('SELECT (r.g = 2) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1 ORDER BY 1');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE COALESCE(r.g = 2 OR r.y = 3, true) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+-- the cell of z = 99 is the rows of key 5: it drops to nothing and is no row
+SELECT * FROM lca_val('SELECT (r.z = 99) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1 ORDER BY 1');
+SELECT lca('SELECT (r.z = 99) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE CASE WHEN r.z = 99 THEN true END AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+-- a column of many constants, the bits of k: ten IN lists of the values
+-- from 1 to 1,023 with each bit set, 1,025 outcomes with another value's and
+-- NULL's, each row's found from its truths (lion_cells_code_of()); the
+-- cells of the inner side's keys come to nothing
+CREATE TEMP TABLE lca_bits AS
+SELECT format('SELECT %s, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
+			  string_agg(format('(r.k IN (%s)) AS b%s', l, j), ', ' ORDER BY j)) AS q
+  FROM (SELECT j, string_agg(v::text, ', ' ORDER BY v) AS l
+		  FROM generate_series(0, 9) j, generate_series(1, 1023) v
+		 WHERE v & (1 << j) <> 0 GROUP BY j) b;
+SELECT ln FROM lca_bits, lca_explain(q) AS ln WHERE ln ~ '^\s*(Group Strategy|Cell Columns|Cells):';
+SELECT lca(q) FROM lca_bits;
+SELECT lca_counters(q) FROM lca_bits;
+DROP TABLE lca_bits;
+-- the correlation by two of the inner side's columns, each equal to the
+-- key: only the inner rows whose a and b agree
+SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier') AS ln
+	WHERE ln ~ 'Join Cond';
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k)');
+SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
+-- inner keys of no row, of rows the WHERE leaves out, NULL keys and
+-- duplicates; an empty inner side
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (450, -1)) GROUP BY tier');
+SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (450, -1)) GROUP BY tier');
+SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE t.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (2, 3)) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.z = 99 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (2, 3)) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IS NULL) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = 42) GROUP BY tier');
+-- a clause of both sides, a key of an inner expression, equal keys of other
+-- bytes, an inner side that is a join, and the HAVING
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b <> t.g) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE t.k = s.a + 1) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_num n WHERE n.d = t.kd) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s JOIN lca_tag g ON g.a = s.a WHERE s.a = t.k AND g.tag = ''on'') GROUP BY tier');
+SELECT lca('SELECT tier, count(*), count(1) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier HAVING count(*) > 4000');
+-- a tally that goes to its file: a cell's counts come up more than once,
+-- and those of a cell that loses rows are added up before it does
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+CREATE TEMP TABLE lca_wide AS
+SELECT format('SELECT CASE %s END AS u, CASE WHEN r.x = 1 THEN 1 WHEN r.x = 2 THEN 2 END AS v, CASE WHEN r.g = 2 THEN 1 WHEN r.g = 4 THEN 2 END AS w, CASE WHEN r.y = 3 THEN 1 WHEN r.y = 5 THEN 2 END AS c, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1, 2, 3, 4',
+			  string_agg(format('WHEN r.k = %s THEN %s', i, i), ' ' ORDER BY i)) AS q
+  FROM generate_series(0, 119) i;
+SELECT count(*) > 0 AS spilled
+  FROM lca_wide, lca_explain(q, 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+ WHERE ln ~ 'Tally Spills: [1-9]';
+SELECT lca(q) FROM lca_wide;
+DROP TABLE lca_wide;
+RESET work_mem;
+RESET hash_mem_multiplier;
+-- no B-tree on the correlated column, and the anti join turned off: core's plan
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.y) GROUP BY tier');
+SET pg_lion.enable_count_anti = off;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+RESET pg_lion.enable_count_anti;
+-- a generic plan, and a rescan under a correlated subquery
+SELECT lca_prep('SELECT tier, count(*) FROM lca_tiered t WHERE t.y < $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = $2) GROUP BY tier', '5, 0');
+SELECT lca_prep('SELECT tier, count(*) FROM lca_tiered t WHERE t.y < $1 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = $2) GROUP BY tier', '3, 42');
+SELECT lca('SELECT o.v, o.w, (SELECT count(*) FROM lca_tiered t WHERE t.y < o.v AND t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.f = o.w)) FROM (VALUES (5, 0), (7, 0), (5, 42), (5, 0)) o(v, w)');
+-- rows deleted and updated - from one cell to another, or to no key's -
+-- and inserted, before VACUUM, in this very transaction, and after VACUUM
+DELETE FROM lca_rows WHERE k = 2 AND x = 1;
+UPDATE lca_rows SET x = 1 WHERE k = 3 AND x = 4;
+UPDATE lca_rows SET g = NULL WHERE k = 5 AND x = 6;
+UPDATE lca_rows SET k = 450 WHERE k = 4 AND x = 7;
+UPDATE lca_rows SET pad = repeat('r', 60) WHERE k = 2 AND x = 2;
+INSERT INTO lca_rows (id, k, kn, kd, g, y, z, x, pad)
+SELECT 30000 + i, 3, 3, 3, NULL, 1, 99, 1, 'n' FROM generate_series(1, 5) i;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca('SELECT (r.g = 2) AS u, (r.z = 99) AS v, count(*) FROM lca_rows r WHERE r.y < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1, 2');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+BEGIN;
+DELETE FROM lca_rows WHERE k = 1 AND x = 3;
+UPDATE lca_rows SET x = 2 WHERE k = 2 AND x = 0;
+UPDATE lca_rows SET k = 3 WHERE k = 9 AND x = 1;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''mid'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+ROLLBACK;
+VACUUM (FREEZE, ANALYZE) lca_rows;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+-- in parallel: every participant runs the child and looks the keys up, and
+-- takes away the rows of the ranges it counts
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier') AS ln
+	WHERE ln !~ 'Group Key';
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3, 4) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
+SELECT lca('SELECT (r.z = 99) AS u, count(*) FROM lca_rows r WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY 1');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
+-- ... the rows subtracted, every participant's, are the serial node's
+SELECT ln FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier',
+						   'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+ WHERE ln ~ 'Join Rows Subtracted';
+SET max_parallel_workers_per_gather = 0;
+SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+SET max_parallel_workers_per_gather = 2;
+-- ... with rows the heap is asked about
+UPDATE lca_rows SET x = 2 WHERE k = 2 AND x = 0;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+-- ... and without the leader taking part
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE lca_par AS SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier;
+SELECT ln FROM lca_explain('EXECUTE lca_par') AS ln WHERE ln ~ 'Parallel';
+SET parallel_leader_participation = off;
+CREATE TEMP TABLE lca_par_on AS EXECUTE lca_par;
+RESET parallel_leader_participation;
+DEALLOCATE lca_par;
+RESET plan_cache_mode;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+SET pg_lion.enable_count_pushdown = off;
+SELECT (SELECT count(*) FROM (TABLE lca_par_on EXCEPT ALL
+		SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier) a) +
+	   (SELECT count(*) FROM (SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier
+		EXCEPT ALL TABLE lca_par_on) b) AS rows_differ;
+RESET pg_lion.enable_count_pushdown;
+DROP TABLE lca_par_on;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+DROP VIEW lca_tiered;
+DROP VIEW lca_scored;
 
 DROP TABLE lca_rows, lca_skip, lca_num, lca_tag;
 DROP FUNCTION lca(text);

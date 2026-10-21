@@ -302,13 +302,48 @@ lion_hooktest_anti(int nkey)
 }
 
 /*
+ * A count by cells driven by pg_class.oid's walk, beside the anti join over
+ * a small inner side (DESIGN.md §27, "Counts by cells beside the anti
+ * join"), at the plan stage: the decoded walk of the driver, the CELLS and
+ * ANTI members, and a target list of the predicate's truth, the count and
+ * the columns the anti join reads - the table's (RESID) and the inner
+ * side's (ANTI).  `ngroupn` columns walked, one the plan's.
+ */
+static void
+lion_hooktest_cells_anti(List *priv, int ngroupn)
+{
+	List	   *attnos = list_make1_int(Anum_pg_class_oid);
+	List	   *oids = list_make1_oid(ClassOidIndexId);
+
+	if (ngroupn > 1)
+	{
+		attnos = lappend_int(attnos, Anum_pg_class_relname);
+		oids = lappend_oid(oids, ClassNameNspIndexId);
+	}
+	lfirst(list_nth_cell(priv, LION_PRIV_OIDS)) =
+		list_make4_oid(RelationRelationId, ClassOidIndexId, InvalidOid,
+					   ClassOidIndexId);
+	lfirst(list_nth_cell(priv, LION_PRIV_INTS)) =
+		list_make5_int(1, Anum_pg_class_oid, 0,
+					   LION_FLAG_DECODE | LION_FLAG_GROUPIDX,
+					   Anum_pg_class_oid);
+	lfirst(list_nth_cell(priv, LION_PRIV_GROUPN)) = list_make2(attnos, oids);
+	lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = lion_hooktest_cells();
+	lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(1);
+	lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+		list_make4_int(LION_TL_CELLPRED(0), LION_TL_COUNT,
+					   LION_TL_RESID(Anum_pg_class_oid), LION_TL_ANTI(1));
+}
+
+/*
  * pg_lion's decoder of a LionCount plan's custom_private, and the rules
  * between its members (lion_count_priv_decode() and lion_count_priv_check(),
  * src/lion_plan_private.h), handed a list a planner of this build would make
  * - one equality clause, a count - with one thing changed, named by
- * `variant`; the number of clauses it decoded.  Every
- * variant but "plan" and "path" is a list it must refuse: no plan carries
- * one, so this is the only way to see that it does.
+ * `variant`; the number of clauses it decoded.  Every variant but "plan",
+ * "path" and the counts by cells beside an anti join, serial and parallel,
+ * is a list it must refuse: no plan carries one, so this is the only way to
+ * see that it does.
  */
 Datum
 lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
@@ -319,6 +354,8 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	LionPrivStage stage = LION_PRIV_STAGE_PLAN;
 	LionCountPriv out;
 	List	   *priv = NIL;
+	bool		parallel = false;
+	int			nplans = 0;		/* the CustomScan's children */
 	int			n;
 
 	decode = (lion_priv_decode_fn)
@@ -476,10 +513,48 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	else if (strcmp(variant, "inner column without an anti join") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make2_int(LION_TL_COUNT, LION_TL_ANTI(1));
+	else if (strcmp(variant, "cells beside an anti join") == 0)
+	{
+		lion_hooktest_cells_anti(priv, 1);
+		nplans = 1;
+	}
+	else if (strcmp(variant, "parallel cells beside an anti join") == 0)
+	{
+		lion_hooktest_cells_anti(priv, 1);
+		nplans = 1;
+		parallel = true;
+	}
+	else if (strcmp(variant, "cells beside an anti join with a grouping equality") == 0)
+	{
+		List	   *anti = lion_hooktest_anti(1);
+		List	   *oids = (List *) lsecond(anti);
+
+		lion_hooktest_cells_anti(priv, 1);
+		/* the first GROUP BY column's equality, after the B-tree and key */
+		lfirst_oid(list_nth_cell(oids, 3)) = (Oid) 607;
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
+		nplans = 1;
+	}
+	else if (strcmp(variant, "anti join beside the decoded walk") == 0)
+	{
+		lion_hooktest_cells_anti(priv, 2);
+		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = NIL;
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make1_int(LION_TL_COUNT);
+		nplans = 1;
+	}
+	else if (strcmp(variant, "table column of a count by cells without an anti join") == 0)
+	{
+		lion_hooktest_cells_anti(priv, 1);
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = NIL;
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make3_int(LION_TL_CELLPRED(0), LION_TL_COUNT,
+						   LION_TL_RESID(Anum_pg_class_oid));
+	}
 	else
 		elog(ERROR, "unknown variant \"%s\"", variant);
 
 	decode(priv, stage, &out);
-	check(&out, false, 0);
+	check(&out, parallel, nplans);
 	PG_RETURN_INT32(out.nclause);
 }

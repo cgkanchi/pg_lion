@@ -2462,6 +2462,21 @@ typedef struct LionCellsPredPriv
 } LionCellsPredPriv;
 
 /*
+ * A dimension's outcomes by the truths its predicates have in them, which
+ * tell a row's outcome from its truths (lion_cells_code_of()): each distinct
+ * tuple of those truths - npd of them (LION_TRUTH_*), in the order of preds
+ * - sorted by memcmp(), with the lowest outcome that has it.
+ */
+typedef struct LionCellsByTruth
+{
+	int			npd;			/* the dimension's predicates ... */
+	int		   *preds;			/* ... their numbers */
+	int			ntup;			/* the distinct tuples of their truths ... */
+	uint8	   *tups;			/* ... npd bytes each, sorted */
+	int		   *outs;			/* ... and each one's outcome */
+} LionCellsByTruth;
+
+/*
  * A count by cells (DESIGN.md §10, "Counts by cells"), as it runs: the
  * plan's dimensions and predicates, each dimension's index and its weight in
  * a cell's code (the dimensions' outcomes are the digits of a mixed radix,
@@ -2492,6 +2507,12 @@ typedef struct LionCellsRun
 	LionCellLabel *labels;
 	LionPostingSet *labelsets;
 	PGAlignedBlock *images;
+
+	/*
+	 * each dimension's outcomes by its predicates' truths, or NULL: made in
+	 * labelcxt for the first row the anti join takes away, once a run
+	 */
+	LionCellsByTruth *bytruth;
 
 	/* the driver's equality, which tells its entries' outcomes */
 	FmgrInfo	drveq;
@@ -3265,6 +3286,16 @@ typedef struct LionJoinShared
  * descriptor: the table's columns at outerpos[], the inner side's at
  * innerpos[].  Of a parallel count one participant runs it, the one that
  * claims it first (LionJoinShared.antiowner), and the others subtract nothing.
+ *
+ * Beside a count by cells (DESIGN.md §27, "Counts by cells beside the anti
+ * join") the predicates are evaluated on each row found, their truths put at
+ * their LION_TL_CELLPRED places in evalslot - where setrefs.c points the
+ * clauses' copies of them - and every row taken away is kept with the
+ * container key its TID is in and its cell (LionAntiCellRow).  Every
+ * participant of a parallel count by cells makes the run, and takes away the
+ * rows of the ranges it counts: the cells of those lose them as the tally
+ * gives them up, each cell's count held back until the tally has given all
+ * of it (LionAntiCell).
  */
 typedef struct LionAntiInner
 {
@@ -3290,6 +3321,20 @@ typedef struct LionAntiGroup
 	bool		isnull[2];
 	int64		n;				/* the rows the group is to lose */
 } LionAntiGroup;
+
+typedef struct LionAntiCellRow
+{
+	uint64		code;			/* the cell of a row taken away */
+	uint32		ckey;			/* ... the container key of its TID */
+	bool		mine;			/* ... in a range this participant counts */
+} LionAntiCellRow;
+
+typedef struct LionAntiCell
+{
+	uint64		code;
+	int64		sub;			/* the rows the cell loses */
+	int64		held;			/* ... and its counts, as the tally gave them */
+} LionAntiCell;
 
 typedef struct LionAntiState
 {
@@ -3347,6 +3392,22 @@ typedef struct LionAntiState
 	int64		ngroups;
 
 	HTAB	   *tidset;
+
+	/* beside a count by cells: what each row found is, and the cells' loss */
+	bool		cells;
+	int			npred;
+	ExprState **predstate;		/* each predicate, over the table's row */
+	int		   *predpos;		/* ... its LION_TL_CELLPRED place */
+	uint8	   *predtruth;		/* ... and its truth (LION_TRUTH_*) in the
+								 * row found last */
+	LionAntiCellRow *cellrows;	/* the rows taken away */
+	int			ncellrows;
+	int			cellrowscap;
+	LionAntiCell *held;			/* the cells this participant's rows are of,
+								 * by code */
+	int			nheld;
+	int			nextheld;		/* ... the next to go up */
+	bool		heldready;
 
 	/* EXPLAIN ANALYZE's counters, and a parallel plan's workers' sums */
 	bool		timing;
@@ -4069,6 +4130,7 @@ extern void lion_cells_close(LionCountScanState *st);
 extern void lion_cells_reset(LionCountScanState *st);
 extern TupleTableSlot *lion_next_cells(LionCountScanState *st,
 									   bool *exhausted);
+extern uint64 lion_cells_code_of(LionCellsRun *cr, const uint8 *truth);
 extern const char *lion_explain_col(Oid idxoid, AttrNumber heapattno,
 									bool multikey, List *vcols);
 extern void lion_explain_cells(LionCountScanState *st, List *ancestors,
@@ -4102,6 +4164,12 @@ extern void lion_anti_run(LionCountScanState *st);
 extern bool lion_anti_adjust(LionCountScanState *st, int nkeys,
 							 const Datum *keys, const bool *keyisnull,
 							 int64 *count);
+extern void lion_anti_cells_range(LionCountScanState *st, uint32 lo,
+								  uint64 hi);
+extern bool lion_anti_cells_hold(LionCountScanState *st, uint64 code,
+								 int64 count);
+extern bool lion_anti_cells_next(LionCountScanState *st, uint64 *code,
+								 int64 *count);
 extern void lion_anti_rescan(LionCountScanState *st, CustomScanState *node);
 extern void lion_anti_end(LionCountScanState *st);
 extern void lion_explain_anti(LionCountScanState *st, List *ancestors,
@@ -4130,7 +4198,8 @@ typedef struct LionAntiPlan
 } LionAntiPlan;
 
 extern bool lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti,
-							 List *restrictions, int ngroup, LionAntiPlan *out);
+							 List *restrictions, int ngroup, List *rowexprs,
+							 LionAntiPlan *out);
 
 extern const CustomPathMethods lion_antijoin_path_methods;
 
