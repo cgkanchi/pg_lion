@@ -9572,7 +9572,11 @@ take the columns one by one, the largest left first (by the size of the particip
 while the leader writes the first: whoever writes a column imports the participants' tapes of it and
 merges them as above, so merging, grouping codes into containers, posting and position trees and
 summaries all run in parallel. The directory, the meta page and the one bulk writer stay the
-leader's. A worker writes its column with the builders a serial build uses into a file of its own
+leader's, and so do the options: every participant scans and writes with the copy the leader took
+when the build began (`lion_build_options()`, in the shared state), not with its own relcache's,
+which an `ALTER INDEX ... SET` committed since - it does not wait for `CREATE INDEX CONCURRENTLY`,
+whose lock on the index is `RowExclusiveLock` - would have changed. A worker writes its column
+with the builders a serial build uses into a file of its own
 instead of the index: its blocks are numbered by a counter of its own from 0, each finished page
 goes to the file with its number, and so does each entry tuple, which a serial build would add to
 the directory there and then; every record says how many blocks the worker had handed out by then.

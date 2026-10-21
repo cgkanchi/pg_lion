@@ -369,9 +369,12 @@ extern PGDLLIMPORT int lion_rmgr_id;
 
 /*
  * The wal_mode a CREATE INDEX gives a new index: the reloption when it was
- * set, else rmgr when this server has the resource manager and generic when
- * it has not.  ERRORs when the reloption asks for rmgr and it is not there.
+ * set (opts, the build's copy of the options), else rmgr when this server
+ * has the resource manager and generic when it has not.  ERRORs when the
+ * reloption asks for rmgr and it is not there.
  */
-extern uint32 lion_wal_mode_for_build(Relation index);
+struct LionOptions;
+extern uint32 lion_wal_mode_for_build(Relation index,
+									  const struct LionOptions *opts);
 
 #endif							/* LION_WAL_H */

@@ -1833,10 +1833,9 @@ lion_wal_init(void)
  * the INDEX, fixed at build time, and REINDEX is what changes it.
  */
 uint32
-lion_wal_mode_for_build(Relation index)
+lion_wal_mode_for_build(Relation index, const LionOptions *opts)
 {
-	LionOptions *opts = (LionOptions *) index->rd_options;
-	int			want = opts ? opts->wal_mode : LION_WALOPT_AUTO;
+	int			want = opts->wal_mode;
 
 	if (want == LION_WALOPT_RMGR && !lion_rmgr_is_registered)
 		ereport(ERROR,
