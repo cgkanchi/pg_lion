@@ -842,9 +842,22 @@ cells_dim_index(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp)
 								   dim->valtype, LION_STRAT_EQUAL,
 								   InvalidOid, dim->coll, false, &col);
 		else
+		{
 			idx = lion_match_index(rel, attno, LION_CLAUSE_NULL, InvalidOid,
 								   InvalidOid, 0, InvalidOid, InvalidOid,
 								   false, &col);
+
+			/*
+			 * lion_match_index() answers a null test from a multi-key
+			 * column's NULL entry where no scalar column has it; that column
+			 * is a multi-key dimension here, whose entries are keys, not the
+			 * values a scalar one's driver reads.
+			 */
+			if (idx != NULL &&
+				lion_opfamily_is_multikey(idx->opfamily[col - 1],
+										  idx->opcintype[col - 1]))
+				idx = NULL;
+		}
 		if (idx == NULL && !dim->hasvalop &&
 			lion_find_roaring_index(rel, attno, true, &col) != NULL)
 		{

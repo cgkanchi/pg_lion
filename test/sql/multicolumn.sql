@@ -97,8 +97,8 @@ VACUUM (ANALYZE) lion_mc;
 
 -- One row per key column.  ntids of the two scalar columns is the row count;
 -- the array column stores one TID per (key, row) pair plus one per key-less
--- row, and only IT has an EMPTY entry.
-SELECT attno, ordered, entries, ntids, null_tids, empty_tids
+-- row, and only IT has the EMPTY and NULLELEMS entries.
+SELECT attno, ordered, entries, ntids, null_tids, empty_tids, nullelem_tids
   FROM lion_index_stats('lion_mc_kta');
 
 SELECT (SELECT ntids FROM lion_index_stats('lion_mc_kta') WHERE attno = 1)
@@ -108,8 +108,10 @@ SELECT (SELECT ntids FROM lion_index_stats('lion_mc_kta') WHERE attno = 1)
 	   (SELECT null_tids FROM lion_index_stats('lion_mc_kta') WHERE attno = 3)
 	 = (SELECT count(*) FROM lion_mc WHERE a IS NULL) AS a_nulls,
 	   (SELECT empty_tids FROM lion_index_stats('lion_mc_kta') WHERE attno = 3)
-	 = (SELECT count(*) FROM lion_mc WHERE a IS NOT NULL AND NOT EXISTS
-		(SELECT 1 FROM unnest(a) e WHERE e IS NOT NULL)) AS a_empties;
+	 = (SELECT count(*) FROM lion_mc WHERE cardinality(a) = 0) AS a_empties,
+	   (SELECT nullelem_tids FROM lion_index_stats('lion_mc_kta') WHERE attno = 3)
+	 = (SELECT count(*) FROM lion_mc WHERE cardinality(a) > 0 AND NOT EXISTS
+		(SELECT 1 FROM unnest(a) e WHERE e IS NOT NULL)) AS a_nullelems;
 
 -- Each column's entry count is that column's own distinct keys (plus its
 -- reserved entries), and nothing about any other column.
@@ -118,7 +120,7 @@ SELECT (SELECT entries FROM lion_index_stats('lion_mc_kta') WHERE attno = 1)
 	   (SELECT entries FROM lion_index_stats('lion_mc_kta') WHERE attno = 2)
 	 = (SELECT count(DISTINCT t) FROM lion_mc) AS t_entries,
 	   (SELECT entries FROM lion_index_stats('lion_mc_kta') WHERE attno = 3)
-	 = (SELECT count(DISTINCT e) + 2 FROM lion_mc, unnest(a) x(e)
+	 = (SELECT count(DISTINCT e) + 3 FROM lion_mc, unnest(a) x(e)
 		 WHERE e IS NOT NULL) AS a_entries;
 
 SELECT lion_index_verify('lion_mc_kta', true);

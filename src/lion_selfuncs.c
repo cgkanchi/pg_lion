@@ -1842,10 +1842,34 @@ lion_canonical_clause_list(PlannerInfo *root, int varRelid, List *clauses,
 }
 
 /*
+ * clauses of rel - RestrictInfos or bare - as lion's estimates take them:
+ * lion_canonical_clause_list()'s form, with the tests of whether a
+ * lion-indexed array is empty on each column as the one clause of
+ * whole-array statistics they come to together (lion_nonempty_rel_clauses(),
+ * DESIGN.md §17 "Non-empty arrays"); and whether any of them differs from
+ * the clauses given.
+ */
+static List *
+lion_canonical_rel_list(PlannerInfo *root, RelOptInfo *rel, List *clauses,
+						bool *changed)
+{
+	List	   *canon;
+	List	   *result;
+	bool		nechanged;
+
+	canon = lion_canonical_clause_list(root, rel->relid, clauses, changed);
+	result = lion_nonempty_rel_clauses(rel, canon, &nechanged);
+	list_free(canon);
+	if (nechanged)
+		*changed = true;
+	return result;
+}
+
+/*
  * Core's estimate of quals - an index path's RestrictInfos, of rel - in
- * *coresel and lion's, of their canonical form (lion_canonical_clause_list()),
- * in *lionsel, when the two forms differ; false, and neither set, when they
- * do not.
+ * *coresel and lion's, of their canonical form (lion_canonical_rel_list(),
+ * as rel's rows take its restriction clauses), in *lionsel, when the two
+ * forms differ; false, and neither set, when they do not.
  */
 bool
 lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel, List *quals,
@@ -1856,7 +1880,7 @@ lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel, List *quals,
 
 	if (root == NULL || rel == NULL || rel->relid == 0 || quals == NIL)
 		return false;
-	canon = lion_canonical_clause_list(root, rel->relid, quals, &changed);
+	canon = lion_canonical_rel_list(root, rel, quals, &changed);
 	if (changed)
 	{
 		*coresel = clauselist_selectivity(root, quals, rel->relid, JOIN_INNER,
@@ -4164,14 +4188,16 @@ lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 /*
  * rel's restriction clauses as lion's estimates take them: an OR of
  * equalities as the IN list it spells, a run of `<>` on one expression as
- * the one exclusion it is (lion_canonical_clause_list()), every other clause
- * as it is; and whether any of them differs from core's.
+ * the one exclusion it is (lion_canonical_clause_list()), the tests of
+ * whether a lion-indexed array is empty on each column as the one clause of
+ * whole-array statistics they come to together (lion_nonempty_rel_clauses(),
+ * DESIGN.md §17 "Non-empty arrays"), every other clause as it is
+ * (lion_canonical_rel_list()); and whether any of them differs from core's.
  */
 static List *
 lion_rel_canonical_clauses(PlannerInfo *root, RelOptInfo *rel, bool *changed)
 {
-	return lion_canonical_clause_list(root, rel->relid, rel->baserestrictinfo,
-									  changed);
+	return lion_canonical_rel_list(root, rel, rel->baserestrictinfo, changed);
 }
 
 /*
@@ -4188,9 +4214,11 @@ lion_rel_canonical_clauses(PlannerInfo *root, RelOptInfo *rel, bool *changed)
  * the arms could overlap, 1 - (1 - s1)(1 - s2), and the list as the disjoint
  * entries they are, s1 + s2, so the same filter came out with fewer rows
  * written as an OR.  So does a run of `<>` on one expression, as the one
- * exclusion it is (lion_neq_runs()): core takes the NULLs away once a clause.
- * The rows are then computed as set_baserel_size_estimates() computes
- * rel->rows, from those clauses.
+ * exclusion it is (lion_neq_runs()): core takes the NULLs away once a clause;
+ * and so do the tests of whether a lion-indexed array is empty, as the one
+ * whole-array clause they come to (lion_nonempty_rel_clauses()).  The rows
+ * are then computed as set_baserel_size_estimates() computes rel->rows, from
+ * those clauses.
  *
  * The factor applies to core's rows before they are rounded and clamped to
  * one: a wide filter of correlated columns is where core's product comes out
@@ -4428,12 +4456,16 @@ lion_correct_path_rows(List *paths, List *ppilist, const double *ppirows,
  * it.
  *
  * The same goes wherever lion's estimates take the restriction clauses in
- * another form than core's (lion_rel_canonical_changes()) - an OR of
- * equalities as its IN list, a run of `<>` on one expression as the one
- * exclusion it is (DESIGN.md §29.11, "A run of `<>` is one exclusion") -
- * with the probe's factor or without it, the probe on or off: rel->rows is
- * then core's estimate of those clauses (lion_probe_rel_rows(), and for a
- * parameterized path lion_param_rows(), from the same clauses).
+ * another form than core's (lion_rel_canonical_changes()): an OR of
+ * equalities as its IN list; a run of `<>` on one expression as the one
+ * exclusion it is (DESIGN.md §29.11, "A run of `<>` is one exclusion"); the
+ * tests of whether a lion-indexed array is empty, which core estimates one at
+ * a time from no statistics at all - `array_length(a, 1) IS NOT NULL` at
+ * 0.995 and `cardinality(a) > 0` at a third, multiplied when both are there -
+ * as the one whole-array comparison they come to (DESIGN.md §17, "Non-empty
+ * arrays").  With the probe's factor or without it, the probe on or off,
+ * rel->rows is then core's estimate of those clauses (lion_probe_rel_rows(),
+ * and for a parameterized path lion_param_rows(), from the same clauses).
  *
  * Only a plain relation of its own: an inheritance parent's rows are its
  * children's sum, made before any child's paths are built, and a child's

@@ -124,9 +124,12 @@ SELECT lion_index_verify('lion_arr_tags', true);
 SELECT lion_index_verify('lion_arr_nums', true);
 
 -- 40 tag entries + 13 + 3 overlap; the NULL array is one entry, the empty
--- array another.  empty_tids counts the rows no key was extracted from.
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_nums');
+-- array another.  empty_tids counts the rows with no element at all, and
+-- nullelem_tids the rows whose every element is NULL (none yet).
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_tags');
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_nums');
 
 -- lion_index_count() is a single-key function: a multi-key index has no
 -- equality strategy to look a value up with, and says so.
@@ -269,7 +272,9 @@ INSERT INTO lion_arr VALUES (30001, 2, ARRAY[NULL]::text[], '{7}');
 
 SELECT lion_index_verify('lion_arr_tags', true);
 SELECT lion_index_verify('lion_arr_nums', true);
-SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_tags');
+-- '{}' joined the EMPTY entry, '{NULL}' started the NULLELEMS one
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_tags');
 
 -- a dirty heap: the count has to visit it
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr WHERE tags @> '{new1}'$$);
@@ -369,6 +374,34 @@ SELECT entries, null_tids, empty_tids FROM lion_index_stats('lion_arr_res2_a');
 SELECT lion_index_verify('lion_arr_res2_a', true);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
 SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a IS NULL$$);
+
+-- The third key-less entry, NULLELEMS (arrays whose elements are all NULL),
+-- spills and keeps its identity the same way: on INSERT ...
+INSERT INTO lion_arr_res
+SELECT i, CASE WHEN i % 4 = 0 THEN ARRAY[NULL]::int[]
+			   WHEN i % 4 = 2 THEN ARRAY[NULL, NULL]::int[]
+			   ELSE '{3}'::int[] END
+  FROM generate_series(30001, 34000) i;
+SELECT entries, null_tids, empty_tids, nullelem_tids,
+	   container_pages > 0 AS spilled
+  FROM lion_index_stats('lion_arr_res_a');
+INSERT INTO lion_arr_res VALUES (40001, '{NULL}'), (40002, '{{NULL},{NULL}}');
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_res_a');
+SELECT lion_index_verify('lion_arr_res_a', true);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res WHERE a @> '{}'$$);
+-- ... and in VACUUM
+INSERT INTO lion_arr_res2
+SELECT i, ARRAY[NULL]::int[] FROM generate_series(30001, 40000) i;
+DELETE FROM lion_arr_res2 WHERE id > 30000 AND id % 2 = 0;
+VACUUM (FREEZE) lion_arr_res2;
+SELECT entries, null_tids, empty_tids, nullelem_tids
+  FROM lion_index_stats('lion_arr_res2_a');
+SELECT lion_index_verify('lion_arr_res2_a', true);
+INSERT INTO lion_arr_res2 VALUES (40001, '{NULL}');
+SELECT entries, nullelem_tids FROM lion_index_stats('lion_arr_res2_a');
+SELECT lion_index_verify('lion_arr_res2_a', true);
+SELECT lion_arrcmp($$SELECT count(*) FROM lion_arr_res2 WHERE a @> '{}'$$);
 DROP TABLE lion_arr_res, lion_arr_res2;
 
 -- ---- a partitioned table (DESIGN.md §16 meets §17) ---------------------

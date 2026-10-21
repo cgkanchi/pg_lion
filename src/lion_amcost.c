@@ -1757,15 +1757,17 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
  * (lion_canonical_quals_sel()): a run of `<>` on one column is the one
  * exclusion it is, 1 - nullfrac - the values' frequencies, where core's
  * product of each clause's 1 - freq - nullfrac takes the NULLs away once a
- * clause (DESIGN.md §29.11, "A run of `<>` is one exclusion").  It is
- * genericcostestimate()'s selectivity times lion's estimate of the quals
- * over core's, which leaves a partial index's predicate's share as it was;
- * the index tuples and the pages genericcostestimate() prorated by them are
- * computed again from it, as genericcostestimate() computes them, and
- * charged as it charges them (lion_generic_page_cost()).  The heap side of
- * the path is priced from it, and it is the share the relation's rows are
- * corrected to (lion_correct_rel_rows()).  A full walk's tuples and pages
- * are the whole index's either way.
+ * clause (DESIGN.md §29.11, "A run of `<>` is one exclusion"); and the tests
+ * of whether an array is empty that reach an index, `a IS NOT NULL AND a =
+ * '{}'`, are the one clause they come to (DESIGN.md §17, "Non-empty
+ * arrays").  It is genericcostestimate()'s selectivity times lion's estimate
+ * of the quals over core's, which leaves a partial index's predicate's share
+ * as it was; the index tuples and the pages genericcostestimate() prorated
+ * by them are computed again from it, as genericcostestimate() computes
+ * them, and charged as it charges them (lion_generic_page_cost()).  The heap
+ * side of the path is priced from it, and it is the share the relation's
+ * rows are corrected to (lion_correct_rel_rows()).  A full walk's tuples and
+ * pages are the whole index's either way.
  */
 static void
 lion_cost_canonical_sel(PlannerInfo *root, IndexPath *path, double loop_count,

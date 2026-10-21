@@ -163,6 +163,29 @@ select together (DESIGN.md §5, SCAN step 5).
 combined with a `GROUP BY` on a scalar roaring column. Array `=` and `@@@` are answered by bitmap and
 index scans only, as GIN answers them.
 
+Whether an array is empty is answered from an `array_ops` index too, which keeps a column's NULL
+arrays, its empty ones and the rest apart (DESIGN.md §17, "Non-empty arrays"). `count(*)` pushes
+down, with no heap visit:
+
+    cardinality(tags) > 0           also >= 1, <> 0; array_length(tags, 1) IS NOT NULL, > 0,
+                                    >= 1, >= 0; array_ndims(tags) > 0; tags <> '{}'
+    tags IS DISTINCT FROM '{}'      also cardinality(tags) IS DISTINCT FROM 0 (NULLs included)
+    tags = '{}'                     also cardinality(tags) = 0, < 1
+    array_length(tags, 1) IS NULL   also coalesce(cardinality(tags), 0) = 0 (NULLs included)
+    tags IS NULL, tags IS NOT NULL  also cardinality(tags) IS NULL, cardinality(tags) >= 0
+
+in any combination on one column (`tags IS NOT NULL AND array_length(tags, 1) > 0`), either way
+round, with integer constants of any width, and under `NOT`, `IS TRUE`, `IS NOT FALSE` and the
+like; in the `WHERE`, a `FILTER`, an `OR`, beside a `GROUP BY`. An array has an element whatever its
+dimensions and lower bounds, and when its elements are all NULL (`'{NULL}'`). Left to the heap, as
+a filter: a test some non-empty arrays pass and others fail (`array_length(tags, 1) > 1`,
+`array_ndims(tags) = 1`, `array_lower(tags, 1) = 1`), a dimension other than 1, a bound that is a
+parameter, and, beside a multi-key query known only at run time, one that NULLs pass. The planner
+estimates the rows from the column's statistics, where it would otherwise take these as functions
+it knows nothing of. Bitmap and index scans cannot use them: PostgreSQL hands an index no function
+of a column, nor `<>`, so only `tags = '{}'` reaches one (answered as every row, rechecked) and
+`IS [NOT] NULL` (exact).
+
 A `tsvector` index also stores every lexeme's positions and weights per row, as GIN does, unless it
 is built `WITH (store_positions = off)`, so phrases (`a <-> b`, `a <3> b`), weights (`a:A`) and NOTs
 (`a & !b`, `a <-> !b`) are answered exactly from the index: bitmap and index scans need no recheck,
@@ -277,6 +300,13 @@ root, the root's type, and one per top-level key, string element or string scala
     doc ?& '{k,l}'             their AND, exact; `?& '{}'` is every row, rechecked
     doc @@ '$.a[*].b == 1'     the keys under a.b with the value 1, rechecked
     doc @? '$.a ? (@.b > 1)'   the keys under a.b (a range only requires the path), rechecked
+
+The count pushdown also takes `(doc ->> 'k') = 'v'` as `doc @> '{"k": "v"}'`, the same test
+when v is a string constant that is not the text of a number, of `true` or `false`, or of an object
+or array (it starts with neither `{` nor `[`), compared under a deterministic collation: in a
+`WHERE` it is answered from the index instead of the heap, and in a `FILTER` it no longer sends the
+count to the ordinary plan. `->>` compared with a parameter, a number's text and the like stay with
+the heap (DESIGN.md §42.6).
 
 Numbers compare by value (`1`, `1.0` and `1e0` are one key) and strings by their bytes, as jsonb
 equality does. A key longer than 2047 bytes is stored as its SHA-256, and a query that needs one is
@@ -543,9 +573,11 @@ key type with no btree opclass, whose entries are then in a complete but arbitra
 column's entries, its containers by kind, its sparse segments, its posting trees' internal pages
 and tallest height (a set of up to 16 leaves has no internal level, DESIGN.md §22), `null_tids`,
 the number of rows whose key in that column is NULL, and `empty_tids`,
-the number of rows a multi-key opclass extracted no key from, `ndistinct`, the distinct keys
-the planner is given for the column (DESIGN.md §33; NULL where none is recorded), and, last,
-`narrow_containers`, the column's NARROW containers (DESIGN.md §38).  `slack_bytes` and
+the number of rows a multi-key opclass extracted no key from (an array with no elements, a tsvector
+with no lexemes), `ndistinct`, the distinct keys
+the planner is given for the column (DESIGN.md §33; NULL where none is recorded),
+`narrow_containers`, the column's NARROW containers (DESIGN.md §38), and, last, `nullelem_tids`,
+the number of rows whose array has elements and all of them NULL (DESIGN.md §17).  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the

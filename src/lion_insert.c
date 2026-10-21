@@ -1750,10 +1750,9 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 
 	hash = (reservedflag != 0) ? LION_NULLKEY_HASH : lion_hash_key(state, key);
 
-	if (reservedflag == LION_ENTRY_NULLKEY)
-		lion_search_key_init(state, &sk, LION_KIND_NULL, (Datum) 0, hash);
-	else if (reservedflag == LION_ENTRY_EMPTYKEY)
-		lion_search_key_init(state, &sk, LION_KIND_EMPTY, (Datum) 0, hash);
+	if (reservedflag != 0)
+		lion_search_key_init(state, &sk, lion_reserved_kind(reservedflag),
+							 (Datum) 0, hash);
 	else
 		lion_search_key_init(state, &sk, LION_KIND_VALUE, key, hash);
 
@@ -1860,24 +1859,26 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			Datum	   *keys;
 			LionKeyPositions *kpos = NULL;
 			LionPosMember *pm = NULL;
+			uint16		nokey;
 			int			nkeys;
 			int			i;
 
 			if (state->positions)
 			{
-				nkeys = lion_extract_value_pos(state, values[c], &keys, &kpos);
+				nkeys = lion_extract_value_pos(state, values[c], &keys, &kpos,
+											   &nokey);
 				pm = (LionPosMember *) palloc(sizeof(LionPosMember));
 			}
 			else
-				nkeys = lion_extract_value(state, values[c], &keys);
+				nkeys = lion_extract_value(state, values[c], &keys, &nokey);
 
 			/* every key checked before any is written (DESIGN.md §4) */
 			for (i = 0; i < nkeys; i++)
 				keys[i] = lion_key_prepare(state, keys[i], heapRel, ht_ctid);
 
 			if (nkeys == 0)
-				lion_insert_one(index, heapRel, state, (Datum) 0,
-							   LION_ENTRY_EMPTYKEY, ckey, lo, NULL);
+				lion_insert_one(index, heapRel, state, (Datum) 0, nokey,
+							   ckey, lo, NULL);
 			for (i = 0; i < nkeys; i++)
 			{
 				if (pm != NULL)

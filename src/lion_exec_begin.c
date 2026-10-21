@@ -182,21 +182,24 @@ lion_load_inner_keys(LionCountScanState *st)
  * (lion_match_index()).  An index with no such column is not the one the
  * plan was made for, and that is said rather than read.
  */
-AttrNumber
-lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey,
-				   List *vcols)
+static Node *
+lion_index_col_vcol(AttrNumber heapattno, List *vcols)
 {
-	Node	   *vcol = NULL;
-	int			c;
-
 	/* an expression column (DESIGN.md §41) is matched by its expression */
-	if (LION_ATTNO_IS_VCOL(heapattno))
-	{
-		if (LION_VCOL_INDEX(heapattno) >= list_length(vcols))
-			elog(ERROR, "LionCount: expression column %d of %d",
-				 (int) heapattno, list_length(vcols));
-		vcol = (Node *) list_nth(vcols, LION_VCOL_INDEX(heapattno));
-	}
+	if (!LION_ATTNO_IS_VCOL(heapattno))
+		return NULL;
+	if (LION_VCOL_INDEX(heapattno) >= list_length(vcols))
+		elog(ERROR, "LionCount: expression column %d of %d",
+			 (int) heapattno, list_length(vcols));
+	return (Node *) list_nth(vcols, LION_VCOL_INDEX(heapattno));
+}
+
+/* ... the column, or 0 when the index has none */
+static AttrNumber
+lion_index_col_find(Relation index, AttrNumber heapattno, bool multikey,
+					Node *vcol)
+{
+	int			c;
 
 	for (c = 0; c < IndexRelationGetNumberOfKeyAttributes(index); c++)
 	{
@@ -208,6 +211,18 @@ lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey,
 			continue;
 		return (AttrNumber) (c + 1);
 	}
+	return 0;
+}
+
+AttrNumber
+lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey,
+				   List *vcols)
+{
+	Node	   *vcol = lion_index_col_vcol(heapattno, vcols);
+	AttrNumber	col = lion_index_col_find(index, heapattno, multikey, vcol);
+
+	if (col != 0)
+		return col;
 
 	if (vcol != NULL)
 		elog(ERROR, "lion index \"%s\" has no %s key column on expression %s",
@@ -217,6 +232,25 @@ lion_index_col_for(Relation index, AttrNumber heapattno, bool multikey,
 		 RelationGetRelationName(index), multikey ? "multi-key" : "scalar",
 		 (int) heapattno, get_rel_name(index->rd_index->indrelid));
 	return 0;					/* keep the compiler quiet */
+}
+
+/*
+ * The key column of index that answers a clause of this kind on heap column
+ * heapattno: a multi-key one for a clause a multi-key column answers, a
+ * scalar one for the others - and for a null test, which either kind
+ * answers, the scalar one where the index has one and the multi-key one
+ * where it has not, as lion_match_index() chose the index.
+ */
+AttrNumber
+lion_index_col_for_kind(Relation index, AttrNumber heapattno, int kind,
+						List *vcols)
+{
+	if (LION_CLAUSE_ANY_COLUMN(kind) &&
+		lion_index_col_find(index, heapattno, false,
+							lion_index_col_vcol(heapattno, vcols)) == 0)
+		return lion_index_col_for(index, heapattno, true, vcols);
+	return lion_index_col_for(index, heapattno, LION_CLAUSE_IS_MULTI(kind),
+							  vcols);
 }
 
 /*
@@ -562,11 +596,11 @@ lion_open_relation(LionCountScanState *st, int p)
 		if (st->clause[i].idx == NULL)
 			continue;
 		st->clause[i].idxcol =
-			lion_index_col_for(st->clause[i].idx,
-							   lion_heap_attno_in(st->heap, st->plan.heapoid,
-												  st->clause[i].attno),
-							   LION_CLAUSE_IS_MULTI(st->clause[i].kind),
-							   st->plan.vcols);
+			lion_index_col_for_kind(st->clause[i].idx,
+									lion_heap_attno_in(st->heap,
+													   st->plan.heapoid,
+													   st->clause[i].attno),
+									st->clause[i].kind, st->plan.vcols);
 	}
 	if (part != NULL)
 		lion_relation_items(st);

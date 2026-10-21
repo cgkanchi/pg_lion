@@ -592,6 +592,51 @@ lion_locate_leaf(LionCountScanState *st, LionClauseState *cl,
 				break;
 			}
 
+		case LION_CLAUSE_RESERVED:
+		case LION_CLAUSE_NOTRESERVED:
+			{
+				/*
+				 * Whether an array is empty (DESIGN.md §17, "Non-empty
+				 * arrays"): the rows of the reserved entries the mask names -
+				 * the EMPTY one, and the NULL one when it is there - which
+				 * RESERVED selects and NOTRESERVED subtracts.  An entry the
+				 * column does not have holds no row.
+				 */
+				int32		mask = DatumGetInt32(cl->val);
+				LionKeyNode **args;
+
+				if (cl->valisnull || !LION_RESERVED_MASK_OK(mask))
+					elog(ERROR, "LionCount: reserved entries 0x%x of index \"%s\"",
+						 cl->valisnull ? 0 : (unsigned int) mask,
+						 RelationGetRelationName(cl->idx));
+				*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * 2);
+				if (lion_posting_set_lookup_reserved_col(cl->idx, cl->idxcol,
+														 LION_ENTRY_EMPTYKEY,
+														 &(*sets)[n]))
+					n++;
+				else
+					lion_posting_set_release(&(*sets)[n]);
+				if ((mask & LION_ENTRY_NULLKEY) != 0)
+				{
+					if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
+														 &(*sets)[n]))
+						n++;
+					else
+						lion_posting_set_release(&(*sets)[n]);
+				}
+				if (n == 1)
+					tree = lion_key_node(0);
+				else if (n == 2)
+				{
+					/* the node keeps the array: not the stack's */
+					args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+					args[0] = lion_key_node(0);
+					args[1] = lion_key_node(1);
+					tree = lion_bool_node(LION_KN_OR, args, 2);
+				}
+				break;
+			}
+
 		case LION_CLAUSE_NULL:
 		case LION_CLAUSE_NOTNULL:
 			*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet));

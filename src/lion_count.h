@@ -503,7 +503,9 @@ typedef struct LionCountSource
 /*
  * Locate the posting set of the rows whose key column `attno` is NULL: that
  * column's reserved entry (DESIGN.md §14, §24).  Returns false when the
- * column holds no NULLs.
+ * column holds no NULLs.  lion_posting_set_lookup_reserved_col() locates any
+ * reserved entry of the column, named by its flag: the NULL one, or a
+ * multi-key column's EMPTY or NULLELEMS one (§17).
  *
  * Every lookup below names an INDEX COLUMN, 1-based, exactly as a ScanKey's
  * sk_attno and an IndexOptInfo's indexkeys[i] + 1 do.  The wrappers without
@@ -511,6 +513,10 @@ typedef struct LionCountSource
  */
 extern bool lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 											LionPostingSet *ps);
+extern bool lion_posting_set_lookup_reserved_col(Relation index,
+												 AttrNumber attno,
+												 uint16 reservedflag,
+												 LionPostingSet *ps);
 
 static inline bool
 lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
@@ -1877,13 +1883,35 @@ extern Node *lion_canonical_clause(Node *clause);
  * disjoint 1 - nullfrac - sum of the distinct values' frequencies (DESIGN.md
  * §29.11, "A run of `<>` is one exclusion"); *changed says whether any
  * clause was taken so.  lion_canonical_quals_sel() is core's estimate of an
- * index path's quals and lion's, where the two forms differ.
+ * index path's quals and lion's - of that form, with the tests of whether an
+ * array is empty as lion_nonempty_rel_clauses() takes them - where the two
+ * forms differ.
  */
 extern List *lion_canonical_clause_list(PlannerInfo *root, int varRelid,
 										List *clauses, bool *changed);
 extern bool lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel,
 									 List *quals, Selectivity *coresel,
 									 Selectivity *lionsel);
+
+/*
+ * A predicate on one array column that is true of every row of each of the
+ * three classes a lion array column's entries tell apart, or of none
+ * (DESIGN.md §17, "Non-empty arrays"): the column NULL, an array with no
+ * element, and one with an element (lion_plan_nonempty.c).
+ */
+typedef struct LionNonEmpty
+{
+	Var		   *var;			/* the column */
+	bool		isnull;			/* selects the rows whose column is NULL */
+	bool		isempty;		/* ... whose array has no element */
+	bool		nonempty;		/* ... whose array has one or more */
+} LionNonEmpty;
+
+extern bool lion_nonempty_test(Node *clause, LionNonEmpty *ne);
+extern Node *lion_nonempty_clause(const LionNonEmpty *ne);
+extern bool lion_nonempty_index(IndexOptInfo *idx, AttrNumber col);
+extern List *lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses,
+									   bool *changed);
 #if PG_VERSION_NUM < 180000
 
 /*
