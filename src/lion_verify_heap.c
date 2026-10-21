@@ -596,8 +596,9 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 			Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, ItemIdGetLength(iid));
 			Size		cur = 0;
 
-			while (lion_inline_fetch(LionEntryGetPayload(entry), paylen, &cur,
-									vs->cbuf) > 0)
+			while (lion_inline_fetch(index, BufferGetBlockNumber(entrybuf),
+									 entryoff, LionEntryGetPayload(entry),
+									 paylen, &cur, vs->cbuf) > 0)
 			{
 				if (lion_item_covers(vs->cbuf, ckey))
 				{

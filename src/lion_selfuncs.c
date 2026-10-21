@@ -391,15 +391,16 @@ lion_probe_member(uint16 lo, void *arg)
 }
 
 /*
- * Does the entry, a private copy of itemsz bytes, hold a row the probe
- * accepts?  Its members are read in heap order until one does, through a
- * stream of its one set that pins nothing between containers (DESIGN.md
- * §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set VACUUM has
- * freed since reads as empty (DESIGN.md §18).
+ * Does the entry, a private copy of itemsz bytes of entry off on leaf blk,
+ * hold a row the probe accepts?  Its members are read in heap order until one
+ * does, through a stream of its one set that pins nothing between containers
+ * (DESIGN.md §29.3), as a WALK reads a walked entry.  A CHAIN copy whose set
+ * VACUUM has freed since reads as empty (DESIGN.md §18).
  */
 static bool
 lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
-					   LionEntryTuple *entry, Size itemsz)
+					   LionEntryTuple *entry, Size itemsz, BlockNumber blk,
+					   OffsetNumber off)
 {
 	LionPostingSet ps;
 	LionSetStream *st;
@@ -415,8 +416,8 @@ lion_probe_entry_alive(LionProbeHeap *ph, Relation index,
 	ps.pinbuf = InvalidBuffer;
 	ps.ntids = lion_entry_ntids(entry);
 	ps.ncontainers = lion_entry_ncontainers(entry);
-	ps.entryblk = InvalidBlockNumber;
-	ps.entryoff = InvalidOffsetNumber;
+	ps.entryblk = blk;
+	ps.entryoff = off;
 	ps.cxt = CurrentMemoryContext;
 	if ((entry->flags & LION_ENTRY_INLINE) != 0)
 	{
@@ -474,6 +475,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	char	   *copy = (char *) palloc(BLCKSZ);
 	LionEntryTuple **items;
 	Size	   *sizes;
+	OffsetNumber *offs;
 	int			maxitems;
 	OffsetNumber boundary;
 	Buffer		buf;
@@ -488,6 +490,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 	maxitems = BLCKSZ / (MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData)) + 1;
 	items = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * maxitems);
 	sizes = (Size *) palloc(sizeof(Size) * maxitems);
+	offs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxitems);
 
 	buf = last ? lion_dir_value_end(index, state, &boundary) :
 		lion_dir_value_start(index, state, &boundary);
@@ -554,6 +557,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 			memcpy(dst, entry, sz);
 			items[n] = (LionEntryTuple *) dst;
 			sizes[n] = sz;
+			offs[n] = off;
 			n++;
 			dst += MAXALIGN(sz);
 		}
@@ -567,7 +571,8 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 		{
 			int			k = last ? n - 1 - i : i;
 
-			if (lion_probe_entry_alive(ph, index, items[k], sizes[k]))
+			if (lion_probe_entry_alive(ph, index, items[k], sizes[k], blkno,
+									   offs[k]))
 			{
 				*value = datumCopy(lion_entry_key(state, items[k]),
 								   state->typbyval, state->typlen);
@@ -604,6 +609,7 @@ lion_probe_walk(LionProbeHeap *ph, Relation index, LionState *state,
 
 	pfree(items);
 	pfree(sizes);
+	pfree(offs);
 	pfree(copy);
 	return found;
 }
