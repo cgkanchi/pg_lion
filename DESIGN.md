@@ -6587,10 +6587,12 @@ WARNING, once per backend per index (a static HTAB keyed by relation Oid), and n
 
 - Build: exact.  Pass 1 has just counted the distinct keys, so the test is `ndistinct > max_entries`.
 - Insert: a running estimate, and only on the one path that can add a key - creating a new entry.
-  **The heuristic is `entries on this bucket's chain + 1, times the bucket count`.**  Hashes spread
-  keys evenly enough for the product to have the right order of magnitude, and the bucket chain is
-  already locked and about to be walked anyway, so the guard costs nothing on the hot path.  It is
-  deliberately crude: counting the whole index per new key would read every bucket page.
+  **The heuristic is `entries on this directory leaf + 1, times the leaves`** (§21), the leaves
+  being the meta page's count of directory pages less the directory's height, and one at least
+  (`lion_insert_new_entry()`).  The index's other blocks - posting and position trees, free pages -
+  hold no entries: a column of five keys with 100,000 rows each is 62 blocks and one leaf.  The
+  leaf is already locked, and the meta page comes after it in a split's lock order.  It is
+  deliberately crude: counting the whole index per new key would read every leaf.
 
 ### Not supported
 
