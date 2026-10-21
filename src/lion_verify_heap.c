@@ -118,10 +118,17 @@ lion_verify_recheck_downlink(LionVerifyState *vs, const LionVerifyCand *cand)
 
 /*
  * Mark in found[] which of the n blocks in roots[] (sorted) an entry of the
- * directory names as its posting set's root.  One walk of the leaves, with
- * nothing but the entries' headers read: an entry the walk has not reached
- * yet may move right in a split, but only onto a page the walk still comes
- * to, so it is seen.
+ * directory names as the root of one of its trees: its posting set's, or -
+ * in a column that stores positions - its position tree's (DESIGN.md §17).
+ * Both come from the end of the relation, and both can grow out of the free
+ * space map before the walk is over.  One walk of the leaves, with nothing
+ * but the entries' headers (and position extensions) read: an entry the walk
+ * has not reached yet may move right in a split, but only onto a page the
+ * walk still comes to, so it is seen.
+ *
+ * Only the posting root used to be looked for, and a key inserted during the
+ * walk whose position tree took a leaf from the free space map was reported
+ * as "block N is not reachable from the meta page" (2026-10-20 review).
  */
 static void
 lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
@@ -158,6 +165,18 @@ lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
 										  lion_verify_blkcmp);
 			if (hit != NULL)
 				found[hit - roots] = true;
+
+			/* the extension lies inside the item, before its payload */
+			if ((e->flags & LION_ENTRY_POSITIONS) != 0 &&
+				ItemIdGetLength(iid) >= LionEntryPayloadOffset(e))
+			{
+				ehead = lion_entry_posext(e)->pos_root;
+				hit = (BlockNumber *) bsearch(&ehead, roots, n,
+											  sizeof(BlockNumber),
+											  lion_verify_blkcmp);
+				if (hit != NULL)
+					found[hit - roots] = true;
+			}
 		}
 		next = LionPageGetOpaque(page)->rightlink;
 		UnlockReleaseBuffer(buf);
@@ -171,6 +190,43 @@ lion_verify_find_heads(LionVerifyState *vs, const BlockNumber *roots, int n,
 }
 
 /*
+ * The first key a search for a page of a posting set or a position tree
+ * uses: a leaf's minckey, an internal page's first separator.  False when it
+ * has none - an empty leaf, an internal page without a downlink.  The page's
+ * header bounds have been checked.
+ */
+static bool
+lion_verify_tree_page_key(LionVerifyState *vs, BlockNumber blk, Page page,
+						  uint32 *ckey)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber first = lion_posting_first_data(page);
+	ItemId		iid;
+
+	if (maxoff < FirstOffsetNumber)
+		return false;
+	if (LionPageGetOpaque(page)->level == 0)
+	{
+		*ckey = LionPageGetOpaque(page)->minckey;
+		return true;
+	}
+	if (first > maxoff)
+		return false;
+
+	/*
+	 * The line pointer is vouched for before the pivot is read, as every
+	 * other item this file reads is: its length alone says nothing about
+	 * WHERE it points, and a damaged offset put the "pivot" past the end of
+	 * the page.
+	 */
+	iid = lion_verify_itemid(vs, blk, page, first);
+	if (!ItemIdIsUsed(iid) || ItemIdGetLength(iid) != LION_POSTING_PIVOT_SIZE)
+		return false;
+	*ckey = lion_posting_pivot(page, first)->ckey;
+	return true;
+}
+
+/*
  * What a page no walk reached is, read again after the wait: its kind, its
  * level, and the first key a search for it would use.  False when it has no
  * first key to search for.
@@ -179,8 +235,8 @@ typedef struct LionVerifyUnreached
 {
 	bool		isdir;
 	uint16		level;
-	BlockNumber ohead;			/* a posting page's root */
-	uint32		ckey;			/* ... and its first container key */
+	BlockNumber ohead;			/* a posting or position page's root */
+	uint32		ckey;			/* ... and its first key */
 	LionEntryTuple *first;		/* a directory page's first item (a copy) */
 } LionVerifyUnreached;
 
@@ -235,33 +291,10 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 				}
 			}
 		}
-		else if (LionPageIsContainer(page) && maxoff >= FirstOffsetNumber)
+		else if (LionPageIsContainer(page))
 		{
-			OffsetNumber first = lion_posting_first_data(page);
-
 			u->ohead = opaque->owner_head;
-			if (opaque->level == 0)
-			{
-				u->ckey = opaque->minckey;
-				ok = true;
-			}
-			else if (first <= maxoff)
-			{
-				/*
-				 * The line pointer is vouched for before the pivot is read,
-				 * as every other item this file reads is: its length alone
-				 * says nothing about WHERE it points, and a damaged offset
-				 * put the "pivot" past the end of the page.
-				 */
-				ItemId		iid = lion_verify_itemid(vs, blk, page, first);
-
-				if (ItemIdIsUsed(iid) &&
-					ItemIdGetLength(iid) == LION_POSTING_PIVOT_SIZE)
-				{
-					u->ckey = lion_posting_pivot(page, first)->ckey;
-					ok = true;
-				}
-			}
+			ok = lion_verify_tree_page_key(vs, blk, page, &u->ckey);
 		}
 	}
 
@@ -270,14 +303,87 @@ lion_verify_read_unreached(LionVerifyState *vs, BlockNumber blk,
 }
 
 /*
+ * Is blk on `level` of the tree - a posting set, or a position tree - rooted
+ * at root, where a search for its first key ckey goes?  The search takes the
+ * route of what sorts just BELOW ckey (lion_posting_search_level() with
+ * before), which lands at or left of every page of the level whose first key
+ * is ckey, and the level is then walked right to blk, or to the first page
+ * whose own first key is above ckey, past which blk cannot be: the first
+ * keys of a level do not descend from left to right.  Each step lets go of
+ * the page before it takes the next, as a reader's does; pages only ever
+ * enter a level while VACUUM is locked out, and a split puts its new page
+ * right of the one it splits, so a page right of the one let go is still
+ * right of it.
+ *
+ * A search for ckey itself used to have to land on blk, and in a position
+ * tree it often does not (2026-10-20 review).  Its keys are heap blocks, and
+ * one block's members can fill more than one leaf (lion_postree.c): a leaf's
+ * first key is then its left neighbour's last, where the reader's walk right
+ * along the leaves stops, and leaves can share a separator, where the
+ * descent goes to the last of them.  A leaf an insert split off an existing
+ * key's position tree while the check walked was reported as "block N is not
+ * reachable from the meta page".  A posting set's container keys do not
+ * repeat, but its separators can (a split whose halves are both empty by the
+ * time it is repaired gives the right one the left one's, DESIGN.md §22),
+ * and the walk costs it nothing: blk is the page the search lands on, or the
+ * one after it.
+ */
+static bool
+lion_verify_on_level(LionVerifyState *vs, BlockNumber root, BlockNumber blk,
+					 uint32 ckey, uint16 level)
+{
+	Buffer		buf = lion_posting_search_level(vs->index, root, ckey, level,
+												true);
+	BlockNumber steps = 0;
+
+	while (BufferIsValid(buf))
+	{
+		Page		page = BufferGetPage(buf);
+		BlockNumber cur = BufferGetBlockNumber(buf);
+		BlockNumber next = LionPageGetOpaque(page)->rightlink;
+		uint32		first;
+
+		if (cur == blk)
+		{
+			UnlockReleaseBuffer(buf);
+			return true;
+		}
+
+		/* a page of the tree, perhaps one nothing has checked yet */
+		lion_verify_page_bounds(vs, cur, page);
+		if (LionPageIsRightmost(page) || ++steps > vs->nblocks ||
+			(lion_verify_tree_page_key(vs, cur, page, &first) && first > ckey))
+			break;
+
+		UnlockReleaseBuffer(buf);
+		buf = InvalidBuffer;
+		CHECK_FOR_INTERRUPTS();
+		if (!lion_verify_block_exists(vs, next))
+			break;
+		buf = ReadBuffer(vs->index, next);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		if (!lion_page_owns_tree(page, root) ||
+			LionPageGetOpaque(page)->level != level)
+			break;
+	}
+
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	return false;
+}
+
+/*
  * Is blk, a page no walk reached, part of its tree now that the writers that
  * were in flight are done?  A search for the page's own first key has to land
- * on it: from the directory's root for a directory page, from its posting
- * set's root for a posting page - a root that is itself reached, or named by
- * an entry (rootfound).  A root of a posting set is part of the index when an
- * entry names it.  A search races with the writers that started since the
- * wait, and the page's first key can move right in a split of the page, so a
- * miss is tried again, with the key read again, a few times.
+ * on it: from the directory's root for a directory page; from its tree's root
+ * for a page of a posting set or a position tree - a root that is itself
+ * reached, or named by an entry (rootfound) - where the search lands at or
+ * left of it and its level is walked to it (lion_verify_on_level()).  A root
+ * is part of the index when an entry names it.  A search races with the
+ * writers that started since the wait, and the page's first key can move
+ * right in a split of the page, so a miss is tried again, with the key read
+ * again, a few times.
  */
 static bool
 lion_verify_confirm(LionVerifyState *vs, BlockNumber blk,
@@ -322,7 +428,10 @@ lion_verify_confirm(LionVerifyState *vs, BlockNumber blk,
 				if (r == NULL || !rootfound[r - roots])
 					return false;
 			}
-			buf = lion_posting_search_level(vs->index, u.ohead, u.ckey, u.level);
+			if (lion_verify_on_level(vs, u.ohead, blk, u.ckey, u.level))
+				return true;
+			CHECK_FOR_INTERRUPTS();
+			continue;
 		}
 
 		if (!BufferIsValid(buf))
@@ -372,12 +481,14 @@ lion_verify_recheck(LionVerifyState *vs)
 	/*
 	 * The roots no walk reached are found through the entries that name them,
 	 * all in one walk of the leaves: an unreached page that is a root itself,
-	 * and the root an unreached posting page is stamped with.  The second is
-	 * not a candidate in its own right when a writer made it: a posting set's
-	 * root always comes from the end of the relation (§18), past the blocks
-	 * the reachability pass looks at, while the pages the set grows by later
-	 * may come out of the free space map, well inside them.  A new key, or an
-	 * entry the walk read INLINE and a writer spilled, is exactly that.
+	 * and the root an unreached posting or position page is stamped with.
+	 * The second is not a candidate in its own right when a writer made it:
+	 * the root of a posting set or of a position tree always comes from the
+	 * end of the relation (§18, §17), past the blocks the reachability pass
+	 * looks at, while the pages the tree grows by later may come out of the
+	 * free space map, well inside them.  A new key, or an entry the walk read
+	 * INLINE and a writer spilled, is exactly that - twice over in a column
+	 * that stores positions.
 	 */
 	roots = (BlockNumber *) palloc(sizeof(BlockNumber) * vs->ncands);
 	for (i = 0; i < vs->ncands; i++)
