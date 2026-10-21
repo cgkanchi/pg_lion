@@ -1670,6 +1670,22 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    bound, 20M candidates - which a standby produces for any 20M-row posting
    set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
    allocation.
+   That holds for ONE merge, whose list comes out in block order. A count taken in PASSES - the
+   disjoint sum's entries (§15), a long list's batches (`lion_run_batches()`, §15 "Bounded
+   cursors") - yields every container key from the first again in each pass, so the dirty blocks
+   one pass queues are the next pass's too, and a flush would read them again in every pass after
+   it: flushed so, at 64 kB of work_mem `x IN (1, 2)` over a fully dirty heap of 4,286 pages
+   would recheck 8,573 blocks (the regression is `test/sql/countbudget.sql`'s). Such a count's list
+   (`LionCountCtx.passes`) is not flushed while a pass is still to come: once it is full, it and every
+   TID after it go to a sort of their codes (`lion_recheck_spill()`) that is given work_mem and
+   writes sorted runs to temporary files past it, as a Sort node does, and the flush at the end
+   reads it back in order into a list of `LION_RECHECK_MIN_BATCH`, flushed at block boundaries like
+   one merge's, so every dirty block is read once (EXPLAIN ANALYZE: `Heap TIDs Spilled`). Each TID
+   waits in the sort for the recheck an unbounded list would have made at the end of the count, and
+   a recheck needs no pin (below). An existence test (§26) is not taken in passes: it rechecks after
+   every container until it is settled, and may read a block of a later entry again. Counts of
+   their own - a GROUP BY's groups, the batches a node locates a long list in ("A list too long to
+   locate at once"), a range walk's entries - share the visibility cache of step 6 instead.
    Flushing mid-merge does not weaken the interlock above: the ordering rule is that the VM question
    about a container's blocks is asked before the pin on the page that container came from is
    released, and a flush asks no VM question - those are what put the TIDs on the list. Rechecking a
@@ -4505,7 +4521,9 @@ IN list names instead of to all of them.
 
 `lion_count_sources_cached()` therefore counts each entry's posting set on its own -
 `lion_count_one_set()`, one pass of the ordinary single-key machinery per entry, sharing the
-visibility-map pin, the recheck batch and the visibility cache - and adds the results up, whenever
+visibility-map pin, the recheck batch (spilled to a sort rather than flushed while an entry is
+still to come, so that a dirty block is read once, §9 step 5) and the visibility cache - and adds
+the results up, whenever
 
 - the IN list is the ONLY positive source (`count(*) WHERE k IN (...)`, the common shape), and
 - there is no GROUP BY driver, and
@@ -4898,8 +4916,9 @@ What changed, each where the cost was:
   U_m the batches' unions, R the intersection of the other positive sources and N the union of the
   negated ones, `|((U_1 ∪ ... ∪ U_m) ∩ R) \ N| = Σ_j |(U_j ∩ R) \ N|`, the terms being disjoint -
   the sum's own argument, one batch at a time instead of one set. Every pass accumulates into the
-  same recheck queue, visibility-map pin and visibility cache, as the sum's passes do. A list that
-  fits is one pass, and nothing changes for it.
+  same recheck queue, visibility-map pin and visibility cache, as the sum's passes do, and the
+  queue is spilled to a sort rather than flushed while a batch is still to come (§9 step 5). A list
+  that fits is one pass, and nothing changes for it.
 - **Any other union too wide is WINDOWED** (`lion_wide_fill()`). A union that is not disjoint -
   an OR across columns (§19), a multi-key OR (§17), a list under an OR - cannot be cut into batches
   that add up, so an OR node too big for the budget opens its children ONE AT A TIME: for a window
