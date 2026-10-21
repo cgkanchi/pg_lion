@@ -15243,8 +15243,14 @@ Lion's cost model now makes the same correction itself, from lion's directory (`
   state per TID; the probe keeps one of each (`lion_tid_fetch_begin()`, lion_compat.h), and the pin
   on a page while its TIDs are asked about (2026-09-28 review).
 - **Once per planner run.** The ends are cached for the PlannerGlobal of the query, in its memory,
-  and forgotten when that memory is reset. Neither a hypothetical nor a partial index is read, nor the
-  parent of an inheritance tree. A column core reads itself - it has a btree on it - is left to core.
+  and forgotten when that memory is reset. A planner run nested inside another - a function an
+  estimate evaluates that plans a query of its own - keeps a cache of its own beside the outer
+  run's, which it leaves as it found it (`lion_run_cache_for()`). Neither a hypothetical nor a
+  partial index is read, nor the parent of an inheritance tree. A column core reads itself is left
+  to core: one that leads an index core reads ends from - ordered, whole, able to return the column,
+  under the histogram's collation and in the order of its sort operator (`lion_core_probes()`). A
+  btree on the column under another collation, or a `text_pattern_ops` one under text's own `<`, is
+  one core passes over, and the probe reads the column's ends from lion.
 - **An end found empty is not read again at every plan** (2026-09-28 review). Where the probe found
   no live key - it reached a bound, or read the column's whole run - the backend remembers so, per
   index, key column and end (`lion_probe_missed()`, sixteen at most), in place of the dead entries
