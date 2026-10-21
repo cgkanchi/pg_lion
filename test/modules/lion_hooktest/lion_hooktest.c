@@ -279,6 +279,29 @@ lion_hooktest_cells(void)
 }
 
 /*
+ * The ANTI member of a plan of the anti join over a small inner side
+ * (DESIGN.md §27) looking `nkey` keys up in pg_class's oid index, its one
+ * join clause and no restriction.
+ */
+static List *
+lion_hooktest_anti(int nkey)
+{
+	List	   *ints = list_make4_int(0, nkey, 1, 0);
+	List	   *oids = list_make1_oid(ClassOidIndexId);
+	int			i;
+
+	for (i = 0; i < nkey; i++)
+		ints = lappend_int(ints, 1);
+	for (i = 0; i < nkey; i++)
+		oids = lappend_oid(oids, (Oid) 607);	/* oid = oid */
+	for (i = 0; i < nkey; i++)
+		oids = lappend_oid(oids, InvalidOid);
+	for (i = 0; i < 4; i++)
+		oids = lappend_oid(oids, InvalidOid);
+	return list_make2(ints, oids);
+}
+
+/*
  * pg_lion's decoder of a LionCount plan's custom_private, and the rules
  * between its members (lion_count_priv_decode() and lion_count_priv_check(),
  * src/lion_plan_private.h), handed a list a planner of this build would make
@@ -446,6 +469,13 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 	else if (strcmp(variant, "cell predicate without cells") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make2_int(LION_TL_CELLPRED(0), LION_TL_COUNT);
+	else if (strcmp(variant, "anti join without its child") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(1);
+	else if (strcmp(variant, "anti join of no key") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(0);
+	else if (strcmp(variant, "inner column without an anti join") == 0)
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make2_int(LION_TL_COUNT, LION_TL_ANTI(1));
 	else
 		elog(ERROR, "unknown variant \"%s\"", variant);
 

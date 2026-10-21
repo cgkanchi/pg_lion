@@ -706,6 +706,20 @@ working around a bad choice:
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
   the heap row of each row the others select (DESIGN.md §10, "Residual clauses"). Off, such a count
   goes to the ordinary plan.
+- `pg_lion.enable_count_anti`: let the count pushdown answer `SELECT count(*) FROM t WHERE ... AND
+  NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)` over a small inner side as the count of the
+  `WHERE` less the rows some inner row matches: the node runs the inner side as its child, looks
+  each distinct key of its rows up in a B-tree on `t.k` under the query's snapshot, and subtracts
+  the rows found that pass the join's clauses and `t`'s own (DESIGN.md §27, "The anti join over a
+  small inner side"). Also `count(1)`, a `count(col)` the pushdown answers, `count(DISTINCT)` of a
+  unique column, and a `GROUP BY` of `t`'s columns the pushdown groups by, a group that comes to
+  nothing left out; in parallel, the ungrouped count. It needs a B-tree whose first column is a key
+  of the join; the cost model leaves a large inner side to the ordinary plan. EXPLAIN prints `Join
+  Type: Anti`, `Join Rows: the rows counted, less those with a match`, `Join Lookup Index` and
+  `Join Cond` above the inner side's plan, and under ANALYZE `Join Child Rows`, `Join Keys Looked
+  Up`, `Join Rows Fetched` and `Join Rows Subtracted` (with `Join Child Time` and `Join Lookup Time`
+  under TIMING). `LEFT JOIN ... IS NULL` and `NOT IN` are left alone. Off, the pushdown does not
+  count an anti join this way.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot

@@ -3722,10 +3722,10 @@ taken - and expressions over them; nothing else) and the strategy (the decoded w
 collected copy, every range a source, a positive clause to begin from, no complement OR, no
 residual clause, no filtered count). The WHERE phase is the count's own; with cells being built, a
 clause no posting set answers that is a function of predicates (`lion_cells_shape_ok()`) is taken
-as one over cells instead of declining. A plain table only, not a partition, an FK-side join, a
-DISTINCT, a partial index's build (§45), a hot standby, or beside an expression column (§41). The
-GROUP BY of a column is never one: its plan is the plain walk's, which the cells build leaves
-alone.
+as one over cells instead of declining. A plain table only, not a partition, an FK-side join, the
+table of an anti join over a small inner side (§27), a DISTINCT, a partial index's build (§45), a
+hot standby, or beside an expression column (§41). The GROUP BY of a column is never one: its plan
+is the plain walk's, which the cells build leaves alone.
 
 **The price** (`lion_cost_cells_path()`): the driver's grouped count against the WHERE as
 `lion_cost_count_rel()` prices it, its containers decoded at the keys the WHERE's rows lie at; at
@@ -3743,14 +3743,14 @@ count, what each of its ranges pays again (the driver's walk begun anew and ever
 the range in each pass), and its partial rows - the cells with rows of its share of the rows, one
 set a participant.
 
-**The plan.** custom_private member 23, `LION_PRIV_CELLS` (shape 28): each dimension's kind,
-column, index, outcomes, NULL's outcome, the values with their outcomes or the leaves' operators and
+**The plan.** custom_private member 23, `LION_PRIV_CELLS` (shape 28): each dimension's kind, column,
+index, outcomes, NULL's outcome, the values with their outcomes or the leaves' operators and
 queries; each predicate's dimension and its truth in each outcome - a table for a scalar
 dimension's, a bit for a leaf, the two truths of a null test of a multi-key column; and the driver's
-dimension, or -1. TLKINDS is member 24, the members 25, the magic 0x5242491c. At the path stage
-the member also carries the predicates and the clauses over them, which `lion_plan_custom_path()`
-makes custom_scan_tlist's columns and the plan's qual. `LION_FLAG_DECODE` with the driver as the
-one GROUPN column.
+dimension, or -1. The anti join's ANTI member (24, §27) and TLKINDS (25) follow it: 26 members, the
+magic 0x5242491d. At the path stage the member also carries the predicates and the clauses over
+them, which `lion_plan_custom_path()` makes custom_scan_tlist's columns and the plan's qual.
+`LION_FLAG_DECODE` with the driver as the one GROUPN column.
 
 **EXPLAIN** prints the driver among `Lion Indexes` as a grouping column's, `Group Strategy: Cells`,
 `Cell Columns` - each dimension's index and column - `Cell Predicates` in their order, and `Cells`,
@@ -13934,6 +13934,196 @@ VACUUM - deletes and updates in the fact, the dimension and the folded table, wh
 and out of its filter, and new rows with NULL and new keys. `node_contracts.sql` and
 `exec_hook.sql` check the folded join's operator, `int48eq`, refused as the ordinary plan refuses it.
 
+### The anti join over a small inner side (2026-10-20)
+
+    SELECT count(*) FROM t WHERE <clauses the count answers on t>
+      AND NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k AND <filters on s>)
+
+counts t's rows WITHOUT a qualifying inner row: a complement of the forward semi join's union,
+which no count per key gives, and core's plan is an anti join over the whole of t. Where the inner
+side is a few rows, the complement is cheap the other way round: count t's WHERE as the count
+pushdown counts any, and take away the rows of it that some inner row matches, which a B-tree on
+`t.k` finds a key at a time.
+
+**What is computed.**
+
+    count = C - |M|
+    C = { rows of t visible under the snapshot that pass W }          (the count of W, §9)
+    M = { r in C : some row of the inner side passes every join clause with r }
+
+`W` is t's own restrictions (and, for `count(col)`, the `col IS NOT NULL` the count adds to them).
+The node runs the inner side as its child, once. Each child row's scan keys - the values of the
+inner expressions of the join clauses a B-tree on t looks up by - are evaluated; a row with a NULL
+key matches nothing (every key is a strict operator) and is skipped; the rest are kept once per
+distinct key tuple, and under each key each distinct inner row once (both by their bytes,
+`datum_image_eq()`). Each key is then looked up in the B-tree under the query's snapshot, and every
+row found is tested on all the join clauses, with each inner row of its key in turn, and on `W`; a
+row that passes is in M. With two clauses on the same column (`s.a = t.k AND s.b = t.k`) both are
+scan keys of it: the B-tree's preprocessing makes an inner row whose `a` and `b` differ an empty
+scan, and the clauses are tested on what is found anyway. Clauses that are not keys - `s.b <> t.g`,
+a clause of t alone inside the NOT EXISTS, which belongs to the join - are tested the same way.
+
+**Forms.** `count(*)`, `count(1)`, `count(col)` where the count answers it (a column declared NOT
+NULL, or the `IS NOT NULL` clause it adds, which the subtraction tests too: a row with a NULL `col`
+is in neither C nor M), a `count(DISTINCT col)` of a column proved unique (§26, "A unique column",
+which is that `count(col)`), and a GROUP BY of one or two of t's columns that LionCount groups by
+(§10, §20), with a HAVING, or folded by the planner to one group. Not: the decoded walk (§34) or
+a count by cells over it (§10, "Counts by cells"), a `count(DISTINCT)` walked, filtered counts,
+the aggregates over keys (§37), the top k (§36), a coalesce group, expression columns (§41), a
+partitioned or inheritance parent - each counts in a way the subtraction would have to follow, and
+none is needed by the query this is for.
+
+**Recognition** (`lion_fkjoin_recognize_small_anti()`, from the join rel `create_upper_paths_hook`
+is given at `UPPERREL_GROUP_AGG`, where §27's joins are recognised):
+
+- a sublink anti join - NOT EXISTS pulled up by core, its RTE_JOIN not in the FROM list - whose
+  outer side is exactly one table t and whose two sides make the whole join rel; any other special
+  join lies inside the inner side; no PlaceHolderVars, pseudoconstant quals or LATERAL references;
+- t a plain table or a materialized view as the fact of §27 is asked to be
+  (`lion_fkjoin_rel_ok()`), not a parent; the inner tables base relations with no TABLESAMPLE
+  (`lion_fkjoin_member_ok()`); the inner rel - one table, or the join rel of several - has a
+  cheapest path that is not parameterized;
+- the join clauses: the equivalence-class clauses between the two sides and t's joininfo clauses
+  within the join rel, each non-volatile, with no SubPlan, aggregate, window function or set-returning
+  function, over plain columns - t's, and the inner side's that its rel's target carries;
+- at least one of them a strict binary operator between a plain column of t and an expression of
+  the inner side alone: the keys.
+
+`LEFT JOIN s ON s.a = t.k WHERE s.a IS NULL`, which core makes an anti join of, keeps its `IS NULL`
+quals above the join, and is not a sublink anti join; `t.k NOT IN (SELECT s.a ...)` is a hashed
+SubPlan (or, on 19, an anti join only where both sides are proved non-NULL). Both are left alone:
+they are not free, and nothing asked for them.
+
+**The B-tree** (`lion_anti_choose()`, lion_plan_anti.c): a B-tree of t's own that has
+`amgettuple`, not hypothetical, whole or partial with a predicate t's restrictions imply (`predOK`:
+a row outside it fails `W`, and is in neither C nor M), with an equality scan key on its first
+column at least. A key is a scan key of index column c when the column is the key's t column, the
+operator - commuted when t's column is its right operand - is the equality of c's operator family
+with c's opclass type on the left, and its collation is the index's (or the index has none). The
+scan keys cover a prefix of the columns, each with every key that is one of its; the B-tree that
+covers the most columns is taken, and of those the smallest. None, and the query is core's.
+
+Two keys the node keeps apart by their bytes may still be equal - a cross-type key, numeric's `1.0`
+and `1.00`, a nondeterministic collation - and find the same row twice. Unless every scan key is of
+the column's own type and the column's equality is its type's own, under which equal values are the
+same bytes (`lion_index_can_emit_value()`, `LION_ANTIFLAG_TIDS`), the node keeps the TIDs of the
+rows in M and counts each once.
+
+**Why the subtraction is exact.** The count and the lookups are made under one snapshot S,
+`es_snapshot`:
+
+- C is the count of W under S (§9: the interlock makes every count exact under the snapshot the
+  query runs with, the visibility of each candidate row decided by S).
+- An MVCC index scan returns, for one scan key, each row version visible under S whose key equals it
+  once: a heap-only tuple through its chain's root entry, a version an index entry points at
+  directly through that entry, and nothing for the entries of versions S does not see. Every
+  version has an entry under its own key (or, heap-only, its root has one under the same key), so a
+  row visible under S with `t.k = v` is found by the lookup of `v`.
+- Every row found is tested on W on the version S sees: a row in M passes W and is visible under
+  S, so `M ⊆ C`, and no row is subtracted that the count did not count. Every row of C with a
+  matching inner row has a key equal under the join's operator to that row's, which is not NULL
+  (the operators are strict), and the lookup of that value finds it: M is complete.
+- Distinct lookups find disjoint rows when equal keys are equal bytes; otherwise the TIDs keep each
+  row of M once.
+- The inner side is core's plan under S, as the ordinary anti join's is: the same inner rows.
+
+So the count is `|{ r ∈ C : no inner row matches r }|`, which is what core's plan counts. §11's
+rule - lion's VACUUM leaves a posting set's TIDs alone while a scan may need them - is about lion's
+own sets, which C reads under it; the B-tree is core's, and core's VACUUM removes an entry only once
+its version is dead to every snapshot, S among them. Each structure is exact under S on its own, so
+nothing ties the two together. Rows the query's own transaction changed are seen as S's command id
+says, by both.
+
+**Execution** (lion_exec_anti.c). The run is made once, at the start of the first row's call, after
+the clause values are evaluated and before the count locates anything, so that no lion pin is held
+while the child runs. Reading the child, looking the keys up (the B-tree opened then, under
+`AccessShareLock`), testing each row found in a slot of the node's scan tuple - t's columns read
+from the heap tuple, the inner row's beside them - and adding it to the subtraction: one total for
+an ungrouped count, or, for a GROUP BY, each row's group (its grouping columns read from the heap
+tuple, hashed and compared with the grouping's own equality and hash function, under its collation).
+`lion_emit_keys()` takes each row's subtraction off its count: a group left with none is no row, as
+a group with no rows to start with is not, and so is the one group of a GROUP BY the planner folded;
+a plain count's one row stays a row, of 0. A subtraction larger than the count is an error in a
+serial plan, which the argument above rules out. A rescan makes the run again: the child is rescanned
+with the changed parameters core does not hand to `custom_ps`, and a parameter of t's WHERE or of
+the inner side's filters is the new one's.
+
+**Parallel.** The ungrouped count only, offered as §10's parallel count: the participants divide the
+count, and the participant that comes to the run first (an atomic flag in the node's shared memory,
+`antiowner`) makes it - runs the child, looks the keys up, and takes the whole subtraction off its
+partial count; the others take nothing off theirs, and the Finalize Aggregate adds them up. A partial
+count may go below zero. The child is the inner side's cheapest path a worker may run, unparameterized
+and not partial (the serial node's cheapest may be a Gather). Without a shared memory (none could be
+made) the participant subtracts. A rescan of the Gather clears the flag. EXPLAIN ANALYZE's counters
+are every participant's, summed.
+
+**Cost.**
+
+    the count's price (converted, §39)
+      + lion_units_price(the lookups)          (converted, as the node's own work)
+      + the child's total cost                 (core's plan, in core's units, as a dimension's)
+
+all of it before the first row. The lookups are priced as core prices an index scan repeated once per
+outer row of a nested loop (`cost_index()`, `btcostestimate()`): `lookups` = the inner key
+expressions' distinct values (`estimate_num_groups()`) over the child's rows, no more than the rows;
+each finds t's rows over the distinct values of its key columns; a descent costs
+`ceil(log2(index tuples)) * cpu_operator_cost` and `(height + 1) * 50 * cpu_operator_cost`; each
+index tuple read `cpu_index_tuple_cost` and a `cpu_operator_cost` per scan key; the index pages over
+every lookup by `index_pages_fetched()` at the random page cost; the heap pages between as many as
+the rows (no order) and a lookup's share of the table's pages (the index's order), as far between as
+the correlation squared puts them, at the random page cost; each row found a `cpu_tuple_cost` and the
+clauses it is tested on; a `cpu_operator_cost` a row for the TIDs and each grouping column; and each
+child row's keys evaluated and hashed. A large inner side is many descents and many rows, which the
+ordinary plan's one pass over t undercuts: the cost model, nothing else, leaves it to core. On
+PostgreSQL 18 the path carries the child's disabled nodes.
+
+**The plan.** `custom_private` grows (shape 29) an `ANTI` member, 24, after the cells' (§10): the
+flags, the B-tree, its scan keys' columns, operators and collations, the number of keys, join
+clauses and restrictions, and the grouping columns' equalities and collations; at the PATH stage
+also the expressions - the keys' inner values, the join clauses and the restrictions - which
+`lion_plan_custom_path()` appends to `custom_exprs` after the residual clauses, where setrefs.c
+points their columns at `custom_scan_tlist`: t's as a residual clause's are (`LION_TL_RESID`), the
+inner side's as `LION_TL_ANTI` entries naming their place in the child's target list. The plan check
+requires its one child and refuses it beside the FK-side join, partitions, the decoded walk and the
+other forms above. EXPLAIN prints, under the node's indexes:
+
+    Join Type: Anti
+    Join Rows: the rows counted, less those with a match
+    Join Lookup Index: t_k_idx
+    Join Cond: (s.a = k)
+
+the join clauses deparsed as core prints a join's (t's columns bare, as in a `Residual Filter`), and
+under ANALYZE `Join Child Rows`, `Join Keys Looked Up` (distinct keys, NULL ones not), `Join Rows
+Fetched` and `Join Rows Subtracted`, with `Join Child Time` and `Join Lookup Time` under TIMING. The
+child is printed under the node. `pg_lion.enable_count_anti` turns it off.
+
+**Beside the FK-side anti join.** A reverse anti join - `SELECT count(*) FROM dim d WHERE NOT EXISTS
+(SELECT 1 FROM fact f WHERE f.fk = d.pk ...)` - is both §27's anti join, the dimension's rows
+tested against the fact's posting sets, and this one, with the fact's rows as the inner side and the
+dimension's primary key as the B-tree; the cost model chooses. The suites of the FK-side join that
+pin its plans turn this one off.
+
+Measured (2026-10-20, PostgreSQL 18, a synthetic table of 3M rows of some 240 bytes - 710 MB - whose
+key has 1M values of three rows each scattered over the heap, a B-tree on the key and a lion index
+on the WHERE's column; warm, best of 7 runs - of 5 for the larger inner sides - on a machine other
+work kept busy; core's plan a parallel hash anti join with up to two workers):
+
+| WHERE | inner keys | LionCount | core's plan | the model's choice |
+|---|---|---|---|---|
+| a half | 2 | 15 ms | 181 ms | LionCount, parallel |
+| a half | 2,000 | 26 ms | 172 ms | LionCount, parallel |
+| a twentieth | 2 | 2.4 ms | 137 ms | LionCount |
+| a twentieth | 2,000 | 12 ms | 139 ms | LionCount |
+| a half | 20,000 | 149 ms | 240 ms | core |
+| a twentieth | 20,000 | 128 ms | 152 ms | core |
+| a half | 200,000 | 1,463 ms | 391 ms | core |
+| a twentieth | 200,000 | 1,215 ms | 184 ms | core |
+
+LionCount's times in the last four rows are with core's joins turned off. The model leaves the inner
+side to core somewhere between 2,000 and 20,000 keys, where the node is still a little faster on a
+warm cache: its heap fetches are priced at the random page cost, as core prices its own index
+scans.
+
 ### The dimension from a B-tree (2026-10-20)
 
 The node's child is core's: the dimension rel's cheapest total path, or its cheapest partial path
@@ -14002,9 +14192,6 @@ serially against 1,777 over the bitmap heap scan, and 689 against 1,194 on two w
   rows" does not answer**: of a fact column other than the key, ones that see multiplicity but
   counts and int2 or int4 sums (`avg`, `sum` of int8 or numeric, `string_agg`), and any with FILTER
   or ORDER BY.
-- **The anti join the other way round**, `NOT EXISTS (SELECT 1 FROM dim d WHERE d.k = f.fk ...)`
-  over the fact's rows: the fact rows WITHOUT a qualifying key, a complement of the forward semi
-  join's union that no count per key gives.
 - **A DISTINCT over an expression** or over a fact column other than the key, an fk of another
   type than the key, a DISTINCT under another collation than the join's ("count(DISTINCT)" above).
   A count of rows beside a `count(DISTINCT)` used to be declined here ("Every aggregate over the
@@ -14407,6 +14594,34 @@ at a `work_mem` of 64 kB, against the batches the executor made; next to nothing
 and an `ORDER BY ... LIMIT 5` over the path, a Sort above it over one batch and the outer side's
 order with no Sort over several. And a dirty heap - deletes, updates, fks moved, NULL keys made, on
 every table - before and after VACUUM.
+
+`test/sql/countanti.sql` (2026-10-20), the anti join over a small inner side, every answer against
+the pushdown off with sequential scans only, as a multiset both ways round (`lca()`), over a
+20,000-row table whose key has 400 values of some 50 rows each and NULLs: a WHERE of a half and of a
+tenth; NULL keys on both sides, duplicated inner keys, inner keys of no row and of rows the WHERE
+leaves out, an empty inner side, a WHERE with nothing left after the subtraction; the two-clause
+form over one column with inner rows whose two values differ; a clause of both sides beside the key,
+a clause of the counted table alone inside the NOT EXISTS, a key of an inner expression, a
+cross-type key, numeric keys equal in other spellings (each row subtracted once, by TID); an inner
+side that is a join; residual clauses beside the count's; `count(1)`, `count` of a key declared NOT
+NULL and of a nullable one, `count(DISTINCT)` of the primary key; GROUP BY of one and two columns, a
+group that drops to nothing and one the planner folded, HAVING; a two-column B-tree with the key
+first, by one scan key and by two, and one whose first column is no key's (declined); a dirty heap -
+deletes, updates of the key, of the WHERE's column and of a column no index has, new rows, the inner
+side updated - before and after VACUUM and inside the transaction that made it; generic plans with
+Params in the WHERE, in the inner side's filter and in a key's inner expression; a correlated
+subquery that rescans the node and its child; parallel - EXPLAIN of the Gather over the parallel
+node, the counters of the one participant that subtracts equal to the serial node's, a correlated
+rescan, the leader not taking part, and the GROUP BY left serial; the counters (`lca_counters()`),
+and EXPLAIN of the node, a GROUP BY, an inner join as the child, and of ANALYZE. The declines: no
+B-tree on the key, `LEFT JOIN ... IS NULL`, `NOT IN`, a WHERE clause nothing answers, a NOT EXISTS
+beside a second table in the FROM, a correlation by no equality, a GROUP BY of expressions over
+predicates and a WHERE over them (which a count by cells would answer without the subtraction), RLS
+on the counted table, a partitioned table, `pg_lion.enable_count_anti` off; and the cost model with
+nothing disabled: the node for a few keys of a row or so each, core's plan for an inner side of
+10,000 keys. `fkjoin_semi.sql` and `fkjoin_parallel.sql` turn it off, so that their reverse anti
+joins stay the FK-side join's plans they pin. `priv_decode.sql` (test/modules/lion_hooktest) refuses
+an ANTI member without its child, one of no key, and an inner column without an ANTI member.
 
 ## 28. Range predicates over the sorted directory (v1, implemented)
 

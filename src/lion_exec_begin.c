@@ -1922,7 +1922,9 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	LionCountScanState *st = (LionCountScanState *) node;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *exprs = cscan->custom_exprs;
+	List	   *own;
 	const LionCountPriv *priv = &st->plan;
+	int			nanti;
 
 	/*
 	 * custom_private is positional: every member's shape is checked before a
@@ -1939,6 +1941,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_count_priv_check(priv, cscan->scan.plan.parallel_aware,
 						  list_length(cscan->custom_plans));
 	st->mode = lion_count_mode_of(priv, cscan->scan.plan.parallel_aware);
+	nanti = lion_anti_nexprs(priv);
 
 	/*
 	 * One value expression per clause in custom_exprs, then one argument per
@@ -1946,12 +1949,19 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	 * drift, exactly like a wrong shape marker, and is said rather than
 	 * decoded.
 	 */
-	if (list_length(exprs) < priv->nclause + priv->nwagg ||
+	if (list_length(exprs) < priv->nclause + priv->nwagg + nanti ||
 		((priv->flags & LION_FLAG_RESID) == 0) !=
-		(list_length(exprs) == priv->nclause + priv->nwagg))
+		(list_length(exprs) == priv->nclause + priv->nwagg + nanti))
 		elog(ERROR, "LionCount: %d clauses but %d value expressions",
-			 priv->nclause, list_length(exprs) - priv->nwagg);
+			 priv->nclause, list_length(exprs) - priv->nwagg - nanti);
 	st->nclause = priv->nclause;
+
+	/*
+	 * ... and, last, the anti join's keys, clauses and restrictions
+	 * (DESIGN.md §27), which are its own: the rest is the count's.
+	 */
+	own = (nanti == 0) ? exprs :
+		list_copy_head(exprs, list_length(exprs) - nanti);
 
 	lion_begin_topk(st, priv, estate);
 	lion_begin_coalesce(st, priv, estate);
@@ -1960,9 +1970,9 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_inner(st, priv, estate);
 	lion_begin_join(st, priv, estate);
 	lion_begin_target_list(st, cscan, priv);
-	lion_begin_wagg(st, node, priv, exprs, estate);
-	lion_begin_residual(st, node, priv, exprs, estate);
-	lion_begin_clauses(st, node, priv, exprs);
+	lion_begin_wagg(st, node, priv, own, estate);
+	lion_begin_residual(st, node, priv, own, estate);
+	lion_begin_clauses(st, node, priv, own);
 	lion_begin_driving_column(st, priv);
 	lion_begin_ors_and_items(st, priv);
 	lion_begin_partitions(st, priv);
@@ -1977,6 +1987,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_join_key(st);
 	lion_begin_join_distinct_key(st, estate);
 	lion_begin_join_batches(st, estate);
+	lion_begin_anti(st, node, cscan, priv, exprs, estate, eflags);
 
 	if ((eflags & EXEC_FLAG_EXPLAIN_ONLY) != 0)
 		return;
