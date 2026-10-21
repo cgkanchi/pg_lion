@@ -1659,7 +1659,7 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    cursors") - yields every container key from the first again in each pass, so the dirty blocks
    one pass queues are the next pass's too, and a flush would read them again in every pass after
    it: flushed so, at 64 kB of work_mem `x IN (1, 2)` over a fully dirty heap of 4,286 pages
-   rechecked 8,573 blocks (2026-10-20 review; the regression is `test/sql/countbudget.sql`'s). Such a count's list
+   would recheck 8,573 blocks (the regression is `test/sql/countbudget.sql`'s). Such a count's list
    (`LionCountCtx.passes`) is not flushed while a pass is still to come: once it is full, it and every
    TID after it go to a sort of their codes (`lion_recheck_spill()`) that is given work_mem and
    writes sorted runs to temporary files past it, as a Sort node does, and the flush at the end
