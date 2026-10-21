@@ -84,11 +84,13 @@
 #include "lion.h"
 
 /*
- * The page at blk, which a link says is a directory page at `level`, read and
- * locked in lockmode; an ERROR when it is not one.
+ * The page at blk, which a link says is a directory page at `level`, read
+ * through strategy (NULL for the default) and locked in lockmode; an ERROR
+ * when it is not one.
  */
 static Buffer
-lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
+lion_dirdel_read_ext(Relation index, BlockNumber blk, int lockmode, int level,
+					 BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -99,7 +101,7 @@ lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
 				 errmsg("lion index \"%s\" links to an invalid block number",
 						RelationGetRelationName(index))));
 
-	buf = ReadBuffer(index, blk);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
 	LockBuffer(buf, lockmode);
 	page = BufferGetPage(buf);
 	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
@@ -116,6 +118,12 @@ lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
 						RelationGetRelationName(index), blk, level)));
 	}
 	return buf;
+}
+
+static Buffer
+lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
+{
+	return lion_dirdel_read_ext(index, blk, lockmode, level, NULL);
 }
 
 /* Does the page hold no data item?  (Its high key does not count.) */
@@ -319,6 +327,12 @@ lion_dirdel_find_parent(Relation index, LionIndexState *ix,
  * special area *opaque, holding nothing but a MINUS INFINITY high key: what a
  * HALF_DEAD leaf and a DELETED page look like.  hk is that key, built before
  * the record began.
+ *
+ * The caller registers p as initialised (LION_WALBUF_INIT): the record builds
+ * the page from nothing, so redo zeroes it and replays the two operations,
+ * and the record takes no full-page image of it.  Registered as an ordinary
+ * change, it would take one at every rewrite: lion_init_page() zeroes its
+ * LSN, which is then older than any checkpoint.
  */
 static void
 lion_dirdel_rewrite(LionWalState *xstate, Page p, const LionPageOpaqueData *opaque,
@@ -497,7 +511,7 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 	lion_wal_op_replace(xstate, p, poff, retarget, retargetsz);
 	PageIndexTupleDelete(p, OffsetNumberNext(poff));
 	lion_wal_op(xstate, p, LION_OP_DELETE, OffsetNumberNext(poff), 0, NULL, 0);
-	p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_STD);
+	p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_INIT);
 	lion_dirdel_rewrite(xstate, p, &halfdead, minf, minfsz);
 	lion_wal_finish(xstate, LION_XLOG_UNLINK);
 
@@ -699,7 +713,7 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		LionPageGetOpaque(p)->rightlink = rightsib;
 		lion_wal_log_special(xstate, p);
 	}
-	p = lion_wal_register_buffer(xstate, tbuf, LION_WALBUF_STD);
+	p = lion_wal_register_buffer(xstate, tbuf, LION_WALBUF_INIT);
 	lion_dirdel_rewrite(xstate, p, &deleted, minf, minfsz);
 	p = lion_wal_register_buffer(xstate, rbuf, LION_WALBUF_STD);
 	LionPageGetOpaque(p)->leftlink = leftsib;
@@ -729,15 +743,21 @@ out:
 }
 
 int
-lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk)
+lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
+					 BufferAccessStrategy strategy)
 {
 	Buffer		leafbuf;
 	Page		leaf;
 	int			ndeleted = 0;
 	bool		halfdead;
 
-	/* A look first, SHARE: nearly every leaf VACUUM walks is not empty. */
-	leafbuf = lion_dirdel_read(index, leafblk, BUFFER_LOCK_SHARE, 0);
+	/*
+	 * A look first, SHARE: nearly every leaf VACUUM walks is not empty.
+	 * Through VACUUM's strategy, as its walk read the leaf a moment ago: read
+	 * without it, every leaf of the index would stay in shared buffers.
+	 */
+	leafbuf = lion_dirdel_read_ext(index, leafblk, BUFFER_LOCK_SHARE, 0,
+								   strategy);
 	leaf = BufferGetPage(leafbuf);
 	halfdead = LionPageIsHalfDead(leaf) && !LionPageIsDeleted(leaf);
 	if (!halfdead && !lion_dirdel_leaf_candidate(leaf))

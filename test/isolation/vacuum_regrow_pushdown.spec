@@ -32,6 +32,11 @@
 # 191, every other one k = 1, give each key a BITSET a container key, about a
 # leaf each, and k = 1 its 16th leaf: the set has no internal level until the
 # regrow needs one more.  k = 2, a leaf longer, has one already.
+#
+# The second permutation parks the regrow before it tries the directory leaf
+# of both keys' entries, and an insert into k = 2 parks in a leaf split with
+# that leaf held: the regrow must wait for the leaf with nothing held and
+# then go on, with the push-down and the count as in the first.
 
 setup
 {
@@ -73,6 +78,38 @@ setup
 		RETURN 'never';
 	END $fn$;
 
+	/*
+	 * Waits until the VACUUM waits for a buffer content lock, reported as
+	 * 'a page lock' as above; and until a backend is parked at `point`.
+	 */
+	CREATE FUNCTION rgp_vacuum_waits() RETURNS text
+	LANGUAGE plpgsql AS $fn$
+	DECLARE ev text; evtype text;
+	BEGIN
+		FOR i IN 1 .. 3000 LOOP
+			PERFORM pg_stat_clear_snapshot();
+			SELECT wait_event, wait_event_type INTO ev, evtype
+			  FROM pg_stat_activity
+			 WHERE datname = current_database() AND query LIKE 'VACUUM%';
+			IF evtype = 'Buffer' OR ev = 'BufferContent' THEN
+				RETURN 'a page lock';
+			END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+		RETURN 'never';
+	END $fn$;
+	CREATE FUNCTION rgp_parked(point text) RETURNS boolean
+	LANGUAGE plpgsql AS $fn$
+	BEGIN
+		FOR i IN 1 .. 3000 LOOP
+			PERFORM pg_stat_clear_snapshot();
+			PERFORM 1 FROM pg_stat_activity WHERE wait_event = point;
+			IF FOUND THEN RETURN true; END IF;
+			PERFORM pg_sleep(0.01);
+		END LOOP;
+		RETURN false;
+	END $fn$;
+
 	CREATE FUNCTION rgp_release(point text) RETURNS void
 	LANGUAGE plpgsql AS $fn$
 	DECLARE n int; zero int := 0;
@@ -100,12 +137,18 @@ teardown
 {
 	DROP TABLE rgp;
 	DROP FUNCTION rgp_reader_waits(text, boolean);
+	DROP FUNCTION rgp_vacuum_waits();
+	DROP FUNCTION rgp_parked(text);
 	DROP FUNCTION rgp_release(text);
 	DO $$ BEGIN PERFORM injection_points_detach('lion-count-chain-entered');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-count-containers-pinned');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-pushdown-child');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-vacuum-regrow-locked');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-split-incomplete');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
@@ -151,6 +194,41 @@ setup
 }
 step s3_vacuum	{ VACUUM (INDEX_CLEANUP ON) rgp; }
 
+# The second permutation's VACUUM, parked in its regrow with k = 1's head
+# cleanup-locked and the leaf of both keys' entries not yet tried ...
+session s5
+setup
+{
+	SET synchronous_commit = on;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('lion-vacuum-regrow-locked', 'wait');
+}
+step s5_vacuum	{ VACUUM (INDEX_CLEANUP ON) rgp; }
+
+# ... and an insert into k = 2's set, parked in a split with that leaf held.
+session s6
+setup
+{
+	SET synchronous_commit = on;
+	SELECT injection_points_set_local();
+	SELECT injection_points_attach('lion-posting-split-incomplete', 'wait');
+}
+step s6_insert	{
+	INSERT INTO rgp SELECT i, 2, repeat('x', 70)
+	  FROM generate_series(200001, 240000) i;
+}
+
+# One step, because the VACUUM then waits for a buffer content lock, which
+# isolationtester cannot see: release the VACUUM, wait until it waits for the
+# leaf, then release the insert.
+session s7
+step s7_parked	{ SELECT rgp_parked('lion-posting-split-incomplete') AS insert_holds_the_leaf; }
+step s7_wake_both	{
+	SELECT rgp_release('lion-vacuum-regrow-locked');
+	SELECT rgp_vacuum_waits() AS vacuum_waits_on;
+	SELECT rgp_release('lion-posting-split-incomplete');
+}
+
 # Bookkeeping.
 session s4
 setup			{ SET pg_lion.enable_count_pushdown = off; SET synchronous_commit = on; }
@@ -179,5 +257,24 @@ permutation
 								# on; VACUUM ends
 	s2_wake_pinned				# the count consults the map: 42,341
 	s4_after					# one more leaf and one more internal page
+	s4_count
+	s4_verify
+
+# The regrow finds the leaf busy: an insert into the other key holds it.  It
+# lets go of k = 1's head, waits for the leaf with nothing else held, and
+# then takes the head's cleanup lock under it (lion_vacuum_regrow()), as
+# lion_vacuum_container_page() does: with the leaf held no insert can be on
+# the head, so the try fails only while a reader pins it.
+permutation
+	s4_prep
+	s2_delete
+	s4_before
+	s5_vacuum(s7_wake_both)		# parks in its regrow, the head held
+	s6_insert(s7_wake_both)		# k = 2's leaf splits, the leaf of the
+								# entries held
+	s7_parked
+	s7_wake_both				# the leaf is busy: VACUUM waits for it;
+								# the insert ends, and the regrow goes on
+	s4_after
 	s4_count
 	s4_verify

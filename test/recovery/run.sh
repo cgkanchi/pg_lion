@@ -1343,8 +1343,18 @@ phase1e() {
 # wal_mode = auto must still refuse an insert, and a VACUUM with dead rows to
 # remove from it, with a hint naming both the preload and a REINDEX in
 # generic mode - and that REINDEX must make it writable again.
+#
+# Where the server has injection points, one more index comes with work that
+# any VACUUM finds, removing or not: phase 1b's crash, with the manager,
+# leaves it with entries deleted and the pages of their chains leaked.  The
+# VACUUM without the manager has nothing to remove from it and must go
+# through, leaving the leaks for a VACUUM with the manager, which in rmgr
+# mode frees them at the end of the phase.  That VACUUM is given dead rows
+# to remove: one with none calls no ambulkdelete, and only ambulkdelete's
+# walk sweeps the index for leaks (lionvacuumcleanup()), as only nbtree's
+# btvacuumscan() finds its half-dead pages.
 phase1f() {
-	local before after custom off out
+	local before after custom off out leak=0 leaked parked vacpid
 	log ""
 	log "=== phase 1f: VACUUM of an rmgr-mode index on a server without the manager ==="
 
@@ -1354,6 +1364,52 @@ phase1f() {
 		-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries=pg_lion" \
 		-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not start the primary with the preload"
 	verify_node psql_p "$PRIMARY_DATA"
+
+	# An rmgr-mode index with work left over for any VACUUM, removing or
+	# not: phase 1b's crash between a whole-chain free's two steps, with the
+	# manager, leaves its entries deleted and the pages of their chains
+	# unreferenced.  A VACUUM without the manager has nothing to remove from
+	# it - the entries and their TIDs are gone - and must leave the leaks
+	# for one with the manager, not stop at the record that would free them.
+	if psql_p -c "CREATE EXTENSION IF NOT EXISTS injection_points" >>"$RUNLOG" 2>&1; then
+		leak=1
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: leak fixture failed"
+			SET synchronous_commit = on;
+			DROP TABLE IF EXISTS lion_norm_l;
+			CREATE TABLE lion_norm_l (id int, k int NOT NULL);
+			CREATE INDEX lion_norm_l_k ON lion_norm_l USING lion (k)
+				WITH (wal_mode = rmgr, inline_limit = 64);
+			INSERT INTO lion_norm_l SELECT i, i % 6 FROM generate_series(1, 120000) i;
+			VACUUM (ANALYZE) lion_norm_l;
+			DELETE FROM lion_norm_l WHERE k IN (0, 1, 2, 3);
+			SELECT injection_points_attach('lion-vacuum-entries-deleted', 'wait');
+		SQL
+		"$PGBIN/psql" -X -q -h "$SOCKDIR" -p "$PRIMARY_PORT" -U postgres -d "$DBNAME" \
+			-c "VACUUM (INDEX_CLEANUP ON) lion_norm_l" >>"$RUNLOG" 2>&1 &
+		vacpid=$!
+		wait_true psql_p \
+			"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-vacuum-entries-deleted'" \
+			60 "the VACUUM of lion_norm_l to park between the entry deletion and the page marking"
+		# what makes the first step durable, as in phase 1b
+		psql_p -c "CHECKPOINT" >>"$RUNLOG" 2>&1
+		parked=$(psql_p -tAc "select entries from lion_index_stats('lion_norm_l_k')")
+		[ "$parked" -lt 6 ] ||
+			die "phase 1f: the VACUUM of lion_norm_l parked before it had deleted an entry"
+		crash_immediate
+		wait "$vacpid" 2>/dev/null || true
+		as_server "$PGBIN/pg_ctl" -D "$PRIMARY_DATA" -l "$PRIMARY_LOG" \
+			-o "-p $PRIMARY_PORT -k $SOCKDIR -c listen_addresses='' -c shared_preload_libraries=pg_lion" \
+			-w -t 120 start >>"$RUNLOG" 2>&1 || die "phase 1f: could not restart the primary with the preload"
+		verify_node psql_p "$PRIMARY_DATA"
+		leaked=$(psql_p -c "SELECT lion_index_verify('lion_norm_l_k', true)" 2>&1 >>"$RUNLOG" |
+			grep -c 'unused and unreachable' || true)
+		[ "$leaked" -gt 0 ] ||
+			die "phase 1f: the crash leaked no page of lion_norm_l"
+	elif [ "$REQUIRE_INJECTION" = 1 ]; then
+		die "phase 1f's leaked index needs the injection_points extension, which this server does not have"
+	else
+		log "phase 1f: no injection_points extension, so no index with leaks to vacuum without the manager"
+	fi
 
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: fixture failed"
 		SET synchronous_commit = on;
@@ -1416,6 +1472,20 @@ phase1f() {
 		SET pg_lion.vacuum_barrier_ranges = 1;
 		VACUUM (INDEX_CLEANUP ON) lion_norm;
 	SQL
+	if [ "$leak" = 1 ]; then
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) lion_norm_l" >>"$RUNLOG" 2>&1 ||
+			die "phase 1f: the VACUUM of the index with leaks failed without the manager"
+		[ "$(psql_p -c "SELECT lion_index_verify('lion_norm_l_k', true)" 2>&1 >>"$RUNLOG" |
+			grep -c 'unused and unreachable' || true)" = "$leaked" ] ||
+			die "phase 1f: the VACUUM without the manager changed the $leaked leaked pages of lion_norm_l"
+		nu=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_norm_l where k = 4")
+		run_check "phase 1f leaks left" psql_p \
+			"select lion_index_count('lion_norm_l_k', 4) = $nu and $nu = 20000,
+					'the index with leaks counts the 20000 rows of k = 4'
+			 union all
+			 select (select entries from lion_index_stats('lion_norm_l_k')) = $parked,
+					'its entries are the $parked the crash left'"
+	fi
 	off=$(stat -c %s "$PRIMARY_LOG")
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL
 		SET synchronous_commit = on;
@@ -1469,10 +1539,33 @@ phase1f() {
 		die "phase 1f: could not stop the primary"
 	start_node "$PRIMARY_DATA" "$PRIMARY_PORT" "$PRIMARY_LOG"
 	verify_node psql_p "$PRIMARY_DATA"
+
+	# With the manager back, the next VACUUM that walks the index frees the
+	# leaks.  The VACUUM without the manager took the dead rows the crash
+	# left in the heap, so this one is given 17 of its own to remove: without
+	# them it would call no ambulkdelete, whose walk is what sweeps for them.
+	if [ "$leak" = 1 ] && [ "$MODE" = rmgr ]; then
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1f: the VACUUM of lion_norm_l failed with the manager"
+			SET synchronous_commit = on;
+			DELETE FROM lion_norm_l WHERE k = 4 AND id <= 100;
+			VACUUM (INDEX_CLEANUP ON) lion_norm_l;
+		SQL
+		[ "$(psql_p -c "SELECT lion_index_verify('lion_norm_l_k', true)" 2>&1 >>"$RUNLOG" |
+			grep -c 'unused and unreachable' || true)" = 0 ] ||
+			die "phase 1f: the VACUUM with the manager left pages of lion_norm_l leaked"
+		nu=$(PGOPTIONS="$HEAPONLY" psql_p -tAc "select count(*) from lion_norm_l where k = 4")
+		run_check "phase 1f leaks freed" psql_p \
+			"select lion_index_count('lion_norm_l_k', 4) = $nu and $nu = 19983,
+					'the index counts the 19983 rows of k = 4 left'"
+	fi
+	psql_p -c "DROP TABLE IF EXISTS lion_norm_l" >>"$RUNLOG" 2>&1
 	psql_p -c "DROP TABLE lion_norm, lion_norm_flush, lion_norm_u, lion_norm_w" >>"$RUNLOG" 2>&1
 
 	log "phase 1f: no record of an unregistered manager in $before..$after, and recovery went through it"
 	SUMMARY+=("phase1f            VACUUM without the manager wrote nothing it could not replay")
+	if [ "$leak" = 1 ]; then
+		SUMMARY+=("phase1f            ... and left the $leaked pages a crash leaked for a VACUUM with it")
+	fi
 	SUMMARY+=("phase1f            an unlogged rmgr-mode index was written without the manager")
 	SUMMARY+=("phase1f            a logged one refused insert and VACUUM with the hint, until REINDEXed generic")
 }
