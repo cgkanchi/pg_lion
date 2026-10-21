@@ -1192,15 +1192,35 @@ lion_sumall_relation(LionCountScanState *st)
 }
 
 /*
+ * Is the source one set collected into memory or a file - a list too long to
+ * locate at once (lion_locate_list()), a range taken as a source - with no
+ * chain behind it: one that pins nothing as it is counted?
+ */
+static bool
+lion_source_collected(const LionCountSource *src)
+{
+	return src->nsets == 1 && src->sets[0].found && src->sets[0].mat != NULL &&
+		!BlockNumberIsValid(src->sets[0].head);
+}
+
+/*
  * Does an item of the run being counted select rows and carry the §9
- * interlock whatever its value: a clause of an equality, a list or `IS
- * NULL`, or an OR none of whose leaves is a range taken as a source
- * (DESIGN.md §32) and none of whose arms is a complement?  An OR with a
- * complement arm selects nothing by itself (§35, "Complements in an OR"):
- * the rows outside M are every row but a few sets', which only a sum over
- * every row can hand the count.  A multi-key clause is not counted on: its
- * query may turn out to narrow nothing (§17).  The planner asks the same of
- * the run's clauses (lion_count_run_plain(), lion_partial_run_plain()).
+ * interlock whatever its value: a clause of an equality, a list located as
+ * its values' sets or `IS NULL`, or an OR none of whose leaves is a range
+ * taken as a source (DESIGN.md §32) and none of whose arms is a complement?
+ * An OR with a complement arm selects nothing by itself (§35, "Complements in
+ * an OR"): the rows outside M are every row but a few sets', which only a sum
+ * over every row can hand the count.  A multi-key clause is not counted on:
+ * its query may turn out to narrow nothing (§17).  The planner asks the same
+ * of the run's clauses (lion_count_run_plain(), lion_partial_run_plain()).
+ *
+ * A list too long to locate at once is collected into one pinless set
+ * instead (DESIGN.md §15, "A list too long to locate at once"), as a range
+ * taken as a source is, and carries the interlock no more than the range
+ * does: as the run's one source the map could answer for none of its rows,
+ * which would all go to the heap (lion_count_one_set()), where the sum's
+ * driving walk carries the interlock for them.  Which lists are collected is
+ * known only now: a parameter's length is the run's, not the plan's.
  */
 static bool
 lion_run_has_plain_source(LionCountScanState *st)
@@ -1231,8 +1251,11 @@ lion_run_has_plain_source(LionCountScanState *st)
 			continue;
 		switch (st->clause[it->clauseno].kind)
 		{
-			case LION_CLAUSE_EQ:
 			case LION_CLAUSE_ARRAY:
+				if (lion_source_collected(&st->sources[k + 1]))
+					break;
+				return true;
+			case LION_CLAUSE_EQ:
 			case LION_CLAUSE_NULL:
 			case LION_CLAUSE_RESERVED:
 				return true;
