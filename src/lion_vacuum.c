@@ -149,6 +149,7 @@
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
+#include "storage/procarray.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
@@ -245,8 +246,27 @@ typedef struct LionVacState
 	int64		pages_newly_deleted;	/* pages this call freed */
 	int64		pages_deleted;	/* free pages the index holds now */
 	int64		pages_free;		/* ... of which reusable now */
+
+	/*
+	 * The free pages this call came across that were not reusable yet - the
+	 * ones it freed, and the ones the sweep found waiting - with their
+	 * safexids: what lion_vac_pending_record() hands to the free space map at
+	 * the end of the call when the horizon has passed them by then
+	 * (lion_vac_pending_add(); nbtree's _bt_pendingfsm_add()).
+	 */
+	struct LionVacPendingPage *pending;
+	int			npending;
+	int			maxpending;		/* the array's allocated length */
+	int			pendinglimit;	/* ... and the most work_mem lets it have */
 	LionVacProfile prof;
 } LionVacState;
+
+/* One page of LionVacState.pending. */
+typedef struct LionVacPendingPage
+{
+	BlockNumber blk;
+	FullTransactionId safexid;
+} LionVacPendingPage;
 
 static inline void
 lion_vac_visit(LionVacState *vs, BlockNumber blk)
@@ -440,6 +460,9 @@ static void lion_vacuum_free_chain(LionVacState *vs, uint32 hash,
 static void lion_vacuum_sweep(LionVacState *vs);
 static void lion_vacuum_postree(LionVacState *vs, BlockNumber root);
 static void lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk);
+static void lion_vac_pending_add(LionVacState *vs, BlockNumber blk,
+								 FullTransactionId safexid);
+static void lion_vac_pending_record(LionVacState *vs);
 static bool lion_vac_may_write(Relation index);
 static bool lion_vac_may_count(Relation index, LionIndexState *ix);
 static void lion_vacuum_count_keys(IndexVacuumInfo *info);
@@ -560,6 +583,24 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	lion_vac_visit(&vs, LION_METAPAGE_BLKNO);
 
 	/*
+	 * The pages to record once they are reusable, bounded by work_mem as
+	 * nbtree's are (_bt_pendingfsm_init()): one that does not fit is left to
+	 * the next VACUUM, as every one of them would be without the list.
+	 */
+	{
+		Size		limit = ((Size) work_mem * 1024) / sizeof(LionVacPendingPage);
+
+		limit = Min(limit, MaxAllocSize / sizeof(LionVacPendingPage));
+		limit = Min(limit, (Size) INT_MAX);
+		vs.pendinglimit = (int) Max(limit, (Size) 256);
+
+		/* here, and not in the walk's contexts, which are reset under it */
+		vs.maxpending = 256;
+		vs.pending = (LionVacPendingPage *)
+			palloc(sizeof(LionVacPendingPage) * vs.maxpending);
+	}
+
+	/*
 	 * The standby barrier (DESIGN.md §11, §25) starts empty for this index;
 	 * whatever is left of it at the end - blocks visited after the last
 	 * removal - protects nothing and is dropped.
@@ -617,6 +658,13 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	lion_wal_visits_reset();
 
 	/*
+	 * The free pages that were not reusable when this call came across them
+	 * go to the free space map now if they are, so that the inserts after
+	 * this VACUUM can take them (DESIGN.md §18, "Reuse").
+	 */
+	lion_vac_pending_record(&vs);
+
+	/*
 	 * The walk has counted each key column's distinct keys on its way, as it
 	 * counted the rows (lion_vac_count()): record them for the planner
 	 * (DESIGN.md §33), so that the cleanup call after this one need not walk
@@ -648,6 +696,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	MemoryContextDelete(vs.pagecxt);
 	MemoryContextDelete(vaccxt);
 	pfree(vs.visited);
+	pfree(vs.pending);
 	pfree(vs.cbuf2);
 	pfree(vs.cbuf);
 
@@ -1810,8 +1859,9 @@ lion_vacuum_leaf_page(LionVacState *vs, BlockNumber blk, BlockNumber *nextp)
 	 * A leaf left with no entry at all leaves the directory (DESIGN.md §21,
 	 * "Page deletion"), and one an earlier VACUUM left HALF_DEAD is finished.
 	 * Its right link, which the walk continues at, is the one it had: a
-	 * deleted page keeps it.  The pages go to the free space map in the sweep
-	 * at the end, which finds them DELETED and unvisited.
+	 * deleted page keeps it.  The sweep at the end finds the pages DELETED
+	 * and unvisited, and they go to the free space map once they are
+	 * reusable (lion_vac_found_free()).
 	 */
 	if (lion_vac_may_write(vs->index))
 	{
@@ -2056,9 +2106,9 @@ lion_vacuum_chain(LionVacState *vs, Buffer entrybuf, LionVacEntry *ent)
  * held EXCLUSIVE - every writer of the set holds it (rule 2) - so that an
  * insert waits for one leaf at a time, not for the run.  ref is the entry's
  * leaf, pinned and not locked.  A leaf that may not go now stays, empty;
- * one that went is DELETED for the leak sweep's purposes and goes to the
- * free space map from a later VACUUM's sweep, once no scan can still hold a
- * link to it.
+ * one that went is a free page for the leak sweep's purposes and goes to the
+ * free space map once no scan can still hold a link to it - at the end of
+ * this call (lion_vac_pending_record()), or from a later VACUUM's sweep.
  */
 static void
 lion_vacuum_unlink_empties(LionVacState *vs, LionVacEntryRef *ref,
@@ -2537,7 +2587,7 @@ lion_vac_delete_group(LionVacState *vs, Buffer buf, OffsetNumber *offs,
 	for (i = 0; i < nroots; i++)
 	{
 		UnlockReleaseBuffer(rootbufs[i]);
-		RecordFreeIndexPage(vs->index, roots[i]);
+		lion_vac_pending_add(vs, roots[i], safexid);
 		lion_vac_visit(vs, roots[i]);
 		vs->pages_newly_deleted++;
 		vs->pages_deleted++;
@@ -2814,10 +2864,10 @@ lion_vacuum_free_level(LionVacState *vs, uint32 hash, BlockNumber head,
 
 		/*
 		 * Counted here and marked, so that the sweep does not come across it
-		 * as an unvisited DELETED page and count it a second time - which it
-		 * did, reporting twice the pages freed as "currently deleted".
+		 * as an unvisited DELETED page and count it a second time.  It goes
+		 * to the free space map once it is reusable (lion_vac_pending_add()).
 		 */
-		RecordFreeIndexPage(vs->index, blk);
+		lion_vac_pending_add(vs, blk, safexid);
 		lion_vac_visit(vs, blk);
 		vs->pages_newly_deleted++;
 		vs->pages_deleted++;
@@ -2888,14 +2938,15 @@ lion_vacuum_free_chain(LionVacState *vs, uint32 hash, BlockNumber head)
  * nothing about and must not touch - a page an earlier VACUUM freed, or a
  * leak.  This is where the free pages are counted and the leaks come back:
  *
- *	- an all-zero page, from an extension whose record never happened, and a
- *	  DELETED page, freed by an earlier VACUUM or by one that crashed between
- *	  recording it and vacuuming the free space map.  It goes (back) into the
- *	  map, and counts as reusable when it is all-zero, or DELETED with a
- *	  safexid behind every snapshot (lion_vac_page_reusable()).
+ *	- an all-zero page, from an extension whose record never happened, which
+ *	  goes into the map; and a DELETED page or an empty UNLINKED posting
+ *	  leaf, out of the index's trees by an earlier VACUUM or by this one's
+ *	  directory deletion and leaf unlinking, which goes into the map once its
+ *	  safexid is behind every snapshot (lion_vac_found_free()) - now, or at
+ *	  the end of this call (lion_vac_pending_record()), or in a later VACUUM.
  *	- an EMPTY container page nothing references, which is what a crash
  *	  between the two steps of a whole-chain free leaves.  It becomes a
- *	  DELETED page and goes into the map.
+ *	  DELETED page, for the map once it is reusable.
  *	- a container LEAF nothing references whose root is not a live root of
  *	  its key (lion_posting_root_live()): what a multi-leaf spill that an
  *	  ERROR or a crash stopped before its last record leaves behind, full
@@ -2960,23 +3011,97 @@ lion_vac_children_deleted(LionVacState *vs, Page page)
 }
 
 /*
- * May the next allocation take this DELETED page, or UNLINKED posting leaf,
- * already?  The rule
- * lion_alloc_page() applies, nbtree's: its safexid is behind every snapshot.
- * Without the heap relation there is no horizon to test against, and the page
- * is counted as free but not as reusable.
+ * A free page the sweep came across: a DELETED page, or an empty UNLINKED
+ * posting leaf, whose safexid is safexid.  It is counted, and it goes to the
+ * free space map if the next allocation may take it already - the rule
+ * lion_alloc_page() applies, nbtree's: its safexid is behind every snapshot -
+ * and is kept for lion_vac_pending_record() otherwise.  Without the heap
+ * relation there is no horizon to test against, and the page is counted as
+ * free but not as reusable.
  */
-static bool
-lion_vac_page_reusable(LionVacState *vs, Page page)
+static void
+lion_vac_found_free(LionVacState *vs, BlockNumber blk,
+					FullTransactionId safexid)
 {
+	lion_vac_visit(vs, blk);
+	vs->pages_deleted++;
 	if (vs->heaprel == NULL)
-		return false;
-
-	return GlobalVisCheckRemovableFullXid(vs->heaprel,
-										  lion_page_get_safexid(page));
+		return;
+	if (GlobalVisCheckRemovableFullXid(vs->heaprel, safexid))
+	{
+		RecordFreeIndexPage(vs->index, blk);
+		vs->pages_free++;
+	}
+	else
+		lion_vac_pending_add(vs, blk, safexid);
 }
 
-/* Mark blk DELETED and hand it to the free space map.  buf is cleanup-locked. */
+/*
+ * A free page that may not be handed out yet: remember it, with its safexid,
+ * for lion_vac_pending_record() at the end of the call.  nbtree's
+ * _bt_pendingfsm_add(), and bounded the same way: a page past the bound is
+ * left to the next VACUUM, which records it once it is reusable, as it would
+ * have been without the list.
+ */
+static void
+lion_vac_pending_add(LionVacState *vs, BlockNumber blk,
+					 FullTransactionId safexid)
+{
+	if (vs->npending >= vs->maxpending)
+	{
+		int			newmax;
+
+		if (vs->maxpending >= vs->pendinglimit)
+			return;
+		newmax = (vs->maxpending > vs->pendinglimit / 2) ?
+			vs->pendinglimit : vs->maxpending * 2;
+		vs->pending = (LionVacPendingPage *)
+			repalloc(vs->pending, sizeof(LionVacPendingPage) * newmax);
+		vs->maxpending = newmax;
+	}
+	vs->pending[vs->npending].blk = blk;
+	vs->pending[vs->npending].safexid = safexid;
+	vs->npending++;
+}
+
+/*
+ * Hand the pages lion_vac_pending_add() kept to the free space map, those of
+ * them that are reusable now (DESIGN.md §18, "Reuse"): nbtree's
+ * _bt_pendingfsm_finalize().  A page freed early in a long VACUUM is often
+ * reusable by its end - every snapshot that could hold a link to it has gone
+ * - and recording it here lets the inserts after this VACUUM take it, where
+ * the sweep of the next one would have been the first to.  The horizon is
+ * computed afresh first, which is what makes GlobalVisCheckRemovableFullXid()
+ * see the transactions that ended during the walk, and each page is tested
+ * on its own: the sweep adds pages of every age.  The pages are not read
+ * again, and need not be: nothing changes a free page that the map does not
+ * hold, and lion_alloc_page() tests each page it takes again.
+ */
+static void
+lion_vac_pending_record(LionVacState *vs)
+{
+	int			i;
+
+	if (vs->npending == 0 || vs->heaprel == NULL)
+		return;
+
+	(void) GetOldestNonRemovableTransactionId(vs->heaprel);
+
+	for (i = 0; i < vs->npending; i++)
+	{
+		if (!GlobalVisCheckRemovableFullXid(vs->heaprel,
+											vs->pending[i].safexid))
+			continue;
+		RecordFreeIndexPage(vs->index, vs->pending[i].blk);
+		vs->pages_free++;
+	}
+	vs->npending = 0;
+}
+
+/*
+ * Mark blk DELETED, for the free space map once it is reusable.  buf is
+ * cleanup-locked.
+ */
 static void
 lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk)
 {
@@ -2990,7 +3115,7 @@ lion_vac_free_page(LionVacState *vs, Buffer buf, BlockNumber blk)
 	lion_wal_finish(xstate, LION_XLOG_PAGE_DELETED);
 	UnlockReleaseBuffer(buf);
 
-	RecordFreeIndexPage(vs->index, blk);
+	lion_vac_pending_add(vs, blk, safexid);
 	lion_vac_visit(vs, blk);
 	vs->pages_newly_deleted++;
 	vs->pages_deleted++;
@@ -3099,14 +3224,10 @@ lion_vacuum_sweep(LionVacState *vs)
 			 */
 			if (LionPageIsDeleted(page))
 			{
-				bool		reusable = lion_vac_page_reusable(vs, page);
+				FullTransactionId safexid = lion_page_get_safexid(page);
 
 				UnlockReleaseBuffer(buf);
-				RecordFreeIndexPage(vs->index, blk);
-				lion_vac_visit(vs, blk);
-				vs->pages_deleted++;
-				if (reusable)
-					vs->pages_free++;
+				lion_vac_found_free(vs, blk, safexid);
 				progress = true;
 				continue;
 			}
@@ -3114,25 +3235,22 @@ lion_vacuum_sweep(LionVacState *vs)
 			/*
 			 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of
 			 * its set, and handed out again once no scan can still hold a link
-			 * to it.  It goes to the free space map now, as a DELETED page
-			 * does, and lion_alloc_page() takes it once its transaction id
-			 * says so; until then it stays as it is, an empty leaf that a
-			 * reader with an old link walks through.  One that holds items is
-			 * not ours to reason about: verify() reports it.
+			 * to it, as a DELETED page is; until then it stays as it is, an
+			 * empty leaf that a reader with an old link walks through.  One
+			 * that holds items is not ours to reason about: verify() reports
+			 * it.
 			 */
 			if (LionPageIsUnlinked(page))
 			{
-				bool		empty = PageGetMaxOffsetNumber(page) == 0;
-				bool		reusable = empty && lion_vac_page_reusable(vs, page);
-
-				UnlockReleaseBuffer(buf);
-				if (empty)
-					vs->pages_deleted++;
-				if (reusable)
+				if (PageGetMaxOffsetNumber(page) == 0)
 				{
-					RecordFreeIndexPage(vs->index, blk);
-					vs->pages_free++;
+					FullTransactionId safexid = lion_page_get_safexid(page);
+
+					UnlockReleaseBuffer(buf);
+					lion_vac_found_free(vs, blk, safexid);
+					continue;
 				}
+				UnlockReleaseBuffer(buf);
 				lion_vac_visit(vs, blk);
 				continue;
 			}
