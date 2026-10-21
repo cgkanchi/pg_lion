@@ -183,8 +183,12 @@ the server there and checks what comes back. Four more (DESIGN.md §18, §22,
   names the manager), and a VACUUM that removes nothing from the index runs
   with `pg_lion.vacuum_barrier_ranges = 1`. `pg_waldump` over its range must
   find no record of a custom manager - it used to find `custom128` ones, which
-  no such server can replay - and a crash right after it must recover. The
-  primary is restarted in its `--mode` afterwards.
+  no such server can replay - and a crash right after it must recover. With
+  injection points, a second rmgr-mode index first gets phase 1b's crash
+  under the manager, which leaves entries deleted and their chains' pages
+  leaked; the VACUUM without the manager has nothing to remove from it and
+  must go through and leave the leaks, which a VACUUM with the manager frees
+  in rmgr mode. The primary is restarted in its `--mode` afterwards.
 * **1g**, a crash between a PROMOTION and the split it was for. A posting
   set of up to 16 leaves has no internal level; the split that would make a
   17th leaf first pushes the head down under a root that links every leaf,

@@ -84,11 +84,13 @@
 #include "lion.h"
 
 /*
- * The page at blk, which a link says is a directory page at `level`, read and
- * locked in lockmode; an ERROR when it is not one.
+ * The page at blk, which a link says is a directory page at `level`, read
+ * through strategy (NULL for the default) and locked in lockmode; an ERROR
+ * when it is not one.
  */
 static Buffer
-lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
+lion_dirdel_read_ext(Relation index, BlockNumber blk, int lockmode, int level,
+					 BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -99,7 +101,7 @@ lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
 				 errmsg("lion index \"%s\" links to an invalid block number",
 						RelationGetRelationName(index))));
 
-	buf = ReadBuffer(index, blk);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
 	LockBuffer(buf, lockmode);
 	page = BufferGetPage(buf);
 	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
@@ -116,6 +118,12 @@ lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
 						RelationGetRelationName(index), blk, level)));
 	}
 	return buf;
+}
+
+static Buffer
+lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
+{
+	return lion_dirdel_read_ext(index, blk, lockmode, level, NULL);
 }
 
 /* Does the page hold no data item?  (Its high key does not count.) */
@@ -729,15 +737,21 @@ out:
 }
 
 int
-lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk)
+lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
+					 BufferAccessStrategy strategy)
 {
 	Buffer		leafbuf;
 	Page		leaf;
 	int			ndeleted = 0;
 	bool		halfdead;
 
-	/* A look first, SHARE: nearly every leaf VACUUM walks is not empty. */
-	leafbuf = lion_dirdel_read(index, leafblk, BUFFER_LOCK_SHARE, 0);
+	/*
+	 * A look first, SHARE: nearly every leaf VACUUM walks is not empty.
+	 * Through VACUUM's strategy, as its walk read the leaf a moment ago: read
+	 * without it, every leaf of the index would stay in shared buffers.
+	 */
+	leafbuf = lion_dirdel_read_ext(index, leafblk, BUFFER_LOCK_SHARE, 0,
+								   strategy);
 	leaf = BufferGetPage(leafbuf);
 	halfdead = LionPageIsHalfDead(leaf) && !LionPageIsDeleted(leaf);
 	if (!halfdead && !lion_dirdel_leaf_candidate(leaf))
