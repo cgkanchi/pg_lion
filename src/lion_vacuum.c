@@ -3188,6 +3188,63 @@ lion_vac_postree_root_live(LionVacState *vs, BlockNumber root)
 	return live;
 }
 
+/*
+ * The sweep's case for a page out of the index's trees, which buf holds
+ * locked, SHARE or more: true, with buf released, when the page is one, and
+ * false, with buf still locked, when it is anything else.  *progress is set
+ * for a DELETED page, whose finding may let a leaked internal page go in the
+ * next round (lion_vac_children_deleted()).
+ */
+static bool
+lion_vac_sweep_out(LionVacState *vs, Buffer buf, BlockNumber blk,
+				   bool *progress)
+{
+	Page		page = BufferGetPage(buf);
+
+	if (PageIsNew(page) ||
+		PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID)
+		return false;
+
+	/*
+	 * A DELETED page: a container page a free left behind, or a directory
+	 * page deletion unlinked (DESIGN.md §21), which no walk reaches either.
+	 */
+	if (LionPageIsDeleted(page))
+	{
+		FullTransactionId safexid = lion_page_get_safexid(page);
+
+		UnlockReleaseBuffer(buf);
+		lion_vac_found_free(vs, blk, safexid);
+		*progress = true;
+		return true;
+	}
+
+	/*
+	 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of its
+	 * set, and handed out again once no scan can still hold a link to it, as
+	 * a DELETED page is; until then it stays as it is, an empty leaf that a
+	 * reader with an old link walks through.  One that holds items is not
+	 * ours to reason about: verify() reports it.
+	 */
+	if (LionPageIsContainer(page) && LionPageIsUnlinked(page))
+	{
+		if (PageGetMaxOffsetNumber(page) == 0)
+		{
+			FullTransactionId safexid = lion_page_get_safexid(page);
+
+			UnlockReleaseBuffer(buf);
+			lion_vac_found_free(vs, blk, safexid);
+			return true;
+		}
+		UnlockReleaseBuffer(buf);
+		lion_vac_visit(vs, blk);
+		return true;
+	}
+
+	return false;
+}
+
 static void
 lion_vacuum_sweep(LionVacState *vs)
 {
@@ -3232,6 +3289,22 @@ lion_vacuum_sweep(LionVacState *vs)
 			lion_vacuum_delay_point();
 
 			buf = lion_vac_read(vs, blk);
+
+			/*
+			 * A page out of the index's trees is only read, so a SHARE lock
+			 * does, as in lion_vacuum_recycle() and nbtree's btvacuumpage():
+			 * it holds no TIDs, and a pin on it stops nothing.  A cleanup
+			 * lock would miss every such page that the checkpointer or the
+			 * background writer has pinned to write it out, and the page
+			 * would wait for the next VACUUM to be recorded.  The wait for
+			 * the lock, with nothing else held, is for a writer of the page,
+			 * which holds it briefly.
+			 */
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			if (lion_vac_sweep_out(vs, buf, blk, &progress))
+				continue;
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
 			if (!ConditionalLockBufferForCleanup(buf))
 			{
 				ReleaseBuffer(buf);
@@ -3241,7 +3314,11 @@ lion_vacuum_sweep(LionVacState *vs)
 
 			if (PageIsNew(page))
 			{
-				/* An extension whose WAL record never happened. */
+				/*
+				 * An extension whose WAL record never happened.  Under the
+				 * cleanup lock: the pin of a backend that has extended the
+				 * index and not yet locked the new page is what keeps it.
+				 */
 				UnlockReleaseBuffer(buf);
 				RecordFreeIndexPage(vs->index, blk);
 				lion_vac_visit(vs, blk);
@@ -3260,42 +3337,11 @@ lion_vacuum_sweep(LionVacState *vs)
 			}
 
 			/*
-			 * A DELETED page: a container page a free left behind, or a
-			 * directory page deletion unlinked (DESIGN.md §21), which no walk
-			 * reaches either.
+			 * Out of the trees after all: only this VACUUM takes a page out,
+			 * so not since the look above, but it costs nothing to ask.
 			 */
-			if (LionPageIsDeleted(page))
-			{
-				FullTransactionId safexid = lion_page_get_safexid(page);
-
-				UnlockReleaseBuffer(buf);
-				lion_vac_found_free(vs, blk, safexid);
-				progress = true;
+			if (lion_vac_sweep_out(vs, buf, blk, &progress))
 				continue;
-			}
-
-			/*
-			 * An UNLINKED posting leaf (DESIGN.md §22, "Empty leaves"): out of
-			 * its set, and handed out again once no scan can still hold a link
-			 * to it, as a DELETED page is; until then it stays as it is, an
-			 * empty leaf that a reader with an old link walks through.  One
-			 * that holds items is not ours to reason about: verify() reports
-			 * it.
-			 */
-			if (LionPageIsUnlinked(page))
-			{
-				if (PageGetMaxOffsetNumber(page) == 0)
-				{
-					FullTransactionId safexid = lion_page_get_safexid(page);
-
-					UnlockReleaseBuffer(buf);
-					lion_vac_found_free(vs, blk, safexid);
-					continue;
-				}
-				UnlockReleaseBuffer(buf);
-				lion_vac_visit(vs, blk);
-				continue;
-			}
 
 			/*
 			 * Every case below frees the page, in a record, or leaves it.  In

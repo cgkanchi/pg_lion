@@ -6763,7 +6763,11 @@ rest at the end of ambulkdelete: an all-zero page goes into the FSM, a DELETED p
 posting leaf goes there once it is reusable, and an
 unreferenced EMPTY container page becomes a DELETED one first, and so does an unreferenced FULL
 leaf whose root is not a live root of its key (the leftover of an interrupted spill, "The spill"
-below).  The pages out of the index's trees that are not reusable at the end of ambulkdelete - the
+below).  A page already out of the trees is only read, under a SHARE lock, as
+`lion_vacuum_recycle()` and nbtree's `btvacuumpage()` read one; only a page the sweep may free is
+cleanup-locked, conditionally.  So a free page that the checkpointer or the background writer has
+pinned to write it out is recorded all the same, where a cleanup lock would leave it to the next
+VACUUM.  The pages out of the index's trees that are not reusable at the end of ambulkdelete - the
 ones it did not record - are counted on the meta page (the special area's `maxckey`, nbtree's
 `btm_last_cleanup_num_delpages`), and a VACUUM that calls no ambulkdelete reads every block of the
 index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_needs_cleanup()`
