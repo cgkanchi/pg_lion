@@ -287,5 +287,52 @@ SELECT lion_index_verify('lion_ws_k', true);
  
 (1 row)
 
-DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws;
+/*
+ * UNLINK (DESIGN.md §21, §25).  A directory leaf taken out of the tree is
+ * rewritten whole, HALF_DEAD and then DELETED, by records that build the page
+ * from nothing.  The page is registered as one the record initialises: redo
+ * zeroes it and replays the record, and an rmgr-mode record takes no image of
+ * it.  So after a checkpoint each page's first record takes the only image of
+ * it, and no record takes one of a page an earlier record of the same VACUUM
+ * already wrote.  (A generic record logs a page it initialises as an image,
+ * of a nearly empty page here.)
+ */
+CREATE TABLE lion_wu (k text) WITH (autovacuum_enabled = off);
+INSERT INTO lion_wu
+	SELECT 'key' || lpad(g::text, 6, '0') || repeat('x', 40) FROM generate_series(1, 20000) g;
+CREATE INDEX lion_wu_k ON lion_wu USING lion (k);
+DELETE FROM lion_wu WHERE k < 'key015000';
+CHECKPOINT;
+SELECT pg_current_wal_lsn() AS lsn10 \gset
+VACUUM lion_wu;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_six_times;
+ wal_switched_six_times 
+------------------------
+ t
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn11 \gset
+WITH b AS (
+	SELECT start_lsn, relblocknumber AS blk, block_fpi_length AS fpi
+	  FROM pg_get_wal_block_info(:'lsn10', :'lsn11', false)
+	 WHERE relfilenode = pg_relation_filenode('lion_wu_k'))
+SELECT (SELECT deleted_pages > 0 FROM lion_index_stats('lion_wu_k')) AS unlinked,
+	   lion_index_wal_mode('lion_wu_k') <> 'rmgr' OR
+	   NOT EXISTS (SELECT 1 FROM b
+				   WHERE b.fpi > 0 AND
+						  EXISTS (SELECT 1 FROM b e
+								   WHERE e.blk = b.blk AND e.start_lsn < b.start_lsn))
+	   AS one_image_a_page;
+ unlinked | one_image_a_page 
+----------+------------------
+ t        | t
+(1 row)
+
+SELECT lion_index_verify('lion_wu_k', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws, lion_wu;
 DROP EXTENSION pg_walinspect;

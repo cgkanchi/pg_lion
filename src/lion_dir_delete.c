@@ -327,6 +327,12 @@ lion_dirdel_find_parent(Relation index, LionIndexState *ix,
  * special area *opaque, holding nothing but a MINUS INFINITY high key: what a
  * HALF_DEAD leaf and a DELETED page look like.  hk is that key, built before
  * the record began.
+ *
+ * The caller registers p as initialised (LION_WALBUF_INIT): the record builds
+ * the page from nothing, so redo zeroes it and replays the two operations,
+ * and the record takes no full-page image of it.  Registered as an ordinary
+ * change, it would take one at every rewrite: lion_init_page() zeroes its
+ * LSN, which is then older than any checkpoint.
  */
 static void
 lion_dirdel_rewrite(LionWalState *xstate, Page p, const LionPageOpaqueData *opaque,
@@ -505,7 +511,7 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 	lion_wal_op_replace(xstate, p, poff, retarget, retargetsz);
 	PageIndexTupleDelete(p, OffsetNumberNext(poff));
 	lion_wal_op(xstate, p, LION_OP_DELETE, OffsetNumberNext(poff), 0, NULL, 0);
-	p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_STD);
+	p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_INIT);
 	lion_dirdel_rewrite(xstate, p, &halfdead, minf, minfsz);
 	lion_wal_finish(xstate, LION_XLOG_UNLINK);
 
@@ -707,7 +713,7 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		LionPageGetOpaque(p)->rightlink = rightsib;
 		lion_wal_log_special(xstate, p);
 	}
-	p = lion_wal_register_buffer(xstate, tbuf, LION_WALBUF_STD);
+	p = lion_wal_register_buffer(xstate, tbuf, LION_WALBUF_INIT);
 	lion_dirdel_rewrite(xstate, p, &deleted, minf, minfsz);
 	p = lion_wal_register_buffer(xstate, rbuf, LION_WALBUF_STD);
 	LionPageGetOpaque(p)->leftlink = leftsib;

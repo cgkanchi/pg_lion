@@ -8097,7 +8097,10 @@ single MINUS INFINITY high key, and holds its `safexid`, `ReadNextFullTransactio
 moment, in `minckey` (low half) and `maxckey` (high half). The leaf's `owner_head` moves down to
 the next page. A META record then lowers `dirpages` by the pages
 that went: the meta page comes after the parent in a split's lock order, so it is not in the
-records above.
+records above. The page each stage rewrites is registered as one its record initialises
+(`LION_WALBUF_INIT`, REGBUF_WILL_INIT): redo zeroes it and replays INIT + ADD, and the record takes
+no full-page image of it. Registered as an ordinary change, it would take one at every rewrite:
+the rewrite zeroes its LSN, which is then older than any checkpoint.
 
 **Readers** need almost nothing new, because every page that leaves the tree has a MINUS INFINITY
 high key: a descent that reaches it through a downlink it read before, or a walk through a link it
