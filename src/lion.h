@@ -1890,7 +1890,8 @@ extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
  * above it that have no other child - or it finishes doing so for a leaf an
  * earlier VACUUM left HALF_DEAD.  Nothing may be held on entry, and the
  * return value is the number of pages it marked DELETED.  strategy is
- * VACUUM's (info->strategy), which the leaf is looked at through.
+ * VACUUM's (info->strategy), which every page it reads but the meta page goes
+ * through.
  *
  * lion_dir_past_deleted() hands back buf, a directory page locked in
  * lockmode, or - when that page is DELETED - the first page to its right that
@@ -2066,11 +2067,16 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
  * With `before`, the route of what sorts just below ckey, as
  * lion_posting_search_before() takes it.  For lion_index_verify() (DESIGN.md
- * §7), as lion_dir_search_level() is.
+ * §7), as lion_dir_search_level() is, and for VACUUM, which reads through its
+ * ring: _ext's strategy, info->strategy.
  */
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
 										uint32 ckey, uint16 level,
 										bool before);
+extern Buffer lion_posting_search_level_ext(Relation index, BlockNumber head,
+											uint32 ckey, uint16 level,
+											bool before,
+											BufferAccessStrategy strategy);
 
 /*
  * Take the empty leaf blk out of the posting set (hash, head) while the key
@@ -2078,11 +2084,13 @@ extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
  * neighbour's right link and its parent's downlink go to its right sibling,
  * and it is flagged LION_PAGE_UNLINKED, for a later VACUUM to recycle.  The
  * caller holds the key's directory leaf EXCLUSIVE; hint is a leaf it saw left
- * of blk, or InvalidBlockNumber.  False when the leaf may not go now.
+ * of blk, or InvalidBlockNumber.  False when the leaf may not go now.  Every
+ * page is read through strategy, VACUUM's (info->strategy).
  */
 extern bool lion_posting_unlink_leaf(Relation index, uint32 hash,
 									 BlockNumber head, BlockNumber hint,
-									 BlockNumber blk);
+									 BlockNumber blk,
+									 BufferAccessStrategy strategy);
 
 /*
  * The SEPARATORS of the posting set rooted at head - the first container key
@@ -2103,9 +2111,13 @@ extern uint32 *lion_posting_separators(Relation index, BlockNumber head,
 									   int want, int maxpages, int *nsep,
 									   int *level, int *pages);
 
-/* The leftmost leaf, where every sequential walk of a posting set starts. */
-extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
-											  BlockNumber head);
+/*
+ * The leftmost leaf of the set rooted at head, read through strategy, or
+ * InvalidBlockNumber when the set is gone: for VACUUM taking a leaf out of
+ * the set (lion_posting_delete.c).
+ */
+extern BlockNumber lion_posting_leftmost_leaf(Relation index, BlockNumber head,
+											  BufferAccessStrategy strategy);
 
 /* The same, as DESIGN.md §4 named it; now a descent rather than a walk. */
 extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,

@@ -615,23 +615,52 @@ CREATE EXTENSION IF NOT EXISTS pg_buffercache;
 CREATE TABLE lion_vring (i int NOT NULL, k int NOT NULL) WITH (autovacuum_enabled = off);
 INSERT INTO lion_vring SELECT i, i FROM generate_series(1, 200000) i;
 CREATE INDEX lion_vring_k ON lion_vring USING lion (k);
-CREATE FUNCTION lion_vring_cached() RETURNS bigint LANGUAGE sql AS $$
+CREATE FUNCTION lion_vring_cached(idx regclass) RETURNS bigint LANGUAGE sql AS $$
 	SELECT count(*) FROM pg_buffercache
-	 WHERE relfilenode = pg_relation_filenode('lion_vring_k') AND relforknumber = 0
+	 WHERE relfilenode = pg_relation_filenode(idx) AND relforknumber = 0
 	   AND reldatabase = (SELECT oid FROM pg_database WHERE datname = current_database())
 $$;
 SELECT pg_relation_size('lion_vring_k') / 8192 > 400 AS large,
-	   lion_vring_cached() < 4 AS none_cached;
+	   lion_vring_cached('lion_vring_k') < 4 AS none_cached;
 DELETE FROM lion_vring WHERE i % 10 = 0;
 SET vacuum_buffer_usage_limit = '128kB';
 -- FREEZE: the ntids below counts on every dead row going, and a plain VACUUM
 -- leaves those of a heap page it cannot have the cleanup lock of at once
 VACUUM (FREEZE) lion_vring;
 RESET vacuum_buffer_usage_limit;
-SELECT lion_vring_cached() <= 32 AS ringed;
+SELECT lion_vring_cached('lion_vring_k') <= 32 AS ringed;
 SELECT ntids = 180000 AS ntids_ok FROM lion_index_stats('lion_vring_k');
 SELECT lion_index_verify('lion_vring_k', true);
-DROP FUNCTION lion_vring_cached();
+
+-- The pages a VACUUM takes out of the trees are read through the ring as
+-- well, and the pages beside them: the directory leaves it empties, which
+-- page deletion takes out with their siblings and parents (DESIGN.md §21),
+-- and the empty leaves of a key's posting set, which leave the set once its
+-- walk is over (§22, "Empty leaves").  The oldest half of the rows goes: in
+-- k, a key a row, the leaves of half the directory; in g, sixteen keys of
+-- rows in no order, the low half of every key's set, some three of its six
+-- leaves.
+CREATE TABLE lion_vring2 (i int NOT NULL, k int NOT NULL, g int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_vring2
+	SELECT i, i, abs(hashint4(i)) % 16 FROM generate_series(1, 400000) i;
+CREATE INDEX lion_vring2_k ON lion_vring2 USING lion (k);
+CREATE INDEX lion_vring2_g ON lion_vring2 USING lion (g);
+SELECT lion_vring_cached('lion_vring2_k') < 4 AS k_none_cached,
+	   lion_vring_cached('lion_vring2_g') < 4 AS g_none_cached;
+DELETE FROM lion_vring2 WHERE i <= 200000;
+SET vacuum_buffer_usage_limit = '128kB';
+VACUUM (FREEZE) lion_vring2;
+RESET vacuum_buffer_usage_limit;
+SELECT lion_vring_cached('lion_vring2_k') <= 32 AS k_ringed,
+	   lion_vring_cached('lion_vring2_g') <= 32 AS g_ringed;
+SELECT deleted_pages > 900 AS dir_deleted, ntids = 200000 AS ntids_ok
+  FROM lion_index_stats('lion_vring2_k');
+SELECT deleted_pages > 30 AS leaves_unlinked, ntids = 200000 AS ntids_ok
+  FROM lion_index_stats('lion_vring2_g');
+SELECT lion_index_verify('lion_vring2_k', true);
+SELECT lion_index_verify('lion_vring2_g', true);
+DROP FUNCTION lion_vring_cached(regclass);
 
 DROP TABLE lion_vac, lion_vacrun, lion_vacsp, lion_free, lion_vnull, lion_slackv,
-	lion_slacki, lion_vacpre, lion_vacbig, lion_vacwide, lion_vring;
+	lion_slacki, lion_vacpre, lion_vacbig, lion_vacwide, lion_vring, lion_vring2;
