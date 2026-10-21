@@ -291,7 +291,8 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	 * sparse segments of §13, for version 9 the entry tuples of §21, for
 	 * version 10 the key size of §4, for version 11 the first downlinks of
 	 * §21, for version 12 the EMPTY entry of §17, for version 13 its
-	 * EMPTYDIM and EMPTYINNER entries - and anything newer is a format this
+	 * EMPTYDIM and EMPTYINNER entries and the NARROW items of §38, with the
+	 * meta page flag that allowed them - and anything newer is a format this
 	 * build does not know; the hint says which of the two it is, since
 	 * REINDEX with this build is the way out of either, but the reason
 	 * differs.

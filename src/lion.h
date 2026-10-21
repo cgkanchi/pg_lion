@@ -517,9 +517,15 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * entries of their own, LION_ENTRY_EMPTYDIM and LION_ENTRY_EMPTYINNER, where
  * version 13 filed it in the EMPTY entry with the arrays of no dimension
  * (§17).  `a = '{}'`, `a <> '{}'`, array_length() and array_ndims() tell the
- * two apart, so the EMPTY entry of a version 13 index answers them wrongly,
- * and opening one is an ERROR whose hint asks for REINDEX.  Every index this
- * build writes is version 14.
+ * two apart, so the EMPTY entry of a version 13 index answers them wrongly.
+ * Version 14 also lets every index hold NARROW items (§38) wherever a
+ * container goes, whoever writes them - the build, an INSERT or VACUUM - and
+ * its order_flags have the bits defined below and no others, where version
+ * 13 said with the flag 0x0004 that the build had written a NARROW, and
+ * VACUUM made them only in such an index: a version 13 index may carry that
+ * bit, which is no flag of this format.  So opening a version 13 index is an
+ * ERROR whose hint asks for REINDEX.  Every index this build writes is
+ * version 14.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
@@ -529,7 +535,8 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
 #define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
 #define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
-#define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17) */
+#define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17), NARROW
+								 * items anywhere, no flag (§38) */
 
 typedef struct LionMetaPageData
 {
