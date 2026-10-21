@@ -240,6 +240,18 @@ SELECT q, cc_q(q) FROM (VALUES
 	('SELECT count(*) FROM ccp WHERE n <> 3 OR t = ''v1'''),
 	('SELECT a, count(*) FROM ccp WHERE n <> 3 OR t = ''v1'' GROUP BY a')
 ) v(q);
+/*
+ * A fourth complement OR is one more than the counts are doubled for, and so
+ * a restriction no posting set answers - which every partition here implies
+ * (a < 7): it is left out, all of it, and the clauses after it are sources of
+ * their own, not arms of an OR it left behind.
+ */
+SELECT cc_plan('SELECT count(*) FROM ccp WHERE (n <> 1 OR t <> ''v1'') AND (n <> 2 OR t <> ''v2'') AND (n <> 3 OR t <> ''v3'') AND (a <> 100 OR n <> 4) AND n = 1 AND t = ''v4''');
+SELECT q, cc_q(q) FROM (VALUES
+	('SELECT count(*) FROM ccp WHERE (n <> 1 OR t <> ''v1'') AND (n <> 2 OR t <> ''v2'') AND (n <> 3 OR t <> ''v3'') AND (a <> 100 OR n <> 4) AND n = 1 AND t = ''v4'''),
+	('SELECT a, count(*) FROM ccp WHERE (n <> 1 OR t <> ''v1'') AND (n <> 2 OR t <> ''v2'') AND (n <> 3 OR t <> ''v3'') AND (a <> 100 OR n <> 4) AND n = 1 AND t = ''v4'' GROUP BY a'),
+	('SELECT count(*) FROM ccp WHERE (n <> 1 OR t <> ''v1'') AND (n <> 2 OR t <> ''v2'') AND (n <> 3 OR t <> ''v3'') AND (a <> 100 OR n <> 4) AND (n = 1 OR t = ''v4'')')
+) v(q);
 
 DROP TABLE ccp;
 DROP FUNCTION cc_q(text);

@@ -1678,6 +1678,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 												 false, (Expr *) boolvar,
 												 (Expr *) out->val,
 												 InvalidOid, InvalidOid);
+		out->costexact = true;
 	}
 	else if (IsA(clause, OpExpr))
 	{
@@ -1914,7 +1915,8 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 				 * (lion_multikey_cost_mode()), so it is handed the clause
 				 * over that estimate; a value without one - a Param - is
 				 * priced as the expensive shape.  The executor evaluates the
-				 * expression, never the estimate.
+				 * expression, never the estimate, and nothing is proved
+				 * from the estimate either (lion_append_clause()).
 				 */
 				est = estimate_expression_value(root, right);
 				if (IsA(est, Const))
@@ -1975,7 +1977,9 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 		 * clause over it, so that it prices the list's real length rather
 		 * than estimate_array_length()'s guess for an expression.  The
 		 * executor still evaluates the expression itself (the estimate is
-		 * the plan-time value, which a stable function need not keep).
+		 * the plan-time value, which a stable function need not keep), and
+		 * no partition's bounds are asked about the estimate
+		 * (lion_append_clause()).
 		 */
 		if (IsA(out->val, Const))
 		{
@@ -2161,6 +2165,15 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
  * treats them alike; inor says which are which.  The clause the cost model
  * is given is the leaf's own costclause when the analysis made one (a bare
  * boolean column's `col = true`), the query's otherwise.
+ *
+ * What a partition's bounds are asked to prove TRUE or refute of the leaf
+ * (lion_leaf_drops(), DESIGN.md §16) is the clause itself, as the executor
+ * evaluates it, or the costclause only where that is the clause rewritten
+ * (costexact).  An IN list over a stable expression - `k = ANY
+ * (string_to_array(current_setting(...), ','))` - is priced over the array
+ * the expression has while the plan is made, and a plan cached under one
+ * setting runs under every other: a bound that refuted the estimate would
+ * leave out of every later run an arm it then had rows for.
  */
 void
 lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
@@ -2180,6 +2193,8 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 	ci->inor = inor;
 	ci->positions = leaf->positions;
 	ci->rinfono = -1;			/* the caller's to say */
+	ci->clause = (leaf->costclause != NULL && leaf->costexact) ?
+		leaf->costclause : clause;
 
 	*whereattnos = lappend_int(*whereattnos, (int) leaf->var->varattno);
 	*clauseinfos = lappend(*clauseinfos, ci);
@@ -2189,6 +2204,72 @@ lion_append_clause(const LionLeafInfo *leaf, Node *clause, bool inor,
 	*wherekinds = lappend_int(*wherekinds, leaf->kind);
 	*whereopnos = lappend_oid(*whereopnos, leaf->opno);
 	*whereinor = lappend_int(*whereinor, inor ? 1 : 0);
+}
+
+/*
+ * Hold `ors`, the OR restrictions (DESIGN.md §19) as {first, narms,
+ * armlen...} each, to the clause lists they name runs of: every arm of one
+ * leaf or more, every run within the lists and apart from every other, every
+ * clause in a run a leaf of an OR (LionClauseInfo.inor), and no leaf of an OR
+ * outside one.  What reads the runs writes an array per clause through them
+ * (lion_leaf_drops()), and an OR whose leaves were taken back while its entry
+ * stayed would name the clauses appended after them, or clauses that are not
+ * there: an error, rather than a write out of bounds or a count of the wrong
+ * union.
+ */
+void
+lion_ors_check(List *ors, List *clauseinfos)
+{
+	int			nclause = list_length(clauseinfos);
+	bool	   *named = (bool *) palloc0(sizeof(bool) * Max(nclause, 1));
+	ListCell   *lc;
+	int			i;
+
+	foreach(lc, ors)
+	{
+		List	   *one = (List *) lfirst(lc);
+		int			first;
+		int			narms;
+		int			nleaves = 0;
+		int			a;
+
+		if (one == NIL || !IsA(one, IntList) || list_length(one) < 3 ||
+			list_length(one) != 2 + lsecond_int(one))
+			elog(ERROR, "LionCount: malformed OR structure");
+		first = linitial_int(one);
+		narms = lsecond_int(one);
+		for (a = 0; a < narms; a++)
+		{
+			int			len = list_nth_int(one, 2 + a);
+
+			if (len < 1)
+				elog(ERROR, "LionCount: malformed OR structure");
+			if (len > nclause - nleaves)
+				elog(ERROR, "LionCount: an OR has more leaves than the %d clauses",
+					 nclause);
+			nleaves += len;
+		}
+		if (first < 0 || first > nclause - nleaves)
+			elog(ERROR, "LionCount: an OR names clauses %d to %d of %d",
+				 first, first + nleaves - 1, nclause);
+		for (i = first; i < first + nleaves; i++)
+		{
+			if (named[i])
+				elog(ERROR, "LionCount: clause %d is a leaf of two ORs", i);
+			if (!((LionClauseInfo *) list_nth(clauseinfos, i))->inor)
+				elog(ERROR, "LionCount: clause %d is no leaf of the OR that names it",
+					 i);
+			named[i] = true;
+		}
+	}
+	i = 0;
+	foreach(lc, clauseinfos)
+	{
+		if (((LionClauseInfo *) lfirst(lc))->inor && !named[i])
+			elog(ERROR, "LionCount: clause %d is a leaf of no OR", i);
+		i++;
+	}
+	pfree(named);
 }
 
 /*
