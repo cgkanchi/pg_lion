@@ -1098,11 +1098,11 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- asserted, read past the page, or extended the index. Its sixth case is damage only the
         -- recheck below can tell from a concurrent split: a right link, and the left link that
         -- goes with it, that skip a leaf, so the leaf is reached by its downlink alone. Its
-        -- seventh is a posting leaf flagged as a page of a position tree, which verify() passed,
-        -- heapallindexed included, while the counts lost every row from that leaf on (2026-10-20
-        -- review); heapallindexed now holds the leaf its lookup lands on to the readers' test.
-        -- Its ninth is a position tree's downlink, separator and leaf min (§17), which verify()
-        -- passed while it read nothing of a position tree's internal pages but the first downlink.
+        -- seventh is a posting leaf flagged as a page of a position tree: every reader of the set
+        -- stops there, so the counts lose every row from that leaf on, while a lookup through the
+        -- tree code, which does not look at the flag, still finds them - so heapallindexed holds
+        -- the leaf its lookup lands on to the readers' test. Its eighth is a flag bit no page of
+        -- its kind carries, and its ninth a position tree's downlink, separator and leaf min (§17).
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
@@ -1205,9 +1205,9 @@ the leaves, posting roots and position roots both; that is needed for more than 
 because either root always comes from the end of the relation (§18) while the pages its tree grows by
 may come out of the free space map, so a key created during the walk can leave unreached pages under
 a root nothing reached either (a first version reported "block 7 is not reachable from the meta page"
-about exactly that, and until the 2026-10-20 review so did a key of a column storing positions,
-whose position root was not looked for, and a position leaf an existing key split off;
-test/isolation/verify_positions.spec makes both). A candidate the
+about exactly that). test/isolation/verify_positions.spec has an INSERT make both kinds of unreached
+position page under a parked check: the tree of a new key, and a leaf an existing key's tree splits
+off. A candidate the
 recheck cannot settle is reported as the walk would have reported it: as a leak, with a WARNING, when
 it is a kind an interrupted writer leaves and the next VACUUM's sweep frees - an internal posting page
 among them - and as corruption otherwise.
@@ -6194,9 +6194,9 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   split through a run of equal separators leaves. Every chunk, the members' order across the
   tree (P1, P2), and every leaf's min and max are checked on the way; on a primary, which holds
   the entry's leaf for the walk, so is that every TID of the posting set has positions. On a
-  standby a walk that replay changed under it is repeated, as a posting set's is. It used to
-  read only the first downlink of each level (2026-10-20 review); verify.sql's ninth case damages
-  a downlink, a separator and a leaf's min of a tree with an internal level, which it passed.
+  standby a walk that replay changed under it is repeated, as a posting set's is. verify.sql's
+  ninth case damages a downlink, a separator and a leaf's min of a tree with an internal level,
+  and verify() must report each.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every

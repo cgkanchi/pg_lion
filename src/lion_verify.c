@@ -229,10 +229,10 @@ lion_verify_kind_flags(uint16 kind)
  * harmless: every reader of a posting set refuses a page flagged
  * LION_PAGE_POSITIONS (lion_page_owns()) and ends the set there, while the
  * tree code, which serves both kinds, does not look at the flag
- * (lion_page_owns_tree()).  A posting leaf with that one bit set used to
- * pass this check, and heapallindexed found its rows through the tree code,
- * while the counts and the scans lost every row from that leaf on
- * (2026-10-20 review).
+ * (lion_page_owns_tree()).  A posting leaf with that one bit set costs the
+ * counts and the scans every row from that leaf on, while a lookup through
+ * the tree code still finds them - which is why heapallindexed holds the
+ * leaf its lookup lands on to the readers' test (lion_verify_tid_present()).
  */
 uint16
 lion_verify_page_flags(LionVerifyState *vs, BlockNumber blk, Page page)
