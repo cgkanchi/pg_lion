@@ -510,6 +510,38 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(1);
 	else if (strcmp(variant, "anti join of no key") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = lion_hooktest_anti(0);
+	else if (strcmp(variant, "anti join of fewer join clauses than keys") == 0)
+	{
+		List	   *anti = lion_hooktest_anti(2);
+
+		/* two scan keys, each a join clause, and one join clause */
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
+		nplans = 1;
+	}
+	else if (strcmp(variant, "anti join of more join clauses than a list holds") == 0 ||
+			 strcmp(variant, "anti join of more restrictions than a list holds") == 0 ||
+			 strcmp(variant, "anti join of more expressions than a list holds") == 0)
+	{
+		List	   *anti = lion_hooktest_anti(1);
+		List	   *ints = (List *) linitial(anti);
+
+		/*
+		 * The counts after the flags and the number of keys: the join
+		 * clauses' and the restrictions'.  Each of the last pair fits a List
+		 * alone, and their sum, with the key's, does not.
+		 */
+		if (strstr(variant, "join clauses") != NULL)
+			lfirst_int(list_nth_cell(ints, 2)) = PG_INT32_MAX;
+		else if (strstr(variant, "restrictions") != NULL)
+			lfirst_int(list_nth_cell(ints, 3)) = PG_INT32_MAX;
+		else
+		{
+			lfirst_int(list_nth_cell(ints, 2)) = LION_MAX_ANTI_EXPRS / 2 + 1;
+			lfirst_int(list_nth_cell(ints, 3)) = LION_MAX_ANTI_EXPRS / 2;
+		}
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
+		nplans = 1;
+	}
 	else if (strcmp(variant, "inner column without an anti join") == 0)
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make2_int(LION_TL_COUNT, LION_TL_ANTI(1));
@@ -541,6 +573,16 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		lfirst(list_nth_cell(priv, LION_PRIV_CELLS)) = NIL;
 		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
 			list_make1_int(LION_TL_COUNT);
+		nplans = 1;
+	}
+	else if (strcmp(variant, "inner column past the last attribute") == 0)
+	{
+		/* a column a child's row has none of, nor an AttrNumber holds */
+		lion_hooktest_cells_anti(priv, 1);
+		lfirst(list_nth_cell(priv, LION_PRIV_TLKINDS)) =
+			list_make4_int(LION_TL_CELLPRED(0), LION_TL_COUNT,
+						   LION_TL_RESID(Anum_pg_class_oid),
+						   LION_TL_ANTI(PG_INT16_MAX + 1));
 		nplans = 1;
 	}
 	else if (strcmp(variant, "table column of a count by cells without an anti join") == 0)

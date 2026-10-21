@@ -738,8 +738,10 @@ working around a bad choice:
   Type: Anti`, `Join Rows: the rows counted, less those with a match`, `Join Lookup Index` and
   `Join Cond` above the inner side's plan, and under ANALYZE `Join Child Rows`, `Join Keys Looked
   Up`, `Join Rows Fetched` and `Join Rows Subtracted` (with `Join Child Time` and `Join Lookup Time`
-  under TIMING). `LEFT JOIN ... IS NULL` and `NOT IN` are left alone. Off, the pushdown does not
-  count an anti join this way.
+  under TIMING). `LEFT JOIN ... IS NULL` is left alone, and so is `NOT IN` but on PostgreSQL 19
+  where neither side can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that
+  one as the same anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does
+  not count an anti join this way.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot

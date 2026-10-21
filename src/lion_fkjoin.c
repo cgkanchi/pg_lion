@@ -1161,13 +1161,14 @@ lion_anti_inner_expr(PlannerInfo *root, Node *node, Relids inner,
  * small inner side"): joinrel is the whole FROM of a query over one table `t`
  * with a NOT EXISTS correlated with it, and nothing else -
  *
- *	- the special join is the anti join core makes of a NOT EXISTS
- *	  (lion_fkjoin_sublink_anti(): never one of `LEFT JOIN ... IS NULL`, nor
- *	  of a NOT IN, which core leaves a subplan), its outer side t alone,
- *	  minimal and syntactic, and its syntactic inner side every other table
- *	  of the join; every other special join is inside that inner side - an
- *	  EXISTS, a NOT EXISTS or an outer join of the subquery's own, which the
- *	  child plans;
+ *	- the special join is the anti join core makes of a NOT EXISTS - or,
+ *	  from PostgreSQL 19, of a NOT IN whose two sides it proves never NULL,
+ *	  which is then the same join (16 to 18 leave every NOT IN a subplan) -
+ *	  and never one of `LEFT JOIN ... IS NULL` (lion_fkjoin_sublink_anti());
+ *	  its outer side t alone, minimal and syntactic, and its syntactic inner
+ *	  side every other table of the join; every other special join is inside
+ *	  that inner side - an EXISTS, a NOT EXISTS or an outer join of the
+ *	  subquery's own, which the child plans;
  *	- t is a plain table or a materialized view (lion_fkjoin_rel_ok(), and
  *	  not a partitioned table) and the inner side's tables have no LATERAL
  *	  reference and no TABLESAMPLE (lion_fkjoin_member_ok());
@@ -1310,7 +1311,7 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 				!lion_fkjoin_target_has(inner->reltarget, v))
 				return false;
 		}
-		clauses = lappend(clauses, clause);
+		clauses = lappend(clauses, ri);
 
 		/* ... and the keys among them */
 		if (IsA(clause, OpExpr) &&

@@ -434,6 +434,12 @@ DROP TABLE lca_many;
 -- a LEFT JOIN ... IS NULL, and a NOT IN over a nullable column
 SELECT lca('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.k NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)');
+-- ... and a NOT IN whose sides are both never NULL, kn declared so and s.a
+-- by its filter: an anti join from PostgreSQL 19, which the node takes as it
+-- takes NOT EXISTS's, and a hashed SubPlan before it; core's answer either way
+SELECT (l LIKE 'pushed down%') = (current_setting('server_version_num')::int >= 190000) AS as_the_release_plans,
+	   regexp_replace(l, '^(not )?pushed down', 'either plan') AS answer
+  FROM lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.kn NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)') AS l;
 -- a WHERE clause nothing answers: no lion index, and residual clauses off
 SET pg_lion.enable_count_residual = off;
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
@@ -641,6 +647,57 @@ SELECT (SELECT count(*) FROM (TABLE lca_par_on EXCEPT ALL
 		EXCEPT ALL TABLE lca_par_on) b) AS rows_differ;
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lca_par_on;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+
+-- ---------- 10. the order the clauses are tested in ----------
+-- Each row a key finds is tested on the table's own restrictions, and only
+-- if it passes them on the join clauses, the scan keys' first; each list in
+-- the order core's plan tests it in, cheapest first.  A clause core runs
+-- only on the rows a cheaper one keeps - a division by y after y <> 0 - is
+-- never run on a row that one rejects.  Row 7 has y = 0, and an inner row
+-- a = b = 7 matches it.
+SELECT r.id, r.k, r.y FROM lca_rows r WHERE r.id = 7;
+SELECT * FROM lca_skip s WHERE s.a = 7;
+-- a join clause dividing by a column of the table: the WHERE keeps y = 0 out,
+-- planned with nothing disabled ...
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1)');
+SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1);
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1);
+RESET pg_lion.enable_count_pushdown;
+-- ... and with joins disabled, by the key of some 50 rows, grouped, beside
+-- residual clauses and a count of a column
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1) GROUP BY r.g');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y IN (1, 2, 3) AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT count(r.g) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+-- the WHERE in core's order, not as written: 10 / y after the test of y
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE 10 / r.y > 1 AND r.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE 10 / r.y > 1 AND r.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+-- the join clauses in core's order: a clause of the table alone inside the
+-- NOT EXISTS is the join's, and runs before the division
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1 AND r.y <> 0)');
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.b / r.y > 1 AND r.y <> 0 AND s.a = r.k)') AS ln
+	WHERE ln ~ 'Join Cond';
+-- beside a count by cells, the GROUP BY and the WHERE form
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier IN (''low'', ''none'') AND t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1)');
+-- in parallel
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y IN (1, 2, 3) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1) GROUP BY tier');
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

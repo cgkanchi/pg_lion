@@ -723,7 +723,9 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
  * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
  * small inner side"): its flags and counts, each scan key's column, operator
  * and collation, the GROUP BY's equalities, and at the PATH stage its
- * expressions, as many as the counts say.
+ * expressions, as many as the counts say.  Each count is bounded, and so is
+ * their sum, by what a List holds (LION_MAX_ANTI_EXPRS): the executor takes
+ * that many expressions off the end of custom_exprs.
  */
 static void
 lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
@@ -749,7 +751,9 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 	a->nrestrict = lfourth_int(ints);
 	if ((a->flags & ~LION_ANTIFLAG_TIDS) != 0 ||
 		a->nkey < 1 || a->nkey > LION_MAX_ANTI_KEYS ||
-		a->njoin < 1 || a->nrestrict < 0 ||
+		a->njoin < a->nkey || a->njoin > LION_MAX_ANTI_EXPRS ||
+		a->nrestrict < 0 || a->nrestrict > LION_MAX_ANTI_EXPRS ||
+		a->nkey + a->njoin + a->nrestrict > LION_MAX_ANTI_EXPRS ||
 		list_length(ints) != 4 + a->nkey ||
 		list_length(oids) != 1 + 2 * a->nkey + 4)
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
