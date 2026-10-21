@@ -1006,10 +1006,10 @@ SET client_min_messages = warning;
 -- (13) the meta page's other words, each in an index of its own: the unused
 -- bucket count (36, always 0), a WAL mode the format does not have (56), an
 -- order flag it does not have (bit 8 of 60), and its two counts of pages -
--- the directory's (52), which can be no page at all, more pages than the
--- index has, or fewer than the directory walk finds (lion_vfy_badd's has a
--- root and six leaves), and the pages the last VACUUM could not hand out
--- (12 of block 0's special area).
+-- the directory's (52), which can be no page at all or fewer than the
+-- directory walk finds (lion_vfy_badd's has a root and six leaves), and the
+-- pages the last VACUUM could not hand out (12 of block 0's special area),
+-- which can be no more than the index has.
 CREATE FUNCTION lion_vfy_meta(tbl regclass, pos int8, val bytea)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
@@ -1027,20 +1027,18 @@ SELECT what, lion_vfy_meta(tbl, pos, val) AS verify
 			   ('wal mode', 'lion_vfy_bad', 56, lion_vfy_le32(7)),
 			   ('order flags', 'lion_vfy_bad', 61, '\x01'::bytea),
 			   ('no directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(0)),
-			   ('too many directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(1000000)),
 			   ('too few directory pages', 'lion_vfy_badd', 52, lion_vfy_le32(2)),
 			   ('pages to reuse', 'lion_vfy_bad', :special + 12, lion_vfy_le32(1000000)))
 	   v(what, tbl, pos, val);
-           what           |                                                              verify                                                               
---------------------------+-----------------------------------------------------------------------------------------------------------------------------------
- unused bucket count      | XX002: lion index "lion_vfy_bad_meta": meta page has 5 in its unused bucket count, expected 0
- wal mode                 | XX002: lion index "lion_vfy_bad_meta": meta page has wal_mode 7, expected 0 (generic) or 1 (rmgr)
- order flags              | XX002: lion index "lion_vfy_bad_meta": meta page has order flags 00000101, with bits the format does not have
- no directory pages       | XX002: lion index "lion_vfy_bad_meta": meta page counts 0 directory pages, but the index has 7 blocks besides it
- too many directory pages | XX002: lion index "lion_vfy_bad_meta": meta page counts 1000000 directory pages, but the index has 7 blocks besides it
- too few directory pages  | XX002: lion index "lion_vfy_bad_meta": meta page counts 2 directory pages, but the directory has 7
- pages to reuse           | XX002: lion index "lion_vfy_bad_meta": meta page counts 1000000 pages waiting to be reused, but the index has 7 blocks besides it
-(7 rows)
+          what           |                                                              verify                                                               
+-------------------------+-----------------------------------------------------------------------------------------------------------------------------------
+ unused bucket count     | XX002: lion index "lion_vfy_bad_meta": meta page has 5 in its unused bucket count, expected 0
+ wal mode                | XX002: lion index "lion_vfy_bad_meta": meta page has wal_mode 7, expected 0 (generic) or 1 (rmgr)
+ order flags             | XX002: lion index "lion_vfy_bad_meta": meta page has order flags 00000101, with bits the format does not have
+ no directory pages      | XX002: lion index "lion_vfy_bad_meta": meta page counts no directory pages, but the directory has at least its root
+ too few directory pages | XX002: lion index "lion_vfy_bad_meta": meta page counts 2 directory pages, but the directory has 7
+ pages to reuse          | XX002: lion index "lion_vfy_bad_meta": meta page counts 1000000 pages waiting to be reused, but the index has 7 blocks besides it
+(6 rows)
 
 SET client_min_messages = warning;
 -- (14) a root that is not the only page of its level: lion_vfy_badd's
