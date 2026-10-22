@@ -5059,13 +5059,13 @@ size" where the ordinary plan answers. Two things now:
   (`lion_bitmap_list_batch()`). A bitmap is a set, so the batches' answers make the list's:
   `(B_1 ∪ ... ∪ B_m) ∩ R = ∪_j (B_j ∩ R)`, disjoint or not (they are). Each batch reads the other
   trees again, as each of the count's batches does; a list within the batch is located whole, as
-  before. A second long list is held whole, as the count's are, and so is a multi-key `op ANY
-  (array)` - in a huge allocation now (`lion_sets_reserve()`), as are the sets the planner's
-  intersection probe and the facets' filter locate for a scan key through the same code
-  (`lion_scankey_sets()`). `test/sql/scanlist.sql` checks the scans against the heap's answer across
-  the batch boundaries, with repeats, NULLs, values without an entry, two lists, a multi-key column, a
-  range and two beside the list, on a dirty heap and past nine million elements, and the VmHWM of the
-  300,000 values.
+  before. A second long list is held whole there, and so is a multi-key `op ANY (array)` - in a
+  huge allocation now (`lion_sets_reserve()`), as are the sets the planner's intersection probe and
+  the facets' filter locate for a scan key through the same code (`lion_scankey_sets()`).
+  `test/sql/scanlist.sql` checks the scans against the heap's answer across the batch boundaries,
+  with repeats, NULLs, values without an entry, two lists, a multi-key column, a range and two
+  beside the list, on a dirty heap and past nine million elements, and the VmHWM of the 300,000
+  values.
 - **Every other count collects it** (`lion_locate_list()`). A GROUP BY, a count(DISTINCT) and an
   FK-side join count the list many times over - batching it would locate it again for every group -
   and a plain count's second long list is no batch of the first's. Such a list, a source of its own
@@ -5088,16 +5088,39 @@ size" where the ordinary plan answers. Two things now:
   every row of it would go to the heap (`lion_count_one_set()`): on an all-visible heap of 3 million
   rows, 50,000 values spread over all of it took 72 to 79 ms that way, reading every heap page,
   against 49 ms for the sum, which reads none. EXPLAIN ANALYZE prints `Lists Collected` and `Lists
-  Spilled`. A list under an OR, which is no disjoint union and whose leaves are not collected, and
-  the list on the grouping column that drives the groups, which needs each value's set, are held
-  whole, in a huge allocation, so that they answer at any length the array itself can have instead
-  of failing at nine million values.
+  Spilled`, the lists collected and those of them that went to a file: each list once
+  (`lion_list_counted()`), however many partitions, runs and rescans collected it again, and in a
+  parallel plan the most any one participant collected.
+- **So does a list under an OR** (`lion_locate_or()`, 2026-10-22 review). Its union with the other
+  leaves is no disjoint one, so it cannot be taken a batch at a time; a leaf longer than
+  `lion_array_batch_size()` is collected as above, in the same memory, and is one set of the OR's
+  like a range leaf. Like a range leaf it holds no pin, so the OR carries no interlock: the run is
+  counted beside another source that does, or as the sum over the driving walk when it has none
+  (`lion_run_has_plain_source()`, `LionOrState.listcollected`), and otherwise rechecked. A leaf
+  within the batch size is located as it was.
+- **The list that drives the groups is located a batch at a time as they are walked**
+  (`lion_group_list_prepare()`, `lion_ingroup_next()`, 2026-10-22 review). `GROUP BY k` over `k =
+  ANY ($1)` counts each value's set as a group of its own, so a union would not do; past
+  `lion_array_batch_size()` the values are sorted as a lookup sorts them, repeats dropped, and cut
+  where the hash changes, as a plain count's are, and a batch's sets are located when the groups
+  of the one before it are done, its predecessor's released - pins and all - first. The groups come
+  in the order the lookup takes the values in, as they did when the list was located whole; a batch
+  ends only where the hash changes, so no entry, and no group, is in two. Its sets keep the pins
+  they are located with until the next pause, as the WHERE's do (`lion_unpin_where()`). `List
+  Batches` counts these batches too.
+
+Measured on a PostgreSQL 18.6 build without assertions (2026-10-22): 3 million rows, `k` 0 to
+499,999 over 30,928 heap pages, at work_mem 64 kB, the backend's peak anonymous memory with the list
+held whole and now. `GROUP BY k` over `k = ANY (500,000 values)`: 112 MB, now 20 MB, in 782 ms
+where it took 813. `count(DISTINCT k)` over the same list: 112 MB, now 20 MB, 361 ms against 640.
+`k = ANY (250,000 values) OR x = 1`: 86 MB, now 4.7 MB, 392 ms against 727. What is left is the
+values and the batch.
 
 What a batched or collected list still holds per value is the values: the array, and for a batched
 one a Datum and a hash each - what the executor's own `= ANY` holds, and core's B-tree scan of the
-same array deconstructs and sorts it just the same. A list held whole costs its sets' memory
-outside work_mem; the planner cannot see a parameter's length to decline it (the literal cap), and
-at run time there is no plan left to fall back to.
+same array deconstructs and sorts it just the same. A list that the node locates whole is one no
+longer than a batch, a work_mem of sets; the planner cannot see a parameter's length to decline a
+longer one (the literal cap), and at run time there is no plan left to fall back to, so none is.
 
 Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 

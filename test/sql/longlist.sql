@@ -8,9 +8,10 @@
 -- counts up, which is exact because the entries of one scalar index are
 -- disjoint and a batch never splits the values of one entry.  Every other
 -- shape that counts the list as a source of its own collects its sets a batch
--- at a time into one union, as a range is collected; a list under an OR and
--- one that drives the groups are held whole.  Each query below is answered
--- with the pushdown and with a sequential scan, and the two must agree.
+-- at a time into one union, as a range is collected, a list under an OR too;
+-- and one that drives the groups is located a batch at a time as they are
+-- walked.  Each query below is answered with the pushdown and with a
+-- sequential scan, and the two must agree.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
@@ -90,6 +91,7 @@ BEGIN
 	END IF;
 	RETURN CASE WHEN NOT pushed THEN 'not pushed down'
 				WHEN par AND lists > 0 THEN 'pushed down in parallel, collected'
+				WHEN par AND batches > 1 THEN 'pushed down in parallel, in batches'
 				WHEN par THEN 'pushed down in parallel'
 				WHEN batches > 1 AND lists > 0 THEN 'pushed down, in batches and collected'
 				WHEN batches > 1 THEN 'pushed down, in batches'
@@ -119,8 +121,9 @@ SELECT lion_llcmp($$SELECT count(*) FROM lion_ll WHERE t = ANY (array(SELECT 'v'
 SELECT lion_llcmp('SELECT count(*) FROM lion_llp WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g))');
 -- the shapes that count the list more than once collect it, values with no
 -- entry and repeats across the batches included; a second long list in a
--- plain count is collected beside the first's batches; a list under an OR,
--- and one on the grouping column, which drives the groups, are held whole
+-- plain count is collected beside the first's batches; a list under an OR is
+-- collected too, and one on the grouping column, which drives the groups, is
+-- located a batch at a time as they are walked
 SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x');
 SELECT lion_llcmp('SELECT count(DISTINCT x) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))');
 SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT (g * 7) % 7000 FROM generate_series(0, 5999) g)) GROUP BY x');
@@ -130,6 +133,63 @@ SELECT lion_llcmp($$SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g F
 SELECT lion_llcmp('SELECT x, count(*) FROM lion_llp WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g)) GROUP BY x');
 SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) OR x = 1');
 SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY k');
+-- under an OR: in an arm beside another clause, with NULLs and in a GROUP BY,
+-- in a filter, beside a list of another column, beside a range leaf
+-- (rangesrc_spill.sql spills one), and with all but a few values without an
+-- entry; the OR then carries no interlock, as one with a range leaf does not
+SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE (k = ANY (array(SELECT g FROM generate_series(4990, 7990) g)) AND j = 3) OR x = 1');
+SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT CASE WHEN g % 7 = 0 THEN NULL ELSE g END FROM generate_series(0, 3499) g)) OR j = 2 GROUP BY x');
+SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g % 1500 FROM generate_series(0, 5999) g)) OR x = 1), count(*) FROM lion_ll');
+SELECT lion_llcmp($$SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) OR t = ANY (array(SELECT 'v' || g FROM generate_series(0, 3999) g))$$);
+SELECT lion_llcmp('SELECT j, count(*) FROM lion_ll WHERE k = ANY (array(SELECT (g * 7) % 7000 FROM generate_series(0, 5999) g)) OR k < 10 GROUP BY j');
+-- the list that drives the groups: with repeats across the batches, values
+-- without an entry and NULLs, beside another clause, a count(DISTINCT) of it
+-- with and without another, of text, and on a partitioned table
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT (g * 3) % 9000 FROM generate_series(0, 5999) g)) GROUP BY k');
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT CASE WHEN g % 7 = 0 THEN NULL ELSE g END FROM generate_series(0, 3499) g)) AND x = 1 GROUP BY k');
+SELECT lion_llcmp('SELECT count(DISTINCT k) FROM lion_ll WHERE k = ANY (array(SELECT g % 4100 FROM generate_series(0, 5999) g))');
+SELECT lion_llcmp('SELECT count(DISTINCT k), count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) AND j IS NOT NULL');
+SELECT lion_llcmp($$SELECT t, count(*) FROM lion_ll WHERE t = ANY (array(SELECT 'v' || g FROM generate_series(0, 3999) g)) GROUP BY t$$);
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_llp WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g)) GROUP BY k');
+-- how many lists were collected, once each: not once for each partition
+-- that collected one
+CREATE FUNCTION lion_lllists(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	pushed boolean := false;
+	lists bigint := 0;
+	spilled bigint := 0;
+	batches bigint := 0;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF l ~ 'Custom Scan \(LionCount\)' THEN
+			pushed := true;
+		END IF;
+		IF l ~ 'Lists Collected: ' THEN
+			lists := lists + substring(l from 'Lists Collected: ([0-9]+)')::bigint;
+		END IF;
+		IF l ~ 'Lists Spilled: ' THEN
+			spilled := spilled + substring(l from 'Lists Spilled: ([0-9]+)')::bigint;
+		END IF;
+		IF l ~ 'List Batches: ' THEN
+			batches := batches + substring(l from 'List Batches: ([0-9]+)')::bigint;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	RETURN CASE WHEN pushed THEN format('lists collected %s, spilled %s, list batches %s',
+										 lists, spilled, batches)
+				ELSE 'not pushed down' END;
+END $$;
+SELECT lion_lllists('SELECT x, count(*) FROM lion_llp WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g)) GROUP BY x');
+SELECT lion_lllists($$SELECT x, count(*) FROM lion_ll WHERE t = ANY (array(SELECT 'v' || g FROM generate_series(0, 3999) g)) AND k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x$$);
+SELECT lion_lllists('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g))), count(*) FILTER (WHERE k = ANY (array(SELECT g * 2 FROM generate_series(0, 2499) g))) FROM lion_llp');
+SELECT lion_lllists('SELECT k, count(*) FROM lion_llp WHERE k = ANY (array(SELECT g FROM generate_series(0, 2499) g)) GROUP BY k');
 -- a list that is the only source of a filtered count is collected too, and
 -- the filter's run is the sum over the walk that counts every row, ANDed with
 -- that one set, as a run whose source is a range is - alone, beside other
@@ -176,6 +236,9 @@ SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FR
 SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g % 1500 FROM generate_series(0, 5999) g)) AND x = 1');
 SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x');
 SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))), count(*) FILTER (WHERE x = 1) FROM lion_ll');
+SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) OR j = 2 GROUP BY x');
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT (g * 3) % 9000 FROM generate_series(0, 5999) g)) AND x = 1 GROUP BY k');
+SELECT lion_llcmp('SELECT count(DISTINCT k) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))');
 
 -- the filtered counts in parallel: each participant collects the list for
 -- the ranges of the filter's run it counts
@@ -187,6 +250,14 @@ SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
 SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll');
 SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))), count(*) FILTER (WHERE x = 1), count(*) FROM lion_ll');
+-- ... one list, however many participants collected it
+SELECT lion_lllists('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))), count(*) FILTER (WHERE x = 1), count(*) FROM lion_ll');
+-- ... and the list under an OR and the one counted by groups, each
+-- participant for its ranges; the one that drives the groups is walked by
+-- one process, as a short one is
+SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) OR x = 1');
+SELECT lion_llcmp('SELECT x, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY x');
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g)) GROUP BY k');
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
@@ -252,7 +323,8 @@ RESET work_mem;
 SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))');
 
 -- and PostgreSQL's default work_mem, 4MB, has 16384 values a batch: one
--- more is a list past one batch, and a filter of it alone is collected
+-- more is a list past one batch, and a filter of it alone is collected, as
+-- is the list under an OR; the groups it drives are walked in two batches
 SET work_mem = '4MB';
 CREATE TABLE lion_llw (k int NOT NULL, x int NOT NULL);
 INSERT INTO lion_llw SELECT (i * 7) % 20000, i % 3 FROM generate_series(1, 4000) i;
@@ -263,11 +335,14 @@ SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM ge
 SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))) FROM lion_llw');
 SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))), count(*) FILTER (WHERE x = 1) FROM lion_llw');
 SELECT lion_llcmp('SELECT x, count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g))) FROM lion_llw GROUP BY x');
+SELECT lion_llcmp('SELECT count(*) FROM lion_llw WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g)) OR x = 1');
+SELECT lion_llcmp('SELECT k, count(*) FROM lion_llw WHERE k = ANY (array(SELECT g FROM generate_series(0, 16384) g)) GROUP BY k');
 RESET work_mem;
 
 DROP FUNCTION lion_llcmp(text);
 DROP FUNCTION lion_llexec(text, int[]);
 DROP FUNCTION lion_llrechecked(text);
+DROP FUNCTION lion_lllists(text);
 DROP TABLE lion_ll;
 DROP TABLE lion_llp;
 DROP TABLE lion_llw;
