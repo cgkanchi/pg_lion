@@ -3793,7 +3793,14 @@ WHERE's clauses no posting set answers, are walked down to their predicates:
 - a SCALAR TREE: an AND, OR or NOT of leaves of one column - `c = v`, `c <> v`, `c IN (...)`, `c
   NOT IN (...)`, `c IS [NOT] DISTINCT FROM v`, `c IS [NOT] NULL`, a boolean column by itself and
   `IS [NOT] TRUE / FALSE / UNKNOWN` of one - its truth in a row a function of the row's value of the
-  column, the values compared by the equality of a scalar lion index on the column;
+  column, the values compared by the equality of a scalar lion index on the column. Every leaf of a
+  column that names a value names it by one equality and collation, of one type on both sides,
+  and the values are constants of that type - or, for an equality declared on a polymorphic type,
+  of the column's own: enum_ops' `=` is (anyenum, anyenum), and `c = 'live'` compares the column
+  with a constant of its enum, a column of a domain over an enum being taken cast to that enum
+  (`dc::mood = 'live'`). Such values are of the column's BASE type, as the key column's own are
+  (`cells_dim_valop()`, the rule of `lion_type_is_column()`): the index match resolves them to the
+  class's type, and the labels' lookups probe them as the column's;
 - a MULTI-KEY LEAF: `c @> q`, `c && q` or `c @@ q` with a literal q that a multi-key lion index
   answers exactly (§17): a tree of the query's keys, AND for `@>`, OR for `&&`, the tsquery's own
   for `@@`; a query that selects no row (`c && '{}'`) is false, or NULL in a NULL row.

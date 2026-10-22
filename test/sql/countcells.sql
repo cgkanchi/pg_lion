@@ -593,6 +593,185 @@ RESET enable_mergejoin;
 RESET enable_nestloop;
 DROP TABLE lcc_skip;
 
+-- ---------- 10. enums ----------
+-- enum_ops is declared FOR TYPE anyenum, its equality = (anyenum, anyenum),
+-- while a leaf compares the column with a constant of the column's own
+-- enum - and a domain over an enum, which the parser takes cast to its
+-- enum, with one of that enum's.  The values are the column's own
+-- (cells_dim_valop()), for =, <>, IN, NOT IN and IS DISTINCT FROM alike.
+CREATE TYPE lcc_mood AS ENUM ('live', 'dead', 'idle', 'gone');
+CREATE TYPE lcc_tone AS ENUM ('hot', 'cold');
+CREATE DOMAIN lcc_dmood AS lcc_mood;
+/*
+ * 20,000 rows: s of the four moods and NULLs, m of the two tones and no
+ * NULL, dm the domain over the moods with NULLs and no row of 'gone', r of 4
+ * texts, f a boolean with NULLs and n of 100 values.
+ */
+CREATE TABLE lcc_e (id int NOT NULL, s lcc_mood, m lcc_tone NOT NULL,
+					dm lcc_dmood, r text NOT NULL, f bool, n int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcc_e
+SELECT i,
+	   CASE WHEN h % 13 = 0 THEN NULL
+			ELSE (enum_range(NULL::lcc_mood))[1 + (h / 3) % 4] END,
+	   (enum_range(NULL::lcc_tone))[1 + (h / 7) % 2],
+	   CASE WHEN h % 11 = 0 THEN NULL
+			ELSE (enum_range(NULL::lcc_mood))[1 + (h / 5) % 3] END,
+	   'r' || ((h / 17) % 4),
+	   CASE WHEN h % 9 = 0 THEN NULL ELSE (h / 19) % 2 = 0 END,
+	   (h / 23) % 100
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 20000) i) q;
+CREATE INDEX lcc_e_sm ON lcc_e USING lion (s, m);
+CREATE INDEX lcc_e_dm ON lcc_e USING lion (dm);
+CREATE INDEX lcc_e_r ON lcc_e USING lion (r);
+CREATE INDEX lcc_e_f ON lcc_e USING lion (f);
+CREATE INDEX lcc_e_n ON lcc_e USING lion (n);
+VACUUM (FREEZE, ANALYZE) lcc_e;
+
+-- A score gated on a mood: points from the tone, r, f and dm for the rows
+-- live or of no mood, 2 for the others but 'gone', NULL for those.  The
+-- tier is a CASE over it.
+CREATE VIEW lcc_e_scored AS
+SELECT id, n, s, m, dm, r, f,
+	   CASE WHEN s = 'live' OR s IS NULL THEN
+			CASE WHEN m = 'hot' THEN 20 ELSE 5 END
+			+ CASE WHEN r IN ('r1', 'r2') THEN 10 WHEN r = 'r3' THEN 4 ELSE 0 END
+			+ CASE WHEN f THEN 7 WHEN f IS NULL THEN 1 ELSE 0 END
+			+ CASE WHEN dm::lcc_mood IN ('dead', 'idle') THEN 3
+				   WHEN dm IS NULL THEN 1 ELSE 0 END
+			WHEN s IS DISTINCT FROM 'gone' THEN 2
+	   END AS score
+  FROM lcc_e;
+CREATE VIEW lcc_e_tiered AS
+SELECT id, n, s, m, dm, r, f, score,
+	   CASE WHEN score >= 30 THEN 'high' WHEN score >= 15 THEN 'medium'
+			WHEN score IS NOT NULL THEN 'low' ELSE 'none' END AS tier
+  FROM lcc_e_scored;
+
+-- the plans: each enum column a dimension of its own, the domain's too
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lion_explain_norm($$
+SELECT CASE WHEN s = 'live' AND r = 'r0' THEN 'a' ELSE 'c' END AS t, count(*)
+  FROM lcc_e WHERE r IN ('r0', 'r1') GROUP BY 1$$) AS p("QUERY PLAN");
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_e_tiered WHERE n < 50 GROUP BY tier') AS p("QUERY PLAN");
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT CASE WHEN s = ''live'' AND r = ''r0'' THEN ''a'' ELSE ''c'' END AS t, count(*)
+		FROM lcc_e WHERE r IN (''r0'', ''r1'') GROUP BY 1'),
+	-- every value of the column named: one dimension, NULL's outcome too
+	('SELECT CASE WHEN s = ''live'' THEN 1 WHEN s = ''dead'' THEN 2 WHEN s = ''idle'' THEN 3
+				  WHEN s = ''gone'' THEN 4 END AS t, count(*) FROM lcc_e GROUP BY 1'),
+	-- =, <>, and the constant on the left
+	('SELECT (s = ''live'') AS x, (s <> ''dead'') AS y, (''idle'' = s) AS z, count(*)
+		FROM lcc_e GROUP BY 1, 2, 3'),
+	-- IN and NOT IN, and with a NULL element
+	('SELECT (s IN (''live'', ''idle'')) AS x, (s NOT IN (''dead'', ''gone'')) AS y, count(*)
+		FROM lcc_e GROUP BY 1, 2'),
+	('SELECT (s IN (''live'', NULL)) AS x, (s NOT IN (''dead'', NULL)) AS y, count(*)
+		FROM lcc_e GROUP BY 1, 2'),
+	-- IS [NOT] DISTINCT FROM a value and NULL, and null tests
+	('SELECT (s IS DISTINCT FROM ''live'') AS x, (s IS NOT DISTINCT FROM ''idle'') AS y,
+			 (s IS DISTINCT FROM NULL) AS z, count(*) FROM lcc_e GROUP BY 1, 2, 3'),
+	('SELECT (s IS NULL) AS x, (s = ''gone'' OR s IS NULL) AS y, count(*) FROM lcc_e GROUP BY 1, 2'),
+	-- a column of no NULL, both of whose values are named
+	('SELECT CASE WHEN m = ''hot'' THEN ''h'' WHEN m = ''cold'' THEN ''c'' END AS t,
+			 (m <> ''hot'') AS u, count(*) FROM lcc_e GROUP BY 1, 2'),
+	-- the domain over the enum: a value no row has, and NULLs
+	('SELECT (dm::lcc_mood = ''live'') AS x, (dm::lcc_mood IN (''dead'', ''gone'')) AS y,
+			 (dm::lcc_mood IS DISTINCT FROM ''idle'') AS z, (dm IS NULL) AS w, count(*)
+		FROM lcc_e GROUP BY 1, 2, 3, 4'),
+	-- two enum columns, a text and a boolean, ANDed and ORed: 3-valued
+	('SELECT (s = ''live'' AND m = ''hot'') AS x, (s IN (''dead'', ''idle'') OR f) AS y,
+			 (m = ''cold'' AND r = ''r1'') AS z, count(*) FROM lcc_e GROUP BY 1, 2, 3'),
+	-- the score and its tier
+	('SELECT tier, count(*) FROM lcc_e_tiered GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered WHERE n < 50 GROUP BY tier'),
+	('SELECT score, count(*) FROM lcc_e_scored WHERE r IN (''r0'', ''r1'') GROUP BY score'),
+	('SELECT score, tier, count(*) AS c FROM lcc_e_tiered WHERE m = ''hot'' GROUP BY score, tier'),
+	-- the WHERE form
+	('SELECT count(*) FROM lcc_e_tiered WHERE tier = ''high'''),
+	('SELECT count(*), count(n) FROM lcc_e_tiered WHERE n < 50 AND tier IN (''low'', ''none'')'),
+	('SELECT count(*) FROM lcc_e WHERE n < 50 AND CASE WHEN s = ''live'' THEN f ELSE m = ''hot'' END'),
+	('SELECT (dm IS NULL) AS x, count(*) FROM lcc_e_tiered WHERE tier = ''medium'' GROUP BY 1'),
+	-- the enum's order, which no entry answers alone: declined
+	('SELECT (s < ''idle'') AS x, count(*) FROM lcc_e GROUP BY 1')
+) v(q);
+
+-- rows changed, whose pages the visibility map no longer covers, before
+-- VACUUM and in a transaction of their own
+UPDATE lcc_e SET s = 'live', dm = NULL WHERE id % 89 = 0;
+DELETE FROM lcc_e WHERE id % 97 = 0;
+SELECT lcc_check('SELECT tier, count(*) FROM lcc_e_tiered GROUP BY tier');
+BEGIN;
+UPDATE lcc_e SET s = NULL, m = 'cold' WHERE id % 31 = 0;
+SELECT lcc_check('SELECT tier, count(*) FROM lcc_e_tiered GROUP BY tier');
+ROLLBACK;
+VACUUM lcc_e;
+
+-- beside an anti join over a small inner side, by id and by n: the
+-- predicates evaluated on each row taken away
+CREATE INDEX lcc_e_id ON lcc_e (id);
+CREATE INDEX lcc_e_nb ON lcc_e (n);
+CREATE TABLE lcc_e_skip (a int);
+INSERT INTO lcc_e_skip SELECT i * 337 FROM generate_series(1, 30) i;
+INSERT INTO lcc_e_skip VALUES (7), (7), (11), (42), (NULL), (-2);
+VACUUM (ANALYZE) lcc_e, lcc_e_skip;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_e_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier') AS p("QUERY PLAN");
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.n) GROUP BY tier'),
+	('SELECT count(*) FROM lcc_e_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.n)'),
+	('SELECT (s IN (''live'', NULL)) AS x, (dm::lcc_mood IS DISTINCT FROM ''dead'') AS y, (m = ''hot'') AS z, count(*) FROM lcc_e c WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = c.n) GROUP BY 1, 2, 3')
+) v(q);
+
+-- in parallel, beside the anti join too
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_e_tiered WHERE m = ''hot'' GROUP BY tier') AS p("QUERY PLAN");
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_e_tiered GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered WHERE m = ''hot'' GROUP BY tier'),
+	('SELECT count(*) FROM lcc_e_tiered WHERE m = ''hot'' AND tier = ''high'''),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.n) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.m = ''cold'' AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier')
+) v(q);
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+SET max_parallel_workers_per_gather = 0;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP VIEW lcc_e_tiered;
+DROP VIEW lcc_e_scored;
+DROP TABLE lcc_e, lcc_e_skip;
+DROP DOMAIN lcc_dmood;
+DROP TYPE lcc_mood, lcc_tone;
+
 DROP VIEW lcc_tiered;
 DROP VIEW lcc_scored;
 DROP TABLE lcc;
