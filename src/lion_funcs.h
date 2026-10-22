@@ -107,7 +107,7 @@
 #include "lion_count.h"
 
 
-#define LION_STATS_NCOLS		33
+#define LION_STATS_NCOLS		35
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
@@ -157,10 +157,11 @@ typedef struct LionVerifyState
 	BlockNumber root;			/* the directory root, from the meta page */
 	uint32		height;
 	uint32		inline_limit;	/* ... and the largest INLINE payload (§4) */
-	/* per key column (DESIGN.md §24): at most one of each, per column */
-	int64		nnullentries[INDEX_MAX_KEYS];
-	int64		nemptyentries[INDEX_MAX_KEYS];
-	int64		nnullelemsentries[INDEX_MAX_KEYS];
+	/*
+	 * per key column (DESIGN.md §24): at most one of each reserved entry,
+	 * at kind - LION_KIND_NULL
+	 */
+	int64		nreservedentries[LION_NRESERVED][INDEX_MAX_KEYS];
 	int64		nlastsummaries[INDEX_MAX_KEYS];	/* §32: at most one */
 	uint16		lastattno;		/* attno of the last leaf entry seen */
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */

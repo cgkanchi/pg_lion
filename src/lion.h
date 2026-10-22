@@ -510,7 +510,16 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * EMPTY entry").  The EMPTY entry of a version 12 index may hold such rows,
  * which the count of a non-empty array (`array_length(a, 1) IS NOT NULL`)
  * would take away with the empty ones, so opening one is an ERROR whose hint
- * asks for REINDEX.  Every index this build writes is version 13.
+ * asks for REINDEX.
+ *
+ * Version 14 files an array with no element that has dimensions - `[0:-1]`,
+ * an empty int2vector's or oidvector's cast to int2[] or oid[] - in reserved
+ * entries of their own, LION_ENTRY_EMPTYDIM and LION_ENTRY_EMPTYINNER, where
+ * version 13 filed it in the EMPTY entry with the arrays of no dimension
+ * (§17).  `a = '{}'`, `a <> '{}'`, array_length() and array_ndims() tell the
+ * two apart, so the EMPTY entry of a version 13 index answers them wrongly,
+ * and opening one is an ERROR whose hint asks for REINDEX.  Every index this
+ * build writes is version 14.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
@@ -520,6 +529,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
 #define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
 #define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
+#define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17) */
 
 typedef struct LionMetaPageData
 {
@@ -702,14 +712,20 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LionEntryIsMinusInf(e)	(((e)->flags & LION_ENTRY_MINUSINF) != 0)
 
 /*
- * Three entries per key column have no key at all: keylen 0, hash 0, first in
+ * Five entries per key column have no key at all: keylen 0, hash 0, first in
  * the column's run, and recognised by a flag rather than by comparing keys.
  *
  *	- LION_ENTRY_NULLKEY holds the rows whose indexed VALUE is NULL
  *	  (DESIGN.md §14).
  *	- LION_ENTRY_EMPTYKEY holds the rows a multi-key opclass extracted
- *	  nothing from at all - an empty array, a tsvector with no lexemes
- *	  (DESIGN.md §17).  A scalar opclass never creates it.
+ *	  nothing from at all - an array with no element and no dimension, a
+ *	  tsvector with no lexemes (DESIGN.md §17).  A scalar opclass never
+ *	  creates it.
+ *	- LION_ENTRY_EMPTYDIM and LION_ENTRY_EMPTYINNER hold the arrays with no
+ *	  element that have dimensions, an array extraction's alone (§17): the
+ *	  first those whose first dimension has length 0 (`[0:-1]`), the second
+ *	  those whose first dimension has a length and an inner one none
+ *	  (`[1:2][0:-1]`).
  *	- LION_ENTRY_NULLELEMS holds the rows it extracted keys from that are
  *	  all NULL - an array of NULLs (§17).  Only array_ops' extraction
  *	  returns NULL keys.
@@ -723,6 +739,8 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LionEntryIsEmptyKey(e)	(((e)->flags & LION_ENTRY_EMPTYKEY) != 0)
 #define LionEntryIsNullElems(e)	(((e)->flags & LION_ENTRY_NULLELEMS) != 0)
 #define LionEntryIsReserved(e)	(((e)->flags & LION_ENTRY_RESERVED) != 0)
+/* ... and the reserved entries of rows under no key that are not NULL */
+#define LionEntryIsKeyless(e)	(((e)->flags & LION_ENTRY_KEYLESS) != 0)
 #define LionEntryIsSummary(e)	(((e)->flags & LION_ENTRY_SUMKINDS) != 0)
 #define LionEntryIsSumLast(e)	(((e)->flags & LION_ENTRY_SUMLAST) != 0)
 #define LION_NULLKEY_HASH		0
@@ -749,11 +767,12 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
  * carries attno 0 and therefore sorts below every real entry whatever its
  * kind, which is what keeps the MINF rule of §21 intact.
  *
- * Within one column the kind puts the three reserved entries first - they
+ * Within one column the kind puts the five reserved entries first - they
  * have no key to compare - and gives the leftmost downlink of an internal page
  * a value below every real one:
  *
- *		MINF < NULL < EMPTY < NULLELEMS < VALUE < SUMMARY < SUMLAST
+ *		MINF < NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < VALUE
+ *			 < SUMMARY < SUMLAST
  *
  * The two summary kinds of DESIGN.md §32 come after every VALUE entry, so a
  * column's values are one run and its summaries the run right after it: a walk
@@ -773,15 +792,26 @@ StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
 #define LION_KIND_MINF		0
 #define LION_KIND_NULL		1
 #define LION_KIND_EMPTY		2
-#define LION_KIND_NULLELEMS	3	/* DESIGN.md §17, "The reserved EMPTY entry" */
-#define LION_KIND_VALUE		4
-#define LION_KIND_SUMMARY	5	/* DESIGN.md §32 */
-#define LION_KIND_SUMLAST	6
+#define LION_KIND_EMPTYDIM	3	/* DESIGN.md §17, "The reserved EMPTY entry" */
+#define LION_KIND_EMPTYINNER 4	/* ... likewise */
+#define LION_KIND_NULLELEMS	5	/* ... likewise */
+#define LION_KIND_VALUE		6
+#define LION_KIND_SUMMARY	7	/* DESIGN.md §32 */
+#define LION_KIND_SUMLAST	8
 
-/* The kinds of the reserved entries, which have no key and one per column. */
+/*
+ * The kinds of the reserved entries, which have no key and one per column:
+ * NULL to NULLELEMS, consecutive.
+ */
 #define LION_KIND_IS_RESERVED(k) \
-	((k) == LION_KIND_NULL || (k) == LION_KIND_EMPTY || \
-	 (k) == LION_KIND_NULLELEMS)
+	((k) >= LION_KIND_NULL && (k) <= LION_KIND_NULLELEMS)
+#define LION_NRESERVED	(LION_KIND_NULLELEMS - LION_KIND_NULL + 1)
+StaticAssertDecl(LION_KIND_EMPTY == LION_KIND_NULL + 1 &&
+				 LION_KIND_EMPTYDIM == LION_KIND_NULL + 2 &&
+				 LION_KIND_EMPTYINNER == LION_KIND_NULL + 3 &&
+				 LION_KIND_NULLELEMS == LION_KIND_NULL + 4 &&
+				 LION_KIND_VALUE == LION_KIND_NULLELEMS + 1,
+				 "the reserved kinds are consecutive, in directory order");
 
 /* Kinds whose order compares keys (the others are one entry per column). */
 #define LION_KIND_HAS_KEY(k)	((k) == LION_KIND_VALUE || (k) == LION_KIND_SUMMARY)
@@ -812,6 +842,10 @@ lion_entry_kind(const LionEntryTuple *e)
 		return LION_KIND_NULL;
 	if ((e->flags & LION_ENTRY_EMPTYKEY) != 0)
 		return LION_KIND_EMPTY;
+	if ((e->flags & LION_ENTRY_EMPTYDIM) != 0)
+		return LION_KIND_EMPTYDIM;
+	if ((e->flags & LION_ENTRY_EMPTYINNER) != 0)
+		return LION_KIND_EMPTYINNER;
 	if ((e->flags & LION_ENTRY_NULLELEMS) != 0)
 		return LION_KIND_NULLELEMS;
 	if ((e->flags & LION_ENTRY_SUMLAST) != 0)
@@ -824,30 +858,46 @@ lion_entry_kind(const LionEntryTuple *e)
 /*
  * The kind of the reserved entry a reserved flag names, and the flag of a
  * reserved kind: LION_ENTRY_NULLKEY is LION_KIND_NULL, LION_ENTRY_EMPTYKEY
- * LION_KIND_EMPTY and LION_ENTRY_NULLELEMS LION_KIND_NULLELEMS.
+ * LION_KIND_EMPTY, LION_ENTRY_EMPTYDIM LION_KIND_EMPTYDIM,
+ * LION_ENTRY_EMPTYINNER LION_KIND_EMPTYINNER and LION_ENTRY_NULLELEMS
+ * LION_KIND_NULLELEMS.
  */
 static inline int
 lion_reserved_kind(uint16 reservedflag)
 {
-	Assert(reservedflag == LION_ENTRY_NULLKEY ||
-		   reservedflag == LION_ENTRY_EMPTYKEY ||
-		   reservedflag == LION_ENTRY_NULLELEMS);
-	if (reservedflag == LION_ENTRY_NULLKEY)
-		return LION_KIND_NULL;
-	if (reservedflag == LION_ENTRY_EMPTYKEY)
-		return LION_KIND_EMPTY;
-	return LION_KIND_NULLELEMS;
+	switch (reservedflag)
+	{
+		case LION_ENTRY_NULLKEY:
+			return LION_KIND_NULL;
+		case LION_ENTRY_EMPTYKEY:
+			return LION_KIND_EMPTY;
+		case LION_ENTRY_EMPTYDIM:
+			return LION_KIND_EMPTYDIM;
+		case LION_ENTRY_EMPTYINNER:
+			return LION_KIND_EMPTYINNER;
+		default:
+			Assert(reservedflag == LION_ENTRY_NULLELEMS);
+			return LION_KIND_NULLELEMS;
+	}
 }
 
 static inline uint16
 lion_reserved_flag(int kind)
 {
-	Assert(LION_KIND_IS_RESERVED(kind));
-	if (kind == LION_KIND_NULL)
-		return LION_ENTRY_NULLKEY;
-	if (kind == LION_KIND_EMPTY)
-		return LION_ENTRY_EMPTYKEY;
-	return LION_ENTRY_NULLELEMS;
+	switch (kind)
+	{
+		case LION_KIND_NULL:
+			return LION_ENTRY_NULLKEY;
+		case LION_KIND_EMPTY:
+			return LION_ENTRY_EMPTYKEY;
+		case LION_KIND_EMPTYDIM:
+			return LION_ENTRY_EMPTYDIM;
+		case LION_KIND_EMPTYINNER:
+			return LION_ENTRY_EMPTYINNER;
+		default:
+			Assert(kind == LION_KIND_NULLELEMS);
+			return LION_ENTRY_NULLELEMS;
+	}
 }
 
 /*
@@ -1358,11 +1408,22 @@ typedef struct LionQuery
  * ones and the duplicates, and return them in *keys (palloc'd in the current
  * context) with the count as the return value.  Zero keys means the row
  * belongs in a reserved entry, and *nokey (when nokey is not NULL) says
- * which: LION_ENTRY_EMPTYKEY when nothing was extracted at all, and
- * LION_ENTRY_NULLELEMS when every key extracted was NULL (DESIGN.md §17).
+ * which: LION_ENTRY_EMPTYKEY when nothing was extracted at all - or
+ * LION_ENTRY_EMPTYDIM or LION_ENTRY_EMPTYINNER for an array with no element
+ * that has dimensions - and LION_ENTRY_NULLELEMS when every key extracted
+ * was NULL (DESIGN.md §17).
  */
 extern int lion_extract_value(LionState *state, Datum value, Datum **keys,
 							  uint16 *nokey);
+
+/*
+ * Is fn the extraction of an array's elements, lion's array_ops' or GIN's
+ * (DESIGN.md §17)?  And the reserved entry of an array with no element by
+ * its dimensions - LION_ENTRY_EMPTYKEY, LION_ENTRY_EMPTYDIM or
+ * LION_ENTRY_EMPTYINNER - or 0 for one with an element.
+ */
+extern bool lion_extracts_array_elements(PGFunction fn);
+extern uint16 lion_array_empty_flag(Datum value);
 
 /*
  * The positions of one extracted key, as support proc 5 returns them: npos
@@ -1957,8 +2018,8 @@ extern LionEntryTuple *lion_entry_chain_shape(const LionEntryTuple *entry,
 
 /*
  * The same for a reserved entry (DESIGN.md §14 and §17): no key, hash 0, and
- * reservedflag - exactly one of LION_ENTRY_NULLKEY, LION_ENTRY_EMPTYKEY and
- * LION_ENTRY_NULLELEMS - set on top of the caller's INLINE/CHAIN flag.  There is one of each PER KEY
+ * reservedflag - exactly one of the flags of LION_ENTRY_RESERVED - set on
+ * top of the caller's INLINE/CHAIN flag.  There is one of each PER KEY
  * COLUMN (DESIGN.md §24), which is why the column has to be named here.
  */
 extern LionEntryTuple *lion_make_reserved_entry(AttrNumber attno,

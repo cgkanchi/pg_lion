@@ -947,8 +947,8 @@ lion_cells_tree(const LionKeyNode *n, uint64 mask)
 /*
  * The outcome of a row of multi-key dimension dim whose labels' bits are
  * mask: NULL's, for a row of its NULL entry; otherwise the bit of each leaf
- * whose key tree the row's keys satisfy - none for a row of no key, the
- * EMPTY entry's among them.
+ * whose key tree the row's keys satisfy - none for a row of no key, those
+ * of the keyless entries among them.
  */
 int
 lion_cells_outcome(const LionCellDim *dim, uint64 mask)

@@ -977,10 +977,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V13)
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V14)
 		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V13);
+					meta->version, LION_MAGIC, LION_VERSION_V14);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))

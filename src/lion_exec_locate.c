@@ -629,41 +629,46 @@ lion_locate_leaf(LionCountScanState *st, LionClauseState *cl,
 				/*
 				 * Whether an array is empty (DESIGN.md §17, "Non-empty
 				 * arrays"): the rows of the reserved entries the mask names -
-				 * the EMPTY one, and the NULL one when it is there - which
-				 * RESERVED selects and NOTRESERVED subtracts.  An entry the
-				 * column does not have holds no row.
+				 * of EMPTY, EMPTYDIM and EMPTYINNER, and the NULL one when it
+				 * is there - which RESERVED selects and NOTRESERVED
+				 * subtracts.  An entry the column does not have holds no
+				 * row.
 				 */
+				static const uint16 entries[] = {
+					LION_ENTRY_NULLKEY, LION_ENTRY_EMPTYKEY,
+					LION_ENTRY_EMPTYDIM, LION_ENTRY_EMPTYINNER
+				};
 				int32		mask = DatumGetInt32(cl->val);
 				LionKeyNode **args;
+				int			e;
 
 				if (cl->valisnull || !LION_RESERVED_MASK_OK(mask))
 					elog(ERROR, "LionCount: reserved entries 0x%x of index \"%s\"",
 						 cl->valisnull ? 0 : (unsigned int) mask,
 						 RelationGetRelationName(cl->idx));
-				*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * 2);
-				if (lion_posting_set_lookup_reserved_col(cl->idx, cl->idxcol,
-														 LION_ENTRY_EMPTYKEY,
-														 &(*sets)[n]))
-					n++;
-				else
-					lion_posting_set_release(&(*sets)[n]);
-				if ((mask & LION_ENTRY_NULLKEY) != 0)
+				*sets = (LionPostingSet *)
+					palloc0(sizeof(LionPostingSet) * lengthof(entries));
+				for (e = 0; e < (int) lengthof(entries); e++)
 				{
-					if (lion_posting_set_lookup_null_col(cl->idx, cl->idxcol,
-														 &(*sets)[n]))
+					if ((mask & entries[e]) == 0)
+						continue;
+					if (lion_posting_set_lookup_reserved_col(cl->idx,
+															 cl->idxcol,
+															 entries[e],
+															 &(*sets)[n]))
 						n++;
 					else
 						lion_posting_set_release(&(*sets)[n]);
 				}
 				if (n == 1)
 					tree = lion_key_node(0);
-				else if (n == 2)
+				else if (n > 1)
 				{
 					/* the node keeps the array: not the stack's */
-					args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
-					args[0] = lion_key_node(0);
-					args[1] = lion_key_node(1);
-					tree = lion_bool_node(LION_KN_OR, args, 2);
+					args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * n);
+					for (e = 0; e < n; e++)
+						args[e] = lion_key_node(e);
+					tree = lion_bool_node(LION_KN_OR, args, n);
 				}
 				break;
 			}

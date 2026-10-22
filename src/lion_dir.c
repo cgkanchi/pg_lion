@@ -377,8 +377,8 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 		return ikind < sk->kind ? -1 : 1;
 
 	/*
-	 * One NULL, one EMPTY and one last SUMMARY entry per column: their kind is
-	 * their whole position.  VALUE and SUMMARY entries are ordered by their
+	 * One of each reserved entry and one last SUMMARY entry per column: their
+	 * kind is their whole position.  VALUE and SUMMARY entries are ordered by their
 	 * keys (DESIGN.md §32: a summary's key is its bucket's upper bound).
 	 */
 	if (!LION_KIND_HAS_KEY(ikind))

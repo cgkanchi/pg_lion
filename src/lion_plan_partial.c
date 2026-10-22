@@ -329,12 +329,17 @@ lion_partial_used(void)
 	return (lion_partial_scope != NULL) ? lion_partial_scope->used : NIL;
 }
 
-/* A clause of this kind selects only rows its own set holds. */
+/*
+ * A clause of this kind selects only rows its own sets hold: those of its
+ * key or keys, of the NULL entry, of a range, or of an array column's
+ * reserved entries (§17, "Non-empty arrays").
+ */
 static bool
 lion_partial_anchor_kind(int kind)
 {
 	return kind == LION_CLAUSE_EQ || kind == LION_CLAUSE_ARRAY ||
-		kind == LION_CLAUSE_NULL || kind == LION_CLAUSE_RANGESRC;
+		kind == LION_CLAUSE_NULL || kind == LION_CLAUSE_RANGESRC ||
+		kind == LION_CLAUSE_RESERVED;
 }
 
 /* Is clause i one of run r's: the WHERE's (filter 0), or filter r's? */
@@ -366,8 +371,9 @@ lion_partial_run_reads(const LionCountTarget *t, List *clauseinfos,
 /*
  * Is every row run r of target t counts one of partial index p's, by its
  * WHERE alone: a positive clause of the run, outside any OR, read from p -
- * an equality, a list, `IS NULL`, a range taken as a source, whose set holds
- * p's rows only and is ANDed into every count of the run - or an OR each of
+ * an equality, a list, `IS NULL`, a range taken as a source, the rows of an
+ * array column's reserved entries (`cardinality(tags) = 0`), whose sets hold
+ * p's rows only and are ANDed into every count of the run - or an OR each of
  * whose arms the partition keeps has such a leaf?  Not a multi-key clause,
  * whose query may turn out to narrow nothing (DESIGN.md §17), nor anything
  * negated, nor an OR with a complement arm, which counts the rows outside a

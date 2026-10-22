@@ -597,10 +597,13 @@ the number of rows a multi-key opclass extracted no key from (an array with no e
 with no lexemes), `ndistinct`, the distinct keys
 the planner is given for the column (DESIGN.md §33; NULL where none is recorded),
 `narrow_containers`, the column's NARROW containers (DESIGN.md §38), `nullelem_tids`,
-the number of rows whose array has elements and all of them NULL (DESIGN.md §17), and, last,
+the number of rows whose array has elements and all of them NULL (DESIGN.md §17),
 `position_pages` and `position_internal_pages`, the leaves and the pages above them of the column's
 position trees (an index built with `store_positions`, DESIGN.md §17), which `container_pages`,
-`posting_internal_pages` and `max_posting_height` leave out.  `slack_bytes` and
+`posting_internal_pages` and `max_posting_height` leave out, and, last, `emptydim_tids` and
+`emptyinner_tids`, the rows whose array has no element but has dimensions, which `empty_tids` leaves
+out: an empty array whose first dimension has length 0 (an empty `int2vector` or `oidvector` cast
+to `int2[]` or `oid[]`), and one whose first dimension has a length and an inner one none.  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the

@@ -27,6 +27,105 @@ lion_explain_attname(LionCountScanState *st, AttrNumber attno)
 }
 
 /*
+ * Whether the array is empty (DESIGN.md §17, "Non-empty arrays"): the rows
+ * of the reserved entries mask names, or with notreserved every row outside
+ * them, as the five classes of row they are - NULL, empty, an empty first
+ * dimension, an empty inner one, an element - in one spelling for each set
+ * of classes, whichever the query had.  Those are the sets one clause can
+ * select (lion_nonempty_leaf()), its column's own null tests apart; any
+ * other is printed as the OR of its classes' all the same.
+ */
+#define LION_EX_NULL	0x01
+#define LION_EX_EMPTY	0x02
+#define LION_EX_DIM		0x04
+#define LION_EX_INNER	0x08
+#define LION_EX_SOME	0x10
+
+static void
+lion_explain_reserved(StringInfo buf, const char *attname, int32 mask,
+					  bool notreserved)
+{
+	static const struct
+	{
+		int			classes;
+		const char *fmt;
+	}			spellings[] = {
+		{LION_EX_EMPTY, "%s = '{}'"},
+		{LION_EX_DIM | LION_EX_INNER | LION_EX_SOME, "%s <> '{}'"},
+		{LION_EX_NULL | LION_EX_DIM | LION_EX_INNER | LION_EX_SOME,
+		"%s IS DISTINCT FROM '{}'"},
+		{LION_EX_EMPTY | LION_EX_DIM | LION_EX_INNER, "cardinality(%s) = 0"},
+		{LION_EX_NULL | LION_EX_EMPTY | LION_EX_DIM | LION_EX_INNER,
+		"coalesce(cardinality(%s), 0) = 0"},
+		{LION_EX_SOME, "cardinality(%s) > 0"},
+		{LION_EX_NULL | LION_EX_SOME, "cardinality(%s) IS DISTINCT FROM 0"},
+		{LION_EX_NULL | LION_EX_EMPTY, "array_length(%s, 1) IS NULL"},
+		{LION_EX_DIM, "array_length(%s, 1) = 0"},
+		{LION_EX_INNER | LION_EX_SOME, "array_length(%s, 1) > 0"},
+		{LION_EX_NULL | LION_EX_EMPTY | LION_EX_DIM,
+		"coalesce(array_length(%s, 1), 0) = 0"},
+		{LION_EX_NULL | LION_EX_EMPTY | LION_EX_INNER | LION_EX_SOME,
+		"array_length(%s, 1) IS DISTINCT FROM 0"},
+	};
+	int			classes = 0;
+	int			i;
+	bool		first = true;
+
+	if ((mask & LION_ENTRY_NULLKEY) != 0)
+		classes |= LION_EX_NULL;
+	if ((mask & LION_ENTRY_EMPTYKEY) != 0)
+		classes |= LION_EX_EMPTY;
+	if ((mask & LION_ENTRY_EMPTYDIM) != 0)
+		classes |= LION_EX_DIM;
+	if ((mask & LION_ENTRY_EMPTYINNER) != 0)
+		classes |= LION_EX_INNER;
+	if (notreserved)
+		classes = (LION_EX_NULL | LION_EX_EMPTY | LION_EX_DIM | LION_EX_INNER |
+				   LION_EX_SOME) & ~classes;
+
+	for (i = 0; i < (int) lengthof(spellings); i++)
+	{
+		if (spellings[i].classes == classes)
+		{
+			appendStringInfo(buf, spellings[i].fmt, attname);
+			return;
+		}
+	}
+
+	appendStringInfoChar(buf, '(');
+	for (i = 0; i < 5; i++)
+	{
+		int			cls = 1 << i;
+
+		if ((classes & cls) == 0)
+			continue;
+		if (!first)
+			appendStringInfoString(buf, " OR ");
+		first = false;
+		switch (cls)
+		{
+			case LION_EX_NULL:
+				appendStringInfo(buf, "%s IS NULL", attname);
+				break;
+			case LION_EX_EMPTY:
+				appendStringInfo(buf, "%s = '{}'", attname);
+				break;
+			case LION_EX_DIM:
+				appendStringInfo(buf, "array_length(%s, 1) = 0", attname);
+				break;
+			case LION_EX_INNER:
+				appendStringInfo(buf, "(array_length(%s, 1) > 0 AND cardinality(%s) = 0)",
+								 attname, attname);
+				break;
+			case LION_EX_SOME:
+				appendStringInfo(buf, "cardinality(%s) > 0", attname);
+				break;
+		}
+	}
+	appendStringInfoChar(buf, ')');
+}
+
+/*
  * "col = 3", "col = ANY ('{1,2,3}'::integer[])", "col IS NULL",
  * "col IS NOT NULL", "tags @> '{a,b}'::text[]", "col >= 10" (a range,
  * DESIGN.md §28, with the column on the left whichever side the query had it
@@ -61,28 +160,16 @@ lion_explain_clause(LionCountScanState *st, LionClauseState *cl, List *ancestors
 		case LION_CLAUSE_RESERVED:
 		case LION_CLAUSE_NOTRESERVED:
 			{
-				/*
-				 * Whether the array is empty (DESIGN.md §17, "Non-empty
-				 * arrays"), in one spelling for each set of rows, whichever
-				 * the query had: the rows of the EMPTY entry, with the NULL
-				 * one's or without, or every row outside them.
-				 */
 				int32		mask;
-				bool		withnull;
 
 				if (cl->con == NULL)
 					elog(ERROR, "LionCount: the reserved entries of a clause are no constant");
 				mask = DatumGetInt32(cl->con->constvalue);
-				withnull = (mask & LION_ENTRY_NULLKEY) != 0;
-				if (cl->kind == LION_CLAUSE_RESERVED)
-					appendStringInfo(buf, withnull ?
-									 "coalesce(cardinality(%s), 0) = 0" :
-									 "cardinality(%s) = 0", attname);
-				else
-					appendStringInfo(buf, withnull ?
-									 "cardinality(%s) > 0" :
-									 "cardinality(%s) IS DISTINCT FROM 0",
-									 attname);
+				if (!LION_RESERVED_MASK_OK(mask))
+					elog(ERROR, "LionCount: reserved entries 0x%x of a clause",
+						 (unsigned int) mask);
+				lion_explain_reserved(buf, attname, mask,
+									  cl->kind == LION_CLAUSE_NOTRESERVED);
 				break;
 			}
 		default:

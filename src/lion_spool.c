@@ -156,8 +156,8 @@ typedef struct LionAccEntry
 {
 	Datum		key;
 	uint32		hash;
-	uint8		kind;			/* LION_KIND_NULL, _EMPTY, _NULLELEMS or
-								 * _VALUE */
+	uint8		kind;			/* a reserved kind (LION_KIND_NULL to
+								 * _NULLELEMS) or LION_KIND_VALUE */
 	bool		unsorted;		/* a code arrived below the one before it */
 	Size		keylen;			/* lion_key_datum_size(), 0 when reserved */
 	uint64		mincode;
@@ -198,12 +198,10 @@ static inline bool lion_acc_equal(struct LionAccCol *col,
 
 /*
  * The reserved entries a column may have (DESIGN.md §14, §17): the NULL, the
- * EMPTY and the NULLELEMS entry, in directory order, at kind - LION_KIND_NULL.
+ * EMPTY, the EMPTYDIM, the EMPTYINNER and the NULLELEMS entry, in directory
+ * order, at kind - LION_KIND_NULL.
  */
-#define LION_ACC_NRESERVED	3
-StaticAssertDecl(LION_KIND_EMPTY == LION_KIND_NULL + 1 &&
-				 LION_KIND_NULLELEMS == LION_KIND_NULL + 2,
-				 "the reserved kinds are consecutive, in directory order");
+#define LION_ACC_NRESERVED	LION_NRESERVED
 
 /* One key column's accumulator, and the runs it has spilled. */
 typedef struct LionAccCol
@@ -779,9 +777,10 @@ lion_sortitem_cmp(const void *a, const void *b, void *arg)
 }
 
 /*
- * A column's entries in directory order: the NULL entry, the EMPTY entry,
- * the NULLELEMS entry, then the values.  *flagsp gets LION_RUN_TIED for every value whose
- * successor ties with it on the prefix, or NULL when none does.
+ * A column's entries in directory order: the reserved entries (NULL, EMPTY,
+ * EMPTYDIM, EMPTYINNER, NULLELEMS), then the values.  *flagsp gets
+ * LION_RUN_TIED for every value whose successor ties with it on the prefix,
+ * or NULL when none does.
  *
  * An ordered column sorts through the key type's SortSupport, abbreviated
  * where the type offers it, exactly as tuplesort would - and as the
@@ -2374,10 +2373,11 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 			/*
 			 * DESIGN.md §17: one row, many keys.  A row the opclass extracts
 			 * nothing from - an empty array, a tsvector with no lexemes -
-			 * goes into the reserved EMPTY entry, and one it extracts only
-			 * NULL keys from - an array of NULLs - into the NULLELEMS entry,
-			 * so that a scan that has to look at every indexed row (`tags @>
-			 * '{}'`) can still find it.
+			 * goes into the reserved EMPTY entry, or for an empty array with
+			 * dimensions the EMPTYDIM or EMPTYINNER one, and one it extracts
+			 * only NULL keys from - an array of NULLs - into the NULLELEMS
+			 * entry, so that a scan that has to look at every indexed row
+			 * (`tags @> '{}'`) can still find it.
 			 */
 			Datum	   *keys;
 			uint16		nokey;

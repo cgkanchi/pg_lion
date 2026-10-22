@@ -84,6 +84,8 @@ typedef struct LionColStats
 	int64		ntids;
 	int64		null_tids;		/* members of the reserved NULL entry (§14) */
 	int64		empty_tids;		/* members of the reserved EMPTY entry (§17) */
+	int64		emptydim_tids;	/* ... of the EMPTYDIM one (§17) */
+	int64		emptyinner_tids;	/* ... of the EMPTYINNER one (§17) */
 	int64		nullelem_tids;	/* ... and of the NULLELEMS one (§17) */
 	int64		container_pages;	/* posting-tree LEAVES (DESIGN.md §22) */
 	int64		posting_internal_pages; /* ... and the pages above them */
@@ -411,6 +413,10 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						cs->null_tids += (int64) lion_entry_ntids(entry);
 					if (LionEntryIsEmptyKey(entry))
 						cs->empty_tids += (int64) lion_entry_ntids(entry);
+					if ((entry->flags & LION_ENTRY_EMPTYDIM) != 0)
+						cs->emptydim_tids += (int64) lion_entry_ntids(entry);
+					if ((entry->flags & LION_ENTRY_EMPTYINNER) != 0)
+						cs->emptyinner_tids += (int64) lion_entry_ntids(entry);
 					if (LionEntryIsNullElems(entry))
 						cs->nullelem_tids += (int64) lion_entry_ntids(entry);
 
@@ -598,7 +604,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		/*
 		 * The distinct keys the planner is given (DESIGN.md §33), as the last
 		 * build, VACUUM or ANALYZE counted them: not this walk's entries, which
-		 * count the NULL and EMPTY entries too and are as of now.
+		 * count the reserved entries too and are as of now.
 		 */
 		(void) lion_read_meta_ndistinct(index, &st->nd);
 
@@ -659,6 +665,8 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[30] = Int64GetDatum(cs->nullelem_tids);
 		values[31] = Int64GetDatum(cs->position_pages);
 		values[32] = Int64GetDatum(cs->position_internal_pages);
+		values[33] = Int64GetDatum(cs->emptydim_tids);
+		values[34] = Int64GetDatum(cs->emptyinner_tids);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

@@ -262,15 +262,15 @@ smgr_bulk_finish(BulkWriteState *bw)
 
 /*
  * Which entry a sorted tuple belongs to.  A row contributes one tuple per
- * distinct extracted key, or exactly one NULL, EMPTY or NULLELEMS tuple when
- * it has no key at all; the reserved kinds are told apart by this column
- * rather than by the (absent) key, and they share hash 0 with any real key
- * that happens to hash there.  lion_reserved_flag() (lion.h) is the flag of
- * a reserved kind.
+ * distinct extracted key, or exactly one tuple of a reserved kind - NULL,
+ * EMPTY, EMPTYDIM, EMPTYINNER or NULLELEMS - when it has no key at all; the
+ * reserved kinds are told apart by this column rather than by the (absent)
+ * key, and they share hash 0 with any real key that happens to hash there.
+ * lion_reserved_flag() (lion.h) is the flag of a reserved kind.
  *
  * The values are the directory kinds of DESIGN.md §21 (NULL < EMPTY <
- * NULLELEMS < VALUE), so sorting the column ascending is already the order
- * the directory wants.
+ * EMPTYDIM < EMPTYINNER < NULLELEMS < VALUE), so sorting the column
+ * ascending is already the order the directory wants.
  */
 #define LION_KEY_REAL	LION_KIND_VALUE
 
@@ -1914,7 +1914,7 @@ lion_builder_cmp(const void *a, const void *b, void *arg)
 	if (x->keykind != y->keykind)
 		return x->keykind < y->keykind ? -1 : 1;
 	if (x->keykind != LION_KEY_REAL)
-		return 0;				/* one NULL and one EMPTY entry per column */
+		return 0;				/* one of each reserved entry per column */
 
 	if (cs->ordered)
 	{
@@ -2503,7 +2503,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt,
 	/* The root is filled in once the tree has been built. */
 	memset(&meta, 0, sizeof(meta));
 	meta.magic = LION_MAGIC;
-	meta.version = LION_VERSION_V13;
+	meta.version = LION_VERSION_V14;
 	meta.offset_bits = LION_OFFSET_BITS;
 	meta.container_bits = LION_CONTAINER_BITS;
 	meta.inline_limit = inline_limit;

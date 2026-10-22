@@ -172,12 +172,12 @@ SELECT t, lion_nr_maxoff(t::regclass) AS maxoff,
   FROM lion_nr_tabs ORDER BY ord;
      t     | maxoff | version_k | version_g 
 -----------+--------+-----------+-----------
- lion_n35  |     35 | 13        | 13
- lion_n61  |     61 | 13        | 13
- lion_n97  |     97 | 13        | 13
- lion_n136 |    136 | 13        | 13
- lion_n185 |    185 | 13        | 13
- lion_n226 |    226 | 13        | 13
+ lion_n35  |     35 | 14        | 14
+ lion_n61  |     61 | 14        | 14
+ lion_n97  |     97 | 14        | 14
+ lion_n136 |    136 | 14        | 14
+ lion_n185 |    185 | 14        | 14
+ lion_n226 |    226 | 14        | 14
 (6 rows)
 
 SELECT t, m.* FROM lion_nr_tabs, lion_nr_mix((t || '_k')::regclass) m ORDER BY ord;
@@ -227,7 +227,7 @@ VACUUM (FREEZE, ANALYZE) lion_n272;
 SELECT lion_nr_maxoff('lion_n272') AS maxoff, lion_nr_version('lion_n272_i') AS version;
  maxoff | version 
 --------+---------
-    272 | 13
+    272 | 14
 (1 row)
 
 SELECT * FROM lion_nr_mix('lion_n272_i');
@@ -745,7 +745,7 @@ SELECT * FROM lion_nr_mix('lion_nb_k');
 SELECT lion_nr_version('lion_nb_k') AS version;
  version 
 ---------
- 13
+ 14
 (1 row)
 
 UPDATE lion_nb SET k = 1 - k WHERE (ctid::text::point)[0] < 70;
@@ -1073,7 +1073,7 @@ SELECT * FROM lion_nr_mix('lion_nn_k');
 SELECT lion_nr_version('lion_nn_k') AS version;
  version 
 ---------
- 13
+ 14
 (1 row)
 
 SELECT lion_nr_cmp('lion_nn', 'k = 1');
@@ -1093,7 +1093,7 @@ SELECT * FROM lion_nr_mix('lion_nn_k');
 SELECT lion_nr_version('lion_nn_k') AS version;
  version 
 ---------
- 13
+ 14
 (1 row)
 
 SELECT lion_nr_verify('lion_nn_k');
@@ -1118,7 +1118,7 @@ SELECT * FROM lion_nr_mix('lion_nn_k');
 SELECT lion_nr_version('lion_nn_k') AS version;
  version 
 ---------
- 13
+ 14
 (1 row)
 
 SELECT lion_nr_verify('lion_nn_k');
@@ -1157,7 +1157,7 @@ VACUUM (FREEZE, ANALYZE) lion_ns;
 SELECT lion_nr_maxoff('lion_ns') AS maxoff, lion_nr_version('lion_ns_v') AS version;
  maxoff | version 
 --------+---------
-     67 | 13
+     67 | 14
 (1 row)
 
 SELECT containers, array_containers, narrow_containers, summary_entries, summary_tids,
