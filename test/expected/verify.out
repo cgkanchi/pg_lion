@@ -1425,7 +1425,7 @@ SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigroot, :rootitem,
 SET work_mem = '64kB';
 SET client_min_messages = debug1;
 SELECT lion_index_verify('lion_vfy_big_d');
-DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held
+DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared
 DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 25600 bytes in memory and wrote 176 records to temporary files
  lion_index_verify 
 -------------------
@@ -1434,7 +1434,7 @@ DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 25600 b
 
 RESET work_mem;
 SELECT lion_index_verify('lion_vfy_big_d');
-DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held
+DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared
 DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 41984 bytes in memory and wrote 0 records to temporary files
  lion_index_verify 
 -------------------

@@ -1263,9 +1263,23 @@ comparison reads the two trees' leaves in step, a copy of one leaf of each and o
 and keeps nothing else: collecting the members' codes to look the TIDs up in would cost 8 bytes a
 row, without bound. `test/isolation/verify_positions.spec` parks the check after each
 walk (`lion-verify-postree-walked`) and before each new one (`lion-verify-postree-rewalk`) while an
-INSERT changes the key, until the walk with the leaf held (`lion-verify-postree-held`, 'notice'). A
-standby walks a position tree until a walk gets to its end and compares nothing: it has no hold to
-settle a suspicion with.
+INSERT changes the key, until the walk with the leaf held (`lion-verify-postree-held`, 'notice').
+
+A standby has no hold to settle a suspicion with, and the entry reading the same settles nothing
+there: replay applies a writer's records one at a time, and replays VACUUM beside the check - a TID
+taken out of the set, its positions after it (V1), and another row's TID put in leave the entry as
+it was, while a walk read the set before the first and the tree after the second. What settles a
+walk there is the pages' LSNs. Replay sets every page a record changes to the end of the record, and
+`GetXLogReplayRecPtr()` is the end of the last record replayed: a walk that notes it before it reads
+anything and then reads no page past it - of the tree, of the posting set, the entry's leaf - read
+the index as it was at that one point of the primary's WAL, where every TID has its positions (W1
+and V1 order the records so, and an INSERT or a VACUUM stopped between two of them leaves members
+without TIDs, nothing else). A difference that walk finds is damage and is reported - the count
+only when the entry's leaf was read at that point too. A walk that found no difference is kept
+whatever its pages' LSNs, as on a primary; one that found a difference after replay changed a page
+it read is walked again, and after three of those the tree is kept without the comparison, with a
+WARNING whose hint is to pause replay, which leaves every page as it is. `test/recovery/run.sh`
+phase 2 damages a position leaf in the standby's copy of an index and has the standby report it.
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -1402,7 +1416,7 @@ going through while the check waits for the table. Each change is one the old Ac
 reported as damage or would have; `verify.sql`'s sixth damage case is real damage that only the
 recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
 left links and root flags settled on the spot, and posting-set and position-tree walks made, thrown
-away and held.
+away, held and, on a standby, kept without their comparison.
 
 ### Facet counts (`lion_facets.c`)
 

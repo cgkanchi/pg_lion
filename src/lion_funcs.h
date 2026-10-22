@@ -60,7 +60,10 @@
  * the entry read again afterwards - and a set that replay keeps changing is
  * kept from its last walk without comparing its totals, never walked with
  * the leaf held; and heapallindexed lets the entry's leaf go before it
- * descends the set, on a primary too.
+ * descends the set, on a primary too.  A position tree that disagrees with
+ * its posting set there is reported only from a walk that read every page
+ * as it was at one replay position, which the pages' LSNs show; one replay
+ * keeps from that is kept without the comparison too.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -244,7 +247,17 @@ typedef struct LionVerifyState
 	int64		nposwalks;		/* position-tree walks */
 	int64		nposretries;	/* ... thrown away because a writer got in */
 	int64		nposholds;		/* ... made with the entry's leaf held */
+	int64		nposuncompared; /* trees a standby kept without comparing */
 	int			nwaits;			/* WaitForLockers() calls */
+
+	/*
+	 * On a standby, the replay position a walk of a position tree began at,
+	 * and whether a page it read since carries a later LSN
+	 * (lion_verify_read_page(), lion_verify_postree_walks()).
+	 */
+	bool		lsntrack;
+	XLogRecPtr	lsnhorizon;
+	bool		lsnpast;
 } LionVerifyState;
 
 /*
@@ -262,9 +275,10 @@ typedef struct LionVerifyState
  * lion_verify_postree()).  It never walks either with the entry's leaf held
  * - replay takes the tree's pages before the leaf (DESIGN.md §25) - so after
  * LION_VERIFY_SET_ATTEMPTS walks of a set it keeps the next one that reaches
- * the end of the set, a position tree's first such walk, and only a root
- * pushed down or an upper level split under each walk keeps it from doing
- * that.
+ * the end of the set without comparing its totals, and after as many walks
+ * of a position tree that found a difference replay may have made it keeps
+ * the last one without comparing the tree with its set; only a root pushed
+ * down or an upper level split under each walk keeps it from doing that.
  */
 #define LION_VERIFY_STANDBY_WALKS	10
 
