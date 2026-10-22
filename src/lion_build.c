@@ -3209,7 +3209,13 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	SpinLockRelease(&shared->mutex);
 	ConditionVariableBroadcast(&shared->workersdonecv);
 
-	/* The leader takes part as a worker does, on the file after theirs. */
+	/*
+	 * The leader takes part as a worker does, on the file after theirs.  It
+	 * always does, as nbtree's and GIN's leaders do - only a build compiled
+	 * with DISABLE_LEADER_PARTICIPATION leaves theirs out - for
+	 * parallel_leader_participation is a setting of Gather and Gather
+	 * Merge, which no parallel index build of core's reads.
+	 */
 	lion_parallel_scan_and_spool(shared, tapes, columns, heap, index,
 								 shared->leaderfile,
 								 maintenance_work_mem / leader->nparticipants,

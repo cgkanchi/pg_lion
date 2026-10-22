@@ -1821,6 +1821,13 @@ extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
 									 double cand);
 
 /*
+ * The collation a multi-key key column takes its queries apart under in the
+ * executor, which the planner's extractions of a literal use too
+ * (lion_plan_match.c).
+ */
+extern Oid	lion_index_extract_collation(IndexOptInfo *idx, AttrNumber col);
+
+/*
  * `col IS NOT NULL` beside quals whose answer holds `rows` rows (DESIGN.md
  * §14, §29.2): its NULL entry taken away from that answer, or - canwalk, and
  * LION_NOTNULL_WALK_MARGIN times cheaper - the column's other entries walked
@@ -1923,6 +1930,14 @@ extern PGDLLIMPORT bool lion_enable_tree_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);
+
+/*
+ * The list a planner run keeps what lion_tsquery_pos_shape() found of each
+ * position filter's clause on (lion_plan_cost.c), and in *cxt the run's
+ * memory they are kept in: a path's price asks the same clause again at
+ * every path of it.
+ */
+extern List **lion_run_posshapes(PlannerInfo *root, MemoryContext *cxt);
 
 /*
  * One form for one filter (DESIGN.md §29.11, "An OR of equalities is its IN
