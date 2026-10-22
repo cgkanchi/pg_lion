@@ -10,10 +10,11 @@
  *
  * is the count of t's WHERE less the rows of it some row of s matches.  The
  * node runs s as its child, looks each distinct key of its rows up in a
- * B-tree on t.k under the query's snapshot, tests every row found on the join
- * clauses and on t's restrictions, and subtracts the ones that pass.  Which
- * B-tree, and what that costs, is decided here; lion_plan_count.c plans the
- * count and adds the two up, and lion_exec_anti.c runs it.
+ * B-tree on t.k under the query's snapshot, tests every row found on t's
+ * restrictions and then on the join clauses, and subtracts the ones that
+ * pass.  Which B-tree, and what that costs, is decided here;
+ * lion_plan_count.c plans the count and adds the two up, and
+ * lion_exec_anti.c runs it.
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -35,11 +36,14 @@
  * B-tree idx?  The table's column has to be the index's key column c, and the
  * operator - turned round when the column is its right operand - an equality
  * of the column's operator family whose left type is the column's opclass
- * type, under the index's collation (or an index without one).  Fills the
- * operator the scan key is made of.
+ * type, under the index's collation (or an index without one); and the
+ * family has to order two values of the key's type, which the node sorts the
+ * keys by (lion_anti_collect()).  Fills the operator the scan key is made of,
+ * and that order's `<`.
  */
 static bool
-lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop)
+lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop,
+				 Oid *keysort)
 {
 	Oid			op = key->clause->opno;
 	int			strategy;
@@ -61,6 +65,10 @@ lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop)
 		return false;
 	if (OidIsValid(idxcoll) && idxcoll != key->clause->inputcollid)
 		return false;
+	*keysort = get_opfamily_member(idx->opfamily[c], righttype, righttype,
+								   BTLessStrategyNumber);
+	if (!OidIsValid(*keysort))
+		return false;
 	*keyop = op;
 	return true;
 }
@@ -68,8 +76,12 @@ lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop)
 /*
  * The scan keys idx can be looked up by: for each key column from the first,
  * every key of the anti join that is one of that column's, as long as each
- * column has one - a B-tree is searched by a prefix of its columns.  Fills
- * *out's keys and returns how many columns they cover.
+ * column has one - a B-tree is searched by a prefix of its columns.  A key is
+ * the scan key of the first column it is one of, and of no other: of a B-tree
+ * that names t's column twice, the second's would be the same equality on
+ * the same value, and narrow nothing.  So each scan key is a join clause of
+ * its own (lion_anti_join_clauses()).  Fills *out's keys and returns how many
+ * columns they cover.
  */
 static int
 lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
@@ -88,15 +100,24 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 		{
 			LionAntiKey *key = (LionAntiKey *) lfirst(lc);
 			Oid			op;
+			Oid			sortop;
+			int			k;
 
-			if (out->nkey >= LION_MAX_ANTI_KEYS ||
-				!lion_anti_key_of(idx, c, key, &op))
+			for (k = 0; k < out->nkey; k++)
+			{
+				if (out->keyclause[k] == key->clause)
+					break;
+			}
+			if (k < out->nkey || out->nkey >= LION_MAX_ANTI_KEYS ||
+				!lion_anti_key_of(idx, c, key, &op, &sortop))
 				continue;
 			out->keycol[out->nkey] = (AttrNumber) (c + 1);
 			out->keyop[out->nkey] = op;
+			out->keysort[out->nkey] = sortop;
 			out->keycoll[out->nkey] = key->clause->inputcollid;
 			out->keyexpr[out->nkey] = key->innerexpr;
 			out->keyvar[out->nkey] = key->outervar;
+			out->keyclause[out->nkey] = key->clause;
 			out->nkey++;
 			found = true;
 		}
@@ -108,29 +129,111 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 }
 
 /*
- * May one row of the table be found by the lookups of two different keys?
- * Not when every scan key is of the column's own type, and the index's
- * equality on it is the type's own, under which equal values are the same
- * bytes (lion_index_can_emit_value()): keys the node keeps apart by their
- * bytes are then unequal, and so are the rows they find.  Otherwise - a
- * cross-type key, numeric's 1.0 and 1.00, a nondeterministic collation, an
- * opclass coarser than the type's equality - two keys may find one row, and
- * the node keeps the rows matched by TID, to subtract each once.
+ * `clauses` - RestrictInfos or bare expressions - in the order core tests a
+ * scan's or a join's quals in (order_qual_clauses(), which createplan.c keeps
+ * to itself): by security level, a leakproof clause of less than ten
+ * cpu_operator_costs taken as of level 0, then by the cost of one test, in
+ * their given order where those agree.  The bare expressions.
+ *
+ * The anti join tests the table's own restrictions on each row a key finds,
+ * and only on a row that passes them the join clauses, each list in this
+ * order: as core's scan of the table tests its WHERE, and its join the join
+ * clauses on the rows the scan gives it.  A clause core would test only after
+ * a cheaper one has rejected the row - `10 / y > 1` after `x = 3`, a join
+ * clause `s.b / t.y > 1` after the WHERE's `y <> 0` - is not run on it here
+ * either, and fails no query core's plan answers.
  */
-static bool
-lion_anti_needs_tids(const LionAntiPlan *plan)
+List *
+lion_anti_order_quals(PlannerInfo *root, List *clauses)
 {
+	typedef struct
+	{
+		Node	   *clause;
+		Cost		cost;
+		Index		security_level;
+	} LionQualItem;
+	int			n = list_length(clauses);
+	LionQualItem *items;
+	List	   *result = NIL;
+	ListCell   *lc;
+	int			i;
+
+	if (n == 0)
+		return NIL;
+	items = (LionQualItem *) palloc(sizeof(LionQualItem) * n);
+	i = 0;
+	foreach(lc, clauses)
+	{
+		Node	   *clause = (Node *) lfirst(lc);
+		QualCost	qcost;
+
+		cost_qual_eval_node(&qcost, clause, root);
+		items[i].clause = clause;
+		items[i].cost = qcost.per_tuple;
+		items[i].security_level = 0;
+		if (IsA(clause, RestrictInfo))
+		{
+			RestrictInfo *rinfo = (RestrictInfo *) clause;
+
+			items[i].clause = (Node *) rinfo->clause;
+			if (!rinfo->leakproof || items[i].cost >= 10 * cpu_operator_cost)
+				items[i].security_level = rinfo->security_level;
+		}
+		i++;
+	}
+
+	/* an insertion sort, which keeps clauses that compare equal in order */
+	for (i = 1; i < n; i++)
+	{
+		LionQualItem item = items[i];
+		int			j;
+
+		for (j = i; j > 0; j--)
+		{
+			LionQualItem *prev = &items[j - 1];
+
+			if (item.security_level > prev->security_level ||
+				(item.security_level == prev->security_level &&
+				 item.cost >= prev->cost))
+				break;
+			items[j] = *prev;
+		}
+		items[j] = item;
+	}
+	for (i = 0; i < n; i++)
+		result = lappend(result, items[i].clause);
+	pfree(items);
+	return result;
+}
+
+/*
+ * The join clauses the plan tests each row found on, with an inner row of its
+ * key, in the order it tests them: the scan keys' own first, in the keys'
+ * order - true of every row a key's lookup finds, as a hash join's hash
+ * clauses are of the rows it joins - and then the others as core orders a
+ * join filter (lion_anti_order_quals()).  Bare clauses.
+ */
+List *
+lion_anti_join_clauses(PlannerInfo *root, const LionSmallAnti *anti,
+					   const LionAntiPlan *plan)
+{
+	List	   *keys = NIL;
+	List	   *rest = NIL;
+	ListCell   *lc;
 	int			k;
 
 	for (k = 0; k < plan->nkey; k++)
+		keys = lappend(keys, plan->keyclause[k]);
+	foreach(lc, anti->clauses)
 	{
-		int			c = plan->keycol[k] - 1;
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
-		if (exprType(plan->keyexpr[k]) != plan->idx->opcintype[c] ||
-			!lion_index_can_emit_value(plan->idx, plan->keycol[k]))
-			return true;
+		if (!list_member_ptr(keys, rinfo->clause))
+			rest = lappend(rest, rinfo);
 	}
-	return false;
+	if (list_length(keys) + list_length(rest) != list_length(anti->clauses))
+		elog(ERROR, "LionCount: an anti join's scan key is no join clause of it");
+	return list_concat(keys, lion_anti_order_quals(root, rest));
 }
 
 /*
@@ -163,6 +266,37 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
 }
 
 /*
+ * The sort of the child's rows by key (lion_anti_collect()): what
+ * cost_sort() charges a sort of `rows` rows of `width` bytes within work_mem
+ * - a comparison of two keys for each that its quicksort, or its runs and
+ * their merge, make, and past work_mem the pages of the runs written and read
+ * back - as cost_tuplesort(), which costsize.c keeps to itself, has it.  Not
+ * enable_sort's, which is the Sort node's.
+ */
+static Cost
+lion_anti_sort_price(double rows, int width)
+{
+	double		tuples = Max(rows, 2.0);
+	double		bytes = tuples * (MAXALIGN(width) +
+								  MAXALIGN(SizeofHeapTupleHeader));
+	double		mem = (double) work_mem * 1024.0;
+	Cost		cost = 2.0 * cpu_operator_cost * tuples * log2(tuples);
+
+	if (bytes > mem)
+	{
+		double		npages = ceil(bytes / BLCKSZ);
+		double		nruns = bytes / mem;
+		double		mergeorder = tuplesort_merge_order((int64) mem);
+		double		logruns = (nruns > mergeorder) ?
+			ceil(log(nruns) / log(mergeorder)) : 1.0;
+
+		cost += 2.0 * npages * logruns *
+			(seq_page_cost * 0.75 + random_page_cost * 0.25);
+	}
+	return cost + cpu_operator_cost * tuples;
+}
+
+/*
  * The lookups' own price - every one a B-tree descent and the rows it finds,
  * each fetched from the heap and tested - priced as core prices an index scan
  * repeated once per outer row of a nested loop (cost_index() and
@@ -173,8 +307,8 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
  * for each row found, and the expressions it is evaluated on beside a count
  * by cells (`rowexprs`, the predicates) with a cpu_operator_cost each to find
  * its cell.  Beside them, what the node does with the child's rows: each
- * one's keys evaluated and hashed, each distinct one kept.  The child's own
- * price is the caller's.
+ * one's keys evaluated, and the rows sorted by them.  The child's own price
+ * is the caller's.
  *
  * `lookups` is the distinct keys of the child's rows, as estimate_num_groups()
  * makes them of the inner side's key expressions, and the rows of one lookup
@@ -216,6 +350,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	QualCost	qual;
 	QualCost	keyeval;
 	QualCost	roweval;
+	int			width;
 	ListCell   *lc;
 	int			k;
 
@@ -279,13 +414,9 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	cost += (maxpages + corr * corr * (minpages - maxpages)) * spc_random;
 
 	/* ... and each row found: its tuple, the clauses it is tested on */
-	cost_qual_eval(&qual, list_concat(list_copy(anti->clauses), restrictions),
+	cost_qual_eval(&qual, list_concat(list_copy(restrictions), anti->clauses),
 				   root);
 	cost += qual.startup + fetched * (cpu_tuple_cost + qual.per_tuple);
-
-	/* ... kept once by TID, where two keys may find it */
-	if (plan->tids)
-		cost += fetched * cpu_operator_cost;
 
 	/* ... and its group found, to subtract it from, or its cell */
 	cost += fetched * ngroup * cpu_operator_cost;
@@ -296,10 +427,19 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 			(roweval.per_tuple + list_length(rowexprs) * cpu_operator_cost);
 	}
 
-	/* the child's rows: their keys evaluated, hashed and kept once */
+	/*
+	 * the child's rows: their keys evaluated, and the rows sorted by them -
+	 * with the inner row where a join clause but the scan keys' reads it
+	 */
 	cost_qual_eval(&keyeval, innerkeys, root);
-	cost += keyeval.startup +
-		childrows * (keyeval.per_tuple + (plan->nkey + 1) * cpu_operator_cost);
+	width = 0;
+	for (k = 0; k < plan->nkey; k++)
+		width += get_typavgwidth(exprType(plan->keyexpr[k]),
+								 exprTypmod(plan->keyexpr[k]));
+	if (list_length(anti->clauses) > plan->nkey)
+		width += child->pathtarget->width;
+	cost += keyeval.startup + childrows * keyeval.per_tuple +
+		lion_anti_sort_price(childrows, width);
 
 	plan->lookups = lookups;
 	plan->fetched = fetched;
@@ -357,7 +497,6 @@ lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restriction
 	if (best.idx == NULL)
 		return false;
 
-	best.tids = lion_anti_needs_tids(&best);
 	lion_anti_price(root, anti, restrictions, ngroup, rowexprs, &best);
 	*out = best;
 	return true;

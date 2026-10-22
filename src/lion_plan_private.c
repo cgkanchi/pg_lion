@@ -721,9 +721,12 @@ lion_priv_decode_cells(List *priv, LionPrivStage stage, LionCountPriv *out)
 
 /*
  * The anti join over a small inner side (DESIGN.md §27, "The anti join over a
- * small inner side"): its flags and counts, each scan key's column, operator
- * and collation, the GROUP BY's equalities, and at the PATH stage its
- * expressions, as many as the counts say.
+ * small inner side"): its counts, each scan key's column, operator, collation
+ * and order, the GROUP BY's equalities and their orders - one where there is
+ * the other - and at the PATH stage its expressions, as many as the counts
+ * say.  Each count is bounded, and so is
+ * their sum, by what a List holds (LION_MAX_ANTI_EXPRS): the executor takes
+ * that many expressions off the end of custom_exprs.
  */
 static void
 lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
@@ -740,35 +743,41 @@ lion_priv_decode_anti(List *priv, LionPrivStage stage, LionCountPriv *out)
 							(stage == LION_PRIV_STAGE_PLAN) ? 2 : 3);
 	ints = (List *) linitial(m);
 	oids = (List *) lsecond(m);
-	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) < 4 ||
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) < 3 ||
 		oids == NIL || !IsA(oids, OidList))
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
-	a->flags = linitial_int(ints);
-	a->nkey = lsecond_int(ints);
-	a->njoin = lthird_int(ints);
-	a->nrestrict = lfourth_int(ints);
-	if ((a->flags & ~LION_ANTIFLAG_TIDS) != 0 ||
-		a->nkey < 1 || a->nkey > LION_MAX_ANTI_KEYS ||
-		a->njoin < 1 || a->nrestrict < 0 ||
-		list_length(ints) != 4 + a->nkey ||
-		list_length(oids) != 1 + 2 * a->nkey + 4)
+	a->nkey = linitial_int(ints);
+	a->njoin = lsecond_int(ints);
+	a->nrestrict = lthird_int(ints);
+	if (a->nkey < 1 || a->nkey > LION_MAX_ANTI_KEYS ||
+		a->njoin < a->nkey || a->njoin > LION_MAX_ANTI_EXPRS ||
+		a->nrestrict < 0 || a->nrestrict > LION_MAX_ANTI_EXPRS ||
+		a->nkey + a->njoin + a->nrestrict > LION_MAX_ANTI_EXPRS ||
+		list_length(ints) != 3 + a->nkey ||
+		list_length(oids) != 1 + 3 * a->nkey + 6)
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	a->idxoid = linitial_oid(oids);
 	if (!OidIsValid(a->idxoid))
 		elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	for (i = 0; i < a->nkey; i++)
 	{
-		a->keycol[i] = (AttrNumber) list_nth_int(ints, 4 + i);
+		a->keycol[i] = (AttrNumber) list_nth_int(ints, 3 + i);
 		a->keyop[i] = list_nth_oid(oids, 1 + i);
 		a->keycoll[i] = list_nth_oid(oids, 1 + a->nkey + i);
+		a->keysort[i] = list_nth_oid(oids, 1 + 2 * a->nkey + i);
 		if (a->keycol[i] < 1 || a->keycol[i] > INDEX_MAX_KEYS ||
-			!OidIsValid(a->keyop[i]))
+			!OidIsValid(a->keyop[i]) || !OidIsValid(a->keysort[i]))
 			elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	}
 	for (i = 0; i < 2; i++)
 	{
-		a->groupeq[i] = list_nth_oid(oids, 1 + 2 * a->nkey + 2 * i);
-		a->groupcoll[i] = list_nth_oid(oids, 1 + 2 * a->nkey + 2 * i + 1);
+		int			at = 1 + 3 * a->nkey + 3 * i;
+
+		a->groupeq[i] = list_nth_oid(oids, at);
+		a->groupcoll[i] = list_nth_oid(oids, at + 1);
+		a->groupsort[i] = list_nth_oid(oids, at + 2);
+		if (OidIsValid(a->groupeq[i]) != OidIsValid(a->groupsort[i]))
+			elog(ERROR, "LionCount: malformed ANTI member of custom_private");
 	}
 	out->hasanti = true;
 	if (stage == LION_PRIV_STAGE_PLAN)
@@ -1200,8 +1209,7 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 	if (p->hasanti)
 	{
 		const LionCountPrivAnti *a = &p->anti;
-		List	   *aints = list_make4_int(a->flags, a->nkey, a->njoin,
-										   a->nrestrict);
+		List	   *aints = list_make3_int(a->nkey, a->njoin, a->nrestrict);
 		List	   *aoids = list_make1_oid(a->idxoid);
 
 		for (i = 0; i < a->nkey; i++)
@@ -1211,9 +1219,12 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		}
 		for (i = 0; i < a->nkey; i++)
 			aoids = lappend_oid(aoids, a->keycoll[i]);
+		for (i = 0; i < a->nkey; i++)
+			aoids = lappend_oid(aoids, a->keysort[i]);
 		for (i = 0; i < 2; i++)
-			aoids = lappend_oid(lappend_oid(aoids, a->groupeq[i]),
-								a->groupcoll[i]);
+			aoids = lappend_oid(lappend_oid(lappend_oid(aoids, a->groupeq[i]),
+											a->groupcoll[i]),
+								a->groupsort[i]);
 		m = list_make2(aints, aoids);
 		if (stage == LION_PRIV_STAGE_PATH)
 			m = lappend(m, a->exprs);

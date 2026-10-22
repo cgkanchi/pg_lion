@@ -2328,8 +2328,11 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 	 */
 	ResetExprContext(econtext);
 
-	/* rows counted from the relation's indexes (lion_count_report_reads()) */
-	if (st->heap != NULL)
+	/*
+	 * rows counted from the relation's indexes (lion_count_report_reads()),
+	 * once: not again as a group the anti join held back goes up
+	 */
+	if (st->heap != NULL && !lion_anti_draining(st))
 		st->statrows += count;
 
 	/*
