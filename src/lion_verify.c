@@ -11,6 +11,8 @@
  */
 #include "postgres.h"
 
+#include "commands/tablespace.h"
+
 #include "lion_funcs.h"
 
 PG_FUNCTION_INFO_V1(lion_index_verify);
@@ -34,6 +36,161 @@ lion_reserved_name(int kind)
 	}
 	elog(ERROR, "lion index: %d is not the kind of a reserved entry", kind);
 	return NULL;				/* keep the compiler quiet */
+}
+
+/* ---------------------------------------------------------------------
+ * Sequences of records (lion_funcs.h, LionVerifySeq)
+ * --------------------------------------------------------------------- */
+
+/*
+ * An empty sequence of records of recsize bytes, which keeps its memory and
+ * its file in the current memory context and counts them in acct.  Nothing
+ * is allocated until the first record comes.
+ */
+void
+lion_verify_seq_init(LionVerifySeq *s, LionVerifySeqAcct *acct, Size recsize)
+{
+	Assert(recsize > 0 && recsize <= acct->cap);
+	memset(s, 0, sizeof(*s));
+	s->acct = acct;
+	s->cxt = CurrentMemoryContext;
+	s->recsize = recsize;
+	s->fileat = -1;
+}
+
+/*
+ * Append a record.  The records stay in memory while they are a prefix of
+ * the sequence and their share of work_mem allows (the buffer doubles up to
+ * it), and every record after the first that does not goes to the file -
+ * made the first time, in temp_tablespaces, which lion_index_verify() had
+ * PrepareTempTablespaces() look up before the walk began: the lookup reads
+ * catalogs, and that must not happen in the middle of a walk.  The caller
+ * holds no buffer lock: a write to the file is I/O.
+ */
+void
+lion_verify_seq_put(LionVerifySeq *s, const void *rec)
+{
+	LionVerifySeqAcct *acct = s->acct;
+
+	if (s->nmem == s->n && s->nmem == s->memalloc)
+	{
+		int64		capn = (int64) (acct->cap / s->recsize);
+
+		if (s->memalloc < capn)
+		{
+			int64		grow = Min(Max(s->memalloc * 2, 64), capn);
+			MemoryContext oldcxt = MemoryContextSwitchTo(s->cxt);
+
+			s->mem = (s->mem == NULL) ?
+				(char *) palloc(s->recsize * grow) :
+				(char *) repalloc(s->mem, s->recsize * grow);
+			MemoryContextSwitchTo(oldcxt);
+			acct->mem += s->recsize * (grow - s->memalloc);
+			acct->peak = Max(acct->peak, acct->mem);
+			s->memalloc = grow;
+		}
+	}
+
+	if (s->nmem == s->n && s->nmem < s->memalloc)
+	{
+		memcpy(s->mem + s->recsize * s->nmem, rec, s->recsize);
+		s->nmem++;
+		s->n++;
+		return;
+	}
+
+	/* past what memory may keep: onto the end of the file */
+	if (s->file == NULL)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(s->cxt);
+
+		s->file = BufFileCreateTemp(false);
+		s->fileat = 0;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	if (s->fileat != s->n - s->nmem)
+	{
+		if (BufFileSeek(s->file, 0, (off_t) (s->n - s->nmem) * s->recsize,
+						SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the temporary file of a lion index check")));
+		s->fileat = s->n - s->nmem;
+	}
+	BufFileWrite(s->file, rec, s->recsize);
+	s->fileat++;
+	s->n++;
+	acct->spilled++;
+}
+
+/* Read the sequence again from its first record. */
+void
+lion_verify_seq_rewind(LionVerifySeq *s)
+{
+	s->next = 0;
+}
+
+/* The next record into rec, or false when there is none left. */
+bool
+lion_verify_seq_get(LionVerifySeq *s, void *rec)
+{
+	int64		k;
+
+	if (s->next >= s->n)
+		return false;
+	if (s->next < s->nmem)
+	{
+		memcpy(rec, s->mem + s->recsize * s->next, s->recsize);
+		s->next++;
+		return true;
+	}
+
+	Assert(s->file != NULL);
+	k = s->next - s->nmem;
+	if (s->fileat != k)
+	{
+		if (BufFileSeek(s->file, 0, (off_t) k * s->recsize, SEEK_SET) != 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not seek in the temporary file of a lion index check")));
+		s->fileat = k;
+	}
+	BufFileReadExact(s->file, rec, s->recsize);
+	s->fileat++;
+	s->next++;
+	return true;
+}
+
+/*
+ * Empty the sequence for another walk, keeping its buffer and its file:
+ * the records written next overwrite the old ones, and nothing reads past
+ * the count.
+ */
+void
+lion_verify_seq_reset(LionVerifySeq *s)
+{
+	s->n = 0;
+	s->nmem = 0;
+	s->next = 0;
+}
+
+/* Give back the sequence's memory and close its file. */
+void
+lion_verify_seq_free(LionVerifySeq *s)
+{
+	if (s->mem != NULL)
+	{
+		Assert(s->acct->mem >= s->recsize * s->memalloc);
+		s->acct->mem -= s->recsize * s->memalloc;
+		pfree(s->mem);
+	}
+	if (s->file != NULL)
+		BufFileClose(s->file);
+	s->mem = NULL;
+	s->memalloc = 0;
+	s->file = NULL;
+	s->fileat = -1;
+	lion_verify_seq_reset(s);
 }
 
 /* ---------------------------------------------------------------------
@@ -97,17 +254,9 @@ lion_verify_visit(LionVerifyState *vs, BlockNumber blk, const char *what)
 
 	vs->refs[blk]++;
 
+	/* (the setvisits sequence keeps its memory and file outside setcxt) */
 	if (vs->settrack)
-	{
-		if (vs->nsetvisits >= vs->maxsetvisits)
-		{
-			/* repalloc() keeps the array in the context it was made in */
-			vs->maxsetvisits *= 2;
-			vs->setvisits = (BlockNumber *) repalloc(vs->setvisits,
-													 sizeof(BlockNumber) * vs->maxsetvisits);
-		}
-		vs->setvisits[vs->nsetvisits++] = blk;
-	}
+		lion_verify_seq_put(&vs->setvisits, &blk);
 }
 
 /*
@@ -119,24 +268,27 @@ static void
 lion_verify_track_begin(LionVerifyState *vs)
 {
 	vs->settrack = true;
-	vs->nsetvisits = 0;
+	lion_verify_seq_reset(&vs->setvisits);
 }
 
 static void
 lion_verify_track_end(LionVerifyState *vs, bool keep)
 {
-	int			i;
+	BlockNumber blk;
 
 	if (!keep)
 	{
-		for (i = 0; i < vs->nsetvisits; i++)
+		lion_verify_seq_rewind(&vs->setvisits);
+		while (lion_verify_seq_get(&vs->setvisits, &blk))
 		{
-			Assert(vs->refs[vs->setvisits[i]] > 0);
-			vs->refs[vs->setvisits[i]]--;
+			if (blk >= vs->nblocks || vs->refs[blk] == 0)
+				elog(ERROR, "lion index \"%s\": block %u was unmarked twice",
+					 RelationGetRelationName(vs->index), blk);
+			vs->refs[blk]--;
 		}
 	}
 	vs->settrack = false;
-	vs->nsetvisits = 0;
+	lion_verify_seq_reset(&vs->setvisits);
 }
 
 /* Record a candidate for lion_verify_recheck(); only on a primary. */
@@ -674,62 +826,35 @@ lion_verify_container(LionVerifyState *vs, BlockNumber blk, OffsetNumber off,
 }
 
 /*
- * One level of a posting tree, as the walk of that level found it
- * (DESIGN.md §22).
+ * One page of a level of a posting set or a position tree, as the walk of
+ * that level found it (DESIGN.md §22): what the comparison with the level
+ * above needs of it (lion_verify_match_downlink()).  A walk writes its
+ * level's pages into a sequence (LionVerifySeq) and the walk of the level
+ * above reads them back in order, so that it keeps neither level in memory.
  */
-typedef struct LionVerifyPLevel
+typedef struct LionVerifyPage
 {
-	int			npages;
-	int			maxpages;
-	BlockNumber *blocks;
-	uint32	   *firstkey;		/* first separator, or first container key */
-	bool	   *hasfirst;		/* false for an empty leaf */
-	uint32	   *lastkey;		/* last container key of a leaf */
-	uint32	   *highkey;		/* internal pages only */
-	bool	   *hashigh;
-	bool	   *incomplete;	/* flagged LION_PAGE_INCOMPLETE_SPLIT */
-} LionVerifyPLevel;
+	BlockNumber blk;
+	uint32		firstkey;		/* a leaf's first key, or the first separator */
+	uint32		upper;			/* a leaf's last key, or the high key */
+	uint16		flags;			/* LION_VPAGE_* */
+} LionVerifyPage;
 
-static void
-lion_verify_plevel_add(LionVerifyPLevel *lvl, BlockNumber blk, uint32 firstkey,
-					   bool hasfirst, uint32 lastkey, uint32 highkey,
-					   bool hashigh, bool incomplete)
+#define LION_VPAGE_FIRST		0x01	/* firstkey is there: not an empty leaf */
+#define LION_VPAGE_UPPER		0x02	/* upper is there: a leaf with keys, or
+										 * an internal page with a high key */
+#define LION_VPAGE_INCOMPLETE	0x04	/* flagged LION_PAGE_INCOMPLETE_SPLIT */
+
+/*
+ * What the walk of a tree's leaves counts for the checks of a tree without
+ * an internal level (lion_verify_flat()).
+ */
+typedef struct LionVerifyLeafSum
 {
-	if (lvl->npages >= lvl->maxpages)
-	{
-		bool		first = (lvl->maxpages == 0);
-
-		lvl->maxpages = first ? 64 : lvl->maxpages * 2;
-		if (first)
-		{
-			lvl->blocks = (BlockNumber *) palloc(sizeof(BlockNumber) * lvl->maxpages);
-			lvl->firstkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
-			lvl->hasfirst = (bool *) palloc(sizeof(bool) * lvl->maxpages);
-			lvl->lastkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
-			lvl->highkey = (uint32 *) palloc(sizeof(uint32) * lvl->maxpages);
-			lvl->hashigh = (bool *) palloc(sizeof(bool) * lvl->maxpages);
-			lvl->incomplete = (bool *) palloc(sizeof(bool) * lvl->maxpages);
-		}
-		else
-		{
-			lvl->blocks = (BlockNumber *) repalloc(lvl->blocks, sizeof(BlockNumber) * lvl->maxpages);
-			lvl->firstkey = (uint32 *) repalloc(lvl->firstkey, sizeof(uint32) * lvl->maxpages);
-			lvl->hasfirst = (bool *) repalloc(lvl->hasfirst, sizeof(bool) * lvl->maxpages);
-			lvl->lastkey = (uint32 *) repalloc(lvl->lastkey, sizeof(uint32) * lvl->maxpages);
-			lvl->highkey = (uint32 *) repalloc(lvl->highkey, sizeof(uint32) * lvl->maxpages);
-			lvl->hashigh = (bool *) repalloc(lvl->hashigh, sizeof(bool) * lvl->maxpages);
-			lvl->incomplete = (bool *) repalloc(lvl->incomplete, sizeof(bool) * lvl->maxpages);
-		}
-	}
-	lvl->blocks[lvl->npages] = blk;
-	lvl->firstkey[lvl->npages] = firstkey;
-	lvl->hasfirst[lvl->npages] = hasfirst;
-	lvl->lastkey[lvl->npages] = lastkey;
-	lvl->highkey[lvl->npages] = highkey;
-	lvl->hashigh[lvl->npages] = hashigh;
-	lvl->incomplete[lvl->npages] = incomplete;
-	lvl->npages++;
-}
+	int64		npages;
+	BlockNumber flagged;		/* the first leaf flagged as an unfinished
+								 * split, or InvalidBlockNumber */
+} LionVerifyLeafSum;
 
 /*
  * The tree a walk is of: the posting set of a chain entry, or the entry's
@@ -775,6 +900,46 @@ lion_verify_warn_incomplete(LionVerifyState *vs, const char *what,
 			 errhint("The next INSERT into that key repairs it.")));
 }
 
+/* A walk's result, empty, and what it keeps given back. */
+static void
+lion_verify_result_init(LionVerifyState *vs, LionVerifySetResult *res)
+{
+	memset(res, 0, sizeof(*res));
+	lion_verify_seq_init(&res->incomplete, &vs->seqacct, sizeof(BlockNumber));
+}
+
+static void
+lion_verify_result_free(LionVerifySetResult *res)
+{
+	lion_verify_seq_free(&res->incomplete);
+}
+
+/*
+ * A page a walk that may be thrown away found flagged, for the WARNING it
+ * gives once it is kept (lion_verify_warn_flagged()); an exact walk has
+ * given it already (lion_verify_tree_page()).  Called with the page let go:
+ * the list may be in a file.
+ */
+static void
+lion_verify_note_flagged(LionVerifySetResult *res, BlockNumber blk,
+						 bool exact)
+{
+	if (!exact)
+		lion_verify_seq_put(&res->incomplete, &blk);
+}
+
+/* The WARNINGs of the flagged pages of a walk that is kept. */
+static void
+lion_verify_warn_flagged(LionVerifyState *vs, const char *what,
+						 LionVerifySetResult *res)
+{
+	BlockNumber blk;
+
+	lion_verify_seq_rewind(&res->incomplete);
+	while (lion_verify_seq_get(&res->incomplete, &blk))
+		lion_verify_warn_incomplete(vs, what, blk);
+}
+
 /*
  * The page kind and owner checks every page of a posting set or a position
  * tree goes through.
@@ -793,7 +958,7 @@ lion_verify_warn_incomplete(LionVerifyState *vs, const char *what,
 static Page
 lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 					  const LionVerifyTree *tree, uint16 level, bool exact,
-					  LionVerifySetResult *res, Buffer *bufp)
+					  Buffer *bufp)
 {
 	Page		page;
 	LionPageOpaque opaque;
@@ -870,7 +1035,8 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 	 * that sets the flag to the one that clears it (DESIGN.md §22), so this
 	 * is exact on a primary.  A walk that may be repeated warns only once it
 	 * is kept, which lion_verify_chain_totals() does (lion_verify_postree(),
-	 * for a position tree).
+	 * for a position tree); its caller notes the page for that once it has
+	 * let it go (lion_verify_note_flagged()).
 	 *
 	 * The flag is only ever on the LEFT half of a split, which the record
 	 * that sets it links to the split's new page, and which keeps that right
@@ -884,23 +1050,8 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 		lion_corrupt("lion index \"%s\": %s page %u of chain entry %u on block %u is flagged as an unfinished split, but it is the rightmost page of its level, which no split leaves flagged",
 					RelationGetRelationName(vs->index), tree->what, blk,
 					tree->eoff, tree->eblk);
-	if (LionPageIncompleteSplit(page))
-	{
-		if (exact)
-			lion_verify_warn_incomplete(vs, tree->what, blk);
-		else
-		{
-			if (res->nincomplete >= res->maxincomplete)
-			{
-				res->maxincomplete = Max(res->maxincomplete * 2, 4);
-				res->incomplete = (res->incomplete == NULL) ?
-					(BlockNumber *) palloc(sizeof(BlockNumber) * res->maxincomplete) :
-					(BlockNumber *) repalloc(res->incomplete,
-											 sizeof(BlockNumber) * res->maxincomplete);
-			}
-			res->incomplete[res->nincomplete++] = blk;
-		}
-	}
+	if (LionPageIncompleteSplit(page) && exact)
+		lion_verify_warn_incomplete(vs, tree->what, blk);
 
 	return page;
 }
@@ -924,14 +1075,16 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 static bool
 lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 						   const LionEntryTuple *entry, BlockNumber first,
-						   LionVerifyPLevel *out, bool exact,
-						   LionVerifySetResult *res)
+						   LionVerifySeq *out, LionVerifyLeafSum *sum,
+						   bool exact, LionVerifySetResult *res)
 {
 	BlockNumber blk = first;
 	BlockNumber last = InvalidBlockNumber;
 	bool		haveprev = false;
 	uint32		prevckey = 0;
 
+	sum->npages = 0;
+	sum->flagged = InvalidBlockNumber;
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf;
@@ -943,8 +1096,9 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 		OffsetNumber lastused = InvalidOffsetNumber;
 		uint32		minckey = 0;
 		uint32		maxckey = 0;
+		LionVerifyPage pg;
 
-		page = lion_verify_tree_page(vs, blk, tree, 0, exact, res, &buf);
+		page = lion_verify_tree_page(vs, blk, tree, 0, exact, &buf);
 		if (page == NULL)
 			return false;
 		opaque = LionPageGetOpaque(page);
@@ -1001,13 +1155,27 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 							opaque->minckey, opaque->maxckey, minckey, maxckey);
 		}
 
-		lion_verify_plevel_add(out, blk, minckey,
-							   firstused != InvalidOffsetNumber, maxckey, 0,
-							   false, LionPageIncompleteSplit(page));
+		pg.blk = blk;
+		pg.firstkey = minckey;
+		pg.upper = maxckey;
+		pg.flags = (firstused != InvalidOffsetNumber) ?
+			(LION_VPAGE_FIRST | LION_VPAGE_UPPER) : 0;
+		if (LionPageIncompleteSplit(page))
+			pg.flags |= LION_VPAGE_INCOMPLETE;
 
 		last = blk;
 		blk = opaque->rightlink;
 		UnlockReleaseBuffer(buf);
+
+		/* written with the page let go: the sequence may be in a file */
+		lion_verify_seq_put(out, &pg);
+		sum->npages++;
+		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
+		{
+			if (!BlockNumberIsValid(sum->flagged))
+				sum->flagged = pg.blk;
+			lion_verify_note_flagged(res, pg.blk, exact);
+		}
 
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1033,7 +1201,8 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
  */
 static bool
 lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
-					   BlockNumber first, LionVerifyPLevel *out, bool exact,
+					   BlockNumber first, LionVerifySeq *out,
+					   LionVerifyLeafSum *sum, bool exact,
 					   LionVerifySetResult *res)
 {
 	BlockNumber blk = first;
@@ -1045,6 +1214,8 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 	bool		havechunk = false;
 	uint32		lastheader = 0;
 
+	sum->npages = 0;
+	sum->flagged = InvalidBlockNumber;
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf;
@@ -1055,8 +1226,9 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 		LionContainer *c = NULL;
 		uint32		minckey = 0;
 		uint32		maxckey = 0;
+		LionVerifyPage pg;
 
-		page = lion_verify_tree_page(vs, blk, tree, 0, exact, res, &buf);
+		page = lion_verify_tree_page(vs, blk, tree, 0, exact, &buf);
 		if (page == NULL)
 		{
 			pfree(m);
@@ -1114,11 +1286,25 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 						RelationGetRelationName(vs->index), blk,
 						opaque->minckey, opaque->maxckey, minckey, maxckey);
 
-		lion_verify_plevel_add(out, blk, minckey, c != NULL, maxckey, 0,
-							   false, LionPageIncompleteSplit(page));
+		pg.blk = blk;
+		pg.firstkey = minckey;
+		pg.upper = maxckey;
+		pg.flags = (c != NULL) ? (LION_VPAGE_FIRST | LION_VPAGE_UPPER) : 0;
+		if (LionPageIncompleteSplit(page))
+			pg.flags |= LION_VPAGE_INCOMPLETE;
 
 		blk = opaque->rightlink;
 		UnlockReleaseBuffer(buf);
+
+		/* written with the page let go: the sequence may be in a file */
+		lion_verify_seq_put(out, &pg);
+		sum->npages++;
+		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
+		{
+			if (!BlockNumberIsValid(sum->flagged))
+				sum->flagged = pg.blk;
+			lion_verify_note_flagged(res, pg.blk, exact);
+		}
 
 		CHECK_FOR_INTERRUPTS();
 	}
@@ -1128,17 +1314,265 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 }
 
 /*
- * Walk one INTERNAL level of a posting set or a position tree, collecting
- * its downlinks.  Returns false when the walk has to be repeated
- * (lion_verify_tree_page()).
+ * The comparison of level i of a tree with the level below it, made as the
+ * walk of level i meets its downlinks (lion_verify_tree_level()), against
+ * the pages of level i - 1 in the order ITS walk found them, read back from
+ * their sequence: neither level is kept in memory.
+ *
+ * Every downlink but the first carries the separator of its child: at or
+ * below the child's first key, and above everything the page to its left
+ * holds.  A position tree's keys are heap blocks, and its separators repeat
+ * (lion_postree.c): there a leaf's separator IS the header of its first
+ * chunk - (P3), which a split keeps by posting that header and VACUUM by
+ * never deleting a leaf's first chunk - and the leaf to its left may hold
+ * members of that very block, but none above it, since a reader of block X
+ * lands on the leaf of the last separator below X and looks for X's members
+ * from there on, never to its left.
+ *
+ * One page may lack a downlink without being damage: the right sibling a
+ * split made, while the split is unfinished.  The split writes the sibling
+ * in one record and its downlink in the next, and leaves the LEFT page
+ * flagged LION_PAGE_INCOMPLETE_SPLIT in between; a crash - or an error -
+ * there leaves it so until the next writer that descends to the left page
+ * finishes it (DESIGN.md §22).  The sibling is then reachable through its
+ * left neighbour's right link and from nothing above, and the walk has
+ * already warned about the flag.  A three-way split flags both of its first
+ * two pages, so each missing downlink is covered by the page to its own
+ * left.  Such a page lies in its left neighbour's key range until the split
+ * finishes, and is bounded above by the next downlink's separator like any
+ * other.
+ *
+ * In a walk that may be repeated, a downlink to a page the walk of the
+ * level below did not see is a split made after that walk passed: the set
+ * is walked again (see the header of lion_verify_chain()), and nothing else
+ * the comparison found stands, so the first mismatch is only reported once
+ * the walk of level i has met every downlink and none of them was such a
+ * page - which is also why a mismatch waits until the walk of the level is
+ * done, as the damage that walk finds on a page of its own is reported
+ * first.  Every page the walk of the level below saw is marked in refs, and
+ * so is every page any walk saw (lion_verify_visit()), which no downlink of
+ * the tree may name either: a downlink to an unmarked page is the one thing
+ * a split behind the walk shows.  In an exact walk nothing can have split,
+ * and the comparison reports such a downlink as the mismatch it is.
+ */
+typedef struct LionVerifyMatch
+{
+	LionVerifyState *vs;
+	const LionVerifyTree *tree;
+	uint32		level;			/* i, the level whose downlinks are matched */
+	bool		exact;
+	LionVerifySeq *below;		/* the pages of level i - 1, in order */
+	int64		ndownlinks;		/* downlinks met so far */
+	LionVerifyPage open;		/* the page the last downlink named, whose */
+	bool		haveopen;		/* ... upper bound the next one gives */
+	LionVerifyPage prev;		/* the page of level i - 1 read last */
+	bool		haveprev;
+	bool		unseen;			/* a downlink named a page no walk reached */
+	bool		countoff;		/* the downlinks and the pages do not pair */
+	char	   *failure;		/* the first mismatch, reported at the end */
+} LionVerifyMatch;
+
+static void
+lion_verify_match_init(LionVerifyMatch *m, LionVerifyState *vs,
+					   const LionVerifyTree *tree, uint32 level,
+					   LionVerifySeq *below, bool exact)
+{
+	memset(m, 0, sizeof(*m));
+	m->vs = vs;
+	m->tree = tree;
+	m->level = level;
+	m->exact = exact;
+	m->below = below;
+	lion_verify_seq_rewind(below);
+}
+
+/* Keep the first mismatch's message, for lion_verify_match_end(). */
+static void lion_verify_match_fail(LionVerifyMatch *m, const char *fmt,...) pg_attribute_printf(2, 3);
+
+static void
+lion_verify_match_fail(LionVerifyMatch *m, const char *fmt,...)
+{
+	StringInfoData buf;
+
+	if (m->failure != NULL)
+		return;
+	initStringInfo(&buf);
+	for (;;)
+	{
+		va_list		args;
+		int			needed;
+
+		va_start(args, fmt);
+		needed = appendStringInfoVA(&buf, fmt, args);
+		va_end(args);
+		if (needed == 0)
+			break;
+		enlargeStringInfo(&buf, needed);
+	}
+	m->failure = buf.data;
+}
+
+/*
+ * The page's own upper bound - a leaf's last key, an internal page's high
+ * key - against `next`, the separator of the downlink after the one that
+ * names it.  False once there is a mismatch.
+ */
+static bool
+lion_verify_match_upper(LionVerifyMatch *m, const LionVerifyPage *pg,
+						uint32 next)
+{
+	const LionVerifyTree *tree = m->tree;
+	const char *rel = RelationGetRelationName(m->vs->index);
+
+	if ((pg->flags & LION_VPAGE_UPPER) == 0)
+		return true;
+	if (m->level == 1 && tree->positions)
+	{
+		if (pg->upper > next)
+			lion_verify_match_fail(m, "lion index \"%s\": position leaf %u reaches block %u, above the separator %u of its right sibling",
+								   rel, pg->blk, pg->upper, next);
+	}
+	else if (m->level == 1)
+	{
+		if (pg->upper >= next)
+			lion_verify_match_fail(m, "lion index \"%s\": leaf %u holds container key %u, at or above the separator %u of its right sibling",
+								   rel, pg->blk, pg->upper, next);
+	}
+	else if (pg->upper > next)
+		lion_verify_match_fail(m, "lion index \"%s\": the high key %u of %s block %u sorts after the separator %u of its right sibling",
+							   rel, pg->upper, tree->what, pg->blk, next);
+	return m->failure == NULL;
+}
+
+/*
+ * The walk of level i met a downlink to child with separator sep: match it
+ * with the next page of level i - 1 that has one.
+ */
+static void
+lion_verify_match_downlink(LionVerifyMatch *m, BlockNumber child, uint32 sep)
+{
+	LionVerifyState *vs = m->vs;
+	const LionVerifyTree *tree = m->tree;
+	const char *rel = RelationGetRelationName(vs->index);
+	int64		j = m->ndownlinks++;
+	LionVerifyPage pg;
+
+	if (!m->exact && !m->unseen &&
+		(!lion_verify_block_exists(vs, child) || vs->refs[child] == 0))
+		m->unseen = true;
+	if (m->unseen || m->failure != NULL || m->countoff)
+		return;
+
+	/* the page the last downlink named is bounded above by this one */
+	if (m->haveopen)
+	{
+		m->haveopen = false;
+		if (!lion_verify_match_upper(m, &m->open, sep))
+			return;
+	}
+
+	while (lion_verify_seq_get(m->below, &pg))
+	{
+		bool		previncomplete = m->haveprev &&
+			(m->prev.flags & LION_VPAGE_INCOMPLETE) != 0;
+
+		m->prev = pg;
+		m->haveprev = true;
+
+		if (pg.blk == child)
+		{
+			if (j == 0 && sep != 0)
+				lion_verify_match_fail(m, "lion index \"%s\": the first downlink of %s level %u has separator %u, expected minus infinity",
+									   rel, tree->what, m->level, sep);
+
+			/* the separator is at or below its child's own first key */
+			else if (tree->positions && m->level == 1)
+			{
+				if (j > 0 && (pg.flags & LION_VPAGE_FIRST) != 0 &&
+					sep != pg.firstkey)
+					lion_verify_match_fail(m, "lion index \"%s\": the separator %u of position leaf %u is not the header %u of its first chunk",
+										   rel, sep, pg.blk, pg.firstkey);
+			}
+			else if ((pg.flags & LION_VPAGE_FIRST) != 0 && sep > pg.firstkey)
+				lion_verify_match_fail(m, "lion index \"%s\": the separator %u of %s block %u sorts after its own first %s %u",
+									   rel, sep, tree->what, pg.blk,
+									   tree->positions ? "separator" : "container key",
+									   pg.firstkey);
+			m->open = pg;
+			m->haveopen = true;
+			return;
+		}
+
+		if (!previncomplete)
+		{
+			lion_verify_match_fail(m, "lion index \"%s\": downlink %lld of %s level %u points at block %u, but the next page of level %u is block %u",
+								   rel, (long long) j, tree->what, m->level,
+								   child, m->level - 1, pg.blk);
+			return;
+		}
+
+		/* the right half of an unfinished split: no downlink yet */
+		if (!lion_verify_match_upper(m, &pg, sep))
+			return;
+	}
+
+	/* a downlink more than level i - 1 has pages */
+	m->countoff = true;
+}
+
+/*
+ * The walk of level i is over: what is left of level i - 1 can only be the
+ * right halves of unfinished splits.  False when the walk has to be
+ * repeated (a downlink named a page no walk reached), else the first
+ * mismatch is reported, if there is one.
+ */
+static bool
+lion_verify_match_end(LionVerifyMatch *m)
+{
+	const LionVerifyTree *tree = m->tree;
+	LionVerifyPage pg;
+
+	if (m->unseen)
+		return false;
+
+	/* the page the last downlink named has no next one to be bounded by */
+	while (m->failure == NULL && !m->countoff &&
+		   lion_verify_seq_get(m->below, &pg))
+	{
+		bool		previncomplete = m->haveprev &&
+			(m->prev.flags & LION_VPAGE_INCOMPLETE) != 0;
+
+		m->prev = pg;
+		m->haveprev = true;
+		if (!previncomplete)
+			m->countoff = true;
+	}
+
+	if (m->failure != NULL)
+		lion_corrupt("%s", m->failure);
+	if (m->countoff)
+		lion_corrupt("lion index \"%s\": %s level %u of chain entry %u on block %u has %lld downlinks but level %u has %lld pages",
+					RelationGetRelationName(m->vs->index), tree->what,
+					m->level, tree->eoff, tree->eblk,
+					(long long) m->ndownlinks, m->level - 1,
+					(long long) m->below->n);
+	return true;
+}
+
+/*
+ * Walk one INTERNAL level of a posting set or a position tree, matching its
+ * downlinks with the level below as it meets them (match), and writing its
+ * own pages into out for the level above, when there is one.  Returns false
+ * when the walk has to be repeated (lion_verify_tree_page()).
  */
 static bool
 lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
-					   BlockNumber first, uint16 level, LionVerifyPLevel *out,
-					   LionVerifyPLevel *children, bool exact,
+					   BlockNumber first, uint16 level, LionVerifySeq *out,
+					   LionVerifyMatch *match, bool exact,
 					   LionVerifySetResult *res)
 {
 	BlockNumber blk = first;
+	Page		copy = (Page) palloc(BLCKSZ);
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -1152,12 +1586,15 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 		uint32		firstkey = 0;
 		bool		hasfirst = false;
 		uint32		prevkey = 0;
+		LionVerifyPage pg;
 
-		page = lion_verify_tree_page(vs, blk, tree, level, exact, res, &buf);
+		page = lion_verify_tree_page(vs, blk, tree, level, exact, &buf);
 		if (page == NULL)
+		{
+			pfree(copy);
 			return false;
+		}
 		maxoff = PageGetMaxOffsetNumber(page);
-		firstdata = lion_posting_first_data(page);
 
 		/* Every item is one whole pivot before any of them is read. */
 		for (off = FirstOffsetNumber; off <= maxoff; off++)
@@ -1172,6 +1609,18 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 							LION_POSTING_PIVOT_SIZE);
 		}
 		lion_page_check_items(vs->index, page, blk);
+
+		/*
+		 * The rest is read from a copy, with the page let go: the comparison
+		 * with the level below reads that level's pages back from a file once
+		 * there are more of them than memory keeps, and no buffer lock is
+		 * held over I/O.  The page was read under its SHARE lock, so the copy
+		 * is the page as a writer left it.
+		 */
+		memcpy(copy, page, BLCKSZ);
+		UnlockReleaseBuffer(buf);
+		page = copy;
+		firstdata = lion_posting_first_data(page);
 
 		if (!LionPageIsRightmost(page))
 		{
@@ -1240,22 +1689,28 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 			}
 			prevkey = piv->ckey;
 
-			if (children != NULL)
-				lion_verify_plevel_add(children, piv->child, piv->ckey, true,
-									   piv->ckey, 0, false, false);
+			lion_verify_match_downlink(match, piv->child, piv->ckey);
 
 			CHECK_FOR_INTERRUPTS();
 		}
 
-		lion_verify_plevel_add(out, blk, firstkey, hasfirst, prevkey, highkey,
-							   hashigh, LionPageIncompleteSplit(page));
+		pg.blk = blk;
+		pg.firstkey = firstkey;
+		pg.upper = highkey;
+		pg.flags = (hasfirst ? LION_VPAGE_FIRST : 0) |
+			(hashigh ? LION_VPAGE_UPPER : 0) |
+			(LionPageIncompleteSplit(page) ? LION_VPAGE_INCOMPLETE : 0);
+		if (out != NULL)
+			lion_verify_seq_put(out, &pg);
+		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
+			lion_verify_note_flagged(res, blk, exact);
 
 		blk = LionPageGetOpaque(page)->rightlink;
-		UnlockReleaseBuffer(buf);
 
 		CHECK_FOR_INTERRUPTS();
 	}
 
+	pfree(copy);
 	return true;
 }
 
@@ -1348,144 +1803,75 @@ lion_verify_tree_leftmost(LionVerifyState *vs, const LionVerifyTree *tree,
 }
 
 /*
- * Check level i of a tree against the level below it (lion_verify_chain()
- * says why that is exact): children is what the walk of level i collected,
- * its downlinks in the order that walk found them, and below the pages of
- * level i - 1 in the order ITS walk found them.  Returns false, in a walk
- * that may be repeated, when a downlink names a page that walk did not see.
- *
- * Every downlink but the first carries the separator of its child: at or
- * below the child's first key, and above everything the page to its left
- * holds.  A position tree's keys are heap blocks, and its separators repeat
- * (lion_postree.c): there a leaf's separator IS the header of its first
- * chunk - (P3), which a split keeps by posting that header and VACUUM by
- * never deleting a leaf's first chunk - and the leaf to its left may hold
- * members of that very block, but none above it, since a reader of block X
- * lands on the leaf of the last separator below X and looks for X's members
- * from there on, never to its left.
+ * The checks of a tree without an internal level (DESIGN.md §22, §17): at
+ * most LION_POSTING_FLAT_LEAVES leaves, and none of them flagged, since such
+ * a tree's splits post no downlink, and the one that would make it longer
+ * pushes the root down first.  A walk that may be repeated can have seen
+ * that push-down happen behind it, and the leaves and the split that came
+ * after it, so it walks again instead (false).
  */
 static bool
-lion_verify_tree_match(LionVerifyState *vs, const LionVerifyTree *tree,
-					   uint32 i, const LionVerifyPLevel *below,
-					   const LionVerifyPLevel *children, bool exact)
+lion_verify_flat(LionVerifyState *vs, const LionVerifyTree *tree,
+				 const LionVerifyLeafSum *sum, bool exact)
 {
-	int			j;
-	int			p;
-
-	/*
-	 * A downlink to a page the walk of the level below did not see is a
-	 * split made after that walk passed: walk the set again (see the header
-	 * of lion_verify_chain()).  In an exact walk nothing can have split, and
-	 * the comparison below reports such a downlink as the mismatch it is.
-	 */
-	if (!exact)
+	if (sum->npages > LION_POSTING_FLAT_LEAVES)
 	{
-		BlockNumber *seen = lion_verify_sorted_blocks(below->blocks,
-													  below->npages);
-
-		for (j = 0; j < children->npages; j++)
-		{
-			if (!lion_verify_has_block(seen, below->npages,
-									   children->blocks[j]))
-			{
-				pfree(seen);
-				return false;
-			}
-		}
-		pfree(seen);
+		if (!exact)
+			return false;
+		if (tree->positions)
+			lion_corrupt("lion index \"%s\": the position tree at %u of entry %u on block %u has more than %d leaves and no internal level",
+						RelationGetRelationName(vs->index), tree->root,
+						tree->eoff, tree->eblk, LION_POSTING_FLAT_LEAVES);
+		lion_corrupt("lion index \"%s\": the posting set of chain entry %u on block %u has %lld leaves and no internal level, more than %d",
+					RelationGetRelationName(vs->index), tree->eoff,
+					tree->eblk, (long long) sum->npages,
+					LION_POSTING_FLAT_LEAVES);
 	}
-
-	/*
-	 * Match the downlinks with the pages.  j is the next downlink to match.
-	 *
-	 * One page may lack a downlink without being damage: the right sibling a
-	 * split made, while the split is unfinished.  The split writes the
-	 * sibling in one record and its downlink in the next, and leaves the LEFT
-	 * page flagged LION_PAGE_INCOMPLETE_SPLIT in between; a crash - or an
-	 * error - there leaves it so until the next writer that descends to the
-	 * left page finishes it (DESIGN.md §22).  The sibling is then reachable
-	 * through its left neighbour's right link and from nothing above, and the
-	 * walk has already warned about the flag.  A three-way split flags both
-	 * of its first two pages, so each missing downlink is covered by the page
-	 * to its own left.  Such a page lies in its left neighbour's key range
-	 * until the split finishes, and is bounded above by the next downlink's
-	 * separator like any other page.
-	 */
-	j = 0;
-	for (p = 0; p < below->npages; p++)
+	if (BlockNumberIsValid(sum->flagged))
 	{
-		if (j < children->npages && children->blocks[j] == below->blocks[p])
-		{
-			uint32		sep = children->firstkey[j];
-
-			if (j == 0 && sep != 0)
-				lion_corrupt("lion index \"%s\": the first downlink of %s level %u has separator %u, expected minus infinity",
-							RelationGetRelationName(vs->index), tree->what, i,
-							sep);
-
-			/* the separator is at or below its child's own first key */
-			if (tree->positions && i == 1)
-			{
-				if (j > 0 && below->hasfirst[p] && sep != below->firstkey[p])
-					lion_corrupt("lion index \"%s\": the separator %u of position leaf %u is not the header %u of its first chunk",
-								RelationGetRelationName(vs->index), sep,
-								below->blocks[p], below->firstkey[p]);
-			}
-			else if (below->hasfirst[p] && sep > below->firstkey[p])
-				lion_corrupt("lion index \"%s\": the separator %u of %s block %u sorts after its own first %s %u",
-							RelationGetRelationName(vs->index), sep,
-							tree->what, below->blocks[p],
-							tree->positions ? "separator" : "container key",
-							below->firstkey[p]);
-			j++;
-		}
-		else if (p > 0 && below->incomplete[p - 1])
-		{
-			/* the right half of an unfinished split: no downlink yet */
-		}
-		else if (j < children->npages)
-			lion_corrupt("lion index \"%s\": downlink %d of %s level %u points at block %u, but the next page of level %u is block %u",
-						RelationGetRelationName(vs->index), j, tree->what, i,
-						children->blocks[j], i - 1, below->blocks[p]);
-		else
-			lion_corrupt("lion index \"%s\": %s level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
-						RelationGetRelationName(vs->index), tree->what, i,
-						tree->eoff, tree->eblk, children->npages, i - 1,
-						below->npages);
-
-		/* ... and the page's own upper bound is below the next one */
-		if (j < children->npages)
-		{
-			uint32		next = children->firstkey[j];
-
-			if (i == 1 && tree->positions)
-			{
-				if (below->hasfirst[p] && below->lastkey[p] > next)
-					lion_corrupt("lion index \"%s\": position leaf %u reaches block %u, above the separator %u of its right sibling",
-								RelationGetRelationName(vs->index),
-								below->blocks[p], below->lastkey[p], next);
-			}
-			else if (i == 1)
-			{
-				if (below->hasfirst[p] && below->lastkey[p] >= next)
-					lion_corrupt("lion index \"%s\": leaf %u holds container key %u, at or above the separator %u of its right sibling",
-								RelationGetRelationName(vs->index),
-								below->blocks[p], below->lastkey[p], next);
-			}
-			else if (below->hashigh[p] && below->highkey[p] > next)
-				lion_corrupt("lion index \"%s\": the high key %u of %s block %u sorts after the separator %u of its right sibling",
-							RelationGetRelationName(vs->index),
-							below->highkey[p], tree->what, below->blocks[p],
-							next);
-		}
+		if (!exact)
+			return false;
+		if (tree->positions)
+			lion_corrupt("lion index \"%s\": leaf %u of the position tree at %u, which has no internal level, is flagged as an unfinished split",
+						RelationGetRelationName(vs->index), sum->flagged,
+						tree->root);
+		lion_corrupt("lion index \"%s\": leaf %u of the posting set of chain entry %u on block %u, which has no internal level, is flagged as an unfinished split",
+					RelationGetRelationName(vs->index), sum->flagged,
+					tree->eoff, tree->eblk);
 	}
+	return true;
+}
 
-	if (j < children->npages)
-		lion_corrupt("lion index \"%s\": %s level %u of chain entry %u on block %u has %d downlinks but level %u has %d pages",
-					RelationGetRelationName(vs->index), tree->what, i,
-					tree->eoff, tree->eblk, children->npages, i - 1,
-					below->npages);
+/*
+ * Walk the levels of a tree above its leaves, from the bottom up, each
+ * matched with the level below as its walk meets its downlinks
+ * (LionVerifyMatch).  lv[0] holds the leaves' pages, as their walk found
+ * them; lv[1] is empty, and the two take turns as the level below and the
+ * level being walked.  Returns false when the walk has to be repeated.
+ */
+static bool
+lion_verify_tree_levels(LionVerifyState *vs, const LionVerifyTree *tree,
+						const BlockNumber *leftmost, uint32 height,
+						LionVerifySeq *lv, bool exact,
+						LionVerifySetResult *res)
+{
+	uint32		i;
 
+	for (i = 1; i <= height; i++)
+	{
+		LionVerifySeq *below = &lv[(i - 1) % 2];
+		LionVerifySeq *above = &lv[i % 2];
+		LionVerifyMatch match;
+
+		/* the root's level has no level above it to be matched with */
+		lion_verify_seq_reset(above);
+		lion_verify_match_init(&match, vs, tree, i, below, exact);
+		if (!lion_verify_tree_level(vs, tree, leftmost[i], (uint16) i,
+									(i < height) ? above : NULL, &match,
+									exact, res) ||
+			!lion_verify_match_end(&match))
+			return false;
+	}
 	return true;
 }
 
@@ -1521,6 +1907,11 @@ lion_verify_tree_match(LionVerifyState *vs, const LionVerifyTree *tree,
  * the entry's counters anyway - as is a root pushed down under the walk.
  * Everything else the comparison checks is exact.
  *
+ * That order is also why the walk of a level needs the whole level below it,
+ * read before it began: what it keeps of each page is one LionVerifyPage, in
+ * a sequence that goes to a temporary file past its share of work_mem
+ * (LionVerifySeq), so that a set of any size is walked in the same memory.
+ *
  * The position tree of the entry, which is a posting tree too, is walked the
  * same way by lion_verify_postree().
  */
@@ -1531,10 +1922,10 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 {
 	BlockNumber leftmost[LION_POSTING_MAX_HEIGHT + 1];
 	LionVerifyTree tree;
-	LionVerifyPLevel *lvl;
+	LionVerifySeq lv[2];
+	LionVerifyLeafSum sum;
 	uint32		height;
-	uint32		i;
-	int			j;
+	bool		ok;
 
 	if (!BlockNumberIsValid(lion_entry_head(entry)) || !BlockNumberIsValid(lion_entry_tail(entry)))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u has head %u and tail %u",
@@ -1545,41 +1936,12 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	lion_verify_tree_leftmost(vs, &tree, leftmost, &height);
 
 	res->height = height;
-	lvl = (LionVerifyPLevel *) palloc0(sizeof(LionVerifyPLevel) * (height + 1));
+	lion_verify_seq_init(&lv[0], &vs->seqacct, sizeof(LionVerifyPage));
+	lion_verify_seq_init(&lv[1], &vs->seqacct, sizeof(LionVerifyPage));
 
-	if (!lion_verify_posting_leaves(vs, &tree, entry, leftmost[0], &lvl[0],
-									exact, res))
-		return false;
-
-	/*
-	 * A set without an internal level (DESIGN.md §22) has at most
-	 * LION_POSTING_FLAT_LEAVES leaves, and none of them flagged: its splits
-	 * post no downlink, and the one that would make it longer pushes the
-	 * head down first.  A walk that may be repeated can have seen that
-	 * push-down happen behind it, and the leaves and the split that came
-	 * after it, so it walks again instead.
-	 */
-	if (height == 0)
-	{
-		if (lvl[0].npages > LION_POSTING_FLAT_LEAVES)
-		{
-			if (!exact)
-				return false;
-			lion_corrupt("lion index \"%s\": the posting set of chain entry %u on block %u has %d leaves and no internal level, more than %d",
-						RelationGetRelationName(vs->index), eoff, eblk,
-						lvl[0].npages, LION_POSTING_FLAT_LEAVES);
-		}
-		for (j = 0; j < lvl[0].npages; j++)
-		{
-			if (!lvl[0].incomplete[j])
-				continue;
-			if (!exact)
-				return false;
-			lion_corrupt("lion index \"%s\": leaf %u of the posting set of chain entry %u on block %u, which has no internal level, is flagged as an unfinished split",
-						RelationGetRelationName(vs->index), lvl[0].blocks[j],
-						eoff, eblk);
-		}
-	}
+	ok = lion_verify_posting_leaves(vs, &tree, entry, leftmost[0], &lv[0],
+									&sum, exact, res) &&
+		(height > 0 || lion_verify_flat(vs, &tree, &sum, exact));
 
 	/*
 	 * Test hook: the leaves are walked, the levels above are not, and nothing
@@ -1588,22 +1950,14 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	 * exact walk, which may hold a directory leaf that a writer would then
 	 * wait for without isolationtester seeing it wait.
 	 */
-	if (!exact)
+	if (ok && !exact)
 		LION_INJECTION_POINT("lion-verify-set-leaves-walked");
 
-	for (i = 1; i <= height; i++)
-	{
-		LionVerifyPLevel children;
-
-		memset(&children, 0, sizeof(children));
-		if (!lion_verify_tree_level(vs, &tree, leftmost[i], (uint16) i,
-									&lvl[i], &children, exact, res) ||
-			!lion_verify_tree_match(vs, &tree, i, &lvl[i - 1], &children,
-									exact))
-			return false;
-	}
-
-	return true;
+	ok = ok && lion_verify_tree_levels(vs, &tree, leftmost, height, lv, exact,
+									   res);
+	lion_verify_seq_free(&lv[0]);
+	lion_verify_seq_free(&lv[1]);
+	return ok;
 }
 
 /*
@@ -1618,12 +1972,9 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 static void
 lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
 						 OffsetNumber eoff, const LionEntryTuple *entry,
-						 const LionVerifySetResult *res, bool compare)
+						 LionVerifySetResult *res, bool compare)
 {
-	int			i;
-
-	for (i = 0; i < res->nincomplete; i++)
-		lion_verify_warn_incomplete(vs, "posting", res->incomplete[i]);
+	lion_verify_warn_flagged(vs, "posting", res);
 
 	if (res->height > vs->max_posting_height)
 		vs->max_posting_height = res->height;
@@ -1839,7 +2190,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		if (attempt > 0)
 			LION_INJECTION_POINT("lion-verify-set-rewalk");
 
-		memset(&res, 0, sizeof(res));
+		lion_verify_result_init(vs, &res);
 		lion_verify_track_begin(vs);
 		vs->nsetwalks++;
 		ok = lion_verify_chain(vs, blk, off, cur, false, &res);
@@ -1849,6 +2200,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		{
 			lion_verify_track_end(vs, true);
 			lion_verify_chain_totals(vs, blk, off, cur, &res, true);
+			lion_verify_result_free(&res);
 			pfree(cur);
 			return;
 		}
@@ -1859,6 +2211,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		{
 			lion_verify_track_end(vs, true);
 			lion_verify_chain_totals(vs, blk, off, cur, &res, false);
+			lion_verify_result_free(&res);
 			vs->nsetuncompared++;
 			ereport(WARNING,
 					(errmsg("lion index \"%s\": the totals of chain entry %u on block %u were not compared with its posting set",
@@ -1872,6 +2225,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 		/* A writer got in; forget what this walk marked, and walk again. */
 		lion_verify_track_end(vs, false);
+		lion_verify_result_free(&res);
 		vs->nsetretries++;
 		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
 			break;				/* reported below */
@@ -1908,18 +2262,19 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	if ((cur->flags & LION_ENTRY_CHAIN) == 0)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u is an inline entry now",
 					RelationGetRelationName(vs->index), off, blk);
-	memset(&res, 0, sizeof(res));
+	lion_verify_result_init(vs, &res);
 	(void) lion_verify_chain(vs, blk, off, cur, true, &res);
 	lion_verify_chain_totals(vs, blk, off, cur, &res, true);
+	lion_verify_result_free(&res);
 	UnlockReleaseBuffer(leaf);
 	pfree(cur);
 }
 
 /*
  * lion_verify_set_walks() in a memory context of its own, emptied after every
- * set: the level arrays of a walk - and of every walk thrown away - are
- * garbage the moment the set is settled, and an index has as many sets as it
- * has keys with more than an entry's worth of rows.
+ * set: what a walk allocates - and every walk thrown away - is garbage the
+ * moment the set is settled, and an index has as many sets as it has keys
+ * with more than an entry's worth of rows.
  */
 static void
 lion_verify_set(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
@@ -2222,59 +2577,23 @@ lion_verify_postree_walk(LionVerifyState *vs, const LionVerifyTree *tree,
 						 bool exact, LionVerifySetResult *res)
 {
 	BlockNumber leftmost[LION_POSTING_MAX_HEIGHT + 1];
-	LionVerifyPLevel *lvl;
+	LionVerifySeq lv[2];
+	LionVerifyLeafSum sum;
 	uint32		height;
-	uint32		i;
-	int			j;
+	bool		ok;
 
 	lion_verify_tree_leftmost(vs, tree, leftmost, &height);
 	res->height = height;
-	lvl = (LionVerifyPLevel *) palloc0(sizeof(LionVerifyPLevel) * (height + 1));
+	lion_verify_seq_init(&lv[0], &vs->seqacct, sizeof(LionVerifyPage));
+	lion_verify_seq_init(&lv[1], &vs->seqacct, sizeof(LionVerifyPage));
 
-	if (!lion_verify_pos_leaves(vs, tree, leftmost[0], &lvl[0], exact, res))
-		return false;
-
-	/*
-	 * A root at level 0 is the first leaf of a tree without an internal
-	 * level (DESIGN.md §17): at most LION_POSTING_FLAT_LEAVES leaves, none
-	 * flagged, since such a tree's splits post no downlink - unless a walk
-	 * that may be repeated saw the root pushed down behind it.
-	 */
-	if (height == 0)
-	{
-		if (lvl[0].npages > LION_POSTING_FLAT_LEAVES)
-		{
-			if (!exact)
-				return false;
-			lion_corrupt("lion index \"%s\": the position tree at %u of entry %u on block %u has more than %d leaves and no internal level",
-						RelationGetRelationName(vs->index), tree->root,
-						tree->eoff, tree->eblk, LION_POSTING_FLAT_LEAVES);
-		}
-		for (j = 0; j < lvl[0].npages; j++)
-		{
-			if (!lvl[0].incomplete[j])
-				continue;
-			if (!exact)
-				return false;
-			lion_corrupt("lion index \"%s\": leaf %u of the position tree at %u, which has no internal level, is flagged as an unfinished split",
-						RelationGetRelationName(vs->index), lvl[0].blocks[j],
-						tree->root);
-		}
-	}
-
-	for (i = 1; i <= height; i++)
-	{
-		LionVerifyPLevel children;
-
-		memset(&children, 0, sizeof(children));
-		if (!lion_verify_tree_level(vs, tree, leftmost[i], (uint16) i,
-									&lvl[i], &children, exact, res) ||
-			!lion_verify_tree_match(vs, tree, i, &lvl[i - 1], &children,
-									exact))
-			return false;
-	}
-
-	return true;
+	ok = lion_verify_pos_leaves(vs, tree, leftmost[0], &lv[0], &sum, exact,
+								res) &&
+		(height > 0 || lion_verify_flat(vs, tree, &sum, exact)) &&
+		lion_verify_tree_levels(vs, tree, leftmost, height, lv, exact, res);
+	lion_verify_seq_free(&lv[0]);
+	lion_verify_seq_free(&lv[1]);
+	return ok;
 }
 
 /*
@@ -2314,7 +2633,7 @@ lion_verify_postree_totals(LionVerifyState *vs, BlockNumber blk,
  * checked as its posting set is: every page visited once, a position page of
  * this tree, stamped as the entry's, at the level its link promises; every
  * level's keys and links, and its downlinks matched with the level below
- * (lion_verify_tree_match()); every chunk and member
+ * (lion_verify_tree_levels()); every chunk and member
  * (lion_verify_pos_leaves()); and, on a primary, at least as many members as
  * the entry has TIDs and positions for every one of those TIDs
  * (lion_verify_pos_covers()), since a row's positions are written before its
@@ -2341,9 +2660,10 @@ lion_verify_postree_totals(LionVerifyState *vs, BlockNumber blk,
  * (directory page before position page), and it keeps waiting only the
  * writers of the keys on that one leaf, for one walk of one tree.
  *
- * Neither walk keeps more than the tree's level arrays: the comparison reads
- * the two trees' leaves in step and collects nothing
- * (lion_verify_pos_covers()), so a key of any size costs it two pages.
+ * Neither walk keeps more of the tree than its levels' sequences
+ * (LionVerifySeq): the comparison reads the two trees' leaves in step and
+ * collects nothing (lion_verify_pos_covers()), so a key of any size costs it
+ * two pages.
  *
  * On a standby the leaf is never held while a tree is walked
  * (lion_verify_set_walks() says why), so there replay may split the tree or
@@ -2364,7 +2684,6 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 	LionVerifySetResult res;
 	LionVerifyCovers cv;
 	int			attempt;
-	int			i;
 
 	/*
 	 * The tree's root is in the entry's extension, which the entry keeps
@@ -2378,7 +2697,7 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 	{
 		for (attempt = 0;; attempt++)
 		{
-			memset(&res, 0, sizeof(res));
+			lion_verify_result_init(vs, &res);
 			lion_verify_track_begin(vs);
 			vs->nposwalks++;
 			if (lion_verify_postree_walk(vs, &tree, false, &res))
@@ -2387,6 +2706,7 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 				break;
 			}
 			lion_verify_track_end(vs, false);
+			lion_verify_result_free(&res);
 			vs->nposretries++;
 			if (attempt + 1 >= LION_VERIFY_STANDBY_WALKS)
 				ereport(ERROR,
@@ -2397,8 +2717,8 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 								   attempt + 1),
 						 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()).")));
 		}
-		for (i = 0; i < res.nincomplete; i++)
-			lion_verify_warn_incomplete(vs, "position", res.incomplete[i]);
+		lion_verify_warn_flagged(vs, "position", &res);
+		lion_verify_result_free(&res);
 		pfree(cur);
 		return;
 	}
@@ -2422,7 +2742,7 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 		if (attempt > 0)
 			LION_INJECTION_POINT("lion-verify-postree-rewalk");
 
-		memset(&res, 0, sizeof(res));
+		lion_verify_result_init(vs, &res);
 		lion_verify_track_begin(vs);
 		vs->nposwalks++;
 		ok = lion_verify_postree_walk(vs, &tree, false, &res) &&
@@ -2438,9 +2758,8 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 										   false))
 			{
 				lion_verify_track_end(vs, true);
-				for (i = 0; i < res.nincomplete; i++)
-					lion_verify_warn_incomplete(vs, "position",
-												res.incomplete[i]);
+				lion_verify_warn_flagged(vs, "position", &res);
+				lion_verify_result_free(&res);
 				pfree(cur);
 				return;
 			}
@@ -2450,11 +2769,13 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 			 * the pages of the tree again, so this walk's marks go.
 			 */
 			lion_verify_track_end(vs, false);
+			lion_verify_result_free(&res);
 			break;
 		}
 
 		/* A writer got in; forget what this walk marked, and walk again. */
 		lion_verify_track_end(vs, false);
+		lion_verify_result_free(&res);
 		vs->nposretries++;
 	}
 
@@ -2469,13 +2790,13 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 	 */
 	LION_INJECTION_POINT("lion-verify-postree-held");
 
-	memset(&res, 0, sizeof(res));
+	lion_verify_result_init(vs, &res);
 	if (!lion_verify_postree_walk(vs, &tree, true, &res) ||
 		!lion_verify_pos_covers(vs, cur, &tree, true, &cv))
 		elog(ERROR, "an exact walk of a position tree was not finished");
-	for (i = 0; i < res.nincomplete; i++)
-		lion_verify_warn_incomplete(vs, "position", res.incomplete[i]);
+	lion_verify_warn_flagged(vs, "position", &res);
 	(void) lion_verify_postree_totals(vs, blk, off, cur, &res, &cv, true);
+	lion_verify_result_free(&res);
 	UnlockReleaseBuffer(leaf);
 	pfree(cur);
 }
@@ -2920,11 +3241,20 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	vs.nblocks = vs.startblocks = RelationGetNumberOfBlocks(vs.index);
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.refs = (uint8 *) palloc0(sizeof(uint8) * Max(vs.nblocks, 1));
-	vs.maxsetvisits = 64;
-	vs.setvisits = (BlockNumber *) palloc(sizeof(BlockNumber) * vs.maxsetvisits);
 	vs.setcxt = AllocSetContextCreate(CurrentMemoryContext,
 									  "lion index verify posting set",
 									  ALLOCSET_DEFAULT_SIZES);
+
+	/*
+	 * What the walks of the trees keep (LionVerifySeq): an equal share of
+	 * work_mem for each sequence that can be alive at once, and a temporary
+	 * file past it - in temp_tablespaces, looked up now, before any page is
+	 * read, since the lookup reads catalogs.
+	 */
+	vs.seqacct.cap = Max((Size) work_mem * 1024 / LION_VERIFY_SEQS,
+						 sizeof(LionVerifyPage));
+	PrepareTempTablespaces();
+	lion_verify_seq_init(&vs.setvisits, &vs.seqacct, sizeof(BlockNumber));
 
 	lion_verify_meta(&vs);
 
@@ -2957,11 +3287,20 @@ lion_index_verify(PG_FUNCTION_ARGS)
 		 (long long) vs.nsetuncompared, (long long) vs.nposwalks,
 		 (long long) vs.nposretries, (long long) vs.nposholds);
 
+	/*
+	 * ... and what the walks of the trees kept (LionVerifySeq): never more
+	 * memory than work_mem, whatever the size of a tree, and the rest in
+	 * temporary files.
+	 */
+	elog(DEBUG1, "lion index \"%s\": the walks of its trees kept at most %zu bytes in memory and wrote %lld records to temporary files",
+		 RelationGetRelationName(vs.index), vs.seqacct.peak,
+		 (long long) vs.seqacct.spilled);
+
 	if (heapallindexed)
 		lion_verify_heapallindexed(&vs);
 
 	MemoryContextDelete(vs.setcxt);
-	pfree(vs.setvisits);
+	lion_verify_seq_free(&vs.setvisits);
 	pfree(vs.refs);
 	pfree(vs.cbuf);
 

@@ -1215,6 +1215,17 @@ held until its right sibling is locked (left to right, the directory's own order
 link naming the other is exact - and a page at the height the meta page gave has lost its ROOT flag,
 which a root split does in the same record that makes the meta page name a taller directory.
 
+**Memory.** The comparison of two levels needs the whole lower level, read before the walk of the
+upper one began - the order that makes a split harmless. What a walk of a posting set or a position
+tree keeps of a page is 16 bytes (its block, first key, upper bound and flags), in a sequence
+(`LionVerifySeq`, lion_funcs.h) that stays in memory up to a quarter of work_mem and goes on in a
+temporary file past it, read back in order by the walk of the level above; so are the blocks a walk
+that may be thrown away visited and the unfinished splits it met. A tree of any size is walked in
+the same memory: verify.sql's nineteenth case walks a position tree of 1,200 leaves at work_mem =
+64kB, the 176 past the 1,024th going to the file, and verify() says at DEBUG1 the most its walks kept
+in memory and the records they wrote out. The directory's walk keeps its levels in memory, with each
+page's first key and high key, and the reachability pass a byte per block of the index.
+
 **Posting sets** are walked with nothing held: holding the entry's directory leaf for every walk would
 keep the writers of every key on that leaf waiting. The entry is read again afterwards - found by its
 exact key from the leaf it was on, moving right, since an entry leaves its leaf only with the upper

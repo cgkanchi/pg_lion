@@ -766,10 +766,34 @@ SELECT lion_index_verify('lion_vfy_bad_hpch', true);
 \set VERBOSITY terse
 SET client_min_messages = warning;
 
+-- (19) a position tree bigger than the memory a check keeps (DESIGN.md §7):
+-- 36000 rows of 'w' at the 256 positions a tsvector keeps of one lexeme,
+-- whose position tree has over a thousand leaves of two or three heap
+-- blocks each, under two internal pages and a root.  A walk keeps each
+-- level for the level above it as a sequence of 16 bytes a page, in memory
+-- up to a quarter of work_mem and in a temporary file past it: at 64kB the
+-- leaves after the 1024th go to the file, and the comparison with the level
+-- above reads them back from it.  The DEBUG line gives the most the walks
+-- kept in memory and the records they wrote out; at the default work_mem
+-- they write none.
+CREATE TEMP TABLE lion_vfy_big (id int4, d tsvector);
+INSERT INTO lion_vfy_big
+SELECT i, w.d
+  FROM generate_series(1, 36000) i,
+	   (SELECT to_tsvector('simple', repeat('w ', 256)) d) w;
+CREATE INDEX lion_vfy_big_d ON lion_vfy_big USING lion (d)
+  WITH (store_positions = true);
+SET work_mem = '64kB';
+SET client_min_messages = debug1;
+SELECT lion_index_verify('lion_vfy_big_d');
+RESET work_mem;
+SELECT lion_index_verify('lion_vfy_big_d');
+SET client_min_messages = warning;
+
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
 	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph, lion_vfy_badpc,
-	lion_vfy_badhp, lion_vfy_badhc;
+	lion_vfy_badhp, lion_vfy_badhc, lion_vfy_big;
 DROP FUNCTION lion_vfy_meta(regclass, int8, bytea);
 DROP FUNCTION lion_vfy_err(text);
 DROP FUNCTION lion_vfy_peek(regclass, int8, int8, int8);
