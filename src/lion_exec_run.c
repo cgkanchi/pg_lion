@@ -1140,14 +1140,17 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 	sums->rangesrc_collected += st->rangesrc_collected;
 	sums->rangesrc_walked += st->rangesrc_walked;
 	sums->rangesrc_spilled += st->rangesrc_spilled;
-	sums->listsrc_collected += st->listsrc_collected;
-	sums->listsrc_spilled += st->listsrc_spilled;
+	/* every participant collects the same lists: how many, not how often */
+	sums->listsrc_collected = Max(sums->listsrc_collected,
+								  st->listsrc_collected);
+	sums->listsrc_spilled = Max(sums->listsrc_spilled, st->listsrc_spilled);
 	sums->wherecollected += st->wherecollected;
 	sums->wherespilled += st->wherespilled;
 	sums->groupbatches += st->groupbatches;
 	sums->groupsbatched += st->groupsbatched;
 	if (st->lbatch != NULL)
 		sums->listbatches += st->lbatch->batches;
+	sums->listbatches += st->glistbatches;
 	if (dr != NULL)
 	{
 		sums->decodepasses += dr->passes;
