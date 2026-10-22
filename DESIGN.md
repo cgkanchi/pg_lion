@@ -5073,11 +5073,13 @@ size" where the ordinary plan answers. Two things now:
   batch's sets are ORed into ONE union and released before the next batch is located: the list is
   collected as a range taken as a source is (§32, "A range as a source"; `lion_union_collect()`), in
   what is left of the hash table's memory the relation's ranges and lists share, and past it a
-  window of container keys at a time into a temporary file, each window a pass over the values. One
-  that does not fit what the sources collected before it left sends them to files, as a range does
-  (`lion_collect_within()`). A value in two batches is ORed in twice, which a union takes once. The
-  union is one pinless set, counted beside a source that carries the §9 interlock or rechecked in
-  the heap, as a list too wide for the open budget always was ("Bounded cursors"). So a filtered
+  window of container keys at a time into a temporary file: the values are located once, into the
+  first window, and what it does not keep goes to an overflow the windows after it read in their
+  place (§32, "Too large to collect"). One that does not fit what the sources collected before it
+  left sends them to files, as a range does (`lion_collect_within()`). A value in two batches is
+  ORed in twice, which a union takes once. The union is one pinless set, counted beside a source
+  that carries the §9 interlock or rechecked in the heap, as a list too wide for the open budget
+  always was ("Bounded cursors"). So a filtered
   count's run whose one source that selects rows is the list - `count(*) FILTER (WHERE k = ANY
   ($1))` in a node that sums every entry for its run 0 (§10, "Filtered counts"), which takes no
   batches - is counted as a run whose source is a range taken as a source is: the sum over the
@@ -19606,8 +19608,9 @@ because it is read after the snapshot was taken).
 two bytes a row until those fill up. The planner budgets them as the executor holds them, one after
 the other out of that one memory (`lion_cost_range_source()`'s `LionRangeMem`, the node's
 `rangesrc_held`): a range that would not fit what the ranges before it left is collected in
-WINDOWS into a temporary file (below), and priced so - the walk of the range twice for each
-window's worth of its union, and the file written once and read once - and every count that reads
+WINDOWS into a temporary file (below), and priced so - the walk of the range once, the passes of
+what the windows do not keep through their overflow, and the file written once and read once - and
+every count that reads
 the file back pays for each container it seeks there (`LION_SPILL_READ_COST`,
 `lion_count_rel_spill_reads()`). The file is a collected set like any other, so every way of
 counting one takes it: the WHERE collected once and the groups counted in batches (§10), the
@@ -19618,8 +19621,9 @@ back first (`lion_locate_range()`): the executor finds it does not fit by trying
 to files of their own (`lion_range_spill_set()`, each written once in key order, to hold sixteen
 bytes a container key as a range collected in windows does), and it is collected in what that
 freed - in memory, or in windows of nearly all of it. Left to what they left, a range that filled
-the memory to its last few kilobytes would make the next one cost a walk of it for every
-`LION_RANGE_WINDOW_MIN` of its union. The planner prices it so: the try, the files written and
+the memory to its last few kilobytes would leave the next one windows of `LION_RANGE_WINDOW_MIN`,
+and a pass through its overflow for every halving of its union down to that. The planner prices it
+so: the try, the files written and
 read, and every count's reads of them. An IN list too long to locate at once is collected in the
 same memory and the same way (§15, "A list too long to locate at once"; `lion_collect_within()`),
 evicting and evicted alike; the planner, which cannot see a parameter's length, prices none of it.
@@ -19691,16 +19695,42 @@ is bounded (2026-09-28 review):
   (§34), whose WHERE is one collected copy, and every range of a plan that does not walk them. It
   gets what every range of the relation gets - what is left of the hash table's memory, and never
   less than `LION_RANGE_WINDOW_MIN` (32 kB, several bitsets, so that a window always gets on).
-  A window keeps the container keys from where the last one ended; when its memory runs out it
-  gives back the upper half of the keys it holds and ends where they began
-  (`lion_range_union_evict()`); at the end of its walk its containers go to the file in key order,
-  and the next window walks the range again from there. The set reads the file a container at a
-  time and seeks it by the keys it keeps in memory, sixteen bytes a container key. Every window is
-  read after the snapshot, as the one walk always was, and the windows are disjoint ranges of TIDs,
-  so the file holds every row of the range once and none twice - the collected set's argument
-  unchanged. A union n times the memory costs about 2n walks of the range, which is the price the
-  planner puts on it (`lion_cost_range_source()`). EXPLAIN ANALYZE counts `Range Sources
-  Spilled`.
+  The range is walked ONCE, into the first window. When a window's memory runs out it gives back
+  the upper half of the keys it holds and ends where they began (`lion_range_union_evict()`). What
+  it gives back, and every container that comes after at a key past its end, goes to its OVERFLOW
+  (`LionUnionSpill`): logical tapes, the keys from its first cut to its end split into
+  `LION_UNION_FANOUT` parts of equal width - a sixteenth of the memory's blocks, two to 64 - and
+  what a later cut gives back below the first into one part more. The containers go there as the
+  walk hands them out, a set's at a key, not united; a bitset given back is folded and optimized
+  first. At the end of its input the window's containers go to the file in key order, and its
+  parts that hold anything wait on a stack in key order, the lowest on top: each becomes a window
+  of its own, which reads its part in place of the walk, keeps what it can and splits the rest the
+  same way before the part above it is taken. So the windows come off the stack in key order, and
+  the file is written in key order. Each part holds a block of buffer while its window is made,
+  out of the window's memory (`LION_UNION_SPILL_BLOCKS`), and what is read back is checked before
+  it is used: a size a container can have, read whole, a kind whose header says that size, and a
+  key within the part (`lion_union_part_read()`). The set reads the file a container at a time and
+  seeks it by the keys it keeps in memory, sixteen bytes a container key. The one walk is read
+  after the snapshot as it always was, and the windows are disjoint ranges of container keys, each
+  container of the walk kept by the one window whose keys hold it, so the file holds every row of
+  the range once and none twice - the collected set's argument unchanged. A union n times a
+  window's memory costs one walk and about log n / log fanout passes over the walk's containers,
+  each written and read back for every window it is not kept by, which is the price the planner
+  puts on it (`lion_cost_range_source()`, `lion_union_overflow_share()`). Over small sets in no
+  order - summaries of a few dozen rows, a container each at keys all over the heap - that is many
+  times the union's own containers, and the walk at every count may then be the cheaper. An IN
+  list collected the same way locates its values once, into the first window (§15). EXPLAIN
+  ANALYZE counts `Range Sources Spilled`.
+
+  Measured on a PostgreSQL 18.6 build without assertions (2026-10-22), at work_mem 64 kB and
+  `hash_mem_multiplier` 1, against windows that each walked the range again - or located the list
+  again - for its keys: `x, count(*) WHERE k = ANY (50,000 values) GROUP BY x` over 3M rows, the
+  list collected in windows, 934 ms and 500,737 buffer hits then, 75.5 ms and 16,901 now, against
+  54 ms in memory at 4 MB. Priced so, `r < 524288 AND s < 65536 GROUP BY g` over the 360,000 rows
+  above collects both ranges in windows, 11 ms, where it walked `r` and collected `s`, 50; `fk =
+  ANY (1,500 values) AND r < 524288 GROUP BY g` collects the range beside the list, 66 ms where it
+  walked it, 124; and a range of 64-row summaries in no order over 600,000 rows, `r BETWEEN 15000
+  AND 450000 AND s = 7 GROUP BY g`, is still walked, 25.5 ms.
 
 **Flagged:** a walked OR arm by inclusion-exclusion - `|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B
 ∩ Z − Y|` over R's pieces B - would answer such a leaf without its union or its windows, which

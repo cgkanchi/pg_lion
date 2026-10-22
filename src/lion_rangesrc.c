@@ -13,6 +13,8 @@
 
 #include <math.h>
 
+#include "utils/logtape.h"
+
 #include "lion_count_int.h"
 
 /*
@@ -24,7 +26,9 @@
  *
  * Only the container keys in [lo, hi) are kept: all of them, until a
  * WINDOWED collection runs out of memory and lowers hi
- * (lion_range_union_evict()).
+ * (lion_range_union_evict()).  What it gives back, and every container at
+ * or past hi that comes after, goes to the window's OVERFLOW
+ * (LionUnionSpill), which the windows after it read in place of the walk.
  *
  * DENSE ACCUMULATION (DESIGN.md §32, "Summed ranges: dense and probed").  A
  * range over a column in no heap order gives every container key a member or
@@ -79,6 +83,8 @@ typedef struct LionRangeUnion
 	bool		window;			/* past maxbytes, lower hi rather than fail */
 	uint64		lo;				/* the container keys kept: [lo, hi) */
 	uint64		hi;
+	uint64		maxseen;		/* the highest key that came, kept or not */
+	struct LionUnionSpill *spill;	/* where a window's keys past hi go */
 	LionContainer *tmp;			/* LION_CONTAINER_MAX_SIZE bytes */
 	uint64	   *img;			/* LION_BITSET_BYTES: a fold's image */
 	uint32	   *widened;		/* the keys widened since the last compaction */
@@ -86,11 +92,12 @@ typedef struct LionRangeUnion
 	int			widenedcap;
 } LionRangeUnion;
 
-/* No upper bound on the container keys of a window. */
-#define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
-
 /* What one kept container costs beyond its chunk: its hash entry. */
 #define LION_RANGE_UNION_OVERHEAD	(sizeof(LionRangeUnionEnt) + 16)
+
+static void lion_range_union_fold(LionRangeUnion *u, LionRangeUnionEnt *e);
+static void lion_union_overflow_begin(LionRangeUnion *u, uint64 cut);
+static void lion_union_overflow(LionRangeUnion *u, const LionContainer *c);
 
 static int
 lion_ckey_cmp(const void *a, const void *b)
@@ -104,7 +111,8 @@ lion_ckey_cmp(const void *a, const void *b)
 /*
  * A windowed collection past its memory: keep the lower half of the keys
  * the window holds, give the others back, and end the window where they
- * began - the next window starts there, and reads the range again for them.
+ * began.  What it gives back goes to the window's overflow, folded and
+ * optimized, for the window that takes those keys to read (LionUnionSpill).
  * With the window's memory at least LION_RANGE_WINDOW_MIN there are always
  * two keys or more to split.
  */
@@ -128,6 +136,8 @@ lion_range_union_evict(LionRangeUnion *u)
 	qsort(keys, n, sizeof(uint32), lion_ckey_cmp);
 	cut = keys[n / 2];
 	pfree(keys);
+	lion_union_overflow_begin(u, cut);
+	u->hi = cut;
 
 	/* deleting the entry just returned is allowed during a hash_seq_search */
 	hash_seq_init(&seq, u->byckey);
@@ -137,6 +147,15 @@ lion_range_union_evict(LionRangeUnion *u)
 
 		if (ckey < cut)
 			continue;
+		lion_range_union_fold(u, e);
+		if (e->c->type == LION_CT_BITSET)
+		{
+			memcpy(u->tmp, e->c, e->size);
+			lion_container_optimize(u->tmp);
+			lion_union_overflow(u, u->tmp);
+		}
+		else
+			lion_union_overflow(u, e->c);
 		u->held -= Min(u->held,
 					   GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD);
 		pfree(e->c);
@@ -147,7 +166,6 @@ lion_range_union_evict(LionRangeUnion *u)
 		}
 		(void) hash_search(u->byckey, &ckey, HASH_REMOVE, NULL);
 	}
-	u->hi = cut;
 }
 
 /* Make src, a container of e's key, e's union: at its own size. */
@@ -305,8 +323,15 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 
 	if (lion_container_cardinality(c) == 0)
 		return true;
-	if ((uint64) ckey < u->lo || (uint64) ckey >= u->hi)
-		return true;			/* another window's */
+	if ((uint64) ckey < u->lo)
+		elog(ERROR, "lion index: container key %u below the window of a collected union at %llu",
+			 ckey, (unsigned long long) u->lo);
+	u->maxseen = Max(u->maxseen, (uint64) ckey);
+	if ((uint64) ckey >= u->hi)
+	{
+		lion_union_overflow(u, c);	/* a later window's */
+		return true;
+	}
 
 	/*
 	 * What a container takes is counted as the allocator hands it out
@@ -402,8 +427,9 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 
 /*
  * One set a walk hands the union (lion_union_collect()): its containers ORed
- * in at the window's keys.  False once the union has failed - a collection
- * that may not spill, past its memory - when the walk is to stop.
+ * in at the window's keys, and the others sent to its overflow.  False once
+ * the union has failed - a collection that may not spill, past its memory -
+ * when the walk is to stop.
  */
 bool
 lion_union_add(LionRangeUnion *u, LionPostingSet *ps)
@@ -423,9 +449,8 @@ lion_range_union_cmp(const void *a, const void *b)
 }
 
 /*
- * One window of a range's union (above): walk the range and keep what its
- * sets hold at the window's keys.  What the walk read is added to nsets and
- * nsummaries, when they are given.
+ * A range's sets to the union (above): walk the range and add what its sets
+ * hold.  What the walk read is added to nsets and nsummaries.
  */
 static void
 lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
@@ -440,12 +465,10 @@ lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
 	{
 		(void) lion_union_add(u, &ps);
 		lion_posting_set_release(&ps);
-		if (nsets != NULL)
-			(*nsets)++;
+		(*nsets)++;
 		CHECK_FOR_INTERRUPTS();
 	}
-	if (nsummaries != NULL)
-		*nsummaries += es.nsummaries;
+	*nsummaries += es.nsummaries;
 	lion_entry_scan_end(&es);
 }
 
@@ -468,6 +491,237 @@ lion_range_union_sorted(LionRangeUnion *u, long *n)
 	if (*n > 1)
 		qsort(ents, *n, sizeof(LionRangeUnionEnt *), lion_range_union_cmp);
 	return ents;
+}
+
+
+/* ---------------------------------------------------------------------
+ * The OVERFLOW of a windowed collection (lion_union_collect())
+ * --------------------------------------------------------------------- */
+
+/*
+ * One part of a window's overflow, and once the window is over a window
+ * waiting to be made of it: the containers of keys in [lo, end) that came to
+ * the window at or past its hi, each behind its size, in the order they came
+ * - a key may be there many times, a set's piece of it or the union of
+ * several a window gave back - in a tape of the collection's tape set.  max
+ * is the highest key written, valid once `any` says one was.
+ */
+typedef struct LionUnionPart
+{
+	LogicalTape *tape;
+	uint64		lo;
+	uint64		end;
+	uint64		max;
+	bool		any;
+} LionUnionPart;
+
+/*
+ * Where a windowed collection sends what its windows do not keep, and the
+ * windows still to be made of it.
+ *
+ * A window's overflow starts at its first eviction, at the key it cut at
+ * (cut0): the keys from there to the window's end are split into fanout
+ * parts of equal width - the last one open, for the first window, whose end
+ * is no key the walk knows of and which takes the highest key it has seen
+ * for it - and a key below cut0, which a later eviction gave back, goes to
+ * one part more, the LOW part, from the window's final hi to cut0.  When the
+ * window is over, its parts that hold anything wait on the stack in key
+ * order, the lowest on top: each becomes a window of its own, which reads
+ * the part in place of the walk, keeps what it can and splits the rest the
+ * same way, before the part above it is taken.  So the windows come off the
+ * stack in key order, and the set's file (sp) is written in key order, as a
+ * spill is.  Each container is written and read once for every window it is
+ * not kept by, and a window's parts are about 1/fanout of its keys each:
+ * what a union n times the memory costs is a walk of the source and about
+ * log n / log fanout passes over its containers, where a window used to
+ * walk the source again for its keys.
+ *
+ * The tapes, their buffers, and the stack live in cxt, whatever context the
+ * walk that fills them is in; what a window's parts hold in memory while it
+ * is made is a block of buffer each, which comes out of its union's memory
+ * (LION_UNION_SPILL_BLOCKS).
+ */
+typedef struct LionUnionSpill
+{
+	MemoryContext cxt;
+	LogicalTapeSet *lts;
+	int			fanout;
+	LionContainer *buf;			/* LION_CONTAINER_MAX_SIZE: a container read */
+
+	/* the window being made: its end, and its overflow's parts */
+	uint64		end;
+	bool		spilling;		/* a window has evicted: the blocks are held */
+	bool		begun;			/* this one has: cut0 and parts are set */
+	uint64		cut0;
+	uint64		width;
+	LionUnionPart *parts;		/* [0] the low part, [1 .. fanout] the rest */
+
+	/* the windows to make: parts, the next on top */
+	LionUnionPart *stack;
+	int			nstack;
+	int			stackcap;
+} LionUnionSpill;
+
+/* No upper bound on the container keys of a window. */
+#define LION_CKEY_END				((uint64) PG_UINT32_MAX + 1)
+
+/* A window's memory, less the blocks a spilling one holds beside it. */
+static Size
+lion_union_window_mem(LionUnionSpill *s, Size maxbytes)
+{
+	Size		blocks = LION_UNION_SPILL_BLOCKS(s->fanout) * BLCKSZ;
+
+	return Max(maxbytes - Min(maxbytes, blocks), (Size) LION_RANGE_WINDOW_MIN);
+}
+
+/*
+ * The window's first eviction, at cut: its overflow's parts - and, the
+ * first time the collection spills, the tapes, and the union's memory made
+ * smaller by the blocks they hold (above).  A later eviction finds them set.
+ */
+static void
+lion_union_overflow_begin(LionRangeUnion *u, uint64 cut)
+{
+	LionUnionSpill *s = u->spill;
+	uint64		end;
+	int			i;
+
+	if (s == NULL)
+		elog(ERROR, "lion index: a collected union without an overflow evicted");
+	if (s->begun)
+	{
+		if (cut >= s->cut0)
+			elog(ERROR, "lion index: a window cut at %llu past its first cut at %llu",
+				 (unsigned long long) cut, (unsigned long long) s->cut0);
+		return;
+	}
+
+	/* the first window ends past the highest key it saw: its last part open */
+	end = (s->end == LION_CKEY_END) ? u->maxseen + 1 : s->end;
+	if (cut >= end || cut < u->lo)
+		elog(ERROR, "lion index: a window of [%llu, %llu) cut at %llu",
+			 (unsigned long long) u->lo, (unsigned long long) end,
+			 (unsigned long long) cut);
+	if (!s->spilling)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(s->cxt);
+
+		s->lts = LogicalTapeSetCreate(false, NULL, -1);
+		MemoryContextSwitchTo(oldcxt);
+		s->spilling = true;
+		u->maxbytes = lion_union_window_mem(s, u->maxbytes);
+	}
+	s->begun = true;
+	s->cut0 = cut;
+	s->width = Max((end - cut + s->fanout - 1) / s->fanout, 1);
+	memset(s->parts, 0, sizeof(LionUnionPart) * (s->fanout + 1));
+	s->parts[0].end = cut;
+	for (i = 1; i <= s->fanout; i++)
+	{
+		s->parts[i].lo = Min(cut + (uint64) (i - 1) * s->width, s->end);
+		s->parts[i].end = (i == s->fanout) ? s->end :
+			Min(cut + (uint64) i * s->width, s->end);
+	}
+}
+
+/* A container of a key at or past the window's hi, to its part. */
+static void
+lion_union_overflow(LionRangeUnion *u, const LionContainer *c)
+{
+	LionUnionSpill *s = u->spill;
+	uint64		ckey = c->ckey;
+	LionUnionPart *p;
+	MemoryContext oldcxt;
+	uint32		size;
+
+	if (s == NULL || !s->begun || ckey < u->hi)
+		elog(ERROR, "lion index: container key %llu to the overflow of a window ending at %llu",
+			 (unsigned long long) ckey, (unsigned long long) u->hi);
+	if (ckey < s->cut0)
+		p = &s->parts[0];
+	else
+		p = &s->parts[1 + Min((ckey - s->cut0) / s->width,
+							  (uint64) s->fanout - 1)];
+	Assert(ckey >= p->lo && ckey < p->end);
+
+	size = (uint32) lion_container_size(c);
+	if (size < LION_CONTAINER_HDRSZ || size > LION_CONTAINER_MAX_SIZE)
+		elog(ERROR, "lion index: a container of %u bytes to the overflow of a collected union",
+			 size);
+	oldcxt = MemoryContextSwitchTo(s->cxt);
+	if (p->tape == NULL)
+		p->tape = LogicalTapeCreate(s->lts);
+	LogicalTapeWrite(p->tape, &size, sizeof(size));
+	LogicalTapeWrite(p->tape, c, size);
+	MemoryContextSwitchTo(oldcxt);
+	p->max = p->any ? Max(p->max, ckey) : ckey;
+	p->any = true;
+}
+
+/*
+ * The window is over, its keys in [lo, hi) written: the parts of its
+ * overflow that hold anything to the stack, the highest first, so that the
+ * lowest is the next window.  The low part starts at the window's final hi.
+ * Each part's write buffer is given back as its tape is rewound.
+ */
+static void
+lion_union_overflow_end(LionRangeUnion *u)
+{
+	LionUnionSpill *s = u->spill;
+	MemoryContext oldcxt;
+	int			i;
+
+	if (s == NULL || !s->begun)
+		return;
+	oldcxt = MemoryContextSwitchTo(s->cxt);
+	s->parts[0].lo = u->hi;
+	for (i = s->fanout; i >= 0; i--)
+	{
+		LionUnionPart *p = &s->parts[i];
+
+		if (!p->any)
+			continue;
+		if (p->max < p->lo || p->max >= p->end)
+			elog(ERROR, "lion index: a part of [%llu, %llu) of an overflow holds key %llu",
+				 (unsigned long long) p->lo, (unsigned long long) p->end,
+				 (unsigned long long) p->max);
+		LogicalTapeRewindForRead(p->tape, BLCKSZ);
+		if (s->nstack == s->stackcap)
+		{
+			s->stackcap = Max(16, s->stackcap * 2);
+			s->stack = (s->stack != NULL) ?
+				(LionUnionPart *) repalloc(s->stack,
+										   sizeof(LionUnionPart) * s->stackcap) :
+				(LionUnionPart *) palloc(sizeof(LionUnionPart) * s->stackcap);
+		}
+		s->stack[s->nstack++] = *p;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	s->begun = false;
+}
+
+/*
+ * The next container of a part into s->buf, or false at its end.  What is
+ * read is checked before anything uses it: a size a container can have, read
+ * whole, a kind of container whose header says that size, and a key in the
+ * part's range.
+ */
+static bool
+lion_union_part_read(LionUnionSpill *s, const LionUnionPart *p)
+{
+	uint32		size;
+	size_t		got = LogicalTapeRead(p->tape, &size, sizeof(size));
+
+	if (got == 0)
+		return false;
+	if (got != sizeof(size) ||
+		size < LION_CONTAINER_HDRSZ || size > LION_CONTAINER_MAX_SIZE ||
+		LogicalTapeRead(p->tape, s->buf, size) != size ||
+		!lion_container_type_valid(s->buf->type) ||
+		lion_container_size(s->buf) != size ||
+		(uint64) s->buf->ckey < p->lo || (uint64) s->buf->ckey > p->max)
+		elog(ERROR, "lion index: the overflow of a collected union is damaged");
+	return true;
 }
 
 /*
@@ -504,13 +758,13 @@ lion_range_union_sorted(LionRangeUnion *u, long *n)
  * the keys from where the last one ended; when its memory - maxbytes, and
  * never below LION_RANGE_WINDOW_MIN - runs out it gives back the upper half
  * of its keys and ends where they began (lion_range_union_evict()); at the
- * end of the walk its containers go to the file in key order, and the next
- * window reads the range again from its end.  Every window is a walk of the
- * range, so a union n times the memory costs about 2n walks; each is read
- * after the snapshot like the first, and the windows are disjoint ranges of
- * TIDs, so the file holds each row once.
- * The set reads the file a container at a time; what it keeps in memory is
- * sixteen bytes a container key.
+ * end of its input its containers go to the file in key order.  What it
+ * gave back, and every container past its end that came after, went to its
+ * overflow, which the windows after it read in place of the walk, a part of
+ * its keys each (LionUnionSpill): the range is walked once.  Its walk is read
+ * after the snapshot as before, and the windows are disjoint ranges of TIDs,
+ * so the file holds each row once.  The set reads the file a container at a
+ * time; what it keeps in memory is sixteen bytes a container key.
  */
 bool
 lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
@@ -521,7 +775,7 @@ lion_range_collect(Relation index, AttrNumber attno, LionRange *range,
 							   held, spilled, nsets, nsummaries);
 }
 
-/* The ranges a collection walks, and what its first window read. */
+/* The ranges a collection walks, and what the walk read. */
 typedef struct LionRangesWalk
 {
 	LionRange **ranges;
@@ -532,25 +786,23 @@ typedef struct LionRangesWalk
 
 static void
 lion_ranges_walk(Relation index, AttrNumber attno, LionRangeUnion *u,
-				 void *arg, bool first)
+				 void *arg)
 {
 	LionRangesWalk *w = (LionRangesWalk *) arg;
 	int			r;
 
-	/* the first window's walks are the ones that say what the ranges read */
 	for (r = 0; r < w->nranges && !u->failed; r++)
-		lion_range_union_walk(index, attno, w->ranges[r], u,
-							  first ? w->nsets : NULL,
-							  first ? w->nsummaries : NULL);
+		lion_range_union_walk(index, attno, w->ranges[r], u, w->nsets,
+							  w->nsummaries);
 }
 
 /*
  * The same for the UNION of several ranges of one column - the ranges of
  * `col < ANY (array)` on a column that cannot order the elements, one an
- * element (DESIGN.md §28) - as one set, in maxbytes all told: every window is
- * a walk of each range into the one union, so the ranges share the window's
- * memory and a spill's one file.  (A set collected for each range, each in
- * maxbytes, was an array's worth of window memories, 2026-10-18 review.)
+ * element (DESIGN.md §28) - as one set, in maxbytes all told: the walk is a
+ * walk of each range into the one union, so the ranges share its memory and
+ * a spill's one file.  (A set collected for each range, each in maxbytes,
+ * was an array's worth of memories, 2026-10-18 review.)
  */
 bool
 lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
@@ -571,16 +823,84 @@ lion_ranges_collect(Relation index, AttrNumber attno, LionRange **ranges,
 }
 
 /*
+ * One window's union, empty: in a context of its own, keeping keys from lo
+ * to end.  Anything over a kilobyte - a BITSET, a long ARRAY - is a block of
+ * its own there, allocated at its size and given back to malloc when freed
+ * (ALLOCSET_SMALL_SIZES put the chunk limit at 1 kB), so the union takes
+ * about what its containers are.
+ */
+static void
+lion_union_window_begin(LionRangeUnion *u, LionUnionSpill *s, Size maxbytes,
+						uint64 lo, uint64 end)
+{
+	HASHCTL		ctl;
+
+	memset(u, 0, sizeof(LionRangeUnion));
+	u->cxt = AllocSetContextCreate(CurrentMemoryContext, "lion union collect",
+								   ALLOCSET_SMALL_SIZES);
+	if (s == NULL)
+		u->maxbytes = maxbytes;
+	else if (s->spilling)
+		u->maxbytes = lion_union_window_mem(s, maxbytes);
+	else
+		u->maxbytes = Max(maxbytes, (Size) LION_RANGE_WINDOW_MIN);
+	u->window = (s != NULL);
+	u->lo = lo;
+	u->hi = end;
+	u->maxseen = lo;
+	u->spill = s;
+	if (s != NULL)
+	{
+		s->end = end;
+		s->begun = false;
+	}
+	u->tmp = (LionContainer *) MemoryContextAlloc(u->cxt,
+												  LION_CONTAINER_MAX_SIZE);
+	u->img = (uint64 *) MemoryContextAlloc(u->cxt, LION_BITSET_BYTES);
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(uint32);
+	ctl.entrysize = sizeof(LionRangeUnionEnt);
+	ctl.hcxt = u->cxt;
+	u->byckey = hash_create("lion range union", 256, &ctl,
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+}
+
+/*
+ * A window over: its containers, in key order, to the set's file, and the
+ * window's union given back.  Returns the members written.
+ */
+static uint64
+lion_union_window_write(LionRangeUnion *u, LionSpill *sp)
+{
+	LionRangeUnionEnt **ents;
+	uint64		members = 0;
+	long		n;
+	long		i;
+
+	lion_range_union_finish(u);
+	ents = lion_range_union_sorted(u, &n);
+	for (i = 0; i < n; i++)
+	{
+		lion_spill_add(sp, ents[i]->c);
+		members += lion_container_cardinality(ents[i]->c);
+	}
+	pfree(ents);
+	MemoryContextDelete(u->cxt);
+	return members;
+}
+
+/*
  * The union of every set a walk hands it, of one key column of index, as one
  * set: what lion_range_collect() builds of a range, built of whatever sets
- * walk(index, attno, u, arg, first) gives lion_union_add() - a range's, or
- * an IN list's too long to locate at once, a batch of its values at a time
- * (lion_locate_list()).  The walk is made once a window, first for the first
- * one, and must hand out the same sets each time, each set's pin its own to
+ * walk(index, attno, u, arg) gives lion_union_add() - a range's, or an IN
+ * list's too long to locate at once, a batch of its values at a time
+ * (lion_locate_list()).  The walk is made once, each set's pin its own to
  * drop once the set is added; the union is in memory within maxbytes, or
- * fails, or past it - where spill allows - a window of container keys at a
- * time into a temporary file, as above.  The sets of one walk may overlap: a
- * union takes a container key's members once whatever brought them.
+ * fails, or past it - where spill allows - is collected a window of container
+ * keys at a time into a temporary file, the first window made of the walk
+ * and the others of its overflow, as above.  The sets of one walk may
+ * overlap: a union takes a container key's members once whatever brought
+ * them.
  */
 bool
 lion_union_collect(Relation index, AttrNumber attno, LionUnionWalk walk,
@@ -588,14 +908,11 @@ lion_union_collect(Relation index, AttrNumber attno, LionUnionWalk walk,
 				   Size *held, bool *spilled)
 {
 	LionRangeUnion u;
+	LionUnionSpill s;
 	LionSpill	sp;
-	HASHCTL		ctl;
 	LionRangeUnionEnt **ents;
 	LionMatSet *mat;
-	MemoryContext cxt;
-	uint64		lo = 0;
 	uint64		members = 0;
-	bool		windowed = false;
 	long		n;
 	long		i;
 
@@ -610,116 +927,112 @@ lion_union_collect(Relation index, AttrNumber attno, LionUnionWalk walk,
 	*held = 0;
 	*spilled = false;
 	memset(&sp, 0, sizeof(sp));
+	memset(&s, 0, sizeof(s));
 
-	/* the catalogs a spill's file needs, looked up before the walk starts */
+	/*
+	 * The catalogs a spill's files need, looked up before the walk starts;
+	 * the tapes they will be in.  As many parts to a window's overflow as
+	 * its memory has blocks to spare for, a sixteenth of them.
+	 */
 	if (spill)
+	{
 		PrepareTempTablespaces();
+		s.cxt = AllocSetContextCreate(CurrentMemoryContext, "lion union overflow",
+									  ALLOCSET_DEFAULT_SIZES);
+		s.fanout = LION_UNION_FANOUT(maxbytes);
+		s.buf = (LionContainer *) MemoryContextAlloc(s.cxt,
+													 LION_CONTAINER_MAX_SIZE);
+		s.parts = (LionUnionPart *)
+			MemoryContextAllocZero(s.cxt,
+								   sizeof(LionUnionPart) * (s.fanout + 1));
+	}
 
-	for (;;)
+	/* the first window, made of the walk */
+	lion_union_window_begin(&u, spill ? &s : NULL, maxbytes, 0, LION_CKEY_END);
+	walk(index, attno, &u, arg);
+
+	if (u.failed)
+	{
+		Assert(!spill);
+		MemoryContextDelete(u.cxt);
+		return false;
+	}
+
+	if (u.hi == LION_CKEY_END)
 	{
 		/*
-		 * One window, in a context of its own.  Anything over a kilobyte - a
-		 * BITSET, a long ARRAY - is a block of its own there, allocated at
-		 * its size and given back to malloc when freed (ALLOCSET_SMALL_SIZES
-		 * put the chunk limit at 1 kB), so the union takes about what its
-		 * containers are.
+		 * All of it, in memory: the containers stay where they are, and the
+		 * union's context - with nothing else left in it - is the set's.
 		 */
-		cxt = AllocSetContextCreate(CurrentMemoryContext, "lion union collect",
-									ALLOCSET_SMALL_SIZES);
-		memset(&u, 0, sizeof(u));
-		u.cxt = cxt;
-		u.maxbytes = spill ? Max(maxbytes, (Size) LION_RANGE_WINDOW_MIN) :
-			maxbytes;
-		u.window = spill;
-		u.lo = lo;
-		u.hi = LION_CKEY_END;
-		u.tmp = (LionContainer *) MemoryContextAlloc(cxt,
-													 LION_CONTAINER_MAX_SIZE);
-		u.img = (uint64 *) MemoryContextAlloc(cxt, LION_BITSET_BYTES);
-		memset(&ctl, 0, sizeof(ctl));
-		ctl.keysize = sizeof(uint32);
-		ctl.entrysize = sizeof(LionRangeUnionEnt);
-		ctl.hcxt = cxt;
-		u.byckey = hash_create("lion range union", 256, &ctl,
-							   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
-
-		walk(index, attno, &u, arg, !windowed);
-
-		if (u.failed)
-		{
-			Assert(!windowed);
-			MemoryContextDelete(cxt);
-			return false;
-		}
-
+		Assert(!spill || !s.begun);
+		if (spill)
+			MemoryContextDelete(s.cxt);
 		lion_range_union_finish(&u);
 		ents = lion_range_union_sorted(&u, &n);
-
-		if (!windowed && u.hi == LION_CKEY_END)
+		if (n == 0)
 		{
-			/*
-			 * All of it, in memory: the containers stay where they are, and
-			 * cxt - with nothing else left in it - is the set's.
-			 */
-			if (n == 0)
-			{
-				pfree(ents);
-				MemoryContextDelete(cxt);
-				return true;	/* the range selects nothing: not found */
-			}
-			mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
-			mat->ncontainers = (int) n;
-			mat->containers = (LionContainer **)
-				palloc(sizeof(LionContainer *) * n);
-			for (i = 0; i < n; i++)
-			{
-				mat->containers[i] = ents[i]->c;
-				mat->bytes += ents[i]->size;
-				members += lion_container_cardinality(ents[i]->c);
-			}
 			pfree(ents);
-			pfree(u.tmp);
-			pfree(u.img);
-			if (u.widened != NULL)
-				pfree(u.widened);
-			hash_destroy(u.byckey);
-			mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
-				MemoryContextMemAllocated(cxt, true);
-			mat->unioncxt = cxt;
-
-			out->found = true;
-			out->mat = mat;
-			out->ntids = members;
-			out->ncontainers = (uint32) n;
-			*held = mat->held;
-			return true;
+			MemoryContextDelete(u.cxt);
+			return true;		/* the walk selects nothing: not found */
 		}
-
-		/* A window of more: its containers, in key order, to the file. */
-		if (!windowed)
-		{
-			lion_spill_begin(&sp, CurrentMemoryContext);
-			windowed = true;
-		}
+		mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
+		mat->ncontainers = (int) n;
+		mat->containers = (LionContainer **)
+			palloc(sizeof(LionContainer *) * n);
 		for (i = 0; i < n; i++)
 		{
-			lion_spill_add(&sp, ents[i]->c);
+			mat->containers[i] = ents[i]->c;
+			mat->bytes += ents[i]->size;
 			members += lion_container_cardinality(ents[i]->c);
 		}
 		pfree(ents);
-		MemoryContextDelete(cxt);
+		pfree(u.tmp);
+		pfree(u.img);
+		if (u.widened != NULL)
+			pfree(u.widened);
+		hash_destroy(u.byckey);
+		mat->held = sizeof(LionMatSet) + sizeof(LionContainer *) * n +
+			MemoryContextMemAllocated(u.cxt, true);
+		mat->unioncxt = u.cxt;
 
-		if (u.hi == LION_CKEY_END)
-			break;
-		Assert(u.hi > lo);
-		lo = u.hi;
+		out->found = true;
+		out->mat = mat;
+		out->ntids = members;
+		out->ncontainers = (uint32) n;
+		*held = mat->held;
+		return true;
 	}
+
+	/*
+	 * Windows: the first one's keys to the file, and then a window of each
+	 * part of an overflow, the lowest first, until none is left.
+	 */
+	lion_spill_begin(&sp, CurrentMemoryContext);
+	lion_union_overflow_end(&u);
+	members += lion_union_window_write(&u, &sp);
+	while (s.nstack > 0)
+	{
+		LionUnionPart p = s.stack[--s.nstack];
+
+		MemoryContext oldcxt;
+
+		lion_union_window_begin(&u, &s, maxbytes, p.lo, p.max + 1);
+		oldcxt = MemoryContextSwitchTo(s.cxt);	/* the tape's read buffer */
+		while (lion_union_part_read(&s, &p))
+		{
+			(void) lion_range_union_cb(s.buf, &u);
+			CHECK_FOR_INTERRUPTS();
+		}
+		LogicalTapeClose(p.tape);
+		MemoryContextSwitchTo(oldcxt);
+		lion_union_overflow_end(&u);
+		members += lion_union_window_write(&u, &sp);
+	}
+	LogicalTapeSetClose(s.lts);
+	MemoryContextDelete(s.cxt);
 
 	if (sp.nents == 0)
-	{
-		lion_spill_abandon(&sp);
-		return true;			/* the range selects nothing: not found */
-	}
+		elog(ERROR, "lion index: the windows of a collected union hold nothing");
 	mat = lion_spill_finish(&sp);
 	out->found = true;
 	out->mat = mat;

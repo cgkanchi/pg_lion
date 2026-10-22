@@ -851,10 +851,11 @@ lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * left takes that memory back: they go to files of their own
  * (lion_rangesrc_evict()), and it is collected in what that frees - in
  * memory, or in windows of nearly all of it.  Left to what they left, it
- * would be walked once a window of whatever crumbs remained, and a range
- * that filled the memory to its last few kilobytes would make the next one
- * cost a walk for every few kilobytes of it; written out, they cost a write
- * and a read of each container a count seeks.
+ * would be collected in windows of whatever crumbs remained -
+ * LION_RANGE_WINDOW_MIN each, what each does not keep split two ways - and a
+ * range that filled the memory to its last few kilobytes would make the next
+ * one cost a pass over its containers for every halving of it; written out,
+ * they cost a write and a read of each container a count seeks.
  *
  * Unless the plan says to walk it (`walkable`, LION_FLAG_RANGEWALK and
  * LION_CLAUSE_WALK): where there are few counts the planner may have found
@@ -934,7 +935,7 @@ typedef struct LionListWalk
 
 static void
 lion_list_walk(Relation index, AttrNumber attno, struct LionRangeUnion *u,
-			   void *arg, bool first)
+			   void *arg)
 {
 	LionListWalk *w = (LionListWalk *) arg;
 	ArrayIterator it = NULL;
@@ -1024,7 +1025,9 @@ lion_list_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * union of its values' sets, collected as a range taken as a source is
  * (lion_collect_within()) - within what is left of the hash table's memory
  * the relation's collected sources share, and past it a window of container
- * keys at a time into a temporary file, every window a pass over the values.
+ * keys at a time into a temporary file: the first window a pass over the
+ * values, and each of the others a read of its part of what the windows
+ * before it did not keep.
  * The values are located lion_array_batch_size() at a time, each batch's sets
  * ORed into the union and released before the next is located, so what the
  * list holds besides its union is a batch of sets and the values themselves:
