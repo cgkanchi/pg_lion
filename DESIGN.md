@@ -6241,8 +6241,18 @@ participant of a parallel plan), and extracted per relation counted:
   is added to the row filter, which then tests the rows the OTHER sources select;
 - and when there is no other source that selects rows - a plain count whose only positive clause
   was an ALL query - the relation is read by a sequential scan under the count's snapshot, and the
-  filter and the `IS NOT NULL` clauses are tested on each row (`lion_count_heap_filtered()`): the
-  ordinary plan's work, which is what the cost model charges a value it cannot estimate.
+  filter and the negated clauses are tested on each row (`lion_count_heap_filtered()`): the
+  ordinary plan's work, which is what the cost model charges a value it cannot estimate.  The
+  negated clauses are those of a heap column - `IS NOT NULL`, `<>`, `IS DISTINCT FROM`, which a
+  NULL column passes and an equality's true fails, `NOT` of a multi-key query, which a NULL column
+  fails as the query's NULL does, and §35's reserved tests (`lion_filter_with_negated()`,
+  `LionRowFilterClause`'s `negate` and `nullpass`).  A filtered count's run and a partition's count
+  come to it the same way, and a decoded walk (§34) reads every row with the same filter.  The scan
+  makes one count and reads no index expression, so beside such a query the count takes no negated
+  clause on an expression column (§41) and no OR with a complement arm (§35, "Complements in an
+  OR"), which is two counts, wherever it may come to the scan: with no clause positive whatever its
+  value beside the query, and no walk that finds each count's rows by itself - a GROUP BY's but the
+  decoded walk, a count(DISTINCT)'s (`lion_where_scan_untested()`).
 
 **The row filter** (`LionRowFilter`, lion_count.c).  The node builds one per relation it counts - each
 clause `col op value` with the clause's operator and this scan's value, the column numbered as the
@@ -6356,7 +6366,12 @@ HAVING, a folded GROUP BY and count(DISTINCT); the OR that is declined; custom p
 expressions, and one cached generic plan executed as its setting moves through exact, every row and
 widened; an exec Param under LATERAL; the cost model's choices; a partitioned table whose partitions
 number the column differently; the FK-side join's inner, semi, anti and count(DISTINCT) forms, and
-in parallel plans; and a dirty heap before and after VACUUM.
+in parallel plans; a dirty heap before and after VACUUM; and literal prefixes too common to expand,
+one that expands and a jsonpath beside each negated clause of a heap column, of an expression
+column and a complement OR, alone and beside a clause positive whatever its value, grouped by one
+column, two (the nested loop, where a lexeme takes the decoded walk) and three, by cells, in
+count(DISTINCT), in the FK-side join, in a filtered count and beside a residual clause, serially and
+in parallel, and the same beside a parameter's query.
 
 ### Literal queries through the superset (2026-10-07)
 
@@ -6761,7 +6776,10 @@ scan, index scan, count pushdown), never in the planner, so new lexemes are alwa
   So a literal query with a prefix may narrow nothing at run time, as a parameter's may: the count
   pushdown does not take it for a clause positive whatever its value (`plainpositive`), which a
   parallel GROUP BY or count by cells collects by range and a filtered count's decoded walk begins
-  from (§10).
+  from (§10).  Nor, with no such clause beside it and no walk driving each count, does it take a
+  negated clause on an expression column or an OR with a complement arm beside it, which the heap
+  scan of a WHERE that narrows nothing does not test ("A query known only at run time" above,
+  `prefixmulti`).
 - **Planner.**  Costing and the count pushdown's mode choice see the query with its prefix flags
   cleared (`lion_tsquery_strip_prefixes()`), the closest stand-in for an expansion they cannot
   do.  A prefix under an OR of clauses in the count pushdown is refused: that path has no
@@ -6911,16 +6929,17 @@ does (§45, `lion_partial_anchor_kind()`): its entries hold the predicate's rows
 `count(col)` reads the column as NOT NULL beside a RESERVED clause without the NULL entry and a
 NOTRESERVED one with it.  Beside a multi-key query known only at run time ("A query known only at
 run time" above), which may narrow nothing and leave the rows to the row filter, the row filter
-tests a NOTRESERVED mask with the NULL entry on each row the snapshot sees - the array not NULL,
-and in none of the empty entries named, which `lion_array_empty_flag()` reads off its dimensions
-(`lion_filter_with_negated()`, `LionRowFilterClause.reserved`); a NOTRESERVED clause that NULLs
-pass is declined there, as `IS DISTINCT FROM` is.  Two copies of one NOTRESERVED clause -
-`array_length(a, 1) IS NOT NULL AND array_length(a, 1) >= 0` - are counted once.  EXPLAIN prints
-the classes in one spelling whatever the query's (`lion_explain_reserved()`): `a = '{}'`, `a <>
-'{}'`, `a IS DISTINCT FROM '{}'`, `cardinality(a) = 0`, `coalesce(cardinality(a), 0) = 0`,
-`cardinality(a) > 0`, `cardinality(a) IS DISTINCT FROM 0`, `array_length(a, 1) IS NULL`,
-`array_length(a, 1) = 0`, `array_length(a, 1) > 0`, `coalesce(array_length(a, 1), 0) = 0` and
-`array_length(a, 1) IS DISTINCT FROM 0` - the twelve sets of classes one clause can select.
+tests a NOTRESERVED mask on each row the snapshot sees - the array in none of the empty entries
+named, which `lion_array_empty_flag()` reads off its dimensions, and with the NULL entry among them
+not NULL; without it a NULL array passes, as it passes `IS DISTINCT FROM`
+(`lion_filter_with_negated()`, `LionRowFilterClause.reserved` and `nullpass`).  Two copies of one
+NOTRESERVED clause - `array_length(a, 1) IS NOT NULL AND array_length(a, 1) >= 0` - are counted
+once.  EXPLAIN prints the classes in one spelling whatever the query's (`lion_explain_reserved()`):
+`a = '{}'`, `a <> '{}'`, `a IS DISTINCT FROM '{}'`, `cardinality(a) = 0`,
+`coalesce(cardinality(a), 0) = 0`, `cardinality(a) > 0`, `cardinality(a) IS DISTINCT FROM 0`,
+`array_length(a, 1) IS NULL`, `array_length(a, 1) = 0`, `array_length(a, 1) > 0`,
+`coalesce(array_length(a, 1), 0) = 0` and `array_length(a, 1) IS DISTINCT FROM 0` - the twelve sets
+of classes one clause can select.
 
 **The estimates** (`lion_nonempty_rel_clauses()`, §29.11 "The relation's rows").  Core estimates
 each spelling as a function of the column, with no statistics of it: a null test at 0.995 or 0.005,
@@ -21555,12 +21574,15 @@ leaf is no selecting clause of a partition's bounds (`lion_leaf_drops()`). At mo
 (`LION_MAX_COMPL_ORS`): each doubles the counts in the worst case. The cap is asked before the OR
 is noted anywhere, so a fourth is a restriction no posting set answers like any other - residual,
 or left out where every partition's bounds imply it - and leaves nothing behind in `ors` that would
-make the clauses after it its arms. A complement OR, an `IS DISTINCT
-FROM` or a `NOT` beside a multi-key query whose value is known only at run time is declined: that
-query may narrow nothing and leave the heap scan of `lion_count_scan_filtered()` as the count, and
-that scan tests none of them. So is an `IS NOT NULL` or `<>` on an expression column (§41): the scan
-tests those on a heap column only (`lion_filter_with_negated()`, which refuses any other). A complement in a filtered count's condition (§10, "Filtered counts")
-is counted by that filter's run alone, which carries the OR among its items, and answers to the same
+make the clauses after it its arms. A complement OR beside a multi-key query that may narrow
+nothing - one whose value is known only at run time, a literal tsquery with a prefix or a jsonpath
+(§17, "Prefix lexemes"; §43.2) - is declined where that query may leave the heap scan of
+`lion_count_scan_filtered()` as the count, which is one count: with no clause positive whatever its
+value beside it, and no walk of a GROUP BY (but the decoded walk, §34) or a count(DISTINCT) to find
+each count's rows. So is a negated clause on an expression column (§41): the scan tests the negated
+clauses of a heap column alone (`lion_filter_with_negated()`, `lion_where_scan_untested()`). A
+complement in a filtered count's condition (§10, "Filtered counts") is counted by that filter's run
+alone, which carries the OR among its items, and answers to the same
 terms, checked again once the filters are analysed (`lion_count_path_filters()`).
 
 The price (`lion_cost_count_rel()`) is the sum of the two counts': the WHERE with the complement ORs
@@ -27315,8 +27337,9 @@ not come from one of P's sets:
   counted;
 - the count of every row (§14, §35) or a complement (§35, "Complements in an OR") taken from a
   whole index;
-- a multi-key query known only at run time (§17), which may turn out to narrow nothing, and a
-  count with nothing that narrows is the heap scan of `lion_count_scan_filtered()`: every row.
+- a multi-key query known only at run time (§17), or a literal one with a prefix too common to
+  expand, which may turn out to narrow nothing, and a count with nothing that narrows is the heap
+  scan of `lion_count_scan_filtered()`: every row.
 
 So the rule, checked per relation counted - the table, or each leaf partition with its own
 partial index - and per RUN of the count (the WHERE's, run 0, and each filtered count's, §10

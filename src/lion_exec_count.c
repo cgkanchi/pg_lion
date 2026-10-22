@@ -16,6 +16,7 @@
 #include "lion_customscan.h"
 
 #include "access/visibilitymap.h"
+#include "parser/parse_coerce.h"
 #include "pgstat.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
@@ -48,17 +49,16 @@ lion_where_has_positive(LionCountScanState *st)
  * The row filter of a WHERE with nothing to take its candidates from: every
  * WHERE clause that selects rows was a multi-key query no key narrows, so the
  * candidates are every row the count reads, and st->filter - those queries -
- * is extended with the `IS NOT NULL` and `<>` clauses, and the tests of
- * §17 that leave out the NULL arrays and some empty ones (`col <> '{}'`,
- * `cardinality(col) > 0`), which there is no positive source to subtract
- * from, to be tested on each row the snapshot sees.  In the current memory
- * context.
+ * is extended with the negated clauses, which there is no positive source to
+ * subtract from, to be tested on each row the snapshot sees: `IS NOT NULL`,
+ * `<>`, the tests of §17 that leave out some empty arrays (`col <> '{}'`,
+ * `cardinality(col) > 0`) and the NULL ones or not, `IS DISTINCT FROM` and
+ * `NOT (multi-key)` (§35).  In the current memory context.
  *
- * Those are the only negated clauses it tests, and only on a heap column:
- * the planner takes no `IS DISTINCT FROM`, `NOT (multi-key)` or negated
- * clause on an expression column (§41) beside a query known only at run
- * time (lion_count_path_strategy()), and any other clause here is refused
- * rather than tested as something it is not.
+ * Only on a heap column: the planner takes no negated clause on an
+ * expression column (§41) beside a multi-key query that may narrow nothing
+ * (lion_where_scan_untested()), and any other clause here is refused rather
+ * than tested as something it is not.
  */
 static LionRowFilter *
 lion_filter_with_negated(LionCountScanState *st)
@@ -80,7 +80,9 @@ lion_filter_with_negated(LionCountScanState *st)
 		if (st->item[k].orno >= 0 || !LION_CLAUSE_IS_NEGATED(cl->kind))
 			continue;
 		if (cl->kind != LION_CLAUSE_NOTNULL && cl->kind != LION_CLAUSE_NE &&
-			cl->kind != LION_CLAUSE_NOTRESERVED)
+			cl->kind != LION_CLAUSE_NOTRESERVED &&
+			cl->kind != LION_CLAUSE_DISTINCT &&
+			cl->kind != LION_CLAUSE_NOTMULTI)
 			elog(ERROR, "LionCount: a negated clause of kind %d on index \"%s\" tested on a row",
 				 (int) cl->kind, RelationGetRelationName(cl->idx));
 		if (cl->idxcol < 1 || cl->idxcol > cl->idx->rd_index->indnatts)
@@ -93,31 +95,70 @@ lion_filter_with_negated(LionCountScanState *st)
 		if (c->attno < 1 || c->attno > natts)
 			elog(ERROR, "LionCount: an expression column of index \"%s\" tested on a row",
 				 RelationGetRelationName(cl->idx));
-		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL);
+		c->notnull = (cl->kind == LION_CLAUSE_NOTNULL ||
+					  (cl->kind == LION_CLAUSE_DISTINCT && cl->valisnull));
+		c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
+		c->value = cl->val;
 		if (cl->kind == LION_CLAUSE_NOTRESERVED)
 		{
 			/*
 			 * Every row outside the reserved entries the mask names
-			 * (DESIGN.md §17, "Non-empty arrays"): an array, which a NULL
-			 * fails, in none of the others, as its dimensions say.  The
-			 * planner takes no mask without the NULL entry beside a query
-			 * known only at run time.
+			 * (DESIGN.md §17, "Non-empty arrays"): an array in none of the
+			 * others, as its dimensions say, and a NULL one as the mask says.
 			 */
 			if (cl->valisnull ||
 				!LION_RESERVED_MASK_OK(DatumGetInt32(cl->val)) ||
-				(DatumGetInt32(cl->val) & LION_ENTRY_NULLKEY) == 0 ||
+				(DatumGetInt32(cl->val) & ~LION_ENTRY_NULLKEY) == 0 ||
 				!OidIsValid(get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
 																	   c->attno - 1)->atttypid))))
 				elog(ERROR, "LionCount: reserved entries of index \"%s\" tested on a row",
 					 RelationGetRelationName(cl->idx));
 			c->reserved = (uint16) (DatumGetInt32(cl->val) & ~LION_ENTRY_NULLKEY);
+			c->nullpass = (DatumGetInt32(cl->val) & LION_ENTRY_NULLKEY) == 0;
 		}
-		else if (!c->notnull)
+		else if (cl->kind == LION_CLAUSE_NE)
 		{
 			/* `col <> c` (DESIGN.md §35): its own operator, column on the left */
-			c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
-			c->value = cl->val;
 			fmgr_info(get_opcode(cl->opno), &c->flinfo);
+		}
+		else if (cl->kind == LION_CLAUSE_DISTINCT && !c->notnull)
+		{
+			/*
+			 * `col IS DISTINCT FROM c`: true of a NULL column, and of any
+			 * other where its equality is false.  Either side may hold the
+			 * column, so an equality across two types whose left one the
+			 * column is not, nor binary-coercible to, is commuted to take it
+			 * on the left.
+			 */
+			Oid			opno = cl->opno;
+			Oid			lefttype;
+			Oid			righttype;
+
+			op_input_types(opno, &lefttype, &righttype);
+			if (lefttype != righttype &&
+				!IsBinaryCoercible(TupleDescAttr(RelationGetDescr(st->heap),
+												 c->attno - 1)->atttypid,
+								   lefttype))
+				opno = get_commutator(opno);
+			if (!OidIsValid(opno))
+				elog(ERROR, "LionCount: no commutator of operator %u", cl->opno);
+			c->negate = true;
+			c->nullpass = true;
+			lion_row_filter_call(st->heap, c, opno, cl->valtype,
+								 CurrentMemoryContext);
+		}
+		else if (cl->kind == LION_CLAUSE_NOTMULTI)
+		{
+			/*
+			 * `NOT (col @> q)`: NULL, never true, of a NULL column.  The
+			 * planner took a literal query (lion_locate_leaf()).
+			 */
+			if (cl->valisnull)
+				elog(ERROR, "LionCount: a NULL query of index \"%s\" tested on a row",
+					 RelationGetRelationName(cl->idx));
+			c->negate = true;
+			lion_row_filter_call(st->heap, c, cl->opno, cl->valtype,
+								 CurrentMemoryContext);
 		}
 	}
 	return scan;

@@ -554,6 +554,183 @@ RESET min_parallel_index_scan_size;
 RESET parallel_leader_participation;
 SET max_parallel_workers_per_gather = 0;
 
+-- ---- 10. a literal the run may find too common to expand ------------------
+/*
+ * A tsquery's prefix is expanded at run time into the index's lexemes that
+ * have it, up to 1,000 of them, and past that is every row (DESIGN.md §17,
+ * "Prefix lexemes"); a jsonpath's keys are all prefixes (§43).  So such a
+ * literal may narrow nothing, as a parameter may, and leave a WHERE with no
+ * other source to the heap scan, which tests every negated clause of a heap
+ * column - `IS DISTINCT FROM` and `NOT` of a multi-key query among them, as
+ * it does beside a parameter - but none on an index expression, and makes
+ * no second count for an OR with a complement arm: beside those two the
+ * count is declined, unless a clause positive whatever its value is in the
+ * WHERE too, or a walk drives every count and finds its rows by itself.
+ * 'p:*' is 1,500 lexemes and '$.u' 1,500 values, which no run expands, and
+ * 'q:*' five, which every run does.
+ */
+CREATE TABLE lion_mk_x (id int NOT NULL, k int NOT NULL, g int NOT NULL, n int,
+						tags int[], w tsvector NOT NULL, d jsonb NOT NULL);
+INSERT INTO lion_mk_x
+SELECT i, h % 9, (h / 9) % 4, CASE WHEN h % 7 = 3 THEN NULL ELSE (h / 3) % 5 END,
+	   CASE WHEN h % 13 = 0 THEN NULL WHEN h % 13 = 1 THEN '{}' ELSE ARRAY[(h / 7) % 20] END,
+	   to_tsvector('simple', CASE WHEN h % 7 < 4 THEN '' ELSE 'p' || (h % 1500) END ||
+					' q' || ((h / 11) % 5)),
+	   CASE WHEN h % 7 < 4 THEN '{}' ELSE jsonb_build_object('u', h % 1500) END
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 12000) i) s;
+CREATE INDEX lion_mk_x_k ON lion_mk_x USING lion (k);
+CREATE INDEX lion_mk_x_g ON lion_mk_x USING lion (g);
+CREATE INDEX lion_mk_x_n ON lion_mk_x USING lion (n);
+CREATE INDEX lion_mk_x_ne ON lion_mk_x USING lion ((n + 0));
+CREATE INDEX lion_mk_x_tags ON lion_mk_x USING lion (tags);
+CREATE INDEX lion_mk_x_w ON lion_mk_x USING lion (w) WITH (store_positions = false);
+CREATE INDEX lion_mk_x_d ON lion_mk_x USING lion (d jsonb_contains_ops);
+VACUUM (FREEZE, ANALYZE) lion_mk_x;
+CREATE TEMP TABLE lion_mk_xq (m text, c text);
+INSERT INTO lion_mk_xq VALUES
+	('w @@ ''p:*''', 'k IS DISTINCT FROM 3'), ('w @@ ''p:*''', 'NOT (tags && ''{3}'')'),
+	('w @@ ''p:*''', '(n + 0) <> 2'), ('w @@ ''p:*''', '(n + 0) IS NOT NULL'),
+	('w @@ ''p:*''', '(k = 1 OR n <> 2)'), ('w @@ ''p:*''', 'tags IS DISTINCT FROM ''{}'''),
+	('w @@ ''q:*''', 'k IS DISTINCT FROM 3'), ('w @@ ''q:*''', '(n + 0) <> 2'),
+	('d @? ''$.u''', 'k IS DISTINCT FROM 3'), ('d @? ''$.u''', 'NOT (tags && ''{3}'')'),
+	('d @? ''$.u''', '(n + 0) IS NOT NULL'), ('d @? ''$.u''', '(k = 1 OR n <> 2)'),
+	('d @? ''$.u''', 'tags <> ''{}''');
+-- alone: counted beside the negated clauses of a heap column, grouped or not,
+-- by cells and in the FK-side join; declined beside an index expression's and
+-- a complement OR, and a filter's query beside them
+SELECT m, c, lion_mk(format('SELECT count(*) FROM lion_mk_x WHERE %s AND %s', m, c))
+  FROM lion_mk_xq;
+SELECT m, lion_mk(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND k IS DISTINCT FROM 3 GROUP BY g', m)) AS grouped,
+	   lion_mk(format('SELECT (k IN (1, 2)) AS x, (g = 1) AS y, count(*) FROM lion_mk_x WHERE %s AND NOT (tags && ''{3}'') GROUP BY 1, 2', m)) AS cells,
+	   lion_mk(format('SELECT d.attr, count(*) FROM lion_mk_x f JOIN lion_mk_d d ON f.k = d.pk WHERE f.%s AND f.k IS DISTINCT FROM 3 GROUP BY d.attr', m)) AS fkjoin,
+	   lion_mk(format('SELECT count(*) FILTER (WHERE %s) AS m, count(*) AS n FROM lion_mk_x WHERE (n + 0) <> 2', m)) AS filtered
+  FROM (VALUES ('w @@ ''p:*'''), ('d @? ''$.u''')) v(m);
+-- ... and beside all of them where a walk drives every count: a GROUP BY of
+-- one column or two, filtered or not, and a count(DISTINCT); not the decoded
+-- walk of three, which reads the WHERE whole
+SELECT m, c, lion_mk(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND %s GROUP BY g', m, c)) AS grouped,
+	   lion_mk(format('SELECT g, k, count(*) FROM lion_mk_x WHERE %s AND %s GROUP BY g, k', m, c)) AS two
+  FROM lion_mk_xq WHERE c LIKE '(%';
+SELECT m, c, lion_mk(format('SELECT g, count(*) FILTER (WHERE k = 1) AS m, count(*) AS n FROM lion_mk_x WHERE %s AND %s GROUP BY g', m, c)) AS filtered,
+	   lion_mk(format('SELECT count(DISTINCT k) FROM lion_mk_x WHERE %s AND %s', m, c)) AS "distinct",
+	   lion_mk(format('SELECT g, k, n, count(*) FROM lion_mk_x WHERE %s AND %s GROUP BY g, k, n', m, c)) AS three
+  FROM lion_mk_xq WHERE c LIKE '(%';
+-- ... beside `IS NOT NULL` and `<>`, and a residual clause, which the heap
+-- scan tests too
+SELECT m, lion_mk(format('SELECT count(*) FROM lion_mk_x WHERE %s AND n <> 2 AND k IS NOT NULL', m)) AS negated,
+	   lion_mk(format('SELECT count(*) FROM lion_mk_x WHERE %s AND id %% 3 = 0', m)) AS residual
+  FROM (VALUES ('w @@ ''p:*'''), ('w @@ ''q:*'''), ('d @? ''$.u''')) v(m);
+-- ... beside `IS DISTINCT FROM` a parameter, NULL too, and with the column
+-- on either side of an equality of two types; and a parameter's query beside
+-- the same, one too common to expand and one that is not
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ ''p:*'' AND k IS DISTINCT FROM $1', '3');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ ''p:*'' AND n IS DISTINCT FROM $1', 'NULL');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ ''p:*'' AND 3::bigint IS DISTINCT FROM k');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ ''p:*'' AND k IS DISTINCT FROM 3::bigint');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ $1 AND k IS DISTINCT FROM 3 AND NOT (tags && ''{3}'')', '''p:*''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ $1 AND k IS DISTINCT FROM 3 AND NOT (tags && ''{3}'')', '''p1''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ $1 AND (n + 0) <> 2', '''p:*''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ $1 AND (n + 0) <> 2 AND g IN (0, 1, 3)', '''p:*''');
+SELECT lion_mk('SELECT count(*) FROM lion_mk_x WHERE w @@ $1 AND (k = 1 OR n <> 2) AND g IN (0, 1, 3)', '''p:*''');
+SELECT lion_mk('SELECT g, count(*) FROM lion_mk_x WHERE w @@ $1 AND (n + 0) <> 2 GROUP BY g', '''p:*''');
+SELECT lion_mk('SELECT g, count(*) FROM lion_mk_x WHERE w @@ $1 AND (k = 1 OR n <> 2) GROUP BY g', '''p:*''');
+SELECT lion_mk('SELECT count(DISTINCT k) FROM lion_mk_x WHERE w @@ $1 AND (n + 0) IS NOT NULL', '''p:*''');
+-- beside a clause positive whatever its value: counted, serially and in parallel
+SELECT m, c, lion_mk(format('SELECT count(*) FROM lion_mk_x WHERE %s AND %s AND g IN (0, 1, 3)', m, c))
+  FROM lion_mk_xq;
+SELECT m, lion_mk(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND (n + 0) <> 2 AND g IN (0, 1, 3) GROUP BY g', m)) AS grouped,
+	   lion_mk(format('SELECT (k IN (1, 2)) AS x, (n = 1) AS y, count(*) FROM lion_mk_x WHERE %s AND (k = 1 OR n <> 2) AND g IN (0, 1, 3) GROUP BY 1, 2', m)) AS cells,
+	   lion_mk(format('SELECT d.attr, count(*) FROM lion_mk_x f JOIN lion_mk_d d ON f.k = d.pk WHERE f.%s AND (f.n + 0) <> 2 AND f.g IN (0, 1, 3) GROUP BY d.attr', m)) AS fkjoin,
+	   lion_mk(format('SELECT count(*) FILTER (WHERE %s) AS m, count(*) AS n FROM lion_mk_x WHERE (n + 0) <> 2 AND g IN (0, 1, 3)', m)) AS filtered
+  FROM (VALUES ('w @@ ''p:*'''), ('d @? ''$.u''')) v(m);
+-- a GROUP BY of two columns that the decoded walk (§34) counts beside a
+-- lexeme: beside a prefix too common to expand and an index expression's
+-- `<>`, the nested loop of §20 instead
+CREATE TABLE lion_mk_y (a int NOT NULL, b int NOT NULL, n int, w tsvector NOT NULL);
+INSERT INTO lion_mk_y
+SELECT i % 60, (i / 60) % 60, CASE WHEN i % 11 = 0 THEN NULL ELSE i % 5 END,
+	   to_tsvector('simple', 'p' || (i % 1500) || ' q' || (i % 5))
+  FROM generate_series(1, 12000) i;
+CREATE INDEX lion_mk_y_a ON lion_mk_y USING lion (a);
+CREATE INDEX lion_mk_y_b ON lion_mk_y USING lion (b);
+CREATE INDEX lion_mk_y_ne ON lion_mk_y USING lion ((n + 0));
+CREATE INDEX lion_mk_y_w ON lion_mk_y USING lion (w) WITH (store_positions = false);
+VACUUM (FREEZE, ANALYZE) lion_mk_y;
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) SELECT a, b, count(*) FROM lion_mk_y WHERE w @@ 'q1' AND (n + 0) <> 2 GROUP BY a, b;
+EXPLAIN (COSTS OFF) SELECT a, b, count(*) FROM lion_mk_y WHERE w @@ 'p:*' AND (n + 0) <> 2 GROUP BY a, b;
+COMMIT;
+SELECT lion_mk('SELECT a, b, count(*) FROM lion_mk_y WHERE w @@ ''q1'' AND (n + 0) <> 2 GROUP BY a, b');
+SELECT lion_mk('SELECT a, b, count(*) FROM lion_mk_y WHERE w @@ ''p:*'' AND (n + 0) <> 2 GROUP BY a, b');
+SELECT lion_mk('SELECT a, b, count(*) FROM lion_mk_y WHERE w @@ $1 AND (n + 0) <> 2 GROUP BY a, b', '''p:*''');
+DROP TABLE lion_mk_y;
+/*
+ * lion_mk_lit() is lion_mk() in parallel: the plan with every other scan
+ * and join method disabled and parallel plans free, which says how the
+ * node ran, against the pushdown off and sequential scans only.
+ */
+CREATE FUNCTION lion_mk_lit(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed';
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+	PERFORM set_config('parallel_setup_cost', '0', true);
+	PERFORM set_config('parallel_tuple_cost', '0', true);
+	PERFORM set_config('min_parallel_table_scan_size', '0', true);
+	PERFORM set_config('min_parallel_index_scan_size', '0', true);
+	PERFORM set_config('pg_lion.parallel_range_keys', '1', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Parallel Custom Scan (LionCount)%' THEN
+			how := 'parallel';
+		ELSIF ln LIKE '%Custom Scan (LionCount)%' AND how <> 'parallel' THEN
+			how := 'serial';
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE lion_mk_r_on AS ' || q;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE 'CREATE TEMP TABLE lion_mk_r_off AS ' || q;
+	EXECUTE 'SELECT count(*) FROM lion_mk_r_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_mk_r_on EXCEPT ALL SELECT * FROM lion_mk_r_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_mk_r_off EXCEPT ALL SELECT * FROM lion_mk_r_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_mk_r_on, lion_mk_r_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows', how, nrows);
+END $$;
+SELECT m, c, lion_mk_lit(format('SELECT count(*) FROM lion_mk_x WHERE %s AND %s', m, c)) AS alone,
+	   lion_mk_lit(format('SELECT count(*) FROM lion_mk_x WHERE %s AND %s AND g IN (0, 1, 3)', m, c)) AS beside
+  FROM lion_mk_xq;
+SELECT m, lion_mk_lit(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND k IS DISTINCT FROM 3 GROUP BY g', m)) AS grouped,
+	   lion_mk_lit(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND (n + 0) <> 2 GROUP BY g', m)) AS grouped_expr,
+	   lion_mk_lit(format('SELECT (k IN (1, 2)) AS x, (n = 1) AS y, count(*) FROM lion_mk_x WHERE %s AND NOT (tags && ''{3}'') GROUP BY 1, 2', m)) AS cells,
+	   lion_mk_lit(format('SELECT d.attr, count(*) FROM lion_mk_x f JOIN lion_mk_d d ON f.k = d.pk WHERE f.%s AND f.k IS DISTINCT FROM 3 GROUP BY d.attr', m)) AS fkjoin
+  FROM (VALUES ('w @@ ''p:*'''), ('d @? ''$.u''')) v(m);
+SELECT m, lion_mk_lit(format('SELECT g, count(*) FROM lion_mk_x WHERE %s AND (n + 0) <> 2 AND g IN (0, 1, 3) GROUP BY g', m)) AS grouped,
+	   lion_mk_lit(format('SELECT (k IN (1, 2)) AS x, (n = 1) AS y, count(*) FROM lion_mk_x WHERE %s AND (k = 1 OR n <> 2) AND g IN (0, 1, 3) GROUP BY 1, 2', m)) AS cells,
+	   lion_mk_lit(format('SELECT d.attr, count(*) FROM lion_mk_x f JOIN lion_mk_d d ON f.k = d.pk WHERE f.%s AND (f.n + 0) <> 2 AND f.g IN (0, 1, 3) GROUP BY d.attr', m)) AS fkjoin
+  FROM (VALUES ('w @@ ''p:*'''), ('d @? ''$.u''')) v(m);
+DROP TABLE lion_mk_x, lion_mk_xq;
+DROP FUNCTION lion_mk_lit(text);
+
 DROP TABLE lion_mk_t, lion_mk_d, lion_mk_pd, lion_mk_pf;
 DROP FUNCTION lion_mk(text, text, text), lion_mk_pick(text),
 	lion_mk_par(text, text);
