@@ -1324,7 +1324,11 @@ past a split (`lion_postree_fetch()`) - and compared with what `lion_extract_val
 positions cannot move under the check: they were written before its TID (W1), and only VACUUM takes
 them out. One member and one chunk are kept, for the whole scan, so the comparison adds nothing to
 the scan's memory that grows with the index. The TIDs alone would pass a row whose stored positions
-are not its own, which a phrase query decides from alone (verify.sql's eighteenth case).
+are not its own, which a phrase query decides from alone (verify.sql's eighteenth case). A row its
+key holds without any positions the structural check reports first, and no writer leaves one behind
+it, so the scan meets one only in an index damaged between the two passes, which is how
+`test/isolation/verify_nopos.spec` makes it meet one: parked at `lion-verify-heap-scan`, the check
+has the index's buffers evicted and a position leaf damaged in the file under it.
 
 **What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
 nothing and reports what it finds at once, as before - the arguments above rest on how writers hold

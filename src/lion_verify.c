@@ -3357,7 +3357,18 @@ lion_index_verify(PG_FUNCTION_ARGS)
 		 (long long) vs.seqacct.spilled);
 
 	if (heapallindexed)
+	{
+		/*
+		 * Test hook: the structure is checked, the heap scan has not begun,
+		 * and nothing is held.  test/isolation/verify_nopos.spec parks here
+		 * and damages a position tree in the relation file behind the check,
+		 * so that the scan meets a row its key holds without positions: the
+		 * structural check reports such a row itself, and nothing a writer
+		 * does can leave one between the two (DESIGN.md §17, W1 and V1).
+		 */
+		LION_INJECTION_POINT("lion-verify-heap-scan");
 		lion_verify_heapallindexed(&vs);
+	}
 
 	MemoryContextDelete(vs.setcxt);
 	lion_verify_seq_free(&vs.setvisits);
