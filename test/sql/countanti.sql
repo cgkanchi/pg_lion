@@ -332,6 +332,31 @@ DROP INDEX lca_rows_ky;
 CREATE INDEX lca_rows_yk ON lca_rows (y, k);
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 DROP INDEX lca_rows_yk;
+-- one that names the key's column twice: a join clause is the scan key of
+-- the first of the two only, and stays one join clause
+CREATE INDEX lca_rows_kk ON lca_rows (k, k);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b <> r.g)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+-- ... planned with nothing disabled, and with the pushdown off
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+RESET pg_lion.enable_count_pushdown;
+-- ... and twice before a column of another key, which the search then
+-- stops short of: its clause is tested on the rows found
+DROP INDEX lca_rows_kk;
+CREATE INDEX lca_rows_kky ON lca_rows (k, k, y);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+DROP INDEX lca_rows_kky;
 CREATE INDEX lca_rows_k ON lca_rows (k);
 ANALYZE lca_rows;
 

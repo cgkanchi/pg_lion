@@ -76,8 +76,12 @@ lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop,
 /*
  * The scan keys idx can be looked up by: for each key column from the first,
  * every key of the anti join that is one of that column's, as long as each
- * column has one - a B-tree is searched by a prefix of its columns.  Fills
- * *out's keys and returns how many columns they cover.
+ * column has one - a B-tree is searched by a prefix of its columns.  A key is
+ * the scan key of the first column it is one of, and of no other: of a B-tree
+ * that names t's column twice, the second's would be the same equality on
+ * the same value, and narrow nothing.  So each scan key is a join clause of
+ * its own (lion_anti_join_clauses()).  Fills *out's keys and returns how many
+ * columns they cover.
  */
 static int
 lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
@@ -97,8 +101,14 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 			LionAntiKey *key = (LionAntiKey *) lfirst(lc);
 			Oid			op;
 			Oid			sortop;
+			int			k;
 
-			if (out->nkey >= LION_MAX_ANTI_KEYS ||
+			for (k = 0; k < out->nkey; k++)
+			{
+				if (out->keyclause[k] == key->clause)
+					break;
+			}
+			if (k < out->nkey || out->nkey >= LION_MAX_ANTI_KEYS ||
 				!lion_anti_key_of(idx, c, key, &op, &sortop))
 				continue;
 			out->keycol[out->nkey] = (AttrNumber) (c + 1);

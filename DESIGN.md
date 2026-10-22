@@ -14245,7 +14245,12 @@ column at least. A key is a scan key of index column c when the column is the ke
 operator - commuted when t's column is its right operand - is the equality of c's operator family
 with c's opclass type on the left, and its collation is the index's (or the index has none). The
 scan keys cover a prefix of the columns, each with every key that is one of its; the B-tree that
-covers the most columns is taken, and of those the smallest. None, and the query is core's.
+covers the most columns is taken, and of those the smallest. None, and the query is core's. A key is
+the scan key of the first column it is one of, and of no other: of a B-tree that names t's column
+twice, the second's would be the same equality on the same value and narrow nothing. So each scan
+key is a join clause of its own, and the join clauses the node tests lead with each once
+(`lion_anti_join_clauses()`); the prefix searched by ends before the second, unless another key is
+one of its, and a key of a column after it is a join clause tested on the rows found.
 
 **One lookup a key.** The keys are sorted by the `<` of their B-tree column's operator family for
 two values of the key's type (strategy 1 of the family for the operator's right type on both sides;
@@ -15099,7 +15104,9 @@ cross-type key, numeric keys equal in other spellings (one key, looked up once);
 side that is a join; residual clauses beside the count's; `count(1)`, `count` of a key declared NOT
 NULL and of a nullable one, `count(DISTINCT)` of the primary key; GROUP BY of one and two columns, a
 group that drops to nothing and one the planner folded, HAVING; a two-column B-tree with the key
-first, by one scan key and by two, and one whose first column is no key's (declined); a dirty heap -
+first, by one scan key and by two, and one whose first column is no key's (declined); B-trees that
+name the key's column twice, alone and before a column of another key, with nothing disabled and
+with the pushdown off; a dirty heap -
 deletes, updates of the key, of the WHERE's column and of a column no index has, new rows, the inner
 side updated - before and after VACUUM and inside the transaction that made it; generic plans with
 Params in the WHERE, in the inner side's filter and in a key's inner expression; a correlated

@@ -419,9 +419,10 @@ lion_begin_anti(LionCountScanState *st, CustomScanState *node,
 	as->restrictqual = ExecInitQual(as->restrictexprs, &node->ss.ps);
 
 	/*
-	 * The join clauses but the scan keys' own, which come first: those are
-	 * true of every row their lookup finds, a B-tree's equality being exact.
-	 * With none the inner rows are not kept, only their keys.
+	 * The join clauses but the scan keys' own, which come first, one to a
+	 * scan key (lion_anti_join_clauses()): those are true of every row their
+	 * lookup finds, a B-tree's equality being exact.  With none the inner
+	 * rows are not kept, only their keys.
 	 */
 	if (a->njoin > a->nkey)
 		as->joinqual = ExecInitQual(list_copy_tail(as->joinexprs, a->nkey),
