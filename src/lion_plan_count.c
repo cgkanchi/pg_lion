@@ -3673,6 +3673,24 @@ lion_count_path_fill(LionCountPathBuild *cx)
 }
 
 /*
+ * The `<` a GROUP BY column's groups go up in when the anti join's losses
+ * pass hash_mem (lion_anti_groups_next()): the type's own, of its default
+ * btree opclass, where that class's equality is the grouping's - the order
+ * the path's pathkeys claim (lion_count_path_make()) - or else one of any
+ * btree family the grouping's equality is in.  InvalidOid for none.
+ */
+static Oid
+lion_anti_group_order(Oid typid, Oid eqop)
+{
+	TypeCacheEntry *tc = lookup_type_cache(typid, TYPECACHE_LT_OPR |
+										   TYPECACHE_EQ_OPR);
+
+	if (OidIsValid(tc->lt_opr) && tc->eq_opr == eqop)
+		return tc->lt_opr;
+	return get_ordering_op_for_equality_op(eqop, false);
+}
+
+/*
  * THE ANTI JOIN OVER A SMALL INNER SIDE (DESIGN.md §27): the count planned so
  * far is the outer table's, of its WHERE; the query's is that count less the
  * rows some row of the inner side matches, which the node finds by looking
@@ -3688,8 +3706,8 @@ lion_count_path_fill(LionCountPathBuild *cx)
  * count(DISTINCT) walked, the aggregates over keys, a top k, filtered counts,
  * a coalesce group or expression columns (whose expressions setrefs.c could
  * take for the join clauses' own), and grouping columns it can hash under
- * their equalities.  The decoded walk a count by cells drives by groups
- * nothing: its rows are the cells'.
+ * their equalities and sort by a `<` of their families.  The decoded walk a
+ * count by cells drives by groups nothing: its rows are the cells'.
  *
  * Every row a key finds is tested on each of the table's restrictions - and
  * the clauses the count adds to its WHERE (the `col IS NOT NULL` of a
@@ -3710,6 +3728,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	List	   *keyexprs = NIL;
 	List	   *rowexprs = NIL;
 	int			ngroup = cx->cells ? 0 : cx->ngroup;
+	Oid			groupsort[2] = {InvalidOid, InvalidOid};
 	int			g;
 	int			k;
 
@@ -3732,6 +3751,10 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		if (!get_op_hash_functions(cx->groupeqop[g], &lhash, &rhash) ||
 			!OidIsValid(lhash))
 			return false;
+		groupsort[g] = lion_anti_group_order(exprType((Node *) cx->groupvar[g]),
+											 cx->groupeqop[g]);
+		if (!OidIsValid(groupsort[g]))
+			return false;
 	}
 
 	restrictions = list_concat_copy(cx->input_rel->baserestrictinfo,
@@ -3748,7 +3771,6 @@ lion_count_path_anti(LionCountPathBuild *cx)
 
 	p->hasanti = true;
 	memset(a, 0, sizeof(LionCountPrivAnti));
-	a->flags = cx->antiplan.tids ? LION_ANTIFLAG_TIDS : 0;
 	a->idxoid = cx->antiplan.idx->indexoid;
 	a->nkey = cx->antiplan.nkey;
 	for (k = 0; k < a->nkey; k++)
@@ -3756,6 +3778,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		a->keycol[k] = cx->antiplan.keycol[k];
 		a->keyop[k] = cx->antiplan.keyop[k];
 		a->keycoll[k] = cx->antiplan.keycoll[k];
+		a->keysort[k] = cx->antiplan.keysort[k];
 		keyexprs = lappend(keyexprs, cx->antiplan.keyexpr[k]);
 	}
 	a->njoin = list_length(joinclauses);
@@ -3764,6 +3787,7 @@ lion_count_path_anti(LionCountPathBuild *cx)
 	{
 		a->groupeq[g] = cx->groupeqop[g];
 		a->groupcoll[g] = cx->groupcoll[g];
+		a->groupsort[g] = groupsort[g];
 	}
 	a->exprs = list_concat(list_concat(keyexprs, joinclauses), restrictions);
 	return true;
@@ -3850,7 +3874,13 @@ lion_count_path_make(LionCountPathBuild *cx)
 								 true, true, false,
 								 &sortop, &eqop, NULL, &hashable);
 
-		if (!groupdrive && OidIsValid(sortop))
+		/*
+		 * ... and beside the anti join over a small inner side, whose
+		 * groups past hash_mem go up in the order of its own `<`
+		 * (lion_anti_group_order()), only where that is this one.
+		 */
+		if (!groupdrive && OidIsValid(sortop) &&
+			(!cx->priv.hasanti || cx->priv.anti.groupsort[0] == sortop))
 		{
 			SortGroupClause *sgc;
 

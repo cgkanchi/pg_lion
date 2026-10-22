@@ -97,6 +97,12 @@ SELECT lion_hooktest_priv_decode('anti join of more expressions than a list hold
 ERROR:  LionCount: malformed ANTI member of custom_private
 SELECT lion_hooktest_priv_decode('inner column past the last attribute');
 ERROR:  LionCount: unknown target list kind 1610645504
+-- a scan key without the order its values are sorted by, and a GROUP BY
+-- column's equality without the order its groups go up in past hash_mem
+SELECT lion_hooktest_priv_decode('anti join of a key without its order');
+ERROR:  LionCount: malformed ANTI member of custom_private
+SELECT lion_hooktest_priv_decode('anti join of a grouping equality without its order');
+ERROR:  LionCount: malformed ANTI member of custom_private
 -- a count by cells beside the anti join over a small inner side, serial and
 -- parallel, which a planner makes; the same with a GROUP BY column's
 -- equality the cells have no use for, the anti join beside a decoded walk

@@ -36,11 +36,14 @@
  * B-tree idx?  The table's column has to be the index's key column c, and the
  * operator - turned round when the column is its right operand - an equality
  * of the column's operator family whose left type is the column's opclass
- * type, under the index's collation (or an index without one).  Fills the
- * operator the scan key is made of.
+ * type, under the index's collation (or an index without one); and the
+ * family has to order two values of the key's type, which the node sorts the
+ * keys by (lion_anti_collect()).  Fills the operator the scan key is made of,
+ * and that order's `<`.
  */
 static bool
-lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop)
+lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop,
+				 Oid *keysort)
 {
 	Oid			op = key->clause->opno;
 	int			strategy;
@@ -61,6 +64,10 @@ lion_anti_key_of(IndexOptInfo *idx, int c, const LionAntiKey *key, Oid *keyop)
 	if (lefttype != idx->opcintype[c])
 		return false;
 	if (OidIsValid(idxcoll) && idxcoll != key->clause->inputcollid)
+		return false;
+	*keysort = get_opfamily_member(idx->opfamily[c], righttype, righttype,
+								   BTLessStrategyNumber);
+	if (!OidIsValid(*keysort))
 		return false;
 	*keyop = op;
 	return true;
@@ -89,12 +96,14 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 		{
 			LionAntiKey *key = (LionAntiKey *) lfirst(lc);
 			Oid			op;
+			Oid			sortop;
 
 			if (out->nkey >= LION_MAX_ANTI_KEYS ||
-				!lion_anti_key_of(idx, c, key, &op))
+				!lion_anti_key_of(idx, c, key, &op, &sortop))
 				continue;
 			out->keycol[out->nkey] = (AttrNumber) (c + 1);
 			out->keyop[out->nkey] = op;
+			out->keysort[out->nkey] = sortop;
 			out->keycoll[out->nkey] = key->clause->inputcollid;
 			out->keyexpr[out->nkey] = key->innerexpr;
 			out->keyvar[out->nkey] = key->outervar;
@@ -107,45 +116,6 @@ lion_anti_index_keys(const LionSmallAnti *anti, IndexOptInfo *idx,
 		ncol++;
 	}
 	return ncol;
-}
-
-/*
- * May one row of the table be found by the lookups of two different keys?
- * Not when every scan key is a value of the column's opclass type compared by
- * that type's own equality - the B-tree's strategy 3 on it is the operator of
- * the type's default btree opclass - under which equal values are the same
- * bytes (lion_type_equalimage(), under the key's collation): keys the node
- * keeps apart by their bytes are then unequal, and a row equal to both would
- * make them equal.  Otherwise - a cross-type key, numeric's 1.0 and 1.00, a
- * nondeterministic collation, an opclass whose equality is coarser than the
- * type's - two keys may find one row, and the node keeps the rows matched by
- * TID, to subtract each once.  (lion_index_can_emit_value() asks a lion
- * index's strategy 1, which of a B-tree is `<`.)
- */
-static bool
-lion_anti_needs_tids(const LionAntiPlan *plan)
-{
-	int			k;
-
-	for (k = 0; k < plan->nkey; k++)
-	{
-		Oid			typid = plan->idx->opcintype[plan->keycol[k] - 1];
-		TypeCacheEntry *typentry;
-		Oid			typeeq;
-
-		if (exprType(plan->keyexpr[k]) != typid)
-			return true;
-		typentry = lookup_type_cache(typid, TYPECACHE_BTREE_OPFAMILY);
-		if (!OidIsValid(typentry->btree_opf) ||
-			typentry->btree_opintype != typid)
-			return true;
-		typeeq = get_opfamily_member(typentry->btree_opf, typid, typid,
-									 BTEqualStrategyNumber);
-		if (!OidIsValid(typeeq) || plan->keyop[k] != typeeq ||
-			!lion_type_equalimage(typid, plan->keycoll[k]))
-			return true;
-	}
-	return false;
 }
 
 /*
@@ -286,6 +256,37 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
 }
 
 /*
+ * The sort of the child's rows by key (lion_anti_collect()): what
+ * cost_sort() charges a sort of `rows` rows of `width` bytes within work_mem
+ * - a comparison of two keys for each that its quicksort, or its runs and
+ * their merge, make, and past work_mem the pages of the runs written and read
+ * back - as cost_tuplesort(), which costsize.c keeps to itself, has it.  Not
+ * enable_sort's, which is the Sort node's.
+ */
+static Cost
+lion_anti_sort_price(double rows, int width)
+{
+	double		tuples = Max(rows, 2.0);
+	double		bytes = tuples * (MAXALIGN(width) +
+								  MAXALIGN(SizeofHeapTupleHeader));
+	double		mem = (double) work_mem * 1024.0;
+	Cost		cost = 2.0 * cpu_operator_cost * tuples * log2(tuples);
+
+	if (bytes > mem)
+	{
+		double		npages = ceil(bytes / BLCKSZ);
+		double		nruns = bytes / mem;
+		double		mergeorder = tuplesort_merge_order((int64) mem);
+		double		logruns = (nruns > mergeorder) ?
+			ceil(log(nruns) / log(mergeorder)) : 1.0;
+
+		cost += 2.0 * npages * logruns *
+			(seq_page_cost * 0.75 + random_page_cost * 0.25);
+	}
+	return cost + cpu_operator_cost * tuples;
+}
+
+/*
  * The lookups' own price - every one a B-tree descent and the rows it finds,
  * each fetched from the heap and tested - priced as core prices an index scan
  * repeated once per outer row of a nested loop (cost_index() and
@@ -296,8 +297,8 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
  * for each row found, and the expressions it is evaluated on beside a count
  * by cells (`rowexprs`, the predicates) with a cpu_operator_cost each to find
  * its cell.  Beside them, what the node does with the child's rows: each
- * one's keys evaluated and hashed, each distinct one kept.  The child's own
- * price is the caller's.
+ * one's keys evaluated, and the rows sorted by them.  The child's own price
+ * is the caller's.
  *
  * `lookups` is the distinct keys of the child's rows, as estimate_num_groups()
  * makes them of the inner side's key expressions, and the rows of one lookup
@@ -339,6 +340,7 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	QualCost	qual;
 	QualCost	keyeval;
 	QualCost	roweval;
+	int			width;
 	ListCell   *lc;
 	int			k;
 
@@ -406,10 +408,6 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 				   root);
 	cost += qual.startup + fetched * (cpu_tuple_cost + qual.per_tuple);
 
-	/* ... kept once by TID, where two keys may find it */
-	if (plan->tids)
-		cost += fetched * cpu_operator_cost;
-
 	/* ... and its group found, to subtract it from, or its cell */
 	cost += fetched * ngroup * cpu_operator_cost;
 	if (rowexprs != NIL)
@@ -419,10 +417,19 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 			(roweval.per_tuple + list_length(rowexprs) * cpu_operator_cost);
 	}
 
-	/* the child's rows: their keys evaluated, hashed and kept once */
+	/*
+	 * the child's rows: their keys evaluated, and the rows sorted by them -
+	 * with the inner row where a join clause but the scan keys' reads it
+	 */
 	cost_qual_eval(&keyeval, innerkeys, root);
-	cost += keyeval.startup +
-		childrows * (keyeval.per_tuple + (plan->nkey + 1) * cpu_operator_cost);
+	width = 0;
+	for (k = 0; k < plan->nkey; k++)
+		width += get_typavgwidth(exprType(plan->keyexpr[k]),
+								 exprTypmod(plan->keyexpr[k]));
+	if (list_length(anti->clauses) > plan->nkey)
+		width += child->pathtarget->width;
+	cost += keyeval.startup + childrows * keyeval.per_tuple +
+		lion_anti_sort_price(childrows, width);
 
 	plan->lookups = lookups;
 	plan->fetched = fetched;
@@ -480,7 +487,6 @@ lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti, List *restriction
 	if (best.idx == NULL)
 		return false;
 
-	best.tids = lion_anti_needs_tids(&best);
 	lion_anti_price(root, anti, restrictions, ngroup, rowexprs, &best);
 	*out = best;
 	return true;

@@ -645,9 +645,18 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 
 	/* ---- GROUP BY: one row per non-empty group ---- */
 	{
-		bool		exhausted;
-		TupleTableSlot *slot = lion_next_group_any(st, &exhausted);
+		bool		exhausted = true;
+		TupleTableSlot *slot = NULL;
 
+		if (!lion_anti_draining(st))
+			slot = lion_next_group_any(st, &exhausted);
+
+		/*
+		 * ... and, last, the groups the anti join over a small inner side
+		 * held back, its losses past hash_mem (DESIGN.md §27)
+		 */
+		if (exhausted && st->anti != NULL)
+			slot = lion_anti_groups_next(st, &exhausted);
 		if (exhausted)
 			st->done = true;
 		return slot;
@@ -1241,6 +1250,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			shared->antilookups += st->anti->lookups;
 			shared->antifetched += st->anti->fetched;
 			shared->antisubtracted += st->anti->subtracted;
+			shared->antispilled |= st->anti->spilled;
 			for (i = 0; i < 2; i++)
 				INSTR_TIME_ADD(shared->antitime[i], st->anti->time[i]);
 		}
@@ -1280,6 +1290,7 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		st->anti->wlookups = shared->antilookups;
 		st->anti->wfetched = shared->antifetched;
 		st->anti->wsubtracted = shared->antisubtracted;
+		st->anti->wspilled = shared->antispilled;
 		for (i = 0; i < 2; i++)
 			st->anti->wtime[i] = shared->antitime[i];
 	}
