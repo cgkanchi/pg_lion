@@ -187,11 +187,11 @@ SELECT lion_rss_cost('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a 
 
 -- ---------- 2. a range too large to collect: spilled, or walked if cheaper ----------
 -- Many groups count against the one spilled copy, where walking the range
--- at every one of them would walk it 300 times; so do a few, each of whose
--- walks would cost about what the windows do; beside another clause the
--- WHERE is collected once, from the file, and the groups counted against
--- that.  Existence tests stop at their first row, and walking the range at
--- each is the cheaper: that is the planner's choice, priced.
+-- at every one of them would walk it 300 times; so do a few, the windows
+-- walking it once; beside another clause the WHERE is collected once, from
+-- the file, and the groups counted against that.  Existence tests stop at
+-- their first row, and walking the range at each is the cheaper: that is
+-- the planner's choice, priced.
 SELECT lion_rss('SELECT h, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY h');
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY g');
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 AND a < 20 GROUP BY g');
@@ -200,7 +200,12 @@ SELECT lion_rss('SELECT count(*) FROM lion_rss_t WHERE u >= 100 AND r BETWEEN 10
 SELECT lion_rss('SELECT g, h, count(*) FROM lion_rss_t WHERE r > 300000 GROUP BY g, h');
 -- Only the ranges the planner priced walked are: beside one, a range it sized
 -- to fit and whose union outgrows the memory all the same is collected in
--- windows, not walked at every set the walk of the first hands out.
+-- windows, not walked at every set the walk of the first hands out.  The
+-- existence tests of a count(DISTINCT) still walk the first; counted by
+-- groups, the two are both collected in windows, each walked once, and the
+-- WHERE once from their files: 11 ms, where walking the first at every
+-- group took 49.
+SELECT lion_rss('SELECT count(DISTINCT a) FROM lion_rss_t WHERE r < 524288 AND s < 65536');
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 AND s < 65536 GROUP BY g');
 
 -- ---------- 3. the ranges of a relation share the memory ----------
@@ -212,7 +217,8 @@ SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 AND s < 655
 -- second does not fit what it left - so the first goes to a file to make
 -- room, and the second is collected in what that freed.  That is a walk of
 -- each and the try of the second, where windows of what the first left
--- would have walked the second again for each.
+-- would have written and read the second's containers again for every
+-- halving of it.
 SELECT lion_rss_cost('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 AND s < 524288 GROUP BY g',
 					 'work_mem', '512kB') >
 	   lion_rss_cost('SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 AND s < 524288 GROUP BY g',
