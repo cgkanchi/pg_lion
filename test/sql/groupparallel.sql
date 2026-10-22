@@ -234,6 +234,39 @@ SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE g IN (1, 2, 3) AND a = 1 AND
 SELECT lgp_check('SELECT coalesce(g, 2), count(*) FROM lgp WHERE g IN (1, 2, 3) AND a = 1 AND b GROUP BY coalesce(g, 2)');
 SELECT lgp_check('SELECT g, count(*) FROM lgp GROUP BY g');
 SELECT lgp_check('SELECT g, count(*) FROM lgp WHERE a = 1 GROUP BY g');
+/*
+ * ... and a WHERE whose positive clauses are all literal prefixes, which the
+ * run expands into the index's lexemes that have them as far as it can: a
+ * prefix too common for that - 'p:*' of 1,500 lexemes, 'q:*' of 1,200 - is
+ * counted from every row and a recheck (DESIGN.md §17), which leaves a range
+ * nothing to collect.  So is a jsonpath, whose keys are all prefixes
+ * (§43): '$.u' of 1,500 values.  Beside a lexeme, a range collects that,
+ * and the prefix is rechecked; six rows in seven have a lexeme of p and a
+ * key u.
+ */
+CREATE TABLE lgp_w (id int NOT NULL, g int NOT NULL, w tsvector NOT NULL, d jsonb NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lgp_w
+SELECT i, (h / 11) % 30,
+	   to_tsvector('simple', CASE WHEN h % 7 = 0 THEN '' ELSE 'p' || (h % 1500) END ||
+					' q' || (h % 1200) || ' t' || (h % 6)),
+	   CASE WHEN h % 7 = 0 THEN '{}' ELSE jsonb_build_object('u', h % 1500) END
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 60000) i) r;
+CREATE INDEX lgp_w_g ON lgp_w USING lion (g);
+CREATE INDEX lgp_w_w ON lgp_w USING lion (w) WITH (store_positions = false);
+CREATE INDEX lgp_w_d ON lgp_w USING lion (d jsonb_contains_ops);
+VACUUM (FREEZE, ANALYZE) lgp_w;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT lgp_check($$SELECT g, count(*) FROM lgp_w WHERE w @@ 'p:*' AND w @@ 'q:*' GROUP BY g$$);
+SELECT lgp_check($$SELECT g, count(*) FROM lgp_w WHERE d @? '$.u' GROUP BY g$$);
+SELECT lgp_check($$SELECT g, count(*) FROM lgp_w WHERE w @@ 'p:*' AND w @@ 't1' GROUP BY g$$);
+SELECT lgp_check($$SELECT g, count(*) FROM lgp_w WHERE d @? '$.u' AND w @@ 't1' GROUP BY g$$);
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+DROP TABLE lgp_w;
 
 DROP TABLE lgp;
 DROP FUNCTION lgp_check(text);

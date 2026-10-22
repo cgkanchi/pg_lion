@@ -175,7 +175,7 @@ VACUUM (FREEZE, ANALYZE) lcc;
 -- greater of two parts and the lesser of two others, with a COALESCE; only
 -- for the rows r gates, NULL for the others.  The tier is a CASE over it.
 CREATE VIEW lcc_scored AS
-SELECT id, n, k, s, f, g,
+SELECT id, n, k, s, f, g, r,
 	   CASE WHEN r = 'r1' OR r = 'r3' OR r = 'r4' THEN
 			round((CASE WHEN k IN (1, 2, 3) THEN 30
 						WHEN k IN (4, 5) THEN 20
@@ -191,7 +191,7 @@ SELECT id, n, k, s, f, g,
 	   END AS score
   FROM lcc;
 CREATE VIEW lcc_tiered AS
-SELECT id, n, k, s, f, g, score,
+SELECT id, n, k, s, f, g, r, score,
 	   CASE WHEN score >= 70 THEN 'high'
 			WHEN score >= 40 THEN 'medium'
 			WHEN score IS NOT NULL THEN 'low'
@@ -395,6 +395,28 @@ SELECT lcc_check_exec('EXECUTE lcc_w(3)',
 SELECT lcc_check_exec('EXECUTE lcc_w(4)',
 	'SELECT count(*) FROM lcc_tiered WHERE n = 4 AND tier = ''medium''');
 DEALLOCATE lcc_w;
+/*
+ * An IN list of a Param on the column the cells walk - r, which gates the
+ * score - longer than the values a lookup takes at once
+ * (lion_array_batch_size(), 1,000 at this work_mem): a source of the WHERE
+ * like any other list, collected into one set, as it is in a decoded walk
+ * of r and s.
+ */
+SET work_mem = '64kB';
+PREPARE lcc_l(text[]) AS
+	SELECT tier, count(*) FROM lcc_tiered WHERE r = ANY ($1) GROUP BY tier;
+PREPARE lcc_d(text[]) AS
+	SELECT r, s, count(*) FROM lcc WHERE r = ANY ($1) GROUP BY r, s;
+SELECT * FROM lcc_plan('EXECUTE lcc_d(''{r1,r2}'')') AS p("QUERY PLAN");
+SELECT lcc_check_exec(format('EXECUTE lcc_l(%L)', a),
+		format('SELECT tier, count(*) FROM lcc_tiered WHERE r = ANY (%L::text[]) GROUP BY tier', a)) AS cells,
+	   lcc_check_exec(format('EXECUTE lcc_d(%L)', a),
+		format('SELECT r, s, count(*) FROM lcc WHERE r = ANY (%L::text[]) GROUP BY r, s', a)) AS decoded
+  FROM (SELECT (ARRAY['r1', 'r2'] || array_agg('x' || i ORDER BY i))::text AS a
+		  FROM generate_series(1, 1200) i) v;
+DEALLOCATE lcc_l;
+DEALLOCATE lcc_d;
+RESET work_mem;
 RESET plan_cache_mode;
 
 -- a rescan for each outer row, whose value is the WHERE's; and SERIALIZABLE
@@ -455,6 +477,77 @@ SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
 SET parallel_leader_participation = off;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE g GROUP BY tier');
 RESET parallel_leader_participation;
+/*
+ * The WHERE a range collects is every clause of it, an IN list on the
+ * column the cells walk - r here - as much as any other: short, of no value
+ * with rows, or a Param's longer than the values a lookup takes at once.
+ */
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_tiered WHERE r IN (''r1'', ''r2'') GROUP BY tier') AS p("QUERY PLAN");
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_tiered WHERE r IN (''r1'', ''r2'') GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered WHERE r IN (''r1'', ''r2'') AND g GROUP BY tier'),
+	('SELECT count(*) FROM lcc_tiered WHERE r IN (''r0'', ''r3'', ''r9'') AND tier = ''high'''),
+	('SELECT tier, count(*) FROM lcc_tiered WHERE r IN (''r8'', ''r9'') GROUP BY tier')
+) v(q);
+SET plan_cache_mode = force_generic_plan;
+PREPARE lcc_l(text[]) AS
+	SELECT tier, count(*) FROM lcc_tiered WHERE r = ANY ($1) GROUP BY tier;
+SELECT * FROM lcc_plan('EXECUTE lcc_l(''{r1,r2}'')') AS p("QUERY PLAN");
+SET work_mem = '64kB';
+SELECT lcc_check_exec(format('EXECUTE lcc_l(%L)', a),
+		format('SELECT tier, count(*) FROM lcc_tiered WHERE r = ANY (%L::text[]) GROUP BY tier', a))
+  FROM (SELECT (ARRAY['r1', 'r2'] || array_agg('x' || i ORDER BY i))::text AS a
+		  FROM generate_series(1, 1200) i) v;
+RESET work_mem;
+DEALLOCATE lcc_l;
+/*
+ * ... and a WHERE no range can be sure to collect stays serial: a range
+ * taken as a source (DESIGN.md §32), and a multi-key query that may narrow
+ * nothing, counted from every row and a recheck (§17) - a Param's, which
+ * '{}' is of every array, and a literal prefix the run finds too common to
+ * expand into the index's lexemes: 'p:*' of 1,500 below, against 'q:*' of
+ * five, and a jsonpath, whose keys are all prefixes (§43): '$.u' of 1,500
+ * values.  Beside a clause positive whatever its value, a range collects
+ * that.
+ */
+SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered WHERE n < 50 GROUP BY tier');
+PREPARE lcc_m(int[]) AS
+	SELECT (k IN (1, 2)) AS x, (s = 's2') AS y, count(*) FROM lcc WHERE tags @> $1 GROUP BY 1, 2;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SELECT * FROM lcc_plan('EXECUTE lcc_m(''{1}'')') AS p("QUERY PLAN");
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT lcc_check_exec(format('EXECUTE lcc_m(%L)', a),
+		format('SELECT (k IN (1, 2)) AS x, (s = ''s2'') AS y, count(*) FROM lcc WHERE tags @> %L GROUP BY 1, 2', a))
+  FROM (VALUES ('{}'), ('{1}')) v(a);
+DEALLOCATE lcc_m;
+RESET plan_cache_mode;
+CREATE TABLE lcc_lex (id int NOT NULL, k int NOT NULL, s text NOT NULL, w tsvector NOT NULL,
+					  d jsonb NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcc_lex
+SELECT i, (h / 3) % 7, 's' || ((h / 5) % 3),
+	   to_tsvector('simple', CASE WHEN h % 7 = 0 THEN '' ELSE 'p' || (h % 1500) END ||
+					' q' || ((h / 11) % 5)),
+	   CASE WHEN h % 7 = 0 THEN jsonb_build_object('v', h % 9)
+			ELSE jsonb_build_object('u', h % 1500, 'v', h % 9) END
+  FROM (SELECT i, abs(hashint4(i)) AS h FROM generate_series(1, 30000) i) v;
+CREATE INDEX lcc_lex_ks ON lcc_lex USING lion (k, s);
+CREATE INDEX lcc_lex_w ON lcc_lex USING lion (w) WITH (store_positions = false);
+CREATE INDEX lcc_lex_d ON lcc_lex USING lion (d jsonb_contains_ops);
+VACUUM (FREEZE, ANALYZE) lcc_lex;
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT (k IN (1, 2)) AS x, (s = ''s1'') AS y, count(*) FROM lcc_lex WHERE w @@ ''p:*''::tsquery GROUP BY 1, 2'),
+	('SELECT (k IN (1, 2)) AS x, (s = ''s1'') AS y, count(*) FROM lcc_lex WHERE w @@ ''q:*''::tsquery GROUP BY 1, 2'),
+	('SELECT (k IN (1, 2)) AS x, (s = ''s1'') AS y, count(*) FROM lcc_lex WHERE w @@ ''p:*''::tsquery AND w @@ ''q1''::tsquery GROUP BY 1, 2'),
+	('SELECT (k IN (1, 2)) AS x, (s = ''s1'') AS y, count(*) FROM lcc_lex WHERE d @? ''$.u'' GROUP BY 1, 2'),
+	('SELECT (k IN (1, 2)) AS x, (s = ''s1'') AS y, count(*) FROM lcc_lex WHERE d @? ''$.u'' AND w @@ ''q1''::tsquery GROUP BY 1, 2')
+) v(q);
+DROP TABLE lcc_lex;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
@@ -573,7 +666,10 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier'),
 	('SELECT (tags && ''{1,2}'') AS x, (tags IS NULL) AS y, count(*) FROM lcc c WHERE c.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2'),
-	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier')
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.g AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id AND s.b = t.id) GROUP BY tier'),
+	-- an IN list on r, the column the cells walk, in the WHERE beside it
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.r IN (''r1'', ''r2'') AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_tiered t WHERE t.r IN (''r1'', ''r3'') AND NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier')
 ) v(q);
 -- ... and many outcomes to a dimension: each participant makes the table of
 -- them for the rows it takes away
@@ -755,6 +851,17 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT count(*) FROM lcc_e_tiered WHERE m = ''hot'' AND tier = ''high'''),
 	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.n) GROUP BY tier'),
 	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.m = ''cold'' AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier')
+) v(q);
+-- an IN list on a column the score tests, the one the cells walk: a text's
+-- and an enum's, alone and beside the anti join
+SELECT * FROM lcc_plan(
+	'SELECT tier, count(*) FROM lcc_e_tiered WHERE r IN (''r1'', ''r2'') GROUP BY tier') AS p("QUERY PLAN");
+SELECT q, lcc_check(q) FROM (VALUES
+	('SELECT tier, count(*) FROM lcc_e_tiered WHERE r IN (''r1'', ''r2'') GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.r IN (''r1'', ''r2'') AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.r IN (''r0'', ''r3'') AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.n) GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered WHERE s IN (''live'', ''idle'') GROUP BY tier'),
+	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.s IN (''live'', ''gone'') AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier')
 ) v(q);
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;

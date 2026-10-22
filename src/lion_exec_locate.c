@@ -1857,7 +1857,8 @@ lion_ingroup_item(LionCountScanState *st)
 	int			k;
 
 	if (!lion_plan_flag(st, LION_FLAG_GROUPIDX) || st->driveattno == 0 ||
-		st->innerattno != 0 || lion_plan_flag(st, LION_FLAG_SUMALL))
+		st->innerattno != 0 || lion_plan_flag(st, LION_FLAG_SUMALL) ||
+		st->decode != NULL)
 		return -1;
 	for (k = 0; k < st->nitem; k++)
 	{
@@ -2085,6 +2086,14 @@ lion_locate_where(LionCountScanState *st)
 	 * reasons of their own and are left alone, and so does the (g, k) loop of
 	 * a count(DISTINCT k) per group (§26), whose groups are emitted in g's
 	 * directory order, which the planner may have claimed as pathkeys.
+	 *
+	 * So are the decoded walk (§34) and a count by cells (§10), serial or in
+	 * parallel: they walk every entry of their column 0 against the WHERE
+	 * collected whole (lion_decode_where(), lion_where_collect_range()), so
+	 * a list on that column is a source of the copy like any other clause,
+	 * located as one above - past a batch, collected into one set
+	 * (lion_locate_list()), where the driving list's sets are left for a
+	 * walk of them that never comes (lion_group_list_prepare()).
 	 *
 	 * The count(DISTINCT k) walk WITHOUT a GROUP BY is driven like a GROUP BY
 	 * k whose groups are summed (§26), and takes a list on k the same way -
