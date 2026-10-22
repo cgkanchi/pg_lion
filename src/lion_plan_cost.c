@@ -10,6 +10,8 @@
  */
 #include "postgres.h"
 
+#include "tsearch/ts_type.h"
+
 #include "lion_customscan.h"
 
 static LionQueryMode lion_multikey_cost_mode_ex(IndexOptInfo *idx,
@@ -23,6 +25,10 @@ static double lion_bitmap_width(double tuples, double heap_pages);
 static double lion_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 										IndexOptInfo *idx, AttrNumber col,
 										double *colbytes);
+static bool lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel,
+								   IndexOptInfo *idx, AttrNumber col,
+								   Node *clause, double *widen, int *nlex,
+								   double **lexsel);
 
 /*
  * Cost the pushdown (DESIGN.md section 10).
@@ -5843,8 +5849,10 @@ lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
  *
  * How each clause will be answered is asked of its plan-time estimate
  * (lion_multikey_cost_mode()): exactly, which needs no recheck and costs
- * nothing here; as a superset, whose candidates are taken to be the rows the
- * clause selects - a floor, since the estimate says the superset is wider but
+ * nothing here; as a superset, whose candidates are the superset's rows - a
+ * tsquery's, the rows its clause selects times what the superset leaves out
+ * (lion_tsquery_pos_shape()), and any other's taken to be the rows the
+ * clause selects, a floor, since the estimate says the superset is wider but
  * not by how much; or as every row, whose candidates are then every row the
  * OTHER clauses select - with no other clause, every row of the relation,
  * read by a sequential scan (lion_count_heap_filtered()).  A value with no
@@ -5872,6 +5880,9 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	Cost		perrow = cpu_tuple_cost;
 	bool		any = false;
 	double		pages;
+	double		widen;
+	double	   *lexsel;
+	int			nlex;
 	int			ci = 0;
 	ListCell   *lc1;
 	ListCell   *lc2;
@@ -5910,6 +5921,13 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			cand /= Max(clause_selectivity(root, lion_vcol_unvar(clause), 0,
 										   JOIN_INNER, NULL),
 						1e-10);
+		else if (lion_tsquery_pos_shape(root, rel, (IndexOptInfo *) lfirst(lc1),
+										(AttrNumber) lfirst_int(lc4), clause,
+										&widen, &nlex, &lexsel))
+		{
+			cand *= widen;
+			pfree(lexsel);
+		}
 	}
 	pfree(orgrp);
 	if (!any)
@@ -5923,22 +5941,365 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 }
 
 /*
+ * The clause op with its query replaced by a query of one of its operands
+ * alone, `col @@ 'foo'`, as given, weight and prefix flag kept: what core
+ * estimates as the share of the rows that have the lexeme (tsmatchsel(); a
+ * prefix operand, the share that have one of its lexemes), and the posting
+ * set the intersection probe looks the lexeme up as.  Freed with
+ * lion_tsquery_operand_free().
+ */
+static OpExpr *
+lion_tsquery_operand_clause(OpExpr *op, TSQuery tsq,
+							const QueryOperand *operand)
+{
+	int			len = (int) operand->length;
+	Size		size = COMPUTESIZE(1, len + 1);
+	TSQuery		one = (TSQuery) palloc0(size);
+	QueryOperand *val;
+	char	   *str;
+	OpExpr	   *lop;
+
+	SET_VARSIZE(one, size);
+	one->size = 1;
+	val = &GETQUERY(one)->qoperand;
+	*val = *operand;
+	val->distance = 0;
+	str = GETOPERAND(one);
+	memcpy(str, GETOPERAND(tsq) + operand->distance, len);
+	str[len] = '\0';
+
+	lop = (OpExpr *) palloc(sizeof(OpExpr));
+	memcpy(lop, op, sizeof(OpExpr));
+	lop->args = list_make2(linitial(op->args),
+						   makeConst(TSQUERYOID, -1, InvalidOid, -1,
+									 PointerGetDatum(one), false, false));
+	return lop;
+}
+
+static void
+lion_tsquery_operand_free(OpExpr *lop)
+{
+	Const	   *con = lsecond_node(Const, lop->args);
+
+	pfree(DatumGetPointer(con->constvalue));
+	pfree(con);
+	list_free(lop->args);
+	pfree(lop);
+}
+
+/*
+ * The share of the rows the tsquery rooted at items[i] matches, from its
+ * operands' shares lexsel[itemlex[...]], combined as core combines them
+ * (tsquery_opr_selec()): an AND and a phrase their product, an OR as
+ * independent, a NOT the complement.  Or, superset, the share of the rows
+ * of the boolean tree over its lexemes the posting sets answer, which
+ * lion_tsquery_superset() makes of it: a phrase its operands' AND, a weight
+ * the lexeme at any weight, a NOT every row - and an AND with it the other
+ * side, an OR with it every row.  *every says that the tree is every row.
+ * The bounds of an operator's left operand are the ones that function
+ * checks; what it would refuse is every row here.
+ */
+static Selectivity
+lion_tsquery_walk_sel(QueryItem *items, int32 size, int32 i,
+					  const int *itemlex, const double *lexsel, bool superset,
+					  bool *every)
+{
+	QueryItem  *item;
+	Selectivity s1;
+	Selectivity s2;
+	bool		every1 = false;
+	bool		every2 = false;
+	uint32		left;
+
+	check_stack_depth();
+
+	*every = false;
+	if (i < 0 || i >= size)
+	{
+		*every = true;
+		return 1.0;
+	}
+	item = &items[i];
+	if (item->type == QI_VAL)
+		return lexsel[itemlex[i]];
+	if (item->type != QI_OPR)
+	{
+		*every = true;
+		return 1.0;
+	}
+
+	switch (item->qoperator.oper)
+	{
+		case OP_NOT:
+			if (superset)
+			{
+				*every = true;
+				return 1.0;
+			}
+			s1 = lion_tsquery_walk_sel(items, size, i + 1, itemlex, lexsel,
+									   false, &every1);
+			return every1 ? 0.0 : 1.0 - s1;
+
+		case OP_AND:
+		case OP_OR:
+		case OP_PHRASE:
+			left = item->qoperator.left;
+			if (left < 2 || left >= (uint32) (size - i))
+			{
+				*every = true;
+				return 1.0;
+			}
+			s1 = lion_tsquery_walk_sel(items, size, i + 1, itemlex, lexsel,
+									   superset, &every1);
+			s2 = lion_tsquery_walk_sel(items, size, i + (int32) left,
+									   itemlex, lexsel, superset, &every2);
+			if (item->qoperator.oper == OP_OR)
+			{
+				if (every1 || every2)
+				{
+					*every = true;
+					return 1.0;
+				}
+				return s1 + s2 - s1 * s2;
+			}
+			if (every1 && every2)
+			{
+				*every = true;
+				return 1.0;
+			}
+			return (every1 ? 1.0 : s1) * (every2 ? 1.0 : s2);
+
+		default:
+			*every = true;
+			return 1.0;
+	}
+}
+
+/*
+ * The lexemes the superset of the tsquery rooted at items[i] ANDs - those an
+ * AND or a phrase reaches with no OR or NOT on the way, as
+ * lion_tsquery_superset() makes them its tree's top AND - each once into
+ * anded[], by its operand's number itemlex[].  An OR is one source of its
+ * own, and a NOT is no part of the superset.
+ */
+static void
+lion_tsquery_anded(QueryItem *items, int32 size, int32 i, const int *itemlex,
+				   bool *anded)
+{
+	QueryItem  *item;
+	uint32		left;
+
+	check_stack_depth();
+
+	if (i < 0 || i >= size)
+		return;
+	item = &items[i];
+	if (item->type == QI_VAL)
+	{
+		anded[itemlex[i]] = true;
+		return;
+	}
+	if (item->type != QI_OPR ||
+		(item->qoperator.oper != OP_AND && item->qoperator.oper != OP_PHRASE))
+		return;
+	left = item->qoperator.left;
+	if (left < 2 || left >= (uint32) (size - i))
+		return;
+	lion_tsquery_anded(items, size, i + 1, itemlex, anded);
+	lion_tsquery_anded(items, size, i + (int32) left, itemlex, anded);
+}
+
+/*
+ * What a position filter of the tsquery clause `clause`, on key column col of
+ * lion index idx of rel, works through (lion_posfilter.c): its candidates,
+ * the rows of its SUPERSET - the boolean tree over its lexemes the posting
+ * sets answer (lion_extract_query_superset()) - which are *widen times the
+ * rows of the clause itself; and the *nlex lexemes it reads, one cursor each
+ * over that lexeme's members, (*lexsel)[k] the share of the rows that have
+ * the k'th (palloc'd).  A lexeme under a NOT is read too, for the check, and
+ * is no part of the superset.
+ *
+ * Each operand is estimated alone, as core estimates a query of it, and the
+ * clause and its superset are combined from those alike
+ * (lion_tsquery_walk_sel()), so that *widen is what the superset leaves out
+ * - 8 for `foo <-> !bar` of `foo` in every row and `bar` in seven of eight,
+ * whose candidates are every row where the clause selects an eighth - and
+ * what the AND of its lexemes' posting sets holds beyond core's product of
+ * them, measured by the intersection probe as any AND of sets is (DESIGN.md
+ * §29.11, "Correlated sets").  The phrase `new <-> york` of two lexemes in
+ * the same tenth of the rows is a hundredth of them by core's product, and
+ * its candidates the whole tenth.  The probe takes its measure only three
+ * times off core's or more: `foo <-> bar` of two lexemes in the same three
+ * rows of four is decided over 0.75 of the rows, and priced over the 0.56
+ * of core's product.
+ *
+ * False for a clause that is not `col @@ tsquery` of a literal.
+ */
+static bool
+lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					   AttrNumber col, Node *clause, double *widen, int *nlex,
+					   double **lexsel)
+{
+	OpExpr	   *op;
+	Node	   *arg;
+	Const	   *con;
+	TSQuery		tsq;
+	QueryItem  *items;
+	char	   *operands;
+	Size		opbytes;
+	int		   *itemlex;
+	int		   *lexitem;
+	double	   *sels;
+	bool	   *anded;
+	Selectivity full;
+	Selectivity super;
+	bool		every;
+	int			nanded = 0;
+	int			n = 0;
+	int32		i;
+	int32		j;
+
+	*widen = 1.0;
+	*nlex = 0;
+	*lexsel = NULL;
+	clause = lion_vcol_unvar(clause);
+	if (clause == NULL || !IsA(clause, OpExpr) ||
+		list_length(((OpExpr *) clause)->args) != 2)
+		return false;
+	op = (OpExpr *) clause;
+	arg = lion_strip((Node *) lsecond(op->args));
+	if (arg == NULL || !IsA(arg, Const) || ((Const *) arg)->constisnull ||
+		((Const *) arg)->consttype != TSQUERYOID)
+		return false;
+	con = (Const *) arg;
+	tsq = DatumGetTSQuery(con->constvalue);
+	if (tsq->size <= 0)
+		return false;
+	items = GETQUERY(tsq);
+	operands = GETOPERAND(tsq);
+	if ((Size) (operands - (char *) tsq) > VARSIZE(tsq))
+		return false;
+	opbytes = VARSIZE(tsq) - (Size) (operands - (char *) tsq);
+
+	/* each distinct operand once: a cursor is a lexeme's, not an item's */
+	itemlex = (int *) palloc0(sizeof(int) * tsq->size);
+	lexitem = (int *) palloc(sizeof(int) * tsq->size);
+	sels = (double *) palloc(sizeof(double) * tsq->size);
+	for (i = 0; i < tsq->size; i++)
+	{
+		QueryOperand *val;
+		OpExpr	   *lop;
+
+		if (items[i].type != QI_VAL)
+			continue;
+		val = &items[i].qoperand;
+
+		/* an operand outside the query's own bytes is no query of ours */
+		if ((Size) val->distance + val->length >= opbytes)
+		{
+			pfree(itemlex);
+			pfree(lexitem);
+			pfree(sels);
+			return false;
+		}
+		for (j = 0; j < i; j++)
+		{
+			QueryOperand *prev = &items[j].qoperand;
+
+			if (items[j].type == QI_VAL && prev->length == val->length &&
+				prev->prefix == val->prefix &&
+				memcmp(operands + prev->distance, operands + val->distance,
+					   val->length) == 0)
+				break;
+		}
+		if (j < i)
+		{
+			itemlex[i] = itemlex[j];
+			continue;
+		}
+		itemlex[i] = n;
+		lexitem[n] = i;
+		lop = lion_tsquery_operand_clause(op, tsq, val);
+		sels[n++] = Min(Max(clause_selectivity(root, (Node *) lop, 0,
+											   JOIN_INNER, NULL),
+							1e-10), 1.0);
+		lion_tsquery_operand_free(lop);
+	}
+	if (n == 0)
+	{
+		pfree(itemlex);
+		pfree(lexitem);
+		pfree(sels);
+		return false;
+	}
+
+	full = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, sels, false,
+								 &every);
+	super = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, sels, true,
+								  &every);
+	if (every)
+		super = 1.0;
+
+	/* ... and the AND of the superset's lexemes as the probe finds it */
+	anded = (bool *) palloc0(sizeof(bool) * n);
+	if (!every)
+		lion_tsquery_anded(items, tsq->size, 0, itemlex, anded);
+	for (i = 0; i < n; i++)
+		nanded += anded[i] ? 1 : 0;
+	if (nanded >= 2)
+	{
+		OpExpr	  **lops = (OpExpr **) palloc(sizeof(OpExpr *) * nanded);
+		AttrNumber *cols = (AttrNumber *) palloc(sizeof(AttrNumber) * nanded);
+		int			m = 0;
+
+		for (i = 0; i < n; i++)
+		{
+			if (!anded[i])
+				continue;
+			lops[m] = lion_tsquery_operand_clause(op, tsq,
+												  &items[lexitem[i]].qoperand);
+			cols[m++] = col;
+		}
+		super *= lion_isect_factor(root, rel, idx, m, cols, (Node **) lops);
+		for (i = 0; i < m; i++)
+			lion_tsquery_operand_free(lops[i]);
+		pfree(lops);
+		pfree(cols);
+	}
+	pfree(anded);
+	pfree(itemlex);
+	pfree(lexitem);
+
+	*widen = Max(Min(super, 1.0) / Max(full, 1e-10), 1.0);
+	*nlex = n;
+	*lexsel = sels;
+	return true;
+}
+
+/*
  * One clause's position filter, over `cand` candidates of `counts` counts
  * (lion_cost_posfilter()): nothing unless it is a multi-key clause the sets
  * only bound, decided from stored positions - every one under an OR
  * (lion_match_index() takes no other there), one outside it when the index
  * stores positions and the query can be followed through them.
  *
- * Every count's cursors begin again at their lexemes' first member, and seek
- * to the count's candidates in order, decoding the members between
- * (LION_POS_MEMBER_COST): at most every member of the lexeme, which a count
- * whose candidates lie close together comes to, and LION_POS_SEEK_MEMBERS a
- * candidate where they lie further apart than a chunk's members.  Each
- * candidate is then decided at LION_POS_CHECK_COST a lexeme.  A lexeme's
- * members are the rows that have it, taken from the clause's selectivity as
- * the share of rows each of its nkeys lexemes would have to have for that to
- * be their product, which is how the selectivity of a tsquery's AND and
- * phrase is estimated: 0.56 for `foo <-> bar` of lexemes in 0.75 of the rows.
+ * `cand` is the rows the caller's filters select, this clause among them;
+ * the filter decides the rows of its superset among them, *widen times as
+ * many (lion_tsquery_pos_shape()) - every row with `foo` for `foo <-> !bar`,
+ * where the clause keeps an eighth of them.  Priced from the clause's own
+ * rows and the superset's one lexeme, that filter comes to a sixteenth of
+ * what it takes, and an FK-side join that probes it at two or three keys
+ * beats a nested loop of the dimension into a btree of the fact's key that
+ * runs 15 to 40 times as fast (DESIGN.md §17, "The price").
+ *
+ * Every count's cursors - one a lexeme the query names, those under a NOT
+ * too - begin again at their lexemes' first member, and seek to the count's
+ * candidates in order, decoding the members between (LION_POS_MEMBER_COST):
+ * at most every member of the lexeme, which a count whose candidates lie
+ * close together comes to, and LION_POS_SEEK_MEMBERS a candidate where they
+ * lie further apart than a chunk's members.  Each candidate is then decided
+ * at LION_POS_CHECK_COST a lexeme.  A lexeme's members are the rows that
+ * have it, by core's estimate of a query of it alone.
  */
 static Cost
 lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
@@ -5948,8 +6309,11 @@ lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		percount;
 	double		nkeys;
-	double		members;
-	Selectivity sel;
+	double		widen;
+	double	   *lexsel;
+	int			nlex;
+	Cost		cost;
+	int			k;
 
 	if (cand <= 0.0)
 		return 0;
@@ -5958,18 +6322,25 @@ lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
 	if (!inor && !lion_multikey_posexact(idx, col, clause))
 		return 0;
 
+	/* only a tsquery's lexemes have positions to be decided from */
+	if (!lion_tsquery_pos_shape(root, rel, idx, col, clause, &widen, &nlex,
+								&lexsel))
+		return 0;
+
+	/* the superset's rows are the candidates, and no more than the table's */
+	cand = Min(cand * widen, tuples);
+
 	/* a count that has no candidate seeks nothing */
 	counts = Min(Max(counts, 1.0), Max(cand, 1.0));
 	percount = cand / counts;
 
-	nkeys = Max(nkeys, 1.0);
-	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
-							 NULL);
-	members = tuples * pow(Min(Max(sel, 1e-10), 1.0), 1.0 / nkeys);
-	members = Max(members, percount);
-	return counts * nkeys *
-		Min(members, percount * LION_POS_SEEK_MEMBERS) * LION_POS_MEMBER_COST +
-		cand * nkeys * LION_POS_CHECK_COST;
+	cost = cand * nlex * LION_POS_CHECK_COST;
+	for (k = 0; k < nlex; k++)
+		cost += counts *
+			Min(Max(tuples * lexsel[k], 1.0),
+				percount * LION_POS_SEEK_MEMBERS) * LION_POS_MEMBER_COST;
+	pfree(lexsel);
+	return cost;
 }
 
 /*
