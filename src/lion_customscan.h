@@ -635,14 +635,14 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 
 /*
  * The value of a RESERVED or NOTRESERVED clause: an int4 Const, the reserved
- * entries of the column it names, LION_ENTRY_EMPTYKEY always and
- * LION_ENTRY_NULLKEY when the NULL entry is among them (DESIGN.md §17,
- * "Non-empty arrays").  A mask of the NULL entry alone is `IS NULL` or `IS
- * NOT NULL`, and is that clause.
+ * entries of the column it names - one or more of LION_ENTRY_EMPTYKEY,
+ * LION_ENTRY_EMPTYDIM and LION_ENTRY_EMPTYINNER, and LION_ENTRY_NULLKEY when
+ * the NULL entry is among them (DESIGN.md §17, "Non-empty arrays").  A mask
+ * of the NULL entry alone is `IS NULL` or `IS NOT NULL`, and is that clause.
  */
 #define LION_RESERVED_MASK_OK(m) \
-	(((m) & LION_ENTRY_EMPTYKEY) != 0 && \
-	 ((m) & ~(LION_ENTRY_EMPTYKEY | LION_ENTRY_NULLKEY)) == 0)
+	(((m) & LION_ENTRY_EMPTYKINDS) != 0 && \
+	 ((m) & ~(LION_ENTRY_EMPTYKINDS | LION_ENTRY_NULLKEY)) == 0)
 
 /*
  * ORed into a RANGESRC clause's kind in the plan's CLAUSEKINDS: the first

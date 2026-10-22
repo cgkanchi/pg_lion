@@ -1577,8 +1577,9 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 }
 
 /*
- * The next entry of the walk whose rows are a key's: not the reserved EMPTY
- * entry, nor - for a multi-key column, whose NULL rows unnest to nothing -
+ * The next entry of the walk whose rows are a key's: not a reserved entry of
+ * rows with no key (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS), nor - for a
+ * multi-key column, whose NULL rows unnest to nothing -
  * the NULL one, nor the length key of a column that stores positions, nor
  * an entry with no TID.  Its key is copied into keycxt.
  */
@@ -1596,7 +1597,7 @@ lion_facets_next_entry(LionFacetRun *run, LionEntryScan *es,
 		if (entry == NULL)
 			return false;
 		run->walked++;
-		if (LionEntryIsEmptyKey(entry) || LionEntryIsNullElems(entry) ||
+		if (LionEntryIsKeyless(entry) ||
 			lion_entry_ntids(entry) == 0 ||
 			(LionEntryIsNullKey(entry) && run->state->multikey))
 			continue;
@@ -1812,7 +1813,7 @@ lion_facets_nentries(LionFacetRun *run)
 	while ((entry = lion_entry_scan_next_copy(&es, &itemlen)) != NULL)
 	{
 		run->walked++;
-		if (!LionEntryIsEmptyKey(entry) && !LionEntryIsNullElems(entry) &&
+		if (!LionEntryIsKeyless(entry) &&
 			lion_entry_ntids(entry) > 0 &&
 			!(LionEntryIsNullKey(entry) && run->state->multikey))
 			n++;
