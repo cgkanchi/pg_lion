@@ -776,6 +776,15 @@ SET client_min_messages = warning;
 -- above reads them back from it.  The DEBUG line gives the most the walks
 -- kept in memory and the records they wrote out; at the default work_mem
 -- they write none.
+--
+-- And in a twin, the high key of the left internal page and the root's
+-- separator for the right one, which are one key, go one block down, under
+-- the last block the left page's last leaf holds.  Every level is still in
+-- order, and a lookup of that block - lion_postree_fetch(), or a writer
+-- that puts or takes away a member of it - descends through the right
+-- internal page to the leaf after that one, never to it: heapallindexed
+-- finds the positions of the block's first rows gone.  verify() must report
+-- the leaf above its parent's high key.
 CREATE TEMP TABLE lion_vfy_big (id int4, d tsvector);
 INSERT INTO lion_vfy_big
 SELECT i, w.d
@@ -783,11 +792,42 @@ SELECT i, w.d
 	   (SELECT to_tsvector('simple', repeat('w ', 256)) d) w;
 CREATE INDEX lion_vfy_big_d ON lion_vfy_big USING lion (d)
   WITH (store_positions = true);
+CREATE INDEX lion_vfy_bad_parent ON lion_vfy_big USING lion (d)
+  WITH (store_positions = true);
+SELECT b AS bigroot
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_parent') /
+						   current_setting('block_size')::int8 - 1) b
+ WHERE lion_vfy_u32('lion_vfy_bad_parent', b, :special + 26) & 128 <> 0
+   AND lion_vfy_u32('lion_vfy_bad_parent', b, :special + 24) & 65535 = 2 \gset
+SELECT b AS bigleft, lion_vfy_u32('lion_vfy_bad_parent', b, :special) AS bigright,
+	   lion_vfy_item('lion_vfy_bad_parent', b, 1) AS highitem,
+	   lion_vfy_u32('lion_vfy_bad_parent', b,
+					lion_vfy_item('lion_vfy_bad_parent', b, 1)) AS high
+  FROM generate_series(1, pg_relation_size('lion_vfy_bad_parent') /
+						   current_setting('block_size')::int8 - 1) b
+ WHERE lion_vfy_u32('lion_vfy_bad_parent', b, :special + 26) & 128 <> 0
+   AND lion_vfy_u32('lion_vfy_bad_parent', b, :special + 24) & 65535 = 1
+   AND lion_vfy_u32('lion_vfy_bad_parent', b, :special) <> 4294967295 \gset
+SELECT lion_vfy_item('lion_vfy_bad_parent', :bigroot, o) AS rootitem
+  FROM generate_series(1, 2) o
+ WHERE lion_vfy_u32('lion_vfy_bad_parent', :bigroot,
+					lion_vfy_item('lion_vfy_bad_parent', :bigroot, o) + 4) =
+	   :bigright \gset
+SELECT lion_vfy_u32('lion_vfy_bad_parent', :bigroot, :rootitem) = :high
+	   AS same_key;
+SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigleft, :highitem,
+					 lion_vfy_le32(:high - 1));
+SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigroot, :rootitem,
+					 lion_vfy_le32(:high - 1));
 SET work_mem = '64kB';
 SET client_min_messages = debug1;
 SELECT lion_index_verify('lion_vfy_big_d');
 RESET work_mem;
 SELECT lion_index_verify('lion_vfy_big_d');
+SET client_min_messages = error;
+SET work_mem = '64kB';
+SELECT lion_index_verify('lion_vfy_bad_parent');
+RESET work_mem;
 SET client_min_messages = warning;
 
 RESET ignore_checksum_failure;
