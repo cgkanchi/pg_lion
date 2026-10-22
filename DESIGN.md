@@ -1213,7 +1213,11 @@ because one more read proves them: the LEFT LINK of the page the walk reaches ne
 new page rather than the one the walk came from - the level is walked again from that page, each page
 held until its right sibling is locked (left to right, the directory's own order), where one's left
 link naming the other is exact - and a page at the height the meta page gave has lost its ROOT flag,
-which a root split does in the same record that makes the meta page name a taller directory.
+which a root split does in the same record that makes the meta page name a taller directory. In a
+posting set or a position tree each page of the lower level is bounded above by its parent's high key
+as well as by the separator of the next downlink: the two are one key while the upper level is sound,
+and a parent whose high key went down with the separator above it hides the keys over it from every
+descent while the level, read as one sequence, stays in order (verify.sql's nineteenth case).
 
 **Memory.** The comparison of two levels needs the whole lower level, read before the walk of the
 upper one began - the order that makes a split harmless. What a walk of a posting set or a position

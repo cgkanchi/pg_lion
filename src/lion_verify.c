@@ -1329,6 +1329,16 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
  * lands on the leaf of the last separator below X and looks for X's members
  * from there on, never to its left.
  *
+ * Each of them is bounded above by the high key of its parent as well, when
+ * the parent has one: the next downlink, the first of the parent's right
+ * sibling, gives the bound the level as a whole keeps, and the parent's high
+ * key the one a reader that comes down through the parent relies on.  The two
+ * are one key while the parent's level is sound - an internal split gives the
+ * left half the right half's first separator as its high key - and a parent
+ * whose high key was lowered under its last child's keys, with the separator
+ * above it that routes to the parent's right sibling, hides those keys from
+ * every reader while the level, read as one sequence, stays in order.
+ *
  * One page may lack a downlink without being damage: the right sibling a
  * split made, while the split is unfinished.  The split writes the sibling
  * in one record and its downlink in the next, and leaves the LEFT page
@@ -1365,6 +1375,9 @@ typedef struct LionVerifyMatch
 	int64		ndownlinks;		/* downlinks met so far */
 	LionVerifyPage open;		/* the page the last downlink named, whose */
 	bool		haveopen;		/* ... upper bound the next one gives */
+	BlockNumber parent;			/* the page of level i that named it, once */
+	uint32		parenthigh;		/* ... that page's walk is over and it has a */
+								/* high key, until the next downlink matches */
 	LionVerifyPage prev;		/* the page of level i - 1 read last */
 	bool		haveprev;
 	bool		unseen;			/* a downlink named a page no walk reached */
@@ -1383,6 +1396,7 @@ lion_verify_match_init(LionVerifyMatch *m, LionVerifyState *vs,
 	m->level = level;
 	m->exact = exact;
 	m->below = below;
+	m->parent = InvalidBlockNumber;
 	lion_verify_seq_rewind(below);
 }
 
@@ -1414,8 +1428,9 @@ lion_verify_match_fail(LionVerifyMatch *m, const char *fmt,...)
 
 /*
  * The page's own upper bound - a leaf's last key, an internal page's high
- * key - against `next`, the separator of the downlink after the one that
- * names it.  False once there is a mismatch.
+ * key - against the high key of its parent, when the parent's walk is over
+ * and it has one, and against `next`, the separator of the downlink after
+ * the one that names it.  False once there is a mismatch.
  */
 static bool
 lion_verify_match_upper(LionVerifyMatch *m, const LionVerifyPage *pg,
@@ -1426,6 +1441,29 @@ lion_verify_match_upper(LionVerifyMatch *m, const LionVerifyPage *pg,
 
 	if ((pg->flags & LION_VPAGE_UPPER) == 0)
 		return true;
+	if (BlockNumberIsValid(m->parent))
+	{
+		uint32		high = m->parenthigh;
+
+		if (m->level == 1 && tree->positions)
+		{
+			if (pg->upper > high)
+				lion_verify_match_fail(m, "lion index \"%s\": position leaf %u reaches block %u, above the high key %u of its parent %u",
+									   rel, pg->blk, pg->upper, high, m->parent);
+		}
+		else if (m->level == 1)
+		{
+			if (pg->upper >= high)
+				lion_verify_match_fail(m, "lion index \"%s\": leaf %u holds container key %u, at or above the high key %u of its parent %u",
+									   rel, pg->blk, pg->upper, high, m->parent);
+		}
+		else if (pg->upper > high)
+			lion_verify_match_fail(m, "lion index \"%s\": the high key %u of %s block %u sorts after the high key %u of its parent %u",
+								   rel, pg->upper, tree->what, pg->blk, high,
+								   m->parent);
+	}
+	if (m->failure != NULL)
+		return false;
 	if (m->level == 1 && tree->positions)
 	{
 		if (pg->upper > next)
@@ -1442,6 +1480,19 @@ lion_verify_match_upper(LionVerifyMatch *m, const LionVerifyPage *pg,
 		lion_verify_match_fail(m, "lion index \"%s\": the high key %u of %s block %u sorts after the separator %u of its right sibling",
 							   rel, pg->upper, tree->what, pg->blk, next);
 	return m->failure == NULL;
+}
+
+/*
+ * The walk of level i is done with page blk: the page its last downlink
+ * named, and the right halves of unfinished splits after it, are bounded by
+ * blk's high key (highkey, when hashigh) until the next downlink matches.
+ */
+static void
+lion_verify_match_parent_done(LionVerifyMatch *m, BlockNumber blk,
+							  bool hashigh, uint32 highkey)
+{
+	m->parent = hashigh ? blk : InvalidBlockNumber;
+	m->parenthigh = highkey;
 }
 
 /*
@@ -1481,6 +1532,9 @@ lion_verify_match_downlink(LionVerifyMatch *m, BlockNumber child, uint32 sep)
 
 		if (pg.blk == child)
 		{
+			/* a page of this downlink's own parent from here on */
+			m->parent = InvalidBlockNumber;
+
 			if (j == 0 && sep != 0)
 				lion_verify_match_fail(m, "lion index \"%s\": the first downlink of %s level %u has separator %u, expected minus infinity",
 									   rel, tree->what, m->level, sep);
@@ -1535,7 +1589,12 @@ lion_verify_match_end(LionVerifyMatch *m)
 	if (m->unseen)
 		return false;
 
-	/* the page the last downlink named has no next one to be bounded by */
+	/*
+	 * The page the last downlink named has no next one to be bounded by, nor
+	 * the right halves of unfinished splits after it, and no parent's high
+	 * key either: the last page of level i has no right link, and a high key
+	 * there was reported as its walk read it.
+	 */
 	while (m->failure == NULL && !m->countoff &&
 		   lion_verify_seq_get(m->below, &pg))
 	{
@@ -1693,6 +1752,7 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 
 			CHECK_FOR_INTERRUPTS();
 		}
+		lion_verify_match_parent_done(match, blk, hashigh, highkey);
 
 		pg.blk = blk;
 		pg.firstkey = firstkey;
