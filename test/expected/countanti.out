@@ -581,6 +581,105 @@ SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT
 (1 row)
 
 DROP INDEX lca_rows_yk;
+-- one that names the key's column twice: a join clause is the scan key of
+-- the first of the two only, and stays one join clause
+CREATE INDEX lca_rows_kk ON lca_rows (k, k);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+                   ln                   
+----------------------------------------
+   Join Lookup Index: lca_rows_kk
+   Join Cond: ((s.a = k) AND (s.b = k))
+(2 rows)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b <> r.g)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g');
+         lca         
+---------------------
+ pushed down, 7 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+                                lca_counters                                
+----------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 8, Rows Fetched: 243, Rows Subtracted: 122
+(1 row)
+
+-- ... planned with nothing disabled, and with the pushdown off
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+ count 
+-------
+  9830
+(1 row)
+
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+ g | count 
+---+-------
+ 0 |  1498
+ 1 |  1493
+ 2 |  1500
+ 3 |  1493
+ 4 |  1502
+ 5 |  1492
+   |   900
+(7 rows)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+ count 
+-------
+  9830
+(1 row)
+
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+ g | count 
+---+-------
+ 0 |  1498
+ 1 |  1493
+ 2 |  1500
+ 3 |  1493
+ 4 |  1502
+ 5 |  1492
+   |   900
+(7 rows)
+
+RESET pg_lion.enable_count_pushdown;
+-- ... and twice before a column of another key, which the search then
+-- stops short of: its clause is tested on the rows found
+DROP INDEX lca_rows_kk;
+CREATE INDEX lca_rows_kky ON lca_rows (k, k, y);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+                   ln                   
+----------------------------------------
+   Join Lookup Index: lca_rows_kky
+   Join Cond: ((s.a = k) AND (s.b = y))
+(2 rows)
+
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+         lca         
+---------------------
+ pushed down, 1 rows
+(1 row)
+
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+                               lca_counters                                
+---------------------------------------------------------------------------
+ Child Rows: 11, Keys Looked Up: 9, Rows Fetched: 340, Rows Subtracted: 14
+(1 row)
+
+DROP INDEX lca_rows_kky;
 CREATE INDEX lca_rows_k ON lca_rows (k);
 ANALYZE lca_rows;
 -- ---------- 5. a dirty heap: deletes and updates, before and after VACUUM ----------
