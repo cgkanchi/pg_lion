@@ -415,7 +415,23 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		 * Exact: a split holds the page it flags EXCLUSIVE until it clears the
 		 * flag (DESIGN.md §21), so a flag a SHARE lock lets the walk see is one
 		 * a crash or an error left behind.
+		 *
+		 * ... and only ever on the LEFT half of a split, which the record that
+		 * sets the flag links to the split's new page, and which keeps that
+		 * right sibling while the flag lasts: page deletion takes no flagged
+		 * leaf, nor a page whose downlink is not in place (§21, "Page
+		 * deletion"), and a root split, the one split of a page without a
+		 * right sibling to be, flags nothing.  So the flag on a rightmost page
+		 * - the root among them - or on a HALF_DEAD one is damage, not the
+		 * state the next INSERT repairs: that INSERT finds no sibling to post
+		 * a downlink for, and fails on the page.
 		 */
+		if (LionPageIncompleteSplit(page) &&
+			(LionPageIsRightmost(page) || LionPageIsHalfDead(page)))
+			lion_corrupt("lion index \"%s\": directory page %u is flagged as an unfinished split, but it is %s",
+						RelationGetRelationName(vs->index), blk,
+						LionPageIsHalfDead(page) ? "a half-dead leaf" :
+						"the rightmost page of its level, which no split leaves flagged");
 		if (LionPageIncompleteSplit(page))
 			ereport(WARNING,
 					(errmsg("lion index \"%s\": directory page %u has an unfinished split",

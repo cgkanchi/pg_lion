@@ -241,6 +241,13 @@ twice, or one freed a moment ago called reusable, breaks the equation.
   the standby's feedback lets it remove them - each read on the standby
   through `lion_index_stats()` and compared with the primary's, and with the
   exact count, once it has replayed the META record that wrote it.
+* a position tree damaged on the standby alone: verify.sql's seventeenth case
+  built on the primary, checked on the standby while sound, then, with the
+  standby stopped after a restartpoint, one byte of a position leaf changed in
+  the standby's file, which leaves five TIDs without positions.
+  `lion_index_verify()` on the standby must report them: a standby compares a
+  position tree with its posting set from a walk that read every page as it
+  was at one replay position (DESIGN.md §7, "Position trees").
 * the recovery-conflict case, run twice. A standby session opens a
   `REPEATABLE READ` transaction and counts key K; the run waits (on
   `pg_stat_activity`, not on a timer) until that session really holds its
@@ -283,8 +290,20 @@ for a cleanup lock) or has replayed past the primary's last record, releases
 the reader and compares its count with the one its snapshot must see. In rmgr
 mode replay must have blocked; in generic mode it catches up and the count must
 still be right (the standby rechecks every TID). A failing case is reported and
-the other cases still run. `PHASE3_CASES="split spill"` in the environment runs
-a subset, and `--phases 3` skips phases 1 and 2.
+the other cases still run.
+
+A fourth case, **setaba**, parks a standby `lion_index_verify()` instead, at
+`lion-verify-set-leaf-read`, after the first of the two leaves of a posting
+set (DESIGN.md §7, "Posting sets on a standby"). The primary then inserts a
+row into the set's last container and VACUUMs away a row deleted before the
+check began, from the first leaf: the entry's header - TIDs, containers,
+leaves - is as it was, and a walk that read the first leaf before the VACUUM
+and the second after the insert counts one TID more than the entry. The
+check, released once the standby has caught up, must pass, and its DEBUG
+line must show the first walk thrown away.
+
+`PHASE3_CASES="split spill"` in the environment runs a subset, and
+`--phases 3` skips phases 1 and 2.
 
 **Phase 4, `lion_index_verify()` on a standby beside replay** (DESIGN.md §7,
 §11, §25). Replay takes a record's blocks in the order the writer registered

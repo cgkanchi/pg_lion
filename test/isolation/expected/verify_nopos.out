@@ -1,0 +1,52 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_park s1_verify s2_at_scan s2_evict s2_damage s2_wake
+step s1_park: SELECT injection_points_attach('lion-verify-heap-scan', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify: SELECT v_verify('vn_d') AS verify; <waiting ...>
+step s2_at_scan: SELECT v_parked('lion-verify-heap-scan');
+v_parked
+--------
+        
+(1 row)
+
+step s2_evict: 
+	SELECT buffers_skipped = 0 AS all_evicted
+	  FROM pg_buffercache_evict_relation('vn_d');
+
+all_evicted
+-----------
+t          
+(1 row)
+
+step s2_damage: SELECT vn_damage() AS leaves_damaged;
+leaves_damaged
+--------------
+             1
+(1 row)
+
+step s2_wake: 
+	SELECT injection_points_detach('lion-verify-heap-scan');
+	SELECT injection_points_wakeup('lion-verify-heap-scan');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s1_verify: <... completed>
+verify                                                                                                     
+-----------------------------------------------------------------------------------------------------------
+XX002: heap tuple (0,1) from table "vn" has no positions under one of its keys in "vn_d"                   
+Key column 1 of the tuple has key "alpha" at positions 5, and the index stores none for the tuple under it.
+(2 rows)
+

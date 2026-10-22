@@ -22,11 +22,23 @@
 #
 # The table: three keys of 4,000 rows each, with three position leaves apiece,
 # and a fourth of 20,000 rows whose two trees are freed by a DELETE and
-# VACUUM.  Each permutation parks the check with the directory's leaves (and
-# every tree under them) walked, has an INSERT take those free pages, and
-# requires the check to come back clean.  As in verify_concurrent.spec, a
-# parked step carries no (*) marker, and every parked check with a marker is
-# followed by s3_at_level, which fails if the check never parks there.
+# VACUUM.  The first two permutations park the check with the directory's
+# leaves (and every tree under them) walked, have an INSERT take those free
+# pages, and require the check to come back clean.
+#
+# The third is the position tree's own "held" (verify_concurrent.spec has the
+# posting set's): a tree is walked with nothing held and its entry read again
+# afterwards, and a writer that changes the key under every walk gets it
+# walked LION_VERIFY_SET_ATTEMPTS times so and then once with the entry's
+# directory leaf held SHARE, which the 'notice' on lion-verify-postree-held
+# shows.  The check parks after each walk at lion-verify-postree-walked, and
+# before each new one at lion-verify-postree-rewalk.  The writer's rows carry
+# every key - the length key, the empty text, too (DESIGN.md §17) - so the
+# tree the check parks in, whichever it walks first, is one they change.
+#
+# As in verify_concurrent.spec, a parked step carries no (*) marker, and
+# every parked check with a marker is followed by a step that fails if the
+# check never parks there.
 
 setup
 {
@@ -67,12 +79,21 @@ teardown
 	/* Injection points are cluster-wide: never leave one attached. */
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-dir-level-walked');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-postree-walked');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-postree-rewalk');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-postree-held');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
 # The checker.
 session s1
 setup			{ SELECT injection_points_set_local(); }
 step s1_park_level	{ SELECT injection_points_attach('lion-verify-dir-level-walked', 'wait'); }
+step s1_park_walked	{ SELECT injection_points_attach('lion-verify-postree-walked', 'wait'); }
+step s1_park_rewalk	{ SELECT injection_points_attach('lion-verify-postree-rewalk', 'wait'); }
+step s1_note_held	{ SELECT injection_points_attach('lion-verify-postree-held', 'notice'); }
 step s1_verify	{ SELECT lion_index_verify('vt_d', true); }
 # A step of this session cannot start until the check it parked has ended.
 step s1_done	{ SELECT 'checked' AS s1; }
@@ -95,6 +116,11 @@ step s2_grow_key	{
 	INSERT INTO vt SELECT 200000 + i, to_tsvector('simple', 'kept0')
 	  FROM generate_series(1, 8000) i;
 }
+step s2_touch	{
+	INSERT INTO vt SELECT 300000 + i,
+	  to_tsvector('simple', 'kept0 kept1 kept2 doomed')
+	  FROM generate_series(1, 10) i;
+}
 
 # The observer.
 session s3
@@ -107,6 +133,23 @@ step s3_at_level	{ SELECT v_parked('lion-verify-dir-level-walked'); }
 step s3_wake_level	{
 	SELECT injection_points_detach('lion-verify-dir-level-walked');
 	SELECT injection_points_wakeup('lion-verify-dir-level-walked');
+}
+step s3_at_walked	{ SELECT v_parked('lion-verify-postree-walked'); }
+step s3_at_rewalk	{ SELECT v_parked('lion-verify-postree-rewalk'); }
+# Let the check go on, and park at the same point again in the next walk.
+step s3_wake_walked_again	{ SELECT injection_points_wakeup('lion-verify-postree-walked'); }
+step s3_wake_rewalk	{ SELECT injection_points_wakeup('lion-verify-postree-rewalk'); }
+# The last wake detaches the rewalk point too: the trees the check comes to
+# after the held one are walked with the entries the directory walk copied,
+# before the inserts, so each is walked twice, and must not park.
+step s3_wake_walked	{
+	SELECT injection_points_detach('lion-verify-postree-rewalk');
+	SELECT injection_points_detach('lion-verify-postree-walked');
+	SELECT injection_points_wakeup('lion-verify-postree-walked');
+}
+step s3_touched	{
+	SELECT (SELECT count(*) FROM vt WHERE d @@ 'kept0'::tsquery) AS kept0_rows;
+	SELECT lion_index_verify('vt_d', true);
 }
 step s3_new_key	{
 	SELECT s.deleted_pages < f.deleted_pages AS freed_pages_were_taken,
@@ -150,3 +193,24 @@ permutation
 	s3_wake_level
 	s1_done						# the check has ended
 	s3_grown_key
+
+permutation
+	s1_park_walked
+	s1_park_rewalk
+	s1_note_held
+	s1_verify(s3_wake_walked)	# walk 1 of the first tree parks at its end
+	s3_at_walked			# ... and it really is parked there
+	s2_touch
+	s3_wake_walked_again		# walk 1 is thrown away
+	s3_at_rewalk				# walk 2 is about to start
+	s3_wake_rewalk
+	s3_at_walked				# walk 2 parks at its end
+	s2_touch
+	s3_wake_walked_again		# walk 2 is thrown away
+	s3_at_rewalk
+	s3_wake_rewalk
+	s3_at_walked				# walk 3 parks at its end
+	s2_touch
+	s3_wake_walked				# thrown away too: the leaf is held (NOTICE)
+	s1_done						# the check has ended
+	s3_touched
