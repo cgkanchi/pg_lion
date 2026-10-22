@@ -69,8 +69,8 @@ SELECT bm_same('w1 | w2 | t7 | w30', '{w1,w2,t7,w30}', 5);
 SELECT bm_same('w0 | w1 | w9 | t3', '{w0,w1,w9,t3}', 1);
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 0, 0.75);	-- k1 = 0: tf ignored
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 3, 3.0, 1.0);
--- a k1 so large that tf * (k1 + 1) and k1 * L overflowed, and a term came
--- out infinite or NaN: each is close to idf * tf / L now, as BM25's is when
+-- a k1 so large that tf * (k1 + 1) and k1 * L would overflow, and a term
+-- come out infinite or NaN: each is close to idf * tf / L, as BM25's is when
 -- k1 grows; and the largest double
 SELECT bm_same('w1 | w9 | t3', '{w1,w9,t3}', 40, 1e308);
 SELECT bm_same('w4 | t5 | w30', '{w4,t5,w30}', 40, 1.7976931348623157e308, 1.0);

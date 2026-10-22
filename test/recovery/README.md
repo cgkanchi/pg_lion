@@ -182,8 +182,8 @@ the server there and checks what comes back. Four more (DESIGN.md §18, §22,
   is restarted without it (and without `wal_consistency_checking`, which
   names the manager), and a VACUUM that removes nothing from the index runs
   with `pg_lion.vacuum_barrier_ranges = 1`. `pg_waldump` over its range must
-  find no record of a custom manager - it used to find `custom128` ones, which
-  no such server can replay - and a crash right after it must recover. With
+  find no record of a custom manager - a `custom128` one, which no such server
+  can replay - and a crash right after it must recover. With
   injection points, a second rmgr-mode index first gets phase 1b's crash
   under the manager, which leaves entries deleted and their chains' pages
   leaked; the VACUUM without the manager has nothing to remove from it and
@@ -290,13 +290,15 @@ a subset, and `--phases 3` skips phases 1 and 2.
 §11, §25). Replay takes a record's blocks in the order the writer registered
 them and holds every one to the end of the record, and every record that
 changes a posting set registers the set's pages before the entry's directory
-leaf - container page, then leaf, the reverse of the primary's order. verify()
-used to walk each set on a standby with that leaf held SHARE, and its
-heapallindexed lookups descended a set with it held: leaf, then container
-page. The startup process and the backend then waited for each other on buffer
+leaf - container page, then leaf, the reverse of the primary's order. A
+verify() that walked a set with that leaf held SHARE, or whose heapallindexed
+lookups descended a set with it held, would lock leaf, then container page,
+and the startup process and the backend would wait for each other on buffer
 content locks, which have no deadlock detector and ignore cancel and
-terminate: replay stopped for good, and only an immediate shutdown got the
-standby back. The phase makes a standby of its own, with a table of three keys
+terminate: replay would stop for good, and only an immediate shutdown would
+get the standby back. So on a standby verify() walks a set with nothing held,
+and its lookups let the leaf go before they descend (DESIGN.md §7). The phase
+makes a standby of its own, with a table of three keys
 whose posting sets are trees of about twenty leaves, and for `PHASE4_SECS`
 seconds (12) has pgbench insert into those keys on the primary while two loops
 on the standby call `lion_index_verify(sv_k)` and
@@ -307,9 +309,9 @@ deadlock never ends, so the phase cannot hang, and `statement_timeout` would
 not have ended it. Every verify() call must return without an error (a set
 replay kept changing is kept with a WARNING, which the phase counts); then,
 caught up, verify() with heapallindexed and every key's count must agree with
-the primary. Before the fix the phase failed in both modes within seconds of
-the load starting, with the startup process and both verify() backends
-waiting on `LWLock/BufferContent`.
+the primary. A deadlock shows within seconds of the load starting, in either
+mode, as the startup process and both verify() backends waiting on
+`LWLock/BufferContent`.
 
 **Phase 5, lionvec's locator of vectors in TOAST** (DESIGN.md §44.13). A
 lionvec index over vectors stored in TOAST keeps, for each row, where its

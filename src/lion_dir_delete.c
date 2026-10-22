@@ -71,6 +71,12 @@
  * is, a HALF_DEAD one is finished by the next VACUUM that walks it, and
  * lion_index_verify() is what reports damage.
  *
+ * Every page a deletion reads but the meta page goes through the buffer
+ * access strategy VACUUM gives it (info->strategy), as its walk reads the
+ * leaves (lion_vacuum.c, lion_vac_read()).  A VACUUM that empties a run of
+ * leaves reads each one again, with its siblings and its parents, and read
+ * without the ring every one of them would stay in shared buffers.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -85,12 +91,12 @@
 
 /*
  * The page at blk, which a link says is a directory page at `level`, read
- * through strategy (NULL for the default) and locked in lockmode; an ERROR
- * when it is not one.
+ * through strategy - VACUUM's (info->strategy), which every page a deletion
+ * reads goes through - and locked in lockmode; an ERROR when it is not one.
  */
 static Buffer
-lion_dirdel_read_ext(Relation index, BlockNumber blk, int lockmode, int level,
-					 BufferAccessStrategy strategy)
+lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level,
+				 BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -118,12 +124,6 @@ lion_dirdel_read_ext(Relation index, BlockNumber blk, int lockmode, int level,
 						RelationGetRelationName(index), blk, level)));
 	}
 	return buf;
-}
-
-static Buffer
-lion_dirdel_read(Relation index, BlockNumber blk, int lockmode, int level)
-{
-	return lion_dirdel_read_ext(index, blk, lockmode, level, NULL);
 }
 
 /* Does the page hold no data item?  (Its high key does not count.) */
@@ -179,11 +179,12 @@ lion_dirdel_copy_item(Page page, OffsetNumber off, Size *size)
  * below it, lands on the page that holds the downlink, or - after a
  * concurrent split - on one to its left, from which the caller scans right.
  * (lion_dir_search() would land right of it: sk is where the right sibling's
- * range begins.)
+ * range begins.)  Every page but the meta page is read through strategy.
  */
 static Buffer
 lion_dirdel_descend(Relation index, LionIndexState *ix,
-					const LionSearchKey *sk, uint16 level)
+					const LionSearchKey *sk, uint16 level,
+					BufferAccessStrategy strategy)
 {
 	Buffer		buf = InvalidBuffer;
 	uint32		height;
@@ -199,7 +200,7 @@ lion_dirdel_descend(Relation index, LionIndexState *ix,
 
 		if (height < level)
 			return InvalidBuffer;
-		buf = lion_dirdel_read(index, root, BUFFER_LOCK_SHARE, -1);
+		buf = lion_dirdel_read(index, root, BUFFER_LOCK_SHARE, -1, strategy);
 		if (LionPageIsRoot(BufferGetPage(buf)))
 			break;
 		UnlockReleaseBuffer(buf);
@@ -217,11 +218,20 @@ lion_dirdel_descend(Relation index, LionIndexState *ix,
 		BlockNumber child;
 		LionRightWalk walk;
 
+		/* right past a concurrent split: lion_dir_step_right(), but ringed */
 		lion_rightwalk_init(&walk);
 		while (!LionPageIsRightmost(page) &&
 			   lion_cmp_entry(lion_dir_highkey(page), sk) < 0)
 		{
-			buf = lion_dir_step_right(index, buf, BUFFER_LOCK_SHARE, &walk);
+			BlockNumber blk = BufferGetBlockNumber(buf);
+			BlockNumber next = LionPageGetOpaque(page)->rightlink;
+			int			slevel = LionPageGetOpaque(page)->level;
+
+			lion_rightwalk_step(index, &walk, blk, next);
+			UnlockReleaseBuffer(buf);
+			CHECK_FOR_INTERRUPTS();
+			buf = lion_dirdel_read(index, next, BUFFER_LOCK_SHARE, slevel,
+								   strategy);
 			page = BufferGetPage(buf);
 		}
 
@@ -247,7 +257,8 @@ lion_dirdel_descend(Relation index, LionIndexState *ix,
 		/* the parent goes before the child is locked (lion_dir.c) */
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
-		buf = lion_dirdel_read(index, child, BUFFER_LOCK_SHARE, plevel - 1);
+		buf = lion_dirdel_read(index, child, BUFFER_LOCK_SHARE, plevel - 1,
+							   strategy);
 	}
 }
 
@@ -260,13 +271,14 @@ lion_dirdel_descend(Relation index, LionIndexState *ix,
 static Buffer
 lion_dirdel_find_parent(Relation index, LionIndexState *ix,
 						BlockNumber child, uint16 childlevel,
-						const LionSearchKey *sk, OffsetNumber *offp)
+						const LionSearchKey *sk, OffsetNumber *offp,
+						BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	BlockNumber blk;
 	LionRightWalk walk;
 
-	buf = lion_dirdel_descend(index, ix, sk, childlevel + 1);
+	buf = lion_dirdel_descend(index, ix, sk, childlevel + 1, strategy);
 	if (!BufferIsValid(buf))
 		return InvalidBuffer;
 	blk = BufferGetBlockNumber(buf);
@@ -288,7 +300,7 @@ lion_dirdel_find_parent(Relation index, LionIndexState *ix,
 		if (blk == child)
 			return InvalidBuffer;	/* damage; verify() reports it */
 		buf = lion_dirdel_read(index, blk, BUFFER_LOCK_EXCLUSIVE,
-							   childlevel + 1);
+							   childlevel + 1, strategy);
 		page = BufferGetPage(buf);
 
 		if (!LionPageIsDeleted(page))
@@ -404,7 +416,8 @@ lion_dirdel_count(Relation index, int n)
  * way.
  */
 static bool
-lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
+lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf,
+						  BufferAccessStrategy strategy)
 {
 	Page		leaf = BufferGetPage(leafbuf);
 	BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
@@ -441,7 +454,7 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
 		OffsetNumber maxoff;
 
 		pbuf = lion_dirdel_find_parent(index, ix, child, childlevel, &sk,
-									   &poff);
+									   &poff, strategy);
 		if (!BufferIsValid(pbuf))
 			return false;
 		ppage = BufferGetPage(pbuf);
@@ -530,7 +543,8 @@ lion_dirdel_mark_halfdead(Relation index, LionIndexState *ix, Buffer leafbuf)
  * the subtree for the next VACUUM.
  */
 static bool
-lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
+lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done,
+				   BufferAccessStrategy strategy)
 {
 	BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
 	Page		leaf = BufferGetPage(leafbuf);
@@ -574,7 +588,8 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 	}
 	else
 	{
-		tbuf = lion_dirdel_read(index, target, BUFFER_LOCK_SHARE, -1);
+		tbuf = lion_dirdel_read(index, target, BUFFER_LOCK_SHARE, -1,
+								strategy);
 		tpage = BufferGetPage(tbuf);
 		leftsib = LionPageGetOpaque(tpage)->leftlink;
 		level = LionPageGetOpaque(tpage)->level;
@@ -598,7 +613,8 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		LionRightWalk walk;
 
 		lion_rightwalk_init(&walk);
-		lbuf = lion_dirdel_read(index, leftsib, BUFFER_LOCK_EXCLUSIVE, level);
+		lbuf = lion_dirdel_read(index, leftsib, BUFFER_LOCK_EXCLUSIVE, level,
+								strategy);
 		for (;;)
 		{
 			Page		lpage = BufferGetPage(lbuf);
@@ -620,7 +636,7 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 			lion_rightwalk_step(index, &walk, leftsib, next);
 			leftsib = next;
 			lbuf = lion_dirdel_read(index, leftsib, BUFFER_LOCK_EXCLUSIVE,
-									level);
+									level, strategy);
 		}
 	}
 
@@ -632,7 +648,8 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 		tbuf = leafbuf;
 	}
 	else
-		tbuf = lion_dirdel_read(index, target, BUFFER_LOCK_EXCLUSIVE, level);
+		tbuf = lion_dirdel_read(index, target, BUFFER_LOCK_EXCLUSIVE, level,
+								strategy);
 	tpage = BufferGetPage(tbuf);
 
 	if (LionPageIsRightmost(tpage) || LionPageIsRoot(tpage) ||
@@ -673,7 +690,8 @@ lion_dirdel_unlink(Relation index, Buffer leafbuf, bool *done)
 	if (rightsib == leafblk || rightsib == target ||
 		(BufferIsValid(lbuf) && rightsib == BufferGetBlockNumber(lbuf)))
 		goto out;
-	rbuf = lion_dirdel_read(index, rightsib, BUFFER_LOCK_EXCLUSIVE, level);
+	rbuf = lion_dirdel_read(index, rightsib, BUFFER_LOCK_EXCLUSIVE, level,
+							strategy);
 	rpage = BufferGetPage(rbuf);
 	if (LionPageGetOpaque(rpage)->leftlink != target ||
 		LionPageIsDeleted(rpage))
@@ -751,13 +769,9 @@ lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
 	int			ndeleted = 0;
 	bool		halfdead;
 
-	/*
-	 * A look first, SHARE: nearly every leaf VACUUM walks is not empty.
-	 * Through VACUUM's strategy, as its walk read the leaf a moment ago: read
-	 * without it, every leaf of the index would stay in shared buffers.
-	 */
-	leafbuf = lion_dirdel_read_ext(index, leafblk, BUFFER_LOCK_SHARE, 0,
-								   strategy);
+	/* A look first, SHARE: nearly every leaf VACUUM walks is not empty. */
+	leafbuf = lion_dirdel_read(index, leafblk, BUFFER_LOCK_SHARE, 0,
+							   strategy);
 	leaf = BufferGetPage(leafbuf);
 	halfdead = LionPageIsHalfDead(leaf) && !LionPageIsDeleted(leaf);
 	if (!halfdead && !lion_dirdel_leaf_candidate(leaf))
@@ -773,7 +787,7 @@ lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
 		LockBuffer(leafbuf, BUFFER_LOCK_UNLOCK);
 		LockBuffer(leafbuf, BUFFER_LOCK_EXCLUSIVE);
 		marked = lion_dirdel_leaf_candidate(leaf) &&
-			lion_dirdel_mark_halfdead(index, ix, leafbuf);
+			lion_dirdel_mark_halfdead(index, ix, leafbuf, strategy);
 		LockBuffer(leafbuf, BUFFER_LOCK_UNLOCK);
 		if (!marked)
 		{
@@ -797,7 +811,7 @@ lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
 		bool		done;
 
 		CHECK_FOR_INTERRUPTS();
-		if (!lion_dirdel_unlink(index, leafbuf, &done))
+		if (!lion_dirdel_unlink(index, leafbuf, &done, strategy))
 			break;
 		ndeleted++;
 		if (done)

@@ -67,7 +67,7 @@
  *
  * owner_head is the chain's head block, and it is a chain identity that is
  * unique for the whole life of the index: a chain's head page is the only
- * page lion_new_buffer() refuses to take from the free space map (see
+ * page lion_alloc_page() is told not to take from the free space map (see
  * lion_entry_spill()), so a head block always comes from extending the
  * relation and no two chains, at any two times, can share one.  That is what
  * lets a reader that knows only the head block - the count cursor, whose
@@ -195,7 +195,7 @@ lion_page_owns(Page page, BlockNumber head)
  * Is this page a live page of the tree - posting or position - whose root
  * block is root?  The tree code (lion_posting.c) serves both kinds and asks
  * this: a root block is a tree's identity for the whole life of the index
- * (a head is never recycled as a head, lion_new_buffer()), so the owner
+ * (a head is never recycled as a head, lion_alloc_page()), so the owner
  * stamp alone tells the trees apart, and a page of one can never pass for a
  * page of the other.  The kind of a page is in its LION_PAGE_POSITIONS bit,
  * which every page of a tree shares with its root.
@@ -344,10 +344,10 @@ lion_posting_highkey(Page page)
  * round a cycle of damaged right links.  EVERY walk along a level of the
  * directory or of a posting set steps through this - the readers', the
  * writers' and VACUUM's alike; only lion_index_verify() keeps counts and a
- * map of the blocks it has seen of its own.  The scans, the counts and VACUUM
- * used to go round such a cycle until they were cancelled, and autovacuum,
- * which nothing cancels, for ever (2026-09-29 review).  Some walks could not
- * even be cancelled: a posting-tree writer holds its key's directory leaf the
+ * map of the blocks it has seen of its own.  Without the bound the scans, the
+ * counts and VACUUM would go round such a cycle until they were cancelled,
+ * and autovacuum, which nothing cancels, for ever - and some walks cannot be
+ * cancelled at all: a posting-tree writer holds its key's directory leaf the
  * whole time, the directory's find-or-create holds its guard, and a content
  * lock holds interrupts off, so CHECK_FOR_INTERRUPTS() does nothing there and
  * statement_timeout never fires.  (That holds on every major: LockBuffer()
@@ -1566,8 +1566,11 @@ extern LionState *lion_get_state(Relation index);
 extern void lion_init_page(Page page, uint16 flags);
 
 /*
- * A page for the index: a recycled one from the free space map when there is
- * one that is safe to take, else a brand new block (DESIGN.md §18).
+ * Take a block for the index WITHOUT starting a record: a recycled one from
+ * the free space map when one is safe to take, else a fresh one from
+ * extending the relation (DESIGN.md §18).  The buffer comes back pinned and
+ * EXCLUSIVE with an uninitialised page, which the caller initialises in its
+ * record with lion_wal_init_buffer().
  *
  * heaprel is what GlobalVisCheckRemovableFullXid() needs in order to decide
  * whether a DELETED page's safexid is old enough for the page to be reused;
@@ -1575,16 +1578,6 @@ extern void lion_init_page(Page page, uint16 flags);
  * false is the same thing for one call, and is how a chain's HEAD page is
  * allocated: head blocks must be unique for the life of the index, because
  * that is what makes owner_head a chain identity a reader can trust.
- *
- * The buffer comes back pinned and EXCLUSIVE with the page initialised.
- */
-extern Buffer lion_new_buffer(Relation index, Relation heaprel, uint16 flags);
-
-/*
- * Take a block for the index WITHOUT starting a record: a recycled one from
- * the free space map when one is safe to take, else a fresh one from
- * extending the relation.  The buffer comes back pinned and EXCLUSIVE with an
- * uninitialised page.
  *
  * This is the fallible half of allocating a page, and DESIGN.md §25 requires
  * it to happen BEFORE lion_wal_begin(): in rmgr mode the record is written
@@ -1594,9 +1587,6 @@ extern Buffer lion_new_buffer(Relation index, Relation heaprel, uint16 flags);
  * record.
  */
 extern Buffer lion_alloc_page(Relation index, Relation heaprel, bool reuse);
-
-/* Give back a page taken by lion_alloc_page() and not used after all. */
-extern void lion_release_unused_page(Relation index, Buffer buf);
 
 extern void lion_init_metapage(Page page, uint32 inline_limit,
 							  BlockNumber root, uint32 height,
@@ -1951,7 +1941,8 @@ extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
  * above it that have no other child - or it finishes doing so for a leaf an
  * earlier VACUUM left HALF_DEAD.  Nothing may be held on entry, and the
  * return value is the number of pages it marked DELETED.  strategy is
- * VACUUM's (info->strategy), which the leaf is looked at through.
+ * VACUUM's (info->strategy), which every page it reads but the meta page goes
+ * through.
  *
  * lion_dir_past_deleted() hands back buf, a directory page locked in
  * lockmode, or - when that page is DELETED - the first page to its right that
@@ -2127,11 +2118,16 @@ extern Buffer lion_posting_search_before(Relation index, Relation heaprel,
  * of that level the separators route ckey to, locked SHARE, or InvalidBuffer.
  * With `before`, the route of what sorts just below ckey, as
  * lion_posting_search_before() takes it.  For lion_index_verify() (DESIGN.md
- * §7), as lion_dir_search_level() is.
+ * §7), as lion_dir_search_level() is, and for VACUUM, which reads through its
+ * ring: _ext's strategy, info->strategy.
  */
 extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
 										uint32 ckey, uint16 level,
 										bool before);
+extern Buffer lion_posting_search_level_ext(Relation index, BlockNumber head,
+											uint32 ckey, uint16 level,
+											bool before,
+											BufferAccessStrategy strategy);
 
 /*
  * Take the empty leaf blk out of the posting set (hash, head) while the key
@@ -2139,11 +2135,13 @@ extern Buffer lion_posting_search_level(Relation index, BlockNumber head,
  * neighbour's right link and its parent's downlink go to its right sibling,
  * and it is flagged LION_PAGE_UNLINKED, for a later VACUUM to recycle.  The
  * caller holds the key's directory leaf EXCLUSIVE; hint is a leaf it saw left
- * of blk, or InvalidBlockNumber.  False when the leaf may not go now.
+ * of blk, or InvalidBlockNumber.  False when the leaf may not go now.  Every
+ * page is read through strategy, VACUUM's (info->strategy).
  */
 extern bool lion_posting_unlink_leaf(Relation index, uint32 hash,
 									 BlockNumber head, BlockNumber hint,
-									 BlockNumber blk);
+									 BlockNumber blk,
+									 BufferAccessStrategy strategy);
 
 /*
  * The SEPARATORS of the posting set rooted at head - the first container key
@@ -2164,11 +2162,18 @@ extern uint32 *lion_posting_separators(Relation index, BlockNumber head,
 									   int want, int maxpages, int *nsep,
 									   int *level, int *pages);
 
-/* The leftmost leaf, where every sequential walk of a posting set starts. */
-extern BlockNumber lion_posting_leftmost_leaf(Relation index, uint32 hash,
-											  BlockNumber head);
+/*
+ * The leftmost leaf of the set rooted at head, read through strategy, or
+ * InvalidBlockNumber when the set is gone: for VACUUM taking a leaf out of
+ * the set (lion_posting_delete.c).
+ */
+extern BlockNumber lion_posting_leftmost_leaf(Relation index, BlockNumber head,
+											  BufferAccessStrategy strategy);
 
-/* The same, as DESIGN.md §4 named it; now a descent rather than a walk. */
+/*
+ * The container page that owns ckey in the posting set at head (DESIGN.md
+ * §4), found by a descent (lion_posting_search()).
+ */
 extern BlockNumber lion_chain_find_page(Relation index, uint32 hash,
 									   BlockNumber head, BlockNumber tail,
 									   uint32 ckey);

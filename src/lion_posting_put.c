@@ -378,18 +378,14 @@ lion_chain_put_container(Relation index, Relation heaprel, Buffer entrybuf,
  *	- VACUUM spills the payload it has just FILTERED, and removing members
  *	  can make a payload grow by an order of magnitude.  A clustered key's
  *	  RUN container is a few hundred bytes for 64 heap pages of rows; the
- *	  same container with a tenth of them gone at random is a 4104-byte
- *	  BITSET, and two of those do not fit one page.  A 4 KB payload of such
- *	  containers needs a leaf per container: seven for a 300,000-row table of
- *	  three keys, eleven for 150,000 rows of one key with every other row
- *	  deleted.
+ *	  same container with a tenth of them gone at random is a bitmap, a
+ *	  NARROW of up to 2,568 bytes at 8K (DESIGN.md §38), and a few
+ *	  kilobytes of such RUNs become several leaves of NARROWs.
  *
- * This code used to allocate every leaf before its first record and refused
- * anything past four as "unreachable" - which it is for an INSERT - so every
- * VACUUM of such a table failed, and failed again the next time, autovacuum
- * and the anti-wraparound VACUUM included, until the failsafe gave up on
- * index vacuuming (2026-09-25 review).  The number of leaves is bounded by
- * the root now and by nothing else:
+ * The number of leaves is bounded by the root and by nothing else.  A
+ * tighter bound, which an INSERT never reaches, would fail every VACUUM of
+ * such a table, and again the next time, autovacuum and the anti-wraparound
+ * VACUUM included, until the failsafe gave up on index vacuuming:
  *
  *	1. The ROOT is allocated first, because every page of a posting set is
  *	   stamped with the root's block (§18) - and never from the free space

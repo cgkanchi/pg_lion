@@ -269,7 +269,8 @@ lion_posting_check_level(Relation index, Page page, BlockNumber blk,
  * blk a second time and wait for itself for ever, so it is refused before the
  * lock.  The pages checked are the page a walk steps from and every page the
  * enclosing split repairs hold (LionPostingHeld), however far up and sideways
- * the repair has recursed (DESIGN.md §22, 2026-09-28 addendum).
+ * the repair has recursed (DESIGN.md §22, addendum "a repair inside a
+ * repair").
  */
 static void
 lion_posting_held(Relation index, BlockNumber head, BlockNumber blk)
@@ -337,10 +338,15 @@ lion_rightwalk_badlink(Relation index, BlockNumber blk, BlockNumber next)
  * READER treats it as the end of the set and gets InvalidBuffer back.  Every
  * WRITER holds the entry's directory leaf, so the set cannot go away under it
  * and a mismatch is corruption - those callers pass strict.
+ *
+ * The page is read through strategy: NULL, or VACUUM's (info->strategy) for
+ * the descents VACUUM makes to take a leaf out of the set
+ * (lion_posting_delete.c), which read through its ring as its walk does.
  */
 static Buffer
-lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
-					int lockmode, bool strict)
+lion_posting_getbuf_ext(Relation index, BlockNumber blk, BlockNumber head,
+						int lockmode, bool strict,
+						BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -356,7 +362,7 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
 	}
 
 	lion_posting_pages_read++;
-	buf = ReadBuffer(index, blk);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
 	LockBuffer(buf, lockmode);
 	page = BufferGetPage(buf);
 
@@ -372,6 +378,13 @@ lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
 	}
 
 	return buf;
+}
+
+static Buffer
+lion_posting_getbuf(Relation index, BlockNumber blk, BlockNumber head,
+					int lockmode, bool strict)
+{
+	return lion_posting_getbuf_ext(index, blk, head, lockmode, strict, NULL);
 }
 
 /*
@@ -418,11 +431,13 @@ lion_posting_downlink_off(Relation index, Page page, BlockNumber blk,
 
 /*
  * Move to the right sibling, releasing the page we came from first.  walk is
- * the walk the step belongs to; the caller checks the sibling's level.
+ * the walk the step belongs to; the caller checks the sibling's level.  The
+ * sibling is read through strategy (lion_posting_getbuf_ext()).
  */
 static Buffer
 lion_posting_step_right(Relation index, Buffer buf, BlockNumber head,
-						int lockmode, bool strict, LionRightWalk *walk)
+						int lockmode, bool strict, LionRightWalk *walk,
+						BufferAccessStrategy strategy)
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 
@@ -431,7 +446,8 @@ lion_posting_step_right(Relation index, Buffer buf, BlockNumber head,
 
 	/* Between the pages, where no content lock holds interrupts off. */
 	CHECK_FOR_INTERRUPTS();
-	return lion_posting_getbuf(index, next, head, lockmode, strict);
+	return lion_posting_getbuf_ext(index, next, head, lockmode, strict,
+								   strategy);
 }
 
 /*
@@ -701,7 +717,7 @@ restart:
 			 lion_posting_highkey_at(index, page, blk)->ckey <= ckey))
 		{
 			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
-										  forwrite, &walk);
+										  forwrite, &walk, NULL);
 			if (!BufferIsValid(buf))
 				return InvalidBuffer;
 			if (LionPageGetOpaque(BufferGetPage(buf))->level != level)
@@ -740,7 +756,7 @@ restart:
 					   !LionPageIsRightmost(page))
 				{
 					buf = lion_posting_step_right(index, buf, head, lockmode,
-												  false, &walk);
+												  false, &walk, NULL);
 					if (!BufferIsValid(buf))
 						return InvalidBuffer;
 					page = BufferGetPage(buf);
@@ -809,19 +825,23 @@ restart:
  * run of equal separators would send the search without it to the last of
  * them (lion_posting_search_before(), lion_postree.c).
  *
- * lion_index_verify() is the caller (DESIGN.md §7).  A posting page its walk
+ * lion_index_verify() is one caller (DESIGN.md §7).  A posting page its walk
  * did not reach may be one a writer of that key made after the walk of the
  * set was over, and a search for the page's own first container key landing
  * on it, or left of it on its level, is the proof that it belongs to the
- * tree.  A page at a level its link does not promise starts the descent
- * again, a bounded number of times, as in lion_posting_search(), and then
- * there is no answer; a leaf whose right link leads above level 0 is the end
- * of the set, as it is there.  The links and pivots are checked as every
- * descent checks them, so a damaged one is an ERROR here too.
+ * tree.  VACUUM is the other: taking a leaf out of its set, it finds the
+ * leftmost leaf and the leaf's parent this way (lion_posting_delete.c),
+ * reading through its ring (strategy; NULL otherwise).  A page at a level
+ * its link does not promise starts the descent again, a bounded number of
+ * times, as in lion_posting_search(), and then there is no answer; a leaf
+ * whose right link leads above level 0 is the end of the set, as it is
+ * there.  The links and pivots are checked as every descent checks them, so
+ * a damaged one is an ERROR here too.
  */
 Buffer
-lion_posting_search_level(Relation index, BlockNumber head, uint32 ckey,
-						  uint16 level, bool before)
+lion_posting_search_level_ext(Relation index, BlockNumber head, uint32 ckey,
+							  uint16 level, bool before,
+							  BufferAccessStrategy strategy)
 {
 	int			restarts = 0;
 	Buffer		buf;
@@ -832,7 +852,8 @@ restart:
 	if (restarts++ > LION_POSTING_MAX_HEIGHT)
 		return InvalidBuffer;
 
-	buf = lion_posting_getbuf(index, head, head, BUFFER_LOCK_SHARE, false);
+	buf = lion_posting_getbuf_ext(index, head, head, BUFFER_LOCK_SHARE, false,
+								  strategy);
 	if (!BufferIsValid(buf))
 		return InvalidBuffer;
 	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
@@ -858,7 +879,7 @@ restart:
 			 lion_posting_highkey_at(index, page, blk)->ckey <= ckey))
 		{
 			buf = lion_posting_step_right(index, buf, head, BUFFER_LOCK_SHARE,
-										  false, &walk);
+										  false, &walk, strategy);
 			if (!BufferIsValid(buf))
 				return InvalidBuffer;
 			if (LionPageGetOpaque(BufferGetPage(buf))->level != plevel)
@@ -876,7 +897,8 @@ restart:
 				   !LionPageIsRightmost(page))
 			{
 				buf = lion_posting_step_right(index, buf, head,
-											  BUFFER_LOCK_SHARE, false, &walk);
+											  BUFFER_LOCK_SHARE, false, &walk,
+											  strategy);
 				if (!BufferIsValid(buf))
 					return InvalidBuffer;
 				page = BufferGetPage(buf);
@@ -897,7 +919,8 @@ restart:
 		/* Release the parent BEFORE locking the child; see the file header. */
 		UnlockReleaseBuffer(buf);
 		CHECK_FOR_INTERRUPTS();
-		buf = lion_posting_getbuf(index, child, head, BUFFER_LOCK_SHARE, false);
+		buf = lion_posting_getbuf_ext(index, child, head, BUFFER_LOCK_SHARE,
+									  false, strategy);
 		if (!BufferIsValid(buf))
 			return InvalidBuffer;
 		if (LionPageGetOpaque(BufferGetPage(buf))->level != plevel - 1)
@@ -908,6 +931,14 @@ restart:
 		}
 		lion_rightwalk_init(&walk);
 	}
+}
+
+Buffer
+lion_posting_search_level(Relation index, BlockNumber head, uint32 ckey,
+						  uint16 level, bool before)
+{
+	return lion_posting_search_level_ext(index, head, ckey, level, before,
+										 NULL);
 }
 
 /*
@@ -1063,17 +1094,18 @@ lion_posting_separators(Relation index, BlockNumber head, int want,
 }
 
 BlockNumber
-lion_posting_leftmost_leaf(Relation index, uint32 hash, BlockNumber head)
+lion_posting_leftmost_leaf(Relation index, BlockNumber head,
+						   BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	BlockNumber blk;
 
 	/*
-	 * Container key 0 is the smallest there is, so an ordinary descent for it
-	 * takes the leftmost downlink of every level.
+	 * Container key 0 is the smallest there is, so a reader's descent for it
+	 * takes the leftmost downlink of every level, and no leaf's maxckey is
+	 * below it to walk right from.
 	 */
-	buf = lion_posting_search(index, NULL, hash, head, 0, BUFFER_LOCK_SHARE,
-							  false);
+	buf = lion_posting_search_level_ext(index, head, 0, 0, false, strategy);
 	if (!BufferIsValid(buf))
 		return InvalidBlockNumber;
 
@@ -1084,9 +1116,9 @@ lion_posting_leftmost_leaf(Relation index, uint32 hash, BlockNumber head)
 }
 
 /*
- * DESIGN.md §4 called this "the container page that owns ckey", and it was a
- * walk from the head; it is a descent now, and it is still the only place a
- * container key is turned into a block.  The caller holds the entry, so the
+ * "The container page that owns ckey" (DESIGN.md §4), found by a descent from
+ * the head: the only place a container key is turned into a block.  The
+ * caller holds the entry, so the
  * set cannot go away and anything unexpected is corruption.  `tail` is
  * accepted and unused: the append hint lives in the insert path, which takes
  * the tail page EXCLUSIVE directly (lion_insert_lock_chain_page()).
@@ -1140,9 +1172,8 @@ lion_chain_find_page(Relation index, uint32 hash, BlockNumber head,
  * places it, VACUUM's regrow subtracts the TIDs it filtered out), and they go
  * onto the child in a LATER record - the child's own split, which allocates
  * pages and can fail, or be cut short by a crash.  Logging the caller's
- * counters here would leave them claiming items that no page holds (the
- * 2026-09-25 review measured "claims 9241 TIDs, but its containers hold 9240"
- * after an ERROR at lion-posting-pushdown-child).  The push-down moves items
+ * counters here would leave them claiming items that no page holds after an
+ * ERROR at lion-posting-pushdown-child.  The push-down moves items
  * without changing them, so the counters on the page are exactly right for
  * the tree it leaves behind; the caller's copy gets the new `tail` too, and
  * its counters travel with the record that really places the items.
@@ -2054,7 +2085,8 @@ lion_posting_level_start(Relation index, BlockNumber head, uint16 level,
 				if (BufferIsValid(lion_posting_held_buffer(held, next)))
 					lion_posting_held(index, head, next);
 				buf = lion_posting_step_right(index, buf, head,
-											  BUFFER_LOCK_SHARE, true, &walk);
+											  BUFFER_LOCK_SHARE, true, &walk,
+											  NULL);
 				page = BufferGetPage(buf);
 				blk = BufferGetBlockNumber(buf);
 				lion_posting_check_level(index, page, blk, plevel);
@@ -2330,10 +2362,9 @@ lion_posting_adopt(Relation index, Relation heaprel, uint32 hash,
  * which is every page the repair holds (LionPostingHeld).
  *
  * A child with no downlink at all is repaired rather than reported: see
- * lion_posting_adopt().  Before that repair existed, an append that took the
- * right half of an unfinished split through the append hint and then filled
- * it hit an ERROR here, and so did every later split of the tail, for good
- * (2026-09-25 review).
+ * lion_posting_adopt().  An ERROR here would fail every later split of the
+ * tail of a set whose right half of an unfinished split an append filled,
+ * for good.
  */
 static Buffer
 lion_posting_find_parent(Relation index, Relation heaprel, uint32 hash,
