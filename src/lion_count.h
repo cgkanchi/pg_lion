@@ -1912,6 +1912,14 @@ extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								const AttrNumber *cols, Node **clauses);
 
 /*
+ * The list a planner run keeps what lion_tsquery_pos_shape() found of each
+ * position filter's clause on (lion_plan_cost.c), and in *cxt the run's
+ * memory they are kept in: a path's price asks the same clause again at
+ * every path of it.
+ */
+extern List **lion_run_posshapes(PlannerInfo *root, MemoryContext *cxt);
+
+/*
  * One form for one filter (DESIGN.md §29.11, "An OR of equalities is its IN
  * list"): an OR of equalities on one expression with constants - one
  * operator, collation and constant type - as the `expr = ANY (array)` it

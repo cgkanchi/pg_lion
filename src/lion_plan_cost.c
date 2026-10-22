@@ -6136,9 +6136,9 @@ lion_tsquery_anded(QueryItem *items, int32 size, int32 i, const int *itemlex,
  * False for a clause that is not `col @@ tsquery` of a literal.
  */
 static bool
-lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
-					   AttrNumber col, Node *clause, double *widen, int *nlex,
-					   double **lexsel)
+lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
+						  IndexOptInfo *idx, AttrNumber col, Node *clause,
+						  double *widen, int *nlex, double **lexsel)
 {
 	OpExpr	   *op;
 	Node	   *arg;
@@ -6162,7 +6162,6 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	*widen = 1.0;
 	*nlex = 0;
 	*lexsel = NULL;
-	clause = lion_vcol_unvar(clause);
 	if (clause == NULL || !IsA(clause, OpExpr) ||
 		list_length(((OpExpr *) clause)->args) != 2)
 		return false;
@@ -6274,6 +6273,82 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	*nlex = n;
 	*lexsel = sels;
 	return true;
+}
+
+/* What lion_tsquery_pos_shape() found of one clause, kept for the run. */
+typedef struct LionPosShape
+{
+	Oid			indexoid;
+	AttrNumber	col;
+	Node	   *clause;			/* lion_vcol_unvar()'s, in the run's memory */
+	bool		ok;
+	double		widen;
+	int			nlex;
+	double	   *lexsel;
+} LionPosShape;
+
+/*
+ * lion_tsquery_pos_shape_of() of `clause`, once a planner run: every path
+ * of a count, a join or a scan prices its filters again, and a query of
+ * hundreds of lexemes would ask core about each of them every time - 500 of
+ * them, 11 ms more on a plan of 4, where once is 3 ms more.  Kept by the
+ * index and column it is answered on, and the clause, whose Var names the
+ * relation.  *lexsel is the caller's.
+ */
+static bool
+lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					   AttrNumber col, Node *clause, double *widen, int *nlex,
+					   double **lexsel)
+{
+	List	  **shapes;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionPosShape *e;
+	ListCell   *lc;
+
+	clause = lion_vcol_unvar(clause);
+	if (root == NULL || root->glob == NULL || idx == NULL)
+		return lion_tsquery_pos_shape_of(root, rel, idx, col, clause, widen,
+										 nlex, lexsel);
+
+	shapes = lion_run_posshapes(root, &cxt);
+	foreach(lc, *shapes)
+	{
+		e = (LionPosShape *) lfirst(lc);
+		if (e->indexoid != idx->indexoid || e->col != col ||
+			!equal(e->clause, clause))
+			continue;
+		*widen = e->widen;
+		*nlex = e->nlex;
+		*lexsel = NULL;
+		if (!e->ok)
+			return false;
+		*lexsel = (double *) palloc(sizeof(double) * e->nlex);
+		memcpy(*lexsel, e->lexsel, sizeof(double) * e->nlex);
+		return true;
+	}
+
+	oldcxt = MemoryContextSwitchTo(cxt);
+	e = (LionPosShape *) palloc0(sizeof(LionPosShape));
+	e->indexoid = idx->indexoid;
+	e->col = col;
+	e->clause = copyObject(clause);
+	MemoryContextSwitchTo(oldcxt);
+
+	e->ok = lion_tsquery_pos_shape_of(root, rel, idx, col, clause, widen,
+									  nlex, lexsel);
+	e->widen = *widen;
+	e->nlex = *nlex;
+	if (e->ok)
+	{
+		e->lexsel = (double *) MemoryContextAlloc(cxt,
+												  sizeof(double) * *nlex);
+		memcpy(e->lexsel, *lexsel, sizeof(double) * *nlex);
+	}
+	oldcxt = MemoryContextSwitchTo(cxt);
+	*shapes = lappend(*shapes, e);
+	MemoryContextSwitchTo(oldcxt);
+	return e->ok;
 }
 
 /*
