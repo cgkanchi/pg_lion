@@ -6,11 +6,11 @@
 --
 -- is the count of r's WHERE less the rows of it some row of s matches.  The
 -- node runs s as its child, looks each distinct key of its rows up in a
--- B-tree on r.k under the query's snapshot, tests every row found on the
--- join clauses and r's own clauses, and subtracts the ones that pass - from
--- the one row of a count, from each group of a GROUP BY, or from each cell
--- of a count by cells.  Every answer is checked against the same query with
--- the pushdown off, as a multiset in both directions.
+-- B-tree on r.k under the query's snapshot, tests every row found on r's own
+-- clauses and then on the join clauses, and subtracts the ones that pass -
+-- from the one row of a count, from each group of a GROUP BY, or from each
+-- cell of a count by cells.  Every answer is checked against the same query
+-- with the pushdown off, as a multiset in both directions.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
