@@ -6404,10 +6404,27 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its callbacks:
     8.2 to 9.4 ns and 21.6 ns on the release build (§10, "The units"), at the reference's 5 ns a
     `cpu_operator_cost`; the same counts without positions run there at 350 to 1,100 units a
-    millisecond, around the reference.  A lexeme's members are the share of the rows that makes
-    the clause's selectivity their product.  The copy is priced once for its candidates, and
-    every other count for its own, its lexemes decoded up to them - which an FK-side join's
-    probing counts, their candidates a few of every part of the heap, pay at almost every one.
+    millisecond, around the reference.  The candidates are the SUPERSET's rows, not the clause's
+    (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a query of it alone,
+    the clause and its superset are combined from those as core combines a tsquery's operands,
+    and the candidates are the rows the caller's filters select times the superset's share over
+    the clause's - 1 for `foo <-> bar`, whose superset `foo & bar` core estimates as it estimates
+    the phrase, and 8 for `foo <-> !bar` of `foo` in every row and `bar` in seven of eight - and
+    times what the intersection probe measures of the AND of the superset's lexemes (§29.11,
+    "Correlated sets"): `new <-> york` of two lexemes in the same tenth of the rows is a
+    hundredth of them by core's product, and its candidates are the whole tenth.  A cursor is a
+    lexeme's, one for each the query names, those under a NOT too, and its members are the rows
+    that have the lexeme.  Priced from the clause's own rows and the superset's one lexeme,
+    `foo <-> !bar` would come to a sixteenth of what it takes: over 400,000 rows and 2,000 keys,
+    the FK-side join would be taken at one to ten keys over a nested loop into a btree of the
+    fact's key that runs 8 to 40 times as fast (1.2 ms against 18 ms at two keys, on the release
+    build); and the correlated phrase's probing counts would be priced at a fifth of their time.
+    A correlation the probe does not take - less than three times core's product, as for any
+    AND - stays in the price: `foo <-> bar` of two lexemes in the same three rows of four is
+    decided over 0.75 of the rows and priced over core's 0.56.  The copy is priced once for its
+    candidates, and every other count for its own, its lexemes decoded up to them - which an
+    FK-side join's probing counts, their candidates a few of every part of the heap, pay at
+    almost every one.
     The heap recheck (`lion_cost_recheck()`) charges such a clause nothing.  An AM scan, plain or
     bitmap, is priced the same way once a scan (`lion_cost_scan_posfilter()`, from
     `lioncostestimate()`): its cursors begin again at every scan, so a nested loop's inner scan
@@ -9837,10 +9854,11 @@ leading with the key still pays: a C or ICU collation gets abbreviated keys ther
 
 **Parallel build** (PostgreSQL 17 and later, `amcanbuildparallel`; 16's `index_build()` asks for
 workers only for btree). nbtree's and GIN's shape: the leader sets up a parallel heap scan, a shared
-fileset and one TapeShare per participant, launches the workers and takes part itself. Each
-participant scans its block chunks into an accumulator of its own, with maintenance_work_mem divided
-between them, spills as a serial build does, and at the end merges each key column's runs into ONE
-tape for that column (`lion_spool_export()`). A column's runs and its tape share a file of the
+fileset and one TapeShare per participant, launches the workers and takes part itself - always, as
+nbtree's and GIN's leaders do: `parallel_leader_participation` is Gather's and Gather Merge's
+setting, and no parallel index build of core's reads it. Each participant scans its block chunks
+into an accumulator of its own, with maintenance_work_mem divided between them, spills as a serial
+build does, and at the end merges each key column's runs into ONE tape for that column (`lion_spool_export()`). A column's runs and its tape share a file of the
 shared fileset, so the tape re-uses the blocks the runs free as the merge reads them. The write that
 follows is split by column, since no two columns share a key (below). Workers get
 their own IndexInfo, so expression and partial indexes work, and report reltuples, index tuples and
@@ -16543,10 +16561,12 @@ reaches the AM (the planner matches `IndexCollMatchesExprColl()` first).
   A scan of an index (`pgstat_count_index_scan()`, which sets `last_idx_scan` too) is counted once
   per scan and per rescan of each index read: LionCount (`lion_count_report_reads()`, as a run's
   relation closes or the node rescans: each of the relation's indexes whose directory was read
-  since, which `lion_dir_read_since()` answers from the mark every directory page read leaves,
-  `lion_dir_count_read()`, with the rows counted since, `statrows` - so an index opened and never
-  read, the group column of a GROUP BY whose WHERE selects nothing or the fk index of a join no
-  dimension row reaches, counts no scan), the FK-side joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
+  since, which `lion_dir_read_since()` answers from the mark every directory page read leaves
+  (`lion_dir_count_read()`; no count asks about a read before its own transaction, so a
+  transaction that leaves more than 64 marks drops them at its end), with the rows counted since,
+  `statrows` - so an index opened and never read, the group column of a GROUP BY whose WHERE
+  selects nothing or the fk index of a join no dimension row reaches, counts no scan), the FK-side
+  joins, LionOrdered and LionBtreeScan for each lion index whose set they build (the B-tree they walk
   is counted by core's own scan under them), LionBm25 and the lionvec scan once per scan, and the
   SQL functions once per call - `lion_bm25_score()` once a query, when it reads the index's
   statistics into its cache. `idx_tup_read` counts what the index gave: a count's rows counted

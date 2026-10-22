@@ -294,6 +294,35 @@ SELECT n, ius_switch(q, '') AS chosen,
 			   ('ordered', 'SELECT id FROM ius WHERE b = 2 ORDER BY a LIMIT 5'),
 			   ('bm25', $$SELECT id FROM ius WHERE d @@ 'w1' ORDER BY lion_bm25_score(d, 'w1', 'ius_d') DESC LIMIT 5$$)) v(n, q);
 
+-- ---------- 8. the marks the statistics are read from ----------
+-- A count reports a scan of each index whose directory it read
+-- (lion_dir_read_since()), from the mark every directory read leaves.  The
+-- marks of a transaction that leaves more than 64 of them are dropped at
+-- its end: a backend that makes, reads and drops 200 indexes, each in a
+-- transaction of its own, holds no more than 64, where it held one for every
+-- index it ever read - and a count after that reports its reads as before.
+CREATE PROCEDURE ius_churn(n int)
+LANGUAGE plpgsql AS $$
+BEGIN
+	FOR i IN 1 .. n LOOP
+		CREATE TEMP TABLE ius_tmp (a int);
+		INSERT INTO ius_tmp SELECT g % 10 FROM generate_series(1, 100) g;
+		CREATE INDEX ius_tmp_a ON ius_tmp USING lion (a);
+		INSERT INTO ius_tmp VALUES (3);
+		DROP TABLE ius_tmp;
+		COMMIT;
+	END LOOP;
+END $$;
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT count(*) AS changed FROM ius_delta();
+CALL ius_churn(200);
+SELECT coalesce(sum(total_bytes), 0) <= 8192 AS marks_bounded
+  FROM pg_backend_memory_contexts WHERE name = 'lion directory reads';
+SELECT count(*) FROM ius WHERE a = 3;
+SELECT pg_stat_force_next_flush() AS f \gset
+SELECT * FROM ius_delta();
+DROP PROCEDURE ius_churn(int);
+
 DROP FUNCTION ius_switch(text, text);
 DROP FUNCTION ius_run(text);
 DROP FUNCTION ius_node(text);

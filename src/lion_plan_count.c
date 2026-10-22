@@ -1515,6 +1515,14 @@ lion_where_indexed(LionCountPathBuild *cx, int from)
  * alone would share those with cx, and a bound taken back would stay in its
  * column's at the position the next clause appended then has, or at one
  * past the end of the lists.
+ *
+ * Each copy is as long as the lists are by then, and a WHERE of n
+ * restrictions takes n of them, so they are given back as soon as they are
+ * done with: the snapshot's once its restriction is answered
+ * (lion_count_path_snapshot_free()), the build's own once the snapshot takes
+ * their place (lion_count_path_restore()).  Kept, they made the planner's
+ * memory grow with the square of the restrictions: 174 MB for 2000 `<>`
+ * clauses on one column, where the plan without the pushdown takes 3 MB.
  */
 static void
 lion_count_path_snapshot(const LionCountPathBuild *cx,
@@ -1545,6 +1553,57 @@ lion_count_path_snapshot(const LionCountPathBuild *cx,
 	foreach(lc, cx->rangepos)
 		snap->rangepos = lappend(snap->rangepos,
 								 list_copy((List *) lfirst(lc)));
+}
+
+/*
+ * Free the lists of b that lion_count_path_snapshot() copies - the outer
+ * lists, and the per-column lists inside rangecls and rangepos - and nothing
+ * they point to: the clauses, Vars and LionClauseInfos are shared between a
+ * build and its snapshot, and so are the IntLists of `ors`, which the
+ * snapshot copies one level deep only.  Either side may be freed so, for
+ * neither shares a list with the other, nor with anything outside the
+ * WHERE's analysis: every one of these lists is NIL when
+ * lion_count_path_where() begins (lion_count_path_init(); no phase before
+ * it fills one), and only the analysis of a restriction appends to them.
+ */
+static void
+lion_count_path_snapshot_free(LionCountPathBuild *b)
+{
+	ListCell   *lc;
+
+	list_free(b->whereattnos);
+	list_free(b->clauseinfos);
+	list_free(b->whereclauses);
+	list_free(b->whereconsts);
+	list_free(b->wherekinds);
+	list_free(b->whereopnos);
+	list_free(b->whereinor);
+	list_free(b->ors);
+	list_free(b->posattnos);
+	list_free(b->eqattnos);
+	list_free(b->nonnullattnos);
+	list_free(b->nullattnos);
+	list_free(b->valueattnos);
+	list_free(b->rangevars);
+	foreach(lc, b->rangecls)
+		list_free((List *) lfirst(lc));
+	list_free(b->rangecls);
+	foreach(lc, b->rangepos)
+		list_free((List *) lfirst(lc));
+	list_free(b->rangepos);
+}
+
+/*
+ * Take back the analysis of a restriction: cx as snap held it, the lists
+ * the analysis had changed freed first.  What the restriction became -
+ * residual, a cell's predicate, implied by every partition - is the
+ * caller's to note, after this.
+ */
+static void
+lion_count_path_restore(LionCountPathBuild *cx, const LionCountPathBuild *snap)
+{
+	lion_count_path_snapshot_free(cx);
+	*cx = *snap;
 }
 
 /*
@@ -1743,7 +1802,10 @@ lion_count_path_where(LionCountPathBuild *cx)
 			!lion_where_indexed(cx, startlen))
 			answered = false;
 		if (answered)
+		{
+			lion_count_path_snapshot_free(&snap);
 			continue;
+		}
 
 		/*
 		 * Built as a count by cells (DESIGN.md §10, "Counts by cells"), a
@@ -1759,7 +1821,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 									 (Node *) rinfo->clause))
 				return false;
 			cellquals = lappend(cx->cellquals, rinfo->clause);
-			*cx = snap;
+			lion_count_path_restore(cx, &snap);
 			cx->cellquals = cellquals;
 			continue;
 		}
@@ -1776,7 +1838,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 		{
 			List	   *residual = lappend(cx->residual, rinfo->clause);
 
-			*cx = snap;
+			lion_count_path_restore(cx, &snap);
 			cx->residual = residual;
 			continue;
 		}
@@ -1800,7 +1862,7 @@ lion_count_path_where(LionCountPathBuild *cx)
 						makeString(lion_deparse_rel_clause(root, rti,
 														   (Node *) rinfo->clause)));
 
-			*cx = snap;
+			lion_count_path_restore(cx, &snap);
 			cx->impliedtexts = implied;
 		}
 	}

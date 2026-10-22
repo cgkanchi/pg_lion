@@ -416,6 +416,64 @@ SELECT cr_q('SELECT count(*) FROM crp WHERE a = 2 AND p LIKE ''a%''');
 (1 row)
 
 DROP TABLE crp;
+-- ---- the planner's memory over a WHERE of many restrictions ----
+-- Each restriction is analysed beside a snapshot of the clause lists
+-- (lion_count_path_snapshot()), a copy as long as the lists are by then,
+-- which is freed once the restriction is answered or taken back.  Kept, a
+-- WHERE of n restrictions held n of them: 44 MB for the first query below,
+-- 23 MB for each of the others, where each now plans in about 2 MB.  The
+-- check is EXPLAIN (MEMORY)'s, which PostgreSQL 16 does not have: there it
+-- only asks for the plan.
+CREATE FUNCTION cr_plan_mem(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	j json;
+	kb bigint := 0;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	IF current_setting('server_version_num')::int >= 170000 THEN
+		EXECUTE 'EXPLAIN (MEMORY, COSTS OFF, FORMAT JSON) ' || q INTO j;
+		kb := (j->0->'Planning'->>'Memory Used')::bigint;
+	ELSE
+		EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO j;
+	END IF;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	RETURN format('%s, %s', j->0->'Plan'->>'Custom Plan Provider',
+				  CASE WHEN kb < 8192 THEN 'within 8 MB'
+				  ELSE kb || ' kB' END);
+END $$;
+-- 1000 restrictions the posting sets answer
+SELECT cr_plan_mem('SELECT count(*) FROM cr WHERE a = 2 AND ' ||
+				   string_agg(format('b <> %s', g), ' AND '))
+  FROM generate_series(1, 1000) g;
+      cr_plan_mem       
+------------------------
+ LionCount, within 8 MB
+(1 row)
+
+-- ... and 500 of them beside 500 residual ones, each taken back whole
+SELECT cr_plan_mem('SELECT count(*) FROM cr WHERE a = 2 AND ' ||
+				   string_agg(format('b <> %s AND id <> %s', g, g), ' AND '))
+  FROM generate_series(1, 500) g;
+      cr_plan_mem       
+------------------------
+ LionCount, within 8 MB
+(1 row)
+
+SELECT cr_plan_mem('SELECT b, count(*) FROM cr WHERE a = 2 AND ' ||
+				   string_agg(format('n <> %s AND id <> %s', g, g), ' AND ') ||
+				   ' GROUP BY b')
+  FROM generate_series(1, 500) g;
+      cr_plan_mem       
+------------------------
+ LionCount, within 8 MB
+(1 row)
+
+DROP FUNCTION cr_plan_mem(text);
 DROP FUNCTION cr_q(text);
 DROP FUNCTION cr_plan(text);
 DROP TABLE cr;

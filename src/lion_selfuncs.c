@@ -255,6 +255,7 @@ typedef struct LionProbeCache
 	int			isectwidest;	/* ... the most sets one of them sought
 								 * (lion_isect_run_budget()) */
 	List	   *rowsfixed;		/* RelOptInfos whose rows the probe corrected */
+	List	   *posshapes;		/* lion_tsquery_pos_shape()'s findings */
 } LionProbeCache;
 
 static LionRunCache *lion_probe_caches = NULL;
@@ -271,6 +272,15 @@ static LionProbeCache *
 lion_probe_cache_find(PlannerInfo *root)
 {
 	return (LionProbeCache *) lion_run_cache_find(lion_probe_caches, root);
+}
+
+List **
+lion_run_posshapes(PlannerInfo *root, MemoryContext *cxt)
+{
+	LionProbeCache *cache = lion_probe_cache_for(root);
+
+	*cxt = cache->run.cxt;
+	return &cache->posshapes;
 }
 
 /* ---------------------------------------------------------------------

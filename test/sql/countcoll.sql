@@ -33,6 +33,37 @@ SELECT lion_index_count_any('lcc_d_c', ARRAY['abc', 'xyz']) AS c_index,
 SELECT groups, count FROM lion_index_count_group_stats('lcc_d_c');
 DROP TABLE lcc_d;
 
+-- ---------- a multi-key query is taken apart under the index's collation ----------
+-- as the executor takes it apart (lion_multikey_query_mode()), and not under
+-- its literal's: `tags @> ARRAY[...]` over a column COLLATE "C" compares
+-- under C while the literal keeps the default collation.  Under any two
+-- deterministic collations the extraction is the same - an element longer
+-- than a key is hashed, and makes the query a superset rechecked in the heap
+-- - so this only checks the counts; a nondeterministic collation, which does
+-- not hash, would tell the two apart.
+CREATE TABLE lcc_a (id int, tags text[] COLLATE "C")
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcc_a SELECT g, ARRAY['k' || g % 5, repeat('L', 2100) || g % 3]
+  FROM generate_series(1, 300) g;
+CREATE INDEX lcc_a_tags ON lcc_a USING lion (tags);
+VACUUM ANALYZE lcc_a;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM lcc_a WHERE tags @> ARRAY['k1'];
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY['k1'];
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY['k1', repeat('L', 2100) || '1'];
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY[repeat('L', 2100) || '2'];
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY['k1'];
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY['k1', repeat('L', 2100) || '1'];
+SELECT count(*) FROM lcc_a WHERE tags @> ARRAY[repeat('L', 2100) || '2'];
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+DROP TABLE lcc_a;
+
 -- ---------- a nondeterministic collation agrees with no other ----------
 -- the collation, where the build has ICU and the database is UTF8: core
 -- lists its "unicode" ICU collation in pg_collation even in a build without
