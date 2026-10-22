@@ -6,11 +6,11 @@
 --
 -- is the count of r's WHERE less the rows of it some row of s matches.  The
 -- node runs s as its child, looks each distinct key of its rows up in a
--- B-tree on r.k under the query's snapshot, tests every row found on the
--- join clauses and r's own clauses, and subtracts the ones that pass - from
--- the one row of a count, from each group of a GROUP BY, or from each cell
--- of a count by cells.  Every answer is checked against the same query with
--- the pushdown off, as a multiset in both directions.
+-- B-tree on r.k under the query's snapshot, tests every row found on r's own
+-- clauses and then on the join clauses, and subtracts the ones that pass -
+-- from the one row of a count, from each group of a GROUP BY, or from each
+-- cell of a count by cells.  Every answer is checked against the same query
+-- with the pushdown off, as a multiset in both directions.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -286,7 +286,7 @@ SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXIST
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b <> r.g)');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE r.k = s.a + 1)');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.c = r.k)');
--- equal keys of other bytes find the same rows, subtracted once
+-- equal keys of other bytes are one key, looked up once: 1.0, 1.00 and 1
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_num n WHERE n.d = r.kd)');
 SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_num n WHERE n.d = r.kd)');
 -- a clause of the counted table alone inside the NOT EXISTS belongs to the join
@@ -332,6 +332,31 @@ DROP INDEX lca_rows_ky;
 CREATE INDEX lca_rows_yk ON lca_rows (y, k);
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
 DROP INDEX lca_rows_yk;
+-- one that names the key's column twice: a join clause is the scan key of
+-- the first of the two only, and stays one join clause
+CREATE INDEX lca_rows_kk ON lca_rows (k, k);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b <> r.g)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k)');
+-- ... planned with nothing disabled, and with the pushdown off
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k);
+SELECT r.g, count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.k) GROUP BY r.g ORDER BY r.g;
+RESET pg_lion.enable_count_pushdown;
+-- ... and twice before a column of another key, which the search then
+-- stops short of: its clause is tested on the rows found
+DROP INDEX lca_rows_kk;
+CREATE INDEX lca_rows_kky ON lca_rows (k, k, y);
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)') AS ln
+	WHERE ln ~ '(Lookup Index|Join Cond)';
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b = r.y)');
+DROP INDEX lca_rows_kky;
 CREATE INDEX lca_rows_k ON lca_rows (k);
 ANALYZE lca_rows;
 
@@ -434,6 +459,12 @@ DROP TABLE lca_many;
 -- a LEFT JOIN ... IS NULL, and a NOT IN over a nullable column
 SELECT lca('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.k NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)');
+-- ... and a NOT IN whose sides are both never NULL, kn declared so and s.a
+-- by its filter: an anti join from PostgreSQL 19, which the node takes as it
+-- takes NOT EXISTS's, and a hashed SubPlan before it; core's answer either way
+SELECT (l LIKE 'pushed down%') = (current_setting('server_version_num')::int >= 190000) AS as_the_release_plans,
+	   regexp_replace(l, '^(not )?pushed down', 'either plan') AS answer
+  FROM lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.kn NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)') AS l;
 -- a WHERE clause nothing answers: no lion index, and residual clauses off
 SET pg_lion.enable_count_residual = off;
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k)');
@@ -647,8 +678,259 @@ RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET min_parallel_index_scan_size;
 RESET pg_lion.parallel_range_keys;
+
+-- ---------- 10. the order the clauses are tested in ----------
+-- Each row a key finds is tested on the table's own restrictions, and only
+-- if it passes them on the join clauses, the scan keys' first; each list in
+-- the order core's plan tests it in, cheapest first.  A clause core runs
+-- only on the rows a cheaper one keeps - a division by y after y <> 0 - is
+-- never run on a row that one rejects.  Row 7 has y = 0, and an inner row
+-- a = b = 7 matches it.
+SELECT r.id, r.k, r.y FROM lca_rows r WHERE r.id = 7;
+SELECT * FROM lca_skip s WHERE s.a = 7;
+-- a join clause dividing by a column of the table: the WHERE keeps y = 0 out,
+-- planned with nothing disabled ...
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1)');
+SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1);
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1);
+RESET pg_lion.enable_count_pushdown;
+-- ... and with joins disabled, by the key of some 50 rows, grouped, beside
+-- residual clauses and a count of a column
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.id AND s.b / r.y > 1)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1) GROUP BY r.g');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y IN (1, 2, 3) AND r.id % 3 = 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT count(r.g) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca_counters('SELECT count(*) FROM lca_rows r WHERE r.y <> 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+-- the WHERE in core's order, not as written: 10 / y after the test of y
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE 10 / r.y > 1 AND r.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.f = 0)');
+SELECT lca('SELECT r.g, count(*) FROM lca_rows r WHERE 10 / r.y > 1 AND r.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k) GROUP BY r.g');
+-- the join clauses in core's order: a clause of the table alone inside the
+-- NOT EXISTS is the join's, and runs before the division
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1 AND r.y <> 0)');
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.b / r.y > 1 AND r.y <> 0 AND s.a = r.k)') AS ln
+	WHERE ln ~ 'Join Cond';
+-- beside a count by cells, the GROUP BY and the WHERE form
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier IN (''low'', ''none'') AND t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1)');
+-- in parallel
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y IN (1, 2, 3) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1) GROUP BY tier');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
 DROP VIEW lca_tiered;
 DROP VIEW lca_scored;
+
+-- ---------- 11. past work_mem ----------
+-- Nothing the node keeps grows without bound in memory (DESIGN.md §27,
+-- "The anti join within work_mem"): the child's rows sorted by key, a key's
+-- inner rows, and the losses of the groups or the cells - the count's rows
+-- then held back beside them - and the rows taken away beside a parallel
+-- count by cells go to disk past work_mem or hash_mem, and the answers are
+-- core's.
+-- lca_big has 60,000 rows: k has 12,000 values of 5 rows each, the rows of
+-- a key all of one group of g's 6,000 and of several cells of c1 and c2, of
+-- 50 values each; gn is g with NULL on every 7th row, t a text of 3,000
+-- values, x has 10.  lca_many's keys are every value of k, beside 5,000
+-- more rows of key 7 whose b differ, a hundred of them twice.
+CREATE TABLE lca_big (
+	id		int		PRIMARY KEY,
+	k		int		NOT NULL,
+	g		int		NOT NULL,
+	gn		int,
+	t		text	NOT NULL,
+	c1		int		NOT NULL,
+	c2		int		NOT NULL,
+	x		int		NOT NULL,
+	pad		text	NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO lca_big
+SELECT i, i % 12000, i % 6000,
+	   CASE WHEN i % 7 = 0 THEN NULL ELSE i % 6000 END,
+	   'v' || (i % 3000), i % 50, (i / 50) % 50, (i / 1000) % 10,
+	   repeat('p', 20)
+FROM generate_series(1, 60000) i;
+CREATE INDEX lca_big_k ON lca_big (k);
+CREATE INDEX lca_big_g ON lca_big USING lion (g);
+CREATE INDEX lca_big_gn ON lca_big USING lion (gn);
+CREATE INDEX lca_big_t ON lca_big USING lion (t);
+CREATE INDEX lca_big_c1 ON lca_big USING lion (c1);
+CREATE INDEX lca_big_c2 ON lca_big USING lion (c2);
+CREATE INDEX lca_big_x ON lca_big USING lion (x);
+CREATE TABLE lca_many (a int, b int);
+INSERT INTO lca_many SELECT i, i FROM generate_series(0, 11999) i;
+INSERT INTO lca_many SELECT 7, i FROM generate_series(1, 5000) i;
+INSERT INTO lca_many SELECT 7, i FROM generate_series(1, 100) i;
+VACUUM (FREEZE, ANALYZE) lca_big, lca_many;
+-- an inner side the planner takes for ten rows
+CREATE FUNCTION lca_keys(n int) RETURNS SETOF int ROWS 10
+LANGUAGE plpgsql AS $$
+BEGIN
+	RETURN QUERY SELECT generate_series(0, n - 1);
+END $$;
+
+/* What of the anti join went to disk, from EXPLAIN ANALYZE, joins disabled. */
+CREATE FUNCTION lca_spilled(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF btrim(ln) LIKE 'Join Spilled:%' THEN
+			RETURN btrim(substr(btrim(ln), length('Join Spilled:') + 1));
+		END IF;
+	END LOOP;
+	RETURN 'nothing';
+END $$;
+
+/*
+ * A query with an ORDER BY through the pushdown, joins disabled, in the order
+ * it gives its rows, against core's with the pushdown off: the rows out of
+ * their place.
+ */
+CREATE FUNCTION lca_ordered(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	rec record;
+	n int := 0;
+	got text[] := '{}';
+	want text[] := '{}';
+	nbad int := 0;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR rec IN EXECUTE q LOOP
+		got := got || rec::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	FOR rec IN EXECUTE q LOOP
+		want := want || rec::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	IF cardinality(got) <> cardinality(want) THEN
+		RETURN format('MISMATCH: %s rows, not %s', cardinality(got), cardinality(want));
+	END IF;
+	FOR n IN 1 .. cardinality(want) LOOP
+		IF got[n] IS DISTINCT FROM want[n] THEN
+			nbad := nbad + 1;
+		END IF;
+	END LOOP;
+	IF nbad <> 0 THEN
+		RETURN format('MISMATCH: %s rows out of place', nbad);
+	END IF;
+	RETURN format('in order, %s rows', cardinality(want));
+END $$;
+
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+-- the child's 17,100 rows sorted by key on disk
+SELECT * FROM lca_explain('SELECT count(*) FROM lca_big r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)',
+						  'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+	WHERE ln ~ '(Custom Scan|Join (Child|Keys|Rows|Spilled))';
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0)');
+-- ... and an inner side the planner takes for ten rows, with nothing disabled
+SELECT lca_pick('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_keys(12000) s(a) WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_keys(12000) s(a) WHERE s.a = r.k)');
+SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND NOT EXISTS (SELECT 1 FROM lca_keys(12000) s(a) WHERE s.a = r.k)');
+-- a key's 5,000 inner rows, those alike kept once, on disk: each row of key 7
+-- tested against them in turn, b past a bound that grows with x, which
+-- one of them finds no row beyond
+SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+SELECT lca('SELECT count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.g = 7 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+SELECT lca_counters('SELECT count(*) FROM lca_big r WHERE r.g = 7 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+-- the losses of 6,000 groups past hash_mem, held back with the count's rows
+-- and merged on disk: the groups of g under 3,000 lose every row and are no
+-- row, those above it half of theirs
+SELECT lca_spilled('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
+SELECT lca('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
+SELECT * FROM lca_val('SELECT count(*), sum(n), min(n), max(n) FROM (SELECT r.g, count(*) AS n FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g) q');
+-- ... with a WHERE, by two columns, by a column with NULLs and by a text
+SELECT lca('SELECT r.g, count(*) FROM lca_big r WHERE r.x IN (1, 4, 6) AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
+SELECT lca('SELECT r.g, r.x, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0) GROUP BY r.g, r.x');
+SELECT lca('SELECT r.gn, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.gn');
+SELECT lca('SELECT r.t, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 4 = 1) GROUP BY r.t');
+SELECT lca_spilled('SELECT r.t, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 4 = 1) GROUP BY r.t');
+-- ... the HAVING on the counts less the rows lost
+SELECT lca('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0) GROUP BY r.g HAVING count(*) > 5');
+-- ... and the groups in the order the plan claims, no Sort above the node
+SELECT * FROM lca_explain('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g ORDER BY r.g') AS ln
+	WHERE ln !~ '^\s{6}';
+SELECT lca_ordered('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g ORDER BY r.g');
+SELECT lca_ordered('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0) GROUP BY r.g HAVING count(*) > 5 ORDER BY r.g');
+-- a rescan under a correlated subquery: each run's sorts begun again
+SELECT lca('SELECT o.v, (SELECT count(*) FROM lca_big r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a % 3 <> 0)) FROM (VALUES (3), (1), (3)) o(v)');
+SELECT lca('SELECT o.v, (SELECT count(*) FROM lca_big r WHERE r.x = o.v AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g ORDER BY 1 DESC LIMIT 1) FROM (VALUES (3), (1), (3)) o(v)');
+-- the losses of 2,500 cells past hash_mem, the tally's counts held back
+-- with them
+CREATE TEMP TABLE lca_bigcells AS
+SELECT format('SELECT CASE %s END AS u, CASE %s END AS v, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a %% 4 <> 0) GROUP BY 1, 2',
+			  string_agg(format('WHEN r.c1 = %s THEN %s', i, i), ' ' ORDER BY i),
+			  string_agg(format('WHEN r.c2 = %s THEN %s', i, i), ' ' ORDER BY i)) AS q
+  FROM generate_series(0, 49) i;
+SELECT ln FROM lca_bigcells, lca_explain(q) AS ln WHERE ln ~ '^\s*(Group Strategy|Cells|Join Type):';
+SELECT lca_spilled(q) FROM lca_bigcells;
+SELECT lca(q) FROM lca_bigcells;
+SELECT lca(replace(q, 'GROUP BY 1, 2', 'GROUP BY 1, 2 HAVING count(*) > 20')) FROM lca_bigcells;
+-- in parallel: the count divided, and the rows taken away beside a count
+-- by cells, every participant's, sorted by range on disk
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT ln FROM lca_explain('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)') AS ln
+	WHERE ln ~ 'Parallel';
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)');
+SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)');
+SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x IN (4, 8) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE r.x IN (4, 8) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+SELECT ln FROM lca_bigcells, lca_explain(q) AS ln WHERE ln ~ 'Parallel';
+SELECT lca(q) FROM lca_bigcells;
+SELECT lca_spilled(q) ~ 'keys.*ranges' AS spilled FROM lca_bigcells;
+-- ... the rows subtracted, every participant's, are the serial node's
+SELECT ln FROM lca_bigcells,
+	lca_explain(q, 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+ WHERE ln ~ 'Join Rows Subtracted';
+SET max_parallel_workers_per_gather = 0;
+SELECT ln FROM lca_bigcells,
+	lca_explain(q, 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
+ WHERE ln ~ 'Join Rows Subtracted';
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
+DROP TABLE lca_bigcells;
+RESET work_mem;
+RESET hash_mem_multiplier;
+-- within work_mem, nothing spilled
+SELECT lca_spilled('SELECT r.g, count(*) FROM lca_big r WHERE NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.a < 9000) GROUP BY r.g');
+DROP FUNCTION lca_keys(int);
+DROP FUNCTION lca_spilled(text);
+DROP FUNCTION lca_ordered(text);
+DROP TABLE lca_big, lca_many;
 
 DROP TABLE lca_rows, lca_skip, lca_num, lca_tag;
 DROP FUNCTION lca(text);

@@ -260,7 +260,8 @@
  * Above the cells' predicates' range.
  */
 #define LION_TL_ANTI(resno)			(0x60000000 + (resno))
-#define LION_TL_IS_ANTI(kind)		((kind) > 0x60000000 && (kind) < 0x60010000)
+#define LION_TL_IS_ANTI(kind)		((kind) > 0x60000000 && \
+									 (kind) <= 0x60000000 + MaxAttrNumber)
 #define LION_TL_ANTI_RESNO(kind)	((AttrNumber) ((kind) - 0x60000000))
 
 /* ... and what each one computes */
@@ -1330,19 +1331,22 @@ typedef struct LionVColScope
  *		lion_plan_custom_path() makes LION_TL_CELLPRED columns and the qual
  *	24	List, or empty: the anti join over a small inner side (DESIGN.md
  *		§27, "The anti join over a small inner side"), whose inner side is
- *		the plan's one child: an IntList of its LION_ANTIFLAG_* bits, the
- *		number of the B-tree's scan keys, of the join clauses and of the
- *		table's restrictions it tests, and each scan key's column in the
- *		B-tree; an OidList of the B-tree, each scan key's operator - the
- *		table's column its left operand - and collation, and the equality
- *		operator and collation of each of the two GROUP BY columns of member
- *		2 (InvalidOid where there is none); and, in the PATH's list only, a
- *		List of the scan keys' values - expressions of the inner side - then
- *		the join clauses, then the restrictions.  lion_plan_custom_path()
- *		appends those to custom_exprs after the residual clauses, where
- *		setrefs.c points their columns at custom_scan_tlist - the table's at
- *		LION_TL_RESID columns or the ones the target list prints, the inner
- *		side's at LION_TL_ANTI ones - and leaves the list two members long
+ *		the plan's one child: an IntList of the number of the B-tree's scan
+ *		keys, of the join clauses and of the table's restrictions it tests,
+ *		and each scan key's column in the B-tree; an OidList of the B-tree,
+ *		each scan key's operator - the table's column its left operand -
+ *		then each one's collation, then the `<` of its column's family its
+ *		values are sorted by, and the equality operator, collation and a `<`
+ *		of the equality's family of each of the two GROUP BY columns of
+ *		member 2 (InvalidOid where there is none); and, in the PATH's list
+ *		only, a List of the scan keys' values - expressions of the inner
+ *		side - then the join clauses, the scan keys' own first, then the
+ *		restrictions, each in the order the node tests them in.
+ *		lion_plan_custom_path() appends those to custom_exprs after the
+ *		residual clauses, where setrefs.c points their columns at
+ *		custom_scan_tlist - the table's at LION_TL_RESID columns or the ones
+ *		the target list prints, the inner side's at LION_TL_ANTI ones - and
+ *		leaves the list two members long
  *	25	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
@@ -1497,12 +1501,12 @@ typedef struct LionVColScope
 
 /*
  * The anti join over a small inner side (LION_PRIV_ANTI): its scan keys at
- * most, and its flag bits.
+ * most; and its expressions - keys, join clauses and restrictions - at most,
+ * as many as a List holds, its cells one palloc'd array, which bounds each
+ * count the member carries and keeps their sum an int.
  */
 #define LION_MAX_ANTI_KEYS	8
-#define LION_ANTIFLAG_TIDS	0x01	/* two lookups may find one row: the rows
-									 * matched are kept by TID, each counted
-									 * once */
+#define LION_MAX_ANTI_EXPRS	((int) (MaxAllocSize / sizeof(ListCell)))
 
 /*
  * One WHERE clause of the pushdown, as the executor sees it.
@@ -2406,18 +2410,21 @@ typedef struct LionCountPrivJoin
  */
 typedef struct LionCountPrivAnti
 {
-	int			flags;			/* LION_ANTIFLAG_* */
 	Oid			idxoid;			/* the B-tree the keys are looked up in */
 	int			nkey;			/* its scan keys */
 	AttrNumber	keycol[LION_MAX_ANTI_KEYS];	/* ... each one's column there */
 	Oid			keyop[LION_MAX_ANTI_KEYS];	/* ... operator, column on the
 											 * left */
-	Oid			keycoll[LION_MAX_ANTI_KEYS];	/* ... and collation */
-	int			njoin;			/* the join clauses */
+	Oid			keycoll[LION_MAX_ANTI_KEYS];	/* ... collation */
+	Oid			keysort[LION_MAX_ANTI_KEYS];	/* ... and the `<` of the
+												 * column's operator family
+												 * for two of its values */
+	int			njoin;			/* the join clauses, the scan keys' first */
 	int			nrestrict;		/* the table's restrictions, tested again on
 								 * each row a key finds */
 	Oid			groupeq[2];		/* the GROUP BY columns' equality operators */
-	Oid			groupcoll[2];	/* ... and collations */
+	Oid			groupcoll[2];	/* ... collations */
+	Oid			groupsort[2];	/* ... and a `<` of the equality's family */
 	List	   *exprs;			/* PATH stage only: the keys' values, the join
 								 * clauses and the restrictions */
 } LionCountPrivAnti;
@@ -3302,6 +3309,7 @@ typedef struct LionJoinShared
 	int64		antilookups;
 	int64		antifetched;
 	int64		antisubtracted;
+	uint32		antispilled;	/* LION_ANTI_SPILL_*, any participant's */
 	instr_time	antitime[2];
 	pg_atomic_uint32 antiowner; /* ... and whether a participant has claimed
 								 * its subtraction */
@@ -3318,41 +3326,39 @@ typedef struct LionJoinShared
  * keys, the B-tree they are looked up in, and what the rows found subtract -
  * from the one row of an ungrouped count, or from each group they are of.
  *
- * The run (lion_anti_run()) is made once, before the count's first row: it
- * reads the child whole, keeping each distinct inner row once under the
- * values of its scan keys (LionAntiKeyEnt), looks each key up, and tests every
- * row found - the join clauses and the table's restrictions, over the row's
- * columns and the inner row's - in evalslot, which has the node's scan tuple
- * descriptor: the table's columns at outerpos[], the inner side's at
- * innerpos[].  Of a parallel count one participant runs it, the one that
- * claims it first (LionJoinShared.antiowner), and the others subtract nothing.
+ * The run (lion_anti_run()) is made once, before the count's first row.  It
+ * reads the child whole into a sort (keysort) of each row's scan-key values
+ * - and, where a join clause other than the scan keys' reads the inner row,
+ * the row's columns after them - by the order of the B-tree's columns, so
+ * that the keys come out in the index's order and equal ones together.  Each
+ * key is then looked up once, its inner rows kept in a tuplestore while it
+ * is (innerrows), and every row found is tested - the table's restrictions
+ * over the row's columns, then, if it passes them, the other join clauses
+ * over those and each inner row's in turn - in evalslot, which has the
+ * node's scan tuple descriptor: the table's columns at outerpos[], the inner
+ * side's at innerpos[].  Keys unequal under the B-tree's order find no row
+ * in common, so no row is found twice.  Of a parallel count one participant
+ * runs it, the one that claims it first (LionJoinShared.antiowner), and the
+ * others subtract nothing.
+ *
+ * What a GROUP BY's groups lose is kept in a hash table of them
+ * (LionAntiGroup) while it fits hash_mem.  Past that, it goes into a sort by
+ * the groups (held), and so does every row the count then emits, which is
+ * held back: when the count's groups run out, the sort gives each group once,
+ * with its count less what it loses (lion_anti_groups_next()).
  *
  * Beside a count by cells (DESIGN.md §27, "Counts by cells beside the anti
  * join") the predicates are evaluated on each row found, their truths put at
  * their LION_TL_CELLPRED places in evalslot - where setrefs.c points the
- * clauses' copies of them - and every row taken away is kept with the
- * container key its TID is in and its cell (LionAntiCellRow).  Every
- * participant of a parallel count by cells makes the run, and takes away the
- * rows of the ranges it counts: the cells of those lose them as the tally
- * gives them up, each cell's count held back until the tally has given all
- * of it (LionAntiCell).
+ * clauses' copies of them - and each row taken away is counted under its
+ * cell (LionAntiCell, cellsub), the cells by code compacted as the array
+ * fills hash_mem and put into the sort by code past it.  Every participant
+ * of a parallel count by cells makes the run, and takes away the rows of the
+ * ranges it counts: its rows taken away, sorted by the container key of
+ * their TIDs (ranged), are read as it claims its ranges, each later than the
+ * last.  The cells of those lose them as the tally gives them up, each
+ * cell's count held back until the tally has given all of it.
  */
-typedef struct LionAntiInner
-{
-	struct LionAntiInner *next;
-	Datum	   *values;			/* the inner side's columns, ninner */
-	bool	   *isnull;
-} LionAntiInner;
-
-typedef struct LionAntiKeyEnt
-{
-	struct LionAntiKeyEnt *next;	/* in its bucket */
-	struct LionAntiKeyEnt *link;	/* in the order they were made */
-	uint32		hash;
-	Datum	   *keys;			/* the scan keys' values, none NULL */
-	LionAntiInner *inner;		/* the distinct inner rows of the keys */
-} LionAntiKeyEnt;
-
 typedef struct LionAntiGroup
 {
 	struct LionAntiGroup *next;
@@ -3362,13 +3368,6 @@ typedef struct LionAntiGroup
 	int64		n;				/* the rows the group is to lose */
 } LionAntiGroup;
 
-typedef struct LionAntiCellRow
-{
-	uint64		code;			/* the cell of a row taken away */
-	uint32		ckey;			/* ... the container key of its TID */
-	bool		mine;			/* ... in a range this participant counts */
-} LionAntiCellRow;
-
 typedef struct LionAntiCell
 {
 	uint64		code;
@@ -3376,25 +3375,37 @@ typedef struct LionAntiCell
 	int64		held;			/* ... and its counts, as the tally gave them */
 } LionAntiCell;
 
+/* What went past its memory, for EXPLAIN ANALYZE (lion_explain_anti_counters()) */
+#define LION_ANTI_SPILL_KEYS	0x01	/* the child's rows, sorted by key */
+#define LION_ANTI_SPILL_INNER	0x02	/* a key's inner rows */
+#define LION_ANTI_SPILL_SUB		0x04	/* the groups' or the cells' losses */
+#define LION_ANTI_SPILL_HELD	0x08	/* ... and the sort they then go to */
+#define LION_ANTI_SPILL_RANGES	0x10	/* the rows taken away, by container
+										 * key */
+
 typedef struct LionAntiState
 {
 	PlanState  *child;
 	Oid			idxoid;
 	Relation	index;			/* opened at the first run */
 	TupleTableSlot *heapslot;	/* ... and the table's slot for its rows */
-	bool		tids;			/* LION_ANTIFLAG_TIDS */
 
 	int			nkey;
 	ScanKeyData *scankeys;
 	AttrNumber *keycol;
 	Oid		   *keyop;
 	Oid		   *keycoll;
+	Oid		   *keysort;
 	ExprState **keystate;		/* the keys' values, over a child row */
 	int16	   *keylen;
 	bool	   *keybyval;
 
-	ExprState  *qual;			/* the join clauses and the restrictions */
-	List	   *joinexprs;		/* ... for EXPLAIN */
+	ExprState  *restrictqual;	/* the table's restrictions, over a row
+								 * found */
+	ExprState  *joinqual;		/* ... and the join clauses but the scan
+								 * keys', over it and an inner row, if it
+								 * passes them; NULL with none */
+	List	   *joinexprs;		/* ... all of them, for EXPLAIN */
 	List	   *restrictexprs;
 
 	TupleTableSlot *evalslot;
@@ -3408,30 +3419,68 @@ typedef struct LionAntiState
 	int		   *outerpos;
 	AttrNumber *outerattno;
 
+	/*
+	 * The child's rows by key: the keys' values, then - with a joinqual -
+	 * the inner columns, at nkey + j for innerpos[j]; sorted by the keys and
+	 * by each inner column that has an order, so that equal rows come
+	 * together.  A key's values while it is looked up, and its inner rows.
+	 */
+	TupleDesc	sortdesc;
+	int			nsortcol;
+	int			nsortkey;		/* ... the columns it is sorted by */
+	AttrNumber *sortattno;
+	Oid		   *sortops;
+	Oid		   *sortcolls;
+	bool	   *sortnulls;
+	SortSupport keyssup;		/* nkey: two keys' values compared */
+	Tuplesortstate *keysorted;
+	TupleTableSlot *sortin;		/* virtual, of sortdesc */
+	TupleTableSlot *sortcur;	/* minimal: the row read */
+	TupleTableSlot *sortprev;	/* ... and the one before it */
+	Datum	   *keyvals;		/* the key looked up */
+	MemoryContext keycxt;		/* ... its values' memory */
+	Tuplestorestate *innerrows; /* ... and its inner rows, with a joinqual */
+	TupleTableSlot *innerslot;	/* minimal: one of them, read back */
+
 	int			ngroup;			/* the GROUP BY columns: 0, 1 or 2 */
 	AttrNumber	groupattno[2];
 	FmgrInfo	groupeq[2];
 	FmgrInfo	grouphash[2];
 	Oid			groupcoll[2];
+	Oid			groupsort[2];
+	Oid			grouptype[2];
 	int16		grouplen[2];
 	bool		groupbyval[2];
 
-	MemoryContext cxt;			/* the run's: keys, inner rows, groups, TIDs */
+	MemoryContext cxt;			/* the run's: the sorts, the tuplestore */
 	bool		ran;
 	bool		owner;			/* this participant subtracts */
 	int64		total;			/* an ungrouped count's subtraction */
+	Size		memlimit;		/* hash_mem, of the groups' and the cells'
+								 * losses */
 
-	LionAntiKeyEnt **kbuckets;
-	int			knbuckets;
-	int64		nkeys;
-	LionAntiKeyEnt *kfirst;
-	LionAntiKeyEnt *klast;
-
+	MemoryContext gcxt;			/* the groups' or the cells' losses, while
+								 * they fit */
 	LionAntiGroup **gbuckets;
 	int			gnbuckets;
 	int64		ngroups;
 
-	HTAB	   *tidset;
+	/*
+	 * Past memlimit: the groups' - or the cells' - losses and the count's
+	 * rows, sorted by group or by code, which the count's rows are held back
+	 * into until the count is done, then given up one group or cell a call.
+	 */
+	bool		merging;
+	bool		draining;
+	TupleDesc	helddesc;		/* the group's columns or the code, then the
+								 * count and the loss, both int8 */
+	SortSupport heldssup;		/* the group's columns compared */
+	int			nheldkey;
+	Tuplesortstate *heldsort;
+	TupleTableSlot *heldin;		/* virtual, of helddesc */
+	TupleTableSlot *heldcur;	/* minimal: the group or cell given up */
+	TupleTableSlot *heldnext;	/* ... and the row after its last */
+	bool		heldmore;		/* heldnext has a row */
 
 	/* beside a count by cells: what each row found is, and the cells' loss */
 	bool		cells;
@@ -3440,14 +3489,20 @@ typedef struct LionAntiState
 	int		   *predpos;		/* ... its LION_TL_CELLPRED place */
 	uint8	   *predtruth;		/* ... and its truth (LION_TRUTH_*) in the
 								 * row found last */
-	LionAntiCellRow *cellrows;	/* the rows taken away */
-	int			ncellrows;
-	int			cellrowscap;
 	LionAntiCell *held;			/* the cells this participant's rows are of,
-								 * by code */
+								 * by code once compacted */
 	int			nheld;
+	int			heldcap;
 	int			nextheld;		/* ... the next to go up */
 	bool		heldready;
+	TupleDesc	rangedesc;		/* of a parallel count by cells: the rows
+								 * taken away, by container key, and code */
+	Tuplesortstate *ranged;
+	TupleTableSlot *rangein;
+	TupleTableSlot *rangeslot;	/* ... the next not yet in a range */
+	bool		rangemore;
+	bool		rangesorted;
+	uint64		rangehi;		/* ... the end of the last range claimed */
 
 	/* EXPLAIN ANALYZE's counters, and a parallel plan's workers' sums */
 	bool		timing;
@@ -3455,11 +3510,13 @@ typedef struct LionAntiState
 	int64		lookups;
 	int64		fetched;
 	int64		subtracted;
+	uint32		spilled;		/* LION_ANTI_SPILL_* */
 	instr_time	time[2];		/* the child's rows, the lookups */
 	int64		wchildrows;
 	int64		wlookups;
 	int64		wfetched;
 	int64		wsubtracted;
+	uint32		wspilled;
 	instr_time	wtime[2];
 } LionAntiState;
 
@@ -4206,6 +4263,9 @@ extern void lion_anti_run(LionCountScanState *st);
 extern bool lion_anti_adjust(LionCountScanState *st, int nkeys,
 							 const Datum *keys, const bool *keyisnull,
 							 int64 *count);
+extern bool lion_anti_draining(LionCountScanState *st);
+extern TupleTableSlot *lion_anti_groups_next(LionCountScanState *st,
+											 bool *exhausted);
 extern void lion_anti_cells_range(LionCountScanState *st, uint32 lo,
 								  uint64 hi);
 extern bool lion_anti_cells_hold(LionCountScanState *st, uint64 code,
@@ -4232,8 +4292,12 @@ typedef struct LionAntiPlan
 	Oid			keyop[LION_MAX_ANTI_KEYS];
 	Oid			keycoll[LION_MAX_ANTI_KEYS];
 	Node	   *keyexpr[LION_MAX_ANTI_KEYS];	/* the inner side's values */
-	Var		   *keyvar[LION_MAX_ANTI_KEYS];	/* ... and the table's columns */
-	bool		tids;			/* LION_ANTIFLAG_TIDS */
+	Var		   *keyvar[LION_MAX_ANTI_KEYS];	/* ... the table's columns */
+	OpExpr	   *keyclause[LION_MAX_ANTI_KEYS];	/* ... the join clauses they
+												 * are */
+	Oid			keysort[LION_MAX_ANTI_KEYS];	/* ... and the order of their
+												 * values, the column's
+												 * family's `<` */
 	double		lookups;		/* the distinct keys looked up */
 	double		fetched;		/* the rows the lookups find */
 	Cost		cost;			/* the lookups' own price, the child's not */
@@ -4242,6 +4306,10 @@ typedef struct LionAntiPlan
 extern bool lion_anti_choose(PlannerInfo *root, const LionSmallAnti *anti,
 							 List *restrictions, int ngroup, List *rowexprs,
 							 LionAntiPlan *out);
+extern List *lion_anti_order_quals(PlannerInfo *root, List *clauses);
+extern List *lion_anti_join_clauses(PlannerInfo *root,
+									const LionSmallAnti *anti,
+									const LionAntiPlan *plan);
 
 extern const CustomPathMethods lion_antijoin_path_methods;
 

@@ -54,6 +54,20 @@ SELECT lion_hooktest_priv_decode('cell predicate without cells');
 SELECT lion_hooktest_priv_decode('anti join without its child');
 SELECT lion_hooktest_priv_decode('anti join of no key');
 SELECT lion_hooktest_priv_decode('inner column without an anti join');
+-- counts no plan has, each anti join with the child it reads: fewer join
+-- clauses than scan keys, each of which is one; more join clauses, more
+-- restrictions, or more of the three together, than a List holds - the
+-- executor takes their sum of expressions off the end of custom_exprs; and
+-- a column of its inner side past the attribute numbers there are
+SELECT lion_hooktest_priv_decode('anti join of fewer join clauses than keys');
+SELECT lion_hooktest_priv_decode('anti join of more join clauses than a list holds');
+SELECT lion_hooktest_priv_decode('anti join of more restrictions than a list holds');
+SELECT lion_hooktest_priv_decode('anti join of more expressions than a list holds');
+SELECT lion_hooktest_priv_decode('inner column past the last attribute');
+-- a scan key without the order its values are sorted by, and a GROUP BY
+-- column's equality without the order its groups go up in past hash_mem
+SELECT lion_hooktest_priv_decode('anti join of a key without its order');
+SELECT lion_hooktest_priv_decode('anti join of a grouping equality without its order');
 -- a count by cells beside the anti join over a small inner side, serial and
 -- parallel, which a planner makes; the same with a GROUP BY column's
 -- equality the cells have no use for, the anti join beside a decoded walk

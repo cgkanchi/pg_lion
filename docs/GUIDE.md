@@ -332,8 +332,10 @@ outer side can be any table or join, its key need not be unique - each of its ro
 emitted once - and the fact table may be partitioned. It keeps the outer side's order, so a sort
 above it may not be needed, and runs in parallel over a parallel scan of the outer side. It is
 offered for `EXISTS`, `IN` and `NOT EXISTS` whose subquery is the fact alone, correlated on one
-column; `NOT IN` is not an anti join and keeps the ordinary plan. The cost model chooses between it
-and PostgreSQL's own joins; `pg_lion.enable_semijoin` turns it off.
+column. `NOT IN` keeps the ordinary plan, but on PostgreSQL 19 where neither side can be NULL (a
+NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same anti join as `NOT
+EXISTS`, and it is offered for it as for that. The cost model chooses between it and PostgreSQL's
+own joins; `pg_lion.enable_semijoin` turns it off.
 
 `EXPLAIN ANALYZE` of such a join says where each dimension row's time went (DESIGN.md §27, "Where a
 key's time goes"): `Join Child Rows` from the dimension's plan, `Join Keys Looked Up` and `Without
