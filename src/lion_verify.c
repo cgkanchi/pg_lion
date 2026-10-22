@@ -15,6 +15,27 @@
 
 PG_FUNCTION_INFO_V1(lion_index_verify);
 
+/* The name a message gives a reserved entry of kind (DESIGN.md §14, §17). */
+static const char *
+lion_reserved_name(int kind)
+{
+	switch (kind)
+	{
+		case LION_KIND_NULL:
+			return "null";
+		case LION_KIND_EMPTY:
+			return "empty";
+		case LION_KIND_EMPTYDIM:
+			return "empty-dimension";
+		case LION_KIND_EMPTYINNER:
+			return "empty-inner";
+		case LION_KIND_NULLELEMS:
+			return "null-elements";
+	}
+	elog(ERROR, "lion index: %d is not the kind of a reserved entry", kind);
+	return NULL;				/* keep the compiler quiet */
+}
+
 /* ---------------------------------------------------------------------
  * lion_index_verify()
  * --------------------------------------------------------------------- */
@@ -484,9 +505,7 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 		if (item->keylen != 0)
 			lion_corrupt("lion index \"%s\": %s item %u on block %u has a key of %u bytes",
 						RelationGetRelationName(vs->index),
-						kind == LION_KIND_NULL ? "null" :
-						kind == LION_KIND_EMPTY ? "empty" : "null-elements",
-						off, blk, item->keylen);
+						lion_reserved_name(kind), off, blk, item->keylen);
 		return item;
 	}
 
@@ -2337,11 +2356,9 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		 * each per key column at most - a second one would
 		 * split its rows between two entries that no reader looks for twice.
 		 */
-		const char *what = LionEntryIsNullKey(entry) ? "null" :
-			LionEntryIsEmptyKey(entry) ? "empty" : "null-elements";
-		int64	   *seen = LionEntryIsNullKey(entry) ? vs->nnullentries :
-			LionEntryIsEmptyKey(entry) ? vs->nemptyentries :
-			vs->nnullelemsentries;
+		int			kind = lion_reserved_kind(entry->flags & LION_ENTRY_RESERVED);
+		const char *what = lion_reserved_name(kind);
+		int64	   *seen = vs->nreservedentries[kind - LION_KIND_NULL];
 
 		if (entry->keylen != 0)
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u has a key of %u bytes",
@@ -2354,13 +2371,19 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 		/*
 		 * Only a multi-key opclass ever writes an empty or a null-elements
-		 * entry; finding one in a scalar index means the flag bits have been
-		 * confused somewhere.
+		 * entry, and only one that extracts an array's elements an
+		 * empty-dimension or an empty-inner one; finding one anywhere else
+		 * means the flag bits have been confused somewhere.
 		 */
 		if (!LionEntryIsNullKey(entry) && !state->multikey)
-			lion_corrupt("lion index \"%s\": entry %u on block %u is an %s entry, but the operator class of key column %u extracts no keys",
+			lion_corrupt("lion index \"%s\": entry %u on block %u is %s %s entry, but the operator class of key column %u extracts no keys",
 						RelationGetRelationName(vs->index), off, blk,
-						LionEntryIsEmptyKey(entry) ? "empty-key" : "null-elements",
+						kind == LION_KIND_EMPTY ? "an" : "a", what,
+						entry->attno);
+		if ((kind == LION_KIND_EMPTYDIM || kind == LION_KIND_EMPTYINNER) &&
+			!lion_extracts_array_elements(state->extractvalue.fn_addr))
+			lion_corrupt("lion index \"%s\": entry %u on block %u is an %s entry, but the operator class of key column %u does not extract an array's elements",
+						RelationGetRelationName(vs->index), off, blk, what,
 						entry->attno);
 	}
 	else

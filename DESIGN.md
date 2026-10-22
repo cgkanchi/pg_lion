@@ -656,8 +656,8 @@ Lock ordering:
 
 INSERT (`lion_insert.c`: `lioninsert()` calls `lion_insert_one()` once per key column and, for a
 multi-key opclass, once per extracted key)
-1. Hash the key and build the search key - kind VALUE, or the reserved NULL or EMPTY entry (§14,
-   §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
+1. Hash the key and build the search key - kind VALUE, or a reserved entry: NULL, or one of the
+   key-less entries of §17 (EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) (§14, §17). Descend the directory (`lion_dir_find()`) and take the LEAF EXCLUSIVE; a write descent that
    lands on an INCOMPLETE_SPLIT page finishes that split first (§21, the repair rule). The leaf is
    held until the insert is complete: it is the page every writer of this key serialises on.
 2. Look the key up on the leaf: binary search to its prefix run, then the opclass equality over the
@@ -863,7 +863,8 @@ BUILD (`lion_build.c`, `lion_spool.c`)
 1. table_index_build_scan's callback APPENDS each row's code to its key's entry in a per-key-column
    accumulator (§24 "Build"): a hash table of the column's keys, each with its codes as varbyte
    deltas, since the scan delivers TIDs in ascending order. A NULL goes to the column's reserved
-   NULL entry (§14), a row a multi-key opclass extracts nothing from to its EMPTY entry (§17). The
+   NULL entry (§14), a row a multi-key opclass extracts nothing from to the key-less entry its value
+   names (§17). The
    columns share maintenance_work_mem; when it is full, the largest are spilled to a logical tape as
    sorted runs. On PostgreSQL 17 and later the scan can be parallel: every participant fills an
    accumulator of its own and hands the leader one tape.
@@ -1001,7 +1002,9 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- column with none (a multi-key one, or an index nothing has counted since before §33);
         -- narrow_containers is the NARROW containers of §38, last so the others keep their places,
         -- and nullelem_tids the member count of the reserved NULLELEMS entry (§17), the rows whose
-        -- value had elements and all of them NULL;
+        -- value had elements and all of them NULL; emptydim_tids and emptyinner_tids, last, those
+        -- of the EMPTYDIM and EMPTYINNER entries (§17), the empty arrays with dimensions, which
+        -- empty_tids leaves out;
         -- position_pages and position_internal_pages are the leaves and the internal pages of the
         -- column's position trees (§17, "Stored positions"), which hold chunks of word positions
         -- and no posting set: container_pages, posting_internal_pages, container_bytes and
@@ -1015,8 +1018,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- one lexeme and look up no entry at all.
     lion_index_verify(regclass, heapallindexed bool DEFAULT false) RETURNS void
         -- ERRORs on any structural inconsistency: the key column of every entry (in range, and
-        -- never below the column of the entry before it, §24), at most one reserved NULL, one
-        -- EMPTY and one NULLELEMS entry PER COLUMN, page ids, page flags (exactly one kind, and no
+        -- never below the column of the entry before it, §24), at most one of each reserved entry
+        -- (NULL, EMPTY, EMPTYDIM, EMPTYINNER, NULLELEMS) PER COLUMN, and the key-less ones only
+        -- in a multi-key column, the EMPTYDIM and EMPTYINNER ones only in an array's, page ids,
+        -- page flags (exactly one kind, and no
         -- bit that kind never carries: a page of a posting set is never flagged as one of a
         -- position tree, which every reader of the set refuses, ending the set there), meta
         -- values (every word the format has: its WAL mode, its order flags, the unused bucket
@@ -4500,12 +4505,12 @@ the bitmap for more than one, or for one beside quals none of which the sets exp
 (`lion_emit_source()`).
 
 **Multi-key columns.** A multi-key column keeps a NULL value in its NULL entry, a value with no
-key - an empty array, an empty tsvector, `'{}'::jsonb` - in its EMPTY entry, and an array whose
-elements are all NULL in its NULLELEMS entry (§17); the three are mutually exclusive, and every
-other row is under its keys. `IS NOT NULL` is true of an empty value,
-so it is every row the index holds but the NULL entry's, as for a scalar column: the same
-subtraction, and the EMPTY entry is no part of it. Alone, it is the UNION of every entry but the NULL
-one, the EMPTY entry included, which is now exact: the UNION had been rechecked for the mode-ALL
+key - an empty array, an empty tsvector, `'{}'::jsonb` - in its EMPTY entry, or for an empty array
+with dimensions its EMPTYDIM or EMPTYINNER one, and an array whose elements are all NULL in its
+NULLELEMS entry (§17); they are mutually exclusive, and every other row is under its keys. `IS NOT
+NULL` is true of an empty value, so it is every row the index holds but the NULL entry's, as for a
+scalar column: the same subtraction, and the key-less entries are no part of it. Alone, it is the
+UNION of every entry but the NULL one, the key-less ones included, which is now exact: the UNION had been rechecked for the mode-ALL
 queries it also reads (§17), and now is only for those.
 
 **Walking instead** (`lion_scan_notnull_walks()`). Where a column is mostly NULL with a few values,
@@ -5790,34 +5795,48 @@ descriptor is the same answer for every class, needs no polymorphism handling of
 ### The reserved EMPTY entry
 
 A second key-less entry joins the NULL entry of §14: flag `LION_ENTRY_EMPTYKEY`, hash 0, keylen 0,
-bucket 0, one per index.  It holds the rows a multi-key opclass extracted NO key from - an empty
-array, a tsvector with no lexemes - which are under no key at all and which an ALL-mode scan
+bucket 0, one per key column.  It holds the rows a multi-key opclass extracted NO key from - an
+empty array, a tsvector with no lexemes - which are under no key at all and which an ALL-mode scan
 (`tags @> '{}'`) still has to find.  A NULL column value goes to the NULL entry as before; the two
 are mutually exclusive and verify() says so.  `lion_find_entry_ext()` skips both, and
 `lion_find_reserved_entry()` (with `lion_find_null_entry()` as a wrapper) is the only way to either.
 Like the NULL entry it keeps its flag through a spill, whether the spill happens on insert or inside
 VACUUM (§4, §14); test/sql/array.sql and test/sql/tsvector.sql take both transitions.
 
-A third key-less entry, NULLELEMS (flag `LION_ENTRY_NULLELEMS`, hash 0, keylen 0), holds the rows
+An array with no element has no dimension as PostgreSQL makes one nearly everywhere - `'{}'`,
+`construct_empty_array()`, and `array_in()`, `array_recv()`, `construct_md_array()` and
+`array_map()`, which all turn an array of no element into that one - but not an empty `int2vector`
+or `oidvector`: those have one dimension of length 0, `[0:-1]`, which their casts to `int2[]` and
+`oid[]` (binary coercions) keep, as `array_cat()` of two of them does, and `ARRAY[]` or
+`array_agg()` of such arrays has more, `[1:2][0:-1]`.  Neither is equal to `'{}'` - `array_eq()`
+compares the dimensions before any element - and `array_length()`, `array_ndims()`,
+`array_lower()` and `array_upper()` of either are not NULL: `array_length(a, 1)` is 0 for the first
+and 2 for the second, where it is NULL for `'{}'`.  An array column's values with no element are
+therefore three classes, and each has an entry of its own, key-less like EMPTY and one per key
+column: EMPTY the arrays with no dimension, EMPTYDIM (`LION_ENTRY_EMPTYDIM`) those whose first
+dimension has length 0, and EMPTYINNER (`LION_ENTRY_EMPTYINNER`) those whose first dimension has a
+length and an inner one none.  `lion_array_empty_flag()` names the entry from the dimensions alone.
+Only a column whose extraction is an array's elements (`lion_extracts_array_elements()`: lion's
+`array_ops`, or a class of the user's that extracts with `ginarrayextract()` itself) ever files a
+value in EMPTYDIM or EMPTYINNER, and verify() refuses either anywhere else; a tsvector with no
+lexemes or `'{}'::jsonb` is EMPTY's.  test/sql/nonempty_dims.sql builds all three.
+
+A further key-less entry, NULLELEMS (flag `LION_ENTRY_NULLELEMS`, hash 0, keylen 0), holds the rows
 whose extraction returned keys that are ALL NULL - `'{NULL}'`, `'{NULL,NULL}'`,
 `'{{NULL},{NULL}}'` - which are under no key either, since NULL keys are dropped ("Build and
-insert" below).  Keeping them out of the EMPTY entry makes that entry exactly the values with no
+insert" below).  Keeping them out of the empty entries makes those exactly the values with no
 element at all, which is what lets the non-emptiness predicates of "Non-empty arrays" below be
-answered from the entries: a row is in exactly one of NULL (the value is NULL), EMPTY (it has no
-element), NULLELEMS or the value entries of its non-NULL elements.  Only `ginarrayextract()` returns
-NULL keys among the opclasses lion ships; a tsvector, a jsonb value and a range never reach the
-entry.  `lion_extract_value()` reports which reserved entry a key-less value belongs to, and the
-build, insert, VACUUM and verify(heapallindexed) all take it from there.  The three sort
-NULL < EMPTY < NULLELEMS < value.  The entry is part of format version 13 (`LION_VERSION_V13`); an
-index of another version is refused with the REINDEX hint, as after every format change.
+answered from the entries: a row is in exactly one of NULL (the value is NULL), EMPTY, EMPTYDIM or
+EMPTYINNER (it has no element, by its dimensions), NULLELEMS, or the value entries of its non-NULL
+elements.  Only `ginarrayextract()` returns NULL keys among the opclasses lion ships; a tsvector, a
+jsonb value and a range never reach the entry.  `lion_extract_value()` reports which reserved entry
+a key-less value belongs to, and the build, insert, VACUUM and verify(heapallindexed) all take it
+from there.  The five sort NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < value.  They are part
+of format version 14 (`LION_VERSION_V14`); an index of another version is refused with the REINDEX
+hint, as after every format change.
 
-`lion_index_stats()` reports the entry's members in `nullelem_tids`.
-
-The meta page version is NOT bumped.  A version 2 index built with a scalar opclass has no empty
-entry and needs none - only a multi-key opclass ever writes one, and those did not exist before this
-wave - so no existing index answers anything wrongly, which is the test §14 set for a version bump.
-
-`lion_index_stats()` gains `empty_tids`, the member count of that entry, next to `null_tids`.
+`lion_index_stats()` reports their members in `null_tids`, `empty_tids`, `emptydim_tids`,
+`emptyinner_tids` and `nullelem_tids`.
 
 ### Build and insert
 
@@ -5825,8 +5844,8 @@ Build (`lion_build.c`): the tuplesort tuple grows a fourth column, `kind int2`
 (REAL / NULL / EMPTY), still sorted by (hash, code).  A multi-key row is pushed once per distinct
 extracted key, all with the same code; both passes group by (kind, key) instead of (isnull, key).
 Nothing else changes, because the codes of each key still arrive ascending.  *(Since §24 "Build" the
-row's code is appended to each extracted key's entry, and to the reserved EMPTY entry when there is
-none; the sort, and `kind` with it, is gone.)*
+row's code is appended to each extracted key's entry, and to the reserved entry its value names
+when there is none; the sort, and `kind` with it, is gone.)*
 
 Insert (`lion_insert.c`): `lioninsert()` extracts and then performs one ordinary single-key insert per
 key, each taking and releasing its own bucket lock.  They are not atomic with respect to a reader,
@@ -5849,12 +5868,12 @@ there a run is quadratic in the keys that genuinely collide, which the built-in 
 keep small.
 
 `ntids` therefore counts (key, row) pairs, and so does `IndexBuildResult.index_tuples`.  A row with
-no keys contributes one pair, in the EMPTY or the NULLELEMS entry.  **VACUUM is unchanged**: its callback is per TID
+no keys contributes one pair, in one of the empty entries or the NULLELEMS entry.  **VACUUM is unchanged**: its callback is per TID
 and a TID is removed from every entry that holds it.
 
 verify(heapallindexed) extracts each heap row's keys with the same function the build uses and checks
-that the TID is present under every one of them, or in the EMPTY or NULLELEMS entry its value
-belongs to when there are none.
+that the TID is present under every one of them, or in the reserved entry its value belongs to
+(EMPTY, EMPTYDIM, EMPTYINNER or NULLELEMS) when there are none.
 
 ### Queries (`lion_extract_query()`, lion_multikey.c)
 
@@ -5887,15 +5906,15 @@ KEYS trees:
 ### Bitmap scans (`lion_scan.c`)
 
 `liongetbitmap` dispatches on `LionState.multikey`.  NONE emits nothing; ALL emits the union of every
-entry but the NULL one - the EMPTY entry included - with recheck = true (`lion_emit_all_keys()`, which
+entry but the NULL one - the key-less ones included - with recheck = true (`lion_emit_all_keys()`, which
 is the function `IS NOT NULL` already used); KEYS locates one posting set per key and hands the tree
 to the shared evaluator, emitting the result containers with recheck = false.
 
 `col IS NOT NULL` on a multi-key column is NOT a query of the opclass: an empty array or tsvector,
-whose row is in the EMPTY entry, is not NULL, so the rows it selects are every row the index holds
+whose row is in a key-less entry, is not NULL, so the rows it selects are every row the index holds
 but the NULL entry's, as on a scalar column (§14, "`IS NOT NULL` in the scans", 2026-10-19): the
 NULL entry taken away from the other quals' answer, or alone the union of every other entry, the
-EMPTY one included - exact either way.
+key-less ones included - exact either way.
 
 **The scan reuses the count cursors.**  `lion_sets_iterate()` (lion_expr.c) walks
 (tree over located posting sets) in ascending container-key order and calls back per container; the
@@ -6645,52 +6664,61 @@ paths against a sequential scan and GIN, before and after writes, and the facets
 A filter that asks whether an array has an element - `array_length(tags, 1) IS NOT NULL`,
 `cardinality(tags) > 0`, `tags <> '{}'` - was a heap filter beside the count: a function of the
 column is no clause of any kind the pushdown knows, and `<>` is no operator of array_ops.  Every row
-of an array_ops column is in exactly one of three classes, which its entries tell apart since the
-NULLELEMS entry (above): the column is NULL (the NULL entry, §14), it has no element (the EMPTY
-entry), or it has one (NULLELEMS or the entries of its elements).  A predicate whose truth is the
-same for every row of a class is then a union of reserved entries or the complement of one, and is
-answered with no heap visit.
+of an array_ops column is in exactly one of five classes, which its entries tell apart ("The
+reserved EMPTY entry" above): the column is NULL (the NULL entry, §14); it has no element and no
+dimension (EMPTY), no element and a first dimension of length 0 (EMPTYDIM), or no element and a
+first dimension of length 1 or more (EMPTYINNER); or it has an element (NULLELEMS or the entries of
+its elements).  A predicate whose truth is the same for every row of a class is then a union of
+reserved entries or the complement of one, and is answered with no heap visit.
 
-**The classes, as PostgreSQL's arrays make them.**  An array with no element has no dimensions,
-however it was made: `'{}'`, `'{{},{}}'`, `array_fill(1, ARRAY[0])`, an empty slice, `trim_array()`
-and `array_remove()` down to nothing and `string_to_array('', ',')` all come out as the one empty
-array of `construct_empty_array()`, and the binary input makes one of any array with no element.
-Any other array has one to six dimensions of at least one element each, whatever its lower bounds
-and whether its elements are NULL.  So over (NULL, empty, has an element):
+**The classes, as PostgreSQL's arrays make them.**  An array with no element has no dimension
+nearly however it was made: `'{}'`, `'{{},{}}'`, `array_fill(1, ARRAY[0])`, an empty slice,
+`trim_array()` and `array_remove()` down to nothing and `string_to_array('', ',')` all come out as
+the one empty array of `construct_empty_array()`, and the binary input makes one of any array with
+no element.  The exceptions are the empty `int2vector` and `oidvector`, `[0:-1]`, their casts to
+`int2[]` and `oid[]`, and what keeps their dimensions: `array_cat()` of them, and `ARRAY[]` and
+`array_agg()` of them, `[1:2][0:-1]`.  Any other array has one to six dimensions of at least one
+element each, whatever its lower bounds and whether its elements are NULL.  So over (NULL, EMPTY,
+EMPTYDIM, EMPTYINNER, has an element):
 
-    array_length(a, 1)                 NULL, NULL, >= 1
-    cardinality(a)                     NULL, 0,    >= 1
-    array_ndims(a)                     NULL, NULL, 1 .. 6
-    array_lower(a, 1), array_upper(a, 1)   NULL, NULL, any integer
-    a = '{}'                           NULL, true, false   (array_eq() compares the dimensions first)
+    array_length(a, 1)                 NULL, NULL, 0,      >= 1,   >= 1
+    cardinality(a)                     NULL, 0,    0,      0,      >= 1
+    array_ndims(a)                     NULL, NULL, 1 .. 6, 2 .. 6, 1 .. 6
+    array_lower(a, 1), array_upper(a, 1)   NULL, NULL, any integer, any, any
+    a = '{}'                           NULL, true, false,  false,  false
+                                       (array_eq() compares the dimensions first)
 
 **Which predicates** (`lion_nonempty_test()`, lion_plan_nonempty.c).  Each clause is evaluated over
-the three classes, a class's answer being true, false, NULL for every row of it, or mixed; a clause
+the five classes, a class's answer being true, false, NULL for every row of it, or mixed; a clause
 with no mixed class is taken, and what it selects is the classes where it is true.  The values are
 those of the table: the integer functions above with the dimension the constant 1, and
 `coalesce()` of one with an integer constant; compared with an integer constant of any width by an
 operator of the integer btree family, either way round, or with `IS [NOT] DISTINCT FROM`, or tested
-`IS [NOT] NULL`; the column compared with an empty array constant by `=`, `<>` or `IS [NOT]
-DISTINCT FROM`; and any of these under `NOT` and `IS [NOT] TRUE / FALSE / UNKNOWN`.  A value over
-the rows with an element is a range (`>= 1`, 1 to 6, any integer), so `array_length(a, 1) >= 0` is
-true of them all and `array_length(a, 1) > 1` is mixed.  Declined, and left to the heap: a mixed
-class (`array_length(a, 1) = 1`, `array_ndims(a) = 1`, `array_lower(a, 1) = 1`, `tags <> '{1}'`); a
-dimension other than the constant 1 (`array_length(a, 2)` is NULL for a one-dimensional array with
+`IS [NOT] NULL`; the column compared with `'{}'` - an empty array constant with no dimension - by
+`=`, `<>` or `IS [NOT] DISTINCT FROM`; and any of these under `NOT` and `IS [NOT] TRUE / FALSE /
+UNKNOWN`.  A value over a class is a range (`>= 1`, 1 to 6, any integer), so `array_length(a, 1)
+>= 0` is true of every class with dimensions and `array_length(a, 1) > 1` is mixed.  Declined, and
+left to the heap: a mixed class (`array_length(a, 1) = 1`, `array_ndims(a) = 1`, `array_ndims(a) >
+1`, `array_lower(a, 1) = 1`, `tags <> '{1}'`); an empty constant with dimensions
+(`''::int2vector::int2[]`, which a row of EMPTYDIM equals or not by its lower bound); a dimension
+other than the constant 1 (`array_length(a, 2)` is NULL for a one-dimensional array with
 elements); a bound that is not a constant at plan time (the classes a parameter selects depend on
 its value); and a predicate true of every row or of none (`coalesce(cardinality(a), 0) >= 0`),
 which has nothing to read.
 
 **The count** (`lion_nonempty_leaf()`, first in `lion_analyze_leaf()`).  The classes a clause
-selects become one of two clause kinds, whose value is a mask of the column's reserved entries:
+selects become one of two clause kinds, whose value is a mask of the column's reserved entries -
+one or more of EMPTY, EMPTYDIM and EMPTYINNER, and the NULL entry or not (`LION_RESERVED_MASK_OK()`):
 
-- `LION_CLAUSE_RESERVED`, the rows of the EMPTY entry, or of it and the NULL entry - `a = '{}'`,
-  `cardinality(a) = 0`; `array_length(a, 1) IS NULL` - a positive source, located as the OR of
-  those entries' sets (`lion_locate_leaf()`), and a plain one for the one-set counts as an
-  equality's set is;
-- `LION_CLAUSE_NOTRESERVED`, every row outside the EMPTY entry, or outside it and the NULL entry -
-  `a IS DISTINCT FROM '{}'`; `cardinality(a) > 0`, `array_length(a, 1) IS NOT NULL AND
-  array_length(a, 1) >= 0` - a negated source subtracting their union, as `<>` subtracts its value's
-  entry and the NULL one (§35).
+- `LION_CLAUSE_RESERVED`, the rows of the entries named - `a = '{}'` EMPTY's, `cardinality(a) = 0`
+  the three empty entries', `array_length(a, 1) = 0` EMPTYDIM's, `array_length(a, 1) IS NULL`
+  NULL's and EMPTY's - a positive source, located as the OR of those entries' sets
+  (`lion_locate_leaf()`), and a plain one for the one-set counts as an equality's set is;
+- `LION_CLAUSE_NOTRESERVED`, every row outside the entries named - `cardinality(a) > 0` outside the
+  NULL and the three empty entries, `a <> '{}'` and `array_length(a, 1) IS NOT NULL` outside NULL
+  and EMPTY, `array_length(a, 1) > 0` outside those and EMPTYDIM, `a IS DISTINCT FROM '{}'` outside
+  EMPTY alone - a negated source subtracting their union, as `<>` subtracts its value's entry and
+  the NULL one (§35).
 - The NULL class alone, or every row but it, is `a IS NULL` or `a IS NOT NULL`
   (`cardinality(a) IS NULL`, `cardinality(a) >= 0`), the NULL and NOTNULL kinds of §14, now taken on
   a multi-key column too: from its NULL entry, when no index holds the column as a scalar one (a
@@ -6699,22 +6727,28 @@ selects become one of two clause kinds, whose value is a mask of the column's re
 
 The rows with an element alone are never read as a union - NULLELEMS and every element's entry,
 a row under each of its elements - only as what is left of the others.  Both kinds are multi-key
-kinds, resolved on the column's multi-key index, and only on one whose class extracts with
-`lion_array_extract_value()` or `ginarrayextract()` (`lion_nonempty_index()`), which is what files
-a NULL array, an empty one and one of NULL elements in three entries apart: a class of whole arrays,
-one key per row, has no EMPTY entry, and tsvector's and jsonb's classes extract other values.  Both
-are taken wherever their models are, under the same rules: beside positive clauses, under a GROUP
-BY and a count(DISTINCT), in a filtered count, on a partitioned table, as an arm of an OR (§19) and
-as a complement arm (§35), and beside nothing that selects rows, where the count of every row
-drives (§35).  `count(col)` reads the column as NOT NULL beside a RESERVED clause without the NULL
-entry and a NOTRESERVED one with it.  Beside a multi-key query known only at run time ("A query
-known only at run time" above), which may narrow nothing and leave the rows to the row filter, the
-row filter tests `NOT (NULL or EMPTY)` as `a <> '{}'` (array_ne() against the column type's empty
-array, `lion_filter_with_negated()`); a NOTRESERVED clause that NULLs pass is declined there, as
-`IS DISTINCT FROM` is.  Two copies of one NOTRESERVED clause - `array_length(a, 1) IS NOT NULL AND
-array_length(a, 1) >= 0` - are counted once.  EXPLAIN prints the classes in one spelling whatever
-the query's: `idx (cardinality(tags) > 0)`, `(cardinality(tags) IS DISTINCT FROM 0)`,
-`(cardinality(tags) = 0)`, `(coalesce(cardinality(tags), 0) = 0)`.
+kinds, resolved on the column's multi-key index, and only on one whose class extracts an array's
+elements (`lion_nonempty_index()`, `lion_extracts_array_elements()`), which is what files the five
+classes in entries apart: a class of whole arrays, one key per row, has no key-less entry, and
+tsvector's and jsonb's classes extract other values.  Both are taken wherever their models are,
+under the same rules: beside positive clauses, under a GROUP BY and a count(DISTINCT), in a
+filtered count, in parallel, on a partitioned table, as an arm of an OR (§19) and as a complement
+arm (§35), and beside nothing that selects rows, where the count of every row drives (§35).  A
+RESERVED clause read from a partial index holds the count to the predicate's rows, as an equality
+does (§45, `lion_partial_anchor_kind()`): its entries hold the predicate's rows alone.
+`count(col)` reads the column as NOT NULL beside a RESERVED clause without the NULL entry and a
+NOTRESERVED one with it.  Beside a multi-key query known only at run time ("A query known only at
+run time" above), which may narrow nothing and leave the rows to the row filter, the row filter
+tests a NOTRESERVED mask with the NULL entry on each row the snapshot sees - the array not NULL,
+and in none of the empty entries named, which `lion_array_empty_flag()` reads off its dimensions
+(`lion_filter_with_negated()`, `LionRowFilterClause.reserved`); a NOTRESERVED clause that NULLs
+pass is declined there, as `IS DISTINCT FROM` is.  Two copies of one NOTRESERVED clause -
+`array_length(a, 1) IS NOT NULL AND array_length(a, 1) >= 0` - are counted once.  EXPLAIN prints
+the classes in one spelling whatever the query's (`lion_explain_reserved()`): `a = '{}'`, `a <>
+'{}'`, `a IS DISTINCT FROM '{}'`, `cardinality(a) = 0`, `coalesce(cardinality(a), 0) = 0`,
+`cardinality(a) > 0`, `cardinality(a) IS DISTINCT FROM 0`, `array_length(a, 1) IS NULL`,
+`array_length(a, 1) = 0`, `array_length(a, 1) > 0`, `coalesce(array_length(a, 1), 0) = 0` and
+`array_length(a, 1) IS DISTINCT FROM 0` - the twelve sets of classes one clause can select.
 
 **The estimates** (`lion_nonempty_rel_clauses()`, §29.11 "The relation's rows").  Core estimates
 each spelling as a function of the column, with no statistics of it: a null test at 0.995 or 0.005,
@@ -6725,8 +6759,27 @@ take every such clause of one column of a lion array_ops index together, AND the
 selects, and put in their place the one clause core estimates from the column's own statistics for
 the same rows (`lion_nonempty_clause()`): `a <> '{}'`, `a = '{}'`, `a IS DISTINCT FROM '{}'`,
 `NOT (a <> '{}')` (the empty array's share and the NULLs'), `a IS NULL`, `a IS NOT NULL`, or false.
-The relation's rows are corrected wherever this changes a clause, as wherever the intersection probe
-measures a correlation.
+Those clauses tell three classes apart, NULL, `'{}'` and the rest, and core's statistics count an
+empty array with dimensions among the rest; so does the estimate, which leaves the EMPTYDIM and
+EMPTYINNER rows out where a clause selects them beside others, and keeps the clause's own estimate
+where it selects nothing else (`array_length(a, 1) = 0`).  Such arrays come from a cast of an
+`int2vector` or `oidvector`, and a column of them is rare enough that a third clause shape for them
+is not worth its cost.  The relation's rows are corrected wherever this changes a clause, as
+wherever the intersection probe measures a correlation.
+
+**Planning cost.**  Every estimate of a relation lion indexes takes its clauses through
+`lion_nonempty_rel_clauses()`, at least once per relation and again for each index path's quals,
+and the count pushdown takes every clause of its WHERE through `lion_nonempty_leaf()`, a table with
+no lion index included; nearly none is a test of whether an array is empty.  So both look at a
+clause's shape first, with no catalog lookup (`lion_ne_shape()`: one of the five functions above,
+`coalesce()` of one, array `=` or `<>`, or a null test), and only a clause of the shape is evaluated
+over the classes, its operator looked up last; a list with no clause of the shape and fewer than
+two null tests of a column is handed back as it is, without an allocation.  Measured with
+callgrind on 18 (2026-10-21), the planning of a query with three or eight scalar clauses on a table
+with lion indexes spends 0.3-0.5% of its instructions there, where it spent 3-4.5%: 600 of 199,000
+where it was 6,400 of 207,000 for three clauses, and 2,100 of 468,000 where it was 22,400 of 493,000
+for eight under a count.  A count on a table with no lion index spends 900 of 293,000 (0.3%) where
+it spent 8,400 of 301,000 (2.8%), and a query with no count none, as before.
 
 **The scans.**  There is no route.  Core hands an index only the clauses whose operator is in the
 index's operator family, and null tests of its columns (`match_clause_to_indexcol()`): a function of
@@ -6742,7 +6795,14 @@ at run time (with `'{}'`, the row filter's case), a text[] column under "C", a d
 a multicolumn index, a partitioned table (one partition without the index declines), a whole-array
 class and a class of the user's over `ginarrayextract()`; after updates, deletes and inserts that
 move rows between the classes, before and after VACUUM; the plans; the rows estimated against core's
-and the truth; and what reaches the scans.
+and the truth; and what reaches the scans.  `test/sql/nonempty_dims.sql` does the same for the
+empty arrays with dimensions - `''::int2vector::int2[]`, `array_cat()` of two, `ARRAY[]` of them in
+two and three levels, `''::oidvector::oid[]` - beside `'{}'`, NULLs, `'{NULL}'` and arrays with
+elements and lower bounds of 0: every spelling, the empty constants with dimensions and the
+multi-key operators, alone and beside a key; the plans; GROUP BY, filtered counts, count(DISTINCT),
+ORs, the row filter beside a query known only at run time with each mask, counts by cells, the
+parallel node, a partial index the clause holds the count to, the facets, and inserts, updates,
+deletes, VACUUM and REINDEX moving rows between all five entries, with lion_index_verify() after.
 
 ### Cardinality guard
 
@@ -6979,7 +7039,7 @@ the rows: Σ ntids over the entries of the index's FIRST SCALAR key column, SUMM
 out, which is exact because a scalar column files every row the index holds under exactly one
 entry, the NULL entry for a NULL (§14, §24); for a partial index that is the count ANALYZE only
 estimates.  An index whose key columns are all multi-key files a row under any number of entries,
-the EMPTY entry included (§17), and nothing short of their union counts its rows, so it reports
+the key-less entries included (§17), and nothing short of their union counts its rows, so it reports
 the heap's row count instead, exact when the heap's is - `ginvacuumcleanup()`'s answer, and wrong
 for a partial index the same way. `tuples_removed` stays a count of postings, as GIN's is. ambuild
 reported the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or the
@@ -7425,8 +7485,8 @@ version has to be bumped). Leaf pages hold LionEntryTuple items in key order, ex
 pages did; internal pages hold downlink pivots, LionEntryTuple-shaped with LION_ENTRY_DOWNLINK and
 the child block in the header's last word, so the key helpers apply unchanged. Every non-rightmost page's FIRST item
 is its high key (LION_ENTRY_HIGHKEY, key only), and every internal page begins with a
-LION_ENTRY_MINUSINF downlink, with no key, that compares below everything ("Height" below). Reserved NULL and EMPTY entries sort
-first (NULL < EMPTY < value) via a kind prefix in the comparison, not in the stored key, so they
+LION_ENTRY_MINUSINF downlink, with no key, that compares below everything ("Height" below). Reserved entries sort
+first (NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < value) via a kind prefix in the comparison, not in the stored key, so they
 live on the leftmost leaf and are reached by the ordinary descent. Multi-key classes: the key type
 is the STORAGE type (§17), which is what is compared.
 
@@ -7508,7 +7568,7 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 13 (`LION_VERSION_V13`, the NULLELEMS entry of §17): these entry tuples, with keys of up to 2047 bytes
+The format is version 14 (`LION_VERSION_V14`, the EMPTYDIM and EMPTYINNER entries of §17): these entry tuples, with keys of up to 2047 bytes
 (§4), under internal pages that each begin with a minus-infinity downlink ("Height" below), and
 the pages VACUUM takes out and hands out again ("Page deletion" below, §22 "Empty leaves"). An
 index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
@@ -7517,7 +7577,8 @@ any height.
 
 ### The order
 
-    KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < NULLELEMS < VALUE), then proc 4 under the column's
+    KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < VALUE),
+    then proc 4 under the column's
     collation, then the hash (computed from the key, "Entry tuples" above), then a bytewise
     comparison of the stored datum
 
@@ -7997,7 +8058,7 @@ for the same reason the fixed-width ones, first in the tuple descriptor, so that
 cached.
 
 **`kind` is a sort key whenever the leading one can TIE across kinds**: for a multi-key opclass,
-which has an EMPTY entry as well as a NULL one and neither has a key to tell them apart, and for
+which has key-less entries as well as a NULL one and none has a key to tell them apart, and for
 every UNORDERED opclass, whose leading key is the hash. The grouping pass starts a new entry
 whenever the kind changes, so a real key that hashes to 0 interleaving with the reserved NULL rows
 - code by code, which is how the sort leaves them - wrote the NULL entry out several times over and
@@ -9493,7 +9554,7 @@ home for the count pushdown to find every column's posting sets without matching
 **Directory.** The directory key is (column number, key): the directory comparator compares attno
 first, and every entry tuple carries its attno in a `uint16` of its header (§21, "Entry
 tuples").
-Reserved NULL and EMPTY entries exist per column. The leading attno term is compared before any
+Reserved entries (NULL, and the key-less ones of §17) exist per column. The leading attno term is compared before any
 opclass function is called, which is what lets one descent walk past the entries of columns whose
 key type it knows nothing about; the minus-infinity downlink of an internal page carries attno 0 and
 still sorts below everything.
@@ -9529,8 +9590,8 @@ relation-wide ones (the directory's shape, free and deleted pages) are repeated 
 container page is attributed to a column through its owner_head stamp (§18) and the attno of the
 entry that owns that head, accumulated per posting set and folded in at the end; a single-column
 index skips that and attributes everything to column 1. **verify()** checks the attno of every entry
-(in range, never below the entry before it), at most one reserved NULL, one EMPTY and one NULLELEMS
-entry per column, and - with heapallindexed - every heap row under every key of every column.
+(in range, never below the entry before it), at most one of each reserved entry per column, and -
+with heapallindexed - every heap row under every key of every column.
 
 **Scans (amgetbitmap)**: the scan keys arrive with `sk_attno`; each key resolves to its column, every
 set qual of every column is answered (§5 SCAN step 5: several on one column are ANDed like the
@@ -20575,7 +20636,7 @@ between leaves and a right-walk guard against a cycle of right links (§21); a l
 the walk has read it moves entries already counted onto a page between it and the right sibling
 the walk goes to next, one that split before is read with its new sibling. Either way nothing is
 missed but what writers add or VACUUM deletes meanwhile. Counted: the VALUE entries of each column
-with at least one TID. Not counted: the NULL and EMPTY entries (§14, §17), SUMMARY and SUMLAST
+with at least one TID. Not counted: the reserved entries (§14, §17), SUMMARY and SUMLAST
 entries (§32), pivots. A key whose rows are all dead is counted until the VACUUM that empties its
 entry deletes it (§18), and dead TIDs count in the rows: the count is an estimate, as ANALYZE's own
 is.
@@ -21104,8 +21165,9 @@ Two more negated kinds join `IS NOT NULL` and `<>`, each the union of entries it
   out other than exact is an error, not a wrong count.
 
 Both are taken wherever `<>` is, the count of every row above included.  So is §17's
-`LION_CLAUSE_NOTRESERVED` ("Non-empty arrays"), every row outside an array column's EMPTY entry, or
-outside it and the NULL entry: `cardinality(a) IS DISTINCT FROM 0`, `cardinality(a) > 0`.
+`LION_CLAUSE_NOTRESERVED` ("Non-empty arrays"), every row outside some of an array column's empty
+entries, with its NULL entry or without: `cardinality(a) IS DISTINCT FROM 0`, `cardinality(a) > 0`,
+`a <> '{}'`.
 
 **Complements in an OR.** `n <> 17 OR n IS NULL`, `c200 = 17 OR c20 <> 3`: an OR whose arms are each
 all positive or all negated clauses. Let P be the union of the positive arms (a §19 tree, or no row
@@ -21286,7 +21348,7 @@ the planner has no grouped rel to offer it (§7, "Facet counts"): the candidates
 `ntids`, counted largest bound first in batches against the filter's collected copy, then a walk
 of the whole column when they run out. It always stops on the strict rule - the k-th count LARGER
 than the next bound - because its output is ordered by count and then key, so a key tied with the
-k-th may precede it and must be counted. The reserved NULL and EMPTY entries and a positions
+k-th may precede it and must be counted. The reserved entries and a positions
 column's length key are not candidates. When the filter's copy is small next to the keys there
 are to count, the facets are read from its rows instead and the walk is not made.
 

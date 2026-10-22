@@ -379,8 +379,8 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	/*
 	 * lion_fetch_key() points into the page for by-reference types, so copy
 	 * the key out while the buffer is still locked.  The reserved NULL entry
-	 * (DESIGN.md §14) has no key bytes to copy, and the EMPTY and NULLELEMS
-	 * entries (§17) no key at all.
+	 * (DESIGN.md §14) has no key bytes to copy, and the keyless ones of §17
+	 * no key at all.
 	 */
 	ps->keyisnull = LionEntryIsNullKey(entry);
 	if (ps->keyisnull)
@@ -1875,7 +1875,7 @@ lion_posting_set_lookup_null_col(Relation index, AttrNumber attno,
 
 /*
  * ... and for any reserved entry of the column: the NULL one, or a multi-key
- * column's EMPTY or NULLELEMS one (DESIGN.md §17), named by its flag.
+ * column's keyless ones (DESIGN.md §17), named by its flag.
  */
 bool
 lion_posting_set_lookup_reserved_col(Relation index, AttrNumber attno,

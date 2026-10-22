@@ -1066,7 +1066,7 @@ lion_vacuum_count_budget(Relation index)
  * between it and the right sibling the walk goes to next, and one that split
  * before is read with its new sibling: nothing is counted twice or missed but
  * what writers add or VACUUM deletes meanwhile, which is the precision an
- * estimate needs.  Neither the NULL nor the EMPTY entry is a value, nor is a
+ * estimate needs.  No reserved entry (§14, §17) is a value, nor is a
  * summary (§32), nor an entry with no TID at all; a key whose rows are all
  * dead is, until the VACUUM that empties its entry deletes it - an estimate,
  * as ANALYZE's own is.  The leaves go through the VACUUM's or ANALYZE's

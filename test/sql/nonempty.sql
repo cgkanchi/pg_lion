@@ -1,14 +1,17 @@
 -- Whether an array is empty, answered from a lion array column's reserved
 -- entries (DESIGN.md §17, "Non-empty arrays").
 --
--- A row of a column that lion's array_ops indexes is in exactly one of three
+-- A row of a column that lion's array_ops indexes is in exactly one of five
 -- classes: the column is NULL (the NULL entry), it is an array with no
--- element (the EMPTY entry), or it has an element - its elements' entries,
--- or the NULLELEMS entry when every element is NULL.  A predicate that is
--- true of every row of a class or of none - `cardinality(tags) > 0`,
--- `array_length(tags, 1) IS NOT NULL`, `tags <> '{}'`, `tags = '{}'` and
--- the like - is then a union of reserved entries or its complement, which the
--- count pushdown answers with no heap visit.  Every query is run through the
+-- element - '{}' in the EMPTY entry, and in the EMPTYDIM and EMPTYINNER
+-- entries the empty arrays with dimensions an int2vector or oidvector cast
+-- makes, which nonempty_dims tests and this table has none of - or it has an
+-- element - its elements' entries, or the NULLELEMS entry when every
+-- element is NULL.  A predicate that is true of every row of a class or of
+-- none - `cardinality(tags) > 0`, `array_length(tags, 1) IS NOT NULL`,
+-- `tags <> '{}'`, `tags = '{}'` and the like - is then a union of reserved
+-- entries or its complement, which the count pushdown answers with no heap
+-- visit.  Every query is run through the
 -- pushdown with every other scan disabled and through a sequential scan with
 -- the pushdown off, and the two results are compared as multisets both ways
 -- round; the data has NULL arrays, empty ones, arrays of NULLs, arrays of
@@ -211,8 +214,8 @@ VACUUM (FREEZE, ANALYZE) lion_ne_t;
 
 -- ---- 1. the classes are the reserved entries ---------------------------
 -- The NULL entry holds the NULL arrays, the EMPTY entry exactly the arrays
--- with no element, and the NULLELEMS entry the arrays whose elements are all
--- NULL, whatever their dimensions.
+-- with no element (none has dimensions), and the NULLELEMS entry the arrays
+-- whose elements are all NULL, whatever their dimensions.
 SELECT null_tids = (SELECT count(*) FROM lion_ne_t WHERE tags IS NULL) AS nulls,
 	   empty_tids = (SELECT count(*) FROM lion_ne_t WHERE cardinality(tags) = 0) AS empties,
 	   nullelem_tids = (SELECT count(*) FROM lion_ne_t
@@ -224,7 +227,9 @@ SELECT null_tids = (SELECT count(*) FROM lion_ne_t WHERE tags IS NULL) AS nulls,
 SELECT lion_index_verify('lion_ne_tags', true);
 
 -- ---- 2. the spellings answered -----------------------------------------
--- Non-empty: every row outside the NULL and EMPTY entries.
+-- Non-empty: every row outside the NULL and EMPTY entries - and outside
+-- EMPTYDIM and EMPTYINNER too for `cardinality(tags) > 0`, while `tags <>
+-- '{}'` and the array_length() and array_ndims() spellings take their rows.
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) IS NOT NULL$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) > 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) >= 1$$);
@@ -251,12 +256,14 @@ SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND (cardinality(tag
 -- ... with the column's own null test beside it, and the shape written twice
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags IS NOT NULL AND array_length(tags, 1) > 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) IS NOT NULL AND array_length(tags, 1) >= 0$$);
--- Not empty, NULLs included: every row outside the EMPTY entry.
+-- Not empty, NULLs included: every row outside the EMPTY entry (and the
+-- other two empty ones, for cardinality()).
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND cardinality(tags) IS DISTINCT FROM 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags IS DISTINCT FROM '{}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND (cardinality(tags) = 0) IS NOT TRUE$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND coalesce(cardinality(tags), 1) > 0$$);
--- Empty: the rows of the EMPTY entry.
+-- Empty: the rows of the EMPTY entry (and the other two empty ones, for
+-- cardinality()).
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND cardinality(tags) = 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND cardinality(tags) < 1$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND cardinality(tags) <= 0$$);
@@ -264,7 +271,8 @@ SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags = '{}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND '{}' = tags$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags IS NOT DISTINCT FROM '{}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags IS NOT NULL AND array_length(tags, 1) IS NULL$$);
--- Empty or NULL: the rows of the EMPTY and NULL entries.
+-- Empty or NULL: the rows of the EMPTY and NULL entries (and the other two
+-- empty ones, for cardinality()).
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) IS NULL$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_ndims(tags) IS NULL$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND coalesce(cardinality(tags), 0) = 0$$);
@@ -315,7 +323,8 @@ SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_ndims(tags
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_lower(tags, 1) = 1$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND cardinality(tags) > $1$$, '0');
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND tags <> '{1}'$$);
--- True of every row, or of none: nothing to read off the entries.
+-- True of every row, or of none: nothing to read off the entries; and
+-- `array_length(tags, 1) = 0`, the rows of the EMPTYDIM entry, none here.
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND coalesce(cardinality(tags), 0) >= 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) = 0$$);
 SELECT lion_ne_plan($$SELECT count(*) FROM lion_ne_t WHERE k = 3 AND array_length(tags, 1) > 1$$);

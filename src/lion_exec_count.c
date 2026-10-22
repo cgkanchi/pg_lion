@@ -17,8 +17,6 @@
 
 #include "access/visibilitymap.h"
 #include "pgstat.h"
-#include "utils/array.h"
-#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 
@@ -50,10 +48,11 @@ lion_where_has_positive(LionCountScanState *st)
  * The row filter of a WHERE with nothing to take its candidates from: every
  * WHERE clause that selects rows was a multi-key query no key narrows, so the
  * candidates are every row the count reads, and st->filter - those queries -
- * is extended with the `IS NOT NULL` and `<>` clauses, and the non-empty
- * arrays of §17 as `col <> '{}'`, which there is no positive source to
- * subtract from, to be tested on each row the snapshot sees.  In the current
- * memory context.
+ * is extended with the `IS NOT NULL` and `<>` clauses, and the tests of
+ * §17 that leave out the NULL arrays and some empty ones (`col <> '{}'`,
+ * `cardinality(col) > 0`), which there is no positive source to subtract
+ * from, to be tested on each row the snapshot sees.  In the current memory
+ * context.
  *
  * Those are the only negated clauses it tests, and only on a heap column:
  * the planner takes no `IS DISTINCT FROM`, `NOT (multi-key)` or negated
@@ -98,24 +97,20 @@ lion_filter_with_negated(LionCountScanState *st)
 		if (cl->kind == LION_CLAUSE_NOTRESERVED)
 		{
 			/*
-			 * Every row outside the NULL and EMPTY entries (DESIGN.md §17,
-			 * "Non-empty arrays") is `col <> '{}'`: array_ne() against the
-			 * column's own empty array, which no element is compared with.
-			 * The planner takes no other mask beside a query known only at
-			 * run time.
+			 * Every row outside the reserved entries the mask names
+			 * (DESIGN.md §17, "Non-empty arrays"): an array, which a NULL
+			 * fails, in none of the others, as its dimensions say.  The
+			 * planner takes no mask without the NULL entry beside a query
+			 * known only at run time.
 			 */
-			Oid			elemtype;
-
-			elemtype = get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
-																  c->attno - 1)->atttypid));
-			if (cl->valisnull || !OidIsValid(elemtype) ||
-				DatumGetInt32(cl->val) !=
-				(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY))
+			if (cl->valisnull ||
+				!LION_RESERVED_MASK_OK(DatumGetInt32(cl->val)) ||
+				(DatumGetInt32(cl->val) & LION_ENTRY_NULLKEY) == 0 ||
+				!OidIsValid(get_element_type(getBaseType(TupleDescAttr(RelationGetDescr(st->heap),
+																	   c->attno - 1)->atttypid))))
 				elog(ERROR, "LionCount: reserved entries of index \"%s\" tested on a row",
 					 RelationGetRelationName(cl->idx));
-			c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
-			c->value = PointerGetDatum(construct_empty_array(elemtype));
-			fmgr_info(F_ARRAY_NE, &c->flinfo);
+			c->reserved = (uint16) (DatumGetInt32(cl->val) & ~LION_ENTRY_NULLKEY);
 		}
 		else if (!c->notnull)
 		{

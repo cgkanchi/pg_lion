@@ -600,9 +600,10 @@ lion_emit_null(Relation index, LionState *col, TIDBitmap *tbm, bool recheck)
  *	  `<@`, a tsquery with NOT/phrase/prefix/weights.  Those ask for a
  *	  superset and the caller passes recheck = true.
  *
- * The reserved EMPTY entry is emitted like any other, which is what it exists
- * for: a row an opclass extracted no key from is under no key, and only a
- * walk like this one can find it.  The NULL entry is left out, because a NULL
+ * The reserved entries of rows with no key (EMPTY, EMPTYDIM, EMPTYINNER,
+ * NULLELEMS) are emitted like any other, which is what they exist for: a row
+ * an opclass extracted no key from is under no key, and only a walk like this
+ * one can find it.  The NULL entry is left out, because a NULL
  * value satisfies neither kind of qual (the multi-key operators are strict).
  *
  * The walk is the column's first leaf and then the right links (DESIGN.md §21
@@ -1730,7 +1731,7 @@ lion_bitmap_list_batch(Relation index, LionScanList *l, MemoryContext batchcxt,
  * set the evaluator can build on its own - but beside a set to take it away
  * from it is exactly that entry SUBTRACTED (DESIGN.md §14, §29.2): every row
  * the index holds is under exactly one of the column's NULL entry and its
- * other entries (the EMPTY one of a multi-key column among them, §17), so a
+ * other entries (the keyless ones of a multi-key column among them, §17), so a
  * row of the other quals' answer has a value in the column exactly when the
  * NULL entry does not hold it.  A caller that can subtract passes `negated`,
  * and is handed the NULL entry's leaf with *negated set, for the AND of its
@@ -4128,7 +4129,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 		/*
 		 * `IS NOT NULL` is answered EXACTLY (DESIGN.md §14, §29.2): every row
 		 * the index holds is under exactly one of its column's NULL entry and
-		 * its other entries - a multi-key column's EMPTY entry among them
+		 * its other entries - a multi-key column's keyless ones among them
 		 * (§17) - so beside anything that answers, the column's NULL entry is
 		 * taken away from the answer (lion_scan_and()), read only at the
 		 * container keys the answer has.  It used to be dropped there and
