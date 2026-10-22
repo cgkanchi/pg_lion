@@ -60,7 +60,13 @@
  * the entry read again afterwards - and a set that replay keeps changing is
  * kept from its last walk without comparing its totals, never walked with
  * the leaf held; and heapallindexed lets the entry's leaf go before it
- * descends the set, on a primary too.
+ * descends the set, on a primary too.  A posting set that disagrees with
+ * its entry, and a position tree that disagrees with its posting set, are
+ * reported there only from a walk that read every page as it was at one
+ * replay position, which the pages' LSNs show: replay applies VACUUM beside
+ * the check, which can leave an entry reading the same around a walk that
+ * read its set half before and half after.  One replay keeps from that is
+ * kept without the comparison too.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -90,6 +96,7 @@
 #include "catalog/pg_type_d.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "storage/buffile.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "storage/procarray.h"
@@ -145,6 +152,43 @@ typedef struct LionVerifyCand
 	int			downlink;		/* DOWNLINK: its position on its level */
 } LionVerifyCand;
 
+/*
+ * A sequence of records of one size that a walk of a tree writes and then
+ * reads back in order (lion_verify.c): the pages of one level of the tree,
+ * the blocks the walk visited, the pages it found flagged.  A walk needs
+ * whole sequences - the walk of a level is compared with the WHOLE level
+ * below it, which it must have finished reading first (lion_verify_chain()
+ * says why) - and they grow with the tree, so each keeps its first records
+ * in memory, up to an equal share of work_mem (LION_VERIFY_SEQS of them are
+ * alive at once), and writes the rest to a temporary file, which it reads
+ * back in order.  A record is 16 bytes or less for every 8 KB page the walk
+ * reads, so the file costs the walk next to nothing of what the reads do.
+ */
+typedef struct LionVerifySeqAcct
+{
+	Size		cap;			/* bytes one sequence keeps in memory at most */
+	Size		mem;			/* bytes the sequences keep in memory now */
+	Size		peak;			/* ... and the most they ever kept */
+	int64		spilled;		/* records written to temporary files */
+} LionVerifySeqAcct;
+
+/* At most this many sequences are alive at once (lion_verify_seq_put()). */
+#define LION_VERIFY_SEQS	4
+
+typedef struct LionVerifySeq
+{
+	LionVerifySeqAcct *acct;
+	MemoryContext cxt;			/* where its memory and its file live */
+	Size		recsize;
+	char	   *mem;			/* its first records */
+	int64		memalloc;		/* records mem has room for */
+	int64		nmem;			/* records in mem */
+	BufFile    *file;			/* the records after them, or NULL */
+	int64		fileat;			/* the file's position in records, or -1 */
+	int64		n;				/* records in all */
+	int64		next;			/* the next record to read */
+} LionVerifySeq;
+
 typedef struct LionVerifyState
 {
 	Relation	index;
@@ -167,6 +211,8 @@ typedef struct LionVerifyState
 	uint32		max_posting_height;	/* tallest posting tree (DESIGN.md §22) */
 	Oid			keyoutfunc;		/* output function of the column being checked */
 	MemoryContext heapcxt;		/* per heap tuple, heapallindexed only */
+	LionContainer *posbuf;		/* ... an INLINE entry's positions chunk */
+	LionPosMember *posm;		/* ... a member the index stores */
 	int64		nheaptuples;
 	bool		showvalues;		/* the CALLER is a superuser; decided before
 								 * the switch to the table owner */
@@ -191,9 +237,8 @@ typedef struct LionVerifyState
 	 */
 	MemoryContext setcxt;		/* for one set's walks, emptied after it */
 	bool		settrack;
-	BlockNumber *setvisits;		/* allocated outside setcxt */
-	int			nsetvisits;
-	int			maxsetvisits;
+	LionVerifySeq setvisits;	/* BlockNumbers, kept outside setcxt */
+	LionVerifySeqAcct seqacct;	/* what every walk's sequences keep */
 
 	/* What the concurrency cost, for the DEBUG1 line at the end. */
 	int64		nleftlinks;		/* left links settled by a coupled walk */
@@ -202,24 +247,41 @@ typedef struct LionVerifyState
 	int64		nsetretries;	/* ... thrown away because a writer got in */
 	int64		nsetholds;		/* ... made with the entry's leaf held */
 	int64		nsetuncompared;	/* sets a standby kept without their totals */
+	int64		nposwalks;		/* position-tree walks */
+	int64		nposretries;	/* ... thrown away because a writer got in */
+	int64		nposholds;		/* ... made with the entry's leaf held */
+	int64		nposuncompared; /* trees a standby kept without comparing */
 	int			nwaits;			/* WaitForLockers() calls */
+
+	/*
+	 * On a standby, the replay position a walk of a position tree began at,
+	 * and whether a page it read since carries a later LSN
+	 * (lion_verify_read_page(), lion_verify_postree_walks()).
+	 */
+	bool		lsntrack;
+	XLogRecPtr	lsnhorizon;
+	bool		lsnpast;
 } LionVerifyState;
 
 /*
- * How many times a posting set is walked with nothing held before the walk is
- * made with its entry's directory leaf held SHARE (lion_verify_set()).  Each
- * extra walk costs this backend a read of the set; the last one costs the
- * writers of that leaf's keys a wait for one read of it.
+ * How many times a posting set or a position tree is walked with nothing
+ * held before the walk is made with its entry's directory leaf held SHARE
+ * (lion_verify_set(), lion_verify_postree()).  Each extra walk costs this
+ * backend a read of the tree; the last one costs the writers of that leaf's
+ * keys a wait for one read of it.
  */
 #define LION_VERIFY_SET_ATTEMPTS	3
 
 /*
- * How many walks of a posting set a STANDBY makes before it gives up on
- * getting to the end of one (lion_verify_set()).  It never walks a set with
- * the entry's leaf held - replay takes the set's pages before the leaf
- * (DESIGN.md §25) - so after LION_VERIFY_SET_ATTEMPTS walks it keeps the next
- * one that reaches the end of the set, and only a root pushed down or an
- * upper level split under each walk keeps it from doing that.
+ * How many walks of a posting set or a position tree a STANDBY makes before
+ * it gives up on getting to the end of one (lion_verify_set(),
+ * lion_verify_postree()).  It never walks either with the entry's leaf held
+ * - replay takes the tree's pages before the leaf (DESIGN.md §25) - so after
+ * LION_VERIFY_SET_ATTEMPTS walks of a set it keeps the next one that reaches
+ * the end of the set without comparing its totals, and after as many walks
+ * of a position tree that found a difference replay may have made it keeps
+ * the last one without comparing the tree with its set; only a root pushed
+ * down or an upper level split under each walk keeps it from doing that.
  */
 #define LION_VERIFY_STANDBY_WALKS	10
 
@@ -233,9 +295,10 @@ typedef struct LionVerifySetResult
 	uint32		ncontainers;	/* items its leaves hold */
 	BlockNumber last;			/* the last leaf of the right-link chain */
 	uint32		height;			/* its root's level */
-	int			nincomplete;	/* pages flagged LION_PAGE_INCOMPLETE_SPLIT */
-	int			maxincomplete;
-	BlockNumber *incomplete;
+	LionVerifySeq incomplete;	/* the BlockNumbers of the pages flagged
+								 * LION_PAGE_INCOMPLETE_SPLIT, which a walk
+								 * that may be thrown away warns of only once
+								 * it is kept */
 } LionVerifySetResult;
 
 /*
@@ -279,6 +342,13 @@ typedef enum LionVerifyUnref
 extern Relation lion_open_index(Oid relid, LOCKMODE lockmode);
 
 /* lion_verify.c */
+extern void lion_verify_seq_init(LionVerifySeq *s, LionVerifySeqAcct *acct,
+								 Size recsize);
+extern void lion_verify_seq_put(LionVerifySeq *s, const void *rec);
+extern void lion_verify_seq_rewind(LionVerifySeq *s);
+extern bool lion_verify_seq_get(LionVerifySeq *s, void *rec);
+extern void lion_verify_seq_reset(LionVerifySeq *s);
+extern void lion_verify_seq_free(LionVerifySeq *s);
 extern void lion_verify_refresh_nblocks(LionVerifyState *vs);
 extern bool lion_verify_block_exists(LionVerifyState *vs, BlockNumber blk);
 extern void lion_verify_visit(LionVerifyState *vs, BlockNumber blk,

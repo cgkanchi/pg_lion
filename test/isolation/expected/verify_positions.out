@@ -169,3 +169,145 @@ lion_index_verify
                  
 (1 row)
 
+
+starting permutation: s1_park_walked s1_park_rewalk s1_note_held s1_verify s3_at_walked s2_touch s3_wake_walked_again s3_at_rewalk s3_wake_rewalk s3_at_walked s2_touch s3_wake_walked_again s3_at_rewalk s3_wake_rewalk s3_at_walked s2_touch s3_wake_walked s1_done s3_touched
+injection_points_set_local
+--------------------------
+                          
+(1 row)
+
+step s1_park_walked: SELECT injection_points_attach('lion-verify-postree-walked', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_park_rewalk: SELECT injection_points_attach('lion-verify-postree-rewalk', 'wait');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_note_held: SELECT injection_points_attach('lion-verify-postree-held', 'notice');
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step s1_verify: SELECT lion_index_verify('vt_d', true); <waiting ...>
+step s3_at_walked: SELECT v_parked('lion-verify-postree-walked');
+v_parked
+--------
+        
+(1 row)
+
+step s2_touch: 
+	INSERT INTO vt SELECT 300000 + i,
+	  to_tsvector('simple', 'kept0 kept1 kept2 doomed')
+	  FROM generate_series(1, 10) i;
+
+step s3_wake_walked_again: SELECT injection_points_wakeup('lion-verify-postree-walked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_rewalk: SELECT v_parked('lion-verify-postree-rewalk');
+v_parked
+--------
+        
+(1 row)
+
+step s3_wake_rewalk: SELECT injection_points_wakeup('lion-verify-postree-rewalk');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_walked: SELECT v_parked('lion-verify-postree-walked');
+v_parked
+--------
+        
+(1 row)
+
+step s2_touch: 
+	INSERT INTO vt SELECT 300000 + i,
+	  to_tsvector('simple', 'kept0 kept1 kept2 doomed')
+	  FROM generate_series(1, 10) i;
+
+step s3_wake_walked_again: SELECT injection_points_wakeup('lion-verify-postree-walked');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_rewalk: SELECT v_parked('lion-verify-postree-rewalk');
+v_parked
+--------
+        
+(1 row)
+
+step s3_wake_rewalk: SELECT injection_points_wakeup('lion-verify-postree-rewalk');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step s3_at_walked: SELECT v_parked('lion-verify-postree-walked');
+v_parked
+--------
+        
+(1 row)
+
+step s2_touch: 
+	INSERT INTO vt SELECT 300000 + i,
+	  to_tsvector('simple', 'kept0 kept1 kept2 doomed')
+	  FROM generate_series(1, 10) i;
+
+step s3_wake_walked: 
+	SELECT injection_points_detach('lion-verify-postree-rewalk');
+	SELECT injection_points_detach('lion-verify-postree-walked');
+	SELECT injection_points_wakeup('lion-verify-postree-walked');
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+s1: NOTICE:  notice triggered for injection point lion-verify-postree-held
+step s1_verify: <... completed>
+lion_index_verify
+-----------------
+                 
+(1 row)
+
+step s1_done: SELECT 'checked' AS s1;
+s1     
+-------
+checked
+(1 row)
+
+step s3_touched: 
+	SELECT (SELECT count(*) FROM vt WHERE d @@ 'kept0'::tsquery) AS kept0_rows;
+	SELECT lion_index_verify('vt_d', true);
+
+kept0_rows
+----------
+      4030
+(1 row)
+
+lion_index_verify
+-----------------
+                 
+(1 row)
+

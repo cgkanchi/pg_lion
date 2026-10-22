@@ -361,11 +361,14 @@ with summary posting sets, which records them in `summary_cols` and `summary_tid
 were reserved; an index without them is still version 6, byte for byte. Version 8, §38: an index
 with NARROW items, with or without summaries, which builds before it refuse. Version 9, §13: sparse
 segments of delta varints. Version 10, §21: compact entry tuples. Version 11, below: keys of up to
-2047 bytes, which every index this build writes is and the only one it reads; whether there are summaries is `summary_cols`.)* Version 2 was the first that
-indexes NULL keys (§14); version 3 (§18) added owner_hash/owner_head, which grows the special area
-from 16 to 24 bytes and therefore moves every item on every page. An index of an older version is
-structurally readable by nothing in this code, so opening one is an ERROR that asks for a REINDEX
-rather than a wrong answer.
+2047 bytes. Version 12, §21: key-less first downlinks. Version 13, §17: the NULLELEMS entry. Version
+14: the EMPTYDIM and EMPTYINNER entries (§17), and NARROW items wherever a container goes, with no
+meta page flag for them (§38) - which every index this build writes is and the only one it reads;
+whether there are summaries is `summary_cols`.)* Version 2 was the first that indexes NULL keys
+(§14); version 3 (§18) added owner_hash/owner_head, which grows the special area from 16 to 24 bytes
+and therefore moves every item on every page. An index of an older version is structurally readable
+by nothing in this code, so opening one is an ERROR that asks for a REINDEX rather than a wrong
+answer.
 
 **Superseded by §21 (format version 4).** Everything in the next two paragraphs - the bucket
 directory, `nbuckets`, `lion_bucket_of()` - is gone: the entry directory is a B-tree keyed by the
@@ -1043,8 +1046,10 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- safexid less than 2^31 past the next transaction id (a crash's restart of the counter
         -- can leave one a little past it; one further on would keep the page from reuse); with
         -- heapallindexed, scans the heap with a fresh snapshot and checks that every visible
-        -- tuple's TID is present under its key in EVERY key column (§24) - refusing (lion_index_usable(), §9) when this transaction's
-        -- snapshot may not use the index.
+        -- tuple's TID is present under its key in EVERY key column (§24) - and, in a column
+        -- that stores positions, that each of its keys holds the tuple's own positions for it,
+        -- the ones its value gives, position by position and weight by weight (§17) - refusing
+        -- (lion_index_usable(), §9) when this transaction's snapshot may not use the index.
         -- The heap scan evaluates the index's expressions and predicate, which are the table
         -- owner's functions and can be replaced after CREATE INDEX with anything at all. They run
         -- AS THE TABLE OWNER, inside a SECURITY_RESTRICTED_OPERATION, under a GUC nest level that
@@ -1100,8 +1105,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- split flags two pages in a row, and each missing downlink is covered by the page to its
         -- own left. Such a page is bounded above by the next downlink's separator like any other.
         -- The flag with the downlink already in place (the directory clears the flag in a record
-        -- of its own) needs nothing. verify() used to warn and then report the missing downlink
-        -- as "level 1 has 4 downlinks but level 0 has 5 pages";
+        -- of its own) needs nothing. The flag is only ever on the LEFT half of a split, which
+        -- keeps its new right sibling while the flag lasts: neither page deletion nor VACUUM's
+        -- removal of an empty posting leaf takes a flagged page or the page right of one, and a
+        -- root split or push-down flags nothing. So the flag on the rightmost page of a level - a
+        -- root among them - or on a HALF_DEAD directory leaf IS damage, an ERROR: no INSERT can
+        -- finish such a split, and the first one that comes to it fails with "has no right
+        -- sibling to link" (verify.sql's sixteenth case), where a WARNING would leave the missing
+        -- downlink to surface as "level 1 has 4 downlinks but level 0 has 5 pages";
         -- test/isolation/verify_incomplete_split.spec makes a posting split and a directory
         -- split fail at their injection points and verifies both. On a primary the WARNING is
         -- exact even with writers running: a split holds the page it flags EXCLUSIVE from the
@@ -1141,9 +1152,16 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- TID it does not hold, which a phrase query through the index then misses a row for;
         -- its twelfth INLINE entries past the meta page's inline_limit; its thirteenth the meta
         -- page's other words; its fourteenth a second page at the root's level, each flagged
-        -- ROOT; and its fifteenth the body and the safexid of a DELETED container page and of a
+        -- ROOT; its fifteenth the body and the safexid of a DELETED container page and of a
         -- DELETED directory page, which a VACUUM and a move of the index to another tablespace
-        -- put in its file.
+        -- put in its file; its sixteenth the unfinished-split flag on the rightmost page of a
+        -- directory level and of a posting set's; its seventeenth a position tree without
+        -- positions for TIDs of its set; and its eighteenth positions that are not the row's
+        -- own, in an INLINE entry and in a position tree, which only heapallindexed finds. Each
+        -- case
+        -- builds the index it damages and sets every psql variable it uses itself, from the
+        -- file or from a twin; the shared tables and helpers come first. The fifteenth's
+        -- tablespace, a cluster-wide name, is named after the backend that runs it.
     (phase 2) lion_index_count(regclass, key "any") RETURNS bigint
 
 ### verify() beside writers: suspect, wait, recheck (2026-09-26)
@@ -1195,7 +1213,22 @@ because one more read proves them: the LEFT LINK of the page the walk reaches ne
 new page rather than the one the walk came from - the level is walked again from that page, each page
 held until its right sibling is locked (left to right, the directory's own order), where one's left
 link naming the other is exact - and a page at the height the meta page gave has lost its ROOT flag,
-which a root split does in the same record that makes the meta page name a taller directory.
+which a root split does in the same record that makes the meta page name a taller directory. In a
+posting set or a position tree each page of the lower level is bounded above by its parent's high key
+as well as by the separator of the next downlink: the two are one key while the upper level is sound,
+and a parent whose high key went down with the separator above it hides the keys over it from every
+descent while the level, read as one sequence, stays in order (verify.sql's nineteenth case).
+
+**Memory.** The comparison of two levels needs the whole lower level, read before the walk of the
+upper one began - the order that makes a split harmless. What a walk of a posting set or a position
+tree keeps of a page is 16 bytes (its block, first key, upper bound and flags), in a sequence
+(`LionVerifySeq`, lion_funcs.h) that stays in memory up to a quarter of work_mem and goes on in a
+temporary file past it, read back in order by the walk of the level above; so are the blocks a walk
+that may be thrown away visited and the unfinished splits it met. A tree of any size is walked in
+the same memory: verify.sql's nineteenth case walks a position tree of 1,200 leaves at work_mem =
+64kB, the 176 past the 1,024th going to the file, and verify() says at DEBUG1 the most its walks kept
+in memory and the records they wrote out. The directory's walk keeps its levels in memory, with each
+page's first key and high key, and the reachability pass a byte per block of the index.
 
 **Posting sets** are walked with nothing held: holding the entry's directory leaf for every walk would
 keep the writers of every key on that leaf waiting. The entry is read again afterwards - found by its
@@ -1214,6 +1247,39 @@ with the leaf held SHARE throughout. That is the lock order every writer uses (d
 posting page) and keeps waiting only the writers of the keys on that one leaf, for one walk of one
 set; the 50-call stress run below needed it for 6 of its 70 set walks. It is a PRIMARY's last
 resort: replay does not use that lock order (§25), and a standby never makes that walk (below).
+
+**Position trees** (§17) are walked the same way, after their posting set: with nothing held, the
+entry read again, the walk kept when the entry reads the same. A writer holds the entry's leaf from
+its first record to its last, the row's positions among them (W1), and every INSERT that gets to its
+TID changes `ntids`. What the walk compares the tree with - at least as many members as TIDs, and
+every TID of the posting set among the members - needs one more step, because an INSERT that fails
+between its two writes leaves members and no TID, and the entry unchanged: a split it made of a leaf
+the walk had read can have moved members past the walk. So a kept walk is exact about what it found
+(the posting set it read is the entry's, unchanged, and no member leaves a tree while VACUUM is
+locked out) but not about what it missed: a walk that found every TID among the members is kept, and
+one that found a TID without positions, or too few members, is a suspicion, which a walk with the
+entry's leaf held SHARE settles - as is a tree that changed under three walks in a row. The
+comparison reads the two trees' leaves in step, a copy of one leaf of each and one member at a time,
+and keeps nothing else: collecting the members' codes to look the TIDs up in would cost 8 bytes a
+row, without bound. `test/isolation/verify_positions.spec` parks the check after each
+walk (`lion-verify-postree-walked`) and before each new one (`lion-verify-postree-rewalk`) while an
+INSERT changes the key, until the walk with the leaf held (`lion-verify-postree-held`, 'notice').
+
+A standby has no hold to settle a suspicion with, and the entry reading the same settles nothing
+there: replay applies a writer's records one at a time, and replays VACUUM beside the check - a TID
+taken out of the set, its positions after it (V1), and another row's TID put in leave the entry as
+it was, while a walk read the set before the first and the tree after the second. What settles a
+walk there is the pages' LSNs. Replay sets every page a record changes to the end of the record, and
+`GetXLogReplayRecPtr()` is the end of the last record replayed: a walk that notes it before it reads
+anything and then reads no page past it - of the tree, of the posting set, the entry's leaf - read
+the index as it was at that one point of the primary's WAL, where every TID has its positions (W1
+and V1 order the records so, and an INSERT or a VACUUM stopped between two of them leaves members
+without TIDs, nothing else). A difference that walk finds is damage and is reported - the count
+only when the entry's leaf was read at that point too. A walk that found no difference is kept
+whatever its pages' LSNs, as on a primary; one that found a difference after replay changed a page
+it read is walked again, and after three of those the tree is kept without the comparison, with a
+WARNING whose hint is to pause replay, which leaves every page as it is. `test/recovery/run.sh`
+phase 2 damages a position leaf in the standby's copy of an index and has the standby report it.
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -1265,6 +1331,18 @@ descent hands back, locked, the leaf that holds the container key, moving right 
 only way an item moves - so the answer is the one a held leaf would give. *(Until the 2026-09-29
 review the lookup held the entry's leaf for its descent, which replay on a standby deadlocked
 against, §25.)* The owner switch, `lion_index_usable()` and the indcheckxmin refusal are unchanged.
+In a column that stores positions each row's positions under each key are looked up the same way -
+an INLINE entry's chunk under the leaf's lock, a position tree by a reader's lookup that moves right
+past a split (`lion_postree_fetch()`) - and compared with what `lion_extract_value_pos()` and
+`lion_posmember_from_key()` make of the row, the calls the build and the INSERT make. A visible row's
+positions cannot move under the check: they were written before its TID (W1), and only VACUUM takes
+them out. One member and one chunk are kept, for the whole scan, so the comparison adds nothing to
+the scan's memory that grows with the index. The TIDs alone would pass a row whose stored positions
+are not its own, which a phrase query decides from alone (verify.sql's eighteenth case). A row its
+key holds without any positions the structural check reports first, and no writer leaves one behind
+it, so the scan meets one only in an index damaged between the two passes, which is how
+`test/isolation/verify_nopos.spec` makes it meet one: parked at `lion-verify-heap-scan`, the check
+has the index's buffers evicted and a position leaf damaged in the file under it.
 
 **What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
 nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
@@ -1278,12 +1356,20 @@ primary's last resort above - waits for a posting page the startup process holds
 process waits for the leaf. Two buffer content locks: no deadlock detector, and cancel, terminate and
 `pg_ctl stop -m fast` do nothing to either side; replay stopped for good within seconds of a write
 load, in both WAL modes, and only an immediate shutdown got the standby back. So a standby walks a
-set with nothing held and reads the entry again, as above, and the entry reading the same means what
-it means on a primary, for replay's own reason: every record that changes a set's items, counters,
-last leaf or the level of a leaf root carries the entry, and the records that do not - a downlink, a
-flag cleared, an internal split or an internal root pushed down - change nothing the entry counts and
-are what the walk already accepts from a writer between two levels, or throws away. A set that replay
-keeps changing has no last resort: after three walks the next one that gets to the end of the set is
+set with nothing held and reads the entry again, as above. Every record that changes a set's items,
+counters, last leaf or the level of a leaf root carries the entry, and the records that do not - a
+downlink, a flag cleared, an internal split or an internal root pushed down - change nothing the
+entry counts and are what the walk already accepts from a writer between two levels, or throws away.
+But the entry reading the same both times settles less there than on a primary: replay applies
+VACUUM, which the primary's check locks out, and a TID a VACUUM takes out of one leaf and another an
+INSERT puts into another leave the entry as it was, while a walk that read the first leaf before the
+one and the second after the other counts a TID more than the entry says (`test/recovery/run.sh`
+phase 3 parks a standby's check between two leaves, at `lion-verify-set-leaf-read`, for exactly
+that). So a standby keeps, and compares with the entry, a walk that agrees with an entry that read
+the same, and a walk that read every page - the entry's leaf after it among them - as it was at the
+replay position it began at, which the pages' LSNs show (position trees, above): such a walk read the
+set and the entry at one point of the primary's WAL, and a difference there is damage. Any other walk
+is walked again. A set that replay keeps changing has no last resort: after three walks the next one that gets to the end of the set is
 kept, every page it read checked, and its totals are not compared with the entry - a WARNING says so,
 and a check with replay paused compares them. Only a root pushed down or an upper level split under
 it stops a walk short of the end, and a set that does that to ten walks in a row is an ERROR asking
@@ -1330,14 +1416,15 @@ on a directory page (`lion-verify-dir-page-read`), after a posting set's leaves
 behind it, split the page it stands on, split its root, split a posting leaf, push a posting root
 down, spill an INLINE entry, keep changing a set until it is walked with its leaf held
 (`lion-verify-set-held` with 'notice'; the check parks before each new walk of the set too, at
-`lion-verify-set-rewalk`), and take pages VACUUM freed for an existing set and for a new
-one; every time the check passes and the observer shows the change was made. It also shows VACUUM
+`lion-verify-set-rewalk`; verify_positions.spec does the same to a position tree), and take pages
+VACUUM freed for an existing set and for a new one; every time the check passes and the observer shows the change was made. It also shows VACUUM
 waiting for the check, the check waiting for a statement that holds the index open for writing and
 not for a transaction whose statement is over, and `LOCK TABLE; DROP INDEX` in another transaction
 going through while the check waits for the table. Each change is one the old AccessShareLock code
 reported as damage or would have; `verify.sql`'s sixth damage case is real damage that only the
 recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
-left links and root flags settled on the spot, and posting-set walks made, thrown away and held.
+left links and root flags settled on the spot, and posting-set and position-tree walks made, thrown
+away, held and, on a standby, kept without their comparison.
 
 ### Facet counts (`lion_facets.c`)
 
@@ -6335,11 +6422,16 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   its first chunk (P3), no leaf's last member is above the separator of its right neighbour (at
   it is fine), and an internal page's last separators may equal its high key, which an internal
   split through a run of equal separators leaves. Every chunk, the members' order across the
-  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary, which holds
-  the entry's leaf for the walk, so is that every TID of the posting set has positions. On a
-  standby a walk that replay changed under it is repeated, as a posting set's is. verify.sql's
-  ninth case damages a downlink, a separator and a leaf's min of a tree with an internal level,
-  and verify() must report each.
+  tree (P1, P2), and every leaf's min and max are checked on the way; on a primary so is that
+  every TID of the posting set has positions, the two trees' leaves read in step and nothing
+  collected. The tree is walked with nothing held and kept when its entry reads the same before
+  and after, and a walk that finds a TID without positions is made again with the entry's leaf
+  held before it is reported (§7, "Position trees"). On a standby a walk that replay changed under
+  it is repeated, as a posting set's is, and nothing is compared. With heapallindexed every heap
+  row's positions under each of its keys are compared with the ones its value gives (§7).
+  verify.sql's ninth case damages a downlink, a separator and a leaf's min of a tree with an
+  internal level, its seventeenth the members of a tree, its eighteenth a row's positions (INLINE
+  and in a tree), and verify() must report each.
 - **Build**: a row's positions for a key travel through the build's spool (§24) with the row's
   code: in a key's in-memory stream each code is followed by its positions (a varbyte count, then
   the WordEntryPos values), and a code with its positions - a member - stays one item through every
@@ -7615,12 +7707,14 @@ lets verify() and every reader check a page's owner from the entry in hand. Stor
 cost four bytes on every entry to save a hash function call that the ordered descent almost never
 makes.
 
-The format is version 14 (`LION_VERSION_V14`, the EMPTYDIM and EMPTYINNER entries of §17): these entry tuples, with keys of up to 2047 bytes
+The format is version 14 (`LION_VERSION_V14`: the EMPTYDIM and EMPTYINNER entries of §17, and
+NARROW items without a meta page flag, §38): these entry tuples, with keys of up to 2047 bytes
 (§4), under internal pages that each begin with a minus-infinity downlink ("Height" below), and
 the pages VACUUM takes out and hands out again ("Page deletion" below, §22 "Empty leaves"). An
 index of an older version is refused with the REINDEX hint: its entries would be read at the wrong
-offsets, its long jsonb keys looked for in the wrong form, or (version 11) its directory may be of
-any height.
+offsets, its long jsonb keys looked for in the wrong form, (version 11) its directory may be of
+any height, or (version 13) its empty arrays with dimensions are in the EMPTY entry and its meta
+page may carry the NARROW flag this format does not have.
 
 ### The order
 
@@ -8458,7 +8552,8 @@ exactly the pages of the level below in that order (which is "every leaf reachab
 exactly once and the leaf right-link chain equals the in-order sequence"), the leftmost downlink of
 each level being minus infinity, each separator at or below its child's own first key, each child's
 high key at or below the next separator, and INCOMPLETE_SPLIT pages reported as a WARNING with the
-repair hint. At the leaf level it also checks that no two entries of one prefix run - the same
+repair hint - or as an ERROR when the page is the rightmost of its level or HALF_DEAD, where no split
+leaves the flag (§7). At the leaf level it also checks that no two entries of one prefix run - the same
 column, kind, comparison and hash, across page boundaries too - are equal under the opclass
 equality: two entries for one key would leave the rows of the one no lookup returns uncounted, and
 the ordering checks alone only catch byte-identical twins (`directory.sql` §13).
@@ -8962,7 +9057,7 @@ each level being minus infinity, every downlink of a level naming exactly the pa
 below in that order - which is the same statement as "the leaf right-link chain equals the in-order
 leaf sequence" - each separator at or below its child's own first container key, and each child's
 own upper bound below the next separator. INCOMPLETE_SPLIT pages are a WARNING with the repair hint,
-as §21's are. `lion_index_stats()` gains `posting_internal_pages` and `max_posting_height`;
+as §21's are, and an ERROR on the rightmost page of a level, which no split leaves flagged. `lion_index_stats()` gains `posting_internal_pages` and `max_posting_height`;
 `container_pages` counts leaves only. `lion_index_posting_root(idx, key)` is a test helper that
 returns one key's root block, which is how the regression test asserts that a root split did not
 move it.
@@ -21968,10 +22063,12 @@ image is, which is where the bytes are saved.
 ### Format version (lion.h, lion_meta.c)
 
 Version 8 is version 7 plus NARROW items, with or without summaries (`summary_cols` says, as in
-version 7), and its NARROW is the one above. Every version since reads and writes the same NARROW,
-and an index of this build's version may hold one wherever a container goes, whoever wrote it: the
-meta page records nothing about it. An older version is refused with the "not a valid lion index"
-ERROR and its REINDEX hint (lion.h).
+version 7), and its NARROW is the one above. Every version since reads and writes the same NARROW.
+An index of version 14 may hold one wherever a container goes, whoever wrote it - the build, an
+INSERT or VACUUM - and its meta page records nothing about it: `order_flags` has no bit for it.
+Version 13 had one, 0x0004, set when the build had written a NARROW, and VACUUM made NARROWs only
+in such an index. An older version than 14 is refused with the "not a valid lion index" ERROR and
+its REINDEX hint (lion.h).
 
 The first version's NARROWs had flags 0 and two words a block; this build reads flags 0 as no width
 it has, and refuses the item as above. No build of the first version was released, so nothing
@@ -21982,8 +22079,7 @@ reads it in place: a REINDEX under this build rewrites such an index at the widt
 - `lion_index_verify()` checks a NARROW's width (1 .. `LION_NARROW_MAX_WIDTH`), that the item has
   the bytes its width sizes, its cardinality against its payload, its members' offsets against the
   heap block's line pointers like any container's ("narrow container member is not a heap tuple
-  offset" for a bit past the block's last), that every other container's flags are 0, and that the
-  version the meta page says now - read off the page, not the cached state - is 8 or more.
+  offset" for a bit past the block's last), and that every other container's flags are 0.
 - `lion_index_stats()` counts NARROWs of every width in `narrow_containers`, its last column, and
   in `containers`; its signature did not change, and there is no column per width.
 - EXPLAIN has no counter per container kind; `Containers Visited` counts NARROWs with the rest.
