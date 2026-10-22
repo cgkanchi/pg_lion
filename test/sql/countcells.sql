@@ -63,10 +63,16 @@ END $$;
 /*
  * lcc_check() runs q with every scan of the heap disabled, so that a count by
  * cells that is built at all is the plan, under EXPLAIN ANALYZE and again for
- * its rows; then with the pushdown off and sequential scans only, and proves
- * the two answers equal as multisets.  It says whether the plan counted by
- * cells - in parallel or not - the cells it bounds the count by, and whether
- * rows were tested in the heap.
+ * its rows; then with the pushdown off, sequential scans only and every join
+ * method on, and proves the two answers equal as multisets.  A caller
+ * disables joins to leave the node no plan of core's to beat on price, which
+ * only the node's run needs: the reference answer is core's most ordinary
+ * plan, and with the joins off it would be a disabled nested loop, which in
+ * parallel rescans a Gather over its inner side for each outer row, starting
+ * workers each time.  The caller's join settings come back after, for the
+ * rest of its transaction.  It says whether the plan counted by cells - in
+ * parallel or not - the cells it bounds the count by, and whether rows were
+ * tested in the heap.
  */
 CREATE FUNCTION lcc_check(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -77,6 +83,9 @@ DECLARE
 	rechecked bigint := 0;
 	nrows bigint;
 	ndiff bigint;
+	hashjoin text := current_setting('enable_hashjoin');
+	mergejoin text := current_setting('enable_mergejoin');
+	nestloop text := current_setting('enable_nestloop');
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
@@ -95,8 +104,14 @@ BEGIN
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'off', true);
 	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE format('CREATE TEMP TABLE lcc_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_hashjoin', hashjoin, true);
+	PERFORM set_config('enable_mergejoin', mergejoin, true);
+	PERFORM set_config('enable_nestloop', nestloop, true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
 	PERFORM set_config('enable_indexscan', 'on', true);
 	PERFORM set_config('enable_indexonlyscan', 'on', true);
@@ -454,7 +469,8 @@ SET max_parallel_workers_per_gather = 0;
 -- evaluated on it (DESIGN.md §27, "Counts by cells beside the anti join").
 -- By id, a row a key, and by n, 400 rows a key of every cell; keys of
 -- deleted rows and of none, NULL keys and duplicates.  Joins are disabled,
--- so that core has no plan the node must beat on price.
+-- so that core has no plan the node must beat on price; lcc_check() turns
+-- them on again for the reference answer.
 CREATE INDEX lcc_id ON lcc (id);
 CREATE INDEX lcc_nb ON lcc (n);
 CREATE TABLE lcc_skip (a int, b int);
