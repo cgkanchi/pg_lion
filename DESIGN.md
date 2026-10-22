@@ -5059,13 +5059,13 @@ size" where the ordinary plan answers. Two things now:
   (`lion_bitmap_list_batch()`). A bitmap is a set, so the batches' answers make the list's:
   `(B_1 ∪ ... ∪ B_m) ∩ R = ∪_j (B_j ∩ R)`, disjoint or not (they are). Each batch reads the other
   trees again, as each of the count's batches does; a list within the batch is located whole, as
-  before. A second long list is held whole, as the count's are, and so is a multi-key `op ANY
-  (array)` - in a huge allocation now (`lion_sets_reserve()`), as are the sets the planner's
-  intersection probe and the facets' filter locate for a scan key through the same code
-  (`lion_scankey_sets()`). `test/sql/scanlist.sql` checks the scans against the heap's answer across
-  the batch boundaries, with repeats, NULLs, values without an entry, two lists, a multi-key column, a
-  range and two beside the list, on a dirty heap and past nine million elements, and the VmHWM of the
-  300,000 values.
+  before. A second long list is held whole there, and so is a multi-key `op ANY (array)` - in a
+  huge allocation now (`lion_sets_reserve()`), as are the sets the planner's intersection probe and
+  the facets' filter locate for a scan key through the same code (`lion_scankey_sets()`).
+  `test/sql/scanlist.sql` checks the scans against the heap's answer across the batch boundaries,
+  with repeats, NULLs, values without an entry, two lists, a multi-key column, a range and two
+  beside the list, on a dirty heap and past nine million elements, and the VmHWM of the 300,000
+  values.
 - **Every other count collects it** (`lion_locate_list()`). A GROUP BY, a count(DISTINCT) and an
   FK-side join count the list many times over - batching it would locate it again for every group -
   and a plain count's second long list is no batch of the first's. Such a list, a source of its own
@@ -5073,21 +5073,54 @@ size" where the ordinary plan answers. Two things now:
   batch's sets are ORed into ONE union and released before the next batch is located: the list is
   collected as a range taken as a source is (§32, "A range as a source"; `lion_union_collect()`), in
   what is left of the hash table's memory the relation's ranges and lists share, and past it a
-  window of container keys at a time into a temporary file, each window a pass over the values. One
-  that does not fit what the sources collected before it left sends them to files, as a range does
-  (`lion_collect_within()`). A value in two batches is ORed in twice, which a union takes once. The
-  union is one pinless set, counted beside a source that carries the §9 interlock or rechecked in
-  the heap, as a list too wide for the open budget always was ("Bounded cursors"). EXPLAIN ANALYZE
-  prints `Lists Collected` and `Lists Spilled`. A list under an OR, which is no disjoint union and
-  whose leaves are not collected, and the list on the grouping column that drives the groups, which
-  needs each value's set, are held whole, in a huge allocation, so that they answer at any length
-  the array itself can have instead of failing at nine million values.
+  window of container keys at a time into a temporary file: the values are located once, into the
+  first window, and what it does not keep goes to an overflow the windows after it read in their
+  place (§32, "Too large to collect"). One that does not fit what the sources collected before it
+  left sends them to files, as a range does (`lion_collect_within()`). A value in two batches is
+  ORed in twice, which a union takes once. The union is one pinless set, counted beside a source
+  that carries the §9 interlock or rechecked in the heap, as a list too wide for the open budget
+  always was ("Bounded cursors"). So a filtered
+  count's run whose one source that selects rows is the list - `count(*) FILTER (WHERE k = ANY
+  ($1))` in a node that sums every entry for its run 0 (§10, "Filtered counts"), which takes no
+  batches - is counted as a run whose source is a range taken as a source is: the sum over the
+  driving walk's entries, each ANDed with the union, the walk carrying the interlock
+  (`lion_run_has_plain_source()`). On its own the union would have nothing pinned beside it, and
+  every row of it would go to the heap (`lion_count_one_set()`): on an all-visible heap of 3 million
+  rows, 50,000 values spread over all of it took 72 to 79 ms that way, reading every heap page,
+  against 49 ms for the sum, which reads none. EXPLAIN ANALYZE prints `Lists Collected` and `Lists
+  Spilled`, the lists collected and those of them that went to a file: each list once
+  (`lion_list_counted()`), however many partitions, runs and rescans collected it again, and in a
+  parallel plan the most any one participant collected.
+- **So does a list under an OR** (`lion_locate_or()`, 2026-10-22 review). Its union with the other
+  leaves is no disjoint one, so it cannot be taken a batch at a time; a leaf longer than
+  `lion_array_batch_size()` is collected as above, in the same memory, and is one set of the OR's
+  like a range leaf. Like a range leaf it holds no pin, so the OR carries no interlock: the run is
+  counted beside another source that does, or as the sum over the driving walk when it has none
+  (`lion_run_has_plain_source()`, `LionOrState.listcollected`), and otherwise rechecked. A leaf
+  within the batch size is located as it was.
+- **The list that drives the groups is located a batch at a time as they are walked**
+  (`lion_group_list_prepare()`, `lion_ingroup_next()`, 2026-10-22 review). `GROUP BY k` over `k =
+  ANY ($1)` counts each value's set as a group of its own, so a union would not do; past
+  `lion_array_batch_size()` the values are sorted as a lookup sorts them, repeats dropped, and cut
+  where the hash changes, as a plain count's are, and a batch's sets are located when the groups
+  of the one before it are done, its predecessor's released - pins and all - first. The groups come
+  in the order the lookup takes the values in, as they did when the list was located whole; a batch
+  ends only where the hash changes, so no entry, and no group, is in two. Its sets keep the pins
+  they are located with until the next pause, as the WHERE's do (`lion_unpin_where()`). `List
+  Batches` counts these batches too.
+
+Measured on a PostgreSQL 18.6 build without assertions (2026-10-22): 3 million rows, `k` 0 to
+499,999 over 30,928 heap pages, at work_mem 64 kB, the backend's peak anonymous memory with the list
+held whole and now. `GROUP BY k` over `k = ANY (500,000 values)`: 112 MB, now 20 MB, in 782 ms
+where it took 813. `count(DISTINCT k)` over the same list: 112 MB, now 20 MB, 361 ms against 640.
+`k = ANY (250,000 values) OR x = 1`: 86 MB, now 4.7 MB, 392 ms against 727. What is left is the
+values and the batch.
 
 What a batched or collected list still holds per value is the values: the array, and for a batched
 one a Datum and a hash each - what the executor's own `= ANY` holds, and core's B-tree scan of the
-same array deconstructs and sorts it just the same. A list held whole costs its sets' memory
-outside work_mem; the planner cannot see a parameter's length to decline it (the literal cap), and
-at run time there is no plan left to fall back to.
+same array deconstructs and sorts it just the same. A list that the node locates whole is one no
+longer than a batch, a work_mem of sets; the planner cannot see a parameter's length to decline a
+longer one (the literal cap), and at run time there is no plan left to fall back to, so none is.
 
 Measured on the same 18.6 assert build, work_mem 4MB. What the review measured:
 
@@ -11462,16 +11495,19 @@ not set that block all-visible, so the TID goes to the heap recheck and the snap
 copy cannot lack a row the snapshot sees: it is made after the snapshot was taken, and a visible
 row was in every index before its transaction committed. An fk set located over the pin budget
 (NOPIN, §15) carries no interlock, and then nothing does: the merge finds no pinned positive source
-and rechecks every candidate (`cx->novm`), as any count does. `lion_count_one_set()` refuses to
-COUNT a collected set on its own, which no caller does; it copies one for a collection, which asks
-the map nothing. That is the copy of fact filters that are one range already collected into memory
-(§32): one source of one set, which the one-set shortcut takes, and which it used to refuse as a
-count, failing the join before its first row (2026-09-28; `fkjoin_walk.sql` pins it with the range
-source's and the copy's counters). `test/isolation/fkjoin_vacuum_race.spec`
-proves it the way `count_distinct_vacuum_race.spec` proves the existence test: the copy lists
-fk = 0's dead rows, the first count parks at `lion-count-containers-pinned` with fk = 0's set
-pinned, the VACUUM that would remove those rows waits for the pin, and the answers - semi join and
-inner join - exclude fk = 0 and include the rows deleted after the snapshot.
+and rechecks every candidate (`cx->novm`), as any count does. `lion_count_one_set()` copies a
+collected set as it stands for a collection, which asks the map nothing: the copy of fact filters
+that are one range or one list already collected (§32), one source of one set, which the one-set
+shortcut takes (`fkjoin_walk.sql` pins it with the range source's and the copy's counters). It
+COUNTS one on its own as the merge counts a source nothing pinned carries: the map is asked nothing
+and every member is rechecked in the heap (`cx->novm`). The node arranges a carrier where it can -
+a filtered count's run whose one source is a collected list is a sum over the driving walk (§15, "A
+list too long to locate at once") - so that is the count's fallback, exact wherever it is reached.
+`test/isolation/fkjoin_vacuum_race.spec` proves it the way `count_distinct_vacuum_race.spec` proves
+the existence test: the copy lists fk = 0's dead rows, the first count parks at
+`lion-count-containers-pinned` with fk = 0's set pinned, the VACUUM that would remove those rows
+waits for the pin, and the answers - semi join and inner join - exclude fk = 0 and include the rows
+deleted after the snapshot.
 
 The choice between the copy and the probes is the cost model's, per path, and the plan carries it:
 the join member of `custom_private` became `{clause, kind of join, flags [, child column]}` with
@@ -12458,8 +12494,9 @@ path with the first two changes above. It cannot be had at that price:
 
 - As stated, it breaks §9. The accumulator is a collected set; once the keys' pins are gone,
   nothing carries the interlock for the TIDs it holds, and the copy is never counted beside
-  anything else - where a collected set is only ever counted beside a located set that carries
-  the interlock.
+  anything else - where a collected set is otherwise counted beside a located set that carries
+  the interlock, or on its own with every row rechecked in the heap, which is the very cost the
+  map is asked to spare.
 - Keeping the interlock by keeping the pins: every set in the accumulator would hold its pin
   until the AND - an INLINE set its directory leaf, a CHAIN set every leaf its cursor crossed,
   which the cursor lets go of now as it moves on. The pins are bounded by the list pin budget (at
@@ -19594,8 +19631,9 @@ because it is read after the snapshot was taken).
 two bytes a row until those fill up. The planner budgets them as the executor holds them, one after
 the other out of that one memory (`lion_cost_range_source()`'s `LionRangeMem`, the node's
 `rangesrc_held`): a range that would not fit what the ranges before it left is collected in
-WINDOWS into a temporary file (below), and priced so - the walk of the range twice for each
-window's worth of its union, and the file written once and read once - and every count that reads
+WINDOWS into a temporary file (below), and priced so - the walk of the range once, the passes of
+what the windows do not keep through their overflow, and the file written once and read once - and
+every count that reads
 the file back pays for each container it seeks there (`LION_SPILL_READ_COST`,
 `lion_count_rel_spill_reads()`). The file is a collected set like any other, so every way of
 counting one takes it: the WHERE collected once and the groups counted in batches (§10), the
@@ -19606,8 +19644,9 @@ back first (`lion_locate_range()`): the executor finds it does not fit by trying
 to files of their own (`lion_range_spill_set()`, each written once in key order, to hold sixteen
 bytes a container key as a range collected in windows does), and it is collected in what that
 freed - in memory, or in windows of nearly all of it. Left to what they left, a range that filled
-the memory to its last few kilobytes would make the next one cost a walk of it for every
-`LION_RANGE_WINDOW_MIN` of its union. The planner prices it so: the try, the files written and
+the memory to its last few kilobytes would leave the next one windows of `LION_RANGE_WINDOW_MIN`,
+and a pass through its overflow for every halving of its union down to that. The planner prices it
+so: the try, the files written and
 read, and every count's reads of them. An IN list too long to locate at once is collected in the
 same memory and the same way (§15, "A list too long to locate at once"; `lion_collect_within()`),
 evicting and evicted alike; the planner, which cannot see a parameter's length, prices none of it.
@@ -19679,16 +19718,42 @@ is bounded (2026-09-28 review):
   (§34), whose WHERE is one collected copy, and every range of a plan that does not walk them. It
   gets what every range of the relation gets - what is left of the hash table's memory, and never
   less than `LION_RANGE_WINDOW_MIN` (32 kB, several bitsets, so that a window always gets on).
-  A window keeps the container keys from where the last one ended; when its memory runs out it
-  gives back the upper half of the keys it holds and ends where they began
-  (`lion_range_union_evict()`); at the end of its walk its containers go to the file in key order,
-  and the next window walks the range again from there. The set reads the file a container at a
-  time and seeks it by the keys it keeps in memory, sixteen bytes a container key. Every window is
-  read after the snapshot, as the one walk always was, and the windows are disjoint ranges of TIDs,
-  so the file holds every row of the range once and none twice - the collected set's argument
-  unchanged. A union n times the memory costs about 2n walks of the range, which is the price the
-  planner puts on it (`lion_cost_range_source()`). EXPLAIN ANALYZE counts `Range Sources
-  Spilled`.
+  The range is walked ONCE, into the first window. When a window's memory runs out it gives back
+  the upper half of the keys it holds and ends where they began (`lion_range_union_evict()`). What
+  it gives back, and every container that comes after at a key past its end, goes to its OVERFLOW
+  (`LionUnionSpill`): logical tapes, the keys from its first cut to its end split into
+  `LION_UNION_FANOUT` parts of equal width - a sixteenth of the memory's blocks, two to 64 - and
+  what a later cut gives back below the first into one part more. The containers go there as the
+  walk hands them out, a set's at a key, not united; a bitset given back is folded and optimized
+  first. At the end of its input the window's containers go to the file in key order, and its
+  parts that hold anything wait on a stack in key order, the lowest on top: each becomes a window
+  of its own, which reads its part in place of the walk, keeps what it can and splits the rest the
+  same way before the part above it is taken. So the windows come off the stack in key order, and
+  the file is written in key order. Each part holds a block of buffer while its window is made,
+  out of the window's memory (`LION_UNION_SPILL_BLOCKS`), and what is read back is checked before
+  it is used: a size a container can have, read whole, a kind whose header says that size, and a
+  key within the part (`lion_union_part_read()`). The set reads the file a container at a time and
+  seeks it by the keys it keeps in memory, sixteen bytes a container key. The one walk is read
+  after the snapshot as it always was, and the windows are disjoint ranges of container keys, each
+  container of the walk kept by the one window whose keys hold it, so the file holds every row of
+  the range once and none twice - the collected set's argument unchanged. A union n times a
+  window's memory costs one walk and about log n / log fanout passes over the walk's containers,
+  each written and read back for every window it is not kept by, which is the price the planner
+  puts on it (`lion_cost_range_source()`, `lion_union_overflow_share()`). Over small sets in no
+  order - summaries of a few dozen rows, a container each at keys all over the heap - that is many
+  times the union's own containers, and the walk at every count may then be the cheaper. An IN
+  list collected the same way locates its values once, into the first window (§15). EXPLAIN
+  ANALYZE counts `Range Sources Spilled`.
+
+  Measured on a PostgreSQL 18.6 build without assertions (2026-10-22), at work_mem 64 kB and
+  `hash_mem_multiplier` 1, against windows that each walked the range again - or located the list
+  again - for its keys: `x, count(*) WHERE k = ANY (50,000 values) GROUP BY x` over 3M rows, the
+  list collected in windows, 934 ms and 500,737 buffer hits then, 75.5 ms and 16,901 now, against
+  54 ms in memory at 4 MB. Priced so, `r < 524288 AND s < 65536 GROUP BY g` over the 360,000 rows
+  above collects both ranges in windows, 11 ms, where it walked `r` and collected `s`, 50; `fk =
+  ANY (1,500 values) AND r < 524288 GROUP BY g` collects the range beside the list, 66 ms where it
+  walked it, 124; and a range of 64-row summaries in no order over 600,000 rows, `r BETWEEN 15000
+  AND 450000 AND s = 7 GROUP BY g`, is still walked, 25.5 ms.
 
 **Flagged:** a walked OR arm by inclusion-exclusion - `|X ∩ ((R ∩ Z) ∪ Y)| = |X ∩ Y| + Σ_B |X ∩ B
 ∩ Z − Y|` over R's pieces B - would answer such a leaf without its union or its windows, which

@@ -1586,6 +1586,15 @@ typedef struct LionClauseState
 	Datum		storedkey;
 	bool		hasstoredkey;
 	bool		keyisnull;
+
+	/*
+	 * LION_CLAUSE_ARRAY: the list has been collected (lion_locate_list()),
+	 * and has gone to a temporary file, in some partition, run or rescan of
+	 * the node - which EXPLAIN ANALYZE counts once a list (listsrc_collected
+	 * and listsrc_spilled).
+	 */
+	bool		listcollected;
+	bool		listspilled;
 } LionClauseState;
 
 /*
@@ -1610,6 +1619,13 @@ typedef struct LionOrState
 	 */
 	bool	   *armcompl;
 	bool		compl;
+
+	/*
+	 * A leaf of it is an IN list too long to locate at once, collected into
+	 * one pinless set (lion_locate_or()) - as this run located it, a
+	 * parameter's length being the run's.
+	 */
+	bool		listcollected;
 } LionOrState;
 
 /*
@@ -1840,6 +1856,25 @@ typedef struct LionCoalState
 	int64		count;
 	bool		walked;
 } LionCoalState;
+
+/*
+ * The IN list that drives the groups (ingroupitem, DESIGN.md §15) when it is
+ * longer than lion_array_batch_size(): its nval non-NULL values - of type
+ * type - sorted into the order a lookup takes them in, with their hashes,
+ * which lion_ingroup_next() locates a batch at a time into the item's
+ * source, the batch's sets in batchcxt; next is the first value of the batch
+ * after the one located.  It lives in wherecxt and goes with the relation's
+ * WHERE.
+ */
+typedef struct LionGroupList
+{
+	Oid			type;
+	int			nval;
+	Datum	   *val;
+	uint32	   *hash;
+	int			next;
+	MemoryContext batchcxt;
+} LionGroupList;
 
 /*
  * An IN list too long to locate at once (DESIGN.md §15, "A list too long to
@@ -2761,13 +2796,16 @@ typedef struct LionCountScanState
 	 * ... and the IN lists too long to locate at once that a count which is
 	 * not one of the relation as one row collects the same way, within the
 	 * same memory (DESIGN.md §15, "A list too long to locate at once"):
-	 * how many, how many of them spilled, and those in memory (listsrc_mem,
-	 * in wherecxt), which lion_rangesrc_evict() sends to files as it does
-	 * the ranges'.
+	 * how many lists were collected and how many of them spilled - each list
+	 * once, however many partitions, runs or rescans collected it
+	 * (cl->listcollected) - and those in memory (listsrc_mem, their
+	 * LionMatSets, and listsrc_memcl, their clauses, both in wherecxt),
+	 * which lion_rangesrc_evict() sends to files as it does the ranges'.
 	 */
 	int64		listsrc_collected;
 	int64		listsrc_spilled;
 	List	   *listsrc_mem;
+	List	   *listsrc_memcl;
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -2872,6 +2910,8 @@ typedef struct LionCountScanState
 	int			ingroupset;		/* next set of that item */
 	int			ingroupleft;	/* ... and how many of its sets that have an
 								 * entry are still to come */
+	struct LionGroupList *glist;	/* that list a batch at a time, or NULL */
+	int64		glistbatches;	/* ... the batches located, for EXPLAIN */
 	int			sumallitem;
 	LionCountSource *dsources;
 	int			ndsource;
@@ -4095,6 +4135,8 @@ extern LionKeyNode *lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args,
 extern void lion_build_filter(LionCountScanState *st);
 extern void lion_locate_where(LionCountScanState *st);
 extern void lion_release_where(LionCountScanState *st);
+extern LionPostingSet *lion_ingroup_next(LionCountScanState *st);
+extern bool lion_ingroup_more(const LionCountScanState *st);
 extern TupleTableSlot *lion_emit_tuple(LionCountScanState *st, Datum key,
 									   bool keyisnull, Datum key2,
 									   bool key2isnull, int64 count);

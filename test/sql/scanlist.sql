@@ -195,8 +195,9 @@ RESET work_mem;
  * floor's least, the 25 ranges of a < 0 .. 1500, scattered over 3000 heap
  * blocks, outgrow the window as they are ORed in - the union is optimized
  * only once its walks are done (lion_range_union_finish()) - and the
- * collection goes on a window at a time, every window a walk of each range,
- * into one temporary file.
+ * collection goes on a window at a time into a temporary file: the ranges
+ * walked once, into the first window, and what it does not keep read back
+ * from its overflow, a second file, by the windows after it.
  */
 CREATE FUNCTION lion_slu_cmp(int4, int4) RETURNS int4 LANGUAGE sql IMMUTABLE STRICT
 	AS 'SELECT btint4cmp($1, $2)';
@@ -222,7 +223,8 @@ SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a < ANY (array(SELECT g * 60 FR
 SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a >= ANY (array(SELECT 2999 - g * 150 FROM generate_series(1, 12) g)) AND b >= 400', 'lion_slu_ab');
 SELECT lion_slcmp('SELECT id FROM lion_slu WHERE a <= ANY (array(SELECT CASE WHEN g % 3 = 0 THEN NULL ELSE g * 90 END FROM generate_series(1, 15) g)) AND b BETWEEN 100 AND 300', 'lion_slu_ab');
 -- the temporary files the first one's bitmap scan alone makes
--- (pg_stat_database, flushed on demand): one, so the windows were walked
+-- (pg_stat_database, flushed on demand): two, the set's and the overflow's,
+-- so it was collected in windows
 SET pg_lion.enable_count_pushdown = off;
 SET enable_seqscan = off;
 SET enable_indexscan = off;

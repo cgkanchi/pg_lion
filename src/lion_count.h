@@ -1058,6 +1058,24 @@ extern bool lion_posting_set_rewalked(const LionPostingSet *ps);
 #define LION_RANGE_WINDOW_MIN		(32 * 1024)
 
 /*
+ * How many parts a window of such a collection splits the keys it does not
+ * keep into, for the windows after it to read one each (LionUnionSpill): a
+ * block of buffer each while the window is made, so a sixteenth of the
+ * blocks of mem, the memory the collection has, and two at least.
+ */
+#define LION_UNION_FANOUT_MAX		64
+#define LION_UNION_FANOUT(mem) \
+	((int) Min(Max((Size) (mem) / (16 * BLCKSZ), (Size) 2), \
+			   (Size) LION_UNION_FANOUT_MAX))
+
+/*
+ * The blocks of buffer a spilling window holds beside its union, which come
+ * out of its memory: one for each part of its overflow, one for the part it
+ * reads, and the two files' (the overflow's, and the set's).
+ */
+#define LION_UNION_SPILL_BLOCKS(fanout)	((Size) (fanout) + 4)
+
+/*
  * The rows of one range over key column `attno` of index - every set a walk of
  * the range's INSIDE hands out, summaries included (DESIGN.md §32) - as ONE
  * private, pinless posting set: their union, collected in memory.  Like a
@@ -1077,7 +1095,7 @@ extern bool lion_range_collect(Relation index, AttrNumber attno,
 
 /*
  * The same for the union of nranges ranges of one column, as one set within
- * maxbytes all told, every window a walk of each (`col < ANY (array)` on a
+ * maxbytes all told, its walk a walk of each (`col < ANY (array)` on a
  * column that cannot order the elements, DESIGN.md §28).
  */
 extern bool lion_ranges_collect(Relation index, AttrNumber attno,
@@ -1091,14 +1109,13 @@ extern bool lion_ranges_collect(Relation index, AttrNumber attno,
  * of index, collected as a range's is - in memory within maxbytes, or failed,
  * or where spill allows a window of container keys at a time into a temporary
  * file - and made a set the same way (lion_union_collect()).  walk is called
- * once a window, first true for the first, and hands out the same sets each
- * time; lion_union_add() is false once the union has failed and the walk is
- * to stop.  Each set it is given stays the walk's to release.
+ * once, for the first window, whose overflow the others read;
+ * lion_union_add() is false once the union has failed and the walk is to
+ * stop.  Each set it is given stays the walk's to release.
  */
 struct LionRangeUnion;
 typedef void (*LionUnionWalk) (Relation index, AttrNumber attno,
-							   struct LionRangeUnion *u, void *arg,
-							   bool first);
+							   struct LionRangeUnion *u, void *arg);
 extern bool lion_union_add(struct LionRangeUnion *u, LionPostingSet *ps);
 extern bool lion_union_collect(Relation index, AttrNumber attno,
 							   LionUnionWalk walk, void *arg, Size maxbytes,

@@ -207,9 +207,11 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 	 * A parameter's array has no length cap (DESIGN.md §15), and past some
 	 * nine million values the sets pass the 1GB a plain allocation may have.
 	 * A plain count locates such a list a batch at a time instead
-	 * (lion_count_batched()), and every other count collects one that is a
-	 * source of its own (lion_locate_list()); a list under an OR, and the one
-	 * that drives the groups, are held whole.
+	 * (lion_count_batched()), every other count collects one that is a
+	 * source of its own or a leaf of an OR (lion_locate_list()), and the one
+	 * that drives the groups is located a batch at a time as they are walked
+	 * (lion_ingroup_next()).  What comes here is a list no longer than a
+	 * batch, or a multi-key query's.
 	 */
 	*sets = (LionPostingSet *)
 		palloc_extended(sizeof(LionPostingSet) * Max(nelems, 1),
@@ -254,8 +256,10 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
  * the terms being disjoint - lion_run_batches()'s argument, one level up.  A
  * GROUP BY, a count(DISTINCT) and an FK-side join count the list many times
  * over and collect it into one set instead (lion_locate_list()), and so does
- * a plain count a second long list; a list under an OR, whose union is not a
- * disjoint one, is held whole.  One list per relation is batched.
+ * a plain count a second long list and a list under an OR, whose union is not
+ * a disjoint one; the list that drives the groups is located a batch at a
+ * time as they are walked (lion_group_list_prepare()).  One list per
+ * relation is batched.
  *
  * The values are sorted as a lookup sorts them (lion_probe_sort()) and a
  * batch ends only where the hash changes: two values of one equality class
@@ -736,6 +740,26 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 }
 
 /*
+ * A list collected (lion_locate_list()), and spilled: counted once a list,
+ * for EXPLAIN ANALYZE's Lists Collected and Lists Spilled - not once for
+ * every partition, run and rescan that collected it again.
+ */
+static void
+lion_list_counted(LionCountScanState *st, LionClauseState *cl, bool spilled)
+{
+	if (!cl->listcollected)
+	{
+		cl->listcollected = true;
+		st->listsrc_collected++;
+	}
+	if (spilled && !cl->listspilled)
+	{
+		cl->listspilled = true;
+		st->listsrc_spilled++;
+	}
+}
+
+/*
  * Send the ranges and the lists collected in memory so far to files of their
  * own (lion_range_spill_set()), for one after them that does not fit what
  * they left (lion_collect_within()): each then holds what a range collected
@@ -745,6 +769,7 @@ static void
 lion_rangesrc_evict(LionCountScanState *st)
 {
 	ListCell   *lc;
+	ListCell   *lc2;
 
 	foreach(lc, st->rangesrc_mem)
 	{
@@ -754,14 +779,16 @@ lion_rangesrc_evict(LionCountScanState *st)
 	}
 	list_free(st->rangesrc_mem);
 	st->rangesrc_mem = NIL;
-	foreach(lc, st->listsrc_mem)
+	forboth(lc, st->listsrc_mem, lc2, st->listsrc_memcl)
 	{
 		lion_range_spill_set((struct LionMatSet *) lfirst(lc),
 							 &st->rangesrc_held);
-		st->listsrc_spilled++;
+		lion_list_counted(st, (LionClauseState *) lfirst(lc2), true);
 	}
 	list_free(st->listsrc_mem);
 	st->listsrc_mem = NIL;
+	list_free(st->listsrc_memcl);
+	st->listsrc_memcl = NIL;
 }
 
 /*
@@ -851,10 +878,11 @@ lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * left takes that memory back: they go to files of their own
  * (lion_rangesrc_evict()), and it is collected in what that frees - in
  * memory, or in windows of nearly all of it.  Left to what they left, it
- * would be walked once a window of whatever crumbs remained, and a range
- * that filled the memory to its last few kilobytes would make the next one
- * cost a walk for every few kilobytes of it; written out, they cost a write
- * and a read of each container a count seeks.
+ * would be collected in windows of whatever crumbs remained -
+ * LION_RANGE_WINDOW_MIN each, what each does not keep split two ways - and a
+ * range that filled the memory to its last few kilobytes would make the next
+ * one cost a pass over its containers for every halving of it; written out,
+ * they cost a write and a read of each container a count seeks.
  *
  * Unless the plan says to walk it (`walkable`, LION_FLAG_RANGEWALK and
  * LION_CLAUSE_WALK): where there are few counts the planner may have found
@@ -934,7 +962,7 @@ typedef struct LionListWalk
 
 static void
 lion_list_walk(Relation index, AttrNumber attno, struct LionRangeUnion *u,
-			   void *arg, bool first)
+			   void *arg)
 {
 	LionListWalk *w = (LionListWalk *) arg;
 	ArrayIterator it = NULL;
@@ -1024,7 +1052,9 @@ lion_list_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * union of its values' sets, collected as a range taken as a source is
  * (lion_collect_within()) - within what is left of the hash table's memory
  * the relation's collected sources share, and past it a window of container
- * keys at a time into a temporary file, every window a pass over the values.
+ * keys at a time into a temporary file: the first window a pass over the
+ * values, and each of the others a read of its part of what the windows
+ * before it did not keep.
  * The values are located lion_array_batch_size() at a time, each batch's sets
  * ORed into the union and released before the next is located, so what the
  * list holds besides its union is a batch of sets and the values themselves:
@@ -1034,10 +1064,12 @@ lion_list_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * A count of the relation as one row takes such a list a batch at a time
  * instead (lion_array_batch_prepare()); this is every other count's - a GROUP
  * BY, a count(DISTINCT), an FK-side join, which count the list many times
- * over - and a second long list's.  Like a collected range the union is
- * pinless and counted beside a set that carries the §9 interlock or with a
- * recheck in the heap, as a list too wide for the open budget always was
- * (DESIGN.md §15, "Bounded cursors").
+ * over - a second long list's, and a list's under an OR (lion_locate_or()).
+ * Not the list that drives the groups, which is located a batch at a time
+ * as they are walked (lion_group_list_prepare()).  Like a collected range
+ * the union is pinless and counted beside a set that carries the §9
+ * interlock or with a recheck in the heap, as a list too wide for the open
+ * budget always was (DESIGN.md §15, "Bounded cursors").
  *
  * False, with nothing done, for a list no longer than a batch, which is
  * located as ever (lion_locate_leaf()); otherwise the source's set and tree,
@@ -1092,9 +1124,15 @@ lion_locate_list(LionCountScanState *st, LionClauseState *cl,
 
 	(void) lion_collect_within(st, lion_list_collect_fn, &w, false, &ps,
 							   &spilled, &st->listsrc_mem);
-	st->listsrc_collected++;
-	if (spilled)
-		st->listsrc_spilled++;
+	lion_list_counted(st, cl, spilled);
+	if (ps.found && !spilled)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
+
+		/* beside its set in listsrc_mem (lion_collect_within()) */
+		st->listsrc_memcl = lappend(st->listsrc_memcl, cl);
+		MemoryContextSwitchTo(oldcxt);
+	}
 
 	MemoryContextDelete(w.batchcxt);
 	if (w.slot != NULL)
@@ -1166,6 +1204,7 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	int			i;
 	int			j;
 
+	orst->listcollected = false;
 	leafsets = (LionPostingSet **)
 		palloc0(sizeof(LionPostingSet *) * orst->nleaves);
 	leaftree = (LionKeyNode **) palloc0(sizeof(LionKeyNode *) * orst->nleaves);
@@ -1225,6 +1264,17 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 			never[i] = true;
 			continue;
 		}
+		else if (cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull &&
+				 lion_locate_list(st, cl, &leafsets[i], &leafn[i],
+								  &leaftree[i]))
+		{
+			/*
+			 * An IN list too long to locate at once, collected into one set a
+			 * batch of values at a time (lion_locate_list()), as a range leaf
+			 * is collected: pinless, so the OR carries no interlock.
+			 */
+			orst->listcollected = true;
+		}
 		else
 		{
 			/*
@@ -1246,8 +1296,8 @@ lion_locate_or(LionCountScanState *st, LionOrState *orst, LionCountSource *src)
 	/*
 	 * One array for the positive arms' sets and one for the complement arms',
 	 * with every leaf's tree moved onto its own, and each leaf's array let go
-	 * as it is copied: an IN list of a parameter can be millions of sets long
-	 * (DESIGN.md §15).
+	 * as it is copied: an IN list leaf is up to a batch of sets, longer ones
+	 * being collected (DESIGN.md §15), and there may be many leaves.
 	 */
 	src->sets = (LionPostingSet *)
 		palloc_extended(sizeof(LionPostingSet) * Max(total, 1),
@@ -1641,6 +1691,157 @@ lion_build_filter(LionCountScanState *st)
 }
 
 /*
+ * The IN list that drives the groups (lion_ingroup_item()), when it is longer
+ * than a batch: its values sorted as a lookup sorts them, with their hashes,
+ * for lion_ingroup_next() to locate a batch at a time - as a plain count
+ * takes such a list (lion_array_batch_prepare()), and for the same reason: a
+ * parameter's array has no length cap, and every value's located set was
+ * held while the groups were walked.  What is held whole is the values; the
+ * sets are a batch's.  False, with nothing done, for a list no longer than a
+ * batch, which is located whole.  In wherecxt, the caller's context.
+ */
+static bool
+lion_group_list_prepare(LionCountScanState *st, LionClauseState *cl)
+{
+	ArrayType  *arr;
+	Oid			elemtype;
+	int16		elmlen;
+	bool		elmbyval;
+	char		elmalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	LionGroupList *gl;
+
+	Assert(cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull);
+	if (cl->valstore != NULL)
+		elog(ERROR, "LionCount: the IN list that drives the groups is a folded filter's");
+	arr = DatumGetArrayTypeP(cl->val);
+	if (ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) <= lion_array_batch_size())
+	{
+		if ((Pointer) arr != DatumGetPointer(cl->val))
+			pfree(arr);
+		return false;
+	}
+
+	elemtype = ARR_ELEMTYPE(arr);
+	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+					  &elems, &nulls, &nelems);
+
+	gl = (LionGroupList *) palloc0(sizeof(LionGroupList));
+	gl->val = (Datum *)
+		palloc_extended(sizeof(Datum) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	gl->hash = (uint32 *)
+		palloc_extended(sizeof(uint32) * Max(nelems, 1), MCXT_ALLOC_HUGE);
+	gl->nval = lion_probe_sort(cl->idx, cl->idxcol, elemtype, nelems,
+							   elems, nulls, gl->val, gl->hash);
+	gl->nval = lion_probe_sort_unique(gl->val, gl->hash, gl->nval,
+									  elmbyval, elmlen);
+	gl->type = elemtype;
+	gl->next = 0;
+	gl->batchcxt = AllocSetContextCreate(st->wherecxt,
+										 "LionCount group list batch",
+										 ALLOCSET_DEFAULT_SIZES);
+	st->glist = gl;
+
+	/* a by-reference value points into arr, which stays in wherecxt */
+	pfree(elems);
+	pfree(nulls);
+	return true;
+}
+
+/*
+ * The next batch of the list that drives the groups (st->glist) into its
+ * item's source, in place of the batch before it, whose sets are released:
+ * lion_array_batch_size() values, and the ones after them of the same hash -
+ * two values of one equality class hash alike and sort together, so no entry
+ * is located in two batches, and a group is never emitted twice.  The sets
+ * keep the pins they are located with until the next pause unpins them, as
+ * the WHERE's do (lion_unpin_where()).
+ */
+static void
+lion_group_list_batch(LionCountScanState *st, LionCountSource *src,
+					  LionGroupList *gl)
+{
+	LionClauseState *cl = &st->clause[st->item[st->ingroupitem].clauseno];
+	int			batch = lion_array_batch_size();
+	int			start = gl->next;
+	int			end;
+	int			nfound;
+	int			i;
+	MemoryContext oldcxt;
+
+	if (batch <= 0 || start < 0 || start >= gl->nval)
+		elog(ERROR, "LionCount: a batch of the group list at %d of %d values",
+			 start, gl->nval);
+	end = start + Min(batch, gl->nval - start);
+	while (end < gl->nval && gl->hash[end] == gl->hash[end - 1])
+		end++;
+
+	for (i = 0; i < src->nsets; i++)
+		lion_posting_set_release(&src->sets[i]);
+	src->sets = NULL;
+	src->nsets = 0;
+	MemoryContextReset(gl->batchcxt);
+
+	oldcxt = MemoryContextSwitchTo(gl->batchcxt);
+	src->sets = (LionPostingSet *)
+		palloc_extended(sizeof(LionPostingSet) * (end - start),
+						MCXT_ALLOC_HUGE | MCXT_ALLOC_ZERO);
+	src->nsets = lion_posting_set_lookup_many_col(cl->idx, cl->idxcol,
+												 gl->type, end - start,
+												 &gl->val[start], NULL,
+												 src->sets, &nfound);
+	MemoryContextSwitchTo(oldcxt);
+
+	gl->next = end;
+	st->glistbatches++;
+	st->ingroupset = 0;
+	st->ingroupleft = nfound;
+	st->wherepinned = true;
+}
+
+/*
+ * The next set of the IN list that drives the groups (st->ingroupitem) that
+ * has an entry, or NULL once the list is done: its located sets in turn, and
+ * for a list longer than a batch (st->glist) each batch's, located when the
+ * one before it is done.  The groups come in the order the lookup takes the
+ * values in, which no plan claims as the order of its rows.
+ */
+LionPostingSet *
+lion_ingroup_next(LionCountScanState *st)
+{
+	LionCountSource *src = &st->sources[st->ingroupitem + 1];
+
+	for (;;)
+	{
+		LionPostingSet *ps;
+
+		if (st->ingroupset < src->nsets)
+		{
+			ps = &src->sets[st->ingroupset++];
+			if (!ps->found)
+				continue;		/* a listed value with no entry: no group */
+			st->ingroupleft--;
+			return ps;
+		}
+		if (st->glist == NULL || st->glist->next >= st->glist->nval)
+			return NULL;
+		lion_group_list_batch(st, src, st->glist);
+		CHECK_FOR_INTERRUPTS();
+	}
+}
+
+/* May another group of the list that drives them follow? */
+bool
+lion_ingroup_more(const LionCountScanState *st)
+{
+	return st->ingroupleft > 0 ||
+		(st->glist != NULL && st->glist->next < st->glist->nval);
+}
+
+/*
  * The item whose IN list can drive the groups instead of the index's entry
  * scan (DESIGN.md §15), as lion_locate_where() says below, or -1: what the
  * plan and the relation's indexes say, known before anything is located.
@@ -1691,6 +1892,7 @@ lion_locate_where(LionCountScanState *st)
 
 	/* what this locates may be pinned until the next pause unpins it */
 	st->wherepinned = true;
+	st->glist = NULL;
 
 	oldcxt = MemoryContextSwitchTo(st->wherecxt);
 
@@ -1740,6 +1942,19 @@ lion_locate_where(LionCountScanState *st)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
 				st->wheremissing = true;
+			continue;
+		}
+
+		/*
+		 * The list that drives the groups, past one batch: located a batch
+		 * at a time as the groups are walked (lion_ingroup_next()), and
+		 * until then a source of no sets, which nothing else reads - the
+		 * driver makes it redundant (dsources, below).
+		 */
+		if (k == ingroup && cl->kind == LION_CLAUSE_ARRAY && !cl->valisnull &&
+			lion_group_list_prepare(st, cl))
+		{
+			src->disjoint = true;
 			continue;
 		}
 
@@ -1974,6 +2189,7 @@ lion_release_where(LionCountScanState *st)
 	st->rangesrc_held = 0;
 	st->rangesrc_mem = NIL;		/* it lived in wherecxt too */
 	st->listsrc_mem = NIL;		/* and so did this */
+	st->listsrc_memcl = NIL;
 
 	/*
 	 * The collected WHERE (lion_group_count()): its file, if it spilled, is
@@ -2024,6 +2240,7 @@ lion_release_where(LionCountScanState *st)
 	st->ingroupitem = -1;
 	st->ingroupset = 0;
 	st->ingroupleft = 0;
+	st->glist = NULL;			/* it lived in wherecxt */
 	st->sumallitem = -1;
 }
 

@@ -2645,6 +2645,29 @@ lion_poisson_above(double m, int k)
 	return Min(Max(1.0 - cdf, 0.0), 1.0);
 }
 
+/*
+ * The containers a range's walk hands its union: each set's, a container at
+ * every key its rows reach - all over the heap for a column in no order, the
+ * keys its rows span for one in heap order.  *inord and *inscat are the two
+ * ends, which the column's correlation interpolates (lion_cost_range_union(),
+ * lion_cost_range_source()).
+ */
+static void
+lion_range_walk_containers(double heap_pages, double tuples,
+						   const LionRangeWalk *w, double *inord,
+						   double *inscat)
+{
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		perckey = Max(tuples / ckeys, 1.0);
+	double		escat = Max(lion_containers_for(heap_pages, w->entryrows), 1.0);
+	double		sscat = Max(lion_containers_for(heap_pages, w->bucketrows), 1.0);
+	double		eord = Min(escat, 1.0 + w->entryrows / perckey);
+	double		sord = Min(sscat, 1.0 + w->bucketrows / perckey);
+
+	*inord = w->entries * eord + w->sums * sord;
+	*inscat = w->entries * escat + w->sums * sscat;
+}
+
 static Cost
 lion_cost_range_union(double heap_pages, double tuples, double rows,
 					  const LionRangeWalk *w)
@@ -2654,10 +2677,8 @@ lion_cost_range_union(double heap_pages, double tuples, double rows,
 	double		c2 = w->corr * w->corr;
 	double		escat = Max(lion_containers_for(heap_pages, w->entryrows), 1.0);
 	double		sscat = Max(lion_containers_for(heap_pages, w->bucketrows), 1.0);
-	double		eord = Min(escat, 1.0 + w->entryrows / perckey);
-	double		sord = Min(sscat, 1.0 + w->bucketrows / perckey);
-	double		inord = w->entries * eord + w->sums * sord;
-	double		inscat = w->entries * escat + w->sums * sscat;
+	double		inord;
+	double		inscat;
 	double		uord = Min(ckeys, Max(1.0, rows / perckey));
 	double		uscat = Max(lion_containers_for(heap_pages, rows), 1.0);
 	double		ukey = Min(rows / uscat, (double) LION_ARRAY_MAX_CARD);
@@ -2669,6 +2690,8 @@ lion_cost_range_union(double heap_pages, double tuples, double rows,
 	double		merges = 0.0;
 	Cost		ordered;
 	Cost		scattered;
+
+	lion_range_walk_containers(heap_pages, tuples, w, &inord, &inscat);
 
 	/* in order: each key that takes a second container is widened once */
 	ordered = inord * LION_CONTAINER_COST +
@@ -2777,6 +2800,37 @@ lion_container_max_bytes(double tuples, double pages)
 }
 
 /*
+ * What a collection in windows writes to its overflow (lion_union_collect()),
+ * as a share of what its walk hands out, for a union n times a window's
+ * memory: the first window keeps a window's worth of the union's keys and
+ * writes the rest, each of the fanout windows made of that keeps its own
+ * worth and writes the rest again, and so on until the windows of one level
+ * keep it all - each container written once for every level before the one
+ * that keeps its key.  With two parts that is 2/3 of the walk at n = 3, and
+ * twice the walk at n = 11.
+ */
+static double
+lion_union_overflow_share(double n, int fanout)
+{
+	double		kept = 0.0;
+	double		windows = 1.0;
+	double		share = 0.0;
+
+	if (!(n > 1.0))
+		return 0.0;
+	fanout = Max(fanout, 2);
+	for (;;)
+	{
+		kept += windows;
+		if (kept >= n)
+			break;
+		share += 1.0 - kept / n;
+		windows *= fanout;
+	}
+	return share;
+}
+
+/*
  * A RANGE TAKEN AS A SOURCE (DESIGN.md §32, "A range as a source"): the rows
  * whose key lies in it, which the executor collects once per relation - the
  * walk of the range, summaries and all, priced as the walk of a summed range
@@ -2793,13 +2847,23 @@ lion_container_max_bytes(double tuples, double pages)
  * mem->held is what the ranges collected before this one hold, and what this
  * one holds is added to it.  One that would not fit what they left is
  * collected a window of container keys at a time into a temporary file
- * (lion_range_collect()): each window a walk of the range, about two of them
- * for each window's memory the union takes - what is left, and never less
- * than LION_RANGE_WINDOW_MIN - and the file written once and read once; what
- * stays in memory is sixteen bytes a container key and the file's buffer.
- * That is the price, an OR's leaf's as any other's; the counts that read
- * the file back pay for what they read of it, as they read it
- * (LION_SPILL_READ_COST).
+ * (lion_range_collect()): the range is walked once, into the first window,
+ * and what a window does not keep goes to parts of a temporary file that
+ * the windows after it read and split again - as the walk handed it out, a
+ * container a set and key, not the union's one a key.  So a container of
+ * the walk is written, read back and united again up to log(n) / log(fanout)
+ * times, for a union n times a window's memory - what is left less the
+ * overflow's buffers (LION_UNION_SPILL_BLOCKS), and never less than
+ * LION_RANGE_WINDOW_MIN - each time at LION_SPILL_READ_COST, a container
+ * read back from a file, and the pages they take
+ * (lion_union_overflow_share()); and the set's file is written once and read
+ * once.  What stays in memory is sixteen bytes a container key and the
+ * file's buffer.  That is the price, an OR's leaf's as any other's; the
+ * counts that read the file back pay for what they read of it, as they read
+ * it (LION_SPILL_READ_COST).  Over a range of small sets in no order -
+ * summaries of a few dozen rows, a container each at most of the heap's
+ * keys - that is many times the union's containers, and the walk at every
+ * count may be the cheaper.
  *
  * Unless ranges before it are in memory (mem->inmem): it is then tried in
  * what they left, walked until that is spent, and they go to files of their
@@ -2838,6 +2902,12 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		c2;
 	double		ucont;
 	double		spillheld;
+	int			fanout;
+	double		written;
+	double		inord;
+	double		inscat;
+	double		incont;
+	double		inpages;
 	Cost		scan;
 	Cost		unite;
 	Cost		tried;
@@ -2886,10 +2956,20 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		}
 	}
 
-	window = Max(budget, (double) LION_RANGE_WINDOW_MIN);
+	fanout = LION_UNION_FANOUT(budget);
+	window = Max(budget - (double) (LION_UNION_SPILL_BLOCKS(fanout) * BLCKSZ),
+				 (double) LION_RANGE_WINDOW_MIN);
+	written = lion_union_overflow_share(bytes / window, fanout);
+	lion_range_walk_containers(heap_pages, tuples, &w, &inord, &inscat);
+	incont = inscat + (inord - inscat) * c2;
+	inpages = Min(rows * sizeof(uint16) +
+				  incont * (LION_CONTAINER_HDRSZ + sizeof(uint32)),
+				  incont * (LION_CONTAINER_MAX_SIZE + sizeof(uint32))) / BLCKSZ;
 	mem->held += spillheld;
 	*spills = true;
-	return evict + scan * 2.0 * ceil(bytes / window) + unite +
+	return evict + scan + unite +
+		written * (incont * LION_SPILL_READ_COST +
+				   2.0 * ceil(inpages) * seq_page_cost) +
 		2.0 * ceil(bytes / BLCKSZ) * seq_page_cost;
 }
 
