@@ -241,6 +241,13 @@ twice, or one freed a moment ago called reusable, breaks the equation.
   the standby's feedback lets it remove them - each read on the standby
   through `lion_index_stats()` and compared with the primary's, and with the
   exact count, once it has replayed the META record that wrote it.
+* a position tree damaged on the standby alone: verify.sql's seventeenth case
+  built on the primary, checked on the standby while sound, then, with the
+  standby stopped after a restartpoint, one byte of a position leaf changed in
+  the standby's file, which leaves five TIDs without positions.
+  `lion_index_verify()` on the standby must report them: a standby compares a
+  position tree with its posting set from a walk that read every page as it
+  was at one replay position (DESIGN.md §7, "Position trees").
 * the recovery-conflict case, run twice. A standby session opens a
   `REPEATABLE READ` transaction and counts key K; the run waits (on
   `pg_stat_activity`, not on a timer) until that session really holds its
