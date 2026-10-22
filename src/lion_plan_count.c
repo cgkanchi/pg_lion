@@ -1177,14 +1177,22 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	/*
 	 * A multi-key clause whose value is only known at run time may turn
 	 * out to narrow nothing, and be counted as a negated source (§17);
-	 * every other positive clause stays one.
+	 * every other positive clause stays one.  A literal tsquery with a
+	 * prefix lexeme stays one only while the run can expand the prefix
+	 * into the index's lexemes that have it, and narrows nothing past
+	 * that (lion_tsquery_expand_prefixes()); so does a jsonpath, whose
+	 * keys are all prefixes (§43): neither is a source positive whatever
+	 * its value.
 	 */
 	if (leaf.kind == LION_CLAUSE_EQ || leaf.kind == LION_CLAUSE_ARRAY ||
 		leaf.kind == LION_CLAUSE_NULL || leaf.kind == LION_CLAUSE_RESERVED ||
 		(leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
-		 IsA(leaf.val, Const)))
+		 IsA(leaf.val, Const) && !LION_STRAT_IS_JSONPATH(leaf.strategy) &&
+		 !(leaf.strategy == LION_STRAT_MATCH &&
+		   lion_tsquery_has_prefix(((Const *) leaf.val)->constvalue))))
 		cx->plainpositive = true;
-	else if (leaf.kind == LION_CLAUSE_MULTI)
+	else if (leaf.kind == LION_CLAUSE_MULTI &&
+			 (leaf.val == NULL || !IsA(leaf.val, Const)))
 		cx->runtimemulti = true;
 
 	if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)

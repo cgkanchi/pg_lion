@@ -2844,12 +2844,14 @@ parallel-aware one below a Gather and core's Finalize HashAggregate:
   partitioned table, §16) leaves to it.
 - **When.** One GROUP BY column walked whole over one table, whose WHERE the planner prices as
   collected (`lion_cost_where_collected()`), with a positive clause that is positive whatever its
-  value - an equality, an IN list, `IS NULL`, a multi-key literal; a multi-key parameter may narrow
-  nothing at run time and turn into a negated source, and a WHERE of negated sources alone has
-  nothing to collect by range - and no range taken as a source; a grouping core can hash and
-  aggregates it can split, and the table, the target and the clause values parallel-safe. Not a
-  partitioned table, two GROUP BY columns, count(DISTINCT), an IN list that drives the groups, and
-  not during recovery, where the WHERE is never collected. `GROUP BY coalesce(col, c)` divides too
+  value - an equality, an IN list, `IS NULL`, a multi-key literal without a prefix lexeme; a
+  multi-key parameter, a literal tsquery whose prefix the run finds too common to expand (§17,
+  "Prefix lexemes") and a jsonpath, whose keys are all prefixes (§43.2), may narrow nothing at run
+  time and turn into a negated source, and a WHERE of negated sources alone has nothing to collect
+  by range - and no range taken as a source; a grouping core can hash and aggregates it can split,
+  and the table, the target and the clause values parallel-safe. Not a partitioned table, two
+  GROUP BY columns, count(DISTINCT), an IN list that drives the groups, and not during recovery,
+  where the WHERE is never collected. `GROUP BY coalesce(col, c)` divides too
   (2026-10-19): its group of c is the NULL entry's rows and those of the entry the grouping
   equality finds equal to c, which the serial walk adds up as it meets them (`LionCoalState`);
   in a range each of the two goes up as a partial row of the value c itself
@@ -2920,7 +2922,8 @@ columns, a printed filter column, a HAVING, an ORDER BY with LIMIT, `GROUP BY co
 with c a key of the column or none, the leader alone with no worker
 started, SERIALIZABLE, a generic plan's parameters and a heap the map cannot vouch for - each against
 the same query run serially and with the pushdown off - and the ranges, collections and batches the
-participants counted.
+participants counted; and the shapes that stay serial, a WHERE whose positive clauses are literal
+prefixes too common to expand, a tsquery's or a jsonpath's, among them.
 
 ### A count in parallel (2026-10-19)
 
@@ -3629,7 +3632,8 @@ the row filter, and a range source's other bounds are looked for in its own filt
   allow partial aggregation (`GROUPING_CAN_PARTIAL_AGG`) with a hashable grouping, and the path
   claims no sort order. The decoded walk is taken only when every filter's run has a source
   positive whatever its value, in the WHERE or in the filter - an equality, a list, a null test, a
-  literal multi-key clause, or an OR of those - and no range source.
+  literal multi-key clause other than a jsonpath and without a prefix lexeme, or an OR of those -
+  and no range source.
 
 **Declined with filters**: the FK-side join (§27), `count(DISTINCT)` (§26), the aggregates over
 keys (§37), a `coalesce` group, expressions of the grouping columns that are not grouping columns,
@@ -3896,7 +3900,12 @@ WHERE - and count every pass of the driver there into one tally of their own, wh
 partial rows at the end, under the Gather and the Finalize Agg. Each range is the serial walk over
 a copy of its keys, the driver's sets located afresh by the participant under its own pins and the
 labels read after the leader's snapshot, so the argument above holds in each; every row is in one
-range, counted by one participant.
+range, counted by one participant. The WHERE a range collects is every clause of it: an IN list on
+the driver's own column too, which a count by cells never takes for §15's driver of the groups
+(`lion_ingroup_item()`) - it walks every entry of the driver, serial or in parallel - and locates as
+any other list, one set a value, or one collected set past a batch (`lion_locate_list()`). The
+planner makes the parallel form for a WHERE with a clause positive whatever its value, or none, as
+a parallel GROUP BY's, and no range taken as a source: a range can collect nothing else.
 
 **The planner** (`lion_try_count_cells()`, lion_plan_count.c) runs first in each scoped build of a
 count (`lion_try_count_path_scoped()`), with phases of its own for the GROUP BY (every expression
@@ -3999,9 +4008,13 @@ both together, the WHERE form, a HAVING; exclusive and overlapping equalities, N
 DISTINCT FROM with NULLs, booleans with and without NULLs, a value no row has, NULL and empty arrays
 and arrays with a NULL element, an overlap with the empty array, text searches, `round`,
 `GREATEST`, `LEAST` and `COALESCE` over NULLs; the declines - a column read outside a predicate, a
-volatile function, the bound exceeded; generic plans with Params in the WHERE; a rescan per outer
+volatile function, the bound exceeded; generic plans with Params in the WHERE, an IN list of one
+on the driver's column longer than a batch among them, in a decoded walk too; a rescan per outer
 row and SERIALIZABLE; deleted and updated rows before VACUUM, a transaction's own changes, and after
-VACUUM; and parallel plans, with rows the heap decides.
+VACUUM; enum columns and a domain over one; and parallel plans, with rows the heap decides, an IN
+list on the driver's column - short, of no value with rows, a Param's past a batch, beside the anti
+join - and the WHEREs that stay serial: a range source, a Param's multi-key query, a literal
+prefix too common to expand, a tsquery's or a jsonpath's.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
@@ -4737,6 +4750,13 @@ between a plan and no plan: `SELECT c20k, count(*) ... WHERE c20k IN (1000 value
 took **about three minutes** when forced before this (182 and 189 s over two runs) - intersecting
 all twenty thousand entries with the thousand-way union, which is why the cost model rightly refused
 it - and takes 4.6 ms now against the B-tree's 5.1, which it is chosen over.
+
+The list drives the walk of one column's entries: `lion_next_group_inlist()`, and §26's
+count(DISTINCT k) walk. A decoded walk (§34) and a count by cells (§10, "Counts by cells") walk
+every entry of their column 0 against the WHERE collected whole, so a list on that column is a
+clause of the copy like any other, located as one (`lion_ingroup_item()` names no driver for them):
+a list past a batch is collected into one set ("A list too long to locate at once", below), where
+the driver's batches would be left for a walk of them that never comes.
 
 `EXPLAIN ANALYZE` reports `Posting Sets Summed`: how many posting sets had their counts added into a
 total instead of being merged - the entries of a summed IN list, or the entries of a sum-over-all
@@ -6738,6 +6758,10 @@ scan, index scan, count pushdown), never in the planner, so new lexemes are alwa
   either (an indexed `foo` would be in the run), so it selects no row.
 - **The cap.**  At most `LION_MAX_QUERY_KEYS` (1000) lexemes over the whole query.  Past it the
   original query is kept and the old path applies: the prefix is every row and the heap rechecks.
+  So a literal query with a prefix may narrow nothing at run time, as a parameter's may: the count
+  pushdown does not take it for a clause positive whatever its value (`plainpositive`), which a
+  parallel GROUP BY or count by cells collects by range and a filtered count's decoded walk begins
+  from (§10).
 - **Planner.**  Costing and the count pushdown's mode choice see the query with its prefix flags
   cleared (`lion_tsquery_strip_prefixes()`), the closest stand-in for an expansion they cannot
   do.  A prefix under an OR of clauses in the count pushdown is refused: that path has no
@@ -23746,7 +23770,8 @@ is ORed with the prefix `H`, every hashed key.
 
 In the count pushdown a jsonpath is always counted from the superset with a heap recheck
 (`lion_locate_multikey()` takes the superset branch for it), so the planner takes it only where a
-recheck is allowed: never under an OR.
+recheck is allowed: never under an OR. A literal one may come out ALL at run time as a parameter's
+may, so it is no clause positive whatever its value (§17, "Prefix lexemes", the cap).
 
 ### 43.3 Elsewhere
 
