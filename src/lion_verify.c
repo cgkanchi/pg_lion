@@ -1182,6 +1182,16 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 			lion_verify_note_flagged(res, pg.blk, exact);
 		}
 
+		/*
+		 * Test hook: a leaf of the set is read, and nothing is held.
+		 * test/recovery/run.sh phase 3 parks a standby's check here and has
+		 * replay change the set's other leaves and leave its entry as it was
+		 * (lion_verify_set_walks()).  Never in an exact walk, which holds a
+		 * directory leaf.
+		 */
+		if (!exact)
+			LION_INJECTION_POINT("lion-verify-set-leaf-read");
+
 		CHECK_FOR_INTERRUPTS();
 	}
 
@@ -2064,6 +2074,20 @@ lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
 }
 
 /*
+ * Does a walk of a posting set agree with its entry - the last leaf with
+ * `tail`, the TIDs and items with `ntids` and `ncontainers`?  What
+ * lion_verify_chain_totals() reports, without reporting it.
+ */
+static bool
+lion_verify_chain_agrees(const LionEntryTuple *entry,
+						 const LionVerifySetResult *res)
+{
+	return res->last == lion_entry_tail(entry) &&
+		res->card == lion_entry_ntids(entry) &&
+		res->ncontainers == lion_entry_ncontainers(entry);
+}
+
+/*
  * A walk on a standby holds every page it reads from here on to the replay
  * position it begins at: the end of the last record replayed, which is at
  * least the LSN of every page replay has changed so far and below that of
@@ -2233,19 +2257,30 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
  * startup process holds while the startup process waits for the leaf, on two
  * buffer content locks, which no deadlock detector watches and no cancel
  * reaches: replay stopped for good, and so did this backend (2026-09-29
- * review; test/recovery/run.sh phase 4).  The entry reading the same both
- * times settles a walk there too, for replay's own reason: every record that
- * changes a set's items, its counters, its last leaf or the level of a leaf
- * root carries the entry, and the records that do not - a downlink, a flag
+ * review; test/recovery/run.sh phase 4).  Every record that changes a
+ * set's items, its counters, its last leaf or the level of a leaf root
+ * carries the entry, and the records that do not - a downlink, a flag
  * cleared, an internal page split, an internal root pushed down - change
  * nothing the entry counts and are what the walk accepts from a writer
- * between two levels, or throws away.  A set that replay keeps changing has
- * no last resort there, so after LION_VERIFY_SET_ATTEMPTS walks the next one
- * that gets to the end of the set is kept - every page it read is checked -
- * and its totals are not compared with the entry, which a WARNING says.
- * Only a root pushed down or an upper level split under the walk stops one
- * short of the end, and a set that does that to LION_VERIFY_STANDBY_WALKS
- * walks is an ERROR asking for replay to be paused.
+ * between two levels, or throws away.  But the entry reading the same both
+ * times does not settle a walk there as it does on a primary: replay
+ * applies VACUUM too, which the primary's check locks out, and a TID a
+ * VACUUM took out of one leaf and another an INSERT put into another leave
+ * the entry as it was, while a walk that read the first leaf before the one
+ * and the second after the other counts a TID more than the entry.  So a
+ * walk on a standby is kept, and compared with the entry, when it agrees
+ * with an entry that read the same both times - what it found is there - or
+ * when it read every page, the entry's leaf after it among them, as it was
+ * at the replay position it began at (lion_verify_lsn_begin()): then it read
+ * the set and the entry at one point of the primary's WAL, where they agree
+ * unless the index is damaged, and a difference is reported.  Any other
+ * walk is walked again.  A set that replay keeps changing has no last resort
+ * there, so after LION_VERIFY_SET_ATTEMPTS walks the next one that gets to
+ * the end of the set is kept - every page it read is checked - and its
+ * totals are not compared with the entry, which a WARNING says.  Only a root
+ * pushed down or an upper level split under the walk stops one short of the
+ * end, and a set that does that to LION_VERIFY_STANDBY_WALKS walks is an
+ * ERROR asking for replay to be paused.
  */
 static void
 lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
@@ -2285,10 +2320,18 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		lion_verify_result_init(vs, &res);
 		lion_verify_track_begin(vs);
 		vs->nsetwalks++;
+		if (!vs->concurrent)
+			lion_verify_lsn_begin(vs);
 		ok = lion_verify_chain(vs, blk, off, cur, false, &res);
 		(void) lion_verify_refind(vs, cur, &blk, &off, false);
+		if (!vs->concurrent)
+			lion_verify_lsn_end(vs);
 
-		if (ok && lion_verify_same_entry(&before.e, cur))
+		if (ok && (vs->concurrent ?
+				   lion_verify_same_entry(&before.e, cur) :
+				   (lion_verify_lsn_at(vs) ||
+					(lion_verify_same_entry(&before.e, cur) &&
+					 lion_verify_chain_agrees(cur, &res)))))
 		{
 			lion_verify_track_end(vs, true);
 			lion_verify_chain_totals(vs, blk, off, cur, &res, true);

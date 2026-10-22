@@ -1356,12 +1356,20 @@ primary's last resort above - waits for a posting page the startup process holds
 process waits for the leaf. Two buffer content locks: no deadlock detector, and cancel, terminate and
 `pg_ctl stop -m fast` do nothing to either side; replay stopped for good within seconds of a write
 load, in both WAL modes, and only an immediate shutdown got the standby back. So a standby walks a
-set with nothing held and reads the entry again, as above, and the entry reading the same means what
-it means on a primary, for replay's own reason: every record that changes a set's items, counters,
-last leaf or the level of a leaf root carries the entry, and the records that do not - a downlink, a
-flag cleared, an internal split or an internal root pushed down - change nothing the entry counts and
-are what the walk already accepts from a writer between two levels, or throws away. A set that replay
-keeps changing has no last resort: after three walks the next one that gets to the end of the set is
+set with nothing held and reads the entry again, as above. Every record that changes a set's items,
+counters, last leaf or the level of a leaf root carries the entry, and the records that do not - a
+downlink, a flag cleared, an internal split or an internal root pushed down - change nothing the
+entry counts and are what the walk already accepts from a writer between two levels, or throws away.
+But the entry reading the same both times settles less there than on a primary: replay applies
+VACUUM, which the primary's check locks out, and a TID a VACUUM takes out of one leaf and another an
+INSERT puts into another leave the entry as it was, while a walk that read the first leaf before the
+one and the second after the other counts a TID more than the entry says (`test/recovery/run.sh`
+phase 3 parks a standby's check between two leaves, at `lion-verify-set-leaf-read`, for exactly
+that). So a standby keeps, and compares with the entry, a walk that agrees with an entry that read
+the same, and a walk that read every page - the entry's leaf after it among them - as it was at the
+replay position it began at, which the pages' LSNs show (position trees, above): such a walk read the
+set and the entry at one point of the primary's WAL, and a difference there is damage. Any other walk
+is walked again. A set that replay keeps changing has no last resort: after three walks the next one that gets to the end of the set is
 kept, every page it read checked, and its totals are not compared with the entry - a WARNING says so,
 and a check with replay paused compares them. Only a root pushed down or an upper level split under
 it stops a walk short of the end, and a set that does that to ten walks in a row is an ERROR asking
