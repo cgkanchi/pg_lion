@@ -240,17 +240,24 @@ extern void lion_vis_cache_release_vm(LionVisCache *cache);
  *
  * Each clause is `column op value`, the column on the left, of a strict
  * operator: a NULL column fails it, and so does a NULL result.  notnull makes
- * a clause the test `column IS NOT NULL` alone, which is all the heap-scan
- * fallback (lion_count_heap_filtered()) needs besides, and reserved, when it
- * is not 0, the test that a non-NULL array is in none of the column's
- * reserved entries it names (DESIGN.md §17, "Non-empty arrays"),
- * lion_array_empty_flag()'s.  attno is the heap column in the numbering of
- * `heap`, the relation being counted - a partition's own (DESIGN.md §16).
+ * a clause the test `column IS NOT NULL` alone, and reserved, when it is not
+ * 0, the test that a non-NULL array is in none of the column's reserved
+ * entries it names (DESIGN.md §17, "Non-empty arrays"),
+ * lion_array_empty_flag()'s.  The heap-scan fallback
+ * (lion_count_heap_filtered()) tests the negated clauses of a WHERE as well
+ * (DESIGN.md §35): negate makes a clause `NOT (column op value)`, still
+ * failed by a NULL result - `NOT` of a multi-key query, and `IS DISTINCT
+ * FROM` of its equality - and nullpass makes a NULL column pass it, as it
+ * passes `IS DISTINCT FROM` and a test of reserved entries that leaves the
+ * NULL entry out.  attno is the heap column in the numbering of `heap`, the
+ * relation being counted - a partition's own (DESIGN.md §16).
  */
 typedef struct LionRowFilterClause
 {
 	AttrNumber	attno;
 	bool		notnull;
+	bool		negate;
+	bool		nullpass;
 	uint16		reserved;		/* LION_ENTRY_EMPTYKEY and the like */
 	FmgrInfo	flinfo;			/* the operator's function */
 	Oid			collation;

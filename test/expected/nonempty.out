@@ -843,9 +843,8 @@ SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt && '{t1,t2}' AND cardi
 (1 row)
 
 -- a multi-key query known only at run time (DESIGN.md §17): `'{}'` narrows
--- nothing, and every row is then tested on the heap, `tags <> '{}'` with it.
--- A test that NULLs pass is no test of that row filter's, as no `IS
--- DISTINCT FROM` is (§35): beside such a query the count is not pushed.
+-- nothing, and every row is then tested on the heap, `tags <> '{}'` with it,
+-- and a test that NULLs pass as well, as `IS DISTINCT FROM` is (§35)
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND cardinality(tags) > 0$$, $$'{t3}'$$);
       lion_ne      
 -------------------
@@ -859,9 +858,15 @@ SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND cardinality(
 (1 row)
 
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND tags IS DISTINCT FROM '{}'$$, $$'{t3}'$$);
+      lion_ne      
+-------------------
+ LionCount: (1119)
+(1 row)
+
+SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND tags IS DISTINCT FROM '{}'$$, $$'{}'$$);
       lion_ne       
 --------------------
- not pushed: (1119)
+ LionCount: (11103)
 (1 row)
 
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = $1 AND cardinality(tags) > 0$$, '3');

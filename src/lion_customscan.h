@@ -4190,6 +4190,8 @@ extern LionKeyNode *lion_key_node(int keyno);
 extern LionKeyNode *lion_bool_node(LionKeyNodeKind kind, LionKeyNode **args,
 								   int nargs);
 extern void lion_build_filter(LionCountScanState *st);
+extern void lion_row_filter_call(Relation heap, LionRowFilterClause *c,
+								 Oid opno, Oid valtype, MemoryContext cxt);
 extern void lion_locate_where(LionCountScanState *st);
 extern void lion_release_where(LionCountScanState *st);
 extern LionPostingSet *lion_ingroup_next(LionCountScanState *st);
