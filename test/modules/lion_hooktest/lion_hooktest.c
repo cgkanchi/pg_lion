@@ -286,7 +286,7 @@ lion_hooktest_cells(void)
 static List *
 lion_hooktest_anti(int nkey)
 {
-	List	   *ints = list_make4_int(0, nkey, 1, 0);
+	List	   *ints = list_make3_int(nkey, 1, 0);
 	List	   *oids = list_make1_oid(ClassOidIndexId);
 	int			i;
 
@@ -296,7 +296,9 @@ lion_hooktest_anti(int nkey)
 		oids = lappend_oid(oids, (Oid) 607);	/* oid = oid */
 	for (i = 0; i < nkey; i++)
 		oids = lappend_oid(oids, InvalidOid);
-	for (i = 0; i < 4; i++)
+	for (i = 0; i < nkey; i++)
+		oids = lappend_oid(oids, (Oid) 609);	/* oid < oid */
+	for (i = 0; i < 6; i++)
 		oids = lappend_oid(oids, InvalidOid);
 	return list_make2(ints, oids);
 }
@@ -526,19 +528,33 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		List	   *ints = (List *) linitial(anti);
 
 		/*
-		 * The counts after the flags and the number of keys: the join
-		 * clauses' and the restrictions'.  Each of the last pair fits a List
-		 * alone, and their sum, with the key's, does not.
+		 * The counts after the number of keys: the join clauses' and the
+		 * restrictions'.  Each of the last pair fits a List alone, and their
+		 * sum, with the key's, does not.
 		 */
 		if (strstr(variant, "join clauses") != NULL)
-			lfirst_int(list_nth_cell(ints, 2)) = PG_INT32_MAX;
+			lfirst_int(list_nth_cell(ints, 1)) = PG_INT32_MAX;
 		else if (strstr(variant, "restrictions") != NULL)
-			lfirst_int(list_nth_cell(ints, 3)) = PG_INT32_MAX;
+			lfirst_int(list_nth_cell(ints, 2)) = PG_INT32_MAX;
 		else
 		{
-			lfirst_int(list_nth_cell(ints, 2)) = LION_MAX_ANTI_EXPRS / 2 + 1;
-			lfirst_int(list_nth_cell(ints, 3)) = LION_MAX_ANTI_EXPRS / 2;
+			lfirst_int(list_nth_cell(ints, 1)) = LION_MAX_ANTI_EXPRS / 2 + 1;
+			lfirst_int(list_nth_cell(ints, 2)) = LION_MAX_ANTI_EXPRS / 2;
 		}
+		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
+		nplans = 1;
+	}
+	else if (strcmp(variant, "anti join of a key without its order") == 0 ||
+			 strcmp(variant, "anti join of a grouping equality without its order") == 0)
+	{
+		List	   *anti = lion_hooktest_anti(1);
+		List	   *oids = (List *) lsecond(anti);
+
+		/* the key's order, after the B-tree and its operator and collation */
+		if (strstr(variant, "a key") != NULL)
+			lfirst_oid(list_nth_cell(oids, 3)) = InvalidOid;
+		else
+			lfirst_oid(list_nth_cell(oids, 4)) = (Oid) 607;
 		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
 		nplans = 1;
 	}
@@ -562,8 +578,12 @@ lion_hooktest_priv_decode(PG_FUNCTION_ARGS)
 		List	   *oids = (List *) lsecond(anti);
 
 		lion_hooktest_cells_anti(priv, 1);
-		/* the first GROUP BY column's equality, after the B-tree and key */
-		lfirst_oid(list_nth_cell(oids, 3)) = (Oid) 607;
+		/*
+		 * the first GROUP BY column's equality and its order, after the
+		 * B-tree and the key's operator, collation and order
+		 */
+		lfirst_oid(list_nth_cell(oids, 4)) = (Oid) 607;
+		lfirst_oid(list_nth_cell(oids, 6)) = (Oid) 609;
 		lfirst(list_nth_cell(priv, LION_PRIV_ANTI)) = anti;
 		nplans = 1;
 	}
