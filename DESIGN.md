@@ -6353,10 +6353,27 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its callbacks:
     8.2 to 9.4 ns and 21.6 ns on the release build (§10, "The units"), at the reference's 5 ns a
     `cpu_operator_cost`; the same counts without positions run there at 350 to 1,100 units a
-    millisecond, around the reference.  A lexeme's members are the share of the rows that makes
-    the clause's selectivity their product.  The copy is priced once for its candidates, and
-    every other count for its own, its lexemes decoded up to them - which an FK-side join's
-    probing counts, their candidates a few of every part of the heap, pay at almost every one.
+    millisecond, around the reference.  The candidates are the SUPERSET's rows, not the clause's
+    (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a query of it alone,
+    the clause and its superset are combined from those as core combines a tsquery's operands,
+    and the candidates are the rows the caller's filters select times the superset's share over
+    the clause's - 1 for `foo <-> bar`, whose superset `foo & bar` core estimates as it estimates
+    the phrase, and 8 for `foo <-> !bar` of `foo` in every row and `bar` in seven of eight - and
+    times what the intersection probe measures of the AND of the superset's lexemes (§29.11,
+    "Correlated sets"): `new <-> york` of two lexemes in the same tenth of the rows is a
+    hundredth of them by core's product, and its candidates are the whole tenth.  A cursor is a
+    lexeme's, one for each the query names, those under a NOT too, and its members are the rows
+    that have the lexeme.  Priced from the clause's own rows and the superset's one lexeme,
+    `foo <-> !bar` would come to a sixteenth of what it takes: over 400,000 rows and 2,000 keys,
+    the FK-side join would be taken at one to ten keys over a nested loop into a btree of the
+    fact's key that runs 8 to 40 times as fast (1.2 ms against 18 ms at two keys, on the release
+    build); and the correlated phrase's probing counts would be priced at a fifth of their time.
+    A correlation the probe does not take - less than three times core's product, as for any
+    AND - stays in the price: `foo <-> bar` of two lexemes in the same three rows of four is
+    decided over 0.75 of the rows and priced over core's 0.56.  The copy is priced once for its
+    candidates, and every other count for its own, its lexemes decoded up to them - which an
+    FK-side join's probing counts, their candidates a few of every part of the heap, pay at
+    almost every one.
     The heap recheck (`lion_cost_recheck()`) charges such a clause nothing.  An AM scan, plain or
     bitmap, is priced the same way once a scan (`lion_cost_scan_posfilter()`, from
     `lioncostestimate()`): its cursors begin again at every scan, so a nested loop's inner scan

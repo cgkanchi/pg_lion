@@ -344,6 +344,11 @@ CREATE INDEX pos_grouped_cd ON pos_grouped USING lion (cat, d) WITH (store_posit
 CREATE TABLE pos_dim (id int PRIMARY KEY, name text);
 INSERT INTO pos_dim SELECT g, 'n' || (g % 3) FROM generate_series(0, 6) g;
 VACUUM ANALYZE pos_grouped, pos_dim;
+-- The distinct count's filter reads all three lexemes, `again` in 4,183 rows
+-- of 5,767 (lion_cost_posfilter()), and a sort of the rows a bitmap heap scan
+-- fetches comes within a few percent of it on a table this small: sorts are
+-- off here, so that the count is the one checked
+SET enable_sort = off;
 EXPLAIN (COSTS OFF)
 SELECT cat, count(*) FROM pos_grouped WHERE d @@ 'everywhere <-> again' GROUP BY cat;
 EXPLAIN (COSTS OFF)
@@ -365,6 +370,7 @@ SELECT 'join', pos_dim.name, count(*)
 FROM pos_grouped JOIN pos_dim ON pos_grouped.cat = pos_dim.id
 WHERE pos_grouped.d @@ 'w1:A | (common <-> again)' GROUP BY pos_dim.name;
 DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
+RESET enable_sort;
 SET pg_lion.enable_count_pushdown = off;
 SET enable_bitmapscan = off;
 SET enable_indexscan = off;
