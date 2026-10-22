@@ -6,7 +6,7 @@ the pin interlock of §9 does not hold, so the count trusts the visibility map
 for nothing and rechecks every candidate TID. Neither of those had an
 automated test. The only recovery check the project ever had was one manual
 `pg_ctl -m immediate` early in development, before sparse segments (§13),
-byte-sized bucket counts, the reserved NULL and EMPTY entries (§14, §17),
+byte-sized bucket counts, the reserved NULL and key-less entries (§14, §17),
 multi-key operator classes (§17) and the reworked two-pass VACUUM (§11)
 existed. This directory is that test.
 
@@ -106,9 +106,9 @@ directions.
 ## What is covered
 
 The fixture is a table with one column per operator class kind — `int4`,
-`text`, `citext`, `bool`, a nullable `int4`, `int4[]` (with `NULL`, `'{}'` and
-all-`NULL`-element rows) and `tsvector` (with `NULL` and empty rows) — so both
-reserved key-less entries are populated. Three of the seven lion indexes
+`text`, `citext`, `bool`, a nullable `int4`, `int4[]` (with `NULL`, `'{}'`,
+empty arrays with dimensions and all-`NULL`-element rows) and `tsvector` (with
+`NULL` and empty rows) — so every reserved entry is populated. Three of the seven lion indexes
 are created on the empty table and filled by `aminsert`, so their entries go
 through INLINE→CHAIN spills, sparse-segment promotions and container-page
 splits under WAL; four are built by `ambuild` after the load.

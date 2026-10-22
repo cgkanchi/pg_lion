@@ -241,14 +241,17 @@ extern void lion_vis_cache_release_vm(LionVisCache *cache);
  * Each clause is `column op value`, the column on the left, of a strict
  * operator: a NULL column fails it, and so does a NULL result.  notnull makes
  * a clause the test `column IS NOT NULL` alone, which is all the heap-scan
- * fallback (lion_count_heap_filtered()) needs besides.  attno is the heap
- * column in the numbering of `heap`, the relation being counted - a
- * partition's own (DESIGN.md §16).
+ * fallback (lion_count_heap_filtered()) needs besides, and reserved, when it
+ * is not 0, the test that a non-NULL array is in none of the column's
+ * reserved entries it names (DESIGN.md §17, "Non-empty arrays"),
+ * lion_array_empty_flag()'s.  attno is the heap column in the numbering of
+ * `heap`, the relation being counted - a partition's own (DESIGN.md §16).
  */
 typedef struct LionRowFilterClause
 {
 	AttrNumber	attno;
 	bool		notnull;
+	uint16		reserved;		/* LION_ENTRY_EMPTYKEY and the like */
 	FmgrInfo	flinfo;			/* the operator's function */
 	Oid			collation;
 	Datum		value;
@@ -514,7 +517,7 @@ typedef struct LionCountSource
  * column's reserved entry (DESIGN.md §14, §24).  Returns false when the
  * column holds no NULLs.  lion_posting_set_lookup_reserved_col() locates any
  * reserved entry of the column, named by its flag: the NULL one, or a
- * multi-key column's EMPTY or NULLELEMS one (§17).
+ * multi-key column's EMPTY, EMPTYDIM, EMPTYINNER or NULLELEMS one (§17).
  *
  * Every lookup below names an INDEX COLUMN, 1-based, exactly as a ScanKey's
  * sk_attno and an IndexOptInfo's indexkeys[i] + 1 do.  The wrappers without
@@ -1557,8 +1560,8 @@ lion_entry_scan_begin(LionEntryScan *es, Relation index)
 /*
  * The same walk, returning only the entries a range selects (DESIGN.md §28):
  * it starts at the leaf the range's lower bound lives on and ends at the first
- * entry past an upper bound.  The reserved NULL and EMPTY entries never come
- * out of it.  range may be NULL, which is lion_entry_scan_begin_col().
+ * entry past an upper bound.  The reserved entries (§14, §17) never come out
+ * of it.  range may be NULL, which is lion_entry_scan_begin_col().
  */
 extern void lion_entry_scan_begin_range(LionEntryScan *es, Relation index,
 									   AttrNumber attno, LionRange *range);
@@ -1935,16 +1938,18 @@ extern bool lion_canonical_quals_sel(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * A predicate on one array column that is true of every row of each of the
- * three classes a lion array column's entries tell apart, or of none
+ * five classes a lion array column's entries tell apart, or of none
  * (DESIGN.md §17, "Non-empty arrays"): the column NULL, an array with no
- * element, and one with an element (lion_plan_nonempty.c).
+ * element in each of the three entries its dimensions put it in, and one
+ * with an element (lion_plan_nonempty.c).
  */
 typedef struct LionNonEmpty
 {
 	Var		   *var;			/* the column */
-	bool		isnull;			/* selects the rows whose column is NULL */
-	bool		isempty;		/* ... whose array has no element */
-	bool		nonempty;		/* ... whose array has one or more */
+	uint16		reserved;		/* the reserved entries whose rows it
+								 * selects: LION_ENTRY_NULLKEY and those of
+								 * LION_ENTRY_EMPTYKINDS */
+	bool		nonempty;		/* ... and whether the arrays with an element */
 } LionNonEmpty;
 
 extern bool lion_nonempty_test(Node *clause, LionNonEmpty *ne);

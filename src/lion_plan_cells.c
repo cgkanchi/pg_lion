@@ -864,8 +864,8 @@ cells_dim_index(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp)
 			/*
 			 * Null tests alone, of a column only a multi-key index covers:
 			 * its NULL entry holds the NULL rows as a scalar one's does
-			 * (DESIGN.md §17), and every other row is in its keys or its
-			 * EMPTY entry.
+			 * (DESIGN.md §17), and every other row is in its keys or one of
+			 * its keyless entries.
 			 */
 			dim->multi = true;
 		}

@@ -231,9 +231,10 @@ lion_make_entry(LionState *state, Datum key, uint16 flags,
 
 /*
  * Build a reserved entry tuple: the NULL-key one (DESIGN.md §14), or one of
- * the two a multi-key opclass needs for rows it extracts no key from - the
- * EMPTY entry, nothing extracted at all, and the NULLELEMS one, only NULL
- * keys (DESIGN.md §17).
+ * those a multi-key opclass needs for rows it extracts no key from - the
+ * EMPTY entry, nothing extracted at all; the EMPTYDIM and EMPTYINNER ones,
+ * nothing extracted from an array with dimensions; and the NULLELEMS one,
+ * only NULL keys (DESIGN.md §17).
  *
  * None has a key at all: keylen 0, hash 0, and the reservedflag bit, which
  * is how every reader recognises them.  The payload is an ordinary INLINE
@@ -248,9 +249,9 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 	Size		payoff;
 	Size		total;
 
-	Assert(reservedflag == LION_ENTRY_NULLKEY ||
-		   reservedflag == LION_ENTRY_EMPTYKEY ||
-		   reservedflag == LION_ENTRY_NULLELEMS);
+	Assert(reservedflag != 0 &&
+		   (reservedflag & ~LION_ENTRY_RESERVED) == 0 &&
+		   (reservedflag & (reservedflag - 1)) == 0);
 	Assert(attno >= 1);
 
 	flags |= reservedflag;
@@ -575,9 +576,8 @@ lion_find_entry(Relation index, LionState *state, int lockmode, Datum key,
 
 /*
  * Find a reserved entry (DESIGN.md §14 and §17).  They sort before every
- * real key of their column (LION_KIND_NULL, LION_KIND_EMPTY and
- * LION_KIND_NULLELEMS), and are reached by the same descent as anything
- * else.
+ * real key of their column (LION_KIND_NULL to LION_KIND_NULLELEMS), and are
+ * reached by the same descent as anything else.
  */
 bool
 lion_find_reserved_entry(Relation index, LionState *state, int lockmode,

@@ -1983,9 +1983,11 @@ lion_canonical_rel_list(PlannerInfo *root, RelOptInfo *rel, List *clauses,
 
 	canon = lion_canonical_clause_list(root, rel->relid, clauses, changed);
 	result = lion_nonempty_rel_clauses(rel, canon, &nechanged);
-	list_free(canon);
 	if (nechanged)
+	{
+		list_free(canon);
 		*changed = true;
+	}
 	return result;
 }
 

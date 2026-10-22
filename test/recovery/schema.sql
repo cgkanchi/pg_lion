@@ -22,9 +22,10 @@ CREATE EXTENSION IF NOT EXISTS pg_lion_citext;
 
 /*
  * One column per operator class kind that has to survive a crash: int4, text,
- * citext, bool, a nullable int, int4[] (with NULL, '{}' and all-NULL-element
- * rows, so both reserved entries of section 14 / section 17 are populated)
- * and tsvector (with NULL and empty rows, likewise).
+ * citext, bool, a nullable int, int4[] (with NULL, '{}', empty arrays with
+ * dimensions and all-NULL-element rows, so every reserved entry of section 14
+ * and section 17 is populated) and tsvector (with NULL and empty rows,
+ * likewise).
  */
 CREATE TABLE lion_rec (
 	id   bigint PRIMARY KEY,
@@ -57,7 +58,12 @@ LANGUAGE sql IMMUTABLE AS $$
 		   CASE WHEN i % 11 = 0 THEN NULL ELSE (i % 30)::int4 END,
 		   CASE WHEN i % 13 = 0 THEN NULL					   -- NULL entry
 				WHEN i % 13 = 1 THEN '{}'::int4[]			   -- EMPTY entry
-				WHEN i % 13 = 2 THEN ARRAY[NULL, NULL]::int4[] -- EMPTY entry
+				WHEN i % 13 = 2 THEN ARRAY[NULL, NULL]::int4[] -- NULLELEMS entry
+				WHEN i % 13 = 3						   -- EMPTYDIM entry
+					THEN ''::oidvector::oid[]::int4[]
+				WHEN i % 13 = 4						   -- EMPTYINNER entry
+					THEN ARRAY[''::oidvector::oid[]::int4[],
+							   ''::oidvector::oid[]::int4[]]
 				ELSE ARRAY[(i % 17)::int4, (i % 23)::int4,
 						   CASE WHEN i % 5 = 0 THEN NULL
 								ELSE (i % 7)::int4 END]
@@ -188,6 +194,13 @@ LANGUAGE sql IMMUTABLE AS $$
 		   ('select count(*) from lion_rec where arr @> array[3]'),
 		   ('select count(*) from lion_rec where arr && array[1,2]'),
 		   ('select count(*) from lion_rec where arr @> ''{}''::int4[]'),
+		   /* DESIGN.md §17, "Non-empty arrays": the key-less entries. */
+		   ('select count(*) from lion_rec where arr <> ''{}'''),
+		   ('select count(*) from lion_rec where arr = ''{}'''),
+		   ('select count(*) from lion_rec where cardinality(arr) = 0'),
+		   ('select count(*) from lion_rec where array_length(arr, 1) = 0'),
+		   ('select count(*) from lion_rec where array_length(arr, 1) > 0'),
+		   ('select count(*) from lion_rec where k4 = 5 and array_ndims(arr) is null'),
 		   ('select count(*) from lion_rec where tsv @@ ''w1''::tsquery'),
 		   ('select count(*) from lion_rec where tsv @@ ''w2 & w3''::tsquery'),
 		   ('select count(*) from lion_rec where tsv @@ ''w5 | w7''::tsquery'),
@@ -225,7 +238,7 @@ LANGUAGE sql IMMUTABLE AS $$
 	   '(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
 	   'from lion_rec) s)'),
 	  /* A multi-key opclass stores one TID per (key, row) pair, and one in
-	   * the reserved EMPTY entry for a row it extracted no key from. */
+	   * a reserved key-less entry for a row it extracted no key from. */
 	  ('lion_rec_arr',
 	   'select coalesce(sum(greatest(1, cardinality(u))), 0) from '
 	   '(select array(select distinct e from unnest(arr) x(e) where e is not null) u '
@@ -455,11 +468,12 @@ BEGIN
 	RETURN NEXT;
 
 	/*
-	 * 3. the reserved NULL, EMPTY and NULLELEMS entries (sections 14 and
-	 * 17).  Each is a key-less entry found by a flag, so a lost flag is
-	 * invisible to the ntids total above: count them separately.  EMPTY
-	 * holds the arrays with no element, NULLELEMS those whose elements are
-	 * all NULL.
+	 * 3. the reserved NULL, EMPTY, EMPTYDIM, EMPTYINNER and NULLELEMS
+	 * entries (sections 14 and 17).  Each is a key-less entry found by a
+	 * flag, so a lost flag is invisible to the ntids total above: count them
+	 * separately.  EMPTY holds the arrays with no element and no dimension,
+	 * EMPTYDIM those with an empty first dimension, EMPTYINNER those with
+	 * an empty inner one, NULLELEMS those whose elements are all NULL.
 	 */
 	FOR r IN
 		SELECT * FROM (VALUES
@@ -471,7 +485,16 @@ BEGIN
 			 'select count(*) from lion_rec where arr is null'),
 			('lion_rec_arr empty_tids',
 			 'select empty_tids from lion_index_stats(''lion_rec_arr'')',
-			 'select count(*) from lion_rec where cardinality(arr) = 0'),
+			 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			 'and array_ndims(arr) is null'),
+			('lion_rec_arr emptydim_tids',
+			 'select emptydim_tids from lion_index_stats(''lion_rec_arr'')',
+			 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			 'and array_length(arr, 1) = 0'),
+			('lion_rec_arr emptyinner_tids',
+			 'select emptyinner_tids from lion_index_stats(''lion_rec_arr'')',
+			 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			 'and array_length(arr, 1) > 0'),
 			('lion_rec_arr nullelem_tids',
 			 'select nullelem_tids from lion_index_stats(''lion_rec_arr'')',
 			 'select count(*) from lion_rec where cardinality(arr) > 0 and not exists '
@@ -522,9 +545,28 @@ BEGIN
 
 	EXECUTE 'select empty_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
 		INTO got;
-	EXECUTE 'select count(*) from lion_rec where cardinality(arr) = 0' INTO want;
+	EXECUTE 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			'and array_ndims(arr) is null' INTO want;
 	ok := (got >= want) AND (NOT exact_ntids OR got = want);
 	detail := format('lion_rec_mc column 4 (arr) empty_tids = %s, heap wants %s%s',
+					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
+
+	EXECUTE 'select emptydim_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
+		INTO got;
+	EXECUTE 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			'and array_length(arr, 1) = 0' INTO want;
+	ok := (got >= want) AND (NOT exact_ntids OR got = want);
+	detail := format('lion_rec_mc column 4 (arr) emptydim_tids = %s, heap wants %s%s',
+					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
+	RETURN NEXT;
+
+	EXECUTE 'select emptyinner_tids from lion_index_stats(''lion_rec_mc'') where attno = 4'
+		INTO got;
+	EXECUTE 'select count(*) from lion_rec where cardinality(arr) = 0 '
+			'and array_length(arr, 1) > 0' INTO want;
+	ok := (got >= want) AND (NOT exact_ntids OR got = want);
+	detail := format('lion_rec_mc column 4 (arr) emptyinner_tids = %s, heap wants %s%s',
 					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
 	RETURN NEXT;
 

@@ -705,6 +705,8 @@ lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
 			 errdetail("Key column %u of the tuple is %s.", state->attno,
 					   (reservedflag == LION_ENTRY_NULLKEY) ? "NULL" :
 					   (reservedflag == LION_ENTRY_EMPTYKEY) ? "absent" :
+					   (reservedflag == LION_ENTRY_EMPTYDIM) ? "absent, in an array with an empty first dimension" :
+					   (reservedflag == LION_ENTRY_EMPTYINNER) ? "absent, in an array with an empty inner dimension" :
 					   (reservedflag == LION_ENTRY_NULLELEMS) ? "only NULL elements" :
 					   OidOutputFunctionCall(vs->keyoutfunc, key))));
 }
@@ -743,7 +745,8 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 			/*
 			 * DESIGN.md §17: the row has to be present under EVERY key its
 			 * value extracts to, and in the reserved entry the extraction
-			 * names when it extracts to none - the EMPTY one, or the
+			 * names when it extracts to none - the EMPTY one, EMPTYDIM or
+			 * EMPTYINNER for an empty array with dimensions, or the
 			 * NULLELEMS one for keys that are all NULL.  Extracting here
 			 * rather than trusting the index is the whole point of the check:
 			 * it is the same call the build and the insert make, so a row

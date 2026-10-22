@@ -145,7 +145,7 @@ lion_range_bound_ok(LionRange *range, LionRangeBound *b, Datum key)
  * Does one entry of the range's column satisfy every bound?
  *
  * The reserved entries never do: a NULL key satisfies no comparison and the
- * EMPTY entry has no key at all.  In an ORDERED range the first entry that
+ * others (§17) have no key at all.  In an ORDERED range the first entry that
  * fails an UPPER bound ends the walk - every later entry sorts at or above it
  * (the order leads with proc 4 within a column and a kind, §21) and so fails
  * that bound too - while one that fails only a LOWER bound is skipped, and the

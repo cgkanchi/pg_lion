@@ -120,8 +120,28 @@
  */
 #define LION_ENTRY_NULLELEMS	0x0800
 
+/*
+ * The fourth and fifth (DESIGN.md §17): the arrays with no element that have
+ * dimensions all the same, which only an array extraction tells from the
+ * values of the EMPTY entry.  An array with no element has no dimension as
+ * PostgreSQL makes it almost everywhere, but an empty int2vector or
+ * oidvector has one of length 0, and keeps it through its cast to int2[] or
+ * oid[] and through array_cat(); ARRAY[] and array_agg() of such arrays have
+ * more.  EMPTYDIM holds those whose first dimension has length 0 - `[0:-1]`,
+ * array_length(a, 1) = 0 - and EMPTYINNER those whose first dimension has a
+ * length and an inner one none - `[1:2][0:-1]`, array_length(a, 1) = 2.
+ */
+#define LION_ENTRY_EMPTYDIM	0x1000
+#define LION_ENTRY_EMPTYINNER	0x2000
+
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY | \
+							 LION_ENTRY_EMPTYDIM | LION_ENTRY_EMPTYINNER | \
 							 LION_ENTRY_NULLELEMS)
+/* The reserved entries of the values under no key: every one but NULL's */
+#define LION_ENTRY_KEYLESS	(LION_ENTRY_RESERVED & ~LION_ENTRY_NULLKEY)
+/* ... and of the arrays with no element */
+#define LION_ENTRY_EMPTYKINDS	(LION_ENTRY_EMPTYKEY | LION_ENTRY_EMPTYDIM | \
+								 LION_ENTRY_EMPTYINNER)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
  * The flags that make an entry's KIND, which a pivot copied from it keeps -

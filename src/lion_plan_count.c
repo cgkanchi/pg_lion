@@ -1337,7 +1337,7 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 										 (int) leaf.var->varattno);
 			break;
 		case LION_CLAUSE_RESERVED:
-			/* the EMPTY entry alone: its rows are no NULLs (§17) */
+			/* the empty entries alone: none of their rows is NULL (§17) */
 			if ((DatumGetInt32(((Const *) leaf.val)->constvalue) &
 				 LION_ENTRY_NULLKEY) == 0)
 				cx->nonnullattnos = lappend_int(cx->nonnullattnos,
@@ -1347,11 +1347,12 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 
 			/*
 			 * Every row outside the reserved entries named (§17).  With the
-			 * NULL entry among them it is `col <> '{}'`, which the row filter
-			 * of a WHERE with nothing else to take its candidates from tests
-			 * on a heap column (lion_filter_with_negated()); without it NULLs
-			 * pass, and the filter tests nothing of the kind, as it tests
-			 * none of the new negated clauses of §35.
+			 * NULL entry among them NULLs fail it - `col <> '{}'`,
+			 * `cardinality(col) > 0` - and the row filter of a WHERE with
+			 * nothing else to take its candidates from tests it on a heap
+			 * column (lion_filter_with_negated()); without it NULLs pass,
+			 * and the filter tests nothing of the kind, as it tests none of
+			 * the new negated clauses of §35.
 			 */
 			if ((DatumGetInt32(((Const *) leaf.val)->constvalue) &
 				 LION_ENTRY_NULLKEY) != 0)

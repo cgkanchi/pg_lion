@@ -267,11 +267,14 @@ lion_hashpos_cmp(const void *a, const void *b, void *arg)
  * is palloc'd in the current context (NULL when there are none).  Zero means
  * the row belongs in a reserved entry, whose flag goes in *nokey when nokey
  * is not NULL (DESIGN.md §17, "The reserved EMPTY entry"): the EMPTY entry
- * when the function extracted nothing at all - an array with no elements, a
- * tsvector with no lexemes - and the NULLELEMS entry when every key it
- * extracted was NULL - an array of NULLs.  The two are told apart so that
- * the EMPTY entry holds exactly the values with no elements, which is what
- * `cardinality(a) = 0` and `array_length(a, 1) IS NULL` ask for.
+ * when the function extracted nothing at all - an array with no element and
+ * no dimension, a tsvector with no lexemes - or, for an array extraction's
+ * array with no element that has dimensions all the same, the EMPTYDIM or
+ * EMPTYINNER entry (lion_array_empty_flag()); and the NULLELEMS entry when
+ * every key it extracted was NULL - an array of NULLs.  They are told apart
+ * so that each reserved entry holds values that `cardinality(a) = 0`, `a =
+ * '{}'`, `array_length(a, 1) IS NULL` and the like are all true of or all
+ * false of.
  */
 static int lion_extract_internal(LionState *state, Datum value, Datum **keys,
 								 LionKeyPositions **pos, uint16 *nokey);
@@ -349,7 +352,23 @@ lion_extract_internal(LionState *state, Datum value, Datum **keys,
 	 */
 	/* coverity[dead_error_line] */
 	if (nraw <= 0 || raw == NULL)
+	{
+		/*
+		 * Nothing at all: an array with no element, whose dimensions say
+		 * which entry it is in, or a value of another kind with no key.
+		 * An array extraction returns every element, NULLs flagged, so its
+		 * nothing is an array with none.
+		 */
+		if (nokey != NULL &&
+			lion_extracts_array_elements(state->extractvalue.fn_addr))
+		{
+			*nokey = lion_array_empty_flag(value);
+			if (*nokey == 0)
+				elog(ERROR, "lion index: support function %d extracted no key from an array with elements",
+					 LION_EXTRACTVALUE_PROC);
+		}
 		return 0;
+	}
 
 	if (pos != NULL)
 	{
@@ -1708,6 +1727,51 @@ lion_array_hashes_type(Oid elemtype, Oid collation)
 
 PG_FUNCTION_INFO_V1(lion_array_extract_value);
 PG_FUNCTION_INFO_V1(lion_array_extract_query);
+
+/*
+ * Is fn, a multi-key class's support function 2, the extraction of an
+ * array's elements - every one, a NULL flagged as one - that lion's array_ops
+ * names (lion_array_extract_value()) or GIN's own (ginarrayextract())?  Such
+ * a class extracts nothing from exactly the arrays with no element, which it
+ * files in the EMPTY, EMPTYDIM and EMPTYINNER entries by their dimensions,
+ * and only NULL keys from exactly those whose elements are all NULL
+ * (DESIGN.md §17).  The function itself is compared, not its name.
+ */
+bool
+lion_extracts_array_elements(PGFunction fn)
+{
+	return fn == lion_array_extract_value || fn == ginarrayextract;
+}
+
+/*
+ * The reserved entry of value, an array, when it has no element (DESIGN.md
+ * §17, "The reserved EMPTY entry"), or 0 when it has one.  An array with no
+ * element has no dimension as PostgreSQL makes one nearly everywhere - '{}',
+ * construct_empty_array() - and is the EMPTY entry's, LION_ENTRY_EMPTYKEY.
+ * An empty int2vector or oidvector has one dimension of length 0 all the
+ * same, `[0:-1]`, which its cast to int2[] or oid[] keeps, as array_cat()
+ * of two of them does, and ARRAY[] or array_agg() of such arrays has more,
+ * `[1:2][0:-1]`.  The first, whose first dimension has length 0 -
+ * array_length(a, 1) = 0 - is the EMPTYDIM entry's; the second, whose first
+ * dimension has a length and an inner one none - array_length(a, 1) > 0 -
+ * the EMPTYINNER entry's.  Neither is equal to '{}', and array_length(),
+ * array_ndims(), array_lower() and array_upper() of either are not NULL.
+ */
+uint16
+lion_array_empty_flag(Datum value)
+{
+	AnyArrayType *arr = DatumGetAnyArrayP(value);
+	int			ndim = AARR_NDIM(arr);
+	const int  *dims = AARR_DIMS(arr);
+
+	if (ndim == 0)
+		return LION_ENTRY_EMPTYKEY;
+	if (ndim < 0 || ndim > MAXDIM)
+		elog(ERROR, "lion index: an array of %d dimensions", ndim);
+	if (ArrayGetNItems(ndim, dims) > 0)
+		return 0;
+	return (dims[0] == 0) ? LION_ENTRY_EMPTYDIM : LION_ENTRY_EMPTYINNER;
+}
 
 /*
  * lion_array_extract_value(anyarray, internal, internal) returns internal:

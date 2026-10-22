@@ -939,6 +939,8 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
 		d = heap_getattr(tuple, c->attno, desc, &isnull);
 		if (isnull)
 			pass = false;		/* a strict operator, or IS NOT NULL */
+		else if (c->reserved != 0)
+			pass = (lion_array_empty_flag(d) & c->reserved) == 0;
 		else if (!c->notnull)
 		{
 			LOCAL_FCINFO(fcinfo, 2);
@@ -1719,8 +1721,8 @@ lion_tree_is_flat_union(const LionKeyNode *node, int nsets)
  *	- a scalar opclass extracts exactly ONE key from a row's column value, so
  *	  the build and the insert path put that row's TID under exactly one entry:
  *	  the entry of its value, or the reserved NULL entry of DESIGN.md §14 when
- *	  the value is NULL, or (for a multi-key opclass only) the reserved EMPTY
- *	  entry of §17;
+ *	  the value is NULL, or (for a multi-key opclass only) one of the reserved
+ *	  entries of §17;
  *	- the reserved entries are therefore disjoint from every value entry as
  *	  well, and from each other;
  *	- so no TID is in two entries, and the union of any set of entries has

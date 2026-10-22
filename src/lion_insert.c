@@ -49,8 +49,8 @@
  * A NULL key is no different once its entry has been located: it lives in the
  * reserved NULL entry of bucket 0, which has no key bytes and is recognised
  * by LION_ENTRY_NULLKEY (DESIGN.md §14), and its payload is an ordinary
- * INLINE payload that spills to a chain like any other.  So is the reserved
- * EMPTY entry a multi-key opclass uses for rows it extracts no key from
+ * INLINE payload that spills to a chain like any other.  So are the reserved
+ * entries a multi-key opclass uses for rows it extracts no key from
  * (DESIGN.md §17); a row with several keys is simply several of these
  * inserts, one per key.
  *
@@ -1876,8 +1876,8 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 		 * A NULL value belongs to that column's reserved NULL entry, which is
 		 * found by its flag rather than by its (absent) key (DESIGN.md §14).
 		 * A multi-key opclass that extracts nothing from a non-NULL value
-		 * puts the row in the column's reserved EMPTY entry the same way
-		 * (DESIGN.md §17).
+		 * puts the row in the reserved entry the extraction names the same
+		 * way (DESIGN.md §17).
 		 */
 		if (isnull[c])
 			lion_insert_one(index, heapRel, state, (Datum) 0,
