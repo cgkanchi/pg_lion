@@ -2353,12 +2353,12 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	{
 		/*
 		 * A reserved entry (DESIGN.md §14 and §17): no key bytes, and one of
-		 * each per key column at most - a second one would
-		 * split its rows between two entries that no reader looks for twice.
+		 * each per key column at most - a second one would split its rows
+		 * between two entries that no reader looks for twice.
 		 */
-		int			kind = lion_reserved_kind(entry->flags & LION_ENTRY_RESERVED);
-		const char *what = lion_reserved_name(kind);
-		int64	   *seen = vs->nreservedentries[kind - LION_KIND_NULL];
+		int			rkind = lion_reserved_kind(entry->flags & LION_ENTRY_RESERVED);
+		const char *what = lion_reserved_name(rkind);
+		int64	   *seen = vs->nreservedentries[rkind - LION_KIND_NULL];
 
 		if (entry->keylen != 0)
 			lion_corrupt("lion index \"%s\": %s entry %u on block %u has a key of %u bytes",
@@ -2378,9 +2378,9 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		if (!LionEntryIsNullKey(entry) && !state->multikey)
 			lion_corrupt("lion index \"%s\": entry %u on block %u is %s %s entry, but the operator class of key column %u extracts no keys",
 						RelationGetRelationName(vs->index), off, blk,
-						kind == LION_KIND_EMPTY ? "an" : "a", what,
+						rkind == LION_KIND_EMPTY ? "an" : "a", what,
 						entry->attno);
-		if ((kind == LION_KIND_EMPTYDIM || kind == LION_KIND_EMPTYINNER) &&
+		if ((rkind == LION_KIND_EMPTYDIM || rkind == LION_KIND_EMPTYINNER) &&
 			!lion_extracts_array_elements(state->extractvalue.fn_addr))
 			lion_corrupt("lion index \"%s\": entry %u on block %u is an %s entry, but the operator class of key column %u does not extract an array's elements",
 						RelationGetRelationName(vs->index), off, blk, what,
