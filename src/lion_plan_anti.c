@@ -10,10 +10,11 @@
  *
  * is the count of t's WHERE less the rows of it some row of s matches.  The
  * node runs s as its child, looks each distinct key of its rows up in a
- * B-tree on t.k under the query's snapshot, tests every row found on the join
- * clauses and on t's restrictions, and subtracts the ones that pass.  Which
- * B-tree, and what that costs, is decided here; lion_plan_count.c plans the
- * count and adds the two up, and lion_exec_anti.c runs it.
+ * B-tree on t.k under the query's snapshot, tests every row found on t's
+ * restrictions and then on the join clauses, and subtracts the ones that
+ * pass.  Which B-tree, and what that costs, is decided here;
+ * lion_plan_count.c plans the count and adds the two up, and
+ * lion_exec_anti.c runs it.
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
