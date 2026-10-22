@@ -263,8 +263,10 @@ SET work_mem = '64kB';
 -- memory: 1,500 of fk's 2,000 values are 270,000 rows in no order, a union
 -- far past 64 kB, spilled in windows.  Beside a range the two share the
 -- memory; a plain count takes the first long list a batch at a time and
--- collects a second; the FK-side join collects a fact filter's list; the
--- list on the grouping column drives the groups and is held whole.
+-- collects a second; the FK-side join collects a fact filter's list; a list
+-- under an OR is collected as a range leaf is; and the list on the grouping
+-- column drives the groups, located a batch of values at a time as they are
+-- walked.
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
 	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
 SELECT lion_rss('SELECT count(DISTINCT g) FROM lion_rss_t
@@ -276,6 +278,8 @@ SELECT lion_rss('SELECT count(*) FROM lion_rss_t
 	  AND u = ANY (array(SELECT i * 3 FROM generate_series(1, 90000) i))');
 SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
 	WHERE f.u = ANY (array(SELECT i * 3 FROM generate_series(1, 90000) i)) GROUP BY d.attr');
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) OR a = 3 GROUP BY g');
 SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
 	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY fk');
 
@@ -289,6 +293,10 @@ SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON 
 	WHERE f.r < 524288 GROUP BY d.attr');
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
 	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) OR a = 3 GROUP BY g');
+SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY fk');
 RESET work_mem;
 RESET hash_mem_multiplier;
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g');

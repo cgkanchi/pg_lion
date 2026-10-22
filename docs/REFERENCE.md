@@ -537,6 +537,12 @@ within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by 
 one that does not fit what the others left sends those to temporary files first) and past it in
 windows into a temporary file (`Range Sources Spilled` in `EXPLAIN ANALYZE`), or, where there are
 few counts and the planner finds it cheaper, walked again at each (`Range Sources Walked`).
+An IN list longer than a batch - `work_mem` over 256 bytes a value, and never fewer than 1000
+values - is not held whole either: a count of the table as one row locates and counts it a batch at
+a time, the list that drives a `GROUP BY` on its own column is located a batch at a time as the
+groups are walked (both `List Batches` in `EXPLAIN ANALYZE`), and every other count - other groups,
+a `count(DISTINCT)`, a `FILTER`, an OR, a second long list - collects it as a range is, in the same
+memory and past it in windows (`Lists Collected`, and of those `Lists Spilled`, each list once).
 `wal_mode` (`auto` | `generic` | `rmgr`, default `auto`): which WAL resource manager this index is
 logged through (DESIGN.md §25).  Measured on a release build: the 8-client hot-key insert burst goes
 from 765 to 1275 tps (p95 14.8 to 9.9 ms, against btree's 1632 / 7.8), 10,000 inserts into the

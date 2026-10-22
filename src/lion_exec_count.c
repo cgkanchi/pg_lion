@@ -1207,7 +1207,8 @@ lion_source_collected(const LionCountSource *src)
  * Does an item of the run being counted select rows and carry the §9
  * interlock whatever its value: a clause of an equality, a list located as
  * its values' sets or `IS NULL`, or an OR none of whose leaves is a range
- * taken as a source (DESIGN.md §32) and none of whose arms is a complement?
+ * taken as a source (DESIGN.md §32) or a collected list and none of whose
+ * arms is a complement?
  * An OR with a complement arm selects nothing by itself (§35, "Complements in
  * an OR"): the rows outside M are every row but a few sets', which only a sum
  * over every row can hand the count.  A multi-key clause is not counted on:
@@ -1236,7 +1237,7 @@ lion_run_has_plain_source(LionCountScanState *st)
 			const LionOrState *o = &st->ors[it->orno];
 			int			j;
 
-			if (o->compl)
+			if (o->compl || o->listcollected)
 				continue;
 			for (j = 0; j < o->nleaves; j++)
 			{
@@ -2509,7 +2510,6 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 static TupleTableSlot *
 lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 {
-	LionCountSource *src = &st->sources[st->ingroupitem + 1];
 	LionClauseState *cl = &st->clause[st->item[st->ingroupitem].clauseno];
 	MemoryContext oldcxt;
 
@@ -2522,17 +2522,15 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 
 		CHECK_FOR_INTERRUPTS();
 
+		/* before the next batch, which releases the sets the key was in */
 		ExecClearTuple(st->css.ss.ss_ScanTupleSlot);
 
-		if (st->ingroupset >= src->nsets)
+		ps = lion_ingroup_next(st);
+		if (ps == NULL)
 		{
 			*exhausted = true;
 			return NULL;
 		}
-		ps = &src->sets[st->ingroupset++];
-		if (!ps->found)
-			continue;			/* a listed value with no entry: no group */
-		st->ingroupleft--;
 
 		Assert(ps->hasstoredkey && !ps->keyisnull);
 
@@ -2567,7 +2565,7 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		/* the WHERE is every other item: collected once, when that pays */
 		count = lion_group_count(st, st->ndsource, st->dsources,
 								 st->ndsource - 1, st->dsources[0].sets->ntids,
-								 st->ingroupleft > 0);
+								 lion_ingroup_more(st));
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
@@ -2814,18 +2812,12 @@ lion_distinct_relation(LionCountScanState *st)
 
 		if (listdrive)
 		{
-			LionCountSource *src = &st->sources[st->ingroupitem + 1];
-
-			if (st->ingroupset >= src->nsets)
+			/* the listed values with an entry, a batch at a time past one */
+			ps = lion_ingroup_next(st);
+			if (ps == NULL)
 			{
 				MemoryContextSwitchTo(oldcxt);
 				break;
-			}
-			ps = &src->sets[st->ingroupset++];
-			if (!ps->found)
-			{
-				MemoryContextSwitchTo(oldcxt);
-				continue;		/* a listed value with no entry */
 			}
 			sources[0].nsets = 1;
 			sources[0].sets = ps;

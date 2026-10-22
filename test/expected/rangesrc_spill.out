@@ -358,8 +358,10 @@ SET work_mem = '64kB';
 -- memory: 1,500 of fk's 2,000 values are 270,000 rows in no order, a union
 -- far past 64 kB, spilled in windows.  Beside a range the two share the
 -- memory; a plain count takes the first long list a batch at a time and
--- collects a second; the FK-side join collects a fact filter's list; the
--- list on the grouping column drives the groups and is held whole.
+-- collects a second; the FK-side join collects a fact filter's list; a list
+-- under an OR is collected as a range leaf is; and the list on the grouping
+-- column drives the groups, located a batch of values at a time as they are
+-- walked.
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
 	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY g');
                                                       lion_rss                                                      
@@ -394,6 +396,13 @@ SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON 
                                                                            lion_rss                                                                           
 --------------------------------------------------------------------------------------------------------------------------------------------------------------
  collected 0, walked 0, lists collected 1 (spilled 1), filters collected once, copies spilled 1: (0,8957) (1,9063) (2,8994) (3,9019) (4,8979) (5,8942) (6,906
+(1 row)
+
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) OR a = 3 GROUP BY g');
+                                                               lion_rss                                                                
+---------------------------------------------------------------------------------------------------------------------------------------
+ collected 0, walked 0, lists collected 1 (spilled 1), WHERE collected 1: (0,38913) (1,38912) (2,39127) (3,39012) (4,38950) (5,38974) 
 (1 row)
 
 SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
@@ -436,6 +445,20 @@ SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
                                                       lion_rss                                                      
 --------------------------------------------------------------------------------------------------------------------
  collected 0, walked 0, lists collected 1 (spilled 1): (0,34626) (1,38493) (2,38706) (3,38586) (4,38526) (5,38565) 
+(1 row)
+
+SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) OR a = 3 GROUP BY g');
+                                                               lion_rss                                                                
+---------------------------------------------------------------------------------------------------------------------------------------
+ collected 0, walked 0, lists collected 1 (spilled 1), WHERE collected 1: (0,35032) (1,38912) (2,39127) (3,39012) (4,38950) (5,38974) 
+(1 row)
+
+SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
+	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY fk');
+                                      lion_rss                                       
+-------------------------------------------------------------------------------------
+ collected 0, walked 0: (1,177) (10,208) (100,155) (1000,191) (1001,168) (1002,166) 
 (1 row)
 
 RESET work_mem;

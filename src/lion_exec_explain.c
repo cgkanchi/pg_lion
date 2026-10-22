@@ -1221,16 +1221,18 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 	/*
 	 * The IN lists too long to locate at once that were collected the same
 	 * way (DESIGN.md §15, "A list too long to locate at once"), and of those
-	 * the ones spilled.
+	 * the ones spilled: how many lists, each once however many partitions,
+	 * runs, rescans or participants collected it - the participants of a
+	 * parallel count collect the same lists, so the most any of them did.
 	 */
-	if (st->listsrc_collected + st->worker.listsrc_collected > 0)
+	if (Max(st->listsrc_collected, st->worker.listsrc_collected) > 0)
 		ExplainPropertyInteger("Lists Collected", NULL,
-							   st->listsrc_collected +
-							   st->worker.listsrc_collected, es);
-	if (st->listsrc_spilled + st->worker.listsrc_spilled > 0)
+							   Max(st->listsrc_collected,
+								   st->worker.listsrc_collected), es);
+	if (Max(st->listsrc_spilled, st->worker.listsrc_spilled) > 0)
 		ExplainPropertyInteger("Lists Spilled", NULL,
-							   st->listsrc_spilled +
-							   st->worker.listsrc_spilled, es);
+							   Max(st->listsrc_spilled,
+								   st->worker.listsrc_spilled), es);
 }
 
 /*
@@ -1311,12 +1313,18 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 
 	/*
 	 * The batches an IN list too long to locate at once was counted in
-	 * (DESIGN.md §15, "A list too long to locate at once").  Only when
-	 * there were any.
+	 * (DESIGN.md §15, "A list too long to locate at once"), or located in as
+	 * it drove the groups.  Only when there were any.
 	 */
-	if (st->lbatch != NULL && st->lbatch->batches + w->listbatches > 0)
-		ExplainPropertyInteger("List Batches", NULL,
-							   st->lbatch->batches + w->listbatches, es);
+	{
+		int64		batches = st->glistbatches + w->listbatches;
+
+		if (st->lbatch != NULL)
+			batches += st->lbatch->batches;
+
+		if (batches > 0)
+			ExplainPropertyInteger("List Batches", NULL, batches, es);
+	}
 
 	/*
 	 * The existence (or count) tests a count(DISTINCT k) made: one per
