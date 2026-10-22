@@ -60,10 +60,13 @@
  * the entry read again afterwards - and a set that replay keeps changing is
  * kept from its last walk without comparing its totals, never walked with
  * the leaf held; and heapallindexed lets the entry's leaf go before it
- * descends the set, on a primary too.  A position tree that disagrees with
- * its posting set there is reported only from a walk that read every page
- * as it was at one replay position, which the pages' LSNs show; one replay
- * keeps from that is kept without the comparison too.
+ * descends the set, on a primary too.  A posting set that disagrees with
+ * its entry, and a position tree that disagrees with its posting set, are
+ * reported there only from a walk that read every page as it was at one
+ * replay position, which the pages' LSNs show: replay applies VACUUM beside
+ * the check, which can leave an entry reading the same around a walk that
+ * read its set half before and half after.  One replay keeps from that is
+ * kept without the comparison too.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table

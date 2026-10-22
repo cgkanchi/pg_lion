@@ -2406,9 +2406,12 @@ phase2() {
 # mode) and answers the right number without blocking anything.  A standby
 # that catches up while the reader is parked, and a reader that then answers
 # anything else, is the bug.
+#
+# A fourth case, setaba, parks a standby's lion_index_verify() between two
+# leaves of a posting set instead (standby_verify_aba()).
 
 # PHASE3_CASES (environment, a development aid) runs a subset of the cases.
-want_case() { case " ${PHASE3_CASES:-split pushdown spill} " in *" $1 "*) return 0 ;; esac; return 1; }
+want_case() { case " ${PHASE3_CASES:-split pushdown spill setaba} " in *" $1 "*) return 0 ;; esac; return 1; }
 
 # standby_pin_case <label> <index> <key> <expected> <sql to run on the primary>
 standby_pin_case() {
@@ -2486,6 +2489,113 @@ standby_pin_case() {
 		log "   $label: parked reader answered $n (expected $expected), replay $state while it was parked"
 		SUMMARY+=("phase3 $label  standby reader $n = $expected, replay $state")
 	fi
+}
+
+# A standby's check of a posting set that replay changes under it, leaving
+# its entry as it was (DESIGN.md §7, "Posting sets on a standby").  Replay
+# applies VACUUM, which the primary's check locks out: a TID a VACUUM takes
+# out of the set's first leaf and another an INSERT puts into its last leave
+# the entry's header - ntids, containers, head and tail - as it was, and a
+# walk that read the first leaf before the one and the last after the other
+# counts a TID more than the entry says.  Agreeing with the entry is not
+# what such a walk must be judged by; it is walked again, and the walk that
+# read every page as it was at one replay position settles the set.
+#
+# k = 1 is every other row of 2020 wide ones, heap blocks 0..134: one CHAIN
+# set of three containers, which posting_fillfactor 10 spreads over two
+# leaves; the other rows have a key each, INLINE.  Row 1, in heap block 0
+# and the first leaf, is deleted before the standby's check
+# takes its snapshot - so that removing it is no recovery conflict - and not
+# vacuumed.  The check parks after the set's first leaf
+# ('lion-verify-set-leaf-read'); the primary inserts a row of k = 1, which
+# the free space map puts on the last heap page and the set into its last
+# container, on the second leaf, and a VACUUM takes row 1 out; the standby
+# replays both, and the check goes on.  It must pass, its first walk thrown
+# away.
+standby_verify_aba() {
+	local out=$BASE/setaba.out err=$BASE/setaba.err rpid rc=0 before after plsn i n state=""
+	log ""
+	log "-- standby: a posting set changed under a check, its entry as it was"
+
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "standby_verify_aba: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS vfy_aba;
+		CREATE TABLE vfy_aba (id int, k int NOT NULL, pad char(480) NOT NULL DEFAULT '')
+		  WITH (autovacuum_enabled = off);
+		INSERT INTO vfy_aba (id, k)
+		SELECT i, CASE WHEN i % 2 = 1 THEN 1 ELSE 2 + i END FROM generate_series(1, 2020) i;
+		CREATE INDEX vfy_aba_k ON vfy_aba USING lion (k)
+		  WITH (inline_limit = 64, posting_fillfactor = 10);
+		VACUUM (FREEZE) vfy_aba;
+		DELETE FROM vfy_aba WHERE id = 1;
+	SQL
+	[ "$(psql_p -tAc "select container_pages from lion_index_stats('vfy_aba_k')")" = 2 ] ||
+		die "standby_verify_aba: the set does not have two leaves"
+	before=$(psql_p -tAc "select ntids || ' TIDs, ' || containers || ' containers, ' || container_pages || ' leaves' from lion_index_stats('vfy_aba_k')")
+	wait_catchup
+
+	"$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$STANDBY_PORT" \
+		-U postgres -d "$DBNAME" >"$out" 2>"$err" <<-SQL &
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('lion-verify-set-leaf-read', 'wait');
+		SET client_min_messages = debug1;
+		SELECT 'verified ' || (lion_index_verify('vfy_aba_k'::regclass) IS NOT NULL);
+	SQL
+	rpid=$!
+	RRPID=$rpid
+	wait_true psql_s \
+		"select count(*) > 0 from pg_stat_activity where wait_event = 'lion-verify-set-leaf-read'" \
+		30 "standby_verify_aba: the standby's check to park after the set's first leaf"
+
+	# The VACUUM is retried until it has removed row 1: with
+	# hot_standby_feedback on, the primary's horizon is the standby's last
+	# report, which can predate the delete (standby_build_replay does the
+	# same).
+	psql_p -c "SET synchronous_commit = on; INSERT INTO vfy_aba (id, k) VALUES (100000, 1)" \
+		>>"$RUNLOG" 2>&1 || die "standby_verify_aba: the insert failed"
+	for i in $(seq 1 60); do
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) vfy_aba" >>"$RUNLOG" 2>&1 ||
+			die "standby_verify_aba: VACUUM failed"
+		after=$(psql_p -tAc "select ntids || ' TIDs, ' || containers || ' containers, ' || container_pages || ' leaves' from lion_index_stats('vfy_aba_k')")
+		[ "$after" = "$before" ] && break
+		nap 0.5
+	done
+	[ "$after" = "$before" ] ||
+		die "standby_verify_aba: the set's entry did not come back as it was ($before, then $after)"
+	psql_p -c "SET synchronous_commit = on; SELECT pg_current_xact_id()" >>"$RUNLOG" 2>&1
+
+	plsn=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	for i in $(seq 1 300); do
+		if [ "$(psql_s -tAc "select pg_last_wal_replay_lsn() >= '$plsn'::pg_lsn")" = t ]; then
+			state=caughtup
+			break
+		fi
+		nap 0.1
+	done
+	if [ -z "$state" ]; then
+		psql_s -c "select backend_type, state, wait_event_type, wait_event, left(query, 60) from pg_stat_activity" >&2 || true
+		die "standby_verify_aba: replay did not catch up within 30s while the check was parked"
+	fi
+
+	psql_s -tAc "select injection_points_detach('lion-verify-set-leaf-read')" >/dev/null 2>&1 || true
+	for i in $(seq 1 100); do
+		n=$(psql_s -tAc "select count(*) from pg_stat_activity where wait_event = 'lion-verify-set-leaf-read'")
+		[ "$n" = 0 ] && break
+		psql_s -tAc "select injection_points_wakeup('lion-verify-set-leaf-read')" >/dev/null 2>&1 || true
+		nap 0.1
+	done
+	wait "$rpid" || rc=$?
+	RRPID=""
+	{ echo "---- standby_verify_aba (exit $rc)"; cat "$out" "$err"; } >>"$RUNLOG"
+	[ "$rc" = 0 ] && grep -q '^verified true$' "$out" ||
+		die "BUG: standby_verify_aba: the standby's check reported damage replay left it: $(grep -v '^DEBUG' "$err" | tail -3)"
+	grep -q '2 posting-set walks, 1 thrown away, 0 with the leaf held, 0 kept uncompared' "$err" ||
+		die "standby_verify_aba: the check did not walk the set again: $(grep 'posting-set walks' "$err")"
+
+	psql_p -c "DROP TABLE vfy_aba" >>"$RUNLOG" 2>&1
+	wait_catchup
+	log "   setaba: a set replay changed under the check, its entry as it was ($after), walked again and passed"
+	SUMMARY+=("phase3 setaba  a standby's check walked a set again that replay changed, its entry unchanged")
 }
 
 phase3() {
@@ -2602,6 +2712,8 @@ phase3() {
 		[ "$(psql_p -tAc "select inline_entries from lion_index_stats('pin_spill_k')")" = 0 ] ||
 			die "phase 3: the spill case did not spill"
 	fi
+
+	want_case setaba && standby_verify_aba
 
 	run_check "phase 3 standby" psql_s "
 		select lion_index_verify(i::regclass, true) is not null, 'verify ' || i
