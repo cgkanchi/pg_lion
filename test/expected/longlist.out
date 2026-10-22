@@ -37,13 +37,14 @@ VACUUM ANALYZE lion_llp;
 /*
  * lion_llcmp() runs q with the pushdown (every other scan disabled) and with
  * a sequential scan, compares the answers as multisets, and says whether the
- * node took the list a batch at a time, collected it or held it whole.
- * enable_indexscan disables the node as well (REFERENCE.md, "Settings"), so
- * sorting and hashing are disabled too: a grouped plain plan then carries one
- * disable more than the node.  Before PostgreSQL 18 a disable is disable_cost
- * on the price, and add_path() takes two prices that both hold it once as
- * equal, which a plain plan's sorted output would win.  The sequential scan
- * runs serially, whatever max_parallel_workers_per_gather says.
+ * node took the list a batch at a time, collected it or held it whole.  The
+ * plain scans of Lion indexes are disabled by pg_lion.enable_plain_scan, not
+ * enable_indexscan, which would disable the node too (REFERENCE.md,
+ * "Settings"): before PostgreSQL 18 a disable is disable_cost on the price,
+ * add_path() takes two prices that both hold it as equal within its fuzz, and
+ * which plan wins is then up to its tie-breaks - sorted output, parallel
+ * safety, rows - not the price.  The sequential scan runs serially, whatever
+ * max_parallel_workers_per_gather says.
  */
 CREATE FUNCTION lion_llcmp(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -58,9 +59,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	PERFORM set_config('enable_sort', 'off', true);
-	PERFORM set_config('enable_hashagg', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF l ~ 'Custom Scan \(LionCount\)' THEN
 			pushed := true;
@@ -79,12 +78,10 @@ BEGIN
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
-	PERFORM set_config('enable_sort', 'on', true);
-	PERFORM set_config('enable_hashagg', 'on', true);
 	EXECUTE 'SELECT array_agg(r ORDER BY r)::text FROM (' || q || ') r' INTO b;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	IF a IS DISTINCT FROM b THEN
 		RETURN format('MISMATCH: %s against %s', left(a, 120), left(b, 120));
 	END IF;
@@ -248,29 +245,34 @@ SELECT lion_llcmp('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM ge
 
 -- ... where the heap is all-visible the walk lets the map answer for every
 -- row of it, and none is rechecked in the heap
-CREATE FUNCTION lion_llrechecked(q text) RETURNS bigint
+CREATE FUNCTION lion_llrechecked(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	l text;
+	pushed boolean := false;
 	n bigint := 0;
 BEGIN
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	FOR l IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF l ~ 'Custom Scan \(LionCount\)' THEN
+			pushed := true;
+		END IF;
 		IF l ~ 'Heap TIDs Rechecked: ' THEN
 			n := n + substring(l from 'Heap TIDs Rechecked: ([0-9]+)')::bigint;
 		END IF;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
-	RETURN n;
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	RETURN CASE WHEN pushed THEN format('pushed down, %s rows rechecked', n)
+				ELSE 'not pushed down' END;
 END $$;
 SELECT lion_llrechecked('SELECT count(*) FILTER (WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))) FROM lion_ll');
- lion_llrechecked 
-------------------
-                0
+       lion_llrechecked        
+-------------------------------
+ pushed down, 0 rows rechecked
 (1 row)
 
 SELECT lion_llcmp($$SELECT count(*) FILTER (WHERE k = ANY (array(SELECT (g * 7) % 7000 FROM generate_series(0, 5999) g))), count(*) FILTER (WHERE x = 1), count(*) FILTER (WHERE t = ANY (array(SELECT 'v' || g FROM generate_series(0, 3999) g))), count(*) FROM lion_ll$$);
@@ -358,11 +360,12 @@ RESET pg_lion.parallel_range_keys;
 SET max_parallel_workers_per_gather = 0;
 /*
  * A generic plan, the list its parameter: the planner knows nothing of its
- * length, and the run collects it.  lion_llexec() runs the prepared statement
- * with the array arr as the pushdown answers it and with a sequential scan,
- * as lion_llcmp() does a query.
+ * length, and the run collects it.  lion_llexec() prepares q, its $1 an int[],
+ * runs the generic plan with the array arr as the pushdown answers it, and
+ * compares that with q run with arr by a sequential scan - q itself, not the
+ * prepared statement, whose cached plan no setting changes.
  */
-CREATE FUNCTION lion_llexec(stmt text, arr int[]) RETURNS text
+CREATE FUNCTION lion_llexec(q text, arr int[]) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	l text;
@@ -371,10 +374,12 @@ DECLARE
 	a text;
 	b text;
 BEGIN
+	PERFORM set_config('plan_cache_mode', 'force_generic_plan', true);
 	PERFORM set_config('enable_seqscan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
-	PERFORM set_config('enable_indexscan', 'off', true);
-	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) EXECUTE %s(%L)', stmt, arr) LOOP
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	EXECUTE 'PREPARE lion_llq(int[]) AS ' || q;
+	FOR l IN EXECUTE format('EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) EXECUTE lion_llq(%L)', arr) LOOP
 		IF l ~ 'Custom Scan \(LionCount\)' THEN
 			pushed := true;
 		END IF;
@@ -382,13 +387,15 @@ BEGIN
 			lists := lists + substring(l from 'Lists Collected: ([0-9]+)')::bigint;
 		END IF;
 	END LOOP;
-	EXECUTE format('EXECUTE %s(%L)', stmt, arr) INTO a;
+	EXECUTE format('EXECUTE lion_llq(%L)', arr) INTO a;
+	EXECUTE 'DEALLOCATE lion_llq';
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	PERFORM set_config('enable_seqscan', 'on', true);
-	EXECUTE format('EXECUTE %s(%L)', stmt, arr) INTO b;
+	EXECUTE q INTO b USING arr;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('plan_cache_mode', 'auto', true);
 	IF a IS DISTINCT FROM b THEN
 		RETURN format('MISMATCH: %s against %s', a, b);
 	END IF;
@@ -396,30 +403,28 @@ BEGIN
 				WHEN lists > 0 THEN 'pushed down, collected'
 				ELSE 'pushed down, whole' END || ', same answer: ' || a;
 END $$;
-SET plan_cache_mode = force_generic_plan;
-PREPARE lion_llq(int[]) AS
-	SELECT row(count(*) FILTER (WHERE k = ANY ($1)), count(*) FILTER (WHERE x = 1))::text FROM lion_ll;
-SELECT lion_llexec('lion_llq', array(SELECT g FROM generate_series(0, 2999) g));
+SELECT lion_llexec('SELECT row(count(*) FILTER (WHERE k = ANY ($1)), count(*) FILTER (WHERE x = 1))::text FROM lion_ll',
+				   array(SELECT g FROM generate_series(0, 2999) g));
                     lion_llexec                     
 ----------------------------------------------------
  pushed down, collected, same answer: (34104,18944)
 (1 row)
 
-SELECT lion_llexec('lion_llq', array(SELECT g * 3 FROM generate_series(0, 1999) g));
+SELECT lion_llexec('SELECT row(count(*) FILTER (WHERE k = ANY ($1)), count(*) FILTER (WHERE x = 1))::text FROM lion_ll',
+				   array(SELECT g * 3 FROM generate_series(0, 1999) g));
                     lion_llexec                     
 ----------------------------------------------------
  pushed down, collected, same answer: (18948,18944)
 (1 row)
 
 -- ... and one batch: located whole
-SELECT lion_llexec('lion_llq', array(SELECT g FROM generate_series(0, 999) g));
+SELECT lion_llexec('SELECT row(count(*) FILTER (WHERE k = ANY ($1)), count(*) FILTER (WHERE x = 1))::text FROM lion_ll',
+				   array(SELECT g FROM generate_series(0, 999) g));
                   lion_llexec                   
 ------------------------------------------------
  pushed down, whole, same answer: (11364,18944)
 (1 row)
 
-DEALLOCATE lion_llq;
-RESET plan_cache_mode;
 -- with the default work_mem the same list is one batch: located whole
 RESET work_mem;
 SELECT lion_llcmp('SELECT count(*) FROM lion_ll WHERE k = ANY (array(SELECT g FROM generate_series(0, 2999) g))');
