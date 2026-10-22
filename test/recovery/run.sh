@@ -97,9 +97,9 @@
 #
 #   Phase 4  lion_index_verify() in a loop on a hot standby while the primary
 #            inserts into the posting sets it walks, with a watchdog that fails
-#            the phase once replay stops moving: verify() used to hold a
+#            the phase once replay stops moving: a verify() that held a
 #            directory leaf while it locked posting pages, which replay locks
-#            the other way round, and the two deadlocked for good.
+#            the other way round, would deadlock with replay for good.
 #
 #   Phase 5  lionvec's locator of vectors in TOAST (DESIGN.md §44.13): crash
 #            rounds under a write load of its own, an insert cut between its
@@ -866,8 +866,8 @@ phase1b() {
 	# held no DELETED page before, so every one it holds now is one this
 	# VACUUM freed - the leaked pages its sweep found and k = 4's chain - and
 	# none of them is reusable yet; the other free pages, if a split left any,
-	# are all-zero and reusable.  A page freed with its chain used to be
-	# counted a second time by the sweep, and every free page as reusable.
+	# are all-zero and reusable.  A page freed with its chain is counted once,
+	# not again by the sweep, and a page freed now is not reusable.
 	[ "$NEWLY" = "$freed" ] ||
 		die "phase 1b: VACUUM reported $NEWLY pages newly deleted, the index holds $freed DELETED pages"
 	[ "$((CURRENT - NEWLY))" = "$REUSABLE" ] ||
@@ -1007,8 +1007,8 @@ phase1c() {
 # A crash that lands exactly between the two records of a POSTING-TREE LEAF
 # SPLIT (DESIGN.md §22): the leaf has been split and flagged
 # LION_PAGE_INCOMPLETE_SPLIT, its right sibling exists and is linked in, but
-# the parent has no downlink for it yet, and the server dies.  Readers never
-# noticed (the right link gets them there, and a sequential walk of the leaves
+# the parent has no downlink for it yet, and the server dies.  Readers do not
+# notice (the right link gets them there, and a sequential walk of the leaves
 # is all they do), and the next writer finishes the split: an APPEND - the
 # split was of the set's last leaf, so its right half is the entry's tail -
 # and, after it, inserts that descend into every leaf's range.
@@ -1100,16 +1100,13 @@ phase1d() {
 				(select count(*) from lion_psplit where id % 2 = 1),
 				'k = 1 still answers exactly'"
 
-	# An APPEND, which is what an append-only table does next, and until
-	# 2026-09-25 the one writer that could not repair this: it took the set's
-	# last leaf through the append hint - the right half of the unfinished
-	# split, which has no downlink - and the first split of THAT page failed
-	# with "no downlink for block N", as did every later split of the tail
-	# (DESIGN.md §22 addendum, "an unfinished split and the writers that do not
-	# descend").  An insert that may split the page descends now, the descent
-	# routes to the flagged left half and finishes it on the way, and this
-	# phase used to route around the bug by inserting only into the middle of
-	# the heap (below).
+	# An APPEND, which is what an append-only table does next.  The append
+	# hint names the set's last leaf - the right half of the unfinished split,
+	# which has no downlink - and a split of THAT page would find no downlink
+	# for it, nor would any later split of the tail (DESIGN.md §22 addendum,
+	# "an unfinished split and the writers that do not descend").  An insert
+	# that may split the page descends instead: the descent routes to the
+	# flagged left half and finishes it on the way.
 	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "phase 1d: appending after the crash failed"
 		SET synchronous_commit = on;
 		INSERT INTO lion_psplit SELECT 200000 + i, i % 2
@@ -1184,8 +1181,8 @@ phase1d() {
 #    it had, the dead ones included: nothing is lost and nothing is half-CHAIN;
 #  * lion_index_verify() calls the leaves a leak (a WARNING), not corruption;
 #  * the next VACUUM spills the set properly, and its sweep frees the orphan
-#    leaves, which are FULL - the sweep used to free only empty unreferenced
-#    leaves, so these stayed leaked for good.  Its VERBOSE page counts
+#    leaves, which are FULL: it frees an unreferenced leaf whose root is not a
+#    live root of its key whatever it holds.  Its VERBOSE page counts
 #    (DESIGN.md §18, "Page counts") are checked here, where a shell can read
 #    them: the three orphans and the head their spill logged before them (with
 #    no downlink) newly deleted, and never counted twice;
@@ -1329,11 +1326,11 @@ phase1e() {
 # lion_wal_begin()").  The index is built while the library is preloaded,
 # and the server is then restarted without it.  A VACUUM that removes nothing
 # from the index - a partial index none of whose rows died - walks it all the
-# same, and used to hand every page it visited to the standby barrier, which
-# past pg_lion.vacuum_barrier_ranges it wrote out on its own under rmid 128: a
-# manager this server does not have, so crash recovery stopped with a FATAL
-# at the first of those records.  Now nothing of the kind may be in the WAL,
-# and the crash after it must recover.
+# same, and must write nothing under rmid 128, a manager this server does not
+# have: not even the standby barrier of the pages it visited, which past
+# pg_lion.vacuum_barrier_ranges goes out in records of its own.  Crash
+# recovery would stop with a FATAL at the first such record, so nothing of
+# the kind may be in the WAL, and the crash after it must recover.
 #
 # Both modes run it: generic mode preloads the library for the build, rmgr
 # mode drops the preload (and wal_consistency_checking, which names the
@@ -1341,8 +1338,8 @@ phase1e() {
 #
 # An UNLOGGED rmgr-mode index rides along: it writes no WAL at all, so the
 # server without the manager must let it be written - inserted into and
-# vacuumed - where it used to refuse every write with the preload hint
-# (lion_wal_begin(), 2026-09-27 review).  A LOGGED rmgr-mode index built with
+# vacuumed - and not refuse the write with the preload hint
+# (lion_wal_begin()).  A LOGGED rmgr-mode index built with
 # wal_mode = auto must still refuse an insert, and a VACUUM with dead rows to
 # remove from it, with a hint naming both the preload and a REINDEX in
 # generic mode - and that REINDEX must make it writable again.
@@ -2076,8 +2073,8 @@ standby_chain_reuse() {
 # Index-only scans on the standby (DESIGN.md §9 "Hot standby", §29.9).  An
 # index-only scan trusts the visibility map for every TID it returns, which a
 # standby may only do where replay waits for the pin the scan keeps: rmgr
-# mode.  In generic mode liongettuple() looks every TID up in the heap first
-# (it used to return the dead rows instead, 2026-09-27 review).  Either way
+# mode.  In generic mode liongettuple() looks every TID up in the heap first,
+# or it could return rows replay has made dead.  Either way
 # the standby's index-only scan must answer what its sequential scan answers,
 # before and after the primary deletes rows and vacuums them away.  lion plans
 # an index-only scan only for a query that needs no column, which a partial
@@ -2547,13 +2544,15 @@ phase3() {
 # record, and every record that changes a posting set registers the set's
 # pages BEFORE the entry's directory leaf - an insert's, a split's, a
 # push-down's, VACUUM's - so replay locks container page, then leaf: the
-# reverse of the primary's order.  verify() used to walk a set on a standby
-# with that leaf held SHARE, and its heapallindexed lookups descended a set
-# with it held, on a primary too: leaf, then container page.  The startup process and the
-# backend then waited for each other on buffer content locks, which have no
-# deadlock detector and ignore cancel and terminate; replay stopped for good,
-# `pg_ctl stop -m fast` hung, and only an immediate shutdown got the standby
-# back.
+# reverse of the primary's order.  A verify() that walked a set with that
+# leaf held SHARE, or whose heapallindexed lookups descended a set with it
+# held, would lock leaf, then container page, and the startup process and the
+# backend would wait for each other on buffer content locks, which have no
+# deadlock detector and ignore cancel and terminate: replay would stop for
+# good, `pg_ctl stop -m fast` would hang, and only an immediate shutdown would
+# get the standby back.  So on a standby verify() walks a set with nothing
+# held, and its lookups let the entry's leaf go before they descend the set
+# (DESIGN.md §7).
 #
 # So: inserts into three hot keys on the primary, and verify() in two loops on
 # the standby - structural, and with heapallindexed - for PHASE4_SECS

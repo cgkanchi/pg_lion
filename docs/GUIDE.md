@@ -138,7 +138,7 @@ phrase). On five million rows `count(*) WHERE n IS DISTINCT FROM 17` took 1.6 ms
 the sequential scan.
 
 A `WHERE` clause no Lion index answers - `payload LIKE 'ab%'`, `id > 1000` on a column without
-one, `length(name) = 3` - no longer sends the count to the ordinary plan when the other clauses do
+one, `length(name) = 3` - does not send the count to the ordinary plan when the other clauses do
 select rows: the node counts those rows and tests the clause on each of them in the heap
 (`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
 heap scan over the same rows, so it is taken when the other clauses select at most half the table,
@@ -626,7 +626,7 @@ vectors keeps where each one's chunks lie (DESIGN.md §44.13) and reads them the
 checked, through a read stream for an exact answer (`pg_lion.vector_toast_direct`, on by default;
 the answer is the same either way): on DBpedia's embeddings in TOAST a 1% filter answered exactly
 took 68 ms cold, where reading each vector through its table page and the TOAST index took
-180. An index built before 2026-10-17 knows no places until a `REINDEX`. The vectors can also
+180. The vectors can also
 be kept in the table, which an exact answer reads ahead through its rows' pages:
 
 ```sql

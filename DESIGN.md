@@ -600,9 +600,10 @@ append-only or read-mostly index does not pay for room it never uses.
 Page allocation: `lion_alloc_page()` takes a page - a recycled one from the free space map when one
 is safe to take, else a fresh block from ExtendBufferedRel - and `lion_wal_init_buffer()`
 initialises it and registers it in the caller's record, so a crash cannot leave an initialised page
-that nothing links to; `lion_new_buffer()` is the same in a record of its own. The two are separate
-calls since §25: taking the page is the fallible half and has to happen before the record opens,
-because an rmgr-mode record is written inside a critical section. The recycling rule, what `heaprel` is for and
+that nothing links to; a page that nothing links to yet - the root of a set a spill makes, a new
+position tree - is initialised in a PAGE_INIT record of its own. The two are separate calls since
+§25: taking the page is the fallible half and has to happen before the record opens, because an
+rmgr-mode record is written inside a critical section. The recycling rule, what `heaprel` is for and
 why a chain's head page never comes from the map are in §18. verify() reports DELETED pages as the
 ordinary free pages they are, unreferenced never-initialised or empty pages as WARNINGs (the next
 VACUUM's sweep turns them into free pages) and anything else as an ERROR - on a primary only once the
@@ -2306,9 +2307,9 @@ Planner integration
     (`lion_index_column_posting_share()`). Split by entries, the three values of a status column
     beside a 2,000-value column got 0.14% of a 110 MB index's pages where they hold a tenth of it,
     and `status = 'val2'` - a million rows at every container key - was priced at 16 for 1 ms.
-    Since 2026-10-20 a dense set is weighed as the NARROW the index writes, a set's pages are its
-    share of its column's by the same bytes, and a walk's are the column's share of the directory
-    by entries and of the container pages by bytes - "Dense sources" below.)*
+    A dense set is weighed as the NARROW the index writes, a set's pages are its share of its
+    column's by the same bytes, and a walk's are the column's share of the directory by entries
+    and of the container pages by bytes - "Dense sources" below.)*
   - **the merge's CPU** (`lion_merge_cpu_cost()`, "The units" below, since 2026-09-27): each
     container the driving source reads and counts, `LION_CONTAINER_COST` and `LION_MEMBER_COST` a
     member up to a bitset's worth; each probe of another source at the driver's container keys,
@@ -3224,8 +3225,7 @@ ARRAY sets ANDed with dense ones - the whole index of §45.6, 4M rows of 157 a b
 | `c2 < 20 AND f1 AND f2 = 'a' AND f3 = 'n'` (a summed range) | 3,443; 4.61; 746 | 3,229; 4.74; 682 |
 
 **Not done.** A GROUP BY's own work is priced below its time: the GROUP BYs with dense filters
-above at 210 to 280 units a millisecond, and the same over the index grown by inserts at 260 to
-300 (110 with a single filter), as they were before. The WHERE collected for the groups ("The
+above at 210 to 280 units a millisecond. The WHERE collected for the groups ("The
 WHERE sets, collected once") costs about twice its count, the first group is counted by the merge
 that collects it, and each group after it takes 450 to 550 ns a key against the 70 it is priced
 at: the batch's own work - a step, the copy's image narrowed to the group's width, the block mask
@@ -3973,10 +3973,9 @@ the new child EXCLUSIVE from its allocation until the filtered container is on i
 (`lion_posting_root_pushdown()` returns it locked): the push-down has just copied the UNFILTERED
 container there, and a reader that could lock the child in between would copy the dead TIDs, keep
 its pin, and have the write that follows - which takes no cleanup lock - remove them under it.
-(Found while auditing every record VACUUM writes through shared placement code;
-`test/isolation/vacuum_regrow_pushdown.spec` parks the regrow between the push-down and the write
-and sends a count's descent at the child: with the child unlocked there it answered 5,307 for
-4,341, with it held the descent waits for the child and answers 4,341.)
+(`test/isolation/vacuum_regrow_pushdown.spec` parks the regrow between the push-down and the write
+and sends a count's descent at the child: with the child unlocked there it would answer 72,160 for
+64,928; with it held the descent waits for the child and answers 64,928.)
 
 Page recycling (§18) does not weaken either property. A recycled block is still linked immediately
 right of its split origin, so it is still visited after it. A page only ever LEAVES the leaf list as
@@ -6994,8 +6993,8 @@ it is, with a WARNING.)*
 **The free space map holds only pages that may be handed out**, nbtree's rule since PostgreSQL
 14: a page out of the index's trees - LION_PAGE_DELETED, or an UNLINKED posting leaf (§22, "Empty
 leaves") - is recorded in it once GlobalVisCheckRemovableFullXid(heaprel, safexid) is true (no scan
-that could still hold a link to it is running), and not before.  `lion_new_buffer()`/`lion_alloc_page()`
-(§25 split the second out of `lion_new_buffer_xl()`) then take what the map offers, as
+that could still hold a link to it is running), and not before.  `lion_alloc_page()` then takes
+what the map offers, as
 `_bt_allocbuf()` does: GetFreeIndexPage() takes a block off the map, the page is locked with
 ConditionalLockBuffer and taken if it is all-zero or passes the same test, and otherwise the next
 block is asked for, until the map has none left and the relation is extended.  A block refused is
@@ -7033,63 +7032,62 @@ index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_n
 rule, recording the ones that are reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
 those and nothing else.  Every page ambulkdelete's walk and its sweep read goes through VACUUM's
 ring of buffers (`info->strategy`, `lion_vac_read()`; `vacuum_buffer_usage_limit`), as nbtree's
-do, so a VACUUM leaves no more of the index in shared buffers than the ring holds.  It checks for
-interrupts at every block, with nothing locked, and each
-page it reads passes the cost-based delay first, as every page the walk reads does (since the
-2026-10-18 review: the check sat where only a full leaf reached it, so a sweep of a great many
-free pages neither answered a cancel nor paced its reads and records).  A page of a LIVE set is
+do, and so does every page that taking pages out of the trees reads - a directory page deletion's
+leaf, siblings and parents (§21, "Page deletion") and an empty posting leaf's neighbour and parent
+(§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once a leaf - so a VACUUM
+leaves no more of the index in shared buffers than the ring holds, but the meta page.  It checks for
+interrupts at every block, with nothing locked, and each page it reads passes the cost-based delay
+first, as every page the walk reads does, so a sweep of a great many free pages answers a cancel and
+paces its reads and records.  A page of a LIVE set is
 never mistaken for a leak, because pass 2 visits every page of every chain it found, and a chain
 created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
 every page they allocate inside the record that allocates it, under the lock they hold
 throughout) and names a root that is live.
 lion_index_stats() reports deleted_pages; VACUUM is told the counts below.
 
-**Page counts** (2026-09-25 review).  IndexBulkDeleteResult has three: `pages_newly_deleted`,
-the pages this VACUUM freed; `pages_deleted`, the free pages the index holds; and `pages_free`,
-those the next allocation could take already.  All three were wrong.  A page a whole-set free
-marked DELETED was counted there and then un-marked in the bitmap, so the sweep met it again as
-an unaccounted DELETED page and counted it a second time; `pages_free` was a copy of
-`pages_deleted`; and `pages_newly_deleted` was assigned, so a VACUUM that calls ambulkdelete more
-than once (dead TIDs past maintenance_work_mem) reported the last call's pages alone.  `VACUUM
-VERBOSE` said "30 newly deleted, 60 currently deleted, 60 reusable" of an index whose
-lion_index_stats() said 30.  Now a page is counted where it is marked, `pages_newly_deleted` is
-ADDED UP over the calls as nbtree does it, and the other two describe the index as the call leaves
-it - the sweep counts them afresh every time, the earlier calls' pages among them - with a page
-reusable when it is all-zero, or DELETED with its safexid behind every snapshot, which is exactly
-lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: "30 newly
-deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all reports
+**Page counts.**  IndexBulkDeleteResult has three: `pages_newly_deleted`, the pages this VACUUM
+freed; `pages_deleted`, the free pages the index holds; and `pages_free`, those the next allocation
+could take already.  A page is counted once: a whole-set free counts the pages it marks DELETED
+as freed and as free and marks them visited, so the sweep passes them by, and the directory pages
+a deletion frees (§21) are counted as freed there and as free by the sweep, which meets them
+unvisited.  `pages_newly_deleted` is ADDED UP over the calls of a VACUUM that calls ambulkdelete more than once
+(dead TIDs past maintenance_work_mem), as nbtree does it, and the other two describe the index as
+the call leaves it - the sweep counts them afresh every time, the earlier calls' pages among them -
+with a page reusable when it is all-zero, or DELETED with its safexid behind every snapshot, which
+is exactly lion_alloc_page()'s test.  A page freed a moment ago is free and not yet reusable: of an
+index whose lion_index_stats() says 30 deleted pages, all freed by this VACUUM, `VACUUM VERBOSE`
+says "30 newly deleted, 30 currently deleted, 0 reusable".  (A VACUUM that needs no ambulkdelete at all reports
 them only when it reads the index for the pages an earlier one could not hand out yet, above;
 otherwise counting them would mean reading every page of the index.)
 
-**Statistics** (2026-09-27 review).  `num_index_tuples` becomes the index's `pg_class.reltuples`
+**Statistics.**  `num_index_tuples` becomes the index's `pg_class.reltuples`
 whenever it is not marked estimated, and the planner reads that as ROWS - a partial index's size
 is estimate_rel_size()'s tuples-per-page density of it, clamped to the table's rows - and ANALYZE
-writes rows there too.  ambulkdelete used to report Σ ntids over every entry, exact
-(`estimated_count = false`): the NULL entry, every column of a multicolumn index, every element of a
-multi-key one and every SUMMARY entry (§32) all over again, so every VACUUM put a multiple of the
-rows there and every ANALYZE put the rows back, and plans flipped between the two.  Now it reports
-the rows: Σ ntids over the entries of the index's FIRST SCALAR key column, SUMMARY entries left
+writes rows there too.  So ambulkdelete reports rows, not Σ ntids over every entry, which counts
+the NULL entry, every column of a multicolumn index, every element of a multi-key one and every
+SUMMARY entry (§32) all over again: every VACUUM would put a multiple of the rows there and every
+ANALYZE the rows back, and plans would flip between the two.  It reports
+Σ ntids over the entries of the index's FIRST SCALAR key column, SUMMARY entries left
 out, which is exact because a scalar column files every row the index holds under exactly one
 entry, the NULL entry for a NULL (§14, §24); for a partial index that is the count ANALYZE only
 estimates.  An index whose key columns are all multi-key files a row under any number of entries,
 the key-less entries included (§17), and nothing short of their union counts its rows, so it reports
 the heap's row count instead, exact when the heap's is - `ginvacuumcleanup()`'s answer, and wrong
 for a partial index the same way. `tuples_removed` stays a count of postings, as GIN's is. ambuild
-reported the postings it wrote as `index_tuples`, as GIN's does, until the first ANALYZE, or the
-first VACUUM that removes something, replaced them; since 2026-10-19 it reports the rows it added,
-each participant's summed (`lion_spool_nrows()`), so that a partial index is sized by its rows
-from the start (§45.3).
+reports as `index_tuples` the rows it added, each participant's summed (`lion_spool_nrows()`) -
+not, as GIN's does, the postings it wrote - so that a partial index is sized by its rows from the
+start (§45.3).
 
-**The spill** (2026-09-25 review).  An INLINE posting set that outgrows its entry moves onto
+**The spill.**  An INLINE posting set that outgrows its entry moves onto
 container pages (§4, §5), and VACUUM's filtering can make it outgrow the entry by an order of
 magnitude (§5, VACUUM step 2), so `lion_entry_spill()` writes as many leaves as the payload needs:
 
 1. the ROOT first, with reuse = false and held EXCLUSIVE to the end - every page of a set is
    stamped with its root's block, and a root block is never handed out twice (above) - and
-   LOGGED first, as an internal page of the set with no downlink yet, in a record of its own
-   (2026-09-28): an extension no record touches is one an OS crash can lose, and the next
-   extension then handed the same block out again as the root of another set, whose stamp
-   the leaves the crashed spill had written could not be told from (every summary's hash and
+   LOGGED first, as an internal page of the set with no downlink yet, in a record of its own:
+   an extension no record touches is one an OS crash can lose, and the next extension would
+   then hand the same block out again as the root of another set, whose stamp the leaves the
+   crashed spill had written could not be told from (every summary's hash and
    every NULL entry's is 0, §32).  Replaying the record extends the relation past the root
    whatever blocks the leaves took, so the block is never a root again;
 2. then each LEAF, filled, linked to the next one and logged in a record of its own that
@@ -7107,9 +7105,8 @@ The entry changes in the last record and in no other, so it is INLINE until the 
 disk and CHAIN from the moment it is, never half of each.  An ERROR or a crash before the last
 record loses nothing - the entry still holds the payload it held, dead TIDs included, which the
 next VACUUM removes - and leaves FULL leaves that nothing references, stamped with a root that
-has no downlink (before 2026-09-28: that was never written).  The spill's own comment promised
-that the next VACUUM's sweep collects those; it did not, because the sweep only ever freed EMPTY
-unreferenced leaves, so they stayed leaked for good.  The sweep now asks the leaf's ROOT (`lion_posting_root_live()`): a leaf is an orphan when
+has no downlink.  The next VACUUM's sweep collects them: of an unreferenced leaf that is not
+empty it asks the leaf's ROOT (`lion_posting_root_live()`), and a leaf is an orphan when
 the page at its owner_head is not a live container page stamped with that same (owner_hash,
 owner_head), with a downlink on it when it is an internal page.  Every page of a set that exists
 passes - its root is live until the entry is gone and the set freed, is internal only with a
@@ -7146,7 +7143,7 @@ paths that hold the entry's bucket page throughout - insert and VACUUM's own wal
 cannot go away and a mismatch is corruption.
 
 **owner_head alone identifies a chain**, for the whole life of the index, and that is deliberate: a
-chain's HEAD page is the one page `lion_new_buffer()` never takes from the free space map
+chain's HEAD page is the one page `lion_alloc_page()` never takes from the free space map
 (`lion_entry_spill()` passes reuse = false), so a head block always comes from extending the
 relation, is a block number that has never been handed out before, and is therefore never reused as
 a head. Since §22 the head is the posting tree's ROOT rather than its first leaf, and the rule is
@@ -8518,8 +8515,9 @@ Operations.
   each downlink, one tiny one for each flag. In a set with no internal level there is no parent:
   the split is its one record, and nothing is flagged. Injection point `lion-posting-split-incomplete` fires
   between the first record and the downlink; `test/recovery/run.sh` phase 1d crashes the server there
-  and proves the next writer repairs it - an append as much as a descent since the 2026-09-25
-  addendum below, which covers the two writers that reach a leaf WITHOUT descending.
+  and proves the next writer repairs it - an append as much as a descent: the addendum "an
+  unfinished split and the writers that do not descend" below covers the two writers that reach a
+  leaf WITHOUT descending.
 - **A small set has no internal level** (`LION_POSTING_FLAT_LEAVES` = 16). A root over a handful of
   leaves is a page of a few dozen bytes, one per key that has more than one leaf, and on an index of
   many mid-sized keys those pages were about a tenth of the index. So up to 16 leaves the head is
@@ -8569,7 +8567,8 @@ Operations.
   locks are not reentrant, which is safe precisely because writers of one key serialise.
   The push-down's record carries the entry AS IT IS ON THE PAGE with only `tail` moved - not the
   caller's copy, whose counters already count the items being placed, because those go onto the
-  child in the NEXT record, which can fail (2026-09-25 addendum below).
+  child in the NEXT record, which can fail (addendum "a root push-down logs the counters its page
+  holds" below).
 - **VACUUM**: the leaves are visited in ckey order via right links exactly as before, with a cleanup
   lock on every one of them (§11); pass 2 starts by DESCENDING from `head` to the leftmost leaf,
   and the descent takes a cleanup lock on every page it passes, the root first
@@ -8662,7 +8661,7 @@ Operations.
     against the page itself, and every walk of the split repair - `lion_posting_level_start()`, the
     scan for a downlink, `lion_posting_downlink_present()`, `lion_posting_adopt()` - against every
     page the repair holds, however far up and sideways it has recursed (`LionPostingHeld`, the
-    2026-09-28 addendum below; until then each walk checked only the one or two pages nearest it). A
+    addendum "a repair inside a repair" below). A
     link from inside the tree to the entry's directory leaf is caught only when it is the head or the
     tail, a double fault this does not chase;
   - and a walk right along a level ends (`LionRightWalk`, lion.h): a walk that only moves right
@@ -9062,32 +9061,31 @@ filtering an internal page as a leaf would read pivots as containers (an asserti
 build, dead TIDs left behind on a release build). Injection points `lion-vacuum-page-filtered` and
 `lion-vacuum-entry-busy` make the window deterministic; test/isolation/vacuum_retry_pushdown.spec
 parks VACUUM on either side of it while an insert pushes the root down, and asserts that every dead
-TID is gone afterwards (ntids = rows) and verify() is clean. Before the re-check the spec crashed the
-backend.
+TID is gone afterwards (ntids = rows) and verify() is clean.
 
-### §22 addendum: an unfinished split and the writers that do not descend (2026-09-25)
+### §22 addendum: an unfinished split and the writers that do not descend
 
 The repair rule of this section is that a WRITE DESCENT finishes every unfinished split it meets.
-That was the only repair, and two writers reach a leaf without descending at all:
+Two writers reach a leaf without descending at all:
 
 - **An append**, through the entry's `tail` (§5 INSERT step 4). A split of the set's last leaf
   makes the new right half the tail in its FIRST record, so after a crash between the two records -
   or an ERROR there, such as running out of disk while the downlink insertion splits the parent -
-  every append went straight to the right half and no descent ever came near the flagged page.
-  When the right half filled, its own split looked for its downlink in the parent, found none and
-  failed with "no downlink for block N at level 1", and so did every later split of the tail, since
-  each left the next tail without a downlink too: an append-only key never took another row. The
-  2026-09-25 review reproduced it in five statements with the injection point set to 'error'.
+  an append that went straight to the right half would never bring a descent near the flagged
+  page. When the right half filled, its own split would look for its downlink in the parent, find
+  none and fail with "no downlink for block N at level 1", and so would every later split of the
+  tail, since each would leave the next tail without a downlink too: an append-only key would
+  never take another row.
 - **VACUUM's regrow** (§18), which reaches the page a grown container lives on by walking right
   links under cleanup locks - it may not jump there (§11; rule 1 of lion_vacuum.c). On the RIGHT
-  half, which has no downlink, its split's parent lookup failed as above, and VACUUM could not
-  complete. On the flagged LEFT half, the split it caused was guarded by an Assert and nothing
-  else: a release build linked the new page between the two halves of the old split, gave the NEW
-  page a downlink and cleared the one flag that remembered the old right half, which then had no
-  downlink for good. The leaf chain stays intact, so sequential readers were right, but a descent -
-  which is how a seek probes a set - never reached that page again.
+  half, which has no downlink, its split's parent lookup would fail as above, and VACUUM could not
+  complete. On the flagged LEFT half, a split that did not first finish the old one would link the
+  new page between the two halves of the old split, give the NEW page a downlink and clear the one
+  flag that remembers the old right half, which would then have no downlink for good. The leaf
+  chain would stay intact, so sequential readers would be right, but a descent - which is how a
+  seek probes a set - would never reach that page again.
 
-Three rules close it, all three after nbtree:
+Three rules cover both, all three after nbtree:
 
 1. **The append hint serves only changes that stay on the page.** `lion_insert_chain()` uses the
    tail for the in-place member inserts of §4 and nothing else; a member that needs the general
@@ -9114,65 +9112,66 @@ Three rules close it, all three after nbtree:
    link, so the split that follows proceeds exactly as it would have.
 
 Rule 1 makes the repair early - the first general-path insert after the crash does it - and rules 2
-and 3 make it certain for a writer that did not descend, which today means VACUUM's regrow, on
-either half. What rule 1 costs is the descent's locks, one per level, and only on the general
-path: never for a BITSET, and for an ARRAY, a RUN or a sparse segment once each time the item's
-growth slack (§4: an eighth of it, 8 to 64 bytes) runs out - every 32 members of an ARRAY past
-512 bytes. Measured on the assert-enabled development build, 300,000 single-row inserts into a
-dense key (bitsets), 500 keys of sparse segments and 20 keys of arrays showed no difference beyond
-the run-to-run noise of that shared machine (±30%).
+and 3 make it certain for a writer that did not descend, which means VACUUM's regrow, on either
+half. What rule 1 costs is the descent's locks, one per level, and only on the general path: never
+for a BITSET, nor for a NARROW but when a member widens it (§38), and for an ARRAY, a RUN or a
+sparse segment once each time the item's growth slack (§4: an eighth of it, 8 to 64 bytes) runs
+out - every 32 members of an ARRAY past 512 bytes. Measured on the assert-enabled development
+build, 300,000 single-row inserts into a dense key, 500 keys of sparse segments and 20 keys of
+arrays showed no difference beyond the run-to-run noise of that shared machine (±30%).
 
 Tests: `test/isolation/posting_split_repair.spec` cuts a split short with
 `lion-posting-split-incomplete` set to 'error' inside a subtransaction - which leaves on disk
 exactly what a crash between the two records leaves - and then (A) appends, (B) makes VACUUM regrow
 on the right half, which has no downlink, and (C) on the flagged left half. Each ends with verify()
-clean and the index agreeing with the heap; before the fix A and B failed with "no downlink" and C
-crashed an assert build. `test/recovery/run.sh` phase 1d now appends after its real crash, which is
-the case it used to route around by inserting only into the middle of the heap.
+clean and the index agreeing with the heap; without the three rules A and B fail with "no
+downlink" and C trips an assertion. `test/recovery/run.sh` phase 1d appends after its real crash.
 
-### §22 addendum: a root push-down logs the counters its page holds (2026-09-25)
+### §22 addendum: a root push-down logs the counters its page holds
 
 An insert adds its member to `ntids` in its private copy of the entry before placing it, and
 VACUUM's regrow subtracts the TIDs it filtered out of a container it has not written back yet. When
-the placement pushed a leaf root down, the push-down's record wrote that copy - the new `tail` and
-the new counters - while the items were placed by the NEXT record, the child's split, which
-allocates pages and can fail or be cut short by a crash. An ERROR at `lion-posting-pushdown-child`
-in between left verify() reporting "claims 9241 TIDs, but its containers hold 9240" after an
-insert, and "claims 4341 TIDs, but its containers hold 5307" after a VACUUM - and every later VACUUM
-subtracted the regrown container's dead TIDs once more, so the drift never healed. The push-down now
-logs the entry as it stands on the page with only `tail` moved; the counters travel with the record
-that places the items, as §5 has always said they must. `test/isolation/posting_split_repair.spec`
-cuts a push-down short (D) in an insert and (E) in VACUUM's regrow; both used to fail verify().
+the placement pushes a leaf root down, the items are placed by the NEXT record after the
+push-down's, the child's split, which allocates pages and can fail or be cut short by a crash. Had
+the push-down's record written that copy - the new `tail` and the new counters - an ERROR at
+`lion-posting-pushdown-child` in between would leave the entry claiming one TID more than its
+containers hold after an insert, and fewer after a VACUUM, and every later VACUUM would subtract the
+regrown container's dead TIDs once more, so the drift would never heal. So the push-down logs the
+entry as it stands on the page with only `tail` moved; the counters travel with the record that
+places the items, as §5 says they must. `test/isolation/posting_split_repair.spec` cuts a push-down
+short (D) in an insert and (E) in VACUUM's regrow, and checks verify() after each.
 
-### §22 addendum: a repair inside a repair (2026-09-28)
+### §22 addendum: a repair inside a repair
 
-The 2026-09-27 review made the split repair's walks refuse, before the lock, a link to a page the
-backend already holds: a content lock is not reentrant, and a second one waits for this very backend
-for ever - uncancellably, with the key's directory leaf held. But each walk checked only the one or
-two pages its own caller held, and the repair RECURSES: up a level when the page that takes a
+The split repair's walks refuse, before the lock, a link to a page the backend already holds: a
+content lock is not reentrant, and a second one waits for this very backend for ever -
+uncancellably, with the key's directory leaf held. The pages a walk's own caller holds are not
+enough to check, because the repair RECURSES: up a level when the page that takes a
 downlink is flagged itself or has to split, and sideways when a page has no downlink and
 `lion_posting_adopt()` finishes the split to its left - whose right half may have no downlink
 either. Two unfinished splits on one level (two crashes between the records, or two ERRORs in the
 parent insertions) are enough: `adopt(C)` holds C, meets the flagged F on its walk and finishes it,
-and F's own missing downlink runs `adopt(F)` inside, with C still held. That walk stopped only at F,
-and a route key can land RIGHT of the page that holds it - separators are only non-decreasing: a
-split repaired with both halves empty shares its left neighbour's, and an internal split can cut a
-run of equal ones - so a walk that started past F went on to C and locked it a second time.
+and F's own missing downlink runs `adopt(F)` inside, with C still held. A walk that stopped only at
+F would not do, for a route key can land RIGHT of the page that holds it - separators are only
+non-decreasing: a split repaired with both halves empty shares its left neighbour's, and an internal
+split can cut a run of equal ones - so a walk that started past F would go on to C and lock it a
+second time.
 
-Two changes, both in `lion_posting.c`:
+Two rules, both in `lion_posting.c`:
 
 1. **The held pages travel with the recursion.** `LionPostingHeld` is a list with one link per frame
    of `lion_posting_finish_split_ext()`, on that frame's stack: the page whose split it finishes.
    Every walk of the repair looks each page up in it before the lock - the root and the moves of
    `lion_posting_level_start()`, the scan for a downlink, `lion_posting_downlink_present()`'s look at
    the parent's sibling, both walks of `lion_posting_adopt()` - and a held right sibling whose first
-   key a leaf repair needs as its separator is read off the held page, as the single `heldright` was.
+   key a leaf repair needs as its separator is read off the held page.
 2. **`lion_posting_adopt()` walks twice.** First SHARE and finishing nothing, from where the route
    leads, to learn whether its child lies ahead at all; only then again, from the first flagged page
-   that walk saw up to the child, finishing. The old single walk also finished, to no purpose, every
-   flagged page RIGHT of the child whenever the route led past it - a child's missing downlink is
-   only ever caused on its left - and that is what could nest a repair whose own child lies right of
-   a page it would walk through. Now a repair finishes splits only left of its child, so the pages
+   that walk saw up to the child, finishing. A single walk that finished as it went would also
+   finish, to no purpose, every flagged page RIGHT of the child whenever the route led past it - a
+   child's missing downlink is only ever caused on its left - and could so nest a repair whose own
+   child lies right of a page it would walk through. A repair finishes splits only left of its
+   child, so the pages
    nested adoptions hold on one level strictly decrease, each left of the one around it, and a walk
    that meets a held page other than its own child has passed its child exactly as a walk that
    reaches the end of the level has: it stops there, without the lock, and the next attempt starts
@@ -9180,22 +9179,22 @@ Two changes, both in `lion_posting.c`:
    changes in between: finishing a split clears a flag on the child's level and writes only above
    it, and no other writer is in the tree.
 
-Why neither change turns a sound index into an ERROR or a wait. The recursion only climbs or stays
+Why neither rule turns a sound index into an ERROR or a wait. The recursion only climbs or stays
 on its level, so every page the repair holds is on the level being walked or below it, and never the
 root (only a flagged page goes into the list, and the root's split is a push-down, which flags
 nothing; the push-down's unlocked window is therefore never refused). `lion_posting_level_start()`
 returns a held page of its target level as the answer, unread, for the caller to judge, and refuses
 one above that level; the scan for a downlink and `downlink_present()` walk the level ABOVE the child,
 where the repair holds nothing but the parent it has found, so a held page there is damage
-(ERRCODE_INDEX_CORRUPTED, as before);
-and `adopt()` treats a held page as the end of the level. So every new ERROR is a link a sound tree
-does not have, and the one legitimate meeting - nested adoptions on a level - is a stop. The lock
-order is unchanged: the walks take the same pages in the same modes and directions as before, less
-the held ones they used to lock a second time and the flagged pages right of the child. The cost is
+(ERRCODE_INDEX_CORRUPTED);
+and `adopt()` treats a held page as the end of the level. So every such ERROR is a link a sound tree
+does not have, and the one legitimate meeting - nested adoptions on a level - is a stop. Neither
+rule adds to the lock order: the walks take pages in the modes and directions the rest of the repair
+does, and skip the held ones and the flagged pages right of the child. The cost is
 the first walk of `adopt()`, a SHARE read of the pages between the route and the child, on a path
 that only runs after a crash left a split unfinished.
 
-Not covered: the leaf split's second page outside the repair - `lion_split_and_place()` still holds
+Not covered: the leaf split's second page outside the repair - `lion_split_and_place()` holds
 M, EXCLUSIVE, while it finishes P, and P while it finishes M, and neither is in the list, because
 `lion_posting_put.c` does not pass them. Neither is reached: M has no downlink and lies right of P, where
 every walk of that repair stops (P is held); and finishing M finds the downlink finishing P has just
@@ -9997,8 +9996,7 @@ deviations from what this section assumed:
   `lion_alloc_page()` (fallible: the free space map, or extending the relation)
   and `lion_wal_init_buffer()` (registers the page the caller already has with
   REGBUF_WILL_INIT and initialises it). Every split therefore works out how many
-  pages it needs BEFORE it opens its record, and `lion_release_unused_page()`
-  gives back one it turns out not to need.
+  pages it needs BEFORE it opens its record.
 - **A container split rehearses its own deletion.** `lion_split_and_place()`
   used to ask "do the new items still fit on P?" after deleting the moved ones
   from P, inside the record, and allocate the second new page M there if the
@@ -10043,8 +10041,8 @@ image.
                                    length that differ from what the page holds)
                                    or SPLICE (the same with the bytes an insert
                                    moved up said once) + MINMAX + the entry.
-                                   98 B for the dense container that used to
-                                   cost 1658; a rewrite that changes more than
+                                   98 B for a dense container whose whole item
+                                   is 1658; a rewrite that changes more than
                                    half the item falls back to REPLACE, which is
                                    the whole item at its allotted length with
                                    its slack zeroed.
@@ -10053,11 +10051,12 @@ image.
                                    INLINE spill.
     ITEM_DELETE     0x30  2        MULTIDEL + MINMAX + the entry.  CLEANUP LOCK
                                    on the container page.
-    PAGE_INIT       0x40  1        INIT + SPECIAL.  Written by lion_new_buffer()
-                                   alone, which nothing calls today: every page
-                                   is initialised inside the record that links
-                                   it in.  Kept because that is what the record
-                                   type is for.
+    PAGE_INIT       0x40  1        INIT + SPECIAL.  A page initialised before
+                                   anything links to it: the root of a set a
+                                   spill makes (lion_entry_spill()) and of a
+                                   new position tree (lion_postree_create()).
+                                   Every other page is initialised inside the
+                                   record that links it in.
     SPLIT           0x50  2-4      Both halves as INIT + ADD/ADDMANY + SPECIAL,
                                    the old right sibling's SPECIAL, and META or
                                    the entry.  Covers the directory split, the
@@ -14231,8 +14230,8 @@ file, and the IN list is collected from it a batch of keys at a time into one se
 long list is (§15, "A list too long to locate at once"; `lion_locate_list()`): in each leaf of a
 partitioned fact, and again at each rescan, the store ended before the values' context is reset
 (`lion_clause_values_free()`). A table of a million flagged keys whose statistics said none were,
-at work_mem 4MB on the assert build: some 287 MB of the backend's own memory held at the peak, where
-it is now 17 MB, in about the same 2.3 s.
+at work_mem 4MB on the assert build: 17 MB of the backend's own memory at the peak, in 2.3 s, where
+the whole list in one array held some 287 MB in about the same time.
 
 Measured (2026-10-11, 5M fact rows, a 220-row dimension of 10 groups, a 1,000-row filter table of
 which a third is flagged, best of 5, PostgreSQL's own plan with its parallel workers): the flagged
@@ -18337,14 +18336,13 @@ says `Ordered By: <index> (index only)`. The same walk is then also offered with
 
 - **The relation.** A plain base relation (`RELOPT_BASEREL`, `RTE_RELATION`, relkind table or
   materialized view, not an inheritance parent, no TABLESAMPLE) of the heap table AM
-  (`lion_table_am_supported()`, §2), or since 2026-09-29 a leaf partition (§30.11), with at least
+  (`lion_table_am_supported()`, §2), or a leaf partition (§30.11), with at least
   one lion index and one ordered index - or an ordered lion column (§30.11). Declined:
   a relation with security quals - RLS policies or a security-barrier view, i.e. an RTE with
   `securityQuals` or any restriction clause with `security_level > 0` - exactly as LionCount
   declines them (§9, "Row-level security"): the ordinary plan applies them with core's
-  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so,
-  until 2026-09-29, were partitioned tables and their partitions (§30.8, §30.11). So is a relation
-  with LATERAL references (`rel->lateral_relids`: a PlaceHolderVar it computes for a LATERAL
+  leakproofness rules. The target relation of an UPDATE, DELETE or MERGE is declined, and so is
+  a relation with LATERAL references (`rel->lateral_relids`: a PlaceHolderVar it computes for a LATERAL
   subquery pulled up from under an outer join, `la LEFT JOIN LATERAL (SELECT lb.id, la.x FROM lb
   ...) ON true`): every path of it must be parameterized by the relations they name, and every path
   the node builds is unparameterized - the btree path it builds for its ordered side where core
@@ -21352,9 +21350,8 @@ The plan names the column in a new member of custom_private, `LION_PRIV_ALLROWS`
 whichever column it is: the executor never looks for it among the clauses, where the first `IS NOT
 NULL` may be an OR's leaf or a filtered count's and say nothing of the driver. EXPLAIN prints the
 driver as `(all rows)`, or `(all keys)` when it is the column's own `IS NOT NULL` that drives.
-`count(*) WHERE k IS NOT NULL` over a column of many keys is now driven by one of few:
-`lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`, where it was
-`lion_null_k (all keys)`.
+`count(*) WHERE k IS NOT NULL` over a column of many keys is driven by one of few:
+`lion_null_t (all rows), lion_null_k (k IS NOT NULL)` in `null.sql`.
 
 A summarized driver (§32) hands its summaries to the sum, and they hold no NULL row: its NULL entry
 is in no bucket. So the sum over every row counts that entry beside the walk, ANDed with the

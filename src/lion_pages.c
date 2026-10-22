@@ -78,7 +78,7 @@ lion_init_page(Page page, uint16 flags)
  * owner_head are deliberately kept: verify() uses them to say which chain a
  * leaked page came from, and the leak sweep uses the flags.  The body holds
  * the safexid, the transaction id from which on no scan can still be holding
- * a link to this page - which is what lion_new_buffer() waits for before
+ * a link to this page - which is what lion_alloc_page() waits for before
  * handing the block to somebody else.  This mirrors BTPageSetDeleted().
  */
 void
@@ -241,28 +241,6 @@ lion_alloc_page(Relation index, Relation heaprel, bool reuse)
 }
 
 /*
- * Give a page back that a caller took and did not use.
- *
- * Nothing was written to it, so there is nothing to log and nothing to undo:
- * the block is either all-zero (it came from extending the relation) or still
- * the DELETED page, or UNLINKED posting leaf, the free space map offered, and
- * both are exactly what lion_alloc_page() accepts.  Recording it in the map hands it to the next
- * allocation, so a split that turns out to need one page instead of two costs
- * a page once and never again.
- *
- * DESIGN.md §25: the alternative - deciding inside the record - is not open
- * any more, because an rmgr-mode record runs in a critical section.
- */
-void
-lion_release_unused_page(Relation index, Buffer buf)
-{
-	BlockNumber blk = BufferGetBlockNumber(buf);
-
-	UnlockReleaseBuffer(buf);
-	RecordFreeIndexPage(index, blk);
-}
-
-/*
  * Bring a page the caller already took into its open record.
  *
  * The buffer must come from lion_alloc_page(), which is the fallible half and
@@ -292,28 +270,6 @@ lion_wal_log_special(LionWalState *state, Page page)
 {
 	lion_wal_op(state, page, LION_OP_SPECIAL, 0, 0, LionPageGetOpaque(page),
 				sizeof(LionPageOpaqueData));
-}
-
-/*
- * A fresh page in a record of its own, for a caller that has no record open.
- *
- * reuse is implied here; a chain's HEAD page, which must never come from the
- * free space map (DESIGN.md §18), is allocated with lion_alloc_page(...,
- * false) by the caller that links it in.
- */
-Buffer
-lion_new_buffer(Relation index, Relation heaprel, uint16 flags)
-{
-	Buffer		buffer;
-	LionWalState *state;
-
-	buffer = lion_alloc_page(index, heaprel, true);
-
-	state = lion_wal_begin(index);
-	lion_wal_init_buffer(state, buffer, flags);
-	lion_wal_finish(state, LION_XLOG_PAGE_INIT);
-
-	return buffer;
 }
 
 /*

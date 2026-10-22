@@ -310,7 +310,7 @@ root, the root's type, and one per top-level key, string element or string scala
 The count pushdown also takes `(doc ->> 'k') = 'v'` as `doc @> '{"k": "v"}'`, the same test
 when v is a string constant that is not the text of a number, of `true` or `false`, or of an object
 or array (it starts with neither `{` nor `[`), compared under a deterministic collation: in a
-`WHERE` it is answered from the index instead of the heap, and in a `FILTER` it no longer sends the
+`WHERE` it is answered from the index instead of the heap, and in a `FILTER` it does not send the
 count to the ordinary plan. `->>` compared with a parameter, a number's text and the like stay with
 the heap (DESIGN.md §42.6).
 
@@ -1000,11 +1000,11 @@ other rows than `LionOrdered`'s scan of the matching rows alone at the same `pg_
 and `pg_lion.vector_patience`: the plan would decide the answer. `error`, the default: no plan does;
 a filter lion indexes answer goes through `LionOrdered`, and a query whose `lionvec` order would be
 filtered and that `LionOrdered` cannot answer fails when it is planned, `EXPLAIN` included, naming
-the clauses no lion index answers and suggesting the subquery form above, or this setting. `exact`
-(the default before 2026-10-17): the same, but such a query is planned exactly, as a sort of the
+the clauses no lion index answers and suggesting the subquery form above, or this setting. `exact`:
+the same, but such a query is planned exactly, as a sort of the
 filter's rows, however many rows that reads (`WHERE id = 5 ORDER BY embedding <=> $1 LIMIT 1` reads
 the one row by the primary key and sorts it). `allow`: the plain scan with a `Filter`, and
-`LionOrdered` with one, are plans like any other, chosen by cost, as before 2026-10-16.
+`LionOrdered` with one, are plans like any other, chosen by cost.
 `pg_lion.enable_ordered_scan = off` does not re-admit the plain scan: under `error` the query then
 fails, and under `exact` it is sorted. A clause the planner tests once (`WHERE $1`,
 `WHERE current_user = 'app'`), and one a partial `lionvec` index's predicate implies, is no filter

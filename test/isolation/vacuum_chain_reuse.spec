@@ -13,7 +13,7 @@
 #
 # What stops it is the owner check in the page's special area: every container
 # page carries owner_hash and owner_head, and a head block is the one block
-# lion_new_buffer() never takes from the free space map, so owner_head
+# lion_alloc_page() never takes from the free space map, so owner_head
 # identifies a chain for the whole life of the index.  A page that does not
 # claim this chain ends the walk, which is right: the chain was only freed
 # because its posting set held nothing visible to anyone.
