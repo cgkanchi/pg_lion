@@ -17089,10 +17089,10 @@ AND for its own estimates.
   finds it `LION_ISECT_ERROR` (3) times off or more, either way: less is within what ANALYZE's
   per-column estimates and the sample leave of an independent conjunction, and would move plans on
   noise. A position filter's candidates take the probe's measure however near core's
-  (`lion_isect_measured_factor()`, §17 "The price"): they are no estimate a plan is sized from but
-  the rows the filter decides, each at a price, and a phrase's words go together. A sample lowers
-  an estimate no further than what it can rule out, and one that met the AND
-  in fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows it met, or than
+  (`lion_isect_measured_factor()`, §17 "The price"): they are not an estimate from which a plan
+  is sized but the rows the filter decides, each at a price, and a phrase's words go together. A
+  sample lowers an estimate no further than what it can rule out, and one that met the AND in
+  fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows it met, or than
   the longest part of the AND that enough of them met says ("What a sample can rule out", "Wide
   lists", below); a count - every container of the driver ANDed - stands as it is. It applies to
   lion's OWN estimates: the selectivity `lioncostestimate()` returns for a plain or bitmap path -
