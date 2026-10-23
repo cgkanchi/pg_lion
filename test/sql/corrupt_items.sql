@@ -386,6 +386,16 @@ SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 REINDEX INDEX lion_di_old_i;
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
+-- A backend that has read the index - this one, now, by a count - keeps
+-- its state, meta page words and all, and does not read the meta page
+-- again to use it (lion_get_index_state()).  The statistics and VACUUM
+-- read the page for what they count, and refuse a version changed under
+-- that state there (lion_meta_check_version()).
+SELECT lion_index_count('lion_di_old_i', 1) > 0 AS warm;
+SELECT lion_di_evict('lion_di_old_i');
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
+SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
+VACUUM lion_di;
 DROP INDEX lion_di_old_i;
 DROP FUNCTION lion_di_hint(text);
 

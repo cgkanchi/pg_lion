@@ -2367,6 +2367,8 @@ extern LionContainer *lion_page_poschunk_fetch(Relation index, Page page,
 
 /* Convenience: read the meta page once and validate it (used by lion_get_state). */
 extern void lion_read_meta(Relation index, LionMetaPageData *meta);
+extern void lion_meta_check_version(Relation index,
+									const LionMetaPageData *meta);
 
 /* ---------- AM entry points ---------- */
 
