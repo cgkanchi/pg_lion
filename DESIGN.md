@@ -12520,9 +12520,8 @@ How to read them, for any workload:
   node itself read from disk.
 - `Fact Filter Locate Time` is the fact filters located - once a run, and once a leaf's turn over
   a partitioned fact - and it is mostly a range among them collected into memory (§32, "A range as
-  a source"); `Range Sources Collected` says how many ranges were. It was in no phase before
-  2026-09-29, and a
-  semi join whose 90 ms were 87 of collecting a range showed none of it.
+  a source"); `Range Sources Collected` says how many ranges were collected. It was in no phase
+  before 2026-09-29, and a semi join whose 90 ms were 87 of collecting a range showed none of it.
 - What the node took besides these phases - its batches, and handing its rows up - is its time less
   them.
 
