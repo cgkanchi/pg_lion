@@ -565,6 +565,14 @@ SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXI
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
 SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k)');
 SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
+-- a correlation that reads a predicate the cells evaluate: EXPLAIN shows
+-- the predicate as it is written, and a row's truths are evaluated for the
+-- clause before its cell is known
+SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x = 1) GROUP BY tier') AS ln
+	WHERE ln ~ 'Join Cond|Cell Columns';
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x = 1) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND (t.g IN (2, 3) OR s.f = 0)) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''mid'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x IN (2, 3))');
 -- inner keys of no row, of rows the WHERE leaves out, NULL keys and
 -- duplicates; an empty inner side
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (450, -1)) GROUP BY tier');
