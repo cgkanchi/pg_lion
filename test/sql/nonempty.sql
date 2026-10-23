@@ -377,12 +377,12 @@ SELECT lion_ne_plan($$SELECT count(*) FROM lion_ne_t WHERE g = 1 AND (k = 3 OR c
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE tags @> '{4}' AND cardinality(tags) > 0$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt && '{t1,t2}' AND cardinality(tags) = 0$$);
 -- a multi-key query known only at run time (DESIGN.md §17): `'{}'` narrows
--- nothing, and every row is then tested on the heap, `tags <> '{}'` with it.
--- A test that NULLs pass is no test of that row filter's, as no `IS
--- DISTINCT FROM` is (§35): beside such a query the count is not pushed.
+-- nothing, and every row is then tested on the heap, `tags <> '{}'` with it,
+-- and a test that NULLs pass as well, as `IS DISTINCT FROM` is (§35)
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND cardinality(tags) > 0$$, $$'{t3}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND cardinality(tags) > 0$$, $$'{}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND tags IS DISTINCT FROM '{}'$$, $$'{t3}'$$);
+SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE txt @> $1 AND tags IS DISTINCT FROM '{}'$$, $$'{}'$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_t WHERE k = $1 AND cardinality(tags) > 0$$, '3');
 -- a WHERE of several columns, the non-empty test spelled twice, under a
 -- filtered count, in a generic plan

@@ -1546,6 +1546,55 @@ lion_resid_test(void *arg, HeapTuple tuple)
 }
 
 /*
+ * c's call of opno, `column op value`, with c's column, value and collation
+ * set: the function looked up in cxt, and the call the executor would have
+ * made for the clause, expression included, which is what a polymorphic
+ * operator's function asks its argument types of (get_fn_expr_argtype()).
+ * That includes the parser's relabels (lion_arg_type_passed()): a column of
+ * a domain over int[] reaches `@>(anyarray, anyarray)` as int[], and the Var
+ * alone would have shown the function the domain (the 2026-09-27 review).
+ * The value, of valtype, is a Const of the type the parser would have given
+ * it, as constant folding leaves a relabelled literal.
+ */
+void
+lion_row_filter_call(Relation heap, LionRowFilterClause *c, Oid opno,
+					 Oid valtype, MemoryContext cxt)
+{
+	Form_pg_attribute att = TupleDescAttr(RelationGetDescr(heap),
+										  c->attno - 1);
+	Oid			lefttype;
+	Oid			righttype;
+	Oid			coltype;
+	Expr	   *col;
+	int16		typlen;
+	bool		typbyval;
+	MemoryContext oldcxt;
+
+	fmgr_info_cxt(get_opcode(opno), &c->flinfo, cxt);
+	oldcxt = MemoryContextSwitchTo(cxt);
+	op_input_types(opno, &lefttype, &righttype);
+	col = (Expr *) makeVar(1, c->attno, att->atttypid, att->atttypmod,
+						   att->attcollation, 0);
+	coltype = lion_arg_type_passed(att->atttypid, lefttype);
+	if (coltype != att->atttypid)
+		col = (Expr *) makeRelabelType(col, coltype, -1,
+									   type_is_collatable(coltype) ?
+									   att->attcollation : InvalidOid,
+									   COERCE_IMPLICIT_CAST);
+	valtype = lion_arg_type_passed(valtype, righttype);
+	get_typlenbyval(valtype, &typlen, &typbyval);
+	fmgr_info_set_expr((Node *)
+					   make_opclause(opno, BOOLOID, false, col,
+									 (Expr *) makeConst(valtype, -1,
+														InvalidOid,
+														typlen, c->value,
+														false, typbyval),
+									 InvalidOid, c->collation),
+					   &c->flinfo);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
  * The heap recheck this scan's multi-key queries need (DESIGN.md §17, "A
  * query known only at run time"), as a row filter over the relation being
  * counted, set on the visibility cache every count of this execution is
@@ -1597,14 +1646,6 @@ lion_build_filter(LionCountScanState *st)
 	{
 		LionClauseState *cl = &st->clause[i];
 		LionRowFilterClause *c;
-		Form_pg_attribute att;
-		Oid			lefttype;
-		Oid			righttype;
-		Oid			coltype;
-		Oid			valtype;
-		Expr	   *col;
-		int16		typlen;
-		bool		typbyval;
 
 		if (!(cl->kind == LION_CLAUSE_MULTI && !st->inor[i] &&
 			  cl->idx != NULL && lion_clause_in_run(st, i) &&
@@ -1643,38 +1684,7 @@ lion_build_filter(LionCountScanState *st)
 		c->notnull = false;
 		c->collation = cl->idx->rd_indcollation[cl->idxcol - 1];
 		c->value = cl->val;
-		fmgr_info_cxt(get_opcode(cl->opno), &c->flinfo, st->wherecxt);
-
-		/*
-		 * The call the executor would have made for the clause, expression
-		 * included, which is what a polymorphic operator's function asks
-		 * its argument types of (get_fn_expr_argtype()).  That includes the
-		 * parser's relabels (lion_arg_type_passed()): a column of a domain
-		 * over int[] reaches `@>(anyarray, anyarray)` as int[], and the Var
-		 * alone would have shown the function the domain (the 2026-09-27
-		 * review).  The value is a Const of the type the parser would have
-		 * given it, as constant folding leaves a relabelled literal.
-		 */
-		att = TupleDescAttr(RelationGetDescr(st->heap), c->attno - 1);
-		op_input_types(cl->opno, &lefttype, &righttype);
-		col = (Expr *) makeVar(1, c->attno, att->atttypid, att->atttypmod,
-							   att->attcollation, 0);
-		coltype = lion_arg_type_passed(att->atttypid, lefttype);
-		if (coltype != att->atttypid)
-			col = (Expr *) makeRelabelType(col, coltype, -1,
-										   type_is_collatable(coltype) ?
-										   att->attcollation : InvalidOid,
-										   COERCE_IMPLICIT_CAST);
-		valtype = lion_arg_type_passed(cl->valtype, righttype);
-		get_typlenbyval(valtype, &typlen, &typbyval);
-		fmgr_info_set_expr((Node *)
-						   make_opclause(cl->opno, BOOLOID, false, col,
-										 (Expr *) makeConst(valtype, -1,
-															InvalidOid,
-															typlen, cl->val,
-															false, typbyval),
-										 InvalidOid, c->collation),
-						   &c->flinfo);
+		lion_row_filter_call(st->heap, c, cl->opno, cl->valtype, st->wherecxt);
 	}
 
 	/*
@@ -1857,7 +1867,8 @@ lion_ingroup_item(LionCountScanState *st)
 	int			k;
 
 	if (!lion_plan_flag(st, LION_FLAG_GROUPIDX) || st->driveattno == 0 ||
-		st->innerattno != 0 || lion_plan_flag(st, LION_FLAG_SUMALL))
+		st->innerattno != 0 || lion_plan_flag(st, LION_FLAG_SUMALL) ||
+		st->decode != NULL)
 		return -1;
 	for (k = 0; k < st->nitem; k++)
 	{
@@ -2085,6 +2096,14 @@ lion_locate_where(LionCountScanState *st)
 	 * reasons of their own and are left alone, and so does the (g, k) loop of
 	 * a count(DISTINCT k) per group (§26), whose groups are emitted in g's
 	 * directory order, which the planner may have claimed as pathkeys.
+	 *
+	 * So are the decoded walk (§34) and a count by cells (§10), serial or in
+	 * parallel: they walk every entry of their column 0 against the WHERE
+	 * collected whole (lion_decode_where(), lion_where_collect_range()), so
+	 * a list on that column is a source of the copy like any other clause,
+	 * located as one above - past a batch, collected into one set
+	 * (lion_locate_list()), where the driving list's sets are left for a
+	 * walk of them that never comes (lion_group_list_prepare()).
 	 *
 	 * The count(DISTINCT k) walk WITHOUT a GROUP BY is driven like a GROUP BY
 	 * k whose groups are summed (§26), and takes a list on k the same way -
