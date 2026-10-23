@@ -1308,7 +1308,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	ohash = LionPageGetOpaque(page)->owner_hash;
 	UnlockReleaseBuffer(buf);
 
-	if (ohead != blk && !lion_posting_root_live(vs->index, ohash, ohead, true))
+	if (ohead != blk && !lion_posting_root_live(vs->index, ohash, ohead, true,
+													   NULL))
 		return LION_UNREF_LEAK;
 	return LION_UNREF_LIVE;
 }

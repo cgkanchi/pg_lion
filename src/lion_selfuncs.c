@@ -111,6 +111,7 @@
 #include "lion_compat.h"
 #include "lion_container.h"
 #include "lion_count.h"
+#include "lion_customscan.h"
 #include "lion_tid.h"
 
 /*
@@ -1055,8 +1056,10 @@ static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 /* n_distinct from the directory (DESIGN.md §33), at the end of this file */
 static get_index_stats_hook_type lion_prev_index_stats_hook = NULL;
 static bool lion_enable_index_ndistinct = true;
+static bool lion_enable_index_mcv = true;
 static bool lion_enable_skew_estimate = true;
 static bool lion_ndistinct_nested = false;
+static bool lion_skew_unlisted = false;	/* lion_skew_compute()'s lookup */
 static bool lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte,
 								 AttrNumber attnum, VariableStatData *vardata);
 static bool lion_index_expr_stats(PlannerInfo *root, Oid indexOid,
@@ -1069,8 +1072,9 @@ lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 {
 	LionProbeScope *scope = lion_probe_scope;
 
-	if (scope != NULL && root != NULL && root->glob == scope->glob &&
-		rte->rtekind == RTE_RELATION && !rte->inh && rte->relid == scope->relid)
+	if (scope != NULL && !lion_skew_unlisted && root != NULL &&
+		root->glob == scope->glob && rte->rtekind == RTE_RELATION &&
+		!rte->inh && rte->relid == scope->relid)
 	{
 		ListCell   *lc;
 
@@ -1129,6 +1133,26 @@ lion_selfuncs_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §33, "The frequencies of the listed values": the values a
+	 * relation's clauses compare such a column with, each with its exact
+	 * frequency, among its most common values.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_index_mcv",
+							 "Takes the frequencies of the values a query compares a column with from a lion index on it.",
+							 "Off, a value that is not one of ANALYZE's most common values is estimated from the column's number of distinct values.",
+							 &lion_enable_index_mcv,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §33, "The rows of a probed key": a probe of a key the plan
+	 * does not know, on a skewed key column, priced at the rows such a key
+	 * meets, from a lion index's sum of squares of its keys' rows.
+	 */
 	DefineCustomBoolVariable("pg_lion.enable_skew_estimate",
 							 "Prices lion's probes of a skewed key column at the rows a probed key meets, from a lion index's sum of squares.",
 							 "Off, a key looked up by a Param or a join is priced at the planner's rows per key.",
@@ -2006,7 +2030,7 @@ lion_canonical_rel_list(PlannerInfo *root, RelOptInfo *rel, List *clauses,
 	bool		nechanged;
 
 	canon = lion_canonical_clause_list(root, rel->relid, clauses, changed);
-	result = lion_nonempty_rel_clauses(rel, canon, &nechanged);
+	result = lion_nonempty_rel_clauses(root, rel, canon, &nechanged);
 	if (nechanged)
 	{
 		list_free(canon);
@@ -2501,6 +2525,10 @@ typedef struct LionIsect
 	AttrNumber *attnos;			/* the table's column of each clause */
 	Node	  **clauses;		/* bare, in the cache's memory */
 	double		factor;			/* core's estimate is multiplied by it */
+	double		raw;			/* ... and what the probe found of it however
+								 * near core's estimate, for a price of its
+								 * rows (lion_isect_measured_factor()); < 0
+								 * where nothing was measured */
 	bool		measured;		/* by a probe of its own, or taken from a
 								 * part of it (lion_isect_part_factor()) */
 } LionIsect;
@@ -3693,14 +3721,15 @@ lion_isect_within(LionIsect *e, int n, LionIsectClause *cl)
  * of it.  With a part only, the part's: its other clauses independent of
  * those, as core takes them and as the probe's factor takes a range or a
  * clause it has no value for (lion_isect_factor()); with a whole only, from 1
- * at one clause; with neither, 1.  A filter's conjunction and the ones its
- * paths answer share most of their clauses: on the repro of DESIGN.md
- * §29.11, "Wide filters", the five clauses beside four lists measured 3.1,
- * all nine 186, and the five with one list 9.1, where this says 8.6.
+ * at one clause; with neither, 1, and *found (where given) says so.  A
+ * filter's conjunction and the ones its paths answer share most of their
+ * clauses: on the repro of DESIGN.md §29.11, "Wide filters", the five clauses
+ * beside four lists measured 3.1, all nine 186, and the five with one list
+ * 9.1, where this says 8.6.
  */
 static double
 lion_isect_part_factor(LionProbeCache *cache, Oid relid, int n,
-					   LionIsectClause *cl)
+					   LionIsectClause *cl, bool *found)
 {
 	LionIsect  *part = NULL;
 	LionIsect  *whole = NULL;
@@ -3721,6 +3750,8 @@ lion_isect_part_factor(LionProbeCache *cache, Oid relid, int n,
 				 lion_isect_within(e, n, cl))
 			whole = e;
 	}
+	if (found != NULL)
+		*found = (part != NULL || whole != NULL);
 	lo = (part != NULL) ? part->factor : 1.0;
 	lon = (part != NULL) ? (double) part->n : 1.0;
 	if (whole == NULL || whole->factor <= 0.0 || lo <= 0.0)
@@ -3870,11 +3901,12 @@ lion_isect_core_sel(PlannerInfo *root, const LionIsectClause *cl,
 /*
  * Remember a conjunction of this run - the n clauses cl[] of table relid,
  * bare copies in the cache's memory - and what its estimate is to be
- * multiplied by.
+ * multiplied by, and what the probe found of it (LionIsect.raw).
  */
 static LionIsect *
 lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
-					const LionIsectClause *cl, double factor, bool measured)
+					const LionIsectClause *cl, double factor, double raw,
+					bool measured)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	LionIsect  *e = (LionIsect *) palloc(sizeof(LionIsect));
@@ -3890,6 +3922,7 @@ lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
 		e->clauses[i] = (Node *) copyObject(lion_isect_bare(cl[i].clause));
 	}
 	e->factor = factor;
+	e->raw = raw;
 	e->measured = measured;
 	cache->isects = lappend(cache->isects, e);
 	MemoryContextSwitchTo(oldcxt);
@@ -3910,11 +3943,20 @@ lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
  * spent, or the probe gives up - the conjunction is taken to be as the parts
  * of it the run did measure say (lion_isect_part_factor()), and is remembered
  * so only when a probe of it gave up.
+ *
+ * *raw is what the probe found, however near core's estimate
+ * (lion_isect_measured_factor()), or -1 where the run measured nothing of
+ * the conjunction.  A conjunction that is not `raisable` - core's estimate
+ * of it within LION_ISECT_ERROR of its smallest clause's, which
+ * lion_isect_factor() takes as it is without a probe - is probed for *raw
+ * alone: its factor stays 1, and it is no part of another conjunction's
+ * (lion_isect_part_factor()).
  */
 static double
 lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				 LionProbeCache *cache, int ncl, LionIsectClause *cl,
-				 Selectivity coresel, Selectivity minsel)
+				 Selectivity coresel, Selectivity minsel, bool raisable,
+				 double *raw)
 {
 	Oid			relid = planner_rt_fetch(rel->relid, root)->relid;
 	LionIsectClause *mcl = (LionIsectClause *) palloc(sizeof(LionIsectClause) * ncl);
@@ -3924,14 +3966,17 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	Selectivity mminsel = minsel;
 	double		probesel = 0.0;
 	double		factor = 1.0;
+	double		fewlo = -1.0;	/* the rows met, of a sample of few hits */
 	int64		left;
 	int			esets = 0;
 	int			m = 0;
 	int			nused = 0;
 	bool		measured = false;
 	bool		raised = false;
+	bool		found = false;
 	int			i;
 
+	*raw = -1.0;
 	memset(&res, 0, sizeof(res));
 	for (i = 0; i < ncl; i++)
 		esets += lion_isect_clause_sets(&cl[i].skey);
@@ -3945,7 +3990,10 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		/* nothing the run has left can measure: remembered as nothing */
 		pfree(mcl);
 		pfree(used);
-		return lion_isect_part_factor(cache, relid, ncl, cl);
+		factor = lion_isect_part_factor(cache, relid, ncl, cl, &found);
+		if (found)
+			*raw = factor;
+		return raisable ? factor : 1.0;
 	}
 	cache->nisectprobes++;
 	measured = lion_isect_measure(rel, idx, m, mcl, left, used, &res);
@@ -4022,6 +4070,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			}
 		}
 		lo = Min(lo, mminsel);
+		fewlo = lo;
 		if (lo >= msel * LION_ISECT_ERROR)
 		{
 			probesel = lo;
@@ -4041,12 +4090,25 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		if (probesel >= msel * LION_ISECT_ERROR ||
 			probesel * LION_ISECT_ERROR <= msel)
 			factor = probesel / msel;
+
+		/*
+		 * ... and what it found, however near core's: a sample of few hits
+		 * raises no further than the rows of the AND it met, as above.
+		 */
+		*raw = (!raised && fewlo >= 0.0 && probesel > msel) ?
+			Max(Min(probesel, fewlo), msel) / msel : probesel / msel;
 	}
 	else
-		factor = lion_isect_part_factor(cache, relid, ncl, cl);
+	{
+		factor = lion_isect_part_factor(cache, relid, ncl, cl, &found);
+		if (found)
+			*raw = factor;
+	}
+	if (!raisable)
+		factor = 1.0;
 
-	elog(DEBUG2, "lion: intersection probe's factor for %d clauses: %.6g, %s%s; %d of them measured, core's estimate of those %.6g, the probe's %.6g",
-		 ncl, factor,
+	elog(DEBUG2, "lion: intersection probe's factor for %d clauses: %.6g (found %.6g), %s%s; %d of them measured, core's estimate of those %.6g, the probe's %.6g",
+		 ncl, factor, *raw,
 		 !measured ? "not measured: as the run's parts of it say" :
 		 raised ? "raised by a sample of few containers with a row of the AND" :
 		 factor == 1.0 ? "core's estimate stands" : "measured",
@@ -4054,8 +4116,8 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 measured ? nused : 0, measured ? msel : coresel,
 		 measured ? probesel : -1.0);
 
-	(void) lion_isect_remember(cache, relid, ncl, cl, factor,
-							   measured && nused == ncl);
+	(void) lion_isect_remember(cache, relid, ncl, cl, factor, *raw,
+							   raisable && measured && nused == ncl);
 
 	/* ... and the part measured, when it is not the whole */
 	if (measured && nused >= 2 && nused < ncl)
@@ -4076,7 +4138,8 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				known = true;
 		}
 		if (!known)
-			(void) lion_isect_remember(cache, relid, nused, pcl, factor, true);
+			(void) lion_isect_remember(cache, relid, nused, pcl, factor, *raw,
+									   raisable);
 		pfree(pcl);
 	}
 	if (res.part != NULL)
@@ -4089,7 +4152,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 static double lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel,
 									IndexOptInfo *idx, int n,
 									const AttrNumber *cols, Node **clauses,
-									bool relfirst);
+									bool relfirst, double *raw);
 
 /*
  * What lion's estimate of the AND of the n clauses - RestrictInfos or bare
@@ -4105,10 +4168,40 @@ double
 lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				  int n, const AttrNumber *cols, Node **clauses)
 {
-	return lion_isect_factor_run(root, rel, idx, n, cols, clauses, true);
+	return lion_isect_factor_run(root, rel, idx, n, cols, clauses, true, NULL);
 }
 
 /*
+ * What the intersection probe found of the same AND, however near core's
+ * estimate of it, into *factor: the share of the rows the AND holds over
+ * core's estimate.  lion_isect_factor() takes a measure only LION_ISECT_ERROR
+ * times off core's or more, what an estimate the plan's rows are sized from
+ * can tell from the noise of ANALYZE's per-column estimates and the sample;
+ * a price of the AND's rows themselves - the candidates a position filter
+ * decides (lion_tsquery_pos_shape()), which every one of them costs - is
+ * nearer the truth with any measure than with core's product, which a
+ * phrase's words, found together far more often than apart, are at a
+ * fraction of.  So the probe measures it wherever core's estimate is not the
+ * smallest clause's own, which nothing can raise, and a sample of few hits
+ * raises it no further than the rows of the AND it met.  False, and *factor
+ * 1, where the run measured nothing of it.
+ */
+bool
+lion_isect_measured_factor(PlannerInfo *root, RelOptInfo *rel,
+						   IndexOptInfo *idx, int n, const AttrNumber *cols,
+						   Node **clauses, double *factor)
+{
+	double		raw = -1.0;
+
+	(void) lion_isect_factor_run(root, rel, idx, n, cols, clauses, true,
+								 &raw);
+	*factor = (raw >= 0.0) ? raw : 1.0;
+	return raw >= 0.0;
+}
+
+/*
+ * ... raw: lion_isect_measured_factor()'s, or NULL.
+ *
  * ... relfirst: before a conjunction not measured yet in this planner run is,
  * the relation's OWN conjunction on idx - every set clause of its
  * restriction clauses that idx answers (lion_isect_rel_clauses()) - is, when
@@ -4122,7 +4215,7 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 static double
 lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					  int n, const AttrNumber *cols, Node **clauses,
-					  bool relfirst)
+					  bool relfirst, double *raw)
 {
 	LionProbeCache *cache;
 	LionIsectClause *cl;
@@ -4132,9 +4225,14 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	Selectivity coresel;
 	Selectivity minsel = 1.0;
 	double		factor;
+	double		measured;
+	bool		raisable;
 	int			ncl = 0;
 	int			i;
 	ListCell   *lc;
+
+	if (raw != NULL)
+		*raw = -1.0;
 
 	/*
 	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
@@ -4202,11 +4300,14 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 
 	/*
 	 * Where it can matter: the AND holds at most the smallest clause's rows,
-	 * so core's estimate can be too small by at most that over it.
+	 * so core's estimate can be too small by at most that over it - by
+	 * LION_ISECT_ERROR or more, for the factor; by anything, for what the
+	 * probe finds (raw).
 	 */
 	coresel = (ncl >= 2) ?
 		clauselist_selectivity(root, group, 0, JOIN_INNER, NULL) : 0.0;
-	if (ncl < 2 || coresel <= 0.0 || coresel * LION_ISECT_ERROR > minsel ||
+	raisable = (coresel * LION_ISECT_ERROR <= minsel);
+	if (ncl < 2 || coresel <= 0.0 || (!raisable && raw == NULL) ||
 		!lion_isect_readable(root, rel, idx, ncl, cl))
 	{
 		list_free(group);
@@ -4236,7 +4337,7 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		if (nrel >= 2)
 		{
 			(void) lion_isect_factor_run(root, rel, idx, nrel, relcols,
-										 relclauses, false);
+										 relclauses, false, NULL);
 			foreach(lc, cache->isects)
 			{
 				if (lion_isect_same((LionIsect *) lfirst(lc), rte->relid,
@@ -4251,8 +4352,16 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		pfree(relclauses);
 	}
 
-	factor = (e != NULL) ? e->factor :
-		lion_isect_probe(root, rel, idx, cache, ncl, cl, coresel, minsel);
+	if (e != NULL)
+	{
+		factor = e->factor;
+		measured = e->raw;
+	}
+	else
+		factor = lion_isect_probe(root, rel, idx, cache, ncl, cl, coresel,
+								  minsel, raisable, &measured);
+	if (raw != NULL)
+		*raw = measured;
 	pfree(cl);
 	return factor;
 }
@@ -4318,7 +4427,7 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 
 	if (best != NULL && bestn >= 2)
 		factor = lion_isect_factor_run(root, rel, best, bestn, bestcols,
-									   bestclauses, false);
+									   bestclauses, false, NULL);
 	if (best != NULL)
 	{
 		pfree(bestcols);
@@ -4879,6 +4988,8 @@ typedef struct LionNdistinctCache
 	Oid			amoid;			/* lion's, or InvalidOid without the AM */
 	List	   *indexes;		/* LionNdistinctIndex */
 	List	   *rows;			/* LionNdistinctRow */
+	List	   *mcvrows;		/* LionMcvRow (below) */
+	HTAB	   *mcvkeys;		/* LionMcvKey: the keys looked up (below) */
 	List	   *outerrels;		/* LionOuterRel (lion_outer_param_loops()) */
 	List	   *skews;			/* LionSkewCol (lion_skew_param_factor()) */
 	List	   *skewscales;		/* LionSkewScale (lion_skew_scale_find()) */
@@ -5103,28 +5214,845 @@ lion_nd_core_lookup(PlannerInfo *root, Node *node, int varRelid,
 	PG_END_TRY();
 }
 
+/* ---------------------------------------------------------------------
+ * The frequencies of the listed values (DESIGN.md §33, "The frequencies of
+ * the listed values")
+ * --------------------------------------------------------------------- */
+
+/*
+ * Core estimates `col = c` from the column's most common values when c is one
+ * of them, and otherwise from what they leave: the rows that are neither NULL
+ * nor one of them, shared equally among the other distinct values
+ * (var_eq_const()); `col IN (...)` and `col = ANY (array)` add that up over
+ * the values listed (scalararraysel()).  On a skewed column - a few values
+ * with a great many rows, most with a handful - ANALYZE's list holds some of
+ * the heavy values, and every other one is estimated at a rare value's share:
+ * a list of heavy values comes out at a handful of rows a value, and the plan
+ * made for a handful reads the heap for each of the thousands there are.  The
+ * count of distinct values above makes the share exact, and so does not help:
+ * the share is the wrong answer for the values a query names.
+ *
+ * A lion index on the column knows each of those values' rows: its entry's
+ * header counts them (lion_key_ntids(), one descent).  So the row the column
+ * is served with carries every value the relation's clauses - restrictions
+ * and join clauses, at their top level or in ANDs and ORs nested to any
+ * depth - compare it with by the index's equality, `col = c`, `col IN (...)`
+ * or `col = ANY (array)`, among its most common values, with the entry's
+ * TIDs over the relation's rows as its frequency, 0 for a value without an
+ * entry.  A value ANALYZE's list has already gets the exact frequency in place
+ * of the sampled one; the rest of that list, the histogram, every other slot
+ * and stadistinct (as served above) stay.  Core finds each value in the list,
+ * and its estimate is the value's rows.  The list stays in ANALYZE's order,
+ * the most common first.
+ *
+ * What is served, and when:
+ *	- a plain column of a table, by the rules n_distinct is served by: core
+ *	  has a row, not an inheritance tree's or a partitioned table's, and a
+ *	  valid, non-partial, non-hypothetical lion index has a scalar key column
+ *	  that is exactly the column, with the column type's equality.  An
+ *	  expression column is not served;
+ *	- only where the user may read every row of the column (core's acl_ok):
+ *	  the frequencies count the rows a row-level policy or a security barrier
+ *	  view hides, and EXPLAIN shows them, as the intersection probe asks too
+ *	  (lion_isect_readable());
+ *	- the values of the relation's own clauses, its restrictions and its join
+ *	  clauses, that are constants of the index's key type compared with the
+ *	  column by the index's equality, under its collation.  A Param, an
+ *	  expression the executor evaluates and a NULL are left to core;
+ *	- at most LION_MCV_MAX_KEYS values, and only when every comparison of the
+ *	  column with constants by that equality is taken.  Core takes a value
+ *	  outside the list to be no more common than its least common one
+ *	  (var_eq_const()), which a listed value of a few rows, or of none,
+ *	  lowers: so no constant is left outside the list for core to estimate
+ *	  so, and a list too long, or a comparison the index's equality cannot
+ *	  take (another type's constant, a stable expression core folds to one),
+ *	  has the column served without the frequencies;
+ *	- once per planner run and relation: the row is made the first time the
+ *	  column is asked about - when the relation's size is estimated - and
+ *	  handed out as it is for every estimate after, restrictions, joins and
+ *	  GROUP BY alike, and made again only when the relation's clauses have
+ *	  changed in number since.  Each value is looked up once per run, however
+ *	  many relations name it (cache->mcvkeys).
+ *
+ * The endpoint probe's scope (lion_probe_begin()) makes its row from the row
+ * served here, so the two corrections are one row while it lasts.
+ */
+
+/*
+ * The most values of one column of one relation whose frequencies are looked
+ * up: as many as the longest IN list the count pushdown takes as a literal
+ * (LION_MAX_ARRAY_ELEMS, DESIGN.md §15), past which lion_analyze_leaf()
+ * declines a list.  Each is a descent of the directory, once per planner run,
+ * and each joins the most common values that core's estimate of an IN list
+ * walks once per value listed (var_eq_const()): so the bound is on both.
+ */
+#define LION_MCV_MAX_KEYS	LION_MAX_ARRAY_ELEMS
+
+/*
+ * A key looked up in this planner run: the key column of an index and the
+ * hash of the key's bytes, with the key itself to settle a collision.
+ */
+typedef struct LionMcvKeyTag
+{
+	Oid			indexoid;
+	AttrNumber	col;			/* the index's key column, 1-based */
+	uint32		hash;			/* datum_image_hash() of the key */
+} LionMcvKeyTag;
+
+typedef struct LionMcvKey
+{
+	LionMcvKeyTag tag;			/* the hash key: first */
+	Datum		value;			/* the key, in the run's memory */
+	uint64		ntids;			/* its entry's TIDs, 0 without one */
+} LionMcvKey;
+
+/*
+ * One column of one relation of the query, and the row it is served with:
+ * stats NULL when it is served without the frequencies.  Made again when the
+ * relation's clauses are not the nclauses they were.
+ */
+typedef struct LionMcvRow
+{
+	RelOptInfo *rel;
+	AttrNumber	attnum;
+	int			nclauses;		/* baserestrictinfo and joininfo, then */
+	HeapTuple	stats;
+} LionMcvRow;
+
+/* One value a clause compares the column with. */
+typedef struct LionMcvValue
+{
+	Datum		value;
+	uint32		hash;			/* datum_image_hash() */
+	int			pos;			/* its place among the clauses' values */
+	bool		dup;			/* the bytes of an earlier one */
+	uint64		ntids;			/* its entry's TIDs */
+} LionMcvValue;
+
+/* One column of one relation, and the values its clauses compare it with. */
+typedef struct LionMcvCollect
+{
+	PlannerInfo *root;
+	Index		relid;			/* the relation, by its range table index */
+	AttrNumber	attnum;
+	IndexOptInfo *idx;			/* the index the values are looked up in */
+	int			col;			/* ... its key column, 0-based */
+	Oid			eqop;			/* ... its equality */
+	Oid			keytype;		/* ... and its key type */
+	int16		typlen;			/* ... whose storage the values have */
+	bool		typbyval;
+	bool		refused;		/* a comparison with constants not taken */
+	int			nvalues;
+	int			maxvalues;
+	LionMcvValue *values;
+} LionMcvCollect;
+
+/* The relation's clauses a row is made from, by their number. */
+static int
+lion_mcv_nclauses(RelOptInfo *rel)
+{
+	return list_length(rel->baserestrictinfo) + list_length(rel->joininfo);
+}
+
+static LionMcvRow *
+lion_mcv_row(LionNdistinctCache *cache, RelOptInfo *rel, AttrNumber attnum)
+{
+	ListCell   *lc;
+
+	foreach(lc, cache->mcvrows)
+	{
+		LionMcvRow *row = (LionMcvRow *) lfirst(lc);
+
+		if (row->rel == rel && row->attnum == attnum)
+			return row;
+	}
+	return NULL;
+}
+
+/*
+ * Remember what this run made for rel's column: stats (already in the run's
+ * memory), or none.  An entry made before for clauses since added to takes
+ * the new row; the old one stays in the run's memory with whatever was
+ * handed it.
+ */
+static LionMcvRow *
+lion_mcv_remember(LionNdistinctCache *cache, LionMcvRow *row, RelOptInfo *rel,
+				  AttrNumber attnum, HeapTuple stats)
+{
+	if (row == NULL)
+	{
+		MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+
+		row = (LionMcvRow *) palloc0(sizeof(LionMcvRow));
+		row->rel = rel;
+		row->attnum = attnum;
+		cache->mcvrows = lappend(cache->mcvrows, row);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	row->nclauses = lion_mcv_nclauses(rel);
+	row->stats = stats;
+	return row;
+}
+
+/* Is a value of type a stored as one of type b: the same bytes? */
+static bool
+lion_mcv_same_bytes(Oid a, Oid b)
+{
+	int16		len1,
+				len2;
+	bool		byval1,
+				byval2;
+
+	if (a == b)
+		return true;
+	if (!IsBinaryCoercible(a, b) && !IsBinaryCoercible(b, a))
+		return false;
+	get_typlenbyval(a, &len1, &byval1);
+	get_typlenbyval(b, &len2, &byval2);
+	return len1 == len2 && byval1 == byval2;
+}
+
+/* Is node the column, relabelled or not? */
+static bool
+lion_mcv_is_column(Node *node, LionMcvCollect *mc)
+{
+	node = lion_strip(node);
+	return node != NULL && IsA(node, Var) &&
+		((Var *) node)->varno == (int) mc->relid &&
+		((Var *) node)->varattno == mc->attnum &&
+		((Var *) node)->varlevelsup == 0;
+}
+
+/* Does the expression mention the column? */
+static bool
+lion_mcv_mentions(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Var))
+		return lion_mcv_is_column(node, (LionMcvCollect *) context);
+	return expression_tree_walker(node, lion_mcv_mentions, context);
+}
+
+/* Would core estimate node as the constant it folds to (eqsel())? */
+static bool
+lion_mcv_folds(PlannerInfo *root, Node *node)
+{
+	Node	   *est = estimate_expression_value(root, node);
+
+	return IsA(est, Const) && !((Const *) est)->constisnull;
+}
+
+static void
+lion_mcv_add(LionMcvCollect *mc, Datum value)
+{
+	LionMcvValue *v;
+
+	if (mc->nvalues >= mc->maxvalues)
+	{
+		mc->maxvalues = Max(mc->maxvalues * 2, 64);
+		mc->values = (mc->values == NULL) ?
+			(LionMcvValue *) palloc(sizeof(LionMcvValue) * mc->maxvalues) :
+			(LionMcvValue *) repalloc(mc->values,
+									  sizeof(LionMcvValue) * mc->maxvalues);
+	}
+	v = &mc->values[mc->nvalues];
+	v->value = value;
+	v->hash = datum_image_hash(value, mc->typbyval, mc->typlen);
+	v->pos = mc->nvalues++;
+	v->dup = false;
+	v->ntids = 0;
+}
+
+/*
+ * A comparison of the column by the index's equality with a constant, or a
+ * list of them, that lion_analyze_leaf() declined: a list longer than it
+ * takes.  Core estimates its values all the same.
+ */
+static bool
+lion_mcv_untaken(Node *leaf, LionMcvCollect *mc)
+{
+	Node	   *other;
+	Oid			opno;
+
+	if (IsA(leaf, ScalarArrayOpExpr))
+	{
+		ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) leaf;
+
+		if (!saop->useOr || list_length(saop->args) != 2 ||
+			!lion_mcv_is_column((Node *) linitial(saop->args), mc))
+			return false;
+		opno = saop->opno;
+		other = lion_strip((Node *) lsecond(saop->args));
+		if (other == NULL ||
+			!(IsA(other, ArrayExpr) ||
+			  (IsA(other, Const) && !((Const *) other)->constisnull)))
+			return false;
+	}
+	else if (IsA(leaf, OpExpr) && list_length(((OpExpr *) leaf)->args) == 2)
+	{
+		OpExpr	   *op = (OpExpr *) leaf;
+
+		if (lion_mcv_is_column((Node *) linitial(op->args), mc))
+			other = lion_strip((Node *) lsecond(op->args));
+		else if (lion_mcv_is_column((Node *) lsecond(op->args), mc))
+			other = lion_strip((Node *) linitial(op->args));
+		else
+			return false;
+		opno = op->opno;
+		if (other == NULL || !IsA(other, Const) ||
+			((Const *) other)->constisnull)
+			return false;
+	}
+	else
+		return false;
+
+	return get_op_opfamily_strategy(opno, mc->idx->opfamily[mc->col]) ==
+		LION_STRAT_EQUAL;
+}
+
+/*
+ * One leaf of a clause of the relation: the values it compares the column
+ * with, as lion's count pushdown reads the clause (lion_analyze_leaf()), when
+ * they are constants of the index's key type compared by its equality.  A
+ * comparison with constants that cannot be taken refuses the column.
+ */
+static void
+lion_mcv_leaf(Node *leaf, LionMcvCollect *mc)
+{
+	Oid			coll = mc->idx->indexcollations[mc->col];
+	LionLeafInfo li;
+
+	if (!lion_mcv_mentions(leaf, mc))
+		return;
+	if (!lion_analyze_leaf(mc->root, leaf, mc->relid, false, false, false,
+						   &li) ||
+		(li.kind != LION_CLAUSE_EQ && li.kind != LION_CLAUSE_ARRAY) ||
+		li.var->varattno != mc->attnum)
+	{
+		if (lion_mcv_untaken(leaf, mc))
+			mc->refused = true;
+		return;
+	}
+
+	/*
+	 * The index's own equality, under its collation or with the same equality
+	 * (two deterministic collations compare the bytes), on its key type: what
+	 * the index's entries are the classes of.
+	 */
+	if (li.opno != mc->eqop ||
+		!(li.collation == coll ||
+		  (OidIsValid(li.collation) && OidIsValid(coll) &&
+		   get_collation_isdeterministic(li.collation) &&
+		   get_collation_isdeterministic(coll))) ||
+		!lion_mcv_same_bytes(li.cmptype, mc->keytype))
+	{
+		if (lion_mcv_untaken(leaf, mc) ||
+			(li.kind == LION_CLAUSE_EQ && lion_mcv_folds(mc->root, li.val)))
+			mc->refused = true;
+		return;
+	}
+
+	if (IsA(li.val, Const) && ((Const *) li.val)->constisnull)
+		return;					/* `= NULL` is no row's: core's 0 */
+	if (IsA(li.val, Const) && li.kind == LION_CLAUSE_EQ)
+		lion_mcv_add(mc, ((Const *) li.val)->constvalue);
+	else if (IsA(li.val, Const))
+	{
+		ArrayType  *arr = DatumGetArrayTypeP(((Const *) li.val)->constvalue);
+		Oid			elemtype = ARR_ELEMTYPE(arr);
+		int16		elmlen;
+		bool		elmbyval;
+		char		elmalign;
+		Datum	   *elems;
+		bool	   *nulls;
+		int			nelems;
+		int			i;
+
+		if (!lion_mcv_same_bytes(elemtype, mc->keytype))
+		{
+			mc->refused = true;
+			return;
+		}
+		get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
+		deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
+						  &elems, &nulls, &nelems);
+		for (i = 0; i < nelems; i++)
+		{
+			if (!nulls[i])		/* `= NULL` is no row's: core's 0 */
+				lion_mcv_add(mc, elems[i]);
+		}
+	}
+	else if (IsA(li.val, ArrayExpr))
+	{
+		/* `col IN (1, 2, $1)`: core estimates each element by itself */
+		ListCell   *lc;
+
+		foreach(lc, ((ArrayExpr *) li.val)->elements)
+		{
+			Node	   *elem = lion_strip((Node *) lfirst(lc));
+
+			if (!IsA(elem, Const))
+			{
+				if (lion_mcv_folds(mc->root, (Node *) lfirst(lc)))
+					mc->refused = true;
+			}
+			else if (((Const *) elem)->constisnull)
+				continue;
+			else if (!lion_mcv_same_bytes(((Const *) elem)->consttype,
+										  mc->keytype))
+				mc->refused = true;
+			else
+				lion_mcv_add(mc, ((Const *) elem)->constvalue);
+		}
+	}
+	else if (lion_mcv_folds(mc->root, li.val))
+	{
+		/*
+		 * A stable expression, `col = current_setting(...)::int`, which core
+		 * estimates as the constant it has now and the executor evaluates.
+		 */
+		mc->refused = true;
+	}
+}
+
+/* A clause of the relation, through its ANDs and ORs to their leaves. */
+static void
+lion_mcv_clause(Node *clause, LionMcvCollect *mc)
+{
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (clause == NULL || mc->refused)
+		return;
+	if (IsA(clause, RestrictInfo))
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (is_andclause(clause) || is_orclause(clause))
+	{
+		foreach(lc, ((BoolExpr *) clause)->args)
+			lion_mcv_clause((Node *) lfirst(lc), mc);
+		return;
+	}
+	lion_mcv_leaf(clause, mc);
+}
+
+/* By hash, then in the clauses' order. */
+static int
+lion_mcv_value_cmp(const void *a, const void *b)
+{
+	const LionMcvValue *va = (const LionMcvValue *) a;
+	const LionMcvValue *vb = (const LionMcvValue *) b;
+
+	if (va->hash != vb->hash)
+		return (va->hash < vb->hash) ? -1 : 1;
+	return (va->pos < vb->pos) ? -1 : (va->pos > vb->pos) ? 1 : 0;
+}
+
+/*
+ * The values without their repetitions - the same bytes twice - and how many
+ * there are.
+ */
+static int
+lion_mcv_distinct(LionMcvCollect *mc)
+{
+	int			ndistinct = 0;
+	int			i;
+	int			j;
+
+	qsort(mc->values, mc->nvalues, sizeof(LionMcvValue), lion_mcv_value_cmp);
+	for (i = 0; i < mc->nvalues; i++)
+	{
+		LionMcvValue *v = &mc->values[i];
+
+		for (j = i - 1; j >= 0 && mc->values[j].hash == v->hash && !v->dup; j--)
+		{
+			if (!mc->values[j].dup &&
+				datum_image_eq(mc->values[j].value, v->value, mc->typbyval,
+							   mc->typlen))
+				v->dup = true;
+		}
+		if (!v->dup)
+			ndistinct++;
+	}
+	return ndistinct;
+}
+
+/*
+ * The TIDs of value's entry in key column col of index, from this run's
+ * lookups when it has made this one (cache->mcvkeys), and by a descent of the
+ * directory otherwise.
+ */
+static uint64
+lion_mcv_key_ntids(LionNdistinctCache *cache, Relation index, AttrNumber col,
+				   LionMcvCollect *mc, LionMcvValue *v)
+{
+	LionMcvKeyTag tag;
+	LionMcvKey *key;
+	MemoryContext oldcxt;
+	Datum		copy;
+	uint64		ntids;
+	bool		found;
+
+	if (cache->mcvkeys == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(LionMcvKeyTag);
+		ctl.entrysize = sizeof(LionMcvKey);
+		ctl.hcxt = cache->run.cxt;
+		cache->mcvkeys = hash_create("lion index mcv keys", 256, &ctl,
+									 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+
+	memset(&tag, 0, sizeof(tag));	/* the padding is hashed too */
+	tag.indexoid = RelationGetRelid(index);
+	tag.col = col;
+	tag.hash = v->hash;
+	key = (LionMcvKey *) hash_search(cache->mcvkeys, &tag, HASH_FIND, NULL);
+	if (key != NULL &&
+		datum_image_eq(key->value, v->value, mc->typbyval, mc->typlen))
+		return key->ntids;
+
+	CHECK_FOR_INTERRUPTS();
+	(void) lion_key_ntids(index, col, v->value, &ntids);
+
+	/* a collision keeps the key that came first */
+	if (key == NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+		copy = datumCopy(v->value, mc->typbyval, mc->typlen);
+		MemoryContextSwitchTo(oldcxt);
+		key = (LionMcvKey *) hash_search(cache->mcvkeys, &tag, HASH_ENTER,
+										 &found);
+		key->value = copy;
+		key->ntids = ntids;
+	}
+	return ntids;
+}
+
+/* An entry of the list being made. */
+typedef struct LionMcvEntry
+{
+	Datum		value;
+	float4		freq;
+	int			pos;
+} LionMcvEntry;
+
+/* The most common first, and in the order they came among equals. */
+static int
+lion_mcv_entry_cmp(const void *a, const void *b)
+{
+	const LionMcvEntry *ea = (const LionMcvEntry *) a;
+	const LionMcvEntry *eb = (const LionMcvEntry *) b;
+
+	if (ea->freq != eb->freq)
+		return (ea->freq > eb->freq) ? -1 : 1;
+	return (ea->pos < eb->pos) ? -1 : (ea->pos > eb->pos) ? 1 : 0;
+}
+
+/*
+ * base with mc's values among its most common ones, at their frequencies
+ * over tuples rows: ANALYZE's slot with the values it has given theirs and
+ * the others added, or a slot of their own where ANALYZE made none and a
+ * slot is free.  NULL where there is no slot to put them in, or ANALYZE's
+ * values are not stored as the index's keys.
+ */
+static HeapTuple
+lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
+			   Oid varcollid, double tuples)
+{
+	Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(base);
+	AttStatsSlot sslot;
+	bool		have;
+	int			slot;
+	Oid			valuetype;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	FmgrInfo	eqproc;
+	Oid			coll = mc->idx->indexcollations[mc->col];
+	LionMcvEntry *ent;
+	Datum	   *values;
+	Datum	   *freqs;
+	int			nold;
+	int			n;
+	int			i;
+	int			j;
+	double		limit;
+	int			pass;
+	Relation	sd;
+	int			cols[5];
+	Datum		repl[5];
+	bool		nulls[5] = {false, false, false, false, false};
+	int			ncols = 0;
+	HeapTuple	result;
+
+	/* ANALYZE's most common values, or the first free slot */
+	for (slot = 0; slot < STATISTIC_NUM_SLOTS; slot++)
+	{
+		if ((&stats->stakind1)[slot] == STATISTIC_KIND_MCV)
+			break;
+	}
+	have = (slot < STATISTIC_NUM_SLOTS);
+	if (!have)
+	{
+		for (slot = 0; slot < STATISTIC_NUM_SLOTS; slot++)
+		{
+			if ((&stats->stakind1)[slot] == 0)
+				break;
+		}
+		if (slot >= STATISTIC_NUM_SLOTS)
+			return NULL;
+	}
+
+	memset(&sslot, 0, sizeof(sslot));
+	if (have &&
+		(!get_attstatsslot(&sslot, base, STATISTIC_KIND_MCV, InvalidOid,
+						   ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS) ||
+		 sslot.nvalues != sslot.nnumbers))
+	{
+		free_attstatsslot(&sslot);
+		return NULL;
+	}
+	valuetype = have ? sslot.valuetype : vartype;
+	if (!lion_mcv_same_bytes(mc->keytype, valuetype))
+	{
+		free_attstatsslot(&sslot);
+		return NULL;
+	}
+	get_typlenbyvalalign(valuetype, &typlen, &typbyval, &typalign);
+
+	nold = have ? sslot.nvalues : 0;
+	ent = (LionMcvEntry *) palloc(sizeof(LionMcvEntry) *
+								  (nold + mc->nvalues));
+	for (i = 0; i < nold; i++)
+	{
+		ent[i].value = sslot.values[i];
+		ent[i].freq = sslot.numbers[i];
+		ent[i].pos = i;
+	}
+	n = nold;
+
+	/*
+	 * Each value in place of ANALYZE's equal one, by the index's equality -
+	 * which is the column type's, and so the one core will find it by - or
+	 * after them.  The user may read every row (acl_ok), so the equality may
+	 * see ANALYZE's values whether it is leakproof or not.
+	 */
+	fmgr_info(get_opcode(mc->eqop), &eqproc);
+	for (i = 0; i < mc->nvalues; i++)
+	{
+		LionMcvValue *v = &mc->values[i];
+		float4		freq;
+
+		if (v->dup)
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		freq = (float4) Min((double) v->ntids / tuples, 1.0);
+		for (j = 0; j < nold; j++)
+		{
+			if (DatumGetBool(FunctionCall2Coll(&eqproc, coll, sslot.values[j],
+											   v->value)))
+				break;
+		}
+		if (j < nold)
+			ent[j].freq = freq;
+		else
+		{
+			ent[n].value = v->value;
+			ent[n].freq = freq;
+			ent[n].pos = n;
+			n++;
+		}
+	}
+
+	/*
+	 * The values' frequencies and the NULLs' are shares of the same rows, and
+	 * core counts on their adding up to no more than all of them: past it, it
+	 * takes the values of an IN list to be independent of each other rather
+	 * than exclusive (scalararraysel()), and a list of every value of the
+	 * column comes out at two thirds of the rows.  An entry's TIDs count its
+	 * dead row versions until VACUUM, and ANALYZE's other entries are a
+	 * sample's: where the list adds up to more than the rows that are not
+	 * NULL, every entry is scaled down by the same factor to fit - a little
+	 * under, as the sum core makes of the float4 frequencies may round up.
+	 */
+	limit = 1.0 - stats->stanullfrac;
+	for (pass = 0; pass < 3; pass++)
+	{
+		double		sum = 0;
+		double		scale;
+
+		for (i = 0; i < n; i++)
+			sum += ent[i].freq;
+		if (sum <= limit)
+			break;
+		scale = Max(limit, 0.0) / sum * (1.0 - 1e-6 * (pass + 1));
+		for (i = 0; i < n; i++)
+			ent[i].freq = (float4) (ent[i].freq * scale);
+	}
+	qsort(ent, n, sizeof(LionMcvEntry), lion_mcv_entry_cmp);
+
+	values = (Datum *) palloc(sizeof(Datum) * n);
+	freqs = (Datum *) palloc(sizeof(Datum) * n);
+	for (i = 0; i < n; i++)
+	{
+		values[i] = ent[i].value;
+		freqs[i] = Float4GetDatum(ent[i].freq);
+	}
+
+	if (!have)
+	{
+		/* as ANALYZE fills the slot (compute_scalar_stats()) */
+		cols[ncols] = Anum_pg_statistic_stakind1 + slot;
+		repl[ncols++] = Int16GetDatum(STATISTIC_KIND_MCV);
+		cols[ncols] = Anum_pg_statistic_staop1 + slot;
+		repl[ncols++] = ObjectIdGetDatum(mc->eqop);
+		cols[ncols] = Anum_pg_statistic_stacoll1 + slot;
+		repl[ncols++] = ObjectIdGetDatum(varcollid);
+	}
+	cols[ncols] = Anum_pg_statistic_stanumbers1 + slot;
+	repl[ncols++] = PointerGetDatum(construct_array_builtin(freqs, n,
+															FLOAT4OID));
+	cols[ncols] = Anum_pg_statistic_stavalues1 + slot;
+	repl[ncols++] = PointerGetDatum(construct_array(values, n, valuetype,
+													typlen, typbyval,
+													typalign));
+	sd = table_open(StatisticRelationId, AccessShareLock);
+	result = heap_modify_tuple_by_cols(base, RelationGetDescr(sd), ncols,
+									   cols, repl, nulls);
+	table_close(sd, AccessShareLock);
+	free_attstatsslot(&sslot);
+	return result;
+}
+
+/*
+ * The row to serve column attnum of rel with: base - core's row, or the one
+ * with the index's n_distinct - with the values rel's clauses compare the
+ * column with among its most common values (above), in the run's memory; or
+ * NULL, where the column is served as base is.
+ */
+static HeapTuple
+lion_mcv_stats(PlannerInfo *root, LionNdistinctCache *cache, RelOptInfo *rel,
+			   AttrNumber attnum, Oid vartype, Oid varcollid, HeapTuple base)
+{
+	LionMcvCollect mc;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	HeapTuple	result = NULL;
+	ListCell   *lc;
+
+	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9): the column is served without the frequencies.
+	 */
+	if (rel->tuples < 1.0 || lion_old_snapshot_threshold_active())
+		return NULL;
+
+	memset(&mc, 0, sizeof(mc));
+	mc.root = root;
+	mc.relid = rel->relid;
+	mc.attnum = attnum;
+
+	/* the first index that may say, as for n_distinct */
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		if (idx->relam != cache->amoid || idx->hypothetical ||
+			idx->indpred != NIL)
+			continue;
+		for (c = 0; c < idx->nkeycolumns && mc.idx == NULL; c++)
+		{
+			if (idx->indexkeys[c] == attnum &&
+				!lion_opfamily_is_multikey(idx->opfamily[c],
+										   idx->opcintype[c]) &&
+				lion_nd_same_equality(idx, c, vartype, varcollid))
+			{
+				mc.idx = idx;
+				mc.col = c;
+			}
+		}
+		if (mc.idx != NULL)
+			break;
+	}
+	if (mc.idx == NULL)
+		return NULL;
+	mc.eqop = lion_index_equality_op(mc.idx, (AttrNumber) (mc.col + 1));
+	mc.keytype = IsPolymorphicType(mc.idx->opcintype[mc.col]) ?
+		vartype : mc.idx->opcintype[mc.col];
+	get_typlenbyval(mc.keytype, &mc.typlen, &mc.typbyval);
+
+	cxt = AllocSetContextCreate(CurrentMemoryContext, "lion index mcv",
+								ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	foreach(lc, rel->baserestrictinfo)
+		lion_mcv_clause((Node *) lfirst(lc), &mc);
+	foreach(lc, rel->joininfo)
+		lion_mcv_clause((Node *) lfirst(lc), &mc);
+
+	if (!mc.refused && mc.nvalues > 0 &&
+		lion_mcv_distinct(&mc) <= LION_MCV_MAX_KEYS)
+	{
+		Relation	index = index_open(mc.idx->indexoid, NoLock);
+		int			i;
+
+		for (i = 0; i < mc.nvalues; i++)
+		{
+			if (!mc.values[i].dup)
+				mc.values[i].ntids =
+					lion_mcv_key_ntids(cache, index,
+									   (AttrNumber) (mc.col + 1), &mc,
+									   &mc.values[i]);
+		}
+		index_close(index, NoLock);
+
+		result = lion_mcv_merge(&mc, base, vartype, varcollid, rel->tuples);
+		if (result != NULL)
+		{
+			MemoryContextSwitchTo(cache->run.cxt);
+			result = heap_copytuple(result);
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+	return result;
+}
+
 /*
  * get_relation_stats_hook, for column attnum of the table rte names: its
- * pg_statistic row with stadistinct from a lion index on it (above).
+ * pg_statistic row with stadistinct from a lion index on it, and with the
+ * values the relation's clauses compare it with among its most common values
+ * (above) - either, both, or neither.
  */
 static bool
 lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 					 VariableStatData *vardata)
 {
 	LionNdistinctCache *cache;
-	LionNdistinctRow *row;
+	LionNdistinctRow *row = NULL;
+	LionMcvRow *mcv = NULL;
+	bool		listed;			/* the frequencies of the listed values */
+	bool		mcvcurrent = false;
 	RelOptInfo *rel = NULL;
 	Index		varno = 0;
 	Oid			vartype;
 	int32		vartypmod;
 	Oid			varcollid;
 	VariableStatData core;
+	HeapTuple	served;
 	float4		stadistinct = 0;
 	bool		keyed = false;
 	ListCell   *lc;
 	int			i;
 
-	if (!lion_enable_index_ndistinct || root == NULL || root->glob == NULL ||
+	/* not for the rows of a probed key, which are the column's (§33) */
+	listed = lion_enable_index_mcv && !lion_skew_unlisted;
+	if ((!lion_enable_index_ndistinct && !listed) ||
+		root == NULL || root->glob == NULL ||
 		root->simple_rte_array == NULL || attnum <= 0 ||
 		rte->rtekind != RTE_RELATION || rte->inh ||
 		rte->relkind == RELKIND_PARTITIONED_TABLE)
@@ -5160,8 +6088,17 @@ lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 	if (!keyed)
 		return false;
 
-	row = lion_nd_row(cache, rte->relid, attnum);
-	if (row != NULL && row->stats == NULL)
+	/* what this run decided already, and nothing to supply when that's all */
+	if (lion_enable_index_ndistinct)
+		row = lion_nd_row(cache, rte->relid, attnum);
+	if (listed)
+	{
+		mcv = lion_mcv_row(cache, rel, attnum);
+		mcvcurrent = (mcv != NULL &&
+					  mcv->nclauses == lion_mcv_nclauses(rel));
+	}
+	if ((!lion_enable_index_ndistinct || (row != NULL && row->stats == NULL)) &&
+		(!listed || (mcvcurrent && mcv->stats == NULL)))
 		return false;
 
 	/*
@@ -5180,13 +6117,18 @@ lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->staattnum != attnum ||
 		((Form_pg_statistic) GETSTRUCT(core.statsTuple))->stainherit)
 	{
-		if (row == NULL && !HeapTupleIsValid(core.statsTuple))
-			(void) lion_nd_remember(cache, rte->relid, attnum, NULL, 0);
+		if (!HeapTupleIsValid(core.statsTuple))
+		{
+			if (lion_enable_index_ndistinct && row == NULL)
+				(void) lion_nd_remember(cache, rte->relid, attnum, NULL, 0);
+			if (listed && !mcvcurrent)
+				(void) lion_mcv_remember(cache, mcv, rel, attnum, NULL);
+		}
 		ReleaseVariableStats(core);
 		return false;
 	}
 
-	if (row == NULL)
+	if (lion_enable_index_ndistinct && row == NULL)
 	{
 		AttributeOpts *aopt = get_attribute_options(rte->relid, attnum);
 		bool		found = false;
@@ -5228,14 +6170,34 @@ lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 		}
 		row = lion_nd_remember(cache, rte->relid, attnum,
 							   found ? core.statsTuple : NULL, stadistinct);
-		if (row->stats == NULL)
-		{
-			ReleaseVariableStats(core);
-			return false;
-		}
 	}
 
-	vardata->statsTuple = row->stats;
+	/*
+	 * The values the relation's clauses list, in the row served without them:
+	 * the one with the index's count, or core's.  Only for a user who may
+	 * read every row of the column, which is this relation's to say; the
+	 * row is remembered for the relation.
+	 */
+	if (listed && !mcvcurrent)
+		mcv = lion_mcv_remember(cache, mcv, rel, attnum,
+								core.acl_ok ?
+								lion_mcv_stats(root, cache, rel, attnum,
+											   vartype, varcollid,
+											   (row != NULL && row->stats != NULL) ?
+											   row->stats : core.statsTuple) :
+								NULL);
+
+	if (listed && mcv->stats != NULL && core.acl_ok)
+		served = mcv->stats;
+	else if (row != NULL && row->stats != NULL)
+		served = row->stats;
+	else
+	{
+		ReleaseVariableStats(core);
+		return false;
+	}
+
+	vardata->statsTuple = served;
 	vardata->freefunc = lion_nd_release;
 	vardata->acl_ok = core.acl_ok;
 	ReleaseVariableStats(core);
@@ -5646,6 +6608,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 	uint64		best_count = 0;
 	double		tuples = rel->tuples;
 	VariableStatData vardata;
+	bool		saveunlisted;
 	ListCell   *lc;
 
 	col->rows = 0;
@@ -5685,8 +6648,25 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 	if (best == NULL)
 		return;
 
-	/* core's rows per key, as var_eq_non_const() has them, and the MCVs */
-	examine_variable(root, (Node *) var, 0, &vardata);
+	/*
+	 * Core's rows per key, as var_eq_non_const() has them, and the MCVs:
+	 * ANALYZE's, without the values a relation's clauses list (§33, "The
+	 * frequencies of the listed values"), which are one relation's of one
+	 * query, and without the probe scope's ends.  The figure is the
+	 * column's, kept for every relation of the table the run plans
+	 * (lion_skew_param_factor()).
+	 */
+	saveunlisted = lion_skew_unlisted;
+	lion_skew_unlisted = true;
+	PG_TRY();
+	{
+		examine_variable(root, (Node *) var, 0, &vardata);
+	}
+	PG_FINALLY();
+	{
+		lion_skew_unlisted = saveunlisted;
+	}
+	PG_END_TRY();
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
 		Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);

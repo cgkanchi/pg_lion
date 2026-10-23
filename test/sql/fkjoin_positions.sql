@@ -151,8 +151,9 @@ RESET pg_lion.fkjoin_collect_container_cost;
 -- An index scan decides its superset from positions too, its cursors begun
 -- again at every scan: the inner scan of a key's rows, repeated for each
 -- key, is priced with the seeks to them (lion_cost_scan_posfilter()) - both
--- lexemes' 15,000 members decoded, at 1.8 cpu_operator_cost, and 56
--- candidates estimated at 4.3 a lexeme - beyond the same scan of
+-- lexemes' 15,000 members decoded, at 2.4 cpu_operator_cost, and 75
+-- candidates at 4.3 a lexeme, the AND of the two as the intersection probe
+-- measures it, a third more than core's product - beyond the same scan of
 -- `foo & bar`, which the posting sets answer alone.  And the candidates are
 -- the superset's (lion_tsquery_pos_shape()): `foo <-> !bar` decides every
 -- one of a key's 75 rows with `foo`, reading `bar` beside it, where it

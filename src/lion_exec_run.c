@@ -900,10 +900,9 @@ lion_rescan_custom_scan(CustomScanState *node)
  * once for each of its runs - and the sums of their counters.  A node that is
  * none of these, or one run without a Gather, never gets here.
  */
-Size
-lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+static Size
+lion_dsm_counted_off(LionCountScanState *st)
 {
-	LionCountScanState *st = (LionCountScanState *) node;
 	LionJoinState *js;
 
 	if (st->ranged != NULL)
@@ -912,6 +911,19 @@ lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 	return MAXALIGN(sizeof(LionJoinShared)) +
 		(Size) ((js->collect && st->npart > 0) ? st->npart : 1) *
 		lion_shared_copy_size();
+}
+
+/*
+ * ... and after it all, what the workers collected, spilled and walked of
+ * the ranges and lists taken as sources, a byte a clause
+ * (LION_JOIN_SHARED_COUNTED).
+ */
+Size
+lion_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
+{
+	LionCountScanState *st = (LionCountScanState *) node;
+
+	return lion_dsm_counted_off(st) + MAXALIGN(Max(st->nclause, 1));
 }
 
 /*
@@ -952,6 +964,9 @@ lion_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	shared->filterrows = -1;
 	pg_atomic_init_u32(&shared->nextchunk, 0);
 	pg_atomic_init_u32(&shared->antiowner, 0);
+	shared->nclause = st->nclause;
+	shared->countedoff = lion_dsm_counted_off(st);
+	memset(LION_JOIN_SHARED_COUNTED(shared), 0, Max(st->nclause, 1));
 	st->shared = shared;
 
 	/*
@@ -1106,6 +1121,9 @@ lion_initialize_worker(CustomScanState *node, shm_toc *toc, void *coordinate)
 
 	st->shared = (LionJoinShared *) coordinate;
 	lion_list_pin_participants(st->shared->participants);
+	if (st->shared->nclause != st->nclause)
+		elog(ERROR, "LionCount: a worker of %d clauses, the plan's %d",
+			 st->nclause, st->shared->nclause);
 
 	/*
 	 * The fact filters' copy, and the file set its chunks may spill to: only
@@ -1146,13 +1164,6 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 		sums->rangeeval[i] += st->rangeeval[i];
 	sums->summaries += st->summaries;
 	sums->rangeprobed += st->rangeprobed;
-	sums->rangesrc_collected += st->rangesrc_collected;
-	sums->rangesrc_walked += st->rangesrc_walked;
-	sums->rangesrc_spilled += st->rangesrc_spilled;
-	/* every participant collects the same lists: how many, not how often */
-	sums->listsrc_collected = Max(sums->listsrc_collected,
-								  st->listsrc_collected);
-	sums->listsrc_spilled = Max(sums->listsrc_spilled, st->listsrc_spilled);
 	sums->wherecollected += st->wherecollected;
 	sums->wherespilled += st->wherespilled;
 	sums->groupbatches += st->groupbatches;
@@ -1226,6 +1237,9 @@ lion_shutdown_custom_scan(CustomScanState *node)
 			return;
 		SpinLockAcquire(&shared->mutex);
 		lion_scan_sums_add(&shared->scan, st);
+		Assert(shared->nclause == st->nclause);
+		for (i = 0; i < Min(shared->nclause, st->nclause); i++)
+			LION_JOIN_SHARED_COUNTED(shared)[i] |= st->clause[i].counted;
 		if (js != NULL)
 		{
 			shared->lookups += js->lookups;
@@ -1262,8 +1276,16 @@ lion_shutdown_custom_scan(CustomScanState *node)
 		return;
 	}
 
+	if (st->workercounted == NULL && st->nclause > 0)
+		st->workercounted = (uint8 *)
+			MemoryContextAllocZero(node->ss.ps.state->es_query_cxt,
+								   st->nclause);
 	SpinLockAcquire(&shared->mutex);
 	st->worker = shared->scan;
+	Assert(shared->nclause == st->nclause);
+	if (st->workercounted != NULL)
+		memcpy(st->workercounted, LION_JOIN_SHARED_COUNTED(shared),
+			   Min(shared->nclause, st->nclause));
 	if (js != NULL)
 	{
 		LionJoinWorkerSums *w = &js->worker;

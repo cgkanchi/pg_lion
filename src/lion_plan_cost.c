@@ -27,7 +27,8 @@ static double lion_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 										double *colbytes);
 static bool lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
-								   Node *clause, double *widen, int *nlex,
+								   Node *clause, double *widen,
+								   double *supersel, int *nlex,
 								   double **lexsel);
 
 /*
@@ -2823,13 +2824,25 @@ lion_container_max_bytes(double tuples, double pages)
  * keep it all - each container written once for every level before the one
  * that keeps its key.  With two parts that is 2/3 of the walk at n = 3, and
  * twice the walk at n = 11.
+ *
+ * A walk that hands its keys out in order - a column in the heap's order, or
+ * in its reverse - splits the first window's overflow into one part, not
+ * fanout: the window does not know where its keys end, so its last part is
+ * open from the highest key it has seen when it first gives keys back, which
+ * is about where it cut, and every key after that goes to that part (or, in
+ * reverse, to its low part).  The window made of that part knows its end and
+ * splits as the first would have: the levels are 1, 1, fanout, ..., one pass
+ * more (`ordered`).  Measured on 3M rows at 64 kB (2026-10-23): a range of a
+ * column in heap order put 10.77 MB of its 10.78 MB overflow into the first
+ * window's last part, a scattered one 8.4, 4.5 and 4.4 MB into its three.
  */
 static double
-lion_union_overflow_share(double n, int fanout)
+lion_union_overflow_share(double n, int fanout, bool ordered)
 {
 	double		kept = 0.0;
 	double		windows = 1.0;
 	double		share = 0.0;
+	bool		first = true;
 
 	if (!(n > 1.0))
 		return 0.0;
@@ -2840,7 +2853,9 @@ lion_union_overflow_share(double n, int fanout)
 		if (kept >= n)
 			break;
 		share += 1.0 - kept / n;
-		windows *= fanout;
+		if (!(first && ordered))
+			windows *= fanout;
+		first = false;
 	}
 	return share;
 }
@@ -2871,11 +2886,12 @@ lion_union_overflow_share(double n, int fanout)
  * overflow's buffers (LION_UNION_SPILL_BLOCKS), and never less than
  * LION_RANGE_WINDOW_MIN - each time at LION_SPILL_READ_COST, a container
  * read back from a file, and the pages they take
- * (lion_union_overflow_share()); and the set's file is written once and read
- * once.  What stays in memory is sixteen bytes a container key and the
- * file's buffer.  That is the price, an OR's leaf's as any other's; the
- * counts that read the file back pay for what they read of it, as they read
- * it (LION_SPILL_READ_COST).  Over a range of small sets in no order -
+ * (lion_union_overflow_share(): a level more for a column in the heap's
+ * order, which the correlation interpolates); and the set's file is written
+ * once and read once.  What stays in memory is sixteen bytes a container key
+ * and the file's buffer.  That is the price, an OR's leaf's as any other's;
+ * the counts that read the file back pay for what they read of it, as they
+ * read it (LION_SPILL_READ_COST).  Over a range of small sets in no order -
  * summaries of a few dozen rows, a container each at most of the heap's
  * keys - that is many times the union's containers, and the walk at every
  * count may be the cheaper.
@@ -2886,19 +2902,16 @@ lion_union_overflow_share(double n, int fanout)
  * hold what a spilled range holds; this one is collected in what that freed.
  * The caller prices the counts' reads of those files.
  *
- * Walking such a range at every count is the cheaper way where there are few
- * counts, and a count may choose it (LION_FLAG_RANGEWALK,
- * lion_count_rel_walk_save()): where the caller passes `attempt`, *attempt
- * is what trying to collect one that does not fit costs before the executor
- * gives up and walks it - the share of the walk and union that fills the
- * memory left - and 0 for one that fits, which is collected either way.  A
- * walked range sends no other to a file.
+ * Walking the range at every count instead, which the executor then does
+ * from the start, collecting none of it, is the cheaper way where there are
+ * few counts, and a count may choose it (LION_FLAG_RANGEWALK,
+ * lion_count_rel_walk_save()) against what this returns, in memory or in
+ * windows.  A walked range sends no other to a file.
  */
 Cost
 lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					   AttrNumber col, List *bounds, Selectivity sel,
-					   LionRangeMem *mem, bool *spills, bool *evicts,
-					   Cost *attempt)
+					   LionRangeMem *mem, bool *spills, bool *evicts)
 {
 	double		limit = (double) get_hash_memory_limit();
 	double		budget = Max(limit - mem->held, 0.0);
@@ -2925,13 +2938,10 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		inpages;
 	Cost		scan;
 	Cost		unite;
-	Cost		tried;
 	Cost		evict = 0;
 
 	*spills = false;
 	*evicts = false;
-	if (attempt != NULL)
-		*attempt = 0;
 	if (var == NULL)
 		return disable_cost;
 	w.sides = lion_range_sides(idx, col, bounds);
@@ -2951,12 +2961,11 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		return scan + unite;
 	}
 
-	tried = Max((scan + unite) * Min(budget / bytes, 1.0), 1.0);
-	if (attempt != NULL)
-		*attempt = tried;
 	if (mem->inmem > 0.0)
 	{
-		evict = tried + 2.0 * ceil(mem->inmem / BLCKSZ) * seq_page_cost;
+		/* the try in what the others left, until it is spent */
+		evict = Max((scan + unite) * Min(budget / bytes, 1.0), 1.0) +
+			2.0 * ceil(mem->inmem / BLCKSZ) * seq_page_cost;
 		mem->held = Max(mem->held - mem->inmem, 0.0) + mem->inmemspill;
 		mem->inmem = 0.0;
 		mem->inmemspill = 0.0;
@@ -2974,7 +2983,9 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	fanout = LION_UNION_FANOUT(budget);
 	window = Max(budget - (double) (LION_UNION_SPILL_BLOCKS(fanout) * BLCKSZ),
 				 (double) LION_RANGE_WINDOW_MIN);
-	written = lion_union_overflow_share(bytes / window, fanout);
+	written = lion_union_overflow_share(bytes / window, fanout, false);
+	written += (lion_union_overflow_share(bytes / window, fanout, true) -
+				written) * c2;
 	lion_range_walk_containers(heap_pages, tuples, &w, &inord, &inscat);
 	incont = inscat + (inord - inscat) * c2;
 	inpages = Min(rows * sizeof(uint16) +
@@ -3064,10 +3075,11 @@ lion_cost_where_collected(int nsrc, const double *members,
 #define LION_RANGE_DESCENT_PAGES	1.0
 
 /*
- * A range taken as a source too large for the memory the ranges before it
- * left, outside an OR, which a count may walk rather than collect
- * (lion_count_rel_walk_save()): where it is, what of the relation it holds,
- * and what it costs collected in windows or tried before it is walked.
+ * A range taken as a source outside an OR, which a count may walk rather than
+ * collect (lion_count_rel_walk_save()): where it is, what of the relation it
+ * holds, what it costs collected, in memory or in windows, and what the
+ * counts would read back of its file and of the files it sent the ranges in
+ * memory to (lion_count_rel_spill_reads()), which walking it does not.
  */
 typedef struct LionWalkRange
 {
@@ -3076,8 +3088,10 @@ typedef struct LionWalkRange
 	AttrNumber	col;
 	Var		   *var;
 	Selectivity sel;
-	Cost		spill;
-	Cost		attempt;
+	Cost		collect;
+	List	   *evicted;		/* the clauses it sent to files, by first
+								 * bound */
+	Cost		read;
 } LionWalkRange;
 
 /*
@@ -3110,8 +3124,8 @@ typedef struct LionCountRelCost
 	Cost		rangeseek;		/* what a range of a parallel count pays to
 								 * seek the WHERE's sets (§10), priced while
 								 * clauseset is there to price it from */
-	LionWalkSave *walksave; /* NULL, or what walking the ranges too
-								 * large to collect saves (below) */
+	LionWalkSave *walksave; /* NULL, or what walking the ranges taken
+								 * as sources saves (below) */
 
 	/* the relation */
 	double		heap_pages;
@@ -3149,13 +3163,12 @@ typedef struct LionCountRelCost
 	double	   *rangeconts;		/* ... each one, by its first bound: the
 								 * containers it holds */
 	double	   *spillconts;		/* ... the same, of each one spilled */
-	bool	   *walkspill;		/* ... spilled only where the count does
-								 * not walk */
 	LionSumSets sumsets;		/* the sets a summed range counts */
 	double		countrows;		/* the rows of one count's own set */
 	double		countkeys;		/* ... and its containers, or 0 for all */
 	Cost		spillread;		/* the counts' reads of spilled ranges */
-	Cost		walkread;		/* ... of those a count may walk */
+	Cost		walkread;		/* ... of those a count may walk, and
+								 * those they sent to files */
 
 	/* the WHERE clauses, by their position in the lists */
 	int			nclause;
@@ -3224,7 +3237,6 @@ lion_count_rel_alloc(LionCountRelCost *c)
 	c->clausesrc = (int *) palloc0(sizeof(int) * Max(c->nclause, 1));
 	c->rangeconts = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->spillconts = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
-	c->walkspill = (bool *) palloc0(sizeof(bool) * Max(c->nclause, 1));
 	c->srcmembers = (double *) palloc0(sizeof(double) * Max(c->nclause, 1));
 	c->srccontainers = (double *) palloc0(sizeof(double) *
 										  Max(c->nclause, 1));
@@ -3270,9 +3282,10 @@ lion_count_rel_src_words(LionCountRelCost *c, int s, double words)
  * position, and is left past it.  One too large for the memory the ranges
  * before it left is priced collected in windows, or in what it freed by
  * sending those in memory to files; outside an OR, and where the count may
- * walk it (c->walksave), it is kept with what trying to collect it costs,
- * for lion_count_rel_walk_save() to price walked - and the files it sent
- * the others to are then spilled only where the count does not walk.
+ * walk it (c->walksave), it is kept with what collecting it costs, in memory
+ * or not, for lion_count_rel_walk_save() to price walked - and its file, and
+ * the files it sent the others to, are then spilled only where the count
+ * does not walk.
  */
 static void
 lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
@@ -3283,7 +3296,7 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	List	   *bounds = NIL;
 	double		clc;
 	Cost		collect;
-	Cost		attempt = 0;
+	LionWalkRange *walk = NULL;
 	bool		spills;
 	bool		evicts;
 	ListCell   *lc;
@@ -3301,26 +3314,31 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	c->clausesel[c->ci++] = sel;
 
 	collect = lion_cost_range_source(c->root, c->rel, idx, col, bounds, sel,
-									 &c->rangesrc_mem, &spills, &evicts,
-									 (c->walksave != NULL &&
-									  c->orgrp[c->ci - 1] < 0) ?
-									 &attempt : NULL);
+									 &c->rangesrc_mem, &spills, &evicts);
 	c->rangesrc_cost += collect;
 	if (c->orgrp[c->ci - 1] < 0)
 		c->rangesrc_and++;
-	if (attempt > 0)
+
+	/*
+	 * Fit or not: the existence tests of a count(DISTINCT), which stop at
+	 * their first row, walk a range 15 to 130 times faster than they
+	 * collect one that fits (DESIGN.md §32).
+	 */
+	if (c->walksave != NULL && c->orgrp[c->ci - 1] < 0)
 	{
-		LionWalkRange *wr = (LionWalkRange *) palloc(sizeof(LionWalkRange));
+		LionWalkRange *wr = (LionWalkRange *) palloc0(sizeof(LionWalkRange));
 
 		wr->ci = c->ci - 1;
 		wr->idx = idx;
 		wr->col = col;
 		wr->var = lion_index_col_var(c->root, c->rel, idx, col);
 		wr->sel = Min(Max(sel, 1e-10), 1.0);
-		wr->spill = collect;
-		wr->attempt = attempt;
+		wr->collect = collect;
 		if (wr->var != NULL)
+		{
 			c->walkranges = lappend(c->walkranges, wr);
+			walk = wr;
+		}
 		else
 			pfree(wr);
 	}
@@ -3341,7 +3359,8 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 		foreach(lc, c->rangesrc_inmem)
 		{
 			c->spillconts[lfirst_int(lc)] = c->rangeconts[lfirst_int(lc)];
-			c->walkspill[lfirst_int(lc)] = (attempt > 0);
+			if (walk != NULL)
+				walk->evicted = lappend_int(walk->evicted, lfirst_int(lc));
 		}
 		list_free(c->rangesrc_inmem);
 		c->rangesrc_inmem = NIL;
@@ -3350,7 +3369,6 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 		c->spillconts[c->ci - 1] = clc;
 	else
 		c->rangesrc_inmem = lappend_int(c->rangesrc_inmem, c->ci - 1);
-	c->walkspill[c->ci - 1] = (attempt > 0);
 	if (c->orgrp[c->ci - 1] >= 0)
 	{
 		Cost		readleaf = clc * (LION_CONTAINER_COST + LION_MEMBER_COST *
@@ -4602,16 +4620,18 @@ lion_count_rel_recheck(LionCountRelCost *c)
  * - at its own set's containers, or all of them for a count of no set of its
  * own - read from the file (LION_SPILL_READ_COST), an existence test's share
  * of them; or each once, where the WHERE is collected once and the groups
- * counted against the copy (§10).  What it comes to for the ranges a count
- * may walk instead, and for those they sent to files (c->walkspill), is
- * c->walkread, which walking them does not pay.  Frees the arrays it was
- * given.
+ * counted against the copy (§10).  What it comes to for each range a count
+ * may walk instead, and for those it sent to files, is that range's `read`,
+ * which walking it does not pay, and c->walkread for them all, each file
+ * once.  Frees the arrays it was given.
  */
 static void
 lion_count_rel_spill_reads(LionCountRelCost *c)
 {
 	double		counts = Max(c->rangesum ? c->sumsets.counts : c->walked, 1.0);
 	double		keys = c->countkeys;
+	bool		walkable;
+	ListCell   *lc;
 	int			i;
 
 	if (c->rangesum)
@@ -4630,30 +4650,40 @@ lion_count_rel_spill_reads(LionCountRelCost *c)
 				((keys > 0.0) ? Min(c->spillconts[i], keys) :
 				 c->spillconts[i]);
 		c->spillread += reads * LION_SPILL_READ_COST;
-		if (c->walkspill[i])
+		walkable = false;
+		foreach(lc, c->walkranges)
+		{
+			LionWalkRange *wr = (LionWalkRange *) lfirst(lc);
+
+			if (wr->ci == i || list_member_int(wr->evicted, i))
+			{
+				wr->read += reads * LION_SPILL_READ_COST;
+				walkable = true;
+			}
+		}
+		if (walkable)
 			c->walkread += reads * LION_SPILL_READ_COST;
 	}
 	pfree(c->spillconts);
-	pfree(c->walkspill);
 	pfree(c->rangeconts);
 	c->spillconts = NULL;
-	c->walkspill = NULL;
 	c->rangeconts = NULL;
 }
 
 /*
- * The walks of the ranges too large to collect that `counts` counts make
- * with F (lion_count_rel_walk_save()): the first range walked at each count
+ * The walks of the ranges `walk` that `counts` counts make with F
+ * (lion_count_rel_walk_save()): the first range walked at each count
  * (lion_cost_range_sum()), and a second at every set the walk of the first
  * hands out, with that set one more source of F.
  */
 static Cost
-lion_count_rel_walks(LionCountRelCost *c, double counts, LionSumF *f)
+lion_count_rel_walks(LionCountRelCost *c, List *walk, double counts,
+					 LionSumF *f)
 {
 	Cost		walks = 0;
 	ListCell   *lc;
 
-	foreach(lc, c->walkranges)
+	foreach(lc, walk)
 	{
 		LionWalkRange *wr = (LionWalkRange *) lfirst(lc);
 		LionSumSets sets;
@@ -4671,15 +4701,17 @@ lion_count_rel_walks(LionCountRelCost *c, double counts, LionSumF *f)
 }
 
 /*
- * What walking the ranges too large to collect at every count saves over
- * collecting them in windows (LION_FLAG_RANGEWALK, DESIGN.md §32, "Too
- * large to collect"): their collections, and the counts' merges, which a
- * walk makes itself - each set it hands out ANDed with the other sources
- * (lion_walk_count()) - less what walking costs: each range's collection
- * tried first, until the memory runs out, and its walk at every count the
- * relation makes - its groups, pairs or tests - with the count's own set and
- * the other sources for F (lion_count_rel_walks()).  Below nothing where
- * collecting is the cheaper, which is where there are many counts.
+ * What walking the ranges `walk` of those taken as sources at every count
+ * saves over collecting them (LION_FLAG_RANGEWALK, DESIGN.md §32, "Walked
+ * at every count"): their collections, in memory or in windows, `read` -
+ * the reads of the files they and those they sent to files would be read
+ * from - and the counts' merges, which a walk makes itself - each set it
+ * hands out ANDed with the other sources, the ranges collected among them
+ * (lion_walk_count()) - less what walking costs: each range's walk at every
+ * count the relation makes - its groups, pairs or tests - with the count's
+ * own set and the other sources for F (lion_count_rel_walks()).  Nothing of
+ * a walked range is collected first, so nothing else is.  Below nothing
+ * where collecting is the cheaper, which is where there are many counts.
  *
  * A summed range (§28) is walked either way, and every set of the side it
  * takes counted with F: a range walked beside it is walked at each of those
@@ -4689,11 +4721,12 @@ lion_count_rel_walks(LionCountRelCost *c, double counts, LionSumF *f)
  * what walking costs at most.
  */
 static Cost
-lion_count_rel_walk_save(LionCountRelCost *c)
+lion_count_rel_walk_save(LionCountRelCost *c, List *walk, Cost read,
+						 Cost *walks)
 {
 	double		others = c->matching /
 		(c->tuples * Min(Max(c->drivefrac, 1e-10), 1.0));
-	int			nwalk = list_length(c->walkranges);
+	int			nwalk = list_length(walk);
 	int			nsrc = c->nsrc - nwalk;
 	int			nplain = nsrc - (c->rangesrc_and - nwalk);
 	int			own = 0;
@@ -4704,18 +4737,14 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 	ListCell   *lc;
 
 	Assert(nwalk > 0 && nsrc >= 0 && nplain >= 0);
-	foreach(lc, c->walkranges)
+	foreach(lc, walk)
 		others /= ((LionWalkRange *) lfirst(lc))->sel;
 	others = Min(Max(others, 0.0), 1.0);
 
 	/* what collecting them costs that walking does not */
-	save += c->walkread;
-	foreach(lc, c->walkranges)
-	{
-		LionWalkRange *wr = (LionWalkRange *) lfirst(lc);
-
-		save += wr->spill - wr->attempt;
-	}
+	save += read;
+	foreach(lc, walk)
+		save += ((LionWalkRange *) lfirst(lc))->collect;
 
 	/*
 	 * F: the count's own set - a group's, a pair's, a set of the summed
@@ -4723,6 +4752,7 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 	 * taken as sources do not (lion_source_drives())
 	 */
 	memset(&f, 0, sizeof(f));
+	*walks = 0;
 	if (c->rangesum)
 	{
 		own = 1;
@@ -4733,7 +4763,7 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 			f.rows = Max(1.0, c->tuples * others);
 			f.nsrc = nsrc;
 			f.nplain = nplain;
-			save -= lion_count_rel_walks(c, 1.0, &f);
+			*walks += lion_count_rel_walks(c, walk, 1.0, &f);
 			counts = Max(counts - 1.0, 0.0);
 		}
 	}
@@ -4749,8 +4779,118 @@ lion_count_rel_walk_save(LionCountRelCost *c)
 	f.rows = Max(1.0, ownrows * others);
 	f.nsrc = own + nsrc;
 	f.nplain = own + nplain;
-	save -= lion_count_rel_walks(c, counts, &f);
-	return save;
+	*walks += lion_count_rel_walks(c, walk, counts, &f);
+	return save - *walks;
+}
+
+/*
+ * The ways the plan may walk the ranges taken as sources (LionWalkSave): all
+ * of them - a second walked at every set the walk of the first hands out -
+ * or one alone, the others collected and ANDed with each set its walk hands
+ * out.  What walking each way saves this count, and what its walks cost
+ * (lion_count_rel_walk_save()), is added to that way's sums over the plan's
+ * relations and runs, the way named by its clause - the first bound of the
+ * range walked alone, or NULL for all of them - for lion_walk_save_choose()
+ * to take the best of.  A relation that does not have a way's range saves
+ * nothing by it.
+ */
+static void
+lion_walk_save_add(LionWalkSave *ws, Node *clause, Cost save, Cost walks,
+				   List *clauses)
+{
+	LionWalkWay *way = NULL;
+	ListCell   *lc;
+
+	foreach(lc, ws->ways)
+	{
+		if (((LionWalkWay *) lfirst(lc))->clause == clause)
+		{
+			way = (LionWalkWay *) lfirst(lc);
+			break;
+		}
+	}
+	if (way == NULL)
+	{
+		way = (LionWalkWay *) palloc0(sizeof(LionWalkWay));
+		way->clause = clause;
+		ws->ways = lappend(ws->ways, way);
+	}
+	way->save += save;
+	way->walks += walks;
+	foreach(lc, clauses)
+		way->clauses = list_append_unique_ptr(way->clauses, lfirst(lc));
+}
+
+static void
+lion_count_rel_walk_ways(LionCountRelCost *c, LionWalkSave *ws)
+{
+	List	   *all = NIL;
+	Cost		walks;
+	Cost		save;
+	ListCell   *lc;
+
+	foreach(lc, c->walkranges)
+		all = lappend(all, list_nth(c->whereclauses,
+									((LionWalkRange *) lfirst(lc))->ci));
+	save = lion_count_rel_walk_save(c, c->walkranges, c->walkread, &walks);
+	lion_walk_save_add(ws, NULL, save, walks, all);
+	foreach(lc, c->walkranges)
+	{
+		LionWalkRange *wr = (LionWalkRange *) lfirst(lc);
+		Node	   *clause = (Node *) list_nth(c->whereclauses, wr->ci);
+		List	   *one;
+
+		if (list_length(c->walkranges) > 1)
+		{
+			one = list_make1(wr);
+			save = lion_count_rel_walk_save(c, one, wr->read, &walks);
+			list_free(one);
+		}
+		one = list_make1(clause);
+		lion_walk_save_add(ws, clause, save, walks, one);
+		list_free(one);
+	}
+	list_free(all);
+}
+
+/*
+ * Which way of walking the ranges taken as sources the plan takes
+ * (lion_count_rel_walk_ways()), into ws->save and ws->clauses: the one that
+ * saves the most, summed over the relations and runs - where what it would
+ * collect is priced at least LION_RANGE_WALK_MARGIN times its walks, and
+ * none at all otherwise.  A walk costs at every count, which the count's
+ * estimate of its groups and tests sets, where a collection is one walk
+ * bounded by the memory: at the margin the plan collects.  Priced without
+ * it, two ranges beside a GROUP BY of seven groups over 360,000 rows walked
+ * one and collected the other, the collection priced at 1.2 times the walk,
+ * and took 16 ms where collecting both took 11 to 13 (release build,
+ * 2026-10-23); where the margin still walks, the collection was priced at
+ * 1.9 times the walks or more - a count(DISTINCT)'s existence tests, a few
+ * groups - and the walks were 1.5 to 60 times faster.  Of two ranges beside
+ * a count(DISTINCT), one too large to collect walked at each existence
+ * test with the other collected took 3 ms, both collected in windows 9.
+ */
+void
+lion_walk_save_choose(LionWalkSave *ws)
+{
+	LionWalkWay *best = NULL;
+	ListCell   *lc;
+
+	foreach(lc, ws->ways)
+	{
+		LionWalkWay *way = (LionWalkWay *) lfirst(lc);
+
+		if (way->save > 0 &&
+			way->save >= (LION_RANGE_WALK_MARGIN - 1.0) * way->walks &&
+			(best == NULL || way->save > best->save))
+			best = way;
+	}
+	ws->save = (best != NULL) ? best->save : 0;
+	ws->clauses = (best != NULL) ? list_copy(best->clauses) : NIL;
+	foreach(lc, ws->ways)
+		list_free(((LionWalkWay *) lfirst(lc))->clauses);
+	list_free_deep(ws->ways);
+	ws->ways = NIL;
 }
 
 /*
@@ -4863,7 +5003,7 @@ lion_count_rel_calls_share(LionCountRelCost *c)
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
  * heap recheck.  A range source too large to collect is collected in windows
  * into a temporary file (lion_cost_range_source()).  With `walksave` the
- * count may walk such ranges at every count instead (LION_FLAG_RANGEWALK),
+ * count may walk the ranges at every count instead (LION_FLAG_RANGEWALK),
  * and what that would save over collecting them, which may come out below
  * nothing, is added to walksave->save (lion_count_rel_walk_save()), and the
  * first bound of each to walksave->clauses.  `rangesum` is LION_RANGED_SUM
@@ -4887,6 +5027,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
 	Cost		run;
 	double		share;
+	ListCell   *lc;
 
 	memset(&c, 0, sizeof(c));
 	c.root = root;
@@ -5012,16 +5153,9 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 								   rangesum ? c.sumsets.counts : c.walked);
 
 	if (walksave != NULL && c.walkranges != NIL)
-	{
-		ListCell   *lc;
-
-		walksave->save += lion_count_rel_walk_save(&c);
-		foreach(lc, c.walkranges)
-			walksave->clauses =
-				list_append_unique_ptr(walksave->clauses,
-									   list_nth(whereclauses,
-												((LionWalkRange *) lfirst(lc))->ci));
-	}
+		lion_count_rel_walk_ways(&c, walksave);
+	foreach(lc, c.walkranges)
+		list_free(((LionWalkRange *) lfirst(lc))->evicted);
 	list_free_deep(c.walkranges);
 	list_free(c.rangesrc_inmem);
 
@@ -5038,8 +5172,8 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
  * count with the OR's positive arms alone, as an OR of them (an upper bound:
  * the count ANDs M besides).  Each is the whole of a count, so the two are
  * added up, groups and all, as the executor makes them.  `walksave`, when it
- * is given, is what walking the ranges too large to collect saves, summed
- * over the counts (lion_cost_count_rel_one()).
+ * is given, is what walking the ranges taken as sources saves, summed over
+ * the counts (lion_cost_count_rel_one()).
  */
 static Cost
 lion_cost_count_rel(PlannerInfo *root, RelOptInfo *rel,
@@ -5237,12 +5371,12 @@ lion_target_lists(const LionCountTarget *t, List *whereclauses,
  * DESIGN.md §19 names its leaves by their position in them.  A partition
  * prices only the clauses its bounds do not imply (lion_target_lists()).
  *
- * The price takes every range source too large to collect as collected in
- * windows into a temporary file; what walking each of them at every count
- * instead would save, summed over the relations, is added to walksave with
- * the clauses that bound them, for the caller to choose for the whole plan
- * (LION_FLAG_RANGEWALK) - the executor walks those ranges where they do not
- * fit, and collects every other, or walks none.
+ * The price takes every range source as collected, in windows into a
+ * temporary file past the memory; what walking those outside an OR at every
+ * count instead would save, summed over the relations, is added to walksave
+ * with the clauses that bound them, for the caller to choose for the whole
+ * plan (LION_FLAG_RANGEWALK) - the executor walks those ranges, and collects
+ * every other, or walks none.
  */
 void
 lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
@@ -6028,6 +6162,7 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	bool		any = false;
 	double		pages;
 	double		widen;
+	double		supersel;
 	double	   *lexsel;
 	int			nlex;
 	int			ci = 0;
@@ -6070,9 +6205,9 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 						1e-10);
 		else if (lion_tsquery_pos_shape(root, rel, (IndexOptInfo *) lfirst(lc1),
 										(AttrNumber) lfirst_int(lc4), clause,
-										&widen, &nlex, &lexsel))
+										&widen, &supersel, &nlex, &lexsel))
 		{
-			cand *= widen;
+			cand = Min(cand * widen, Max(rel->tuples * supersel, 1.0));
 			pfree(lexsel);
 		}
 	}
@@ -6257,11 +6392,74 @@ lion_tsquery_anded(QueryItem *items, int32 size, int32 i, const int *itemlex,
 }
 
 /*
+ * The share of the rows whose tsvector `arg` is not NULL, as core's estimate
+ * of a tsquery over it takes it (tsquerysel()): each query is estimated over
+ * the column's non-NULL rows, from statistics that count only those, and the
+ * result multiplied by this once - so that every operand's share carries it,
+ * and two of them multiplied carry it twice.  1 where the column has no
+ * statistics, which core takes as no NULLs.
+ */
+static double
+lion_tsvector_nonnull(PlannerInfo *root, Node *arg)
+{
+	VariableStatData vardata;
+	double		nonnull = 1.0;
+
+	examine_variable(root, arg, 0, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple) &&
+		vardata.vartype == TSVECTOROID)
+		nonnull = 1.0 -
+			((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+	ReleaseVariableStats(vardata);
+	return Min(Max(nonnull, 1e-10), 1.0);
+}
+
+/* The order lion_tsquery_pos_shape_of() sorts a query's operands in. */
+typedef struct LionTsqOperands
+{
+	const QueryItem *items;
+	const char *operands;
+} LionTsqOperands;
+
+/*
+ * Items ia and ib in operand order - by length, plain before prefix, then by
+ * bytes - zero when they are the same operand: one lexeme, prefix or not.
+ */
+static int
+lion_tsquery_operand_order(const LionTsqOperands *q, int32 ia, int32 ib)
+{
+	const QueryOperand *a = &q->items[ia].qoperand;
+	const QueryOperand *b = &q->items[ib].qoperand;
+
+	if (a->length != b->length)
+		return (a->length < b->length) ? -1 : 1;
+	if (a->prefix != b->prefix)
+		return a->prefix ? 1 : -1;
+	return memcmp(q->operands + a->distance, q->operands + b->distance,
+				  a->length);
+}
+
+/* ... by operand, and by place in the query among the items of one */
+static int
+lion_tsquery_operand_cmp(const void *a, const void *b, void *arg)
+{
+	int32		ia = *(const int32 *) a;
+	int32		ib = *(const int32 *) b;
+	int			c = lion_tsquery_operand_order((const LionTsqOperands *) arg,
+											   ia, ib);
+
+	if (c != 0)
+		return c;
+	return (ia < ib) ? -1 : (ia > ib) ? 1 : 0;
+}
+
+/*
  * What a position filter of the tsquery clause `clause`, on key column col of
  * lion index idx of rel, works through (lion_posfilter.c): its candidates,
  * the rows of its SUPERSET - the boolean tree over its lexemes the posting
  * sets answer (lion_extract_query_superset()) - which are *widen times the
- * rows of the clause itself; and the *nlex lexemes it reads, one cursor each
+ * rows of the clause itself and *supersel of every row of rel, NULLs among
+ * them; and the *nlex lexemes it reads, one cursor each
  * over that lexeme's members, (*lexsel)[k] the share of the rows that have
  * the k'th (palloc'd).  A lexeme under a NOT is read too, for the check, and
  * is no part of the superset.
@@ -6272,20 +6470,28 @@ lion_tsquery_anded(QueryItem *items, int32 size, int32 i, const int *itemlex,
  * - 8 for `foo <-> !bar` of `foo` in every row and `bar` in seven of eight,
  * whose candidates are every row where the clause selects an eighth - and
  * what the AND of its lexemes' posting sets holds beyond core's product of
- * them, measured by the intersection probe as any AND of sets is (DESIGN.md
- * §29.11, "Correlated sets").  The phrase `new <-> york` of two lexemes in
- * the same tenth of the rows is a hundredth of them by core's product, and
- * its candidates the whole tenth.  The probe takes its measure only three
- * times off core's or more: `foo <-> bar` of two lexemes in the same three
- * rows of four is decided over 0.75 of the rows, and priced over the 0.56
- * of core's product.
+ * them, as the intersection probe finds it (DESIGN.md §29.11, "Correlated
+ * sets"), however near core's (lion_isect_measured_factor()).  The phrase
+ * `new <-> york` of two lexemes in the same tenth of the rows is a hundredth
+ * of them by core's product, and its candidates the whole tenth; `foo <->
+ * bar` of two lexemes in the same three rows of four is decided over 0.75 of
+ * the rows, where core's product is 0.56.
+ *
+ * The shares are combined as core combines them, over the rows whose column
+ * is not NULL (lion_tsvector_nonnull()): core estimates a query over those
+ * rows and takes the NULLs out once, so an operand's share alone carries
+ * them once and a product of n of them n times - with three rows of four
+ * NULL, `new <-> york` would come out at four times its candidates, and
+ * `foo <-> !bar` at two fifths.  The probe's measure, against core's product
+ * of the sets' shares, is taken over those rows likewise.
  *
  * False for a clause that is not `col @@ tsquery` of a literal.
  */
 static bool
 lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 						  IndexOptInfo *idx, AttrNumber col, Node *clause,
-						  double *widen, int *nlex, double **lexsel)
+						  double *widen, double *supersel, int *nlex,
+						  double **lexsel)
 {
 	OpExpr	   *op;
 	Node	   *arg;
@@ -6294,19 +6500,26 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 	QueryItem  *items;
 	char	   *operands;
 	Size		opbytes;
+	LionTsqOperands sortq;
+	int32	   *vals;
+	int32	   *firstof;
 	int		   *itemlex;
 	int		   *lexitem;
 	double	   *sels;
+	double	   *shares;
 	bool	   *anded;
+	double		nonnull;
 	Selectivity full;
 	Selectivity super;
 	bool		every;
+	int			nvals = 0;
 	int			nanded = 0;
 	int			n = 0;
 	int32		i;
 	int32		j;
 
 	*widen = 1.0;
+	*supersel = 1.0;
 	*nlex = 0;
 	*lexsel = NULL;
 	if (clause == NULL || !IsA(clause, OpExpr) ||
@@ -6327,66 +6540,88 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 		return false;
 	opbytes = VARSIZE(tsq) - (Size) (operands - (char *) tsq);
 
-	/* each distinct operand once: a cursor is a lexeme's, not an item's */
-	itemlex = (int *) palloc0(sizeof(int) * tsq->size);
-	lexitem = (int *) palloc(sizeof(int) * tsq->size);
-	sels = (double *) palloc(sizeof(double) * tsq->size);
+	/* the operands, each inside the query's own bytes, or no query of ours */
+	vals = (int32 *) palloc(sizeof(int32) * tsq->size);
 	for (i = 0; i < tsq->size; i++)
 	{
-		QueryOperand *val;
-		OpExpr	   *lop;
+		const QueryOperand *val;
 
 		if (items[i].type != QI_VAL)
 			continue;
 		val = &items[i].qoperand;
-
-		/* an operand outside the query's own bytes is no query of ours */
 		if ((Size) val->distance + val->length >= opbytes)
 		{
-			pfree(itemlex);
-			pfree(lexitem);
-			pfree(sels);
+			pfree(vals);
 			return false;
 		}
-		for (j = 0; j < i; j++)
-		{
-			QueryOperand *prev = &items[j].qoperand;
+		vals[nvals++] = i;
+	}
+	if (nvals == 0)
+	{
+		pfree(vals);
+		return false;
+	}
 
-			if (items[j].type == QI_VAL && prev->length == val->length &&
-				prev->prefix == val->prefix &&
-				memcmp(operands + prev->distance, operands + val->distance,
-					   val->length) == 0)
-				break;
-		}
-		if (j < i)
+	/*
+	 * Each distinct operand once - a cursor is a lexeme's, not an item's -
+	 * numbered in the order of its first item: the operands sorted, each
+	 * item's first the head of its run, so that a query of thousands of
+	 * operands takes a sort, not a comparison of every pair.
+	 */
+	sortq.items = items;
+	sortq.operands = operands;
+	qsort_arg(vals, nvals, sizeof(int32), lion_tsquery_operand_cmp, &sortq);
+	firstof = (int32 *) palloc(sizeof(int32) * tsq->size);
+	for (j = 0; j < nvals; j++)
+		firstof[vals[j]] = (j > 0 &&
+							lion_tsquery_operand_order(&sortq, vals[j - 1],
+													   vals[j]) == 0) ?
+			firstof[vals[j - 1]] : vals[j];
+	pfree(vals);
+
+	itemlex = (int *) palloc0(sizeof(int) * tsq->size);
+	lexitem = (int *) palloc(sizeof(int) * tsq->size);
+	sels = (double *) palloc(sizeof(double) * tsq->size);
+	shares = (double *) palloc(sizeof(double) * tsq->size);
+	nonnull = lion_tsvector_nonnull(root, (Node *) linitial(op->args));
+	for (i = 0; i < tsq->size; i++)
+	{
+		OpExpr	   *lop;
+
+		CHECK_FOR_INTERRUPTS();
+		if (items[i].type != QI_VAL)
+			continue;
+		if (firstof[i] != i)
 		{
-			itemlex[i] = itemlex[j];
+			itemlex[i] = itemlex[firstof[i]];
 			continue;
 		}
 		itemlex[i] = n;
 		lexitem[n] = i;
-		lop = lion_tsquery_operand_clause(op, tsq, val);
-		sels[n++] = Min(Max(clause_selectivity(root, (Node *) lop, 0,
-											   JOIN_INNER, NULL),
-							1e-10), 1.0);
+		lop = lion_tsquery_operand_clause(op, tsq, &items[i].qoperand);
+		sels[n] = Min(Max(clause_selectivity(root, (Node *) lop, 0,
+											 JOIN_INNER, NULL),
+						  1e-10), 1.0);
+		shares[n] = Min(sels[n] / nonnull, 1.0);
+		n++;
 		lion_tsquery_operand_free(lop);
 	}
-	if (n == 0)
-	{
-		pfree(itemlex);
-		pfree(lexitem);
-		pfree(sels);
-		return false;
-	}
+	pfree(firstof);
 
-	full = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, sels, false,
+	full = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, false,
 								 &every);
-	super = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, sels, true,
+	super = lion_tsquery_walk_sel(items, tsq->size, 0, itemlex, shares, true,
 								  &every);
 	if (every)
 		super = 1.0;
 
-	/* ... and the AND of the superset's lexemes as the probe finds it */
+	/*
+	 * ... and the AND of the superset's lexemes as the probe finds it: what
+	 * it measures is a share of every row over core's product of the sets'
+	 * shares, which is the AND's share of the non-NULL rows over the product
+	 * of theirs once nonnull is taken out of the one and of each of the
+	 * others.
+	 */
 	anded = (bool *) palloc0(sizeof(bool) * n);
 	if (!every)
 		lion_tsquery_anded(items, tsq->size, 0, itemlex, anded);
@@ -6396,6 +6631,9 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 	{
 		OpExpr	  **lops = (OpExpr **) palloc(sizeof(OpExpr *) * nanded);
 		AttrNumber *cols = (AttrNumber *) palloc(sizeof(AttrNumber) * nanded);
+		double		factor;
+		double		product = 1.0;
+		double		shareproduct = 1.0;
 		int			m = 0;
 
 		for (i = 0; i < n; i++)
@@ -6405,8 +6643,12 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 			lops[m] = lion_tsquery_operand_clause(op, tsq,
 												  &items[lexitem[i]].qoperand);
 			cols[m++] = col;
+			product *= sels[i];
+			shareproduct *= shares[i];
 		}
-		super *= lion_isect_factor(root, rel, idx, m, cols, (Node **) lops);
+		if (lion_isect_measured_factor(root, rel, idx, m, cols,
+									   (Node **) lops, &factor))
+			super *= factor * product / (nonnull * shareproduct);
 		for (i = 0; i < m; i++)
 			lion_tsquery_operand_free(lops[i]);
 		pfree(lops);
@@ -6415,8 +6657,10 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 	pfree(anded);
 	pfree(itemlex);
 	pfree(lexitem);
+	pfree(shares);
 
 	*widen = Max(Min(super, 1.0) / Max(full, 1e-10), 1.0);
+	*supersel = Min(super, 1.0) * nonnull;
 	*nlex = n;
 	*lexsel = sels;
 	return true;
@@ -6430,9 +6674,36 @@ typedef struct LionPosShape
 	Node	   *clause;			/* lion_vcol_unvar()'s, in the run's memory */
 	bool		ok;
 	double		widen;
+	double		supersel;
 	int			nlex;
 	double	   *lexsel;
 } LionPosShape;
+
+/*
+ * clause, a restriction of the partitioned table or inheritance parent the
+ * query names, in the columns of rel, a child of it whose part of a price is
+ * asked for - as the planner hands rel its own restrictions - so that core
+ * estimates it from rel's statistics and the intersection probe looks its
+ * values up in rel's index, which a clause on the parent's columns matches
+ * no key of; clause itself where it is rel's already, or not one table's.
+ */
+static Node *
+lion_clause_in_child(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+{
+	Relids		varnos;
+	int			varno;
+
+	if (root == NULL || rel == NULL ||
+		rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
+		return clause;
+	varnos = pull_varnos(root, clause);
+	if (!bms_get_singleton_member(varnos, &varno) ||
+		varno == (int) rel->relid ||
+		!bms_is_member(varno, rel->top_parent_relids))
+		return clause;
+	return adjust_appendrel_attrs_multilevel(root, clause, rel,
+											 find_base_rel(root, varno));
+}
 
 /*
  * lion_tsquery_pos_shape_of() of `clause`, once a planner run: every path
@@ -6440,12 +6711,13 @@ typedef struct LionPosShape
  * hundreds of lexemes would ask core about each of them every time - 500 of
  * them, 11 ms more on a plan of 4, where once is 3 ms more.  Kept by the
  * index and column it is answered on, and the clause, whose Var names the
- * relation.  *lexsel is the caller's.
+ * relation; asked of a partition, in the partition's own columns
+ * (lion_clause_in_child()).  *lexsel is the caller's.
  */
 static bool
 lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
-					   AttrNumber col, Node *clause, double *widen, int *nlex,
-					   double **lexsel)
+					   AttrNumber col, Node *clause, double *widen,
+					   double *supersel, int *nlex, double **lexsel)
 {
 	List	  **shapes;
 	MemoryContext cxt;
@@ -6455,8 +6727,10 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 
 	clause = lion_vcol_unvar(clause);
 	if (root == NULL || root->glob == NULL || idx == NULL)
-		return lion_tsquery_pos_shape_of(root, rel, idx, col, clause, widen,
-										 nlex, lexsel);
+		return lion_tsquery_pos_shape_of(root, rel, idx, col,
+										 lion_clause_in_child(root, rel,
+															  clause),
+										 widen, supersel, nlex, lexsel);
 
 	shapes = lion_run_posshapes(root, &cxt);
 	foreach(lc, *shapes)
@@ -6466,6 +6740,7 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			!equal(e->clause, clause))
 			continue;
 		*widen = e->widen;
+		*supersel = e->supersel;
 		*nlex = e->nlex;
 		*lexsel = NULL;
 		if (!e->ok)
@@ -6482,9 +6757,11 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	e->clause = copyObject(clause);
 	MemoryContextSwitchTo(oldcxt);
 
-	e->ok = lion_tsquery_pos_shape_of(root, rel, idx, col, clause, widen,
-									  nlex, lexsel);
+	e->ok = lion_tsquery_pos_shape_of(root, rel, idx, col,
+									  lion_clause_in_child(root, rel, clause),
+									  widen, supersel, nlex, lexsel);
 	e->widen = *widen;
+	e->supersel = *supersel;
 	e->nlex = *nlex;
 	if (e->ok)
 	{
@@ -6512,7 +6789,7 @@ lion_tsquery_pos_shape(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
  * rows and the superset's one lexeme, that filter comes to a sixteenth of
  * what it takes, and an FK-side join that probes it at two or three keys
  * beats a nested loop of the dimension into a btree of the fact's key that
- * runs 15 to 40 times as fast (DESIGN.md §17, "The price").
+ * runs 8 to 40 times as fast (DESIGN.md §17, "The price").
  *
  * Every count's cursors - one a lexeme the query names, those under a NOT
  * too - begin again at their lexemes' first member, and seek to the count's
@@ -6532,6 +6809,7 @@ lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
 	double		percount;
 	double		nkeys;
 	double		widen;
+	double		supersel;
 	double	   *lexsel;
 	int			nlex;
 	Cost		cost;
@@ -6545,12 +6823,17 @@ lion_cost_posfilter_clause(PlannerInfo *root, RelOptInfo *rel,
 		return 0;
 
 	/* only a tsquery's lexemes have positions to be decided from */
-	if (!lion_tsquery_pos_shape(root, rel, idx, col, clause, &widen, &nlex,
-								&lexsel))
+	if (!lion_tsquery_pos_shape(root, rel, idx, col, clause, &widen,
+								&supersel, &nlex, &lexsel))
 		return 0;
 
-	/* the superset's rows are the candidates, and no more than the table's */
-	cand = Min(cand * widen, tuples);
+	/*
+	 * The superset's rows are the candidates, and no more than it holds: a
+	 * clause estimated at next to no rows - `!foo <-> bar` where every row
+	 * has `foo` - widens without bound, and its superset is still only the
+	 * rows that have its lexemes, none of them NULL.
+	 */
+	cand = Min(cand * widen, Max(tuples * supersel, 1.0));
 
 	/* a count that has no candidate seeks nothing */
 	counts = Min(Max(counts, 1.0), Max(cand, 1.0));
