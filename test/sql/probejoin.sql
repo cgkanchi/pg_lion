@@ -373,7 +373,7 @@ SELECT c.tier = 3 AS t3, count(*)
  GROUP BY 1 ORDER BY 1;
 RESET pg_lion.enable_probe_join;
 -- vacuumed, every page all-visible again: no heap read
-VACUUM pj_customers;
+VACUUM (FREEZE) pj_customers;
 SELECT * FROM pj_explain($$SELECT c.tier = 3 AS t3, count(*)
 							 FROM pj_orders o JOIN pj_customers c ON o.customer_id = c.id
 							WHERE c.active

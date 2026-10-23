@@ -28052,9 +28052,13 @@ map does not call all-visible. The group keys are computed above the node from t
   and has no form that reads the rows. The join methods' settings do not touch it - it is an upper
   path, not a join path - so the regression tests disable them to have it be the plan where core's
   would win. btreescan_parallel.sql's FK-side section and fkjoin_semi.sql switch it off, as they
-  switch the other joins off: the plans they pin are other nodes', and on their tables it was
-  priced the cheaper (4.7 ms against the FK-side join's 4.5 on the first, a fact filter with no
-  entry on the second).
+  switch the other joins off: the plans they pin are other nodes', and on their tables the node is
+  priced the cheaper. On the first - 6,070 of 60,000 fact rows under a 12,000-row dimension - its
+  estimate is 2,600 against the FK-side join's 3,228 (1,305 against 1,540 in parallel), yet it runs
+  slower warm, 5.6 ms against 4.3 (7.7 against 6.2 in parallel; PG16, the median of seven runs):
+  a mischoice of about a millisecond, 5,913 probes into a 12,000-row dimension. On the second, a
+  fact filter with no entry (`x = 77`), it is 16.7 against 138, and both run in hundredths of a
+  millisecond.
 
 **Declined, and why.**
 
