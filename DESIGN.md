@@ -21071,14 +21071,15 @@ has ANALYZE's estimate again, exactly as without lion.
 
 ### The meta page, and the format
 
-`LionMetaNdistinct` (lion.h), 272 bytes (536 since the sums of squares of 2026-10-23, below,
-"The rows of a probed key"), right after `LionMetaPageData` on the meta page at
+`LionMetaNdistinct` (lion.h), 528 bytes, right after `LionMetaPageData` on the meta page at
 `LION_META_NDISTINCT_OFFSET`:
 
     valid_cols   uint32   bit i - 1: key column i has a count
     bulkdeletes  uint32   the ambulkdelete calls finished, mod 2^32 (§37; `unused` until then)
     rows         uint64   the rows the index held when counted (above)
     ndistinct    uint64[32]  the VALUE entries of each key column
+    sumsq        uint64[32]  Σn² of each key column: the square of each such entry's TIDs, summed
+                             (below, "The rows of a probed key")
 
 Nothing in it says when it was counted. A build writes exactly the bytes every other build of the
 same rows writes, whatever its memory, its workers or its snapshot - `test/sql/build.sql` and
@@ -21112,8 +21113,7 @@ for nothing they could get wrong.
 
 `lion_meta_write_ndistinct()` writes the area in a record of its own, through the shim (§25):
 the meta page locked EXCLUSIVE, `lion_wal_begin()`, the area copied onto the registered page and
-`pd_lower` raised to cover it, a `LION_OP_NDISTINCT` operation carrying the area (272 bytes; 536
-with the sums of squares, below), and
+`pd_lower` raised to cover it, a `LION_OP_NDISTINCT` operation carrying the 528 bytes, and
 `lion_wal_finish(LION_XLOG_META)` - the record type §25 had reserved for the meta page and never
 written. In generic mode the operation is a no-op and GenericXLog's diff of the image carries the
 change, `pd_lower` included; generic redo zeroes what lies between `pd_lower` and `pd_upper`, and
@@ -21209,8 +21209,8 @@ error), and the row it returns is the one supplied, with its `acl_ok`. As `lion_
 does for the probe's row. The lookup also checks that core's row is the column's own
 (`starelid`, `staattnum`, not `stainherit`).
 
-**Caching.** Each index's meta page is read once per planner run (one pin, a SHARE lock and the
-area, `lion_nd_index()`), and each column's corrected row is made once per planner run and handed
+**Caching.** Each index's meta page is read once per planner run (one pin, a SHARE lock and 528
+bytes, `lion_nd_index()`), and each column's corrected row is made once per planner run and handed
 out as is, with a release function that frees nothing: both live in the memory of the planner run,
 forgotten when it is reset (`lion_nd_cache_for()`, as `lion_probe_cache_for()`). The next plan
 reads the meta page again, so a count written by a build, a REINDEX, a VACUUM or an ANALYZE is what
@@ -21296,28 +21296,11 @@ It is a `uint64` that saturates at its maximum (`lion_sumsq_add()`), which reads
 zero does. It costs a multiply and an add per entry, in a pass that reads every entry already.
 Dead TIDs count in it until VACUUM, as they do in the rows.
 
-**The meta page.** `LionMetaNdistinct` grows from 272 bytes to 536, with two new fields after
-`ndistinct`:
-
-    sumsq_rows   uint64      the rows the sums were taken over: rows, or 0 where none were taken
-    sumsq        uint64[32]  Σn² of each key column
-
-`pd_lower` says which part a page has. `LionMetaHasNdistinct()` now asks for the first 272 bytes,
-`LionMetaHasSumsq()` for all 536. A meta page written before the sums ends at the counts and reads
-as one with counts and no sums: unknown, until the next build, VACUUM that deletes or ANALYZE
-within the bound writes both (`lion_meta_copy_ndistinct()` copies what the page has and zeroes the
-rest). The format version does not move, by the same argument as the counts': nothing before this
-reads past `ndistinct`. An older build that counts again rewrites `rows` and the counts and leaves
-the sums as they were. `sumsq_rows` is what tells that apart: a sum is used only while `sumsq_rows`
-equals `rows` (`LionMetaSumsqKnown()`), and a recount by an older build moves `rows` and not
-`sumsq_rows`.
-
-The `LION_OP_NDISTINCT` record carries the whole area, 536 bytes, written under the same lock and
-the same rule that nothing already there is written again. Redo also takes the 272 bytes an older
-build wrote, for WAL from before an upgrade. It replays them as that build would: `pd_lower`
-raised to cover the counts and no further, and the bytes past them left as they were. A standby
-replaying a newer primary's 536-byte record must have this build, since an older one PANICs on the
-payload's length. Upgrade the standbys first, as for any change to a record.
+**The meta page.** `sumsq uint64[32]`, Σn² of each key column, follows `ndistinct` in
+`LionMetaNdistinct` (above, "The meta page, and the format"). It is written and logged with the
+counts, in the same `LION_OP_NDISTINCT` record, under the same lock and the same rule that nothing
+already there is written again. A sum is known where it is above zero and below the saturated
+maximum, over a count of some rows (`LionMetaSumsqKnown()`).
 
 **The formula** (`lion_skew_rows_of()`, lion_selfuncs.c). From ANALYZE's row of the column take the
 null fraction and the MCV list's frequencies f_i, and the rows N the planner finds the table to
@@ -21329,7 +21312,8 @@ sum, so a row drawn from them belongs to a key of
 rows on average, and of `Σn² / (N (1 - nullfrac))` with no MCV list. The result is bounded below by
 core's rows per key, as `var_eq_non_const()` has them, and above by N. A unique column has
 Σn² = N and stays at its one row; a probe of a most common value is what the MCV list is for, and
-the formula leaves those keys out.
+the formula leaves those keys out. A column whose MCV list holds every value has no key outside it
+(what the formula would leave is rounding) and keeps core's rows.
 
 Σn² was summed over the rows the count was taken over, and the table may have grown since. It is
 scaled by the count's convention (`lion_ndistinct_value()`), with g the table's rows over the rows
@@ -21396,8 +21380,7 @@ subquery, and its fixtures' keys are skewed enough to move its plans.
 - The rows of a probed key are a mean over the keys outside the MCV list, weighted by their rows.
   It is right for outer rows drawn as the fact's rows are, and too many for an outer set that
   covers most of the keys, which meets about the per-key mean. Such sets are hash joins, which no
-  probe's rows price. A meta page from before the sums, or one an older build counted again,
-  supplies no sums until a build, a VACUUM that deletes or an ANALYZE within the bound counts it.
+  probe's rows price.
 
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 

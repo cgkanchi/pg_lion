@@ -762,7 +762,13 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer)
  * a path priced at those rows (lion_units_take_skew()), are weighed with the
  * loop at its price at them, nlcost + nlextra: the correction is the
  * skewscale lion_units_price() applies, outside the bound, and the cold
- * reads are the factor on top of it, within it, as before.
+ * reads are the factor on top of it, within it, as before.  The two do not
+ * count nlextra twice: the skewscale converts the path's price into core's
+ * units, and the factor is each side's cold reads over its own warm price at
+ * the rows both meet, a ratio in which nlextra is only the loop's share of
+ * that price.  Only the FK-side join comes here, and its skewscale is this
+ * loop's (lion_units_take_skew()); a count's, from its relation's own scan
+ * (lion_skew_clauses_scale()), never meets the cold reads.
  */
 #define LION_COLD_MAX_DISCOUNT	1.5
 

@@ -1186,27 +1186,13 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_NDISTINCT:
-
-				/*
-				 * The whole area; or, written by a build that kept no sums
-				 * of squares (WAL from before an upgrade), the counts alone,
-				 * replayed as that build replays them: pd_lower raised to
-				 * cover the counts and no more, and whatever lies past them
-				 * left as it was - unknown below pd_lower, or sums whose
-				 * sumsq_rows no longer match the rows (lion.h).
-				 */
-				if ((op.len != sizeof(LionMetaNdistinct) &&
-					 op.len != LION_META_COUNTS_SIZE) || !LionPageIsMeta(page))
+				if (op.len != sizeof(LionMetaNdistinct) || !LionPageIsMeta(page))
 					elog(PANIC, "pg_lion: bad NDISTINCT payload on block %u",
 						 blkno);
-				memcpy(LionPageGetMetaNdistinct(page), payload, op.len);
-				{
-					LocationIndex end = (op.len == sizeof(LionMetaNdistinct)) ?
-						LION_META_NDISTINCT_END : LION_META_COUNTS_END;
-
-					if (((PageHeader) page)->pd_lower < end)
-						((PageHeader) page)->pd_lower = end;
-				}
+				memcpy(LionPageGetMetaNdistinct(page), payload,
+					   sizeof(LionMetaNdistinct));
+				if (((PageHeader) page)->pd_lower < LION_META_NDISTINCT_END)
+					((PageHeader) page)->pd_lower = LION_META_NDISTINCT_END;
 				break;
 
 			case LION_OP_DELETED:
