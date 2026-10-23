@@ -873,6 +873,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
 | `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan competing with an FK-side join, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
+| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"); 0 turns the charge off |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
@@ -941,6 +942,14 @@ count reads it from - since that scan does the count's work and fetches every ro
 the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
 same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
 and Lion's switches leave theirs out, whatever the margin or price.
+
+`pg_lion.cold_max_discount` (1.5; 1 to 10): the most the uncached reads of a competing plan may
+divide a Lion custom path's price by, where the query's tables do not fit in
+`effective_cache_size` - a nested loop's against an FK-side join (`cold_page_cost`), a bitmap heap
+scan's against a covering walk, a count or an FK-side join (`cold_stream_page_cost`), each with the
+Lion path's own uncached reads added. 1 takes nothing off. It bounds what a misjudged cache costs:
+where the tables are cached after all, a Lion path chosen for those reads can take up to this many
+times its competitor's time (DESIGN.md §39, "A bitmap heap scan's cold reads").
 
 `pg_lion.vector_epsilon` (4, 1 to 10): how wide a `lionvec` scan's error bounds are, in
 standard deviations (DESIGN.md §44.8). A row of the partitions a scan reads is missed only when its
