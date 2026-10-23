@@ -24,15 +24,16 @@
  *		that label each row with the outcome of every predicate the GROUP BY's
  *		expressions are made of - the cells of DESIGN.md §10 ("Counts by
  *		cells"), whose analysis is lion_plan_cells.c's.  The heap is read
- *		only for a page the visibility map does not call all-visible, as the
- *		nested loop's probe of §40.10 reads it.  A NOT EXISTS over a small
- *		table keyed by the join's key is a set too: its rows' keys looked up
- *		in the same B-tree once, every TID found a member.  Each fact row
- *		that finds its dimension row goes up as the fact's columns and the
- *		predicates' truths, LION_TL_CELLPRED columns of custom_scan_tlist,
- *		which setrefs.c matches the GROUP BY's expressions' predicates to; the
- *		Agg above is core's, hashed, and partial below a Gather when the
- *		fact's path is.
+ *		for a page the visibility map does not call all-visible, as the
+ *		nested loop's probe of §40.10 reads it, and for every row found when
+ *		the WHERE's set is inexact, to recheck the WHERE on the heap tuple.
+ *		A NOT EXISTS over a small table keyed by the join's key is a set
+ *		too: its rows' keys looked up in the same B-tree once, every TID
+ *		found a member.  Each fact row that finds its dimension row goes up
+ *		as the fact's columns and the predicates' truths, LION_TL_CELLPRED
+ *		columns of custom_scan_tlist, which setrefs.c matches the GROUP BY's
+ *		expressions' predicates to; the Agg above is core's, hashed, and
+ *		partial below a Gather when the fact's path is.
  *
  *		The sets, the descent's price and the lion access are lion_ordered.c's
  *		(lion_probe_sets_*(), lion_ordered_*()); the shape of the join is

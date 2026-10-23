@@ -472,15 +472,17 @@ SELECT CASE WHEN d.region IN ('north', 'east') THEN 'ne'
 each `dim_id` up in `dim_pkey` (`Probe Index`, `Probe Cond`), and tests the entry against Lion sets
 of the dimension built once: the `WHERE`'s (`Lion Cond`), one for each outcome of the columns the
 `CASE`'s predicates read (`Cell Predicates`), and the `NOT EXISTS`'s keys looked up in the same
-B-tree (`Anti Join Cond`). The heap is read only for pages the visibility map does not call
-all-visible (`Heap TIDs Rechecked` in `EXPLAIN ANALYZE`), and PostgreSQL's `HashAggregate` computes
-the groups from the predicates' truths - in parallel over the fact's parallel scan. The predicates
-are the ones `pg_lion.enable_count_cells` counts (equalities, `IN`, null tests, booleans and
-multi-key queries with constants); a dimension column used any other way - grouped by itself, under
-a `THEN`, in an aggregate - keeps the node out, and so does a `WHERE` clause on the dimension no
-Lion index answers. The planner prices a B-tree descent per fact row and the sets' builds against
-PostgreSQL's plan: the node pays where the fact's rows are few against the dimension's `WHERE`, or
-the dimension's heap would be read cold; `pg_lion.enable_probe_join` turns it off (DESIGN.md §46).
+B-tree (`Anti Join Cond`). The heap is read for pages the visibility map does not call all-visible,
+and for every row found when the `WHERE`'s set is inexact, to recheck the `WHERE` on the heap tuple
+(`Heap TIDs Rechecked` and `Rows Removed by Lion Recheck` in `EXPLAIN ANALYZE`). PostgreSQL's
+`HashAggregate` computes the groups from the predicates' truths - in parallel over the fact's
+parallel scan. The predicates are the ones `pg_lion.enable_count_cells` counts (equalities, `IN`,
+null tests, booleans and multi-key queries with constants); a dimension column used any other way -
+grouped by itself, under a `THEN`, in an aggregate - keeps the node out, and so does a `WHERE`
+clause on the dimension no Lion index answers. The planner prices a B-tree descent per fact row and
+the sets' builds against PostgreSQL's plan: the node pays where the fact's rows are few against the
+dimension's `WHERE`, or the dimension's heap would be read cold; `pg_lion.enable_probe_join` turns
+it off (DESIGN.md §46).
 
 ## Nearest neighbours: lionvec
 
