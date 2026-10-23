@@ -9,9 +9,10 @@
 -- with no lion index on f.  The node reads f's rows from core's own path,
 -- looks each key up in d's primary key, and tests the TID found against sets
 -- of d's lion indexes built once: the WHERE's, and a label set an outcome of
--- each column the GROUP BY's predicates read.  The heap is read only on pages
--- the visibility map does not call all-visible.  Every answer is checked
--- against core's plan with the node switched off.
+-- each column the GROUP BY's predicates read.  The heap is read on pages the
+-- visibility map does not call all-visible, and for every row found when the
+-- WHERE's set is inexact, to recheck the WHERE on the heap tuple.  Every
+-- answer is checked against core's plan with the node switched off.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
