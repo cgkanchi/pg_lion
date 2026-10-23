@@ -1,0 +1,73 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s0_vacuum s1_plan s1_fetches s1_begin s2_begin s1_read s2_read s1_update s2_update s1_commit s2_commit
+step s0_vacuum: VACUUM bps_d;
+step s1_plan: EXPLAIN (COSTS OFF) SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 1;
+QUERY PLAN                                  
+--------------------------------------------
+Nested Loop                                 
+  ->  Seq Scan on bps_o o                   
+  ->  Custom Scan (LionBtreeScan) on bps_d d
+        Index: bps_d_pkey (index only)      
+        Index Cond: (d.id = o.k)            
+        Lion Cond: (d.c = 1)                
+        Lion Indexes: bps_d_c               
+(7 rows)
+
+step s1_fetches: SELECT bps_fetches('SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 1');
+bps_fetches                                    
+-----------------------------------------------
+Index: bps_d_pkey (index only); Heap Fetches: 0
+(1 row)
+
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 1 ORDER BY d.id;
+id
+--
+ 1
+11
+(2 rows)
+
+step s2_read: SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 2 ORDER BY d.id;
+id
+--
+ 2
+12
+(2 rows)
+
+step s1_update: UPDATE bps_d SET note = 's1' WHERE id = 2;
+step s2_update: UPDATE bps_d SET note = 's2' WHERE id = 1;
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s0_vacuum s1_fetches s1_begin s2_begin s1_read s2_read s1_update s1_commit s2_update s2_commit
+step s0_vacuum: VACUUM bps_d;
+step s1_fetches: SELECT bps_fetches('SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 1');
+bps_fetches                                    
+-----------------------------------------------
+Index: bps_d_pkey (index only); Heap Fetches: 0
+(1 row)
+
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 1 ORDER BY d.id;
+id
+--
+ 1
+11
+(2 rows)
+
+step s2_read: SELECT d.id FROM bps_o o JOIN bps_d d ON d.id = o.k WHERE d.c = 2 ORDER BY d.id;
+id
+--
+ 2
+12
+(2 rows)
+
+step s1_update: UPDATE bps_d SET note = 's1' WHERE id = 2;
+step s1_commit: COMMIT;
+step s2_update: UPDATE bps_d SET note = 's2' WHERE id = 1;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s2_commit: COMMIT;

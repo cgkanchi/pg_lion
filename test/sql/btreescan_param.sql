@@ -1,0 +1,562 @@
+-- A covering B-tree's walk as a nested loop's probe (DESIGN.md §40.10).
+--
+-- SELECT ... FROM fact f JOIN dim d ON d.id = f.dim_id WHERE <clauses lion
+-- indexes on d answer> AND <filters on f>: the inner side of the loop is a
+-- LionBtreeScan parameterized by the outer row - a descent of d's primary
+-- key to the outer row's key, the entry probed against a lion set built once
+-- from d's own restriction clauses and kept for every scan of the loop, and
+-- the row's values from the index tuple, the heap read only for pages the
+-- visibility map does not call all-visible.  Core's plan for the same loop
+-- is an Index Scan of the primary key that fetches every outer row's dim
+-- row to test the filter on it.  Every query below is run through the probe
+-- (hash and merge joins off, lion's paths priced at a thousandth) and
+-- through the ordinary plan (the walks off), and the answers are compared,
+-- as multisets unless the query orders them completely.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET default_statistics_target = 1000;
+SET work_mem = '64MB';
+
+CREATE TYPE bsp_grade AS ENUM ('delta', 'gamma', 'alpha', 'beta');
+CREATE TYPE bsp_hue AS ENUM ('blue', 'green', 'amber', 'grey');
+CREATE TABLE bsp_dim (
+	id int PRIMARY KEY,
+	grade bsp_grade NOT NULL,	-- lion-filtered: 'alpha' in 70% of the rows
+	hue bsp_hue NOT NULL,		-- lion-filtered: 'green' in 80%
+	verified bool NOT NULL,		-- lion-filtered: two thirds true
+	tags text[] NOT NULL,		-- lion-filtered: one of ten tags
+	grp int NOT NULL,			-- 2,000 groups: the second B-tree's leader
+	k int NOT NULL,				-- ten values: its second column
+	note text,					-- indexed by nothing: updating it is HOT
+	pad text					-- wide: the heap is many times the B-trees
+) WITH (autovacuum_enabled = off, fillfactor = 90);
+INSERT INTO bsp_dim
+SELECT i,
+	   CASE WHEN h1 < 70 THEN 'alpha' WHEN h1 < 80 THEN 'beta'
+			WHEN h1 < 90 THEN 'gamma' ELSE 'delta' END::bsp_grade,
+	   CASE WHEN h2 < 80 THEN 'green' WHEN h2 < 90 THEN 'amber'
+			WHEN h2 < 95 THEN 'blue' ELSE 'grey' END::bsp_hue,
+	   h3 % 3 <> 0,
+	   ARRAY['t' || (h3 / 3 % 10)],
+	   i % 2000,
+	   (i / 2000) % 10,
+	   'n',
+	   repeat(md5(i::text), 4)
+  FROM (SELECT i,
+			   ((hashint8extended(i::bigint, 1) & 9223372036854775807) % 100)::int AS h1,
+			   ((hashint8extended(i::bigint, 2) & 9223372036854775807) % 100)::int AS h2,
+			   ((hashint8extended(i::bigint, 3) & 9223372036854775807) % 3000)::int AS h3
+		  FROM generate_series(1, 100000) i) s;
+CREATE INDEX bsp_dim_gk ON bsp_dim (grp, k) INCLUDE (id);
+CREATE INDEX bsp_dim_grade ON bsp_dim USING lion (grade);
+CREATE INDEX bsp_dim_hue ON bsp_dim USING lion (hue);
+CREATE INDEX bsp_dim_verified ON bsp_dim USING lion (verified);
+CREATE INDEX bsp_dim_tags ON bsp_dim USING lion (tags);
+
+CREATE TABLE bsp_fact (
+	id int PRIMARY KEY,
+	dim_id int,					-- NULL in every 50th row
+	g int NOT NULL,				-- a group of bsp_dim, for the second B-tree
+	tsv tsvector NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO bsp_fact
+SELECT i,
+	   CASE WHEN i % 50 = 0 THEN NULL
+			ELSE 1 + ((hashint8extended(i::bigint, 5) & 9223372036854775807) % 100000)::int END,
+	   i % 2000,
+	   to_tsvector('simple', 'w' || (i % 40) || ' x' || (i % 7))
+  FROM generate_series(1, 200000) i;
+CREATE INDEX bsp_fact_tsv ON bsp_fact USING lion (tsv);
+VACUUM (FREEZE, ANALYZE) bsp_dim;
+VACUUM (FREEZE, ANALYZE) bsp_fact;
+
+/*
+ * bsp() runs q through the probe - hash and merge joins off and lion's paths
+ * priced at a thousandth (at 1/`margin`), so that a nested loop into the
+ * LionBtreeScan is the plan; Memoize as `memoize` says - and through the ordinary plan (the walks
+ * off, nothing else changed), compares the two answers, as multisets unless
+ * `ordered`, and names the plan's join, a Memoize over the probe, and the
+ * probe's index and Index Cond.  A prepared statement's cached plan does not
+ * change with the settings, so for one the ordinary answer comes from the
+ * query it stands for, given as `ordinary`.
+ */
+CREATE FUNCTION bsp(q text, memoize boolean DEFAULT false,
+					ordered boolean DEFAULT false,
+					ordinary text DEFAULT NULL,
+					margin int DEFAULT 1000) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	shape text := '';
+	cond text := '';
+	a text[] := '{}';
+	b text[] := '{}';
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_memoize', memoize::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin', margin::text, true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ '(Nested Loop|Memoize|Custom Scan \(LionBtreeScan\))' THEN
+			shape := shape || CASE WHEN shape = '' THEN '' ELSE ' > ' END ||
+				substring(ln from '(Nested Loop[ A-Za-z]*|Memoize|LionBtreeScan)');
+		ELSIF ln ~ '^\s*Index: ' AND cond = '' THEN
+			cond := substring(ln from 'Index: (.*)$');
+		ELSIF ln ~ '^\s*Index Cond: ' AND cond <> '' AND cond !~ ' on ' THEN
+			cond := cond || ' on ' || substring(ln from 'Index Cond: (.*)$');
+		END IF;
+	END LOOP;
+	FOR r IN EXECUTE q LOOP
+		a := a || r::text;
+	END LOOP;
+
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	FOR r IN EXECUTE coalesce(ordinary, q) LOOP
+		b := b || r::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
+
+	IF NOT ordered THEN
+		SELECT coalesce(array_agg(e ORDER BY e), '{}') INTO a FROM unnest(a) e;
+		SELECT coalesce(array_agg(e ORDER BY e), '{}') INTO b FROM unnest(b) e;
+	END IF;
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the probe, %s ordinary; first %s / %s',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0),
+					  a[1], b[1]);
+	END IF;
+	RETURN format('%s (%s), %s rows', shape, cond, coalesce(array_length(a, 1), 0));
+END $$;
+
+/*
+ * bsp_run() runs q through the probe under EXPLAIN ANALYZE, as bsp() runs it,
+ * and prints the probe's lines and counters and a Memoize's above it,
+ * without the "actual" figures - and only whether a counter is 0 unless
+ * `counts`: an entry a scan finds dead is marked so in the B-tree, and the
+ * next scan does not meet it.
+ */
+CREATE FUNCTION bsp_run(q text, memoize boolean DEFAULT false,
+						margin int DEFAULT 1000,
+						counts boolean DEFAULT true) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	inside boolean := false;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_memoize', memoize::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin', margin::text, true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionBtreeScan\)' THEN
+			inside := true;
+		ELSIF ln ~ '->' THEN
+			inside := false;
+		END IF;
+		IF NOT counts AND ln ~ '(Walked|Hits|Fetches): [1-9]' THEN
+			ln := regexp_replace(ln, ': [0-9]+$', ': > 0');
+		END IF;
+		IF inside OR ln ~ '(Memoize|Cache Key)' THEN
+			RETURN NEXT btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
+		ELSIF ln ~ 'Hits: [0-9]+ +Misses: [0-9]+' THEN
+			RETURN NEXT substring(ln from 'Hits: [0-9]+ +Misses: [0-9]+');
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+END $$;
+
+/*
+ * bsp_plan() prints the plan with nothing disabled (the plan choice is the
+ * test), without the lines whose contents vary between majors.
+ */
+CREATE FUNCTION bsp_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers|Estimates)' THEN
+			RETURN NEXT ln;
+		END IF;
+	END LOOP;
+END $$;
+
+-- 1. The shape this is for: a dimension's rows that pass its lion filters -
+--    a fifth of them - counted by the fact rows that match a search, the
+--    most first.  With nothing disabled the plan is the nested loop into the
+--    probe.
+SELECT bsp_plan($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id ORDER BY n DESC, d.id LIMIT 20$$);
+SELECT bsp($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id ORDER BY n DESC, d.id LIMIT 20$$, ordered => true);
+SELECT * FROM bsp_run($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id ORDER BY n DESC, d.id LIMIT 20$$);
+-- the switch off: core's plan
+SET pg_lion.enable_btree_scan = off;
+SELECT bsp_plan($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id ORDER BY n DESC, d.id LIMIT 20$$);
+RESET pg_lion.enable_btree_scan;
+
+-- 2. A few outer rows, and outer rows whose key is NULL (every 50th): the
+--    loop's probe for each, forced; the descent for a NULL key finds nothing,
+--    as core's Index Scan's does.  An inner join, a LEFT JOIN whose ON
+--    clauses on d are the probe's set, and a semi and an anti join.  The
+--    Index Cond prints the join clause with the key on the left however the
+--    query wrote it (`f.dim_id = d.id` in the NOT EXISTS), as core's Index
+--    Scan does.
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id IN (3, 50, 77, 100, 401) AND d.verified AND d.grade IN (''alpha'', ''beta'')');
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''');
+SELECT bsp('SELECT f.id, f.dim_id, d.id FROM bsp_fact f LEFT JOIN bsp_dim d
+   ON d.id = f.dim_id AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''
+ WHERE f.id <= 400');
+SELECT count(*) FILTER (WHERE f.dim_id IS NULL) AS null_keys
+  FROM bsp_fact f WHERE f.id <= 400;
+SELECT bsp('SELECT d.id FROM bsp_dim d WHERE d.verified AND d.hue = ''green''
+   AND d.id IN (SELECT f.dim_id FROM bsp_fact f WHERE f.id <= 400)');
+SELECT bsp('SELECT f.id FROM bsp_fact f WHERE f.id <= 400 AND NOT EXISTS
+  (SELECT 1 FROM bsp_dim d WHERE f.dim_id = d.id AND d.verified AND d.hue = ''green'')');
+-- an empty set: no dim row passes, and no scan walks
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''nope'']');
+
+-- 3. Outer rows that repeat their keys: each fact row's group, two thousand
+--    keys among 28,572 rows, probed with a Memoize above the probe (lion's
+--    paths at a tenth: at a thousandth the probe is too cheap to cache) and
+--    without one.  The set is built once either way: a scan Memoize answers
+--    from its cache never reaches the probe, and the probe it rescans keeps
+--    its set (no "builds" in Lion Set) - two thousand walks with a Memoize,
+--    28,572 without.  PostgreSQL 19 may aggregate the fact side below the
+--    join instead (eager aggregation), which probes each key once itself.
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
+SELECT bsp('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+ WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
+		   memoize => true, margin => 10);
+SELECT bsp('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+ WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
+		   memoize => false);
+SELECT * FROM bsp_run('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+ WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
+					  memoize => true, margin => 10);
+SELECT * FROM bsp_run('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+ WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
+					  memoize => false);
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
+
+-- 4. A B-tree of two columns: the leading one the outer row's, the second a
+--    constant, both its Index Cond; each descent finds a few entries.
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.grp = f.g
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.k = 3 AND d.verified AND d.hue = ''green''');
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.grp = f.g
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.k IN (2, 3) AND d.tags && ARRAY[''t2'']');
+SELECT * FROM bsp_run('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.grp = f.g
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.k = 3 AND d.verified AND d.hue = ''green''');
+
+-- 5. Params.  A generic plan's parameter in the lion filter: the set is
+--    built for the value of each execution.  A subquery the outer query
+--    rescans: with its parameter in the fact side's filter the probe keeps
+--    its set across the rescans (built once); with it in the lion filter the
+--    set is built again for each value.
+SET plan_cache_mode = force_generic_plan;
+PREPARE bsp_p(bsp_grade, int) AS
+SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= $2 AND d.grade = $1 AND d.verified;
+SELECT bsp('EXECUTE bsp_p(''alpha'', 300)', ordinary =>
+		   'SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.id <= 300 AND d.grade = ''alpha'' AND d.verified');
+SELECT bsp('EXECUTE bsp_p(''delta'', 3000)', ordinary =>
+		   'SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.id <= 3000 AND d.grade = ''delta'' AND d.verified');
+DEALLOCATE bsp_p;
+RESET plan_cache_mode;
+SELECT bsp('SELECT o.x, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.tsv @@ ''w7 & x3''::tsquery AND f.id % 3 = o.x
+			   AND d.tags && ARRAY[''t1'', ''t3''] AND d.verified)
+  FROM generate_series(0, 2) o(x)');
+SELECT * FROM bsp_run('SELECT o.x, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.tsv @@ ''w7 & x3''::tsquery AND f.id % 3 = o.x
+			   AND d.tags && ARRAY[''t1'', ''t3''] AND d.verified)
+  FROM generate_series(0, 2) o(x)');
+SELECT bsp('SELECT o.t, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.grade = o.t AND d.verified)
+  FROM unnest(''{delta,gamma,alpha}''::bsp_grade[]) o(t)');
+SELECT * FROM bsp_run('SELECT o.t, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+			 WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.grade = o.t AND d.verified)
+  FROM unnest(''{delta,gamma,alpha}''::bsp_grade[]) o(t)');
+
+-- 6. A cursor fetched in pieces: between the fetches the loop's probe keeps
+--    its set and the outer side its place; the rows are the ordinary plan's.
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_memoize = off;
+SET pg_lion.pushdown_margin = 1000;
+BEGIN;
+EXPLAIN (COSTS OFF) DECLARE bsp_c CURSOR FOR
+SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 600 AND d.tags && ARRAY['t1', 't3', 't5'] AND d.hue = 'green' ORDER BY f.id;
+DECLARE bsp_c CURSOR FOR
+SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 600 AND d.tags && ARRAY['t1', 't3', 't5'] AND d.hue = 'green' ORDER BY f.id;
+FETCH 3 FROM bsp_c;
+FETCH 3 FROM bsp_c;
+MOVE FORWARD ALL IN bsp_c;
+FETCH 1 FROM bsp_c;
+COMMIT;
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+SET pg_lion.enable_btree_scan = off;
+SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 600 AND d.tags && ARRAY['t1', 't3', 't5'] AND d.hue = 'green' ORDER BY f.id LIMIT 6;
+SELECT count(*) - 6 AS moved FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 600 AND d.tags && ARRAY['t1', 't3', 't5'] AND d.hue = 'green';
+RESET pg_lion.enable_btree_scan;
+
+-- 7. Pages not all-visible.  In one transaction: dim rows inserted (and
+--    fact rows that join them), dim rows the loop meets deleted, updated
+--    HOT (the note) - the B-tree's entry names the chain's root, which the
+--    heap fetch follows - and updated in the lion filter's columns, in and
+--    out of the set.  The probe reads the heap for the rows on those pages
+--    and nowhere else; the answers are the ordinary plan's in the
+--    transaction, after it, and after VACUUM, which leaves no heap fetch
+--    (INDEX_CLEANUP ON: with as few dead rows as these VACUUM would leave
+--    the B-tree's entries for them, and their pages not all-visible).
+BEGIN;
+INSERT INTO bsp_dim
+SELECT 100000 + i, 'alpha', 'green', true, ARRAY['t1'], i % 2000, 3, 'n', 'blue'
+  FROM generate_series(1, 300) i;
+INSERT INTO bsp_fact
+SELECT 200000 + i, 100000 + i, i % 2000, to_tsvector('simple', 'w7 x3')
+  FROM generate_series(1, 300) i;
+CREATE TEMP TABLE bsp_met AS
+SELECT DISTINCT f.dim_id AS id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.tsv @@ 'w7 & x3'::tsquery AND f.id <= 200000
+   AND d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green';
+DELETE FROM bsp_dim WHERE id IN (SELECT id FROM bsp_met ORDER BY id LIMIT 20);
+UPDATE bsp_dim SET note = 'hot' WHERE id IN (SELECT id FROM bsp_met ORDER BY id OFFSET 20 LIMIT 20);
+UPDATE bsp_dim SET grade = 'delta' WHERE id IN (SELECT id FROM bsp_met ORDER BY id OFFSET 40 LIMIT 20);
+UPDATE bsp_dim SET grade = 'alpha', hue = 'green', verified = true, tags = ARRAY['t9']
+ WHERE id IN (SELECT f.dim_id FROM bsp_fact f
+			   WHERE f.tsv @@ 'w7 & x3'::tsquery AND f.dim_id NOT IN (SELECT id FROM bsp_met)
+			   ORDER BY f.id LIMIT 20);
+SELECT bsp($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$);
+SELECT * FROM bsp_run($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$, counts => false);
+COMMIT;
+SELECT bsp($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$);
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.grp = f.g
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.k = 3 AND d.verified AND d.hue = ''green''');
+VACUUM (ANALYZE, INDEX_CLEANUP ON) bsp_dim;
+VACUUM (ANALYZE) bsp_fact;
+SELECT bsp($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$);
+SELECT * FROM bsp_run($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$, counts => false);
+DROP TABLE bsp_met;
+
+-- 8. A parallel nested loop: the outer side a parallel scan, the probe
+--    below it in each participant - not parallel-aware, each building its
+--    own set (DESIGN.md §40.10, "Parallel query").  Run as CREATE TABLE AS,
+--    which may run in parallel where a plpgsql FOR loop may not.
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+CREATE FUNCTION bsp_par(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	shape text := '';
+	a text[];
+	b text[];
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_memoize', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ '(Gather|Nested Loop|Parallel Seq Scan|Custom Scan \(LionBtreeScan\))' THEN
+			shape := shape || CASE WHEN shape = '' THEN '' ELSE ' > ' END ||
+				substring(ln from '(Gather|Nested Loop|Parallel Seq Scan|LionBtreeScan)');
+		END IF;
+	END LOOP;
+	EXECUTE 'CREATE TEMP TABLE bsp_out AS SELECT s::text AS r FROM (' || q || ') s';
+	SELECT coalesce(array_agg(r ORDER BY r), '{}') INTO a FROM bsp_out;
+	DROP TABLE bsp_out;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	EXECUTE 'CREATE TEMP TABLE bsp_out AS SELECT s::text AS r FROM (' || q || ') s';
+	SELECT coalesce(array_agg(r ORDER BY r), '{}') INTO b FROM bsp_out;
+	DROP TABLE bsp_out;
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the probe, %s ordinary',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0));
+	END IF;
+	RETURN format('%s, %s rows', shape, coalesce(array_length(a, 1), 0));
+END $$;
+SELECT bsp_par('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 20 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.verified AND d.grade = ''alpha''');
+SELECT bsp_par('SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 200 AND d.verified AND d.hue = ''green'' GROUP BY 1');
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_memoize = off;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF)
+SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 200 AND d.verified AND d.hue = 'green' GROUP BY 1;
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+SET max_parallel_workers_per_gather = 0;
+DROP FUNCTION bsp_par(text);
+
+-- 9. A partitionwise join: each partition of the fact joined to the
+--    partition of the dimension with its keys, the probe of each dimension
+--    partition reparameterized from the fact's parent to its partition
+--    (ReparameterizeCustomPathByChild).
+CREATE TABLE bsp_pd (id int PRIMARY KEY, grade bsp_grade NOT NULL, verified bool NOT NULL,
+					 pad text) PARTITION BY HASH (id);
+CREATE TABLE bsp_pd0 PARTITION OF bsp_pd FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE bsp_pd1 PARTITION OF bsp_pd FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE bsp_pf (id int NOT NULL, dim_id int, tsv tsvector NOT NULL) PARTITION BY HASH (dim_id);
+CREATE TABLE bsp_pf0 PARTITION OF bsp_pf FOR VALUES WITH (MODULUS 2, REMAINDER 0)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE bsp_pf1 PARTITION OF bsp_pf FOR VALUES WITH (MODULUS 2, REMAINDER 1)
+	WITH (autovacuum_enabled = off);
+INSERT INTO bsp_pd SELECT id, grade, verified, pad FROM bsp_dim;
+INSERT INTO bsp_pf SELECT id, dim_id, tsv FROM bsp_fact;
+CREATE INDEX bsp_pd_grade ON bsp_pd USING lion (grade);
+CREATE INDEX bsp_pd_verified ON bsp_pd USING lion (verified);
+CREATE INDEX bsp_pf_tsv ON bsp_pf USING lion (tsv);
+VACUUM (FREEZE, ANALYZE) bsp_pd0, bsp_pd1, bsp_pf0, bsp_pf1;
+ANALYZE bsp_pd, bsp_pf;
+SET enable_partitionwise_join = on;
+SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_memoize = off;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF)
+SELECT f.id, d.id FROM bsp_pf f JOIN bsp_pd d ON d.id = f.dim_id
+ WHERE f.tsv @@ 'w7 & x3'::tsquery AND d.grade = 'alpha' AND d.verified;
+RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+SELECT bsp('SELECT f.id, d.id FROM bsp_pf f JOIN bsp_pd d ON d.id = f.dim_id
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND d.grade = ''alpha'' AND d.verified');
+RESET enable_partitionwise_join;
+DROP TABLE bsp_pf, bsp_pd;
+
+-- 10. The price (DESIGN.md §40.10, "Cost"), with nothing disabled.  The
+--     probe at the size of section 1 (above), and for 80 outer rows; not
+--     for 3 or 20, over which the set's build is not spread far enough -
+--     core's Index Scan, which fetches their rows - nor over a dimension of
+--     a few hundred rows.
+SELECT bsp_plan('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id IN (1, 2, 3) AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.verified AND d.grade = ''alpha''');
+SELECT bsp_plan('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 20 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.verified AND d.grade = ''alpha''');
+SELECT bsp_plan('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 80 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.verified AND d.grade = ''alpha''');
+CREATE TABLE bsp_tiny (id int PRIMARY KEY, grade bsp_grade NOT NULL, verified bool NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO bsp_tiny SELECT id, grade, verified FROM bsp_dim WHERE id <= 300;
+CREATE INDEX bsp_tiny_grade ON bsp_tiny USING lion (grade);
+CREATE INDEX bsp_tiny_verified ON bsp_tiny USING lion (verified);
+VACUUM (FREEZE, ANALYZE) bsp_tiny;
+SELECT bsp_plan('SELECT f.id, t.id FROM bsp_fact f JOIN bsp_tiny t ON t.id = f.dim_id
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND t.grade = ''alpha'' AND t.verified');
+SELECT bsp('SELECT f.id, t.id FROM bsp_fact f JOIN bsp_tiny t ON t.id = f.dim_id
+ WHERE f.tsv @@ ''w7 & x3''::tsquery AND t.grade = ''alpha'' AND t.verified');
+DROP TABLE bsp_tiny;
+
+-- 11. The settings.  pg_lion.enable_btree_scan off is core's plan (section
+--     1); core's enable_indexscan disables the probe as it disables the
+--     B-tree's own scans, and enable_indexonlyscan takes away the index-only
+--     mode the probe needs; pg_lion.enable_plain_scan and
+--     pg_lion.enable_ordered_scan leave it.  The B-tree must cover the
+--     columns the query reads of d: d.grp is in no B-tree that d.id is the
+--     key of, and that join is core's.  A row mark needs the row's ctid,
+--     which no index returns: no probe, and EvalPlanQual never meets one.
+SET enable_indexscan = off;
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''');
+RESET enable_indexscan;
+SET enable_indexonlyscan = off;
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''');
+RESET enable_indexonlyscan;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.enable_ordered_scan = off;
+SELECT bsp_plan($$
+SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
+   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id$$);
+RESET pg_lion.enable_plain_scan;
+RESET pg_lion.enable_ordered_scan;
+SELECT bsp('SELECT f.id, d.id, d.grp FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''');
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''
+ FOR UPDATE OF f');
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''
+ FOR SHARE OF d');
+
+DROP FUNCTION bsp(text, boolean, boolean, text, int);
+DROP FUNCTION bsp_run(text, boolean, int, boolean);
+DROP FUNCTION bsp_plan(text);
+DROP TABLE bsp_fact, bsp_dim;
+DROP TYPE bsp_grade, bsp_hue;
