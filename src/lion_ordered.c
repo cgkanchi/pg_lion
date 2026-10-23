@@ -1754,7 +1754,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 													   lionqual, residual));
 	if (calls > 1.0)
 	{
-		rebuilt = lion_has_exec_param((Node *) lionqual);
+		rebuilt = lion_has_outer_param(root, (Node *) lionqual);
 		if (rebuilt)
 			lioncost = Max(lioncost + lo_lion_amortized(root, lion, calls),
 						   0.0);

@@ -23864,7 +23864,10 @@ loop over an assumed number of calls.
   set whose Lion Cond holds the outer Param - the subquery's key is in a lion column too - is built
   again at every call, as `Lion Set`'s `N builds` shows; its lookups' pages alone are spread over
   the calls (`lo_lion_amortized()`: each leaf of the lion access priced again at the calls, the
-  difference taken off), the build's CPU a call's. The heap's pages are a call's, as core's.
+  difference taken off), the build's CPU a call's. An InitPlan's Param in the Lion Cond is set once
+  for every call and rebuilds nothing: only a Param the levels above hand down
+  (`lion_has_outer_param()`, their `plan_params`) counts. The heap's pages are a call's, as
+  core's.
 - **The count** (`lion_cost_count_rel_one()`, `lion_count_rel_calls_share()`, lion_plan_cost.c). A
   `LionCount` whose WHERE holds the Param is located again at every call (its rescan re-locates
   everything), so nothing is built once; the pages it reads - the directory leaves at random, an IN
@@ -23905,8 +23908,9 @@ Memoize does not exist in core's plans.
 **Tests.** test/sql/correlated.sql: the correlated count, its price at a call under half the
 generic plan's and an InitPlan's Param priced as the generic plan's; the lion index's Index Scan
 and the walk chosen in the subquery where the generic plan takes core's bitmap and index scans; a
-scalar `max()` sub-select and an `EXISTS` through the walk; every answer compared with core's plan,
-the lion paths off; and the join of the same rows, its plans unchanged.
+scalar `max()` sub-select and an `EXISTS` through the walk; the walk with an InitPlan's tsquery in
+its Lion Cond, its set built once for every call; every answer compared with core's plan, the lion
+paths off; and the join of the same rows, its plans unchanged.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 
