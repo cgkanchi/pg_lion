@@ -22899,7 +22899,8 @@ lion_plan_units.c):
   below).
 
 The floor is what this costs warm. With the inner table's working set in the cache the loop runs at
-core's price, and a lion path chosen over it can take up to 1.5 times its time. Nothing changes where the tables and the index fit in `effective_cache_size`,
+core's price, and a lion path chosen over it can take up to `pg_lion.cold_max_discount` times its
+time (1.5 by default). Nothing changes where the tables and the index fit in `effective_cache_size`,
 which every table of the regression suite does but `fkjoin_cold.sql`'s, nor against any other kind
 of plan. Not counted: the probes a semi join stops early, which the loop's reads overstate; a
 Memoize over the inner scan, which takes no charge; the count paths other than the FK-side join's,

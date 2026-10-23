@@ -798,41 +798,53 @@ lion_bitmap_index_reads(PlannerInfo *root, Path *bitmapqual, double loops,
 }
 
 /*
- * The scans a Memoize makes of its input over `loops` rescans of it: its
- * cache misses, at the rate cost_memoize_rescan() prices it at - of its
- * `calls`, the distinct values of its keys (all the calls where that
- * estimate fell back on a default), of which the cache holds est_entries
- * at once, hit (calls - ndistinct) / calls x est_entries / ndistinct of the
- * time.  est_entries is what cost_memoize_rescan() set it to, at most
- * ndistinct; 0, a Memoize not yet costed, is taken as a cache that holds
- * every key.  From PostgreSQL 19 the path keeps the ratio itself
- * (est_hit_ratio).  A scan at least.
+ * The hit ratio cost_memoize_rescan() priced a Memoize at: of its calls, the
+ * distinct values of its keys (all the calls where that estimate fell back
+ * on a default), of which the cache holds est_entries at once, hit
+ * (calls - ndistinct) / calls x est_entries / ndistinct of the time.
+ * est_entries is what cost_memoize_rescan() set it to, the least of
+ * ndistinct and the entries hash_mem holds - 0 where one entry does not fit,
+ * which it prices as every call a miss.  A Memoize not costed yet
+ * (create_memoize_path() leaves est_entries 0, and cost_rescan() is reached
+ * only for an outer side of more than one row) is taken the same way: it is
+ * scanned once a call, and is called about once.  From PostgreSQL 19 the
+ * path keeps the ratio itself (est_hit_ratio, 0 until it is costed).
  */
 static double
-lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
+lion_memoize_hit_ratio(PlannerInfo *root, MemoizePath *mpath)
 {
+#if PG_VERSION_NUM >= 190000
+	return mpath->est_hit_ratio;
+#else
 	EstimationInfo estinfo;
-	double		calls = Max(lion_memoize_calls(mpath), 1.0);
+	double		calls = Max(mpath->calls, 1.0);
 	double		ndistinct;
 	double		entries;
-	double		hit_ratio;
 
-#if PG_VERSION_NUM >= 190000
-	/* 19 keeps the ratio cost_memoize_rescan() priced it at */
-	if (mpath->est_entries > 0)
-		return Max(loops * (1.0 - Min(Max(mpath->est_hit_ratio, 0.0), 1.0)),
-				   1.0);
-#endif
+	if (mpath->est_entries == 0)
+		return 0.0;
 	memset(&estinfo, 0, sizeof(estinfo));
 	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
 									&estinfo);
 	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
 		ndistinct = calls;
 	ndistinct = Min(Max(ndistinct, 1.0), calls);
-	entries = (mpath->est_entries > 0) ?
-		Min((double) mpath->est_entries, ndistinct) : ndistinct;
-	hit_ratio = ((calls - ndistinct) / calls) * (entries / ndistinct);
-	hit_ratio = Min(Max(hit_ratio, 0.0), 1.0);
+	entries = Min((double) mpath->est_entries, ndistinct);
+	return ((calls - ndistinct) / calls) * (entries / ndistinct);
+#endif
+}
+
+/*
+ * The scans a Memoize makes of its input over `loops` rescans of it: its
+ * cache misses, at the hit ratio it was priced at (lion_memoize_hit_ratio()).
+ * A scan at least.
+ */
+static double
+lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
+{
+	double		hit_ratio = Min(Max(lion_memoize_hit_ratio(root, mpath), 0.0),
+								1.0);
+
 	return Max(loops * (1.0 - hit_ratio), 1.0);
 }
 
