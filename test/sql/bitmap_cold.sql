@@ -178,6 +178,29 @@ SELECT round((lbc_cost(q, '{effective_cache_size, 1MB, pg_lion.pushdown_margin, 
 						'Bitmap Heap Scan') AS scan
 		  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q)) c;
 
+-- A parallel walk is priced under the Gather core puts over it: its partial
+-- cost is one participant's share and the scan's a whole plan's, so the cap
+-- applies to the walk with parallel_setup_cost (and a parallel_tuple_cost a
+-- row, 0 here) added, which is taken out again
+SET max_parallel_workers_per_gather = 2;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET parallel_setup_cost = 100;
+SET parallel_tuple_cost = 0;
+SET effective_cache_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lbc_f WHERE c IN (1, 2);
+RESET effective_cache_size;
+SELECT d AS cold_max_discount,
+	   round(((lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off}', 'LionBtreeScan') + 100) /
+			  (lbc_cost(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.cold_max_discount', d],
+						'LionBtreeScan') + 100))::numeric, 3) AS gathered_own_over_cold
+  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q),
+	   unnest('{1.5, 2}'::text[]) d;
+SET max_parallel_workers_per_gather = 0;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
 -- the answers: the walk's, the scan's, and a sequential scan's
 SELECT count(DISTINCT lbc_rows('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)', sw)) AS answers
   FROM (VALUES ('{effective_cache_size, 1MB}'::text[]), ('{}'),
