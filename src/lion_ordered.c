@@ -7967,6 +7967,16 @@ lion_ordered_set_price(PlannerInfo *root, RelOptInfo *rel, Path *lion,
 		lo_set_pieces(root, lion, m, ncont);
 }
 
+/*
+ * Whether the set of lion access `lion` is exact as the planner sees it: it
+ * leaves no qual to the recheck (lo_rechecked_quals()).
+ */
+bool
+lion_ordered_set_exact(PlannerInfo *root, Path *lion)
+{
+	return lo_rechecked_quals(root, lion) == NIL;
+}
+
 /* What sets of `bytes` together cost past hash_mem (lo_spill_cost()). */
 Cost
 lion_ordered_spill_price(double bytes)

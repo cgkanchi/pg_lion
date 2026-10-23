@@ -886,6 +886,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	double		setbytes = 0;
 	double		permember;
 	double		memberfrac = 1.0;
+	bool		whereexact = true;
 	double		loops;
 	double		rows;
 	double		reads;
@@ -1005,6 +1006,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 										   &bytes);
 		setbytes += bytes;
 		memberfrac = Min(members / Max(dim->tuples, 1.0), 1.0);
+		whereexact = lion_ordered_set_exact(root, pp.where);
 		pp.lionpages += pj_lion_pages(pp.where);
 	}
 	setbuild += pp.labelcost;
@@ -1032,13 +1034,15 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	/*
 	 * The units (§39): against a nested loop into the B-tree, its cold
 	 * reads against the node's own - a leaf a probe, the members' pages
-	 * not all-visible, and the lion indexes' pages the builds read.
+	 * not all-visible (every member's where the WHERE's set is inexact:
+	 * each is fetched for its recheck, as lo_cost() prices the probe), and
+	 * the lion indexes' pages the builds read.
 	 */
 	idxpages = Max((double) ps->pkidx->pages, 1.0);
 	reads = index_pages_fetched(loops, (BlockNumber) idxpages, idxpages,
 								root) +
 		index_pages_fetched(loops * memberfrac, dim->pages, idxpages, root) *
-		(1.0 - dim->allvisfrac) +
+		(whereexact ? 1.0 - dim->allvisfrac : 1.0) +
 		pp.lionpages;
 	lion_units_for(root, output_rel, &units);
 	lion_units_cold(&units,
