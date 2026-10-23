@@ -55,7 +55,7 @@ SELECT name, setting, boot_val, min_val, max_val::float8 > 1e300 AS unbounded,
  ORDER BY name;
              name              | setting | boot_val | min_val | unbounded | context | no_unit 
 -------------------------------+---------+----------+---------+-----------+---------+---------
- pg_lion.cold_max_discount     | 1.5     | 1.5      | 1       | f         | user    | t
+ pg_lion.cold_max_discount     | 2       | 2        | 1       | f         | user    | t
  pg_lion.cold_page_cost        | 50      | 50       | 0       | t         | user    | t
  pg_lion.cold_stream_page_cost | 6.25    | 6.25     | 0       | t         | user    | t
 (3 rows)
