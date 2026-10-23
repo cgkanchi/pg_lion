@@ -209,6 +209,51 @@ extern bool lion_fkjoin_recognize_small_anti(PlannerInfo *root,
 											 LionSmallAnti *out);
 
 /*
+ * The dimension by probe (DESIGN.md §46): a join of a fact table and a
+ * dimension on one equality whose dimension column a B-tree makes unique,
+ *
+ *		SELECT <expressions of predicates on d>, <columns of f>, count(*)
+ *		FROM fact f JOIN dim d ON f.fk = d.pk
+ *		WHERE <f's clauses> AND <d's clauses>
+ *		  [AND NOT EXISTS (SELECT 1 FROM s WHERE s.a = f.fk ...)]
+ *		GROUP BY ...
+ *
+ * read by a fact row at a time, each row's key looked up in the B-tree.
+ * `probeop` is the B-tree family's equality between the key column's type
+ * and the fk's, `pk = fk`, which the lookup is made with; `antiop` the same
+ * between the key and the NOT EXISTS's inner key, whose clause compares it
+ * with either side of the join under the same family.
+ */
+typedef struct LionProbeShape
+{
+	RelOptInfo *joinrel;		/* the query's join rel */
+	RelOptInfo *factrel;		/* the side read row by row */
+	RelOptInfo *dimrel;			/* the side probed */
+	RestrictInfo *joinclause;	/* fact.fk = dim.pk, either way round */
+	Var		   *fkvar;			/* the fact's join column */
+	Var		   *pkvar;			/* the dimension's */
+	IndexOptInfo *pkidx;		/* the B-tree that makes pkvar unique */
+	Oid			probeop;		/* pk = fk in pkidx's family */
+	Oid			collation;		/* the comparison's, or InvalidOid */
+
+	/* a NOT EXISTS over an inner side of its own, or antirel NULL */
+	RelOptInfo *antirel;		/* its inner side, a base or a join rel */
+	Path	   *antipath;		/* antirel's cheapest total path */
+	RestrictInfo *anticlause;	/* its one clause: inner key = fk or pk */
+	Var		   *antivar;		/* the inner key, a column antirel carries */
+	Oid			antiop;			/* pk = inner key in pkidx's family */
+} LionProbeShape;
+
+/*
+ * How many ways of taking joinrel apart as the dimension by probe qualify
+ * (each way round of a join of two tables whose other side's column is
+ * unique), in a palloc'd array set into *out.  The group target, the
+ * dimension's lion indexes and the price are the caller's.
+ */
+extern int	lion_fkjoin_recognize_probe(PlannerInfo *root, RelOptInfo *joinrel,
+										LionProbeShape **out);
+
+/*
  * Whether rel's column attno is provably unique under the equality opno
  * compares with, under that collation: the dimension-key proof of the join,
  * which the count pushdown reuses for count(DISTINCT) of a unique column

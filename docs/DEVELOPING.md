@@ -173,6 +173,8 @@ the suite as they are in production.
     src/lion_fkjoin.[ch]    the FK-side joins a LionCount answers (fact JOIN dim, EXISTS / NOT EXISTS), and the semi/anti join paths
     src/lion_ordered.c      CustomScans "LionOrdered" and "LionBtreeScan": lion-filtered walks of a btree (its
                             values from the index tuples when it covers the query) or of a lion column's order
+    src/lion_probejoin.c    CustomScan "LionProbeJoin": a GROUP BY of a join to a dimension by its primary
+                            key, each fact row's key looked up in the B-tree and tested against lion sets
     src/lion_multikey.c     array_ops/tsvector_ops: GIN-style extraction and tsquery key trees
     src/lion_jsonb.c        jsonb_contains_ops: path keys for jsonb @>, ?, ?|, ?&, @? and @@
     src/lion_vec.[ch]       lionvec, the nearest-neighbour AM of pgvector's vector and halfvec (created by
