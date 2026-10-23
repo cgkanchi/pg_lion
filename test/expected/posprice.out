@@ -129,7 +129,7 @@ SELECT round(((pq_count('pq_part', 'new <-> york') - pq_count('pq_part', 'new & 
  * three times a rows estimate takes from the intersection probe (DESIGN.md
  * §29.11): priced over that product, the FK-side join's counts at three
  * keys, each deciding its key's four candidates from both lexemes' 8,000
- * members, were taken over a nested loop that fetches the keys' 30 rows and
+ * members, would be taken over a nested loop that fetches the keys' 30 rows and
  * tests them, ten times as fast.  At a hundred keys the join collects the
  * filter once and is the plan.
  */

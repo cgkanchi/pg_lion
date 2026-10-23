@@ -6538,13 +6538,15 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     candidate `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its
     callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and descends to included, and 21.6 ns
     on the release build (§10, "The units"), at the reference's 5 ns a `cpu_operator_cost`.
-    *(Refitted 2026-10-23 on 2 and 10 million rows, `foo` and `bar` in three rows of four and
-    `new` and `york` in a fifth.  The first fit, 1.8 and 1,000, was made on 400,000 rows, whose
-    trees are a few leaves: over the larger ones it priced the probing counts at 211 to 263
-    units a millisecond, and the FK-side join of `new <-> york` was taken at 3 and 20 keys of 2
-    million rows - 2.5 ms against the nested loop's 0.37, 15 against 3.5 - and at 20 and 200 of
-    10 million - 21 against 2.7, 346 against 32.  They now run at 453 to 487, a count of every
-    row at 476 to 511, and the nested loop is taken.)*  The candidates are the SUPERSET's rows,
+    *(Fitted on 2 and 10 million rows, `foo` and `bar` in three rows of four and `new` and
+    `york` in a fifth, where the probing counts run at 453 to 487 units a millisecond and a count
+    of every row at 476 to 511.  A fit on 400,000 rows, whose trees are a few leaves, comes to
+    1.8 and 1,000, which over the larger trees prices the probing counts at 211 to 263 units a
+    millisecond and takes the FK-side join of `new <-> york` at 3 and 20 keys of 2 million rows -
+    2.5 ms against the nested loop's 0.37, 15 against 3.5 - and at 20 keys of 10 million, 21
+    against 2.7; at 2.4 and 1,650 each of those takes the nested loop.  At 200 keys of 10 million
+    the join still collects the filter, 144 ms against the nested loop's 30: core prices that
+    nested loop at its own rate, which §39 holds out.)*  The candidates are the SUPERSET's rows,
     not the clause's (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a
     query of it alone, the clause and its superset are combined from those as core combines a
     tsquery's operands, and the candidates are the rows the caller's filters select times the
@@ -6554,8 +6556,8 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     row has `foo` is estimated at next to no rows, and its candidates are the rows with `bar`.
     The operands' shares are combined over the rows whose column is not NULL
     (`lion_tsvector_nonnull()`), as core combines them: an operand's share alone carries the
-    NULLs once, and a product of n of them n times - with three rows of four NULL, `new <-> york`
-    was priced at three times its candidates and `foo <-> !bar` at under half.  The AND of the
+    NULLs once, and a product of n of them n times - with three rows of four NULL, that would
+    price `new <-> york` at three times its candidates and `foo <-> !bar` at under half.  The AND of the
     superset's lexemes is as the intersection probe measures it (§29.11, "Correlated sets"):
     `new <-> york` of two lexemes in the same tenth of the rows is a hundredth of them by core's
     product, and its candidates are the whole tenth.  The probe's measure is taken however near
@@ -6563,14 +6565,14 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
     before it moves the rows estimate - which the plans above it are sized from, and which
     ANALYZE's per-column estimates and the probe's sample both wobble - is no reason to price a
     filter over rows it does not decide.  `alpha <-> beta` of two lexemes in the same two rows
-    of five, 2.5 times core's product, was priced over that product, and the FK-side join was
+    of five, 2.5 times core's product, would be priced over that product, and the FK-side join
     taken at 3 keys of 20,000 rows at 0.41 ms over a 0.04 ms nested loop (release build).  A
     partition is probed in its own columns, as the planner hands it its restrictions
     (`lion_clause_in_child()`): a clause in the partitioned table's columns matches no key of the
-    partition's index, and a count of every partitioned table priced its filters from core's
+    partition's index, and a count of a partitioned table would price its filters from core's
     product: `new <-> york`'s, over 10,000 rows in two partitions, at 11 against 31 on the same
-    rows unpartitioned.  A cursor is a lexeme's, one for each the query names, those under a NOT too, and
-    its members are the rows that have the lexeme.  Priced from the clause's own rows
+    rows unpartitioned.  A cursor is a lexeme's, one for each the query names, those under a
+    NOT too, and its members are the rows that have the lexeme.  Priced from the clause's own rows
     and the superset's one lexeme, `foo <-> !bar` would come to a sixteenth of what it takes:
     over 400,000 rows and 2,000 keys, the FK-side join would be taken at one to ten keys over a
     nested loop into a btree of the fact's key that runs 8 to 40 times as fast (1.2 ms against
@@ -14615,7 +14617,7 @@ n-distinct extended statistics object's count of as many of the key columns toge
 (the most, and of those the object of the fewest columns, as `estimate_num_groups()` picks one),
 times each other column's `n_distinct` as `lion_fkjoin_fk_ndistinct()` takes it. The product of
 the columns' own takes them as independent: over 3M rows whose two key columns make 1,000 pairs,
-it made a lookup of a pair a share of a row where it finds 3,000, and the node was taken over core's
+it makes a lookup of a pair a share of a row where it finds 3,000, and takes the node over core's
 hash anti join at a third of its speed (334 ms against 122); with `CREATE STATISTICS (ndistinct)` on
 the pair, core's plan is taken. A descent costs `ceil(log2(index tuples)) * cpu_operator_cost` and
 `(height + 1) * 50 * cpu_operator_cost`; each index tuple read `cpu_index_tuple_cost` and a
