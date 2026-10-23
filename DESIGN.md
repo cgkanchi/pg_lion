@@ -1413,7 +1413,7 @@ replay's work:
 **What it can still falsely report.** A WARNING that a block is unused and unreachable for an empty
 posting page a whole-set free's first record emptied before the check began and whose second record
 - which frees the page - replay has not reached yet: the state a crash between the two leaves, and
-which a standby cannot tell from it. The next VACUUM frees either. Nothing else is known to.
+which a standby cannot tell from it. The next VACUUM frees either. No other false report is known.
 
 **Posting sets on a standby** (2026-09-29 review) are the exception, and the reason is a deadlock,
 not exactness. Replay takes a record's blocks in the order they were registered and holds them all
