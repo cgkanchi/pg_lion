@@ -474,6 +474,32 @@ SELECT :rows_on > lsw_rows(q) AS listed_larger
 (1 row)
 
 RESET pg_lion.enable_index_mcv;
+-- ---------- 9. a partial index ----------
+-- A partial lion index's sets hold its predicate's rows, and the share of
+-- them a probed key selects is priced at the rows it meets as a whole
+-- index's is (DESIGN.md §45).  A copy of the fact's lion index whose
+-- predicate every row meets, implied by the key's equality to the outer row:
+-- the correlated count's plans flip with the setting as in section 4, the
+-- count at the whole index's price.
+SELECT lsw_cost(q, 'LionCount') AS count_whole
+  FROM lsw_q WHERE name = 'correlated' \gset
+CREATE INDEX lsw_fact_part ON lsw_fact USING lion (fk, doc) WHERE fk IS NOT NULL;
+SET pg_lion.enable_skew_estimate = off;
+SELECT lsw_plan(q) FROM lsw_q WHERE name = 'correlated';
+                  lsw_plan                   
+---------------------------------------------
+ Seq Scan[Aggregate[Index Scan lsw_fact_fk]]
+(1 row)
+
+SET pg_lion.enable_skew_estimate = on;
+SELECT lsw_plan(q), lsw_cost(q, 'LionCount') = :count_whole AS whole_price
+  FROM lsw_q WHERE name = 'correlated';
+      lsw_plan       | whole_price 
+---------------------+-------------
+ Seq Scan[LionCount] | t
+(1 row)
+
+DROP INDEX lsw_fact_part;
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;
