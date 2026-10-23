@@ -896,9 +896,13 @@ BUILD (`lion_build.c`, `lion_spool.c`)
    (PostgreSQL 16 gets a reduced copy of 17's API in lion_build.c). Pages go straight to the file
    without passing through shared buffers, are WAL-logged in batches of up to 32 as full-page images
    (or not logged at all for an unlogged relation or under wal_level = minimal, in which case the
-   relation is registered for the next sync), and each page is written EXACTLY ONCE. Nothing may
-   touch these blocks through the buffer manager until smgr_bulk_finish() has returned. The build
-   therefore never goes through the WAL shim, and `wal_mode` changes nothing about it (§25).
+   relation is registered for the next sync), and each page is written EXACTLY ONCE. Under
+   wal_level = minimal the build's COMMIT then makes the file durable as core does for any relation
+   the transaction created: one of at least `wal_skip_threshold` is synced, a smaller one is
+   WAL-logged page by page (`log_newpage_range()`), which reads every page into shared buffers.
+   Nothing may touch these blocks through the buffer manager until smgr_bulk_finish() has returned.
+   The build therefore never goes through the WAL shim, and `wal_mode` changes nothing about it
+   (§25).
    Writing each page once is the point: the old route through the buffer manager logged one
    GenericXLog record per entry tuple, so a build of 632k keys paid 632k page diffs and 632k WAL
    records to fill 15k pages (measured, 1M rows, one column: 4.7 s and 76 MiB of WAL against 1.9 s
@@ -7191,10 +7195,19 @@ index for them when they are more than a twentieth of it, nbtree's `_bt_vacuum_n
 rule, recording the ones that are reusable now (`lion_vacuum_recycle()`).  In a healthy index nothing but its free pages is unaccounted for, so the sweep reads
 those and nothing else.  Every page ambulkdelete's walk and its sweep read goes through VACUUM's
 ring of buffers (`info->strategy`, `lion_vac_read()`; `vacuum_buffer_usage_limit`), as nbtree's
-do, and so does every page that taking pages out of the trees reads - a directory page deletion's
-leaf, siblings and parents (§21, "Page deletion") and an empty posting leaf's neighbour and parent
-(§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once a leaf - so a VACUUM
-leaves no more of the index in shared buffers than the ring holds, but the meta page.  It checks for
+do, and so does every other page VACUUM reads to its own ends: the descent to the leftmost leaf
+that the walk, and the count of the keys in amvacuumcleanup, start from
+(`lion_dir_leftmost_leaf_ext()`); the descents and walks right that find an entry or a summary
+again after an insert moved it (`lion_vac_ref_relocate()`); the root of a set the sweep asks is
+live (`lion_posting_root_live()`); and what taking pages out of the trees reads - a directory page
+deletion's leaf, siblings and parents (§21, "Page deletion") and an empty posting leaf's neighbour
+and parent (§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once a leaf.
+What is left reads without it, as the inserts it shares the code with do: the meta page, which
+every scan reads; and a handful of pages a VACUUM writes beside its filtering - a directory leaf
+split by an entry the filtering rewrote larger, with the parent its downlink goes to and any split
+left unfinished that the write finishes on the way (§21), a page a payload spills to, and a page
+taken from the free space map (`lion_alloc_page()`).  So a VACUUM leaves no more of the index in
+shared buffers than the ring holds, but those.  It checks for
 interrupts at every block, with nothing locked, and each page it reads passes the cost-based delay
 first, as every page the walk reads does, so a sweep of a great many free pages answers a cancel and
 paces its reads and records.  A page of a LIVE set is
