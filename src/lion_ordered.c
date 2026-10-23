@@ -291,6 +291,7 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_HEAPRECHECK	0x0008	/* the lion recheck reads the heap tuple */
 #define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
 #define LO_FLAG_KNN			0x0020	/* the order is a lionvec index's (§44.6) */
+#define LO_FLAG_PROBE		0x0040	/* a nested loop's probe (§40.10) */
 
 /*
  * The plan's custom_private as a C struct: lo_priv_decode() is its one
@@ -781,6 +782,13 @@ typedef struct LionOrderedState
 	int64		knnlimit;		/* the rows its LIMIT takes, or -1 */
 
 	/*
+	 * ... or a nested loop's probe (DESIGN.md §40.10): a btree's walk
+	 * parameterized by the outer row, a scan a descent for its keys, over the
+	 * set the loop's scans share; no scan of it counts what it has met.
+	 */
+	bool		probe;
+
+	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
 	 * NULL entry goes, the walk of this scan, and the fetch of what it meets
 	 * (the TID it hands out is a HOT chain's root, as a btree's is).
@@ -956,6 +964,8 @@ typedef struct LionOrderedState
 static Plan *lo_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
 						  List *clauses, List *custom_plans);
+static List *lo_reparameterize(PlannerInfo *root, List *custom_private,
+							   RelOptInfo *child_rel);
 static Node *lo_create_state(CustomScan *cscan);
 static void lo_begin(CustomScanState *node, EState *estate, int eflags);
 static TupleTableSlot *lo_exec(CustomScanState *node);
@@ -986,11 +996,15 @@ static const CustomScanMethods lo_scan_methods = {
 
 /*
  * A btree's walk that claims no order (DESIGN.md §40): the same plan and the
- * same executor under a name that does not promise one.
+ * same executor under a name that does not promise one.  It alone is
+ * parameterized (§40.10), and a partitionwise join translates its
+ * parameterization from the outer side's parent to the partition joined
+ * (lo_reparameterize()).
  */
 const CustomPathMethods lion_btree_path_methods = {
 	.CustomName = "LionBtreeScan",
 	.PlanCustomPath = lo_plan_path,
+	.ReparameterizeCustomPathByChild = lo_reparameterize,
 };
 
 static const CustomScanMethods lo_btree_scan_methods = {
@@ -1244,11 +1258,49 @@ lo_ord_rinfos(IndexPath *ord)
 }
 
 /*
+ * The same restriction clause?  The RestrictInfo itself, or one spelling the
+ * same clause: 18's matching of `k = 1 OR k = 7` to an index makes a fresh
+ * `k = ANY ('{1,7}')` RestrictInfo for EACH index it matches, so the btree's
+ * and the lion index's clause for one OR are two objects (DESIGN.md §40.2).
+ */
+static bool
+lo_same_clause(RestrictInfo *a, RestrictInfo *b)
+{
+	return a == b || equal(a->clause, b->clause);
+}
+
+/*
+ * Does the ordered walk answer rinfo: is it one of the clauses the walk
+ * answers - the RestrictInfo itself, one spelling the same clause, or a join
+ * clause derived from the same equivalence class as one of them, which
+ * create_indexscan_plan() takes as answered too
+ * (is_redundant_with_indexclauses()): a nested loop's probe (DESIGN.md
+ * §40.10) is handed its parameterization's join clauses beside the btree's
+ * own, and an equivalence class makes the two separately.
+ */
+static bool
+lo_ord_answers(RestrictInfo *rinfo, List *ordrinfos)
+{
+	ListCell   *lc;
+
+	foreach(lc, ordrinfos)
+	{
+		RestrictInfo *other = lfirst_node(RestrictInfo, lc);
+
+		if (lo_same_clause(rinfo, other) ||
+			(rinfo->parent_ec != NULL && rinfo->parent_ec == other->parent_ec))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Which restriction clauses the node must still evaluate on a fetched row
  * (DESIGN.md §30.2, step 4): not the ones the ordered walk answers (the
  * ordered index's non-lossy index clauses, or the range a lion column's walk
- * is bounded by), not the lion leaves' index clauses, not what the lion qual
- * implies.
+ * is bounded by: lo_ord_answers()), not the lion leaves' index clauses, not
+ * what the lion qual implies.  A nested loop's probe passes its
+ * parameterization's join clauses among rinfos (§40.10).
  */
 static List *
 lo_residual(List *rinfos, List *ordrinfos, List *lionrinfos, List *lionqual)
@@ -1262,7 +1314,7 @@ lo_residual(List *rinfos, List *ordrinfos, List *lionrinfos, List *lionqual)
 
 		if (rinfo->pseudoconstant)
 			continue;			/* core's gating Result evaluates it */
-		if (list_member_ptr(ordrinfos, rinfo) ||
+		if (lo_ord_answers(rinfo, ordrinfos) ||
 			list_member_ptr(lionrinfos, rinfo))
 			continue;
 		if (lionqual != NIL &&
@@ -1375,18 +1427,6 @@ lo_index_only(IndexOptInfo *idx, Bitmapset *needed, List **iocols)
 		return false;
 	*iocols = cols;
 	return true;
-}
-
-/*
- * The same restriction clause?  The RestrictInfo itself, or one spelling the
- * same clause: 18's matching of `k = 1 OR k = 7` to an index makes a fresh
- * `k = ANY ('{1,7}')` RestrictInfo for EACH index it matches, so the btree's
- * and the lion index's clause for one OR are two objects (DESIGN.md §40.2).
- */
-static bool
-lo_same_clause(RestrictInfo *a, RestrictInfo *b)
-{
-	return a == b || equal(a->clause, b->clause);
 }
 
 /*
@@ -1543,6 +1583,51 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
 }
 
 /*
+ * What §30.3's price of the lookups charges a nested loop's probe for beyond
+ * what its set's build does (DESIGN.md §40.10, "Cost"): in TIDs, each a
+ * cpu_index_tuple_cost and the bitmap's tenth of a cpu_operator_cost.
+ *
+ * The lion access is priced as the bitmap paths it is (cost_bitmap_tree_node(),
+ * lioncostestimate()), a TID each, which is what a lion index's scan hands a
+ * bitmap.  The set's build hands over nothing a TID at a time: each leaf's
+ * posting sets are read and combined a container at a time (lo_build_leaf(),
+ * lo_set_combine()), a dense container's members costing nothing apiece.
+ * The probe's start-up is that build alone, so its price decides the plan:
+ * a set of four dense filters' leaves on a 6M-row dimension of 4,688
+ * containers, priced 88,000, built in 57 ms; on 50M rows of 12,808
+ * containers, priced 715,000, in 80 ms - 1.5 and 0.8 us a container of a
+ * posting set, against the 10 ns a TID stands for.  So a leaf is charged
+ * at most LO_BUILD_PIECE_TIDS TIDs a container of each entry it reads -
+ * 0.8 us a piece at the reference's 500 units a millisecond, the lower of
+ * the two, where a tie should fall - and its TIDs past that are taken back
+ * out.  A sparse leaf keeps its price.  The other walks keep §30.3's price:
+ * their walk, not the build, is most of theirs.
+ */
+#define LO_BUILD_PIECE_TIDS		80
+
+static double
+lo_build_excess(PlannerInfo *root, Path *lion, double tuples, double pages)
+{
+	double		excess = 0.0;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) lion;
+		double		tids = clamp_row_est(ipath->indexselectivity * tuples);
+		double		pieces = lion_cost_path_entries(root, ipath) *
+			Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), tids);
+
+		return Max(tids - LO_BUILD_PIECE_TIDS * pieces, 0.0);
+	}
+	foreach(lc, IsA(lion, BitmapAndPath) ?
+			((BitmapAndPath *) lion)->bitmapquals :
+			castNode(BitmapOrPath, lion)->bitmapquals)
+		excess += lo_build_excess(root, (Path *) lfirst(lc), tuples, pages);
+	return excess;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
@@ -1568,11 +1653,19 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
  * once for all of them, the btree's own cost and the heap's pages are each
  * participant's whole, as core leaves the index and the heap undivided.
  * Returns false when no worker would be given.
+ *
+ * With `loops` above 1 the price is a nested loop's probe of rel (DESIGN.md
+ * §40.10), ord parameterized by the outer side: one scan of `loops`, whose
+ * walk, probes and rows are its own (ord's selectivity and rows are a
+ * scan's), whose heap pages are amortized over the loops as cost_index()
+ * amortizes a parameterized scan's, and which pays its share of the set,
+ * built once for every scan the loop makes: the build divided by `scans`.
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, int *workers, Cost *startup_p, Cost *total_p)
+		bool indexonly, double loops, double scans, int *workers,
+		Cost *startup_p, Cost *total_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1605,6 +1698,13 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 
+	/* a nested loop's probe: its lookups as its set's build reads them */
+	if (ord->path.param_info != NULL)
+		lioncost = Max(lioncost -
+					   lo_build_excess(root, lion, tuples, pages) *
+					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
+					   0.0);
+
 	/* the set's members: the candidates, when it leaves quals to the recheck */
 	candsel = sel;
 	rechecked = lo_rechecked_quals(root, lion);
@@ -1632,10 +1732,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	members = clamp_row_est(candsel * tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
-	/* the lookups, the copy of their answer into the set, and its spill */
+	/*
+	 * the lookups, the copy of their answer into the set, and its spill - a
+	 * probe's share of them (§40.10)
+	 */
 	startup = lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
 		lo_spill_cost(lo_set_bytes(members, ncont));
+	if (scans > 1.0)
+		startup /= scans;
 
 	/*
 	 * the walk: the ordered index's own cost, and the probe of each entry -
@@ -1713,9 +1818,24 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
 									   &ipages);
 	}
-	max_io = index_pages_fetched(heapfetched, rel->pages,
-								 (double) ord->indexinfo->pages, root);
 	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
+	if (loops > 1.0)
+	{
+		/*
+		 * A nested loop's probe (§40.10): the pages every scan of the loop
+		 * fetches, through the Mackert and Lohman formula, as cost_index()
+		 * counts a parameterized scan's - for the uncorrelated order and,
+		 * scan by scan, for the correlated one - pro-rated by the loops
+		 * below.
+		 */
+		max_io = index_pages_fetched(heapfetched * loops, rel->pages,
+									 (double) ord->indexinfo->pages, root);
+		pages_corr = index_pages_fetched(pages_corr * loops, rel->pages,
+										 (double) ord->indexinfo->pages, root);
+	}
+	else
+		max_io = index_pages_fetched(heapfetched, rel->pages,
+									 (double) ord->indexinfo->pages, root);
 	if (indexonly && !heaprecheck)
 	{
 		/*
@@ -1745,7 +1865,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (indexonly)
 		cpu += fetched * cpu_operator_cost;
 	max_io *= spc_random;
-	min_io = (pages_corr > 0) ? spc_random + (pages_corr - 1) * spc_seq : 0;
+	if (loops > 1.0)
+	{
+		/* every fetch random, as cost_index() takes a loop's, per scan */
+		min_io = pages_corr * spc_random / loops;
+		max_io /= loops;
+	}
+	else
+		min_io = (pages_corr > 0) ?
+			spc_random + (pages_corr - 1) * spc_seq : 0;
 	run += max_io + corr * corr * (min_io - max_io);
 
 	cost_qual_eval(&qcost, residual, root);
@@ -1897,9 +2025,17 @@ lo_rel_ok(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * §30.2).  Each index is copied too when there is an `exclude`, with it taken
  * out of the clauses the index may match, which is how a lion column's walk
  * leaves the range it is bounded by out of the set (§30.11).
+ *
+ * With `joins` the copy keeps rel's join clauses, so that the index paths
+ * core would make for a nested loop's inner side are made too: a btree's,
+ * for the probe of §40.10.  (An index that is not copied belongs to rel,
+ * whose equivalence classes core matches it to whatever the copy says -
+ * match_eclass_clauses_to_index() asks index->rel - so its paths
+ * parameterized by those come out either way; every caller but that probe
+ * passes over them.)
  */
 static RelOptInfo *
-lo_scratch_rel(RelOptInfo *rel, List *indexes, List *exclude)
+lo_scratch_rel(RelOptInfo *rel, List *indexes, List *exclude, bool joins)
 {
 	RelOptInfo *scratch;
 	ListCell   *lc;
@@ -1931,8 +2067,11 @@ lo_scratch_rel(RelOptInfo *rel, List *indexes, List *exclude)
 	scratch->cheapest_startup_path = NULL;
 	scratch->cheapest_total_path = NULL;
 	scratch->cheapest_parameterized_paths = NIL;
-	scratch->joininfo = NIL;
-	scratch->has_eclass_joins = false;
+	if (!joins)
+	{
+		scratch->joininfo = NIL;
+		scratch->has_eclass_joins = false;
+	}
 	scratch->consider_parallel = false;
 	return scratch;
 }
@@ -1946,7 +2085,7 @@ static List *
 lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
 				 List *exclude, Oid lionam)
 {
-	RelOptInfo *scratch = lo_scratch_rel(rel, lionidx, exclude);
+	RelOptInfo *scratch = lo_scratch_rel(rel, lionidx, exclude, false);
 	List	   *cands = NIL;
 	ListCell   *lc;
 
@@ -1984,6 +2123,30 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
 }
 
 /*
+ * Do two lists of IndexClauses from one create_index_paths() run name the
+ * same clauses at the same columns?  Its paths share the RestrictInfos;
+ * equal() has no support for an IndexClause.
+ */
+static bool
+lo_same_indexclauses(List *a, List *b)
+{
+	ListCell   *la;
+	ListCell   *lb;
+
+	if (list_length(a) != list_length(b))
+		return false;
+	forboth(la, a, lb, b)
+	{
+		IndexClause *ia = lfirst_node(IndexClause, la);
+		IndexClause *ib = lfirst_node(IndexClause, lb);
+
+		if (ia->rinfo != ib->rinfo || ia->indexcol != ib->indexcol)
+			return false;
+	}
+	return true;
+}
+
+/*
  * The IndexPaths core builds for one btree of rel over the relation's
  * restriction clauses, whether or not it finds their order useful (DESIGN.md
  * §40.2): create_index_paths() on a scratch copy of rel that sees that index
@@ -1993,22 +2156,34 @@ lo_lion_accesses(PlannerInfo *root, RelOptInfo *rel, List *lionidx,
  * path list.  One add_path() still dropped for a bitmap scan of the same
  * index is taken from that scan's one-leaf bitmapqual.
  *
- * And the walk of the whole index when core built no path of it at all: it
- * builds one without index clauses only when its order is useful or the
- * index alone answers the query - every column of the restriction clauses
- * among its own (check_index_only()) - and a btree that lacks the lion
- * filter's columns, a primary key under a filter on others, is walked whole
- * by the node all the same, the filter answered by the set and the columns
- * the node must produce decided per pair (§40.1).  A partial btree only where
- * the query implies its predicate, as core takes one.  Not when core built a
- * path of it that is none of these - a BitmapOr of its scans for an OR of its
- * column's equalities, on 16 and 17 - which reads its matches alone.
+ * And the walk of the whole index when core built no unparameterized path of
+ * it at all: it builds one without index clauses only when its order is
+ * useful or the index alone answers the query - every column of the
+ * restriction clauses among its own (check_index_only()) - and a btree that
+ * lacks the lion filter's columns, a primary key under a filter on others, is
+ * walked whole by the node all the same, the filter answered by the set and
+ * the columns the node must produce decided per pair (§40.1).  A partial
+ * btree only where the query implies its predicate, as core takes one.  Not
+ * when core built a path of it that is none of these - a BitmapOr of its
+ * scans for an OR of its column's equalities, on 16 and 17 - which reads its
+ * matches alone.  (Until 2026-10-23 "no path at all": the paths core makes
+ * for the key's equivalence class's joins, which the scratch copy never
+ * stopped, then kept a primary key's whole walk out of every join query.)
+ *
+ * *params gets the btree's paths PARAMETERIZED by the outer side of a nested
+ * loop (§40.10): the scratch copy keeps rel's join clauses for them, so they
+ * are the ones core makes for the btree as an inner side - its join clauses
+ * as index clauses beside the restriction clauses it matches - forward only
+ * (the backward twin of a parameterized path walks the same entries), one a
+ * parameterization and set of index clauses.
  */
 static List *
-lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
+lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+			   List **params)
 {
-	RelOptInfo *scratch = lo_scratch_rel(rel, list_make1(idx), NIL);
+	RelOptInfo *scratch = lo_scratch_rel(rel, list_make1(idx), NIL, true);
 	List	   *result = NIL;
+	bool		unparam = false;
 	ListCell   *lc;
 
 	create_index_paths(root, scratch);
@@ -2017,18 +2192,43 @@ lo_btree_paths(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx)
 		Path	   *p = (Path *) lfirst(lc);
 		IndexPath  *ipath;
 
+		if (p->param_info == NULL)
+			unparam = true;
 		if (IsA(p, BitmapHeapPath))
 			p = ((BitmapHeapPath *) p)->bitmapqual;
-		if (!IsA(p, IndexPath) || p->param_info != NULL)
+		if (!IsA(p, IndexPath))
 			continue;
 		ipath = (IndexPath *) p;
 		if (ipath->indexinfo != idx || ipath->indexorderbys != NIL ||
 			!lo_indexpath_ok(ipath))
 			continue;
-		if (!list_member_ptr(result, ipath))
-			result = lappend(result, ipath);
+		if (p->param_info == NULL)
+		{
+			if (!list_member_ptr(result, ipath))
+				result = lappend(result, ipath);
+		}
+		else if (!ScanDirectionIsBackward(ipath->indexscandir))
+		{
+			ListCell   *lc2;
+			bool		dup = false;
+
+			foreach(lc2, *params)
+			{
+				IndexPath  *other = (IndexPath *) lfirst(lc2);
+
+				if (other == ipath ||
+					(other->indexinfo == ipath->indexinfo &&
+					 bms_equal(PATH_REQ_OUTER(&other->path),
+							   PATH_REQ_OUTER(&ipath->path)) &&
+					 lo_same_indexclauses(other->indexclauses,
+										  ipath->indexclauses)))
+					dup = true;
+			}
+			if (!dup)
+				*params = lappend(*params, ipath);
+		}
 	}
-	if (scratch->pathlist == NIL && (idx->indpred == NIL || idx->predOK))
+	if (!unparam && (idx->indpred == NIL || idx->predOK))
 		result = lappend(result,
 						 create_index_path(root, idx, NIL, NIL, NIL, NIL,
 										   ForwardScanDirection, true, NULL,
@@ -2573,19 +2773,24 @@ static double lo_margin = 1.0;
  * worker runs, say; and with `workers` above zero it is a PARTIAL path, a
  * parallel-aware walk whose participants share the btree's pages, offered
  * to add_partial_path() with its rows a participant's.
+ *
+ * With `ppi` it is a nested loop's probe of rel, parameterized by the outer
+ * relations ppi names (§40.10): never partial, never ordered.
  */
 static void
-lo_add_path(RelOptInfo *rel, const CustomPathMethods *methods, List *pathkeys,
+lo_add_path(RelOptInfo *rel, ParamPathInfo *ppi,
+			const CustomPathMethods *methods, List *pathkeys,
 			List *priv, double rows, Cost startup, Cost total,
 			bool parallel_safe, int workers)
 {
 	CustomPath *cp = makeNode(CustomPath);
 
 	Assert(workers == 0 || parallel_safe);
+	Assert(ppi == NULL || (workers == 0 && pathkeys == NIL));
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = rel;
 	cp->path.pathtarget = rel->reltarget;
-	cp->path.param_info = NULL;
+	cp->path.param_info = ppi;
 	cp->path.parallel_aware = (workers > 0);
 	cp->path.parallel_safe = parallel_safe;
 	cp->path.parallel_workers = workers;
@@ -2624,6 +2829,104 @@ lo_parallel_ok(RelOptInfo *rel, IndexPath *ord)
 {
 	return rel->consider_parallel && ord->indexinfo->amcanparallel &&
 		max_parallel_workers_per_gather > 0;
+}
+
+/*
+ * A nested loop's probe of rel parameterized by the outer relations ppi
+ * names (DESIGN.md §40.10): how many times the loop is expected to scan it
+ * in one execution of the plan, and over how many scans the set, built once
+ * for all of them, is spread.
+ *
+ * *loops is what core's get_loop_count() makes of the parameterization for
+ * its own parameterized index scans, and what their heap pages are amortized
+ * over: the fewest rows of the outer relations, each taken as the distinct
+ * values of a semi join's inner side where it is one, unique-ified before
+ * the loop.
+ *
+ * The scans returned are the loops, or - while enable_memoize lets core put
+ * a Memoize above the probe - the distinct values the outer side hands it,
+ * as Memoize counts them (estimate_num_groups() over the outer side of each
+ * join clause; where a clause is not one Memoize can key on, the loops): a
+ * Memoize rescans its inner side for a value it has not cached alone, and
+ * charges a scan's price a miss, so the set spread over the loops would be
+ * charged a fraction of it - the misses over the loops - in the plan core
+ * then likes best.  Spread over the distinct values, the plan without the
+ * Memoize pays the set as often as the outer side repeats its values, and
+ * loses to the plan with it, which is right.
+ */
+static double
+lo_probe_scans(PlannerInfo *root, RelOptInfo *rel, ParamPathInfo *ppi,
+			   double *loops)
+{
+	double		n = 0.0;
+	double		d;
+	List	   *exprs = NIL;
+	int			relid = -1;
+	ListCell   *lc;
+
+	while ((relid = bms_next_member(ppi->ppi_req_outer, relid)) >= 0)
+	{
+		RelOptInfo *outer;
+		double		rows;
+
+		/* an outer join's relid names no relation */
+		if (relid >= root->simple_rel_array_size)
+			continue;
+		outer = root->simple_rel_array[relid];
+		if (outer == NULL || IS_DUMMY_REL(outer))
+			continue;
+		rows = Max(outer->rows, 1.0);
+		foreach(lc, root->join_info_list)
+		{
+			SpecialJoinInfo *sjinfo = lfirst_node(SpecialJoinInfo, lc);
+			double		nraw = 1.0;
+			int			rhs = -1;
+
+			if (sjinfo->jointype != JOIN_SEMI ||
+				sjinfo->semi_rhs_exprs == NIL ||
+				!bms_is_member((int) rel->relid, sjinfo->syn_lefthand) ||
+				!bms_is_member(relid, sjinfo->syn_righthand))
+				continue;
+			/* the product of its relations' rows, as core approximates it */
+			while ((rhs = bms_next_member(sjinfo->syn_righthand, rhs)) >= 0)
+			{
+				RelOptInfo *r = (rhs < root->simple_rel_array_size) ?
+					root->simple_rel_array[rhs] : NULL;
+
+				if (r != NULL && !IS_DUMMY_REL(r))
+					nraw *= Max(r->rows, 1.0);
+			}
+			rows = Min(rows, estimate_num_groups(root, sjinfo->semi_rhs_exprs,
+												 nraw, NULL, NULL));
+		}
+		if (n == 0.0 || rows < n)
+			n = rows;
+	}
+	n = Max(n, 1.0);
+	*loops = n;
+	if (!enable_memoize)
+		return n;
+
+	foreach(lc, ppi->ppi_clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *op = (OpExpr *) rinfo->clause;
+
+		if (!IsA(op, OpExpr) || list_length(op->args) != 2)
+			return n;
+		if (bms_is_subset(rinfo->left_relids, ppi->ppi_req_outer) &&
+			bms_is_subset(rinfo->right_relids, rel->relids))
+			exprs = lappend(exprs, linitial(op->args));
+		else if (bms_is_subset(rinfo->right_relids, ppi->ppi_req_outer) &&
+				 bms_is_subset(rinfo->left_relids, rel->relids))
+			exprs = lappend(exprs, lsecond(op->args));
+		else
+			return n;
+	}
+	if (exprs == NIL)
+		return n;
+	d = estimate_num_groups(root, exprs, n, NULL, NULL);
+	return Max(Min(d, n), 1.0);
 }
 
 /* ---------------------------------------------------------------------
@@ -3263,6 +3566,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	Oid			lionam;
 	List	   *ordpaths = NIL;
 	List	   *btpaths = NIL;
+	List	   *probepaths = NIL;
 	List	   *lionidx = NIL;
 	List	   *cands = NIL;
 	List	   *knncands;
@@ -3367,10 +3671,11 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (idx->relam != BTREE_AM_OID || idx->hypothetical ||
 				!lo_index_only(idx, targetattrs, &iocols))
 				continue;
-			btpaths = list_concat(btpaths, lo_btree_paths(root, rel, idx));
+			btpaths = list_concat(btpaths,
+								  lo_btree_paths(root, rel, idx, &probepaths));
 		}
 	}
-	if (ordpaths == NIL && walks == NIL && btpaths == NIL)
+	if (ordpaths == NIL && walks == NIL && btpaths == NIL && probepaths == NIL)
 		return;
 
 	/* the heap table AM only (§2); ambuild refused every other */
@@ -3403,7 +3708,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * The lion side of a btree walk, as core would build it for every
 	 * restriction clause.
 	 */
-	if (ordpaths != NIL || btpaths != NIL)
+	if (ordpaths != NIL || btpaths != NIL || probepaths != NIL)
 		cands = lo_lion_accesses(root, rel, lionidx, NIL, lionam);
 
 	/*
@@ -3473,7 +3778,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				/* a lionvec index returns no values: heap mode (§44.6) */
 				lo_cost_knn(root, rel, ord, lion, residual, rows,
 							&startup, &total);
-				lo_add_path(rel, &lion_ordered_path_methods,
+				lo_add_path(rel, NULL, &lion_ordered_path_methods,
 							ord->path.pathkeys, list_make3(ord, lion, NIL),
 							rows, startup, total, false, 0);
 				knn->offered++;
@@ -3489,16 +3794,16 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lion == lioncover && !indexonly)
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, NULL, &startup, &total);
-			lo_add_path(rel, &lion_ordered_path_methods, ord->path.pathkeys,
-						list_make3(ord, lion, iocols), rows, startup, total,
-						rel->consider_parallel, 0);
+					indexonly, 1.0, 1.0, NULL, &startup, &total);
+			lo_add_path(rel, NULL, &lion_ordered_path_methods,
+						ord->path.pathkeys, list_make3(ord, lion, iocols),
+						rows, startup, total, rel->consider_parallel, 0);
 
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
-						rows, indexonly, &workers, &startup, &total))
-				lo_add_path(rel, &lion_ordered_path_methods,
+						rows, indexonly, 1.0, 1.0, &workers, &startup, &total))
+				lo_add_path(rel, NULL, &lion_ordered_path_methods,
 							ord->path.pathkeys, list_make3(ord, lion, iocols),
 							rows, startup, total, true, workers);
 		}
@@ -3557,8 +3862,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, NULL, &startup, &total);
-			lo_add_path(rel, pathkeys != NIL ?
+					rows, true, 1.0, 1.0, NULL, &startup, &total);
+			lo_add_path(rel, NULL, pathkeys != NIL ?
 						&lion_ordered_path_methods : &lion_btree_path_methods,
 						pathkeys, list_make3(ipath, lion, iocols),
 						rows, startup, total, rel->consider_parallel, 0);
@@ -3566,11 +3871,61 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ipath) &&
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-						rows, true, &workers, &startup, &total))
-				lo_add_path(rel, pathkeys != NIL ?
+						rows, true, 1.0, 1.0, &workers, &startup, &total))
+				lo_add_path(rel, NULL, pathkeys != NIL ?
 							&lion_ordered_path_methods : &lion_btree_path_methods,
 							pathkeys, list_make3(ipath, lion, iocols),
 							rows, startup, total, true, workers);
+		}
+	}
+
+	/*
+	 * A covering btree's paths parameterized by the outer side of a nested
+	 * loop (DESIGN.md §40.10): its walk as the loop's probe, each scan a
+	 * descent for the outer row's key, over a set built from the relation's
+	 * restriction clauses alone - never from a join clause, which stays the
+	 * btree's index clause or the node's filter - and kept for every scan.
+	 * Paired with each lion access as the unordered paths are, priced as a
+	 * probe in index-only mode, and offered claiming no order: an inner
+	 * side's order is no use to a nested loop.
+	 */
+	foreach(lc, probepaths)
+	{
+		IndexPath  *ipath = (IndexPath *) lfirst(lc);
+		ParamPathInfo *ppi = get_baserel_parampathinfo(root, rel,
+													   PATH_REQ_OUTER(&ipath->path));
+		List	   *ordrinfos = lo_ord_rinfos(ipath);
+		List	   *clauses = list_concat_copy(rel->baserestrictinfo,
+											   ppi->ppi_clauses);
+		double		loops;
+		double		scans = lo_probe_scans(root, rel, ppi, &loops);
+
+		foreach(lc2, cands)
+		{
+			Path	   *lion = (Path *) lfirst(lc2);
+			List	   *lionrinfos = NIL;
+			bool		lossy = false;
+			List	   *lionqual;
+			List	   *residual;
+			List	   *iocols;
+			Cost		startup;
+			Cost		total;
+
+			if (!lo_lion_adds(lion, ipath->indexclauses))
+				continue;
+			lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
+			residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
+			if (!lo_index_only(ipath->indexinfo,
+							   lo_needed_attrs(rel, residual,
+											   ipath->indexclauses,
+											   lionqual, lossy),
+							   &iocols))
+				continue;
+			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
+					ppi->ppi_rows, true, loops, scans, NULL, &startup, &total);
+			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
+						list_make3(ipath, lion, iocols), ppi->ppi_rows,
+						startup, total, rel->consider_parallel, 0);
 		}
 	}
 
@@ -3609,7 +3964,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							  list_make1(w->var));
 			priv = lappend(priv, lion);
 			priv = lappend(priv, w->vrinfos);
-			lo_add_path(rel, &lion_ordered_path_methods,
+			lo_add_path(rel, NULL, &lion_ordered_path_methods,
 						list_make1(w->pathkey), priv, rows, startup, total,
 						false, 0);
 		}
@@ -3913,9 +4268,22 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * The set lazily only for a walk expected to stop short (§30.4): the
 	 * share of its walk a LIMIT on the node alone lets it go, and the entries
 	 * that comes to.  A parallel walk's set is built at once, for every
-	 * participant (§40.9).
+	 * participant (§40.9).  A nested loop's probe (§40.10) keeps its set for
+	 * every scan the loop makes, and its walk is all of theirs: lazily while
+	 * the loop's scans together are expected to meet fewer entries than a
+	 * walk that would be built for - a few outer rows probing a few keys of
+	 * the set - and built at once otherwise.
 	 */
-	if (best_path->path.parallel_aware)
+	if (best_path->path.param_info != NULL)
+	{
+		double		loops;
+
+		flags |= LO_FLAG_PROBE;
+		(void) lo_probe_scans(root, rel, best_path->path.param_info, &loops);
+		if (loops * expected >= LO_SWITCH_MIN_WALK)
+			flags |= LO_FLAG_BUILD;
+	}
+	else if (best_path->path.parallel_aware)
 		flags |= LO_FLAG_BUILD;
 	else
 	{
@@ -4010,6 +4378,35 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		&lo_btree_scan_methods : &lo_scan_methods;
 
 	return &cscan->scan.plan;
+}
+
+/*
+ * ReparameterizeCustomPathByChild: a partitionwise join's nested loop probes
+ * a partition of rel with a LionBtreeScan parameterized by the outer side's
+ * parent, as every inner path of a partition is, and has core move it to the
+ * outer partition (reparameterize_path_by_child()) - the path's own
+ * parameterization, and through this its private list, of which only the
+ * btree's IndexPath names the outer side: its join clauses, translated by
+ * core's own reparameterization of an index path.  The lion access is the
+ * partition's own and unparameterized (§40.10), the column mapping the
+ * btree's.
+ */
+static List *
+lo_reparameterize(PlannerInfo *root, List *custom_private,
+				  RelOptInfo *child_rel)
+{
+	Path	   *ord;
+	Path	   *moved;
+
+	if (list_length(custom_private) != 3 ||
+		!IsA(linitial(custom_private), IndexPath))
+		elog(ERROR, "LionBtreeScan: unrecognized path to reparameterize");
+	ord = (Path *) linitial(custom_private);
+	moved = reparameterize_path_by_child(root, ord, child_rel);
+	if (moved == NULL)
+		elog(ERROR, "LionBtreeScan: could not reparameterize the walk of index %u",
+			 ((IndexPath *) ord)->indexinfo->indexoid);
+	return list_make3(moved, lsecond(custom_private), lthird(custom_private));
 }
 
 /* ---------------------------------------------------------------------
@@ -5599,6 +5996,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->lionheaprecheck = (priv.flags & LO_FLAG_HEAPRECHECK) != 0;
 	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
 	st->knnlimit = priv.limit;
+	st->probe = (priv.flags & LO_FLAG_PROBE) != 0;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
@@ -5624,6 +6022,16 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		(st->lionwalk || st->knn || tree == NIL ||
 		 (priv.flags & LO_FLAG_BUILD) == 0 || priv.nsort > 0))
 		elog(ERROR, "LionOrdered: malformed parallel walk");
+
+	/*
+	 * A nested loop's probe (DESIGN.md §40.10) is an unordered btree walk
+	 * over a set, never parallel-aware: it has no sort keys, and it never
+	 * switches.
+	 */
+	if (st->probe &&
+		(st->parallel || st->lionwalk || st->knn || tree == NIL ||
+		 priv.nsort > 0))
+		elog(ERROR, "LionOrdered: malformed nested loop probe");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -6133,8 +6541,12 @@ lo_sort_end(LionOrderedState *st)
 static void
 lo_scan_reset(LionOrderedState *st)
 {
-	/* what the lazy set's memo says this scan met goes with scancxt */
-	if (st->memo != NULL)
+	/*
+	 * what the lazy set's memo says this scan met goes with scancxt - none
+	 * of it in a nested loop's probe, which marks nothing (§40.10) and whose
+	 * memo, kept for every scan of the loop, is not walked at each
+	 */
+	if (st->memo != NULL && !st->probe)
 	{
 		lo_memo_iterator it;
 		LoMemoEnt  *e;
@@ -6579,7 +6991,7 @@ lo_next(ScanState *ss)
 				lo_lazy_convert(st);
 			}
 		}
-		counted = !st->noset && !st->lazy;
+		counted = !st->noset && !st->lazy && !st->probe;
 
 		/*
 		 * Every member met: nothing further along can be one (§30.4,
@@ -6614,7 +7026,7 @@ lo_next(ScanState *ss)
 
 			if (e == NULL)
 				continue;
-			if (!lo_lazy_mark(st, e, tid))
+			if (!st->probe && !lo_lazy_mark(st, e, tid))
 				continue;		/* met before: a recycled slot (§30.4) */
 			st->distinct++;
 			st->hits++;
@@ -6624,7 +7036,17 @@ lo_next(ScanState *ss)
 			idx = lo_set_find(st->set, tid);
 			if (idx < 0)
 				continue;
-			if (!lo_mark(st, idx, tid))
+
+			/*
+			 * A nested loop's probe marks nothing (§40.10): its scans stop
+			 * nowhere early and never switch, which are what the marks are
+			 * counted for, and the visited bits' directory, made again for
+			 * every scan, is as long as the set's places.  A TID met twice
+			 * in one scan is then fetched twice; the second time it names a
+			 * tuple written after the snapshot (§30.4), which the heap's
+			 * visibility check skips.
+			 */
+			if (!st->probe && !lo_mark(st, idx, tid))
 				continue;		/* met before: a recycled slot (§30.4) */
 			st->distinct++;
 			st->hits++;
@@ -6734,11 +7156,16 @@ lo_rescan(CustomScanState *node)
 {
 	LionOrderedState *st = (LionOrderedState *) node;
 
-	/* the walk restarts, with its keys evaluated again */
+	/*
+	 * The walk restarts, with its keys evaluated again.  A nested loop's
+	 * probe keeps the visibility map's page it read last, as core's Index
+	 * Only Scan keeps it across its rescans: the next outer row's key is
+	 * often on the same page (DESIGN.md §40.10).
+	 */
 	st->started = false;
 	st->done = false;
 	lo_scan_reset(st);
-	if (BufferIsValid(st->vmbuffer))
+	if (BufferIsValid(st->vmbuffer) && !st->probe)
 	{
 		ReleaseBuffer(st->vmbuffer);
 		st->vmbuffer = InvalidBuffer;
@@ -7157,7 +7584,15 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyText(cscan->methods == &lo_btree_scan_methods ?
 						"Index" : "Ordered By", buf.data, es);
 
-	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_ORDORIG),
+	/*
+	 * The walk's index quals, key on the left, as core prints an Index Scan's
+	 * (its indexqualorig is the same list): `100 > k` as `(k < 100)`, and a
+	 * nested loop's probe's join clause as `(d.id = f.dim_id)` however the
+	 * query wrote it (DESIGN.md §40.10).  A lossy clause's original is the
+	 * Filter's, as there.
+	 */
+	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
+											LO_EXPR_ORDQUALS),
 					"Index Cond", ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_ORDERBYS),
