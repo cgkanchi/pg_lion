@@ -1780,6 +1780,13 @@ extern PGDLLIMPORT set_join_pathlist_hook_type lion_prev_set_join_pathlist_hook;
  */
 extern PGDLLIMPORT bool lion_enable_count_anti;
 
+/*
+ * Whether a GROUP BY over a join of a table to a dimension by its primary key
+ * may be grouped by LionProbeJoin (DESIGN.md §46).  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_probe_join;
+extern void lion_probe_join_register(void);
+
 extern void lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 								   RelOptInfo *outerrel, RelOptInfo *innerrel,
 								   JoinType jointype,
