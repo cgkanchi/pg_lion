@@ -655,13 +655,17 @@ ROLLBACK;
 VACUUM lcc;
 SELECT lcc_check('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier');
 -- in parallel: every participant looks the keys up, and takes away the rows
--- of the ranges it counts
+-- of the ranges it counts.  Without the leader, whose run of the lookups the
+-- workers' share of the count would otherwise have to outweigh, as the
+-- shares of 40,000 rows do not the runs of n's keys, some 400 rows each
+-- (lion_add_parallel_cells_path())
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
+SET parallel_leader_participation = off;
 SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.id) GROUP BY tier'),
 	('SELECT tier, count(*) FROM lcc_tiered t WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = t.n) GROUP BY tier'),
@@ -677,6 +681,7 @@ SELECT lcc_check('SELECT (tags && ''{0}'') AS t0, (tags && ''{1,9}'') AS t1, (ta
 SELECT c, lcc_check(format('SELECT %s, count(*) FROM lcc c WHERE NOT EXISTS (SELECT 1 FROM lcc_skip s WHERE s.a = c.n) GROUP BY 1, 2, 3, 4, 5, 6, 7, 8, 9, 10',
 						   lcc_bits(c)))
   FROM (VALUES ('k'), ('n')) v(c);
+RESET parallel_leader_participation;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
@@ -836,13 +841,14 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT (s IN (''live'', NULL)) AS x, (dm::lcc_mood IS DISTINCT FROM ''dead'') AS y, (m = ''hot'') AS z, count(*) FROM lcc_e c WHERE NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = c.n) GROUP BY 1, 2, 3')
 ) v(q);
 
--- in parallel, beside the anti join too
+-- in parallel, beside the anti join too (without the leader, as above)
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
+SET parallel_leader_participation = off;
 SELECT * FROM lcc_plan(
 	'SELECT tier, count(*) FROM lcc_e_tiered WHERE m = ''hot'' GROUP BY tier') AS p("QUERY PLAN");
 SELECT q, lcc_check(q) FROM (VALUES
@@ -863,6 +869,7 @@ SELECT q, lcc_check(q) FROM (VALUES
 	('SELECT tier, count(*) FROM lcc_e_tiered WHERE s IN (''live'', ''idle'') GROUP BY tier'),
 	('SELECT tier, count(*) FROM lcc_e_tiered t WHERE t.s IN (''live'', ''gone'') AND NOT EXISTS (SELECT 1 FROM lcc_e_skip k WHERE k.a = t.id) GROUP BY tier')
 ) v(q);
+RESET parallel_leader_participation;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;

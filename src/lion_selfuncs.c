@@ -1992,7 +1992,7 @@ lion_canonical_rel_list(PlannerInfo *root, RelOptInfo *rel, List *clauses,
 	bool		nechanged;
 
 	canon = lion_canonical_clause_list(root, rel->relid, clauses, changed);
-	result = lion_nonempty_rel_clauses(rel, canon, &nechanged);
+	result = lion_nonempty_rel_clauses(root, rel, canon, &nechanged);
 	if (nechanged)
 	{
 		list_free(canon);
@@ -2487,6 +2487,10 @@ typedef struct LionIsect
 	AttrNumber *attnos;			/* the table's column of each clause */
 	Node	  **clauses;		/* bare, in the cache's memory */
 	double		factor;			/* core's estimate is multiplied by it */
+	double		raw;			/* ... and what the probe found of it however
+								 * near core's estimate, for a price of its
+								 * rows (lion_isect_measured_factor()); < 0
+								 * where nothing was measured */
 	bool		measured;		/* by a probe of its own, or taken from a
 								 * part of it (lion_isect_part_factor()) */
 } LionIsect;
@@ -3679,14 +3683,15 @@ lion_isect_within(LionIsect *e, int n, LionIsectClause *cl)
  * of it.  With a part only, the part's: its other clauses independent of
  * those, as core takes them and as the probe's factor takes a range or a
  * clause it has no value for (lion_isect_factor()); with a whole only, from 1
- * at one clause; with neither, 1.  A filter's conjunction and the ones its
- * paths answer share most of their clauses: on the repro of DESIGN.md
- * §29.11, "Wide filters", the five clauses beside four lists measured 3.1,
- * all nine 186, and the five with one list 9.1, where this says 8.6.
+ * at one clause; with neither, 1, and *found (where given) says so.  A
+ * filter's conjunction and the ones its paths answer share most of their
+ * clauses: on the repro of DESIGN.md §29.11, "Wide filters", the five clauses
+ * beside four lists measured 3.1, all nine 186, and the five with one list
+ * 9.1, where this says 8.6.
  */
 static double
 lion_isect_part_factor(LionProbeCache *cache, Oid relid, int n,
-					   LionIsectClause *cl)
+					   LionIsectClause *cl, bool *found)
 {
 	LionIsect  *part = NULL;
 	LionIsect  *whole = NULL;
@@ -3707,6 +3712,8 @@ lion_isect_part_factor(LionProbeCache *cache, Oid relid, int n,
 				 lion_isect_within(e, n, cl))
 			whole = e;
 	}
+	if (found != NULL)
+		*found = (part != NULL || whole != NULL);
 	lo = (part != NULL) ? part->factor : 1.0;
 	lon = (part != NULL) ? (double) part->n : 1.0;
 	if (whole == NULL || whole->factor <= 0.0 || lo <= 0.0)
@@ -3856,11 +3863,12 @@ lion_isect_core_sel(PlannerInfo *root, const LionIsectClause *cl,
 /*
  * Remember a conjunction of this run - the n clauses cl[] of table relid,
  * bare copies in the cache's memory - and what its estimate is to be
- * multiplied by.
+ * multiplied by, and what the probe found of it (LionIsect.raw).
  */
 static LionIsect *
 lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
-					const LionIsectClause *cl, double factor, bool measured)
+					const LionIsectClause *cl, double factor, double raw,
+					bool measured)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(cache->run.cxt);
 	LionIsect  *e = (LionIsect *) palloc(sizeof(LionIsect));
@@ -3876,6 +3884,7 @@ lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
 		e->clauses[i] = (Node *) copyObject(lion_isect_bare(cl[i].clause));
 	}
 	e->factor = factor;
+	e->raw = raw;
 	e->measured = measured;
 	cache->isects = lappend(cache->isects, e);
 	MemoryContextSwitchTo(oldcxt);
@@ -3896,11 +3905,20 @@ lion_isect_remember(LionProbeCache *cache, Oid relid, int n,
  * spent, or the probe gives up - the conjunction is taken to be as the parts
  * of it the run did measure say (lion_isect_part_factor()), and is remembered
  * so only when a probe of it gave up.
+ *
+ * *raw is what the probe found, however near core's estimate
+ * (lion_isect_measured_factor()), or -1 where the run measured nothing of
+ * the conjunction.  A conjunction that is not `raisable` - core's estimate
+ * of it within LION_ISECT_ERROR of its smallest clause's, which
+ * lion_isect_factor() takes as it is without a probe - is probed for *raw
+ * alone: its factor stays 1, and it is no part of another conjunction's
+ * (lion_isect_part_factor()).
  */
 static double
 lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				 LionProbeCache *cache, int ncl, LionIsectClause *cl,
-				 Selectivity coresel, Selectivity minsel)
+				 Selectivity coresel, Selectivity minsel, bool raisable,
+				 double *raw)
 {
 	Oid			relid = planner_rt_fetch(rel->relid, root)->relid;
 	LionIsectClause *mcl = (LionIsectClause *) palloc(sizeof(LionIsectClause) * ncl);
@@ -3910,14 +3928,17 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	Selectivity mminsel = minsel;
 	double		probesel = 0.0;
 	double		factor = 1.0;
+	double		fewlo = -1.0;	/* the rows met, of a sample of few hits */
 	int64		left;
 	int			esets = 0;
 	int			m = 0;
 	int			nused = 0;
 	bool		measured = false;
 	bool		raised = false;
+	bool		found = false;
 	int			i;
 
+	*raw = -1.0;
 	memset(&res, 0, sizeof(res));
 	for (i = 0; i < ncl; i++)
 		esets += lion_isect_clause_sets(&cl[i].skey);
@@ -3931,7 +3952,10 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		/* nothing the run has left can measure: remembered as nothing */
 		pfree(mcl);
 		pfree(used);
-		return lion_isect_part_factor(cache, relid, ncl, cl);
+		factor = lion_isect_part_factor(cache, relid, ncl, cl, &found);
+		if (found)
+			*raw = factor;
+		return raisable ? factor : 1.0;
 	}
 	cache->nisectprobes++;
 	measured = lion_isect_measure(rel, idx, m, mcl, left, used, &res);
@@ -4008,6 +4032,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			}
 		}
 		lo = Min(lo, mminsel);
+		fewlo = lo;
 		if (lo >= msel * LION_ISECT_ERROR)
 		{
 			probesel = lo;
@@ -4027,12 +4052,25 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		if (probesel >= msel * LION_ISECT_ERROR ||
 			probesel * LION_ISECT_ERROR <= msel)
 			factor = probesel / msel;
+
+		/*
+		 * ... and what it found, however near core's: a sample of few hits
+		 * raises no further than the rows of the AND it met, as above.
+		 */
+		*raw = (!raised && fewlo >= 0.0 && probesel > msel) ?
+			Max(Min(probesel, fewlo), msel) / msel : probesel / msel;
 	}
 	else
-		factor = lion_isect_part_factor(cache, relid, ncl, cl);
+	{
+		factor = lion_isect_part_factor(cache, relid, ncl, cl, &found);
+		if (found)
+			*raw = factor;
+	}
+	if (!raisable)
+		factor = 1.0;
 
-	elog(DEBUG2, "lion: intersection probe's factor for %d clauses: %.6g, %s%s; %d of them measured, core's estimate of those %.6g, the probe's %.6g",
-		 ncl, factor,
+	elog(DEBUG2, "lion: intersection probe's factor for %d clauses: %.6g (found %.6g), %s%s; %d of them measured, core's estimate of those %.6g, the probe's %.6g",
+		 ncl, factor, *raw,
 		 !measured ? "not measured: as the run's parts of it say" :
 		 raised ? "raised by a sample of few containers with a row of the AND" :
 		 factor == 1.0 ? "core's estimate stands" : "measured",
@@ -4040,8 +4078,8 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		 measured ? nused : 0, measured ? msel : coresel,
 		 measured ? probesel : -1.0);
 
-	(void) lion_isect_remember(cache, relid, ncl, cl, factor,
-							   measured && nused == ncl);
+	(void) lion_isect_remember(cache, relid, ncl, cl, factor, *raw,
+							   raisable && measured && nused == ncl);
 
 	/* ... and the part measured, when it is not the whole */
 	if (measured && nused >= 2 && nused < ncl)
@@ -4062,7 +4100,8 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				known = true;
 		}
 		if (!known)
-			(void) lion_isect_remember(cache, relid, nused, pcl, factor, true);
+			(void) lion_isect_remember(cache, relid, nused, pcl, factor, *raw,
+									   raisable);
 		pfree(pcl);
 	}
 	if (res.part != NULL)
@@ -4075,7 +4114,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 static double lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel,
 									IndexOptInfo *idx, int n,
 									const AttrNumber *cols, Node **clauses,
-									bool relfirst);
+									bool relfirst, double *raw);
 
 /*
  * What lion's estimate of the AND of the n clauses - RestrictInfos or bare
@@ -4091,10 +4130,40 @@ double
 lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 				  int n, const AttrNumber *cols, Node **clauses)
 {
-	return lion_isect_factor_run(root, rel, idx, n, cols, clauses, true);
+	return lion_isect_factor_run(root, rel, idx, n, cols, clauses, true, NULL);
 }
 
 /*
+ * What the intersection probe found of the same AND, however near core's
+ * estimate of it, into *factor: the share of the rows the AND holds over
+ * core's estimate.  lion_isect_factor() takes a measure only LION_ISECT_ERROR
+ * times off core's or more, what an estimate the plan's rows are sized from
+ * can tell from the noise of ANALYZE's per-column estimates and the sample;
+ * a price of the AND's rows themselves - the candidates a position filter
+ * decides (lion_tsquery_pos_shape()), which every one of them costs - is
+ * nearer the truth with any measure than with core's product, which a
+ * phrase's words, found together far more often than apart, are at a
+ * fraction of.  So the probe measures it wherever core's estimate is not the
+ * smallest clause's own, which nothing can raise, and a sample of few hits
+ * raises it no further than the rows of the AND it met.  False, and *factor
+ * 1, where the run measured nothing of it.
+ */
+bool
+lion_isect_measured_factor(PlannerInfo *root, RelOptInfo *rel,
+						   IndexOptInfo *idx, int n, const AttrNumber *cols,
+						   Node **clauses, double *factor)
+{
+	double		raw = -1.0;
+
+	(void) lion_isect_factor_run(root, rel, idx, n, cols, clauses, true,
+								 &raw);
+	*factor = (raw >= 0.0) ? raw : 1.0;
+	return raw >= 0.0;
+}
+
+/*
+ * ... raw: lion_isect_measured_factor()'s, or NULL.
+ *
  * ... relfirst: before a conjunction not measured yet in this planner run is,
  * the relation's OWN conjunction on idx - every set clause of its
  * restriction clauses that idx answers (lion_isect_rel_clauses()) - is, when
@@ -4108,7 +4177,7 @@ lion_isect_factor(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 static double
 lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 					  int n, const AttrNumber *cols, Node **clauses,
-					  bool relfirst)
+					  bool relfirst, double *raw)
 {
 	LionProbeCache *cache;
 	LionIsectClause *cl;
@@ -4118,9 +4187,14 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	Selectivity coresel;
 	Selectivity minsel = 1.0;
 	double		factor;
+	double		measured;
+	bool		raisable;
 	int			ncl = 0;
 	int			i;
 	ListCell   *lc;
+
+	if (raw != NULL)
+		*raw = -1.0;
 
 	/*
 	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
@@ -4188,11 +4262,14 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 
 	/*
 	 * Where it can matter: the AND holds at most the smallest clause's rows,
-	 * so core's estimate can be too small by at most that over it.
+	 * so core's estimate can be too small by at most that over it - by
+	 * LION_ISECT_ERROR or more, for the factor; by anything, for what the
+	 * probe finds (raw).
 	 */
 	coresel = (ncl >= 2) ?
 		clauselist_selectivity(root, group, 0, JOIN_INNER, NULL) : 0.0;
-	if (ncl < 2 || coresel <= 0.0 || coresel * LION_ISECT_ERROR > minsel ||
+	raisable = (coresel * LION_ISECT_ERROR <= minsel);
+	if (ncl < 2 || coresel <= 0.0 || (!raisable && raw == NULL) ||
 		!lion_isect_readable(root, rel, idx, ncl, cl))
 	{
 		list_free(group);
@@ -4222,7 +4299,7 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		if (nrel >= 2)
 		{
 			(void) lion_isect_factor_run(root, rel, idx, nrel, relcols,
-										 relclauses, false);
+										 relclauses, false, NULL);
 			foreach(lc, cache->isects)
 			{
 				if (lion_isect_same((LionIsect *) lfirst(lc), rte->relid,
@@ -4237,8 +4314,16 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		pfree(relclauses);
 	}
 
-	factor = (e != NULL) ? e->factor :
-		lion_isect_probe(root, rel, idx, cache, ncl, cl, coresel, minsel);
+	if (e != NULL)
+	{
+		factor = e->factor;
+		measured = e->raw;
+	}
+	else
+		factor = lion_isect_probe(root, rel, idx, cache, ncl, cl, coresel,
+								  minsel, raisable, &measured);
+	if (raw != NULL)
+		*raw = measured;
 	pfree(cl);
 	return factor;
 }
@@ -4304,7 +4389,7 @@ lion_isect_rel_factor(PlannerInfo *root, RelOptInfo *rel)
 
 	if (best != NULL && bestn >= 2)
 		factor = lion_isect_factor_run(root, rel, best, bestn, bestcols,
-									   bestclauses, false);
+									   bestclauses, false, NULL);
 	if (best != NULL)
 	{
 		pfree(bestcols);
