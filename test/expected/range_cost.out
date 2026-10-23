@@ -130,7 +130,9 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE w1 BETWEEN 10 AND 900 AND w2 B
 (1 row)
 
 -- An equality beside the range drives the complement: the eleven keys
--- outside it are walked, and the node is still the plan.
+-- outside it are walked, and the node is still the plan.  A second range
+-- beside them, w1's, is walked at the one count rather than collected
+-- (DESIGN.md §32, "Walked at every count").
 EXPLAIN (COSTS OFF) SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10;
                       QUERY PLAN                       
 -------------------------------------------------------
@@ -147,14 +149,17 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10');
 SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w1 > 10 AND w2 > 10');
                        rc_check                        
 -------------------------------------------------------
- collected 1, walked 0, spilled 0, complement: (24690)
+ collected 0, walked 1, spilled 0, complement: (24690)
 (1 row)
 
 -- ---------- 2. A range collected as a source, its union a RUN ----------
 -- In the heap's order every key's union is a RUN, and each container after
 -- its first used to be priced - and made - a fold into it: half the keys of
 -- o went to an index scan and a sort.  They are a fold or two a union key
--- now, and the node is the plan.
+-- now, and the node is the plan.  Four groups, or a count(DISTINCT)'s four
+-- existence tests, walk the range at each count instead, which is cheaper
+-- than collecting it (DESIGN.md §32, "Walked at every count"); an OR's leaf
+-- is never walked, and is collected.
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500;
                            QUERY PLAN                            
 -----------------------------------------------------------------
@@ -166,10 +171,16 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500');
                rc_check                
 ---------------------------------------
- collected 1, walked 0, spilled 0: (4)
+ collected 0, walked 1, spilled 0: (4)
 (1 row)
 
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+                                 rc_check                                  
+---------------------------------------------------------------------------
+ collected 0, walked 1, spilled 0: (0,23991) (1,23991) (2,23991) (3,23991)
+(1 row)
+
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE (o BETWEEN 10 AND 24000 OR w2 = -1) GROUP BY lo');
                                  rc_check                                  
 ---------------------------------------------------------------------------
  collected 1, walked 0, spilled 0: (0,23991) (1,23991) (2,23991) (3,23991)
@@ -180,13 +191,19 @@ SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GRO
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w1 BETWEEN 10 AND 990 GROUP BY lo');
                                  rc_check                                  
 ---------------------------------------------------------------------------
+ collected 0, walked 1, spilled 0: (0,24500) (1,24500) (2,24600) (3,24500)
+(1 row)
+
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE (w1 BETWEEN 10 AND 990 OR w2 = -1) GROUP BY lo');
+                                 rc_check                                  
+---------------------------------------------------------------------------
  collected 1, walked 0, spilled 0: (0,24500) (1,24500) (2,24600) (3,24500)
 (1 row)
 
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
                rc_check                
 ---------------------------------------
- collected 1, walked 0, spilled 0: (4)
+ collected 0, walked 1, spilled 0: (4)
 (1 row)
 
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w2 BETWEEN 5000 AND 12000 GROUP BY lo');
@@ -214,9 +231,10 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 2 AND o > 100 AND m BETWE
 -- rows in rcost's order, some 25 to a page and 63 container keys, and there
 -- the widened unions do not all fit, and are optimized back - compacted - to
 -- make room: for the next widening, and before the collection would give
--- up.  The unions optimized fit, and the range is still collected; w2's -
--- keys of five scattered rows, whose unions are ARRAYs with members pending
--- until they are folded - does not, and is walked.  A widening that finds no
+-- up.  The unions optimized fit, and the range is still collected - as an
+-- OR's leaf, o's, which four groups walk otherwise; w2's - keys of five
+-- scattered rows, whose unions are ARRAYs with members pending until they
+-- are folded - does not, and is walked.  A widening that finds no
 -- room even then is refused, and folds as before: rcostn below.
 CREATE TABLE rcostw AS SELECT id, lo, w1, w2, o, m, repeat('x', 260) AS pad
   FROM rcost ORDER BY id;
@@ -230,10 +248,16 @@ SET hash_mem_multiplier = 1.0;
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
                rc_check                
 ---------------------------------------
- collected 1, walked 0, spilled 0: (4)
+ collected 0, walked 1, spilled 0: (4)
 (1 row)
 
 SELECT rc_check('SELECT lo, count(*) FROM rcostw WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+                                 rc_check                                  
+---------------------------------------------------------------------------
+ collected 0, walked 1, spilled 0: (0,23991) (1,23991) (2,23991) (3,23991)
+(1 row)
+
+SELECT rc_check('SELECT lo, count(*) FROM rcostw WHERE (o BETWEEN 10 AND 24000 OR w2 = -1) GROUP BY lo');
                                  rc_check                                  
 ---------------------------------------------------------------------------
  collected 1, walked 0, spilled 0: (0,23991) (1,23991) (2,23991) (3,23991)

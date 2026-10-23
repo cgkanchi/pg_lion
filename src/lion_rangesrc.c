@@ -57,11 +57,33 @@
  * memory where its optimized form may take a few bytes, so the unions
  * widened since the last time are optimized again - COMPACTED,
  * lion_range_union_compact() - whenever that memory runs short: before a
- * union is refused a widening, which then folds as before, and before the
- * collection gives up or a window gives back keys, which therefore happens
- * only where it did before.  A widening is made where a fold would have been
- * and compacted at most once, so a collection short of memory spends about
- * what it did, and one that is not a fold or two a union key.
+ * union is refused a widening, and before the collection gives up or a window
+ * gives back keys, which therefore happens only where it did before.
+ *
+ * HYSTERESIS.  A union that has been compacted is never widened again.  Near
+ * its memory a collection of scattered rows - every key taking containers
+ * until the walk is over - compacted to make room for one widening, and the
+ * next container to come to the union just compacted widened it again, which
+ * compacted the one widened before: a 4 KB optimize and a 4 KB widening for
+ * every container (2026-10-22 review: 12 s at 768 kB, 60 to 70% of it in the
+ * optimize).  So a union is widened once and compacted once at most, and one
+ * that may not be widened - compacted, or with no room left even after a
+ * compaction - takes the few members of a small ARRAY into `pend` as an
+ * ARRAY union does, folded in once they come to a quarter of its size in
+ * bytes, and folds anything larger as it comes.  Those buffers are memory a
+ * fold as it comes did not take, so before they would put the union past its
+ * memory they are folded and given back - SQUEEZED,
+ * lion_range_union_squeeze() - and the unions that are no ARRAY fold as they
+ * come until a window gives back keys: a collection that fit as it folded
+ * fits still, at no more than the folds it made.  A column in heap order
+ * loses nothing by any of it: a key there takes its containers one after the
+ * other, and the unions a compaction finds are those the walk has passed.
+ * Measured on the assert build (2026-10-23), with the walk's sets freed as it
+ * goes (lion_range_union_walk()): a range over 950,000 of 3M rows in no order
+ * took 1.82 s at a work_mem of 1 MB, twice what 64 MB took, and takes 0.66 s,
+ * no more than 64 MB now does; in windows at 64 kB 1.93 s, now 1.11.  Over
+ * 36 shapes - three columns, four ranges of each, three memories - none is
+ * slower beyond the noise.
  */
 typedef struct LionRangeUnionEnt
 {
@@ -71,6 +93,7 @@ typedef struct LionRangeUnionEnt
 	uint16	   *pend;			/* members still to fold into c, any order */
 	uint32		npend;
 	uint32		pendcap;
+	bool		compacted;		/* widened and compacted: not widened again */
 } LionRangeUnionEnt;
 
 typedef struct LionRangeUnion
@@ -90,6 +113,8 @@ typedef struct LionRangeUnion
 	uint32	   *widened;		/* the keys widened since the last compaction */
 	int			nwidened;
 	int			widenedcap;
+	bool		squeezed;		/* only ARRAY unions take members to `pend`,
+								 * until a window gives back keys */
 } LionRangeUnion;
 
 /* What one kept container costs beyond its chunk: its hash entry. */
@@ -166,6 +191,9 @@ lion_range_union_evict(LionRangeUnion *u)
 		}
 		(void) hash_search(u->byckey, &ckey, HASH_REMOVE, NULL);
 	}
+
+	/* half the keys are gone: room to set members aside again */
+	u->squeezed = false;
 }
 
 /* Make src, a container of e's key, e's union: at its own size. */
@@ -188,8 +216,9 @@ lion_range_union_store(LionRangeUnion *u, LionRangeUnionEnt *e,
 
 /*
  * Fold e's pending members into its union, in one pass through an image
- * (lion_container_add_many()).  A union that is no ARRAY afterwards takes
- * no more pending members, and gives their buffer back.
+ * (lion_container_add_many()).  A union that is no ARRAY afterwards gives
+ * their buffer back: it takes no more pending members, or a few at a time
+ * where it may not be widened, in a buffer of that size (HYSTERESIS, above).
  */
 static void
 lion_range_union_fold(LionRangeUnion *u, LionRangeUnionEnt *e)
@@ -214,7 +243,8 @@ lion_range_union_fold(LionRangeUnion *u, LionRangeUnionEnt *e)
  * - a windowed collection may have given it back since - and that is still a
  * BITSET, so that what the unions hold is what their optimized forms take
  * again (DENSE ACCUMULATION, above).  A union that comes out of it a BITSET
- * all the same is one past what an ARRAY or a RUN holds, and stays one.
+ * all the same is one past what an ARRAY or a RUN holds, and stays one; any
+ * other is not widened again (HYSTERESIS, above).
  */
 static void
 lion_range_union_compact(LionRangeUnion *u)
@@ -231,21 +261,57 @@ lion_range_union_compact(LionRangeUnion *u)
 		memcpy(u->tmp, e->c, e->size);
 		lion_container_optimize(u->tmp);
 		lion_range_union_store(u, e, u->tmp);
+		e->compacted = (e->c->type != LION_CT_BITSET);
 	}
 	u->nwidened = 0;
 }
 
 /*
+ * Fold the pending members of every union that is no ARRAY and give their
+ * buffers back, and take no more for such a union until a window gives back
+ * keys (HYSTERESIS, above): what they held is what a fold as each container
+ * came would not have, and a union past its memory with them may fit
+ * without.
+ */
+static void
+lion_range_union_squeeze(LionRangeUnion *u)
+{
+	HASH_SEQ_STATUS seq;
+	LionRangeUnionEnt *e;
+
+	hash_seq_init(&seq, u->byckey);
+	while ((e = (LionRangeUnionEnt *) hash_seq_search(&seq)) != NULL)
+	{
+		if (e->pend == NULL || e->c->type == LION_CT_ARRAY)
+			continue;
+		lion_range_union_fold(u, e);
+		if (e->pend != NULL)
+		{
+			/* nothing was pending: the buffer a merge left an ARRAY's */
+			u->held -= Min(u->held, GetMemoryChunkSpace(e->pend));
+			pfree(e->pend);
+			e->pend = NULL;
+			e->pendcap = 0;
+		}
+	}
+	u->squeezed = true;
+}
+
+/*
  * Make e's union, which is no BITSET and has nothing pending, a BITSET to OR
  * into in place (DENSE ACCUMULATION, above) - if the memory has room for one,
- * after compacting the unions widened before it if it has not.  False, with
- * nothing changed, when it has no room even then: the caller folds.
+ * after compacting the unions widened before it if it has not, and if it has
+ * not been compacted itself (HYSTERESIS, above).  False, with nothing
+ * changed, when it may not be widened: the caller sets the members aside or
+ * folds.
  */
 static bool
 lion_range_union_widen(LionRangeUnion *u, LionRangeUnionEnt *e)
 {
 	Assert(e->c->type != LION_CT_BITSET && e->npend == 0);
 
+	if (e->compacted)
+		return false;
 	if (u->held + LION_CONTAINER_MAX_SIZE > u->maxbytes)
 	{
 		lion_range_union_compact(u);
@@ -350,6 +416,7 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		e->pend = NULL;
 		e->npend = 0;
 		e->pendcap = 0;
+		e->compacted = false;
 		u->held += GetMemoryChunkSpace(e->c) + LION_RANGE_UNION_OVERHEAD;
 	}
 	else if (e->c->type == LION_CT_BITSET)
@@ -357,20 +424,28 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		/* dense: ORed in place, optimized once the walk is over */
 		(void) lion_container_or_inplace(e->c, c);
 	}
-	else if (e->c->type == LION_CT_ARRAY && c->type == LION_CT_ARRAY &&
+	else if (c->type == LION_CT_ARRAY &&
 			 Min((uint32) c->cardinality, (uint32) LION_ARRAY_MAX_CARD) <=
-			 LION_RANGE_UNION_PEND_MIN)
+			 LION_RANGE_UNION_PEND_MIN &&
+			 (e->c->type == LION_CT_ARRAY ||
+			  (!u->squeezed &&
+			   (e->npend > 0 || !lion_range_union_widen(u, e)))))
 	{
 		/*
-		 * A few members: pending, until half as many as the union holds
-		 * have come.  The buffer grows with the union, never past that.  The
-		 * counts are clamped as everywhere a header's count sizes a copy.
+		 * A few members: pending, until half as many as an ARRAY union holds
+		 * have come, or for any other union - one that may not be widened
+		 * (HYSTERESIS, above), and is not asked again while members wait -
+		 * a quarter of its size in bytes.  The buffer grows with the union,
+		 * never past that.  The counts are clamped as everywhere a header's
+		 * count sizes a copy.
 		 */
 		uint32		ncard = Min((uint32) c->cardinality,
 								(uint32) LION_ARRAY_MAX_CARD);
 		uint32		fold = Max((uint32) LION_RANGE_UNION_PEND_MIN,
+							   (e->c->type == LION_CT_ARRAY) ?
 							   Min((uint32) e->c->cardinality,
-								   (uint32) LION_ARRAY_MAX_CARD) / 2);
+								   (uint32) LION_ARRAY_MAX_CARD) / 2 :
+							   e->size / (4 * sizeof(uint16)));
 		uint32		want = fold + LION_RANGE_UNION_PEND_MIN;
 
 		if (e->pendcap < want)
@@ -409,9 +484,11 @@ lion_range_union_cb(const LionContainer *c, void *arg)
 		}
 	}
 
-	/* the widened unions give back what they took first */
+	/* the widened unions give back what they took first, then the buffers */
 	if (u->held > u->maxbytes && u->nwidened > 0)
 		lion_range_union_compact(u);
+	if (u->held > u->maxbytes && !u->squeezed)
+		lion_range_union_squeeze(u);
 	if (u->held > u->maxbytes)
 	{
 		if (!u->window)
@@ -451,6 +528,18 @@ lion_range_union_cmp(const void *a, const void *b)
 /*
  * A range's sets to the union (above): walk the range and add what its sets
  * hold.  What the walk read is added to nsets and nsummaries.
+ *
+ * Each set is handed out and read in a context of its own, reset once the
+ * set has been added: what it takes there - an INLINE set's copy of its
+ * payload and key (lion_fill_posting_set_entry()), and the stream, plan and
+ * cursors lion_sets_iterate() reads it through - is the set's alone, and a
+ * release gives back its pin, not its memory.  Left in the caller's context
+ * it stayed there for the rest of the query, some 250 bytes for every entry
+ * walked, outside the union's memory and whatever work_mem said: 154 MB for
+ * a range over 600,000 keys at a work_mem of 4 MB (2026-10-22 review).  The
+ * union keeps nothing there - its containers are in its own context, its
+ * overflow in the spill's - and the walk's position and batch are in the
+ * scan's own contexts, made before this one, which a reset does not touch.
  */
 static void
 lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
@@ -459,15 +548,24 @@ lion_range_union_walk(Relation index, AttrNumber attno, LionRange *range,
 	LionEntryScan es;
 	LionPostingSet ps;
 	Datum		key;
+	MemoryContext setcxt;
+	MemoryContext oldcxt;
 
 	lion_entry_scan_begin_sum(&es, index, attno, range, LION_WALK_INSIDE);
+	setcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "lion range union set",
+								   ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(setcxt);
 	while (!u->failed && lion_entry_scan_next(&es, &key, &ps))
 	{
 		(void) lion_union_add(u, &ps);
 		lion_posting_set_release(&ps);
 		(*nsets)++;
+		MemoryContextReset(setcxt);
 		CHECK_FOR_INTERRUPTS();
 	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(setcxt);
 	*nsummaries += es.nsummaries;
 	lion_entry_scan_end(&es);
 }
