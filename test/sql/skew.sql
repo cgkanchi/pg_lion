@@ -340,25 +340,51 @@ SELECT :rows_on > lsw_rows(q) AS listed_larger
 RESET pg_lion.enable_index_mcv;
 
 -- ---------- 9. a partial index ----------
--- A partial lion index's sets hold its predicate's rows, and the share of
--- them a probed key selects is priced at the rows it meets as a whole
--- index's is (DESIGN.md §45).  A copy of the fact's lion index whose
--- predicate every row meets, implied by the key's equality to the outer row:
--- the correlated count's plans flip with the setting as in section 4, the
--- count at the whole index's price.
+-- A partial lion index's sets hold its predicate's rows; the share of them
+-- a probed key selects is priced at the rows it meets, as a whole index's
+-- is (DESIGN.md §45).  The fact's lion index is replaced by a copy whose
+-- predicate every row meets - the key's equality to the outer row implies
+-- it - and a whole lion index of the key alone, which the figure comes from
+-- (a partial index gives none).  The count reads the copy alone, its plans
+-- flip with the setting as in section 4, and its price is the one it had
+-- over the whole index.  Lion's plain scans and bitmap scans are off, so
+-- that the key's own index is not the competitor the count is weighed
+-- against, and so are residual counts, so that the count does not read it.
+-- lsw_lion_indexes() names the lion indexes q's LionCount reads.
+CREATE FUNCTION lsw_lion_indexes(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	p jsonb;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN (SELECT string_agg(DISTINCT m[1], ', ')
+			  FROM regexp_matches(jsonb_path_query_first(p, '$.**."Lion Indexes"') #>> '{}',
+								  '(?:^|, )(\w+)', 'g') m);
+END $$;
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_count_residual = off;
+SELECT lsw_lion_indexes(q) FROM lsw_q WHERE name = 'correlated';
 SELECT lsw_cost(q, 'LionCount') AS count_whole
   FROM lsw_q WHERE name = 'correlated' \gset
+DROP INDEX lsw_fact_lion;
+CREATE INDEX lsw_fact_key ON lsw_fact USING lion (fk);
 CREATE INDEX lsw_fact_part ON lsw_fact USING lion (fk, doc) WHERE fk IS NOT NULL;
+SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lsw_q, lsw_skew_rows(q) WHERE name = 'correlated';
 SET pg_lion.enable_skew_estimate = off;
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'correlated';
 SET pg_lion.enable_skew_estimate = on;
-SELECT lsw_plan(q), lsw_cost(q, 'LionCount') = :count_whole AS whole_price
+SELECT lsw_plan(q), lsw_lion_indexes(q),
+	   lsw_cost(q, 'LionCount') = :count_whole AS whole_price
   FROM lsw_q WHERE name = 'correlated';
-DROP INDEX lsw_fact_part;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_count_residual;
 
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;
 DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json, text),
-	lsw_cost(text, text), lsw_rows(text), lsw_key_skew(regclass),
-	lsw_skew_rows(text);
+	lsw_cost(text, text), lsw_rows(text), lsw_lion_indexes(text),
+	lsw_key_skew(regclass), lsw_skew_rows(text);

@@ -21513,8 +21513,10 @@ extension's SQL does not create: `test/sql/skew.sql` binds them from the library
 - an EXISTS over the fact whose probed relation lists keys 9 to 128, the keys of 1,000 rows
   outside ANALYZE's list: the figure stays 750.50 with `pg_lion.enable_index_mcv` on and off, and
   the semi-join's estimate, which takes the list's rows, is larger with it on;
-- a copy of the fact's lion index, partial on a predicate every row meets (`fk IS NOT NULL`): the
-  correlated count's plans flip with the setting as the whole index's do, the count at its price.
+- the fact's lion index replaced by a copy partial on a predicate every row meets
+  (`fk IS NOT NULL`), beside a whole lion index of the key alone that the figure comes from: the
+  correlated count reads the copy alone, its plans flip with the setting as the whole index's do,
+  and it is priced as it was over the whole index.
 
 `test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
 subquery, and its fixtures' keys are skewed enough to move its plans.
