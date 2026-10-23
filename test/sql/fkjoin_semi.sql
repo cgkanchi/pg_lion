@@ -27,6 +27,10 @@ SET pg_lion.enable_semijoin = off;
 -- (DESIGN.md §27, "The anti join over a small inner side"): off here, so that
 -- the plans pinned are the FK-side join's, and tested in countanti.sql.
 SET pg_lion.enable_count_anti = off;
+-- A semi join to a dimension by its primary key is also the dimension by
+-- probe (DESIGN.md §46), which looks each fact row's key up in it: off here
+-- too, and tested in probejoin.sql.
+SET pg_lion.enable_probe_join = off;
 SET default_statistics_target = 1000;
 
 /*

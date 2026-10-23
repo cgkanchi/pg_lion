@@ -188,6 +188,11 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
 							   (GroupPathExtraData *) extra, &fj[i]);
 		lion_try_small_anti(root, input_rel, output_rel,
 							(GroupPathExtraData *) extra);
+
+		/* ... and the dimension by probe (§46) */
+		if (stage == UPPERREL_GROUP_AGG)
+			lion_try_probe_join(root, input_rel, output_rel,
+								(GroupPathExtraData *) extra);
 		lion_units_unpin();
 		return;
 	}
