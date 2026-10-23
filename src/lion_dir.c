@@ -128,14 +128,15 @@ static void lion_dir_finish_split(Relation index, Relation heaprel,
  * root - and a damaged page can hold anything there.  In particular it can
  * hold InvalidBlockNumber, which is P_NEW, and ReadBuffer() on PostgreSQL 16
  * to 18 answers P_NEW by EXTENDING the relation: a root downlink set to
- * 0xFFFFFFFF grew the index by a block on every SELECT and INSERT that
- * descended through it (2026-09-25 review).  So every directory read refuses
- * one, as corruption.  A block past the end of the relation needs no test of
- * its own - ReadBuffer() fails on it - and asking for the relation's size on
- * every step of every descent would cost a system call each.
+ * 0xFFFFFFFF would grow the index by a block on every SELECT and INSERT that
+ * descended through it.  So every directory read refuses one, as corruption.
+ * A block past the end of the relation needs no test of its own -
+ * ReadBuffer() fails on it - and asking for the relation's size on every step
+ * of every descent would cost a system call each.
  */
 static inline Buffer
-lion_dir_readbuf(Relation index, BlockNumber blk)
+lion_dir_readbuf_ext(Relation index, BlockNumber blk,
+					 BufferAccessStrategy strategy)
 {
 	if (unlikely(!BlockNumberIsValid(blk)))
 		ereport(ERROR,
@@ -143,7 +144,20 @@ lion_dir_readbuf(Relation index, BlockNumber blk)
 				 errmsg("lion index \"%s\" links to an invalid block number",
 						RelationGetRelationName(index))));
 	lion_dir_count_read(index);
-	return ReadBuffer(index, blk);
+	return ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL, strategy);
+}
+
+/*
+ * The same read through no strategy, which is every directory read but some
+ * of VACUUM's.  VACUUM reads through its ring of buffers (info->strategy,
+ * DESIGN.md §18) the descent to the leftmost leaf its walk starts from, and
+ * the descents and the walks right that find an entry again after an insert
+ * moved it: the _ext variants below take the strategy.
+ */
+static inline Buffer
+lion_dir_readbuf(Relation index, BlockNumber blk)
+{
+	return lion_dir_readbuf_ext(index, blk, NULL);
 }
 
 /*
@@ -353,11 +367,12 @@ lion_dir_downlink_block(Relation index, Page page, BlockNumber blk,
  * right needs no coupling: items only ever move rightwards, so a page that
  * splits under us puts what we are looking for on a page we have not passed.
  * walk is the walk along the level this step belongs to, which a cycle of
- * damaged right links ends in an ERROR (lion.h).
+ * damaged right links ends in an ERROR (lion.h).  The sibling is read
+ * through strategy: NULL, or VACUUM's (lion_dir_readbuf()).
  */
 Buffer
-lion_dir_step_right(Relation index, Buffer buf, int lockmode,
-					LionRightWalk *walk)
+lion_dir_step_right_ext(Relation index, Buffer buf, int lockmode,
+						LionRightWalk *walk, BufferAccessStrategy strategy)
 {
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
 	int			level = LionPageGetOpaque(BufferGetPage(buf))->level;
@@ -372,12 +387,19 @@ lion_dir_step_right(Relation index, Buffer buf, int lockmode,
 	 * links would then not even answer a cancel (see lion_dir_search()).
 	 */
 	CHECK_FOR_INTERRUPTS();
-	nbuf = lion_dir_readbuf(index, next);
+	nbuf = lion_dir_readbuf_ext(index, next, strategy);
 	LockBuffer(nbuf, lockmode);
 	lion_dir_check_page(index, BufferGetPage(nbuf), next);
 	lion_dir_check_level(index, BufferGetPage(nbuf), next, level);
 
 	return nbuf;
+}
+
+Buffer
+lion_dir_step_right(Relation index, Buffer buf, int lockmode,
+					LionRightWalk *walk)
+{
+	return lion_dir_step_right_ext(index, buf, lockmode, walk, NULL);
 }
 
 /*
@@ -708,14 +730,15 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
  * one record (lion_dir_split()), and nothing ever makes the directory
  * shorter.  So the meta page is read again for as long as the height it names
  * keeps growing, and only one that names the same height as before, with a
- * page that is not the root, is damage.  This used to allow a single refresh,
- * which turned a root split racing it into a spurious ERROR (2026-09-27
- * review).  nbtree's _bt_getroot() would instead descend from the demoted
- * page, which is correct for a search but not for lion_dir_find_parent(),
- * whose parent may be on the new level above it.
+ * page that is not the root, is damage: a bound on the refreshes would turn
+ * a run of root splits racing it into a spurious ERROR.  nbtree's
+ * _bt_getroot() would instead descend from the demoted page, which is
+ * correct for a search but not for lion_dir_find_parent(), whose parent may
+ * be on the new level above it.
  */
 static Buffer
-lion_dir_get_root(Relation index, LionIndexState *ix)
+lion_dir_get_root(Relation index, LionIndexState *ix,
+				  BufferAccessStrategy strategy)
 {
 	BlockNumber blk;
 	uint32		height = 0;
@@ -731,7 +754,7 @@ lion_dir_get_root(Relation index, LionIndexState *ix)
 
 	for (;;)
 	{
-		Buffer		buf = lion_dir_readbuf(index, blk);
+		Buffer		buf = lion_dir_readbuf_ext(index, blk, strategy);
 		Page		page;
 		BlockNumber newblk;
 		uint32		newheight;
@@ -763,7 +786,15 @@ lion_dir_get_root(Relation index, LionIndexState *ix)
 BlockNumber
 lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 {
-	Buffer		buf = lion_dir_get_root(index, ix);
+	return lion_dir_leftmost_leaf_ext(index, ix, NULL);
+}
+
+/* ... with every page but the meta page read through strategy */
+BlockNumber
+lion_dir_leftmost_leaf_ext(Relation index, LionIndexState *ix,
+						   BufferAccessStrategy strategy)
+{
+	Buffer		buf = lion_dir_get_root(index, ix, strategy);
 
 	for (;;)
 	{
@@ -782,12 +813,12 @@ lion_dir_leftmost_leaf(Relation index, LionIndexState *ix)
 		UnlockReleaseBuffer(buf);
 
 		CHECK_FOR_INTERRUPTS();
-		buf = lion_dir_readbuf(index, child);
+		buf = lion_dir_readbuf_ext(index, child, strategy);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 		/* the first downlink was taken without a key: §21, "Page deletion" */
-		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
+		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE, strategy);
 	}
 }
 
@@ -831,10 +862,16 @@ lion_dir_note_parent(Page page, BlockNumber blk, LionDirParent *parent)
 	}
 }
 
+/*
+ * The descent of lion_dir_search() and lion_dir_search_from(), with each page
+ * read through strategy: NULL, or VACUUM's (lion_dir_readbuf()).  The split
+ * a writer finishes on the way reads without it, as every write does.
+ */
 static Buffer
-lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
-					const LionSearchKey *sk, int lockmode, bool forwrite,
-					OffsetNumber *offp, LionDirParent *parent)
+lion_dir_descend(Relation index, Relation heaprel, LionIndexState *ix,
+				 const LionSearchKey *sk, int lockmode, bool forwrite,
+				 OffsetNumber *offp, LionDirParent *parent,
+				 BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 
@@ -849,7 +886,7 @@ lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
 		 */
 		BlockNumber start = parent->blk;
 
-		buf = lion_dir_readbuf(index, start);
+		buf = lion_dir_readbuf_ext(index, start, strategy);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		lion_dir_check_page(index, BufferGetPage(buf), start);
 		lion_dir_check_level(index, BufferGetPage(buf), start, 1);
@@ -860,7 +897,7 @@ lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
 		if (parent != NULL)
 			parent->blk = InvalidBlockNumber;
 restart:
-		buf = lion_dir_get_root(index, ix);
+		buf = lion_dir_get_root(index, ix, strategy);
 
 		if (LionPageIsLeaf(BufferGetPage(buf)) && lockmode != BUFFER_LOCK_SHARE)
 		{
@@ -928,7 +965,8 @@ restart:
 			if (lion_cmp_entry(lion_page_highkey(page), sk) > 0)
 				break;
 
-			buf = lion_dir_step_right(index, buf, pagelock, &walk);
+			buf = lion_dir_step_right_ext(index, buf, pagelock, &walk,
+										  strategy);
 		}
 		page = BufferGetPage(buf);
 
@@ -955,7 +993,7 @@ restart:
 		 * refuses - did not answer even statement_timeout, only SIGKILL.
 		 */
 		CHECK_FOR_INTERRUPTS();
-		buf = lion_dir_readbuf(index, child);
+		buf = lion_dir_readbuf_ext(index, child, strategy);
 		LockBuffer(buf, childlock);
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
@@ -967,8 +1005,17 @@ lion_dir_search(Relation index, Relation heaprel, LionIndexState *ix,
 				const LionSearchKey *sk, int lockmode, bool forwrite,
 				OffsetNumber *offp)
 {
-	return lion_dir_search_ext(index, heaprel, ix, sk, lockmode, forwrite,
-							   offp, NULL);
+	return lion_dir_descend(index, heaprel, ix, sk, lockmode, forwrite, offp,
+							NULL, NULL);
+}
+
+Buffer
+lion_dir_search_ext(Relation index, Relation heaprel, LionIndexState *ix,
+					const LionSearchKey *sk, int lockmode, bool forwrite,
+					OffsetNumber *offp, BufferAccessStrategy strategy)
+{
+	return lion_dir_descend(index, heaprel, ix, sk, lockmode, forwrite, offp,
+							NULL, strategy);
 }
 
 Buffer
@@ -976,8 +1023,8 @@ lion_dir_search_from(Relation index, LionIndexState *ix,
 					 const LionSearchKey *sk, LionDirParent *parent,
 					 OffsetNumber *offp)
 {
-	return lion_dir_search_ext(index, NULL, ix, sk, BUFFER_LOCK_SHARE, false,
-							   offp, parent);
+	return lion_dir_descend(index, NULL, ix, sk, BUFFER_LOCK_SHARE, false,
+							offp, parent, NULL);
 }
 
 /*
@@ -1053,7 +1100,7 @@ Buffer
 lion_dir_search_level(Relation index, LionIndexState *ix,
 					  const LionSearchKey *sk, uint16 level)
 {
-	Buffer		buf = lion_dir_get_root(index, ix);
+	Buffer		buf = lion_dir_get_root(index, ix, NULL);
 
 	if (LionPageGetOpaque(BufferGetPage(buf))->level < level)
 	{
@@ -1099,20 +1146,21 @@ lion_dir_search_level(Relation index, LionIndexState *ix,
  * The cross-type fallback of DESIGN.md §21: an opfamily that offers
  * cross-type equality but no cross-type ordering cannot be descended for such
  * a value, so every leaf is walked instead.  Correct, and linear in the
- * directory; none of pg_lion's own opclasses take this path.
+ * directory; none of pg_lion's own opclasses take this path.  Each page is
+ * read through strategy (lion_dir_readbuf()).
  */
 static bool
 lion_dir_find_by_scan(Relation index, LionIndexState *ix,
 					 const LionSearchKey *sk, int lockmode, Buffer *bufp,
-					 OffsetNumber *offnum)
+					 OffsetNumber *offnum, BufferAccessStrategy strategy)
 {
-	BlockNumber blk = lion_dir_leftmost_leaf(index, ix);
+	BlockNumber blk = lion_dir_leftmost_leaf_ext(index, ix, strategy);
 	LionRightWalk walk;
 
 	lion_rightwalk_init(&walk);
 	while (BlockNumberIsValid(blk))
 	{
-		Buffer		buf = lion_dir_readbuf(index, blk);
+		Buffer		buf = lion_dir_readbuf_ext(index, blk, strategy);
 		Page		page;
 		OffsetNumber off;
 		OffsetNumber maxoff;
@@ -1171,11 +1219,13 @@ lion_dir_find_by_scan(Relation index, LionIndexState *ix,
  * link does to it have to be caught here: a link to buf or to the guard
  * would lock a page this backend holds and wait for itself for ever, and is
  * refused before the lock; and a cycle that avoids both would go round with
- * interrupts held off, until the walk's bound refuses it (lion.h).
+ * interrupts held off, until the walk's bound refuses it (lion.h).  The
+ * sibling is read through strategy (lion_dir_readbuf()).
  */
 static Buffer
 lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
-							int lockmode, bool keep, LionRightWalk *walk)
+							int lockmode, bool keep, LionRightWalk *walk,
+							BufferAccessStrategy strategy)
 {
 	BlockNumber blk = BufferGetBlockNumber(buf);
 	BlockNumber next = LionPageGetOpaque(BufferGetPage(buf))->rightlink;
@@ -1187,7 +1237,7 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
 		lion_dir_held_link(index, blk, next);
 	lion_rightwalk_step(index, walk, blk, next);
 
-	nbuf = lion_dir_readbuf(index, next);
+	nbuf = lion_dir_readbuf_ext(index, next, strategy);
 	LockBuffer(nbuf, lockmode);
 	lion_dir_check_page(index, BufferGetPage(nbuf), next);
 	lion_dir_check_level(index, BufferGetPage(nbuf), next,
@@ -1221,11 +1271,14 @@ lion_dir_step_right_coupled(Relation index, Buffer buf, Buffer guard,
  * locked, and the scan couples its steps right.  Every writer of a key of
  * this prefix starts on that same page, so holding it serialises them.
  * *guardp is InvalidBuffer when the scan never left its first page.
+ *
+ * Each page right of the first is read through strategy (lion_dir_readbuf()).
  */
 static bool
 lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 					  int lockmode, Buffer *bufp, OffsetNumber *offp,
-					  bool *movedright, Buffer *guardp)
+					  bool *movedright, Buffer *guardp,
+					  BufferAccessStrategy strategy)
 {
 	Buffer		buf = *bufp;
 	OffsetNumber off = *offp;
@@ -1300,10 +1353,11 @@ lion_dir_scan_run_ext(Relation index, const LionSearchKey *sk,
 			if (keep)
 				*guardp = buf;
 			buf = lion_dir_step_right_coupled(index, buf, *guardp, lockmode,
-											  keep, &walk);
+											  keep, &walk, strategy);
 		}
 		else
-			buf = lion_dir_step_right(index, buf, lockmode, &walk);
+			buf = lion_dir_step_right_ext(index, buf, lockmode, &walk,
+										  strategy);
 		off = lion_page_first_data(BufferGetPage(buf));
 		moved = true;
 	}
@@ -1322,13 +1376,23 @@ lion_dir_scan_run(Relation index, const LionSearchKey *sk,
 				  bool *movedright)
 {
 	return lion_dir_scan_run_ext(index, sk, lockmode, bufp, offp, movedright,
-								 NULL);
+								 NULL, NULL);
 }
 
 bool
 lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 			  const LionSearchKey *sk, int lockmode, bool forwrite,
 			  Buffer *bufp, OffsetNumber *offnum, bool *movedright)
+{
+	return lion_dir_find_ext(index, heaprel, ix, sk, lockmode, forwrite, bufp,
+							 offnum, movedright, NULL);
+}
+
+bool
+lion_dir_find_ext(Relation index, Relation heaprel, LionIndexState *ix,
+				  const LionSearchKey *sk, int lockmode, bool forwrite,
+				  Buffer *bufp, OffsetNumber *offnum, bool *movedright,
+				  BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	OffsetNumber off;
@@ -1339,10 +1403,12 @@ lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 	if (sk->col->ordered && sk->cmpproc == NULL && sk->kind == LION_KIND_VALUE)
 	{
 		Assert(!forwrite);
-		return lion_dir_find_by_scan(index, ix, sk, lockmode, bufp, offnum);
+		return lion_dir_find_by_scan(index, ix, sk, lockmode, bufp, offnum,
+									 strategy);
 	}
 
-	buf = lion_dir_search(index, heaprel, ix, sk, lockmode, forwrite, &off);
+	buf = lion_dir_descend(index, heaprel, ix, sk, lockmode, forwrite, &off,
+						   NULL, strategy);
 
 	*bufp = buf;
 	*offnum = off;
@@ -1364,7 +1430,7 @@ lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 		 * second time before this one has placed it.
 		 */
 		found = lion_dir_scan_run_ext(index, sk, lockmode, bufp, offnum,
-									  &moved, &guard);
+									  &moved, &guard, strategy);
 		if (movedright != NULL)
 			*movedright = moved;
 		if (!BufferIsValid(guard))
@@ -1381,7 +1447,8 @@ lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 		return false;
 	}
 
-	return lion_dir_scan_run(index, sk, lockmode, bufp, offnum, movedright);
+	return lion_dir_scan_run_ext(index, sk, lockmode, bufp, offnum, movedright,
+								 NULL, strategy);
 }
 
 /*
@@ -1515,7 +1582,7 @@ lion_dir_step_left(Relation index, Buffer buf, int maxsteps)
 		LionRightWalk walk;
 
 		/* a page deleted under the walk: its range went right */
-		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
+		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE, NULL);
 		page = BufferGetPage(buf);
 		cur = BufferGetBlockNumber(buf);
 		left = LionPageGetOpaque(page)->leftlink;
@@ -1731,8 +1798,7 @@ StaticAssertDecl(MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData) +
  * terminates because every split moves at least one item off the page and a
  * page holding one item plus the new one always splits.
  *
- * *(This replaces an error branch, reported by the 2026-09-22 review of §21.
- * With today's size caps the shape is in fact unreachable - a fresh entry is
+ * *(With today's size caps the shape is in fact unreachable - a fresh entry is
  * its key and one row's container, a little over 2 kB at most on a page, and
  * a replacement grows by at most a few dozen, and either way a cut exists -
  * but that rests on three independent constants
@@ -2431,7 +2497,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 	LionRightWalk walk;
 
 	/* Descend to the level above the child, reading only. */
-	buf = lion_dir_get_root(index, ix);
+	buf = lion_dir_get_root(index, ix, NULL);
 	if (LionPageGetOpaque(BufferGetPage(buf))->level <= childlevel)
 	{
 		UnlockReleaseBuffer(buf);
@@ -2481,7 +2547,7 @@ lion_dir_find_parent(Relation index, Relation heaprel, LionIndexState *ix,
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 		if (sk == NULL)
-			buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE);
+			buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE, NULL);
 	}
 
 	/*
@@ -2604,7 +2670,7 @@ lion_dir_add_entry(Relation index, Relation heaprel, LionIndexState *ix,
 			}
 			buf = lion_dir_step_right_coupled(index, buf, guard,
 											  BUFFER_LOCK_EXCLUSIVE,
-											  buf == guard, &walk);
+											  buf == guard, &walk, NULL);
 		}
 		off = lion_dir_binsrch(BufferGetPage(buf), &exact);
 	}

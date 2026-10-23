@@ -1762,8 +1762,14 @@ extern int	lion_cmp_entries(LionIndexState *ix, const LionEntryTuple *a,
 /* The root block of the directory, refreshing the cached copy if need be. */
 extern BlockNumber lion_dir_root(Relation index, LionIndexState *ix,
 								uint32 *height);
-/* The leftmost leaf, where an ordered walk of every entry starts. */
+/*
+ * The leftmost leaf, where an ordered walk of every entry starts.  _ext reads
+ * every page but the meta page through strategy: VACUUM's (info->strategy),
+ * whose walk starts there (DESIGN.md §18).
+ */
 extern BlockNumber lion_dir_leftmost_leaf(Relation index, LionIndexState *ix);
+extern BlockNumber lion_dir_leftmost_leaf_ext(Relation index, LionIndexState *ix,
+											  BufferAccessStrategy strategy);
 
 /*
  * The leaf where key column `col`'s run of entries begins, and the offset of
@@ -1842,6 +1848,16 @@ lion_page_entry(Page page, OffsetNumber off)
 extern Buffer lion_dir_search(Relation index, Relation heaprel,
 							 LionIndexState *ix, const LionSearchKey *sk,
 							 int lockmode, bool forwrite, OffsetNumber *offp);
+/*
+ * The same with every page but the meta page read through strategy: VACUUM's
+ * (info->strategy), which finds a summary again this way after an insert
+ * moved it (DESIGN.md §18).  A split it finishes on the way reads without it.
+ */
+extern Buffer lion_dir_search_ext(Relation index, Relation heaprel,
+								  LionIndexState *ix, const LionSearchKey *sk,
+								  int lockmode, bool forwrite,
+								  OffsetNumber *offp,
+								  BufferAccessStrategy strategy);
 
 /*
  * The level-1 page a read-only descent took its leaf's downlink from, for a
@@ -1905,11 +1921,23 @@ extern Buffer lion_dir_search_level(Relation index, LionIndexState *ix,
 extern bool lion_dir_find(Relation index, Relation heaprel, LionIndexState *ix,
 						 const LionSearchKey *sk, int lockmode, bool forwrite,
 						 Buffer *buf, OffsetNumber *offnum, bool *movedright);
+/* ... reading through strategy, as lion_dir_search_ext() does */
+extern bool lion_dir_find_ext(Relation index, Relation heaprel,
+							 LionIndexState *ix, const LionSearchKey *sk,
+							 int lockmode, bool forwrite, Buffer *buf,
+							 OffsetNumber *offnum, bool *movedright,
+							 BufferAccessStrategy strategy);
 
-/* The pieces of the above, for a caller that walks the leaves itself. */
+/*
+ * The pieces of the above, for a caller that walks the leaves itself; _ext
+ * reads the sibling through strategy.
+ */
 extern LionEntryTuple *lion_dir_highkey(Page page);
 extern Buffer lion_dir_step_right(Relation index, Buffer buf, int lockmode,
 								  LionRightWalk *walk);
+extern Buffer lion_dir_step_right_ext(Relation index, Buffer buf, int lockmode,
+									  LionRightWalk *walk,
+									  BufferAccessStrategy strategy);
 extern Buffer lion_dir_read_leaf(Relation index, BlockNumber blk);
 extern OffsetNumber lion_dir_binsrch(Page page, const LionSearchKey *sk);
 extern bool lion_dir_scan_run(Relation index, const LionSearchKey *sk,
@@ -1954,12 +1982,14 @@ extern void lion_dir_delete(Relation index, Buffer buf, OffsetNumber *offs,
  * lion_dir_past_deleted() hands back buf, a directory page locked in
  * lockmode, or - when that page is DELETED - the first page to its right that
  * is not, for the walks that take a downlink without comparing a key with the
- * page's high key.
+ * page's high key; the pages it steps to are read through strategy (NULL, or
+ * VACUUM's).
  */
 extern int	lion_dir_delete_page(Relation index, LionIndexState *ix,
 								 BlockNumber leafblk,
 								 BufferAccessStrategy strategy);
-extern Buffer lion_dir_past_deleted(Relation index, Buffer buf, int lockmode);
+extern Buffer lion_dir_past_deleted(Relation index, Buffer buf, int lockmode,
+									BufferAccessStrategy strategy);
 
 /* The safexid a DELETED directory page keeps in its special area. */
 static inline FullTransactionId
@@ -2752,10 +2782,13 @@ extern void lion_entry_spill_pos(Relation index, Relation heaprel,
  * Does `head` name the live root of a posting set whose key hashes to `hash`?
  * What tells a leaf that an interrupted multi-leaf spill left behind - its
  * root was never written - from a leaf of a set that exists (DESIGN.md §18).
- * wait = false never blocks and answers true when the root is busy.
+ * wait = false never blocks and answers true when the root is busy.  The root
+ * is read through strategy: VACUUM's sweep passes its own (info->strategy),
+ * lion_index_verify() NULL.
  */
 extern bool lion_posting_root_live(Relation index, uint32 hash,
-								   BlockNumber head, bool wait);
+								   BlockNumber head, bool wait,
+								   BufferAccessStrategy strategy);
 
 
 /* ---------- additive helpers (wave 3, write path) ---------- */

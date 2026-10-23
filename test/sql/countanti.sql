@@ -456,6 +456,30 @@ VACUUM (ANALYZE) lca_many;
 SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many m WHERE m.a = r.id)');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_many m WHERE m.a = r.id)');
 DROP TABLE lca_many;
+-- ... but for a hundred and fifty: a row found is a read of a heap page the
+-- cache holds, not a page at random_page_cost (lion_anti_price())
+CREATE TABLE lca_some (a int NOT NULL);
+INSERT INTO lca_some SELECT i * 2 FROM generate_series(1, 150) i;
+VACUUM (ANALYZE) lca_some;
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_some m WHERE m.a = r.id)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_some m WHERE m.a = r.id)');
+DROP TABLE lca_some;
+-- a key of two columns that go together, k and kn: a lookup of a pair finds
+-- its 50 rows, which the product of the columns' n_distinct, 400 x 400 over
+-- 20,000 rows, makes one; CREATE STATISTICS's n_distinct of the pair says
+-- 400 (lion_anti_key_values())
+CREATE INDEX lca_rows_kkn ON lca_rows (k, kn);
+CREATE TABLE lca_pairs (a int, b int);
+INSERT INTO lca_pairs SELECT i, i FROM generate_series(1, 100) i;
+VACUUM (ANALYZE) lca_pairs;
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_pairs p WHERE p.a = r.k AND p.b = r.kn)');
+CREATE STATISTICS lca_rows_kkn_st (ndistinct) ON k, kn FROM lca_rows;
+ANALYZE lca_rows;
+SELECT lca_pick('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_pairs p WHERE p.a = r.k AND p.b = r.kn)');
+SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x < 5 AND NOT EXISTS (SELECT 1 FROM lca_pairs p WHERE p.a = r.k AND p.b = r.kn)');
+DROP STATISTICS lca_rows_kkn_st;
+DROP INDEX lca_rows_kkn;
+DROP TABLE lca_pairs;
 -- a LEFT JOIN ... IS NULL, and a NOT IN over a nullable column
 SELECT lca('SELECT count(*) FROM lca_rows r LEFT JOIN lca_skip s ON s.a = r.k WHERE r.x = 3 AND s.a IS NULL');
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.x = 3 AND r.k NOT IN (SELECT s.a FROM lca_skip s WHERE s.f = 0 AND s.a IS NOT NULL)');
@@ -565,6 +589,14 @@ SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXI
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
 SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k)');
 SELECT lca_counters('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b = t.k) GROUP BY tier');
+-- a correlation that reads a predicate the cells evaluate: EXPLAIN shows
+-- the predicate as it is written, and a row's truths are evaluated for the
+-- clause before its cell is known
+SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x = 1) GROUP BY tier') AS ln
+	WHERE ln ~ 'Join Cond|Cell Columns';
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x = 1) GROUP BY tier');
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND (t.g IN (2, 3) OR s.f = 0)) GROUP BY tier');
+SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''mid'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND t.x IN (2, 3))');
 -- inner keys of no row, of rows the WHERE leaves out, NULL keys and
 -- duplicates; an empty inner side
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.a IN (450, -1)) GROUP BY tier');
@@ -627,13 +659,19 @@ VACUUM (FREEZE, ANALYZE) lca_rows;
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
 SELECT lca('SELECT count(*) FROM lca_tiered t WHERE t.tier = ''high'' AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k)');
 -- in parallel: every participant runs the child and looks the keys up, and
--- takes away the rows of the ranges it counts
+-- takes away the rows of the ranges it counts - priced as the participants'
+-- runs of it all, which here outweigh their shares of the count of 20,000
+-- rows: the serial node (lion_add_parallel_cells_path())
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
+SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
+-- ... and, with the pages the lookups read priced low, the parallel node
+SET random_page_cost = 0.1;
+SET seq_page_cost = 0.1;
 SELECT * FROM lca_explain('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier') AS ln
 	WHERE ln !~ 'Group Key';
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k) GROUP BY tier');
@@ -672,6 +710,8 @@ SELECT (SELECT count(*) FROM (TABLE lca_par_on EXCEPT ALL
 		EXCEPT ALL TABLE lca_par_on) b) AS rows_differ;
 RESET pg_lion.enable_count_pushdown;
 DROP TABLE lca_par_on;
+RESET random_page_cost;
+RESET seq_page_cost;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
@@ -722,7 +762,12 @@ SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
 SET pg_lion.parallel_range_keys = 1;
 SELECT lca('SELECT count(*) FROM lca_rows r WHERE r.y IN (1, 2, 3) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = r.k AND s.b / r.y > 1)');
+-- ... the count by cells with the pages priced low, as in 9.
+SET random_page_cost = 0.1;
+SET seq_page_cost = 0.1;
 SELECT lca('SELECT tier, count(*) FROM lca_tiered t WHERE t.y IN (1, 2, 3) AND NOT EXISTS (SELECT 1 FROM lca_skip s WHERE s.a = t.k AND s.b / t.y > 1) GROUP BY tier');
+RESET random_page_cost;
+RESET seq_page_cost;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
@@ -905,6 +950,10 @@ SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND length(r.pad) > 0 A
 SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE r.x = 3 AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k)');
 SELECT lca('SELECT count(*) FROM lca_big r WHERE r.x IN (4, 8) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
 SELECT lca_spilled('SELECT count(*) FROM lca_big r WHERE r.x IN (4, 8) AND length(r.pad) > 0 AND NOT EXISTS (SELECT 1 FROM lca_many s WHERE s.a = r.k AND s.b > r.g + r.x * 700)');
+-- ... and beside a count by cells, without the leader taking part: every
+-- participant's run of the lookups, which find every row of the table, is
+-- then a worker's to itself (lion_add_parallel_cells_path())
+SET parallel_leader_participation = off;
 SELECT ln FROM lca_bigcells, lca_explain(q) AS ln WHERE ln ~ 'Parallel';
 SELECT lca(q) FROM lca_bigcells;
 SELECT lca_spilled(q) ~ 'keys.*ranges' AS spilled FROM lca_bigcells;
@@ -916,6 +965,7 @@ SET max_parallel_workers_per_gather = 0;
 SELECT ln FROM lca_bigcells,
 	lca_explain(q, 'ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF') AS ln
  WHERE ln ~ 'Join Rows Subtracted';
+RESET parallel_leader_participation;
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
