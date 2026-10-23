@@ -530,7 +530,7 @@ lion_verify_recheck(LionVerifyState *vs)
 		if (lion_verify_confirm(vs, blk, roots, nroots, rootfound))
 			continue;
 
-		switch (lion_verify_classify(vs, blk))
+		switch (lion_verify_classify(vs, blk, NULL))
 		{
 			case LION_UNREF_FREE:
 				break;

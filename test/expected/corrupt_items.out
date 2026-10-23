@@ -800,6 +800,40 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
  ok
 (1 row)
 
+-- A backend that has read the index - this one, now, by a count - keeps
+-- its state, meta page words and all, and does not read the meta page
+-- again to use it (lion_get_index_state()).  The statistics and VACUUM
+-- read the page for what they count, and refuse a version changed under
+-- that state there (lion_meta_check_version()).
+SELECT lion_index_count('lion_di_old_i', 1) > 0 AS warm;
+ warm 
+------
+ t
+(1 row)
+
+SELECT lion_di_evict('lion_di_old_i');
+ lion_di_evict 
+---------------
+ 
+(1 row)
+
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
+ lion_di_poke 
+--------------
+ 
+(1 row)
+
+SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
+                                 lion_di_hint                                 
+------------------------------------------------------------------------------
+ XX002: REINDEX the index: its on-disk format predates this build of pg_lion.
+(1 row)
+
+VACUUM lion_di;
+ERROR:  index "lion_di_old_i" is not a valid lion index
+DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14.
+HINT:  REINDEX the index: its on-disk format predates this build of pg_lion.
+CONTEXT:  while cleaning up index "lion_di_old_i" of relation "public.lion_di"
 DROP INDEX lion_di_old_i;
 DROP FUNCTION lion_di_hint(text);
 -- ---------- 11. an entry whose line pointer reaches into a CHAIN entry ----------

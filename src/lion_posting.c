@@ -1901,8 +1901,10 @@ lion_posting_finish_split_ext(Relation index, Relation heaprel, uint32 hash,
 	Assert(LionPageIncompleteSplit(ppage));
 
 	if (pblk == head || !BlockNumberIsValid(rblk))
-		elog(ERROR, "lion index \"%s\": block %u is flagged as an incomplete split but has no right sibling to link",
-			 RelationGetRelationName(index), pblk);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lion index \"%s\": block %u is flagged as an incomplete split but has no right sibling to link",
+						RelationGetRelationName(index), pblk)));
 	if (rblk == pblk)
 		lion_posting_held(index, head, rblk);	/* its own right sibling */
 
@@ -2012,6 +2014,15 @@ lion_posting_finish_split_ext(Relation index, Relation heaprel, uint32 hash,
 	}
 
 	UnlockReleaseBuffer(parent);
+
+	/*
+	 * Test hook: the downlink is in place and the flag not yet cleared, with
+	 * pbuf held EXCLUSIVE.  test/isolation/verify_incomplete_split.spec
+	 * attaches 'error' here: the flag outlives the split with the downlink
+	 * in place, the state lion_index_verify() warns of and the next writer
+	 * whose descent passes through the page clears.
+	 */
+	LION_INJECTION_POINT("lion-posting-split-placed");
 
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);

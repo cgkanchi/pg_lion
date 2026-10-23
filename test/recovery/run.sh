@@ -2411,7 +2411,8 @@ phase2() {
 # leaves of a posting set instead (standby_verify_aba()).
 
 # PHASE3_CASES (environment, a development aid) runs a subset of the cases.
-want_case() { case " ${PHASE3_CASES:-split pushdown spill setaba} " in *" $1 "*) return 0 ;; esac; return 1; }
+want_case() { case " ${PHASE3_CASES:-split pushdown spill setaba $PHASE3_VERIFY_CASES} " in *" $1 "*) return 0 ;; esac; return 1; }
+PHASE3_VERIFY_CASES="vunlink vfree vreach vdownlink vleftlink vsummary vsplitdir vsplitpost"
 
 # standby_pin_case <label> <index> <key> <expected> <sql to run on the primary>
 standby_pin_case() {
@@ -2498,8 +2499,10 @@ standby_pin_case() {
 # the entry's header - ntids, containers, head and tail - as it was, and a
 # walk that read the first leaf before the one and the last after the other
 # counts a TID more than the entry says.  Agreeing with the entry is not
-# what such a walk must be judged by; it is walked again, and the walk that
-# read every page as it was at one replay position settles the set.
+# what such a walk must be judged by: it is kept for what it checked of the
+# pages, and its totals are counted again, a pass that reads the set's
+# leaves alone, and the pass that read every page as it was at one replay
+# position settles them (lion_verify_set_count()).
 #
 # k = 1 is every other row of 2020 wide ones, heap blocks 0..134: one CHAIN
 # set of three containers, which posting_fillfactor 10 spreads over two
@@ -2510,8 +2513,8 @@ standby_pin_case() {
 # ('lion-verify-set-leaf-read'); the primary inserts a row of k = 1, which
 # the free space map puts on the last heap page and the set into its last
 # container, on the second leaf, and a VACUUM takes row 1 out; the standby
-# replays both, and the check goes on.  It must pass, its first walk thrown
-# away.
+# replays both, and the check goes on.  It must pass, the totals of its one
+# walk settled by a counting pass.
 standby_verify_aba() {
 	local out=$BASE/setaba.out err=$BASE/setaba.err rpid rc=0 before after plsn i n state=""
 	log ""
@@ -2589,13 +2592,405 @@ standby_verify_aba() {
 	{ echo "---- standby_verify_aba (exit $rc)"; cat "$out" "$err"; } >>"$RUNLOG"
 	[ "$rc" = 0 ] && grep -q '^verified true$' "$out" ||
 		die "BUG: standby_verify_aba: the standby's check reported damage replay left it: $(grep -v '^DEBUG' "$err" | tail -3)"
-	grep -q '2 posting-set walks, 1 thrown away, 0 with the leaf held, 0 kept uncompared' "$err" ||
-		die "standby_verify_aba: the check did not walk the set again: $(grep 'posting-set walks' "$err")"
+	grep -q '1 posting-set walks, 0 thrown away, 0 with the leaf held, 1 counting passes, 0 kept uncompared' "$err" ||
+		die "standby_verify_aba: the check did not count the set again: $(grep 'posting-set walks' "$err")"
 
 	psql_p -c "DROP TABLE vfy_aba" >>"$RUNLOG" 2>&1
 	wait_catchup
-	log "   setaba: a set replay changed under the check, its entry as it was ($after), walked again and passed"
-	SUMMARY+=("phase3 setaba  a standby's check walked a set again that replay changed, its entry unchanged")
+	log "   setaba: a set replay changed under the check, its entry as it was ($after), counted again and passed"
+	SUMMARY+=("phase3 setaba  a standby's check counted a set again that replay changed, its entry unchanged")
+}
+
+# ---- a standby's check beside the states replay passes through
+#
+# The rest of phase 3 sets up, one at a time and at an injection point, the
+# states a standby's lion_index_verify() meets and a primary's never does
+# (DESIGN.md §7, "verify() on a standby"; R-S1 to R-S5 of the 2026-10-23
+# review).  A primary's check locks VACUUM out and waits for the writers
+# beside it; a standby's can do neither: replay applies VACUUM's records
+# beside it, and every operation the primary writes in more than one record
+# - a split, a row's key and its summary - shows the states between its
+# records to the standby's readers for as long as the primary takes.  Every
+# case has the check pass, and none has it warn of an unfinished split that
+# is not abandoned; the last has an abandoned one, which it must warn of.
+#
+#   vunlink    the check parks after a posting set's first leaf, and a VACUUM
+#              takes the emptied second leaf out of the set (UNLINKED) under
+#              it: the walk reads it so, past the replay position it began
+#              at, and walks again (lion_verify_tree_page()).
+#   vfree      ... and a VACUUM that removed the key's every row frees the
+#              set and its entry: the check of the set ends there
+#              (lion_verify_refind()).
+#   vreach     the check parks before its reachability pass, and a split of
+#              a directory leaf takes a page out of the free space map that
+#              no walk reached: its LSN is past the position the check began
+#              at, and it is not reported (lion_verify_reachable()).
+#   vdownlink  the check parks after the directory's leaves, and the split's
+#              downlink, on a parent past that position, names a leaf the
+#              walk did not reach (lion_verify_filter_downlinks()).
+#   vleftlink  the check parks on the first leaf, and the split of that leaf
+#              changes the left link of the page after it, which the walk
+#              reads past the position (lion_verify_walk_level()).
+#   vsummary   an INSERT parks on the primary between its row's key and its
+#              summary (lion-insert-before-summary): its transaction is in
+#              progress, and its row is no candidate (lion_verify_settle()).
+#   vsplitdir  a directory leaf split parks on the primary between its first
+#              record and its downlink: the flag the check sees is a split in
+#              progress, and it is not warned of; the check parks before it
+#              looks at the flagged page again, the split finishes, and it is
+#              not warned of either (lion_verify_flags_recheck()); then a
+#              split that fails there (an error) is warned of.
+#   vsplitpost the same for a split of a posting leaf, without the re-look.
+#
+# Each table is the case's own and is dropped after it.
+
+# sv_sync: the standby has replayed everything the primary wrote.  The commit
+# is what flushes - and so sends - WAL that a writer parked in the middle of
+# its transaction has only inserted.
+sv_sync() {
+	psql_p -c "SET synchronous_commit = on; SELECT pg_current_xact_id()" >>"$RUNLOG" 2>&1 ||
+		die "sv_sync: the primary's commit failed"
+	wait_catchup
+}
+
+# sv_park <label> <point> <index>: a standby lion_index_verify() of <index>
+# in the background, parked at <point>; it prints "verified true" in
+# $BASE/sv_<label>.out when it returns, and its messages go to .err.
+sv_park() {
+	local label=$1 point=$2 idx=$3
+	SV_LABEL=$label
+	SV_OUT=$BASE/sv_$label.out
+	SV_ERR=$BASE/sv_$label.err
+	"$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$STANDBY_PORT" \
+		-U postgres -d "$DBNAME" >"$SV_OUT" 2>"$SV_ERR" <<-SQL &
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('$point', 'wait');
+		SET client_min_messages = debug1;
+		SELECT 'verified ' || (lion_index_verify('$idx'::regclass) IS NOT NULL);
+	SQL
+	SV_PID=$!
+	RRPID=$SV_PID
+	wait_true psql_s \
+		"select count(*) > 0 from pg_stat_activity where wait_event = '$point'" \
+		30 "$label: the standby's check to park at $point"
+}
+
+# sv_release <point>: let the parked check go for good, and wait for it.
+sv_release() {
+	local point=$1 i n
+	SV_RC=0
+	psql_s -tAc "select injection_points_detach('$point')" >/dev/null 2>&1 || true
+	for i in $(seq 1 100); do
+		n=$(psql_s -tAc "select count(*) from pg_stat_activity where wait_event = '$point'")
+		[ "$n" = 0 ] && break
+		psql_s -tAc "select injection_points_wakeup('$point')" >/dev/null 2>&1 || true
+		nap 0.1
+	done
+	wait "$SV_PID" || SV_RC=$?
+	RRPID=""
+}
+
+# sv_now <label> <index> [heapallindexed]: a standby lion_index_verify() of
+# <index>, run to its end, into the same files.
+sv_now() {
+	local label=$1 idx=$2 hai=${3:-false}
+	SV_LABEL=$label
+	SV_OUT=$BASE/sv_$label.out
+	SV_ERR=$BASE/sv_$label.err
+	SV_RC=0
+	psql_s -At -c "SET client_min_messages = debug1" \
+		-c "SELECT 'verified ' || (lion_index_verify('$idx'::regclass, $hai) IS NOT NULL)" \
+		>"$SV_OUT" 2>"$SV_ERR" || SV_RC=$?
+}
+
+# sv_judge <warn>: the last check passed, and with <warn> "none" gave no
+# WARNING, with "split" warned of an unfinished split.
+sv_judge() {
+	local warn=$1
+	{ echo "---- standby case $SV_LABEL (exit $SV_RC)"; cat "$SV_OUT" "$SV_ERR"; } >>"$RUNLOG"
+	[ "$SV_RC" = 0 ] && grep -q '^verified true$' "$SV_OUT" ||
+		die "BUG: $SV_LABEL: the standby's check reported damage that replay left it: $(grep -v '^DEBUG' "$SV_ERR" | tail -3)"
+	case $warn in
+	none)
+		! grep -q '^WARNING' "$SV_ERR" ||
+			die "BUG: $SV_LABEL: the standby's check warned of a state replay passes through: $(grep '^WARNING' "$SV_ERR" | head -2)" ;;
+	split)
+		grep -q '^WARNING: .* has an unfinished split$' "$SV_ERR" ||
+			die "$SV_LABEL: the standby's check did not warn of an abandoned split: $(grep -v '^DEBUG' "$SV_ERR" | tail -3)" ;;
+	esac
+}
+
+# pw_park <label> <point> <sql>: <sql> on the primary in the background, its
+# writer parked at <point>.
+pw_park() {
+	local label=$1 point=$2 sql=$3
+	PW_POINT=$point
+	"$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -h "$SOCKDIR" -p "$PRIMARY_PORT" \
+		-U postgres -d "$DBNAME" >"$BASE/pw_$label.out" 2>&1 <<-SQL &
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('$point', 'wait');
+		$sql
+	SQL
+	PW_PID=$!
+	wait_true psql_p \
+		"select count(*) > 0 from pg_stat_activity where wait_event = '$point'" \
+		120 "$label: the primary's writer to park at $point"
+}
+
+# pw_release: let the parked writer go for good, and wait for it to commit.
+pw_release() {
+	local i n rc=0
+	psql_p -tAc "select injection_points_detach('$PW_POINT')" >/dev/null 2>&1 || true
+	for i in $(seq 1 100); do
+		n=$(psql_p -tAc "select count(*) from pg_stat_activity where wait_event = '$PW_POINT'")
+		[ "$n" = 0 ] && break
+		psql_p -tAc "select injection_points_wakeup('$PW_POINT')" >/dev/null 2>&1 || true
+		nap 0.1
+	done
+	wait "$PW_PID" || rc=$?
+	[ "$rc" = 0 ] || die "the primary's parked writer failed: $(tail -3 "$BASE"/pw_*.out)"
+}
+
+# sv_quiet <label> <index>: both nodes, caught up, verify <index>.
+sv_quiet() {
+	local label=$1 idx=$2
+	sv_sync
+	run_check "phase 3 $label quiesced" psql_s "
+		select lion_index_verify('$idx'::regclass, true) is not null, 'standby verify $idx'"
+	run_check "phase 3 $label quiesced" psql_p "
+		select lion_index_verify('$idx'::regclass, true) is not null, 'primary verify $idx'"
+}
+
+# standby_verify_vacuum <unlink|free>: R-S1.  k = 1 is every other row of
+# 6000 wide ones, a CHAIN set whose six leaves (posting_fillfactor 10) are
+# heap blocks 0..63, 64..127 and so on; the rest have a key each.  The rows
+# of the second leaf - or every row of k = 1 - are deleted before the
+# check takes its snapshot, and vacuumed after it has read the first leaf.
+standby_verify_vacuum() {
+	local variant=$1 label=v$1 i n want
+	log ""
+	log "-- standby: VACUUM replayed under a check's walk of a posting set ($variant)"
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS vfy_vac;
+		CREATE TABLE vfy_vac (id int, k int NOT NULL, pad char(480) NOT NULL DEFAULT '')
+		  WITH (autovacuum_enabled = off);
+		INSERT INTO vfy_vac (id, k)
+		SELECT i, CASE WHEN i % 2 = 1 THEN 1 ELSE 2 + i END FROM generate_series(1, 6000) i;
+		CREATE INDEX vfy_vac_k ON vfy_vac USING lion (k)
+		  WITH (inline_limit = 64, posting_fillfactor = 10);
+		VACUUM (FREEZE) vfy_vac;
+	SQL
+	[ "$(psql_p -tAc "select container_pages || ' ' || max_posting_height from lion_index_stats('vfy_vac_k')")" = "6 0" ] ||
+		die "$label: the set is not six leaves without an internal level"
+	if [ "$variant" = free ]; then
+		psql_p -c "SET synchronous_commit = on; DELETE FROM vfy_vac WHERE k = 1" >>"$RUNLOG" 2>&1
+		want="0 "
+	else
+		psql_p -c "SET synchronous_commit = on; DELETE FROM vfy_vac WHERE k = 1 AND (ctid::text::point)[0] BETWEEN 64 AND 127" >>"$RUNLOG" 2>&1
+		want="5 1 "
+	fi
+	sv_sync
+	sv_park "$label" lion-verify-set-leaf-read vfy_vac_k
+
+	# Retried: with hot_standby_feedback on, the primary's horizon is the
+	# standby's last report, which can predate the delete.
+	for i in $(seq 1 60); do
+		psql_p -c "VACUUM (INDEX_CLEANUP ON) vfy_vac" >>"$RUNLOG" 2>&1 || die "$label: VACUUM failed"
+		n=$(psql_p -tAc "select container_pages || ' ' || deleted_pages || ' ' from lion_index_stats('vfy_vac_k')")
+		case "$n" in "$want"*) break ;; esac
+		nap 0.5
+	done
+	case "$n" in "$want"*) ;; *) die "$label: VACUUM did not take the set apart (pages, deleted: $n)" ;; esac
+	sv_sync
+	sv_release lion-verify-set-leaf-read
+	sv_judge none
+	sv_quiet "$label" vfy_vac_k
+	psql_p -c "DROP TABLE vfy_vac" >>"$RUNLOG" 2>&1
+	log "   $label: a check whose set VACUUM's replay took apart under it passed ($(grep -o '[0-9]* posting-set walks, [0-9]* thrown away' "$SV_ERR"))"
+	SUMMARY+=("phase3 $label  a standby's check passed beside the replay of a VACUUM that took its set apart")
+}
+
+# standby_verify_dirsplit <reach|downlink|leftlink>: R-S2.  The table of
+# standby_verify_vacuum(), whose 3000 keys fill a few directory leaves under
+# a root; new keys among the first leaf's split it.  For vreach the emptied
+# second leaf of k = 1 is taken out of its set and handed to the free space
+# map first, so that the split's new page is a block the index had when the
+# check began, which the reachability pass looks at.
+standby_verify_dirsplit() {
+	local variant=$1 label=v$1 point i n
+	log ""
+	log "-- standby: a directory leaf split replayed under a check ($variant)"
+	if [ "$variant" = reach ] &&
+		[ "$(psql_p -tAc "select count(*) from pg_available_extensions where name = 'pg_freespacemap'" 2>>"$RUNLOG" || true)" != 1 ]; then
+		log "   $label skipped: this server has no pg_freespacemap"
+		SUMMARY+=("phase3 $label  skipped (no pg_freespacemap)")
+		return 0
+	fi
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS vfy_dir;
+		CREATE TABLE vfy_dir (id int, k int NOT NULL, pad char(480) NOT NULL DEFAULT '')
+		  WITH (autovacuum_enabled = off);
+		INSERT INTO vfy_dir (id, k)
+		SELECT i, CASE WHEN i % 2 = 1 THEN 1 ELSE 2 + i END FROM generate_series(1, 6000) i;
+		CREATE INDEX vfy_dir_k ON vfy_dir USING lion (k)
+		  WITH (inline_limit = 64, posting_fillfactor = 10);
+		VACUUM (FREEZE) vfy_dir;
+	SQL
+	[ "$(psql_p -tAc "select directory_height from lion_index_stats('vfy_dir_k')")" = 1 ] ||
+		die "$label: the directory is not leaves under a root"
+	if [ "$variant" = reach ]; then
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+			CREATE EXTENSION IF NOT EXISTS pg_freespacemap;
+			SET synchronous_commit = on;
+			DELETE FROM vfy_dir WHERE k = 1 AND (ctid::text::point)[0] BETWEEN 64 AND 127;
+		SQL
+		# The leaf goes once the delete is behind the standby's horizon, and
+		# into the map once its safexid is, which a later VACUUM sees.
+		for i in $(seq 1 60); do
+			nap 1.2
+			psql_p -c "VACUUM (INDEX_CLEANUP ON) vfy_dir" >>"$RUNLOG" 2>&1 || die "$label: VACUUM failed"
+			[ "$(psql_p -tAc "select deleted_pages from lion_index_stats('vfy_dir_k')")" = 1 ] && break
+		done
+		[ "$(psql_p -tAc "select deleted_pages from lion_index_stats('vfy_dir_k')")" = 1 ] ||
+			die "$label: VACUUM did not take the emptied leaf out of its set"
+		for i in $(seq 1 60); do
+			psql_p -c "SET synchronous_commit = on; DELETE FROM vfy_dir WHERE id = (SELECT min(id) FROM vfy_dir WHERE k > 1)" >>"$RUNLOG" 2>&1
+			nap 1.2
+			psql_p -c "VACUUM (INDEX_CLEANUP ON) vfy_dir" >>"$RUNLOG" 2>&1 || die "$label: VACUUM failed"
+			[ "$(psql_p -tAc "select count(*) from pg_freespace('vfy_dir_k') where avail > 0")" = 1 ] && break
+		done
+		[ "$(psql_p -tAc "select count(*) from pg_freespace('vfy_dir_k') where avail > 0")" = 1 ] ||
+			die "$label: the free leaf did not reach the free space map"
+	fi
+	sv_sync
+	case $variant in
+	reach) point=lion-verify-reachable ;;
+	downlink) point=lion-verify-dir-level-walked ;;
+	leftlink) point=lion-verify-dir-page-read ;;
+	esac
+	sv_park "$label" "$point" vfy_dir_k
+	n=$(psql_p -tAc "select leaf_pages from lion_index_stats('vfy_dir_k')")
+	psql_p -c "SET synchronous_commit = on; INSERT INTO vfy_dir (id, k) SELECT 200000 + i, 2 * i + 3 FROM generate_series(1, 300) i" \
+		>>"$RUNLOG" 2>&1 || die "$label: the inserts failed"
+	[ "$(psql_p -tAc "select leaf_pages from lion_index_stats('vfy_dir_k')")" -gt "$n" ] ||
+		die "$label: the inserts split no directory leaf"
+	[ "$variant" != reach ] ||
+		[ "$(psql_p -tAc "select count(*) from pg_freespace('vfy_dir_k') where avail > 0")" = 0 ] ||
+		die "$label: the split did not take the free page"
+	sv_sync
+	sv_release "$point"
+	sv_judge none
+	sv_quiet "$label" vfy_dir_k
+	psql_p -c "DROP TABLE vfy_dir" >>"$RUNLOG" 2>&1
+	log "   $label: a check that a directory split was replayed under at $point passed"
+	SUMMARY+=("phase3 $label  a standby's check passed beside the replay of a directory split ($point)")
+}
+
+# standby_verify_summary: R-S3.  Keys 1..4000, a row each, in summaries of
+# 1000 TIDs; a new row of key 2500 parks between its key and its summary.
+standby_verify_summary() {
+	local label=vsummary
+	log ""
+	log "-- standby: a check beside an INSERT between its key and its summary"
+	psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+		SET synchronous_commit = on;
+		DROP TABLE IF EXISTS vfy_sum;
+		CREATE TABLE vfy_sum (id int, k int NOT NULL) WITH (autovacuum_enabled = off);
+		INSERT INTO vfy_sum SELECT i, i FROM generate_series(1, 4000) i;
+		CREATE INDEX vfy_sum_k ON vfy_sum USING lion (k) WITH (summaries = on, summary_tids = 1000);
+		VACUUM (FREEZE) vfy_sum;
+	SQL
+	pw_park "$label" lion-insert-before-summary "INSERT INTO vfy_sum VALUES (99999, 2500);"
+	sv_sync
+	sv_now "$label" vfy_sum_k
+	sv_judge none
+	sv_now "${label}_hai" vfy_sum_k true
+	sv_judge none
+	pw_release
+	sv_quiet "$label" vfy_sum_k
+	psql_p -c "DROP TABLE vfy_sum" >>"$RUNLOG" 2>&1
+	log "   $label: a check beside an INSERT between its key and its summary passed"
+	SUMMARY+=("phase3 $label  a standby's check passed beside an INSERT between its key and its summary")
+}
+
+# standby_verify_split <dir|post>: R-S5.  vsplitdir: the table of
+# standby_verify_vacuum(), whose first directory leaf the new keys split;
+# vsplitpost: 90000 rows of two keys at posting_fillfactor 10, each key's
+# set a tree (verify_incomplete_split.spec), whose last leaves new rows of
+# the two keys, taking alternate TIDs, fill and split.
+standby_verify_split() {
+	local variant=$1 label=vsplit$1 point idx ins ins2
+	log ""
+	log "-- standby: a check beside a $variant split the primary is in the middle of"
+	if [ "$variant" = dir ]; then
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+			SET synchronous_commit = on;
+			DROP TABLE IF EXISTS vfy_split;
+			CREATE TABLE vfy_split (id int, k int NOT NULL, pad char(480) NOT NULL DEFAULT '')
+			  WITH (autovacuum_enabled = off);
+			INSERT INTO vfy_split (id, k)
+			SELECT i, CASE WHEN i % 2 = 1 THEN 1 ELSE 2 + i END FROM generate_series(1, 6000) i;
+			CREATE INDEX vfy_split_k ON vfy_split USING lion (k)
+			  WITH (inline_limit = 64, posting_fillfactor = 10);
+			VACUUM (FREEZE) vfy_split;
+		SQL
+		point=lion-dir-split-incomplete
+		ins="INSERT INTO vfy_split (id, k) SELECT 200000 + i, 2 * i + 3 FROM generate_series(1, 300) i;"
+		ins2="INSERT INTO vfy_split (id, k) SELECT 300000 + i, 1000000 + i FROM generate_series(1, 600) i;"
+	else
+		psql_p >>"$RUNLOG" 2>&1 <<-SQL || die "$label: fixture failed"
+			SET synchronous_commit = on;
+			DROP TABLE IF EXISTS vfy_split;
+			CREATE TABLE vfy_split (id int, k int NOT NULL, pad char(80) NOT NULL DEFAULT 'x')
+			  WITH (autovacuum_enabled = off);
+			INSERT INTO vfy_split SELECT i, i % 2 FROM generate_series(1, 90000) i;
+			CREATE INDEX vfy_split_k ON vfy_split USING lion (k) WITH (posting_fillfactor = 10);
+			VACUUM (FREEZE) vfy_split;
+		SQL
+		[ "$(psql_p -tAc "select max_posting_height from lion_index_stats('vfy_split_k')")" -ge 1 ] ||
+			die "$label: the posting sets are not trees"
+		point=lion-posting-split-incomplete
+		ins="INSERT INTO vfy_split SELECT 100000 + i, i % 2 FROM generate_series(1, 60000) i;"
+		ins2="INSERT INTO vfy_split SELECT 200000 + i, i % 2 FROM generate_series(1, 60000) i;"
+	fi
+	idx=vfy_split_k
+
+	# The split in progress, seen by the whole check.
+	pw_park "$label" "$point" "$ins"
+	sv_sync
+	if [ "$variant" = dir ]; then
+		sv_now "$label" "$idx"
+		sv_judge none
+		# ... and finished while the check is about to look at it again.
+		sv_park "${label}_done" lion-verify-flags-recheck "$idx"
+		pw_release
+		sv_sync
+		sv_release lion-verify-flags-recheck
+		sv_judge none
+	else
+		sv_now "$label" "$idx"
+		sv_judge none
+		pw_release
+	fi
+
+	# A split that fails between its records is abandoned, and warned of: new
+	# keys past the last for the directory, which split its last leaf.
+	psql_p -At >"$BASE/pw_${label}_err.out" 2>&1 <<-SQL || true
+		SELECT injection_points_set_local();
+		SELECT injection_points_attach('$point', 'error');
+		$ins2
+	SQL
+	grep -q "error triggered for injection point $point" "$BASE/pw_${label}_err.out" ||
+		die "$label: the failing split did not fail at $point: $(tail -3 "$BASE/pw_${label}_err.out")"
+	sv_sync
+	sv_now "${label}_abandoned" "$idx"
+	sv_judge split
+	sv_quiet "$label" "$idx"
+	psql_p -c "DROP TABLE vfy_split" >>"$RUNLOG" 2>&1
+	log "   $label: a split in progress was not warned of, an abandoned one was"
+	SUMMARY+=("phase3 $label  a standby's check warned of an abandoned $variant split, not of one in progress")
 }
 
 phase3() {
@@ -2714,6 +3109,14 @@ phase3() {
 	fi
 
 	want_case setaba && standby_verify_aba
+	want_case vunlink && standby_verify_vacuum unlink
+	want_case vfree && standby_verify_vacuum free
+	want_case vreach && standby_verify_dirsplit reach
+	want_case vdownlink && standby_verify_dirsplit downlink
+	want_case vleftlink && standby_verify_dirsplit leftlink
+	want_case vsummary && standby_verify_summary
+	want_case vsplitdir && standby_verify_split dir
+	want_case vsplitpost && standby_verify_split post
 
 	run_check "phase 3 standby" psql_s "
 		select lion_index_verify(i::regclass, true) is not null, 'verify ' || i

@@ -44,13 +44,17 @@ are not executable by PUBLIC, as with pageinspect and amcheck; `lion_index_stats
 `lion_index_verify()` checks the index while it is being written to, the way `CREATE INDEX
 CONCURRENTLY` builds one: it takes ShareUpdateExclusiveLock on the table and the index, so INSERT,
 UPDATE and DELETE go on while it runs, and VACUUM, ANALYZE, DDL and a second verify wait for it;
-a relation that is not a lion index is refused before either is locked.  What a concurrent insert
-could make look wrong it checks again once the statements that were writing the index have ended,
-so it may wait for them - for as long as statement_timeout and lock_timeout allow - but never
-reports their changes as damage.  On a hot standby it takes AccessShareLock, holds
-no page while it waits for another that replay may hold, and is exact only while replay leaves the
-index alone; a posting set that replay keeps changing is checked page by page, with a WARNING that
-its totals were not compared.  With `heapallindexed` it checks that every row the heap shows is
+a relation that is not a lion index is refused before either is locked.  CREATE INDEX
+CONCURRENTLY on the same table can deadlock with it, whatever column it indexes - its last phases
+wait out the snapshot the statement calling verify took - so run the two apart.  What a concurrent
+insert could make look wrong it checks again once the statements that were writing the index have
+ended, so it may wait for them - for as long as statement_timeout and lock_timeout allow - but never
+reports their changes as damage.  On a hot standby it takes AccessShareLock, holds no page while it
+waits for another that replay may hold, and tells what replay changed under it from damage by the
+pages' LSNs, which it holds to the replay position it noted before reading them; a posting set or
+position tree that replay changes under every one of several recounts is checked page by page, with
+a WARNING that its totals were not compared, and pausing replay (`pg_wal_replay_pause()`) makes the
+check exact.  With `heapallindexed` it checks that every row the heap shows is
 under each of its keys - with its own positions and weights, in an index that stores them - and
 evaluates the index's expressions as the table's owner (DESIGN.md §7).
 
