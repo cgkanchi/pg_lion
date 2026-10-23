@@ -160,6 +160,7 @@ lion_meta_put_ndistinct(Relation index, const LionMetaNdistinct *nd,
 				 errmsg("lion index \"%s\": block 0 is not the meta page",
 						RelationGetRelationName(index))));
 	}
+	lion_meta_check_version(index, LionPageGetMeta(page));
 	has = LionMetaHasNdistinct(page);
 	if (has)
 		memcpy(&cur, LionPageGetMetaNdistinct(page), sizeof(LionMetaNdistinct));
@@ -232,6 +233,7 @@ lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index))));
 	}
+	lion_meta_check_version(index, LionPageGetMeta(page));
 	if (LionMetaHasNdistinct(page) &&
 		((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
 	{
@@ -241,6 +243,55 @@ lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 	UnlockReleaseBuffer(buf);
 
 	return have;
+}
+
+/*
+ * Refuse a meta page of another format: its magic and version, as
+ * lion_read_meta() reads them.
+ *
+ * Every reader of the meta page asks this, not lion_read_meta() alone: a
+ * backend that has the index open keeps its state, the meta page's words
+ * among them (lion_get_index_state()), and does not read the page again
+ * to use it - so a version changed under that state, which only damage
+ * does, is refused by the next reader that reads the page for something
+ * else: the counts of lion_index_stats() and the facets, VACUUM's, a
+ * descent that looks up the root.  An INSERT whose descent the cached root
+ * serves reads no meta page, and is refused only in a backend that builds
+ * the state afresh.
+ */
+void
+lion_meta_check_version(Relation index, const LionMetaPageData *meta)
+{
+	/*
+	 * Version 14 is the only one read.  Anything older predates a format
+	 * change that moved or reinterpreted items - for versions 6 to 8 the
+	 * sparse segments of §13, for version 9 the entry tuples of §21, for
+	 * version 10 the key size of §4, for version 11 the first downlinks of
+	 * §21, for version 12 the EMPTY entry of §17, for version 13 its
+	 * EMPTYDIM and EMPTYINNER entries and the NARROW items of §38, with the
+	 * meta page flag that allowed them - and anything newer is a format this
+	 * build does not know; the hint says which of the two it is, since
+	 * REINDEX with this build is the way out of either, but the reason
+	 * differs.
+	 */
+	if (meta->magic != LION_MAGIC)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page magic %08X, expected %08X.",
+						   meta->magic, LION_MAGIC)));
+	if (meta->version != LION_VERSION_V14)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
+						   meta->magic, meta->version, LION_MAGIC,
+						   LION_VERSION_V14),
+				 meta->version < LION_VERSION_V14 ?
+				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
+				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
 }
 
 /*
@@ -285,36 +336,7 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 	*meta = *ondisk;
 	UnlockReleaseBuffer(buf);
 
-	/*
-	 * Version 14 is the only one read.  Anything older predates a format
-	 * change that moved or reinterpreted items - for versions 6 to 8 the
-	 * sparse segments of §13, for version 9 the entry tuples of §21, for
-	 * version 10 the key size of §4, for version 11 the first downlinks of
-	 * §21, for version 12 the EMPTY entry of §17, for version 13 its
-	 * EMPTYDIM and EMPTYINNER entries and the NARROW items of §38, with the
-	 * meta page flag that allowed them - and anything newer is a format this
-	 * build does not know; the hint says which of the two it is, since
-	 * REINDEX with this build is the way out of either, but the reason
-	 * differs.
-	 */
-	if (meta->magic != LION_MAGIC)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" is not a valid lion index",
-						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X, expected %08X.",
-						   meta->magic, LION_MAGIC)));
-	if (meta->version != LION_VERSION_V14)
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("index \"%s\" is not a valid lion index",
-						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
-						   meta->magic, meta->version, LION_MAGIC,
-						   LION_VERSION_V14),
-				 meta->version < LION_VERSION_V14 ?
-				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
-				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
+	lion_meta_check_version(index, meta);
 
 	/* The right version, and a special area of the wrong size: damage. */
 	if (special != LION_SPECIAL_SIZE)

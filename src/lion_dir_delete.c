@@ -391,6 +391,7 @@ lion_dirdel_count(Relation index, int n)
 				 errmsg("lion index \"%s\": block 0 is not the meta page",
 						RelationGetRelationName(index))));
 	}
+	lion_meta_check_version(index, LionPageGetMeta(page));
 	dirpages = LionPageGetMeta(page)->dirpages;
 	if (dirpages <= 1)
 	{
