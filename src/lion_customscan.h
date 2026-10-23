@@ -646,11 +646,12 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 
 /*
  * ORed into a RANGESRC clause's kind in the plan's CLAUSEKINDS: the first
- * bound of a range the planner priced walked at every count where it does
- * not fit the memory left (LION_FLAG_RANGEWALK, LionCountPrivClause.walk).
- * Every other range of such a plan is collected, in windows past the memory,
- * as in any other: a range the planner expected to fit is never walked
- * because it did not, at a price nobody made.
+ * bound of a range the planner priced walked at every count rather than
+ * collected (LION_FLAG_RANGEWALK, LionCountPrivClause.walk), which the
+ * executor then walks without collecting any of it.  Every other range of
+ * such a plan is collected, in windows past the memory, as in any other: a
+ * range the planner priced collected is never walked because it did not
+ * fit, at a price nobody made.
  */
 #define LION_CLAUSE_WALK		0x100
 
@@ -1079,28 +1080,30 @@ typedef struct LionVColScope
  * at a time (LION_POS_MEMBER_COST), and TS_execute() over what they found, a
  * callback per lexeme and the candidate's memory reset after it
  * (LION_POS_CHECK_COST a lexeme).  Fitted on the release build (DESIGN.md
- * §10, "The units") to 400,000 rows of three or four lexemes, two of them in
- * three rows of four, one position each, every page all-visible: a count of
- * `foo <-> bar` decides its 300,000 candidates in 17.6 to 18.4 ms beyond
- * what `foo & bar` takes, 600,000 members decoded; the FK-side joins that
- * probe the filters - 200 counts deciding 30,000 candidates, decoding 1,105
- * members a seek, and 400 counts deciding 112,500 at 300 a seek - take 8.2
- * to 9.4 ns a member decoded.  At the reference's 5 ns a cpu_operator_cost
- * (§10, "The reference") that is 1.8 of them, and the 21.6 ns a candidate
- * spends a lexeme beyond its decoding is 4.3.
+ * §10, "The units") to 2 and 10 million rows of four to six lexemes, two of
+ * them in three rows of four and two in a fifth, one position each, every
+ * page all-visible.  The FK-side joins that probe the filters - 20 and 200
+ * counts of 20 or 75 candidates each, their rows all over the heap - take
+ * 11.4 to 12.8 ns a member decoded, the leaves stepped to and descended to
+ * on the way included, 2.4 cpu_operator_cost at the reference's 5 ns (§10,
+ * "The reference").  A count of every row, which decodes each member once,
+ * then takes the 21.6 ns a candidate spends a lexeme beyond its decoding,
+ * 4.3: `foo <-> bar` decides its 7.5 million candidates in 528 ms beyond
+ * what `foo & bar` takes, priced at 476 units a millisecond.
  *
  * A seek decodes a chunk's members from the first, or from where the cursor
  * stood, up to the candidate's (lion_poscursor_seek()), skipping the chunks
  * before it by their headers: a cursor that walks every member once - the
  * candidates of one count, or a collection's, close together - decodes each
  * member once, and one whose candidates lie further apart than a chunk
- * decodes part of one at each, LION_POS_SEEK_MEMBERS on average: four
- * fifths of a chunk of 1,339 members of one position, which a chunk of
- * members of more positions holds fewer of.
+ * decodes part of one at each, LION_POS_SEEK_MEMBERS on average: 1,606 to
+ * 1,703 members a seek, measured, over trees of 400,000 to 7.5 million
+ * members of one position.  Members of more positions, which a chunk holds
+ * fewer of, cost more each.
  */
 #define LION_POS_MEMBER_COST	(lion_position_member_cost * cpu_operator_cost)
 #define LION_POS_CHECK_COST		(lion_position_check_cost * cpu_operator_cost)
-#define LION_POS_SEEK_MEMBERS	1000.0
+#define LION_POS_SEEK_MEMBERS	1650.0
 
 /* Which walk a range bounds, for the cost model (DESIGN.md §28). */
 #define LION_RANGED_NONE	0
@@ -1158,10 +1161,9 @@ typedef struct LionVColScope
 #define LION_FLAG_RANGEWALK		0x40	/* the ranges taken as sources
 										 * whose clause says so
 										 * (LION_CLAUSE_WALK) are walked at
-										 * every count where they do not fit
-										 * the memory left, not collected in
-										 * windows (DESIGN.md §32, "Too large
-										 * to collect") */
+										 * every count, not collected
+										 * (DESIGN.md §32, "Walked at every
+										 * count") */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -1592,14 +1594,19 @@ typedef struct LionClauseState
 	bool		keyisnull;
 
 	/*
-	 * LION_CLAUSE_ARRAY: the list has been collected (lion_locate_list()),
-	 * and has gone to a temporary file, in some partition, run or rescan of
-	 * the node - which EXPLAIN ANALYZE counts once a list (listsrc_collected
-	 * and listsrc_spilled).
+	 * The source this clause stands for - a LION_CLAUSE_ARRAY list
+	 * (lion_locate_list()), or the range a LION_CLAUSE_RANGESRC clause is
+	 * the first bound of (lion_locate_range()) - has been collected, has
+	 * gone to a temporary file, or has been walked, in some partition, run,
+	 * rescan or participant of the node (LION_SRC_*): what EXPLAIN ANALYZE
+	 * counts, once a source.
 	 */
-	bool		listcollected;
-	bool		listspilled;
+	uint8		counted;
 } LionClauseState;
+
+#define LION_SRC_COLLECTED	0x01
+#define LION_SRC_SPILLED	0x02	/* of the collected: in a temporary file */
+#define LION_SRC_WALKED		0x04
 
 /*
  * One OR restriction (DESIGN.md §19), as a structure over the flattened
@@ -1646,10 +1653,10 @@ typedef struct LionSourceItem
 } LionSourceItem;
 
 /*
- * A range taken as a source that was too large to collect into memory, in a
- * plan that walks those (DESIGN.md §32, "A range as a source";
- * LION_FLAG_RANGEWALK): what LionCountSource.rangewalk points at, and what
- * lion_node_count() expands into the sets a walk of the range hands out.
+ * A range taken as a source that the plan walks at every count (DESIGN.md
+ * §32, "A range as a source"; LION_FLAG_RANGEWALK): what
+ * LionCountSource.rangewalk points at, and what lion_node_count() expands
+ * into the sets a walk of the range hands out.
  */
 typedef struct LionRangeSource
 {
@@ -1657,6 +1664,8 @@ typedef struct LionRangeSource
 	AttrNumber	col;			/* its KEY COLUMN in index */
 	LionRange	range;
 	bool		walk;			/* one of its bounds is LION_CLAUSE_WALK */
+	int			lead;			/* the clause of its first bound, which
+								 * counts it (LionClauseState.counted) */
 } LionRangeSource;
 
 /*
@@ -2676,11 +2685,6 @@ typedef struct LionScanWorkerSums
 	int64		rangeeval[3];
 	int64		summaries;
 	int64		rangeprobed;
-	int64		rangesrc_collected;
-	int64		rangesrc_walked;
-	int64		rangesrc_spilled;
-	int64		listsrc_collected;
-	int64		listsrc_spilled;
 	int64		wherecollected;
 	int64		wherespilled;
 	int64		groupbatches;
@@ -2785,34 +2789,23 @@ typedef struct LionCountScanState
 	int64		rangeprobed;
 
 	/*
-	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"): how
-	 * many were collected, and of those how many spilled to a temporary file;
-	 * how many were too large and were summed over their walk at every count
-	 * instead, in a plan that walks those; and what the collected ones hold -
-	 * all of them within one hash table's memory - and which of them are in
-	 * it (rangesrc_mem, their LionMatSets, in wherecxt), for one that does not
-	 * fit what they left to send to files (lion_locate_range()).
+	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"), and
+	 * the IN lists too long to locate at once that a count which is not one
+	 * of the relation as one row collects the same way (§15, "A list too long
+	 * to locate at once"): what the collected ones hold - all of them within
+	 * one hash table's memory - and which of them are in it (rangesrc_mem,
+	 * their LionMatSets, and rangesrc_memcl, the clauses that count them,
+	 * both in wherecxt), for one that does not fit what they left to send to
+	 * files (lion_rangesrc_evict()).  Each source's clause says whether it
+	 * was collected, spilled or walked (LionClauseState.counted), and
+	 * workercounted what any worker's said, ORed
+	 * (lion_shutdown_custom_scan()): EXPLAIN ANALYZE counts each source once,
+	 * however many partitions, runs, rescans or participants collected it.
 	 */
-	int64		rangesrc_collected;
-	int64		rangesrc_walked;
-	int64		rangesrc_spilled;	/* of the collected: in a temporary file */
 	Size		rangesrc_held;
 	List	   *rangesrc_mem;
-
-	/*
-	 * ... and the IN lists too long to locate at once that a count which is
-	 * not one of the relation as one row collects the same way, within the
-	 * same memory (DESIGN.md §15, "A list too long to locate at once"):
-	 * how many lists were collected and how many of them spilled - each list
-	 * once, however many partitions, runs or rescans collected it
-	 * (cl->listcollected) - and those in memory (listsrc_mem, their
-	 * LionMatSets, and listsrc_memcl, their clauses, both in wherecxt),
-	 * which lion_rangesrc_evict() sends to files as it does the ranges'.
-	 */
-	int64		listsrc_collected;
-	int64		listsrc_spilled;
-	List	   *listsrc_mem;
-	List	   *listsrc_memcl;
+	List	   *rangesrc_memcl;
+	uint8	   *workercounted;	/* NULL, or nclause of them */
 	int			nclause;
 	LionClauseState *clause;
 	int			ntlist;
@@ -3283,7 +3276,9 @@ lion_st_join(LionCountScanState *st)
  * ranges its workers' count of them, summed.  So does a parallel count of
  * one row (§10, "A count in parallel"), whose chunks are nranges for each of
  * its runs.  Whatever the shape, scan is the sum of the workers' own scan
- * counters (LionScanWorkerSums).
+ * counters (LionScanWorkerSums), and after the copies, if any, come what the
+ * workers collected, spilled and walked of the ranges and lists taken as
+ * sources, a byte a clause (LionClauseState.counted), ORed.
  */
 typedef struct LionJoinShared
 {
@@ -3318,6 +3313,9 @@ typedef struct LionJoinShared
 	int			nranges;
 	uint32		ckeys;
 	bool		copyready;		/* a LionSharedCopy follows this struct */
+	int			nclause;		/* the workers' LionClauseState.counted, */
+	Size		countedoff;		/* ORed: nclause of them, this far in
+								 * (LION_JOIN_SHARED_COUNTED) */
 } LionJoinShared;
 
 /*
@@ -3375,11 +3373,16 @@ typedef struct LionAntiCell
 	int64		held;			/* ... and its counts, as the tally gave them */
 } LionAntiCell;
 
-/* What went past its memory, for EXPLAIN ANALYZE (lion_explain_anti_counters()) */
+/*
+ * What went past its memory, for EXPLAIN ANALYZE
+ * (lion_explain_anti_counters()): a sort or the tuplestore on disk past
+ * work_mem, or the losses past hash_mem
+ */
 #define LION_ANTI_SPILL_KEYS	0x01	/* the child's rows, sorted by key */
 #define LION_ANTI_SPILL_INNER	0x02	/* a key's inner rows */
-#define LION_ANTI_SPILL_SUB		0x04	/* the groups' or the cells' losses */
-#define LION_ANTI_SPILL_HELD	0x08	/* ... and the sort they then go to */
+#define LION_ANTI_SPILL_SUB		0x04	/* the groups' or the cells' losses,
+										 * past hash_mem into a sort */
+#define LION_ANTI_SPILL_HELD	0x08	/* ... and that sort, on disk */
 #define LION_ANTI_SPILL_RANGES	0x10	/* the rows taken away, by container
 										 * key */
 
@@ -3489,6 +3492,8 @@ typedef struct LionAntiState
 	int		   *predpos;		/* ... its LION_TL_CELLPRED place */
 	uint8	   *predtruth;		/* ... and its truth (LION_TRUTH_*) in the
 								 * row found last */
+	bool		predsread;		/* a join clause or restriction reads a
+								 * predicate's truth */
 	LionAntiCell *held;			/* the cells this participant's rows are of,
 								 * by code once compacted */
 	int			nheld;
@@ -3530,6 +3535,8 @@ typedef struct LionAntiState
 #define LION_JOIN_SHARED_PART_COPY(shared, p) \
 	((LionSharedCopy *) ((char *) LION_JOIN_SHARED_COPY(shared) + \
 						 (Size) (p) * lion_shared_copy_size()))
+#define LION_JOIN_SHARED_COUNTED(shared) \
+	((uint8 *) ((char *) (shared) + (shared)->countedoff))
 
 
 
@@ -4023,16 +4030,13 @@ typedef struct LionRangeMem
  * the relation's ranges before it left of a hash table's memory (*mem) or in
  * windows into a temporary file past it, which *spills says; *evicts says
  * that the ranges in memory before it went to files to make room for it.
- * Where `attempt` is given, *attempt is what trying to collect one that does
- * not fit costs, for a count that may walk it at every count instead
- * (LION_FLAG_RANGEWALK).
  */
 extern double lion_container_max_bytes(double tuples, double pages);
 extern Cost lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
 								   List *bounds, Selectivity sel,
 								   LionRangeMem *mem, bool *spills,
-								   bool *evicts, Cost *attempt);
+								   bool *evicts);
 extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
@@ -4046,17 +4050,37 @@ extern void lion_cost_topk_path(PlannerInfo *root, CustomPath *cpath,
 								double drivefrac, double cand,
 								double candrows, double outrows);
 /*
- * What walking the ranges too large to collect at every count would save
- * over collecting them in windows, summed over the relations and runs a
- * plan counts (lion_cost_count_path()), and the clauses it would walk: the
- * first bound of each range, a clause of the WHERE, which the plan marks
- * LION_CLAUSE_WALK where it takes the saving (LION_FLAG_RANGEWALK).
+ * What walking the ranges taken as sources at every count would save over
+ * collecting them, summed over the relations and runs a plan counts
+ * (lion_cost_count_path()), and the clauses it would walk: the first bound
+ * of each range, a clause of the WHERE, which the plan marks
+ * LION_CLAUSE_WALK where it takes the saving (LION_FLAG_RANGEWALK).  Summed
+ * for each way of walking them (LionWalkWay) - all of them, or one alone -
+ * in `ways`, of which lion_walk_save_choose() takes the best into save and
+ * clauses.
  */
+typedef struct LionWalkWay
+{
+	Node	   *clause;			/* the range walked alone, or NULL: all */
+	Cost		save;
+	Cost		walks;			/* what the walks cost */
+	List	   *clauses;
+} LionWalkWay;
+
 typedef struct LionWalkSave
 {
 	Cost		save;
 	List	   *clauses;
+	List	   *ways;
 } LionWalkSave;
+
+/*
+ * The plan walks ranges taken as sources only where collecting them is priced
+ * at least this many times what walking them is (lion_walk_save_choose()).
+ */
+#define LION_RANGE_WALK_MARGIN	1.5
+
+extern void lion_walk_save_choose(LionWalkSave *ws);
 
 extern void lion_cost_count_path(PlannerInfo *root, CustomPath *cpath,
 								 List *targets, List *whereclauses,

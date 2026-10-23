@@ -631,9 +631,11 @@ lion_handler(PG_FUNCTION_ARGS)
 		 * ambulkdelete may run in a parallel vacuum worker (DESIGN.md §11,
 		 * §18): one index is still vacuumed start to finish by one process
 		 * under the same protocol, and the heap is only marked all-visible
-		 * once every index is done.  amvacuumcleanup stays with the leader -
-		 * it vacuums the free space map and nothing else, which is not
-		 * worth a worker.
+		 * once every index is done.  amvacuumcleanup stays with the leader:
+		 * it vacuums the free space map, and after a VACUUM that called no
+		 * ambulkdelete it also counts the keys and, when the pages waiting
+		 * to be handed out are more than a twentieth of the index, reads the
+		 * index for them (lionvacuumcleanup()).
 		 */
 		.amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL,
 		.amkeytype = InvalidOid,

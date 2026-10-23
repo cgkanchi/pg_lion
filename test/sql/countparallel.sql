@@ -85,12 +85,11 @@ END $$;
 
 /*
  * The node's counters in EXPLAIN ANALYZE named in names, as "Name: value,
- * ...".  Range sources are collected by each participant that counts a
- * range, as many times as there are such participants: only their name is
- * printed.
+ * ...".  A range source is collected by each participant that counts a
+ * range, but it is one range: counted once, however many there were.
  */
 CREATE FUNCTION lcp_counters(q text, names text[] DEFAULT
-							 '{Key Ranges, List Batches, Heap Blocks Skipped via VM, Range Evaluation}')
+							 '{Key Ranges, List Batches, Heap Blocks Skipped via VM, Range Evaluation, Range Sources Collected}')
 RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -100,9 +99,6 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF btrim(split_part(ln, ':', 1)) = ANY (names) THEN
 			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END || btrim(ln);
-		ELSIF btrim(split_part(ln, ':', 1)) = 'Range Sources Collected' THEN
-			out := out || CASE WHEN out = '' THEN '' ELSE ', ' END ||
-				btrim(split_part(ln, ':', 1));
 		END IF;
 	END LOOP;
 	RETURN out;

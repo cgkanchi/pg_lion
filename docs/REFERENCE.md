@@ -537,7 +537,10 @@ g`, a range in an OR, a join's fact filter) is answered too, collected once from
 within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by the table's ranges:
 one that does not fit what the others left sends those to temporary files first) and past it in
 windows into a temporary file (`Range Sources Spilled` in `EXPLAIN ANALYZE`), or, where there are
-few counts and the planner finds it cheaper, walked again at each (`Range Sources Walked`).
+few counts - a few groups, a `count(DISTINCT)`'s tests - and the planner finds it at least half
+again cheaper, walked again at each, whether or not it would fit (`Range Sources Walked`; a range
+in an OR is always collected). These counters count each range once, however many partitions,
+rescans and parallel workers collected it.
 An IN list longer than a batch - `work_mem` over 256 bytes a value, and never fewer than 1000
 values - is not held whole either: a count of the table as one row locates and counts it a batch at
 a time, the list that drives a `GROUP BY` on its own column is located a batch at a time as the
@@ -761,13 +764,20 @@ working around a bad choice:
   Type: Anti`, `Join Rows: the rows counted, less those with a match`, `Join Lookup Index` and
   `Join Cond` above the inner side's plan, and under ANALYZE `Join Child Rows`, `Join Keys Looked
   Up`, `Join Rows Fetched` and `Join Rows Subtracted` (with `Join Child Time` and `Join Lookup Time`
-  under TIMING), and `Join Spilled` where part of the run went to disk: the inner side's keys and
-  rows are sorted and kept within `work_mem`, and what the groups or cells lose within `hash_mem`
-  (`work_mem` times `hash_mem_multiplier`), each spilling past it (DESIGN.md §27, "The anti join
-  within work_mem"). `LEFT JOIN ... IS NULL` is left alone, and so is `NOT IN` but on PostgreSQL 19
-  where neither side can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that
-  one as the same anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does
-  not count an anti join this way.
+  under TIMING), and `Join Spilled` where part of the run went past its memory: `keys`, `inner rows`
+  and `ranges` where the inner side's keys, a key's inner rows or, in parallel, the rows taken away
+  by range went to disk past `work_mem`; `losses` where what the groups or cells lose went past
+  `hash_mem` (`work_mem` times `hash_mem_multiplier`) into a sort that the count's rows are then held
+  back into, and `held rows` where that sort went to disk past `work_mem` (DESIGN.md §27, "The anti
+  join within work_mem"). In a parallel plan each counter is every participant's, summed, and `Join
+  Spilled` what went past its memory in any of them: beside a parallel count by cells, where every
+  participant reads the inner side and looks each key up, `Join Child Rows`, `Join Keys Looked Up`,
+  `Join Rows Fetched` and the times add up to a run per participant, while `Join Rows Subtracted` is
+  what the serial plan subtracts, each row taken away by the one participant that counts its range.
+  `LEFT JOIN ... IS NULL` is left alone, and so is `NOT IN` but on PostgreSQL 19 where neither side
+  can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same
+  anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does not count an anti
+  join this way.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -812,6 +822,24 @@ working around a bad choice:
   expression), while the table holds within a factor of 2 of the rows the count was taken over, and
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
+- `pg_lion.enable_index_mcv`: give the planner the exact frequency of each value a query compares a
+  column with from a Lion index on it. The values are the constants of every `col = c`, `col IN
+  (...)` and `col = ANY (array)` on the column (of an `ARRAY[...]`, its constant elements) in the
+  table's `WHERE` conditions and in the join conditions that mention the table, whether such a
+  comparison stands alone or inside `AND`s and `OR`s nested to any depth. Each gets the rows of
+  its entry in the index, or none for a value the index does not have,
+  added to ANALYZE's most common values (or put in place of the sampled frequency of one it has)
+  for that query's plan (DESIGN.md §33, "The frequencies of the listed values"). Without it, the
+  planner estimates a value ANALYZE did not list as an equal share of the rest of the rows, which
+  on a skewed column takes a value of thousands of rows for a handful, the more so with the exact
+  number of distinct values above. It applies to the columns and indexes that setting applies to,
+  but not to an expression; to constants of the index's key type compared by its equality (a
+  generic plan's parameter is estimated as before); to at most 1000 values of a column in one table
+  of a query, past which, or where another comparison of the column for equality cannot be
+  taken, the column is estimated as without it; and only for a user who may read every row of the
+  table. Each value is looked up once per planning, one descent of the index's directory, and an
+  `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
+  shows ANALYZE's list.
 - `pg_lion.enable_skew_estimate` (on by default): price Lion's probes of a key the plan does not
   know (a nested loop's outer row, a correlated subquery's, a generic plan's parameter) at the rows
   such a key really meets on a skewed column, and price the core scan they compete with at the same
@@ -880,7 +908,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
 | `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
-| `position_member_cost` | 1.8 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
+| `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
 | `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan competing with an FK-side join, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |

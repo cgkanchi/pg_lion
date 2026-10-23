@@ -464,7 +464,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			located += lion_cost_range_source(root, rel, idx,
 											  (AttrNumber) lfirst_int(lc4),
 											  bounds, sel, &rangemem,
-											  &spills, &evicts, NULL);
+											  &spills, &evicts);
 			if (evicts)
 			{
 				foreach(lc5, rangeinmem)
