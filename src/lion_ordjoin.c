@@ -270,7 +270,8 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
  * non-NULL key is taken to name a dimension row: the join is on a foreign
  * key.  *rows is what it returns: the keys' share of the dimension's rows
  * pass its quals (lion_probe_rel_rows()).  *share is the share of the walk
- * the query's LIMIT is expected to take, *probes the descents.
+ * the query's LIMIT is expected to take, *probes the descents of the whole
+ * walk.
  */
 static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
@@ -340,6 +341,21 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 	*rows = out;
 	*probes = descents;
+
+	/*
+	 * The share of the walk the LIMIT takes, which decides whether each
+	 * side's set is lazy or built at once (§30.4); it is not a stop.  The
+	 * LIMIT bounds the join's output only through what sits above it, and
+	 * a join above that filters lets the walk go on further.  But a lazy set
+	 * that goes on further builds itself once its probes have cost what the
+	 * build would, so going lazy wrongly costs about one more build, where a
+	 * set built at once for a walk that stops after a few hundred entries
+	 * costs the whole build.  The cheaper error is the lazy one, and the
+	 * share is applied with joins above the node too: the left joins and
+	 * NOT EXISTS the node sits below keep its rows about one to one with the
+	 * LIMIT's.  The plain LionOrdered keeps its own stricter rule (lo_limit(),
+	 * the node alone under the LIMIT) for its hard stop, which this is not.
+	 */
 	*share = 1.0;
 	if (root->limit_tuples > 0)
 		*share = Min(1.0, root->limit_tuples / out);
@@ -384,9 +400,10 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 									  facttotal);
 	pkpath = create_index_path(root, j->pkidx, NIL, NIL, NIL, NIL,
 							   ForwardScanDirection, false, NULL, 1.0, false);
+	/* the dimension's weight: the descents the LIMIT's share of the walk makes */
 	dimpath = lion_ordered_side_path(j->dim, pkpath, dimlion, NIL, true,
-									 probes, j->keyqual, rows, ds.build,
-									 ds.build);
+									 clamp_row_est(probes * share),
+									 j->keyqual, rows, ds.build, ds.build);
 
 	cp = makeNode(CustomPath);
 	cp->path.pathtype = T_CustomScan;
