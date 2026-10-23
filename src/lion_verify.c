@@ -893,16 +893,146 @@ lion_verify_tree_init(LionVerifyTree *tree, BlockNumber eblk,
 	tree->what = positions ? "position" : "posting";
 }
 
-/* The unfinished-split WARNING, which a set walk may defer (see below). */
+/* What a flagged page is a page of, for its WARNING (LION_VFLAG_*). */
+static const char *
+lion_verify_flag_what(uint16 what)
+{
+	switch (what)
+	{
+		case LION_VFLAG_DIR:
+			return "directory";
+		case LION_VFLAG_POSTING:
+			return "posting";
+		case LION_VFLAG_POSITION:
+			return "position";
+	}
+	elog(ERROR, "lion index: %u is not the kind of a flagged page", what);
+	return NULL;				/* keep the compiler quiet */
+}
+
+/*
+ * The unfinished-split WARNING (DESIGN.md §21, §22).  A split writes its new
+ * right sibling and the flag in one record, the sibling's downlink in the
+ * parent in the next, and clears the flag in a third: a crash or an error
+ * after the first or the second leaves the flag, with or without the
+ * downlink, and the next writer whose descent passes through the page does
+ * what is missing (lion_dir_downlink_present(),
+ * lion_posting_downlink_present()).  Only a descent through the page does
+ * it: an append that fits a posting set's last leaf goes there without one
+ * (lion_insert.c), so a flag on a leaf below the inserts' range can outlive
+ * any number of inserts into the key.
+ */
 static void
-lion_verify_warn_incomplete(LionVerifyState *vs, const char *what,
+lion_verify_warn_incomplete(LionVerifyState *vs, uint16 what,
 							BlockNumber blk)
 {
 	ereport(WARNING,
 			(errmsg("lion index \"%s\": %s page %u has an unfinished split",
-					RelationGetRelationName(vs->index), what, blk),
-			 errdetail("Its right sibling has no downlink in the parent yet."),
-			 errhint("The next INSERT into that key repairs it.")));
+					RelationGetRelationName(vs->index),
+					lion_verify_flag_what(what), blk),
+			 errdetail("The split that flagged it did not finish: the downlink of its right sibling, or the record that clears the flag after it, was never written."),
+			 errhint("The next INSERT that descends to this page repairs it.")));
+}
+
+/*
+ * A page a walk that is kept found flagged as an unfinished split, read with
+ * LSN lsn.
+ *
+ * On a primary that is a split that was abandoned, never one in progress: a
+ * writer holds the page it flags EXCLUSIVE from the record that sets the
+ * flag to the one that clears it, and the walk read the page under a SHARE
+ * lock.  So the WARNING is given at once.
+ *
+ * On a standby it is not: replay locks each record's pages for that record
+ * alone, so a split the primary is in the middle of - between its first
+ * record and its last - shows the flag there to whoever reads the page.  So
+ * the page is noted, with the next transaction id at the time - every
+ * transaction that can have written the flag has a lower one - and looked at
+ * again at the end of the check (lion_verify_flags_recheck()).
+ */
+static void
+lion_verify_flag_add(LionVerifyState *vs, const LionVerifyFlag *f)
+{
+	if (vs->concurrent)
+		lion_verify_warn_incomplete(vs, f->what, f->blk);
+	else
+		lion_verify_seq_put(&vs->flags, f);
+}
+
+void
+lion_verify_flagged(LionVerifyState *vs, uint16 what, BlockNumber blk,
+					XLogRecPtr lsn)
+{
+	LionVerifyFlag f;
+
+	memset(&f, 0, sizeof(f));
+	f.blk = blk;
+	f.what = what;
+	f.lsn = lsn;
+	f.next = ReadNextFullTransactionId();
+	lion_verify_flag_add(vs, &f);
+}
+
+/*
+ * A standby's flagged pages, at the end of the check: the WARNING for each
+ * that still carries the flag, with the LSN it had - no record has changed
+ * the page since, the one that clears the flag among them - and whose
+ * flag no running transaction can still be about to clear: every
+ * transaction older than the next transaction id noted with the page has
+ * ended (a fresh snapshot's xmin is past it), so the split that flagged it
+ * was abandoned, by an error or by a crash of the primary.  Every other
+ * flag is a split that finished since, or may yet, and is not warned of.
+ * The pages are read with nothing else held, and one that is not a lion
+ * page of the kind it was any more - freed, or reused - is not flagged.
+ */
+void
+lion_verify_flags_recheck(LionVerifyState *vs)
+{
+	LionVerifyFlag f;
+	TransactionId xmin = InvalidTransactionId;
+
+	if (vs->concurrent || vs->flags.n == 0)
+		return;
+
+	/*
+	 * Test hook: a standby's check has walked everything and is about to
+	 * look at the flagged pages it found again.  test/recovery/run.sh phase
+	 * 3 parks here with a split it saw half done on the primary, and lets
+	 * the split finish first.
+	 */
+	LION_INJECTION_POINT("lion-verify-flags-recheck");
+
+	lion_verify_seq_rewind(&vs->flags);
+	while (lion_verify_seq_get(&vs->flags, &f))
+	{
+		Buffer		buf;
+		Page		page;
+		bool		still;
+
+		CHECK_FOR_INTERRUPTS();
+		vs->nflags++;
+		if (!lion_verify_block_exists(vs, f.blk))
+			continue;
+		buf = ReadBuffer(vs->index, f.blk);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		still = !PageIsNew(page) &&
+			PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
+			LionPageGetOpaque(page)->page_id == LION_PAGE_ID &&
+			LionPageIncompleteSplit(page) &&
+			BufferGetLSNAtomic(buf) == f.lsn;
+		UnlockReleaseBuffer(buf);
+		if (!still)
+			continue;
+
+		/* one snapshot for every page: its xmin only grows */
+		if (!TransactionIdIsValid(xmin))
+			xmin = GetLatestSnapshot()->xmin;
+		if (TransactionIdPrecedes(xmin, XidFromFullTransactionId(f.next)))
+			continue;
+		lion_verify_warn_incomplete(vs, f.what, f.blk);
+	}
+	lion_verify_seq_reset(&vs->flags);
 }
 
 /* A walk's result, empty, and what it keeps given back. */
@@ -910,7 +1040,8 @@ static void
 lion_verify_result_init(LionVerifyState *vs, LionVerifySetResult *res)
 {
 	memset(res, 0, sizeof(*res));
-	lion_verify_seq_init(&res->incomplete, &vs->seqacct, sizeof(BlockNumber));
+	lion_verify_seq_init(&res->incomplete, &vs->seqacct,
+						 sizeof(LionVerifyFlag));
 }
 
 static void
@@ -920,29 +1051,37 @@ lion_verify_result_free(LionVerifySetResult *res)
 }
 
 /*
- * A page a walk that may be thrown away found flagged, for the WARNING it
- * gives once it is kept (lion_verify_warn_flagged()); an exact walk has
- * given it already (lion_verify_tree_page()).  Called with the page let go:
- * the list may be in a file.
+ * A page a walk that may be thrown away found flagged, read with LSN lsn,
+ * for lion_verify_flagged() once the walk is kept
+ * (lion_verify_warn_flagged()); an exact walk has given its WARNING already
+ * (lion_verify_tree_page()).  Called with the page let go: the list may be
+ * in a file.
  */
 static void
-lion_verify_note_flagged(LionVerifySetResult *res, BlockNumber blk,
-						 bool exact)
+lion_verify_note_flagged(LionVerifySetResult *res, const LionVerifyTree *tree,
+						 BlockNumber blk, XLogRecPtr lsn, bool exact)
 {
-	if (!exact)
-		lion_verify_seq_put(&res->incomplete, &blk);
+	LionVerifyFlag f;
+
+	if (exact)
+		return;
+	memset(&f, 0, sizeof(f));
+	f.blk = blk;
+	f.what = tree->positions ? LION_VFLAG_POSITION : LION_VFLAG_POSTING;
+	f.lsn = lsn;
+	f.next = ReadNextFullTransactionId();
+	lion_verify_seq_put(&res->incomplete, &f);
 }
 
-/* The WARNINGs of the flagged pages of a walk that is kept. */
+/* The flagged pages of a walk that is kept (lion_verify_flagged()). */
 static void
-lion_verify_warn_flagged(LionVerifyState *vs, const char *what,
-						 LionVerifySetResult *res)
+lion_verify_warn_flagged(LionVerifyState *vs, LionVerifySetResult *res)
 {
-	BlockNumber blk;
+	LionVerifyFlag f;
 
 	lion_verify_seq_rewind(&res->incomplete);
-	while (lion_verify_seq_get(&res->incomplete, &blk))
-		lion_verify_warn_incomplete(vs, what, blk);
+	while (lion_verify_seq_get(&res->incomplete, &f))
+		lion_verify_flag_add(vs, &f);
 }
 
 /*
@@ -951,14 +1090,24 @@ lion_verify_warn_flagged(LionVerifyState *vs, const char *what,
  *
  * With `exact` false the walk is one lion_verify_set() may throw away and
  * repeat, because writers of the key can be changing the set under it; then
- * one check here is not an error but a reason to walk again - the ROOT at
- * another level than the descent found it at, which is what a push-down of
- * the root does (DESIGN.md §22: the root keeps its block and becomes the
- * level above) - and NULL comes back with the buffer released.  Every other
- * check here is exact whatever writers do: VACUUM, the only thing that frees
- * a page, is locked out, so a page reached through a link of the set belongs
- * to the set for as long as the check runs, and no page but the root ever
- * changes level.
+ * a check here may be a reason to walk again instead of an error, and NULL
+ * comes back with the buffer released.  On a primary that is one check: the
+ * ROOT at another level than the descent found it at, which is what a
+ * push-down of the root does (DESIGN.md §22: the root keeps its block and
+ * becomes the level above).  Every other check here is exact there whatever
+ * writers do: VACUUM, the only thing that frees a page or takes a leaf out
+ * of its set, is locked out, so a page reached through a link of the set
+ * belongs to the set for as long as the check runs, and no page but the root
+ * ever changes level.
+ *
+ * Not on a standby, where replay applies VACUUM beside the walk: a leaf
+ * taken out of its set (§22, "Empty leaves") or a whole set freed after the
+ * walk read the link that leads here leaves that link pointing at a page
+ * that is UNLINKED or DELETED by the time the walk gets to it.  There every
+ * check of this page against the tree is a reason to walk again once the
+ * walk has read a page past its replay position, this one included
+ * (lion_verify_moved()), and damage only when it has not: then the walk read
+ * the link and this page as they were at one point of the WAL.
  */
 static Page
 lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
@@ -967,11 +1116,13 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 {
 	Page		page;
 	LionPageOpaque opaque;
+	bool		moved;
 
 	lion_verify_visit(vs, blk, tree->positions ? "a position tree page" :
 					  "a posting tree");
 	page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, bufp);
 	opaque = LionPageGetOpaque(page);
+	moved = !exact && lion_verify_moved(vs);
 
 	/*
 	 * DESIGN.md §18.  A live entry must not reach a freed page at all, and
@@ -981,9 +1132,13 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 	 * the entry's own stamp.
 	 */
 	if (LionPageIsDeleted(page))
+	{
+		if (moved)
+			goto again;
 		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but is marked deleted",
 					RelationGetRelationName(vs->index), blk, tree->eoff,
 					tree->eblk);
+	}
 
 	/*
 	 * DESIGN.md §22, "Empty leaves": a leaf VACUUM took out of the set is
@@ -991,15 +1146,23 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 	 * of a position tree is ever taken out: lion_verify_page_flags().)
 	 */
 	if (LionPageIsUnlinked(page))
+	{
+		if (moved)
+			goto again;
 		lion_corrupt("lion index \"%s\": block %u is reachable from chain entry %u on block %u but was taken out of the posting set",
 					RelationGetRelationName(vs->index), blk, tree->eoff,
 					tree->eblk);
+	}
 
 	if (opaque->owner_head != tree->root || opaque->owner_hash != tree->owner)
+	{
+		if (moved)
+			goto again;
 		lion_corrupt("lion index \"%s\": block %u of chain entry %u on block %u is owned by stamp %u at head %u, expected stamp %u at head %u",
 					RelationGetRelationName(vs->index), blk, tree->eoff,
 					tree->eblk, opaque->owner_hash, opaque->owner_head,
 					tree->owner, tree->root);
+	}
 
 	/*
 	 * ... and is a page of the tree's own kind (DESIGN.md §17).  The owner
@@ -1012,6 +1175,8 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 	 */
 	if (((opaque->flags & LION_PAGE_POSITIONS) != 0) != tree->positions)
 	{
+		if (moved)
+			goto again;
 		if (tree->positions)
 			lion_corrupt("lion index \"%s\": block %u of the position tree of chain entry %u on block %u is not flagged as a page of a position tree",
 						RelationGetRelationName(vs->index), blk, tree->eoff,
@@ -1023,42 +1188,46 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
 
 	if (opaque->level != level)
 	{
-		if (!exact && blk == tree->root)
-		{
-			UnlockReleaseBuffer(*bufp);
-			*bufp = InvalidBuffer;
-			return NULL;
-		}
+		if ((!exact && blk == tree->root) || moved)
+			goto again;
 		lion_corrupt("lion index \"%s\": %s page %u of chain entry %u on block %u is at level %u, expected %u",
 					RelationGetRelationName(vs->index), tree->what, blk,
 					tree->eoff, tree->eblk, opaque->level, level);
 	}
 
 	/*
-	 * A flag seen under a SHARE lock is a split that was abandoned, never one
-	 * in progress: a writer holds the flagged page EXCLUSIVE from the record
-	 * that sets the flag to the one that clears it (DESIGN.md §22), so this
-	 * is exact on a primary.  A walk that may be repeated warns only once it
-	 * is kept, which lion_verify_chain_totals() does (lion_verify_postree(),
-	 * for a position tree); its caller notes the page for that once it has
-	 * let it go (lion_verify_note_flagged()).
+	 * A flag seen under a SHARE lock on a primary is a split that was
+	 * abandoned, never one in progress: a writer holds the flagged page
+	 * EXCLUSIVE from the record that sets the flag to the one that clears it
+	 * (DESIGN.md §22).  A walk that may be repeated says so only once it is
+	 * kept, which lion_verify_chain_totals() does (lion_verify_postree(), for
+	 * a position tree); its caller notes the page for that once it has let it
+	 * go (lion_verify_note_flagged()), and a standby looks at it again at the
+	 * end of the check (lion_verify_flagged()).
 	 *
 	 * The flag is only ever on the LEFT half of a split, which the record
 	 * that sets it links to the split's new page, and which keeps that right
 	 * sibling while the flag lasts: VACUUM takes no empty leaf whose left
 	 * neighbour is flagged, nor a flagged one (§22, "Empty leaves"), and a
 	 * root pushed down flags nothing.  So a rightmost page with the flag - a
-	 * root above the leaves among them - is damage in any walk, not the
-	 * state the next INSERT repairs, which finds no sibling to post.
+	 * root above the leaves among them - is damage in any walk, on a standby
+	 * too, where it is one page as one record left it: not the state the
+	 * next INSERT repairs, which finds no sibling to post.
 	 */
 	if (LionPageIncompleteSplit(page) && LionPageIsRightmost(page))
 		lion_corrupt("lion index \"%s\": %s page %u of chain entry %u on block %u is flagged as an unfinished split, but it is the rightmost page of its level, which no split leaves flagged",
 					RelationGetRelationName(vs->index), tree->what, blk,
 					tree->eoff, tree->eblk);
 	if (LionPageIncompleteSplit(page) && exact)
-		lion_verify_warn_incomplete(vs, tree->what, blk);
+		lion_verify_warn_incomplete(vs, tree->positions ? LION_VFLAG_POSITION :
+									LION_VFLAG_POSTING, blk);
 
 	return page;
+
+again:
+	UnlockReleaseBuffer(*bufp);
+	*bufp = InvalidBuffer;
+	return NULL;
 }
 
 /*
@@ -1072,10 +1241,17 @@ lion_verify_tree_page(LionVerifyState *vs, BlockNumber blk,
  * on the page it read that page's right link from.  So is the set of items
  * the walk sees: an item that moves right in a split the walk has not reached
  * yet is met on its new page, one that moves after the walk read its page was
- * seen there.  What is NOT exact while writers run is how many items there
- * are and which leaf is the last, so those are only collected here and
- * compared by lion_verify_chain_totals() - except in an exact walk, which
- * checks the tail at once, as it always did.
+ * seen there.  Both hold beside the VACUUM a standby replays too, which only
+ * ever takes items out, and a leaf it empties out of the set - which a walk
+ * that read the link to it before is sent round again for
+ * (lion_verify_tree_page()).  What is NOT exact while writers run is how
+ * many items there are and which leaf is the last, so those are only
+ * collected here and compared by lion_verify_chain_totals() - except in an
+ * exact walk, which checks the tail at once, as it always did.
+ *
+ * Each page's LionVerifyPage goes into out for the comparison with the level
+ * above; an exact walk passes none, and that comparison reads the leaves
+ * again instead (LionVerifyBelow).
  */
 static bool
 lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
@@ -1102,6 +1278,7 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 		uint32		minckey = 0;
 		uint32		maxckey = 0;
 		LionVerifyPage pg;
+		XLogRecPtr	lsn;
 
 		page = lion_verify_tree_page(vs, blk, tree, 0, exact, &buf);
 		if (page == NULL)
@@ -1167,19 +1344,21 @@ lion_verify_posting_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 			(LION_VPAGE_FIRST | LION_VPAGE_UPPER) : 0;
 		if (LionPageIncompleteSplit(page))
 			pg.flags |= LION_VPAGE_INCOMPLETE;
+		lsn = BufferGetLSNAtomic(buf);
 
 		last = blk;
 		blk = opaque->rightlink;
 		UnlockReleaseBuffer(buf);
 
 		/* written with the page let go: the sequence may be in a file */
-		lion_verify_seq_put(out, &pg);
+		if (out != NULL)
+			lion_verify_seq_put(out, &pg);
 		sum->npages++;
 		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
 		{
 			if (!BlockNumberIsValid(sum->flagged))
 				sum->flagged = pg.blk;
-			lion_verify_note_flagged(res, pg.blk, exact);
+			lion_verify_note_flagged(res, tree, pg.blk, lsn, exact);
 		}
 
 		/*
@@ -1242,6 +1421,7 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 		uint32		minckey = 0;
 		uint32		maxckey = 0;
 		LionVerifyPage pg;
+		XLogRecPtr	lsn;
 
 		page = lion_verify_tree_page(vs, blk, tree, 0, exact, &buf);
 		if (page == NULL)
@@ -1307,18 +1487,20 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
 		pg.flags = (c != NULL) ? (LION_VPAGE_FIRST | LION_VPAGE_UPPER) : 0;
 		if (LionPageIncompleteSplit(page))
 			pg.flags |= LION_VPAGE_INCOMPLETE;
+		lsn = BufferGetLSNAtomic(buf);
 
 		blk = opaque->rightlink;
 		UnlockReleaseBuffer(buf);
 
 		/* written with the page let go: the sequence may be in a file */
-		lion_verify_seq_put(out, &pg);
+		if (out != NULL)
+			lion_verify_seq_put(out, &pg);
 		sum->npages++;
 		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
 		{
 			if (!BlockNumberIsValid(sum->flagged))
 				sum->flagged = pg.blk;
-			lion_verify_note_flagged(res, pg.blk, exact);
+			lion_verify_note_flagged(res, tree, pg.blk, lsn, exact);
 		}
 
 		CHECK_FOR_INTERRUPTS();
@@ -1379,14 +1561,114 @@ lion_verify_pos_leaves(LionVerifyState *vs, const LionVerifyTree *tree,
  * the tree may name either: a downlink to an unmarked page is the one thing
  * a split behind the walk shows.  In an exact walk nothing can have split,
  * and the comparison reports such a downlink as the mismatch it is.
+ *
+ * On a standby the same holds of a walk that read a page past its replay
+ * position (lion_verify_moved()): replay may have split a page, or unlinked
+ * an empty leaf - which retargets its downlink to its right sibling - behind
+ * either walk, so a downlink to an unmarked page and any mismatch mean
+ * walking again.  A walk that read every page at or below its position read
+ * both levels at one point of the WAL, where they agree on a sound index,
+ * and is held to them as an exact one is.
  */
+
+/*
+ * The pages of level i - 1, as the comparison with level i reads them back
+ * in the order the walk of level i - 1 found them: from that walk's
+ * sequence, or - in an exact walk - from the index itself, along the level's
+ * right links from its leftmost page.  An exact walk holds the entry's
+ * directory leaf, so it must not wait for file I/O, which a sequence past its
+ * share of work_mem costs (2026-10-23 review), and it need not: the writers
+ * of the set wait for the leaf, and VACUUM for the check, so the pages are
+ * what that walk read, and reading one again costs a buffer hit.
+ */
+typedef struct LionVerifyBelow
+{
+	LionVerifySeq *seq;			/* a walk that may be thrown away, or NULL */
+	BlockNumber next;			/* an exact walk: the next page to read */
+	uint16		level;			/* ... of this level */
+	bool		positions;		/* ... of a position tree */
+	int64		n;				/* the pages of the level */
+} LionVerifyBelow;
+
+/*
+ * What the comparison needs of one page of level `level`, read from the page
+ * itself: what the walk of that level collected of it, from the same fields
+ * it checked them against (lion_verify_posting_leaves(),
+ * lion_verify_pos_leaves(), lion_verify_tree_level()).
+ */
+static void
+lion_verify_page_summary(LionVerifyState *vs, BlockNumber blk, Page page,
+						 uint16 level, bool positions, LionVerifyPage *pg)
+{
+	LionPageOpaque opaque = LionPageGetOpaque(page);
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+	memset(pg, 0, sizeof(*pg));
+	pg->blk = blk;
+	if (level == 0)
+	{
+		bool		any = false;
+		OffsetNumber off;
+
+		/* a posting leaf may keep unused line pointers; a position leaf not */
+		for (off = FirstOffsetNumber; off <= maxoff && !any; off++)
+			any = positions ||
+				ItemIdIsUsed(lion_verify_itemid(vs, blk, page, off));
+		if (any)
+		{
+			pg->firstkey = opaque->minckey;
+			pg->upper = opaque->maxckey;
+			pg->flags = LION_VPAGE_FIRST | LION_VPAGE_UPPER;
+		}
+	}
+	else
+	{
+		OffsetNumber firstdata = lion_posting_first_data(page);
+
+		if (!LionPageIsRightmost(page) && maxoff >= FirstOffsetNumber)
+		{
+			pg->upper = lion_posting_pivot(page, FirstOffsetNumber)->ckey;
+			pg->flags |= LION_VPAGE_UPPER;
+		}
+		if (firstdata <= maxoff)
+		{
+			pg->firstkey = lion_posting_pivot(page, firstdata)->ckey;
+			pg->flags |= LION_VPAGE_FIRST;
+		}
+	}
+	if (LionPageIncompleteSplit(page))
+		pg->flags |= LION_VPAGE_INCOMPLETE;
+}
+
+/* The next page of the level below into pg, or false when there is none. */
+static bool
+lion_verify_below_get(LionVerifyState *vs, LionVerifyBelow *b,
+					  LionVerifyPage *pg)
+{
+	Buffer		buf;
+	Page		page;
+
+	if (b->seq != NULL)
+		return lion_verify_seq_get(b->seq, pg);
+	if (!BlockNumberIsValid(b->next))
+		return false;
+	page = lion_verify_read_page(vs, b->next, LION_PAGE_CONTAINER, &buf);
+	if (LionPageGetOpaque(page)->level != b->level)
+		elog(ERROR, "lion index \"%s\": block %u changed level under an exact walk",
+			 RelationGetRelationName(vs->index), b->next);
+	lion_verify_page_summary(vs, b->next, page, b->level, b->positions, pg);
+	b->next = LionPageGetOpaque(page)->rightlink;
+	UnlockReleaseBuffer(buf);
+	return true;
+}
+
 typedef struct LionVerifyMatch
 {
 	LionVerifyState *vs;
 	const LionVerifyTree *tree;
 	uint32		level;			/* i, the level whose downlinks are matched */
 	bool		exact;
-	LionVerifySeq *below;		/* the pages of level i - 1, in order */
+	LionVerifyBelow *below;		/* the pages of level i - 1, in order */
 	int64		ndownlinks;		/* downlinks met so far */
 	LionVerifyPage open;		/* the page the last downlink named, whose */
 	bool		haveopen;		/* ... upper bound the next one gives */
@@ -1403,7 +1685,7 @@ typedef struct LionVerifyMatch
 static void
 lion_verify_match_init(LionVerifyMatch *m, LionVerifyState *vs,
 					   const LionVerifyTree *tree, uint32 level,
-					   LionVerifySeq *below, bool exact)
+					   LionVerifyBelow *below, bool exact)
 {
 	memset(m, 0, sizeof(*m));
 	m->vs = vs;
@@ -1412,7 +1694,8 @@ lion_verify_match_init(LionVerifyMatch *m, LionVerifyState *vs,
 	m->exact = exact;
 	m->below = below;
 	m->parent = InvalidBlockNumber;
-	lion_verify_seq_rewind(below);
+	if (below->seq != NULL)
+		lion_verify_seq_rewind(below->seq);
 }
 
 /* Keep the first mismatch's message, for lion_verify_match_end(). */
@@ -1523,7 +1806,15 @@ lion_verify_match_downlink(LionVerifyMatch *m, BlockNumber child, uint32 sep)
 	int64		j = m->ndownlinks++;
 	LionVerifyPage pg;
 
+	/*
+	 * A downlink to a page no walk reached, in a walk a writer - or, on a
+	 * standby, replay - may have split a page under (above).  A standby's
+	 * walk that has read nothing past its replay position so far compares
+	 * the downlink as an exact walk does; one that reads such a page later
+	 * is thrown away at the end all the same (lion_verify_match_end()).
+	 */
 	if (!m->exact && !m->unseen &&
+		(vs->concurrent || lion_verify_moved(vs)) &&
 		(!lion_verify_block_exists(vs, child) || vs->refs[child] == 0))
 		m->unseen = true;
 	if (m->unseen || m->failure != NULL || m->countoff)
@@ -1537,7 +1828,7 @@ lion_verify_match_downlink(LionVerifyMatch *m, BlockNumber child, uint32 sep)
 			return;
 	}
 
-	while (lion_verify_seq_get(m->below, &pg))
+	while (lion_verify_below_get(vs, m->below, &pg))
 	{
 		bool		previncomplete = m->haveprev &&
 			(m->prev.flags & LION_VPAGE_INCOMPLETE) != 0;
@@ -1592,8 +1883,9 @@ lion_verify_match_downlink(LionVerifyMatch *m, BlockNumber child, uint32 sep)
 /*
  * The walk of level i is over: what is left of level i - 1 can only be the
  * right halves of unfinished splits.  False when the walk has to be
- * repeated (a downlink named a page no walk reached), else the first
- * mismatch is reported, if there is one.
+ * repeated - a downlink named a page no walk reached, or, on a standby, the
+ * comparison found a mismatch after the walk read a page past its replay
+ * position - else the first mismatch is reported, if there is one.
  */
 static bool
 lion_verify_match_end(LionVerifyMatch *m)
@@ -1611,7 +1903,7 @@ lion_verify_match_end(LionVerifyMatch *m)
 	 * there was reported as its walk read it.
 	 */
 	while (m->failure == NULL && !m->countoff &&
-		   lion_verify_seq_get(m->below, &pg))
+		   lion_verify_below_get(m->vs, m->below, &pg))
 	{
 		bool		previncomplete = m->haveprev &&
 			(m->prev.flags & LION_VPAGE_INCOMPLETE) != 0;
@@ -1622,6 +1914,9 @@ lion_verify_match_end(LionVerifyMatch *m)
 			m->countoff = true;
 	}
 
+	if ((m->failure != NULL || m->countoff) && !m->exact &&
+		lion_verify_moved(m->vs))
+		return false;
 	if (m->failure != NULL)
 		lion_corrupt("%s", m->failure);
 	if (m->countoff)
@@ -1636,17 +1931,20 @@ lion_verify_match_end(LionVerifyMatch *m)
 /*
  * Walk one INTERNAL level of a posting set or a position tree, matching its
  * downlinks with the level below as it meets them (match), and writing its
- * own pages into out for the level above, when there is one.  Returns false
- * when the walk has to be repeated (lion_verify_tree_page()).
+ * own pages into out for the level above, when there is one and the walk
+ * keeps sequences (LionVerifyBelow); *npagesp is how many pages it walked.
+ * Returns false when the walk has to be repeated (lion_verify_tree_page()).
  */
 static bool
 lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 					   BlockNumber first, uint16 level, LionVerifySeq *out,
 					   LionVerifyMatch *match, bool exact,
-					   LionVerifySetResult *res)
+					   LionVerifySetResult *res, int64 *npagesp)
 {
 	BlockNumber blk = first;
 	Page		copy = (Page) palloc(BLCKSZ);
+
+	*npagesp = 0;
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -1686,10 +1984,11 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 
 		/*
 		 * The rest is read from a copy, with the page let go: the comparison
-		 * with the level below reads that level's pages back from a file once
-		 * there are more of them than memory keeps, and no buffer lock is
-		 * held over I/O.  The page was read under its SHARE lock, so the copy
-		 * is the page as a writer left it.
+		 * with the level below reads that level's pages back - from a file
+		 * once there are more of them than memory keeps, or from the index in
+		 * an exact walk (LionVerifyBelow) - and no posting page is held while
+		 * it does.  The page was read under its SHARE lock, so the copy is
+		 * the page as a writer left it.
 		 */
 		memcpy(copy, page, BLCKSZ);
 		UnlockReleaseBuffer(buf);
@@ -1777,8 +2076,9 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
 			(LionPageIncompleteSplit(page) ? LION_VPAGE_INCOMPLETE : 0);
 		if (out != NULL)
 			lion_verify_seq_put(out, &pg);
+		(*npagesp)++;
 		if ((pg.flags & LION_VPAGE_INCOMPLETE) != 0)
-			lion_verify_note_flagged(res, blk, exact);
+			lion_verify_note_flagged(res, tree, blk, PageGetLSN(page), exact);
 
 		blk = LionPageGetOpaque(page)->rightlink;
 
@@ -1794,8 +2094,13 @@ lion_verify_tree_level(LionVerifyState *vs, const LionVerifyTree *tree,
  * leftmost[], and the root's level into *height.  The pages are read, not
  * visited: the level walks visit them.  An ERROR raised with a buffer locked
  * releases it on the way out, as everywhere else in this file.
+ *
+ * False on a standby when a page of the descent is not what its parent
+ * promises and the walk has read a page past its replay position by then: a
+ * set freed, or its root pushed down, under the descent (lion_verify_moved(),
+ * lion_verify_tree_page()), and the walk is made again.
  */
-static void
+static bool
 lion_verify_tree_leftmost(LionVerifyState *vs, const LionVerifyTree *tree,
 						  BlockNumber *leftmost, uint32 *height)
 {
@@ -1824,6 +2129,16 @@ lion_verify_tree_leftmost(LionVerifyState *vs, const LionVerifyTree *tree,
 		/* the block's range, the header and the page kind */
 		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
 
+		/* what a set freed under the walk leaves, which the walk would meet */
+		if (lion_verify_moved(vs) &&
+			(LionPageIsDeleted(page) || LionPageIsUnlinked(page) ||
+			 LionPageGetOpaque(page)->owner_head != tree->root ||
+			 LionPageGetOpaque(page)->owner_hash != tree->owner))
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+
 		level = LionPageGetOpaque(page)->level;
 		if (level > LION_POSTING_MAX_HEIGHT)
 			lion_corrupt("lion index \"%s\": %s page %u claims level %u",
@@ -1832,9 +2147,16 @@ lion_verify_tree_leftmost(LionVerifyState *vs, const LionVerifyTree *tree,
 		if (blk == tree->root)
 			*height = level;
 		else if (level != expect)
+		{
+			if (lion_verify_moved(vs))
+			{
+				UnlockReleaseBuffer(buf);
+				return false;
+			}
 			lion_corrupt("lion index \"%s\": %s page %u is at level %u, but its parent is at level %u",
 						RelationGetRelationName(vs->index), tree->what, blk,
 						level, expect + 1);
+		}
 
 		/*
 		 * A root at level 0 is the first leaf of a tree without an internal
@@ -1875,6 +2197,7 @@ lion_verify_tree_leftmost(LionVerifyState *vs, const LionVerifyTree *tree,
 		expect = level - 1;
 		UnlockReleaseBuffer(buf);
 	}
+	return true;
 }
 
 /*
@@ -1921,31 +2244,45 @@ lion_verify_flat(LionVerifyState *vs, const LionVerifyTree *tree,
  * Walk the levels of a tree above its leaves, from the bottom up, each
  * matched with the level below as its walk meets its downlinks
  * (LionVerifyMatch).  lv[0] holds the leaves' pages, as their walk found
- * them; lv[1] is empty, and the two take turns as the level below and the
- * level being walked.  Returns false when the walk has to be repeated.
+ * them - nleaves of them; lv[1] is empty, and the two take turns as the
+ * level below and the level being walked.  An exact walk keeps no sequence
+ * and reads each level below again instead (LionVerifyBelow), and lv is
+ * NULL.  Returns false when the walk has to be repeated.
  */
 static bool
 lion_verify_tree_levels(LionVerifyState *vs, const LionVerifyTree *tree,
 						const BlockNumber *leftmost, uint32 height,
-						LionVerifySeq *lv, bool exact,
+						LionVerifySeq *lv, int64 nleaves, bool exact,
 						LionVerifySetResult *res)
 {
+	int64		nbelow = nleaves;
 	uint32		i;
 
+	Assert(exact == (lv == NULL));
 	for (i = 1; i <= height; i++)
 	{
-		LionVerifySeq *below = &lv[(i - 1) % 2];
-		LionVerifySeq *above = &lv[i % 2];
+		LionVerifySeq *above = exact ? NULL : &lv[i % 2];
+		LionVerifyBelow below;
 		LionVerifyMatch match;
+		int64		nlevel;
+
+		memset(&below, 0, sizeof(below));
+		below.seq = exact ? NULL : &lv[(i - 1) % 2];
+		below.next = leftmost[i - 1];
+		below.level = (uint16) (i - 1);
+		below.positions = tree->positions;
+		below.n = nbelow;
 
 		/* the root's level has no level above it to be matched with */
-		lion_verify_seq_reset(above);
-		lion_verify_match_init(&match, vs, tree, i, below, exact);
+		if (above != NULL)
+			lion_verify_seq_reset(above);
+		lion_verify_match_init(&match, vs, tree, i, &below, exact);
 		if (!lion_verify_tree_level(vs, tree, leftmost[i], (uint16) i,
 									(i < height) ? above : NULL, &match,
-									exact, res) ||
+									exact, res, &nlevel) ||
 			!lion_verify_match_end(&match))
 			return false;
+		nbelow = nlevel;
 	}
 	return true;
 }
@@ -1986,6 +2323,10 @@ lion_verify_tree_levels(LionVerifyState *vs, const LionVerifyTree *tree,
  * read before it began: what it keeps of each page is one LionVerifyPage, in
  * a sequence that goes to a temporary file past its share of work_mem
  * (LionVerifySeq), so that a set of any size is walked in the same memory.
+ * An exact walk keeps none: it holds the entry's leaf, and the writers of
+ * every key on that leaf wait for it, so it reads the level below again from
+ * the index instead, a buffer hit a page, and never waits for a file while
+ * it holds the leaf (LionVerifyBelow).
  *
  * The position tree of the entry, which is a posting tree too, is walked the
  * same way by lion_verify_postree().
@@ -2008,14 +2349,15 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					lion_entry_head(entry), lion_entry_tail(entry));
 
 	lion_verify_tree_init(&tree, eblk, eoff, entry, false);
-	lion_verify_tree_leftmost(vs, &tree, leftmost, &height);
+	if (!lion_verify_tree_leftmost(vs, &tree, leftmost, &height))
+		return false;
 
 	res->height = height;
 	lion_verify_seq_init(&lv[0], &vs->seqacct, sizeof(LionVerifyPage));
 	lion_verify_seq_init(&lv[1], &vs->seqacct, sizeof(LionVerifyPage));
 
-	ok = lion_verify_posting_leaves(vs, &tree, entry, leftmost[0], &lv[0],
-									&sum, exact, res) &&
+	ok = lion_verify_posting_leaves(vs, &tree, entry, leftmost[0],
+									exact ? NULL : &lv[0], &sum, exact, res) &&
 		(height > 0 || lion_verify_flat(vs, &tree, &sum, exact));
 
 	/*
@@ -2028,7 +2370,8 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 	if (ok && !exact)
 		LION_INJECTION_POINT("lion-verify-set-leaves-walked");
 
-	ok = ok && lion_verify_tree_levels(vs, &tree, leftmost, height, lv, exact,
+	ok = ok && lion_verify_tree_levels(vs, &tree, leftmost, height,
+									   exact ? NULL : lv, sum.npages, exact,
 									   res);
 	lion_verify_seq_free(&lv[0]);
 	lion_verify_seq_free(&lv[1]);
@@ -2040,23 +2383,16 @@ lion_verify_chain(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  * against `tail`, the TIDs and items against `ntids` and `ncontainers`.  Only
  * for a walk that is kept: an exact one, or one lion_verify_set() found the
  * entry unchanged around - or, with compare false, the one a standby keeps of
- * a set that replay would not leave alone, which is compared with nothing.
- * Also where a kept walk's unfinished-split warnings are given, so that a walk
- * that is thrown away and repeated gives them once.
+ * a set that replay would not leave alone, which is compared with nothing, or
+ * settles with a counting pass (lion_verify_set_count()).  Also where a kept
+ * walk's unfinished-split warnings are given, so that a walk that is thrown
+ * away and repeated gives them once.
  */
 static void
-lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
-						 OffsetNumber eoff, const LionEntryTuple *entry,
-						 LionVerifySetResult *res, bool compare)
+lion_verify_chain_compare(LionVerifyState *vs, BlockNumber eblk,
+						  OffsetNumber eoff, const LionEntryTuple *entry,
+						  const LionVerifySetResult *res)
 {
-	lion_verify_warn_flagged(vs, "posting", res);
-
-	if (res->height > vs->max_posting_height)
-		vs->max_posting_height = res->height;
-
-	if (!compare)
-		return;
-
 	if (res->last != lion_entry_tail(entry))
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u ends at block %u, but its tail is block %u",
 					RelationGetRelationName(vs->index), eoff, eblk, res->last,
@@ -2071,6 +2407,20 @@ lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u claims %u containers, but its posting tree holds %u",
 					RelationGetRelationName(vs->index), eoff, eblk,
 					lion_entry_ncontainers(entry), res->ncontainers);
+}
+
+static void
+lion_verify_chain_totals(LionVerifyState *vs, BlockNumber eblk,
+						 OffsetNumber eoff, const LionEntryTuple *entry,
+						 LionVerifySetResult *res, bool compare)
+{
+	lion_verify_warn_flagged(vs, res);
+
+	if (res->height > vs->max_posting_height)
+		vs->max_posting_height = res->height;
+
+	if (compare)
+		lion_verify_chain_compare(vs, eblk, eoff, entry, res);
 }
 
 /*
@@ -2093,7 +2443,7 @@ lion_verify_chain_agrees(const LionEntryTuple *entry,
  * least the LSN of every page replay has changed so far and below that of
  * every page it changes next (lion_verify_read_page() notes one).
  */
-static void
+void
 lion_verify_lsn_begin(LionVerifyState *vs)
 {
 	vs->lsnhorizon = GetXLogReplayRecPtr(NULL);
@@ -2108,10 +2458,26 @@ lion_verify_lsn_at(const LionVerifyState *vs)
 	return !vs->lsnpast;
 }
 
-static void
+void
 lion_verify_lsn_end(LionVerifyState *vs)
 {
 	vs->lsntrack = false;
+}
+
+/*
+ * A standby's walk has read its entry again since it noted its replay
+ * position, as it does before it reads anything of the tree: the entry is as
+ * it was at that position or as replay left it since, and either way names
+ * the tree the walk is of - its root keeps its block for as long as the
+ * entry is a CHAIN entry (DESIGN.md §22), and a set freed under the walk is
+ * one whose pages the walk finds freed past the position
+ * (lion_verify_tree_page()).  So the read of the entry's leaf is not held to
+ * the position; the one after the walk is, for the totals.
+ */
+static void
+lion_verify_lsn_forget(LionVerifyState *vs)
+{
+	vs->lsnpast = false;
 }
 
 /* Does the entry header read now say what the one read before said? */
@@ -2123,22 +2489,43 @@ lion_verify_same_entry(const LionEntryTuple *a, const LionEntryTuple *b)
 }
 
 /*
+ * Where the entry a walk is of was last seen: its directory leaf, its offset
+ * there, and the leaf's LSN then - at first the directory walk's copy of the
+ * leaf (lion_verify_entry()).
+ */
+typedef struct LionVerifySeen
+{
+	BlockNumber blk;
+	OffsetNumber off;
+	XLogRecPtr	lsn;
+} LionVerifySeen;
+
+/*
  * Find the entry `cur` names again, by its exact stored key, and copy its
  * header - flags, head, tail, counters - over cur's; the key, the hash and the
- * column cannot change.  *blkp is the leaf it was last seen on and the search
- * starts there and goes right: an entry only ever leaves its leaf in a split,
- * for the page the split links immediately to the right (DESIGN.md §21), and
- * nothing deletes an entry while VACUUM is locked out.  So the leaf whose high
- * key is above the key is where the entry is, and its absence there is
- * corruption.  With keep the leaf comes back locked SHARE (the last resort of
- * lion_verify_set()), else it is released.
+ * column cannot change.  seen->blk is the leaf it was last seen on and the
+ * search starts there and goes right: an entry only ever leaves its leaf in a
+ * split, for the page the split links immediately to the right (DESIGN.md
+ * §21), and nothing deletes an entry while VACUUM is locked out.  So the leaf
+ * whose high key is above the key is where the entry is, and its absence
+ * there is corruption.  With leafp the leaf comes back locked SHARE in
+ * *leafp (the last resort of lion_verify_set()), else it is released.
+ *
+ * On a standby replay applies VACUUM, which deletes the entry of a key whose
+ * last row it took out - and frees the set with it - and turns a CHAIN entry
+ * that it shrank back into an INLINE one.  There an entry that is not where
+ * its key sorts, or not of the form it had, is reported only when the leaf it
+ * was looked for on is the leaf it was last seen on, with the LSN it had then:
+ * nothing changed the leaf in between, so the entry it held then is still
+ * there.  Otherwise the entry has gone, and false comes back: there is nothing
+ * left of it to check.
  */
-static Buffer
-lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
-				   OffsetNumber *offp, bool keep)
+static bool
+lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur,
+				   LionVerifySeen *seen, Buffer *leafp)
 {
 	LionSearchKey sk;
-	BlockNumber blk = *blkp;
+	BlockNumber blk = seen->blk;
 	BlockNumber steps = 0;
 
 	lion_search_key_exact(vs->ix, &sk, cur);
@@ -2151,6 +2538,7 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
 		OffsetNumber off;
 		ItemId		iid;
 		LionEntryTuple *item;
+		bool		gone;
 
 		page = lion_verify_read_page(vs, blk, LION_PAGE_BUCKET, &buf);
 		if (LionPageGetOpaque(page)->level != 0)
@@ -2178,19 +2566,31 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
 			UnlockReleaseBuffer(buf);
 			if (++steps > vs->nblocks)
 				lion_corrupt("lion index \"%s\": the right links of the directory leaves from block %u go round in a cycle",
-							RelationGetRelationName(vs->index), *blkp);
+							RelationGetRelationName(vs->index), seen->blk);
 			blk = next;
 			CHECK_FOR_INTERRUPTS();
 			continue;
 		}
+
+		/* on a standby: has replay changed the leaf since the entry was seen? */
+		gone = !vs->concurrent &&
+			(blk != seen->blk || BufferGetLSNAtomic(buf) != seen->lsn);
 
 		off = lion_dir_binsrch(page, &sk);
 		iid = (off <= maxoff) ? PageGetItemId(page, off) : NULL;
 		item = (iid != NULL && ItemIdIsUsed(iid)) ?
 			(LionEntryTuple *) PageGetItem(page, iid) : NULL;
 		if (item == NULL || lion_cmp_entry(item, &sk) != 0)
+		{
+			if (gone)
+			{
+				UnlockReleaseBuffer(buf);
+				return false;
+			}
 			lion_corrupt("lion index \"%s\": entry %u on block %u is not on block %u, where its key sorts",
-						RelationGetRelationName(vs->index), *offp, *blkp, blk);
+						RelationGetRelationName(vs->index), seen->off,
+						seen->blk, blk);
+		}
 		if ((item->flags & LION_ENTRY_CHAIN) != 0 &&
 			ItemIdGetLength(iid) != LionEntryPayloadOffset(item))
 			lion_corrupt("lion index \"%s\": chain entry %u on block %u is %zu bytes, expected %zu",
@@ -2199,55 +2599,251 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
 						LionEntryPayloadOffset(item));
 
 		/*
-		 * A CHAIN entry never goes back to INLINE, and its key and column are
-		 * its own, so the header it has now has the form cur has: anything
-		 * else is not the entry cur was copied from.
+		 * A CHAIN entry never goes back to INLINE beside the check on a
+		 * primary, and its key and column are its own, so the header it has
+		 * now has the form cur has: anything else is not the entry cur was
+		 * copied from.
 		 */
 		if (((item->flags ^ cur->flags) &
 			 (LION_ENTRY_CHAIN | LION_ENTRY_ALIGNKEY | LION_ENTRY_POSITIONS)) != 0)
+		{
+			if (gone)
+			{
+				UnlockReleaseBuffer(buf);
+				return false;
+			}
 			lion_corrupt("lion index \"%s\": entry %u on block %u changed its header form from flags 0x%04X to 0x%04X",
 						RelationGetRelationName(vs->index), off, blk,
 						cur->flags, item->flags);
+		}
 		memcpy(cur, item, LionEntryHdrSize(item));
 
-		*blkp = blk;
-		*offp = off;
-		if (keep)
-			return buf;
-		UnlockReleaseBuffer(buf);
-		return InvalidBuffer;
+		seen->blk = blk;
+		seen->off = off;
+		seen->lsn = BufferGetLSNAtomic(buf);
+		if (leafp != NULL)
+			*leafp = buf;
+		else
+			UnlockReleaseBuffer(buf);
+		return true;
 	}
 }
 
 /*
+ * Count the TIDs, the items and the last leaf of the posting set of cur, as
+ * lion_verify_posting_leaves() does, and check nothing: the root, the first
+ * downlink of every level down to the leaves, and the leaves along their
+ * right links, each read under its SHARE lock and let go at once, and none
+ * of them visited.  The walk before it has checked every page of the set; so
+ * a page here that is not one of the set's - freed, taken out of it, at
+ * another level than its parent says - is what replay did to the set since,
+ * and false says so.  A leaf replay took out of the set under it is empty
+ * and keeps its right link, and is walked through, as readers do (DESIGN.md
+ * §22, "Empty leaves").
+ */
+static bool
+lion_verify_set_tally(LionVerifyState *vs, const LionEntryTuple *cur,
+					  LionVerifySetResult *cnt)
+{
+	BlockNumber root = lion_entry_head(cur);
+	uint32		owner = lion_entry_owner(cur);
+	BlockNumber blk = root;
+	BlockNumber steps = 0;
+	int			expect = -1;
+
+	cnt->card = 0;
+	cnt->ncontainers = 0;
+	cnt->last = InvalidBlockNumber;
+
+	for (;;)
+	{
+		Buffer		buf;
+		Page		page;
+		LionPageOpaque opaque;
+		OffsetNumber firstdata;
+		ItemId		iid;
+
+		if (++steps > LION_POSTING_MAX_HEIGHT + 1)
+			return false;
+		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
+		opaque = LionPageGetOpaque(page);
+		if (LionPageIsDeleted(page) || LionPageIsUnlinked(page) ||
+			opaque->owner_head != root || opaque->owner_hash != owner ||
+			(opaque->flags & LION_PAGE_POSITIONS) != 0 ||
+			opaque->level > LION_POSTING_MAX_HEIGHT ||
+			(expect >= 0 && opaque->level != expect))
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		if (opaque->level == 0)
+		{
+			UnlockReleaseBuffer(buf);
+			break;
+		}
+		firstdata = lion_posting_first_data(page);
+		if (firstdata > PageGetMaxOffsetNumber(page))
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		iid = lion_verify_itemid(vs, blk, page, firstdata);
+		if (!ItemIdIsUsed(iid) ||
+			ItemIdGetLength(iid) != LION_POSTING_PIVOT_SIZE)
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		expect = opaque->level - 1;
+		blk = lion_posting_pivot(page, firstdata)->child;
+		UnlockReleaseBuffer(buf);
+	}
+
+	steps = 0;
+	while (BlockNumberIsValid(blk))
+	{
+		Buffer		buf;
+		Page		page;
+		LionPageOpaque opaque;
+		BlockNumber next;
+
+		if (++steps > vs->nblocks)
+			return false;
+		page = lion_verify_read_page(vs, blk, LION_PAGE_CONTAINER, &buf);
+		opaque = LionPageGetOpaque(page);
+		if (LionPageIsDeleted(page) || opaque->owner_head != root ||
+			opaque->owner_hash != owner ||
+			(opaque->flags & LION_PAGE_POSITIONS) != 0 || opaque->level != 0)
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
+		if (!LionPageIsUnlinked(page))
+		{
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+			OffsetNumber off;
+
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				ItemId		iid = lion_verify_itemid(vs, blk, page, off);
+
+				if (!ItemIdIsUsed(iid))
+					continue;
+				if (ItemIdGetLength(iid) < LION_CONTAINER_HDRSZ)
+				{
+					UnlockReleaseBuffer(buf);
+					return false;
+				}
+				cnt->card += ((LionContainer *) PageGetItem(page, iid))->cardinality;
+				cnt->ncontainers++;
+			}
+			cnt->last = blk;
+		}
+		next = opaque->rightlink;
+		UnlockReleaseBuffer(buf);
+		blk = next;
+		CHECK_FOR_INTERRUPTS();
+	}
+	return true;
+}
+
+/*
+ * Settle, on a standby, the totals of a set whose walk got to its end while
+ * replay changed it, with at most LION_VERIFY_STANDBY_PASSES counting passes
+ * (lion_verify_set_tally()), each between two reads of the entry, as a walk
+ * is.  A pass that read every page - the entry's leaf after it among them -
+ * at or below the replay position it began at read the set and its entry at
+ * one point of the primary's WAL, and its totals are compared with the
+ * entry's there: a difference is damage.  One that agrees with an entry that
+ * read the same both times is kept too: what it counted is there.  A pass
+ * is a fraction of a walk, and so is far likelier to read one point under a
+ * steady replay, which changes the set's last leaf and the entry's with
+ * every row it adds.  True when a pass settled the totals, or the entry has
+ * gone (*gonep); false when none did.
+ */
+static bool
+lion_verify_set_count(LionVerifyState *vs, LionEntryTuple *cur,
+					  LionVerifySeen *seen, bool *gonep)
+{
+	int			pass;
+
+	*gonep = false;
+	for (pass = 0; pass < LION_VERIFY_STANDBY_PASSES; pass++)
+	{
+		union
+		{
+			LionEntryTuple e;
+			LionEntryChainHdr c;	/* room for either header form */
+		}			before;
+		LionVerifySetResult cnt;
+		bool		counted;
+
+		CHECK_FOR_INTERRUPTS();
+		vs->nsetcounts++;
+		memset(&cnt, 0, sizeof(cnt));
+		lion_verify_lsn_begin(vs);
+		if (!lion_verify_refind(vs, cur, seen, NULL))
+		{
+			lion_verify_lsn_end(vs);
+			*gonep = true;
+			return true;
+		}
+		lion_verify_lsn_forget(vs);
+		memcpy(&before, cur, LionEntryHdrSize(cur));
+		counted = lion_verify_set_tally(vs, cur, &cnt);
+		if (!lion_verify_refind(vs, cur, seen, NULL))
+		{
+			lion_verify_lsn_end(vs);
+			*gonep = true;
+			return true;
+		}
+		lion_verify_lsn_end(vs);
+		if (!counted)
+			continue;
+		if (lion_verify_lsn_at(vs))
+		{
+			lion_verify_chain_compare(vs, seen->blk, seen->off, cur, &cnt);
+			return true;
+		}
+		if (lion_verify_same_entry(&before.e, cur) &&
+			lion_verify_chain_agrees(cur, &cnt))
+			return true;
+	}
+	return false;
+}
+
+/*
  * Walk and check the posting set of the CHAIN entry `entry`, which the walk
- * of the directory found at (eblk, eoff) - on its copy of the leaf, with the
- * leaf itself no longer locked (DESIGN.md §7).
+ * of the directory found at (eblk, eoff) - on its copy of the leaf, whose LSN
+ * is elsn, with the leaf itself no longer locked (DESIGN.md §7).
  *
  * The counters of a set that writers are adding to cannot be compared with
  * its containers by a walk that holds nothing, and holding the entry's leaf
  * for every walk would keep the writers of every key on that leaf waiting
- * for it.  So the set is walked with nothing held, and the entry read again
- * afterwards, and the walk is kept when the entry reads the same both times.
- * That is exact, for two reasons.  Every writer of a key holds the directory
- * leaf of its entry EXCLUSIVE from its first record to its last (§5, §21),
- * and the entry was read under a SHARE lock both times, so a writer that
- * changed the set in between did all of it in between.  And every change an
- * INSERT makes to a set moves the entry: an item added, grown or split off
- * adds a TID to `ntids` in the record that places it, a push-down of the root
- * moves `tail`; the one kind of writer that adds no TID - one that finishes an
- * abandoned split on its way down and then finds its TID already there, or
- * fails - only adds a downlink and clears a flag, which the walk accepts
- * either way, and whatever internal split that makes shows up as a downlink
- * the walk of the level below never saw, which throws the walk away too.
- * VACUUM, the one writer that changes containers without adding TIDs, is
- * locked out.
+ * for it.  So the entry is read again, the set walked with nothing held, and
+ * the entry read again afterwards, and the walk is kept when the entry reads
+ * the same both times.  That is exact, for two reasons.  Every writer of a
+ * key holds the directory leaf of its entry EXCLUSIVE from its first record
+ * to its last (§5, §21), and the entry was read under a SHARE lock both
+ * times, so a writer that changed the set in between did all of it in
+ * between.  And every change an INSERT makes to a set moves the entry: an
+ * item added, grown or split off adds a TID to `ntids` in the record that
+ * places it, a push-down of the root moves `tail`; the one kind of writer
+ * that adds no TID - one that finishes an abandoned split on its way down and
+ * then finds its TID already there, or fails - only adds a downlink and
+ * clears a flag, which the walk accepts either way, and whatever internal
+ * split that makes shows up as a downlink the walk of the level below never
+ * saw, which throws the walk away too.  VACUUM, the one writer that changes
+ * containers without adding TIDs, is locked out.  The entry is read before
+ * the first walk as before every other, and not taken from the directory
+ * walk's copy, which writers have usually moved on from by the time the set
+ * is walked (2026-10-23 review).
  *
  * A set that keeps changing - a hot key - is walked at most
  * LION_VERIFY_SET_ATTEMPTS times that way, and then once more with the leaf
- * held SHARE throughout.  That is the lock order every writer uses (directory
- * page before posting page, §5), and it keeps waiting only the writers of the
- * keys on that one leaf, for one walk of one set.
+ * held SHARE throughout.  That is the lock order every writer uses
+ * (directory page before posting page, §5), and it keeps waiting only the
+ * writers of the keys on that one leaf, for one walk of one set.
  *
  * On a standby the set is walked the same way, and NEVER with its leaf held
  * (DESIGN.md §25).  Replay takes the blocks of a record in the order the
@@ -2273,28 +2869,33 @@ lion_verify_refind(LionVerifyState *vs, LionEntryTuple *cur, BlockNumber *blkp,
  * when it read every page, the entry's leaf after it among them, as it was
  * at the replay position it began at (lion_verify_lsn_begin()): then it read
  * the set and the entry at one point of the primary's WAL, where they agree
- * unless the index is damaged, and a difference is reported.  Any other
- * walk is walked again.  A set that replay keeps changing has no last resort
- * there, so after LION_VERIFY_SET_ATTEMPTS walks the next one that gets to
- * the end of the set is kept - every page it read is checked - and its
- * totals are not compared with the entry, which a WARNING says.  Only a root
- * pushed down or an upper level split under the walk stops one short of the
- * end, and a set that does that to LION_VERIFY_STANDBY_WALKS walks is an
- * ERROR asking for replay to be paused.
+ * unless the index is damaged, and a difference is reported.  A walk that
+ * replay changed a page of under it is walked again: what it found against
+ * the tree may be replay's doing (lion_verify_tree_page(),
+ * lion_verify_match_end()).  One that got to the end and is neither of the
+ * two is kept for what it checked, and its totals are settled by counting
+ * passes (lion_verify_set_count()) - and when none of those settles them
+ * either, it is kept without the comparison, which a WARNING says.  The
+ * VACUUM replay applies can take the entry away too, and the set with it
+ * (lion_verify_refind()): then the check of the set ends there.  Only a set
+ * that replay keeps from being walked to its end LION_VERIFY_STANDBY_WALKS
+ * times is an ERROR asking for replay to be paused.
  */
 static void
 lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-					  const LionEntryTuple *entry)
+					  XLogRecPtr elsn, const LionEntryTuple *entry)
 {
 	Size		sz = LionEntryPayloadOffset(entry);
 	LionEntryTuple *cur = (LionEntryTuple *) palloc(sz);
-	BlockNumber blk = eblk;
-	OffsetNumber off = eoff;
+	LionVerifySeen seen;
 	LionVerifySetResult res;
 	Buffer		leaf;
 	int			attempt;
 
 	memcpy(cur, entry, sz);
+	seen.blk = eblk;
+	seen.off = eoff;
+	seen.lsn = elsn;
 
 	for (attempt = 0;; attempt++)
 	{
@@ -2304,6 +2905,7 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 			LionEntryChainHdr c;	/* room for either header form */
 		}			before;
 		bool		ok;
+		bool		gone;
 
 		/*
 		 * Test hook: the last walk was thrown away, the entry is read again,
@@ -2313,7 +2915,6 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		 * from one still to wake from the point, but it can tell two points
 		 * apart.
 		 */
-		memcpy(&before, cur, LionEntryHdrSize(cur));
 		if (attempt > 0)
 			LION_INJECTION_POINT("lion-verify-set-rewalk");
 
@@ -2322,8 +2923,31 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		vs->nsetwalks++;
 		if (!vs->concurrent)
 			lion_verify_lsn_begin(vs);
-		ok = lion_verify_chain(vs, blk, off, cur, false, &res);
-		(void) lion_verify_refind(vs, cur, &blk, &off, false);
+		if (!lion_verify_refind(vs, cur, &seen, NULL))
+		{
+			/* replay took the entry away before the walk began */
+			lion_verify_lsn_end(vs);
+			lion_verify_track_end(vs, false);
+			lion_verify_result_free(&res);
+			pfree(cur);
+			return;
+		}
+		if (!vs->concurrent)
+			lion_verify_lsn_forget(vs);
+		memcpy(&before, cur, LionEntryHdrSize(cur));
+		ok = lion_verify_chain(vs, seen.blk, seen.off, cur, false, &res);
+		if (!lion_verify_refind(vs, cur, &seen, NULL))
+		{
+			/*
+			 * ... or during it: what the walk read of the set is kept, the
+			 * pages marked as reached, and nothing is compared.
+			 */
+			lion_verify_lsn_end(vs);
+			lion_verify_track_end(vs, true);
+			lion_verify_result_free(&res);
+			pfree(cur);
+			return;
+		}
 		if (!vs->concurrent)
 			lion_verify_lsn_end(vs);
 
@@ -2334,26 +2958,36 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 					 lion_verify_chain_agrees(cur, &res)))))
 		{
 			lion_verify_track_end(vs, true);
-			lion_verify_chain_totals(vs, blk, off, cur, &res, true);
+			lion_verify_chain_totals(vs, seen.blk, seen.off, cur, &res, true);
 			lion_verify_result_free(&res);
 			pfree(cur);
 			return;
 		}
 
-		/* A standby's last resort: the walk, without the totals (above). */
-		if (!vs->concurrent && ok && attempt + 1 >= LION_VERIFY_SET_ATTEMPTS &&
-			(cur->flags & LION_ENTRY_CHAIN) != 0)
+		/*
+		 * A standby's walk that got to the end of the set while replay
+		 * changed it: kept for what it checked, and its totals settled by
+		 * counting passes, or compared with nothing (above).
+		 */
+		if (!vs->concurrent && ok)
 		{
+			bool		settled;
+
 			lion_verify_track_end(vs, true);
-			lion_verify_chain_totals(vs, blk, off, cur, &res, false);
+			lion_verify_chain_totals(vs, seen.blk, seen.off, cur, &res, false);
 			lion_verify_result_free(&res);
-			vs->nsetuncompared++;
-			ereport(WARNING,
-					(errmsg("lion index \"%s\": the totals of chain entry %u on block %u were not compared with its posting set",
-							RelationGetRelationName(vs->index), off, blk),
-					 errdetail("Recovery changed the set during each of the %d walks made of it; every page of the last one was checked.",
-							   attempt + 1),
-					 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()) to compare them.")));
+			settled = lion_verify_set_count(vs, cur, &seen, &gone);
+			if (!settled)
+			{
+				vs->nsetuncompared++;
+				ereport(WARNING,
+						(errmsg("lion index \"%s\": the totals of chain entry %u on block %u were not compared with its posting set",
+								RelationGetRelationName(vs->index), seen.off,
+								seen.blk),
+						 errdetail("Recovery changed the set during the walk made of it and during each of the %d passes that counted it again; every page of the walk was checked.",
+								   LION_VERIFY_STANDBY_PASSES),
+						 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()) to compare them.")));
+			}
 			pfree(cur);
 			return;
 		}
@@ -2362,30 +2996,24 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 		lion_verify_track_end(vs, false);
 		lion_verify_result_free(&res);
 		vs->nsetretries++;
-		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
-			break;				/* reported below */
 		if (attempt + 1 >= (vs->concurrent ? LION_VERIFY_SET_ATTEMPTS :
 							LION_VERIFY_STANDBY_WALKS))
 			break;
 	}
 
 	if (!vs->concurrent)
-	{
-		if ((cur->flags & LION_ENTRY_CHAIN) == 0)
-			lion_corrupt("lion index \"%s\": chain entry %u on block %u is an inline entry now",
-						RelationGetRelationName(vs->index), off, blk);
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("lion index \"%s\": could not walk the posting set of chain entry %u on block %u to its end",
-						RelationGetRelationName(vs->index), off, blk),
-				 errdetail("Recovery changed the upper levels of the set during each of the %d walks made of it.",
+						RelationGetRelationName(vs->index), seen.off,
+						seen.blk),
+				 errdetail("Recovery changed the set during each of the %d walks made of it.",
 						   attempt + 1),
 				 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()).")));
-	}
 
 	vs->nsetwalks++;
 	vs->nsetholds++;
-	leaf = lion_verify_refind(vs, cur, &blk, &off, true);
+	(void) lion_verify_refind(vs, cur, &seen, &leaf);
 
 	/*
 	 * Test hook: the leaf is held and the exact walk is about to begin.
@@ -2396,10 +3024,10 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
 
 	if ((cur->flags & LION_ENTRY_CHAIN) == 0)
 		lion_corrupt("lion index \"%s\": chain entry %u on block %u is an inline entry now",
-					RelationGetRelationName(vs->index), off, blk);
+					RelationGetRelationName(vs->index), seen.off, seen.blk);
 	lion_verify_result_init(vs, &res);
-	(void) lion_verify_chain(vs, blk, off, cur, true, &res);
-	lion_verify_chain_totals(vs, blk, off, cur, &res, true);
+	(void) lion_verify_chain(vs, seen.blk, seen.off, cur, true, &res);
+	lion_verify_chain_totals(vs, seen.blk, seen.off, cur, &res, true);
 	lion_verify_result_free(&res);
 	UnlockReleaseBuffer(leaf);
 	pfree(cur);
@@ -2413,11 +3041,11 @@ lion_verify_set_walks(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
  */
 static void
 lion_verify_set(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-				const LionEntryTuple *entry)
+				XLogRecPtr elsn, const LionEntryTuple *entry)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(vs->setcxt);
 
-	lion_verify_set_walks(vs, eblk, eoff, entry);
+	lion_verify_set_walks(vs, eblk, eoff, elsn, entry);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(vs->setcxt);
 }
@@ -2497,10 +3125,14 @@ typedef struct LionVerifyLeaves
  *
  * The tree's own walk has just checked every page of it, and no page leaves
  * a tree while VACUUM is locked out, so anything but a leaf of the tree here
- * is damage - with one exception, in a walk that may be repeated: a push-down
- * of the root keeps its block and makes it the level above (DESIGN.md §22),
- * so the first leaf of a tree without an internal level, which is its root,
- * can be an internal page by now.  False says so, and the walk is repeated.
+ * is damage - with two exceptions, in a walk that may be repeated.  A
+ * push-down of the root keeps its block and makes it the level above
+ * (DESIGN.md §22), so the first leaf of a tree without an internal level,
+ * which is its root, can be an internal page by now.  And on a standby,
+ * where replay applies VACUUM, a leaf the tree's walk read can be taken out
+ * of the tree or freed with it by now - which the walk can tell from damage
+ * by the LSN it reads past the replay position it began at
+ * (lion_verify_moved()).  False says so, and the walk is repeated.
  */
 static bool
 lion_verify_leaves_read(LionVerifyState *vs, LionVerifyLeaves *lv,
@@ -2527,9 +3159,16 @@ lion_verify_leaves_read(LionVerifyState *vs, LionVerifyLeaves *lv,
 		LionPageIsUnlinked(page) || opaque->owner_head != tree->root ||
 		opaque->owner_hash != tree->owner ||
 		((opaque->flags & LION_PAGE_POSITIONS) != 0) != tree->positions)
+	{
+		if (!exact && lion_verify_moved(vs))
+		{
+			UnlockReleaseBuffer(buf);
+			return false;
+		}
 		lion_corrupt("lion index \"%s\": block %u is not a leaf of the %s tree of chain entry %u on block %u",
 					RelationGetRelationName(vs->index), blk, tree->what,
 					tree->eoff, tree->eblk);
+	}
 
 	memcpy(lv->page, page, BLCKSZ);
 	UnlockReleaseBuffer(buf);
@@ -2557,6 +3196,7 @@ typedef struct LionVerifyCovers
 	bool		have;			/* ... which there is one of */
 	bool		done;			/* the tree has no member left */
 	bool		changed;		/* the tree changed: the walk is repeated */
+	uint64		nmembers;		/* members stepped onto */
 	uint32		ckey;			/* the posting container being read */
 	uint64		missing;		/* TIDs without positions */
 	uint64		first_missing;
@@ -2574,6 +3214,7 @@ lion_verify_covers_step(LionVerifyCovers *cv)
 		if (cv->inchunk && lion_poschunk_iter_next_npos(&cv->it, cv->m))
 		{
 			cv->have = true;
+			cv->nmembers++;
 			return;
 		}
 		cv->inchunk = false;
@@ -2641,12 +3282,16 @@ lion_verify_covers_pair(uint32 ckey, uint16 lo, void *arg)
  * Compare the posting set of the CHAIN entry `entry` with its position tree
  * ptree, as above, and leave in cv how many of the set's TIDs have no
  * positions, and the first of them; lion_verify_postree_walks() decides
- * whether that stands.  Returns false when the walk has to be repeated
- * (lion_verify_leaves_read()), which only a walk that is not exact does.
+ * whether that stands.  With count, the members after the set's last TID
+ * are read too, and cv->nmembers is all of the tree's: the count a standby's
+ * covers pass compares with the entry, as a walk's res->card is
+ * (lion_verify_postree_count()).  Returns false when the walk has to be
+ * repeated (lion_verify_leaves_read()), which only a walk that is not exact
+ * does.
  */
 static bool
 lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
-					   const LionVerifyTree *ptree, bool exact,
+					   const LionVerifyTree *ptree, bool exact, bool count,
 					   LionVerifyCovers *cv)
 {
 	BlockNumber leftmost[LION_POSTING_MAX_HEIGHT + 1];
@@ -2660,16 +3305,16 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 	cv->m = (LionPosMember *) palloc(sizeof(LionPosMember));
 	cv->pos.tree = ptree;
 	cv->pos.page = (Page) palloc(BLCKSZ);
-	lion_verify_tree_leftmost(vs, ptree, leftmost, &height);
-	if (!lion_verify_leaves_read(vs, &cv->pos, leftmost[0], exact))
+	if (!lion_verify_tree_leftmost(vs, ptree, leftmost, &height) ||
+		!lion_verify_leaves_read(vs, &cv->pos, leftmost[0], exact))
 		return false;
 
 	lion_verify_tree_init(&stree, ptree->eblk, ptree->eoff, entry, false);
 	memset(&set, 0, sizeof(set));
 	set.tree = &stree;
 	set.page = (Page) palloc(BLCKSZ);
-	lion_verify_tree_leftmost(vs, &stree, leftmost, &height);
-	if (!lion_verify_leaves_read(vs, &set, leftmost[0], exact))
+	if (!lion_verify_tree_leftmost(vs, &stree, leftmost, &height) ||
+		!lion_verify_leaves_read(vs, &set, leftmost[0], exact))
 		return false;
 
 	for (;;)
@@ -2692,13 +3337,21 @@ lion_verify_pos_covers(LionVerifyState *vs, const LionEntryTuple *entry,
 				return false;
 		}
 		if (LionPageIsRightmost(set.page))
-			return true;
+			break;
 		if (!lion_verify_leaves_read(vs, &set,
 									 LionPageGetOpaque(set.page)->rightlink,
 									 exact))
 			return false;
 		CHECK_FOR_INTERRUPTS();
 	}
+
+	while (count && !cv->done)
+	{
+		lion_verify_covers_step(cv);
+		if (cv->changed)
+			return false;
+	}
+	return true;
 }
 
 /*
@@ -2717,15 +3370,17 @@ lion_verify_postree_walk(LionVerifyState *vs, const LionVerifyTree *tree,
 	uint32		height;
 	bool		ok;
 
-	lion_verify_tree_leftmost(vs, tree, leftmost, &height);
+	if (!lion_verify_tree_leftmost(vs, tree, leftmost, &height))
+		return false;
 	res->height = height;
 	lion_verify_seq_init(&lv[0], &vs->seqacct, sizeof(LionVerifyPage));
 	lion_verify_seq_init(&lv[1], &vs->seqacct, sizeof(LionVerifyPage));
 
-	ok = lion_verify_pos_leaves(vs, tree, leftmost[0], &lv[0], &sum, exact,
-								res) &&
+	ok = lion_verify_pos_leaves(vs, tree, leftmost[0], exact ? NULL : &lv[0],
+								&sum, exact, res) &&
 		(height > 0 || lion_verify_flat(vs, tree, &sum, exact)) &&
-		lion_verify_tree_levels(vs, tree, leftmost, height, lv, exact, res);
+		lion_verify_tree_levels(vs, tree, leftmost, height,
+								exact ? NULL : lv, sum.npages, exact, res);
 	lion_verify_seq_free(&lv[0]);
 	lion_verify_seq_free(&lv[1]);
 	return ok;
@@ -2768,6 +3423,75 @@ lion_verify_postree_totals(LionVerifyState *vs, BlockNumber blk,
 }
 
 /*
+ * Settle, on a standby, the comparison of a position tree with its posting
+ * set that a walk of it found a difference in while replay changed a page
+ * it read, with at most LION_VERIFY_STANDBY_PASSES covers passes - the
+ * comparison of lion_verify_pos_covers() alone, with the tree's members
+ * counted - each between two reads of the entry, as a walk is.  A pass that
+ * found no difference settles it; so does one that read every page of the
+ * two trees at or below the replay position it began at, which reports what
+ * it found, the count against the entry only when it read the entry's leaf
+ * at that position too.  A pass reads the leaves of the two trees and one
+ * page a level, a fraction of a walk, and is far likelier to read one point
+ * of the WAL under a steady replay.  True when a pass settled it, or the
+ * entry has gone (*gonep); false when none did.
+ */
+static bool
+lion_verify_postree_count(LionVerifyState *vs, LionEntryTuple *cur,
+						  const LionVerifyTree *tree, LionVerifySeen *seen,
+						  bool *gonep)
+{
+	int			pass;
+
+	*gonep = false;
+	for (pass = 0; pass < LION_VERIFY_STANDBY_PASSES; pass++)
+	{
+		LionVerifySetResult cnt;
+		LionVerifyCovers cv;
+		bool		ok;
+		bool		treesat;
+		bool		entryat;
+
+		CHECK_FOR_INTERRUPTS();
+		vs->nposcovers++;
+		lion_verify_lsn_begin(vs);
+		if (!lion_verify_refind(vs, cur, seen, NULL))
+		{
+			lion_verify_lsn_end(vs);
+			*gonep = true;
+			return true;
+		}
+		lion_verify_lsn_forget(vs);
+		ok = lion_verify_pos_covers(vs, cur, tree, false, true, &cv);
+		treesat = lion_verify_lsn_at(vs);
+		if (!lion_verify_refind(vs, cur, seen, NULL))
+		{
+			lion_verify_lsn_end(vs);
+			*gonep = true;
+			return true;
+		}
+		entryat = lion_verify_lsn_at(vs);
+		lion_verify_lsn_end(vs);
+		if (!ok)
+			continue;
+
+		memset(&cnt, 0, sizeof(cnt));
+		cnt.card = cv.nmembers;
+		if (lion_verify_postree_totals(vs, seen->blk, seen->off, cur, &cnt,
+									   &cv, false, true))
+			return true;
+		if (treesat)
+		{
+			(void) lion_verify_postree_totals(vs, seen->blk, seen->off, cur,
+											  &cnt, &cv, true, entryat);
+			if (entryat)
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
  * The position tree of a chain entry that stores positions (DESIGN.md §17),
  * checked as its posting set is: every page visited once, a position page of
  * this tree, stamped as the entry's, at the level its link promises; every
@@ -2778,25 +3502,26 @@ lion_verify_postree_totals(LionVerifyState *vs, BlockNumber blk,
  * since a row's positions are written before its TID and removed after it.
  *
  * On a primary the tree is walked as lion_verify_set_walks() walks a posting
- * set: with nothing held, the entry read again afterwards, and the walk kept
- * when the entry reads the same both times.  Every writer of the key holds
- * the entry's leaf EXCLUSIVE from its first record to its last, the
- * positions it writes among them (W1), and the entry was read under a SHARE
- * lock both times, so a writer that changed the tree in between did all of it
- * in between - and every INSERT that gets to its TID changes the entry.  One
- * that fails between its two writes does not, and leaves members no TID of
- * the set has (lion_vac_delete_group()); a walk it changed the tree under
- * can have missed members, which it moves right in a split of a leaf the
- * walk had read.  So such a walk is exact about what it found - the set the
- * covers pass read is the entry's, unchanged, and no member the walk saw is
- * one a writer took away - but not about what it did not find: a walk that
- * found every TID of the set among the members is kept, and one that found
- * too few members or a TID without them is a suspicion, which a walk with
- * the leaf held SHARE settles (DESIGN.md §7, "suspect, wait, recheck").  So
- * is a tree whose writers keep changing it, after LION_VERIFY_SET_ATTEMPTS
- * walks, as a posting set is.  That hold is the lock order every writer uses
- * (directory page before position page), and it keeps waiting only the
- * writers of the keys on that one leaf, for one walk of one tree.
+ * set: the entry read, the tree walked with nothing held, the entry read
+ * again afterwards, and the walk kept when the entry reads the same both
+ * times.  Every writer of the key holds the entry's leaf EXCLUSIVE from its
+ * first record to its last, the positions it writes among them (W1), and the
+ * entry was read under a SHARE lock both times, so a writer that changed the
+ * tree in between did all of it in between - and every INSERT that gets to
+ * its TID changes the entry.  One that fails between its two writes does
+ * not, and leaves members no TID of the set has (lion_vac_delete_group()); a
+ * walk it changed the tree under can have missed members, which it moves
+ * right in a split of a leaf the walk had read.  So such a walk is exact
+ * about what it found - the set the covers pass read is the entry's,
+ * unchanged, and no member the walk saw is one a writer took away - but not
+ * about what it did not find: a walk that found every TID of the set among
+ * the members is kept, and one that found too few members or a TID without
+ * them is a suspicion, which a walk with the leaf held SHARE settles
+ * (DESIGN.md §7, "suspect, wait, recheck").  So is a tree whose writers keep
+ * changing it, after LION_VERIFY_SET_ATTEMPTS walks, as a posting set is.
+ * That hold is the lock order every writer uses (directory page before
+ * position page), and it keeps waiting only the writers of the keys on that
+ * one leaf, for one walk of one tree.
  *
  * Neither walk keeps more of the tree than its levels' sequences
  * (LionVerifySeq): the comparison reads the two trees' leaves in step and
@@ -2822,21 +3547,23 @@ lion_verify_postree_totals(LionVerifyState *vs, BlockNumber blk,
  * reported, the count only when the entry's leaf was read at that point too.
  * A walk that found no difference is kept whatever its pages' LSNs, as on a
  * primary: what it found is there.  One that found a difference after replay
- * changed a page it read is walked again, and after LION_VERIFY_SET_ATTEMPTS
- * such walks the last one is kept - every page of it checked - without the
- * comparison, which a WARNING says; with replay paused nothing changes a
- * page, and the first walk settles it.  A walk replay split the tree under,
- * or pushed its root down under, is thrown away and repeated, at most
- * LION_VERIFY_STANDBY_WALKS times.
+ * changed a page it read is kept for what it checked, and the comparison
+ * settled by covers passes (lion_verify_postree_count()) - and when none of
+ * those settles it either, it is left unsettled, which a WARNING says; with
+ * replay paused nothing changes a page, and the first walk settles it.  A
+ * walk replay changed the tree's shape under - split it, pushed its root
+ * down, freed it - is thrown away and repeated, at most
+ * LION_VERIFY_STANDBY_WALKS times, and an entry replay took away ends the
+ * check of its tree (lion_verify_refind()).
  */
 static void
 lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
-						  OffsetNumber eoff, const LionEntryTuple *entry)
+						  OffsetNumber eoff, XLogRecPtr elsn,
+						  const LionEntryTuple *entry)
 {
 	Size		sz = LionEntryPayloadOffset(entry);
 	LionEntryTuple *cur = (LionEntryTuple *) palloc(sz);
-	BlockNumber blk = eblk;
-	OffsetNumber off = eoff;
+	LionVerifySeen seen;
 	Buffer		leaf;
 	LionVerifyTree tree;
 	LionVerifySetResult res;
@@ -2849,37 +3576,55 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 	 * push-down keeps the root's block (DESIGN.md §22).
 	 */
 	memcpy(cur, entry, sz);
-	lion_verify_tree_init(&tree, blk, off, cur, true);
+	seen.blk = eblk;
+	seen.off = eoff;
+	seen.lsn = elsn;
+	lion_verify_tree_init(&tree, eblk, eoff, cur, true);
 
 	if (!vs->concurrent)
 	{
-		int			nfound = 0;
-
 		for (attempt = 0;; attempt++)
 		{
 			bool		ok;
 			bool		treesat;
 			bool		entryat;
+			bool		gone;
 
 			lion_verify_result_init(vs, &res);
 			lion_verify_track_begin(vs);
 			vs->nposwalks++;
 
 			lion_verify_lsn_begin(vs);
+			if (!lion_verify_refind(vs, cur, &seen, NULL))
+			{
+				lion_verify_lsn_end(vs);
+				lion_verify_track_end(vs, false);
+				lion_verify_result_free(&res);
+				pfree(cur);
+				return;
+			}
+			lion_verify_lsn_forget(vs);
 			ok = lion_verify_postree_walk(vs, &tree, false, &res) &&
-				lion_verify_pos_covers(vs, cur, &tree, false, &cv);
+				lion_verify_pos_covers(vs, cur, &tree, false, false, &cv);
 			treesat = lion_verify_lsn_at(vs);
-			(void) lion_verify_refind(vs, cur, &blk, &off, false);
+			if (!lion_verify_refind(vs, cur, &seen, NULL))
+			{
+				lion_verify_lsn_end(vs);
+				lion_verify_track_end(vs, true);
+				lion_verify_result_free(&res);
+				pfree(cur);
+				return;
+			}
 			entryat = lion_verify_lsn_at(vs);
 			lion_verify_lsn_end(vs);
 
 			if (ok)
 			{
-				if (lion_verify_postree_totals(vs, blk, off, cur, &res, &cv,
-											   false, true))
+				lion_verify_track_end(vs, true);
+				lion_verify_warn_flagged(vs, &res);
+				if (lion_verify_postree_totals(vs, seen.blk, seen.off, cur,
+											   &res, &cv, false, true))
 				{
-					lion_verify_track_end(vs, true);
-					lion_verify_warn_flagged(vs, "position", &res);
 					lion_verify_result_free(&res);
 					pfree(cur);
 					return;
@@ -2887,24 +3632,32 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 
 				/* a difference, which stands if the walk read one replay point */
 				if (treesat)
-					(void) lion_verify_postree_totals(vs, blk, off, cur, &res,
-													  &cv, true, entryat);
-
-				if (++nfound >= LION_VERIFY_SET_ATTEMPTS)
 				{
-					lion_verify_track_end(vs, true);
-					lion_verify_warn_flagged(vs, "position", &res);
-					lion_verify_result_free(&res);
+					(void) lion_verify_postree_totals(vs, seen.blk, seen.off,
+													  cur, &res, &cv, true,
+													  entryat);
+					if (entryat)
+					{
+						lion_verify_result_free(&res);
+						pfree(cur);
+						return;
+					}
+				}
+				lion_verify_result_free(&res);
+
+				if (!lion_verify_postree_count(vs, cur, &tree, &seen, &gone))
+				{
 					vs->nposuncompared++;
 					ereport(WARNING,
 							(errmsg("lion index \"%s\": the position tree of chain entry %u on block %u was not compared with its posting set",
-									RelationGetRelationName(vs->index), off, blk),
-							 errdetail("Each of the %d walks that found a difference between the two read a page that recovery changed during the walk; every page of the last one was checked.",
-									   nfound),
+									RelationGetRelationName(vs->index),
+									seen.off, seen.blk),
+							 errdetail("Recovery changed the two during the walk that found a difference between them and during each of the %d passes that compared them again; every page of the walk was checked.",
+									   LION_VERIFY_STANDBY_PASSES),
 							 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()) to compare them.")));
-					pfree(cur);
-					return;
 				}
+				pfree(cur);
+				return;
 			}
 
 			/* replay got in; forget what this walk marked, and walk again */
@@ -2915,7 +3668,8 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 				ereport(ERROR,
 						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						 errmsg("lion index \"%s\": could not walk the position tree of chain entry %u on block %u to its end",
-								RelationGetRelationName(vs->index), off, blk),
+								RelationGetRelationName(vs->index), seen.off,
+								seen.blk),
 						 errdetail("Recovery changed the tree during each of the %d walks made of it.",
 								   attempt + 1),
 						 errhint("Run the check with replay paused (pg_wal_replay_pause(), then pg_wal_replay_resume()).")));
@@ -2937,27 +3691,28 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 		 * here and at lion-verify-postree-walked in turn, as
 		 * verify_concurrent.spec does at the posting set's two points.
 		 */
-		memcpy(&before, cur, LionEntryHdrSize(cur));
 		if (attempt > 0)
 			LION_INJECTION_POINT("lion-verify-postree-rewalk");
 
 		lion_verify_result_init(vs, &res);
 		lion_verify_track_begin(vs);
 		vs->nposwalks++;
+		(void) lion_verify_refind(vs, cur, &seen, NULL);
+		memcpy(&before, cur, LionEntryHdrSize(cur));
 		ok = lion_verify_postree_walk(vs, &tree, false, &res) &&
-			lion_verify_pos_covers(vs, cur, &tree, false, &cv);
+			lion_verify_pos_covers(vs, cur, &tree, false, false, &cv);
 
 		/* Test hook: a walk is done, and the entry not yet read again. */
 		LION_INJECTION_POINT("lion-verify-postree-walked");
 
-		(void) lion_verify_refind(vs, cur, &blk, &off, false);
+		(void) lion_verify_refind(vs, cur, &seen, NULL);
 		if (ok && lion_verify_same_entry(&before.e, cur))
 		{
-			if (lion_verify_postree_totals(vs, blk, off, cur, &res, &cv,
-										   false, true))
+			if (lion_verify_postree_totals(vs, seen.blk, seen.off, cur, &res,
+										   &cv, false, true))
 			{
 				lion_verify_track_end(vs, true);
-				lion_verify_warn_flagged(vs, "position", &res);
+				lion_verify_warn_flagged(vs, &res);
 				lion_verify_result_free(&res);
 				pfree(cur);
 				return;
@@ -2980,7 +3735,7 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 
 	vs->nposwalks++;
 	vs->nposholds++;
-	leaf = lion_verify_refind(vs, cur, &blk, &off, true);
+	(void) lion_verify_refind(vs, cur, &seen, &leaf);
 
 	/*
 	 * Test hook: the leaf is held and the exact walk is about to begin.
@@ -2991,11 +3746,11 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
 
 	lion_verify_result_init(vs, &res);
 	if (!lion_verify_postree_walk(vs, &tree, true, &res) ||
-		!lion_verify_pos_covers(vs, cur, &tree, true, &cv))
+		!lion_verify_pos_covers(vs, cur, &tree, true, false, &cv))
 		elog(ERROR, "an exact walk of a position tree was not finished");
-	lion_verify_warn_flagged(vs, "position", &res);
-	(void) lion_verify_postree_totals(vs, blk, off, cur, &res, &cv, true,
-									  true);
+	lion_verify_warn_flagged(vs, &res);
+	(void) lion_verify_postree_totals(vs, seen.blk, seen.off, cur, &res, &cv,
+									  true, true);
 	lion_verify_result_free(&res);
 	UnlockReleaseBuffer(leaf);
 	pfree(cur);
@@ -3008,11 +3763,11 @@ lion_verify_postree_walks(LionVerifyState *vs, BlockNumber eblk,
  */
 static void
 lion_verify_postree(LionVerifyState *vs, BlockNumber eblk, OffsetNumber eoff,
-					const LionEntryTuple *entry)
+					XLogRecPtr elsn, const LionEntryTuple *entry)
 {
 	MemoryContext oldcxt = MemoryContextSwitchTo(vs->setcxt);
 
-	lion_verify_postree_walks(vs, eblk, eoff, entry);
+	lion_verify_postree_walks(vs, eblk, eoff, elsn, entry);
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextReset(vs->setcxt);
 }
@@ -3149,7 +3904,9 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 		if (!LionEntryIsNullKey(entry) && !state->multikey)
 			lion_corrupt("lion index \"%s\": entry %u on block %u is %s %s entry, but the operator class of key column %u extracts no keys",
 						RelationGetRelationName(vs->index), off, blk,
-						rkind == LION_KIND_EMPTY ? "an" : "a", what,
+						(rkind == LION_KIND_EMPTY ||
+						 rkind == LION_KIND_EMPTYDIM ||
+						 rkind == LION_KIND_EMPTYINNER) ? "an" : "a", what,
 						entry->attno);
 		if ((rkind == LION_KIND_EMPTYDIM || rkind == LION_KIND_EMPTYINNER) &&
 			!lion_extracts_array_elements(state->extractvalue.fn_addr))
@@ -3332,9 +4089,9 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						RelationGetRelationName(vs->index), off, blk,
 						lion_entry_head(entry), lion_entry_tail(entry));
 
-		lion_verify_set(vs, blk, off, entry);
+		lion_verify_set(vs, blk, off, PageGetLSN(page), entry);
 		if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
-			lion_verify_postree(vs, blk, off, entry);
+			lion_verify_postree(vs, blk, off, PageGetLSN(page), entry);
 	}
 }
 
@@ -3455,6 +4212,16 @@ lion_index_verify(PG_FUNCTION_ARGS)
 						 sizeof(LionVerifyPage));
 	PrepareTempTablespaces();
 	lion_verify_seq_init(&vs.setvisits, &vs.seqacct, sizeof(BlockNumber));
+	lion_verify_seq_init(&vs.flags, &vs.seqacct, sizeof(LionVerifyFlag));
+
+	/*
+	 * On a standby, the replay position before anything of the index is
+	 * read: a page whose LSN is past it is one replay has changed since the
+	 * check began, which the parts of the check that read the index once
+	 * - the directory's levels, the reachability pass - tell from damage by
+	 * that (lion_verify_past_start()).
+	 */
+	vs.lsnstart = inrecovery ? GetXLogReplayRecPtr(NULL) : InvalidXLogRecPtr;
 
 	lion_verify_meta(&vs);
 
@@ -3468,6 +4235,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	lion_verify_directory(&vs);
 	lion_verify_reachable(&vs);
 	lion_verify_recheck(&vs);
+	lion_verify_flags_recheck(&vs);
 
 	/*
 	 * The structure is sound: now what the summaries hold (DESIGN.md §32),
@@ -3479,14 +4247,15 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	 * What writers running beside the check cost it (DESIGN.md §7), in the
 	 * spirit of ambulkdelete's DEBUG1 breakdown.
 	 */
-	elog(DEBUG1, "lion index \"%s\": %u blocks at the start and %u at the end; %d candidates settled after %d waits; %lld left links and %lld root flags settled on the spot; %lld posting-set walks, %lld thrown away, %lld with the leaf held, %lld kept uncompared; %lld position-tree walks, %lld thrown away, %lld with the leaf held, %lld kept uncompared",
+	elog(DEBUG1, "lion index \"%s\": %u blocks at the start and %u at the end; %d candidates settled after %d waits; %lld left links and %lld root flags settled on the spot; %lld posting-set walks, %lld thrown away, %lld with the leaf held, %lld counting passes, %lld kept uncompared; %lld position-tree walks, %lld thrown away, %lld with the leaf held, %lld covers passes, %lld kept uncompared; %lld flagged pages looked at again",
 		 RelationGetRelationName(vs.index), vs.startblocks, vs.nblocks,
 		 vs.ncands, vs.nwaits, (long long) vs.nleftlinks,
 		 (long long) vs.nrootsplits, (long long) vs.nsetwalks,
 		 (long long) vs.nsetretries, (long long) vs.nsetholds,
-		 (long long) vs.nsetuncompared, (long long) vs.nposwalks,
-		 (long long) vs.nposretries, (long long) vs.nposholds,
-		 (long long) vs.nposuncompared);
+		 (long long) vs.nsetcounts, (long long) vs.nsetuncompared,
+		 (long long) vs.nposwalks, (long long) vs.nposretries,
+		 (long long) vs.nposholds, (long long) vs.nposcovers,
+		 (long long) vs.nposuncompared, (long long) vs.nflags);
 
 	/*
 	 * ... and what the walks of the trees kept (LionVerifySeq): never more
@@ -3513,6 +4282,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 
 	MemoryContextDelete(vs.setcxt);
 	lion_verify_seq_free(&vs.setvisits);
+	lion_verify_seq_free(&vs.flags);
 	pfree(vs.refs);
 	pfree(vs.cbuf);
 

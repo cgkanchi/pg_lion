@@ -1067,7 +1067,14 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- LOCKING: ShareUpdateExclusiveLock on the table, then on the index - the lock CREATE
         -- INDEX CONCURRENTLY builds under, and verify() checks the way CIC builds, beside the
         -- writers. INSERT, UPDATE and DELETE go on while it runs; VACUUM, ANALYZE, DDL, CIC and a
-        -- second verify() wait for it (and it for them). Both locks are released when it returns
+        -- second verify() wait for it (and it for them). CREATE INDEX CONCURRENTLY can deadlock
+        -- with it, even one on another column of the table: CIC holds the table's
+        -- ShareUpdateExclusiveLock while its last phases wait out every older snapshot
+        -- (WaitForOlderSnapshots()), and a verify() that arrives meanwhile waits for that lock
+        -- under the snapshot of the statement that called it - which the portal took before the
+        -- function ran, so nothing verify() does can avoid it. The deadlock detector cancels one
+        -- of the two (the CIC, in every round of the review's load run); run them apart. Both
+        -- locks are released when it returns
         -- rather than at commit, as amcheck does. With VACUUM locked out nothing leaves the index
         -- while it is walked, so the only changes it meets are an INSERT's, and each of them is
         -- settled rather than reported - "verify() beside writers" below says how, and what it
@@ -1079,22 +1086,20 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- about a sound index - and then ShareLock, bt_index_parent_check()'s, which kept every
         -- writer out for as long as it ran.
         -- DURING RECOVERY no lock above RowExclusiveLock can be taken, and replay takes no relation
-        -- locks anyway, so on a hot standby verify() takes AccessShareLock, reads an index that
-        -- replay may be changing, and reports what it finds at once, as it always has: none of
-        -- the settling below applies there, because it rests on how WRITERS lock pages across
-        -- their records, and replay locks each record's pages for that record alone. It re-reads
-        -- the block count before calling a link out of range, which covers the commonest case (a
-        -- split replay has just extended the index with), but a level comparison, a left link or
-        -- the reachability pass can still report a change replay made while it walked. Such a
-        -- report is confirmed with replay paused (pg_wal_replay_pause(), then
-        -- pg_wal_replay_resume()); run on a quiet standby, as test/recovery/run.sh does, the check
-        -- is exact. A standby is the one place verify() can report damage that is not there.
-        -- A POSTING SET is the one thing a standby settles like a primary: walked with nothing
-        -- held, its entry read again, the walk thrown away when replay changed the set - and never
-        -- walked with the entry's leaf held, the primary's last resort, because replay locks a
-        -- set's pages BEFORE the leaf (§25) and that walk deadlocked replay for good (2026-09-29
-        -- review). A set replay keeps changing is kept from a later walk that gets to its end,
-        -- every page checked, with a WARNING that its totals were not compared with the entry.
+        -- locks anyway, so on a hot standby verify() takes AccessShareLock and reads an index that
+        -- replay may be changing - VACUUM's records among the rest, which a primary's lock keeps
+        -- out. None of the waiting below applies there: it rests on how WRITERS lock pages across
+        -- their records, and replay locks each record's pages for that record alone. A standby
+        -- tells replay's work from damage by the pages' LSNs instead ("verify() on a standby"
+        -- below): replay stamps every page of a record with the record's end, so pages that all
+        -- read at or below a replay position noted before the first of them was read were read
+        -- as they were at one point of the primary's WAL, where a difference between them is
+        -- damage; a difference that involves a page past it is replay's, and is walked again or
+        -- left to the next check. A POSTING SET is walked with nothing held and its entry read
+        -- again - never with the entry's leaf held, the primary's last resort, because replay
+        -- locks a set's pages BEFORE the leaf (§25) and that walk deadlocked replay for good
+        -- (2026-09-29 review). With replay paused (pg_wal_replay_pause(), then
+        -- pg_wal_replay_resume()) no page changes, and the first walk of everything settles it.
         -- AN UNFINISHED SPLIT IS NOT DAMAGE (§21, §22). A split writes the new right sibling in one
         -- record and its downlink in the next, with the left page flagged
         -- LION_PAGE_INCOMPLETE_SPLIT in between, and a crash or an error there leaves the sibling
@@ -1104,8 +1109,11 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- accepts a page without one if its left neighbour carries the flag - a three-way posting
         -- split flags two pages in a row, and each missing downlink is covered by the page to its
         -- own left. Such a page is bounded above by the next downlink's separator like any other.
-        -- The flag with the downlink already in place (the directory clears the flag in a record
-        -- of its own) needs nothing. The flag is only ever on the LEFT half of a split, which
+        -- The flag with the downlink already in place needs nothing: every split clears the flag
+        -- in a record of its own, which a crash or an error can cut off as well, and the next
+        -- writer that descends to the page clears it (verify_incomplete_split.spec's second
+        -- permutation fails a posting split and a directory split between the two, and verify()
+        -- warns, and passes - 2026-10-23 review, R-V4). The flag is only ever on the LEFT half of a split, which
         -- keeps its new right sibling while the flag lasts: neither page deletion nor VACUUM's
         -- removal of an empty posting leaf takes a flagged page or the page right of one, and a
         -- root split or push-down flags nothing. So the flag on the rightmost page of a level - a
@@ -1117,7 +1125,16 @@ via anyenum (hashenum). Strategy 1 operator = the type's `=`.
         -- split fail at their injection points and verifies both. On a primary the WARNING is
         -- exact even with writers running: a split holds the page it flags EXCLUSIVE from the
         -- record that sets the flag to the one that clears it, so a flag a SHARE lock lets
-        -- verify() read is one a crash or an error left behind.
+        -- verify() read is one a crash or an error left behind. On a standby it is not: replay
+        -- locks each record's pages for that record alone, and a split the primary is in the
+        -- middle of shows its flag to every reader there. So a standby notes each flagged page
+        -- with its LSN and the next transaction id, and at the end of the check warns of the
+        -- ones still flagged with the same LSN whose split no transaction still running can
+        -- finish - a fresh snapshot's xmin is past the id - which a crash or an error abandoned
+        -- (lion_verify_flags_recheck(); test/recovery/run.sh phase 3, vsplitdir and vsplitpost).
+        -- The WARNING's hint is the next INSERT whose DESCENT passes through the page: an append
+        -- that fits a posting set's last leaf never descends, so a flag on a leaf below the
+        -- inserts' range outlives any number of inserts into the key (2026-10-23 review).
         -- A DAMAGED PAGE IS AN ERROR, never a crash, a read past the page or a write: every block
         -- number verify() follows - the meta page's root, downlinks, right links, an entry's head,
         -- a posting pivot's child - is checked against the index's length before ReadBuffer(),
@@ -1277,9 +1294,15 @@ and V1 order the records so, and an INSERT or a VACUUM stopped between two of th
 without TIDs, nothing else). A difference that walk finds is damage and is reported - the count
 only when the entry's leaf was read at that point too. A walk that found no difference is kept
 whatever its pages' LSNs, as on a primary; one that found a difference after replay changed a page
-it read is walked again, and after three of those the tree is kept without the comparison, with a
-WARNING whose hint is to pause replay, which leaves every page as it is. `test/recovery/run.sh`
-phase 2 damages a position leaf in the standby's copy of an index and has the standby report it.
+it read is kept for what it checked of the pages, and the comparison alone is made again - the two
+trees' leaves and one page a level above them, the tree's members counted - between two reads of
+the entry, at most eight times (`lion_verify_postree_count()`). A pass that found no difference
+settles it, and so does one that read every page at the replay position it began at, which reports
+what it found; only when none does is the tree kept without the comparison, with a WARNING whose
+hint is to pause replay, which leaves every page as it is. Until the 2026-10-23 review a walk that
+found a difference was walked again, whole, and after three the WARNING came: one standby check in
+nine under a steady replay gave it (R-S4). `test/recovery/run.sh` phase 2 damages a position leaf in
+the standby's copy of an index and has the standby report it.
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
 reached (directory pages, posting leaves with a live root, internal posting pages) - is recorded, not
@@ -1344,9 +1367,49 @@ it, so the scan meets one only in an index damaged between the two passes, which
 `test/isolation/verify_nopos.spec` makes it meet one: parked at `lion-verify-heap-scan`, the check
 has the index's buffers evicted and a position leaf damaged in the file under it.
 
-**What it can still falsely report: only on a standby**, where it takes AccessShareLock, settles
-nothing and reports what it finds at once, as before - the arguments above rest on how writers hold
-pages across their records, and replay holds each record's pages for that record alone.
+**verify() on a standby** (2026-10-23 review) takes AccessShareLock and waits for nothing: the
+arguments above rest on how writers hold pages across their records, and replay holds each record's
+pages for that record alone - and replays VACUUM beside the check, which a primary's check locks
+out, so pages are freed, emptied, taken out of their sets and unlinked from their levels under it.
+What a standby has instead is the pages' LSNs. Replay sets every page of a record to the record's
+end and moves `GetXLogReplayRecPtr()` past it afterwards, so a page read with an LSN at or below a
+replay position noted before some earlier read was, at that read, as it was at that position: pages
+that all are, against the position noted before the first of them was read, were read as they were
+at one point of the primary's WAL, where the index is sound unless it is damaged. Every check that
+compares what two reads found is held to that, and what a page past the position breaks is
+replay's work:
+
+- *A posting set's or position tree's walk* (below) reads a page freed, taken out of the set
+  (UNLINKED), stamped as another set's or at another level than its link promises: damage when the
+  walk has read no page past the position it began at, a reason to walk again when it has
+  (`lion_verify_moved()`). An entry that is gone from where its key sorts, or has changed its form
+  (VACUUM shrinks a CHAIN entry back to INLINE), on a leaf replay changed since the entry was seen
+  there, is an entry VACUUM's replay took away, and the check of its set ends there
+  (`lion_verify_refind()`). `test/recovery/run.sh` phase 3, vunlink and vfree.
+- *The directory*: a DELETED page a level's walk reached by a right link read before it was
+  unlinked - its LSN past the position noted before the page left of it was read - is walked
+  through, as readers do; a left link is compared only between two pages read at that position;
+  a downlink to a page the walk of the level below did not reach is dropped when the page it is on
+  is past the position that walk began at, which a split's downlink, placed after the walk passed
+  the place, always is; and a page of the level below without a downlink is accepted when either
+  downlink around it is on such a page, or the walk found it dying - page deletion's first stage
+  takes the downlink out. The meta page's count of directory pages is compared only when no record
+  has changed the meta page since the check began. Phase 3, vdownlink and vleftlink.
+- *The reachability pass* reports a page no walk reached only when the page - and the root that
+  tells a leak from a live page - is at or below the position the check began at: then it was what
+  it is when the check began, and the walks, which began after, would have reached it. A page
+  replay made, emptied or took out of a tree since is left to the next check. Phase 3, vreach.
+- *The summaries*: a row whose inserting transaction is still running may be between its key and
+  its summary for as long as the primary takes, and is no candidate; a transaction's commit record
+  follows every record of its statements, so a committed row has both (`lion_verify_settle()`).
+  Phase 3, vsummary.
+- *An unfinished split* is warned of only when it is abandoned (above, and phase 3's vsplitdir and
+  vsplitpost).
+
+**What it can still falsely report.** A WARNING that a block is unused and unreachable for an empty
+posting page a whole-set free's first record emptied before the check began and whose second record
+- which frees the page - replay has not reached yet: the state a crash between the two leaves, and
+which a standby cannot tell from it. The next VACUUM frees either. Nothing else is known to.
 
 **Posting sets on a standby** (2026-09-29 review) are the exception, and the reason is a deadlock,
 not exactness. Replay takes a record's blocks in the order they were registered and holds them all
@@ -1368,12 +1431,20 @@ phase 3 parks a standby's check between two leaves, at `lion-verify-set-leaf-rea
 that). So a standby keeps, and compares with the entry, a walk that agrees with an entry that read
 the same, and a walk that read every page - the entry's leaf after it among them - as it was at the
 replay position it began at, which the pages' LSNs show (position trees, above): such a walk read the
-set and the entry at one point of the primary's WAL, and a difference there is damage. Any other walk
-is walked again. A set that replay keeps changing has no last resort: after three walks the next one that gets to the end of the set is
-kept, every page it read checked, and its totals are not compared with the entry - a WARNING says so,
-and a check with replay paused compares them. Only a root pushed down or an upper level split under
-it stops a walk short of the end, and a set that does that to ten walks in a row is an ERROR asking
-for replay to be paused. In a 30 s run of 8 clients inserting 15,000 rows a second into three keys
+set and the entry at one point of the primary's WAL, and a difference there is damage. A walk that
+got to the end of the set and is neither is kept for what it checked of the pages, and its totals
+are counted again: a counting pass reads the root, the first page of each level below it and the
+leaves, nothing else, between two reads of the entry, and settles them when it read every page at
+the replay position it began at - a difference is damage then - or agrees with an entry that read
+the same (`lion_verify_set_count()`). A pass is a fraction of a walk, and far likelier to read one
+point under a steady replay, which changes the set's last leaf and its entry with every row; only
+when eight passes in a row do not settle them are the totals left uncompared, with a WARNING whose
+hint is to pause replay (until the 2026-10-23 review that came after three whole walks, R-S4). The
+entry is read before the first walk as before every other, not taken from the directory walk's copy
+of its leaf, which the writers have usually moved on from by then (R-V3) - on a primary too, where
+that threw the first walk of every busy set away. A root pushed down, an upper level split or a
+page freed under a walk stops it short of the end, and a set that does that to ten walks in a row
+is an ERROR asking for replay to be paused. In a 30 s run of 8 clients inserting 15,000 rows a second into three keys
 of 700,000 rows each (the assert-enabled 18.6, rmgr mode), two clients verifying on the standby made
 27,000 calls without an error, 0.5% of the sets they walked were kept uncompared, and replay kept up
 throughout. `test/recovery/run.sh` phase 4 is that run, shortened, with a watchdog on replay's
@@ -1423,8 +1494,9 @@ not for a transaction whose statement is over, and `LOCK TABLE; DROP INDEX` in a
 going through while the check waits for the table. Each change is one the old AccessShareLock code
 reported as damage or would have; `verify.sql`'s sixth damage case is real damage that only the
 recheck can tell from one of them. verify() says at DEBUG1 what writers cost it: candidates, waits,
-left links and root flags settled on the spot, and posting-set and position-tree walks made, thrown
-away, held and, on a standby, kept without their comparison.
+left links and root flags settled on the spot, posting-set and position-tree walks made, thrown
+away, held and, on a standby, kept without their comparison, a standby's counting and covers passes,
+and the flagged pages it looked at again.
 
 ### Facet counts (`lion_facets.c`)
 
@@ -6468,8 +6540,10 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   every TID of the posting set has positions, the two trees' leaves read in step and nothing
   collected. The tree is walked with nothing held and kept when its entry reads the same before
   and after, and a walk that finds a TID without positions is made again with the entry's leaf
-  held before it is reported (§7, "Position trees"). On a standby a walk that replay changed under
-  it is repeated, as a posting set's is, and nothing is compared. With heapallindexed every heap
+  held before it is reported (§7, "Position trees"). On a standby a walk is held to the replay
+  position it began at instead: what one that read every page at it found is reported, one that
+  found no difference is kept, and a difference after replay changed a page is settled by passes
+  of the comparison alone, or left uncompared with a WARNING (§7). With heapallindexed every heap
   row's positions under each of its keys are compared with the ones its value gives (§7).
   verify.sql's ninth case damages a downlink, a separator and a leaf's min of a tree with an
   internal level, its seventeenth the members of a tree, its eighteenth a row's positions (INLINE
