@@ -14632,8 +14632,8 @@ cells' (below) and the other forms above. EXPLAIN prints, under the node's index
 the join clauses deparsed as core prints a join's (t's columns bare, as in a `Residual Filter`), and
 under ANALYZE `Join Child Rows`, `Join Keys Looked Up` (distinct keys, NULL ones not), `Join Rows
 Fetched` and `Join Rows Subtracted`, with `Join Child Time` and `Join Lookup Time` under TIMING, and
-`Join Spilled` where some of the run went to disk ("The anti join within work_mem"). The child is
-printed under the node. `pg_lion.enable_count_anti` turns it off.
+`Join Spilled` where some of the run went past its memory ("The anti join within work_mem"). The
+child is printed under the node. `pg_lion.enable_count_anti` turns it off.
 
 **Beside the FK-side anti join.** A reverse anti join - `SELECT count(*) FROM dim d WHERE NOT EXISTS
 (SELECT 1 FROM fact f WHERE f.fk = d.pk ...)` - is both §27's anti join, the dimension's rows
@@ -14682,7 +14682,7 @@ The count by cells makes the first term, as ever; the lookups find M, as for any
 row of M is counted under its cell.
 
 **A row's cell** (`lion_cells_code_of()`, lion_exec_cells.c). Each predicate - the expression of its
-`LION_TL_CELLPRED` column of custom_scan_tlist - is evaluated on the heap tuple the lookup fetched
+`LION_TL_CELLPRED` column of custom_scan_tlist - is evaluated on the heap tuple of a row of M
 (`lion_anti_cells_truths()`), NULL a truth of its own: the truths that, in the count, the labels
 give its cell. Of each dimension the row's outcome is the one in which every predicate of the
 dimension has the row's truth (`lion_cells_truth_in()`, the truth the node emits for a cell). There
@@ -14712,7 +14712,12 @@ setrefs.c replaces any subexpression of it `equal()` to a custom_scan_tlist entr
 to it: a WHERE clause over predicates (the CASE of the WHERE form, which is one of t's
 restrictions) comes to read the predicates' `LION_TL_CELLPRED` columns, as the node's qual does.
 Those columns are no column of the table, so the node puts each predicate's truth, as a boolean or
-NULL, at its place in the slot it tests the row in, before the clauses run.
+NULL, at its place in the slot it tests the row in, before the clauses run - when a clause reads one
+(`predsread`). When none does, the predicates are evaluated on the rows of M alone, to tell their
+cells, and not on every row a lookup fetches: the restrictions reject most of those where the WHERE
+is narrower than the key. On a million-row table with a WHERE of a tenth, 40,000 inner keys fetching
+419,594 rows of which 41,977 are taken away, and five predicates, the lookups took a median 490 ms
+against 600 when every row fetched was evaluated (an assert-enabled build).
 
 **Why it is exact.** M's rows are rows of C (above), and each is in the count under the cell of its
 values and keys as the snapshot sees them (§10, "Why it is exact": a row the snapshot sees has
@@ -14848,13 +14853,16 @@ past them it goes to disk, and the answer is the same.
   `work_mem`, which the participant reads as it claims its ranges ("Counts by cells beside the anti
   join").
 
-The ungrouped count keeps one total. EXPLAIN ANALYZE prints what went to disk in any participant,
-nothing when nothing did:
+The ungrouped count keeps one total. EXPLAIN ANALYZE prints what went past its memory in any
+participant, nothing when nothing did:
 
     Join Spilled: keys, losses, held rows
 
-`keys` the child's rows, `inner rows` a key's, `losses` the groups' or the cells', `held rows` the
-sort they went to with the count's rows, `ranges` the rows taken away by container key.
+`keys` the child's rows, `inner rows` a key's and `ranges` the rows taken away by container key,
+each on disk past `work_mem`; `losses` the groups' or the cells' losses past `hash_mem`, gone to a
+sort with the count's rows held back into it, and `held rows` that sort on disk past `work_mem`.
+`losses` alone is a sort that stayed in memory. A participant that claims no range still made its
+sort of the rows taken away, and reports it gone to disk when it did.
 
 Measured (2026-10-22, PostgreSQL 18, warm): a table of 4,000,000 rows, a B-tree on a key of one row
 each and a lion index on a column of 10 values, `count(*) ... WHERE x < 5 AND NOT EXISTS (SELECT 1

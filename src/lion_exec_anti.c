@@ -41,6 +41,8 @@
 
 #define LION_ANTI_BUCKETS	64
 
+static void lion_anti_cells_truths(LionAntiState *as);
+
 /* How many of the node's expressions are the anti join's (LION_PRIV_ANTI). */
 int
 lion_anti_nexprs(const LionCountPriv *priv)
@@ -58,7 +60,7 @@ lion_anti_nexprs(const LionCountPriv *priv)
  * prints.  Positions in the scan tuple, which evalslot has the descriptor of.
  * Beside a count by cells setrefs.c points a clause's copy of a predicate at
  * the predicate's LION_TL_CELLPRED place, which holds its truth in the row
- * (lion_anti_cells_truths()).
+ * (lion_anti_cells_truths()): predsread says whether any clause does.
  */
 static void
 lion_anti_columns(LionAntiState *as, CustomScanState *node,
@@ -103,6 +105,7 @@ lion_anti_columns(LionAntiState *as, CustomScanState *node,
 		{
 			if (priv->ncelldim == 0)
 				elog(ERROR, "LionCount: an anti join clause reads a cells predicate without cells");
+			as->predsread = true;
 			continue;
 		}
 		if (LION_TL_IS_ANTI(kind))
@@ -1068,8 +1071,9 @@ lion_anti_ranged_put(LionAntiState *as, uint32 ckey, uint64 code)
 
 /*
  * A row found that an inner row of its key matches, subtracted: from the
- * total; from its group; or from its cell - beside a parallel count by cells
- * once this participant claims its range.
+ * total; from its group; or from its cell, of the predicates' truths in it -
+ * evaluated here unless a clause read them (lion_anti_matches()) - beside a
+ * parallel count by cells once this participant claims its range.
  */
 static void
 lion_anti_subtract(LionCountScanState *st)
@@ -1082,7 +1086,11 @@ lion_anti_subtract(LionCountScanState *st)
 
 	if (as->cells)
 	{
-		uint64		code = lion_cells_code_of(st->cells, as->predtruth);
+		uint64		code;
+
+		if (!as->predsread)
+			lion_anti_cells_truths(as);
+		code = lion_cells_code_of(st->cells, as->predtruth);
 
 		if (st->shared != NULL)
 			lion_anti_ranged_put(as,
@@ -1155,10 +1163,13 @@ lion_anti_cells_truths(LionAntiState *as)
  * and each of the key's inner rows in turn, read back from the tuplestore.
  * Each list is in the order core would test it in (lion_anti_order_quals()).
  *
- * Beside a count by cells the predicates' truths go in first, where the
- * restrictions' copies of them read them: tests of a column against
+ * Beside a count by cells the predicates' truths go in first when a clause
+ * reads them, through its copy of one (predsread): tests of a column against
  * constants, which a lion index answers (lion_plan_cells.c), and which fail
- * on no row.
+ * on no row.  When no clause does, only a row that matches needs them, to
+ * tell its cell, and they are evaluated on it alone (lion_anti_subtract()):
+ * the restrictions reject most of the rows a lookup finds where the WHERE is
+ * narrower than the key.
  */
 static bool
 lion_anti_matches(LionAntiState *as)
@@ -1168,7 +1179,7 @@ lion_anti_matches(LionAntiState *as)
 	TupleTableSlot *in = as->innerslot;
 	int			j;
 
-	if (as->cells)
+	if (as->cells && as->predsread)
 		lion_anti_cells_truths(as);
 	for (j = 0; j < as->nouter; j++)
 		es->tts_values[as->outerpos[j]] =
@@ -1502,6 +1513,31 @@ lion_anti_cells_range(LionCountScanState *st, uint32 lo, uint64 hi)
 }
 
 /*
+ * The sort of the rows taken away by range let go of.  A participant that
+ * claimed no range - the others took them all - never sorted it, and so
+ * never asked it whether it went past work_mem (lion_anti_cells_range()):
+ * it is asked here, since the rows that did not fit went to disk as they
+ * went in.
+ */
+static void
+lion_anti_ranged_end(LionAntiState *as)
+{
+	if (as->ranged == NULL)
+		return;
+	if (!as->rangesorted)
+	{
+		TuplesortInstrumentation stats;
+
+		tuplesort_get_stats(as->ranged, &stats);
+		if (stats.spaceType == SORT_SPACE_TYPE_DISK)
+			as->spilled |= LION_ANTI_SPILL_RANGES;
+	}
+	tuplesort_end(as->ranged);
+	as->ranged = NULL;
+	as->rangemore = false;
+}
+
+/*
  * The cells this participant's rows are of, each once with the rows it
  * loses, in the order of their codes: made when the tally gives its first
  * cell, every range counted.  Of the held sort, nothing to make.
@@ -1514,9 +1550,7 @@ lion_anti_cells_ready(LionAntiState *as)
 	as->heldready = true;
 	if (as->ranged != NULL)
 	{
-		tuplesort_end(as->ranged);
-		as->ranged = NULL;
-		as->rangemore = false;
+		lion_anti_ranged_end(as);
 		ExecClearTuple(as->rangeslot);
 	}
 	if (!as->merging)
@@ -1617,12 +1651,10 @@ lion_anti_release(LionAntiState *as)
 		tuplestore_end(as->innerrows);
 	if (as->heldsort != NULL)
 		tuplesort_end(as->heldsort);
-	if (as->ranged != NULL)
-		tuplesort_end(as->ranged);
+	lion_anti_ranged_end(as);
 	as->keysorted = NULL;
 	as->innerrows = NULL;
 	as->heldsort = NULL;
-	as->ranged = NULL;
 	if (as->sortcur != NULL)
 	{
 		ExecClearTuple(as->sortcur);
@@ -1728,16 +1760,50 @@ lion_anti_end(LionCountScanState *st)
  * --------------------------------------------------------------------- */
 
 /*
+ * A join clause with each reference to a cells predicate's LION_TL_CELLPRED
+ * place (lion_anti_columns()) replaced by the predicate itself, for EXPLAIN:
+ * ruleutils.c puts a reference to an expression of custom_scan_tlist in
+ * parentheses of its own, round the expression's, so `t.x = 1` in a join
+ * clause beside a count by cells would print as `((x = 1))`.
+ */
+static Node *
+lion_anti_cellpred_inline(Node *node, void *context)
+{
+	LionCountScanState *st = (LionCountScanState *) context;
+
+	if (node == NULL)
+		return NULL;
+	if (IsA(node, Var))
+	{
+		Var		   *var = (Var *) node;
+		CustomScan *cscan = (CustomScan *) st->css.ss.ps.plan;
+		List	   *tlist = cscan->custom_scan_tlist;
+
+		if (var->varno == INDEX_VAR && var->varattno >= 1 &&
+			var->varattno <= st->ntlist &&
+			var->varattno <= list_length(tlist) &&
+			LION_TL_IS_CELLPRED(st->tlkind[var->varattno - 1]))
+			return (Node *) copyObject(((TargetEntry *)
+										list_nth(tlist,
+												 var->varattno - 1))->expr);
+		return node;
+	}
+	return expression_tree_mutator(node, lion_anti_cellpred_inline, context);
+}
+
+/*
  * What the node does with its child (DESIGN.md §27): the kind of join, what
  * the rows it counts are, the B-tree the keys are looked up in, and the join
  * clauses every row found is tested on - as core prints a join's condition,
- * the inner side's columns and the table's both named.
+ * the inner side's columns and the table's both named, and a clause that is
+ * a cells predicate printed as the predicate.
  */
 void
 lion_explain_anti(LionCountScanState *st, List *ancestors, ExplainState *es)
 {
 	LionAntiState *as = st->anti;
 	List	   *context;
+	Node	   *cond;
 
 	ExplainPropertyText("Join Type", "Anti", es);
 	ExplainPropertyText("Join Rows", "the rows counted, less those with a match",
@@ -1745,18 +1811,19 @@ lion_explain_anti(LionCountScanState *st, List *ancestors, ExplainState *es)
 	ExplainPropertyText("Join Lookup Index", get_rel_name(as->idxoid), es);
 	context = set_deparse_context_plan(es->deparse_cxt, st->css.ss.ps.plan,
 									   ancestors);
+	cond = (Node *) make_ands_explicit(as->joinexprs);
+	if (as->cells)
+		cond = lion_anti_cellpred_inline(cond, st);
 	ExplainPropertyText("Join Cond",
-						deparse_expression((Node *)
-										   make_ands_explicit(as->joinexprs),
-										   context, true, false),
-						es);
+						deparse_expression(cond, context, true, false), es);
 }
 
 /*
- * What went past its memory and on to disk (LION_ANTI_SPILL_*), if anything
- * did: the child's rows sorted by key, a key's inner rows, the groups' or
- * cells' losses - the count's rows then held back with them - and the sort
- * that holds them, and the rows taken away sorted by range.
+ * What went past its memory (LION_ANTI_SPILL_*), if anything did: on to disk
+ * past work_mem, the child's rows sorted by key, a key's inner rows, the sort
+ * that holds the losses ("held rows") and the rows taken away sorted by
+ * range; and past hash_mem, the groups' or the cells' losses, which then go
+ * to that sort, the count's rows held back into it with them ("losses").
  */
 static void
 lion_explain_anti_spilled(uint32 spilled, ExplainState *es)
