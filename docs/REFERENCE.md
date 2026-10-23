@@ -822,6 +822,24 @@ working around a bad choice:
   expression), while the table holds within a factor of 2 of the rows the count was taken over, and
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
+- `pg_lion.enable_index_mcv`: give the planner the exact frequency of each value a query compares a
+  column with from a Lion index on it. The values are the constants of every `col = c`, `col IN
+  (...)` and `col = ANY (array)` on the column (of an `ARRAY[...]`, its constant elements) in the
+  table's `WHERE` conditions and in the join conditions that mention the table, whether such a
+  comparison stands alone or inside `AND`s and `OR`s nested to any depth. Each gets the rows of
+  its entry in the index, or none for a value the index does not have,
+  added to ANALYZE's most common values (or put in place of the sampled frequency of one it has)
+  for that query's plan (DESIGN.md §33, "The frequencies of the listed values"). Without it, the
+  planner estimates a value ANALYZE did not list as an equal share of the rest of the rows, which
+  on a skewed column takes a value of thousands of rows for a handful, the more so with the exact
+  number of distinct values above. It applies to the columns and indexes that setting applies to,
+  but not to an expression; to constants of the index's key type compared by its equality (a
+  generic plan's parameter is estimated as before); to at most 1000 values of a column in one table
+  of a query, past which, or where another comparison of the column for equality cannot be
+  taken, the column is estimated as without it; and only for a user who may read every row of the
+  table. Each value is looked up once per planning, one descent of the index's directory, and an
+  `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
+  shows ANALYZE's list.
 
 PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
 stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`
