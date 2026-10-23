@@ -271,8 +271,19 @@ SELECT s.same, s.probed, s.collected
  t    | f      | t
 (1 row)
 
+-- Five groups walk a range over nearly every row at each count, probed at
+-- the group's rows, cheaper than collecting it (DESIGN.md §32, "Walked at
+-- every count"); as an OR's leaf it is never walked, and its union is
+-- NARROWs.
 SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r < 588000 GROUP BY g') s;
+ same | probed | collected 
+------+--------+-----------
+ t    | t      | f
+(1 row)
+
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE (r < 588000 OR s = -1) GROUP BY g') s;
  same | probed | collected 
 ------+--------+-----------
  t    | f      | t

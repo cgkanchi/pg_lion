@@ -537,7 +537,10 @@ g`, a range in an OR, a join's fact filter) is answered too, collected once from
 within a hash table's memory (`work_mem` times `hash_mem_multiplier`, shared by the table's ranges:
 one that does not fit what the others left sends those to temporary files first) and past it in
 windows into a temporary file (`Range Sources Spilled` in `EXPLAIN ANALYZE`), or, where there are
-few counts and the planner finds it cheaper, walked again at each (`Range Sources Walked`).
+few counts - a few groups, a `count(DISTINCT)`'s tests - and the planner finds it at least half
+again cheaper, walked again at each, whether or not it would fit (`Range Sources Walked`; a range
+in an OR is always collected). These counters count each range once, however many partitions,
+rescans and parallel workers collected it.
 An IN list longer than a batch - `work_mem` over 256 bytes a value, and never fewer than 1000
 values - is not held whole either: a count of the table as one row locates and counts it a batch at
 a time, the list that drives a `GROUP BY` on its own column is located a batch at a time as the

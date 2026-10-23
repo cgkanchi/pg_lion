@@ -111,7 +111,9 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE w1 > 10 AND w2 > 10');
 SELECT rc_check('SELECT count(*) FROM rcost WHERE w1 BETWEEN 10 AND 900 AND w2 BETWEEN 10 AND 19000');
 
 -- An equality beside the range drives the complement: the eleven keys
--- outside it are walked, and the node is still the plan.
+-- outside it are walked, and the node is still the plan.  A second range
+-- beside them, w1's, is walked at the one count rather than collected
+-- (DESIGN.md §32, "Walked at every count").
 EXPLAIN (COSTS OFF) SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10;
 SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w2 > 10');
 SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w1 > 10 AND w2 > 10');
@@ -121,14 +123,19 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 1 AND w1 > 10 AND w2 > 10
 -- In the heap's order every key's union is a RUN, and each container after
 -- its first used to be priced - and made - a fold into it: half the keys of
 -- o went to an index scan and a sort.  They are a fold or two a union key
--- now, and the node is the plan.
+-- now, and the node is the plan.  Four groups, or a count(DISTINCT)'s four
+-- existence tests, walk the range at each count instead, which is cheaper
+-- than collecting it (DESIGN.md §32, "Walked at every count"); an OR's leaf
+-- is never walked, and is collected.
 EXPLAIN (COSTS OFF) SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500;
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE o BETWEEN 10 AND 12500');
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE (o BETWEEN 10 AND 24000 OR w2 = -1) GROUP BY lo');
 
 -- Nearly all of w1's rows: the union of every container key is dense, a
 -- RUN - the case that folded every container - and widened into a bitset.
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w1 BETWEEN 10 AND 990 GROUP BY lo');
+SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE (w1 BETWEEN 10 AND 990 OR w2 = -1) GROUP BY lo');
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
 SELECT rc_check('SELECT lo, count(*) FROM rcost WHERE w2 BETWEEN 5000 AND 12000 GROUP BY lo');
 -- half in the heap's order, half scattered
@@ -141,9 +148,10 @@ SELECT rc_check('SELECT count(*) FROM rcost WHERE lo = 2 AND o > 100 AND m BETWE
 -- rows in rcost's order, some 25 to a page and 63 container keys, and there
 -- the widened unions do not all fit, and are optimized back - compacted - to
 -- make room: for the next widening, and before the collection would give
--- up.  The unions optimized fit, and the range is still collected; w2's -
--- keys of five scattered rows, whose unions are ARRAYs with members pending
--- until they are folded - does not, and is walked.  A widening that finds no
+-- up.  The unions optimized fit, and the range is still collected - as an
+-- OR's leaf, o's, which four groups walk otherwise; w2's - keys of five
+-- scattered rows, whose unions are ARRAYs with members pending until they
+-- are folded - does not, and is walked.  A widening that finds no
 -- room even then is refused, and folds as before: rcostn below.
 CREATE TABLE rcostw AS SELECT id, lo, w1, w2, o, m, repeat('x', 260) AS pad
   FROM rcost ORDER BY id;
@@ -156,6 +164,7 @@ SET work_mem = '64kB';
 SET hash_mem_multiplier = 1.0;
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcost WHERE w2 BETWEEN 10 AND 19000');
 SELECT rc_check('SELECT lo, count(*) FROM rcostw WHERE o BETWEEN 10 AND 24000 GROUP BY lo');
+SELECT rc_check('SELECT lo, count(*) FROM rcostw WHERE (o BETWEEN 10 AND 24000 OR w2 = -1) GROUP BY lo');
 SELECT rc_check('SELECT lo, count(*) FROM rcostw WHERE m BETWEEN 0 AND 18750 GROUP BY lo');
 SELECT rc_check('SELECT count(DISTINCT lo) FROM rcostw WHERE w2 BETWEEN 10 AND 19000');
 -- an OR's leaves, which cannot be walked: the second has what the first

@@ -189,8 +189,8 @@ lion_shift_keynos(LionKeyNode *node, int delta)
 static int
 lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 {
-	ArrayType  *arr = DatumGetArrayTypeP(cl->val);
-	Oid			elemtype = ARR_ELEMTYPE(arr);
+	ArrayType  *arr;
+	Oid			elemtype;
 	int16		elmlen;
 	bool		elmbyval;
 	char		elmalign;
@@ -199,6 +199,17 @@ lion_locate_array(LionClauseState *cl, LionPostingSet **sets)
 	int			nelems;
 	int			nsets;
 
+	/*
+	 * A folded filter's keys are in a tuplestore, with no array behind
+	 * cl->val (lion_locate_list() reads them): routed there, never here.
+	 */
+	Assert(!cl->valisnull && cl->valstore == NULL &&
+		   DatumGetPointer(cl->val) != NULL);
+	if (cl->valisnull || cl->valstore != NULL ||
+		DatumGetPointer(cl->val) == NULL)
+		elog(ERROR, "LionCount: an IN list to locate with no array");
+	arr = DatumGetArrayTypeP(cl->val);
+	elemtype = ARR_ELEMTYPE(arr);
 	get_typlenbyvalalign(elemtype, &elmlen, &elmbyval, &elmalign);
 	deconstruct_array(arr, elemtype, elmlen, elmbyval, elmalign,
 					  &elems, &nulls, &nelems);
@@ -292,6 +303,10 @@ lion_array_batch_prepare(LionCountScanState *st, int k, LionClauseState *cl)
 		return false;
 	lb = st->lbatch;
 
+	/* ... and a folded filter's keys are no array (lion_locate_array()) */
+	Assert(cl->valstore == NULL && DatumGetPointer(cl->val) != NULL);
+	if (cl->valstore != NULL || DatumGetPointer(cl->val) == NULL)
+		elog(ERROR, "LionCount: an IN list to batch with no array");
 	arr = DatumGetArrayTypeP(cl->val);
 	if (ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr)) <= lion_array_batch_size())
 	{
@@ -726,6 +741,7 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 		{
 			rs->index = cl->idx;
 			rs->col = cl->idxcol;
+			rs->lead = i;
 			lion_range_init(&rs->range, cl->idx, cl->idxcol);
 		}
 		else if (RelationGetRelid(cl->idx) != RelationGetRelid(rs->index) ||
@@ -745,26 +761,6 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 }
 
 /*
- * A list collected (lion_locate_list()), and spilled: counted once a list,
- * for EXPLAIN ANALYZE's Lists Collected and Lists Spilled - not once for
- * every partition, run and rescan that collected it again.
- */
-static void
-lion_list_counted(LionCountScanState *st, LionClauseState *cl, bool spilled)
-{
-	if (!cl->listcollected)
-	{
-		cl->listcollected = true;
-		st->listsrc_collected++;
-	}
-	if (spilled && !cl->listspilled)
-	{
-		cl->listspilled = true;
-		st->listsrc_spilled++;
-	}
-}
-
-/*
  * Send the ranges and the lists collected in memory so far to files of their
  * own (lion_range_spill_set()), for one after them that does not fit what
  * they left (lion_collect_within()): each then holds what a range collected
@@ -776,24 +772,17 @@ lion_rangesrc_evict(LionCountScanState *st)
 	ListCell   *lc;
 	ListCell   *lc2;
 
-	foreach(lc, st->rangesrc_mem)
+	Assert(list_length(st->rangesrc_mem) == list_length(st->rangesrc_memcl));
+	forboth(lc, st->rangesrc_mem, lc2, st->rangesrc_memcl)
 	{
 		lion_range_spill_set((struct LionMatSet *) lfirst(lc),
 							 &st->rangesrc_held);
-		st->rangesrc_spilled++;
+		((LionClauseState *) lfirst(lc2))->counted |= LION_SRC_SPILLED;
 	}
 	list_free(st->rangesrc_mem);
 	st->rangesrc_mem = NIL;
-	forboth(lc, st->listsrc_mem, lc2, st->listsrc_memcl)
-	{
-		lion_range_spill_set((struct LionMatSet *) lfirst(lc),
-							 &st->rangesrc_held);
-		lion_list_counted(st, (LionClauseState *) lfirst(lc2), true);
-	}
-	list_free(st->listsrc_mem);
-	st->listsrc_mem = NIL;
-	list_free(st->listsrc_memcl);
-	st->listsrc_memcl = NIL;
+	list_free(st->rangesrc_memcl);
+	st->rangesrc_memcl = NIL;
 }
 
 /*
@@ -808,15 +797,14 @@ typedef bool (*LionCollectFn) (void *arg, Size budget, bool spill,
  * Collect a source - a range's union, or a long list's - within what is left
  * of the hash table's memory the relation's collected sources share
  * (get_hash_memory_limit(), rangesrc_held), as lion_locate_range() says, and
- * add it to those held in memory (*mem) when it is in memory.  A source that
- * does not fit what the others left takes that memory back
- * (lion_rangesrc_evict()) and is collected in what that frees, in windows if
- * it must - unless it is walkable, when false says it is left to be walked.
+ * add it to those held in memory (rangesrc_mem) when it is in memory, with
+ * cl, the clause that counts it.  A source that does not fit what the others
+ * left takes that memory back (lion_rangesrc_evict()) and is collected in
+ * what that frees, in windows if it must.
  */
-static bool
+static void
 lion_collect_within(LionCountScanState *st, LionCollectFn collect, void *arg,
-					bool walkable, LionPostingSet *ps, bool *spilled,
-					List **mem)
+					LionClauseState *cl, LionPostingSet *ps, bool *spilled)
 {
 	Size		limit = get_hash_memory_limit();
 	Size		budget;
@@ -824,27 +812,30 @@ lion_collect_within(LionCountScanState *st, LionCollectFn collect, void *arg,
 	bool		collected;
 
 	budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-	if (walkable || (st->rangesrc_mem == NIL && st->listsrc_mem == NIL))
-		collected = collect(arg, budget, !walkable, ps, &held, spilled);
+	if (st->rangesrc_mem == NIL)
+		collected = collect(arg, budget, true, ps, &held, spilled);
 	else if (!(collected = collect(arg, budget, false, ps, &held, spilled)))
 	{
 		lion_rangesrc_evict(st);
 		budget = (st->rangesrc_held < limit) ? limit - st->rangesrc_held : 0;
-		if (!collect(arg, budget, true, ps, &held, spilled))
-			elog(ERROR, "LionCount: a source to collect in windows refused");
-		collected = true;
+		collected = collect(arg, budget, true, ps, &held, spilled);
 	}
-	if (!collected || !ps->found)
-		return collected;
+	if (!collected)
+		elog(ERROR, "LionCount: a source to collect in windows refused");
+	cl->counted |= LION_SRC_COLLECTED;
+	if (*spilled)
+		cl->counted |= LION_SRC_SPILLED;
+	if (!ps->found)
+		return;
 	st->rangesrc_held += held;
 	if (!*spilled)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
 
-		*mem = lappend(*mem, ps->mat);
+		st->rangesrc_mem = lappend(st->rangesrc_mem, ps->mat);
+		st->rangesrc_memcl = lappend(st->rangesrc_memcl, cl);
 		MemoryContextSwitchTo(oldcxt);
 	}
-	return true;
 }
 
 /* A range source's collection, and what its walk read. */
@@ -890,14 +881,20 @@ lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * they cost a write and a read of each container a count seeks.
  *
  * Unless the plan says to walk it (`walkable`, LION_FLAG_RANGEWALK and
- * LION_CLAUSE_WALK): where there are few counts the planner may have found
- * walking the range at every count cheaper than collecting it in windows,
- * and if it does not fit it is then left to be walked instead
- * (src->rangewalk, lion_node_count()).  Only the ranges the planner priced
- * so: one it expected to fit is collected, in windows if it must.  An OR's
- * leaf is never walked - it cannot be taken apart that way - nor a source of
- * the decoded walk's WHERE (DESIGN.md §34) or of the FK-side join, whose
- * plans never say so.
+ * LION_CLAUSE_WALK): where there are few counts - a few groups, the
+ * existence tests of a count(DISTINCT), which stop at their first row - the
+ * planner may have found walking the range at every count cheaper than
+ * collecting it, in memory or in windows, and it is then walked from the
+ * start (src->rangewalk, lion_node_count()), not collected.  It used to be
+ * collected first all the same, until the memory ran out: a range that fit
+ * after all was collected whatever walking it would have cost, and one that
+ * did not cost the walk of as much of it as filled the memory before it was
+ * walked - which the walk's price, and the walk, grew with (2026-10-22
+ * review: 5 ms walked at 64 kB, 34 ms at 256 kB, 0.45 s collected from
+ * 768 kB).  Only the ranges the planner priced so are walked.  An OR's leaf
+ * is never walked - it cannot be taken apart that way - nor a source of the
+ * decoded walk's WHERE (DESIGN.md §34) or of the FK-side join, whose plans
+ * never say so.
  *
  * Returns the source's tree the way lion_locate_leaf() does: NULL when the
  * range selects nothing - an empty range, a NULL bound, or no row in it - and
@@ -917,21 +914,20 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 
 	if (rs->range.empty)
 		return NULL;
-
-	rc.rs = rs;
-	rc.nread = 0;
-	rc.nsums = 0;
-	if (!lion_collect_within(st, lion_range_collect_fn, &rc, walkable, &ps,
-							 &spilled, &st->rangesrc_mem))
+	if (rs->lead < 0 || rs->lead >= st->nclause)
+		elog(ERROR, "LionCount: a range source of no clause");
+	if (walkable)
 	{
-		st->rangesrc_walked++;
+		st->clause[rs->lead].counted |= LION_SRC_WALKED;
 		*walked = true;
 		return NULL;
 	}
 
-	st->rangesrc_collected++;
-	if (spilled)
-		st->rangesrc_spilled++;
+	rc.rs = rs;
+	rc.nread = 0;
+	rc.nsums = 0;
+	lion_collect_within(st, lion_range_collect_fn, &rc, &st->clause[rs->lead],
+						&ps, &spilled);
 	st->summaries += rc.nsums;
 	if (!ps.found)
 		return NULL;
@@ -1127,17 +1123,7 @@ lion_locate_list(LionCountScanState *st, LionClauseState *cl,
 									   "lion list batch",
 									   ALLOCSET_DEFAULT_SIZES);
 
-	(void) lion_collect_within(st, lion_list_collect_fn, &w, false, &ps,
-							   &spilled, &st->listsrc_mem);
-	lion_list_counted(st, cl, spilled);
-	if (ps.found && !spilled)
-	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(st->wherecxt);
-
-		/* beside its set in listsrc_mem (lion_collect_within()) */
-		st->listsrc_memcl = lappend(st->listsrc_memcl, cl);
-		MemoryContextSwitchTo(oldcxt);
-	}
+	lion_collect_within(st, lion_list_collect_fn, &w, cl, &ps, &spilled);
 
 	MemoryContextDelete(w.batchcxt);
 	if (w.slot != NULL)
@@ -2212,8 +2198,7 @@ lion_release_where(LionCountScanState *st)
 	}
 	st->rangesrc_held = 0;
 	st->rangesrc_mem = NIL;		/* it lived in wherecxt too */
-	st->listsrc_mem = NIL;		/* and so did this */
-	st->listsrc_memcl = NIL;
+	st->rangesrc_memcl = NIL;	/* and so did this */
 
 	/*
 	 * The collected WHERE (lion_group_count()): its file, if it spilled, is

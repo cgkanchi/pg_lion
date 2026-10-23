@@ -3012,7 +3012,11 @@ which adds the participants' partial counts up and applies the HAVING:
   every counter of the scan a worker moves is summed into the leader's (`LionScanWorkerSums` in
   `LionJoinShared`), so that none of them prints the leader's share alone, or nothing where the
   leader takes no part. A range source is collected by each participant that counts a range of
-  its run, so `Range Sources Collected` counts collections, not the sources of the query.
+  its run, but `Range Sources Collected` counts the sources of the query, not the collections: each
+  clause marks how it was taken (`LionClauseState.counted`), and a worker ORs its marks into an
+  array after `LionJoinShared` that the leader reads at shutdown (`LION_JOIN_SHARED_COUNTED()`).
+  It counted collections before the 2026-10-23 review: 2 over two partitions, 3 over three
+  rescans, 2 or 3 in a parallel plan, for the one range.
 
 **Measured** on the release build (PostgreSQL 18.6 at -O2 without assertions, the library at -O2),
 on four cores other sessions' work shared (a one-minute load of 1.6 to 2.0 throughout),
@@ -5206,9 +5210,11 @@ size" where the ordinary plan answers. Two things now:
   every row of it would go to the heap (`lion_count_one_set()`): on an all-visible heap of 3 million
   rows, 50,000 values spread over all of it took 72 to 79 ms that way, reading every heap page,
   against 49 ms for the sum, which reads none. EXPLAIN ANALYZE prints `Lists Collected` and `Lists
-  Spilled`, the lists collected and those of them that went to a file: each list once
-  (`lion_list_counted()`), however many partitions, runs and rescans collected it again, and in a
-  parallel plan the most any one participant collected.
+  Spilled`, the lists collected and those of them that went to a file: each list once, however
+  many partitions, runs, rescans and participants collected it again, as the range sources are
+  counted (§32, "Walked at every count"). A parallel plan printed the most any one participant
+  had collected before the 2026-10-23 review, which counted two lists that two workers spilled
+  one each as one.
 - **So does a list under an OR** (`lion_locate_or()`, 2026-10-22 review). Its union with the other
   leaves is no disjoint one, so it cannot be taken a batch at a time; a leaf longer than
   `lion_array_batch_size()` is collected as above, in the same memory, and is one set of the OR's
@@ -12514,7 +12520,8 @@ How to read them, for any workload:
   node itself read from disk.
 - `Fact Filter Locate Time` is the fact filters located - once a run, and once a leaf's turn over
   a partitioned fact - and it is mostly a range among them collected into memory (§32, "A range as
-  a source"); `Range Sources Collected` says how many. It was in no phase before 2026-09-29, and a
+  a source"); `Range Sources Collected` says how many ranges were. It was in no phase before
+  2026-09-29, and a
   semi join whose 90 ms were 87 of collecting a range showed none of it.
 - What the node took besides these phases - its batches, and handing its rows up - is its time less
   them.
@@ -20032,8 +20039,9 @@ read, and every count's reads of them. An IN list too long to locate at once is 
 same memory and the same way (§15, "A list too long to locate at once"; `lion_collect_within()`),
 evicting and evicted alike; the planner, which cannot see a parameter's length, prices none of it.
 
-Such a range may instead be WALKED at every count it is part of (`LionCountSource.rangewalk`,
-`lion_node_count()`), where the plan says so (`LION_FLAG_RANGEWALK`): the rows of the range are
+**Walked at every count.** A range may instead be WALKED at every count it is part of
+(`LionCountSource.rangewalk`, `lion_node_count()`), where the plan says so (`LION_FLAG_RANGEWALK`):
+the rows of the range are
 the disjoint union of the sets its walk hands out, so the count is the SUM over them of the count
 of each - a leaf's worth of small entries at a time, as §28 counts - ANDed with the other sources,
 or, when the leaf-by-leaf race says the outside is shorter, the count of the other sources minus
@@ -20044,20 +20052,40 @@ counting core unchanged - so a multi-key clause answered only as a superset (a p
 element) is rechecked there as it always is.
 
 That is a walk of the range per count, which is no plan for many counts, and the planner takes it
-as a choice, priced (`lion_count_rel_walk_save()`): the collection the executor tries first, until
-the memory runs out, and the walk at every count the relation makes - its groups, pairs or tests,
-or the sets of the range it sums - with the count's own set and the other sources for F
-(`lion_cost_range_sum()` with F given: an existence test's share of the inside, a second walked
-range at every set the first hands out), against the windows, the reads of the file and the
-counts' merges, which a walk makes itself. A summed range beside one is priced at the side it
+as a choice, priced (`lion_count_rel_walk_save()`): the walk at every count the relation makes -
+its groups, pairs or tests, or the sets of the range it sums - with the count's own set and the
+other sources for F (`lion_cost_range_sum()` with F given: an existence test's share of the
+inside, a second walked range at every set the first hands out), against the collection, in
+memory or in windows, the reads of the files it and the ranges it sent to files would be read
+from, and the counts' merges, which a walk makes itself. Any range outside an OR may be walked,
+one that fits as well as one that does not. A summed range beside one is priced at the side it
 takes beside the range collected - its inside, as often as not, which is what walking costs at
-most. The choice is the node's, and names the ranges it priced walked: the first bound of each is
-`LION_CLAUSE_WALK` in the plan's clause kinds, and the executor walks those where they do not fit
-(`lion_locate_range()`). Every other range of the node - one the planner sized to fit - is
-collected, in windows if its union outgrows the memory all the same: a range nobody priced walked
-is never walked at every set of another's walk. Never beside the decoded walk (§34) or in an
-FK-side join (§27), whose WHERE is one collected copy and whose counts are the dimension rows, nor
-for an OR's leaf, which cannot be walked.
+most. The plan takes one WAY of walking its ranges (`lion_walk_save_choose()`): all of them - a
+second at every set the walk of the first hands out - or one alone with the others collected, the
+way that saves the most over the relations and runs it counts, and only where the collection is
+priced at least `LION_RANGE_WALK_MARGIN` (1.5) times the walks, since a walk's price is the
+count's estimate of its groups and tests times one walk, and a collection's is one walk bounded by
+the memory. The choice is the node's, and names the ranges it priced walked: the first bound of
+each is `LION_CLAUSE_WALK` in the plan's clause kinds, and the executor walks those from the start
+(`lion_locate_range()`), collecting nothing of them. Every other range of the node is collected,
+in windows if its union outgrows the memory: a range nobody priced walked is never walked at every
+set of another's walk. Never beside the decoded walk (§34) or in an FK-side join (§27), whose WHERE
+is one collected copy and whose counts are the dimension rows, nor for an OR's leaf, which cannot
+be walked.
+
+Until the 2026-10-23 review only a range the planner found too large to fit was priced walked, and
+the executor collected it first all the same, walking it only once the memory ran out. A range that
+fit after all was collected whatever walking it would have cost, and one that did not cost the walk
+of as much of it as filled the memory before it was walked - so the walk's price, and the walk,
+grew with `work_mem`: a `count(DISTINCT)`'s existence tests over a range of 3M rows took 5 ms
+walked at 64 kB, 34 ms at 256 kB and 0.45 s collected from 768 kB, and the existence tests of the
+regression suite's shapes 15 to 130 times what walking took. Measured on the release build since,
+over a 20M-row table and the suite's tables: a `count(DISTINCT)`'s existence tests and a few
+groups walk, 1.5 to 60 times faster than collecting; 300 groups and more collect, as before; the
+margin keeps two ranges beside seven groups collected, 11 to 13 ms, where walking one took 16 (the
+collection priced at 1.2 times the walk), and the ways leave a range too large to collect walked
+beside a `count(DISTINCT)` with the other collected, 3 ms, where collecting both in windows took
+9.
 
 Measured on the assert-enabled build (2026-10-19): 3M rows on 25,000 pages, `r` a hash of the row
 number with summaries, `r < 5592405` a third of them, 1.6 MB as its union builds it, at `work_mem`
@@ -20094,6 +20122,18 @@ is bounded (2026-09-28 review):
   array is a block of its own at its own size, where the default context rounded a 4104-byte bitset
   up to 8 kB; and what the union holds is counted as the allocator hands it out
   (`GetMemoryChunkSpace()`), where it used to be counted at the containers' own sizes.
+- **The walk keeps nothing of a set it has added.** Each set the walk hands out is read in a
+  context of its own, reset once the union has taken it (`lion_range_union_walk()`): an INLINE
+  set's copy of its payload and key, and the stream, plan and cursors it is read through, are the
+  set's alone, and releasing a set gives back its pin, not its memory. Until the 2026-10-23 review
+  they stayed in the node's WHERE context for the rest of the query, some 250 bytes for every entry
+  walked, outside the union's memory and whatever `work_mem` said: 154 MB over 600,000 keys at
+  4 MB (the review's), and over a 20M-row table on the release build, `r < 8388608 GROUP BY g`
+  (8.4 million keys) at 64 MB, 1.2 GB of peak RssAnon and 9.8 s, now 26 MB and 3.8 s; on the
+  assert build a range over 950,000 of 3M rows, 242 MB, now 4 MB. The node's other walks - a walked
+  range a batch at a time (`lion_walk_range_part()`), a probed one's sets, an IN list's batches,
+  the FK-side join's chunks of groups, the inner GROUP BY column's entries, the key aggregates'
+  entries - already reset a context of their own as they went.
 - **Past the memory, a range is collected in WINDOWS**, into a temporary file (`LionSpill`, the
   same the FK-side join's copy spills into, §27): an OR's leaf, every range beside the decoded walk
   (§34), whose WHERE is one collected copy, and every range of a plan that does not walk them. It
@@ -20120,7 +20160,14 @@ is bounded (2026-09-28 review):
   the range once and none twice - the collected set's argument unchanged. A union n times a
   window's memory costs one walk and about log n / log fanout passes over the walk's containers,
   each written and read back for every window it is not kept by, which is the price the planner
-  puts on it (`lion_cost_range_source()`, `lion_union_overflow_share()`). Over small sets in no
+  puts on it (`lion_cost_range_source()`, `lion_union_overflow_share()`). A walk that hands its
+  keys out in order - a column in the heap's order, or its reverse - makes one pass more: the first
+  window does not know where its keys end, so its last part is open from about where it cut, and
+  every key after that goes there - 10.77 MB of a 10.78 MB overflow over 3M rows at 64 kB, where a
+  scattered range's went 8.4, 4.5 and 4.4 MB into three - and only the window made of that part
+  splits fanout ways. The planner priced that pass at none before the 2026-10-23 review, and
+  interpolates it by the column's correlation now, as it does the union's size. Over small sets in
+  no
   order - summaries of a few dozen rows, a container each at keys all over the heap - that is many
   times the union's own containers, and the walk at every count may then be the cheaper. An IN
   list collected the same way locates its values once, into the first window (§15). EXPLAIN
@@ -20142,7 +20189,9 @@ for few counts would be the cheaper.
 
 EXPLAIN names each range with all of its bounds (`lion_src_ur.u (u > 100 AND u <= 900)`), and
 EXPLAIN ANALYZE counts `Range Sources Collected` and `Range Sources Walked` when there are any, and
-of the collected, `Range Sources Spilled`. An FK-side join's collection is timed, with TIMING, in
+of the collected, `Range Sources Spilled`: each range once, however many partitions, rescans and
+participants of a parallel plan took it (§10, "A count in parallel"). An FK-side join's collection
+is timed, with TIMING, in
 `Fact Filter Locate Time` (since 2026-09-29, "What collecting a range costs").
 
 ### Summed ranges: dense and probed (2026-09-28)
@@ -20275,8 +20324,18 @@ keys, which therefore happens only where it did before. Each widening is made wh
 have been and compacted at most once, so a collection short of memory spends about what it did - a
 scattered range at `work_mem` 64 kB widened and compacted 6,916 times in 495 compactions and took as
 long as it did - and one that is not spends a fold or two a union key and a few nanoseconds a
-container. On an assert build the series went from 30 ms, 1.09 s and 9.1 s to 21, 101 and 455 ms,
-against core's 176, 269 and 492; over 2M rows in heap order, one row a key, 1.9 million keys went
+container. *(Until the 2026-10-23 review a union compacted could be widened again: near its memory a
+collection of scattered rows compacted to make room for one widening, the next container widened
+the union just compacted, which compacted the one before - a 4 kB optimize and a 4 kB widening a
+container, 12 s at 768 kB over 3M rows, 60 to 70% of it in the optimize. Now a union is widened
+once and compacted once at most (`LionRangeUnionEnt.compacted`); one that may not be widened takes
+the members of a small ARRAY into a buffer as an ARRAY union does, folded once they come to a
+quarter of its size in bytes, and before those buffers would put the collection past its memory
+they are folded and given back (`lion_range_union_squeeze()`), and such unions fold as each
+container comes until a window gives back keys. `k < 950000` over 3M rows in no order went from
+1.82 s at a 1 MB `work_mem`, twice what 64 MB took, to 0.66, and in windows at 64 kB from 1.93 s
+to 1.11, with the walk's sets freed as it goes (above, "What it needs beside it").)* On an assert
+build the series went from 30 ms, 1.09 s and 9.1 s to 21, 101 and 455 ms, against core's 176, 269 and 492; over 2M rows in heap order, one row a key, 1.9 million keys went
 from 14.1 s to 1.24, the walk of the keys most of it, and ten rows a key from 951 ms to 109.
 Measured over 40 collections - two orders, one row and ten a key, with and without summaries, 1% to
 95% of the keys - none is slower beyond the noise, and all but six are 2 to 30 times faster. The
