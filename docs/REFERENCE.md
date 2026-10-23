@@ -847,12 +847,14 @@ working around a bad choice:
   index-only where its B-tree holds every column of the fact the query reads (`Ordered By: <index>
   (index only)`); the dimension's row is read from its heap once its entry has passed the
   dimension's set, never from an index. The planner prices the walk, a B-tree descent per key and
-  the dimension rows read, divided by `pg_lion.pushdown_margin`; where the tables do not fit in
-  `effective_cache_size` and PostgreSQL's cheapest plan under the `LIMIT` is a nested loop in the
-  walk's order, the pages each reads outside the cache are charged `pg_lion.cold_page_cost`, which
-  takes the node's price down by at most `pg_lion.cold_max_discount`. EXPLAIN prints `Ordered
-  By`, `Index Cond`, `Filter`, `Lion Cond` and `Lion Indexes` for the fact, `Dimension: <table>
-  via <index>` with `Dimension Filter`, `Dimension Lion Cond` and `Dimension Lion Indexes`, and
+  the dimension rows read, divided by `pg_lion.pushdown_margin`. Where PostgreSQL's cheapest plan
+  under the `LIMIT` is a nested loop in the walk's order (over the fact's B-tree or over
+  `LionOrdered`), that loop's Memoize is taken at the cache hits the `LIMIT` lets it meet
+  (`pg_lion.enable_memoize_limit`); and where the tables do not fit in `effective_cache_size`, the
+  pages each plan reads outside the cache are charged `pg_lion.cold_page_cost`, which takes the
+  node's price down by at most `pg_lion.cold_max_discount`. EXPLAIN prints `Ordered By`, `Index
+  Cond`, `Filter`, `Lion Cond` and `Lion Indexes` for the fact, `Dimension: <table> via <index>`
+  with `Dimension Filter`, `Dimension Lion Cond` and `Dimension Lion Indexes`, and
   `Key Sets: <tables>`, each key set's table's plan below the node; `EXPLAIN ANALYZE` adds the
   fact's `Index Entries Walked`, `Lion Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`,
   `Rows Removed by Filter`, `Lion Set`, `Switched to Fetch and Sort` and `Scans Stopped Early`; `Key
@@ -939,6 +941,16 @@ working around a bad choice:
   table. Each value is looked up once per planning, one descent of the index's directory, and an
   `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
   shows ANALYZE's list.
+- `pg_lion.enable_memoize_limit` (on by default): price a nested loop that Lion's paths compete
+  with at the cache hits its Memoize meets under the query's `LIMIT` (DESIGN.md §39, "A Memoize
+  under a LIMIT"). The planner prices a Memoize at one hit ratio for every call of the loop's whole
+  walk. A `LIMIT` that stops the loop after a few thousand calls meets few repeated keys, and the
+  loop's price of those rows counts hits it does not get: 70% where it gets under 1% in DESIGN.md
+  §47.9's measurement. Lion's price is put into the loop's units by the loop's price over its
+  price with those hits taken out, so row estimates and every other plan comparison are unchanged.
+  It applies where the query has a `LIMIT` and no grouping, aggregate or window, the loop's order
+  gives the query at least its first sort key, and the `LIMIT` takes a share of the loop's rows.
+  Off, the loop is taken at the planner's price.
 
 PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
 stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`

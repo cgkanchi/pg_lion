@@ -1946,6 +1946,13 @@ extern PGDLLIMPORT bool lion_enable_intersection_probe;
 extern PGDLLIMPORT bool lion_enable_rows_correction;
 
 /*
+ * Whether a nested loop competitor's Memoize is priced at the hits the
+ * LIMIT's share of its calls meets (DESIGN.md §39, "A Memoize under a
+ * LIMIT").
+ */
+extern PGDLLIMPORT bool lion_enable_memoize_limit;
+
+/*
  * Whether an AND of posting sets may look its running intersection up in the
  * containers of a union at a key instead of building the union (DESIGN.md
  * §29.11, "Unions probed"): an executor setting, for comparing the two.

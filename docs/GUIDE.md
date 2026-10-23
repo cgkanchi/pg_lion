@@ -513,10 +513,11 @@ its key, the join that one equality and nothing else; the fact's B-tree must giv
 at least its first column, and where it holds every fact column the query reads the walk is
 index-only (`Ordered By: fact_grp_score (index only)`). `EXPLAIN ANALYZE` shows each side's
 counters, the dimension's behind `Dimension` (`Dimension Descents`, `Dimension Heap Fetches`).
-The planner prices it against PostgreSQL's plans. Where the tables outgrow `effective_cache_size`,
-the pages PostgreSQL's nested loop reads for each fact row and key it keeps are charged as cold
-reads, as are the node's own, which are fewer. `pg_lion.enable_ordered_join` turns it off (DESIGN.md
-§47).
+The planner prices it against PostgreSQL's plans. A nested loop's Memoize is taken at the cache hits
+the `LIMIT` lets it meet, not at the hit ratio of the loop's whole walk. Where the tables outgrow
+`effective_cache_size`, the pages PostgreSQL's nested loop reads for each fact row and key it keeps
+are charged as cold reads, as are the node's own, which are fewer. `pg_lion.enable_ordered_join`
+turns it off (DESIGN.md §47).
 
 ## Nearest neighbours: lionvec
 

@@ -37,6 +37,13 @@
 
 #include "lion_customscan.h"
 
+/*
+ * Whether a nested loop competitor's Memoize is priced at the hits the
+ * LIMIT's share of its calls meets (DESIGN.md §39, "A Memoize under a
+ * LIMIT"; lion_memoize_limit_extra()).
+ */
+bool		lion_enable_memoize_limit = true;
+
 static const char *const lion_competitor_names[] = {
 	[LION_COMPETITOR_NONE] = "none",
 	[LION_COMPETITOR_DISABLED] = "disabled plan",
@@ -719,6 +726,13 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
  * price and the lion path can be the slower, by up to that factor where its
  * own price is the dearer.
  *
+ * A loop over a Memoize whose LIMIT meets fewer hits than core priced
+ * (lion_memoize_limit_scale()) is weighed at its price with them, nlcost /
+ * memoscale: the loop's price with lion_memoize_limit_extra() brought into
+ * the frame of its cost.  memoscale itself multiplies the path's price
+ * (lion_units_price()), outside the bound; the factor is each side's cold
+ * reads over its own warm price, in which the extra is the loop's.
+ *
  * A competitor with no loop's cold reads but a bitmap heap scan's
  * (lion_bitmap_cold()) is priced against those instead
  * (lion_units_bitmap_cold()).
@@ -729,6 +743,8 @@ void
 lion_units_cold(LionUnits *u, Cost own, double reads)
 {
 	Cost		price = own * u->rate;
+	Cost		loop = (u->memoscale > 0.0 && u->memoscale < 1.0) ?
+		u->nlcost / u->memoscale : u->nlcost;
 	Cost		lioncold;
 	double		factor;
 
@@ -741,11 +757,10 @@ lion_units_cold(LionUnits *u, Cost own, double reads)
 		u->nlcost <= 0.0 || price <= 0.0)
 		return;
 	lioncold = Max(reads, 0.0) * u->coldpage;
-	factor = (price + lioncold) * u->nlcost /
-		((u->nlcost + u->nlcold) * price);
+	factor = (price + lioncold) * loop / ((loop + u->nlcold) * price);
 	factor = Min(Max(factor, 1.0 / lion_cold_cap()), 1.0);
 	elog(DEBUG2, "lion: a nested loop's cold reads, %.2f over its %.2f against %.2f over %.2f, at factor %g",
-		 u->nlcold, u->nlcost, lioncold, price, factor);
+		 u->nlcold, loop, lioncold, price, factor);
 	u->rate *= factor;
 }
 
@@ -817,17 +832,56 @@ lion_bitmap_index_reads(PlannerInfo *root, Path *bitmapqual, double loops,
 }
 
 /*
+ * The calls a Memoize was priced for: the rescans its loop makes, one for
+ * each outer row (PostgreSQL 19 calls them est_calls).
+ */
+static double
+lion_memoize_calls(MemoizePath *mpath)
+{
+#if PG_VERSION_NUM >= 190000
+	return Max(mpath->est_calls, 1.0);
+#else
+	return Max(mpath->calls, 1.0);
+#endif
+}
+
+/*
+ * The distinct values of a Memoize's keys over its calls, as
+ * cost_memoize_rescan() estimates them: estimate_num_groups() of its keys,
+ * all the calls where that estimate fell back on a default, at least 1 and at
+ * most the calls.  PostgreSQL 19 keeps the figure on the path once it is
+ * costed (est_unique_keys).
+ */
+static double
+lion_memoize_ndistinct(PlannerInfo *root, MemoizePath *mpath)
+{
+	double		calls = lion_memoize_calls(mpath);
+	double		ndistinct;
+	EstimationInfo estinfo;
+
+#if PG_VERSION_NUM >= 190000
+	if (mpath->est_unique_keys > 0.0)
+		return Min(Max(mpath->est_unique_keys, 1.0), calls);
+#endif
+	memset(&estinfo, 0, sizeof(estinfo));
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
+									&estinfo);
+	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
+		ndistinct = calls;
+	return Min(Max(ndistinct, 1.0), calls);
+}
+
+/*
  * The hit ratio cost_memoize_rescan() priced a Memoize at: of its calls, the
- * distinct values of its keys (all the calls where that estimate fell back
- * on a default), of which the cache holds est_entries at once, hit
- * (calls - ndistinct) / calls x est_entries / ndistinct of the time.
- * est_entries is what cost_memoize_rescan() set it to, the least of
- * ndistinct and the entries hash_mem holds - 0 where one entry does not fit,
- * which it prices as every call a miss.  A Memoize not costed yet
- * (create_memoize_path() leaves est_entries 0, and cost_rescan() is reached
- * only for an outer side of more than one row) is taken the same way: it is
- * scanned once a call, and is called about once.  From PostgreSQL 19 the
- * path keeps the ratio itself (est_hit_ratio, 0 until it is costed).
+ * distinct values of its keys (lion_memoize_ndistinct()), of which the cache
+ * holds est_entries at once, hit (calls - ndistinct) / calls x est_entries /
+ * ndistinct of the time.  est_entries is what cost_memoize_rescan() set it
+ * to, the least of ndistinct and the entries hash_mem holds - 0 where one
+ * entry does not fit, which it prices as every call a miss.  A Memoize not
+ * costed yet (create_memoize_path() leaves est_entries 0, and cost_rescan()
+ * is reached only for an outer side of more than one row) is taken the same
+ * way: it is scanned once a call, and is called about once.  From PostgreSQL
+ * 19 the path keeps the ratio itself (est_hit_ratio, 0 until it is costed).
  */
 static double
 lion_memoize_hit_ratio(PlannerInfo *root, MemoizePath *mpath)
@@ -835,19 +889,13 @@ lion_memoize_hit_ratio(PlannerInfo *root, MemoizePath *mpath)
 #if PG_VERSION_NUM >= 190000
 	return mpath->est_hit_ratio;
 #else
-	EstimationInfo estinfo;
-	double		calls = Max(mpath->calls, 1.0);
+	double		calls = lion_memoize_calls(mpath);
 	double		ndistinct;
 	double		entries;
 
 	if (mpath->est_entries == 0)
 		return 0.0;
-	memset(&estinfo, 0, sizeof(estinfo));
-	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
-									&estinfo);
-	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
-		ndistinct = calls;
-	ndistinct = Min(Max(ndistinct, 1.0), calls);
+	ndistinct = lion_memoize_ndistinct(root, mpath);
 	entries = Min((double) mpath->est_entries, ndistinct);
 	return ((calls - ndistinct) / calls) * (entries / ndistinct);
 #endif
@@ -865,6 +913,124 @@ lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
 								1.0);
 
 	return Max(loops * (1.0 - hit_ratio), 1.0);
+}
+
+/*
+ * A MEMOIZE UNDER A LIMIT (DESIGN.md §39, "A Memoize under a LIMIT"): what a
+ * nested loop over a Memoize costs more than core priced it at, when the
+ * query's LIMIT takes `share` of its rows.  cost_memoize_rescan() prices
+ * each of the Memoize's calls at the hit ratio hr of all of them
+ * (lion_memoize_hit_ratio()), a miss at its input's total cost and a hit at
+ * the lookup a miss pays too.  The loop's price of a LIMIT's share of its
+ * rows is that share of its run, so it counts hr of the first n = share x
+ * calls calls hits, where those n calls repeat only the keys among
+ * themselves.  Of ndistinct keys drawn about uniformly, n calls hold
+ *
+ *	d(n) = ndistinct x (1 - (1 - 1 / ndistinct)^n)
+ *
+ * distinct ones, and hit n - d(n) times where the cache holds them all, of
+ * which est_entries / d(n) where it holds fewer, as core takes est_entries /
+ * ndistinct of the whole walk's:
+ *
+ *	hits(n) = (n - d(n)) x min(1, est_entries / d(n))
+ *
+ * and the loop's price of its first n calls lacks
+ *
+ *	extra = n x (hr - hits(n) / n) x the input's total cost
+ *
+ * where that is positive.  Over 200,000 keys, 26,000 calls hit about 6% of
+ * the time; core's 625,000 calls of the whole walk, 68%.  0 with
+ * pg_lion.enable_memoize_limit off, with share 1 or more, and where path is
+ * not a nested loop (under a projection) whose inner side is a Memoize (under
+ * a Material or a projection); a Memoize core priced as never hitting
+ * (est_entries 0) lacks nothing.
+ */
+Cost
+lion_memoize_limit_extra(PlannerInfo *root, Path *path, double share)
+{
+	JoinPath   *jp;
+	Path	   *inner;
+	MemoizePath *mpath;
+	double		calls;
+	double		ndistinct;
+	double		hr;
+	double		n;
+	double		dn;
+	double		hits;
+	Cost		extra;
+
+	if (!lion_enable_memoize_limit || root == NULL || path == NULL ||
+		share <= 0.0 || share >= 1.0)
+		return 0.0;
+	while (path != NULL && IsA(path, ProjectionPath))
+		path = ((ProjectionPath *) path)->subpath;
+	if (path == NULL || !IsA(path, NestPath))
+		return 0.0;
+	jp = (JoinPath *) path;
+	inner = jp->innerjoinpath;
+	while (inner != NULL &&
+		   (IsA(inner, MaterialPath) || IsA(inner, ProjectionPath)))
+		inner = lion_path_input(inner);
+	if (inner == NULL || !IsA(inner, MemoizePath))
+		return 0.0;
+	mpath = (MemoizePath *) inner;
+	if (mpath->est_entries == 0 || mpath->subpath == NULL)
+		return 0.0;
+	hr = Min(Max(lion_memoize_hit_ratio(root, mpath), 0.0), 1.0);
+	if (hr <= 0.0)
+		return 0.0;
+	calls = lion_memoize_calls(mpath);
+	ndistinct = lion_memoize_ndistinct(root, mpath);
+	n = Max(share * calls, 1.0);
+	if (n >= calls)
+		return 0.0;
+	dn = (ndistinct > 1.0) ?
+		ndistinct * (1.0 - exp(n * log1p(-1.0 / ndistinct))) : 1.0;
+	dn = Min(Max(dn, 1.0), n);
+	hits = (n - dn) * Min((double) mpath->est_entries / dn, 1.0);
+	extra = n * (hr - hits / n) * mpath->subpath->total_cost;
+	if (extra <= 0.0)
+		return 0.0;
+	elog(DEBUG2, "lion: a Memoize under a LIMIT, %.0f of its %.0f calls over %.0f keys hitting %g where core took %g: %.2f more",
+		 n, calls, ndistinct, hits / n, hr, extra);
+	return extra;
+}
+
+/*
+ * The share of its price a nested loop competitor over a Memoize is priced
+ * at under the query's LIMIT, against its price with the hits that share of
+ * its calls lacks (lion_memoize_limit_extra()): its price of the LIMIT's
+ * share of its rows - its startup and that share of its run, as the Limit
+ * over it takes - over that and the extra.  Only where the LIMIT takes a
+ * share of the loop's own rows: the query has one (limit_tuples, which the
+ * planner leaves -1 under a grouping, an aggregate or a window), and the
+ * loop's order gives the query at least its first sort key.  1 elsewhere.
+ */
+static double
+lion_memoize_limit_scale(PlannerInfo *root, Path *best)
+{
+	double		share;
+	int			ncommon = 0;
+	Cost		price;
+	Cost		extra;
+
+	if (root == NULL || best == NULL || root->limit_tuples <= 0.0 ||
+		best->rows <= 0.0 || best->pathkeys == NIL ||
+		root->query_pathkeys == NIL)
+		return 1.0;
+	(void) pathkeys_count_contained_in(root->query_pathkeys, best->pathkeys,
+									   &ncommon);
+	if (ncommon == 0)
+		return 1.0;
+	share = root->limit_tuples / best->rows;
+	if (share >= 1.0)
+		return 1.0;
+	extra = lion_memoize_limit_extra(root, best, share);
+	price = best->startup_cost +
+		share * (best->total_cost - best->startup_cost);
+	if (extra <= 0.0 || price <= 0.0)
+		return 1.0;
+	return price / (price + extra);
 }
 
 /*
@@ -1132,6 +1298,7 @@ lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 	u->kind = LION_COMPETITOR_NONE;
 	u->rate = 1.0;
 	u->margin = 1.0;
+	u->memoscale = 1.0;
 	foreach(lc, rel->partial_pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
@@ -1175,11 +1342,14 @@ lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
  * enable_* settings, which leave a lion path nothing to compete with.
  * *ownscan says whether that path is one of the AM's own scans of a lion
  * index (lion_path_is_lion_scan()), *rate its rate; *nlcold and *coldpage
- * a nested loop's cold reads (lion_nestloop_cold()), when root is given.
+ * a nested loop's cold reads (lion_nestloop_cold()), and *memoscale the
+ * share of its price a loop over a Memoize is priced at under the LIMIT
+ * (lion_memoize_limit_scale()), when root is given.
  */
 static LionCompetitor
 lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
-				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage)
+				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage,
+				   double *memoscale)
 {
 	Path	   *best = lion_competitor_path(rel);
 	LionCompetitor kind;
@@ -1189,6 +1359,7 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 	*rate = 1.0;
 	*nlcold = 0.0;
 	*coldpage = 0.0;
+	*memoscale = 1.0;
 	if (best == NULL)
 		return LION_COMPETITOR_NONE;
 	if (lion_path_disabled(best))
@@ -1198,7 +1369,10 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
 		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
 	if (kind == LION_COMPETITOR_NESTLOOP)
+	{
 		lion_nestloop_cold(root, best, nlcold, coldpage);
+		*memoscale = lion_memoize_limit_scale(root, best);
+	}
 	return kind;
 }
 
@@ -1240,6 +1414,7 @@ static bool lion_units_pinned_ownscan;
 static double lion_units_pinned_rate;
 static Cost lion_units_pinned_nlcold;
 static Cost lion_units_pinned_coldpage;
+static double lion_units_pinned_memoscale;
 static Cost lion_units_pinned_bmcold;
 static Cost lion_units_pinned_bmcoldpage;
 
@@ -1262,18 +1437,22 @@ lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 		u->rate = lion_units_pinned_rate;
 		u->nlcold = lion_units_pinned_nlcold;
 		u->coldpage = lion_units_pinned_coldpage;
+		u->memoscale = lion_units_pinned_memoscale;
 		u->bmcold = lion_units_pinned_bmcold;
 		u->bmcoldpage = lion_units_pinned_bmcoldpage;
 	}
 	else
 	{
 		u->kind = lion_competitor_of(root, rel, &cost, &ownscan, &u->rate,
-									 &u->nlcold, &u->coldpage);
+									 &u->nlcold, &u->coldpage,
+									 &u->memoscale);
 		lion_competitor_bitmap_cold(root, lion_competitor_path(rel), u->kind,
 									u->nlcold, &u->bmcold, &u->bmcoldpage);
 	}
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
+	if (u->memoscale <= 0.0 || u->memoscale > 1.0)
+		u->memoscale = 1.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
 	u->nlcost = cost;
 	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at rate %g and margin %g",
@@ -1295,7 +1474,8 @@ lion_units_pin(PlannerInfo *root, RelOptInfo *rel)
 												&lion_units_pinned_ownscan,
 												&lion_units_pinned_rate,
 												&lion_units_pinned_nlcold,
-												&lion_units_pinned_coldpage);
+												&lion_units_pinned_coldpage,
+												&lion_units_pinned_memoscale);
 	lion_competitor_bitmap_cold(root, lion_competitor_path(rel),
 								lion_units_pinned_kind,
 								lion_units_pinned_nlcold,
@@ -1361,18 +1541,26 @@ lion_units_margin_for(RelOptInfo *rel)
 	double		rate;
 	Cost		nlcold;
 	Cost		coldpage;
+	double		memoscale;
 	LionCompetitor kind = lion_competitor_of(NULL, rel, &cost, &ownscan,
-											 &rate, &nlcold, &coldpage);
+											 &rate, &nlcold, &coldpage,
+											 &memoscale);
 
 	return lion_competitor_margin(kind, false);
 }
 
 /*
  * A lion path's own price, in lion's units, converted into the competitor's
- * and offered at the margin.
+ * and offered at the margin; and, against a loop over a Memoize whose LIMIT
+ * meets fewer hits than core priced, put into core's units of that loop
+ * (memoscale, lion_memoize_limit_scale()): the two then compare as they would
+ * with the loop at its price with those hits, and the plan around them stays
+ * in core's units.  Not bounded by pg_lion.cold_max_discount, which bounds
+ * only the cold reads on top (lion_units_cold()): it is the competitor's own
+ * price, corrected.
  */
 Cost
 lion_units_price(const LionUnits *u, Cost own)
 {
-	return own * u->rate / u->margin;
+	return own * u->rate * u->memoscale / u->margin;
 }
