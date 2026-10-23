@@ -303,8 +303,9 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
  * run of leaves reads every one of them again, with its siblings.  The pages
  * read by the writes a VACUUM shares with the inserts - a split of a leaf an
  * entry or a container grew out of (lion_vacuum_regrow()) and any unfinished
- * split it finishes, a spill, a page taken from the free space map - are few,
- * and are read without it, as is the meta page, which every scan reads.
+ * split it finishes, a spill, and every candidate the free space map offers
+ * an allocation (lion_alloc_page()) - are read without it, as many as those
+ * writes need, and so is the meta page, which every scan reads.
  */
 static inline Buffer
 lion_vac_read(LionVacState *vs, BlockNumber blk)
