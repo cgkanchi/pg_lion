@@ -22956,7 +22956,11 @@ lion_plan_units.c), and the same way §39's loop is priced:
   (the competitor's cost + its cold reads), of the competitor's cost, at most 1 and at least
   1 / `pg_lion.cold_max_discount` - a factor of the rate for a count and the FK-side join
   (`lion_units_bitmap_cold()`), of the walk's own startup and total for a covering walk
-  (`lo_cold_price()`). The margin divides the result as it divides any price.
+  (`lo_cold_price()`). A parallel walk's partial cost is one participant's share where the scan's
+  is a whole plan's, so it is priced under the Gather core puts over it - `parallel_setup_cost`
+  and a `parallel_tuple_cost` a row, as `lion_units_scan_cold()` adds to the scan's partial path -
+  and the Gather's share taken out again (`lo_cold_price_partial()`). The margin divides the
+  result as it divides any price.
 
 `pg_lion.cold_stream_page_cost` is 6.25 `seq_page_cost`, an eighth of `cold_page_cost`'s 50: the
 middle of the measured 0.11 to 0.15. The device measured is some three times slower than the
@@ -23016,7 +23020,7 @@ against a sequential scan, an index scan or an index-only scan. Not done:
 Tests: `bitmap_cold.sql`, with a cache of a megabyte as `fkjoin_cold.sql` has: a covering walk
 taken over a bitmap heap scan cold and not where the tables fit, with the charge at 0 or the cap at
 1; the walk's price over its price against the cold scan exactly the cap where it binds (1.5, 2) and
-past 2 uncapped; the margin dividing the cold price and still a threshold on it; a GROUP BY's count
+past 2 uncapped, and a parallel walk's the same under its Gather; the margin dividing the cold price and still a threshold on it; a GROUP BY's count
 the same way, over an all-visible heap and with rows added since the VACUUM, which it rechecks; a
 count whose residual clause reads more heap pages than the scan, not taken; the
 FK-side join against a hash join over the fact's bitmap heap scan; and the answers the same under

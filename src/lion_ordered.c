@@ -2875,6 +2875,34 @@ lo_cold_price(const LionUnits *cold, double reads, Cost *startup, Cost *total)
 }
 
 /*
+ * ... and a partial walk's, whose startup and total are one participant's
+ * share with no Gather over it, where the scan's cost it is weighed against
+ * (lion_units_scan_cold()) is a whole plan's: the serial scan's, or a
+ * partial one's under its Gather.  So the walk is priced under the same
+ * Gather - parallel_setup_cost, and a parallel_tuple_cost a row of the
+ * relation's `rows`, as cost_gather() and lion_units_scan_cold() charge them
+ * - the factor is taken of that, and the Gather's share is taken out again:
+ * both prices in one unit, and the Gather's overhead discounted with the
+ * walk under it.  Never a startup below 0, nor a total below the startup,
+ * which a deep discount of a small partial cost would otherwise give.
+ */
+static void
+lo_cold_price_partial(const LionUnits *cold, double reads, double rows,
+					  Cost *startup, Cost *total)
+{
+	Cost		overhead = parallel_setup_cost +
+		parallel_tuple_cost * clamp_row_est(rows);
+	Cost		gathered = *total + overhead;
+	double		factor = lion_units_bitmap_factor(cold, gathered, reads);
+
+	if (factor >= 1.0)
+		return;
+	*startup = Max((*startup + parallel_setup_cost) * factor -
+				   parallel_setup_cost, 0.0);
+	*total = Max(gathered * factor - overhead, *startup);
+}
+
+/*
  * May a walk of this btree be divided among the participants of a parallel
  * plan (DESIGN.md §40.9)?  The relation may be read in a worker - its
  * restriction clauses, which the node evaluates, and its target are
@@ -3868,7 +3896,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 						&reads))
 			{
 				if (indexonly)
-					lo_cold_price(&cold, reads, &startup, &total);
+					lo_cold_price_partial(&cold, reads, rows, &startup,
+										  &total);
 				lo_add_path(rel, NULL, &lion_ordered_path_methods,
 							ord->path.pathkeys, list_make3(ord, lion, iocols),
 							rows, startup, total, true, workers);
@@ -3943,7 +3972,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 						rows, true, 1.0, 1.0, &workers, &startup, &total,
 						&reads))
 			{
-				lo_cold_price(&cold, reads, &startup, &total);
+				lo_cold_price_partial(&cold, reads, rows, &startup, &total);
 				lo_add_path(rel, NULL, pathkeys != NIL ?
 							&lion_ordered_path_methods : &lion_btree_path_methods,
 							pathkeys, list_make3(ipath, lion, iocols),
