@@ -1750,7 +1750,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 
-	/* a correlated subquery's calls, over which its walk is a probe (§40.11) */
+	/* the calls of a correlated subquery, each walk a probe (§40.11) */
 	calls = lion_outer_param_loops(root,
 								   (Node *) list_make3(ord->indexclauses,
 													   lionqual, residual));

@@ -184,7 +184,10 @@ lion_skew_index_heap(PlannerInfo *root, IndexPath *ip, double tuples,
 	return max_io + csquared * (min_io - max_io);
 }
 
-/* An index's leaf pages for `tuples` entries a scan, as genericcostestimate(). */
+/*
+ * An index's leaf pages for `tuples` entries a scan, as
+ * genericcostestimate() counts them.
+ */
 static Cost
 lion_skew_index_leaves(PlannerInfo *root, IndexOptInfo *index, double tuples,
 					   double loops, double spc_random)
@@ -336,8 +339,9 @@ lion_skew_path_disabled(const Path *p)
  * its price at core's rows over its price at the rows its own scan of a
  * skewed key meets (above), one of `loops` scans.  1 where there is none, or
  * its scan meets no skewed key - a sequential scan, whose price no key's rows
- * change - or keeps core's rows: one of the AM's own scans of a lion index.  Worked out once a planner run for rel, the outer rels and the
- * loops (lion_skew_scale_find()), the first time from core's paths alone
+ * change - or keeps core's rows: one of the AM's own scans of a lion index.
+ * Worked out once a planner run for rel, the outer rels and the loops
+ * (lion_skew_scale_find()), the first time from core's paths alone
  * (lion_skew_rel_note()): add_path() drops the competitor once a lion path
  * beats it.
  */
