@@ -382,6 +382,47 @@ RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_count_residual;
 
+-- ---------- 10. a semi or anti join's probe ----------
+-- A semi or anti join's probe whose index answers every join clause stops
+-- at its key's first match, which more rows do not delay: the loop is left
+-- at core's price, no figure is worked out for its probe, and the lion path
+-- weighed against it keeps its price with the setting on and off.  A join
+-- clause beyond the key - the fact's id against the outer row's, which the
+-- key's B-tree does not answer - is tested on the key's rows until one
+-- passes it, on all of them when none does: the loop's probe is priced at
+-- the rows the key meets, the figure worked out for it.  Lion declines a
+-- join of two clauses, and the loop is the plan either way.  Lion's plain
+-- scans and bitmap scans are off, so that the loop probes the key's B-tree,
+-- and the margin is 10, so that the semi and anti joins of the key alone
+-- are lion's and their price shows.
+INSERT INTO lsw_q VALUES
+	('semi', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
+	('anti', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND NOT EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
+	('semi_beyond', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id > d.id)$q$),
+	('anti_beyond', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND NOT EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id > d.id)$q$);
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.pushdown_margin = 10;
+SELECT name, lsw_plan(q), s.figures, s.rows
+  FROM lsw_q,
+	   LATERAL (SELECT count(*) AS figures, round(max(rows)::numeric, 2) AS rows
+				  FROM lsw_skew_rows(q)) s
+ WHERE name IN ('semi', 'anti', 'semi_beyond', 'anti_beyond')
+ ORDER BY name;
+SELECT lsw_cost(q, 'LionSemiJoin') AS semi_on FROM lsw_q WHERE name = 'semi' \gset
+SELECT lsw_cost(q, 'LionAntiJoin') AS anti_on FROM lsw_q WHERE name = 'anti' \gset
+SET pg_lion.enable_skew_estimate = off;
+SELECT (SELECT lsw_cost(q, 'LionSemiJoin') FROM lsw_q WHERE name = 'semi') = :semi_on
+	   AS semi_unchanged,
+	   (SELECT lsw_cost(q, 'LionAntiJoin') FROM lsw_q WHERE name = 'anti') = :anti_on
+	   AS anti_unchanged;
+SELECT name, (SELECT count(*) FROM lsw_skew_rows(q)) AS figures
+  FROM lsw_q WHERE name IN ('semi_beyond', 'anti_beyond') ORDER BY name;
+RESET pg_lion.enable_skew_estimate;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET pg_lion.pushdown_margin;
+
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;

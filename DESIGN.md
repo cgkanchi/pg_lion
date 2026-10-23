@@ -21591,7 +21591,11 @@ extension's SQL does not create: `test/sql/skew.sql` binds them from the library
 - the fact's lion index replaced by a copy partial on a predicate every row meets
   (`fk IS NOT NULL`), beside a whole lion index of the key alone that the figure comes from: the
   correlated count reads the copy alone, its plans flip with the setting as the whole index's do,
-  and it is priced as it was over the whole index.
+  and it is priced as it was over the whole index;
+- a semi and an anti join of the dimension's group 1 to the fact over the key's B-tree: on the key
+  alone no figure is worked out for the loop's probe, and the lion path's price does not move with
+  the setting; with a second clause, the fact's id against the dimension's, which lion declines,
+  the loop's probe is priced at the figure, 750.50 rows (§39, "Against a nested loop").
 
 `test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
 subquery, and its fixtures' keys are skewed enough to move its plans.
@@ -23638,8 +23642,17 @@ column to a value the plan does not know: a Param, or another relation's Var
 one index scan or bitmap heap scan parameterized by the outer rows, under a Material or a
 projection at most. The extra is the loops (the outer rows) times one scan's extra. A semi or anti
 join's probe, and one into an inner side core proved unique, stops at its key's first match, and
-more rows do not delay it: those loops are left at core's price. A loop below a subquery scan is
-the subquery's, and its Vars are looked up in the subquery's planner info (`rel->subroot`), not
+more rows do not delay it: those loops are left at core's price - the semi and anti join's only
+when the scan's index answers every join clause (`lion_competitor_key_only()`). Each clause the
+scan's parameterization pushed into it is then one of its index clauses, or of the same
+equivalence class as one (of a bitmap heap scan's, any arm of an AND or every arm of an OR), and
+the join has none left to evaluate itself. With a clause beyond the key the probe reads the key's
+rows until one passes it, all of them when none does, the semi and the anti join alike, and the
+loop takes the extra like any other. That is a bound: it charges every row of a key where the
+clause may pass earlier. In `test/sql/skew.sql`'s section 10 no figure is worked out for the
+probe of a semi or anti join on the key alone, and the lion path weighed against it keeps its
+price; a probe with a clause beyond the key is priced at the figure. A loop below a subquery scan
+is the subquery's, and its Vars are looked up in the subquery's planner info (`rel->subroot`), not
 the outer root's. The paths that price their lookups at the figure take it with
 `lion_units_take_skew()`, which sets the scale:
 
