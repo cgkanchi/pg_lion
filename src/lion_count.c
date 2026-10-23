@@ -952,7 +952,7 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
 
 		d = heap_getattr(tuple, c->attno, desc, &isnull);
 		if (isnull)
-			pass = false;		/* a strict operator, or IS NOT NULL */
+			pass = c->nullpass; /* a strict operator, or IS NOT NULL */
 		else if (c->reserved != 0)
 			pass = (lion_array_empty_flag(d) & c->reserved) == 0;
 		else if (!c->notnull)
@@ -967,7 +967,7 @@ lion_row_filter_test(LionRowFilter *filter, HeapTuple tuple)
 			fcinfo->args[1].value = c->value;
 			fcinfo->args[1].isnull = false;
 			result = FunctionCallInvoke(fcinfo);
-			pass = (!fcinfo->isnull && DatumGetBool(result));
+			pass = (!fcinfo->isnull && DatumGetBool(result) != c->negate);
 		}
 	}
 	if (pass && filter->rowtest != NULL)

@@ -415,9 +415,12 @@ typedef struct LionCountPathBuild
 	int			ncompl;			/* ORs with a complement arm (§35) */
 	bool		runtimemulti;	/* a multi-key clause outside the ORs whose
 								 * query is known only at run time (§17) */
+	bool		prefixmulti;	/* ... or a literal one with prefixes the
+								 * run may find too common to expand: a
+								 * tsquery's `foo:*`, a jsonpath (§17, §43) */
 	bool		newnegated;		/* an `IS DISTINCT FROM` or `NOT (multi-key)`
 								 * clause outside the ORs (§35) */
-	bool		exprnegated;	/* an `IS NOT NULL` or `<>` on an expression
+	bool		exprnegated;	/* a negated clause on an expression
 								 * column outside the ORs (§41) */
 	List	   *residual;		/* clauses no posting set answers, tested on
 								 * the heap (§10, "Residual clauses") */
@@ -1177,15 +1180,26 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	/*
 	 * A multi-key clause whose value is only known at run time may turn
 	 * out to narrow nothing, and be counted as a negated source (§17);
-	 * every other positive clause stays one.
+	 * every other positive clause stays one.  A literal tsquery with a
+	 * prefix lexeme stays one only while the run can expand the prefix
+	 * into the index's lexemes that have it, and narrows nothing past
+	 * that (lion_tsquery_expand_prefixes()); so does a jsonpath, whose
+	 * keys are all prefixes (§43): neither is a source positive whatever
+	 * its value.
 	 */
-	if (leaf.kind == LION_CLAUSE_EQ || leaf.kind == LION_CLAUSE_ARRAY ||
-		leaf.kind == LION_CLAUSE_NULL || leaf.kind == LION_CLAUSE_RESERVED ||
-		(leaf.kind == LION_CLAUSE_MULTI && leaf.val != NULL &&
-		 IsA(leaf.val, Const)))
-		cx->plainpositive = true;
-	else if (leaf.kind == LION_CLAUSE_MULTI)
+	if (leaf.kind == LION_CLAUSE_MULTI &&
+		(leaf.val == NULL || !IsA(leaf.val, Const)))
 		cx->runtimemulti = true;
+	else if (leaf.kind == LION_CLAUSE_MULTI &&
+			 (LION_STRAT_IS_JSONPATH(leaf.strategy) ||
+			  (leaf.strategy == LION_STRAT_MATCH &&
+			   lion_tsquery_has_prefix(((Const *) leaf.val)->constvalue))))
+		cx->prefixmulti = true;
+	else if (leaf.kind == LION_CLAUSE_EQ || leaf.kind == LION_CLAUSE_ARRAY ||
+			 leaf.kind == LION_CLAUSE_NULL ||
+			 leaf.kind == LION_CLAUSE_RESERVED ||
+			 leaf.kind == LION_CLAUSE_MULTI)
+		cx->plainpositive = true;
 
 	if (LION_CLAUSE_IS_POSITIVE(leaf.kind) && leaf.kind != LION_CLAUSE_MULTI)
 	{
@@ -1303,7 +1317,8 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			 * On an expression column (§41) it is no heap column's test, which
 			 * is all the row filter of a WHERE with nothing else to take its
 			 * candidates from makes (lion_filter_with_negated()): not beside a
-			 * query known only at run time, as NOTRESERVED's below.
+			 * query that may narrow nothing (lion_where_scan_untested()), as
+			 * every negated clause below.
 			 */
 			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
 				cx->exprnegated = true;
@@ -1321,10 +1336,14 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			cx->nonnullattnos = lappend_int(cx->nonnullattnos,
 											(int) leaf.var->varattno);
 			cx->newnegated = true;
+			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+				cx->exprnegated = true;
 			break;
 		case LION_CLAUSE_DISTINCT:
 			/* true of NULL: it proves nothing of the column (§35) */
 			cx->newnegated = true;
+			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+				cx->exprnegated = true;
 			break;
 		case LION_CLAUSE_ARRAY:
 		case LION_CLAUSE_MULTI:
@@ -1348,11 +1367,10 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			/*
 			 * Every row outside the reserved entries named (§17).  With the
 			 * NULL entry among them NULLs fail it - `col <> '{}'`,
-			 * `cardinality(col) > 0` - and the row filter of a WHERE with
-			 * nothing else to take its candidates from tests it on a heap
-			 * column (lion_filter_with_negated()); without it NULLs pass,
-			 * and the filter tests nothing of the kind, as it tests none of
-			 * the new negated clauses of §35.
+			 * `cardinality(col) > 0` - and without it they pass, as they
+			 * pass the new negated clauses of §35.  The row filter of a WHERE
+			 * with nothing else to take its candidates from tests either on
+			 * a heap column (lion_filter_with_negated()).
 			 */
 			if ((DatumGetInt32(((Const *) leaf.val)->constvalue) &
 				 LION_ENTRY_NULLKEY) != 0)
@@ -1361,7 +1379,10 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 			else
 				cx->newnegated = true;
 			if (LION_ATTNO_IS_VCOL(leaf.var->varattno))
+			{
 				cx->newnegated = true;
+				cx->exprnegated = true;
+			}
 			break;
 	}
 
@@ -1873,6 +1894,29 @@ lion_count_path_where(LionCountPathBuild *cx)
 }
 
 /*
+ * May a run of the WHERE find nothing to take its candidates from, and
+ * count every row the heap holds (lion_count_scan_filtered()), beside a
+ * clause that scan does not test?  A multi-key query known only at run
+ * time may narrow nothing (DESIGN.md §17), and so may a literal one with
+ * prefixes, past what the run can expand (§17, "Prefix lexemes"; §43).  A
+ * clause beside it positive whatever its value is a source in every run,
+ * and so is the walk that drives each count of a GROUP BY or a
+ * count(DISTINCT) - not the decoded walk's (decode), which reads the WHERE
+ * whole.  The scan tests every negated clause of a heap column
+ * (lion_filter_with_negated()) and makes one count: none on an expression
+ * column (§41), and no OR with a complement arm (§35), which is two counts.
+ */
+static bool
+lion_where_scan_untested(const LionCountPathBuild *cx, bool decode)
+{
+	if (!(cx->runtimemulti || cx->prefixmulti) || cx->plainpositive)
+		return false;
+	if (!decode && (cx->ngroup > 0 || cx->distvar != NULL))
+		return false;
+	return cx->ncompl > 0 || cx->exprnegated;
+}
+
+/*
  * The FK-side join (DESIGN.md §27) takes it from here: false once it has,
  * true when there is none and the count goes on.
  */
@@ -1888,8 +1932,8 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 	/*
 	 * An OR with a complement arm is two counts (DESIGN.md §35), which the
 	 * join's collected fact filters have no place for; nor do its counts
-	 * have a fallback beside a multi-key query known only at run time for
-	 * the new negated clauses (lion_count_path_strategy()).
+	 * have a fallback beside a multi-key query that may narrow nothing for
+	 * a negated clause on an expression column (lion_where_scan_untested()).
 	 *
 	 * Every FK-side join is held to the same terms - the dimension LEFT JOIN
 	 * the fact and a join with dimensions folded into fact filters ("A
@@ -1903,8 +1947,7 @@ lion_count_path_fkjoin(LionCountPathBuild *cx)
 	 * combination declined, with the ordinary plan's answer.
 	 */
 	if (fj != NULL &&
-		(cx->ncompl > 0 ||
-		 ((cx->newnegated || cx->exprnegated) && cx->runtimemulti)))
+		(cx->ncompl > 0 || lion_where_scan_untested(cx, cx->decode)))
 		return false;
 
 	/*
@@ -2671,17 +2714,20 @@ lion_count_path_filters(LionCountPathBuild *cx)
 
 	/*
 	 * A filter's complements (DESIGN.md §35, "Complements in an OR") and
-	 * multi-key queries known only at run time (§17) answer to the terms
+	 * multi-key queries that may narrow nothing (§17) answer to the terms
 	 * lion_count_path_strategy() set the WHERE's, which it checked before
 	 * the filters were analysed: no complement OR in the decoded walk's
-	 * collected copy, none beside a query known only at run time, and no
-	 * residual clause (§10, "Residual clauses") beside one either.
+	 * collected copy, none and no negated clause on an expression column
+	 * beside a query that may narrow nothing where no walk drives the
+	 * counts (lion_where_scan_untested(), the WHERE's clauses positive
+	 * whatever their value being in every run), and no residual clause
+	 * (§10, "Residual clauses") beside one known only at run time either.
 	 */
 	if (cx->ncompl > 0 && cx->decode)
 		return false;
-	if ((cx->ncompl > 0 || cx->newnegated || cx->exprnegated ||
-		 cx->residual != NIL) &&
-		cx->runtimemulti)
+	if (lion_where_scan_untested(cx, cx->decode))
+		return false;
+	if (cx->residual != NIL && cx->runtimemulti)
 		return false;
 	return true;
 }
@@ -2831,17 +2877,15 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 * (lion_node_count(), DESIGN.md §35, "Complements in an OR"), and the
 	 * shapes that read the WHERE some other way - the decoded walk's
 	 * collected copy, the FK-side join's fact filters - have no second
-	 * count to make: not beside them, as yet.  Nor beside a multi-key query
-	 * known only at run time, which may turn out to narrow nothing and
-	 * leave the count with no source to take its rows from but the heap
-	 * (lion_count_scan_filtered()); the new negated clauses of §35 are not
-	 * among the tests that scan makes either, nor a negated clause on an
-	 * expression column (§41).
+	 * count to make: not beside them, as yet.  Nor, where no walk drives
+	 * the count, beside a multi-key query that may turn out to narrow
+	 * nothing and leave the count with no source to take its rows from but
+	 * the heap, which makes one count and tests no negated clause on an
+	 * expression column (§41) either (lion_where_scan_untested()).
 	 */
 	if (cx->ncompl > 0 && cx->decode)
 		return false;
-	if ((cx->ncompl > 0 || cx->newnegated || cx->exprnegated) &&
-		cx->runtimemulti)
+	if (lion_where_scan_untested(cx, cx->decode))
 		return false;
 
 	/* Something has to drive the count. */
@@ -4753,7 +4797,8 @@ lion_count_cells_outputs(LionCountPathBuild *cx)
 /*
  * The WHERE as the decoded walk reads it (lion_count_path_strategy()): one
  * collected copy, every range in it a source, a positive clause to begin
- * from, and no complement OR or residual clause.
+ * from, no complement OR or residual clause, and none of what the heap scan
+ * of a WHERE that narrows nothing does not test (lion_where_scan_untested()).
  */
 static bool
 lion_count_cells_strategy(LionCountPathBuild *cx)
@@ -4762,7 +4807,7 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
 
 	if (cx->ncompl > 0 || cx->residual != NIL || cx->nfilter > 0)
 		return false;
-	if ((cx->newnegated || cx->exprnegated) && cx->runtimemulti)
+	if (lion_where_scan_untested(cx, true))
 		return false;
 	if (cx->rangevars != NIL)
 	{
@@ -5071,8 +5116,10 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
  * the decoded walk of §34 as well?  On the terms of three columns
  * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
  * partitioned one, partial counts core can add up, no count(DISTINCT) or
- * coalesce group, and not on a hot standby.  A range in the WHERE is a source
- * already, as every range beside two grouping columns is.
+ * coalesce group, nothing the heap scan of a WHERE that narrows nothing does
+ * not test (lion_where_scan_untested()), and not on a hot standby.  A range
+ * in the WHERE is a source already, as every range beside two grouping
+ * columns is.
  */
 static bool
 lion_count_path_decodable(LionCountPathBuild *cx)
@@ -5083,6 +5130,7 @@ lion_count_path_decodable(LionCountPathBuild *cx)
 		!cx->partitioned && cx->distvar == NULL && cx->groupcoal == NULL &&
 		cx->groupdeps == NIL && !cx->sumall && !cx->singlegroup &&
 		cx->ncompl == 0 && cx->residual == NIL &&
+		!lion_where_scan_untested(cx, true) &&
 		cx->rangevar == NULL &&
 		(cx->nwhere == 0 || cx->havepositive) &&
 		(cx->nfilter == 0 || cx->filterdecode) &&

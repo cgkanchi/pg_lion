@@ -49,7 +49,8 @@ typedef struct CellDim
 	List	   *leaves;			/* CellLeaf, of its scalar trees */
 	List	   *consts;			/* the values its leaves name, distinct */
 	Oid			eqop;			/* ... compared by this equality */
-	Oid			valtype;
+	Oid			valtype;		/* ... of this type */
+	bool		polyop;			/* eqop is declared on a polymorphic type */
 	Oid			coll;
 	bool		hasvalop;		/* eqop and coll are set */
 	FmgrInfo	eqfn;
@@ -401,6 +402,17 @@ cells_value_no(CellsCx *cx, CellDim *dim, Datum value, Oid type)
  * The equality and collation the dimension's values are compared by: every
  * leaf that names a value has to name it by the same, an equality of one
  * type on both sides.
+ *
+ * The values are of that type, or - for an equality declared on a
+ * polymorphic type, enum_ops' = (anyenum, anyenum) - of the column's own:
+ * the parser hands such an operator the column and its constants as the
+ * enum the column holds, a domain over it relabelled to the enum
+ * (lion_arg_type_passed(), lion_exec_locate.c).  So they are of the column's
+ * BASE type, as a key column's own values are (lion_type_is_column(),
+ * lion_set.c), which lion_match_index() resolves to the class's type
+ * (lion_index_answers()) and the labels' lookups probe as the column's own.
+ * Whether equality is identity is asked of the operator's declared type,
+ * the class's, as of every other key type (lion_type_equalimage()).
  */
 static bool
 cells_dim_valop(CellsCx *cx, CellDim *dim, Oid eqop, Oid coll)
@@ -414,12 +426,25 @@ cells_dim_valop(CellsCx *cx, CellDim *dim, Oid eqop, Oid coll)
 	if (!OidIsValid(lt) || lt != rt)
 		return false;
 	dim->eqop = eqop;
-	dim->valtype = rt;
+	dim->polyop = IsPolymorphicType(rt);
+	dim->valtype = dim->polyop ? getBaseType(dim->var->vartype) : rt;
 	dim->coll = coll;
 	dim->equalimage = lion_type_equalimage(rt, coll);
 	fmgr_info(get_opcode(eqop), &dim->eqfn);
 	dim->hasvalop = true;
 	return true;
+}
+
+/*
+ * Is a value of type typid one of the dimension's values: of their type, or
+ * - for an equality on a polymorphic type - of the column's, domains looked
+ * through (cells_dim_valop())?
+ */
+static bool
+cells_value_type_ok(const CellDim *dim, Oid typid)
+{
+	return typid == dim->valtype ||
+		(dim->polyop && getBaseType(typid) == dim->valtype);
 }
 
 /*
@@ -477,13 +502,13 @@ cells_note_leaves(CellsCx *cx, CellDim *dim, Node *node)
 
 				if (c->constisnull)
 					leaf->hasnull = true;
-				else if (c->consttype != dim->valtype)
+				else if (!cells_value_type_ok(dim, c->consttype))
 					cx->failed = true;
 				else
 					leaf->vals = bms_add_member(leaf->vals,
 												cells_value_no(cx, dim,
 															   c->constvalue,
-															   c->consttype));
+															   dim->valtype));
 			}
 			break;
 		case CL_IN:
@@ -499,7 +524,7 @@ cells_note_leaves(CellsCx *cx, CellDim *dim, Node *node)
 				int			n;
 				int			i;
 
-				if (ARR_ELEMTYPE(a) != dim->valtype)
+				if (!cells_value_type_ok(dim, ARR_ELEMTYPE(a)))
 				{
 					cx->failed = true;
 					break;
@@ -517,7 +542,7 @@ cells_note_leaves(CellsCx *cx, CellDim *dim, Node *node)
 						leaf->vals = bms_add_member(leaf->vals,
 													cells_value_no(cx, dim,
 																   elems[i],
-																   ARR_ELEMTYPE(a)));
+																   dim->valtype));
 				}
 			}
 			break;
