@@ -383,18 +383,18 @@ RESET enable_bitmapscan;
 RESET pg_lion.enable_count_residual;
 
 -- ---------- 10. a semi or anti join's probe ----------
--- A semi or anti join's probe whose index answers every join clause stops
--- at its key's first match, which more rows do not delay: the loop is left
--- at core's price, no figure is worked out for its probe, and the lion path
--- weighed against it keeps its price with the setting on and off.  A join
--- clause beyond the key - the fact's id against the outer row's, which the
--- key's B-tree does not answer - is tested on the key's rows until one
--- passes it, on all of them when none does: the loop's probe is priced at
--- the rows the key meets, the figure worked out for it.  Lion declines a
--- join of two clauses, and the loop is the plan either way.  Lion's plain
--- scans and bitmap scans are off, so that the loop probes the key's B-tree,
--- and the margin is 10, so that the semi and anti joins of the key alone
--- are lion's and their price shows.
+-- A semi or anti join's probe comes to its key's first match no later at a
+-- heavy key, and one with no match ends at once where the index answers
+-- every join clause: the loop is left at core's price, no figure is worked
+-- out for its probe, and the lion path weighed against it keeps its price
+-- with the setting on and off.  With a join clause beyond the key - the
+-- fact's id against the outer row's, which the key's B-tree does not answer
+-- - a probe with no match reads every row of its key, a full scan in core's
+-- model: the loop's probe is priced at the rows the key meets, the figure
+-- worked out for it.  Lion declines a join of two clauses, and the loop is
+-- the plan either way.  Lion's plain scans and bitmap scans are off, so
+-- that the loop probes the key's B-tree, and the margin is 10, so that the
+-- semi and anti joins of the key alone are lion's and their price shows.
 INSERT INTO lsw_q VALUES
 	('semi', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
 	('anti', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND NOT EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),

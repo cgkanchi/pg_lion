@@ -35,6 +35,8 @@
  */
 #include "postgres.h"
 
+#include "optimizer/restrictinfo.h"
+
 #include "lion_customscan.h"
 
 static const char *const lion_competitor_names[] = {
@@ -685,17 +687,57 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
 }
 
 /*
- * Do an index scan's index clauses answer rinfo: is it one of them, or of the
- * same equivalence class as one (is_redundant_with_indexclauses(), the test
- * create_indexscan_plan() leaves a clause out of the scan's filter by), or
- * one spelling the same clause?  A lossy index clause answers nothing: the
- * rows it finds are rechecked.
+ * Does a semi or anti join's probe of a key with no match end at once: does
+ * the index of the loop's inner side answer every join clause?  This is
+ * core's has_indexed_join_quals() (costsize.c) restated, since that function
+ * is static: final_cost_nestloop() charges an unmatched outer row a full
+ * inner scan wherever it says no.  The join itself has no clause left to
+ * evaluate (joinrestrictinfo); the inner side is a parameterized index or
+ * index-only scan, or a bitmap heap scan over one index scan (not an AND or
+ * an OR of them), with nothing above it; and each clause its
+ * parameterization takes from the join's outer side
+ * (join_clause_is_movable_into() the inner rel within the join) is one of
+ * its index clauses or of the same equivalence class as one
+ * (is_redundant_with_indexclauses()), with at least one such clause.  The
+ * inner side's restriction clauses are not looked at, as core does not look
+ * at them.
  */
 static bool
-lion_index_answers(List *indexclauses, RestrictInfo *rinfo)
+lion_competitor_key_only(JoinPath *jp)
 {
+	Path	   *inner = jp->innerjoinpath;
+	List	   *indexclauses;
+	bool		found = false;
 	ListCell   *lc;
 
+	if (jp->joinrestrictinfo != NIL)
+		return false;
+	if (inner == NULL || inner->param_info == NULL || inner->parent == NULL ||
+		jp->path.parent == NULL)
+		return false;
+	switch (inner->pathtype)
+	{
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+			if (!IsA(inner, IndexPath))
+				return false;
+			indexclauses = ((IndexPath *) inner)->indexclauses;
+			break;
+		case T_BitmapHeapScan:
+			{
+				Path	   *bitmapqual;
+
+				if (!IsA(inner, BitmapHeapPath))
+					return false;
+				bitmapqual = ((BitmapHeapPath *) inner)->bitmapqual;
+				if (bitmapqual == NULL || !IsA(bitmapqual, IndexPath))
+					return false;
+				indexclauses = ((IndexPath *) bitmapqual)->indexclauses;
+				break;
+			}
+		default:
+			return false;
+	}
 	foreach(lc, indexclauses)
 	{
 		IndexClause *iclause = (IndexClause *) lfirst(lc);
@@ -703,103 +745,21 @@ lion_index_answers(List *indexclauses, RestrictInfo *rinfo)
 		if (iclause == NULL || !IsA(iclause, IndexClause) ||
 			iclause->rinfo == NULL)
 			return false;
-		if (!iclause->lossy &&
-			(iclause->rinfo == rinfo ||
-			 equal(iclause->rinfo->clause, rinfo->clause)))
-			return true;
 	}
-	return is_redundant_with_indexclauses(rinfo, indexclauses);
-}
-
-/*
- * ... and the index scans of a bitmap heap scan's tree: an AND answers what
- * any of its arms answers, an OR what every one of its arms does.
- */
-static bool
-lion_bitmap_answers(Path *bitmapqual, RestrictInfo *rinfo)
-{
-	ListCell   *lc;
-
-	if (bitmapqual == NULL)
-		return false;
-	if (IsA(bitmapqual, IndexPath))
-		return lion_index_answers(((IndexPath *) bitmapqual)->indexclauses,
-								  rinfo);
-	if (IsA(bitmapqual, BitmapAndPath))
-	{
-		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
-		{
-			if (lion_bitmap_answers((Path *) lfirst(lc), rinfo))
-				return true;
-		}
-		return false;
-	}
-	if (IsA(bitmapqual, BitmapOrPath))
-	{
-		List	   *arms = ((BitmapOrPath *) bitmapqual)->bitmapquals;
-
-		if (arms == NIL)
-			return false;
-		foreach(lc, arms)
-		{
-			if (!lion_bitmap_answers((Path *) lfirst(lc), rinfo))
-				return false;
-		}
-		return true;
-	}
-	return false;
-}
-
-/*
- * Does a semi or anti join's probe stop at its key's first match: does the
- * index of scan, the loop's inner side, answer every join clause of the loop
- * - each clause the scan's parameterization pushed into it (ppi_clauses),
- * with none left for the join itself to evaluate (joinrestrictinfo, from
- * which create_nestloop_path() has taken the clauses the parameterization
- * enforces)?  Then each row the scan returns is a match.  A pseudoconstant
- * clause is gated above the join and tests no row.  A shape this does not
- * know is not a key-only probe.
- */
-static bool
-lion_competitor_key_only(JoinPath *jp, Path *scan)
-{
-	List	   *indexclauses = NIL;
-	Path	   *bitmapqual = NULL;
-	ListCell   *lc;
-
-	foreach(lc, jp->joinrestrictinfo)
+	foreach(lc, inner->param_info->ppi_clauses)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-		if (rinfo == NULL || !IsA(rinfo, RestrictInfo) ||
-			!rinfo->pseudoconstant)
-			return false;
-	}
-	if (scan->param_info == NULL)
-		return false;
-	if (IsA(scan, IndexPath))
-		indexclauses = ((IndexPath *) scan)->indexclauses;
-	else if (IsA(scan, BitmapHeapPath))
-		bitmapqual = ((BitmapHeapPath *) scan)->bitmapqual;
-	else
-		return false;
-	foreach(lc, scan->param_info->ppi_clauses)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-		bool		answered;
 
 		if (rinfo == NULL || !IsA(rinfo, RestrictInfo))
 			return false;
-		if (rinfo->pseudoconstant)
+		if (!join_clause_is_movable_into(rinfo, inner->parent->relids,
+										 jp->path.parent->relids))
 			continue;
-		if (IsA(scan, IndexPath))
-			answered = lion_index_answers(indexclauses, rinfo);
-		else
-			answered = lion_bitmap_answers(bitmapqual, rinfo);
-		if (!answered)
+		if (!is_redundant_with_indexclauses(rinfo, indexclauses))
 			return false;
+		found = true;
 	}
-	return true;
+	return found;
 }
 
 /*
@@ -807,14 +767,20 @@ lion_competitor_key_only(JoinPath *jp, Path *scan)
  * loop's probes of a skewed key column meet (lion_skew_scan_factor()), in
  * *extra what the loop costs more at them - its inner side an index or a
  * bitmap heap scan parameterized by the outer rows, under a Material or a
- * projection - and in *outer what its outer side costs.  A probe into an
- * inner side core proved unique, and a semi or anti join's probe whose index
- * answers every join clause (lion_competitor_key_only()), stops at its key's
- * first match, which more rows do not delay: 1 for those, as for any other
- * inner side or plan.  A semi or anti join's probe with a join clause beyond
- * the key reads the key's rows until one passes it, all of them when none
- * does, and the loop takes the extra as any other: a bound, which charges
- * every row of a key where the clause may pass earlier.  A loop below a
+ * projection - and in *outer what its outer side costs.  The extra is what
+ * core's own model of the loop (final_cost_nestloop()) charges more at the
+ * skewed rows.  An inner join's every probe reads its key's rows: the loops
+ * times one scan's extra.  A probe into an inner side core proved unique
+ * stops at its key's first match: 1.  A semi or anti join's matched outer
+ * row reads 2 / (match_count + 1) of a scan, and the match count grows with
+ * the key's rows, so the first match comes no later at a heavy key.  Its
+ * unmatched outer row costs a fraction of a scan where the index answers
+ * every join clause (lion_competitor_key_only()), which more rows do not
+ * change: 1 for those loops, as for any other inner side or plan.  Otherwise
+ * core charges an unmatched row a full scan, which grows with the key's
+ * rows: the extra is those rows times one scan's extra - the outer rows less
+ * the join's for a semi join, which emits the matched ones, and the join's
+ * rows for an anti join, which emits the unmatched ones.  A loop below a
  * subquery scan is the subquery's, and its Vars are looked up in the
  * subquery's planner info.
  */
@@ -824,6 +790,7 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer)
 	JoinPath   *jp = NULL;
 	Path	   *scan;
 	double		loops;
+	double		probes;
 	double		skew;
 
 	*extra = 0.0;
@@ -854,12 +821,20 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer)
 		(!IsA(scan, IndexPath) && !IsA(scan, BitmapHeapPath)))
 		return 1.0;
 	if ((jp->jointype == JOIN_SEMI || jp->jointype == JOIN_ANTI) &&
-		lion_competitor_key_only(jp, scan))
+		lion_competitor_key_only(jp))
 		return 1.0;
 	loops = Max(jp->outerjoinpath->rows, 1.0);
+
+	/* the probes core charges a full scan: the unmatched outer rows */
+	if (jp->jointype == JOIN_SEMI)
+		probes = Max(loops - jp->path.rows, 0.0);
+	else if (jp->jointype == JOIN_ANTI)
+		probes = Min(Max(jp->path.rows, 0.0), loops);
+	else
+		probes = loops;
 	skew = lion_skew_scan_factor(root, scan);
-	if (skew > 1.0)
-		*extra = loops * lion_skew_scan_extra(root, scan, skew, loops);
+	if (skew > 1.0 && probes > 0.0)
+		*extra = probes * lion_skew_scan_extra(root, scan, skew, loops);
 	*outer = jp->outerjoinpath->total_cost;
 	return skew;
 }

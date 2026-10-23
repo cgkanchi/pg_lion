@@ -23640,21 +23640,30 @@ column to a value the plan does not know: a Param, or another relation's Var
 
 **Against a nested loop** (`lion_competitor_skew()`, lion_plan_units.c). The inner side must be
 one index scan or bitmap heap scan parameterized by the outer rows, under a Material or a
-projection at most. The extra is the loops (the outer rows) times one scan's extra. A semi or anti
-join's probe, and one into an inner side core proved unique, stops at its key's first match, and
-more rows do not delay it: those loops are left at core's price - the semi and anti join's only
-when the scan's index answers every join clause (`lion_competitor_key_only()`). Each clause the
-scan's parameterization pushed into it is then one of its index clauses, or of the same
-equivalence class as one (of a bitmap heap scan's, any arm of an AND or every arm of an OR), and
-the join has none left to evaluate itself. With a clause beyond the key the probe reads the key's
-rows until one passes it, all of them when none does, the semi and the anti join alike, and the
-loop takes the extra like any other. That is a bound: it charges every row of a key where the
-clause may pass earlier. In `test/sql/skew.sql`'s section 10 no figure is worked out for the
-probe of a semi or anti join on the key alone, and the lion path weighed against it keeps its
-price; a probe with a clause beyond the key is priced at the figure. A loop below a subquery scan
-is the subquery's, and its Vars are looked up in the subquery's planner info (`rel->subroot`), not
-the outer root's. The paths that price their lookups at the figure take it with
-`lion_units_take_skew()`, which sets the scale:
+projection at most. The extra is what core's own model of the loop (`final_cost_nestloop()`)
+charges more at the skewed rows. An inner join's every probe reads its key's rows: the extra is
+the loops (the outer rows) times one scan's extra. A probe into an inner side core proved unique
+stops at its key's first match, and that loop is left at core's price. Core prices a semi or anti
+join's loop by its outer rows with a match and without one. A matched row's probe reads
+`2 / (match_count + 1)` of a scan, and the match count grows with the key's rows, so the first
+match comes no later at a heavy key. An unmatched row's probe costs a fraction of a scan where the
+scan's index answers every join clause (`lion_competitor_key_only()`, core's static
+`has_indexed_join_quals()` restated): the join has no clause left to evaluate itself, the inner
+side is a parameterized index or index-only scan or a bitmap heap scan over one index scan, and
+each clause its parameterization takes from the join's outer side is one of its index clauses or
+of the same equivalence class as one, with at least one such clause. That loop is left at core's
+price too. Otherwise core charges an unmatched row a full scan, which grows with the key's rows,
+and the extra is the unmatched rows times one scan's extra: the outer rows less the join's rows
+for a semi join, which emits the matched ones, and the join's rows for an anti join, which emits
+the unmatched ones. The inner side's restriction clauses are left out of the test, as core leaves
+them out: its match count already scales with the key's rows, so the first match past such a
+clause comes no later at a heavy key, and an outer row with no match, which reads every row of its
+key, is under-charged by core at any key - core's model, not the skew's. In
+`test/sql/skew.sql`'s section 10 no figure is worked out for the probe of a semi or anti join on
+the key alone, and the lion path weighed against it keeps its price; a probe with a clause beyond
+the key is priced at the figure. A loop below a subquery scan is the subquery's, and its Vars are
+looked up in the subquery's planner info (`rel->subroot`), not the outer root's. The paths that
+price their lookups at the figure take it with `lion_units_take_skew()`, which sets the scale:
 
     skewscale = (nlcost - nlouter) / (nlcost - nlouter + nlextra)
 
