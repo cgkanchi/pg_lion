@@ -28913,6 +28913,9 @@ the node's rows to them above is the plan.
   member - and the price does not see it; §46 applies `lion_units_cold()`, this does not yet.
 - **The switch's price.** The fetch-and-sort switch acts at run time on what the walk meets; the
   path is priced as a walk to the end.
+- **The fact's set's build price** is `lo_cost()`'s, its lion access's bitmap index scan price, per
+  TID; the dimension's takes the excess over the containers' reads off (§40.10). §47.9 measures
+  what that costs the plan choice.
 - **The dimension index-only.** The probe always reads the member's heap row. Where a B-tree on the
   key holds every column the query reads of the dimension, §40.10's nested loop probe
   (`LionBtreeScan`) answers it from the index; a covering form of the join's probe is not built.
@@ -28952,3 +28955,54 @@ side, the setting off (core's nested loop over a Memoize).
 
 btreescan_param.sql's cursor section turns the node off: under that section's
 `pushdown_margin = 1000` the node took the join from the `LionBtreeScan` probe the section tests.
+
+### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB, every table and index in it: warm; EXPLAIN (ANALYZE, TIMING OFF), the median of seven runs after one)
+
+A 5,000,000-row fact table (554 MB; its key uniform over the dimension, every 101st NULL; `score`
+uncorrelated with the heap) with a B-tree `(score DESC) INCLUDE (fk, id)` (193 MB) and lion
+indexes on an eight-value int `chan` and a text array `tags`, one of four a's and one of nine b's;
+a 200,000-row dimension of 576-byte payloads (120 MB, a 4.4 MB primary key) with lion indexes on a
+ten-value `kind`, a hundred-value `lvl`, a bool `flag` and a five-value `region`; a 20,000-row key
+table. The query is `SELECT f.id, f.score, f.amount, d.pk, d.region FROM bfact f JOIN bdim d ON
+f.fk = d.pk WHERE ... ORDER BY f.score DESC LIMIT 20`, `amount` in no index, so that the fact's
+walk is in heap mode; without it the walk is index-only. "Walked" is the node's `Index Entries
+Walked`. The plan with the node on and off was the same, core's, in every row; the node's time is
+with `pg_lion.pushdown_margin = 1000`.
+
+| page | WHERE | walked | core's plan | its time | the node |
+|---|---|---|---|---|---|
+| dense | `f.chan = 3 AND d.region = 'north'` | 720 | nested loop, Memoize | 0.88 ms | 1.67 ms |
+| dense | `f.tags @> '{a1}' AND d.region = 'north'` | 491 | nested loop | 1.03 ms | 1.82 ms |
+| dense | `f.chan = 3 AND d.lvl < 50` | 248 | nested loop | 0.59 ms | 7.61 ms |
+| dense, a key set | the first, `AND f.fk IN (SELECT k FROM bwatch WHERE active)` | 2,829 | nested loops | 2.42 ms | 3.43 ms |
+| medium | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 34.0 ms | 11.6 ms |
+| medium | `f.tags @> '{a1}' AND d.lvl = 3 AND d.flag` | 9,595 | nested loop | 11.6 ms | 6.9 ms |
+| medium, index-only | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 31.7 ms | 9.0 ms |
+| the dimension's only, index-only | `d.lvl = 3 AND d.flag` | 3,902 | nested loop, Index Only Scan | 6.9 ms | 5.1 ms |
+| dense, OFFSET 2000 | `f.chan = 3 AND d.region = 'north'` | 81,388 | nested loop | 101 ms | 49 ms |
+| sparse | `f.tags @> '{a1}' AND f.tags @> '{b2}' AND d.lvl = 3 AND d.kind = 3` | 730,643 | hash join, Sort | 67.8 ms | 173 ms |
+
+Where the page is neither dense nor sparse the node runs 1.4 to 3.5 times faster than core's nested
+loop, which fetches every fact row the walk meets to test the fact's filter and reads the
+dimension's heap row of every key it keeps: the node fetches a member's row, and the dimension's of
+a member's key, one dimension row in about a hundred descents here. The index-only walk takes the
+fact's heap out (0 heap fetches, 9.0 against 11.6 ms). A deep page gains as much, 2.1 times. Where
+the page is dense core reads a few hundred fact rows and about a hundred dimension rows, and the
+node pays its sets: the scalar ones lazily, each built after 64 keys by §30.4's heap-order rule
+(1,109 and 241 containers, about a millisecond), the multi-key fact set at once; a range on the
+dimension (`lvl < 50`, fifty posting lists) is always built at once, 7 ms; a key set's table is read
+whole first, a Seq Scan of 20,000 rows. Where it is sparse the walk meets 730,000 entries for twenty
+rows, and core's hash join of the two sets and its sort is 2.6 times faster.
+
+The planner kept core's plan in every row: rightly where the page is dense or sparse, wrongly for
+the medium pages and the deep one. The node's price (§47.3) is the limit's share of a walk to the
+end, at warm units; two terms of it are high against core's. The fact's set is priced as `lo_cost()`
+prices a LionOrdered walk's, at its lion access's bitmap index scan price - 3,772 for `chan = 3`'s
+625,000 rows, 8,401 for `tags @> '{a1}'`'s 1.26 million, per-TID CPU - where the run builds it from
+its containers in about a millisecond; the dimension's set takes that excess off
+(`lion_ordered_set_price()`, §40.10). And the members' heap fetches are Mackert and Lohman over the
+walk's members, 625,000 fetches over the table's 70,900 pages charged about 0.45 each, where core's
+Index Scan, priced as fetching all five million rows of its walk, is charged about 0.06 a fetch, and
+the LIMIT takes the same share of each. §47.7 lists the price's other omissions; cold, which §39's
+units would weigh, core's nested loop reads a fact heap page for each entry the walk meets. Not
+measured: cold caches, other majors.
