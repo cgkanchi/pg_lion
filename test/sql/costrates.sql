@@ -34,6 +34,27 @@ SELECT name, setting, boot_val, min_val, max_val, context
   FROM pg_settings
  WHERE name ~ '^pg_lion\.([a-z]+_rate|pushdown_margin)$'
  ORDER BY name;
+-- the cold reads' (DESIGN.md §39, "A nested loop's cold reads", "A bitmap
+-- heap scan's cold reads"): the price of a page read synchronously and of
+-- one read ahead, multiples of seq_page_cost from 0 up as every cost
+-- setting is, and the most they take off a lion path's price, a divisor
+-- from 1 (nothing) to 10
+SELECT name, setting, boot_val, min_val, max_val::float8 > 1e300 AS unbounded,
+	   context, unit IS NULL AS no_unit
+  FROM pg_settings
+ WHERE name ~ '^pg_lion\.cold_'
+ ORDER BY name;
+SET pg_lion.cold_max_discount = 0.99;
+SET pg_lion.cold_max_discount = 10.5;
+SET pg_lion.cold_stream_page_cost = -1;
+SET pg_lion.cold_page_cost = -1;
+SET pg_lion.cold_max_discount = 1;
+SET pg_lion.cold_max_discount = 10;
+SET pg_lion.cold_stream_page_cost = 0;
+SHOW pg_lion.cold_max_discount;
+SHOW pg_lion.cold_stream_page_cost;
+RESET pg_lion.cold_max_discount;
+RESET pg_lion.cold_stream_page_cost;
 
 -- 60000 rows: g20, g200 and c2 at random, k a permutation of the ids under a
 -- btree for the ordered scan

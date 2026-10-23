@@ -1055,6 +1055,20 @@ typedef struct LionVColScope
 #define LION_COLD_PAGE_COST		(lion_cold_page_cost * seq_page_cost)
 
 /*
+ * A page that a bitmap heap scan reads from the device, not the cache, as a
+ * lion path's competitor, and a page the lion path reads in its place
+ * (lion_bitmap_cold(), DESIGN.md §39, "A bitmap heap scan's cold reads"):
+ * asked for ahead of the scan, effective_io_concurrency at a time, so that
+ * the reads overlap one another and the scan's own work.  Measured on a
+ * private workload, the same device under both: a parallel bitmap heap scan
+ * read 1.9M uncached heap pages at 33 us a page, and 605k at 40 us, where a
+ * nested loop's synchronous probe paid 270 to 300 us a page - 0.11 to 0.15
+ * of it, an eighth in the middle.  An eighth of LION_COLD_PAGE_COST's 50 is
+ * 6.25 seq_page_cost, 12.5 us at 500 units a millisecond.
+ */
+#define LION_COLD_STREAM_PAGE_COST	(lion_cold_stream_page_cost * seq_page_cost)
+
+/*
  * One candidate TID of a heap recheck (DESIGN.md §9): the visibility check of
  * its tuple, on a page the recheck has pinned (the page itself is charged as
  * I/O).  Fitted on the release build to counts of 99 to 1M candidates on a
@@ -3707,6 +3721,9 @@ typedef struct LionRangeCost
 	Cost		countrange;
 	Cost		whole;
 	double		pages;
+	double		reads;			/* every page the count reads: its directory
+								 * leaves, posting pages and heap recheck, for
+								 * a cold cache (DESIGN.md §39) */
 } LionRangeCost;
 
 /*
@@ -3926,6 +3943,9 @@ typedef struct LionUnits
 	Cost		nlcost;			/* the cheapest core path's cost */
 	Cost		nlcold;			/* a nested loop's cold reads, over that */
 	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
+	Cost		bmcold;			/* its bitmap heap scans' cold reads, over
+								 * that, where the loop has none */
+	Cost		bmcoldpage;		/* ... and a cold page's charge, for lion's */
 } LionUnits;
 
 /*
@@ -3950,6 +3970,11 @@ extern void lion_units_unpin(void);
 extern RelOptInfo *lion_units_pin_move(RelOptInfo *rel);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern void lion_units_cold(LionUnits *u, Cost own, double reads);
+extern void lion_units_bitmap_cold(LionUnits *u, Cost own, double reads);
+extern void lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel,
+								 LionUnits *u);
+extern double lion_units_bitmap_factor(const LionUnits *u, Cost own,
+									   double reads);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
 
@@ -4069,6 +4094,8 @@ extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,
 							  IndexOptInfo *idx);
 extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
 							   List *residual, double counts);
+extern double lion_residual_pages(PlannerInfo *root, RelOptInfo *rel,
+								  List *residual, double counts);
 
 /*
  * The largest share of a table the rows that residual clauses are tested on

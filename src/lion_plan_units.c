@@ -694,12 +694,17 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
  * competitor, or a loop with nothing cold.
  *
  * The factor is at most 1 - a path that reads more than the loop keeps its
- * price - and never below 1 / LION_COLD_MAX_DISCOUNT.  The charge is what a
- * cold cache costs, and a warm one costs none of it: with the inner table's
- * working set cached, the nested loop runs at core's price and the lion path
- * can be the slower, by up to that factor where its own price is the dearer.
+ * price - and never below 1 / pg_lion.cold_max_discount (lion_cold_cap()).
+ * The charge is what a cold cache costs, and a warm one costs none of it:
+ * with the inner table's working set cached, the nested loop runs at core's
+ * price and the lion path can be the slower, by up to that factor where its
+ * own price is the dearer.
+ *
+ * A competitor with no loop's cold reads but a bitmap heap scan's
+ * (lion_bitmap_cold()) is priced against those instead
+ * (lion_units_bitmap_cold()).
  */
-#define LION_COLD_MAX_DISCOUNT	1.5
+static double lion_cold_cap(void);
 
 void
 lion_units_cold(LionUnits *u, Cost own, double reads)
@@ -708,16 +713,364 @@ lion_units_cold(LionUnits *u, Cost own, double reads)
 	Cost		lioncold;
 	double		factor;
 
+	if (u->bmcold > 0.0)
+	{
+		lion_units_bitmap_cold(u, own, reads);
+		return;
+	}
 	if (u->kind != LION_COMPETITOR_NESTLOOP || u->nlcold <= 0.0 ||
 		u->nlcost <= 0.0 || price <= 0.0)
 		return;
 	lioncold = Max(reads, 0.0) * u->coldpage;
 	factor = (price + lioncold) * u->nlcost /
 		((u->nlcost + u->nlcold) * price);
-	factor = Min(Max(factor, 1.0 / LION_COLD_MAX_DISCOUNT), 1.0);
+	factor = Min(Max(factor, 1.0 / lion_cold_cap()), 1.0);
 	elog(DEBUG2, "lion: a nested loop's cold reads, %.2f over its %.2f against %.2f over %.2f, at factor %g",
 		 u->nlcold, u->nlcost, lioncold, price, factor);
 	u->rate *= factor;
+}
+
+/*
+ * The most a competitor's cold reads divide a lion path's price by,
+ * pg_lion.cold_max_discount (DESIGN.md §39): the warm floor.
+ */
+static double
+lion_cold_cap(void)
+{
+	return Max(lion_cold_max_discount, 1.0);
+}
+
+/*
+ * What lion_bitmap_reads() sums over the bitmap heap scans of a core path
+ */
+typedef struct LionBitmapReads
+{
+	double		pages;			/* the pages they read, heap and index */
+	Cost		over;			/* ... each at the cold price less core's */
+	double		idxpages;		/* the pages of the indexes they read */
+	double		heappages;		/* the most heap pages one of them reads */
+	double		random;			/* ... and its tablespace's random_page_cost */
+} LionBitmapReads;
+
+/*
+ * The index pages of a bitmap's tree of quals, into r: each leaf's index
+ * whole in r->idxpages, as core's get_indexpath_pages() counts them for the
+ * residency, and the pages a scan of it reads - its selectivity's share of
+ * the index, a page at least, as genericcostestimate() counts a B-tree's and
+ * as a lion index's sets hold their rows - over the loops, as
+ * index_pages_fetched() counts a page that a later loop finds cached; each
+ * charged the cold price over the random_page_cost core's estimate charges
+ * an index page.
+ */
+static void
+lion_bitmap_index_reads(PlannerInfo *root, Path *bitmapqual, double loops,
+						LionBitmapReads *r)
+{
+	List	   *quals = NIL;
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (IsA(bitmapqual, IndexPath))
+	{
+		IndexPath  *ip = (IndexPath *) bitmapqual;
+		double		ipages = Max((double) ip->indexinfo->pages, 1.0);
+		double		read = Min(Max(ceil(ip->indexselectivity * ipages), 1.0),
+							   ipages);
+		double		spc_random;
+		double		spc_seq;
+
+		if (loops > 1.0)
+			read = index_pages_fetched(read * loops, (BlockNumber) ipages,
+									   ipages, root);
+		get_tablespace_page_costs(ip->indexinfo->reltablespace,
+								  &spc_random, &spc_seq);
+		r->idxpages += ipages;
+		r->pages += read;
+		r->over += read * Max(LION_COLD_STREAM_PAGE_COST - spc_random, 0.0);
+		return;
+	}
+	if (IsA(bitmapqual, BitmapAndPath))
+		quals = ((BitmapAndPath *) bitmapqual)->bitmapquals;
+	else if (IsA(bitmapqual, BitmapOrPath))
+		quals = ((BitmapOrPath *) bitmapqual)->bitmapquals;
+	foreach(lc, quals)
+		lion_bitmap_index_reads(root, (Path *) lfirst(lc), loops, r);
+}
+
+/*
+ * The pages a core path's bitmap heap scans read, into r: each scan's heap
+ * pages as compute_bitmap_pages() counts them, over `loops` scans - the outer
+ * rows of the nested loops it is the inner side of, each of which scans it
+ * again, and none past a Material or a Memoize, which keep its rows - each
+ * charged the cold price over the price cost_bitmap_heap_scan() charged it:
+ * random_page_cost falling to seq_page_cost with the square root of the share
+ * of the heap one scan reads; and the index pages its bitmap reads
+ * (lion_bitmap_index_reads()).  Down through every node that passes rows up
+ * and both sides of every join; a custom path, lion's or another's, reads
+ * nothing of core's.
+ */
+static void
+lion_bitmap_reads(PlannerInfo *root, Path *path, double loops,
+				  LionBitmapReads *r)
+{
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (path == NULL)
+		return;
+	switch (nodeTag(path))
+	{
+		case T_BitmapHeapPath:
+			{
+				BitmapHeapPath *bp = (BitmapHeapPath *) path;
+				RelOptInfo *baserel = bp->path.parent;
+				Cost		indexcost;
+				double		tuples;
+				double		pages;
+				double		T;
+				double		perpage;
+				double		spc_random;
+				double		spc_seq;
+
+				if (baserel == NULL || !IS_SIMPLE_REL(baserel) ||
+					baserel->rtekind != RTE_RELATION)
+					return;
+				pages = lion_compute_bitmap_pages(root, baserel,
+												  bp->bitmapqual, loops,
+												  &indexcost, &tuples);
+				T = (baserel->pages > 1) ? (double) baserel->pages : 1.0;
+				get_tablespace_page_costs(baserel->reltablespace,
+										  &spc_random, &spc_seq);
+				perpage = (pages >= 2.0) ?
+					spc_random - (spc_random - spc_seq) * sqrt(pages / T) :
+					spc_random;
+				pages *= loops; /* compute_bitmap_pages() gives one loop's */
+				r->pages += pages;
+				r->over += pages * Max(LION_COLD_STREAM_PAGE_COST - perpage,
+									   0.0);
+				if (pages > r->heappages)
+				{
+					r->heappages = pages;
+					r->random = spc_random;
+				}
+				lion_bitmap_index_reads(root, bp->bitmapqual, loops, r);
+				return;
+			}
+		case T_NestPath:
+			{
+				JoinPath   *jp = (JoinPath *) path;
+
+				lion_bitmap_reads(root, jp->outerjoinpath, loops, r);
+				lion_bitmap_reads(root, jp->innerjoinpath,
+								  loops * Max(jp->outerjoinpath->rows, 1.0),
+								  r);
+				return;
+			}
+		case T_MergePath:
+		case T_HashPath:
+			lion_bitmap_reads(root, ((JoinPath *) path)->outerjoinpath,
+							  loops, r);
+			lion_bitmap_reads(root, ((JoinPath *) path)->innerjoinpath,
+							  loops, r);
+			return;
+		case T_AppendPath:
+			foreach(lc, ((AppendPath *) path)->subpaths)
+				lion_bitmap_reads(root, (Path *) lfirst(lc), loops, r);
+			return;
+		case T_MergeAppendPath:
+			foreach(lc, ((MergeAppendPath *) path)->subpaths)
+				lion_bitmap_reads(root, (Path *) lfirst(lc), loops, r);
+			return;
+		case T_MaterialPath:
+		case T_MemoizePath:
+			lion_bitmap_reads(root, lion_path_input(path), 1.0, r);
+			return;
+		case T_CustomPath:
+			return;
+		default:
+			lion_bitmap_reads(root, lion_path_input(path), loops, r);
+			return;
+	}
+}
+
+/*
+ * A BITMAP HEAP SCAN'S COLD READS (DESIGN.md §39, "A bitmap heap scan's cold
+ * reads"): what the bitmap heap scans of a core path - one, under an
+ * aggregate or a Gather, or the scan of a join's fact side - would pay for
+ * the pages they find outside the cache, over what core charged them, into
+ * *cold; and what each page a lion path reads outside the cache is charged
+ * the same way, into *perpage.  Both 0 when nothing is cold.
+ *
+ * Core prices a bitmap heap scan's pages at random_page_cost falling to
+ * seq_page_cost by the share of the table it reads, as if each were cached
+ * or a device's cheap random read; and a page outside the cache costs it a
+ * read from the device, issued ahead of the scan (effective_io_concurrency),
+ * so that the reads overlap - an eighth of a nested loop's synchronous one,
+ * LION_COLD_STREAM_PAGE_COST, but several times what core charged.  The
+ * share taken as uncached is the one lion_nestloop_cold() takes: what
+ * effective_cache_size cannot hold of the query's tables and the indexes
+ * the bitmaps read.  A lion path's own reads are charged the same price:
+ * its posting chains, the B-tree's leaves a covering walk reads in order and
+ * the heap pages a recheck reads through a read stream are each read in an
+ * order the device or the kernel reads ahead of, as the bitmap heap scan's
+ * are.
+ */
+static void
+lion_bitmap_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
+{
+	LionBitmapReads r;
+	double		resident;
+
+	*cold = 0.0;
+	*perpage = 0.0;
+	if (root == NULL || path == NULL)
+		return;
+	memset(&r, 0, sizeof(r));
+	lion_bitmap_reads(root, path, 1.0, &r);
+	if (r.heappages <= 0.0 || r.over <= 0.0)
+		return;
+	resident = Min((double) effective_cache_size /
+				   Max(root->total_table_pages + r.idxpages, 1.0), 1.0);
+	if (resident >= 1.0)
+		return;
+	*cold = (1.0 - resident) * r.over;
+	*perpage = (1.0 - resident) *
+		Max(LION_COLD_STREAM_PAGE_COST - r.random, 0.0);
+	elog(DEBUG2, "lion: a bitmap heap scan's %.0f pages, %.0f%% resident, read cold for %.2f",
+		 r.pages, resident * 100.0, *cold);
+}
+
+/*
+ * The factor a lion path's price, `price` in its competitor's units, takes
+ * against a competitor of cost `cost` with `cold` of uncached reads, its own
+ * being `lioncold`: both plans with their uncached reads added, the path at
+ * (price + lioncold) / (cost + cold) of the competitor's cost, at most 1 and
+ * never below 1 / pg_lion.cold_max_discount - lion_units_cold()'s, for a
+ * loop.
+ */
+static double
+lion_cold_factor(Cost price, Cost lioncold, Cost cost, Cost cold)
+{
+	double		factor;
+
+	if (cold <= 0.0 || cost <= 0.0 || price <= 0.0)
+		return 1.0;
+	factor = (price + Max(lioncold, 0.0)) * cost / ((cost + cold) * price);
+	return Min(Max(factor, 1.0 / lion_cold_cap()), 1.0);
+}
+
+/*
+ * A lion path whose own price is `own`, in lion's units, and which reads
+ * `reads` pages, priced against a competitor with a bitmap heap scan's cold
+ * reads (lion_bitmap_cold()), as lion_units_cold() prices one against a
+ * nested loop's: its rate times lion_cold_factor().  For the counts and the
+ * FK-side join; nothing where the competitor has no such reads.
+ */
+void
+lion_units_bitmap_cold(LionUnits *u, Cost own, double reads)
+{
+	double		factor = lion_units_bitmap_factor(u, own * u->rate, reads);
+
+	u->rate *= factor;
+}
+
+/*
+ * ... the factor itself, for a path whose price in its competitor's units is
+ * `own`: the covering walks of a base rel (lion_units_scan_cold()), which
+ * have no rate, multiply their own price by it.
+ */
+double
+lion_units_bitmap_factor(const LionUnits *u, Cost own, double reads)
+{
+	Cost		lioncold;
+	double		factor;
+
+	if (u->bmcold <= 0.0 || u->nlcost <= 0.0 || own <= 0.0 || reads < 0.0)
+		return 1.0;
+	lioncold = reads * u->bmcoldpage;
+	factor = lion_cold_factor(own, lioncold, u->nlcost, u->bmcold);
+	elog(DEBUG2, "lion: a bitmap heap scan's cold reads, %.2f over its %.2f against %.2f over %.2f, at factor %g",
+		 u->bmcold, u->nlcost, lioncold, own, factor);
+	return factor;
+}
+
+/*
+ * The bitmap heap scans' cold reads of `best`, the competitor of kind `kind`
+ * found for a lion path (lion_competitor_of()), into *bmcold and *bmcoldpage:
+ * where it is a plan of core's, enabled, and a nested loop's cold reads
+ * (nlcold) do not price it already.
+ */
+static void
+lion_competitor_bitmap_cold(PlannerInfo *root, Path *best,
+							LionCompetitor kind, Cost nlcold,
+							Cost *bmcold, Cost *bmcoldpage)
+{
+	*bmcold = 0.0;
+	*bmcoldpage = 0.0;
+	if (best == NULL || kind == LION_COMPETITOR_NONE ||
+		kind == LION_COMPETITOR_DISABLED || nlcold > 0.0)
+		return;
+	lion_bitmap_cold(root, best, bmcold, bmcoldpage);
+}
+
+/*
+ * The competitor of a base rel's covering walks (LionOrdered and
+ * LionBtreeScan index-only, DESIGN.md §40), for their cold reads alone: the
+ * cheapest of rel's scans of core's, serial (lion_competitor_path()) or
+ * parallel - the cheapest partial path, unparameterized and with nothing of
+ * lion's, under the Gather core puts over it: its cost and parallel_setup_cost
+ * with a parallel_tuple_cost a row, as cost_gather() prices it.  Where that is
+ * a bitmap heap scan with cold reads, u holds them and its cost
+ * (lion_units_bitmap_factor() reads nothing else); otherwise u has none.  The
+ * walks are not converted (their competitors' units are the reference), and
+ * their margin is lion_units_margin_for()'s.
+ */
+void
+lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
+{
+	Path	   *best = lion_competitor_path(rel);
+	Path	   *partial = NULL;
+	Cost		cost = (best != NULL) ? best->total_cost : 0.0;
+	ListCell   *lc;
+
+	memset(u, 0, sizeof(LionUnits));
+	u->kind = LION_COMPETITOR_NONE;
+	u->rate = 1.0;
+	u->margin = 1.0;
+	foreach(lc, rel->partial_pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (p->param_info != NULL || lion_path_has_lion(p))
+			continue;
+		if (partial == NULL || lion_path_cheaper(p, partial))
+			partial = p;
+	}
+	if (partial != NULL)
+	{
+		Cost		gathered = partial->total_cost + parallel_setup_cost +
+			parallel_tuple_cost * clamp_row_est(rel->rows);
+
+		if (best == NULL ||
+#if PG_VERSION_NUM >= 180000
+			partial->disabled_nodes < best->disabled_nodes ||
+			(partial->disabled_nodes == best->disabled_nodes &&
+			 gathered < cost))
+#else
+			gathered < cost)
+#endif
+		{
+			best = partial;
+			cost = gathered;
+		}
+	}
+	if (best == NULL || lion_path_disabled(best))
+		return;
+	u->kind = lion_competitor_kind(best);
+	if (u->kind != LION_COMPETITOR_BITMAP)
+		return;
+	u->nlcost = cost;
+	lion_bitmap_cold(root, best, &u->bmcold, &u->bmcoldpage);
 }
 
 /*
@@ -792,6 +1145,8 @@ static bool lion_units_pinned_ownscan;
 static double lion_units_pinned_rate;
 static Cost lion_units_pinned_nlcold;
 static Cost lion_units_pinned_coldpage;
+static Cost lion_units_pinned_bmcold;
+static Cost lion_units_pinned_bmcoldpage;
 
 /*
  * The units a lion path of rel is to be priced in - the cheapest core path's
@@ -812,10 +1167,16 @@ lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 		u->rate = lion_units_pinned_rate;
 		u->nlcold = lion_units_pinned_nlcold;
 		u->coldpage = lion_units_pinned_coldpage;
+		u->bmcold = lion_units_pinned_bmcold;
+		u->bmcoldpage = lion_units_pinned_bmcoldpage;
 	}
 	else
+	{
 		u->kind = lion_competitor_of(root, rel, &cost, &ownscan, &u->rate,
 									 &u->nlcold, &u->coldpage);
+		lion_competitor_bitmap_cold(root, lion_competitor_path(rel), u->kind,
+									u->nlcold, &u->bmcold, &u->bmcoldpage);
+	}
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
@@ -840,6 +1201,11 @@ lion_units_pin(PlannerInfo *root, RelOptInfo *rel)
 												&lion_units_pinned_rate,
 												&lion_units_pinned_nlcold,
 												&lion_units_pinned_coldpage);
+	lion_competitor_bitmap_cold(root, lion_competitor_path(rel),
+								lion_units_pinned_kind,
+								lion_units_pinned_nlcold,
+								&lion_units_pinned_bmcold,
+								&lion_units_pinned_bmcoldpage);
 	lion_units_pinned_rel = rel;
 }
 
