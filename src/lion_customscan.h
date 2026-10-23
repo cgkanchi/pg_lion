@@ -3375,11 +3375,16 @@ typedef struct LionAntiCell
 	int64		held;			/* ... and its counts, as the tally gave them */
 } LionAntiCell;
 
-/* What went past its memory, for EXPLAIN ANALYZE (lion_explain_anti_counters()) */
+/*
+ * What went past its memory, for EXPLAIN ANALYZE
+ * (lion_explain_anti_counters()): a sort or the tuplestore on disk past
+ * work_mem, or the losses past hash_mem
+ */
 #define LION_ANTI_SPILL_KEYS	0x01	/* the child's rows, sorted by key */
 #define LION_ANTI_SPILL_INNER	0x02	/* a key's inner rows */
-#define LION_ANTI_SPILL_SUB		0x04	/* the groups' or the cells' losses */
-#define LION_ANTI_SPILL_HELD	0x08	/* ... and the sort they then go to */
+#define LION_ANTI_SPILL_SUB		0x04	/* the groups' or the cells' losses,
+										 * past hash_mem into a sort */
+#define LION_ANTI_SPILL_HELD	0x08	/* ... and that sort, on disk */
 #define LION_ANTI_SPILL_RANGES	0x10	/* the rows taken away, by container
 										 * key */
 
@@ -3489,6 +3494,8 @@ typedef struct LionAntiState
 	int		   *predpos;		/* ... its LION_TL_CELLPRED place */
 	uint8	   *predtruth;		/* ... and its truth (LION_TRUTH_*) in the
 								 * row found last */
+	bool		predsread;		/* a join clause or restriction reads a
+								 * predicate's truth */
 	LionAntiCell *held;			/* the cells this participant's rows are of,
 								 * by code once compacted */
 	int			nheld;

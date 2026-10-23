@@ -761,13 +761,20 @@ working around a bad choice:
   Type: Anti`, `Join Rows: the rows counted, less those with a match`, `Join Lookup Index` and
   `Join Cond` above the inner side's plan, and under ANALYZE `Join Child Rows`, `Join Keys Looked
   Up`, `Join Rows Fetched` and `Join Rows Subtracted` (with `Join Child Time` and `Join Lookup Time`
-  under TIMING), and `Join Spilled` where part of the run went to disk: the inner side's keys and
-  rows are sorted and kept within `work_mem`, and what the groups or cells lose within `hash_mem`
-  (`work_mem` times `hash_mem_multiplier`), each spilling past it (DESIGN.md §27, "The anti join
-  within work_mem"). `LEFT JOIN ... IS NULL` is left alone, and so is `NOT IN` but on PostgreSQL 19
-  where neither side can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that
-  one as the same anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does
-  not count an anti join this way.
+  under TIMING), and `Join Spilled` where part of the run went past its memory: `keys`, `inner rows`
+  and `ranges` where the inner side's keys, a key's inner rows or, in parallel, the rows taken away
+  by range went to disk past `work_mem`; `losses` where what the groups or cells lose went past
+  `hash_mem` (`work_mem` times `hash_mem_multiplier`) into a sort that the count's rows are then held
+  back into, and `held rows` where that sort went to disk past `work_mem` (DESIGN.md §27, "The anti
+  join within work_mem"). In a parallel plan each counter is every participant's, summed, and `Join
+  Spilled` what went past its memory in any of them: beside a parallel count by cells, where every
+  participant reads the inner side and looks each key up, `Join Child Rows`, `Join Keys Looked Up`,
+  `Join Rows Fetched` and the times add up to a run per participant, while `Join Rows Subtracted` is
+  what the serial plan subtracts, each row taken away by the one participant that counts its range.
+  `LEFT JOIN ... IS NULL` is left alone, and so is `NOT IN` but on PostgreSQL 19 where neither side
+  can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that one as the same
+  anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does not count an anti
+  join this way.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
