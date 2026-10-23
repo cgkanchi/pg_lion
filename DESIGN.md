@@ -20072,16 +20072,15 @@ set of another's walk. Never beside the decoded walk (§34) or in an FK-side joi
 is one collected copy and whose counts are the dimension rows, nor for an OR's leaf, which cannot
 be walked.
 
-Until the 2026-10-23 review only a range the planner found too large to fit was priced walked, and
-the executor collected it first all the same, walking it only once the memory ran out. A range that
-fit after all was collected whatever walking it would have cost, and one that did not cost the walk
-of as much of it as filled the memory before it was walked - so the walk's price, and the walk,
-grew with `work_mem`: a `count(DISTINCT)`'s existence tests over a range of 3M rows took 5 ms
-walked at 64 kB, 34 ms at 256 kB and 0.45 s collected from 768 kB, and the existence tests of the
-regression suite's shapes 15 to 130 times what walking took. Measured on the release build since,
-over a 20M-row table and the suite's tables: a `count(DISTINCT)`'s existence tests and a few
-groups walk, 1.5 to 60 times faster than collecting; 300 groups and more collect, as before; the
-margin keeps two ranges beside seven groups collected, 11 to 13 ms, where walking one took 16 (the
+Why from the start, and why at any size: a range collected first and walked only once the memory
+ran out would cost, where it fit, its collection whatever walking it would have cost, and where it
+did not, the walk of as much of it as filled the memory before it was walked - so the walk's price,
+and the walk, would grow with `work_mem`. That way a `count(DISTINCT)`'s existence tests over a
+range of 3M rows took 5 ms walked at 64 kB, 34 ms at 256 kB and 0.45 s collected from 768 kB, and
+the existence tests of the regression suite's shapes 15 to 130 times what walking takes. Measured
+on the release build over a 20M-row table and the suite's tables: a `count(DISTINCT)`'s existence
+tests and a few groups walk, 1.5 to 60 times faster than collecting; 300 groups and more collect;
+the margin keeps two ranges beside seven groups collected, 11 to 13 ms, where walking one took 16 (the
 collection priced at 1.2 times the walk), and the ways leave a range too large to collect walked
 beside a `count(DISTINCT)` with the other collected, 3 ms, where collecting both in windows took
 9.
@@ -20124,12 +20123,12 @@ is bounded (2026-09-28 review):
 - **The walk keeps nothing of a set it has added.** Each set the walk hands out is read in a
   context of its own, reset once the union has taken it (`lion_range_union_walk()`): an INLINE
   set's copy of its payload and key, and the stream, plan and cursors it is read through, are the
-  set's alone, and releasing a set gives back its pin, not its memory. Until the 2026-10-23 review
-  they stayed in the node's WHERE context for the rest of the query, some 250 bytes for every entry
-  walked, outside the union's memory and whatever `work_mem` said: 154 MB over 600,000 keys at
-  4 MB (the review's), and over a 20M-row table on the release build, `r < 8388608 GROUP BY g`
-  (8.4 million keys) at 64 MB, 1.2 GB of peak RssAnon and 9.8 s, now 26 MB and 3.8 s; on the
-  assert build a range over 950,000 of 3M rows, 242 MB, now 4 MB. The node's other walks - a walked
+  set's alone, and releasing a set gives back its pin, not its memory. Left in the node's WHERE
+  context they would stay there for the rest of the query, some 250 bytes for every entry walked,
+  outside the union's memory and whatever `work_mem` said: 154 MB over 600,000 keys at 4 MB; over a
+  20M-row table on the release build, `r < 8388608 GROUP BY g` (8.4 million keys) at 64 MB takes
+  26 MB of peak RssAnon and 3.8 s, where keeping them took 1.2 GB and 9.8 s; on the assert build a
+  range over 950,000 of 3M rows takes 4 MB, where keeping them took 242 MB. The node's other walks - a walked
   range a batch at a time (`lion_walk_range_part()`), a probed one's sets, an IN list's batches,
   the FK-side join's chunks of groups, the inner GROUP BY column's entries, the key aggregates'
   entries - already reset a context of their own as they went.
@@ -20323,17 +20322,17 @@ keys, which therefore happens only where it did before. Each widening is made wh
 have been and compacted at most once, so a collection short of memory spends about what it did - a
 scattered range at `work_mem` 64 kB widened and compacted 6,916 times in 495 compactions and took as
 long as it did - and one that is not spends a fold or two a union key and a few nanoseconds a
-container. *(Until the 2026-10-23 review a union compacted could be widened again: near its memory a
-collection of scattered rows compacted to make room for one widening, the next container widened
-the union just compacted, which compacted the one before - a 4 kB optimize and a 4 kB widening a
-container, 12 s at 768 kB over 3M rows, 60 to 70% of it in the optimize. Now a union is widened
-once and compacted once at most (`LionRangeUnionEnt.compacted`); one that may not be widened takes
-the members of a small ARRAY into a buffer as an ARRAY union does, folded once they come to a
-quarter of its size in bytes, and before those buffers would put the collection past its memory
-they are folded and given back (`lion_range_union_squeeze()`), and such unions fold as each
-container comes until a window gives back keys. `k < 950000` over 3M rows in no order went from
-1.82 s at a 1 MB `work_mem`, twice what 64 MB took, to 0.66, and in windows at 64 kB from 1.93 s
-to 1.11, with the walk's sets freed as it goes (above, "What it needs beside it").)* On an assert
+container. *(A union is widened once and compacted once at most (`LionRangeUnionEnt.compacted`).
+Were a compacted union widened again, a collection of scattered rows near its memory would compact
+to make room for one widening, and the next container would widen the union just compacted, which
+compacts the one before - a 4 kB optimize and a 4 kB widening a container, 12 s at 768 kB over 3M
+rows, 60 to 70% of it in the optimize. One that may not be widened takes the members of a small
+ARRAY into a buffer as an ARRAY union does, folded once they come to a quarter of its size in
+bytes, and before those buffers would put the collection past its memory they are folded and given
+back (`lion_range_union_squeeze()`), and such unions fold as each container comes until a window
+gives back keys. `k < 950000` over 3M rows in no order takes 0.66 s at a 1 MB `work_mem`, no more
+than at 64 MB, where widening compacted unions again took 1.82 s, and in windows at 64 kB 1.11 s
+against 1.93, with the walk's sets freed as it goes (above, "What it needs beside it").)* On an assert
 build the series went from 30 ms, 1.09 s and 9.1 s to 21, 101 and 455 ms, against core's 176, 269 and 492; over 2M rows in heap order, one row a key, 1.9 million keys went
 from 14.1 s to 1.24, the walk of the keys most of it, and ten rows a key from 951 ms to 109.
 Measured over 40 collections - two orders, one row and ten a key, with and without summaries, 1% to
