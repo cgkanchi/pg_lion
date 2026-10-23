@@ -1915,6 +1915,23 @@ extern double lion_outer_param_loops(PlannerInfo *root, Node *quals);
 extern bool lion_has_outer_param(PlannerInfo *root, Node *node);
 
 /*
+ * The rows a probed key meets on a skewed key column (DESIGN.md §33, "The
+ * rows of a probed key"), as a factor over core's rows per key: for column
+ * var of rel, and the largest over the clauses that equate a column of rel
+ * to a value the plan does not know - a Param, another relation's Var.  1
+ * where nothing is known, or pg_lion.enable_skew_estimate is off.
+ */
+extern double lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel,
+									 Var *var);
+extern double lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel,
+									   List *clauses);
+/* ... and the scales lion_skew_rel_scale() found, kept for the planner run */
+extern bool lion_skew_scale_find(PlannerInfo *root, RelOptInfo *rel,
+								 Relids outer, double loops, double *scale);
+extern void lion_skew_scale_keep(PlannerInfo *root, RelOptInfo *rel,
+								 Relids outer, double loops, double scale);
+
+/*
  * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
  * estimate of a conjunction holding the n set clauses - on key columns
  * cols[] (1-based) of lion index idx of rel - is to be multiplied by, 1 when

@@ -611,10 +611,13 @@ lion_path_is_lion_scan(Path *path)
  * charged LION_COLD_PAGE_COST less the random_page_cost core charged it.  A
  * Memoize over the inner scan, which leaves the probes it saves unknown, and
  * an inner side that is not one index scan, take no charge; probes a semi
- * join stops early are counted whole.
+ * join stops early are counted whole.  The heap pages are counted at the
+ * rows a probe of a skewed key meets, `skew` times core's (§39, "A skewed
+ * key's probes"; lion_competitor_skew()).
  */
 static void
-lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
+lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
+				   double skew)
 {
 	JoinPath   *jp = NULL;
 	Path	   *inner;
@@ -668,7 +671,8 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 	if (ip->path.pathtype != T_IndexOnlyScan || baserel->allvisfrac < 1.0)
 	{
 		double		heap = index_pages_fetched(loops *
-											   Max(ip->indexselectivity *
+											   Max(Min(ip->indexselectivity *
+													   skew, 1.0) *
 												   baserel->tuples, 1.0),
 											   baserel->pages, idxpages,
 											   root);
@@ -678,6 +682,61 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 		reads += heap;
 	}
 	*cold = reads * *perpage;
+}
+
+/*
+ * A SKEWED KEY'S PROBES (§39): how many times core's rows per key a nested
+ * loop's probes of a skewed key column meet (lion_skew_scan_factor()), in
+ * *extra what the loop costs more at them - its inner side an index or a
+ * bitmap heap scan parameterized by the outer rows, under a Material or a
+ * projection - and in *outer what its outer side costs.  A semi or anti
+ * join's probe, and one into an inner side core proved unique, stops at its
+ * key's first match, which more rows do not delay: 1 for those, as for any
+ * other inner side or plan.  A loop below a subquery scan is the subquery's,
+ * and its Vars are looked up in the subquery's planner info.
+ */
+static double
+lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer)
+{
+	JoinPath   *jp = NULL;
+	Path	   *scan;
+	double		loops;
+	double		skew;
+
+	*extra = 0.0;
+	*outer = 0.0;
+	if (root == NULL)
+		return 1.0;
+	for (scan = best; scan != NULL; scan = lion_path_input(scan))
+	{
+		if (IsA(scan, NestPath))
+		{
+			jp = (JoinPath *) scan;
+			break;
+		}
+		if (IsA(scan, SubqueryScanPath))
+		{
+			root = (scan->parent != NULL) ? scan->parent->subroot : NULL;
+			if (root == NULL)
+				return 1.0;
+		}
+	}
+	if (jp == NULL || jp->jointype == JOIN_SEMI ||
+		jp->jointype == JOIN_ANTI || jp->inner_unique)
+		return 1.0;
+	scan = jp->innerjoinpath;
+	while (scan != NULL &&
+		   (IsA(scan, MaterialPath) || IsA(scan, ProjectionPath)))
+		scan = lion_path_input(scan);
+	if (scan == NULL || scan->param_info == NULL ||
+		(!IsA(scan, IndexPath) && !IsA(scan, BitmapHeapPath)))
+		return 1.0;
+	loops = Max(jp->outerjoinpath->rows, 1.0);
+	skew = lion_skew_scan_factor(root, scan);
+	if (skew > 1.0)
+		*extra = loops * lion_skew_scan_extra(root, scan, skew, loops);
+	*outer = jp->outerjoinpath->total_cost;
+	return skew;
 }
 
 /*
@@ -698,6 +757,12 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
  * cold cache costs, and a warm one costs none of it: with the inner table's
  * working set cached, the nested loop runs at core's price and the lion path
  * can be the slower, by up to that factor where its own price is the dearer.
+ *
+ * A loop whose probes meet more rows than core priced, on a skewed key, and
+ * a path priced at those rows (lion_units_take_skew()), are weighed with the
+ * loop at its price at them, nlcost + nlextra: the correction is the
+ * skewscale lion_units_price() applies, outside the bound, and the cold
+ * reads are the factor on top of it, within it, as before.
  */
 #define LION_COLD_MAX_DISCOUNT	1.5
 
@@ -705,6 +770,7 @@ void
 lion_units_cold(LionUnits *u, Cost own, double reads)
 {
 	Cost		price = own * u->rate;
+	Cost		loop = u->nlcost + ((u->skewscale < 1.0) ? u->nlextra : 0.0);
 	Cost		lioncold;
 	double		factor;
 
@@ -712,8 +778,7 @@ lion_units_cold(LionUnits *u, Cost own, double reads)
 		u->nlcost <= 0.0 || price <= 0.0)
 		return;
 	lioncold = Max(reads, 0.0) * u->coldpage;
-	factor = (price + lioncold) * u->nlcost /
-		((u->nlcost + u->nlcold) * price);
+	factor = (price + lioncold) * loop / ((loop + u->nlcold) * price);
 	factor = Min(Max(factor, 1.0 / LION_COLD_MAX_DISCOUNT), 1.0);
 	elog(DEBUG2, "lion: a nested loop's cold reads, %.2f over its %.2f against %.2f over %.2f, at factor %g",
 		 u->nlcold, u->nlcost, lioncold, price, factor);
@@ -727,11 +792,15 @@ lion_units_cold(LionUnits *u, Cost own, double reads)
  * enable_* settings, which leave a lion path nothing to compete with.
  * *ownscan says whether that path is one of the AM's own scans of a lion
  * index (lion_path_is_lion_scan()), *rate its rate; *nlcold and *coldpage
- * a nested loop's cold reads (lion_nestloop_cold()), when root is given.
+ * a nested loop's cold reads (lion_nestloop_cold()), when root is given; and
+ * *skew, *nlextra and *nlouter the rows its probes of a skewed key meet,
+ * what it costs more at them and its outer side's cost
+ * (lion_competitor_skew()).
  */
 static LionCompetitor
 lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
-				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage)
+				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage,
+				   Cost *nlextra, Cost *nlouter, double *skew)
 {
 	Path	   *best = lion_competitor_path(rel);
 	LionCompetitor kind;
@@ -741,6 +810,9 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 	*rate = 1.0;
 	*nlcold = 0.0;
 	*coldpage = 0.0;
+	*nlextra = 0.0;
+	*nlouter = 0.0;
+	*skew = 1.0;
 	if (best == NULL)
 		return LION_COMPETITOR_NONE;
 	if (lion_path_disabled(best))
@@ -750,7 +822,10 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
 		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
 	if (kind == LION_COMPETITOR_NESTLOOP)
-		lion_nestloop_cold(root, best, nlcold, coldpage);
+	{
+		*skew = lion_competitor_skew(root, best, nlextra, nlouter);
+		lion_nestloop_cold(root, best, nlcold, coldpage, *skew);
+	}
 	return kind;
 }
 
@@ -792,6 +867,9 @@ static bool lion_units_pinned_ownscan;
 static double lion_units_pinned_rate;
 static Cost lion_units_pinned_nlcold;
 static Cost lion_units_pinned_coldpage;
+static Cost lion_units_pinned_nlextra;
+static Cost lion_units_pinned_nlouter;
+static double lion_units_pinned_skew;
 
 /*
  * The units a lion path of rel is to be priced in - the cheapest core path's
@@ -812,12 +890,17 @@ lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 		u->rate = lion_units_pinned_rate;
 		u->nlcold = lion_units_pinned_nlcold;
 		u->coldpage = lion_units_pinned_coldpage;
+		u->nlextra = lion_units_pinned_nlextra;
+		u->nlouter = lion_units_pinned_nlouter;
+		u->skew = lion_units_pinned_skew;
 	}
 	else
 		u->kind = lion_competitor_of(root, rel, &cost, &ownscan, &u->rate,
-									 &u->nlcold, &u->coldpage);
+									 &u->nlcold, &u->coldpage, &u->nlextra,
+									 &u->nlouter, &u->skew);
 	if (u->rate <= 0.0)
 		u->rate = 1.0;
+	u->skewscale = 1.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
 	u->nlcost = cost;
 	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at rate %g and margin %g",
@@ -839,7 +922,10 @@ lion_units_pin(PlannerInfo *root, RelOptInfo *rel)
 												&lion_units_pinned_ownscan,
 												&lion_units_pinned_rate,
 												&lion_units_pinned_nlcold,
-												&lion_units_pinned_coldpage);
+												&lion_units_pinned_coldpage,
+												&lion_units_pinned_nlextra,
+												&lion_units_pinned_nlouter,
+												&lion_units_pinned_skew);
 	lion_units_pinned_rel = rel;
 }
 
@@ -900,18 +986,51 @@ lion_units_margin_for(RelOptInfo *rel)
 	double		rate;
 	Cost		nlcold;
 	Cost		coldpage;
+	Cost		nlextra;
+	Cost		nlouter;
+	double		skew;
 	LionCompetitor kind = lion_competitor_of(NULL, rel, &cost, &ownscan,
-											 &rate, &nlcold, &coldpage);
+											 &rate, &nlcold, &coldpage,
+											 &nlextra, &nlouter, &skew);
 
 	return lion_competitor_margin(kind, false);
 }
 
 /*
  * A lion path's own price, in lion's units, converted into the competitor's
- * and offered at the margin.
+ * and offered at the margin; and, priced at the rows its probes of a skewed
+ * key meet, put back into core's units (lion_units_take_skew()).
  */
 Cost
 lion_units_price(const LionUnits *u, Cost own)
 {
-	return own * u->rate / u->margin;
+	return own * u->rate * u->skewscale / u->margin;
+}
+
+/*
+ * A SKEWED KEY'S PROBES (DESIGN.md §39): the factor over core's rows per key
+ * that a nested loop competitor's probes of a skewed key meet
+ * (lion_competitor_skew()), which the path is to be priced at - its lookups
+ * of the same keys meeting the same rows - and from now on its price is
+ * scaled back into core's units by the loop's price at core's rows over its
+ * price at those: the loop without its outer side, which the lion path takes
+ * as its child at core's price, nlcost - nlouter, over that and nlextra.  The
+ * two then compare as they would at the rows both meet, and the plan around
+ * them stays in core's units.  The scale is not bounded: it is the
+ * competitor's own price, corrected, and LION_COLD_MAX_DISCOUNT bounds only
+ * the cold reads on top of it (lion_units_cold()).  A path that does not
+ * price its lookups at the factor does not call this, and keeps core's rows
+ * on both sides.  1 where the competitor meets no skewed key.
+ */
+double
+lion_units_take_skew(LionUnits *u)
+{
+	Cost		loop = u->nlcost - u->nlouter;
+
+	if (u->skew <= 1.0 || u->nlextra <= 0.0 || loop <= 0.0)
+		return 1.0;
+	u->skewscale = loop / (loop + u->nlextra);
+	elog(DEBUG2, "lion: the competitor's probes of a skewed key meet %g times its rows, %.2f more over its %.2f",
+		 u->skew, u->nlextra, loop);
+	return u->skew;
 }

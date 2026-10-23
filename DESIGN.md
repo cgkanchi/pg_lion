@@ -21071,7 +21071,8 @@ has ANALYZE's estimate again, exactly as without lion.
 
 ### The meta page, and the format
 
-`LionMetaNdistinct` (lion.h), 272 bytes, right after `LionMetaPageData` on the meta page at
+`LionMetaNdistinct` (lion.h), 272 bytes (536 since the sums of squares of 2026-10-23, below,
+"The rows of a probed key"), right after `LionMetaPageData` on the meta page at
 `LION_META_NDISTINCT_OFFSET`:
 
     valid_cols   uint32   bit i - 1: key column i has a count
@@ -21111,7 +21112,8 @@ for nothing they could get wrong.
 
 `lion_meta_write_ndistinct()` writes the area in a record of its own, through the shim (§25):
 the meta page locked EXCLUSIVE, `lion_wal_begin()`, the area copied onto the registered page and
-`pd_lower` raised to cover it, a `LION_OP_NDISTINCT` operation carrying the 272 bytes, and
+`pd_lower` raised to cover it, a `LION_OP_NDISTINCT` operation carrying the area (272 bytes; 536
+with the sums of squares, below), and
 `lion_wal_finish(LION_XLOG_META)` - the record type §25 had reserved for the meta page and never
 written. In generic mode the operation is a no-op and GenericXLog's diff of the image carries the
 change, `pd_lower` included; generic redo zeroes what lies between `pd_lower` and `pd_upper`, and
@@ -21207,8 +21209,8 @@ error), and the row it returns is the one supplied, with its `acl_ok`. As `lion_
 does for the probe's row. The lookup also checks that core's row is the column's own
 (`starelid`, `staattnum`, not `stainherit`).
 
-**Caching.** Each index's meta page is read once per planner run (one pin, a SHARE lock and 272
-bytes, `lion_nd_index()`), and each column's corrected row is made once per planner run and handed
+**Caching.** Each index's meta page is read once per planner run (one pin, a SHARE lock and the
+area, `lion_nd_index()`), and each column's corrected row is made once per planner run and handed
 out as is, with a release function that frees nothing: both live in the memory of the planner run,
 forgotten when it is reset (`lion_nd_cache_for()`, as `lion_probe_cache_for()`). The next plan
 reads the meta page again, so a count written by a build, a REINDEX, a VACUUM or an ANALYZE is what
@@ -21252,6 +21254,132 @@ a HashAggregate, where it chose the pushdown under a Finalize HashAggregate expe
 and the scan takes about half the pushdown's time there. The section is about the planner that
 does not know, so the rest of it runs with the setting off.
 
+### The rows of a probed key (2026-10-23)
+
+n_distinct says how many rows a key has on average over the keys. A probe does not meet an average
+key. Core prices a key the plan does not know when it plans at `(1 - nullfrac) / n_distinct` of
+the table (`var_eq_non_const()`), capped by the most common value's share: an equality to a Param,
+a nested loop's outer row, a correlated subquery's, a prepared statement's generic plan. That is
+the rows of a key drawn at random from the column's keys. The keys a query probes are not drawn
+that way. An outer row names the key its own row references, and a set of outer rows draws keys
+as rows draw them, each key with the chance of its rows. Of keys of n_1 ... n_K rows, N = Σn, a
+key drawn by key has N / K rows on average and one drawn by row has Σn² / N. On a column whose
+keys are skewed the two are orders of magnitude apart, and every probe of such a key is priced
+for a sliver of what it reads.
+
+**Measured** (a private workload, a fact table's key column into a dimension): 205 million rows
+over 13.3 million keys, 15.4 rows a key over all of them and 13.5 over the keys outside the MCV
+list. ANALYZE's MCV list has 500 values. Their frequencies add up to 13% of the rows, their keys
+hold 13.4%, and the smallest of them has 21,912 rows. Over all the rows Σn² / Σn is 17,105, with 88% of Σn² in
+the keys of the MCV list. Outside them a key drawn by row has 2,396 rows (the formula below).
+The keys the workload's queries probed met:
+
+- 770 to 1,800 rows each, from outer sets of 60 to 6,000 keys. Core priced each of those probes
+  at the per-key mean, 50 to 130 times too few rows; the formula is 1.3 to 3.1 times
+  above them.
+- 3 to 117 rows a key, from outer sets of 1 to 47 million keys. Those sets cover most of the keys
+  and meet about the per-key mean, as core has it. They are planned as hash joins, which no
+  probe's rows price (Limits, below).
+
+§39's "A skewed key's probes" has what that did to a plan.
+
+**The statistic.** Σn² of each key column is summed in the same pass that counts its n_distinct
+and over the same entries: the VALUE entries with at least one TID, each adding the square of its
+TIDs. That pass is one of:
+
+- at build, `lion_build_add_entry()`;
+- in VACUUM's ambulkdelete, `lion_vac_count()`, with the TIDs the entry keeps;
+- in the walk of a small directory at ANALYZE and at a VACUUM that deletes nothing,
+  `lion_vacuum_count_keys()`.
+
+It is a `uint64` that saturates at its maximum (`lion_sumsq_add()`), which reads as unknown, as
+zero does. It costs a multiply and an add per entry, in a pass that reads every entry already.
+Dead TIDs count in it until VACUUM, as they do in the rows.
+
+**The meta page.** `LionMetaNdistinct` grows from 272 bytes to 536, with two new fields after
+`ndistinct`:
+
+    sumsq_rows   uint64      the rows the sums were taken over: rows, or 0 where none were taken
+    sumsq        uint64[32]  Σn² of each key column
+
+`pd_lower` says which part a page has. `LionMetaHasNdistinct()` now asks for the first 272 bytes,
+`LionMetaHasSumsq()` for all 536. A meta page written before the sums ends at the counts and reads
+as one with counts and no sums: unknown, until the next build, VACUUM that deletes or ANALYZE
+within the bound writes both (`lion_meta_copy_ndistinct()` copies what the page has and zeroes the
+rest). The format version does not move, by the same argument as the counts': nothing before this
+reads past `ndistinct`. An older build that counts again rewrites `rows` and the counts and leaves
+the sums as they were. `sumsq_rows` is what tells that apart: a sum is used only while `sumsq_rows`
+equals `rows` (`LionMetaSumsqKnown()`), and a recount by an older build moves `rows` and not
+`sumsq_rows`.
+
+The `LION_OP_NDISTINCT` record carries the whole area, 536 bytes, written under the same lock and
+the same rule that nothing already there is written again. Redo also takes the 272 bytes an older
+build wrote, for WAL from before an upgrade. It replays them as that build would: `pd_lower`
+raised to cover the counts and no further, and the bytes past them left as they were. A standby
+replaying a newer primary's 536-byte record must have this build, since an older one PANICs on the
+payload's length. Upgrade the standbys first, as for any change to a record.
+
+**The formula** (`lion_skew_rows_of()`, lion_selfuncs.c). From ANALYZE's row of the column take the
+null fraction and the MCV list's frequencies f_i, and the rows N the planner finds the table to
+have. The keys outside the list hold `N (1 - nullfrac - Σf_i)` rows and `Σn² - Σ(f_i N)²` of the
+sum, so a row drawn from them belongs to a key of
+
+    (Σn² - Σ(f_i N)²) / (N (1 - nullfrac - Σf_i))
+
+rows on average, and of `Σn² / (N (1 - nullfrac))` with no MCV list. The result is bounded below by
+core's rows per key, as `var_eq_non_const()` has them, and above by N. A unique column has
+Σn² = N and stays at its one row; a probe of a most common value is what the MCV list is for, and
+the formula leaves those keys out.
+
+Σn² was summed over the rows the count was taken over, and the table may have grown since. It is
+scaled by the count's convention (`lion_ndistinct_value()`), with g the table's rows over the rows
+counted. A count of a tenth of the rows or fewer is a fixed set of keys, each of which grew with
+the table, so Σn² grows as g². More keys than that grow with the table and keep their rows, so
+Σn² grows as g. Past a factor of 2 the count is not used (`lion_nd_current()`), and neither is the
+sum.
+
+The index is chosen as for n_distinct (§33, "The hook"): non-partial, a scalar opclass with the
+type's equality, the column itself, the count nearest the table's rows. The column must have
+ANALYZE's statistics. The figure is worked out once a planner run and column and kept in the
+planner run's memory with the counts (`lion_skew_param_factor()`).
+
+**What it is used for.** The figure is lion's own. Path rows keep core's per-key rows, and so does
+every estimate core makes and the AM's own scans. Lion prices its probes of a key the plan does
+not know at the figure, and the competitor they are weighed against is priced at the same rows,
+its price then put back into core's units (§39, "A skewed key's probes"). Those probes are:
+
+- a walk of a B-tree keyed on the column (`lo_cost()`);
+- a LionCount whose WHERE equates the column to a Param (`lion_count_rel_set_clause()`);
+- an FK-side join's lookups against a nested loop (`lion_cost_fkjoin_rel()`).
+
+`pg_lion.enable_skew_estimate` (on by default, PGC_USERSET) turns it all off. The figure is a
+factor of the competitor's price as well as lion's, so it moves plans both ways, and the setting
+puts them back to what they were.
+
+**Inspecting it.** `lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct`
+and `sumsq` from the meta page, with `sumsq` NULL where it is unknown.
+`lion_debug_skew_rows(text)` plans a query and returns the figure and core's rows per key for each
+column a probe was priced on. Both are C functions for the tests, superuser only, that the
+extension's SQL does not create: `test/sql/skew.sql` binds them from the library.
+
+**Tests** (`test/sql/skew.sql`):
+
+- the setting's row in `pg_settings`;
+- on 15,000 rows, the build's Σn² exactly. The figure is 162.07 rows against core's 15. A VACUUM
+  that deletes counts what is left, and an ANALYZE of a small directory counts the inserts. A table
+  that doubles without a count doubles the figure, and past twice the rows counted it is not used;
+- on a fact of 200,000 rows over a dimension of 20,128 keys (eight of 5,000 rows, 120 of 1,000, the
+  rest of two), the figure, 750.50 rows against core's 10. A unique column stays at one row and its
+  plan's cost does not move;
+- the plans that flip with the setting: a correlated count (an aggregate over the key's B-tree off,
+  a LionCount on), a nested loop over one key's rows (the loop's index scan off, the walk of the
+  B-tree on; with the walk switched off, the LionCount on, priced past the cold reads' bound), and a
+  generic plan's parameter;
+- every answer against core's.
+
+`test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
+subquery, and its fixtures' keys are skewed enough to move its plans.
+
 ### Limits
 
 - The count is as fresh as the last build, VACUUM that deleted, or ANALYZE of a directory within
@@ -21265,6 +21393,11 @@ does not know, so the rest of it runs with the setting off.
 - Dead row versions count until VACUUM (above).
 - An index whose meta page predates this section supplies nothing until a build, a VACUUM that
   deletes, or an ANALYZE within the bound has counted it.
+- The rows of a probed key are a mean over the keys outside the MCV list, weighted by their rows.
+  It is right for outer rows drawn as the fact's rows are, and too many for an outer set that
+  covers most of the keys, which meets about the per-key mean. Such sets are hash joins, which no
+  probe's rows price. A meta page from before the sums, or one an older build counted again,
+  supplies no sums until a build, a VACUUM that deletes or an ANALYZE within the bound counts it.
 
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 
@@ -22971,6 +23104,92 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
   and measures nothing of the rate.
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
+
+### A skewed key's probes (2026-10-23)
+
+§33's "The rows of a probed key" has the rows a probe of a key the plan does not know meets, on a
+column whose keys are skewed: from Σn², and many times the per-key rows core prices it at. Lion
+prices its own probes of such a key there. Its competitor was priced at core's rows, so the
+comparison was between a lion path at the rows it meets and a core path at a sliver of them, and
+the lion path lost to plans that run many times slower. A competitor at core's rows is under-priced
+by however many rows it is short.
+
+**Measured** (the same private workload as §33's). A nested loop from a dimension's small set of
+keys into the fact table, its inner side the fact's B-tree on the key. Lion's probe of a key was
+priced at 57 a call, 54 of that about 13 container seeks of about 4 random pages each. Core's
+B-tree scan was priced at 18.46 a call: the per-key rows, 13 heap pages at a `random_page_cost` of
+1.1. The loop won. Run cold, each of its calls read about 4,700 heap tuples and took 1.7 s.
+
+**R1: the rows are the same on both sides, or core's on both.** A lion path is priced at the
+skewed rows only where its competitor meets them too. The competitor is priced at those rows as
+well, and the lion path's price is put back into core's units by the competitor's price at core's
+rows over its price at the skewed rows:
+
+    price = lion's price at the skewed rows x competitor at core's rows / competitor at the skewed rows
+
+So the two compare as they would at the rows both meet, and everything else the plan weighs them
+against stays in core's units. Where no competitor meets the rows (none, or a sequential scan whose
+price no key's rows change), the lion path keeps core's rows too. AM scans are core's scans of a
+lion index and keep core's rows: they compete with core's paths of the relation by core's own
+rules. Path rows never change.
+
+**What the competitor costs at the skewed rows** (`lion_skew_scan_extra()`, lion_plan_skew.c) is
+the difference between core's own price terms worked out at core's rows and at `factor` times
+them:
+
+- an index scan: `cost_index()`'s heap pages, Mackert and Lohman's over the loop's scans and
+  interpolated by the index's correlation, which it takes from the AM's `amcostestimate`;
+- the leaf pages `genericcostestimate()` prorates;
+- a bitmap heap scan: `cost_bitmap_heap_scan()`'s pages and the price of a page;
+- a CPU charge for each row, index tuple and restriction qual.
+
+The descent, the start-up and everything above the scan are left as they were. The factor is the
+largest of the figures (`lion_skew_param_factor()`) for the scan's index clauses that equate a
+column to a value the plan does not know: a Param, or another relation's Var
+(`lion_skew_clauses_factor()`).
+
+**Against a nested loop** (`lion_competitor_skew()`, lion_plan_units.c). The inner side must be
+one index scan or bitmap heap scan parameterized by the outer rows, under a Material or a
+projection at most. The extra is the loops (the outer rows) times one scan's extra. A semi or anti
+join's probe, and one into an inner side core proved unique, stops at its key's first match, and
+more rows do not delay it: those loops are left at core's price. A loop below a subquery scan is
+the subquery's, and its Vars are looked up in the subquery's planner info (`rel->subroot`), not
+the outer root's. The paths that price their lookups at the figure take it with
+`lion_units_take_skew()`, which sets the scale:
+
+    skewscale = (nlcost - nlouter) / (nlcost - nlouter + nlextra)
+
+That is the loop's price without its outer side, at core's rows over at the skewed ones. The outer
+side is left out because the lion path takes it as its child at core's price, and it would dilute
+the correction. The FK-side join and its semi join path do this, their lookups priced at the same
+rows (`lion_fkjoin_fk_keys()`: the keys the skewed rows per key would make, n_distinct over the
+factor).
+
+**Against the relation's own paths** (`lion_skew_rel_scale()`): a walk of a B-tree keyed on the
+column (`lo_cost()`), and a LionCount whose WHERE equates it to a Param
+(`lion_count_skew_units()`). The competitor is the cheapest of core's paths of the relation with
+the same parameterization, neither one of lion's custom paths nor disabled. The scale is its
+price over its price plus its extra, for one scan or for the walk's loops. By the time the count
+or the walk is costed, `add_path()` may have pruned that path in favour of a lion path. So the
+scale is worked out once a planner run for each relation, outer rels and loops, and kept
+(`lion_skew_scale_keep()`). The unparameterized one is worked out at the top of lion's
+`set_rel_pathlist_hook` (`lion_skew_rel_note()`), from core's paths alone.
+
+**The cold reads, on top.** `lion_nestloop_cold()` counts the loop's heap pages at the skewed
+rows: one changed term, `indexselectivity x skew`. `lion_units_cold()` weighs the lion path
+against the loop at its corrected price, nlcost + nlextra. The skew correction is the skewscale
+`lion_units_price()` multiplies by, outside `LION_COLD_MAX_DISCOUNT`, because it is the
+competitor's own price corrected and not a guess about the cache. The cold reads' factor applies
+on top of it, within the 1.5 bound, as before. In `test/sql/skew.sql` the LionCount against the
+loop is priced far below the loop, past that bound (`past_cold_bound`).
+
+**Plans.** At the figure the measured loop's index scan meets about 2,396 rows a call, not about
+15, and is charged for its heap pages and CPU at those rows. That is nearer the 4,700 tuples a call
+it read than core's 13 pages were. This build has not been run on that workload. The regression
+test's fixtures reproduce the plan's shape at a small scale: a skewed key column, its B-tree, a
+lion index, a correlated subquery, a nested loop and a generic plan. `pg_lion.enable_skew_estimate`
+off gives back the plans this section changes. `test/sql/correlated.sql`'s plans move with it, and
+that test runs with the setting off (§33's subsection).
 
 ## 40. Lion-filtered walks of a covering B-tree, index-only (`LionOrdered`'s index-only mode and `LionBtreeScan`, lion_ordered.c; 2026-10-06)
 

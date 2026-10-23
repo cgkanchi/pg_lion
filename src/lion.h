@@ -17,6 +17,7 @@
 #include "access/generic_xlog.h"
 #include "access/itup.h"
 #include "access/transam.h"
+#include "common/int.h"
 #include "fmgr.h"
 #include "nodes/tidbitmap.h"
 #include "storage/bufmgr.h"
@@ -666,6 +667,23 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
  *				their second.  ANALYZE, and a VACUUM that calls no
  *				ambulkdelete, keep it.  Zero where a build wrote the area,
  *				and on a meta page that has none.
+ *	sumsq_rows	the rows the sums below were taken over: rows, where the
+ *				pass that took the counts summed them too, and 0 where it
+ *				did not.  A build from before the sums, counting again,
+ *				writes the counts and rows and leaves the rest of the
+ *				area as it was; the sums are the counts' only while
+ *				sumsq_rows equals rows (LionMetaSumsqKnown()).
+ *	sumsq		the sum over the same VALUE entries of the square of each
+ *				one's TIDs, Σn², counted in the same pass as ndistinct
+ *				(DESIGN.md §33, "The rows of a probed key"): the rows a
+ *				key drawn by row meets, Σn²/Σn, are what an equality to a
+ *				Param meets on a skewed column.  Saturates at
+ *				PG_UINT64_MAX, which the planner takes for unknown, as it
+ *				takes 0.  A meta page written before it was kept ends at
+ *				sumsq_rows - pd_lower covers ndistinct and no more, the
+ *				272 bytes the area was - and reads as one with counts and
+ *				no sums (LionMetaHasSumsq()); the next VACUUM or ANALYZE
+ *				that counts writes both.
  *
  * Nothing in it says when it was counted: a build writes exactly the bytes
  * every other build of the same rows writes, whatever the memory, the workers
@@ -683,22 +701,53 @@ typedef struct LionMetaNdistinct
 	uint32		bulkdeletes;
 	uint64		rows;
 	uint64		ndistinct[LION_META_MAX_COLS];
+	uint64		sumsq_rows;
+	uint64		sumsq[LION_META_MAX_COLS];
 } LionMetaNdistinct;
+
+/* The area as §33 first wrote it, up to the sums: what an older page has. */
+#define LION_META_COUNTS_SIZE	offsetof(LionMetaNdistinct, sumsq_rows)
 
 StaticAssertDecl(INDEX_MAX_KEYS <= LION_META_MAX_COLS,
 				 "lion's meta page counts the keys of at most 32 key columns");
-StaticAssertDecl(sizeof(LionMetaNdistinct) == 272,
+StaticAssertDecl(sizeof(LionMetaNdistinct) == 536 &&
+				 LION_META_COUNTS_SIZE == 272,
 				 "the lion meta page's key counts must not change size");
+
+/* Key column i's (from 0) Σn² of nd, when it is known and the counts'. */
+#define LionMetaSumsqKnown(nd, i) \
+	((nd)->sumsq_rows == (nd)->rows && (nd)->rows > 0 && \
+	 (nd)->sumsq[i] != 0 && (nd)->sumsq[i] != PG_UINT64_MAX)
 
 #define LION_META_NDISTINCT_OFFSET \
 	(MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(LionMetaPageData)))
 #define LION_META_NDISTINCT_END \
 	(LION_META_NDISTINCT_OFFSET + sizeof(LionMetaNdistinct))
+#define LION_META_COUNTS_END \
+	(LION_META_NDISTINCT_OFFSET + LION_META_COUNTS_SIZE)
 #define LionPageGetMetaNdistinct(page) \
 	((LionMetaNdistinct *) ((char *) (page) + LION_META_NDISTINCT_OFFSET))
 /* Does this meta page carry the counts at all? */
 #define LionMetaHasNdistinct(page) \
+	(((PageHeader) (page))->pd_lower >= LION_META_COUNTS_END)
+/* ... and the sums of squares beside them? */
+#define LionMetaHasSumsq(page) \
 	(((PageHeader) (page))->pd_lower >= LION_META_NDISTINCT_END)
+
+/*
+ * Add an entry of n TIDs to a column's Σn², saturating at PG_UINT64_MAX
+ * (which the planner reads as unknown).
+ */
+static inline void
+lion_sumsq_add(uint64 *sum, uint64 n)
+{
+	uint64		sq;
+
+	if (*sum == PG_UINT64_MAX)
+		return;
+	if (pg_mul_u64_overflow(n, n, &sq) || pg_add_u64_overflow(*sum, sq, sum))
+		*sum = PG_UINT64_MAX;
+}
 
 /* The first block after the meta page; where ambuild puts the first leaf. */
 #define LION_FIRST_BLKNO		((BlockNumber) 1)
@@ -2527,15 +2576,17 @@ extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 
 /*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of
- * ix's columns from the VALUE entries of each (nvalues[], one per key column)
- * and the rows under its first scalar column, taken now; put it on a meta page
+ * ix's columns from the VALUE entries of each (nvalues[], one per key column),
+ * the sum of the squares of their TIDs (sumsq[], or NULL for none) and the
+ * rows under its first scalar column, taken now; put it on a meta page
  * image nothing else can see yet (ambuild); write it on the index's meta page
  * in a WAL record of its own (VACUUM and ANALYZE); read it back, false when the
  * meta page carries none.
  */
 extern void lion_meta_fill_ndistinct(LionMetaNdistinct *nd,
 									 const LionIndexState *ix,
-									 const uint64 *nvalues, uint64 rows);
+									 const uint64 *nvalues,
+									 const uint64 *sumsq, uint64 rows);
 extern void lion_meta_record_ndistinct(Page metapage,
 									   const LionMetaNdistinct *nd);
 extern void lion_meta_write_ndistinct(Relation index,

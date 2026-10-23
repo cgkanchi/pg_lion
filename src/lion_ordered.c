@@ -1740,6 +1740,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		ipages = 0.0;
 	double		calls;
 	bool		rebuilt = false;
+	double		skew;
+	double		skewscale = 1.0;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
@@ -1811,6 +1813,28 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * CPU, which a parallel walk divides
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
+
+	/*
+	 * A key the plan does not know - the outer row's, a Param - on a skewed
+	 * key column: the walk meets the rows a probed key meets (DESIGN.md §33,
+	 * "The rows of a probed key"), and so do its members' tests and fetches
+	 * below, where its competitor - the cheapest of core's paths of rel with
+	 * the same parameterization - meets them too and is priced at them
+	 * (lion_skew_rel_scale(), DESIGN.md §39, "A skewed key's probes"); the
+	 * price is put back into core's units at the end by the competitor's two
+	 * prices.  A competitor no key's rows change, a sequential scan, leaves
+	 * the walk at core's rows too.
+	 */
+	skew = lion_skew_clauses_factor(root, rel, ord->indexclauses);
+	if (skew > 1.0)
+	{
+		skewscale = lion_skew_rel_scale(root, rel,
+										PATH_REQ_OUTER(&ord->path),
+										(ord->path.param_info != NULL) ?
+										loops : 1.0);
+		if (skewscale < 1.0)
+			walked = Min(clamp_row_est(walked * skew), tuples);
+	}
 	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
@@ -1959,6 +1983,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (workers != NULL)
 		cpu /= lion_parallel_divisor(*workers);
 	run += cpu;
+
+	/*
+	 * Priced at the rows a probed key meets, the walk is put back into core's
+	 * units by what its competitor costs at core's rows over what it costs at
+	 * those: the two compare as they would at the rows both meet, and the
+	 * loop around them stays in core's units.
+	 */
+	startup *= skewscale;
+	run *= skewscale;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -4068,6 +4101,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	LoKnn		knn;
 	IndexPath  *first;
 
+	/* core's price of a skewed key's scan, before lion's paths join it */
+	lion_skew_rel_note(root, rel);
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 

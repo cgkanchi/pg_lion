@@ -588,6 +588,9 @@ WAL written under one id replays only under that id, so change `pg_lion.rmgr_id`
 shutdown, once every standby and WAL archive consumer has replayed everything written under the old
 id, and restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so
 an upgrade may change it freely.
+Upgrade a standby's `pg_lion` before its primary's. In rmgr mode the meta page's key counts are
+logged with the sums of squares beside them (DESIGN.md §33), and an older build's replay stops at
+that record. A newer build replays an older one's records.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
@@ -812,6 +815,18 @@ working around a bad choice:
   expression), while the table holds within a factor of 2 of the rows the count was taken over, and
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
+- `pg_lion.enable_skew_estimate` (on by default): price Lion's probes of a key the plan does not
+  know (a nested loop's outer row, a correlated subquery's, a generic plan's parameter) at the rows
+  such a key really meets on a skewed column, and price the core scan they compete with at the same
+  rows (DESIGN.md §33, "The rows of a probed key", and §39, "A skewed key's probes"). The planner
+  prices such a probe at the column's rows per key. But the keys a query probes are drawn as rows
+  are, so on a column where a few keys have thousands of rows and most have a handful, a probe
+  meets many times that. The same pass that counts a Lion index's keys sums the squares of their
+  rows, and with ANALYZE's most common values that gives the rows of a probed key outside them.
+  Lion's price is then put back into the planner's units, so row estimates and every other plan
+  comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply, and the
+  sums need an index built, vacuumed or analyzed by a version that keeps them. Off, every probe is
+  priced at the planner's rows per key, as before.
 
 PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
 stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`
