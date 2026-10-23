@@ -21143,7 +21143,9 @@ is, in order: the probe scope's corrected row when a scope covers the column (un
 previous hook when it takes the column, then `lion_ndistinct_stats()`, then nothing. It supplies,
 for column `attnum` of the base relation `rte` names, the column's `pg_statistic` row with
 `stadistinct` replaced, and everything else - null fraction, most common values, histogram,
-correlation - as ANALYZE left it, when all of these hold:
+correlation - as ANALYZE left it (but for the frequencies of the values the query compares the
+column with, since 2026-10-23: "The frequencies of the listed values", below), when all of these
+hold:
 
 - `pg_lion.enable_index_ndistinct` is on (the default; PGC_USERSET);
 - a plain column (`attnum > 0`) of a table's own statistics: not `rte->inh`, which asks for the
@@ -21264,6 +21266,134 @@ does not know, so the rest of it runs with the setting off.
 - Dead row versions count until VACUUM (above).
 - An index whose meta page predates this section supplies nothing until a build, a VACUUM that
   deletes, or an ANALYZE within the bound has counted it.
+
+### The frequencies of the listed values (2026-10-23)
+
+Serving the exact count made one estimate worse. Core estimates `col = c` for a value that is not
+among ANALYZE's most common values as an equal share of the rows those leave: the rest of the
+rows over the rest of the distinct values (`var_eq_const()`), no more than the least common listed
+value. `col IN (...)` and `col = ANY (array)` add that up value by value (`scalararraysel()`), and
+an OR of equalities on one column is estimated as the IN list it spells (§29.11). On a skewed column - a few values
+with thousands of rows, most with a handful - ANALYZE's list holds some of the heavy values, a
+statistics target's worth, and a heavy value it left out is estimated at a rare value's share,
+which the exact count, larger than ANALYZE's estimate of it, makes smaller still. In
+`test/sql/index_mcv.sql` a value with 1,750 of 30,000 rows is planned at 7, an IN list of five
+heavy values (11,250 rows) at 34, and the planner reads them through an index scan and filters,
+joins or groups them, where with their rows it counts them from the index (`LionCount`, with its
+FK-side join or Top K).
+
+A lion index on the column knows each value's rows: the header of the value's entry counts its
+TIDs. So the row `lion_relation_stats()` serves a plain column with carries the values the
+relation's clauses compare the column with among its most common values, at their exact
+frequencies, and core's estimate is then each value's rows.
+
+**What is served.** For each value, the TIDs of its entry (`lion_key_ntids()`, one descent of the
+directory under a SHARE lock, no predicate lock - planning reads no rows for the transaction - and
+no pin kept) over the rows the planner finds the table to have (`rel->tuples`), 0 for a value
+the index has no entry for; core multiplies the frequency back by the same rows, so its estimate
+is the entry's TIDs. A value ANALYZE's list has already gets the exact frequency in place of the
+sampled one, a value it does not have is added, and the list is sorted again by frequency, the most
+common first, as ANALYZE leaves it: `var_eq_non_const()` and the hash join's bucket estimate read
+the first entry as the most common, and `eqjoinsel_semi()` cuts the list from its end. ANALYZE's
+other entries stay, and so do the histogram, the correlation, every other slot, the null fraction
+and `stadistinct` (the index's count, as served above, or ANALYZE's). A column whose row has no
+most common values - every value sampled once - gets a new slot, the first free one, with the
+type's equality and the column's collation; a row with no free slot is served without the
+frequencies. The values are:
+
+- the constants of the relation's restrictions and join clauses, through ANDs and ORs as deep as
+  the clauses go, that lion's count pushdown reads as `col = c`, `col IN (...)` or `col = ANY
+  (array)` (`lion_analyze_leaf()`, `src/lion_plan_match.c`) for this column: a Const, a Const
+  array, or the Const elements of an `ARRAY[...]`;
+- compared by the index's own equality (`lion_index_equality_op()`), under its collation or a
+  deterministic one where the index's is deterministic too, on the index's key type (or one stored
+  the same way, as `varchar` is under `text`'s class; an enum is under the class of every enum).
+  NULL elements are skipped: `=` takes no rows for them.
+
+**All or none.** Core takes a value outside the list to be no more common than the least common
+value in it, and a listed value of a few rows, or of none, lowers that bound to almost nothing. So
+no constant compared with the column by an equality may be left outside the list: a comparison of
+the column with constants that cannot be taken - a list of more values than the cap, a constant of
+another type (`int4col = 5::bigint` is `int48eq`, not the index's `=`), another collation, an
+expression the executor evaluates and the planner folds to a constant for its estimate (a stable
+function's result) - has the column served without the frequencies, for the whole relation. A
+Param (a generic plan's `$1`, or an InitPlan's) is estimated by `var_eq_non_const()`, whose bound
+is the first entry's frequency, not the last's, and is left as it was, beside the constants of the
+same list: `kind IN (1, 2, $1)` has the frequencies of 1 and 2 and the share of the distinct values
+for `$1`. A custom plan's value is a constant, and gets its frequency. `<>`, `NOT IN` and `IS
+DISTINCT FROM` are not looked up and do not refuse the column: their estimates are one minus the
+equality's.
+
+**The cap.** At most `LION_MCV_MAX_KEYS` distinct values of one column of one relation, 1,000 - the
+longest IN list the count pushdown takes as a literal (`LION_MAX_ARRAY_ELEMS`, §15), past which
+`lion_analyze_leaf()` declines a list. A column whose clauses name more is served as before. The
+bound is on two costs: one descent per value, and core's estimate of each listed value, which walks
+the list once per value with the clause's operator - its time grows with the square of the list.
+Measured on the PostgreSQL 17 packages, best of five, planning `SELECT *` (a count, a join) of the
+test's table: an IN list of 228 values 0.88 ms (1.19, 0.90) with the frequencies, 0.11 ms (0.21,
+0.29) without; of 1,000 values 5.4 ms (9.4, 8.9) against 0.46 ms (1.0, 1.2). Building the row
+takes 0.22 ms of that at 228 values and 1.1 ms at 1,000: the rest is core's walk of the longer
+list.
+
+**The cache.** Both live in the cache of the planner run that serves the count
+(`lion_nd_cache_for()`, forgotten when the run's memory is reset):
+
+- each served row, per relation of the query (its `RelOptInfo`) and column: made the first time the
+  column is asked about - when the relation's size is estimated - and handed out as it is for every
+  estimate after, restrictions, joins and GROUP BY alike, with the same release function that frees
+  nothing; made again when the relation's clauses have changed in number since. A self-join's two
+  scans of the table are two relations with two rows, each with its own values;
+- each value's TIDs, per index, key column and the hash of the value's bytes, with the value to
+  settle a collision (`cache->mcvkeys`, a dynahash in the run's memory): a value is looked up once
+  per planner run however many relations or subqueries name it in that column.
+
+The values are collected and the row merged in a memory context of their own, deleted before the
+hook returns; only the finished row is copied into the run's memory.
+
+**The switch.** `pg_lion.enable_index_mcv` (on; PGC_USERSET), beside
+`pg_lion.enable_index_ndistinct` and independent of it: off, the row is served without the
+frequencies (with the count while that is on); on with the count off, the frequencies go into
+core's row as ANALYZE wrote it. Both off, the hook supplies nothing.
+
+**The probe scope.** The endpoint probe's scope (§28) makes its row through core's
+`examine_variable()`, which comes through this hook: the scope's corrected histogram ends sit in a
+copy of the row served here, frequencies and all, so the two corrections are merged, and the
+scope's row still comes first while it lasts.
+
+**Who may see them.** The frequencies count the rows a row-level policy or a security-barrier view
+would hide, and EXPLAIN shows the estimates they make: they are served only where core's `acl_ok`
+says the user may read every row of the column, as the intersection probe asks too
+(`lion_isect_readable()`). Elsewhere the row is the one served without them.
+
+**What is not done.**
+
+- Expression columns (`get_index_stats_hook`, `lion_index_expr_stats()`): their count is served,
+  not their values' frequencies.
+- A partial lion index (it counts a part of the table), a hypothetical one, a multi-key opclass
+  (its entries are elements, not values) and a user opclass whose `=` is not the type's: the
+  indexes the count is not taken from either.
+- Inheritance trees and partitioned tables, as for the count; each partition is planned with its
+  own index's frequencies.
+- Values of a join: a join clause between two columns names no constant. Core's join estimate
+  reads the row, and so the listed values with their exact frequencies.
+- Dead TIDs count until VACUUM, as for the count.
+- Nothing is stored: `pg_stats` shows ANALYZE's list.
+
+**Tests.** `test/sql/index_mcv.sql`: a table of 30,000 rows in no order, eight values of 1,750 to
+3,500 rows and 3,000 of one to five, analyzed whole at statistics target 3 for the column, so its
+list is three of the heavy values and every number is the same at every run. Each estimate is
+shown with the switch on and off beside the rows the query returns, from `EXPLAIN (FORMAT JSON)`:
+`= c` for a heavy value in the list and out of it, a rare one and an absent one; IN lists mixing
+them, `= ANY` of an array constant and of `ARRAY[...]`, NULL and repeated elements, two lists of
+one column; ORs of equalities, with another column, with ANDs in their arms; the second column of
+the two-column index; a generic plan's Param alone and beside constants, and the custom plan; a
+self-join; the cap at 1,000 and 1,001 values and two lists of 600; a cross-type constant and a
+`<>`; the plan flips (a bitmap scan, `LionCount` under the join to its FK side and with Top K, in
+place of index scans and a sort or a merge join) with the same answers; a partial index and an
+expression index served without them; a role under a row-level policy served without them;
+`varchar` and an enum; and a sampled column whose count is served beside the frequencies. The
+tests around the hook (`ndistinct`, `partition`, the probes', the count's and the FK joins')
+plan as they did.
 
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 
