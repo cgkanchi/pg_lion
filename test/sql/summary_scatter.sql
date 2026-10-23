@@ -176,8 +176,14 @@ SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT count(*) FROM lion_sc_w WHERE r BETWEEN 60000 AND 330000 AND g = 3') s;
 SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r BETWEEN 15000 AND 150000 GROUP BY g') s;
+-- Five groups walk a range over nearly every row at each count, probed at
+-- the group's rows, cheaper than collecting it (DESIGN.md §32, "Walked at
+-- every count"); as an OR's leaf it is never walked, and its union is
+-- NARROWs.
 SELECT s.same, s.probed, s.collected
   FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE r < 588000 GROUP BY g') s;
+SELECT s.same, s.probed, s.collected
+  FROM lion_sc('SELECT g, count(*) FROM lion_sc_w WHERE (r < 588000 OR s = -1) GROUP BY g') s;
 -- At work_mem's floor a range over three quarters of the rows is a NARROW
 -- of width 3 at every one of the 51 keys, some 78 kB, more than the 64 kB a
 -- relation's ranges may collect into: it is not collected but walked at each

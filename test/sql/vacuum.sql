@@ -608,13 +608,20 @@ SELECT lion_cmp('lion_vacwide', 'n IS NULL');
 -- VACUUM's buffer ring.  A VACUUM reads the index through the ring of
 -- buffers VACUUM gives it (vacuum_buffer_usage_limit), as it reads the heap,
 -- and leaves no more of the index in shared buffers than the ring holds.  The
--- build writes the index past the buffer pool, so none of it is there to
--- begin with; deleting one row in ten removes an entry from nearly every leaf
--- and empties none.
+-- build writes its pages through the bulk writer and not through shared
+-- buffers (DESIGN.md §5, step 4), so none of the index is there to begin
+-- with.  Under wal_level = minimal, though, the COMMIT of an index smaller
+-- than wal_skip_threshold WAL-logs it page by page (log_newpage_range()),
+-- which reads every page into shared buffers; with wal_skip_threshold = 0 the
+-- COMMIT syncs the file instead, so the builds here set it, whatever the
+-- cluster's wal_level.  Deleting one row in ten removes an entry from nearly
+-- every leaf and empties none.
 CREATE EXTENSION IF NOT EXISTS pg_buffercache;
 CREATE TABLE lion_vring (i int NOT NULL, k int NOT NULL) WITH (autovacuum_enabled = off);
 INSERT INTO lion_vring SELECT i, i FROM generate_series(1, 200000) i;
+SET wal_skip_threshold = 0;
 CREATE INDEX lion_vring_k ON lion_vring USING lion (k);
+RESET wal_skip_threshold;
 CREATE FUNCTION lion_vring_cached(idx regclass) RETURNS bigint LANGUAGE sql AS $$
 	SELECT count(*) FROM pg_buffercache
 	 WHERE relfilenode = pg_relation_filenode(idx) AND relforknumber = 0
@@ -644,8 +651,10 @@ CREATE TABLE lion_vring2 (i int NOT NULL, k int NOT NULL, g int NOT NULL)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lion_vring2
 	SELECT i, i, abs(hashint4(i)) % 16 FROM generate_series(1, 400000) i;
+SET wal_skip_threshold = 0;
 CREATE INDEX lion_vring2_k ON lion_vring2 USING lion (k);
 CREATE INDEX lion_vring2_g ON lion_vring2 USING lion (g);
+RESET wal_skip_threshold;
 SELECT lion_vring_cached('lion_vring2_k') < 4 AS k_none_cached,
 	   lion_vring_cached('lion_vring2_g') < 4 AS g_none_cached;
 DELETE FROM lion_vring2 WHERE i <= 200000;

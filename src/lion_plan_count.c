@@ -1539,11 +1539,12 @@ lion_where_indexed(LionCountPathBuild *cx, int from)
  *
  * Each copy is as long as the lists are by then, and a WHERE of n
  * restrictions takes n of them, so they are given back as soon as they are
- * done with: the snapshot's once its restriction is answered
- * (lion_count_path_snapshot_free()), the build's own once the snapshot takes
- * their place (lion_count_path_restore()).  Kept, they made the planner's
- * memory grow with the square of the restrictions: 174 MB for 2000 `<>`
- * clauses on one column, where the plan without the pushdown takes 3 MB.
+ * done with: the snapshot's once its restriction is answered, or declines
+ * the query (lion_count_path_snapshot_free()), the build's own once the
+ * snapshot takes their place (lion_count_path_restore()).  Kept, they made
+ * the planner's memory grow with the square of the restrictions: 174 MB for
+ * 2000 `<>` clauses on one column, where the plan without the pushdown takes
+ * 3 MB.
  */
 static void
 lion_count_path_snapshot(const LionCountPathBuild *cx,
@@ -1840,7 +1841,10 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 			if (!lion_cells_shape_ok(root, input_rel, rti,
 									 (Node *) rinfo->clause))
+			{
+				lion_count_path_snapshot_free(&snap);
 				return false;
+			}
 			cellquals = lappend(cx->cellquals, rinfo->clause);
 			lion_count_path_restore(cx, &snap);
 			cx->cellquals = cellquals;
@@ -1876,7 +1880,10 @@ lion_count_path_where(LionCountPathBuild *cx)
 		if (!cx->partitioned ||
 			!lion_implied_everywhere(root, input_rel, input_rel,
 									 (Node *) rinfo->clause))
+		{
+			lion_count_path_snapshot_free(&snap);
 			return false;
+		}
 		{
 			List	   *implied =
 				lappend(cx->impliedtexts,
@@ -3843,11 +3850,13 @@ lion_count_path_anti(LionCountPathBuild *cx)
 		return true;
 	if (cx->partitioned || cx->distvar != NULL ||
 		cx->wattnos != NIL || cx->topkn > 0 || cx->nfilter > 0 ||
-		cx->groupcoal != NULL || cx->ngroup > 2 || p->vcols != NIL)
+		cx->groupcoal != NULL || p->vcols != NIL)
 		return false;
 	if (cx->cells ? (cx->cellplan == NULL || p->ncelldim == 0) :
 		(cx->decode || cx->partialtarget != NULL || p->ngroupn > 0))
 		return false;
+	/* more than two grouping columns are the decoded walk's */
+	Assert(ngroup <= 2);
 	if (cx->cells)
 		rowexprs = cx->cellplan->predexprs;
 	for (g = 0; g < ngroup; g++)
@@ -4385,6 +4394,57 @@ lion_count_ownscan_cost(LionCountPathBuild *cx)
  */
 #define LION_COUNT_OWNSCAN_EDGE		1.02
 
+/*
+ * The anti join over a small inner side (DESIGN.md §27) on the price of the
+ * serial node cpath, whose own work `units` converted: its lookups, the
+ * node's own work, converted as the count is; and its child, core's plan in
+ * core's units, as an FK-side join's dimension is.  Both before the first
+ * row, which comes once every key is looked up.  Returns the lookups'
+ * converted price, which a participant of the parallel form that makes the
+ * run pays too (lion_count_anti_parallel()); 0 without the anti join.
+ */
+static Cost
+lion_count_anti_price(const LionCountPathBuild *cx, const LionUnits *units,
+					  CustomPath *cpath)
+{
+	Path	   *child;
+	Cost		lookups;
+
+	if (cx->anti == NULL)
+		return 0.0;
+	child = cx->anti->innerpath;
+	lookups = lion_units_price(units, cx->antiplan.cost);
+	cpath->path.startup_cost += lookups + child->total_cost;
+	cpath->path.total_cost += lookups + child->total_cost;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = child->disabled_nodes;
+#endif
+	return lookups;
+}
+
+/*
+ * ... and of its parallel form: the child a participant runs
+ * (lion_anti_parallel_child()), where the join's expressions may be
+ * evaluated in a worker and the inner side has one, and into *run the price
+ * of a participant's run - `lookups`, the lookups converted, and that
+ * child's price.  NULL, and *run 0, when there is none.
+ */
+static Path *
+lion_count_anti_parallel(const LionCountPathBuild *cx, Cost lookups,
+						 Cost *run)
+{
+	Path	   *child;
+
+	*run = 0.0;
+	if (cx->anti == NULL ||
+		!is_parallel_safe(cx->root, (Node *) cx->priv.anti.exprs))
+		return NULL;
+	child = lion_anti_parallel_child(cx->anti->innerrel);
+	if (child != NULL)
+		*run = lookups + child->total_cost;
+	return child;
+}
+
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 {
@@ -4397,8 +4457,9 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionWalkSave walksave = {0};	/* ... and what walking them would
 									 * save */
 	Cost		serialrun;		/* the serial node's price, without HAVING */
-	Cost		antilookups = 0.0;	/* the anti join's lookups (§27) */
-	Path	   *antichild = NULL;	/* ... a parallel count's child */
+	Cost		antilookups;	/* the anti join's lookups (§27) */
+	Cost		antirun;		/* ... and a participant's run of them */
+	Path	   *antichild;		/* ... and the child it runs */
 	LionUnits	units;			/* the competitor's (§39) */
 
 	lion_units_for(root, output_rel, &units);
@@ -4441,17 +4502,19 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	}
 
 	/*
-	 * A range taken as a source too large for the memory (DESIGN.md §32,
-	 * "Too large to collect") is collected in windows into a temporary file,
-	 * or walked at every count it is part of: the first is what the price
-	 * takes, and the second is cheaper where there are few counts - one
-	 * count, a few groups - which the plan then says (LION_FLAG_RANGEWALK),
-	 * for all of the node's ranges at once, naming the clauses of those it
-	 * priced walked (LION_CLAUSE_WALK): only they are walked, where they do
-	 * not fit.  Not beside the decoded walk, whose WHERE is one copy, nor
-	 * the top k, whose price leaves it out, nor where the aggregates over
-	 * entries are all the node prices.
+	 * A range taken as a source (DESIGN.md §32) is collected - past the
+	 * memory in windows into a temporary file - or walked at every count it
+	 * is part of: the first is what the price takes, and the second is
+	 * cheaper where there are few counts - one count, a few groups, the
+	 * existence tests of a count(DISTINCT) - which the plan then says
+	 * (LION_FLAG_RANGEWALK), for all of the node's ranges at once, naming
+	 * the clauses of those it priced walked (LION_CLAUSE_WALK,
+	 * lion_walk_save_choose()): only they are walked.  Not beside the
+	 * decoded walk, whose WHERE is one copy, nor the top k, whose price
+	 * leaves it out, nor where the aggregates over entries are all the node
+	 * prices.
 	 */
+	lion_walk_save_choose(&walksave);
 	if (walksave.save > 0 && !cx->decode && cx->topkn == 0 &&
 		(cx->wattnos == NIL || cx->wcounts))
 	{
@@ -4502,23 +4565,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	rangeprice.whole = lion_units_price(&units, rangeprice.whole);
 	serialrun = cpath->path.total_cost;
 
-	/*
-	 * The anti join over a small inner side (DESIGN.md §27): its lookups, the
-	 * node's own work, converted as the count is; and its child, core's plan
-	 * in core's units, as an FK-side join's dimension is.  Both before the
-	 * first row, which comes once every key is looked up.
-	 */
-	if (cx->anti != NULL)
-	{
-		Path	   *child = cx->anti->innerpath;
-
-		antilookups = lion_units_price(&units, cx->antiplan.cost);
-		cpath->path.startup_cost += antilookups + child->total_cost;
-		cpath->path.total_cost += antilookups + child->total_cost;
-#if PG_VERSION_NUM >= 180000
-		cpath->path.disabled_nodes = child->disabled_nodes;
-#endif
-	}
+	/* the anti join over a small inner side (DESIGN.md §27) */
+	antilookups = lion_count_anti_price(cx, &units, cpath);
 
 	/*
 	 * The HAVING the node applies itself costs an evaluation per group and
@@ -4635,9 +4683,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * anti join over a small inner side is one, its child and its lookups
 	 * the work of one participant (§27), when both may run in a worker.
 	 */
-	if (cx->anti != NULL &&
-		is_parallel_safe(root, (Node *) cx->priv.anti.exprs))
-		antichild = lion_anti_parallel_child(cx->anti->innerrel);
+	antichild = lion_count_anti_parallel(cx, antilookups, &antirun);
 	if (cx->ngroup == 0 && !cx->singlegroup && !cx->partitioned &&
 		cx->fj == NULL && cx->distvar == NULL && cx->wattnos == NIL &&
 		cx->topkn == 0 && !cx->decode && cx->groupcoal == NULL &&
@@ -4648,10 +4694,7 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		!RecoveryInProgress())
 		lion_add_parallel_count_path(root, input_rel, output_rel, cpath,
 									 serialrun, &rangeprice, cx->having,
-									 antichild,
-									 (antichild != NULL) ?
-									 antilookups + antichild->total_cost :
-									 0.0);
+									 antichild, antirun);
 
 	add_path(output_rel, &cpath->path);
 }
@@ -4834,7 +4877,19 @@ lion_count_cells_strategy(LionCountPathBuild *cx)
  * again (perrange), plus a cpu_tuple_cost a partial row.  Beside the anti
  * join over a small inner side (§27) every participant runs `child` and
  * looks its keys up, taking away the rows of the ranges it counts: `once`,
- * their price, is each participant's whole, before its first row.
+ * their price, is each participant's whole, before its first row - and as
+ * many runs of it as there are participants, at the pace of the divisor's,
+ * where that is more: a leader that takes part makes the run as a worker
+ * does, though the divisor counts it as a part of one.  The runs are one
+ * participant's work repeated, not shared out: they compete for the cores
+ * the count's share is divided among, and a worker that starts late still
+ * makes its whole run before it finds whether a range is left to count,
+ * which the Gather waits for.  Measured (2026-10-23, release build, 3M rows
+ * in 40,000 pages, 2,000 to 20,000 keys of three rows each, a box other work
+ * kept busy), every participant's run made the parallel form 1.3 to 2.5
+ * times the serial node's time, where without the anti join the two were
+ * even or the parallel form faster: with its share of the count small
+ * against the run, the serial node is the safer plan.
  */
 static void
 lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
@@ -4866,6 +4921,8 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
 												  cx->cellwhererows /
 												  (workers + 1)));
 	rows = clamp_row_est(totalrows / divisor);
+	once *= Max((workers + (parallel_leader_participation ? 1.0 : 0.0)) /
+				divisor, 1.0);
 
 	cpath = makeNode(CustomPath);
 	cpath->path.pathtype = T_CustomScan;
@@ -4925,8 +4982,9 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	LionUnits	units;
 	Cost		perrange = 0;
 	Cost		serialrun;
-	Cost		antilookups = 0.0;
-	Path	   *antichild = NULL;
+	Cost		antilookups;
+	Cost		antirun;
+	Path	   *antichild;
 
 	lion_units_for(root, output_rel, &units);
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
@@ -4949,17 +5007,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	cpath->path.total_cost = lion_units_price(&units, cpath->path.total_cost);
 	perrange = lion_units_price(&units, perrange);
 	serialrun = cpath->path.total_cost;
-	if (cx->anti != NULL)
-	{
-		Path	   *child = cx->anti->innerpath;
-
-		antilookups = lion_units_price(&units, cx->antiplan.cost);
-		cpath->path.startup_cost += antilookups + child->total_cost;
-		cpath->path.total_cost += antilookups + child->total_cost;
-#if PG_VERSION_NUM >= 180000
-		cpath->path.disabled_nodes = child->disabled_nodes;
-#endif
-	}
+	antilookups = lion_count_anti_price(cx, &units, cpath);
 
 	/* answered from the indexes alone: core's index-only switches apply */
 	lion_path_core_switches(&cpath->path, LION_CORE_INDEXONLY);
@@ -4973,9 +5021,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * range taken as a source, or none at all; and the anti join's child a
 	 * path a worker may run, its clauses ones it may evaluate.
 	 */
-	if (cx->anti != NULL &&
-		is_parallel_safe(root, (Node *) cx->priv.anti.exprs))
-		antichild = lion_anti_parallel_child(cx->anti->innerrel);
+	antichild = lion_count_anti_parallel(cx, antilookups, &antirun);
 	if (((cx->plainpositive && !cx->hasrangesrc) || cx->wherekinds == NIL) &&
 		rel->consider_parallel && output_rel->consider_parallel &&
 		is_parallel_safe(root, (Node *) cx->priv.consts) &&
@@ -4984,10 +5030,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 		is_parallel_safe(root, (Node *) cpath->path.pathtarget->exprs) &&
 		(cx->anti == NULL || antichild != NULL))
 		lion_add_parallel_cells_path(cx, cpath, serialrun, perrange,
-									 &agg_final_costs, antichild,
-									 (antichild != NULL) ?
-									 antilookups + antichild->total_cost :
-									 0.0);
+									 &agg_final_costs, antichild, antirun);
 
 	add_path(output_rel, (Path *)
 			 create_agg_path(root, output_rel, &cpath->path,
