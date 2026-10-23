@@ -813,8 +813,11 @@ working around a bad choice:
   never where the column's `n_distinct` has been set by hand. `pg_stats` still shows ANALYZE's
   number.
 - `pg_lion.enable_index_mcv`: give the planner the exact frequency of each value a query compares a
-  column with - `col = c`, `col IN (...)`, `col = ANY (array)`, also as the arms of an `OR` - from a
-  Lion index on it: the rows of the value's entry, or none for a value the index does not have,
+  column with from a Lion index on it. The values are the constants of every `col = c`, `col IN
+  (...)` and `col = ANY (array)` on the column (of an `ARRAY[...]`, its constant elements) in the
+  table's `WHERE` conditions and in the join conditions that mention the table, whether such a
+  comparison stands alone or inside `AND`s and `OR`s nested to any depth. Each gets the rows of
+  its entry in the index, or none for a value the index does not have,
   added to ANALYZE's most common values (or put in place of the sampled frequency of one it has)
   for that query's plan (DESIGN.md §33, "The frequencies of the listed values"). Without it, the
   planner estimates a value ANALYZE did not list as an equal share of the rest of the rows, which

@@ -312,6 +312,28 @@ SELECT est_on, actual
 RESET pg_lion.enable_index_ndistinct;
 DROP TABLE accounts;
 
+-- ---------- 13. dead row versions ----------
+-- The index counts a value's dead row versions until VACUUM.  Where the
+-- list's frequencies then add up to more than the table's rows, they are
+-- scaled down to fit: past all of the rows, core takes the values of an IN
+-- list to be independent of each other, and a list of every value of the
+-- column would come out at about two thirds of the rows.  Eight values of
+-- 1,750 rows each, which ANALYZE puts at an eighth each; a fifth of the rows
+-- then updated, so that each value's entry has 2,100 TIDs, of which 350 are
+-- dead.  The whole list is the table's rows; a shorter one still counts its
+-- values' dead versions, less what the scaling takes off, until VACUUM.
+CREATE TABLE versions (id int NOT NULL, k int NOT NULL)
+	WITH (autovacuum_enabled = off, fillfactor = 70);
+INSERT INTO versions SELECT i, i % 8 FROM generate_series(1, 14000) i;
+CREATE INDEX versions_k ON versions USING lion (k);
+VACUUM ANALYZE versions;
+-- a new version of a fifth of the rows, each beside the old one on its page
+UPDATE versions SET k = (k + 1) % 8 WHERE id % 5 = 0;
+SELECT q, s.*
+  FROM (VALUES ('k IN (0, 1, 2, 3, 4, 5, 6, 7)'), ('k IN (0, 1)'), ('k = 3')) v(q),
+	   LATERAL mcv_show('SELECT * FROM versions WHERE ' || q) s;
+DROP TABLE versions;
+
 DROP TABLE events, owners;
 DROP FUNCTION mcv_list(int, int);
 DROP FUNCTION mcv_show(text);

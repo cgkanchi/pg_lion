@@ -5120,9 +5120,10 @@ lion_nd_core_lookup(PlannerInfo *root, Node *node, int varRelid,
  *
  * A lion index on the column knows each of those values' rows: its entry's
  * header counts them (lion_key_ntids(), one descent).  So the row the column
- * is served with carries every value the relation's clauses compare it with
- * by the index's equality - `col = c`, `col IN (...)`, `col = ANY (array)`,
- * also as the arms of an OR - among its most common values, with the entry's
+ * is served with carries every value the relation's clauses - restrictions
+ * and join clauses, at their top level or in ANDs and ORs nested to any
+ * depth - compare it with by the index's equality, `col = c`, `col IN (...)`
+ * or `col = ANY (array)`, among its most common values, with the entry's
  * TIDs over the relation's rows as its frequency, 0 for a value without an
  * entry.  A value ANALYZE's list has already gets the exact frequency in place
  * of the sampled one; the rest of that list, the histogram, every other slot
@@ -5664,6 +5665,8 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 	int			n;
 	int			i;
 	int			j;
+	double		limit;
+	int			pass;
 	Relation	sd;
 	int			cols[5];
 	Datum		repl[5];
@@ -5749,6 +5752,32 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 			n++;
 		}
 	}
+
+	/*
+	 * The values' frequencies and the NULLs' are shares of the same rows, and
+	 * core counts on their adding up to no more than all of them: past it, it
+	 * takes the values of an IN list to be independent of each other rather
+	 * than exclusive (scalararraysel()), and a list of every value of the
+	 * column comes out at two thirds of the rows.  An entry's TIDs count its
+	 * dead row versions until VACUUM, and ANALYZE's other entries are a
+	 * sample's: where the list adds up to more than the rows that are not
+	 * NULL, every entry is scaled down by the same factor to fit - a little
+	 * under, as the sum core makes of the float4 frequencies may round up.
+	 */
+	limit = 1.0 - stats->stanullfrac;
+	for (pass = 0; pass < 3; pass++)
+	{
+		double		sum = 0;
+		double		scale;
+
+		for (i = 0; i < n; i++)
+			sum += ent[i].freq;
+		if (sum <= limit)
+			break;
+		scale = Max(limit, 0.0) / sum * (1.0 - 1e-6 * (pass + 1));
+		for (i = 0; i < n; i++)
+			ent[i].freq = (float4) (ent[i].freq * scale);
+	}
 	qsort(ent, n, sizeof(LionMcvEntry), lion_mcv_entry_cmp);
 
 	values = (Datum *) palloc(sizeof(Datum) * n);
@@ -5800,7 +5829,11 @@ lion_mcv_stats(PlannerInfo *root, LionNdistinctCache *cache, RelOptInfo *rel,
 	HeapTuple	result = NULL;
 	ListCell   *lc;
 
-	if (rel->tuples < 1.0)
+	/*
+	 * No lion index may be read while PostgreSQL 16's old_snapshot_threshold
+	 * is set (DESIGN.md §9): the column is served without the frequencies.
+	 */
+	if (rel->tuples < 1.0 || lion_old_snapshot_threshold_active())
 		return NULL;
 
 	memset(&mc, 0, sizeof(mc));
