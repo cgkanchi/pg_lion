@@ -80,6 +80,7 @@ DECLARE
 	ln text;
 	r record;
 	used boolean := false;
+	keys text := '';
 	a text[] := '{}';
 	b text[] := '{}';
 BEGIN
@@ -87,6 +88,9 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
 			used := true;
+		END IF;
+		IF ln ~ '^\s*Key Sets: ' THEN
+			keys := format(' (key sets: %s)', regexp_replace(ln, '^\s*Key Sets: ', ''));
 		END IF;
 	END LOOP;
 	FOR r IN EXECUTE q LOOP
@@ -106,7 +110,7 @@ BEGIN
 					  a[1], b[1]);
 	END IF;
 	RETURN format('%s, %s rows',
-				  CASE WHEN used THEN 'LionOrderedJoin' ELSE 'no LionOrderedJoin' END,
+				  CASE WHEN used THEN 'LionOrderedJoin' || keys ELSE 'no LionOrderedJoin' END,
 				  coalesce(array_length(a, 1), 0));
 END $$;
 
@@ -270,9 +274,85 @@ SELECT * FROM oj_run('SELECT v.l, s.* FROM (VALUES (3), (40), (40), (3)) v(l),
 			 WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = v.l AND d.flag
 			 ORDER BY f.score DESC NULLS LAST, f.id LIMIT 5) s');
 
--- 9. What it declines, for core to plan: a join on more than the key, a
---    key that is not unique, rows locked, no lion clause on either side,
---    and the setting off.
+-- 9. Key sets: a table that only filters the join's key - by IN or EXISTS,
+--    or by an inner join on a unique column of it with nothing of it wanted -
+--    is read into a hash set of its keys before the walk, and each fact row's
+--    key is tested against the sets before the dimension's btree is
+--    descended.  fltn's keys repeat, each three times.
+CREATE TABLE fltn (k int NOT NULL);
+INSERT INTO fltn SELECT (i % 3000) * 3 + 1 FROM generate_series(1, 9000) i;
+VACUUM (FREEZE, ANALYZE) fltn;
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 10 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3) AND d.pk IN (SELECT k FROM fltn)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x = 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	JOIN flt x ON x.pk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag AND x.x = 2
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl = 3 AND f.fk IN (SELECT pk FROM flt WHERE x = 1)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- ... an empty key set, which ends the scan before the walk starts.
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x = 99)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- ... a key set whose plan depends on an outer row's value: rebuilt for each
+--     value, while the dimension's set, which does not depend on it, is
+--     built once.
+SELECT oj('SELECT v.l, s.* FROM (VALUES (1), (2), (2), (1)) v(l),
+	LATERAL (SELECT f.id, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+			 WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+			   AND f.fk IN (SELECT pk FROM flt WHERE x = v.l)
+			 ORDER BY f.score DESC NULLS LAST, f.id LIMIT 5) s');
+SELECT * FROM oj_run('SELECT v.l, s.* FROM (VALUES (1), (2), (2), (1)) v(l),
+	LATERAL (SELECT f.id, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+			 WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+			   AND f.fk IN (SELECT pk FROM flt WHERE x = v.l)
+			 ORDER BY f.score DESC NULLS LAST, f.id LIMIT 5) s');
+
+-- ... a semi join's keys repeated, held once each; and what is not a key
+--     set: an inner join to a column that is not unique, which repeats the
+--     rows; a table a column of which the query wants; a NOT EXISTS, which
+--     stays an anti join above the node; and keys that would not fit in
+--     work_mem.
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 10 AND d.flag
+	  AND f.fk IN (SELECT k FROM fltn)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	JOIN fltn n ON n.k = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 10 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, x.x FROM fact f JOIN dim d ON f.fk = d.pk
+	JOIN flt x ON x.pk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag AND x.x = 2
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND NOT EXISTS (SELECT 1 FROM flt x WHERE x.pk = f.fk AND x.x = 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SET work_mem = '64kB';
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 9)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET work_mem;
+
+-- 10. What it declines, for core to plan: a join on more than the key, a
+--     key that is not unique, rows locked, no lion clause on either side,
+--     and the setting off.
 SELECT oj('SELECT f.id, d.pk FROM fact f JOIN dim d ON f.fk = d.pk AND f.ver < d.kind
 	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
@@ -294,4 +374,4 @@ RESET pg_lion.enable_ordered_join;
 DROP FUNCTION oj(text, text);
 DROP FUNCTION oj_plan(text);
 DROP FUNCTION oj_run(text);
-DROP TABLE fact, dim, flt;
+DROP TABLE fact, dim, flt, fltn;

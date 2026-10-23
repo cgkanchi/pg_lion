@@ -298,7 +298,7 @@ lion_fkjoin_member_ok(PlannerInfo *root, int relid)
  * comes first decides its operator between two types (`int48eq` or
  * `int84eq`).
  */
-static List *
+List *
 lion_fkjoin_pair_clauses(PlannerInfo *root, RelOptInfo *a, RelOptInfo *b)
 {
 	Relids		pair = bms_union(a->relids, b->relids);
