@@ -22895,12 +22895,12 @@ lion_plan_units.c):
 - **the path is priced with both added** (`lion_units_cold()`): (own x rate + its cold reads) over
   (the loop's cost + the loop's cold reads), of the loop's cost - a factor of the rate, each path
   of the relation with its own reads. It is at most 1, so a path that reads more than the loop
-  keeps its price, and at least 1 / `pg_lion.cold_max_discount`, 1.5 by default ("The cap"
+  keeps its price, and at least 1 / `pg_lion.cold_max_discount`, 2 by default ("The cap"
   below).
 
 The floor is what this costs warm. With the inner table's working set in the cache the loop runs at
 core's price, and a lion path chosen over it can take up to `pg_lion.cold_max_discount` times its
-time (1.5 by default). Nothing changes where the tables and the index fit in `effective_cache_size`,
+time (2 by default). Nothing changes where the tables and the index fit in `effective_cache_size`,
 which every table of the regression suite does but `fkjoin_cold.sql`'s, nor against any other kind
 of plan. Not counted: the probes a semi join stops early, which the loop's reads overstate; a
 Memoize over the inner scan, which takes no charge; the count paths other than the FK-side join's,
@@ -22974,11 +22974,11 @@ clauses; and the FK-side join, where its competitor is a hash join over a bitmap
 than a loop. Not a walk in heap mode, which fetches each member's tuple as it meets it, a
 synchronous read the stream's price would under-charge, nor §40.10's probes.
 
-**The cap** (`pg_lion.cold_max_discount`, 1.5 by default, 1 to 10) is `LION_COLD_MAX_DISCOUNT`
-made a setting, the loop's and the bitmap's alike. It is the warm floor: where the cache holds what
-both plans read after all - `effective_cache_size` set below the real cache, a hot working set - a
-lion path chosen for those reads can take up to the cap times its competitor's time. The measured
-case:
+**The cap** (`pg_lion.cold_max_discount`, 2 by default, 1 to 10) is `LION_COLD_MAX_DISCOUNT`, which
+was 1.5, made a setting, the loop's and the bitmap's alike. It is the warm floor: where the cache
+holds what both plans read after all - `effective_cache_size` set below the real cache, a hot
+working set - a lion path chosen for those reads can take up to the cap times its competitor's
+time. The measured case:
 
 | | the walk | the bitmap heap scan |
 |---|---|---|
@@ -22994,12 +22994,12 @@ priced at 733k and loses; at 1.82 it ties within `add_path()`'s fuzz; at 2 it is
 and wins by 9%; at 2.5, at 440k. The model's own ratio, 2.9M against 1.46M, is 2.0 against the
 measured 2.2.
 
-**Recommended: 2.** It is the smallest round cap that takes the measured case with room past the
-fuzz, and what it costs is bounded: only where `effective_cache_size` says the tables do not fit,
-and there a third more than 1.5's worst case where they do after all - twice the competitor's time
-where 1.5 allowed one and a half. A cap past 2 changes nothing in that case, and lets a path priced
-2.5 times core's through on the model's say alone. The default stays 1.5 until it is decided
-(Chinmay decides).
+**The default is 2**, Chinmay's choice after the measured cold and warm comparison (1.5 was
+proposed, 2 recommended). It is the smallest round cap that takes the measured case with room past
+the fuzz, and what it costs is bounded: only where `effective_cache_size` says the tables do not
+fit, and there a third more than 1.5's worst case where they do after all - twice the competitor's
+time where 1.5 allowed one and a half. A cap past 2 changes nothing in that case, and lets a path
+priced 2.5 times core's through on the model's say alone.
 
 Nothing changes where the tables and the indexes fit in `effective_cache_size`, and nothing
 against a sequential scan, an index scan or an index-only scan. Not done:

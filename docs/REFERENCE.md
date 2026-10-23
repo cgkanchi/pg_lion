@@ -943,7 +943,7 @@ the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's
 same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
 and Lion's switches leave theirs out, whatever the margin or price.
 
-`pg_lion.cold_max_discount` (1.5; 1 to 10): the most the uncached reads of a competing plan may
+`pg_lion.cold_max_discount` (2; 1 to 10): the most the uncached reads of a competing plan may
 divide a Lion custom path's price by, where the query's tables do not fit in
 `effective_cache_size` - a nested loop's against an FK-side join (`cold_page_cost`), a bitmap heap
 scan's against a covering walk, a count or an FK-side join (`cold_stream_page_cost`), each with the

@@ -337,7 +337,7 @@ lion_costs_init(void)
 							 "Sets the most a competing plan's uncached reads may divide a lion custom path's price by.",
 							 "A lion path priced against a nested loop or a bitmap heap scan that reads tables larger than effective_cache_size takes both plans' uncached reads into its price, down to its own price over this (DESIGN.md §39); 1 takes nothing off.",
 							 &lion_cold_max_discount,
-							 1.5,
+							 2.0,
 							 1.0, 10.0,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
