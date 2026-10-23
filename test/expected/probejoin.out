@@ -879,6 +879,58 @@ SELECT pj($$SELECT c.active, count(*) FROM pj_orders o JOIN pj_customers c ON o.
  no probe join, 3 rows
 (1 row)
 
+-- a clause lion answers only through a range core derives from it: a LIKE
+-- over a column of "C" collation is the range of its prefix, a lossy index
+-- clause, and the range's set holds rows the pattern rejects (`k1...` not
+-- ending in 7).  The node declines it, alone or beside an exact clause; the
+-- same range written out is the clause itself, and the node takes it.
+CREATE TABLE pj_codes (
+	id int PRIMARY KEY,
+	code text COLLATE "C" NOT NULL,	-- lion: 'k1' .. 'k6000'
+	kind int NOT NULL				-- lion: 0 to 3
+) WITH (autovacuum_enabled = off);
+INSERT INTO pj_codes SELECT i, 'k' || i, i % 4 FROM generate_series(1, 6000) i;
+CREATE INDEX pj_codes_code ON pj_codes USING lion (code);
+CREATE INDEX pj_codes_kind ON pj_codes USING lion (kind);
+VACUUM (FREEZE, ANALYZE) pj_codes;
+SELECT pj($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN pj_codes d ON o.customer_id = d.id
+			 WHERE d.code LIKE 'k1%7' GROUP BY 1$$);
+          pj           
+-----------------------
+ no probe join, 2 rows
+(1 row)
+
+SELECT * FROM pj_val($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN pj_codes d ON o.customer_id = d.id
+						WHERE d.code LIKE 'k1%7' GROUP BY 1$$);
+ pj_val  
+---------
+ (f,261)
+ (t,261)
+(2 rows)
+
+SELECT pj($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN pj_codes d ON o.customer_id = d.id
+			 WHERE d.kind <> 0 AND d.code LIKE 'k2%' GROUP BY 1$$);
+          pj           
+-----------------------
+ no probe join, 2 rows
+(1 row)
+
+SELECT pj($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN pj_codes d ON o.customer_id = d.id
+			 WHERE d.code >= 'k1' AND d.code < 'k2' GROUP BY 1$$);
+         pj         
+--------------------
+ probe join, 2 rows
+(1 row)
+
+SELECT * FROM pj_val($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN pj_codes d ON o.customer_id = d.id
+						WHERE d.code >= 'k1' AND d.code < 'k2' GROUP BY 1$$);
+  pj_val  
+----------
+ (f,3984)
+ (t,1340)
+(2 rows)
+
+DROP TABLE pj_codes;
 -- a predicate no posting set decides
 SELECT pj($$SELECT c.tier >= 4 AS high, count(*) FROM pj_orders o JOIN pj_customers c ON o.customer_id = c.id
 			 GROUP BY 1$$);

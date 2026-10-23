@@ -7756,13 +7756,31 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
  * --------------------------------------------------------------------- */
 
 /*
+ * Whether a lion access answers the clauses its qual names exactly: none of
+ * its index clauses lossy.  A lossy one - the range core derives from a
+ * LIKE prefix, `code >= 'k1' AND code < 'k2'` for `code LIKE 'k1%7'` -
+ * still names the original clause, which lo_residual() then counts as
+ * answered, while the set its leaf builds holds every row of the range and
+ * says it is exact; the probe would count rows the clause rejects, with no
+ * recheck to stop it (2026-10-23 review).  A probe declines such an access.
+ */
+static bool
+lo_where_exact(Path *cand, List **rinfos, List **qual)
+{
+	bool		lossy = false;
+
+	*qual = lo_lion_qual(cand, rinfos, &lossy);
+	return !lossy;
+}
+
+/*
  * A BitmapAnd that answers every restriction clause of rel when no access
  * core builds does: core's choice of an AND (choose_bitmap_and()) leaves out
  * a leaf that selects too little to pay for its lookups in a bitmap scan -
  * `active` of two rows in three - where the probe's set must answer it all
  * the same, or read the heap for it.  Each clause the leaves before it do
- * not answer gets the cheapest access core builds for it alone; NULL when a
- * clause has none.
+ * not answer gets the cheapest exact access core builds for it alone
+ * (lo_where_exact()); NULL when a clause has none.
  */
 static Path *
 lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
@@ -7772,7 +7790,6 @@ lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
 	List	   *rinfos = NIL;
 	List	   *quals = NIL;
 	List	   *andrinfos = NIL;
-	bool		lossy = false;
 	Path	   *and;
 	ListCell   *lc;
 
@@ -7796,11 +7813,12 @@ lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
 		{
 			Path	   *cand = (Path *) lfirst(lc2);
 			List	   *crinfos = NIL;
-			List	   *cqual = lo_lion_qual(cand, &crinfos, &lossy);
+			List	   *cqual;
 			Cost		cost;
 			Selectivity sel;
 
-			if (lo_residual(list_make1(rinfo), NIL, crinfos, cqual) != NIL)
+			if (!lo_where_exact(cand, &crinfos, &cqual) ||
+				lo_residual(list_make1(rinfo), NIL, crinfos, cqual) != NIL)
 				continue;
 			cost_bitmap_tree_node(cand, &cost, &sel);
 			if (best == NULL || cost < bestcost)
@@ -7821,8 +7839,8 @@ lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
 		return NULL;
 	and = (list_length(parts) == 1) ? (Path *) linitial(parts) :
 		(Path *) create_bitmap_and_path(root, rel, parts);
-	quals = lo_lion_qual(and, &andrinfos, &lossy);
-	if (lo_residual(rel->baserestrictinfo, NIL, andrinfos, quals) != NIL)
+	if (!lo_where_exact(and, &andrinfos, &quals) ||
+		lo_residual(rel->baserestrictinfo, NIL, andrinfos, quals) != NIL)
 		return NULL;
 	*qual = quals;
 	return and;
@@ -7831,10 +7849,11 @@ lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
 /*
  * The lion access that answers every restriction clause of rel - the
  * cheapest of those core builds over its lion indexes (lo_lion_accesses()),
- * with nothing left to a filter (lo_residual()) - into *lion, and its
- * original qual into *lionqual, as a recheck evaluates it.  False when no
- * access answers them all; true with *lion NULL when rel has no restriction
- * clause.  The caller has checked the relation (§46, "What qualifies").
+ * none of its index clauses lossy (lo_where_exact()), with nothing left to
+ * a filter (lo_residual()) - into *lion, and its original qual into
+ * *lionqual, as a recheck evaluates it.  False when no access answers them
+ * all; true with *lion NULL when rel has no restriction clause.  The
+ * caller has checked the relation (§46, "What qualifies").
  */
 bool
 lion_ordered_where_access(PlannerInfo *root, RelOptInfo *rel, Path **lion,
@@ -7869,12 +7888,12 @@ lion_ordered_where_access(PlannerInfo *root, RelOptInfo *rel, Path **lion,
 	{
 		Path	   *cand = (Path *) lfirst(lc);
 		List	   *rinfos = NIL;
-		bool		lossy = false;
-		List	   *qual = lo_lion_qual(cand, &rinfos, &lossy);
+		List	   *qual;
 		Cost		cost;
 		Selectivity sel;
 
-		if (lo_residual(rel->baserestrictinfo, NIL, rinfos, qual) != NIL)
+		if (!lo_where_exact(cand, &rinfos, &qual) ||
+			lo_residual(rel->baserestrictinfo, NIL, rinfos, qual) != NIL)
 			continue;
 		cost_bitmap_tree_node(cand, &cost, &sel);
 		if (best == NULL || cost < bestcost)

@@ -27940,7 +27940,13 @@ map does not call all-visible. The group keys are computed above the node from t
   leaves before it do not answer takes the cheapest access core builds for that clause alone. The
   set is built as §30.4 builds a walk's (`lo_build_node()`), exact or not: an inexact one - a
   condition lion can only bound - is rechecked on the heap tuple, fetched for that, with the
-  original qual (`Rows Removed by Lion Recheck`).
+  original qual (`Rows Removed by Lion Recheck`). An access with a lossy index clause is not a
+  candidate, in either path (`lo_where_exact()`): the range core derives from a LIKE prefix over a
+  column of "C" collation (`code LIKE 'k1%7'` as `code >= 'k1' AND code < 'k2'`) still names the
+  original clause, so `lo_residual()` counts it answered, while the range's set holds rows the
+  pattern rejects and calls itself exact - nothing would recheck them, and the node counted them
+  (2026-10-23 review). Every LIKE is lossy in core, an exact pattern too, so a LIKE on the dimension
+  leaves the node unoffered; the range written out is the clause itself, and the node takes it.
 - **The labels** (`pj_labels()`). §10's analysis gives each column the predicates read its
   OUTCOMES - a scalar column's values grouped by the truths they give every predicate, outcome 0
   any other value's, and NULL's; a multi-key column's leaves true of a row as bits, and NULL past
@@ -28091,7 +28097,9 @@ HashAggregate, Gather, Partial HashAggregate, the node over a Parallel Seq Scan 
 whole); the plan chosen on price with nothing disabled, an 80,000-row dimension of wide rows
 under 3,000 fact rows; and the node not offered - a dimension column grouped by, under a THEN, in
 an aggregate; a predicate of a column with no lion index, or one no posting set decides
-(`tier >= 4`), or of both tables; a WHERE no lion index answers; a LEFT JOIN; a join on a
+(`tier >= 4`), or of both tables; a WHERE no lion index answers; a LIKE lion answers only by its
+prefix's range, alone or beside an exact clause, against the range written out, which the node
+takes; a LEFT JOIN; a join on a
 column with no unique index; no set to build; the switch off. EXPLAIN is printed with its
 counters where a run leaves them the same and as `> 0` where an earlier run's killed index entries
 change them.
