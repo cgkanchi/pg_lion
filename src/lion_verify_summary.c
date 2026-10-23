@@ -55,6 +55,21 @@
  * the other, and that row is one no snapshot can see, and the next VACUUM
  * removes it from both.
  *
+ * A standby has no statements of its own writing the index to wait for:
+ * replay applies the primary's, one record at a time, and an INSERT the
+ * primary is between the two steps of is one replay is between them too, for
+ * as long as the primary takes - a check can look at the row any number of
+ * times there.  But its transaction is in progress, as the standby knows from
+ * the WAL (HeapTupleSatisfiesVacuum() asks the known-assigned transaction
+ * ids), and a transaction's commit record comes after every record of its
+ * statements, so a row whose insert has committed has both of its steps
+ * replayed.  So on a standby the candidates are looked at before the second
+ * look, and one whose row's transaction is still in progress is settled
+ * there: it may be between its steps.  Every other candidate is looked for
+ * again, as on a primary, and is damage when it is still missing and its row
+ * is not DEAD - its insert committed before the second look began, or
+ * aborted, which makes it DEAD.
+ *
  * The OPEN bucket is read when the walk reaches it: its key and its summary as
  * they are then, and every key the walk finds above that key belongs to a row
  * that ARRIVED while the check ran - an append - and is no candidate.  So does
@@ -535,7 +550,10 @@ lion_verify_row_state(LionVerifyState *vs, uint64 code)
  * The first summary of the column whose key is above lo - its first summary
  * when lo is NULL - as it is now, which is the summary of the bucket whose
  * lower bound is lo: middle buckets never split, and VACUUM, the one thing
- * that deletes a summary, waits for the check.  A descent to (SUMMARY, lo)
+ * that deletes a summary, waits for the check - on a primary.  On a standby
+ * its replay can delete one beside the check, and only one whose every row
+ * VACUUM took out: a row whose bucket it was is DEAD, which no candidate
+ * whose row is not is (lion_verify_settle()).  A descent to (SUMMARY, lo)
  * lands on the summary keyed lo, and the walk steps past it.  Returns false
  * when the column has no summary there; otherwise *ps is its set, located as
  * a count's is (the caller releases it), *keyp a copy of its key and
@@ -813,6 +831,18 @@ lion_verify_settle(LionVerifySumState *ss)
 	{
 		lion_verify_wait_for_writers(vs);
 		vs->nwaits++;
+	}
+	else
+	{
+		/* a standby's: rows of transactions in progress (above) */
+		for (i = 0; i < ss->ncands; i++)
+		{
+			LionVerifySumCand *c = &ss->cands[i];
+
+			CHECK_FOR_INTERRUPTS();
+			if (lion_verify_row_state(vs, c->code) == LION_VERIFY_ROW_INSERTING)
+				c->settled = true;
+		}
 	}
 
 	/*

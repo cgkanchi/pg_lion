@@ -300,10 +300,37 @@ check began, from the first leaf: the entry's header - TIDs, containers,
 leaves - is as it was, and a walk that read the first leaf before the VACUUM
 and the second after the insert counts one TID more than the entry. The
 check, released once the standby has caught up, must pass, and its DEBUG
-line must show the first walk thrown away.
+line must show the walk kept for its pages and its totals settled by one
+counting pass.
 
-`PHASE3_CASES="split spill"` in the environment runs a subset, and
-`--phases 3` skips phases 1 and 2.
+Eight more cases set up, one at a time, a state a standby's
+`lion_index_verify()` meets and a primary's never does (DESIGN.md §7,
+"verify() on a standby"): replay applies VACUUM beside the check, and every
+operation the primary writes in more than one record shows the states between
+its records to the standby's readers for as long as the primary takes. Each
+check must pass, with no WARNING, except the last one of the split cases:
+
+* **vunlink**, **vfree**: the check parks after the first leaf of a posting
+  set of six; a VACUUM takes the emptied second leaf out of the set
+  (UNLINKED), or frees the whole set and its entry, under it.
+* **vreach**: the check parks before its reachability pass, and a directory
+  leaf split takes a page out of the free space map that no walk reached
+  (needs `pg_freespacemap`; skipped without it).
+* **vdownlink**: the check parks after the directory's leaves, and a split's
+  downlink names a leaf the walk did not reach.
+* **vleftlink**: the check parks on the first directory leaf, and its split
+  changes the left link of the page after it.
+* **vsummary**: an INSERT parks on the primary between its row's key and its
+  summary (`lion-insert-before-summary`), and the check runs, then again
+  with heapallindexed.
+* **vsplitdir**, **vsplitpost**: a directory leaf split, or a posting leaf
+  split, parks on the primary between its first record and its downlink, and
+  the check sees the flag - and, for the directory, parks before it looks at
+  the flagged page again while the split finishes. Then a split that fails
+  there (an error injected) is abandoned, and the check must warn of it.
+
+`PHASE3_CASES="split spill"` in the environment runs a subset (the default is
+every case), and `--phases 3` skips phases 1 and 2.
 
 **Phase 4, `lion_index_verify()` on a standby beside replay** (DESIGN.md §7,
 §11, §25). Replay takes a record's blocks in the order the writer registered
@@ -326,7 +353,8 @@ where replay stands, and fails the phase as soon as replay has not moved for
 `PHASE4_STALL` seconds (10) while WAL it received waits to be replayed - a
 deadlock never ends, so the phase cannot hang, and `statement_timeout` would
 not have ended it. Every verify() call must return without an error (a set
-replay kept changing is kept with a WARNING, which the phase counts); then,
+or position tree that replay kept changing through every counting pass is
+kept with a WARNING, which the phase counts); then,
 caught up, verify() with heapallindexed and every key's count must agree with
 the primary. A deadlock shows within seconds of the load starting, in either
 mode, as the startup process and both verify() backends waiting on

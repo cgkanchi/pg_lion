@@ -24,6 +24,14 @@
 #  * the directory: 200 keys of about a hundred bytes are a few leaves under
 #    a root, and new keys among them split a leaf that is not the root (a
 #    root split is atomic and never flagged).
+#
+# The second permutation fails each split one record later, between the
+# downlink and the record that clears the flag (lion-posting-split-placed,
+# lion-dir-split-placed): the flag stays on a page whose right sibling has
+# its downlink.  That is as normal as the first state - the flag is cleared
+# by a record of its own, which a crash or an error can cut off - and the
+# next writer that descends to the page clears it.  verify() must warn of
+# it as of the first, and pass (2026-10-23 review, R-V4).
 
 setup
 {
@@ -46,6 +54,10 @@ teardown
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 	DO $$ BEGIN PERFORM injection_points_detach('lion-dir-split-incomplete');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-posting-split-placed');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
+	DO $$ BEGIN PERFORM injection_points_detach('lion-dir-split-placed');
+	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
 }
 
 session s1
@@ -66,6 +78,18 @@ step s1_split_dir	{
 }
 step s1_detach_posting	{ SELECT injection_points_detach('lion-posting-split-incomplete'); }
 step s1_detach_dir	{ SELECT injection_points_detach('lion-dir-split-incomplete'); }
+# The same splits, failing between the downlink and the flag's clearing.
+step s1_placed_posting	{
+	SELECT injection_points_attach('lion-posting-split-placed', 'error');
+	INSERT INTO vis_p SELECT 100000 + i, i % 2 FROM generate_series(1, 30000) i;
+}
+step s1_placed_dir	{
+	SELECT injection_points_attach('lion-dir-split-placed', 'error');
+	INSERT INTO vis_d SELECT 'key-' || lpad((2 * i + 1)::text, 90, '0')
+	  FROM generate_series(1, 20) i;
+}
+step s1_detach_placed_posting	{ SELECT injection_points_detach('lion-posting-split-placed'); }
+step s1_detach_placed_dir	{ SELECT injection_points_detach('lion-dir-split-placed'); }
 step s1_verify_posting	{
 	SELECT lion_index_verify('vis_p_k');
 	SELECT lion_index_verify('vis_p_k', true);
@@ -90,6 +114,16 @@ permutation
 	s1_detach_posting
 	s1_split_dir
 	s1_detach_dir
+	s1_verify_posting
+	s1_verify_dir
+	s1_answers
+
+permutation
+	s1_shape
+	s1_placed_posting
+	s1_detach_placed_posting
+	s1_placed_dir
+	s1_detach_placed_dir
 	s1_verify_posting
 	s1_verify_dir
 	s1_answers
