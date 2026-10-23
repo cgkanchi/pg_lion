@@ -477,4 +477,19 @@ lion_toast_snapshot(SnapshotData *data)
 	} while (0)
 #endif
 
+/*
+ * compute_bitmap_pages()'s count of loops is a double from PostgreSQL 17, an
+ * int before it; a caller gives a double, which on 16 is held to an int's
+ * range.  optimizer/cost.h declares it, where it is called.
+ */
+#if PG_VERSION_NUM >= 170000
+#define lion_compute_bitmap_pages(root, rel, qual, loops, cost, tuples) \
+	compute_bitmap_pages((root), (rel), (qual), (loops), (cost), (tuples))
+#else
+#define lion_compute_bitmap_pages(root, rel, qual, loops, cost, tuples) \
+	compute_bitmap_pages((root), (rel), (qual), \
+						 (int) Min((loops), (double) PG_INT32_MAX), \
+						 (cost), (tuples))
+#endif
+
 #endif							/* LION_COMPAT_H */

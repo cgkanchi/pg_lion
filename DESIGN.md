@@ -23314,14 +23314,139 @@ lion_plan_units.c):
 - **the path is priced with both added** (`lion_units_cold()`): (own x rate + its cold reads) over
   (the loop's cost + the loop's cold reads), of the loop's cost - a factor of the rate, each path
   of the relation with its own reads. It is at most 1, so a path that reads more than the loop
-  keeps its price, and at least 1 / 1.5 (`LION_COLD_MAX_DISCOUNT`).
+  keeps its price, and at least 1 / `pg_lion.cold_max_discount`, 2 by default ("The cap"
+  below).
 
 The floor is what this costs warm. With the inner table's working set in the cache the loop runs at
-core's price, and a lion path chosen over it can take up to 1.5 times its time. Nothing changes where the tables and the index fit in `effective_cache_size`,
+core's price, and a lion path chosen over it can take up to `pg_lion.cold_max_discount` times its
+time (2 by default). Nothing changes where the tables and the index fit in `effective_cache_size`,
 which every table of the regression suite does but `fkjoin_cold.sql`'s, nor against any other kind
 of plan. Not counted: the probes a semi join stops early, which the loop's reads overstate; a
 Memoize over the inner scan, which takes no charge; the count paths other than the FK-side join's,
 which compare with the loop at its price as before.
+
+### A bitmap heap scan's cold reads (2026-10-23)
+
+Core prices a bitmap heap scan's heap pages at `random_page_cost` falling to `seq_page_cost` with
+the square root of the share of the table one scan reads (`cost_bitmap_heap_scan()`), as if each
+page were cached or a device's cheap random read. On a private workload, over a fact heap almost
+four times `effective_cache_size`, a covering walk of a B-tree on the fact's key, index-only over
+the lion set (LionOrdered, §40), was priced at about 1.1M units against a parallel bitmap heap
+scan's 605k, 1.82 times, and lost; cold it ran in 11.0 s against the scan's 24 s, 2.2 times
+faster. The walk's price was right, 10 us a unit; the scan's 605k heap pages, which core charged
+some 1.08 units each, took 40 us each, four times the walk's rate. They are not a loop's reads: a
+bitmap heap scan asks for its pages ahead of itself (`effective_io_concurrency`), so that the
+reads overlap one another and the scan's own work. On the same device a parallel bitmap heap scan
+read 1.9M uncached pages at 33 us a page and this one 605k at 40 us, where a nested loop's
+synchronous probe paid 270 to 300 us: 0.11 to 0.15 of it.
+
+So against a competitor that reads through bitmap heap scans (`lion_bitmap_cold()`,
+lion_plan_units.c), and the same way §39's loop is priced:
+
+- **the competitor** is the cheapest core path of the relation the lion path is added to,
+  `lion_competitor_path()`'s, pinned for the hook's paths as before - for a count and the FK-side
+  join, `lion_units_for()`'s, where the loop's cold reads are not taken already (both are never
+  added); for a base relation's covering walks, which have no rate, `lion_units_scan_cold()`'s, the
+  cheaper of that path and the relation's cheapest unparameterized partial path under the Gather
+  core puts over it (`parallel_setup_cost` and a `parallel_tuple_cost` a row, as `cost_gather()`
+  prices it), taken before the walks are added, since `add_path()` frees what they dominate. A
+  plain or parallel bitmap heap scan; an aggregate over one; a hash or merge join with one on
+  either side; a nested loop's parameterized inner one, over the loop's outer rows; a Material
+  scans its input once, a Memoize once a cache miss, at the hit ratio `cost_memoize_rescan()`
+  prices it at (`lion_memoize_misses()`), a subquery's scan is followed into its plan under the
+  subquery's own root, and a custom path reads nothing of core's;
+- **its cold reads** are each scan's heap pages as `compute_bitmap_pages()` counts them, over the
+  loops (`loop_count`, which pro-rates them, times the loops), and each bitmap leaf's index pages,
+  its selectivity's share of the index and a page at least, over the loops as
+  `index_pages_fetched()` counts them; in the share the cache cannot hold, one less the residency
+  `lion_index_page_cost()` argues from - `effective_cache_size` over the query's tables and the
+  bitmaps' indexes - each charged `pg_lion.cold_stream_page_cost` less the price core charged it:
+  the heap page the scan's `random_page_cost - (random_page_cost - seq_page_cost) x sqrt(pages /
+  T)`, the index page `random_page_cost`;
+- **the lion path's own reads** are counted at the same per-page charge (`cold_stream_page_cost`
+  less the largest scan's `random_page_cost`), since they too are read in an order the device or
+  the kernel reads ahead of - posting chains, a B-tree's leaves in order, a recheck's heap through
+  a read stream: an index-only covering walk's B-tree pages as its `amcostestimate()` counts them,
+  its set's build (each lion leaf's share, as the scan's bitmap) and its heap fetches as priced
+  (`lo_cost()`'s `reads`); a count's directory leaves, posting and summed pages and heap rechecks
+  as its price counts them (`LionRangeCost.reads`), and the heap pages its residual clauses read,
+  each count's candidates in block order as `compute_bitmap_pages()` counts the scan's
+  (`lion_residual_pages()`); the FK-side join's as §39 counts them;
+- **the path is priced with both added** as against the loop: (own x rate + its cold reads) over
+  (the competitor's cost + its cold reads), of the competitor's cost, at most 1 and at least
+  1 / `pg_lion.cold_max_discount` - a factor of the rate for a count and the FK-side join
+  (`lion_units_bitmap_cold()`), of the walk's own startup and total for a covering walk
+  (`lo_cold_price()`). A parallel walk's partial cost is one participant's share where the scan's
+  is a whole plan's, so it is priced under the Gather core puts over it - `parallel_setup_cost`
+  and a `parallel_tuple_cost` a row, as `lion_units_scan_cold()` adds to the scan's partial path -
+  and the Gather's share taken out again (`lo_cold_price_partial()`). The margin divides the
+  result as it divides any price.
+
+`pg_lion.cold_stream_page_cost` is 6.25 `seq_page_cost`, an eighth of `cold_page_cost`'s 50: the
+middle of the measured 0.11 to 0.15. The device measured is some three times slower than the
+reference's local SSD under both kinds of read (270 to 300 us against `cold_page_cost`'s 100); the
+ratio is what carries over, and 6.25 is 12.5 us at the reference. 0 turns the charge off.
+
+Which paths: the index-only covering walks, LionOrdered's and LionBtreeScan's, serial and parallel;
+the count of one relation, of its WHERE or its groups' sets, with its heap rechecks and residual
+clauses; and the FK-side join, where its competitor is a hash join over a bitmap heap scan rather
+than a loop. Not a walk in heap mode, which fetches each member's tuple as it meets it, a
+synchronous read the stream's price would under-charge, nor §40.10's probes.
+
+**The cap** (`pg_lion.cold_max_discount`, 2 by default, 1 to 10) is `LION_COLD_MAX_DISCOUNT`, which
+was 1.5, made a setting, the loop's and the bitmap's alike. It is the warm floor: where the cache
+holds what both plans read after all - `effective_cache_size` set below the real cache, a hot
+working set - a lion path chosen for those reads can take up to the cap times its competitor's
+time. The measured case:
+
+| | the walk | the bitmap heap scan |
+|---|---|---|
+| priced | 1.1M | 605k |
+| ran, cold | 11.0 s | 24 s |
+| its pages, uncached | an estimated 95k of the B-tree's | 605k of the heap |
+| their cold reads, x 0.74 uncached | 95k x 0.74 x (6.25 - 1.1) = 0.36M | 605k x 0.74 x (6.25 - 1.08) = 2.3M |
+
+The factor, uncapped, is (1.1M + 0.36M) x 605k / ((605k + 2.3M) x 1.1M) = 0.28: the walk at 0.30M
+against the scan's 605k. The walk's pages are an estimate, and move it little: none would make it
+0.21, three times as many 0.41. The case needs a cap above 1.82 (1.1M / 605k). At 1.5 the walk is
+priced at 733k and loses; at 1.82 it ties within `add_path()`'s fuzz; at 2 it is priced at 550k
+and wins by 9%; at 2.5, at 440k. The model's own ratio, 2.9M against 1.46M, is 2.0 against the
+measured 2.2.
+
+**The default is 2**, Chinmay's choice after the measured cold and warm comparison (1.5 was
+proposed, 2 recommended). It is the smallest round cap that takes the measured case with room past
+the fuzz, and what it costs is bounded: only where `effective_cache_size` says the tables do not
+fit, and there a third more than 1.5's worst case where they do after all - twice the competitor's
+time where 1.5 allowed one and a half. A cap past 2 changes nothing in that case, and lets a path
+priced 2.5 times core's through on the model's say alone.
+
+Nothing changes where the tables and the indexes fit in `effective_cache_size`, and nothing
+against a sequential scan, an index scan or an index-only scan. Not done:
+
+- **A sequential scan's cold reads**: its pages are read ahead in long runs, near `seq_page_cost`
+  even cold, and none are charged; a lion path against one keeps its price.
+- **Core's plain index scans** read their heap pages synchronously outside a loop too; only the
+  loop's are priced (§39 above).
+- **A loop with a bitmap heap scan beside it**: a competitor with both kinds of cold reads takes the
+  loop's alone.
+- **The counts whose prices leave their reads out** - the decoded walk (§34), the top k (§36), the
+  aggregates over entries (§37), a partitioned table's, beside an anti join, the cells' - and
+  LionSemiJoin and LionAntiJoin, KNN and lion-column walks, keep their price against a cold scan.
+- **One residency for every table**: a hot dimension and a cold fact are taken alike, as for the
+  loop. A parallel scan's pages are counted whole, as core counts its I/O; several workers
+  prefetching overlap more than one does (33 us a page against 40 above), which the one price does
+  not see.
+
+Tests: `bitmap_cold.sql`, with a cache of a megabyte as `fkjoin_cold.sql` has: a covering walk
+taken over a bitmap heap scan cold and not where the tables fit, with the charge at 0 or the cap at
+1; the walk's price over its price against the cold scan exactly the cap where it binds (1.5, 2) and
+past 2 uncapped, and a parallel walk's the same under its Gather; the margin dividing the cold price and still a threshold on it; a GROUP BY's count
+the same way, over an all-visible heap and with rows added since the VACUUM, which it rechecks; a
+count whose residual clause reads more heap pages than the scan, not taken; the
+FK-side join against a hash join over the fact's bitmap heap scan; the answers the same under
+each plan; and a GROUP BY over a subquery whose plan holds a Memoize, estimated under the
+subquery's root. `costrates.sql` lists both settings and their ranges, and `costgucs.sql` lists
+`cold_stream_page_cost` among the cost settings.
 
 ### Tests
 
@@ -23674,7 +23799,9 @@ MB) but spends those 170 ns an entry, so warm it loses to the lion index's own s
 by four times and to the sequential scan by two; it pays when the heap would be read cold, or the
 filter is far wider than the B-tree's share of the heap. The planner's I/O constants decide,
 `pg_lion.enable_btree_scan` turns the unordered walks off and `pg_lion.enable_ordered_scan` the
-ordered ones.
+ordered ones. Since 2026-10-23 an index-only walk against a bitmap heap scan whose
+heap the cache cannot hold is priced with both plans' cold reads (§39, "A bitmap heap scan's cold
+reads").
 
 ### 40.4 Execution
 

@@ -4518,12 +4518,14 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 			runs.countrange += rangeprice.countrange;
 			runs.whole += rangeprice.whole;
 			runs.pages += rangeprice.pages;
+			runs.reads += rangeprice.reads;
 		}
 		cpath->path.startup_cost = startup;
 		cpath->path.total_cost = total;
 		rangeprice.countrange = runs.countrange;
 		rangeprice.whole = runs.whole;
 		rangeprice.pages = runs.pages;
+		rangeprice.reads = runs.reads;
 	}
 
 	/*
@@ -4580,6 +4582,28 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		cpath->path.total_cost += resid;
 		if (cpath->path.startup_cost > 0)
 			cpath->path.startup_cost += resid;
+	}
+
+	/*
+	 * Against a bitmap heap scan with cold reads (DESIGN.md §39, "A bitmap
+	 * heap scan's cold reads"), the count's own reads beside them: its
+	 * directory leaves, posting pages and heap recheck, which its price
+	 * counted (rangeprice.reads), and the heap its residual clauses read.
+	 * Only where the price counts them - one relation's count, of its WHERE
+	 * or its groups' sets - and not the decoded walk's, the top k's, the
+	 * aggregates over entries', a partitioned table's, or beside an anti
+	 * join, whose prices leave them out.
+	 */
+	if (units.bmcold > 0.0 && list_length(cx->targets) == 1 &&
+		!cx->decode && cx->topkn == 0 && cx->wattnos == NIL &&
+		cx->anti == NULL && cx->fj == NULL)
+	{
+		double		reads = rangeprice.reads;
+
+		if (cx->residual != NIL)
+			reads += lion_residual_pages(root, input_rel, cx->residual,
+										 (1 + cx->nfilter) * cx->numgroups);
+		lion_units_bitmap_cold(&units, cpath->path.total_cost, reads);
 	}
 
 	cpath->path.startup_cost = lion_units_price(&units,
