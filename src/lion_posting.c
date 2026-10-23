@@ -3,13 +3,11 @@
  * lion_posting.c
  *		The per-key posting tree of the lion index (DESIGN.md §22).
  *
- * A CHAIN entry's posting set used to be a rightlinked chain of container
- * pages, which can only be walked.  It is now a B-tree over container keys -
- * GIN's posting-tree shape - whose LEAVES are those very container pages,
- * still rightlinked in ckey order, so every sequential reader (the bitmap
- * scan, the single-set count, VACUUM) does exactly what it did before, while
- * an intersection can SEEK to a container key instead of streaming everything
- * below it.
+ * A CHAIN entry's posting set is a B-tree over container keys - GIN's
+ * posting-tree shape - whose LEAVES are the container pages, rightlinked in
+ * ckey order, so a sequential reader (the bitmap scan, the single-set count,
+ * VACUUM) walks the leaves from the leftmost one, while an intersection can
+ * SEEK to a container key instead of streaming everything below it.
  *
  * The shape, and the four rules that make it work:
  *
@@ -152,7 +150,7 @@ static void lion_posting_finish_split_ext(Relation index, Relation heaprel,
  *	  level.  Only the root ever changes level (a push-down, rule 1), and the
  *	  root is nobody's child and nobody's sibling, so this is exact - and it is
  *	  what makes a descent end: a downlink to the root or to the page itself
- *	  used to send lion_posting_search() round for ever;
+ *	  would otherwise send lion_posting_search() round for ever;
  *	- a page reached through a link is not one this backend already holds,
  *	  checked BEFORE it is locked: a content lock is not reentrant, and taking
  *	  one twice waits for this very backend for ever (lion_posting_held()).
@@ -1229,11 +1227,11 @@ lion_posting_pushdown(Relation index, Relation heaprel, Buffer buf,
 	 * The items move by their line pointers, inside the record (see
 	 * lion_page_check_items()), so they are checked before anything is
 	 * allocated: each as a reader checks it, and all of them for fitting the
-	 * child, which the items of an undamaged root always do.  One line pointer
-	 * that claimed 4000 bytes for an item of 1816 used to fail the push-down
-	 * half way through its record - a PANIC in rmgr mode, and the same PANIC
-	 * again at the first insert into the key after recovery (2026-09-29
-	 * review).
+	 * child, which the items of an undamaged root always do.  A line pointer
+	 * that claims more than its item - 4000 bytes for an item of 1816 - would
+	 * otherwise fail the push-down half way through its record: a PANIC in
+	 * rmgr mode, and the same PANIC again at the first insert into the key
+	 * after recovery.
 	 */
 	maxoff = PageGetMaxOffsetNumber(page);
 	lion_page_check_items(index, page, head);

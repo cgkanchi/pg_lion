@@ -111,11 +111,11 @@ lion_recheck_add(LionCountCtx *cx, uint64 code)
 	 * boundary; that also keeps blocks_rechecked exact.  It comes at the
 	 * first boundary past which the next block might not fit - a block puts
 	 * at most LION_RECHECK_BLOCK_TIDS on the list - so that the list never
-	 * outgrows batchmax: it used to fill to batchmax and then to the end of
-	 * the block it was on, a step of LION_RECHECK_GROW_TIDS more, which the
-	 * hundreds of queues of a grouped walk (lion_count_groups_copy()) each
-	 * took past their share (2026-10 review).  A list out of order has no
-	 * blocks to wait for, and is flushed when it is full.
+	 * outgrows batchmax, which matters to the hundreds of queues of a grouped
+	 * walk (lion_count_groups_copy()): a flush that waited for the end of the
+	 * block it was on would take each queue up to LION_RECHECK_GROW_TIDS past
+	 * its share.  A list out of order has no blocks to wait for, and is
+	 * flushed when it is full.
 	 *
 	 * Neither holds for a count taken in passes (LionCountCtx.passes): every
 	 * pass begins at the first key again, so a block flushed now is a block

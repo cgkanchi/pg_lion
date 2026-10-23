@@ -128,11 +128,11 @@ static void lion_dir_finish_split(Relation index, Relation heaprel,
  * root - and a damaged page can hold anything there.  In particular it can
  * hold InvalidBlockNumber, which is P_NEW, and ReadBuffer() on PostgreSQL 16
  * to 18 answers P_NEW by EXTENDING the relation: a root downlink set to
- * 0xFFFFFFFF grew the index by a block on every SELECT and INSERT that
- * descended through it (2026-09-25 review).  So every directory read refuses
- * one, as corruption.  A block past the end of the relation needs no test of
- * its own - ReadBuffer() fails on it - and asking for the relation's size on
- * every step of every descent would cost a system call each.
+ * 0xFFFFFFFF would grow the index by a block on every SELECT and INSERT that
+ * descended through it.  So every directory read refuses one, as corruption.
+ * A block past the end of the relation needs no test of its own -
+ * ReadBuffer() fails on it - and asking for the relation's size on every step
+ * of every descent would cost a system call each.
  */
 static inline Buffer
 lion_dir_readbuf_ext(Relation index, BlockNumber blk,
@@ -729,11 +729,11 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
  * one record (lion_dir_split()), and nothing ever makes the directory
  * shorter.  So the meta page is read again for as long as the height it names
  * keeps growing, and only one that names the same height as before, with a
- * page that is not the root, is damage.  This used to allow a single refresh,
- * which turned a root split racing it into a spurious ERROR (2026-09-27
- * review).  nbtree's _bt_getroot() would instead descend from the demoted
- * page, which is correct for a search but not for lion_dir_find_parent(),
- * whose parent may be on the new level above it.
+ * page that is not the root, is damage: a bound on the refreshes would turn
+ * a run of root splits racing it into a spurious ERROR.  nbtree's
+ * _bt_getroot() would instead descend from the demoted page, which is
+ * correct for a search but not for lion_dir_find_parent(), whose parent may
+ * be on the new level above it.
  */
 static Buffer
 lion_dir_get_root(Relation index, LionIndexState *ix,
@@ -1797,8 +1797,7 @@ StaticAssertDecl(MAXALIGN(LION_ENTRY_SHORT_HDRSZ) + sizeof(ItemIdData) +
  * terminates because every split moves at least one item off the page and a
  * page holding one item plus the new one always splits.
  *
- * *(This replaces an error branch, reported by the 2026-09-22 review of §21.
- * With today's size caps the shape is in fact unreachable - a fresh entry is
+ * *(With today's size caps the shape is in fact unreachable - a fresh entry is
  * its key and one row's container, a little over 2 kB at most on a page, and
  * a replacement grows by at most a few dozen, and either way a cut exists -
  * but that rests on three independent constants

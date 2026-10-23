@@ -748,9 +748,9 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 		 * was just added to it, because the last insert-driven rewrite left
 		 * some: then the entry KEEPS the bytes the page has allotted it and
 		 * only its own bytes change.  PageIndexTupleOverwrite() then moves no
-		 * other entry on the leaf - which is what an INLINE insert used to pay
-		 * for every time, 1.5-2.9 KB of it in generic mode - and the record is
-		 * a delta of the counters and the tail of the payload.
+		 * other entry on the leaf, as a change of length would (1.5-2.9 KB of
+		 * record in generic mode), and the record is a delta of the counters
+		 * and the tail of the payload.
 		 *
 		 * Otherwise the entry is written at its new length PLUS fresh slack,
 		 * which is what puts the next few inserts on the cheap path.  Only
@@ -1371,10 +1371,9 @@ lion_summary_make_last(LionState *state, Datum key, uint32 hash, uint32 ckey,
  * is rebuilt around the new key with the row already in its payload and put
  * back through lion_dir_place() - ONE record, which splits the leaf when the
  * entry no longer fits it; the SUMLAST kind sorts after every other summary
- * whatever its key, so its position does not change.  It used to be the key
- * alone, in a record of its own, and then a second descent from the root and
- * a second record for the row: every append to a summarized column paid
- * twice (2026-09-28 review).  A payload that the row and a longer key push
+ * whatever its key, so its position does not change.  So an append to a
+ * summarized column costs one descent and one record, not one for the key
+ * and another for the row.  A payload that the row and a longer key push
  * past what an entry may inline is spilled first (lion_entry_spill(), as an
  * insert's would be), with the old key, and the entry is then a CHAIN.
  *
@@ -1787,8 +1786,7 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	/*
 	 * One descent, with the leaf taken EXCLUSIVE, and it is held for the whole
 	 * insert: every writer of a key (inserts and VACUUM) serialises on the
-	 * leaf that holds its entry, exactly as they used to serialise on the
-	 * bucket head page (DESIGN.md §5, §21).
+	 * leaf that holds its entry (DESIGN.md §5, §21).
 	 */
 	found = lion_dir_find(index, heaprel, state->ix, &sk, BUFFER_LOCK_EXCLUSIVE,
 						  true, &leafbuf, &entryoff, &movedright);

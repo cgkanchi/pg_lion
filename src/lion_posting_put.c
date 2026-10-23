@@ -1160,12 +1160,11 @@ lion_split_and_place(Relation index, Relation heaprel, Buffer buf,
 	/*
 	 * Does P still hold the new items once the moved ones are gone?
 	 *
-	 * The question used to be asked of the page itself, in the middle of the
-	 * record, and the second new page was allocated there if the answer was
-	 * no.  DESIGN.md §25 does not allow that any more - an rmgr-mode record
-	 * runs in a critical section, where extending the relation would turn a
-	 * full disk into a PANIC - so it is asked HERE, of a private copy that
-	 * the deletion is rehearsed on.  A copy rather than arithmetic because
+	 * The answer decides whether a second new page is needed, and that page
+	 * is allocated before the record: an rmgr-mode record runs in a critical
+	 * section, where extending the relation would turn a full disk into a
+	 * PANIC (DESIGN.md §25).  So it is asked HERE, of a private copy that the
+	 * deletion is rehearsed on.  A copy rather than arithmetic because
 	 * PageIndexMultiDelete() compacts, and what a compaction recovers is
 	 * exactly what the arithmetic would have to guess at.  A split copies a
 	 * page once; the hot path (an in-place member insert) copies nothing at
