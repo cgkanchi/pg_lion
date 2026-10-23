@@ -22934,7 +22934,8 @@ lion_plan_units.c), and the same way §39's loop is priced:
   plain or parallel bitmap heap scan; an aggregate over one; a hash or merge join with one on
   either side; a nested loop's parameterized inner one, over the loop's outer rows; a Material
   scans its input once, a Memoize once a cache miss, at the hit ratio `cost_memoize_rescan()`
-  prices it at (`lion_memoize_misses()`), and a custom path reads nothing of core's;
+  prices it at (`lion_memoize_misses()`), a subquery's scan is followed into its plan under the
+  subquery's own root, and a custom path reads nothing of core's;
 - **its cold reads** are each scan's heap pages as `compute_bitmap_pages()` counts them, over the
   loops (`loop_count`, which pro-rates them, times the loops), and each bitmap leaf's index pages,
   its selectivity's share of the index and a page at least, over the loops as
@@ -23023,8 +23024,9 @@ taken over a bitmap heap scan cold and not where the tables fit, with the charge
 past 2 uncapped, and a parallel walk's the same under its Gather; the margin dividing the cold price and still a threshold on it; a GROUP BY's count
 the same way, over an all-visible heap and with rows added since the VACUUM, which it rechecks; a
 count whose residual clause reads more heap pages than the scan, not taken; the
-FK-side join against a hash join over the fact's bitmap heap scan; and the answers the same under
-each plan. `costrates.sql` lists both settings and their ranges, and `costgucs.sql` lists
+FK-side join against a hash join over the fact's bitmap heap scan; the answers the same under
+each plan; and a GROUP BY over a subquery whose plan holds a Memoize, estimated under the
+subquery's root. `costrates.sql` lists both settings and their ranges, and `costgucs.sql` lists
 `cold_stream_page_cost` among the cost settings.
 
 ### Tests

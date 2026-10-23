@@ -279,7 +279,22 @@ SELECT count(DISTINCT lbc_rows('SELECT d.grp, count(*) FROM lbc_x f JOIN lbc_d d
   FROM (VALUES ('{effective_cache_size, 1MB}'::text[]), ('{}'),
 			   ('{pg_lion.enable_count_pushdown, off, enable_bitmapscan, off}')) v(sw);
 
-DROP TABLE lbc_f, lbc_g, lbc_x, lbc_d;
+-- ---------- 4. a subquery ----------
+-- A GROUP BY over a subquery is weighed against the subquery's scan, whose
+-- paths were planned under the subquery's own root: here a nested loop with
+-- a Memoize over the unnest of each row's array, keyed by the array, whose
+-- misses are estimated under that root - the outer query's range table has
+-- no such column.  It has only to plan and give the subquery's rows.
+CREATE TABLE lbc_a (id int, g int, a int[]) WITH (autovacuum_enabled = off);
+INSERT INTO lbc_a SELECT i, i % 4, ARRAY[i % 5, i % 3] FROM generate_series(1, 20000) i;
+CREATE INDEX lbc_a_g ON lbc_a USING lion (g);
+CREATE INDEX lbc_a_a ON lbc_a USING lion (a);
+VACUUM (FREEZE, ANALYZE) lbc_a;
+SELECT e, count(*)
+  FROM (SELECT DISTINCT id, e FROM lbc_a, unnest(a) e WHERE e IS NOT NULL) r
+ GROUP BY e ORDER BY e;
+
+DROP TABLE lbc_f, lbc_g, lbc_x, lbc_d, lbc_a;
 DROP FUNCTION lbc_rows(text, text[]);
 DROP FUNCTION lbc_cost(text, text[], text);
 DROP FUNCTION lbc_plan(text, text[]);
