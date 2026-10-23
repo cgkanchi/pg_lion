@@ -1666,6 +1666,36 @@ lo_lion_amortized(PlannerInfo *root, Path *lion, double loops)
 }
 
 /*
+ * The pages a lion access's set reads where it is built: each leaf index's
+ * selectivity's share of its pages, a page at least - a lion index's posting
+ * sets hold their rows in proportion - as the competing bitmap heap scan's
+ * bitmap reads the same leaves (lion_bitmap_cold(), DESIGN.md §39).
+ */
+static double
+lo_lion_pages(Path *lion)
+{
+	double		pages = 0.0;
+	List	   *quals = NIL;
+	ListCell   *lc;
+
+	check_stack_depth();
+	if (IsA(lion, IndexPath))
+	{
+		IndexPath  *ip = (IndexPath *) lion;
+		double		ipages = Max((double) ip->indexinfo->pages, 1.0);
+
+		return Min(Max(ceil(ip->indexselectivity * ipages), 1.0), ipages);
+	}
+	if (IsA(lion, BitmapAndPath))
+		quals = ((BitmapAndPath *) lion)->bitmapquals;
+	else if (IsA(lion, BitmapOrPath))
+		quals = ((BitmapOrPath *) lion)->bitmapquals;
+	foreach(lc, quals)
+		pages += lo_lion_pages((Path *) lfirst(lc));
+	return pages;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
@@ -1707,12 +1737,18 @@ lo_lion_amortized(PlannerInfo *root, Path *lion, double loops)
  * every call (lo_rescan()) - or, where one does, its lookups' pages alone,
  * the set being built again at every call.  The heap's pages are a call's, as
  * core prices the subquery's own scans.
+ *
+ * With `reads_p` not NULL, the pages the walk reads go there, which a bitmap
+ * heap scan's cold reads are weighed against (DESIGN.md §39, "A bitmap heap
+ * scan's cold reads"): the btree's, as its amcostestimate() counts them, the
+ * set's build reads (lo_lion_pages()), and the heap pages its fetches read,
+ * as priced below.
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
 		bool indexonly, double loops, double scans, int *workers,
-		Cost *startup_p, Cost *total_p)
+		Cost *startup_p, Cost *total_p, double *reads_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1962,6 +1998,9 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	}
 	if (indexonly)
 		cpu += fetched * cpu_operator_cost;
+	if (reads_p != NULL)
+		*reads_p = ipages + lo_lion_pages(lion) +
+			Max(max_io + corr * corr * (pages_corr - max_io), 0.0);
 	max_io *= spc_random;
 	if (loops > 1.0)
 	{
@@ -2925,6 +2964,52 @@ lo_add_path(RelOptInfo *rel, ParamPathInfo *ppi,
 }
 
 /*
+ * A covering walk's price against the bitmap heap scan it competes with, when
+ * that scan's reads are cold (lion_units_scan_cold(), DESIGN.md §39, "A
+ * bitmap heap scan's cold reads"): its startup and total times the factor
+ * its own reads and the scan's give it - at most 1, and never below 1 /
+ * pg_lion.cold_max_discount.  Only an index-only walk: one in heap mode
+ * fetches each member's tuple when it meets it, a synchronous read, which
+ * the stream's price would not cover.
+ */
+static void
+lo_cold_price(const LionUnits *cold, double reads, Cost *startup, Cost *total)
+{
+	double		factor = lion_units_bitmap_factor(cold, *total, reads);
+
+	*startup *= factor;
+	*total *= factor;
+}
+
+/*
+ * ... and a partial walk's, whose startup and total are one participant's
+ * share with no Gather over it, where the scan's cost it is weighed against
+ * (lion_units_scan_cold()) is a whole plan's: the serial scan's, or a
+ * partial one's under its Gather.  So the walk is priced under the same
+ * Gather - parallel_setup_cost, and a parallel_tuple_cost a row of the
+ * relation's `rows`, as cost_gather() and lion_units_scan_cold() charge them
+ * - the factor is taken of that, and the Gather's share is taken out again:
+ * both prices in one unit, and the Gather's overhead discounted with the
+ * walk under it.  Never a startup below 0, nor a total below the startup,
+ * which a deep discount of a small partial cost would otherwise give.
+ */
+static void
+lo_cold_price_partial(const LionUnits *cold, double reads, double rows,
+					  Cost *startup, Cost *total)
+{
+	Cost		overhead = parallel_setup_cost +
+		parallel_tuple_cost * clamp_row_est(rows);
+	Cost		gathered = *total + overhead;
+	double		factor = lion_units_bitmap_factor(cold, gathered, reads);
+
+	if (factor >= 1.0)
+		return;
+	*startup = Max((*startup + parallel_setup_cost) * factor -
+				   parallel_setup_cost, 0.0);
+	*total = Max(gathered * factor - overhead, *startup);
+}
+
+/*
  * May a walk of this btree be divided among the participants of a parallel
  * plan (DESIGN.md §40.9)?  The relation may be read in a worker - its
  * restriction clauses, which the node evaluates, and its target are
@@ -3683,6 +3768,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	ListCell   *lc;
 	ListCell   *lc2;
 	double		rows;
+	LionUnits	cold;			/* a bitmap heap scan's cold reads (§39) */
 
 	if (!lion_enable_ordered_scan)
 		lo_knn_why(knn, LO_KNN_DISABLED);
@@ -3711,6 +3797,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	if (lionidx == NIL)
 		return;
 	lo_margin = lion_units_margin_for(rel);
+	lion_units_scan_cold(root, rel, &cold);
 	if (enable_indexonlyscan)
 		pull_varattnos((Node *) rel->reltarget->exprs, rel->relid,
 					   &targetattrs);
@@ -3869,6 +3956,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			int			workers;
 			Cost		startup;
 			Cost		total;
+			double		reads;
 
 			if (lo_knn_path(ord))
 			{
@@ -3901,7 +3989,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lion == lioncover && !indexonly)
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, 1.0, 1.0, NULL, &startup, &total);
+					indexonly, 1.0, 1.0, NULL, &startup, &total, &reads);
+			if (indexonly)
+				lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, &lion_ordered_path_methods,
 						ord->path.pathkeys, list_make3(ord, lion, iocols),
 						rows, startup, total, rel->consider_parallel, 0);
@@ -3909,10 +3999,16 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
-						rows, indexonly, 1.0, 1.0, &workers, &startup, &total))
+						rows, indexonly, 1.0, 1.0, &workers, &startup, &total,
+						&reads))
+			{
+				if (indexonly)
+					lo_cold_price_partial(&cold, reads, rows, &startup,
+										  &total);
 				lo_add_path(rel, NULL, &lion_ordered_path_methods,
 							ord->path.pathkeys, list_make3(ord, lion, iocols),
 							rows, startup, total, true, workers);
+			}
 		}
 	}
 
@@ -3956,6 +4052,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			int			workers;
 			Cost		startup;
 			Cost		total;
+			double		reads;
 
 			if (!lo_lion_adds(lion, ipath->indexclauses))
 				continue;
@@ -3969,7 +4066,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, 1.0, 1.0, NULL, &startup, &total);
+					rows, true, 1.0, 1.0, NULL, &startup, &total, &reads);
+			lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, pathkeys != NIL ?
 						&lion_ordered_path_methods : &lion_btree_path_methods,
 						pathkeys, list_make3(ipath, lion, iocols),
@@ -3978,11 +4076,15 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ipath) &&
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-						rows, true, 1.0, 1.0, &workers, &startup, &total))
+						rows, true, 1.0, 1.0, &workers, &startup, &total,
+						&reads))
+			{
+				lo_cold_price_partial(&cold, reads, rows, &startup, &total);
 				lo_add_path(rel, NULL, pathkeys != NIL ?
 							&lion_ordered_path_methods : &lion_btree_path_methods,
 							pathkeys, list_make3(ipath, lion, iocols),
 							rows, startup, total, true, workers);
+			}
 		}
 	}
 
@@ -4029,7 +4131,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					ppi->ppi_rows, true, loops, scans, NULL, &startup, &total);
+					ppi->ppi_rows, true, loops, scans, NULL, &startup, &total,
+					NULL);
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
 						list_make3(ipath, lion, iocols), ppi->ppi_rows,
 						startup, total, rel->consider_parallel, 0);
