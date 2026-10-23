@@ -21532,8 +21532,9 @@ sum, so a row drawn from them belongs to a key of
 
 rows on average, and of `Σn² / (N (1 - nullfrac))` with no MCV list. The result is bounded below by
 core's rows per key, as `var_eq_non_const()` has them, and above by N. A unique column has
-Σn² = N and stays at its one row; a probe of a most common value is what the MCV list is for, and
-the formula leaves those keys out. A column whose MCV list holds every value has no key outside it
+Σn² = N (1 - nullfrac), its NULL entry not being one of the VALUE entries summed, and with no MCV
+list stays at its one row; a probe of a most common value is what the MCV list is for, and the
+formula leaves those keys out. A column whose MCV list holds every value has no key outside it
 (what the formula would leave is rounding) and keeps core's rows.
 
 Σn² was summed over the rows the count was taken over, and the table may have grown since. It is
