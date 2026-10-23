@@ -5,25 +5,31 @@
  *
  *			SELECT f.<cols>, d.<cols> FROM fact f JOIN dim d ON f.fk = d.pk
  *			WHERE <fact quals> AND <dim quals>
+ *			  [AND f.fk IN (SELECT k FROM flt WHERE ...) ...]
  *			ORDER BY <columns a btree of the fact provides> LIMIT n
  *
  *		that walks the fact's btree in order, as LionOrdered does, over the
- *		fact's lion set; descends the dimension's unique btree for each
- *		member's key and tests the TID it finds against the dimension's own
- *		lion set BEFORE it touches the dimension's heap; and returns the two
- *		rows together, in the walk's order, until whatever is above it stops
- *		pulling.  DESIGN.md section 47 is the specification.
+ *		fact's lion set; tests each member's key against the key sets of the
+ *		tables that only filter the key; descends the dimension's unique
+ *		btree for the key and tests the TID it finds against the dimension's
+ *		own lion set BEFORE it touches the dimension's heap; and returns the
+ *		two rows together, in the walk's order, until whatever is above it
+ *		stops pulling.  DESIGN.md section 47 is the specification.
  *
  *		Each side is a LionOrdered walk, built by lion_ordered.c for the join
  *		and kept as a child of the join's own plan: the fact's is its ordered
  *		walk, with its set, its early stop and its fetch-and-sort switch; the
  *		dimension's a probe of its unique btree (§40.10), handed each key
  *		before its descent (lion_ordered_probe_key()).  EXPLAIN shows the
- *		join alone, its sides' lines in its own.
+ *		join alone, its sides' lines in its own; a key set's table is
+ *		scanned by a plan of core's, the join's child.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#include "common/hashfn.h"
+#include "utils/datum.h"
 
 #include "lion_customscan.h"
 #include "lion_count.h"
@@ -34,20 +40,34 @@ bool		lion_enable_ordered_join = true;
 static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 
 /*
+ * The most tables a join rel of the node may hold: the fact, the dimension
+ * and the tables its key sets are made of.
+ */
+#define OJ_MAX_RELS			6
+
+/*
  * custom_private of the plan is POSITIONAL, behind a shape marker:
  *
  *	OJ_PRIV_INTS	IntList (OJ_PRIV_MAGIC, the fact's columns in
- *					custom_scan_tlist, the fk's position among them, 1-based)
+ *					custom_scan_tlist, the fk's position among them, 1-based,
+ *					the key sets)
  *	OJ_PRIV_INDEX	OidList: the dimension's unique btree, for EXPLAIN
+ *	OJ_PRIV_KEYOPS	OidList: each key set's equality, hashable
+ *	OJ_PRIV_KEYCOLL	OidList: ... its collation
+ *	OJ_PRIV_KEYCOLS	IntList: ... the key's position in its plan's target
  *
- * custom_plans are the fact's walk and the dimension's probe, in that order;
- * custom_scan_tlist is the fact's target list followed by the dimension's,
- * the rows the join puts together in its scan slot.
+ * custom_plans are the fact's walk, the dimension's probe and each key set's
+ * plan, in that order; custom_scan_tlist is the fact's target list followed by
+ * the dimension's - the rows the join puts together in its scan slot - and
+ * then each key set's key, which no row holds, for EXPLAIN to name its table.
  */
 #define OJ_PRIV_MAGIC		0x4c4f4a4e	/* "LOJN" */
 #define OJ_PRIV_INTS		0
 #define OJ_PRIV_INDEX		1
-#define OJ_PRIV_NMEMBERS	2
+#define OJ_PRIV_KEYOPS		2
+#define OJ_PRIV_KEYCOLL		3
+#define OJ_PRIV_KEYCOLS		4
+#define OJ_PRIV_NMEMBERS	5
 
 static Plan *oj_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
@@ -83,7 +103,22 @@ static const CustomExecMethods oj_exec_methods = {
  * Planner (DESIGN.md §47.2)
  * --------------------------------------------------------------------- */
 
-/* The join the node answers: its two sides and its key */
+/*
+ * A table that only filters the key (DESIGN.md §47.6): its key's values, of
+ * the rows its own quals let through, become a set the fact's keys are
+ * tested against.
+ */
+typedef struct OjKeySet
+{
+	RelOptInfo *rel;
+	Var		   *keyvar;			/* its key column */
+	Path	   *path;			/* the plan the set is built from */
+	Oid			eqop;			/* the key type's equality, hashable */
+	Oid			collation;
+	double		rows;			/* the keys the set is expected to hold */
+} OjKeySet;
+
+/* The join the node answers: its two sides, its key and its key sets */
 typedef struct OjJoin
 {
 	RelOptInfo *fact;
@@ -92,10 +127,12 @@ typedef struct OjJoin
 	Var		   *pkvar;			/* the dimension's */
 	IndexOptInfo *pkidx;		/* the unique btree on it */
 	Expr	   *keyqual;		/* `pk = NULL`, the descent's qual */
+	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
+	List	   *keysets;		/* OjKeySet */
 } OjJoin;
 
 /*
- * Does rel's target hold plain columns of its own alone?  A PlaceHolderVar
+ * Does rel's target hold plain columns of relids alone?  A PlaceHolderVar
  * evaluated at it - or at the join, in the join's target - is core's to
  * place; v1 leaves such queries to it.
  */
@@ -153,17 +190,15 @@ oj_plain_var(Node *node)
 }
 
 /*
- * Is the join of outerrel (the fact) and innerrel (the dimension) one the node
- * answers (DESIGN.md §47.1)?  An inner join of the two base relations alone,
- * its one clause `f.fk = d.pk` under an equality of a unique single-column
- * btree on d.pk, which each fact row's key is then looked up in.
+ * Is the join of fact and dim by `clauses` - every clause between the two -
+ * one the node answers (DESIGN.md §47.1)?  One clause, `f.fk = d.pk` under an
+ * equality of a unique single-column btree on d.pk, which each fact row's
+ * key is then looked up in; both sides tables LionOrdered may scan.
  */
 static bool
-oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
-			 RelOptInfo *innerrel, JoinType jointype, JoinPathExtraData *extra,
-			 OjJoin *j)
+oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
+			List *clauses, OjJoin *j)
 {
-	Query	   *parse = root->parse;
 	RestrictInfo *rinfo;
 	OpExpr	   *op;
 	Var		   *l;
@@ -177,28 +212,12 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 
 	memset(j, 0, sizeof(OjJoin));
 
-	/* a plain query's inner join, nothing locked or written */
-	if (jointype != JOIN_INNER || extra->sjinfo == NULL ||
-		extra->sjinfo->jointype != JOIN_INNER)
-		return false;
-	if (parse->commandType != CMD_SELECT || parse->rowMarks != NIL ||
-		root->rowMarks != NIL)
-		return false;
-
-	/* two base relations, nothing from outside them */
-	if (outerrel->reloptkind != RELOPT_BASEREL ||
-		innerrel->reloptkind != RELOPT_BASEREL ||
-		!bms_equal(joinrel->relids,
-				   bms_union(outerrel->relids, innerrel->relids)) ||
-		!bms_is_empty(joinrel->lateral_relids) ||
-		!oj_target_ok(joinrel, joinrel->relids))
-		return false;
-
 	/* one clause: f.fk = d.pk, between two columns */
-	if (list_length(extra->restrictlist) != 1)
+	if (list_length(clauses) != 1)
 		return false;
-	rinfo = linitial_node(RestrictInfo, extra->restrictlist);
-	if (rinfo->pseudoconstant || !IsA(rinfo->clause, OpExpr))
+	rinfo = (RestrictInfo *) linitial(clauses);
+	if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant ||
+		!IsA(rinfo->clause, OpExpr))
 		return false;
 	op = (OpExpr *) rinfo->clause;
 	if (list_length(op->args) != 2 || op->opretset || !op_strict(op->opno))
@@ -207,8 +226,7 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	r = oj_plain_var((Node *) lsecond(op->args));
 	if (l == NULL || r == NULL)
 		return false;
-	if (l->varno == (int) innerrel->relid &&
-		r->varno == (int) outerrel->relid)
+	if (l->varno == (int) dim->relid && r->varno == (int) fact->relid)
 	{
 		j->pkvar = l;
 		j->fkvar = r;
@@ -216,8 +234,7 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		fkarg = (Node *) lsecond(op->args);
 		opno = op->opno;
 	}
-	else if (l->varno == (int) outerrel->relid &&
-			 r->varno == (int) innerrel->relid)
+	else if (l->varno == (int) fact->relid && r->varno == (int) dim->relid)
 	{
 		j->pkvar = r;
 		j->fkvar = l;
@@ -235,7 +252,7 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 	 * descent reads (lion_column_unique_index()), the equality its with the
 	 * key column on the left.
 	 */
-	j->pkidx = lion_column_unique_index(innerrel, j->pkvar->varattno, opno,
+	j->pkidx = lion_column_unique_index(dim, j->pkvar->varattno, opno,
 										op->inputcollid);
 	if (j->pkidx == NULL || !op_in_opfamily(opno, j->pkidx->opfamily[0]))
 		return false;
@@ -248,11 +265,12 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 		return false;
 
 	/* both sides scanned as LionOrdered scans them */
-	if (!oj_side_ok(root, outerrel) || !oj_side_ok(root, innerrel))
+	if (!oj_side_ok(root, fact) || !oj_side_ok(root, dim))
 		return false;
 
-	j->fact = outerrel;
-	j->dim = innerrel;
+	j->fact = fact;
+	j->dim = dim;
+	j->keyec = rinfo->parent_ec;
 	j->keyqual = make_opclause(opno, BOOLOID, false, (Expr *) copyObject(pkarg),
 							   (Expr *) makeNullConst(righttype, -1,
 													  InvalidOid),
@@ -262,16 +280,235 @@ oj_recognize(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *outerrel,
 }
 
 /*
+ * The semi join whose inner side is x alone, minimal and syntactic - an
+ * EXISTS or an IN of x - or NULL.  *other says another special join needs
+ * x: x is in its minimal inner or outer side.  Only the syntactic outer side
+ * is let pass: an IN after another has the first's table on it, which the
+ * join does not need (oj_special_ok() asks the inner sides of them all).
+ */
+static SpecialJoinInfo *
+oj_semi_of(PlannerInfo *root, RelOptInfo *x, bool *other)
+{
+	SpecialJoinInfo *semi = NULL;
+	ListCell   *lc;
+
+	*other = false;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (sjinfo->jointype == JOIN_SEMI &&
+			bms_equal(sjinfo->min_righthand, x->relids) &&
+			bms_equal(sjinfo->syn_righthand, x->relids))
+			semi = sjinfo;
+		else if (bms_overlap(sjinfo->min_lefthand, x->relids) ||
+				 bms_overlap(sjinfo->min_righthand, x->relids) ||
+				 bms_overlap(sjinfo->syn_righthand, x->relids))
+			*other = true;
+	}
+	return semi;
+}
+
+/* Does the target carry the column `var` is of, as a plain Var? */
+static bool
+oj_target_has(PathTarget *target, Var *var)
+{
+	ListCell   *lc;
+
+	foreach(lc, target->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (IsA(v, Var) && v->varno == var->varno &&
+			v->varattno == var->varattno && v->varlevelsup == 0)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * May x, a table of joinrel, be folded into a key set of the join j
+ * (DESIGN.md §47.6)?  Appends it to j->keysets when it may:
+ *
+ *	- a table with no LATERAL reference and no TABLESAMPLE, whose cheapest
+ *	  path is unparameterized and carries the key;
+ *	- the whole inner side of a semi join - an EXISTS or an IN - whose outer
+ *	  side is in the join; or in no special join at all, inner-joined, and
+ *	  then its key unique under the clause (lion_column_is_unique()), so that
+ *	  no fact row is repeated;
+ *	- nothing of it wanted above the join (the join rel's target);
+ *	- exactly one clause joins it to the rest of the join, and that clause is
+ *	  of the key's equivalence class: the key is the fact's key, f.fk = x.k,
+ *	  whichever two columns of the class it was written between;
+ *	- its key of the fact key's type, whose equality in the class is
+ *	  hashable: the set is a hash table of that type's values;
+ *	- the keys its path is expected to return fit work_mem: the set is held
+ *	  in memory, and never spilled.
+ */
+static bool
+oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
+			 RelOptInfo *x)
+{
+	RangeTblEntry *rte = root->simple_rte_array[x->relid];
+	SpecialJoinInfo *semi;
+	bool		other;
+	Relids		rest;
+	List	   *clauses;
+	RestrictInfo *rinfo;
+	OpExpr	   *op;
+	Var		   *l;
+	Var		   *r;
+	Var		   *key;
+	Oid			type;
+	Oid			eqop = InvalidOid;
+	RegProcedure lhash;
+	RegProcedure rhash;
+	OjKeySet   *ks;
+	double		bytes;
+	int32		width;
+	ListCell   *lc;
+
+	if (j->keyec == NULL || j->keyec->ec_has_volatile || j->keyec->ec_broken)
+		return false;
+	if (x->reloptkind != RELOPT_BASEREL || rte == NULL ||
+		rte->rtekind != RTE_RELATION || rte->tablesample != NULL ||
+		!bms_is_empty(x->lateral_relids))
+		return false;
+
+	/* an EXISTS or an IN, or an inner join */
+	semi = oj_semi_of(root, x, &other);
+	if (other ||
+		(semi != NULL &&
+		 !bms_is_subset(semi->min_lefthand,
+						bms_difference(joinrel->relids, x->relids))))
+		return false;
+
+	/* nothing of it wanted above */
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		if (bms_overlap(pull_varnos(root, (Node *) lfirst(lc)), x->relids))
+			return false;
+	}
+
+	/* one clause joins it to the rest, and it is the key's */
+	rest = bms_difference(joinrel->relids, x->relids);
+	clauses = generate_join_implied_equalities(root, joinrel->relids, rest, x,
+											   NULL);
+	foreach(lc, x->joininfo)
+	{
+		RestrictInfo *ri = (RestrictInfo *) lfirst(lc);
+
+		if (bms_is_subset(ri->required_relids, joinrel->relids))
+			clauses = lappend(clauses, ri);
+	}
+	if (list_length(clauses) != 1)
+		return false;
+	rinfo = (RestrictInfo *) linitial(clauses);
+	if (!IsA(rinfo, RestrictInfo) || rinfo->parent_ec != j->keyec ||
+		!IsA(rinfo->clause, OpExpr))
+		return false;
+	op = (OpExpr *) rinfo->clause;
+	if (list_length(op->args) != 2)
+		return false;
+	l = oj_plain_var((Node *) linitial(op->args));
+	r = oj_plain_var((Node *) lsecond(op->args));
+	if (l == NULL || r == NULL)
+		return false;
+	key = (l->varno == (int) x->relid) ? l : r;
+	if (key->varno != (int) x->relid ||
+		(semi == NULL &&
+		 !lion_column_is_unique(x, key->varattno, op->opno, op->inputcollid)))
+		return false;
+
+	/* a hash table of the fact key's type */
+	type = exprType((Node *) j->fkvar);
+	if (exprType((Node *) key) != type)
+		return false;
+	foreach(lc, j->keyec->ec_opfamilies)
+	{
+		Oid			opno = get_opfamily_member(lfirst_oid(lc), type, type,
+											   BTEqualStrategyNumber);
+
+		if (OidIsValid(opno) && op_hashjoinable(opno, type) &&
+			get_op_hash_functions(opno, &lhash, &rhash) && lhash == rhash)
+		{
+			eqop = opno;
+			break;
+		}
+	}
+	if (!OidIsValid(eqop))
+		return false;
+
+	/* the cheapest path, with the key, and the set it makes in work_mem */
+	if (x->cheapest_total_path == NULL ||
+		x->cheapest_total_path->param_info != NULL ||
+		!oj_target_has(x->reltarget, key))
+		return false;
+	width = get_attavgwidth(rte->relid, key->varattno);
+	if (width <= 0)
+		width = get_typavgwidth(type, key->vartypmod);
+	bytes = x->cheapest_total_path->rows *
+		(2.0 * (sizeof(Datum) + sizeof(uint32) + sizeof(char) + 3) +
+		 (get_typbyval(type) ? 0.0 : MAXALIGN(width) + 16.0));
+	if (bytes > (double) work_mem * 1024.0)
+		return false;
+
+	ks = (OjKeySet *) palloc0(sizeof(OjKeySet));
+	ks->rel = x;
+	ks->keyvar = key;
+	ks->path = x->cheapest_total_path;
+	ks->eqop = eqop;
+	ks->collation = j->keyec->ec_collation;
+	ks->rows = clamp_row_est(x->cheapest_total_path->rows);
+	j->keysets = lappend(j->keysets, ks);
+	return true;
+}
+
+/*
+ * Is every special join with an inner side in joinrel the semi join of one of
+ * j's key sets?  The fact and the dimension are then inner-joined, and so is
+ * every key set that is not a semi join's.
+ */
+static bool
+oj_special_ok(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
+{
+	ListCell   *lc;
+
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		rh = bms_union(sjinfo->min_righthand,
+								   sjinfo->syn_righthand);
+		bool		mine = false;
+		ListCell   *lc2;
+
+		if (!bms_overlap(rh, joinrel->relids))
+			continue;
+		foreach(lc2, j->keysets)
+		{
+			if (sjinfo->jointype == JOIN_SEMI &&
+				bms_equal(rh, ((OjKeySet *) lfirst(lc2))->rel->relids))
+				mine = true;
+		}
+		if (!mine)
+			return false;
+	}
+	return true;
+}
+
+/*
  * The price of one LionOrderedJoin (DESIGN.md §47.3): the fact's walk as
  * LionOrdered prices it with its set (lion_ordered_walk_price()); a test of
- * each fact row's key; for each key a descent of the dimension's unique btree
- * and a test of the TID against its set; and for each member found a heap
- * fetch, its recheck and its filter; then the join's own target.  Each
- * non-NULL key is taken to name a dimension row: the join is on a foreign
- * key.  *rows is what it returns: the keys' share of the dimension's rows
- * pass its quals (lion_probe_rel_rows()).  *share is the share of the walk
- * the query's LIMIT is expected to take, *probes the descents of the whole
- * walk.
+ * each fact row's key, and of each key against the key sets, built before the
+ * walk from their tables' plans; for each key left a descent of the
+ * dimension's unique btree and a test of the TID against its set; and for
+ * each member found a heap fetch, its recheck and its filter; then the join's
+ * own target.  Each non-NULL key is taken to name a dimension row - the join
+ * is on a foreign key - and a key set to let through the share of them its
+ * keys are of the dimension's rows.  *rows is what it returns: the keys' share
+ * of the dimension's rows pass its quals (lion_probe_rel_rows()).  *share is
+ * the share of the walk the query's LIMIT is expected to take, *probes the
+ * descents of the whole walk.
  */
 static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
@@ -281,6 +518,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	RelOptInfo *dim = j->dim;
 	IndexOptInfo *pkidx = j->pkidx;
 	double		nonnull;
+	double		keys;
 	double		descents;
 	double		members;
 	double		out;
@@ -293,6 +531,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	Cost		startup;
 	Cost		run;
 	QualCost	resid;
+	ListCell   *lc;
 
 	/* the fact's walk, and a test of each of its rows' keys */
 	startup = factstartup;
@@ -300,7 +539,19 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	nonnull = nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar,
 						  j->fact->relid, JOIN_INNER, NULL);
 	run += factrows * cpu_operator_cost;
-	descents = clamp_row_est(factrows * nonnull);
+	keys = clamp_row_est(factrows * nonnull);
+
+	/* the key sets: built from their plans, and each key tested in turn */
+	descents = keys;
+	foreach(lc, j->keysets)
+	{
+		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+
+		startup += ks->path->total_cost + ks->rows * cpu_operator_cost;
+		run += descents * cpu_operator_cost;
+		descents *= Min(1.0, ks->rows / dimtuples);
+	}
+	descents = clamp_row_est(descents);
 
 	/*
 	 * Each key's descent of the dimension's btree, priced as
@@ -365,9 +616,9 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 /*
  * One LionOrderedJoin path (DESIGN.md §47.2): the fact's walk of ord with its
- * set factlion, the dimension's probe with its set dimlion, priced and
- * offered to the join rel at pg_lion.pushdown_margin (§39), as LionOrdered's
- * paths are offered to their relation.
+ * set factlion, the dimension's probe with its set dimlion, the key sets,
+ * priced and offered to the join rel at pg_lion.pushdown_margin (§39), as
+ * LionOrdered's paths are offered to their relation.
  */
 static void
 oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
@@ -379,6 +630,8 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	IndexPath  *pkpath;
 	LionOrderedSet ds;
 	List	   *iocols;
+	List	   *keyinfo = NIL;
+	List	   *paths;
 	double		factrows = lion_probe_rel_rows(root, j->fact);
 	double		rows;
 	double		probes;
@@ -388,6 +641,7 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	Cost		facttotal;
 	Cost		startup;
 	Cost		total;
+	ListCell   *lc;
 
 	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, false,
 							&iocols, &factstartup, &facttotal);
@@ -404,6 +658,16 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	dimpath = lion_ordered_side_path(j->dim, pkpath, dimlion, NIL, true,
 									 clamp_row_est(probes * share),
 									 j->keyqual, rows, ds.build, ds.build);
+	paths = list_make2(factpath, dimpath);
+	foreach(lc, j->keysets)
+	{
+		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+
+		paths = lappend(paths, ks->path);
+		keyinfo = lappend(keyinfo, list_make3(ks->keyvar,
+											  list_make1_oid(ks->eqop),
+											  list_make1_oid(ks->collation)));
+	}
 
 	cp = makeNode(CustomPath);
 	cp->path.pathtype = T_CustomScan;
@@ -418,9 +682,10 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	cp->path.total_cost = total / margin;
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
-	cp->custom_paths = list_make2(factpath, dimpath);
-	cp->custom_private = list_make2(j->fkvar,
-									list_make1_oid(j->pkidx->indexoid));
+	cp->custom_paths = paths;
+	cp->custom_private = list_make3(j->fkvar,
+									list_make1_oid(j->pkidx->indexoid),
+									keyinfo);
 	cp->methods = &lion_ordjoin_path_methods;
 
 	/* a walk of an index and descents of another, as index scans are */
@@ -429,40 +694,30 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 }
 
 /*
- * set_join_pathlist_hook: LionOrderedJoin's paths for the join of outerrel,
- * the fact, and innerrel, the dimension (DESIGN.md §47.2) - one for each
- * ordered btree of the fact whose order the query wants, with each of the
- * fact's lion accesses and each of the dimension's: every pair is priced and
- * add_path() keeps what it keeps.  A side without a lion access is walked or
- * probed with no set, every row it meets filtered; one side has a set.  The
- * other orientation is the hook's other call.
+ * The paths of a join j recognized in joinrel: one for each ordered btree of
+ * the fact whose order the query wants, with each of the fact's lion accesses
+ * and each of the dimension's - every pair is priced and add_path() keeps
+ * what it keeps.  A side without a lion access is walked or probed with no
+ * set, every row it meets filtered; one side has a set, or a key set
+ * filters.
  */
 static void
-oj_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
-					 RelOptInfo *outerrel, RelOptInfo *innerrel,
-					 JoinType jointype, JoinPathExtraData *extra)
+oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 {
-	OjJoin		j;
 	List	   *ords;
 	List	   *factcands;
 	List	   *dimcands;
 	ListCell   *lc;
 
-	if (oj_prev_set_join_pathlist_hook != NULL)
-		oj_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
-									   jointype, extra);
-
-	if (!lion_enable_ordered_join || root->query_pathkeys == NIL)
+	if (!bms_is_empty(joinrel->lateral_relids) ||
+		!oj_target_ok(joinrel, bms_union(j->fact->relids, j->dim->relids)))
 		return;
-	if (!oj_recognize(root, joinrel, outerrel, innerrel, jointype, extra, &j))
-		return;
-
-	ords = lion_ordered_orders(j.fact);
+	ords = lion_ordered_orders(j->fact);
 	if (ords == NIL)
 		return;
-	factcands = lion_ordered_accesses(root, j.fact);
-	dimcands = lion_ordered_accesses(root, j.dim);
-	if (factcands == NIL && dimcands == NIL)
+	factcands = lion_ordered_accesses(root, j->fact);
+	dimcands = lion_ordered_accesses(root, j->dim);
+	if (factcands == NIL && dimcands == NIL && j->keysets == NIL)
 		return;
 	if (factcands == NIL)
 		factcands = list_make1(NULL);
@@ -488,8 +743,107 @@ oj_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 		foreach(lc2, factcands)
 		{
 			foreach(lc3, dimcands)
-				oj_add_path(root, joinrel, &j, ord, pathkeys,
+				oj_add_path(root, joinrel, j, ord, pathkeys,
 							(Path *) lfirst(lc2), (Path *) lfirst(lc3));
+		}
+	}
+}
+
+/*
+ * set_join_pathlist_hook: LionOrderedJoin's paths (DESIGN.md §47.2).
+ *
+ * The join of two tables, outerrel the fact and innerrel the dimension,
+ * inner-joined by their clauses - the other orientation is the hook's other
+ * call.  Or the join of outerrel, the fact and the dimension with key sets
+ * folded already, and innerrel, a table that only filters the key: taken
+ * apart whole (oj_keyset_of()), in the one call where innerrel is the key
+ * set's table of the highest relid, so that each join rel is offered its
+ * paths once.
+ */
+static void
+oj_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
+					 RelOptInfo *outerrel, RelOptInfo *innerrel,
+					 JoinType jointype, JoinPathExtraData *extra)
+{
+	Query	   *parse = root->parse;
+	OjJoin		j;
+	RelOptInfo *rels[OJ_MAX_RELS];
+	int			nrels = 0;
+	int			a;
+	int			b;
+	int			relid;
+
+	if (oj_prev_set_join_pathlist_hook != NULL)
+		oj_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
+									   jointype, extra);
+
+	if (!lion_enable_ordered_join || root->query_pathkeys == NIL)
+		return;
+
+	/* a plain query's join, nothing locked or written */
+	if (parse->commandType != CMD_SELECT || parse->rowMarks != NIL ||
+		root->rowMarks != NIL || extra->sjinfo == NULL)
+		return;
+	if (innerrel->reloptkind != RELOPT_BASEREL)
+		return;
+
+	if (outerrel->reloptkind == RELOPT_BASEREL)
+	{
+		/* the fact and the dimension, inner-joined */
+		if (jointype != JOIN_INNER || extra->sjinfo->jointype != JOIN_INNER ||
+			!bms_equal(joinrel->relids,
+					   bms_union(outerrel->relids, innerrel->relids)))
+			return;
+		if (oj_key_join(root, outerrel, innerrel, extra->restrictlist, &j))
+			oj_add_paths(root, joinrel, &j);
+		return;
+	}
+
+	/* a key set's table, inner-joined or the inner side of a semi join */
+	if (!((jointype == JOIN_INNER && extra->sjinfo->jointype == JOIN_INNER) ||
+		  (jointype == JOIN_SEMI && extra->sjinfo->jointype == JOIN_SEMI)))
+		return;
+	if (!bms_equal(joinrel->relids,
+				   bms_union(outerrel->relids, innerrel->relids)))
+		return;
+	relid = -1;
+	while ((relid = bms_next_member(outerrel->relids, relid)) >= 0)
+	{
+		RelOptInfo *rel = (relid < root->simple_rel_array_size) ?
+			root->simple_rel_array[relid] : NULL;
+
+		/* base relations alone: an outer join's relid has none */
+		if (rel == NULL || rel->reloptkind != RELOPT_BASEREL ||
+			nrels == OJ_MAX_RELS - 1)
+			return;
+		rels[nrels++] = rel;
+	}
+
+	/* every way of taking two tables of outerrel as the fact and dimension */
+	for (a = 0; a < nrels; a++)
+	{
+		for (b = 0; b < nrels; b++)
+		{
+			List	   *clauses;
+			int			i;
+			bool		ok = true;
+
+			if (a == b)
+				continue;
+			clauses = (rels[a]->relid < rels[b]->relid) ?
+				lion_fkjoin_pair_clauses(root, rels[a], rels[b]) :
+				lion_fkjoin_pair_clauses(root, rels[b], rels[a]);
+			if (!oj_key_join(root, rels[a], rels[b], clauses, &j))
+				continue;
+			for (i = 0; i < nrels && ok; i++)
+			{
+				if (i != a && i != b)
+					ok = rels[i]->relid < innerrel->relid &&
+						oj_keyset_of(root, joinrel, &j, rels[i]);
+			}
+			if (ok && oj_keyset_of(root, joinrel, &j, innerrel) &&
+				oj_special_ok(root, joinrel, &j))
+				oj_add_paths(root, joinrel, &j);
 		}
 	}
 }
@@ -497,7 +851,8 @@ oj_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 /*
  * PlanCustomPath: the scan slot is the fact's row and then the dimension's,
  * as the sides' plans return them - each its relation's target, in that
- * target's order - and the join's target list is evaluated over it.
+ * target's order - and the join's target list is evaluated over it; then each
+ * key set's key, for EXPLAIN.
  */
 static Plan *
 oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -506,14 +861,20 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	CustomScan *cscan = makeNode(CustomScan);
 	Var		   *fkvar = (Var *) linitial(best_path->custom_private);
 	List	   *index = (List *) lsecond(best_path->custom_private);
+	List	   *keyinfo = (List *) lthird(best_path->custom_private);
 	List	   *sctlist = NIL;
+	List	   *keyops = NIL;
+	List	   *keycolls = NIL;
+	List	   *keycols = NIL;
 	AttrNumber	resno = 1;
 	int			nfact = 0;
 	int			fkresno = 0;
 	ListCell   *lc;
+	ListCell   *lck;
 	int			side;
 
-	if (list_length(custom_plans) != 2 || clauses != NIL)
+	if (list_length(custom_plans) != 2 + list_length(keyinfo) ||
+		clauses != NIL)
 		elog(ERROR, "LionOrderedJoin: unexpected plan shape");
 	for (side = 0; side < 2; side++)
 	{
@@ -537,6 +898,39 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (fkresno == 0)
 		elog(ERROR, "LionOrderedJoin: the fact's key is not in its target");
 
+	/* each key set: its key's position in its plan's target */
+	foreach(lck, keyinfo)
+	{
+		List	   *info = (List *) lfirst(lck);
+		Var		   *key = (Var *) linitial(info);
+		Plan	   *child = (Plan *) list_nth(custom_plans,
+											  2 + foreach_current_index(lck));
+		int			col = 0;
+		int			i = 1;
+		ListCell   *lct;
+
+		foreach(lct, child->targetlist)
+		{
+			Var		   *var = (Var *) lfirst_node(TargetEntry, lct)->expr;
+
+			if (IsA(var, Var) && var->varno == key->varno &&
+				var->varattno == key->varattno)
+			{
+				col = i;
+				break;
+			}
+			i++;
+		}
+		if (col == 0)
+			elog(ERROR, "LionOrderedJoin: a key set's key is not in its plan's target");
+		keycols = lappend_int(keycols, col);
+		keyops = lappend_oid(keyops, linitial_oid((List *) lsecond(info)));
+		keycolls = lappend_oid(keycolls, linitial_oid((List *) lthird(info)));
+		sctlist = lappend(sctlist,
+						  makeTargetEntry((Expr *) copyObject(key), resno++,
+										  NULL, true));
+	}
+
 	cscan->scan.plan.targetlist = tlist;
 	cscan->scan.plan.qual = NIL;
 	cscan->scan.scanrelid = 0;
@@ -544,12 +938,70 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_plans = custom_plans;
 	cscan->custom_scan_tlist = sctlist;
 	cscan->custom_exprs = NIL;
-	cscan->custom_private = list_make2(list_make3_int(OJ_PRIV_MAGIC, nfact,
-													  fkresno),
-									   list_copy(index));
+	cscan->custom_private = list_make5(list_make4_int(OJ_PRIV_MAGIC, nfact,
+													  fkresno,
+													  list_length(keyinfo)),
+									   list_copy(index), keyops, keycolls,
+									   keycols);
 	cscan->methods = &oj_scan_methods;
 	return &cscan->scan.plan;
 }
+
+/* ---------------------------------------------------------------------
+ * Key sets (DESIGN.md §47.6): a hash table of a key type's values
+ * --------------------------------------------------------------------- */
+
+typedef struct OjKeyFuncs
+{
+	FmgrInfo	hash;
+	FmgrInfo	eq;
+	Oid			collation;
+} OjKeyFuncs;
+
+typedef struct OjKeyEnt
+{
+	Datum		key;
+	uint32		hash;
+	char		status;
+} OjKeyEnt;
+
+static inline uint32
+oj_key_hash(OjKeyFuncs *f, Datum key)
+{
+	return DatumGetUInt32(FunctionCall1Coll(&f->hash, f->collation, key));
+}
+
+static inline bool
+oj_key_equal(OjKeyFuncs *f, Datum a, Datum b)
+{
+	return DatumGetBool(FunctionCall2Coll(&f->eq, f->collation, a, b));
+}
+
+#define SH_PREFIX		ojkeys
+#define SH_ELEMENT_TYPE OjKeyEnt
+#define SH_KEY_TYPE		Datum
+#define SH_KEY			key
+#define SH_HASH_KEY(tb, k) oj_key_hash((OjKeyFuncs *) (tb)->private_data, k)
+#define SH_EQUAL(tb, a, b) oj_key_equal((OjKeyFuncs *) (tb)->private_data, a, b)
+#define SH_STORE_HASH
+#define SH_GET_HASH(tb, a) ((a)->hash)
+#define SH_SCOPE		static inline
+#define SH_DECLARE
+#define SH_DEFINE
+#include "lib/simplehash.h"
+
+typedef struct OjKeySetState
+{
+	PlanState  *child;			/* the plan the set is built from */
+	AttrNumber	col;			/* the key in its target */
+	OjKeyFuncs	funcs;
+	bool		byval;
+	int16		typlen;
+	MemoryContext cxt;			/* the set; reset per build */
+	ojkeys_hash *keys;			/* NULL: not built for this scan */
+	uint64		nkeys;			/* EXPLAIN ANALYZE: the last build's keys */
+	uint64		builds;
+} OjKeySetState;
 
 /* ---------------------------------------------------------------------
  * Executor (DESIGN.md §47.4)
@@ -564,6 +1016,9 @@ typedef struct OjState
 	int			ndim;			/* ... the dimension's, after them */
 	AttrNumber	fkresno;		/* the key among the fact's */
 	Oid			pkindex;		/* the dimension's unique btree */
+	int			nkeysets;
+	OjKeySetState *keysets;
+	uint64		rejected;		/* EXPLAIN ANALYZE: keys no key set holds */
 } OjState;
 
 static Node *
@@ -583,47 +1038,130 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	List	   *ints;
 	List	   *index;
+	List	   *keyops;
+	List	   *keycolls;
+	List	   *keycols;
 	int			ncols = list_length(cscan->custom_scan_tlist);
+	int			i;
 
 	if (list_length(cscan->custom_private) != OJ_PRIV_NMEMBERS)
 		elog(ERROR, "LionOrderedJoin: unrecognized custom_private shape");
 	ints = (List *) list_nth(cscan->custom_private, OJ_PRIV_INTS);
 	index = (List *) list_nth(cscan->custom_private, OJ_PRIV_INDEX);
-	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 3 ||
+	keyops = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYOPS);
+	keycolls = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLL);
+	keycols = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLS);
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 4 ||
 		linitial_int(ints) != OJ_PRIV_MAGIC ||
 		index == NIL || !IsA(index, OidList) || list_length(index) != 1)
 		elog(ERROR, "LionOrderedJoin: unrecognized custom_private shape");
 	st->nfact = lsecond_int(ints);
 	st->fkresno = (AttrNumber) lthird_int(ints);
+	st->nkeysets = lfourth_int(ints);
 	st->pkindex = linitial_oid(index);
-	st->ndim = ncols - st->nfact;
-	if (list_length(cscan->custom_plans) != 2 ||
-		st->nfact < 1 || st->ndim < 0 ||
+	st->ndim = ncols - st->nfact - st->nkeysets;
+	if (list_length(cscan->custom_plans) != 2 + st->nkeysets ||
+		st->nfact < 1 || st->ndim < 0 || st->nkeysets < 0 ||
 		st->fkresno < 1 || st->fkresno > st->nfact ||
 		list_length(((Plan *) linitial(cscan->custom_plans))->targetlist) !=
 		st->nfact ||
 		list_length(((Plan *) lsecond(cscan->custom_plans))->targetlist) !=
-		st->ndim)
+		st->ndim ||
+		(keyops != NIL && !IsA(keyops, OidList)) ||
+		(keycolls != NIL && !IsA(keycolls, OidList)) ||
+		(keycols != NIL && !IsA(keycols, IntList)) ||
+		list_length(keyops) != st->nkeysets ||
+		list_length(keycolls) != st->nkeysets ||
+		list_length(keycols) != st->nkeysets)
 		elog(ERROR, "LionOrderedJoin: malformed plan");
 
 	/*
 	 * The sides, run by the join alone: neither scans backward nor marks.
 	 * They are not among custom_ps, which EXPLAIN would show as nodes of
-	 * their own; the join shows their lines in its own.
+	 * their own; the join shows their lines in its own.  The key sets' plans
+	 * are core's, and EXPLAIN shows them under the join.
 	 */
 	eflags &= ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK);
 	st->fact = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate,
 							eflags);
 	st->dim = ExecInitNode((Plan *) lsecond(cscan->custom_plans), estate,
 						   eflags);
+	st->keysets = (OjKeySetState *)
+		palloc0(sizeof(OjKeySetState) * Max(st->nkeysets, 1));
+	for (i = 0; i < st->nkeysets; i++)
+	{
+		OjKeySetState *ks = &st->keysets[i];
+		Plan	   *plan = (Plan *) list_nth(cscan->custom_plans, 2 + i);
+		Oid			eqop = list_nth_oid(keyops, i);
+		RegProcedure lhash;
+		RegProcedure rhash;
+		TargetEntry *tle;
+		Oid			type;
+
+		ks->child = ExecInitNode(plan, estate, eflags);
+		node->custom_ps = lappend(node->custom_ps, ks->child);
+		ks->col = (AttrNumber) list_nth_int(keycols, i);
+		if (ks->col < 1 || ks->col > list_length(plan->targetlist))
+			elog(ERROR, "LionOrderedJoin: malformed key set");
+		tle = (TargetEntry *) list_nth(plan->targetlist, ks->col - 1);
+		type = exprType((Node *) tle->expr);
+		if (!get_op_hash_functions(eqop, &lhash, &rhash) || lhash != rhash)
+			elog(ERROR, "LionOrderedJoin: the key set's equality %u is not hashable",
+				 eqop);
+		fmgr_info(lhash, &ks->funcs.hash);
+		fmgr_info(get_opcode(eqop), &ks->funcs.eq);
+		ks->funcs.collation = list_nth_oid(keycolls, i);
+		get_typlenbyval(type, &ks->typlen, &ks->byval);
+		ks->cxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionOrderedJoin key set",
+										ALLOCSET_DEFAULT_SIZES);
+	}
 }
 
 /*
- * The next joined row: the fact's walk's next row whose key is not NULL and
- * names a dimension row that is a member of its set, visible and passes its
- * filter.  The key is unique, so one descent finds that row or none.  The
- * scan slot's values are the two sides' slots', which neither touches until
- * the join asks it for its next row.
+ * Build a key set from its plan's rows: each non-NULL key once, its value
+ * copied into the set's memory.  A NULL key matches nothing.
+ */
+static void
+oj_keyset_build(OjKeySetState *ks)
+{
+	MemoryContextReset(ks->cxt);
+	ks->keys = ojkeys_create(ks->cxt, 256, &ks->funcs);
+	ks->nkeys = 0;
+	for (;;)
+	{
+		TupleTableSlot *slot;
+		Datum		key;
+		bool		isnull;
+		bool		found;
+		OjKeyEnt   *ent;
+
+		CHECK_FOR_INTERRUPTS();
+		slot = ExecProcNode(ks->child);
+		if (TupIsNull(slot))
+			break;
+		key = slot_getattr(slot, ks->col, &isnull);
+		if (isnull)
+			continue;
+		ent = ojkeys_insert(ks->keys, key, &found);
+		if (!found)
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(ks->cxt);
+
+			ent->key = datumCopy(key, ks->byval, ks->typlen);
+			MemoryContextSwitchTo(oldcxt);
+			ks->nkeys++;
+		}
+	}
+	ks->builds++;
+}
+
+/*
+ * The next joined row: the fact's walk's next row whose key is not NULL, is
+ * in every key set and names a dimension row that is a member of its set,
+ * visible and passes its filter.  The key is unique, so one descent finds
+ * that row or none.  The scan slot's values are the two sides' slots', which
+ * neither touches until the join asks it for its next row.
  */
 static TupleTableSlot *
 oj_exec(CustomScanState *node)
@@ -631,6 +1169,16 @@ oj_exec(CustomScanState *node)
 	OjState    *st = (OjState *) node;
 	TupleTableSlot *scanslot = node->ss.ss_ScanTupleSlot;
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	int			i;
+
+	/* the key sets, before the walk: one that is empty ends the scan */
+	for (i = 0; i < st->nkeysets; i++)
+	{
+		if (st->keysets[i].keys == NULL)
+			oj_keyset_build(&st->keysets[i]);
+		if (st->keysets[i].nkeys == 0)
+			return NULL;
+	}
 
 	ResetExprContext(econtext);
 	for (;;)
@@ -649,6 +1197,16 @@ oj_exec(CustomScanState *node)
 		key = slot_getattr(fslot, st->fkresno, &isnull);
 		if (isnull)
 			continue;			/* the clause is strict: no row matches */
+		for (i = 0; i < st->nkeysets; i++)
+		{
+			if (ojkeys_lookup(st->keysets[i].keys, key) == NULL)
+				break;
+		}
+		if (i < st->nkeysets)
+		{
+			st->rejected++;
+			continue;
+		}
 
 		lion_ordered_probe_key(st->dim, key);
 		dslot = ExecProcNode(st->dim);
@@ -668,6 +1226,13 @@ oj_exec(CustomScanState *node)
 			memcpy(scanslot->tts_isnull + st->nfact, dslot->tts_isnull,
 				   sizeof(bool) * st->ndim);
 		}
+		/* the key sets' keys, which no row holds */
+		for (i = st->nfact + st->ndim;
+			 i < scanslot->tts_tupleDescriptor->natts; i++)
+		{
+			scanslot->tts_values[i] = (Datum) 0;
+			scanslot->tts_isnull[i] = true;
+		}
 		ExecStoreVirtualTuple(scanslot);
 
 		if (node->ss.ps.ps_ProjInfo == NULL)
@@ -680,45 +1245,80 @@ oj_exec(CustomScanState *node)
 /*
  * The walk restarts; the dimension is rescanned at its next descent anyway.
  * A changed Param reaches each side, whose rescan rebuilds its set only when
- * its lion quals use the Param (DESIGN.md §30.4).
+ * its lion quals use the Param (DESIGN.md §30.4), and each key set's plan,
+ * whose set is rebuilt only when the plan depends on it.
  */
 static void
 oj_rescan(CustomScanState *node)
 {
 	OjState    *st = (OjState *) node;
+	int			i;
 
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 	if (node->ss.ps.chgParam != NULL)
 	{
 		UpdateChangedParamSet(st->fact, node->ss.ps.chgParam);
 		UpdateChangedParamSet(st->dim, node->ss.ps.chgParam);
+		for (i = 0; i < st->nkeysets; i++)
+			UpdateChangedParamSet(st->keysets[i].child, node->ss.ps.chgParam);
 	}
 	if (st->fact->chgParam == NULL)
 		ExecReScan(st->fact);
+	for (i = 0; i < st->nkeysets; i++)
+	{
+		/* rescanned by its next ExecProcNode(), as the set is rebuilt */
+		if (st->keysets[i].child->chgParam != NULL)
+			st->keysets[i].keys = NULL;
+	}
 }
 
 static void
 oj_end(CustomScanState *node)
 {
 	OjState    *st = (OjState *) node;
+	int			i;
 
 	if (st->fact != NULL)
 		ExecEndNode(st->fact);
 	if (st->dim != NULL)
 		ExecEndNode(st->dim);
+	for (i = 0; i < st->nkeysets; i++)
+	{
+		if (st->keysets[i].child != NULL)
+			ExecEndNode(st->keysets[i].child);
+		st->keysets[i].child = NULL;
+		st->keysets[i].keys = NULL;
+	}
 	st->fact = NULL;
 	st->dim = NULL;
+}
+
+/* A relation as EXPLAIN names it, its alias after it when that differs */
+static void
+oj_explain_rel(StringInfo buf, Index rti, ExplainState *es)
+{
+	RangeTblEntry *rte = rt_fetch(rti, es->rtable);
+	char	   *refname = (char *) list_nth(es->rtable_names, rti - 1);
+	char	   *relname = get_rel_name(rte->relid);
+
+	appendStringInfoString(buf, quote_identifier(relname != NULL ?
+												 relname : "???"));
+	if (refname != NULL && (relname == NULL || strcmp(refname, relname) != 0))
+		appendStringInfo(buf, " %s", quote_identifier(refname));
 }
 
 /*
  * EXPLAIN (DESIGN.md §47.5): the fact's walk's lines, as LionOrdered prints
  * them; the dimension, by its relation and its unique btree, and its probe's
- * lines behind "Dimension "; and under ANALYZE the counters of each.
+ * lines behind "Dimension "; the key sets' tables; and under ANALYZE the
+ * counters of each.
  */
 static void
 oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	OjState    *st = (OjState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+
 	/*
 	 * The sides' expressions are deparsed with the join as their parent, in a
 	 * copy of the ancestors: lcons() extends the list in place, and the
@@ -729,31 +1329,59 @@ oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	 */
 	List	   *anc = lcons(node->ss.ps.plan, list_copy(ancestors));
 	Scan	   *dscan = (Scan *) st->dim->plan;
-	RangeTblEntry *rte = rt_fetch(dscan->scanrelid, es->rtable);
-	char	   *refname = (char *) list_nth(es->rtable_names,
-											dscan->scanrelid - 1);
-	char	   *relname = get_rel_name(rte->relid);
 	char	   *idxname = get_rel_name(st->pkindex);
 	StringInfoData buf;
+	int			i;
 
 	lion_ordered_explain_side(st->fact, anc, es, NULL, false);
 
 	initStringInfo(&buf);
-	appendStringInfoString(&buf, quote_identifier(relname != NULL ?
-												  relname : "???"));
-	if (refname != NULL && (relname == NULL || strcmp(refname, relname) != 0))
-		appendStringInfo(&buf, " %s", quote_identifier(refname));
+	oj_explain_rel(&buf, dscan->scanrelid, es);
 	appendStringInfo(&buf, " via %s",
 					 quote_identifier(idxname != NULL ? idxname : "???"));
 	ExplainPropertyText("Dimension", buf.data, es);
-	pfree(buf.data);
 	lion_ordered_explain_side(st->dim, anc, es, "Dimension ", false);
+
+	if (st->nkeysets > 0)
+	{
+		resetStringInfo(&buf);
+		for (i = 0; i < st->nkeysets; i++)
+		{
+			TargetEntry *tle = (TargetEntry *)
+				list_nth(cscan->custom_scan_tlist, st->nfact + st->ndim + i);
+			Var		   *key = (Var *) tle->expr;
+
+			if (i > 0)
+				appendStringInfoString(&buf, ", ");
+			if (IsA(key, Var))
+				oj_explain_rel(&buf, key->varno, es);
+			else
+				appendStringInfoString(&buf, "???");
+		}
+		ExplainPropertyText("Key Sets", buf.data, es);
+	}
 
 	if (es->analyze)
 	{
 		lion_ordered_explain_side(st->fact, anc, es, NULL, true);
+		if (st->nkeysets > 0)
+		{
+			uint64		nkeys = 0;
+			uint64		builds = 0;
+
+			for (i = 0; i < st->nkeysets; i++)
+			{
+				nkeys += st->keysets[i].nkeys;
+				builds += st->keysets[i].builds;
+			}
+			ExplainPropertyInteger("Key Set Keys", NULL, (int64) nkeys, es);
+			ExplainPropertyInteger("Key Set Builds", NULL, (int64) builds, es);
+			ExplainPropertyInteger("Keys Rejected by Key Sets", NULL,
+								   (int64) st->rejected, es);
+		}
 		lion_ordered_explain_side(st->dim, anc, es, "Dimension ", true);
 	}
+	pfree(buf.data);
 }
 
 /* ---------------------------------------------------------------------
