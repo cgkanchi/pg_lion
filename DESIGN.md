@@ -28759,14 +28759,21 @@ the key is written into the scan key's argument at run time.
 
 ### 47.3 Cost (`oj_cost()`)
 
-In the planner's units, on the walk's own price; no §39 rate and no cold units. With `factrows`
-the fact's rows after its quals as lion estimates them (`lion_probe_rel_rows()`):
+In the planner's units, on the walk's own price, with no §39 rate; cold, weighed against core's
+nested loop by §39's cold reads ("Cold reads" below). With `factrows` the fact's rows after its
+quals as lion estimates them (`lion_probe_rel_rows()`):
 
 - **The fact's walk**: `lion_ordered_walk_price()`, which is `lo_cost()` (§30.3, §40.3) over the
   whole walk - the set's build, the entries walked, the members' fetches (in index-only mode the
   pages not all-visible, and every candidate where an inexact set's columns are not in the
   B-tree), the filter, the fact's target - with no set where the fact has no lion access (`lion`
-  NULL, as §46 prices it). A `cpu_operator_cost` a fact row for its key's test.
+  NULL, as §46 prices it). The set's build is priced as a probe's (`lo_cost()`'s `probebuild`):
+  its lion access's bitmap index scan price less `lo_build_excess()`, the TIDs past
+  `LO_BUILD_PIECE_TIDS` a container piece, as the dimension's set and §40.10's probe are priced -
+  3,772 down to about 960 for §47.9's `chan = 3`, 8,401 to about 2,250 for `tags @> '{a1}'`. A plain
+  LionOrdered walk keeps the bitmap scan's price (§30.3): its walk is most of its price, where the
+  LIMIT scales this one's walk and not its build. A `cpu_operator_cost` a fact row for its key's
+  test.
 - **The keys**: `keys = factrows * P(fk IS NOT NULL)` (`nulltestsel()`). Each key set adds its
   plan's total cost and a `cpu_operator_cost` a key to the startup, a `cpu_operator_cost` to each
   key still tested, and lets through the share of keys its keys are of the dimension's rows,
@@ -28805,6 +28812,41 @@ set whose walk goes on builds itself once its probes have cost what the build wo
 build more, where a set built at once for a walk that stops after a few hundred entries costs the
 whole build: the lazy error is the cheaper one. The left joins and NOT EXISTS above the node keep
 its rows about one to one with the LIMIT's.
+
+**Cold reads** (`oj_competitor()`, the end of `oj_cost()`), as §46 weighs them (§39, "A nested
+loop's cold reads", `lion_units_cold()`). The competitor is the plan the LIMIT would take of the
+join rel's paths as core leaves them when the hook runs, found before the node's first path is
+added (`add_path()` frees the paths a new one dominates): unparameterized, with no lion path inside
+(`lion_path_has_lion()`), not disabled; one whose first sort key is the walk's at its startup and
+the LIMIT's share of its run, any other at its total, which the Sort above it reads whole. It is
+not `lion_competitor_path()`'s, the cheapest total, which here is a hash join at §39's rate for one,
+0.5: under a LIMIT core takes neither that plan nor its whole price. Only a nested loop in the
+walk's order is weighed; a hash join and its Sort read the two sides through bitmap heap scans,
+which §46 does not weigh either.
+Over the LIMIT's share `s` of the walk (`*share`), with `walked` the entries of the fact's B-tree
+its Index Cond selects:
+
+- **the loop's reads** (`corereads`): a leaf of the dimension's key and a dimension heap page for
+  each key it keeps, `index_pages_fetched(s * keys)` over the B-tree's pages and over the
+  dimension's; and where the loop's outer side is the fact's index scan, a fact heap page for each
+  entry it walks, `index_pages_fetched(s * walked)` over the fact's pages - in an index-only scan
+  those not all-visible, `1 - allvisfrac` of them;
+- **the node's** (`ownreads`): the fact heap pages of its fetches (`lo_cost()`'s fetches of the
+  whole walk, `fetches_p`), a leaf a descent and a dimension heap page a member, each
+  `index_pages_fetched()` of `s` of them; the lion index pages the two sets' builds read
+  (`lo_lion_pages()`, `LionOrderedSet.lionpages`); and each key set's table, whole.
+
+Each page is charged `lion_units_cold_page()`, `perpage`: `pg_lion.cold_page_cost` less the
+`random_page_cost` core charged it, in the share of the query's tables and the two B-trees
+`effective_cache_size` cannot hold, 0 where it holds them all. The startup and total are then
+multiplied by
+
+    (own + ownreads * perpage) * core / ((core + corereads * perpage) * own)
+
+`own` the node's price of the LIMIT's share (`startup + s * run`), `core` the competitor's: at most
+1, a node that reads more than the loop keeping its price, and at least 1 /
+`pg_lion.cold_max_discount`. Warm it is 1. A Memoize over the loop's index scan is not counted, as
+§39 does not count one: the LIMIT's share of the walk meets few keys twice.
 
 ### 47.4 Execution (`oj_begin()`, `oj_exec()`, `oj_rescan()`)
 
@@ -28908,14 +28950,16 @@ the node's rows to them above is the plan.
   larger than planned is held all the same, never spilled. A hash join spills; a key set's
   rejections would have to be held back until its batches are read, which the walk's order
   forbids.
-- **§39's cold units.** The price is warm. The node's gain over core's nested loop is largest
-  cold - core reads a dimension heap page for each fact row the walk keeps, the node only for a
-  member - and the price does not see it; §46 applies `lion_units_cold()`, this does not yet.
+- **Core's Memoize, warm.** Core prices a Memoize over its loop's index scan on the hit ratio of
+  the whole walk's keys, which the LIMIT's share of the walk does not reach; the node's descents
+  are priced in full. Warm, it keeps the medium pages core's, where the node runs 1.4 to 3.5 times
+  faster (§47.9); the price does not correct core's.
+- **Cold reads against lion's own loop.** The competitor is core's plan without lion's paths. Where
+  the plan the node meets is core's nested loop over a LionOrdered walk (§47.9's deep page, cold),
+  that loop's dimension reads are not weighed against the node's; core's plan without lion's is
+  there a hash join, which is not weighed at all.
 - **The switch's price.** The fetch-and-sort switch acts at run time on what the walk meets; the
   path is priced as a walk to the end.
-- **The fact's set's build price** is `lo_cost()`'s, its lion access's bitmap index scan price, per
-  TID; the dimension's takes the excess over the containers' reads off (§40.10). §47.9 measures
-  what that costs the plan choice.
 - **The dimension index-only.** The probe always reads the member's heap row. Where a B-tree on the
   key holds every column the query reads of the dimension, §40.10's nested loop probe
   (`LionBtreeScan`) answers it from the index; a covering form of the join's probe is not built.
@@ -28936,27 +28980,28 @@ lion's paths priced at a thousandth so that the join is the node wherever it may
 core's plan with the node off, and the answers compared row by row, in order, every ORDER BY ending
 in a unique key; `oj()` says whether the first plan was the node and how many key sets it had. The
 plan chosen with nothing forced: the node for a page the walk fills early, core's hash join and sort
-for one whose rows are rare. The walk forward and backward, NULLs where the order puts them; an
-OFFSET; a side with no lion clause, each way; an inexact dimension set, rechecked; a fact filter; an
-Incremental Sort above for a trailing dimension key, a LEFT JOIN and a LEFT JOIN ... IS NULL to a
-third table, and under a LEFT JOIN with LIMIT 5 the dimension's set lazy and built on its probe
-budget (`after 20 keys probed (probe budget)`, §47.3's share); a generic plan's Param in a lion
-qual; a LATERAL subquery rescanned for four outer rows, the dimension's set, which depends on their
-value, rebuilt for each (`4 builds`) and the fact's built once. Key sets: two at once (an IN on the
-fact's key, an IN on the dimension's of a table whose keys repeat), an IN, an EXISTS, an inner join
-to a unique column, an empty set ending the scan, a set rebuilt for each value of a LATERAL rescan
-(`Key Set Builds: 4`); and what is not a key set - an inner join to a column that is not unique, a
-table a column of which the query wants, a NOT EXISTS, keys past `work_mem` (64 kB). Two different
-tables make the two key sets: PostgreSQL 19 merges two semi joins of one table into one. The fact's
-walk index-only, with a set, with none, and with an inexact set whose columns the B-tree lacks
-(`Heap Fetches` its candidates); the switch, made due at once by `pg_lion.ordered_switch_ratio = 1`.
-Declined: a second join clause, a key that is not unique, `FOR SHARE`, no lion clause on either
-side, the setting off (core's nested loop over a Memoize).
+for one whose rows are rare; core's nested loop over the fact's LionOrdered walk for a third warm,
+the node at `effective_cache_size = 1MB` (§47.3's cold reads). The walk forward and backward, NULLs
+where the order puts them; an OFFSET; a side with no lion clause, each way; an inexact dimension
+set, rechecked; a fact filter; an Incremental Sort above for a trailing dimension key, a LEFT JOIN
+and a LEFT JOIN ... IS NULL to a third table, and under a LEFT JOIN with LIMIT 5 the dimension's set
+lazy and built on its probe budget (`after 20 keys probed (probe budget)`, §47.3's share); a generic
+plan's Param in a lion qual; a LATERAL subquery rescanned for four outer rows, the dimension's set,
+which depends on their value, rebuilt for each (`4 builds`) and the fact's built once. Key sets: two
+at once (an IN on the fact's key, an IN on the dimension's of a table whose keys repeat), an IN, an
+EXISTS, an inner join to a unique column, an empty set ending the scan, a set rebuilt for each value
+of a LATERAL rescan (`Key Set Builds: 4`); and what is not a key set - an inner join to a column
+that is not unique, a table a column of which the query wants, a NOT EXISTS, keys past `work_mem`
+(64 kB). Two different tables make the two key sets: PostgreSQL 19 merges two semi joins of one
+table into one. The fact's walk index-only, with a set, with none, and with an inexact set whose
+columns the B-tree lacks (`Heap Fetches` its candidates); the switch, made due at once by
+`pg_lion.ordered_switch_ratio = 1`. Declined: a second join clause, a key that is not unique, `FOR
+SHARE`, no lion clause on either side, the setting off (core's nested loop over a Memoize).
 
 btreescan_param.sql's cursor section turns the node off: under that section's
 `pushdown_margin = 1000` the node took the join from the `LionBtreeScan` probe the section tests.
 
-### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB, every table and index in it: warm; EXPLAIN (ANALYZE, TIMING OFF), the median of seven runs after one)
+### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
 A 5,000,000-row fact table (554 MB; its key uniform over the dimension, every 101st NULL; `score`
 uncorrelated with the heap) with a B-tree `(score DESC) INCLUDE (fk, id)` (193 MB) and lion
@@ -28966,21 +29011,27 @@ ten-value `kind`, a hundred-value `lvl`, a bool `flag` and a five-value `region`
 table. The query is `SELECT f.id, f.score, f.amount, d.pk, d.region FROM bfact f JOIN bdim d ON
 f.fk = d.pk WHERE ... ORDER BY f.score DESC LIMIT 20`, `amount` in no index, so that the fact's
 walk is in heap mode; without it the walk is index-only. "Walked" is the node's `Index Entries
-Walked`. The plan with the node on and off was the same, core's, in every row; the node's time is
-with `pg_lion.pushdown_margin = 1000`.
+Walked`. Warm: every table and index in shared buffers, the median of seven runs after one. Cold:
+`effective_cache_size = 400MB`, which the tables and B-trees, about 870 MB, are twice, as a
+50-million-row fact table is twice the default 4 GB; the cluster restarted and the kernel's page
+cache dropped before each run, the median of three. "Planned" is the plan with nothing forced, at
+the default 4 GB and at 400 MB; the node's time where it was not planned is with
+`pg_lion.pushdown_margin = 1000`. Core's cold time is the plan with the node off, which for the
+medium pages, the key set's and the deep one is core's nested loop over lion's LionOrdered walk of
+the fact and a Memoize.
 
-| page | WHERE | walked | core's plan | its time | the node |
-|---|---|---|---|---|---|
-| dense | `f.chan = 3 AND d.region = 'north'` | 720 | nested loop, Memoize | 0.88 ms | 1.67 ms |
-| dense | `f.tags @> '{a1}' AND d.region = 'north'` | 491 | nested loop | 1.03 ms | 1.82 ms |
-| dense | `f.chan = 3 AND d.lvl < 50` | 248 | nested loop | 0.59 ms | 7.61 ms |
-| dense, a key set | the first, `AND f.fk IN (SELECT k FROM bwatch WHERE active)` | 2,829 | nested loops | 2.42 ms | 3.43 ms |
-| medium | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 34.0 ms | 11.6 ms |
-| medium | `f.tags @> '{a1}' AND d.lvl = 3 AND d.flag` | 9,595 | nested loop | 11.6 ms | 6.9 ms |
-| medium, index-only | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 31.7 ms | 9.0 ms |
-| the dimension's only, index-only | `d.lvl = 3 AND d.flag` | 3,902 | nested loop, Index Only Scan | 6.9 ms | 5.1 ms |
-| dense, OFFSET 2000 | `f.chan = 3 AND d.region = 'north'` | 81,388 | nested loop | 101 ms | 49 ms |
-| sparse | `f.tags @> '{a1}' AND f.tags @> '{b2}' AND d.lvl = 3 AND d.kind = 3` | 730,643 | hash join, Sort | 67.8 ms | 173 ms |
+| page | WHERE | walked | core's plan | warm: core | the node | planned, 4 GB | planned, 400 MB | cold: core | the node |
+|---|---|---|---|---|---|---|---|---|---|
+| dense | `f.chan = 3 AND d.region = 'north'` | 720 | nested loop, Memoize | 0.88 ms | 1.67 ms | core | node | 45.0 ms | 17.6 ms |
+| dense | `f.tags @> '{a1}' AND d.region = 'north'` | 491 | nested loop | 1.03 ms | 1.82 ms | core | core | 36.1 ms | 15.8 ms |
+| dense | `f.chan = 3 AND d.lvl < 50` | 248 | nested loop | 0.59 ms | 7.61 ms | core | core | 18.1 ms | 19.4 ms |
+| dense, a key set | the first, `AND f.fk IN (SELECT k FROM bwatch WHERE active)` | 2,829 | nested loops | 2.42 ms | 3.43 ms | core | node | 29.1 ms | 28.6 ms |
+| medium | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 34.0 ms | 11.6 ms | core | node | 343 ms | 195 ms |
+| medium | `f.tags @> '{a1}' AND d.lvl = 3 AND d.flag` | 9,595 | nested loop | 11.6 ms | 6.9 ms | core | node | 244 ms | 159 ms |
+| medium, index-only | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 31.7 ms | 9.0 ms | core | node | 190 ms | 39.0 ms |
+| the dimension's only, index-only | `d.lvl = 3 AND d.flag` | 3,902 | nested loop, Index Only Scan | 6.9 ms | 5.1 ms | core | core | 189 ms | 29.3 ms |
+| dense, OFFSET 2000 | `f.chan = 3 AND d.region = 'north'` | 81,388 | nested loop | 101 ms | 49 ms | core | core | 893 ms | 727 ms |
+| sparse | `f.tags @> '{a1}' AND f.tags @> '{b2}' AND d.lvl = 3 AND d.kind = 3` | 730,643 | hash join, Sort | 67.8 ms | 173 ms | core | core | 534 ms | 1,184 ms |
 
 Where the page is neither dense nor sparse the node runs 1.4 to 3.5 times faster than core's nested
 loop, which fetches every fact row the walk meets to test the fact's filter and reads the
@@ -28994,15 +29045,31 @@ dimension (`lvl < 50`, fifty posting lists) is always built at once, 7 ms; a key
 whole first, a Seq Scan of 20,000 rows. Where it is sparse the walk meets 730,000 entries for twenty
 rows, and core's hash join of the two sets and its sort is 2.6 times faster.
 
-The planner kept core's plan in every row: rightly where the page is dense or sparse, wrongly for
-the medium pages and the deep one. The node's price (§47.3) is the limit's share of a walk to the
-end, at warm units; two terms of it are high against core's. The fact's set is priced as `lo_cost()`
-prices a LionOrdered walk's, at its lion access's bitmap index scan price - 3,772 for `chan = 3`'s
-625,000 rows, 8,401 for `tags @> '{a1}'`'s 1.26 million, per-TID CPU - where the run builds it from
-its containers in about a millisecond; the dimension's set takes that excess off
-(`lion_ordered_set_price()`, §40.10). And the members' heap fetches are Mackert and Lohman over the
-walk's members, 625,000 fetches over the table's 70,900 pages charged about 0.45 each, where core's
-Index Scan, priced as fetching all five million rows of its walk, is charged about 0.06 a fetch, and
-the LIMIT takes the same share of each. §47.7 lists the price's other omissions; cold, which §39's
-units would weigh, core's nested loop reads a fact heap page for each entry the walk meets. Not
-measured: cold caches, other majors.
+Warm, the planner keeps core's plan in every row: rightly where the page is dense or sparse, wrongly
+for the medium pages and the deep one. The fact's set's build no longer keeps it (§47.3: `chan =
+3`'s 3,772 now about 960), nor the fact's heap: the node's fetches are Mackert and Lohman's over the
+walk's 625,000 members and the table's 70,900 pages, about 0.45 a fetch, and core's Index Scan
+fetches all five million rows of its walk over the same pages, about 0.06 a fetch, eight to a
+member: 0.45 for each row either keeps. Core's Memoize keeps it. The medium scalar page: the node
+1,150..818,180 for 4,129 rows, its Limit 1,150..5,110; core's nested loop 0.9..587,688 for the same
+rows, its Limit 0.9..2,847. A descent of the node's is `btcostestimate()`'s, `(tree_height + 1) *
+50` operator costs and its comparisons, 0.39; core's probe is the same index scan under a Memoize,
+priced on its hit ratio over the whole walk, 625,000 keys of 200,000 dimension rows, about 68%:
+117,569 for the 625,000 probes, 0.19 a probe. The LIMIT's share of the walk meets a few thousand
+keys, nearly all distinct, and gets almost none of those hits. The dense page `f.chan = 3 AND
+d.region = 'north'`: the node 1,280..861,590 for 123,747 rows, its Limit 1,280..1,420, its sets'
+builds most of it; core's loop over a Memoize, its Limit 95.8.
+
+Cold, the cold reads (§47.3) take the node's price down by 0.70 and 0.59 for the medium pages in
+heap mode, 0.74 for the key set's, and by the cap, a half, for the others it is weighed in, and the
+plan flips to the node for the medium pages, the dense scalar one and the key set's. Each flip is
+right: the medium pages 1.8, 1.5 and 4.9 times faster than the plan without the node, the dense one
+2.6 times, the key set's a tie. Core's plan stays, rightly, for the sparse page (534 against 1,184
+ms) and the dense range (18.1 against 19.4 ms); and wrongly for the dense multi-key page (36 against
+16 ms), the dimension's only (189 against 29 ms) and the deep page (893 against 727 ms). The first
+two are Memoize's again: core's loops at 944 and 621 under the LIMIT, the node's own prices 3,219
+and 6,649 before the factor, of which the cap takes at most half. The deep page's plan is core's
+loop over lion's LionOrdered walk, 42,317 against the node's 46,920; the competitor its cold reads
+are weighed against, core's cheapest plan without lion's under the LIMIT, is there the hash join
+(101,117, its Sort above), which is not weighed (§47.7). At 256 MB the plans are the same. Not
+measured: other majors.

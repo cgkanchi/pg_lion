@@ -846,17 +846,19 @@ working around a bad choice:
   never parallel and never the inner side of a parameterized nested loop. The fact's walk is
   index-only where its B-tree holds every column of the fact the query reads (`Ordered By: <index>
   (index only)`); the dimension's row is read from its heap once its entry has passed the
-  dimension's set, never from an index. The planner prices the walk,
-  a B-tree descent per key and the dimension rows read, warm, divided by
-  `pg_lion.pushdown_margin`. EXPLAIN prints `Ordered By`, `Index Cond`, `Filter`, `Lion Cond` and
-  `Lion Indexes` for the fact, `Dimension: <table> via <index>` with `Dimension Filter`,
-  `Dimension Lion Cond` and `Dimension Lion Indexes`, and `Key Sets: <tables>`, each key set's
-  table's plan below the node; `EXPLAIN ANALYZE` adds the fact's `Index Entries Walked`, `Lion Set
-  Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`, `Rows Removed by Filter`, `Lion Set`,
-  `Switched to Fetch and Sort` and `Scans Stopped Early`; `Key Set Keys`, `Key Set Builds` and
-  `Keys Rejected by Key Sets`; and the dimension's `Dimension Descents`, `Dimension Lion Set
-  Hits`, `Dimension Heap Fetches`, `Dimension Rows Removed by Lion Recheck`, `Dimension Rows
-  Removed by Filter` and `Dimension Lion Set`:
+  dimension's set, never from an index. The planner prices the walk, a B-tree descent per key and
+  the dimension rows read, divided by `pg_lion.pushdown_margin`; where the tables do not fit in
+  `effective_cache_size` and PostgreSQL's cheapest plan under the `LIMIT` is a nested loop in the
+  walk's order, the pages each reads outside the cache are charged `pg_lion.cold_page_cost`, which
+  takes the node's price down by at most `pg_lion.cold_max_discount`. EXPLAIN prints `Ordered
+  By`, `Index Cond`, `Filter`, `Lion Cond` and `Lion Indexes` for the fact, `Dimension: <table>
+  via <index>` with `Dimension Filter`, `Dimension Lion Cond` and `Dimension Lion Indexes`, and
+  `Key Sets: <tables>`, each key set's table's plan below the node; `EXPLAIN ANALYZE` adds the
+  fact's `Index Entries Walked`, `Lion Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`,
+  `Rows Removed by Filter`, `Lion Set`, `Switched to Fetch and Sort` and `Scans Stopped Early`; `Key
+  Set Keys`, `Key Set Builds` and `Keys Rejected by Key Sets`; and the dimension's `Dimension
+  Descents`, `Dimension Lion Set Hits`, `Dimension Heap Fetches`, `Dimension Rows Removed by Lion
+  Recheck`, `Dimension Rows Removed by Filter` and `Dimension Lion Set`:
 
       Limit
         ->  Custom Scan (LionOrderedJoin)

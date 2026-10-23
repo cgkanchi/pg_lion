@@ -497,6 +497,94 @@ oj_special_ok(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 }
 
 /*
+ * The core plan a LionOrderedJoin path competes with (DESIGN.md §47.3,
+ * "Cold reads"), found before the first of its paths is added: add_path()
+ * frees the paths a new one dominates.
+ */
+typedef struct OjCompetitor
+{
+	bool		nestloop;		/* a nested loop into an index scan, in the
+								 * walk's order */
+	bool		factwalk;		/* ... whose outer side is the fact's index
+								 * scan */
+	bool		indexonly;		/* ... index-only */
+	Cost		cost;			/* its price of the LIMIT's rows */
+} OjCompetitor;
+
+/* The share of a path's rows the query's LIMIT takes: all without one */
+static double
+oj_limit_share(PlannerInfo *root, double rows)
+{
+	if (root->limit_tuples <= 0 || rows <= 0)
+		return 1.0;
+	return Min(1.0, root->limit_tuples / rows);
+}
+
+/*
+ * The plan the LIMIT would take of core's paths of joinrel so far (core adds
+ * them before it calls the hook): unparameterized, with no lion path inside
+ * (lion_path_has_lion()), not disabled; an ordered one - its first sort key
+ * the walk's - at its price of the LIMIT's share of its rows, any other at
+ * its total, which the Sort over it reads whole.  Only a nested loop into an
+ * index scan in the walk's order is weighed for its cold reads; a hash join
+ * and its Sort read the two sets' heaps as bitmap scans, which §46 does not
+ * weigh either.
+ */
+static void
+oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
+			  List *pathkeys, OjCompetitor *c)
+{
+	Path	   *best = NULL;
+	bool		bestordered = false;
+	ListCell   *lc;
+
+	memset(c, 0, sizeof(OjCompetitor));
+	foreach(lc, joinrel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		bool		ordered;
+		Cost		cost;
+
+		if (p->param_info != NULL || lion_path_has_lion(p) ||
+			lion_path_disabled(p))
+			continue;
+		ordered = (p->pathkeys != NIL && pathkeys != NIL &&
+				   linitial(p->pathkeys) == linitial(pathkeys));
+		cost = ordered ?
+			p->startup_cost + oj_limit_share(root, p->rows) *
+			(p->total_cost - p->startup_cost) :
+			p->total_cost;
+		if (best == NULL || cost < c->cost)
+		{
+			best = p;
+			bestordered = ordered;
+			c->cost = cost;
+		}
+	}
+	if (best == NULL || !bestordered ||
+		lion_competitor_kind(best) != LION_COMPETITOR_NESTLOOP)
+		return;
+	c->nestloop = true;
+
+	/* the loop's outermost side: the fact's walk, or something else */
+	while (best != NULL && !IsA(best, IndexPath))
+	{
+		if (IsA(best, NestPath) || IsA(best, MergePath) ||
+			IsA(best, HashPath))
+			best = ((JoinPath *) best)->outerjoinpath;
+		else if (IsA(best, ProjectionPath))
+			best = ((ProjectionPath *) best)->subpath;
+		else
+			best = NULL;
+	}
+	if (best != NULL && best->parent == fact)
+	{
+		c->factwalk = true;
+		c->indexonly = (best->pathtype == T_IndexOnlyScan);
+	}
+}
+
+/*
  * The price of one LionOrderedJoin (DESIGN.md §47.3): the fact's walk as
  * LionOrdered prices it with its set (lion_ordered_walk_price()); a test of
  * each fact row's key, and of each key against the key sets, built before the
@@ -509,11 +597,29 @@ oj_special_ok(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
  * of the dimension's rows pass its quals (lion_probe_rel_rows()).  *share is
  * the share of the walk the query's LIMIT is expected to take, *probes the
  * descents of the whole walk.
+ *
+ * Then §39's cold reads, as LionProbeJoin weighs them (lion_units_cold()),
+ * against comp, core's nested loop over the same walk, both over the LIMIT's
+ * share s of the walk: the loop reads a fact heap page for each entry it
+ * walks (in its index-only scan, those of pages not all-visible) and a leaf
+ * and a heap page of the dimension for each key it keeps; the node reads the
+ * fact's heap for its fetches (factfetches over the whole walk, lo_cost()'s),
+ * a leaf for each descent, the dimension's heap for each member, the lion
+ * index pages its sets' builds read, and the key sets' tables.  Each page is
+ * charged lion_units_cold_page() over core's random_page_cost, the share of
+ * the tables effective_cache_size cannot hold, and the price multiplied by
+ *
+ *	(own + ownreads * perpage) * core / ((core + corereads * perpage) * own)
+ *
+ * - own the node's price of the LIMIT's share, core the loop's - at most 1
+ * and at least 1 / pg_lion.cold_max_discount.
  */
 static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
-		Cost factstartup, Cost facttotal, double factrows, double *rows,
-		double *probes, double *share, Cost *startup_p, Cost *total_p)
+		IndexPath *ord, Cost factstartup, Cost facttotal, double factrows,
+		double factfetches, double factlionpages, const OjCompetitor *comp,
+		double *rows, double *probes, double *share, Cost *startup_p,
+		Cost *total_p)
 {
 	RelOptInfo *dim = j->dim;
 	IndexOptInfo *pkidx = j->pkidx;
@@ -531,6 +637,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	Cost		startup;
 	Cost		run;
 	QualCost	resid;
+	double		factor;
 	ListCell   *lc;
 
 	/* the fact's walk, and a test of each of its rows' keys */
@@ -607,11 +714,54 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * LIMIT's.  The plain LionOrdered keeps its own stricter rule (lo_limit(),
 	 * the node alone under the LIMIT) for its hard stop, which this is not.
 	 */
-	*share = 1.0;
-	if (root->limit_tuples > 0)
-		*share = Min(1.0, root->limit_tuples / out);
-	*startup_p = startup;
-	*total_p = startup + run;
+	*share = oj_limit_share(root, out);
+
+	/* the cold reads, over the LIMIT's share of the walk */
+	factor = 1.0;
+	if (comp->nestloop)
+	{
+		double		s = *share;
+		double		ordpages = Max((double) ord->indexinfo->pages, 1.0);
+		Cost		perpage = lion_units_cold_page(root, ordpages + idxpages,
+												   j->fact->reltablespace);
+
+		if (perpage > 0.0)
+		{
+			double		walked = clamp_row_est(ord->indexselectivity *
+											   j->fact->tuples);
+			double		corereads;
+			double		ownreads;
+			LionUnits	u;
+
+			corereads = index_pages_fetched(s * keys, (BlockNumber) idxpages,
+											idxpages, root) +
+				index_pages_fetched(s * keys, dim->pages, idxpages, root);
+			if (comp->factwalk)
+				corereads += index_pages_fetched(s * walked, j->fact->pages,
+												 ordpages, root) *
+					(comp->indexonly ? 1.0 - j->fact->allvisfrac : 1.0);
+			ownreads = index_pages_fetched(s * factfetches, j->fact->pages,
+										   ordpages, root) +
+				index_pages_fetched(s * descents, (BlockNumber) idxpages,
+									idxpages, root) +
+				index_pages_fetched(s * members, dim->pages, idxpages, root) +
+				factlionpages + ds->lionpages;
+			foreach(lc, j->keysets)
+				ownreads += (double) ((OjKeySet *) lfirst(lc))->rel->pages;
+
+			memset(&u, 0, sizeof(LionUnits));
+			u.kind = LION_COMPETITOR_NESTLOOP;
+			u.rate = 1.0;
+			u.margin = 1.0;
+			u.nlcost = comp->cost;
+			u.nlcold = corereads * perpage;
+			u.coldpage = perpage;
+			lion_units_cold(&u, startup + s * run, ownreads);
+			factor = u.rate;
+		}
+	}
+	*startup_p = startup * factor;
+	*total_p = (startup + run) * factor;
 }
 
 /*
@@ -622,7 +772,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
  */
 static void
 oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
-			IndexPath *ord, List *pathkeys, Path *factlion, Path *dimlion)
+			IndexPath *ord, List *pathkeys, const OjCompetitor *comp,
+			Path *factlion, Path *dimlion)
 {
 	CustomPath *cp;
 	CustomPath *factpath;
@@ -639,16 +790,20 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	double		margin = lion_units_margin();
 	Cost		factstartup;
 	Cost		facttotal;
+	double		factfetches;
+	double		factlionpages;
 	Cost		startup;
 	Cost		total;
 	ListCell   *lc;
 
 	/* the fact's walk, index-only where its btree has every column it needs */
 	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
-							&iocols, &factstartup, &facttotal);
+							&iocols, &factstartup, &facttotal, &factfetches,
+							&factlionpages);
 	lion_ordered_set_info(root, j->dim, dimlion, &ds);
-	oj_cost(root, joinrel, j, &ds, factstartup, facttotal, factrows, &rows,
-			&probes, &share, &startup, &total);
+	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
+			factfetches, factlionpages, comp, &rows, &probes, &share,
+			&startup, &total);
 
 	factpath = lion_ordered_side_path(j->fact, ord, factlion, iocols, false,
 									  share, NULL, factrows, factstartup,
@@ -708,7 +863,10 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	List	   *ords;
 	List	   *factcands;
 	List	   *dimcands;
+	List	   *keys = NIL;
+	OjCompetitor *comps;
 	ListCell   *lc;
+	ListCell   *lck;
 
 	if (!bms_is_empty(joinrel->lateral_relids) ||
 		!oj_target_ok(joinrel, bms_union(j->fact->relids, j->dim->relids)))
@@ -725,26 +883,44 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	if (dimcands == NIL)
 		dimcands = list_make1(NULL);
 
+	/*
+	 * Each order the query wants, as far as it wants it, and the core plan
+	 * it competes with, before the first path is added (oj_competitor())
+	 */
+	comps = (OjCompetitor *) palloc0(sizeof(OjCompetitor) *
+									 Max(list_length(ords), 1));
 	foreach(lc, ords)
 	{
 		IndexPath  *ord = (IndexPath *) lfirst(lc);
 		List	   *pathkeys = build_join_pathkeys(root, joinrel, JOIN_INNER,
 												   ord->path.pathkeys);
 		int			ncommon = 0;
+
+		if (pathkeys != NIL)
+			(void) pathkeys_count_contained_in(root->query_pathkeys, pathkeys,
+											   &ncommon);
+		if (ncommon == 0)
+			pathkeys = NIL;
+		else
+			oj_competitor(root, joinrel, j->fact, pathkeys,
+						  &comps[foreach_current_index(lc)]);
+		keys = lappend(keys, pathkeys);
+	}
+
+	forboth(lc, ords, lck, keys)
+	{
+		IndexPath  *ord = (IndexPath *) lfirst(lc);
+		List	   *pathkeys = (List *) lfirst(lck);
 		ListCell   *lc2;
 		ListCell   *lc3;
 
-		/* the walk's order, as far as the query wants it */
 		if (pathkeys == NIL)
-			continue;
-		(void) pathkeys_count_contained_in(root->query_pathkeys, pathkeys,
-										   &ncommon);
-		if (ncommon == 0)
 			continue;
 		foreach(lc2, factcands)
 		{
 			foreach(lc3, dimcands)
 				oj_add_path(root, joinrel, j, ord, pathkeys,
+							&comps[foreach_current_index(lc)],
 							(Path *) lfirst(lc2), (Path *) lfirst(lc3));
 		}
 	}

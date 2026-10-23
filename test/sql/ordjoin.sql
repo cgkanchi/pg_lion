@@ -168,6 +168,19 @@ SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.
 	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.kind = 3
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
 
+-- ... and a page core's nested loop over fact's walk takes while the tables
+--     fit in effective_cache_size, the node's once they do not: the loop's
+--     dimension leaf and heap page for each key it keeps are then read cold
+--     (§39), as are the node's own reads, which are fewer.
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND f.tags @> ''{b2}'' AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST LIMIT 20');
+SET effective_cache_size = '1MB';
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND f.tags @> ''{b2}'' AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST LIMIT 20');
+RESET effective_cache_size;
+
 -- 2. The walk either way, NULLs where the order puts them: forward for
 --    DESC NULLS LAST, backward for ASC NULLS FIRST, which meets the NULL
 --    scores first.
