@@ -23588,10 +23588,10 @@ scale is worked out once a planner run for each relation, outer rels and loops, 
 **The cold reads, on top.** `lion_nestloop_cold()` counts the loop's heap pages at the skewed
 rows: one changed term, `indexselectivity x skew`. `lion_units_cold()` weighs the lion path
 against the loop at its corrected price, nlcost + nlextra. The skew correction is the skewscale
-`lion_units_price()` multiplies by, outside `LION_COLD_MAX_DISCOUNT`, because it is the
+`lion_units_price()` multiplies by, outside `pg_lion.cold_max_discount`, because it is the
 competitor's own price corrected and not a guess about the cache. The cold reads' factor applies
-on top of it, within the 1.5 bound, as before. In `test/sql/skew.sql` the LionCount against the
-loop is priced far below the loop, past that bound (`past_cold_bound`).
+on top of it, within that cap. In `test/sql/skew.sql` the LionCount against the loop is priced far
+below the loop, past the cap at its default of 2 (`past_cold_bound`).
 
 **Plans.** At the figure the measured loop's index scan meets about 2,396 rows a call, not about
 15, and is charged for its heap pages and CPU at those rows. That is nearer the 4,700 tuples a call

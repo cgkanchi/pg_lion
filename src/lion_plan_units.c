@@ -1465,10 +1465,11 @@ lion_units_price(const LionUnits *u, Cost own)
  * as its child at core's price, nlcost - nlouter, over that and nlextra.  The
  * two then compare as they would at the rows both meet, and the plan around
  * them stays in core's units.  The scale is not bounded: it is the
- * competitor's own price, corrected, and LION_COLD_MAX_DISCOUNT bounds only
- * the cold reads on top of it (lion_units_cold()).  A path that does not
- * price its lookups at the factor does not call this, and keeps core's rows
- * on both sides.  1 where the competitor meets no skewed key.
+ * competitor's own price, corrected, and pg_lion.cold_max_discount
+ * (lion_cold_cap()) bounds only the cold reads on top of it
+ * (lion_units_cold()).  A path that does not price its lookups at the factor
+ * does not call this, and keeps core's rows on both sides.  1 where the
+ * competitor meets no skewed key.
  */
 double
 lion_units_take_skew(LionUnits *u)
