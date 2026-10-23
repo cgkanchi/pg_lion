@@ -452,6 +452,35 @@ tuple: the heap is read only for pages the visibility map does not call all-visi
 dimension vacuumed (DESIGN.md §40.10). The B-tree must hold every column the query reads of the
 dimension; a `Memoize` above the probe and a parallel nested loop work as with PostgreSQL's scan.
 
+When the query groups the join by expressions over the dimension's Lion-indexed columns themselves,
+which no B-tree on the key holds, and the fact table has no Lion index, the join and the group keys'
+predicates are one node:
+
+```sql
+-- the fact's rows grouped by a CASE over the dimension's Lion columns and a fact column
+SELECT CASE WHEN d.region IN ('north', 'east') THEN 'ne'
+            WHEN d.tier = 1 THEN 't1' ELSE 'other' END AS k,
+       f.channel, count(*)
+  FROM fact f JOIN dim d ON f.dim_id = d.id
+ WHERE d.active AND d.tier < 4
+   AND NOT EXISTS (SELECT 1 FROM blocked b WHERE b.dim_id = f.dim_id)
+ GROUP BY 1, 2;
+```
+
+`Custom Scan (LionProbeJoin)` reads the fact's rows from PostgreSQL's own plan of the fact, looks
+each `dim_id` up in `dim_pkey` (`Probe Index`, `Probe Cond`), and tests the entry against Lion sets
+of the dimension built once: the `WHERE`'s (`Lion Cond`), one for each outcome of the columns the
+`CASE`'s predicates read (`Cell Predicates`), and the `NOT EXISTS`'s keys looked up in the same
+B-tree (`Anti Join Cond`). The heap is read only for pages the visibility map does not call
+all-visible (`Heap TIDs Rechecked` in `EXPLAIN ANALYZE`), and PostgreSQL's `HashAggregate` computes
+the groups from the predicates' truths - in parallel over the fact's parallel scan. The predicates
+are the ones `pg_lion.enable_count_cells` counts (equalities, `IN`, null tests, booleans and
+multi-key queries with constants); a dimension column used any other way - grouped by itself, under
+a `THEN`, in an aggregate - keeps the node out, and so does a `WHERE` clause on the dimension no
+Lion index answers. The planner prices a B-tree descent per fact row and the sets' builds against
+PostgreSQL's plan: the node pays where the fact's rows are few against the dimension's `WHERE`, or
+the dimension's heap would be read cold; `pg_lion.enable_probe_join` turns it off (DESIGN.md §46).
+
 ## Nearest neighbours: lionvec
 
 `CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers

@@ -353,7 +353,7 @@ pj_null_test(Var *var)
 /*
  * `var = v` of the one value, or `var = ANY (array)` of several, by the
  * dimension's equality - an OR of equalities when their type has no array
- * type to make the list of.
+ * type to make the list of, or they are not all of one type.
  */
 static Path *
 pj_values_path(PlannerInfo *root, RelOptInfo *rel, LionCellsDimPlan *dp,
@@ -362,9 +362,17 @@ pj_values_path(PlannerInfo *root, RelOptInfo *rel, LionCellsDimPlan *dp,
 	const LionCellsDimPriv *pv = &dp->priv;
 	Const	   *first = (Const *) linitial(vals);
 	Oid			arraytype = get_array_type(first->consttype);
+	bool		onetype = true;
 	ListCell   *lc;
 
-	if (list_length(vals) == 1 || !OidIsValid(arraytype))
+	foreach(lc, vals)
+	{
+		Const	   *c = (Const *) lfirst(lc);
+
+		if (c->consttype != first->consttype || c->constisnull)
+			onetype = false;
+	}
+	if (list_length(vals) == 1 || !OidIsValid(arraytype) || !onetype)
 	{
 		List	   *paths = NIL;
 
@@ -393,13 +401,7 @@ pj_values_path(PlannerInfo *root, RelOptInfo *rel, LionCellsDimPlan *dp,
 		int			i = 0;
 
 		foreach(lc, vals)
-		{
-			Const	   *c = (Const *) lfirst(lc);
-
-			if (c->consttype != first->consttype || c->constisnull)
-				elog(ERROR, "LionProbeJoin: a label's values of two types");
-			elems[i++] = c->constvalue;
-		}
+			elems[i++] = ((Const *) lfirst(lc))->constvalue;
 		get_typlenbyvalalign(first->consttype, &typlen, &typbyval, &typalign);
 		arr = construct_array(elems, n, first->consttype, typlen, typbyval,
 							  typalign);
@@ -1462,14 +1464,18 @@ pj_begin(CustomScanState *node, EState *estate, int eflags)
 	/*
 	 * The WHERE's recheck, over the heap tuple, for a set a source built
 	 * inexact (lion_source_exact()): initialised, and so checked, whenever
-	 * the plan starts, as the scan's own quals are.
+	 * the plan starts, as the scan's own quals are.  With no parent, so that
+	 * its Vars are read from the table slot it is given, deformed as that
+	 * slot's type is: the node's scan slot, whose type the parent would fix,
+	 * is the virtual one of custom_scan_tlist.  The planner took no WHERE
+	 * with a SubPlan in it, which would need one.
 	 */
 	recheck = pj_priv_list(priv, PJ_PRIV_RECHECK, T_List, true);
 	if (recheck != NIL)
 	{
 		recheck = (List *) copyObject(recheck);
 		fix_opfuncids((Node *) recheck);
-		st->recheck = ExecInitQual(recheck, &node->ss.ps);
+		st->recheck = ExecInitQual(recheck, NULL);
 	}
 
 	/* the sets' trees; EXPLAIN without ANALYZE opens nothing */
@@ -1833,6 +1839,7 @@ pj_rescan(CustomScanState *node)
 	Bitmapset  *chg = node->ss.ps.chgParam;
 	bool		rebuild = false;
 
+	ExecScanReScan(&node->ss);
 	if (chg != NULL)
 		UpdateChangedParamSet(st->factps, chg);
 	if (st->factps->chgParam == NULL)

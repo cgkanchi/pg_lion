@@ -768,6 +768,48 @@ working around a bad choice:
   where neither side can be NULL (a NOT NULL column, or a filter that rules NULL out): 19 plans that
   one as the same anti join as `NOT EXISTS`, and it is counted as that is. Off, the pushdown does
   not count an anti join this way.
+- `pg_lion.enable_probe_join`: group a join of a table to a dimension by the dimension's primary
+  key with `LionProbeJoin` (DESIGN.md §46) - `SELECT CASE WHEN d.region IN ('north', 'east') THEN
+  'ne' ELSE 'other' END, f.channel, count(*) FROM fact f JOIN dim d ON f.dim_id = d.id WHERE
+  d.active AND d.tier < 4 GROUP BY 1, 2`, a `NOT EXISTS (SELECT 1 FROM s WHERE s.dim_id =
+  f.dim_id)` over a small table beside it or not. The fact's rows come from PostgreSQL's own plan
+  of the fact; each row's key is looked up in the dimension's unique B-tree, and the entry tested
+  against Lion sets of the dimension built once - its `WHERE`'s, and one for each outcome of each
+  column the `GROUP BY`'s predicates read - and against the `NOT EXISTS`'s set of the B-tree
+  entries of its keys; the heap is read only for pages the visibility map does not call
+  all-visible. Each row found goes up as the fact's columns and the predicates' truths, and
+  PostgreSQL's aggregate computes the groups above it - in parallel as `Finalize HashAggregate`,
+  `Gather` and `Partial HashAggregate` over the node over the fact's parallel scan, each process
+  building the sets for itself. It needs an inner join of two tables on one equality whose
+  dimension side has a unique one-column B-tree; every `WHERE` clause on the dimension answered by
+  its Lion indexes; the dimension's columns read only inside predicates
+  `pg_lion.enable_count_cells` takes (an equality, `IN`, a null test, a boolean, a multi-key query,
+  with constants) - a dimension column in the output by itself, under a `THEN` or in an aggregate
+  keeps it out; and `enable_indexonlyscan`. The fact needs no Lion index; a run of sets past
+  `work_mem` × `hash_mem_multiplier` spills to a temporary file. The planner prices a descent of the
+  B-tree for each fact row and the sets' builds against PostgreSQL's plan, the nested loop's cold
+  heap reads included (DESIGN.md §39). EXPLAIN prints `Probe Index`, `Probe Cond`, `Lion Cond` and
+  `Lion Indexes` for the `WHERE`, `Cell Predicates` and `Cell Indexes` for the labels, and `Anti
+  Join Cond`; `EXPLAIN ANALYZE` adds `Probes`, `Null Keys`, `Rows Removed by Lion Cond`, `Rows
+  Removed by Anti Join`, `Heap TIDs Skipped via VM`, `Heap TIDs Rechecked`, `Rows Removed by
+  Visibility`, `Rows Removed by Lion Recheck` (a set built inexact, checked on the heap tuple),
+  `Lion Sets: <sets>, <members> members in <containers> containers[, rechecked][, spilled N
+  kB][, N builds]` and `Anti Join Keys: <rows> rows, <TIDs> TIDs` - the leader's alone in
+  parallel:
+
+      HashAggregate
+        Group Key: CASE WHEN ((d.region = ANY ('{north,east}'::text[]))) THEN 'ne'::text ELSE 'other'::text END, f.channel
+        ->  Custom Scan (LionProbeJoin) on dim d
+              Probe Index: dim_pkey
+              Probe Cond: (d.id = f.dim_id)
+              Lion Cond: (d.active AND (d.tier < 4))
+              Lion Indexes: dim_active, dim_tier
+              Cell Predicates: (d.region = ANY ('{north,east}'::text[]))
+              Cell Indexes: dim_region
+              ->  Seq Scan on fact f
+
+  Off, or with `pg_lion.enable_count_pushdown` off, such a join is left to PostgreSQL's join
+  methods. `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop` do not disable it.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -820,8 +862,8 @@ before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` 
 
 | PostgreSQL setting | the Lion paths it disables |
 |---|---|
-| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
-| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin` and `LionAntiJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
+| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionProbeJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
+| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin`, `LionAntiJoin` and `LionProbeJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
 | `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
 
 `LionOrdered`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan does, and so answer to
