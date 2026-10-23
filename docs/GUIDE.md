@@ -484,6 +484,38 @@ the sets' builds against PostgreSQL's plan: the node pays where the fact's rows 
 dimension's `WHERE`, or the dimension's heap would be read cold; `pg_lion.enable_probe_join` turns
 it off (DESIGN.md §46).
 
+When the query returns the joined rows themselves, a page of them in the order of a B-tree of the
+fact table, the ordered walk crosses the join:
+
+```sql
+CREATE INDEX fact_grp_score ON fact (grp, score DESC NULLS LAST);
+
+-- the best-scored fact rows of a group whose tags match, with their dimension rows that pass
+-- the dimension's own Lion filter, and only for the keys a small table lists
+SELECT f.id, f.score, d.id, d.name FROM fact f JOIN dim d ON f.dim_id = d.id
+ WHERE f.grp = 2 AND f.tags @> ARRAY['a1'] AND d.region = 'north' AND d.verified
+   AND f.dim_id IN (SELECT dim_id FROM watchlist WHERE active)
+ ORDER BY f.score DESC NULLS LAST LIMIT 20;
+```
+
+PostgreSQL's plan walks `fact_grp_score` with the tags as a `Filter`, reading each fact row to
+test them, and looks each kept row's `dim_id` up in `dim_pkey`, reading the dimension row to test
+`region` and `verified` and rejecting most of them; or it reads every row of both filters, joins
+them and sorts. `Custom Scan (LionOrderedJoin)` walks the B-tree over a Lion set of the fact's
+filter (`Ordered By`, `Lion Cond`), as `LionOrdered` does, looks each member's key up in the
+dimension's primary key (`Dimension: dim d via dim_pkey`) and tests the entry against a Lion set of
+the dimension's filter (`Dimension Lion Cond`) before reading the dimension row, and returns the
+rows joined in the walk's order until the `LIMIT` has its twenty. A table that only filters the key,
+as `watchlist` does here, is read once into a hash set of its keys (`Key Sets: watchlist`), and a
+fact row whose key is not in it is skipped before the lookup. Either table may have no Lion
+filter, as long as the other has one or a key set filters. The dimension needs a unique B-tree on
+its key, the join that one equality and nothing else; the fact's B-tree must give the `ORDER BY`
+at least its first column, and where it holds every fact column the query reads the walk is
+index-only (`Ordered By: fact_grp_score (index only)`). `EXPLAIN ANALYZE` shows each side's
+counters, the dimension's behind `Dimension` (`Dimension Descents`, `Dimension Heap Fetches`).
+The planner prices it against PostgreSQL's plans, warm; `pg_lion.enable_ordered_join` turns it off
+(DESIGN.md §47).
+
 ## Nearest neighbours: lionvec
 
 `CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers
