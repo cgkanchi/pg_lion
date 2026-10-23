@@ -1036,7 +1036,11 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	 * reads against the node's own - a leaf a probe, the members' pages
 	 * not all-visible (every member's where the WHERE's set is inexact:
 	 * each is fetched for its recheck, as lo_cost() prices the probe), and
-	 * the lion indexes' pages the builds read.
+	 * the lion indexes' pages the builds read.  Not against a bitmap heap
+	 * scan's cold reads (§39, "A bitmap heap scan's cold reads"): the node
+	 * reads the fact through core's own path, as the competitor's scans of
+	 * it do, and the dimension a descent at a time, synchronous reads the
+	 * stream's price would under-charge.
 	 */
 	idxpages = Max((double) ps->pkidx->pages, 1.0);
 	reads = index_pages_fetched(loops, (BlockNumber) idxpages, idxpages,
@@ -1045,6 +1049,8 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 		(whereexact ? 1.0 - dim->allvisfrac : 1.0) +
 		pp.lionpages;
 	lion_units_for(root, output_rel, &units);
+	units.bmcold = 0.0;
+	units.bmcoldpage = 0.0;
 	lion_units_cold(&units,
 					setbuild + antibuild + loops * perprobe +
 					loops * memberfrac * permember, reads);
