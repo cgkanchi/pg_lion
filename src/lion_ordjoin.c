@@ -1121,10 +1121,13 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 
 /*
  * Build a key set from its plan's rows: each non-NULL key once, its value
- * copied into the set's memory.  A NULL key matches nothing.
+ * copied into the set's memory.  A NULL key matches nothing.  The key type's
+ * hash and equality run in econtext's per-tuple memory, reset a row, as a
+ * hash join's do (ExecHashGetHashValue()): a type's own functions may leave
+ * what they allocate behind.  The table and its keys are the set's.
  */
 static void
-oj_keyset_build(OjKeySetState *ks)
+oj_keyset_build(OjKeySetState *ks, ExprContext *econtext)
 {
 	MemoryContextReset(ks->cxt);
 	ks->keys = ojkeys_create(ks->cxt, 256, &ks->funcs);
@@ -1132,27 +1135,29 @@ oj_keyset_build(OjKeySetState *ks)
 	for (;;)
 	{
 		TupleTableSlot *slot;
+		MemoryContext oldcxt;
 		Datum		key;
 		bool		isnull;
 		bool		found;
 		OjKeyEnt   *ent;
 
 		CHECK_FOR_INTERRUPTS();
+		ResetExprContext(econtext);
 		slot = ExecProcNode(ks->child);
 		if (TupIsNull(slot))
 			break;
 		key = slot_getattr(slot, ks->col, &isnull);
 		if (isnull)
 			continue;
+		oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 		ent = ojkeys_insert(ks->keys, key, &found);
 		if (!found)
 		{
-			MemoryContext oldcxt = MemoryContextSwitchTo(ks->cxt);
-
+			MemoryContextSwitchTo(ks->cxt);
 			ent->key = datumCopy(key, ks->byval, ks->typlen);
-			MemoryContextSwitchTo(oldcxt);
 			ks->nkeys++;
 		}
+		MemoryContextSwitchTo(oldcxt);
 	}
 	ks->builds++;
 }
@@ -1176,21 +1181,27 @@ oj_exec(CustomScanState *node)
 	for (i = 0; i < st->nkeysets; i++)
 	{
 		if (st->keysets[i].keys == NULL)
-			oj_keyset_build(&st->keysets[i]);
+			oj_keyset_build(&st->keysets[i], econtext);
 		if (st->keysets[i].nkeys == 0)
 			return NULL;
 	}
 
-	ResetExprContext(econtext);
 	for (;;)
 	{
 		TupleTableSlot *fslot;
 		TupleTableSlot *dslot;
+		MemoryContext oldcxt;
 		Datum		key;
 		bool		isnull;
 
 		CHECK_FOR_INTERRUPTS();
 
+		/*
+		 * The row this returned last has been read by now, and its
+		 * projection with it; the key sets' hash and equality run in the
+		 * memory reset here, as oj_keyset_build()'s do.
+		 */
+		ResetExprContext(econtext);
 		ExecClearTuple(scanslot);
 		fslot = ExecProcNode(st->fact);
 		if (TupIsNull(fslot))
@@ -1198,11 +1209,13 @@ oj_exec(CustomScanState *node)
 		key = slot_getattr(fslot, st->fkresno, &isnull);
 		if (isnull)
 			continue;			/* the clause is strict: no row matches */
+		oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 		for (i = 0; i < st->nkeysets; i++)
 		{
 			if (ojkeys_lookup(st->keysets[i].keys, key) == NULL)
 				break;
 		}
+		MemoryContextSwitchTo(oldcxt);
 		if (i < st->nkeysets)
 		{
 			st->rejected++;
