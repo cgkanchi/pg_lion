@@ -307,8 +307,40 @@ SELECT w.count AS want, g2.count AS walk, g3.count AS lion_count
   FROM lsw_want2 w, lsw_got2 g2, lsw_got3 g3;
 SELECT count(*) AS want FROM lsw_fact WHERE fk = 9 AND doc @@ 'a1 & b2'::tsquery;
 
+-- ---------- 8. a list of the keys ----------
+-- A relation whose clauses list keys of the column has their rows among its
+-- most common values (§33, "The frequencies of the listed values"); a probed
+-- key meets the column's rows, from ANALYZE's list, whatever the relation
+-- lists.  The keys of group 1 with a row of both words among keys 9 to 128,
+-- the 120 keys of 1,000 rows outside ANALYZE's list, listed on the probed
+-- fact: 750.50 rows with pg_lion.enable_index_mcv on and off, while the
+-- semi-join's estimate, which takes the list's rows, is larger with it on.
+-- lsw_rows() is the rows q's plan returns.
+INSERT INTO lsw_q
+SELECT 'listed', format($q$SELECT d.id FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.doc @@ 'a1 & b2'::tsquery AND f.fk IN (%s))$q$,
+						string_agg(k::text, ', '))
+  FROM generate_series(9, 128) k;
+CREATE FUNCTION lsw_rows(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN (p->0->'Plan'->>'Plan Rows')::float8;
+END $$;
+SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lsw_q, lsw_skew_rows(q) WHERE name = 'listed';
+SELECT lsw_rows(q) AS rows_on FROM lsw_q WHERE name = 'listed' \gset
+SET pg_lion.enable_index_mcv = off;
+SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lsw_q, lsw_skew_rows(q) WHERE name = 'listed';
+SELECT :rows_on > lsw_rows(q) AS listed_larger
+  FROM lsw_q WHERE name = 'listed';
+RESET pg_lion.enable_index_mcv;
+
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;
 DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json, text),
-	lsw_cost(text, text), lsw_key_skew(regclass), lsw_skew_rows(text);
+	lsw_cost(text, text), lsw_rows(text), lsw_key_skew(regclass),
+	lsw_skew_rows(text);
