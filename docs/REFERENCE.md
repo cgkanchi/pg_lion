@@ -654,7 +654,8 @@ working around a bad choice:
   rescan, a `Memoize` above it or not; the values come from the index tuple and the heap is read
   only for pages not all-visible. `EXPLAIN ANALYZE` counts every rescan's entries and fetches, and
   `Lion Set` shows one build. It needs a B-tree that covers the columns the query reads of the
-  relation (no row lock on it: a lock needs the `ctid`) and `enable_indexonlyscan`; the planner
+  relation (and no row lock anywhere in the query, nor an `UPDATE`, `DELETE` or `MERGE`: these give
+  every relation a `ctid`, which no index returns) and `enable_indexonlyscan`; the planner
   prices the set's build spread over the loop's rescans - over the outer side's distinct keys when
   `enable_memoize` is on - against PostgreSQL's heap fetch per outer row.
   `pg_lion.enable_btree_scan` turns it off with the other walks.
