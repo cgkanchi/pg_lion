@@ -492,4 +492,15 @@ lion_toast_snapshot(SnapshotData *data)
 						 (cost), (tuples))
 #endif
 
+/*
+ * A MemoizePath's expected rescans are est_calls from PostgreSQL 19, calls
+ * before it.  19 also keeps the hit ratio cost_memoize_rescan() priced it at
+ * (est_hit_ratio), which 16 to 18 leave to be worked out again.
+ */
+#if PG_VERSION_NUM >= 190000
+#define lion_memoize_calls(mpath)	((mpath)->est_calls)
+#else
+#define lion_memoize_calls(mpath)	((mpath)->calls)
+#endif
+
 #endif							/* LION_COMPAT_H */

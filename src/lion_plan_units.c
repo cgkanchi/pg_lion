@@ -805,17 +805,24 @@ lion_bitmap_index_reads(PlannerInfo *root, Path *bitmapqual, double loops,
  * at once, hit (calls - ndistinct) / calls x est_entries / ndistinct of the
  * time.  est_entries is what cost_memoize_rescan() set it to, at most
  * ndistinct; 0, a Memoize not yet costed, is taken as a cache that holds
- * every key.  A scan at least.
+ * every key.  From PostgreSQL 19 the path keeps the ratio itself
+ * (est_hit_ratio).  A scan at least.
  */
 static double
 lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
 {
 	EstimationInfo estinfo;
-	double		calls = Max(mpath->calls, 1.0);
+	double		calls = Max(lion_memoize_calls(mpath), 1.0);
 	double		ndistinct;
 	double		entries;
 	double		hit_ratio;
 
+#if PG_VERSION_NUM >= 190000
+	/* 19 keeps the ratio cost_memoize_rescan() priced it at */
+	if (mpath->est_entries > 0)
+		return Max(loops * (1.0 - Min(Max(mpath->est_hit_ratio, 0.0), 1.0)),
+				   1.0);
+#endif
 	memset(&estinfo, 0, sizeof(estinfo));
 	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
 									&estinfo);
