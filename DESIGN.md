@@ -21508,7 +21508,10 @@ extension's SQL does not create: `test/sql/skew.sql` binds them from the library
   a LionCount on), a nested loop over one key's rows (the loop's index scan off, the walk of the
   B-tree on; with the walk switched off, the LionCount on, priced past the cold reads' bound), and a
   generic plan's parameter;
-- every answer against core's.
+- every answer against core's;
+- an EXISTS over the fact whose probed relation lists keys 9 to 128, the keys of 1,000 rows
+  outside ANALYZE's list: the figure stays 750.50 with `pg_lion.enable_index_mcv` on and off, and
+  the semi-join's estimate, which takes the list's rows, is larger with it on.
 
 `test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
 subquery, and its fixtures' keys are skewed enough to move its plans.
