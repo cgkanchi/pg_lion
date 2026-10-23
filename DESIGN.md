@@ -21283,7 +21283,7 @@ joins or groups them, where with their rows it counts them from the index (`Lion
 FK-side join or Top K).
 
 A lion index on the column knows each value's rows: the header of the value's entry counts its
-TIDs. So the row `lion_relation_stats()` serves a plain column with carries the values the
+TIDs. So the row that `lion_relation_stats()` serves for a plain column carries the values the
 relation's clauses compare the column with among its most common values, at their exact
 frequencies, and core's estimate is then each value's rows.
 
@@ -21299,12 +21299,26 @@ other entries stay, and so do the histogram, the correlation, every other slot, 
 and `stadistinct` (the index's count, as served above, or ANALYZE's). A column whose row has no
 most common values - every value sampled once - gets a new slot, the first free one, with the
 type's equality and the column's collation; a row with no free slot is served without the
-frequencies. The values are:
+frequencies.
 
-- the constants of the relation's restrictions and join clauses, through ANDs and ORs as deep as
-  the clauses go, that lion's count pushdown reads as `col = c`, `col IN (...)` or `col = ANY
-  (array)` (`lion_analyze_leaf()`, `src/lion_plan_match.c`) for this column: a Const, a Const
-  array, or the Const elements of an `ARRAY[...]`;
+**Scaled to fit.** The values' frequencies and the null fraction are shares of the same rows, and
+core counts on their adding up to no more than all of them: past it, `scalararraysel()` takes the
+values of an IN list to be independent of each other rather than exclusive. An entry's TIDs count
+its dead row versions until VACUUM, and ANALYZE's other entries are a sample's, so where the merged
+list adds up to more than the rows that are not NULL, every entry is scaled down by the same factor
+to fit - by a millionth more, as the sum core makes of the float4 frequencies may round up. Without
+it, `test/sql/countresid.sql`'s list of every value of a column, on a table with dead versions of
+some 6% of its rows, added up to 1.05, came out at two thirds of the rows, and turned the plan from
+the sequential scan to a bitmap scan of the whole table. A list shorter than the column's values
+still counts its values' dead versions, less what the scaling takes off.
+
+The values are:
+
+- the constants in the relation's restrictions (`rel->baserestrictinfo`) and in its join clauses
+  (`rel->joininfo`), each clause taken at its top level or inside ANDs and ORs nested to any
+  depth, at every leaf that lion's count pushdown reads as `col = c` (either side), `col IN (...)`
+  or `col = ANY (array)` for this column (`lion_analyze_leaf()`, `src/lion_plan_match.c`): a
+  Const, the elements of a Const array, or the Const elements of an `ARRAY[...]`;
 - compared by the index's own equality (`lion_index_equality_op()`), under its collation or a
   deterministic one where the index's is deterministic too, on the index's key type (or one stored
   the same way, as `varchar` is under `text`'s class; an enum is under the class of every enum).
@@ -21376,7 +21390,10 @@ says the user may read every row of the column, as the intersection probe asks t
   own index's frequencies.
 - Values of a join: a join clause between two columns names no constant. Core's join estimate
   reads the row, and so the listed values with their exact frequencies.
-- Dead TIDs count until VACUUM, as for the count.
+- Dead TIDs count until VACUUM, as for the count, less what the scaling takes off where they take
+  the list past the rows (above).
+- Nothing while PostgreSQL 16's `old_snapshot_threshold` is set, when no lion index may be read
+  (§9): the column is served without the frequencies.
 - Nothing is stored: `pg_stats` shows ANALYZE's list.
 
 **Tests.** `test/sql/index_mcv.sql`: a table of 30,000 rows in no order, eight values of 1,750 to
@@ -21391,9 +21408,10 @@ self-join; the cap at 1,000 and 1,001 values and two lists of 600; a cross-type 
 `<>`; the plan flips (a bitmap scan, `LionCount` under the join to its FK side and with Top K, in
 place of index scans and a sort or a merge join) with the same answers; a partial index and an
 expression index served without them; a role under a row-level policy served without them;
-`varchar` and an enum; and a sampled column whose count is served beside the frequencies. The
-tests around the hook (`ndistinct`, `partition`, the probes', the count's and the FK joins')
-plan as they did.
+`varchar` and an enum; a sampled column whose count is served beside the frequencies; and a table
+with dead versions of a fifth of its rows, whose list of every value is the table's rows. The
+tests around the hook (`ndistinct`, `partition`, `countresid`, the probes', the count's and the FK
+joins') plan as they did.
 
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 
