@@ -562,6 +562,16 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
 }
 
 /*
+ * The TIDs key's entry holds in key column attno - its header's ntids, dead
+ * rows included until VACUUM - read with the leaf share-locked for a moment
+ * and nothing kept: no posting set, pin or predicate lock.  For the planner
+ * (DESIGN.md §33, "The frequencies of the listed values"); key is of the
+ * column's own key type.  False, with *ntids 0, when the key has no entry.
+ */
+extern bool lion_key_ntids(Relation index, AttrNumber attno, Datum key,
+						   uint64 *ntids);
+
+/*
  * Locate the posting sets of nvalues keys of one index at once: the IN list
  * of DESIGN.md §15.  isnull may be NULL (no value is NULL), and NULL values
  * are skipped, as `col = NULL` is never true.  The keys are hashed first and
