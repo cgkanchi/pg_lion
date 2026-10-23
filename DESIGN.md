@@ -24640,7 +24640,7 @@ Memoize does not exist in core's plans.
 generic plan's and an InitPlan's Param priced as the generic plan's; the lion index's Index Scan
 and the walk chosen in the subquery where the generic plan takes core's bitmap and index scans; a
 scalar `max()` sub-select and an `EXISTS` through the walk; the walk with an InitPlan's tsquery in
-its Lion Cond, its set built once for every call; every answer compared with core's plan, the lion
+its Lion Cond, its set built once and kept through every call; every answer compared with core's plan, the lion
 paths off; and the join of the same rows, its plans unchanged.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
