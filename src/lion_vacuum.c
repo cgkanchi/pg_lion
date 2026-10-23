@@ -915,7 +915,13 @@ lion_vac_pending_put(Relation index, uint32 npending)
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-		!LionPageIsMeta(page) || LionPageGetOpaque(page)->maxckey == npending)
+		!LionPageIsMeta(page))
+	{
+		UnlockReleaseBuffer(buf);
+		return;
+	}
+	lion_meta_check_version(index, LionPageGetMeta(page));
+	if (LionPageGetOpaque(page)->maxckey == npending)
 	{
 		UnlockReleaseBuffer(buf);
 		return;
