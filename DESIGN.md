@@ -7201,16 +7201,16 @@ that the walk, and the count of the keys in amvacuumcleanup, start from
 again after an insert moved it (`lion_vac_ref_relocate()`); the root of a set the sweep asks is
 live (`lion_posting_root_live()`); and what taking pages out of the trees reads - a directory page
 deletion's leaf, siblings and parents (§21, "Page deletion") and an empty posting leaf's neighbour
-and parent (§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once a leaf.
-What is left reads without it, as the inserts it shares the code with do: the meta page, which
-every scan reads; and a handful of pages a VACUUM writes beside its filtering - a directory leaf
-split by an entry the filtering rewrote larger, with the parent its downlink goes to and any split
-left unfinished that the write finishes on the way (§21), a page a payload spills to, and a page
-taken from the free space map (`lion_alloc_page()`).  So a VACUUM leaves no more of the index in
-shared buffers than the ring holds, but those.  It checks for
-interrupts at every block, with nothing locked, and each page it reads passes the cost-based delay
-first, as every page the walk reads does, so a sweep of a great many free pages answers a cancel and
-paces its reads and records.  A page of a LIVE set is
+and parent (§22, "Empty leaves"), which a VACUUM that empties a run of leaves reads once per
+leaf.  What is left reads without it, as the inserts it shares the code with do: the meta page,
+which every scan reads; and a handful of pages a VACUUM writes beside its filtering - a directory
+leaf split by an entry the filtering rewrote larger, with the parent its downlink goes to and any
+split left unfinished that the write finishes on the way (§21), a page a payload spills to, and a
+page taken from the free space map (`lion_alloc_page()`).  So a VACUUM leaves no more of the index
+in shared buffers than the ring holds, besides the meta page and those few pages it writes.  It
+checks for interrupts at every block, with nothing locked, and each page it reads passes the
+cost-based delay first, as every page the walk reads does, so a sweep of a great many free pages
+answers a cancel and paces its reads and records.  A page of a LIVE set is
 never mistaken for a leak, because pass 2 visits every page of every chain it found, and a chain
 created after pass 1 read its bucket page has no empty page in it (a spill and a split both fill
 every page they allocate inside the record that allocates it, under the lock they hold
