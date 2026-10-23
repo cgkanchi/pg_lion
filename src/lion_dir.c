@@ -697,6 +697,7 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 						RelationGetRelationName(index))));
 	}
 	meta = LionPageGetMeta(page);
+	lion_meta_check_version(index, meta);
 	root = meta->root;
 	h = meta->height;
 	UnlockReleaseBuffer(buf);
@@ -2460,6 +2461,12 @@ lion_dir_finish_split(Relation index, Relation heaprel, LionIndexState *ix,
 
 	UnlockReleaseBuffer(parent);
 	pfree(sep);
+
+	/*
+	 * Test hook: the downlink is in place and the flag not yet cleared, with
+	 * pbuf held EXCLUSIVE, as at lion-posting-split-placed.
+	 */
+	LION_INJECTION_POINT("lion-dir-split-placed");
 
 	xstate = lion_wal_begin(index);
 	p = lion_wal_register_buffer(xstate, pbuf, LION_WALBUF_STD);
