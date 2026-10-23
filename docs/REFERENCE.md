@@ -646,6 +646,18 @@ working around a bad choice:
   (1, 2)` of three values beside `a IN (...)`): EXPLAIN lists it under `Lion Cond`, and the heap is
   not read for it (DESIGN.md §40.2, "A clause core's AND leaves out"); the planner prices that
   larger set against walks of the smaller sets PostgreSQL chose, which read the heap.
+- Nested loop probes: `LionBtreeScan` is also offered as the inner side of a nested loop,
+  parameterized by the outer row as PostgreSQL's Index Scan is (`... FROM fact f JOIN dim d ON
+  d.id = f.dim_id WHERE <Lion filters on d>`, DESIGN.md §40.10): `Index Cond: (d.id = f.dim_id)`,
+  each rescan a descent of the B-tree to the outer row's key, the entry tested against a Lion set
+  built once from the relation's own Lion conditions - never from the join - and kept for every
+  rescan, a `Memoize` above it or not; the values come from the index tuple and the heap is read
+  only for pages not all-visible. `EXPLAIN ANALYZE` counts every rescan's entries and fetches, and
+  `Lion Set` shows one build. It needs a B-tree that covers the columns the query reads of the
+  relation (no row lock on it: a lock needs the `ctid`) and `enable_indexonlyscan`; the planner
+  prices the set's build spread over the loop's rescans - over the outer side's distinct keys when
+  `enable_memoize` is on - against PostgreSQL's heap fetch per outer row.
+  `pg_lion.enable_btree_scan` turns it off with the other walks.
 - Parallel walks: when the table may be read in parallel, `LionBtreeScan` and the B-tree walks of
   `LionOrdered` are also offered as partial paths (DESIGN.md §40.9): `Parallel Custom Scan
   (LionBtreeScan)` below a `Gather` - under partial aggregates, and on either side of a parallel
@@ -808,7 +820,7 @@ before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` 
 | PostgreSQL setting | the Lion paths it disables |
 |---|---|
 | `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
-| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin` and `LionAntiJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled |
+| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin` and `LionAntiJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
 | `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
 
 `LionOrdered`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan does, and so answer to

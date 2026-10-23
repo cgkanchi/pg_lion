@@ -435,6 +435,23 @@ they share: `Parallel Custom Scan (LionBtreeScan)` below a `Gather`, `Parallel C
 the filtered columns, such as the primary key of `SELECT sum(id) FROM t WHERE <Lion filter>`; it
 walks the whole index.
 
+The same walk is the inner side of a nested loop when the other table's filter leaves few rows:
+
+```sql
+-- the dimension rows that pass Lion filters, counted by the fact rows that match a search
+SELECT d.id, count(*) AS n FROM dim d JOIN fact f ON f.dim_id = d.id
+ WHERE d.tags && ARRAY['t1', 't3'] AND d.verified AND f.tsv @@ 'w7 & x3'::tsquery
+ GROUP BY d.id ORDER BY n DESC LIMIT 100;
+```
+
+PostgreSQL's plan looks each fact row's `dim_id` up with an Index Scan of `dim_pkey` and reads the
+dimension row from the heap to test the filter, rejecting most of them. `Custom Scan (LionBtreeScan)`
+with `Index Cond: (d.id = f.dim_id)` looks the key up in the same B-tree, tests the entry against
+a Lion set of the dimension's filter, built once for the whole loop, and takes `id` from the index
+tuple: the heap is read only for pages the visibility map does not call all-visible, so keep the
+dimension vacuumed (DESIGN.md §40.10). The B-tree must hold every column the query reads of the
+dimension; a `Memoize` above the probe and a parallel nested loop work as with PostgreSQL's scan.
+
 ## Nearest neighbours: lionvec
 
 `CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers

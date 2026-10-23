@@ -341,10 +341,15 @@ END $$;
 
 -- ten dimension rows and a range over nearly every row: the collection
 -- costs more than ten probes of the fk btree (the node was chosen before it
--- was priced, and ran three times slower than the nested loop)
+-- was priced, and ran three times slower than the nested loop).  The probes
+-- are core's Index Scan's here: the btree on fk covers the fact side, and
+-- lion's walk of it as the loop's probe (DESIGN.md §40.10) is the other
+-- plan of these joins, which btreescan_param.sql tests.
+SET pg_lion.enable_btree_scan = off;
 SELECT lion_src_chosen('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 2000 AND f.ts < 1000000 GROUP BY d.attr');
 -- a hundred, and a range over a tenth of the rows: the node
 SELECT lion_src_chosen('SELECT d.attr, count(*) FROM lion_src_cf f JOIN lion_src_cd d ON f.fk = d.pk WHERE d.sel < 20000 AND f.ts < 100000 GROUP BY d.attr');
+RESET pg_lion.enable_btree_scan;
 
 -- The collection is timed, under EXPLAIN ANALYZE with TIMING, in `Fact
 -- Filter Locate Time`: it happens while the fact filters are located, which

@@ -12778,7 +12778,9 @@ copy. Two ways of making the node fact-driven were considered, and neither is ta
   rows - which core builds from the same lion indexes (§29) - feeding a hash semi join or a memoized
   index lookup into the dimension, which is exactly the ordinary plan. The node would reimplement
   core's hash join over a lion bitmap scan, with core's hashing and equality (§10's finding 3), to
-  gain nothing core's plan does not have.
+  gain nothing core's plan does not have. *(That memoized lookup is where lion helps since
+  2026-10-23: §40.10 makes it a nested loop's probe of the dimension's covering B-tree, index-only,
+  over the set of the dimension's own filters, the heap left out of the loop.)*
 
 So which side drives is the cost model's choice between two plans, and what it needs is each priced
 for what it does: the node O(keys), per the table above, and core's plan O(the copy's rows), by
@@ -18462,6 +18464,8 @@ says `Ordered By: <index> (index only)`. The same walk is then also offered with
   ...) ON true`): every path of it must be parameterized by the relations they name, and every path
   the node builds is unparameterized - the btree path it builds for its ordered side where core
   built none (§40.2) trips core's assertion that it names them (`get_baserel_parampathinfo()`).
+  *(Since 2026-10-23 a nested loop's probe is parameterized (§40.10), by its join clauses' outer
+  relations; a LATERAL relation stays declined, its other paths being what they were.)*
 - **The WHERE.** The relation's restriction clauses, an implicit AND. Some of them are answered by
   lion indexes and the rest stay a heap-side filter. WHICH of them lion answers, and how, is not
   decided here but by core's own index matching: every shape the bitmap path supports - `=`, IN /
@@ -19051,6 +19055,8 @@ space type (§30.4, "When the walk is not paying").
 - **Parameterized paths** (the node as the inner side of a nested loop with `t.x = outer.y` pushed
   into it): an inner side needs no order, so an ordered filter scan has nothing to offer there.
   Params inside a subquery (LATERAL, correlated) are ordinary Params and ARE supported (§30.4).
+  *(Done 2026-10-23 for the walk that claims no order, §40.10: what an inner side wants of the node
+  is §40's index-only walk, which leaves the heap out of every probe; an ordered one stays declined.)*
 - **Backward scans**, **mark/restore**: the shape needs neither; core adds a Material where a
   caller does. A parallel walk is §40.9's.
 - **RowCompareExpr index quals** on the ordered index (`(a, b) > (1, 2)`): the executor's key
@@ -22994,10 +23000,11 @@ a B-tree's clustering on a pinned key, and the B-tree is the user's to create.
   no-qual path only where its order is useful or the index alone answers the query
   (`check_index_only()`, every restriction clause's columns among its own), which a B-tree lacking
   the lion filter's columns - a primary key under a lion filter on other columns - never does; when
-  core built no path of the index at all, `lo_btree_paths()` builds that walk of the whole index
+  core built no unparameterized path of the index, `lo_btree_paths()` builds that walk of the whole index
   itself (`create_index_path()` with no clauses; a partial B-tree only where the query implies its
   predicate), and the pair decides coverage as for any other. Each resulting
-  IndexPath - a B-tree, not hypothetical, `param_info == NULL`, no ORDER BY operators,
+  IndexPath - a B-tree, not hypothetical, `param_info == NULL` (the parameterized ones are §40.10's
+  nested loop probes), no ORDER BY operators,
   `lo_indexpath_ok()` - whose twin is not among the ordered paths (the same index, direction and
   pathkeys: offered above already) is paired with each lion access from `lo_lion_accesses()`, as
   the ordered loop pairs them, less the pairs in which the lion access adds nothing: every clause
@@ -23469,6 +23476,272 @@ build: 192 ms shared against 214 each its own on two workers, 152 against 197 on
 seven). Built in every participant at once, the set costs the same time on idle cores but as many
 times the CPU and memory, which on four busy ones shows; shared, it is built once and held once.
 So it is shared, and each builds its own only when it would not fit.
+
+
+### 40.10 A nested loop's probe: the walk parameterized (2026-10-23)
+
+The shape is
+
+    SELECT d.id, count(*) AS n FROM dim d JOIN fact f ON f.dim_id = d.id
+     WHERE <clauses lion indexes on d answer> AND <a selective filter on f>
+     GROUP BY d.id ORDER BY n DESC LIMIT 100
+
+where the fact side's filter leaves few rows against the dimension's, so that core's plan is a
+nested loop over them into the dimension's primary key: an Index Scan that fetches each outer row's
+dimension row from the heap to test the filter on it, and throws most of them away. On a production
+table of this shape - an 85 GB dimension heap, filters of array overlap, a bool and two enum
+equalities - that was 603,000 heap fetches, 77% of them rejected by the Filter, read cold. Nothing
+of §40 so far could be the loop's inner side: every path the node built was unparameterized (§30.8
+declined parameterized paths, "an inner side needs no order"), and the walk of the whole primary key
+under a hash join reads every entry of the key where the loop wants six hundred thousand. What the
+inner side needs is not an order but §40's index-only half: the outer row's key looked up in the
+B-tree, the entry tested against lion's set of the dimension's filter, the visibility map asked, the
+values taken from the index tuple, and the heap read only for pages not all-visible.
+
+    Nested Loop
+      ->  Index Scan using fact_tsv on fact f
+            Index Cond: (tsv @@ '''w7'' & ''x3'''::tsquery)
+      ->  Custom Scan (LionBtreeScan) on dim d
+            Index: dim_pkey (index only)
+            Index Cond: (d.id = f.dim_id)
+            Lion Cond: ((d.tags && '{t1,t3,t5,t7,t9}'::text[]) AND d.verified AND (d.hue = 'green'::hue) AND (d.grade = 'alpha'::grade))
+            Lion Indexes: dim_tags, dim_verified, dim_hue, dim_grade
+
+The probe is a `LionBtreeScan` parameterized by the outer relations, as core's parameterized Index
+Scan is: its B-tree quals include the join clauses (`id = outer.fk`), and each rescan is a descent
+to the outer row's key. Its set is built from the inner relation's restriction clauses that lion
+answers - never from a join clause or an outer row's Param - once per execution of the plan, and
+kept for every scan the loop makes. A scan then costs a descent, a membership test per entry, a
+visibility-map test per member and the values from the index tuple.
+
+- **Which paths** (`lo_btree_paths()`, the probe loop of `lo_set_rel_pathlist()`). Core's
+  own: the scratch copy of the relation that sees one B-tree (§40.2) now keeps the relation's join
+  clauses (`lo_scratch_rel()`'s `joins`), so `create_index_paths()` makes for that B-tree the
+  parameterized IndexPaths it makes for an inner side - the join clauses as index clauses, beside the
+  restriction clauses the B-tree matches: `(grp, k)` under `grp = f.g AND k = 3` probes both
+  columns. (Its equivalence-class joins it made all along: `match_eclass_clauses_to_index()` asks
+  `index->rel`, the relation itself, not the copy. Those paths were then dropped - and, being paths,
+  stopped §40.2's whole walk of a B-tree core made no unparameterized path of, which kept a primary
+  key's whole walk out of every join on it; the fallback now looks for an unparameterized path, and
+  that bug is gone.) The parameterized paths kept are forward ones (a backward twin walks the same
+  entries), one per parameterization and set of index clauses (`lo_same_indexclauses()`: an
+  IndexClause has no `equal()` support), that pass `lo_indexpath_ok()`. Each is paired with every
+  lion access of §40.2, which are unparameterized - built from the restriction clauses alone - and
+  priced, less the pairs that add nothing (`lo_lion_adds()`); the residual (`lo_residual()`) is taken
+  over the restriction clauses and the parameterization's join clauses (`ppi_clauses`), a join
+  clause the B-tree's index clause answers left out - the same RestrictInfo, or one of the same
+  equivalence class (`lo_ord_answers()`), as `create_indexscan_plan()` drops it as redundant - and
+  the B-tree must cover what is left (§40.1), the outer side's Vars being Params. The path carries
+  `get_baserel_parampathinfo()`'s ParamPathInfo and its rows, claims no order (an inner side's order
+  is no use to a nested loop, and a merge join takes unparameterized inputs) and is never partial. Core
+  then builds the nested loops, and the Memoizes above them, as for its own parameterized scans.
+  §30.1's precondition that the relation have no LATERAL references stands: a LATERAL relation's
+  paths are parameterized by what it references, not by join clauses, and the node's others are not.
+- **The set** is the relation's, as for an unparameterized walk: the lion access's lookups, built
+  after the snapshot is taken, held in the query's memory, and rebuilt on a rescan only when a Param
+  of the lion quals changed (§30.4) - which an outer row's never is, since no join clause reaches the
+  lion side. A correlated subquery's or a generic plan's Param in the lion filter still rebuilds it
+  for each value, counted in `Lion Set`'s builds. It is built lazily (§30.4, "The set, lazily") when
+  the loop's scans together are expected to meet fewer than `LO_SWITCH_MIN_WALK` (10,000) entries -
+  a few outer rows probing a few keys, the memo of the keys probed kept across the scans - and at once
+  otherwise (`LO_FLAG_BUILD`).
+- **Cost** (`lo_cost()` with `loops` and `scans`; `lo_probe_scans()`). A scan's price is §40.3's
+  with the walk the parameterized IndexPath's: core's `indextotalcost` for one scan (the descent,
+  and the B-tree's pages amortized over the loop count by core's `amcostestimate`), each entry's
+  probe at `LO_PROBE_TUPLES` × `cpu_tuple_cost` + `cpu_operator_cost`, a member's visibility-map
+  test at `cpu_operator_cost`, the residual and the target per row; and the heap pages as
+  `cost_index()` prices a parameterized index-only scan's - the fetches of all the loops' scans
+  through the Mackert and Lohman formula, scaled by `1 - allvisfrac`, every fetch random, divided
+  by the loops - which on a vacuumed table is nothing, where core's Index Scan pays a random page
+  per outer row. The loops are what core's `get_loop_count()` makes of the parameterization: the
+  fewest rows of the outer relations, a semi join's inner side as its distinct values. The set's
+  build (the lookups, the copy, the spill) is the start-up, divided by the scans `S` it is spread
+  over: core's nested loop charges an inner path's start-up again on every rescan (`cost_rescan()`
+  of a CustomPath), so `S` scans of `build / S` charge it once. `S` is the loops when
+  `enable_memoize` is off, and otherwise the distinct values the outer side hands the probe,
+  `Min(D, loops)` with `D` from `estimate_num_groups()` over the outer side of each join clause (a
+  clause Memoize cannot key on gives the loops): a Memoize rescans its inner side for a value it
+  has not cached alone, and `cost_memoize_rescan()` charges a scan's price per expected miss, so a
+  build spread over the loops would be charged only `misses / loops` of it in the plan core likes
+  best. Spread over the distinct values, the Memoize's plan pays the build once and the plan without
+  it `loops / D` times, though it builds once too: an overcharge that tips the choice only where the
+  values repeat, and there the Memoize's `D` scans against the loops' are the faster plan anyway.
+  `lo_margin` (§39) applies as to every `LionBtreeScan`: the price divided by
+  `pg_lion.pushdown_margin`, 1 by default. Where the outer side is small the build is not spread
+  far enough: three or twenty outer rows take core's Index Scan, which fetches their rows, eighty
+  the probe, and a dimension of a few hundred rows takes a hash join of a sequential scan
+  (test/sql/btreescan_param.sql, section 10).
+- **The build's price** (`lo_build_excess()`). §30.3 prices the lookups as the lion access's bitmap
+  paths (`cost_bitmap_tree_node()`, `lioncostestimate()`), a `cpu_index_tuple_cost` a TID - what a
+  lion index's scan hands a bitmap. The set's build hands nothing over a TID at a time: each leaf's
+  posting sets are read and combined a container at a time (`lo_build_leaf()`,
+  `lo_set_combine()`), a dense container's members costing nothing apiece. For the walks of §40 the
+  walk is most of the price and this did not decide; for the probe the build is the whole fixed
+  cost, and it decided wrongly: four dense filters on a 6M-row dimension of 4,688 containers were
+  priced 88,000 and built in 57 ms, on a 50M-row one of 12,808 containers 715,000 and 80 ms - 1.5
+  and 0.8 us a container of a posting set, against the 10 ns a TID stands for at the reference's 500
+  units a millisecond, and the error grows with the rows a container holds. So the probe charges a
+  leaf at most `LO_BUILD_PIECE_TIDS` (80) TIDs a container of each entry it reads - 0.8 us a piece,
+  the lower of the two measurements, where a tie should fall - and takes its TIDs past that back
+  out; a sparse leaf keeps its price, and the other walks keep §30.3's.
+- **Cold reads, declined.** §39's "A nested loop's cold reads" prices a loop's pages the cache
+  cannot hold at `pg_lion.cold_page_cost`, and a probe saves core's scan one heap page an outer row.
+  Taking the probe against core's scan that way (its leaf, its members' pages not all-visible and
+  the lion indexes' pages once for the set, against core's leaf and heap page) was built and
+  measured: with the build priced as above it moved none of the plans measured below - the probe's
+  own price is the lower wherever its cold reads are the fewer - and on the regression tables, where
+  the lion indexes' pages over a few dozen scans outweigh core's heap pages, it never applied. It
+  was taken out rather than kept untested.
+- **Execution** (`LO_FLAG_PROBE`, `st->probe`). Each rescan restarts the walk with its keys
+  evaluated again (core's run-time keys, `ExecIndexBuildScanKeys()`), so a NULL outer key makes a
+  strict operator's key unsatisfiable and the descent finds nothing, as in core's Index Scan. A
+  probe marks nothing: the met-before marks of §30.4 are counted for the early stop and the
+  fetch-and-sort switch, neither of which a probe has, and the visited bits' directory, remade for
+  every scan, is as long as the set's places - O(the set) a rescan for a scan of a few entries. A TID
+  met twice in one scan is then fetched twice; the second time it names a tuple written after the
+  snapshot (§30.4, "A recycled TID"), on a page whose all-visible bit the write cleared, which the
+  heap's visibility check skips. The lazy set's memo is not walked at each scan's reset for the same
+  reason. The visibility map's buffer is kept across rescans, as core's Index Only Scan keeps
+  `ioss_VMBuffer`: the next outer key is often on the same map page. `lo_begin()` refuses a plan
+  that marks a probe parallel-aware, a lion column's walk, a lionvec order, setless or sorted.
+- **Memoize, and rescans with no Param changed.** A nested loop puts its parameters in the inner
+  side's `chgParam` for every outer row. Under a Memoize the probe's `chgParam` accumulates while the
+  cache answers, and the probe is rescanned by its next `ExecProcNode()` with all of them; a rescan
+  of the Memoize with none changed - its parent rescanned with the same values, a cursor moved back
+  - rescans the probe directly (`ExecReScanMemoize()`) with `chgParam` empty. Either way the set is
+  kept unless a lion Param is in `chgParam` (`lo_rescan()`): the probe restarts its walk with the
+  same keys and the same set. Memoize's own purge on a non-key Param is untouched by any of this.
+- **EvalPlanQual and row marks.** A row mark of the dimension - `FOR UPDATE OF d`, `FOR SHARE`, or
+  the `ROW_MARK_REFERENCE` every other relation of a locking query or an UPDATE gets - puts its
+  `ctid` in the target, which no index returns (§40.1): no probe is offered, and EvalPlanQual never
+  meets one. `lo_recheck()` would evaluate the original clauses, the join clause with the outer row's
+  Param among them, and the lion qual, as for any walk.
+- **Parallel query.** The probe is `parallel_safe` when the relation is (`rel->consider_parallel`),
+  so a partial nested loop below a Gather runs it whole in each participant, the outer side divided;
+  it is never `parallel_aware` - a scan is a descent for one key, with nothing to divide. Each
+  participant then builds its own set: core calls a CustomScan's DSM hooks for a parallel-aware
+  node alone, so §40.9's shared set has no place to live, and the price charges the build once.
+  Its ANALYZE counters stay in the workers (§40.9).
+- **Partitions.** A partitioned dimension's Append takes each partition's probe when its
+  parameterization is the Append's (`reparameterize_path()` gives a CustomPath none). A
+  partitionwise join's nested loop joins a fact partition to the dimension partition of the same
+  keys, whose probe is parameterized by the fact's parent and is moved to the partition by core
+  (`reparameterize_path_by_child()`: at path time on 16, at plan creation on 17 and later) through
+  `ReparameterizeCustomPathByChild` (`lo_reparameterize()`): the B-tree's IndexPath is
+  reparameterized by core's own code; the lion access is the partition's and unparameterized, and
+  the column mapping the B-tree's.
+- **EXPLAIN** is §40.6's `LionBtreeScan` with core's `Index Cond`: the index quals with the key on
+  the left, which core's Index Scan prints (its `indexqualorig` is that list) - `(d.id = f.dim_id)`
+  however the query wrote the join. Every walk prints them now (`LO_EXPR_ORDQUALS` in place of the
+  original clauses, `LO_EXPR_ORDORIG`, which stay the recheck): `100 > k` as `(k < 100)`, a prefix
+  `LIKE` as the range it is searched by, with the `LIKE` in the Filter, as core's. No expected output
+  of the suite changed; the old display printed such a `LIKE` in both. Under ANALYZE
+  `Index Entries Walked`, `Lion Set Hits` and `Heap Fetches` are the sums over every scan, and
+  `Lion Set` shows the set built once - `48 containers, exact`, with no builds count - or `N builds`
+  where a lion Param made it rebuild; a Memoize above it prints its own hits and misses.
+- **Correctness.** Per scan, §30.5's and §40.5's arguments hold unchanged: the B-tree's entries and
+  the set's members are both HOT chains' root TIDs, the visible version reached from a root has the
+  index's values, the visibility map's bit is tested under the leaf's pin, and a row returned
+  without a heap visit takes the predicate lock of its heap page. Across scans the snapshot is the
+  execution's, so a set built after it serves every scan of it, a cursor's pieces included.
+  test/isolation/btreescan_param_serializable.spec is §40.5's write skew read through the loop's
+  probes (two HOT updates of rows the other transaction read index-only): it must fail.
+- **Settings.** No new one. `pg_lion.enable_btree_scan` gates the probe with the other unordered
+  walks; core's `enable_indexscan` disables it as it disables the B-tree's own scans (§40.2), and
+  `enable_indexonlyscan = off` takes it away, since the probe is index-only or nothing.
+  `pg_lion.enable_plain_scan` and `pg_lion.enable_ordered_scan` do not touch it: it is neither a
+  scan of a lion index nor an ordered walk. `enable_memoize` decides `S` above.
+- **A count over the join** (§27, §39). A `LionCount` meets core's plan above the join in the
+  competitor's units, and the competitor (`lion_competitor_path()`) is core's cheapest path with no
+  lion path inside: where the probe's nested loop is the join's cheapest path, every aggregate core
+  builds over it holds lion, the competitor is none, and the count is priced at rate 1 where a hash
+  join's 0.5 had been. test/sql/rangesource.sql's join of a ten-row dimension then planned the
+  probe's loop over its count, 2.1 ms against 1.8; that section now runs with the walks off.
+
+**Declined, and why.**
+
+- *A heap-mode probe* (a B-tree that does not cover): a scan would fetch every member's heap tuple,
+  which is core's Index Scan with lion's test in place of its Filter - the heap fetches of the members
+  saved only where the set rejects most of them, and a plan that loses to core's wherever the set
+  does not; the index-only probe is the one that removes the heap from the loop.
+- *A parameterized ordered walk* (`LionOrdered`), a lion column's walk and a lionvec order: an inner
+  side's order is no use to a nested loop, a merge join takes its inputs unparameterized, and a lion
+  column has no descent to a key.
+- *A set from the join clause* - the outer row's key in the lion side: a set per outer row, which is
+  §30.4's rebuild per Param at a loop's scale; the B-tree's descent does that part.
+- *Sharing the set among a parallel nested loop's participants*: core gives a CustomScan that is not
+  parallel-aware no shared memory; the set is each participant's, and the price is one build.
+
+**Not done.**
+
+- The price of the build does not shrink with a LIMIT above the loop: a fraction of the loop's
+  scans still pays its share of a build that happened whole on the first.
+- Duplicate outer keys with `enable_memoize` on but no Memoize chosen are charged the build
+  `loops / D` times; it is built once.
+- A parallel nested loop's participants each build the set and are charged one build.
+- The container price of the build is the probe's alone. The walks of §40 keep §30.3's TID price,
+  so a hash join over the dimension's whole covering walk carries a build priced several times the
+  probe's for the same set: at 600,000 outer rows into 6M dimension rows the two plans tie on price
+  and the probe's loop, chosen, runs twice as long (below). Refitting §30.3's price moves every
+  walk's plans, each to be timed against the plan it replaces.
+- A build is not repaid by warm heap fetches: 14,000 outer rows into the 6M-row dimension take the
+  probe (a 57 ms build) and run 1.7 times as long as core's loop with its heap fetches in the cache.
+  The probe is for a dimension the cache does not hold, and the planner's page costs are the
+  user's statement of that.
+
+**Tests.** test/sql/btreescan_param.sql, on a 100,000-row dimension - its heap several times its
+primary key - with lion indexes on an array, a bool and two enum columns and a `(grp, k) INCLUDE
+(id)` B-tree, and a 200,000-row fact table with a lion tsvector index and every fiftieth key NULL:
+every query run through the probe (hash and merge joins off, lion's paths priced at a thousandth)
+and through the ordinary plan (the walks off), the answers compared as multisets, the plan's shape
+and Index Cond named. The production shape, chosen with nothing disabled (`Index Entries Walked:
+714`, `Lion Set Hits: 135`, `Heap Fetches: 0`, the set built once), and core's plan with the switch
+off; a few outer rows, NULL outer keys, a LEFT JOIN and an empty set; repeated outer keys with a
+Memoize (`Hits: 26572  Misses: 2000`, two thousand walks) and without (28,572 walks), the set built
+once either way; the two-column B-tree with a parameterized leader and a constant second column; a
+generic plan's Param in the lion filter, a subquery rescanned with its Param in the fact's filter
+(built once) and in the lion filter (built for each value); a cursor fetched in pieces; pages not
+all-visible - inserts, deletes, HOT updates and lion-column updates in the transaction, then after
+it and after VACUUM (`Heap Fetches: 0`); a parallel nested loop (CREATE TABLE AS, Gather over a
+nested loop over a Parallel Seq Scan and the probe); a partitionwise join of hash-partitioned
+tables, the probe reparameterized per partition; the price with nothing disabled (above): 3, 20
+and 80 outer rows and a 300-row dimension; and the settings - `enable_indexscan` and
+`enable_indexonlyscan` off, `pg_lion.enable_plain_scan` and `pg_lion.enable_ordered_scan` off
+(the probe stays), a column no B-tree with the key covers, `FOR UPDATE OF f` and `FOR SHARE OF d`
+(no probe). Section 2 also has a semi and an anti join, the Index Cond printed key first however
+the clause was written. test/isolation/btreescan_param_serializable.spec is the write skew above.
+
+**Measured** (2026-10-23; PostgreSQL 16.15, the dev cluster: `shared_buffers` 2 GB, a VM of four
+cores and 15 GB shared with other work; warm, the tables in the OS cache; EXPLAIN (ANALYZE, TIMING
+OFF), medians of five or seven). Two synthetic dimensions with the production shape's filters - an
+array overlap of five tags of ten, a bool true in two thirds of the rows, enum equalities of 70% and
+80%: 18.7% of the rows pass - each joined from a fact table whose tsvector search picks the outer
+rows, `GROUP BY d.id ORDER BY n DESC LIMIT 100`: 6M rows of 410 bytes (a 2.3 GB heap, a 129 MB
+primary key) under 4M fact rows, and 50M rows of 134 bytes (6.4 GB, 1 GB) under 2M.
+
+| dimension | outer rows | planned | its time | core's plan, the walks off | core's nested loop |
+|---|---|---|---|---|---|
+| 6M | 14,286 | the probe | 142 ms | its nested loop, 84 ms | (the same) |
+| 6M | 100,000 | the probe | 536 | hash join over a bitmap heap scan, 3,206 | 655 |
+| 6M | 300,000 | the probe | 1,573 | hash join, 3,420 | 2,199 |
+| 6M | 600,000 | the probe under a Memoize | 3,322 | hash join, 3,662 | 5,302 |
+| 50M | 7,143 | core's nested loop | 54 | (the same) | (the same) |
+| 50M | 50,000 | the probe | 352 | its nested loop, 318 | (the same) |
+| 50M | 150,000 | the probe | 1,016 | its nested loop, 1,045 | (the same) |
+| 50M | 300,000 | the probe | 1,874 | hash join over a bitmap heap scan, 12,510 | - |
+
+The 600,000-row line's other plan with the walks on, a hash join over the dimension's whole
+covering walk, ran in 1,627 ms ("Not done"). The set took 57 ms to build on 6M rows and 80 ms on
+50M, warm (84 and 170 ms the first time); a scan of the loop, the descent, the probe and the
+visibility map's test, 4 to 5 us, within a microsecond of core's Index Only Scan rescanned for the
+same keys without a filter (2.56 s for 600,000). Warm, then, the probe ties core's nested loop at
+0.1 to 0.3% of the 50M rows and is 1.1 to 6.7 times faster where core's plan reads the dimension's
+heap whole. What it is for is the cold case, which a table in the OS cache cannot show: at 150,000
+outer rows of the 50M table core's Index Scan read 139,693 pages from outside `shared_buffers` and
+the probe 61,753, the primary key's leaves and the lion indexes; on a dimension of 85 GB each of
+core's is a synchronous read from the device, and the probe reads none of them. A
+500M-row dimension was not built: its set's build grows with the heap's containers, 0.8 to 1.5 us
+each of each posting set, some 1 to 2 s for 85 GB under four filters.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 
