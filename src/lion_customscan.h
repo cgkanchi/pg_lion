@@ -3950,6 +3950,8 @@ typedef struct LionUnits
 	Cost		nlcost;			/* the cheapest core path's cost */
 	Cost		nlcold;			/* a nested loop's cold reads, over that */
 	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
+	double		memoscale;		/* a loop's price over its price with its
+								 * Memoize's hits under the LIMIT, or 1 */
 	Cost		bmcold;			/* its bitmap heap scans' cold reads, over
 								 * that, where the loop has none */
 	Cost		bmcoldpage;		/* ... and a cold page's charge, for lion's */
@@ -3970,6 +3972,8 @@ extern void lion_path_core_switches(Path *path, LionCoreScan scan);
 extern bool lion_path_disabled(const Path *p);
 extern Cost lion_units_cold_page(PlannerInfo *root, double idxpages,
 								 Oid reltablespace);
+extern Cost lion_memoize_limit_extra(PlannerInfo *root, Path *path,
+									 double share);
 extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
@@ -4449,6 +4453,8 @@ extern void lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel,
 									bool indexonly_ok, List **iocols,
 									Cost *startup, Cost *total,
 									double *fetches, double *lionpages);
+extern bool lion_ordered_walk_reads(PlannerInfo *root, Path *path,
+									double share, double *reads);
 extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Path *lion, List *iocols, bool dim,
 										  double weight, Expr *keyqual,

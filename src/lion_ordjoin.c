@@ -508,7 +508,13 @@ typedef struct OjCompetitor
 	bool		factwalk;		/* ... whose outer side is the fact's index
 								 * scan */
 	bool		indexonly;		/* ... index-only */
+	bool		lionwalk;		/* ... or the fact's LionOrdered walk */
+	double		walkreads;		/* that walk's reads over the LIMIT's share
+								 * (lion_ordered_walk_reads()) */
 	Cost		cost;			/* its price of the LIMIT's rows */
+	Cost		memo;			/* what its Memoize's hits under the LIMIT
+								 * leave out of that
+								 * (lion_memoize_limit_extra()) */
 } OjCompetitor;
 
 /* The share of a path's rows the query's LIMIT takes: all without one */
@@ -521,32 +527,69 @@ oj_limit_share(PlannerInfo *root, double rows)
 }
 
 /*
+ * Is p core's nested loop over the fact's LionOrdered walk - its outer side,
+ * under a projection, a LionOrdered path of fact, and its inner side free of
+ * lion's paths?  *walk is that walk.
+ */
+static bool
+oj_loop_over_walk(Path *p, RelOptInfo *fact, Path **walk)
+{
+	JoinPath   *jp;
+	Path	   *outer;
+
+	*walk = NULL;
+	while (p != NULL && IsA(p, ProjectionPath))
+		p = ((ProjectionPath *) p)->subpath;
+	if (p == NULL || !IsA(p, NestPath))
+		return false;
+	jp = (JoinPath *) p;
+	if (lion_path_has_lion(jp->innerjoinpath))
+		return false;
+	outer = jp->outerjoinpath;
+	while (outer != NULL && IsA(outer, ProjectionPath))
+		outer = ((ProjectionPath *) outer)->subpath;
+	if (outer == NULL || !IsA(outer, CustomPath) ||
+		((CustomPath *) outer)->methods != &lion_ordered_path_methods ||
+		outer->parent != fact)
+		return false;
+	*walk = outer;
+	return true;
+}
+
+/*
  * The plan the LIMIT would take of core's paths of joinrel so far (core adds
- * them before it calls the hook): unparameterized, with no lion path inside
- * (lion_path_has_lion()), not disabled; an ordered one - its first sort key
- * the walk's - at its price of the LIMIT's share of its rows, any other at
- * its total, which the Sort over it reads whole.  Only a nested loop into an
- * index scan in the walk's order is weighed for its cold reads; a hash join
- * and its Sort read the two sets' heaps as bitmap scans, which §46 does not
- * weigh either.
+ * them before it calls the hook): unparameterized, not disabled, with no lion
+ * path inside (lion_path_has_lion()) but a nested loop's outer LionOrdered
+ * walk of the fact (oj_loop_over_walk()), which a page core walks over
+ * LionOrdered competes with; an ordered one - its first sort key the walk's -
+ * at its price of the LIMIT's share of its rows, any other at its total,
+ * which the Sort over it reads whole.  Only a nested loop into an index scan
+ * in the walk's order is weighed: for what its Memoize's hits under the LIMIT
+ * leave out of its price (lion_memoize_limit_extra()), and for its cold
+ * reads, a walk over LionOrdered with that walk's own
+ * (lion_ordered_walk_reads()).  A hash join and its Sort read the two sets'
+ * heaps as bitmap scans, which §46 does not weigh either.
  */
 static void
 oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 			  List *pathkeys, OjCompetitor *c)
 {
 	Path	   *best = NULL;
+	Path	   *bestwalk = NULL;
 	bool		bestordered = false;
+	double		share;
 	ListCell   *lc;
 
 	memset(c, 0, sizeof(OjCompetitor));
 	foreach(lc, joinrel->pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
+		Path	   *walk = NULL;
 		bool		ordered;
 		Cost		cost;
 
-		if (p->param_info != NULL || lion_path_has_lion(p) ||
-			lion_path_disabled(p))
+		if (p->param_info != NULL || lion_path_disabled(p) ||
+			(lion_path_has_lion(p) && !oj_loop_over_walk(p, fact, &walk)))
 			continue;
 		ordered = (p->pathkeys != NIL && pathkeys != NIL &&
 				   linitial(p->pathkeys) == linitial(pathkeys));
@@ -557,6 +600,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 		if (best == NULL || cost < c->cost)
 		{
 			best = p;
+			bestwalk = walk;
 			bestordered = ordered;
 			c->cost = cost;
 		}
@@ -565,6 +609,14 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 		lion_competitor_kind(best) != LION_COMPETITOR_NESTLOOP)
 		return;
 	c->nestloop = true;
+	share = oj_limit_share(root, best->rows);
+	c->memo = lion_memoize_limit_extra(root, best, share);
+	if (bestwalk != NULL)
+	{
+		c->lionwalk = lion_ordered_walk_reads(root, bestwalk, share,
+											  &c->walkreads);
+		return;
+	}
 
 	/* the loop's outermost side: the fact's walk, or something else */
 	while (best != NULL && !IsA(best, IndexPath))
@@ -598,21 +650,33 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
  * the share of the walk the query's LIMIT is expected to take, *probes the
  * descents of the whole walk.
  *
- * Then §39's cold reads, as LionProbeJoin weighs them (lion_units_cold()),
- * against comp, core's nested loop over the same walk, both over the LIMIT's
- * share s of the walk: the loop reads a fact heap page for each entry it
- * walks (in its index-only scan, those of pages not all-visible) and a leaf
- * and a heap page of the dimension for each key it keeps; the node reads the
- * fact's heap for its fetches (factfetches over the whole walk, lo_cost()'s),
- * a leaf for each descent, the dimension's heap for each member, the lion
- * index pages its sets' builds read, and the key sets' tables.  Each page is
- * charged lion_units_cold_page() over core's random_page_cost, the share of
- * the tables effective_cache_size cannot hold, and the price multiplied by
+ * Then, against comp, core's nested loop over the same walk, both over the
+ * LIMIT's share s of the walk.  First its Memoize: the loop's price core
+ * there, of the LIMIT's share of its rows, lacks memo, the hits core counted
+ * that the share of its calls does not meet (lion_memoize_limit_extra()), and
+ * the price is multiplied by
  *
- *	(own + ownreads * perpage) * core / ((core + corereads * perpage) * own)
+ *	memoscale = core / (core + memo)
  *
- * - own the node's price of the LIMIT's share, core the loop's - at most 1
- * and at least 1 / pg_lion.cold_max_discount.
+ * unbounded, as lion_units_price() puts a path into the loop's units.  Then
+ * §39's cold reads, as LionProbeJoin weighs them (lion_units_cold()): the
+ * loop reads a leaf and a heap page of the dimension for each key it keeps,
+ * and over the fact's index scan a fact heap page for each entry it walks (in
+ * an index-only scan, those of pages not all-visible), over a LionOrdered walk
+ * that walk's own reads (lion_ordered_walk_reads(), none where its price
+ * carries a cold discount of its own already); the node reads the fact's
+ * heap for its fetches (factfetches over the whole walk, lo_cost()'s), a leaf
+ * for each descent, the dimension's heap for each member, the lion index
+ * pages its sets' builds read, and the key sets' tables.  Each page is
+ * charged perpage, lion_units_cold_page() over core's random_page_cost in the
+ * share of the tables effective_cache_size cannot hold, and the price
+ * multiplied by
+ *
+ *	(own + ownreads * perpage) * (core + memo) /
+ *		((core + memo + corereads * perpage) * own)
+ *
+ * - own the node's price of the LIMIT's share - at most 1 and at least
+ * 1 / pg_lion.cold_max_discount, on top of memoscale.
  */
 static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
@@ -716,7 +780,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 */
 	*share = oj_limit_share(root, out);
 
-	/* the cold reads, over the LIMIT's share of the walk */
+	/* the loop's Memoize and the cold reads, over the LIMIT's share */
 	factor = 1.0;
 	if (comp->nestloop)
 	{
@@ -724,19 +788,28 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		double		ordpages = Max((double) ord->indexinfo->pages, 1.0);
 		Cost		perpage = lion_units_cold_page(root, ordpages + idxpages,
 												   j->fact->reltablespace);
+		LionUnits	u;
 
+		memset(&u, 0, sizeof(LionUnits));
+		u.kind = LION_COMPETITOR_NESTLOOP;
+		u.rate = 1.0;
+		u.margin = 1.0;
+		u.nlcost = comp->cost;
+		u.memoscale = (comp->memo > 0.0 && comp->cost > 0.0) ?
+			comp->cost / (comp->cost + comp->memo) : 1.0;
 		if (perpage > 0.0)
 		{
 			double		walked = clamp_row_est(ord->indexselectivity *
 											   j->fact->tuples);
 			double		corereads;
 			double		ownreads;
-			LionUnits	u;
 
 			corereads = index_pages_fetched(s * keys, (BlockNumber) idxpages,
 											idxpages, root) +
 				index_pages_fetched(s * keys, dim->pages, idxpages, root);
-			if (comp->factwalk)
+			if (comp->lionwalk)
+				corereads += comp->walkreads;
+			else if (comp->factwalk)
 				corereads += index_pages_fetched(s * walked, j->fact->pages,
 												 ordpages, root) *
 					(comp->indexonly ? 1.0 - j->fact->allvisfrac : 1.0);
@@ -749,16 +822,11 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 			foreach(lc, j->keysets)
 				ownreads += (double) ((OjKeySet *) lfirst(lc))->rel->pages;
 
-			memset(&u, 0, sizeof(LionUnits));
-			u.kind = LION_COMPETITOR_NESTLOOP;
-			u.rate = 1.0;
-			u.margin = 1.0;
-			u.nlcost = comp->cost;
 			u.nlcold = corereads * perpage;
 			u.coldpage = perpage;
 			lion_units_cold(&u, startup + s * run, ownreads);
-			factor = u.rate;
 		}
+		factor = u.rate * u.memoscale;
 	}
 	*startup_p = startup * factor;
 	*total_p = (startup + run) * factor;
@@ -836,6 +904,9 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	cp->path.rows = rows;
 	cp->path.startup_cost = startup / margin;
 	cp->path.total_cost = total / margin;
+	elog(DEBUG2, "lion: a LionOrderedJoin path over %s, %.2f..%.2f for %.0f rows",
+		 get_rel_name(ord->indexinfo->indexoid), cp->path.startup_cost,
+		 cp->path.total_cost, rows);
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = paths;

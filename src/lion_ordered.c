@@ -4346,6 +4346,77 @@ lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 }
 
 /*
+ * The pages a LionOrdered walk of a btree reads over `share` of it, as a
+ * competitor's (DESIGN.md §47.3, "Cold reads"): a core nested loop over the
+ * walk, which a LionOrderedJoin is weighed against.  lo_cost() is taken again
+ * for the path's btree and lion access as lo_set_rel_pathlist() took it: the
+ * heap pages of its fetches, `share` of the whole walk's
+ * (index_pages_fetched() over the table's pages), and the lion index pages
+ * its set's build reads (lo_lion_pages()) - the reads lo_cold_price() weighs,
+ * less the btree's, which the join's own walk reads as well and which are
+ * left out of both.  An index-only walk's price may already carry
+ * lo_cold_price()'s discount, its reads weighed cold against a bitmap heap
+ * scan's (lion_units_scan_cold()): where it does, *reads is 0, and those
+ * reads are not weighed a second time.  False for a path that is not a serial
+ * LionOrdered walk of a btree.
+ */
+bool
+lion_ordered_walk_reads(PlannerInfo *root, Path *path, double share,
+						double *reads)
+{
+	CustomPath *cp;
+	RelOptInfo *rel;
+	IndexPath  *ord;
+	Path	   *lion;
+	List	   *iocols;
+	List	   *lionrinfos = NIL;
+	bool		lossy = false;
+	List	   *lionqual;
+	List	   *residual;
+	bool		indexonly;
+	Cost		startup;
+	Cost		total;
+	double		walkreads;
+	double		fetches;
+
+	*reads = 0.0;
+	if (path == NULL || !IsA(path, CustomPath))
+		return false;
+	cp = (CustomPath *) path;
+	rel = cp->path.parent;
+	if (cp->methods != &lion_ordered_path_methods || cp->path.parallel_aware ||
+		rel == NULL || list_length(cp->custom_private) != 3 ||
+		!IsA(linitial(cp->custom_private), IndexPath))
+		return false;
+	ord = (IndexPath *) linitial(cp->custom_private);
+	lion = (Path *) lsecond(cp->custom_private);
+	iocols = (List *) lthird(cp->custom_private);
+	if (lo_knn_path(ord))
+		return false;
+	indexonly = (iocols != NIL);
+	lionqual = (lion != NULL) ? lo_lion_qual(lion, &lionrinfos, &lossy) : NIL;
+	residual = lo_residual(rel->baserestrictinfo, lo_ord_rinfos(ord),
+						   lionrinfos, lionqual);
+	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
+				   cp->path.rows, indexonly, 1.0, 1.0,
+				   ord->path.param_info != NULL, NULL, &startup, &total,
+				   &walkreads, &fetches);
+	if (indexonly)
+	{
+		LionUnits	cold;
+
+		lion_units_scan_cold(root, rel, &cold);
+		if (lion_units_bitmap_factor(&cold, total, walkreads) < 1.0)
+			return true;
+	}
+	*reads = index_pages_fetched(Max(share, 0.0) * fetches, rel->pages,
+								 Max((double) ord->indexinfo->pages, 1.0),
+								 root) +
+		lo_lion_pages(lion);
+	return true;
+}
+
+/*
  * A side of the join as a LionOrdered path of rel, which is never offered to
  * rel's path list: the fact's ordered walk (`weight` the share of it the
  * join's LIMIT is expected to take), or the dimension's probe of its unique

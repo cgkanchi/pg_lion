@@ -23398,6 +23398,50 @@ each plan; and a GROUP BY over a subquery whose plan holds a Memoize, estimated 
 subquery's root. `costrates.sql` lists both settings and their ranges, and `costgucs.sql` lists
 `cold_stream_page_cost` among the cost settings.
 
+### A Memoize under a LIMIT (2026-10-23)
+
+Core prices a Memoize over a nested loop's inner scan at one hit ratio for all its calls
+(`cost_memoize_rescan()`): of `calls` rescans over `ndistinct` keys, of which the cache holds
+`est_entries`, `hr = (calls - ndistinct) / calls x est_entries / ndistinct` hit, each priced at the
+lookup alone, and the rest at the inner scan's total cost. Under a LIMIT the planner takes the
+loop's startup and the LIMIT's share of its run, and that share counts the hits of the whole walk.
+But the loop stops after the share's first calls, which repeat only the keys among themselves. On
+§47.9's bench a medium page's walk makes 625,513 calls over 188,097 keys, and core priced 70% of
+them as hits; the LIMIT's 3,030 calls hit 0.8% of the time. The loop's price of its first 20 rows
+was 2,847, where the same model with those hits is 3,982.
+
+So against a nested loop over a Memoize (under a Material or a projection) in a query with a LIMIT
+(`limit_tuples`, which the planner leaves -1 under a grouping, an aggregate or a window), whose
+order gives the query at least its first sort key and of whose rows the LIMIT takes a share
+`s < 1` (`lion_memoize_limit_extra()`, `lion_memoize_limit_scale()`, lion_plan_units.c):
+
+- `n = s x calls` calls are made; of `ndistinct` keys drawn about uniformly they hold
+  `d(n) = ndistinct x (1 - (1 - 1 / ndistinct)^n)` distinct ones;
+- they hit `hits(n) = (n - d(n)) x min(1, est_entries / d(n))` times: every repeat where the cache
+  holds every key met, and `est_entries / d(n)` of them where it holds fewer, as core takes
+  `est_entries / ndistinct` of the whole walk's;
+- the loop's price lacks `extra = n x (hr - hits(n) / n) x` the inner scan's total cost, where that
+  is positive.
+
+The figures are core's own: `calls` (`est_calls` from PostgreSQL 19), `est_entries`, `ndistinct`
+as `cost_memoize_rescan()` estimates it (`estimate_num_groups()` of the cache keys, or the calls
+where that falls back on a default; `est_unique_keys` from 19) and the hit ratio from them
+(`est_hit_ratio` from 19). As with a cold loop's reads, the lion path's price is put into the loop's
+units: it is multiplied by `memoscale`, the loop's price of the share (its startup and `s` of its
+run) over that price plus the extra (`lion_units_price()`). That scale is not bounded by
+`pg_lion.cold_max_discount`, since it is the competitor's own price, corrected; the cap bounds only
+the cold reads on top, which take the loop at `nlcost / memoscale` (`lion_units_cold()`). Every
+lion path priced against such a loop through `lion_units_for()` sees it, and LionOrderedJoin
+weighs its own competitor the same way (§47.3). A LionOrdered walk is priced against a scan of its
+relation, never a loop, and its price does not change. `pg_lion.enable_memoize_limit` (on) turns
+it off.
+
+Not counted: keys drawn other than uniformly. A skewed key column repeats more early, and a key
+correlated with the loop's order (each run of the walk meeting the same few keys) hits more than
+this model and core's both. A cache that evicts is taken at core's share of entries, not at the
+hits its eviction order leaves. Tests: ordjoin.sql's page that is core's loop over a Memoize with
+the setting off and LionOrderedJoin with it on.
+
 ### Tests
 
 `test/sql/costrates.sql`: the settings and their ranges; the margin as a threshold - a GROUP BY the
@@ -28759,9 +28803,10 @@ the key is written into the scan key's argument at run time.
 
 ### 47.3 Cost (`oj_cost()`)
 
-In the planner's units, on the walk's own price, with no §39 rate; cold, weighed against core's
-nested loop by §39's cold reads ("Cold reads" below). With `factrows` the fact's rows after its
-quals as lion estimates them (`lion_probe_rel_rows()`):
+In the planner's units, on the walk's own price, with no §39 rate; against core's nested loop, put
+into the loop's units with its Memoize at the hits the LIMIT meets, and cold weighed by §39's cold
+reads ("The competitor" below). With `factrows` the fact's rows after its quals as lion estimates
+them (`lion_probe_rel_rows()`):
 
 - **The fact's walk**: `lion_ordered_walk_price()`, which is `lo_cost()` (§30.3, §40.3) over the
   whole walk - the set's build, the entries walked, the members' fetches (in index-only mode the
@@ -28813,24 +28858,38 @@ build more, where a set built at once for a walk that stops after a few hundred 
 whole build: the lazy error is the cheaper one. The left joins and NOT EXISTS above the node keep
 its rows about one to one with the LIMIT's.
 
-**Cold reads** (`oj_competitor()`, the end of `oj_cost()`), as §46 weighs them (§39, "A nested
-loop's cold reads", `lion_units_cold()`). The competitor is the plan the LIMIT would take of the
-join rel's paths as core leaves them when the hook runs, found before the node's first path is
-added (`add_path()` frees the paths a new one dominates): unparameterized, with no lion path inside
-(`lion_path_has_lion()`), not disabled; one whose first sort key is the walk's at its startup and
-the LIMIT's share of its run, any other at its total, which the Sort above it reads whole. It is
-not `lion_competitor_path()`'s, the cheapest total, which here is a hash join at §39's rate for one,
-0.5: under a LIMIT core takes neither that plan nor its whole price. Only a nested loop in the
-walk's order is weighed; a hash join and its Sort read the two sides through bitmap heap scans,
-which §46 does not weigh either.
-Over the LIMIT's share `s` of the walk (`*share`), with `walked` the entries of the fact's B-tree
-its Index Cond selects:
+**The competitor** (`oj_competitor()`) is the plan the LIMIT would take of the join rel's paths as
+core leaves them when the hook runs, found before the node's first path is added (`add_path()`
+frees the paths a new one dominates): unparameterized and not disabled, with no lion path inside
+(`lion_path_has_lion()`) but for a nested loop's outer LionOrdered walk of the fact
+(`oj_loop_over_walk()`), the plan core takes where LionOrdered walks the page; one whose first sort
+key is the walk's at its startup and the LIMIT's share of its run, any other at its total, which
+the Sort above it reads whole. It is not `lion_competitor_path()`'s, the cheapest total, which here
+is a hash join at §39's rate for one, 0.5: under a LIMIT core takes neither that plan nor its whole
+price. Only a nested loop in the walk's order is weighed, for its Memoize and its cold reads; a
+hash join and its Sort read the two sides through bitmap heap scans, which §46 does not weigh
+either.
+
+**Its Memoize** (§39, "A Memoize under a LIMIT"): `core`, the loop's price of the LIMIT's share,
+counts the hits of a Memoize over its inner scan at core's ratio over the whole walk; it lacks
+`memo`, what the share's calls do not hit (`lion_memoize_limit_extra()`). The node's startup and
+total are multiplied by `memoscale = core / (core + memo)`, unbounded, as `lion_units_price()`
+puts a path into such a loop's units.
+
+**Cold reads** (the end of `oj_cost()`), as §46 weighs them (§39, "A nested loop's cold reads",
+`lion_units_cold()`), over the LIMIT's share `s` of the walk (`*share`), with `walked` the entries
+of the fact's B-tree its Index Cond selects:
 
 - **the loop's reads** (`corereads`): a leaf of the dimension's key and a dimension heap page for
   each key it keeps, `index_pages_fetched(s * keys)` over the B-tree's pages and over the
-  dimension's; and where the loop's outer side is the fact's index scan, a fact heap page for each
-  entry it walks, `index_pages_fetched(s * walked)` over the fact's pages - in an index-only scan
-  those not all-visible, `1 - allvisfrac` of them;
+  dimension's; where its outer side is the fact's index scan, a fact heap page for each entry it
+  walks, `index_pages_fetched(s * walked)` over the fact's pages - in an index-only scan those not
+  all-visible, `1 - allvisfrac` of them; and where it is a LionOrdered walk, that walk's reads
+  (`lion_ordered_walk_reads()`): `lo_cost()` taken again for its B-tree and lion access, the heap
+  pages of the LIMIT's share of its fetches and its set's lion index pages - the reads
+  `lo_cold_price()` weighs, less the B-tree's, which the node's walk reads too and which are left
+  out of both. An index-only walk whose price already carries `lo_cold_price()`'s discount, its
+  reads weighed cold against a bitmap heap scan's, adds none: they are not weighed twice;
 - **the node's** (`ownreads`): the fact heap pages of its fetches (`lo_cost()`'s fetches of the
   whole walk, `fetches_p`), a leaf a descent and a dimension heap page a member, each
   `index_pages_fetched()` of `s` of them; the lion index pages the two sets' builds read
@@ -28838,15 +28897,13 @@ its Index Cond selects:
 
 Each page is charged `lion_units_cold_page()`, `perpage`: `pg_lion.cold_page_cost` less the
 `random_page_cost` core charged it, in the share of the query's tables and the two B-trees
-`effective_cache_size` cannot hold, 0 where it holds them all. The startup and total are then
-multiplied by
+`effective_cache_size` cannot hold, 0 where it holds them all. The startup and total, after
+`memoscale`, are then multiplied by
 
-    (own + ownreads * perpage) * core / ((core + corereads * perpage) * own)
+    (own + ownreads * perpage) * (core + memo) / ((core + memo + corereads * perpage) * own)
 
-`own` the node's price of the LIMIT's share (`startup + s * run`), `core` the competitor's: at most
-1, a node that reads more than the loop keeping its price, and at least 1 /
-`pg_lion.cold_max_discount`. Warm it is 1. A Memoize over the loop's index scan is not counted, as
-§39 does not count one: the LIMIT's share of the walk meets few keys twice.
+`own` the node's price of the LIMIT's share (`startup + s * run`): at most 1, a node that reads
+more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discount`. Warm it is 1.
 
 ### 47.4 Execution (`oj_begin()`, `oj_exec()`, `oj_rescan()`)
 
@@ -28950,14 +29007,13 @@ the node's rows to them above is the plan.
   larger than planned is held all the same, never spilled. A hash join spills; a key set's
   rejections would have to be held back until its batches are read, which the walk's order
   forbids.
-- **Core's Memoize, warm.** Core prices a Memoize over its loop's index scan on the hit ratio of
-  the whole walk's keys, which the LIMIT's share of the walk does not reach; the node's descents
-  are priced in full. Warm, it keeps the medium pages core's, where the node runs 1.4 to 3.5 times
-  faster (§47.9); the price does not correct core's.
-- **Cold reads against lion's own loop.** The competitor is core's plan without lion's paths. Where
-  the plan the node meets is core's nested loop over a LionOrdered walk (§47.9's deep page, cold),
-  that loop's dimension reads are not weighed against the node's; core's plan without lion's is
-  there a hash join, which is not weighed at all.
+- **The fact heap under a LIMIT.** Core's index scan's heap pages are Mackert and Lohman's over the
+  whole walk's fetches, each page counted once though the walk fetches it about seventy times, and
+  the LIMIT takes its share of that: 343 pages for the medium page's 26,257 fetches, which meet
+  about 22,000. The node's 3,030 member fetches are priced the same way, 343 pages for about 3,000.
+  The model at the share's own fetches would charge core's loop some 86,000 more and the node
+  10,500. The Memoize's hits are corrected (§39, "A Memoize under a LIMIT"); these pages are not,
+  and with them the node's startup, its sets' builds, keeps the medium pages core's warm (§47.9).
 - **The switch's price.** The fetch-and-sort switch acts at run time on what the walk meets; the
   path is priced as a walk to the end.
 - **The dimension index-only.** The probe always reads the member's heap row. Where a B-tree on the
@@ -28980,8 +29036,12 @@ lion's paths priced at a thousandth so that the join is the node wherever it may
 core's plan with the node off, and the answers compared row by row, in order, every ORDER BY ending
 in a unique key; `oj()` says whether the first plan was the node and how many key sets it had. The
 plan chosen with nothing forced: the node for a page the walk fills early, core's hash join and sort
-for one whose rows are rare; core's nested loop over the fact's LionOrdered walk for a third warm,
-the node at `effective_cache_size = 1MB` (§47.3's cold reads). The walk forward and backward, NULLs
+for one whose rows are rare; core's nested loop for a third warm, the node at `effective_cache_size
+= 1MB` (§47.3's cold reads: the node's price 4.2 times core's warm and 0.53 of it cold, on
+PostgreSQL 17 and 19 alike, a margin that a plan's prices moving with the sample ANALYZE takes does
+not cross); core's nested loop over a Memoize for a fourth with `pg_lion.enable_memoize_limit` off,
+the node with it on (the node's price 1.11 and 0.90 of core's: no page of this table that the term
+flips clears core's by more, warm, at a LIMIT of 20 to 200). The walk forward and backward, NULLs
 where the order puts them; an OFFSET; a side with no lion clause, each way; an inexact dimension
 set, rechecked; a fact filter; an Incremental Sort above for a trailing dimension key, a LEFT JOIN
 and a LEFT JOIN ... IS NULL to a third table, and under a LEFT JOIN with LIMIT 5 the dimension's set
@@ -29028,9 +29088,9 @@ the fact and a Memoize.
 | dense, a key set | the first, `AND f.fk IN (SELECT k FROM bwatch WHERE active)` | 2,829 | nested loops | 2.42 ms | 3.43 ms | core | node | 29.1 ms | 28.6 ms |
 | medium | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 34.0 ms | 11.6 ms | core | node | 343 ms | 195 ms |
 | medium | `f.tags @> '{a1}' AND d.lvl = 3 AND d.flag` | 9,595 | nested loop | 11.6 ms | 6.9 ms | core | node | 244 ms | 159 ms |
-| medium, index-only | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 31.7 ms | 9.0 ms | core | node | 190 ms | 39.0 ms |
-| the dimension's only, index-only | `d.lvl = 3 AND d.flag` | 3,902 | nested loop, Index Only Scan | 6.9 ms | 5.1 ms | core | core | 189 ms | 29.3 ms |
-| dense, OFFSET 2000 | `f.chan = 3 AND d.region = 'north'` | 81,388 | nested loop | 101 ms | 49 ms | core | core | 893 ms | 727 ms |
+| medium, index-only | `f.chan = 3 AND d.lvl = 3 AND d.flag` | 26,257 | nested loop | 31.7 ms | 9.0 ms | node | node | 190 ms | 39.0 ms |
+| the dimension's only, index-only | `d.lvl = 3 AND d.flag` | 3,902 | nested loop, Index Only Scan | 6.9 ms | 5.1 ms | core | node | 189 ms | 27.8 ms |
+| dense, OFFSET 2000 | `f.chan = 3 AND d.region = 'north'` | 81,388 | nested loop | 101 ms | 49 ms | core | node | 893 ms | 599 ms |
 | sparse | `f.tags @> '{a1}' AND f.tags @> '{b2}' AND d.lvl = 3 AND d.kind = 3` | 730,643 | hash join, Sort | 67.8 ms | 173 ms | core | core | 534 ms | 1,184 ms |
 
 Where the page is neither dense nor sparse the node runs 1.4 to 3.5 times faster than core's nested
@@ -29045,31 +29105,34 @@ dimension (`lvl < 50`, fifty posting lists) is always built at once, 7 ms; a key
 whole first, a Seq Scan of 20,000 rows. Where it is sparse the walk meets 730,000 entries for twenty
 rows, and core's hash join of the two sets and its sort is 2.6 times faster.
 
-Warm, the planner keeps core's plan in every row: rightly where the page is dense or sparse, wrongly
-for the medium pages and the deep one. The fact's set's build no longer keeps it (§47.3: `chan =
-3`'s 3,772 now about 960), nor the fact's heap: the node's fetches are Mackert and Lohman's over the
-walk's 625,000 members and the table's 70,900 pages, about 0.45 a fetch, and core's Index Scan
-fetches all five million rows of its walk over the same pages, about 0.06 a fetch, eight to a
-member: 0.45 for each row either keeps. Core's Memoize keeps it. The medium scalar page: the node
-1,150..818,180 for 4,129 rows, its Limit 1,150..5,110; core's nested loop 0.9..587,688 for the same
-rows, its Limit 0.9..2,847. A descent of the node's is `btcostestimate()`'s, `(tree_height + 1) *
-50` operator costs and its comparisons, 0.39; core's probe is the same index scan under a Memoize,
-priced on its hit ratio over the whole walk, 625,000 keys of 200,000 dimension rows, about 68%:
-117,569 for the 625,000 probes, 0.19 a probe. The LIMIT's share of the walk meets a few thousand
-keys, nearly all distinct, and gets almost none of those hits. The dense page `f.chan = 3 AND
-d.region = 'north'`: the node 1,280..861,590 for 123,747 rows, its Limit 1,280..1,420, its sets'
-builds most of it; core's loop over a Memoize, its Limit 95.8.
+Warm, at the default 4 GB, the planner takes the node for the medium index-only page (9.5 ms, timed
+again, against 31.7) and keeps core's plan elsewhere: rightly where the page is dense or sparse,
+wrongly for the other medium pages, the dimension's only and the deep one. The fact set's build
+(§47.3: `chan = 3`'s 3,772 now about 960) and core's Memoize (§39, "A Memoize under a LIMIT") are
+corrected. Per row kept, the two prices of the fact's heap agree: the node's fetches are Mackert and
+Lohman's over the walk's 625,000 members and the table's 70,900 pages, about 0.45 a fetch, and
+core's Index Scan fetches all five million rows of its walk over the same pages, about 0.06 a fetch,
+eight to a member. The medium scalar page: the node 1,150..818,180 for 4,129 rows before the
+Memoize's scale of 0.715, its Limit 5,110; core's loop 0.9..587,688 for the same rows, its Limit
+2,847, and 3,982 with the hits its 3,030 calls meet where core counted 70% of them. The node's run
+under the LIMIT, 3,960, is now core's corrected 3,982; what is left is its startup, the sets'
+builds, 1,150, against core's fact heap, which Mackert and Lohman price at the whole walk's share
+(§47.7, "The fact heap under a LIMIT"). The multi-key page's set is built at once (2,600 of
+startup); the deep page comes to 11,040 against 9,594; and the dimension's only page ties, 235.2
+against 235.3, where add_path() keeps the loop's lower startup. A descent of the node's is
+`btcostestimate()`'s, `(tree_height + 1) * 50` operator costs and its comparisons, 0.39; core's
+probe, the same index scan under the Memoize, was priced 0.19 on its hit ratio over the whole walk.
+The dense page `f.chan = 3 AND d.region = 'north'`: the node 1,280..861,590 for 123,747 rows, its
+Limit 1,420, its sets' builds most of it; core's loop over a Memoize, its Limit 95.8.
 
-Cold, the cold reads (§47.3) take the node's price down by 0.70 and 0.59 for the medium pages in
-heap mode, 0.74 for the key set's, and by the cap, a half, for the others it is weighed in, and the
-plan flips to the node for the medium pages, the dense scalar one and the key set's. Each flip is
-right: the medium pages 1.8, 1.5 and 4.9 times faster than the plan without the node, the dense one
-2.6 times, the key set's a tie. Core's plan stays, rightly, for the sparse page (534 against 1,184
-ms) and the dense range (18.1 against 19.4 ms); and wrongly for the dense multi-key page (36 against
-16 ms), the dimension's only (189 against 29 ms) and the deep page (893 against 727 ms). The first
-two are Memoize's again: core's loops at 944 and 621 under the LIMIT, the node's own prices 3,219
-and 6,649 before the factor, of which the cap takes at most half. The deep page's plan is core's
-loop over lion's LionOrdered walk, 42,317 against the node's 46,920; the competitor its cold reads
-are weighed against, core's cheapest plan without lion's under the LIMIT, is there the hash join
-(101,117, its Sort above), which is not weighed (§47.7). At 256 MB the plans are the same. Not
-measured: other majors.
+Cold, the planner takes the node for every medium page, the dimension's only, the deep page, the
+dense scalar page and the key set's, and each flip is right: the medium pages 1.8, 1.5 and 4.9 times
+faster than the plan without the node, the dimension's only 6.8 times (27.8 against 189 ms), the
+deep page 1.5 times (599 against 893 ms), the dense scalar page 2.6 times, the key set's a tie. The
+deep page's competitor is core's loop over lion's LionOrdered walk, weighed with that walk's reads
+(§47.3): 42,317, which its Memoize's hits under the LIMIT bring to 68,059, against the node's 52,452
+before the cold reads' 0.96, 31,306 in the loop's units. Core's plan stays, rightly, for the sparse
+page (534 against 1,184 ms) and the dense range (18.1 against 19.4 ms); and wrongly for the dense
+multi-key page (36 against 16 ms): core's loop at 944 under the LIMIT, 1,264 with its Memoize's
+hits, against the node's 3,219, most of it the multi-key set built at once, of which the cold reads
+take 0.54. Not measured: other majors.
