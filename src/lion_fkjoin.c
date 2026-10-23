@@ -228,6 +228,17 @@ bool
 lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 					  Oid collation)
 {
+	return lion_column_unique_index(rel, attno, opno, collation) != NULL;
+}
+
+/*
+ * ... and the index that proves it, or NULL: the first of rel->indexlist that
+ * does.  LionOrderedJoin (DESIGN.md §47) descends it for each key.
+ */
+IndexOptInfo *
+lion_column_unique_index(RelOptInfo *rel, AttrNumber attno, Oid opno,
+						 Oid collation)
+{
 	ListCell   *lc;
 
 	foreach(lc, rel->indexlist)
@@ -245,10 +256,10 @@ lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 			continue;
 		if (OidIsValid(collation) && ind->indexcollations[0] != collation)
 			continue;
-		return true;
+		return ind;
 	}
 
-	return false;
+	return NULL;
 }
 
 /*

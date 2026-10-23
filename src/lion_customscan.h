@@ -4377,6 +4377,45 @@ extern const CustomPathMethods lion_ordered_path_methods;
 extern const CustomPathMethods lion_btree_path_methods;
 extern const CustomPathMethods lion_bm25_path_methods;
 
+/*
+ * lion_ordered.c: the sides of a LionOrderedJoin (lion_ordjoin.c, DESIGN.md
+ * §47) - each a LionOrdered walk the join keeps as a child of its own - and
+ * what the join's planner asks of LionOrdered's.
+ */
+typedef struct LionOrderedSet
+{
+	Path	   *lion;			/* the lion access, or NULL: no set */
+	List	   *lionqual;		/* its original qual (implicit AND) */
+	List	   *residual;		/* RestrictInfos left to the side's filter */
+	Cost		build;			/* the set's price */
+	Selectivity sel;			/* the lion access's selectivity */
+	Selectivity candsel;		/* the share of the rows the set holds */
+	Cost		recheck;		/* a member's recheck, when it leaves quals */
+} LionOrderedSet;
+
+extern bool lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel);
+extern List *lion_ordered_orders(RelOptInfo *rel);
+extern List *lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel,
+								  Path *lion, bool probe,
+								  LionOrderedSet *out);
+extern void lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel,
+									IndexPath *ord, Path *lion, double rows,
+									bool indexonly_ok, List **iocols,
+									Cost *startup, Cost *total);
+extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
+										  Path *lion, List *iocols, bool dim,
+										  double weight, Expr *keyqual,
+										  double rows, Cost startup,
+										  Cost total);
+extern void lion_ordered_probe_key(PlanState *ps, Datum key);
+extern void lion_ordered_explain_side(PlanState *ps, List *ancestors,
+									  ExplainState *es, const char *prefix,
+									  bool counters);
+
+/* lion_ordjoin.c: LionOrderedJoin's paths (DESIGN.md §47) */
+extern const CustomPathMethods lion_ordjoin_path_methods;
+
 /* lion_plan_hooks.c */
 extern bool		lion_enable_count_pushdown;
 extern bool		lion_enable_filter_switch;

@@ -525,6 +525,13 @@ _PG_init(void)
 	lion_ordered_init();
 
 	/*
+	 * The LionOrderedJoin CustomScan (DESIGN.md §47): its GUC, its scan
+	 * methods and the set_join_pathlist_hook that offers it, chained as the
+	 * semi and anti join paths' hook below chains it.
+	 */
+	lion_ordjoin_init();
+
+	/*
 	 * The LionBm25 CustomScan (DESIGN.md §17, "Ranking"): ORDER BY
 	 * lion_bm25_score(...) DESC from the index.
 	 */

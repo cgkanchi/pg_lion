@@ -216,5 +216,8 @@ extern bool lion_fkjoin_recognize_small_anti(PlannerInfo *root,
  */
 extern bool lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 								  Oid collation);
+extern IndexOptInfo *lion_column_unique_index(RelOptInfo *rel,
+											  AttrNumber attno, Oid opno,
+											  Oid collation);
 
 #endif							/* LION_FKJOIN_H */
