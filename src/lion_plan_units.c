@@ -798,10 +798,43 @@ lion_bitmap_index_reads(PlannerInfo *root, Path *bitmapqual, double loops,
 }
 
 /*
+ * The scans a Memoize makes of its input over `loops` rescans of it: its
+ * cache misses, at the rate cost_memoize_rescan() prices it at - of its
+ * `calls`, the distinct values of its keys (all the calls where that
+ * estimate fell back on a default), of which the cache holds est_entries
+ * at once, hit (calls - ndistinct) / calls x est_entries / ndistinct of the
+ * time.  est_entries is what cost_memoize_rescan() set it to, at most
+ * ndistinct; 0, a Memoize not yet costed, is taken as a cache that holds
+ * every key.  A scan at least.
+ */
+static double
+lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
+{
+	EstimationInfo estinfo;
+	double		calls = Max(mpath->calls, 1.0);
+	double		ndistinct;
+	double		entries;
+	double		hit_ratio;
+
+	memset(&estinfo, 0, sizeof(estinfo));
+	ndistinct = estimate_num_groups(root, mpath->param_exprs, calls, NULL,
+									&estinfo);
+	if ((estinfo.flags & SELFLAG_USED_DEFAULT) != 0)
+		ndistinct = calls;
+	ndistinct = Min(Max(ndistinct, 1.0), calls);
+	entries = (mpath->est_entries > 0) ?
+		Min((double) mpath->est_entries, ndistinct) : ndistinct;
+	hit_ratio = ((calls - ndistinct) / calls) * (entries / ndistinct);
+	hit_ratio = Min(Max(hit_ratio, 0.0), 1.0);
+	return Max(loops * (1.0 - hit_ratio), 1.0);
+}
+
+/*
  * The pages a core path's bitmap heap scans read, into r: each scan's heap
  * pages as compute_bitmap_pages() counts them, over `loops` scans - the outer
  * rows of the nested loops it is the inner side of, each of which scans it
- * again, and none past a Material or a Memoize, which keep its rows - each
+ * again; one past a Material, which keeps its rows, and a Memoize's misses
+ * past a Memoize (lion_memoize_misses()) - each
  * charged the cold price over the price cost_bitmap_heap_scan() charged it:
  * random_page_cost falling to seq_page_cost with the square root of the share
  * of the heap one scan reads; and the index pages its bitmap reads
@@ -882,9 +915,16 @@ lion_bitmap_reads(PlannerInfo *root, Path *path, double loops,
 				lion_bitmap_reads(root, (Path *) lfirst(lc), loops, r);
 			return;
 		case T_MaterialPath:
-		case T_MemoizePath:
 			lion_bitmap_reads(root, lion_path_input(path), 1.0, r);
 			return;
+		case T_MemoizePath:
+			{
+				MemoizePath *mp = (MemoizePath *) path;
+
+				lion_bitmap_reads(root, mp->subpath,
+								  lion_memoize_misses(root, mp, loops), r);
+				return;
+			}
 		case T_CustomPath:
 			return;
 		default:

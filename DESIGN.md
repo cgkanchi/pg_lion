@@ -22895,7 +22895,8 @@ lion_plan_units.c):
 - **the path is priced with both added** (`lion_units_cold()`): (own x rate + its cold reads) over
   (the loop's cost + the loop's cold reads), of the loop's cost - a factor of the rate, each path
   of the relation with its own reads. It is at most 1, so a path that reads more than the loop
-  keeps its price, and at least 1 / 1.5 (`pg_lion.cold_max_discount`, "The cap" below).
+  keeps its price, and at least 1 / `pg_lion.cold_max_discount`, 1.5 by default ("The cap"
+  below).
 
 The floor is what this costs warm. With the inner table's working set in the cache the loop runs at
 core's price, and a lion path chosen over it can take up to 1.5 times its time. Nothing changes where the tables and the index fit in `effective_cache_size`,
@@ -22930,8 +22931,9 @@ lion_plan_units.c), and the same way §39's loop is priced:
   core puts over it (`parallel_setup_cost` and a `parallel_tuple_cost` a row, as `cost_gather()`
   prices it), taken before the walks are added, since `add_path()` frees what they dominate. A
   plain or parallel bitmap heap scan; an aggregate over one; a hash or merge join with one on
-  either side; a nested loop's parameterized inner one, over the loop's outer rows; a Material or
-  a Memoize scans its input once, and a custom path reads nothing of core's;
+  either side; a nested loop's parameterized inner one, over the loop's outer rows; a Material
+  scans its input once, a Memoize once a cache miss, at the hit ratio `cost_memoize_rescan()`
+  prices it at (`lion_memoize_misses()`), and a custom path reads nothing of core's;
 - **its cold reads** are each scan's heap pages as `compute_bitmap_pages()` counts them, over the
   loops (`loop_count`, which pro-rates them, times the loops), and each bitmap leaf's index pages,
   its selectivity's share of the index and a page at least, over the loops as
