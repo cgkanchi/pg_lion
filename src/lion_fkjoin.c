@@ -223,17 +223,9 @@ lion_fkjoin_is_parent(PlannerInfo *root, RelOptInfo *rel)
  *
  * A multi-column unique index whose other columns the query pins to constants
  * would prove it too; v1 does not look for one.
- */
-bool
-lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
-					  Oid collation)
-{
-	return lion_column_unique_index(rel, attno, opno, collation) != NULL;
-}
-
-/*
- * ... and the index that proves it, or NULL: the first of rel->indexlist that
- * does.  LionOrderedJoin (DESIGN.md §47) descends it for each key.
+ *
+ * The index that proves it, or NULL: the first of rel->indexlist that does,
+ * which LionProbeJoin (DESIGN.md §46) and LionOrderedJoin (§47) descend.
  */
 IndexOptInfo *
 lion_column_unique_index(RelOptInfo *rel, AttrNumber attno, Oid opno,
@@ -260,6 +252,14 @@ lion_column_unique_index(RelOptInfo *rel, AttrNumber attno, Oid opno,
 	}
 
 	return NULL;
+}
+
+/* Is it unique: does lion_column_unique_index() find an index that proves it? */
+bool
+lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
+					  Oid collation)
+{
+	return lion_column_unique_index(rel, attno, opno, collation) != NULL;
 }
 
 /*
@@ -1362,4 +1362,321 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 	out->clauses = clauses;
 	out->keys = keys;
 	return true;
+}
+
+/*
+ * The B-tree family's equality of a key column of type `keytype` (the
+ * family's own input type) with a value of the type `clause` compares it
+ * with: the clause's operator, an equality of `idx`'s family, taken apart
+ * into its two input types, `keyleft` saying which one is the key's.  What a
+ * lookup of the other side's value in the B-tree is made with, as
+ * ExecIndexBuildScanKeys() makes a scan key of an index qual.  InvalidOid
+ * when the family has none, or the operator is not its equality.
+ */
+static Oid
+lion_probe_lookup_op(IndexOptInfo *idx, OpExpr *clause, bool keyleft)
+{
+	int			strategy;
+	Oid			lefttype;
+	Oid			righttype;
+
+	if (!op_in_opfamily(clause->opno, idx->opfamily[0]))
+		return InvalidOid;
+	get_op_opfamily_properties(clause->opno, idx->opfamily[0], false,
+							   &strategy, &lefttype, &righttype);
+	if (strategy != BTEqualStrategyNumber)
+		return InvalidOid;
+	return get_opfamily_member(idx->opfamily[0], idx->opcintype[0],
+							   keyleft ? righttype : lefttype,
+							   BTEqualStrategyNumber);
+}
+
+/* Is node, its relabels peeled, a plain user column of relation relid? */
+static Var *
+lion_probe_plain_var(Node *node, int relid)
+{
+	Node	   *n = lion_fkjoin_strip(node);
+
+	if (n == NULL || !IsA(n, Var))
+		return NULL;
+	if (((Var *) n)->varno != relid || ((Var *) n)->varattno <= 0 ||
+		((Var *) n)->varlevelsup != 0)
+		return NULL;
+	return (Var *) n;
+}
+
+/*
+ * The NOT EXISTS of the dimension by probe (DESIGN.md §46, "The anti
+ * join"): its one clause is `inner key = fk` or `inner key = pk`, a strict
+ * equality of the B-tree's family under its collation - so that, the join
+ * having made fk and pk equal under that family, the dimension rows some
+ * inner row matches are the ones a lookup of the inner keys in the B-tree
+ * finds - and the inner key a plain column the inner side's rows carry.
+ * Every clause the anti join evaluates is that one: any other, of the inner
+ * side and the join, is declined; the inner side's own are its child's.
+ */
+static bool
+lion_probe_anti(PlannerInfo *root, LionProbeShape *ps,
+				SpecialJoinInfo *anti, Relids innertables)
+{
+	RelOptInfo *inner;
+	Relids		outerrels = bms_union(ps->factrel->relids, ps->dimrel->relids);
+	List	   *rinfos;
+	RestrictInfo *ri;
+	OpExpr	   *op;
+	Var		   *sides[2];
+	int			innerrelid;
+	int			k;
+	ListCell   *lc;
+
+	if (bms_get_singleton_member(innertables, &innerrelid) &&
+		bms_equal(anti->syn_righthand, innertables))
+		inner = root->simple_rel_array[innerrelid];
+	else
+		inner = find_join_rel(root, anti->syn_righthand);
+	if (inner == NULL || IS_DUMMY_REL(inner))
+		return false;
+	if (!bms_is_empty(inner->lateral_relids))
+		return false;
+	if (inner->cheapest_total_path == NULL ||
+		inner->cheapest_total_path->param_info != NULL)
+		return false;
+
+	/* every clause of the anti join: an equivalence class's, and joininfo's */
+	rinfos = generate_join_implied_equalities(root, ps->joinrel->relids,
+											  outerrels, inner, NULL);
+	foreach(lc, list_concat(list_copy(ps->factrel->joininfo),
+							ps->dimrel->joininfo))
+	{
+		RestrictInfo *r = (RestrictInfo *) lfirst(lc);
+
+		if (bms_is_subset(r->required_relids, ps->joinrel->relids) &&
+			bms_overlap(r->required_relids, innertables))
+			rinfos = list_append_unique_ptr(rinfos, r);
+	}
+	if (list_length(rinfos) != 1)
+		return false;
+	ri = (RestrictInfo *) linitial(rinfos);
+	if (!IsA(ri, RestrictInfo) || ri->pseudoconstant ||
+		!IsA(ri->clause, OpExpr))
+		return false;
+	op = (OpExpr *) ri->clause;
+	if (list_length(op->args) != 2 || !op_strict(op->opno) || op->opretset)
+		return false;
+	if (OidIsValid(ps->collation) ? op->inputcollid != ps->collation :
+		OidIsValid(op->inputcollid))
+		return false;
+
+	/* one side the fk or the pk, the other a column of the inner side */
+	for (k = 0; k < 2; k++)
+	{
+		Node	   *n = lion_fkjoin_strip((Node *) list_nth(op->args, k));
+
+		sides[k] = (n != NULL && IsA(n, Var) && ((Var *) n)->varlevelsup == 0 &&
+					((Var *) n)->varattno > 0) ? (Var *) n : NULL;
+	}
+	if (sides[0] == NULL || sides[1] == NULL)
+		return false;
+	for (k = 0; k < 2; k++)
+	{
+		Var		   *mine = sides[k];
+		Var		   *theirs = sides[1 - k];
+		bool		joinside;
+
+		joinside = (mine->varno == ps->fkvar->varno &&
+					mine->varattno == ps->fkvar->varattno) ||
+			(mine->varno == ps->pkvar->varno &&
+			 mine->varattno == ps->pkvar->varattno);
+		if (!joinside || !bms_is_member(theirs->varno, innertables) ||
+			!lion_fkjoin_member_ok(root, theirs->varno) ||
+			!lion_fkjoin_target_has(inner->reltarget, theirs))
+			continue;
+
+		/* the lookup of the inner key: the key on the operator's other side */
+		ps->antiop = lion_probe_lookup_op(ps->pkidx, op, k == 0);
+		if (!OidIsValid(ps->antiop))
+			return false;
+		ps->antirel = inner;
+		ps->antipath = inner->cheapest_total_path;
+		ps->anticlause = ri;
+		ps->antivar = theirs;
+		return true;
+	}
+	return false;
+}
+
+/* One way round of the dimension by probe: factrelid the fact. */
+static bool
+lion_probe_try(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
+			   int dimrelid, SpecialJoinInfo *anti, Relids innertables,
+			   LionProbeShape *ps)
+{
+	RelOptInfo *fact = root->simple_rel_array[factrelid];
+	RelOptInfo *dim = root->simple_rel_array[dimrelid];
+	RangeTblEntry *dimrte;
+	List	   *clauses;
+	RestrictInfo *rinfo;
+	OpExpr	   *op;
+	Var		   *fk;
+	Var		   *pk;
+	bool		pkleft;
+
+	memset(ps, 0, sizeof(LionProbeShape));
+	if (!lion_fkjoin_rel_ok(root, fact) || !lion_fkjoin_rel_ok(root, dim) ||
+		lion_fkjoin_is_parent(root, dim))
+		return false;
+	dimrte = root->simple_rte_array[dimrelid];
+	if (dimrte->securityQuals != NIL)
+		return false;
+
+	/* the one clause that joins them */
+	clauses = (factrelid < dimrelid) ?
+		lion_fkjoin_pair_clauses(root, fact, dim) :
+		lion_fkjoin_pair_clauses(root, dim, fact);
+	if (list_length(clauses) != 1)
+		return false;
+	rinfo = (RestrictInfo *) linitial(clauses);
+	if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant ||
+		!IsA(rinfo->clause, OpExpr))
+		return false;
+	op = (OpExpr *) rinfo->clause;
+	if (list_length(op->args) != 2 || !op_strict(op->opno) || op->opretset)
+		return false;
+	if ((fk = lion_probe_plain_var((Node *) linitial(op->args),
+								   factrelid)) != NULL &&
+		(pk = lion_probe_plain_var((Node *) lsecond(op->args),
+								   dimrelid)) != NULL)
+		pkleft = false;
+	else if ((pk = lion_probe_plain_var((Node *) linitial(op->args),
+										dimrelid)) != NULL &&
+			 (fk = lion_probe_plain_var((Node *) lsecond(op->args),
+										factrelid)) != NULL)
+		pkleft = true;
+	else
+		return false;
+
+	/* ... on a column of the dimension a B-tree makes unique */
+	ps->pkidx = lion_column_unique_index(dim, pk->varattno, op->opno,
+										 op->inputcollid);
+	if (ps->pkidx == NULL)
+		return false;
+	ps->probeop = lion_probe_lookup_op(ps->pkidx, op, pkleft);
+	if (!OidIsValid(ps->probeop))
+		return false;
+	ps->joinrel = joinrel;
+	ps->factrel = fact;
+	ps->dimrel = dim;
+	ps->joinclause = rinfo;
+	ps->fkvar = fk;
+	ps->pkvar = pk;
+	ps->collation = op->inputcollid;
+	if (OidIsValid(ps->collation) &&
+		ps->pkidx->indexcollations[0] != ps->collation)
+		return false;
+
+	if (anti != NULL && !lion_probe_anti(root, ps, anti, innertables))
+		return false;
+	return true;
+}
+
+/*
+ * The dimension by probe (DESIGN.md §46, "What qualifies"): joinrel is the
+ * whole FROM of a query over two tables inner-joined on one equality, and
+ * at most a NOT EXISTS beside them -
+ *
+ *	- no special join but that NOT EXISTS, the anti join core makes of one
+ *	  (lion_fkjoin_sublink_anti()), whose syntactic outer side is the two
+ *	  tables and whose inner side every other table; every other special
+ *	  join is inside that inner side;
+ *	- each table a plain one or a materialized view - the fact may be a
+ *	  partitioned table, which its child reads as core does - with no
+ *	  LATERAL reference and no TABLESAMPLE (lion_fkjoin_rel_ok()); the
+ *	  dimension with no security barrier quals;
+ *	- one clause between them (lion_fkjoin_pair_clauses()), a strict
+ *	  equality of plain columns, whose dimension column a unique B-tree of
+ *	  the operator's family and collation covers alone
+ *	  (lion_column_is_unique()), and which that family can look the fact's
+ *	  value up with;
+ *	- no PlaceHolderVar, pseudoconstant qual or LATERAL reference anywhere.
+ *
+ * Each way round is tried, as for the FK-side join.
+ */
+int
+lion_fkjoin_recognize_probe(PlannerInfo *root, RelOptInfo *joinrel,
+							LionProbeShape **out)
+{
+	Relids		tables;
+	Relids		outer;
+	Relids		innertables = NULL;
+	SpecialJoinInfo *anti = NULL;
+	LionProbeShape *shapes;
+	int			n = 0;
+	int			a;
+	int			b;
+	ListCell   *lc;
+
+	*out = NULL;
+	if (joinrel->reloptkind != RELOPT_JOINREL || IS_DUMMY_REL(joinrel))
+		return 0;
+	if (root->placeholder_list != NIL)
+		return 0;
+	if (root->hasPseudoConstantQuals || root->hasLateralRTEs)
+		return 0;
+
+	tables = bms_difference(joinrel->relids, root->outer_join_rels);
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		lt;
+		Relids		rt;
+
+		if (!lion_fkjoin_sublink_anti(root, sjinfo))
+			continue;
+		lt = bms_difference(sjinfo->syn_lefthand, root->outer_join_rels);
+		rt = bms_difference(sjinfo->syn_righthand, root->outer_join_rels);
+		if (bms_num_members(lt) != 2 || bms_is_empty(rt) ||
+			bms_overlap(lt, rt) || !bms_equal(bms_union(lt, rt), tables))
+			continue;
+		if (anti != NULL)
+			return 0;
+		anti = sjinfo;
+		innertables = rt;
+	}
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if (sjinfo == anti)
+			continue;
+		if (anti == NULL ||
+			!bms_is_subset(sjinfo->syn_lefthand, anti->syn_righthand) ||
+			!bms_is_subset(sjinfo->syn_righthand, anti->syn_righthand))
+			return 0;
+	}
+	outer = bms_difference(tables, innertables);
+	if (bms_num_members(outer) != 2)
+		return 0;
+	a = bms_next_member(outer, -1);
+	b = bms_next_member(outer, a);
+	if (a <= 0 || b <= 0 || a >= root->simple_rel_array_size ||
+		b >= root->simple_rel_array_size)
+		return 0;
+	if (innertables != NULL)
+	{
+		int			i = -1;
+
+		while ((i = bms_next_member(innertables, i)) >= 0)
+		{
+			if (!lion_fkjoin_member_ok(root, i))
+				return 0;
+		}
+	}
+
+	shapes = (LionProbeShape *) palloc0(sizeof(LionProbeShape) * 2);
+	if (lion_probe_try(root, joinrel, a, b, anti, innertables, &shapes[n]))
+		n++;
+	if (lion_probe_try(root, joinrel, b, a, anti, innertables, &shapes[n]))
+		n++;
+	*out = shapes;
+	return n;
 }
