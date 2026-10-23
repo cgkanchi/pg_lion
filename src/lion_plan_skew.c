@@ -26,6 +26,8 @@
  * (lo_cost()), a LionCount whose WHERE equates it to a Param - the cheapest
  * of core's paths of that relation with the same parameterization
  * (lion_skew_rel_scale()), taken from core's paths before lion's join them.
+ * A competitor that is one of the AM's own scans of a lion index keeps
+ * core's rows, as every AM scan does, and so does the lion path against it.
  *
  * The extra is cost_index()'s and cost_bitmap_heap_scan()'s own terms for
  * the scan's rows, worked out at its rows and at `factor` times them and
@@ -73,9 +75,44 @@ lion_skew_bitmap_leaves(Path *bitmapqual, List **leaves)
 }
 
 /*
+ * Does a scan path read a lion index - an index scan of one, or a bitmap heap
+ * scan with one among its index scans?  The AM's own scans keep core's rows
+ * (DESIGN.md §39, "A skewed key's probes"), and their price is lion's
+ * (lioncostestimate()), which is not to be asked from inside lion's costing.
+ */
+static bool
+lion_skew_reads_lion(Path *scan)
+{
+	Oid			lionam = lion_get_am_oid();
+	List	   *leaves = NIL;
+	ListCell   *lc;
+	bool		reads = false;
+
+	if (!OidIsValid(lionam))
+		return false;
+	if (IsA(scan, IndexPath))
+		return ((IndexPath *) scan)->indexinfo->relam == lionam;
+	if (!IsA(scan, BitmapHeapPath))
+		return false;
+	lion_skew_bitmap_leaves(((BitmapHeapPath *) scan)->bitmapqual, &leaves);
+	foreach(lc, leaves)
+	{
+		if (((IndexPath *) lfirst(lc))->indexinfo->relam == lionam)
+		{
+			reads = true;
+			break;
+		}
+	}
+	list_free(leaves);
+	return reads;
+}
+
+/*
  * How many times core's rows per key a scan path of core's meets through its
  * index clauses (lion_skew_clauses_factor()): an index scan's, or the index
- * scans' of a bitmap heap scan.  1 for any other path.
+ * scans' of a bitmap heap scan.  1 for any other path, and for one of the
+ * AM's own scans of a lion index, which keeps core's rows: a lion path
+ * weighed against it keeps them too.
  */
 double
 lion_skew_scan_factor(PlannerInfo *root, Path *scan)
@@ -84,7 +121,7 @@ lion_skew_scan_factor(PlannerInfo *root, Path *scan)
 	List	   *leaves = NIL;
 	ListCell   *lc;
 
-	if (scan == NULL || scan->parent == NULL)
+	if (scan == NULL || scan->parent == NULL || lion_skew_reads_lion(scan))
 		return 1.0;
 	if (IsA(scan, IndexPath))
 		return lion_skew_clauses_factor(root, scan->parent,
@@ -186,8 +223,8 @@ lion_skew_bitmap_heap(PlannerInfo *root, RelOptInfo *baserel, double tuples,
 /*
  * What one of `loops` scans of a scan path of core's - an index scan, an
  * index-only scan or a bitmap heap scan - costs more when it meets `factor`
- * times the rows its index clauses select (above).  0 for any other path, or
- * a factor of 1.
+ * times the rows its index clauses select (above).  0 for any other path, a
+ * scan of a lion index (lion_skew_reads_lion()), or a factor of 1.
  */
 Cost
 lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
@@ -201,7 +238,7 @@ lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
 	double		spc_seq;
 	Cost		extra;
 
-	if (scan == NULL || factor <= 1.0)
+	if (scan == NULL || factor <= 1.0 || lion_skew_reads_lion(scan))
 		return 0.0;
 	loops = Max(loops, 1.0);
 
@@ -299,7 +336,7 @@ lion_skew_path_disabled(const Path *p)
  * its price at core's rows over its price at the rows its own scan of a
  * skewed key meets (above), one of `loops` scans.  1 where there is none, or
  * its scan meets no skewed key - a sequential scan, whose price no key's rows
- * change.  Worked out once a planner run for rel, the outer rels and the
+ * change - or keeps core's rows: one of the AM's own scans of a lion index.  Worked out once a planner run for rel, the outer rels and the
  * loops (lion_skew_scale_find()), the first time from core's paths alone
  * (lion_skew_rel_note()): add_path() drops the competitor once a lion path
  * beats it.

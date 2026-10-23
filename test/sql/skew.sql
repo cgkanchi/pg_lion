@@ -73,6 +73,20 @@ SET pg_lion.enable_skew_estimate = off;
 SELECT count(*) AS figures
   FROM lsw_skew_rows('SELECT (SELECT count(*) FROM lsw_s s WHERE s.k = t.x) FROM (VALUES (1), (2)) t(x)');
 RESET pg_lion.enable_skew_estimate;
+-- a column whose MCV list holds every value has no key outside it: a probe
+-- keeps core's rows
+CREATE TABLE lsw_m (k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lsw_m
+SELECT CASE WHEN i <= 900 THEN 1 WHEN i <= 990 THEN 2 ELSE 3 END
+  FROM generate_series(1, 1000) i;
+CREATE INDEX lsw_m_k ON lsw_m USING lion (k);
+ANALYZE lsw_m;
+SELECT (SELECT sumsq FROM lsw_key_skew('lsw_m_k')) AS sumsq,
+	   (SELECT array_length(most_common_vals::text::int[], 1) FROM pg_stats
+		 WHERE tablename = 'lsw_m' AND attname = 'k') AS mcvs;
+SELECT relid, attnum, rows = keyrows AS core_rows, keyrows
+  FROM lsw_skew_rows('SELECT (SELECT count(*) FROM lsw_m m WHERE m.k = t.x) FROM (VALUES (1), (2)) t(x)');
+DROP TABLE lsw_m;
 -- a VACUUM that deletes counts what is left: half of key 2's rows, and
 -- every row of keys 11 to 20
 DELETE FROM lsw_s WHERE (k = 2 AND id % 2 = 0) OR k BETWEEN 11 AND 20;

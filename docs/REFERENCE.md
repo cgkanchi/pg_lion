@@ -588,9 +588,6 @@ WAL written under one id replays only under that id, so change `pg_lion.rmgr_id`
 shutdown, once every standby and WAL archive consumer has replayed everything written under the old
 id, and restart each server of the cluster with the new one; `pg_upgrade` carries no WAL across, so
 an upgrade may change it freely.
-Upgrade a standby's `pg_lion` before its primary's. In rmgr mode the meta page's key counts are
-logged with the sums of squares beside them (DESIGN.md §33), and an older build's replay stops at
-that record. A newer build replays an older one's records.
 `lion_index_stats()` reports ONE ROW PER KEY COLUMN (DESIGN.md §24), with a leading `attno`: the
 directory's height, its leaf and internal pages and whether that column is `ordered` (false for a
 key type with no btree opclass, whose entries are then in a complete but arbitrary order), the
@@ -824,9 +821,8 @@ working around a bad choice:
   meets many times that. The same pass that counts a Lion index's keys sums the squares of their
   rows, and with ANALYZE's most common values that gives the rows of a probed key outside them.
   Lion's price is then put back into the planner's units, so row estimates and every other plan
-  comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply, and the
-  sums need an index built, vacuumed or analyzed by a version that keeps them. Off, every probe is
-  priced at the planner's rows per key, as before.
+  comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply. Off,
+  every probe is priced at the planner's rows per key.
 
 PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
 stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`

@@ -104,6 +104,7 @@
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 #include "utils/typcache.h"
 
 #include "lion.h"
@@ -5696,6 +5697,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 		double		mcvsum = 0;
 		double		mcvsq = 0;
 		bool		hasmcv = false;
+		bool		allmcv = false;
 		AttStatsSlot sslot;
 
 		if (ndist > 1)
@@ -5711,13 +5713,24 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 				mcvsq += (double) sslot.numbers[i] * sslot.numbers[i];
 			}
 			hasmcv = (sslot.nnumbers > 0);
+			allmcv = (hasmcv && ndist <= (double) sslot.nnumbers);
 			if (hasmcv && keysel > sslot.numbers[0])
 				keysel = sslot.numbers[0];
 			free_attstatsslot(&sslot);
 		}
 		col->keyrows = clamp_row_est(keysel * tuples);
-		col->rows = lion_skew_rows_of(best, bestcol, tuples, nullfrac, hasmcv,
-									  mcvsum, mcvsq, col->keyrows);
+
+		/*
+		 * A list that holds every value leaves no key outside it - what is
+		 * left of the rows and of the sum is rounding - and core prices a
+		 * probe of any of them by the list: core's rows.
+		 */
+		if (allmcv)
+			col->rows = col->keyrows;
+		else
+			col->rows = lion_skew_rows_of(best, bestcol, tuples, nullfrac,
+										  hasmcv, mcvsum, mcvsq,
+										  col->keyrows);
 	}
 	ReleaseVariableStats(vardata);
 }

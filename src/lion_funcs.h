@@ -108,6 +108,7 @@
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
+#include "utils/tuplestore.h"
 #include "varatt.h"
 
 #include "lion.h"
