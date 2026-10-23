@@ -502,6 +502,9 @@ SELECT * FROM bsp_run('SELECT o.t, (SELECT count(*) FROM bsp_fact f JOIN bsp_dim
 --    its set and the outer side its place; the rows are the ordinary plan's.
 SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_memoize = off;
 SET pg_lion.pushdown_margin = 1000;
+-- the loop's probe: the margin would otherwise take the whole join to
+-- LionOrderedJoin (DESIGN.md §47), whose dimension is a probe of its own
+SET pg_lion.enable_ordered_join = off;
 BEGIN;
 EXPLAIN (COSTS OFF) DECLARE bsp_c CURSOR FOR
 SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
@@ -545,7 +548,7 @@ FETCH 1 FROM bsp_c;
 
 COMMIT;
 RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_memoize;
-RESET pg_lion.pushdown_margin;
+RESET pg_lion.pushdown_margin; RESET pg_lion.enable_ordered_join;
 SET pg_lion.enable_btree_scan = off;
 SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
  WHERE f.id <= 600 AND d.tags && ARRAY['t1', 't3', 't5'] AND d.hue = 'green' ORDER BY f.id LIMIT 6;
