@@ -55,6 +55,7 @@
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/restrictinfo.h"
 #include "utils/array.h"
 #include "utils/fmgroids.h"
 #include "utils/fmgrprotos.h"
@@ -735,11 +736,12 @@ lion_nonempty_test(Node *clause, LionNonEmpty *ne)
  * Those clauses tell three classes apart, not five: core counts an empty
  * array with dimensions as one of the arrays unequal to '{}', and so do they.
  * The rows of the EMPTYDIM and EMPTYINNER classes - which only an
- * int2vector or an oidvector cast to an array makes, and are as rare as that
- * - are left out of the estimate where ne selects them and others: a true
- * constant for every row but some of them, and NULL, the clause's own
- * estimate, where ne selects nothing else.  An array type whose element type
- * cannot be found has NULL too.
+ * int2vector or an oidvector cast to an array makes - are where the clause
+ * puts them: a true constant for every row but some of them, and NULL, the
+ * clause's own estimate, where ne selects nothing else.  The estimates of
+ * the relation's rows take their share on or off (lion_ne_dims_clause());
+ * the count pushdown's price of the test takes the clause as it is.  An
+ * array type whose element type cannot be found has NULL too.
  */
 Node *
 lion_nonempty_clause(const LionNonEmpty *ne)
@@ -892,15 +894,101 @@ lion_nonempty_index(IndexOptInfo *idx, AttrNumber col)
 }
 
 /*
+ * The shares of var's rows in the EMPTYDIM and EMPTYINNER classes, as the
+ * column's statistics have them: the frequencies of its most common values
+ * that are empty arrays with dimensions, into *dim and *inner.  0 for a value
+ * too rare to be one of them, and without statistics.
+ */
+static void
+lion_ne_dim_shares(PlannerInfo *root, Var *var, Selectivity *dim,
+				   Selectivity *inner)
+{
+	VariableStatData vardata;
+	AttStatsSlot sslot;
+
+	*dim = 0.0;
+	*inner = 0.0;
+	examine_variable(root, (Node *) var, 0, &vardata);
+	if (HeapTupleIsValid(vardata.statsTuple) &&
+		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+						 InvalidOid,
+						 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
+	{
+		int			i;
+
+		for (i = 0; i < sslot.nvalues && i < sslot.nnumbers; i++)
+		{
+			uint16		flag = lion_array_empty_flag(sslot.values[i]);
+
+			if (flag == LION_ENTRY_EMPTYDIM)
+				*dim += sslot.numbers[i];
+			else if (flag == LION_ENTRY_EMPTYINNER)
+				*inner += sslot.numbers[i];
+		}
+		free_attstatsslot(&sslot);
+	}
+	ReleaseVariableStats(vardata);
+}
+
+/*
+ * The clause lion_nonempty_clause() spells for the classes ne selects,
+ * `canon`, with the EMPTYDIM and EMPTYINNER rows estimated as ne selects
+ * them: core's estimate of it counts them among the arrays unequal to '{}',
+ * as the clause does, so where ne selects the arrays with an element and not
+ * a class of those rows, its share comes off the estimate, and where ne
+ * selects such a class and not the arrays with an element, its share goes
+ * on (lion_ne_dim_shares()) - a RestrictInfo of canon whose cached
+ * selectivity says so, as a run of `<>` is one (lion_neq_runs()).  A class of
+ * those rows and nothing else, which no clause spells, is `first`, the
+ * group's first clause, at the class's share.  canon itself, or NULL, where
+ * the statistics know no such row, and where the clause cannot be spelled.
+ */
+static Node *
+lion_ne_dims_clause(PlannerInfo *root, const LionNonEmpty *ne, Node *canon,
+					Node *first)
+{
+	bool		dimsel = (ne->reserved & LION_ENTRY_EMPTYDIM) != 0;
+	bool		innersel = (ne->reserved & LION_ENTRY_EMPTYINNER) != 0;
+	bool		dimsonly = !ne->nonempty &&
+		(ne->reserved & (LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY)) == 0;
+	Selectivity dim;
+	Selectivity inner;
+	Selectivity delta;
+	Selectivity sel;
+	RestrictInfo *rinfo;
+
+	if (root == NULL || (canon == NULL && !(dimsonly && (dimsel || innersel))))
+		return canon;
+	lion_ne_dim_shares(root, ne->var, &dim, &inner);
+	if (ne->nonempty)
+		delta = -((dimsel ? 0.0 : dim) + (innersel ? 0.0 : inner));
+	else
+		delta = (dimsel ? dim : 0.0) + (innersel ? inner : 0.0);
+	if (delta == 0.0)
+		return canon;
+	sel = (canon != NULL) ?
+		clause_selectivity(root, canon, 0, JOIN_INNER, NULL) : 0.0;
+	sel += delta;
+	CLAMP_PROBABILITY(sel);
+	rinfo = make_simple_restrictinfo(root,
+									 (Expr *) ((canon != NULL) ? canon : first));
+	rinfo->norm_selec = sel;
+	rinfo->outer_selec = sel;
+	return (Node *) rinfo;
+}
+
+/*
  * clauses - rel's restriction clauses, RestrictInfos or bare - with the
  * predicates lion_nonempty_test() takes on each array column that a lion
  * array_ops index of rel holds ANDed into one clause, the one
  * lion_nonempty_clause() spells for the classes they select together, in
- * the place of the first of them; and whether that changed anything.  Core
- * estimates each of them alone and multiplies, so `array_length(a, 1) IS
- * NOT NULL AND array_length(a, 1) >= 0` - one set of rows written twice -
- * came out at 0.995 times a third of the table, whatever share of it is
- * empty.  The column's own null test, alone, is left as it is.
+ * the place of the first of them, with the empty arrays with dimensions
+ * estimated as they select them (lion_ne_dims_clause()); and whether that
+ * changed anything.  Core estimates each of them alone and multiplies, so
+ * `array_length(a, 1) IS NOT NULL AND array_length(a, 1) >= 0` - one set of
+ * rows written twice - came out at 0.995 times a third of the table,
+ * whatever share of it is empty.  The column's own null test, alone, is left
+ * as it is, and so is a clause alone that already is the one it comes to.
  *
  * Every estimate of a relation lion indexes asks this of its clauses, so a
  * list with nothing of the kind - no clause of a shape lion_ne_shape() lets
@@ -909,12 +997,15 @@ lion_nonempty_index(IndexOptInfo *idx, AttrNumber col)
  * that changes is a new one.
  */
 List *
-lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
+lion_nonempty_rel_clauses(PlannerInfo *root, RelOptInfo *rel, List *clauses,
+						  bool *changed)
 {
 	int			n = list_length(clauses);
 	LionNonEmpty *ne;
 	int		   *group;
+	int		   *members;
 	bool	   *bare;
+	Node	  **expr;
 	Node	  **canon;
 	List	   *result = NIL;
 	ListCell   *lc;
@@ -949,7 +1040,9 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 
 	ne = (LionNonEmpty *) palloc0(sizeof(LionNonEmpty) * n);
 	group = (int *) palloc(sizeof(int) * n);
+	members = (int *) palloc0(sizeof(int) * n);
 	bare = (bool *) palloc0(sizeof(bool) * n);
+	expr = (Node **) palloc(sizeof(Node *) * n);
 	canon = (Node **) palloc0(sizeof(Node *) * n);
 
 	/* each clause's column, and the first clause on it as its group */
@@ -957,15 +1050,15 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 	foreach(lc, clauses)
 	{
 		Node	   *clause = (Node *) lfirst(lc);
-		Node	   *expr = IsA(clause, RestrictInfo) ?
-			(Node *) ((RestrictInfo *) clause)->clause : clause;
 		AttrNumber	col = 0;
 
+		expr[i] = IsA(clause, RestrictInfo) ?
+			(Node *) ((RestrictInfo *) clause)->clause : clause;
 		group[i] = -1;
 		if ((!IsA(clause, RestrictInfo) ||
 			 !((RestrictInfo *) clause)->pseudoconstant) &&
-			lion_ne_shape(expr) != 0 &&
-			lion_nonempty_test(expr, &ne[i]) &&
+			lion_ne_shape(expr[i]) != 0 &&
+			lion_nonempty_test(expr[i], &ne[i]) &&
 			ne[i].var->varno == (int) rel->relid &&
 			ne[i].var->varlevelsup == 0 && ne[i].var->varattno > 0)
 		{
@@ -985,8 +1078,8 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 						break;
 					}
 				}
-				bare[i] = IsA(expr, NullTest) &&
-					IsA(lion_strip((Node *) ((NullTest *) expr)->arg), Var);
+				bare[i] = IsA(expr[i], NullTest) &&
+					IsA(lion_strip((Node *) ((NullTest *) expr[i])->arg), Var);
 			}
 		}
 		i++;
@@ -997,6 +1090,8 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 	{
 		int			g = group[i];
 
+		if (g >= 0)
+			members[g]++;
 		if (g < 0 || g == i)
 			continue;
 		ne[g].reserved &= ne[i].reserved;
@@ -1008,18 +1103,24 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 	 * Each group's clause, or none when it selects every row.  A group with
 	 * no clause to spell its rows otherwise - an element type that cannot be
 	 * found, or only empty arrays with dimensions - and a bare null test are
-	 * left as they are.
+	 * left as they are, and so is a clause alone that already is the one
+	 * its group comes to (`a = '{}'`), which changes nothing.
 	 */
 	for (i = 0; i < n; i++)
 	{
 		bool		every;
+		Node	   *spelled;
 
 		if (group[i] != i)
 			continue;
 		every = ne[i].nonempty &&
 			ne[i].reserved == (LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKINDS);
-		canon[i] = bare[i] ? NULL : lion_nonempty_clause(&ne[i]);
-		if (bare[i] || (canon[i] == NULL && !every))
+		spelled = bare[i] ? NULL : lion_nonempty_clause(&ne[i]);
+		canon[i] = (bare[i] || every) ? spelled :
+			lion_ne_dims_clause(root, &ne[i], spelled, expr[i]);
+		if (bare[i] || (canon[i] == NULL && !every) ||
+			(members[i] == 1 && canon[i] == spelled && spelled != NULL &&
+			 equal(spelled, expr[i])))
 		{
 			for (j = i; j < n; j++)
 			{
@@ -1046,7 +1147,9 @@ lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses, bool *changed)
 
 	pfree(ne);
 	pfree(group);
+	pfree(members);
 	pfree(bare);
+	pfree(expr);
 	pfree(canon);
 	if (!*changed)
 	{

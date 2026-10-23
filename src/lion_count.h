@@ -1937,6 +1937,10 @@ extern PGDLLIMPORT bool lion_enable_tree_probe;
 extern double lion_isect_factor(PlannerInfo *root, RelOptInfo *rel,
 								IndexOptInfo *idx, int n,
 								const AttrNumber *cols, Node **clauses);
+extern bool lion_isect_measured_factor(PlannerInfo *root, RelOptInfo *rel,
+									   IndexOptInfo *idx, int n,
+									   const AttrNumber *cols, Node **clauses,
+									   double *factor);
 
 /*
  * The list a planner run keeps what lion_tsquery_pos_shape() found of each
@@ -1994,8 +1998,8 @@ typedef struct LionNonEmpty
 extern bool lion_nonempty_test(Node *clause, LionNonEmpty *ne);
 extern Node *lion_nonempty_clause(const LionNonEmpty *ne);
 extern bool lion_nonempty_index(IndexOptInfo *idx, AttrNumber col);
-extern List *lion_nonempty_rel_clauses(RelOptInfo *rel, List *clauses,
-									   bool *changed);
+extern List *lion_nonempty_rel_clauses(PlannerInfo *root, RelOptInfo *rel,
+									   List *clauses, bool *changed);
 #if PG_VERSION_NUM < 180000
 
 /*
