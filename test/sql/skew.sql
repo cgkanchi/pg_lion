@@ -256,7 +256,8 @@ SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
 DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got2 AS ' || (SELECT q FROM lsw_q WHERE name = 'loop'); END $$;
 -- without the walk: the loop, and at the rows the key meets the count, its
 -- own price scaled by the loop's at core's rows over the loop's at those -
--- far below the loop's, past the bound of the cold reads' discount
+-- far below the loop's, past the bound of the cold reads' discount, 2,
+-- pg_lion.cold_max_discount's default
 SET pg_lion.enable_btree_scan = off;
 SET pg_lion.enable_skew_estimate = off;
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
@@ -264,7 +265,7 @@ SELECT lsw_cost(q, 'Nested Loop') - lsw_cost(q, 'Seq Scan') AS loop_own
   FROM lsw_q WHERE name = 'loop' \gset
 SET pg_lion.enable_skew_estimate = on;
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
-SELECT (lsw_cost(q, 'LionCount') - lsw_cost(q, 'Seq Scan')) * 1.5 < :loop_own
+SELECT (lsw_cost(q, 'LionCount') - lsw_cost(q, 'Seq Scan')) * 2 < :loop_own
 	   AS past_cold_bound
   FROM lsw_q WHERE name = 'loop';
 DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got3 AS ' || (SELECT q FROM lsw_q WHERE name = 'loop'); END $$;
