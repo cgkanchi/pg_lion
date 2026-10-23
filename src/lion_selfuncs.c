@@ -82,6 +82,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/plancat.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "parser/parse_coerce.h"
@@ -4865,6 +4866,7 @@ typedef struct LionNdistinctCache
 	Oid			amoid;			/* lion's, or InvalidOid without the AM */
 	List	   *indexes;		/* LionNdistinctIndex */
 	List	   *rows;			/* LionNdistinctRow */
+	List	   *outerrels;		/* LionOuterRel (lion_outer_param_loops()) */
 } LionNdistinctCache;
 
 static LionRunCache *lion_nd_caches = NULL;
@@ -5314,4 +5316,175 @@ lion_index_expr_stats(PlannerInfo *root, Oid indexOid, AttrNumber indexattnum,
 	vardata->acl_ok = core.acl_ok;
 	ReleaseVariableStats(core);
 	return true;
+}
+
+/* ---------------------------------------------------------------------
+ * A correlated subquery's calls (DESIGN.md §40.11)
+ * --------------------------------------------------------------------- */
+
+/*
+ * A correlated subquery - a scalar sub-select or an EXISTS the executor
+ * evaluates again for every row of the query around it - is planned as a query
+ * of its own, with no loop count: core prices each of its scans for one call,
+ * and cost_subplan() charges the plan's price again per call.  For core's
+ * scans that is the convention a heap page is charged in.  For lion's it
+ * charged every call the pages of the first: the sought sets' posting trees,
+ * the directory's leaves, a set built once and kept - the parts of a nested
+ * loop's inner side that a parameterized path spreads over its loops.  So a
+ * lion path whose quals hold a Param of an outer query is priced as such an
+ * inner side, over an assumed loop count: the rows of the outer relation the
+ * Param's Var belongs to, and of several the fewest, as get_loop_count()
+ * takes the fewest rows of a path's outer relations.
+ *
+ * The outer query level is still being planned, its relations not yet
+ * sized; the rows are the relation's own, pg_class.reltuples scaled to its
+ * pages now (estimate_rel_size()), before any restriction of the outer query.
+ * A Param that is not an outer Var - an InitPlan's output, a PlaceHolderVar
+ * or an aggregate of the outer query, a prepared statement's own (an EXTERN
+ * one) - is not a loop, and a relation of no known size (a subquery's, a
+ * function's, a table never vacuumed or analyzed that estimate_rel_size()
+ * makes nothing of) says nothing.
+ */
+
+/* One outer relation's rows, as this planner run sized it. */
+typedef struct LionOuterRel
+{
+	Oid			relid;
+	double		rows;
+} LionOuterRel;
+
+/* The PARAM_EXEC ids in node, RestrictInfos and IndexClauses looked into. */
+static bool
+lion_exec_param_ids_walker(Node *node, List **ids)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, RestrictInfo))
+		return lion_exec_param_ids_walker((Node *) ((RestrictInfo *) node)->clause,
+										  ids);
+	if (IsA(node, IndexClause))
+		return lion_exec_param_ids_walker((Node *) ((IndexClause *) node)->rinfo,
+										  ids);
+	if (IsA(node, Param))
+	{
+		Param	   *p = (Param *) node;
+
+		if (p->paramkind == PARAM_EXEC)
+			*ids = list_append_unique_int(*ids, p->paramid);
+		return false;
+	}
+	return expression_tree_walker(node, lion_exec_param_ids_walker,
+								  (void *) ids);
+}
+
+/* Does node hold an exec Param, one that may change between two scans? */
+bool
+lion_has_exec_param(Node *node)
+{
+	List	   *ids = NIL;
+	bool		has;
+
+	(void) lion_exec_param_ids_walker(node, &ids);
+	has = (ids != NIL);
+	list_free(ids);
+	return has;
+}
+
+/* The rows of the table relid, once per planner run; 0 when unknown. */
+static double
+lion_outer_rel_rows(PlannerInfo *root, Oid relid)
+{
+	LionNdistinctCache *cache = lion_nd_cache_for(root);
+	LionOuterRel *ent;
+	MemoryContext oldcxt;
+	Relation	rel;
+	BlockNumber pages;
+	double		tuples = 0;
+	double		allvisfrac;
+	ListCell   *lc;
+
+	foreach(lc, cache->outerrels)
+	{
+		ent = (LionOuterRel *) lfirst(lc);
+		if (ent->relid == relid)
+			return ent->rows;
+	}
+
+	/* the query holds its relations locked since parse analysis */
+	rel = table_open(relid, NoLock);
+	estimate_rel_size(rel, NULL, &pages, &tuples, &allvisfrac);
+	table_close(rel, NoLock);
+
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+	ent = (LionOuterRel *) palloc(sizeof(LionOuterRel));
+	ent->relid = relid;
+	ent->rows = (tuples >= 1.0) ? tuples : 0.0;
+	cache->outerrels = lappend(cache->outerrels, ent);
+	MemoryContextSwitchTo(oldcxt);
+	return ent->rows;
+}
+
+/*
+ * The rows of the outer relation whose Var exec Param paramid hands this
+ * query level, or 0 when it is not an outer Var of a relation of known size.
+ * The Var's query level lists it in its plan_params while the subquery is
+ * planned (paramassign.c), with its varno that level's.
+ */
+static double
+lion_outer_param_rows(PlannerInfo *root, int paramid)
+{
+	PlannerInfo *up;
+
+	for (up = root->parent_root; up != NULL; up = up->parent_root)
+	{
+		ListCell   *lc;
+
+		foreach(lc, up->plan_params)
+		{
+			PlannerParamItem *pitem = (PlannerParamItem *) lfirst(lc);
+			Var		   *var;
+			RangeTblEntry *rte;
+
+			if (pitem->paramId != paramid)
+				continue;
+			if (!IsA(pitem->item, Var))
+				return 0.0;
+			var = (Var *) pitem->item;
+			if (var->varno < 1 || up->parse == NULL ||
+				var->varno > list_length(up->parse->rtable))
+				return 0.0;
+			rte = rt_fetch(var->varno, up->parse->rtable);
+			if (rte->rtekind != RTE_RELATION || !OidIsValid(rte->relid))
+				return 0.0;
+			return lion_outer_rel_rows(root, rte->relid);
+		}
+	}
+	return 0.0;
+}
+
+/*
+ * The calls a scan whose quals are `quals` is assumed to be made over, as the
+ * inner side of the loop a correlated subquery is: the fewest rows of the
+ * outer relations its exec Params' Vars belong to, and 1 where it has none
+ * (above).
+ */
+double
+lion_outer_param_loops(PlannerInfo *root, Node *quals)
+{
+	List	   *ids = NIL;
+	double		loops = 0;
+	ListCell   *lc;
+
+	if (root == NULL || root->parent_root == NULL || quals == NULL)
+		return 1.0;
+	(void) lion_exec_param_ids_walker(quals, &ids);
+	foreach(lc, ids)
+	{
+		double		rows = lion_outer_param_rows(root, lfirst_int(lc));
+
+		if (rows >= 1.0 && (loops == 0 || rows < loops))
+			loops = rows;
+	}
+	list_free(ids);
+	return Max(loops, 1.0);
 }
