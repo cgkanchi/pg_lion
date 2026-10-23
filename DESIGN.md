@@ -6532,33 +6532,52 @@ Not reachable from the extension's SQL yet: nothing reads positions, so no opera
   - **The price** (`lion_cost_posfilter()`).  A cursor decodes its chunk's members up to the
     candidate's, so a count whose candidates lie close together - a copy's, a count of every
     row - decodes each member of its lexemes once, and one whose candidates lie further apart than
-    a chunk holds decodes part of one at each: 1,105 members a seek, measured, of a chunk of
-    1,339 of one position (`LION_POS_SEEK_MEMBERS`, 1,000).  Each member decoded is
-    `pg_lion.position_member_cost` (1.8 `cpu_operator_cost`), and each candidate
-    `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its callbacks:
-    8.2 to 9.4 ns and 21.6 ns on the release build (§10, "The units"), at the reference's 5 ns a
-    `cpu_operator_cost`; the same counts without positions run there at 350 to 1,100 units a
-    millisecond, around the reference.  The candidates are the SUPERSET's rows, not the clause's
-    (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a query of it alone,
-    the clause and its superset are combined from those as core combines a tsquery's operands,
-    and the candidates are the rows the caller's filters select times the superset's share over
-    the clause's - 1 for `foo <-> bar`, whose superset `foo & bar` core estimates as it estimates
-    the phrase, and 8 for `foo <-> !bar` of `foo` in every row and `bar` in seven of eight - and
-    times what the intersection probe measures of the AND of the superset's lexemes (§29.11,
-    "Correlated sets"): `new <-> york` of two lexemes in the same tenth of the rows is a
-    hundredth of them by core's product, and its candidates are the whole tenth.  A cursor is a
-    lexeme's, one for each the query names, those under a NOT too, and its members are the rows
-    that have the lexeme.  Priced from the clause's own rows and the superset's one lexeme,
-    `foo <-> !bar` would come to a sixteenth of what it takes: over 400,000 rows and 2,000 keys,
-    the FK-side join would be taken at one to ten keys over a nested loop into a btree of the
-    fact's key that runs 8 to 40 times as fast (1.2 ms against 18 ms at two keys, on the release
-    build); and the correlated phrase's probing counts would be priced at a fifth of their time.
-    A correlation the probe does not take - less than three times core's product, as for any
-    AND - stays in the price: `foo <-> bar` of two lexemes in the same three rows of four is
-    decided over 0.75 of the rows and priced over core's 0.56.  The copy is priced once for its
-    candidates, and every other count for its own, its lexemes decoded up to them - which an
-    FK-side join's probing counts, their candidates a few of every part of the heap, pay at
-    almost every one.
+    a chunk holds decodes part of one at each: 1,606 to 1,703 members a seek, measured over trees
+    of 400,000 to 7.5 million members of one position (`LION_POS_SEEK_MEMBERS`, 1,650).  Each
+    member decoded is `pg_lion.position_member_cost` (2.4 `cpu_operator_cost`), and each
+    candidate `pg_lion.position_check_cost` (4.3) a lexeme beyond that, `TS_execute()` and its
+    callbacks: 11.4 to 12.8 ns, the leaves a cursor steps and descends to included, and 21.6 ns
+    on the release build (§10, "The units"), at the reference's 5 ns a `cpu_operator_cost`.
+    *(Refitted 2026-10-23 on 2 and 10 million rows, `foo` and `bar` in three rows of four and
+    `new` and `york` in a fifth.  The first fit, 1.8 and 1,000, was made on 400,000 rows, whose
+    trees are a few leaves: over the larger ones it priced the probing counts at 211 to 263
+    units a millisecond, and the FK-side join of `new <-> york` was taken at 3 and 20 keys of 2
+    million rows - 2.5 ms against the nested loop's 0.37, 15 against 3.5 - and at 20 and 200 of
+    10 million - 21 against 2.7, 346 against 32.  They now run at 453 to 487, a count of every
+    row at 476 to 511, and the nested loop is taken.)*  The candidates are the SUPERSET's rows,
+    not the clause's (`lion_tsquery_pos_shape()`): each operand is estimated as core estimates a
+    query of it alone, the clause and its superset are combined from those as core combines a
+    tsquery's operands, and the candidates are the rows the caller's filters select times the
+    superset's share over the clause's - 1 for `foo <-> bar`, whose superset `foo & bar` core
+    estimates as it estimates the phrase, and 8 for `foo <-> !bar` of `foo` in every row and
+    `bar` in seven of eight - and never more than the superset holds: `!foo <-> bar` where every
+    row has `foo` is estimated at next to no rows, and its candidates are the rows with `bar`.
+    The operands' shares are combined over the rows whose column is not NULL
+    (`lion_tsvector_nonnull()`), as core combines them: an operand's share alone carries the
+    NULLs once, and a product of n of them n times - with three rows of four NULL, `new <-> york`
+    was priced at three times its candidates and `foo <-> !bar` at under half.  The AND of the
+    superset's lexemes is as the intersection probe measures it (§29.11, "Correlated sets"):
+    `new <-> york` of two lexemes in the same tenth of the rows is a hundredth of them by core's
+    product, and its candidates are the whole tenth.  The probe's measure is taken however near
+    core's product (`lion_isect_measured_factor()`): the three times §29.11 asks of a measure
+    before it moves the rows estimate - which the plans above it are sized from, and which
+    ANALYZE's per-column estimates and the probe's sample both wobble - is no reason to price a
+    filter over rows it does not decide.  `alpha <-> beta` of two lexemes in the same two rows
+    of five, 2.5 times core's product, was priced over that product, and the FK-side join was
+    taken at 3 keys of 20,000 rows at 0.41 ms over a 0.04 ms nested loop (release build).  A
+    partition is probed in its own columns, as the planner hands it its restrictions
+    (`lion_clause_in_child()`): a clause in the partitioned table's columns matches no key of the
+    partition's index, and a count of every partitioned table priced its filters from core's
+    product: `new <-> york`'s, over 10,000 rows in two partitions, at 11 against 31 on the same
+    rows unpartitioned.  A cursor is a lexeme's, one for each the query names, those under a NOT too, and
+    its members are the rows that have the lexeme.  Priced from the clause's own rows
+    and the superset's one lexeme, `foo <-> !bar` would come to a sixteenth of what it takes:
+    over 400,000 rows and 2,000 keys, the FK-side join would be taken at one to ten keys over a
+    nested loop into a btree of the fact's key that runs 8 to 40 times as fast (1.2 ms against
+    18 ms at two keys, on the release build); and the correlated phrase's probing counts would be
+    priced at a fifth of their time.  The copy is priced once for its candidates, and every
+    other count for its own, its lexemes decoded up to them - which an FK-side join's probing
+    counts, their candidates a few of every part of the heap, pay at almost every one.
     The heap recheck (`lion_cost_recheck()`) charges such a clause nothing.  An AM scan, plain or
     bitmap, is priced the same way once a scan (`lion_cost_scan_posfilter()`, from
     `lioncostestimate()`): its cursors begin again at every scan, so a nested loop's inner scan
@@ -6951,11 +6970,16 @@ selects, and put in their place the one clause core estimates from the column's 
 the same rows (`lion_nonempty_clause()`): `a <> '{}'`, `a = '{}'`, `a IS DISTINCT FROM '{}'`,
 `NOT (a <> '{}')` (the empty array's share and the NULLs'), `a IS NULL`, `a IS NOT NULL`, or false.
 Those clauses tell three classes apart, NULL, `'{}'` and the rest, and core's statistics count an
-empty array with dimensions among the rest; so does the estimate, which leaves the EMPTYDIM and
-EMPTYINNER rows out where a clause selects them beside others, and keeps the clause's own estimate
-where it selects nothing else (`array_length(a, 1) = 0`).  Such arrays come from a cast of an
-`int2vector` or `oidvector`, and a column of them is rare enough that a third clause shape for them
-is not worth its cost.  The relation's rows are corrected wherever this changes a clause, as
+empty array with dimensions among the rest, as the clause does. So the EMPTYDIM and EMPTYINNER rows
+are taken from the column's most common values (`lion_ne_dims_clause()`): the frequencies of those
+that are empty arrays with dimensions come off the clause's estimate where the test selects the
+arrays with an element and not their class, and go on where it selects their class and not the
+arrays with an element - the clause then a RestrictInfo whose cached selectivity says so, as a run
+of `<>` is one (§29.11, "A run of `<>` is one exclusion"). A test of those rows alone
+(`array_length(a, 1) = 0`) is its own clause at their share. A value too rare to be a common one
+counts as none: such arrays come from a cast of an `int2vector` or `oidvector`, and a column with
+few of them loses little. A test alone that already is the clause it comes to (`a = '{}'`) is left
+as it is, and changes nothing. The relation's rows are corrected wherever this changes a clause, as
 wherever the intersection probe measures a correlation.
 
 **Planning cost.**  Every estimate of a relation lion indexes takes its clauses through
@@ -14584,21 +14608,35 @@ A GROUP BY of columns stays serial.
 all of it before the first row. The lookups are priced as core prices an index scan repeated once
 per outer row of a nested loop (`cost_index()`, `btcostestimate()`): `lookups` = the inner key
 expressions' distinct values (`estimate_num_groups()`) over the child's rows, no more than the rows;
-each finds t's rows over the distinct values of its key columns in the whole table, each column's
-`n_distinct` as `lion_fkjoin_fk_ndistinct()` takes it - a lookup finds every row of its key, and the
-restrictions are tested after, where `estimate_num_groups()` would scale the values down to the rows
-the WHERE leaves; a descent costs `ceil(log2(index tuples)) * cpu_operator_cost` and `(height + 1) *
-50 * cpu_operator_cost`; each index tuple read `cpu_index_tuple_cost` and a `cpu_operator_cost` per
-scan key; the index pages over every lookup by `index_pages_fetched()` at the random page cost; the
-heap pages between as many as the rows (no order) and a lookup's share of the table's pages (the
-index's order), as far between as the correlation squared puts them, at the random page cost; each
-row found a `cpu_tuple_cost` and the clauses it is tested on; a `cpu_operator_cost` a row for each
-grouping column; and each child row's keys evaluated, and the child's rows sorted by them as
-`cost_sort()` prices a sort (`lion_anti_sort_price()`, after costsize.c's `cost_tuplesort()`): of
-the keys' width, and the child row's where a join clause other than the keys' reads it, with the
-pages written and read back past `work_mem`. A large inner side is many descents and many rows,
-which the ordinary plan's one pass over t undercuts: the cost model, nothing else, leaves it to
-core. On PostgreSQL 18 the path carries the child's disabled nodes.
+each finds t's rows over the distinct values of its key columns in the whole table
+(`lion_anti_key_values()`) - a lookup finds every row of its key, and the restrictions are tested
+after, where `estimate_num_groups()` would scale the values down to the rows the WHERE leaves: an
+n-distinct extended statistics object's count of as many of the key columns together as one has
+(the most, and of those the object of the fewest columns, as `estimate_num_groups()` picks one),
+times each other column's `n_distinct` as `lion_fkjoin_fk_ndistinct()` takes it. The product of
+the columns' own takes them as independent: over 3M rows whose two key columns make 1,000 pairs,
+it made a lookup of a pair a share of a row where it finds 3,000, and the node was taken over core's
+hash anti join at a third of its speed (334 ms against 122); with `CREATE STATISTICS (ndistinct)` on
+the pair, core's plan is taken. A descent costs `ceil(log2(index tuples)) * cpu_operator_cost` and
+`(height + 1) * 50 * cpu_operator_cost`; each index tuple read `cpu_index_tuple_cost` and a
+`cpu_operator_cost` per scan key; the index pages over every lookup by `index_pages_fetched()` at
+the random page cost; the heap a read for each row found (no order) or for each page of a lookup's
+share of the table's pages (the index's order), as far between the two as the correlation squared
+puts them, each read at the price of a page of the pages the reads come to, as many as
+`index_pages_fetched()` makes them (`lion_anti_heap_page_cost()`: from `random_page_cost` towards
+`seq_page_cost` as the table's share of `effective_cache_size` holds them, not by density, since
+the lookups read the pages in the key's order). A read is a buffer looked up, pinned and locked
+whether or not another lookup read the page before, and that, on a table the cache holds, is the
+lookups' time; core's index scan, whose model this was, charges the distinct pages at the random
+page cost and none of the reads again, which over the table below priced 10,000 lookups at 4.2
+times their time and 100,000 at about once, `index_pages_fetched()` by then at every page of the
+table. Each row found a `cpu_tuple_cost` and the clauses it is tested on; a `cpu_operator_cost` a
+row for each grouping column; and each child row's keys evaluated, and the child's rows sorted by
+them as `cost_sort()` prices a sort (`lion_anti_sort_price()`, after costsize.c's
+`cost_tuplesort()`): of the keys' width, and the child row's where a join clause other than the
+keys' reads it, with the pages written and read back past `work_mem`. A large inner side is many
+descents and many rows, which the ordinary plan's one pass over t undercuts: the cost model, nothing
+else, leaves it to core. On PostgreSQL 18 the path carries the child's disabled nodes.
 
 **The plan.** `custom_private` grows (shape 29) an `ANTI` member, 24, after the cells' (§10): the
 B-tree, its scan keys' columns, operators, collations and the `<` they are sorted by, the number of
@@ -14644,10 +14682,29 @@ work kept busy; core's plan a parallel hash anti join with up to two workers):
 | a half | 200,000 | 1,463 ms | 391 ms | core |
 | a twentieth | 200,000 | 1,215 ms | 184 ms | core |
 
-LionCount's times in the last four rows are with core's joins turned off. The model leaves the inner
-side to core somewhere between 2,000 and 20,000 keys, where the node is still a little faster on a
-warm cache: its heap fetches are priced at the random page cost, as core prices its own index
-scans.
+LionCount's times in the last four rows are with core's joins turned off. The model left the inner
+side to core somewhere between 2,000 and 20,000 keys, where the node was still faster on a warm
+cache, its heap fetches priced at the random page cost as core prices its own index scans' pages:
+at a third of the keys where the two plans' times cross. Priced by the read (2026-10-23, a release
+build, PostgreSQL 20devel, the same shape at 3M rows in 40,000 pages, `shared_buffers` 512 MB,
+serial plans, medians of five warm runs):
+
+| WHERE | inner keys | LionCount | core's plan | the model's choice, before | now |
+|---|---|---|---|---|---|
+| a tenth | 2,000 | 10 ms | 115 ms | LionCount | LionCount |
+| a tenth | 5,000 | 30 ms | 117 ms | LionCount | LionCount |
+| a tenth | 10,000 | 54-56 ms | 111-139 ms | core | LionCount |
+| a tenth | 20,000 | 101-108 ms | 128-150 ms | core | LionCount |
+| a tenth | 50,000 | 259 ms | 145-166 ms | core | core |
+| a tenth | 100,000 | 495 ms | 171-191 ms | core | core |
+| a half | 10,000 | 49-72 ms | 399-414 ms | LionCount | LionCount |
+| a half | 20,000 | 107-122 ms | 413-453 ms | LionCount | LionCount |
+| a half | 50,000 | 277-291 ms | 495-718 ms | core | core |
+
+The node's price is now 1.4 to 1.8 times its warm time at every size, against core's hash anti
+join, whose price grows with the table where the lookups' does not: the conservative side of the
+crossing, which a table of 50M rows moves further out. The last row is a hash join of a half of
+the table priced at the hash join's rate (§39), below its time.
 
 ### Counts by cells beside the anti join (2026-10-21)
 
@@ -17031,7 +17088,10 @@ AND for its own estimates.
 - **What it corrects.** A factor on core's estimate of the same clauses, applied when the probe
   finds it `LION_ISECT_ERROR` (3) times off or more, either way: less is within what ANALYZE's
   per-column estimates and the sample leave of an independent conjunction, and would move plans on
-  noise. A sample lowers an estimate no further than what it can rule out, and one that met the AND
+  noise. A position filter's candidates take the probe's measure however near core's
+  (`lion_isect_measured_factor()`, §17 "The price"): they are no estimate a plan is sized from but
+  the rows the filter decides, each at a price, and a phrase's words go together. A sample lowers
+  an estimate no further than what it can rule out, and one that met the AND
   in fewer than `LION_ISECT_MIN_HITS` containers raises it no further than the rows it met, or than
   the longest part of the AND that enough of them met says ("What a sample can rule out", "Wide
   lists", below); a count - every container of the driver ANDed - stands as it is. It applies to

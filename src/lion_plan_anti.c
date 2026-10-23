@@ -23,6 +23,9 @@
  */
 #include "postgres.h"
 
+#include "catalog/pg_statistic_ext.h"
+#include "statistics/statistics.h"
+
 #include "lion_customscan.h"
 
 /*
@@ -266,6 +269,121 @@ lion_anti_correlation(PlannerInfo *root, const LionAntiPlan *plan)
 }
 
 /*
+ * The distinct values of the table's key columns `keys` (its Vars) in the
+ * whole table: an extended statistics object's n-distinct of as many of them
+ * together as one has - the most, and of those the object of the fewest
+ * columns, as estimate_num_groups() picks one - times each other column's
+ * own, as lion_fkjoin_fk_ndistinct() takes it.  The product of the columns'
+ * own takes them as independent, which two columns that go together are not:
+ * a lookup of a pair of them finds the rows of the pair, and the product made
+ * that a share of a row where it is hundreds.
+ */
+static double
+lion_anti_key_values(PlannerInfo *root, RelOptInfo *rel, List *keys)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+	Bitmapset  *attnums = NULL;
+	Bitmapset  *covered = NULL;
+	StatisticExtInfo *best = NULL;
+	int			bestn = 1;
+	double		values = 1.0;
+	ListCell   *lc;
+
+	foreach(lc, keys)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (var->varattno > 0)
+			attnums = bms_add_member(attnums, var->varattno);
+	}
+
+	foreach(lc, rel->statlist)
+	{
+		StatisticExtInfo *info = (StatisticExtInfo *) lfirst(lc);
+		Bitmapset  *shared;
+		int			n;
+
+		if (info->kind != STATS_EXT_NDISTINCT || info->inherit != rte->inh)
+			continue;
+		shared = bms_intersect(info->keys, attnums);
+		n = bms_num_members(shared);
+		bms_free(shared);
+		if (n > bestn ||
+			(n == bestn && best != NULL &&
+			 bms_num_members(info->keys) < bms_num_members(best->keys)))
+		{
+			best = info;
+			bestn = n;
+		}
+	}
+
+	/* ... its item of exactly those columns: it has one of every set of two or more */
+	if (best != NULL)
+	{
+		MVNDistinct *stats = statext_ndistinct_load(best->statOid, rte->inh);
+		Bitmapset  *shared = bms_intersect(best->keys, attnums);
+		uint32		i;
+
+		for (i = 0; i < stats->nitems; i++)
+		{
+			MVNDistinctItem *item = &stats->items[i];
+			int			j;
+
+			if (item->nattributes != bestn)
+				continue;
+			for (j = 0; j < item->nattributes; j++)
+			{
+				if (item->attributes[j] <= 0 ||
+					!bms_is_member(item->attributes[j], shared))
+					break;
+			}
+			if (j == item->nattributes)
+			{
+				values = item->ndistinct;
+				covered = shared;
+				break;
+			}
+		}
+	}
+
+	foreach(lc, keys)
+	{
+		Var		   *var = (Var *) lfirst(lc);
+
+		if (var->varattno <= 0 || !bms_is_member(var->varattno, covered))
+			values *= lion_fkjoin_fk_ndistinct(root, rel, var);
+	}
+	return values;
+}
+
+/*
+ * The price of a heap page a lookup reads, `pages` distinct pages of the
+ * table's `heap_pages` read in all: lion_heap_page_cost()'s residency, from
+ * random_page_cost towards seq_page_cost as the table's share of
+ * effective_cache_size holds them (index_pages_fetched()'s proration), but
+ * not its density - the lookups read the pages in the key's order, which a
+ * set covering most of the table does not make the heap's.
+ */
+static Cost
+lion_anti_heap_page_cost(PlannerInfo *root, RelOptInfo *rel, double pages,
+						 double heap_pages)
+{
+	double		spc_random;
+	double		spc_seq;
+	double		total_pages = Max(root->total_table_pages, heap_pages);
+	double		cache_pages;
+	double		resident;
+
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	if (pages <= 0.0)
+		return spc_random;
+	cache_pages = Max((double) effective_cache_size * heap_pages / total_pages,
+					  1.0);
+	resident = Min(cache_pages / pages, 1.0);
+	return spc_random - (spc_random - spc_seq) * resident;
+}
+
+/*
  * The sort of the child's rows by key (lion_anti_collect()): what
  * cost_sort() charges a sort of `rows` rows of `width` bytes within work_mem
  * - a comparison of two keys for each that its quicksort, or its runs and
@@ -341,8 +459,8 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	double		corr;
 	double		minpages;
 	double		maxpages;
-	double		spc_random;
-	double		spc_seq;
+	double		minreads;
+	double		reads;
 	double		idx_random;
 	double		idx_seq;
 	Cost		descent;
@@ -351,7 +469,6 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	QualCost	keyeval;
 	QualCost	roweval;
 	int			width;
-	ListCell   *lc;
 	int			k;
 
 	for (k = 0; k < plan->nkey; k++)
@@ -367,17 +484,14 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 	/*
 	 * ... and the rows each finds: every row of its key in the table, which
 	 * the restrictions are tested on after, so the table's rows over its key
-	 * columns' distinct values in the whole table, each column's as
-	 * lion_fkjoin_fk_ndistinct() takes it - not estimate_num_groups()'s,
-	 * which scales them down to the rows the restrictions leave
+	 * columns' distinct values in the whole table (lion_anti_key_values()) -
+	 * not estimate_num_groups()'s, which scales them down to the rows the
+	 * restrictions leave
 	 */
-	values = 1.0;
-	foreach(lc, outerkeys)
-		values *= lion_fkjoin_fk_ndistinct(root, rel, (Var *) lfirst(lc));
+	values = lion_anti_key_values(root, rel, outerkeys);
 	perlookup = tuples / Max(Min(values, tuples), 1.0);
 	fetched = Min(perlookup * lookups, tuples);
 
-	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	get_tablespace_page_costs(idx->reltablespace, &idx_random, &idx_seq);
 
 	/*
@@ -401,17 +515,29 @@ lion_anti_price(PlannerInfo *root, const LionSmallAnti *anti, List *restrictions
 								root) * idx_random;
 
 	/*
-	 * ... the heap's: as many pages as rows, in no order, or as few as a
-	 * lookup's share of the table's pages, in the index's, and as far between
-	 * the two as the correlation squared puts it (cost_index()).
+	 * ... the heap's: a page read for each row found, in no order, or for
+	 * each page of a lookup's share of the table's pages, in the index's, as
+	 * far between the two as the correlation squared puts it (cost_index()).
+	 * Each is a read whether or not another lookup read the page before - a
+	 * buffer looked up, pinned and locked again, which is the lookups' time
+	 * when the cache holds the table - at the price of a page of the pages
+	 * the reads come to, as many as index_pages_fetched() makes them
+	 * (lion_anti_heap_page_cost()).  Core's index scan charges those pages,
+	 * every one at random_page_cost, and none of the reads again: on a table
+	 * the cache holds that priced a few thousand lookups at four times their
+	 * time and a hundred thousand at their time.
 	 */
+	corr = lion_anti_correlation(root, plan);
 	maxpages = index_pages_fetched(fetched, (BlockNumber) relpages, idxpages,
 								   root);
-	minpages = index_pages_fetched(ceil(perlookup / tuples * relpages) *
-								   lookups, (BlockNumber) relpages, idxpages,
+	minreads = ceil(perlookup / tuples * relpages) * lookups;
+	minpages = index_pages_fetched(minreads, (BlockNumber) relpages, idxpages,
 								   root);
-	corr = lion_anti_correlation(root, plan);
-	cost += (maxpages + corr * corr * (minpages - maxpages)) * spc_random;
+	reads = fetched + corr * corr * (minreads - fetched);
+	cost += reads *
+		lion_anti_heap_page_cost(root, rel,
+								 maxpages + corr * corr * (minpages - maxpages),
+								 relpages);
 
 	/* ... and each row found: its tuple, the clauses it is tested on */
 	cost_qual_eval(&qual, list_concat(list_copy(restrictions), anti->clauses),

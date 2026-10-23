@@ -147,7 +147,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
 	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
-	{"pg_lion.position_member_cost", &lion_position_member_cost, 1.8, LION_OP,
+	{"pg_lion.position_member_cost", &lion_position_member_cost, 2.4, LION_OP,
 	 "Sets the planner's estimate of the cost of each member of a lexeme's stored positions that a lion position filter decodes"},
 	{"pg_lion.position_check_cost", &lion_position_check_cost, 4.3, LION_OP,
 	 "Sets the planner's estimate of the cost of deciding a candidate row from stored positions, per lexeme of the query"},
