@@ -3967,6 +3967,9 @@ typedef enum LionCoreScan
 
 /* lion_plan_units.c */
 extern void lion_path_core_switches(Path *path, LionCoreScan scan);
+extern bool lion_path_disabled(const Path *p);
+extern Cost lion_units_cold_page(PlannerInfo *root, double idxpages,
+								 Oid reltablespace);
 extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
@@ -4433,6 +4436,7 @@ typedef struct LionOrderedSet
 	Cost		build;			/* the set's price */
 	Selectivity candsel;		/* the share of the rows the set holds */
 	Cost		recheck;		/* a member's recheck, when it leaves quals */
+	double		lionpages;		/* the lion index pages its build reads */
 } LionOrderedSet;
 
 extern bool lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel);
@@ -4443,7 +4447,8 @@ extern void lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel,
 extern void lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel,
 									IndexPath *ord, Path *lion, double rows,
 									bool indexonly_ok, List **iocols,
-									Cost *startup, Cost *total);
+									Cost *startup, Cost *total,
+									double *fetches, double *lionpages);
 extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Path *lion, List *iocols, bool dim,
 										  double weight, Expr *keyqual,

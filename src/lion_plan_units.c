@@ -464,7 +464,7 @@ lion_competitor_path(RelOptInfo *rel)
  * Is a path one core's enable_* settings have disabled: a node of it is
  * (PostgreSQL 18's disabled_nodes), or its cost holds disable_cost?
  */
-static bool
+bool
 lion_path_disabled(const Path *p)
 {
 #if PG_VERSION_NUM >= 180000
@@ -593,6 +593,29 @@ lion_path_is_lion_scan(Path *path)
 }
 
 /*
+ * What a page read outside the cache is charged over the random_page_cost
+ * core charges it (DESIGN.md §39, "A nested loop's cold reads"):
+ * LION_COLD_PAGE_COST less the tablespace's random_page_cost, in the share of
+ * the query's tables and idxpages of index that effective_cache_size cannot
+ * hold.  0 when it holds them all.
+ */
+Cost
+lion_units_cold_page(PlannerInfo *root, double idxpages, Oid reltablespace)
+{
+	double		resident;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+
+	resident = Min((double) effective_cache_size /
+				   Max(root->total_table_pages + idxpages, 1.0), 1.0);
+	get_tablespace_page_costs(reltablespace, &spc_random_page_cost,
+							  &spc_seq_page_cost);
+	if (resident >= 1.0 || LION_COLD_PAGE_COST <= spc_random_page_cost)
+		return 0.0;
+	return (1.0 - resident) * (LION_COLD_PAGE_COST - spc_random_page_cost);
+}
+
+/*
  * A NESTED LOOP'S COLD READS (DESIGN.md §39, "A nested loop's cold reads"):
  * what the inner index scan of path - a nested loop into a parameterized
  * index scan, under whatever passes its rows up - would pay for the pages it
@@ -624,11 +647,8 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 	IndexPath  *ip;
 	RelOptInfo *baserel;
 	double		idxpages;
-	double		resident;
 	double		loops;
 	double		reads;
-	double		spc_random_page_cost;
-	double		spc_seq_page_cost;
 
 	*cold = 0.0;
 	*perpage = 0.0;
@@ -657,13 +677,9 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 		return;
 
 	idxpages = Max((double) ip->indexinfo->pages, 1.0);
-	resident = Min((double) effective_cache_size /
-				   Max(root->total_table_pages + idxpages, 1.0), 1.0);
-	get_tablespace_page_costs(baserel->reltablespace,
-							  &spc_random_page_cost, &spc_seq_page_cost);
-	if (resident >= 1.0 || LION_COLD_PAGE_COST <= spc_random_page_cost)
+	*perpage = lion_units_cold_page(root, idxpages, baserel->reltablespace);
+	if (*perpage <= 0.0)
 		return;
-	*perpage = (1.0 - resident) * (LION_COLD_PAGE_COST - spc_random_page_cost);
 
 	/* a leaf a probe, and the heap pages of its rows */
 	loops = Max(jp->outerjoinpath->rows, 1.0);

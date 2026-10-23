@@ -1626,7 +1626,8 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
  * 0.8 us a piece at the reference's 500 units a millisecond, the lower of
  * the two, where a tie should fall - and its TIDs past that are taken back
  * out.  A sparse leaf keeps its price.  The other walks keep §30.3's price:
- * their walk, not the build, is most of theirs.
+ * their walk, not the build, is most of theirs - but for a LionOrderedJoin's
+ * sides (§47.3), under a LIMIT that scales their walks and not their builds.
  */
 #define LO_BUILD_PIECE_TIDS		80
 
@@ -1719,6 +1720,11 @@ lo_lion_pages(Path *lion)
  * amortizes a parameterized scan's, and which pays its share of the set,
  * built once for every scan the loop makes: the build divided by `scans`.
  *
+ * With `probebuild` the set's lookups are priced as its build reads them,
+ * lo_build_excess() taken off: a nested loop's probe's (§40.10), and a
+ * LionOrderedJoin's side's (§47.3), whose LIMIT scales the walk but not the
+ * build.  Without it, §30.3's price of a walk, the lookups a bitmap scan's.
+ *
  * With `lion` NULL there is no set: each entry walked is only tested in the
  * visibility map, and the heap read for the share of pages not all-visible -
  * a LionProbeJoin's descent where the dimension's WHERE is empty (§46).
@@ -1727,13 +1733,17 @@ lo_lion_pages(Path *lion)
  * heap scan's cold reads are weighed against (DESIGN.md §39, "A bitmap heap
  * scan's cold reads"): the btree's, as its amcostestimate() counts them, the
  * set's build reads (lo_lion_pages()), and the heap pages its fetches read,
- * as priced below.
+ * as priced below.  With `fetches_p` not NULL, the heap fetches of the whole
+ * walk go there, each a page to read: every candidate in heap mode or where
+ * the recheck reads the tuple, otherwise the members on pages the visibility
+ * map does not call all-visible (a LionOrderedJoin's cold reads, §47.3).
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, double loops, double scans, int *workers,
-		Cost *startup_p, Cost *total_p, double *reads_p)
+		bool indexonly, double loops, double scans, bool probebuild,
+		int *workers, Cost *startup_p, Cost *total_p, double *reads_p,
+		double *fetches_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1773,8 +1783,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (lion != NULL)
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
 
-	/* a nested loop's probe: its lookups as its set's build reads them */
-	if (lion != NULL && ord->path.param_info != NULL)
+	/* a probe's, or a join's side's: its lookups as its build reads them */
+	if (lion != NULL && probebuild)
 		lioncost = Max(lioncost -
 					   lo_build_excess(root, lion, tuples, pages) *
 					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
@@ -1943,6 +1953,9 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (reads_p != NULL)
 		*reads_p = ipages + lo_lion_pages(lion) +
 			Max(max_io + corr * corr * (pages_corr - max_io), 0.0);
+	if (fetches_p != NULL)
+		*fetches_p = (indexonly && !heaprecheck) ?
+			heapfetched * (1.0 - rel->allvisfrac) : heapfetched;
 	max_io *= spc_random;
 	if (loops > 1.0)
 	{
@@ -3922,7 +3935,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lion == lioncover && !indexonly)
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, 1.0, 1.0, NULL, &startup, &total, &reads);
+					indexonly, 1.0, 1.0, ord->path.param_info != NULL, NULL,
+					&startup, &total, &reads, NULL);
 			if (indexonly)
 				lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, &lion_ordered_path_methods,
@@ -3932,8 +3946,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
-						rows, indexonly, 1.0, 1.0, &workers, &startup, &total,
-						&reads))
+						rows, indexonly, 1.0, 1.0,
+						ord->path.param_info != NULL, &workers, &startup,
+						&total, &reads, NULL))
 			{
 				if (indexonly)
 					lo_cold_price_partial(&cold, reads, rows, &startup,
@@ -3999,7 +4014,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, 1.0, 1.0, NULL, &startup, &total, &reads);
+					rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
+					NULL, &startup, &total, &reads, NULL);
 			lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, pathkeys != NIL ?
 						&lion_ordered_path_methods : &lion_btree_path_methods,
@@ -4009,8 +4025,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ipath) &&
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-						rows, true, 1.0, 1.0, &workers, &startup, &total,
-						&reads))
+						rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
+						&workers, &startup, &total, &reads, NULL))
 			{
 				lo_cold_price_partial(&cold, reads, rows, &startup, &total);
 				lo_add_path(rel, NULL, pathkeys != NIL ?
@@ -4064,8 +4080,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					ppi->ppi_rows, true, loops, scans, NULL, &startup, &total,
-					NULL);
+					ppi->ppi_rows, true, loops, scans,
+					ipath->path.param_info != NULL, NULL, &startup, &total,
+					NULL, NULL);
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
 						list_make3(ipath, lion, iocols), ppi->ppi_rows,
 						startup, total, rel->consider_parallel, 0);
@@ -4251,8 +4268,9 @@ lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel)
  * The set of one lion access of a probed side - or none, lion NULL: the
  * restriction clauses left for the side's filter, the set's price as a nested
  * loop's probe builds it (lion_ordered_set_price(), and its spill), the share
- * of rel's rows it holds, and the price of a member's recheck when it leaves
- * quals to it (lion_ordered_set_exact()).
+ * of rel's rows it holds, the price of a member's recheck when it leaves
+ * quals to it (lion_ordered_set_exact()), and the lion index pages its build
+ * reads (lo_lion_pages()).
  */
 void
 lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel, Path *lion,
@@ -4274,6 +4292,7 @@ lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel, Path *lion,
 		out->build = lion_ordered_set_price(root, rel, lion, &members, &bytes) +
 			lion_ordered_spill_price(bytes);
 		out->candsel = Min(members / Max(rel->tuples, 1.0), 1.0);
+		out->lionpages = lo_lion_pages(lion);
 		if (!lion_ordered_set_exact(root, lion))
 		{
 			QualCost	rq;
@@ -4289,14 +4308,18 @@ lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel, Path *lion,
 /*
  * The price of the fact's walk of ord with one lion access, or none (lion
  * NULL, every entry walked fetched and filtered): lo_cost() - the set's
- * build, the walk, the members' fetches, the filter and the target - in heap
- * mode, or in index-only mode where the btree has every column the side needs
- * and indexonly_ok (*iocols is then its mapping, NIL otherwise).
+ * build, its lookups as a probe's build reads them (§47.3), the walk, the
+ * members' fetches, the filter and the target - in heap mode, or in
+ * index-only mode where the btree has every column the side needs and
+ * indexonly_ok (*iocols is then its mapping, NIL otherwise).  *fetches is the
+ * heap fetches of the whole walk (lo_cost()), *lionpages the lion index pages
+ * the set's build reads.
  */
 void
 lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 						Path *lion, double rows, bool indexonly_ok,
-						List **iocols, Cost *startup, Cost *total)
+						List **iocols, Cost *startup, Cost *total,
+						double *fetches, double *lionpages)
 {
 	List	   *lionrinfos = NIL;
 	bool		lossy = false;
@@ -4317,7 +4340,9 @@ lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 	if (!indexonly)
 		*iocols = NIL;
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-				   indexonly, 1.0, 1.0, NULL, startup, total, NULL);
+				   indexonly, 1.0, 1.0, true, NULL, startup, total, NULL,
+				   fetches);
+	*lionpages = lo_lion_pages(lion);
 }
 
 /*
@@ -8562,7 +8587,8 @@ lion_ordered_probe_price(PlannerInfo *root, RelOptInfo *rel,
 	if (lion != NULL)
 		(void) lo_lion_qual(lion, &lionrinfos, &lossy);
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, NIL, 0.0,
-				   true, Max(loops, 1.0), 1.0, NULL, &startup, &total, NULL);
+				   true, Max(loops, 1.0), 1.0, ord->path.param_info != NULL,
+				   NULL, &startup, &total, NULL, NULL);
 	*perprobe = Max(total - startup, 0.0);
 	*probe = ord;
 	return true;
