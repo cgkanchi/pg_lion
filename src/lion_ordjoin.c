@@ -643,7 +643,8 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	Cost		total;
 	ListCell   *lc;
 
-	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, false,
+	/* the fact's walk, index-only where its btree has every column it needs */
+	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
 							&iocols, &factstartup, &facttotal);
 	lion_ordered_set_info(root, j->dim, dimlion, &ds);
 	oj_cost(root, joinrel, j, &ds, factstartup, facttotal, factrows, &rows,

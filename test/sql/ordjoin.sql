@@ -142,7 +142,7 @@ DECLARE
 BEGIN
 	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
-		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers|Full-sort Groups|Pre-sorted Groups|Sort Method)' THEN
+		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers|Full-sort Groups|Pre-sorted Groups|Sort Method|Fetch and Sort Space Used)' THEN
 			RETURN NEXT regexp_replace(ln, '\s*\(actual.*\)', '');
 		END IF;
 	END LOOP;
@@ -350,7 +350,42 @@ SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
 RESET work_mem;
 
--- 10. What it declines, for core to plan: a join on more than the key, a
+-- 10. The fact's walk index-only, where its btree has every column of the
+--     fact the join needs: no heap read for a member on an all-visible page;
+--     with no set, every entry a member; and with an inexact set, each
+--     member read for its recheck, the btree lacking the column.
+SELECT oj('SELECT f.score, f.fk, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+SELECT * FROM oj_run('SELECT f.score, f.fk, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+SELECT oj('SELECT f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 3 AND d.lvl = 7 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+SELECT * FROM oj_run('SELECT f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 3 AND d.lvl = 7 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+SELECT oj('SELECT f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags <@ ''{a1,b2,b5}'' AND d.lvl < 50 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+SELECT * FROM oj_run('SELECT f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags <@ ''{a1,b2,b5}'' AND d.lvl < 50 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 20');
+
+-- ... and the fact's fetch-and-sort switch (§30.4), made due at once: the
+--     rest of the walk's members fetched and sorted, the join reading them
+--     as it read the walk.
+SET pg_lion.ordered_switch_ratio = 1;
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND f.tags @> ''{b2}'' AND d.lvl = 3 AND d.kind = 3
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND f.tags @> ''{b2}'' AND d.lvl = 3 AND d.kind = 3
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET pg_lion.ordered_switch_ratio;
+
+-- 11. What it declines, for core to plan: a join on more than the key, a
 --     key that is not unique, rows locked, no lion clause on either side,
 --     and the setting off.
 SELECT oj('SELECT f.id, d.pk FROM fact f JOIN dim d ON f.fk = d.pk AND f.ver < d.kind
