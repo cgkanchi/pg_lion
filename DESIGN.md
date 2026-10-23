@@ -23650,7 +23650,15 @@ visibility-map test per member and the values from the index tuple.
   walks; core's `enable_indexscan` disables it as it disables the B-tree's own scans (§40.2), and
   `enable_indexonlyscan = off` takes it away, since the probe is index-only or nothing.
   `pg_lion.enable_plain_scan` and `pg_lion.enable_ordered_scan` do not touch it: it is neither a
-  scan of a lion index nor an ordered walk. `enable_memoize` decides `S` above.
+  scan of a lion index nor an ordered walk. `enable_memoize` decides `S` above. With
+  `enable_nestloop = off` the probe is still offered, and on 18 it then costs a parallel plan its
+  partial hash join: 18's `add_partial_path_precheck()` compares a new partial path with the join
+  relation's existing ones by cost alone, so the disabled partial nested loop over the probe, cheaper
+  than the partial hash join, keeps that join out, and the plan is a hash join of two Gathers; 19 and
+  later compare the disabled nodes first and take the hash join (test/sql/btreescan_parallel.sql's
+  section 9 switches the probe off with the loop). Not offering the probe while nested loops are
+  disabled would avoid it, and was not done: a disabled path is still the plan where nothing else
+  joins, and the quirk is 18's alone.
 - **A count over the join** (§27, §39). A `LionCount` meets core's plan above the join in the
   competitor's units, and the competitor (`lion_competitor_path()`) is core's cheapest path with no
   lion path inside: where the probe's nested loop is the join's cheapest path, every aggregate core

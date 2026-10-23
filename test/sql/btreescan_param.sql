@@ -159,7 +159,7 @@ BEGIN
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_memoize', memoize::text, true);
 	PERFORM set_config('pg_lion.pushdown_margin', margin::text, true);
-	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionBtreeScan\)' THEN
 			inside := true;
 		ELSIF ln ~ '->' THEN
@@ -254,7 +254,9 @@ SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
 --    without one.  The set is built once either way: a scan Memoize answers
 --    from its cache never reaches the probe, and the probe it rescans keeps
 --    its set (no "builds" in Lion Set) - two thousand walks with a Memoize,
---    28,572 without.
+--    28,572 without.  PostgreSQL 19 may aggregate the fact side below the
+--    join instead (eager aggregation), which probes each key once itself.
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
 SELECT bsp('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
  WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
 		   memoize => true, margin => 10);
@@ -267,6 +269,7 @@ SELECT * FROM bsp_run('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d
 SELECT * FROM bsp_run('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
  WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
 					  memoize => false);
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN EXECUTE 'RESET enable_eager_aggregate'; END IF; END$$;
 
 -- 4. A B-tree of two columns: the leading one the outer row's, the second a
 --    constant, both its Index Cond; each descent finds a few entries.
@@ -527,11 +530,8 @@ DROP TABLE bsp_tiny;
 --     key of, and that join is core's.  A row mark needs the row's ctid,
 --     which no index returns: no probe, and EvalPlanQual never meets one.
 SET enable_indexscan = off;
-SELECT bsp_plan($$
-SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
- WHERE d.tags && ARRAY['t1', 't3', 't5', 't7', 't9'] AND d.verified
-   AND d.grade = 'alpha' AND d.hue = 'green' AND f.tsv @@ 'w7 & x3'::tsquery
- GROUP BY d.id$$);
+SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id <= 400 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.hue = ''green''');
 RESET enable_indexscan;
 SET enable_indexonlyscan = off;
 SELECT bsp('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
