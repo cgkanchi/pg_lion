@@ -1660,6 +1660,10 @@ lo_build_excess(PlannerInfo *root, Path *lion, double tuples, double pages)
  * scan's), whose heap pages are amortized over the loops as cost_index()
  * amortizes a parameterized scan's, and which pays its share of the set,
  * built once for every scan the loop makes: the build divided by `scans`.
+ *
+ * With `lion` NULL there is no set: each entry walked is only tested in the
+ * visibility map, and the heap read for the share of pages not all-visible -
+ * a LionProbeJoin's descent where the dimension's WHERE is empty (§46).
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
@@ -1696,10 +1700,17 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	Cost		run;
 	Cost		cpu;
 
-	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	/*
+	 * No lion access at all is LionProbeJoin's descent alone (DESIGN.md
+	 * §46): every entry walked a member, and no set to build.
+	 */
+	lioncost = 0;
+	sel = 1.0;
+	if (lion != NULL)
+		cost_bitmap_tree_node(lion, &lioncost, &sel);
 
 	/* a nested loop's probe: its lookups as its set's build reads them */
-	if (ord->path.param_info != NULL)
+	if (lion != NULL && ord->path.param_info != NULL)
 		lioncost = Max(lioncost -
 					   lo_build_excess(root, lion, tuples, pages) *
 					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
@@ -1707,7 +1718,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	/* the set's members: the candidates, when it leaves quals to the recheck */
 	candsel = sel;
-	rechecked = lo_rechecked_quals(root, lion);
+	rechecked = (lion != NULL) ? lo_rechecked_quals(root, lion) : NIL;
 	rqcost.startup = 0;
 	rqcost.per_tuple = 0;
 	if (rechecked != NIL)
@@ -1736,7 +1747,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * the lookups, the copy of their answer into the set, and its spill - a
 	 * probe's share of them (§40.10)
 	 */
-	startup = lioncost + ncont * cpu_operator_cost +
+	startup = (lion == NULL) ? 0.0 :
+		lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
 		lo_spill_cost(lo_set_bytes(members, ncont));
 	if (scans > 1.0)
@@ -7731,6 +7743,549 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 								   (int64) st->earlystops, es);
 	}
 	pfree(buf.data);
+}
+
+/* ---------------------------------------------------------------------
+ * What LionProbeJoin takes from the walk (lion_probejoin.c, DESIGN.md §46)
+ *
+ * A dimension probed by a fact's rows through its primary key is a nested
+ * loop's probe (§40.10) whose sets are the dimension's WHERE and the labels
+ * of its cells: the same lion accesses, the same price for the descent, and
+ * the same sets - built from lion sources a container at a time, held within
+ * hash_mem and spilled past it - so they are this file's, lent out here.
+ * --------------------------------------------------------------------- */
+
+/*
+ * A BitmapAnd that answers every restriction clause of rel when no access
+ * core builds does: core's choice of an AND (choose_bitmap_and()) leaves out
+ * a leaf that selects too little to pay for its lookups in a bitmap scan -
+ * `active` of two rows in three - where the probe's set must answer it all
+ * the same, or read the heap for it.  Each clause the leaves before it do
+ * not answer gets the cheapest access core builds for it alone; NULL when a
+ * clause has none.
+ */
+static Path *
+lo_where_and(PlannerInfo *root, RelOptInfo *rel, List *lionidx, Oid lionam,
+			 List **qual)
+{
+	List	   *parts = NIL;
+	List	   *rinfos = NIL;
+	List	   *quals = NIL;
+	List	   *andrinfos = NIL;
+	bool		lossy = false;
+	Path	   *and;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		List	   *others;
+		List	   *cands;
+		Path	   *best = NULL;
+		Cost		bestcost = 0;
+		List	   *bestrinfos = NIL;
+		List	   *bestqual = NIL;
+		ListCell   *lc2;
+
+		if (rinfo->pseudoconstant ||
+			lo_residual(list_make1(rinfo), NIL, rinfos, quals) == NIL)
+			continue;
+		others = list_delete_ptr(list_copy(rel->baserestrictinfo), rinfo);
+		cands = lo_lion_accesses(root, rel, lionidx, others, lionam);
+		foreach(lc2, cands)
+		{
+			Path	   *cand = (Path *) lfirst(lc2);
+			List	   *crinfos = NIL;
+			List	   *cqual = lo_lion_qual(cand, &crinfos, &lossy);
+			Cost		cost;
+			Selectivity sel;
+
+			if (lo_residual(list_make1(rinfo), NIL, crinfos, cqual) != NIL)
+				continue;
+			cost_bitmap_tree_node(cand, &cost, &sel);
+			if (best == NULL || cost < bestcost)
+			{
+				best = cand;
+				bestcost = cost;
+				bestrinfos = crinfos;
+				bestqual = cqual;
+			}
+		}
+		if (best == NULL)
+			return NULL;
+		parts = lappend(parts, best);
+		rinfos = list_concat(rinfos, bestrinfos);
+		quals = list_concat(quals, bestqual);
+	}
+	if (parts == NIL)
+		return NULL;
+	and = (list_length(parts) == 1) ? (Path *) linitial(parts) :
+		(Path *) create_bitmap_and_path(root, rel, parts);
+	quals = lo_lion_qual(and, &andrinfos, &lossy);
+	if (lo_residual(rel->baserestrictinfo, NIL, andrinfos, quals) != NIL)
+		return NULL;
+	*qual = quals;
+	return and;
+}
+
+/*
+ * The lion access that answers every restriction clause of rel - the
+ * cheapest of those core builds over its lion indexes (lo_lion_accesses()),
+ * with nothing left to a filter (lo_residual()) - into *lion, and its
+ * original qual into *lionqual, as a recheck evaluates it.  False when no
+ * access answers them all; true with *lion NULL when rel has no restriction
+ * clause.  The caller has checked the relation (§46, "What qualifies").
+ */
+bool
+lion_ordered_where_access(PlannerInfo *root, RelOptInfo *rel, Path **lion,
+						  List **lionqual)
+{
+	Oid			lionam = lion_get_am_oid();
+	List	   *lionidx = NIL;
+	List	   *cands;
+	Path	   *best = NULL;
+	Cost		bestcost = 0;
+	List	   *bestqual = NIL;
+	ListCell   *lc;
+
+	*lion = NULL;
+	*lionqual = NIL;
+	if (rel->baserestrictinfo == NIL)
+		return true;
+	if (!OidIsValid(lionam))
+		return false;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx->relam == lionam && !idx->hypothetical)
+			lionidx = lappend(lionidx, idx);
+	}
+	if (lionidx == NIL)
+		return false;
+
+	cands = lo_lion_accesses(root, rel, lionidx, NIL, lionam);
+	foreach(lc, cands)
+	{
+		Path	   *cand = (Path *) lfirst(lc);
+		List	   *rinfos = NIL;
+		bool		lossy = false;
+		List	   *qual = lo_lion_qual(cand, &rinfos, &lossy);
+		Cost		cost;
+		Selectivity sel;
+
+		if (lo_residual(rel->baserestrictinfo, NIL, rinfos, qual) != NIL)
+			continue;
+		cost_bitmap_tree_node(cand, &cost, &sel);
+		if (best == NULL || cost < bestcost)
+		{
+			best = cand;
+			bestcost = cost;
+			bestqual = qual;
+		}
+	}
+	if (best == NULL)
+		best = lo_where_and(root, rel, lionidx, lionam, &bestqual);
+	if (best == NULL)
+		return false;
+	*lion = best;
+	*lionqual = bestqual;
+	return true;
+}
+
+/*
+ * A lion access as custom_private carries it (lo_lion_tree()): its tree in
+ * preorder, appended to *tree's; each leaf's index, appended to *leaves; and
+ * each leaf's index quals, key on the left, appended to *quals.
+ */
+void
+lion_ordered_lion_tree(Path *lion, List **tree, List **leaves, List **quals)
+{
+	lo_lion_tree(lion, tree, leaves, quals);
+}
+
+/*
+ * The price of building a set of lion access `lion` of rel, as a nested
+ * loop's probe builds it (§30.3, §40.10): its lookups as the build reads
+ * them (lo_build_excess()), a cpu_operator_cost a container key, and the
+ * copy of its pieces (lo_set_pieces()); its spill is the caller's, over all
+ * of its sets together (lion_ordered_spill_price()).  *members and *bytes
+ * are what the set is expected to hold and take (lo_set_bytes()).
+ */
+Cost
+lion_ordered_set_price(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+					   double *members, double *bytes)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	Cost		lioncost;
+	Selectivity sel;
+	Selectivity candsel;
+	List	   *rechecked;
+	double		m;
+	double		ncont;
+
+	cost_bitmap_tree_node(lion, &lioncost, &sel);
+	lioncost = Max(lioncost -
+				   lo_build_excess(root, lion, tuples, pages) *
+				   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
+				   0.0);
+	candsel = sel;
+	rechecked = lo_rechecked_quals(root, lion);
+	if (rechecked != NIL)
+	{
+		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
+												  JOIN_INNER, NULL);
+
+		if (rsel > 0)
+			candsel = Min(sel / rsel, 1.0);
+	}
+	m = clamp_row_est(candsel * tuples);
+	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), m);
+	*members = m;
+	*bytes = lo_set_bytes(m, ncont);
+	return lioncost + ncont * cpu_operator_cost +
+		lo_set_pieces(root, lion, m, ncont);
+}
+
+/* What sets of `bytes` together cost past hash_mem (lo_spill_cost()). */
+Cost
+lion_ordered_spill_price(double bytes)
+{
+	return lo_spill_cost(bytes);
+}
+
+/*
+ * The bytes a set of `members` TIDs of a relation of `pages` pages takes
+ * (lo_set_bytes()), its containers as many as the members' blocks can fill
+ * at most.
+ */
+double
+lion_ordered_set_bytes(double members, double pages)
+{
+	double		m = clamp_row_est(members);
+
+	return lo_set_bytes(m, Min(ceil(Max(pages, 1.0) /
+									LION_BLOCKS_PER_CONTAINER), m));
+}
+
+/*
+ * One lookup of a key in B-tree path probe's index, with no heap visit and
+ * no set: the descent core prices a scan of the path at, and the entry the
+ * key finds, read as the probe reads one (LO_PROBE_TUPLES).
+ */
+Cost
+lion_ordered_lookup_price(IndexPath *probe)
+{
+	return probe->indextotalcost +
+		LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost;
+}
+
+/*
+ * The price of one descent of B-tree idx of rel to an outer row's key, of
+ * `loops` (§40.10's scan of the probe): core's IndexPath of idx
+ * parameterized by relations within `outer` (lo_btree_paths()), whose
+ * descent and leaf pages core has priced over the loops, each entry's probe
+ * of the set of `lion` (or none), each member's visibility-map test, and the
+ * heap pages of the members on pages not all-visible - with no row
+ * returned, and no set: the build is lion_ordered_set_price()'s.  The
+ * IndexPath goes into *probe, for the caller's cold reads.  False when core
+ * makes no such path.
+ */
+bool
+lion_ordered_probe_price(PlannerInfo *root, RelOptInfo *rel,
+						 IndexOptInfo *idx, Relids outer, Path *lion,
+						 List *lionqual, double loops, Cost *perprobe,
+						 IndexPath **probe)
+{
+	List	   *params = NIL;
+	IndexPath  *ord = NULL;
+	List	   *lionrinfos = NIL;
+	bool		lossy = false;
+	Cost		startup;
+	Cost		total;
+	ListCell   *lc;
+
+	(void) lo_btree_paths(root, rel, idx, &params);
+	foreach(lc, params)
+	{
+		IndexPath  *ip = (IndexPath *) lfirst(lc);
+
+		if (!bms_is_subset(PATH_REQ_OUTER(&ip->path), outer))
+			continue;
+		if (ord == NULL || ip->indextotalcost < ord->indextotalcost)
+			ord = ip;
+	}
+	if (ord == NULL)
+		return false;
+	if (lion != NULL)
+		(void) lo_lion_qual(lion, &lionrinfos, &lossy);
+	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, NIL, 0.0,
+				   true, Max(loops, 1.0), 1.0, NULL, &startup, &total);
+	*perprobe = Max(total - startup, 0.0);
+	*probe = ord;
+	return true;
+}
+
+/*
+ * The sets of a LionProbeJoin as it runs: a LionOrderedState lends them its
+ * memory - charged against hash_mem, in the arena past it (§30.4,
+ * "Spilling") - and its leaves; each tree a set, built by lo_build_node(),
+ * and the extra sets the caller makes from TIDs it found itself.
+ */
+struct LionProbeSets
+{
+	LionOrderedState st;
+	int			ntree;
+	LoNode	  **trees;
+	int			nset;			/* the trees', then the extra sets */
+	LionTidSet **sets;			/* [nset]; NULL until built */
+	bool	   *exact;			/* [nset] */
+	bool		open;			/* the leaves' indexes are */
+};
+
+/*
+ * The sets of `trees` - each one as lo_lion_tree() encodes it, their leaves'
+ * indexes `leafoids` and index quals `quals` all of them in one list, in
+ * order - and room for `nextra` more.  The quals' keys are any expression of
+ * the key's type: lo_fix_qual() puts the index column in their place.
+ * Without `open` (EXPLAIN alone) nothing is opened; with it the leaves'
+ * indexes are opened and their scan keys built, run-time keys under ps.
+ */
+LionProbeSets *
+lion_probe_sets_begin(PlanState *ps, List *trees, List *leafoids, List *quals,
+					  int nextra, bool open)
+{
+	EState	   *estate = ps->state;
+	MemoryContext oldcxt = MemoryContextSwitchTo(estate->es_query_cxt);
+	LionProbeSets *sets = (LionProbeSets *) palloc0(sizeof(LionProbeSets));
+	LionOrderedState *st = &sets->st;
+	int			leafno = 0;
+	int			qualno = 0;
+	int			i = 0;
+	ListCell   *lc;
+
+	/* lo_spill_begin() finds the query's memory through it */
+	st->css.ss.ps.state = estate;
+	st->vmbuffer = InvalidBuffer;
+	st->arenafile = -1;
+	st->nleaves = list_length(leafoids);
+	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * Max(st->nleaves, 1));
+	sets->ntree = list_length(trees);
+	sets->trees = (LoNode **) palloc0(sizeof(LoNode *) * Max(sets->ntree, 1));
+	foreach(lc, trees)
+	{
+		List	   *tree = (List *) lfirst(lc);
+		ListCell   *pos = list_head(tree);
+
+		if (tree == NIL)
+			elog(ERROR, "LionProbeJoin: an empty lion tree");
+		sets->trees[i++] = lo_decode_tree(st, tree, &pos, leafoids, quals,
+										  &leafno, &qualno);
+		if (pos != NULL)
+			elog(ERROR, "LionProbeJoin: malformed lion tree");
+	}
+	if (leafno != st->nleaves || qualno != list_length(quals))
+		elog(ERROR, "LionProbeJoin: malformed lion trees");
+	if (nextra < 0)
+		elog(ERROR, "LionProbeJoin: malformed extra sets");
+	sets->nset = sets->ntree + nextra;
+	sets->sets = (LionTidSet **) palloc0(sizeof(LionTidSet *) *
+										 Max(sets->nset, 1));
+	sets->exact = (bool *) palloc0(sizeof(bool) * Max(sets->nset, 1));
+
+	if (open)
+	{
+		st->setcxt = AllocSetContextCreate(estate->es_query_cxt,
+										   "LionProbeJoin sets",
+										   ALLOCSET_DEFAULT_SIZES);
+		st->buildcxt = AllocSetContextCreate(estate->es_query_cxt,
+											 "LionProbeJoin build",
+											 ALLOCSET_DEFAULT_SIZES);
+		st->lrtcxt = CreateExprContext(estate);
+		st->limit = get_hash_memory_limit();
+		sets->open = true;
+
+		/* what is read of each lion index is predicate-locked as it is (§9) */
+		for (i = 0; i < st->nleaves; i++)
+		{
+			LoLeaf	   *leaf = &st->leaves[i];
+
+			leaf->index = index_open(leaf->indexoid, AccessShareLock);
+			ExecIndexBuildScanKeys(ps, leaf->index, leaf->quals, false,
+								   &leaf->keys, &leaf->nkeys,
+								   &leaf->rtkeys, &leaf->nrtkeys, NULL, NULL);
+		}
+	}
+	MemoryContextSwitchTo(oldcxt);
+	return sets;
+}
+
+/*
+ * Build every tree's set for this scan's Params, the last build's sets and
+ * the extra ones let go first; each tree's set is exact unless a source of
+ * it said otherwise (lion_source_exact()).
+ */
+void
+lion_probe_sets_build(LionProbeSets *sets)
+{
+	LionOrderedState *st = &sets->st;
+	int			i;
+
+	if (!sets->open)
+		elog(ERROR, "LionProbeJoin: its sets were never opened");
+	lo_set_reset(st);
+	memset(sets->sets, 0, sizeof(LionTidSet *) * Max(sets->nset, 1));
+	memset(sets->exact, 0, sizeof(bool) * Max(sets->nset, 1));
+	lo_leaf_keys(st);
+	for (i = 0; i < sets->ntree; i++)
+	{
+		st->exact = true;
+		sets->sets[i] = lo_build_node(st, sets->trees[i]);
+		sets->exact[i] = st->exact;
+		MemoryContextReset(st->buildcxt);
+	}
+	st->builds++;
+}
+
+/*
+ * Extra set `setno` from heap TIDs as lion_tid_to_code() codes them, in a
+ * datum sort of int8 performed already, ascending, repeats allowed: a
+ * container a key, made from its members' bits (lion_bits_to_container()).
+ * Built after lion_probe_sets_build(), in the same memory.
+ */
+void
+lion_probe_sets_put_codes(LionProbeSets *sets, int setno,
+						  struct Tuplesortstate *codes)
+{
+	LionOrderedState *st = &sets->st;
+	LionTidSet *set;
+	uint64	   *img;
+	LionContainer *out;
+	uint32		cur = 0;
+	bool		have = false;
+	Datum		d;
+	bool		isnull;
+
+	if (setno < sets->ntree || setno >= sets->nset)
+		elog(ERROR, "LionProbeJoin: no extra set %d", setno);
+	set = lo_set_new(st);
+	img = (uint64 *) MemoryContextAllocZero(st->buildcxt, LION_BITSET_BYTES);
+	out = (LionContainer *) MemoryContextAlloc(st->buildcxt,
+											   LION_CONTAINER_MAX_SIZE);
+	while (tuplesort_getdatum(codes, true, false, &d, &isnull, NULL))
+	{
+		uint64		code;
+		uint32		ckey;
+		uint32		lo;
+
+		CHECK_FOR_INTERRUPTS();
+		if (isnull)
+			continue;
+		code = (uint64) DatumGetInt64(d);
+		ckey = lion_code_ckey(code);
+		if (have && ckey != cur)
+		{
+			if (ckey < cur)
+				elog(ERROR, "LionProbeJoin: TID codes out of order");
+			lion_bits_to_container(img, cur, out);
+			lo_set_push(st, set, cur, out);
+			memset(img, 0, LION_BITSET_BYTES);
+		}
+		cur = ckey;
+		have = true;
+		lo = lion_code_lo(code);
+		img[lo >> 6] |= UINT64CONST(1) << (lo & 63);
+	}
+	if (have)
+	{
+		lion_bits_to_container(img, cur, out);
+		lo_set_push(st, set, cur, out);
+	}
+	sets->sets[setno] = set;
+	sets->exact[setno] = true;
+	MemoryContextReset(st->buildcxt);
+}
+
+/* Is tid a member of set setno?  A set not built has none. */
+bool
+lion_probe_sets_has(LionProbeSets *sets, int setno, ItemPointer tid)
+{
+	Assert(setno >= 0 && setno < sets->nset);
+	if (sets->sets[setno] == NULL)
+		return false;
+	return lo_set_find(sets->sets[setno], tid) >= 0;
+}
+
+/* Was set setno built exact, with nothing to recheck? */
+bool
+lion_probe_sets_exact(LionProbeSets *sets, int setno)
+{
+	Assert(setno >= 0 && setno < sets->nset);
+	return sets->exact[setno];
+}
+
+/*
+ * EXPLAIN ANALYZE: the last build's members and containers, over every set,
+ * the bytes it spilled, and the builds.
+ */
+void
+lion_probe_sets_counts(LionProbeSets *sets, uint64 *members, uint64 *ncont,
+					   Size *spilled, uint64 *builds)
+{
+	LionOrderedState *st = &sets->st;
+	int			i;
+
+	*members = 0;
+	*ncont = 0;
+	for (i = 0; i < sets->nset; i++)
+	{
+		LionTidSet *set = sets->sets[i];
+		int			k;
+
+		if (set == NULL)
+			continue;
+		*ncont += (uint64) set->n;
+		for (k = 0; k < set->n; k++)
+			*members += set->conts[k]->cardinality;
+	}
+	*spilled = (st->spilled && st->arena != NULL) ?
+		lion_arena_used(st->arena) : 0;
+	*builds = st->builds;
+}
+
+/* The end: the leaves' indexes closed, the sets' memory and file gone. */
+void
+lion_probe_sets_end(LionProbeSets *sets)
+{
+	LionOrderedState *st;
+	int			i;
+
+	if (sets == NULL)
+		return;
+	st = &sets->st;
+	for (i = 0; i < st->nleaves; i++)
+	{
+		if (st->leaves[i].index != NULL)
+			index_close(st->leaves[i].index, AccessShareLock);
+		st->leaves[i].index = NULL;
+	}
+	if (st->setcxt != NULL)
+		MemoryContextDelete(st->setcxt);
+	if (st->buildcxt != NULL)
+		MemoryContextDelete(st->buildcxt);
+	st->setcxt = NULL;
+	st->buildcxt = NULL;
+	memset(sets->sets, 0, sizeof(LionTidSet *) * Max(sets->nset, 1));
+	if (st->arena != NULL)
+	{
+		/* the mappings first: the file is unlinked as it is closed */
+		lion_arena_release(st->arena);
+		FileClose(st->arenafile);
+		st->arenafile = -1;
+		st->arena = NULL;
+	}
+	sets->open = false;
 }
 
 /* ---------------------------------------------------------------------

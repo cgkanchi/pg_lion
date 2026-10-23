@@ -4224,6 +4224,8 @@ extern bool lion_where_collect_range(LionCountScanState *st, uint32 lo,
 									 uint64 hi);
 
 /* lion_exec_cells.c */
+extern uint8 lion_cells_pred_truth(const LionCellsDimPriv *pv,
+								   const LionCellsPredPriv *pp, int out);
 extern void lion_begin_cells(LionCountScanState *st, const LionCountPriv *priv,
 							 EState *estate);
 extern void lion_cells_open(LionCountScanState *st);
@@ -4325,6 +4327,47 @@ extern const CustomPathMethods lion_semijoin_path_methods;
 extern const CustomPathMethods lion_ordered_path_methods;
 extern const CustomPathMethods lion_btree_path_methods;
 extern const CustomPathMethods lion_bm25_path_methods;
+
+/*
+ * lion_ordered.c: what LionProbeJoin (lion_probejoin.c, DESIGN.md §46) takes
+ * from the walk - the dimension's lion access, the prices of a set and of a
+ * descent, and the sets themselves as it runs.
+ */
+typedef struct LionProbeSets LionProbeSets;
+struct Tuplesortstate;
+
+extern bool lion_ordered_where_access(PlannerInfo *root, RelOptInfo *rel,
+									  Path **lion, List **lionqual);
+extern void lion_ordered_lion_tree(Path *lion, List **tree, List **leaves,
+								   List **quals);
+extern Cost lion_ordered_set_price(PlannerInfo *root, RelOptInfo *rel,
+								   Path *lion, double *members, double *bytes);
+extern Cost lion_ordered_spill_price(double bytes);
+extern double lion_ordered_set_bytes(double members, double pages);
+extern Cost lion_ordered_lookup_price(IndexPath *probe);
+extern bool lion_ordered_probe_price(PlannerInfo *root, RelOptInfo *rel,
+									 IndexOptInfo *idx, Relids outer,
+									 Path *lion, List *lionqual, double loops,
+									 Cost *perprobe, IndexPath **probe);
+extern LionProbeSets *lion_probe_sets_begin(PlanState *ps, List *trees,
+											List *leafoids, List *quals,
+											int nextra, bool open);
+extern void lion_probe_sets_build(LionProbeSets *sets);
+extern void lion_probe_sets_put_codes(LionProbeSets *sets, int setno,
+									  struct Tuplesortstate *codes);
+extern bool lion_probe_sets_has(LionProbeSets *sets, int setno,
+								ItemPointer tid);
+extern bool lion_probe_sets_exact(LionProbeSets *sets, int setno);
+extern void lion_probe_sets_counts(LionProbeSets *sets, uint64 *members,
+								   uint64 *ncont, Size *spilled,
+								   uint64 *builds);
+extern void lion_probe_sets_end(LionProbeSets *sets);
+
+/* lion_probejoin.c: LionProbeJoin (DESIGN.md §46) */
+extern const CustomPathMethods lion_probe_join_path_methods;
+extern void lion_try_probe_join(PlannerInfo *root, RelOptInfo *input_rel,
+								RelOptInfo *output_rel,
+								GroupPathExtraData *extra);
 
 /* lion_plan_hooks.c */
 extern bool		lion_enable_count_pushdown;
