@@ -434,7 +434,7 @@ EXPLAIN (COSTS OFF) SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = 
                      Dimension Lion Cond: (d.lvl = 3)
                      Dimension Lion Indexes: dim_lvl
                ->  Index Only Scan using flt_pkey on flt x
-                     Index Cond: (pk = $0)
+                     Index Cond: (pk = d.pk)
 (16 rows)
 
 RESET pg_lion.pushdown_margin;
