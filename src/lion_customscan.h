@@ -3926,6 +3926,19 @@ typedef struct LionUnits
 	Cost		nlcost;			/* the cheapest core path's cost */
 	Cost		nlcold;			/* a nested loop's cold reads, over that */
 	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
+	double		skew;			/* the rows a nested loop's probes of a
+								 * skewed key meet, as a factor over core's
+								 * (§39, "A skewed key's probes"), 1 for
+								 * none */
+	Cost		nlextra;		/* ... what the loop costs more at them */
+	Cost		nlouter;		/* ... and the cost of its outer side */
+	double		skewscale;		/* the loop's price at core's rows over its
+								 * price at those, its outer side apart,
+								 * once the path is priced at them
+								 * (lion_units_take_skew()) - or a count's
+								 * scan's, for its WHERE
+								 * (lion_skew_clauses_scale()); 1 until
+								 * then */
 } LionUnits;
 
 /*
@@ -3950,8 +3963,19 @@ extern void lion_units_unpin(void);
 extern RelOptInfo *lion_units_pin_move(RelOptInfo *rel);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern void lion_units_cold(LionUnits *u, Cost own, double reads);
+extern double lion_units_take_skew(LionUnits *u);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
+
+/* lion_plan_skew.c */
+extern double lion_skew_scan_factor(PlannerInfo *root, Path *scan);
+extern Cost lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
+								 double loops);
+extern double lion_skew_rel_scale(PlannerInfo *root, RelOptInfo *rel,
+								  Relids required_outer, double loops);
+extern double lion_skew_clauses_scale(PlannerInfo *root, RelOptInfo *rel,
+									  List *clauses);
+extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
@@ -4089,7 +4113,8 @@ extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 									   Var *fkvar);
 extern double lion_parallel_divisor(int workers);
 extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
-								  List *targets, Var *fkvar, int joinclause,
+								  List *targets, Var *fkvar, double fkskew,
+								  int joinclause,
 								  List *whereclauses, List *wherekinds,
 								  List *ors, double dimrows, double found,
 								  bool exists, double rowbytes, int workers,

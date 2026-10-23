@@ -1267,7 +1267,8 @@ lion_add_fkjoin_paths(PlannerInfo *root, RelOptInfo *rel,
 	 * of the grouped rel (DESIGN.md §39); the child is core's, priced by core.
 	 */
 	lion_units_for(root, output_rel, &units);
-	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar, joinclause,
+	run = lion_cost_fkjoin_path(root, rel, targets, fj->fkvar,
+								lion_units_take_skew(&units), joinclause,
 								whereclauses, wherekinds, ors, childrows,
 								childfound,
 								jointype != LION_JOIN_INNER ||
@@ -2524,6 +2525,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	Cost		run;
 	Cost		startrun;
 	LionUnits	units;
+	double		fkskew;
 	double		reads;
 	ListCell   *lc;
 
@@ -2596,7 +2598,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * child and the rows it emits are core's prices.
 	 */
 	lion_units_for(root, joinrel, &units);
-	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
+	fkskew = lion_units_take_skew(&units);
+	run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar, fkskew,
 								setup.joinclause, setup.whereclauses,
 								setup.wherekinds, ors, dimrows, dimrows, true,
 								rowbytes, 0, &collect, &walk, false, &reads,
@@ -2615,7 +2618,8 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 	perbatch = lion_join_batch_rows(rowbytes);
 	firstrows = (walk || partitioned) ? Min(perbatch, dimrows) : 1.0;
 	startrun = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
-									 setup.joinclause, setup.whereclauses,
+									 fkskew, setup.joinclause,
+									 setup.whereclauses,
 									 setup.wherekinds, ors, firstrows,
 									 firstrows, true, rowbytes, 0, &collect,
 									 &walk, true, NULL, NULL);
@@ -2663,14 +2667,16 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 												  lion_parallel_divisor(workers));
 
 			run = lion_cost_fkjoin_path(root, rel, setup.targets, fj->fkvar,
-										setup.joinclause, setup.whereclauses,
+										fkskew, setup.joinclause,
+										setup.whereclauses,
 										setup.wherekinds, ors, childrows,
 										childrows, true, rowbytes, workers,
 										&collect, &walk, false, NULL, NULL);
 			/* a participant's first batch, of its share of the child */
 			firstrows = (walk || partitioned) ? Min(perbatch, childrows) : 1.0;
 			startrun = lion_cost_fkjoin_path(root, rel, setup.targets,
-											 fj->fkvar, setup.joinclause,
+											 fj->fkvar, fkskew,
+											 setup.joinclause,
 											 setup.whereclauses,
 											 setup.wherekinds, ors, firstrows,
 											 firstrows, true, rowbytes,

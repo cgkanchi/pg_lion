@@ -82,11 +82,14 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 
 /*
  * The key counts of DESIGN.md §33 for ix's columns: the VALUE entries of each
- * scalar key column, and the rows under the first of them, as of now.
+ * scalar key column, the sum of the squares of their TIDs when the pass that
+ * counted them summed those (sumsq, or NULL), and the rows under the first of
+ * them, as of now.
  */
 void
 lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
-						 const uint64 *nvalues, uint64 rows)
+						 const uint64 *nvalues, const uint64 *sumsq,
+						 uint64 rows)
 {
 	int			i;
 
@@ -98,8 +101,25 @@ lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
 			continue;
 		nd->valid_cols |= ((uint32) 1) << i;
 		nd->ndistinct[i] = nvalues[i];
+		if (sumsq != NULL)
+			nd->sumsq[i] = sumsq[i];
 	}
 	nd->rows = rows;
+	nd->sumsq_rows = (sumsq != NULL) ? rows : 0;
+}
+
+/*
+ * The area of a meta page as it is there: the counts, and the sums of squares
+ * only where pd_lower covers them - a page written before they were kept has
+ * none, which is zero, "unknown" (lion.h).  The page carries the counts.
+ */
+static void
+lion_meta_copy_ndistinct(Page page, LionMetaNdistinct *nd)
+{
+	memset(nd, 0, sizeof(LionMetaNdistinct));
+	memcpy(nd, LionPageGetMetaNdistinct(page),
+		   LionMetaHasSumsq(page) ? sizeof(LionMetaNdistinct) :
+		   LION_META_COUNTS_SIZE);
 }
 
 /*
@@ -120,7 +140,8 @@ lion_meta_record_ndistinct(Page metapage, const LionMetaNdistinct *nd)
  * deletes plus bump (§37).  That number is the page's, never the caller's -
  * the counts lion_meta_fill_ndistinct() fills in carry a zero there - so that
  * no ANALYZE ever takes it back.  A meta page written before §33 gets the area
- * here: pd_lower moves to cover it, in generic mode as in rmgr mode, so that
+ * here, and one written before the sums of squares were kept the rest of it:
+ * pd_lower moves to cover it, in generic mode as in rmgr mode, so that
  * neither GenericXLog's diff - which leaves out, and at redo zeroes, what lies
  * between pd_lower and pd_upper - nor a full-page image drops it.  The record
  * carries the whole area, the count with it, and redo copies it, so a standby
@@ -162,7 +183,7 @@ lion_meta_put_ndistinct(Relation index, const LionMetaNdistinct *nd,
 	}
 	has = LionMetaHasNdistinct(page);
 	if (has)
-		memcpy(&cur, LionPageGetMetaNdistinct(page), sizeof(LionMetaNdistinct));
+		lion_meta_copy_ndistinct(page, &cur);
 	else
 		memset(&cur, 0, sizeof(LionMetaNdistinct));
 	put = (nd != NULL) ? *nd : cur;
@@ -235,7 +256,7 @@ lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 	if (LionMetaHasNdistinct(page) &&
 		((PageHeader) page)->pd_lower <= ((PageHeader) page)->pd_upper)
 	{
-		memcpy(nd, LionPageGetMetaNdistinct(page), sizeof(LionMetaNdistinct));
+		lion_meta_copy_ndistinct(page, nd);
 		have = true;
 	}
 	UnlockReleaseBuffer(buf);

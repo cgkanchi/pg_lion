@@ -315,7 +315,10 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
   with a lion index takes its number of distinct values from the index, and a table's row estimate
   can be corrected from one, even with `pg_lion.enable_count_pushdown` off. Results never change.
   Set `pg_lion.enable_index_ndistinct` and `pg_lion.enable_rows_correction` off to keep the
-  planner's own estimates.
+  planner's own estimates. On a skewed key column, Lion also prices a probe of a key the plan does
+  not know, and the core scan it competes with, at the rows such a key really meets. That can move
+  nested-loop and correlated-subquery plans. `pg_lion.enable_skew_estimate` off prices them as
+  before.
 
 The [full list](docs/REFERENCE.md#known-limitations) has the details.
 

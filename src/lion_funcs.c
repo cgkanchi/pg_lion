@@ -676,6 +676,78 @@ lion_index_stats(PG_FUNCTION_ARGS)
 }
 
 /* ---------------------------------------------------------------------
+ * lion_debug_key_skew()
+ * --------------------------------------------------------------------- */
+
+/*
+ * lion_debug_key_skew(idx regclass, OUT col int2, OUT rows int8,
+ * OUT ndistinct int8, OUT sumsq numeric): what the meta page of idx holds
+ * for each key column (DESIGN.md §33) - the rows the counts were taken over,
+ * the column's distinct keys and the sum of the squares of their TIDs, NULL
+ * where the page has none (a multi-key column, a page written before the
+ * sums were kept, a sum that saturated).  A test function like
+ * lion_debug_key_positions(): the tests create it from the library, and
+ * lion_index_stats(), whose columns are the extension's, keeps showing the
+ * count.  Superuser only.
+ */
+PG_FUNCTION_INFO_V1(lion_debug_key_skew);
+
+Datum
+lion_debug_key_skew(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	index;
+	LionIndexState *ix;
+	LionMetaNdistinct nd;
+	bool		have;
+	int			ncols;
+	int			i;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_key_skew() is for superusers")));
+	InitMaterializedSRF(fcinfo, 0);
+
+	index = lion_open_index(relid, AccessShareLock);
+	ix = lion_get_index_state(index);
+	ncols = ix->ncolumns;
+	have = lion_read_meta_ndistinct(index, &nd);
+	index_close(index, AccessShareLock);
+
+	for (i = 0; i < ncols; i++)
+	{
+		Datum		values[4];
+		bool		nulls[4] = {false, false, false, false};
+		bool		valid = have && i < LION_META_MAX_COLS &&
+			(nd.valid_cols & (((uint32) 1) << i)) != 0;
+
+		values[0] = Int16GetDatum((int16) (i + 1));
+		values[1] = Int64GetDatum((int64) nd.rows);
+		nulls[1] = !have;
+		if (valid)
+			values[2] = Int64GetDatum((int64) nd.ndistinct[i]);
+		else
+			nulls[2] = true;
+		if (valid && LionMetaSumsqKnown(&nd, i))
+		{
+			char		buf[32];
+
+			snprintf(buf, sizeof(buf), UINT64_FORMAT, nd.sumsq[i]);
+			values[3] = DirectFunctionCall3(numeric_in, CStringGetDatum(buf),
+											ObjectIdGetDatum(InvalidOid),
+											Int32GetDatum(-1));
+		}
+		else
+			nulls[3] = true;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+							 nulls);
+	}
+	return (Datum) 0;
+}
+
+/* ---------------------------------------------------------------------
  * lion_index_wal_mode()
  * --------------------------------------------------------------------- */
 

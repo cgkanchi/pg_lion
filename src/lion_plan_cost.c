@@ -1093,7 +1093,8 @@ typedef struct LionSetClause
 
 static void
 lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
-					 AttrNumber col, Node *clause, LionSetClause *sc)
+					 AttrNumber col, Node *clause, double skew,
+					 LionSetClause *sc)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	Node	   *bare = IsA(clause, RestrictInfo) ?
@@ -1111,6 +1112,13 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	memset(sc, 0, sizeof(*sc));
 	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
 							 NULL);
+
+	/*
+	 * A key the plan does not know, priced at the rows a probed key meets
+	 * where the caller says so (DESIGN.md §33, "The rows of a probed key").
+	 */
+	if (skew > 1.0)
+		sel = Min(sel * skew, 1.0);
 	sc->sel = sel;
 
 	/*
@@ -1420,7 +1428,8 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 	for (i = 0; i < n; i++)
 	{
-		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], &sc[i]);
+		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], 1.0,
+							 &sc[i]);
 
 		lookup += sc[i].lookup;
 		out->leafpages += sc[i].lookuppages;
@@ -1577,7 +1586,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		return 0.0;
 	isnull = (NullTest *) copyObject(bare);
 	isnull->nulltesttype = IS_NULL;
-	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, &sc);
+	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, 1.0, &sc);
 
 	/* the lookup, whichever way it is answered */
 	cost = sc.randompages * random_page_cost + sc.descent;
@@ -3379,15 +3388,25 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 	Selectivity sel;
 	double		nkeys;
 	double		qkeys = 1.0;
+	double		skew;
 
 	/*
 	 * The clause's sets, priced as every AND of them is priced
 	 * (lion_cost_set_clause()): its lookups - a directory leaf and a
 	 * descent, or an IN list's leaves in key order and a search per value
 	 * - are charged here, and what a walk of them reads once the driver
-	 * is known, below.
+	 * is known, below.  A key the plan does not know - a Param, a
+	 * correlated subquery's outer row - is priced at the rows a probed key
+	 * meets on a skewed column (DESIGN.md §33, "The rows of a probed key"),
+	 * where the relation's own scan of it is priced at them too, and the
+	 * count's price put back into core's units by that scan's two prices
+	 * (lion_count_path_add(); §39, "A skewed key's probes").
 	 */
-	lion_cost_set_clause(c->root, c->rel, idx, col, clause, sc);
+	skew = lion_skew_clauses_factor(c->root, c->rel,
+									list_make1(lion_vcol_unvar(clause)));
+	if (skew > 1.0 && lion_skew_rel_scale(c->root, c->rel, NULL, 1.0) >= 1.0)
+		skew = 1.0;
+	lion_cost_set_clause(c->root, c->rel, idx, col, clause, skew, sc);
 	sel = sc->sel;
 	nkeys = sc->nkeys;
 	c->clauseindex[c->ci] = idx;
