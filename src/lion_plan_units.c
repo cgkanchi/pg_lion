@@ -858,8 +858,8 @@ lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath, double loops)
  * random_page_cost falling to seq_page_cost with the square root of the share
  * of the heap one scan reads; and the index pages its bitmap reads
  * (lion_bitmap_index_reads()).  Down through every node that passes rows up
- * and both sides of every join; a custom path, lion's or another's, reads
- * nothing of core's.
+ * and both sides of every join, and into a subquery under its own root; a
+ * custom path, lion's or another's, reads nothing of core's.
  */
 static void
 lion_bitmap_reads(PlannerInfo *root, Path *path, double loops,
@@ -936,6 +936,23 @@ lion_bitmap_reads(PlannerInfo *root, Path *path, double loops,
 		case T_MaterialPath:
 			lion_bitmap_reads(root, lion_path_input(path), 1.0, r);
 			return;
+		case T_SubqueryScanPath:
+			{
+				/*
+				 * A subquery's paths were planned under its own root: their
+				 * Vars are its range table's, and estimate_num_groups() or
+				 * index_pages_fetched() asked under this one would read
+				 * another query's (a Memoize's keys, its tables' pages).
+				 */
+				RelOptInfo *subrel = path->parent;
+
+				if (subrel == NULL || subrel->subroot == NULL)
+					return;
+				lion_bitmap_reads(subrel->subroot,
+								  ((SubqueryScanPath *) path)->subpath, loops,
+								  r);
+				return;
+			}
 		case T_MemoizePath:
 			{
 				MemoizePath *mp = (MemoizePath *) path;
