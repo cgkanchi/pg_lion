@@ -375,7 +375,7 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 
 	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, false,
 							&iocols, &factstartup, &facttotal);
-	lion_ordered_set_info(root, j->dim, dimlion, true, &ds);
+	lion_ordered_set_info(root, j->dim, dimlion, &ds);
 	oj_cost(root, joinrel, j, &ds, factstartup, facttotal, factrows, &rows,
 			&probes, &share, &startup, &total);
 

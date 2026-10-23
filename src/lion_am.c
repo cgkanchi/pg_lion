@@ -341,6 +341,22 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §46, "The dimension by probe": whether the planner may group
+	 * a join of a table to a dimension by its primary key with LionProbeJoin
+	 * - the dimension's key looked up for each row, its WHERE and the GROUP
+	 * BY's predicates answered from sets of its lion indexes.
+	 * pg_lion.enable_count_pushdown switches it off as well.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_probe_join",
+							 "Enables lion's join of a table to a dimension by the dimension's primary key, its filters and grouped predicates answered from lion indexes.",
+							 "Off, such a join is left to the planner's own join methods; pg_lion.enable_count_pushdown = off turns it off too.",
+							 &lion_enable_probe_join,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §29.11, "Plain scans switched off": whether the planner may
 	 * scan a lion index with a plain or an index-only scan.  Off, it plans
 	 * lion indexes as it plans GIN's, for bitmap scans only, where
@@ -559,6 +575,7 @@ _PG_init(void)
 	 * DESIGN.md §27 - before it has planned anything of its own.
 	 */
 	lion_count_scan_register();
+	lion_probe_join_register();
 
 	lion_prev_create_upper_paths_hook = create_upper_paths_hook;
 	create_upper_paths_hook = lion_create_upper_paths;

@@ -23339,7 +23339,9 @@ Which paths: the index-only covering walks, LionOrdered's and LionBtreeScan's, s
 the count of one relation, of its WHERE or its groups' sets, with its heap rechecks and residual
 clauses; and the FK-side join, where its competitor is a hash join over a bitmap heap scan rather
 than a loop. Not a walk in heap mode, which fetches each member's tuple as it meets it, a
-synchronous read the stream's price would under-charge, nor §40.10's probes.
+synchronous read the stream's price would under-charge, nor §40.10's probes, nor LionProbeJoin
+(§46), which reads the fact through core's own path as the competitor's scans of it do and the
+dimension a descent at a time; it is priced against a loop's cold reads alone.
 
 **The cap** (`pg_lion.cold_max_discount`, 2 by default, 1 to 10) is `LION_COLD_MAX_DISCOUNT`, which
 was 1.5, made a setting, the loop's and the bitmap's alike. It is the warm floor: where the cache
@@ -28352,3 +28354,286 @@ predicate it does not imply declines.
   - and a positive one: a partial index that leaves one source or none after the restrictions go
   is counted serially, against the whole index's parallel plan (45.6).
 - **Estimates** still come from the table's statistics (45.3).
+
+## 46. The dimension by probe (`LionProbeJoin`, lion_probejoin.c; 2026-10-23)
+
+The shape is
+
+    SELECT CASE WHEN d.region IN ('north', 'east') THEN 'ne'
+                WHEN d.tier = 1 THEN 't1' ELSE 'other' END AS k,
+           f.channel, count(*)
+      FROM fact f JOIN dim d ON f.dim_id = d.id
+     WHERE d.active AND d.tier < 4
+       AND NOT EXISTS (SELECT 1 FROM blocked b WHERE b.dim_id = f.dim_id)
+     GROUP BY 1, 2
+
+- a GROUP BY over a join of a fact table to a dimension by the dimension's primary key, its keys
+CASE or boolean expressions over the dimension's lion-indexed columns, perhaps beside the fact's
+own columns; `count(*)`; a WHERE on the dimension its lion indexes answer; perhaps a NOT EXISTS over
+a small table keyed by the dimension's key; and no lion index on the fact. Nothing of lion's so far
+took it: the FK-side join (§27) reads the fact's rows from a lion index on its key; a count by
+cells (§10, "Counts by cells") counts one table; the nested loop's probe (§40.10) needs a B-tree
+that covers what the query reads of the dimension, and the group keys read the lion-indexed
+columns themselves. Core's plan is a nested loop over the fact's rows into the dimension's primary
+key - an Index Scan a fact row, the dimension row fetched from the heap for the Filter and for the
+group keys' columns - and on a production dimension of 87 GB that was two million random heap
+pages, 140 s cold. A hash join reads the dimension's WHERE whole, which is most of that heap.
+
+    HashAggregate
+      Group Key: CASE WHEN ((d.region = ANY ('{north,east}'::text[]))) THEN 'ne'::text WHEN ((d.tier = 1)) THEN 't1'::text ELSE 'other'::text END, f.channel
+      ->  Custom Scan (LionProbeJoin) on dim d
+            Probe Index: dim_pkey
+            Probe Cond: (d.id = f.dim_id)
+            Lion Cond: (d.active AND (d.tier < 4))
+            Lion Indexes: dim_active, dim_region_tier
+            Cell Predicates: (d.region = ANY ('{north,east}'::text[])), (d.tier = 1)
+            Cell Indexes: dim_region_tier
+            Anti Join Cond: (b.dim_id = f.dim_id)
+            ->  Seq Scan on fact f
+            ->  Seq Scan on blocked b
+
+`LionProbeJoin` takes the join and the group keys' predicates; core's Agg does the rest. For each
+fact row, read from core's own path of the fact, it looks the key up in the dimension's primary
+key, tests the TID found against lion sets of the dimension built once before the first row - the
+WHERE's, and the LABELS that give each column the predicates read its outcome - asks the visibility
+map, and emits the fact's columns and each predicate's truth. The heap is read for a page the map
+does not call all-visible, and for every row found when the WHERE's set is inexact, to recheck the
+WHERE on the heap tuple (`Rows Removed by Lion Recheck`). The group keys are computed above the
+node from those truths, `setrefs.c` matching each predicate inside them to the node's column for it
+(`LION_TL_CELLPRED`, as §10's cells are matched).
+
+- **What qualifies** (`lion_fkjoin_recognize_probe()`, `pj_try_shape()`). At the GROUP BY of a
+  join rel (`lion_create_upper_paths()`, `UPPERREL_GROUP_AGG`, no grouping sets, no set-returning
+  target): an inner join of exactly two tables, either way round, joined by exactly one clause, a
+  strict equality of plain Vars whose dimension side is the one column of a unique B-tree
+  (`lion_column_unique_index()`) and whose operator is an equality of that B-tree's family (the
+  probe's operator is the family's member for the fact column's type); no placeholder, no
+  pseudoconstant clause, no LATERAL reference. The dimension is a plain heap table, not a parent,
+  not the query's result relation, with no security quals or barrier clauses and no TABLESAMPLE,
+  and every one of its restriction clauses is answered by a lion access with nothing left to a
+  filter (`lion_ordered_where_access()`, below), or it has none. The grouping input target - what
+  the node emits - holds expressions each of the fact's columns alone or of the dimension's alone,
+  none volatile, with no SubPlan and no placeholder; the dimension's are functions of predicates
+  §10's analysis decides (`lion_cells_analyze()`: equalities, `IN` lists, null tests, booleans,
+  `<>`, and `@>`, `&&` or `@@` of a multi-key column, with constants, each of a column with a
+  non-partial lion index). A dimension column outside a predicate - grouped by itself, under a
+  CASE's THEN, an aggregate's argument - keeps the node out: its value is not in any set. The
+  fact's path returns plain Vars, the join key among them. There must be a set to build: a WHERE on
+  the dimension or a predicate, or core's nested loop already is the plan. The fact needs no lion
+  index; where it has one the FK-side join is offered too, and the price chooses.
+- **The NOT EXISTS** (`lion_probe_anti()`). At most one anti join, from a sublink, whose syntactic
+  lefthand is the two tables and whose righthand is the rest of the query: a small inner side, one
+  table or a join of several, each passing §27's member checks, unparameterized, joined by exactly
+  one clause - a strict equality, of the join's collation, between a Var of the inner side's target
+  and the fact's key or the dimension's (`b.dim_id = f.dim_id` or `= d.id`) - whose operator is an
+  equality of the probe B-tree's family for the inner column's type. Its other clauses are the
+  inner side's own, in its path.
+- **The WHERE's set** (`lion_ordered_where_access()`, lion_ordered.c). The cheapest of the lion
+  accesses core builds for the dimension's restriction clauses over its lion indexes alone (§30.2,
+  `lo_lion_accesses()`) that leaves nothing to a filter (`lo_residual()`); and, where none does, an
+  AND of one access per clause (`lo_where_and()`): core's own AND (`choose_bitmap_and()`) leaves out
+  a leaf that selects too little to pay for its lookups in a bitmap scan - `active` of two rows in
+  three - which the probe's set must answer all the same, or read the heap for it. Each clause the
+  leaves before it do not answer takes the cheapest access core builds for that clause alone. The
+  set is built as §30.4 builds a walk's (`lo_build_node()`), exact or not: an inexact one - a
+  condition lion can only bound - is rechecked on the heap tuple, fetched for that, with the
+  original qual (`Rows Removed by Lion Recheck`). An access with a lossy index clause is not a
+  candidate, in either path (`lo_where_exact()`): the range core derives from a LIKE prefix over a
+  column of "C" collation (`code LIKE 'k1%7'` as `code >= 'k1' AND code < 'k2'`) still names the
+  original clause, so `lo_residual()` counts it answered, while the range's set holds rows the
+  pattern rejects and calls itself exact - nothing would recheck them, and the node counted them
+  (2026-10-23 review). Every LIKE is lossy in core, an exact pattern too, so a LIKE on the dimension
+  leaves the node unoffered; the range written out is the clause itself, and the node takes it.
+- **The labels** (`pj_labels()`). §10's analysis gives each column the predicates read its
+  OUTCOMES - a scalar column's values grouped by the truths they give every predicate, outcome 0
+  any other value's, and NULL's; a multi-key column's leaves true of a row as bits, and NULL past
+  them - and each predicate its truth in every outcome. A scalar column gets a set for each outcome
+  but 0: its values' equality, `= ANY` of an array where it has several (an OR of equalities where
+  their type has none or they are of two types), ORed with `IS NULL` where NULL's outcome is it; a
+  row in none of them has outcome 0. A multi-key column gets a set for each leaf - the leaf's own
+  clause - and one of `IS NULL`; its outcome is the mask of the leaves whose sets hold the row, or
+  NULL's. Each is an IndexPath made for the clause (`create_index_path()` over a made-up
+  IndexClause), priced as lion prices a set (`lion_ordered_set_price()`), and built as the WHERE's
+  is. A label must be exact - §10 takes only predicates a posting set decides - and the node stops
+  with an error if one is not. The truths are §10's (`lion_cells_pred_truth()`, the one function
+  for both): true, false or NULL, by SQL's rules.
+- **A fact row** (`pj_next()`). Its key is read from the fact's slot; a NULL finds nothing, as the
+  strict equality finds nothing. Otherwise the B-tree is descended to it (`index_rescan()` of one
+  scan opened for the whole run, the probe's scan key the join operator's procedure) and each TID
+  found, in order, is tested: in the WHERE's set, not in the anti join's, and visible - by the
+  visibility map, tested under the leaf's pin (the scan asks for index tuples, so nbtree keeps it,
+  §40.5), or by the heap, whose fetch follows the HOT chain from its root to the version the
+  snapshot sees (`index_fetch_heap()`; on 20 `table_fetch_tid()` and
+  `table_tuple_fetch_row_version()`). The first TID that passes is the row's dimension row: the key
+  is unique, so no other entry of it holds a version the snapshot sees. The fact's columns are
+  copied into the scan tuple, each column's outcome found from its labels, and each predicate's
+  truth from its outcome. A row taken without a heap visit takes its heap page's predicate lock, as
+  an Index Only Scan does.
+- **Correctness.** §40.5's argument, per probe: the B-tree's entries and the sets' members are both
+  HOT chains' root TIDs; a version reached from a root has the indexed values of every version of
+  its chain, a HOT update changing none; a TID's entries are removed from every index before VACUUM
+  lets its line pointer be reused, so an entry and a member of one TID describe the same chain; a
+  page the map calls all-visible holds only versions every snapshot sees; and the sets are built
+  after the query's snapshot, from entries that version already had. The anti join's set is every
+  TID the B-tree holds for the inner side's keys, visible or not: a fact row's probe meets a TID
+  `t` there only where an inner key `k` has the entry `(k, t)` beside the fact row's `(fk, t)`, so
+  that `k = fk` by the family's equality and the row has a match; and where the dimension row has an
+  inner row with an equal key, that key's lookup found its TID. Inner keys that are NULL find
+  nothing, and a fact row with no dimension row is not joined anyway.
+- **The anti join's set** (`pj_build_anti()`). Built after the other sets, before the first fact
+  row: the inner side's child read whole, each non-NULL key looked up in the same B-tree under the
+  query's snapshot, and every TID found sorted (a datum `tuplesort` of the TIDs' codes, within
+  `work_mem` and spilling past it) into a set (`lion_probe_sets_put_codes()`), a container a
+  container key. `Anti Join Keys` counts the inner rows and the TIDs.
+- **The sets' memory.** lion_ordered.c's: a `LionProbeSets` lends the sets a `LionOrderedState`'s
+  allocator, charged against `hash_mem` and spilling past it to the arena's temporary file (§30.4,
+  "Spilling") - never refused for its size. `Lion Sets` counts them, their members and containers,
+  the bytes spilled, and the builds.
+- **Cost** (`pj_make_path()`). The children are core's, at core's price: the fact's cheapest total
+  path (or its cheapest partial path), and the anti join's inner side's. In the competitor's units
+  (§39), with `lion_units_cold()`'s discount: the sets' builds, each priced as lion prices a set -
+  its lookups less the excess of §40.10's container price, a `cpu_operator_cost` a container key,
+  the copy of its pieces - and their spill (`lion_ordered_set_price()`,
+  `lion_ordered_spill_price()`), started before the first row; the anti join's keys, each a lookup
+  (`lion_ordered_lookup_price()`: the probe IndexPath's `indextotalcost` and an entry's probe) and a
+  sort of their TIDs; for each fact row a scan of the probe as §40.10 prices it
+  (`lion_ordered_probe_price()`: core's parameterized IndexPath of the B-tree, its descent and
+  pages amortized over the loops, an entry's probe of the WHERE's set, a member's visibility-map
+  test, the heap pages of the members on pages not all-visible through Mackert and Lohman, and of
+  every member where the WHERE's set is inexact, all-visible or not, as `lo_cost()`'s heap recheck
+  fetches each for the recheck), with `loops` the fact's rows; for each member - the share of the
+  dimension's rows the WHERE keeps - a `cpu_operator_cost` for the anti join's test, each label's
+  and each predicate's truth; and the emitted rows' `cpu_tuple_cost` and target. The cold discount
+  weighs the pages the node reads - a B-tree leaf a probe (`index_pages_fetched()` over the loops),
+  the members' heap pages not all-visible (every member's where the WHERE's set is inexact, as the
+  probe's price fetches them; `lion_ordered_set_exact()`), and the lion indexes' pages the builds
+  read - against the competitor's, which is a nested loop's where core's cheapest plan is one (§39,
+  "A nested loop's cold reads"): the node's reason to be is the heap page each of the loop's probes
+  reads. It divides the price by at most `pg_lion.cold_max_discount`. Never a bitmap heap scan's
+  cold reads (§39, "A bitmap heap scan's cold reads"): the node reads the fact through core's own
+  path, as the competitor's scans of it do, and the dimension a descent at a time, synchronous
+  reads the stream's price would under-charge. No knob beyond the switch.
+- **Above the node** (`pj_add_aggs()`). The Agg core would build over the join: hashed where the
+  GROUP BY can be hashed (`GROUPING_CAN_USE_HASH`, no ordered aggregate), a sort and a sorted Agg
+  otherwise, a plain one without a GROUP BY (sorted for a GROUP BY of constants alone), the HAVING
+  its qual. The node's rows are the join's estimate, `input_rel->rows`.
+- **Parallel** (`pj_add_aggs()`). Where the fact has a partial path, the aggregates can be split
+  and every rel may be read in parallel: Finalize HashAggregate (or a plain one), Gather, Partial
+  HashAggregate over the node over the fact's partial path. The node is parallel-safe, never
+  parallel-aware: each participant reads its share of the fact's rows and builds the sets for
+  itself - core gives a CustomScan that is not parallel-aware no shared memory, so §40.9's shared
+  set has no place to live - and reads the anti join's inner side whole, through its cheapest
+  parallel-safe path (never the Gather the serial node may read). The price divides the rows
+  (`lion_parallel_divisor()`), not the builds. A sorted GROUP BY stays serial. EXPLAIN ANALYZE's
+  counters are the leader's.
+- **Params and rescans** (`pj_rescan()`). The sets' leaves' quals are `custom_exprs`, their keys a
+  CaseTestExpr that `lo_fix_qual()` replaces with the index column, so `setrefs.c` fixes their
+  Params; a generic plan's `$1` or a correlated subquery's outer reference in the WHERE is a run-time
+  key. A rescan reads the fact's child again, handing it the changed Params core hands only to a
+  plan's outer and inner children, and keeps the sets unless a Param of their quals, or of the anti
+  join's inner side, changed (`N builds`). A predicate takes constants only (§10).
+- **The plan** (`pj_plan_path()`). A CustomScan whose `scanrelid` is the dimension, so that core
+  opens it and EXPLAIN names it, with a `custom_scan_tlist` of the fact's columns, the predicates
+  and three resjunk entries EXPLAIN deparses - the probe's clause key first, the WHERE's qual, the
+  anti join's clause - never filled, there so that `setrefs.c` moves their Vars with the range
+  table. Its children are the fact's plan and the anti join's inner plan (`custom_plans`). The
+  recheck qual, the dimension's Vars as INDEX_VAR, is in `custom_private` and initialised with no
+  parent, so that its Vars are read from the heap tuple's slot it is given, deformed as that slot's
+  type is, rather than from the virtual scan slot whose type the parent fixes; the planner took no
+  WHERE with a SubPlan, which would need one.
+- **EXPLAIN** (`pj_explain()`). `Probe Index`, `Probe Cond`, `Lion Cond` and `Lion Indexes` (the
+  WHERE's), `Cell Predicates` and `Cell Indexes` (the labels'), `Anti Join Cond`; under ANALYZE
+  `Probes`, `Null Keys`, `Rows Removed by Lion Cond`, `Rows Removed by Anti Join`, `Heap TIDs
+  Skipped via VM`, `Heap TIDs Rechecked` (the heap fetches), `Rows Removed by Visibility`, `Rows
+  Removed by Lion Recheck` (an inexact WHERE), `Lion Sets: S, M members in C containers[,
+  rechecked][, spilled N kB][, N builds]` and `Anti Join Keys: R rows, T TIDs`. Group keys show the
+  matched predicates with an extra pair of parentheses, as §10's do.
+- **Settings.** `pg_lion.enable_probe_join` (on) offers the node; `pg_lion.enable_count_pushdown =
+  off`, which keeps lion's upper-path hook out, takes it away too. `enable_indexscan` and
+  `enable_indexonlyscan` disable it as they disable core's index-only scans
+  (`lion_path_core_switches()`, `LION_CORE_INDEXONLY`): it answers the dimension from its indexes
+  and has no form that reads the rows. The join methods' settings do not touch it - it is an upper
+  path, not a join path - so the regression tests disable them to have it be the plan where core's
+  would win. btreescan_parallel.sql's FK-side section and fkjoin_semi.sql switch it off, as they
+  switch the other joins off: the plans they pin are other nodes', and on their tables the node is
+  priced the cheaper. On the first - 6,070 of 60,000 fact rows under a 12,000-row dimension - its
+  estimate is 2,600 against the FK-side join's 3,228 (1,305 against 1,540 in parallel), yet it runs
+  slower warm, 5.6 ms against 4.3 (7.7 against 6.2 in parallel; PG16, the median of seven runs):
+  a mischoice of about a millisecond, 5,913 probes into a 12,000-row dimension. On the second, a
+  fact filter with no entry (`x = 77`), it is 16.7 against 138, and both run in hundredths of a
+  millisecond.
+
+**Declined, and why.**
+
+- *A join path* (`set_join_pathlist_hook`) emitting the dimension's columns: those are what the
+  node never reads. Its rows are useful only to the expressions over its predicates, which only the
+  grouping target holds; a join path's target is the join rel's, its Vars.
+- *A dimension column outside a predicate* from the probe B-tree's INCLUDE columns: §40.10's probe
+  does that, as a join's inner side, where the B-tree covers the query; here the columns are the
+  lion-indexed ones, which the primary key does not hold.
+- *Sets shared among parallel participants*, for the reason §40.10 gives.
+- *Refusing a set past `hash_mem`*: a set spills, as every lion set does, and its price says so.
+
+**Not done.**
+
+- An outer or semi join (the inner join's semantics are the node's: no dimension row, no row), a
+  dimension that is a join, a partitioned dimension, more than one dimension.
+- A predicate with a Param: §10's outcomes are of constants.
+- Labels shared with the WHERE's leaves where the two read the same index: each set is built for
+  itself.
+- A per-key cache of the outcome (a Memoize's): the fact rows' keys repeat, and each repetition is
+  a descent and a set test, a few microseconds; a cache keyed by the fact key would save the
+  descent but not the visibility test of a page the map does not call all-visible.
+- The spill of a set is not exercised by the regression test, whose sets stay far below 64 kB;
+  it is lion_ordered.c's, which ordered.sql spills.
+
+**Tests.** test/sql/probejoin.sql: a 6,000-row dimension with lion indexes on `(region, tier)`, a
+bool, an enum and an int array, every 23rd region, 31st bool and 29th array NULL; a 30,000-row
+fact table with no lion index, every 50th key NULL and every 47th past the dimension's; a 120-row
+inner side of keys, keys of no row and NULLs. Every query is run through the node (the join
+methods off) and through core's plan (the node and lion's pushdowns off, sequential scans only)
+and the answers compared as multisets: a CASE over two columns beside a fact column; booleans
+with NULL truths; a WHERE alone, no GROUP BY at all; arithmetic over CASEs with the fact's own
+WHERE and a fact predicate; an enum, a multi-key column and a HAVING; a sum and a max of fact
+columns; a WHERE lion can only bound (`tags <@ ...`), its set inexact and every member rechecked
+on the heap tuple (`Rows Removed by Lion Recheck`); the anti join on the fact's key and on the dimension's, with a filter of its own; a
+generic plan's Param in the WHERE; a correlated subquery rebuilding the sets for each value
+(`5 builds`); pages not all-visible - HOT and non-HOT updates, deletes and inserts on half of the
+table, unvacuumed, then vacuumed (`Heap TIDs Rechecked: 0`); the parallel form (Finalize
+HashAggregate, Gather, Partial HashAggregate, the node over a Parallel Seq Scan and the inner side
+whole); the plan chosen on price with nothing disabled, an 80,000-row dimension of wide rows
+under 3,000 fact rows; and the node not offered - a dimension column grouped by, under a THEN, in
+an aggregate; a predicate of a column with no lion index, or one no posting set decides
+(`tier >= 4`), or of both tables; a WHERE no lion index answers; a LIKE lion answers only by its
+prefix's range, alone or beside an exact clause, against the range written out, which the node
+takes; a LEFT JOIN; a join on a
+column with no unique index; no set to build; the switch off. EXPLAIN is printed with its
+counters where a run leaves them the same and as `> 0` where an earlier run's killed index entries
+change them.
+
+**Measured** (2026-10-23; PostgreSQL 16, the dev cluster - a VM of four cores shared with other
+work, `shared_buffers` 128 MB, the tables in the OS cache: warm; EXPLAIN (ANALYZE, TIMING OFF),
+three runs each). A 2,000,000-row dimension (a 422 MB heap, a 43 MB primary key) with lion indexes
+on a five-value text column, a five-value int, a bool and a four-value enum; a 1,000,000-row fact
+table with no lion index, its keys spread over the dimension; 2,000 keys in the NOT EXISTS. The
+query is the shape above, `WHERE d.active AND d.mood IN (three of four)` keeping half the
+dimension, with `f.id <= n` choosing the fact rows:
+
+| fact rows | planned | its time | core's plan, the switch off | core's nested loop |
+|---|---|---|---|---|
+| 1,000,000 | core's hash join | 1.06 - 1.48 s | (the same) | 4.5 - 5.1 s |
+| 1,000,000 | the node, the joins off | 2.61 - 2.92 s | | |
+| 300,000 | the node | 1.04 - 1.18 s | hash join, 0.67 - 0.68 s | |
+| 100,000 | the node | 0.34 - 0.39 s | hash join, 0.61 - 0.66 s | |
+| 10 | the node, the joins off | 48 - 62 ms | | |
+
+The ten-row line is the fixed part, the sets' builds - five sets, 2.2 million members in 3,303
+containers - and the fact's scan; a probe then costs 2.6 to 3.5 us, the descent most of it, as
+§40.10 measured its own. Warm, the node beats core's nested loop by 1.7 times and core's hash join
+where the fact rows are few against the dimension's WHERE; the descent's price, core's own for an
+index scan's, makes it some 1.7 times too cheap against the hash join's in a warm cache, so that
+at 300,000 rows - 15% of the dimension - it is chosen and runs 1.6 times the hash join's time. Cold
+is not measured; the pages each plan reads say it goes the other way: the hash join reads the
+WHERE's heap pages, half of the 422 MB here and most of an 87 GB heap, and the nested loop a random
+heap page a fact row, where the node reads the primary key's leaves and the lion indexes and no
+heap page of an all-visible dimension.
