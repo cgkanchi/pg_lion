@@ -447,6 +447,9 @@ RESET enable_nestloop;
 --     and at 1, a heap page costing what an index page does.
 SET pg_lion.enable_count_pushdown = on;
 SET pg_lion.enable_semijoin = off;
+-- ... and the dimension by probe (DESIGN.md §46), which would look the
+-- fact's rows up in bpd's primary key instead: probejoin.sql tests it.
+SET pg_lion.enable_probe_join = off;
 CREATE TABLE bpd (
 	id int PRIMARY KEY,
 	attr int NOT NULL,
@@ -563,6 +566,7 @@ SELECT bp_fk('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.regio
 SELECT bp_fk('SELECT count(*) FROM bpd d WHERE d.region = 1 AND NOT EXISTS (SELECT 1 FROM bpf f WHERE f.fk = d.id AND f.x = 3)');
 SELECT bp_fk_heap('SELECT count(*) FROM bpf f JOIN bpd d ON d.id = f.fk WHERE d.region = 1 AND f.x = 3');
 RESET pg_lion.enable_semijoin;
+RESET pg_lion.enable_probe_join;
 SET pg_lion.enable_count_pushdown = off;
 DROP TABLE bpf, bpd;
 DROP TABLE bp;

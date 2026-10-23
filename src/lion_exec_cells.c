@@ -578,13 +578,15 @@ lion_cells_run_ranged(LionCountScanState *st)
 	st->wcollected = false;
 }
 
-/* The truth of predicate p in outcome `out` of its dimension */
-static uint8
-lion_cells_truth_in(const LionCellsRun *cr, int p, int out)
+/*
+ * The truth of predicate pp in outcome `out` of its dimension pv: the
+ * planner's table, a multi-key leaf's bit, or a null test's - what
+ * LionProbeJoin computes a row's truths with too (DESIGN.md §46).
+ */
+uint8
+lion_cells_pred_truth(const LionCellsDimPriv *pv, const LionCellsPredPriv *pp,
+					  int out)
 {
-	const LionCellsPredPriv *pp = &cr->pred[p];
-	const LionCellsDimPriv *pv = &cr->dimpriv[pp->dim];
-
 	switch (pp->kind)
 	{
 		case LION_CELLPRED_TABLE:
@@ -598,8 +600,17 @@ lion_cells_truth_in(const LionCellsRun *cr, int p, int out)
 		case LION_CELLPRED_NULLS:
 			return pp->truth[(out == pv->nullout) ? 1 : 0];
 	}
-	elog(ERROR, "LionCount: a cells predicate of kind %d", pp->kind);
+	elog(ERROR, "lion: a cells predicate of kind %d", pp->kind);
 	return LION_TRUTH_NULL;		/* keep the compiler quiet */
+}
+
+/* The truth of predicate p in outcome `out` of its dimension */
+static uint8
+lion_cells_truth_in(const LionCellsRun *cr, int p, int out)
+{
+	const LionCellsPredPriv *pp = &cr->pred[p];
+
+	return lion_cells_pred_truth(&cr->dimpriv[pp->dim], pp, out);
 }
 
 /* ... and in the cell whose outcomes are cr->outs */

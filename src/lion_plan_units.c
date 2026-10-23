@@ -71,7 +71,8 @@ lion_custom_is_lion(const CustomPath *cp)
 		m == &lion_join_agg_path_methods ||
 		m == &lion_ordered_path_methods ||
 		m == &lion_btree_path_methods ||
-		m == &lion_bm25_path_methods;
+		m == &lion_bm25_path_methods ||
+		m == &lion_probe_join_path_methods;
 }
 
 /*
