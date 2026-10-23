@@ -1299,9 +1299,9 @@ trees' leaves and one page a level above them, the tree's members counted - betw
 the entry, at most eight times (`lion_verify_postree_count()`). A pass that found no difference
 settles it, and so does one that read every page at the replay position it began at, which reports
 what it found; only when none does is the tree kept without the comparison, with a WARNING whose
-hint is to pause replay, which leaves every page as it is. Until the 2026-10-23 review a walk that
-found a difference was walked again, whole, and after three the WARNING came: one standby check in
-nine under a steady replay gave it (R-S4). `test/recovery/run.sh` phase 2 damages a position leaf in
+hint is to pause replay, which leaves every page as it is. Walking a set that found a difference
+again, whole, and warning after three such walks would give the WARNING to one standby check in
+nine under a steady replay (R-S4). `test/recovery/run.sh` phase 2 damages a position leaf in
 the standby's copy of an index and has the standby report it.
 
 **Candidates.** What is left - a downlink to a page the lower walk did not reach, a live page nothing
@@ -1439,7 +1439,7 @@ the replay position it began at - a difference is damage then - or agrees with a
 the same (`lion_verify_set_count()`). A pass is a fraction of a walk, and far likelier to read one
 point under a steady replay, which changes the set's last leaf and its entry with every row; only
 when eight passes in a row do not settle them are the totals left uncompared, with a WARNING whose
-hint is to pause replay (until the 2026-10-23 review that came after three whole walks, R-S4). The
+hint is to pause replay (three whole walks in its place would warn in one check of nine, R-S4). The
 entry is read before the first walk as before every other, not taken from the directory walk's copy
 of its leaf, which the writers have usually moved on from by then (R-V3) - on a primary too, where
 that threw the first walk of every busy set away. A root pushed down, an upper level split or a
