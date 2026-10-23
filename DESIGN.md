@@ -23395,11 +23395,10 @@ clauses; and the FK-side join, where its competitor is a hash join over a bitmap
 than a loop. Not a walk in heap mode, which fetches each member's tuple as it meets it, a
 synchronous read the stream's price would under-charge, nor §40.10's probes.
 
-**The cap** (`pg_lion.cold_max_discount`, 2 by default, 1 to 10) is `LION_COLD_MAX_DISCOUNT`, which
-was 1.5, made a setting, the loop's and the bitmap's alike. It is the warm floor: where the cache
-holds what both plans read after all - `effective_cache_size` set below the real cache, a hot
-working set - a lion path chosen for those reads can take up to the cap times its competitor's
-time. The measured case:
+**The cap** is `pg_lion.cold_max_discount` (2 by default, 1 to 10), the loop's and the bitmap's
+alike. It is the warm floor: where the cache holds what both plans read after all -
+`effective_cache_size` set below the real cache, a hot working set - a lion path chosen for those
+reads can take up to the cap times its competitor's time. The measured case:
 
 | | the walk | the bitmap heap scan |
 |---|---|---|
