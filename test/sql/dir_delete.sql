@@ -132,8 +132,9 @@ SELECT * FROM dd_check();
 -- ---------- 3. new keys use the pages again ----------
 -- A transaction id is spent first, so that the deleted pages' safexid is
 -- behind every snapshot, and the VACUUM after it, which has no row to remove,
--- hands them to the free space map (nbtree's rule, DESIGN.md §18, "Reuse"):
--- the index does not grow, and fewer of its pages are free.  Keys 4999 down
+-- hands them to the free space map because they are more than a twentieth of
+-- the index (nbtree's _bt_vacuum_needs_cleanup() rule, DESIGN.md §18,
+-- "Reuse"): the index does not grow, and fewer of its pages are free.  Keys 4999 down
 -- to 4900 go first, into the range the run left: they go under the page of
 -- one downlink, whose leaf splits again and again, and the page takes their
 -- separators after its minus-infinity downlink and splits itself.

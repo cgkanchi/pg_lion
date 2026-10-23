@@ -1807,8 +1807,8 @@ Algorithm `lion_count_keys(Relation heap, int nkeys, Relation *indexes, Datum *k
    the flush waits for a heap-block boundary, so no block is pinned twice and `blocks_rechecked`
    stays exact - the first boundary past which the next block might not fit (a block puts at most
    `LION_RECHECK_BLOCK_TIDS`, 512 at 8 kB pages, on the list), so the list never outgrows its budget.
-   It used to fill to the budget and then to the end of the block it was on, a step of 1024 TIDs
-   more, which every queue of a grouped walk (§10) took past its share (2026-10 review). Without a
+   That matters to every queue of a grouped walk (§10): a flush that waited for the end of the block
+   it was on would take each one a step of 1024 TIDs past its share. Without a
    bound, 20M candidates - which a standby produces for any 20M-row posting
    set, since it never trusts the VM - meant a 192 MiB array, and 134M candidates an impossible
    allocation.
@@ -7176,8 +7176,8 @@ with their safexids (bounded by work_mem, as nbtree's `_bt_pendingfsm_add()`; on
 waits for the next VACUUM), computes the horizon afresh at its end and records those that are
 reusable by then (`lion_vac_pending_record()`, nbtree's `_bt_pendingfsm_finalize()`) - a page
 freed early in a long VACUUM, beside short transactions, usually is.  A page freed with no
-transaction started since is not, and the next VACUUM records it, with or without rows to remove
-(below).  Leak recovery:
+transaction started since is not, and the next VACUUM with rows to remove records it, as does one
+without them once such pages are more than a twentieth of the index (below).  Leak recovery:
 ambulkdelete keeps a bitmap of the blocks it accounted for - the meta page, every bucket page it
 walked, every container page it reached from a live entry, and every page it freed - and sweeps the
 rest at the end of ambulkdelete: an all-zero page goes into the FSM, a DELETED page or an UNLINKED
@@ -8679,7 +8679,7 @@ Operations.
   upgraded. `lion_chain_find_page()` is that descent (`lion_posting_search()` in the new
   `lion_posting.c`); the tail hint stays for appends and is now decided with the EXCLUSIVE lock the
   insert needs anyway, without descending at all, when the tail is still the rightmost leaf.
-  *(Narrowed 2026-09-25: the hint serves only the in-place fast path; anything that may split the
+  *(The hint serves only the in-place fast path; anything that may split the
   page descends - see the addendum "an unfinished split and the writers that do not descend".)*
 - **Leaf split**: as today (items at and after the insert position move to a brand new page N linked
   right; when the new items still do not fit on P they get a second new page M linked between them),
@@ -8785,22 +8785,20 @@ Operations.
   them a container at `key + 1` that the seek is about to skip anyway. The same holds inside an AND
   node of the expression evaluator (§17), where only the driver steps. Union and single-set
   counting keep the sequential walk.
-  **Since §25 the probes are ordered and abandoned early**: the non-driver sources are sorted by
+  **The probes are ordered and abandoned early** (§25): the non-driver sources are sorted by
   ascending members (the same `ntids`), and a container key is abandoned - the remaining sources
   neither sought nor read - the moment the running intersection empties or a seek lands past the
   target. That is the executor half of the open item below, and it is measured there.
-  **Since 2026-09-28 an AND node is the same leapfrog** (`lion_leapfrog()`, one function for both):
-  it used to step its FIRST child, seek every other one to it at every key and AND all of their
-  containers, and it is what a lion index scan's AND of its quals' sets is (§29.11, "The AND, as
-  the count makes it").  And a union it meets is built at a key only where that is the cheaper
-  way to AND it; elsewhere the intersection's members are looked up in the union's containers
-  (§29.11, "Unions probed").
+  **An AND node is the same leapfrog** (`lion_leapfrog()`, one function for both), and it is what
+  a lion index scan's AND of its quals' sets is (§29.11, "The AND, as the count makes it").  And a
+  union it meets is built at a key only where that is the cheaper way to AND it; elsewhere the
+  intersection's members are looked up in the union's containers (§29.11, "Unions probed").
 - **The §9 pin discipline is unchanged.** A leaf stays pinned until the container taken from it has
   passed the visibility-map check, and a seek releases the previous leaf's pin only at that same
   point: the two callers of `seek` are the merge's "this container key is missing from some set"
-  branch and an AND node's wind-forward, which are exactly the two places that used to call
-  `lion_ecursor_next()` for the same reason - nothing of those container keys reaches the visibility
-  map, so no answer rests on them.
+  branch and an AND node's wind-forward, which skip container keys rather than step through them
+  with `lion_ecursor_next()`, and for the same reason - nothing of those container keys reaches the
+  visibility map, so no answer rests on them.
   **The early exit of §25 does not touch it either, for the same reason and one more**: a container
   key that is abandoned contributes nothing to the answer, so no visibility-map question is asked
   about it and there is nothing to discharge for any page it touched; and the sources that were not
@@ -8808,17 +8806,17 @@ Operations.
   makes a count wrong - it only makes VACUUM wait.
 - **Owner validation (§18) applies to internal pages as well**, and to the LEVEL: a leaf's right link
   always names another leaf, so a page above level 0 reached through one is treated exactly as a page
-  whose owner no longer matches - the end of the set. *(Until the 2026-09-27 review
-  `lion_posting_search()` started its descent again there instead, and a damaged right link sent it
-  back to the same page for ever; it and `lion_posting_search_level()` now end the set.)*
+  whose owner no longer matches - the end of the set. `lion_posting_search()` and
+  `lion_posting_search_level()` end the set there: a descent started again would follow a damaged
+  right link back to the same page for ever.
 - **A link read from a posting page is data**, as §21's "Readers" says of the directory, and the
-  posting tree now checks what its descents and walks would otherwise follow blindly (2026-09-27
-  review; `lion_posting.c`, "POSTING-TREE LINKS ARE DATA"). Every failure is an ERROR,
+  posting tree checks what its descents and walks would otherwise follow blindly
+  (`lion_posting.c`, "POSTING-TREE LINKS ARE DATA"). Every failure is an ERROR,
   INDEX_CORRUPTED:
   - a pivot's line pointer is one whole pivot inside the page before it is read, and a non-rightmost
-    internal page has its high key (`lion_posting_pivot_at()`, `lion_posting_highkey_at()`) - the
-    binary search, the high key and the repair's scans used to take `lion_posting_pivot()` on
-    trust, and a damaged line pointer put the "pivot" up to 32 kB past the page;
+    internal page has its high key (`lion_posting_pivot_at()`, `lion_posting_highkey_at()`, which
+    the binary search, the high key and the repair's scans read them through) - a damaged line
+    pointer taken on trust would put the "pivot" up to 32 kB past the page;
   - a downlink names a valid block (`lion_posting_downlink()`, which VACUUM's descent uses too), and
     so do the head and tail an insert reads off its entry (`lion_insert_lock_chain_page()`):
     InvalidBlockNumber is P_NEW, and `ReadBuffer()` EXTENDS the index when asked for it;
@@ -8844,13 +8842,14 @@ Operations.
     page to the right, so one that has taken more steps than the index has blocks is going round a
     cycle of right links, and is refused. The index's size is asked for only once a walk is 1024
     pages long. A right link to the page itself or to the meta page is refused at the step; the
-    second used to END a reader's walk without a word, since block 0 does not claim the set and a
-    page that does not is what a freed one looks like (§18), so the count came out short. Since the
-    2026-09-29 review this holds for the READERS' walks of the leaves too (§21, "Readers"):
+    second would otherwise END a reader's walk without a word, since block 0 does not claim the set
+    and a page that does not is what a freed one looks like (§18), and the count would come out
+    short. This holds for the READERS' walks of the leaves too (§21, "Readers"):
     `lion_emit_chain()`, `LionOrderWalk`, the count cursor over the whole of its life, seeks and all
     (a cursor only moves forward, and a seek lands no further left than it stands), the private
     copy of `lion_posting_set_materialize()`, and VACUUM's pass 2, its regrow walk and its freeing of
-    a set's levels. They went round a cycle until cancelled, and VACUUM for ever under autovacuum.
+    a set's levels. Unbounded, they would go round a cycle until cancelled, and VACUUM for ever
+    under autovacuum.
 
   "For ever" meant UNCANCELLABLE on every writer's path, which is why the bounds, and not the checks
   for interrupts, are what matter there: a writer holds the key's directory leaf throughout, a held
@@ -8917,7 +8916,8 @@ leaf, because a set's internal pages stay.
 - **Reuse.** A sweep (§18, "Reuse") that finds L unvisited and UNLINKED records it in the free space
   map once its transaction id is behind every snapshot, nbtree's rule, as it records a DELETED
   page. The VACUUM that took L out records it at its end when the horizon has passed it by then,
-  and the next one otherwise, with or without rows to remove (§18, "Reuse"). The
+  and the next one otherwise: one with rows to remove, or one without them once such pages are
+  more than a twentieth of the index (§18, "Reuse"). The
   allocation that takes it checks the horizon again and announces the reuse to a standby first
   (§25), whose queries may hold a link for longer. Until then the page is exactly what it was, an
   empty leaf, on a standby as on the primary. `lion_index_stats()` counts it among the
@@ -9052,18 +9052,18 @@ every one of them the driver is either the only source or has a container at nea
 key. The quick benchmark at one and five million rows confirms it from the other side: no case
 changes plan and every case is at its baseline within run-to-run noise.
 
-**Since 2026-09-27 the CPU of the leapfrog is `lion_merge_cpu_cost()`** (§10, "The units"; the
+**The CPU of the leapfrog is `lion_merge_cpu_cost()`** (§10, "The units"; the
 fit is in §31): the driver's containers and members, a probe and the running intersection's members
 per other source at each of its keys - and the k'th source is sought only at the keys where the
 ones before it left a row, `1 - exp(-lambda)` of them, lambda the rows the intersection is expected
-to hold at a key. That is §25's early exit, which the model had never priced: the third source of
-`c20k = 77 AND c200 = 17 AND c2 = 1` over 5M rows was charged a probe - and a descent of its posting
-tree - at each of the 219 container keys of `c20k = 77`, where the executor abandons all but two of
-them once `c200 = 17` is empty (217 "Probes Avoided"). It cost 777 against a BitmapAnd's 237 and
-took 0.03 ms against 2.8; it now costs 59. The probed pages of `lion_probed_pages()` are counted
-over the probes that happen, too.
+to hold at a key. That is §25's early exit: the executor seeks the third source of
+`c20k = 77 AND c200 = 17 AND c2 = 1` over 5M rows at two of the 219 container keys of `c20k = 77`
+and abandons the rest once `c200 = 17` is empty (217 "Probes Avoided"), so the count costs 59
+against a BitmapAnd's 237 and takes 0.03 ms against 2.8, where a probe - and a descent of its
+posting tree - at each of the 219 would price it at 777. The probed pages of `lion_probed_pages()`
+are counted over the probes that happen, too.
 
-**Since 2026-09-28 these terms are shared with the lion index scan** (§29.11, "One price for the
+**These terms are shared with the lion index scan** (§29.11, "One price for the
 AND of sets"). A WHERE source's lookup, the pages a walk of its sets reads, its containers and a
 list's union are `lion_cost_set_clause()`'s, what the driver walks and the others' probes touch is
 `lion_cost_set_pages()`'s, and the directory leaves the lookups read - one each, and no more of an
@@ -9389,19 +9389,20 @@ stated a different equality (e.g. `bpchar =~~= text` with text semantics on a bp
 shows the shortcut answering 100 where the family and the seqscan answer 0.
 
 **Before any of the outcomes above, a value of the column's OWN type needs no resolution** - and
-for a class declared on a POLYMORPHIC type the class's input type does not say what that is
-(2026-09-25 review). `enum_ops` is FOR TYPE anyenum: a scan key names its member by that type
+for a class declared on a POLYMORPHIC type the class's input type does not say what that is.
+`enum_ops` is FOR TYPE anyenum: a scan key names its member by that type
 (`sk_subtype` = anyenum), but the elements of `m IN ('a', 'b')` are of the column's enum, because
 the operator is polymorphic and the parser leaves the array as it is (`make_scalar_array_op()`).
-`lion_probe_init()` took `keytype == opcintype` for the only way to say "own type", so every path
-that probes with the ARRAY's element type - a plain index scan's set tree and its LIST batches
-(§29.3, §29.4), a multicolumn bitmap scan (§24) - looked up an (anyenum, mood) member, found none
-and raised "type mood cannot be compared with index"; only the single-column bitmap scan, which
-probes with `sk_subtype`, worked. For a polymorphic class the own type is now also the column's
-actual type, read from the key column (`LionState.typid`), with domains looked through on both
-sides; a different enum is still not one (its OIDs mean nothing to this column) and still refused.
-`lion_range_add()` had made the same step for range bounds since §28. test/sql/keytypes.sql runs
-every scan shape against a sequential scan on an enum column, a list longer than a batch included.
+For a polymorphic class `lion_probe_init()` takes the column's actual type, read from the key
+column (`LionState.typid`), for its own type as well as the class's, with domains looked through on
+both sides. With `keytype == opcintype` the only way to say "own type", every path that probes
+with the ARRAY's element type - a plain index scan's set tree and its LIST batches (§29.3, §29.4),
+a multicolumn bitmap scan (§24) - would look up an (anyenum, mood) member, find none and raise
+"type mood cannot be compared with index"; only the single-column bitmap scan, which probes with
+`sk_subtype`, would work. A different enum is not the own type (its OIDs mean nothing to this
+column) and is refused. `lion_range_add()` makes the same step for range bounds (§28).
+test/sql/keytypes.sql runs every scan shape against a sequential scan on an enum column, a list
+longer than a batch included.
 
 ## 23. Backlog (not urgent; ordered by when they should happen)
 
@@ -10162,22 +10163,21 @@ and is used for the record header alone.
 place and an ERROR between the first modification and XLogInsert() would leave a
 page in shared buffers that no record describes. Everything fallible therefore
 has to happen BEFORE the record opens - which includes looking at the line
-pointers the record is going to move, overwrite or delete items by (§3,
-2026-09-29: `lion_page_check_items()`, `lion_page_check_alone()`,
+pointers the record is going to move, overwrite or delete items by (§3:
+`lion_page_check_items()`, `lion_page_check_alone()`,
 `lion_page_entry_fetch()`), and the header of a page it only adds an item to
-(§3, 2026-10-18: `lion_page_check_header()`). Three consequences, all of them
+(§3: `lion_page_check_header()`). Three consequences, all of them
 deviations from what this section assumed:
 
-- `lion_new_buffer_xl()` is gone. Allocating a page is split into
+- Allocating a page is two steps:
   `lion_alloc_page()` (fallible: the free space map, or extending the relation)
   and `lion_wal_init_buffer()` (registers the page the caller already has with
   REGBUF_WILL_INIT and initialises it). Every split therefore works out how many
   pages it needs BEFORE it opens its record.
 - **A container split rehearses its own deletion.** `lion_split_and_place()`
-  used to ask "do the new items still fit on P?" after deleting the moved ones
-  from P, inside the record, and allocate the second new page M there if the
-  answer was no. It now asks the same question of a private copy of the page
-  that the deletion is rehearsed on, and allocates M before the record. A copy
+  asks "do the new items still fit on P once the moved ones are gone?" of a
+  private copy of the page that the deletion is rehearsed on, and allocates the
+  second new page M before the record when the answer is no. A copy
   rather than arithmetic because PageIndexMultiDelete() compacts, and what a
   compaction recovers is exactly what the arithmetic would have to guess at. A
   split copies a page once; the hot path copies nothing at all, which is the
@@ -10189,7 +10189,7 @@ deviations from what this section assumed:
   changed under a lock this backend holds.
 
 Nothing above changes generic mode, where GenericXLogFinish() opens its own
-critical section as it always did.
+critical section.
 
 ### The record catalogue as implemented
 
