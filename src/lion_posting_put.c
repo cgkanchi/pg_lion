@@ -953,10 +953,12 @@ lion_entry_spill_pos(Relation index, Relation heaprel, Buffer entrybuf,
  * With wait = false the only lock taken is a conditional one, so the caller
  * may hold other buffer locks (the sweep holds the leaf's cleanup lock); with
  * wait = true it must hold none.  A block past the end of the relation - a
- * root whose extension a crash undid - is not live.
+ * root whose extension a crash undid - is not live.  The root is read through
+ * strategy: VACUUM's ring for its sweep, NULL for lion_index_verify().
  */
 bool
-lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
+lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait,
+					   BufferAccessStrategy strategy)
 {
 	Buffer		buf;
 	Page		page;
@@ -966,7 +968,7 @@ lion_posting_root_live(Relation index, uint32 hash, BlockNumber head, bool wait)
 		head >= RelationGetNumberOfBlocks(index))
 		return false;
 
-	buf = ReadBuffer(index, head);
+	buf = ReadBufferExtended(index, MAIN_FORKNUM, head, RBM_NORMAL, strategy);
 	if (wait)
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
 	else if (!ConditionalLockBuffer(buf))
