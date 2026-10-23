@@ -53,7 +53,8 @@ VACUUM (FREEZE, ANALYZE) lsq_fact;
  * lsq_plan() is q's plan as its nodes' names, a node's children in brackets
  * after it: a custom scan by its name, an index scan with its index's, a
  * SubPlan's nodes among its parent's children.  lsq_cost() is the total cost
- * of the first node of q's plan, top down, whose name is `node`.
+ * (or another of its costs) of the first node of q's plan, top down, whose
+ * name is `node`.
  */
 CREATE FUNCTION lsq_names(p json) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -80,31 +81,32 @@ BEGIN
 	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO p;
 	RETURN lsq_names(p->0->'Plan');
 END $$;
-CREATE FUNCTION lsq_find(p json, node text) RETURNS float8
+CREATE FUNCTION lsq_find(p json, node text, field text) RETURNS float8
 LANGUAGE plpgsql AS $$
 DECLARE
 	c json;
 	r float8;
 BEGIN
 	IF coalesce(p->>'Custom Plan Provider', p->>'Node Type') = node THEN
-		RETURN (p->>'Total Cost')::float8;
+		RETURN (p->>field)::float8;
 	END IF;
 	FOR c IN SELECT * FROM json_array_elements(coalesce(p->'Plans', '[]'::json))
 	LOOP
-		r := lsq_find(c, node);
+		r := lsq_find(c, node, field);
 		IF r IS NOT NULL THEN
 			RETURN r;
 		END IF;
 	END LOOP;
 	RETURN NULL;
 END $$;
-CREATE FUNCTION lsq_cost(q text, node text) RETURNS float8
+CREATE FUNCTION lsq_cost(q text, node text, field text DEFAULT 'Total Cost')
+RETURNS float8
 LANGUAGE plpgsql AS $$
 DECLARE
 	p json;
 BEGIN
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
-	RETURN lsq_find(p->0->'Plan', node);
+	RETURN lsq_find(p->0->'Plan', node, field);
 END $$;
 
 -- The count, a call for each key of one group of a thousand (one key in a
@@ -235,8 +237,32 @@ RESET enable_bitmapscan;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 
+-- ---------- 7. an InitPlan's Param in the Lion Cond ----------
+-- the lion index on the tsvector alone, so that the outer row's key is the
+-- B-tree's alone and the Lion Cond holds the tsquery an InitPlan computes:
+-- set once for every call, it rebuilds nothing, and the set's build is
+-- spread over the calls - a call's share of it next to nothing beside the
+-- call's walk.  The margin keeps the walk in the plan, a choice close to
+-- core's index scan on these tables, and divides both costs alike.
+CREATE INDEX lsq_fact_doc ON lsq_fact USING lion (doc);
+DROP INDEX lsq_fact_lion;
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.pushdown_margin = 4;
+SELECT lsq_cost(q, 'LionBtreeScan', 'Startup Cost') * 100 <
+	   lsq_cost(q, 'LionBtreeScan') AS built_once
+  FROM (VALUES ($q$SELECT d.id, (SELECT count(*) FROM lsq_fact f WHERE f.fk = d.id AND f.doc @@ (SELECT 'a1 & b3 & c1'::tsquery)) FROM lsq_dim d WHERE d.grp = 7$q$)) v (q);
+SELECT count(*) AS rows, sum(n) AS counted
+  FROM (SELECT d.id, (SELECT count(*) FROM lsq_fact f WHERE f.fk = d.id AND f.doc @@ (SELECT 'a1 & b3 & c1'::tsquery)) AS n
+		  FROM lsq_dim d WHERE d.grp = 7) g;
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET pg_lion.pushdown_margin;
+
 DROP TABLE lsq_want, lsq_got1, lsq_got2, lsq_got3, lsq_max, lsq_exists;
 DROP VIEW lsq_q;
 DROP TABLE lsq_fact, lsq_dim;
-DROP FUNCTION lsq_plan(text), lsq_cost(text, text), lsq_names(json),
-	lsq_find(json, text);
+DROP FUNCTION lsq_plan(text), lsq_cost(text, text, text), lsq_names(json),
+	lsq_find(json, text, text);

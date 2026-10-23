@@ -5377,18 +5377,6 @@ lion_exec_param_ids_walker(Node *node, List **ids)
 								  (void *) ids);
 }
 
-/* Does node hold an exec Param, one that may change between two scans? */
-bool
-lion_has_exec_param(Node *node)
-{
-	List	   *ids = NIL;
-	bool		has;
-
-	(void) lion_exec_param_ids_walker(node, &ids);
-	has = (ids != NIL);
-	list_free(ids);
-	return has;
-}
 
 /* The rows of the table relid, once per planner run; 0 when unknown. */
 static double
@@ -5460,6 +5448,47 @@ lion_outer_param_rows(PlannerInfo *root, int paramid)
 		}
 	}
 	return 0.0;
+}
+
+/*
+ * Does node hold a Param that an outer query hands this level - one that
+ * the query levels above list in their plan_params while this one is planned,
+ * whatever it stands for, and so may change at every call?  An InitPlan's
+ * output, set once for every call, is not one, nor a prepared statement's.
+ */
+bool
+lion_has_outer_param(PlannerInfo *root, Node *node)
+{
+	List	   *ids = NIL;
+	bool		has = false;
+	ListCell   *lc;
+
+	if (root == NULL || root->parent_root == NULL || node == NULL)
+		return false;
+	(void) lion_exec_param_ids_walker(node, &ids);
+	foreach(lc, ids)
+	{
+		PlannerInfo *up;
+
+		for (up = root->parent_root; up != NULL && !has; up = up->parent_root)
+		{
+			ListCell   *lc2;
+
+			foreach(lc2, up->plan_params)
+			{
+				if (((PlannerParamItem *) lfirst(lc2))->paramId ==
+					lfirst_int(lc))
+				{
+					has = true;
+					break;
+				}
+			}
+		}
+		if (has)
+			break;
+	}
+	list_free(ids);
+	return has;
 }
 
 /*

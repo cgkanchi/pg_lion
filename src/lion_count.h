@@ -1907,11 +1907,12 @@ extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
  * A correlated subquery's scan, priced as the inner side of the loop it is
  * (DESIGN.md §40.11): the calls a scan whose quals are `quals` is assumed to
  * be made over - the fewest rows of the outer relations whose Vars its exec
- * Params hand it, 1 where it has none - and whether quals hold an exec Param
- * at all, one that may change between two scans.
+ * Params hand it, 1 where it has none - and whether node holds a Param an
+ * outer query hands it, one that may change at every call (an InitPlan's
+ * does not).
  */
 extern double lion_outer_param_loops(PlannerInfo *root, Node *quals);
-extern bool lion_has_exec_param(Node *node);
+extern bool lion_has_outer_param(PlannerInfo *root, Node *node);
 
 /*
  * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
