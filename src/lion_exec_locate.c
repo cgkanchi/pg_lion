@@ -885,13 +885,13 @@ lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
  * existence tests of a count(DISTINCT), which stop at their first row - the
  * planner may have found walking the range at every count cheaper than
  * collecting it, in memory or in windows, and it is then walked from the
- * start (src->rangewalk, lion_node_count()), not collected.  It used to be
- * collected first all the same, until the memory ran out: a range that fit
- * after all was collected whatever walking it would have cost, and one that
- * did not cost the walk of as much of it as filled the memory before it was
- * walked - which the walk's price, and the walk, grew with (2026-10-22
- * review: 5 ms walked at 64 kB, 34 ms at 256 kB, 0.45 s collected from
- * 768 kB).  Only the ranges the planner priced so are walked.  An OR's leaf
+ * start (src->rangewalk, lion_node_count()), not collected.  Collected
+ * first and walked only once the memory ran out, a range that fit after all
+ * would cost its collection whatever walking it would have cost, and one
+ * that did not the walk of as much of it as filled the memory before it was
+ * walked - which the walk's price, and the walk, would grow with (5 ms
+ * walked at 64 kB, 34 ms at 256 kB, 0.45 s collected from 768 kB:
+ * DESIGN.md §32).  Only the ranges the planner priced so are walked.  An OR's leaf
  * is never walked - it cannot be taken apart that way - nor a source of the
  * decoded walk's WHERE (DESIGN.md §34) or of the FK-side join, whose plans
  * never say so.

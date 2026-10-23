@@ -3310,9 +3310,8 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 
 	/*
 	 * Fit or not: the existence tests of a count(DISTINCT), which stop at
-	 * their first row, walked a range 15 to 130 times faster than they
-	 * collected one that fit, which used to be collected whatever walking
-	 * it would have cost (2026-10-22 review).
+	 * their first row, walk a range 15 to 130 times faster than they
+	 * collect one that fits (DESIGN.md §32).
 	 */
 	if (c->walksave != NULL && c->orgrp[c->ci - 1] < 0)
 	{

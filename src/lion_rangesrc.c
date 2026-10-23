@@ -60,13 +60,13 @@
  * union is refused a widening, and before the collection gives up or a window
  * gives back keys, which therefore happens only where it did before.
  *
- * HYSTERESIS.  A union that has been compacted is never widened again.  Near
- * its memory a collection of scattered rows - every key taking containers
- * until the walk is over - compacted to make room for one widening, and the
- * next container to come to the union just compacted widened it again, which
- * compacted the one widened before: a 4 KB optimize and a 4 KB widening for
- * every container (2026-10-22 review: 12 s at 768 kB, 60 to 70% of it in the
- * optimize).  So a union is widened once and compacted once at most, and one
+ * HYSTERESIS.  A union that has been compacted is never widened again.  Were
+ * it, a collection of scattered rows near its memory - every key taking
+ * containers until the walk is over - would compact to make room for one
+ * widening, and the next container to come to the union just compacted would
+ * widen it again, which compacts the one widened before: a 4 KB optimize and
+ * a 4 KB widening for every container (12 s at 768 kB, 60 to 70% of it in
+ * the optimize).  So a union is widened once and compacted once at most, and one
  * that may not be widened - compacted, or with no room left even after a
  * compaction - takes the few members of a small ARRAY into `pend` as an
  * ARRAY union does, folded in once they come to a quarter of its size in
@@ -80,8 +80,9 @@
  * other, and the unions a compaction finds are those the walk has passed.
  * Measured on the assert build (2026-10-23), with the walk's sets freed as it
  * goes (lion_range_union_walk()): a range over 950,000 of 3M rows in no order
- * took 1.82 s at a work_mem of 1 MB, twice what 64 MB took, and takes 0.66 s,
- * no more than 64 MB now does; in windows at 64 kB 1.93 s, now 1.11.  Over
+ * takes 0.66 s at a work_mem of 1 MB, no more than 64 MB takes, where widening
+ * compacted unions again took 1.82 s; in windows at 64 kB 1.11 s against
+ * 1.93.  Over
  * 36 shapes - three columns, four ranges of each, three memories - none is
  * slower beyond the noise.
  */
@@ -534,9 +535,9 @@ lion_range_union_cmp(const void *a, const void *b)
  * payload and key (lion_fill_posting_set_entry()), and the stream, plan and
  * cursors lion_sets_iterate() reads it through - is the set's alone, and a
  * release gives back its pin, not its memory.  Left in the caller's context
- * it stayed there for the rest of the query, some 250 bytes for every entry
- * walked, outside the union's memory and whatever work_mem said: 154 MB for
- * a range over 600,000 keys at a work_mem of 4 MB (2026-10-22 review).  The
+ * it would stay there for the rest of the query, some 250 bytes for every
+ * entry walked, outside the union's memory and whatever work_mem said:
+ * 154 MB for a range over 600,000 keys at a work_mem of 4 MB.  The
  * union keeps nothing there - its containers are in its own context, its
  * overflow in the spill's - and the walk's position and batch are in the
  * scan's own contexts, made before this one, which a reset does not touch.
