@@ -291,15 +291,15 @@ lion_wal_log_special(LionWalState *state, Page page)
  * (LION_ITEM_SLACK_BOUND, the rule lion_index_verify() applies); and a sparse
  * segment has to hold a pair, because an empty one is never stored and has no
  * last container key.  Anything else is an ERROR naming the index and the
- * block.  Before this, a damaged item was read wherever its line pointer and
- * its header said, up to 256 KiB past the page image (2026-09-27 review).
+ * block.  Unchecked, a damaged item would be read wherever its line pointer
+ * and its header said, up to 256 KiB past the page image.
  * What the payload itself holds is lion_index_verify()'s business.
  *
  * The slack bound is not for the readers, which never look past the size the
  * header gives, but for the WRITERS, which copy, move and rewrite an item by
- * its line pointer, inside a WAL record: a length that reached from an item
- * into the next one made every root push-down of its set PANIC in rmgr mode,
- * again after every recovery (2026-09-29 review).  What a writer needs beyond
+ * its line pointer, inside a WAL record: a length that reaches from an item
+ * into the next one would make every root push-down of its set PANIC in rmgr
+ * mode, again after every recovery.  What a writer needs beyond
  * this - the item alone in its bytes, the items of the page apart - it checks
  * itself (lion_page_check_alone(), lion_page_check_items()).
  *
@@ -549,10 +549,9 @@ lion_page_check_items(Relation index, Page page, BlockNumber blkno)
  * It is lion_page_check_items() for the one item a record overwrites or
  * deletes in place, as one pass over the line pointers rather than over the
  * page, because the in-place insert of a member is the hot path of a hot
- * key; and it is what keeps a line
- * pointer whose length reaches into the next item from having that item
- * overwritten - which that insert did, growing a container into its
- * neighbour, and logged (2026-09-29 review).
+ * key; and it is what keeps a line pointer whose length reaches into the
+ * next item from having that item overwritten by that insert, which grows a
+ * container in place and logs it.
  */
 void
 lion_page_check_alone(Relation index, Page page, BlockNumber blkno,
