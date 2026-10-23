@@ -21390,8 +21390,9 @@ says the user may read every row of the column, as the intersection probe asks t
   own index's frequencies.
 - Values of a join: a join clause between two columns names no constant. Core's join estimate
   reads the row, and so the listed values with their exact frequencies.
-- Dead TIDs count until VACUUM, as for the count, less what the scaling takes off where they take
-  the list past the rows (above).
+- An entry's TIDs include its dead row versions until VACUUM, as the count does. Where they make
+  the merged frequencies add up to more than the share of rows that are not NULL, every entry is
+  scaled down by the same factor ("Scaled to fit", above).
 - Nothing while PostgreSQL 16's `old_snapshot_threshold` is set, when no lion index may be read
   (§9): the column is served without the frequencies.
 - Nothing is stored: `pg_stats` shows ANALYZE's list.
@@ -21410,8 +21411,8 @@ place of index scans and a sort or a merge join) with the same answers; a partia
 expression index served without them; a role under a row-level policy served without them;
 `varchar` and an enum; a sampled column whose count is served beside the frequencies; and a table
 with dead versions of a fifth of its rows, whose list of every value is the table's rows. The
-tests around the hook (`ndistinct`, `partition`, `countresid`, the probes', the count's and the FK
-joins') plan as they did.
+tests around the hook plan as they did: `ndistinct`, `partition`, `countresid`, and the tests of
+the probes, the count pushdown and the FK joins.
 
 ## 34. GROUP BY three or more indexed columns: the decoded walk (implemented 2026-09-30)
 
