@@ -234,6 +234,13 @@ EXPLAIN (COSTS OFF) SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = 
 	WHERE f.grp = 2 AND f.tags @> '{a1}' AND d.lvl = 3 AND d.flag AND x.pk IS NULL
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20;
 RESET pg_lion.pushdown_margin;
+-- ... and with the left join above, the LIMIT's share of the walk still
+--     decides the dimension's set: it starts lazy, its keys probed one by
+--     one, and is built once those probes have cost what the build would.
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, x.x FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt x ON x.pk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 5');
 
 -- 8. A Param in a lion qual: a generic plan's, the set built from the value
 --    each EXECUTE brings; and a rescan's, where the dimension's set is
