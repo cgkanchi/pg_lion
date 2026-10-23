@@ -413,6 +413,9 @@ SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
 (1 row)
 
 -- ---------- 6. dirty, and the same with the memory to hold it all ----------
+-- The existence tests walk the range whether or not it would fit: walking it
+-- is cheaper than collecting it at any memory (DESIGN.md §32, "Walked at
+-- every count").
 UPDATE lion_rss_t SET a = a + 1 WHERE u % 50 = 0;
 DELETE FROM lion_rss_t WHERE u % 70 = 0;
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g');
@@ -485,7 +488,7 @@ SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
 SELECT lion_rss('SELECT count(DISTINCT a) FROM lion_rss_t WHERE r < 524288');
           lion_rss           
 -----------------------------
- collected 1, walked 0: (30)
+ collected 0, walked 1: (30)
 (1 row)
 
 SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
@@ -495,6 +498,43 @@ SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON 
  collected 1, walked 0, filters collected once: (0,17691) (1,17668) (2,17659) (3,17744) (4,17783) (5,17578) 
 (1 row)
 
+-- What the walk of a collected range reads of an entry is freed after each
+-- set: the memory the collection holds is its union, not the 150,000 keys it
+-- walked (a megabyte and more, outside work_mem, before).
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+DECLARE c CURSOR FOR SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY g;
+FETCH 1 FROM c;
+ g | count 
+---+-------
+ 0 | 23069
+(1 row)
+
+SELECT sum(total_bytes) < 262144 AS walk_freed
+  FROM pg_backend_memory_contexts WHERE name = 'LionCount where keys';
+ walk_freed 
+------------
+ t
+(1 row)
+
+CLOSE c;
+DECLARE c CURSOR FOR SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g;
+FETCH 1 FROM c;
+ g | count 
+---+-------
+ 0 | 23924
+(1 row)
+
+SELECT sum(total_bytes) < 262144 AS walk_freed
+  FROM pg_backend_memory_contexts WHERE name = 'LionCount where keys';
+ walk_freed 
+------------
+ t
+(1 row)
+
+COMMIT;
 DROP TABLE lion_rss_t, lion_rss_d;
 DROP FUNCTION lion_rss(text);
 DROP FUNCTION lion_rss_cost(text, text, text);

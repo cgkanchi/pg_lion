@@ -494,14 +494,14 @@ typedef struct LionCountSource
 
 	/*
 	 * A RANGE on a column that does not drive the count, taken as a source
-	 * (DESIGN.md §32, "A range as a source") that was too large to collect
-	 * into memory, in a plan that walks those (LION_FLAG_RANGEWALK) rather
-	 * than collect them in windows: the rows whose key lies in the range,
-	 * which the caller counts as the SUM over the sets a walk of the range
-	 * hands out - disjoint entries and summaries of one scalar column - each
-	 * ANDed with the other sources in its place.  The count functions below
-	 * never take one; the count pushdown, which defines the structure,
-	 * expands it before it calls them (lion_node_count()).
+	 * (DESIGN.md §32, "A range as a source") in a plan that walks it at
+	 * every count (LION_FLAG_RANGEWALK) rather than collect it: the rows
+	 * whose key lies in the range, which the caller counts as the SUM over
+	 * the sets a walk of the range hands out - disjoint entries and
+	 * summaries of one scalar column - each ANDed with the other sources in
+	 * its place.  The count functions below never take one; the count
+	 * pushdown, which defines the structure, expands it before it calls them
+	 * (lion_node_count()).
 	 */
 	struct LionRangeSource *rangewalk;
 
