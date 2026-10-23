@@ -28193,10 +28193,11 @@ pages, 140 s cold. A hash join reads the dimension's WHERE whole, which is most 
 fact row, read from core's own path of the fact, it looks the key up in the dimension's primary
 key, tests the TID found against lion sets of the dimension built once before the first row - the
 WHERE's, and the LABELS that give each column the predicates read its outcome - asks the visibility
-map, and emits the fact's columns and each predicate's truth. The heap is read only for a page the
-map does not call all-visible. The group keys are computed above the node from those truths,
-`setrefs.c` matching each predicate inside them to the node's column for it (`LION_TL_CELLPRED`, as
-§10's cells are matched).
+map, and emits the fact's columns and each predicate's truth. The heap is read for a page the map
+does not call all-visible, and for every row found when the WHERE's set is inexact, to recheck the
+WHERE on the heap tuple (`Rows Removed by Lion Recheck`). The group keys are computed above the
+node from those truths, `setrefs.c` matching each predicate inside them to the node's column for it
+(`LION_TL_CELLPRED`, as §10's cells are matched).
 
 - **What qualifies** (`lion_fkjoin_recognize_probe()`, `pj_try_shape()`). At the GROUP BY of a
   join rel (`lion_create_upper_paths()`, `UPPERREL_GROUP_AGG`, no grouping sets, no set-returning

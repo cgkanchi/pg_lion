@@ -786,13 +786,14 @@ working around a bad choice:
   of the fact; each row's key is looked up in the dimension's unique B-tree, and the entry tested
   against Lion sets of the dimension built once - its `WHERE`'s, and one for each outcome of each
   column the `GROUP BY`'s predicates read - and against the `NOT EXISTS`'s set of the B-tree
-  entries of its keys; the heap is read only for pages the visibility map does not call
-  all-visible. Each row found goes up as the fact's columns and the predicates' truths, and
-  PostgreSQL's aggregate computes the groups above it - in parallel as `Finalize HashAggregate`,
-  `Gather` and `Partial HashAggregate` over the node over the fact's parallel scan, each process
-  building the sets for itself. It needs an inner join of two tables on one equality whose
-  dimension side has a unique one-column B-tree; every `WHERE` clause on the dimension answered by
-  its Lion indexes; the dimension's columns read only inside predicates
+  entries of its keys; the heap is read for pages the visibility map does not call all-visible,
+  and for every row found when the `WHERE`'s set is inexact, to recheck the `WHERE` on the heap
+  tuple (`Rows Removed by Lion Recheck`). Each row found goes up as the fact's columns and the
+  predicates' truths, and PostgreSQL's aggregate computes the groups above it - in parallel as
+  `Finalize HashAggregate`, `Gather` and `Partial HashAggregate` over the node over the fact's
+  parallel scan, each process building the sets for itself. It needs an inner join of two tables on
+  one equality whose dimension side has a unique one-column B-tree; every `WHERE` clause on the
+  dimension answered by its Lion indexes; the dimension's columns read only inside predicates
   `pg_lion.enable_count_cells` takes (an equality, `IN`, a null test, a boolean, a multi-key query,
   with constants) - a dimension column in the output by itself, under a `THEN` or in an aggregate
   keeps it out; and `enable_indexonlyscan`. The fact needs no Lion index; a run of sets past
