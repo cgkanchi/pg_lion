@@ -675,6 +675,7 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 						RelationGetRelationName(index))));
 	}
 	meta = LionPageGetMeta(page);
+	lion_meta_check_version(index, meta);
 	root = meta->root;
 	h = meta->height;
 	UnlockReleaseBuffer(buf);

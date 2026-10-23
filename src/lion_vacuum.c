@@ -877,7 +877,9 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * out of the index's trees - DELETED, or UNLINKED posting leaves - that were
  * not reusable yet when the last ambulkdelete ended.  The meta page keeps it
  * in its special area's maxckey, which nothing else uses on that page; an
- * index that never had it reads 0, "none".
+ * index that never had it reads 0, "none".  The page's format is asked for
+ * first (lion_meta_check_version()): this is the one read of the meta page a
+ * VACUUM with nothing to remove makes.
  */
 static uint32
 lion_vac_pending_get(Relation index)
@@ -890,7 +892,10 @@ lion_vac_pending_get(Relation index)
 	page = BufferGetPage(buf);
 	if (!PageIsNew(page) && PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
 		LionPageIsMeta(page))
+	{
+		lion_meta_check_version(index, LionPageGetMeta(page));
 		pending = LionPageGetOpaque(page)->maxckey;
+	}
 	UnlockReleaseBuffer(buf);
 	return pending;
 }
