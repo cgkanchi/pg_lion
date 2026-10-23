@@ -702,7 +702,15 @@ static void
 oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 {
 	OjState    *st = (OjState *) node;
-	List	   *anc = lcons(node->ss.ps.plan, ancestors);
+	/*
+	 * The sides' expressions are deparsed with the join as their parent, in a
+	 * copy of the ancestors: lcons() extends the list in place, and the
+	 * caller's list is the one the nodes after this one are deparsed in.  A
+	 * nested loop's inner side above the join finds its Params' outer Vars
+	 * through it, and with the join left at its head it found none: "$0",
+	 * and an assertion failure in an assert-enabled build.
+	 */
+	List	   *anc = lcons(node->ss.ps.plan, list_copy(ancestors));
 	Scan	   *dscan = (Scan *) st->dim->plan;
 	RangeTblEntry *rte = rt_fetch(dscan->scanrelid, es->rtable);
 	char	   *refname = (char *) list_nth(es->rtable_names,
