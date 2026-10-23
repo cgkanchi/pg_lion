@@ -22,6 +22,11 @@ static LionQueryMode lion_multikey_cost_mode(IndexOptInfo *idx, AttrNumber col,
 static Cost lion_range_recheck(PlannerInfo *root, RelOptInfo *rel,
 							   double tids, double entries, double corr);
 static double lion_bitmap_width(double tuples, double heap_pages);
+static Cost lion_cost_recheck_read(PlannerInfo *root, RelOptInfo *rel,
+								   List *whereidx, List *wherecol,
+								   List *whereclauses, List *wherekinds,
+								   List *ors, double matched, double counts,
+								   double ceiling, double *reads);
 static double lion_column_posting_share(PlannerInfo *root, RelOptInfo *rel,
 										IndexOptInfo *idx, AttrNumber col,
 										double *colbytes);
@@ -5047,9 +5052,17 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	lion_count_rel_pair_cost(&c);
 	lion_count_rel_recheck(&c);
 
-	/* ... and what a parallel count's ranges pay of it (§10) */
+	/*
+	 * ... and what a parallel count's ranges pay of it (§10), and the pages
+	 * it reads, which a competitor's cold reads are weighed against (§39,
+	 * "A bitmap heap scan's cold reads")
+	 */
 	if (rc != NULL)
+	{
 		lion_count_rel_range_price(&c, rc);
+		rc->reads += c.random_pages + c.seq_pages + c.probed_pages +
+			c.recheck_pages + (c.rangesum ? c.sumsets.pages : 0.0);
+	}
 
 	run = c.random_pages * random_page_cost;
 	run += c.descent_cost;
@@ -5329,6 +5342,7 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		rc->countrange = 0;
 		rc->whole = 0;
 		rc->pages = 0;
+		rc->reads = 0;
 	}
 
 	foreach(lc, targets)
@@ -5381,9 +5395,12 @@ lion_cost_count_path(PlannerInfo *root, CustomPath *cpath, List *targets,
 		 * candidates rechecked in the heap, one count - one group, one test -
 		 * at a time (DESIGN.md §17, "A query known only at run time").
 		 */
-		run += lion_cost_recheck(root, t->rel, tidx, tcol, tclauses, tkinds,
-								 tors, lion_probe_rel_rows(root, t->rel),
-								 numgroups, t->rel->tuples);
+		run += lion_cost_recheck_read(root, t->rel, tidx, tcol, tclauses,
+									  tkinds, tors,
+									  lion_probe_rel_rows(root, t->rel),
+									  numgroups, t->rel->tuples,
+									  (rc != NULL && list_length(targets) == 1) ?
+									  &rc->reads : NULL);
 
 		/*
 		 * A range-bounded GROUP BY walk (DESIGN.md §28) pays a fixed cost per
@@ -6055,6 +6072,28 @@ lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
 }
 
 /*
+ * The heap pages the residual clauses of a count read (lion_cost_residual()),
+ * what a competitor's cold reads are weighed against (DESIGN.md §39, "A
+ * bitmap heap scan's cold reads"): each count's candidates read in block
+ * order, each page once, as compute_bitmap_pages() counts a bitmap heap
+ * scan's - the same count the competitor's pages are taken at, where the
+ * price's index_pages_fetched() adds the re-reads a small cache would make
+ * of pages read at random.
+ */
+double
+lion_residual_pages(PlannerInfo *root, RelOptInfo *rel, List *residual,
+					double counts)
+{
+	double		T = Max((double) rel->pages, 1.0);
+	double		rows = lion_residual_rows(root, rel, residual);
+	double		n;
+
+	counts = Min(Max(counts, 1.0), rows);
+	n = rows / counts;
+	return counts * Min(ceil((2.0 * T * n) / (2.0 * T + n)), T);
+}
+
+/*
  * The heap recheck of the multi-key clauses whose query the node only has at
  * run time (DESIGN.md §17, "A query known only at run time"), over `matched`
  * rows of `rel` - the rows every clause selects - counted `counts` times over
@@ -6087,6 +6126,18 @@ Cost
 lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 				  List *wherecol, List *whereclauses, List *wherekinds,
 				  List *ors, double matched, double counts, double ceiling)
+{
+	return lion_cost_recheck_read(root, rel, whereidx, wherecol,
+								  whereclauses, wherekinds, ors, matched,
+								  counts, ceiling, NULL);
+}
+
+/* ... and the heap pages it reads added to *reads, when that is given */
+static Cost
+lion_cost_recheck_read(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
+					   List *wherecol, List *whereclauses, List *wherekinds,
+					   List *ors, double matched, double counts,
+					   double ceiling, double *reads)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	double		cand = Max(matched, 1.0);
@@ -6150,6 +6201,8 @@ lion_cost_recheck(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 
 	cand = Min(cand, Max(ceiling, 1.0));
 	pages = Min(cand, heap_pages * Max(counts, 1.0));
+	if (reads != NULL)
+		*reads += pages;
 
 	return pages * lion_heap_page_cost(root, rel, pages, heap_pages) +
 		cand * perrow;
