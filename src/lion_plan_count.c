@@ -4441,17 +4441,19 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	}
 
 	/*
-	 * A range taken as a source too large for the memory (DESIGN.md §32,
-	 * "Too large to collect") is collected in windows into a temporary file,
-	 * or walked at every count it is part of: the first is what the price
-	 * takes, and the second is cheaper where there are few counts - one
-	 * count, a few groups - which the plan then says (LION_FLAG_RANGEWALK),
-	 * for all of the node's ranges at once, naming the clauses of those it
-	 * priced walked (LION_CLAUSE_WALK): only they are walked, where they do
-	 * not fit.  Not beside the decoded walk, whose WHERE is one copy, nor
-	 * the top k, whose price leaves it out, nor where the aggregates over
-	 * entries are all the node prices.
+	 * A range taken as a source (DESIGN.md §32) is collected - past the
+	 * memory in windows into a temporary file - or walked at every count it
+	 * is part of: the first is what the price takes, and the second is
+	 * cheaper where there are few counts - one count, a few groups, the
+	 * existence tests of a count(DISTINCT) - which the plan then says
+	 * (LION_FLAG_RANGEWALK), for all of the node's ranges at once, naming
+	 * the clauses of those it priced walked (LION_CLAUSE_WALK,
+	 * lion_walk_save_choose()): only they are walked.  Not beside the
+	 * decoded walk, whose WHERE is one copy, nor the top k, whose price
+	 * leaves it out, nor where the aggregates over entries are all the node
+	 * prices.
 	 */
+	lion_walk_save_choose(&walksave);
 	if (walksave.save > 0 && !cx->decode && cx->topkn == 0 &&
 		(cx->wattnos == NIL || cx->wcounts))
 	{
