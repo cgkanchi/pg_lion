@@ -1,0 +1,350 @@
+-- A bitmap heap scan's cold reads (DESIGN.md §39, "A bitmap heap scan's
+-- cold reads"): a lion path priced against a plan that reads a table through
+-- a bitmap heap scan takes the pages that scan will find outside the cache
+-- into account - the share of the query's tables and the bitmap's indexes
+-- that effective_cache_size cannot hold, each page read ahead at
+-- pg_lion.cold_stream_page_cost over what core charged it - and its own
+-- reads the same way, down to its price over pg_lion.cold_max_discount.
+-- With the tables inside the cache nothing changes.  Every answer is the
+-- same whichever plan is taken.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+-- a sample of every row: the statistics, and the plans, do not depend on it
+SET default_statistics_target = 1000;
+-- the lion indexes' bitmap scans only, as a GIN index's: no plain scan of
+-- them competes, and the competitor is the bitmap heap scan
+SET pg_lion.enable_plain_scan = off;
+-- a fact of 50,000 rows of 300 bytes, 23 to a page: k a permutation of the
+-- ids under a covering B-tree (k) INCLUDE (id), c of 100 values at random
+-- under a lion index - a filter of two values is a bitmap heap scan of some
+-- 800 of the 2,200 heap pages, or a walk of the B-tree's 140
+CREATE TABLE lbc_f (id int, k int, c int, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lbc_f
+SELECT i, (i::bigint * 7919 % 50021)::int, (hashint4(i) & 2147483647) % 100,
+	   repeat('x', 300)
+  FROM generate_series(1, 50000) i;
+CREATE INDEX lbc_f_k ON lbc_f (k) INCLUDE (id);
+CREATE INDEX lbc_f_c ON lbc_f USING lion (c);
+VACUUM (FREEZE, ANALYZE) lbc_f;
+-- the same shape grouped: g of 1,200 values at random under a lion index
+CREATE TABLE lbc_g (id int, g int, c int, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lbc_g
+SELECT i, (hashint4(i + 7) & 2147483647) % 1200,
+	   (hashint4(i) & 2147483647) % 100, repeat('x', 300)
+  FROM generate_series(1, 40000) i;
+CREATE INDEX lbc_g_g ON lbc_g USING lion (g);
+CREATE INDEX lbc_g_c ON lbc_g USING lion (c);
+VACUUM (FREEZE, ANALYZE) lbc_g;
+/*
+ * lbc_set() sets, for the rest of the statement, every setting this test
+ * moves to its default, and then the settings in sw, name and value in turn.
+ */
+CREATE FUNCTION lbc_set(sw text[]) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+	n text;
+	i int;
+BEGIN
+	FOREACH n IN ARRAY ARRAY['effective_cache_size', 'pg_lion.cold_stream_page_cost',
+							 'pg_lion.cold_max_discount', 'pg_lion.pushdown_margin',
+							 'pg_lion.enable_btree_scan', 'pg_lion.enable_count_pushdown',
+							 'enable_bitmapscan'] LOOP
+		PERFORM set_config(n, (SELECT boot_val FROM pg_settings WHERE name = n),
+						   true);
+	END LOOP;
+	FOR i IN 1 .. coalesce(array_length(sw, 1), 0) BY 2 LOOP
+		PERFORM set_config(sw[i], sw[i + 1], true);
+	END LOOP;
+END $$;
+/*
+ * The plan q takes under the settings in sw: the covering walk, lion's
+ * count (the FK-side join's too), or core's hash join or bitmap heap scan.
+ */
+CREATE FUNCTION lbc_plan(q text, sw text[] DEFAULT '{}') RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM lbc_set(sw);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'LionBtreeScan|LionOrdered' THEN
+			RETURN 'covering walk';
+		ELSIF ln ~ 'LionCount' THEN
+			RETURN 'lion count';
+		ELSIF ln ~ 'Hash Join' THEN
+			RETURN 'hash join';
+		ELSIF ln ~ 'Bitmap Heap Scan' THEN
+			RETURN 'bitmap heap scan';
+		END IF;
+	END LOOP;
+	RETURN 'other';
+END $$;
+/*
+ * The estimated total cost of q's plan under the settings in sw, or of its
+ * first node whose type or custom plan provider is `node`.
+ */
+CREATE FUNCTION lbc_cost(q text, sw text[] DEFAULT '{}', node text DEFAULT NULL)
+RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+	todo json[];
+	n json;
+	c json;
+BEGIN
+	PERFORM lbc_set(sw);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	IF node IS NULL THEN
+		RETURN (p->0->'Plan'->>'Total Cost')::float8;
+	END IF;
+	todo := ARRAY[p->0->'Plan'];
+	WHILE cardinality(todo) > 0 LOOP
+		n := todo[1];
+		todo := todo[2:];
+		IF n->>'Node Type' = node OR n->>'Custom Plan Provider' = node THEN
+			RETURN (n->>'Total Cost')::float8;
+		END IF;
+		FOR c IN SELECT * FROM json_array_elements(coalesce(n->'Plans', '[]')) LOOP
+			todo := todo || c;
+		END LOOP;
+	END LOOP;
+	RETURN NULL;
+END $$;
+/* q's rows under the settings in sw, as one sorted text */
+CREATE FUNCTION lbc_rows(q text, sw text[] DEFAULT '{}') RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text;
+BEGIN
+	PERFORM lbc_set(sw);
+	EXECUTE format('SELECT string_agg(s::text, '' '' ORDER BY s::text) FROM (%s) s', q)
+		INTO r;
+	RETURN md5(r);
+END $$;
+-- ---------- 1. the covering walk ----------
+-- The tables fit in the cache: the bitmap heap scan, at core's price, below
+-- the walk's.  A cache of a megabyte holds 6% of them: the scan's 800 heap
+-- pages are cold, the walk's 140 B-tree pages hardly less so, and the walk
+-- is taken - and not with the charge off, nor with nothing to take off.
+SELECT n, lbc_plan('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)', sw) AS plan
+  FROM (VALUES ('fits in the cache', '{}'::text[]),
+			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
+			   ('... no charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}'),
+			   ('... no discount', '{effective_cache_size, 1MB, pg_lion.cold_max_discount, 1}')) v(n, sw);
+         n         |       plan       
+-------------------+------------------
+ fits in the cache | bitmap heap scan
+ a cache of 1MB    | covering walk
+ ... no charge     | bitmap heap scan
+ ... no discount   | bitmap heap scan
+(4 rows)
+
+SET effective_cache_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT sum(id) FROM lbc_f WHERE c IN (1, 2);
+                    QUERY PLAN                     
+---------------------------------------------------
+ Aggregate
+   ->  Custom Scan (LionBtreeScan) on lbc_f
+         Index: lbc_f_k (index only)
+         Lion Cond: (c = ANY ('{1,2}'::integer[]))
+         Lion Indexes: lbc_f_c
+(5 rows)
+
+RESET effective_cache_size;
+-- The walk's price over what it is priced at against the cold scan - its
+-- own price where nothing of the scan competes (bitmap scans off: the
+-- sequential scan has no cold reads) - is the cap where it binds: the
+-- scan's cold reads, against the walk's own, would take off more than
+-- twice its price.
+SELECT d AS cold_max_discount,
+	   round((lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off}', 'LionBtreeScan') /
+			  lbc_cost(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.cold_max_discount', d],
+					   'LionBtreeScan'))::numeric, 3) AS own_over_cold
+  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q),
+	   unnest('{1.5, 2}'::text[]) d;
+ cold_max_discount | own_over_cold 
+-------------------+---------------
+ 1.5               |         1.500
+ 2                 |         2.000
+(2 rows)
+
+SELECT lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off}', 'LionBtreeScan') /
+	   lbc_cost(q, '{effective_cache_size, 1MB, pg_lion.cold_max_discount, 10}', 'LionBtreeScan')
+	   BETWEEN 2 AND 10 AS uncapped_past_2
+  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q);
+ uncapped_past_2 
+-----------------
+ t
+(1 row)
+
+-- the margin divides the cold price as it divides any: the walk's cost at a
+-- margin of 0.8 is its cost at 1 over 0.8, and the margin is a threshold on
+-- the ratio of the cold price to the scan's - just above it the walk is
+-- taken, just below it the scan
+SELECT round((lbc_cost(q, '{effective_cache_size, 1MB, pg_lion.pushdown_margin, 0.8}', 'LionBtreeScan') /
+			  lbc_cost(q, '{effective_cache_size, 1MB}', 'LionBtreeScan'))::numeric, 3) AS at_08_over_at_1,
+	   walk / scan < 0.9 AS cold_walk_below_scan,
+	   lbc_plan(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.pushdown_margin',
+						 (walk / scan * 1.05)::text]) AS just_above,
+	   lbc_plan(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.pushdown_margin',
+						 (walk / scan * 0.95)::text]) AS just_below
+  FROM (SELECT q, lbc_cost(q, '{effective_cache_size, 1MB}', 'LionBtreeScan') AS walk,
+			   lbc_cost(q, '{effective_cache_size, 1MB, pg_lion.enable_btree_scan, off}',
+						'Bitmap Heap Scan') AS scan
+		  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q)) c;
+ at_08_over_at_1 | cold_walk_below_scan |  just_above   |    just_below    
+-----------------+----------------------+---------------+------------------
+           1.250 | t                    | covering walk | bitmap heap scan
+(1 row)
+
+-- the answers: the walk's, the scan's, and a sequential scan's
+SELECT count(DISTINCT lbc_rows('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)', sw)) AS answers
+  FROM (VALUES ('{effective_cache_size, 1MB}'::text[]), ('{}'),
+			   ('{pg_lion.enable_btree_scan, off, enable_bitmapscan, off}')) v(sw);
+ answers 
+---------
+       1
+(1 row)
+
+-- ---------- 2. the count ----------
+-- A GROUP BY of 1,200 groups under the same filter: lion's count, priced
+-- some 1.2 times the hash aggregate over the bitmap heap scan, loses while
+-- the tables fit in the cache and is taken with a cache of a megabyte, its
+-- reads the filter's few posting pages; not with the charge off.
+SELECT n, lbc_plan('SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) GROUP BY g', sw) AS plan
+  FROM (VALUES ('fits in the cache', '{}'::text[]),
+			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
+			   ('... no charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}')) v(n, sw);
+         n         |       plan       
+-------------------+------------------
+ fits in the cache | bitmap heap scan
+ a cache of 1MB    | lion count
+ ... no charge     | bitmap heap scan
+(3 rows)
+
+-- A residual clause the count tests on each group's candidates, which it
+-- fetches for themselves, reads more heap pages than the scan, and is priced
+-- several times it: cold, the cap takes off what it may, and the scan stays.
+SELECT n, lbc_plan('SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) AND id % 7 <> 3 GROUP BY g', sw) AS plan
+  FROM (VALUES ('fits in the cache', '{}'::text[]),
+			   ('a cache of 1MB', '{effective_cache_size, 1MB}')) v(n, sw);
+         n         |       plan       
+-------------------+------------------
+ fits in the cache | bitmap heap scan
+ a cache of 1MB    | bitmap heap scan
+(2 rows)
+
+-- Rows added since the VACUUM: their pages are not all-visible, and the
+-- count rechecks its candidates on them - a tenth of the scan's pages, the
+-- same choices
+INSERT INTO lbc_g
+SELECT i, (hashint4(i + 7) & 2147483647) % 1200,
+	   (hashint4(i) & 2147483647) % 100, repeat('x', 300)
+  FROM generate_series(40001, 44000) i;
+ANALYZE lbc_g;
+SELECT relallvisible < relpages AS dirty FROM pg_class WHERE relname = 'lbc_g';
+ dirty 
+-------
+ t
+(1 row)
+
+SELECT n, lbc_plan('SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) GROUP BY g', sw) AS plan
+  FROM (VALUES ('fits in the cache', '{}'::text[]),
+			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
+			   ('... no charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}')) v(n, sw);
+         n         |       plan       
+-------------------+------------------
+ fits in the cache | bitmap heap scan
+ a cache of 1MB    | lion count
+ ... no charge     | bitmap heap scan
+(3 rows)
+
+SET effective_cache_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) GROUP BY g;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: lbc_g_g (g), lbc_g_c (c = ANY ('{1,2}'::integer[]))
+   Group Key: g
+(3 rows)
+
+RESET effective_cache_size;
+-- the answers: the count's, the scan's, and a sequential scan's
+SELECT q, count(DISTINCT lbc_rows(q, sw)) AS answers
+  FROM (VALUES ('SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) GROUP BY g'),
+			   ('SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) AND id % 7 <> 3 GROUP BY g')) v(q),
+	   (VALUES ('{effective_cache_size, 1MB}'::text[]), ('{}'),
+			   ('{pg_lion.enable_count_pushdown, off, enable_bitmapscan, off}')) w(sw)
+ GROUP BY q ORDER BY q;
+                                     q                                      | answers 
+----------------------------------------------------------------------------+---------
+ SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) AND id % 7 <> 3 GROUP BY g |       1
+ SELECT g, count(*) FROM lbc_g WHERE c IN (1, 2) GROUP BY g                 |       1
+(2 rows)
+
+-- ---------- 3. the FK-side join ----------
+-- A fact of 50,000 rows of 300 bytes over a dimension of 5,000 keys, x of
+-- 50 values at random: core's plan is a hash join of the dimension with a
+-- bitmap heap scan of the fact's two values, some 1,400 of its 2,200 pages.
+-- The FK-side join, which reads the fact's posting sets alone, loses to it
+-- while the tables fit in the cache and is taken with a cache of a
+-- megabyte; not with the charge off.  (PostgreSQL 19 may aggregate the
+-- fact below the join instead - eager aggregation - which is another plan
+-- to compete with: off where it exists.)
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
+CREATE TABLE lbc_d (pk int8 PRIMARY KEY, grp int NOT NULL);
+INSERT INTO lbc_d SELECT i, i % 100 FROM generate_series(1, 5000) i;
+CREATE TABLE lbc_x (fk int8 NOT NULL, x int NOT NULL, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lbc_x
+SELECT 1 + (i::int8 * 7919) % 5000, (hashint4(i) & 2147483647) % 50,
+	   repeat('y', 300)
+  FROM generate_series(1, 50000) i;
+CREATE INDEX lbc_x_lion ON lbc_x USING lion (x, fk);
+VACUUM (FREEZE, ANALYZE) lbc_d;
+VACUUM (FREEZE, ANALYZE) lbc_x;
+SELECT n, lbc_plan('SELECT d.grp, count(*) FROM lbc_x f JOIN lbc_d d ON f.fk = d.pk WHERE f.x IN (1, 2) GROUP BY d.grp', sw) AS plan
+  FROM (VALUES ('fits in the cache', '{}'::text[]),
+			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
+			   ('... no charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}')) v(n, sw);
+         n         |    plan    
+-------------------+------------
+ fits in the cache | hash join
+ a cache of 1MB    | lion count
+ ... no charge     | hash join
+(3 rows)
+
+SET effective_cache_size = '1MB';
+EXPLAIN (COSTS OFF) SELECT d.grp, count(*) FROM lbc_x f JOIN lbc_d d ON f.fk = d.pk WHERE f.x IN (1, 2) GROUP BY d.grp;
+                                          QUERY PLAN                                          
+----------------------------------------------------------------------------------------------
+ Finalize HashAggregate
+   Group Key: d.grp
+   ->  Custom Scan (LionCount)
+         Lion Indexes: lbc_x_lion.fk (fk = d.pk), lbc_x_lion.x (x = ANY ('{1,2}'::integer[]))
+         Join Key Lookups: in index order
+         Fact Filters: collected once
+         ->  Seq Scan on lbc_d d
+(7 rows)
+
+RESET effective_cache_size;
+SELECT count(DISTINCT lbc_rows('SELECT d.grp, count(*) FROM lbc_x f JOIN lbc_d d ON f.fk = d.pk WHERE f.x IN (1, 2) GROUP BY d.grp', sw)) AS answers
+  FROM (VALUES ('{effective_cache_size, 1MB}'::text[]), ('{}'),
+			   ('{pg_lion.enable_count_pushdown, off, enable_bitmapscan, off}')) v(sw);
+ answers 
+---------
+       1
+(1 row)
+
+DROP TABLE lbc_f, lbc_g, lbc_x, lbc_d;
+DROP FUNCTION lbc_rows(text, text[]);
+DROP FUNCTION lbc_cost(text, text[], text);
+DROP FUNCTION lbc_plan(text, text[]);
+DROP FUNCTION lbc_set(text[]);

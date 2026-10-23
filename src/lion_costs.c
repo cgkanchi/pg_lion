@@ -58,6 +58,7 @@ double		lion_position_member_cost;
 double		lion_position_check_cost;
 double		lion_resident_page_cost;
 double		lion_cold_page_cost;
+double		lion_cold_stream_page_cost;
 double		lion_entry_count_cost;
 double		lion_list_group_cost;
 double		lion_distinct_test_cost;
@@ -88,6 +89,7 @@ double		lion_hashjoin_rate;
 double		lion_mergejoin_rate;
 double		lion_bitmap_rate;
 double		lion_pushdown_margin;
+double		lion_cold_max_discount;
 
 typedef struct LionCostSetting
 {
@@ -157,6 +159,9 @@ static const LionCostSetting lion_cost_settings[] = {
 	/* lion_plan_units.c: a nested loop competitor's uncached reads (§39) */
 	{"pg_lion.cold_page_cost", &lion_cold_page_cost, 50.0, LION_SEQ,
 	 "Sets the planner's estimate of the cost of each uncached page that a nested loop competing with a lion path reads from its inner index scan, one synchronous read at a time"},
+	/* ... and a bitmap heap scan competitor's, read ahead (§39) */
+	{"pg_lion.cold_stream_page_cost", &lion_cold_stream_page_cost, 6.25, LION_SEQ,
+	 "Sets the planner's estimate of the cost of each uncached page that a bitmap heap scan competing with a lion path reads ahead of itself, and of each the lion path reads in its place"},
 
 	/* lion_plan_cost.c: the count's walks (§20, §26, §28, §32) */
 	{"pg_lion.entry_count_cost", &lion_entry_count_cost, 50.0, LION_TUPLE,
@@ -316,6 +321,24 @@ lion_costs_init(void)
 							 &lion_pushdown_margin,
 							 1.0,
 							 0.01, 1000.0,
+							 PGC_USERSET,
+							 GUC_EXPLAIN,
+							 NULL, NULL, NULL);
+
+	/*
+	 * THE COLD READS' CAP (DESIGN.md §39, "A nested loop's cold reads", "A
+	 * bitmap heap scan's cold reads"): the most a competitor's uncached reads
+	 * divide a lion path's price by.  It is the warm floor: where the cache
+	 * holds what both plans read after all, a lion path chosen for those
+	 * reads may take up to this many times its competitor's time.  1 takes
+	 * nothing off.
+	 */
+	DefineCustomRealVariable("pg_lion.cold_max_discount",
+							 "Sets the most a competing plan's uncached reads may divide a lion custom path's price by.",
+							 "A lion path priced against a nested loop or a bitmap heap scan that reads tables larger than effective_cache_size takes both plans' uncached reads into its price, down to its own price over this (DESIGN.md §39); 1 takes nothing off.",
+							 &lion_cold_max_discount,
+							 1.5,
+							 1.0, 10.0,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
 							 NULL, NULL, NULL);

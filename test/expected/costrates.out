@@ -43,6 +43,48 @@ SELECT name, setting, boot_val, min_val, max_val, context
  pg_lion.pushdown_margin | 1       | 1        | 0.01    | 1000    | user
 (6 rows)
 
+-- the cold reads' (DESIGN.md §39, "A nested loop's cold reads", "A bitmap
+-- heap scan's cold reads"): the price of a page read synchronously and of
+-- one read ahead, multiples of seq_page_cost from 0 up as every cost
+-- setting is, and the most they take off a lion path's price, a divisor
+-- from 1 (nothing) to 10
+SELECT name, setting, boot_val, min_val, max_val::float8 > 1e300 AS unbounded,
+	   context, unit IS NULL AS no_unit
+  FROM pg_settings
+ WHERE name ~ '^pg_lion\.cold_'
+ ORDER BY name;
+             name              | setting | boot_val | min_val | unbounded | context | no_unit 
+-------------------------------+---------+----------+---------+-----------+---------+---------
+ pg_lion.cold_max_discount     | 1.5     | 1.5      | 1       | f         | user    | t
+ pg_lion.cold_page_cost        | 50      | 50       | 0       | t         | user    | t
+ pg_lion.cold_stream_page_cost | 6.25    | 6.25     | 0       | t         | user    | t
+(3 rows)
+
+SET pg_lion.cold_max_discount = 0.99;
+ERROR:  0.99 is outside the valid range for parameter "pg_lion.cold_max_discount" (1 .. 10)
+SET pg_lion.cold_max_discount = 10.5;
+ERROR:  10.5 is outside the valid range for parameter "pg_lion.cold_max_discount" (1 .. 10)
+SET pg_lion.cold_stream_page_cost = -1;
+ERROR:  -1 is outside the valid range for parameter "pg_lion.cold_stream_page_cost" (0 .. 1.79769e+308)
+SET pg_lion.cold_page_cost = -1;
+ERROR:  -1 is outside the valid range for parameter "pg_lion.cold_page_cost" (0 .. 1.79769e+308)
+SET pg_lion.cold_max_discount = 1;
+SET pg_lion.cold_max_discount = 10;
+SET pg_lion.cold_stream_page_cost = 0;
+SHOW pg_lion.cold_max_discount;
+ pg_lion.cold_max_discount 
+---------------------------
+ 10
+(1 row)
+
+SHOW pg_lion.cold_stream_page_cost;
+ pg_lion.cold_stream_page_cost 
+-------------------------------
+ 0
+(1 row)
+
+RESET pg_lion.cold_max_discount;
+RESET pg_lion.cold_stream_page_cost;
 -- 60000 rows: g20, g200 and c2 at random, k a permutation of the ids under a
 -- btree for the ordered scan
 CREATE TABLE lcr (id int, k int, g20 int, g200 int, c2 int, pad text)

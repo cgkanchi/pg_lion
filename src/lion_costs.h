@@ -45,6 +45,7 @@ extern PGDLLIMPORT double lion_position_member_cost;
 extern PGDLLIMPORT double lion_position_check_cost;
 extern PGDLLIMPORT double lion_resident_page_cost;
 extern PGDLLIMPORT double lion_cold_page_cost;
+extern PGDLLIMPORT double lion_cold_stream_page_cost;
 
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;
@@ -92,6 +93,12 @@ extern PGDLLIMPORT double lion_bitmap_rate;
  * of the best core plan's to be chosen.  1 is no margin.
  */
 extern PGDLLIMPORT double lion_pushdown_margin;
+
+/*
+ * The most a competitor's uncached reads divide a lion path's price by
+ * (DESIGN.md §39, "A nested loop's cold reads"): the warm floor.
+ */
+extern PGDLLIMPORT double lion_cold_max_discount;
 
 extern void lion_costs_init(void);
 
