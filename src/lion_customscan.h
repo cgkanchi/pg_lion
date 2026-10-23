@@ -4366,6 +4366,7 @@ extern void lion_ordered_lion_tree(Path *lion, List **tree, List **leaves,
 								   List **quals);
 extern Cost lion_ordered_set_price(PlannerInfo *root, RelOptInfo *rel,
 								   Path *lion, double *members, double *bytes);
+extern bool lion_ordered_set_exact(PlannerInfo *root, Path *lion);
 extern Cost lion_ordered_spill_price(double bytes);
 extern double lion_ordered_set_bytes(double members, double pages);
 extern Cost lion_ordered_lookup_price(IndexPath *probe);

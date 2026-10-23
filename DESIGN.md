@@ -28296,14 +28296,17 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   sort of their TIDs; for each fact row a scan of the probe as §40.10 prices it
   (`lion_ordered_probe_price()`: core's parameterized IndexPath of the B-tree, its descent and
   pages amortized over the loops, an entry's probe of the WHERE's set, a member's visibility-map
-  test, the heap pages of the members on pages not all-visible through Mackert and Lohman), with
-  `loops` the fact's rows; for each member - the share of the dimension's rows the WHERE keeps -
-  a `cpu_operator_cost` for the anti join's test, each label's and each predicate's truth; and the
-  emitted rows' `cpu_tuple_cost` and target. The cold discount weighs the pages the node reads -
-  a B-tree leaf a probe (`index_pages_fetched()` over the loops), the members' heap pages not
-  all-visible, and the lion indexes' pages the builds read - against the competitor's, which is a
-  nested loop's where core's cheapest plan is one (§39, "A nested loop's cold reads"): the node's
-  reason to be is the heap page each of the loop's probes reads. No knob beyond the switch.
+  test, the heap pages of the members on pages not all-visible through Mackert and Lohman, and of
+  every member where the WHERE's set is inexact, all-visible or not, as `lo_cost()`'s heap recheck
+  fetches each for the recheck), with `loops` the fact's rows; for each member - the share of the
+  dimension's rows the WHERE keeps - a `cpu_operator_cost` for the anti join's test, each label's
+  and each predicate's truth; and the emitted rows' `cpu_tuple_cost` and target. The cold discount
+  weighs the pages the node reads - a B-tree leaf a probe (`index_pages_fetched()` over the loops),
+  the members' heap pages not all-visible (every member's where the WHERE's set is inexact, as the
+  probe's price fetches them; `lion_ordered_set_exact()`), and the lion indexes' pages the builds
+  read - against the competitor's, which is a nested loop's where core's cheapest plan is one (§39,
+  "A nested loop's cold reads"): the node's reason to be is the heap page each of the loop's probes
+  reads. No knob beyond the switch.
 - **Above the node** (`pj_add_aggs()`). The Agg core would build over the join: hashed where the
   GROUP BY can be hashed (`GROUPING_CAN_USE_HASH`, no ordered aggregate), a sort and a sorted Agg
   otherwise, a plain one without a GROUP BY (sorted for a GROUP BY of constants alone), the HAVING
