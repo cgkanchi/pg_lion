@@ -418,11 +418,17 @@ SELECT bp_same($$SELECT id FROM bp WHERE tsv @@ '!w3'::tsquery$$);
 RESET parallel_leader_participation;
 
 -- 9. The partial paths in joins: both sides of a parallel hash join, and
---    an anti join.
+--    an anti join.  The nested loop's probe (DESIGN.md §40.10) is switched
+--    off with the loop: on 18 core's add_partial_path_precheck() compares
+--    the partial paths by cost alone, so the disabled loop over the probe,
+--    cheaper than the partial hash join, keeps that join out (19 and later
+--    compare the disabled nodes first).
 SET enable_mergejoin = off;
 SET enable_nestloop = off;
+SET pg_lion.enable_btree_scan = off;
 SELECT bp_cmp('SELECT count(*), sum(a.x) FROM bp a JOIN bp b ON a.k = b.id WHERE a.c20 = 3 AND b.c2 = 1');
 SELECT bp_cmp('SELECT count(*) FROM bp a WHERE a.c20 = 3 AND NOT EXISTS (SELECT 1 FROM bp b WHERE b.id = a.k AND b.c2 = 1)');
+RESET pg_lion.enable_btree_scan;
 RESET enable_mergejoin;
 RESET enable_nestloop;
 
