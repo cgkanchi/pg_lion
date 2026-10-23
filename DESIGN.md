@@ -28559,6 +28559,7 @@ containers - and the fact's scan; a probe then costs 2.6 to 3.5 us, the descent 
 where the fact rows are few against the dimension's WHERE; the descent's price, core's own for an
 index scan's, makes it some 1.7 times too cheap against the hash join's in a warm cache, so that
 at 300,000 rows - 15% of the dimension - it is chosen and runs 1.6 times the hash join's time. Cold
-it is the other way: the hash join reads the WHERE's heap pages, half of the 422 MB here and most
-of an 87 GB heap, and the nested loop a random heap page a fact row, where the node reads the
-primary key's leaves and the lion indexes and no heap page of an all-visible dimension.
+is not measured; the pages each plan reads say it goes the other way: the hash join reads the
+WHERE's heap pages, half of the 422 MB here and most of an 87 GB heap, and the nested loop a random
+heap page a fact row, where the node reads the primary key's leaves and the lion indexes and no
+heap page of an all-visible dimension.
