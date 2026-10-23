@@ -150,10 +150,12 @@ SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE r < 900 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE k > 700 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE k > 700 AND k <= 790 AND a = 3 GROUP BY g');
 SELECT lion_src('SELECT g, count(k) FROM lion_src_t WHERE k < 20 GROUP BY g');
--- two ranges beside a GROUP BY, and two bounds on one side of one
+-- two ranges beside a GROUP BY, and two bounds on one side of one: seven
+-- groups walk one of them at each count, cheaper than collecting it, and the
+-- other is collected (DESIGN.md §32, "Walked at every count")
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u > 100 AND r < 15000 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u < 9000 AND u <= 8000::int8 AND r > 50 GROUP BY g');
--- an empty range, a range outside the keys
+-- an empty range, a range outside the keys, walked to nothing
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u BETWEEN 900 AND 300 GROUP BY g');
 SELECT lion_src('SELECT g, count(*) FROM lion_src_t WHERE u > 5000000000::int8 GROUP BY g');
 -- a range and an equality on one column: two sources
@@ -258,6 +260,10 @@ CREATE INDEX lion_src_p2_i ON lion_src_p2 USING lion (u, g, ts);
 VACUUM (FREEZE, ANALYZE) lion_src_p;
 SELECT lion_src('SELECT g, count(*) FROM lion_src_p WHERE ts >= ''2025-01-05'' GROUP BY g');
 SELECT lion_src('SELECT count(*) FROM lion_src_p WHERE u > 300 AND ts < ''2025-01-09''');
+-- Each partition collects its own share of the range, and a rescan collects
+-- it again, but it is one range of the query: counted once.
+SELECT lion_src('SELECT x.v, s.* FROM (VALUES (1), (2), (3)) x(v),
+	LATERAL (SELECT a, count(*) FROM lion_src_t WHERE r < 900 AND g = x.v GROUP BY a) s');
 
 -- ---------- 8. the fact filters of an FK-side join ----------
 CREATE TABLE lion_src_dim (pk int PRIMARY KEY, attr text NOT NULL);

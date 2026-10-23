@@ -284,6 +284,9 @@ SELECT lion_rss('SELECT fk, count(*) FROM lion_rss_t
 	WHERE fk = ANY (array(SELECT i FROM generate_series(1, 1500) i)) GROUP BY fk');
 
 -- ---------- 6. dirty, and the same with the memory to hold it all ----------
+-- The existence tests walk the range whether or not it would fit: walking it
+-- is cheaper than collecting it at any memory (DESIGN.md §32, "Walked at
+-- every count").
 UPDATE lion_rss_t SET a = a + 1 WHERE u % 50 = 0;
 DELETE FROM lion_rss_t WHERE u % 70 = 0;
 SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g');
@@ -306,6 +309,23 @@ SELECT lion_rss('SELECT g, count(*) FROM lion_rss_t
 SELECT lion_rss('SELECT count(DISTINCT a) FROM lion_rss_t WHERE r < 524288');
 SELECT lion_rss('SELECT d.attr, count(*) FROM lion_rss_t f JOIN lion_rss_d d ON f.fk = d.pk
 	WHERE f.r < 524288 GROUP BY d.attr');
+-- What the walk of a collected range reads of an entry is freed after each
+-- set: the memory the collection holds is its union, not the 150,000 keys it
+-- walked (a megabyte and more, outside work_mem, before).
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+DECLARE c CURSOR FOR SELECT g, count(*) FROM lion_rss_t WHERE r < 524288 GROUP BY g;
+FETCH 1 FROM c;
+SELECT sum(total_bytes) < 262144 AS walk_freed
+  FROM pg_backend_memory_contexts WHERE name = 'LionCount where keys';
+CLOSE c;
+DECLARE c CURSOR FOR SELECT g, count(*) FROM lion_rss_t WHERE (r < 524288 OR a = 3) GROUP BY g;
+FETCH 1 FROM c;
+SELECT sum(total_bytes) < 262144 AS walk_freed
+  FROM pg_backend_memory_contexts WHERE name = 'LionCount where keys';
+COMMIT;
 
 DROP TABLE lion_rss_t, lion_rss_d;
 DROP FUNCTION lion_rss(text);

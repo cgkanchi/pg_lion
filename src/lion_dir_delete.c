@@ -835,10 +835,13 @@ lion_dir_delete_page(Relation index, LionIndexState *ix, BlockNumber leafblk,
  * took a downlink without comparing a key with the high key of the page it
  * landed on - the descent to the leftmost page of a level - and so has to
  * move off a page deleted under it by hand.  A DELETED page keeps the right
- * link it had, and the page it names took its range over.
+ * link it had, and the page it names took its range over.  Each page right
+ * of buf is read through strategy: NULL, or VACUUM's for the descent its walk
+ * starts with (lion_dir_leftmost_leaf_ext()).
  */
 Buffer
-lion_dir_past_deleted(Relation index, Buffer buf, int lockmode)
+lion_dir_past_deleted(Relation index, Buffer buf, int lockmode,
+					  BufferAccessStrategy strategy)
 {
 	LionRightWalk walk;
 
@@ -855,7 +858,7 @@ lion_dir_past_deleted(Relation index, Buffer buf, int lockmode)
 					 errmsg("lion index \"%s\": deleted directory page %u has no right sibling",
 							RelationGetRelationName(index), blk)));
 		}
-		buf = lion_dir_step_right(index, buf, lockmode, &walk);
+		buf = lion_dir_step_right_ext(index, buf, lockmode, &walk, strategy);
 	}
 	return buf;
 }

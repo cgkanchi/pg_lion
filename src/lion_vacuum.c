@@ -292,15 +292,20 @@ lion_vac_visited(LionVacState *vs, BlockNumber blk)
  * sizes, which the heap's pages go through as well.  Without it every page of
  * the index the walk reads stays in shared buffers and pushes out what the
  * queries had there; with it a VACUUM of an index larger than the ring leaves
- * no more than the ring behind, as nbtree's btvacuumpage() does.  Taking
- * pages out of the trees reads through it too - the directory's page
- * deletion (lion_dir_delete_page()) and a posting set's empty leaves
- * (lion_posting_unlink_leaf()) - for a VACUUM that empties a run of leaves
- * reads every one of them again, with its siblings.  The pages read by the
- * code a VACUUM shares with the inserts - a split of a page a container grew
- * out of (lion_vacuum_regrow()), a spill, finding an entry again after an
- * insert moved it - are few, and are read without it, as is the meta page,
- * which every scan reads.
+ * no more than the ring behind, as nbtree's btvacuumpage() does.  Every
+ * other page VACUUM reads to its own ends goes through it too: the descent
+ * to the leftmost leaf the walk starts from (lion_dir_leftmost_leaf_ext()),
+ * the descents that find an entry or a summary again after an insert moved
+ * it (lion_vac_ref_relocate()), the root the sweep asks about
+ * (lion_posting_root_live()), and taking pages out of the trees - the
+ * directory's page deletion (lion_dir_delete_page()) and a posting set's
+ * empty leaves (lion_posting_unlink_leaf()) - for a VACUUM that empties a
+ * run of leaves reads every one of them again, with its siblings.  The pages
+ * read by the writes a VACUUM shares with the inserts - a split of a leaf an
+ * entry or a container grew out of (lion_vacuum_regrow()) and any unfinished
+ * split it finishes, a spill, and every candidate the free space map offers
+ * an allocation (lion_alloc_page()) - are read without it, as many as those
+ * writes need, and so is the meta page, which every scan reads.
  */
 static inline Buffer
 lion_vac_read(LionVacState *vs, BlockNumber blk)
@@ -656,7 +661,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	 * ever.
 	 */
 	lion_rightwalk_init(&walk);
-	blk = lion_dir_leftmost_leaf(index, vs.ix);
+	blk = lion_dir_leftmost_leaf_ext(index, vs.ix, vs.strategy);
 	while (BlockNumberIsValid(blk))
 	{
 		BlockNumber next;
@@ -1109,7 +1114,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 
 	/* the internal pages of the descent to the leftmost leaf, then leaves */
 	nread = meta.height;
-	blk = lion_dir_leftmost_leaf(index, ix);
+	blk = lion_dir_leftmost_leaf_ext(index, ix, info->strategy);
 	while (BlockNumberIsValid(blk))
 	{
 		Buffer		buf;
@@ -1531,8 +1536,9 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 
 		lion_search_key_init(col, &sk, LION_KIND_SUMMARY,
 							 lion_fetch_key(col, ent->keydata), 0);
-		buf = lion_dir_search(vs->index, vs->heaprel, vs->ix, &sk,
-							  BUFFER_LOCK_SHARE, false, &off);
+		buf = lion_dir_search_ext(vs->index, vs->heaprel, vs->ix, &sk,
+								  BUFFER_LOCK_SHARE, false, &off,
+								  vs->strategy);
 		lion_rightwalk_init(&walk);
 		for (;;)
 		{
@@ -1555,8 +1561,8 @@ lion_vac_ref_relocate(LionVacState *vs, LionVacEntryRef *ref,
 			}
 			if (LionPageIsRightmost(page))
 				break;
-			buf = lion_dir_step_right(vs->index, buf, BUFFER_LOCK_SHARE,
-									  &walk);
+			buf = lion_dir_step_right_ext(vs->index, buf, BUFFER_LOCK_SHARE,
+										  &walk, vs->strategy);
 			off = lion_page_first_data(BufferGetPage(buf));
 		}
 summary_gone:
@@ -1581,8 +1587,9 @@ summary_gone:
 		memcpy(LionEntryGetKey(probe), ent->keydata, ent->keylen);
 	lion_search_key_exact(vs->ix, &sk, probe);
 
-	if (!lion_dir_find(vs->index, vs->heaprel, vs->ix, &sk,
-					   BUFFER_LOCK_SHARE, false, &buf, &off, NULL))
+	if (!lion_dir_find_ext(vs->index, vs->heaprel, vs->ix, &sk,
+						   BUFFER_LOCK_SHARE, false, &buf, &off, NULL,
+						   vs->strategy))
 	{
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);
@@ -3420,7 +3427,7 @@ lion_vacuum_sweep(LionVacState *vs)
 				!lion_posting_root_live(vs->index,
 										LionPageGetOpaque(page)->owner_hash,
 										LionPageGetOpaque(page)->owner_head,
-										false))
+										false, vs->strategy))
 			{
 				lion_vac_free_page(vs, buf, blk);
 				progress = true;
