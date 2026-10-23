@@ -16951,7 +16951,8 @@ several of one - item for item the classification `lion_scan_choose()` makes, wh
 `lion_set_merge_cost()`, which is gone; it keeps what is the scan's: a TID a result row at
 `cpu_index_tuple_cost`, the quals' arguments, and the heap, which core prices. A nested loop's inner
 scan repeats the AND, and its pages are spread over the repetitions as `genericcostestimate()`
-spreads its own (`index_pages_fetched()`). What is the count's own is the heap recheck of the pages
+spreads its own (`index_pages_fetched()`), as are a correlated subquery's over its calls (§40.11).
+What is the count's own is the heap recheck of the pages
 the visibility map cannot vouch for, and its row; its visibility-map checks are inside the merge's
 constants, which were fitted on counts (`LION_MEMBER_COST` is the mask built from a container's
 members), so the scan is charged them too - 0.74 ns a member beside the 10 ns a TID it pays anyway.
@@ -23803,6 +23804,109 @@ the probe 61,753, the primary key's leaves and the lion indexes; on a dimension 
 core's is a synchronous read from the device, and the probe reads none of them. A
 500M-row dimension was not built: its set's build grows with the heap's containers, 0.8 to 1.5 us
 each of each posting set, some 1 to 2 s for 85 GB under four filters.
+
+### 40.11 A correlated subquery's calls (2026-10-23)
+
+The shape is
+
+    SELECT d.id,
+           (SELECT count(*) FROM fact f
+             WHERE f.dim_id = d.id AND f.doc @@ '<a tsquery>'::tsquery) AS n
+      FROM dim d WHERE <a filter on d>
+
+or the same subquery as an `EXISTS`, or a scalar sub-select of another aggregate (`max(f.id)`):
+a subquery that refers to the query around it, which the executor runs again for every outer row,
+the outer row's value arriving as an exec Param. Core plans such a subquery as a query of its own,
+with no loop count, prices each of its scans for one call, and `cost_subplan()` charges the plan's
+price again per call. For core's scans that is the convention a heap page is charged in. For
+lion's it charged every call the pages of the first: the posting trees a sought set reads, the
+directory leaves its keys are looked up in, a set that §40.10's probe builds once and keeps across
+rescans - the parts of a nested loop's inner side that core's parameterized paths spread over their
+loops (`index_pages_fetched()` with the loop count, `cost_index()`), and that a correlated
+subquery repeats exactly as a loop does. On a fact table with a lion index on the key and a
+tsvector and a covering B-tree on the key, a correlated count over a thousand outer rows was
+priced at a call as the same count in a prepared statement's generic plan, and the subquery's
+lion paths lost to core's B-tree scans they beat inside a join of the same rows.
+
+So a lion path whose quals hold an outer query's exec Param is priced as the inner side of a nested
+loop over an assumed number of calls.
+
+- **The calls** (`lion_outer_param_loops()`, lion_selfuncs.c). The subquery's exec Params are
+  found in its quals (RestrictInfos and IndexClauses looked into) and each is looked up in the
+  `plan_params` of the query levels above, where `replace_outer_var()` lists the outer Var it
+  stands for while the subquery is planned, with that level's range table index. The calls are
+  the rows of the Var's relation, and of several relations the fewest, as `get_loop_count()`
+  takes the fewest rows of a parameterized path's outer relations. The outer level is still being
+  planned and its relations not yet sized, so the rows are the relation's own -
+  `pg_class.reltuples` scaled to its pages now (`estimate_rel_size()`), before the outer query's
+  restrictions, read once per planner run (the run cache of §33). A filter on the outer relation
+  makes the calls fewer than that, and the price a call's share of more calls than there are:
+  index pages are spread further than they will be, which, as for a parameterized scan, matters
+  only where the index is larger than `effective_cache_size` says the cache holds. Restricting the
+  outer relation would need its clauses' selectivity before its level has its paths; it was not
+  done.
+- **What is not a loop.** A Param that is not an outer relation's Var - an InitPlan's output, an
+  outer aggregate or PlaceHolderVar, a prepared statement's own (`PARAM_EXTERN`, its generic
+  plan's `$1`) - is evaluated once, or once per execution, and its scan keeps the price of one
+  call. A relation of no known size (a subquery's, a function's, a table neither vacuumed nor
+  analyzed that `estimate_rel_size()` makes nothing of) gives no calls either.
+- **The lion index's own scans** (`lioncostestimate()`). `genericcostestimate()` takes the loop
+  count times the calls, so the directory leaves and the pages it prorates are spread over both;
+  the price of a set AND (§29.11, "One price for the AND of sets") spreads its leaves and posting
+  pages the same way (`setand.leafpages + setand.setpages`), its CPU a call's. The heap is core's,
+  which prices a subquery's heap pages for one call, and `lion_plain_heap_correlation()` keeps
+  core's loop count.
+- **The walk of a covering B-tree** (`lo_cost()`, lion_ordered.c). The subquery's walk is a
+  probe, as §40.10's: its B-tree's descents and pages priced by the B-tree's `amcostestimate`
+  at the calls times the loops, the build priced by containers (`lo_build_excess()`), and the
+  build's start-up divided by the calls as well as by §40.10's `scans`: a set no Param reaches is
+  built once and kept for every call (`lo_rescan()` rebuilds it only when a lion Param changed). A
+  set whose Lion Cond holds the outer Param - the subquery's key is in a lion column too - is built
+  again at every call, as `Lion Set`'s `N builds` shows; its lookups' pages alone are spread over
+  the calls (`lo_lion_amortized()`: each leaf of the lion access priced again at the calls, the
+  difference taken off), the build's CPU a call's. The heap's pages are a call's, as core's.
+- **The count** (`lion_cost_count_rel_one()`, `lion_count_rel_calls_share()`, lion_plan_cost.c). A
+  `LionCount` whose WHERE holds the Param is located again at every call (its rescan re-locates
+  everything), so nothing is built once; the pages it reads - the directory leaves at random, an IN
+  list's buckets, the walked and the sought posting pages - are spread over the calls as fetches at
+  random from the indexes its WHERE reads (`index_pages_fetched()` of the pages times the calls over
+  those indexes' pages, divided back), the CPU of the lookups, the merges and the counts a call's,
+  and the heap a recheck reads a call's.
+- **Unchanged.** `cost_subplan()`: a SubPlan's price is still its plan's per call, and the whole of
+  the change is what a call costs. A join's paths, which the planner sees inside their loop, carry
+  Vars and no exec Params and are priced as they were; a parameterized path's own loop count is
+  core's as before, the calls multiplying it only inside a correlated subquery. No setting: the
+  price follows the shape, and the switches that remove the paths (`pg_lion.enable_count_pushdown`,
+  `pg_lion.enable_btree_scan`, `pg_lion.enable_plain_scan`) remove them here too.
+
+**Measured** (2026-10-23; the test's tables: 100,208 dimension rows, 300,000 fact rows - eight keys
+of 5,000 rows, two hundred of 300 and the rest one to three - a lion index on the key and a
+three-word tsvector, a B-tree on the key including `id`; the subquery called for the 1,003 keys of
+one group; warm, `effective_cache_size` the default 4 GB). A call's price, before and after, the
+generic plan's being what a call cost before:
+
+| subquery's scan | a call, generic plan | a call, correlated | chosen there instead |
+|---|---|---|---|
+| `LionCount` | 11.6 | 2.3 to 3.0 | - |
+| the lion index's Index Scan (the count off) | (core's bitmap scan of the B-tree, 16.3) | 6.3 | core's bitmap scan |
+| `LionBtreeScan` (the count and the lion index's scans off) | (core's Index Scan, 16.5) | 2.8 | core's Index Scan |
+
+The table being warm and small, the plans' times are close: 16 to 20 ms for the count, 19 ms for
+the walk against core's Index Scan's 22, and 37 ms for the lion index's Index Scan against 17 for a
+bitmap scan of it and 22 for core's Index Scan - a lion index scan's rescan costs a few dozen
+microseconds of CPU that §29.11 prices, and that the cache hides from nothing here. What the change
+prices is the index pages a cold loop reads once rather than at every call.
+
+**Not done.** The outer relation's restrictions (above). A subquery's heap pages stay a call's
+each: core's convention for its own scans, which lion's are compared with. A SubPlan core hashes
+(`hashed SubPlan`, its Params none) is run once and is not a loop; a correlated subquery under a
+Memoize does not exist in core's plans.
+
+**Tests.** test/sql/correlated.sql: the correlated count, its price at a call under half the
+generic plan's and an InitPlan's Param priced as the generic plan's; the lion index's Index Scan
+and the walk chosen in the subquery where the generic plan takes core's bitmap and index scans; a
+scalar `max()` sub-select and an `EXISTS` through the walk; every answer compared with core's plan,
+the lion paths off; and the join of the same rows, its plans unchanged.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 

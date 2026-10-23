@@ -3117,6 +3117,7 @@ typedef struct LionCountRelCost
 	Cost		seq_cost;		/* ... and their price, each at its index's
 								 * third rung (lion_index_page_cost()) */
 	Cost		lookup_cost;	/* an IN list's bucket pages, in order */
+	double		lookup_pages;	/* ... how many */
 	Cost		probe_cost;		/* what the SOUGHT sources read (§22) */
 	Cost		read_cpu;		/* containers read whole: unions, lists */
 	Cost		merge_cpu;		/* the AND's driver and probes (§10) */
@@ -3392,6 +3393,7 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 	c->clauseindex[c->ci] = idx;
 	c->clausesel[c->ci++] = sel;
 	c->lookup_cost += sc->lookup;
+	c->lookup_pages += sc->lookuppages;
 	c->descent_cost += sc->descent;
 
 	/*
@@ -4796,6 +4798,47 @@ lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
 }
 
 /*
+ * The share of its index pages a count pays at a call of a correlated
+ * subquery (DESIGN.md §40.11), 1 elsewhere: a WHERE holding an outer query's
+ * Param is located again at every call (lion_rescan_custom_scan()), and the
+ * pages it reads - the directory leaves, the walked and the sought posting
+ * pages - are spread over the calls lion_outer_param_loops() assumes, as
+ * index_pages_fetched() spreads a parameterized scan's over its loops: as
+ * fetches at random from the indexes the WHERE reads.  The CPU of the
+ * lookups, the merges and the counts stays the call's, and so does the heap
+ * a recheck reads, which core prices a subquery's scans for one call.
+ */
+static double
+lion_count_rel_calls_share(LionCountRelCost *c)
+{
+	double		calls = lion_outer_param_loops(c->root,
+											   (Node *) c->whereclauses);
+	double		pages = c->random_pages + c->lookup_pages + c->seq_pages +
+		c->probed_pages;
+	double		idxpages = 0;
+	List	   *seen = NIL;
+	ListCell   *lc;
+
+	if (calls <= 1.0 || pages <= 0.0)
+		return 1.0;
+	foreach(lc, c->whereidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx == NULL || list_member_ptr(seen, idx))
+			continue;
+		seen = lappend(seen, idx);
+		idxpages += Max((double) idx->pages, 1.0);
+	}
+	if (c->groupidx != NULL && !list_member_ptr(seen, c->groupidx))
+		idxpages += Max((double) c->groupidx->pages, 1.0);
+	list_free(seen);
+	idxpages = Max(idxpages, 1.0);
+	return Min(index_pages_fetched(pages * calls, (BlockNumber) idxpages,
+								   idxpages, c->root) / (pages * calls), 1.0);
+}
+
+/*
  * What a LionCount path costs over one relation, phase by phase: the WHERE
  * clauses' lookups and the sources of their AND, the merges that count them,
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
@@ -4824,6 +4867,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
 	Cost		run;
+	double		share;
 
 	memset(&c, 0, sizeof(c));
 	c.root = root;
@@ -4915,6 +4959,10 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	run += c.lookup_cost;
 	run += c.seq_cost;			/* c.seq_pages, each at its index's rung */
 	run += c.probe_cost;
+	share = lion_count_rel_calls_share(&c);
+	if (share < 1.0)
+		run -= (1.0 - share) * (c.random_pages * random_page_cost +
+								c.lookup_cost + c.seq_cost + c.probe_cost);
 	run += c.read_cpu + c.merge_cpu;	/* containers, members, probes (§10) */
 	run += c.merge_ops * cpu_operator_cost;
 	run += c.recheck_pages * lion_heap_page_cost(root, rel, c.recheck_pages,

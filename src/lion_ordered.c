@@ -1628,6 +1628,44 @@ lo_build_excess(PlannerInfo *root, Path *lion, double tuples, double pages)
 }
 
 /*
+ * What the lion access's lookups cost less, a call, when a correlated
+ * subquery's walk rebuilds its set at every call (DESIGN.md §40.11): its
+ * pages spread over the `loops` calls, as lioncostestimate() spreads a
+ * parameterized scan's.  A leaf whose quals hold the outer query's Param was
+ * priced so already (lioncostestimate()); the others are priced again at the
+ * loop count, and the difference, at most nothing, is returned.  The CPU of
+ * the lookups stays the call's.
+ */
+static Cost
+lo_lion_amortized(PlannerInfo *root, Path *lion, double loops)
+{
+	Cost		less = 0.0;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) lion;
+		Cost		startup;
+		Cost		total;
+		Selectivity sel;
+		double		corr;
+		double		pages;
+
+		if (lion_outer_param_loops(root,
+								   (Node *) ipath->indexclauses) > 1.0)
+			return 0.0;
+		ipath->indexinfo->amcostestimate(root, ipath, loops, &startup, &total,
+										 &sel, &corr, &pages);
+		return Min(total - ipath->indextotalcost, 0.0);
+	}
+	foreach(lc, IsA(lion, BitmapAndPath) ?
+			((BitmapAndPath *) lion)->bitmapquals :
+			castNode(BitmapOrPath, lion)->bitmapquals)
+		less += lo_lion_amortized(root, (Path *) lfirst(lc), loops);
+	return less;
+}
+
+/*
  * The price of one (ordered path, lion access) pair (DESIGN.md §30.3), and the
  * size its set is expected to have.  rows is what the node returns, as lion's
  * estimates see it (lion_probe_rel_rows()).  In index-only mode (§40.3) the
@@ -1660,6 +1698,15 @@ lo_build_excess(PlannerInfo *root, Path *lion, double tuples, double pages)
  * scan's), whose heap pages are amortized over the loops as cost_index()
  * amortizes a parameterized scan's, and which pays its share of the set,
  * built once for every scan the loop makes: the build divided by `scans`.
+ *
+ * In a correlated subquery, whose quals hold an outer query's Param, the price
+ * is a call's of the loop the subquery is (DESIGN.md §40.11), over the calls
+ * lion_outer_param_loops() assumes: the walk's descents and the B-tree's pages
+ * spread over them as core spreads a parameterized scan's, and the set's build
+ * too where no Param reaches the lion quals - it is built once and kept for
+ * every call (lo_rescan()) - or, where one does, its lookups' pages alone,
+ * the set being built again at every call.  The heap's pages are a call's, as
+ * core prices the subquery's own scans.
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
@@ -1691,15 +1738,30 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		pages_corr;
 	double		corr = 0.0;
 	double		ipages = 0.0;
+	double		calls;
+	bool		rebuilt = false;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
 	Cost		cpu;
+	Cost		ordtotal = ord->indextotalcost;
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 
+	/* a correlated subquery's calls, over which its walk is a probe (§40.11) */
+	calls = lion_outer_param_loops(root,
+								   (Node *) list_make3(ord->indexclauses,
+													   lionqual, residual));
+	if (calls > 1.0)
+	{
+		rebuilt = lion_has_exec_param((Node *) lionqual);
+		if (rebuilt)
+			lioncost = Max(lioncost + lo_lion_amortized(root, lion, calls),
+						   0.0);
+	}
+
 	/* a nested loop's probe: its lookups as its set's build reads them */
-	if (ord->path.param_info != NULL)
+	if (ord->path.param_info != NULL || calls > 1.0)
 		lioncost = Max(lioncost -
 					   lo_build_excess(root, lion, tuples, pages) *
 					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
@@ -1739,6 +1801,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	startup = lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
 		lo_spill_cost(lo_set_bytes(members, ncont));
+	if (calls > 1.0 && !rebuilt)
+		scans *= calls;
 	if (scans > 1.0)
 		startup /= scans;
 
@@ -1747,7 +1811,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * CPU, which a parallel walk divides
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-	run = ord->indextotalcost;
 	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
@@ -1815,9 +1878,20 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Cost		t;
 		Selectivity isel;
 
-		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
-									   &ipages);
+		/*
+		 * The B-tree's correlation and pages; and in a correlated subquery
+		 * its own cost again, its pages spread over the calls as well as
+		 * over a nested loop's scans (§40.11).
+		 */
+		ord->indexinfo->amcostestimate(root, ord,
+									   (calls > 1.0) ?
+									   calls * (ord->path.param_info != NULL ?
+												loops : 1.0) : 1.0,
+									   &s, &t, &isel, &corr, &ipages);
+		if (calls > 1.0)
+			ordtotal = Min(t, ordtotal);
 	}
+	run = ordtotal;
 	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
 	if (loops > 1.0)
 	{

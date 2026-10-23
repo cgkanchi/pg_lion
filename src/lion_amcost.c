@@ -1835,6 +1835,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	bool		emits_all_rows;
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 	double		walkrows = 0.0;
+	double		idxloops;
 
 	/*
 	 * pg_lion.enable_plain_scan off (DESIGN.md §29.11, "Plain scans switched
@@ -1867,7 +1868,18 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	if (fullscan)
 		costs.numIndexTuples = Max(path->indexinfo->tuples, 1.0);
 
-	genericcostestimate(root, path, loop_count, &costs);
+	/*
+	 * The scans the index's pages are spread over: a nested loop's, and in a
+	 * correlated subquery the calls it is assumed to be made over, when the
+	 * quals hold an outer query's Param (DESIGN.md §40.11).  Only the index's
+	 * pages: the heap side is core's, which prices a subquery's heap pages for
+	 * one call (lion_plain_heap_correlation() is given core's loop count).
+	 */
+	idxloops = loop_count *
+		lion_outer_param_loops(root,
+							   (Node *) get_quals_from_indexclauses(path->indexclauses));
+
+	genericcostestimate(root, path, idxloops, &costs);
 
 	/*
 	 * genericcostestimate() charges every index tuple it expects to visit an
@@ -1886,7 +1898,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		list_length(get_quals_from_indexclauses(path->indexclauses));
 	costs.indexTotalCost = Max(costs.indexTotalCost, costs.indexStartupCost);
 
-	lion_cost_canonical_sel(root, path, loop_count, fullscan, &costs);
+	lion_cost_canonical_sel(root, path, idxloops, fullscan, &costs);
 
 	if (fullscan)
 	{
@@ -1948,7 +1960,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 		{
 			LionAndCost setand;
 			Cost		setcost;
-			Cost		pagecost = lion_generic_page_cost(root, path, loop_count,
+			Cost		pagecost = lion_generic_page_cost(root, path, idxloops,
 														  &costs);
 			double		factor;
 			int			i;
@@ -1975,13 +1987,13 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
 										setcols, (Node **) setquals, factor,
 										&setand);
-			if (loop_count > 1)
+			if (idxloops > 1)
 				setcost = setand.cpu +
 					index_pages_fetched((setand.leafpages + setand.setpages) *
-										loop_count,
+										idxloops,
 										index->pages, (double) index->pages,
 										root) *
-					costs.spc_random_page_cost / loop_count;
+					costs.spc_random_page_cost / idxloops;
 			costs.indexTotalCost += setcost - pagecost;
 			costs.indexTotalCost = Max(costs.indexTotalCost,
 									   costs.indexStartupCost);

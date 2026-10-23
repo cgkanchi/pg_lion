@@ -1904,6 +1904,16 @@ extern double lion_probe_rel_rows(PlannerInfo *root, RelOptInfo *rel);
 extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
 
 /*
+ * A correlated subquery's scan, priced as the inner side of the loop it is
+ * (DESIGN.md §40.11): the calls a scan whose quals are `quals` is assumed to
+ * be made over - the fewest rows of the outer relations whose Vars its exec
+ * Params hand it, 1 where it has none - and whether quals hold an exec Param
+ * at all, one that may change between two scans.
+ */
+extern double lion_outer_param_loops(PlannerInfo *root, Node *quals);
+extern bool lion_has_exec_param(Node *node);
+
+/*
  * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
  * estimate of a conjunction holding the n set clauses - on key columns
  * cols[] (1-based) of lion index idx of rel - is to be multiplied by, 1 when
