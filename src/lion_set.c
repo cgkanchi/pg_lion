@@ -668,6 +668,47 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
 	return lion_posting_set_locate(index, state, &probe, key, hash, ps);
 }
 
+/*
+ * The TIDs the entry of key holds in key column attno, for the planner's
+ * frequencies of the values a query lists (DESIGN.md §33, "The frequencies of
+ * the listed values"): its header's ntids, which every write keeps exact and
+ * which counts a dead row until VACUUM takes its TID out.  One descent, the
+ * leaf share-locked while the header is read and let go of at once: no
+ * posting set, no pin kept, and no predicate lock, because an estimate is not
+ * a read of the query's rows - core's own plan-time probe of an index
+ * (get_actual_variable_endpoint()) takes none either.
+ *
+ * key is of the column's own key type (lion_probe_init()'s keytype
+ * InvalidOid): a cross-type value may need a walk of every leaf
+ * (lion_dir_find_by_scan()), which a plan may not cost.  False, with *ntids
+ * 0, when the key has no entry.
+ */
+bool
+lion_key_ntids(Relation index, AttrNumber attno, Datum key, uint64 *ntids)
+{
+	LionState  *state = lion_index_column_state(index, attno);
+	LionProbe	probe;
+	LionSearchKey sk;
+	Buffer		buf;
+	OffsetNumber off;
+	bool		moved;
+	bool		found;
+
+	*ntids = 0;
+	lion_probe_init(index, state, InvalidOid, &probe);
+	key = lion_probe_value(&probe, key);
+	lion_probe_search_key(state, &probe, key,
+						  lion_probe_hash(state, &probe, key), &sk);
+
+	found = lion_dir_find(index, NULL, state->ix, &sk, BUFFER_LOCK_SHARE,
+						  false, &buf, &off, &moved);
+	if (found)
+		*ntids = lion_entry_ntids(lion_page_entry(BufferGetPage(buf), off));
+	if (BufferIsValid(buf))
+		UnlockReleaseBuffer(buf);
+	return found;
+}
+
 
 /*
  * One of many single lookups a caller keeps located together - the keys of a

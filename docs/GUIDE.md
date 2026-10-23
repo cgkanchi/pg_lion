@@ -46,8 +46,9 @@ to a temporary file past it. A range on another column (`... WHERE created_at >=
 country`, with `summaries = on` on its index) is one such filter, collected from the summaries and
 past the memory into a temporary file too - a table's ranges share the memory, and one that does
 not fit what the others left sends those to files first; where there are only a few counts to
-make - a `count(DISTINCT)`'s tests, which stop at a row - the planner may walk it at each instead,
-when that is the cheaper (`Range Sources Walked` in `EXPLAIN ANALYZE`). The groups are then
+make - a few groups, or a `count(DISTINCT)`'s tests, which stop at a row - the planner may walk it
+at each instead, whether or not it fits, when that is clearly the cheaper (`Range Sources Walked`
+in `EXPLAIN ANALYZE`). The groups are then
 counted against it up to a few hundred at a time, in one pass over its containers for all of them
 (`Group Batches` in `EXPLAIN ANALYZE`). With parallel query enabled
 (`max_parallel_workers_per_gather`) such a `GROUP BY` over one table can

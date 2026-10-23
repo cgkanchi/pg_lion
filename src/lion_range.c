@@ -1633,10 +1633,10 @@ void
 lion_entry_scan_pause(LionEntryScan *es)
 {
 	Assert(!es->usesum);
-	if (!BufferIsValid(es->batchbuf) || es->nextbatch == 0)
-		return;
 	if (unlikely(es->usesum))
 		elog(ERROR, "lion index: a walk that uses summaries cannot be paused");
+	if (!BufferIsValid(es->batchbuf) || es->nextbatch == 0)
+		return;
 
 	ReleaseBuffer(es->batchbuf);
 	es->batchbuf = InvalidBuffer;

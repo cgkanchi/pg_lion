@@ -451,6 +451,45 @@ SELECT null_tids, empty_tids, emptydim_tids, emptyinner_tids, nullelem_tids
   FROM lion_index_stats('lion_ned_a');
 SELECT lion_index_verify('lion_ned_a', true);
 
+-- ---- the rows the planner expects --------------------------------------
+-- Core's statistics count an empty array with dimensions among the arrays
+-- unequal to '{}', and so does the clause lion's estimates put in the place
+-- of a test of whether an array is empty (lion_nonempty_clause()); the
+-- shares of the EMPTYDIM and EMPTYINNER rows among the column's most common
+-- values go on or come off its estimate as the test selects them
+-- (lion_ne_dims_clause()).  'close' is within 10% of the rows there are.
+CREATE FUNCTION lion_ned_rows(cond text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	plan json;
+	est float8;
+	actual bigint;
+BEGIN
+	EXECUTE format('EXPLAIN (FORMAT JSON) SELECT * FROM lion_ned_t WHERE %s', cond)
+		INTO plan;
+	est := (plan -> 0 -> 'Plan' ->> 'Plan Rows')::float8;
+	EXECUTE format('SELECT count(*) FROM lion_ned_t WHERE %s', cond) INTO actual;
+	IF abs(est - actual) <= 0.1 * actual + 1 THEN
+		RETURN format('%s rows, estimate close', actual);
+	END IF;
+	RETURN format('%s rows, estimate off %sx', actual,
+				  round((greatest(est, actual) / greatest(least(est, actual), 1))::numeric, 1));
+END $$;
+SELECT c AS cond, lion_ned_rows(c) FROM unnest(ARRAY[
+	$$cardinality(a) = 0$$,
+	$$cardinality(a) > 0$$,
+	$$array_length(a, 1) = 0$$,
+	$$array_length(a, 1) > 0$$,
+	$$array_length(a, 1) IS NOT NULL$$,
+	$$coalesce(array_length(a, 1), 0) = 0$$,
+	$$cardinality(a) = 0 AND array_length(a, 1) > 0$$,
+	$$cardinality(a) = 0 AND array_length(a, 1) IS NOT NULL$$,
+	$$a = '{}'$$,
+	$$a <> '{}'$$,
+	$$a IS NOT NULL AND cardinality(a) = 0$$
+]) c;
+DROP FUNCTION lion_ned_rows(text);
+
 DROP TABLE lion_ned_t;
 DROP FUNCTION lion_ned(text, text);
 DROP FUNCTION lion_ned_each(text[], text);

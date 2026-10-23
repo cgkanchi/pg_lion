@@ -1216,14 +1216,18 @@ lion_explain_scan_counters(LionCountScanState *st, const LionCountStats *tot,
 
 /*
  * EXPLAIN ANALYZE's counters of ranges and sums: how the range bounding a
- * sum was evaluated, the summaries and walks it used, and the ranges taken
- * as sources - the leader's and, under a Gather, its workers' (st->worker).
+ * sum was evaluated, the summaries and walks it used, and the ranges and
+ * lists taken as sources - the leader's and, under a Gather, its workers'
+ * (st->worker, st->workercounted).
  */
 static void
 lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 {
 	StringInfoData buf;
 	int64		eval[lengthof(st->rangeeval)];
+	int64		ranges[3] = {0, 0, 0};	/* collected, walked, spilled */
+	int64		lists[3] = {0, 0, 0};
+	int			i;
 	int			k;
 
 	for (k = 0; k < (int) lengthof(eval); k++)
@@ -1283,43 +1287,39 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 							   st->rangeprobed + st->worker.rangeprobed, es);
 
 	/*
-	 * The ranges taken as sources (DESIGN.md §32): collected, or - too large
-	 * for the memory, where the plan walks those - summed over their walk at
-	 * every count they are part of.  Again only when there were any.  Each
-	 * participant of a parallel count collects its own (DESIGN.md §10, "A
-	 * count in parallel").
+	 * The ranges taken as sources (DESIGN.md §32): collected, or walked at
+	 * every count they are part of, where the plan walks those - and of the
+	 * collected, those spilled to a file, past the memory; and the IN lists
+	 * too long to locate at once that were collected the same way (§15, "A
+	 * list too long to locate at once"), and of those the ones spilled.  How
+	 * many sources, each once however many partitions, runs, rescans or
+	 * participants collected it (LionClauseState.counted); again only when
+	 * there were any.
 	 */
-	if (st->rangesrc_collected + st->worker.rangesrc_collected > 0)
-		ExplainPropertyInteger("Range Sources Collected", NULL,
-							   st->rangesrc_collected +
-							   st->worker.rangesrc_collected, es);
-	if (st->rangesrc_walked + st->worker.rangesrc_walked > 0)
-		ExplainPropertyInteger("Range Sources Walked", NULL,
-							   st->rangesrc_walked +
-							   st->worker.rangesrc_walked, es);
-	/*
-	 * ... and of the collected, those spilled to a file, past the memory
-	 */
-	if (st->rangesrc_spilled + st->worker.rangesrc_spilled > 0)
-		ExplainPropertyInteger("Range Sources Spilled", NULL,
-							   st->rangesrc_spilled +
-							   st->worker.rangesrc_spilled, es);
+	for (i = 0; i < st->nclause; i++)
+	{
+		uint8		counted = st->clause[i].counted |
+			((st->workercounted != NULL) ? st->workercounted[i] : 0);
+		int64	   *n = (st->clause[i].kind == LION_CLAUSE_ARRAY) ? lists :
+			ranges;
 
-	/*
-	 * The IN lists too long to locate at once that were collected the same
-	 * way (DESIGN.md §15, "A list too long to locate at once"), and of those
-	 * the ones spilled: how many lists, each once however many partitions,
-	 * runs, rescans or participants collected it - the participants of a
-	 * parallel count collect the same lists, so the most any of them did.
-	 */
-	if (Max(st->listsrc_collected, st->worker.listsrc_collected) > 0)
-		ExplainPropertyInteger("Lists Collected", NULL,
-							   Max(st->listsrc_collected,
-								   st->worker.listsrc_collected), es);
-	if (Max(st->listsrc_spilled, st->worker.listsrc_spilled) > 0)
-		ExplainPropertyInteger("Lists Spilled", NULL,
-							   Max(st->listsrc_spilled,
-								   st->worker.listsrc_spilled), es);
+		if (counted & LION_SRC_COLLECTED)
+			n[0]++;
+		if (counted & LION_SRC_WALKED)
+			n[1]++;
+		if (counted & LION_SRC_SPILLED)
+			n[2]++;
+	}
+	if (ranges[0] > 0)
+		ExplainPropertyInteger("Range Sources Collected", NULL, ranges[0], es);
+	if (ranges[1] > 0)
+		ExplainPropertyInteger("Range Sources Walked", NULL, ranges[1], es);
+	if (ranges[2] > 0)
+		ExplainPropertyInteger("Range Sources Spilled", NULL, ranges[2], es);
+	if (lists[0] > 0)
+		ExplainPropertyInteger("Lists Collected", NULL, lists[0], es);
+	if (lists[2] > 0)
+		ExplainPropertyInteger("Lists Spilled", NULL, lists[2], es);
 }
 
 /*
