@@ -1115,14 +1115,6 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 							 NULL);
 
 	/*
-	 * A key the plan does not know, priced at the rows a probed key meets
-	 * where the caller says so (DESIGN.md §33, "The rows of a probed key").
-	 */
-	if (skew > 1.0)
-		sel = Min(sel * skew, 1.0);
-	sc->sel = sel;
-
-	/*
 	 * A partial index's sets hold its predicate's rows alone (DESIGN.md §45):
 	 * the rows the index has (itup), and the share of them the clause
 	 * selects (psel), price its sets where a whole index's are the table's
@@ -1130,6 +1122,18 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	 */
 	itup = lion_index_rows(root, rel, idx);
 	psel = lion_index_clause_share(root, idx, lion_vcol_unvar(bare), sel);
+
+	/*
+	 * A key the plan does not know, priced at the rows a probed key meets
+	 * where the caller says so (DESIGN.md §33, "The rows of a probed key"):
+	 * the clause's share of the table's rows and of the index's alike.
+	 */
+	if (skew > 1.0)
+	{
+		sel = Min(sel * skew, 1.0);
+		psel = Min(psel * skew, 1.0);
+	}
+	sc->sel = sel;
 
 	/*
 	 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md §24):

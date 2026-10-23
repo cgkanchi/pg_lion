@@ -21402,9 +21402,10 @@ does not know, so the rest of it runs with the setting off.
 
 ### The rows of a probed key (2026-10-23)
 
-n_distinct says how many rows a key has on average over the keys. A probe does not meet an average
-key. Core prices a key the plan does not know when it plans at `(1 - nullfrac) / n_distinct` of
-the table (`var_eq_non_const()`), capped by the most common value's share: an equality to a Param,
+n_distinct is the number of distinct keys, from which core takes the rows a key has on average,
+`(1 - nullfrac) N / n_distinct` of a table of N rows. A probe does not meet an average key. Core
+prices a key the plan does not know when it plans at `(1 - nullfrac) / n_distinct` of the table
+(`var_eq_non_const()`), capped by the most common value's share: an equality to a Param,
 a nested loop's outer row, a correlated subquery's, a prepared statement's generic plan. That is
 the rows of a key drawn at random from the column's keys. The keys a query probes are not drawn
 that way. An outer row names the key its own row references, and a set of outer rows draws keys
@@ -21511,7 +21512,9 @@ extension's SQL does not create: `test/sql/skew.sql` binds them from the library
 - every answer against core's;
 - an EXISTS over the fact whose probed relation lists keys 9 to 128, the keys of 1,000 rows
   outside ANALYZE's list: the figure stays 750.50 with `pg_lion.enable_index_mcv` on and off, and
-  the semi-join's estimate, which takes the list's rows, is larger with it on.
+  the semi-join's estimate, which takes the list's rows, is larger with it on;
+- a copy of the fact's lion index, partial on a predicate every row meets (`fk IS NOT NULL`): the
+  correlated count's plans flip with the setting as the whole index's do, the count at its price.
 
 `test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
 subquery, and its fixtures' keys are skewed enough to move its plans.
@@ -24366,7 +24369,7 @@ loop over an assumed number of calls.
   again at every call, as `Lion Set`'s `N builds` shows; its lookups' pages alone are spread over
   the calls (`lo_lion_amortized()`: each leaf of the lion access priced again at the calls, the
   difference taken off), the build's CPU a call's. An InitPlan's Param in the Lion Cond is set once
-  for every call and rebuilds nothing: only a Param the levels above hand down
+  per execution, before the calls, and rebuilds nothing: only a Param the levels above hand down
   (`lion_has_outer_param()`, their `plan_params`) counts. The heap's pages are a call's, as
   core's.
 - **The count** (`lion_cost_count_rel_one()`, `lion_count_rel_calls_share()`, lion_plan_cost.c). A
