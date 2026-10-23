@@ -47,12 +47,26 @@
  *	  keeps the writers of that one leaf's keys waiting for that one walk.
  *
  * During recovery no lock above RowExclusiveLock can be taken and replay
- * takes no relation locks at all: there it takes AccessShareLock, reports
- * what it finds at once, as it always has, and is exact only while replay
- * leaves the index alone.  None of the settling above holds against replay,
- * which locks each record's pages for that record alone, so a standby is the
- * one place verify() can report damage that is not there.  What it must
- * never do there is hold a directory page while it waits for a posting page:
+ * takes no relation locks at all: there it takes AccessShareLock, and none
+ * of the settling above holds against replay, which locks each record's
+ * pages for that record alone and applies VACUUM - page deletion, leaves
+ * unlinked, whole sets freed - beside the check.  What settles a finding
+ * there is the pages' LSNs instead (DESIGN.md §7, "On a standby").  Replay
+ * stamps every page a record changes with the end of the record and moves
+ * the replay position past it only afterwards, so a walk that notes the
+ * position before it reads anything and reads no page whose LSN is past it
+ * has read the index as it was at that one point of the primary's WAL, where
+ * every invariant holds that holds between two records.  A finding such a
+ * walk makes is damage, and is reported; one that a page past the position
+ * may have caused means the walk is made again, or the finding is skipped -
+ * never a report.  So: a posting set or a position tree is walked again when
+ * replay changed a page of it under the walk, and settled by short passes
+ * when replay keeps changing it; the directory's levels and the reachability
+ * pass report only what pages at or below their position show; a summary is
+ * not held to a row whose transaction is still running; and an unfinished
+ * split's flag is looked at again at the end, and warned of only when no
+ * transaction that could still finish it runs.  What the check must never
+ * do there is hold a directory page while it waits for a posting page:
  * replay takes a record's posting pages BEFORE its directory leaf and holds
  * both to the end of the record (DESIGN.md §25), and two buffer locks taken
  * in opposite orders are a deadlock nothing detects and nothing cancels.  So
@@ -60,13 +74,7 @@
  * the entry read again afterwards - and a set that replay keeps changing is
  * kept from its last walk without comparing its totals, never walked with
  * the leaf held; and heapallindexed lets the entry's leaf go before it
- * descends the set, on a primary too.  A posting set that disagrees with
- * its entry, and a position tree that disagrees with its posting set, are
- * reported there only from a walk that read every page as it was at one
- * replay position, which the pages' LSNs show: replay applies VACUUM beside
- * the check, which can leave an entry reading the same around a walk that
- * read its set half before and half after.  One replay keeps from that is
- * kept without the comparison too.
+ * descends the set, on a primary too.
  *
  * With heapallindexed, lion_index_verify() evaluates the index's expressions
  * and predicate, which are the table owner's code; it runs them as the table
@@ -163,7 +171,8 @@ typedef struct LionVerifyCand
  * in memory, up to an equal share of work_mem (LION_VERIFY_SEQS of them are
  * alive at once), and writes the rest to a temporary file, which it reads
  * back in order.  A record is 16 bytes or less for every 8 KB page the walk
- * reads, so the file costs the walk next to nothing of what the reads do.
+ * reads (24 for a page flagged as an unfinished split, which is rare), so the
+ * file costs the walk next to nothing of what the reads do.
  */
 typedef struct LionVerifySeqAcct
 {
@@ -173,8 +182,15 @@ typedef struct LionVerifySeqAcct
 	int64		spilled;		/* records written to temporary files */
 } LionVerifySeqAcct;
 
-/* At most this many sequences are alive at once (lion_verify_seq_put()). */
-#define LION_VERIFY_SEQS	4
+/*
+ * At most this many sequences are alive at once (lion_verify_seq_put()): a
+ * walk's two levels and its flagged pages, the blocks a walk that may be
+ * thrown away marked, and a standby's flagged pages for the end of the check.
+ * A walk made with a directory leaf held keeps no sequence at all, so that
+ * nothing it reads goes through a file while it holds the leaf
+ * (lion_verify_chain()).
+ */
+#define LION_VERIFY_SEQS	5
 
 typedef struct LionVerifySeq
 {
@@ -220,10 +236,9 @@ typedef struct LionVerifyState
 
 	/*
 	 * Writers may run beside the check: true on a primary, where the check
-	 * holds ShareUpdateExclusiveLock.  On a standby it is false, and every
-	 * suspicion is reported the moment it arises, as it always was there -
-	 * but a posting set is walked with nothing held there too, and walked
-	 * again when replay changed it (lion_verify_set()).
+	 * holds ShareUpdateExclusiveLock.  On a standby it is false: there is no
+	 * waiting for writers there, and what replay may have changed under a
+	 * walk is told by the pages' LSNs instead (lsnstart, lsnhorizon).
 	 */
 	bool		concurrent;
 	bool		rootsplit;		/* the meta page showed a taller directory */
@@ -252,17 +267,72 @@ typedef struct LionVerifyState
 	int64		nposretries;	/* ... thrown away because a writer got in */
 	int64		nposholds;		/* ... made with the entry's leaf held */
 	int64		nposuncompared; /* trees a standby kept without comparing */
+	int64		nsetcounts;		/* a standby's counting passes of a set */
+	int64		nposcovers;		/* ... and comparisons of a tree, repeated */
+	int64		nflags;			/* flags a standby looked at again */
 	int			nwaits;			/* WaitForLockers() calls */
 
 	/*
-	 * On a standby, the replay position a walk of a position tree began at,
-	 * and whether a page it read since carries a later LSN
-	 * (lion_verify_read_page(), lion_verify_postree_walks()).
+	 * On a standby, the replay position the check began at, before it read
+	 * the meta page: a page whose LSN is past it changed since the check
+	 * began (the reachability pass, the meta page's count of directory
+	 * pages).  InvalidXLogRecPtr on a primary.
+	 */
+	XLogRecPtr	lsnstart;
+
+	/*
+	 * On a standby, the replay position the walk under way began at - of a
+	 * posting set, a position tree, or a level of the directory - and
+	 * whether a page it read since carries a later LSN
+	 * (lion_verify_read_page(), lion_verify_moved()).
 	 */
 	bool		lsntrack;
 	XLogRecPtr	lsnhorizon;
 	bool		lsnpast;
+
+	/*
+	 * On a standby, the pages a walk found flagged as an unfinished split,
+	 * for lion_verify_flags_recheck() at the end of the check
+	 * (LionVerifyFlag records).
+	 */
+	LionVerifySeq flags;
 } LionVerifyState;
+
+/*
+ * A page found flagged LION_PAGE_INCOMPLETE_SPLIT (lion_verify_flagged()):
+ * which page, of what, its LSN when it was read, and the next transaction id
+ * then - every transaction that could have written the flag has a lower one.
+ */
+typedef struct LionVerifyFlag
+{
+	BlockNumber blk;
+	uint16		what;			/* LION_VFLAG_* */
+	XLogRecPtr	lsn;
+	FullTransactionId next;
+} LionVerifyFlag;
+
+#define LION_VFLAG_DIR			0	/* a directory page */
+#define LION_VFLAG_POSTING		1	/* a page of a posting set */
+#define LION_VFLAG_POSITION		2	/* a page of a position tree */
+
+/*
+ * Has the walk under way read a page past the replay position it began at?
+ * Only ever on a standby, and then a finding that compares two pages, or a
+ * page with what the walk read before, may be one replay made, and means
+ * walking again or skipping it, never a report.  Always false on a primary.
+ */
+static inline bool
+lion_verify_moved(const LionVerifyState *vs)
+{
+	return vs->lsntrack && vs->lsnpast;
+}
+
+/* Is a page's LSN past the replay position the check began at? */
+static inline bool
+lion_verify_past_start(const LionVerifyState *vs, XLogRecPtr lsn)
+{
+	return !vs->concurrent && lsn > vs->lsnstart;
+}
 
 /*
  * How many times a posting set or a position tree is walked with nothing
@@ -277,14 +347,23 @@ typedef struct LionVerifyState
  * How many walks of a posting set or a position tree a STANDBY makes before
  * it gives up on getting to the end of one (lion_verify_set(),
  * lion_verify_postree()).  It never walks either with the entry's leaf held
- * - replay takes the tree's pages before the leaf (DESIGN.md §25) - so after
- * LION_VERIFY_SET_ATTEMPTS walks of a set it keeps the next one that reaches
- * the end of the set without comparing its totals, and after as many walks
- * of a position tree that found a difference replay may have made it keeps
- * the last one without comparing the tree with its set; only a root pushed
- * down or an upper level split under each walk keeps it from doing that.
+ * - replay takes the tree's pages before the leaf (DESIGN.md §25) - so a
+ * walk that replay changed a page of under it is made again, and one that
+ * gets to the end is settled by the passes below; only a walk that replay
+ * keeps from getting to the end that many times is an ERROR.
  */
 #define LION_VERIFY_STANDBY_WALKS	10
+
+/*
+ * How many short passes a STANDBY makes to settle a walk that got to the
+ * end of a tree while replay changed it: a posting set's totals counted
+ * again, a position tree compared with its set again (lion_verify_set(),
+ * lion_verify_postree()).  Each is a fraction of a walk - it checks nothing
+ * the walk checked - and so far likelier to read every page as it was at
+ * one replay position, or to find nothing to settle.  A walk that none of
+ * them settles is kept without the comparison, which a WARNING says.
+ */
+#define LION_VERIFY_STANDBY_PASSES	8
 
 /*
  * What one walk of a posting set found (lion_verify_chain()), or of a
@@ -296,10 +375,10 @@ typedef struct LionVerifySetResult
 	uint32		ncontainers;	/* items its leaves hold */
 	BlockNumber last;			/* the last leaf of the right-link chain */
 	uint32		height;			/* its root's level */
-	LionVerifySeq incomplete;	/* the BlockNumbers of the pages flagged
-								 * LION_PAGE_INCOMPLETE_SPLIT, which a walk
-								 * that may be thrown away warns of only once
-								 * it is kept */
+	LionVerifySeq incomplete;	/* the pages flagged
+								 * LION_PAGE_INCOMPLETE_SPLIT (LionVerifyFlag
+								 * records), which a walk that may be thrown
+								 * away warns of only once it is kept */
 } LionVerifySetResult;
 
 /*
@@ -374,13 +453,19 @@ extern LionEntryTuple *lion_verify_dir_item(LionVerifyState *vs,
 											OffsetNumber off);
 extern void lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 							  OffsetNumber off, ItemId iid, Page page);
+extern void lion_verify_lsn_begin(LionVerifyState *vs);
+extern void lion_verify_lsn_end(LionVerifyState *vs);
+extern void lion_verify_flagged(LionVerifyState *vs, uint16 what,
+								BlockNumber blk, XLogRecPtr lsn);
+extern void lion_verify_flags_recheck(LionVerifyState *vs);
 
 /* lion_verify_dir.c */
 extern LionEntryTuple *lion_verify_copy_item(Page page, OffsetNumber off);
 extern void lion_verify_directory(LionVerifyState *vs);
 extern void lion_verify_meta(LionVerifyState *vs);
 extern LionVerifyUnref lion_verify_classify(LionVerifyState *vs,
-											BlockNumber blk);
+											BlockNumber blk,
+											XLogRecPtr *lsnp);
 extern void lion_verify_warn_leak(LionVerifyState *vs, BlockNumber blk);
 extern void lion_verify_reachable(LionVerifyState *vs);
 

@@ -10,6 +10,8 @@
  */
 #include "postgres.h"
 
+#include "access/xlogrecovery.h"
+
 #include "lion_funcs.h"
 
 /* ---------------------------------------------------------------------
@@ -22,6 +24,18 @@
  * name exactly those pages, in that order, with separators that bound them.
  * Every page is passed through lion_verify_visit(), so a page reachable twice
  * - or not at all - is reported by that and by lion_verify_reachable().
+ *
+ * On a standby replay changes the directory under the walk - splits, and the
+ * page deletion of the VACUUM it replays, which a primary's check locks out
+ * - and a check across two pages read at two moments is exact only for
+ * pages replay left alone in between.  Replay stamps every page of a record
+ * with the record's end and moves GetXLogReplayRecPtr() past it afterwards,
+ * so a page read with an LSN at or below the replay position noted before
+ * some earlier read was, at that read, as it was at the position: two pages
+ * that both are, against the position noted before the first of them was
+ * read, were read as they were at one point of the primary's WAL.  Every
+ * check across pages on a standby is held to that (lion_verify_at()), and
+ * what is not is replay's doing, which nothing here reports.
  * --------------------------------------------------------------------- */
 
 typedef struct LionVerifyLevel
@@ -33,7 +47,32 @@ typedef struct LionVerifyLevel
 	LionEntryTuple **highkey;	/* its high key, or NULL when rightmost */
 	bool	   *incomplete;		/* flagged LION_PAGE_INCOMPLETE_SPLIT */
 	bool	   *dying;			/* in a subtree being deleted (§21) */
+	XLogRecPtr *lsn;			/* the page's LSN as read; for a downlink,
+								 * its page's */
+	XLogRecPtr *seenat;			/* the replay position noted before the
+								 * read (a standby's; else invalid) */
+	XLogRecPtr	start;			/* ... and before the level's walk began */
 } LionVerifyLevel;
+
+/*
+ * On a standby, the replay position now, which every page read after this is
+ * held to; InvalidXLogRecPtr on a primary, where nothing needs it.
+ */
+static XLogRecPtr
+lion_verify_replay_now(const LionVerifyState *vs)
+{
+	return vs->concurrent ? InvalidXLogRecPtr : GetXLogReplayRecPtr(NULL);
+}
+
+/*
+ * Was a page read with LSN lsn as it was at the replay position at, noted
+ * before it was read?  Always on a primary, where nothing is held to one.
+ */
+static bool
+lion_verify_at(const LionVerifyState *vs, XLogRecPtr lsn, XLogRecPtr at)
+{
+	return vs->concurrent || lsn <= at;
+}
 
 static bool lion_verify_dir_chain(LionVerifyState *vs, BlockNumber blk,
 								  uint16 level, BlockNumber *ownerp);
@@ -44,7 +83,8 @@ static void lion_verify_deleted(LionVerifyState *vs, BlockNumber blk,
 static void
 lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 					 LionEntryTuple *firstkey, LionEntryTuple *highkey,
-					 bool incomplete, bool dying)
+					 bool incomplete, bool dying, XLogRecPtr lsn,
+					 XLogRecPtr seenat)
 {
 	if (lvl->npages >= lvl->maxpages)
 	{
@@ -58,6 +98,8 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 			lvl->highkey = (LionEntryTuple **) palloc(sizeof(LionEntryTuple *) * lvl->maxpages);
 			lvl->incomplete = (bool *) palloc(sizeof(bool) * lvl->maxpages);
 			lvl->dying = (bool *) palloc(sizeof(bool) * lvl->maxpages);
+			lvl->lsn = (XLogRecPtr *) palloc(sizeof(XLogRecPtr) * lvl->maxpages);
+			lvl->seenat = (XLogRecPtr *) palloc(sizeof(XLogRecPtr) * lvl->maxpages);
 		}
 		else
 		{
@@ -71,6 +113,10 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 												sizeof(bool) * lvl->maxpages);
 			lvl->dying = (bool *) repalloc(lvl->dying,
 										   sizeof(bool) * lvl->maxpages);
+			lvl->lsn = (XLogRecPtr *) repalloc(lvl->lsn,
+											   sizeof(XLogRecPtr) * lvl->maxpages);
+			lvl->seenat = (XLogRecPtr *) repalloc(lvl->seenat,
+												  sizeof(XLogRecPtr) * lvl->maxpages);
 		}
 	}
 	lvl->blocks[lvl->npages] = blk;
@@ -78,6 +124,8 @@ lion_verify_level_add(LionVerifyLevel *lvl, BlockNumber blk,
 	lvl->highkey[lvl->npages] = highkey;
 	lvl->incomplete[lvl->npages] = incomplete;
 	lvl->dying[lvl->npages] = dying;
+	lvl->lsn[lvl->npages] = lsn;
+	lvl->seenat[lvl->npages] = seenat;
 	lvl->npages++;
 }
 
@@ -189,6 +237,12 @@ lion_verify_run_add(LionVerifyState *vs, LionVerifyRun *run,
  * right one's left link naming the left one is exact.  The pages found in
  * between are not visited here: nothing reached them, and the reachability
  * pass settles them as it settles every page a split made behind the walk.
+ *
+ * On a standby nothing is held to walk the level again with: replay locks
+ * a record's pages in the order the writer registered them, which no reader
+ * can be sure to share.  There the walk calls this only when it read both
+ * pages as they were at one replay position (lion_verify_walk_level()), and
+ * at one position a left link that is not the page left of it is damage.
  */
 static void
 lion_verify_leftlink(LionVerifyState *vs, BlockNumber blk, uint16 level,
@@ -245,16 +299,15 @@ lion_verify_leftlink(LionVerifyState *vs, BlockNumber blk, uint16 level,
  * page that now says the directory is taller settles what such a split does
  * to the level the meta page called the root's.  The new root and the old
  * root's new sibling are pages the walk may not reach; the reachability pass
- * settles them.  Only writers running beside the check split anything.
+ * settles them.  Only writers running beside the check split anything - on
+ * a standby, the replay of their records, which writes the meta page in the
+ * record of the split as the primary did.
  */
 static bool
 lion_verify_root_split(LionVerifyState *vs)
 {
 	Buffer		buf;
 	Page		page;
-
-	if (!vs->concurrent)
-		return false;
 
 	/* once the meta page has said so, it says so for every such page */
 	if (!vs->rootsplit)
@@ -344,20 +397,37 @@ lion_verify_copy_page(LionVerifyState *vs, BlockNumber blk, uint16 kind,
  * leaves a page without its first item.  What a concurrent split can change
  * is the right page's left link (lion_verify_leftlink()) and which page is
  * the root (lion_verify_root_flag()).
+ *
+ * On a standby the page deletion VACUUM's replay does changes more: a page
+ * the walk has read the right link to can be unlinked and DELETED by the
+ * time the walk gets to it.  A DELETED page keeps its right link for the
+ * readers that land on it (§21, "Page deletion"), and the walk moves right
+ * off it as they do when it was deleted after the replay position noted
+ * before its left neighbour was read: the left neighbour was read before
+ * the record that unlinked it.  One deleted at or before that position is
+ * still linked from a page that was read after the record, which is damage.
+ * The left link is held to the same position (lion_verify_leftlink()).
+ * seenat is that position for the level's first page, noted before its
+ * leftmost page was looked for (lion_verify_directory()).
  */
 static void
 lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
-					  bool isleaf, LionVerifyLevel *out,
+					  bool isleaf, XLogRecPtr firstat, LionVerifyLevel *out,
 					  LionVerifyLevel *children)
 {
 	BlockNumber blk = first;
 	BlockNumber prev = InvalidBlockNumber;
+	XLogRecPtr	prevlsn = InvalidXLogRecPtr;
+	XLogRecPtr	prevat = firstat;
 	LionEntryTuple *prevhigh = NULL;
 	LionVerifyRun run;
 	uint16		kind = isleaf ? LION_PAGE_BUCKET : LION_PAGE_DIR;
 	Page		page = (Page) palloc(BLCKSZ);
 
 	memset(&run, 0, sizeof(run));
+	out->start = lion_verify_replay_now(vs);
+	if (children != NULL)
+		children->start = out->start;
 
 	while (BlockNumberIsValid(blk))
 	{
@@ -369,10 +439,14 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		LionEntryTuple *firstkey = NULL;
 		LionEntryTuple *highkey = NULL;
 		bool		dying;
+		XLogRecPtr	seenat;
+		XLogRecPtr	lsn;
 
 		lion_verify_visit(vs, blk, "the directory");
+		seenat = lion_verify_replay_now(vs);
 		lion_verify_copy_page(vs, blk, kind, page);
 		opaque = LionPageGetOpaque(page);
+		lsn = PageGetLSN(page);
 
 		/*
 		 * Test hook: this page is copied and its right link read, and nothing
@@ -390,12 +464,20 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 		/*
 		 * Page deletion (DESIGN.md §21) unlinks a page from both of its
 		 * siblings in the record that marks it DELETED, so no level walk
-		 * reaches one; a HALF_DEAD leaf is still linked, empty, with a MINUS
-		 * INFINITY high key.
+		 * reaches one - but a standby's that read the link to it before the
+		 * replay of that record (above); a HALF_DEAD leaf is still linked,
+		 * empty, with a MINUS INFINITY high key.
 		 */
 		if (LionPageIsDeleted(page))
-			lion_corrupt("lion index \"%s\": deleted directory page %u is still linked into level %u",
-						RelationGetRelationName(vs->index), blk, level);
+		{
+			if (lion_verify_at(vs, lsn, prevat))
+				lion_corrupt("lion index \"%s\": deleted directory page %u is still linked into level %u",
+							RelationGetRelationName(vs->index), blk, level);
+			lion_verify_deleted(vs, blk, page);
+			blk = opaque->rightlink;
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
 		if (LionPageIsHalfDead(page) &&
 			(LionPageIsRightmost(page) || LionPageIsRoot(page) ||
 			 PageGetMaxOffsetNumber(page) != FirstOffsetNumber ||
@@ -405,18 +487,22 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			lion_corrupt("lion index \"%s\": half-dead directory leaf %u is not an empty page with a minus infinity high key",
 						RelationGetRelationName(vs->index), blk);
 
-		if (opaque->leftlink != prev)
+		if (opaque->leftlink != prev &&
+			(!BlockNumberIsValid(prev) ||
+			 (lion_verify_at(vs, prevlsn, prevat) &&
+			  lion_verify_at(vs, lsn, prevat))))
 			lion_verify_leftlink(vs, blk, level, kind, prev, opaque->leftlink);
 		lion_verify_root_flag(vs, blk, level, LionPageIsRoot(page));
 		if (level == vs->height)
 			lion_verify_root_alone(vs, blk, level, opaque);
 
 		/*
-		 * Exact: a split holds the page it flags EXCLUSIVE until it clears the
-		 * flag (DESIGN.md §21), so a flag a SHARE lock lets the walk see is one
-		 * a crash or an error left behind.
+		 * The flag of a split that has not finished: a crash or an error left
+		 * it behind, which lion_verify_flagged() warns of - on a standby,
+		 * where a split the primary is in the middle of shows it too, only
+		 * if the split is still not finished at the end of the check.
 		 *
-		 * ... and only ever on the LEFT half of a split, which the record that
+		 * It is only ever on the LEFT half of a split, which the record that
 		 * sets the flag links to the split's new page, and which keeps that
 		 * right sibling while the flag lasts: page deletion takes no flagged
 		 * leaf, nor a page whose downlink is not in place (§21, "Page
@@ -433,11 +519,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 						LionPageIsHalfDead(page) ? "a half-dead leaf" :
 						"the rightmost page of its level, which no split leaves flagged");
 		if (LionPageIncompleteSplit(page))
-			ereport(WARNING,
-					(errmsg("lion index \"%s\": directory page %u has an unfinished split",
-							RelationGetRelationName(vs->index), blk),
-					 errdetail("Its right sibling has no downlink in the parent yet."),
-					 errhint("The next INSERT that descends to this page repairs it.")));
+			lion_verify_flagged(vs, LION_VFLAG_DIR, blk, lsn);
 
 		maxoff = PageGetMaxOffsetNumber(page);
 		firstdata = lion_page_first_data(page);
@@ -543,7 +625,7 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 										  LionEntryIsMinusInf(item) &&
 										  prevhigh != NULL ? prevhigh :
 										  lion_verify_copy_item(page, off),
-										  NULL, false, false);
+										  NULL, false, false, lsn, seenat);
 			}
 
 			CHECK_FOR_INTERRUPTS();
@@ -568,9 +650,12 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
 			 lion_verify_dir_chain(vs, blk, level, NULL));
 
 		lion_verify_level_add(out, blk, firstkey, highkey,
-							  LionPageIncompleteSplit(page), dying);
+							  LionPageIncompleteSplit(page), dying, lsn,
+							  seenat);
 
 		prev = blk;
+		prevlsn = lsn;
+		prevat = seenat;
 		/* owned by *out; not freed here */
 		if (!dying)
 			prevhigh = highkey;
@@ -602,8 +687,20 @@ lion_verify_walk_level(LionVerifyState *vs, BlockNumber first, uint16 level,
  * writers do, and are reported at once: the level's FIRST downlink, which
  * names the level's leftmost page, and no split ever moves that; one to a
  * page something else reached - a posting page, or a directory page of
- * another level - since no page is freed or changes level while the check
- * runs; and a second downlink to the same page.
+ * another level - since no page a walk reached changes level, or is freed
+ * and taken again, while the check runs (on a standby the replay of a page
+ * taken again that was freed after the check began is a recovery conflict
+ * with it, lion_wal_log_reuse(), which ends it); and a second downlink to
+ * the same page.
+ *
+ * A standby has no writers to wait for, and the split's downlink is a
+ * record replayed after the walk of the level below passed the place: after
+ * the replay position noted when that walk began (below->start), which the
+ * LSN of the page the downlink is on is past.  So such a downlink is
+ * replay's doing and is left out; one on a page at or below that position
+ * was there before the walk began, and names a page the walk should have
+ * reached, which is reported.  The first downlink is held to the same rule
+ * there, since the page deletion VACUUM's replay does can retarget it.
  */
 static void
 lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
@@ -622,11 +719,13 @@ lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
 	{
 		BlockNumber b = children->blocks[j];
 		LionVerifyCand cand;
+		bool		replayed;
 
 		if (lion_verify_has_block(sorted, below->npages, b))
 		{
 			lion_verify_level_add(seen, b, children->firstkey[j], NULL, false,
-								  false);
+								  false, children->lsn[j],
+								  children->seenat[j]);
 			/* the candidates since the last reached page lie before this one */
 			for (; pending < vs->ncands; pending++)
 				vs->cands[pending].right = b;
@@ -634,14 +733,18 @@ lion_verify_filter_downlinks(LionVerifyState *vs, uint32 level,
 			continue;
 		}
 
-		if (j == 0)
+		replayed = !lion_verify_at(vs, children->lsn[j], below->start);
+		if (j == 0 && !replayed)
 			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, but the next page of level %u is block %u",
 						RelationGetRelationName(vs->index), j, level, b,
-						level - 1, below->blocks[0]);
+						level - 1, below->npages > 0 ? below->blocks[0] :
+						InvalidBlockNumber);
 		if (b < vs->nblocks && vs->refs[b] != 0)
 			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which is not a page of level %u",
 						RelationGetRelationName(vs->index), j, level, b,
 						level - 1);
+		if (replayed)
+			continue;			/* replay's (above) */
 		if (!vs->concurrent)
 			lion_corrupt("lion index \"%s\": downlink %d of level %u points at block %u, which the walk of level %u did not reach",
 						RelationGetRelationName(vs->index), j, level, b,
@@ -763,6 +866,7 @@ lion_verify_directory(LionVerifyState *vs)
 	uint32		h = vs->height;
 	uint32		i;
 	int			j;
+	XLogRecPtr	descended = lion_verify_replay_now(vs);
 
 	/* The leftmost page of every level, from the root down. */
 	leftmost = (BlockNumber *) palloc(sizeof(BlockNumber) * (h + 1));
@@ -840,8 +944,8 @@ lion_verify_directory(LionVerifyState *vs)
 
 		memset(&walked, 0, sizeof(walked));
 		memset(&children, 0, sizeof(children));
-		lion_verify_walk_level(vs, leftmost[i], (uint16) i, i == 0, &lvl[i],
-							   i == 0 ? NULL : &walked);
+		lion_verify_walk_level(vs, leftmost[i], (uint16) i, i == 0,
+							   descended, &lvl[i], i == 0 ? NULL : &walked);
 
 		if (i > 0)
 		{
@@ -861,6 +965,16 @@ lion_verify_directory(LionVerifyState *vs)
 			 * with the downlink already in place is normal too - the flag is
 			 * cleared by a record of its own - and needs nothing here.  The
 			 * rules are the posting tree's, in lion_verify_chain().
+			 *
+			 * On a standby a page also lacks its downlink when the replay of
+			 * a page deletion's first stage took it out after the walk of
+			 * the level below had read the page, in the record that marks
+			 * the page HALF_DEAD: the parent the downlink was on is past
+			 * the replay position noted when that walk began.  So is a page
+			 * of a subtree whose deletion had begun when the walk read it,
+			 * and whose second stage the replay has since unlinked and
+			 * DELETED, which the test below no longer finds: the walk found
+			 * it dying.  Either bounds nothing any more.
 			 */
 			j = 0;
 			for (p = 0; p < below->npages; p++)
@@ -900,6 +1014,17 @@ lion_verify_directory(LionVerifyState *vs)
 					 * right sibling's separator now bounds the range it had,
 					 * so its high key is not compared with that either.
 					 */
+					dying = true;
+				}
+				else if (!vs->concurrent &&
+						 (below->dying[p] ||
+						  (j > 0 && !lion_verify_at(vs, children.lsn[j - 1],
+													below->start)) ||
+						  (j < children.npages &&
+						   !lion_verify_at(vs, children.lsn[j],
+										   below->start))))
+				{
+					/* a standby's: replay deleted it (above) */
 					dying = true;
 				}
 				else if (j < children.npages)
@@ -959,8 +1084,10 @@ lion_verify_directory(LionVerifyState *vs)
  * (lion_dirdel_count()), so a crash, an ERROR or a cancel in between leaves
  * the count high and nothing leaves it low: read after the walk, it is at
  * least what the walk found, splits beside the check included.  On a standby
- * the replay of a deletion can take off pages the walk counted, a report of
- * the kind DESIGN.md §7 says to confirm with replay paused.  The count is
+ * the replay of a deletion can take off pages the walk counted, so there the
+ * count is compared only when no record has changed the meta page since the
+ * check began (lion_verify_past_start()): then no split and no deletion has
+ * either, and the count is what it was when the walk began.  The count is
  * the planner's (§21, lion_index_dir_pages()).
  */
 static void
@@ -969,11 +1096,15 @@ lion_verify_dirpages(LionVerifyState *vs, uint64 walked)
 	Buffer		buf;
 	Page		page;
 	uint32		dirpages;
+	XLogRecPtr	lsn;
 
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	dirpages = LionPageGetMeta(page)->dirpages;
+	lsn = BufferGetLSNAtomic(buf);
 	UnlockReleaseBuffer(buf);
 
+	if (lion_verify_past_start(vs, lsn))
+		return;
 	if ((uint64) dirpages < walked)
 		lion_corrupt("lion index \"%s\": meta page counts %u directory pages, but the directory has " UINT64_FORMAT,
 					RelationGetRelationName(vs->index), dirpages, walked);
@@ -1177,6 +1308,27 @@ lion_verify_deleted(LionVerifyState *vs, BlockNumber blk, Page page)
 }
 
 /*
+ * Fold the LSN of root, the root a posting page blk names, into *lsnp, for
+ * lion_verify_classify(): read under its SHARE lock with nothing else held,
+ * and only when it is a block of the index other than blk and the meta page.
+ */
+static void
+lion_verify_root_lsn(LionVerifyState *vs, BlockNumber blk, BlockNumber root,
+					 XLogRecPtr *lsnp)
+{
+	Buffer		rbuf;
+
+	if (lsnp == NULL || root == blk || !BlockNumberIsValid(root) ||
+		root == LION_METAPAGE_BLKNO ||
+		root >= RelationGetNumberOfBlocks(vs->index))
+		return;
+	rbuf = ReadBuffer(vs->index, root);
+	LockBuffer(rbuf, BUFFER_LOCK_SHARE);
+	*lsnp = Max(*lsnp, BufferGetLSNAtomic(rbuf));
+	UnlockReleaseBuffer(rbuf);
+}
+
+/*
  * Classify blk, which no walk reached.
  *
  * Some unreferenced blocks are tolerated (with a warning), because a crash or
@@ -1198,9 +1350,14 @@ lion_verify_deleted(LionVerifyState *vs, BlockNumber blk, Page page)
  * new page is never empty, and every page a split or a push-down makes is
  * stamped with a root that is live.  Only the internal and the live kinds can
  * be pages a writer made behind the walk, and those are the candidates.
+ *
+ * With lsnp, *lsnp is the latest LSN of the pages the kind was told by: the
+ * page's, and its root's when the root was looked at - what a standby's
+ * reachability pass holds to the replay position the check began at
+ * (lion_verify_reachable()).
  */
 LionVerifyUnref
-lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
+lion_verify_classify(LionVerifyState *vs, BlockNumber blk, XLogRecPtr *lsnp)
 {
 	Buffer		buf;
 	Page		page;
@@ -1210,6 +1367,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	buf = ReadBuffer(vs->index, blk);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
+	if (lsnp != NULL)
+		*lsnp = BufferGetLSNAtomic(buf);
 
 	if (PageIsNew(page))
 	{
@@ -1282,6 +1441,8 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 		rbuf = ReadBuffer(vs->index, root);
 		LockBuffer(rbuf, BUFFER_LOCK_SHARE);
 		live = lion_page_owns_positions(BufferGetPage(rbuf), root);
+		if (lsnp != NULL)
+			*lsnp = Max(*lsnp, BufferGetLSNAtomic(rbuf));
 		UnlockReleaseBuffer(rbuf);
 		return live ? LION_UNREF_LIVE : LION_UNREF_LEAK;
 	}
@@ -1290,9 +1451,12 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 		UnlockReleaseBuffer(buf);
 		return LION_UNREF_LEAK;
 	}
+	ohead = LionPageGetOpaque(page)->owner_head;
+	ohash = LionPageGetOpaque(page)->owner_hash;
 	if (LionPageIsPostingInternal(page))
 	{
 		UnlockReleaseBuffer(buf);
+		lion_verify_root_lsn(vs, blk, ohead, lsnp);
 		return LION_UNREF_INTERNAL;
 	}
 
@@ -1304,10 +1468,9 @@ lion_verify_classify(LionVerifyState *vs, BlockNumber blk)
 	 * root heads a set without an internal level, which a spill writes in the
 	 * same record as its entry.
 	 */
-	ohead = LionPageGetOpaque(page)->owner_head;
-	ohash = LionPageGetOpaque(page)->owner_hash;
 	UnlockReleaseBuffer(buf);
 
+	lion_verify_root_lsn(vs, blk, ohead, lsnp);
 	if (ohead != blk && !lion_posting_root_live(vs->index, ohash, ohead, true,
 													   NULL))
 		return LION_UNREF_LEAK;
@@ -1335,22 +1498,45 @@ lion_verify_warn_leak(LionVerifyState *vs, BlockNumber blk)
  * live page no walk reached may be a page a writer made - a split's new
  * sibling, a push-down's child, a spilled set's root, from the end of the
  * relation or out of the free space map - after the walk had passed the place
- * it went.  On a primary that is a candidate for lion_verify_recheck(); on a
- * standby it is reported, as it always was.
+ * it went.  On a primary that is a candidate for lion_verify_recheck().
+ *
+ * A standby has no writers to wait for, but it has the LSNs instead: a page
+ * no walk reached, of a kind it was told from with pages at or below the
+ * replay position the check began at (lion_verify_past_start()), was what it
+ * is when the check began, and the walks, which began after, would have
+ * reached it if anything referenced it.  So it is reported - a live page as
+ * unreachable, a leak with the WARNING a primary gives it.  A page replay
+ * changed since is one replay made, emptied or took out of a tree behind
+ * the walks - a split's, a push-down's, a set's that VACUUM's replay freed
+ * after the walk of its entry - and is left to the next check.
  */
 void
 lion_verify_reachable(LionVerifyState *vs)
 {
 	BlockNumber blk;
 
+	/*
+	 * Test hook: every tree is walked, and no unreferenced page looked at
+	 * yet.  test/recovery/run.sh phase 3 parks a standby's check here while
+	 * the primary splits a directory leaf onto a page out of the free space
+	 * map, which no walk reached.
+	 */
+	LION_INJECTION_POINT("lion-verify-reachable");
+
 	for (blk = 0; blk < vs->startblocks; blk++)
 	{
 		LionVerifyCand cand;
+		LionVerifyUnref unref;
+		XLogRecPtr	lsn;
 
 		if (vs->refs[blk] != 0)
 			continue;
 
-		switch (lion_verify_classify(vs, blk))
+		unref = lion_verify_classify(vs, blk, &lsn);
+		if (unref != LION_UNREF_FREE && unref != LION_UNREF_FOREIGN &&
+			lion_verify_past_start(vs, lsn))
+			continue;
+		switch (unref)
 		{
 			case LION_UNREF_FREE:
 				continue;

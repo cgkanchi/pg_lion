@@ -1252,6 +1252,51 @@ SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_splitp')$$);
 (1 row)
 
 SET client_min_messages = warning;
+-- And an INSERT that reaches such a page - the last leaf of a posting set
+-- with an internal level, which an append goes to - finds no sibling to
+-- post a downlink for, and says the index is damaged (INDEX_CORRUPTED), as
+-- the directory's does, not that something went wrong inside (XX000).  On
+-- a table of its own, as an INSERT writes to every index of its table:
+-- 90000 rows of two keys at posting_fillfactor 10 make key 0's set a tree
+-- (verify_incomplete_split.spec).
+CREATE TEMP TABLE lion_vfy_badsi (id int4, k int4, pad char(80) NOT NULL DEFAULT 'x');
+INSERT INTO lion_vfy_badsi SELECT i, i % 2 FROM generate_series(1, 90000) i;
+CREATE INDEX lion_vfy_badsi_twin ON lion_vfy_badsi USING lion (k)
+  WITH (posting_fillfactor = 10);
+CREATE INDEX lion_vfy_bad_splitins ON lion_vfy_badsi USING lion (k)
+  WITH (posting_fillfactor = 10);
+SELECT max_posting_height > 0 AS posting_is_a_tree
+  FROM lion_index_stats('lion_vfy_badsi_twin');
+ posting_is_a_tree 
+-------------------
+ t
+(1 row)
+
+SELECT lion_index_posting_root('lion_vfy_badsi_twin', 0) AS root \gset
+SELECT b AS lastleaf
+  FROM generate_series(1, pg_relation_size('lion_vfy_badsi_twin') /
+					   current_setting('block_size')::int8 - 1) b
+ WHERE lion_vfy_u32('lion_vfy_badsi_twin', b, :special + 20) = :root
+   AND lion_vfy_u32('lion_vfy_badsi_twin', b, :special + 24) & 65535 = 0
+   AND lion_vfy_u32('lion_vfy_badsi_twin', b, :special) = 4294967295 \gset
+SELECT lion_vfy_poke('lion_vfy_bad_splitins', :lastleaf, :special + 26,
+					 lion_vfy_le32(lion_vfy_u32('lion_vfy_badsi_twin', :lastleaf,
+												:special + 26) | 64));
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT regexp_replace(lion_vfy_err($$INSERT INTO lion_vfy_badsi (id, k) VALUES (0, 0)$$),
+					  'block [0-9]+', 'block N') AS insert;
+                                                        insert                                                         
+-----------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_vfy_bad_splitins": block N is flagged as an incomplete split but has no right sibling to link
+(1 row)
+
+SET client_min_messages = warning;
+DROP TABLE lion_vfy_badsi;
 -- (17) a position tree without positions for some TIDs of its posting set.
 -- 600 rows of 'alpha:5 beta:6', whose keys are CHAIN entries (inline_limit
 -- = 64) with a position tree of one leaf each: one chunk, a 10-byte header
@@ -1359,8 +1404,8 @@ SET client_min_messages = warning;
 -- whose position tree has over a thousand leaves of two or three heap
 -- blocks each, under two internal pages and a root.  A walk keeps each
 -- level for the level above it as a sequence of 16 bytes a page, in memory
--- up to a quarter of work_mem and in a temporary file past it: at 64kB the
--- leaves after the 1024th go to the file, and the comparison with the level
+-- up to a fifth of work_mem and in a temporary file past it: at 64kB the
+-- leaves after the 819th go to the file, and the comparison with the level
 -- above reads them back from it.  The DEBUG line gives the most the walks
 -- kept in memory and the records they wrote out; at the default work_mem
 -- they write none.
@@ -1425,8 +1470,8 @@ SELECT lion_vfy_poke('lion_vfy_bad_parent', :bigroot, :rootitem,
 SET work_mem = '64kB';
 SET client_min_messages = debug1;
 SELECT lion_index_verify('lion_vfy_big_d');
-DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared
-DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 25600 bytes in memory and wrote 176 records to temporary files
+DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 counting passes, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 covers passes, 0 kept uncompared; 0 flagged pages looked at again
+DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 22320 bytes in memory and wrote 381 records to temporary files
  lion_index_verify 
 -------------------
  
@@ -1434,7 +1479,7 @@ DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 25600 b
 
 RESET work_mem;
 SELECT lion_index_verify('lion_vfy_big_d');
-DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 kept uncompared
+DEBUG:  lion index "lion_vfy_big_d": 1229 blocks at the start and 1229 at the end; 0 candidates settled after 0 waits; 0 left links and 0 root flags settled on the spot; 2 posting-set walks, 0 thrown away, 0 with the leaf held, 0 counting passes, 0 kept uncompared; 2 position-tree walks, 0 thrown away, 0 with the leaf held, 0 covers passes, 0 kept uncompared; 0 flagged pages looked at again
 DEBUG:  lion index "lion_vfy_big_d": the walks of its trees kept at most 41984 bytes in memory and wrote 0 records to temporary files
  lion_index_verify 
 -------------------
@@ -1447,6 +1492,37 @@ SELECT lion_index_verify('lion_vfy_bad_parent');
 ERROR:  lion index "lion_vfy_bad_parent": position leaf 702 reaches block 1450, above the high key 1449 of its parent 1227
 RESET work_mem;
 SET client_min_messages = warning;
+-- (20) a reserved entry of a kind its column never writes: an int4 column's
+-- NULL entry (flags 5, INLINE and NULLKEY) made an empty-dimension one
+-- (0x1001), which only an operator class that extracts an array's elements
+-- writes (DESIGN.md §17).  verify() must report it, and say "an".
+CREATE TEMP TABLE lion_vfy_badr (k int4);
+INSERT INTO lion_vfy_badr
+SELECT CASE WHEN i % 10 = 0 THEN NULL ELSE i END FROM generate_series(1, 100) i;
+CREATE INDEX lion_vfy_badr_twin ON lion_vfy_badr USING lion (k);
+CREATE INDEX lion_vfy_bad_reserved ON lion_vfy_badr USING lion (k);
+SELECT b AS nullblk, lion_vfy_item('lion_vfy_badr_twin', b, o) AS nullitem
+  FROM generate_series(1, pg_relation_size('lion_vfy_badr_twin') /
+					   current_setting('block_size')::int8 - 1) b,
+	   generate_series(1, 4) o
+ WHERE lion_vfy_u32('lion_vfy_badr_twin', b, :special + 24) & 65535 = 0
+   AND lion_vfy_u32('lion_vfy_badr_twin', b,
+					lion_vfy_item('lion_vfy_badr_twin', b, o)) = 5 \gset
+SELECT lion_vfy_poke('lion_vfy_bad_reserved', :nullblk, :nullitem, '\x0110');
+ lion_vfy_poke 
+---------------
+ 
+(1 row)
+
+SET client_min_messages = error;
+SELECT lion_vfy_err($$SELECT lion_index_verify('lion_vfy_bad_reserved')$$);
+                                                                    lion_vfy_err                                                                    
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ XX002: lion index "lion_vfy_bad_reserved": entry 1 on block 1 is an empty-dimension entry, but the operator class of key column 1 extracts no keys
+(1 row)
+
+SET client_min_messages = warning;
+DROP TABLE lion_vfy_badr;
 RESET ignore_checksum_failure;
 DROP TABLE lion_vfy_bad, lion_vfy_badp, lion_vfy_badd, lion_vfy_badpos,
 	lion_vfy_badi, lion_vfy_badm, lion_vfy_badph, lion_vfy_badpc,
