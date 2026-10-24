@@ -18976,7 +18976,8 @@ is past the default `hash_mem`, and a refused plan there is the query failing un
   with POSIX `mmap()`, which it needs: pg_lion builds where there is one. The walk's visited
   bits (below, "Stopping early") come from `lo_set_alloc()` too, charged against `hash_mem` with
   the set and in the arena past it, so neither the early stop nor the switch depends on
-  `work_mem` either. *(Before this the set DEGRADED past `hash_mem`: it freed every container
+  `work_mem` either; so does a LionOrderedSplit's arm's narrowed set (§48.4, "The arm's
+  memory"). *(Before this the set DEGRADED past `hash_mem`: it freed every container
   and kept the keys - "every TID of these 64 heap blocks may be a member" -, rechecking every
   fetched member, and the planner refused a path whose estimate exceeded `hash_mem`; the test
   tables for that at 64 kB, ordered.sql's lon and vector_filter.sql's vfn, now spill.)*
@@ -29499,3 +29500,326 @@ page (534 against 1,184 ms) and the dense range (18.1 against 19.4 ms); and wron
 multi-key page (36 against 16 ms): core's loop at 944 under the LIMIT, 1,264 with its Memoize's
 hits, against the node's 3,219, most of it the multi-key set built at once, of which the cold reads
 take 0.54. Not measured: other majors.
+
+## 48. An ORDER BY led by the dimension: the join an arm at a time (LionOrderedSplit, lion_ordjoin.c, 2026-10-24)
+
+The shape is §47's with the ORDER BY led by a column of the dimension:
+
+    SELECT f.id, f.score, d.pk, d.flag
+      FROM fact f JOIN dim d ON f.fk = d.pk
+     WHERE f.grp = 2 AND f.tags @> '{a1}' AND d.lvl < 30
+     ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20
+
+asks for the fact's best rows among the flagged dimension rows first, then among the rest. No B-tree
+of the fact gives that order, so §47's walk is not offered (§47.1, "The order"), and core has one
+plan: the hash join of the two sets' bitmap heap scans, every joined row sorted for the first
+twenty: 7,525 rows here, and on §48.8's tables 625,000 fact rows read for twenty. But the leading
+column has few values, and lion holds each value's rows as an entry of its directory, in the
+column's order (§30.11). Among the rows of one value the ORDER BY is the fact's walk: §47's join
+with the dimension narrowed to that value's rows returns them in the order wanted, and run for each
+value in turn, in the ORDER BY's order, the joins' rows one after another are the query's.
+
+    Limit
+      ->  Incremental Sort
+            Sort Key: d.flag DESC, f.score DESC NULLS LAST, f.id
+            Presorted Key: d.flag, f.score
+            ->  Custom Scan (LionOrderedSplit)
+                  Split By: dim_flag (flag, backward, nulls first)
+                  Arms Max: 8
+                  ->  Custom Scan (LionOrderedJoin)
+                        Ordered By: fact_grp_score
+                        Index Cond: (f.grp = 2)
+                        Lion Cond: (f.tags @> '{a1}'::text[])
+                        Lion Indexes: fact_tags
+                        Dimension: dim d via dim_pkey
+                        Dimension Lion Cond: (d.lvl < 30)
+                        Dimension Lion Indexes: dim_lvl
+
+`LionOrderedSplit` is the join rel's CustomScan over one LionOrderedJoin, its child. It walks the
+column's lion entries in the ORDER BY's direction with §30.11's walk, the NULL entry where NULLS
+FIRST or LAST puts it; for each entry - an arm - it narrows the child's dimension to the entry's
+rows, the entry's TIDs ANDed with the dimension's own set, and runs the child from the start of its
+walk; past the arm's last row, the next entry is the next arm. The dimension's set is made once and
+kept, as is the fact's; only the fact's walk restarts. Core puts the rest above it: the Limit, and
+an Incremental Sort for what the ORDER BY has past the walk - here `f.id`, which `fact_grp_score`
+does not hold.
+
+### 48.1 What qualifies (`os_split_of()`)
+
+- **The join.** Everything §47.1 asks of the join, its sides and the query - one key join to a
+  unique B-tree, each side a table LionOrdered may scan, the target, no row marks - with its key
+  sets (§47.6); what §47.1 declines the split declines (`FOR SHARE OF d`, a `LEFT JOIN`). Neither
+  side needs a lion clause and no key set is needed: the arm's narrowed set is a set of the
+  dimension's.
+- **The column** (`lion_ordered_column_order()`, lion_ordered.c; `lo_column_gives()`, the rule of
+  §30.11's walk of a table's own column). The ORDER BY's first sort key is of an equivalence class
+  that holds a column of the dimension; the column is a plain column, not an expression of it
+  (`d.kind % 2`); a key column of a lion index, ordered and scalar - not multikey - of the column's
+  type, under the column's collation; its comparison its type's default B-tree comparison; and its
+  pathkey in that order of the sort key's class and operator family: another family (`USING ~<~`) or
+  another collation (`COLLATE "POSIX"`) is declined. A partial index qualifies only where the query
+  implies its predicate. The walk gives either direction and either place for NULLs.
+- **The fact's order** (`lion_ordered_orders_for()`, lion_ordered.c). The rest of the ORDER BY leads
+  with the order of a B-tree of the fact, at least its first key; an Incremental Sort above sorts
+  what follows. Core builds no ordered path of the fact for an order the query's does not lead with
+  (`truncate_useless_pathkeys()` finds the B-tree's pathkeys useless), so the paths are built on a
+  scratch copy of the fact that sees only its B-trees, with `root->query_pathkeys` and
+  `root->sort_pathkeys` both the rest of the ORDER BY while `create_index_paths()` runs: it judges
+  an order by the one or the other, depending on the major. An order that holds the column's own
+  class (a fact column the WHERE equates with it) is passed over.
+- **The arms** (`os_arms()`, §48.3). At most `pg_lion.ordered_split_max` (8; 0 offers no split)
+  are expected: the column's distinct values, and its NULL entry where the walk takes it. A column
+  whose distinct count is a default is declined. The cap is the planner's alone: at run time every
+  entry of the column is an arm, however many.
+
+### 48.2 Planner (`os_add_paths()`, `os_add_path()`, `os_plan_path()`)
+
+`oj_add_paths()` asks `os_split_of()` for each join §47.2 recognizes - two tables, or two and their
+key sets - before it takes the join's own orders. For each order of the fact (§48.1), each of the
+fact's lion accesses and each of the dimension's, paired as §47.2 pairs them, one path is priced
+(§48.3) and handed to `add_path()`; the competitor of each order (`oj_competitor()`, §47.3) is
+found at the split's pathkeys before the first path is added. Where a column of the fact is in the
+column's class the join's own paths are offered too, and `add_path()` keeps what it keeps.
+
+- The path's pathkeys are the column's sort key and then the order's pathkeys, as far as they give
+  the rest of the ORDER BY; its target is the join rel's; it is unparameterized and not
+  parallel-safe, and `enable_indexscan = off` disables it (`lion_path_core_switches()`,
+  `LION_CORE_INDEXSCAN`) as it does the join's.
+- Its one child (`custom_paths`) is the arms' LionOrderedJoin, built as §47.2 builds the join's
+  path (`oj_join_path()`): its pathkeys the order's alone, its rows and price an arm's - the arms'
+  rows divided by their count, the first arm's start-up and the mean arm's run - and its fact's
+  side weighted for its lazy set by the arms the LIMIT takes (§48.3).
+- The NULL entry's place (`os_nulls()`) is where the sort key puts NULLs, or nowhere when a
+  restriction clause of the dimension is strict in the column (`find_nonnullable_vars()`: `kind IS
+  NOT NULL`, `kind IN (2, 7)`), which no NULL passes.
+
+The plan (`os_plan_path()`) is a CustomScan with `scanrelid` 0 over the child, whose
+`custom_scan_tlist` is the child's target list; the split's target is projected over it
+(`CUSTOMPATH_SUPPORT_PROJECTION`). `custom_private` is positional behind a marker: the column as
+its lion index numbers it, whether the walk is backward, the NULL entry's place
+(`LION_ORDER_NULLS_*`), the cap the plan was made under, and the index.
+
+### 48.3 Cost (`os_arms()`, `os_cost()`)
+
+**The arms.** With `nd` the column's distinct values (`get_variable_numdistinct()`: lion's count of
+the column's entries where it has one, §33, ANALYZE's otherwise), ANALYZE's MCV list and its null
+fraction:
+
+- an arm for each of `max(ceil(nd), MCVs)` values, and one for the NULL entry where the walk takes
+  it and the column has NULLs;
+- a most common value's arm has its frequency, `freq`. The list is sorted by the type's B-tree
+  comparison under the column's collation and taken in the walk's direction; the values past it
+  share what is left of the rows, `1 - nullfrac - Σ freq`, evenly, and are taken after it; the NULL
+  arm has `nullfrac`, first or last. The list is used only where `statistic_proc_security_check()`
+  lets the comparison run on the column's statistics, as core's estimators ask (the user may read
+  the column, or the comparison is leakproof); elsewhere every value shares `1 - nullfrac` evenly,
+  the split priced less well rather than refused;
+- arm i's share of the rows the dimension's quals pass is `share_i = freq_i / Σ freq` over the arms
+  walked.
+
+**An arm** is priced as §47.3 prices the join (`oj_cost()`, its competitor's Memoize and the cold
+reads with it), the dimension's set taken to hold `share_i` of what it holds: the members, their
+heap reads and the rows out are scaled by it, and each descent's TID is tested against a set even
+where the dimension has no lion access, since the narrowed set is one. Each arm's walk starts at the
+start of the fact's order, and the LIMIT's share of it is the share its own rows give.
+
+**The arms in order.** The first arm's start-up is paid once: the sets' builds, the key sets', and
+the column walk's descent, two `random_page_cost` (§30.11). Each later arm restarts the fact's walk
+with a descent of its B-tree, `(tree_height + 1) * 50` operator costs and a random page. Each arm
+reads its entry first (`os_entry_cost()`): `LION_RANGE_UNION_ENTRY_COST`, two `cpu_operator_cost` a
+TID - handed out, gathered into the arm's set - and the entry's TIDs' pages, two bytes a row, at
+`seq_page_cost`; and it holds its narrowed set beside the dimension's, within `hash_mem` and past it
+in the arena (§48.4, "The arm's memory"), so it pays what the two sets take past `hash_mem` together
+less what the dimension's alone takes, which the set's build has paid, at `lo_spill_cost()`'s price
+(§30.3, §30.4 "Spilling"). The arm's set holds `share_i` of the dimension's set's members, or
+without a set of the dimension the entry's rows, `freq_i` of the table, its bytes
+`lion_ordered_set_bytes()`'s (`lo_set_bytes()` over at most a container for each
+`LION_BLOCKS_PER_CONTAINER` pages); the arms' sets are given back one after another, so each arm is
+priced against the dimension's set alone. With `out_i` the rows of arm i, `run_i` its price past its
+start-up, and `S` the first arm's start-up with the walk's descent, the price of the LIMIT's `n`
+rows (`limit_tuples`, the OFFSET's with the count's) is
+
+    C(n) = S + Σ (entry_i + restart_i + run_i)  over the arms before m
+             + entry_m + restart_m + run_m * (n - Σ out_i over the arms before m) / out_m
+
+with `m` the first arm whose rows, added to those before it, reach `n` (the first arm has no
+restart).
+
+**The shape.** Core's Limit takes `startup + (total - startup) * n / rows` of its input. The path's
+start-up is `S` and the first arm's entry, its rows `R` the arms' sum, and its total
+`startup + (C(n) - startup) * R / n`, at which the Limit's price is `C(n)`. Without a LIMIT, or
+with one the arms are not expected to meet, the total is every arm's. Both are divided by
+`pg_lion.pushdown_margin`, as the join's are.
+
+**The sides' sets** (§47.4). The fact's is weighed for its lazy set by the arms up to `m`, their
+shares of its walk summed - two whole arms weigh 2. The dimension's is built at once under a split,
+whatever its weight (§48.4, "Built at once"), and `oj_cost()` prices its build whole, as it does
+for the join.
+
+**Where the price and the run part:**
+
+- *Independence.* The dimension's quals are taken to pass the same share of each value's rows -
+  `share_i` of the rows they pass are arm i's - which a correlation of the quals and the column
+  breaks: the LIMIT may be met in another arm than the priced one.
+- *The values past the MCV list* are priced after it, evenly; the walk meets them in their place.
+  ANALYZE keeps every value it samples of a column of a few values in the list, so only a value its
+  sample missed, a rare one, is misplaced.
+- *The shape is for core's Limit.* It is exact where the Limit is right above the split. An
+  Incremental Sort between them is priced by core from the split's start-up, total and rows, and
+  hands the Limit a price near `C(n)`. A plan that reads every row of the split below the Limit -
+  the split as a hash join's inner side - takes a total that is the LIMIT's price stretched over `R`
+  rows, not every arm's, and may be under it or over.
+- *An arm that returns fewer rows than priced walks further*: an entry whose dimension rows no fact
+  row of the set joins walks the whole fact, or until the fact's walk has met every member of its
+  set (§30.4's early stop).
+- *An entry whose rows are all dead*, or invisible to the snapshot, still has members of the
+  dimension's set: its arm runs and returns nothing. Only an entry with no member is passed over.
+
+### 48.4 Execution (`os_begin()`, `os_exec()`, `os_next_arm()`, `os_rescan()`; `lion_ordered_narrow_begin()`, `_add()`, `_end()`, lion_ordered.c)
+
+- **Begin.** The `custom_private` shape is checked; the child is initialised without
+  `EXEC_FLAG_BACKWARD` or `EXEC_FLAG_MARK` - the split supports neither, and core puts a Material
+  above it for a scroll cursor - and must be a LionOrderedJoin, whose dimension's side, the probe,
+  is what the arms narrow. The column's lion index is opened.
+- **An arm** (`os_next_arm()`). The column's walk begins with the first arm
+  (`lion_order_walk_begin()`: the column, no bounds, the direction, the NULL entry's place). For
+  each entry: the child is rescanned first, when it has run since its last rescan or a Param of the
+  split's has changed; then `lion_ordered_narrow_begin()` on the probe, `lion_ordered_narrow_add()`
+  for each of the entry's TIDs, and `lion_ordered_narrow_end()`, which returns the narrowed set's
+  members. An entry with none is passed over (`Entries Skipped`), the child's rescan, which reads
+  nothing, not repeated for the next; otherwise the child runs, and its rows are the split's until
+  it returns none. The walk has read the next entry's first TID, and holds no pin or lock while the
+  arm runs (§30.11).
+- **The narrowing.** `narrow_begin` gives back the last arm's narrowed set, then makes the
+  dimension's set unless it has it - built at once (below) - a changed Param of its lion quals
+  making it again first. The narrowed set is built from the entry's TIDs a container key at a time,
+  as they come in heap order (§30.11), each key's together, and each container is ANDed
+  (`lion_container_and()`) with the dimension's set's container of the key; without a set the
+  container is kept whole. While an arm runs, the probe tests a descent's TID against the narrowed
+  set alone, a subset of the dimension's. A container key below the one before it would be an entry
+  out of heap order, which only damage makes: `ERRCODE_INDEX_CORRUPTED`.
+- **The arm's memory.** The narrowed set's containers and its directory are the set's memory
+  (`lo_set_push()`, `lo_set_alloc()`): charged against `hash_mem` with the dimension's set, and in
+  its arena past it (§30.4, "Spilling") - neither held without bound nor a reason to decline the
+  plan. It matters most without a set of the dimension, where an arm's set is its entry whole: on a
+  dimension of hundreds of millions of rows, a value of a column of a few holds tens of millions of
+  TIDs, tens to hundreds of MB of containers, held for as long as the arm runs. Hence the order in
+  `narrow_begin`. The last arm's set is given back first (`lo_set_drop()`): its bytes in memory to
+  the charge, its blocks in the arena to the arena's free lists, where the next arm's take them, and
+  the spill is put back as the set's build left it, so that an arm past `hash_mem` does not send the
+  next, which may fit, to the file. Then the set: its build after a changed Param lets go of all of
+  the set's memory and the arena's before it starts (`lo_set_reset()`), and of the arm's set with
+  it. Then the new arm's set, charged on top of the set's. The node's end lets go of what is left
+  with the set. EXPLAIN ANALYZE counts the arms whose set had bytes in the arena, and the most of
+  one there (§48.5); the arena's bytes the node holds are counted for that (`arenabytes`), added at
+  each block `lo_set_alloc()` takes there and taken off at each it gives back, since the arena's own
+  measure (`lion_arena_used()`) is the file's high-water mark, which blocks taken again from the
+  free lists do not raise.
+- **Built at once.** Under a split the dimension's set is built at once, whatever the weight its
+  plan carries (§48.3). Each arm ANDs its entry with the set at every container key the entry has,
+  which for a column of a few values is most of them, so a lazy set would evaluate nearly every key
+  before the first arm's first descent; its memo would sit outside `hash_mem` while the arm runs;
+  and its conversion to a built set in the middle of an arm (`lo_lazy_convert()`) would reset the
+  set's memory, the arm's set with it. `oj_cost()` prices the dimension's build whole either way.
+- **The fact's side** is the child's (§47.4): its rescan restarts its walk and keeps its set, which
+  no Param reaches (§30.4).
+- **A row.** The child's row is copied into the scan slot and the split's target projected; the
+  child does not touch its slot until it is asked for its next row.
+- **Correctness.** The column is scalar, not multikey: each row version is under exactly one of its
+  entries (§30.11), the NULL entry holding the NULLs, so the arms divide the join's rows by the
+  column's value, and each arm's rows in the fact walk's order are a run of the query's order. The
+  narrowed set is a subset of the dimension's set, so an arm returns only rows the join returns,
+  and every row the join returns is in the arm of its dimension row's value: the walk reads the
+  index, not the statistics, so a value ANALYZE never saw is an entry in its place, and a row
+  inserted earlier in the same transaction is in the index. An update of the column is not HOT and
+  puts the new version's TID under the new value: the arm of the old value meets the old version's
+  TID, which a snapshot that sees the new version does not see, and the arm of the new value the
+  new one. A TID met under two entries is a slot reused after the walk passed it, its row invisible
+  to the snapshot (§30.11).
+- **Rescans** (`os_rescan()`). The column's walk ends, and begins again at the next arm. A changed
+  Param is handed to the child, whose rescan at the next arm hands it to its sides (§47.4) before
+  the entry is narrowed: `narrow_begin` consumes the probe's with a rescan of it, which drops the
+  dimension's set when its lion quals use the Param, and makes the set for the new value, once; the
+  arm's descents find no Param left to rescan for. Rescanned after the narrowing instead, the child
+  would hand the Param to the probe again, and its first descent would drop the set and build it a
+  second time. Each side keeps its set unless its lion quals use the Param; a key set is kept
+  unless its plan does.
+
+### 48.5 EXPLAIN (`os_explain()`)
+
+`Split By: <index> (<column>[, backward][, nulls first|nulls last])`, the column's walk as planned,
+with no NULLs placement where a clause is strict in the column, and `Arms Max: N`, the cap the plan
+was made under; under ANALYZE, `Arms Run` and `Entries Skipped`, the entries with no member of the
+dimension's set; and, where any arm's narrowed set had bytes in the arena (§48.4, "The arm's
+memory"), `Arm Sets Spilled: <arms>, <N> kB`, those arms and the most bytes of one there - what the
+dimension's set itself spilled is its own line's. The child is printed beneath it once, as a
+LionOrderedJoin with its own lines (§47.5), its counters summed over the arms and its loops theirs;
+its `Dimension Lion Set` is the dimension's set, not an arm's.
+
+### 48.6 Not done
+
+- **An ORDER BY of the column alone** (`ORDER BY d.flag DESC LIMIT 20`): an arm needs an order of
+  the fact to walk, and here any would do. Core's plan stays.
+- **Two columns of the dimension leading** (`ORDER BY d.flag, d.kind, f.score`): arms of the first
+  column only, and the fact's order then does not lead the rest, so no split. An arm for each pair
+  of entries, the two ANDed, is not built.
+- **Arms at once.** The arms run one after another; none is run ahead, merged or in parallel, and
+  the split is not parallel (§47.7).
+- **A cap at run time.** None: a column with more entries than planned - values inserted since
+  ANALYZE - runs every one.
+- **A multikey column**, whose rows are under several entries: declined.
+
+### 48.7 Tests
+
+test/sql/ordjoin.sql, section 13, on §47.8's tables and a nullable copy of the dimension (`dimn`:
+every 11th `flag`, 13th `kind` and 17th `tier` NULL, `kind` four values and `tier` three, each with
+a lion index). Each query is run through the split and through core's plan with the node off and the
+answers compared row by row, in order; `oj()` says `LionOrderedSplit`. `d.flag` leading, DESC and
+ASC: the split with nothing forced for a page in the first arm, an OFFSET into the second (`Arms
+Run: 2`), and the whole join without a LIMIT (7,525 rows); a trailing `d.lvl` sorted by the
+Incremental Sort; `d.kind` leading, ten values, declined at the default cap and split at
+`ordered_split_max = 10`, and `kind IN (2, 7)` passing over the two entries above 7 (`Entries
+Skipped: 2`). On the copy: NULLS FIRST and LAST, DESC and ASC; a text column, `tier`; `kind IS NOT
+NULL`, whose walk takes no NULL entry (`Split By: dimn_kind (kind)`); a value inserted after ANALYZE
+(`kind` 9, `tier` 'zinc') and one inserted in the same transaction before the query (`kind` -1,
+`tier` 'aluminium'), each returned in its place. A key set built once for two arms (`Key Set Builds:
+1`); a LATERAL subquery rescanned for each outer row, the dimension's set made again for each value
+once however many arms the row runs (seven rows of two arms each: `7 builds`), and one that passes
+over entries between rescans (`d.kind IN (x.x, x.x + 4)`); a generic plan's Param. Arms past a 64 kB
+`hash_mem`, on a dimension of 640,000 narrow rows (`dimbig`, 55 containers): without a set of the
+dimension, each arm's set the entry whole (`Arm Sets Spilled: 2, 21 kB`); with `d.lvl < 4`, the set
+in memory and the arm's past it (`1, 23 kB`); with `d.lvl < 5`, the set spilled too and the arms'
+sets in the arena whole; and a LATERAL subquery whose set, rebuilt for each of seven outer rows,
+lets go of the arms' with its own (`7 builds`, `8, 83 kB`). Declined: another operator family,
+another collation, an expression of the column, `FOR SHARE OF d`, a LEFT JOIN, `ordered_split_max` 1
+and 0, and `enable_ordered_join` off (core's Sort over a Hash Join).
+
+### 48.8 Measured (2026-10-24; PostgreSQL 17, §47.9's cluster and tables; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
+
+`SELECT f.id, f.score, f.amount, d.pk, d.region FROM bfact f JOIN bdim d ON f.fk = d.pk WHERE ...
+ORDER BY <the column>, f.score DESC LIMIT 20` on §47.9's 5,000,000-row fact table and
+200,000-row dimension. Warm: the median of seven runs after one. Cold: `effective_cache_size =
+400MB`, the cluster restarted and the kernel's page cache dropped before each run, the median of
+three; the reads are EXPLAIN's shared buffers read. "Planned" is the plan with nothing forced, at
+the default 4 GB and at 400 MB. Core's plan, with `pg_lion.enable_ordered_join` off, is in each
+case a Sort over the hash join of the two sets' bitmap heap scans. "Walked" is the child's `Index
+Entries Walked`; every page below took one arm.
+
+| page | WHERE | ORDER BY | walked | warm: core | the split | cold: core | the split | planned, 4 GB / 400 MB |
+|---|---|---|---|---|---|---|---|---|
+| dense | `f.chan = 3 AND d.region = 'north'` | `d.flag DESC` | 1,282 | 243 ms | 3.3 ms | 1,488 ms (86,490 reads) | 23.9 ms (532) | split / split |
+| dense | the same | `d.flag` | 1,770 | 243 ms | 3.1 ms | 1,350 ms | 30.6 ms | split / split |
+| dense, five values | `f.chan = 3 AND d.lvl < 50` | `d.region` | 1,079 | 323 ms | 8.2 ms | 1,473 ms | 29.0 ms | split / split |
+| medium | `f.chan = 3 AND d.lvl = 3` | `d.flag DESC` | 26,257 | 167 ms | 12.7 ms | 805 ms (72,973 reads) | 208 ms (4,085) | split / split |
+| medium | the same | `d.flag` | 32,336 | 192 ms | 13.2 ms | 757 ms | 218 ms | split / split |
+| sparse | `f.tags @> '{a1}' AND f.tags @> '{b2}' AND d.lvl = 3 AND d.kind = 3` | `d.flag DESC` | 1,187,000 | 61.5 ms | 265 ms | | | core / core |
+
+Core reads every row of both sets, joins them and sorts the join for twenty: `chan = 3` is 625,000
+fact rows. The split's first arm fills each dense and medium page, its walk §47's for that value:
+the medium `d.flag DESC` page's arm is §47.9's medium page (`d.lvl = 3 AND d.flag`), the same 26,257
+entries, in about the same time (12.7 against 11.6 ms). Warm the split is 13 to 78 times faster
+than core's plan, cold 3.5 to 62 times, and the planner takes it for each of those pages at both
+sizes: its Limit 2,197 against core's 104,372 for the dense `d.flag DESC` page, 5,785 against
+90,083 for the medium. It keeps core's plan for the sparse page, rightly: the arm walks 1.19 million
+entries for its twenty rows, 4.3 times slower than core's plan, and is priced 128,890 warm and
+190,970 cold against 77,161. Not measured: other majors.

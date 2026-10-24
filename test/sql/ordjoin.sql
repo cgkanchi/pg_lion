@@ -70,7 +70,8 @@ VACUUM (FREEZE, ANALYZE) fact;
 /*
  * oj() runs q through the node - lion's paths priced at a thousandth - and
  * through the ordinary plan (the node off), compares the two answers in
- * order, and says whether the first plan was the node.  A prepared
+ * order, and says whether the first plan was the node, or its split
+ * (section 13).  A prepared
  * statement's cached plan does not change with the settings, so for one the
  * ordinary answer comes from the query it stands for, given as `ordinary`.
  */
@@ -80,6 +81,7 @@ DECLARE
 	ln text;
 	r record;
 	used boolean := false;
+	split boolean := false;
 	keys text := '';
 	a text[] := '{}';
 	b text[] := '{}';
@@ -88,6 +90,9 @@ BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
 			used := true;
+		END IF;
+		IF ln ~ 'Custom Scan \(LionOrderedSplit\)' THEN
+			split := true;
 		END IF;
 		IF ln ~ '^\s*Key Sets: ' THEN
 			keys := format(' (key sets: %s)', regexp_replace(ln, '^\s*Key Sets: ', ''));
@@ -110,7 +115,9 @@ BEGIN
 					  a[1], b[1]);
 	END IF;
 	RETURN format('%s, %s rows',
-				  CASE WHEN used THEN 'LionOrderedJoin' || keys ELSE 'no LionOrderedJoin' END,
+				  CASE WHEN split THEN 'LionOrderedSplit' || keys
+					   WHEN used THEN 'LionOrderedJoin' || keys
+					   ELSE 'no LionOrderedJoin' END,
 				  coalesce(array_length(a, 1), 0));
 END $$;
 
@@ -479,6 +486,278 @@ SELECT oj_rows('SELECT o.id, d.pk FROM orph o JOIN dim d ON o.fk = d.pk
 	WHERE d.lvl = 3 AND o.fk IN (SELECT pk FROM flt WHERE x < 3)');
 DROP FUNCTION oj_rows(text, text);
 DROP TABLE orph;
+
+-- 13. LionOrderedSplit (DESIGN.md §48): an ORDER BY that leads with a column
+--     of the dimension, which a lion index of it walks in that order, and
+--     goes on with the fact's walk.  The join runs an arm at a time: one for
+--     each entry of the column, in the ORDER BY's order, the dimension's set
+--     narrowed to the entry's rows and the fact walked from its start; an
+--     Incremental Sort above sorts what the ORDER BY has past the walk.
+--     d.flag leading, descending and ascending: a page the first arm fills
+--     is the split's, nothing forced, and so are pages past it, OFFSET into
+--     the second arm and the whole join without a LIMIT.
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 30 OFFSET 2500');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id');
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 30 OFFSET 2500');
+
+-- ... a trailing d.lvl, sorted by the Incremental Sort above the split
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF) SELECT f.id, f.score, d.pk, d.flag, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> '{a1}' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, d.lvl, f.id LIMIT 20;
+RESET pg_lion.pushdown_margin;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, d.lvl, f.id LIMIT 20');
+
+-- ... d.kind leading: ten values, more arms than pg_lion.ordered_split_max
+--     plans for, until it is raised; an entry with no row of the dimension's
+--     set - d.kind IN (2, 7) leaves eight - is passed over, its arm not run.
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SET pg_lion.ordered_split_max = 10;
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.kind, f.score DESC NULLS LAST, f.id LIMIT 200 OFFSET 900');
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.kind IN (2, 7)
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 100');
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.kind IN (2, 7)
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 100');
+RESET pg_lion.ordered_split_max;
+
+-- ... NULLs, on a nullable copy of the dimension: the NULL entry walked
+--     first or last, as NULLS FIRST or LAST puts it, either way; not at all
+--     where a clause on the column is strict.
+CREATE TABLE dimn (pk int PRIMARY KEY, flag bool, kind int, lvl int NOT NULL,
+	tier text) WITH (autovacuum_enabled = off);
+INSERT INTO dimn
+SELECT pk, CASE WHEN pk % 11 = 0 THEN NULL ELSE flag END,
+	   CASE WHEN pk % 13 = 0 THEN NULL ELSE kind % 4 END, lvl,
+	   CASE WHEN pk % 17 = 0 THEN NULL
+			ELSE (ARRAY['gold', 'silver', 'bronze'])[1 + pk % 3] END
+  FROM dim;
+CREATE INDEX dimn_flag ON dimn USING lion (flag);
+CREATE INDEX dimn_kind ON dimn USING lion (kind);
+CREATE INDEX dimn_lvl ON dimn USING lion (lvl);
+CREATE INDEX dimn_tier ON dimn USING lion (tier);
+VACUUM (FREEZE, ANALYZE) dimn;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 3000');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag DESC NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 1300');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag NULLS LAST, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 7000');
+SELECT oj('SELECT f.id, f.score, d.pk, d.tier FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.tier DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 1000');
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 1300');
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (COSTS OFF) SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.kind IS NOT NULL
+	ORDER BY d.kind NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20;
+RESET pg_lion.pushdown_margin;
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.kind IS NOT NULL
+	ORDER BY d.kind NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- ... a value the statistics have never seen, inserted after ANALYZE, and
+--     one inserted in the same transaction before the query: each is an
+--     entry of the column, walked in its place; the planner's arms are only
+--     its price.
+INSERT INTO dimn SELECT 100000 + i, true, 9, i % 100, 'zinc' FROM generate_series(1, 50) i;
+INSERT INTO fact SELECT 600000 + i, 100001 + i % 50, 2, 0, i, '{a1}', 'n'
+  FROM generate_series(1, 30) i;
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.kind DESC NULLS LAST, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.kind NULLS LAST, f.score DESC NULLS LAST, f.id OFFSET 29600');
+BEGIN;
+INSERT INTO dimn SELECT 100100 + i, false, -1, i % 100, 'aluminium' FROM generate_series(1, 50) i;
+INSERT INTO fact SELECT 600100 + i, 100101 + i % 50, 2, 0, 5000 + i, '{a1}', 'n'
+  FROM generate_series(1, 30) i;
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.kind NULLS FIRST, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 2280');
+SELECT oj('SELECT f.id, f.score, d.pk, d.tier FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.tier, f.score DESC NULLS LAST, f.id LIMIT 20');
+SET LOCAL pg_lion.pushdown_margin = 1000;
+SELECT f.id, f.score, d.pk, d.kind, d.tier FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.tier, f.score DESC NULLS LAST, f.id LIMIT 5;
+ROLLBACK;
+
+-- ... a key set (§47.6), built once for every arm
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3)
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 600');
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3)
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 600');
+
+-- ... a rescan, the dimension's set made again for each outer row's value,
+--     once however many arms the row runs (seven rows, two arms each: 7
+--     builds), and entries passed over between rescans; and a generic
+--     plan's Param
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id');
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 100) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 100) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id') ln
+ WHERE ln ~ '(LionOrderedSplit|Arms Run|Entries Skipped|Lion Set):';
+SET pg_lion.ordered_split_max = 10;
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.kind
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.kind IN (x.x, x.x + 4)
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 1300) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.kind DESC, s.score DESC NULLS LAST, s.id');
+RESET pg_lion.ordered_split_max;
+SET plan_cache_mode = force_generic_plan;
+SET pg_lion.pushdown_margin = 1000;
+PREPARE ps(int) AS SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl = $1 ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 5;
+RESET pg_lion.pushdown_margin;
+SELECT oj('EXECUTE ps(4)', 'SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl = 4 ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 5');
+SELECT oj('EXECUTE ps(9)', 'SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl = 9 ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 5');
+DEALLOCATE ps;
+RESET plan_cache_mode;
+
+-- ... an arm's set past hash_mem: the set's memory, charged with the
+--     dimension's set and spilled to its arena past it (§30.4, "Spilling"),
+--     given back as the next arm begins.  A dimension of 640,000 narrow rows,
+--     55 containers: at a 64 kB hash_mem, an arm's set without a set of the
+--     dimension - the entry whole - spills in each arm; with d.lvl < 4 the
+--     set is in memory and the arm's past it; with d.lvl < 5 the set spills
+--     too, and the arms' sets are in the arena whole; in a LATERAL subquery,
+--     the set rebuilt for each outer row lets go of the arms' with its own.
+CREATE TABLE dimbig (pk int PRIMARY KEY, flag bool NOT NULL, lvl int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO dimbig
+SELECT i, (hashint8extended(i::bigint, 5) & 9223372036854775807) % 3 <> 0,
+	   ((hashint8extended(i::bigint, 6) & 9223372036854775807) % 100)::int
+  FROM generate_series(1, 640000) i;
+CREATE INDEX dimbig_flag ON dimbig USING lion (flag);
+CREATE INDEX dimbig_lvl ON dimbig USING lion (lvl);
+VACUUM (FREEZE, ANALYZE) dimbig;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}''
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 17000');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}''
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 17000') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 4
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 4
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 5
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 5
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < x.x + 3
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 700) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag DESC, s.score DESC NULLS LAST, s.id');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < x.x + 3
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 700) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag DESC, s.score DESC NULLS LAST, s.id') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+RESET hash_mem_multiplier;
+RESET work_mem;
+DROP TABLE dimbig;
+
+-- ... and what it declines: a column whose lion order is not the ORDER BY's
+--     - another operator family, another collation - an expression of the
+--     column, and what the join itself declines (§47.1); and the settings.
+SELECT oj('SELECT f.id, f.score, d.pk, d.tier FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.tier USING ~<~, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.tier FROM fact f JOIN dimn d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.tier COLLATE "POSIX", f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.kind FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.kind % 2, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 FOR SHARE OF d');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f LEFT JOIN dim d ON f.fk = d.pk AND d.lvl < 30
+	WHERE f.grp = 2
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SET pg_lion.ordered_split_max = 1;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SET pg_lion.ordered_split_max = 0;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET pg_lion.ordered_split_max;
+SET pg_lion.enable_ordered_join = off;
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET pg_lion.enable_ordered_join;
+DROP TABLE dimn;
 
 DROP FUNCTION oj(text, text);
 DROP FUNCTION oj_plan(text);

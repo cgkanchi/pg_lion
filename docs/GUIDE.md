@@ -519,6 +519,31 @@ the `LIMIT` lets it meet, not at the hit ratio of the loop's whole walk. Where t
 are charged as cold reads, as are the node's own, which are fewer. `pg_lion.enable_ordered_join`
 turns it off (DESIGN.md §47).
 
+When the page is ordered first by a column of the dimension with few values, and then by the
+fact's B-tree, no B-tree gives the order, and PostgreSQL joins every row of both filters and sorts:
+
+```sql
+-- the verified dimension rows' best-scored fact rows first, then the rest's
+SELECT f.id, f.score, d.id, d.name FROM fact f JOIN dim d ON f.dim_id = d.id
+ WHERE f.grp = 2 AND f.tags @> ARRAY['a1'] AND d.region = 'north'
+ ORDER BY d.verified DESC, f.score DESC NULLS LAST LIMIT 20;
+```
+
+With a Lion index on `d.verified`, `Custom Scan (LionOrderedSplit)` runs the join a value of the
+column at a time, in the `ORDER BY`'s order (`Split By: dim_verified (verified, backward, nulls
+first)`): a `LionOrderedJoin` beneath it with the dimension narrowed to the rows of that value,
+which walks the fact's B-tree from the top until the page is full, and moves on to the next value
+only if it is not. A column can be split when it is a plain column with a Lion index, sorted in its
+type's own order and collation, and has at most `pg_lion.ordered_split_max` values (8) by its
+statistics; values added since `ANALYZE` are still returned in their place. While a value runs, its
+rows - those that pass the dimension's Lion filter, where it has one - are held as a Lion set, which
+shares `work_mem` × `hash_mem_multiplier` with the filter's own set and goes to a temporary file
+past it, as a hash join's table would. `EXPLAIN ANALYZE` shows how many values were run (`Arms
+Run`), how many were passed over because none of their rows pass the dimension's filter (`Entries
+Skipped`), and how many of the values' sets spilled, with the most of one in the file (`Arm Sets
+Spilled: 2, 21 kB`). An `ORDER BY` that goes on past the fact's B-tree is finished by an Incremental
+Sort above (DESIGN.md §48).
+
 ## Nearest neighbours: lionvec
 
 `CREATE EXTENSION pg_lion_vector` (with pgvector installed) adds `lionvec`, an index that answers
