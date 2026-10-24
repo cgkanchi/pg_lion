@@ -818,17 +818,21 @@ typedef struct LionOrderedState
 	 * of one entry of the split's column: that entry's TIDs ANDed with the
 	 * set a container at a time as the split hands them in
 	 * (lion_ordered_narrow_add()), which a TID a descent finds is tested
-	 * against in place of the set.  In memory of its own: a lazy set's build
-	 * (lo_lazy_convert()) resets the set's.
+	 * against in place of the set.  Its memory is the set's, lo_set_alloc()'s
+	 * - charged against hash_mem with the set's, in the arena past it - given
+	 * back as the next arm begins, or with the set's (lo_set_reset()).
 	 */
 	bool		narrowing;
-	LionTidSet *narrow;
-	MemoryContext narrowcxt;	/* the narrowed set; reset per arm */
+	LionTidSet *narrow;			/* NULL: none held */
 	LionContainer *narrowbuf;	/* the entry's TIDs of one container key */
 	LionContainer *narrowand;	/* ... ANDed with the set's */
 	bool		narrowopen;		/* narrowbuf holds the key's TIDs so far */
 	uint32		narrowlast;		/* the key narrowbuf was opened for last */
 	uint64		narrowmembers;
+	bool		setspilled;		/* spilled, as the set left it */
+	Size		narrowbase;		/* arenabytes, as the set left them */
+	uint64		narrowspills;	/* EXPLAIN ANALYZE: arms whose set spilled */
+	Size		narrowspillbytes;	/* ... the most of one in the arena */
 
 	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
@@ -893,6 +897,7 @@ typedef struct LionOrderedState
 	Size		limit;			/* ... within which it stays: hash_mem */
 	bool		spilled;		/* this build's set outgrew it: in the arena */
 	LionArena  *arena;			/* the set past hash_mem (§30.4, "Spilling") */
+	Size		arenabytes;		/* what lo_set_alloc() holds in it now */
 	File		arenafile;		/* its temporary file, once needed */
 	MemoryContextCallback arenacb;	/* unmaps it with the query's memory */
 	Size		spillbytes;		/* EXPLAIN: arena bytes the last build and its
@@ -5271,6 +5276,7 @@ lo_set_alloc(LionOrderedState *st, MemoryContext cxt, Size size)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not spill LionOrdered's set to a temporary file: %m")));
+	st->arenabytes += size;
 	return p;
 }
 
@@ -5279,7 +5285,11 @@ static void
 lo_set_free(LionOrderedState *st, void *p, Size size)
 {
 	if (st->arena != NULL && lion_arena_contains(st->arena, p))
+	{
+		Assert(st->arenabytes >= size);
+		st->arenabytes -= size;
 		lion_arena_free(st->arena, p, size);
+	}
 	else
 	{
 		Assert(st->bytes >= size);
@@ -5833,9 +5843,11 @@ lo_set_reset(LionOrderedState *st)
 	if (st->arena != NULL)
 		lion_arena_reset(st->arena);
 	st->set = NULL;
+	st->narrow = NULL;			/* a LionOrderedSplit arm's, gone with it */
 	st->setview = false;
 	st->live = NIL;
 	st->bytes = 0;
+	st->arenabytes = 0;
 	st->spilled = false;
 	st->limit = get_hash_memory_limit();
 }
@@ -6438,13 +6450,14 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 }
 
 /*
- * The memo's entry for container key ckey: a key met for the first time is
- * evaluated and remembered, members or not.  Its container is NULL where the
- * set has no member at the key.
+ * The memo's entry for tid's container key if tid is a member, else NULL: a
+ * key met for the first time is evaluated and remembered, members or not.
  */
 static LoMemoEnt *
-lo_lazy_entry(LionOrderedState *st, uint32 ckey)
+lo_lazy_find(LionOrderedState *st, ItemPointer tid)
 {
+	uint64		code = lion_tid_to_code(tid);
+	uint32		ckey = lion_code_ckey(code);
 	LoMemoEnt  *e = lo_memo_lookup(st->memo, ckey);
 
 	if (e == NULL)
@@ -6475,16 +6488,6 @@ lo_lazy_entry(LionOrderedState *st, uint32 ckey)
 		st->lazykeys++;
 		CHECK_FOR_INTERRUPTS();
 	}
-	return e;
-}
-
-/* The memo's entry for tid's container key if tid is a member, else NULL. */
-static LoMemoEnt *
-lo_lazy_find(LionOrderedState *st, ItemPointer tid)
-{
-	uint64		code = lion_tid_to_code(tid);
-	LoMemoEnt  *e = lo_lazy_entry(st, lion_code_ckey(code));
-
 	if (e->c == NULL || !lion_container_contains(e->c, lion_code_lo(code)))
 		return NULL;
 	return e;
@@ -7720,7 +7723,7 @@ lo_next(ScanState *ss)
 	 * participant of a parallel walk for all of them, when the Gather has
 	 * set one up (§40.9).
 	 */
-	if (st->set == NULL && !st->noset && !st->lazy &&
+	if (st->set == NULL && !st->noset && !st->lazy && !st->narrowing &&
 		!(st->lazyok && lo_lazy_begin(st)))
 	{
 		if (st->shared != NULL)
@@ -7731,10 +7734,14 @@ lo_next(ScanState *ss)
 	if (!st->started)
 		lo_start_walk(st);
 
-	/* an empty set selects nothing, and needs no walk */
+	/*
+	 * An empty set selects nothing, and needs no walk.  A LionOrderedSplit's
+	 * arm tests its narrowed set alone, which lion_ordered_narrow_begin()
+	 * made after the set (§48).
+	 */
 	if (st->done ||
-		(!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0)) ||
-		(st->narrowing && st->narrow->n == 0))
+		(st->narrowing ? (st->narrow == NULL || st->narrow->n == 0) :
+		 (!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0))))
 		return ExecClearTuple(slot);
 	if (st->sorting)
 		return lo_sort_next(st, slot);
@@ -8638,33 +8645,15 @@ lo_narrow_state(PlanState *ps)
 }
 
 /*
- * The set's container at ckey, or NULL where it has no member there: the
- * built set's, or the lazy set's, evaluated there and remembered as a
- * descent's TID would have it (lo_lazy_entry()).
- */
-static const LionContainer *
-lo_set_at(LionOrderedState *st, uint32 ckey)
-{
-	int			idx;
-
-	if (st->lazy)
-		return st->lazyempty ? NULL : lo_lazy_entry(st, ckey)->c;
-	idx = lo_set_key_index(st->set, ckey);
-	return idx < 0 ? NULL : st->set->conts[idx];
-}
-
-/*
  * The entry's TIDs of the container key narrowbuf holds, ANDed with the
  * set's container of the key - without a set, all of them - into the
- * narrowed set, when that leaves any.
+ * narrowed set, when that leaves any: copied into memory of the set's
+ * (lo_set_push()), charged against hash_mem with it and in the arena past it.
  */
 static void
 lo_narrow_flush(LionOrderedState *st)
 {
 	const LionContainer *keep = st->narrowbuf;
-	LionTidSet *set = st->narrow;
-	LionContainer *copy;
-	Size		size;
 
 	if (!st->narrowopen)
 		return;
@@ -8672,35 +8661,40 @@ lo_narrow_flush(LionOrderedState *st)
 	lion_container_optimize(st->narrowbuf);
 	if (!st->noset)
 	{
-		const LionContainer *c = lo_set_at(st, st->narrowbuf->ckey);
+		int			idx = lo_set_key_index(st->set, st->narrowbuf->ckey);
 
-		if (c == NULL || lion_container_and(st->narrowbuf, c,
-											st->narrowand) == 0)
+		if (idx < 0 || lion_container_and(st->narrowbuf, st->set->conts[idx],
+										   st->narrowand) == 0)
 			return;
 		keep = st->narrowand;
 	}
-	if (set->n == set->cap)
-	{
-		set->cap *= 2;
-		set->keys = (uint32 *) repalloc(set->keys, sizeof(uint32) * set->cap);
-		set->conts = (LionContainer **)
-			repalloc(set->conts, sizeof(LionContainer *) * set->cap);
-	}
-	size = lion_container_size(keep);
-	copy = (LionContainer *) MemoryContextAlloc(st->narrowcxt, size);
-	memcpy(copy, keep, size);
-	set->keys[set->n] = keep->ckey;
-	set->conts[set->n] = copy;
-	set->n++;
+	lo_set_push(st, st->narrow, keep->ckey, keep);
 	st->narrowmembers += keep->cardinality;
 }
 
 /*
- * Begin an arm: the dimension's set, made as its first descent would make it
- * (lo_next()) - built, or lazy - and kept for every arm, unless a Param of
- * its lion quals has changed since the last; and the narrowed set emptied,
- * for lion_ordered_narrow_add() to fill.  The dimension returns no row until
+ * Begin an arm: the last arm's narrowed set given back; the dimension's set,
+ * built once and kept for every arm, unless a Param of its lion quals has
+ * changed since the last; and the narrowed set started empty, for
+ * lion_ordered_narrow_add() to fill.  The dimension returns no row until
  * lion_ordered_narrow_end().
+ *
+ * The narrowed set's memory is the set's (lo_set_alloc()): charged against
+ * hash_mem with the set's, and in the arena past it, as a set that outgrows
+ * hash_mem is (DESIGN.md §30.4, "Spilling").  Without a set of the dimension
+ * it is the entry whole, on a large dimension no small copy.  Hence the
+ * order here: the last arm's set given back first, its blocks in the arena
+ * to the free lists, and the spill left as the set left it - one arm past
+ * hash_mem says nothing of the next; then the set, whose build, after a
+ * changed Param, lets go of everything before it starts (lo_set_reset());
+ * then the arm's set, on top of the set's charge.
+ *
+ * The set is built at once, never lazily: each arm ANDs its entry with the
+ * set at every container key the entry has, which is most of them for a
+ * column of a few values, so a lazy set would evaluate nearly every key
+ * anyway - with its memo outside hash_mem while the arm runs, and its
+ * conversion, in the middle of an arm, resetting the set's memory and the
+ * arm's set with it.  oj_cost() prices the set's build whole.
  *
  * The split rescans its child before this (os_next_arm()), and the child's
  * rescan hands a changed Param to this dimension: it is consumed here, by a
@@ -8714,29 +8708,34 @@ lion_ordered_narrow_begin(PlanState *ps)
 	LionOrderedState *st = lo_narrow_state(ps);
 	MemoryContext oldcxt;
 
+	if (st->narrow != NULL)
+	{
+		lo_set_drop(st, st->narrow);
+		st->narrow = NULL;
+		st->spilled = st->setspilled;
+	}
 	if (ps->chgParam != NULL)
 		ExecReScan(ps);
-	if (st->set == NULL && !st->noset && !st->lazy &&
-		!(st->lazyok && lo_lazy_begin(st)))
-		lo_build_set(st);
-	if (st->narrowcxt == NULL)
+	Assert(!st->lazy);
+	if (st->narrowbuf == NULL)
 	{
 		MemoryContext qcxt = st->css.ss.ps.state->es_query_cxt;
 
-		st->narrowcxt = AllocSetContextCreate(qcxt, "LionOrdered arm",
-											  ALLOCSET_DEFAULT_SIZES);
 		st->narrowbuf = (LionContainer *)
 			MemoryContextAlloc(qcxt, LION_CONTAINER_MAX_SIZE);
 		st->narrowand = (LionContainer *)
 			MemoryContextAlloc(qcxt, LION_CONTAINER_MAX_SIZE);
+		/* a dimension without a set has no build to set the limit */
+		st->limit = get_hash_memory_limit();
 	}
-	MemoryContextReset(st->narrowcxt);
-	oldcxt = MemoryContextSwitchTo(st->narrowcxt);
-	st->narrow = (LionTidSet *) palloc0(sizeof(LionTidSet));
-	st->narrow->cap = 16;
-	st->narrow->keys = (uint32 *) palloc(sizeof(uint32) * st->narrow->cap);
-	st->narrow->conts = (LionContainer **)
-		palloc(sizeof(LionContainer *) * st->narrow->cap);
+	if (st->set == NULL && !st->noset)
+		lo_build_set(st);
+	st->setspilled = st->spilled;
+	st->narrowbase = st->arenabytes;
+
+	/* the live sets' list, which lo_set_new() adds to, in the set's memory */
+	oldcxt = MemoryContextSwitchTo(st->setcxt);
+	st->narrow = lo_set_new(st);
 	MemoryContextSwitchTo(oldcxt);
 	st->narrowopen = false;
 	st->narrowlast = 0;
@@ -8784,7 +8783,27 @@ lion_ordered_narrow_end(PlanState *ps)
 	LionOrderedState *st = lo_narrow_state(ps);
 
 	lo_narrow_flush(st);
+	if (st->narrowmembers > 0 && st->arenabytes > st->narrowbase)
+	{
+		st->narrowspills++;
+		st->narrowspillbytes = Max(st->narrowspillbytes,
+								   st->arenabytes - st->narrowbase);
+	}
 	return st->narrowmembers;
+}
+
+/*
+ * EXPLAIN ANALYZE's: the arms run whose narrowed set was in the arena, at
+ * least in part - past hash_mem with the set's, or all of it after a set
+ * that had spilled - and the most bytes of one there.
+ */
+void
+lion_ordered_narrow_spill(PlanState *ps, uint64 *arms, Size *bytes)
+{
+	LionOrderedState *st = lo_narrow_state(ps);
+
+	*arms = st->narrowspills;
+	*bytes = st->narrowspillbytes;
 }
 
 /* ---------------------------------------------------------------------

@@ -1621,6 +1621,107 @@ SELECT oj('EXECUTE ps(9)', 'SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN 
 
 DEALLOCATE ps;
 RESET plan_cache_mode;
+-- ... an arm's set past hash_mem: the set's memory, charged with the
+--     dimension's set and spilled to its arena past it (§30.4, "Spilling"),
+--     given back as the next arm begins.  A dimension of 640,000 narrow rows,
+--     55 containers: at a 64 kB hash_mem, an arm's set without a set of the
+--     dimension - the entry whole - spills in each arm; with d.lvl < 4 the
+--     set is in memory and the arm's past it; with d.lvl < 5 the set spills
+--     too, and the arms' sets are in the arena whole; in a LATERAL subquery,
+--     the set rebuilt for each outer row lets go of the arms' with its own.
+CREATE TABLE dimbig (pk int PRIMARY KEY, flag bool NOT NULL, lvl int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO dimbig
+SELECT i, (hashint8extended(i::bigint, 5) & 9223372036854775807) % 3 <> 0,
+	   ((hashint8extended(i::bigint, 6) & 9223372036854775807) % 100)::int
+  FROM generate_series(1, 640000) i;
+CREATE INDEX dimbig_flag ON dimbig USING lion (flag);
+CREATE INDEX dimbig_lvl ON dimbig USING lion (lvl);
+VACUUM (FREEZE, ANALYZE) dimbig;
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}''
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 17000');
+            oj             
+---------------------------
+ LionOrderedSplit, 20 rows
+(1 row)
+
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}''
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 17000') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+          counters          
+----------------------------
+ Arms Run: 2
+ Arm Sets Spilled: 2, 21 kB
+(2 rows)
+
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 4
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500');
+            oj             
+---------------------------
+ LionOrderedSplit, 20 rows
+(1 row)
+
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 4
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+                 counters                 
+------------------------------------------
+ Arms Run: 1
+ Arm Sets Spilled: 1, 23 kB
+ Dimension Lion Set: 55 containers, exact
+(3 rows)
+
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 5
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500');
+            oj             
+---------------------------
+ LionOrderedSplit, 20 rows
+(1 row)
+
+SELECT btrim(ln) AS counters FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 5
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 500') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+                        counters                         
+---------------------------------------------------------
+ Arms Run: 2
+ Arm Sets Spilled: 2, 43 kB
+ Dimension Lion Set: 55 containers, exact, spilled 30 kB
+(3 rows)
+
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < x.x + 3
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 700) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag DESC, s.score DESC NULLS LAST, s.id');
+            oj             
+---------------------------
+ LionOrderedSplit, 21 rows
+(1 row)
+
+SELECT btrim(ln) AS counters FROM oj_run('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dimbig d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < x.x + 3
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 700) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag DESC, s.score DESC NULLS LAST, s.id') ln
+ WHERE ln ~ '(Arms Run|Arm Sets Spilled|Dimension Lion Set):';
+                              counters                              
+--------------------------------------------------------------------
+ Arms Run: 9
+ Arm Sets Spilled: 8, 83 kB
+ Dimension Lion Set: 55 containers, exact, spilled 110 kB, 7 builds
+(3 rows)
+
+RESET hash_mem_multiplier;
+RESET work_mem;
+DROP TABLE dimbig;
 -- ... and what it declines: a column whose lion order is not the ORDER BY's
 --     - another operator family, another collation - an expression of the
 --     column, and what the join itself declines (§47.1); and the settings.

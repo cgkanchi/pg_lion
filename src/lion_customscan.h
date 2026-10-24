@@ -4494,6 +4494,8 @@ extern IndexOptInfo *lion_ordered_column_order(PlannerInfo *root,
 extern void lion_ordered_narrow_begin(PlanState *ps);
 extern void lion_ordered_narrow_add(PlanState *ps, ItemPointer tid);
 extern uint64 lion_ordered_narrow_end(PlanState *ps);
+extern void lion_ordered_narrow_spill(PlanState *ps, uint64 *arms,
+									  Size *bytes);
 extern void lion_ordered_explain_side(PlanState *ps, List *ancestors,
 									  ExplainState *es, const char *prefix,
 									  bool counters);
