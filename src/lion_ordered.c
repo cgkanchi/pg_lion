@@ -814,6 +814,27 @@ typedef struct LionOrderedState
 	bool		keyed;
 
 	/*
+	 * ... narrowed, for a LionOrderedSplit's arm (DESIGN.md §48), to the rows
+	 * of one entry of the split's column: that entry's TIDs ANDed with the
+	 * set a container at a time as the split hands them in
+	 * (lion_ordered_narrow_add()), which a TID a descent finds is tested
+	 * against in place of the set.  Its memory is the set's, lo_set_alloc()'s
+	 * - charged against hash_mem with the set's, in the arena past it - given
+	 * back as the next arm begins, or with the set's (lo_set_reset()).
+	 */
+	bool		narrowing;
+	LionTidSet *narrow;			/* NULL: none held */
+	LionContainer *narrowbuf;	/* the entry's TIDs of one container key */
+	LionContainer *narrowand;	/* ... ANDed with the set's */
+	bool		narrowopen;		/* narrowbuf holds the key's TIDs so far */
+	uint32		narrowlast;		/* the key narrowbuf was opened for last */
+	uint64		narrowmembers;
+	bool		setspilled;		/* spilled, as the set left it */
+	Size		narrowbase;		/* arenabytes, as the set left them */
+	uint64		narrowspills;	/* EXPLAIN ANALYZE: arms whose set spilled */
+	Size		narrowspillbytes;	/* ... the most of one in the arena */
+
+	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
 	 * NULL entry goes, the walk of this scan, and the fetch of what it meets
 	 * (the TID it hands out is a HOT chain's root, as a btree's is).
@@ -876,6 +897,7 @@ typedef struct LionOrderedState
 	Size		limit;			/* ... within which it stays: hash_mem */
 	bool		spilled;		/* this build's set outgrew it: in the arena */
 	LionArena  *arena;			/* the set past hash_mem (§30.4, "Spilling") */
+	Size		arenabytes;		/* what lo_set_alloc() holds in it now */
 	File		arenafile;		/* its temporary file, once needed */
 	MemoryContextCallback arenacb;	/* unmaps it with the query's memory */
 	Size		spillbytes;		/* EXPLAIN: arena bytes the last build and its
@@ -2646,19 +2668,74 @@ lo_walk_value_rinfos(RelOptInfo *rel, IndexOptInfo *idx, int c, Var *var,
 }
 
 /*
+ * Does key column c of the lion index idx of rel give the pathkey want in
+ * its directory's order (DESIGN.md §30.11): an ordered scalar key column, a
+ * plain column of the table under the column's own collation, in its type's
+ * own btree order, whose pathkey - the ascending one, as
+ * build_expression_pathkey() finds it among the query's equivalence classes
+ * (for a partition, through its member of the parent's class) - has want's
+ * class and operator family?  *var is the column, as rel's Var.  *indexrel is
+ * the index, opened at the first call that needs it, for the caller to close.
+ */
+static bool
+lo_column_gives(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+				IndexOptInfo *idx, Relation *indexrel, int c, PathKey *want,
+				Var **var)
+{
+	AttrNumber	attno = idx->indexkeys[c];
+	LionState  *state;
+	TypeCacheEntry *typentry;
+	Oid			type;
+	int32		typmod;
+	Oid			coll;
+	List	   *pks;
+	PathKey    *mine;
+
+	if (attno <= 0)
+		return false;			/* an expression: no Var to order by */
+	get_atttypetypmodcoll(rte->relid, attno, &type, &typmod, &coll);
+	if (idx->indexcollations[c] != coll)
+		return false;
+
+	if (*indexrel == NULL)
+		*indexrel = index_open(idx->indexoid, AccessShareLock);
+	state = lion_index_column_state(*indexrel, (AttrNumber) (c + 1));
+	if (state->multikey || !state->ordered || state->typid != type)
+		return false;
+
+	/*
+	 * The directory is in the type's default btree order only when the
+	 * column's comparison is that order's (the GROUP BY walk's rule,
+	 * lion_index_orders_naturally()); its `<` names the operator family the
+	 * pathkey is in.
+	 */
+	typentry = lookup_type_cache(type, TYPECACHE_CMP_PROC | TYPECACHE_LT_OPR);
+	if (!OidIsValid(typentry->cmp_proc) ||
+		typentry->cmp_proc != state->cmpproc.fn_oid ||
+		!OidIsValid(typentry->lt_opr))
+		return false;
+
+	*var = makeVar(rel->relid, attno, type, typmod, coll, 0);
+	pks = build_expression_pathkey(root, (Expr *) *var, typentry->lt_opr,
+								   rel->relids, false);
+	if (pks == NIL)
+		return false;
+	mine = (PathKey *) linitial(pks);
+	return mine->pk_eclass == want->pk_eclass &&
+		mine->pk_opfamily == want->pk_opfamily;
+}
+
+/*
  * The walks of rel's lion columns that give the query's ORDER BY (DESIGN.md
- * §30.11): an ordered scalar key column of a lion index, in its type's own
- * btree order under the column's collation, whose pathkey - the ascending
- * one, as build_expression_pathkey() finds it among the query's equivalence
- * classes (for a partition, through its member of the parent's class) - is
- * the first of the ORDER BY's.  The walk then gives that pathkey whichever
- * direction and NULLs placement it asks for: it runs either way, and takes
- * the column's NULL entry before its values or after them.  Only the first
- * pathkey: a lion column orders one column, and core sorts the rest
- * incrementally.  Only the ORDER BY's: a GROUP BY, a DISTINCT or a merge
- * join over a lion column wants every row, which the count pushdown counts
- * from the same entries and a hash or a Sort takes from the heap in its
- * order, where the walk would fetch them in key order.
+ * §30.11): an ordered scalar key column of a lion index whose order is the
+ * first of the ORDER BY's pathkeys (lo_column_gives()).  The walk then gives
+ * that pathkey whichever direction and NULLs placement it asks for: it runs
+ * either way, and takes the column's NULL entry before its values or after
+ * them.  Only the first pathkey: a lion column orders one column, and core
+ * sorts the rest incrementally.  Only the ORDER BY's: a GROUP BY, a DISTINCT
+ * or a merge join over a lion column wants every row, which the count
+ * pushdown counts from the same entries and a hash or a Sort takes from the
+ * heap in its order, where the walk would fetch them in key order.
  */
 static List *
 lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
@@ -2688,53 +2765,13 @@ lo_lion_walks(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 
 		for (c = 0; c < idx->nkeycolumns; c++)
 		{
-			AttrNumber	attno = idx->indexkeys[c];
-			LionState  *state;
-			TypeCacheEntry *typentry;
-			Oid			type;
-			int32		typmod;
-			Oid			coll;
 			Var		   *var;
-			List	   *pks;
-			PathKey    *mine;
 			LoWalk	   *w;
 			ListCell   *lc2;
 			bool		strict = false;
 
-			if (attno <= 0)
-				continue;		/* an expression: no Var to order by */
-			get_atttypetypmodcoll(rte->relid, attno, &type, &typmod, &coll);
-			if (idx->indexcollations[c] != coll)
-				continue;
-
-			if (indexrel == NULL)
-				indexrel = index_open(idx->indexoid, AccessShareLock);
-			state = lion_index_column_state(indexrel, (AttrNumber) (c + 1));
-			if (state->multikey || !state->ordered || state->typid != type)
-				continue;
-
-			/*
-			 * The directory is in the type's default btree order only when
-			 * the column's comparison is that order's (the GROUP BY walk's
-			 * rule, lion_index_orders_naturally()); its `<` names the
-			 * operator family the pathkey is in.
-			 */
-			typentry = lookup_type_cache(type, TYPECACHE_CMP_PROC |
-										 TYPECACHE_LT_OPR);
-			if (!OidIsValid(typentry->cmp_proc) ||
-				typentry->cmp_proc != state->cmpproc.fn_oid ||
-				!OidIsValid(typentry->lt_opr))
-				continue;
-
-			var = makeVar(rel->relid, attno, type, typmod, coll, 0);
-			pks = build_expression_pathkey(root, (Expr *) var,
-										   typentry->lt_opr, rel->relids,
-										   false);
-			if (pks == NIL)
-				continue;
-			mine = (PathKey *) linitial(pks);
-			if (mine->pk_eclass != want->pk_eclass ||
-				mine->pk_opfamily != want->pk_opfamily)
+			if (!lo_column_gives(root, rel, rte, idx, &indexrel, c, want,
+								 &var))
 				continue;
 
 			w = (LoWalk *) palloc0(sizeof(LoWalk));
@@ -4357,6 +4394,62 @@ lion_ordered_orders(RelOptInfo *rel)
 	return result;
 }
 
+/*
+ * rel's ordered btree paths for an order the query's own does not lead with,
+ * want - a list of pathkeys: core's index paths, as lion_ordered_orders()
+ * takes them, built on a scratch copy of rel that sees only its btrees with
+ * want as the query's pathkeys and its sort pathkeys while they are built -
+ * truncate_useless_pathkeys() judges an order by the one or the other,
+ * depending on the major - so that the orders create_index_paths() keeps are
+ * those useful for want.  For a LionOrderedSplit (lion_ordjoin.c,
+ * DESIGN.md §48), whose arms walk the fact in the order the ORDER BY has
+ * after its first key, a column of another table: core builds no ordered
+ * path of the fact for it, its order useless to the query.
+ */
+List *
+lion_ordered_orders_for(PlannerInfo *root, RelOptInfo *rel, List *want)
+{
+	List	   *btrees = NIL;
+	List	   *savedquery = root->query_pathkeys;
+	List	   *savedsort = root->sort_pathkeys;
+	List	   *result = NIL;
+	RelOptInfo *scratch;
+	ListCell   *lc;
+
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx->relam == BTREE_AM_OID && !idx->hypothetical)
+			btrees = lappend(btrees, idx);
+	}
+	if (btrees == NIL || want == NIL)
+		return NIL;
+	scratch = lo_scratch_rel(rel, btrees, NIL, false);
+	root->query_pathkeys = want;
+	root->sort_pathkeys = want;
+	create_index_paths(root, scratch);
+	root->query_pathkeys = savedquery;
+	root->sort_pathkeys = savedsort;
+
+	foreach(lc, scratch->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		IndexPath  *ipath;
+
+		if (!IsA(p, IndexPath) || p->param_info != NULL ||
+			p->pathkeys == NIL)
+			continue;
+		ipath = (IndexPath *) p;
+		if (ipath->indexorderbys != NIL ||
+			ipath->indexinfo->relam != BTREE_AM_OID ||
+			!lo_indexpath_ok(ipath))
+			continue;
+		result = lappend(result, ipath);
+	}
+	return result;
+}
+
 /* rel's lion accesses for all its restriction clauses (§30.2, step 2) */
 List *
 lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel)
@@ -4377,6 +4470,50 @@ lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel)
 	if (lionidx == NIL)
 		return NIL;
 	return lo_lion_accesses(root, rel, lionidx, NIL, lionam);
+}
+
+/*
+ * The lion index of rel, and its key column, whose directory's order gives
+ * the pathkey want (lo_column_gives(), DESIGN.md §30.11), for a
+ * LionOrderedSplit's walk of the column (lion_ordjoin.c, §48): *indexcol the
+ * column, 0-based, *var the table's.  NULL when none does.  A partial index
+ * holds every row the query reads only when the query implies its predicate
+ * (predOK), as for the walk of §30.11.
+ */
+IndexOptInfo *
+lion_ordered_column_order(PlannerInfo *root, RelOptInfo *rel, PathKey *want,
+						  int *indexcol, Var **var)
+{
+	RangeTblEntry *rte = planner_rt_fetch(rel->relid, root);
+	Oid			lionam = lion_get_am_oid();
+	ListCell   *lc;
+
+	if (!OidIsValid(lionam))
+		return NULL;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	indexrel = NULL;
+		int			c;
+		int			found = -1;
+
+		if (idx->relam != lionam || idx->hypothetical ||
+			(idx->indpred != NIL && !idx->predOK))
+			continue;
+		for (c = 0; c < idx->nkeycolumns && found < 0; c++)
+		{
+			if (lo_column_gives(root, rel, rte, idx, &indexrel, c, want, var))
+				found = c;
+		}
+		if (indexrel != NULL)
+			index_close(indexrel, AccessShareLock);
+		if (found >= 0)
+		{
+			*indexcol = found;
+			return idx;
+		}
+	}
+	return NULL;
 }
 
 /*
@@ -5139,6 +5276,7 @@ lo_set_alloc(LionOrderedState *st, MemoryContext cxt, Size size)
 		ereport(ERROR,
 				(errcode_for_file_access(),
 				 errmsg("could not spill LionOrdered's set to a temporary file: %m")));
+	st->arenabytes += size;
 	return p;
 }
 
@@ -5147,7 +5285,11 @@ static void
 lo_set_free(LionOrderedState *st, void *p, Size size)
 {
 	if (st->arena != NULL && lion_arena_contains(st->arena, p))
+	{
+		Assert(st->arenabytes >= size);
+		st->arenabytes -= size;
 		lion_arena_free(st->arena, p, size);
+	}
 	else
 	{
 		Assert(st->bytes >= size);
@@ -5701,9 +5843,11 @@ lo_set_reset(LionOrderedState *st)
 	if (st->arena != NULL)
 		lion_arena_reset(st->arena);
 	st->set = NULL;
+	st->narrow = NULL;			/* a LionOrderedSplit arm's, gone with it */
 	st->setview = false;
 	st->live = NIL;
 	st->bytes = 0;
+	st->arenabytes = 0;
 	st->spilled = false;
 	st->limit = get_hash_memory_limit();
 }
@@ -7579,7 +7723,7 @@ lo_next(ScanState *ss)
 	 * participant of a parallel walk for all of them, when the Gather has
 	 * set one up (§40.9).
 	 */
-	if (st->set == NULL && !st->noset && !st->lazy &&
+	if (st->set == NULL && !st->noset && !st->lazy && !st->narrowing &&
 		!(st->lazyok && lo_lazy_begin(st)))
 	{
 		if (st->shared != NULL)
@@ -7590,9 +7734,14 @@ lo_next(ScanState *ss)
 	if (!st->started)
 		lo_start_walk(st);
 
-	/* an empty set selects nothing, and needs no walk */
+	/*
+	 * An empty set selects nothing, and needs no walk.  A LionOrderedSplit's
+	 * arm tests its narrowed set alone, which lion_ordered_narrow_begin()
+	 * made after the set (§48).
+	 */
 	if (st->done ||
-		(!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0)))
+		(st->narrowing ? (st->narrow == NULL || st->narrow->n == 0) :
+		 (!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0))))
 		return ExecClearTuple(slot);
 	if (st->sorting)
 		return lo_sort_next(st, slot);
@@ -7648,7 +7797,18 @@ lo_next(ScanState *ss)
 			break;
 		st->walked++;
 		st->scanwalked++;
-		if (st->lazy)
+		if (st->narrowing)
+		{
+			/*
+			 * A LionOrderedSplit's arm (§48): the set narrowed to the rows
+			 * of the arm's entry, which holds no TID the set does not.
+			 */
+			if (lo_set_find(st->narrow, tid) < 0)
+				continue;
+			st->distinct++;
+			st->hits++;
+		}
+		else if (st->lazy)
 		{
 			LoMemoEnt  *e = lo_lazy_find(st, tid);
 
@@ -8466,6 +8626,184 @@ lion_ordered_probe_key(PlanState *ps, Datum key)
 	st->okeys[0].sk_argument = key;
 	st->okeys[0].sk_flags &= ~SK_ISNULL;
 	ExecReScan(ps);
+}
+
+/* ---------------------------------------------------------------------
+ * A LionOrderedSplit's arm (lion_ordjoin.c, DESIGN.md §48): a join's
+ * dimension narrowed to the rows of one entry of the split's column
+ * --------------------------------------------------------------------- */
+
+static LionOrderedState *
+lo_narrow_state(PlanState *ps)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &lo_exec_methods || !st->keyed)
+		elog(ERROR, "LionOrdered: not a join's dimension");
+	return st;
+}
+
+/*
+ * The entry's TIDs of the container key narrowbuf holds, ANDed with the
+ * set's container of the key - without a set, all of them - into the
+ * narrowed set, when that leaves any: copied into memory of the set's
+ * (lo_set_push()), charged against hash_mem with it and in the arena past it.
+ */
+static void
+lo_narrow_flush(LionOrderedState *st)
+{
+	const LionContainer *keep = st->narrowbuf;
+
+	if (!st->narrowopen)
+		return;
+	st->narrowopen = false;
+	lion_container_optimize(st->narrowbuf);
+	if (!st->noset)
+	{
+		int			idx = lo_set_key_index(st->set, st->narrowbuf->ckey);
+
+		if (idx < 0 || lion_container_and(st->narrowbuf, st->set->conts[idx],
+										   st->narrowand) == 0)
+			return;
+		keep = st->narrowand;
+	}
+	lo_set_push(st, st->narrow, keep->ckey, keep);
+	st->narrowmembers += keep->cardinality;
+}
+
+/*
+ * Begin an arm: the last arm's narrowed set given back; the dimension's set,
+ * built once and kept for every arm, unless a Param of its lion quals has
+ * changed since the last; and the narrowed set started empty, for
+ * lion_ordered_narrow_add() to fill.  The dimension returns no row until
+ * lion_ordered_narrow_end().
+ *
+ * The narrowed set's memory is the set's (lo_set_alloc()): charged against
+ * hash_mem with the set's, and in the arena past it, as a set that outgrows
+ * hash_mem is (DESIGN.md §30.4, "Spilling").  Without a set of the dimension
+ * it is the entry whole, on a large dimension no small copy.  Hence the
+ * order here: the last arm's set given back first, its blocks in the arena
+ * to the free lists, and the spill left as the set left it - one arm past
+ * hash_mem says nothing of the next; then the set, whose build, after a
+ * changed Param, lets go of everything before it starts (lo_set_reset());
+ * then the arm's set, on top of the set's charge.
+ *
+ * The set is built at once, never lazily: each arm ANDs its entry with the
+ * set at every container key the entry has, which is most of them for a
+ * column of a few values, so a lazy set would evaluate nearly every key
+ * anyway - with its memo outside hash_mem while the arm runs, and its
+ * conversion, in the middle of an arm, resetting the set's memory and the
+ * arm's set with it.  oj_cost() prices the set's build whole.
+ *
+ * The split rescans its child before this (os_next_arm()), and the child's
+ * rescan hands a changed Param to this dimension: it is consumed here, by a
+ * rescan that drops the set when its lion quals use the Param (lo_rescan()),
+ * so that the set is made for the new value once, here, and the arm's
+ * descents find nothing left to rescan for.
+ */
+void
+lion_ordered_narrow_begin(PlanState *ps)
+{
+	LionOrderedState *st = lo_narrow_state(ps);
+	MemoryContext oldcxt;
+
+	if (st->narrow != NULL)
+	{
+		lo_set_drop(st, st->narrow);
+		st->narrow = NULL;
+		st->spilled = st->setspilled;
+	}
+	if (ps->chgParam != NULL)
+		ExecReScan(ps);
+	Assert(!st->lazy);
+	if (st->narrowbuf == NULL)
+	{
+		MemoryContext qcxt = st->css.ss.ps.state->es_query_cxt;
+
+		st->narrowbuf = (LionContainer *)
+			MemoryContextAlloc(qcxt, LION_CONTAINER_MAX_SIZE);
+		st->narrowand = (LionContainer *)
+			MemoryContextAlloc(qcxt, LION_CONTAINER_MAX_SIZE);
+		/* a dimension without a set has no build to set the limit */
+		st->limit = get_hash_memory_limit();
+	}
+	if (st->set == NULL && !st->noset)
+		lo_build_set(st);
+	st->setspilled = st->spilled;
+	st->narrowbase = st->arenabytes;
+
+	/* the live sets' list, which lo_set_new() adds to, in the set's memory */
+	oldcxt = MemoryContextSwitchTo(st->setcxt);
+	st->narrow = lo_set_new(st);
+	MemoryContextSwitchTo(oldcxt);
+	st->narrowopen = false;
+	st->narrowlast = 0;
+	st->narrowmembers = 0;
+	st->narrowing = true;
+}
+
+/*
+ * One TID of the arm's entry, in the order the column's walk hands them out:
+ * heap order (DESIGN.md §30.11), each container key's TIDs together, which
+ * are ANDed with the set's as the next key begins.  A key below the one
+ * before it is an entry out of order, which nothing but damage makes.
+ */
+void
+lion_ordered_narrow_add(PlanState *ps, ItemPointer tid)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+	uint64		code = lion_tid_to_code(tid);
+	uint32		ckey = lion_code_ckey(code);
+
+	Assert(st->narrowing);
+	if (st->narrowopen && ckey != st->narrowlast)
+		lo_narrow_flush(st);
+	if (!st->narrowopen)
+	{
+		if (ckey < st->narrowlast)
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("LionOrderedSplit: an entry's TIDs out of heap order")));
+		lion_container_init(st->narrowbuf, ckey);
+		st->narrowopen = true;
+		st->narrowlast = ckey;
+	}
+	lion_container_append_sorted(st->narrowbuf, lion_code_lo(code));
+}
+
+/*
+ * End the arm's entry: the members of the narrowed set, which the dimension
+ * is narrowed to until the next arm begins.  0: the entry has no row of the
+ * set, and the arm need not run.
+ */
+uint64
+lion_ordered_narrow_end(PlanState *ps)
+{
+	LionOrderedState *st = lo_narrow_state(ps);
+
+	lo_narrow_flush(st);
+	if (st->narrowmembers > 0 && st->arenabytes > st->narrowbase)
+	{
+		st->narrowspills++;
+		st->narrowspillbytes = Max(st->narrowspillbytes,
+								   st->arenabytes - st->narrowbase);
+	}
+	return st->narrowmembers;
+}
+
+/*
+ * EXPLAIN ANALYZE's: the arms run whose narrowed set was in the arena, at
+ * least in part - past hash_mem with the set's, or all of it after a set
+ * that had spilled - and the most bytes of one there.
+ */
+void
+lion_ordered_narrow_spill(PlanState *ps, uint64 *arms, Size *bytes)
+{
+	LionOrderedState *st = lo_narrow_state(ps);
+
+	*arms = st->narrowspills;
+	*bytes = st->narrowspillbytes;
 }
 
 /* ---------------------------------------------------------------------

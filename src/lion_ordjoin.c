@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "common/hashfn.h"
+#include "nodes/multibitmapset.h"
 #include "utils/datum.h"
 
 #include "lion_customscan.h"
@@ -83,6 +84,60 @@ static void oj_explain(CustomScanState *node, List *ancestors,
 const CustomPathMethods lion_ordjoin_path_methods = {
 	.CustomName = "LionOrderedJoin",
 	.PlanCustomPath = oj_plan_path,
+};
+
+/*
+ * LionOrderedSplit (DESIGN.md §48): the join of an ORDER BY that leads with a
+ * column of the dimension, run an arm at a time - one LionOrderedJoin, its
+ * dimension narrowed to the rows of one entry of the column's lion index,
+ * for each entry in the ORDER BY's order.
+ *
+ * custom_private of its path and plan is POSITIONAL:
+ *
+ *	OS_PRIV_INTS	IntList (OS_PRIV_MAGIC, the column as its lion index
+ *					numbers it, 1-based, whether the walk is backward, where
+ *					its NULL entry goes (LION_ORDER_NULLS_*), and
+ *					pg_lion.ordered_split_max as it was planned)
+ *	OS_PRIV_INDEX	OidList: the column's lion index
+ *
+ * custom_plans is the arms' LionOrderedJoin; custom_scan_tlist is its target
+ * list, the rows it returns.
+ */
+int			lion_ordered_split_max = 8;
+
+#define OS_PRIV_MAGIC		0x4c4f5350	/* "LOSP" */
+#define OS_PRIV_INTS		0
+#define OS_PRIV_INDEX		1
+#define OS_PRIV_NMEMBERS	2
+
+static Plan *os_plan_path(PlannerInfo *root, RelOptInfo *rel,
+						  CustomPath *best_path, List *tlist,
+						  List *clauses, List *custom_plans);
+static Node *os_create_state(CustomScan *cscan);
+static void os_begin(CustomScanState *node, EState *estate, int eflags);
+static TupleTableSlot *os_exec(CustomScanState *node);
+static void os_end(CustomScanState *node);
+static void os_rescan(CustomScanState *node);
+static void os_explain(CustomScanState *node, List *ancestors,
+					   ExplainState *es);
+
+const CustomPathMethods lion_ordsplit_path_methods = {
+	.CustomName = "LionOrderedSplit",
+	.PlanCustomPath = os_plan_path,
+};
+
+static const CustomScanMethods os_scan_methods = {
+	.CustomName = "LionOrderedSplit",
+	.CreateCustomScanState = os_create_state,
+};
+
+static const CustomExecMethods os_exec_methods = {
+	.CustomName = "LionOrderedSplit",
+	.BeginCustomScan = os_begin,
+	.ExecCustomScan = os_exec,
+	.EndCustomScan = os_end,
+	.ReScanCustomScan = os_rescan,
+	.ExplainCustomScan = os_explain,
 };
 
 static const CustomScanMethods oj_scan_methods = {
@@ -679,7 +734,10 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * *rows is what it returns: of the descents that find a dimension row, the
  * share of the dimension's rows that pass its quals (lion_probe_rel_rows()).
  * *share is the share of the walk the query's LIMIT is expected to take,
- * *probes the descents of the whole walk.
+ * *probes the descents of the whole walk.  armshare is 1 for the join, and
+ * for an arm of a LionOrderedSplit (§48) the share of the dimension's rows
+ * its entry holds: the dimension's set narrowed to them holds that share of
+ * its members and its rows, and every descent's TID is tested against it.
  *
  * Then, against comp, core's nested loop over the same walk, both over the
  * LIMIT's share s of the walk.  First its Memoize: the loop's price core
@@ -714,8 +772,8 @@ static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		IndexPath *ord, Cost factstartup, Cost facttotal, double factrows,
 		double factfetches, double factlionpages, const OjCompetitor *comp,
-		double *rows, double *probes, double *share, Cost *startup_p,
-		Cost *total_p)
+		double armshare, double *rows, double *probes, double *share,
+		Cost *startup_p, Cost *total_p)
 {
 	RelOptInfo *dim = j->dim;
 	IndexOptInfo *pkidx = j->pkidx;
@@ -779,7 +837,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	run += descents * descent +
 		index_pages_fetched(descents, (BlockNumber) idxpages, idxpages, root) *
 		spc_random;
-	if (ds->lion != NULL)
+	if (ds->lion != NULL || armshare < 1.0)
 		run += descents * hit * cpu_operator_cost;
 
 	/*
@@ -788,7 +846,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * filter.
 	 */
 	startup += ds->build;
-	members = clamp_row_est(descents * hit * ds->candsel);
+	members = clamp_row_est(descents * hit * ds->candsel * armshare);
 	get_tablespace_page_costs(dim->reltablespace, &spc_random, &spc_seq);
 	cost_qual_eval(&resid, ds->residual, root);
 	startup += resid.startup;
@@ -797,7 +855,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		members * (cpu_tuple_cost + ds->recheck + resid.per_tuple);
 
 	/* the rows it returns, and the join's target */
-	out = clamp_row_est(descents * hit *
+	out = clamp_row_est(descents * hit * armshare *
 						Min(1.0, lion_probe_rel_rows(root, dim) / dimtuples));
 	startup += joinrel->reltarget->cost.startup;
 	run += out * (cpu_tuple_cost + joinrel->reltarget->cost.per_tuple);
@@ -876,55 +934,36 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 }
 
 /*
- * One LionOrderedJoin path (DESIGN.md §47.2): the fact's walk of ord with its
- * set factlion, the dimension's probe with its set dimlion, the key sets,
- * priced and offered to the join rel at pg_lion.pushdown_margin (§39), as
- * LionOrdered's paths are offered to their relation.
+ * A LionOrderedJoin path of the join j (DESIGN.md §47.2), at the price given:
+ * the fact's walk of ord with its set factlion, index-only by iocols; the
+ * dimension's probe with its set dimlion; the key sets.  factweight is the
+ * share of the walk the query's LIMIT is expected to take, dimweight the
+ * descents it is expected to make (lion_ordered_side_path()); factrows,
+ * factstartup and facttotal the walk's own, dimbuild the dimension's set's.
  */
-static void
-oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
-			IndexPath *ord, List *pathkeys, const OjCompetitor *comp,
-			Path *factlion, Path *dimlion)
+static CustomPath *
+oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
+			 IndexPath *ord, List *pathkeys, Path *factlion, Path *dimlion,
+			 List *iocols, double factweight, double dimweight,
+			 double factrows, Cost factstartup, Cost facttotal,
+			 Cost dimbuild, double rows, Cost startup, Cost total)
 {
 	CustomPath *cp;
 	CustomPath *factpath;
 	CustomPath *dimpath;
 	IndexPath  *pkpath;
-	LionOrderedSet ds;
-	List	   *iocols;
 	List	   *keyinfo = NIL;
 	List	   *paths;
-	double		factrows = lion_probe_rel_rows(root, j->fact);
-	double		rows;
-	double		probes;
-	double		share;
-	double		margin = lion_units_margin();
-	Cost		factstartup;
-	Cost		facttotal;
-	double		factfetches;
-	double		factlionpages;
-	Cost		startup;
-	Cost		total;
 	ListCell   *lc;
 
-	/* the fact's walk, index-only where its btree has every column it needs */
-	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
-							&iocols, &factstartup, &facttotal, &factfetches,
-							&factlionpages);
-	lion_ordered_set_info(root, j->dim, dimlion, &ds);
-	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
-			factfetches, factlionpages, comp, &rows, &probes, &share,
-			&startup, &total);
-
 	factpath = lion_ordered_side_path(j->fact, ord, factlion, iocols, false,
-									  share, NULL, factrows, factstartup,
+									  factweight, NULL, factrows, factstartup,
 									  facttotal);
 	pkpath = create_index_path(root, j->pkidx, NIL, NIL, NIL, NIL,
 							   ForwardScanDirection, false, NULL, 1.0, false);
-	/* the dimension's weight: the descents the LIMIT's share of the walk makes */
 	dimpath = lion_ordered_side_path(j->dim, pkpath, dimlion, NIL, true,
-									 clamp_row_est(probes * share),
-									 j->keyqual, rows, ds.build, ds.build);
+									 dimweight, j->keyqual, rows, dimbuild,
+									 dimbuild);
 	paths = list_make2(factpath, dimpath);
 	foreach(lc, j->keysets)
 	{
@@ -945,11 +984,8 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	cp->path.parallel_safe = false;
 	cp->path.parallel_workers = 0;
 	cp->path.rows = rows;
-	cp->path.startup_cost = startup / margin;
-	cp->path.total_cost = total / margin;
-	elog(DEBUG2, "lion: a LionOrderedJoin path over %s, %.2f..%.2f for %.0f rows",
-		 get_rel_name(ord->indexinfo->indexoid), cp->path.startup_cost,
-		 cp->path.total_cost, rows);
+	cp->path.startup_cost = startup;
+	cp->path.total_cost = total;
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = paths;
@@ -957,10 +993,558 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 									list_make1_oid(j->pkidx->indexoid),
 									keyinfo);
 	cp->methods = &lion_ordjoin_path_methods;
+	return cp;
+}
+
+/*
+ * One LionOrderedJoin path (DESIGN.md §47.2): the fact's walk of ord with its
+ * set factlion, the dimension's probe with its set dimlion, the key sets,
+ * priced and offered to the join rel at pg_lion.pushdown_margin (§39), as
+ * LionOrdered's paths are offered to their relation.
+ */
+static void
+oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
+			IndexPath *ord, List *pathkeys, const OjCompetitor *comp,
+			Path *factlion, Path *dimlion)
+{
+	CustomPath *cp;
+	LionOrderedSet ds;
+	List	   *iocols;
+	double		factrows = lion_probe_rel_rows(root, j->fact);
+	double		rows;
+	double		probes;
+	double		share;
+	double		margin = lion_units_margin();
+	Cost		factstartup;
+	Cost		facttotal;
+	double		factfetches;
+	double		factlionpages;
+	Cost		startup;
+	Cost		total;
+
+	/* the fact's walk, index-only where its btree has every column it needs */
+	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
+							&iocols, &factstartup, &facttotal, &factfetches,
+							&factlionpages);
+	lion_ordered_set_info(root, j->dim, dimlion, &ds);
+	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
+			factfetches, factlionpages, comp, 1.0, &rows, &probes, &share,
+			&startup, &total);
+
+	/* the dimension's weight: the descents the LIMIT's share of the walk makes */
+	cp = oj_join_path(root, joinrel, j, ord, pathkeys, factlion, dimlion,
+					  iocols, share, clamp_row_est(probes * share), factrows,
+					  factstartup, facttotal, ds.build, rows,
+					  startup / margin, total / margin);
+	elog(DEBUG2, "lion: a LionOrderedJoin path over %s, %.2f..%.2f for %.0f rows",
+		 get_rel_name(ord->indexinfo->indexoid), cp->path.startup_cost,
+		 cp->path.total_cost, rows);
 
 	/* a walk of an index and descents of another, as index scans are */
 	lion_path_core_switches(&cp->path, LION_CORE_INDEXSCAN);
 	add_path(joinrel, &cp->path);
+}
+
+/* ---------------------------------------------------------------------
+ * LionOrderedSplit (DESIGN.md §48): the join an arm at a time, one an entry
+ * of a column of the dimension that leads the ORDER BY
+ * --------------------------------------------------------------------- */
+
+/*
+ * The arms a split is expected to run, in the walk's order (os_arms()): each
+ * an entry of the column, its share of the dimension's rows, and its share of
+ * the rows the walk's entries hold together - the share of the rows that
+ * pass the dimension's quals its narrowed set is taken to hold.
+ */
+typedef struct OsArms
+{
+	int			n;
+	double	   *freq;			/* [n] */
+	double	   *share;			/* [n] */
+} OsArms;
+
+/* The split of a join: the column that leads the ORDER BY, and its walk */
+typedef struct OsSplit
+{
+	PathKey    *pathkey;		/* the ORDER BY's first: the column's */
+	IndexOptInfo *index;		/* the column's lion index */
+	int			indexcol;		/* ... the column in it, 0-based */
+	Var		   *col;
+	bool		backward;
+	int			nulls;			/* LION_ORDER_NULLS_* */
+	OsArms		arms;
+} OsSplit;
+
+/* A most common value of the column and its share, sorted by the column */
+typedef struct OsValue
+{
+	Datum		value;
+	double		freq;
+} OsValue;
+
+typedef struct OsValueSort
+{
+	FmgrInfo   *cmp;
+	Oid			collation;
+} OsValueSort;
+
+static int
+os_value_cmp(const void *a, const void *b, void *arg)
+{
+	OsValueSort *s = (OsValueSort *) arg;
+
+	return DatumGetInt32(FunctionCall2Coll(s->cmp, s->collation,
+										   ((const OsValue *) a)->value,
+										   ((const OsValue *) b)->value));
+}
+
+/*
+ * Where the walk of the split's column takes its NULL entry: where the
+ * pathkey puts NULLs, or nowhere when a restriction clause of the dimension
+ * is strict in the column, which no NULL passes.
+ */
+static int
+os_nulls(RelOptInfo *dim, Var *col, PathKey *pathkey)
+{
+	ListCell   *lc;
+
+	foreach(lc, dim->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		if (mbms_is_member(col->varno,
+						   col->varattno - FirstLowInvalidHeapAttributeNumber,
+						   find_nonnullable_vars((Node *) rinfo->clause)))
+			return LION_ORDER_NULLS_NONE;
+	}
+	return pathkey->pk_nulls_first ? LION_ORDER_NULLS_FIRST :
+		LION_ORDER_NULLS_LAST;
+}
+
+/*
+ * The arms a split of the column col is expected to run (DESIGN.md §48.3),
+ * in the walk's order: an entry each of the column's distinct values -
+ * lion's count of its entries where it has one (§33), ANALYZE's otherwise -
+ * and its NULL entry where the walk takes it and the column has NULLs.  A
+ * most common value's share of the rows is its frequency, the list sorted by
+ * the column's order and walked in the walk's direction; the values past the
+ * list share what is left evenly, and are taken after it.  The list is
+ * sorted only where core would call the comparison on the column's
+ * statistics, as below.  False - no split - when the arms are more than
+ * pg_lion.ordered_split_max, or the count is a default.
+ */
+static bool
+os_arms(PlannerInfo *root, Var *col, bool backward, int nulls, OsArms *arms)
+{
+	VariableStatData vardata;
+	AttStatsSlot sslot;
+	TypeCacheEntry *typentry = NULL;
+	bool		hasmcv = false;
+	bool		isdefault;
+	double		nd;
+	double		nullfrac = 0.0;
+	double		mcvsum = 0.0;
+	double		walked = 0.0;
+	double		rest;
+	OsValue    *mcv = NULL;
+	int			nvals;
+	int			nmcv = 0;
+	bool		nullarm;
+	bool		ok = false;
+	int			i;
+	int			k = 0;
+
+	memset(arms, 0, sizeof(OsArms));
+	examine_variable(root, (Node *) col, 0, &vardata);
+	nd = get_variable_numdistinct(&vardata, &isdefault);
+	if (isdefault || nd > (double) lion_ordered_split_max)
+		goto done;
+	if (HeapTupleIsValid(vardata.statsTuple))
+	{
+		Form_pg_statistic stats = (Form_pg_statistic)
+			GETSTRUCT(vardata.statsTuple);
+
+		nullfrac = stats->stanullfrac;
+		hasmcv = get_attstatsslot(&sslot, vardata.statsTuple,
+								  STATISTIC_KIND_MCV, InvalidOid,
+								  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
+	}
+	if (hasmcv)
+	{
+		typentry = lookup_type_cache(col->vartype, TYPECACHE_CMP_PROC_FINFO);
+		if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+			goto done;
+
+		/*
+		 * Sorting the most common values calls the type's comparison on them,
+		 * which core does on a column's statistics only where
+		 * statistic_proc_security_check() allows it: the user may read the
+		 * column, or the function is leakproof - one that is not could
+		 * report a value it is handed, in an error or otherwise.  Elsewhere
+		 * the list is dropped, not the split: every value then shares the
+		 * rows evenly, from the distinct count and the null fraction, which
+		 * call no function.  The split is priced less well, not refused, as
+		 * core's own estimates fall back on what they may read.
+		 */
+		if (!statistic_proc_security_check(&vardata,
+										   typentry->cmp_proc_finfo.fn_oid))
+		{
+			free_attstatsslot(&sslot);
+			hasmcv = false;
+		}
+	}
+	if (hasmcv)
+	{
+		OsValueSort sort;
+
+		nmcv = Min(sslot.nvalues, sslot.nnumbers);
+		mcv = (OsValue *) palloc(sizeof(OsValue) * Max(nmcv, 1));
+		for (i = 0; i < nmcv; i++)
+		{
+			mcv[i].value = sslot.values[i];
+			mcv[i].freq = sslot.numbers[i];
+			mcvsum += sslot.numbers[i];
+		}
+		sort.cmp = &typentry->cmp_proc_finfo;
+		sort.collation = col->varcollid;
+		qsort_arg(mcv, nmcv, sizeof(OsValue), os_value_cmp, &sort);
+	}
+	nvals = Max((int) ceil(nd), nmcv);
+	nullarm = (nulls != LION_ORDER_NULLS_NONE && nullfrac > 0.0);
+	arms->n = nvals + (nullarm ? 1 : 0);
+	if (arms->n > lion_ordered_split_max)
+		goto done;
+
+	arms->freq = (double *) palloc(sizeof(double) * arms->n);
+	arms->share = (double *) palloc(sizeof(double) * arms->n);
+	rest = (nvals > nmcv) ?
+		Max(0.0, 1.0 - nullfrac - mcvsum) / (double) (nvals - nmcv) : 0.0;
+	if (nullarm && nulls == LION_ORDER_NULLS_FIRST)
+		arms->freq[k++] = nullfrac;
+	for (i = 0; i < nmcv; i++)
+		arms->freq[k++] = mcv[backward ? nmcv - 1 - i : i].freq;
+	for (i = nmcv; i < nvals; i++)
+		arms->freq[k++] = rest;
+	if (nullarm && nulls == LION_ORDER_NULLS_LAST)
+		arms->freq[k++] = nullfrac;
+	Assert(k == arms->n);
+	for (i = 0; i < arms->n; i++)
+		walked += arms->freq[i];
+	for (i = 0; i < arms->n; i++)
+		arms->share[i] = (walked > 0.0) ? arms->freq[i] / walked :
+			1.0 / (double) arms->n;
+	ok = true;
+
+done:
+	if (hasmcv)
+		free_attstatsslot(&sslot);
+	ReleaseVariableStats(vardata);
+	return ok;
+}
+
+/*
+ * One entry of the column's walk (DESIGN.md §30.11, "Cost"): the entry, each
+ * of its TIDs handed out and gathered into the arm's set, and the pages its
+ * TIDs take, two bytes a row; and the arm's set of `members`, held with the
+ * dimension's set of `setbytes` within hash_mem and past it spilled
+ * (lion_ordered_spill_price()), over a dimension of `pages` pages.
+ */
+static Cost
+os_entry_cost(double tids, double members, double setbytes, double pages)
+{
+	double		armbytes = lion_ordered_set_bytes(members, pages);
+
+	return LION_RANGE_UNION_ENTRY_COST + tids * 2.0 * cpu_operator_cost +
+		ceil(tids * 2.0 / BLCKSZ) * seq_page_cost +
+		lion_ordered_spill_price(setbytes + armbytes) -
+		lion_ordered_spill_price(setbytes);
+}
+
+/*
+ * The price of a split of the join j (DESIGN.md §48.3).  Each arm is priced
+ * as §47.3 prices the join (oj_cost(), its competitor and cold reads with
+ * it), the dimension's set narrowed to the arm's share of the rows; the arms
+ * run in the walk's order, each a walk of the fact from its start, until the
+ * LIMIT's rows are met.  The first arm's start-up is paid once - the sets'
+ * builds, the key sets', the column walk's descent - and each later arm's
+ * walk restarts with a descent of the fact's btree; each arm reads its entry
+ * first, and holds its narrowed set with the dimension's within hash_mem,
+ * the bytes past it spilled.  So, with out_i the rows of arm i and run_i its
+ * price past its start-up, the price of the LIMIT's n rows is
+ *
+ *	C(n) = S + sum of run_i over the arms before the m-th, the first whose
+ *		   rows reach n, + run_m x (n - rows before it) / out_m
+ *
+ * plus the entries and restarts, and without a LIMIT every arm's.  The path
+ * is shaped for core's Limit, which takes startup + (total - startup) x n /
+ * rows of a path: its start-up S, the first arm's; its rows R the sum of the
+ * arms'; and its total S + (C(n) - S) x R / n, at which the Limit's price is
+ * C(n).  Without a LIMIT, or one the arms never meet, the total is every
+ * arm's.  *factweight is the shares of the fact's walk the arms take, summed,
+ * which weigh the fact's lazy set (§47.4), and *dimweight the descents those
+ * shares make, which weigh nothing at run time: under a split the
+ * dimension's set is built at once (lion_ordered_narrow_begin()), as
+ * oj_cost() prices it; *armstartup and *armtotal an arm's, for its
+ * LionOrderedJoin's plan.
+ */
+static void
+os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
+		LionOrderedSet *ds, IndexPath *ord, Cost factstartup,
+		Cost facttotal, double factrows, double factfetches,
+		double factlionpages, const OjCompetitor *comp, double *rows_p,
+		double *factweight, double *dimweight, Cost *startup_p,
+		Cost *total_p, Cost *armstartup, Cost *armtotal)
+{
+	double		dimtuples = Max(j->dim->tuples, 1.0);
+	double		dimpages = (double) j->dim->pages;
+	double		setbytes = 0.0;
+	double		need = root->limit_tuples;
+	double		rows = 0.0;
+	double		spc_random;
+	double		spc_seq;
+	Cost		restart;
+	Cost		once = 0.0;
+	Cost		full = 0.0;
+	Cost		atlimit = -1.0;
+	Cost		startup = 0.0;
+	int			i;
+
+	get_tablespace_page_costs(ord->indexinfo->reltablespace, &spc_random,
+							  &spc_seq);
+	restart = (Max(ord->indexinfo->tree_height, 0) + 1) * 50.0 *
+		cpu_operator_cost + spc_random;
+	if (ds->lion != NULL)
+		setbytes = lion_ordered_set_bytes(dimtuples * ds->candsel, dimpages);
+	*factweight = 0.0;
+	*dimweight = 0.0;
+	for (i = 0; i < sp->arms.n; i++)
+	{
+		double		out;
+		double		probes;
+		double		share;
+		double		frac = 1.0;
+		Cost		st;
+		Cost		tot;
+		Cost		run;
+		Cost		entry;
+
+		oj_cost(root, joinrel, j, ds, ord, factstartup, facttotal, factrows,
+				factfetches, factlionpages, comp, sp->arms.share[i], &out,
+				&probes, &share, &st, &tot);
+		run = tot - st;
+		entry = os_entry_cost(dimtuples * sp->arms.freq[i],
+							  ds->lion != NULL ?
+							  dimtuples * ds->candsel * sp->arms.share[i] :
+							  dimtuples * sp->arms.freq[i],
+							  setbytes, dimpages);
+		if (i == 0)
+		{
+			/* the column's walk descends to its first entry (§30.11) */
+			once = st + 2.0 * random_page_cost;
+			full = once;
+			startup = once + entry;
+		}
+		else
+			full += restart;
+		full += entry + run;
+		rows += out;
+		if (atlimit >= 0.0)
+			continue;			/* past the arm the LIMIT is met in */
+		if (need > 0.0 && out >= need)
+		{
+			frac = need / out;
+			atlimit = full - run * (1.0 - frac);
+		}
+		else if (need > 0.0)
+			need -= out;
+		*factweight += frac;
+		*dimweight += probes * frac;
+	}
+
+	*rows_p = clamp_row_est(rows);
+	*startup_p = startup;
+	if (root->limit_tuples > 0.0 && atlimit >= 0.0)
+		*total_p = startup + (atlimit - startup) * *rows_p /
+			root->limit_tuples;
+	else
+		*total_p = full;
+	*armstartup = startup;
+	*armtotal = startup + (full - startup) / (double) sp->arms.n;
+}
+
+/*
+ * One LionOrderedSplit path (DESIGN.md §48.2): the split sp of the join j,
+ * its arms a LionOrderedJoin of the fact's walk of ord in the order joinkeys
+ * - its set factlion - and the dimension's probe with its set dimlion,
+ * narrowed per arm; priced (os_cost()) and offered to the join rel at
+ * pg_lion.pushdown_margin, as the join's paths are.
+ */
+static void
+os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
+			IndexPath *ord, List *joinkeys, List *pathkeys,
+			const OjCompetitor *comp, Path *factlion, Path *dimlion)
+{
+	CustomPath *cp;
+	CustomPath *child;
+	LionOrderedSet ds;
+	List	   *iocols;
+	double		factrows = lion_probe_rel_rows(root, j->fact);
+	double		margin = lion_units_margin();
+	double		rows;
+	double		factweight;
+	double		dimweight;
+	double		factfetches;
+	double		factlionpages;
+	Cost		factstartup;
+	Cost		facttotal;
+	Cost		startup;
+	Cost		total;
+	Cost		armstartup;
+	Cost		armtotal;
+
+	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
+							&iocols, &factstartup, &facttotal, &factfetches,
+							&factlionpages);
+	lion_ordered_set_info(root, j->dim, dimlion, &ds);
+	os_cost(root, joinrel, j, sp, &ds, ord, factstartup, facttotal, factrows,
+			factfetches, factlionpages, comp, &rows, &factweight, &dimweight,
+			&startup, &total, &armstartup, &armtotal);
+
+	child = oj_join_path(root, joinrel, j, ord, joinkeys, factlion, dimlion,
+						 iocols, factweight, clamp_row_est(dimweight),
+						 factrows, factstartup, facttotal, ds.build,
+						 clamp_row_est(rows / sp->arms.n),
+						 armstartup / margin, armtotal / margin);
+
+	cp = makeNode(CustomPath);
+	cp->path.pathtype = T_CustomScan;
+	cp->path.parent = joinrel;
+	cp->path.pathtarget = joinrel->reltarget;
+	cp->path.param_info = NULL;
+	cp->path.parallel_aware = false;
+	cp->path.parallel_safe = false;
+	cp->path.parallel_workers = 0;
+	cp->path.rows = rows;
+	cp->path.startup_cost = startup / margin;
+	cp->path.total_cost = total / margin;
+	cp->path.pathkeys = pathkeys;
+	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cp->custom_paths = list_make1(child);
+	cp->custom_private =
+		list_make2(list_make5_int(OS_PRIV_MAGIC, sp->indexcol + 1,
+								  (int) sp->backward, sp->nulls,
+								  lion_ordered_split_max),
+				   list_make1_oid(sp->index->indexoid));
+	cp->methods = &lion_ordsplit_path_methods;
+	elog(DEBUG2, "lion: a LionOrderedSplit path over %s by %s, %d arms, %.2f..%.2f for %.0f rows",
+		 get_rel_name(ord->indexinfo->indexoid),
+		 get_rel_name(sp->index->indexoid), sp->arms.n,
+		 cp->path.startup_cost, cp->path.total_cost, rows);
+
+	/* a walk of two indexes and descents of a third, as index scans are */
+	lion_path_core_switches(&cp->path, LION_CORE_INDEXSCAN);
+	add_path(joinrel, &cp->path);
+}
+
+/*
+ * Is the ORDER BY of the join j one a split answers (DESIGN.md §48.1): its
+ * first sort key a column of the dimension whose lion index walks it in that
+ * order (lion_ordered_column_order(), §30.11's rule - a plain column, in its
+ * type's btree order under its own collation), at most
+ * pg_lion.ordered_split_max arms expected of it (os_arms()), and more sort
+ * keys after it?  *sp is the split.
+ */
+static bool
+os_split_of(PlannerInfo *root, OjJoin *j, OsSplit *sp)
+{
+	memset(sp, 0, sizeof(OsSplit));
+	if (lion_ordered_split_max <= 0 || list_length(root->query_pathkeys) < 2)
+		return false;
+	sp->pathkey = (PathKey *) linitial(root->query_pathkeys);
+	if (!bms_is_subset(j->dim->relids, sp->pathkey->pk_eclass->ec_relids))
+		return false;			/* no column of the dimension's */
+	sp->index = lion_ordered_column_order(root, j->dim, sp->pathkey,
+										  &sp->indexcol, &sp->col);
+	if (sp->index == NULL)
+		return false;
+#if PG_VERSION_NUM >= 180000
+	sp->backward = (sp->pathkey->pk_cmptype == COMPARE_GT);
+#else
+	sp->backward = (sp->pathkey->pk_strategy == BTGreaterStrategyNumber);
+#endif
+	sp->nulls = os_nulls(j->dim, sp->col, sp->pathkey);
+	return os_arms(root, sp->col, sp->backward, sp->nulls, &sp->arms);
+}
+
+/*
+ * The paths of the split sp of the join j (DESIGN.md §48.1): for each order
+ * of the fact's btrees the rest of the ORDER BY begins with
+ * (lion_ordered_orders_for(): core builds none for an order the query's does
+ * not lead with), each of the fact's lion accesses and each of the
+ * dimension's, one path.  What the ORDER BY has past the fact's order is
+ * core's to sort, an Incremental Sort above the split.  The competitors are
+ * found before the first path is added (oj_competitor()).
+ */
+static void
+os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
+			 List *factcands, List *dimcands)
+{
+	List	   *rest = list_copy_tail(root->query_pathkeys, 1);
+	List	   *ords = lion_ordered_orders_for(root, j->fact, rest);
+	List	   *keys = NIL;
+	List	   *joinkeys = NIL;
+	OjCompetitor *comps;
+	ListCell   *lc;
+	ListCell   *lck;
+	ListCell   *lcj;
+
+	if (ords == NIL)
+		return;
+	comps = (OjCompetitor *) palloc0(sizeof(OjCompetitor) *
+									 list_length(ords));
+	foreach(lc, ords)
+	{
+		IndexPath  *ord = (IndexPath *) lfirst(lc);
+		List	   *jk = NIL;
+		List	   *pk = NIL;
+		int			ncommon = 0;
+		ListCell   *lc2;
+
+		(void) pathkeys_count_contained_in(rest, ord->path.pathkeys,
+										   &ncommon);
+		foreach(lc2, ord->path.pathkeys)
+		{
+			if (((PathKey *) lfirst(lc2))->pk_eclass == sp->pathkey->pk_eclass)
+				ncommon = 0;	/* the column's class: no order of the fact */
+		}
+		if (ncommon > 0)
+		{
+			jk = list_copy_head(ord->path.pathkeys, ncommon);
+			pk = lcons(sp->pathkey, list_copy(jk));
+			oj_competitor(root, joinrel, j->fact, pk,
+						  &comps[foreach_current_index(lc)]);
+		}
+		joinkeys = lappend(joinkeys, jk);
+		keys = lappend(keys, pk);
+	}
+
+	forthree(lc, ords, lck, keys, lcj, joinkeys)
+	{
+		IndexPath  *ord = (IndexPath *) lfirst(lc);
+		List	   *pathkeys = (List *) lfirst(lck);
+		ListCell   *lc2;
+		ListCell   *lc3;
+
+		if (pathkeys == NIL)
+			continue;
+		foreach(lc2, factcands)
+		{
+			foreach(lc3, dimcands)
+				os_add_path(root, joinrel, j, sp, ord, (List *) lfirst(lcj),
+							pathkeys, &comps[foreach_current_index(lc)],
+							(Path *) lfirst(lc2), (Path *) lfirst(lc3));
+		}
+	}
 }
 
 /*
@@ -969,7 +1553,10 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
  * and each of the dimension's - every pair is priced and add_path() keeps
  * what it keeps.  A side without a lion access is walked or probed with no
  * set, every row it meets filtered; one side has a set, or a key set
- * filters.
+ * filters.  An ORDER BY that leads with a column of the dimension is the
+ * split's (os_add_paths(), §48), whose arms narrow the dimension by the
+ * column's entries, a set of their own; where a column of the fact is in the
+ * same class, both are offered and add_path() keeps what it keeps.
  */
 static void
 oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
@@ -979,6 +1566,9 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	List	   *dimcands;
 	List	   *keys = NIL;
 	OjCompetitor *comps;
+	OsSplit		sp;
+	bool		split;
+	bool		anyset;
 	ListCell   *lc;
 	ListCell   *lck;
 
@@ -986,16 +1576,21 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		!oj_target_ok(joinrel, bms_union(j->fact->relids, j->dim->relids)))
 		return;
 	ords = lion_ordered_orders(j->fact);
-	if (ords == NIL)
+	split = os_split_of(root, j, &sp);
+	if (ords == NIL && !split)
 		return;
 	factcands = lion_ordered_accesses(root, j->fact);
 	dimcands = lion_ordered_accesses(root, j->dim);
-	if (factcands == NIL && dimcands == NIL && j->keysets == NIL)
-		return;
+	anyset = (factcands != NIL || dimcands != NIL || j->keysets != NIL);
 	if (factcands == NIL)
 		factcands = list_make1(NULL);
 	if (dimcands == NIL)
 		dimcands = list_make1(NULL);
+
+	if (split)
+		os_add_paths(root, joinrel, j, &sp, factcands, dimcands);
+	if (ords == NIL || !anyset)
+		return;
 
 	/*
 	 * Each order the query wants, as far as it wants it, and the core plan
@@ -1689,6 +2284,310 @@ oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 }
 
 /* ---------------------------------------------------------------------
+ * LionOrderedSplit's plan and executor (DESIGN.md §48.2, §48.4)
+ * --------------------------------------------------------------------- */
+
+/*
+ * PlanCustomPath: the scan slot is the row the arm's LionOrderedJoin returns,
+ * its target list's, and the split's target list is evaluated over it.
+ */
+static Plan *
+os_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
+			 List *tlist, List *clauses, List *custom_plans)
+{
+	CustomScan *cscan = makeNode(CustomScan);
+	Plan	   *child;
+	List	   *sctlist = NIL;
+	AttrNumber	resno = 1;
+	ListCell   *lc;
+
+	if (list_length(custom_plans) != 1 || clauses != NIL ||
+		list_length(best_path->custom_private) != OS_PRIV_NMEMBERS)
+		elog(ERROR, "LionOrderedSplit: unexpected plan shape");
+	child = (Plan *) linitial(custom_plans);
+	foreach(lc, child->targetlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		sctlist = lappend(sctlist,
+						  makeTargetEntry((Expr *) copyObject(tle->expr),
+										  resno++, NULL, false));
+	}
+
+	cscan->scan.plan.targetlist = tlist;
+	cscan->scan.plan.qual = NIL;
+	cscan->scan.scanrelid = 0;
+	cscan->flags = best_path->flags;
+	cscan->custom_plans = custom_plans;
+	cscan->custom_scan_tlist = sctlist;
+	cscan->custom_exprs = NIL;
+	cscan->custom_private = copyObject(best_path->custom_private);
+	cscan->methods = &os_scan_methods;
+	return &cscan->scan.plan;
+}
+
+typedef struct OsState
+{
+	CustomScanState css;
+	PlanState  *child;			/* the arms' LionOrderedJoin */
+	PlanState  *probe;			/* ... its dimension, narrowed per arm */
+	Oid			colindex;		/* the column's lion index */
+	AttrNumber	colattno;		/* ... the column, as the index numbers it */
+	bool		backward;
+	int			nulls;			/* LION_ORDER_NULLS_* */
+	int			cap;			/* pg_lion.ordered_split_max, planned at */
+	Relation	colrel;
+	MemoryContext walkcxt;		/* the column's walk; reset per scan */
+	LionOrderWalk *walk;		/* NULL: not begun in this scan */
+	ItemPointerData next;		/* the TID the walk handed out past the arm */
+	bool		hasnext;
+	bool		inarm;			/* the child is running an arm */
+	bool		childran;		/* ... has run since it was last rescanned */
+	uint64		arms;			/* EXPLAIN ANALYZE: arms run */
+	uint64		skipped;		/* ... entries with no row of the set */
+} OsState;
+
+static Node *
+os_create_state(CustomScan *cscan)
+{
+	OsState    *st = (OsState *) newNode(sizeof(OsState), T_CustomScanState);
+
+	st->css.methods = &os_exec_methods;
+	st->css.slotOps = &TTSOpsVirtual;
+	return (Node *) st;
+}
+
+static void
+os_begin(CustomScanState *node, EState *estate, int eflags)
+{
+	OsState    *st = (OsState *) node;
+	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
+	List	   *ints;
+	List	   *index;
+
+	if (list_length(cscan->custom_private) != OS_PRIV_NMEMBERS ||
+		list_length(cscan->custom_plans) != 1)
+		elog(ERROR, "LionOrderedSplit: unrecognized plan shape");
+	ints = (List *) list_nth(cscan->custom_private, OS_PRIV_INTS);
+	index = (List *) list_nth(cscan->custom_private, OS_PRIV_INDEX);
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5 ||
+		linitial_int(ints) != OS_PRIV_MAGIC ||
+		index == NIL || !IsA(index, OidList) || list_length(index) != 1)
+		elog(ERROR, "LionOrderedSplit: unrecognized custom_private shape");
+	st->colattno = (AttrNumber) lsecond_int(ints);
+	st->backward = lthird_int(ints) != 0;
+	st->nulls = lfourth_int(ints);
+	st->cap = list_nth_int(ints, 4);
+	st->colindex = linitial_oid(index);
+	if (st->colattno < 1 ||
+		(st->nulls != LION_ORDER_NULLS_NONE &&
+		 st->nulls != LION_ORDER_NULLS_FIRST &&
+		 st->nulls != LION_ORDER_NULLS_LAST))
+		elog(ERROR, "LionOrderedSplit: malformed plan");
+
+	/*
+	 * The arms' join, run by the split alone and rescanned for each arm: it
+	 * scans neither backward nor marks.  EXPLAIN shows it beneath the split.
+	 */
+	eflags &= ~(EXEC_FLAG_BACKWARD | EXEC_FLAG_MARK);
+	st->child = ExecInitNode((Plan *) linitial(cscan->custom_plans), estate,
+							 eflags);
+	node->custom_ps = list_make1(st->child);
+	if (!IsA(st->child, CustomScanState) ||
+		((CustomScanState *) st->child)->methods != &oj_exec_methods)
+		elog(ERROR, "LionOrderedSplit: its arms are not a LionOrderedJoin");
+	st->probe = ((OjState *) st->child)->dim;
+
+	st->colrel = index_open(st->colindex, AccessShareLock);
+	st->walkcxt = AllocSetContextCreate(estate->es_query_cxt,
+										"LionOrderedSplit walk",
+										ALLOCSET_DEFAULT_SIZES);
+}
+
+/*
+ * The next arm, its child rescanned and its dimension narrowed: the column's
+ * next entry - in the walk's order, its NULL entry where the ORDER BY puts
+ * NULLs (DESIGN.md §30.11) - that has a row of the dimension's set.  An entry
+ * with none is passed over without running its arm.  false past the last.
+ *
+ * The child is rescanned BEFORE the entry is narrowed, when it has run or a
+ * Param of the split's has changed: its rescan hands the Param to the probe
+ * (oj_rescan()), and lion_ordered_narrow_begin() then rescans the probe,
+ * which makes the dimension's set again for the new value, once, before the
+ * entry is ANDed with it; the child's descents find the probe's Param
+ * consumed and the set current.  Rescanned after the narrowing, the child
+ * would hand the Param on again, and the probe's first descent would drop
+ * and build the set a second time.  An entry passed over costs a rescan of
+ * the child at most once, and that rescan reads nothing.
+ */
+static bool
+os_next_arm(OsState *st)
+{
+	if (st->walk == NULL)
+	{
+		st->walk = lion_order_walk_begin(st->colrel, st->colattno, NULL, 0,
+										 st->backward, st->nulls,
+										 st->walkcxt);
+		pgstat_count_index_scan(st->colrel);
+		st->hasnext = lion_order_walk_next(st->walk, &st->next);
+	}
+	while (st->hasnext)
+	{
+		int64		entry = lion_order_walk_entryno(st->walk);
+
+		CHECK_FOR_INTERRUPTS();
+		if (st->childran || st->child->chgParam != NULL)
+		{
+			ExecReScan(st->child);
+			st->childran = false;
+		}
+		lion_ordered_narrow_begin(st->probe);
+		do
+		{
+			lion_ordered_narrow_add(st->probe, &st->next);
+			st->hasnext = lion_order_walk_next(st->walk, &st->next);
+		} while (st->hasnext && lion_order_walk_entryno(st->walk) == entry);
+		if (lion_ordered_narrow_end(st->probe) == 0)
+		{
+			st->skipped++;
+			continue;
+		}
+		st->childran = true;
+		st->arms++;
+		return true;
+	}
+	return false;
+}
+
+/*
+ * The next row: the arm's next, in the fact's walk's order, and past an
+ * arm's last the next arm's first.  The scan slot's values are the child's,
+ * which it does not touch until it is asked for its next row.
+ */
+static TupleTableSlot *
+os_exec(CustomScanState *node)
+{
+	OsState    *st = (OsState *) node;
+	TupleTableSlot *scanslot = node->ss.ss_ScanTupleSlot;
+	ExprContext *econtext = node->ss.ps.ps_ExprContext;
+	int			natts = scanslot->tts_tupleDescriptor->natts;
+
+	for (;;)
+	{
+		TupleTableSlot *slot;
+
+		if (!st->inarm)
+		{
+			if (!os_next_arm(st))
+				return NULL;
+			st->inarm = true;
+		}
+		ResetExprContext(econtext);
+		ExecClearTuple(scanslot);
+		slot = ExecProcNode(st->child);
+		if (TupIsNull(slot))
+		{
+			st->inarm = false;
+			continue;
+		}
+		slot_getsomeattrs(slot, natts);
+		memcpy(scanslot->tts_values, slot->tts_values, sizeof(Datum) * natts);
+		memcpy(scanslot->tts_isnull, slot->tts_isnull, sizeof(bool) * natts);
+		ExecStoreVirtualTuple(scanslot);
+		if (node->ss.ps.ps_ProjInfo == NULL)
+			return scanslot;
+		econtext->ecxt_scantuple = scanslot;
+		return ExecProject(node->ss.ps.ps_ProjInfo);
+	}
+}
+
+/*
+ * The walk of the column starts again; the child is rescanned at the next
+ * arm, before its narrowing (os_next_arm()), a changed Param handed to it
+ * first, which its rescan hands to its sides: they keep their sets unless
+ * their lion quals use the Param (§47.4).
+ */
+static void
+os_rescan(CustomScanState *node)
+{
+	OsState    *st = (OsState *) node;
+
+	ExecClearTuple(node->ss.ss_ScanTupleSlot);
+	if (st->walk != NULL)
+		lion_order_walk_end(st->walk);
+	st->walk = NULL;
+	MemoryContextReset(st->walkcxt);
+	st->hasnext = false;
+	st->inarm = false;
+	if (node->ss.ps.chgParam != NULL)
+		UpdateChangedParamSet(st->child, node->ss.ps.chgParam);
+}
+
+static void
+os_end(CustomScanState *node)
+{
+	OsState    *st = (OsState *) node;
+
+	if (st->child != NULL)
+		ExecEndNode(st->child);
+	st->child = NULL;
+	if (st->walk != NULL)
+		lion_order_walk_end(st->walk);
+	st->walk = NULL;
+	if (st->colrel != NULL)
+		index_close(st->colrel, AccessShareLock);
+	st->colrel = NULL;
+}
+
+/*
+ * EXPLAIN (DESIGN.md §48.5): the column walked, by its index, as LionOrdered
+ * prints a lion column's walk - its direction and where its NULL entry goes
+ * - and the most arms the planner would split into; under ANALYZE the arms
+ * run, the entries passed over, and - where any did - the arms whose
+ * narrowed set spilled, with the most of one in the arena.  The arms'
+ * LionOrderedJoin is printed beneath, once, its counters summed over the
+ * arms and its loops theirs.
+ */
+static void
+os_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	OsState    *st = (OsState *) node;
+	char	   *idxname = get_rel_name(st->colindex);
+	char	   *colname = get_attname(st->colindex, st->colattno, true);
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	appendStringInfo(&buf, "%s (%s%s%s)",
+					 quote_identifier(idxname != NULL ? idxname : "???"),
+					 quote_identifier(colname != NULL ? colname : "???"),
+					 st->backward ? ", backward" : "",
+					 st->nulls == LION_ORDER_NULLS_FIRST ? ", nulls first" :
+					 st->nulls == LION_ORDER_NULLS_LAST ? ", nulls last" : "");
+	ExplainPropertyText("Split By", buf.data, es);
+	ExplainPropertyInteger("Arms Max", NULL, (int64) st->cap, es);
+	if (es->analyze)
+	{
+		uint64		spills = 0;
+		Size		spillbytes = 0;
+
+		ExplainPropertyInteger("Arms Run", NULL, (int64) st->arms, es);
+		ExplainPropertyInteger("Entries Skipped", NULL, (int64) st->skipped,
+							   es);
+		if (st->probe != NULL)
+			lion_ordered_narrow_spill(st->probe, &spills, &spillbytes);
+		if (spills > 0)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%llu, %zu kB",
+							 (unsigned long long) spills,
+							 (spillbytes + 1023) / 1024);
+			ExplainPropertyText("Arm Sets Spilled", buf.data, es);
+		}
+	}
+	pfree(buf.data);
+}
+
+/* ---------------------------------------------------------------------
  * Initialisation, from _PG_init (lion_am.c)
  * --------------------------------------------------------------------- */
 
@@ -1704,7 +2603,19 @@ lion_ordjoin_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomIntVariable("pg_lion.ordered_split_max",
+							"The most arms a LionOrderedSplit is planned for: the distinct values of the dimension's column that leads the ORDER BY, and its NULLs.",
+							"0 offers no split.  At run time every entry of the column is an arm, however many.",
+							&lion_ordered_split_max,
+							8,
+							0,
+							1024,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
 	RegisterCustomScanMethods(&oj_scan_methods);
+	RegisterCustomScanMethods(&os_scan_methods);
 
 	oj_prev_set_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = oj_set_join_pathlist;

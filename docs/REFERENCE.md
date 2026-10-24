@@ -876,9 +876,45 @@ working around a bad choice:
               ->  Seq Scan on flt
                     Filter: (x < 3)
 
+  Where the `ORDER BY` leads with a column of the dimension instead - `ORDER BY d.flag DESC,
+  f.score DESC LIMIT 20` - and goes on with the order of a B-tree of the fact, `LionOrderedSplit`
+  (DESIGN.md §48) runs the join an arm at a time: it walks the column's entries in its Lion index
+  in the `ORDER BY`'s direction, its NULLs first or last as the `ORDER BY` puts them, and for each
+  value runs one `LionOrderedJoin` with the dimension narrowed to that value's rows, the fact's
+  B-tree walked from its start each time, until the `LIMIT` has its rows. The column must be a plain
+  column of the dimension, a key column of a Lion index that is not multi-key, sorted in its type's
+  default B-tree order under its own collation (not `USING` another operator, not `COLLATE` another
+  collation); the planner offers the split only where it expects at most
+  `pg_lion.ordered_split_max` values (below), and prices the values in order, from the column's
+  statistics, so that the `LIMIT` is met in the right one. At run time it runs every value it meets
+  in the index, whatever the statistics say, and passes over a value none of whose rows pass the
+  dimension's Lion filter. While a value runs, the set of its rows that pass that filter - all of
+  them without one - is held with the filter's own set within `work_mem` × `hash_mem_multiplier`,
+  and past it in a temporary file. What follows the fact's order in the `ORDER BY` is sorted by an
+  Incremental Sort above it. EXPLAIN prints `Split By: <index> (<column>[, backward][, nulls
+  first|last])` and `Arms Max`, and the `LionOrderedJoin` beneath it once; `EXPLAIN ANALYZE` adds
+  `Arms Run` and `Entries Skipped`, and `Arm Sets Spilled: <values>, <N> kB` where a value's set
+  spilled - the values whose sets did, and the most of one in the file:
+
+      Limit
+        ->  Incremental Sort
+              Sort Key: d.flag DESC, f.score DESC NULLS LAST, f.id
+              Presorted Key: d.flag, f.score
+              ->  Custom Scan (LionOrderedSplit)
+                    Split By: dim_flag (flag, backward, nulls first)
+                    Arms Max: 8
+                    ->  Custom Scan (LionOrderedJoin)
+                          Ordered By: fact_grp_score
+                          Index Cond: (f.grp = 2)
+                          Lion Cond: (f.tags @> '{a1}'::text[])
+                          Lion Indexes: fact_tags
+                          Dimension: dim d via dim_pkey
+                          Dimension Lion Cond: (d.lvl < 30)
+                          Dimension Lion Indexes: dim_lvl
+
   Off, such a join is left to PostgreSQL's join methods, with `LionOrdered` or a `LionBtreeScan`
-  probe on either side where they apply. `enable_hashjoin`, `enable_mergejoin` and
-  `enable_nestloop` do not disable it.
+  probe on either side where they apply; the split goes with it. `enable_hashjoin`,
+  `enable_mergejoin` and `enable_nestloop` do not disable either.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -970,12 +1006,12 @@ before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` 
 
 | PostgreSQL setting | the Lion paths it disables |
 |---|---|
-| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionProbeJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionOrderedJoin`, `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
+| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionProbeJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionOrderedJoin`, `LionOrderedSplit`, `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
 | `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin`, `LionAntiJoin` and `LionProbeJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered`, `LionBtreeScan` and `LionOrderedJoin`'s walk (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
 | `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
 
-`LionOrdered`, `LionOrderedJoin`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan
-does, and so answer to `enable_indexscan` alone. To have the planner prefer Lion's paths without
+`LionOrdered`, `LionOrderedJoin`, `LionOrderedSplit`, `LionBtreeScan` and `LionBm25` read the rows,
+as an index scan does, and so answer to `enable_indexscan` alone. To have the planner prefer Lion's paths without
 disabling PostgreSQL's, set `pg_lion.pushdown_margin` above 1 (below).
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
@@ -1257,6 +1293,12 @@ ANALYZE`), so whether and where a walk switches does not depend on `work_mem`. I
 the switch is also held back while the walk meets members at the rate a uniform spread predicts,
 since there it would read heap pages the walk never touches (DESIGN.md §40.4). A large value keeps
 a walk from switching at all.
+
+`pg_lion.ordered_split_max` (8, 0 to 1024): the most values of a dimension's column - its NULLs one
+more where it has them - that the planner offers a `LionOrderedSplit` for (DESIGN.md §48), from the
+column's number of distinct values; a column whose count is a default is not split. 0 offers none.
+It bounds the plan only: at run time the split runs every value it meets in the index, however
+many, and `EXPLAIN` prints the value it was planned under as `Arms Max`.
 
 ## Monitoring
 
