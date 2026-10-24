@@ -5128,7 +5128,8 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 
 	/* the predicates, the cells they make, and the column that drives */
 	cp = lion_cells_analyze(root, rel, cx.rti,
-							list_concat_copy(cx.cellexprs, cx.cellquals));
+							list_concat_copy(cx.cellexprs, cx.cellquals),
+							false);
 	if (cp == NULL)
 		return;
 	fallback = lion_count_all_driver(&cx);

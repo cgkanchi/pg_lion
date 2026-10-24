@@ -932,8 +932,9 @@ SELECT * FROM pj_val($$SELECT d.kind = 1 AS k1, count(*) FROM pj_orders o JOIN p
 (2 rows)
 
 DROP TABLE pj_codes;
--- a predicate no posting set decides
-SELECT pj($$SELECT c.tier >= 4 AS high, count(*) FROM pj_orders o JOIN pj_customers c ON o.customer_id = c.id
+-- a predicate no posting set decides: a range whose bound is no constant
+SELECT pj($$SELECT c.tier >= CASE WHEN now() IS NULL THEN 9 ELSE 4 END AS high, count(*)
+			  FROM pj_orders o JOIN pj_customers c ON o.customer_id = c.id
 			 GROUP BY 1$$);
           pj           
 -----------------------
@@ -981,6 +982,227 @@ SELECT pj($$SELECT c.active, count(*) FROM pj_orders o JOIN pj_customers c ON o.
 (1 row)
 
 RESET pg_lion.enable_probe_join;
+-- ---------- 9. ranges ----------
+-- A range of a scalar lion column is a cell predicate too (DESIGN.md §46,
+-- "Ranges"): its column's outcomes are runs of its order - the gaps between
+-- the predicates' constants, and the constants themselves - grouped by the
+-- truths they give every predicate, NULL apart; each outcome but the
+-- largest is a set of its runs, a range or an equality each.  A NULL row's
+-- range is NULL, NaN is above every number, and an empty gap (between 2
+-- and 3 of an int) is an empty set.
+CREATE TABLE pj_ranged (
+	id int PRIMARY KEY,
+	score numeric,			-- lion: 0 to 0.999, NaN and NULL
+	since date,				-- lion: 1990 to 2022, NULL
+	size int NOT NULL,		-- lion: 1 to 7
+	code text COLLATE "C",	-- lion: 'k0' .. 'k49', NULL
+	grade pj_mood,			-- lion: an enum, NULL
+	tags int[],				-- lion
+	seg int NOT NULL		-- lion: the WHERE's
+) WITH (autovacuum_enabled = off);
+INSERT INTO pj_ranged
+SELECT i,
+	   CASE WHEN i % 41 = 0 THEN NULL WHEN i % 97 = 0 THEN 'NaN'
+			ELSE round((abs(hashint4(i)) % 1000) / 1000.0, 3) END,
+	   CASE WHEN i % 37 = 0 THEN NULL
+			ELSE date '1990-01-01' + abs(hashint4(i + 1)) % 12000 END,
+	   1 + abs(hashint4(i + 2)) % 7,
+	   CASE WHEN i % 53 = 0 THEN NULL ELSE 'k' || abs(hashint4(i + 3)) % 50 END,
+	   CASE WHEN i % 29 = 0 THEN NULL
+			ELSE (enum_range(NULL::pj_mood))[1 + i % 4] END,
+	   ARRAY[i % 6, 6 + i % 5],
+	   i % 5
+  FROM generate_series(1, 6000) i;
+CREATE INDEX pj_ranged_score ON pj_ranged USING lion (score);
+CREATE INDEX pj_ranged_since ON pj_ranged USING lion (since);
+CREATE INDEX pj_ranged_size ON pj_ranged USING lion (size);
+CREATE INDEX pj_ranged_code ON pj_ranged USING lion (code);
+CREATE INDEX pj_ranged_grade ON pj_ranged USING lion (grade);
+CREATE INDEX pj_ranged_tags ON pj_ranged USING lion (tags);
+CREATE INDEX pj_ranged_seg ON pj_ranged USING lion (seg);
+VACUUM (FREEZE, ANALYZE) pj_ranged;
+-- one bound, NULL apart, beside a fact column
+SELECT pj($$SELECT CASE WHEN d.score > 0.6 THEN 'hi' WHEN d.score IS NULL THEN 'none'
+						ELSE 'lo' END AS k, o.channel, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2$$);
+         pj         
+--------------------
+ probe join, 9 rows
+(1 row)
+
+SELECT * FROM pj_val($$SELECT d.score > 0.6 AS hi, count(*)
+						 FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+						GROUP BY 1$$);
+  pj_val   
+-----------
+ (,643)
+ (f,16579)
+ (t,11552)
+(3 rows)
+
+-- bounds of every strategy, BETWEEN, a constant on the left
+SELECT pj($$SELECT CASE WHEN d.score >= 0.8 THEN 3 WHEN d.score >= 0.5 THEN 2
+						WHEN 0.2 < d.score THEN 1 ELSE 0 END AS b,
+				   d.score BETWEEN 0.25 AND 0.6 AS mid, d.score <= 0.5 AS le, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2, 3$$);
+         pj         
+--------------------
+ probe join, 8 rows
+(1 row)
+
+-- ranges beside equalities, IN, <>, NOT IN and IS DISTINCT FROM of the same
+-- column, a constant both a bound and a value, empty gaps of an int
+SELECT pj($$SELECT d.size >= 3 AS a, d.size = 3 AS b, d.size IN (2, 5) AS c,
+				   d.size <> 4 AS e, d.size NOT IN (1, 7) AS g,
+				   d.size IS DISTINCT FROM 6 AS h, d.size > 2 AS i, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2, 3, 4, 5, 6, 7$$);
+         pj         
+--------------------
+ probe join, 7 rows
+(1 row)
+
+-- a date, a text of "C" collation, an enum's order, each with NULLs
+SELECT pj($$SELECT d.since >= DATE '2015-01-01' AS recent,
+				   d.since < '2000-01-01' AS old, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2$$);
+         pj         
+--------------------
+ probe join, 4 rows
+(1 row)
+
+SELECT pj($$SELECT d.code < 'k3' AS lo, d.code >= 'k45' AS hi, d.code = 'k2' AS k2, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2, 3$$);
+         pj         
+--------------------
+ probe join, 5 rows
+(1 row)
+
+SELECT pj($$SELECT d.grade > 'busy' AS late, d.grade <= 'calm' AS first, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 GROUP BY 1, 2$$);
+         pj         
+--------------------
+ probe join, 4 rows
+(1 row)
+
+-- a score of ranges, an overlap and an IN list, rounded, under a gate, in a
+-- tier, with a range in the WHERE and the anti join
+SELECT pj($$SELECT CASE WHEN (CASE WHEN d.code IS NOT NULL AND d.grade IN ('calm', 'busy')
+								   THEN CAST(round(CAST(((0
+										+ 5.0 * CASE WHEN d.score > 0.6 THEN 1 ELSE 0 END
+										+ 3.0 * CASE WHEN d.tags && ARRAY[1, 2] THEN 1 ELSE 0 END
+										+ 2.0 * CASE WHEN d.since >= DATE '2010-01-01' THEN 1 ELSE 0 END
+										+ 1.0 * CASE WHEN d.size IN (2, 3) THEN 1 ELSE 0 END) * 100) / 11.0
+										AS NUMERIC), 4) AS FLOAT) ELSE NULL END) >= 50 THEN 'high'
+						WHEN (CASE WHEN d.code IS NOT NULL AND d.grade IN ('calm', 'busy')
+								   THEN CAST(round(CAST(((0
+										+ 5.0 * CASE WHEN d.score > 0.6 THEN 1 ELSE 0 END
+										+ 3.0 * CASE WHEN d.tags && ARRAY[1, 2] THEN 1 ELSE 0 END
+										+ 2.0 * CASE WHEN d.since >= DATE '2010-01-01' THEN 1 ELSE 0 END
+										+ 1.0 * CASE WHEN d.size IN (2, 3) THEN 1 ELSE 0 END) * 100) / 11.0
+										AS NUMERIC), 4) AS FLOAT) ELSE NULL END) IS NOT NULL THEN 'low'
+						ELSE 'none' END AS lbl,
+				   o.channel, count(*)
+			  FROM pj_ranged d JOIN pj_orders o ON o.customer_id = d.id AND o.amount < 70
+			 WHERE d.seg IN (1, 2, 3) AND d.size >= 2
+			   AND NOT EXISTS (SELECT 1 FROM pj_blocked b
+								WHERE b.customer_id = d.id AND b.reason = 'audit')
+			 GROUP BY 1, 2$$);
+         pj         
+--------------------
+ probe join, 9 rows
+(1 row)
+
+SELECT * FROM pj_explain($$SELECT CASE WHEN d.score > 0.6 THEN 'hi' WHEN d.score IS NULL THEN 'none'
+									   ELSE 'lo' END AS k,
+								  d.size BETWEEN 2 AND 4 AS mid, o.channel, count(*)
+							 FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+							WHERE d.seg <> 0
+							GROUP BY 1, 2, 3$$, true);
+                                           pj_explain                                           
+------------------------------------------------------------------------------------------------
+ HashAggregate
+   ->  Custom Scan (LionProbeJoin) on pj_ranged d
+         Probe Index: pj_ranged_pkey
+         Probe Cond: (d.id = o.customer_id)
+         Lion Cond: (d.seg <> 0)
+         Lion Indexes: pj_ranged_seg
+         Cell Predicates: (d.score > 0.6), (d.score IS NULL), ((d.size >= 2) AND (d.size <= 4))
+         Cell Indexes: pj_ranged_score, pj_ranged_size
+         Probes: 29900
+         Null Keys: 600
+         Rows Removed by Lion Cond: 5725
+         Heap TIDs Skipped via VM: 23049
+         Heap TIDs Rechecked: 0
+         Rows Removed by Visibility: 0
+         Lion Sets: 4, 9897 members in 8 containers
+         ->  Seq Scan on pj_orders o
+(16 rows)
+
+-- the parallel form
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SELECT pj($$SELECT CASE WHEN d.score >= 0.8 THEN 3 WHEN d.score >= 0.5 THEN 2
+						WHEN d.score > 0.2 THEN 1 ELSE 0 END AS b,
+				   d.since >= DATE '2015-01-01' AS recent, count(*)
+			  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+			 WHERE NOT EXISTS (SELECT 1 FROM pj_blocked b WHERE b.customer_id = o.customer_id)
+			 GROUP BY 1, 2$$);
+              pj               
+-------------------------------
+ probe join, parallel, 12 rows
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+SET max_parallel_workers_per_gather = 0;
+-- the range of section 8's customers, which a count by cells still declines
+SELECT pj($$SELECT c.tier >= 4 AS high, count(*) FROM pj_orders o JOIN pj_customers c ON o.customer_id = c.id
+			 GROUP BY 1$$);
+         pj         
+--------------------
+ probe join, 2 rows
+(1 row)
+
+-- not offered: a Param's bound, which no outcome can be planned for
+SET plan_cache_mode = force_generic_plan;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_nestloop = off;
+PREPARE pj_r(numeric) AS
+	SELECT d.score > $1 AS hi, count(*)
+	  FROM pj_orders o JOIN pj_ranged d ON o.customer_id = d.id
+	 GROUP BY 1 ORDER BY 1;
+SELECT count(*) FILTER (WHERE p LIKE '%LionProbeJoin%') AS probe_joins
+  FROM pj_explain('EXECUTE pj_r(0.6)') p;
+ probe_joins 
+-------------
+           0
+(1 row)
+
+EXECUTE pj_r(0.6);
+ hi | count 
+----+-------
+ f  | 16579
+ t  | 11552
+    |   643
+(3 rows)
+
+DEALLOCATE pj_r;
+RESET plan_cache_mode;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET enable_nestloop;
+DROP TABLE pj_ranged;
 DROP TABLE pj_orders, pj_customers, pj_blocked;
 DROP TYPE pj_mood;
 DROP FUNCTION pj(text), pj_val(text), pj_explain(text, boolean, boolean);
