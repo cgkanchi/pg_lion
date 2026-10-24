@@ -637,18 +637,49 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 }
 
 /*
+ * The share of the fact's non-NULL keys that name a dimension row (DESIGN.md
+ * §47.3, "The rows").  The dimension's key is unique, but nothing makes the
+ * fact's a foreign key: of the fact key's nd distinct values at most
+ * dim.tuples are the dimension's, so
+ *
+ *	found = min(1, dim.tuples / nd)
+ *
+ * as core's eqjoinsel_inner() takes the join with no MCV list to match:
+ * keys x dimrows / max(nd, dim.tuples) rows.  1 where nd is a default.
+ */
+static double
+oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
+{
+	VariableStatData vardata;
+	double		nd;
+	bool		isdefault;
+
+	examine_variable(root, (Node *) j->fkvar, 0, &vardata);
+	nd = get_variable_numdistinct(&vardata, &isdefault);
+	ReleaseVariableStats(vardata);
+	if (isdefault || nd <= dimtuples)
+		return 1.0;
+	return dimtuples / nd;
+}
+
+/*
  * The price of one LionOrderedJoin (DESIGN.md §47.3): the fact's walk as
  * LionOrdered prices it with its set (lion_ordered_walk_price()); a test of
  * each fact row's key, and of each key against the key sets, built before the
  * walk from their tables' plans; for each key left a descent of the
  * dimension's unique btree and a test of the TID against its set; and for
  * each member found a heap fetch, its recheck and its filter; then the join's
- * own target.  Each non-NULL key is taken to name a dimension row - the join
- * is on a foreign key - and a key set to let through the share of them its
- * keys are of the dimension's rows.  *rows is what it returns: the keys' share
- * of the dimension's rows pass its quals (lion_probe_rel_rows()).  *share is
- * the share of the walk the query's LIMIT is expected to take, *probes the
- * descents of the whole walk.
+ * own target.  A non-NULL key costs its descent whether or not it names a
+ * dimension row; found of them do (oj_found_share()).  A key set's keys are
+ * taken to be dimension keys: it lets through ks.rows / dim.tuples of the
+ * keys that name a row, found x ks.rows / dim.tuples of them all - ks.rows /
+ * max(nd, dim.tuples), core's eqjoinsel_semi() once nd passes dim.tuples -
+ * and each key it lets through names one, so that the orphan share is taken
+ * once, at the first key set or, with none, at the members and the rows.
+ * *rows is what it returns: of the descents that find a dimension row, the
+ * share of the dimension's rows that pass its quals (lion_probe_rel_rows()).
+ * *share is the share of the walk the query's LIMIT is expected to take,
+ * *probes the descents of the whole walk.
  *
  * Then, against comp, core's nested loop over the same walk, both over the
  * LIMIT's share s of the walk.  First its Memoize: the loop's price core
@@ -660,15 +691,16 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
  *
  * unbounded, as lion_units_price() puts a path into the loop's units.  Then
  * §39's cold reads, as LionProbeJoin weighs them (lion_units_cold()): the
- * loop reads a leaf and a heap page of the dimension for each key it keeps,
- * and over the fact's index scan a fact heap page for each entry it walks (in
- * an index-only scan, those of pages not all-visible), over a LionOrdered walk
- * that walk's own reads (lion_ordered_walk_reads(), none where its price
- * carries a cold discount of its own already); the node reads the fact's
- * heap for its fetches (factfetches over the whole walk, lo_cost()'s), a leaf
- * for each descent, the dimension's heap for each member, the lion index
- * pages its sets' builds read, and the key sets' tables.  Each page is
- * charged perpage, lion_units_cold_page() over core's random_page_cost in the
+ * loop reads a leaf of the dimension for each key it keeps and a heap page
+ * for each that names a row (found of them), and over the fact's index scan
+ * a fact heap page for each entry it walks (in an index-only scan, those of
+ * pages not all-visible), over a LionOrdered walk that walk's own reads
+ * (lion_ordered_walk_reads(), none where its price carries a cold discount
+ * of its own already); the node reads the fact's heap for its fetches
+ * (factfetches over the whole walk, lo_cost()'s), a leaf for each descent,
+ * the dimension's heap for each member, the lion index pages its sets'
+ * builds read, and the key sets' tables.  Each page is charged perpage,
+ * lion_units_cold_page() over core's random_page_cost in the
  * share of the tables effective_cache_size cannot hold, and the price
  * multiplied by
  *
@@ -689,6 +721,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	IndexOptInfo *pkidx = j->pkidx;
 	double		nonnull;
 	double		keys;
+	double		found;
+	double		hit;
 	double		descents;
 	double		members;
 	double		out;
@@ -711,16 +745,23 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 						  j->fact->relid, JOIN_INNER, NULL);
 	run += factrows * cpu_operator_cost;
 	keys = clamp_row_est(factrows * nonnull);
+	found = oj_found_share(root, j, dimtuples);
 
-	/* the key sets: built from their plans, and each key tested in turn */
+	/*
+	 * The key sets: built from their plans, and each key tested in turn.
+	 * hit is the share of the keys left that name a dimension row: found
+	 * until a key set has let through only its own keys, the dimension's.
+	 */
 	descents = keys;
+	hit = found;
 	foreach(lc, j->keysets)
 	{
 		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
 
 		startup += ks->path->total_cost + ks->rows * cpu_operator_cost;
 		run += descents * cpu_operator_cost;
-		descents *= Min(1.0, ks->rows / dimtuples);
+		descents *= Min(1.0, hit * ks->rows / dimtuples);
+		hit = 1.0;
 	}
 	descents = clamp_row_est(descents);
 
@@ -729,7 +770,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * btcostestimate() prices one: its comparisons, the pages of the
 	 * descent, an index tuple; and the leaf pages the descents read, as
 	 * index_pages_fetched() spreads them over the index.  Then the set's
-	 * test of the TID found.
+	 * test of the TID found, by the descents that find one.
 	 */
 	descent = ceil(log(idxtuples) / log(2.0)) * cpu_operator_cost +
 		(Max(pkidx->tree_height, 0) + 1) * 50.0 * cpu_operator_cost +
@@ -739,7 +780,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		index_pages_fetched(descents, (BlockNumber) idxpages, idxpages, root) *
 		spc_random;
 	if (ds->lion != NULL)
-		run += descents * cpu_operator_cost;
+		run += descents * hit * cpu_operator_cost;
 
 	/*
 	 * The set's build, and the members' heap fetches - the TIDs of the set
@@ -747,7 +788,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * filter.
 	 */
 	startup += ds->build;
-	members = clamp_row_est(descents * ds->candsel);
+	members = clamp_row_est(descents * hit * ds->candsel);
 	get_tablespace_page_costs(dim->reltablespace, &spc_random, &spc_seq);
 	cost_qual_eval(&resid, ds->residual, root);
 	startup += resid.startup;
@@ -756,8 +797,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		members * (cpu_tuple_cost + ds->recheck + resid.per_tuple);
 
 	/* the rows it returns, and the join's target */
-	out = clamp_row_est(descents * Min(1.0, lion_probe_rel_rows(root, dim) /
-									   dimtuples));
+	out = clamp_row_est(descents * hit *
+						Min(1.0, lion_probe_rel_rows(root, dim) / dimtuples));
 	startup += joinrel->reltarget->cost.startup;
 	run += out * (cpu_tuple_cost + joinrel->reltarget->cost.per_tuple);
 
@@ -806,7 +847,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 			corereads = index_pages_fetched(s * keys, (BlockNumber) idxpages,
 											idxpages, root) +
-				index_pages_fetched(s * keys, dim->pages, idxpages, root);
+				index_pages_fetched(s * keys * found, dim->pages, idxpages,
+									root);
 			if (comp->lionwalk)
 				corereads += comp->walkreads;
 			else if (comp->factwalk)

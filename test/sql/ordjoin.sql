@@ -432,6 +432,48 @@ SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d 
 	ORDER BY f.score DESC NULLS LAST LIMIT 20');
 RESET pg_lion.enable_ordered_join;
 
+-- 12. The rows out where the fact's key is not a foreign key (§47.3, "The
+--     rows"): orph's 200,000 keys are twice the dimension's, so half of
+--     them name no dimension row and cost a descent that returns nothing.
+--     The node's estimate of the join is its descents' found share, as
+--     core's is; under a key set, whose keys are the dimension's, that
+--     share is taken once.  oj_rows() gives the node's estimate, lion's
+--     paths priced at a thousandth, against the rows of the count.
+CREATE FUNCTION oj_rows(q text, actual text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	p jsonb;
+	n numeric;
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	p := p->0->'Plan'->'Plans'->0;
+	IF p->>'Custom Plan Provider' IS DISTINCT FROM 'LionOrderedJoin' THEN
+		RETURN 'no LionOrderedJoin';
+	END IF;
+	EXECUTE actual INTO n;
+	RETURN format('LionOrderedJoin, %s times the rows',
+				  round((p->>'Plan Rows')::numeric / n, 1));
+END $$;
+CREATE TABLE orph (id int PRIMARY KEY, fk int NOT NULL, score int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO orph
+SELECT i, i, ((hashint8extended(i::bigint, 5) & 9223372036854775807) % 1000000)::int
+  FROM generate_series(1, 200000) i;
+CREATE INDEX orph_score ON orph (score);
+VACUUM (FREEZE, ANALYZE) orph;
+SELECT oj_rows('SELECT o.id, d.pk FROM orph o JOIN dim d ON o.fk = d.pk
+	WHERE d.lvl = 3 ORDER BY o.score LIMIT 20',
+	'SELECT count(*) FROM orph o JOIN dim d ON o.fk = d.pk WHERE d.lvl = 3');
+SELECT oj_rows('SELECT o.id, d.pk FROM orph o JOIN dim d ON o.fk = d.pk
+	WHERE d.lvl = 3 AND o.fk IN (SELECT pk FROM flt WHERE x < 3)
+	ORDER BY o.score LIMIT 20',
+	'SELECT count(*) FROM orph o JOIN dim d ON o.fk = d.pk
+	WHERE d.lvl = 3 AND o.fk IN (SELECT pk FROM flt WHERE x < 3)');
+DROP FUNCTION oj_rows(text, text);
+DROP TABLE orph;
+
 DROP FUNCTION oj(text, text);
 DROP FUNCTION oj_plan(text);
 DROP FUNCTION oj_run(text);
