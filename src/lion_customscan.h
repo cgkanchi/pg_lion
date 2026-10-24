@@ -4020,7 +4020,8 @@ extern double lion_skew_rel_scale(PlannerInfo *root, RelOptInfo *rel,
 								  Relids required_outer, double loops);
 extern double lion_skew_clauses_scale(PlannerInfo *root, RelOptInfo *rel,
 									  List *clauses);
-extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel,
+							   RangeTblEntry *rte);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);

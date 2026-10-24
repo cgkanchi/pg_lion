@@ -4346,7 +4346,7 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	IndexPath  *first;
 
 	/* core's price of a skewed key's scan, before lion's paths join it */
-	lion_skew_rel_note(root, rel);
+	lion_skew_rel_note(root, rel, rte);
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 

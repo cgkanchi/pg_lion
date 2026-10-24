@@ -4645,8 +4645,8 @@ lion_plain_remainders_drop(PlannerInfo *root, int mark)
  * ... and the remainder noted for path priced as the rest of its price is
  * when lion_skew_am_paths() puts it into core's units (DESIGN.md §40.12): its
  * run's `share`, times `scale`.  The bitmap heap scan of the path offered
- * beside it below is priced from the same index path, at the same rows, and
- * is put into core's units alike.
+ * beside it when it pays (lion_plain_pay_remainders()) is priced from the
+ * same index path, at the same rows, and is put into core's units alike.
  */
 void
 lion_plain_scale_remainder(PlannerInfo *root, IndexPath *path, double share,
@@ -4850,12 +4850,12 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 }
 
 /*
- * set_rel_pathlist_hook: each plain lion path of rel with a remainder noted
- * pays it, and is offered again with the bitmap heap scan of the same index
- * path beside it, which add_path() may have discarded for the plain one - the
- * paths added here are compared as any others (set_rel_pathlist() allows a
- * hook to modify the core paths).  The plain path keeps its startup cost, which
- * is what a LIMIT asks of it.
+ * Each plain lion path of rel with a remainder noted pays it, and is offered
+ * again with the bitmap heap scan of the same index path beside it, which
+ * add_path() may have discarded for the plain one - the paths added here are
+ * compared as any others (set_rel_pathlist() allows a hook to modify the core
+ * paths).  The plain path keeps its startup cost, which is what a LIMIT asks
+ * of it.  A remainder is paid once, and is 0 from then on.
  *
  * The bitmap heap scan is not all the plain path may have displaced before it
  * paid: set_plain_rel_pathlist() offers the sequential scan before the index
@@ -4867,13 +4867,94 @@ lion_correct_rel_rows(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
  * rebuilt without building the relation's index paths again, lion's among
  * them, and are not: they would have had to cost less than the plain path
  * with its remainder and more than it without.
+ *
+ * Run by lion's set_rel_pathlist_hook below for the paths core built, before
+ * LionOrdered's hook sees them, and again by lion_skew_am_paths() for the
+ * AM's scans it builds later in the chain (DESIGN.md §40.12).
+ */
+void
+lion_plain_pay_remainders(PlannerInfo *root, RelOptInfo *rel,
+						  RangeTblEntry *rte)
+{
+	LionProbeCache *cache;
+	List	   *repriced = NIL;
+	ListCell   *lc;
+
+	if (root == NULL || root->glob == NULL ||
+		(cache = lion_probe_cache_find(root)) == NULL ||
+		cache->remainders == NIL)
+		return;
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		ListCell   *lc2;
+		bool		found = false;
+
+		if (!IsA(p, IndexPath) || p->pathtype != T_IndexScan ||
+			p->param_info != NULL)
+			continue;
+		foreach(lc2, cache->remainders)
+		{
+			LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
+
+			if (r->path == (IndexPath *) p && r->remainder > 0)
+			{
+				p->total_cost += r->remainder;
+				r->remainder = 0;
+				found = true;
+				break;
+			}
+		}
+		if (found)
+		{
+			repriced = lappend(repriced, p);
+			rel->pathlist = foreach_delete_current(rel->pathlist, lc);
+		}
+	}
+
+	foreach(lc, repriced)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		Path	   *bp;
+		ListCell   *lc2;
+
+		add_path(rel, p);
+		bp = (Path *) create_bitmap_heap_path(root, rel, p, NULL, 1.0, 0);
+		/* in core's units, as p is (lion_plain_scale_remainder()) */
+		foreach(lc2, cache->remainders)
+		{
+			LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
+
+			if (r->path == (IndexPath *) p)
+			{
+				if (r->share < 1.0 || r->scale < 1.0)
+					lion_skew_reprice(bp, r->share, r->scale);
+				break;
+			}
+		}
+		add_path(rel, bp);
+	}
+	if (repriced != NIL && rte->rtekind == RTE_RELATION &&
+		rte->tablesample == NULL)
+	{
+		/* as set_plain_rel_pathlist() offers them */
+		add_path(rel, create_seqscan_path(root, rel, rel->lateral_relids,
+										  0));
+		(void) create_tidscan_paths(root, rel);
+	}
+	list_free(repriced);
+}
+
+/*
+ * set_rel_pathlist_hook: rel's rows corrected (lion_correct_rel_rows()),
+ * before 18 the IN lists an OR of equalities spells, and each plain lion
+ * path's remainder paid (lion_plain_pay_remainders()).
  */
 static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 							RangeTblEntry *rte)
 {
-	LionProbeCache *cache;
-
 	lion_correct_rel_rows(root, rel, rte);
 
 #if PG_VERSION_NUM < 180000
@@ -4905,72 +4986,7 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	}
 #endif
 
-	if (root->glob != NULL && (cache = lion_probe_cache_find(root)) != NULL &&
-		cache->remainders != NIL)
-	{
-		List	   *repriced = NIL;
-		ListCell   *lc;
-
-		foreach(lc, rel->pathlist)
-		{
-			Path	   *p = (Path *) lfirst(lc);
-			ListCell   *lc2;
-			bool		found = false;
-
-			if (!IsA(p, IndexPath) || p->pathtype != T_IndexScan ||
-				p->param_info != NULL)
-				continue;
-			foreach(lc2, cache->remainders)
-			{
-				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
-
-				if (r->path == (IndexPath *) p && r->remainder > 0)
-				{
-					p->total_cost += r->remainder;
-					r->remainder = 0;
-					found = true;
-					break;
-				}
-			}
-			if (found)
-			{
-				repriced = lappend(repriced, p);
-				rel->pathlist = foreach_delete_current(rel->pathlist, lc);
-			}
-		}
-
-		foreach(lc, repriced)
-		{
-			Path	   *p = (Path *) lfirst(lc);
-			Path	   *bp;
-			ListCell   *lc2;
-
-			add_path(rel, p);
-			bp = (Path *) create_bitmap_heap_path(root, rel, p, NULL, 1.0, 0);
-			/* in core's units, as p is (lion_plain_scale_remainder()) */
-			foreach(lc2, cache->remainders)
-			{
-				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
-
-				if (r->path == (IndexPath *) p)
-				{
-					if (r->share < 1.0 || r->scale < 1.0)
-						lion_skew_reprice(bp, r->share, r->scale);
-					break;
-				}
-			}
-			add_path(rel, bp);
-		}
-		if (repriced != NIL && rte->rtekind == RTE_RELATION &&
-			rte->tablesample == NULL)
-		{
-			/* as set_plain_rel_pathlist() offers them */
-			add_path(rel, create_seqscan_path(root, rel, rel->lateral_relids,
-											  0));
-			(void) create_tidscan_paths(root, rel);
-		}
-		list_free(repriced);
-	}
+	lion_plain_pay_remainders(root, rel, rte);
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
