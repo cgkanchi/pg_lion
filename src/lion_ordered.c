@@ -8701,6 +8701,12 @@ lo_narrow_flush(LionOrderedState *st)
  * its lion quals has changed since the last; and the narrowed set emptied,
  * for lion_ordered_narrow_add() to fill.  The dimension returns no row until
  * lion_ordered_narrow_end().
+ *
+ * The split rescans its child before this (os_next_arm()), and the child's
+ * rescan hands a changed Param to this dimension: it is consumed here, by a
+ * rescan that drops the set when its lion quals use the Param (lo_rescan()),
+ * so that the set is made for the new value once, here, and the arm's
+ * descents find nothing left to rescan for.
  */
 void
 lion_ordered_narrow_begin(PlanState *ps)
@@ -8708,7 +8714,6 @@ lion_ordered_narrow_begin(PlanState *ps)
 	LionOrderedState *st = lo_narrow_state(ps);
 	MemoryContext oldcxt;
 
-	/* a changed Param of its lion quals: the set made again (lo_rescan()) */
 	if (ps->chgParam != NULL)
 		ExecReScan(ps);
 	if (st->set == NULL && !st->noset && !st->lazy &&

@@ -29672,12 +29672,14 @@ set is then built at once.
   above it for a scroll cursor - and must be a LionOrderedJoin, whose dimension's side, the probe,
   is what the arms narrow. The column's lion index is opened.
 - **An arm** (`os_next_arm()`). The column's walk begins with the first arm (`lion_order_walk_begin()`:
-  the column, no bounds, the direction, the NULL entry's place). For each entry,
-  `lion_ordered_narrow_begin()` on the probe, `lion_ordered_narrow_add()` for each of the entry's
-  TIDs, and `lion_ordered_narrow_end()`, which returns the narrowed set's members. An entry with
-  none is passed over (`Entries Skipped`); otherwise the child is rescanned - from the second arm
-  on - and run, and its rows are the split's until it returns none. The walk has read the next
-  entry's first TID, and holds no pin or lock while the arm runs (§30.11).
+  the column, no bounds, the direction, the NULL entry's place). For each entry: the child is
+  rescanned first, when it has run since its last rescan or a Param of the split's has changed;
+  then `lion_ordered_narrow_begin()` on the probe, `lion_ordered_narrow_add()` for each of the
+  entry's TIDs, and `lion_ordered_narrow_end()`, which returns the narrowed set's members. An entry
+  with none is passed over (`Entries Skipped`), the child's rescan, which reads nothing, not
+  repeated for the next; otherwise the child runs, and its rows are the split's until it returns
+  none. The walk has read the next entry's first TID, and holds no pin or lock while the arm runs
+  (§30.11).
 - **The narrowing.** `narrow_begin` makes the dimension's set as the probe's first descent would
   (§47.4: built at once, or lazy), unless it has it; a changed Param of its lion quals makes it
   again first. The narrowed set is built from the entry's TIDs a container key at a time - they
@@ -29705,9 +29707,13 @@ set is then built at once.
   new one. A TID met under two entries is a slot reused after the walk passed it, its row invisible
   to the snapshot (§30.11).
 - **Rescans** (`os_rescan()`). The column's walk ends, and begins again at the next arm. A changed
-  Param is handed to the child and to the probe: `narrow_begin` reads the probe's set before the
-  child's rescan would hand the Param on, and so rescans the probe itself. Each side keeps its set
-  unless its lion quals use the Param (§47.4); a key set is kept unless its plan does.
+  Param is handed to the child, whose rescan at the next arm hands it to its sides (§47.4) before
+  the entry is narrowed: `narrow_begin` consumes the probe's with a rescan of it, which drops the
+  dimension's set when its lion quals use the Param, and makes the set for the new value, once; the
+  arm's descents find no Param left to rescan for. Rescanned after the narrowing instead, the child
+  would hand the Param to the probe again, and its first descent would drop the set and build it a
+  second time. Each side keeps its set unless its lion quals use the Param; a key set is kept
+  unless its plan does.
 
 ### 48.5 EXPLAIN (`os_explain()`)
 
@@ -29745,8 +29751,9 @@ Skipped: 2`). On the copy: NULLS FIRST and LAST, DESC and ASC; a text column, `t
 NULL`, whose walk takes no NULL entry (`Split By: dimn_kind (kind)`); a value inserted after ANALYZE
 (`kind` 9, `tier` 'zinc') and one inserted in the same transaction before the query (`kind` -1,
 `tier` 'aluminium'), each returned in its place. A key set built once for two arms (`Key Set Builds:
-1`); a LATERAL subquery rescanned for each outer row, the dimension's set made again for each value;
-a generic plan's Param. Declined: another operator family, another collation, an expression of the
+1`); a LATERAL subquery rescanned for each outer row, the dimension's set made again for each value
+once however many arms the row runs (seven rows of two arms each: `7 builds`), and one that passes
+over entries between rescans (`d.kind IN (x.x, x.x + 4)`); a generic plan's Param. Declined: another operator family, another collation, an expression of the
 column, `FOR SHARE OF d`, a LEFT JOIN, `ordered_split_max` 1 and 0, and `enable_ordered_join` off
 (core's Sort over a Hash Join).
 

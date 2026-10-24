@@ -632,12 +632,32 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d 
 	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 600');
 
 -- ... a rescan, the dimension's set made again for each outer row's value,
---     and a generic plan's Param
+--     once however many arms the row runs (seven rows, two arms each: 7
+--     builds), and entries passed over between rescans; and a generic
+--     plan's Param
 SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
 	FROM fact f JOIN dim d ON f.fk = d.pk
 	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
 	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3) s
 	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id');
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 100) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id');
+SELECT btrim(ln) AS counters FROM oj_run('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.flag
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = x.x + 3
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 100) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.flag, s.score DESC NULLS LAST, s.id') ln
+ WHERE ln ~ '(LionOrderedSplit|Arms Run|Entries Skipped|Lion Set):';
+SET pg_lion.ordered_split_max = 10;
+SELECT oj('SELECT x.pk, s.* FROM flt x, LATERAL (SELECT f.id, f.score, d.pk, d.kind
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.kind IN (x.x, x.x + 4)
+	ORDER BY d.kind DESC, f.score DESC NULLS LAST, f.id LIMIT 3 OFFSET 1300) s
+	WHERE x.pk < 20 ORDER BY x.pk, s.kind DESC, s.score DESC NULLS LAST, s.id');
+RESET pg_lion.ordered_split_max;
 SET plan_cache_mode = force_generic_plan;
 SET pg_lion.pushdown_margin = 1000;
 PREPARE ps(int) AS SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk

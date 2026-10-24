@@ -64,9 +64,9 @@ static const char *const lion_competitor_names[] = {
 /*
  * Is cp one of lion's own custom paths - LionCount, LionSemiJoin,
  * LionAntiJoin, LionJoinAgg, LionOrdered, LionBtreeScan, LionOrderedJoin,
- * LionOrderedSplit, LionBm25 or LionProbeJoin?  By its methods, which are this library's own: a
- * name is only what EXPLAIN prints, and another extension's path may carry
- * any.
+ * LionOrderedSplit, LionBm25 or LionProbeJoin?  By its methods, which are
+ * this library's own: a name is only what EXPLAIN prints, and another
+ * extension's path may carry any.
  */
 static bool
 lion_custom_is_lion(const CustomPath *cp)

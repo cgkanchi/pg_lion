@@ -4498,7 +4498,7 @@ extern void lion_ordered_explain_side(PlanState *ps, List *ancestors,
 									  ExplainState *es, const char *prefix,
 									  bool counters);
 
-/* lion_ordjoin.c: LionOrderedJoin's and LionOrderedSplit's paths (§47, §48) */
+/* lion_ordjoin.c: LionOrderedJoin's paths (§47), LionOrderedSplit's (§48) */
 extern const CustomPathMethods lion_ordjoin_path_methods;
 extern const CustomPathMethods lion_ordsplit_path_methods;
 
