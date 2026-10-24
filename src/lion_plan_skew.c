@@ -661,7 +661,8 @@ lion_skew_set_extra(PlannerInfo *root, RelOptInfo *rel, Path *lion,
  * on it builds the unparameterized index paths of those indexes as it builds
  * them for rel, competing with nothing else.  Parallel paths as rel has them.
  * The copy of core's indexes is given the sequential scan too, which
- * add_path() may have dropped from rel as it drops the index paths.
+ * add_path() may have dropped from rel as it drops the index paths.  Only for
+ * a relation core builds those paths for (lion_skew_rel_note()).
  */
 static RelOptInfo *
 lion_skew_scratch(PlannerInfo *root, RelOptInfo *rel, bool lion)
@@ -687,8 +688,7 @@ lion_skew_scratch(PlannerInfo *root, RelOptInfo *rel, bool lion)
 	scratch->cheapest_parameterized_paths = NIL;
 	scratch->joininfo = NIL;
 	scratch->has_eclass_joins = false;
-	if (!lion && rel->rtekind == RTE_RELATION &&
-		planner_rt_fetch(rel->relid, root)->tablesample == NULL)
+	if (!lion)
 		add_path(scratch, create_seqscan_path(root, scratch,
 											  rel->lateral_relids, 0));
 	if (scratch->indexlist != NIL)
@@ -752,20 +752,26 @@ lion_skew_reprice(Path *path, double share, double scale)
  * equate the key to the value the plan does not know (a scan of a lion index
  * on other columns meets no more rows at a heavier key, and keeps its price;
  * a BitmapAnd of a lion index and another index is core's mixture, and keeps
- * it too).  add_path() may have dropped core's own index scans in their
- * favour: core's paths, which `core` built again over its other indexes, are
- * offered again at core's prices.  Then the lion indexes' paths are built
- * again on a copy of rel that sees them alone, lioncostestimate() pricing
- * each scan's sets, index tuples and selectivity - and core, from it, the
- * heap - at the rows a probed key meets (lion_skew_am_factor()); each that
- * meets the key has its run cut to the share of it the query's count of rows
- * takes at those rows, over the share core's Limit takes at core's
- * (lion_skew_limit_rows(), lion_skew_limit_share()), is multiplied by
- * `scale` and offered.
+ * it too).  Then the lion indexes' paths are built again on a copy of rel
+ * that sees them alone, lioncostestimate() pricing each scan's sets, index
+ * tuples and selectivity - and core, from it, the heap - at the rows a probed
+ * key meets (lion_skew_am_factor()); each that meets the key has its run cut
+ * to the share of it the query's count of rows takes at those rows, over the
+ * share core's Limit takes at core's (lion_skew_limit_rows(),
+ * lion_skew_limit_share()), is multiplied by `scale` and offered.
+ *
+ * A plain scan's remainder (DESIGN.md §29.11), noted as lioncostestimate()
+ * priced it and put into core's units with it, is paid here: lion's pass that
+ * pays them (lion_plain_pay_remainders()) ran on rel's paths before this
+ * hook, and these were not among them.  It offers the bitmap heap scan of each
+ * such path beside it.  Last, core's paths, which `core` built again over its
+ * other indexes, are offered again at core's prices: add_path() may have
+ * dropped core's own scans for an AM scan of a lion index at core's rows, or
+ * for one of these before it paid.
  */
 static void
-lion_skew_am_paths(PlannerInfo *root, RelOptInfo *rel, RelOptInfo *core,
-				   double scale, double limit)
+lion_skew_am_paths(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
+				   RelOptInfo *core, double scale, double limit)
 {
 	RelOptInfo *lion;
 	ListCell   *lc;
@@ -786,23 +792,6 @@ lion_skew_am_paths(PlannerInfo *root, RelOptInfo *rel, RelOptInfo *core,
 			lion_skew_path_factor(root, rel, p) > 1.0)
 			rel->partial_pathlist = foreach_delete_current(rel->partial_pathlist,
 														   lc);
-	}
-	if (core != NULL)
-	{
-		foreach(lc, core->pathlist)
-		{
-			Path	   *p = (Path *) lfirst(lc);
-
-			if (p->param_info == NULL)
-				add_path(rel, p);
-		}
-		foreach(lc, core->partial_pathlist)
-		{
-			Path	   *p = (Path *) lfirst(lc);
-
-			if (p->param_info == NULL)
-				add_partial_path(rel, p);
-		}
 	}
 
 	lion_skew_am_rel = rel;
@@ -848,6 +837,25 @@ lion_skew_am_paths(PlannerInfo *root, RelOptInfo *rel, RelOptInfo *core,
 		lion_skew_reprice(p, 1.0, scale);
 		add_partial_path(rel, p);
 	}
+	lion_plain_pay_remainders(root, rel, rte);
+
+	if (core != NULL)
+	{
+		foreach(lc, core->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (p->param_info == NULL)
+				add_path(rel, p);
+		}
+		foreach(lc, core->partial_pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lc);
+
+			if (p->param_info == NULL)
+				add_partial_path(rel, p);
+		}
+	}
 }
 
 /*
@@ -861,9 +869,17 @@ lion_skew_am_paths(PlannerInfo *root, RelOptInfo *rel, RelOptInfo *core,
  * scan of a lion index beat at core's rows.  The AM's scans are lion's plans
  * as much as LionCount and the walks are, and are priced in the same units
  * (lion_skew_am_paths()).
+ *
+ * Only a relation whose index paths core builds as lion_skew_scratch() builds
+ * them again, with the scan core plans for it: not an inheritance parent,
+ * whose rows are its children's Append, nor a parent whose children the query
+ * does not reach (lion_rel_is_unexpanded_parent()), nor a sampled relation,
+ * which core reads by its sample alone, nor one already proven empty, whose
+ * pages the planner leaves out of root->total_table_pages, which cost_index()
+ * asserts they are in (as lo_rel_ok() has it).
  */
 void
-lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel)
+lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 {
 	RelOptInfo *core;
 	Path	   *best = NULL;
@@ -873,8 +889,13 @@ lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel)
 	Cost		more;
 	ListCell   *lc;
 
-	if (rel == NULL || rel->reloptkind != RELOPT_BASEREL ||
-		rel->rtekind != RTE_RELATION || rel->baserestrictinfo == NIL)
+	if (rel == NULL || rte == NULL || rel->reloptkind != RELOPT_BASEREL ||
+		rte->rtekind != RTE_RELATION || rel->baserestrictinfo == NIL)
+		return;
+	if (rte->inh || rte->tablesample != NULL ||
+		lion_rel_is_unexpanded_parent(rte) ||
+		(rte->relkind != RELKIND_RELATION && rte->relkind != RELKIND_MATVIEW) ||
+		IS_DUMMY_REL(rel))
 		return;
 	if (lion_skew_clauses_factor(root, rel, rel->baserestrictinfo) <= 1.0 ||
 		lion_skew_scale_find(root, rel, NULL, 1.0, &scale))
@@ -910,7 +931,7 @@ lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel)
 	}
 	lion_skew_scale_keep(root, rel, NULL, 1.0, scale);
 	if (scale < 1.0)
-		lion_skew_am_paths(root, rel, core, scale, limit);
+		lion_skew_am_paths(root, rel, rte, core, scale, limit);
 }
 
 /*

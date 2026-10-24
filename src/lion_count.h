@@ -2090,6 +2090,8 @@ extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
 									  Cost remainder);
 extern void lion_plain_scale_remainder(PlannerInfo *root, IndexPath *path,
 									   double share, double scale);
+extern void lion_plain_pay_remainders(PlannerInfo *root, RelOptInfo *rel,
+									  RangeTblEntry *rte);
 extern int	lion_plain_remainders_mark(PlannerInfo *root);
 extern void lion_plain_remainders_drop(PlannerInfo *root, int mark);
 

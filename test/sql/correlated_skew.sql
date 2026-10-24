@@ -270,6 +270,41 @@ SELECT g.name, count(*) AS rows, sum(w.n) AS counted,
   FULL JOIN lcs_want2 w ON w.id = g.id
  GROUP BY g.name ORDER BY g.name;
 
+-- ---------- 8. the relations left out ----------
+-- Only a relation whose index paths core builds is priced in these units,
+-- with the scan core plans for it.  A sampled relation is read by its
+-- sample: its Sample Scan.
+SELECT name, lcs_plan(replace(q, 'FROM lcs_fact f',
+							  'FROM lcs_fact f TABLESAMPLE SYSTEM (50) REPEATABLE (7)'))
+  FROM lcs_q ORDER BY name;
+-- one proven empty by its CHECK constraint, the key's clause still among its
+-- restrictions: no index path, whose cost_index() asserts the relation's
+-- pages are among the planner's
+ALTER TABLE lcs_fact ADD CONSTRAINT lcs_fact_id CHECK (id > 0);
+SET constraint_exclusion = on;
+SELECT name, lcs_plan(replace(q, 'f.fk = d.id', 'f.id < 0 AND f.fk = d.id'))
+  FROM lcs_q ORDER BY name;
+RESET constraint_exclusion;
+ALTER TABLE lcs_fact DROP CONSTRAINT lcs_fact_id;
+-- an inheritance parent: the Append of it and its child, each scanned as a
+-- member of it
+CREATE TABLE lcs_kid () INHERITS (lcs_fact);
+INSERT INTO lcs_kid SELECT id + 200000, fk, doc, pad FROM lcs_fact WHERE id % 50 = 0;
+VACUUM (FREEZE, ANALYZE) lcs_kid;
+SELECT name, lcs_plan(q) ~ '^Seq Scan\[Aggregate\[(Limit\[Result\[)?Append\[' AS appended
+  FROM lcs_q ORDER BY name;
+-- the parent read alone, its child out of the query: at core's rows, the
+-- plan the skew estimate's being off gives
+CREATE TEMP TABLE lcs_only AS
+SELECT name, lcs_plan(replace(q, 'FROM lcs_fact f', 'FROM ONLY lcs_fact f')) AS plan
+  FROM lcs_q;
+SET pg_lion.enable_skew_estimate = off;
+SELECT o.name, o.plan,
+	   o.plan = lcs_plan(replace(q, 'FROM lcs_fact f', 'FROM ONLY lcs_fact f')) AS core_rows
+  FROM lcs_only o JOIN lcs_q USING (name) ORDER BY name;
+RESET pg_lion.enable_skew_estimate;
+DROP TABLE lcs_kid, lcs_only;
+
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lcs_got1, lcs_got2, lcs_got3, lcs_got4, lcs_got5, lcs_got6,

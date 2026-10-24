@@ -18210,7 +18210,8 @@ index cost for the bitmap path the moment amcostestimate returns, and reads noth
 it. So `lion_plain_heap_correlation()` notes what is left over for an unparameterized plain path
 (`lion_plain_note_remainder()`), and lion's set_rel_pathlist_hook adds it to the path once the
 relation's paths are built and offers the bitmap heap scan of the same index path again beside it
-(`lion_plain_set_rel_pathlist()`, in `lion_selfuncs.c`, before LionOrdered's hook sees the paths);
+(`lion_plain_pay_remainders()`, in `lion_selfuncs.c`, run by `lion_plain_set_rel_pathlist()` before
+LionOrdered's hook sees the paths, and again for the AM scans §40.12 builds after it);
 set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
 others. The plain path keeps its startup cost, which is what a LIMIT asks of it. The hook offers the
 sequential scan and the TID scans again as well, rebuilt as set_plain_rel_pathlist() builds them
@@ -21562,9 +21563,9 @@ are:
 - a walk of a B-tree keyed on the column (`lo_cost()`), and the set of a walk whose lion access
   equates the column to the Param (`lion_skew_set_extra()`);
 - a LionCount whose WHERE equates the column to a Param (`lion_count_rel_set_clause()`);
-- an unparameterized AM scan of a lion index whose index clauses do, a correlated subquery's or a
-  generic plan's (`lioncostestimate()`, `lion_skew_am_paths()`, §40.12); the AM's other scans keep
-  core's rows;
+- an unparameterized AM scan of a lion index whose index clauses equate the column to a Param - a
+  correlated subquery's scan, or a generic plan's (`lioncostestimate()`, `lion_skew_am_paths()`,
+  §40.12); the AM's other scans keep core's rows;
 - an FK-side join's lookups against a nested loop (`lion_cost_fkjoin_rel()`).
 
 `pg_lion.enable_skew_estimate` (on by default, PGC_USERSET) turns it all off. The figure is a
@@ -24655,10 +24656,10 @@ loop over an assumed number of calls.
   again at every call, as `Lion Set`'s `N builds` shows; its lookups' pages alone are spread over
   the calls (`lo_lion_amortized()`: each leaf of the lion access priced again at the calls, the
   difference taken off), the build's CPU a call's. Beside it the walk is offered the set without
-  the Param, built once (§40.12, "A set without the key"). An InitPlan's Param in the Lion Cond is set once
-  per execution, before the calls, and rebuilds nothing: only a Param the levels above hand down
-  (`lion_has_outer_param()`, their `plan_params`) counts. The heap's pages are a call's, as
-  core's.
+  the Param, built once (§40.12, "A set without the key"). An InitPlan's Param in the Lion Cond is
+  set once per execution, before the calls, and rebuilds nothing: only a Param the levels above
+  hand down (`lion_has_outer_param()`, their `plan_params`) counts. The heap's pages are a call's,
+  as core's.
 - **The count** (`lion_cost_count_rel_one()`, `lion_count_rel_calls_share()`, lion_plan_cost.c). A
   `LionCount` whose WHERE holds the Param is located again at every call (its rescan re-locates
   everything), so nothing is built once; the pages it reads - the directory leaves at random, an IN
@@ -24730,18 +24731,26 @@ run, at the top of lion's `set_rel_pathlist_hook`, against the cheapest of:
   indexes alone (`lion_skew_scratch()`): by then `add_path()` has dropped the core paths that an
   AM scan of the lion index beat at core's rows.
 
+The relation is one core builds index paths for, as the copy builds them again, and with the scan
+core plans for it (as `lo_rel_ok()` has it): a plain table or a materialized view, not an
+inheritance parent, whose rows are its children's Append, nor a parent whose children the query
+does not reach (`lion_rel_is_unexpanded_parent()`, §23), nor a sampled relation, which core reads
+by its sample alone, nor one already proven empty, whose pages the planner leaves out of
+`root->total_table_pages`, which `cost_index()` asserts they are in. Such a relation keeps core's
+rows.
+
 An AM scan of a lion index is lion's plan, not its competitor. Were it the competitor, it would
 keep core's rows, its scale would be 1, and every lion path of the relation would keep core's rows
 with it: in `test/sql/correlated_skew.sql`, where the AM's plain scan is the cheapest at core's
 rows, the count would be priced at 2.36 a call, against the 0.12 it is priced at against core's
 scan, with the AM's plain scans on or off.
 
-**The AM's scans in the same units** (`lion_skew_am_paths()`, `lioncostestimate()`). Where the
-scale is below 1, the relation's unparameterized paths whose index scans are all of lion indexes
-and whose index clauses equate the key are taken out, serial and partial, and core's paths of the
-copy above are offered again at core's prices. The lion indexes' paths are built again on a copy of
-the relation that sees them alone, with `lion_skew_am_rel` set, under which `lioncostestimate()`
-prices a scan whose index clauses equate the key at their factor (`lion_skew_am_factor()`):
+**The AM's scans in the same units** (`lion_skew_am_paths()`, `lioncostestimate()`). Where the scale
+is below 1, the relation's unparameterized paths whose index scans are all of lion indexes and whose
+index clauses equate the key are taken out, serial and partial. The lion indexes' paths are built
+again on a copy of the relation that sees them alone, with `lion_skew_am_rel` set, under which
+`lioncostestimate()` prices a scan whose index clauses equate the key at their factor
+(`lion_skew_am_factor()`):
 
 - the index tuples and the pages `genericcostestimate()` prorates, at the selectivity times the
   factor (`lion_cost_prorate()`, the tail of `lion_cost_canonical_sel()`);
@@ -24751,12 +24760,16 @@ prices a scan whose index clauses equate the key at their factor (`lion_skew_am_
 
 Each such path's run is then cut to the share a count of rows takes (below), and the whole
 multiplied by the scale (`lion_skew_reprice()`; before PostgreSQL 18 a disabled path's
-`disable_cost` is left whole). The plain scan's remainder (§29.11) is priced alike
-(`lion_plain_scale_remainder()`), and so is the bitmap heap scan the remainder's hook offers beside
-it, which is priced from the same index path at the same rows. A partial path takes the scale
-alone. Path rows stay core's. A parameterized AM scan, a join's inner side, keeps core's rows as
-§39 has it; a scan of a lion index on other columns meets no more rows at a heavy key and keeps its
-price; a BitmapAnd of a lion index and another index is core's mixture and keeps it too.
+`disable_cost` is left whole). A partial path takes the scale alone. A plain scan's remainder
+(§29.11) is priced alike (`lion_plain_scale_remainder()`) and paid there
+(`lion_plain_pay_remainders()`): lion's pass that pays remainders runs on the relation's paths
+first in the hook chain, before this note, and these are built after it. The pass offers the bitmap
+heap scan of the same index path beside each, priced from it at the same rows and put into core's
+units alike. Core's paths of the copy above are then offered again at core's prices, against these
+at their whole price. Path rows stay core's. A parameterized AM scan, a join's inner side, keeps
+core's rows as §39 has it; a scan of a lion index on other columns meets no more rows at a heavy
+key and keeps its price; a BitmapAnd of a lion index and another index is core's mixture and keeps
+it too.
 
 **A count of rows** (`lion_skew_limit_rows()`, `lion_skew_limit_read()`,
 `lion_skew_limit_share()`). Where the query level is the relation alone and ends at a count k of
@@ -24812,10 +24825,10 @@ into its paths and their competitors and nowhere else.
 each, the rest one to three; `tsv` holds three words of 600; a lion index on (fk, tsv) and B-trees
 on (fk) and (fk, id); the subquery called for the 316 keys of one group, keys 1 to 316. A
 statistics target of 10 on fk gives the figure 86,314 rows against core's 28, and every row below
-is at that target. At the default target every heavy key is in the MCV list and the figure is noise
-(below); the rows with `pg_lion.enable_skew_estimate` off stand for that, the figure at core's
-rows. Warm, best of three; cold, the cluster restarted and the OS cache dropped. `Q8` is an OR of eight phrases, `(w7 <-> w8) | ... |
-(w21 <-> w22)`.
+is at that target. At the default target every heavy key is in the MCV list and the figure is
+what the sample's error leaves (below); the rows with `pg_lion.enable_skew_estimate` off stand for
+that, the figure at core's rows. Warm, best of three; cold, the cluster restarted and the OS cache
+dropped. `Q8` is an OR of eight phrases, `(w7 <-> w8) | ... | (w21 <-> w22)`.
 
 | settings | tsquery, form | before: plan, warm, cold | after: plan, warm, cold |
 |---|---|---|---|
@@ -24848,12 +24861,14 @@ the default settings went from the walk to the lion Index Scan, 527 ms to 564.
 
 **Not done.**
 
-- The figure. It leaves out the keys of the MCV list, which a correlated subquery probes as any
-  other: here keys 1 to 16, of 100,000 rows and more, are probed by 16 of the 316 calls. And its
-  subtraction of the MCV keys' rows takes ANALYZE's sampled frequencies from the exact Σn²: with
-  every heavy key in the list, what is left is the error of the sample, and six ANALYZEs of the
-  table above at the default target gave 63, 351, 28, 28, 11,536 and 28 against core's 28. A
-  figure over the probed keys as rows draw them, the MCV keys among them, is §33's to make.
+- A probe of a most common key. The figure is the rows a key outside the MCV list meets (§33, "The
+  rows of a probed key", measured against the workload's probed sets), and a probe of a key in the
+  list is priced at it too, below the rows it meets. The table above is that case: its heavy keys,
+  1 to 16 of 100,000 rows and more, are probed by 16 of the 316 calls. At the default statistics
+  target all of them are in the MCV list, and what the remainder keeps of them is the error of
+  ANALYZE's sampled frequencies against the exact Σn²: six ANALYZEs gave 63, 351, 28, 28, 11,536
+  and 28 against core's 28. At a target of 10 the list holds keys 7 to 16, keys 1 to 6 are left in
+  the remainder, and the figure is 86,314. So the table's figure moves with the statistics target.
 - A prefix union inside a count. With the skew estimate on, `w1:* | w2:* | w3:*`'s count goes to
   LionCount before and after, and takes 13 s, where core's own plan takes 1.8 s and the walk with
   the set built once 0.5 s: LionCount's price of the AND of a heavy key with a large OR of prefixes
@@ -24866,9 +24881,13 @@ the default settings went from the walk to the lion Index Scan, 527 ms to 564.
 scans on and off; the AM's scan of the lion index chosen at the figure for the capped count and the
 count where core's B-tree scan is chosen at core's rows, and priced below a third of core's plan;
 the AM's scan priced alike under a LIMIT of 21 and of 100,000; the walk's set without the key, with
-the skew estimate off and on, built once for ten calls; the plans with every path on; and every
-answer compared with core's plan. test/sql/correlated.sql and test/sql/skew.sql, whose correlated
-plans weigh the count against core's scan, turn the walk off there.
+the skew estimate off and on, built once for ten calls; the plans with every path on; every answer
+compared with core's plan; and the relations left out - an inheritance parent planned as its Append,
+a parent read alone (`FROM ONLY`) at core's rows, a sampled relation as its Sample Scan, and one
+proven empty by its CHECK constraint, an index path of which fails `cost_index()`'s assertion on
+an assert-enabled build. test/sql/correlated.sql and
+test/sql/skew.sql, whose correlated plans weigh the count against core's scan, turn the walk off
+there.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 
