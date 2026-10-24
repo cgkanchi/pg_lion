@@ -28810,19 +28810,22 @@ them (`lion_probe_rel_rows()`):
 
 - **The fact's walk**: `lion_ordered_walk_price()`, which is `lo_cost()` (§30.3, §40.3) over the
   whole walk - the set's build, the entries walked, the members' fetches (in index-only mode the
-  pages not all-visible, and every candidate where an inexact set's columns are not in the
-  B-tree), the filter, the fact's target - with no set where the fact has no lion access (`lion`
-  NULL, as §46 prices it). The set's build is priced as a probe's (`lo_cost()`'s `probebuild`):
-  its lion access's bitmap index scan price less `lo_build_excess()`, the TIDs past
-  `LO_BUILD_PIECE_TIDS` a container piece, as the dimension's set and §40.10's probe are priced -
-  3,772 down to about 960 for §47.9's `chan = 3`, 8,401 to about 2,250 for `tags @> '{a1}'`. A plain
-  LionOrdered walk keeps the bitmap scan's price (§30.3): its walk is most of its price, where the
-  LIMIT scales this one's walk and not its build. A `cpu_operator_cost` a fact row for its key's
-  test.
+  pages not all-visible, and every candidate where an inexact set's columns are not in the B-tree),
+  the filter, the fact's target - with no set where the fact has no lion access (`lion` NULL, as §46
+  prices it). The set's build is priced as a probe's (`lo_cost()`'s `probebuild`): its lion access's
+  bitmap index scan price less `lo_build_excess()`, the TIDs past `LO_BUILD_PIECE_TIDS` a container
+  piece, as the dimension's set and §40.10's probe are priced - 3,772 down to about 960 for §47.9's
+  `chan = 3`, 8,401 to about 2,250 for `tags @> '{a1}'`. A plain LionOrdered walk keeps the bitmap
+  scan's price (§30.3): its walk is most of its price, where the LIMIT scales this one's walk and
+  not its build. A `cpu_operator_cost` a fact row for its key's test.
 - **The keys**: `keys = factrows * P(fk IS NOT NULL)` (`nulltestsel()`). Each key set adds its
   plan's total cost and a `cpu_operator_cost` a key to the startup, a `cpu_operator_cost` to each
-  key still tested, and lets through the share of keys its keys are of the dimension's rows,
-  `min(1, setrows / dim.tuples)`: the descents left.
+  key still tested, and lets through the share of keys its keys are of the dimension's rows among
+  the keys that name one, `min(1, found * setrows / dim.tuples)` (`found` below), which is `setrows
+  / max(nd, dim.tuples)`: the descents left. A key set's keys are taken to be dimension keys, so
+  each key it lets through names a row, and the orphan share is taken at the first key set only.
+  Core's `eqjoinsel_semi()` takes `setrows / nd` where `nd` passes `dim.tuples`, the same, and then
+  takes the orphan share again at the join.
 - **A descent**, as `btcostestimate()` prices one: `ceil(log2(index tuples))` comparisons,
   `(tree_height + 1) * 50` operator costs for the pages descended, an index tuple, an operator;
   and the B-tree's pages the descents read, `index_pages_fetched(descents, index pages)` at
@@ -28832,11 +28835,20 @@ them (`lion_probe_rel_rows()`):
   (`lion_ordered_set_price()` and `lion_ordered_spill_price()`, §46's), in the startup; the share
   of the dimension's rows it holds (`candsel`); a recheck's price when it is inexact
   (`lion_ordered_set_exact()`); the clauses it leaves to the side's filter (`lo_residual()`).
-- **The members**: `descents * candsel`, each a heap row read at random (Mackert and Lohman over
-  the dimension's pages, `index_pages_fetched()`), a `cpu_tuple_cost`, the recheck and the filter.
-- **The rows**: `descents * min(1, dimrows / dim.tuples)`, `dimrows` the dimension's rows after
-  its quals; each a `cpu_tuple_cost` and the join's target. Every non-NULL key is taken to name a
-  dimension row: the join is on a foreign key.
+- **The members**: `descents * hit * candsel`, each a heap row read at random (Mackert and Lohman
+  over the dimension's pages, `index_pages_fetched()`), a `cpu_tuple_cost`, the recheck and the
+  filter.
+- **The rows**: `descents * hit * min(1, dimrows / dim.tuples)`, `dimrows` the dimension's rows
+  after its quals; each a `cpu_tuple_cost` and the join's target. The dimension's key is unique, but
+  nothing makes the fact's a foreign key: a key that names no dimension row costs its descent and
+  returns nothing. Of the fact key's `nd` distinct values (`get_variable_numdistinct()`) at most
+  `dim.tuples` are the dimension's, so `found = min(1, dim.tuples / nd)` of the keys name a row
+  (`oj_found_share()`; 1 where `nd` is a default), and `hit`, the share of the descents that do, is
+  `found`, or 1 once a key set has let through only its own keys. Core's `eqjoinsel_inner()`, with
+  no MCV list to match, takes the join at `keys * dimrows / max(nd, dim.tuples)`, and the node takes
+  the same: `found` is 1 where the fact's distinct keys are no more than the dimension's rows, and
+  the orphan share where they are more. The members, a set's test of a TID and core's loop's
+  dimension heap reads (below) are counted over the keys that name a row.
 
 The startup and total are divided by `pg_lion.pushdown_margin`, as LionOrdered's paths' are; core's
 Limit takes its share of the run. The path's rows are the node's estimate, not the join rel's.
@@ -28880,16 +28892,17 @@ puts a path into such a loop's units.
 `lion_units_cold()`), over the LIMIT's share `s` of the walk (`*share`), with `walked` the entries
 of the fact's B-tree its Index Cond selects:
 
-- **the loop's reads** (`corereads`): a leaf of the dimension's key and a dimension heap page for
-  each key it keeps, `index_pages_fetched(s * keys)` over the B-tree's pages and over the
-  dimension's; where its outer side is the fact's index scan, a fact heap page for each entry it
-  walks, `index_pages_fetched(s * walked)` over the fact's pages - in an index-only scan those not
-  all-visible, `1 - allvisfrac` of them; and where it is a LionOrdered walk, that walk's reads
-  (`lion_ordered_walk_reads()`): `lo_cost()` taken again for its B-tree and lion access, the heap
-  pages of the LIMIT's share of its fetches and its set's lion index pages - the reads
-  `lo_cold_price()` weighs, less the B-tree's, which the node's walk reads too and which are left
-  out of both. An index-only walk whose price already carries `lo_cold_price()`'s discount, its
-  reads weighed cold against a bitmap heap scan's, adds none: they are not weighed twice;
+- **the loop's reads** (`corereads`): a leaf of the dimension's key for each key it keeps and a
+  dimension heap page for each that names a row, `index_pages_fetched(s * keys)` over the B-tree's
+  pages and `index_pages_fetched(s * keys * found)` over the dimension's; where its outer side is
+  the fact's index scan, a fact heap page for each entry it walks, `index_pages_fetched(s * walked)`
+  over the fact's pages - in an index-only scan those not all-visible, `1 - allvisfrac` of them; and
+  where it is a LionOrdered walk, that walk's reads (`lion_ordered_walk_reads()`): `lo_cost()` taken
+  again for its B-tree and lion access, the heap pages of the LIMIT's share of its fetches and its
+  set's lion index pages - the reads `lo_cold_price()` weighs, less the B-tree's, which the node's
+  walk reads too and which are left out of both. An index-only walk whose price already carries
+  `lo_cold_price()`'s discount, its reads weighed cold against a bitmap heap scan's, adds none: they
+  are not weighed twice;
 - **the node's** (`ownreads`): the fact heap pages of its fetches (`lo_cost()`'s fetches of the
   whole walk, `fetches_p`), a leaf a descent and a dimension heap page a member, each
   `index_pages_fetched()` of `s` of them; the lion index pages the two sets' builds read
@@ -29055,8 +29068,11 @@ that is not unique, a table a column of which the query wants, a NOT EXISTS, key
 (64 kB). Two different tables make the two key sets: PostgreSQL 19 merges two semi joins of one
 table into one. The fact's walk index-only, with a set, with none, and with an inexact set whose
 columns the B-tree lacks (`Heap Fetches` its candidates); the switch, made due at once by
-`pg_lion.ordered_switch_ratio = 1`. Declined: a second join clause, a key that is not unique, `FOR
-SHARE`, no lion clause on either side, the setting off (core's nested loop over a Memoize).
+`pg_lion.ordered_switch_ratio = 1`. The rows out where half the fact's keys name no dimension row
+(`orph`, 200,000 keys against the dimension's 100,000): the node's estimate is the join's count, and
+under a key set 1.1 times it; taking every non-NULL key to name a row would make both twice that.
+Declined: a second join clause, a key that is not unique, `FOR SHARE`, no lion clause on either
+side, the setting off (core's nested loop over a Memoize).
 
 btreescan_param.sql's cursor section turns the node off: under that section's
 `pushdown_margin = 1000` the node took the join from the `LionBtreeScan` probe the section tests.
