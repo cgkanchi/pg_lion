@@ -29610,7 +29610,10 @@ fraction:
 - a most common value's arm has its frequency, `freq`. The list is sorted by the type's B-tree
   comparison under the column's collation and taken in the walk's direction; the values past it
   share what is left of the rows, `1 - nullfrac - Σ freq`, evenly, and are taken after it; the NULL
-  arm has `nullfrac`, first or last;
+  arm has `nullfrac`, first or last. The list is used only where `statistic_proc_security_check()`
+  lets the comparison run on the column's statistics, as core's estimators ask (the user may read
+  the column, or the comparison is leakproof); elsewhere every value shares `1 - nullfrac` evenly,
+  the split priced less well rather than refused;
 - arm i's share of the rows the dimension's quals pass is `share_i = freq_i / Σ freq` over the arms
   walked.
 

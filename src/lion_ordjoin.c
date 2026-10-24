@@ -1128,15 +1128,17 @@ os_nulls(RelOptInfo *dim, Var *col, PathKey *pathkey)
  * and its NULL entry where the walk takes it and the column has NULLs.  A
  * most common value's share of the rows is its frequency, the list sorted by
  * the column's order and walked in the walk's direction; the values past the
- * list share what is left evenly, and are taken after it.  False - no split
- * - when the arms are more than pg_lion.ordered_split_max, or the count is a
- * default.
+ * list share what is left evenly, and are taken after it.  The list is
+ * sorted only where core would call the comparison on the column's
+ * statistics, as below.  False - no split - when the arms are more than
+ * pg_lion.ordered_split_max, or the count is a default.
  */
 static bool
 os_arms(PlannerInfo *root, Var *col, bool backward, int nulls, OsArms *arms)
 {
 	VariableStatData vardata;
 	AttStatsSlot sslot;
+	TypeCacheEntry *typentry = NULL;
 	bool		hasmcv = false;
 	bool		isdefault;
 	double		nd;
@@ -1169,12 +1171,32 @@ os_arms(PlannerInfo *root, Var *col, bool backward, int nulls, OsArms *arms)
 	}
 	if (hasmcv)
 	{
-		TypeCacheEntry *typentry = lookup_type_cache(col->vartype,
-													 TYPECACHE_CMP_PROC_FINFO);
-		OsValueSort sort;
-
+		typentry = lookup_type_cache(col->vartype, TYPECACHE_CMP_PROC_FINFO);
 		if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
 			goto done;
+
+		/*
+		 * Sorting the most common values calls the type's comparison on them,
+		 * which core does on a column's statistics only where
+		 * statistic_proc_security_check() allows it: the user may read the
+		 * column, or the function is leakproof - one that is not could
+		 * report a value it is handed, in an error or otherwise.  Elsewhere
+		 * the list is dropped, not the split: every value then shares the
+		 * rows evenly, from the distinct count and the null fraction, which
+		 * call no function.  The split is priced less well, not refused, as
+		 * core's own estimates fall back on what they may read.
+		 */
+		if (!statistic_proc_security_check(&vardata,
+										   typentry->cmp_proc_finfo.fn_oid))
+		{
+			free_attstatsslot(&sslot);
+			hasmcv = false;
+		}
+	}
+	if (hasmcv)
+	{
+		OsValueSort sort;
+
 		nmcv = Min(sslot.nvalues, sslot.nnumbers);
 		mcv = (OsValue *) palloc(sizeof(OsValue) * Max(nmcv, 1));
 		for (i = 0; i < nmcv; i++)
