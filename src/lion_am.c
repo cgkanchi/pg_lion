@@ -556,9 +556,10 @@ _PG_init(void)
 	lion_ordered_init();
 
 	/*
-	 * The LionOrderedJoin CustomScan (DESIGN.md §47): its GUC, its scan
-	 * methods and the set_join_pathlist_hook that offers it, chained as the
-	 * semi and anti join paths' hook below chains it.
+	 * The LionOrderedJoin and LionOrderedSplit CustomScans (DESIGN.md §47,
+	 * §48): their GUCs, their scan methods and the set_join_pathlist_hook
+	 * that offers them, chained as the semi and anti join paths' hook below
+	 * chains it.
 	 */
 	lion_ordjoin_init();
 
