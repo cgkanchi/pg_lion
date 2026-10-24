@@ -121,6 +121,10 @@ CREATE VIEW lsq_q (q) AS VALUES
 	($q$SELECT d.id, (SELECT count(*) FROM lsq_fact f WHERE f.fk = d.id AND f.doc @@ 'a1 & b3 & c1'::tsquery) AS n FROM lsq_dim d WHERE d.grp = 7$q$);
 
 -- ---------- 1. a correlated count ----------
+-- the walk off: its set of the tsquery's rows, which no Param reaches, is
+-- built once for every call (section 3), and the count is the one weighed
+-- here
+SET pg_lion.enable_btree_scan = off;
 SELECT lsq_plan(q) FROM lsq_q;
 PREPARE lsq_generic(int) AS
 	SELECT count(*) FROM lsq_fact f WHERE f.fk = $1 AND f.doc @@ 'a1 & b3 & c1'::tsquery;
@@ -138,6 +142,7 @@ SELECT lsq_cost($$SELECT count(*) FROM lsq_fact f WHERE f.fk = (SELECT max(id) F
 RESET plan_cache_mode;
 DEALLOCATE lsq_generic;
 DO $$ BEGIN EXECUTE 'CREATE TABLE lsq_got1 AS ' || (SELECT q FROM lsq_q); END $$;
+RESET pg_lion.enable_btree_scan;
 
 -- ---------- 2. the lion index's own scan ----------
 -- the count pushdown and the walk off: a call's scan of the lion index on
@@ -159,9 +164,9 @@ RESET pg_lion.enable_btree_scan;
 
 -- ---------- 3. the walk of the covering B-tree ----------
 -- the count and the lion index's own scans off: the call's scan is the
--- walk, its set built at every call (the key is in its Lion Cond) and only
--- its pages spread over the calls; the generic plan's is core's index scan
--- with the tsquery as its filter
+-- walk, its set the tsquery's alone - no Param reaches it - built once for
+-- every call, and its pages spread over the calls; the generic plan's is
+-- core's index scan with the tsquery as its filter
 SET pg_lion.enable_count_pushdown = off;
 SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;

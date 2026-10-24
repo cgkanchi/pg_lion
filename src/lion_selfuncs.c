@@ -4575,6 +4575,8 @@ typedef struct LionPlainRemainder
 {
 	IndexPath  *path;
 	Cost		remainder;
+	double		share;			/* lion_plain_scale_remainder()'s, or 1 */
+	double		scale;
 } LionPlainRemainder;
 
 /*
@@ -4606,8 +4608,67 @@ lion_plain_note_remainder(PlannerInfo *root, IndexPath *path, Cost remainder)
 	r = (LionPlainRemainder *) palloc(sizeof(LionPlainRemainder));
 	r->path = path;
 	r->remainder = remainder;
+	r->share = 1.0;
+	r->scale = 1.0;
 	cache->remainders = lappend(cache->remainders, r);
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * How many remainders are noted so far; and those noted since `mark` taken
+ * back: what a path's index side priced again for another purpose notes
+ * (lion_skew_set_extra()) is not the path's to pay.
+ */
+int
+lion_plain_remainders_mark(PlannerInfo *root)
+{
+	LionProbeCache *cache;
+
+	if (root == NULL || root->glob == NULL ||
+		(cache = lion_probe_cache_find(root)) == NULL)
+		return 0;
+	return list_length(cache->remainders);
+}
+
+void
+lion_plain_remainders_drop(PlannerInfo *root, int mark)
+{
+	LionProbeCache *cache;
+
+	if (root == NULL || root->glob == NULL ||
+		(cache = lion_probe_cache_find(root)) == NULL)
+		return;
+	cache->remainders = list_truncate(cache->remainders, mark);
+}
+
+/*
+ * ... and the remainder noted for path priced as the rest of its price is
+ * when lion_skew_am_paths() puts it into core's units (DESIGN.md §40.12): its
+ * run's `share`, times `scale`.  The bitmap heap scan of the path offered
+ * beside it below is priced from the same index path, at the same rows, and
+ * is put into core's units alike.
+ */
+void
+lion_plain_scale_remainder(PlannerInfo *root, IndexPath *path, double share,
+						   double scale)
+{
+	LionProbeCache *cache;
+	ListCell   *lc;
+
+	if (root == NULL || root->glob == NULL ||
+		(cache = lion_probe_cache_find(root)) == NULL)
+		return;
+	foreach(lc, cache->remainders)
+	{
+		LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc);
+
+		if (r->path == path)
+		{
+			r->remainder *= share * scale;
+			r->share = share;
+			r->scale = scale;
+		}
+	}
 }
 
 /*
@@ -4881,10 +4942,24 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		foreach(lc, repriced)
 		{
 			Path	   *p = (Path *) lfirst(lc);
+			Path	   *bp;
+			ListCell   *lc2;
 
 			add_path(rel, p);
-			add_path(rel, (Path *) create_bitmap_heap_path(root, rel, p, NULL,
-														   1.0, 0));
+			bp = (Path *) create_bitmap_heap_path(root, rel, p, NULL, 1.0, 0);
+			/* in core's units, as p is (lion_plain_scale_remainder()) */
+			foreach(lc2, cache->remainders)
+			{
+				LionPlainRemainder *r = (LionPlainRemainder *) lfirst(lc2);
+
+				if (r->path == (IndexPath *) p)
+				{
+					if (r->share < 1.0 || r->scale < 1.0)
+						lion_skew_reprice(bp, r->share, r->scale);
+					break;
+				}
+			}
+			add_path(rel, bp);
 		}
 		if (repriced != NIL && rte->rtekind == RTE_RELATION &&
 			rte->tablesample == NULL)
