@@ -29069,8 +29069,9 @@ that is not unique, a table a column of which the query wants, a NOT EXISTS, key
 table into one. The fact's walk index-only, with a set, with none, and with an inexact set whose
 columns the B-tree lacks (`Heap Fetches` its candidates); the switch, made due at once by
 `pg_lion.ordered_switch_ratio = 1`. The rows out where half the fact's keys name no dimension row
-(`orph`, 200,000 keys against the dimension's 100,000): the node's estimate is the join's count, and
-under a key set 1.1 times it; taking every non-NULL key to name a row would make both twice that.
+(`orph`, 200,000 keys against the dimension's 100,000): the node's estimate is about the join's
+count (0.7 to 1.4 times it, the check coarse enough that ANALYZE's sample does not move it), with a
+key set and without; taking every non-NULL key to name a row would make it about twice (1.6 to 2.4).
 Declined: a second join clause, a key that is not unique, `FOR SHARE`, no lion clause on either
 side, the setting off (core's nested loop over a Memoize).
 
