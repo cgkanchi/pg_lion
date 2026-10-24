@@ -501,7 +501,9 @@ typedef struct LionBuildState
 	LionBuildLevel *leaf;		/* the bottom of the directory */
 	int64		ndirpages;
 	int64		ndistinct;		/* entries written, for the §17 guard */
-	uint64	   *nvalues;		/* VALUE entries of each key column, and */
+	uint64	   *nvalues;		/* VALUE entries of each key column, */
+	uint64	   *sumsq;			/* ... the sum of the squares of their TIDs,
+								 * and */
 	uint64		rows;			/* ... the TIDs of the first scalar one's
 								 * entries: the key counts of §33 */
 	AttrNumber	rowcol;			/* that column (lion_index_row_column()) */
@@ -933,11 +935,14 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 		bs->ndistinct++;
 
 	/*
-	 * ... and each column's values and the rows, for the planner (DESIGN.md
-	 * §33): exact here, where every entry passes once.
+	 * ... and each column's values, their TIDs' squares and the rows, for the
+	 * planner (DESIGN.md §33): exact here, where every entry passes once.
 	 */
 	if (lion_entry_kind(entry) == LION_KIND_VALUE)
+	{
 		bs->nvalues[entry->attno - 1]++;
+		lion_sumsq_add(&bs->sumsq[entry->attno - 1], lion_entry_ntids(entry));
+	}
 	if (entry->attno == bs->rowcol && !LionEntryIsSummary(entry))
 		bs->rows += lion_entry_ntids(entry);
 }
@@ -2605,6 +2610,8 @@ lion_build_state_init(LionBuildState *bs, Relation index, int memkb,
 	ncols = bs->ix.ncolumns;
 	bs->nvalues = (uint64 *) MemoryContextAllocZero(bs->buildctx,
 													sizeof(uint64) * ncols);
+	bs->sumsq = (uint64 *) MemoryContextAllocZero(bs->buildctx,
+												  sizeof(uint64) * ncols);
 	bs->rows = 0;
 	bs->rowcol = lion_index_row_column(&bs->ix);
 
@@ -3433,7 +3440,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	{
 		LionMetaNdistinct nd;
 
-		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.rows);
+		lion_meta_fill_ndistinct(&nd, &bs.ix, bs.nvalues, bs.sumsq, bs.rows);
 		lion_meta_record_ndistinct((Page) metabuf->data, &nd);
 	}
 	smgr_bulk_write(bs.bulk, LION_METAPAGE_BLKNO, metabuf, true);

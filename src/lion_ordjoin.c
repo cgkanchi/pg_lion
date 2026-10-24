@@ -835,6 +835,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		u.kind = LION_COMPETITOR_NESTLOOP;
 		u.rate = 1.0;
 		u.margin = 1.0;
+		u.skewscale = 1.0;
 		u.nlcost = comp->cost;
 		u.memoscale = (comp->memo > 0.0 && comp->cost > 0.0) ?
 			comp->cost / (comp->cost + comp->memo) : 1.0;

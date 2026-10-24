@@ -1654,6 +1654,44 @@ lo_build_excess(PlannerInfo *root, Path *lion, double tuples, double pages)
 }
 
 /*
+ * What the lion access's lookups cost less, a call, when a correlated
+ * subquery's walk rebuilds its set at every call (DESIGN.md §40.11): its
+ * pages spread over the `loops` calls, as lioncostestimate() spreads a
+ * parameterized scan's.  A leaf whose quals hold the outer query's Param was
+ * priced so already (lioncostestimate()); the others are priced again at the
+ * loop count, and the difference, at most nothing, is returned.  The CPU of
+ * the lookups stays the call's.
+ */
+static Cost
+lo_lion_amortized(PlannerInfo *root, Path *lion, double loops)
+{
+	Cost		less = 0.0;
+	ListCell   *lc;
+
+	if (IsA(lion, IndexPath))
+	{
+		IndexPath  *ipath = (IndexPath *) lion;
+		Cost		startup;
+		Cost		total;
+		Selectivity sel;
+		double		corr;
+		double		pages;
+
+		if (lion_outer_param_loops(root,
+								   (Node *) ipath->indexclauses) > 1.0)
+			return 0.0;
+		ipath->indexinfo->amcostestimate(root, ipath, loops, &startup, &total,
+										 &sel, &corr, &pages);
+		return Min(total - ipath->indextotalcost, 0.0);
+	}
+	foreach(lc, IsA(lion, BitmapAndPath) ?
+			((BitmapAndPath *) lion)->bitmapquals :
+			castNode(BitmapOrPath, lion)->bitmapquals)
+		less += lo_lion_amortized(root, (Path *) lfirst(lc), loops);
+	return less;
+}
+
+/*
  * The pages a lion access's set reads where it is built: each leaf index's
  * selectivity's share of its pages, a page at least - a lion index's posting
  * sets hold their rows in proportion - as the competing bitmap heap scan's
@@ -1720,10 +1758,22 @@ lo_lion_pages(Path *lion)
  * amortizes a parameterized scan's, and which pays its share of the set,
  * built once for every scan the loop makes: the build divided by `scans`.
  *
+ * In a correlated subquery, whose quals hold an outer query's Param, the price
+ * is a call's of the loop the subquery is (DESIGN.md §40.11), over the calls
+ * lion_outer_param_loops() assumes: the walk's descents and the B-tree's pages
+ * spread over them as core spreads a parameterized scan's, and the set's build
+ * too where no Param reaches the lion quals - it is built once and kept for
+ * every call (lo_rescan()) - or, where one does, its lookups' pages alone,
+ * the set being built again at every call.  The heap's pages are a call's, as
+ * core prices the subquery's own scans.
+ *
  * With `probebuild` the set's lookups are priced as its build reads them,
- * lo_build_excess() taken off: a nested loop's probe's (§40.10), and a
- * LionOrderedJoin's side's (§47.3), whose LIMIT scales the walk but not the
- * build.  Without it, §30.3's price of a walk, the lookups a bitmap scan's.
+ * lo_build_excess() taken off: a nested loop's probe's (§40.10), whose
+ * callers pass ord's param_info test, and a LionOrderedJoin's side's (§47.3),
+ * whose LIMIT scales the walk but not the build.  A correlated subquery's
+ * calls (more than one, as above) are priced so too: lo_cost() finds them
+ * itself, as it does for the rest of their price.  Otherwise §30.3's price of
+ * a walk, the lookups a bitmap scan's.
  *
  * With `lion` NULL there is no set: each entry walked is only tested in the
  * visibility map, and the heap read for the share of pages not all-visible -
@@ -1769,10 +1819,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		pages_corr;
 	double		corr = 0.0;
 	double		ipages = 0.0;
+	double		calls;
+	bool		rebuilt = false;
+	double		skew;
+	double		skewscale = 1.0;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
 	Cost		cpu;
+	Cost		ordtotal = ord->indextotalcost;
 
 	/*
 	 * No lion access at all is LionProbeJoin's descent alone (DESIGN.md
@@ -1783,8 +1838,23 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (lion != NULL)
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
 
-	/* a probe's, or a join's side's: its lookups as its build reads them */
-	if (lion != NULL && probebuild)
+	/* the calls of a correlated subquery, each walk a probe (§40.11) */
+	calls = lion_outer_param_loops(root,
+								   (Node *) list_make3(ord->indexclauses,
+													   lionqual, residual));
+	if (calls > 1.0)
+	{
+		rebuilt = lion_has_outer_param(root, (Node *) lionqual);
+		if (rebuilt)
+			lioncost = Max(lioncost + lo_lion_amortized(root, lion, calls),
+						   0.0);
+	}
+
+	/*
+	 * A probe's, a join's side's or a correlated subquery's call's: its
+	 * lookups as its set's build reads them.
+	 */
+	if (lion != NULL && (probebuild || calls > 1.0))
 		lioncost = Max(lioncost -
 					   lo_build_excess(root, lion, tuples, pages) *
 					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
@@ -1825,6 +1895,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		lioncost + ncont * cpu_operator_cost +
 		lo_set_pieces(root, lion, members, ncont) +
 		lo_spill_cost(lo_set_bytes(members, ncont));
+	if (calls > 1.0 && !rebuilt)
+		scans *= calls;
 	if (scans > 1.0)
 		startup /= scans;
 
@@ -1833,7 +1905,28 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * CPU, which a parallel walk divides
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-	run = ord->indextotalcost;
+
+	/*
+	 * A key the plan does not know - the outer row's, a Param - on a skewed
+	 * key column: the walk meets the rows a probed key meets (DESIGN.md §33,
+	 * "The rows of a probed key"), and so do its members' tests and fetches
+	 * below, where its competitor - the cheapest of core's paths of rel with
+	 * the same parameterization - meets them too and is priced at them
+	 * (lion_skew_rel_scale(), DESIGN.md §39, "A skewed key's probes"); the
+	 * price is put back into core's units at the end by the competitor's two
+	 * prices.  A competitor no key's rows change, a sequential scan, leaves
+	 * the walk at core's rows too.
+	 */
+	skew = lion_skew_clauses_factor(root, rel, ord->indexclauses);
+	if (skew > 1.0)
+	{
+		skewscale = lion_skew_rel_scale(root, rel,
+										PATH_REQ_OUTER(&ord->path),
+										(ord->path.param_info != NULL) ?
+										loops : 1.0);
+		if (skewscale < 1.0)
+			walked = Min(clamp_row_est(walked * skew), tuples);
+	}
 	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
@@ -1901,9 +1994,20 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		Cost		t;
 		Selectivity isel;
 
-		ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
-									   &ipages);
+		/*
+		 * The B-tree's correlation and pages; and in a correlated subquery
+		 * its own cost again, its pages spread over the calls as well as
+		 * over a nested loop's scans (§40.11).
+		 */
+		ord->indexinfo->amcostestimate(root, ord,
+									   (calls > 1.0) ?
+									   calls * (ord->path.param_info != NULL ?
+												loops : 1.0) : 1.0,
+									   &s, &t, &isel, &corr, &ipages);
+		if (calls > 1.0)
+			ordtotal = Min(t, ordtotal);
 	}
+	run = ordtotal;
 	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
 	if (loops > 1.0)
 	{
@@ -1977,6 +2081,15 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (workers != NULL)
 		cpu /= lion_parallel_divisor(*workers);
 	run += cpu;
+
+	/*
+	 * Priced at the rows a probed key meets, the walk is put back into core's
+	 * units by what its competitor costs at core's rows over what it costs at
+	 * those: the two compare as they would at the rows both meet, and the
+	 * loop around them stays in core's units.
+	 */
+	startup *= skewscale;
+	run *= skewscale;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -4154,6 +4267,8 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	LoKnn		knn;
 	IndexPath  *first;
 
+	/* core's price of a skewed key's scan, before lion's paths join it */
+	lion_skew_rel_note(root, rel);
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 

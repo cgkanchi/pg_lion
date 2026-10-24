@@ -211,6 +211,8 @@ typedef struct LionVacState
 	uint64	   *nvalues;		/* per key column, the VALUE entries left
 								 * holding a TID: the distinct keys of §33
 								 * (lion_vac_count()) */
+	uint64	   *sumsq;			/* ... and the sum of the squares of their
+								 * TIDs */
 	LionContainer *cbuf;			/* aligned container work buffer */
 	LionContainer *cbuf2;		/* and a second one, for the unchanged items
 								 * in front of the first INLINE item that
@@ -352,7 +354,10 @@ lion_vac_count(LionVacState *vs, const LionEntryTuple *entry, uint64 ntids)
 		vs->numtids += (double) ntids;
 	if (ntids > 0 && entry->attno >= 1 && entry->attno <= vs->ix->ncolumns &&
 		lion_entry_kind(entry) == LION_KIND_VALUE)
+	{
 		vs->nvalues[entry->attno - 1]++;
+		lion_sumsq_add(&vs->sumsq[entry->attno - 1], ntids);
+	}
 }
 
 /*
@@ -605,6 +610,7 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	vs.rowattno = lion_vac_row_column(vs.ix);
 	vs.numtids = 0;
 	vs.nvalues = (uint64 *) palloc0(sizeof(uint64) * vs.ix->ncolumns);
+	vs.sumsq = (uint64 *) palloc0(sizeof(uint64) * vs.ix->ncolumns);
 	vs.cbuf = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.cbuf2 = (LionContainer *) palloc(LION_CONTAINER_MAX_SIZE);
 	vs.nblocks = RelationGetNumberOfBlocks(index);
@@ -715,11 +721,12 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		bool		counted = lion_vac_may_count(index, vs.ix);
 
 		if (counted)
-			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues,
+			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, vs.sumsq,
 									 (uint64) vs.numtids);
 		lion_meta_count_bulkdelete(index, counted ? &nd : NULL);
 	}
 	pfree(vs.nvalues);
+	pfree(vs.sumsq);
 
 	MemoryContextDelete(vs.bucketcxt);
 	MemoryContextDelete(vs.pagecxt);
@@ -1103,6 +1110,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	LionMetaNdistinct nd;
 	LionRightWalk walk;
 	uint64	   *nvalues;
+	uint64	   *sumsq;
 	uint64		rows = 0;
 	BlockNumber budget;
 	BlockNumber nread;
@@ -1116,6 +1124,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 		return;
 
 	nvalues = (uint64 *) palloc0(sizeof(uint64) * ix->ncolumns);
+	sumsq = (uint64 *) palloc0(sizeof(uint64) * ix->ncolumns);
 	lion_rightwalk_init(&walk);
 
 	/* the internal pages of the descent to the leftmost leaf, then leaves */
@@ -1132,6 +1141,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 		if (++nread > budget)
 		{
 			pfree(nvalues);
+			pfree(sumsq);
 			return;
 		}
 
@@ -1159,7 +1169,11 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 				continue;
 			/* a key with no row at all, whose entry VACUUM has not deleted */
 			if (lion_entry_kind(entry) == LION_KIND_VALUE && lion_entry_ntids(entry) > 0)
+			{
 				nvalues[entry->attno - 1]++;
+				lion_sumsq_add(&sumsq[entry->attno - 1],
+							   lion_entry_ntids(entry));
+			}
 			if (entry->attno == rowcol && !LionEntryIsSummary(entry))
 				rows += lion_entry_ntids(entry);
 		}
@@ -1173,9 +1187,10 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 		lion_vacuum_delay_point();
 	}
 
-	lion_meta_fill_ndistinct(&nd, ix, nvalues, rows);
+	lion_meta_fill_ndistinct(&nd, ix, nvalues, sumsq, rows);
 	lion_meta_write_ndistinct(index, &nd);
 	pfree(nvalues);
+	pfree(sumsq);
 }
 
 /*

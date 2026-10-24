@@ -4395,6 +4395,29 @@ lion_count_ownscan_cost(LionCountPathBuild *cx)
 #define LION_COUNT_OWNSCAN_EDGE		1.02
 
 /*
+ * A WHERE clause that equates a skewed key to a value the plan does not know
+ * is priced at the rows a probed key meets where the relation's own scan of
+ * the key is priced at them too (lion_count_rel_set_clause()), and the
+ * count's price is put back into core's units by that scan's price at core's
+ * rows over its price at those (DESIGN.md §39, "A skewed key's probes"),
+ * whatever the competitor: the set was priced so whatever it is.
+ */
+static void
+lion_count_skew_units(LionCountPathBuild *cx, LionUnits *units)
+{
+	List	   *clauses = NIL;
+	ListCell   *lc;
+
+	if (cx->first == NULL || cx->whereclauses == NIL)
+		return;
+	foreach(lc, cx->whereclauses)
+		clauses = lappend(clauses, lion_vcol_unvar((Node *) lfirst(lc)));
+	units->skewscale = lion_skew_clauses_scale(cx->root, cx->first->rel,
+											   clauses);
+	list_free(clauses);
+}
+
+/*
  * The anti join over a small inner side (DESIGN.md §27) on the price of the
  * serial node cpath, whose own work `units` converted: its lookups, the
  * node's own work, converted as the count is; and its child, core's plan in
@@ -4466,6 +4489,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
 								 cx->whereinor))
 		units.margin = 1.0;
+
+	lion_count_skew_units(cx, &units);
 
 	/*
 	 * Filtered counts (DESIGN.md §10, "Filtered counts") are a count of the
@@ -5014,6 +5039,7 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
 								 cx->whereinor))
 		units.margin = 1.0;
+	lion_count_skew_units(cx, &units);
 	lion_cost_cells_path(root, cpath, cx->targets, cx->whereclauses,
 						 cx->wherekinds, cx->ors, cx->cellplan,
 						 cx->cellwhererows, cx->outrows, &perrange);
