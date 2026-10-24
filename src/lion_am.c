@@ -401,6 +401,21 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	/*
+	 * DESIGN.md §39, "A Memoize under a LIMIT": whether a lion path priced
+	 * against a nested loop over a Memoize takes the loop at the hits the
+	 * LIMIT's share of its calls meets, rather than core's hit ratio over
+	 * all of them.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_memoize_limit",
+							 "Prices a competing nested loop's Memoize at the cache hits the query's LIMIT lets it meet.",
+							 "Off, the loop is taken at the hit ratio the planner priced it at over all of its calls.",
+							 &lion_enable_memoize_limit,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
 	 * DESIGN.md §29.11, "Unions probed": whether the AND of posting sets may
 	 * look its running intersection up in the containers of an IN list's or
 	 * a multi-key query's union at a key, where that is cheaper than building
@@ -539,6 +554,13 @@ _PG_init(void)
 	 * and the set_rel_pathlist_hook that offers it, chained like the other.
 	 */
 	lion_ordered_init();
+
+	/*
+	 * The LionOrderedJoin CustomScan (DESIGN.md §47): its GUC, its scan
+	 * methods and the set_join_pathlist_hook that offers it, chained as the
+	 * semi and anti join paths' hook below chains it.
+	 */
+	lion_ordjoin_init();
 
 	/*
 	 * The LionBm25 CustomScan (DESIGN.md §17, "Ranking"): ORDER BY

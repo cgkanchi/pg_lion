@@ -262,4 +262,17 @@ extern int	lion_fkjoin_recognize_probe(PlannerInfo *root, RelOptInfo *joinrel,
 extern bool lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 								  Oid collation);
 
+/* ... and the unique btree that proves it, or NULL */
+extern IndexOptInfo *lion_column_unique_index(RelOptInfo *rel,
+											  AttrNumber attno, Oid opno,
+											  Oid collation);
+
+/*
+ * The clauses that join two base relations with nothing else: what their
+ * equivalence classes give for the pair, and a's joininfo clauses that need
+ * nothing but the two.  a is the one with the lower relid.
+ */
+extern List *lion_fkjoin_pair_clauses(PlannerInfo *root, RelOptInfo *a,
+									  RelOptInfo *b);
+
 #endif							/* LION_FKJOIN_H */

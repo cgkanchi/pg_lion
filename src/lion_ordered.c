@@ -292,6 +292,22 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
 #define LO_FLAG_BUILD		0x0010	/* the set built at once, never lazily */
 #define LO_FLAG_KNN			0x0020	/* the order is a lionvec index's (§44.6) */
 #define LO_FLAG_PROBE		0x0040	/* a nested loop's probe (§40.10) */
+#define LO_FLAG_SIDE		0x0080	/* a side of a LionOrderedJoin (§47) */
+#define LO_FLAG_KEYED		0x0100	/* ... its dimension, keyed by the join */
+
+/*
+ * A side of a LionOrderedJoin (DESIGN.md §47) is a LionOrdered path built
+ * for it and never added to its relation (lion_ordered_side_path()): its
+ * custom_private is a btree walk's three members and a fourth, the side's -
+ * an IntList (LO_SIDE_MAGIC, LO_SIDE_FACT or LO_SIDE_DIM), a float8 Const
+ * (the fact's: the share of its walk the join's LIMIT is expected to take;
+ * the dimension's: the descents the join is expected to make) and, for the
+ * dimension, the qual its unique btree is descended by, `pk = NULL`, the
+ * NULL the key each descent is handed (lion_ordered_probe_key()).
+ */
+#define LO_SIDE_MAGIC		0x4c4f534a	/* "LOSJ" */
+#define LO_SIDE_FACT		1
+#define LO_SIDE_DIM			2
 
 /*
  * The plan's custom_private as a C struct: lo_priv_decode() is its one
@@ -787,6 +803,15 @@ typedef struct LionOrderedState
 	 * set the loop's scans share; no scan of it counts what it has met.
 	 */
 	bool		probe;
+
+	/*
+	 * ... or a side of a LionOrderedJoin (DESIGN.md §47): a btree's walk that
+	 * may have no set, its rows those of the relation's other quals - and its
+	 * dimension, a probe whose one index qual is the key the join hands it
+	 * before each descent (lion_ordered_probe_key()).
+	 */
+	bool		side;
+	bool		keyed;
 
 	/*
 	 * ... or a lion column's walk (DESIGN.md §30.11): the column, where its
@@ -1601,7 +1626,8 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
  * 0.8 us a piece at the reference's 500 units a millisecond, the lower of
  * the two, where a tie should fall - and its TIDs past that are taken back
  * out.  A sparse leaf keeps its price.  The other walks keep §30.3's price:
- * their walk, not the build, is most of theirs.
+ * their walk, not the build, is most of theirs - but for a LionOrderedJoin's
+ * sides (§47.3), under a LIMIT that scales their walks and not their builds.
  */
 #define LO_BUILD_PIECE_TIDS		80
 
@@ -1741,6 +1767,14 @@ lo_lion_pages(Path *lion)
  * the set being built again at every call.  The heap's pages are a call's, as
  * core prices the subquery's own scans.
  *
+ * With `probebuild` the set's lookups are priced as its build reads them,
+ * lo_build_excess() taken off: a nested loop's probe's (§40.10), whose
+ * callers pass ord's param_info test, and a LionOrderedJoin's side's (§47.3),
+ * whose LIMIT scales the walk but not the build.  A correlated subquery's
+ * calls (more than one, as above) are priced so too: lo_cost() finds them
+ * itself, as it does for the rest of their price.  Otherwise §30.3's price of
+ * a walk, the lookups a bitmap scan's.
+ *
  * With `lion` NULL there is no set: each entry walked is only tested in the
  * visibility map, and the heap read for the share of pages not all-visible -
  * a LionProbeJoin's descent where the dimension's WHERE is empty (§46).
@@ -1749,13 +1783,17 @@ lo_lion_pages(Path *lion)
  * heap scan's cold reads are weighed against (DESIGN.md §39, "A bitmap heap
  * scan's cold reads"): the btree's, as its amcostestimate() counts them, the
  * set's build reads (lo_lion_pages()), and the heap pages its fetches read,
- * as priced below.
+ * as priced below.  With `fetches_p` not NULL, the heap fetches of the whole
+ * walk go there, each a page to read: every candidate in heap mode or where
+ * the recheck reads the tuple, otherwise the members on pages the visibility
+ * map does not call all-visible (a LionOrderedJoin's cold reads, §47.3).
  */
 static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
-		bool indexonly, double loops, double scans, int *workers,
-		Cost *startup_p, Cost *total_p, double *reads_p)
+		bool indexonly, double loops, double scans, bool probebuild,
+		int *workers, Cost *startup_p, Cost *total_p, double *reads_p,
+		double *fetches_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1812,8 +1850,11 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 						   0.0);
 	}
 
-	/* a nested loop's probe: its lookups as its set's build reads them */
-	if (lion != NULL && (ord->path.param_info != NULL || calls > 1.0))
+	/*
+	 * A probe's, a join's side's or a correlated subquery's call's: its
+	 * lookups as its set's build reads them.
+	 */
+	if (lion != NULL && (probebuild || calls > 1.0))
 		lioncost = Max(lioncost -
 					   lo_build_excess(root, lion, tuples, pages) *
 					   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
@@ -2016,6 +2057,9 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (reads_p != NULL)
 		*reads_p = ipages + lo_lion_pages(lion) +
 			Max(max_io + corr * corr * (pages_corr - max_io), 0.0);
+	if (fetches_p != NULL)
+		*fetches_p = (indexonly && !heaprecheck) ?
+			heapfetched * (1.0 - rel->allvisfrac) : heapfetched;
 	max_io *= spc_random;
 	if (loops > 1.0)
 	{
@@ -4004,7 +4048,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lion == lioncover && !indexonly)
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, 1.0, 1.0, NULL, &startup, &total, &reads);
+					indexonly, 1.0, 1.0, ord->path.param_info != NULL, NULL,
+					&startup, &total, &reads, NULL);
 			if (indexonly)
 				lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, &lion_ordered_path_methods,
@@ -4014,8 +4059,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
-						rows, indexonly, 1.0, 1.0, &workers, &startup, &total,
-						&reads))
+						rows, indexonly, 1.0, 1.0,
+						ord->path.param_info != NULL, &workers, &startup,
+						&total, &reads, NULL))
 			{
 				if (indexonly)
 					lo_cold_price_partial(&cold, reads, rows, &startup,
@@ -4081,7 +4127,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					rows, true, 1.0, 1.0, NULL, &startup, &total, &reads);
+					rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
+					NULL, &startup, &total, &reads, NULL);
 			lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, pathkeys != NIL ?
 						&lion_ordered_path_methods : &lion_btree_path_methods,
@@ -4091,8 +4138,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			/* ... and its walk divided among a parallel plan's participants */
 			if (lo_parallel_ok(rel, ipath) &&
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-						rows, true, 1.0, 1.0, &workers, &startup, &total,
-						&reads))
+						rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
+						&workers, &startup, &total, &reads, NULL))
 			{
 				lo_cold_price_partial(&cold, reads, rows, &startup, &total);
 				lo_add_path(rel, NULL, pathkeys != NIL ?
@@ -4146,8 +4193,9 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 							   &iocols))
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					ppi->ppi_rows, true, loops, scans, NULL, &startup, &total,
-					NULL);
+					ppi->ppi_rows, true, loops, scans,
+					ipath->path.param_info != NULL, NULL, &startup, &total,
+					NULL, NULL);
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
 						list_make3(ipath, lion, iocols), ppi->ppi_rows,
 						startup, total, rel->consider_parallel, 0);
@@ -4241,6 +4289,287 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 		lionvec_postfilter == LIONVEC_POSTFILTER_ERROR && !lo_knn_kept(rel) &&
 		!lion_old_snapshot_threshold_active())
 		lo_knn_error(root, rel, rte, &knn);
+}
+
+/* ---------------------------------------------------------------------
+ * The sides of a LionOrderedJoin (lion_ordjoin.c, DESIGN.md §47): the
+ * relation's tests, its ordered btrees and lion accesses, and the prices,
+ * as LionOrdered's own paths take them, for the join's planner.
+ * --------------------------------------------------------------------- */
+
+/*
+ * May rel be a side of the join: a base relation LionOrdered may scan
+ * (lo_rel_ok()), of the heap AM, and lion indexes read at all (§9)?
+ */
+bool
+lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	Relation	relation;
+	bool		supported;
+
+	if (rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
+		return false;
+	if (lion_old_snapshot_threshold_active())
+		return false;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (!lo_rel_ok(root, rel, rte))
+		return false;
+	relation = table_open(rte->relid, NoLock);
+	supported = lion_table_am_supported(relation);
+	table_close(relation, NoLock);
+	return supported;
+}
+
+/*
+ * rel's ordered btree paths, as LionOrdered takes them (§30.2, step 1):
+ * core's unparameterized IndexPaths with pathkeys, and those LionOrdered's
+ * own paths walk, which add_path() may have let go of in their favour.
+ */
+List *
+lion_ordered_orders(RelOptInfo *rel)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		IndexPath  *ipath = NULL;
+
+		if (p->param_info != NULL || p->pathkeys == NIL)
+			continue;
+		if (IsA(p, IndexPath))
+			ipath = (IndexPath *) p;
+		else if (IsA(p, CustomPath) &&
+				 ((CustomPath *) p)->methods == &lion_ordered_path_methods &&
+				 IsA(linitial(((CustomPath *) p)->custom_private), IndexPath))
+			ipath = (IndexPath *) linitial(((CustomPath *) p)->custom_private);
+		if (ipath == NULL || ipath->path.pathkeys == NIL ||
+			ipath->path.param_info != NULL ||
+			ipath->indexorderbys != NIL ||
+			ipath->indexinfo->relam != BTREE_AM_OID ||
+			ipath->indexinfo->hypothetical || !lo_indexpath_ok(ipath) ||
+			list_member_ptr(result, ipath))
+			continue;
+		result = lappend(result, ipath);
+	}
+	return result;
+}
+
+/* rel's lion accesses for all its restriction clauses (§30.2, step 2) */
+List *
+lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel)
+{
+	Oid			lionam = lion_get_am_oid();
+	List	   *lionidx = NIL;
+	ListCell   *lc;
+
+	if (!OidIsValid(lionam) || rel->baserestrictinfo == NIL)
+		return NIL;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx->relam == lionam && !idx->hypothetical)
+			lionidx = lappend(lionidx, idx);
+	}
+	if (lionidx == NIL)
+		return NIL;
+	return lo_lion_accesses(root, rel, lionidx, NIL, lionam);
+}
+
+/*
+ * The set of one lion access of a probed side - or none, lion NULL: the
+ * restriction clauses left for the side's filter, the set's price as a nested
+ * loop's probe builds it (lion_ordered_set_price(), and its spill), the share
+ * of rel's rows it holds, the price of a member's recheck when it leaves
+ * quals to it (lion_ordered_set_exact()), and the lion index pages its build
+ * reads (lo_lion_pages()).
+ */
+void
+lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+					  LionOrderedSet *out)
+{
+	List	   *lionrinfos = NIL;
+	List	   *lionqual = NIL;
+	bool		lossy = false;
+
+	memset(out, 0, sizeof(LionOrderedSet));
+	out->lion = lion;
+	out->candsel = 1.0;
+	if (lion != NULL)
+	{
+		double		members;
+		double		bytes;
+
+		lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
+		out->build = lion_ordered_set_price(root, rel, lion, &members, &bytes) +
+			lion_ordered_spill_price(bytes);
+		out->candsel = Min(members / Max(rel->tuples, 1.0), 1.0);
+		out->lionpages = lo_lion_pages(lion);
+		if (!lion_ordered_set_exact(root, lion))
+		{
+			QualCost	rq;
+
+			cost_qual_eval(&rq, lionqual, root);
+			out->recheck = rq.per_tuple;
+		}
+	}
+	out->residual = lo_residual(rel->baserestrictinfo, NIL, lionrinfos,
+								lionqual);
+}
+
+/*
+ * The price of the fact's walk of ord with one lion access, or none (lion
+ * NULL, every entry walked fetched and filtered): lo_cost() - the set's
+ * build, its lookups as a probe's build reads them (§47.3), the walk, the
+ * members' fetches, the filter and the target - in heap mode, or in
+ * index-only mode where the btree has every column the side needs and
+ * indexonly_ok (*iocols is then its mapping, NIL otherwise).  *fetches is the
+ * heap fetches of the whole walk (lo_cost()), *lionpages the lion index pages
+ * the set's build reads.
+ */
+void
+lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
+						Path *lion, double rows, bool indexonly_ok,
+						List **iocols, Cost *startup, Cost *total,
+						double *fetches, double *lionpages)
+{
+	List	   *lionrinfos = NIL;
+	bool		lossy = false;
+	List	   *lionqual;
+	List	   *residual;
+	bool		indexonly = false;
+
+	*iocols = NIL;
+	lionqual = (lion != NULL) ? lo_lion_qual(lion, &lionrinfos, &lossy) : NIL;
+	residual = lo_residual(rel->baserestrictinfo, lo_ord_rinfos(ord),
+						   lionrinfos, lionqual);
+	if (indexonly_ok && enable_indexonlyscan)
+		indexonly = lo_index_only(ord->indexinfo,
+								  lo_needed_attrs(rel, residual,
+												  ord->indexclauses,
+												  lionqual, lossy),
+								  iocols);
+	if (!indexonly)
+		*iocols = NIL;
+	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
+				   indexonly, 1.0, 1.0, true, NULL, startup, total, NULL,
+				   fetches);
+	*lionpages = lo_lion_pages(lion);
+}
+
+/*
+ * The pages a LionOrdered walk of a btree reads over `share` of it, as a
+ * competitor's (DESIGN.md §47.3, "Cold reads"): a core nested loop over the
+ * walk, which a LionOrderedJoin is weighed against.  lo_cost() is taken again
+ * for the path's btree and lion access as lo_set_rel_pathlist() took it: the
+ * heap pages of its fetches, `share` of the whole walk's
+ * (index_pages_fetched() over the table's pages), and the lion index pages
+ * its set's build reads (lo_lion_pages()) - the reads lo_cold_price() weighs,
+ * less the btree's, which the join's own walk reads as well and which are
+ * left out of both.  An index-only walk's price may already carry
+ * lo_cold_price()'s discount, its reads weighed cold against a bitmap heap
+ * scan's (lion_units_scan_cold()): where it does, *reads is 0, and those
+ * reads are not weighed a second time.  False for a path that is not a serial
+ * LionOrdered walk of a btree.
+ */
+bool
+lion_ordered_walk_reads(PlannerInfo *root, Path *path, double share,
+						double *reads)
+{
+	CustomPath *cp;
+	RelOptInfo *rel;
+	IndexPath  *ord;
+	Path	   *lion;
+	List	   *iocols;
+	List	   *lionrinfos = NIL;
+	bool		lossy = false;
+	List	   *lionqual;
+	List	   *residual;
+	bool		indexonly;
+	Cost		startup;
+	Cost		total;
+	double		walkreads;
+	double		fetches;
+
+	*reads = 0.0;
+	if (path == NULL || !IsA(path, CustomPath))
+		return false;
+	cp = (CustomPath *) path;
+	rel = cp->path.parent;
+	if (cp->methods != &lion_ordered_path_methods || cp->path.parallel_aware ||
+		rel == NULL || list_length(cp->custom_private) != 3 ||
+		!IsA(linitial(cp->custom_private), IndexPath))
+		return false;
+	ord = (IndexPath *) linitial(cp->custom_private);
+	lion = (Path *) lsecond(cp->custom_private);
+	iocols = (List *) lthird(cp->custom_private);
+	if (lo_knn_path(ord))
+		return false;
+	indexonly = (iocols != NIL);
+	lionqual = (lion != NULL) ? lo_lion_qual(lion, &lionrinfos, &lossy) : NIL;
+	residual = lo_residual(rel->baserestrictinfo, lo_ord_rinfos(ord),
+						   lionrinfos, lionqual);
+	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
+				   cp->path.rows, indexonly, 1.0, 1.0,
+				   ord->path.param_info != NULL, NULL, &startup, &total,
+				   &walkreads, &fetches);
+	if (indexonly)
+	{
+		LionUnits	cold;
+
+		lion_units_scan_cold(root, rel, &cold);
+		if (lion_units_bitmap_factor(&cold, total, walkreads) < 1.0)
+			return true;
+	}
+	*reads = index_pages_fetched(Max(share, 0.0) * fetches, rel->pages,
+								 Max((double) ord->indexinfo->pages, 1.0),
+								 root) +
+		lo_lion_pages(lion);
+	return true;
+}
+
+/*
+ * A side of the join as a LionOrdered path of rel, which is never offered to
+ * rel's path list: the fact's ordered walk (`weight` the share of it the
+ * join's LIMIT is expected to take), or the dimension's probe of its unique
+ * btree (`weight` the descents the join is expected to make, keyqual the
+ * `pk = NULL` it is descended by).  Serial, unparameterized; a probe in heap
+ * mode.
+ */
+CustomPath *
+lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord, Path *lion,
+					   List *iocols, bool dim, double weight, Expr *keyqual,
+					   double rows, Cost startup, Cost total)
+{
+	CustomPath *cp = makeNode(CustomPath);
+	List	   *info;
+
+	Assert(dim ? (keyqual != NULL && iocols == NIL) : keyqual == NULL);
+	info = list_make3(list_make2_int(LO_SIDE_MAGIC,
+									 dim ? LO_SIDE_DIM : LO_SIDE_FACT),
+					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
+								Float8GetDatum(weight), false,
+								FLOAT8PASSBYVAL),
+					  keyqual);
+	cp->path.pathtype = T_CustomScan;
+	cp->path.parent = rel;
+	cp->path.pathtarget = rel->reltarget;
+	cp->path.param_info = NULL;
+	cp->path.parallel_aware = false;
+	cp->path.parallel_safe = false;
+	cp->path.parallel_workers = 0;
+	cp->path.rows = rows;
+	cp->path.startup_cost = startup;
+	cp->path.total_cost = total;
+	cp->path.pathkeys = dim ? NIL : ord->path.pathkeys;
+	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
+	cp->custom_paths = NIL;
+	cp->custom_private = list_make4(ord, lion, iocols, info);
+	cp->methods = dim ? &lion_btree_path_methods : &lion_ordered_path_methods;
+	return cp;
 }
 
 /*
@@ -4395,6 +4724,36 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Oid			ordoid;
 	LoPriv		priv;
 	ListCell   *lc;
+	int			side = 0;
+	double		sideweight = 0.0;
+
+	if (list_length(best_path->custom_private) == 4)
+	{
+		/* a side of a LionOrderedJoin (§47): its walk, and its side */
+		List	   *info = (List *) lfourth(best_path->custom_private);
+		List	   *head = (List *) linitial(info);
+		Const	   *w = (Const *) lsecond(info);
+
+		if (list_length(info) != 3 || !IsA(head, IntList) ||
+			linitial_int(head) != LO_SIDE_MAGIC || !IsA(w, Const) ||
+			!IsA(linitial(best_path->custom_private), IndexPath))
+			elog(ERROR, "LionOrdered: unrecognized side of a join");
+		side = lsecond_int(head);
+		sideweight = DatumGetFloat8(w->constvalue);
+		flags |= LO_FLAG_SIDE;
+		if (side == LO_SIDE_DIM)
+		{
+			Expr	   *keyqual = (Expr *) lthird(info);
+
+			if (keyqual == NULL || !IsA(keyqual, OpExpr))
+				elog(ERROR, "LionOrdered: a join's dimension without its key");
+			flags |= LO_FLAG_PROBE | LO_FLAG_KEYED;
+			ordquals = list_make1(keyqual);
+			ordcols = list_make1_int(0);
+		}
+		else if (side != LO_SIDE_FACT)
+			elog(ERROR, "LionOrdered: unrecognized side %d of a join", side);
+	}
 
 	if (IsA(linitial(best_path->custom_private), IndexPath))
 	{
@@ -4501,7 +4860,25 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	 * walk that would be built for - a few outer rows probing a few keys of
 	 * the set - and built at once otherwise.
 	 */
-	if (best_path->path.param_info != NULL)
+	if (side == LO_SIDE_DIM)
+	{
+		/*
+		 * A join's dimension (§47): a probe, each descent meeting one entry,
+		 * whose set is lazy while the join's descents are fewer than the
+		 * entries a walk would be built for, as a nested loop's is.
+		 */
+		expected = 1.0;
+		if (sideweight >= LO_SWITCH_MIN_WALK)
+			flags |= LO_FLAG_BUILD;
+	}
+	else if (side == LO_SIDE_FACT)
+	{
+		/* a join's fact: the share of its walk the join's LIMIT takes */
+		if (sideweight >= LO_LAZY_MAX_SHARE &&
+			sideweight * expected >= LO_SWITCH_MIN_WALK)
+			flags |= LO_FLAG_BUILD;
+	}
+	else if (best_path->path.param_info != NULL)
 	{
 		double		loops;
 
@@ -6224,6 +6601,8 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->knn = (priv.flags & LO_FLAG_KNN) != 0;
 	st->knnlimit = priv.limit;
 	st->probe = (priv.flags & LO_FLAG_PROBE) != 0;
+	st->side = (priv.flags & LO_FLAG_SIDE) != 0;
+	st->keyed = (priv.flags & LO_FLAG_KEYED) != 0;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
@@ -6256,9 +6635,20 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	 * switches.
 	 */
 	if (st->probe &&
-		(st->parallel || st->lionwalk || st->knn || tree == NIL ||
-		 priv.nsort > 0))
+		(st->parallel || st->lionwalk || st->knn ||
+		 (tree == NIL && !st->side) || priv.nsort > 0))
 		elog(ERROR, "LionOrdered: malformed nested loop probe");
+
+	/*
+	 * A side of a LionOrderedJoin (DESIGN.md §47) is a serial btree's walk;
+	 * its dimension a probe in heap mode, keyed by the join.
+	 */
+	if ((st->side &&
+		 (st->parallel || st->lionwalk || st->knn)) ||
+		(st->keyed &&
+		 (!st->side || !st->probe || st->indexonly ||
+		  list_length(priv.ordcols) != 1)))
+		elog(ERROR, "LionOrdered: malformed side of a join");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -6280,7 +6670,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->nleaves = list_length(leafoids);
 	st->leaves = (LoLeaf *) palloc0(sizeof(LoLeaf) * Max(st->nleaves, 1));
 	st->noset = (tree == NIL);
-	if (st->noset && !st->lionwalk)
+	if (st->noset && !st->lionwalk && !st->side)
 		elog(ERROR, "LionOrdered: a btree's walk without a lion set");
 	if (!st->noset)
 	{
@@ -6370,6 +6760,17 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	ExecIndexBuildScanKeys(&node->ss.ps, st->ordidx, fixed, false,
 						   &st->okeys, &st->nokeys,
 						   &st->ortkeys, &st->nortkeys, NULL, NULL);
+
+	/*
+	 * A join's dimension (§47): its one key, `pk = NULL` as planned, takes
+	 * the key the join hands it before each descent.
+	 */
+	if (st->keyed &&
+		(st->nokeys != 1 || st->nortkeys != 0 ||
+		 (st->okeys[0].sk_flags & SK_ISNULL) == 0 ||
+		 st->okeys[0].sk_attno != 1 ||
+		 st->okeys[0].sk_strategy != BTEqualStrategyNumber))
+		elog(ERROR, "LionOrdered: malformed key of a join's dimension");
 	if (st->knn)
 	{
 		/*
@@ -7777,10 +8178,27 @@ lo_explain_parallel(LionOrderedState *st, StringInfo buf, ExplainState *es)
 							   (int64) t.earlystops, es);
 }
 
-static void
-lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+/* An EXPLAIN label, behind a join's prefix for its side (§47) */
+static const char *
+lo_label(const char *prefix, const char *label)
 {
-	LionOrderedState *st = (LionOrderedState *) node;
+	if (prefix == NULL || *prefix == '\0')
+		return label;
+	return psprintf("%s%s", prefix, label);
+}
+
+/*
+ * What the plan says: the walk, its quals, the set's - and, for a side of a
+ * LionOrderedJoin (DESIGN.md §47), its filter, which core would print for a
+ * node of its own, each label behind the join's prefix for it.  A join's
+ * dimension names its index on the join's own line, and its descent's key is
+ * the join's clause: neither is repeated.
+ */
+static void
+lo_explain_lines(LionOrderedState *st, List *ancestors, ExplainState *es,
+				 const char *prefix)
+{
+	CustomScanState *node = &st->css;
 	CustomScan *cscan = (CustomScan *) node->ss.ps.plan;
 	StringInfoData buf;
 	const char *name;
@@ -7808,8 +8226,11 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 						 ", " : "",
 						 st->indexonly ? "index only" : "");
 	/* a LionBtreeScan claims no order: the index it walks (§40.6) */
-	ExplainPropertyText(cscan->methods == &lo_btree_scan_methods ?
-						"Index" : "Ordered By", buf.data, es);
+	if (!st->keyed)
+		ExplainPropertyText(lo_label(prefix,
+									 cscan->methods == &lo_btree_scan_methods ?
+									 "Index" : "Ordered By"),
+							buf.data, es);
 
 	/*
 	 * The walk's index quals, key on the left, as core prints an Index Scan's
@@ -7818,17 +8239,21 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	 * query wrote it (DESIGN.md §40.10).  A lossy clause's original is the
 	 * Filter's, as there.
 	 */
-	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
-											LO_EXPR_ORDQUALS),
-					"Index Cond", ancestors, es);
+	if (!st->keyed)
+		lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
+												LO_EXPR_ORDQUALS),
+						lo_label(prefix, "Index Cond"), ancestors, es);
+	if (st->side)
+		lo_explain_qual(node, cscan->scan.plan.qual,
+						lo_label(prefix, "Filter"), ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_ORDERBYS),
-					"Order By", ancestors, es);
+					lo_label(prefix, "Order By"), ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs, LO_EXPR_LIONQUAL),
-					"Lion Cond", ancestors, es);
+					lo_label(prefix, "Lion Cond"), ancestors, es);
 	lo_explain_qual(node, (List *) list_nth(cscan->custom_exprs,
 											LO_EXPR_VALUEQUAL),
-					"Filter per Value", ancestors, es);
+					lo_label(prefix, "Filter per Value"), ancestors, es);
 
 	resetStringInfo(&buf);
 	for (i = 0; i < st->nleaves; i++)
@@ -7850,7 +8275,25 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	}
 	/* a lion column's walk without a set reads no other lion index */
 	if (buf.len > 0)
-		ExplainPropertyText("Lion Indexes", buf.data, es);
+		ExplainPropertyText(lo_label(prefix, "Lion Indexes"), buf.data, es);
+	pfree(buf.data);
+}
+
+/*
+ * What EXPLAIN ANALYZE counted, each label behind a join's prefix for its
+ * side (§47) - whose descents are its dimension's walks, and whose filter's
+ * rejections core would count for a node of its own.
+ */
+static void
+lo_explain_counters(LionOrderedState *st, ExplainState *es,
+					const char *prefix)
+{
+	CustomScanState *node = &st->css;
+	StringInfoData buf;
+
+	if (!es->analyze)
+		return;
+	initStringInfo(&buf);
 
 	/*
 	 * A serial node below a Gather that only workers ran - under
@@ -7859,15 +8302,19 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	 * parallel walk's do (§40.9): none are shown rather than this process's
 	 * zeros.  Its rows and loops are core's, summed over the workers.
 	 */
-	if (es->analyze && !st->parallel && !st->ran &&
+	if (!st->parallel && !st->ran &&
 		node->ss.ps.instrument != NULL && node->ss.ps.instrument->nloops > 0)
 		;
-	else if (es->analyze && st->parallel)
+	else if (st->parallel)
 		lo_explain_parallel(st, &buf, es);
-	else if (es->analyze)
+	else
 	{
-		ExplainPropertyInteger("Index Entries Walked", NULL,
-							   (int64) st->walked, es);
+		if (st->keyed)
+			ExplainPropertyInteger(lo_label(prefix, "Descents"), NULL,
+								   (int64) st->scans, es);
+		else
+			ExplainPropertyInteger(lo_label(prefix, "Index Entries Walked"),
+								   NULL, (int64) st->walked, es);
 		if (st->lionwalk)
 		{
 			int64		entries = 0;
@@ -7882,14 +8329,22 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 									   (int64) st->valueskips, es);
 		}
 		if (!st->noset)
-			ExplainPropertyInteger("Lion Set Hits", NULL, (int64) st->hits,
-								   es);
-		ExplainPropertyInteger("Heap Fetches", NULL, (int64) st->fetched, es);
+			ExplainPropertyInteger(lo_label(prefix, "Lion Set Hits"), NULL,
+								   (int64) st->hits, es);
+		ExplainPropertyInteger(lo_label(prefix, "Heap Fetches"), NULL,
+							   (int64) st->fetched, es);
 		/* a node that never made its set has no exactness to report */
 		if (st->removed > 0 ||
 			((st->builds > 0 || st->lazykeys > 0) && !st->exact))
-			ExplainPropertyInteger("Rows Removed by Lion Recheck", NULL,
-								   (int64) st->removed, es);
+			ExplainPropertyInteger(lo_label(prefix,
+											"Rows Removed by Lion Recheck"),
+								   NULL, (int64) st->removed, es);
+		if (st->side && node->ss.ps.plan->qual != NIL &&
+			node->ss.ps.instrument != NULL)
+			ExplainPropertyInteger(lo_label(prefix, "Rows Removed by Filter"),
+								   NULL,
+								   (int64) node->ss.ps.instrument->nfiltered1,
+								   es);
 		if (st->builds > 0)
 		{
 			resetStringInfo(&buf);
@@ -7921,7 +8376,7 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				if (*sep == ',')
 					appendStringInfoChar(&buf, ')');
 			}
-			ExplainPropertyText("Lion Set", buf.data, es);
+			ExplainPropertyText(lo_label(prefix, "Lion Set"), buf.data, es);
 		}
 		else if (st->lazykeys > 0)
 		{
@@ -7930,7 +8385,7 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			appendStringInfo(&buf, "lazy, %llu keys probed, %s",
 							 (unsigned long long) st->lazykeys,
 							 st->exact ? "exact" : "rechecked");
-			ExplainPropertyText("Lion Set", buf.data, es);
+			ExplainPropertyText(lo_label(prefix, "Lion Set"), buf.data, es);
 		}
 		if (st->switches > 0)
 		{
@@ -7939,25 +8394,78 @@ lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 							 (unsigned long long) st->switches,
 							 (unsigned long long) st->scans,
 							 (unsigned long long) st->sortfetched);
-			ExplainPropertyText("Switched to Fetch and Sort", buf.data, es);
+			ExplainPropertyText(lo_label(prefix, "Switched to Fetch and Sort"),
+								buf.data, es);
 		}
 		if (st->sorted)
 		{
 			/* the last switch's sort, as a Sort node shows its last run's */
-			ExplainPropertyText("Fetch and Sort Method",
+			ExplainPropertyText(lo_label(prefix, "Fetch and Sort Method"),
 								tuplesort_method_name(st->sortstats.sortMethod),
 								es);
-			ExplainPropertyInteger("Fetch and Sort Space Used", "kB",
-								   st->sortstats.spaceUsed, es);
-			ExplainPropertyText("Fetch and Sort Space Type",
+			ExplainPropertyInteger(lo_label(prefix, "Fetch and Sort Space Used"),
+								   "kB", st->sortstats.spaceUsed, es);
+			ExplainPropertyText(lo_label(prefix, "Fetch and Sort Space Type"),
 								tuplesort_space_type_name(st->sortstats.spaceType),
 								es);
 		}
 		if (st->earlystops > 0)
-			ExplainPropertyInteger("Scans Stopped Early", NULL,
-								   (int64) st->earlystops, es);
+			ExplainPropertyInteger(lo_label(prefix, "Scans Stopped Early"),
+								   NULL, (int64) st->earlystops, es);
 	}
 	pfree(buf.data);
+}
+
+static void
+lo_explain(CustomScanState *node, List *ancestors, ExplainState *es)
+{
+	LionOrderedState *st = (LionOrderedState *) node;
+
+	lo_explain_lines(st, ancestors, es, NULL);
+	lo_explain_counters(st, es, NULL);
+}
+
+/*
+ * A side of a LionOrderedJoin (DESIGN.md §47), which its join keeps out of
+ * the plan tree EXPLAIN walks and prints in its own lines: what the plan says
+ * of it, or what EXPLAIN ANALYZE counted, each label behind `prefix`.
+ * ancestors are the join's, the join in front.
+ */
+void
+lion_ordered_explain_side(PlanState *ps, List *ancestors, ExplainState *es,
+						  const char *prefix, bool counters)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &lo_exec_methods || !st->side)
+		elog(ERROR, "LionOrdered: not a side of a join");
+	if (counters)
+		lo_explain_counters(st, es, prefix);
+	else
+		lo_explain_lines(st, ancestors, es, prefix);
+}
+
+/*
+ * Hand a join's dimension (DESIGN.md §47) the key of its next descent, and
+ * restart its walk there: the next row it returns is the dimension's row of
+ * that key, if it has a visible one that is a member and passes its filter.
+ * key must stay valid until that row has been read: it is the scan key's
+ * argument.  The set is kept, as a nested loop's probe keeps it (§40.10),
+ * unless a Param of its lion quals has changed.
+ */
+void
+lion_ordered_probe_key(PlanState *ps, Datum key)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &lo_exec_methods || !st->keyed ||
+		st->nokeys != 1)
+		elog(ERROR, "LionOrdered: not a join's dimension");
+	st->okeys[0].sk_argument = key;
+	st->okeys[0].sk_flags &= ~SK_ISNULL;
+	ExecReScan(ps);
 }
 
 /* ---------------------------------------------------------------------
@@ -8265,7 +8773,8 @@ lion_ordered_probe_price(PlannerInfo *root, RelOptInfo *rel,
 	if (lion != NULL)
 		(void) lo_lion_qual(lion, &lionrinfos, &lossy);
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, NIL, 0.0,
-				   true, Max(loops, 1.0), 1.0, NULL, &startup, &total, NULL);
+				   true, Max(loops, 1.0), 1.0, ord->path.param_info != NULL,
+				   NULL, &startup, &total, NULL, NULL);
 	*perprobe = Max(total - startup, 0.0);
 	*probe = ord;
 	return true;

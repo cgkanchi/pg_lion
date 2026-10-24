@@ -16,6 +16,8 @@ bitmap. Many queries can then be answered by combining bitmaps instead of visiti
 - `count(*)` with equality, `IN`, range, `<>` and `IS NULL` filters, ANDed and ORed;
 - `GROUP BY`, `count(DISTINCT ...)`, top-k groups;
 - counts over a fact table joined to a filtered dimension;
+- the first rows in a B-tree's order (`ORDER BY ... LIMIT`) under lion filters, also across a join
+  to a filtered dimension by its key;
 - array membership (`tags @> ...`) and full-text search (`tsv @@ ...`), with phrase search and BM25
   ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
@@ -136,6 +138,11 @@ SELECT id, title FROM docs
 Lion walks the B-tree newest first and keeps only the entries whose rows are in the lion bitmap,
 stopping at the tenth (`Custom Scan (LionOrdered)` in `EXPLAIN`). The values come straight from the
 B-tree, so the heap is read only for pages that aren't all-visible.
+
+The walk also crosses a join to a dimension by its primary key: for `SELECT ... FROM fact f JOIN
+dim d ON f.dim_id = d.id WHERE <lion filters on both> ORDER BY f.score DESC LIMIT 20`, each fact
+row the walk keeps looks its key up in the dimension's primary key, and the entry is tested against
+the dimension's lion bitmap before the dimension row is read (`Custom Scan (LionOrderedJoin)`).
 
 ### Arrays and full-text search
 
