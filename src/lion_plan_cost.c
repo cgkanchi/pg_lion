@@ -1099,7 +1099,8 @@ typedef struct LionSetClause
 
 static void
 lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
-					 AttrNumber col, Node *clause, LionSetClause *sc)
+					 AttrNumber col, Node *clause, double skew,
+					 LionSetClause *sc)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	Node	   *bare = IsA(clause, RestrictInfo) ?
@@ -1117,7 +1118,6 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	memset(sc, 0, sizeof(*sc));
 	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
 							 NULL);
-	sc->sel = sel;
 
 	/*
 	 * A partial index's sets hold its predicate's rows alone (DESIGN.md §45):
@@ -1127,6 +1127,18 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	 */
 	itup = lion_index_rows(root, rel, idx);
 	psel = lion_index_clause_share(root, idx, lion_vcol_unvar(bare), sel);
+
+	/*
+	 * A key the plan does not know, priced at the rows a probed key meets
+	 * where the caller says so (DESIGN.md §33, "The rows of a probed key"):
+	 * the clause's share of the table's rows and of the index's alike.
+	 */
+	if (skew > 1.0)
+	{
+		sel = Min(sel * skew, 1.0);
+		psel = Min(psel * skew, 1.0);
+	}
+	sc->sel = sel;
 
 	/*
 	 * The page terms belong to ONE KEY COLUMN of this index (DESIGN.md §24):
@@ -1426,7 +1438,8 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 	for (i = 0; i < n; i++)
 	{
-		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], &sc[i]);
+		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], 1.0,
+							 &sc[i]);
 
 		lookup += sc[i].lookup;
 		out->leafpages += sc[i].lookuppages;
@@ -1583,7 +1596,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		return 0.0;
 	isnull = (NullTest *) copyObject(bare);
 	isnull->nulltesttype = IS_NULL;
-	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, &sc);
+	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, 1.0, &sc);
 
 	/* the lookup, whichever way it is answered */
 	cost = sc.randompages * random_page_cost + sc.descent;
@@ -3136,6 +3149,7 @@ typedef struct LionCountRelCost
 	Cost		seq_cost;		/* ... and their price, each at its index's
 								 * third rung (lion_index_page_cost()) */
 	Cost		lookup_cost;	/* an IN list's bucket pages, in order */
+	double		lookup_pages;	/* ... how many */
 	Cost		probe_cost;		/* what the SOUGHT sources read (§22) */
 	Cost		read_cpu;		/* containers read whole: unions, lists */
 	Cost		merge_cpu;		/* the AND's driver and probes (§10) */
@@ -3401,20 +3415,31 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 	Selectivity sel;
 	double		nkeys;
 	double		qkeys = 1.0;
+	double		skew;
 
 	/*
 	 * The clause's sets, priced as every AND of them is priced
 	 * (lion_cost_set_clause()): its lookups - a directory leaf and a
 	 * descent, or an IN list's leaves in key order and a search per value
 	 * - are charged here, and what a walk of them reads once the driver
-	 * is known, below.
+	 * is known, below.  A key the plan does not know - a Param, a
+	 * correlated subquery's outer row - is priced at the rows a probed key
+	 * meets on a skewed column (DESIGN.md §33, "The rows of a probed key"),
+	 * where the relation's own scan of it is priced at them too, and the
+	 * count's price put back into core's units by that scan's two prices
+	 * (lion_count_path_add(); §39, "A skewed key's probes").
 	 */
-	lion_cost_set_clause(c->root, c->rel, idx, col, clause, sc);
+	skew = lion_skew_clauses_factor(c->root, c->rel,
+									list_make1(lion_vcol_unvar(clause)));
+	if (skew > 1.0 && lion_skew_rel_scale(c->root, c->rel, NULL, 1.0) >= 1.0)
+		skew = 1.0;
+	lion_cost_set_clause(c->root, c->rel, idx, col, clause, skew, sc);
 	sel = sc->sel;
 	nkeys = sc->nkeys;
 	c->clauseindex[c->ci] = idx;
 	c->clausesel[c->ci++] = sel;
 	c->lookup_cost += sc->lookup;
+	c->lookup_pages += sc->lookuppages;
 	c->descent_cost += sc->descent;
 
 	/*
@@ -4941,6 +4966,47 @@ lion_count_rel_range_price(LionCountRelCost *c, LionRangeCost *rc)
 }
 
 /*
+ * The share of its index pages a count pays at a call of a correlated
+ * subquery (DESIGN.md §40.11), 1 elsewhere: a WHERE holding an outer query's
+ * Param is located again at every call (lion_rescan_custom_scan()), and the
+ * pages it reads - the directory leaves, the walked and the sought posting
+ * pages - are spread over the calls lion_outer_param_loops() assumes, as
+ * index_pages_fetched() spreads a parameterized scan's over its loops: as
+ * fetches at random from the indexes the WHERE reads.  The CPU of the
+ * lookups, the merges and the counts stays the call's, and so does the heap
+ * a recheck reads, which core prices a subquery's scans for one call.
+ */
+static double
+lion_count_rel_calls_share(LionCountRelCost *c)
+{
+	double		calls = lion_outer_param_loops(c->root,
+											   (Node *) c->whereclauses);
+	double		pages = c->random_pages + c->lookup_pages + c->seq_pages +
+		c->probed_pages;
+	double		idxpages = 0;
+	List	   *seen = NIL;
+	ListCell   *lc;
+
+	if (calls <= 1.0 || pages <= 0.0)
+		return 1.0;
+	foreach(lc, c->whereidx)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+
+		if (idx == NULL || list_member_ptr(seen, idx))
+			continue;
+		seen = lappend(seen, idx);
+		idxpages += Max((double) idx->pages, 1.0);
+	}
+	if (c->groupidx != NULL && !list_member_ptr(seen, c->groupidx))
+		idxpages += Max((double) c->groupidx->pages, 1.0);
+	list_free(seen);
+	idxpages = Max(idxpages, 1.0);
+	return Min(index_pages_fetched(pages * calls, (BlockNumber) idxpages,
+								   idxpages, c->root) / (pages * calls), 1.0);
+}
+
+/*
  * What a LionCount path costs over one relation, phase by phase: the WHERE
  * clauses' lookups and the sources of their AND, the merges that count them,
  * the pages they read, the entry scans and pairs of the GROUP BY, and the
@@ -4969,6 +5035,7 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	LionCountRelCost c;
 	bool		sumshort;		/* §15: the IN list is summed, not merged */
 	Cost		run;
+	double		share;
 	ListCell   *lc;
 
 	memset(&c, 0, sizeof(c));
@@ -5069,6 +5136,10 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	run += c.lookup_cost;
 	run += c.seq_cost;			/* c.seq_pages, each at its index's rung */
 	run += c.probe_cost;
+	share = lion_count_rel_calls_share(&c);
+	if (share < 1.0)
+		run -= (1.0 - share) * (c.random_pages * random_page_cost +
+								c.lookup_cost + c.seq_cost + c.probe_cost);
 	run += c.read_cpu + c.merge_cpu;	/* containers, members, probes (§10) */
 	run += c.merge_ops * cpu_operator_cost;
 	run += c.recheck_pages * lion_heap_page_cost(root, rel, c.recheck_pages,

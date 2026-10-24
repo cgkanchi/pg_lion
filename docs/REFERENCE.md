@@ -941,6 +941,17 @@ working around a bad choice:
   table. Each value is looked up once per planning, one descent of the index's directory, and an
   `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
   shows ANALYZE's list.
+- `pg_lion.enable_skew_estimate` (on by default): price Lion's probes of a key the plan does not
+  know (a nested loop's outer row, a correlated subquery's, a generic plan's parameter) at the rows
+  such a key really meets on a skewed column, and price the core scan they compete with at the same
+  rows (DESIGN.md §33, "The rows of a probed key", and §39, "A skewed key's probes"). The planner
+  prices such a probe at the column's rows per key. But the keys a query probes are drawn as rows
+  are, so on a column where a few keys have thousands of rows and most have a handful, a probe
+  meets many times that. The same pass that counts a Lion index's keys sums the squares of their
+  rows, and with ANALYZE's most common values that gives the rows of a probed key outside them.
+  Lion's price is then put back into the planner's units, so row estimates and every other plan
+  comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply. Off,
+  every probe is priced at the planner's rows per key.
 - `pg_lion.enable_memoize_limit` (on by default): price a nested loop that Lion's paths compete
   with at the cache hits its Memoize meets under the query's `LIMIT` (DESIGN.md §39, "A Memoize
   under a LIMIT"). The planner prices a Memoize at one hit ratio for every call of the loop's whole
