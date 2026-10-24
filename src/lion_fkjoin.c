@@ -223,8 +223,11 @@ lion_fkjoin_is_parent(PlannerInfo *root, RelOptInfo *rel)
  *
  * A multi-column unique index whose other columns the query pins to constants
  * would prove it too; v1 does not look for one.
+ *
+ * The index that proves it, or NULL: the first of rel->indexlist that does,
+ * which LionProbeJoin (DESIGN.md §46) and LionOrderedJoin (§47) descend.
  */
-static IndexOptInfo *
+IndexOptInfo *
 lion_column_unique_index(RelOptInfo *rel, AttrNumber attno, Oid opno,
 						 Oid collation)
 {
@@ -251,6 +254,7 @@ lion_column_unique_index(RelOptInfo *rel, AttrNumber attno, Oid opno,
 	return NULL;
 }
 
+/* Is it unique: does lion_column_unique_index() find an index that proves it? */
 bool
 lion_column_is_unique(RelOptInfo *rel, AttrNumber attno, Oid opno,
 					  Oid collation)
@@ -294,7 +298,7 @@ lion_fkjoin_member_ok(PlannerInfo *root, int relid)
  * comes first decides its operator between two types (`int48eq` or
  * `int84eq`).
  */
-static List *
+List *
 lion_fkjoin_pair_clauses(PlannerInfo *root, RelOptInfo *a, RelOptInfo *b)
 {
 	Relids		pair = bms_union(a->relids, b->relids);

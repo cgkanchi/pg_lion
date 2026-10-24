@@ -3950,6 +3950,8 @@ typedef struct LionUnits
 	Cost		nlcost;			/* the cheapest core path's cost */
 	Cost		nlcold;			/* a nested loop's cold reads, over that */
 	Cost		coldpage;		/* ... and a cold page's charge, for lion's */
+	double		memoscale;		/* a loop's price over its price with its
+								 * Memoize's hits under the LIMIT, or 1 */
 	Cost		bmcold;			/* its bitmap heap scans' cold reads, over
 								 * that, where the loop has none */
 	Cost		bmcoldpage;		/* ... and a cold page's charge, for lion's */
@@ -3980,6 +3982,11 @@ typedef enum LionCoreScan
 
 /* lion_plan_units.c */
 extern void lion_path_core_switches(Path *path, LionCoreScan scan);
+extern bool lion_path_disabled(const Path *p);
+extern Cost lion_units_cold_page(PlannerInfo *root, double idxpages,
+								 Oid reltablespace);
+extern Cost lion_memoize_limit_extra(PlannerInfo *root, Path *path,
+									 double share);
 extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
 extern double lion_competitor_rate(LionCompetitor kind);
@@ -4445,6 +4452,46 @@ extern const CustomPathMethods lion_probe_join_path_methods;
 extern void lion_try_probe_join(PlannerInfo *root, RelOptInfo *input_rel,
 								RelOptInfo *output_rel,
 								GroupPathExtraData *extra);
+
+/*
+ * lion_ordered.c: the sides of a LionOrderedJoin (lion_ordjoin.c, DESIGN.md
+ * §47) - each a LionOrdered walk the join keeps as a child of its own - and
+ * what the join's planner asks of LionOrdered's.
+ */
+typedef struct LionOrderedSet
+{
+	Path	   *lion;			/* the lion access, or NULL: no set */
+	List	   *residual;		/* RestrictInfos left to the side's filter */
+	Cost		build;			/* the set's price */
+	Selectivity candsel;		/* the share of the rows the set holds */
+	Cost		recheck;		/* a member's recheck, when it leaves quals */
+	double		lionpages;		/* the lion index pages its build reads */
+} LionOrderedSet;
+
+extern bool lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel);
+extern List *lion_ordered_orders(RelOptInfo *rel);
+extern List *lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel,
+								  Path *lion, LionOrderedSet *out);
+extern void lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel,
+									IndexPath *ord, Path *lion, double rows,
+									bool indexonly_ok, List **iocols,
+									Cost *startup, Cost *total,
+									double *fetches, double *lionpages);
+extern bool lion_ordered_walk_reads(PlannerInfo *root, Path *path,
+									double share, double *reads);
+extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
+										  Path *lion, List *iocols, bool dim,
+										  double weight, Expr *keyqual,
+										  double rows, Cost startup,
+										  Cost total);
+extern void lion_ordered_probe_key(PlanState *ps, Datum key);
+extern void lion_ordered_explain_side(PlanState *ps, List *ancestors,
+									  ExplainState *es, const char *prefix,
+									  bool counters);
+
+/* lion_ordjoin.c: LionOrderedJoin's paths (DESIGN.md §47) */
+extern const CustomPathMethods lion_ordjoin_path_methods;
 
 /* lion_plan_hooks.c */
 extern bool		lion_enable_count_pushdown;

@@ -825,6 +825,60 @@ working around a bad choice:
 
   Off, or with `pg_lion.enable_count_pushdown` off, such a join is left to PostgreSQL's join
   methods. `enable_hashjoin`, `enable_mergejoin` and `enable_nestloop` do not disable it.
+- `pg_lion.enable_ordered_join`: return the first rows of a join of a table to a dimension by
+  the dimension's key, in the order of a B-tree of the table, with `LionOrderedJoin` (DESIGN.md
+  §47) - `SELECT f.id, f.score, d.name FROM fact f JOIN dim d ON f.dim_id = d.id WHERE f.tags @>
+  '{a1}' AND d.region = 'north' ORDER BY f.score DESC LIMIT 20`. The node walks the B-tree in
+  order over a Lion set of the fact's `WHERE`, as `LionOrdered` does (above: its lazy set, early
+  stop and fetch-and-sort switch, `pg_lion.ordered_switch_ratio`); looks each row's key up in the
+  dimension's unique B-tree; tests the entry against a Lion set of the dimension's `WHERE` before
+  it reads the dimension's heap; and returns the two rows joined, in the walk's order. Either table
+  may lack a Lion clause - its rows are then fetched and filtered - as long as the other has one or
+  a key set filters. A table that only filters the join's key - `f.dim_id IN (SELECT ...)`,
+  `EXISTS (SELECT 1 FROM s WHERE s.id = d.id ...)`, or an inner join on a unique column of it with
+  none of its columns in the output - is read once, before the walk, into a hash set of its keys,
+  and each fact row's key is tested against it before the lookup; its key must be of the join
+  key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
+  spilled). It needs an inner join of two tables on one equality whose dimension side has a unique
+  one-column B-tree and no other clause between them; heap tables or materialized views, not
+  partitioned, without row-level security or `TABLESAMPLE`; a `SELECT` without `FOR UPDATE`/`FOR
+  SHARE`; and a B-tree of the fact that gives the `ORDER BY` at least its first column. It is
+  never parallel and never the inner side of a parameterized nested loop. The fact's walk is
+  index-only where its B-tree holds every column of the fact the query reads (`Ordered By: <index>
+  (index only)`); the dimension's row is read from its heap once its entry has passed the
+  dimension's set, never from an index. The planner prices the walk, a B-tree descent per key and
+  the dimension rows read, divided by `pg_lion.pushdown_margin`. Where PostgreSQL's cheapest plan
+  under the `LIMIT` is a nested loop in the walk's order (over the fact's B-tree or over
+  `LionOrdered`), that loop's Memoize is taken at the cache hits the `LIMIT` lets it meet
+  (`pg_lion.enable_memoize_limit`); and where the tables do not fit in `effective_cache_size`, the
+  pages each plan reads outside the cache are charged `pg_lion.cold_page_cost`, which takes the
+  node's price down by at most `pg_lion.cold_max_discount`. EXPLAIN prints `Ordered By`, `Index
+  Cond`, `Filter`, `Lion Cond` and `Lion Indexes` for the fact, `Dimension: <table> via <index>`
+  with `Dimension Filter`, `Dimension Lion Cond` and `Dimension Lion Indexes`, and
+  `Key Sets: <tables>`, each key set's table's plan below the node; `EXPLAIN ANALYZE` adds the
+  fact's `Index Entries Walked`, `Lion Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`,
+  `Rows Removed by Filter`, `Lion Set`, `Switched to Fetch and Sort` and `Scans Stopped Early`; `Key
+  Set Keys`, `Key Set Builds` and `Keys Rejected by Key Sets`; and the dimension's `Dimension
+  Descents`, `Dimension Lion Set Hits`, `Dimension Heap Fetches`, `Dimension Rows Removed by Lion
+  Recheck`, `Dimension Rows Removed by Filter` and `Dimension Lion Set`:
+
+      Limit
+        ->  Custom Scan (LionOrderedJoin)
+              Ordered By: fact_grp_score
+              Index Cond: (f.grp = 2)
+              Lion Cond: (f.tags @> '{a1}'::text[])
+              Lion Indexes: fact_tags
+              Dimension: dim d via dim_pkey
+              Dimension Filter: d.flag
+              Dimension Lion Cond: (d.lvl = 3)
+              Dimension Lion Indexes: dim_lvl
+              Key Sets: flt
+              ->  Seq Scan on flt
+                    Filter: (x < 3)
+
+  Off, such a join is left to PostgreSQL's join methods, with `LionOrdered` or a `LionBtreeScan`
+  probe on either side where they apply. `enable_hashjoin`, `enable_mergejoin` and
+  `enable_nestloop` do not disable it.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -898,6 +952,16 @@ working around a bad choice:
   Lion's price is then put back into the planner's units, so row estimates and every other plan
   comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply. Off,
   every probe is priced at the planner's rows per key.
+- `pg_lion.enable_memoize_limit` (on by default): price a nested loop that Lion's paths compete
+  with at the cache hits its Memoize meets under the query's `LIMIT` (DESIGN.md §39, "A Memoize
+  under a LIMIT"). The planner prices a Memoize at one hit ratio for every call of the loop's whole
+  walk. A `LIMIT` that stops the loop after a few thousand calls meets few repeated keys, and the
+  loop's price of those rows counts hits it does not get: 70% where it gets under 1% in DESIGN.md
+  §47.9's measurement. Lion's price is put into the loop's units by the loop's price over its
+  price with those hits taken out, so row estimates and every other plan comparison are unchanged.
+  It applies where the query has a `LIMIT` and no grouping, aggregate or window, the loop's order
+  gives the query at least its first sort key, and the `LIMIT` takes a share of the loop's rows.
+  Off, the loop is taken at the planner's price.
 
 PostgreSQL's own scan settings disable Lion's custom paths as they disable the index scans each
 stands for: the path is kept but marked disabled (`disabled_nodes` on PostgreSQL 18, `disable_cost`
@@ -906,13 +970,13 @@ before), so that it is chosen only where nothing enabled is left, and `EXPLAIN` 
 
 | PostgreSQL setting | the Lion paths it disables |
 |---|---|
-| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionProbeJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
-| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin`, `LionAntiJoin` and `LionProbeJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered` and `LionBtreeScan` (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
+| `enable_indexscan = off` | every one: `LionCount` (with its FK-side joins and grouped forms), `LionSemiJoin`, `LionAntiJoin`, `LionProbeJoin`, `LionOrdered` (a B-tree's, a Lion column's and a `lionvec` index's walks), `LionOrderedJoin`, `LionBtreeScan` and `LionBm25`, as it disables index-only scans with plain ones |
+| `enable_indexonlyscan = off` | the ones that answer from the index alone: `LionCount` and its forms, `LionSemiJoin`, `LionAntiJoin` and `LionProbeJoin`, which have no form that reads the rows to fall back to, as an index-only scan has its plain scan. It also takes away the index-only mode of `LionOrdered`, `LionBtreeScan` and `LionOrderedJoin`'s walk (above), and the plain walks stay enabled; a nested loop's `LionBtreeScan` probe, which is index-only or nothing, goes with it |
 | `enable_bitmapscan`, `enable_seqscan`, joins and sorts | none |
 
-`LionOrdered`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan does, and so answer to
-`enable_indexscan` alone. To have the planner prefer Lion's paths without disabling PostgreSQL's,
-set `pg_lion.pushdown_margin` above 1 (below).
+`LionOrdered`, `LionOrderedJoin`, `LionBtreeScan` and `LionBm25` read the rows, as an index scan
+does, and so answer to `enable_indexscan` alone. To have the planner prefer Lion's paths without
+disabling PostgreSQL's, set `pg_lion.pushdown_margin` above 1 (below).
 
 Testing knobs rather than tuning ones: `pg_lion.scan_window_floor` (4 MB), the least memory a plain
 scan's window of container keys takes (DESIGN.md §29.3), `pg_lion.parallel_range_keys` (16), the

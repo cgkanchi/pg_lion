@@ -1894,6 +1894,15 @@ extern PGDLLIMPORT bool lion_enable_lazy_set;
 extern void lion_ordered_init(void);
 
 /* ---------------------------------------------------------------------
+ * lion_ordjoin.c (DESIGN.md section 47): the LionOrderedJoin CustomScan
+ * --------------------------------------------------------------------- */
+
+extern PGDLLIMPORT bool lion_enable_ordered_join;
+
+/* GUC, scan methods and set_join_pathlist_hook; called from _PG_init. */
+extern void lion_ordjoin_init(void);
+
+/* ---------------------------------------------------------------------
  * lion_selfuncs.c (DESIGN.md §28, "The endpoint probe")
  * --------------------------------------------------------------------- */
 
@@ -1963,6 +1972,13 @@ extern PGDLLIMPORT bool lion_enable_intersection_probe;
  * the planner sizes its joins from (DESIGN.md §29.11, "The relation's rows").
  */
 extern PGDLLIMPORT bool lion_enable_rows_correction;
+
+/*
+ * Whether a nested loop competitor's Memoize is priced at the hits the
+ * LIMIT's share of its calls meets (DESIGN.md §39, "A Memoize under a
+ * LIMIT").
+ */
+extern PGDLLIMPORT bool lion_enable_memoize_limit;
 
 /*
  * Whether an AND of posting sets may look its running intersection up in the
