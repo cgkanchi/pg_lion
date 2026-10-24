@@ -143,6 +143,9 @@ The walk also crosses a join to a dimension by its primary key: for `SELECT ... 
 dim d ON f.dim_id = d.id WHERE <lion filters on both> ORDER BY f.score DESC LIMIT 20`, each fact
 row the walk keeps looks its key up in the dimension's primary key, and the entry is tested against
 the dimension's lion bitmap before the dimension row is read (`Custom Scan (LionOrderedJoin)`).
+When the `ORDER BY` leads with a lion-indexed column of the dimension that has a few values -
+`ORDER BY d.verified DESC, f.score DESC` - the join runs a value at a time, in that order, the
+dimension narrowed to the value's rows, until the page is full (`Custom Scan (LionOrderedSplit)`).
 
 ### Arrays and full-text search
 

@@ -4470,6 +4470,8 @@ typedef struct LionOrderedSet
 
 extern bool lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel);
 extern List *lion_ordered_orders(RelOptInfo *rel);
+extern List *lion_ordered_orders_for(PlannerInfo *root, RelOptInfo *rel,
+									 List *want);
 extern List *lion_ordered_accesses(PlannerInfo *root, RelOptInfo *rel);
 extern void lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel,
 								  Path *lion, LionOrderedSet *out);
@@ -4486,12 +4488,19 @@ extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  double rows, Cost startup,
 										  Cost total);
 extern void lion_ordered_probe_key(PlanState *ps, Datum key);
+extern IndexOptInfo *lion_ordered_column_order(PlannerInfo *root,
+											   RelOptInfo *rel, PathKey *want,
+											   int *indexcol, Var **var);
+extern void lion_ordered_narrow_begin(PlanState *ps);
+extern void lion_ordered_narrow_add(PlanState *ps, ItemPointer tid);
+extern uint64 lion_ordered_narrow_end(PlanState *ps);
 extern void lion_ordered_explain_side(PlanState *ps, List *ancestors,
 									  ExplainState *es, const char *prefix,
 									  bool counters);
 
-/* lion_ordjoin.c: LionOrderedJoin's paths (DESIGN.md §47) */
+/* lion_ordjoin.c: LionOrderedJoin's and LionOrderedSplit's paths (§47, §48) */
 extern const CustomPathMethods lion_ordjoin_path_methods;
+extern const CustomPathMethods lion_ordsplit_path_methods;
 
 /* lion_plan_hooks.c */
 extern bool		lion_enable_count_pushdown;

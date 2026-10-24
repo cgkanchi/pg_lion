@@ -1894,12 +1894,14 @@ extern PGDLLIMPORT bool lion_enable_lazy_set;
 extern void lion_ordered_init(void);
 
 /* ---------------------------------------------------------------------
- * lion_ordjoin.c (DESIGN.md section 47): the LionOrderedJoin CustomScan
+ * lion_ordjoin.c (DESIGN.md sections 47 and 48): the LionOrderedJoin and
+ * LionOrderedSplit CustomScans
  * --------------------------------------------------------------------- */
 
 extern PGDLLIMPORT bool lion_enable_ordered_join;
+extern PGDLLIMPORT int lion_ordered_split_max;
 
-/* GUC, scan methods and set_join_pathlist_hook; called from _PG_init. */
+/* GUCs, scan methods and set_join_pathlist_hook; called from _PG_init. */
 extern void lion_ordjoin_init(void);
 
 /* ---------------------------------------------------------------------
