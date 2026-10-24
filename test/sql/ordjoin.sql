@@ -438,12 +438,15 @@ RESET pg_lion.enable_ordered_join;
 --     The node's estimate of the join is its descents' found share, as
 --     core's is; under a key set, whose keys are the dimension's, that
 --     share is taken once.  oj_rows() gives the node's estimate, lion's
---     paths priced at a thousandth, against the rows of the count.
+--     paths priced at a thousandth, against the rows of the count: about
+--     them (0.7 to 1.4 times), about twice them (1.6 to 2.4, as every
+--     non-NULL key taken to name a row would make it), or the ratio.
 CREATE FUNCTION oj_rows(q text, actual text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	p jsonb;
 	n numeric;
+	r numeric;
 BEGIN
 	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
@@ -453,8 +456,11 @@ BEGIN
 		RETURN 'no LionOrderedJoin';
 	END IF;
 	EXECUTE actual INTO n;
-	RETURN format('LionOrderedJoin, %s times the rows',
-				  round((p->>'Plan Rows')::numeric / n, 1));
+	r := (p->>'Plan Rows')::numeric / n;
+	RETURN 'LionOrderedJoin, ' ||
+		CASE WHEN r BETWEEN 0.7 AND 1.4 THEN 'about the rows'
+			 WHEN r BETWEEN 1.6 AND 2.4 THEN 'about twice the rows'
+			 ELSE format('%s times the rows', round(r, 1)) END;
 END $$;
 CREATE TABLE orph (id int PRIMARY KEY, fk int NOT NULL, score int NOT NULL)
 	WITH (autovacuum_enabled = off);
