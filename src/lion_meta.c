@@ -82,11 +82,13 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 
 /*
  * The key counts of DESIGN.md §33 for ix's columns: the VALUE entries of each
- * scalar key column, and the rows under the first of them, as of now.
+ * scalar key column, the sum of the squares of their TIDs, and the rows under
+ * the first of them, as of now.
  */
 void
 lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
-						 const uint64 *nvalues, uint64 rows)
+						 const uint64 *nvalues, const uint64 *sumsq,
+						 uint64 rows)
 {
 	int			i;
 
@@ -98,6 +100,7 @@ lion_meta_fill_ndistinct(LionMetaNdistinct *nd, const LionIndexState *ix,
 			continue;
 		nd->valid_cols |= ((uint32) 1) << i;
 		nd->ndistinct[i] = nvalues[i];
+		nd->sumsq[i] = sumsq[i];
 	}
 	nd->rows = rows;
 }
