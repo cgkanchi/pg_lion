@@ -60,7 +60,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  * custom_plans are the fact's walk, the dimension's probe and each key set's
  * plan, in that order; custom_scan_tlist is the fact's target list followed by
  * the dimension's - the rows the join puts together in its scan slot - and
- * then each key set's key, which no row holds, for EXPLAIN to name its table.
+ * then each key set's key, for EXPLAIN to name its table, which each row fills
+ * with the fact's key: the target may read it (oj_keyset_of()).
  */
 #define OJ_PRIV_MAGIC		0x4c4f4a4e	/* "LOJN" */
 #define OJ_PRIV_INTS		0
@@ -184,6 +185,7 @@ typedef struct OjJoin
 	Expr	   *keyqual;		/* `pk = NULL`, the descent's qual */
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
 	List	   *keysets;		/* OjKeySet */
+	bool		alone;			/* alone under the LIMIT (oj_alone()) */
 } OjJoin;
 
 /*
@@ -382,6 +384,92 @@ oj_target_has(PathTarget *target, Var *var)
 }
 
 /*
+ * Do x's restriction clauses pin column c of its index ind to one value: a
+ * clause `col = <pseudo-constant>`, either way round, whose operator is an
+ * equality of the column's family in the index, under the index's collation
+ * for the column?  A plain column only.
+ */
+static bool
+oj_column_pinned(RelOptInfo *x, IndexOptInfo *ind, int c)
+{
+	ListCell   *lc;
+
+	if (ind->indexkeys[c] <= 0)
+		return false;
+	foreach(lc, x->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		OpExpr	   *op = (OpExpr *) rinfo->clause;
+		int			side;
+
+		if (rinfo->pseudoconstant || !IsA(op, OpExpr) ||
+			list_length(op->args) != 2 ||
+			get_op_opfamily_strategy(op->opno, ind->opfamily[c]) !=
+			BTEqualStrategyNumber ||
+			(OidIsValid(ind->indexcollations[c]) &&
+			 ind->indexcollations[c] != op->inputcollid))
+			continue;
+		for (side = 0; side < 2; side++)
+		{
+			Var		   *var = oj_plain_var((Node *) list_nth(op->args, side));
+
+			if (var != NULL && var->varno == (int) x->relid &&
+				var->varattno == ind->indexkeys[c] &&
+				is_pseudo_constant_clause((Node *) list_nth(op->args,
+															1 - side)))
+				return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Does no value of x's key repeat among the rows x's restriction clauses let
+ * through, so that an inner join to it repeats no row (DESIGN.md §47.6)?  A
+ * unique btree of the key alone proves it (lion_column_is_unique()), and so
+ * does one of more columns whose others those clauses pin to a constant
+ * each (oj_column_pinned()) - `(k, kind)` under `kind = 2` - with the key's
+ * equality in the key column's family and its collation the index's, as
+ * relation_has_unique_index_for() takes them; a partial one where the
+ * clauses imply its predicate (predOK).  The key set holds the keys of those
+ * rows alone, so the proof need be for them only.  A deferrable constraint's
+ * index is no proof, as core's is not.
+ */
+static bool
+oj_keyset_unique(RelOptInfo *x, Var *key, Oid opno, Oid collation)
+{
+	ListCell   *lc;
+
+	if (lion_column_is_unique(x, key->varattno, opno, collation))
+		return true;
+	foreach(lc, x->indexlist)
+	{
+		IndexOptInfo *ind = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		if (!ind->unique || !ind->immediate || ind->hypothetical ||
+			ind->relam != BTREE_AM_OID ||
+			(ind->indpred != NIL && !ind->predOK))
+			continue;
+		for (c = 0; c < ind->nkeycolumns; c++)
+		{
+			bool		iskey = (ind->indexkeys[c] == key->varattno &&
+								 get_op_opfamily_strategy(opno,
+														  ind->opfamily[c]) ==
+								 BTEqualStrategyNumber &&
+								 (!OidIsValid(collation) ||
+								  ind->indexcollations[c] == collation));
+
+			if (!iskey && !oj_column_pinned(x, ind, c))
+				break;
+		}
+		if (c == ind->nkeycolumns)
+			return true;
+	}
+	return false;
+}
+
+/*
  * May x, a table of joinrel, be folded into a key set of the join j
  * (DESIGN.md §47.6)?  Appends it to j->keysets when it may:
  *
@@ -389,14 +477,23 @@ oj_target_has(PathTarget *target, Var *var)
  *	  path is unparameterized and carries the key;
  *	- the whole inner side of a semi join - an EXISTS or an IN - whose outer
  *	  side is in the join; or in no special join at all, inner-joined, and
- *	  then its key unique under the clause (lion_column_is_unique()), so that
- *	  no fact row is repeated;
- *	- nothing of it wanted above the join (the join rel's target);
+ *	  then its key unique among the rows its quals let through
+ *	  (oj_keyset_unique()), so that no fact row is repeated;
  *	- exactly one clause joins it to the rest of the join, and that clause is
  *	  of the key's equivalence class: the key is the fact's key, f.fk = x.k,
  *	  whichever two columns of the class it was written between;
  *	- its key of the fact key's type, whose equality in the class is
  *	  hashable: the set is a hash table of that type's values;
+ *	- nothing of it wanted above the join (the join rel's target), but its
+ *	  key where nothing outside the key's equivalence class needs it.  Core
+ *	  makes every member of a class available wherever the class's tables
+ *	  are joined (generate_base_implied_equalities()), so a table
+ *	  inner-joined to the key above the join rel - a LATERAL subquery on the
+ *	  key that a strict WHERE clause made an inner join - puts x's key in the
+ *	  target though the query reads nothing of x.  The node fills the key's
+ *	  column with the fact's key, which equals it, and is the very value x's
+ *	  row holds where the key's equality is the identity of its values
+ *	  (lion_type_equalimage(), under the type's default equality);
  *	- the keys its path is expected to return fit work_mem: the set is held
  *	  in memory, and never spilled.
  */
@@ -438,13 +535,6 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 						bms_difference(joinrel->relids, x->relids))))
 		return false;
 
-	/* nothing of it wanted above */
-	foreach(lc, joinrel->reltarget->exprs)
-	{
-		if (bms_overlap(pull_varnos(root, (Node *) lfirst(lc)), x->relids))
-			return false;
-	}
-
 	/* one clause joins it to the rest, and it is the key's */
 	rest = bms_difference(joinrel->relids, x->relids);
 	clauses = generate_join_implied_equalities(root, joinrel->relids, rest, x,
@@ -472,7 +562,7 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	key = (l->varno == (int) x->relid) ? l : r;
 	if (key->varno != (int) x->relid ||
 		(semi == NULL &&
-		 !lion_column_is_unique(x, key->varattno, op->opno, op->inputcollid)))
+		 !oj_keyset_unique(x, key, op->opno, op->inputcollid)))
 		return false;
 
 	/* a hash table of the fact key's type */
@@ -493,6 +583,27 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	}
 	if (!OidIsValid(eqop))
 		return false;
+
+	/*
+	 * Nothing of it wanted above, but its key for the class's other members'
+	 * joins, which the node fills with the fact's: the same value where
+	 * equality is the identity of the type's values.
+	 */
+	foreach(lc, joinrel->reltarget->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!bms_overlap(pull_varnos(root, (Node *) v), x->relids))
+			continue;
+		if (!IsA(v, Var) || v->varno != key->varno ||
+			v->varattno != key->varattno || v->varlevelsup != 0 ||
+			key->varattno < x->min_attr || key->varattno > x->max_attr ||
+			!bms_is_subset(x->attr_needed[key->varattno - x->min_attr],
+						   j->keyec->ec_relids) ||
+			eqop != lookup_type_cache(type, TYPECACHE_EQ_OPR)->eq_opr ||
+			!lion_type_equalimage(type, j->keyec->ec_collation))
+			return false;
+	}
 
 	/* the cheapest path, with the key, and the set it makes in work_mem */
 	if (x->cheapest_total_path == NULL ||
@@ -552,6 +663,120 @@ oj_special_ok(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 }
 
 /*
+ * Is the join rel alone under its query level's LIMIT (DESIGN.md §47.10):
+ * does nothing above it drop a row the node returns?  The LIMIT's share of
+ * the node's rows is its share of the node's walk only where the rows the
+ * LIMIT counts are the node's, one to one.  Core prices a join or a filter
+ * above by the rows it is expected to let through, spread evenly over the
+ * rows below, and under a LIMIT takes the same share of everything beneath:
+ * a filter that lets few through - a small table inner-joined to the key, a
+ * selective clause on a LATERAL subquery's columns - would have the node
+ * walk until enough of those few had come, which may be the whole walk, and
+ * the price would be of a few hundred entries.  So, after
+ * reduce_outer_joins(), which makes a left join whose inner side a strict
+ * WHERE clause reads an inner join:
+ *
+ *	- every other table of the query level is on the inner side of a left
+ *	  join or an anti join that the join rel is not inside.  A left join
+ *	  returns each of the rows; an anti join drops those it matches, and is
+ *	  taken to match few - a NOT EXISTS of a list of exclusions - as the
+ *	  left joins and anti joins the node was made for do.  A table joined by
+ *	  an inner, semi or full join, or by none, is not;
+ *	- the join rel is on no special join's inner side but its own key sets'
+ *	  semi joins (oj_special_ok());
+ *	- every clause that reaches past the join rel is an outer join's own ON
+ *	  clause, or is evaluated within the inner side of such a left or anti
+ *	  join, where it filters only that side: a WHERE clause on an inner
+ *	  side's columns carries the outer join's relid, and is neither; and no
+ *	  equivalence class joins the join rel to another table;
+ *	- the query level asks nothing more of the rows: no HAVING, no
+ *	  set-returning function in its target, which may return no row for one,
+ *	  and no WITH TIES.
+ *
+ * Grouping, aggregates, DISTINCT and windows leave root->limit_tuples -1,
+ * and row marks are declined before (oj_set_join_pathlist()).  What the
+ * ORDER BY has past the node's order is a Sort's or an Incremental Sort's,
+ * which core prices from the node's own start-up, total and rows.
+ */
+static bool
+oj_alone(PlannerInfo *root, RelOptInfo *joinrel)
+{
+	Query	   *parse = root->parse;
+	Relids		rest = bms_difference(root->all_baserels, joinrel->relids);
+	Relids		nullable = NULL;
+	List	   *insides = NIL;
+	ListCell   *lc;
+	int			relid;
+
+	if (parse->limitOption == LIMIT_OPTION_WITH_TIES ||
+		root->hasHavingQual || parse->hasTargetSRFs)
+		return false;
+	if (bms_is_empty(rest))
+		return true;
+
+	/* each other table on the inner side of a left or anti join above */
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		rh = bms_union(sjinfo->min_righthand,
+								   sjinfo->syn_righthand);
+
+		if (bms_overlap(rh, joinrel->relids))
+		{
+			if (!bms_is_subset(rh, joinrel->relids))
+				return false;	/* the join rel on an inner side */
+			continue;			/* a key set's semi join */
+		}
+		if (sjinfo->jointype == JOIN_LEFT || sjinfo->jointype == JOIN_ANTI)
+		{
+			nullable = bms_add_members(nullable, sjinfo->syn_righthand);
+			insides = lappend(insides, sjinfo->syn_righthand);
+		}
+	}
+	if (!bms_is_subset(rest, nullable))
+		return false;
+
+	/* no clause past the join rel filters, but within an inner side */
+	relid = -1;
+	while ((relid = bms_next_member(root->all_baserels, relid)) >= 0)
+	{
+		RelOptInfo *rel = (relid < root->simple_rel_array_size) ?
+			root->simple_rel_array[relid] : NULL;
+
+		if (rel == NULL)
+			continue;
+		foreach(lc, rel->joininfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+			bool		inside = false;
+			ListCell   *lci;
+
+			if (!rinfo->is_pushed_down ||
+				bms_is_subset(rinfo->required_relids, joinrel->relids))
+				continue;		/* an outer join's ON clause, or the join's */
+			foreach(lci, insides)
+			{
+				if (bms_is_subset(rinfo->required_relids,
+								  (Relids) lfirst(lci)))
+					inside = true;
+			}
+			if (!inside)
+				return false;
+		}
+	}
+	foreach(lc, root->eq_classes)
+	{
+		EquivalenceClass *ec = (EquivalenceClass *) lfirst(lc);
+
+		if (!ec->ec_has_const &&
+			bms_overlap(ec->ec_relids, joinrel->relids) &&
+			bms_overlap(ec->ec_relids, rest))
+			return false;
+	}
+	return true;
+}
+
+/*
  * The core plan a LionOrderedJoin path competes with (DESIGN.md §47.3,
  * "Cold reads"), found before the first of its paths is added: add_path()
  * frees the paths a new one dominates.
@@ -572,11 +797,14 @@ typedef struct OjCompetitor
 								 * (lion_memoize_limit_extra()) */
 } OjCompetitor;
 
-/* The share of a path's rows the query's LIMIT takes: all without one */
+/*
+ * The share of a path's rows the query's LIMIT takes: all without one, and
+ * all where the join is not alone under it (oj_alone(), DESIGN.md §47.10).
+ */
 static double
-oj_limit_share(PlannerInfo *root, double rows)
+oj_limit_share(PlannerInfo *root, const OjJoin *j, double rows)
 {
-	if (root->limit_tuples <= 0 || rows <= 0)
+	if (!j->alone || root->limit_tuples <= 0 || rows <= 0)
 		return 1.0;
 	return Min(1.0, root->limit_tuples / rows);
 }
@@ -623,12 +851,15 @@ oj_loop_over_walk(Path *p, RelOptInfo *fact, Path **walk)
  * leave out of its price (lion_memoize_limit_extra()), and for its cold
  * reads, a walk over LionOrdered with that walk's own
  * (lion_ordered_walk_reads()).  A hash join and its Sort read the two sets'
- * heaps as bitmap scans, which §46 does not weigh either.
+ * heaps as bitmap scans, which §46 does not weigh either.  Where the join is
+ * not alone under the LIMIT (oj_alone()) the share is all of the rows, as it
+ * is for the node.
  */
 static void
-oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
+oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, const OjJoin *j,
 			  List *pathkeys, OjCompetitor *c)
 {
+	RelOptInfo *fact = j->fact;
 	Path	   *best = NULL;
 	Path	   *bestwalk = NULL;
 	bool		bestordered = false;
@@ -649,7 +880,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 		ordered = (p->pathkeys != NIL && pathkeys != NIL &&
 				   linitial(p->pathkeys) == linitial(pathkeys));
 		cost = ordered ?
-			p->startup_cost + oj_limit_share(root, p->rows) *
+			p->startup_cost + oj_limit_share(root, j, p->rows) *
 			(p->total_cost - p->startup_cost) :
 			p->total_cost;
 		if (best == NULL || cost < c->cost)
@@ -664,7 +895,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, RelOptInfo *fact,
 		lion_competitor_kind(best) != LION_COMPETITOR_NESTLOOP)
 		return;
 	c->nestloop = true;
-	share = oj_limit_share(root, best->rows);
+	share = oj_limit_share(root, j, best->rows);
 	c->memo = lion_memoize_limit_extra(root, best, share);
 	if (bestwalk != NULL)
 	{
@@ -733,8 +964,9 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * once, at the first key set or, with none, at the members and the rows.
  * *rows is what it returns: of the descents that find a dimension row, the
  * share of the dimension's rows that pass its quals (lion_probe_rel_rows()).
- * *share is the share of the walk the query's LIMIT is expected to take,
- * *probes the descents of the whole walk.  armshare is 1 for the join, and
+ * *share is the share of the walk the query's LIMIT is expected to take, all
+ * of it where the join is not alone under the LIMIT (oj_alone()), *probes
+ * the descents of the whole walk.  armshare is 1 for the join, and
  * for an arm of a LionOrderedSplit (§48) the share of the dimension's rows
  * its entry holds: the dimension's set narrowed to them holds that share of
  * its members and its rows, and every descent's TID is tested against it.
@@ -865,19 +1097,22 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 	/*
 	 * The share of the walk the LIMIT takes, which decides whether each
-	 * side's set is lazy or built at once (§30.4); it is not a stop.  The
-	 * LIMIT bounds the join's output only through what sits above it, and
-	 * a join above that filters lets the walk go on further.  But a lazy set
-	 * that goes on further builds itself once its probes have cost what the
-	 * build would, so going lazy wrongly costs about one more build, where a
-	 * set built at once for a walk that stops after a few hundred entries
-	 * costs the whole build.  The cheaper error is the lazy one, and the
-	 * share is applied with joins above the node too: the left joins and
-	 * NOT EXISTS the node sits below keep its rows about one to one with the
-	 * LIMIT's.  The plain LionOrdered keeps its own stricter rule (lo_limit(),
-	 * the node alone under the LIMIT) for its hard stop, which this is not.
+	 * side's set is lazy or built at once (§30.4), and over which the loop's
+	 * Memoize and the cold reads are weighed below; it is not a stop.  It is
+	 * taken where the join is alone under the LIMIT (oj_alone(), §47.10),
+	 * the left joins and anti joins above it keeping its rows about one to
+	 * one with the LIMIT's.  Under a join or a clause above that filters,
+	 * the walk may run to its end, and the share is all of it: the sets are
+	 * built at once where the walk is long, and the price is the whole
+	 * walk's, at start-up (oj_add_path()).  Where the share is still wrong
+	 * the lazy error is the cheaper one: a lazy set whose walk goes on
+	 * builds itself once its probes have cost what the build would, about
+	 * one build more, where a set built at once for a walk that stops after
+	 * a few hundred entries costs the whole build.  The plain LionOrdered's
+	 * hard stop has its own stricter rule (lo_limit(), the node the query
+	 * level's only table), which this is not.
 	 */
-	*share = oj_limit_share(root, out);
+	*share = oj_limit_share(root, j, out);
 
 	/* the loop's Memoize and the cold reads, over the LIMIT's share */
 	factor = 1.0;
@@ -1030,6 +1265,14 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
 			factfetches, factlionpages, comp, 1.0, &rows, &probes, &share,
 			&startup, &total);
+
+	/*
+	 * Not alone under the LIMIT (oj_alone(), DESIGN.md §47.10): the first
+	 * row may come at the walk's end, and the whole walk is its start-up,
+	 * which core's Limit, taking its share of the run alone, cannot discount.
+	 */
+	if (!j->alone)
+		startup = total;
 
 	/* the dimension's weight: the descents the LIMIT's share of the walk makes */
 	cp = oj_join_path(root, joinrel, j, ord, pathkeys, factlion, dimlion,
@@ -1280,7 +1523,10 @@ os_entry_cost(double tids, double members, double setbytes, double pages)
  * rows of a path: its start-up S, the first arm's; its rows R the sum of the
  * arms'; and its total S + (C(n) - S) x R / n, at which the Limit's price is
  * C(n).  Without a LIMIT, or one the arms never meet, the total is every
- * arm's.  *factweight is the shares of the fact's walk the arms take, summed,
+ * arm's.  Where the join is not alone under the LIMIT (oj_alone(), §47.10)
+ * nothing is shaped for it: a filter above may let the LIMIT's rows come
+ * from the last arm's end, and every arm's price is the total and the
+ * start-up.  *factweight is the shares of the fact's walk the arms take, summed,
  * which weigh the fact's lazy set (§47.4), and *dimweight the descents those
  * shares make, which weigh nothing at run time: under a split the
  * dimension's set is built at once (lion_ordered_narrow_begin()), as
@@ -1298,7 +1544,8 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	double		dimtuples = Max(j->dim->tuples, 1.0);
 	double		dimpages = (double) j->dim->pages;
 	double		setbytes = 0.0;
-	double		need = root->limit_tuples;
+	double		limit = j->alone ? root->limit_tuples : -1.0;
+	double		need = limit;
 	double		rows = 0.0;
 	double		spc_random;
 	double		spc_seq;
@@ -1362,14 +1609,18 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	}
 
 	*rows_p = clamp_row_est(rows);
-	*startup_p = startup;
-	if (root->limit_tuples > 0.0 && atlimit >= 0.0)
-		*total_p = startup + (atlimit - startup) * *rows_p /
-			root->limit_tuples;
-	else
-		*total_p = full;
 	*armstartup = startup;
 	*armtotal = startup + (full - startup) / (double) sp->arms.n;
+	if (limit > 0.0 && atlimit >= 0.0)
+		*total_p = startup + (atlimit - startup) * *rows_p / limit;
+	else
+		*total_p = full;
+	if (!j->alone)
+	{
+		startup = full;
+		*armstartup = *armtotal;
+	}
+	*startup_p = startup;
 }
 
 /*
@@ -1521,7 +1772,7 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		{
 			jk = list_copy_head(ord->path.pathkeys, ncommon);
 			pk = lcons(sp->pathkey, list_copy(jk));
-			oj_competitor(root, joinrel, j->fact, pk,
+			oj_competitor(root, joinrel, j, pk,
 						  &comps[foreach_current_index(lc)]);
 		}
 		joinkeys = lappend(joinkeys, jk);
@@ -1556,7 +1807,11 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
  * filters.  An ORDER BY that leads with a column of the dimension is the
  * split's (os_add_paths(), §48), whose arms narrow the dimension by the
  * column's entries, a set of their own; where a column of the fact is in the
- * same class, both are offered and add_path() keeps what it keeps.
+ * same class, both are offered and add_path() keeps what it keeps.  Each is
+ * priced for the LIMIT only where the join is alone under it (oj_alone(),
+ * §47.10), and as the whole walk elsewhere.  The join rel's target is plain
+ * columns of its tables: the fact's and the dimension's, and a key set's key
+ * where oj_keyset_of() let it be.
  */
 static void
 oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
@@ -1573,8 +1828,9 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	ListCell   *lck;
 
 	if (!bms_is_empty(joinrel->lateral_relids) ||
-		!oj_target_ok(joinrel, bms_union(j->fact->relids, j->dim->relids)))
+		!oj_target_ok(joinrel, joinrel->relids))
 		return;
+	j->alone = oj_alone(root, joinrel);
 	ords = lion_ordered_orders(j->fact);
 	split = os_split_of(root, j, &sp);
 	if (ords == NIL && !split)
@@ -1611,7 +1867,7 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		if (ncommon == 0)
 			pathkeys = NIL;
 		else
-			oj_competitor(root, joinrel, j->fact, pathkeys,
+			oj_competitor(root, joinrel, j, pathkeys,
 						  &comps[foreach_current_index(lc)]);
 		keys = lappend(keys, pathkeys);
 	}
@@ -1738,7 +1994,8 @@ oj_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
  * PlanCustomPath: the scan slot is the fact's row and then the dimension's,
  * as the sides' plans return them - each its relation's target, in that
  * target's order - and the join's target list is evaluated over it; then each
- * key set's key, for EXPLAIN.
+ * key set's key, for EXPLAIN, and for the target where it reads the key
+ * (oj_keyset_of()).
  */
 static Plan *
 oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
@@ -2052,7 +2309,8 @@ oj_keyset_build(OjKeySetState *ks, ExprContext *econtext)
  * in every key set and names a dimension row that is a member of its set,
  * visible and passes its filter.  The key is unique, so one descent finds
  * that row or none.  The scan slot's values are the two sides' slots', which
- * neither touches until the join asks it for its next row.
+ * neither touches until the join asks it for its next row, and the fact's key
+ * again for each key set's.
  */
 static TupleTableSlot *
 oj_exec(CustomScanState *node)
@@ -2125,12 +2383,15 @@ oj_exec(CustomScanState *node)
 			memcpy(scanslot->tts_isnull + st->nfact, dslot->tts_isnull,
 				   sizeof(bool) * st->ndim);
 		}
-		/* the key sets' keys, which no row holds */
+		/*
+		 * Each key set's key: the fact's, which it equals, and is where the
+		 * target reads it (oj_keyset_of())
+		 */
 		for (i = st->nfact + st->ndim;
 			 i < scanslot->tts_tupleDescriptor->natts; i++)
 		{
-			scanslot->tts_values[i] = (Datum) 0;
-			scanslot->tts_isnull[i] = true;
+			scanslot->tts_values[i] = key;
+			scanslot->tts_isnull[i] = false;
 		}
 		ExecStoreVirtualTuple(scanslot);
 
