@@ -747,7 +747,9 @@ static double lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath,
  * pages are counted at the rows a probe of a skewed key meets, `skew` times
  * core's (§39, "A skewed key's probes"; lion_competitor_skew()).  The loop
  * is the competitor's kind's: in an upper rel's plan, past a semi or anti
- * join over it (lion_competitor_below()).
+ * join over it (lion_competitor_below()).  A loop below a subquery scan is
+ * the subquery's, and its pages, its residency and a Memoize's keys are
+ * looked up in the subquery's planner info.
  */
 static void
 lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
@@ -773,6 +775,12 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
 		{
 			jp = (JoinPath *) path;
 			break;
+		}
+		if (IsA(path, SubqueryScanPath))
+		{
+			root = (path->parent != NULL) ? path->parent->subroot : NULL;
+			if (root == NULL)
+				return;
 		}
 	}
 	if (jp == NULL)

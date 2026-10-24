@@ -207,6 +207,22 @@ SELECT lion_cc_plan(:'memo');
 (1 row)
 
 RESET pg_lion.cold_page_cost;
+-- The same loop in a subquery the planner cannot pull up, under the
+-- count's grouping: its pages, its residency and the Memoize's keys are
+-- looked up in the subquery's planner info
+\set sub 'SELECT q.flag, q.kind, count(*) FROM (SELECT d.flag, f.kind FROM lion_cc_m f JOIN lion_cc_d d ON f.fk = d.pk WHERE d.seg = 1 OFFSET 0) q GROUP BY 1, 2'
+SELECT lion_cc_plan(:'sub');
+     lion_cc_plan      
+-----------------------
+ nested loop > memoize
+(1 row)
+
+SELECT lion_cc_same(:'sub');
+ lion_cc_same 
+--------------
+ same, 3 rows
+(1 row)
+
 -- The 300 rows from a scan of 200,000: the scan is most of both plans,
 -- and the node reads it through core's own path, at core's price.  Its
 -- price is weighed against the loop's less that scan, which neither side's
