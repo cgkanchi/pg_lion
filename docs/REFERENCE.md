@@ -888,10 +888,13 @@ working around a bad choice:
   `pg_lion.ordered_split_max` values (below), and prices the values in order, from the column's
   statistics, so that the `LIMIT` is met in the right one. At run time it runs every value it meets
   in the index, whatever the statistics say, and passes over a value none of whose rows pass the
-  dimension's Lion filter. What follows the fact's order in the `ORDER BY` is sorted by an
+  dimension's Lion filter. While a value runs, the set of its rows that pass that filter - all of
+  them without one - is held with the filter's own set within `work_mem` × `hash_mem_multiplier`,
+  and past it in a temporary file. What follows the fact's order in the `ORDER BY` is sorted by an
   Incremental Sort above it. EXPLAIN prints `Split By: <index> (<column>[, backward][, nulls
   first|last])` and `Arms Max`, and the `LionOrderedJoin` beneath it once; `EXPLAIN ANALYZE` adds
-  `Arms Run` and `Entries Skipped`:
+  `Arms Run` and `Entries Skipped`, and `Arm Sets Spilled: <values>, <N> kB` where a value's set
+  spilled - the values whose sets did, and the most of one in the file:
 
       Limit
         ->  Incremental Sort

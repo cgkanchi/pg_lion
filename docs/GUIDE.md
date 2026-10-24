@@ -529,16 +529,20 @@ SELECT f.id, f.score, d.id, d.name FROM fact f JOIN dim d ON f.dim_id = d.id
  ORDER BY d.verified DESC, f.score DESC NULLS LAST LIMIT 20;
 ```
 
-With a Lion index on `d.verified`, `Custom Scan (LionOrderedSplit)` runs the join a value of
-the column at a time, in the `ORDER BY`'s order (`Split By: dim_verified (verified, backward, nulls
+With a Lion index on `d.verified`, `Custom Scan (LionOrderedSplit)` runs the join a value of the
+column at a time, in the `ORDER BY`'s order (`Split By: dim_verified (verified, backward, nulls
 first)`): a `LionOrderedJoin` beneath it with the dimension narrowed to the rows of that value,
 which walks the fact's B-tree from the top until the page is full, and moves on to the next value
 only if it is not. A column can be split when it is a plain column with a Lion index, sorted in its
 type's own order and collation, and has at most `pg_lion.ordered_split_max` values (8) by its
-statistics; values added since `ANALYZE` are still returned in their place. `EXPLAIN ANALYZE`
-shows how many values were run (`Arms Run`) and how many were passed over because none of their
-rows pass the dimension's filter (`Entries Skipped`). An `ORDER BY` that goes on past the fact's
-B-tree is finished by an Incremental Sort above (DESIGN.md §48).
+statistics; values added since `ANALYZE` are still returned in their place. While a value runs, its
+rows - those that pass the dimension's Lion filter, where it has one - are held as a Lion set, which
+shares `work_mem` × `hash_mem_multiplier` with the filter's own set and goes to a temporary file
+past it, as a hash join's table would. `EXPLAIN ANALYZE` shows how many values were run (`Arms
+Run`), how many were passed over because none of their rows pass the dimension's filter (`Entries
+Skipped`), and how many of the values' sets spilled, with the most of one in the file (`Arm Sets
+Spilled: 2, 21 kB`). An `ORDER BY` that goes on past the fact's B-tree is finished by an Incremental
+Sort above (DESIGN.md §48).
 
 ## Nearest neighbours: lionvec
 

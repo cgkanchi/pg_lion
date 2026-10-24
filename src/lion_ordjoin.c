@@ -1159,7 +1159,10 @@ os_arms(PlannerInfo *root, Var *col, bool backward, int nulls, OsArms *arms)
 		goto done;
 	if (HeapTupleIsValid(vardata.statsTuple))
 	{
-		nullfrac = ((Form_pg_statistic) GETSTRUCT(vardata.statsTuple))->stanullfrac;
+		Form_pg_statistic stats = (Form_pg_statistic)
+			GETSTRUCT(vardata.statsTuple);
+
+		nullfrac = stats->stanullfrac;
 		hasmcv = get_attstatsslot(&sslot, vardata.statsTuple,
 								  STATISTIC_KIND_MCV, InvalidOid,
 								  ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS);
@@ -1220,13 +1223,19 @@ done:
 /*
  * One entry of the column's walk (DESIGN.md §30.11, "Cost"): the entry, each
  * of its TIDs handed out and gathered into the arm's set, and the pages its
- * TIDs take, two bytes a row.
+ * TIDs take, two bytes a row; and the arm's set of `members`, held with the
+ * dimension's set of `setbytes` within hash_mem and past it spilled
+ * (lion_ordered_spill_price()), over a dimension of `pages` pages.
  */
 static Cost
-os_entry_cost(double tids)
+os_entry_cost(double tids, double members, double setbytes, double pages)
 {
+	double		armbytes = lion_ordered_set_bytes(members, pages);
+
 	return LION_RANGE_UNION_ENTRY_COST + tids * 2.0 * cpu_operator_cost +
-		ceil(tids * 2.0 / BLCKSZ) * seq_page_cost;
+		ceil(tids * 2.0 / BLCKSZ) * seq_page_cost +
+		lion_ordered_spill_price(setbytes + armbytes) -
+		lion_ordered_spill_price(setbytes);
 }
 
 /*
@@ -1237,8 +1246,9 @@ os_entry_cost(double tids)
  * LIMIT's rows are met.  The first arm's start-up is paid once - the sets'
  * builds, the key sets', the column walk's descent - and each later arm's
  * walk restarts with a descent of the fact's btree; each arm reads its entry
- * first.  So, with out_i the rows of arm i and run_i its price past its
- * start-up, the price of the LIMIT's n rows is
+ * first, and holds its narrowed set with the dimension's within hash_mem,
+ * the bytes past it spilled.  So, with out_i the rows of arm i and run_i its
+ * price past its start-up, the price of the LIMIT's n rows is
  *
  *	C(n) = S + sum of run_i over the arms before the m-th, the first whose
  *		   rows reach n, + run_m x (n - rows before it) / out_m
@@ -1249,9 +1259,11 @@ os_entry_cost(double tids)
  * arms'; and its total S + (C(n) - S) x R / n, at which the Limit's price is
  * C(n).  Without a LIMIT, or one the arms never meet, the total is every
  * arm's.  *factweight is the shares of the fact's walk the arms take, summed,
- * and *dimweight their descents and their entries' TIDs, each tested against
- * the dimension's set as a descent's is, for the sides' lazy sets (§47.4);
- * *armstartup and *armtotal an arm's, for its LionOrderedJoin's plan.
+ * which weigh the fact's lazy set (§47.4), and *dimweight the descents those
+ * shares make, which weigh nothing at run time: under a split the
+ * dimension's set is built at once (lion_ordered_narrow_begin()), as
+ * oj_cost() prices it; *armstartup and *armtotal an arm's, for its
+ * LionOrderedJoin's plan.
  */
 static void
 os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
@@ -1262,6 +1274,8 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		Cost *total_p, Cost *armstartup, Cost *armtotal)
 {
 	double		dimtuples = Max(j->dim->tuples, 1.0);
+	double		dimpages = (double) j->dim->pages;
+	double		setbytes = 0.0;
 	double		need = root->limit_tuples;
 	double		rows = 0.0;
 	double		spc_random;
@@ -1277,6 +1291,8 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 							  &spc_seq);
 	restart = (Max(ord->indexinfo->tree_height, 0) + 1) * 50.0 *
 		cpu_operator_cost + spc_random;
+	if (ds->lion != NULL)
+		setbytes = lion_ordered_set_bytes(dimtuples * ds->candsel, dimpages);
 	*factweight = 0.0;
 	*dimweight = 0.0;
 	for (i = 0; i < sp->arms.n; i++)
@@ -1294,7 +1310,11 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 				factfetches, factlionpages, comp, sp->arms.share[i], &out,
 				&probes, &share, &st, &tot);
 		run = tot - st;
-		entry = os_entry_cost(dimtuples * sp->arms.freq[i]);
+		entry = os_entry_cost(dimtuples * sp->arms.freq[i],
+							  ds->lion != NULL ?
+							  dimtuples * ds->candsel * sp->arms.share[i] :
+							  dimtuples * sp->arms.freq[i],
+							  setbytes, dimpages);
 		if (i == 0)
 		{
 			/* the column's walk descends to its first entry (§30.11) */
@@ -1316,7 +1336,7 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		else if (need > 0.0)
 			need -= out;
 		*factweight += frac;
-		*dimweight += probes * frac + dimtuples * sp->arms.freq[i];
+		*dimweight += probes * frac;
 	}
 
 	*rows_p = clamp_row_est(rows);
@@ -2501,8 +2521,10 @@ os_end(CustomScanState *node)
  * EXPLAIN (DESIGN.md §48.5): the column walked, by its index, as LionOrdered
  * prints a lion column's walk - its direction and where its NULL entry goes
  * - and the most arms the planner would split into; under ANALYZE the arms
- * run and the entries passed over.  The arms' LionOrderedJoin is printed
- * beneath, once, its counters summed over the arms and its loops theirs.
+ * run, the entries passed over, and - where any did - the arms whose
+ * narrowed set spilled, with the most of one in the arena.  The arms'
+ * LionOrderedJoin is printed beneath, once, its counters summed over the
+ * arms and its loops theirs.
  */
 static void
 os_explain(CustomScanState *node, List *ancestors, ExplainState *es)
@@ -2523,9 +2545,22 @@ os_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 	ExplainPropertyInteger("Arms Max", NULL, (int64) st->cap, es);
 	if (es->analyze)
 	{
+		uint64		spills = 0;
+		Size		spillbytes = 0;
+
 		ExplainPropertyInteger("Arms Run", NULL, (int64) st->arms, es);
 		ExplainPropertyInteger("Entries Skipped", NULL, (int64) st->skipped,
 							   es);
+		if (st->probe != NULL)
+			lion_ordered_narrow_spill(st->probe, &spills, &spillbytes);
+		if (spills > 0)
+		{
+			resetStringInfo(&buf);
+			appendStringInfo(&buf, "%llu, %zu kB",
+							 (unsigned long long) spills,
+							 (spillbytes + 1023) / 1024);
+			ExplainPropertyText("Arm Sets Spilled", buf.data, es);
+		}
 	}
 	pfree(buf.data);
 }
