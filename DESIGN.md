@@ -23605,6 +23605,9 @@ LionProbeJoin, which take every join below the aggregate):
   under a Material or a projection) probes it once a miss, at the hit ratio
   `cost_memoize_rescan()` priced it at (`lion_memoize_misses()`, as the bitmap heap scans' reads
   count it): a leaf and the heap pages of a probe's rows for each miss.
+- **in a subquery's plan** (`lion_nestloop_cold()`, `lion_competitor_skew()`): a loop below a
+  subquery scan is the subquery's, and its pages, the residency over its tables and a Memoize's
+  keys are looked up in the subquery's planner info, whose range table its Vars refer to.
 - **the loop less its outer side** (`lion_units_cold()`, `LionUnits.nlshared`): where the lion path
   reads the loop's outer side as its child, at core's price beside its own price - LionProbeJoin's
   fact, the same rels as the loop's outer side (`pj_units()`, lion_probejoin.c) - its own price is
@@ -23616,7 +23619,9 @@ LionProbeJoin, which take every join below the aggregate):
 - **each LionProbeJoin path its own reads** (`pj_units()`): a participant of the parallel form
   probes its share of the fact's rows and makes every build, so the partial path's factor is of
   its loops' reads over its price with the builds whole. The serial node's factor would weigh the
-  cold reads of every participant's probes against the builds of one.
+  cold reads of every participant's probes against the builds of one. Its probes are priced at its
+  own loops too (`lion_ordered_probe_price()`), as core prices a parallel loop's inner scan: fewer
+  probes revisit fewer pages, each a little dearer.
 
 Against a hash anti join over the loop, the loop's rate with its cold reads prices a lion path at
 no less than the hash join's rate would: that rate, 0.5, is the cold factor's floor at the default
@@ -23625,20 +23630,20 @@ the dimension's cold reads count wherever an anti join of either method sits ove
 
 **Measured** (2026-10-24; PostgreSQL 18, the dev cluster - a VM of four cores shared with other
 work; EXPLAIN (ANALYZE, TIMING OFF); warm, `shared_buffers` 2 GB, the median of seven runs; cold,
-the server restarted and the relations' files dropped from the OS cache before each run, the
-median of three). A 1,000,000-row dimension (a 503 MB heap, a 21 MB primary key, lion indexes on
-twelve columns) and the 42,858 fact rows of one `grp` of 3,000,000, under §46's shape with a CASE
-of nine predicates - ranges among them, which the node takes as cells with #178 - and a NOT EXISTS
-over 60,000 rows, at an `effective_cache_size` of about a quarter of the query's tables and a
+the server restarted and the relations' files dropped from the OS cache before each run, the median
+of three). A 1,000,000-row dimension (a 503 MB heap, a 21 MB primary key, lion indexes on twelve
+columns) and the 42,858 fact rows of one `grp` of 3,000,000, under §46's shape with a CASE of nine
+predicates - ranges among them, which the node takes as cells with #178 - and a NOT EXISTS over
+60,000 rows, at an `effective_cache_size` of about a quarter of the query's tables and a
 `random_page_cost` of 1.1, in parallel: core's plan is a `Hash Anti Join` over the `Nested Loop`
 into the dimension, cost 57,893. Against the loop, whose cold reads are 796,568 over its own 35,613
 (57,893 less the fact's parallel bitmap heap scan, 22,280) - the serial node's 1,156,102 over its
-86,138 (factor 0.62), the parallel form's 410,937 over 49,590 (0.40, at the cap of 0.5) - the node
-is 53,934, the plan, as it is at the hash join's rate. With the loop's whole cost the parallel
-form's factor would be 0.63, and with the serial node's factor 0.62: core's plan either way. The
-node runs it in 895 ms cold against core's 1,666 (404 against 1,274 with the dimension's heap
-alone dropped), and in 295 warm against 184. The thirteen other settings and forms the query was
-measured at keep their plans, and their prices but one: serially, with the cache holding the
+86,138 (factor 0.62), the parallel form's 410,937 over 49,590 (0.40 before the cap, 0.5 applied) -
+the node is 53,934, the plan, as it is at the hash join's rate. With the loop's whole cost the
+parallel form's factor would be 0.63, and with the serial node's factor 0.62: core's plan either
+way. The node runs it in 895 ms cold against core's 1,666 (404 against 1,274 with the dimension's
+heap alone dropped), and in 295 warm against 184. The thirteen other settings and forms the query
+was measured at keep their plans, and their prices but one: serially, with the cache holding the
 tables at `random_page_cost` 1.1, core's plan is a hash anti join over the loop with a Memoize,
 86,032, and the node 77,053 at the loop's rate (51,805 at the hash join's), still the plan.
 
@@ -29027,8 +29032,9 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   itself - core gives a CustomScan that is not parallel-aware no shared memory, so §40.9's shared
   set has no place to live - and reads the anti join's inner side whole, through its cheapest
   parallel-safe path (never the Gather the serial node may read). The price divides the rows
-  (`lion_parallel_divisor()`), not the builds, and the cold discount is the partial path's own
-  (above). A sorted GROUP BY stays serial. EXPLAIN ANALYZE's counters are the leader's.
+  (`lion_parallel_divisor()`), not the builds; a participant's probes are priced at its own
+  loops, its share of the fact's rows, and the cold discount is the partial path's own (above). A
+  sorted GROUP BY stays serial. EXPLAIN ANALYZE's counters are the leader's.
 - **Params and rescans** (`pj_rescan()`). The sets' leaves' quals are `custom_exprs`, their keys a
   CaseTestExpr that `lo_fix_qual()` replaces with the index column, so `setrefs.c` fixes their
   Params; a generic plan's `$1` or a correlated subquery's outer reference in the WHERE is a run-time
@@ -29120,8 +29126,8 @@ column with no unique index; no set to build; the switch off. EXPLAIN is printed
 counters where a run leaves them the same and as `> 0` where an earlier run's killed index entries
 change them. test/sql/competitor_cold.sql prices the node against core's loop on a dimension ten
 times `effective_cache_size` and one the cache holds: below a hash anti join and a nested loop
-anti join, through a Memoize, under a scan of a large fact, and in parallel (§39, "The join that
-reads the dimension").
+anti join, through a Memoize (and in a subquery the planner cannot pull up), under a scan of a
+large fact, and in parallel (§39, "The join that reads the dimension").
 
 **Measured** (2026-10-23; PostgreSQL 16, the dev cluster - a VM of four cores shared with other
 work, `shared_buffers` 128 MB, the tables in the OS cache: warm; EXPLAIN (ANALYZE, TIMING OFF),

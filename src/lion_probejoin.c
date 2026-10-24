@@ -922,6 +922,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	int			d;
 	int			p;
 	Cost		perprobe;
+	Cost		pperprobe;
 	Cost		setbuild = 0;
 	Cost		antibuild = 0;
 	double		setbytes = 0;
@@ -931,6 +932,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	double		loops;
 	double		rows;
 	IndexPath  *probepath;
+	IndexPath  *pprobepath;
 	LionUnits	base;
 	LionUnits	units;
 	LionUnits	punits;
@@ -1192,15 +1194,26 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	serial = pj_make_path(root, &pp, child, ps->antipath, bundle, &units, setbuild,
 						  antibuild, perprobe, permember, memberfrac, rows,
 						  false);
-	if (pchild != NULL)
+
+	/*
+	 * A participant's probes are priced at its own loops, its share of the
+	 * fact's rows, as core prices a parallel loop's inner scan: fewer probes
+	 * meet fewer of the pages one before them read, and each is a little
+	 * dearer than the serial node's.
+	 */
+	if (pchild != NULL &&
+		lion_ordered_probe_price(root, dim, ps->pkidx, fact->relids,
+								 pp.where, pp.wherequal,
+								 clamp_row_est(pchild->rows), &pperprobe,
+								 &pprobepath))
 	{
 		double		divisor = lion_parallel_divisor(pchild->parallel_workers);
 
 		pj_units(root, &pp, &base, clamp_row_est(pchild->rows), setbuild,
-				 antibuild, perprobe, permember, memberfrac, whereexact,
+				 antibuild, pperprobe, permember, memberfrac, whereexact,
 				 &punits);
 		partial = pj_make_path(root, &pp, pchild, pantichild, bundle, &punits,
-							   setbuild, antibuild, perprobe, permember,
+							   setbuild, antibuild, pperprobe, permember,
 							   memberfrac, clamp_row_est(rows / divisor), true);
 		if (!partial->path.parallel_safe)
 			partial = NULL;
