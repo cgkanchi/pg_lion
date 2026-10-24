@@ -667,6 +667,47 @@ pj_pred_private(PjPlan *pp, int p)
 }
 
 /*
+ * The units a path of the node is priced in (DESIGN.md §46, "Cost"): the
+ * competitor's, base (lion_units_for()), with a nested loop's cold reads
+ * weighed against the path's own price and reads (lion_units_cold()) - each
+ * path its own, as §39 has every path of a relation take its reads.  The
+ * path's reads are those of `loops` fact rows - a leaf a probe, the members'
+ * pages not all-visible (every member's where the WHERE's set is inexact:
+ * each is fetched for its recheck, as lo_cost() prices the probe) - and the
+ * lion indexes' pages the builds read; its price the builds, the anti
+ * join's lookups and those probes.  A participant of the parallel form
+ * probes its share of the fact's rows and makes every build, so its loops
+ * are the partial path's rows and its builds the serial node's: the serial
+ * node's factor would weigh the cold reads of every participant's probes
+ * against the builds of one.  Where the loop's outer side reads the fact,
+ * the node's child, it is weighed less that side (units->nlshared): the
+ * node reads the fact through core's own path, at core's price.
+ */
+static void
+pj_units(PlannerInfo *root, const PjPlan *pp, const LionUnits *base,
+		 double loops, double setbuild, double antibuild, double perprobe,
+		 double permember, double memberfrac, bool whereexact,
+		 LionUnits *units)
+{
+	RelOptInfo *dim = pp->shape->dimrel;
+	double		idxpages = Max((double) pp->shape->pkidx->pages, 1.0);
+	double		reads;
+
+	*units = *base;
+	if (base->nlouterrels != NULL &&
+		bms_equal(base->nlouterrels, pp->shape->factrel->relids))
+		units->nlshared = base->nlouter;
+	reads = index_pages_fetched(loops, (BlockNumber) idxpages, idxpages,
+								root) +
+		index_pages_fetched(loops * memberfrac, dim->pages, idxpages, root) *
+		(whereexact ? 1.0 - dim->allvisfrac : 1.0) +
+		pp->lionpages;
+	lion_units_cold(units,
+					setbuild + antibuild + loops * perprobe +
+					loops * memberfrac * permember, reads);
+}
+
+/*
  * The node's path over `child` - the fact's cheapest path, or its partial
  * one - priced (DESIGN.md §46, "Cost"): the child's and the anti join's
  * child's costs, core's own; and in the competitor's units (§39) the sets'
@@ -889,10 +930,10 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	bool		whereexact = true;
 	double		loops;
 	double		rows;
-	double		reads;
-	double		idxpages;
 	IndexPath  *probepath;
+	LionUnits	base;
 	LionUnits	units;
+	LionUnits	punits;
 	CustomPath *serial;
 	CustomPath *partial = NULL;
 	ListCell   *lc;
@@ -1032,28 +1073,18 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 		((ps->antipath != NULL ? 1 : 0) + list_length(pp.labels) + npred);
 
 	/*
-	 * The units (§39): against a nested loop into the B-tree, its cold
-	 * reads against the node's own - a leaf a probe, the members' pages
-	 * not all-visible (every member's where the WHERE's set is inexact:
-	 * each is fetched for its recheck, as lo_cost() prices the probe), and
-	 * the lion indexes' pages the builds read.  Not against a bitmap heap
-	 * scan's cold reads (§39, "A bitmap heap scan's cold reads"): the node
-	 * reads the fact through core's own path, as the competitor's scans of
-	 * it do, and the dimension a descent at a time, synchronous reads the
-	 * stream's price would under-charge.
+	 * The units (§39): the competitor's, its cold reads weighed against
+	 * each path's own (pj_units()).  Not against a bitmap heap scan's cold
+	 * reads (§39, "A bitmap heap scan's cold reads"): the node reads the
+	 * fact through core's own path, as the competitor's scans of it do, and
+	 * the dimension a descent at a time, synchronous reads the stream's
+	 * price would under-charge.
 	 */
-	idxpages = Max((double) ps->pkidx->pages, 1.0);
-	reads = index_pages_fetched(loops, (BlockNumber) idxpages, idxpages,
-								root) +
-		index_pages_fetched(loops * memberfrac, dim->pages, idxpages, root) *
-		(whereexact ? 1.0 - dim->allvisfrac : 1.0) +
-		pp.lionpages;
-	lion_units_for(root, output_rel, &units);
-	units.bmcold = 0.0;
-	units.bmcoldpage = 0.0;
-	lion_units_cold(&units,
-					setbuild + antibuild + loops * perprobe +
-					loops * memberfrac * permember, reads);
+	lion_units_for(root, output_rel, &base);
+	base.bmcold = 0.0;
+	base.bmcoldpage = 0.0;
+	pj_units(root, &pp, &base, loops, setbuild, antibuild, perprobe,
+			 permember, memberfrac, whereexact, &units);
 
 	/* ---- the plan's pieces ---- */
 	if (pp.where != NULL)
@@ -1165,9 +1196,12 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	{
 		double		divisor = lion_parallel_divisor(pchild->parallel_workers);
 
-		partial = pj_make_path(root, &pp, pchild, pantichild, bundle, &units, setbuild,
-							   antibuild, perprobe, permember, memberfrac,
-							   clamp_row_est(rows / divisor), true);
+		pj_units(root, &pp, &base, clamp_row_est(pchild->rows), setbuild,
+				 antibuild, perprobe, permember, memberfrac, whereexact,
+				 &punits);
+		partial = pj_make_path(root, &pp, pchild, pantichild, bundle, &punits,
+							   setbuild, antibuild, perprobe, permember,
+							   memberfrac, clamp_row_est(rows / divisor), true);
 		if (!partial->path.parallel_safe)
 			partial = NULL;
 	}

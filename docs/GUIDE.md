@@ -481,8 +481,9 @@ null tests, booleans and multi-key queries with constants); a dimension column u
 grouped by itself, under a `THEN`, in an aggregate - keeps the node out, and so does a `WHERE`
 clause on the dimension no Lion index answers. The planner prices a B-tree descent per fact row and
 the sets' builds against PostgreSQL's plan: the node pays where the fact's rows are few against the
-dimension's `WHERE`, or the dimension's heap would be read cold; `pg_lion.enable_probe_join` turns
-it off (DESIGN.md §46).
+dimension's `WHERE`, or where the dimension outgrows `effective_cache_size` and PostgreSQL's nested
+loop into it - under the `NOT EXISTS`'s join too, a `Memoize`'s misses where one sits over its
+probe - would read its heap cold; `pg_lion.enable_probe_join` turns it off (DESIGN.md §46).
 
 When the query returns the joined rows themselves, a page of them in the order of a B-tree of the
 fact table, the ordered walk crosses the join:
