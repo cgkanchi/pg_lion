@@ -4009,7 +4009,13 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 /* lion_plan_skew.c */
 extern double lion_skew_scan_factor(PlannerInfo *root, Path *scan);
 extern Cost lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
-								 double loops);
+								 double loops, double limit);
+extern double lion_skew_limit_rows(PlannerInfo *root, RelOptInfo *rel);
+extern double lion_skew_limit_share(PlannerInfo *root, RelOptInfo *rel,
+									double rows, double factor, double limit);
+extern void lion_skew_reprice(Path *path, double share, double scale);
+extern Cost lion_skew_set_extra(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+								double *factor);
 extern double lion_skew_rel_scale(PlannerInfo *root, RelOptInfo *rel,
 								  Relids required_outer, double loops);
 extern double lion_skew_clauses_scale(PlannerInfo *root, RelOptInfo *rel,

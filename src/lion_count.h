@@ -1838,7 +1838,8 @@ typedef struct LionAndCost
 
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
-							  Node **clauses, double isect, LionAndCost *out);
+							  Node **clauses, double isect, bool skewed,
+							  LionAndCost *out);
 
 /* What an AM scan's position filters decode and decide (DESIGN.md §17). */
 extern Cost lion_cost_scan_posfilter(PlannerInfo *root, IndexPath *path,
@@ -1953,6 +1954,8 @@ extern double lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel,
 									 Var *var);
 extern double lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel,
 									   List *clauses);
+/* ... and the factor an AM scan of a lion index is priced at (§40.12) */
+extern double lion_skew_am_factor(PlannerInfo *root, IndexPath *path);
 /* ... and the scales lion_skew_rel_scale() found, kept for the planner run */
 extern bool lion_skew_scale_find(PlannerInfo *root, RelOptInfo *rel,
 								 Relids outer, double loops, double *scale);
@@ -2085,5 +2088,9 @@ extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
  */
 extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
 									  Cost remainder);
+extern void lion_plain_scale_remainder(PlannerInfo *root, IndexPath *path,
+									   double share, double scale);
+extern int	lion_plain_remainders_mark(PlannerInfo *root);
+extern void lion_plain_remainders_drop(PlannerInfo *root, int mark);
 
 #endif							/* LION_COUNT_H */

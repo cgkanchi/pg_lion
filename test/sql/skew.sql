@@ -238,11 +238,15 @@ SET effective_cache_size = '1MB';
 
 -- ---------- 4. a correlated count ----------
 -- core's scan of the key's B-tree at its 10 rows a call, against the count;
--- at the 750 a call meets, the count
+-- at the 750 a call meets, the count.  The walk is off: its set of the
+-- tsquery's rows, which no Param reaches, built once for every call, is
+-- cheaper than either (correlated_skew.sql).
+SET pg_lion.enable_btree_scan = off;
 SET pg_lion.enable_skew_estimate = off;
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'correlated';
 SET pg_lion.enable_skew_estimate = on;
 SELECT lsw_plan(q) FROM lsw_q WHERE name = 'correlated';
+RESET pg_lion.enable_btree_scan;
 DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got1 AS ' || (SELECT q FROM lsw_q WHERE name = 'correlated'); END $$;
 
 -- ---------- 5. a nested loop ----------
@@ -349,8 +353,9 @@ RESET pg_lion.enable_index_mcv;
 -- flip with the setting as in section 4, and its price is the one it had
 -- over the whole index.  Lion's plain scans and bitmap scans are off, so
 -- that the key's own index is not the competitor the count is weighed
--- against, and so are residual counts, so that the count does not read it.
--- lsw_lion_indexes() names the lion indexes q's LionCount reads.
+-- against, and so are residual counts, so that the count does not read it;
+-- the walk is off, as in section 4.  lsw_lion_indexes() names the lion
+-- indexes q's LionCount reads.
 CREATE FUNCTION lsw_lion_indexes(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -364,6 +369,7 @@ END $$;
 SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
 SET pg_lion.enable_count_residual = off;
+SET pg_lion.enable_btree_scan = off;
 SELECT lsw_lion_indexes(q) FROM lsw_q WHERE name = 'correlated';
 SELECT lsw_cost(q, 'LionCount') AS count_whole
   FROM lsw_q WHERE name = 'correlated' \gset
@@ -381,6 +387,7 @@ SELECT lsw_plan(q), lsw_lion_indexes(q),
 RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 RESET pg_lion.enable_count_residual;
+RESET pg_lion.enable_btree_scan;
 
 -- ---------- 10. a semi or anti join's probe ----------
 -- A semi or anti join's probe comes to its key's first match no later at a

@@ -1845,6 +1845,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	bool		rebuilt = false;
 	double		skew;
 	double		skewscale = 1.0;
+	double		setskew = 1.0;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
@@ -1859,6 +1860,28 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	sel = 1.0;
 	if (lion != NULL)
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
+
+	/*
+	 * A key the plan does not know - the outer row's, a Param - on a skewed
+	 * key column: the walk meets the rows a probed key meets (DESIGN.md §33,
+	 * "The rows of a probed key"), and so do its members' tests and fetches
+	 * below, where its competitor - the cheapest of core's paths of rel with
+	 * the same parameterization - meets them too and is priced at them
+	 * (lion_skew_rel_scale(), DESIGN.md §39, "A skewed key's probes"); the
+	 * price is put back into core's units at the end by the competitor's two
+	 * prices.  A competitor no key's rows change, a sequential scan, leaves
+	 * the walk at core's rows too.  A set whose lion quals equate the key to
+	 * that value meets those rows as well: its lookups, and the members it
+	 * copies, are priced at them (lion_skew_set_extra(), §40.12).
+	 */
+	skew = lion_skew_clauses_factor(root, rel, ord->indexclauses);
+	if (skew > 1.0)
+		skewscale = lion_skew_rel_scale(root, rel,
+										PATH_REQ_OUTER(&ord->path),
+										(ord->path.param_info != NULL) ?
+										loops : 1.0);
+	if (skewscale < 1.0 && lion != NULL && ord->path.param_info == NULL)
+		lioncost += lion_skew_set_extra(root, rel, lion, &setskew);
 
 	/* the calls of a correlated subquery, each walk a probe (§40.11) */
 	calls = lion_outer_param_loops(root,
@@ -1906,7 +1929,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 														   &cols));
 		}
 	}
-	members = clamp_row_est(candsel * tuples);
+	members = Min(clamp_row_est(candsel * tuples * setskew), tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
 	/*
@@ -1927,28 +1950,8 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * CPU, which a parallel walk divides
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-
-	/*
-	 * A key the plan does not know - the outer row's, a Param - on a skewed
-	 * key column: the walk meets the rows a probed key meets (DESIGN.md §33,
-	 * "The rows of a probed key"), and so do its members' tests and fetches
-	 * below, where its competitor - the cheapest of core's paths of rel with
-	 * the same parameterization - meets them too and is priced at them
-	 * (lion_skew_rel_scale(), DESIGN.md §39, "A skewed key's probes"); the
-	 * price is put back into core's units at the end by the competitor's two
-	 * prices.  A competitor no key's rows change, a sequential scan, leaves
-	 * the walk at core's rows too.
-	 */
-	skew = lion_skew_clauses_factor(root, rel, ord->indexclauses);
-	if (skew > 1.0)
-	{
-		skewscale = lion_skew_rel_scale(root, rel,
-										PATH_REQ_OUTER(&ord->path),
-										(ord->path.param_info != NULL) ?
-										loops : 1.0);
-		if (skewscale < 1.0)
-			walked = Min(clamp_row_est(walked * skew), tuples);
-	}
+	if (skewscale < 1.0)
+		walked = Min(clamp_row_est(walked * skew), tuples);
 	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
@@ -2103,6 +2106,19 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (workers != NULL)
 		cpu /= lion_parallel_divisor(*workers);
 	run += cpu;
+
+	/*
+	 * A walk of a skewed key whose query level stops at a count of rows -
+	 * a correlated subquery's LIMIT, an EXISTS's first row
+	 * (lion_skew_limit_rows(), DESIGN.md §40.12) - stops once it has them:
+	 * its run is charged the share of it the count takes at the rows a
+	 * probed key meets, over the share core's Limit takes at core's rows
+	 * (lion_skew_limit_share()).  The set is built whole first, and keeps
+	 * its price.
+	 */
+	if (skewscale < 1.0 && ord->path.param_info == NULL && workers == NULL)
+		run *= lion_skew_limit_share(root, rel, rows, skew,
+									 lion_skew_limit_rows(root, rel));
 
 	/*
 	 * Priced at the rows a probed key meets, the walk is put back into core's
@@ -4033,6 +4049,31 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 		lioncover = lo_lion_cover(root, rel, cands, lionidx, lionam);
 	if (lioncover != NULL)
 		cands = lappend(list_copy(cands), lioncover);
+
+	/*
+	 * In a correlated subquery, the sets that leave the clauses holding the
+	 * outer query's Param - the key a walk keyed on it answers - to the walk
+	 * (DESIGN.md §40.12): a set with no such Param is built once and kept for
+	 * every call (lo_rescan(), §40.11), where one with it is built again at
+	 * each, and a call's walk then reads its key's entries alone.
+	 */
+	if (cands != NIL)
+	{
+		List	   *outer = NIL;
+
+		foreach(lc, rel->baserestrictinfo)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			if (lion_has_outer_param(root, (Node *) rinfo->clause))
+				outer = lappend(outer, rinfo);
+		}
+		if (outer != NIL)
+			cands = list_concat(list_copy(cands),
+								lo_lion_accesses(root, rel, lionidx, outer,
+												 lionam));
+		list_free(outer);
+	}
 
 	foreach(lc, ordpaths)
 	{
