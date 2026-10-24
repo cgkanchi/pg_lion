@@ -2367,6 +2367,16 @@ os_begin(CustomScanState *node, EState *estate, int eflags)
  * next entry - in the walk's order, its NULL entry where the ORDER BY puts
  * NULLs (DESIGN.md §30.11) - that has a row of the dimension's set.  An entry
  * with none is passed over without running its arm.  false past the last.
+ *
+ * The child is rescanned BEFORE the entry is narrowed, when it has run or a
+ * Param of the split's has changed: its rescan hands the Param to the probe
+ * (oj_rescan()), and lion_ordered_narrow_begin() then rescans the probe,
+ * which makes the dimension's set again for the new value, once, before the
+ * entry is ANDed with it; the child's descents find the probe's Param
+ * consumed and the set current.  Rescanned after the narrowing, the child
+ * would hand the Param on again, and the probe's first descent would drop
+ * and build the set a second time.  An entry passed over costs a rescan of
+ * the child at most once, and that rescan reads nothing.
  */
 static bool
 os_next_arm(OsState *st)
@@ -2384,6 +2394,11 @@ os_next_arm(OsState *st)
 		int64		entry = lion_order_walk_entryno(st->walk);
 
 		CHECK_FOR_INTERRUPTS();
+		if (st->childran || st->child->chgParam != NULL)
+		{
+			ExecReScan(st->child);
+			st->childran = false;
+		}
 		lion_ordered_narrow_begin(st->probe);
 		do
 		{
@@ -2395,8 +2410,6 @@ os_next_arm(OsState *st)
 			st->skipped++;
 			continue;
 		}
-		if (st->childran)
-			ExecReScan(st->child);
 		st->childran = true;
 		st->arms++;
 		return true;
@@ -2448,7 +2461,8 @@ os_exec(CustomScanState *node)
 
 /*
  * The walk of the column starts again; the child is rescanned at the next
- * arm, a changed Param handed to it first: its sides keep their sets unless
+ * arm, before its narrowing (os_next_arm()), a changed Param handed to it
+ * first, which its rescan hands to its sides: they keep their sets unless
  * their lion quals use the Param (§47.4).
  */
 static void
@@ -2463,17 +2477,8 @@ os_rescan(CustomScanState *node)
 	MemoryContextReset(st->walkcxt);
 	st->hasnext = false;
 	st->inarm = false;
-
-	/*
-	 * ... and the dimension, which the next arm's narrowing reads before the
-	 * child's rescan hands the Param on: lion_ordered_narrow_begin() rescans
-	 * it first.
-	 */
 	if (node->ss.ps.chgParam != NULL)
-	{
 		UpdateChangedParamSet(st->child, node->ss.ps.chgParam);
-		UpdateChangedParamSet(st->probe, node->ss.ps.chgParam);
-	}
 }
 
 static void
