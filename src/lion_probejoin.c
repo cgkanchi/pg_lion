@@ -322,20 +322,38 @@ pj_index_vars_mutator(Node *node, void *context)
 	return expression_tree_mutator(node, pj_index_vars_mutator, context);
 }
 
+/*
+ * Index quals of one lion index column, ANDed - a clause, or the two bounds
+ * of an interval - as a lion leaf of a set
+ */
+static IndexPath *
+pj_quals_path(PlannerInfo *root, IndexOptInfo *idx, AttrNumber col,
+			  List *clauses)
+{
+	List	   *ics = NIL;
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+	{
+		IndexClause *ic = makeNode(IndexClause);
+
+		ic->rinfo = make_simple_restrictinfo(root, (Expr *) lfirst(lc));
+		ic->indexquals = list_make1(ic->rinfo);
+		ic->lossy = false;
+		ic->indexcol = col - 1;
+		ic->indexcols = NIL;
+		ics = lappend(ics, ic);
+	}
+	return create_index_path(root, idx, ics, NIL, NIL, NIL,
+							 ForwardScanDirection, false, NULL, 1.0, false);
+}
+
 /* An index qual of one lion index column, as a lion leaf of a set */
 static IndexPath *
 pj_label_path(PlannerInfo *root, IndexOptInfo *idx, AttrNumber col,
 			  Expr *clause)
 {
-	IndexClause *ic = makeNode(IndexClause);
-
-	ic->rinfo = make_simple_restrictinfo(root, clause);
-	ic->indexquals = list_make1(ic->rinfo);
-	ic->lossy = false;
-	ic->indexcol = col - 1;
-	ic->indexcols = NIL;
-	return create_index_path(root, idx, list_make1(ic), NIL, NIL, NIL,
-							 ForwardScanDirection, false, NULL, 1.0, false);
+	return pj_quals_path(root, idx, col, list_make1(clause));
 }
 
 /* `var IS NULL` */
@@ -445,8 +463,9 @@ pj_lion_pages(Path *lion)
 /*
  * Each dimension's labels (DESIGN.md §46, "The labels"): a scalar column's
  * set of each outcome but 0 - its values' equality, `= ANY` of several, ORed
- * with its NULL entry where NULL's outcome is it - and a multi-key column's
- * set of each leaf and of its NULL entry; each priced as a set is
+ * with its NULL entry where NULL's outcome is it; a ranged one's (§46,
+ * "Ranges") its values alone and its intervals, ORed - and a multi-key
+ * column's set of each leaf and of its NULL entry; each priced as a set is
  * (lion_ordered_set_price()).  False when an index cannot be read for them.
  */
 static bool
@@ -475,13 +494,24 @@ pj_labels(PlannerInfo *root, RelOptInfo *dim, PjPlan *pp)
 				ListCell   *lc;
 				int			i = 0;
 
-				foreach(lc, pv->vals)
+				if (dp->ranged)
 				{
-					if (pv->valout[i++] == o)
-						vals = lappend(vals, lfirst(lc));
+					vals = dp->outpoints[o];
+					foreach(lc, dp->outranges[o])
+						paths = lappend(paths,
+										pj_quals_path(root, dp->idx, dp->col,
+													  (List *) lfirst(lc)));
+				}
+				else
+				{
+					foreach(lc, pv->vals)
+					{
+						if (pv->valout[i++] == o)
+							vals = lappend(vals, lfirst(lc));
+					}
 				}
 				if (vals != NIL)
-					paths = lappend(paths, pj_values_path(root, dim, dp, vals));
+					paths = lcons(pj_values_path(root, dim, dp, vals), paths);
 				if (pv->nullout == o)
 					paths = lappend(paths,
 									pj_label_path(root, dp->idx, dp->col,
@@ -931,7 +961,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 		return;
 	if (dimexprs != NIL)
 	{
-		pp.cells = lion_cells_analyze(root, dim, dim->relid, dimexprs);
+		pp.cells = lion_cells_analyze(root, dim, dim->relid, dimexprs, true);
 		if (pp.cells == NULL)
 			return;
 	}
