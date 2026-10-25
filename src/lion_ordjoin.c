@@ -10,11 +10,13 @@
  *
  *		that walks the fact's btree in order, as LionOrdered does, over the
  *		fact's lion set; tests each member's key against the key sets of the
- *		tables that only filter the key; descends the dimension's unique
- *		btree for the key and tests the TID it finds against the dimension's
- *		own lion set BEFORE it touches the dimension's heap; and returns the
- *		two rows together, in the walk's order, until whatever is above it
- *		stops pulling.  DESIGN.md section 47 is the specification.
+ *		tables that only filter the key - whose keys' rows, where the fact's
+ *		key has a lion index, are ANDed into the fact's set, so that a row
+ *		they reject is never fetched; descends the dimension's unique btree
+ *		for the key and tests the TID it finds against the dimension's own
+ *		lion set BEFORE it touches the dimension's heap; and returns the two
+ *		rows together, in the walk's order, until whatever is above it stops
+ *		pulling.  DESIGN.md section 47 is the specification.
  *
  *		Each side is a LionOrdered walk, built by lion_ordered.c for the join
  *		and kept as a child of the join's own plan: the fact's is its ordered
@@ -38,6 +40,7 @@
 #include "lion_fkjoin.h"
 
 bool		lion_enable_ordered_join = true;
+static bool lion_enable_key_set_fold = true;
 static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 
 /*
@@ -56,6 +59,9 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  *	OJ_PRIV_KEYOPS	OidList: each key set's equality, hashable
  *	OJ_PRIV_KEYCOLL	OidList: ... its collation
  *	OJ_PRIV_KEYCOLS	IntList: ... the key's position in its plan's target
+ *	OJ_PRIV_FOLD	OidList: the fact key's lion index the key sets are
+ *					folded into, their keys handed to the fact's walk for its
+ *					set (§47.6); NIL where they are not
  *
  * custom_plans are the fact's walk, the dimension's probe and each key set's
  * plan, in that order; custom_scan_tlist is the fact's target list followed by
@@ -69,7 +75,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 #define OJ_PRIV_KEYOPS		2
 #define OJ_PRIV_KEYCOLL		3
 #define OJ_PRIV_KEYCOLS		4
-#define OJ_PRIV_NMEMBERS	5
+#define OJ_PRIV_FOLD		5
+#define OJ_PRIV_NMEMBERS	6
 
 static Plan *oj_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
@@ -186,6 +193,9 @@ typedef struct OjJoin
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
 	List	   *keysets;		/* OjKeySet */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
+	IndexOptInfo *keyidx;		/* the fact key's lion index the key sets
+								 * fold into (oj_key_index()), or NULL */
+	int			keycol;			/* ... the key's column in it, 0-based */
 } OjJoin;
 
 /*
@@ -631,6 +641,71 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 }
 
 /*
+ * The lion index of the fact whose key column the key sets of j can be
+ * folded into (DESIGN.md §47.6, "Folded into the walk"), or NULL: a column of
+ * a lion index that is the fact's key itself, a plain column, scalar - one
+ * entry a row, not multikey - of the key's type, whose equality strategy is
+ * each key set's equality, under the key sets' collation, so that the rows
+ * of a key set's keys there are the rows whose key the key set holds; an
+ * index not partial, or one whose predicate the query implies, which holds
+ * every row the walk can meet.  The key's type has an array type: the leaf
+ * the key set becomes is `fk = ANY (array)`.  *col is the column, 0-based.
+ */
+static IndexOptInfo *
+oj_key_index(OjJoin *j, int *col)
+{
+	Oid			lionam = lion_get_am_oid();
+	Oid			type = exprType((Node *) j->fkvar);
+	ListCell   *lc;
+
+	if (!lion_enable_key_set_fold || j->keysets == NIL ||
+		!OidIsValid(lionam) || !OidIsValid(get_array_type(type)))
+		return NULL;
+	foreach(lc, j->fact->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		if (idx->relam != lionam || idx->hypothetical ||
+			(idx->indpred != NIL && !idx->predOK))
+			continue;
+		for (c = 0; c < idx->nkeycolumns; c++)
+		{
+			bool		ok = (idx->indexkeys[c] == j->fkvar->varattno &&
+							  idx->opcintype[c] == type);
+			ListCell   *lck;
+
+			foreach(lck, j->keysets)
+			{
+				OjKeySet   *ks = (OjKeySet *) lfirst(lck);
+
+				if (!ok)
+					break;
+				ok = get_op_opfamily_strategy(ks->eqop, idx->opfamily[c]) ==
+					LION_STRAT_EQUAL &&
+					(!type_is_collatable(type) ||
+					 idx->indexcollations[c] == ks->collation);
+			}
+			if (ok)
+			{
+				Relation	irel = index_open(idx->indexoid, AccessShareLock);
+				LionState  *state = lion_index_column_state(irel,
+															(AttrNumber) (c + 1));
+
+				ok = !state->multikey && state->typid == type;
+				index_close(irel, AccessShareLock);
+			}
+			if (ok)
+			{
+				*col = c;
+				return idx;
+			}
+		}
+	}
+	return NULL;
+}
+
+/*
  * Is every special join with an inner side in joinrel the semi join of one of
  * j's key sets?  The fact and the dimension are then inner-joined, and so is
  * every key set that is not a semi join's.
@@ -964,6 +1039,21 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * once, at the first key set or, with none, at the members and the rows.
  * *rows is what it returns: of the descents that find a dimension row, the
  * share of the dimension's rows that pass its quals (lion_probe_rel_rows()).
+ *
+ * With `fold` the key sets are folded into the fact's set (§47.6): its walk,
+ * priced with them (lion_ordered_walk_price()), returns only the rows of
+ * their keys, factrows of them, each key a dimension key; they are tested
+ * against the key sets all the same, and pass.  Without it the walk fetches
+ * every member of its set to read its key, and the key sets keep `kept` of
+ * them: the rest are fetched for nothing.  Under a LIMIT those fetches are
+ * the LIMIT's share s of the walk's, as many as the walk makes to find its
+ * rows among the few the key sets keep, and they read the pages that many
+ * fetches read (lion_ordered_heap_price() over them), not s of the pages the
+ * whole walk's fetches read, which is what core's Limit would take of a run
+ * priced whole: their difference is charged, at s of it in the run.  A key
+ * set that keeps one row in ten thousand then costs the walk the heap pages
+ * of the million rows it fetches for the hundred the page takes.
+ *
  * *share is the share of the walk the query's LIMIT is expected to take, all
  * of it where the join is not alone under the LIMIT (oj_alone()), *probes
  * the descents of the whole walk.  armshare is 1 for the join, and
@@ -1003,9 +1093,9 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
 static void
 oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		IndexPath *ord, Cost factstartup, Cost facttotal, double factrows,
-		double factfetches, double factlionpages, const OjCompetitor *comp,
-		double armshare, double *rows, double *probes, double *share,
-		Cost *startup_p, Cost *total_p)
+		double factfetches, double factlionpages, bool fold,
+		const OjCompetitor *comp, double armshare, double *rows,
+		double *probes, double *share, Cost *startup_p, Cost *total_p)
 {
 	RelOptInfo *dim = j->dim;
 	IndexOptInfo *pkidx = j->pkidx;
@@ -1014,6 +1104,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	double		found;
 	double		hit;
 	double		descents;
+	double		kept;
 	double		members;
 	double		out;
 	double		idxtuples = Max(pkidx->tuples, 1.0);
@@ -1028,11 +1119,15 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	double		factor;
 	ListCell   *lc;
 
-	/* the fact's walk, and a test of each of its rows' keys */
+	/*
+	 * the fact's walk, and a test of each of its rows' keys - none NULL where
+	 * the key sets are folded into its set, whose keys are not
+	 */
 	startup = factstartup;
 	run = facttotal - factstartup;
-	nonnull = nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar,
-						  j->fact->relid, JOIN_INNER, NULL);
+	nonnull = fold ? 1.0 :
+		nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar, j->fact->relid,
+					JOIN_INNER, NULL);
 	run += factrows * cpu_operator_cost;
 	keys = clamp_row_est(factrows * nonnull);
 	found = oj_found_share(root, j, dimtuples);
@@ -1041,6 +1136,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * The key sets: built from their plans, and each key tested in turn.
 	 * hit is the share of the keys left that name a dimension row: found
 	 * until a key set has let through only its own keys, the dimension's.
+	 * Folded, the walk returns only those, which each key set passes; their
+	 * keys are made an array for the fact's set besides, a copy a key.
 	 */
 	descents = keys;
 	hit = found;
@@ -1050,9 +1147,13 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 		startup += ks->path->total_cost + ks->rows * cpu_operator_cost;
 		run += descents * cpu_operator_cost;
-		descents *= Min(1.0, hit * ks->rows / dimtuples);
+		if (fold)
+			startup += ks->rows * cpu_operator_cost;
+		else
+			descents *= Min(1.0, hit * ks->rows / dimtuples);
 		hit = 1.0;
 	}
+	kept = Min(descents / keys, 1.0);
 	descents = clamp_row_est(descents);
 
 	/*
@@ -1113,6 +1214,28 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * level's only table), which this is not.
 	 */
 	*share = oj_limit_share(root, j, out);
+
+	/*
+	 * The members the key sets reject, fetched for nothing where they are
+	 * not folded into the set: under a LIMIT, the heap pages of the LIMIT's
+	 * share of the walk's fetches at their own count, past the share of the
+	 * whole walk's pages that core's Limit takes of the run, for the share
+	 * of them the key sets reject - charged at s of it in the run, which the
+	 * Limit takes s of.
+	 */
+	if (!fold && j->keysets != NIL && kept < 1.0 && *share < 1.0 &&
+		factfetches > 0.0)
+	{
+		double		s = *share;
+		double		walked = clamp_row_est(ord->indexselectivity *
+										   j->fact->tuples);
+		Cost		own = lion_ordered_heap_price(root, j->fact, ord,
+												  s * walked, s * factfetches);
+		Cost		whole = lion_ordered_heap_price(root, j->fact, ord, walked,
+													factfetches);
+
+		run += (1.0 - kept) * Max(own - s * whole, 0.0) / s;
+	}
 
 	/* the loop's Memoize and the cold reads, over the LIMIT's share */
 	factor = 1.0;
@@ -1175,11 +1298,14 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
  * share of the walk the query's LIMIT is expected to take, dimweight the
  * descents it is expected to make (lion_ordered_side_path()); factrows,
  * factstartup and facttotal the walk's own, dimbuild the dimension's set's.
+ * With `fold` the key sets are folded into the fact's set (§47.6): a leaf of
+ * it for each, `fk = ANY (NULL::array)` on the fact key's lion index, in the
+ * key sets' order, whose array the join fills with the key set's keys.
  */
 static CustomPath *
 oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 			 IndexPath *ord, List *pathkeys, Path *factlion, Path *dimlion,
-			 List *iocols, double factweight, double dimweight,
+			 List *iocols, bool fold, double factweight, double dimweight,
 			 double factrows, Cost factstartup, Cost facttotal,
 			 Cost dimbuild, double rows, Cost startup, Cost total)
 {
@@ -1188,17 +1314,42 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	CustomPath *dimpath;
 	IndexPath  *pkpath;
 	List	   *keyinfo = NIL;
+	List	   *keyquals = NIL;
+	List	   *keyfold = NIL;
 	List	   *paths;
 	ListCell   *lc;
 
+	Assert(!fold || j->keyidx != NULL);
+	if (fold)
+	{
+		Oid			arraytype = get_array_type(exprType((Node *) j->fkvar));
+
+		foreach(lc, j->keysets)
+		{
+			OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+			ScalarArrayOpExpr *saop = makeNode(ScalarArrayOpExpr);
+
+			saop->opno = ks->eqop;
+			saop->opfuncid = get_opcode(ks->eqop);
+			saop->useOr = true;
+			saop->inputcollid = ks->collation;
+			saop->args = list_make2(copyObject(j->fkvar),
+									makeNullConst(arraytype, -1, InvalidOid));
+			saop->location = -1;
+			keyquals = lappend(keyquals, saop);
+		}
+		keyfold = list_make3(list_make1_oid(j->keyidx->indexoid),
+							 list_make1_int(j->keycol), keyquals);
+	}
+
 	factpath = lion_ordered_side_path(j->fact, ord, factlion, iocols, false,
-									  factweight, NULL, factrows, factstartup,
-									  facttotal);
+									  factweight, NULL, keyfold, factrows,
+									  factstartup, facttotal);
 	pkpath = create_index_path(root, j->pkidx, NIL, NIL, NIL, NIL,
 							   ForwardScanDirection, false, NULL, 1.0, false);
 	dimpath = lion_ordered_side_path(j->dim, pkpath, dimlion, NIL, true,
-									 dimweight, j->keyqual, rows, dimbuild,
-									 dimbuild);
+									 dimweight, j->keyqual, NIL, rows,
+									 dimbuild, dimbuild);
 	paths = list_make2(factpath, dimpath);
 	foreach(lc, j->keysets)
 	{
@@ -1224,23 +1375,65 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = paths;
-	cp->custom_private = list_make3(j->fkvar,
+	cp->custom_private = list_make4(j->fkvar,
 									list_make1_oid(j->pkidx->indexoid),
-									keyinfo);
+									keyinfo,
+									fold ?
+									list_make1_oid(j->keyidx->indexoid) :
+									NIL);
 	cp->methods = &lion_ordjoin_path_methods;
 	return cp;
 }
 
 /*
+ * The key sets of j folded into the fact's set (DESIGN.md §47.6, §47.3): the
+ * share of the fact's rows whose key every key set holds, as oj_cost() takes
+ * the key sets' keys - its non-NULL keys, found x ks.rows / dim.tuples of
+ * them at the first key set, ks.rows / dim.tuples at each after - and into
+ * *build the price of their leaves, each the rows of its own keys on the fact
+ * key's lion index (lion_ordered_keys_price()), *pages the index pages those
+ * read.
+ */
+static double
+oj_fold_share(PlannerInfo *root, OjJoin *j, Cost *build, double *pages)
+{
+	double		dimtuples = Max(j->dim->tuples, 1.0);
+	double		tuples = Max(j->fact->tuples, 1.0);
+	double		found = oj_found_share(root, j, dimtuples);
+	double		nonnull = nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar,
+									  j->fact->relid, JOIN_INNER, NULL);
+	double		hit = found;
+	double		sel = nonnull;
+	ListCell   *lc;
+
+	*build = 0.0;
+	*pages = 0.0;
+	foreach(lc, j->keysets)
+	{
+		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+		double		own = Min(1.0, found * ks->rows / dimtuples);
+		double		p;
+
+		*build += lion_ordered_keys_price(root, j->fact, j->keyidx, ks->rows,
+										  tuples * nonnull * own, &p);
+		*pages += p;
+		sel *= Min(1.0, hit * ks->rows / dimtuples);
+		hit = 1.0;
+	}
+	return sel;
+}
+
+/*
  * One LionOrderedJoin path (DESIGN.md §47.2): the fact's walk of ord with its
- * set factlion, the dimension's probe with its set dimlion, the key sets,
- * priced and offered to the join rel at pg_lion.pushdown_margin (§39), as
+ * set factlion - and with the key sets folded into it where `fold` says so
+ * (§47.6) - the dimension's probe with its set dimlion, the key sets, priced
+ * and offered to the join rel at pg_lion.pushdown_margin (§39), as
  * LionOrdered's paths are offered to their relation.
  */
 static void
 oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 			IndexPath *ord, List *pathkeys, const OjCompetitor *comp,
-			Path *factlion, Path *dimlion)
+			Path *factlion, Path *dimlion, bool fold)
 {
 	CustomPath *cp;
 	LionOrderedSet ds;
@@ -1250,6 +1443,9 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	double		probes;
 	double		share;
 	double		margin = lion_units_margin();
+	double		keysel = 1.0;
+	Cost		keybuild = 0.0;
+	double		keypages = 0.0;
 	Cost		factstartup;
 	Cost		facttotal;
 	double		factfetches;
@@ -1257,14 +1453,23 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	Cost		startup;
 	Cost		total;
 
-	/* the fact's walk, index-only where its btree has every column it needs */
+	/*
+	 * the fact's walk, index-only where its btree has every column it needs,
+	 * over the rows of the key sets' keys alone where they are folded in
+	 */
+	if (fold)
+	{
+		keysel = oj_fold_share(root, j, &keybuild, &keypages);
+		factrows = clamp_row_est(factrows * keysel);
+	}
 	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
-							&iocols, &factstartup, &facttotal, &factfetches,
-							&factlionpages);
+							keysel, keybuild, &iocols, &factstartup,
+							&facttotal, &factfetches, &factlionpages);
+	factlionpages += keypages;
 	lion_ordered_set_info(root, j->dim, dimlion, &ds);
 	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
-			factfetches, factlionpages, comp, 1.0, &rows, &probes, &share,
-			&startup, &total);
+			factfetches, factlionpages, fold, comp, 1.0, &rows, &probes,
+			&share, &startup, &total);
 
 	/*
 	 * Not alone under the LIMIT (oj_alone(), DESIGN.md §47.10): the first
@@ -1276,11 +1481,12 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 
 	/* the dimension's weight: the descents the LIMIT's share of the walk makes */
 	cp = oj_join_path(root, joinrel, j, ord, pathkeys, factlion, dimlion,
-					  iocols, share, clamp_row_est(probes * share), factrows,
-					  factstartup, facttotal, ds.build, rows,
+					  iocols, fold, share, clamp_row_est(probes * share),
+					  factrows, factstartup, facttotal, ds.build, rows,
 					  startup / margin, total / margin);
-	elog(DEBUG2, "lion: a LionOrderedJoin path over %s, %.2f..%.2f for %.0f rows",
-		 get_rel_name(ord->indexinfo->indexoid), cp->path.startup_cost,
+	elog(DEBUG2, "lion: a LionOrderedJoin path over %s%s, %.2f..%.2f for %.0f rows",
+		 get_rel_name(ord->indexinfo->indexoid),
+		 fold ? ", key sets folded" : "", cp->path.startup_cost,
 		 cp->path.total_cost, rows);
 
 	/* a walk of an index and descents of another, as index scans are */
@@ -1537,9 +1743,9 @@ static void
 os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		LionOrderedSet *ds, IndexPath *ord, Cost factstartup,
 		Cost facttotal, double factrows, double factfetches,
-		double factlionpages, const OjCompetitor *comp, double *rows_p,
-		double *factweight, double *dimweight, Cost *startup_p,
-		Cost *total_p, Cost *armstartup, Cost *armtotal)
+		double factlionpages, bool fold, const OjCompetitor *comp,
+		double *rows_p, double *factweight, double *dimweight,
+		Cost *startup_p, Cost *total_p, Cost *armstartup, Cost *armtotal)
 {
 	double		dimtuples = Max(j->dim->tuples, 1.0);
 	double		dimpages = (double) j->dim->pages;
@@ -1576,8 +1782,8 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		Cost		entry;
 
 		oj_cost(root, joinrel, j, ds, ord, factstartup, facttotal, factrows,
-				factfetches, factlionpages, comp, sp->arms.share[i], &out,
-				&probes, &share, &st, &tot);
+				factfetches, factlionpages, fold, comp, sp->arms.share[i],
+				&out, &probes, &share, &st, &tot);
 		run = tot - st;
 		entry = os_entry_cost(dimtuples * sp->arms.freq[i],
 							  ds->lion != NULL ?
@@ -1626,14 +1832,16 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 /*
  * One LionOrderedSplit path (DESIGN.md §48.2): the split sp of the join j,
  * its arms a LionOrderedJoin of the fact's walk of ord in the order joinkeys
- * - its set factlion - and the dimension's probe with its set dimlion,
- * narrowed per arm; priced (os_cost()) and offered to the join rel at
- * pg_lion.pushdown_margin, as the join's paths are.
+ * - its set factlion, with the key sets folded into it where `fold` says so
+ * (§47.6) - and the dimension's probe with its set dimlion, narrowed per arm;
+ * priced (os_cost()) and offered to the join rel at pg_lion.pushdown_margin,
+ * as the join's paths are.
  */
 static void
 os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 			IndexPath *ord, List *joinkeys, List *pathkeys,
-			const OjCompetitor *comp, Path *factlion, Path *dimlion)
+			const OjCompetitor *comp, Path *factlion, Path *dimlion,
+			bool fold)
 {
 	CustomPath *cp;
 	CustomPath *child;
@@ -1646,6 +1854,9 @@ os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	double		dimweight;
 	double		factfetches;
 	double		factlionpages;
+	double		keysel = 1.0;
+	Cost		keybuild = 0.0;
+	double		keypages = 0.0;
 	Cost		factstartup;
 	Cost		facttotal;
 	Cost		startup;
@@ -1653,16 +1864,22 @@ os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	Cost		armstartup;
 	Cost		armtotal;
 
+	if (fold)
+	{
+		keysel = oj_fold_share(root, j, &keybuild, &keypages);
+		factrows = clamp_row_est(factrows * keysel);
+	}
 	lion_ordered_walk_price(root, j->fact, ord, factlion, factrows, true,
-							&iocols, &factstartup, &facttotal, &factfetches,
-							&factlionpages);
+							keysel, keybuild, &iocols, &factstartup,
+							&facttotal, &factfetches, &factlionpages);
+	factlionpages += keypages;
 	lion_ordered_set_info(root, j->dim, dimlion, &ds);
 	os_cost(root, joinrel, j, sp, &ds, ord, factstartup, facttotal, factrows,
-			factfetches, factlionpages, comp, &rows, &factweight, &dimweight,
-			&startup, &total, &armstartup, &armtotal);
+			factfetches, factlionpages, fold, comp, &rows, &factweight,
+			&dimweight, &startup, &total, &armstartup, &armtotal);
 
 	child = oj_join_path(root, joinrel, j, ord, joinkeys, factlion, dimlion,
-						 iocols, factweight, clamp_row_est(dimweight),
+						 iocols, fold, factweight, clamp_row_est(dimweight),
 						 factrows, factstartup, facttotal, ds.build,
 						 clamp_row_est(rows / sp->arms.n),
 						 armstartup / margin, armtotal / margin);
@@ -1687,9 +1904,10 @@ os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 								  lion_ordered_split_max),
 				   list_make1_oid(sp->index->indexoid));
 	cp->methods = &lion_ordsplit_path_methods;
-	elog(DEBUG2, "lion: a LionOrderedSplit path over %s by %s, %d arms, %.2f..%.2f for %.0f rows",
+	elog(DEBUG2, "lion: a LionOrderedSplit path over %s by %s%s, %d arms, %.2f..%.2f for %.0f rows",
 		 get_rel_name(ord->indexinfo->indexoid),
-		 get_rel_name(sp->index->indexoid), sp->arms.n,
+		 get_rel_name(sp->index->indexoid),
+		 fold ? ", key sets folded" : "", sp->arms.n,
 		 cp->path.startup_cost, cp->path.total_cost, rows);
 
 	/* a walk of two indexes and descents of a third, as index scans are */
@@ -1791,9 +2009,16 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 		foreach(lc2, factcands)
 		{
 			foreach(lc3, dimcands)
-				os_add_path(root, joinrel, j, sp, ord, (List *) lfirst(lcj),
-							pathkeys, &comps[foreach_current_index(lc)],
-							(Path *) lfirst(lc2), (Path *) lfirst(lc3));
+			{
+				int			fold;
+
+				for (fold = 0; fold <= (j->keyidx != NULL ? 1 : 0); fold++)
+					os_add_path(root, joinrel, j, sp, ord,
+								(List *) lfirst(lcj), pathkeys,
+								&comps[foreach_current_index(lc)],
+								(Path *) lfirst(lc2), (Path *) lfirst(lc3),
+								fold != 0);
+			}
 		}
 	}
 }
@@ -1811,7 +2036,11 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
  * priced for the LIMIT only where the join is alone under it (oj_alone(),
  * §47.10), and as the whole walk elsewhere.  The join rel's target is plain
  * columns of its tables: the fact's and the dimension's, and a key set's key
- * where oj_keyset_of() let it be.
+ * where oj_keyset_of() let it be.  Where the fact's key has a lion index the
+ * key sets fold into (oj_key_index(), §47.6), each pair is offered twice,
+ * the key sets folded into the fact's set and tested after its fetches, and
+ * add_path() keeps what it keeps: the fold reads every key's postings before
+ * the walk, which a page met in a few entries does not pay back.
  */
 static void
 oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
@@ -1831,6 +2060,7 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		!oj_target_ok(joinrel, joinrel->relids))
 		return;
 	j->alone = oj_alone(root, joinrel);
+	j->keyidx = oj_key_index(j, &j->keycol);
 	ords = lion_ordered_orders(j->fact);
 	split = os_split_of(root, j, &sp);
 	if (ords == NIL && !split)
@@ -1884,9 +2114,15 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		foreach(lc2, factcands)
 		{
 			foreach(lc3, dimcands)
-				oj_add_path(root, joinrel, j, ord, pathkeys,
-							&comps[foreach_current_index(lc)],
-							(Path *) lfirst(lc2), (Path *) lfirst(lc3));
+			{
+				int			fold;
+
+				for (fold = 0; fold <= (j->keyidx != NULL ? 1 : 0); fold++)
+					oj_add_path(root, joinrel, j, ord, pathkeys,
+								&comps[foreach_current_index(lc)],
+								(Path *) lfirst(lc2), (Path *) lfirst(lc3),
+								fold != 0);
+			}
 		}
 	}
 }
@@ -2005,6 +2241,7 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	Var		   *fkvar = (Var *) linitial(best_path->custom_private);
 	List	   *index = (List *) lsecond(best_path->custom_private);
 	List	   *keyinfo = (List *) lthird(best_path->custom_private);
+	List	   *fold = (List *) lfourth(best_path->custom_private);
 	List	   *sctlist = NIL;
 	List	   *keyops = NIL;
 	List	   *keycolls = NIL;
@@ -2086,6 +2323,7 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 													  list_length(keyinfo)),
 									   list_copy(index), keyops, keycolls,
 									   keycols);
+	cscan->custom_private = lappend(cscan->custom_private, list_copy(fold));
 	cscan->methods = &oj_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -2138,9 +2376,12 @@ typedef struct OjKeySetState
 	PlanState  *child;			/* the plan the set is built from */
 	AttrNumber	col;			/* the key in its target */
 	OjKeyFuncs	funcs;
+	Oid			type;			/* the key's */
 	bool		byval;
 	int16		typlen;
-	MemoryContext cxt;			/* the set; reset per build */
+	char		typalign;
+	MemoryContext cxt;			/* the set, and its keys' array; reset per
+								 * build */
 	ojkeys_hash *keys;			/* NULL: not built for this scan */
 	uint64		nkeys;			/* EXPLAIN ANALYZE: the last build's keys */
 	uint64		builds;
@@ -2161,6 +2402,8 @@ typedef struct OjState
 	Oid			pkindex;		/* the dimension's unique btree */
 	int			nkeysets;
 	OjKeySetState *keysets;
+	Oid			keyindex;		/* the fact key's lion index the key sets are
+								 * folded into (§47.6), or InvalidOid */
 	uint64		rejected;		/* EXPLAIN ANALYZE: keys no key set holds */
 } OjState;
 
@@ -2184,6 +2427,7 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	List	   *keyops;
 	List	   *keycolls;
 	List	   *keycols;
+	List	   *fold;
 	int			ncols = list_length(cscan->custom_scan_tlist);
 	int			i;
 
@@ -2194,6 +2438,7 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	keyops = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYOPS);
 	keycolls = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLL);
 	keycols = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLS);
+	fold = (List *) list_nth(cscan->custom_private, OJ_PRIV_FOLD);
 	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 4 ||
 		linitial_int(ints) != OJ_PRIV_MAGIC ||
 		index == NIL || !IsA(index, OidList) || list_length(index) != 1)
@@ -2215,8 +2460,12 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 		(keycols != NIL && !IsA(keycols, IntList)) ||
 		list_length(keyops) != st->nkeysets ||
 		list_length(keycolls) != st->nkeysets ||
-		list_length(keycols) != st->nkeysets)
+		list_length(keycols) != st->nkeysets ||
+		(fold != NIL &&
+		 (!IsA(fold, OidList) || list_length(fold) != 1 ||
+		  st->nkeysets < 1)))
 		elog(ERROR, "LionOrderedJoin: malformed plan");
+	st->keyindex = (fold != NIL) ? linitial_oid(fold) : InvalidOid;
 
 	/*
 	 * The sides, run by the join alone: neither scans backward nor marks.
@@ -2254,7 +2503,8 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 		fmgr_info(lhash, &ks->funcs.hash);
 		fmgr_info(get_opcode(eqop), &ks->funcs.eq);
 		ks->funcs.collation = list_nth_oid(keycolls, i);
-		get_typlenbyval(type, &ks->typlen, &ks->byval);
+		ks->type = type;
+		get_typlenbyvalalign(type, &ks->typlen, &ks->byval, &ks->typalign);
 		ks->cxt = AllocSetContextCreate(estate->es_query_cxt,
 										"LionOrderedJoin key set",
 										ALLOCSET_DEFAULT_SIZES);
@@ -2305,6 +2555,35 @@ oj_keyset_build(OjKeySetState *ks, ExprContext *econtext)
 }
 
 /*
+ * The keys of a key set just built as an array of the key's type, in the
+ * set's memory, for the fact's walk to make the rows of them its set's leaf
+ * (DESIGN.md §47.6): each key once, in the hash table's order, which the lion
+ * index's list sorts by itself; none NULL.  It lives as long as the set does,
+ * until the next build, which hands its own.
+ */
+static Datum
+oj_keyset_array(OjKeySetState *ks)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(ks->cxt);
+	Datum	   *elems = (Datum *) palloc(sizeof(Datum) * Max(ks->nkeys, 1));
+	ojkeys_iterator it;
+	OjKeyEnt   *ent;
+	int			n = 0;
+	ArrayType  *arr;
+
+	ojkeys_start_iterate(ks->keys, &it);
+	while ((ent = ojkeys_iterate(ks->keys, &it)) != NULL)
+		elems[n++] = ent->key;
+	Assert((uint64) n == ks->nkeys);
+	arr = (n == 0) ? construct_empty_array(ks->type) :
+		construct_array(elems, n, ks->type, ks->typlen, ks->byval,
+						ks->typalign);
+	pfree(elems);
+	MemoryContextSwitchTo(oldcxt);
+	return PointerGetDatum(arr);
+}
+
+/*
  * The next joined row: the fact's walk's next row whose key is not NULL, is
  * in every key set and names a dimension row that is a member of its set,
  * visible and passes its filter.  The key is unique, so one descent finds
@@ -2320,11 +2599,24 @@ oj_exec(CustomScanState *node)
 	ExprContext *econtext = node->ss.ps.ps_ExprContext;
 	int			i;
 
-	/* the key sets, before the walk: one that is empty ends the scan */
+	/*
+	 * The key sets, before the walk: one that is empty ends the scan.  Where
+	 * they are folded into the fact's set (§47.6), each one built is handed
+	 * to the walk as its keys, and the walk's set is made again from them:
+	 * an entry whose key a key set lacks is then not a member, and is never
+	 * fetched.  The test below stays, and passes every row.  An empty key
+	 * set's array is handed too, so that no leaf keeps the keys of a build
+	 * gone with its memory.
+	 */
 	for (i = 0; i < st->nkeysets; i++)
 	{
 		if (st->keysets[i].keys == NULL)
+		{
 			oj_keyset_build(&st->keysets[i], econtext);
+			if (OidIsValid(st->keyindex))
+				lion_ordered_keyset_keys(st->fact, i,
+										 oj_keyset_array(&st->keysets[i]));
+		}
 		if (st->keysets[i].nkeys == 0)
 			return NULL;
 	}
@@ -2519,6 +2811,16 @@ oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				appendStringInfoString(&buf, "???");
 		}
 		ExplainPropertyText("Key Sets", buf.data, es);
+
+		/* the fact key's lion index they are folded into (§47.6) */
+		if (OidIsValid(st->keyindex))
+		{
+			char	   *name = get_rel_name(st->keyindex);
+
+			ExplainPropertyText("Key Set Index",
+								quote_identifier(name != NULL ? name : "???"),
+								es);
+		}
 	}
 
 	if (es->analyze)
@@ -2859,6 +3161,15 @@ lion_ordjoin_init(void)
 							 "Offer LionOrderedJoin: an ordered walk of a table's btree across a join to a unique key, both sides filtered by lion sets.",
 							 NULL,
 							 &lion_enable_ordered_join,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_key_set_fold",
+							 "Offer LionOrderedJoin's key sets folded into the fact's walk where the fact's key has a lion index.",
+							 "The walk's set is then the rows of the key sets' keys, and an entry a key set rejects is never fetched.",
+							 &lion_enable_key_set_fold,
 							 true,
 							 PGC_USERSET,
 							 0,
