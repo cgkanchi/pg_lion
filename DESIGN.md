@@ -7917,9 +7917,10 @@ for its estimates whether or not the plan uses them - a column's n_distinct from
 (§33), a range's entries, the directory's pages (§27). So once a build of another format was
 installed, every query that so much as estimated a column such an index covers failed with the
 index's error until it was rebuilt: a count by another column, through the count pushdown's look at
-the indexed one, a GROUP BY of it, a join on it. A `get_relation_info_hook`
-(`lion_get_relation_info()`, lion_am.c) now leaves such an index out of `rel->indexlist`, as the
-planner leaves out an index that is not valid - the hook's documented use, removing an index: no path
+the indexed one, a GROUP BY of it, a join on it. The hook that follows `get_relation_info()` -
+`get_relation_info_hook`, and from PostgreSQL 19, which replaced it, `build_simple_rel_hook` - now
+leaves such an index out of `rel->indexlist` (`lion_drop_other_format()`, lion_am.c), as the planner
+leaves out an index that is not valid - the hook's documented use, removing an index: no path
 of core's or lion's reads it, and the table's queries run without it, by core's plans. The backend
 warns of it once (an OID list in TopMemoryContext), so that a query slower than it was says why.
 Its readers refuse it as before - an insert into the table, VACUUM, `lion_index_verify()` and the
