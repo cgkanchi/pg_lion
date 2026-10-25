@@ -861,7 +861,7 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer)
 		probes = loops;
 	skew = lion_skew_scan_factor(root, scan);
 	if (skew > 1.0 && probes > 0.0)
-		*extra = probes * lion_skew_scan_extra(root, scan, skew, loops);
+		*extra = probes * lion_skew_scan_extra(root, scan, skew, loops, 0.0);
 	*outer = jp->outerjoinpath->total_cost;
 	return skew;
 }
