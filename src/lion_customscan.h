@@ -3973,7 +3973,13 @@ typedef struct LionUnits
 								 * (§39, "A skewed key's probes"), 1 for
 								 * none */
 	Cost		nlextra;		/* ... what the loop costs more at them */
-	Cost		nlouter;		/* ... and the cost of its outer side */
+	Cost		nlouter;		/* the cost of the loop's outer side */
+	Relids		nlouterrels;	/* ... and its rels, NULL for a loop in
+								 * a subquery's plan */
+	Cost		nlshared;		/* ... where the lion path reads that side
+								 * as its child at core's price, so that its
+								 * cold reads weigh against the loop's own
+								 * (lion_units_cold()); 0 otherwise */
 	double		skewscale;		/* the loop's price at core's rows over its
 								 * price at those, its outer side apart,
 								 * once the path is priced at them
