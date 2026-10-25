@@ -1,22 +1,31 @@
 #!/usr/bin/env python3
 """Lion's per-operation costs, measured against core's (DESIGN.md §49).
 
-Each lion-only operation the planner prices is timed against a core
-operation whose cost core states, on the same build, server and tables, and
-printed as a multiple of the core cost setting it is written in, beside what
-lion charges for it now.  A ratio of two operations on one machine carries
-to another far better than a rate of cost units a millisecond, which is the
-machine's: this is what "calibrated against core" means for a constant.
+Each lion-only operation the planner prices is timed against the core
+operation it stands in for, on the same build, server and tables, and
+priced as that core operation's own rate prices it: its time over core's
+price of it.  Core's plans do not all run at one rate - a cached Index Scan
+loop takes two or three times as long a cost unit as a sequential scan's
+quals - and a lion operation that competes with one of them must be priced
+in that one's units for the planner to weigh the two as their times weigh.
+A ratio of operations on one machine carries to another far better than a
+rate of cost units a millisecond, which is the machine's: this is what
+"calibrated against core" means for a constant.
 
-  anchor  cpu_operator_cost: the slope of a cached sequential scan's time
-          over the number of `a <> -k` quals it evaluates a row - each an
-          int4ne of procost 1, one cpu_operator_cost a row to core.
-  probe   a nested loop probe's own work an outer row (DESIGN.md §40.10,
-          §49): the heap probe over a set that passes every row, against
-          core's Index Scan of the same B-tree with no filter - the same
-          descents and the same heap fetches, the probe's set test and its
-          rescans apart.  The slope over the outer rows, so that the set's
-          build, made once, stays out of it.
+  anchor  cpu_operator_cost at a sequential scan's rate: the slope of a
+          cached sequential scan's time over the number of `a <> -k` quals
+          it evaluates a row - each an int4ne of procost 1, one
+          cpu_operator_cost a row to core.  Printed for comparison.
+  probe   a nested loop probe's own work (DESIGN.md §40.10, §49): the heap
+          probe over a set that passes every row, against core's Index Scan
+          of the same B-tree with no filter - the same descents and the same
+          heap fetches, the probe's set tests and its rescans apart - at the
+          Index Scan's rate: the slope of its time over the outer rows over
+          the slope of core's price of it.  The slopes, so that the set's
+          build, made once, stays out; taken of a unique key (an entry a
+          scan) and of a key of PROBE_MANY entries, which apportion it
+          between the scan (pg_lion.probe_rescan_cost) and the entry
+          (pg_lion.probe_entry_cost).
 
 Every query runs serial, JIT off, after a warm-up, interleaved round by
 round, each in its own transaction on one connection; the time is
@@ -39,7 +48,7 @@ import subprocess
 import sys
 
 SETUP = r"""
-DROP TABLE IF EXISTS calib_ops_a, calib_ops_fact, calib_ops_dim;
+DROP TABLE IF EXISTS calib_ops_a, calib_ops_fact, calib_ops_dim, calib_ops_many;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 
 -- the anchor's table: 2M narrow rows, all-visible, read from shared buffers
@@ -61,7 +70,18 @@ CREATE TABLE calib_ops_fact (id int PRIMARY KEY, dim_id int NOT NULL)
 INSERT INTO calib_ops_fact
 SELECT i, 1 + ((hashint8extended(i::bigint, 7) & 9223372036854775807) % 100000)::int
   FROM generate_series(1, 200000) i;
-VACUUM (FREEZE, ANALYZE) calib_ops_a, calib_ops_dim, calib_ops_fact;
+
+-- the probe of a key of eight entries: the dimension's keys eight times
+-- over, a key's rows on one page, under a B-tree on the key and a lion
+-- index on a four-valued column
+CREATE TABLE calib_ops_many (k int NOT NULL, grade int NOT NULL, v int NOT NULL)
+  WITH (autovacuum_enabled = off);
+INSERT INTO calib_ops_many
+SELECT 1 + (i - 1) / 8, i % 4, i FROM generate_series(1, 800000) i;
+CREATE INDEX calib_ops_many_k ON calib_ops_many (k);
+CREATE INDEX calib_ops_many_grade ON calib_ops_many USING lion (grade);
+VACUUM (FREEZE, ANALYZE) calib_ops_a, calib_ops_dim, calib_ops_fact,
+  calib_ops_many;
 """
 
 BASE = """SET max_parallel_workers_per_gather = 0;
@@ -70,6 +90,7 @@ SET jit = off;
 
 ANCHOR_QUALS = [0, 8, 16, 32]
 PROBE_LOOPS = [50000, 100000, 200000]
+PROBE_MANY = 8
 
 
 class Psql:
@@ -110,9 +131,10 @@ def nodes(plan):
         yield from nodes(p)
 
 
-def time_queries(psql, cases, warmup, repeats):
+def time_queries(psql, cases, warmup, repeats, prices=None):
     """cases: {name: (settings, query, check)}, check(plan) -> bool; the median
-    Execution Time of each, its runs interleaved with the others'."""
+    Execution Time of each, its runs interleaved with the others'; and into
+    prices, when given, each one's plan's Total Cost."""
     script = BASE
     for r in range(warmup + repeats):
         for name, (settings, q, _) in cases.items():
@@ -128,6 +150,8 @@ def time_queries(psql, cases, warmup, repeats):
                 raise RuntimeError('%s did not run the plan it stands for:\n%s'
                                    % (name, json.dumps(p['Plan'], indent=1)[:3000]))
             ms.append(float(p['Execution Time']))
+            if prices is not None:
+                prices[name] = float(p['Plan']['Total Cost'])
         res[name] = statistics.median(ms)
     return res
 
@@ -143,13 +167,17 @@ def slope(xs, ys):
 
 
 def settings_of(psql, names):
-    out = psql.run(''.join("SELECT current_setting('%s');\n" % n for n in names))
+    # planning over a lion index loads the library, whose settings then exist
+    out = psql.run('\\o /dev/null\nEXPLAIN SELECT 1 FROM calib_ops_dim WHERE grade = 0;\n'
+                   '\\o\n' +
+                   ''.join("SELECT current_setting('%s');\n" % n for n in names))
     return dict(zip(names, (float(v) for v in out.split())))
 
 
 def measure(args):
     psql = Psql(args)
-    s = settings_of(psql, ['cpu_operator_cost', 'cpu_tuple_cost'])
+    s = settings_of(psql, ['cpu_operator_cost', 'cpu_tuple_cost',
+                           'pg_lion.probe_entry_cost', 'pg_lion.probe_rescan_cost'])
     nrows = int(psql.run('SELECT count(*) FROM calib_ops_a;').strip())
 
     # the anchor: ns an int4ne qual a row
@@ -165,44 +193,75 @@ def measure(args):
     ms_per_qual, _ = slope(ANCHOR_QUALS, [t['q%d' % k] for k in ANCHOR_QUALS])
     ns_op = ms_per_qual * 1e6 / nrows
 
-    # the probe: its own ns an outer row over core's Index Scan's
+    # the probe: its own ns an outer row over core's Index Scan's, of a
+    # unique key and of a key of PROBE_MANY entries
     def probe(p):
         return any(n.get('Custom Plan Provider') == 'LionBtreeScan' for n in nodes(p))
 
-    def core(p):
-        return any(n['Node Type'] == 'Index Scan' and
-                   n.get('Relation Name') == 'calib_ops_dim' for n in nodes(p))
+    def core_of(rel):
+        def core(p):
+            return any(n['Node Type'] == 'Index Scan' and
+                       n.get('Relation Name') == rel for n in nodes(p))
+        return core
     loopset = ('SET LOCAL enable_hashjoin = off;\nSET LOCAL enable_mergejoin = off;\n'
                'SET LOCAL enable_memoize = off;\n')
-    cases = {}
-    for n in PROBE_LOOPS:
-        q = ('SELECT count(d.name) FROM calib_ops_fact f JOIN calib_ops_dim d '
-             'ON d.id = f.dim_id WHERE f.id <= %d' % n)
-        cases['p%d' % n] = (loopset + 'SET LOCAL pg_lion.enable_heap_probe = on;\n'
-                            'SET LOCAL pg_lion.pushdown_margin = 1000;\n',
-                            q + ' AND d.grade IN (0, 1, 2, 3)', probe)
-        cases['c%d' % n] = (loopset + 'SET LOCAL pg_lion.enable_btree_scan = off;\n'
-                            'SET LOCAL pg_lion.enable_ordered_scan = off;\n', q, core)
-    t2 = time_queries(psql, cases, args.warmup, args.repeats)
-    d_ms, d_fixed = slope(PROBE_LOOPS, [t2['p%d' % n] - t2['c%d' % n] for n in PROBE_LOOPS])
-    c_ms, _ = slope(PROBE_LOOPS, [t2['c%d' % n] for n in PROBE_LOOPS])
-    probe_ns = d_ms * 1e6
-    charged = 2 * s['cpu_tuple_cost'] + s['cpu_operator_cost']   # LO_PROBE_TUPLES
+    shapes = {
+        'one': ('calib_ops_dim', 'd.name', 'd.id', 1),
+        'many': ('calib_ops_many', 'd.v', 'd.k', PROBE_MANY),
+    }
+    probes = {}
+    for shape, (rel, col, key, entries) in shapes.items():
+        cases = {}
+        for n in PROBE_LOOPS:
+            q = ('SELECT count(%s) FROM calib_ops_fact f JOIN %s d '
+                 'ON %s = f.dim_id WHERE f.id <= %d' % (col, rel, key, n))
+            cases['p%d' % n] = (loopset + 'SET LOCAL pg_lion.enable_heap_probe = on;\n'
+                                'SET LOCAL pg_lion.pushdown_margin = 1000;\n',
+                                q + ' AND d.grade IN (0, 1, 2, 3)', probe)
+            cases['c%d' % n] = (loopset + 'SET LOCAL pg_lion.enable_btree_scan = off;\n'
+                                'SET LOCAL pg_lion.enable_ordered_scan = off;\n', q,
+                                core_of(rel))
+        prices = {}
+        t2 = time_queries(psql, cases, args.warmup, args.repeats, prices)
+        d_ms, d_fixed = slope(PROBE_LOOPS, [t2['p%d' % n] - t2['c%d' % n]
+                                            for n in PROBE_LOOPS])
+        c_ms, _ = slope(PROBE_LOOPS, [t2['c%d' % n] for n in PROBE_LOOPS])
+        c_price, _ = slope(PROBE_LOOPS, [prices['c%d' % n] for n in PROBE_LOOPS])
+        # the Index Scan's own rate: its ns an outer row over core's price
+        # of an outer row, in ns a cpu_operator_cost
+        ns_op_core = c_ms * 1e6 / (c_price / s['cpu_operator_cost'])
+        probes[shape] = {'entries': entries, 'ms': t2, 'prices': prices,
+                         'core_ns_per_loop': c_ms * 1e6,
+                         'core_price_per_loop': c_price,
+                         'core_ns_per_cpu_operator_cost': ns_op_core,
+                         'probe_ns_per_loop_over_core': d_ms * 1e6,
+                         'probe_cpu_operator_costs_per_loop':
+                             d_ms * 1e6 / ns_op_core,
+                         'build_ms': d_fixed}
+
+    # apportioned between the scan and the entry, from the two shapes, each
+    # in its Index Scan's units
+    one = probes['one']
+    many = probes['many']
+    entry = ((many['probe_cpu_operator_costs_per_loop'] -
+              one['probe_cpu_operator_costs_per_loop']) /
+             (many['entries'] - one['entries']))
+    scan = one['probe_cpu_operator_costs_per_loop'] - entry
 
     res = {
         'anchor': {'rows': nrows, 'ms': t, 'ns_per_cpu_operator_cost': ns_op},
-        'probe': {'ms': t2, 'core_ns_per_loop': c_ms * 1e6,
-                  'probe_ns_per_loop_over_core': probe_ns,
-                  'build_ms': d_fixed,
-                  'measured_cpu_operator_costs': probe_ns / ns_op,
-                  'charged_cpu_operator_costs': charged / s['cpu_operator_cost']},
+        'probe': probes,
+        'probe_apportioned': {
+            'scan_cpu_operator_costs': scan,
+            'entry_cpu_operator_costs': entry,
+            'charged_scan_cpu_operator_costs': s['pg_lion.probe_rescan_cost'],
+            'charged_entry_cpu_operator_costs': s['pg_lion.probe_entry_cost']},
     }
     return res
 
 
 def report(res):
     a = res['anchor']
-    p = res['probe']
     print('## Anchor\n')
     print('| quals a row | ms |')
     print('|---|---|')
@@ -211,16 +270,25 @@ def report(res):
     print('\n%.2f ns a qual a row over %d rows: one cpu_operator_cost.\n'
           % (a['ns_per_cpu_operator_cost'], a['rows']))
     print('## Probe\n')
-    print('| outer rows | heap probe ms | core Index Scan ms |')
-    print('|---|---|---|')
-    for n in PROBE_LOOPS:
-        print('| %d | %.2f | %.2f |' % (n, p['ms']['p%d' % n], p['ms']['c%d' % n]))
-    print('\ncore: %.0f ns an outer row; the probe %+.1f ns an outer row over it '
-          '(and %.2f ms once, its set);' % (p['core_ns_per_loop'],
-                                            p['probe_ns_per_loop_over_core'],
-                                            p['build_ms']))
-    print('measured %.1f cpu_operator_costs an entry, charged %.1f.'
-          % (p['measured_cpu_operator_costs'], p['charged_cpu_operator_costs']))
+    print('| entries a key | outer rows | heap probe ms | core Index Scan ms |')
+    print('|---|---|---|---|')
+    for shape, p in res['probe'].items():
+        for n in PROBE_LOOPS:
+            print('| %d | %d | %.2f | %.2f |' % (p['entries'], n, p['ms']['p%d' % n],
+                                                p['ms']['c%d' % n]))
+    for shape, p in res['probe'].items():
+        print('\n%d entries a key: core %.0f ns an outer row, priced %.4f - %.2f ns a '
+              'cpu_operator_cost; the probe %+.1f ns an outer row over it, %.1f '
+              'cpu_operator_costs at that rate (and %.2f ms once, its set).'
+              % (p['entries'], p['core_ns_per_loop'], p['core_price_per_loop'],
+                 p['core_ns_per_cpu_operator_cost'],
+                 p['probe_ns_per_loop_over_core'],
+                 p['probe_cpu_operator_costs_per_loop'], p['build_ms']))
+    ap = res['probe_apportioned']
+    print('\nA scan %.1f cpu_operator_costs (pg_lion.probe_rescan_cost %.1f); an entry '
+          '%.1f (pg_lion.probe_entry_cost %.1f).'
+          % (ap['scan_cpu_operator_costs'], ap['charged_scan_cpu_operator_costs'],
+             ap['entry_cpu_operator_costs'], ap['charged_entry_cpu_operator_costs']))
 
 
 def main():

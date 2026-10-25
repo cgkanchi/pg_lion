@@ -30543,7 +30543,7 @@ five to seven runs on a shared VM whose runs vary by a third, so a difference be
 |---|---|---|---|---|
 | 3,585 | 0.7% | 6.9 ms | 11.1 ms | the probe |
 | 3,585 | 10% | 7.3 to 10.5 | 10.6 | the probe |
-| 40,000 | 10% | 65.9 | 80.2 | the probe |
+| 40,000 | 10% | 65.9 | 80.2 | core's, at a price 1.8% below the probe's ("The probe's own work", below) |
 | 200,000 | 10% | 267 | 406 | core's, at a price 1% below the probe's |
 | 4,000 | 100% | 12.3 | 13.0 | core's (the set rejects nothing) |
 | 200,000 | 100% | 388 | 376 | core's |
@@ -30559,35 +30559,68 @@ the probe saves are pages, and its price shows them.
 
 ### Calibration (`bench/calib/ops.py`)
 
-A lion constant is a multiple of a core cost setting; what it should be is the ratio of the time of
-lion's operation to the time of the core operation that setting prices, both on the same build and
-machine - a ratio that carries to another machine, where a rate of cost units a millisecond does
-not. `bench/calib/ops.py` checks such ratios into the tree. Its anchor is `cpu_operator_cost`: the
-slope of a cached sequential scan's time over the number of `a <> -k` quals it evaluates a row, each
-an `int4ne` of procost 1. Its first lion operation is a probe's own work an outer row: the heap probe
-over a set that passes every row against core's Index Scan of the same B-tree with no filter - the
-same descents and fetches - taken as the slope over 50,000, 100,000 and 200,000 outer rows, so that
-the set's build stays out of it.
+A lion constant is a multiple of a core cost setting; what multiple is set by the core operation the
+lion operation stands in for. Core's plans do not run at one rate. On PostgreSQL 18.6 (release), on
+the shared VM above, a cached sequential scan's quals take 4.9 to 5.5 ns a `cpu_operator_cost` - the
+slope of its time over the number of `a <> -k` quals a row - and a nested loop of cached Index Scans
+12 to 15 ns: core prices a descent and a heap fetch at less of their time than a qual. A lion
+operation that competes with one of them is priced at that one's rate - its time over core's price
+of it - so that the planner weighs the two as their times weigh. Priced at the sequential scan's
+rate, a probe's few hundred nanoseconds cost two and a half times what core charges for the same
+time in the Index Scan the probe replaces. A ratio measured on one machine carries to another far
+better than a rate of cost units a millisecond, which is the machine's. This is not §39's rates: a
+constant is fitted once, offline, against the core operation its own shape replaces, and no price
+reads the plan it meets.
 
-On PostgreSQL 18.6 (release), on the shared VM above with nothing else running, three runs of 21
-rounds each: a `cpu_operator_cost` is 4.90 to 5.12 ns; core's Index Scan loop 1,311 to 1,351 ns an
-outer row; and the probe 98 to 169 ns an outer row over it - 20 to 34 `cpu_operator_cost`s, where
-`lo_cost()` charges an entry `LO_PROBE_TUPLES` (2) `cpu_tuple_cost`s and a `cpu_operator_cost`, 9.
-Under callgrind (a single-user backend, the same query at 10,000 and 30,000 outer rows, the
-difference over 20,000) the probe runs 10,198 instructions an outer row against core's 9,849, the
-same descents, buffer and heap work in both; of the 349 more, the set's test is 195
-(`lo_set_find()` 84, `lion_container_contains()` 110) - about 10 `cpu_operator_cost`s at the
-anchor, which the 9 charged meets - and the rest is the executor's: the node's projection of its
-target into a slot of its own (`ExecInterpExpr`, 79), where core's Index Scan returns the heap tuple
-through a physical target list, and `lo_next()` and `lo_rescan()` (194) against core's
-`IndexNext()`, `index_getnext_slot()` and rescan (about 120). So the constant stands for what it
-prices, and the 150 instructions past it are the node's to remove rather than lion's to charge.
-Taken at 25, the
-probe's price rises by 0.04 a scan, and the 40,000-row row of the table above - the probe at 0.58 a
-scan against core's 0.60 - goes to core's plan, which runs it 1.2 times slower: the same price of a
-cached heap fetch as at 200,000 rows, met sooner. A measured constant on lion's side cannot make up
-for core's price on its own; how lion's plans fare against core's on a warm machine will rest on
-core's page costs as the deployment sets them.
+`bench/calib/ops.py` checks the measurements into the tree. It prints the sequential scan's rate for
+comparison; its first lion operation is the probe: the heap probe over a set that passes every row,
+against core's Index Scan of the same B-tree with no filter - the same descents and fetches - as the
+slopes of their times and of core's price over 50,000, 100,000 and 200,000 outer rows, so that the
+set's build stays out; of a unique key (`calib_ops_dim`) and of a key of eight entries on one page
+(`calib_ops_many`), which apportion the probe's own work between the scan and the entry.
+
+**The probe's own work.** Under callgrind (a single-user backend, 10,000 and 30,000 outer rows, with
+the cache and branch simulators, the difference over 20,000) a scan of the probe runs no more
+instructions than core's Index Scan, but 134 instruction cache misses to core's 69: the node's code -
+`lo_next()`, `lo_rescan()`, the set's lookup - runs beside core's between one outer row and the next,
+and the two no longer fit the first-level cache. An entry costs about 370 instructions more: the
+set's lookup, two binary searches - the container key's (`lo_set_find()`, 96 instructions and 1.6
+mispredicted branches an entry) and the member's in its container (`lion_container_contains()`, 110
+and 1.4) - and the node's projection of its target into a slot of its own (about 110 with its
+bookkeeping), where core's Index Scan returns the heap tuple through a physical target list. The
+key's search now starts within what sorted, distinct keys allow - an index no further from either end
+than the key is from that end's key - so a set with a container at every key of its range, as a set
+of a share of most blocks' rows has, finds it with no search: one run before measured an entry at 93
+ns over core's, seven after at 31 to 107 (median 49).
+
+Over those seven runs, at the Index Scan's rate, an outer row of a unique key costs the probe 14 to 29
+`cpu_operator_cost`s more than core's (median 20), one of eight entries 40 to 70 (median 51): an entry
+4.4, a scan 15.6. They are two settings: `pg_lion.probe_entry_cost` (4.5), charged by `lo_cost()` for
+each entry an index parameterized by the outer row walks, in place of the walk's `LO_PROBE_TUPLES`
+(a probe marks nothing), and `pg_lion.probe_rescan_cost` (16), charged a scan of LionBtreeScan's
+probe. A probe of a unique key was charged 9 an entry and nothing a scan, and is now charged 20.5.
+LionProbeJoin's probes (`lion_ordered_probe_price()`) take the entry's price; a scan of them is the
+join's own loop, not a node's rescan, and is not measured.
+
+**The descent is startup.** `lo_cost()` puts the B-tree's descent in the walk's run, so LionBtreeScan's
+probe offered `add_path()` a first row at 0.00 against core's Index Scan's 0.29 - for the same
+descent - and, its total within `add_path()`'s 1% of core's, won on it: at 40,000 outer rows the plan
+above was the probe's at a price 1.8% above core's. The probe's path now takes the descent as its
+startup, as `cost_index()` has an Index Scan's (`ipath`'s startup, in `lo_set_rel_pathlist()`). The
+walks keep it in their run - one descent beside a set's build - and `lion_ordered_probe_price()`,
+which takes a probe's price as its total less its startup, the build, keeps it in the probe's price.
+
+**What it costs.** Priced so, the probe keeps the 3,585-row loop of the table above and loses the
+40,000-row one to core's Index Scan, at a price 1.8% below the probe's - re-timed, the probe 70.5 ms
+against core's 77.9 - and the 196,000-row one (359 against 419). The probe's saving is heap fetches
+of cached pages, which core prices at an Index Scan's entry and its fetch, `cpu_index_tuple_cost` +
+`cpu_operator_cost` + `cpu_tuple_cost`: 7 `cpu_operator_cost`s, about 95 ns at the Index Scan's rate,
+against about 300 ns measured for each row past the first of a key's eight on one page (the
+`calib_ops_many` loop), and more for a row on a page of its own. A probe that saves most of them wins
+by more than its price says, and the near ties go to core's plan. That is core's price of a cached
+fetch, which every core plan takes too; by this section's rule the probe takes it as well, and how
+lion's plans fare against core's on a warm machine rests on core's page costs as the deployment sets
+them.
 
 **Not done.**
 
@@ -30596,11 +30629,17 @@ core's page costs as the deployment sets them.
   as LionProbeJoin's labels give a predicate's truth, and be covering for it.
 - *The comparison with LionProbeJoin and LionOrderedJoin* on their fixtures and the private
   workload, with the switch off, before either default changes.
-- *The probe's own overhead* (above): a physical target list where the node projects nothing, and
-  `lo_next()`'s and `lo_rescan()`'s path for a probe; then `ops.py` again. And the harness's next
-  operations - the set's build a container (`lo_build_excess()`'s `LO_BUILD_PIECE_TIDS` is a
-  correction of §30.3's price, not a measurement of its own), a container's AND, a count - each a
-  ratio to the core operation of its unit.
+- *The probe's projection* (above). Core's Index Scan under a plain nested loop returns the heap
+  tuple; the node projects its target. Core gives a CustomPath no physical target list
+  (`use_physical_tlist()`), and `PlanCustomPath` is not told whether its parent needs an exact one
+  (an Append's child) or a small one (a Memoize's) - the flags `create_scan_plan()` reads; a
+  pathtarget of the relation's columns would have a Memoize cache whole rows.
+- *LionProbeJoin's scan*: its overhead over core's nested loop, which `probe_rescan_cost` does not
+  price.
+- *The harness's next operations* - the set's build a container (`lo_build_excess()`'s
+  `LO_BUILD_PIECE_TIDS` is a correction of §30.3's price, not a measurement of its own), a
+  container's AND, a count - each against the core operation it stands in for, at that operation's
+  rate.
 
 **Tests.** test/sql/heapprobe.sql: every query through the heap probe and through core's plan,
 answers compared - an inner join, a left join, a Memoize chosen at the prices, an ORDER BY the loop
