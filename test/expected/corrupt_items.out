@@ -834,6 +834,71 @@ ERROR:  index "lion_di_old_i" is not a valid lion index
 DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14.
 HINT:  REINDEX the index: its on-disk format predates this build of pg_lion.
 CONTEXT:  while cleaning up index "lion_di_old_i" of relation "public.lion_di"
+-- To the planner such an index is not there (DESIGN.md §21, "An index of
+-- another format"): it reads lion indexes for its estimates whether or not
+-- the plan uses them, and every query that so much as estimated the column
+-- failed with the index's error.  A new backend - one whose relcache holds
+-- no state of the index, as every backend after an upgrade - warns of it
+-- once and plans the table's queries without it; an insert still refuses
+-- it, and a REINDEX gives it back to the planner.
+CREATE FUNCTION lion_di_lion(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	lion boolean := false;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		lion := lion OR ln ~ '(Lion|lion_di_old_i)';
+	END LOOP;
+	RETURN lion;
+END $$;
+\c
+SET statement_timeout = '60s';
+SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;
+WARNING:  lion index "lion_di_old_i" is of another on-disk format, and is not used
+HINT:  REINDEX the index.  Until then the planner leaves it out, and inserts into its table and VACUUM fail.
+ planned_with_lion 
+-------------------
+ f
+(1 row)
+
+SELECT count(*) FROM lion_di WHERE k = 7;
+ count 
+-------
+   904
+(1 row)
+
+SELECT k, count(*) FROM lion_di GROUP BY k ORDER BY k;
+ k | count 
+---+-------
+ 1 | 13560
+ 7 |   904
+(2 rows)
+
+SELECT count(*) FROM lion_di a JOIN lion_di b ON a.k = b.k WHERE a.k = 7 AND b.k = 7;
+ count  
+--------
+ 817216
+(1 row)
+
+INSERT INTO lion_di VALUES (7);
+ERROR:  index "lion_di_old_i" is not a valid lion index
+DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14.
+HINT:  REINDEX the index: its on-disk format predates this build of pg_lion.
+REINDEX INDEX lion_di_old_i;
+SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;
+ planned_with_lion 
+-------------------
+ t
+(1 row)
+
+SELECT count(*) FROM lion_di WHERE k = 7;
+ count 
+-------
+   904
+(1 row)
+
+DROP FUNCTION lion_di_lion(text);
 DROP INDEX lion_di_old_i;
 DROP FUNCTION lion_di_hint(text);
 -- ---------- 11. an entry whose line pointer reaches into a CHAIN entry ----------
