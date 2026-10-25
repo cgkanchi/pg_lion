@@ -1398,12 +1398,15 @@ lion_cost_set_pages(PlannerInfo *root, RelOptInfo *rel,
  * The parts come back in *out, so that a caller that repeats the AND - a
  * nested loop's inner scan - can amortize its pages over the repetitions.
  * isect is what the intersection probe found of the AND's rows against the
- * product of the clauses' selectivities (lion_merge_cpu_cost()).
+ * product of the clauses' selectivities (lion_merge_cpu_cost()).  skewed
+ * prices each clause that equates a skewed key to a value the plan does not
+ * know at the rows a probed key meets (lion_skew_clauses_factor(); DESIGN.md
+ * §40.12), the others at their own.
  */
 Cost
 lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 				  IndexOptInfo **idxs, const AttrNumber *cols, Node **clauses,
-				  double isect, LionAndCost *out)
+				  double isect, bool skewed, LionAndCost *out)
 {
 	LionSetClause *sc;
 	double	   *members;
@@ -1438,7 +1441,11 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 	for (i = 0; i < n; i++)
 	{
-		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], 1.0,
+		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i],
+							 skewed ?
+							 lion_skew_clauses_factor(root, rel,
+													  list_make1(clauses[i])) :
+							 1.0,
 							 &sc[i]);
 
 		lookup += sc[i].lookup;

@@ -29,6 +29,7 @@
 #define CL_NOTNULL	6
 #define CL_BOOL		7			/* a boolean column by itself */
 #define CL_BOOLTEST 8			/* col IS [NOT] TRUE / FALSE / UNKNOWN */
+#define CL_RANGE	9			/* col < v, <=, >=, > (a caller's ranges) */
 
 typedef struct CellLeaf
 {
@@ -39,6 +40,7 @@ typedef struct CellLeaf
 								 * FROM NULL */
 	bool		empty;			/* a list of no element */
 	BoolTestType btype;			/* CL_BOOLTEST */
+	StrategyNumber strategy;	/* CL_RANGE: col's side, LION_STRAT_LT .. GT */
 } CellLeaf;
 
 /* A column the predicates are of, as it is being found. */
@@ -56,6 +58,9 @@ typedef struct CellDim
 	FmgrInfo	eqfn;
 	bool		equalimage;
 	List	   *preds;			/* its predicates, by number */
+	bool		ranged;			/* it has a CL_RANGE leaf */
+	int		   *rank;			/* RANGED: each value's place in the order */
+	int		   *byrank;			/* ... and the value at each place */
 	int			nbit;			/* its multi-key leaves */
 	Node	   *bitleaf[LION_CELLS_MAX_BITS];
 	LionLeafInfo bitinfo[LION_CELLS_MAX_BITS];
@@ -80,6 +85,7 @@ typedef struct CellsCx
 	List	   *preds;			/* CellPred */
 	CellDim		dims[LION_CELLS_MAX_DIMS];
 	int			ndim;
+	bool		ranges;			/* ranges are leaves (lion_cells_analyze()) */
 	bool		failed;
 } CellsCx;
 
@@ -113,6 +119,32 @@ cells_scalar_strategy(CellsCx *cx, Var *var, Oid opno)
 	if (idx == NULL || !OidIsValid(opno))
 		return 0;
 	return get_op_opfamily_strategy(opno, idx->opfamily[col - 1]);
+}
+
+/*
+ * The equality of a range's operator opno, col's side on the left: the
+ * member of the scalar lion index's family for the same pair of types, which
+ * the range's bound is told apart from the column's other values by
+ * (cells_dim_valop()); InvalidOid when the family has none.
+ */
+static Oid
+cells_range_eqop(CellsCx *cx, Var *var, Oid opno)
+{
+	AttrNumber	col;
+	IndexOptInfo *idx = lion_find_roaring_index(cx->rel, var->varattno,
+												 false, &col);
+	int			strategy;
+	Oid			lt;
+	Oid			rt;
+
+	if (idx == NULL || !op_in_opfamily(opno, idx->opfamily[col - 1]))
+		return InvalidOid;
+	get_op_opfamily_properties(opno, idx->opfamily[col - 1], false,
+							   &strategy, &lt, &rt);
+	if (lt != rt)
+		return InvalidOid;
+	return get_opfamily_member(idx->opfamily[col - 1], lt, rt,
+							   LION_STRAT_EQUAL);
 }
 
 /*
@@ -216,6 +248,10 @@ cells_scalar_leaf(CellsCx *cx, Node *node, Var **var, int *kind, Oid *eqop)
 			*kind = CL_NE;
 			*eqop = get_negator(opno);
 		}
+		else if (cx->ranges && LION_STRAT_IS_RANGE(strategy) &&
+				 getBaseType(v->vartype) != BOOLOID &&
+				 OidIsValid(*eqop = cells_range_eqop(cx, v, opno)))
+			*kind = CL_RANGE;
 		else
 			return false;
 		*var = v;
@@ -494,11 +530,33 @@ cells_note_leaves(CellsCx *cx, CellDim *dim, Node *node)
 		case CL_EQ:
 		case CL_NE:
 		case CL_DISTINCT:
+		case CL_RANGE:
 			{
 				OpExpr	   *op = (OpExpr *) node;
 				Node	   *l = lion_strip((Node *) linitial(op->args));
 				Const	   *c = (Const *) (IsA(l, Const) ? l :
 										   lion_strip((Node *) lsecond(op->args)));
+
+				if (kind == CL_RANGE)
+				{
+					/* the strategy with the column on the left */
+					AttrNumber	col;
+					IndexOptInfo *idx = lion_find_roaring_index(cx->rel,
+																 v->varattno,
+																 false, &col);
+					Oid			opno = IsA(l, Const) ?
+						get_commutator(op->opno) : op->opno;
+
+					leaf->strategy = (idx == NULL || !OidIsValid(opno)) ? 0 :
+						get_op_opfamily_strategy(opno,
+												 idx->opfamily[col - 1]);
+					if (!LION_STRAT_IS_RANGE(leaf->strategy))
+					{
+						cx->failed = true;
+						break;
+					}
+					dim->ranged = true;
+				}
 
 				if (c->constisnull)
 					leaf->hasnull = true;
@@ -726,18 +784,52 @@ cells_null_test(Var *var)
 }
 
 /*
- * The truth of scalar tree node in value u of dimension dim: u < nval one of
- * its values, nval any other, nval + 1 NULL - in SQL's three-valued logic,
- * as the executor would compute it of a row with that value.
+ * The pieces of a RANGED dimension's column (DESIGN.md §46, "Ranges"): its
+ * m values in the order of the index's family, and the gaps around them -
+ * piece 2r + 1 the value at place r, piece 2g the values between the ones
+ * at places g - 1 and g (below the first for g = 0, above the last for
+ * g = m) - and NULL, piece 2m + 1.  Any other dimension's are its values,
+ * any other value (nval) and NULL (nval + 1).
+ */
+static int
+cells_npieces(const CellDim *dim)
+{
+	int			nval = list_length(dim->consts);
+
+	return dim->ranged ? 2 * nval + 2 : nval + 2;
+}
+
+/*
+ * The truth of scalar tree node in piece u of dimension dim
+ * (cells_npieces()) - in SQL's three-valued logic, as the executor would
+ * compute it of a row whose value is in it.
  */
 static int
 cells_eval(CellDim *dim, Node *node, int u)
 {
 	int			nval = list_length(dim->consts);
-	bool		isnull = (u == nval + 1);
-	bool		isval = (u < nval);
+	bool		isnull;
+	int			valno = -1;		/* the value it is, or -1 */
+	int			gap = -1;		/* RANGED: the gap it is, or -1 */
+	bool		isval;
 	CellLeaf   *leaf = NULL;
 	ListCell   *lc;
+
+	if (dim->ranged)
+	{
+		isnull = (u == 2 * nval + 1);
+		if (!isnull && (u % 2) == 1)
+			valno = dim->byrank[(u - 1) / 2];
+		else if (!isnull)
+			gap = u / 2;
+	}
+	else
+	{
+		isnull = (u == nval + 1);
+		if (u < nval)
+			valno = u;
+	}
+	isval = (valno >= 0);
 
 	if (IsA(node, BoolExpr))
 	{
@@ -783,17 +875,54 @@ cells_eval(CellDim *dim, Node *node, int u)
 	{
 		case CL_EQ:
 			return isnull ? LION_TRUTH_NULL :
-				TV(isval && bms_is_member(u, leaf->vals));
+				TV(isval && bms_is_member(valno, leaf->vals));
 		case CL_NE:
 			return isnull ? LION_TRUTH_NULL :
-				TV(!(isval && bms_is_member(u, leaf->vals)));
+				TV(!(isval && bms_is_member(valno, leaf->vals)));
+		case CL_RANGE:
+			{
+				/*
+				 * The bound's place rk: a value at place r is below it for
+				 * r < rk, and a gap g's values for g <= rk - they are below
+				 * the value at place g.
+				 */
+				int			rk = dim->rank[bms_singleton_member(leaf->vals)];
+				bool		below;
+				bool		at;
+
+				Assert(dim->ranged);
+				if (isnull)
+					return LION_TRUTH_NULL;
+				if (isval)
+				{
+					below = dim->rank[valno] < rk;
+					at = dim->rank[valno] == rk;
+				}
+				else
+				{
+					below = gap <= rk;
+					at = false;
+				}
+				switch (leaf->strategy)
+				{
+					case LION_STRAT_LT:
+						return TV(below);
+					case LION_STRAT_LE:
+						return TV(below || at);
+					case LION_STRAT_GE:
+						return TV(!below);
+					case LION_STRAT_GT:
+						return TV(!below && !at);
+				}
+			}
+			break;
 		case CL_IN:
 			/* ANY of no element is false, of a NULL too (ExecEvalScalarArrayOp) */
 			if (leaf->empty)
 				return LION_TRUTH_FALSE;
 			if (isnull)
 				return LION_TRUTH_NULL;
-			if (isval && bms_is_member(u, leaf->vals))
+			if (isval && bms_is_member(valno, leaf->vals))
 				return LION_TRUTH_TRUE;
 			return leaf->hasnull ? LION_TRUTH_NULL : LION_TRUTH_FALSE;
 		case CL_NOTIN:
@@ -801,24 +930,24 @@ cells_eval(CellDim *dim, Node *node, int u)
 				return LION_TRUTH_TRUE;
 			if (isnull)
 				return LION_TRUTH_NULL;
-			if (isval && bms_is_member(u, leaf->vals))
+			if (isval && bms_is_member(valno, leaf->vals))
 				return LION_TRUTH_FALSE;
 			return leaf->hasnull ? LION_TRUTH_NULL : LION_TRUTH_TRUE;
 		case CL_DISTINCT:
 			if (leaf->hasnull)
 				return TV(!isnull);
-			return TV(isnull || !(isval && bms_is_member(u, leaf->vals)));
+			return TV(isnull || !(isval && bms_is_member(valno, leaf->vals)));
 		case CL_ISNULL:
 			return TV(isnull);
 		case CL_NOTNULL:
 			return TV(!isnull);
 		case CL_BOOL:
 			return isnull ? LION_TRUTH_NULL :
-				TV(isval && bms_is_member(u, leaf->vals));
+				TV(isval && bms_is_member(valno, leaf->vals));
 		case CL_BOOLTEST:
 			{
 				/* vals holds true's number; false is the other value */
-				bool		istrue = isval && bms_is_member(u, leaf->vals);
+				bool		istrue = isval && bms_is_member(valno, leaf->vals);
 				bool		isfalse = isval && !istrue;
 
 				switch (leaf->btype)
@@ -956,14 +1085,363 @@ cells_sel(CellsCx *cx, Node *clause)
 }
 
 /*
+ * A scalar dimension's outcomes (DESIGN.md §10, "Counts by cells"): its
+ * pieces (cells_npieces()) - each value named, any other and NULL - grouped
+ * by the truths sig gives them.  The outcome of each piece into out, and a
+ * piece of each outcome into rep.
+ */
+static void
+cells_scalar_outcomes(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp,
+					  const uint8 *sig, int npd, bool nonull, int *out,
+					  int *rep)
+{
+	LionCellsDimPriv *pv = &dp->priv;
+	int			nval = list_length(dim->consts);
+	int			nu = nval + 2;
+	int			nout = 0;
+	bool		noother;
+	int			u;
+
+	/*
+	 * Any other value's outcome is 0, then the rest as they come.  A boolean
+	 * column both of whose values are named has no other value: its outcome
+	 * 0 is its first value's, which then needs no label either.  A column
+	 * declared NOT NULL has no NULL, which is then outcome 0 too.
+	 */
+	noother = dim->hasvalop && dim->valtype == BOOLOID && nval == 2;
+	rep[nout] = noother ? 0 : nval;
+	out[nval] = nout++;
+	if (noother)
+		out[0] = 0;
+	if (nonull)
+		out[nval + 1] = 0;
+	for (u = 0; u < nu; u++)
+	{
+		int			o;
+
+		if (u == nval || (noother && u == 0) || (nonull && u == nval + 1))
+			continue;
+		for (o = 0; o < nout; o++)
+		{
+			if (memcmp(&sig[(Size) u * npd], &sig[(Size) rep[o] * npd],
+					   npd) == 0)
+				break;
+		}
+		if (o == nout)
+			rep[nout++] = u;
+		out[u] = o;
+	}
+	pv->radix = nout;
+	pv->nullout = out[nval + 1];
+	pv->nval = 0;
+	pv->vals = NIL;
+	pv->valout = (int *) palloc(sizeof(int) * Max(nval, 1));
+	dp->valsel = (double *) palloc(sizeof(double) * Max(nval, 1));
+	for (u = 0; u < nval; u++)
+	{
+		Const	   *c = (Const *) list_nth(dim->consts, u);
+
+		if (out[u] == 0)
+			continue;
+		pv->vals = lappend(pv->vals, c);
+		pv->valout[pv->nval] = out[u];
+		dp->valsel[pv->nval] =
+			cells_sel(cx, (Node *) make_opclause(dim->eqop, BOOLOID, false,
+												 (Expr *) dim->var,
+												 (Expr *) c, InvalidOid,
+												 dim->coll));
+		pv->nval++;
+	}
+}
+
+/* What cells_value_cmp() sorts a RANGED dimension's values by */
+typedef struct CellsOrderCx
+{
+	FmgrInfo   *cmp;
+	Oid			coll;
+	Const	  **vals;
+	bool		tie;			/* two values the order calls equal */
+} CellsOrderCx;
+
+static int
+cells_value_cmp(const void *a, const void *b, void *arg)
+{
+	CellsOrderCx *ox = (CellsOrderCx *) arg;
+	int			r = DatumGetInt32(FunctionCall2Coll(ox->cmp, ox->coll,
+													ox->vals[*(const int *) a]->constvalue,
+													ox->vals[*(const int *) b]->constvalue));
+
+	if (r == 0 && *(const int *) a != *(const int *) b)
+		ox->tie = true;
+	return (r > 0) - (r < 0);
+}
+
+/* `var op c`, an operator of the dimension's family for its values' type */
+static Expr *
+cells_bound(const LionCellsDimPlan *dp, Oid opno, Const *c)
+{
+	return make_opclause(opno, BOOLOID, false, (Expr *) copyObject(dp->var),
+						 (Expr *) copyObject(c), InvalidOid,
+						 dp->priv.collation);
+}
+
+/*
+ * A RANGED dimension (DESIGN.md §46, "Ranges"), its index known: its values
+ * put in the order of the index's family (LION_CMP_PROC), every range leaf's
+ * operator one of that index's range strategies, and the family's members
+ * found that bound the runs of its outcomes.  False to decline.
+ */
+static bool
+cells_ranged_order(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp,
+				   Oid *ops)
+{
+	IndexOptInfo *idx = dp->idx;
+	Oid			opfamily = idx->opfamily[dp->col - 1];
+	Oid			type = IsPolymorphicType(idx->opcintype[dp->col - 1]) ?
+		idx->opcintype[dp->col - 1] : dim->valtype;
+	int			nval = list_length(dim->consts);
+	Oid			cmpproc;
+	FmgrInfo	cmp;
+	CellsOrderCx ox;
+	int			i;
+	ListCell   *lc;
+	static const StrategyNumber strategies[] = {
+		LION_STRAT_LT, LION_STRAT_LE, LION_STRAT_GE, LION_STRAT_GT
+	};
+
+	if (nval == 0)
+		return false;
+	cmpproc = get_opfamily_proc(opfamily, type, type, LION_CMP_PROC);
+	if (!OidIsValid(cmpproc))
+		return false;
+	for (i = 0; i < 4; i++)
+	{
+		ops[i] = get_opfamily_member(opfamily, type, type, strategies[i]);
+		if (!OidIsValid(ops[i]))
+			return false;
+	}
+
+	/* every range leaf an index range of this index's column */
+	foreach(lc, dim->leaves)
+	{
+		CellLeaf   *leaf = (CellLeaf *) lfirst(lc);
+		OpExpr	   *op = (OpExpr *) leaf->node;
+		Oid			opno;
+		AttrNumber	col;
+
+		if (leaf->kind != CL_RANGE)
+			continue;
+		opno = IsA(lion_strip((Node *) linitial(op->args)), Const) ?
+			get_commutator(op->opno) : op->opno;
+		if (lion_match_index(cx->rel, dim->var->varattno, LION_CLAUSE_RANGE,
+							 opno, dim->valtype, leaf->strategy, InvalidOid,
+							 dim->coll, false, &col) != idx ||
+			col != dp->col)
+			return false;
+	}
+
+	/* the values in order, no two of them one place */
+	fmgr_info(cmpproc, &cmp);
+	ox.cmp = &cmp;
+	ox.coll = dim->coll;
+	ox.vals = (Const **) palloc(sizeof(Const *) * nval);
+	ox.tie = false;
+	dim->byrank = (int *) palloc(sizeof(int) * nval);
+	dim->rank = (int *) palloc(sizeof(int) * nval);
+	i = 0;
+	foreach(lc, dim->consts)
+	{
+		ox.vals[i] = (Const *) lfirst(lc);
+		dim->byrank[i] = i;
+		i++;
+	}
+	qsort_arg(dim->byrank, nval, sizeof(int), cells_value_cmp, &ox);
+	if (ox.tie)
+		return false;
+	for (i = 0; i < nval; i++)
+		dim->rank[dim->byrank[i]] = i;
+	return true;
+}
+
+/*
+ * A RANGED dimension's outcomes (DESIGN.md §46, "Ranges"): its pieces
+ * (cells_npieces()) grouped by the truths sig gives them, the group that
+ * holds the most rows by the planner's estimates outcome 0 - its rows need
+ * no label - and the others numbered as they come; each outcome's runs of
+ * adjacent pieces, a value alone or an interval between bounds, in
+ * dp->outpoints and dp->outranges; and NULL's outcome, 0 for a column
+ * declared NOT NULL.  The outcome of each piece into out, and a piece of
+ * each outcome into rep.
+ */
+static void
+cells_ranged_outcomes(CellsCx *cx, CellDim *dim, LionCellsDimPlan *dp,
+					  const Oid *ops, const uint8 *sig, int npd,
+					  bool nonull, int *out, int *rep)
+{
+	LionCellsDimPriv *pv = &dp->priv;
+	int			nval = list_length(dim->consts);
+	int			npiece = 2 * nval + 1;	/* the NULL piece is npiece */
+	int		   *cls = (int *) palloc(sizeof(int) * (npiece + 1));
+	int		   *first = (int *) palloc(sizeof(int) * (npiece + 1));
+	double	   *share = (double *) palloc0(sizeof(double) * (npiece + 1));
+	bool	   *hasval = (bool *) palloc0(sizeof(bool) * (npiece + 1));
+	int		   *renum = (int *) palloc(sizeof(int) * (npiece + 1));
+	int			ncls = 0;
+	int			zero = -1;
+	int			u;
+	int			c;
+	int			o;
+
+	/* the pieces by their truths, the NULL piece last */
+	for (u = 0; u <= npiece; u++)
+	{
+		if (u == npiece && nonull)
+		{
+			cls[u] = -1;
+			continue;
+		}
+		for (c = 0; c < ncls; c++)
+		{
+			if (memcmp(&sig[(Size) u * npd], &sig[(Size) first[c] * npd],
+					   npd) == 0)
+				break;
+		}
+		if (c == ncls)
+			first[ncls++] = u;
+		cls[u] = c;
+	}
+
+	/* each group's rows: a value's equality, a gap's bounds, NULL's */
+	for (u = 0; u <= npiece; u++)
+	{
+		List	   *bounds = NIL;
+		double		sel;
+
+		if (cls[u] < 0)
+			continue;
+		if (u == npiece)
+			sel = dp->nullsel;
+		else if (u % 2 == 1)
+		{
+			hasval[cls[u]] = true;
+			sel = cells_sel(cx, (Node *) cells_bound(dp, pv->eqop,
+													 (Const *) list_nth(dim->consts,
+																		dim->byrank[(u - 1) / 2])));
+		}
+		else
+		{
+			int			g = u / 2;
+
+			hasval[cls[u]] = true;
+			if (g > 0)
+				bounds = lappend(bounds,
+								 cells_bound(dp, ops[3],
+											 (Const *) list_nth(dim->consts,
+																dim->byrank[g - 1])));
+			if (g < nval)
+				bounds = lappend(bounds,
+								 cells_bound(dp, ops[0],
+											 (Const *) list_nth(dim->consts,
+																dim->byrank[g])));
+			sel = clauselist_selectivity(cx->root, bounds, 0, JOIN_INNER,
+										 NULL);
+		}
+		share[cls[u]] += sel;
+	}
+
+	/* outcome 0 the largest group of values, NULL apart */
+	for (c = 0; c < ncls; c++)
+	{
+		if (hasval[c] && (zero < 0 || share[c] > share[zero]))
+			zero = c;
+	}
+	Assert(zero >= 0);
+	o = 1;
+	for (c = 0; c < ncls; c++)
+		renum[c] = (c == zero) ? 0 : o++;
+	pv->radix = ncls;
+	for (u = 0; u <= npiece; u++)
+		out[u] = (cls[u] < 0) ? 0 : renum[cls[u]];
+	for (c = 0; c < ncls; c++)
+		rep[renum[c]] = first[c];
+	pv->nullout = out[npiece];
+	pv->nval = 0;
+	pv->vals = NIL;
+	pv->valout = (int *) palloc(sizeof(int));
+	dp->valsel = (double *) palloc(sizeof(double));
+
+	/* each outcome's runs of pieces */
+	dp->ranged = true;
+	dp->outpoints = (List **) palloc0(sizeof(List *) * ncls);
+	dp->outranges = (List **) palloc0(sizeof(List *) * ncls);
+	u = 0;
+	while (u < npiece)
+	{
+		int			a = u;
+		int			b = u;
+		List	   *bounds = NIL;
+
+		while (b + 1 < npiece && out[b + 1] == out[a])
+			b++;
+		u = b + 1;
+		o = out[a];
+		if (o == 0)
+			continue;
+		if (a == b && a % 2 == 1)
+		{
+			dp->outpoints[o] = lappend(dp->outpoints[o],
+									   list_nth(dim->consts,
+												dim->byrank[(a - 1) / 2]));
+			continue;
+		}
+		/* from: a value's place, or above the one below a gap */
+		if (a % 2 == 1)
+			bounds = lappend(bounds,
+							 cells_bound(dp, ops[2],
+										 (Const *) list_nth(dim->consts,
+															dim->byrank[(a - 1) / 2])));
+		else if (a > 0)
+			bounds = lappend(bounds,
+							 cells_bound(dp, ops[3],
+										 (Const *) list_nth(dim->consts,
+															dim->byrank[a / 2 - 1])));
+		/* to: a value's place, or below the one above a gap */
+		if (b % 2 == 1)
+			bounds = lappend(bounds,
+							 cells_bound(dp, ops[1],
+										 (Const *) list_nth(dim->consts,
+															dim->byrank[(b - 1) / 2])));
+		else if (b < npiece - 1)
+			bounds = lappend(bounds,
+							 cells_bound(dp, ops[0],
+										 (Const *) list_nth(dim->consts,
+															dim->byrank[b / 2])));
+
+		/* every value one outcome but 0, which has a value: never */
+		if (bounds == NIL)
+			elog(ERROR, "lion: a cells outcome of every value but outcome 0's");
+		dp->outranges[o] = lappend(dp->outranges[o], bounds);
+	}
+	pfree(cls);
+	pfree(first);
+	pfree(share);
+	pfree(hasval);
+	pfree(renum);
+}
+
+/*
  * Every predicate of exprs (DESIGN.md §10, "Counts by cells"), each
  * dimension's outcomes and each predicate's truth in them, and the cells
  * they make; or NULL when exprs are not functions of predicates the posting
- * sets decide, or make more cells than pg_lion.count_cells_max.  The driver
- * is lion_cells_choose_driver()'s.
+ * sets decide, or make more cells than pg_lion.count_cells_max.  With
+ * `ranges`, a range of a scalar column is a leaf too, and its column a
+ * RANGED dimension, whose outcomes are runs of the column's order (§46,
+ * "Ranges"); the count takes none.  The driver is
+ * lion_cells_choose_driver()'s.
  */
 LionCellsPlan *
-lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
+lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs,
+				   bool ranges)
 {
 	CellsCx		cx;
 	LionCellsPlan *cp;
@@ -976,6 +1454,7 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 	cx.root = root;
 	cx.rel = rel;
 	cx.rti = rti;
+	cx.ranges = ranges;
 	foreach(lc, exprs)
 	{
 		Node	   *e = (Node *) lfirst(lc);
@@ -1044,24 +1523,25 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 		}
 		else
 		{
-			int			nval = list_length(dim->consts);
-			int			nu = nval + 2;
+			int			nu = cells_npieces(dim);
 			int			npd = list_length(dim->preds);
 			int		   *out = (int *) palloc(sizeof(int) * nu);
 			int		   *rep = (int *) palloc(sizeof(int) * nu);
 			uint8	   *sig = (uint8 *) palloc(sizeof(uint8) *
 												 (Size) Max(npd, 1) * nu);
-			int			nout = 0;
-			bool		noother;
+			int			nout;
 			bool		nonull;
+			Oid			rangeops[4];
 			int			u;
 			int			k;
 
 			pv->kind = LION_CELLDIM_SCALAR;
 			pv->eqop = dim->hasvalop ? dim->eqop : InvalidOid;
 			pv->collation = dim->hasvalop ? dim->coll : InvalidOid;
+			if (dim->ranged && !cells_ranged_order(&cx, dim, dp, rangeops))
+				return NULL;
 
-			/* each value's truths: its signature */
+			/* each piece's truths: its signature */
 			for (u = 0; u < nu; u++)
 			{
 				k = 0;
@@ -1075,61 +1555,14 @@ lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel, Index rti, List *exprs)
 				}
 			}
 
-			/*
-			 * Any other value's outcome is 0, then the rest as they come.  A
-			 * boolean column both of whose values are named has no other
-			 * value: its outcome 0 is its first value's, which then needs no
-			 * label either.  A column declared NOT NULL has no NULL, which
-			 * is then outcome 0 too.
-			 */
-			noother = dim->hasvalop && dim->valtype == BOOLOID && nval == 2;
 			nonull = bms_is_member(dim->var->varattno, notnull);
-			rep[nout] = noother ? 0 : nval;
-			out[nval] = nout++;
-			if (noother)
-				out[0] = 0;
-			if (nonull)
-				out[nval + 1] = 0;
-			for (u = 0; u < nu; u++)
-			{
-				int			o;
-
-				if (u == nval || (noother && u == 0) ||
-					(nonull && u == nval + 1))
-					continue;
-				for (o = 0; o < nout; o++)
-				{
-					if (memcmp(&sig[(Size) u * npd],
-							   &sig[(Size) rep[o] * npd], npd) == 0)
-						break;
-				}
-				if (o == nout)
-					rep[nout++] = u;
-				out[u] = o;
-			}
-			pv->radix = nout;
-			pv->nullout = out[nval + 1];
-			pv->nval = 0;
-			pv->vals = NIL;
-			pv->valout = (int *) palloc(sizeof(int) * Max(nval, 1));
-			dp->valsel = (double *) palloc(sizeof(double) * Max(nval, 1));
-			for (u = 0; u < nval; u++)
-			{
-				Const	   *c = (Const *) list_nth(dim->consts, u);
-
-				if (out[u] == 0)
-					continue;
-				pv->vals = lappend(pv->vals, c);
-				pv->valout[pv->nval] = out[u];
-				dp->valsel[pv->nval] =
-					cells_sel(&cx, (Node *) make_opclause(dim->eqop, BOOLOID,
-														  false,
-														  (Expr *) dim->var,
-														  (Expr *) c,
-														  InvalidOid,
-														  dim->coll));
-				pv->nval++;
-			}
+			if (dim->ranged)
+				cells_ranged_outcomes(&cx, dim, dp, rangeops, sig, npd,
+									  nonull, out, rep);
+			else
+				cells_scalar_outcomes(&cx, dim, dp, sig, npd, nonull, out,
+									  rep);
+			nout = pv->radix;
 
 			/* each predicate's truth in each outcome */
 			k = 0;
@@ -1361,7 +1794,8 @@ cells_label_rows(const LionCellsDimPlan *dp, double tuples)
  * is the scalar dimension that leaves the fewest labels' rows to read times
  * its passes - or, where none will do, `fallback`, a lion-indexed column of
  * the table no dimension is (lion_count_all_driver()), which labels nothing.
- * False when neither will: too many entries, or none at all.
+ * False when neither will: too many entries, or none at all; or when a
+ * dimension is RANGED, which only LionProbeJoin reads.
  */
 bool
 lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
@@ -1377,6 +1811,12 @@ lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 
 	for (d = 0; d < cp->ndim; d++)
 	{
+		/* a RANGED dimension is no count's (DESIGN.md §10, "Ranges") */
+		if (cp->dims[d].ranged)
+		{
+			pfree(rows);
+			return false;
+		}
 		rows[d] = cells_label_rows(&cp->dims[d], tuples);
 		total += rows[d];
 	}

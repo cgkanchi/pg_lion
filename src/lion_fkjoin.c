@@ -222,7 +222,9 @@ lion_fkjoin_is_parent(PlannerInfo *root, RelOptInfo *rel)
  * own uses of the proof.
  *
  * A multi-column unique index whose other columns the query pins to constants
- * would prove it too; v1 does not look for one.
+ * would prove it too; this does not look for one.  A key set of
+ * LionOrderedJoin's, whose keys are those of the rows its own clauses let
+ * through, does (oj_keyset_unique(), lion_ordjoin.c).
  *
  * The index that proves it, or NULL: the first of rel->indexlist that does,
  * which LionProbeJoin (DESIGN.md §46) and LionOrderedJoin (§47) descend.

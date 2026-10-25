@@ -3835,6 +3835,19 @@ typedef struct LionCellsDimPlan
 	double		bitsel[LION_CELLS_MAX_BITS];	/* MULTI: each leaf's */
 	double		bitkeys[LION_CELLS_MAX_BITS];	/* ... and its keys */
 	Node	   *bitclause[LION_CELLS_MAX_BITS];
+
+	/*
+	 * A SCALAR dimension read by ranges (DESIGN.md §46, "Ranges"): its
+	 * outcomes are runs of the column's order, not values, and each outcome
+	 * but 0 is told by its runs - a List each of its values alone (Consts,
+	 * `= v` or `= ANY`) and of its intervals, each a List of one or two
+	 * bounds over the column (an OpExpr of the index's family).  The
+	 * priv's values are none.  Only a caller that asked for ranges
+	 * (lion_cells_analyze()) gets one: LionProbeJoin.
+	 */
+	bool		ranged;
+	List	  **outpoints;		/* [radix] */
+	List	  **outranges;		/* [radix] */
 } LionCellsDimPlan;
 
 typedef struct LionCellsPlan
@@ -3853,7 +3866,7 @@ typedef struct LionCellsPlan
 extern bool lion_cells_shape_ok(PlannerInfo *root, RelOptInfo *rel,
 								Index rti, Node *expr);
 extern LionCellsPlan *lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel,
-										 Index rti, List *exprs);
+										 Index rti, List *exprs, bool ranges);
 extern bool lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 									 LionCellsPlan *cp, Var *fallback,
 									 double fallbackentries);
@@ -4015,12 +4028,19 @@ extern double lion_units_margin_for(RelOptInfo *rel);
 /* lion_plan_skew.c */
 extern double lion_skew_scan_factor(PlannerInfo *root, Path *scan);
 extern Cost lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
-								 double loops);
+								 double loops, double limit);
+extern double lion_skew_limit_rows(PlannerInfo *root, RelOptInfo *rel);
+extern double lion_skew_limit_share(PlannerInfo *root, RelOptInfo *rel,
+									double rows, double factor, double limit);
+extern void lion_skew_reprice(Path *path, double share, double scale);
+extern Cost lion_skew_set_extra(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+								double *factor);
 extern double lion_skew_rel_scale(PlannerInfo *root, RelOptInfo *rel,
 								  Relids required_outer, double loops);
 extern double lion_skew_clauses_scale(PlannerInfo *root, RelOptInfo *rel,
 									  List *clauses);
-extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel);
+extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel,
+							   RangeTblEntry *rte);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
