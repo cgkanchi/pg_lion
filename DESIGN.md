@@ -29445,11 +29445,12 @@ before each descent (`lion_ordered_probe_key()`). Each carries a weight in a fou
 `custom_private` member that `lo_plan_path()` reads for the side's lazy set (§47.4).
 
 The plan (`oj_plan_path()`) is a CustomScan with `scanrelid` 0 whose `custom_scan_tlist` is the
-fact's side's target, then the dimension's, then a resjunk entry a key set, its key, which no row
-fills and EXPLAIN reads to name the table. The join's target list is evaluated over that slot
-(`CUSTOMPATH_SUPPORT_PROJECTION`). `custom_private` is positional behind a marker: the counts and
-the key's position among the fact's columns, the dimension's B-tree, each key set's hashable
-equality, collation and key column in its plan's target.
+fact's side's target, then the dimension's, then a resjunk entry a key set, its key, which EXPLAIN
+reads to name the table and each row fills with the fact's key, for a target that reads it (§47.6).
+The join's target list is evaluated over that slot (`CUSTOMPATH_SUPPORT_PROJECTION`).
+`custom_private` is positional behind a marker: the counts and the key's position among the fact's
+columns, the dimension's B-tree, each key set's hashable equality, collation and key column in its
+plan's target.
 
 A side is a child the join keeps out of `custom_ps`, not a parameterized plan of its own:
 `finalize_plan()` refuses a CustomScan child whose quals reference a PARAM_EXEC its parent sets,
@@ -29507,32 +29508,36 @@ them (`lion_probe_rel_rows()`):
   dimension heap reads (below) are counted over the keys that name a row.
 
 The startup and total are divided by `pg_lion.pushdown_margin`, as LionOrdered's paths' are; core's
-Limit takes its share of the run. The path's rows are the node's estimate, not the join rel's.
-Not priced, as `lo_cost()` prices neither: the fetch-and-sort switch, which the walk takes at run
-time when its entries per member say it pays (§30.4), and the early stop once the walk has met
-every member. `enable_indexscan = off` disables the path
+Limit takes its share of the run. Where the node is not alone under the LIMIT (§47.10) the startup
+is the total: the whole walk, which no Limit above discounts. The path's rows are the node's
+estimate, not the join rel's. Not priced, as `lo_cost()` prices neither: the fetch-and-sort switch,
+which the walk takes at run time when its entries per member say it pays (§30.4), and the early stop
+once the walk has met every member. `enable_indexscan = off` disables the path
 (`lion_path_core_switches()`, `LION_CORE_INDEXSCAN`): it is a walk of one index and descents of
-another, and reads the rows; `enable_indexonlyscan = off` takes the fact's index-only mode away.
-The join methods' settings do not touch it.
+another, and reads the rows; `enable_indexonlyscan = off` takes the fact's index-only mode away. The
+join methods' settings do not touch it.
 
-**The share** the LIMIT takes, `min(1, limit_tuples / rows)`, is not a stop and not in the price:
-it decides each side's set, built at once or lazily (§47.4). The fact's side weighs its walk by it;
-the dimension's weighs the descents, `probes * share` - the descents the LIMIT's share of the walk
-makes, not the whole walk's (2026-10-23 review). `root->limit_tuples` is applied though the node is
-not alone under the LIMIT, where §30's `lo_limit()` refuses to: LionOrdered's limit is a hard stop,
-and a join above that filters lets the walk go on further; this is only the set's choice. A lazy
-set whose walk goes on builds itself once its probes have cost what the build would (§30.4), one
-build more, where a set built at once for a walk that stops after a few hundred entries costs the
-whole build: the lazy error is the cheaper one. The left joins and NOT EXISTS above the node keep
-its rows about one to one with the LIMIT's.
+**The share** the LIMIT takes, `min(1, limit_tuples / rows)` (`oj_limit_share()`), is not a stop
+and not in the price: it decides each side's set, built at once or lazily (§47.4), and it is what
+the competitor's Memoize and the cold reads are weighed over (below). The fact's side weighs its
+walk by it; the dimension's weighs the descents, `probes * share` - the descents the LIMIT's share
+of the walk makes, not the whole walk's (2026-10-23 review). It is taken only where the node is
+alone under the LIMIT (§47.10): the left joins and NOT EXISTS above it keep its rows about one to
+one with the LIMIT's. Under a join or a clause above that filters, the share is 1, the whole walk,
+and the price all start-up. §30's `lo_limit()` is stricter, LionOrdered's limit being a hard stop:
+the node the query level's only table. Where the share is wrong all the same the lazy error is the
+cheaper one: a lazy set whose walk goes on builds itself once its probes have cost what the build
+would (§30.4), one build more, where a set built at once for a walk that stops after a few hundred
+entries costs the whole build.
 
 **The competitor** (`oj_competitor()`) is the plan the LIMIT would take of the join rel's paths as
 core leaves them when the hook runs, found before the node's first path is added (`add_path()`
 frees the paths a new one dominates): unparameterized and not disabled, with no lion path inside
 (`lion_path_has_lion()`) but for a nested loop's outer LionOrdered walk of the fact
 (`oj_loop_over_walk()`), the plan core takes where LionOrdered walks the page; one whose first sort
-key is the walk's at its startup and the LIMIT's share of its run, any other at its total, which
-the Sort above it reads whole. It is not `lion_competitor_path()`'s, the cheapest total, which here
+key is the walk's at its startup and the LIMIT's share of its run - all of it where the node is not
+alone under the LIMIT, as for the node - any other at its total, which the Sort above it reads
+whole. It is not `lion_competitor_path()`'s, the cheapest total, which here
 is a hash join at §39's rate for one, 0.5: under a LIMIT core takes neither that plan nor its whole
 price. Only a nested loop in the walk's order is weighed, for its Memoize and its cold reads; a
 hash join and its Sort read the two sides through bitmap heap scans, which §46 does not weigh
@@ -29598,8 +29603,9 @@ more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discoun
   or built) before the heap, the heap read for a member (`index_fetch_heap()`, the HOT chain
   followed to the version the snapshot sees), rechecked where the set is inexact and filtered. The
   key is unique, so one descent finds the row or none. The scan slot's values are copied from the
-  two sides' slots, fact first, the key sets' columns NULL; neither side's slot changes until the
-  join asks it for its next row, and the key stays valid in the fact's slot through the descent.
+  two sides' slots, fact first, and each key set's column is the fact's key (§47.6); neither side's
+  slot changes until the join asks it for its next row, and the key stays valid in the fact's slot
+  through the descent.
   The join's target is projected from it.
 - **Memory.** The key sets' hash and equality run in the node's per-tuple memory, reset each row
   the walk returns and each row a key set's plan returns, as a hash join's do
@@ -29654,10 +29660,24 @@ fetched, descended and its dimension row read. A table becomes a key set when:
 - it is the whole inner side of a semi join - minimal and syntactic, an IN or an EXISTS of it
   alone - whose outer side is in the join rel, and in no other special join's sides
   (`oj_semi_of()`: a second IN has the first's table in its syntactic outer side, which is let
-  pass); or it is in no special join, inner-joined, and its key unique under the clause
-  (`lion_column_is_unique()`), so that no row is repeated - core turns a semi join on a unique
-  key into that inner join itself (`reduce_unique_semijoins()`);
-- nothing of it is in the join rel's target;
+  pass); or it is in no special join, inner-joined, and its key unique among the rows its own
+  clauses let through (`oj_keyset_unique()`), so that no row is repeated - core turns a semi join
+  on a unique key into that inner join itself (`reduce_unique_semijoins()`). The key alone unique
+  under the clause proves it (`lion_column_is_unique()`), and so does a unique B-tree of more
+  columns whose others the table's restriction clauses pin to a constant each
+  (`oj_column_pinned()`: `col = <pseudo-constant>` either way round, by an equality of the
+  column's family in the index, under the index's collation for it) - `ib (fk, kind)` under
+  `kind = 2`, the key set holding those rows' keys alone; immediate, B-tree, and partial only where
+  the clauses imply its predicate, as `relation_has_unique_index_for()` takes them;
+- nothing of it is in the join rel's target but its key, and the key only where core put it there
+  for its equivalence class alone: core makes each member of a class available wherever the
+  class's tables are joined (`generate_base_implied_equalities()`), so a table joined to the key
+  above the join rel - a LATERAL subquery on the key that a strict WHERE clause made an inner join
+  - puts the key set's key in the target though the query reads nothing of the table. The key's
+  `attr_needed` is within the class's relations, its type has image equality
+  (`lion_type_equalimage()`) and the class's equality is its type's default: the node fills the
+  column with the fact's key, which equals it, and under such an equality is the very value the key
+  set's row holds;
 - exactly one clause joins it to the rest of the join rel, and it is of the key's equivalence
   class: whichever of `f.fk`, `d.pk` it was written against, it filters the fact's key;
 - its key is of the fact key's type, with an equality in the class's families that hashes both
@@ -29694,6 +29714,29 @@ the node's rows to them above is the plan.
 - **Parallel**, parameterized paths, partitioned tables, an outer join as the join itself, PHVs and
   LATERAL references at the join: declined (§47.1).
 - **More than one dimension.** A second key join to another dimension is core's, above the node.
+- **A walk that fills slowly, at run time.** Not alone under the LIMIT the node is priced at its
+  whole walk (§47.10), and alone a key set's keys are taken to be spread over it; nothing at run
+  time turns from the walk when its rows come slowly - the node having returned many times the
+  LIMIT's rows and still pulled (a filter above), or a key set's walk past many times the entries
+  priced. Under a key set the turn could be to the filter first: its keys looked up in a B-tree of
+  the fact's key and their rows sorted in the walk's order past its position (the B-tree's order is
+  the score's, then the TID's), arm by arm under the split - about core's plan, after the walk
+  before it. Under a filter above, which the node does not see, it could only be the rest of the
+  join at once, the two sets hash-joined and sorted: core's plan of the join without the page's
+  filters, a bound, but the dense page's 6.5 seconds on §47.10's tables. Either needs a price for
+  the switch, as §30.4's has, and a sort past `work_mem`.
+- **A key set's keys tested before the fact's heap.** In heap mode the walk fetches the member's
+  row, and the join then reads its key for the key sets; where the B-tree holds the key (`INCLUDE
+  (fk)`) the key could be tested on the index tuple and a rejected entry never fetched. An
+  index-only walk fetches no row either way.
+- **A key set's other columns.** A table a column of which the query reads is not a key set, even a
+  column its clauses pin to a constant, which the node could fill as it fills the key: §47.10 says
+  why that would cost the page its plan. A key that repeats under the table's clauses is not one
+  either: the rows would have to come out once for each of its rows.
+- **Arms a key set passes over.** Under the split, an arm none of whose dimension rows a key set's
+  keys name walks to its end (§47.10, "What a key set leaves"). The key set's keys could be
+  descended once into the dimension and tested against each arm's set, and an arm with none passed
+  over; it is not.
 
 ### 47.8 Tests
 
@@ -29733,6 +29776,28 @@ side, the setting off (core's nested loop over a Memoize).
 
 btreescan_param.sql's cursor section turns the node off: under that section's
 `pushdown_margin = 1000` the node took the join from the `LionBtreeScan` probe the section tests.
+
+test/sql/ordjoin_alone.sql, §47.10, in a schema of its own: a 100,000-row wide dimension with lion
+indexes on a bool `flag` and a hundred-value `lvl`; a 350,000-row fact table of four slices `(grp,
+ver)`, the pages' `(1, 2)` holding the keys up to 50,000 and the others every key, with a B-tree
+`(grp, ver, score DESC NULLS LAST) INCLUDE (fk)`, a unique `(fk, grp, ver)` and a lion index on a
+three-value `rec`; a key table unique by `(fk, kind)`, kind 2 some 8,300 keys, all past the slice's
+but forty, kind 1 some 3,900 over every key; a side table by key and day whose `'high'` rows in the
+slice are those of its fifth of lowest scores and its NULL ones; the suppressed keys, one in fifty.
+Each query runs through the node, forced, and through core's plan, the answers compared in order;
+`oja_plan()` names the plan with nothing forced, `LionOrderedSplit`, `LionOrderedJoin` or core's,
+and its key sets. Core's plan, with the node priced at 3.4 to 25 times core's: the page (the key
+table, the side table's clause read, the anti join) in the split's order and the join's, and its
+counters forced - both arms walked, 100,000 entries, 99,920 rejected by the key set, 80 descents;
+the side table's clause alone; a clause on the side table that is not strict, so the left join stays
+one with a filter above; the key table with a column read, and with `kind IN (2, 3)`, which pins
+nothing. The node, priced 1.4 to 47 times under core's: the split with only a left join and an anti
+join above, and with a NOT EXISTS; the join, ordered by the score, under a left join and a NOT
+EXISTS; the split with kind 1 a key set (`Arms Run: 1`, 332 descents); and with kind 2 a key set,
+alone, its walk both arms long (§47.10, "What a key set leaves"). Not alone and still taken: the
+split under a LATERAL subquery's clause, its LIMIT 1 keeping it from being pulled up, at 2.2 times
+under core's price. A key set's key in the target: with nested loops and merge joins off, the side
+table's hash join above reads the key set's key, `Hash Cond: (s.fk = ib.fk)`, which the node fills.
 
 ### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
@@ -29809,6 +29874,143 @@ page (534 against 1,184 ms) and the dense range (18.1 against 19.4 ms); and wron
 multi-key page (36 against 16 ms): core's loop at 944 under the LIMIT, 1,264 with its Memoize's
 hits, against the node's 3,219, most of it the multi-key set built at once, of which the cold reads
 take 0.54. Not measured: other majors.
+
+### 47.10 Alone under the LIMIT (`oj_alone()`, `oj_limit_share()`, 2026-10-24)
+
+What the LIMIT gives the node - the share of the walk it takes (§47.3: each side's set lazy or at
+once, the competitor's Memoize under the LIMIT, the cold reads over that share) and the split's
+shape (§48.3) - it gives only where the node is alone under the LIMIT: where the rows the LIMIT
+counts are the node's, one to one, or about.
+
+**The rule** (`oj_alone()`, asked once for each join rel in `oj_add_paths()`, the answer in
+`OjJoin.alone`). After `reduce_outer_joins()`, which makes a left join whose inner side a strict
+WHERE clause reads an inner join, and a left join under `IS NULL` of its key an anti join:
+
+- every other table of the query level is on the inner side of a left join or an anti join that
+  the join rel is not inside. A left join returns each of the node's rows; an anti join drops those
+  it matches, and is taken to match few, the exclusions a NOT EXISTS lists. A table joined by an
+  inner, semi or full join, or by none, is not;
+- the join rel is on no special join's inner side but its own key sets' semi joins
+  (`oj_special_ok()`);
+- every clause that reaches past the join rel (its `joininfo`) is an outer join's own ON clause
+  (not `is_pushed_down`), or is evaluated within the inner side of such a left or anti join, where
+  it filters only that side; a WHERE clause on an inner side's columns carries the outer join's
+  relid and is neither. No equivalence class joins the join rel to another table (a class with a
+  constant makes no join clause);
+- the query level asks nothing more of the rows: no HAVING, no set-returning function in its
+  target, which may return no row for one, and no WITH TIES.
+
+Grouping, aggregates, DISTINCT and windows leave `root->limit_tuples` at -1, so there is no share
+to take; row marks are declined (§47.1). A Sort or Incremental Sort above for the rest of the ORDER
+BY is core's, priced from the node's own start-up, total and rows. The key sets are inside the
+join rel (§47.6), so a table folded into one filters nothing above it. `lo_limit()`'s other
+conditions (§30.4) are its hard stop's and not a price's: a LIMIT of a Param is priced at core's
+guess, as core's own plans are, and the order past the node's is the sort's above.
+
+**Not alone**, the share is 1 (`oj_limit_share()`): the sets are chosen for the whole walk (at once
+where it is long, §47.4), the competitor's Memoize gets no correction for the LIMIT
+(`lion_memoize_limit_extra()` adds nothing at a share of 1), the cold reads are weighed over the
+whole walk, and the path's start-up is its total (`oj_add_path()`), so that core's Limit, which
+takes `startup + (total - startup) * n / rows` of its input, pays all of it. The split is priced
+as without a LIMIT, every arm, its start-up its total too (`os_cost()`, §48.3). Both are still
+offered. At the price of the walk to its end the node is taken only where core's plans cost more:
+where they sort a large join for the page, or run a subquery for each row of a large first group
+of the ORDER BY. The walk then costs at most what it was priced at, wherever the page's rows are.
+
+**Why core's estimate is no price under a LIMIT.** Core prices a join or a clause above the node by
+the share of rows it expects through, `sel`, spread evenly over the rows beneath, and its Limit
+takes `n / (rows * sel)` of everything below: the walk is priced at the entries it takes to meet
+`n` survivors at that density. Under an ordered walk the survivors are where what the filter keeps
+falls in the walk's order, and nothing in the statistics says where that is: a small table's keys
+among the fact rows the walk meets last, a side table's flagged rows those of the lowest scores, a
+key table of the dimension rows of one value of the split's column. Where they come late the walk
+runs on, possibly to its end - every entry fetched, descended and joined above - priced at a few
+hundred. The page of the tests (§47.8) is this: core takes the filters above the walk to pass some
+3,000 of its rows, ten do, and the walk's two arms run to their ends for them. Core's own plans
+for it are a filter first and a sort, which read what they read whatever the order; core's ordered
+nested loops under a LIMIT carry the same estimate, and it is theirs.
+
+**What is pessimistic.** A filter above that is spread over the walk as core takes it would let the
+walk stop early, and the node is priced as if it would not: a selective clause on a side table's
+column that is not correlated with the score is priced as the whole walk, and core's plan is taken
+(the measurements below: 968 ms against 37 ms for the walk). So is an inner join that drops no row,
+a foreign key's to the referenced table's key with the fact's key NOT NULL.
+
+**What it still takes on trust.** An anti join that drops many rows is taken to drop few. And the
+joins above the node are core's, priced at core's density: not alone under a clause on a LATERAL
+subquery that core cannot pull up (its LIMIT 1), the split is taken at the price of its whole walk,
+under core's plans, which sort the whole of the flag's first value and run the subquery for each of
+its rows; the nested loop of the subquery above the split takes the LIMIT's share of its own run,
+and the tests' page of that shape runs 195 ms against core's 105 to 150.
+
+**What the key sets take back** (§47.6). A table folded into a key set is inside the node: its
+rejections are the node's, an entry of the fact's walk and a hash probe each, before any descent,
+and it filters nothing above. The page's small key table was kept out of §47.6 for two reasons,
+both lifted:
+
+- *its key unique only with its primary key's other columns pinned* - `ib (fk, kind)` under `kind
+  = 2` - which `lion_column_is_unique()`, a unique B-tree of the key alone, does not prove:
+  `oj_keyset_unique()` takes a unique B-tree whose other columns the table's own restriction
+  clauses pin to a constant each, the key set holding only those rows' keys;
+- *its key in the join rel's target*, which the query does not read: a LATERAL subquery on the key,
+  which a strict WHERE clause made an inner join, joins the key's class above the join rel, and core
+  makes every member of the class available there, the key set's among them. Where nothing outside
+  the class needs the key, its type has image equality and the class's equality is the type's
+  default, the node fills the column with the fact's key (§47.6).
+
+Not lifted:
+
+- *a key that repeats* - `kind IN (2, 3)`, which pins nothing: each fact row would have to come out
+  once for each of the key's rows, a count a hash set does not hold;
+- *a column of the table read*, even one its clauses pin to a constant. The node could fill a
+  pinned column with its constant as it fills the key; that would fold the page's side table -
+  `s.level` read and pinned to `'high'` by the WHERE clause, its key unique with its other columns
+  pinned - into a key set, and make the page's own shape alone, under the key set's estimate, which
+  is the one that fails there (below);
+- a second join clause, a key of another type, a key in the target whose type lacks image equality,
+  a set past `work_mem` (§47.7), and a join rel core never forms as the rest joined to the key set
+  of the highest relid (§47.2), as GEQO, or a join order the collapse limits keep, may not.
+
+**What a key set leaves.** Its share of the walk is still core's estimate: its keys are taken to be
+`setrows / dim.tuples` of the dimension's rows, spread evenly over the walk and over the split's
+arms (§47.3, §48.3 "Independence"). Where they are not - the slice holding forty of kind 2's keys,
+or a key table of `flag = false` rows under a split led by `flag DESC` - the walk runs to its end
+as it would under the join above, but each entry it rejects is an index entry and a hash probe,
+not a fetch, a descent, a dimension heap read and a join: 2.3 seconds where the join above took 20
+and core's plan, the key table first, under one (below). Bounded by the walk, not by the page.
+
+**Measured** (2026-10-24; PostgreSQL 17, §47.9's cluster and tables, warm: every table and index in
+shared buffers, the median of five runs after one; EXPLAIN (ANALYZE, TIMING OFF)). §47.9's tables
+with an index on the fact's key, `bfact (fk)`, as the page's own fact has one, and three tables of
+the page's shape: `bib (fk, kind, since)`, primary key `(fk, kind)`, kind 3 the keys of 12,000
+`flag = false` rows, kind 1 4,000 keys spread over all; `bsig (fk, day, level)`, primary key `(fk,
+day)`, `'high'` for a tenth of the keys, spread; `bsup (fk, reason)`, every 50th key. The page is
+`SELECT d.pk, d.flag, d.region, f.id, f.score[, s.level] FROM bdim d JOIN bfact f ON f.fk = d.pk
+LEFT JOIN LATERAL (SELECT s.* FROM bsig s WHERE s.fk = f.fk AND s.day = 3) s ON true [JOIN bib ON
+bib.fk = d.pk AND bib.kind = K] LEFT JOIN bsup ON bsup.fk = d.pk AND bsup.reason = 1 WHERE bsup.fk
+IS NULL [AND s.level = 'high'] ORDER BY d.flag DESC, f.score DESC, f.id LIMIT 100`, the walk
+index-only. "Taken under any LIMIT" is the same build without `oj_alone()` and the two key set
+rules above. Core's plan, with the node off, is the key table or the side table first, the fact by
+its key and a Sort, but for the dense page's, a Sort over the hash joins of the whole fact.
+
+| page | above the node | taken under any LIMIT | §47.10 | core's plan |
+|---|---|---|---|---|
+| the page | `bib` kind 3, `s.level = 'high'`, `s.level` read | split, 19,884 ms (5,019,060 walked, 4,969,363 descents) | core's, 151 ms | 149 ms |
+| the side table's clause alone | `s.level = 'high'`, read | split, 37.4 ms (1,807 walked) | core's, 968 ms | 983 ms |
+| the same, `s` not read | `s.level = 'high'` | split, 36.1 ms | split, key set `bsig`, 47.7 ms | 954 ms |
+| the key table alone | `bib` kind 3 | split, 20,116 ms (4,952,137 descents) | split, key set `bib`, 2,344 ms (5,001,659 walked, 297,188 descents) | 767 to 867 ms |
+| the page, `s` not read | `bib` kind 3, `s.level = 'high'` | split, 18,189 ms | split, key sets `bib` and `bsig`, 1,597 ms (5,019,060 walked) | 151 ms |
+| dense, a key set | `bib` kind 1 | split, 78.4 ms (7,681 descents) | split, key set `bib`, 10.4 ms (165 descents) | 359 to 385 ms |
+| dense | the left join and the anti join | split, 8.8 ms (170 walked) | split, 9.2 ms | 6,452 ms |
+
+The page goes to core's plan, 130 times faster; the dense pages keep the split, 35 to 700 times
+faster than core's; the dense page with the key table gains the key set, 7.5 times. The side
+table's clause alone is the rule's pessimism: spread as core takes it, it costs the walk 26 times
+over. Read, the side table stays a join above; not read, it is a key set (its key unique with
+`day` pinned) and the split is taken, 47.7 ms. The key table alone, and the page with the side
+table not read, are a key set's estimate: 8.6 and 11 times faster than the join above, about 3 and
+11 times slower than core's plan. Ordered by the score alone, the page is core's either way (50 and
+54 ms). Not measured: cold, other majors.
 
 ## 48. An ORDER BY led by the dimension: the join an arm at a time (LionOrderedSplit, lion_ordjoin.c, 2026-10-24)
 
@@ -29957,7 +30159,10 @@ restart).
 **The shape.** Core's Limit takes `startup + (total - startup) * n / rows` of its input. The path's
 start-up is `S` and the first arm's entry, its rows `R` the arms' sum, and its total
 `startup + (C(n) - startup) * R / n`, at which the Limit's price is `C(n)`. Without a LIMIT, or
-with one the arms are not expected to meet, the total is every arm's. Both are divided by
+with one the arms are not expected to meet, the total is every arm's. Where the split is not alone
+under the LIMIT (§47.10: a join or a clause above it filters) nothing is shaped: `n` is taken as no
+LIMIT, the fact's set weighed by every arm, and the start-up is the total, every arm's, which
+core's Limit pays whole; the child's start-up is its own total too. Both are divided by
 `pg_lion.pushdown_margin`, as the join's are.
 
 **The sides' sets** (§47.4). The fact's is weighed for its lazy set by the arms up to `m`, their
@@ -29983,6 +30188,10 @@ for the join.
   set (§30.4's early stop).
 - *An entry whose rows are all dead*, or invisible to the snapshot, still has members of the
   dimension's set: its arm runs and returns nothing. Only an entry with no member is passed over.
+- *A filter above the split*, a join or a clause that drops rows of the arms: §47.10 prices the
+  split at every arm. A key set filters inside it, and its keys are taken to be spread over the
+  arms as the dimension's quals are; a key set of one arm's rows walks the others to their ends
+  (§47.10, "What a key set leaves").
 
 ### 48.4 Execution (`os_begin()`, `os_exec()`, `os_next_arm()`, `os_rescan()`; `lion_ordered_narrow_begin()`, `_add()`, `_end()`, lion_ordered.c)
 
@@ -30077,6 +30286,7 @@ its `Dimension Lion Set` is the dimension's set, not an arm's.
 - **A cap at run time.** None: a column with more entries than planned - values inserted since
   ANALYZE - runs every one.
 - **A multikey column**, whose rows are under several entries: declined.
+- **Arms a key set passes over**, and a switch from a slow arm to the filter first: §47.7.
 
 ### 48.7 Tests
 
@@ -30101,7 +30311,8 @@ in memory and the arm's past it (`1, 23 kB`); with `d.lvl < 5`, the set spilled 
 sets in the arena whole; and a LATERAL subquery whose set, rebuilt for each of seven outer rows,
 lets go of the arms' with its own (`7 builds`, `8, 83 kB`). Declined: another operator family,
 another collation, an expression of the column, `FOR SHARE OF d`, a LEFT JOIN, `ordered_split_max` 1
-and 0, and `enable_ordered_join` off (core's Sort over a Hash Join).
+and 0, and `enable_ordered_join` off (core's Sort over a Hash Join). test/sql/ordjoin_alone.sql
+(§47.8) tests the split alone and not alone under the LIMIT (§47.10).
 
 ### 48.8 Measured (2026-10-24; PostgreSQL 17, §47.9's cluster and tables; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
