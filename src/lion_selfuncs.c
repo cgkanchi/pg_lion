@@ -6820,7 +6820,8 @@ lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel, Var *var)
 	MemoryContext oldcxt;
 	ListCell   *lc;
 
-	if (!lion_enable_skew_estimate || root == NULL || root->glob == NULL ||
+	if (!lion_enable_skew_estimate || !lion_competitor_pricing ||
+		root == NULL || root->glob == NULL ||
 		rel == NULL || var == NULL || !IS_SIMPLE_REL(rel) ||
 		rel->rtekind != RTE_RELATION || rel->indexlist == NIL ||
 		var->varlevelsup != 0 || (Index) var->varno != rel->relid ||
@@ -7000,7 +7001,7 @@ lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 	double		factor = 1.0;
 	ListCell   *lc;
 
-	if (!lion_enable_skew_estimate || rel == NULL)
+	if (!lion_enable_skew_estimate || !lion_competitor_pricing || rel == NULL)
 		return 1.0;
 	foreach(lc, clauses)
 	{

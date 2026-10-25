@@ -1129,6 +1129,14 @@ the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's
 same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
 and Lion's switches leave theirs out, whatever the margin or price.
 
+`pg_lion.competitor_pricing` (on): whether a Lion custom path's price is corrected by what Lion
+reads of the PostgreSQL plan it competes with - the rates above, that plan's uncached reads
+(`cold_page_cost`, `cold_stream_page_cost`, `cold_max_discount`), the rows a skewed key meets
+(`pg_lion.enable_skew_estimate`) and a `Memoize`'s hits under a `LIMIT`
+(`pg_lion.enable_memoize_limit`). Off, a Lion path is priced by its own work alone, in
+PostgreSQL's units, and PostgreSQL's plans by PostgreSQL (DESIGN.md §49); the margin still
+applies.
+
 `pg_lion.cold_max_discount` (2; 1 to 10): the most the uncached reads of a competing plan may
 divide a Lion custom path's price by, where the query's tables do not fit in
 `effective_cache_size` - a nested loop's against an FK-side join or a `LionProbeJoin`

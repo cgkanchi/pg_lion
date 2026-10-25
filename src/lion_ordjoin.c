@@ -1116,7 +1116,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 	/* the loop's Memoize and the cold reads, over the LIMIT's share */
 	factor = 1.0;
-	if (comp->nestloop)
+	if (comp->nestloop && lion_competitor_pricing)
 	{
 		double		s = *share;
 		double		ordpages = Max((double) ord->indexinfo->pages, 1.0);

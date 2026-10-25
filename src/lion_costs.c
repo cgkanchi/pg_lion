@@ -90,6 +90,7 @@ double		lion_mergejoin_rate;
 double		lion_bitmap_rate;
 double		lion_pushdown_margin;
 double		lion_cold_max_discount;
+bool		lion_competitor_pricing = true;
 
 typedef struct LionCostSetting
 {
@@ -339,6 +340,22 @@ lion_costs_init(void)
 							 &lion_cold_max_discount,
 							 2.0,
 							 1.0, 10.0,
+							 PGC_USERSET,
+							 GUC_EXPLAIN,
+							 NULL, NULL, NULL);
+
+	/*
+	 * WHETHER THE COMPETITOR CORRECTS THE PRICE (DESIGN.md §49): on, a lion
+	 * path's own price is taken into the units of the core plan it competes
+	 * with and weighed against that plan's cold reads, a skewed key's rows
+	 * and a Memoize's LIMIT (§39); off, it is priced by the work it does
+	 * alone, in core's units, and core's plans by core.
+	 */
+	DefineCustomBoolVariable("pg_lion.competitor_pricing",
+							 "Corrects a lion custom path's price by what lion reads of the core plan it competes with.",
+							 "Off, a lion path is priced by its own work alone: no rate, no competitor's cold reads, skewed keys or Memoize hits (DESIGN.md §39, §49).",
+							 &lion_competitor_pricing,
+							 true,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
 							 NULL, NULL, NULL);
