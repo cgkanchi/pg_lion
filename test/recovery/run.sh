@@ -1856,14 +1856,33 @@ restart_standby() {
 	verify_node psql_s "$STANDBY_DATA"
 }
 
-# The INSERT position, not pg_current_wal_lsn(), which is the WRITE position:
-# a VACUUM assigns no transaction id and commits nothing, so its records can
-# sit in the WAL buffers - unsent - behind a write pointer the standby has
-# already passed.
+# The standby has replayed everything the primary had written when it reaches
+# a mark written here: a transactional logical message, committed with
+# synchronous_commit = on, so that the commit flushes - and so sends - every
+# record inserted before it, whoever inserted it; the standby replays the
+# message as nothing.  The target is the LSN pg_logical_emit_message()
+# returns, the end of the message, which is a record's end, as the replay
+# position is, and which no record written later moves.
+#
+# Not pg_current_wal_insert_lsn(): that is where the next record would START,
+# and once a record ends exactly at a page boundary it is past the next page's
+# header, where no replay position ever is - replay reports the end of the
+# last record, the boundary.  Only more WAL moves it, and an idle primary may
+# write none: its last record is often the bgwriter's running-xacts record,
+# which the bgwriter logs only after other WAL, so one that itself ends on a
+# boundary leaves the insert position out of reach until the next checkpoint.
+# catchup_mark() writes the mark and prints its LSN; wait_catchup() waits for
+# the primary's view of replay to reach it.
+catchup_mark() {
+	psql_p -tAc "set synchronous_commit = on; select pg_logical_emit_message(true, 'lion_recovery', 'catchup')"
+}
+
 wait_catchup() {
+	local target
+	target=$(catchup_mark) || die "could not write the catch-up mark on the primary"
 	wait_true psql_p \
-		"select coalesce(bool_or(replay_lsn >= pg_current_wal_insert_lsn()), false) from pg_stat_replication" \
-		120 "the standby to replay everything the primary has written"
+		"select coalesce(bool_or(replay_lsn >= '$target'::pg_lsn), false) from pg_stat_replication" \
+		120 "the standby to replay everything the primary has written (to $target)"
 }
 
 # rr_variant <hot_standby_feedback on|off> <k4 value>
@@ -2441,10 +2460,10 @@ standby_pin_case() {
 		SELECT pg_current_xact_id();
 	SQL
 
-	# Either replay blocks on the reader's pin, or it catches up.  Both are
-	# asked of the standby itself: the primary's view of replay_lsn is only as
-	# fresh as the last status message.
-	plsn=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	# Either replay blocks on the reader's pin, or it catches up, to the mark
+	# (catchup_mark()).  Both are asked of the standby itself: the primary's
+	# view of replay_lsn is only as fresh as the last status message.
+	plsn=$(catchup_mark) || die "$label: could not write the catch-up mark on the primary"
 	for i in $(seq 1 300); do
 		if [ "$(psql_s -tAc "select count(*) > 0 from pg_stat_activity where backend_type = 'startup' and wait_event in ('BufferPin', 'BufferCleanup')")" = t ]; then
 			state=blocked
@@ -2567,7 +2586,7 @@ standby_verify_aba() {
 		die "standby_verify_aba: the set's entry did not come back as it was ($before, then $after)"
 	psql_p -c "SET synchronous_commit = on; SELECT pg_current_xact_id()" >>"$RUNLOG" 2>&1
 
-	plsn=$(psql_p -tAc "select pg_current_wal_insert_lsn()")
+	plsn=$(catchup_mark) || die "standby_verify_aba: could not write the catch-up mark on the primary"
 	for i in $(seq 1 300); do
 		if [ "$(psql_s -tAc "select pg_last_wal_replay_lsn() >= '$plsn'::pg_lsn")" = t ]; then
 			state=caughtup
