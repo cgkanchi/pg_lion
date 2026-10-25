@@ -29612,6 +29612,28 @@ them (`lion_probe_rel_rows()`):
   each key it lets through names a row, and the orphan share is taken at the first key set only.
   Core's `eqjoinsel_semi()` takes `setrows / nd` where `nd` passes `dim.tuples`, the same, and then
   takes the orphan share again at the join.
+- **The key sets folded** (§47.6, "Folded into the walk"; `oj_fold_share()`): the walk is priced
+  over the AND of its set and the rows of the key sets' keys, `keysel = P(fk IS NOT NULL) * Π
+  min(1, hit * setrows / dim.tuples)` of the table, taken as independent of the fact's quals
+  (`lo_cost()`'s `keysel`): its members, pieces, bytes and fetches are the AND's, its rows
+  `factrows * keysel`, every key a dimension key that each key set passes (a test each all the
+  same). Each key set's leaf is priced in the start-up (`lion_ordered_keys_price()`): its keys'
+  entries located in the key's lion index, `index_pages_fetched()` over the index's pages at
+  `random_page_cost` as `genericcostestimate()` prices an IN list's descents, a descent's
+  comparisons a key, and a piece a container key its rows reach; and an operator a key for the
+  array. Its pages join the cold reads. Folded and not are both offered (`oj_add_paths()`), and
+  `add_path()` keeps what it keeps: a page the walk meets in a few hundred entries does not pay a
+  thousand keys' lookups back.
+- **The fetches the key sets reject**, not folded: the walk fetches each member to read its key,
+  and the key sets keep `kept = descents / keys` of them. Core's Limit takes `s` of a run priced
+  whole, which charges those fetches `s` of the pages Mackert and Lohman give the whole walk's -
+  each page once, a page for the seventy fetches the whole walk makes of it - where the LIMIT's
+  share makes `s * fetches` of them, which read the pages that many fetches read: a walk that
+  fetches a million rows for a hundred was charged a fifth of the table. So the pages of the
+  share's fetches at their own count (`lion_ordered_heap_price()`, `lo_cost()`'s heap price with
+  its correlation) past `s` of the whole walk's are charged, for the share `1 - kept` of them the
+  key sets reject, at `1 / s` of it in the run, which the Limit takes `s` of. Not alone under the
+  LIMIT (`s` 1) or with nothing rejected it is 0; folded there is nothing to reject.
 - **A descent**, as `btcostestimate()` prices one: `ceil(log2(index tuples))` comparisons,
   `(tree_height + 1) * 50` operator costs for the pages descended, an index tuple, an operator;
   and the B-tree's pages the descents read, `index_pages_fetched(descents, index pages)` at
@@ -29758,7 +29780,8 @@ The fact's side's lines as LionOrdered prints them - `Ordered By: <index>[ (inde
 Cond`, `Filter`, `Lion Cond`, `Lion Indexes` - then `Dimension: <table> [<alias>] via <index>`
 and the dimension's side's lines behind `Dimension ` (`Dimension Filter`, `Dimension Lion Cond`,
 `Dimension Lion Indexes`; its index and its descent's key, the join's clause, are not repeated),
-then `Key Sets: <table>, ...`. Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
+then `Key Sets: <table>, ...` and, where they are folded into the fact's set, `Key Set Index:
+<index>` (§47.6). Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
 Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`, `Rows Removed by Filter`, `Lion Set: N
 containers, exact|rechecked[, after N keys probed (probe budget)][, N builds]`, `Switched to Fetch
 and Sort` and the sort's method and space, `Scans Stopped Early`; then `Key Set Keys` (the last
@@ -29819,6 +29842,39 @@ context; a NULL key matches nothing. `Key Set Keys` counts them. Planning takes 
 join rel whole: a join rel some of whose tables are not key sets gets no path, and core's join of
 the node's rows to them above is the plan.
 
+**Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
+after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
+private workload's pages a key set of 746 companies kept 101 of 969,731 entries walked, each
+fetched (70.6 s against core's 0.9). Where the fact's key has a lion index the key sets are ANDed
+into the walk's set instead, and an entry whose key a key set lacks is not a member: never
+fetched. The index (`oj_key_index()`): a lion index of the fact, not partial unless the query
+implies its predicate, with a key column that is the key itself, a plain column, scalar - an entry
+a row, not multikey - of the key's type, whose equality strategy is each key set's hashable
+equality, under the key sets' collation; so the rows of a key there are the rows that key set's
+test passes, and an index that answers a key's rows differently is not taken. The keys are known
+only at run time, so the fact's plan carries a leaf for each key set (LO_SIDE_FACT's fourth member,
+`LO_PRIV_INTS`' fifth): `fk = ANY (NULL::type[])` on that index, ANDed at the root of its tree
+before the lion access's - or the tree alone where the fact has none - in the key sets' order.
+When the join builds a key set (`oj_exec()`) it hands its keys to the walk as an array of the key's
+type in the set's memory (`oj_keyset_array()`), the leaf's scan key's argument
+(`lion_ordered_keyset_keys()`, as `lion_ordered_probe_key()` hands the dimension its key), which
+drops the walk's set and restarts its walk; the set is then made from them as §30.4 makes any
+set, lazily or at once - a list longer than a batch built - an AND that a key set with no row
+empties before the lion access is read. The walk refuses to make its set while a leaf still holds
+the planned NULL. The join's test stays and passes every row: the posting union is exact for a
+scalar equality, and the test costs a hash probe. What follows is LionOrdered's: members are root
+TIDs and a member's row the version the snapshot sees (§30.5) - an update of the key is not HOT and
+puts the new version under its new key; NULL keys are in no key's postings; repeated keys are one
+array element each, the set's; an empty key set ends the scan before the walk, its empty array
+handed all the same so that no leaf keeps a freed array; a rescan keeps the set unless a key set
+is rebuilt (its plan's Param) or a lion qual's Param changed. And the walk's early stop and its
+fetch-and-sort switch (§30.4) now see the key sets: a set of a few thousand members switches to
+fetching and sorting them after 32 entries walked a member it has not met, which is the filter
+first, at run time. EXPLAIN prints `Key Set Index: <index>` after `Key Sets`, and the fact's `Lion
+Indexes` leaves that index's leaves out; under ANALYZE `Lion Set Hits`, `Heap Fetches` and `Lion
+Set` are the AND's, `Keys Rejected by Key Sets` 0. `pg_lion.enable_key_set_fold` (on) offers it;
+the price is §47.3's.
+
 ### 47.7 Not done
 
 - **A key set past `work_mem`.** Declined at plan time from the estimate; at run time a set
@@ -29850,20 +29906,28 @@ the node's rows to them above is the plan.
   priced. Under a key set the turn could be to the filter first: its keys looked up in a B-tree of
   the fact's key and their rows sorted in the walk's order past its position (the B-tree's order is
   the score's, then the TID's), arm by arm under the split - about core's plan, after the walk
-  before it. Under a filter above, which the node does not see, it could only be the rest of the
-  join at once, the two sets hash-joined and sorted: core's plan of the join without the page's
-  filters, a bound, but the dense page's 6.5 seconds on §47.10's tables. Either needs a price for
-  the switch, as §30.4's has, and a sort past `work_mem`.
-- **A key set's keys tested before the fact's heap.** In heap mode the walk fetches the member's
-  row, and the join then reads its key for the key sets; where the B-tree holds the key (`INCLUDE
-  (fk)`) the key could be tested on the index tuple and a rejected entry never fetched. An
-  index-only walk fetches no row either way.
+  before it. Folded into the walk's set (§47.6) that is the fetch-and-sort switch's, where the
+  fact's key has a lion index; without one it is not done. Under a filter above, which the node
+  does not see, it could only be the rest of the join at once, the two sets hash-joined and sorted:
+  core's plan of the join without the page's filters, a bound, but the dense page's 6.5 seconds on
+  §47.10's tables. Either needs a price for the switch, as §30.4's has, and a sort past `work_mem`.
+- **A key set's keys tested before the fact's heap, without a lion index of the key.** Folded
+  where the key has one (§47.6). Without, the walk fetches the member's row and the join reads its
+  key; where the B-tree holds the key (`INCLUDE (fk)`) the key could be tested on the index tuple
+  and a rejected entry never fetched. An index-only walk fetches no row either way.
+- **Core's own walk under a key set.** Without a lion index of the key the fetches a key set
+  rejects are priced at their own pages (§47.3); core's nested loop over the fact's B-tree with
+  the key table's semi join Memoized above is not, its Limit taking its share of the whole walk's.
+  Where the fact's key has no index at all and the ORDER BY is the B-tree's, that loop can come out
+  under the node and core's filter first, and is the slowest of the three: on 2,000,000 rows, 1,048
+  ms against the node's 284 and the hash join's 200 (the split's order has no such loop).
 - **A key set's other columns.** A table a column of which the query reads is not a key set, even a
   column its clauses pin to a constant, which the node could fill as it fills the key: §47.10 says
   why that would cost the page its plan. A key that repeats under the table's clauses is not one
   either: the rows would have to come out once for each of its rows.
 - **Arms a key set passes over.** Under the split, an arm none of whose dimension rows a key set's
-  keys name walks to its end (§47.10, "What a key set leaves"). The key set's keys could be
+  keys name walks to its end (§47.10, "What a key set leaves") - folded (§47.6), to the last
+  member of its set, or to the switch, which fetches and sorts them. The key set's keys could be
   descended once into the dimension and tested against each arm's set, and an arm with none passed
   over; it is not.
 
@@ -29927,6 +29991,26 @@ alone, its walk both arms long (§47.10, "What a key set leaves"). Not alone and
 split under a LATERAL subquery's clause, its LIMIT 1 keeping it from being pulled up, at 2.2 times
 under core's price. A key set's key in the target: with nested loops and merge joins off, the side
 table's hash join above reads the key set's key, `Hash Cond: (s.fk = ib.fk)`, which the node fills.
+
+test/sql/ordjoin_keyfold.sql, §47.6's fold, in a schema of its own: a 20,000-row dimension with
+lion indexes on a three-value `tier` and a ten-value `region`; a 200,000-row fact table, ten rows a
+key, every 97th key NULL, with a B-tree by a random rank that does not hold the key and a lion
+index on a twenty-value `prod`; a key table of sixty keys for product 7 (600 fact rows) and 2,000
+for product 3, and one of 40 keys repeated and NULLs. Each query through the node, forced, and
+through core's plan, answers compared in order. Without a lion index of the key, the split led by
+the tier under product 7's key set walks 18,275 entries, every one fetched, 18,043 keys rejected;
+with nothing forced the plan is core's, the walk priced at its share's fetches (§47.3), and for
+product 3's two thousand keys the split's. With `cpc_fk`, a lion index of the key: the same split
+forced walks 17,792 entries over a set of the key set's 610 rows, 54 met, then switches and
+fetches the 556 left, 610 fetches in all and no key rejected; the join with a fact and a
+dimension lion clause besides, its set the AND of both; with nothing forced core's plan for
+product 7 - the key table, then the key's lion index - and the split folded for product 3. A key
+set of repeated keys and NULLs; two key sets, an IN on the fact's key and an EXISTS on the
+dimension's, two leaves; an empty one; the whole join without a LIMIT; a LATERAL rescan whose key
+set is built and handed again for each of three rows (`Key Set Builds: 3`); a key updated and a row
+inserted in the transaction before the query. Not folded: a partial lion index of the key whose
+predicate the query does not imply, and folded into where it does; a key table of `bigint` keys,
+no key set; `pg_lion.enable_key_set_fold` off.
 
 ### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
@@ -30297,7 +30381,9 @@ core's Limit pays whole; the child's start-up is its own total too. Both are div
 **The sides' sets** (§47.4). The fact's is weighed for its lazy set by the arms up to `m`, their
 shares of its walk summed - two whole arms weigh 2. The dimension's is built at once under a split,
 whatever its weight (§48.4, "Built at once"), and `oj_cost()` prices its build whole, as it does
-for the join.
+for the join. Key sets folded into the fact's set (§47.6) are priced in it as for the join (§47.3),
+once: the set is kept from arm to arm, the key sets built once; and each arm's run, not folded,
+carries the pages of the fetches its key sets reject at the arm's own share (§47.3).
 
 **Where the price and the run part:**
 
@@ -30320,7 +30406,8 @@ for the join.
 - *A filter above the split*, a join or a clause that drops rows of the arms: §47.10 prices the
   split at every arm. A key set filters inside it, and its keys are taken to be spread over the
   arms as the dimension's quals are; a key set of one arm's rows walks the others to their ends
-  (§47.10, "What a key set leaves").
+  (§47.10, "What a key set leaves") - folded into the fact's set (§47.6), each to the last member
+  of the set, or to the switch.
 
 ### 48.4 Execution (`os_begin()`, `os_exec()`, `os_next_arm()`, `os_rescan()`; `lion_ordered_narrow_begin()`, `_add()`, `_end()`, lion_ordered.c)
 
@@ -30415,7 +30502,8 @@ its `Dimension Lion Set` is the dimension's set, not an arm's.
 - **A cap at run time.** None: a column with more entries than planned - values inserted since
   ANALYZE - runs every one.
 - **A multikey column**, whose rows are under several entries: declined.
-- **Arms a key set passes over**, and a switch from a slow arm to the filter first: §47.7.
+- **Arms a key set passes over**, and a switch from a slow arm to the filter first: §47.7 - the
+  switch is the fetch-and-sort's where the key sets are folded into the fact's set (§47.6).
 
 ### 48.7 Tests
 
