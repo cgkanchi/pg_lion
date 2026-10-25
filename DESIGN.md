@@ -30472,3 +30472,140 @@ sizes: its Limit 2,197 against core's 104,372 for the dense `d.flag DESC` page, 
 90,083 for the medium. It keeps core's plan for the sparse page, rightly: the arm walks 1.19 million
 entries for its twenty rows, 4.3 times slower than core's plan, and is priced 128,890 warm and
 190,970 cold against 77,161. Not measured: other majors.
+
+## 49. A lion path's own price, and the heap probe (2026-10-25)
+
+§39 prices a lion path against the cheapest core plan it meets: its own price times that plan's
+rate, divided by that plan's cold reads, scaled by the rows that plan's probes of a skewed key meet
+and by its Memoize's hits under a LIMIT. Each correction reads the competitor's plan, so each new
+shape of core plan needs a new reading (§39's "The join that reads the dimension" is the latest),
+and a path's price moves with a plan it is not part of. This section starts replacing that with a
+rule: **a lion path is priced by the work it does, in core's units, and core's plans by core.**
+
+- **Its own work, itemized.** No factor comes from another path.
+- **What it shares with core, at core's prices.** Heap pages through `index_pages_fetched()` and the
+  tablespace's page costs, a B-tree descent through the index's `amcostestimate`, a row at
+  `cpu_tuple_cost`, quals at `cost_qual_eval()`. A table read cold is core's to price, through
+  `effective_cache_size` and the tablespace's `random_page_cost`, and then it is priced so for every
+  plan alike.
+- **What is lion's alone, at its constants** (§31), fitted in core's units.
+- **One set of row estimates.** What lion knows better than core (n_distinct, §33; the rows of an
+  intersection, `pg_lion.enable_rows_correction`) goes to every path or to none.
+- **Scans that core composes.** Where lion can offer a path of a relation that core's join search
+  combines - the inner side of a nested loop, under a Memoize, a semi, anti or left join - its price
+  meets core's alternative for the same relation and parameterization in `add_path()`, both made by
+  the same formulas, and nothing needs to read the plan around it.
+
+### The switch (`pg_lion.competitor_pricing`)
+
+On by default, §39 as it was. Off, `lion_competitor_of()` finds the competitor's kind (for the margin,
+which stays a policy) and takes nothing else from it: rate 1, no nested loop's or bitmap heap scan's
+cold reads (`lion_competitor_bitmap_cold()`, `lion_units_scan_cold()`), no Memoize scale, and
+LionOrderedJoin weighs no competitor of its own (`oj_cost()`). A skewed key's rows
+(`lion_skew_param_factor()`, `lion_skew_clauses_factor()`) are core's: lion's paths, the AM's scans
+and the competitors are all priced at core's rows per key. Off is the ablation of §39 in one
+setting; the next step is to run the private workload and the matrix with it off, and keep only what
+moves a plan to a faster one.
+
+### The heap probe (`pg_lion.enable_heap_probe`)
+
+§40.10's probe is index-only: a nested loop's inner `LionBtreeScan` descends a covering B-tree to the
+outer row's key and tests the entry against the relation's lion set. It declined the heap mode as "a
+plan that loses to core's wherever the set does not" reject most rows. That is a judgement for the
+price, and the price can make it: in heap mode the probe is core's parameterized Index Scan of the
+same B-tree with the lion test in place of the Filter, the heap row fetched for a member alone. Its
+fetches are a subset of the Index Scan's, priced by the same formula (`lo_cost()` with `loops`), so
+its price is lower by the rejected rows' pages and quals and higher by the set's build, spread over
+the scans (§40.10), and an entry's test. Where the B-tree does not cover what the scan must return,
+`lo_set_rel_pathlist()` takes its parameterized paths alone (`lo_btree_paths()`; its unparameterized
+walk would read every member's row) and offers each paired lion access in heap mode: `iocols` NIL,
+no `LO_FLAG_INDEXONLY`; the executor's heap fetch, recheck and EvalPlanQual are §30's. It needs
+`enable_indexscan`. This is the shape LionProbeJoin (§46) and LionOrderedJoin's dimension (§47)
+each build inside a join of their own; as a path of the relation, core composes it with any join.
+
+**The probe's members over the loop.** `lo_cost()` counted a probe's members and their pages a scan
+at a time, each clamped to one: a set that passes one key in a hundred was charged a heap fetch and a
+page an outer row - core's Index Scan's - plus its own test, and lost to it everywhere. A key finds
+its entry in every scan and the set passes a share of them, so a probe's members are now counted over
+all of the loop's scans and shared out (`fetched`, `candidates`), and a scan that fetches less than a
+row reads that share of a page (`pages_corr`). The index-only probes are priced by the same counts.
+In competitor_cold.sql three plans moved to LionProbeJoin, whose probe is priced the same way
+(`lion_ordered_probe_price()`): the anti join's nested loop at ten times the cache with the cold
+charge at 0, and the Memoize loop in the cache and at ten times it uncharged. Warm, on PostgreSQL 18.6
+(release), medians of nine over three rounds: the anti join ties (node 1.54 to 1.89 ms, loop 1.46 to
+1.92), and the Memoize query runs faster through the node (5.22 to 5.67 against 5.79 to 7.00).
+
+**Measured** (heapprobe.sql's tables: a 100,000-row dimension on 2,619 pages, 200,000 fact rows;
+PostgreSQL 18.6 release, warm, hash and merge joins off, `pg_lion.competitor_pricing` off; medians of
+five to seven runs on a shared VM whose runs vary by a third, so a difference below that is a tie):
+
+| outer rows | the set passes | heap probe | core's Index Scan | the planner takes |
+|---|---|---|---|---|
+| 3,585 | 0.7% | 6.9 ms | 11.1 ms | the probe |
+| 3,585 | 10% | 7.3 to 10.5 | 10.6 | the probe |
+| 40,000 | 10% | 65.9 | 80.2 | the probe |
+| 200,000 | 10% | 267 | 406 | core's, at a price 1% below the probe's |
+| 4,000 | 100% | 12.3 | 13.0 | core's (the set rejects nothing) |
+| 200,000 | 100% | 388 | 376 | core's |
+| 3 | 7% | | | core's (the build is not paid back) |
+
+With 200,000 outer rows over a 2,619-page table both plans read every page about once, which is all
+`index_pages_fetched()` charges them, and each heap fetch past that is a `cpu_tuple_cost`: the 180,000
+fetches the probe saves, about 0.7 us each here, are priced at a hundredth of a unit, and the two come
+out within 1%. That is core's price of a cached heap fetch, which core's own plans take too; by this
+section's rule the probe takes it as well, and the near tie goes to core's plan. Where the pages are
+not all read - fewer outer rows, a larger table, a cold one at its `random_page_cost` - the fetches
+the probe saves are pages, and its price shows them.
+
+### Calibration (`bench/calib/ops.py`)
+
+A lion constant is a multiple of a core cost setting; what it should be is the ratio of the time of
+lion's operation to the time of the core operation that setting prices, both on the same build and
+machine - a ratio that carries to another machine, where a rate of cost units a millisecond does
+not. `bench/calib/ops.py` checks such ratios into the tree. Its anchor is `cpu_operator_cost`: the
+slope of a cached sequential scan's time over the number of `a <> -k` quals it evaluates a row, each
+an `int4ne` of procost 1. Its first lion operation is a probe's own work an outer row: the heap probe
+over a set that passes every row against core's Index Scan of the same B-tree with no filter - the
+same descents and fetches - taken as the slope over 50,000, 100,000 and 200,000 outer rows, so that
+the set's build stays out of it.
+
+On PostgreSQL 18.6 (release), on the shared VM above with nothing else running, three runs of 21
+rounds each: a `cpu_operator_cost` is 4.90 to 5.12 ns; core's Index Scan loop 1,311 to 1,351 ns an
+outer row; and the probe 98 to 169 ns an outer row over it - 20 to 34 `cpu_operator_cost`s, where
+`lo_cost()` charges an entry `LO_PROBE_TUPLES` (2) `cpu_tuple_cost`s and a `cpu_operator_cost`, 9.
+Under callgrind (a single-user backend, the same query at 10,000 and 30,000 outer rows, the
+difference over 20,000) the probe runs 10,198 instructions an outer row against core's 9,849, the
+same descents, buffer and heap work in both; of the 349 more, the set's test is 195
+(`lo_set_find()` 84, `lion_container_contains()` 110) - about 10 `cpu_operator_cost`s at the
+anchor, which the 9 charged meets - and the rest is the executor's: the node's projection of its
+target into a slot of its own (`ExecInterpExpr`, 79), where core's Index Scan returns the heap tuple
+through a physical target list, and `lo_next()` and `lo_rescan()` (194) against core's
+`IndexNext()`, `index_getnext_slot()` and rescan (about 120). So the constant stands for what it
+prices, and the 150 instructions past it are the node's to remove rather than lion's to charge.
+Taken at 25, the
+probe's price rises by 0.04 a scan, and the 40,000-row row of the table above - the probe at 0.58 a
+scan against core's 0.60 - goes to core's plan, which runs it 1.2 times slower: the same price of a
+cached heap fetch as at 200,000 rows, met sooner. A measured constant on lion's side cannot make up
+for core's price on its own; how lion's plans fare against core's on a warm machine will rest on
+core's page costs as the deployment sets them.
+
+**Not done.**
+
+- *Column values from the sets.* A query that reads a low-cardinality lion column of the dimension
+  still fetches the row for it; the probe could return its value from the column's per-value sets,
+  as LionProbeJoin's labels give a predicate's truth, and be covering for it.
+- *The comparison with LionProbeJoin and LionOrderedJoin* on their fixtures and the private
+  workload, with the switch off, before either default changes.
+- *The probe's own overhead* (above): a physical target list where the node projects nothing, and
+  `lo_next()`'s and `lo_rescan()`'s path for a probe; then `ops.py` again. And the harness's next
+  operations - the set's build a container (`lo_build_excess()`'s `LO_BUILD_PIECE_TIDS` is a
+  correction of §30.3's price, not a measurement of its own), a container's AND, a count - each a
+  ratio to the core operation of its unit.
+
+**Tests.** test/sql/heapprobe.sql: every query through the heap probe and through core's plan,
+answers compared - an inner join, a left join, a Memoize chosen at the prices, an ORDER BY the loop
+keeps, a residual filter, `FOR SHARE` of the dimension, rows updated after the VACUUM - and the
+choice at the prices between the probe and core's Index Scan. costrates.sql: with the switch off no
+rate moves a count, a GROUP BY, an FK-side join or a semi or anti join, each at its reference price.
+competitor_cold.sql: with the switch off LionProbeJoin's price at ten times the cache is its price
+with no cold charge.
