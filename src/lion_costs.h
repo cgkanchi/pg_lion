@@ -100,6 +100,14 @@ extern PGDLLIMPORT double lion_pushdown_margin;
  */
 extern PGDLLIMPORT double lion_cold_max_discount;
 
+/*
+ * Whether a lion path's price is corrected by what lion reads of the core
+ * plan it competes with (DESIGN.md §39): the rates, the cold reads, a skewed
+ * key's rows and a Memoize's LIMIT.  Off, a path is priced by its own work
+ * alone (DESIGN.md §49).
+ */
+extern PGDLLIMPORT bool lion_competitor_pricing;
+
 extern void lion_costs_init(void);
 
 #endif							/* LION_COSTS_H */
