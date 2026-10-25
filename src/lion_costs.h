@@ -47,6 +47,10 @@ extern PGDLLIMPORT double lion_resident_page_cost;
 extern PGDLLIMPORT double lion_cold_page_cost;
 extern PGDLLIMPORT double lion_cold_stream_page_cost;
 
+/* A nested loop's B-tree probe (lion_ordered.c, DESIGN.md §40.10, §49) */
+extern PGDLLIMPORT double lion_probe_entry_cost;
+extern PGDLLIMPORT double lion_probe_rescan_cost;
+
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;
 extern PGDLLIMPORT double lion_list_group_cost;

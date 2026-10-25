@@ -132,10 +132,12 @@ build with nothing else on the machine:
     python3 bench/calib/ops.py --setup && python3 bench/calib/ops.py   # lion's operations against core's
     python3 bench/calib/matrix.py --setup-only && python3 bench/calib/matrix.py --out run.json   # plan choices
 
-`ops.py` times each lion-only operation the planner prices against the core operation whose cost
-setting its constant is written in, on the same build - `cpu_operator_cost` from the slope of a
-sequential scan over its quals - and prints each as a multiple of that setting beside what lion
-charges (DESIGN.md §49, "Calibration"). `matrix.py` plans and times a fixed set of queries under
+`ops.py` times each lion-only operation the planner prices against the core operation it stands in
+for, on the same build, and prices it at that operation's own rate - its time over core's price of
+it, in `cpu_operator_cost`s - printed beside the setting that charges it (DESIGN.md §49,
+"Calibration"): a nested loop's B-tree probe against core's Index Scan, apportioned between
+`pg_lion.probe_rescan_cost` and `pg_lion.probe_entry_cost`. It prints a sequential scan's rate
+too, the slope of its time over its quals, for comparison. `matrix.py` plans and times a fixed set of queries under
 every arm and reports the planner's mispicks (DESIGN.md §39, "The matrix"); `--set
 pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own work alone.
 

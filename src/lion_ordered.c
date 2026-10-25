@@ -216,6 +216,21 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 #define LO_PROBE_TUPLES		2
 
 /*
+ * A nested loop's B-tree probe (§40.10) beyond core's Index Scan of the same
+ * B-tree, which it stands in for (DESIGN.md §49, "The probe's own work"),
+ * timed against it by bench/calib/ops.py - scans of one entry and of eight -
+ * and priced in that Index Scan's units: its time over core's price of it.
+ * An entry it meets is tested against the set, and marks nothing; a scan
+ * is the node's rescan, and the code of its loop and of the set's lookup run
+ * beside core's between one outer row and the next, more than the
+ * processor's instruction cache holds for both - under callgrind the probe
+ * runs no more instructions a scan than core's Index Scan, but twice its
+ * instruction cache misses.
+ */
+#define LO_PROBE_ENTRY_COST		(lion_probe_entry_cost * cpu_operator_cost)
+#define LO_PROBE_RESCAN_COST	(lion_probe_rescan_cost * cpu_operator_cost)
+
+/*
  * The set evaluated lazily (DESIGN.md §30.4, "The set, lazily"), until its
  * probes have cost what building it would: a probe of a stream is a unit of
  * work for each of its posting sets, starting a stream again behind where it
@@ -1948,12 +1963,14 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	/*
 	 * the walk: the ordered index's own cost, and the probe of each entry -
-	 * CPU, which a parallel walk divides
+	 * CPU, which a parallel walk divides; a nested loop's probe, an index
+	 * parameterized by the outer row, at its own (LO_PROBE_ENTRY_COST)
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
 	if (skewscale < 1.0)
 		walked = Min(clamp_row_est(walked * skew), tuples);
-	cpu = walked * (LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
+	cpu = walked * ((ord->path.param_info != NULL) ? LO_PROBE_ENTRY_COST :
+					LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
 	/*
 	 * The members' heap fetches, priced as cost_index() prices them: of the
@@ -4316,6 +4333,15 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					ppi->ppi_rows, indexonly, loops, scans,
 					ipath->path.param_info != NULL, NULL, &startup, &total,
 					NULL, NULL);
+			total += LO_PROBE_RESCAN_COST;
+
+			/*
+			 * The descent comes before the first entry, as before core's
+			 * Index Scan's first row, and is startup as cost_index() has it:
+			 * left in the run, it would offer add_path() a first row cheaper
+			 * than core's, which it is not, and win a tie on it.
+			 */
+			startup = Min(startup + ipath->path.startup_cost, total);
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
 						list_make3(ipath, lion, iocols), ppi->ppi_rows,
 						startup, total, rel->consider_parallel, 0);
@@ -5798,15 +5824,27 @@ lo_set_combine(LionOrderedState *st, LionTidSet *a, LionTidSet *b, bool isand)
 	return r;
 }
 
-/* The index of tid's container key if tid is a member, else -1. */
+/*
+ * The index of tid's container key if tid is a member, else -1.  The keys
+ * are distinct and ascending, so a key's index is no further from either end
+ * than the key is from that end's key: the search starts within those
+ * bounds, and a set with every key of its range - one of a share of most
+ * blocks' rows - finds its key with no search at all (DESIGN.md §49, "The
+ * probe's own work").
+ */
 static int
 lo_set_find(const LionTidSet *set, ItemPointer tid)
 {
 	uint64		code = lion_tid_to_code(tid);
 	uint32		ckey = lion_code_ckey(code);
-	int			lo = 0;
-	int			hi = set->n - 1;
+	int			lo;
+	int			hi;
 
+	if (set->n == 0 || ckey < set->keys[0] || ckey > set->keys[set->n - 1])
+		return -1;
+	hi = (int) Min((int64) set->n - 1, (int64) ckey - set->keys[0]);
+	lo = (int) Max((int64) 0, (int64) set->n - 1 -
+				   ((int64) set->keys[set->n - 1] - ckey));
 	while (lo <= hi)
 	{
 		int			mid = lo + (hi - lo) / 2;
