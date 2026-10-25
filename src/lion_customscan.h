@@ -3835,6 +3835,19 @@ typedef struct LionCellsDimPlan
 	double		bitsel[LION_CELLS_MAX_BITS];	/* MULTI: each leaf's */
 	double		bitkeys[LION_CELLS_MAX_BITS];	/* ... and its keys */
 	Node	   *bitclause[LION_CELLS_MAX_BITS];
+
+	/*
+	 * A SCALAR dimension read by ranges (DESIGN.md §46, "Ranges"): its
+	 * outcomes are runs of the column's order, not values, and each outcome
+	 * but 0 is told by its runs - a List each of its values alone (Consts,
+	 * `= v` or `= ANY`) and of its intervals, each a List of one or two
+	 * bounds over the column (an OpExpr of the index's family).  The
+	 * priv's values are none.  Only a caller that asked for ranges
+	 * (lion_cells_analyze()) gets one: LionProbeJoin.
+	 */
+	bool		ranged;
+	List	  **outpoints;		/* [radix] */
+	List	  **outranges;		/* [radix] */
 } LionCellsDimPlan;
 
 typedef struct LionCellsPlan
@@ -3853,7 +3866,7 @@ typedef struct LionCellsPlan
 extern bool lion_cells_shape_ok(PlannerInfo *root, RelOptInfo *rel,
 								Index rti, Node *expr);
 extern LionCellsPlan *lion_cells_analyze(PlannerInfo *root, RelOptInfo *rel,
-										 Index rti, List *exprs);
+										 Index rti, List *exprs, bool ranges);
 extern bool lion_cells_choose_driver(PlannerInfo *root, RelOptInfo *rel,
 									 LionCellsPlan *cp, Var *fallback,
 									 double fallbackentries);

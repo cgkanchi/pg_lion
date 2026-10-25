@@ -3890,10 +3890,11 @@ WHERE's clauses no posting set answers, are walked down to their predicates:
   for `@@`; a query that selects no row (`c && '{}'`) is false, or NULL in a NULL row.
 
 The predicates are told apart by `equal()`. Anything else in the expressions - a column read
-outside a predicate, a range, a `CASE c WHEN ...` (whose WHEN tests a placeholder), a subquery, an
-aggregate, a mutable function, a set-returning one - declines the count; so does a tsquery with a
-NOT, a query a stored position would have to narrow (§17, "Stored positions"), and a GROUP BY that
-holds a bare column - that column's walk is the plain GROUP BY's, and a cell is no group of it.
+outside a predicate, a range ("Ranges", below), a `CASE c WHEN ...` (whose WHEN tests a
+placeholder), a subquery, an aggregate, a mutable function, a set-returning one - declines the
+count; so does a tsquery with a NOT, a query a stored position would have to narrow (§17, "Stored
+positions"), and a GROUP BY that holds a bare column - that column's walk is the plain GROUP BY's,
+and a cell is no group of it.
 
 **Dimensions and outcomes.** The predicates are grouped by column into DIMENSIONS. A scalar
 column's rows are told apart by the values its predicates name: every value named, any other value
@@ -4095,6 +4096,26 @@ VACUUM; enum columns and a domain over one; and parallel plans, with rows the he
 list on the driver's column - short, of no value with rows, a Param's past a batch, beside the anti
 join - and the WHEREs that stay serial: a range source, a Param's multi-key query, a literal
 prefix too common to expand, a tsquery's or a jsonpath's.
+
+**Ranges** (not done). The analysis takes a range of a scalar column for LionProbeJoin (§46,
+"Ranges": the column's values in the index's order, the gaps between them and NULL its pieces,
+outcome 0 its largest), and declines it here (`lion_cells_analyze(..., false)`;
+`lion_cells_choose_driver()` declines a ranged dimension too): the walk reads a scalar column by its
+values. The count would take it in four parts, a change of its own. *The driver*: a ranged
+dimension can drive, its entries walked in the column's order; each entry's outcome is its key's
+piece, found by the family's comparison (`LION_CMP_PROC`) - a merge of the pass's keys with the m
+sorted values, a comparison an entry and a value, where an equality dimension compares each entry
+with its values - and the bound on comparisons counts those. *The labels*: a ranged dimension that
+does not drive is labelled by its outcomes' runs, as §46's are; an interval is many entries, which
+read at each container key would be a seek each, so each run is collected first, as a range taken
+as a source is (`lion_range_collect()`, §28; `lion_sources_collect_range()` for a participant's
+range of keys in parallel), within the hash table's memory that the WHERE's collections share, and
+read at each key as a copy, as the WHERE's is; a run that would not fit declines the plan.
+*The price*: a run's collection as `lion_cost_range_source()` prices it, its reads at the keys as a
+copy's, and the cells with rows from each piece's share, a gap's its bounds'. *The plan*:
+`LION_PRIV_CELLS` carries, for a ranged dimension, its sorted values, each piece's outcome and each
+outcome's runs; EXPLAIN is unchanged, the ranges among `Cell Predicates`. The argument for exactness
+is the walk's: the collected runs are read after the snapshot, as the labels are.
 
 ## 11. Additional VACUUM rule for phase 2 (binding on wave 2 `lion_vacuum.c`)
 
@@ -28805,11 +28826,12 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   the node emits - holds expressions each of the fact's columns alone or of the dimension's alone,
   none volatile, with no SubPlan and no placeholder; the dimension's are functions of predicates
   §10's analysis decides (`lion_cells_analyze()`: equalities, `IN` lists, null tests, booleans,
-  `<>`, and `@>`, `&&` or `@@` of a multi-key column, with constants, each of a column with a
-  non-partial lion index). A dimension column outside a predicate - grouped by itself, under a
-  CASE's THEN, an aggregate's argument - keeps the node out: its value is not in any set. The
-  fact's path returns plain Vars, the join key among them. There must be a set to build: a WHERE on
-  the dimension or a predicate, or core's nested loop already is the plan. The fact needs no lion
+  `<>`, ranges of a scalar column - "Ranges", below - and `@>`, `&&` or `@@` of a multi-key column,
+  with constants, each of a column with a non-partial lion index). A dimension column outside a
+  predicate - grouped by itself, under a CASE's THEN, an aggregate's argument - keeps the node out:
+  its value is not in any set. The fact's path returns plain Vars, the join key among them. There
+  must be a set to build: a WHERE on the dimension or a predicate, or core's nested loop already is
+  the plan. The fact needs no lion
   index; where it has one the FK-side join is offered too, and the price chooses.
 - **The NOT EXISTS** (`lion_probe_anti()`). At most one anti join, from a sublink, whose syntactic
   lefthand is the two tables and whose righthand is the rest of the query: a small inner side, one
@@ -28847,6 +28869,38 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   is. A label must be exact - §10 takes only predicates a posting set decides - and the node stops
   with an error if one is not. The truths are §10's (`lion_cells_pred_truth()`, the one function
   for both): true, false or NULL, by SQL's rules.
+- **Ranges** (`cells_ranged_order()`, `cells_ranged_outcomes()`, lion_plan_cells.c). The node asks
+  §10's analysis for ranges (`lion_cells_analyze(..., ranges)`), which a count does not: `c < v`,
+  `<=`, `>=` and `>` - a BETWEEN is two of them, and a constant on the left is read commuted - of a
+  scalar column other than a boolean, v a constant, the operator a range strategy of the family of
+  the column's scalar lion index for one type on both sides, whose equality of that type tells the
+  column's values apart (`cells_range_eqop()`), and every range of the column one that index answers
+  as a range (`lion_match_index()`, `LION_CLAUSE_RANGE`: the strategy, the family's comparison, the
+  collation). The column is a RANGED dimension. Its PIECES are the m values its predicates name - a
+  bound's and an equality's alike - in the family's order (`LION_CMP_PROC`), the m + 1 gaps around
+  them (below the first, between neighbours, above the last) and NULL: 2m + 2 of them
+  (`cells_npieces()`). The values are told apart by the equality (`cells_value_no()`), so numeric's
+  `1.0` and `1.00` are one; two the order still calls equal decline the node. Every predicate's
+  truth is one across a piece: a bound's by the places - a value at place r is below the bound at
+  place k for r < k, and the values of gap g for g <= k, since they are below the value at place g;
+  an equality's, an IN list's, `<>`'s by the value, a gap naming none; NULL's by SQL's rules, a
+  range of NULL being NULL (`cells_eval()`). The pieces of one signature are an OUTCOME, as a scalar
+  column's values are, and outcome 0 is the one of the most rows by the planner's estimates - a
+  value's by its equality's selectivity, a gap's by its two bounds' together
+  (`clauselist_selectivity()`), never NULL's alone - so that the labels hold the fewest: for
+  `score > 0.6` of scores from 0 to 1, outcome 0 is the rows at or below 0.6, and the label the rows
+  above.
+  Each other outcome's label is its RUNS of adjacent pieces, ORed: a value alone is its equality,
+  the outcome's single values gathered into one `= ANY`; a longer run is the interval from its first
+  piece to its last - `>=` the value it begins at or `>` the value below the gap it begins at, `<=`
+  or `<` at its end likewise, an end at the column's first or last gap none - one IndexPath of both
+  bounds, its set built as lion builds a range's (§28, exact); and `IS NULL` where NULL's outcome is
+  it. An empty gap, between 2 and 3 of an int, is an empty set. The order is the index's, so every
+  value of the column is in exactly one piece and a row in one label at most: numeric's NaN, which
+  the order puts above every number, is in the last gap, where `score > 0.6` is true of it, as the
+  operator says. A bound that is no Const - a Param, `CURRENT_DATE`, `now()` - keeps the node out:
+  the outcomes are places in the order of the values, and a value known only at run time has none
+  when the plan is made ("Not done").
 - **A fact row** (`pj_next()`). Its key is read from the fact's slot; a NULL finds nothing, as the
   strict equality finds nothing. Otherwise the B-tree is descended to it (`index_rescan()` of one
   scan opened for the whole run, the probe's scan key the join operator's procedure) and each TID
@@ -28968,7 +29022,17 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
 
 - An outer or semi join (the inner join's semantics are the node's: no dimension row, no row), a
   dimension that is a join, a partitioned dimension, more than one dimension.
-- A predicate with a Param: §10's outcomes are of constants.
+- A predicate with a Param or a stable bound (`since >= CURRENT_DATE - 365`): §10's outcomes
+  are of constants. Such a predicate could be a bit of its own, as a multi-key column's leaf is -
+  its set the leaf's clause with its run-time key, built at the first row like the WHERE's Params
+  (`lo_fix_qual()`), its outcome the mask of the bits a row's sets hold - at the price of a set a
+  predicate rather than a set an outcome, and of no exclusion among them.
+- The competitor's cold reads behind an anti join. §39 takes the competitor's kind from the first
+  join it meets (`lion_competitor_kind()`), so a Hash Anti Join over the nested loop into the
+  dimension is priced as a hash join's, whose rate stands and whose loop's cold reads are not
+  weighed: the node meets the loop beneath at its warm price. And
+  `lion_nestloop_cold()` charges no cold read to a loop whose inner side is a Memoize. Both are
+  §39's, for every lion path priced against such a plan.
 - Labels shared with the WHERE's leaves where the two read the same index: each set is built for
   itself.
 - A per-key cache of the outcome (a Memoize's): the fact rows' keys repeat, and each repetition is
@@ -28993,13 +29057,20 @@ table, unvacuumed, then vacuumed (`Heap TIDs Rechecked: 0`); the parallel form (
 HashAggregate, Gather, Partial HashAggregate, the node over a Parallel Seq Scan and the inner side
 whole); the plan chosen on price with nothing disabled, an 80,000-row dimension of wide rows
 under 3,000 fact rows; and the node not offered - a dimension column grouped by, under a THEN, in
-an aggregate; a predicate of a column with no lion index, or one no posting set decides
-(`tier >= 4`), or of both tables; a WHERE no lion index answers; a LIKE lion answers only by its
-prefix's range, alone or beside an exact clause, against the range written out, which the node
-takes; a LEFT JOIN; a join on a
-column with no unique index; no set to build; the switch off. EXPLAIN is printed with its
-counters where a run leaves them the same and as `> 0` where an earlier run's killed index entries
-change them.
+an aggregate; a predicate of a column with no lion index, or one no posting set decides (a range
+whose bound is no constant), or of both tables; a WHERE no lion index answers; a LIKE lion answers
+only by its prefix's range, alone or beside an exact clause, against the range written out, which
+the node takes; a LEFT JOIN; a join on a column with no unique index; no set to build; the switch
+off. Ranges (section 9): a 6,000-row
+dimension with lion indexes on a numeric with NULLs and NaN, a date, an int declared NOT NULL, a
+text of "C" collation and an enum, each with NULLs where it may; one bound beside a fact column,
+its truths compared too; bounds of every strategy, BETWEEN and a constant on the left; a range
+beside `=`, `IN`, `<>`, `NOT IN` and `IS DISTINCT FROM` of the same column, with empty gaps; a
+date's, a text's and an enum's order; the tier of the shape above - ranges, an overlap and an IN
+list under a gate, rounded - with a range in the WHERE and the NOT EXISTS; EXPLAIN ANALYZE of the
+labels; the parallel form; `tier >= 4`, which a count by cells declines; and a generic plan's
+Param as a bound, not offered. EXPLAIN is printed with its counters where a run leaves them the
+same and as `> 0` where an earlier run's killed index entries change them.
 
 **Measured** (2026-10-23; PostgreSQL 16, the dev cluster - a VM of four cores shared with other
 work, `shared_buffers` 128 MB, the tables in the OS cache: warm; EXPLAIN (ANALYZE, TIMING OFF),
@@ -29027,6 +29098,45 @@ is not measured; the pages each plan reads say it goes the other way: the hash j
 WHERE's heap pages, half of the 422 MB here and most of an 87 GB heap, and the nested loop a random
 heap page a fact row, where the node reads the primary key's leaves and the lion indexes and no
 heap page of an all-visible dimension.
+
+**Measured, ranges** (2026-10-24; PostgreSQL 18, the dev cluster - a VM of four cores shared with
+other work; EXPLAIN (ANALYZE, TIMING OFF); warm, `shared_buffers` 2 GB, the median of five to nine
+runs; cold, `shared_buffers` 128 MB, the server restarted and the dimension's heap dropped from the
+OS cache before each run, the median of three). A 1,000,000-row dimension of wide rows (a 503 MB
+heap, a 21 MB primary key) with lion indexes on twelve columns - texts of 20, 8, 8 and 4 values with
+NULLs, an int of 5, a text array of one to four of 30 tags, a numeric `score` from 0 to 1, a date
+`since`, two booleans, the WHERE's `status` and `country` - and a 3,000,000-row fact table with a
+B-tree on `(grp, ver, fk)` and no lion index; 60,000 rows in the NOT EXISTS's table, 10,000 of them
+its keys. The query is the shape above with a tier over a gated, rounded score of nine CASEs -
+`score > s` (true of 53% of the rows), `since >= DATE '2015-01-01'`, `tier IN (1, 2)`, an overlap,
+IN lists and equalities - beside `f.level`, under
+`d.status = 'active' AND d.country IN ('us', 'ca')` (187,000 rows) and the NOT EXISTS, for the fact
+rows of one `grp` (42,858), of ten (300,006) and of the largest (750,000). Before ranges the node
+was not offered and core's plan was the plan; a count by cells of the same tier over the dimension
+alone is still declined.
+
+| fact rows | form | planned (cost) | warm; cold ms | core's plan (cost): warm; cold | core's nested loop: warm; cold |
+|---|---|---|---|---|---|
+| 42,858 | serial | the node (60,033) | 391; 481 | hash join (105,398): 393; 690 | 367; 2,839 |
+| 42,858 | 3 workers | the node (71,556) | 257 - 307; 383 | nested loop (80,137): 142 - 168; 1,152 | (the same) |
+| 300,006 | serial | hash join (147,427) | 614; 1,034 | (the same) | 1,821; 7,226 |
+| 300,006 | 3 workers | the node (103,782) | 514; 826 | hash join (131,788): 316; 903 | 494; 2,521 |
+| 750,000 | serial | hash join (241,445) | 981; 1,612 | (the same) | 1,184; 2,202 |
+| 750,000 | 3 workers | hash join (195,118) | 420; 986 | (the same) | 557; 948 |
+
+The node forced where it is not planned - the joins off - took 1,472 and 3,126 ms warm serially at
+300,006 and 750,000 rows (1,769 and 3,992 cold): the price is right to leave it. Its fixed part is
+the sets' builds - 21 sets, 3,748,275 members in 20,140 containers, 227 ms of a 517 ms run with
+timing on - and a range's set builds slower a member than an equality list's, its entries many
+(§28): the score's labels, `score <= s` and its NULLs, 469,190 members in some 45 ms (10,000
+values); `since >= DATE '2015-01-01'`, 320,184 in 30; `tier IN (1, 2)`, 399,692 in 6. Each
+participant builds every set for itself, so the parallel form's warm time is mostly one build, and
+against the parallel nested loop warm it is 1.8 times slower: within the cold discount's warm floor
+(`pg_lion.cold_max_discount`, §39), and 3.0 times faster cold, where the loop reads a random heap
+page a probe. With `effective_cache_size` at 186 MB and `random_page_cost` 1.1 the node is planned
+serially at 70,912 against the hash join's 103,670, and in parallel at 53,935 against 57,893 - the
+nested loop, under a Hash Anti Join that hides its cold reads ("Not done"); at `random_page_cost` 4
+the serial plan is the hash join, and the parallel one the node, at 82,323 against 98,691.
 
 ## 47. An ordered walk across a key join (LionOrderedJoin, lion_ordjoin.c, 2026-10-23)
 
