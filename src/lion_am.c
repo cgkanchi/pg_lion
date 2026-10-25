@@ -33,6 +33,7 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
+#include "optimizer/plancat.h"
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
@@ -132,6 +133,73 @@ static relopt_enum_elt_def lion_build_slack_options[] = {
 	{"off", LION_SLACKOPT_OFF},
 	{(const char *) NULL}
 };
+
+static get_relation_info_hook_type lion_prev_get_relation_info_hook = NULL;
+
+/* The indexes of another format this backend has warned of, by OID. */
+static List *lion_other_format_warned = NIL;
+
+/*
+ * get_relation_info_hook: leave a lion index of another on-disk format out
+ * of the planner's view of its table (DESIGN.md §21, "An index of another
+ * format"), as the planner leaves out an index that is not valid.  Every
+ * reader of such an index refuses it, asking for a REINDEX, and the planner
+ * reads lion indexes for its estimates - a column's n_distinct, a range's
+ * entries, the directory's pages - whether or not the plan would use them:
+ * planned with, the index failed every query that so much as estimated a
+ * column it covers.  Left out, the queries run without it; inserts into the
+ * table, VACUUM and lion's SQL functions still refuse it, and a backend
+ * warns of it once.  A damaged meta page is not taken for another format
+ * (lion_index_other_format()), and its errors stand.  An index whose state
+ * this backend has built (rd_amcache) passed the version check then, and is
+ * not read again.
+ */
+static void
+lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+					   bool inhparent, RelOptInfo *rel)
+{
+	Oid			lionam;
+	ListCell   *lc;
+
+	if (lion_prev_get_relation_info_hook)
+		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
+										 rel);
+	if (rel->indexlist == NIL)
+		return;
+	lionam = lion_get_am_oid();
+	if (!OidIsValid(lionam))
+		return;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	index;
+		bool		other;
+
+		if (idx->relam != lionam || idx->hypothetical)
+			continue;
+		/* the planner holds the index locked since get_relation_info() */
+		index = index_open(idx->indexoid, NoLock);
+		other = index->rd_rel->relkind == RELKIND_INDEX &&
+			index->rd_amcache == NULL && lion_index_other_format(index);
+		if (other && !list_member_oid(lion_other_format_warned,
+									  idx->indexoid))
+		{
+			MemoryContext oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+
+			lion_other_format_warned = lappend_oid(lion_other_format_warned,
+												   idx->indexoid);
+			MemoryContextSwitchTo(oldcxt);
+			ereport(WARNING,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("lion index \"%s\" is of another on-disk format, and is not used",
+							RelationGetRelationName(index)),
+					 errhint("REINDEX the index.  Until then the planner leaves it out, and inserts into its table and VACUUM fail.")));
+		}
+		index_close(index, NoLock);
+		if (other)
+			rel->indexlist = foreach_delete_current(rel->indexlist, lc);
+	}
+}
 
 /*
  * Module initialisation: register the reloptions of the roaring AM, the
@@ -599,6 +667,15 @@ _PG_init(void)
 	/* ... and the semi and anti join paths (DESIGN.md §27) */
 	lion_prev_set_join_pathlist_hook = set_join_pathlist_hook;
 	set_join_pathlist_hook = lion_set_join_pathlist;
+
+	/*
+	 * A lion index of another on-disk format, left out of the planner's view
+	 * (DESIGN.md §21, "An index of another format").  Installed before the
+	 * get_relation_info() that loads the library returns, so that the table
+	 * whose index brought it in is the first it sees.
+	 */
+	lion_prev_get_relation_info_hook = get_relation_info_hook;
+	get_relation_info_hook = lion_get_relation_info;
 }
 
 /*
