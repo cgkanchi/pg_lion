@@ -1,0 +1,419 @@
+-- A correlated subquery's scans of a skewed key, priced in lion's units
+-- (DESIGN.md §40.12).
+--
+-- A correlated subquery keys its scan on the outer row's value, an exec
+-- Param, and on a skewed key column a probed key meets far more rows than
+-- core's rows per key (§33, "The rows of a probed key").  Lion prices its
+-- own scans of such a key at those rows and puts the price back into core's
+-- units by what core's cheapest scan of the relation costs at core's rows
+-- over what it costs at those (§39, "A skewed key's probes").  That
+-- competitor is core's own scan, never one of the AM's scans of the lion
+-- index; the AM's scans are lion's plans and are priced in the same units; a
+-- subquery capped by a LIMIT reads its scan only until the count is found,
+-- core's and lion's alike; and a walk keyed on the outer row's value is also
+-- offered a set without it, which is built once for every call.  Every
+-- answer is compared with core's.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+CREATE FUNCTION lcs_skew_rows(text, OUT relid regclass, OUT attnum int2,
+							  OUT rows float8, OUT keyrows float8)
+	RETURNS SETOF record
+	AS '$libdir/pg_lion', 'lion_debug_skew_rows' LANGUAGE C STRICT;
+-- ---------- 1. the tables ----------
+-- A dimension of 20,128 keys and a fact of 200,000 rows on them: keys 1 to
+-- 8 have 5,000 rows each, keys 9 to 128 1,000 each, the other 20,000 two.
+-- Every row read by ANALYZE; the key's statistics target 8, so that its
+-- most common values are the eight largest keys.  doc holds two words, a of
+-- three values and b of four.  The fact's lion index holds both; a B-tree
+-- on the key.  Keys 9 to 18 are the dimension's group 1.
+CREATE TABLE lcs_dim (id int PRIMARY KEY, grp int NOT NULL);
+INSERT INTO lcs_dim
+SELECT i, CASE WHEN i <= 8 THEN 0 WHEN i <= 128 THEN 1 + (i - 9) / 10
+			   ELSE 100 + i % 1000 END
+  FROM generate_series(1, 20128) i;
+CREATE TABLE lcs_fact (id int NOT NULL, fk int NOT NULL, doc tsvector NOT NULL,
+					   pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lcs_fact
+SELECT row_number() OVER (ORDER BY hashint4(k * 7 + n)), k,
+	   to_tsvector('simple',
+				   'a' || (hashint4(k * 31 + n) & 2147483647) % 3 ||
+				   ' b' || (hashint4(k * 17 + n + 5) & 2147483647) % 4),
+	   repeat('p', 150)
+  FROM (SELECT k, generate_series(1, CASE WHEN k <= 8 THEN 5000
+										  WHEN k <= 128 THEN 1000
+										  ELSE 2 END) AS n
+		  FROM generate_series(1, 20128) k) s
+ ORDER BY hashint4(k * 7 + n);
+ALTER TABLE lcs_fact ALTER fk SET STATISTICS 8;
+CREATE INDEX lcs_fact_lion ON lcs_fact USING lion (fk, doc);
+CREATE INDEX lcs_fact_fk ON lcs_fact (fk);
+SET default_statistics_target = 1000;
+VACUUM (FREEZE, ANALYZE) lcs_dim;
+VACUUM (FREEZE, ANALYZE) lcs_fact;
+RESET default_statistics_target;
+/*
+ * lcs_plan() is q's plan as its nodes' names, a node's children in brackets
+ * after it: a custom scan by its name, an index scan with its index's, a
+ * SubPlan's nodes among its parent's children.  lcs_cost() is the total cost
+ * of the first node of q's plan, top down, whose name is `node`;
+ * lcs_prop() the text of property `prop` of that node, from q's EXPLAIN
+ * ANALYZE when `run`.  lcs_core() is lcs_cost(q, 'Aggregate') with every
+ * lion path off: the price of core's plan of the subquery.
+ */
+CREATE FUNCTION lcs_names(p json) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text := coalesce(p->>'Custom Plan Provider', p->>'Node Type') ||
+		coalesce(' ' || (p->>'Index Name'), '');
+	c json;
+	kids text[] := '{}';
+BEGIN
+	FOR c IN SELECT * FROM json_array_elements(coalesce(p->'Plans', '[]'::json))
+	LOOP
+		kids := kids || lcs_names(c);
+	END LOOP;
+	IF cardinality(kids) > 0 THEN
+		r := r || '[' || array_to_string(kids, ', ') || ']';
+	END IF;
+	RETURN r;
+END $$;
+CREATE FUNCTION lcs_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO p;
+	RETURN lcs_names(p->0->'Plan');
+END $$;
+CREATE FUNCTION lcs_find(p json, node text, prop text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	c json;
+	r text;
+BEGIN
+	IF coalesce(p->>'Custom Plan Provider', p->>'Node Type') = node THEN
+		RETURN p->>prop;
+	END IF;
+	FOR c IN SELECT * FROM json_array_elements(coalesce(p->'Plans', '[]'::json))
+	LOOP
+		r := lcs_find(c, node, prop);
+		IF r IS NOT NULL THEN
+			RETURN r;
+		END IF;
+	END LOOP;
+	RETURN NULL;
+END $$;
+CREATE FUNCTION lcs_cost(q text, node text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN lcs_find(p->0->'Plan', node, 'Total Cost')::float8;
+END $$;
+CREATE FUNCTION lcs_prop(q text, node text, prop text,
+						 run bool DEFAULT false) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON, COSTS OFF' ||
+		CASE WHEN run THEN ', ANALYZE, TIMING OFF, SUMMARY OFF' ELSE '' END ||
+		') ' || q INTO p;
+	RETURN lcs_find(p->0->'Plan', node, prop);
+END $$;
+CREATE FUNCTION lcs_core(q text) RETURNS float8
+LANGUAGE plpgsql
+SET pg_lion.enable_count_pushdown = off
+SET pg_lion.enable_btree_scan = off
+SET pg_lion.enable_plain_scan = off
+SET enable_bitmapscan = off
+AS $$
+BEGIN
+	RETURN lcs_cost(q, 'Aggregate');
+END $$;
+-- The queries: for each key of group 1, its rows with both words, capped at
+-- 21 - the count a page shows as "20 or more" - and uncapped.
+CREATE TEMP TABLE lcs_q (name text PRIMARY KEY, q text);
+INSERT INTO lcs_q VALUES
+	('capped', $q$SELECT d.id, (SELECT count(*) FROM (SELECT 1 FROM lcs_fact f WHERE f.fk = d.id AND f.doc @@ 'a1 & b2'::tsquery LIMIT 21) s) AS n FROM lcs_dim d WHERE d.grp = 1$q$),
+	('count', $q$SELECT d.id, (SELECT count(*) FROM lcs_fact f WHERE f.fk = d.id AND f.doc @@ 'a1 & b2'::tsquery) AS n FROM lcs_dim d WHERE d.grp = 1$q$);
+-- a probed key meets (320,080,000 - 8 x 5,000^2) / 160,000 rows, where core
+-- has 200,000 / 20,128
+SELECT name, relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lcs_q, lcs_skew_rows(q) ORDER BY name;
+  name  |  relid   | attnum |  rows  | keyrows 
+--------+----------+--------+--------+---------
+ capped | lcs_fact |      2 | 750.50 |      10
+ count  | lcs_fact |      2 | 750.50 |      10
+(2 rows)
+
+-- ---------- 2. the competitor is core's own scan ----------
+-- At the default costs the AM's plain scan of the lion index is cheaper at
+-- core's rows than core's scan of the key's B-tree.  Taken for the
+-- competitor, it would keep the count at core's rows, its price with the
+-- setting off; weighed against core's scan alone, the count's price is the
+-- same with the AM's plain scans on and off.  (Core's bitmap scans off under
+-- both, so that core's cheapest scan is the same one.)
+SET enable_bitmapscan = off;
+SELECT lcs_plan(q), lcs_cost(q, 'LionCount') AS count_am
+  FROM lcs_q WHERE name = 'count' \gset
+SELECT :'lcs_plan' AS plan;
+        plan         
+---------------------
+ Seq Scan[LionCount]
+(1 row)
+
+SET pg_lion.enable_plain_scan = off;
+SELECT lcs_cost(q, 'LionCount') = :count_am AS same_price
+  FROM lcs_q WHERE name = 'count';
+ same_price 
+------------
+ t
+(1 row)
+
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+-- A table the cache cannot hold, on storage whose random reads cost little
+-- more than sequential ones.
+SET random_page_cost = 1.1;
+SET effective_cache_size = '1MB';
+-- ---------- 3. the AM's scans in lion's units ----------
+-- The walk off, and for the count the count pushdown too: the subquery's
+-- scan is the AM's scan of the lion index, which reads the key's rows with
+-- both words alone, or core's scan of the key's B-tree, which reads every
+-- row of the key and filters it.  At core's 10 rows a call core's scan is
+-- the cheaper; at the 750 a call meets, the AM's - and its price in core's
+-- units is far below core's plan's.
+SET pg_lion.enable_btree_scan = off;
+SET pg_lion.enable_skew_estimate = off;
+SELECT lcs_plan(q) FROM lcs_q WHERE name = 'capped';
+                      lcs_plan                      
+----------------------------------------------------
+ Seq Scan[Aggregate[Limit[Index Scan lcs_fact_fk]]]
+(1 row)
+
+SET pg_lion.enable_skew_estimate = on;
+SELECT lcs_plan(q) FROM lcs_q WHERE name = 'capped';
+                       lcs_plan                       
+------------------------------------------------------
+ Seq Scan[Aggregate[Limit[Index Scan lcs_fact_lion]]]
+(1 row)
+
+SELECT lcs_cost(q, 'Aggregate') < lcs_core(q) / 3 AS below_core
+  FROM lcs_q WHERE name = 'capped';
+ below_core 
+------------
+ t
+(1 row)
+
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got1 AS ' || (SELECT q FROM lcs_q WHERE name = 'capped'); END $$;
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_skew_estimate = off;
+SELECT lcs_plan(q) FROM lcs_q WHERE name = 'count';
+                  lcs_plan                   
+---------------------------------------------
+ Seq Scan[Aggregate[Index Scan lcs_fact_fk]]
+(1 row)
+
+SET pg_lion.enable_skew_estimate = on;
+SELECT lcs_plan(q) FROM lcs_q WHERE name = 'count';
+                   lcs_plan                    
+-----------------------------------------------
+ Seq Scan[Aggregate[Index Scan lcs_fact_lion]]
+(1 row)
+
+SELECT lcs_cost(q, 'Aggregate') < lcs_core(q) / 3 AS below_core
+  FROM lcs_q WHERE name = 'count';
+ below_core 
+------------
+ t
+(1 row)
+
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got2 AS ' || (SELECT q FROM lcs_q WHERE name = 'count'); END $$;
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_btree_scan;
+-- ---------- 4. the capped scan ----------
+-- A LIMIT reads core's scan until the count's rows pass its filter, and
+-- lion's for the same share of its run: the AM's scan, in core's units, is
+-- priced alike under a cap that its rows at 750 a call pass and under one
+-- they do not.
+SET pg_lion.enable_btree_scan = off;
+SELECT round((lcs_cost(q, 'Index Scan') /
+			  lcs_cost(replace(q, 'LIMIT 21', 'LIMIT 100000'), 'Index Scan'))::numeric,
+			 1) AS capped_over_uncapped
+  FROM lcs_q WHERE name = 'capped';
+ capped_over_uncapped 
+----------------------
+                  1.0
+(1 row)
+
+RESET pg_lion.enable_btree_scan;
+-- ---------- 5. the walk's set without the key ----------
+-- The count pushdown and the AM's scans off: the walk of the key's B-tree,
+-- its set of the words alone, built once and kept for every call, where a
+-- set of the key's rows with the words is built again at each - against
+-- core's scan of the key's B-tree, whatever the rows a call meets.
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_skew_estimate = off;
+SELECT name, lcs_plan(q), lcs_prop(q, 'LionBtreeScan', 'Lion Cond') AS lion_cond
+  FROM lcs_q ORDER BY name;
+  name  |                 lcs_plan                  |               lion_cond               
+--------+-------------------------------------------+---------------------------------------
+ capped | Seq Scan[Aggregate[Limit[LionBtreeScan]]] | (f.doc @@ '''a1'' & ''b2'''::tsquery)
+ count  | Seq Scan[Aggregate[LionBtreeScan]]        | (f.doc @@ '''a1'' & ''b2'''::tsquery)
+(2 rows)
+
+SET pg_lion.enable_skew_estimate = on;
+SELECT name, lcs_plan(q), lcs_prop(q, 'LionBtreeScan', 'Lion Cond') AS lion_cond
+  FROM lcs_q ORDER BY name;
+  name  |                 lcs_plan                  |               lion_cond               
+--------+-------------------------------------------+---------------------------------------
+ capped | Seq Scan[Aggregate[Limit[LionBtreeScan]]] | (f.doc @@ '''a1'' & ''b2'''::tsquery)
+ count  | Seq Scan[Aggregate[LionBtreeScan]]        | (f.doc @@ '''a1'' & ''b2'''::tsquery)
+(2 rows)
+
+-- ten calls, one build
+SELECT lcs_prop(q, 'LionBtreeScan', 'Lion Set', true) AS lion_set
+  FROM lcs_q WHERE name = 'count';
+       lion_set       
+----------------------
+ 85 containers, exact
+(1 row)
+
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got3 AS ' || (SELECT q FROM lcs_q WHERE name = 'capped'); END $$;
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got4 AS ' || (SELECT q FROM lcs_q WHERE name = 'count'); END $$;
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+-- ---------- 6. every path on ----------
+SELECT name, lcs_plan(q) FROM lcs_q ORDER BY name;
+  name  |                 lcs_plan                  
+--------+-------------------------------------------
+ capped | Seq Scan[Aggregate[Limit[LionBtreeScan]]]
+ count  | Seq Scan[LionCount]
+(2 rows)
+
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got5 AS ' || (SELECT q FROM lcs_q WHERE name = 'capped'); END $$;
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_got6 AS ' || (SELECT q FROM lcs_q WHERE name = 'count'); END $$;
+-- ---------- 7. the answers, against core's ----------
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_btree_scan = off;
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SELECT name, lcs_plan(q) FROM lcs_q ORDER BY name;
+  name  |                      lcs_plan                      
+--------+----------------------------------------------------
+ capped | Seq Scan[Aggregate[Limit[Index Scan lcs_fact_fk]]]
+ count  | Seq Scan[Aggregate[Index Scan lcs_fact_fk]]
+(2 rows)
+
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_want1 AS ' || (SELECT q FROM lcs_q WHERE name = 'capped'); END $$;
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lcs_want2 AS ' || (SELECT q FROM lcs_q WHERE name = 'count'); END $$;
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_btree_scan;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+SELECT g.name, count(*) AS rows, sum(w.n) AS counted,
+	   count(*) FILTER (WHERE g.n IS NOT DISTINCT FROM w.n) AS same
+  FROM (SELECT 'AM, capped' AS name, * FROM lcs_got1
+		UNION ALL SELECT 'walk, capped', * FROM lcs_got3
+		UNION ALL SELECT 'all on, capped', * FROM lcs_got5) g
+  FULL JOIN lcs_want1 w ON w.id = g.id
+ GROUP BY g.name ORDER BY g.name;
+      name      | rows | counted | same 
+----------------+------+---------+------
+ AM, capped     |   10 |     210 |   10
+ all on, capped |   10 |     210 |   10
+ walk, capped   |   10 |     210 |   10
+(3 rows)
+
+SELECT g.name, count(*) AS rows, sum(w.n) AS counted,
+	   count(*) FILTER (WHERE g.n IS NOT DISTINCT FROM w.n) AS same
+  FROM (SELECT 'AM, count' AS name, * FROM lcs_got2
+		UNION ALL SELECT 'walk, count', * FROM lcs_got4
+		UNION ALL SELECT 'all on, count', * FROM lcs_got6) g
+  FULL JOIN lcs_want2 w ON w.id = g.id
+ GROUP BY g.name ORDER BY g.name;
+     name      | rows | counted | same 
+---------------+------+---------+------
+ AM, count     |   10 |     842 |   10
+ all on, count |   10 |     842 |   10
+ walk, count   |   10 |     842 |   10
+(3 rows)
+
+-- ---------- 8. the relations left out ----------
+-- Only a relation whose index paths core builds is priced in these units,
+-- with the scan core plans for it.  A sampled relation is read by its
+-- sample: its Sample Scan.
+SELECT name, lcs_plan(replace(q, 'FROM lcs_fact f',
+							  'FROM lcs_fact f TABLESAMPLE SYSTEM (50) REPEATABLE (7)'))
+  FROM lcs_q ORDER BY name;
+  name  |                lcs_plan                 
+--------+-----------------------------------------
+ capped | Seq Scan[Aggregate[Limit[Sample Scan]]]
+ count  | Seq Scan[Aggregate[Sample Scan]]
+(2 rows)
+
+-- one proven empty by its CHECK constraint, the key's clause still among its
+-- restrictions: no index path, whose cost_index() asserts the relation's
+-- pages are among the planner's
+ALTER TABLE lcs_fact ADD CONSTRAINT lcs_fact_id CHECK (id > 0);
+SET constraint_exclusion = on;
+SELECT name, lcs_plan(replace(q, 'f.fk = d.id', 'f.id < 0 AND f.fk = d.id'))
+  FROM lcs_q ORDER BY name;
+  name  |              lcs_plan              
+--------+------------------------------------
+ capped | Seq Scan[Aggregate[Limit[Result]]]
+ count  | Seq Scan[Aggregate[Result]]
+(2 rows)
+
+RESET constraint_exclusion;
+ALTER TABLE lcs_fact DROP CONSTRAINT lcs_fact_id;
+-- an inheritance parent: the Append of it and its child, each scanned as a
+-- member of it
+CREATE TABLE lcs_kid () INHERITS (lcs_fact);
+INSERT INTO lcs_kid SELECT id + 200000, fk, doc, pad FROM lcs_fact WHERE id % 50 = 0;
+VACUUM (FREEZE, ANALYZE) lcs_kid;
+SELECT name, lcs_plan(q) ~ '^Seq Scan\[Aggregate\[(Limit\[Result\[)?Append\[' AS appended
+  FROM lcs_q ORDER BY name;
+  name  | appended 
+--------+----------
+ capped | t
+ count  | t
+(2 rows)
+
+-- the parent read alone, its child out of the query: at core's rows, the
+-- plan the skew estimate's being off gives
+CREATE TEMP TABLE lcs_only AS
+SELECT name, lcs_plan(replace(q, 'FROM lcs_fact f', 'FROM ONLY lcs_fact f')) AS plan
+  FROM lcs_q;
+SET pg_lion.enable_skew_estimate = off;
+SELECT o.name, o.plan,
+	   o.plan = lcs_plan(replace(q, 'FROM lcs_fact f', 'FROM ONLY lcs_fact f')) AS core_rows
+  FROM lcs_only o JOIN lcs_q USING (name) ORDER BY name;
+  name  |                        plan                        | core_rows 
+--------+----------------------------------------------------+-----------
+ capped | Seq Scan[Aggregate[Limit[Index Scan lcs_fact_fk]]] | t
+ count  | Seq Scan[Aggregate[Index Scan lcs_fact_fk]]        | t
+(2 rows)
+
+RESET pg_lion.enable_skew_estimate;
+DROP TABLE lcs_kid, lcs_only;
+RESET random_page_cost;
+RESET effective_cache_size;
+DROP TABLE lcs_got1, lcs_got2, lcs_got3, lcs_got4, lcs_got5, lcs_got6,
+	lcs_want1, lcs_want2;
+DROP TABLE lcs_fact, lcs_dim;
+DROP FUNCTION lcs_skew_rows(text), lcs_names(json), lcs_plan(text),
+	lcs_find(json, text, text), lcs_cost(text, text),
+	lcs_prop(text, text, text, bool), lcs_core(text);
