@@ -379,6 +379,35 @@ SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
 SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
 VACUUM lion_di;
+-- To the planner such an index is not there (DESIGN.md §21, "An index of
+-- another format"): it reads lion indexes for its estimates whether or not
+-- the plan uses them, and every query that so much as estimated the column
+-- failed with the index's error.  A new backend - one whose relcache holds
+-- no state of the index, as every backend after an upgrade - warns of it
+-- once and plans the table's queries without it; an insert still refuses
+-- it, and a REINDEX gives it back to the planner.
+CREATE FUNCTION lion_di_lion(q text) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	lion boolean := false;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		lion := lion OR ln ~ '(Lion|lion_di_old_i)';
+	END LOOP;
+	RETURN lion;
+END $$;
+\c
+SET statement_timeout = '60s';
+SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;
+SELECT count(*) FROM lion_di WHERE k = 7;
+SELECT k, count(*) FROM lion_di GROUP BY k ORDER BY k;
+SELECT count(*) FROM lion_di a JOIN lion_di b ON a.k = b.k WHERE a.k = 7 AND b.k = 7;
+INSERT INTO lion_di VALUES (7);
+REINDEX INDEX lion_di_old_i;
+SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;
+SELECT count(*) FROM lion_di WHERE k = 7;
+DROP FUNCTION lion_di_lion(text);
 DROP INDEX lion_di_old_i;
 DROP FUNCTION lion_di_hint(text);
 -- ---------- 11. an entry whose line pointer reaches into a CHAIN entry ----------

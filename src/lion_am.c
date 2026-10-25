@@ -33,7 +33,11 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/paths.h"
+#if PG_VERSION_NUM >= 190000
+#include "optimizer/pathnode.h"
+#else
 #include "optimizer/plancat.h"
+#endif
 #include "parser/parsetree.h"
 #include "storage/bufmgr.h"
 #include "storage/indexfsm.h"
@@ -134,15 +138,21 @@ static relopt_enum_elt_def lion_build_slack_options[] = {
 	{(const char *) NULL}
 };
 
+#if PG_VERSION_NUM >= 190000
+static build_simple_rel_hook_type lion_prev_build_simple_rel_hook = NULL;
+#else
 static get_relation_info_hook_type lion_prev_get_relation_info_hook = NULL;
+#endif
 
 /* The indexes of another format this backend has warned of, by OID. */
 static List *lion_other_format_warned = NIL;
 
 /*
- * get_relation_info_hook: leave a lion index of another on-disk format out
- * of the planner's view of its table (DESIGN.md §21, "An index of another
- * format"), as the planner leaves out an index that is not valid.  Every
+ * Leave a lion index of another on-disk format out of the planner's view of
+ * its table (DESIGN.md §21, "An index of another format"), as the planner
+ * leaves out an index that is not valid: from the hook that follows
+ * get_relation_info() - get_relation_info_hook, build_simple_rel_hook from
+ * PostgreSQL 19 - whose documented uses include removing an index.  Every
  * reader of such an index refuses it, asking for a REINDEX, and the planner
  * reads lion indexes for its estimates - a column's n_distinct, a range's
  * entries, the directory's pages - whether or not the plan would use them:
@@ -155,15 +165,11 @@ static List *lion_other_format_warned = NIL;
  * not read again.
  */
 static void
-lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
-					   bool inhparent, RelOptInfo *rel)
+lion_drop_other_format(RelOptInfo *rel)
 {
 	Oid			lionam;
 	ListCell   *lc;
 
-	if (lion_prev_get_relation_info_hook)
-		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
-										 rel);
 	if (rel->indexlist == NIL)
 		return;
 	lionam = lion_get_am_oid();
@@ -200,6 +206,26 @@ lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 			rel->indexlist = foreach_delete_current(rel->indexlist, lc);
 	}
 }
+
+#if PG_VERSION_NUM >= 190000
+static void
+lion_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
+{
+	if (lion_prev_build_simple_rel_hook)
+		lion_prev_build_simple_rel_hook(root, rel, rte);
+	lion_drop_other_format(rel);
+}
+#else
+static void
+lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
+					   bool inhparent, RelOptInfo *rel)
+{
+	if (lion_prev_get_relation_info_hook)
+		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
+										 rel);
+	lion_drop_other_format(rel);
+}
+#endif
 
 /*
  * Module initialisation: register the reloptions of the roaring AM, the
@@ -674,8 +700,13 @@ _PG_init(void)
 	 * get_relation_info() that loads the library returns, so that the table
 	 * whose index brought it in is the first it sees.
 	 */
+#if PG_VERSION_NUM >= 190000
+	lion_prev_build_simple_rel_hook = build_simple_rel_hook;
+	build_simple_rel_hook = lion_build_simple_rel;
+#else
 	lion_prev_get_relation_info_hook = get_relation_info_hook;
 	get_relation_info_hook = lion_get_relation_info;
+#endif
 }
 
 /*
