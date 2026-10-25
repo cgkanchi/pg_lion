@@ -1,0 +1,292 @@
+-- The competitor's kind and cold reads come from the join that reads the
+-- dimension (DESIGN.md §39, "A nested loop's cold reads"; §46, "Cost"): in
+-- an upper rel's plan, past a semi or anti join over it, and through a
+-- Memoize on its inner side, whose misses read the pages.  LionProbeJoin is
+-- priced against that loop, on a dimension ten times effective_cache_size
+-- ('1MB') and one the cache holds ('4GB').  Every answer is checked against
+-- core's plan with the node off.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+DO $$BEGIN IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_eager_aggregate') THEN PERFORM set_config('enable_eager_aggregate', 'off', false); END IF; END$$;
+-- The dimension, 80,000 rows on some 1,250 pages, analyzed whole (the
+-- sample covers every row: the estimates are exact) and, until the last
+-- case, not vacuumed: no page is all-visible, so the node reads the heap of
+-- every member it finds, as on a table under writes, and costs about what
+-- core's loop does while the cache holds the table.
+CREATE TABLE lion_cc_d (pk int8 PRIMARY KEY, seg int NOT NULL,
+						flag bool NOT NULL, pad text NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_d
+SELECT i, i % 10, i % 4 = 0, repeat('p', 80) FROM generate_series(1, 80000) i;
+CREATE INDEX lion_cc_d_seg ON lion_cc_d USING lion (seg);
+CREATE INDEX lion_cc_d_flag ON lion_cc_d USING lion (flag);
+ALTER TABLE lion_cc_d ALTER seg SET STATISTICS 1000;
+ANALYZE lion_cc_d;
+-- facts: 3,000 rows of scattered keys; 4,500 over 3,000 keys, which core
+-- reads through a Memoize; and 200,000, whose scan is most of a plan
+CREATE TABLE lion_cc_f (id int NOT NULL, fk int8 NOT NULL, kind int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_f
+SELECT i, 1 + abs(hashint4(i)) % 80000, i % 3 FROM generate_series(1, 3000) i;
+CREATE TABLE lion_cc_m (id int NOT NULL, fk int8 NOT NULL, kind int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_m
+SELECT i, 1 + abs(hashint4(i % 3000)) % 80000, i % 3
+  FROM generate_series(1, 4500) i;
+CREATE TABLE lion_cc_g (id int NOT NULL, fk int8 NOT NULL, kind int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_g
+SELECT i, 1 + abs(hashint4(i)) % 80000, i % 3 FROM generate_series(1, 200000) i;
+ALTER TABLE lion_cc_g ALTER id SET STATISTICS 1000;
+-- the anti join's tables, a B-tree on each key: 300 rows, and 30,000
+CREATE TABLE lion_cc_s (fk int8 NOT NULL, why int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_s
+SELECT 1 + abs(hashint4(i + 7)) % 80000, i % 2 FROM generate_series(1, 300) i;
+CREATE INDEX lion_cc_s_fk ON lion_cc_s (fk);
+CREATE TABLE lion_cc_t (fk int8 NOT NULL, why int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lion_cc_t
+SELECT 1 + abs(hashint4(i + 11)) % 80000, i % 2 FROM generate_series(1, 30000) i;
+CREATE INDEX lion_cc_t_fk ON lion_cc_t (fk);
+VACUUM (FREEZE, ANALYZE) lion_cc_f, lion_cc_m, lion_cc_g, lion_cc_s, lion_cc_t;
+/*
+ * lion_cc_plan() names the plan of q: the node (and its parallel form), or
+ * core's joins from the top down, with each Memoize and Gather where it
+ * sits.
+ */
+CREATE FUNCTION lion_cc_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	m text;
+	parts text[] := '{}';
+	node boolean := false;
+	parallel boolean := false;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		node := node OR ln ~ 'Custom Scan \(LionProbeJoin\)';
+		parallel := parallel OR ln ~ 'Partial ';
+		m := substring(ln from '((?:Nested Loop|Hash|Merge)(?: Right| Left)?(?: Semi| Anti)? Join|Nested Loop|Memoize|Gather)');
+		IF m IS NOT NULL THEN
+			parts := parts || lower(m);
+		END IF;
+	END LOOP;
+	IF node THEN
+		RETURN CASE WHEN parallel THEN 'probe join, parallel' ELSE 'probe join' END;
+	END IF;
+	RETURN array_to_string(parts, ' > ');
+END $$;
+/*
+ * lion_cc_same() runs q under the session's settings, then with the node and
+ * the rest of lion's pushdowns off, and compares the answers as multisets.
+ * The settings it changes are the transaction's.
+ */
+CREATE FUNCTION lion_cc_same(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	EXECUTE format('CREATE TEMP TABLE lion_cc_on AS SELECT q::text AS r FROM (%s) q', q);
+	PERFORM set_config('pg_lion.enable_probe_join', 'off', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE lion_cc_off AS SELECT q::text AS r FROM (%s) q', q);
+	EXECUTE 'SELECT count(*) FROM lion_cc_off' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (TABLE lion_cc_on EXCEPT ALL TABLE lion_cc_off) a)'
+			' + (SELECT count(*) FROM (TABLE lion_cc_off EXCEPT ALL TABLE lion_cc_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_cc_on, lion_cc_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('same, %s rows', nrows);
+END $$;
+-- the anti join of 300 fact rows: the dimension's rows the anti join's
+-- table names are dropped
+\set anti 'SELECT d.flag, f.kind, count(*) FROM lion_cc_f f JOIN lion_cc_d d ON f.fk = d.pk WHERE f.id <= 300 AND d.seg IN (1, 2, 3, 4, 5, 6) AND NOT EXISTS (SELECT 1 FROM lion_cc_s s WHERE s.fk = d.pk AND s.why = 1) GROUP BY 1, 2'
+-- Core hashes the anti join's table over its nested loop into the
+-- dimension.  The plan's cost is the loop's, and so are its units: a nested
+-- loop's rate, not a hash join's.  With the dimension in the cache, the
+-- loop at its price beats the node.
+SET effective_cache_size = '4GB';
+SELECT lion_cc_plan(:'anti');
+         lion_cc_plan         
+------------------------------
+ hash anti join > nested loop
+(1 row)
+
+-- ... and with it ten times the cache, the loop's cold reads weigh: the
+-- node
+SET effective_cache_size = '1MB';
+SELECT lion_cc_plan(:'anti');
+ lion_cc_plan 
+--------------
+ probe join
+(1 row)
+
+SELECT lion_cc_same(:'anti');
+ lion_cc_same 
+--------------
+ same, 6 rows
+(1 row)
+
+-- With core's hash and merge joins off the anti join is a nested loop
+-- too, into the B-tree of its own small table, over the loop into the
+-- dimension.  The cold reads are the dimension's loop's, past the anti
+-- join: in the cache, core's plan ...
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET effective_cache_size = '4GB';
+SELECT lion_cc_plan(:'anti');
+            lion_cc_plan             
+-------------------------------------
+ nested loop anti join > nested loop
+(1 row)
+
+-- ... and ten times the cache, the node
+SET effective_cache_size = '1MB';
+SELECT lion_cc_plan(:'anti');
+ lion_cc_plan 
+--------------
+ probe join
+(1 row)
+
+SELECT lion_cc_same(:'anti');
+ lion_cc_same 
+--------------
+ same, 6 rows
+(1 row)
+
+-- ... which the cold reads alone choose: without their charge, core's plan
+SET pg_lion.cold_page_cost = 0;
+SELECT lion_cc_plan(:'anti');
+            lion_cc_plan             
+-------------------------------------
+ nested loop anti join > nested loop
+(1 row)
+
+RESET pg_lion.cold_page_cost;
+-- A Memoize over the loop's inner side: 4,500 fact rows over 3,000 keys,
+-- the loop probing the dimension on a miss alone, and reading the pages of
+-- those.  In the cache, the loop ...
+\set memo 'SELECT d.flag, f.kind, count(*) FROM lion_cc_m f JOIN lion_cc_d d ON f.fk = d.pk WHERE d.seg = 1 GROUP BY 1, 2'
+SET effective_cache_size = '4GB';
+SELECT lion_cc_plan(:'memo');
+     lion_cc_plan      
+-----------------------
+ nested loop > memoize
+(1 row)
+
+-- ... and ten times the cache, the misses' cold reads weigh: the node
+SET effective_cache_size = '1MB';
+SELECT lion_cc_plan(:'memo');
+ lion_cc_plan 
+--------------
+ probe join
+(1 row)
+
+SELECT lion_cc_same(:'memo');
+ lion_cc_same 
+--------------
+ same, 3 rows
+(1 row)
+
+-- ... and the loop again without the charge
+SET pg_lion.cold_page_cost = 0;
+SELECT lion_cc_plan(:'memo');
+     lion_cc_plan      
+-----------------------
+ nested loop > memoize
+(1 row)
+
+RESET pg_lion.cold_page_cost;
+-- The same loop in a subquery the planner cannot pull up, under the
+-- count's grouping: its pages, its residency and the Memoize's keys are
+-- looked up in the subquery's planner info
+\set sub 'SELECT q.flag, q.kind, count(*) FROM (SELECT d.flag, f.kind FROM lion_cc_m f JOIN lion_cc_d d ON f.fk = d.pk WHERE d.seg = 1 OFFSET 0) q GROUP BY 1, 2'
+SELECT lion_cc_plan(:'sub');
+     lion_cc_plan      
+-----------------------
+ nested loop > memoize
+(1 row)
+
+SELECT lion_cc_same(:'sub');
+ lion_cc_same 
+--------------
+ same, 3 rows
+(1 row)
+
+-- The 300 rows from a scan of 200,000: the scan is most of both plans,
+-- and the node reads it through core's own path, at core's price.  Its
+-- price is weighed against the loop's less that scan, which neither side's
+-- cold reads change - against the whole plan the scan would draw the
+-- weighing towards core's.  In the cache, core's plan; ten times the cache,
+-- the node.
+\set big 'SELECT d.flag, f.kind, count(*) FROM lion_cc_g f JOIN lion_cc_d d ON f.fk = d.pk WHERE f.id <= 300 AND d.seg IN (1, 2, 3, 4, 5, 6) AND NOT EXISTS (SELECT 1 FROM lion_cc_s s WHERE s.fk = d.pk AND s.why = 1) GROUP BY 1, 2'
+SET effective_cache_size = '4GB';
+SELECT lion_cc_plan(:'big');
+            lion_cc_plan             
+-------------------------------------
+ nested loop anti join > nested loop
+(1 row)
+
+SET effective_cache_size = '1MB';
+SELECT lion_cc_plan(:'big');
+ lion_cc_plan 
+--------------
+ probe join
+(1 row)
+
+SELECT lion_cc_same(:'big');
+ lion_cc_same 
+--------------
+ same, 6 rows
+(1 row)
+
+-- In parallel, each path takes its own cold reads: a participant probes
+-- its share of the fact rows and makes every build whole - here the anti
+-- join's 15,000 lookups in the dimension's key, most of its price.  The
+-- dimension vacuumed now, all-visible: the node reads no heap, and the
+-- loop a page a probe.  10,000 rows of the 200,000: core's plan in the
+-- cache, the node's parallel form ten times it.
+VACUUM (FREEZE, ANALYZE) lion_cc_d;
+\set par 'SELECT d.flag, f.kind, count(*) FROM lion_cc_g f JOIN lion_cc_d d ON f.fk = d.pk WHERE f.id <= 10000 AND d.seg IN (1, 2, 3, 4, 5, 6) AND NOT EXISTS (SELECT 1 FROM lion_cc_t t WHERE t.fk = d.pk AND t.why = 1) GROUP BY 1, 2'
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET effective_cache_size = '4GB';
+SELECT lion_cc_plan(:'par');
+                 lion_cc_plan                 
+----------------------------------------------
+ gather > nested loop anti join > nested loop
+(1 row)
+
+SET effective_cache_size = '1MB';
+SELECT lion_cc_plan(:'par');
+     lion_cc_plan     
+----------------------
+ probe join, parallel
+(1 row)
+
+SELECT lion_cc_same(:'par');
+ lion_cc_same 
+--------------
+ same, 6 rows
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET effective_cache_size;
+DROP TABLE lion_cc_f, lion_cc_m, lion_cc_g, lion_cc_s, lion_cc_t, lion_cc_d;
+DROP FUNCTION lion_cc_plan(text);
+DROP FUNCTION lion_cc_same(text);
