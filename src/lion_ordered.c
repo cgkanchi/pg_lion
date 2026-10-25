@@ -2012,6 +2012,22 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	}
 	fetched = clamp_row_est(walked * selwalk);
 	candidates = clamp_row_est(walked * Min(selwalk * candsel / sel, 1.0));
+
+	/*
+	 * A nested loop's probe meets its members over all of the loop's scans,
+	 * not a whole one in each: a key finds its entry in every scan, and the
+	 * set passes a share of them.  Counted at a member a scan, a set that
+	 * passes one key in a hundred was charged a heap fetch an outer row, as
+	 * core's Index Scan of the same B-tree is, and lost to it on its own
+	 * test (DESIGN.md §49).  So a probe's members are counted over the loops
+	 * and shared out among them.
+	 */
+	if (loops > 1.0)
+	{
+		fetched = clamp_row_est(walked * selwalk * loops) / loops;
+		candidates = clamp_row_est(walked * loops *
+								   Min(selwalk * candsel / sel, 1.0)) / loops;
+	}
 	heapfetched = (!indexonly || heaprecheck) ? candidates : fetched;
 	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
 	{
@@ -2033,7 +2049,13 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 			ordtotal = Min(t, ordtotal);
 	}
 	run = ordtotal;
-	pages_corr = ceil(Min(heapfetched, walked / tuples * pages));
+	/*
+	 * A scan reads a page for each run of its fetches - and, a probe's
+	 * member being found in a share of its scans (above), a scan that
+	 * fetches less than a row reads that share of a page, not a whole one.
+	 */
+	pages_corr = (heapfetched < 1.0) ? heapfetched :
+		ceil(Min(heapfetched, walked / tuples * pages));
 	if (loops > 1.0)
 	{
 		/*
