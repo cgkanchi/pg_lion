@@ -1755,6 +1755,35 @@ lion_generic_page_cost(PlannerInfo *root, IndexPath *path, double loop_count,
 }
 
 /*
+ * The index tuples and the pages genericcostestimate() prorated by the
+ * selectivity of the quals, computed again from another selectivity `sel` as
+ * it computes them and charged as it charges them (lion_generic_page_cost()),
+ * and the selectivity made `sel`.
+ */
+static void
+lion_cost_prorate(PlannerInfo *root, IndexPath *path, double loop_count,
+				  GenericCosts *costs, Selectivity sel)
+{
+	IndexOptInfo *index = path->indexinfo;
+	double		tuples;
+	Cost		pagecost;
+
+	tuples = rint(sel * index->rel->tuples / Max(costs->num_sa_scans, 1.0));
+	tuples = Max(Min(tuples, index->tuples), 1.0);
+	pagecost = lion_generic_page_cost(root, path, loop_count, costs);
+	costs->indexTotalCost += (tuples - costs->numIndexTuples) *
+		costs->num_sa_scans * cpu_index_tuple_cost;
+	costs->numIndexTuples = tuples;
+	costs->numIndexPages = (index->pages > 1 && index->tuples > 1) ?
+		ceil(tuples * index->pages / index->tuples) : 1.0;
+	costs->indexTotalCost += lion_generic_page_cost(root, path, loop_count,
+													costs) - pagecost;
+	costs->indexTotalCost = Max(costs->indexTotalCost,
+								costs->indexStartupCost);
+	costs->indexSelectivity = sel;
+}
+
+/*
  * The selectivity of the path's quals as lion's estimates take them
  * (lion_canonical_quals_sel()): a run of `<>` on one column is the one
  * exclusion it is, 1 - nullfrac - the values' frequencies, where core's
@@ -1780,8 +1809,6 @@ lion_cost_canonical_sel(PlannerInfo *root, IndexPath *path, double loop_count,
 	Selectivity coresel;
 	Selectivity lionsel;
 	Selectivity sel;
-	double		tuples;
-	Cost		pagecost;
 
 	if (!lion_canonical_quals_sel(root, index->rel, quals, &coresel,
 								  &lionsel))
@@ -1790,24 +1817,10 @@ lion_cost_canonical_sel(PlannerInfo *root, IndexPath *path, double loop_count,
 	sel = (coresel > 0) ? costs->indexSelectivity * (lionsel / coresel) :
 		lionsel;
 	CLAMP_PROBABILITY(sel);
-	if (!fullscan)
-	{
-		tuples = rint(sel * index->rel->tuples /
-					  Max(costs->num_sa_scans, 1.0));
-		tuples = Max(Min(tuples, index->tuples), 1.0);
-		pagecost = lion_generic_page_cost(root, path, loop_count, costs);
-		costs->indexTotalCost += (tuples - costs->numIndexTuples) *
-			costs->num_sa_scans * cpu_index_tuple_cost;
-		costs->numIndexTuples = tuples;
-		costs->numIndexPages = (index->pages > 1 && index->tuples > 1) ?
-			ceil(tuples * index->pages / index->tuples) : 1.0;
-		costs->indexTotalCost += lion_generic_page_cost(root, path,
-														loop_count, costs) -
-			pagecost;
-		costs->indexTotalCost = Max(costs->indexTotalCost,
-									costs->indexStartupCost);
-	}
-	costs->indexSelectivity = sel;
+	if (fullscan)
+		costs->indexSelectivity = sel;
+	else
+		lion_cost_prorate(root, path, loop_count, costs, sel);
 }
 
 /*
@@ -1836,6 +1849,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 	double		walkrows = 0.0;
 	double		idxloops;
+	double		skew;
 
 	/*
 	 * pg_lion.enable_plain_scan off (DESIGN.md §29.11, "Plain scans switched
@@ -1899,6 +1913,21 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	costs.indexTotalCost = Max(costs.indexTotalCost, costs.indexStartupCost);
 
 	lion_cost_canonical_sel(root, path, idxloops, fullscan, &costs);
+
+	/*
+	 * A correlated subquery's scan, or a generic plan's, that equates a
+	 * skewed key to a value the plan does not know, while the relation's
+	 * scans are priced again in lion's units (DESIGN.md §40.12): the rows a
+	 * probed key meets, which lion's other paths of it are priced at
+	 * (lion_skew_am_factor()).  The key's sets, the index tuples and pages
+	 * prorated by the selectivity, and the heap side core prices from the
+	 * selectivity all move with them; the path's rows stay core's, and the
+	 * caller puts the price back into core's units (lion_skew_am_paths()).
+	 */
+	skew = fullscan ? 1.0 : lion_skew_am_factor(root, path);
+	if (skew > 1.0)
+		lion_cost_prorate(root, path, idxloops, &costs,
+						  Min(costs.indexSelectivity * skew, 1.0));
 
 	if (fullscan)
 	{
@@ -1986,7 +2015,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
 										setcols, (Node **) setquals, factor,
-										&setand);
+										skew > 1.0, &setand);
 			if (idxloops > 1)
 				setcost = setand.cpu +
 					index_pages_fetched((setand.leafpages + setand.setpages) *
