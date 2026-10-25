@@ -29852,9 +29852,10 @@ implies its predicate, with a key column that is the key itself, a plain column,
 a row, not multikey - of the key's type, whose equality strategy is each key set's hashable
 equality, under the key sets' collation; so the rows of a key there are the rows that key set's
 test passes, and an index that answers a key's rows differently is not taken. The keys are known
-only at run time, so the fact's plan carries a leaf for each key set (LO_SIDE_FACT's fourth member,
-`LO_PRIV_INTS`' fifth): `fk = ANY (NULL::type[])` on that index, ANDed at the root of its tree
-before the lion access's - or the tree alone where the fact has none - in the key sets' order.
+only at run time, so the fact's plan carries a leaf for each key set (the fact side's third member,
+their count `LO_PRIV_INTS`' fifth): `fk = ANY (NULL::type[])` on that index, ANDed at the root of
+its tree before the lion access's - or the tree alone where the fact has none - in the key sets'
+order.
 When the join builds a key set (`oj_exec()`) it hands its keys to the walk as an array of the key's
 type in the set's memory (`oj_keyset_array()`), the leaf's scan key's argument
 (`lion_ordered_keyset_keys()`, as `lion_ordered_probe_key()` hands the dimension its key), which
@@ -29874,6 +29875,33 @@ first, at run time. EXPLAIN prints `Key Set Index: <index>` after `Key Sets`, an
 Indexes` leaves that index's leaves out; under ANALYZE `Lion Set Hits`, `Heap Fetches` and `Lion
 Set` are the AND's, `Keys Rejected by Key Sets` 0. `pg_lion.enable_key_set_fold` (on) offers it;
 the price is §47.3's.
+
+**Measured** (2026-10-25; PostgreSQL 18.6 release, the shared VM of four cores, `shared_buffers` 1
+GB, `work_mem` 4 MB; warm, the median of seven runs, and buffers-cold - every buffer evicted with
+`pg_buffercache_evict_all()` before each run, the kernel's cache warm - of five). A stand-in for the
+page: a 2,000,000-row fact (165 MB) walked by a B-tree of a random rank that does not hold the key,
+a 1,000,000-row dimension with a three-value lion `tier`, and a key table whose 746 keys hold 1,487
+fact rows, 0.075% of the entries; `... WHERE f.company_id IN (SELECT company_id FROM installbase
+WHERE product_id = 7) ORDER BY d.tier, f.rank DESC LIMIT 100`, and 19,817 keys (2%) for product 3.
+"Before" is the parent commit; core's plan is with the node off.
+
+| the key's index | key set | before | after | core's plan |
+|---|---|---|---|---|
+| none | 746 keys | split, 419 ms (371,712 walked, all fetched, 371,412 rejected); cold 717 | core's hash join, 220 ms; cold 250 | 224 ms |
+| lion | 746 keys | core's, 37 ms (the split, forced: 473) | core's, 36 ms (the split folded, forced: 52 - 46,560 walked, 1,487 fetched, 0 rejected; cold 85 against 635) | 37 ms |
+| lion | 19,817 keys | split, 60 ms (13,342 walked and fetched) | split folded, 77 ms (275 fetched) | 328 ms |
+| B-tree | 746 keys | core's, 51 ms | core's, 32 ms | 33 ms |
+| B-tree | 19,817 keys | split, 72 ms; cold 123 | core's, 326 ms; cold 547 | 328 ms |
+| none | 19,817 keys | split, 61 ms | split, 66 ms | 524 ms |
+
+Without an index of the key the page goes to core's plan, 1.9 times faster warm and 2.9 cold. With
+the key's lion index core's plan is the key table first and the key's lion index looked up for each
+key, 37 ms, and stays; the split folded runs 52 ms, nine times the split not folded. Folding the 2%
+key set reads 19,817 keys' postings to save 13,067 fetches, and is chosen at 77 ms where the split
+not folded ran 60. The 2% key set over a B-tree of the key is §47.7's warm case. Ordered by the rank
+alone, with `d.region < 10`, the node gave way to core's hash join without an index of the key (266
+against 255 ms); at a `work_mem` of 64 MB core's nested loop over the rank's B-tree, a Memoize
+under its semi join, came out under both and ran 946 ms (§47.7).
 
 ### 47.7 Not done
 
@@ -29915,12 +29943,17 @@ the price is §47.3's.
   where the key has one (§47.6). Without, the walk fetches the member's row and the join reads its
   key; where the B-tree holds the key (`INCLUDE (fk)`) the key could be tested on the index tuple
   and a rejected entry never fetched. An index-only walk fetches no row either way.
-- **Core's own walk under a key set.** Without a lion index of the key the fetches a key set
-  rejects are priced at their own pages (§47.3); core's nested loop over the fact's B-tree with
-  the key table's semi join Memoized above is not, its Limit taking its share of the whole walk's.
-  Where the fact's key has no index at all and the ORDER BY is the B-tree's, that loop can come out
-  under the node and core's filter first, and is the slowest of the three: on 2,000,000 rows, 1,048
-  ms against the node's 284 and the hash join's 200 (the split's order has no such loop).
+- **The rejected fetches on a warm machine.** Not folded, the fetches a key set rejects are priced
+  at their own pages (§47.3), each page a `random_page_cost`, which is what they cost where the
+  walk reads the disk - the private workload's walk read 541,680 buffers - and many times what they
+  cost where the table is in memory. There the node can lose a page it runs faster: §47.6's
+  measurements, the 2% key set over a B-tree of the key, 72 ms through the split and 326 through
+  core's plan. And core's own nested loop over the fact's B-tree, its key table's semi join
+  Memoized above, keeps its Limit's share of the whole walk's pages: where the key has no index and
+  the ORDER BY is the B-tree's, that loop can come out under the node and core's filter first and
+  be the slowest of the three (946 ms at a `work_mem` of 64 MB, against the node's 354 and the hash
+  join's 292; the split's order has no such loop). At `random_page_cost = 1.1` the 2% key set keeps
+  the split, and the 0.075% one keeps it too (405 ms against core's 224).
 - **A key set's other columns.** A table a column of which the query reads is not a key set, even a
   column its clauses pin to a constant, which the node could fill as it fills the key: §47.10 says
   why that would cost the page its plan. A key that repeats under the table's clauses is not one

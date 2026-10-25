@@ -1957,6 +1957,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 														   &cols));
 		}
 	}
+
 	/*
 	 * A join's key sets folded into the set (§47.6): the AND of the lion
 	 * access's set, or of none, with the rows of the key sets' keys.
