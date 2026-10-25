@@ -666,6 +666,14 @@ working around a bad choice:
   prices the set's build spread over the loop's rescans - over the outer side's distinct keys when
   `enable_memoize` is on - against PostgreSQL's heap fetch per outer row.
   `pg_lion.enable_btree_scan` turns it off with the other walks.
+- `pg_lion.enable_heap_probe` (off): also offer that probe where the B-tree does not cover what
+  the query reads of the relation - a primary key under a Lion filter, the query reading other
+  columns (DESIGN.md §49). EXPLAIN shows `Index: <index>` without `(index only)`: the entry the
+  outer row's key finds is tested against the Lion set, and the heap row is fetched for a member
+  alone, where PostgreSQL's Index Scan of the same B-tree fetches every row to test its `Filter`.
+  The planner prices both with the same heap-page formula, the probe over its members' fetches
+  alone, so it is chosen where the set rejects enough rows to pay for its build. It needs
+  `enable_indexscan`, and is offered under a `Memoize`, a left join and `FOR SHARE` of the relation.
 - Parallel walks: when the table may be read in parallel, `LionBtreeScan` and the B-tree walks of
   `LionOrdered` are also offered as partial paths (DESIGN.md §40.9): `Parallel Custom Scan
   (LionBtreeScan)` below a `Gather` - under partial aggregates, and on either side of a parallel

@@ -113,6 +113,7 @@
 /* GUCs, and the hook this file chains (all installed by lion_ordered_init). */
 bool		lion_enable_ordered_scan = true;
 bool		lion_enable_btree_scan = true;
+bool		lion_enable_heap_probe = false;
 bool		lion_enable_lazy_set = true;
 static bool lion_enable_shared_set = true;
 static double lion_ordered_switch_ratio = 32.0;
@@ -3986,21 +3987,28 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * target's columns (what every pair below needs, and the rest is the
 	 * pair's), whether or not core found their order useful (DESIGN.md
 	 * §40.2): with the row's values coming from the index tuple, their walk
-	 * pays without an ORDER BY.
+	 * pays without an ORDER BY.  Under pg_lion.enable_heap_probe a B-tree
+	 * that does not cover the target gives its parameterized paths alone, a
+	 * nested loop's probe in heap mode (§49); its unparameterized walk would
+	 * be core's Index Scan with lion's test in place of its Filter, reading
+	 * the whole set's rows.
 	 */
-	if (lion_enable_btree_scan && enable_indexonlyscan &&
-		rel->baserestrictinfo != NIL)
+	if (lion_enable_btree_scan && rel->baserestrictinfo != NIL &&
+		(enable_indexonlyscan || (lion_enable_heap_probe && enable_indexscan)))
 	{
 		foreach(lc, rel->indexlist)
 		{
 			IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
 			List	   *iocols;
 
-			if (idx->relam != BTREE_AM_OID || idx->hypothetical ||
-				!lo_index_only(idx, targetattrs, &iocols))
+			if (idx->relam != BTREE_AM_OID || idx->hypothetical)
 				continue;
-			btpaths = list_concat(btpaths,
-								  lo_btree_paths(root, rel, idx, &probepaths));
+			if (enable_indexonlyscan && lo_index_only(idx, targetattrs, &iocols))
+				btpaths = list_concat(btpaths,
+									  lo_btree_paths(root, rel, idx,
+													 &probepaths));
+			else if (lion_enable_heap_probe && enable_indexscan)
+				(void) lo_btree_paths(root, rel, idx, &probepaths);
 		}
 	}
 	if (ordpaths == NIL && walks == NIL && btpaths == NIL && probepaths == NIL)
@@ -4258,7 +4266,12 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 	 * btree's index clause or the node's filter - and kept for every scan.
 	 * Paired with each lion access as the unordered paths are, priced as a
 	 * probe in index-only mode, and offered claiming no order: an inner
-	 * side's order is no use to a nested loop.
+	 * side's order is no use to a nested loop.  Where the B-tree does not
+	 * cover what the scan must return, the probe runs in heap mode under
+	 * pg_lion.enable_heap_probe (§49): the entry tested against the set,
+	 * and the heap row fetched for a member alone - core's parameterized
+	 * Index Scan of the same B-tree, less the rows the set rejects, priced
+	 * by the same formula over the members' fetches.
 	 */
 	foreach(lc, probepaths)
 	{
@@ -4278,7 +4291,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			bool		lossy = false;
 			List	   *lionqual;
 			List	   *residual;
-			List	   *iocols;
+			List	   *iocols = NIL;
+			bool		indexonly;
 			Cost		startup;
 			Cost		total;
 
@@ -4286,14 +4300,20 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				continue;
 			lionqual = lo_lion_qual(lion, &lionrinfos, &lossy);
 			residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
-			if (!lo_index_only(ipath->indexinfo,
-							   lo_needed_attrs(rel, residual,
-											   ipath->indexclauses,
-											   lionqual, lossy),
-							   &iocols))
-				continue;
+			indexonly = enable_indexonlyscan &&
+				lo_index_only(ipath->indexinfo,
+							  lo_needed_attrs(rel, residual,
+											  ipath->indexclauses,
+											  lionqual, lossy),
+							  &iocols);
+			if (!indexonly)
+			{
+				if (!lion_enable_heap_probe || !enable_indexscan)
+					continue;
+				iocols = NIL;
+			}
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
-					ppi->ppi_rows, true, loops, scans,
+					ppi->ppi_rows, indexonly, loops, scans,
 					ipath->path.param_info != NULL, NULL, &startup, &total,
 					NULL, NULL);
 			lo_add_path(rel, ppi, &lion_btree_path_methods, NIL,
@@ -9496,6 +9516,19 @@ lion_ordered_init(void)
 							 "The rows' values come from the index tuples; the heap is read only for pages not all-visible.",
 							 &lion_enable_btree_scan,
 							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §49: a nested loop's probe of a B-tree that does not cover
+	 * the query, the heap row fetched for the set's members alone.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_heap_probe",
+							 "Offer LionBtreeScan as a nested loop's probe of a B-tree that does not cover the query.",
+							 "The entry the outer row's key finds is tested against the lion set before its heap row is fetched.",
+							 &lion_enable_heap_probe,
+							 false,
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
