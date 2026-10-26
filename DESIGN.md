@@ -30900,6 +30900,38 @@ and the competitors are all priced at core's rows per key. Off is the ablation o
 setting; the next step is to run the private workload and the matrix with it off, and keep only what
 moves a plan to a faster one.
 
+**On the fixtures' shapes at scale** (2026-10-26; PostgreSQL 18.6 release, the shared VM of four
+cores, `shared_buffers` 1 GB, `work_mem` 64 MB, `effective_cache_size` 4 GB; `bench/calib/joins.sql`
+and `joins.py` through `matrix.py`). A 4,000,000-row dimension of 1,563 MB with probejoin.sql's,
+ordjoin.sql's and heapprobe.sql's lion columns, all-visible; an 8,000,000-row fact of 833 MB, two
+rows a key, walked by §47.9's `(score DESC) INCLUDE (fk, id)` and by a B-tree of a rank without the
+key; key sets of 1,000 and 80,000 keys; competitor_cold.sql's dimension at 8,000,000 rows, not
+vacuumed. 48 queries of §40.10's, §46's, §47's, §47.6's, §48's and §49's shapes and
+competitor_cold.sql's, each planned at the four settings of this switch and
+`pg_lion.enable_heap_probe` and timed with every plan core's and lion's forced arms make. Warm, the
+tables in the kernel's cache but not in `shared_buffers`: medians of seven runs, interleaved, and a
+second run of five that made the same choices. Cold - before each run `matrix.py --cold` ran a
+script that stopped the server (`pg_ctl stop`), ran `sync`, dropped each file of the database's
+directory from the kernel's cache (`posix_fadvise(POSIX_FADV_DONTNEED)`) and started the server -
+medians of three, 27 of the queries, planned at `effective_cache_size` 4 GB and 256 MB. Cold this disk reads
+1.5 GB/s in sequence and a random page in about 70 us.
+
+With the switch off, two warm choices change, both to slower plans: LionProbeJoin under a NOT
+EXISTS of 150,000 keys, priced at its own 596,693 against the hash anti join's 323,929 where the hash
+join's rate, 0.5, had it at 319,902 (2,021 ms against 879 warm); and LionOrderedJoin's medium page,
+which without the Memoize under a LIMIT loses to core's loop, 5,917 against 5,573 (44.0 against 14.0
+ms warm, 1,304 against 330 cold). At `effective_cache_size` 256 MB two more: a bitmap heap scan's
+cold reads had taken LionBtreeScan's covering walk under the hash join, 795 ms cold against the
+bitmap heap scan's 1,751; and a nested loop's cold reads had taken the dense page's LionOrderedJoin,
+34.5 against 75.9 ms. Off took one plan to a faster one, and only cold with the planner told the
+tables were cached: the same LionProbeJoin, 4,113 ms cold against the hash join's 2,343, which reads
+its 1.2 GB in sequence. Off costs the warm matrix 1.2 s and the cold one at 256 MB 1.0 s, and moves
+nothing faster that the planner was told the truth about. So four of §39's corrections still earn
+their place: the hash join's rate, the Memoize under a LIMIT, and a bitmap heap scan's and a nested
+loop's cold reads; the switch stays on until each is priced as work. The skew factors and the rates
+other than the hash join's moved nothing here (no key of these tables is skewed, and no count
+competes with a hash aggregate); whether they earn theirs is the private workload's to say.
+
 ### The heap probe (`pg_lion.enable_heap_probe`)
 
 §40.10's probe is index-only: a nested loop's inner `LionBtreeScan` descends a covering B-tree to the
@@ -30949,6 +30981,22 @@ out within 1%. That is core's price of a cached heap fetch, which core's own pla
 section's rule the probe takes it as well, and the near tie goes to core's plan. Where the pages are
 not all read - fewer outer rows, a larger table, a cold one at its `random_page_cost` - the fetches
 the probe saves are pages, and its price shows them.
+
+**At scale** (the fixtures of "The switch", above). On, the loops of the table above move to the
+probe and run faster on the 200,000-page dimension: 39,600 outer rows 1.1 to 1.8 times warm and 1.6
+to 2.9 times cold, 3,960 tied warm and 1.5 times faster cold; at 198,000 the probe is priced 2% over
+the hash join and runs 1.4 times faster warm, 2.0 cold. Core's hash join over the dimension's bitmap
+heap scan in competitor_cold.sql's subquery, 784 to 860 ms warm, gives way to the probe under a
+Memoize, 118 to 139 (cold the hash join is 12% faster). Under a LIMIT the probe loses: on
+LionOrderedJoin's medium page core's ordered loop over a Memoize of the probe is priced 3,635 against
+the node's 5,475 and runs 3.1 times slower warm, 3.7 times cold, because the probe's set - 14,990 to
+build - is spread over the 883,021 scans the whole loop would make, of which the LIMIT charges 2,403,
+while it is built whole at the first (`loops * expected >= LO_SWITCH_MIN_WALK`, from the whole
+loop's rows). The dense page and the medium page index-only lose the same way, 2.8 to 3.3 times; the
+sparse page, 5.6 times, to core's price of the outer Index Scan's cached fetches, which the probe's
+lower inner price exposes. On, the warm matrix comes out level with the default, the cold one 3.8 s
+worse at 4 GB and 6.7 s better at 256 MB: the probe stays off until its set under a LIMIT is priced as
+it is built.
 
 ### Calibration (`bench/calib/ops.py`)
 
@@ -31052,14 +31100,27 @@ measures it.
 - *Column values from the sets.* A query that reads a low-cardinality lion column of the dimension
   still fetches the row for it; the probe could return its value from the column's per-value sets,
   as LionProbeJoin's labels give a predicate's truth, and be covering for it.
-- *The comparison with LionProbeJoin and LionOrderedJoin* on their fixtures and the private
-  workload, with the switch off, before either default changes.
+- *The comparison on the private workload* with the switch off, for the skew factors and the rates
+  other than the hash join's, which the fixtures do not reach ("The switch", above).
 - *LionProbeJoin's scan*: its overhead over core's nested loop, which `probe_rescan_cost` does not
   price.
 - *The harness's next operations* - the set's build a container (`lo_build_excess()`'s
   `LO_BUILD_PIECE_TIDS` is a correction of §30.3's price, not a measurement of its own), a
   container's AND, a count - each against the core operation it stands in for, at that operation's
   rate.
+- *A probe's set under a LIMIT* ("At scale", above): priced the LIMIT's share of its build, built
+  whole at the first scan. LionOrderedJoin's dimension side, the same probe, prices its build in the
+  startup and builds it lazily while the LIMIT's share of its descents is under 10,000 (§47.3,
+  §47.4). Deciding lazy or at once at run time, as §30.4's lazy set does, and pricing a scan at the
+  lesser of a lazy lookup and the build's share, is right for any share of the loop a LIMIT runs.
+- *LionProbeJoin's competitor under the heap probe*: where the probe's loop takes the join, every
+  path of the upper rel has a lion path inside, `lion_competitor_path()` finds none, and the node's
+  rate rises from 0.5 to 1 - its price doubled (65,055 to 129,373) for nothing of its own: one more
+  reason the rates are to be priced as work.
+- *LionOrderedJoin's rejected fetches* (§47.3, `ks.noinc.*`): priced at the LIMIT's own pages where
+  core's loop doing the same fetches is priced its share of the whole walk's - 18,897 against 1,158
+  for 5,000 fetches, the node running 1.7 to 2.2 times faster than the loop chosen. By this section's
+  rule the two are to be priced alike.
 
 **Tests.** test/sql/heapprobe.sql: every query through the heap probe and through core's plan,
 answers compared - an inner join, a left join, a Memoize chosen at the prices, an ORDER BY the loop
