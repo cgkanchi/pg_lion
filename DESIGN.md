@@ -30992,6 +30992,38 @@ fetch, which every core plan takes too; by this section's rule the probe takes i
 lion's plans fare against core's on a warm machine rests on core's page costs as the deployment sets
 them.
 
+**The probe's projection** (2026-10-26). Core's Index Scan under a plain nested loop returns the heap tuple it fetched, through a physical
+target list, and the loop's own projection reads what it needs from it; the probe projected its
+target into a slot of its own first. Core gives a CustomPath no physical target list
+(`use_physical_tlist()`: "the custom path creator can set up the path's pathtarget that way"), and
+a pathtarget of the relation's columns cannot be the probe path's own: `PlanCustomPath` is not told
+whether its parent needs an exact target list (an Append's child) or a small one (a Memoize's,
+which caches the rows) - the flags `create_scan_plan()` reads. The parent is known one level up:
+`create_nestloop_plan()` asks its inner side for no particular list. So the join hook
+(`lion_ordered_join_probes()`) gives each nested loop core made whose inner side is a probe a copy
+of the probe whose pathtarget is the relation's columns (`lo_physical_target()`, under
+`use_physical_tlist()`'s conditions: a plain table of the query, no system column, whole-row Var or
+placeholder wanted of it; and none of its columns dropped or missing from older tuples, which
+`tlist_matches_tupdesc()` would project anyway). Its plan's target list then matches the scan
+tuple, and `ExecAssignScanProjectionInfo()` leaves the node no projection: heap mode returns the
+buffer's heap tuple, index-only mode the virtual tuple it fills from the index tuple - the columns
+the index does not hold NULL, which nothing above reads, since the loop reads the relation's
+target alone. A Memoize's or an Append's probe keeps the relation's target, and its projection.
+The path's width is the relation's row, which no nested loop's price reads. `EXPLAIN VERBOSE`
+shows the probe's `Output` as every column of the relation, as it shows a core scan's physical
+target list.
+
+Under callgrind (§49's harness, the difference of 30,000 and 10,000 outer rows), an outer row of a
+key of eight entries took the probe 23,157 instructions, 145 instruction cache misses and 37
+mispredicted indirect branches - the expression interpreter's dispatch - against core's Index
+Scan's 20,150, 75 and 4; returning its scan tuple, 22,274, 135 and 8. An entry is 110 instructions
+and 3.6 mispredicted branches cheaper; a unique key's outer row 106 instructions and 8 cache
+misses. Timed (`ops.py`, seven runs on the VM shared with another benchmark, load 2), the probe
+over core's Index Scan came to 21.6 `cpu_operator_cost`s an outer row of a unique key (-3 to 58)
+and 58 of eight entries (39 to 81), against 20 and 51 before: the runs spread wider than the
+saving, so `probe_entry_cost` and `probe_rescan_cost` stay at 4.5 and 16 until a quiet machine
+measures it.
+
 **Not done.**
 
 - *Column values from the sets.* A query that reads a low-cardinality lion column of the dimension
@@ -30999,11 +31031,6 @@ them.
   as LionProbeJoin's labels give a predicate's truth, and be covering for it.
 - *The comparison on the private workload* with the switch off, for the skew factors and the rates
   other than the hash join's, which the fixtures do not reach ("The switch", above).
-- *The probe's projection* (above). Core's Index Scan under a plain nested loop returns the heap
-  tuple; the node projects its target. Core gives a CustomPath no physical target list
-  (`use_physical_tlist()`), and `PlanCustomPath` is not told whether its parent needs an exact one
-  (an Append's child) or a small one (a Memoize's) - the flags `create_scan_plan()` reads; a
-  pathtarget of the relation's columns would have a Memoize cache whole rows.
 - *LionProbeJoin's scan*: its overhead over core's nested loop, which `probe_rescan_cost` does not
   price.
 - *The harness's next operations* - the set's build a container (`lo_build_excess()`'s

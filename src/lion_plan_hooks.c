@@ -229,8 +229,10 @@ lion_create_upper_paths(PlannerInfo *root, UpperRelationKind stage,
  * the upper node itself as its joined dimension ("A dimension that is a
  * join").  lion_fkjoin_recognize_join() says whether this call is one;
  * lion_try_count_path() then checks the fact side exactly as for the upper
- * node, and lion_try_semijoin_path() adds the paths.  Chained to any hook
- * installed before ours, which runs first.
+ * node, and lion_try_semijoin_path() adds the paths.  Before that, the
+ * nested loops core made over a LionBtreeScan probe take a copy of it that
+ * returns its scan tuple (lion_ordered_join_probes(), DESIGN.md §49).
+ * Chained to any hook installed before ours, which runs first.
  */
 void
 lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
@@ -243,6 +245,9 @@ lion_set_join_pathlist(PlannerInfo *root, RelOptInfo *joinrel,
 		lion_prev_set_join_pathlist_hook(root, joinrel, outerrel, innerrel,
 										 jointype, extra);
 	lion_units_unpin();
+
+	/* a nested loop's probe returns its scan tuple (DESIGN.md §49) */
+	lion_ordered_join_probes(root, joinrel);
 
 	if (!lion_enable_count_pushdown || !lion_enable_semijoin)
 		return;

@@ -277,6 +277,58 @@ UPDATE hp_dim SET grade = 'alpha', name = name || '-new' WHERE id IN (SELECT dim
 SELECT hp($$SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
 			WHERE f.g < 5 AND d.grade = 'alpha'$$);
 
+-- 6. What the probe returns (DESIGN.md §49, "The probe's projection"):
+--    under a plain nested loop its scan tuple as it is, through the
+--    relation's columns, which the loop reads what it needs from, as core's
+--    Index Scan's heap tuple is read - in heap mode and index-only alike,
+--    where the columns the index does not hold are NULL and nothing above
+--    reads them; under a Memoize, which caches what the probe returns, the
+--    columns the query needs alone; and those alone too where the relation's
+--    tuple would be projected anyway, a dropped column in it, or holds no
+--    whole-row value.  The answers are the ordinary plan's.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+SET pg_lion.enable_heap_probe = on;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.id FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+SET enable_memoize = on;
+SET pg_lion.pushdown_margin = 1;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.g + 1
+ WHERE f.g < 20 AND d.grade = 'alpha' AND d.verified;
+RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_heap_probe;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT hp($$SELECT f.id, d FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+			WHERE f.g < 10 AND d.grade = 'alpha'$$);
+ALTER TABLE hp_dim DROP COLUMN pad;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+SET pg_lion.enable_heap_probe = on;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_heap_probe;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT hp($$SELECT f.id, f.v, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+			WHERE f.g < 10 AND d.grade = 'alpha' AND d.verified$$);
+
 DROP FUNCTION hp_inner(text);
 DROP FUNCTION hp_run(text, boolean, int);
 DROP FUNCTION hp(text, boolean, boolean, int);
