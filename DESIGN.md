@@ -22635,7 +22635,10 @@ Q4's 3.4M entries are the walk of every header, as for the top k of §36.
   still priced as the header walk. Correcting the headers' sums by the dirty pages alone would
   need each dirty TID's key, which a dead item no longer has.
 - **A WHERE, a GROUP BY, a partitioned table**: each entry's rows would be its count against the
-  WHERE, per group - the walks of §10 with an argument per entry, not yet written.
+  WHERE, per group - the walks of §10 with an argument per entry, not yet written. *(2026-10-26:
+  for an integer, date, time or timestamp column a lion index slices (§51), §52 answers `sum`,
+  `avg`, `min` and `max` under a WHERE and per group of a GROUP BY from the slices instead, and
+  with no WHERE competes with this walk on price. The walk stays for every other column and type.)*
 
 ### Tests
 
@@ -31939,7 +31942,8 @@ index built there in mode `rmgr`, as `make installcheck-rmgr` does.
   priced dearer than the same index without slices though they read the same pages. Pricing them
   from the pages before the first SLICE entry needs a page count the meta page does not keep;
   nothing here changes the cost model, and the planner task that reads the slices is the place to
-  decide it.
+  decide it. *(2026-10-26, §52.6: the planner is handed the index's pages less an estimate of the
+  slices', from their entries' headers, within 2% of `lion_index_stats()`'s count here.)*
 
 ### 51.14 Not done
 
@@ -31952,14 +31956,476 @@ index built there in mode `rmgr`, as `make installcheck-rmgr` does.
   lion_slice.c, over a `LionSliceRun` whose filter is `LionTextFilter`'s collected copy, so a
   LionCount plan, whose filter is its own sources, lifts them into an interface that takes a
   collected copy (or, on a standby, constraint lists) - and §51.11's numbers are what its cost
-  model has to weigh: (2 · nbits + 1) counts against the filter's rows.
+  model has to weigh: (2 · nbits + 1) counts against the filter's rows. *(2026-10-26, §52: done
+  for `count`, `sum`, `avg`, `min` and `max` under the node's WHERE and per group of a GROUP BY of
+  one or two columns, through `LionSliceAgg` - the interface both the function and the node now
+  use. Ranges on the sliced column and percentiles are still to do, §52.10.)*
 - **The plane kernel** (§50): the counts of k slices' BITSETs ANDed with the filter's image at a
   container key in one strided pass (`lion_planes_count_strided()`, at the seam in
   `lion_slice_counts()`; slices that are not BITSETs keep the container AND), and the build's and a
   bulk insert's transposition of a container key's values into slice words
   (`lion_planes_scatter_strided()`, at `lion_acc_add_slices()` and `lion_slice_insert()`).
+  *(2026-10-26, §52.4: the counts take the kernel - BITSETs and NARROWs of one width at a key the
+  map vouches for, `pg_lion.enable_slice_kernel`; the scatter at build and insert is still to do.)*
 - **Other types**: `oid` (unsigned: no flip), `float4`/`float8` (the sign-magnitude flip, NaN's
   place), `numeric` and `interval` (not one integer).
 - **Per-column control** (§51.13), and an `ALTER INDEX` that adds slices without a REINDEX.
 - **The standby path of the descent** is exercised by no test here: the recovery harness's
   standby readers do not call the function yet.
+
+## 52. Aggregates and ranges from slices in the count pushdown (2026-10-26)
+
+§51 stored a bit-sliced column's values as posting sets and proved them exact through a SQL
+function; this is the planner's half. The LionCount node (§10) answers `count(x)`, `sum(x)`,
+`avg(x)`, `min(x)` and `max(x)` of a column a lion index slices, under any `WHERE` the count
+pushdown answers from posting sets and per group of a `GROUP BY` of one or two lion-indexed
+columns, from the column's slices - beside the `count(*)` and the filtered counts it answered
+before:
+
+    SELECT sum(amount), avg(amount), max(amount), count(*) FROM events
+     WHERE country = 'JP' AND tags && '{mobile}';
+    SELECT country, sum(amount), min(amount) FROM events
+     WHERE device = 'ios' GROUP BY country;
+
+The one row is the column's width in counted ANDs - every bit's slice counted against the rows a
+sum is over, one AND a bit for each extreme - over the `WHERE`'s container keys, against a read
+of its rows (§52.2). A `GROUP BY` is that a group at a time, a few dozen counted ANDs a group
+(§52.3), or, past a few groups, a walk a batch of groups that reads the slices once and every
+row's value off them (§52.4, "the decode route"); the price decides (§52.6). The index's pages
+the planner prices a sliced index's scans by now leave the slices out (§52.7). Three of the four
+levels the task set are done; the fourth - a range on the sliced column itself, as a count's
+source and as a filter, by O'Neil's descent with container algebra - is not, nor are
+percentiles (§52.12).
+
+### 52.1 What is taken (`lion_sagg_classify()`, `lion_count_path_sagg()`, `lion_find_sliced_index()`)
+
+- **The aggregates**: `count(x)`; `sum(x)` and `avg(x)` of `int2`, `int4` and `int8` - sums of
+  integers only: the date and time types have none, and the allowlist's others are not sliced;
+  `min(x)` and `max(x)` of those and of `date`, `time`, `timestamp` and `timestamptz` - of the bare
+  column (a `RelabelType` aside), with no `DISTINCT`, `FILTER` or `ORDER BY`. They are told by
+  `aggfnoid` (`F_SUM_INT4`, `F_MAX_TIMESTAMPTZ`, ...), so a user's aggregate of the same name is
+  not taken. Without `int128` in the compiler, sum and avg are left to the other plans.
+- **The column**: a key column of a whole (not partial) lion index that slices it at its type's
+  width (`LionState.sliced`, `slicebits == lion_slice_type_nbits(typid)`), not multi-key. Several
+  columns, of one index or several, in one query; a column may also be the grouping column.
+- **The rest of the query** is what the count pushdown takes on one table (§10): equalities, `IN`
+  lists, `IS [NOT] NULL`, `<>` and the other subtractions (§35), `OR` trees, the multi-key
+  operators, a range on another column - summed from its entries (§28) or collected as a source
+  (§32) - parameters of a generic plan and stable expressions; `count(*)` and `count(*) FILTER
+  (WHERE ...)` beside the aggregates and a `HAVING` over them; a `GROUP BY` of one or two
+  lion-indexed columns, an `IN` list on the grouping column driving its groups (§15), or none.
+- **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join), a
+  partitioned table (each partition would answer its own and core's partial aggregates add them
+  up, which needs the partial states of `avg` and `sum(int8)` serialized - not written), a
+  residual clause (§10: the slices would have to be counted over the rows the heap keeps), the
+  aggregates over keys in the same target list (§37), `count(DISTINCT)`, the top k (§36), the
+  decoded walk of §34, three grouping columns, a filtered count beside a `GROUP BY`, a coalesce
+  group or cells (§10), a parallel plan, and a hot standby, where the pushdown collects nothing
+  (§10) - a plan made on the primary and run there all the same counts every slice beside the
+  `WHERE`'s located sets (`lion_slice_column()`'s standby branch), exact and slow. With no `WHERE`
+  and no `GROUP BY` this and the aggregates over keys (§37) are both offered, and the price
+  decides.
+- **The switches**: `pg_lion.enable_count_slices` (on) turns the whole of it off, and the planner
+  builds what it built before; `pg_lion.enable_slice_decode` (on) the decode route alone (§52.4);
+  `pg_lion.enable_slice_kernel` (on) the plane kernel alone (§52.5).
+
+The planner builds such a query's LionCount path in a mode of its own first
+(`lion_try_count_path_scoped()`, `slicemode`), with the sliced columns' aggregates as the node's
+outputs (`LION_TL_SAGG(j)` among the target-list kinds; custom_private member 25, `SLICES`: the
+columns, their indexes and key columns, and each aggregate's kind and column). A query it declines
+gets the paths it got before - the aggregates over keys, the counts with an Agg above them, or
+none - and add_path() keeps the cheapest of everything offered.
+
+### 52.2 The one row (`lion_exec_slice.c`, `lion_slice.c`)
+
+`lion_index_slice_agg()`'s statics are an interface now (`LionSliceAgg`, `lion_slice_counts()`,
+`lion_slice_extreme()`, lion_count.h) over a filter that is a collected copy or, on a standby, a
+list of located sources (`LionSliceFilter`); the SQL function and the node both run on it. For
+each sliced column of the plan, once the node has located its `WHERE` (`lion_locate_where()`):
+
+1. **C0 = E ∧ WHERE**, collected (`lion_sources_collect()`) from the column's existence slice E,
+   located with its pin, and the `WHERE`'s sources as the node located them for its own count -
+   every clause, an `OR` tree, a multi-key query, a list, the negated clauses that subtract, a
+   range taken as a source (collected, §32), and a range summed over its entries (§28), collected
+   for this from its summaries and entries (`lion_range_collect()`). Budgeted like every copy the
+   node makes, and spilled past it (§27). E ∧ WHERE rather than the `WHERE` alone: the copy holds
+   no row whose value is NULL, so `count(x) = |C0|` and a descent starts from it.
+2. **The counts**: every slice located with its pin and counted against C0 a batch at a time in
+   one walk of C0's container keys (`lion_count_groups_copy_ext()`, §10 "The groups of a walk,
+   counted together") - E's count beside them, and every bit's for a sum or an average. A bit no
+   row has is a slice with no entry, counted 0.
+3. **min, max**: §51.10's descent from C0 (`lion_slice_extreme()`), a step a bit, |C ∧ S_i| counted
+   with S_i located, C collected again only where the bit splits what C shows.
+4. **The results** as core computes them (§37, "The results"): `count` an int8; `sum(int2|int4)`
+   the int128 sum modulo 2^64, which is the int8 core's wrapping adds come to in any order;
+   `sum(int8)` the int128 made a numeric (`lion_slice_int128_numeric()`); `avg` core's - the sum
+   over the count, `numeric_div()` of two numerics, as `int8_avg()` and `numeric_poly_avg()`
+   compute it; `min` and `max` the encoding decoded to the type's Datum
+   (`lion_slice_value_datum()`), infinities included. NULL over no row but `count`, which is 0.
+
+The `WHERE`'s own count (`count(*)`, the filtered counts) runs as before where the target list
+has one (`needcount`), and is skipped where it has none. A `WHERE` that selects nothing
+(`wheremissing`) answers 0 and NULLs without locating a slice (`lion_slice_none()`). A LATERAL
+rescan locates and collects again.
+
+**Why it is exact.** §51.10's argument with the node's `WHERE` for the text filter, and §10's for a
+collected `WHERE`: C0 is a copy made after the snapshot was taken, pinless, and only ever counted
+ANDed with a slice located with its pin, and every TID on a page the map does not vouch for goes
+to the heap under the node's snapshot (§9). A summed range is collected from the entries the node
+would have walked, under the same snapshot. On a standby nothing is collected, and every count
+intersects E, the `WHERE`'s located sources and the slice - and the descent's steps' slices.
+
+### 52.3 GROUP BY, a group at a time (`lion_slice_group()`)
+
+Each group with a visible row is answered as the one row is, its rows the `WHERE`'s: its copy C
+= G ∧ C0 (G1 ∧ G2 ∧ C0 for a pair of two columns, §20), collected from the group's sets as the
+walk located them, with their pins, and C0, made once a relation in the node's relation memory
+(`relcxt`, released with the `WHERE` by `lion_release_where()`). Then the counts and the descents
+against C: 33 counted ANDs for the sum of an int4, 33 more for each extreme, each over C's keys.
+Every place a group's row is made calls it while the group's sets are still located: the walk a
+group at a time (`lion_next_group()`), §10's batches, which keep each group's answers in the
+batch's memory until its row goes up (`lion_slice_keep()`, `lion_slice_put()`), an `IN` list's
+groups (`lion_next_group_inlist()`) and the pairs' nested loop (`lion_next_group2()`). A `HAVING`
+over the aggregates is the node's filter on its rows. Exact as the one row is: C is a copy made
+after the snapshot, counted only ANDed with a pinned slice, and its visible rows are the group's
+rows the `WHERE` keeps (§10's argument for a group's count against the collected `WHERE`).
+
+A group at a time reads every slice at every key the group's rows lie on. A group of a column of
+200 values under a 10% `WHERE` lies at all 806 keys of §52.10's table, so each group read the 32
+slices of an int4 whole - 1.73 s for 200 groups where the ordinary plan took 181 ms (§52.10).
+That is what the decode route is for.
+
+### 52.4 The decode route (`lion_slice_batch()`, `lion_count_groups_slices()`, lion_slice_decode.c)
+
+The task's alternative to the pairs was §34's decoded walk with the slices gathered at each key
+by `lion_planes_gather_strided()`. The measurements of §52.3 said many groups need it, so it is
+here - not inside §34's walk, whose rows are partial counts below a Finalize Agg, which the
+slices' aggregates would need serialized partial states to go through, but as a walk of its own
+over §10's batches of a column's groups, whose rows go up final:
+
+- **The batch**: §10's batch of the walk's entries (`lion_group_batch_fill()`, up to
+  `lion_count_groups_batch()` of them - the pin and memory budget of one count's cursors, 256 at
+  most), located with their pins, taken a batch at a time whether or not the `WHERE` has been
+  collected yet (`lion_slice_batch_ok()`): the `WHERE` is collected before the first batch.
+- **One walk a sliced column** (`lion_count_groups_slices()`): `lion_count_groups_decode()`'s walk
+  with one column, the batch's groups, and the collected `WHERE` (or every row, with none). At
+  each key the `WHERE` leaves rows at, each group's container is decoded into the group of each of
+  its rows, and each of the column's slices - every bit's and E - is read there by a cursor that
+  holds no pin: a BITSET or a NARROW where it lies, its word of 64 positions read at block b, word
+  s of it when s is below its width (`lion_slice_plane_word()`); an ARRAY or a RUN made an image.
+  Then each 64-row word: E's word says which rows have a value, and their values are gathered 64
+  at a time by a transpose of the word's 64 × nbits bits (`lion_planes_gather_strided()`, §50)
+  where it holds 4 such rows or more, or read a bit at a time where it holds fewer
+  (`LION_SLICE_GATHER_MIN`: a transpose costs about what four rows read bit by bit do), and added
+  to its group's count, sum of encodings, least and greatest (`lion_slice_decode_add()`). The
+  first column's walk also counts every row of each group, value or not: the groups' own counts,
+  so the batch is walked once for them and the first column together.
+- **Visibility**: the map asked at a key after every group's container there was copied under
+  its pin, and a row on a block it does not vouch for sent to the heap with its group, its value
+  and whether it has one (`lion_recheck_visible()`), after the walk or when the list is full - the
+  decoded walk's machinery, and its argument: every row counted is in exactly one group's pinned
+  set, and the slices, the `WHERE`'s copy and E only label rows of pinned sets. A row the snapshot
+  sees with a value is in E and in exactly the slices of its value's bits, which its insert wrote
+  before its transaction committed and only VACUUM removes, for rows no snapshot sees; read after
+  the snapshot, a slice lacks no visible row's bit and holds none it should not. A TID a slice
+  holds for a row the snapshot does not see labels a row the heap or the map rejects.
+- **Where not**: two grouping columns (their pairs would be the decoded walk's combinations, whose
+  partial rows the Finalize Agg adds - the partial states again), groups an `IN` list or equality
+  on the grouping column drives (one located at a time, §15: the planner offers the route only
+  where no `WHERE` clause names the grouping column), a `WHERE` with no copy (one that selects
+  nothing by its sets, left to the row filter: answered a group at a time), and a standby, whose
+  counts cannot read the slices without their pins (a group at a time, which on a standby counts
+  every slice beside the sets).
+
+A batch of 200 groups of §52.10's int4 under a 10% `WHERE` is one walk of 806 keys: 33 slices read
+once, 200 groups' containers decoded, 500,000 rows' values gathered - 41 ms against 1,734 a group
+at a time and 181 for the ordinary plan.
+
+### 52.5 The kernel (`lion_count_groups_copy_ext()`, `lion_groups_count_clean()`)
+
+The slices' counts of §52.2 and §52.3 are §10's batch walk with an option the slices ask for: at
+a container key of C whose blocks the map calls all-visible - nothing to recheck, and not
+SERIALIZABLE, whose blocks take their predicate locks one at a time below - every slice standing
+there is counted without its intersection being built. The BITSETs and NARROWs of one width
+together, by one pass of `lion_planes_count_strided()` (§50) over their payloads against C's
+container as an image of that width - C's own words where it is a NARROW of that width, or the
+first `width` words of each block of its full image (`lion_groups_width_image()`), which is
+exact since a NARROW of width k has no member past offset 64·k of a block; every other
+container, and every one with `pg_lion.enable_slice_kernel` off, by
+`lion_container_and_cardinality()` (an ARRAY against the image by a bit test a member,
+`lion_container_and_image_count()`). The blocks the map vouches for count in
+`blocks_skipped_via_vm` for each group with a row there, as before. lion_planes.[ch] are
+unchanged; the kernel and its unit tests are §50's. What it buys end to end is §52.10's
+`kernel off` column: 0 to 20% (the median 7%; once 1.6 times, once 0.86, both within this
+machine's noise), because the walk's time goes to the cursors' page copies
+(`lion_cursor_next_item()`, `memcpy()`: most of a profile of `u4 all 10%`) and the counting the
+kernel replaces was some 10% of it. It is kept for the shapes where the counting is the work - many
+slices of a dense column against a dense `WHERE`, a cache that holds the slices' pages - and its
+answers are the container AND's, to the bit (slices_plan.sql runs both).
+
+### 52.6 Cost (`lion_cost_slice_path()`, nine settings)
+
+The path is the count's path (`lion_count_path_add()`: the `WHERE`'s count, or the grouped count,
+priced as before) with the slices' work added - in the count's place when the target list has no
+count and no `GROUP BY` - in the pushdown's units (§39, 500 a millisecond), from what the slices
+hold: their entries' rows and items, read at plan time from the directory (`lion_slice_shape()`:
+a descent and the entries' headers, four leaves at most; a column it cannot read whole is taken
+as every slice holding half of every key's rows). For each column:
+
+- **The collection of C0**: the `WHERE`'s merge again - half its price beside a count, whose
+  pages it reads cached, all of it without one - E sought at each of C0's keys
+  (`LION_PROBE_COST`) and a container of the copy written there (`fkjoin_copy_container_cost`);
+  with no `WHERE`, E's containers read and written. Once for every column: they share the `WHERE`.
+- **The walk**: each of C0's keys a batch of up to 64 slices (`pg_lion.slice_key_cost`, 120: the
+  copy's image, the map, the cursors' heap) and each slice read at those keys
+  (`lion_slice_read_cost()`): the containers met (`slice_container_cost`, 15), the posting pages
+  they lie on - a page read (`lion_index_page_cost()`, §39's resident pages) and a copy of it
+  walked (`slice_page_cost`, 200) - and, where the keys are fewer than the pages, a descent of the
+  posting tree to each page sought. A container takes a bitmap of the heap's width at most, and an
+  ARRAY's two bytes a row below that.
+- **A descent**: nbits steps (`slice_step_cost`, 1000: the slice located and the count set up),
+  each - but a bit no row has - a count of the candidates, `slice_step_key_cost` (50) a key and
+  `slice_step_row_cost` (0.9) a row of them, the rows capped at 1,024 a key, which a step that
+  splits them narrows to the rows kept: those with the bit for the maximum, without it for the
+  minimum, taken to have it as often as E's rows have it (the slice's rows over E's) - so a
+  uniform column's halve at every bit of its range, and a skewed one's minimum keeps most of them
+  for long. The candidates' collections are in the two step prices, as fitted.
+- **A group at a time** (§52.3): one group's share of C0's rows, at the keys it lies at, its copy
+  collected there (a probe, a container and a copy a key) and counted and descended as the one row
+  is, times the planner's estimate of the groups.
+- **The decode route** (§52.4): a walk a batch (`lion_count_groups_batch()` of the grouping index,
+  read at plan time): every slice read at the `WHERE`'s keys and a key's overhead; each group's
+  containers at its keys (`slice_container_cost`); each 64-row word that holds rows, the lesser of
+  its rows read a bit at a time (`slice_decode_bit_cost`, 0.3 a bit) and a transpose
+  (`slice_gather_cost`, 12 for 32 bits); and each row added to its group's answers
+  (`slice_decode_row_cost`, 1). Both routes are offered for a `GROUP BY` of one column, and
+  add_path() keeps the cheaper.
+
+The constants were fitted on §52.10's 5M-row table: the shapes there run at 300 to 900, the median about 600 (a sum over a range collected for C0 at 210, §52.12) units a
+millisecond of the price the planner gave them under the lion paths, against the 500 the
+pushdown's units stand for; the decisions are in §52.10's `plan` column.
+
+### 52.7 The index's pages (`lion_index_slice_pages()`, `lion_leave_out_slice_pages()`)
+
+§51.13 left this open: the planner prices a lion index's scans by `index->pages` - prorated by the
+selectivity in genericcostestimate(), shared out among the columns by the AND of sets and the
+count pushdown - and a sliced index's pages include its slices, 13% of the u4 index's in §51.11,
+23% of the u8's and 28% of the k4's, which no scan of its keys reads. So the hook that follows
+get_relation_info() (`lion_get_relation_info()`, `build_simple_rel_hook` from 19) hands the
+planner each sliced lion index's pages less its slices', as estimated from their entries'
+headers (`lion_slice_shape()`): each slice's containers, sixteen bytes of header each and the
+smallest of the container kinds for its members a key - an ARRAY's two bytes a member, a bitmap
+of the heap's width, or a RUN of the rows it lacks there, which is what a slice every row of a key
+has (a constant bit, or E with no NULL) comes to - at 87% of a page filled. An index without
+slices is not touched (its meta page's `slice_cols` is 0) and costs nothing to ask; DEBUG1 reports
+each estimate. The meta page keeps no page count of the slices, and `lion_index_stats()` walks
+every posting tree for one; the estimate against it:
+
+| index                                  | pages  | slice pages (stats) | estimate | error |
+|----------------------------------------|--------|---------------------|----------|-------|
+| u4, 5M rows (§51.11)                   | 28,482 | 3,776               | 3,767    | -0.2% |
+| k4                                     | 8,484  | 2,404               | 2,358    | -1.9% |
+| u8                                     | 32,275 | 7,520               | 7,531    | +0.1% |
+| slices_plan.sql's 7 columns, 30k rows  | 1,088  | 233                 | 257      | +10%  |
+| slices.sql's `slc_w1_k`, 8k rows       | 66     | 13 (inline)         | 22       | +70%  |
+
+It is high where the values run in heap order (slices.sql's hourly timestamps), whose slices
+are RUNs a bitmap's estimate overstates, and on a small index whose slices are inline in its
+directory entries. Of slices_plan.sql's sliced index, the bitmap index scans of a range and of
+an AND of two columns, priced 1.4 and 1.3 times the same index's without slices, are priced the
+same now (to a tenth). slices.sql's summed range over `slc_w1_k`, which the LionCount node took at
+about the bitmap scan's price, went to the bitmap scan with that index 9 pages cheaper than its
+unsliced twin; the test turns the bitmap scan off there. The suite's plans over unsliced indexes
+did not move (§52.11).
+
+### 52.8 EXPLAIN
+
+    Custom Scan (LionCount)
+      Lion Indexes: slp_g (g), slp_h (h = 1)
+      Group Key: g
+      Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+      Slice Groups: decoded by batch
+
+a column at a time: its index, and what is counted - `every bit counted` for a sum or an average,
+`existence counted` for a count, a min or a max alone - and the descents; for a `GROUP BY`, `one at
+a time` or `decoded by batch`. `EXPLAIN ANALYZE` adds `Slices Located` and `Slices Absent` (bits no
+row has), `Slice Counts` (slices counted against a copy) and `Slice Containers Counted`, `Slice
+Containers by Kernel`, `Slice Kernel Keys` (the keys the kernel ran at) and `Slice Kernel`
+(`lion_simd_name()`: avx512, avx2, popcnt, portable), `Slice Descent Steps`, `Slice Candidate
+Sets` (the descents' collections), `Slice WHERE Copies` (C0 and the groups' copies), `Slice
+Batches Decoded`, `Slice Keys Decoded` and `Slice Rows Decoded` (and `Slice Rows Rechecked`), and
+`Slice Heap TIDs Rechecked` and `Slice Heap Blocks Rechecked` where the map did not vouch for a
+page.
+
+### 52.9 Not on a standby, a join or partitions
+
+Restated from §52.1 because the task asked for each: on a hot standby the planner offers none of
+this (the pushdown collects nothing there, §10), and a plan made on the primary runs exact and
+slow - every slice counted beside the located sets, the descent's steps intersected again, and the
+groups a group at a time; a join (the FK-side join of §27, a semi or anti join) and a partitioned
+table are declined, the latter for want of serialized partial states for core's Finalize Agg
+(§52.12).
+
+### 52.10 Measured
+
+`bench/slices_pushdown.sql` (`psql -X -v rows=5000000 -f bench/slices_pushdown.sql`, then `-v
+setup=off`; `-v only=1` or `only=2` for one level): 5,000,000 rows on 51,547 pages - §51.11's u4,
+k4 and u8 (uniform int4, skewed int4, uniform int8) each under a one-column sliced index, `g100`,
+`g10` and `g2` for filters of 1%, 10% and 50% and `h2`, `h20` and `h200` for groups of 2, 20 and
+200 (two multicolumn lion indexes), and `r` with summaries for a range. PostgreSQL 16 at -O2
+without assertions, four cores shared with another session's test suite (a load of two), no
+parallel workers; each number the best of three, warm. `plan` is what the planner chose at its
+defaults; `lion` the LionCount node with every other scan off (the planner's choice among its
+paths), `kernel off` the same with `pg_lion.enable_slice_kernel` off, `one at a time` with
+`pg_lion.enable_slice_decode` off; `ordinary` the plan with the pushdown off. Every answer of
+each was compared with the ordinary plan's.
+
+**The one row** (`only=1`); `sum,count` is `sum(x), count(x)`, `all` adds `avg`, `min` and `max`:
+
+| shape                  | plan               | ms    | lion  | kernel off | ordinary plan          | ordinary ms |
+|------------------------|--------------------|-------|-------|------------|------------------------|-------------|
+| u4 sum,count, 1%       | LionCount (slices) | 12.3  | 7.7   | 7.6        | Aggregate > Index Scan | 36.0        |
+| u4 sum,count, 10%      | LionCount (slices) | 9.8   | 7.0   | 9.0        | ... > Bitmap Heap Scan | 166.0       |
+| u4 sum,count, 50%      | LionCount (slices) | 6.7   | 5.8   | 7.0        | ... > Bitmap Heap Scan | 340.3       |
+| u4 all, 1%             | LionCount (slices) | 13.8  | 13.1  | 14.9       | Aggregate > Index Scan | 23.5        |
+| u4 all, 10%            | LionCount (slices) | 27.2  | 28.2  | 27.6       | ... > Bitmap Heap Scan | 174.9       |
+| u4 all, 50%            | LionCount (slices) | 33.1  | 33.6  | 34.3       | ... > Bitmap Heap Scan | 369.1       |
+| u8 all, 1%             | LionCount (slices) | 23.1  | 22.2  | 24.6       | Aggregate > Index Scan | 28.4        |
+| u8 all, 10%            | LionCount (slices) | 47.8  | 33.5  | 53.8       | ... > Bitmap Heap Scan | 189.8       |
+| u8 all, 50%            | LionCount (slices) | 41.6  | 38.2  | 37.6       | ... > Bitmap Heap Scan | 332.3       |
+| k4 all, 1%             | LionCount (slices) | 16.4  | 16.5  | 17.8       | Aggregate > Index Scan | 26.4        |
+| k4 all, 10%            | LionCount (slices) | 41.2  | 54.0  | 46.4       | ... > Bitmap Heap Scan | 143.4       |
+| k4 all, 50%            | LionCount (slices) | 34.7  | 37.5  | 38.9       | ... > Bitmap Heap Scan | 379.1       |
+| u4 max, 10%            | Result (min/max)   | 0.1   | 0.1   | 0.1        | Result                 | 0.1         |
+| u4 sum, `IN`, 2%       | LionCount (slices) | 8.7   | 8.0   | 9.4        | Aggregate > Index Scan | 64.1        |
+| u4 sum, range 10% (§32)| LionCount (slices) | 41.4  | 39.6  | 41.0       | ... > Bitmap Heap Scan | 167.1       |
+| u4 sum, max, no WHERE  | LionCount (slices) | 25.7  | 18.8  | 22.4       | Aggregate > Seq Scan   | 325.1       |
+| k4 sum, max, no WHERE  | LionCount (slices) | 12.0  | 11.6  | 12.3       | Aggregate > Seq Scan   | 331.9       |
+
+**GROUP BY** (`only=2`), of `h2`, `h20` or `h200`; `decoded` marks the decode route, `one at a time`
+the same with `pg_lion.enable_slice_decode` off:
+
+| shape                      | plan                       | ms    | lion  | one at a time | ordinary plan          | ordinary ms |
+|----------------------------|----------------------------|-------|-------|---------------|------------------------|-------------|
+| u4 sum, 10%, 2 groups      | LionCount (slices)         | 14.0  | 15.2  | 15.2          | ... > Bitmap Heap Scan | 185.7       |
+| u4 sum, 10%, 20 groups     | LionCount (slices) decoded | 39.5  | 39.3  | 129.1         | ... > Bitmap Heap Scan | 187.4       |
+| u4 sum, 10%, 200 groups    | LionCount (slices) decoded | 52.1  | 51.8  | 903.0         | ... > Bitmap Heap Scan | 189.1       |
+| u4 all, 10%, 2 groups      | LionCount (slices) decoded | 40.1  | 39.5  | 47.7          | ... > Bitmap Heap Scan | 181.9       |
+| u4 all, 10%, 20 groups     | LionCount (slices) decoded | 42.5  | 41.0  | 219.5         | ... > Bitmap Heap Scan | 186.0       |
+| u4 all, 10%, 200 groups    | LionCount (slices) decoded | 45.6  | 41.1  | 1,734.2       | ... > Bitmap Heap Scan | 181.4       |
+| k4 all, 10%, 20 groups     | LionCount (slices) decoded | 37.5  | 36.8  | 294.0         | ... > Bitmap Heap Scan | 194.7       |
+| u4 max, 1%, 20 groups      | LionCount (slices) decoded | 20.1  | 21.0  | 62.0          | Aggregate > Index Scan | 29.5        |
+| u4 sum, no WHERE, 2        | LionCount (slices)         | 12.0  | 11.1  | 11.0          | Aggregate > Seq Scan   | 428.9       |
+| u4 sum, no WHERE, 20       | LionCount (slices) decoded | 47.8  | 50.6  | 112.6         | Aggregate > Seq Scan   | 479.4       |
+| u4 sum, no WHERE, 200      | LionCount (slices) decoded | 71.0  | 70.4  | 1,135.5       | Aggregate > Seq Scan   | 693.3       |
+| u4 sum, 10%, pairs 2 × 20  | ... > Bitmap Heap Scan     | 181.4 | 237.8 | 271.1         | ... > Bitmap Heap Scan | 200.2       |
+| u4 sum, 50%, pairs 10 × 20 | ... > Bitmap Heap Scan     | 439.9 | 1,327 | 1,360         | ... > Bitmap Heap Scan | 437.2       |
+
+(`ordinary` aggregates are HashAggregates for the GROUP BYs. Timings move by 10-20% from run to
+run on this shared machine - `u8 all, 10%` took 33.5 and 47.8 ms in two columns that ran the same
+plan - which is also the size of what the kernel changes.)
+
+What the tables say:
+
+- **The one row** wins from 1% up, by 1.2 to 51 times: its work hardly grows with the `WHERE`'s
+  rows - the slices are read at the `WHERE`'s keys, which a 1% `WHERE` of rows spread over the heap
+  already spans - where the ordinary plan's does. A sum alone is a walk of 33 counts (6 to 8 ms);
+  the extremes add two descents of 32 steps (13 to 54 ms). The int8's 1% is the closest (23
+  against 28 ms). With no `WHERE` the slices beat the sequential scan 13 to 28 times and were
+  chosen over §37's walk of keys, which a near-unique u4 makes a walk of five million entries.
+- **max alone** goes to core's min/max optimization, a `Result` over an ordered scan of the lion
+  index (§30): 0.1 ms, which nothing here competes with.
+- **GROUP BY**: a group at a time wins at 2 groups and loses from about 20 on - 1.73 s at 200
+  against 181 for the ordinary plan; the decode route stays near 40-70 ms from 2 groups to 200,
+  1.5 to 10 times faster than the ordinary plan. The planner took the decode route wherever it was the faster,
+  a group at a time for the sum of 2 groups, and the ordinary plan for the two-column pairs,
+  which are a group at a time and lose.
+- **The kernel**: 0 to 20% (§52.5).
+
+### 52.11 Tests
+
+- `test/sql/slices_plan.sql`: every answer against the ordinary plan (the pushdown off, a
+  sequential scan) as multisets, with the plan that ran it named (`slp_q()`: from slices,
+  decoded, over keys, counts only, or no pushdown): each type of the allowlist with NULLs,
+  negatives and each type's extremes and infinities; several columns of one index at once; a
+  `WHERE` of every kind (equality, `IN`, `<>`, `NOT IN`, `IS [NOT] NULL` of the column and of
+  others, `OR`, multi-key `@>` and `&&`, a range on another column summed and as a source, an
+  equality on the sliced column, a stable expression, no row); no `WHERE`, against §37's
+  aggregates over keys; beside `count(*)`, filtered counts, a `HAVING` and expressions over the
+  aggregates; the kernel off; generic plans' parameters (an array, a range with its bounds
+  crossed, NULL) and a LATERAL rescan; deletes and updates on a dirty heap, this transaction's rows
+  at the extremes and its deletes, rolled back, and VACUUM; a `GROUP BY` of fourteen shapes each
+  way (`slp_groups()`: a group at a time, then decoded) - one column with few groups, a thousand
+  in four batches, an `IN` list's, a group of NULL, groups the `WHERE` empties of values, the
+  sliced column itself as the group, `HAVING`, two columns - again on a dirty heap with this
+  transaction's rows; EXPLAIN of each shape and EXPLAIN ANALYZE's counters (the kernel's name
+  masked); the index's pages (§52.7), the bitmap scans' prices against the same index without
+  slices; EXECUTE on `max(int4)` revoked, refused by the node as by core's Agg; the declines - a
+  column not sliced, a float column, an expression, DISTINCT, FILTER, ORDER BY, a residual
+  clause, a join, a partitioned table, a filtered count beside a `GROUP BY`, three grouping
+  columns, a grouping expression.
+- `test/isolation/slices_pushdown.spec`: the node's answers beside the same aggregates of `x + 0`,
+  which only the ordinary plan computes, in one statement: a REPEATABLE READ reader across a
+  writer's rows at every column's extremes, updates and deletes, committed, rolled back, and
+  VACUUMed under the reader's snapshot - for the one row and for each group of a `GROUP BY`,
+  decoded and a group at a time.
+- `test/sql/slices.sql` keeps §37's plan with the path off and shows the slices' plan for the
+  same query; its summed range turns the bitmap scan off (§52.7).
+- `costgucs.sql` lists the nine settings; `priv_decode.out` (`make hookcheck`) the plan's new
+  member.
+- The whole suite: 191 regression and 32 isolation tests in generic WAL mode and again with
+  the resource manager registered (`shared_preload_libraries = pg_lion`, an index built there
+  reporting `rmgr`), the injection-point specs skipped on this build as always; hookcheck's
+  `tableam`, `priv_decode` and `exec_hook` with nothing preloaded.
+
+### 52.12 Not done
+
+- **Ranges on the sliced column itself** (the task's fourth level): `x > c`, `x BETWEEN a AND b` and
+  `x <> c` as a count's SOURCE and as a FILTER of these aggregates, by O'Neil's range algorithm
+  over the slices. What it takes: at each container key of the rows that matter (the `WHERE`'s
+  copy, or E), the slices' containers read as §52.4 reads them and folded from the top bit into
+  two images, GT and EQ - for each bit, `GT |= EQ ∧ S_i` where c's bit is 0 and `EQ &= S_i` or `EQ
+  &= ¬S_i` by c's bit - two word operations a bit and a word, the range's container then GT, GT ∪
+  EQ, E ∖ (GT ∪ EQ) and so on, collected into a LionMatSet as §32's range union is
+  (`lion_range_union_*`) and spilled past the memory as it is; a source like §32's collected
+  range, pinless and counted only beside a pinned set (E itself serves), on §52.4's argument; the
+  planner offering it beside §28's walk of entries and §32's summaries for a range on a sliced
+  column, priced at nbits × the keys' words against the entries walked - which wins for a wide
+  range over a near-unique column (u4's 5 million entries) and loses to §32's summaries for a
+  narrow one; and the measurement with and without summaries the task asked for.
+- **Percentiles** (`percentile_disc(f) WITHIN GROUP (ORDER BY x)`, `percentile_cont`): the k-th
+  value by Rinfret, O'Neil and O'Neil's descent - §51.10's min descent with the rank in place of
+  the count: at bit i, `|C ∧ ¬S_i|` against the rank still to go, the bit clear and C narrowed to
+  `C ∧ ¬S_i` when the rank lies among them, set and the rank less that count otherwise; one counted
+  AND and at most one collection a bit, as a minimum. `percentile_cont` interpolates between the
+  k-th and the (k+1)-th, two descents (or one that keeps both while they agree). The planner has
+  to take an ordered-set aggregate whose argument is the column cast to `float8`
+  (`percentile_cont` has no integer form) and a constant fraction, k from the count; per group,
+  as the extremes are, and on the decode route, which would need each group's values sorted or a
+  descent per group.
+- **The decode route for two grouping columns and for an `IN` list's groups**: the pairs and the
+  listed values stay a group at a time, so `GROUP BY g, h` of many combinations goes to the
+  ordinary plan (`u4 sum, 50%, pairs 10 × 20`: 1.3 s against 437 ms). §34's decoded walk with the
+  slices beside its columns would answer it in one pass, if its tally did not spill (a dense tally
+  of the pass's combinations, whose rows go up final), or with serialized partial states below a
+  Finalize Agg.
+- **Partitioned tables, joins**: each partition answering its own needs partial states core's
+  Finalize Agg can combine - `sum(int8)` and `avg` keep `internal` states, which the node would
+  have to emit serialized (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the
+  int8 sums of `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row
+  (§27) would each need the slices - a group at a time, or decoded by fact key.
+- **The decode route on a standby**, which cannot collect the `WHERE`: a walk with the row filter
+  and the located sources would do, as §34's does without a copy.
+- **A summed range's collection for C0 is underpriced**: `u4 sum, range 10%` runs at 210 units a
+  millisecond, priced as half the summed walk where collecting the range from its summaries and
+  entries costs more; the decision there is right by a wide margin (40 ms against 167).
+- **The competitor's warm pages**: at a 0.1% `WHERE`, `min` and `max` were priced 6,746 against
+  core's index scan at 15,040 and ran 10.5 ms against 3.7 warm - core's random page cost for
+  pages that are in shared buffers is §39's to correct, not this section's.
+- **The walk's time is the cursors' page copies** (`lion_cursor_next_item()`, `memcpy()`), not the
+  counting: a cursor that reads a posting page in place under its pin would serve the slices'
+  counts, a group at a time and decoded, more than any kernel. A column asked for `count(x)` alone
+  on the decode route reads every bit slice where E would do.
+- **The slices' page estimate** (§52.7) overstates a column in heap order; an exact count would
+  need the meta page to keep the slices' pages, a format change.
+- **The plane scatter** of §51.14 (build and bulk insert) is still to do.

@@ -676,7 +676,8 @@ SELECT slc_both($$SELECT count(DISTINCT ts) FROM %s$$);
  same
 (1 row)
 
--- the aggregates over keys (§37)
+-- the aggregates over keys (§37), the slices' answer (§52) set aside
+SET pg_lion.enable_count_slices = off;
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
               QUERY PLAN               
 ---------------------------------------
@@ -691,7 +692,25 @@ SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
  same
 (1 row)
 
+RESET pg_lion.enable_count_slices;
+-- and from the slices, which this small table's costs choose (§52)
+EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slc_w1_k.g (all rows)
+   Aggregates From Slices: slc_w1_k (k: every bit counted, min descent, max descent)
+(3 rows)
+
+SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
+ slc_both 
+----------
+ same
+(1 row)
+
 -- ranges, summed from the summaries, whose walk ends where the slices begin
+-- (the bitmap scan off: the two cost about the same here)
+SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k > -150;
                     QUERY PLAN                    
 --------------------------------------------------
@@ -729,6 +748,7 @@ SELECT slc_both($$SELECT count(*) FROM %s WHERE k <> 3$$);
  same
 (1 row)
 
+RESET enable_bitmapscan;
 -- IS NOT NULL and a range by bitmap scans: a walk of the whole column
 SET pg_lion.enable_count_pushdown = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k IS NOT NULL;
