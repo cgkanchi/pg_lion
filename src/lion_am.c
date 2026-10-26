@@ -336,7 +336,7 @@ _PG_init(void)
 					  ShareUpdateExclusiveLock);
 
 	/*
-	 * DESIGN.md §50.  Bit slices: one posting set per bit of every value of
+	 * DESIGN.md §51.  Bit slices: one posting set per bit of every value of
 	 * a key column of an integer, date, time or timestamp type, from which
 	 * sum, min and max under a filter are counted without the rows.  "off"
 	 * by default - every insert into a sliced column pays a posting-set
@@ -1406,7 +1406,7 @@ lionbuildempty(Relation index)
 	}
 
 	/*
-	 * Slices (DESIGN.md §50): "on" slices every column it can encode, of an
+	 * Slices (DESIGN.md §51): "on" slices every column it can encode, of an
 	 * empty index as of a full one; the first insert makes the entries.
 	 */
 	lion_meta_record_slices(&meta, lion_settle_slices(&ix, &opts));

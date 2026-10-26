@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * lion_slice_enc.h
- *	  The encoding of a BIT-SLICED key column (DESIGN.md §50): which types a
+ *	  The encoding of a BIT-SLICED key column (DESIGN.md §51): which types a
  *	  column may be sliced for, how a value becomes the unsigned integer whose
  *	  bits the slices hold, and how the slices' entries are named.
  *
@@ -15,9 +15,11 @@
  *	  of the encodings is the type's btree order.
  *
  *	  Only c.h and the generated catalog/pg_type_d.h here, so that the next
- *	  piece of work - the planner's answers from slices and the strided plane
- *	  kernel - can unit-test the arithmetic without a server, as
- *	  lion_entryfmt.h and lion_vec_math.h are.
+ *	  piece of work - the planner's answers from slices, and the build's and
+ *	  the readers' use of the bit-plane kernel (DESIGN.md §50,
+ *	  lion_planes_scatter_strided() takes these encodings) - can unit-test
+ *	  the arithmetic without a server, as lion_entryfmt.h and lion_vec_math.h
+ *	  are.
  *
  *-------------------------------------------------------------------------
  */
@@ -31,7 +33,7 @@
 #define LION_SLICE_MAX_BITS		64
 
 /*
- * The one-byte key a SLICE entry is stored with (DESIGN.md §50, "The entry
+ * The one-byte key a SLICE entry is stored with (DESIGN.md §51, "The entry
  * and its order"): the bit position 0 .. nbits - 1, or LION_SLICE_EXISTS for
  * the existence slice, which therefore sorts after every bit slice of its
  * column.
@@ -129,7 +131,7 @@ lion_slice_decode(uint64 u, int nbits)
 /*
  * The sum of the values of n rows whose encodings sum to encsum: each
  * encoding is its value plus 2^(nbits-1).  Exact in 128 bits, which is where
- * a sum over the slices is kept (DESIGN.md §50, "The SQL function").
+ * a sum over the slices is kept (DESIGN.md §51, "The SQL function").
  */
 #ifdef HAVE_INT128
 static inline int128

@@ -274,7 +274,7 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 }
 
 /*
- * Build a SLICE entry tuple (DESIGN.md §50): the key is the one byte pos - a
+ * Build a SLICE entry tuple (DESIGN.md §51): the key is the one byte pos - a
  * bit position, or LION_SLICE_EXISTS - and the payload an ordinary INLINE
  * payload, so that once the entry exists the insert, VACUUM and count paths
  * treat it as any other.  No layout flag: the key is a byte, not a value of
@@ -631,7 +631,7 @@ lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
 }
 
 /*
- * The SLICE entry of column state at pos (DESIGN.md §50): one per position,
+ * The SLICE entry of column state at pos (DESIGN.md §51): one per position,
  * found as a reserved entry is (lion_cmp_prefix() compares the position).
  */
 bool

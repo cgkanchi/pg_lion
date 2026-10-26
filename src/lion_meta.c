@@ -302,7 +302,7 @@ void
 lion_meta_check_version(Relation index, const LionMetaPageData *meta)
 {
 	/*
-	 * Versions 14 and 15 are read: 15 is 14 with the SLICE entries of §50,
+	 * Versions 14 and 15 are read: 15 is 14 with the SLICE entries of §51,
 	 * which a build writes only when a column is sliced.  Anything older
 	 * predates a format change that moved or reinterpreted items - for
 	 * versions 6 to 8 the sparse segments of §13, for version 9 the entry
@@ -404,7 +404,7 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 						   meta->summary_tids)));
 
 	/*
-	 * The sliced columns (§50) and the version say the same thing: a
+	 * The sliced columns (§51) and the version say the same thing: a
 	 * version 15 meta page names at least one, a version 14 one none.
 	 */
 	if ((meta->version == LION_VERSION_V15) != (meta->slice_cols != 0))

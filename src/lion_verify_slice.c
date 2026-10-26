@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * lion_verify_slice.c
- *		lion_index_verify(): the bit slices (DESIGN.md §50).
+ *		lion_index_verify(): the bit slices (DESIGN.md §51).
  *
  * Part of the SQL-callable helpers of the lion index; lion_funcs.h
  * describes them and declares what their files share.
@@ -17,7 +17,7 @@
 #include "utils/tuplesort.h"
 
 /* ---------------------------------------------------------------------
- * Bit slices (DESIGN.md §50, "Verify")
+ * Bit slices (DESIGN.md §51, "Verify")
  *
  * Every slice of a sliced column must hold exactly the rows its position
  * names: bit slice i the rows under a key whose encoding has bit i set, the
@@ -476,7 +476,7 @@ lion_verify_column_slices(LionVerifyState *vs, LionState *col)
 	sc.sort = tuplesort_begin_heap(sc.desc, 1, &sortcol, &sortop, &sortcoll,
 								   &nullsfirst, workmem, NULL, TUPLESORT_NONE);
 
-	/* the keys first: a row in a slice went under its key before (§50) */
+	/* the keys first: a row in a slice went under its key before (§51) */
 	lion_verify_slice_keys(&sc);
 	lion_verify_slice_read(&sc);
 

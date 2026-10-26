@@ -1121,7 +1121,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 	{
 		if (kind < LION_KIND_SUMMARY)
 			return false;		/* the column's values, on the landing leaf */
-		/* past the open bucket: the column's slices (§50) end the phase */
+		/* past the open bucket: the column's slices (§51) end the phase */
 		if (kind > LION_KIND_SUMLAST)
 		{
 			*stop = true;
@@ -1140,7 +1140,7 @@ lion_entry_scan_selects(LionEntryScan *es, const LionEntryTuple *entry,
 
 	/*
 	 * A walk of values ends where the column's summaries begin: they sort
-	 * after its last value (§32), and its slices after them (§50).
+	 * after its last value (§32), and its slices after them (§51).
 	 */
 	if (LION_KIND_IS_DERIVED(kind))
 	{

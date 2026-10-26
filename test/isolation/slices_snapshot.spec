@@ -1,4 +1,4 @@
-# Snapshot semantics of lion_index_slice_agg() (DESIGN.md §50, "The SQL
+# Snapshot semantics of lion_index_slice_agg() (DESIGN.md §51, "The SQL
 # function").
 #
 # Every step reports the function's count, sum, min and max of the sliced

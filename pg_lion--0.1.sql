@@ -745,7 +745,7 @@ COMMENT ON FUNCTION lion_index_facets(regclass, integer, text, int2) IS
 	'the keys of a lion index column with the most visible rows under a filter of lion-indexed conditions, counted exactly';
 
 /*
- * Aggregates from bit slices (lion_slice.c, DESIGN.md §50): count(x), sum(x),
+ * Aggregates from bit slices (lion_slice.c, DESIGN.md §51): count(x), sum(x),
  * min(x) and max(x) of key column attno of a lion index built WITH (slices =
  * on), over the rows the snapshot sees that filter keeps - the filter of
  * lion_index_facets(), an AND and OR of what lion indexes answer exactly -
@@ -868,7 +868,7 @@ AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows (empty_tids, and emptydim_tids and emptyinner_tids for empty arrays with dimensions, nullelem_tids for arrays of NULLs, §17), summary posting sets, the distinct keys the planner is given, the pages of the position trees (§17), and whether the column is bit-sliced with what its slices hold (§50)';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows (empty_tids, and emptydim_tids and emptyinner_tids for empty arrays with dimensions, nullelem_tids for arrays of NULLs, §17), summary posting sets, the distinct keys the planner is given, the pages of the position trees (§17), and whether the column is bit-sliced with what its slices hold (§51)';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key

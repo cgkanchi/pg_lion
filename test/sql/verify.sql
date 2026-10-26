@@ -558,7 +558,7 @@ SET client_min_messages = warning;
 
 -- (13) the meta page's other words, each in an index of its own: sliced key
 -- columns on a version 14 page (36, the word that was the bucket count,
--- DESIGN.md §50; every reader refuses it), a WAL mode the format does not have (56), an
+-- DESIGN.md §51; every reader refuses it), a WAL mode the format does not have (56), an
 -- order flag it does not have (bit 8 of 60), and its two counts of pages -
 -- the directory's (52), which can be no page at all or fewer than the
 -- directory walk finds (lion_vfy_badd's has a root and six leaves), and the

@@ -390,7 +390,7 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 	}
 	else if (LionEntryIsReserved(entry) || LionEntryIsSlice(entry))
 	{
-		/* ... nor a slice (§50), whose one-byte key is not the column's */
+		/* ... nor a slice (§51), whose one-byte key is not the column's */
 		ps->storedkey = (Datum) 0;
 		ps->hasstoredkey = false;
 	}

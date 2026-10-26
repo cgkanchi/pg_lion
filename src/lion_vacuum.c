@@ -1599,7 +1599,7 @@ summary_gone:
 
 		/*
 		 * the key where an entry of its column has it (lion_entryfmt.h); a
-		 * slice's one byte is at the header's end (DESIGN.md §50)
+		 * slice's one byte is at the header's end (DESIGN.md §51)
 		 */
 		if (ent->attno >= 1 && ent->attno <= vs->ix->ncolumns &&
 			ent->kind != LION_KIND_SLICE)

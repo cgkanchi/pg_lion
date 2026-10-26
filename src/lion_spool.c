@@ -207,7 +207,7 @@ static inline bool lion_acc_equal(struct LionAccCol *col,
 #define LION_ACC_NRESERVED	LION_NRESERVED
 
 /*
- * The SLICE entries a bit-sliced column may have (DESIGN.md §50), at their
+ * The SLICE entries a bit-sliced column may have (DESIGN.md §51), at their
  * index (lion_slice_pos_index()): one per bit of its encoding and the
  * existence slice.  Like the reserved entries they are found by position, not
  * through the table, and come out after the values, in position order.
@@ -224,7 +224,7 @@ typedef struct LionAccCol
 	lionacc_hash *table;		/* the VALUE entries */
 	LionAccEntry *reserved[LION_ACC_NRESERVED];	/* the reserved entries, if
 												 * any */
-	LionAccEntry *slices[LION_ACC_NSLICES]; /* its SLICE entries (§50) */
+	LionAccEntry *slices[LION_ACC_NSLICES]; /* its SLICE entries (§51) */
 	char	   *arena;
 	Size		arenafree;
 	Size		arenablock;		/* the size of an arena block */
@@ -597,7 +597,7 @@ lion_acc_new_entry(LionAccCol *col, int kind, Datum key, uint32 hash,
 	e->keylen = 0;
 	if (kind == LION_KIND_SLICE)
 	{
-		/* the key is the position byte (DESIGN.md §50), which key carries */
+		/* the key is the position byte (DESIGN.md §51), which key carries */
 		uint8	   *raw = lion_acc_alloc(col, LION_SLICE_KEYLEN);
 
 		*raw = DatumGetUInt8(key);
@@ -754,7 +754,7 @@ lion_acc_add_reserved(LionSpool *sp, LionAccCol *col, int kind, uint64 code)
 
 /*
  * A row's code in the SLICE entry at index idx of a bit-sliced column
- * (DESIGN.md §50).  Not a key the budget counts by itself: a row brings at
+ * (DESIGN.md §51).  Not a key the budget counts by itself: a row brings at
  * most LION_ACC_NSLICES of them, and the budget is checked at every heap page.
  */
 static inline void
@@ -775,11 +775,12 @@ lion_acc_add_slice(LionAccCol *col, int idx, uint64 code)
  * One row's slices: its code in the slice of every bit its value's encoding
  * has set, and in the existence slice.
  *
- * THE SEAM for the plane kernel (DESIGN.md §50, "Not done"): this is one
- * row's bits taken one at a time.  A build that transposes 64 rows' values
- * into 64 bit-plane words at once (src/lion_planes.[ch], in progress) will
- * replace it with a word per plane and container key, appended as whole
- * bitset items - the dedicated route the section describes.
+ * THE SEAM for the plane kernel (DESIGN.md §50, §51 "Not done"): this is
+ * one row's bits taken one at a time.  A build that keeps a container key's
+ * values and turns them into slice words at once
+ * (lion_planes_scatter_strided(values, n, nbits, planes), src/lion_planes.c)
+ * will replace it with a BITSET item per slice and container key, appended
+ * as whole items - the dedicated route the section describes.
  */
 static void
 lion_acc_add_slices(LionAccCol *col, Datum key, uint64 code)
@@ -864,7 +865,7 @@ lion_sortitem_cmp(const void *a, const void *b, void *arg)
 /*
  * A column's entries in directory order: the reserved entries (NULL, EMPTY,
  * EMPTYDIM, EMPTYINNER, NULLELEMS), then the values, then the slices of a
- * bit-sliced column in position order (DESIGN.md §50).  *flagsp gets
+ * bit-sliced column in position order (DESIGN.md §51).  *flagsp gets
  * LION_RUN_TIED for every value whose successor ties with it on the prefix,
  * or NULL when none does.
  *
@@ -1005,7 +1006,7 @@ lion_acc_sorted(LionAccCol *col, uint8 **flagsp, int *np)
 		}
 	}
 
-	/* ... and the slices after the values, in position order (§50) */
+	/* ... and the slices after the values, in position order (§51) */
 	n = nvals;
 	for (i = 0; i < LION_ACC_NSLICES; i++)
 	{
@@ -1519,7 +1520,7 @@ lion_cursor_next_record(LionRunCursor *c)
 		}
 		lion_tape_read(c->tape, c->keybuf, h.keylen);
 		c->raw = c->keybuf;
-		/* a slice's key is its position byte, not a value (§50) */
+		/* a slice's key is its position byte, not a value (§51) */
 		c->key = (h.kind == LION_KIND_SLICE) ? (Datum) 0 :
 			lion_fetch_key(c->state, c->keybuf);
 	}
@@ -1762,7 +1763,7 @@ lion_merge_prefix_cmp(LionMerge *m, const LionRunCursor *x,
 {
 	if (x->kind != y->kind)
 		return x->kind < y->kind ? -1 : 1;
-	if (x->kind == LION_KIND_SLICE)	/* by position (DESIGN.md §50) */
+	if (x->kind == LION_KIND_SLICE)	/* by position (DESIGN.md §51) */
 		return (*(const uint8 *) x->raw > *(const uint8 *) y->raw) -
 			(*(const uint8 *) x->raw < *(const uint8 *) y->raw);
 	if (x->kind != LION_KIND_VALUE)
@@ -2535,7 +2536,7 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 
 			lion_acc_add(sp, col, key, code, NULL);
 
-			/* ... and a sliced column's bits (DESIGN.md §50) */
+			/* ... and a sliced column's bits (DESIGN.md §51) */
 			if (cs->sliced)
 				lion_acc_add_slices(col, key, code);
 		}

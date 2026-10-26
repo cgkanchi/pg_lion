@@ -135,7 +135,7 @@
 #define LION_ENTRY_EMPTYINNER	0x2000
 
 /*
- * SLICE entries (DESIGN.md §50, format version 15).  A bit-sliced column keeps,
+ * SLICE entries (DESIGN.md §51, format version 15).  A bit-sliced column keeps,
  * after its VALUE entries and its summaries, one entry per bit position of
  * its values' encoding (lion_slice_enc.h) whose posting set is the rows with
  * that bit set, and one EXISTENCE slice of every row not NULL.  Its key is
@@ -158,7 +158,7 @@
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
  * The kinds whose posting sets are DERIVED from the column's rows rather than
- * a key's own - the summaries of §32 and the slices of §50 - and which sort
+ * a key's own - the summaries of §32 and the slices of §51 - and which sort
  * after every VALUE entry of their column.
  */
 #define LION_ENTRY_DERIVED	(LION_ENTRY_SUMKINDS | LION_ENTRY_SLICE)

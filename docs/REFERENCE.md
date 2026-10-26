@@ -15,6 +15,7 @@ and these functions are for testing, diagnostics and the occasional direct count
     lion_index_count_stats(idx, key)                lion_index_count() plus the heap it visited
     lion_index_count_group_stats(idx [, use_cache, attno])   every group's count, as GROUP BY does
     lion_index_facets(idx [, k, filter, attno])     the k keys with the most rows under a filter (below)
+    lion_index_slice_agg(idx [, filter, attno])     count, sum, min and max of a bit-sliced column (below)
     lion_index_stats(idx)                           the index's shape, one row per key column
     lion_index_verify(idx [, heapallindexed])       structural check, optionally against the heap
     lion_index_wal_mode(idx)                        'generic' or 'rmgr' (DESIGN.md §25)
@@ -124,6 +125,44 @@ count functions' are, after deletes and updates VACUUM has not yet cleaned up in
   debug1` shows the entries read, the keys counted, the rows read and the keys sorted past
   `work_mem`.
 - A partial index counts the rows it holds. An expression index's keys are the expression's.
+
+### Aggregates from bit slices (DESIGN.md §51)
+
+    lion_index_slice_agg(idx regclass, filter text DEFAULT NULL, attno int2 DEFAULT 1,
+                         OUT count bigint, OUT sum numeric, OUT min text, OUT max text)
+
+`count(x)`, `sum(x)`, `min(x)` and `max(x)` of key column `attno` of `idx`, an index built `WITH
+(slices = on)` (below, "Reloptions"), over the rows the caller's snapshot sees that `filter` keeps,
+counted from the column's bit slices without reading a row:
+
+```sql
+SELECT count(x), sum(x), min(x)::text, max(x)::text FROM t WHERE <filter>;
+```
+
+`count` is from the column's existence slice (its rows not NULL), `sum` from the rows in each bit's
+slice, `min` and `max` by a descent from the top bit, one counted AND a bit. `sum` is a `numeric`
+whatever the column's type, computed in 128 bits, so an `int8` column's sum past `int8`'s range is
+exact; it is NULL for a `date`, `time`, `timestamp` or `timestamptz` column, whose types have no
+`sum`, and NULL with `min` and `max` when no row is counted (`count` 0). `min` and `max` are the
+column type's text output, infinities included. The answers are exact under the snapshot, as the
+count functions' are: deletes and updates VACUUM has not cleaned up yet, and the caller's own
+uncommitted rows, are what the query would see.
+
+- **The filter** is `lion_index_facets()`'s, with the same rules and errors (an AND and OR of
+  equalities, `IN` lists, `IS NULL` and the multi-key operators that Lion indexes answer exactly;
+  anything else is an ERROR naming the condition, never a scan), collected once and ANDed with each
+  slice. `NULL` (the default) and `'true'` keep every row.
+- **Privileges** are those of the query it stands for: SELECT on the column and on every column the
+  filter reads, EXECUTE on `count`, `sum`, `min` and `max` of the column's type and on the filter's
+  operators, no row-level security in force; an index that is not valid, or that the caller's
+  snapshot may not use, is refused, and a SERIALIZABLE caller takes the predicate locks an index
+  scan would.
+- **Refused**: a key column that is not sliced - built without `slices = on`, or of a type that is
+  not sliced (the error says which) - and a multi-key column.
+- A partial index answers for the rows it holds (`... WHERE <predicate> AND <filter>`). `SET
+  client_min_messages = debug1` shows the slices counted and the descent's steps.
+- The planner does not use slices yet: `SELECT sum(x) ... WHERE ...` takes its ordinary plan. The
+  LionCount pushdown of `sum`, `avg`, `min`, `max` and ranges from slices is the next step.
 
 
 ## Key types
@@ -523,6 +562,21 @@ grows by splitting and has nothing to size, so an index built with any value is 
 without it. A value above 0 is answered with a NOTICE saying so when it is set, by `CREATE INDEX`
 or `ALTER INDEX ... SET`; a value outside the range is an error, as for any reloption.
 `fillfactor` is what decides how full the build packs the directory's leaves.
+`slices` (`on` | `off`, default `off`): bit slices of every integer, date, time and timestamp key
+column (DESIGN.md §51). A sliced column keeps, after its keys and their summaries, one posting set
+per bit of its values - the rows whose value, as a signed integer of the type's width with the sign
+bit flipped, has that bit set: 16 for `int2`, 32 for `int4` and `date`, 64 for `int8`, `time`,
+`timestamp` and `timestamptz` - and one of its rows that are not NULL; `lion_index_slice_agg()`
+counts `sum`, `min` and `max` under a filter from them. A key column of any other type (`oid`,
+`float4`, `float8`, `numeric`, `interval`, text, arrays, ...) is simply not sliced, and
+`lion_index_stats().sliced` says which are. Every insert into a sliced column also puts the row
+into the slice of each bit its value has set - about half the bits for values spread over the type,
+so some 17 posting-set inserts for an `int4`, 33 for an `int8` - which is the price of the option
+(measured in DESIGN.md §51); the slices of a dense column are mostly bitsets, which an insert
+changes in place. Read at build time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes
+effect at the next REINDEX. An index with a sliced column is on-disk format 15, which a build of
+pg_lion before this option refuses; one without stays format 14, readable by both - so REINDEX with
+`slices = off` before going back to an older build.
 `summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
 With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
 consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their
@@ -611,7 +665,11 @@ position trees (an index built with `store_positions`, DESIGN.md §17), which `c
 `posting_internal_pages` and `max_posting_height` leave out, and, last, `emptydim_tids` and
 `emptyinner_tids`, the rows whose array has no element but has dimensions, which `empty_tids` leaves
 out: an empty array whose first dimension has length 0 (an empty `int2vector` or `oidvector` cast
-to `int2[]` or `oid[]`), and one whose first dimension has a length and an inner one none.  `slack_bytes` and
+to `int2[]` or `oid[]`), and one whose first dimension has a length and an inner one none; then
+`sliced`, whether the column keeps bit slices (DESIGN.md §51), and `slice_entries`, `slice_tids`,
+`slice_bytes` and `slice_pages`, what its slices hold - their entries (a bit's or the existence
+slice's), the rows in them counted once a slice, the bytes of their items and their posting pages -
+which the other counters leave out, as they leave out the summaries'.  `slack_bytes` and
 `inline_slack_bytes` are the growth slack inserts leave inside items and inside INLINE entry
 payloads (DESIGN.md §4), which is space a later insert into the same key grows into for free; a
 bulk-built index has none of either unless it was built with `build_slack`.  The counters that describe the
@@ -1340,7 +1398,8 @@ and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "
 - `idx_scan` and `last_idx_scan`: a scan of each index a node or function reads, each time it reads
   it, a rescan with another parameter included: `LionCount` in all its forms, `LionSemiJoin`,
   `LionAntiJoin`, `LionOrdered`, `LionBtreeScan`, `LionBm25`, `lion_index_count()`,
-  `lion_index_count_any()`, `lion_index_count_group_stats()`, `lion_index_facets()`, `lion_bm25()`,
+  `lion_index_count_any()`, `lion_index_count_group_stats()`, `lion_index_facets()`,
+  `lion_index_slice_agg()`, `lion_bm25()`,
   and `lion_bm25_score()`, which reads the index's statistics once a query. The B-tree that
   `LionOrdered` or `LionBtreeScan` walks is counted by PostgreSQL, as its own scans are. A
   partitioned table's partitions count their own indexes.
@@ -1407,6 +1466,12 @@ one generic-mode index falls back to rechecking everything, because the interloc
 every source it intersects. The SQL count functions require SELECT
 on the table or on the indexed columns and refuse tables where row-level security applies to the
 caller; the pushdown only uses an index whose collation matches the clause or grouping collation.
+Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, `date`, `time`,
+`timestamp` and `timestamptz` key columns only - not `oid`, whose order is unsigned, nor floats,
+`numeric` or `interval` - for every such column of the index or none (the option is the index's,
+not a column's), and are read only by `lion_index_slice_agg()`: the planner does not answer `sum`,
+`avg`, `min`, `max` or ranges from them yet. An insert into a sliced column costs a posting-set
+insert per set bit of its value.
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
 the planner prices them out and declines the count pushdown and `LionOrdered` - a filtered

@@ -667,7 +667,7 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 	}
 
 	/*
-	 * A slice, or a pivot made from one (§50): its key is one byte, a bit
+	 * A slice, or a pivot made from one (§51): its key is one byte, a bit
 	 * position of its column's width or the existence slice's, and its
 	 * column is one the meta page says is sliced - which is what the order
 	 * checks and the rest of the check can then rely on.
@@ -691,7 +691,8 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 						RelationGetRelationName(vs->index), off, blk, pos,
 						item->attno, col->slicebits);
 		if ((item->flags & (LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS |
-							LION_ENTRY_POSITIONS | LION_ENTRY_ALIGNKEY)) != 0)
+							LION_ENTRY_POSITIONS | LION_ENTRY_ALIGNKEY)) != 0 ||
+			(item->flags & ~(uint16) LION_ENTRY_ALLFLAGS) != 0)
 			lion_corrupt("lion index \"%s\": slice item %u on block %u has flags 0x%04X, which no slice has",
 						RelationGetRelationName(vs->index), off, blk,
 						item->flags);
@@ -3957,7 +3958,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	else if (LionEntryIsSlice(entry))
 	{
 		/*
-		 * A slice (§50): what lion_verify_dir_item() checked of its key and
+		 * A slice (§51): what lion_verify_dir_item() checked of its key and
 		 * column, and a kind of its own - one of the others' flags beside
 		 * it would make it two kinds.  What it holds is checked by
 		 * lion_verify_slices() once the structure is known to be sound.
@@ -4296,7 +4297,7 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	 */
 	lion_verify_summaries(&vs);
 
-	/* ... and what the bit slices hold (DESIGN.md §50) */
+	/* ... and what the bit slices hold (DESIGN.md §51) */
 	lion_verify_slices(&vs);
 
 	/*

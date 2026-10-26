@@ -163,6 +163,15 @@ map calls all-visible - as after a `VACUUM` - the rows of each key are the count
 and nothing else is read; a `VACUUM` that removes rows from the index while the walk runs, or a
 table that is not all-visible, has each key's rows counted instead.
 
+With a `WHERE`, an integer, date, time or timestamp column indexed `WITH (slices = on)` keeps one
+posting set per bit of its values, and `SELECT * FROM lion_index_slice_agg('events_amount',
+'country = ''JP''')` answers `count`, `sum`, `min` and `max` of the column under that filter from
+those sets alone, exactly, without reading the rows (DESIGN.md §51; the filter is
+`lion_index_facets()`'s). The price is an insert into each set bit's set on every write of the
+column. The planner does not use the slices yet - `SELECT sum(amount) FROM events WHERE ...` takes
+its ordinary plan - and answering `sum`, `avg`, `min`, `max` and ranges from them in the `LionCount`
+pushdown is coming.
+
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
 except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,

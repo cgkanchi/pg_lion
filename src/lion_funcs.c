@@ -108,7 +108,7 @@ typedef struct LionColStats
 	int64		summary_pages;
 
 	/*
-	 * SLICE entries (DESIGN.md §50), counted apart for the same reason: the
+	 * SLICE entries (DESIGN.md §51), counted apart for the same reason: the
 	 * bit slices and the existence slice of a sliced column, their rows (a
 	 * row once per bit its value has set, and once more in the existence
 	 * slice), the bytes of their items and the posting pages of those too
@@ -120,7 +120,7 @@ typedef struct LionColStats
 	int64		slice_pages;
 } LionColStats;
 
-/* Whose a posting set is: a key's, a summary's (§32) or a slice's (§50). */
+/* Whose a posting set is: a key's, a summary's (§32) or a slice's (§51). */
 #define LION_STATS_SET_KEY		0
 #define LION_STATS_SET_SUMMARY	1
 #define LION_STATS_SET_SLICE	2
@@ -146,7 +146,7 @@ typedef struct LionStats
 	int			ncolumns;
 	LionColStats *cols;			/* [ncolumns] */
 	bool	   *ordered;		/* [ncolumns]: the column's own opclass (§21) */
-	bool	   *sliced;			/* [ncolumns]: the column is bit-sliced (§50) */
+	bool	   *sliced;			/* [ncolumns]: the column is bit-sliced (§51) */
 	HTAB	   *sets;			/* head block -> LionSetStats, or NULL */
 	LionMetaNdistinct nd;		/* the key counts on the meta page (§33) */
 } LionStats;
@@ -323,7 +323,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 
 		/*
 		 * A column's posting pages are its own for a single-column index -
-		 * unless it has summaries (DESIGN.md §32) or slices (§50), whose
+		 * unless it has summaries (DESIGN.md §32) or slices (§51), whose
 		 * pages are counted apart and are known only through the entries
 		 * that own them.
 		 */
@@ -405,7 +405,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					cs = &st->cols[entry->attno - 1];
 
 					/*
-					 * A summary (DESIGN.md §32) or a slice (§50) is counted
+					 * A summary (DESIGN.md §32) or a slice (§51) is counted
 					 * apart.
 					 */
 					if (LionEntryIsDerived(entry))
