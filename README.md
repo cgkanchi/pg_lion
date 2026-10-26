@@ -31,7 +31,8 @@ faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (Li
 
 **Status: beta.** It works on PostgreSQL 16 through 19 and master, and CI tests every one of them
 in both WAL modes, with crash recovery and standby replay. The on-disk format may still change
-before 1.0; a release that changes it will say so, and the indexes will need a `REINDEX`.
+before 1.0; a release that changes it will say so, and the indexes will need a `REINDEX`. Until
+then queries run without them (each backend warns once), and inserts into their tables fail.
 
 ## When to use it
 

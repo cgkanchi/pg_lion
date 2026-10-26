@@ -7910,6 +7910,38 @@ offsets, its long jsonb keys looked for in the wrong form, (version 11) its dire
 any height, or (version 13) its empty arrays with dimensions are in the EMPTY entry and its meta
 page may carry the NARROW flag this format does not have.
 
+### An index of another format
+
+Refused by its readers, such an index was still planned with, and the planner reads lion indexes
+for its estimates whether or not the plan uses them - a column's n_distinct from the meta page
+(§33), a range's entries, the directory's pages (§27). So once a build of another format was
+installed, every query that so much as estimated a column such an index covers failed with the
+index's error until it was rebuilt: a count by another column, through the count pushdown's look at
+the indexed one, a GROUP BY of it, a join on it. The hook that follows `get_relation_info()` -
+`get_relation_info_hook`, and from PostgreSQL 19, which replaced it, `build_simple_rel_hook` - now
+leaves such an index out of `rel->indexlist` (`lion_drop_other_format()`, lion_am.c), as the planner
+leaves out an index that is not valid - the hook's documented use, removing an index: no path
+of core's or lion's reads it, and the table's queries run without it, by core's plans. The backend
+warns of it once (an OID list in TopMemoryContext), so that a query slower than it was says why.
+Its readers refuse it as before - an insert into the table, VACUUM, `lion_index_verify()` and the
+SQL functions - so that a table written to cannot go on without its index unnoticed, and a REINDEX
+gives it back to the planner.
+
+- *Which index.* `lion_index_other_format()` (lion_meta.c) reads the meta page as `lion_read_meta()`
+  does - a special area of another size still read for its magic and version - and says yes only to
+  lion's magic with a version not this build's: a damaged meta page is not another format, and its
+  readers' errors stand. Not a partitioned index, which has no storage, nor a hypothetical one.
+- *Its cost.* One pin and a share lock of the meta page per lion index of each relation planned,
+  none for an index whose state the backend has built (`rd_amcache`): that state was read through the
+  version check, and a library of another format is loaded only by a new backend.
+- *Loading.* When the library is not preloaded it is loaded inside the `get_relation_info()` that
+  opens the first lion index, and `_PG_init` installs the hook before that call reaches it: the table
+  that brought the library in is the first the hook sees.
+
+test/sql/corrupt_items.sql, section 10: an index whose meta page says version 13, in a new backend -
+the warning, the count, a GROUP BY and a join on the column planned without it, an insert refused,
+and after the REINDEX the index planned again.
+
 ### The order
 
     KEY COLUMN (§24), then kind (MINF < NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < VALUE),
