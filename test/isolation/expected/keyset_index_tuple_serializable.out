@@ -1,0 +1,60 @@
+Parsed test spec with 2 sessions
+
+starting permutation: s1_plan s1_begin s2_begin s1_read s2_read s2_update s1_insert s1_commit s2_commit
+step s1_plan: EXPLAIN (COSTS OFF) SELECT f.id, f.fk FROM kcpc f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kib WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3;
+QUERY PLAN                           
+-------------------------------------
+Limit                                
+  ->  Custom Scan (LionOrderedJoin)  
+        Ordered By: kcpc_rank        
+        Dimension: kco d via kco_pkey
+        Key Sets: kib                
+        Key Sets Tested On: kcpc_rank
+        ->  Seq Scan on kib          
+              Filter: (prod = 1)     
+(8 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT f.id, f.fk FROM kcpc f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kib WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3;
+  id|fk
+----+--
+1972| 5
+1944| 9
+1943| 2
+(3 rows)
+
+step s2_read: SELECT count(*) FROM kib WHERE prod = 9;
+count
+-----
+    0
+(1 row)
+
+step s2_update: UPDATE kcpc SET fk = 1 WHERE id = 2000;
+step s1_insert: INSERT INTO kib VALUES (5, 9);
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
+starting permutation: s1_begin s2_begin s1_read s2_read s2_update s2_commit s1_insert s1_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_read: SELECT f.id, f.fk FROM kcpc f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kib WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3;
+  id|fk
+----+--
+1972| 5
+1944| 9
+1943| 2
+(3 rows)
+
+step s2_read: SELECT count(*) FROM kib WHERE prod = 9;
+count
+-----
+    0
+(1 row)
+
+step s2_update: UPDATE kcpc SET fk = 1 WHERE id = 2000;
+step s2_commit: COMMIT;
+step s1_insert: INSERT INTO kib VALUES (5, 9);
+ERROR:  could not serialize access due to read/write dependencies among transactions
+step s1_commit: COMMIT;

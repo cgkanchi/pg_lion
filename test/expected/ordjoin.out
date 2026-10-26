@@ -677,9 +677,10 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk 
                Dimension Lion Cond: (d.lvl < 10)
                Dimension Lion Indexes: dim_lvl
                Key Sets: flt, fltn
+               Key Sets Tested On: fact_grp_score
                Index Entries Walked: 79598
                Lion Set Hits: 19944
-               Heap Fetches: 19944
+               Heap Fetches: 191
                Lion Set: 89 containers, exact
                Key Set Keys: 13001
                Key Set Builds: 2
@@ -693,7 +694,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk 
                      Filter: (x < 3)
                      Rows Removed by Filter: 23333
                ->  Seq Scan on fltn
-(30 rows)
+(31 rows)
 
 SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
 	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
@@ -776,9 +777,10 @@ SELECT * FROM oj_run('SELECT v.l, s.* FROM (VALUES (1), (2), (2), (1)) v(l),
                      Dimension Lion Cond: (d.lvl = 3)
                      Dimension Lion Indexes: dim_lvl
                      Key Sets: flt
+                     Key Sets Tested On: fact_grp_score
                      Index Entries Walked: 328794
                      Lion Set Hits: 82302
-                     Heap Fetches: 82302
+                     Heap Fetches: 2750
                      Lion Set: 89 containers, exact
                      Key Set Keys: 3334
                      Key Set Builds: 4
@@ -791,7 +793,7 @@ SELECT * FROM oj_run('SELECT v.l, s.* FROM (VALUES (1), (2), (2), (1)) v(l),
                      ->  Seq Scan on flt
                            Filter: (x = "*VALUES*".column1)
                            Rows Removed by Filter: 30000
-(31 rows)
+(32 rows)
 
 -- ... a semi join's keys repeated, held once each; and what is not a key
 --     set: an inner join to a column that is not unique, which repeats the
@@ -1534,13 +1536,14 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d 
                      Dimension Lion Cond: (d.lvl < 30)
                      Dimension Lion Indexes: dim_lvl
                      Key Sets: flt
-                     Index Entries Walked: 181192
-                     Lion Set Hits: 45347
-                     Heap Fetches: 45347
+                     Key Sets Tested On: fact_grp_score
+                     Index Entries Walked: 181252
+                     Lion Set Hits: 45407
+                     Heap Fetches: 4498
                      Lion Set: 89 containers, exact
                      Key Set Keys: 10001
                      Key Set Builds: 1
-                     Keys Rejected by Key Sets: 40406
+                     Keys Rejected by Key Sets: 40466
                      Dimension Descents: 4498
                      Dimension Lion Set Hits: 621
                      Dimension Heap Fetches: 621
@@ -1548,7 +1551,7 @@ SELECT * FROM oj_run('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d 
                      ->  Seq Scan on flt
                            Filter: (x < 3)
                            Rows Removed by Filter: 23333
-(32 rows)
+(33 rows)
 
 -- ... a rescan, the dimension's set made again for each outer row's value,
 --     once however many arms the row runs (seven rows, two arms each: 7

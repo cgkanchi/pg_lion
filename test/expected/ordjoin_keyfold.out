@@ -8,11 +8,13 @@
 -- never fetched; without one, the walk fetches every member of its set to
 -- read its key, and the key set rejects it after the fetch, which the price
 -- charges at the pages of the fetches the LIMIT's share makes.  The fact's
--- B-tree here orders by a rank and does not hold the key.  Each query is run
--- through the node (lion's paths priced at a thousandth) and through core's
--- plan with the node off, and the two answers compared row by row in order;
--- every ORDER BY ends in a unique key.  What is chosen with nothing forced is
--- printed as the node's name, or core's, without the plan.
+-- B-tree here orders by a rank and does not hold the key, until section 6,
+-- where it does and the key sets are tested on its index tuples before the
+-- fetch.  Each query is run through the node (lion's paths priced at a
+-- thousandth) and through core's plan with the node off, and the two answers
+-- compared row by row in order; every ORDER BY ends in a unique key.  What is
+-- chosen with nothing forced is printed as the node's name, or core's,
+-- without the plan.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -71,10 +73,10 @@ VACUUM (FREEZE, ANALYZE) ib;
 VACUUM (FREEZE, ANALYZE) ibdup;
 /*
  * okf_kind() says what the plan of q is: LionOrderedSplit, LionOrderedJoin
- * or core's, its key sets, and the index they are folded into.  okf() runs q
- * through the node - lion's paths priced at a thousandth - and through
- * core's plan (the node off), compares the two answers in order, and says
- * what the first plan was.  okf_run() runs q through the node under EXPLAIN
+ * or core's, its key sets, and the index they are folded into or tested on.
+ * okf() runs q through the node - lion's paths priced at a thousandth - and
+ * through core's plan (the node off), compares the two answers in order, and
+ * says what the first plan was.  okf_run() runs q through the node under EXPLAIN
  * ANALYZE and prints the lines asked for, their counters.
  */
 CREATE FUNCTION okf_kind(q text) RETURNS text
@@ -85,6 +87,7 @@ DECLARE
 	split boolean := false;
 	keys text := '';
 	fold text := '';
+	tested text := '';
 BEGIN
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
 		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
@@ -99,11 +102,14 @@ BEGIN
 		IF ln ~ '^\s*Key Set Index: ' THEN
 			fold := regexp_replace(ln, '^\s*Key Set Index: ', ' in ');
 		END IF;
+		IF ln ~ '^\s*Key Sets Tested On: ' THEN
+			tested := regexp_replace(ln, '^\s*Key Sets Tested On: ', ' tested on ');
+		END IF;
 	END LOOP;
 	RETURN CASE WHEN split THEN 'LionOrderedSplit'
 				WHEN used THEN 'LionOrderedJoin'
 				ELSE 'core''s plan' END ||
-		CASE WHEN keys <> '' THEN format(' (key sets: %s%s)', keys, fold)
+		CASE WHEN keys <> '' THEN format(' (key sets: %s%s%s)', keys, fold, tested)
 			 ELSE '' END;
 END $$;
 CREATE FUNCTION okf(q text) RETURNS text
@@ -411,6 +417,144 @@ SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
 (1 row)
 
 RESET pg_lion.enable_key_set_fold;
+-- 6. The fact's B-tree holds the key - an INCLUDE column here - and no lion
+--    index does (§47.6, "Tested on the index tuple"): the walk tests the key
+--    sets on its index tuples before it fetches, and an entry they reject is
+--    turned away unfetched - Heap Fetches the rows they keep, Keys Rejected
+--    by Key Sets the rest - and with nothing forced the split is the plan.
+DROP INDEX cpc_fk;
+DROP INDEX cpc_rank;
+CREATE INDEX cpc_rank ON cpc (rank DESC) INCLUDE (fk);
+ANALYZE cpc;
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                             okf                             
+-------------------------------------------------------------
+ LionOrderedSplit (key sets: ib tested on cpc_rank), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Switched)');
+             okf_run              
+----------------------------------
+ Arms Run: 1
+ Key Sets: ib
+ Key Sets Tested On: cpc_rank
+ Index Entries Walked: 18275
+ Heap Fetches: 55
+ Key Set Keys: 60
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 18043
+(8 rows)
+
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                      okf_kind                      
+----------------------------------------------------
+ LionOrderedSplit (key sets: ib tested on cpc_rank)
+(1 row)
+
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                      okf_kind                      
+----------------------------------------------------
+ LionOrderedSplit (key sets: ib tested on cpc_rank)
+(1 row)
+
+-- ... repeated keys and NULLs, a NULL key in the index tuple turned away as
+--     the strict clause turns it away; two key sets; a key set rebuilt for
+--     each row of a LATERAL rescan, its keys tested anew.
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ibdup)
+	ORDER BY f.rank DESC, f.id LIMIT 30$$);
+                              okf                              
+---------------------------------------------------------------
+ LionOrderedJoin (key sets: ibdup tested on cpc_rank), 30 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ibdup)
+	ORDER BY f.rank DESC, f.id LIMIT 30$$,
+	'^\s*(Key Set|Keys Rejected|Heap Fetches)');
+             okf_run              
+----------------------------------
+ Key Sets: ibdup
+ Key Sets Tested On: cpc_rank
+ Heap Fetches: 31
+ Key Set Keys: 40
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 15066
+(6 rows)
+
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                                 okf                                  
+----------------------------------------------------------------------
+ LionOrderedSplit (key sets: ibdup x, ib tested on cpc_rank), 20 rows
+(1 row)
+
+SELECT okf($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
+	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+			  ORDER BY f.rank DESC LIMIT 100) s
+	ORDER BY v.p, s.rank DESC, s.id$$);
+                             okf                             
+-------------------------------------------------------------
+ LionOrderedJoin (key sets: ib tested on cpc_rank), 200 rows
+(1 row)
+
+-- ... MVCC: a fact row's key changed in the transaction - never a HOT update,
+--     the key being in the index, so the old index tuple holds the old key
+--     and a new one the new - a row inserted with a key of the set, and rows
+--     of the set's keys updated HOT, their index tuples' key their new
+--     versions' too: all found as core's plan finds them.
+BEGIN;
+UPDATE cpc SET fk = 1 + 331 WHERE id = 5;
+INSERT INTO cpc VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
+UPDATE cpc SET note = 'hot' WHERE fk IN (SELECT fk FROM ib WHERE prod = 7) AND id % 2 = 0;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                            okf                             
+------------------------------------------------------------
+ LionOrderedJoin (key sets: ib tested on cpc_rank), 20 rows
+(1 row)
+
+ROLLBACK;
+-- ... and the key a key column of the B-tree, after the rank it orders by
+DROP INDEX cpc_rank;
+CREATE INDEX cpc_rank ON cpc (rank DESC, fk);
+ANALYZE cpc;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                            okf                             
+------------------------------------------------------------
+ LionOrderedJoin (key sets: ib tested on cpc_rank), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Key Set|Keys Rejected|Index Entries Walked|Heap Fetches)');
+             okf_run             
+---------------------------------
+ Key Sets: ib
+ Key Sets Tested On: cpc_rank
+ Index Entries Walked: 5142
+ Heap Fetches: 21
+ Key Set Keys: 60
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 5076
+(7 rows)
+
 SET client_min_messages = warning;
 DROP SCHEMA ojfold CASCADE;
 RESET client_min_messages;
