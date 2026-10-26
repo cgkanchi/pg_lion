@@ -249,6 +249,41 @@ lion_read_meta_ndistinct(Relation index, LionMetaNdistinct *nd)
 }
 
 /*
+ * Is the index of another on-disk format than this build's: a meta page that
+ * lion_read_meta() would refuse for its version alone, its magic lion's?  For
+ * the planner, which leaves such an index out of its view
+ * (lion_get_relation_info(), DESIGN.md §21, "An index of another format")
+ * where every reader of it refuses it.  A damaged meta page is not one, and
+ * its readers' errors stand.  Read as lion_read_meta() reads the page: a
+ * special area of another size is still read for its magic and version.
+ */
+bool
+lion_index_other_format(Relation index)
+{
+	Buffer		buf;
+	Page		page;
+	uint16		special;
+	bool		other = false;
+
+	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	special = PageIsNew(page) ? 0 : PageGetSpecialSize(page);
+	if (!PageIsNew(page) &&
+		(special != LION_SPECIAL_SIZE ||
+		 (LionPageIsMeta(page) &&
+		  LionPageGetOpaque(page)->page_id == LION_PAGE_ID)))
+	{
+		LionMetaPageData *meta = LionPageGetMeta(page);
+
+		other = meta->magic == LION_MAGIC &&
+			meta->version != LION_VERSION_V14;
+	}
+	UnlockReleaseBuffer(buf);
+	return other;
+}
+
+/*
  * Refuse a meta page of another format: its magic and version, as
  * lion_read_meta() reads them.
  *
