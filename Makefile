@@ -142,8 +142,12 @@ test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test t
 .PHONY: .lion-force-unit
 endif
 
-test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
+# The container library picks its whole-bitset kernels by the extension's
+# one choice of SIMD implementation, which lion_planes.c holds, so every test
+# that links the library links that too.
+test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+                          src/lion_container.h src/lion_planes.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c src/lion_planes.c $(UNIT_LDFLAGS)
 
 # The same tests with -DLION_NO_SIMD: the build without the x86-64 kernels,
 # which must refuse to force them and run the portable one.  On an x86-64
@@ -152,15 +156,19 @@ test/unit/container_test: test/unit/container_test.c src/lion_container.c src/li
 # pg_popcount() - which container_test covers when it forces the portable
 # kernel.
 UNIT_NOSIMD_CFLAGS = -DLION_NO_SIMD $(if $(filter x86_64 amd64,$(shell uname -m)),-mpopcnt)
-test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
+test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+                                 src/lion_container.h src/lion_planes.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+		$(UNIT_LDFLAGS)
 
-test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c \
-                       src/lion_sparse.h src/lion_positions.h src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c $(UNIT_LDFLAGS)
+test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c src/lion_planes.c \
+                       src/lion_sparse.h src/lion_positions.h src/lion_container.h src/lion_planes.h \
+                       src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c src/lion_planes.c \
+		$(UNIT_LDFLAGS)
 
 test/unit/positions_test: test/unit/positions_test.c src/lion_positions.c \
-                          src/lion_positions.h src/lion_container.h src/lion_tid.h
+                          src/lion_positions.h src/lion_container.h src/lion_planes.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/positions_test.c src/lion_positions.c $(UNIT_LDFLAGS)
 
 # The WAL's item encoding (DESIGN.md §25, LION_OP_DELTA and LION_OP_SPLICE):

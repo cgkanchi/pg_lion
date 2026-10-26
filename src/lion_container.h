@@ -2,10 +2,11 @@
  * lion_container.h
  *	  Roaring-style containers for pg_lion.  See DESIGN.md §3.
  *
- *	  This module depends only on c.h and port/pg_bitutils.h so that it can be
- *	  unit-tested outside the server (test/unit/container_test.c, built with
- *	  -DFRONTEND).  No palloc, no elog: every function is total over valid
- *	  inputs, and Assert()s its caller's side of the contract.
+ *	  This module depends only on c.h, port/pg_bitutils.h and lion_planes.c
+ *	  (the extension's choice of SIMD implementation, as frontend-safe) so
+ *	  that it can be unit-tested outside the server (test/unit/container_test.c,
+ *	  built with -DFRONTEND).  No palloc, no elog: every function is total
+ *	  over valid inputs, and Assert()s its caller's side of the contract.
  *
  *	  DAMAGED INPUT.  A container read from disk is data.  Every function is
  *	  memory-safe for any payload behind a header of a valid type: nothing
@@ -55,6 +56,7 @@
 #define LION_CONTAINER_H
 
 #include "c.h"
+#include "lion_planes.h"
 #include "lion_tid.h"
 
 /*
@@ -527,19 +529,15 @@ typedef enum LionBitsOp
 /*
  * For the unit tests: which implementation of the whole-bitset kernels
  * (lion_container.c) the library runs.  The server always runs the best its
- * CPU has, picked at the first call, which LION_SIMD_AUTO restores.  force()
- * returns false, and changes nothing, for one this build or this CPU does
- * not have: the x86-64 ones outside x86-64 GCC and clang, or under
- * LION_NO_SIMD.  Every implementation gives the same results.
+ * CPU has, picked at the first call, which LION_SIMD_AUTO restores.  The
+ * choice is the extension's one (LionSimdImpl, lion_planes.h), so force()
+ * is lion_simd_force(), and every kernel follows it: it returns false, and
+ * changes nothing, for one this build or this CPU does not have - the
+ * x86-64 ones outside x86-64 GCC and clang, or under LION_NO_SIMD.
+ * current() is the implementation whose kernel the passes run, which is
+ * LION_SIMD_AVX2 when the choice is LION_SIMD_AVX512: the library has no
+ * AVX-512 kernel.  Every implementation gives the same results.
  */
-typedef enum LionSimdImpl
-{
-	LION_SIMD_AUTO = 0,			/* the best this CPU runs */
-	LION_SIMD_PORTABLE,			/* plain C */
-	LION_SIMD_POPCNT,			/* x86-64: a POPCNT a word */
-	LION_SIMD_AVX2				/* x86-64: AVX2 */
-} LionSimdImpl;
-
 extern bool lion_container_simd_force(LionSimdImpl impl);
 extern LionSimdImpl lion_container_simd_current(void);
 

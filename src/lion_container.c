@@ -35,8 +35,9 @@
  *	  globally smallest representation, and the only one that chooses a
  *	  NARROW's width.
  *
- *	  This file depends only on c.h, port/pg_bitutils.h and the project
- *	  headers, so that it also builds standalone with -DFRONTEND for
+ *	  This file depends only on c.h, port/pg_bitutils.h, the project
+ *	  headers and lion_planes.c (the extension's choice of SIMD
+ *	  implementation), so that it also builds standalone with -DFRONTEND for
  *	  test/unit/container_test.c.  No palloc, no elog: the caller's side of
  *	  every contract is Assert()ed, structural damage is reported by
  *	  lion_container_check(), and a damaged container is never trusted with a
@@ -59,6 +60,7 @@
 #include "port/pg_bitutils.h"
 
 #include "lion_container.h"
+#include "lion_planes.h"
 
 /*
  * pg_always_inline is the newer spelling of pg_attribute_always_inline, and
@@ -70,17 +72,12 @@
 #endif
 
 /*
- * The x86-64 kernels of "whole-bitset kernels" below: GCC or clang, whose
- * __attribute__((target)) compiles them for AVX2 and POPCNT whatever -march
- * the rest of the extension is built for, and whose __builtin_cpu_supports()
- * says at run time whether they may run.  LION_NO_SIMD (make
- * LION_NO_SIMD=1) leaves them out, and every build then runs the portable
- * kernel.
+ * The x86-64 kernels of "whole-bitset kernels" below: built where
+ * lion_planes.h says the compiler can (LION_HAVE_X86_SIMD: GCC or clang on
+ * x86-64, and not LION_NO_SIMD), and run where the extension's one choice
+ * of implementation, lion_simd_current(), says the CPU can.
  */
-#if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
-	((defined(__clang__) && __clang_major__ >= 6) || \
-	 (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 5))
-#define LION_HAVE_X86_SIMD 1
+#ifdef LION_HAVE_X86_SIMD
 #include <immintrin.h>
 #endif
 
@@ -392,9 +389,10 @@ container_clamp(LionContainer *c)
  * the "before" of the ones that count through it (and_cardinality() 404 /
  * 500 ns, bitset_recount() 290 / 289 against an -O1 build of 18's).
  *
- * Three implementations, one picked at the first call: bits_kernel starts
- * as bits_kernel_choose(), which asks the CPU and overwrites the pointer
- * with its choice, as PostgreSQL's own pg_popcount64 does.
+ * Three implementations, of which every pass runs the one the extension's
+ * single choice names (lion_simd_current(), lion_planes.h), made at the
+ * first call - as PostgreSQL's own pg_popcount64 is - from what the CPU
+ * runs, best first:
  *
  *	- AVX2 (x86-64): 32 bytes at a time, each byte's popcount looked up a
  *	  nibble at a time in a 16-entry table with VPSHUFB (Mula), the byte
@@ -411,19 +409,21 @@ container_clamp(LionContainer *c)
  * runs it as two 256-bit halves, and outside L1 a pass waits on the cache,
  * not on the popcount - with the pairs cycling through 2 MB the AVX2 kernel
  * is within a tenth of the POPCNT one above - so a fourth implementation
- * to test would buy little beyond a hot L1.  (pg_popcount() uses VPOPCNTDQ
- * where it finds it, from PostgreSQL 17 on, and the portable kernel on x86
- * counts through it.)
+ * to test would buy little beyond a hot L1.  Where the extension's choice
+ * is AVX-512, which lionvec's kernels and lion_planes.c's have, the passes
+ * run their AVX2 kernel.  (pg_popcount() uses VPOPCNTDQ where it finds it,
+ * from PostgreSQL 17 on, and the portable kernel on x86 counts through it.)
  *
  * The x86-64 kernels are compiled with __attribute__((target)), so the
  * extension builds with the default -march and runs on any x86-64;
  * __builtin_cpu_supports("avx2") also checks that the OS saves the AVX
  * registers.  Every implementation returns the same count and writes the
  * same words: which one runs changes the time a pass takes, nothing else.
- * lion_container_simd_force() makes a -DFRONTEND build use a given one, for
- * test/unit/container_test.c, which compares each against a reference; the
- * unit tests are also built with -DLION_NO_SIMD, which leaves only the
- * portable one (container_test_nosimd).
+ * lion_container_simd_force() makes a -DFRONTEND build use a given one,
+ * through lion_simd_force(), for test/unit/container_test.c, which compares
+ * each against a reference; the unit tests are also built with
+ * -DLION_NO_SIMD, which leaves only the portable one
+ * (container_test_nosimd).
  * ----------------------------------------------------------------
  */
 
@@ -431,25 +431,18 @@ typedef uint32 (*LionBitsKernel) (uint64 *d, const uint64 *a, const uint64 *b,
 								  LionBitsOp op, uint32 nwords);
 
 /*
- * The portable kernel's popcount of a word.  __builtin_popcountll() is an
- * instruction where the build's target has one - CNT on aarch64, POPCNT on
- * an x86 build for a CPU that has it (-mpopcnt, -march=native) - and there
- * the portable kernel is a fused loop like the POPCNT kernel's
- * (LION_POPCOUNT64_INLINE).  On x86 built for the baseline ISA the builtin is
- * a call into libgcc's table lookup, and pg_popcount64() either the POPCNT
- * instruction behind a function pointer (before PostgreSQL 19) or a dozen
- * instructions inline (19 on): a fused loop of those took 640 - 900 ns
- * where the stored result and one pg_popcount() of it take what they did
- * before this kernel (bits_kernel_portable()).  So does a compiler without
- * the builtin.
+ * The portable kernel's popcount of a word is lion_popcount64()
+ * (lion_planes.h).  __builtin_popcountll() is an instruction where the
+ * build's target has one - CNT on aarch64, POPCNT on an x86 build for a CPU
+ * that has it (-mpopcnt, -march=native) - and there the portable kernel is
+ * a fused loop like the POPCNT kernel's (LION_POPCOUNT64_INLINE).  On x86
+ * built for the baseline ISA the builtin is a call into libgcc's table
+ * lookup, and pg_popcount64() either the POPCNT instruction behind a
+ * function pointer (before PostgreSQL 19) or a dozen instructions inline
+ * (19 on): a fused loop of those took 640 - 900 ns where the stored result
+ * and one pg_popcount() of it take what they did before this kernel
+ * (bits_kernel_portable()).  So does a compiler without the builtin.
  */
-#if (defined(__GNUC__) || defined(__clang__)) && \
-	(defined(__POPCNT__) || !(defined(__x86_64__) || defined(__i386__)))
-#define LION_POPCOUNT64_INLINE 1
-#define lion_popcount64(w)	((uint32) __builtin_popcountll(w))
-#else
-#define lion_popcount64(w)	((uint32) pg_popcount64(w))
-#endif
 
 /*
  * The word-at-a-time kernels' popcount: POPCNT's own when hw (the POPCNT
@@ -606,9 +599,12 @@ bits_portable_pass(uint64 *d, const uint64 *a, const uint64 *b,
  * LION_BLOCKS_PER_CONTAINER and so of four.  A BITSET's pass runs with the
  * count as a constant, so that it is the code it was before NARROW; the
  * narrower widths share one pass that takes the count as it comes - a loop
- * bound, where the BITSET's is a constant, and nothing else.
+ * bound, where the BITSET's is a constant, and nothing else.  Each kernel
+ * is a function of its own, which the dispatch below calls and does not
+ * inline into every pass's caller, as the function pointer it replaced
+ * could not.
  */
-static uint32
+static pg_noinline uint32
 bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
 					 LionBitsOp op, uint32 nwords)
 {
@@ -619,8 +615,6 @@ bits_kernel_portable(uint64 *d, const uint64 *a, const uint64 *b,
 }
 
 #ifdef LION_HAVE_X86_SIMD
-
-#define LION_TARGET(isa)	__attribute__((target(isa)))
 
 /* The POPCNT kernel's pass, inlined into the function compiled for it. */
 static pg_always_inline uint32
@@ -648,7 +642,7 @@ bits_popcnt_pass(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 	return 0;
 }
 
-static LION_TARGET("popcnt") uint32
+static pg_noinline LION_TARGET("popcnt") uint32
 bits_kernel_popcnt(uint64 *d, const uint64 *a, const uint64 *b,
 				   LionBitsOp op, uint32 nwords)
 {
@@ -804,7 +798,7 @@ bits_avx2_pass(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 	return 0;
 }
 
-static LION_TARGET("avx2") uint32
+static pg_noinline LION_TARGET("avx2") uint32
 bits_kernel_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 				 uint32 nwords)
 {
@@ -814,31 +808,36 @@ bits_kernel_avx2(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 	return bits_avx2_pass(d, a, b, op, nwords);
 }
 
-/* The best kernel this CPU runs. */
-static LionBitsKernel
-bits_kernel_best(void)
+/*
+ * The kernel of an implementation of the extension's choice (lion_planes.h):
+ * AVX2's for AVX-512, of which this library has none ("No AVX-512" above).
+ */
+static inline LionBitsKernel
+bits_kernel_of(LionSimdImpl impl)
 {
-	/* a no-op after libgcc's constructor, which has run by any first call */
-	__builtin_cpu_init();
-	if (__builtin_cpu_supports("avx2"))
-		return bits_kernel_avx2;
-	if (__builtin_cpu_supports("popcnt"))
-		return bits_kernel_popcnt;
+	switch (impl)
+	{
+		case LION_SIMD_AVX512:
+		case LION_SIMD_AVX2:
+			return bits_kernel_avx2;
+		case LION_SIMD_POPCNT:
+			return bits_kernel_popcnt;
+		case LION_SIMD_AUTO:
+		case LION_SIMD_PORTABLE:
+			break;
+	}
 	return bits_kernel_portable;
 }
 
-static uint32 bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b,
-								 LionBitsOp op, uint32 nwords);
-
-static LionBitsKernel bits_kernel_fn = bits_kernel_choose;
-
-static uint32
-bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
-				   uint32 nwords)
-{
-	bits_kernel_fn = bits_kernel_best();
-	return bits_kernel_fn(d, a, b, op, nwords);
-}
+/*
+ * A pass, by the kernel of the implementation the extension runs:
+ * lion_simd_current(), resolved at the first call to the best this CPU runs
+ * (lion_simd_best(), which picks the kernels bits_kernel_best() picked
+ * here before: AVX2 where the CPU has it, else POPCNT, else the portable
+ * one), and in a FRONTEND build whatever lion_simd_force() last made it.
+ */
+#define bits_kernel_fn(d, a, b, op, n) \
+	(bits_kernel_of(lion_simd_current()) ((d), (a), (b), (op), (n)))
 
 #else							/* !LION_HAVE_X86_SIMD */
 
@@ -853,34 +852,11 @@ bits_kernel_choose(uint64 *d, const uint64 *a, const uint64 *b, LionBitsOp op,
 	bits_kernel_fn((d), (a), (b), (op), LION_WIDTH_WORDS(k))
 
 #ifdef FRONTEND
+/* The extension's choice forced: every kernel follows it, not only these. */
 bool
 lion_container_simd_force(LionSimdImpl impl)
 {
-#ifdef LION_HAVE_X86_SIMD
-	__builtin_cpu_init();
-	switch (impl)
-	{
-		case LION_SIMD_AUTO:
-			bits_kernel_fn = bits_kernel_best();
-			return true;
-		case LION_SIMD_PORTABLE:
-			bits_kernel_fn = bits_kernel_portable;
-			return true;
-		case LION_SIMD_POPCNT:
-			if (!__builtin_cpu_supports("popcnt"))
-				return false;
-			bits_kernel_fn = bits_kernel_popcnt;
-			return true;
-		case LION_SIMD_AVX2:
-			if (!__builtin_cpu_supports("avx2"))
-				return false;
-			bits_kernel_fn = bits_kernel_avx2;
-			return true;
-	}
-	return false;
-#else
-	return impl == LION_SIMD_AUTO || impl == LION_SIMD_PORTABLE;
-#endif
+	return lion_simd_force(impl);
 }
 
 uint32
@@ -891,18 +867,13 @@ lion_container_bits_pass(LionBitsOp op, uint32 width, uint64 *d,
 	return bitmap_kernel(d, a, b, op, width);
 }
 
+/* The implementation whose kernel the passes run: AVX2 under AVX-512. */
 LionSimdImpl
 lion_container_simd_current(void)
 {
-#ifdef LION_HAVE_X86_SIMD
-	if (bits_kernel_fn == bits_kernel_choose)
-		bits_kernel_fn = bits_kernel_best();
-	if (bits_kernel_fn == bits_kernel_avx2)
-		return LION_SIMD_AVX2;
-	if (bits_kernel_fn == bits_kernel_popcnt)
-		return LION_SIMD_POPCNT;
-#endif
-	return LION_SIMD_PORTABLE;
+	LionSimdImpl impl = lion_simd_current();
+
+	return impl == LION_SIMD_AVX512 ? LION_SIMD_AVX2 : impl;
 }
 #endif							/* FRONTEND */
 
