@@ -24562,8 +24562,9 @@ participants planned - the answers and the counters of parallel walks against th
 over a SETS source, a WALK of a range, a LIST longer than a batch, a UNION of a query that needs
 every row, an OR, an empty answer and a WINDOW of a long range beside another column's set in one
 index; the leader taking no part; no room; a Gather run again, its parts built again each run.
-test/sql/btreescan_param.sql, section 8, the same for a parallel nested loop's probe, and a
-Memoize above it.
+test/sql/btreescan_param.sql, section 8, the same for a parallel nested loop's probe, and its
+answers with Memoize enabled (chosen over the probe or not by a near tie of the prices, which 18
+and 19 break differently).
 
 
 ### 40.10 A nested loop's probe: the walk parameterized (2026-10-23)
@@ -24807,7 +24808,7 @@ all-visible - inserts, deletes, HOT updates and lion-column updates in the trans
 it and after VACUUM (`Heap Fetches: 0`); a parallel nested loop (CREATE TABLE AS, Gather over a
 nested loop over a Parallel Seq Scan and the probe, parallel-aware: its set built in parts and its
 counters the participants' sums, against the serial probe's; a Gather run again; no room to share;
-few outer rows, each participant's lazy set; a Memoize over the probe); a partitionwise join of hash-partitioned
+few outer rows, each participant's lazy set; Memoize enabled); a partitionwise join of hash-partitioned
 tables, the probe reparameterized per partition; the price with nothing disabled (above): 3, 20
 and 80 outer rows and a 300-row dimension; and the settings - `enable_indexscan` and
 `enable_indexonlyscan` off, `pg_lion.enable_plain_scan` and `pg_lion.enable_ordered_scan` off
