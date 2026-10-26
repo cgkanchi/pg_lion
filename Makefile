@@ -78,7 +78,9 @@ src/lion_vec_math.o: override CFLAGS += $(VEC_MATH_CFLAGS)
 src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
               test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-              test/unit/readahead_test test/results test/isolation/results
+              test/unit/readahead_test test/unit/arena_test \
+              test/unit/planes_test test/unit/planes_test_nosimd test/unit/planes_bench \
+              test/results test/isolation/results
 # Every object and dependency file in src, not only those OBJS names now, so
 # that a source removed or renamed leaves no object behind.
 EXTRA_CLEAN += src/*.o src/*.d src/*.bc
@@ -138,7 +140,8 @@ UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
     test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-    test/unit/readahead_test test/unit/arena_test: .lion-force-unit
+    test/unit/readahead_test test/unit/arena_test \
+    test/unit/planes_test test/unit/planes_test_nosimd: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
@@ -188,6 +191,27 @@ test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
 test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
 	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
 
+# Bit-plane arithmetic and the choice of SIMD implementation (DESIGN.md §50):
+# every implementation's popcounts per plane, in both layouts, against a
+# count a bit at a time, the transpose and the values' planes both ways; and
+# against lionvec's own plane-1 kernel and query planes, so lionvec's
+# arithmetic is linked and compiled as vec_test compiles it.  Again without
+# the x86-64 kernels.  `make planes-bench` times the kernels, built at -O2.
+PLANES_TEST_SRCS = test/unit/planes_test.c src/lion_planes.c src/lion_vec_math.c
+PLANES_TEST_DEPS = $(PLANES_TEST_SRCS) src/lion_planes.h src/lion_vec_math.h
+test/unit/planes_test: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+test/unit/planes_test_nosimd: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+test/unit/planes_bench: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -O2 -DNDEBUG -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+.PHONY: planes-bench
+planes-bench: test/unit/planes_bench
+	./test/unit/planes_bench --bench
+
 # The read stream ring's bookkeeping (DESIGN.md §44.4, "Read streams"),
 # against a model of core's read stream.
 test/unit/readahead_test: test/unit/readahead_test.c src/lion_readahead_ring.c src/lion_readahead_ring.h
@@ -200,9 +224,12 @@ test/unit/arena_test: test/unit/arena_test.c src/lion_arena.c src/lion_arena.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/arena_test.c src/lion_arena.c $(UNIT_LDFLAGS)
 
 .PHONY: unit
-unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+unit: test/unit/planes_test test/unit/planes_test_nosimd \
+      test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
       test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
       test/unit/readahead_test test/unit/arena_test
+	./test/unit/planes_test
+	./test/unit/planes_test_nosimd
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test
