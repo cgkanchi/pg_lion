@@ -744,6 +744,34 @@ LANGUAGE C CALLED ON NULL INPUT VOLATILE PARALLEL UNSAFE ROWS 10;
 COMMENT ON FUNCTION lion_index_facets(regclass, integer, text, int2) IS
 	'the keys of a lion index column with the most visible rows under a filter of lion-indexed conditions, counted exactly';
 
+/*
+ * Aggregates from bit slices (lion_slice.c, DESIGN.md §50): count(x), sum(x),
+ * min(x) and max(x) of key column attno of a lion index built WITH (slices =
+ * on), over the rows the snapshot sees that filter keeps - the filter of
+ * lion_index_facets(), an AND and OR of what lion indexes answer exactly -
+ * from the column's bit slices alone:
+ *
+ *   SELECT count(x), sum(x), min(x)::text, max(x)::text FROM t WHERE <filter>
+ *
+ * sum is a numeric, NULL for a date, time or timestamp column (whose types
+ * have no sum) and, with min and max, when no row is counted.  The answers
+ * are exact, as the count functions' are.  The planner does not call it: the
+ * LionCount pushdown of sum, avg, min and max from slices is not written yet.
+ */
+CREATE FUNCTION lion_index_slice_agg(idx regclass,
+									 filter text DEFAULT NULL,
+									 attno int2 DEFAULT 1,
+									 OUT count bigint,
+									 OUT sum numeric,
+									 OUT min text,
+									 OUT max text)
+RETURNS record
+AS 'MODULE_PATHNAME', 'lion_index_slice_agg'
+LANGUAGE C CALLED ON NULL INPUT VOLATILE PARALLEL UNSAFE;
+
+COMMENT ON FUNCTION lion_index_slice_agg(regclass, text, int2) IS
+	'count, sum, min and max of a bit-sliced lion index column over its visible rows under a filter of lion-indexed conditions, from the slices alone, exactly';
+
 /* ---------------------------------------------------------------------
  * aggregates of the FK-side join (lion_customscan.c, DESIGN.md §27,
  * "Every aggregate over the node's rows")

@@ -554,6 +554,16 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 					   LionCountKey *keys, AttrNumber wantcol,
 					   bool multikey_ok, LionCountCall *call)
 {
+	lion_count_open_indexes_ext(snapshot, nidx, idxoid, keys, wantcol,
+								multikey_ok, false, call);
+}
+
+void
+lion_count_open_indexes_ext(Snapshot snapshot, int nidx, const Oid *idxoid,
+							LionCountKey *keys, AttrNumber wantcol,
+							bool multikey_ok, bool ownfuncs,
+							LionCountCall *call)
+{
 	Oid			heapoid = InvalidOid;
 	char	   *heapname;
 	int			i;
@@ -834,7 +844,7 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 	 * strategy 1 IS that equality (DESIGN.md §10), so strategy 1 for
 	 * (opcintype, opcintype) is the function there.
 	 */
-	for (i = 0; i < nidx; i++)
+	for (i = 0; i < nidx && !ownfuncs; i++)
 	{
 		Relation	index = call->index[i];
 		AttrNumber	col = (wantcol == 0) ? 1 : wantcol;
@@ -869,7 +879,8 @@ lion_count_open_indexes(Snapshot snapshot, int nidx, const Oid *idxoid,
 				 opcintype, opfamily);
 		lion_check_execute(get_opcode(eqop));
 	}
-	lion_check_aggregate_execute(F_COUNT_);
+	if (!ownfuncs)
+		lion_check_aggregate_execute(F_COUNT_);
 
 	/*
 	 * Row-level security and snapshot eligibility, as for every direct
