@@ -432,11 +432,6 @@ typedef struct LionCountPathBuild
 	Bitmapset  *keyattnos;		/* the partitioning keys' columns, at every
 								 * level the planner keeps */
 	bool		keyattnosdone;
-	RelOptInfo *firstleaf;		/* a partitioned table's first live leaf,
-								 * whose indexes stand for the table's
-								 * (lion_where_indexed()), and the parent's
-								 * columns there; NULL until asked for */
-	AttrNumber *firstleafattnos;
 	int			nfilter;		/* filtered counts (§10): their conditions */
 	List	   *filterexprs;	/* ... each one once, by equal() */
 	List	   *filtercols;		/* ... an IntList {filter, attno} for each
@@ -456,8 +451,6 @@ typedef struct LionCountPathBuild
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
 static void lion_try_count_cells(const LionCountPathBuild *cxp);
 static int	lion_count_path_filter_no(LionCountPathBuild *cx, Node *fexpr);
-static RelOptInfo *lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel,
-										 AttrNumber *attnos, int natts);
 
 /*
  * Start the build of lion_try_count_path(): its arguments, and every other
@@ -1529,64 +1522,78 @@ lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
 }
 
 /*
+ * Does rel - a table, or a partitioned one, through every level down to its
+ * live leaves - have a lion index to answer clause ci on column attno (in
+ * rel's own numbering, translated for each child)?  Of a partitioned table,
+ * any live leaf's will do: a column no leaf indexes is what makes the clause
+ * residual (lion_where_indexed()), and one some leaf indexes and another
+ * does not is the partitions' to settle when they are matched
+ * (lion_collect_targets()).
+ */
+static bool
+lion_rel_has_index(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
+				   const LionClauseInfo *ci)
+{
+	AttrNumber	col = 1;
+
+	check_stack_depth();
+	if (IS_PARTITIONED_REL(rel))
+	{
+		int			i;
+
+		for (i = 0; i < rel->nparts; i++)
+		{
+			RelOptInfo *child = rel->part_rels[i];
+			AttrNumber	cattno = attno;
+
+			if (child == NULL || !bms_is_member(i, rel->live_parts) ||
+				IS_DUMMY_REL(child))
+				continue;
+			if (attno > 0 && !LION_ATTNO_IS_VCOL(attno))
+			{
+				Var		   *cvar = lion_child_var(root, child->relid, attno);
+
+				if (cvar == NULL)
+					continue;
+				cattno = cvar->varattno;
+			}
+			if (lion_rel_has_index(root, child, cattno, ci))
+				return true;
+		}
+		return false;
+	}
+	return lion_match_index(rel, attno, ci->kind, ci->opno, ci->cmptype,
+							ci->strategy, ci->extractquery, ci->collation,
+							ci->positions, &col) != NULL;
+}
+
+/*
  * Has every clause the analysis of one restriction appended, from position
  * `from` on, an index of this table to answer it?  A clause of the right
  * shape on a column no lion index covers - `id > 10` - is only found out
  * when the relation's indexes are matched (lion_collect_targets()), which
  * declines the whole query; asked here, it can be residual instead.  A
- * partitioned table has no indexes of its own, and its first live leaf's
- * stand for them, as they do for the column a sum over every row drives by
- * (lion_count_all_driver()): a column no leaf indexes is found out here,
- * and one some leaf indexes and another does not when the partitions are
- * matched, which asks for a second attempt then (DESIGN.md §16, "Residual
- * clauses over a partitioned table").
+ * partitioned table has no indexes of its own, and its live leaves' stand
+ * for them (lion_rel_has_index()): a column no leaf indexes is found out
+ * here, and one some leaf indexes and another does not when the partitions
+ * are matched, which may ask for a second attempt then (DESIGN.md §16,
+ * "Residual clauses over a partitioned table").
  */
 static bool
 lion_where_indexed(LionCountPathBuild *cx, int from)
 {
-	RelOptInfo *rel = cx->input_rel;
 	ListCell   *l1;
 	ListCell   *l2;
 	int			i = 0;
 
-	if (cx->partitioned)
-	{
-		if (cx->firstleaf == NULL)
-		{
-			int			natts = Max((int) rel->max_attr, 0);
-			int			a;
-
-			cx->firstleafattnos = (AttrNumber *)
-				palloc0(sizeof(AttrNumber) * Max(natts, 1));
-			for (a = 0; a < natts; a++)
-				cx->firstleafattnos[a] = (AttrNumber) (a + 1);
-			cx->firstleaf = lion_count_first_leaf(cx->root, rel,
-												  cx->firstleafattnos, natts);
-		}
-		if (cx->firstleaf == NULL)
-			return false;
-		rel = cx->firstleaf;
-	}
-
 	forboth(l1, cx->whereattnos, l2, cx->clauseinfos)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
-		AttrNumber	attno = (AttrNumber) lfirst_int(l1);
-		AttrNumber	col = 1;
 
 		if (i++ < from)
 			continue;
-		if (cx->partitioned && attno > 0 && !LION_ATTNO_IS_VCOL(attno))
-		{
-			if (attno > cx->input_rel->max_attr)
-				return false;
-			attno = cx->firstleafattnos[attno - 1];
-			if (attno == 0)
-				return false;
-		}
-		if (lion_match_index(rel, attno, ci->kind, ci->opno, ci->cmptype,
-							 ci->strategy, ci->extractquery, ci->collation,
-							 ci->positions, &col) == NULL)
+		if (!lion_rel_has_index(cx->root, cx->input_rel,
+								(AttrNumber) lfirst_int(l1), ci))
 			return false;
 	}
 	return true;

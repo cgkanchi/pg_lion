@@ -147,10 +147,12 @@ SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind IS NOT NULL AND kind = 'b' 
 /*
  * Ranges.  One on the key keeps the default partition, which could hold
  * values between any two of the others' (the planner does not prune it), and
- * which implies nothing of it: declined.  One on ts that ip_a_2026's own bound
- * implies: a range every partition implies does not drive the count while
- * another clause selects the rows, and is left out; with nothing else it
- * still drives, and only kind is left out.
+ * which implies nothing of it: tested on that partition's rows, and left out
+ * of ip_b's (DESIGN.md §16, "Residual clauses over a partitioned table").
+ * One on ts that ip_a_2026's own bound implies: a range every partition
+ * implies does not drive the count while another clause selects the rows,
+ * and is left out; with nothing else it still drives, and only kind is left
+ * out.
  */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind >= 'b' AND kind <= 'b' AND tags && '{x3}'$q$);
 SELECT lion_ipplan($q$SELECT count(*) FROM ip WHERE kind = 'a' AND ts >= '2026-01-01' AND tags && '{x1}'$q$);
@@ -167,7 +169,7 @@ SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND ts >= '2025-06-01
  * No posting set answers an OR one of whose arms is not a plain column, but
  * every partition kind = 'a' leaves implies it: it is left out, and so is
  * what its first arm had been taken as.  Without kind = 'a' nothing prunes,
- * and the partitions that do not imply it decline the query.
+ * and the partitions that do not imply it test it on their rows.
  */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND (kind = 'a' OR upper(kind) = 'Z') AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind = 'a' OR upper(kind) = 'Z') AND tags && '{x1}'$q$);
@@ -316,29 +318,36 @@ DROP TABLE ipk;
 -- ---- NULLs and the default partition -------------------------------------
 /*
  * ip_n holds NULL as well as 'n', so neither `kind = 'n'` nor `kind IS NULL`
- * is implied there and, with no index on kind, the query is declined; the OR
- * of the two is implied, and is left out.
+ * is implied there and, with no index on kind, it tests the clause on its
+ * rows; the OR of the two is implied, and is left out.
  */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'n' AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind IS NULL AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE (kind IS NULL OR kind = 'n') AND tags && '{x1}'$q$);
 /*
  * The default partition's bound is the negation of every other one's, and
- * implies no equality: 'e' could share it with anything no partition lists.
- * It does imply the NOT IN of every listed value - the `<>` clauses it
- * stands for (DESIGN.md §10), each implied and left out.  `kind IS NOT
- * NULL` is implied by every partition but ip_n, which holds the NULLs (the
- * default partition would, if no other partition took them) and has no
- * index on kind: declined.
+ * implies no equality: 'e' could share it with anything no partition lists,
+ * and is tested on its rows.  It does imply the NOT IN of every listed
+ * value, which is left out whole.  `kind IS NOT NULL` is implied by every
+ * partition but ip_n, which holds the NULLs (the default partition would, if
+ * no other partition took them) and has no index on kind: tested there, and
+ * left out everywhere else.
  */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'e' AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind NOT IN ('a', 'b', 'c', 'd', 'n') AND tags && '{x1}'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind IS NOT NULL AND tags && '{x1}'$q$);
 
--- ---- still declined ------------------------------------------------------
-/* nothing left in the partitions to select rows by */
+-- ---- counted whole --------------------------------------------------------
+/*
+ * Nothing left in the partitions to select rows by: a clause no partition
+ * indexes and every one implies is left out before anything else, and each
+ * partition is counted whole, by the entries of one of its columns, as a
+ * table without a WHERE is (DESIGN.md §35, "Every row").
+ */
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a'$q$);
 SELECT lion_ip($q$SELECT count(*) FROM ip WHERE kind = 'a' AND fk IS NOT NULL$q$);
+
+-- ---- still declined ------------------------------------------------------
 /* a pinned column the target list prints comes out of the index's key */
 SELECT lion_ip($q$SELECT kind, count(*) FROM ip WHERE kind = 'b' AND tags && '{x1}' GROUP BY kind$q$);
 /* a volatile clause is the query's to run per row */
