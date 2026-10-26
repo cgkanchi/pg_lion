@@ -1589,8 +1589,9 @@ lion_competitor_bitmap_cold(PlannerInfo *root, Path *best,
 {
 	*bmcold = 0.0;
 	*bmcoldpage = 0.0;
-	if (best == NULL || kind == LION_COMPETITOR_NONE ||
-		kind == LION_COMPETITOR_DISABLED || nlcold > 0.0)
+	if (!lion_competitor_pricing || best == NULL ||
+		kind == LION_COMPETITOR_NONE || kind == LION_COMPETITOR_DISABLED ||
+		nlcold > 0.0)
 		return;
 	lion_bitmap_cold(root, best, bmcold, bmcoldpage);
 }
@@ -1621,6 +1622,8 @@ lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 	u->margin = 1.0;
 	u->skewscale = 1.0;
 	u->memoscale = 1.0;
+	if (!lion_competitor_pricing)
+		return;
 	foreach(lc, rel->partial_pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
@@ -1695,6 +1698,14 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 		return LION_COMPETITOR_DISABLED;
 	*ownscan = lion_path_is_lion_scan(best);
 	kind = lion_competitor_kind(best);
+
+	/*
+	 * Priced by its own work alone (pg_lion.competitor_pricing off, DESIGN.md
+	 * §49): the competitor's kind still says whether there is one to offer
+	 * the margin against, and nothing of its plan corrects the price.
+	 */
+	if (!lion_competitor_pricing)
+		return kind;
 	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
 		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
 	if (kind == LION_COMPETITOR_NESTLOOP)

@@ -666,6 +666,14 @@ working around a bad choice:
   prices the set's build spread over the loop's rescans - over the outer side's distinct keys when
   `enable_memoize` is on - against PostgreSQL's heap fetch per outer row.
   `pg_lion.enable_btree_scan` turns it off with the other walks.
+- `pg_lion.enable_heap_probe` (off): also offer that probe where the B-tree does not cover what
+  the query reads of the relation - a primary key under a Lion filter, the query reading other
+  columns (DESIGN.md §49). EXPLAIN shows `Index: <index>` without `(index only)`: the entry the
+  outer row's key finds is tested against the Lion set, and the heap row is fetched for a member
+  alone, where PostgreSQL's Index Scan of the same B-tree fetches every row to test its `Filter`.
+  The planner prices both with the same heap-page formula, the probe over its members' fetches
+  alone, so it is chosen where the set rejects enough rows to pay for its build. It needs
+  `enable_indexscan`, and is offered under a `Memoize`, a left join and `FOR SHARE` of the relation.
 - Parallel walks: when the table may be read in parallel, `LionBtreeScan` and the B-tree walks of
   `LionOrdered` are also offered as partial paths (DESIGN.md §40.9): `Parallel Custom Scan
   (LionBtreeScan)` below a `Gather` - under partial aggregates, and on either side of a parallel
@@ -839,7 +847,15 @@ working around a bad choice:
   none of its columns in the output - is read once, before the walk, into a hash set of its keys,
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
-  spilled). It needs an inner join of two tables on one equality whose dimension side has a unique
+  spilled). Where the fact's key column has a Lion index of its own (scalar, of the key's type,
+  not partial unless the query implies its predicate), the key set's keys are also looked up in it
+  and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
+  (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`). Where the fact's
+  ordering B-tree holds the key column, as a key or an `INCLUDE` column, each entry's key is tested
+  on its index tuple before the row is read, and a row the table lacks is not read either (`Key
+  Sets Tested On: <index>` in `EXPLAIN`). With neither, the walk reads each row to test its key,
+  and the planner charges it the pages of those reads.
+  It needs an inner join of two tables on one equality whose dimension side has a unique
   one-column B-tree and no other clause between them; heap tables or materialized views, not
   partitioned, without row-level security or `TABLESAMPLE`; a `SELECT` without `FOR UPDATE`/`FOR
   SHARE`; and a B-tree of the fact that gives the `ORDER BY` at least its first column. It is
@@ -915,6 +931,12 @@ working around a bad choice:
   Off, such a join is left to PostgreSQL's join methods, with `LionOrdered` or a `LionBtreeScan`
   probe on either side where they apply; the split goes with it. `enable_hashjoin`,
   `enable_mergejoin` and `enable_nestloop` do not disable either.
+- `pg_lion.enable_key_set_fold` (on by default): offer `LionOrderedJoin` and `LionOrderedSplit`
+  with their key sets folded into the fact's walk where the fact's key has a Lion index (DESIGN.md
+  §47.6): the walk's set is then the rows of the key sets' keys, and a row a key set rejects is
+  never fetched; `EXPLAIN` prints `Key Set Index: <index>`. Each join is offered both ways and the
+  planner keeps the cheaper: the fold looks every key up before the walk starts. Off, the key sets
+  are only tested after each row is read.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -1060,6 +1082,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
 | `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
 | `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"); 0 turns the charge off |
+| `probe_entry_cost` | 4.5 | `cpu_operator_cost` | an entry a nested loop's B-tree probe (`LionBtreeScan` parameterized by the outer row, and `LionProbeJoin`'s descents) meets, beyond core's Index Scan of the same B-tree: its test against the set, measured at that Index Scan's own rate (DESIGN.md §49, "The probe's own work") |
+| `probe_rescan_cost` | 16 | `cpu_operator_cost` | a scan of `LionBtreeScan`'s probe beyond core's Index Scan's: its rescan, and its code run beside core's, measured so |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
 | `list_group_cost` | 18 | `cpu_tuple_cost` | a count of a group an `IN` list drives |
 | `distinct_test_cost` | 50 | `cpu_tuple_cost` | a test of a `count(DISTINCT)` walk |
@@ -1128,6 +1152,14 @@ count reads it from - since that scan does the count's work and fetches every ro
 the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
 same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
 and Lion's switches leave theirs out, whatever the margin or price.
+
+`pg_lion.competitor_pricing` (on): whether a Lion custom path's price is corrected by what Lion
+reads of the PostgreSQL plan it competes with - the rates above, that plan's uncached reads
+(`cold_page_cost`, `cold_stream_page_cost`, `cold_max_discount`), the rows a skewed key meets
+(`pg_lion.enable_skew_estimate`) and a `Memoize`'s hits under a `LIMIT`
+(`pg_lion.enable_memoize_limit`). Off, a Lion path is priced by its own work alone, in
+PostgreSQL's units, and PostgreSQL's plans by PostgreSQL (DESIGN.md §49); the margin still
+applies.
 
 `pg_lion.cold_max_discount` (2; 1 to 10): the most the uncached reads of a competing plan may
 divide a Lion custom path's price by, where the query's tables do not fit in

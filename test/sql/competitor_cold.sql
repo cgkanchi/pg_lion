@@ -140,22 +140,25 @@ SELECT lion_cc_plan(:'anti');
 SET effective_cache_size = '1MB';
 SELECT lion_cc_plan(:'anti');
 SELECT lion_cc_same(:'anti');
--- ... which the cold reads alone choose: without their charge, core's plan
+-- ... and without their charge the node still: its probe's members are
+-- counted over the loop's scans, not a whole one a scan (DESIGN.md §49), and
+-- warm the two plans run alike
 SET pg_lion.cold_page_cost = 0;
 SELECT lion_cc_plan(:'anti');
 RESET pg_lion.cold_page_cost;
 
 -- A Memoize over the loop's inner side: 4,500 fact rows over 3,000 keys,
 -- the loop probing the dimension on a miss alone, and reading the pages of
--- those.  In the cache, the loop ...
+-- those.  In the cache, the node, by its own price (§49): warm it runs about
+-- a sixth faster than the loop ...
 \set memo 'SELECT d.flag, f.kind, count(*) FROM lion_cc_m f JOIN lion_cc_d d ON f.fk = d.pk WHERE d.seg = 1 GROUP BY 1, 2'
 SET effective_cache_size = '4GB';
 SELECT lion_cc_plan(:'memo');
--- ... and ten times the cache, the misses' cold reads weigh: the node
+-- ... and at ten times the cache, where the misses' cold reads weigh too
 SET effective_cache_size = '1MB';
 SELECT lion_cc_plan(:'memo');
 SELECT lion_cc_same(:'memo');
--- ... and the loop again without the charge
+-- ... and without the charge
 SET pg_lion.cold_page_cost = 0;
 SELECT lion_cc_plan(:'memo');
 RESET pg_lion.cold_page_cost;
@@ -198,6 +201,34 @@ SELECT lion_cc_same(:'par');
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
+
+-- With pg_lion.competitor_pricing off (DESIGN.md §49) the node is priced by
+-- its own work alone, and the loop's cold reads are not weighed against it:
+-- at ten times the cache it costs what it costs with no cold charge at all,
+-- where competitor pricing takes them off its price.  The node's own cost,
+-- the plan forced to it.
+CREATE FUNCTION lion_cc_cost(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN (SELECT max((n->>'Total Cost')::float8)
+			  FROM jsonb_path_query(p::jsonb, 'lax $.** ? (@."Custom Plan Provider" == "LionProbeJoin")') n);
+END $$;
+SET effective_cache_size = '1MB';
+SET pg_lion.competitor_pricing = off;
+SELECT lion_cc_cost(:'big') AS own \gset
+RESET pg_lion.competitor_pricing;
+SET pg_lion.cold_page_cost = 0;
+SET pg_lion.cold_stream_page_cost = 0;
+SELECT lion_cc_cost(:'big') AS uncharged \gset
+RESET pg_lion.cold_page_cost;
+RESET pg_lion.cold_stream_page_cost;
+SELECT lion_cc_cost(:'big') AS charged \gset
+SELECT :own = :uncharged AS own_is_uncharged, :charged < :own AS cold_takes_off;
+DROP FUNCTION lion_cc_cost(text);
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET effective_cache_size;
