@@ -37,11 +37,12 @@
  *						the implementations
  *
  * One choice for the whole extension: the container library's whole-bitset
- * kernels (lion_container.c) and the kernels below each dispatch on
- * lion_simd_current(), which is resolved at the first call - as PostgreSQL's
- * own pg_popcount64 resolves at its first - to the best implementation the
- * build has and the CPU runs.  A FRONTEND build may force another, for the
- * unit tests, and every kernel follows at its next call.
+ * kernels (lion_container.c), lionvec's (lion_vec_math.c, whose plane-1
+ * kernel is lion_planes_dot_interleaved() below) and the kernels below each
+ * dispatch on lion_simd_current(), which is resolved at the first call - as
+ * PostgreSQL's own pg_popcount64 resolves at its first - to the best
+ * implementation the build has and the CPU runs.  A FRONTEND build may force
+ * another, for the unit tests, and every kernel follows at its next call.
  *
  *	PORTABLE	plain C, every build
  *	POPCNT		x86-64: the POPCNT instruction a word at a time
@@ -54,7 +55,8 @@
  *				(DESIGN.md §44.3, "Kernels")
  *
  * A module without a kernel of an implementation runs its best below it:
- * the container library has no AVX-512 kernel and runs its AVX2 one.
+ * the container library has no AVX-512 kernel and runs its AVX2 one, and
+ * lionvec runs its AVX2 ones but for plane 1, which is here.
  * ----------------------------------------------------------------
  */
 
@@ -878,9 +880,10 @@ planes_weigh(const uint32 *counts, uint32 k)
  * pass and its weighing in one function, the stride a constant and the
  * lanes weighed in registers.  Through the counts of any k - a call more,
  * an array of 64 counts on the stack, a loop of shifts - an AVX-512 sum over
- * 24 words (1536 dimensions) took 22 - 28 ns where lionvec_plane_dot() takes
- * 11 - 15; this way 16 against 15, and AVX2's 26 against 29, POPCNT's 38
- * against 35 (DESIGN.md §50, Measured).
+ * 24 words (1536 dimensions) took 22 - 28 ns where lionvec's own kernel
+ * took 11 - 15; this way 16 against 15, and AVX2's 26 against 29, POPCNT's
+ * 38 against 35 (DESIGN.md §50, Measured).  These are lionvec's plane-1
+ * kernels now (lionvec_plane_dot(), DESIGN.md §44.3, "Kernels").
  */
 static uint64
 planes_dot4_portable(const uint64 *bits, const uint64 *planes, uint32 nwords)
