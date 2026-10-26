@@ -847,7 +847,12 @@ working around a bad choice:
   none of its columns in the output - is read once, before the walk, into a hash set of its keys,
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
-  spilled). It needs an inner join of two tables on one equality whose dimension side has a unique
+  spilled). Where the fact's key column has a Lion index of its own (scalar, of the key's type,
+  not partial unless the query implies its predicate), the key set's keys are also looked up in it
+  and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
+  (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`); without one, the
+  walk reads each row to test its key, and the planner charges it the pages of those reads.
+  It needs an inner join of two tables on one equality whose dimension side has a unique
   one-column B-tree and no other clause between them; heap tables or materialized views, not
   partitioned, without row-level security or `TABLESAMPLE`; a `SELECT` without `FOR UPDATE`/`FOR
   SHARE`; and a B-tree of the fact that gives the `ORDER BY` at least its first column. It is
@@ -923,6 +928,12 @@ working around a bad choice:
   Off, such a join is left to PostgreSQL's join methods, with `LionOrdered` or a `LionBtreeScan`
   probe on either side where they apply; the split goes with it. `enable_hashjoin`,
   `enable_mergejoin` and `enable_nestloop` do not disable either.
+- `pg_lion.enable_key_set_fold` (on by default): offer `LionOrderedJoin` and `LionOrderedSplit`
+  with their key sets folded into the fact's walk where the fact's key has a Lion index (DESIGN.md
+  §47.6): the walk's set is then the rows of the key sets' keys, and a row a key set rejects is
+  never fetched; `EXPLAIN` prints `Key Set Index: <index>`. Each join is offered both ways and the
+  planner keeps the cheaper: the fold looks every key up before the walk starts. Off, the key sets
+  are only tested after each row is read.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot

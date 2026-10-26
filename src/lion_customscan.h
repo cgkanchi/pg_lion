@@ -4503,17 +4503,25 @@ extern void lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel,
 								  Path *lion, LionOrderedSet *out);
 extern void lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel,
 									IndexPath *ord, Path *lion, double rows,
-									bool indexonly_ok, List **iocols,
+									bool indexonly_ok, double keysel,
+									Cost keybuild, List **iocols,
 									Cost *startup, Cost *total,
 									double *fetches, double *lionpages);
+extern Cost lion_ordered_keys_price(PlannerInfo *root, RelOptInfo *rel,
+									IndexOptInfo *idx, double nkeys,
+									double members, double *pages);
+extern Cost lion_ordered_heap_price(PlannerInfo *root, RelOptInfo *rel,
+									IndexPath *ord, double walked,
+									double fetches);
 extern bool lion_ordered_walk_reads(PlannerInfo *root, Path *path,
 									double share, double *reads);
 extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Path *lion, List *iocols, bool dim,
 										  double weight, Expr *keyqual,
-										  double rows, Cost startup,
-										  Cost total);
+										  List *keyfold, double rows,
+										  Cost startup, Cost total);
 extern void lion_ordered_probe_key(PlanState *ps, Datum key);
+extern void lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array);
 extern IndexOptInfo *lion_ordered_column_order(PlannerInfo *root,
 											   RelOptInfo *rel, PathKey *want,
 											   int *indexcol, Var **var);
