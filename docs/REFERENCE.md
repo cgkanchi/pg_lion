@@ -850,8 +850,11 @@ working around a bad choice:
   spilled). Where the fact's key column has a Lion index of its own (scalar, of the key's type,
   not partial unless the query implies its predicate), the key set's keys are also looked up in it
   and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
-  (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`); without one, the
-  walk reads each row to test its key, and the planner charges it the pages of those reads.
+  (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`). Where the fact's
+  ordering B-tree holds the key column, as a key or an `INCLUDE` column, each entry's key is tested
+  on its index tuple before the row is read, and a row the table lacks is not read either (`Key
+  Sets Tested On: <index>` in `EXPLAIN`). With neither, the walk reads each row to test its key,
+  and the planner charges it the pages of those reads.
   It needs an inner join of two tables on one equality whose dimension side has a unique
   one-column B-tree and no other clause between them; heap tables or materialized views, not
   partitioned, without row-level security or `TABLESAMPLE`; a `SELECT` without `FOR UPDATE`/`FOR

@@ -54,7 +54,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  *
  *	OJ_PRIV_INTS	IntList (OJ_PRIV_MAGIC, the fact's columns in
  *					custom_scan_tlist, the fk's position among them, 1-based,
- *					the key sets)
+ *					the key sets, the column of the fact's walked btree that
+ *					holds the key, 1-based, or 0 - see OJ_PRIV_ITUP)
  *	OJ_PRIV_INDEX	OidList: the dimension's unique btree, for EXPLAIN
  *	OJ_PRIV_KEYOPS	OidList: each key set's equality, hashable
  *	OJ_PRIV_KEYCOLL	OidList: ... its collation
@@ -62,6 +63,9 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  *	OJ_PRIV_FOLD	OidList: the fact key's lion index the key sets are
  *					folded into, their keys handed to the fact's walk for its
  *					set (§47.6); NIL where they are not
+ *	OJ_PRIV_ITUP	OidList: the fact's walked btree, on whose index tuples
+ *					the walk tests the key sets before it fetches (§47.6,
+ *					"Tested on the index tuple"); NIL where it does not
  *
  * custom_plans are the fact's walk, the dimension's probe and each key set's
  * plan, in that order; custom_scan_tlist is the fact's target list followed by
@@ -76,7 +80,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 #define OJ_PRIV_KEYCOLL		3
 #define OJ_PRIV_KEYCOLS		4
 #define OJ_PRIV_FOLD		5
-#define OJ_PRIV_NMEMBERS	6
+#define OJ_PRIV_ITUP		6
+#define OJ_PRIV_NMEMBERS	7
 
 static Plan *oj_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
@@ -706,6 +711,39 @@ oj_key_index(OjJoin *j, int *col)
 }
 
 /*
+ * The column of ord's btree, 1-based, that holds the fact's key - a key
+ * column or an INCLUDE one, the key column itself, stored as the key's type,
+ * one the btree can return - so that the fact's walk can test the key sets on
+ * each index tuple before it fetches the row (DESIGN.md §47.6, "Tested on the
+ * index tuple"); 0 if none.  Not folded into the walk's set, the key sets
+ * then turn away the entries they reject unfetched all the same.
+ */
+static int
+oj_itup_col(OjJoin *j, IndexPath *ord)
+{
+	IndexOptInfo *idx = ord->indexinfo;
+	Oid			type = exprType((Node *) j->fkvar);
+	int			c;
+
+	if (j->keysets == NIL || idx->relam != BTREE_AM_OID || idx->hypothetical)
+		return 0;
+	for (c = 0; c < idx->ncolumns; c++)
+	{
+		Relation	irel;
+		bool		ok;
+
+		if (idx->indexkeys[c] != j->fkvar->varattno || !idx->canreturn[c])
+			continue;
+		irel = index_open(idx->indexoid, AccessShareLock);
+		ok = TupleDescAttr(RelationGetDescr(irel), c)->atttypid == type;
+		index_close(irel, AccessShareLock);
+		if (ok)
+			return c + 1;
+	}
+	return 0;
+}
+
+/*
  * Is every special join with an inner side in joinrel the semi join of one of
  * j's key sets?  The fact and the dimension are then inner-joined, and so is
  * every key set that is not a semi join's.
@@ -1052,7 +1090,11 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * whole walk's fetches read, which is what core's Limit would take of a run
  * priced whole: their difference is charged, at s of it in the run.  A key
  * set that keeps one row in ten thousand then costs the walk the heap pages
- * of the million rows it fetches for the hundred the page takes.
+ * of the million rows it fetches for the hundred the page takes.  Where the
+ * walked btree holds the key (oj_itup_col()), the walk tests the key sets on
+ * its index tuples and fetches only what they keep: the walk is priced at
+ * `kept` of its fetches - their heap pages, and a row each - and nothing is
+ * fetched for nothing.
  *
  * *share is the share of the walk the query's LIMIT is expected to take, all
  * of it where the join is not alone under the LIMIT (oj_alone()), *probes
@@ -1105,6 +1147,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	double		hit;
 	double		descents;
 	double		kept;
+	bool		itup;
 	double		members;
 	double		out;
 	double		idxtuples = Max(pkidx->tuples, 1.0);
@@ -1155,6 +1198,26 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	}
 	kept = Min(descents / keys, 1.0);
 	descents = clamp_row_est(descents);
+
+	/*
+	 * Tested on the walked btree's index tuples, the members the key sets
+	 * reject are not fetched: the walk's heap pages and rows are those of
+	 * the fetches of the members they keep, in place of all of its members'.
+	 */
+	itup = !fold && oj_itup_col(j, ord) > 0;
+	if (itup && kept < 1.0 && factfetches > 0.0)
+	{
+		double		walked = clamp_row_est(ord->indexselectivity *
+										   j->fact->tuples);
+		double		keptfetches = kept * factfetches;
+
+		run -= lion_ordered_heap_price(root, j->fact, ord, walked,
+									   factfetches) -
+			lion_ordered_heap_price(root, j->fact, ord, walked, keptfetches) +
+			(factfetches - keptfetches) * cpu_tuple_cost;
+		run = Max(run, 0.0);
+		factfetches = keptfetches;
+	}
 
 	/*
 	 * Each key's descent of the dimension's btree, priced as
@@ -1223,7 +1286,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * of them the key sets reject - charged at s of it in the run, which the
 	 * Limit takes s of.
 	 */
-	if (!fold && j->keysets != NIL && kept < 1.0 && *share < 1.0 &&
+	if (!fold && !itup && j->keysets != NIL && kept < 1.0 && *share < 1.0 &&
 		factfetches > 0.0)
 	{
 		double		s = *share;
@@ -1317,6 +1380,8 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	List	   *keyquals = NIL;
 	List	   *keyfold = NIL;
 	List	   *paths;
+	int			itupcol;
+	List	   *itup = NIL;
 	ListCell   *lc;
 
 	Assert(!fold || j->keyidx != NULL);
@@ -1375,12 +1440,17 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	cp->path.pathkeys = pathkeys;
 	cp->flags = CUSTOMPATH_SUPPORT_PROJECTION;
 	cp->custom_paths = paths;
-	cp->custom_private = list_make4(j->fkvar,
+	itupcol = fold ? 0 : oj_itup_col(j, ord);
+	if (itupcol > 0)
+		itup = list_make2(list_make1_oid(ord->indexinfo->indexoid),
+						  list_make1_int(itupcol));
+	cp->custom_private = list_make5(j->fkvar,
 									list_make1_oid(j->pkidx->indexoid),
 									keyinfo,
 									fold ?
 									list_make1_oid(j->keyidx->indexoid) :
-									NIL);
+									NIL,
+									itup);
 	cp->methods = &lion_ordjoin_path_methods;
 	return cp;
 }
@@ -2242,6 +2312,9 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *index = (List *) lsecond(best_path->custom_private);
 	List	   *keyinfo = (List *) lthird(best_path->custom_private);
 	List	   *fold = (List *) lfourth(best_path->custom_private);
+	List	   *itup = (List *) list_nth(best_path->custom_private, 4);
+	int			itupcol = (itup != NIL) ?
+		linitial_int((List *) lsecond(itup)) : 0;
 	List	   *sctlist = NIL;
 	List	   *keyops = NIL;
 	List	   *keycolls = NIL;
@@ -2318,12 +2391,16 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_plans = custom_plans;
 	cscan->custom_scan_tlist = sctlist;
 	cscan->custom_exprs = NIL;
-	cscan->custom_private = list_make5(list_make4_int(OJ_PRIV_MAGIC, nfact,
+	cscan->custom_private = list_make5(list_make5_int(OJ_PRIV_MAGIC, nfact,
 													  fkresno,
-													  list_length(keyinfo)),
+													  list_length(keyinfo),
+													  itupcol),
 									   list_copy(index), keyops, keycolls,
 									   keycols);
 	cscan->custom_private = lappend(cscan->custom_private, list_copy(fold));
+	cscan->custom_private = lappend(cscan->custom_private,
+									itup != NIL ?
+									list_copy((List *) linitial(itup)) : NIL);
 	cscan->methods = &oj_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -2404,6 +2481,9 @@ typedef struct OjState
 	OjKeySetState *keysets;
 	Oid			keyindex;		/* the fact key's lion index the key sets are
 								 * folded into (§47.6), or InvalidOid */
+	Oid			itupindex;		/* the fact's walked btree, whose index tuples
+								 * the key sets are tested on, or InvalidOid */
+	MemoryContext testcxt;		/* ... that test's, reset an entry */
 	uint64		rejected;		/* EXPLAIN ANALYZE: keys no key set holds */
 } OjState;
 
@@ -2417,6 +2497,40 @@ oj_create_state(CustomScan *cscan)
 	return (Node *) st;
 }
 
+/*
+ * The fact's walk's test of an entry's key, read from its btree's index tuple
+ * before the fetch (lion_ordered_entry_test()): what the join's own test
+ * after the fetch would make of the row, a NULL key rejected as the strict
+ * clause rejects it.  Only the rejections of keys are counted, as there.
+ */
+static bool
+oj_entry_test(void *arg, Datum key, bool isnull)
+{
+	OjState    *st = (OjState *) arg;
+	MemoryContext oldcxt;
+	int			i;
+
+	if (isnull)
+		return false;
+	oldcxt = MemoryContextSwitchTo(st->testcxt);
+	for (i = 0; i < st->nkeysets; i++)
+	{
+		/* not built yet: the join tests the row after the fetch */
+		if (st->keysets[i].keys == NULL)
+			continue;
+		if (ojkeys_lookup(st->keysets[i].keys, key) == NULL)
+			break;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextReset(st->testcxt);
+	if (i < st->nkeysets)
+	{
+		st->rejected++;
+		return false;
+	}
+	return true;
+}
+
 static void
 oj_begin(CustomScanState *node, EState *estate, int eflags)
 {
@@ -2428,6 +2542,8 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	List	   *keycolls;
 	List	   *keycols;
 	List	   *fold;
+	List	   *itup;
+	AttrNumber	itupcol;
 	int			ncols = list_length(cscan->custom_scan_tlist);
 	int			i;
 
@@ -2439,13 +2555,15 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	keycolls = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLL);
 	keycols = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLS);
 	fold = (List *) list_nth(cscan->custom_private, OJ_PRIV_FOLD);
-	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 4 ||
+	itup = (List *) list_nth(cscan->custom_private, OJ_PRIV_ITUP);
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5 ||
 		linitial_int(ints) != OJ_PRIV_MAGIC ||
 		index == NIL || !IsA(index, OidList) || list_length(index) != 1)
 		elog(ERROR, "LionOrderedJoin: unrecognized custom_private shape");
 	st->nfact = lsecond_int(ints);
 	st->fkresno = (AttrNumber) lthird_int(ints);
 	st->nkeysets = lfourth_int(ints);
+	itupcol = (AttrNumber) list_nth_int(ints, 4);
 	st->pkindex = linitial_oid(index);
 	st->ndim = ncols - st->nfact - st->nkeysets;
 	if (list_length(cscan->custom_plans) != 2 + st->nkeysets ||
@@ -2463,9 +2581,14 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 		list_length(keycols) != st->nkeysets ||
 		(fold != NIL &&
 		 (!IsA(fold, OidList) || list_length(fold) != 1 ||
-		  st->nkeysets < 1)))
+		  st->nkeysets < 1)) ||
+		(itup != NIL) != (itupcol > 0) ||
+		(itup != NIL &&
+		 (!IsA(itup, OidList) || list_length(itup) != 1 ||
+		  st->nkeysets < 1 || fold != NIL)))
 		elog(ERROR, "LionOrderedJoin: malformed plan");
 	st->keyindex = (fold != NIL) ? linitial_oid(fold) : InvalidOid;
+	st->itupindex = (itup != NIL) ? linitial_oid(itup) : InvalidOid;
 
 	/*
 	 * The sides, run by the join alone: neither scans backward nor marks.
@@ -2508,6 +2631,26 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 		ks->cxt = AllocSetContextCreate(estate->es_query_cxt,
 										"LionOrderedJoin key set",
 										ALLOCSET_DEFAULT_SIZES);
+	}
+
+	/*
+	 * The key sets tested on the fact's walked btree's index tuples (§47.6,
+	 * "Tested on the index tuple"), in memory of the test's own, reset an
+	 * entry: the walk may test many before it returns a row, and a key type's
+	 * functions may leave what they allocate behind.
+	 */
+	if (OidIsValid(st->itupindex) && !(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+	{
+		Plan	   *fplan = (Plan *) linitial(cscan->custom_plans);
+		TargetEntry *tle = (TargetEntry *) list_nth(fplan->targetlist,
+													st->fkresno - 1);
+		Oid			keytype = exprType((Node *) tle->expr);
+
+		st->testcxt = AllocSetContextCreate(estate->es_query_cxt,
+											"LionOrderedJoin key test",
+											ALLOCSET_SMALL_SIZES);
+		lion_ordered_entry_test(st->fact, itupcol, keytype, oj_entry_test,
+								st);
 	}
 }
 
@@ -2818,6 +2961,16 @@ oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 			char	   *name = get_rel_name(st->keyindex);
 
 			ExplainPropertyText("Key Set Index",
+								quote_identifier(name != NULL ? name : "???"),
+								es);
+		}
+
+		/* the fact's walked btree, on whose index tuples they are tested */
+		if (OidIsValid(st->itupindex))
+		{
+			char	   *name = get_rel_name(st->itupindex);
+
+			ExplainPropertyText("Key Sets Tested On",
 								quote_identifier(name != NULL ? name : "???"),
 								es);
 		}

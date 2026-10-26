@@ -850,6 +850,16 @@ typedef struct LionOrderedState
 	int			nkeyleaves;
 
 	/*
+	 * ... and its fact's key, tested for the join on the walked btree's index
+	 * tuple before the heap fetch (lion_ordered_entry_test(), DESIGN.md
+	 * §47.6): column entrycol of the btree, an entry entrytest turns away
+	 * not fetched.
+	 */
+	LionOrderedEntryTest entrytest;
+	void	   *entryarg;
+	AttrNumber	entrycol;
+
+	/*
 	 * ... narrowed, for a LionOrderedSplit's arm (DESIGN.md §48), to the rows
 	 * of one entry of the split's column: that entry's TIDs ANDed with the
 	 * set a container at a time as the split hands them in
@@ -7583,8 +7593,11 @@ lo_start_walk(LionOrderedState *st)
 								   estate->es_snapshot, st->nokeys,
 								   st->nobkeys);
 #endif
-		/* index-only mode reads the index tuples (§40.4), as core's does */
-		st->scan->xs_want_itup = st->indexonly;
+		/*
+		 * index-only mode reads the index tuples (§40.4), as core's does, and
+		 * so does a join's test of its key (lion_ordered_entry_test())
+		 */
+		st->scan->xs_want_itup = st->indexonly || st->entrytest != NULL;
 	}
 	index_rescan(st->scan, st->okeys, st->nokeys, st->obkeys, st->nobkeys);
 
@@ -8167,6 +8180,26 @@ lo_next(ScanState *ss)
 			st->distinct++;
 			st->hits++;
 		}
+
+		/*
+		 * A join's key sets, tested on the btree's copy of the fact's key
+		 * before the heap is read (DESIGN.md §47.6, "Tested on the index
+		 * tuple"): an entry whose key they lack is turned away unfetched.
+		 * Every version its TID reaches has the key the index tuple holds -
+		 * an update of an indexed column, an INCLUDE one too, is never HOT -
+		 * so the visible one, if any, would have been turned away by the
+		 * join's test after the fetch.
+		 */
+		if (st->entrytest != NULL && st->scan != NULL &&
+			st->scan->xs_itup != NULL)
+		{
+			bool		isnull;
+			Datum		key = index_getattr(st->scan->xs_itup, st->entrycol,
+											st->scan->xs_itupdesc, &isnull);
+
+			if (!st->entrytest(st->entryarg, key, isnull))
+				continue;
+		}
 		if (st->indexonly)
 		{
 			/* the index tuple's values; the heap for visibility (§40.4) */
@@ -8448,8 +8481,8 @@ lo_parallel_attach(LionOrderedState *st, LoShared *sh)
 		index_endscan(st->scan);
 	st->scan = lo_pscan_begin(st,
 							  (ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
-	/* index-only mode reads the index tuples (§40.4), as core's does */
-	st->scan->xs_want_itup = st->indexonly;
+	/* index-only mode reads the index tuples (§40.4), as does a key's test */
+	st->scan->xs_want_itup = st->indexonly || st->entrytest != NULL;
 	st->shared = sh;
 	st->counted = false;
 }
@@ -8998,6 +9031,36 @@ lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array)
 	if (st->lazy)
 		lo_lazy_end(st);
 	st->set = NULL;
+}
+
+/*
+ * Have a join's fact (DESIGN.md §47.6, "Tested on the index tuple") hand
+ * every entry it would fetch to `test` first, with the key the btree holds in
+ * its column indexcol (1-based, a key or an INCLUDE column), of the join
+ * key's type: one turned away is not fetched.  Called as the join begins,
+ * before the walk asks its btree for an index tuple; the plan has found that
+ * column (oj_itup_col()), and a btree walk always has one to give.
+ */
+void
+lion_ordered_entry_test(PlanState *ps, AttrNumber indexcol, Oid type,
+						LionOrderedEntryTest test, void *arg)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+	TupleDesc	desc;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &lo_exec_methods || !st->side ||
+		st->keyed || st->lionwalk || st->ordidx == NULL || st->scan != NULL)
+		elog(ERROR, "LionOrdered: not a join's fact walking a btree");
+	desc = RelationGetDescr(st->ordidx);
+	if (indexcol < 1 || indexcol > desc->natts ||
+		TupleDescAttr(desc, indexcol - 1)->atttypid != type ||
+		!index_can_return(st->ordidx, indexcol))
+		elog(ERROR, "LionOrdered: column %d of index \"%s\" does not hold the join's key",
+			 indexcol, RelationGetRelationName(st->ordidx));
+	st->entrytest = test;
+	st->entryarg = arg;
+	st->entrycol = indexcol;
 }
 
 /* ---------------------------------------------------------------------

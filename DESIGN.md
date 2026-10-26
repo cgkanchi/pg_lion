@@ -29634,6 +29634,12 @@ them (`lion_probe_rel_rows()`):
   its correlation) past `s` of the whole walk's are charged, for the share `1 - kept` of them the
   key sets reject, at `1 / s` of it in the run, which the Limit takes `s` of. Not alone under the
   LIMIT (`s` 1) or with nothing rejected it is 0; folded there is nothing to reject.
+- **The key sets tested on the index tuple** (§47.6, "Tested on the index tuple";
+  `oj_itup_col()`), not folded, where the walked B-tree holds the key: the walk fetches only the
+  members the key sets keep, so its heap price is that of `kept` of its fetches - `lo_cost()`'s
+  heap price over the whole walk (`lion_ordered_heap_price()`) for them in place of all of them, and
+  a `cpu_tuple_cost` less for each fetch not made - and nothing is fetched for nothing: the term
+  above is 0. The key's test is a hash probe, as after the fetch.
 - **A descent**, as `btcostestimate()` prices one: `ceil(log2(index tuples))` comparisons,
   `(tree_height + 1) * 50` operator costs for the pages descended, an index tuple, an operator;
   and the B-tree's pages the descents read, `index_pages_fetched(descents, index pages)` at
@@ -29781,7 +29787,8 @@ Cond`, `Filter`, `Lion Cond`, `Lion Indexes` - then `Dimension: <table> [<alias>
 and the dimension's side's lines behind `Dimension ` (`Dimension Filter`, `Dimension Lion Cond`,
 `Dimension Lion Indexes`; its index and its descent's key, the join's clause, are not repeated),
 then `Key Sets: <table>, ...` and, where they are folded into the fact's set, `Key Set Index:
-<index>` (§47.6). Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
+<index>`, or, where the fact's walked B-tree holds the key and they are tested on its index
+tuples, `Key Sets Tested On: <index>` (§47.6). Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
 Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`, `Rows Removed by Filter`, `Lion Set: N
 containers, exact|rechecked[, after N keys probed (probe budget)][, N builds]`, `Switched to Fetch
 and Sort` and the sort's method and space, `Scans Stopped Early`; then `Key Set Keys` (the last
@@ -29903,6 +29910,47 @@ alone, with `d.region < 10`, the node gave way to core's hash join without an in
 against 255 ms); at a `work_mem` of 64 MB core's nested loop over the rank's B-tree, a Memoize
 under its semi join, came out under both and ran 946 ms (§47.7).
 
+**Tested on the index tuple** (2026-10-26; `oj_itup_col()`, `lion_ordered_entry_test()`). The
+private workload's walked B-tree holds the key it joins on - `cpc_rank_idx (customer_product_id,
+version, model_score DESC) INCLUDE (company_id)` - while its lion index has the key as the eighth of
+twenty columns and a plain B-tree has it alone. Folding reads the postings of every key; the
+B-tree's index tuple has the key already. Where a column of the fact's walked B-tree - a key column
+or an INCLUDE one - is the key column itself, stored as the key's type and returnable
+(`oj_itup_col()`, and `lion_ordered_entry_test()` checks it again at run time), the join, not
+folded, has the walk hand it each member's key from the index tuple before the fetch
+(`oj_entry_test()`: each key set's hash probe, in a memory context of its own reset an entry), and
+an entry a key set rejects is turned away unfetched - an index-only walk does not visit the heap
+for its visibility either. The walk asks its B-tree for index tuples (`xs_want_itup`) as an
+index-only walk does. It is right for the same reason the fold is: every version a TID of the
+B-tree reaches holds the key its index tuple holds, an update of an indexed column - an INCLUDE one
+too - being never HOT, so the version the snapshot sees, if any, would have been rejected after the
+fetch; a NULL key is rejected as the strict clause rejects it, and not counted. A rejected row
+takes no tuple predicate lock, which core's plan, fetching it and filtering, would: under
+SERIALIZABLE the B-tree's own lock on the leaf page it read stands for it, as for core's index-only
+scan, and an update that moves the row's key into a key set writes a new entry there
+(`test/isolation/keyset_index_tuple_serializable.spec` ends in the serialization failure core's
+plan ends in). The join's test after the fetch stays, and passes every row. A rejected entry
+whose row is dead is not marked dead in the B-tree either, as a fetch that finds its chain dead
+marks it (`kill_prior_tuple`), so a later walk meets it again until VACUUM, as core's index-only
+scan leaves the entries it does not fetch: in ordjoin.sql a query walked twice walks 60 entries
+more the second time than it did when the first fetched them. EXPLAIN prints `Key Sets Tested On:
+<index>`, and under ANALYZE `Heap Fetches` are the kept members and `Keys Rejected by Key Sets` the
+rest. Folded paths are still offered beside them; `add_path()` keeps the cheaper.
+
+**Measured** (2026-10-26; the stand-in above, its indexes the private workload's: the key the third
+column of a multicolumn lion index `(product_id, intensity, company_id)`, a plain B-tree on the key,
+and the walked B-tree `(rank DESC) INCLUDE (company_id)`; release build, the median of five, warm,
+and buffers-cold as above).
+
+| key set | before the fold | folded (§47.6 above) | tested on the index tuple | core's plan |
+|---|---|---|---|---|
+| 746 keys | core's, 35 ms; cold 61 | core's, 32 ms; cold 56 | core's, 25 ms; cold 49 | 34 ms |
+| 19,817 keys | split, 57 ms (13,342 walked and fetched, 13,067 rejected); cold 493 | split folded, 75 ms (275 fetched); cold 92 | split, 27 ms (13,342 walked, 275 fetched, 13,067 rejected unfetched); cold 35 | 307 ms |
+
+Without the price of §47.3 for the rejected fetches the fold is not chosen (the split not folded,
+52 ms warm), which is the plan that read the disk for the workload's rejected rows; tested on the
+index tuple, the rejected rows are not fetched and need no price.
+
 ### 47.7 Not done
 
 - **A key set past `work_mem`.** Declined at plan time from the estimate; at run time a set
@@ -29939,13 +29987,13 @@ under its semi join, came out under both and ran 946 ms (§47.7).
   does not see, it could only be the rest of the join at once, the two sets hash-joined and sorted:
   core's plan of the join without the page's filters, a bound, but the dense page's 6.5 seconds on
   §47.10's tables. Either needs a price for the switch, as §30.4's has, and a sort past `work_mem`.
-- **A key set's keys tested before the fact's heap, without a lion index of the key.** Folded
-  where the key has one (§47.6). Without, the walk fetches the member's row and the join reads its
-  key; where the B-tree holds the key (`INCLUDE (fk)`) the key could be tested on the index tuple
-  and a rejected entry never fetched. An index-only walk fetches no row either way.
-- **The rejected fetches on a warm machine.** Not folded, the fetches a key set rejects are priced
-  at their own pages (§47.3), each page a `random_page_cost`, which is what they cost where the
-  walk reads the disk - the private workload's walk read 541,680 buffers - and many times what they
+- **A key set's keys tested before the fact's heap, where neither index holds the key.** Folded
+  where the key has a lion index, tested on the index tuple where the walked B-tree holds it
+  (§47.6). With neither, the walk fetches the member's row and the join reads its key.
+- **The rejected fetches on a warm machine.** Not folded, and where the walked B-tree does not hold
+  the key (§47.6, "Tested on the index tuple"), the fetches a key set rejects are priced at their
+  own pages (§47.3), each page a `random_page_cost`, which is what they cost where the walk reads
+  the disk - the private workload's walk read 541,680 buffers - and many times what they
   cost where the table is in memory. There the node can lose a page it runs faster: §47.6's
   measurements, the 2% key set over a B-tree of the key, 72 ms through the split and 326 through
   core's plan. And core's own nested loop over the fact's B-tree, its key table's semi join
@@ -30043,7 +30091,17 @@ dimension's, two leaves; an empty one; the whole join without a LIMIT; a LATERAL
 set is built and handed again for each of three rows (`Key Set Builds: 3`); a key updated and a row
 inserted in the transaction before the query. Not folded: a partial lion index of the key whose
 predicate the query does not imply, and folded into where it does; a key table of `bigint` keys,
-no key set; `pg_lion.enable_key_set_fold` off.
+no key set; `pg_lion.enable_key_set_fold` off. Section 6, the key tested on the index tuple: with
+no lion index of the key and the B-tree `(rank DESC) INCLUDE (fk)`, the split under product 7's
+key set walks the same 18,275 entries and fetches 55, 18,043 keys rejected unfetched, and with
+nothing forced the split is the plan, for product 3 too; repeated keys and NULLs, two key sets, a
+LATERAL rescan; a key updated, a row inserted and rows of the set's keys updated HOT in the
+transaction; and the key a key column, `(rank DESC, fk)`.
+test/isolation/keyset_index_tuple_serializable.spec: the write skew of a row whose key an update
+moves into the key set, after the join turned its entry away unfetched, ends in a serialization
+failure in either order of the commits. ordjoin.sql's B-tree `fact_grp_score` holds the key
+(`INCLUDE (fk)`), so its key sets are tested on the index tuple too: 191 heap fetches where there
+were 19,944, 2,750 where there were 82,302.
 
 ### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
