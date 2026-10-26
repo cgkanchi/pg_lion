@@ -676,15 +676,19 @@ SELECT d.id, count(*) AS n FROM bsp_dim d JOIN bsp_fact f ON f.dim_id = d.id
 
 DROP TABLE bsp_met;
 -- 8. A parallel nested loop: the outer side a parallel scan, the probe
---    below it in each participant - not parallel-aware, each building its
---    own set (DESIGN.md §40.10, "Parallel query").  Run as CREATE TABLE AS,
---    which may run in parallel where a plpgsql FOR loop may not.
+--    below it in each participant, run whole for that participant's outer
+--    rows - and parallel-aware for its set, which the participants build
+--    together, a part each, and read where it is in the Gather's shared
+--    memory (DESIGN.md §40.10, "Parallel query"; §40.9, "Built in parts").
+--    Run as CREATE TABLE AS, which may run in parallel where a plpgsql FOR
+--    loop may not.
 SET max_parallel_workers_per_gather = 2;
 SET parallel_setup_cost = 0;
 SET parallel_tuple_cost = 0;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
-CREATE FUNCTION bsp_par(q text) RETURNS text
+CREATE FUNCTION bsp_par(q text, memoize boolean DEFAULT false,
+						margin int DEFAULT 1000) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
@@ -694,12 +698,13 @@ DECLARE
 BEGIN
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
-	PERFORM set_config('enable_memoize', 'off', true);
-	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	PERFORM set_config('enable_memoize', memoize::text, true);
+	PERFORM set_config('pg_lion.pushdown_margin', margin::text, true);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
-		IF ln ~ '(Gather|Nested Loop|Parallel Seq Scan|Custom Scan \(LionBtreeScan\))' THEN
+		IF ln ~ '(Gather|Nested Loop|Parallel Seq Scan|Memoize|Custom Scan \(LionBtreeScan\))' THEN
 			shape := shape || CASE WHEN shape = '' THEN '' ELSE ' > ' END ||
-				substring(ln from '(Gather|Nested Loop|Parallel Seq Scan|LionBtreeScan)');
+				CASE WHEN ln ~ 'Parallel Custom Scan' THEN 'parallel LionBtreeScan'
+					 ELSE substring(ln from '(Gather|Nested Loop|Parallel Seq Scan|Memoize|LionBtreeScan)') END;
 		END IF;
 	END LOOP;
 	EXECUTE 'CREATE TEMP TABLE bsp_out AS SELECT s::text AS r FROM (' || q || ') s';
@@ -724,16 +729,16 @@ BEGIN
 END $$;
 SELECT bsp_par('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
  WHERE f.g < 20 AND d.tags && ARRAY[''t1'', ''t3'', ''t5''] AND d.verified AND d.grade = ''alpha''');
-                              bsp_par                               
---------------------------------------------------------------------
- Gather > Nested Loop > Parallel Seq Scan > LionBtreeScan, 284 rows
+                                   bsp_par                                   
+-----------------------------------------------------------------------------
+ Gather > Nested Loop > Parallel Seq Scan > parallel LionBtreeScan, 284 rows
 (1 row)
 
 SELECT bsp_par('SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
  WHERE f.g < 200 AND d.verified AND d.hue = ''green'' GROUP BY 1');
-                             bsp_par                              
-------------------------------------------------------------------
- Gather > Nested Loop > Parallel Seq Scan > LionBtreeScan, 7 rows
+                                  bsp_par                                  
+---------------------------------------------------------------------------
+ Gather > Nested Loop > Parallel Seq Scan > parallel LionBtreeScan, 7 rows
 (1 row)
 
 SET enable_hashjoin = off; SET enable_mergejoin = off; SET enable_memoize = off;
@@ -750,7 +755,7 @@ SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
          ->  Nested Loop
                ->  Parallel Seq Scan on bsp_fact f
                      Filter: (g < 200)
-               ->  Custom Scan (LionBtreeScan) on bsp_dim d
+               ->  Parallel Custom Scan (LionBtreeScan) on bsp_dim d
                      Index: bsp_dim_pkey (index only)
                      Index Cond: (d.id = f.dim_id)
                      Lion Cond: (d.verified AND (d.hue = 'green'::bsp_hue))
@@ -759,13 +764,106 @@ SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
 
 RESET enable_hashjoin; RESET enable_mergejoin; RESET enable_memoize;
 RESET pg_lion.pushdown_margin;
+-- The counters, the participants' summed (bsp_par_counters()), against the
+-- serial probe's: the members met, the set's, built in six parts at 64
+-- blocks a part; the Gather run again for each row of a nested loop above
+-- it, its set built again each run; no room to share it, each participant's
+-- own.  Then the answers: few outer rows, each participant's lazy set of the
+-- keys it probes - built for itself when its probes have cost a build, which
+-- depends on the rows it is handed - and a Memoize above the probe, each
+-- participant's own over the shared set.
+CREATE FUNCTION bsp_par_counters(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	node text := 'no probe';
+	hits bigint;
+	shits bigint;
+	lset text := 'none';
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_memoize', 'off', true);
+	PERFORM set_config('enable_material', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionBtreeScan\)' THEN
+			node := substring(ln from '(Parallel Custom Scan|Custom Scan)');
+		ELSIF ln ~ '^\s*Lion Set Hits:' THEN
+			hits := split_part(ln, ': ', 2)::bigint;
+		ELSIF ln ~ '^\s*Lion Set:' THEN
+			lset := regexp_replace(split_part(ln, ': ', 2), '^\d+ containers, ', '');
+		END IF;
+	END LOOP;
+	-- a set each participant built for itself counts the participants that ran
+	IF lset !~ 'shared' THEN
+		lset := regexp_replace(lset, ', \d+ builds$', '');
+	END IF;
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) ' || q LOOP
+		IF ln ~ '^\s*Lion Set Hits:' THEN
+			shits := split_part(ln, ': ', 2)::bigint;
+		END IF;
+	END LOOP;
+	PERFORM set_config('max_parallel_workers_per_gather', '2', true);
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_memoize', 'on', true);
+	PERFORM set_config('enable_material', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	RETURN format('%s, hits %s%s, set %s', node, hits,
+				  CASE WHEN hits = shits THEN ' as serially'
+					   ELSE ' - MISMATCH: ' || shits || ' serially' END,
+				  lset);
+END $$;
+SET pg_lion.shared_set_part_blocks = 64;
+SELECT bsp_par_counters('SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 200 AND d.verified AND d.hue = ''green'' GROUP BY 1');
+                              bsp_par_counters                              
+----------------------------------------------------------------------------
+ Parallel Custom Scan, hits 10611 as serially, set exact, shared in 6 parts
+(1 row)
+
+SELECT bsp_par_counters('SELECT * FROM (SELECT count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 200 AND d.verified AND d.hue = ''green'') ss RIGHT JOIN (VALUES (1), (2), (3)) v(i) ON true');
+                                   bsp_par_counters                                   
+--------------------------------------------------------------------------------------
+ Parallel Custom Scan, hits 31833 as serially, set exact, shared in 6 parts, 3 builds
+(1 row)
+
+SET pg_lion.enable_shared_set = off;
+SELECT bsp_par_counters('SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.g < 200 AND d.verified AND d.hue = ''green'' GROUP BY 1');
+                    bsp_par_counters                     
+---------------------------------------------------------
+ Parallel Custom Scan, hits 10611 as serially, set exact
+(1 row)
+
+RESET pg_lion.enable_shared_set;
+SELECT bsp_par('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
+ WHERE f.id < 60 AND d.verified AND d.hue = ''green''');
+                        bsp_par                         
+--------------------------------------------------------
+ Gather > Nested Loop > parallel LionBtreeScan, 34 rows
+(1 row)
+
+SELECT bsp_par('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+ WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
+			   memoize => true, margin => 10);
+                              bsp_par                              
+-------------------------------------------------------------------
+ Gather > Nested Loop > Memoize > parallel LionBtreeScan, 931 rows
+(1 row)
+
+RESET pg_lion.shared_set_part_blocks;
+DROP FUNCTION bsp_par_counters(text);
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
 RESET min_parallel_table_scan_size;
 RESET min_parallel_index_scan_size;
 SET max_parallel_workers_per_gather = 0;
-DROP FUNCTION bsp_par(text);
+DROP FUNCTION bsp_par(text, boolean, int);
 -- 9. A partitionwise join: each partition of the fact joined to the
 --    partition of the dimension with its keys, the probe of each dimension
 --    partition reparameterized from the fact's parent to its partition

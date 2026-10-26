@@ -735,21 +735,33 @@ typedef struct LoMemoEnt
 #include "lib/simplehash.h"
 
 /*
- * A parallel walk (DESIGN.md §40.9).  The participants of a parallel-aware
- * plan share the btree's parallel scan, which hands each of them leaf pages
- * of its own, and the lion set, which the first of them to need it builds
- * while the others wait: into the query's DSA when it fits the room a
- * Parallel Hash's table would have - a hash table's memory for each
- * participant planned - and each reads it there (LO_SHSET_SHARED); and
- * otherwise each builds its own, as the serial node does (LO_SHSET_OWN).
- * EXPLAIN ANALYZE's counters are summed here too.  The struct lives in the
- * Gather's dynamic shared memory, the btree's parallel scan descriptor
- * after it.
+ * A parallel walk (DESIGN.md §40.9), and a parallel nested loop's probe
+ * (§40.10).  The participants of a parallel-aware plan share the lion set,
+ * which they build together, a part of its container keys each (§40.9,
+ * "Built in parts"), while those with no part left wait: into the query's
+ * DSA when it fits the room a Parallel Hash's table would have - a hash
+ * table's memory for each participant planned - and each reads it there
+ * (LO_SHSET_SHARED); and otherwise each builds its own, as the serial node
+ * does (LO_SHSET_OWN).  A walk's participants share the btree's parallel
+ * scan too, which hands each of them leaf pages of its own; a probe's descend
+ * the btree each for its own outer rows.  EXPLAIN ANALYZE's counters are
+ * summed here too.  The struct lives in the Gather's dynamic shared memory, a
+ * walk's btree's parallel scan descriptor after it.
  */
 #define LO_SHSET_NONE		0	/* nobody has started the set */
-#define LO_SHSET_BUILDING	1	/* a participant is building it */
-#define LO_SHSET_SHARED		2	/* ... and has put it in the DSA */
-#define LO_SHSET_OWN		3	/* ... and kept it: each builds its own */
+#define LO_SHSET_BUILDING	1	/* participants are building its parts */
+#define LO_SHSET_SHARED		2	/* ... and have put them in the DSA */
+#define LO_SHSET_OWN		3	/* ... one did not fit: each builds its own */
+
+/*
+ * The most parts a set is built in, and the parts for each participant
+ * planned: two, so that the leader, which starts before the workers, and a
+ * participant that finishes early take another - and not more, since a part
+ * has a cost of its own: each walks a range's entries again, each entry's
+ * postings sought to the part (DESIGN.md §40.9, "Built in parts").
+ */
+#define LO_SHARED_PARTS		64
+#define LO_PARTS_EACH		2
 
 /* What EXPLAIN ANALYZE adds up over a parallel walk's participants */
 typedef struct LoCounts
@@ -760,6 +772,7 @@ typedef struct LoCounts
 	uint64		removed;
 	uint64		builds;
 	uint64		published;		/* builds put into the DSA for all */
+	uint64		parts;			/* ... and the parts they were built in */
 	uint64		earlystops;
 } LoCounts;
 
@@ -768,16 +781,26 @@ typedef struct LoShared
 	slock_t		mutex;
 	LoCounts	sums;			/* the workers', each added as it shuts down */
 
-	/* the set, and what its last builder saw of it */
+	/* the set, and what its builders saw of it */
 	int			setstate;		/* LO_SHSET_* */
 	ConditionVariable setcv;	/* broadcast as setstate leaves BUILDING */
-	dsa_pointer setimage;		/* LO_SHSET_SHARED: a LoSetImage */
 	Size		setroom;		/* the most of the DSA it may take */
 	int			ncont;
 	bool		exact;
 	Size		spillbytes;
+	uint32		gen;			/* the Gather's runs: one set each */
 
-	Size		pscanoff;		/* where the btree's parallel scan is */
+	/* its parts (lo_shared_set()): container keys [lo[i], lo[i + 1]) */
+	int			nplanned;		/* participants planned, the leader too */
+	int			nparts;
+	int			nextpart;		/* the next one nobody has taken */
+	int			partsdone;
+	bool		overflow;		/* one did not fit the room */
+	Size		used;			/* the room the parts put in the DSA take */
+	uint64		lo[LO_SHARED_PARTS + 1];
+	dsa_pointer part[LO_SHARED_PARTS];	/* each a LoSetImage */
+
+	Size		pscanoff;		/* where a walk's btree's parallel scan is */
 } LoShared;
 
 /*
@@ -1018,15 +1041,23 @@ typedef struct LionOrderedState
 	Size		sortrowcap;
 
 	/*
-	 * A parallel walk (DESIGN.md §40.9): the shared struct, once the Gather
-	 * has set it up; whether the set is a view of its shared copy; and - in
-	 * the leader - the workers' counters, taken from the sums as it shuts
-	 * down, with how much of the sums it has taken already, and the set as
-	 * its builder saw it, for a leader that never had one.
+	 * A parallel walk (DESIGN.md §40.9) or probe (§40.10): the shared struct,
+	 * once the Gather has set it up; whether the set is a view of its shared
+	 * copy, and of which of the Gather's runs; the container keys a part
+	 * being built is bounded by; and - in the leader - the workers' counters,
+	 * taken from the sums as it shuts down, with how much of the sums it has
+	 * taken already, and the set as its builders saw it, for a leader that
+	 * never had one.
 	 */
-	bool		parallel;		/* the plan is parallel-aware */
+	bool		parallel;		/* a parallel walk: the btree's pages shared */
+	bool		pshared;		/* the plan is parallel-aware: the set shared */
 	LoShared   *shared;
 	bool		setview;
+	bool		setused;		/* a set of the Gather's run setgen taken */
+	uint32		setgen;
+	bool		buildpart;		/* a part is being built: ... */
+	uint32		buildlo;		/* ... of container keys [buildlo, buildhi) */
+	uint64		buildhi;
 	bool		counted;		/* a worker's counters are in the sums */
 	LoCounts	wsums;
 	LoCounts	wseen;
@@ -1034,6 +1065,7 @@ typedef struct LionOrderedState
 	bool		wexact;
 	Size		wspill;
 	uint64		published;		/* sets this participant shared */
+	uint64		parts;			/* ... the parts it built of them */
 	uint64		attaches;		/* views this participant took of one */
 
 	/*
@@ -5505,21 +5537,58 @@ lo_physical_target(PlannerInfo *root, RelOptInfo *rel)
 									 make_pathtarget_from_tlist(build_physical_tlist(root, rel)));
 }
 
+/* Is path a LionBtreeScan probe (§40.10) as lo_set_rel_pathlist() made it? */
+static bool
+lo_is_probe(Path *path)
+{
+	return IsA(path, CustomPath) &&
+		((CustomPath *) path)->methods == &lion_btree_path_methods &&
+		path->param_info != NULL && !path->parallel_aware;
+}
+
+/*
+ * The probe as the loop above it holds it: a copy that returns its scan
+ * tuple through the relation's columns, where target is not NULL, and that is
+ * parallel-aware, under a Gather - or the probe itself, when neither applies.
+ */
+static Path *
+lo_loop_probe(Path *probe, PathTarget *target, bool partial)
+{
+	CustomPath *cp;
+
+	if (target == NULL && !partial)
+		return probe;
+	cp = makeNode(CustomPath);
+	memcpy(cp, probe, sizeof(CustomPath));
+	if (target != NULL)
+		cp->path.pathtarget = target;
+	cp->path.parallel_aware = partial;
+	return &cp->path;
+}
+
 /*
  * The nested loops among paths whose inner side is a LionBtreeScan probe
- * (§40.10): each takes a copy of the probe that returns its scan tuple
- * through the relation's columns, which the loop's own projection reads - as
- * core's Index Scan under a nested loop returns the heap tuple, since
- * create_nestloop_plan() asks its inner side for no particular target list.
- * Projected by the node, each row the probe returns cost it an interpreted
- * expression: 110 instructions and 3.6 mispredicted indirect branches a row
- * under callgrind.  The probe's own path keeps the relation's target for
- * every other parent - a Memoize, which caches the rows it returns and wants
- * them small, and an Append, whose children must return exactly its target -
- * the flags create_scan_plan() reads and PlanCustomPath is not given.
+ * (§40.10), each given a copy of the probe as its loop holds it.
+ *
+ * - Under a plain nested loop it returns its scan tuple through the
+ *   relation's columns, which the loop's own projection reads - as core's
+ *   Index Scan under a nested loop returns the heap tuple, since
+ *   create_nestloop_plan() asks its inner side for no particular target list.
+ *   Projected by the node, each row the probe returns cost it an interpreted
+ *   expression: 110 instructions and 3.6 mispredicted indirect branches a row
+ *   under callgrind.  The probe's own path keeps the relation's target for
+ *   every other parent - a Memoize, which caches the rows it returns and
+ *   wants them small, and an Append, whose children must return exactly its
+ *   target - the flags create_scan_plan() reads and PlanCustomPath is not
+ *   given.
+ * - Under a partial nested loop - below a Gather, run whole by each
+ *   participant, the outer side divided - and under a Memoize there, it is
+ *   parallel-aware, for its set alone: core then gives it the Gather's shared
+ *   memory, and the participants build the set together (§40.9, "Built in
+ *   parts") where each built its own.
  */
 static void
-lo_loop_probes(PlannerInfo *root, List *paths)
+lo_loop_probes(PlannerInfo *root, List *paths, bool partial)
 {
 	RelOptInfo *rel = NULL;
 	PathTarget *target = NULL;
@@ -5529,40 +5598,42 @@ lo_loop_probes(PlannerInfo *root, List *paths)
 	{
 		JoinPath   *jpath = (JoinPath *) lfirst(lc);
 		Path	   *inner;
-		CustomPath *cp;
 
 		if (!IsA(jpath, NestPath))
 			continue;
 		inner = jpath->innerjoinpath;
-		if (!IsA(inner, CustomPath) ||
-			((CustomPath *) inner)->methods != &lion_btree_path_methods ||
-			inner->param_info == NULL ||
-			inner->pathtarget != inner->parent->reltarget)
+		if (partial && IsA(inner, MemoizePath) &&
+			lo_is_probe(((MemoizePath *) inner)->subpath))
+		{
+			MemoizePath *mp = makeNode(MemoizePath);
+
+			memcpy(mp, inner, sizeof(MemoizePath));
+			mp->subpath = lo_loop_probe(mp->subpath, NULL, true);
+			jpath->innerjoinpath = &mp->path;
+			continue;
+		}
+		if (!lo_is_probe(inner) || inner->pathtarget != inner->parent->reltarget)
 			continue;
 		if (inner->parent != rel)
 		{
 			rel = inner->parent;
 			target = lo_physical_target(root, rel);
 		}
-		if (target == NULL)
-			continue;
-		cp = makeNode(CustomPath);
-		memcpy(cp, inner, sizeof(CustomPath));
-		cp->path.pathtarget = target;
-		jpath->innerjoinpath = &cp->path;
+		jpath->innerjoinpath = lo_loop_probe(inner, target, partial);
 	}
 }
 
 /*
  * set_join_pathlist_hook's part (lion_set_join_pathlist()): the paths core
  * made of joinrel so far, once a pair of its sides' are made.  A probe already
- * taken is not taken again: its target is no longer the relation's.
+ * taken is not taken again: its target is no longer the relation's, or it is
+ * parallel-aware.
  */
 void
 lion_ordered_join_probes(PlannerInfo *root, RelOptInfo *joinrel)
 {
-	lo_loop_probes(root, joinrel->pathlist);
-	lo_loop_probes(root, joinrel->partial_pathlist);
+	lo_loop_probes(root, joinrel->pathlist, false);
+	lo_loop_probes(root, joinrel->partial_pathlist, true);
 }
 
 /* ---------------------------------------------------------------------
@@ -6185,7 +6256,11 @@ lo_build_leaf(LionOrderedState *st, LoLeaf *leaf)
 
 	src = lion_source_open(leaf->index, leaf->keys, leaf->nkeys, false,
 						   st->buildcxt);
-	pgstat_count_index_scan(leaf->index);
+	/* a part of the set: its keys alone, the index's scan counted once */
+	if (st->buildpart)
+		lion_source_bound(src, st->buildlo, st->buildhi);
+	if (!st->buildpart || st->buildlo == 0)
+		pgstat_count_index_scan(leaf->index);
 	if (!lion_source_exact(src))
 		st->exact = false;
 	if (lion_source_sorted(src))
@@ -6316,6 +6391,28 @@ lo_build_set(LionOrderedState *st)
 	st->builds++;
 }
 
+/*
+ * A part of the set (lo_shared_set()): every leaf's source bounded to
+ * container keys [lo, hi), the leaves combined as for the whole - an AND or
+ * an OR of sets is one key at a time, so the whole's part is the parts' AND
+ * or OR.
+ */
+static void
+lo_build_part(LionOrderedState *st, uint32 lo, uint64 hi)
+{
+	lo_set_reset(st);
+	st->exact = !st->lossyqual;
+
+	lo_leaf_keys(st);
+	st->buildpart = true;
+	st->buildlo = lo;
+	st->buildhi = hi;
+	st->set = lo_build_node(st, st->tree);
+	st->buildpart = false;
+	MemoryContextReset(st->buildcxt);
+	st->spillbytes = st->spilled ? lion_arena_used(st->arena) : 0;
+}
+
 /* ---------------------------------------------------------------------
  * The set shared by a parallel walk's participants (DESIGN.md §40.9)
  * --------------------------------------------------------------------- */
@@ -6335,31 +6432,27 @@ lo_set_wait_event(void)
 #endif
 }
 
-/*
- * The set just built, copied into the DSA as one LoSetImage, or
- * InvalidDsaPointer when it would take more than `room` - or more than the
- * DSA will give.
- */
-static dsa_pointer
-lo_set_publish(LionOrderedState *st, dsa_area *dsa, Size room)
+/* The bytes the set just built takes as a LoSetImage. */
+static Size
+lo_image_size(const LionTidSet *set)
 {
-	LionTidSet *set = st->set;
 	Size		total = LO_IMAGE_HEAD(set->n);
-	dsa_pointer p;
-	LoSetImage *img;
-	Size	   *offs;
-	Size		off;
 	int			i;
 
 	for (i = 0; i < set->n; i++)
 		total += MAXALIGN(lion_container_size(set->conts[i]));
-	if (total > room)
-		return InvalidDsaPointer;
-	p = dsa_allocate_extended(dsa, total, DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
-	if (!DsaPointerIsValid(p))
-		return InvalidDsaPointer;
+	return total;
+}
 
-	img = (LoSetImage *) dsa_get_address(dsa, p);
+/* The set just built, copied to img: lo_image_size() bytes. */
+static void
+lo_image_write(LionOrderedState *st, LoSetImage *img, Size total)
+{
+	LionTidSet *set = st->set;
+	Size	   *offs;
+	Size		off;
+	int			i;
+
 	img->n = set->n;
 	img->exact = st->exact;
 	if (set->n > 0)
@@ -6377,88 +6470,240 @@ lo_set_publish(LionOrderedState *st, dsa_area *dsa, Size room)
 		off += MAXALIGN(size);
 	}
 	Assert(off == total);
-	return p;
 }
 
 /*
- * The set as a view of its shared copy: the keys and the containers read
- * where they are in the DSA, the directory of where each is and the walk's
- * places this participant's own.
+ * The set as a view of its shared parts: the containers read where they are
+ * in the DSA; the container keys - each part's in turn, which is their order
+ * - the directory of where each container is, and the walk's places, this
+ * participant's own.  A set of one part reads its keys in place too.
  */
 static void
-lo_set_attach(LionOrderedState *st, LoSetImage *img)
+lo_set_attach(LionOrderedState *st, LoShared *sh, dsa_area *dsa)
 {
+	LoSetImage *imgs[LO_SHARED_PARTS];
 	LionTidSet *set;
-	Size	   *offs = LO_IMAGE_OFFS(img);
-	int			i;
+	int			n = 0;
+	int			k = 0;
+	int			p;
 
 	lo_set_reset(st);
+	for (p = 0; p < sh->nparts; p++)
+	{
+		imgs[p] = (LoSetImage *) dsa_get_address(dsa, sh->part[p]);
+		n += imgs[p]->n;
+	}
 	set = (LionTidSet *) MemoryContextAllocZero(st->setcxt, sizeof(LionTidSet));
-	set->n = img->n;
-	set->cap = img->n;
-	set->keys = LO_IMAGE_KEYS(img);
+	set->n = n;
+	set->cap = n;
+	set->keys = (sh->nparts == 1) ? LO_IMAGE_KEYS(imgs[0]) :
+		(uint32 *) lo_set_alloc(st, st->setcxt,
+								sizeof(uint32) * (Size) Max(n, 1));
 	set->conts = (LionContainer **)
-		lo_set_alloc(st, st->setcxt,
-					 sizeof(LionContainer *) * (Size) Max(img->n, 1));
-	for (i = 0; i < img->n; i++)
-		set->conts[i] = (LionContainer *) ((char *) img + offs[i]);
+		lo_set_alloc(st, st->setcxt, sizeof(LionContainer *) * (Size) Max(n, 1));
+	for (p = 0; p < sh->nparts; p++)
+	{
+		LoSetImage *img = imgs[p];
+		Size	   *offs = LO_IMAGE_OFFS(img);
+		int			i;
+
+		if (sh->nparts > 1 && img->n > 0)
+			memcpy(set->keys + k, LO_IMAGE_KEYS(img),
+				   sizeof(uint32) * (Size) img->n);
+		for (i = 0; i < img->n; i++)
+			set->conts[k + i] = (LionContainer *) ((char *) img + offs[i]);
+		k += img->n;
+	}
 	st->set = set;
 	st->setview = true;
-	st->exact = img->exact;
+	st->exact = sh->exact;
 	lo_set_places(st);
 	st->spillbytes = 0;
 	st->attaches++;
 }
 
+/* The parts in the DSA let go of, by the one participant still there. */
+static void
+lo_parts_free(LoShared *sh, dsa_area *dsa)
+{
+	int			p;
+
+	for (p = 0; p < sh->nparts; p++)
+	{
+		if (DsaPointerIsValid(sh->part[p]) && dsa != NULL)
+			dsa_free(dsa, sh->part[p]);
+		sh->part[p] = InvalidDsaPointer;
+	}
+}
+
 /*
- * The set of a parallel walk (DESIGN.md §40.9): the first participant to need
- * it builds it, as the serial node does, and puts it into the DSA when it
- * fits the room; the others wait for it there and read it, or build their
- * own when it did not fit.  A builder's error ends the query, the waiters'
- * sleep with it: the leader rethrows a worker's error at its next interrupt
- * check, which the wait makes, and its abort ends every worker.
+ * pg_lion.shared_set_part_blocks: the fewest heap blocks a part of a shared
+ * set covers (DESIGN.md §40.9, "Built in parts") - 16,384, 128 MB of heap at
+ * 8 kB; the regression suite lowers it to build a small table's set in parts.
+ */
+static int	lion_shared_set_part_blocks = 16384;
+
+/*
+ * The set's parts: LO_PARTS_EACH for each participant planned, at most
+ * LO_SHARED_PARTS, each of at least pg_lion.shared_set_part_blocks of the
+ * nblocks the relation has now - one, the whole set, below two of them - by
+ * container key, the last part open-ended for the rows added since.
+ */
+static int
+lo_parts_plan(int nplanned, BlockNumber nblocks, uint64 *lo)
+{
+	uint64		ckeys = ((uint64) nblocks + LION_BLOCKS_PER_CONTAINER - 1) /
+		LION_BLOCKS_PER_CONTAINER;
+	uint64		least = Max((uint64) 1,
+							((uint64) lion_shared_set_part_blocks +
+							 LION_BLOCKS_PER_CONTAINER - 1) /
+							LION_BLOCKS_PER_CONTAINER);
+	uint64		n = (uint64) Min(LO_SHARED_PARTS,
+								 Max(nplanned, 1) * LO_PARTS_EACH);
+	uint64		i;
+
+	n = Max(Min(n, ckeys / least), (uint64) 1);
+	for (i = 0; i < n; i++)
+		lo[i] = ckeys * i / n;
+	lo[n] = PG_UINT64_MAX;
+	return (int) n;
+}
+
+/*
+ * Build part p and put it in the DSA, when the room the set may take has it:
+ * otherwise no part is built any more, and the set is each participant's own
+ * (LO_SHSET_OWN).  The last part done ends the build and wakes the waiters.
+ */
+static void
+lo_share_part(LionOrderedState *st, LoShared *sh, dsa_area *dsa, int p)
+{
+	dsa_pointer ptr = InvalidDsaPointer;
+	Size		size;
+	Size		spill;
+	bool		fits;
+	bool		exact;
+	bool		done;
+	bool		overflow;
+	int			ncont;
+
+	lo_build_part(st, (uint32) sh->lo[p], sh->lo[p + 1]);
+	ncont = st->set->n;
+	exact = st->exact;
+	spill = st->spillbytes;
+	size = lo_image_size(st->set);
+
+	SpinLockAcquire(&sh->mutex);
+	fits = (dsa != NULL && !sh->overflow && sh->used + size <= sh->setroom);
+	if (fits)
+		sh->used += size;
+	SpinLockRelease(&sh->mutex);
+	if (fits)
+	{
+		ptr = dsa_allocate_extended(dsa, size,
+									DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
+		if (DsaPointerIsValid(ptr))
+			lo_image_write(st, (LoSetImage *) dsa_get_address(dsa, ptr), size);
+	}
+	/* its own copy goes: it reads the shared one, as the others do */
+	lo_set_reset(st);
+
+	SpinLockAcquire(&sh->mutex);
+	if (DsaPointerIsValid(ptr))
+		sh->part[p] = ptr;
+	else
+	{
+		sh->overflow = true;
+		sh->partsdone += sh->nparts - sh->nextpart;
+		sh->nextpart = sh->nparts;
+	}
+	sh->ncont += ncont;
+	sh->exact = sh->exact && exact;
+	sh->spillbytes = Max(sh->spillbytes, spill);
+	done = (++sh->partsdone == sh->nparts);
+	overflow = sh->overflow;
+	if (done)
+		sh->setstate = overflow ? LO_SHSET_OWN : LO_SHSET_SHARED;
+	SpinLockRelease(&sh->mutex);
+
+	st->parts++;
+	if (done)
+	{
+		if (overflow)
+			lo_parts_free(sh, dsa);
+		else
+		{
+			st->builds++;
+			st->published++;
+		}
+		ConditionVariableBroadcast(&sh->setcv);
+	}
+}
+
+/*
+ * The set of a parallel walk or probe (DESIGN.md §40.9, "Built in parts"):
+ * the participants that need it build it together.  The first to come cuts
+ * its container keys into parts (lo_parts_plan()); each takes the next part
+ * nobody has, builds it as the serial node builds the whole, bounded to the
+ * part's keys, and puts it in the DSA, until none is left; then it waits for
+ * the parts the others are building, and reads them all where they are.  A
+ * part that does not fit the room ends the build: each participant then
+ * builds its own whole set, as the serial node does.  A builder's error ends
+ * the query, the waiters' sleep with it: the leader rethrows a worker's error
+ * at its next interrupt check, which the wait makes, and its abort ends every
+ * worker.
  */
 static void
 lo_shared_set(LionOrderedState *st)
 {
 	LoShared   *sh = st->shared;
 	dsa_area   *dsa = st->css.ss.ps.state->es_query_dsa;
-	dsa_pointer p;
+	uint64		lo[LO_SHARED_PARTS + 1];
+	int			nparts;
 	int			state;
+
+	/* no room: nothing is shared (pg_lion.enable_shared_set off) */
+	if (sh->setroom == 0)
+	{
+		lo_build_set(st);
+		return;
+	}
+	nparts = lo_parts_plan(sh->nplanned,
+						   RelationGetNumberOfBlocks(st->css.ss.ss_currentRelation),
+						   lo);
+	SpinLockAcquire(&sh->mutex);
+	if (sh->setstate == LO_SHSET_NONE)
+	{
+		sh->setstate = LO_SHSET_BUILDING;
+		sh->nparts = nparts;
+		memcpy(sh->lo, lo, sizeof(uint64) * (nparts + 1));
+		sh->nextpart = 0;
+		sh->partsdone = 0;
+		sh->overflow = false;
+		sh->used = 0;
+		sh->ncont = 0;
+		sh->exact = true;
+		sh->spillbytes = 0;
+	}
+	st->setgen = sh->gen;
+	SpinLockRelease(&sh->mutex);
+	st->setused = true;
+
+	for (;;)
+	{
+		int			p = -1;
+
+		SpinLockAcquire(&sh->mutex);
+		if (sh->setstate == LO_SHSET_BUILDING && sh->nextpart < sh->nparts)
+			p = sh->nextpart++;
+		SpinLockRelease(&sh->mutex);
+		if (p < 0)
+			break;
+		lo_share_part(st, sh, dsa, p);
+	}
 
 	SpinLockAcquire(&sh->mutex);
 	state = sh->setstate;
-	if (state == LO_SHSET_NONE)
-		sh->setstate = LO_SHSET_BUILDING;
-	p = sh->setimage;
 	SpinLockRelease(&sh->mutex);
-
-	if (state == LO_SHSET_NONE)
-	{
-		lo_build_set(st);
-		p = (dsa != NULL) ? lo_set_publish(st, dsa, sh->setroom) :
-			InvalidDsaPointer;
-		SpinLockAcquire(&sh->mutex);
-		sh->setimage = p;
-		sh->setstate = DsaPointerIsValid(p) ? LO_SHSET_SHARED : LO_SHSET_OWN;
-		sh->ncont = st->ncont;
-		sh->exact = st->exact;
-		sh->spillbytes = Max(sh->spillbytes, st->spillbytes);
-		SpinLockRelease(&sh->mutex);
-		ConditionVariableBroadcast(&sh->setcv);
-
-		/* its own copy goes: it reads the shared one, as the others do */
-		if (DsaPointerIsValid(p))
-		{
-			Size		spill = st->spillbytes;
-
-			lo_set_attach(st, (LoSetImage *) dsa_get_address(dsa, p));
-			st->spillbytes = spill;
-			st->published++;
-		}
-		return;
-	}
-
 	if (state == LO_SHSET_BUILDING)
 	{
 		ConditionVariablePrepareToSleep(&sh->setcv);
@@ -6466,7 +6711,6 @@ lo_shared_set(LionOrderedState *st)
 		{
 			SpinLockAcquire(&sh->mutex);
 			state = sh->setstate;
-			p = sh->setimage;
 			SpinLockRelease(&sh->mutex);
 			if (state != LO_SHSET_BUILDING)
 				break;
@@ -6475,7 +6719,7 @@ lo_shared_set(LionOrderedState *st)
 		ConditionVariableCancelSleep();
 	}
 	if (state == LO_SHSET_SHARED && dsa != NULL)
-		lo_set_attach(st, (LoSetImage *) dsa_get_address(dsa, p));
+		lo_set_attach(st, sh, dsa);
 	else
 		lo_build_set(st);
 }
@@ -7193,9 +7437,11 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 
 	/*
 	 * A parallel walk (DESIGN.md §40.9) is a btree's, over a set built at
-	 * once, and has no sort keys: it never switches.
+	 * once, and has no sort keys: it never switches.  A nested loop's probe
+	 * under a Gather is parallel-aware for its set alone (§40.10).
 	 */
-	st->parallel = cscan->scan.plan.parallel_aware;
+	st->pshared = cscan->scan.plan.parallel_aware;
+	st->parallel = st->pshared && !st->probe;
 	if (st->parallel &&
 		(st->lionwalk || st->knn || tree == NIL ||
 		 (priv.flags & LO_FLAG_BUILD) == 0 || priv.nsort > 0))
@@ -7203,11 +7449,11 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 
 	/*
 	 * A nested loop's probe (DESIGN.md §40.10) is an unordered btree walk
-	 * over a set, never parallel-aware: it has no sort keys, and it never
-	 * switches.
+	 * over a set: it has no sort keys, and it never switches - and a join's
+	 * side is never parallel-aware.
 	 */
 	if (st->probe &&
-		(st->parallel || st->lionwalk || st->knn ||
+		((st->pshared && st->side) || st->lionwalk || st->knn ||
 		 (tree == NIL && !st->side) || priv.nsort > 0))
 		elog(ERROR, "LionOrdered: malformed nested loop probe");
 
@@ -8184,14 +8430,16 @@ lo_next(ScanState *ss)
 
 	/*
 	 * The set: lazily, evaluated only where the walk goes, when its keys
-	 * can be sought (§30.4, "The set, lazily"); built otherwise - by one
-	 * participant of a parallel walk for all of them, when the Gather has
-	 * set one up (§40.9).
+	 * can be sought (§30.4, "The set, lazily"); built otherwise - by the
+	 * participants of a parallel walk or probe together, a part each, when
+	 * the Gather has set one up (§40.9), once a run of the Gather: a set
+	 * rebuilt in the same run is this participant's own.
 	 */
 	if (st->set == NULL && !st->noset && !st->lazy && !st->narrowing &&
 		!(st->lazyok && lo_lazy_begin(st)))
 	{
-		if (st->shared != NULL)
+		if (st->shared != NULL &&
+			!(st->setused && st->setgen == st->shared->gen))
 			lo_shared_set(st);
 		else
 			lo_build_set(st);
@@ -8587,11 +8835,12 @@ lo_pscan_begin(LionOrderedState *st, ParallelIndexScanDesc pscan)
 }
 
 /*
- * A participant joins the shared struct: the btree's parallel scan, in place
- * of a scan of its own - or of the scan of an earlier Gather run's memory,
- * which the leader has when the Gather was shut down and started again (a
- * LIMIT, then a rescan) - and the set, which an earlier run's view of
- * cannot be read any more.
+ * A participant joins the shared struct: a walk the btree's parallel scan, in
+ * place of a scan of its own - or of the scan of an earlier Gather run's
+ * memory, which the leader has when the Gather was shut down and started
+ * again (a LIMIT, then a rescan) - and the set, which an earlier run's view
+ * of cannot be read any more.  A probe's scans stay its own: each descends
+ * the btree for its own outer rows.
  */
 static void
 lo_parallel_attach(LionOrderedState *st, LoShared *sh)
@@ -8601,12 +8850,16 @@ lo_parallel_attach(LionOrderedState *st, LoShared *sh)
 		st->set = NULL;
 		st->setview = false;
 	}
-	if (st->scan != NULL)
-		index_endscan(st->scan);
-	st->scan = lo_pscan_begin(st,
-							  (ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
-	/* index-only mode reads the index tuples (§40.4), as does a key's test */
-	st->scan->xs_want_itup = st->indexonly || st->entrytest != NULL;
+	st->setused = false;
+	if (!st->probe)
+	{
+		if (st->scan != NULL)
+			index_endscan(st->scan);
+		st->scan = lo_pscan_begin(st,
+								  (ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
+		/* index-only mode reads the index tuples (§40.4), as does a key's test */
+		st->scan->xs_want_itup = st->indexonly || st->entrytest != NULL;
+	}
 	st->shared = sh;
 	st->counted = false;
 }
@@ -8616,6 +8869,8 @@ lo_estimate_dsm(CustomScanState *node, ParallelContext *pcxt)
 {
 	LionOrderedState *st = (LionOrderedState *) node;
 
+	if (st->probe)
+		return MAXALIGN(sizeof(LoShared));
 	return add_size(MAXALIGN(sizeof(LoShared)),
 					lo_pscan_estimate(st, node->ss.ps.state->es_snapshot,
 									  pcxt->nworkers));
@@ -8639,21 +8894,22 @@ lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	SpinLockInit(&sh->mutex);
 	ConditionVariableInit(&sh->setcv);
 	sh->setstate = LO_SHSET_NONE;
-	sh->setimage = InvalidDsaPointer;
 	sh->setroom = lion_enable_shared_set ?
 		(Size) Min(room, (double) (SIZE_MAX / 2)) : 0;
+	sh->nplanned = pcxt->nworkers + 1;
 	sh->pscanoff = MAXALIGN(sizeof(LoShared));
-	lo_pscan_initialize(st, node->ss.ps.state->es_snapshot, pcxt->nworkers,
-						(ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
+	if (!st->probe)
+		lo_pscan_initialize(st, node->ss.ps.state->es_snapshot, pcxt->nworkers,
+							(ParallelIndexScanDesc) ((char *) sh + sh->pscanoff));
 	memset(&st->wseen, 0, sizeof(LoCounts));
 	lo_parallel_attach(st, sh);
 }
 
 /*
- * Before the workers are launched again, for a rescan of the Gather: the
+ * Before the workers are launched again, for a rescan of the Gather: a walk's
  * btree's parallel scan starts over, and the set is built again by the next
- * run, whose parameters may be others - its shared copy freed, and the
- * leader's view of it let go first: the rescan of the leader's own node may
+ * run, whose parameters may be others - its shared parts freed, and the
+ * leader's view of them let go first: the rescan of the leader's own node may
  * come after this (ExecReScanGather()).  The sums are kept: they are the
  * whole execution's, as the leader's own counters are.  No participant is
  * running.
@@ -8672,11 +8928,12 @@ lo_reinitialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 		st->set = NULL;
 		st->setview = false;
 	}
-	if (DsaPointerIsValid(sh->setimage) && dsa != NULL)
-		dsa_free(dsa, sh->setimage);
-	sh->setimage = InvalidDsaPointer;
+	lo_parts_free(sh, dsa);
+	sh->nparts = 0;
 	sh->setstate = LO_SHSET_NONE;
-	index_parallelrescan(st->scan);
+	sh->gen++;
+	if (!st->probe)
+		index_parallelrescan(st->scan);
 }
 
 static void
@@ -8695,6 +8952,7 @@ lo_counts_add(LoCounts *a, const LoCounts *b, const LoCounts *c)
 	a->removed += b->removed - c->removed;
 	a->builds += b->builds - c->builds;
 	a->published += b->published - c->published;
+	a->parts += b->parts - c->parts;
 	a->earlystops += b->earlystops - c->earlystops;
 }
 
@@ -8729,6 +8987,7 @@ lo_shutdown(CustomScanState *node)
 		mine.removed = st->removed;
 		mine.builds = st->builds;
 		mine.published = st->published;
+		mine.parts = st->parts;
 		mine.earlystops = st->earlystops;
 		SpinLockAcquire(&sh->mutex);
 		lo_counts_add(&sh->sums, &mine, &zero);
@@ -8796,6 +9055,7 @@ lo_explain_parallel(LionOrderedState *st, StringInfo buf, ExplainState *es)
 	t.removed += st->removed;
 	t.builds += st->builds;
 	t.published += st->published;
+	t.parts += st->parts;
 	t.earlystops += st->earlystops;
 
 	ExplainPropertyInteger("Index Entries Walked", NULL, (int64) t.walked, es);
@@ -8813,6 +9073,9 @@ lo_explain_parallel(LionOrderedState *st, StringInfo buf, ExplainState *es)
 			appendStringInfo(buf, ", spilled %zu kB", (spill + 1023) / 1024);
 		if (t.published > 0)
 			appendStringInfoString(buf, ", shared");
+		if (t.published > 0 && t.parts > t.published)
+			appendStringInfo(buf, " in %llu parts",
+							 (unsigned long long) (t.parts / t.published));
 		if (t.builds > 1)
 			appendStringInfo(buf, ", %llu builds",
 							 (unsigned long long) t.builds);
@@ -8951,10 +9214,10 @@ lo_explain_counters(LionOrderedState *st, ExplainState *es,
 	 * parallel walk's do (§40.9): none are shown rather than this process's
 	 * zeros.  Its rows and loops are core's, summed over the workers.
 	 */
-	if (!st->parallel && !st->ran &&
+	if (!st->pshared && !st->ran &&
 		node->ss.ps.instrument != NULL && node->ss.ps.instrument->nloops > 0)
 		;
-	else if (st->parallel)
+	else if (st->pshared)
 		lo_explain_parallel(st, &buf, es);
 	else
 	{
@@ -9982,6 +10245,21 @@ lion_ordered_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §40.9, "Built in parts": the fewest heap blocks a part of a
+	 * shared set covers.  A testing knob: the regression suite lowers it to
+	 * build a small table's set in parts.
+	 */
+	DefineCustomIntVariable("pg_lion.shared_set_part_blocks",
+							"The fewest heap blocks a part of a shared lion set covers, built by one participant of a parallel plan.",
+							"A relation of fewer than twice as many blocks has its set built whole, by one participant.",
+							&lion_shared_set_part_blocks,
+							16384,
+							1, INT_MAX,
+							PGC_USERSET,
+							GUC_NOT_IN_SAMPLE,
+							NULL, NULL, NULL);
 
 	/*
 	 * DESIGN.md §40: the walks of a covering btree offered without an ORDER

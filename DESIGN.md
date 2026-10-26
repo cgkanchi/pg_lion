@@ -24390,17 +24390,19 @@ theirs, and the set, built once.
   divisor; the lion lookups and the set (the start-up), the B-tree's own cost and the heap's pages
   are each participant's whole. The partial path's rows are divided likewise.
 - **The set, built once** (`lo_shared_set()`). A `LoShared` in the Gather's dynamic shared memory,
-  the B-tree's parallel scan descriptor after it, holds the set's state. The first participant to
-  need the set builds it, as the serial node does, and when it fits the room a Parallel Hash's
-  table would have - `get_hash_memory_limit()` for each participant planned, the leader among them
-  - copies it into the query's DSA as one image (`lo_set_publish()`: the container keys, each
-  container's offset, the containers, and whether the set is exact); the others sleep on a
-  condition variable while it is built (the wait event `LionOrderedSetBuild` on 17 and later, the
-  generic `Extension` on 16) and then read its containers where they are (`lo_set_attach()`), each
-  with a directory and the walk's visited bits of its own. A set larger than that is built by each
-  participant for itself, spilling as the serial node's does (§30.4), and so is every set under
-  `pg_lion.enable_shared_set = off`. A builder's error ends the query: the leader rethrows it at its
-  next interrupt check, which its wait makes, and its abort ends every worker.
+  the B-tree's parallel scan descriptor after it, holds the set's state. The participants that
+  need the set build it together, a part of its container keys each ("Built in parts", below), as
+  the serial node builds the whole, and copy each part into the query's DSA as one image while it
+  fits the room a Parallel Hash's table would have - `get_hash_memory_limit()` for each participant
+  planned, the leader among them (`lo_image_write()`: the container keys, each container's offset,
+  the containers, and whether the part is exact); one with no part left sleeps on a condition
+  variable while the others finish theirs (the wait event `LionOrderedSetBuild` on 17 and later,
+  the generic `Extension` on 16), and then each reads the containers where they are
+  (`lo_set_attach()`), with a directory, the container keys and the walk's visited bits of its own.
+  A set larger than the room is built by each participant for itself, spilling as the serial
+  node's does (§30.4), and so is every set under `pg_lion.enable_shared_set = off`. A builder's
+  error ends the query: the leader rethrows it at its next interrupt check, which its wait makes,
+  and its abort ends every worker.
 - **What a participant does with an entry** is the serial node's, on the entries it is handed: the
   probe, the visibility map's test in index-only mode with a heap fetch for a page it does not call
   all-visible, the rechecks - the B-tree's under `xs_recheck`, and an inexact set's on the index
@@ -24414,14 +24416,16 @@ theirs, and the set, built once.
   only when the others met none, so it rarely fires; a count shared among them would need the
   met-before bits shared too.
 - **Rescans.** Before a Gather's workers are launched again (`ReInitializeDSM`), the B-tree's
-  parallel scan starts over (`index_parallelrescan()`) and the set's shared copy is freed, the
-  leader's view of it let go first, to be built again by the next run, whose parameters may be
-  others. A Gather Merge that a LIMIT shut down and that is rescanned initialises its memory afresh.
+  parallel scan starts over (`index_parallelrescan()`) and the set's shared parts are freed, the
+  leader's view of them let go first, to be built again by the next run, whose parameters may be
+  others; the run is counted (`gen`), and a set a participant needs again in the same run - a
+  lion Param changed under it, which no plan of this section's has - is its own. A Gather Merge that a LIMIT shut down and that is rescanned initialises its memory afresh.
 - **EXPLAIN** names the node `Parallel Custom Scan (LionBtreeScan)` or `(LionOrdered)`. Under
   ANALYZE the counters are the leader's own and the workers' sums, which each worker adds as it
   shuts down and the leader takes as it does (a LIMIT that stops the Gather early leaves the
   workers' out, as §27's parallel node does); `Lion Set` shows the set as the leader had it, or its
-  last builder when the leader took no part, `shared` when the participants read one copy. A walk
+  builders' when the leader took no part, `shared` when the participants read one copy, and `in N
+  parts` when it was built in more than one. A walk
   that is not parallel-aware but ran in a worker only - under `debug_parallel_query`, or the inner
   side of a join a worker ran - prints no counters: they stayed in the worker, since a
   CustomScan's DSM hooks are called for a parallel-aware node alone, and the leader's zeros would
@@ -24487,6 +24491,79 @@ build: 192 ms shared against 214 each its own on two workers, 152 against 197 on
 seven). Built in every participant at once, the set costs the same time on idle cores but as many
 times the CPU and memory, which on four busy ones shows; shared, it is built once and held once.
 So it is shared, and each builds its own only when it would not fit.
+
+**Built in parts** (2026-10-26). The first participant to need the set built it whole while the
+others waited, idle for the whole build - 1 to 2 s on the 85 GB dimension of §40.10, every worker
+of the Gather waiting on one. An AND or an OR of sets is decided one container key at a time, so
+the set's part at a range of container keys is the AND or the OR of its leaves' parts there, and
+the whole set is its parts in key order: the participants can build it a range each, with nothing
+to merge.
+
+- **The parts** (`lo_parts_plan()`). The first participant to need the set cuts the relation's
+  container keys - its blocks now, 64 to a key at 8 kB - into `LO_PARTS_EACH` (2) for each
+  participant planned, at most `LO_SHARED_PARTS` (64), each of at least
+  `pg_lion.shared_set_part_blocks` (16,384 blocks, 128 MB at 8 kB); the last part is open-ended,
+  for the rows added since. A relation of fewer than twice that has its set in one part, built
+  whole by one participant as before. Two for each participant, because the leader starts building
+  before the workers have started and a participant that finishes early can take another; not
+  more, because a part has a cost of its own: each walks a range's entries again ("Measured",
+  below).
+- **A part's build** (`lo_build_part()`). Each leaf's source is bounded to the part's keys
+  (`lion_source_bound()`): a SETS stream is sought to the first key and left at the last; a LIST's
+  batches and a WALK's entries are each sought as they open and left at the last key; a UNION's
+  windows start at the first key and stop at the last; a WINDOW's other columns are sought
+  likewise. A sparse segment can start below the key sought, and its keys below are skipped. The
+  leaves are combined as for the whole. A part is exact when every leaf's source was; the set is
+  exact when every part is. An index's scan is counted once, by the first part's build.
+- **Taken, built, put in the DSA** (`lo_share_part()`). A participant takes the next part nobody
+  has (`nextpart`, under the struct's spin lock), builds it in its own memory, copies it into the
+  DSA when the room still has it, and lets its own copy go; the last part done ends the build
+  (`LO_SHSET_SHARED`) and wakes the waiters. A part that does not fit the room ends the building:
+  the parts nobody has taken are counted done, the last part done frees the ones put in the DSA,
+  and each participant builds its own set (`LO_SHSET_OWN`). With no room at all
+  (`pg_lion.enable_shared_set` off) nothing is built in parts. A participant's view
+  (`lo_set_attach()`) reads each part's containers where they are, with the parts' container keys
+  copied in order into a directory of its own - a set of one part reads its keys in place too.
+- **What a waiter can wait on.** A participant takes a part only from inside the build, and
+  finishes it without waiting on anything: the build reads lion indexes and its own memory, and no
+  tuple queue. So every part taken ends, and the waiters with it, or the query ends with its
+  builder's error.
+- **The probe's set** (§40.10, "Parallel query") is built the same way: below a Gather a nested
+  loop's probe is parallel-aware for its set alone.
+- **The price** is not changed. A walk's (above) charges each participant the whole build, which
+  a set built in parts takes about the participants' share of; a probe's spreads the build over
+  the loop's scans, which at a participant's share of the scans is the build divided by core's
+  parallel divisor - what the parts take of each, as long as the set has parts enough for every
+  participant. A set of one part (a relation under 256 MB) is built by one participant while the
+  others wait, and that probe's price is low by the divisor, on the cheapest builds.
+
+**Measured** (2026-10-26, PostgreSQL 18.6 release build; the four-core VM shared with another
+benchmark, load 2 to 3; a timer around `lo_shared_set()` in each participant, the longest
+participant's time until the set is in hand, medians of five). A 4,000,000-row dimension of 665
+MB - 85,107 blocks, 1,330 container keys - probed by a parallel nested loop of 10,000 outer rows,
+two workers planned, at 1,024-block parts so that the parts are `LO_PARTS_EACH` for each
+participant:
+
+| set | whole, one builder | 1 part each (3) | 2 each (6) | 4 each (12) |
+|---|---|---|---|---|
+| tags overlap of four, a bool, two IN lists (a SETS source each) | 10.1 ms (7.6 to 26.8) | 10.7 | 7.9 | 7.6 |
+| a range over 3,000 of a column's 10,000 values, beside a bool | 119 (90 to 142) | 94 | 106 | 105 |
+
+The workers start a few milliseconds after the leader, so on a build of ten the leader builds
+most of the parts; a range's every part walks its 3,000 entries again, 25 to 30 ms a part on this
+table, so that more parts cost more than they divide. At the default part size the table's set
+is 5 parts, 88 to 104 ms for the range against 130 to 171 whole. A build of seconds - the 85 GB
+dimension's - leaves the workers' start a smaller share of it; this machine holds no such table to
+measure. The parts take the memory one set took, where each participant building its own took it
+as many times over.
+
+**Tests.** test/sql/btreescan_parallel.sql, section 11: at 64-block parts - six for the three
+participants planned - the answers and the counters of parallel walks against the serial walk's
+over a SETS source, a WALK of a range, a LIST longer than a batch, a UNION of a query that needs
+every row, an OR, an empty answer and a WINDOW of a long range beside another column's set in one
+index; the leader taking no part; no room; a Gather run again, its parts built again each run.
+test/sql/btreescan_param.sql, section 8, the same for a parallel nested loop's probe, and a
+Memoize above it.
 
 
 ### 40.10 A nested loop's probe: the walk parameterized (2026-10-23)
@@ -24628,11 +24705,17 @@ visibility-map test per member and the values from the index tuple.
   meets one. `lo_recheck()` would evaluate the original clauses, the join clause with the outer row's
   Param among them, and the lion qual, as for any walk.
 - **Parallel query.** The probe is `parallel_safe` when the relation is (`rel->consider_parallel`),
-  so a partial nested loop below a Gather runs it whole in each participant, the outer side divided;
-  it is never `parallel_aware` - a scan is a descent for one key, with nothing to divide. Each
-  participant then builds its own set: core calls a CustomScan's DSM hooks for a parallel-aware
-  node alone, so §40.9's shared set has no place to live, and the price charges the build once.
-  Its ANALYZE counters stay in the workers (§40.9).
+  so a partial nested loop below a Gather runs it whole in each participant, the outer side divided
+  - a scan is a descent for one key, with nothing to divide. Core calls a CustomScan's DSM hooks
+  for a parallel-aware node alone, so the probe is parallel-aware for its set: the join hook
+  (`lion_ordered_join_probes()`, 2026-10-26) gives each partial nested loop core made over a probe
+  - or over a Memoize over one - a copy of the probe marked `parallel_aware`, its own path left as
+  it was for the serial loops. Its participants then build the set together and read it from the
+  Gather's shared memory (§40.9, "Built in parts"), where each had built its own; the struct has no
+  parallel scan of the B-tree, each participant descending it for its own outer rows. EXPLAIN
+  names it `Parallel Custom Scan (LionBtreeScan)`, and its ANALYZE counters are the participants'
+  sums, as a parallel walk's. A lazy set (above) stays each participant's own - the containers its
+  own outer rows reach - and is built whole for itself when its probes have cost a build.
 - **Partitions.** A partitioned dimension's Append takes each partition's probe when its
   parameterization is the Append's (`reparameterize_path()` gives a CustomPath none). A
   partitionwise join's nested loop joins a fact partition to the dimension partition of the same
@@ -24688,8 +24771,6 @@ visibility-map test per member and the values from the index tuple.
   column has no descent to a key.
 - *A set from the join clause* - the outer row's key in the lion side: a set per outer row, which is
   §30.4's rebuild per Param at a loop's scale; the B-tree's descent does that part.
-- *Sharing the set among a parallel nested loop's participants*: core gives a CustomScan that is not
-  parallel-aware no shared memory; the set is each participant's, and the price is one build.
 
 **Not done.**
 
@@ -24697,7 +24778,9 @@ visibility-map test per member and the values from the index tuple.
   scans still pays its share of a build that happened whole on the first.
 - Duplicate outer keys with `enable_memoize` on but no Memoize chosen are charged the build
   `loops / D` times; it is built once.
-- A parallel nested loop's participants each build the set and are charged one build.
+- A parallel nested loop's participants build the set together (§40.9, "Built in parts"), and
+  are charged a participant's share of it; a set of one part, a relation under 256 MB, is built by
+  one while the others wait.
 - The container price of the build is the probe's alone. The walks of §40 keep §30.3's TID price,
   so a hash join over the dimension's whole covering walk carries a build priced several times the
   probe's for the same set: at 600,000 outer rows into 6M dimension rows the two plans tie on price
@@ -24722,7 +24805,9 @@ generic plan's Param in the lion filter, a subquery rescanned with its Param in 
 (built once) and in the lion filter (built for each value); a cursor fetched in pieces; pages not
 all-visible - inserts, deletes, HOT updates and lion-column updates in the transaction, then after
 it and after VACUUM (`Heap Fetches: 0`); a parallel nested loop (CREATE TABLE AS, Gather over a
-nested loop over a Parallel Seq Scan and the probe); a partitionwise join of hash-partitioned
+nested loop over a Parallel Seq Scan and the probe, parallel-aware: its set built in parts and its
+counters the participants' sums, against the serial probe's; a Gather run again; no room to share;
+few outer rows, each participant's lazy set; a Memoize over the probe); a partitionwise join of hash-partitioned
 tables, the probe reparameterized per partition; the price with nothing disabled (above): 3, 20
 and 80 outer rows and a 300-row dimension; and the settings - `enable_indexscan` and
 `enable_indexonlyscan` off, `pg_lion.enable_plain_scan` and `pg_lion.enable_ordered_scan` off

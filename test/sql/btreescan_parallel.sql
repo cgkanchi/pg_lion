@@ -569,6 +569,61 @@ RESET pg_lion.enable_semijoin;
 RESET pg_lion.enable_probe_join;
 SET pg_lion.enable_count_pushdown = off;
 DROP TABLE bpf, bpd;
+
+-- 11. Built in parts (DESIGN.md §40.9, "Built in parts"): with
+--     pg_lion.shared_set_part_blocks at 64 blocks - one container key - the
+--     set's keys are cut into six parts, two for each participant
+--     planned, which the participants build together, each leaf's source
+--     bounded to a part's keys: a SETS source's sets, a range's entries one
+--     by one (WALK), a list longer than a batch (LIST), a query that needs
+--     every row (UNION), an OR and an empty answer.  The answers and the
+--     counters are the serial walk's; EXPLAIN names the parts.  Then the
+--     leader taking no part; no room, where each participant builds its own
+--     set; a Gather run again, its parts built again each time; and, the
+--     other column's own index gone, a long range beside that column's set
+--     in one index (WINDOW).
+SET pg_lion.shared_set_part_blocks = 64;
+SET pg_lion.scan_window_floor = 64;
+CREATE INDEX bp_xc ON bp USING lion (x, c20);
+ANALYZE bp;
+SELECT bp_cmp('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
+SELECT bp_same('SELECT count(*), sum(x) FROM bp WHERE c20 = 3 AND tags @> ARRAY[''t3'']');
+SELECT bp_cmp('SELECT k, x FROM bp WHERE c20 BETWEEN 3 AND 5');
+SELECT bp_same('SELECT k, x FROM bp WHERE c20 BETWEEN 3 AND 5');
+SELECT bp_cmp('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3'']');
+SELECT bp_same('SELECT k, x FROM bp WHERE c2 = 1 OR tags @> ARRAY[''t3'']');
+SELECT bp_cmp($$SELECT id FROM bp WHERE tsv @@ '!w3'::tsquery$$);
+SELECT bp_same($$SELECT id FROM bp WHERE tsv @@ '!w3'::tsquery$$);
+SELECT bp_cmp('SELECT id FROM bp WHERE c20 = -1');
+SET work_mem = '64kB';
+SELECT bp_cmp('SELECT k, x FROM bp WHERE x IN (' ||
+			  (SELECT string_agg(i::text, ', ') FROM generate_series(1, 300, 3) i) || ')');
+SELECT bp_same('SELECT k, x FROM bp WHERE x IN (' ||
+			   (SELECT string_agg(i::text, ', ') FROM generate_series(1, 300, 3) i) || ')');
+RESET work_mem;
+SET parallel_leader_participation = off;
+SELECT bp_same('SELECT k, x FROM bp WHERE c20 BETWEEN 3 AND 5');
+RESET parallel_leader_participation;
+SET pg_lion.enable_shared_set = off;
+SELECT bp_cmp('SELECT k, x FROM bp WHERE c20 BETWEEN 3 AND 5');
+SELECT bp_same('SELECT k, x FROM bp WHERE c20 BETWEEN 3 AND 5');
+RESET pg_lion.enable_shared_set;
+SET enable_material = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT bp_cmp('SELECT * FROM (SELECT count(*), sum(x) FROM bp WHERE c20 BETWEEN 3 AND 5) ss
+			   RIGHT JOIN (VALUES (1), (2), (3)) v(i) ON true');
+RESET enable_material;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+-- the long range beside the other column's set, with no index of that
+-- column's own to take instead
+DROP INDEX bp_c20;
+SELECT bp_cmp('SELECT k, x FROM bp WHERE x < 900 AND c20 = 3');
+SELECT bp_same('SELECT k, x FROM bp WHERE x < 900 AND c20 = 3');
+DROP INDEX bp_xc;
+RESET pg_lion.scan_window_floor;
+RESET pg_lion.shared_set_part_blocks;
 DROP TABLE bp;
 DROP FUNCTION bp_fk_heap(text);
 DROP FUNCTION bp_fk(text);
