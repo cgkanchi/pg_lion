@@ -77,7 +77,15 @@ lion_child_attno(PlannerInfo *root, Index childrelid, AttrNumber parentattno)
  *
  * With `imply` (a partitioned table) a leaf leaves out the WHERE clauses its
  * partition bounds imply (lion_leaf_drops()), and needs no index for them:
- * its target's `dropped` says which, and its whereidx holds NULL there.
+ * its target's `dropped` says which, and its whereidx holds NULL there.  The
+ * same bounds say which of the residual clauses (imply->residual) the leaf
+ * tests none of its rows for (`residdrop`), and a leaf whose bounds refute
+ * one is left out.  A leaf that can neither answer a restriction nor leave
+ * it out asks for it to be residual instead where it could be
+ * (imply->residable, imply->wantresid), and the whole returns false then
+ * too, with imply->hard clear: the caller may try once more with those
+ * restrictions residual (DESIGN.md §16, "Residual clauses over a
+ * partitioned table").
  */
 /*
  * The constraint every row of leaf partition `relation` satisfies, as an
@@ -293,6 +301,130 @@ lion_deparse_rel_clause(PlannerInfo *root, Index rti, Node *clause)
 }
 
 /*
+ * The attribute number of toprel's column that child relation `childrelid`
+ * - a partition at any depth under it - numbers `childattno`: back up
+ * through each level's translated_vars (lion_child_var() goes the other
+ * way), or 0 when no column of toprel's maps to it.
+ */
+static AttrNumber
+lion_parent_attno(PlannerInfo *root, Index childrelid, Index toprelid,
+				  AttrNumber childattno)
+{
+	while (childrelid != toprelid)
+	{
+		AppendRelInfo *appinfo;
+		AttrNumber	parentattno = 0;
+		ListCell   *lc;
+		int			i = 0;
+
+		if (childrelid == 0 || childrelid >= (Index) root->simple_rel_array_size ||
+			root->append_rel_array == NULL ||
+			(appinfo = root->append_rel_array[childrelid]) == NULL)
+			return 0;
+		foreach(lc, appinfo->translated_vars)
+		{
+			Var		   *v = (Var *) lfirst(lc);
+
+			i++;
+			if (v != NULL && IsA(v, Var) && v->varattno == childattno)
+			{
+				parentattno = (AttrNumber) i;
+				break;
+			}
+		}
+		if (parentattno == 0)
+			return 0;
+		childattno = parentattno;
+		childrelid = appinfo->parent_relid;
+	}
+	return childattno;
+}
+
+/*
+ * The columns of partitioned table toprel that it, or a sub-partitioned
+ * child under it that the planner keeps, partitions by - the columns of the
+ * key expressions at every level, in toprel's numbering, as a Bitmapset of
+ * attnos (DESIGN.md §16, "Residual clauses over a partitioned table").  A
+ * clause on one of them with a Param or a stable function is what run-time
+ * pruning decides, which the node has none of, so it is never taken as
+ * residual: tested on the rows of every partition the plan keeps, it would
+ * fetch the rows of the partitions pruning would have skipped.
+ */
+static void
+lion_partition_key_attnos_in(PlannerInfo *root, RelOptInfo *toprel,
+							 RelOptInfo *rel, Bitmapset **attnos)
+{
+	int			k;
+	int			i;
+
+	check_stack_depth();
+	if (!IS_PARTITIONED_REL(rel) || rel->partexprs == NULL)
+		return;
+	for (k = 0; k < rel->part_scheme->partnatts; k++)
+	{
+		List	   *vars = pull_var_clause((Node *) rel->partexprs[k],
+										   PVC_RECURSE_PLACEHOLDERS);
+		ListCell   *lc;
+
+		foreach(lc, vars)
+		{
+			Var		   *v = (Var *) lfirst(lc);
+			AttrNumber	attno;
+
+			if (!IsA(v, Var) || v->varattno <= 0)
+				continue;
+			attno = (rel == toprel) ? v->varattno :
+				lion_parent_attno(root, rel->relid, toprel->relid,
+								  v->varattno);
+			if (attno > 0)
+				*attnos = bms_add_member(*attnos, (int) attno);
+		}
+		list_free(vars);
+	}
+	for (i = 0; i < rel->nparts; i++)
+	{
+		RelOptInfo *child = rel->part_rels[i];
+
+		if (child == NULL || !bms_is_member(i, rel->live_parts) ||
+			IS_DUMMY_REL(child))
+			continue;
+		lion_partition_key_attnos_in(root, toprel, child, attnos);
+	}
+}
+
+Bitmapset *
+lion_partition_key_attnos(PlannerInfo *root, RelOptInfo *toprel)
+{
+	Bitmapset  *attnos = NULL;
+
+	lion_partition_key_attnos_in(root, toprel, toprel, &attnos);
+	return attnos;
+}
+
+/*
+ * The residual clauses target t tests on its rows: `residual` less the ones
+ * its bounds imply (DESIGN.md §16, "Residual clauses over a partitioned
+ * table"); NIL when it tests none.
+ */
+List *
+lion_target_residual(List *residual, const LionCountTarget *t)
+{
+	List	   *kept = NIL;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (t->residdrop == NULL)
+		return residual;
+	foreach(lc, residual)
+	{
+		if (!t->residdrop[i])
+			kept = lappend(kept, lfirst(lc));
+		i++;
+	}
+	return kept;
+}
+
+/*
  * Is `clause`, over partitioned table toprel's columns, implied by the bounds
  * of every live leaf partition under `rel` (toprel itself, or one of its
  * sub-partitioned descendants)?  The leaves are the ones lion_collect_targets()
@@ -479,7 +611,7 @@ lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
  */
 static bool
 lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
-				const LionImply *imply, List *clauseinfos,
+				LionImply *imply, List *clauseinfos,
 				IndexOptInfo **idxs, bool **droppedp, int *ndroppedp,
 				bool *emptyp)
 {
@@ -495,6 +627,7 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 	bool	   *armdrop;		/* an OR's leaf, left out with its arm or alone */
 	bool	   *dropped;
 	int			ndropped = 0;
+	bool		wanted = false;
 	int			i;
 	int			r;
 	ListCell   *lc;
@@ -614,14 +747,33 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 		i++;
 	}
 
-	/* What the partition cannot answer, it must be able to leave out. */
+	/*
+	 * What the partition cannot answer, it must be able to leave out - or,
+	 * where the restriction could be tested on the rows instead
+	 * (imply->residable), the build may try once more with it residual
+	 * (§16, "Residual clauses over a partitioned table"): that is asked for
+	 * in wantresid, and this leaf declines, as it did.
+	 */
 	for (r = 0; r < nr; r++)
 	{
 		if (!need[r])
 			continue;
 		if (keep[r] || !LION_IMPLIED(r))
+		{
+			if (bms_is_member(r, imply->residable))
+			{
+				imply->wantresid = bms_add_member(imply->wantresid, r);
+				wanted = true;
+				continue;
+			}
 			return false;
+		}
 		drop[r] = true;
+	}
+	if (wanted)
+	{
+		imply->wanted = true;
+		return false;
 	}
 	if (!imply->driven && !lion_leaf_selects(clauseinfos, drop, orrange))
 		return false;
@@ -664,7 +816,7 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 bool
 lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 					const LionDriveInfo *drive, int ndrive, List *whereattnos,
-					List *clauseinfos, const LionImply *imply, List **targets)
+					List *clauseinfos, LionImply *imply, List **targets)
 {
 	RangeTblEntry *rte;
 	LionCountTarget *t;
@@ -691,6 +843,8 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 
 	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
 	{
+		bool		failed = false;
+
 		/* Pruned down to nothing: no targets, but no reason to bail either. */
 		if (IS_DUMMY_REL(rel))
 			return true;
@@ -729,11 +883,30 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 				cattnos = lappend_int(cattnos, (int) ca);
 			}
 
+			/*
+			 * A child that declines for a restriction it could test on its
+			 * rows instead (imply->wantresid) is passed over, so that every
+			 * leaf's such restrictions are known to the second attempt; one
+			 * that declines for anything else declines the query, as before.
+			 */
+			if (imply != NULL)
+				imply->wanted = false;
 			if (!lion_collect_targets(root, child, cdrive, ndrive, cattnos,
 									 clauseinfos, imply, targets))
+			{
+				if (imply != NULL && imply->wanted && !imply->hard)
+				{
+					failed = true;
+					continue;
+				}
+				if (imply != NULL)
+					imply->hard = true;
 				return false;
+			}
 		}
-		return true;
+		if (failed)
+			imply->wanted = true;	/* for the level above, if any */
+		return !failed;
 	}
 
 	/*
@@ -775,6 +948,41 @@ lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 	t = (LionCountTarget *) palloc0(sizeof(LionCountTarget));
 	t->rel = rel;
 	t->heapoid = rte->relid;
+
+	/*
+	 * The residual clauses (DESIGN.md §10) are tested on this leaf's rows -
+	 * but for one its bounds imply, which every row of it passes and it
+	 * tests none for, and one they refute, which no row of it passes: the
+	 * leaf counts nothing then, and is left out as one whose bounds refute
+	 * every arm of an OR is (§16, "Residual clauses over a partitioned
+	 * table").
+	 */
+	if (imply != NULL && imply->residual != NIL)
+	{
+		int			nres = list_length(imply->residual);
+
+		t->residdrop = (bool *) palloc0(sizeof(bool) * nres);
+		i = 0;
+		foreach(l1, imply->residual)
+		{
+			Node	   *clause = (Node *) lfirst(l1);
+
+			if (lion_leaf_refutes(root, rel, imply->toprel, partqual,
+								  list_make1(clause)))
+				return true;	/* no row of the leaf passes it */
+			if (lion_leaf_implies(root, rel, imply->toprel, partqual, clause))
+			{
+				t->residdrop[i] = true;
+				t->nresiddrop++;
+			}
+			i++;
+		}
+		if (t->nresiddrop == 0)
+		{
+			pfree(t->residdrop);
+			t->residdrop = NULL;
+		}
+	}
 
 	/*
 	 * The driving indexes - a GROUP BY column's (two of them for the nested

@@ -1520,7 +1520,7 @@ lion_resid_test(void *arg, HeapTuple tuple)
 	}
 	for (i = 0; i < st->nresidcol; i++)
 		slot->tts_values[st->residslotcol[i]] =
-			heap_getattr(tuple, st->residattno[i], hdesc,
+			heap_getattr(tuple, st->residheapattno[i], hdesc,
 						 &slot->tts_isnull[st->residslotcol[i]]);
 	ExecStoreVirtualTuple(slot);
 
@@ -1675,11 +1675,12 @@ lion_build_filter(LionCountScanState *st)
 
 	/*
 	 * ... and the residual clauses (DESIGN.md §10, "Residual clauses"), which
-	 * only the heap can decide.
+	 * only the heap can decide: the table's, or the ones this partition's
+	 * bounds do not imply (lion_open_relation(), DESIGN.md §16).
 	 */
 	if (st->resid != NULL)
 	{
-		if (RelationGetRelid(st->heap) != st->plan.heapoid)
+		if (st->npart == 0 && RelationGetRelid(st->heap) != st->plan.heapoid)
 			elog(ERROR, "LionCount: residual clauses over another relation");
 		filter->rowtest = lion_resid_test;
 		filter->rowtestarg = st;

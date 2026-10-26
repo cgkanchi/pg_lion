@@ -3763,9 +3763,10 @@ handed is fetched and tested.
 **Which clauses.** `lion_count_path_where()` tries each restriction as it always did; one the
 posting sets do not answer - or that only an index the table does not have would answer
 (`lion_where_indexed()`, asked here rather than when the indexes are matched, which declined the
-whole query) - is residual when `lion_residual_ok()` takes it: a plain table's count, not a
-partition's or an FK-side join's; Vars of the table's own user columns only (no system column, no
-whole row); nothing volatile, no subplan. Whatever the analysis had appended for it (the first
+whole query) - is residual when `lion_residual_ok()` takes it: a table's count, or a partitioned
+table's (§16, "Residual clauses over a partitioned table"), not an FK-side join's; Vars of the
+table's own user columns only (no system column, no whole row); nothing volatile, no subplan.
+Whatever the analysis had appended for it (the first
 arms of an OR, a range's bound) is undone from a snapshot of the build taken before it
 (`lion_count_path_snapshot()`): its own copy of every list the analysis appends to, the per-column
 lists of range bounds inside `rangecls` and `rangepos` included, which are appended to in place - a
@@ -3794,7 +3795,9 @@ virtual slot of the node's scan tuple, as the ordinary plan's scan initialises i
 checks EXECUTE on every function they call and calls the object access hook - at executor start,
 plain EXPLAIN included, and as the role that runs the plan. The test of a row
 (`lion_resid_test()`) copies the columns they read from the heap tuple into their places in that
-slot and evaluates the qual: a NULL result rejects the row, as a qual's does. It is the row
+slot and evaluates the qual: a NULL result rejects the row, as a qual's does. The columns are
+read at the numbers the relation counted gives them, looked up when it is made so
+(`lion_open_relation()`, `lion_heap_attno_in()`): the plan's are the parent's (§16). It is the row
 filter's `rowtest` (`LionRowFilter`, §17), set on the visibility cache every count of the
 execution is handed (`lion_build_filter()`), so every count the node makes - a plain count, each
 group of a walk or a batch, each test of a count(DISTINCT), the top k's candidates, both counts of
@@ -5589,7 +5592,8 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
   operator and an opfamily member and hash function for the compared type, all checked per
   partition because nothing stops two partitions from using different opclasses. A foreign table,
   or a leaf without one of the indexes, bails out - unless the leaf's bounds imply the clause, which
-  it then leaves out ("Clauses the partition bounds imply", below).
+  it then leaves out ("Clauses the partition bounds imply", below), or the clause can be tested on
+  the leaf's rows instead ("Residual clauses over a partitioned table", below).
 - The two §10 rules about what an index's entries MEAN are checked per partition for the same
   reason: the driving index's strategy-1 operator must be the grouping equality
   (`SortGroupClause.eqop`), and an index whose stored key will be printed - the group key in the
@@ -5607,7 +5611,8 @@ Planning (`lion_try_count_path`, `lion_collect_targets`)
 - One CustomPath per query - added to the grouped rel directly, or, for a GROUP BY, as the subpath
   of the Finalize Agg that is added instead (below). custom_private gains one member: LION_PRIV_PARTS, a
   list of one OidList per partition (heap Oid, driving index Oid or InvalidOid, then one index Oid
-  per WHERE clause in clause order), empty for a plain table. A partitioned plan leaves the index
+  per WHERE clause in clause order, then - shape 30 - one Oid per residual clause, 1 where the
+  partition's bounds imply it), empty for a plain table. A partitioned plan leaves the index
   Oids in LION_PRIV_OIDS invalid - there is no single index - and keeps the parent's heap Oid there,
   which is what EXPLAIN resolves column names against.
 - Cost: `lion_cost_count_rel()` is the per-relation estimate of §10, taking one relation's pages,
@@ -5930,6 +5935,104 @@ but the partition key has to be asked for (`lion_leaf_bound_value()`). A count o
 kind, count(*) ... GROUP BY kind`, still needs a lion index on kind in every partition: it would
 need an executor mode that counts one partition as one group, and a partition count with nothing
 left to select its rows by is one the node has never made.
+
+### Residual clauses over a partitioned table (2026-10-26)
+
+A count over a partitioned table declined every WHERE clause no index of its leaves answers, unless
+the leaves' bounds implied it: `count(*) ... WHERE country = 'US' AND ts >= '2026-10-19' AND ts <
+'2026-10-26'` over monthly partitions, or `... AND payload LIKE 'ab%'`, got the ordinary plan from
+the parent where the same count named one of the leaves and tested the clause on the heap row of
+each row the other clauses select (§10, "Residual clauses"). Now a partitioned table takes a
+residual clause as one table does, each leaf testing it on its own rows - but for the leaves whose
+bounds decide it.
+
+- **Which restrictions.** The decision is still the WHERE analysis's, restriction by restriction,
+  and `lion_residual_ok()` takes a partitioned table's as it takes a table's. A clause of no lion
+  shape - `payload LIKE 'ab%'`, `n % 2 = 0` - is residual unless every leaf's bounds imply it,
+  which is asked first (`lion_implied_everywhere()`, as before), so that a clause no row can fail is
+  left out of the plan rather than tested. A clause of the right shape on a column no leaf indexes -
+  `ts >= '2026-10-19'`, `id > 10` - is found out as a table's is, right after its analysis
+  (`lion_where_indexed()`): the parent has no indexes of its own, and its first live leaf's stand for
+  them, as they do for the column a sum over every row drives by (`lion_count_all_driver()`). Asked
+  then rather than when the partitions are matched, the clause can be residual before a range on an
+  unindexed column is made the walk's driver, whose missing index would decline the query outright.
+  An OR is left as answered: its arms may be what the bounds refute or imply, which narrows it to
+  clauses the indexes answer ("OR arms the partition bounds refute", above), and testing the whole OR
+  on the rows would throw that away. What the first leaf's indexes do not settle - a column some
+  leaf indexes and another does not, an OR no bounds narrow in some leaf - the partitions settle:
+  where a leaf can neither answer a restriction from an index nor leave it out by its bounds,
+  `lion_leaf_drops()` no longer declines the query but asks for the restriction to be residual
+  (`LionImply.wantresid`, among the restrictions `lion_residual_ok()` took, `residable`), the leaf
+  declines, the other leaves are asked the same (`lion_collect_targets()` passes such a leaf over,
+  and stops at a leaf that declines for anything else, `hard`), and the build is made once more from
+  the start with those restrictions residual (`lion_try_count_path_scoped()`, `forceresid`): once,
+  because the second attempt's partitions answer or leave out every clause left, as the first
+  established. Every restriction's number is the same in both attempts.
+- **Never on a partitioning key with a Param or a stable function.** `ts >= $1`, `ts >= now() -
+  interval '7 days'`: that is a clause run-time pruning decides, and the node has none - it counts
+  the partitions the planner kept ("What it does not change", above). Counted with the clause
+  residual, every partition pruning would have skipped fetches the rows the other clauses select
+  there, only to reject them. So `lion_residual_ok()` refuses it over a partitioned table, and the
+  query keeps the ordinary plan, whose Append prunes at run time; the same clause on any other
+  column (`payload LIKE $1`, `created_by = current_user`) is residual, tested everywhere. The keys
+  are the columns of every partitioning expression at every level the planner keeps, in the
+  parent's numbering (`lion_partition_key_attnos()`), a Var of a sub-partition's key mapped back up
+  through each level's translated_vars (`lion_parent_attno()`).
+- **Per leaf, implied or refuted.** Each target says which residual clauses its bounds imply
+  (`LionCountTarget.residdrop`, by `lion_leaf_implies()`, the proof of "Clauses the partition bounds
+  imply"): every row of the leaf passes them, and it tests none of its rows for them - fetches no row
+  at all where it keeps none, so the month in the middle of `ts >= ... AND ts < ...` is counted from
+  its indexes alone, and only the months at the ends read their heaps. A leaf whose bounds refute a
+  residual clause (`lion_leaf_refutes()`, weakly: false or NULL of every row) holds no row that
+  passes it and is left out, as a leaf whose bounds refute every arm of an OR is - which shows with
+  `enable_partition_pruning = off`, or for a clause pruning does not read. The plan carries the
+  flags per partition after its index Oids (`LION_PRIV_PARTS`, shape 30; `LionCountPrivPart.residdrop`),
+  as many as the residual clauses, which the executor counts against custom_exprs
+  (`lion_begin_partitions()`).
+- **The price, and the share.** The rows a leaf tests are its own estimate
+  (`lion_residual_rows(root, toprel, rel, ...)`): the parent's other restrictions mapped onto the
+  leaf's columns and estimated by its statistics, as a range source's are
+  (`lion_rel_clauses_selectivity()`), and its own pages at its own tablespace's costs
+  (`lion_cost_residual()`), summed over the leaves that test the clause. The half-the-table rule
+  (`LION_RESID_MAX_SHARE`) is asked of those leaves together - the rows they test against the rows
+  they hold - rather than of each: a sub-partition of the one kind the WHERE selects fetches every
+  row of its own, and would decline a query whose other partitions test a fifth of theirs, where the
+  ordinary plan is the whole table's and the question is of the whole. A query whose only testing
+  partition is such a sub-partition keeps the ordinary plan.
+- **The executor.** The residual qual is initialised at Begin over every clause, as before
+  (`lion_begin_residual()`, the EXECUTE checks included), and kept as `residall`. When a partition is
+  made the relation counted (`lion_open_relation()`), its own qual takes its place
+  (`lion_part_residual()`): the node's where it leaves none out, NULL where it leaves all out - its
+  counts then read the visibility map as a count without a residual does - and otherwise a qual
+  over the clauses it keeps, made at its first turn with `ExecInitQual()` in the query's context and
+  kept for the rescans (`LionPartState.resid`). The columns the clauses read are looked up in the
+  partition by name then (`lion_heap_attno_in()`, `residheapattno`), since a partition may number
+  them differently from the parent, whose numbering the plan's columns are in.
+- **EXPLAIN** prints the clauses under `Residual Filter`, as for a table, and the ones some
+  partitions leave out under `Implied by Partition Bounds`, each followed by `in N of M partitions`,
+  as it prints the indexed clauses they leave out:
+
+      Custom Scan (LionCount)
+        Partitions: ev_m1, ev_m2, ev_m3
+        Lion Indexes: (country = 'US'::text)
+        Residual Filter: ((day >= '2026-01-10'::date) AND (day < '2026-03-20'::date))
+        Implied by Partition Bounds: (day >= '2026-01-10'::date) in 2 of 3 partitions,
+                                     (day < '2026-03-20'::date) in 2 of 3 partitions
+
+`test/sql/partition_residual.sql` checks every answer against the pushdown off, forcing the node
+wherever it has a path, over a table RANGE-partitioned by day with one month sub-partitioned by
+LIST on kind and the first month attached with two columns dropped, so that it numbers the columns
+the clauses read differently: clauses on columns no index covers and expressions, tested in every
+partition; a range on the key implied by the partitions in the middle and tested at the ends,
+through a sub-partition's parent, implied by every partition kept (no residual), and beside a clause
+on the key no bound decides; with pruning off, the partition whose bounds refute the clause left
+out; a GROUP BY of one and of two columns, HAVING, a top k, `count(col)`, a filtered count, an IN
+list, a `<>`, an OR with a residual arm, a division by a column that is 0 in dead versions only,
+and a SELECT DISTINCT; a generic plan's parameter on the key against one off it, a stable
+expression on the key against one off it, a volatile function, a subplan, a residual clause alone,
+more than half the rows to fetch of every partition and of the one sub-partition left to test the
+clause, and the switch; a dirty heap before and after VACUUM; and a LATERAL value in the clause,
+which rescans the node partition by partition.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
