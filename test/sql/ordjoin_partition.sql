@@ -198,6 +198,15 @@ SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.
 SELECT oj('SELECT f.*, d.pk, d.flag, d.tags FROM fact f JOIN dim d ON f.fk = d.pk
 	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- a whole row of either parent: the leaf's row converted to the parent's
+-- row type (the attached leaf's has the dropped columns), output as the
+-- parent's whole-row column
+SELECT oj('SELECT f, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, d, row_to_json(f) FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
 
 -- 2. A key set beside them, from a leaf of the dimension's parent
 SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
