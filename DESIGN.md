@@ -5810,9 +5810,12 @@ of the partition, selects nothing there, and is left out of that partition's cou
   GROUP BY, no sum over a column's entries, no fk key (§27) - needs, in every partition, a positive
   clause or an OR of them that carries the §9 interlock (not a range collected into memory, §32),
   as the planner asks of the query as a whole (`pinnedsrc`). A partition that would have to leave
-  out every such clause declines the query: `count(*) ... WHERE kind = 'a' AND fk IS NOT NULL`,
-  over partitions that do not index kind, is still the ordinary plan's, and so is `count(*) ...
-  WHERE kind = 'a'`, a count of whole partitions, which the node has never made.
+  out every such clause declines the query. Since "Residual clauses over a partitioned table"
+  (below) a clause no partition indexes is left out before the analysis when every partition
+  implies it, as a clause no posting set answers always was, so `count(*) ... WHERE kind = 'a'`
+  and `... AND fk IS NOT NULL`, over partitions that do not index kind, are counted whole, by the
+  entries of one column of each (§35, "Every row"); a partition that indexes kind keeps the clause
+  as one its index answers, and leaves it out as before.
 - **Implied by every partition.** A clause no posting set answers at all - an operator no lion
   opclass has, an OR with an expression for an arm - declines the query unless every partition
   counted implies it (`lion_implied_everywhere()`); then it is left out of the plan altogether, and
@@ -5852,9 +5855,10 @@ clauses implied by every partition counted (through a parent's bound, an IN list
 year's range beside another clause and alone, an OR with an unanswerable arm, the default
 partition's NOT IN), by some and not others (a list one partition answers from its own index, a
 range taken as a source, an OR across columns), and not at all (the NULL partition's equality and
-null test, the default's equality, a range on the key that keeps the default partition); counts,
-GROUP BYs of one and two columns; the declines (nothing left to select rows by, a printed pinned
-column, a volatile arm, a generic plan's parameter against a custom plan's literal); and a dirty
+null test, the default's equality, a range on the key that keeps the default partition - residual
+there since 2026-10-26); counts, GROUP BYs of one and two columns; partitions counted whole where
+nothing is left to select rows by; the declines (a printed pinned column, a volatile arm, a generic
+plan's parameter against a custom plan's literal); and a dirty
 heap before and after VACUUM. Since "OR arms the partition bounds refute" it also checks a filter
 per kind ORed, counted and grouped by one and two columns, with a range beside it and without,
 before and after VACUUM; an arm a sub-partition's bound refutes, whose range then no longer keeps
@@ -5952,14 +5956,15 @@ bounds decide it.
   which is asked first (`lion_implied_everywhere()`, as before), so that a clause no row can fail is
   left out of the plan rather than tested. A clause of the right shape on a column no leaf indexes -
   `ts >= '2026-10-19'`, `id > 10` - is found out as a table's is, right after its analysis
-  (`lion_where_indexed()`): the parent has no indexes of its own, and its first live leaf's stand for
-  them, as they do for the column a sum over every row drives by (`lion_count_all_driver()`). Asked
-  then rather than when the partitions are matched, the clause can be residual before a range on an
-  unindexed column is made the walk's driver, whose missing index would decline the query outright.
-  An OR is left as answered: its arms may be what the bounds refute or imply, which narrows it to
-  clauses the indexes answer ("OR arms the partition bounds refute", above), and testing the whole OR
-  on the rows would throw that away. What the first leaf's indexes do not settle - a column some
-  leaf indexes and another does not, an OR no bounds narrow in some leaf - the partitions settle:
+  (`lion_where_indexed()`): the parent has no indexes of its own, and its live leaves' stand for
+  them, any one's (`lion_rel_has_index()`, through every level, the column translated for each
+  child). Asked then rather than when the partitions are matched, the clause can be residual before
+  a range on an unindexed column is made the walk's driver, whose missing index would decline the
+  query outright. An OR is left as answered: its arms may be what the bounds refute or imply, which
+  narrows it to clauses the indexes answer ("OR arms the partition bounds refute", above), and
+  testing the whole OR on the rows would throw that away. What the leaves' indexes do not settle - a
+  column some leaf indexes and another does not, which that leaf's own index answers where the
+  others' bounds imply the clause, or an OR no bounds narrow in some leaf - the partitions settle:
   where a leaf can neither answer a restriction from an index nor leave it out by its bounds,
   `lion_leaf_drops()` no longer declines the query but asks for the restriction to be residual
   (`LionImply.wantresid`, among the restrictions `lion_residual_ok()` took, `residable`), the leaf
