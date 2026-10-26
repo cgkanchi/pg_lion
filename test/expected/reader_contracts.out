@@ -19,7 +19,7 @@ INSERT INTO rcon SELECT g, g % 10, g % 7,
 	to_tsvector('simple', 'w' || (g % 10) || CASE WHEN g % 3 = 0 THEN ' secret' ELSE '' END)
   FROM generate_series(1, 3000) g;
 CREATE INDEX rcon_k ON rcon USING lion (k);
-CREATE INDEX rcon_j ON rcon USING lion (j);
+CREATE INDEX rcon_j ON rcon USING lion (j) WITH (slices = on);
 CREATE INDEX rcon_d ON rcon USING lion (d) WITH (store_positions = true);
 VACUUM ANALYZE rcon;
 -- every direct reader, each as one statement; a new one goes here
@@ -35,7 +35,8 @@ INSERT INTO rcon_readers VALUES
 	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$),
 	('lion_bm25_score, a named column', $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d', col => 'd') > 0$$),
 	('lion_index_facets',            $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_d', 3)$$),
-	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$);
+	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$),
+	('lion_index_slice_agg',         $$SELECT count || ' ' || sum || ' ' || min || ' ' || max FROM lion_index_slice_agg('%1$s_j', 'k = 3')$$);
 -- what each reader says for the relation rel: its answer, or its error
 CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE r text;
@@ -59,7 +60,8 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
  lion_index_count_stats          | 300
  lion_index_facets               | secret:1000 w0:300 w1:300
  lion_index_facets, filtered     | 3:15 5:15 0:14
-(11 rows)
+ lion_index_slice_agg            | 300 903 0 6
+(12 rows)
 
 -- sql's rows with lion's paths allowed and with all of them off
 CREATE FUNCTION rcon_same(sql text) RETURNS text LANGUAGE plpgsql AS $$
@@ -94,7 +96,8 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
  lion_index_count_stats          | cannot count through index "rcon_k" because row-level security is enabled on table "rcon"
  lion_index_facets               | cannot count through index "rcon_d" because row-level security is enabled on table "rcon"
  lion_index_facets, filtered     | cannot count through index "rcon_j" because row-level security is enabled on table "rcon"
-(11 rows)
+ lion_index_slice_agg            | cannot count through index "rcon_j" because row-level security is enabled on table "rcon"
+(12 rows)
 
 -- the planner's paths apply the policy: the same rows as seq scan
 SELECT rcon_same($$SELECT count(*) FROM rcon WHERE k = 3$$);
@@ -144,10 +147,34 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
  lion_index_count_stats          | permission denied for function int4eq
  lion_index_facets               | permission denied for function texteq
  lion_index_facets, filtered     | permission denied for function int4eq
-(11 rows)
+ lion_index_slice_agg            | permission denied for function int4eq
+(12 rows)
 
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) TO PUBLIC;
+-- ... and on an aggregate the query a reader stands for calls: refused by it
+-- (lion_index_slice_agg() stands for count, sum, min and max of the column)
+REVOKE EXECUTE ON FUNCTION sum(int4) FROM PUBLIC;
+SET ROLE rcon_reader;
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+              name               |              rcon_try               
+---------------------------------+-------------------------------------
+ lion_bm25                       | 10
+ lion_bm25, a named column       | 10
+ lion_bm25_score                 | true
+ lion_bm25_score, a named column | true
+ lion_index_count                | 300
+ lion_index_count, two keys      | 43
+ lion_index_count_any            | 600
+ lion_index_count_group_stats    | 1
+ lion_index_count_stats          | 300
+ lion_index_facets               | secret:1000 w0:300 w1:300
+ lion_index_facets, filtered     | 3:15 5:15 0:14
+ lion_index_slice_agg            | permission denied for aggregate sum
+(12 rows)
+
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION sum(int4) TO PUBLIC;
 -- an index that is not valid, as a failed CREATE INDEX CONCURRENTLY leaves
 -- one: refused
 UPDATE pg_index SET indisvalid = false
@@ -166,14 +193,15 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
  lion_index_count_stats          | cannot count through index "rcon_k" because the index is not valid
  lion_index_facets               | cannot count through index "rcon_d" because the index is not valid
  lion_index_facets, filtered     | cannot count through index "rcon_j" because the index is not valid
-(11 rows)
+ lion_index_slice_agg            | cannot count through index "rcon_j" because the index is not valid
+(12 rows)
 
 UPDATE pg_index SET indisvalid = true
  WHERE indexrelid IN ('rcon_k'::regclass, 'rcon_j'::regclass, 'rcon_d'::regclass);
 -- an unpopulated materialized view: refused, as querying it is
 CREATE MATERIALIZED VIEW rcon_mv AS SELECT * FROM rcon WITH NO DATA;
 CREATE INDEX rcon_mv_k ON rcon_mv USING lion (k);
-CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j);
+CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j) WITH (slices = on);
 CREATE INDEX rcon_mv_d ON rcon_mv USING lion (d) WITH (store_positions = true);
 SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
               name               |                      rcon_try                      
@@ -189,7 +217,8 @@ SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
  lion_index_count_stats          | materialized view "rcon_mv" has not been populated
  lion_index_facets               | materialized view "rcon_mv" has not been populated
  lion_index_facets, filtered     | materialized view "rcon_mv" has not been populated
-(11 rows)
+ lion_index_slice_agg            | materialized view "rcon_mv" has not been populated
+(12 rows)
 
 DROP MATERIALIZED VIEW rcon_mv;
 DROP FUNCTION rcon_same(text);
