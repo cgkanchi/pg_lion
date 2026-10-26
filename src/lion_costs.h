@@ -47,6 +47,10 @@ extern PGDLLIMPORT double lion_resident_page_cost;
 extern PGDLLIMPORT double lion_cold_page_cost;
 extern PGDLLIMPORT double lion_cold_stream_page_cost;
 
+/* A nested loop's B-tree probe (lion_ordered.c, DESIGN.md §40.10, §49) */
+extern PGDLLIMPORT double lion_probe_entry_cost;
+extern PGDLLIMPORT double lion_probe_rescan_cost;
+
 /* The count's walks: GROUP BY, count(DISTINCT), ranges (§20, §26, §28, §32) */
 extern PGDLLIMPORT double lion_entry_count_cost;
 extern PGDLLIMPORT double lion_list_group_cost;
@@ -99,6 +103,14 @@ extern PGDLLIMPORT double lion_pushdown_margin;
  * (DESIGN.md §39, "A nested loop's cold reads"): the warm floor.
  */
 extern PGDLLIMPORT double lion_cold_max_discount;
+
+/*
+ * Whether a lion path's price is corrected by what lion reads of the core
+ * plan it competes with (DESIGN.md §39): the rates, the cold reads, a skewed
+ * key's rows and a Memoize's LIMIT.  Off, a path is priced by its own work
+ * alone (DESIGN.md §49).
+ */
+extern PGDLLIMPORT bool lion_competitor_pricing;
 
 extern void lion_costs_init(void);
 

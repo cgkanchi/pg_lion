@@ -55,6 +55,11 @@ SHOW pg_lion.cold_max_discount;
 SHOW pg_lion.cold_stream_page_cost;
 RESET pg_lion.cold_max_discount;
 RESET pg_lion.cold_stream_page_cost;
+-- the switch that takes all of it away (DESIGN.md §49): a user setting,
+-- on by default
+SELECT name, setting, boot_val, vartype, context
+  FROM pg_settings
+ WHERE name = 'pg_lion.competitor_pricing';
 
 -- 60000 rows: g20, g200 and c2 at random, k a permutation of the ids under a
 -- btree for the ordered scan
@@ -111,7 +116,8 @@ BEGIN
 	FOREACH n IN ARRAY ARRAY['pg_lion.pushdown_margin', 'pg_lion.hashagg_rate',
 							 'pg_lion.agg_rate', 'pg_lion.hashjoin_rate',
 							 'pg_lion.mergejoin_rate',
-							 'pg_lion.bitmap_rate', 'pg_lion.enable_count_pushdown',
+							 'pg_lion.bitmap_rate', 'pg_lion.competitor_pricing',
+							 'pg_lion.enable_count_pushdown',
 							 'pg_lion.enable_semijoin', 'pg_lion.enable_ordered_scan',
 							 'pg_lion.enable_plain_scan',
 							 'enable_seqscan', 'enable_indexscan',
@@ -379,6 +385,27 @@ SELECT n, lcr_lion(q, sw) AS plan, lcr_hashrate(q, sw, 0.1) < 0.6 AS hashing_bou
 	   unnest('{0.05, 0.1, 0.5}'::float8[]) r
  GROUP BY n, q, sw ORDER BY n;
 
+
+-- With pg_lion.competitor_pricing off (DESIGN.md §49) a lion path is priced
+-- by its own work alone: no rate moves any of the paths above, and each costs
+-- what it costs with competitor pricing on and every rate at 1 - the
+-- reference, which the constants are fitted in (a margin of 100 on both
+-- sides keeps the lion path the plan)
+SELECT n, lcr_lion(q, sw || '{pg_lion.competitor_pricing, off}'::text[]) AS plan,
+	   lcr_cost(q, sw || '{pg_lion.competitor_pricing, off, pg_lion.hashagg_rate, 0.05, pg_lion.agg_rate, 0.05, pg_lion.hashjoin_rate, 0.05, pg_lion.mergejoin_rate, 0.05, pg_lion.bitmap_rate, 0.05}'::text[]) =
+	   lcr_cost(q, sw || '{pg_lion.competitor_pricing, off, pg_lion.hashagg_rate, 5, pg_lion.agg_rate, 5, pg_lion.hashjoin_rate, 5, pg_lion.mergejoin_rate, 5, pg_lion.bitmap_rate, 5}'::text[]) AS same_at_every_rate,
+	   lcr_cost(q, sw || '{pg_lion.competitor_pricing, off}'::text[]) =
+	   lcr_cost(q, sw || '{pg_lion.hashagg_rate, 1, pg_lion.agg_rate, 1, pg_lion.hashjoin_rate, 1, pg_lion.mergejoin_rate, 1, pg_lion.bitmap_rate, 1}'::text[]) AS reference_price
+  FROM (VALUES ('count', 'SELECT count(*) FROM lcr WHERE g200 = 17',
+				'{enable_bitmapscan, off, pg_lion.enable_plain_scan, off, pg_lion.pushdown_margin, 100}'::text[]),
+			   ('group', 'SELECT g20, count(*) FROM lcr GROUP BY g20',
+				'{enable_sort, off, pg_lion.pushdown_margin, 100}'),
+			   ('fkjoin, hash', 'SELECT count(*) FROM lcrf f JOIN lcrd d ON f.fk = d.pk WHERE d.attr = 2',
+				'{enable_mergejoin, off, enable_nestloop, off, pg_lion.pushdown_margin, 100}'),
+			   ('semi, merge', 'SELECT d.pk FROM lcrd d WHERE EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_hashjoin, off, enable_nestloop, off, pg_lion.pushdown_margin, 100}'),
+			   ('anti, hash', 'SELECT d.pk FROM lcrd d WHERE NOT EXISTS (SELECT 1 FROM lcrf f WHERE f.fk = d.pk AND f.x = 3)',
+				'{enable_mergejoin, off, enable_nestloop, off, pg_lion.pushdown_margin, 100}')) v(n, q, sw);
 
 -- ---------- 4. what is not converted ----------
 -- the AM's own scans (the count's pushdown off, sequential scans off) cost
