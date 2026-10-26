@@ -46,9 +46,9 @@
  * This header is private to the count engine, the files lion_count.h
  * declares the interface of: lion_set.c, lion_set_copy.c, lion_cursor.c,
  * lion_expr.c, lion_vis.c, lion_count.c, lion_count_groups.c,
- * lion_count_shared.c, lion_rangesrc.c, lion_range.c, lion_count_sql.c
- * and lion_facets.c.  What they share and nothing else needs is declared
- * here.
+ * lion_count_shared.c, lion_rangesrc.c, lion_range.c, lion_count_sql.c,
+ * lion_facets.c and lion_slice.c.  What they share and nothing else needs is
+ * declared here.
  *
  *-------------------------------------------------------------------------
  */
@@ -1457,6 +1457,17 @@ extern void lion_count_open_indexes(Snapshot snapshot, int nidx,
 									const Oid *idxoid, LionCountKey *keys,
 									AttrNumber wantcol, bool multikey_ok,
 									LionCountCall *call);
+
+/*
+ * The same for a caller whose query calls other functions than count(*) and
+ * the column's equality - lion_index_slice_agg()'s count(x), sum(x), min(x)
+ * and max(x) (DESIGN.md §50) - and checks EXECUTE on those itself:
+ * ownfuncs leaves both of those checks out, and everything else is as above.
+ */
+extern void lion_count_open_indexes_ext(Snapshot snapshot, int nidx,
+										const Oid *idxoid, LionCountKey *keys,
+										AttrNumber wantcol, bool multikey_ok,
+										bool ownfuncs, LionCountCall *call);
 extern void lion_count_sql_close(LionCountCall *call);
 extern void lion_count_sql_report(LionCountCall *call, int64 rows);
 
@@ -1465,5 +1476,47 @@ extern void lion_count_sql_report(LionCountCall *call, int64 rows);
  * (lion_check_execute()): an expression_tree_walker() callback, context NULL.
  */
 extern bool lion_check_functions_walker(Node *node, void *context);
+
+/*
+ * A FILTER GIVEN AS TEXT (lion_facets.c): the WHERE condition
+ * lion_index_facets() and lion_index_slice_agg() take, parsed and analysed
+ * against the table, taken apart into posting sets of the table's lion
+ * indexes (an AND and OR of equalities, IN lists, IS NULL and the multi-key
+ * operators; anything else is an ERROR that deparses it), and collected ONCE
+ * into a pinless copy (lion_sources_collect()) that each count ANDs with a
+ * set it locates with its pin (DESIGN.md §7, "Facet counts"; §10, "The WHERE
+ * sets, collected once").  `what` names it in the errors ("facet filter").
+ *
+ * lion_text_filter_begin() returns false when the filter selects no row;
+ * otherwise hasfilter says whether it restricts the rows at all, and when it
+ * does, hascopy whether it was collected into copy - always, but on a hot
+ * standby, where src is the filter's sets as a source of a count instead.
+ * Every index it reads is vetted (lion_reader_vet()) before it is read.
+ * lion_text_filter_report() counts a scan of each of them for
+ * pg_stat_user_indexes, but `except`; lion_text_filter_end() releases the
+ * sets, the copy and the indexes.
+ */
+typedef struct LionTextFilter
+{
+	const char *what;			/* "facet filter", "slice filter" */
+	Relation	heap;
+	Snapshot	snapshot;
+	List	   *indexes;		/* the lion indexes of heap, opened */
+	List	   *vetted;			/* OIDs of the ones lion_reader_vet() passed */
+	int			nsets;
+	int			maxsets;
+	LionPostingSet *sets;
+	bool		hasfilter;
+	bool		hascopy;
+	LionPostingSet copy;
+	LionCountSource src;
+} LionTextFilter;
+
+extern bool lion_text_filter_begin(LionTextFilter *tf, const char *what,
+								   Relation heap, Snapshot snapshot,
+								   const char *filter, LionCountStats *stats);
+extern void lion_text_filter_report(LionTextFilter *tf, Relation except,
+									int64 rows);
+extern void lion_text_filter_end(LionTextFilter *tf);
 
 #endif							/* LION_COUNT_INT_H */
