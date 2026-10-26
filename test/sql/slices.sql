@@ -288,12 +288,15 @@ RESET pg_lion.enable_count_slices;
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
 SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
 -- ranges, summed from the summaries, whose walk ends where the slices begin
+-- (the bitmap scan off: the two cost about the same here)
+SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k > -150;
 SELECT slc_both($$SELECT count(*) FROM %s WHERE k > -150$$);
 SELECT slc_both($$SELECT count(*) FROM %s WHERE k >= -200$$);
 SELECT slc_both($$SELECT count(*) FROM %s WHERE k BETWEEN -50 AND 50 AND g = 1$$);
 SELECT slc_both($$SELECT count(*) FROM %s WHERE ts >= '2020-03-01'$$);
 SELECT slc_both($$SELECT count(*) FROM %s WHERE k <> 3$$);
+RESET enable_bitmapscan;
 -- IS NOT NULL and a range by bitmap scans: a walk of the whole column
 SET pg_lion.enable_count_pushdown = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k IS NOT NULL;

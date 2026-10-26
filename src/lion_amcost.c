@@ -1824,6 +1824,130 @@ lion_cost_canonical_sel(PlannerInfo *root, IndexPath *path, double loop_count,
 }
 
 /*
+ * THE SLICES' PAGES (DESIGN.md §52, "The index's pages").  The planner
+ * prices a scan of a lion index by the index's pages - genericcostestimate()
+ * prorates them by the selectivity, the AND of sets and the count pushdown
+ * take a column's share of them - and a bit-sliced column's slices (§51) are
+ * pages no scan of its keys reads: nbits + 1 more posting sets of up to every
+ * row each, 13 to 28% of the index in §51.11, which priced the sliced
+ * index's scans dearer than the same index's without them.  So the planner is
+ * given the index's pages less the slices', as estimated here from their
+ * entries' headers (lion_slice_shape()): each slice's containers, a header
+ * each (LION_SLICE_ITEM_BYTES) and the smallest of the container kinds
+ * for its members a key - an ARRAY's two bytes a member, a bitmap of the
+ * heap's width, or a RUN of the rows it lacks there, which is what a slice
+ * every row of a key has (a constant bit, or E with no NULL) comes to.  A
+ * column whose slices the shape cannot read whole is taken as every slice
+ * holding half of every key's rows.  The pages hold their items with the
+ * fill a posting page has (LION_SLICE_PAGE_FILL).
+ *
+ * An estimate, not a count: the meta page keeps no page count of its own for
+ * the slices (§51.13), and lion_index_stats() walks every posting tree for
+ * one.  test/sql/slices_plan.sql compares the two.
+ */
+#define LION_SLICE_PAGE_FILL	0.87
+#define LION_SLICE_ITEM_BYTES	16.0	/* LION_CONTAINER_ITEM_BYTES */
+
+double
+lion_index_slice_pages(Relation index, double heap_pages, double tuples)
+{
+	LionIndexState *ix = lion_get_index_state(index);
+	double		nkeys = Max(ceil(Max(heap_pages, 1.0) /
+								 LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		perkey;
+	double		width;
+	double		cap;
+	double		bytes = 0.0;
+	int			c;
+
+	if (ix->meta.slice_cols == 0)
+		return 0.0;
+	tuples = Max(tuples, 1.0);
+	perkey = Max(tuples / nkeys, 1.0);
+	width = ceil(tuples / Max(heap_pages, 1.0) / 64.0);
+	if (width > (double) LION_NARROW_MAX_WIDTH)
+		width = (double) LION_BITSET_WIDTH;
+	cap = (double) LION_WIDTH_BYTES(1) * Max(width, 1.0);
+
+	for (c = 0; c < RelationGetNumberOfAttributes(index) &&
+		 c < INDEX_MAX_KEYS; c++)
+	{
+		LionSliceShape shape;
+		int			s;
+
+		if ((ix->meta.slice_cols & ((uint32) 1 << c)) == 0)
+			continue;
+		lion_slice_shape(index, (AttrNumber) (c + 1), &shape);
+		if (shape.nbits <= 0)
+			continue;
+		if (!shape.complete)
+		{
+			for (s = 0; s < shape.nbits; s++)
+			{
+				shape.rows[s] = tuples / 2.0;
+				shape.items[s] = nkeys;
+			}
+			shape.rows[shape.nbits] = tuples;
+			shape.items[shape.nbits] = nkeys;
+		}
+		for (s = 0; s <= shape.nbits; s++)
+		{
+			double		k = shape.items[s];
+			double		m;
+
+			if (k <= 0.0 || shape.rows[s] <= 0.0)
+				continue;
+			m = shape.rows[s] / k;
+			bytes += k * (LION_SLICE_ITEM_BYTES +
+						  Min(Min(2.0 * m, cap),
+							  4.0 * Max(perkey - m, 0.0) + 8.0));
+		}
+	}
+	return ceil(bytes / (LION_SLICE_PAGE_FILL * (double) BLCKSZ));
+}
+
+/*
+ * Every sliced lion index of rel planned by its pages less its slices'
+ * (lion_index_slice_pages()), from the hook that follows get_relation_info()
+ * (lion_am.c), which has the pages from the relation and the heap's from
+ * estimate_rel_size().  An index without slices is left as it is.
+ */
+void
+lion_leave_out_slice_pages(RelOptInfo *rel)
+{
+	Oid			lionam;
+	ListCell   *lc;
+
+	if (rel->indexlist == NIL)
+		return;
+	lionam = lion_get_am_oid();
+	if (!OidIsValid(lionam))
+		return;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	index;
+		double		slicepages;
+
+		if (idx->relam != lionam || idx->hypothetical || idx->pages <= 1)
+			continue;
+		/* the planner holds the index locked since get_relation_info() */
+		index = index_open(idx->indexoid, NoLock);
+		slicepages = (index->rd_rel->relkind == RELKIND_INDEX) ?
+			lion_index_slice_pages(index, (double) rel->pages, rel->tuples) :
+			0.0;
+		if (slicepages > 0.0)
+		{
+			elog(DEBUG1, "lion index \"%s\": %u pages, %.0f of them its slices' by their headers",
+				 RelationGetRelationName(index), idx->pages, slicepages);
+			idx->pages = (BlockNumber)
+				Max((double) idx->pages - slicepages, 1.0);
+		}
+		index_close(index, NoLock);
+	}
+}
+
+/*
  * Cost estimate: the generic estimate, with four corrections and the heap
  * correlation.  A scan that has to walk the whole index is priced as one
  * rather than as the selective lookup its predicate's output selectivity

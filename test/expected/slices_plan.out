@@ -943,7 +943,50 @@ SELECT slp_q('SELECT g % 2, sum(b) FROM slp GROUP BY g % 2');
  no pushdown, 2 rows
 (1 row)
 
--- ---------- 7. declined ----------
+-- ---------- 7. the index's pages ----------
+-- A scan of a sliced index's keys reads none of its slices, and the planner
+-- prices it by the index's pages less the slices', estimated from their
+-- entries' headers: as it prices the same index without slices, about.
+-- (Counting the slices' pages, the range's scan here was priced 1.4 times
+-- the unsliced index's, and the AND's 1.3.)
+REINDEX INDEX slp_v;
+CREATE INDEX slp_v2 ON slp USING lion (a, b, c, d, t, ts, tz);
+VACUUM ANALYZE slp;
+-- The price of the bitmap index scan alone, of q with no other scan:
+CREATE FUNCTION slp_cost(q text) RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	RETURN (j -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Total Cost')::numeric;
+END $$;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET pg_lion.enable_count_pushdown = off;
+BEGIN;
+DROP INDEX slp_v2;
+SELECT slp_cost('SELECT id FROM slp WHERE b = 15827') AS sliced_eq,
+	   slp_cost('SELECT id FROM slp WHERE c > 0') AS sliced_range,
+	   slp_cost('SELECT id FROM slp WHERE a IN (1, 2, 3) AND d > ''2000-01-01''') AS sliced_and \gset
+ROLLBACK;
+BEGIN;
+DROP INDEX slp_v;
+SELECT slp_cost('SELECT id FROM slp WHERE b = 15827') AS plain_eq,
+	   slp_cost('SELECT id FROM slp WHERE c > 0') AS plain_range,
+	   slp_cost('SELECT id FROM slp WHERE a IN (1, 2, 3) AND d > ''2000-01-01''') AS plain_and \gset
+ROLLBACK;
+SELECT round(:sliced_eq / :plain_eq, 1) AS eq, round(:sliced_range / :plain_range, 1) AS range,
+	   round(:sliced_and / :plain_and, 1) AS "and";
+ eq  | range | and 
+-----+-------+-----
+ 1.0 |   1.0 | 1.0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+DROP INDEX slp_v2;
+DROP FUNCTION slp_cost(text);
+-- ---------- 8. declined ----------
 -- a column that is not sliced, and a float column, which no slice takes
 SELECT slp_q('SELECT sum(r), max(r) FROM slp WHERE g = 3');
         slp_q        
@@ -1019,6 +1062,38 @@ SELECT slp_q('SELECT count(*) FROM slp_part WHERE k = 7');
  counts only, 1 rows
 (1 row)
 
+-- EXECUTE on what the node replaces (DESIGN.md §9, "Privileges"): an
+-- aggregate revoked is refused as the ordinary plan refuses it
+CREATE ROLE regress_slp_user;
+GRANT SELECT ON slp TO regress_slp_user;
+REVOKE EXECUTE ON FUNCTION max(int4) FROM PUBLIC;
+SET ROLE regress_slp_user;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) SELECT sum(b), min(b) FROM slp WHERE g = 3;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent)
+(3 rows)
+
+SELECT sum(b), min(b) FROM slp WHERE g = 3;
+  sum   |     min     
+--------+-------------
+ -18608 | -2147483648
+(1 row)
+
+SELECT sum(b), max(b) FROM slp WHERE g = 3;
+ERROR:  permission denied for aggregate max
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION max(int4) TO PUBLIC;
+REVOKE SELECT ON slp FROM regress_slp_user;
+DROP ROLE regress_slp_user;
 DROP TABLE slp, slp_dim, slp_part;
 DROP FUNCTION slp_lim();
 DROP FUNCTION slp_plan(text, bool);

@@ -2527,6 +2527,11 @@ extern bool lion_rel_is_unexpanded_parent(struct RangeTblEntry *rte);
 extern void lioncostestimate(struct PlannerInfo *root, struct IndexPath *path, double loop_count,
 							Cost *indexStartupCost, Cost *indexTotalCost, Selectivity *indexSelectivity,
 							double *indexCorrelation, double *indexPages);
+/* a sliced index's pages less its slices', as the planner prices it (lion_amcost.c) */
+struct RelOptInfo;
+extern double lion_index_slice_pages(Relation index, double heap_pages,
+									 double tuples);
+extern void lion_leave_out_slice_pages(struct RelOptInfo *rel);
 /* the entries a lion path's lookups hand their answer out by (lion_amcost.c) */
 extern double lion_cost_path_entries(struct PlannerInfo *root,
 									 struct IndexPath *path);
