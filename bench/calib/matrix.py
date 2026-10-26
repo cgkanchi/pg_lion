@@ -677,6 +677,10 @@ def main():
     args = ap.parse_args()
     if args.sweep is None:
         args.sweep = ['pg_lion.pushdown_margin=1,0.9,0.8,0.7,0.6,0.5']
+    for s in args.sweep:
+        k, _, vs = s.partition('=')
+        if not vs or any(len(v.split('+')) != len(k.split('+')) for v in vs.split(',')):
+            ap.error('--sweep %s: each value needs one part per setting, joined by +' % s)
     if args.files:
         if args.files[0] != 'compare' or len(args.files) != 3:
             ap.error('usage: matrix.py compare A.json B.json')
