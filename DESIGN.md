@@ -30840,9 +30840,10 @@ vacuumed. 48 queries of §40.10's, §46's, §47's, §47.6's, §48's and §49's s
 competitor_cold.sql's, each planned at the four settings of this switch and
 `pg_lion.enable_heap_probe` and timed with every plan core's and lion's forced arms make. Warm, the
 tables in the kernel's cache but not in `shared_buffers`: medians of seven runs, interleaved, and a
-second run of five that made the same choices. Cold - the server stopped, the database's files
-dropped from the kernel's cache, the server started, before each run (`matrix.py --cold`) - medians
-of three, 27 of the queries, planned at `effective_cache_size` 4 GB and 256 MB. Cold this disk reads
+second run of five that made the same choices. Cold - before each run `matrix.py --cold` ran a
+script that stopped the server (`pg_ctl stop`), ran `sync`, dropped each file of the database's
+directory from the kernel's cache (`posix_fadvise(POSIX_FADV_DONTNEED)`) and started the server -
+medians of three, 27 of the queries, planned at `effective_cache_size` 4 GB and 256 MB. Cold this disk reads
 1.5 GB/s in sequence and a random page in about 70 us.
 
 With the switch off, two warm choices change, both to slower plans: LionProbeJoin under a NOT
@@ -31044,7 +31045,7 @@ measures it.
   lesser of a lazy lookup and the build's share, is right for any share of the loop a LIMIT runs.
 - *LionProbeJoin's competitor under the heap probe*: where the probe's loop takes the join, every
   path of the upper rel has a lion path inside, `lion_competitor_path()` finds none, and the node's
-  rate falls from 0.5 to 1 - its price doubled (65,055 to 129,373) for nothing of its own: one more
+  rate rises from 0.5 to 1 - its price doubled (65,055 to 129,373) for nothing of its own: one more
   reason the rates are to be priced as work.
 - *LionOrderedJoin's rejected fetches* (§47.3, `ks.noinc.*`): priced at the LIMIT's own pages where
   core's loop doing the same fetches is priced its share of the whole walk's - 18,897 against 1,158
