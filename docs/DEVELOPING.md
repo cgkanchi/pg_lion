@@ -140,6 +140,11 @@ it, in `cpu_operator_cost`s - printed beside the setting that charges it (DESIGN
 too, the slope of its time over its quals, for comparison. `matrix.py` plans and times a fixed set of queries under
 every arm and reports the planner's mispicks (DESIGN.md §39, "The matrix"); `--set
 pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own work alone.
+`--setup-file bench/calib/joins.sql --queries bench/calib/joins.py` swaps in the joins of DESIGN.md
+§40.10 and §46 to §49 at scale (a 4.7 GB fixture at `--rows 4000000`), `--arms` plans under the
+named arms alone (`probejoin`, `ordjoin` and `probe` force lion's joins), `--sweep A+B=v+w,...`
+sweeps settings together, and `--cold CMD` runs CMD - one that stops the server, drops the
+database's files from the OS cache and starts it - before each timed run.
 
 ## Source layout
 
