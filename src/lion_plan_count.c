@@ -408,6 +408,8 @@ typedef struct LionCountPathBuild
 	bool		wcounts;		/* the counts of the target list besides */
 	bool		slicemode;		/* §52: this build answers aggregates of
 								 * sliced columns from their slices */
+	bool		slicedecode;	/* ... a GROUP BY's a batch of groups at a
+								 * time (§52, "The decode route") */
 	List	   *sattnos;		/* ... the columns they are taken over */
 	List	   *sidx;			/* ... the indexes whose slices they read
 								 * (IndexOptInfo) */
@@ -3899,6 +3901,7 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		(cx->driveattno != 0 ? LION_FLAG_GROUPIDX : 0) |
 		(cx->rangevar != NULL ? LION_FLAG_RANGE : 0) |
 		(cx->decode ? LION_FLAG_DECODE : 0) |
+		(cx->slicedecode ? LION_FLAG_SLICEDECODE : 0) |
 		(cx->residual != NIL ? LION_FLAG_RESID : 0);
 	p->resid = cx->residual;
 
@@ -4740,6 +4743,24 @@ lion_count_anti_parallel(const LionCountPathBuild *cx, Cost lookups,
 	return child;
 }
 
+/*
+ * The groups the executor takes in a batch of the walk of idx's entries
+ * (lion_count_groups_batch()), which the slices' decode route reads the
+ * slices once for (DESIGN.md §52).
+ */
+static int
+lion_count_groups_batch_est(IndexOptInfo *idx)
+{
+	Relation	index;
+	int			n;
+
+	/* the planner holds the index locked since get_relation_info() */
+	index = index_open(idx->indexoid, NoLock);
+	n = lion_count_groups_batch(index);
+	index_close(index, NoLock);
+	return n;
+}
+
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 {
@@ -4814,7 +4835,10 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							 cx->nwhere > 0 ||
 							 input_rel->baserestrictinfo != NIL,
 							 cx->wcounts || cx->nfilter > 0 || cx->ngroup > 0,
-							 (cx->ngroup > 0) ? cx->numgroups : 0.0);
+							 (cx->ngroup > 0) ? cx->numgroups : 0.0,
+							 cx->slicedecode ?
+							 lion_count_groups_batch_est(cx->first->driveidx[0]) :
+							 0);
 
 	/*
 	 * A range taken as a source (DESIGN.md §32) is collected - past the
@@ -5529,6 +5553,27 @@ lion_try_count_cells(const LionCountPathBuild *cxp)
 }
 
 /*
+ * May the aggregates of sliced columns of this GROUP BY be decoded a batch of
+ * groups at a time (DESIGN.md §52, "The decode route")?  The groups of one
+ * column's walk of its entries, which the executor takes a batch at a time:
+ * not a coalesce group, not the top k, and not where a WHERE clause names the
+ * grouping column - an IN list or an equality there drives the groups by its
+ * values, one at a time (§15) - and not on a hot standby, where the slices
+ * cannot be read without their pins.
+ */
+static bool
+lion_count_path_slices_decodable(LionCountPathBuild *cx)
+{
+	return lion_enable_slice_decode &&
+		cx->slicemode && cx->sattnos != NIL && cx->ngroup == 1 &&
+		!cx->decode && cx->groupcoal == NULL && cx->topkn == 0 &&
+		cx->groupattno[0] > 0 &&
+		!list_member_int(cx->whereattnos, cx->groupattno[0]) &&
+		cx->first != NULL && cx->first->driveidx[0] != NULL &&
+		!RecoveryInProgress();
+}
+
+/*
  * May a GROUP BY of two columns, made the nested loop of DESIGN.md §20, be
  * the decoded walk of §34 as well?  On the terms of three columns
  * (lion_count_path_group_by(), lion_count_path_strategy()): one table, not a
@@ -5788,6 +5833,22 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 		return false;
 	cpath = lion_count_path_make(cx);
 	lion_count_path_add(cx, cpath);
+
+	/*
+	 * The aggregates of sliced columns of a GROUP BY of one column are counted
+	 * a group at a time - a copy of the group's rows and the slices counted
+	 * against it - or decoded a batch of groups at a time, the slices read
+	 * once a batch (DESIGN.md §52, "The decode route"): both are priced, and
+	 * add_path() keeps the cheaper.
+	 */
+	if (lion_count_path_slices_decodable(cx))
+	{
+		cx->slicedecode = true;
+		lion_count_path_fill(cx);
+		cpath = lion_count_path_make(cx);
+		lion_count_path_add(cx, cpath);
+		cx->slicedecode = false;
+	}
 
 	/*
 	 * Two columns are the nested loop of DESIGN.md §20, which ANDs the sets of

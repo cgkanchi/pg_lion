@@ -17,8 +17,9 @@ SET DateStyle = 'ISO, YMD';
 /*
  * slp_q() runs q with the lion paths preferred - every other scan disabled -
  * then as a sequential scan with the pushdown off, and compares the two as
- * multisets.  It says what the node did: answered aggregates from slices,
- * over keys (§37), counts only, or nothing.
+ * multisets.  It says what the node did: answered aggregates from slices -
+ * a GROUP BY's decoded a batch of groups at a time - over keys (§37), counts
+ * only, or nothing.
  */
 CREATE FUNCTION slp_q(q text) RETURNS text
 LANGUAGE plpgsql AS $$
@@ -26,6 +27,7 @@ DECLARE
 	ln text;
 	used boolean := false;
 	slices boolean := false;
+	decoded boolean := false;
 	keys boolean := false;
 	nrows bigint;
 	ndiff bigint;
@@ -42,6 +44,9 @@ BEGIN
 		END IF;
 		IF ln ~ 'Aggregates Over Keys:' THEN
 			keys := true;
+		END IF;
+		IF ln ~ 'Slice Groups: decoded' THEN
+			decoded := true;
 		END IF;
 	END LOOP;
 	EXECUTE format('CREATE TEMP TABLE slp_on AS SELECT s::text AS r FROM (%s) s', q);
@@ -62,7 +67,8 @@ BEGIN
 		RETURN format('MISMATCH: %s rows differ', ndiff);
 	END IF;
 	RETURN format('%s, %s rows',
-				  CASE WHEN slices THEN 'from slices' WHEN keys THEN 'over keys'
+				  CASE WHEN decoded THEN 'from slices, decoded'
+					   WHEN slices THEN 'from slices' WHEN keys THEN 'over keys'
 					   WHEN used THEN 'counts only' ELSE 'no pushdown' END,
 				  nrows);
 END $$;
@@ -262,28 +268,63 @@ SELECT * FROM slp_plan('SELECT count(b), sum(b) FROM slp WHERE g = 3', true);
 -- test/isolation/slices_pushdown.spec)
 
 -- ---------- 6. GROUP BY ----------
--- Each group's set ANDed into the WHERE's copy, and that copy counted
--- against the slices and descended as the one row is: a group of one
--- column, its values walked; of two, its pairs; of an IN list's values.
+-- A group at a time: each group's set ANDed into the WHERE's copy, and that
+-- copy counted against the slices and descended as the one row is - a group
+-- of one column, its values walked; of two, its pairs; of an IN list's
+-- values.  Or a batch of groups at a time (one column's walk): the slices
+-- read once a batch, each row's value read off them and added to its
+-- group's.  The price decides between the two; here each is asked for in
+-- turn, and every answer checked against the ordinary plan's.
+CREATE FUNCTION slp_groups(route text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text;
+BEGIN
+	IF route = 'one at a time' THEN
+		PERFORM set_config('pg_lion.enable_slice_decode', 'off', false);
+	ELSE
+		PERFORM set_config('pg_lion.slice_gather_cost', '0', false);
+		PERFORM set_config('pg_lion.slice_decode_bit_cost', '0', false);
+		PERFORM set_config('pg_lion.slice_decode_row_cost', '0', false);
+	END IF;
+	FOREACH q IN ARRAY ARRAY[
+		'SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g',
+		'SELECT g, count(a), sum(a), avg(a), avg(c), min(d), max(tz) FROM slp GROUP BY g',
+		'SELECT h, sum(c), min(c), max(c), max(d), count(*) FROM slp WHERE tags && ''{1, 6}'' GROUP BY h',
+		'SELECT g, sum(b), max(b) FROM slp WHERE g IN (1, 2, 99) GROUP BY g',
+		'SELECT g, sum(b), max(b) FROM slp WHERE r < 300 GROUP BY g',
+		'SELECT g, count(b), sum(b), min(b), count(*) FROM slp WHERE b IS NULL GROUP BY g',
+		'SELECT g, count(c), sum(c), max(c) FROM slp WHERE c IS NULL OR h = 3 GROUP BY g',
+		'SELECT r, sum(b), min(b), max(b), count(*) FROM slp GROUP BY r',
+		'SELECT r, max(ts), min(t) FROM slp WHERE g = 3 GROUP BY r',
+		'SELECT b, sum(c), count(*) FROM slp WHERE g = 3 GROUP BY b',
+		'SELECT g, sum(b) FROM slp GROUP BY g HAVING max(b) > 99990',
+		'SELECT g, sum(b) FROM slp GROUP BY g HAVING sum(b) > 0 AND count(*) > 2000',
+		'SELECT g, h, sum(b), max(d), count(*) FROM slp GROUP BY g, h',
+		'SELECT g, h, min(c), avg(b) FROM slp WHERE r BETWEEN 100 AND 600 GROUP BY g, h']
+	LOOP
+		RETURN NEXT slp_q(q);
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_slice_decode', 'on', false);
+	PERFORM set_config('pg_lion.slice_gather_cost', '12', false);
+	PERFORM set_config('pg_lion.slice_decode_bit_cost', '0.3', false);
+	PERFORM set_config('pg_lion.slice_decode_row_cost', '1', false);
+END $$;
+SELECT * FROM slp_groups('one at a time');
+SELECT * FROM slp_groups('decoded');
 SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g');
 SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g', true);
-SELECT slp_q('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g');
-SELECT slp_q('SELECT g, count(a), sum(a), avg(a), avg(c), min(d), max(tz) FROM slp GROUP BY g');
-SELECT slp_q('SELECT h, sum(c), min(c), max(c), max(d), count(*) FROM slp WHERE tags && ''{1, 6}'' GROUP BY h');
-SELECT slp_q('SELECT g, sum(b), max(b) FROM slp WHERE g IN (1, 2, 99) GROUP BY g');
-SELECT slp_q('SELECT g, sum(b), max(b) FROM slp WHERE r < 300 GROUP BY g');
--- two columns: the pairs
+SET pg_lion.enable_slice_decode = off;
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g');
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g', true);
+RESET pg_lion.enable_slice_decode;
+-- two columns: the pairs, a group at a time
 SELECT * FROM slp_plan('SELECT g, h, sum(b), max(d) FROM slp GROUP BY g, h');
-SELECT slp_q('SELECT g, h, sum(b), max(d), count(*) FROM slp GROUP BY g, h');
-SELECT slp_q('SELECT g, h, min(c), avg(b) FROM slp WHERE r BETWEEN 100 AND 600 GROUP BY g, h');
--- many groups: a thousand values of r, a few rows each
-SELECT slp_q('SELECT r, sum(b), min(b), max(b), count(*) FROM slp GROUP BY r');
-SELECT slp_q('SELECT r, max(ts) FROM slp WHERE g = 3 GROUP BY r');
+-- many groups: a thousand values of r, a few rows each, in batches
+SELECT * FROM slp_plan('SELECT r, sum(b), min(b), max(b), count(*) FROM slp GROUP BY r', true);
 -- the group with NULL, the extremes' group, a group the WHERE empties
 SELECT g, sum(c), min(c), max(c), min(a), max(a), max(d) FROM slp WHERE h IN (1, 2) GROUP BY g ORDER BY g;
 -- HAVING, and ordered above the node
-SELECT slp_q('SELECT g, sum(b) FROM slp GROUP BY g HAVING max(b) > 99990');
-SELECT slp_q('SELECT g, sum(b) FROM slp GROUP BY g HAVING sum(b) > 0 AND count(*) > 2000');
 SELECT * FROM slp_plan('SELECT g, sum(b) FROM slp GROUP BY g HAVING max(b) > 99990');
 SELECT g, sum(b), max(b) FROM slp GROUP BY g ORDER BY sum(b) DESC LIMIT 3;
 -- with the kernel off, the same
@@ -306,18 +347,20 @@ SELECT g, sum(b), min(b), count(*) FROM slp WHERE h = 2 GROUP BY g ORDER BY g;
 DEALLOCATE ALL;
 -- the heap the map does not vouch for, and this transaction's rows
 BEGIN;
-UPDATE slp SET b = b + 1 WHERE id % 11 = 0;
-INSERT INTO slp (id, g, h, r, b, c) VALUES (40003, 5, 1, 3, 2147483647, -9223372036854775808);
-SELECT slp_q('SELECT g, sum(b), min(b), max(b), sum(c), min(c), count(*) FROM slp WHERE h = 1 GROUP BY g');
-SELECT slp_q('SELECT g, h, sum(b), max(b) FROM slp GROUP BY g, h');
+UPDATE slp SET b = b + 1, c = NULL WHERE id % 11 = 0;
+DELETE FROM slp WHERE id % 23 = 5;
+INSERT INTO slp (id, g, h, r, b, c) VALUES
+	(40003, 5, 1, 3, 2147483647, -9223372036854775808),
+	(40004, NULL, 1, 4, -7, NULL);
+SELECT * FROM slp_groups('one at a time');
+SELECT * FROM slp_groups('decoded');
 ROLLBACK;
--- a grouping by a sliced column itself, its values walked as any column's
-SELECT slp_q('SELECT b, sum(c) FROM slp WHERE g = 3 GROUP BY b');
 -- declined: a filtered count beside a GROUP BY, three columns, a grouping
 -- by an expression
 SELECT slp_q('SELECT g, sum(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
 SELECT slp_q('SELECT g, h, r, sum(b) FROM slp WHERE r < 5 GROUP BY g, h, r');
 SELECT slp_q('SELECT g % 2, sum(b) FROM slp GROUP BY g % 2');
+DROP FUNCTION slp_groups(text);
 
 -- ---------- 7. the index's pages ----------
 -- A scan of a sliced index's keys reads none of its slices, and the planner

@@ -1078,6 +1078,15 @@ typedef struct LionVColScope
 #define LION_SLICE_STEP_KEY_COST (lion_slice_step_key_cost * cpu_operator_cost)
 #define LION_SLICE_STEP_ROW_COST (lion_slice_step_row_cost * cpu_operator_cost)
 #define LION_SLICE_PAGE_COST	(lion_slice_page_cost * cpu_operator_cost)
+/*
+ * ... and the decode route's (DESIGN.md §52, "The decode route"): the values
+ * of a word of 64 rows gathered from 32 slices by a transpose, a bit of a
+ * row's value read on its own, and a row's value added to its group's
+ * answers.
+ */
+#define LION_SLICE_GATHER_COST	(lion_slice_gather_cost * cpu_operator_cost)
+#define LION_SLICE_DECODE_BIT_COST (lion_slice_decode_bit_cost * cpu_operator_cost)
+#define LION_SLICE_DECODE_ROW_COST (lion_slice_decode_row_cost * cpu_operator_cost)
 /* ... and the levels of a slice's posting tree a seek descends */
 #define LION_POSTREE_SEEK_LEVELS	2.0
 
@@ -1226,6 +1235,11 @@ typedef struct LionVColScope
 										 * every count, not collected
 										 * (DESIGN.md §32, "Walked at every
 										 * count") */
+#define LION_FLAG_SLICEDECODE	0x80	/* the aggregates of sliced columns
+										 * of a GROUP BY of one column are
+										 * decoded a batch of groups at a
+										 * time (DESIGN.md §52, "The decode
+										 * route") */
 
 /*
  * What the planner decided, in a form the executor can be handed through
@@ -2179,6 +2193,17 @@ typedef struct LionSliceState
 	int64		runs;
 	int64		tidsrechecked;	/* the counts' heap rechecks, TIDs */
 	int64		blocksrechecked;	/* ... and blocks */
+
+	/*
+	 * The decode route (DESIGN.md §52, LION_FLAG_SLICEDECODE): a GROUP BY's
+	 * groups answered a batch at a time, the slices read once a batch
+	 * (lion_slice_batch()) - and what its walks did.
+	 */
+	bool		decode;
+	int64		batches;		/* batches decoded, a walk a column each */
+	int64		decodekeys;		/* container keys the walks decoded */
+	int64		decoderows;		/* rows they read a value of */
+	int64		decoderechecked;	/* ... the heap asked about */
 } LionSliceState;
 
 /*
@@ -4326,7 +4351,8 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 extern void lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath,
 								 RelOptInfo *rel, List *idxs, List *cols,
 								 List *wants, double whererows,
-								 bool haswhere, bool counts, double ngroups);
+								 bool haswhere, bool counts, double ngroups,
+								 int batch);
 extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
 								RelOptInfo *rel, List *idxs, List *cols,
 								List *naggs, bool counts);
@@ -4561,6 +4587,11 @@ extern void lion_slice_run(LionCountScanState *st);
 extern void lion_slice_none(LionCountScanState *st);
 extern void lion_slice_group(LionCountScanState *st, int ngset,
 							 LionPostingSet *const *gsets);
+extern void lion_slice_batch(LionCountScanState *st, int n,
+							 LionPostingSet *gsets, int64 *gcounts,
+							 bool count, PGAlignedBlock *images,
+							 const LionPostingSet *where, MemoryContext cxt,
+							 Datum **values, bool **isnull);
 extern void lion_slice_keep(LionCountScanState *st, MemoryContext cxt,
 							Datum **values, bool **isnull);
 extern void lion_slice_put(LionCountScanState *st, const Datum *values,

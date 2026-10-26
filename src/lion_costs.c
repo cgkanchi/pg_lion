@@ -87,6 +87,9 @@ double		lion_slice_step_cost;
 double		lion_slice_step_key_cost;
 double		lion_slice_step_row_cost;
 double		lion_slice_page_cost;
+double		lion_slice_gather_cost;
+double		lion_slice_decode_bit_cost;
+double		lion_slice_decode_row_cost;
 double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
@@ -209,6 +212,12 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each container key of the candidates a step of a lion descent over a sliced column's slices counts"},
 	{"pg_lion.slice_step_row_cost", &lion_slice_step_row_cost, 0.9, LION_OP,
 	 "Sets the planner's estimate of the cost of each candidate row a step of a lion descent over a sliced column's slices counts"},
+	{"pg_lion.slice_gather_cost", &lion_slice_gather_cost, 12.0, LION_OP,
+	 "Sets the planner's estimate of the cost of gathering the values of 64 rows from 32 of a sliced column's slices by a transpose, in a lion GROUP BY decoding a batch of groups"},
+	{"pg_lion.slice_decode_bit_cost", &lion_slice_decode_bit_cost, 0.3, LION_OP,
+	 "Sets the planner's estimate of the cost of reading one bit of a row's value off a sliced column's slice, in a lion GROUP BY decoding a batch of groups"},
+	{"pg_lion.slice_decode_row_cost", &lion_slice_decode_row_cost, 1.0, LION_OP,
+	 "Sets the planner's estimate of the cost of adding a row's value to its group's aggregates, in a lion GROUP BY decoding a batch of groups"},
 
 	/* lion_plan_fkjoin_cost.c: the FK-side join (§27) */
 	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 14.0, LION_TUPLE,

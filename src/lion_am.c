@@ -655,6 +655,15 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomBoolVariable("pg_lion.enable_slice_decode",
+							 "Lets a GROUP BY of one column answer the aggregates of bit-sliced columns a batch of groups at a time.",
+							 "Off, each group's aggregates are counted from the slices on their own.",
+							 &lion_enable_slice_decode,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_slice_kernel",
 							 "Lets the counts of a bit-sliced column's slices use the bit-plane kernel where the slices are bitmaps of one width.",
 							 "Off, each slice's container is counted on its own; the answers are the same either way.",

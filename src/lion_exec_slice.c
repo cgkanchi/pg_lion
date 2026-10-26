@@ -258,6 +258,49 @@ lion_slice_answer(LionSliceAgg *sa, LionSCol *col, LionSliceFilter *f)
 }
 
 /*
+ * A GROUP BY's E ∧ WHERE of column col, C0, collected once a relation into
+ * the relation's memory (col->c0; none, col->hasc0 false, where the column
+ * has no row not NULL) - the copy every group's answers start from, a group
+ * at a time (lion_slice_column()) or a batch (lion_slice_batch()).
+ */
+static void
+lion_slice_c0(LionCountScanState *st, LionSCol *col, Relation idx,
+			  LionSliceAgg *sa)
+{
+	LionSliceState *ss = st->slice;
+	LionCountSource *srcs;
+	LionPostingSet e;
+	LionPostingSet range;
+	bool		hasrange = false;
+	MemoryContext oldcxt;
+	int			n;
+
+	if (col->c0done)
+		return;
+	srcs = (LionCountSource *)
+		palloc0(sizeof(LionCountSource) * (st->nitem + 2));
+	sa->located++;
+	n = lion_slice_where_sources(st, col, idx, &e, &range, &hasrange, srcs);
+	col->c0done = true;
+	if (n == 0)
+	{
+		sa->absent++;
+		col->hasc0 = false;
+	}
+	else
+	{
+		oldcxt = MemoryContextSwitchTo(ss->relcxt);
+		lion_slice_collect_into(st, sa, n, srcs, &col->c0);
+		MemoryContextSwitchTo(oldcxt);
+		col->hasc0 = true;
+		lion_posting_set_release(&e);
+		if (hasrange)
+			lion_posting_set_release(&range);
+	}
+	pfree(srcs);
+}
+
+/*
  * One column's answers, the WHERE located as the node located it for its own
  * count: of the one row (ngset 0), or of the group whose sets gsets[] are -
  * located by the GROUP BY's walk with their pins, one for a column's group,
@@ -351,31 +394,7 @@ lion_slice_column(LionCountScanState *st, LionSCol *col, int ngset,
 		 * A group: E ∧ WHERE once a relation, in the relation's memory, and
 		 * the group's own copy of it.
 		 */
-		if (!col->c0done)
-		{
-			MemoryContext oldcxt;
-
-			sa.located++;
-			n = lion_slice_where_sources(st, col, idx, &e, &range, &hasrange,
-										 srcs);
-			col->c0done = true;
-			if (n == 0)
-			{
-				sa.absent++;
-				col->hasc0 = false;
-			}
-			else
-			{
-				oldcxt = MemoryContextSwitchTo(ss->relcxt);
-				lion_slice_collect_into(st, &sa, n, srcs, &col->c0);
-				MemoryContextSwitchTo(oldcxt);
-				col->hasc0 = true;
-				lion_posting_set_release(&e);
-				if (hasrange)
-					lion_posting_set_release(&range);
-				hasrange = false;
-			}
-		}
+		lion_slice_c0(st, col, idx, &sa);
 		if (!col->hasc0)
 			goto done;
 		/* the slots C0's sources took, each a plain set again */
@@ -485,6 +504,173 @@ lion_slice_group(LionCountScanState *st, int ngset,
 	ss->runs++;
 	ss->groups++;
 	lion_slice_columns(st, ngset, gsets);
+}
+
+/*
+ * One column's answers for a batch of n groups, decoded (DESIGN.md §52, "The
+ * decode route"): the column's slices - every bit's and E - located and made
+ * pinless, and one walk of the groups' sets - located by the GROUP BY's walk
+ * with their pins - and the collected WHERE (`where`, NULL for none), which
+ * reads every row's value off the slices (lion_count_groups_slices()).
+ * out's arrays are n each.
+ */
+static void
+lion_slice_column_batch(LionCountScanState *st, LionSCol *col, int n,
+						LionPostingSet *gsets, PGAlignedBlock *images,
+						const LionPostingSet *where, LionSliceGroupsOut *out)
+{
+	EState	   *estate = st->css.ss.ps.state;
+	LionSliceState *ss = st->slice;
+	Relation	idx;
+	LionState  *state;
+	LionSliceAgg sa;
+	LionPostingSet *slices;
+	LionDecodeStats dstats;
+	int			i;
+	int			g;
+
+	idx = index_open(col->idxoid, AccessShareLock);
+	state = lion_index_column_state(idx, col->idxcol);
+	if (!state->sliced || lion_slice_type_nbits(state->typid) != state->slicebits)
+		elog(ERROR, "LionCount: key column %d of lion index \"%s\" is not sliced",
+			 col->idxcol, RelationGetRelationName(idx));
+	col->typid = state->typid;
+	col->nbits = state->slicebits;
+
+	lion_slice_agg_begin(&sa, st->heap, idx, col->idxcol,
+						 estate->es_snapshot, st->viscache,
+						 st->rel_read_only);
+	memset(&dstats, 0, sizeof(dstats));
+	for (g = 0; g < n; g++)
+		out->count[g] = 0;
+
+	/*
+	 * Every bit's slice and E, pinless: they label the rows of the groups'
+	 * pinned sets.
+	 */
+	slices = (LionPostingSet *)
+		palloc0(sizeof(LionPostingSet) * (col->nbits + 1));
+	for (i = 0; i <= col->nbits; i++)
+	{
+		sa.located++;
+		if (lion_posting_set_lookup_slice_col(idx, col->idxcol,
+											  lion_slice_index_pos(i, col->nbits),
+											  &slices[i]))
+			lion_posting_set_unpin(&slices[i]);
+		else
+		{
+			lion_posting_set_release(&slices[i]);
+			memset(&slices[i], 0, sizeof(LionPostingSet));
+			sa.absent++;
+		}
+	}
+	lion_count_groups_slices(st->heap, estate->es_snapshot, n, gsets, images,
+							 where, col->nbits, slices, out, &sa.stats,
+							 &dstats, st->viscache, st->rel_read_only);
+	for (i = 0; i <= col->nbits; i++)
+	{
+		if (slices[i].found)
+			lion_posting_set_release(&slices[i]);
+	}
+	pfree(slices);
+
+	ss->located += sa.located;
+	ss->absent += sa.absent;
+	ss->tidsrechecked += sa.stats.tids_rechecked;
+	ss->blocksrechecked += sa.stats.blocks_rechecked;
+	ss->decodekeys += dstats.keys;
+	ss->decoderows += dstats.rows;
+	ss->decoderechecked += dstats.rechecked;
+	lion_slice_agg_end(&sa);
+
+	pgstat_count_index_scan(idx);
+	index_close(idx, AccessShareLock);
+}
+
+/*
+ * The answers of a batch of n groups (DESIGN.md §52, "The decode route"):
+ * the groups whose sets gsets[] are, located by the GROUP BY's walk with
+ * their pins, counted already - gcounts[] - or, with count, counted by the
+ * first column's walk into gcounts[], under the WHERE collected as `where`
+ * (NULL with no WHERE): each column's answers for all of them from one walk
+ * (lion_slice_column_batch()), and every group with a row
+ * given its row's answers, copied into cxt as lion_slice_keep() copies them
+ * (values[g], isnull[g]; a group with no row is given none).  Called before
+ * the sets are released.
+ */
+void
+lion_slice_batch(LionCountScanState *st, int n, LionPostingSet *gsets,
+				 int64 *gcounts, bool count, PGAlignedBlock *images,
+				 const LionPostingSet *where, MemoryContext cxt,
+				 Datum **values, bool **isnull)
+{
+	LionSliceState *ss = st->slice;
+	LionSliceGroupsOut *outs;
+	MemoryContext runcxt;
+	MemoryContext oldcxt;
+	int			c;
+	int			g;
+
+	Assert(ss != NULL && st->located && n > 0);
+	runcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "LionCount slice aggregates batch",
+								   ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(runcxt);
+	outs = (LionSliceGroupsOut *) palloc0(sizeof(LionSliceGroupsOut) * ss->ncol);
+	for (c = 0; c < ss->ncol; c++)
+	{
+		LionSCol   *col = &ss->col[c];
+		LionSliceGroupsOut *out = &outs[c];
+
+		CHECK_FOR_INTERRUPTS();
+		out->count = (int64 *) palloc0(sizeof(int64) * n);
+		/* the groups' own counts too, from the first column's walk */
+		if (count && c == 0)
+			out->allcount = gcounts;
+#ifdef HAVE_INT128
+		if ((col->want & LION_SWANT_SUM) != 0)
+			out->sumenc = (int128 *) palloc0(sizeof(int128) * n);
+#endif
+		if ((col->want & LION_SWANT_MIN) != 0)
+			out->minenc = (uint64 *) palloc0(sizeof(uint64) * n);
+		if ((col->want & LION_SWANT_MAX) != 0)
+			out->maxenc = (uint64 *) palloc0(sizeof(uint64) * n);
+		lion_slice_column_batch(st, col, n, gsets, images, where, out);
+	}
+	MemoryContextSwitchTo(oldcxt);
+
+	/* each group's answers, as the one row's are made (lion_slice_results()) */
+	for (g = 0; g < n; g++)
+	{
+		values[g] = NULL;
+		isnull[g] = NULL;
+		if (gcounts[g] == 0)
+			continue;
+		MemoryContextReset(ss->cxt);
+		for (c = 0; c < ss->ncol; c++)
+		{
+			LionSCol   *col = &ss->col[c];
+			LionSliceGroupsOut *out = &outs[c];
+
+			col->count = out->count[g];
+#ifdef HAVE_INT128
+			col->sum = 0;
+			if (out->sumenc != NULL)
+				col->sum = out->sumenc[g] -
+					(int128) col->count * ((int128) 1 << (col->nbits - 1));
+#endif
+			if (out->minenc != NULL)
+				col->minenc = out->minenc[g];
+			if (out->maxenc != NULL)
+				col->maxenc = out->maxenc[g];
+		}
+		lion_slice_results(st);
+		lion_slice_keep(st, cxt, &values[g], &isnull[g]);
+		ss->groups++;
+	}
+	ss->runs++;
+	ss->batches++;
+	MemoryContextDelete(runcxt);
 }
 
 /*

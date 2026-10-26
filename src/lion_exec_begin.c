@@ -1005,6 +1005,8 @@ lion_begin_slices(LionCountScanState *st, const LionCountPriv *priv,
 	ss->relcxt = AllocSetContextCreate(estate->es_query_cxt,
 									   "LionCount slice copies",
 									   ALLOCSET_DEFAULT_SIZES);
+	/* a GROUP BY's groups a batch at a time (DESIGN.md §52, "The decode route") */
+	ss->decode = (priv->flags & LION_FLAG_SLICEDECODE) != 0;
 	st->slice = ss;
 }
 

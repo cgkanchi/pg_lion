@@ -23,6 +23,7 @@ bool		lion_enable_count_cells = true;
 int			lion_count_cells_max = 134217728;
 bool		lion_enable_topk = true;
 bool		lion_enable_count_slices = true;
+bool		lion_enable_slice_decode = true;
 bool		lion_enable_count_residual = true;
 bool		lion_enable_count_partial = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
