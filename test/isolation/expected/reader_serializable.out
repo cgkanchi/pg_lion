@@ -145,6 +145,27 @@ step s1_commit: COMMIT;
 step s2_commit: COMMIT;
 ERROR:  could not serialize access due to read/write dependencies among transactions
 
+starting permutation: s1_begin s2_begin s1_slices s2_slices s1_insert s2_insert s1_commit s2_commit
+step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
+step s1_slices: SELECT count FROM lion_index_slice_agg('rc_j', 'k = 99');
+count
+-----
+    0
+(1 row)
+
+step s2_slices: SELECT count FROM lion_index_slice_agg('rc_j', 'k = 99');
+count
+-----
+    0
+(1 row)
+
+step s1_insert: INSERT INTO rc VALUES (-1, 99, 99, to_tsvector('simple', 'secret'));
+step s2_insert: INSERT INTO rc VALUES (-2, 99, 99, to_tsvector('simple', 'secret'));
+step s1_commit: COMMIT;
+step s2_commit: COMMIT;
+ERROR:  could not serialize access due to read/write dependencies among transactions
+
 starting permutation: s1_begin s2_begin s1_push s2_push s1_insert s2_insert s1_commit s2_commit
 step s1_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;
 step s2_begin: BEGIN ISOLATION LEVEL SERIALIZABLE;

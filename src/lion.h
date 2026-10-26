@@ -11,6 +11,7 @@
 #include "postgres.h"
 
 #include "lion_compat.h"
+#include "lion_slice_enc.h"
 
 #include "access/amapi.h"
 #include "access/genam.h"
@@ -525,8 +526,17 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * 13 said with the flag 0x0004 that the build had written a NARROW, and
  * VACUUM made them only in such an index: a version 13 index may carry that
  * bit, which is no flag of this format.  So opening a version 13 index is an
- * ERROR whose hint asks for REINDEX.  Every index this build writes is
- * version 14.
+ * ERROR whose hint asks for REINDEX.
+ *
+ * Version 15 (DESIGN.md §51) is version 14 plus SLICE ENTRIES: after a
+ * bit-sliced column's VALUE entries and summaries, one entry per bit of its
+ * values' encoding and one of the rows not NULL, of a kind no build before
+ * knows - it would read a slice as a VALUE entry with a one-byte key, and fail
+ * on it or count it.  An ADDITION, as version 7 was (§32): every page and item
+ * of a version 14 index reads as it did, and a build writes version 15 only
+ * when at least one key column is sliced (slice_cols below), so an index
+ * built with `slices = off` is version 14 byte for byte and stays readable by
+ * the builds before this one.  This build reads both.
  */
 #define LION_VERSION			6	/* the base format of versions 6 .. 8 */
 #define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
@@ -538,6 +548,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
 #define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17), NARROW
 								 * items anywhere, no flag (§38) */
+#define LION_VERSION_V15		15	/* ... plus the SLICE entries of §51 */
 
 typedef struct LionMetaPageData
 {
@@ -545,7 +556,16 @@ typedef struct LionMetaPageData
 	uint32		version;
 	uint16		offset_bits;	/* LION_OFFSET_BITS at build time */
 	uint16		container_bits; /* LION_CONTAINER_BITS at build time */
-	uint32		unused_nbuckets;	/* always 0 since version 4 (§21) */
+
+	/*
+	 * BIT-SLICED KEY COLUMNS (DESIGN.md §51): bit i - 1, key column i keeps
+	 * SLICE entries, decided when the index was built and fixed for its life.
+	 * Nonzero only on a version 15 meta page.  The word was nbuckets, the
+	 * hash directory's bucket count, which is 0 on every meta page written
+	 * since version 4 (§21) - exactly "no column is sliced" - so the struct
+	 * keeps its 56 bytes, as §25, §21's order record and §32 kept them.
+	 */
+	uint32		slice_cols;
 	uint32		inline_limit;	/* max inline payload bytes in an entry tuple */
 	BlockNumber root;			/* root of the entry directory (§21) */
 	uint32		height;			/* level of the root; 0 = the root is a leaf */
@@ -779,6 +799,15 @@ lion_sumsq_add(uint64 *sum, uint64 n)
 #define LionEntryIsKeyless(e)	(((e)->flags & LION_ENTRY_KEYLESS) != 0)
 #define LionEntryIsSummary(e)	(((e)->flags & LION_ENTRY_SUMKINDS) != 0)
 #define LionEntryIsSumLast(e)	(((e)->flags & LION_ENTRY_SUMLAST) != 0)
+/* A bit slice or the existence slice of a sliced column (DESIGN.md §51). */
+#define LionEntryIsSlice(e)		(((e)->flags & LION_ENTRY_SLICE) != 0)
+/*
+ * A summary or a slice: an entry whose posting set is derived from its
+ * column's rows and that sorts after every VALUE entry of the column.  Every
+ * walk that returns keys stops at the first one, as it stops at the next
+ * column's first entry (DESIGN.md §32, §51).
+ */
+#define LionEntryIsDerived(e)	(((e)->flags & LION_ENTRY_DERIVED) != 0)
 #define LION_NULLKEY_HASH		0
 
 /*
@@ -808,14 +837,18 @@ lion_sumsq_add(uint64 *sum, uint64 n)
  * a value below every real one:
  *
  *		MINF < NULL < EMPTY < EMPTYDIM < EMPTYINNER < NULLELEMS < VALUE
- *			 < SUMMARY < SUMLAST
+ *			 < SUMMARY < SUMLAST < SLICE
  *
  * The two summary kinds of DESIGN.md §32 come after every VALUE entry, so a
  * column's values are one run and its summaries the run right after it: a walk
  * of a column's values ends at its first summary exactly as it ends at the
  * next column's first entry.  SUMMARY entries are ordered by their keys like
  * values; the one SUMLAST entry a column may have is ordered by its kind
- * alone.
+ * alone.  The SLICE entries of §51 come last, after the summaries, each
+ * ordered by its one-byte key - the bit position - which the prefix compares
+ * bytewise (lion_cmp_prefix()): one entry per position, found as a reserved
+ * entry is found, and the first of a column's derived kinds that a walk of
+ * values meets when the column has no summaries.
  *
  * Within VALUE the order is the opclass's ordering support function (proc 4)
  * under the index collation, then the hash, then a bytewise comparison of the
@@ -834,6 +867,7 @@ lion_sumsq_add(uint64 *sum, uint64 n)
 #define LION_KIND_VALUE		6
 #define LION_KIND_SUMMARY	7	/* DESIGN.md §32 */
 #define LION_KIND_SUMLAST	8
+#define LION_KIND_SLICE		9	/* DESIGN.md §51 */
 
 /*
  * The kinds of the reserved entries, which have no key and one per column:
@@ -849,8 +883,14 @@ StaticAssertDecl(LION_KIND_EMPTY == LION_KIND_NULL + 1 &&
 				 LION_KIND_VALUE == LION_KIND_NULLELEMS + 1,
 				 "the reserved kinds are consecutive, in directory order");
 
-/* Kinds whose order compares keys (the others are one entry per column). */
+/*
+ * Kinds whose order compares keys OF THE COLUMN'S TYPE through its opclass
+ * (the others are one entry per column, or - a SLICE - one per position of a
+ * key that is not the column's, compared bytewise).
+ */
 #define LION_KIND_HAS_KEY(k)	((k) == LION_KIND_VALUE || (k) == LION_KIND_SUMMARY)
+/* The kinds after a column's VALUE entries: its summaries and its slices. */
+#define LION_KIND_IS_DERIVED(k)	((k) > LION_KIND_VALUE)
 
 /*
  * The largest key, in bytes as stored (a varlena with its 4-byte header).  A
@@ -884,6 +924,8 @@ lion_entry_kind(const LionEntryTuple *e)
 		return LION_KIND_EMPTYINNER;
 	if ((e->flags & LION_ENTRY_NULLELEMS) != 0)
 		return LION_KIND_NULLELEMS;
+	if ((e->flags & LION_ENTRY_SLICE) != 0)
+		return LION_KIND_SLICE;
 	if ((e->flags & LION_ENTRY_SUMLAST) != 0)
 		return LION_KIND_SUMLAST;
 	if ((e->flags & LION_ENTRY_SUMMARY) != 0)
@@ -1060,6 +1102,7 @@ typedef struct LionOptions
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
 	int			store_positions;	/* LION_POSOPT_*, DESIGN.md §17 */
+	bool		slices;			/* bit-sliced columns, DESIGN.md §51 */
 } LionOptions;
 
 /*
@@ -1245,6 +1288,16 @@ typedef struct LionState
 	 * them.
 	 */
 	bool		summarized;
+
+	/*
+	 * The column is BIT-SLICED (DESIGN.md §51): its bit in the meta page's
+	 * slice_cols.  Only ever set on a scalar column whose key type
+	 * lion_slice_type_nbits() takes, and only on a version 15 index; slicebits
+	 * is that width, 16, 32 or 64.  Inserts keep the slices current;
+	 * lion_index_slice_agg() reads them.
+	 */
+	bool		sliced;
+	int			slicebits;
 } LionState;
 
 struct LionIndexState
@@ -2085,6 +2138,31 @@ extern LionEntryTuple *lion_make_reserved_entry(AttrNumber attno,
 											  Size payloadlen, Size *size);
 
 /*
+ * The same for a SLICE entry (DESIGN.md §51): its one-byte key is pos, a bit
+ * position or LION_SLICE_EXISTS, and LION_ENTRY_SLICE is set on top of the
+ * caller's INLINE/CHAIN flag.
+ */
+extern LionEntryTuple *lion_make_slice_entry(AttrNumber attno, int pos,
+										   uint16 flags, const char *payload,
+										   Size payloadlen, Size *size);
+
+/* The bit position a SLICE entry's key names (lion_slice_enc.h). */
+static inline int
+lion_entry_slice_pos(const LionEntryTuple *e)
+{
+	Assert(LionEntryIsSlice(e) && e->keylen == LION_SLICE_KEYLEN);
+	return (int) *(const uint8 *) LionEntryGetKey(e);
+}
+
+/*
+ * A search key for the SLICE entry of column state at pos (DESIGN.md §51):
+ * the kind and the one-byte key, which the prefix compares (lion_dir.c).
+ * posbyte is the caller's, and has to live as long as sk.
+ */
+extern void lion_search_key_slice(LionState *state, LionSearchKey *sk,
+								  int pos, uint8 *posbyte);
+
+/*
  * Locate the entry for a real key (the caller supplies its hash), or one of
  * the reserved key-less entries of DESIGN.md §14 and §17.  Both descend
  * the directory and hand back the leaf locked in lockmode; the caller
@@ -2097,6 +2175,20 @@ extern bool lion_find_entry(Relation index, LionState *state, int lockmode,
 extern bool lion_find_reserved_entry(Relation index, LionState *state,
 									int lockmode, uint16 reservedflag,
 									Buffer *buf, OffsetNumber *offnum);
+
+/* ... and a SLICE entry of a bit-sliced column (DESIGN.md §51). */
+extern bool lion_find_slice_entry(Relation index, LionState *state,
+								  int lockmode, int pos, Buffer *buf,
+								  OffsetNumber *offnum);
+
+/*
+ * Add the row at (ckey, lo) to the SLICE of column state at pos, creating
+ * the entry when there is none (lion_insert.c): one step of an insert into a
+ * sliced column, and what lion_debug_slice_insert() damages a slice with.
+ */
+extern void lion_slice_insert_one(Relation index, Relation heaprel,
+								  LionState *state, int pos, uint32 ckey,
+								  uint16 lo);
 
 static inline bool
 lion_find_null_entry(Relation index, LionState *state, int lockmode,
@@ -2588,6 +2680,13 @@ extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
 
 /*
+ * ... and which are bit-sliced (DESIGN.md §51), which decides the version:
+ * 15 when any is, 14 - byte for byte what it was - when none is.  After
+ * lion_meta_record_summaries(), which sets 14.
+ */
+extern void lion_meta_record_slices(LionMetaPageData *meta, uint32 cols);
+
+/*
  * The distinct keys of each key column (DESIGN.md §33).  Fill in a count of
  * ix's columns from the VALUE entries of each (nvalues[], one per key column),
  * the sum of the squares of their TIDs (sumsq[], one per key column) and the
@@ -3007,6 +3106,7 @@ extern void lion_posfilter_end(LionPosFilter *pf);
 extern LionKeyNode *lion_posfilter_keynode(Relation index, LionState *col,
 										   Datum query, StrategyNumber strategy,
 										   LionKeyNode *child);
+extern uint32 lion_settle_slices(LionIndexState *ix, const LionOptions *opts);
 extern void lion_settle_store_positions(Relation index, LionIndexState *ix,
 										const LionOptions *opts);
 extern bool lion_query_posexact(Oid opfamily, Oid lefttype, Oid opno,

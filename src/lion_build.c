@@ -930,8 +930,8 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 	}
 
 	lion_build_level_add(bs, bs->leaf, entry, size);
-	/* the keys, for the §17 guard; a summary (§32) is not one */
-	if (!LionEntryIsSummary(entry))
+	/* the keys, for the §17 guard; a summary (§32) or a slice (§51) is not one */
+	if (!LionEntryIsDerived(entry))
 		bs->ndistinct++;
 
 	/*
@@ -943,7 +943,7 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 		bs->nvalues[entry->attno - 1]++;
 		lion_sumsq_add(&bs->sumsq[entry->attno - 1], lion_entry_ntids(entry));
 	}
-	if (entry->attno == bs->rowcol && !LionEntryIsSummary(entry))
+	if (entry->attno == bs->rowcol && !LionEntryIsDerived(entry))
 		bs->rows += lion_entry_ntids(entry);
 }
 
@@ -1223,6 +1223,17 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash,
 	b->hash = hash;
 	b->key = (keykind != LION_KEY_REAL) ? (Datum) 0 :
 		datumCopy(key, cs->typbyval, cs->typlen);
+
+	/*
+	 * A SLICE entry's key is its one-byte position (DESIGN.md §51), which
+	 * `key` carries as a uint8.
+	 */
+	if (keykind == LION_KIND_SLICE)
+	{
+		b->rawlen = LION_SLICE_KEYLEN;
+		b->rawkey = (char *) palloc(LION_SLICE_KEYLEN);
+		*(uint8 *) b->rawkey = DatumGetUInt8(key);
+	}
 	/*
 	 * The stored bytes, which are the tail of the directory order
 	 * (DESIGN.md §21): two keys whose prefixes tie - which for an unordered
@@ -1250,6 +1261,10 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash,
 								   lion_entry_payoff_for(LION_ENTRY_INLINE |
 														 lion_key_layout_flags(cs),
 														 b->rawlen) :
+								   (keykind == LION_KIND_SLICE) ?
+								   lion_entry_payoff_for(LION_ENTRY_INLINE |
+														 LION_ENTRY_SLICE,
+														 LION_SLICE_KEYLEN) :
 								   lion_entry_payoff_for(LION_ENTRY_INLINE, 0),
 								   (Size) bs->inline_limit);
 	b->spilled = false;
@@ -1845,7 +1860,11 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 		if (b->hastree)
 			lion_builder_finish_tree(bs, b);
 
-		entry = (b->keykind != LION_KEY_REAL) ?
+		entry = (b->keykind == LION_KIND_SLICE) ?
+			lion_make_slice_entry((AttrNumber) bs->cur->attno,
+								  *(uint8 *) b->rawkey, LION_ENTRY_CHAIN,
+								  NULL, 0, &size) :
+			(b->keykind != LION_KEY_REAL) ?
 			lion_make_reserved_entry((AttrNumber) bs->cur->attno,
 									lion_reserved_flag(b->keykind),
 									LION_ENTRY_CHAIN, NULL, 0, &size) :
@@ -1855,7 +1874,11 @@ lion_builder_flush(LionBuildState *bs, LionBuilder *b)
 	}
 	else
 	{
-		entry = (b->keykind != LION_KEY_REAL) ?
+		entry = (b->keykind == LION_KIND_SLICE) ?
+			lion_make_slice_entry((AttrNumber) bs->cur->attno,
+								  *(uint8 *) b->rawkey, LION_ENTRY_INLINE,
+								  b->inlinebuf, b->inlineused, &size) :
+			(b->keykind != LION_KEY_REAL) ?
 			lion_make_reserved_entry((AttrNumber) bs->cur->attno,
 									lion_reserved_flag(b->keykind),
 									LION_ENTRY_INLINE, b->inlinebuf,
@@ -1918,6 +1941,8 @@ lion_builder_cmp(const void *a, const void *b, void *arg)
 
 	if (x->keykind != y->keykind)
 		return x->keykind < y->keykind ? -1 : 1;
+	if (x->keykind == LION_KIND_SLICE)	/* one per position (§51) */
+		return memcmp(x->rawkey, y->rawkey, LION_SLICE_KEYLEN);
 	if (x->keykind != LION_KEY_REAL)
 		return 0;				/* one of each reserved entry per column */
 
@@ -2399,12 +2424,32 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	if (sumkey)
 		lion_sum_key_begin(bs, bs->sum);
 
+	/*
+	 * A sliced column's SLICE entries (DESIGN.md §51) come after its values
+	 * AND its summaries: the first slice closes the summaries, which are
+	 * written here, where the directory order puts them.
+	 */
+	if (lion_spool_group_entry(group, 0)->kind == LION_KIND_SLICE &&
+		bs->sum != NULL)
+	{
+		/* one slice a group, so nothing of this call is in tmpctx yet */
+		Assert(n == 1);
+		MemoryContextSwitchTo(oldctx);
+		lion_sum_finish(bs, bs->sum);
+		bs->sum = NULL;
+		MemoryContextSwitchTo(bs->tmpctx);
+	}
+
 	Assert(bs->nbuilders == 0);
 	for (i = 0; i < n; i++)
 	{
 		const LionSpoolEntry *e = lion_spool_group_entry(group, i);
 
-		b[i] = lion_builder_create(bs, e->key, e->kind, e->hash, false);
+		/* a slice's key is its position, the one byte of its raw key */
+		b[i] = lion_builder_create(bs,
+								   (e->kind == LION_KIND_SLICE) ?
+								   UInt8GetDatum(*(const uint8 *) e->raw) :
+								   e->key, e->kind, e->hash, false);
 	}
 
 	/*
@@ -2517,6 +2562,8 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt,
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, ix, &meta, cxt);
 	lion_settle_store_positions(index, ix, opts);
+	/* ... and the columns it slices (DESIGN.md §51), which the spool reads */
+	(void) lion_settle_slices(ix, opts);
 
 	return inline_limit;
 }
@@ -3436,6 +3483,9 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and which columns got summaries (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
+	/* ... and which are bit-sliced, which sets the version (§51). */
+	lion_meta_record_slices(LionPageGetMeta((Page) metabuf->data),
+							bs.ix.meta.slice_cols);
 	/* ... and each column's distinct keys, for the planner (§33). */
 	{
 		LionMetaNdistinct nd;

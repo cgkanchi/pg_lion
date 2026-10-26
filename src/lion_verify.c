@@ -667,6 +667,46 @@ lion_verify_dir_item(LionVerifyState *vs, BlockNumber blk, Page page,
 	}
 
 	/*
+	 * A slice, or a pivot made from one (§51): its key is one byte, a bit
+	 * position of its column's width or the existence slice's, and its
+	 * column is one the meta page says is sliced - which is what the order
+	 * checks and the rest of the check can then rely on.
+	 */
+	if (kind == LION_KIND_SLICE)
+	{
+		LionState  *col = lion_column(vs->ix, (AttrNumber) item->attno);
+		int			pos;
+
+		if (item->keylen != LION_SLICE_KEYLEN)
+			lion_corrupt("lion index \"%s\": slice item %u on block %u has a key of %u bytes, expected %d",
+						RelationGetRelationName(vs->index), off, blk,
+						item->keylen, LION_SLICE_KEYLEN);
+		pos = lion_entry_slice_pos(item);
+		if (!col->sliced)
+			lion_corrupt("lion index \"%s\": item %u on block %u is a slice of key column %u, which has none",
+						RelationGetRelationName(vs->index), off, blk,
+						item->attno);
+		if (pos != LION_SLICE_EXISTS && pos >= col->slicebits)
+			lion_corrupt("lion index \"%s\": slice item %u on block %u names bit %d of key column %u, whose values are %d bits wide",
+						RelationGetRelationName(vs->index), off, blk, pos,
+						item->attno, col->slicebits);
+		if ((item->flags & (LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS |
+							LION_ENTRY_POSITIONS | LION_ENTRY_ALIGNKEY)) != 0 ||
+			(item->flags & ~(uint16) LION_ENTRY_ALLFLAGS) != 0)
+			lion_corrupt("lion index \"%s\": slice item %u on block %u has flags 0x%04X, which no slice has",
+						RelationGetRelationName(vs->index), off, blk,
+						item->flags);
+		if (LionEntryIsPivot(item) &&
+			((item->flags & (LION_ENTRY_INLINE | LION_ENTRY_CHAIN)) != 0 ||
+			 item->sh_ncontainers != 0))
+			lion_corrupt("lion index \"%s\": %s %u on block %u has flags 0x%04X, which no pivot of key column %u has",
+						RelationGetRelationName(vs->index),
+						LionEntryIsHighKey(item) ? "high key" : "downlink",
+						off, blk, item->flags, item->attno);
+		return item;
+	}
+
+	/*
 	 * A pivot (lion_entryfmt.h): the short header, no counts, and the key
 	 * where the key column keeps it.  Leaf entries are checked in full by
 	 * lion_verify_entry().
@@ -3830,7 +3870,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 
 	if ((entry->flags & ~(uint16) (LION_ENTRY_INLINE | LION_ENTRY_CHAIN |
 								   LION_ENTRY_RESERVED |
-								   LION_ENTRY_SUMKINDS |
+								   LION_ENTRY_DERIVED |
 								   LION_ENTRY_POSITIONS |
 								   LION_ENTRY_ALIGNKEY)) != 0)
 		lion_corrupt("lion index \"%s\": entry %u on block %u has unknown flag bits in 0x%04X",
@@ -3841,7 +3881,8 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	 * column's type needs it.  A reserved entry has no key, and no flag.
 	 */
 	if ((entry->flags & LION_ENTRY_ALIGNKEY) !=
-		(LionEntryIsReserved(entry) ? 0 : lion_key_layout_flags(state)))
+		((LionEntryIsReserved(entry) || LionEntryIsSlice(entry)) ? 0 :
+		 lion_key_layout_flags(state)))
 		lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, which place its key where key column %u does not keep it",
 					RelationGetRelationName(vs->index), off, blk, entry->flags,
 					entry->attno);
@@ -3914,6 +3955,19 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 						RelationGetRelationName(vs->index), off, blk, what,
 						entry->attno);
 	}
+	else if (LionEntryIsSlice(entry))
+	{
+		/*
+		 * A slice (§51): what lion_verify_dir_item() checked of its key and
+		 * column, and a kind of its own - one of the others' flags beside
+		 * it would make it two kinds.  What it holds is checked by
+		 * lion_verify_slices() once the structure is known to be sound.
+		 */
+		if ((entry->flags & (LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS)) != 0)
+			lion_corrupt("lion index \"%s\": entry %u on block %u has flags 0x%04X, which no slice has",
+						RelationGetRelationName(vs->index), off, blk,
+						entry->flags);
+	}
 	else
 		lion_verify_keylen(vs, state, blk, off, entry);
 
@@ -3923,7 +3977,7 @@ lion_verify_entry(LionVerifyState *vs, BlockNumber blk,
 	 */
 	if (((entry->flags & LION_ENTRY_POSITIONS) != 0) !=
 		(state->positions && !LionEntryIsReserved(entry) &&
-		 !LionEntryIsSummary(entry)))
+		 !LionEntryIsDerived(entry)))
 		lion_corrupt("lion index \"%s\": entry %u on block %u %s positions, but key column %u %s",
 					RelationGetRelationName(vs->index), off, blk,
 					(entry->flags & LION_ENTRY_POSITIONS) != 0 ? "stores" : "does not store",
@@ -4242,6 +4296,9 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	 * which reads the index the way the counts do.
 	 */
 	lion_verify_summaries(&vs);
+
+	/* ... and what the bit slices hold (DESIGN.md §51) */
+	lion_verify_slices(&vs);
 
 	/*
 	 * What writers running beside the check cost it (DESIGN.md §7), in the

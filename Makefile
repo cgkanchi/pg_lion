@@ -9,7 +9,7 @@ PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o 
 # private header src/lion_count_int.h.
 COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
        src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_count_shared.o \
-       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o src/lion_facets.o
+       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o src/lion_facets.o src/lion_slice.o
 # The LionCount custom scan: its planner half (lion_plan_*) and its executor
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
 CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
@@ -25,7 +25,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
-       src/lion_verify_summary.o
+       src/lion_verify_summary.o src/lion_verify_slice.o
 # lionvec, the nearest-neighbour index of pgvector's `vector` and `halfvec`
 # (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
 # standalone.

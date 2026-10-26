@@ -388,8 +388,9 @@ lion_fill_posting_set_entry(Relation index, LionState *state,
 		ps->storedkey = (Datum) 0;
 		ps->hasstoredkey = true;
 	}
-	else if (LionEntryIsReserved(entry))
+	else if (LionEntryIsReserved(entry) || LionEntryIsSlice(entry))
 	{
+		/* ... nor a slice (§51), whose one-byte key is not the column's */
 		ps->storedkey = (Datum) 0;
 		ps->hasstoredkey = false;
 	}
@@ -1938,6 +1939,39 @@ lion_posting_set_lookup_reserved_col(Relation index, AttrNumber attno,
 								  reservedflag, &buf, &off))
 	{
 		/* one entry of its kind per column: no run to move right through */
+		lion_reader_lock_absent(index, buf, false);
+		if (BufferIsValid(buf))
+			UnlockReleaseBuffer(buf);
+		return false;
+	}
+
+	lion_posting_set_take(index, state, buf, off, ps);
+	return true;
+}
+
+bool
+lion_posting_set_lookup_slice_col(Relation index, AttrNumber attno, int pos,
+								  LionPostingSet *ps)
+{
+	LionState  *state = lion_index_column_state(index, attno);
+	Buffer		buf;
+	OffsetNumber off;
+
+	memset(ps, 0, sizeof(LionPostingSet));
+	ps->index = index;
+	ps->attno = state->attno;
+	ps->pinbuf = InvalidBuffer;
+	ps->head = InvalidBlockNumber;
+	ps->entryblk = InvalidBlockNumber;
+	ps->entryoff = InvalidOffsetNumber;
+
+	if (!state->sliced)
+		elog(ERROR, "lion index \"%s\": key column %d has no slices",
+			 RelationGetRelationName(index), attno);
+	if (!lion_find_slice_entry(index, state, BUFFER_LOCK_SHARE, pos, &buf,
+							   &off))
+	{
+		/* one entry per position: no run to move right through */
 		lion_reader_lock_absent(index, buf, false);
 		if (BufferIsValid(buf))
 			UnlockReleaseBuffer(buf);

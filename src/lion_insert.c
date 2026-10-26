@@ -1818,6 +1818,111 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	UnlockReleaseBuffer(leafbuf);
 }
 
+/* ---------------------------------------------------------------------
+ * Bit slices (DESIGN.md §51)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Add one row to the SLICE entry of column state at pos: the entry located
+ * or created by the find-or-create every new entry takes (lion_dir_find(),
+ * which with the position in the prefix finds exactly that slice), and the
+ * member put in it by the same INLINE and CHAIN paths a key's entry takes,
+ * the in-place fast paths for a BITSET or a slack item and their records
+ * included - a slice of a dense column is bitsets, so most of its inserts
+ * are a bit set in place.
+ */
+void
+lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
+					  int pos, uint32 ckey, uint16 lo)
+{
+	LionSearchKey sk;
+	uint8		posbyte;
+	Buffer		leafbuf;
+	OffsetNumber entryoff;
+	bool		movedright;
+	bool		found;
+
+	lion_search_key_slice(state, &sk, pos, &posbyte);
+	found = lion_dir_find(index, heaprel, state->ix, &sk, BUFFER_LOCK_EXCLUSIVE,
+						  true, &leafbuf, &entryoff, &movedright);
+
+	/* SERIALIZABLE: the page that stands for the slice (DESIGN.md §9) */
+	lion_writer_check(index, leafbuf, entryoff, found);
+
+	if (!found)
+	{
+		char		payload[LION_SPARSE_SINGLETON_MAX];
+		Size		paylen = lion_put_singleton(payload, ckey, lo);
+		LionEntryTuple *entry;
+		Size		size;
+
+		entry = lion_make_slice_entry((AttrNumber) state->attno, pos,
+									  LION_ENTRY_INLINE, payload, paylen,
+									  &size);
+		lion_entry_set_ncontainers(entry, 1);
+		lion_entry_set_ntids(entry, 1);
+		lion_dir_add_entry(index, heaprel, state->ix, &leafbuf, entryoff,
+						   movedright, entry, size);
+		pfree(entry);
+	}
+	else if ((lion_page_entry(BufferGetPage(leafbuf), entryoff)->flags &
+			  LION_ENTRY_INLINE) != 0)
+		lion_insert_inline(index, heaprel, state, leafbuf, entryoff, ckey, lo,
+						   NULL);
+	else
+		lion_insert_chain(index, heaprel, leafbuf, entryoff, ckey, lo, NULL);
+
+	UnlockReleaseBuffer(leafbuf);
+}
+
+/*
+ * A row of a sliced column: into the slice of every bit its value's encoding
+ * has set, in ascending position, and then into the existence slice - each
+ * an insert of its own, with nothing held in between, AFTER the row went
+ * under its key.  Readers see no half-done row: its transaction has not
+ * committed (lioninsert()).  A failure between the steps leaves a dead row in
+ * some of the sets and not the others, which no snapshot sees and the next
+ * VACUUM takes out of all of them; lion_index_verify() knows such a row by
+ * its being dead (lion_verify_slices()).
+ *
+ * THE SEAM for the plane kernel (DESIGN.md §50, §51 "Not done"): one row,
+ * one descent per slice.  An insert of many rows - a COPY, an INSERT ...
+ * SELECT - could turn them into planes (lion_planes_scatter_strided()) and
+ * add each plane's word to its slice once; aminsert is handed one row at a
+ * time, so that is a bulk-insert path of its own.
+ */
+static void
+lion_slice_insert(Relation index, Relation heaprel, LionState *state,
+				  Datum key, uint32 ckey, uint16 lo)
+{
+	int			nbits = state->slicebits;
+	int64		v;
+	uint64		enc;
+
+	switch (nbits)
+	{
+		case 16:
+			v = DatumGetInt16(key);
+			break;
+		case 32:
+			v = DatumGetInt32(key);
+			break;
+		default:
+			v = DatumGetInt64(key);
+			break;
+	}
+	enc = lion_slice_encode(v, nbits);
+	while (enc != 0)
+	{
+		int			bit = pg_rightmost_one_pos64(enc);
+
+		lion_slice_insert_one(index, heaprel, state, bit, ckey, lo);
+		enc &= enc - 1;
+		CHECK_FOR_INTERRUPTS();
+	}
+	lion_slice_insert_one(index, heaprel, state, LION_SLICE_EXISTS, ckey, lo);
+}
+
 /*
  * aminsert
  *
@@ -1934,6 +2039,13 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 				LION_INJECTION_POINT("lion-insert-before-summary");
 				lion_summary_insert(index, heapRel, state, key, ckey, lo);
 			}
+
+			/*
+			 * ... and in its bit slices (DESIGN.md §51), a step after that
+			 * with nothing held in between, as for the summary.
+			 */
+			if (state->sliced)
+				lion_slice_insert(index, heapRel, state, key, ckey, lo);
 		}
 
 		CHECK_FOR_INTERRUPTS();
