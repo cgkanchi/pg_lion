@@ -161,6 +161,10 @@ uncommitted rows, are what the query would see.
   not sliced (the error says which) - and a multi-key column.
 - A partial index answers for the rows it holds (`... WHERE <predicate> AND <filter>`). `SET
   client_min_messages = debug1` shows the slices counted and the descent's steps.
+- **Its cost** hardly depends on how many rows the filter keeps: 2 · bits + 1 counted ANDs (97 for
+  an `int4`, 193 for an `int8`), each over the filter's containers. On 5 million rows it took 26 to
+  52 ms, against 30 ms for the query at a 1% filter and 140 to 330 ms at 10% and 50% (DESIGN.md
+  §51.11): a win from some 1% of the rows up, sooner for narrower types.
 - The planner does not use slices yet: `SELECT sum(x) ... WHERE ...` takes its ordinary plan. The
   LionCount pushdown of `sum`, `avg`, `min`, `max` and ranges from slices is the next step.
 
@@ -571,12 +575,15 @@ counts `sum`, `min` and `max` under a filter from them. A key column of any othe
 `float4`, `float8`, `numeric`, `interval`, text, arrays, ...) is simply not sliced, and
 `lion_index_stats().sliced` says which are. Every insert into a sliced column also puts the row
 into the slice of each bit its value has set - about half the bits for values spread over the type,
-so some 17 posting-set inserts for an `int4`, 33 for an `int8` - which is the price of the option
-(measured in DESIGN.md §51); the slices of a dense column are mostly bitsets, which an insert
-changes in place. Read at build time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes
-effect at the next REINDEX. An index with a sliced column is on-disk format 15, which a build of
-pg_lion before this option refuses; one without stays format 14, readable by both - so REINDEX with
-`slices = off` before going back to an older build.
+so some 17 posting-set inserts for an `int4`, 33 for an `int8` - which is the price of the option:
+an `INSERT` of such values into a lion index of an `int4` and one of an `int8` took about 9 times
+as long as without slices (DESIGN.md §51.11). The slices of a dense column are mostly bitsets, which
+an insert changes in place; they added 4% to 40% to the size of the indexes measured, the most to a
+column of few keys. An index build with slices took 1.2 to 1.5 times as long. Read at build
+time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes effect at the next REINDEX. An
+index with a sliced column is on-disk format 15, which a build of pg_lion before this option
+refuses; one without stays format 14, readable by both - so REINDEX with `slices = off` before
+going back to an older build.
 `summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
 With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
 consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their
