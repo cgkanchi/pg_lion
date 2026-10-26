@@ -30,9 +30,11 @@
  *		bits past the width ignored, and the gather the scatter's inverse,
  *		whatever the padding holds;
  *	  - lionvec: the INTERLEAVED weighted sum of four planes is
- *		lionvec_plane_dot() under every pair of implementations, and the
- *		scatter of a query's 4-bit codes is the planes lionvec_query_init()
- *		builds, to the bit.
+ *		lionvec_plane_dot() under every pair of implementations - which,
+ *		since lionvec takes its plane-1 kernel from here, is each
+ *		implementation of this sum against every other through lionvec's
+ *		call - and the scatter of a query's 4-bit codes is the planes
+ *		lionvec_query_init() builds, to the bit.
  *
  *	  With --bench it times the kernels instead (make planes-bench, at -O2).
  *	  Exit status is 0 only if every check passed.
@@ -789,7 +791,11 @@ test_scatter(void)
  * The INTERLEAVED weighted sum of four planes against lionvec_plane_dot(),
  * every implementation of each against every one of the other, at every
  * word count an index takes, and the planes of a query's 4-bit codes
- * against those lionvec_query_init() builds.
+ * against those lionvec_query_init() builds.  lionvec_plane_dot() was a
+ * kernel set of lionvec's own when this was written, and is this sum since
+ * (DESIGN.md §44.3, "Kernels"): forcing lionvec's set forces the choice
+ * every implementation here follows, so the pairs are this module's
+ * implementations against one another, through lionvec's call.
  */
 #define TEST_MAX_DIMSP		8128
 
