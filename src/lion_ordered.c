@@ -79,8 +79,10 @@
 #include "optimizer/cost.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/pathnode.h"
+#include "optimizer/plancat.h"
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -5439,6 +5441,128 @@ lo_reparameterize(PlannerInfo *root, List *custom_private,
 		elog(ERROR, "LionBtreeScan: could not reparameterize the walk of index %u",
 			 ((IndexPath *) ord)->indexinfo->indexoid);
 	return list_make3(moved, lsecond(custom_private), lthird(custom_private));
+}
+
+/* ---------------------------------------------------------------------
+ * A nested loop's probe as its loop holds it (DESIGN.md §49, "The probe's
+ * projection")
+ * --------------------------------------------------------------------- */
+
+/*
+ * The relation's columns as a path target, through which the node returns its
+ * scan tuple as it is, as core's scans return theirs through a physical target
+ * list - or NULL where core's use_physical_tlist() would not have one (a
+ * relation that is not a plain table of the query; a system column, a
+ * whole-row Var or a placeholder wanted of it) or where the executor would
+ * project all the same (tlist_matches_tupdesc(): a dropped column, or one
+ * whose value is missing from the older tuples).
+ */
+static PathTarget *
+lo_physical_target(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	Relation	heap;
+	TupleDesc	desc;
+	bool		ok = true;
+	ListCell   *lc;
+	int			i;
+
+	if (rel->rtekind != RTE_RELATION || rel->reloptkind != RELOPT_BASEREL)
+		return NULL;
+	for (i = rel->min_attr; i <= 0; i++)
+	{
+		if (!bms_is_empty(rel->attr_needed[i - rel->min_attr]))
+			return NULL;
+	}
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
+
+		if (bms_nonempty_difference(phinfo->ph_needed, rel->relids) &&
+			bms_is_subset(phinfo->ph_eval_at, rel->relids))
+			return NULL;
+	}
+	foreach(lc, rel->reltarget->exprs)
+	{
+		if (!IsA(lfirst(lc), Var))
+			return NULL;
+	}
+
+	rte = planner_rt_fetch(rel->relid, root);
+	heap = table_open(rte->relid, NoLock);
+	desc = RelationGetDescr(heap);
+	for (i = 0; i < desc->natts && ok; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(desc, i);
+
+		ok = !att->attisdropped && !att->atthasmissing;
+	}
+	table_close(heap, NoLock);
+	if (!ok)
+		return NULL;
+
+	return set_pathtarget_cost_width(root,
+									 make_pathtarget_from_tlist(build_physical_tlist(root, rel)));
+}
+
+/*
+ * The nested loops among paths whose inner side is a LionBtreeScan probe
+ * (§40.10): each takes a copy of the probe that returns its scan tuple
+ * through the relation's columns, which the loop's own projection reads - as
+ * core's Index Scan under a nested loop returns the heap tuple, since
+ * create_nestloop_plan() asks its inner side for no particular target list.
+ * Projected by the node, each row the probe returns cost it an interpreted
+ * expression: 110 instructions and 3.6 mispredicted indirect branches a row
+ * under callgrind.  The probe's own path keeps the relation's target for
+ * every other parent - a Memoize, which caches the rows it returns and wants
+ * them small, and an Append, whose children must return exactly its target -
+ * the flags create_scan_plan() reads and PlanCustomPath is not given.
+ */
+static void
+lo_loop_probes(PlannerInfo *root, List *paths)
+{
+	RelOptInfo *rel = NULL;
+	PathTarget *target = NULL;
+	ListCell   *lc;
+
+	foreach(lc, paths)
+	{
+		JoinPath   *jpath = (JoinPath *) lfirst(lc);
+		Path	   *inner;
+		CustomPath *cp;
+
+		if (!IsA(jpath, NestPath))
+			continue;
+		inner = jpath->innerjoinpath;
+		if (!IsA(inner, CustomPath) ||
+			((CustomPath *) inner)->methods != &lion_btree_path_methods ||
+			inner->param_info == NULL ||
+			inner->pathtarget != inner->parent->reltarget)
+			continue;
+		if (inner->parent != rel)
+		{
+			rel = inner->parent;
+			target = lo_physical_target(root, rel);
+		}
+		if (target == NULL)
+			continue;
+		cp = makeNode(CustomPath);
+		memcpy(cp, inner, sizeof(CustomPath));
+		cp->path.pathtarget = target;
+		jpath->innerjoinpath = &cp->path;
+	}
+}
+
+/*
+ * set_join_pathlist_hook's part (lion_set_join_pathlist()): the paths core
+ * made of joinrel so far, once a pair of its sides' are made.  A probe already
+ * taken is not taken again: its target is no longer the relation's.
+ */
+void
+lion_ordered_join_probes(PlannerInfo *root, RelOptInfo *joinrel)
+{
+	lo_loop_probes(root, joinrel->pathlist);
+	lo_loop_probes(root, joinrel->partial_pathlist);
 }
 
 /* ---------------------------------------------------------------------

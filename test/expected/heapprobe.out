@@ -379,6 +379,161 @@ SELECT hp($$SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
  Nested Loop > LionBtreeScan (hp_dim_pkey), 79 rows
 (1 row)
 
+-- 6. What the probe returns (DESIGN.md §49, "The probe's projection"):
+--    under a plain nested loop its scan tuple as it is, through the
+--    relation's columns, which the loop reads what it needs from, as core's
+--    Index Scan's heap tuple is read - in heap mode and index-only alike,
+--    where the columns the index does not hold are NULL and nothing above
+--    reads them; under a Memoize, which caches what the probe returns, the
+--    columns the query needs alone; and those alone too where the relation's
+--    tuple would be projected anyway, a dropped column in it, or holds no
+--    whole-row value.  The answers are the ordinary plan's.
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+SET pg_lion.enable_heap_probe = on;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Nested Loop
+   Output: f.id, d.name
+   Inner Unique: true
+   ->  Bitmap Heap Scan on public.hp_fact f
+         Output: f.id, f.dim_id, f.g, f.v
+         Recheck Cond: (f.g < 10)
+         ->  Bitmap Index Scan on hp_fact_g
+               Index Cond: (f.g < 10)
+   ->  Custom Scan (LionBtreeScan) on public.hp_dim d
+         Output: d.id, d.grade, d.verified, d.tags, d.name, d.pad
+         Index: hp_dim_pkey
+         Index Cond: (d.id = f.dim_id)
+         Lion Cond: (d.grade = 'alpha'::hp_grade)
+         Lion Indexes: hp_dim_grade
+(14 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.id FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+                            QUERY PLAN                            
+------------------------------------------------------------------
+ Nested Loop
+   Output: f.id, d.id
+   Inner Unique: true
+   ->  Bitmap Heap Scan on public.hp_fact f
+         Output: f.id, f.dim_id, f.g, f.v
+         Recheck Cond: (f.g < 10)
+         ->  Bitmap Index Scan on hp_fact_g
+               Index Cond: (f.g < 10)
+   ->  Custom Scan (LionBtreeScan) on public.hp_dim d
+         Output: d.id, d.grade, d.verified, d.tags, d.name, d.pad
+         Index: hp_dim_pkey (index only)
+         Index Cond: (d.id = f.dim_id)
+         Lion Cond: (d.grade = 'alpha'::hp_grade)
+         Lion Indexes: hp_dim_grade
+(14 rows)
+
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop
+   Output: f.id, d.*
+   Inner Unique: true
+   ->  Bitmap Heap Scan on public.hp_fact f
+         Output: f.id, f.dim_id, f.g, f.v
+         Recheck Cond: (f.g < 10)
+         ->  Bitmap Index Scan on hp_fact_g
+               Index Cond: (f.g < 10)
+   ->  Custom Scan (LionBtreeScan) on public.hp_dim d
+         Output: d.*, d.id
+         Index: hp_dim_pkey
+         Index Cond: (d.id = f.dim_id)
+         Lion Cond: (d.grade = 'alpha'::hp_grade)
+         Lion Indexes: hp_dim_grade
+(14 rows)
+
+SET enable_memoize = on;
+SET pg_lion.pushdown_margin = 1;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.g + 1
+ WHERE f.g < 20 AND d.grade = 'alpha' AND d.verified;
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ Nested Loop
+   Output: f.id, d.name
+   Inner Unique: true
+   ->  Bitmap Heap Scan on public.hp_fact f
+         Output: f.id, f.dim_id, f.g, f.v
+         Recheck Cond: (f.g < 20)
+         ->  Bitmap Index Scan on hp_fact_g
+               Index Cond: (f.g < 20)
+   ->  Memoize
+         Output: d.name, d.id
+         Cache Key: (f.g + 1)
+         Cache Mode: logical
+         ->  Custom Scan (LionBtreeScan) on public.hp_dim d
+               Output: d.name, d.id
+               Index: hp_dim_pkey
+               Index Cond: (d.id = (f.g + 1))
+               Lion Cond: ((d.grade = 'alpha'::hp_grade) AND d.verified)
+               Lion Indexes: hp_dim_grade, hp_dim_verified
+(18 rows)
+
+RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_heap_probe;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT hp($$SELECT f.id, d FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+			WHERE f.g < 10 AND d.grade = 'alpha'$$);
+                         hp                          
+-----------------------------------------------------
+ Nested Loop > LionBtreeScan (hp_dim_pkey), 174 rows
+(1 row)
+
+ALTER TABLE hp_dim DROP COLUMN pad;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET enable_memoize = off;
+SET pg_lion.enable_heap_probe = on;
+SET pg_lion.pushdown_margin = 1000;
+EXPLAIN (VERBOSE, COSTS OFF)
+SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+ WHERE f.g < 10 AND d.grade = 'alpha';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Nested Loop
+   Output: f.id, d.name
+   Inner Unique: true
+   ->  Bitmap Heap Scan on public.hp_fact f
+         Output: f.id, f.dim_id, f.g, f.v
+         Recheck Cond: (f.g < 10)
+         ->  Bitmap Index Scan on hp_fact_g
+               Index Cond: (f.g < 10)
+   ->  Custom Scan (LionBtreeScan) on public.hp_dim d
+         Output: d.name, d.id
+         Index: hp_dim_pkey
+         Index Cond: (d.id = f.dim_id)
+         Lion Cond: (d.grade = 'alpha'::hp_grade)
+         Lion Indexes: hp_dim_grade
+(14 rows)
+
+RESET enable_memoize;
+RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_heap_probe;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+SELECT hp($$SELECT f.id, f.v, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
+			WHERE f.g < 10 AND d.grade = 'alpha' AND d.verified$$);
+                         hp                          
+-----------------------------------------------------
+ Nested Loop > LionBtreeScan (hp_dim_pkey), 113 rows
+(1 row)
+
 DROP FUNCTION hp_inner(text);
 DROP FUNCTION hp_run(text, boolean, int);
 DROP FUNCTION hp(text, boolean, boolean, int);
