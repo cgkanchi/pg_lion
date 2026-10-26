@@ -64,7 +64,7 @@ lion_init_metapage(Page page, uint32 inline_limit, BlockNumber root,
 	meta->version = LION_VERSION_V14;
 	meta->offset_bits = LION_OFFSET_BITS;
 	meta->container_bits = LION_CONTAINER_BITS;
-	meta->unused_nbuckets = 0;
+	meta->slice_cols = 0;
 	meta->inline_limit = inline_limit;
 	meta->root = root;
 	meta->height = height;
@@ -277,7 +277,8 @@ lion_index_other_format(Relation index)
 		LionMetaPageData *meta = LionPageGetMeta(page);
 
 		other = meta->magic == LION_MAGIC &&
-			meta->version != LION_VERSION_V14;
+			meta->version != LION_VERSION_V14 &&
+			meta->version != LION_VERSION_V15;
 	}
 	UnlockReleaseBuffer(buf);
 	return other;
@@ -301,16 +302,17 @@ void
 lion_meta_check_version(Relation index, const LionMetaPageData *meta)
 {
 	/*
-	 * Version 14 is the only one read.  Anything older predates a format
-	 * change that moved or reinterpreted items - for versions 6 to 8 the
-	 * sparse segments of §13, for version 9 the entry tuples of §21, for
-	 * version 10 the key size of §4, for version 11 the first downlinks of
-	 * §21, for version 12 the EMPTY entry of §17, for version 13 its
-	 * EMPTYDIM and EMPTYINNER entries and the NARROW items of §38, with the
-	 * meta page flag that allowed them - and anything newer is a format this
-	 * build does not know; the hint says which of the two it is, since
-	 * REINDEX with this build is the way out of either, but the reason
-	 * differs.
+	 * Versions 14 and 15 are read: 15 is 14 with the SLICE entries of §50,
+	 * which a build writes only when a column is sliced.  Anything older
+	 * predates a format change that moved or reinterpreted items - for
+	 * versions 6 to 8 the sparse segments of §13, for version 9 the entry
+	 * tuples of §21, for version 10 the key size of §4, for version 11 the
+	 * first downlinks of §21, for version 12 the EMPTY entry of §17, for
+	 * version 13 its EMPTYDIM and EMPTYINNER entries and the NARROW items of
+	 * §38, with the meta page flag that allowed them - and anything newer is
+	 * a format this build does not know; the hint says which of the two it
+	 * is, since REINDEX with this build is the way out of either, but the
+	 * reason differs.
 	 */
 	if (meta->magic != LION_MAGIC)
 		ereport(ERROR,
@@ -319,14 +321,15 @@ lion_meta_check_version(Relation index, const LionMetaPageData *meta)
 						RelationGetRelationName(index)),
 				 errdetail("Meta page magic %08X, expected %08X.",
 						   meta->magic, LION_MAGIC)));
-	if (meta->version != LION_VERSION_V14)
+	if (meta->version != LION_VERSION_V14 &&
+		meta->version != LION_VERSION_V15)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a valid lion index",
 						RelationGetRelationName(index)),
-				 errdetail("Meta page magic %08X version %u, expected %08X version %u.",
+				 errdetail("Meta page magic %08X version %u, expected %08X version %u or %u.",
 						   meta->magic, meta->version, LION_MAGIC,
-						   LION_VERSION_V14),
+						   LION_VERSION_V14, LION_VERSION_V15),
 				 meta->version < LION_VERSION_V14 ?
 				 errhint("REINDEX the index: its on-disk format predates this build of pg_lion.") :
 				 errhint("The index was written by a newer build of pg_lion than this one: use that build, or REINDEX the index with this one.")));
@@ -399,6 +402,18 @@ lion_read_meta(Relation index, LionMetaPageData *meta)
 				 errdetail("Meta page version %u names summarized columns %08X with buckets of %u TIDs.",
 						   meta->version, meta->summary_cols,
 						   meta->summary_tids)));
+
+	/*
+	 * The sliced columns (§50) and the version say the same thing: a
+	 * version 15 meta page names at least one, a version 14 one none.
+	 */
+	if ((meta->version == LION_VERSION_V15) != (meta->slice_cols != 0))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("index \"%s\" is not a valid lion index",
+						RelationGetRelationName(index)),
+				 errdetail("Meta page version %u names sliced columns %08X.",
+						   meta->version, meta->slice_cols)));
 
 	if (meta->offset_bits != LION_OFFSET_BITS ||
 		meta->container_bits != LION_CONTAINER_BITS)
@@ -483,4 +498,11 @@ lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 		meta->summary_cols = cols;
 		meta->summary_tids = bucket_tids;
 	}
+}
+
+void
+lion_meta_record_slices(LionMetaPageData *meta, uint32 cols)
+{
+	meta->slice_cols = cols;
+	meta->version = (cols != 0) ? LION_VERSION_V15 : LION_VERSION_V14;
 }

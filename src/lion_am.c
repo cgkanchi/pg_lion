@@ -98,7 +98,8 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
 	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
-	{"store_positions", RELOPT_TYPE_ENUM, offsetof(LionOptions, store_positions)}
+	{"store_positions", RELOPT_TYPE_ENUM, offsetof(LionOptions, store_positions)},
+	{"slices", RELOPT_TYPE_BOOL, offsetof(LionOptions, slices)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -333,6 +334,19 @@ _PG_init(void)
 					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
 					  LION_MAX_SUMMARY_TIDS,
 					  ShareUpdateExclusiveLock);
+
+	/*
+	 * DESIGN.md §50.  Bit slices: one posting set per bit of every value of
+	 * a key column of an integer, date, time or timestamp type, from which
+	 * sum, min and max under a filter are counted without the rows.  "off"
+	 * by default - every insert into a sliced column pays a posting-set
+	 * insert per set bit - and, like summaries, read at build time only and
+	 * recorded on the meta page, so it is REINDEX that adds or drops them.
+	 */
+	add_bool_reloption(lion_relopt_kind, "slices",
+					   "Keep bit-sliced posting sets of every integer, date, time and timestamp key column",
+					   false,
+					   ShareUpdateExclusiveLock);
 
 	/*
 	 * DESIGN.md §17, "Stored positions".  "auto" by default: a tsvector
@@ -1391,6 +1405,12 @@ lionbuildempty(Relation index)
 		lion_meta_record_summaries(&meta, cols, (uint32) opts.summary_tids);
 	}
 
+	/*
+	 * Slices (DESIGN.md §50): "on" slices every column it can encode, of an
+	 * empty index as of a full one; the first insert makes the entries.
+	 */
+	lion_meta_record_slices(&meta, lion_settle_slices(&ix, &opts));
+
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -1404,6 +1424,7 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->version = meta.version;
 	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
 	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
+	LionPageGetMeta(BufferGetPage(buf))->slice_cols = meta.slice_cols;
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

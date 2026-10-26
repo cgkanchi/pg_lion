@@ -134,6 +134,19 @@
 #define LION_ENTRY_EMPTYDIM	0x1000
 #define LION_ENTRY_EMPTYINNER	0x2000
 
+/*
+ * SLICE entries (DESIGN.md §50, format version 15).  A bit-sliced column keeps,
+ * after its VALUE entries and its summaries, one entry per bit position of
+ * its values' encoding (lion_slice_enc.h) whose posting set is the rows with
+ * that bit set, and one EXISTENCE slice of every row not NULL.  Its key is
+ * one byte, the bit position or LION_SLICE_EXISTS, which the directory order
+ * compares bytewise as the slice's whole position within its kind: a slice is
+ * one entry per (column, kind, position), as a reserved entry is one per
+ * (column, kind).  The key is not a value of the column, and nothing reads it
+ * as one.
+ */
+#define LION_ENTRY_SLICE		0x4000
+
 #define LION_ENTRY_RESERVED	(LION_ENTRY_NULLKEY | LION_ENTRY_EMPTYKEY | \
 							 LION_ENTRY_EMPTYDIM | LION_ENTRY_EMPTYINNER | \
 							 LION_ENTRY_NULLELEMS)
@@ -144,14 +157,20 @@
 								 LION_ENTRY_EMPTYINNER)
 #define LION_ENTRY_SUMKINDS	(LION_ENTRY_SUMMARY | LION_ENTRY_SUMLAST)
 /*
+ * The kinds whose posting sets are DERIVED from the column's rows rather than
+ * a key's own - the summaries of §32 and the slices of §50 - and which sort
+ * after every VALUE entry of their column.
+ */
+#define LION_ENTRY_DERIVED	(LION_ENTRY_SUMKINDS | LION_ENTRY_SLICE)
+/*
  * The flags that make an entry's KIND, which a pivot copied from it keeps -
  * all but SUMLAST (lion_pivot_kindflags()).
  */
-#define LION_ENTRY_KINDFLAGS	(LION_ENTRY_RESERVED | LION_ENTRY_SUMKINDS)
+#define LION_ENTRY_KINDFLAGS	(LION_ENTRY_RESERVED | LION_ENTRY_DERIVED)
 #define LION_ENTRY_PIVOT		(LION_ENTRY_HIGHKEY | LION_ENTRY_DOWNLINK)
 #define LION_ENTRY_ALLFLAGS \
 	(LION_ENTRY_INLINE | LION_ENTRY_CHAIN | LION_ENTRY_RESERVED | \
-	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_SUMKINDS | \
+	 LION_ENTRY_PIVOT | LION_ENTRY_MINUSINF | LION_ENTRY_DERIVED | \
 	 LION_ENTRY_POSITIONS | LION_ENTRY_ALIGNKEY)
 
 /* ---------- the two header forms ---------- */
