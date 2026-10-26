@@ -33,17 +33,20 @@ has the setting, DESIGN.md §9).
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
-    make unit PG_CONFIG=.local/pg/bin/pg_config           # containers, segments, positions, entry layout,
-                                                          # lionvec's arithmetic, the read stream ring;
-                                                          # no server
+    make unit PG_CONFIG=.local/pg/bin/pg_config           # bit-planes, containers, segments, positions,
+                                                          # entry layout, lionvec's arithmetic, the read
+                                                          # stream ring; no server
+    make planes-bench PG_CONFIG=.local/pg/bin/pg_config   # the bit-plane kernels timed, at -O2
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
 the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
-lionvec's kernels, compiled with target attributes, and pick one at run time by what the CPU has;
-other targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
-(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels").  `make unit` runs the container and
-lionvec tests against each version the CPU has, and once more built without the x86-64 ones
-(`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
+the bit-plane kernels and of lionvec's, compiled with target attributes, and pick one at run time by
+what the CPU has - one choice for the extension, `lion_simd_current()` in `src/lion_planes.h`, except
+lionvec's, which still choose their own; other targets and compilers get a portable one, and
+`make LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels"; §44.3,
+"Kernels"; §50).  `make unit` runs the bit-plane, container and lionvec tests against each version
+the CPU has, and once more built without the x86-64 ones (`test/unit/planes_test_nosimd`,
+`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
 
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
@@ -144,8 +147,13 @@ pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own wo
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
+    src/lion_planes.[ch]    bit-plane arithmetic - popcounts of a bit vector AND each of k planes, interleaved
+                            or each its own array, their weighted sum, the 64x64 bit transpose and values to
+                            and from planes - and the extension's one choice of SIMD implementation
+                            (portable, POPCNT, AVX2, AVX-512); below the container library and lionvec,
+                            frontend-safe and unit-tested standalone (test/unit/planes_test.c)
     src/lion_container.[ch] container library (array/bitset/run/narrow), set algebra, AVX2/POPCNT bitset kernels
-                            picked at run time, unit-tested standalone
+                            picked by that choice at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
     src/lion_entryfmt.h     the directory entry tuple's byte layout and accessors, unit-tested standalone

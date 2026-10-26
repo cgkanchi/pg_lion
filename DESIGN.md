@@ -261,8 +261,10 @@ Before, the AND of two BITSETs was a 4 KB copy of one, a pass ANDing in the othe
 `pg_popcount()` of it, and the run count and the in-place OR a `pg_popcount64()` a word - which on
 x86-64 before PostgreSQL 19 is an indirect call, as is every word of `pg_popcount()` itself before
 17. There are three implementations, picked once per process at the first call: a static function
-pointer starts at a resolver, which asks `__builtin_cpu_supports()` and overwrites the pointer with
-its choice, as PostgreSQL's own `pg_popcount64` does:
+pointer started at a resolver, which asked `__builtin_cpu_supports()` and overwrote the pointer with
+its choice, as PostgreSQL's own `pg_popcount64` does - and since 2026-10-26 every pass dispatches on
+the extension's one choice instead, `lion_simd_current()`, made the same way and to the same
+kernel on every CPU (§50, "One choice of implementation"):
 
 - **AVX2** (x86-64): Muła's popcount - each byte's count looked up a nibble at a time in a 16-entry
   table with VPSHUFB - summed in bytes over 16 vectors, at most 128 a byte, before one VPSADBW;
@@ -316,7 +318,8 @@ thousand members does, 800 ns) were measured with the old passes and now overcha
 somewhat, which a refit may take up with the rest of the model.
 
 `lion_container_simd_force()` (a `-DFRONTEND` build only) makes the library use a given
-implementation: the unit tests force each one the build and CPU have, check every pass against a
+implementation - through `lion_simd_force()` since §50, so every kernel of the extension that
+dispatches on the choice follows it: the unit tests force each one the build and CPU have, check every pass against a
 reference that counts a bit at a time - 22 x 22 pairs of patterns: empty, full, densities from 0.05%
 to 99.95%, the first or last bit of every word, runs across words and across the AVX2 kernel's
 16-vector blocks - in exact-size heap buffers at every 8-byte alignment modulo 32, check what the
@@ -30971,3 +30974,252 @@ choice at the prices between the probe and core's Index Scan. costrates.sql: wit
 rate moves a count, a GROUP BY, an FK-side join or a semi or anti join, each at its reference price.
 competitor_cold.sql: with the switch off LionProbeJoin's price at ten times the cache is its price
 with no cold charge.
+
+## 50. Bit-plane arithmetic (`lion_planes.[ch]`, 2026-10-26)
+
+n values of nbits bits each are nbits **bit-planes**: plane j holds bit j of every value, bit i of
+its word w being bit j of value 64 w + i. A set of rows F, as a bit vector over the same rows, then
+weighs the values it selects as
+
+    sum over i in F of x_i  =  sum over j of 2^j popcount(F AND plane_j)
+
+Two parts of lion compute that sum. lionvec's plane-1 estimate (§44.3) is it with F a row's sign
+bits, one a dimension, and the planes the query's four bits a dimension; a bit-sliced index's
+`sum(x)` under a filter, the section after this one, is it with F the filter's container and the
+planes the column's slices, a roaring container each. The identity is one; the operands are
+transposed. lionvec's many-bit operand is the query: made once a scan, in memory, short (dimsp / 64
+words, 24 at 1536 dimensions), met by thousands of rows' sign bits, and kept **interleaved**, a
+word's four planes side by side, `planes[w * 4 + j]`, so that one vector holds them against the row's
+word broadcast. A bit-sliced index's many-bit operand is the stored column: a slice is a posting set
+of its own, a container per container key in whatever representation suits it - the high slices of
+small values sparse ARRAYs or nothing, the low ones BITSETs or NARROWs (§38) - inserted into and
+vacuumed one slice at a time as any posting set is, so its planes are **strided**: each its own
+512-word payload (a BITSET's; 64 k words a NARROW's), wherever its page holds it. Interleaving
+slices on disk would make one item of 4 KB a slice that no container operation reads, that every
+insert rewrites whole, and whose empty high slices still cost their words; de-interleaving lionvec's
+query would cost its kernel the one-vector-a-word load. So the layouts stay as their owners need
+them, and this module takes both: one kernel for the identity, below the container library and
+lionvec, frontend-safe as lion_container.c is (c.h, pg_bitutils and libpgcommon).
+
+### The interface (`lion_planes.h`)
+
+    /* per-plane counts: counts[j] = sum over w < nwords of popcount(bits[w] AND plane j's word w) */
+    void   lion_planes_count_interleaved(const uint64 *bits, const uint64 *planes,  /* [w * k + j] */
+                                         uint32 nwords, uint32 k, uint32 *counts);
+    void   lion_planes_count_strided(const uint64 *bits, const uint64 *const *planes, /* [j][w] */
+                                     uint32 nwords, uint32 k, uint32 *counts);
+    /* sum over j < k of 2^j counts[j], modulo 2^64; k <= 64 */
+    uint64 lion_planes_dot_interleaved(const uint64 *bits, const uint64 *planes, uint32 nwords, uint32 k);
+    uint64 lion_planes_dot_strided(const uint64 *bits, const uint64 *const *planes, uint32 nwords, uint32 k);
+    /* 64 x 64 bit matrix, in place: bit c of word r to bit r of word c */
+    void   lion_planes_transpose64(uint64 *m);
+    /* n values of nbits (1 .. 64) to nbits planes of ceil(n / 64) words, and back */
+    void   lion_planes_scatter_interleaved(const uint64 *values, uint32 n, uint32 nbits, uint64 *planes);
+    void   lion_planes_scatter_strided(const uint64 *values, uint32 n, uint32 nbits, uint64 *const *planes);
+    void   lion_planes_gather_interleaved(const uint64 *planes, uint32 n, uint32 nbits, uint64 *values);
+    void   lion_planes_gather_strided(const uint64 *const *planes, uint32 n, uint32 nbits, uint64 *values);
+
+STRIDED takes an array of k pointers, so that k payloads that lie on k pages, or anywhere, need no
+copy; a caller whose planes are one array at a stride builds the k pointers. nwords and k are any,
+0 included: a BITSET's 512, a NARROW's 64 k, lionvec's dimsp / 64. A scatter pads the last word with
+zeros past value n - 1 and leaves out a value's bits from nbits up; a gather writes exactly n values
+and does not read the padding as one. Nothing allocates; every array is the caller's.
+
+**Counts, not sums.** A count is at most 64 nwords, a uint32 below 2^26 words. A weighted sum is
+not bounded so: 64 slices over a container's 32,768 rows weigh to (2^64 - 1) 32,768, past any
+uint64, and a column's sum over many containers further. So the count functions return per-plane
+counts and the caller weighs them as its sum needs - a bit-sliced index into int128, a signed
+column's top slice negatively - and the `dot` functions are the convenience for a caller that
+knows `(2^k - 1) 64 nwords` is below 2^64, lionvec's being at most 121,920 (k = 4, 127 words);
+past that they wrap, deterministically, and every implementation wraps alike.
+
+### Kernels
+
+Each count function runs one of four implementations (below), every one returning the same counts
+to the bit. Every kernel takes the planes four at a time, a group, whose four sums stay in
+registers through one pass over the words; the last k % 4 planes are a shorter group. bits is read
+once a pass, from L1 after the first.
+
+- **portable** and **POPCNT**: a word at a time, four sums, one a plane, so that neither their adds
+  nor POPCNT's false dependency on its destination chain the words; the word's popcount
+  `lion_popcount64()` (the builtin where the target has the instruction, `pg_popcount64()` where not,
+  as §3's portable kernel counts) or the POPCNT instruction.
+- **AVX2**: each byte counted a nibble at a time with VPSHUFB (Muła, as §3 and lionvec count), the
+  byte counts added over 31 vectors, 248 a byte at most, before VPSADBW sums them into 64-bit lanes.
+  INTERLEAVED, lionvec's: a word's four planes are one vector, ANDed with the bits' word broadcast,
+  lane j counting plane j; up to four groups a pass, a word's 16 planes, so that a pass over 64
+  interleaved planes reads each cache line once - a group a pass read each line twice and took a
+  fifth longer. STRIDED: four words of the bits against four of each of the group's planes, one
+  vector a plane, as §3 counts an AND.
+- **AVX-512**: AVX2's, each lane's word counted whole by VPOPCNTDQ into its 64-bit sum, on 256-bit
+  vectors (`avx512f,avx512vl,avx512vpopcntdq`, as lionvec's, §44.3): no 512-bit instruction runs.
+
+Where a vector would reach past the caller's array - the last nwords % 4 words of a STRIDED pass,
+the last k % 4 planes of an INTERLEAVED one at its last words - AVX2 reads a zero-padded copy and
+AVX-512 a masked load (`_mm256_maskz_loadu_epi64`), which reads nothing past the lanes it keeps;
+elsewhere the last planes' vector reads the next word's planes into its spare lanes, whose sums are
+dropped. The unit test holds every array in an exact-size heap allocation, so a sanitized build sees
+a read one byte past.
+
+Two things the first version did and this one does not, both found by the timings. Each group's sums
+were arrays of vectors indexed in a loop over the group's planes; GCC kept them in memory, and four
+STRIDED planes took longer than four calls of one (AVX2 671 ns against 450, AVX-512 397 against
+250, 512 words); they are named registers now (446 and 195). And at lionvec's shape - four planes,
+24 words - the weighted sum went through the counts of any k: a call more, 64 counts on the stack
+with its canary, a loop of variable shifts, 22 - 28 ns against `lionvec_plane_dot()`'s 11 - 15 with
+AVX-512. Every INTERLEAVED kernel now has a pass of constant stride for k = 4, and the weighted sum a
+function for each implementation that weighs its lanes in registers (`planes_dot4_*()`): 16 ns
+against 15.
+
+### One choice of implementation (`lion_simd_*`)
+
+The extension chose its SIMD kernels twice, by the same tests written twice: lion_container.c's
+`bits_kernel_best()` (AVX2, else POPCNT, else portable, §3) and lionvec's `lionvec_kernels_init()`
+(AVX-512 with VPOPCNTDQ, AVX2, POPCNT, §44.3). The choice is now one, here:
+
+- `LionSimdImpl` - `LION_SIMD_PORTABLE`, `_POPCNT`, `_AVX2`, `_AVX512` (AVX2 and AVX-512F, VL and
+  VPOPCNTDQ), and `LION_SIMD_AUTO`, the best - moves from lion_container.h, where it was the unit
+  tests' alone; `lion_simd_has()` is whether the build has one and the CPU runs it
+  (`__builtin_cpu_supports()`, which also checks that the OS saves the registers);
+  `lion_simd_best()` the best of those; `lion_simd_current()` what every kernel runs, resolved at its
+  first call to the best - as PostgreSQL's `pg_popcount64` resolves at its first - and read through an
+  inline function, a load and a compare; `lion_simd_force()`, in a `-DFRONTEND` build, makes every
+  kernel run another, or the best again, and refuses (false, nothing changed) one the build or the
+  CPU lacks; `lion_simd_f16c()` is whether the build knows F16C (GCC 11, clang 18) and the CPU has it,
+  for lionvec's halves, not an implementation of its own nor forced.
+- The compile-time side moves with it: `LION_HAVE_X86_SIMD` (GCC 5 or clang 6 on x86-64, and not
+  `LION_NO_SIMD`), `LION_HAVE_X86_AVX512` (GCC 8, clang 8), `LION_HAVE_X86_F16C`, `LION_TARGET()`,
+  and the portable kernels' `lion_popcount64()`.
+- lion_container.c keeps its seven whole-bitset passes - COUNT, RUNS, AND_COUNT, AND, OR, ANDNOT,
+  OR_NEW - as they were, and picks among their three kernels by `lion_simd_current()`
+  (`bits_kernel_of()`) where a function pointer started at a resolver did; AVX-512 runs its AVX2
+  kernel, which is what `bits_kernel_best()` picked on such a CPU. Each kernel stays a function the
+  dispatch calls (`pg_noinline`), as it was behind the pointer. `lion_container_simd_force()` and
+  `lion_container_simd_current()` keep their signatures: force() is `lion_simd_force()`, and so
+  forces every kernel that follows the choice, and current() reports the kernel the passes run, AVX2
+  under AVX-512. The passes take what they took: through the library, one pair of BITSETs in L1, the
+  fastest of six alternated runs before and after, AVX2 `and_cardinality()` 94.1 / 94.2 ns,
+  `and_raw()` 109.2 / 109.0, `bitset_recount()` 88.9 / 89.3, `or_inplace()` 113.8 / 113.4 (this
+  section's machine, below; on the Cascade Lake Xeon at 2.8 GHz without VPOPCNTDQ where this work
+  began, 125.0 / 126.3, 128.2 / 130.2, 104.3 / 105.8, 134.4 / 134.7), and container_test passes
+  under every forced implementation with the same 3,139,381 checks as before (2,887,036 without the
+  x86-64 kernels), under AddressSanitizer and UBSan too.
+- lion_vec_math.c is unchanged: lionvec still chooses its own set, under its own `LIONVEC_HAVE_*`
+  tests, until it takes its kernels from here ("Not done").
+
+### The transpose
+
+The 64 x 64 bit matrix, word r its row r and bit c its column c, transposed in six rounds as
+Hacker's Delight's 7-3 transposes 32 x 32: round j = 32, 16, .., 1 swaps the off-diagonal j x j
+blocks of every 2j x 2j block, word k's columns from j up for word k + j's below j (bit j of k
+clear) - a mask, two shifts and three XORs a pair, 192 pairs. Round j exchanges bit j of a bit's
+row index with bit j of its column index, so the rounds commute, and all six exchange every bit of
+the two: the transpose. The planes of 64 values are the first nbits rows of the transpose of the
+values (scatter), and 64 values the transpose of their planes padded with zero rows (gather); for
+nbits up to p, a power of two below 64, each needs only part of the work. The scatter needs only
+rows below p: round j < p mixes rows below p among themselves, and round j >= p, which runs
+first, need make only its pairs' first rows, j half-swaps. The gather runs the rounds the other
+way, j = 1 .. 32, on rows of which those from p up are zero: rounds j < p mix rows below p, and
+round j >= p splits each row k below j into itself and row k + j. A word of 4-bit values - lionvec's
+query, a column of 16 values - takes 60 half-swaps and four swaps rather than 192.
+
+### Measured
+
+Intel Xeon at 2.10 GHz (family 6, model 207: Emerald Rapids; AVX-512 with VPOPCNTDQ, and F16C), a VM
+of four cores shared with other builds; gcc 13.3 -O2 (`make planes-bench`, the unit test's
+program with `--bench`), PostgreSQL 16's libpgcommon. Each figure is ns a call, the median of
+three runs of the median of nine rounds of about 2 ms; operands warm, random at half density, each
+plane 4 KB, 64 of them 256 KB, in L2. "A plane a call" is the STRIDED count called once a plane, k
+calls, which is what the container library's AND_COUNT pass a slice would cost:
+
+| 512 words x k planes | k = 4 | k = 32 | k = 64 |
+|---|---|---|---|
+| portable, STRIDED | 2,706 | 21,662 | 40,487 |
+| portable, INTERLEAVED | 2,539 | 22,984 | 42,095 |
+| portable, a plane a call | 3,317 | 25,844 | 53,562 |
+| POPCNT, STRIDED | 688 | 5,807 | 11,392 |
+| POPCNT, INTERLEAVED | 668 | 6,269 | 15,594 |
+| POPCNT, a plane a call | 1,028 | 7,439 | 16,144 |
+| AVX2, STRIDED | 446 | 3,642 | 7,636 |
+| AVX2, INTERLEAVED | 512 | 3,897 | 7,866 |
+| AVX2, a plane a call | 540 | 4,512 | 9,077 |
+| AVX-512, STRIDED | 195 | 2,181 | 4,274 |
+| AVX-512, INTERLEAVED | 279 | 2,657 | 5,245 |
+| AVX-512, a plane a call | 325 | 3,165 | 6,276 |
+
+So the sum of a 64-slice column over one container key of a filter takes 4.3 us with AVX-512 and 7.6
+with AVX2, 0.13 and 0.23 ns a row: a third less than a slice at a time with AVX-512, a sixth with
+AVX2. The portable kernel is x86 built for its baseline, a `pg_popcount64()` - an indirect call on
+PostgreSQL 16 - a word; on aarch64 and under `-mpopcnt` it is POPCNT's loop. INTERLEAVED is the
+slower layout at 32 and 64 planes, a word's planes being a stride of 256 or 512 bytes; STRIDED is
+what the large k have.
+
+At lionvec's shape, 24 words (1536 dimensions) by four INTERLEAVED planes, the weighted sum against
+`lionvec_plane_dot()`, the same program: portable 144 / 135, POPCNT 38.9 / 34.3, AVX2 27.2 / 29.0,
+AVX-512 16.3 / 15.1.
+
+The transpose takes 320 ns. A container's 32,768 values to STRIDED planes and back: 4 bits 40.0 and
+48.4 us, 16 bits 58.3 and 63.4, 32 bits 91.5 and 90.6, 64 bits 211 and 206 - from 78 ns a word of 64
+values at 4 bits to 410 at 64, the loads and stores of a word's 64 values and nbits planes beside
+the transpose.
+
+### Tests
+
+`test/unit/planes_test.c` (`make unit`, with `planes_test_nosimd` built as `container_test_nosimd` is,
+`-DLION_NO_SIMD` and `-mpopcnt` on x86-64), every count against one a bit at a time - each row the
+bits select, each plane's bit there - and every weighted sum against the values the planes hold
+summed over those rows, modulo 2^64:
+
+- the choice: the best is what runs before any force; forcing each of the four returns what
+  `lion_simd_has()` says and takes effect, or changes nothing; `LION_SIMD_AUTO` restores the best; a
+  build without the x86-64 kernels has the portable one alone and no F16C;
+- under every implementation the build and CPU have, both layouts: k of 1, 3, 4, 5, 32 and 64
+  planes over 1, 3, 4, 24, 100 and 512 words, 32 cases each - the bits and each plane its own of 16
+  patterns: none, all, the first or the last bit of every word, a single bit at either edge of a
+  word, random words, densities from 0.05% to 99.95% - in exact-size heap buffers at every 8-byte
+  alignment modulo 32, each STRIDED plane its own allocation; the inputs left as they were; a single
+  set bit on each side of every word boundary of 1, 3, 24, 100 and 512 words against 1, 5 and 64
+  random planes; every bit set at every word count from 1 to 130 and 1 to 8 planes, the most a
+  byte count adds up, across every run and tail length; and no words or no planes;
+- the transpose against one a bit at a time on 200 matrices, every single bit, and twice the
+  identity; scatter and gather at every width of 1 to 64 bits for ten counts of 1 to 1,000 values,
+  and at 4,113 and 32,768 values for 13 widths, both layouts, against planes made a bit at a time,
+  the padding zero, a value's bits past its width ignored, and the gather blind to padding set to
+  ones;
+- the bridge to lionvec, `lion_vec_math.c` linked as vec_test links it (`-ffp-contract=off`): the
+  INTERLEAVED weighted sum of four planes is `lionvec_plane_dot()` under every pair of the two's
+  implementations, at every word count an index takes (1 to 127) on random and full inputs; and for
+  45 queries of 64 to 7,232 dimensions and every metric, the scatter of the query's 4-bit codes -
+  recomputed from `qc`, `qlo` and `qdelta` as `lionvec_query_init()` rounds them - is the planes it
+  built, to the bit, and the gather of its planes the codes.
+
+113,714 checks on this section's machine, 37,169 without the x86-64 kernels, under AddressSanitizer
+and UBSan as well (`make unit SANITIZE=1`). Deliberate faults - a byte run of 33 vectors, a wrong
+round mask, a tail copied a word short, a half-swap range one short in either direction of the
+transpose, the plane order of a group swapped, a weighed count shifted mod 32 - each failed the
+test.
+
+### Not done
+
+- **lionvec onto this module** (the next change), which would take from it: `lion_simd_current()`
+  for `lionvec_kernels_init()`'s choice, so that the extension chooses once and its tests force one
+  (`lionvec_kernel_force()` becomes `lion_simd_force()`, its sets this enum's); `LION_HAVE_X86_*` for
+  its `LIONVEC_HAVE_X86/_AVX512/_F16C`; `lion_simd_f16c()` for its halves; and
+  `lion_planes_dot_interleaved(bits, planes, nwords, 4)` for `lionvec_plane_dot` - every pair agrees
+  to the bit (the bridge test), at the same time within a nanosecond or two with AVX2 and AVX-512.
+  Its 8-bit sums, l2sq, rotation and halves stay its own kernels, under the one choice.
+  `lionvec_query_init()` may keep building its planes in registers as it does, which the scatter
+  reproduces to the bit; the scatter would need the codes in an array first, and the time is the
+  floats' arithmetic, not the planes'.
+- **The bit-sliced index** (§51), which would call `lion_planes_count_strided()` per container key
+  with the filter's BITSET words and its slices' payloads - slices of other representations through
+  the container library's AND cardinality, a NARROW against the filter at its width - and weigh the
+  counts into int128; `lion_planes_scatter_strided()` to build a container key's slices from its
+  32,768 values, each slice then `lion_container_optimize()`d; and the gather, or a bit test a slice,
+  to decode a row's value. Its own: a signed column's offset or two's complement, min and max by
+  the slices from the top, and comparisons as slice algebra.
+- **A faster scatter for few bits.** At 4 bits a word's planes are four movemasks of its 64 values
+  as bytes (VPMOVMSKB after a shift), which would beat the 78 ns a word of the partial transpose
+  several times over; nothing needs it yet.
+- **A scalar INTERLEAVED pass of eight planes**, a word's cache line, for portable and POPCNT at 32
+  and more planes (POPCNT's a third slower than STRIDED at 64), which no caller uses.
