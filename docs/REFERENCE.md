@@ -671,7 +671,12 @@ working around a bad choice:
   written: `EXPLAIN VERBOSE` then lists every column of the relation as its `Output` (in
   index-only mode the columns the index does not hold are NULL, and nothing reads them). Under a
   `Memoize`, which caches the rows, and where the row would be projected anyway, it returns only
-  the columns the query needs (DESIGN.md §49, "The probe's projection").
+  the columns the query needs (DESIGN.md §49, "The probe's projection"). Below a `Gather` - the
+  outer side a parallel scan, each process running the loop for its own outer rows - it is
+  `Parallel Custom Scan (LionBtreeScan)`: parallel-aware for its set alone, which the processes
+  build together and read from shared memory, as a parallel walk's (below) - a lazy set
+  (`pg_lion.enable_lazy_set`, where the process meets few outer rows) stays each process's own -
+  and `EXPLAIN ANALYZE` sums the processes' counters.
   `pg_lion.enable_btree_scan` turns it off with the other walks.
 - `pg_lion.enable_heap_probe` (off): also offer that probe where the B-tree does not cover what
   the query reads of the relation - a primary key under a Lion filter, the query reading other
@@ -686,10 +691,12 @@ working around a bad choice:
   (LionBtreeScan)` below a `Gather` - under partial aggregates, and on either side of a parallel
   hash join or below an anti join - and `Parallel Custom Scan (LionOrdered)` below a `Gather
   Merge`. The processes share the B-tree's parallel scan, each taking whole leaf pages of it, and
-  one Lion set: the first to need it builds it while the others wait (wait event
-  `LionOrderedSetBuild` on PostgreSQL 17 and later, `Extension` on 16) and they read it from
-  shared memory; a set larger than `work_mem` × `hash_mem_multiplier` for each process planned is
-  built by each for itself. Each process tests visibility and rechecks as the serial walk does.
+  one Lion set, which they build together: its container keys are cut into parts - two for each
+  process planned, each of at least `pg_lion.shared_set_part_blocks` heap blocks - and each process
+  that needs the set builds the next part nobody has taken until none is left, then waits for the
+  others' (wait event `LionOrderedSetBuild` on PostgreSQL 17 and later, `Extension` on 16), and
+  they read the parts from shared memory; a set larger than `work_mem` × `hash_mem_multiplier` for
+  each process planned is built by each for itself. Each process tests visibility and rechecks as the serial walk does.
   The price is PostgreSQL's for a parallel index scan: the per-row work divided among the
   processes, the set, the B-tree's own cost and the heap pages not; the workers come from the
   B-tree's pages (`min_parallel_index_scan_size`), and the heap pages a walk in heap mode fetches
@@ -697,11 +704,13 @@ working around a bad choice:
   `max_parallel_workers_per_gather`. A parallel walk builds its set before it walks
   (`pg_lion.enable_lazy_set` does not apply) and never switches to fetch and sort. Under `EXPLAIN
   ANALYZE` its counters are summed over the processes, and `Lion Set: ..., shared` says they read
-  one copy; a walk that is not parallel itself but ran only in a worker (under
+  one copy (`shared in N parts` when it was built in parts); a walk that is not parallel itself but ran only in a worker (under
   `debug_parallel_query`, or as the inner side of a join a worker ran) prints no counters. A
   walk of a Lion index's own column and an order by distance stay serial.
   `pg_lion.enable_shared_set` (on): off, each process builds the set for itself, for comparing the
-  two.
+  two. `pg_lion.shared_set_part_blocks` (16384, 128 MB at 8 kB blocks): the fewest heap blocks a
+  part of a shared set covers; a table of fewer than twice as many has its set built whole by one
+  process while the others wait. A testing knob.
 - The FK-side join (DESIGN.md §27) reads its dimension through whatever plan is cheapest for the
   dimension's rows, so a walk of a B-tree holding the dimension's key (and any column grouped by)
   is its dimension side where it beats a bitmap scan of the dimension's heap, serially and in
