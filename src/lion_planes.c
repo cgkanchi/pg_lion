@@ -884,8 +884,14 @@ planes_weigh(const uint32 *counts, uint32 k)
  * took 11 - 15; this way 16 against 15, and AVX2's 26 against 29, POPCNT's
  * 38 against 35 (DESIGN.md §50, Measured).  These are lionvec's plane-1
  * kernels now (lionvec_plane_dot(), DESIGN.md §44.3, "Kernels").
+ *
+ * The portable one is kept out of line, as the others are by their target:
+ * inlined into lion_planes_dot_interleaved(), its loop's registers made
+ * that function save six and grow a frame on every call, whichever
+ * implementation it then jumped to, where it is now a test of k, a load of
+ * the choice and a jump.
  */
-static uint64
+static pg_noinline uint64
 planes_dot4_portable(const uint64 *bits, const uint64 *planes, uint32 nwords)
 {
 	uint32		c[PLANES_K_QUERY];
