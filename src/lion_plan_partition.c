@@ -306,7 +306,7 @@ lion_deparse_rel_clause(PlannerInfo *root, Index rti, Node *clause)
  * through each level's translated_vars (lion_child_var() goes the other
  * way), or 0 when no column of toprel's maps to it.
  */
-static AttrNumber
+AttrNumber
 lion_parent_attno(PlannerInfo *root, Index childrelid, Index toprelid,
 				  AttrNumber childattno)
 {
@@ -338,6 +338,151 @@ lion_parent_attno(PlannerInfo *root, Index childrelid, Index toprelid,
 		childrelid = appinfo->parent_relid;
 	}
 	return childattno;
+}
+
+/*
+ * The one relation a path over rel reads (DESIGN.md §16, "A parent pruned
+ * to one leaf"): rel itself for a table, a materialized view or a leaf
+ * partition reached through its parent; for a partitioned parent, the one
+ * live leaf plan-time pruning left it, through every level of
+ * sub-partitioning; NULL for a parent with several live leaves or none, an
+ * old-style inheritance parent, or anything else.  Every node that scans
+ * one relation's indexes and heap asks this of the relation it is offered,
+ * so that a query naming the parent gets the node the leaf would, and
+ * plans its physical side - indexes, statistics, paths - on the leaf, with
+ * what it outputs and what the query's clauses say in the parent's
+ * numbering (lion_leaf_expr(), lion_top_var()).
+ */
+RelOptInfo *
+lion_single_leaf(PlannerInfo *root, RelOptInfo *rel)
+{
+	RangeTblEntry *rte;
+	RelOptInfo *leaf = NULL;
+	int			i;
+
+	check_stack_depth();
+	if (rel == NULL || rel->relid == 0 ||
+		rel->relid >= (Index) root->simple_rel_array_size)
+		return NULL;
+	if (rel->reloptkind != RELOPT_BASEREL &&
+		rel->reloptkind != RELOPT_OTHER_MEMBER_REL)
+		return NULL;
+	rte = root->simple_rte_array[rel->relid];
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return NULL;
+	if (!rte->inh)
+		return rel;
+	if (rte->relkind != RELKIND_PARTITIONED_TABLE || IS_DUMMY_REL(rel) ||
+		!IS_PARTITIONED_REL(rel))
+		return NULL;
+	for (i = 0; i < rel->nparts; i++)
+	{
+		RelOptInfo *child = rel->part_rels[i];
+		RelOptInfo *one;
+
+		if (child == NULL || !bms_is_member(i, rel->live_parts) ||
+			IS_DUMMY_REL(child))
+			continue;
+		one = lion_single_leaf(root, child);
+		if (one == NULL || leaf != NULL)
+			return NULL;		/* several leaves, or a tree with none */
+		leaf = one;
+	}
+	return leaf;
+}
+
+/*
+ * The topmost partitioned table rel is a partition of, through every level
+ * of sub-partitioning - the table the query names - or rel itself where it
+ * is no partition reached through its parent.
+ */
+RelOptInfo *
+lion_top_rel(PlannerInfo *root, RelOptInfo *rel)
+{
+	Index		relid;
+
+	if (rel == NULL || rel->relid == 0 ||
+		rel->relid >= (Index) root->simple_rel_array_size ||
+		root->append_rel_array == NULL)
+		return rel;
+	relid = rel->relid;
+	while (relid < (Index) root->simple_rel_array_size &&
+		   root->append_rel_array[relid] != NULL)
+		relid = root->append_rel_array[relid]->parent_relid;
+	if (relid == rel->relid || relid >= (Index) root->simple_rel_array_size ||
+		root->simple_rel_array[relid] == NULL)
+		return rel;
+	return root->simple_rel_array[relid];
+}
+
+/*
+ * The path a plan over a parent pruned to one leaf runs: core's Append over
+ * the parent has that leaf's path as its one subpath, and costs nothing
+ * (create_append_path() takes the child's cost) and is elided by setrefs.c,
+ * so what inspects a plan's side - the walk a loop is over
+ * (oj_loop_over_walk()) - looks through it, as through a projection, to the
+ * leaf's path.  Any other path is returned as it is.
+ */
+Path *
+lion_single_leaf_path(Path *path)
+{
+	if (path != NULL && IsA(path, AppendPath) &&
+		list_length(((AppendPath *) path)->subpaths) == 1)
+	{
+		path = (Path *) linitial(((AppendPath *) path)->subpaths);
+		while (path != NULL && IsA(path, ProjectionPath))
+			path = ((ProjectionPath *) path)->subpath;
+	}
+	return path;
+}
+
+/*
+ * expr, written over top's columns, as leaf - top itself, or a leaf
+ * partition under it (lion_single_leaf()) - numbers them: what a path over
+ * the leaf evaluates, where the query's clauses name the parent.
+ */
+Node *
+lion_leaf_expr(PlannerInfo *root, Node *expr, RelOptInfo *leaf,
+			   RelOptInfo *top)
+{
+	if (leaf == top)
+		return expr;
+	return adjust_appendrel_attrs_multilevel(root, expr, leaf, top);
+}
+
+/*
+ * var, a column of a leaf partition reached through its parent, as the
+ * topmost partitioned table above it numbers it: the Var the query's target
+ * and clauses hold, which a node over the leaf outputs (lion_single_leaf()).
+ * A Var of a table that is no child, or that no column of the top maps to,
+ * is returned as it is.
+ */
+Var *
+lion_top_var(PlannerInfo *root, Var *var)
+{
+	Index		relid = (Index) var->varno;
+	Index		top;
+	RelOptInfo *toprel;
+	AttrNumber	attno;
+	Var		   *out;
+
+	if (var->varlevelsup != 0 || var->varattno <= 0 ||
+		relid == 0 || relid >= (Index) root->simple_rel_array_size ||
+		root->simple_rel_array[relid] == NULL)
+		return var;
+	toprel = lion_top_rel(root, root->simple_rel_array[relid]);
+	if (toprel == NULL || toprel->relid == relid)
+		return var;
+	top = toprel->relid;
+	attno = lion_parent_attno(root, relid, top, var->varattno);
+	if (attno == 0)
+		return var;
+	out = (Var *) copyObject(var);
+	out->varno = (int) top;
+	out->varattno = attno;
+	out->varnosyn = (Index) top;
+	out->varattnosyn = attno;
+	return out;
 }
 
 /*
