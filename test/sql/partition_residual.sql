@@ -54,7 +54,10 @@ BEGIN
 			pushed := true;
 		END IF;
 		IF ln LIKE '%Residual Filter:%' THEN
-			resid := btrim(split_part(ln, 'Residual Filter:', 2));
+			-- a parameter as every release spells it: $0, (InitPlan 1).col1
+			-- from 17, (InitPlan expr_1).col1 on master
+			resid := regexp_replace(btrim(split_part(ln, 'Residual Filter:', 2)),
+									'\(InitPlan [^)]*\)\.col1|\$\d+', '$N', 'g');
 		END IF;
 		IF ln LIKE '%Implied by Partition Bounds:%' THEN
 			implied := btrim(split_part(ln, 'Implied by Partition Bounds:', 2));

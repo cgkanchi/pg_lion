@@ -52,7 +52,10 @@ BEGIN
 			pushed := true;
 		END IF;
 		IF ln LIKE '%Residual Filter:%' THEN
-			resid := btrim(split_part(ln, 'Residual Filter:', 2));
+			-- a parameter as every release spells it: $0, (InitPlan 1).col1
+			-- from 17, (InitPlan expr_1).col1 on master
+			resid := regexp_replace(btrim(split_part(ln, 'Residual Filter:', 2)),
+									'\(InitPlan [^)]*\)\.col1|\$\d+', '$N', 'g');
 		END IF;
 		IF ln LIKE '%Implied by Partition Bounds:%' THEN
 			implied := btrim(split_part(ln, 'Implied by Partition Bounds:', 2));
@@ -328,7 +331,7 @@ SELECT lion_rp('SELECT count(kind) FROM rp WHERE country = ''US'' AND p LIKE ''a
 SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND amount > (SELECT 900)');
                    lion_rp                    
 ----------------------------------------------
- pushed down, 1 rows; residual: (amount > $0)
+ pushed down, 1 rows; residual: (amount > $N)
 (1 row)
 
 SELECT lion_rp('SELECT count(*) FILTER (WHERE kind = ''click''), count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
@@ -382,7 +385,7 @@ SELECT lion_rp('EXECUTE rp_key(''2026-02-15'')');
 SELECT lion_rp('EXECUTE rp_off(''a%'')');
                  lion_rp                  
 ------------------------------------------
- pushed down, 1 rows; residual: (p ~~ $1)
+ pushed down, 1 rows; residual: (p ~~ $N)
 (1 row)
 
 RESET plan_cache_mode;
