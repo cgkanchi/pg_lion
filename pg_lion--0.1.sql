@@ -829,13 +829,18 @@ CREATE FUNCTION lion_index_stats(idx regclass,
 									OUT position_pages int8,
 									OUT position_internal_pages int8,
 									OUT emptydim_tids int8,
-									OUT emptyinner_tids int8)
+									OUT emptyinner_tids int8,
+									OUT sliced bool,
+									OUT slice_entries int8,
+									OUT slice_tids int8,
+									OUT slice_bytes int8,
+									OUT slice_pages int8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'lion_index_stats'
 LANGUAGE C STRICT VOLATILE PARALLEL RESTRICTED;
 
 COMMENT ON FUNCTION lion_index_stats(regclass) IS
-	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows (empty_tids, and emptydim_tids and emptyinner_tids for empty arrays with dimensions, nullelem_tids for arrays of NULLs, §17), summary posting sets, the distinct keys the planner is given, and the pages of the position trees (§17)';
+	'shape of a lion index, one row per key column: directory shape, entries, containers by kind (narrow_containers, DESIGN.md §38), sparse segments, posting trees, NULL keys and key-less rows (empty_tids, and emptydim_tids and emptyinner_tids for empty arrays with dimensions, nullelem_tids for arrays of NULLs, §17), summary posting sets, the distinct keys the planner is given, the pages of the position trees (§17), and whether the column is bit-sliced with what its slices hold (§50)';
 
 /*
  * The ROOT block of one key's posting tree (DESIGN.md §22), NULL when the key

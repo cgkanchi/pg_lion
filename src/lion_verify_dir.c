@@ -1124,10 +1124,13 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION_V14)
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
+	if (meta->magic != LION_MAGIC ||
+		(meta->version != LION_VERSION_V14 &&
+		 meta->version != LION_VERSION_V15))
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u or %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V14);
+					meta->version, LION_MAGIC, LION_VERSION_V14,
+					LION_VERSION_V15);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
@@ -1183,9 +1186,20 @@ lion_verify_meta(LionVerifyState *vs)
 	 * generic by every writer (lion_wal_mode()), whatever the index was built
 	 * with.
 	 */
-	if (meta->unused_nbuckets != 0)
-		lion_corrupt("lion index \"%s\": meta page has %u in its unused bucket count, expected 0",
-					RelationGetRelationName(vs->index), meta->unused_nbuckets);
+	/*
+	 * The sliced columns of §50, in the word that was the bucket count: as
+	 * many as the version says, columns the index has, and columns that can
+	 * be sliced (lion_fill_index_state() refuses the rest before this runs).
+	 */
+	if ((meta->version == LION_VERSION_V15) != (meta->slice_cols != 0))
+		lion_corrupt("lion index \"%s\": meta page version %u names sliced key columns %08X",
+					RelationGetRelationName(vs->index), meta->version,
+					meta->slice_cols);
+	if ((meta->slice_cols >> vs->ix->ncolumns) != 0 &&
+		vs->ix->ncolumns < 32)
+		lion_corrupt("lion index \"%s\": meta page names sliced key columns %08X of %d",
+					RelationGetRelationName(vs->index), meta->slice_cols,
+					vs->ix->ncolumns);
 	if (meta->wal_mode != LION_WAL_MODE_GENERIC &&
 		meta->wal_mode != LION_WAL_MODE_RMGR)
 		lion_corrupt("lion index \"%s\": meta page has wal_mode %u, expected %d (generic) or %d (rmgr)",

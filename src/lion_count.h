@@ -537,6 +537,19 @@ extern bool lion_posting_set_lookup_reserved_col(Relation index,
 												 uint16 reservedflag,
 												 LionPostingSet *ps);
 
+/*
+ * ... and one SLICE of a bit-sliced column (DESIGN.md §50): pos is a bit
+ * position of the column's encoding (lion_slice_enc.h) or LION_SLICE_EXISTS.
+ * False when the slice has no entry - no row of the column has that bit, or
+ * none at all - which counts as an empty set.  Located with its pin, as every
+ * single lookup is, so a count of it carries the §9 interlock; it has no
+ * stored key, and a NOPIN copy of it is never located again
+ * (lion_posting_set_relocate()), which no reader of slices makes.  What the
+ * planner's answers from slices locate them with.
+ */
+extern bool lion_posting_set_lookup_slice_col(Relation index, AttrNumber attno,
+											  int pos, LionPostingSet *ps);
+
 static inline bool
 lion_posting_set_lookup_null(Relation index, LionPostingSet *ps)
 {

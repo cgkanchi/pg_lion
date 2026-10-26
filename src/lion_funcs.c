@@ -106,14 +106,31 @@ typedef struct LionColStats
 	int64		summary_tids;
 	int64		summary_bytes;
 	int64		summary_pages;
+
+	/*
+	 * SLICE entries (DESIGN.md §50), counted apart for the same reason: the
+	 * bit slices and the existence slice of a sliced column, their rows (a
+	 * row once per bit its value has set, and once more in the existence
+	 * slice), the bytes of their items and the posting pages of those too
+	 * large to stay INLINE.
+	 */
+	int64		slice_entries;
+	int64		slice_tids;
+	int64		slice_bytes;
+	int64		slice_pages;
 } LionColStats;
+
+/* Whose a posting set is: a key's, a summary's (§32) or a slice's (§50). */
+#define LION_STATS_SET_KEY		0
+#define LION_STATS_SET_SUMMARY	1
+#define LION_STATS_SET_SLICE	2
 
 /* What one posting set contributed, before its column is known. */
 typedef struct LionSetStats
 {
 	BlockNumber head;			/* hash key: the set's root block */
 	uint16		attno;			/* 0 until the owning entry is seen */
-	bool		summary;		/* ... and it is a summary's (§32) */
+	uint8		owner;			/* ... and whose it is, LION_STATS_SET_* */
 	LionColStats st;
 } LionSetStats;
 
@@ -129,6 +146,7 @@ typedef struct LionStats
 	int			ncolumns;
 	LionColStats *cols;			/* [ncolumns] */
 	bool	   *ordered;		/* [ncolumns]: the column's own opclass (§21) */
+	bool	   *sliced;			/* [ncolumns]: the column is bit-sliced (§50) */
 	HTAB	   *sets;			/* head block -> LionSetStats, or NULL */
 	LionMetaNdistinct nd;		/* the key counts on the meta page (§33) */
 } LionStats;
@@ -150,7 +168,7 @@ lion_stats_bucket(LionStats *st, BlockNumber head)
 	if (!found)
 	{
 		ent->attno = 0;
-		ent->summary = false;
+		ent->owner = LION_STATS_SET_KEY;
 		memset(&ent->st, 0, sizeof(LionColStats));
 	}
 	return &ent->st;
@@ -158,7 +176,7 @@ lion_stats_bucket(LionStats *st, BlockNumber head)
 
 /* ... and the same for an entry, whose column is known right away. */
 static void
-lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno, bool summary)
+lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno, uint8 owner)
 {
 	LionSetStats *ent;
 	bool		found;
@@ -173,7 +191,7 @@ lion_stats_claim(LionStats *st, BlockNumber head, uint16 attno, bool summary)
 		memset(&ent->st, 0, sizeof(LionColStats));
 	}
 	ent->attno = attno;
-	ent->summary = summary;
+	ent->owner = owner;
 }
 
 /*
@@ -295,16 +313,22 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		st->cols = (LionColStats *) palloc0(sizeof(LionColStats) *
 											st->ncolumns);
 		st->ordered = (bool *) palloc0(sizeof(bool) * st->ncolumns);
+		st->sliced = (bool *) palloc0(sizeof(bool) * st->ncolumns);
 		for (i = 0; i < st->ncolumns; i++)
+		{
 			st->ordered[i] = ix->cols[i].ordered;
+			st->sliced[i] = ix->cols[i].sliced;
+		}
 		st->sets = NULL;
 
 		/*
 		 * A column's posting pages are its own for a single-column index -
-		 * unless it has summaries (DESIGN.md §32), whose pages are counted
-		 * apart and are known only through the entries that own them.
+		 * unless it has summaries (DESIGN.md §32) or slices (§50), whose
+		 * pages are counted apart and are known only through the entries
+		 * that own them.
 		 */
-		if (st->ncolumns > 1 || ix->meta.summary_cols != 0)
+		if (st->ncolumns > 1 || ix->meta.summary_cols != 0 ||
+			ix->meta.slice_cols != 0)
 		{
 			HASHCTL		ctl;
 
@@ -380,11 +404,24 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						continue;
 					cs = &st->cols[entry->attno - 1];
 
-					/* A summary (DESIGN.md §32) is counted apart. */
-					if (LionEntryIsSummary(entry))
+					/*
+					 * A summary (DESIGN.md §32) or a slice (§50) is counted
+					 * apart.
+					 */
+					if (LionEntryIsDerived(entry))
 					{
-						cs->summary_entries++;
-						cs->summary_tids += (int64) lion_entry_ntids(entry);
+						bool		slice = LionEntryIsSlice(entry);
+
+						if (slice)
+						{
+							cs->slice_entries++;
+							cs->slice_tids += (int64) lion_entry_ntids(entry);
+						}
+						else
+						{
+							cs->summary_entries++;
+							cs->summary_tids += (int64) lion_entry_ntids(entry);
+						}
 						if ((entry->flags & LION_ENTRY_INLINE) != 0)
 						{
 							LionColStats tmp;
@@ -399,11 +436,15 @@ lion_index_stats(PG_FUNCTION_ARGS)
 															 paylen, &cur, cbuf,
 															 &damage)) > 0)
 								lion_stats_item(&tmp, cbuf, csize);
-							cs->summary_bytes += tmp.container_bytes;
+							if (slice)
+								cs->slice_bytes += tmp.container_bytes;
+							else
+								cs->summary_bytes += tmp.container_bytes;
 						}
 						else
 							lion_stats_claim(st, lion_entry_head(entry), entry->attno,
-											 true);
+											 slice ? LION_STATS_SET_SLICE :
+											 LION_STATS_SET_SUMMARY);
 						continue;
 					}
 
@@ -456,7 +497,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					else
 					{
 						lion_stats_claim(st, lion_entry_head(entry), entry->attno,
-										 false);
+										 LION_STATS_SET_KEY);
 
 						/*
 						 * ... and its position tree's (DESIGN.md §17), whose
@@ -464,7 +505,7 @@ lion_index_stats(PG_FUNCTION_ARGS)
 						 */
 						if ((entry->flags & LION_ENTRY_POSITIONS) != 0)
 							lion_stats_claim(st, lion_entry_posext(entry)->pos_root,
-											 entry->attno, false);
+											 entry->attno, LION_STATS_SET_KEY);
 					}
 				}
 			}
@@ -574,10 +615,17 @@ lion_index_stats(PG_FUNCTION_ARGS)
 					continue;
 				cs = &st->cols[ent->attno - 1];
 
-				if (ent->summary)
+				if (ent->owner == LION_STATS_SET_SUMMARY)
 				{
 					cs->summary_bytes += ent->st.container_bytes;
 					cs->summary_pages += ent->st.container_pages +
+						ent->st.posting_internal_pages;
+					continue;
+				}
+				if (ent->owner == LION_STATS_SET_SLICE)
+				{
+					cs->slice_bytes += ent->st.container_bytes;
+					cs->slice_pages += ent->st.container_pages +
 						ent->st.posting_internal_pages;
 					continue;
 				}
@@ -667,6 +715,11 @@ lion_index_stats(PG_FUNCTION_ARGS)
 		values[32] = Int64GetDatum(cs->position_internal_pages);
 		values[33] = Int64GetDatum(cs->emptydim_tids);
 		values[34] = Int64GetDatum(cs->emptyinner_tids);
+		values[35] = BoolGetDatum(st->sliced[call]);
+		values[36] = Int64GetDatum(cs->slice_entries);
+		values[37] = Int64GetDatum(cs->slice_tids);
+		values[38] = Int64GetDatum(cs->slice_bytes);
+		values[39] = Int64GetDatum(cs->slice_pages);
 
 		tuple = heap_form_tuple(funcctx->tuple_desc, values, nulls);
 		SRF_RETURN_NEXT(funcctx, HeapTupleGetDatum(tuple));

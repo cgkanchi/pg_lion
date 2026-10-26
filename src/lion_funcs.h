@@ -123,7 +123,7 @@
 #include "lion_count.h"
 
 
-#define LION_STATS_NCOLS		35
+#define LION_STATS_NCOLS		40
 
 /*
  * A check a concurrent INSERT can make fail on a sound index, recorded instead
