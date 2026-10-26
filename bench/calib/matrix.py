@@ -32,6 +32,14 @@ PGUSER, PGDATABASE, or --dbname); it needs only Python's standard library.
       --set pg_lion.pushdown_margin=1 --set pg_lion.hashagg_rate=1 ...
                                               # lion's own units a millisecond
   python3 bench/calib/matrix.py compare before.json after.json
+  python3 bench/calib/matrix.py --setup-only --setup-file bench/calib/joins.sql \\
+      --rows 4000000                          # §46 to §49's joins at scale
+  python3 bench/calib/matrix.py --queries bench/calib/joins.py --only '^hp\\.' \\
+      --arms core,hashjoin,nestloop,probe \\
+      --sweep 'pg_lion.competitor_pricing+pg_lion.enable_heap_probe=on+off,off+off,on+on,off+on'
+                                              # two settings swept together
+  ... --cold 'CMD' --repeats 3                # each run after CMD (caches dropped,
+                                              # the server restarted): cold
 
 A run against a build without §39's settings (the "before" of DESIGN.md
 §39's tables) skips the settings and sweeps it does not have.
@@ -124,7 +132,11 @@ QUERIES = [
 
 LION_OFF = {'pg_lion.enable_count_pushdown': 'off',
             'pg_lion.enable_semijoin': 'off',
-            'pg_lion.enable_ordered_scan': 'off'}
+            'pg_lion.enable_ordered_scan': 'off',
+            'pg_lion.enable_btree_scan': 'off',
+            'pg_lion.enable_heap_probe': 'off',
+            'pg_lion.enable_ordered_join': 'off',
+            'pg_lion.enable_probe_join': 'off'}
 SCANS = ['enable_seqscan', 'enable_bitmapscan', 'enable_indexscan',
          'enable_indexonlyscan']
 JOINS = ['enable_hashjoin', 'enable_mergejoin', 'enable_nestloop']
@@ -166,7 +178,21 @@ ARMS = {
     'hashjoin': arm(LION_OFF, off('enable_mergejoin', 'enable_nestloop')),
     'mergejoin': arm(LION_OFF, off('enable_hashjoin', 'enable_nestloop')),
     'nestloop': arm(LION_OFF, off('enable_hashjoin', 'enable_mergejoin')),
+    # lion's joins, each where the query has it (DESIGN.md §46 to §49):
+    # LionProbeJoin, an upper path, under every join method off;
+    # LionOrderedJoin (or its split) at the forcing margin; and a nested
+    # loop's LionBtreeScan probe, index-only where the B-tree covers the
+    # query and in heap mode where it does not, with no Memoize over it
+    'probejoin': off(*JOINS),
+    'ordjoin': arm(off('pg_lion.enable_btree_scan'),
+                   {'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
+    'probe': arm(off('enable_hashjoin', 'enable_mergejoin', 'enable_memoize',
+                     'pg_lion.enable_ordered_join', 'pg_lion.enable_probe_join'),
+                 {'pg_lion.enable_heap_probe': 'on',
+                  'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
 }
+# arms whose settings are what they force: --set does not override them
+FORCED = {'probejoin', 'ordjoin', 'probe'}
 
 PASS_THROUGH = {'Limit', 'Sort', 'Incremental Sort', 'Gather', 'Gather Merge',
                 'Result', 'Materialize', 'Memoize', 'Unique', 'Subquery Scan',
@@ -355,26 +381,41 @@ def plan_all(psql, cat, base, q, arms, scales=None):
     return res
 
 
-def time_plans(psql, cat, base, q, plans, warmup, repeats):
-    """plans: {sig: settings}; returns {sig: median ms} and checks that each
-    run's plan is the plan it stands for."""
-    script = base
-    for r in range(warmup + repeats):
-        for i, (sig, settings) in enumerate(plans.items()):
-            script += 'BEGIN;\n' + set_local(cat.usable(settings))
-            script += ('\\echo @@%d.%d\nEXPLAIN (ANALYZE, TIMING OFF, FORMAT JSON) %s;\n'
-                       'ROLLBACK;\n' % (i, r, q))
-    out = psql.tagged(script)
+def time_plans(psql, cat, base, q, plans, warmup, repeats, cold=None):
+    """plans: {sig: settings}; returns {sig: {ms: the median, runs: each
+    run's ms, reads: the median of the shared blocks read}} and checks that
+    each run's plan is the plan it stands for.  cold: a shell command run
+    before each run (one that drops the caches and restarts the server),
+    each run then a session of its own, with no warm-up."""
+    def one(i, r, settings):
+        return ('BEGIN;\n' + set_local(cat.usable(settings)) +
+                '\\echo @@%d.%d\nEXPLAIN (ANALYZE, TIMING OFF, BUFFERS, FORMAT JSON) %s;\n'
+                'ROLLBACK;\n' % (i, r, q))
+    if cold:
+        warmup = 0
+        out = {}
+        for r in range(repeats):
+            for i, settings in enumerate(plans.values()):
+                subprocess.run(cold, shell=True, check=True, capture_output=True)
+                out.update(psql.tagged(base + one(i, r, settings)))
+    else:
+        script = base
+        for r in range(warmup + repeats):
+            for i, settings in enumerate(plans.values()):
+                script += one(i, r, settings)
+        out = psql.tagged(script)
     res = {}
     for i, sig in enumerate(plans):
         ms = []
+        reads = []
         for r in range(warmup, warmup + repeats):
             p = json.loads(out['%d.%d' % (i, r)][0])[0]
             got = signature(p['Plan'], cat)
             if got != sig:
                 sys.stderr.write('warning: %s planned as %s, timed as %s\n' % (q[:60], sig, got))
             ms.append(float(p['Execution Time']))
-        res[sig] = statistics.median(ms)
+            reads.append(int(p['Plan'].get('Shared Read Blocks', 0)))
+        res[sig] = {'ms': statistics.median(ms), 'runs': ms, 'reads': statistics.median(reads)}
     return res
 
 # ---------------------------------------------------------------- the run
@@ -417,10 +458,11 @@ def run(args):
         extra[k] = v
     for k, v in cat.usable(extra).items():
         base += 'SET %s = %s;\n' % (k, sql_literal(v))
+    # NAME=V1,V2 sweeps one setting; A+B=V1+W1,V2+W2 sweeps them together
     sweeps = []
     for s in args.sweep:
         k, vs = s.split('=', 1)
-        if cat.has(k):
+        if all(cat.has(n) for n in k.split('+')):
             sweeps.append((k, vs.split(',')))
         else:
             print('sweep %s: no such setting in this build, skipped' % k, file=sys.stderr)
@@ -431,17 +473,27 @@ def run(args):
     for cat_name, qid, q in QUERIES:
         if pat and not pat.search(qid):
             continue
-        arms = {n: arm(s, extra) for n, s in ARMS.items()}
+        names = [n for n in ARMS if n == 'chosen' or not args.arms or n in args.arms]
+        arms = {n: arm(extra, s) if n in FORCED else arm(s, extra)
+                for n, s in ARMS.items() if n in names}
         # the lion arm's margin is its own, whatever --set says, and its
         # lion nodes are priced back at the margin the other arms plan at;
         # a build whose margin stops at 1 forces lion's paths with every
-        # core scan off, which does not disable them there
+        # core scan off, which does not disable them there.  So are
+        # ordjoin's and probe's, but their costs are not plans' (nan): a
+        # LionOrderedJoin's under a Limit, of which the Limit takes a share,
+        # and a probe's, a scan of a loop, would be scaled whole
         scales = {}
         if cat.margin_max is not None and cat.margin_max >= LION_FORCE_MARGIN:
-            arms['lion'] = arm(arms['lion'], ARMS['lion'])
-            scales['lion'] = LION_FORCE_MARGIN / \
-                float(extra.get('pg_lion.pushdown_margin', 1))
-        else:
+            for n in ('lion', 'ordjoin', 'probe'):
+                if n in arms:
+                    arms[n] = arm(arms[n], ARMS[n])
+                    scales[n] = LION_FORCE_MARGIN / \
+                        float(extra.get('pg_lion.pushdown_margin', 1))
+            for n in ('ordjoin', 'probe'):
+                if n in scales:
+                    scales[n] = float('nan')
+        elif 'lion' in arms:
             arms['lion'] = arm(off(*SCANS), off(*JOINS), off('enable_tidscan'), extra)
         planned = plan_all(psql, cat, base, q, arms, scales)
         plans = {}
@@ -454,21 +506,24 @@ def run(args):
                 info[sig]['arms'].append(name)
         # the sweeps' choices
         swept = {}
-        for k, vals in sweeps:
-            for v in vals:
-                s = arm(extra, {k: v})
-                sig, cost, kd = plan_all(psql, cat, base, q, {'x': s})['x']
-                swept['%s=%s' % (k, v)] = sig
+        swept_cost = {}
+        sweep_arms = {'%s=%s' % (k, v): arm(extra, dict(zip(k.split('+'), v.split('+'))))
+                      for k, vals in sweeps for v in vals}
+        if sweep_arms:
+            for key, (sig, cost, kd) in plan_all(psql, cat, base, q, sweep_arms).items():
+                swept[key] = sig
+                swept_cost[key] = cost
                 if sig not in plans:
-                    plans[sig] = s
-                    info[sig] = {'cost': cost, 'kind': kd, 'arms': ['%s=%s' % (k, v)]}
-        times = time_plans(psql, cat, base, q, plans, args.warmup, args.repeats)
-        for sig, ms in times.items():
-            info[sig]['ms'] = ms
+                    plans[sig] = sweep_arms[key]
+                    info[sig] = {'cost': cost, 'kind': kd, 'arms': [key]}
+        times = time_plans(psql, cat, base, q, plans, args.warmup, args.repeats, args.cold)
+        for sig, t in times.items():
+            info[sig].update(t)
+        times = {sig: t['ms'] for sig, t in times.items()}
         chosen = planned['chosen'][0]
         best = min(times, key=times.get)
         rec = {'category': cat_name, 'id': qid, 'query': q, 'chosen': chosen,
-               'best': best, 'plans': info, 'swept': swept}
+               'best': best, 'plans': info, 'swept': swept, 'swept_cost': swept_cost}
         result['queries'].append(rec)
         print('%-22s %-40s %9.3f ms  fastest %9.3f ms%s' % (
             qid, info[chosen]['kind'][:40], times[chosen], times[best],
@@ -523,7 +578,7 @@ def report(result, sweeps):
     by = {}
     for rec in recs:
         for sig, p in rec['plans'].items():
-            if p.get('ms', 0) > 0:
+            if p.get('ms', 0) > 0 and p['cost'] == p['cost']:
                 by.setdefault(p['kind'], []).append(p['cost'] / p['ms'])
     for k in sorted(by, key=lambda k: -len(by[k])):
         v = by[k]
@@ -537,6 +592,18 @@ def report(result, sweeps):
                 key = '%s=%s' % (k, v)
                 n, lost, ct, _ = tally(recs, key)
                 print('| `%s` | %d | %.1f | %.1f |' % (key, n, lost, ct))
+        keys = ['%s=%s' % (k, v) for k, vals in sweeps for v in vals]
+        print('\n### Per query, at each swept value (ms; a mispick in bold)\n')
+        print('| query | ' + ' | '.join('`%s`' % k for k in keys) + ' | fastest |')
+        print('|---|' + '---|' * (len(keys) + 1))
+        for rec in recs:
+            b = rec['plans'][rec['best']]
+            cells = []
+            for key in keys:
+                p = rec['plans'][chosen_at(rec, key)]
+                cell = '%s %.3f' % (p['kind'], p['ms'])
+                cells.append('**%s**' % cell if mispick(p['ms'], b['ms']) else cell)
+            print('| `%s` | %s | %s %.3f |' % (rec['id'], ' | '.join(cells), b['kind'], b['ms']))
 
 
 def compare(args):
@@ -591,6 +658,12 @@ def main():
     ap.add_argument('--sweep', action='append', metavar='NAME=V1,V2,..',
                     help='the choices at each value (default: pg_lion.pushdown_margin '
                     '1 to 0.5, where the build has it)')
+    ap.add_argument('--arms', type=lambda s: s.split(','), metavar='A,B,..',
+                    help='plan under these arms only (and the chosen plan); default all')
+    ap.add_argument('--cold', metavar='CMD',
+                    help='a shell command run before each timed run, each run then a '
+                    'session of its own with no warm-up: one that drops the OS cache '
+                    'and restarts the server times every plan cold')
     ap.add_argument('--parallel', action='store_true')
     ap.add_argument('--jit', action='store_true')
     ap.add_argument('--label')
