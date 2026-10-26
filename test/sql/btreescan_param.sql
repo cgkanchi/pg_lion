@@ -470,8 +470,8 @@ RESET pg_lion.pushdown_margin;
 -- it, its set built again each run; no room to share it, each participant's
 -- own.  Then the answers: few outer rows, each participant's lazy set of the
 -- keys it probes - built for itself when its probes have cost a build, which
--- depends on the rows it is handed - and a Memoize above the probe, each
--- participant's own over the shared set.
+-- depends on the rows it is handed - and Memoize enabled, which puts each
+-- participant's own Memoize over the shared set where the prices choose one.
 CREATE FUNCTION bsp_par_counters(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -527,9 +527,11 @@ SELECT bsp_par_counters('SELECT d.id % 7, count(*) FROM bsp_fact f JOIN bsp_dim 
 RESET pg_lion.enable_shared_set;
 SELECT bsp_par('SELECT f.id, d.id FROM bsp_fact f JOIN bsp_dim d ON d.id = f.dim_id
  WHERE f.id < 60 AND d.verified AND d.hue = ''green''');
-SELECT bsp_par('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
+-- (whether a Memoize is chosen over the probe here is a near tie of the
+-- prices, which 18 and 19 break differently: the shape is printed without it)
+SELECT replace(bsp_par('SELECT d.id, count(*) FROM bsp_fact f JOIN bsp_dim d ON d.id = f.g + 1
  WHERE f.tsv @@ ''x3''::tsquery AND d.grade = ''alpha'' AND d.verified GROUP BY d.id',
-			   memoize => true, margin => 10);
+					   memoize => true, margin => 10), 'Memoize > ', '') AS bsp_par;
 RESET pg_lion.shared_set_part_blocks;
 DROP FUNCTION bsp_par_counters(text);
 RESET max_parallel_workers_per_gather;
