@@ -79,7 +79,7 @@ src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
               test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
               test/unit/readahead_test test/unit/arena_test \
-              test/unit/planes_test test/unit/planes_test_nosimd test/unit/planes_bench \
+              test/unit/planes_test test/unit/planes_test_nosimd test/unit/planes_bench test/unit/vecplanes_eval \
               test/results test/isolation/results
 # Every object and dependency file in src, not only those OBJS names now, so
 # that a source removed or renamed leaves no object behind.
@@ -214,6 +214,19 @@ test/unit/planes_bench: $(PLANES_TEST_DEPS)
 .PHONY: planes-bench
 planes-bench: test/unit/planes_bench
 	./test/unit/planes_bench --bench
+
+# An evaluation, not a test (DESIGN.md §44.14): whether lionvec's 8-bit codes
+# kept as bit-planes 2 to 8 would let a refine stop early - the planes a
+# refine needs on vec_test's kinds of data, and what a plane's sum costs
+# against the codes' - linked as vec_test is, built at -O2.  Not in `make
+# unit`: it takes minutes, and what it prints is measurements.
+test/unit/vecplanes_eval: test/unit/vecplanes_eval.c $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -O2 -DNDEBUG -o $@ test/unit/vecplanes_eval.c \
+		src/lion_vec_math.c src/lion_planes.c $(UNIT_LDFLAGS)
+
+.PHONY: vecplanes-eval
+vecplanes-eval: test/unit/vecplanes_eval
+	./test/unit/vecplanes_eval
 
 # The read stream ring's bookkeeping (DESIGN.md §44.4, "Read streams"),
 # against a model of core's read stream.
