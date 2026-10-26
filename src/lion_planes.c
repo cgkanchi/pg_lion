@@ -156,7 +156,7 @@ lion_simd_force(LionSimdImpl impl)
  * counts[j] = sum over w of popcount(bits[w] & plane_j[w]), j < k.  Every
  * kernel takes the planes four at a time, a group, its four sums in
  * registers through one pass over the words, and the last k % 4 as a
- * shorter group; bits is read once a group, from L1 after the first.
+ * shorter group; bits is read once a pass, from L1 after the first.
  *
  *	portable,	a word at a time: four sums, one a plane, so that neither
  *	POPCNT		their adds nor POPCNT's false dependency on its destination
@@ -165,21 +165,34 @@ lion_simd_force(LionSimdImpl impl)
  *				ANDed with the bits' word broadcast, each byte counted with
  *				VPSHUFB, lane j counting plane j; the byte counts add up
  *				over 31 words, 248 a byte at most, before VPSADBW sums each
- *				lane's.  STRIDED: four words of the bits against four of
- *				each of the group's planes, one vector a plane, byte counts
- *				over 31 vectors before VPSADBW, as lion_container.c counts
- *				an AND
+ *				lane's.  Up to four groups a pass, a word's 16 planes, two
+ *				cache lines: a group a pass read each line of 64 planes
+ *				twice, and took a fifth longer.  STRIDED: four words of the
+ *				bits against four of each of the group's planes, one vector
+ *				a plane, byte counts over 31 vectors before VPSADBW, as
+ *				lion_container.c counts an AND
  *	AVX512		AVX2's, each lane's word counted whole by VPOPCNTDQ into its
  *				64-bit sum, with no byte counts to add up
  *
+ * Each group's sums are named registers, not an array indexed in a loop:
+ * GCC kept such an array in memory, and four planes took longer than four
+ * calls of one.
+ *
  * nwords and k are any: the last nwords % 4 words of a STRIDED vector pass,
- * and the last group of an INTERLEAVED one where its vector would reach
- * past the planes, are read through zero-padded copies (AVX2) or masked
- * loads (AVX-512), never past the caller's arrays; an INTERLEAVED group of
- * fewer than four planes otherwise reads the next word's planes into its
- * spare lanes, whose sums are dropped.
+ * and the last k % 4 planes of an INTERLEAVED one where their vector would
+ * reach past the planes, are read through zero-padded copies (AVX2) or
+ * masked loads (AVX-512), never past the caller's arrays; those last
+ * planes' vector otherwise reads the next word's planes into its spare
+ * lanes, whose sums are dropped.
  * ----------------------------------------------------------------
  */
+
+/*
+ * lionvec's query planes, four interleaved: every INTERLEAVED kernel runs a
+ * pass compiled for that stride, and the weighted sum one of its own
+ * (planes_dot4_*() below).
+ */
+#define PLANES_K_QUERY		4
 
 /* The word-at-a-time popcount: POPCNT's own when hw, else lion_popcount64(). */
 #ifdef LION_HAVE_X86_SIMD
@@ -271,7 +284,10 @@ static void
 planes_interleaved_portable(const uint64 *bits, const uint64 *planes,
 							uint32 nwords, uint32 k, uint32 *counts)
 {
-	planes_count_words(bits, planes, NULL, true, nwords, k, false, counts);
+	if (k == PLANES_K_QUERY)
+		planes_count_words(bits, planes, NULL, true, nwords, PLANES_K_QUERY, false, counts);
+	else
+		planes_count_words(bits, planes, NULL, true, nwords, k, false, counts);
 }
 
 static void
@@ -289,7 +305,10 @@ static LION_TARGET("popcnt") void
 planes_interleaved_popcnt(const uint64 *bits, const uint64 *planes,
 						  uint32 nwords, uint32 k, uint32 *counts)
 {
-	planes_count_words(bits, planes, NULL, true, nwords, k, true, counts);
+	if (k == PLANES_K_QUERY)
+		planes_count_words(bits, planes, NULL, true, nwords, PLANES_K_QUERY, true, counts);
+	else
+		planes_count_words(bits, planes, NULL, true, nwords, k, true, counts);
 }
 
 static LION_TARGET("popcnt") void
@@ -317,6 +336,15 @@ planes_avx2_byte_counts(__m256i v)
 						   _mm256_shuffle_epi8(lut, hi));
 }
 
+/* bytes plus the byte counts of b AND the four words at p */
+static pg_always_inline LION_TARGET("avx2") __m256i
+planes_avx2_add(__m256i bytes, __m256i b, const uint64 *p)
+{
+	return _mm256_add_epi8(bytes,
+						   planes_avx2_byte_counts(_mm256_and_si256(b,
+																	_mm256_loadu_si256((const __m256i *) p))));
+}
+
 /* The four 64-bit lanes of v added up. */
 static pg_always_inline LION_TARGET("avx2") uint64
 planes_avx2_hsum(__m256i v)
@@ -327,130 +355,248 @@ planes_avx2_hsum(__m256i v)
 	return (uint64) _mm_cvtsi128_si64(s) + (uint64) _mm_extract_epi64(s, 1);
 }
 
+/* The lanes of v, four 64-bit sums, to counts[0 .. r). */
+static pg_always_inline LION_TARGET("avx2") void
+planes_avx2_lanes_out(__m256i v, uint32 r, uint32 *counts)
+{
+	uint64		s[4];
+	uint32		i;
+
+	_mm256_storeu_si256((__m256i *) s, v);
+	for (i = 0; i < r; i++)
+		counts[i] = (uint32) s[i];
+}
+
+/* The four 64-bit lanes of v weighed, lane j by 2^j: lionvec's sum. */
+static pg_always_inline LION_TARGET("avx2") uint64
+planes_avx2_weigh4(__m256i v)
+{
+	uint64		s[4];
+
+	_mm256_storeu_si256((__m256i *) s, v);
+	return s[0] + 2 * s[1] + 4 * s[2] + 8 * s[3];
+}
+
 /* The vectors a byte count adds up before VPSADBW: 31 of at most 8, 248. */
 #define PLANES_AVX2_RUN		31
 
 /*
- * Plane j0 + i's word w and its next three words of the interleaving, lane
- * i; through a zero-padded copy where those reach past the planes' total
- * words, the lanes past them zero.
+ * INTERLEAVED, g full groups at once (1 .. 4), planes j0 .. j0 + 4 g - 1: a
+ * word's 4 g planes, two cache lines at g = 4, in g vectors against the
+ * bits' word broadcast, vector i's lane l counting plane j0 + 4 i + l.  A
+ * full group's vector never reaches past the planes.  With counts NULL, of
+ * one group, its four counts weighed are returned instead (lionvec's sum).
  */
-static pg_always_inline LION_TARGET("avx2") __m256i
-planes_avx2_lanes(const uint64 *planes, Size at, Size total)
+static pg_always_inline LION_TARGET("avx2") uint64
+planes_interleaved_groups_avx2(const uint64 *bits, const uint64 *planes,
+							   uint32 nwords, uint32 k, uint32 j0, uint32 g,
+							   uint32 *counts)
 {
-	uint64		pad[4] = {0, 0, 0, 0};
-
-	if (at + 4 <= total)
-		return _mm256_loadu_si256((const __m256i *) (planes + at));
-	memcpy(pad, planes + at, (total - at) * sizeof(uint64));
-	return _mm256_loadu_si256((const __m256i *) pad);
-}
-
-/*
- * One INTERLEAVED group, planes j0 .. j0 + 3, of which the first r are the
- * caller's: a word's four in one vector against the bits' word broadcast.
- * A full group's vector never reaches past the planes; a shorter group's
- * may, at its last words, and those are read padded.
- */
-static pg_always_inline LION_TARGET("avx2") void
-planes_interleaved_group_avx2(const uint64 *bits, const uint64 *planes,
-							  uint32 nwords, uint32 k, uint32 j0, uint32 r,
-							  uint32 *counts)
-{
-	Size		total = (Size) nwords * k;
-	__m256i		sum = _mm256_setzero_si256();
-	uint64		s[4];
+	const __m256i zero = _mm256_setzero_si256();
+	__m256i		s0 = zero;
+	__m256i		s1 = zero;
+	__m256i		s2 = zero;
+	__m256i		s3 = zero;
 	uint32		w = 0;
-	uint32		i;
 
 	while (w < nwords)
 	{
 		uint32		end = Min(nwords, w + PLANES_AVX2_RUN);
-		__m256i		bytes = _mm256_setzero_si256();
+		__m256i		c0 = zero;
+		__m256i		c1 = zero;
+		__m256i		c2 = zero;
+		__m256i		c3 = zero;
+
+		for (; w < end; w++)
+		{
+			__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
+			const uint64 *at = planes + (Size) w * k + j0;
+
+			c0 = planes_avx2_add(c0, b, at);
+			if (g > 1)
+				c1 = planes_avx2_add(c1, b, at + 4);
+			if (g > 2)
+				c2 = planes_avx2_add(c2, b, at + 8);
+			if (g > 3)
+				c3 = planes_avx2_add(c3, b, at + 12);
+		}
+		s0 = _mm256_add_epi64(s0, _mm256_sad_epu8(c0, zero));
+		if (g > 1)
+			s1 = _mm256_add_epi64(s1, _mm256_sad_epu8(c1, zero));
+		if (g > 2)
+			s2 = _mm256_add_epi64(s2, _mm256_sad_epu8(c2, zero));
+		if (g > 3)
+			s3 = _mm256_add_epi64(s3, _mm256_sad_epu8(c3, zero));
+	}
+	if (counts == NULL)
+		return planes_avx2_weigh4(s0);
+	planes_avx2_lanes_out(s0, 4, counts);
+	if (g > 1)
+		planes_avx2_lanes_out(s1, 4, counts + 4);
+	if (g > 2)
+		planes_avx2_lanes_out(s2, 4, counts + 8);
+	if (g > 3)
+		planes_avx2_lanes_out(s3, 4, counts + 12);
+	return 0;
+}
+
+/*
+ * INTERLEAVED, the last r planes (1 .. 3), from j0: a vector of four words
+ * from each word's plane j0, through a zero-padded copy where that reaches
+ * past the planes; the lanes past r count the next word's planes, or the
+ * padding, and are dropped.
+ */
+static pg_always_inline LION_TARGET("avx2") void
+planes_interleaved_last_avx2(const uint64 *bits, const uint64 *planes,
+							 uint32 nwords, uint32 k, uint32 j0, uint32 r,
+							 uint32 *counts)
+{
+	const __m256i zero = _mm256_setzero_si256();
+	Size		total = (Size) nwords * k;
+	__m256i		sum = zero;
+	uint32		w = 0;
+
+	while (w < nwords)
+	{
+		uint32		end = Min(nwords, w + PLANES_AVX2_RUN);
+		__m256i		bytes = zero;
 
 		for (; w < end; w++)
 		{
 			__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
 			Size		at = (Size) w * k + j0;
-			__m256i		p = (r == 4) ?
-				_mm256_loadu_si256((const __m256i *) (planes + at)) :
-				planes_avx2_lanes(planes, at, total);
 
-			bytes = _mm256_add_epi8(bytes,
-									planes_avx2_byte_counts(_mm256_and_si256(b, p)));
+			if (at + 4 <= total)
+				bytes = planes_avx2_add(bytes, b, planes + at);
+			else
+			{
+				uint64		pad[4] = {0, 0, 0, 0};
+
+				memcpy(pad, planes + at, (total - at) * sizeof(uint64));
+				bytes = planes_avx2_add(bytes, b, pad);
+			}
 		}
-		sum = _mm256_add_epi64(sum, _mm256_sad_epu8(bytes, _mm256_setzero_si256()));
+		sum = _mm256_add_epi64(sum, _mm256_sad_epu8(bytes, zero));
 	}
-	_mm256_storeu_si256((__m256i *) s, sum);
-	for (i = 0; i < r; i++)
-		counts[i] = (uint32) s[i];
+	planes_avx2_lanes_out(sum, r, counts);
 }
 
 static LION_TARGET("avx2") void
 planes_interleaved_avx2(const uint64 *bits, const uint64 *planes,
 						uint32 nwords, uint32 k, uint32 *counts)
 {
-	uint32		j0;
+	uint32		j0 = 0;
 
-	for (j0 = 0; j0 + 4 <= k; j0 += 4)
-		planes_interleaved_group_avx2(bits, planes, nwords, k, j0, 4, counts + j0);
+	if (k == PLANES_K_QUERY)
+	{
+		planes_interleaved_groups_avx2(bits, planes, nwords, PLANES_K_QUERY, 0, 1, counts);
+		return;
+	}
+
+	for (; j0 + 16 <= k; j0 += 16)
+		planes_interleaved_groups_avx2(bits, planes, nwords, k, j0, 4, counts + j0);
+	switch ((k - j0) / 4)
+	{
+		case 3:
+			planes_interleaved_groups_avx2(bits, planes, nwords, k, j0, 3, counts + j0);
+			break;
+		case 2:
+			planes_interleaved_groups_avx2(bits, planes, nwords, k, j0, 2, counts + j0);
+			break;
+		case 1:
+			planes_interleaved_groups_avx2(bits, planes, nwords, k, j0, 1, counts + j0);
+			break;
+		default:
+			break;
+	}
+	j0 = k - k % 4;
 	if (j0 < k)
-		planes_interleaved_group_avx2(bits, planes, nwords, k, j0, k - j0, counts + j0);
+		planes_interleaved_last_avx2(bits, planes, nwords, k, j0, k - j0, counts + j0);
+}
+
+/* p's words w .. w + n - 1, n < 4, and zeros: a vector */
+static pg_always_inline LION_TARGET("avx2") __m256i
+planes_avx2_padded(const uint64 *p, uint32 n)
+{
+	uint64		pad[4] = {0, 0, 0, 0};
+
+	memcpy(pad, p, n * sizeof(uint64));
+	return _mm256_loadu_si256((const __m256i *) pad);
 }
 
 /*
- * One STRIDED group of r planes (1 .. 4), p[i] plane i: four words of the
- * bits against four of each plane, one byte count a plane, VPSADBW every
- * PLANES_AVX2_RUN vectors; the last nwords % 4 words through zero-padded
- * copies.
+ * STRIDED, one group of r planes (1 .. 4): four words of the bits against
+ * four of each plane, one byte count a plane, VPSADBW every PLANES_AVX2_RUN
+ * vectors; the last nwords % 4 words through zero-padded copies.
  */
 static pg_always_inline LION_TARGET("avx2") void
 planes_strided_group_avx2(const uint64 *bits, const uint64 *const *p,
 						  uint32 nwords, uint32 r, uint32 *counts)
 {
 	const __m256i zero = _mm256_setzero_si256();
-	__m256i		sum[4] = {zero, zero, zero, zero};
+	const uint64 *p0 = p[0];
+	const uint64 *p1 = r > 1 ? p[1] : p0;
+	const uint64 *p2 = r > 2 ? p[2] : p0;
+	const uint64 *p3 = r > 3 ? p[3] : p0;
+	__m256i		s0 = zero;
+	__m256i		s1 = zero;
+	__m256i		s2 = zero;
+	__m256i		s3 = zero;
 	uint32		nvec = nwords & ~(uint32) 3;
 	uint32		w = 0;
-	uint32		i;
 
 	while (w < nvec)
 	{
 		uint32		end = Min(nvec, w + 4 * PLANES_AVX2_RUN);
-		__m256i		bytes[4] = {zero, zero, zero, zero};
+		__m256i		c0 = zero;
+		__m256i		c1 = zero;
+		__m256i		c2 = zero;
+		__m256i		c3 = zero;
 
 		for (; w < end; w += 4)
 		{
 			__m256i		b = _mm256_loadu_si256((const __m256i *) (bits + w));
 
-			for (i = 0; i < r; i++)
-				bytes[i] = _mm256_add_epi8(bytes[i],
-										   planes_avx2_byte_counts(_mm256_and_si256(b,
-																					_mm256_loadu_si256((const __m256i *) (p[i] + w)))));
+			c0 = planes_avx2_add(c0, b, p0 + w);
+			if (r > 1)
+				c1 = planes_avx2_add(c1, b, p1 + w);
+			if (r > 2)
+				c2 = planes_avx2_add(c2, b, p2 + w);
+			if (r > 3)
+				c3 = planes_avx2_add(c3, b, p3 + w);
 		}
-		for (i = 0; i < r; i++)
-			sum[i] = _mm256_add_epi64(sum[i], _mm256_sad_epu8(bytes[i], zero));
+		s0 = _mm256_add_epi64(s0, _mm256_sad_epu8(c0, zero));
+		if (r > 1)
+			s1 = _mm256_add_epi64(s1, _mm256_sad_epu8(c1, zero));
+		if (r > 2)
+			s2 = _mm256_add_epi64(s2, _mm256_sad_epu8(c2, zero));
+		if (r > 3)
+			s3 = _mm256_add_epi64(s3, _mm256_sad_epu8(c3, zero));
 	}
 	if (w < nwords)
 	{
-		uint64		bpad[4] = {0, 0, 0, 0};
-		__m256i		b;
+		uint32		n = nwords - w;
+		__m256i		b = planes_avx2_padded(bits + w, n);
 
-		memcpy(bpad, bits + w, (nwords - w) * sizeof(uint64));
-		b = _mm256_loadu_si256((const __m256i *) bpad);
-		for (i = 0; i < r; i++)
-		{
-			uint64		ppad[4] = {0, 0, 0, 0};
-
-			memcpy(ppad, p[i] + w, (nwords - w) * sizeof(uint64));
-			sum[i] = _mm256_add_epi64(sum[i],
-									  _mm256_sad_epu8(planes_avx2_byte_counts(_mm256_and_si256(b,
-																							   _mm256_loadu_si256((const __m256i *) ppad))),
-													  zero));
-		}
+#define PLANES_AVX2_TAIL(s, pi) \
+		s = _mm256_add_epi64(s, _mm256_sad_epu8(planes_avx2_byte_counts(_mm256_and_si256(b, \
+								planes_avx2_padded((pi) + w, n))), zero))
+		PLANES_AVX2_TAIL(s0, p0);
+		if (r > 1)
+			PLANES_AVX2_TAIL(s1, p1);
+		if (r > 2)
+			PLANES_AVX2_TAIL(s2, p2);
+		if (r > 3)
+			PLANES_AVX2_TAIL(s3, p3);
+#undef PLANES_AVX2_TAIL
 	}
-	for (i = 0; i < r; i++)
-		counts[i] = (uint32) planes_avx2_hsum(sum[i]);
+	counts[0] = (uint32) planes_avx2_hsum(s0);
+	if (r > 1)
+		counts[1] = (uint32) planes_avx2_hsum(s1);
+	if (r > 2)
+		counts[2] = (uint32) planes_avx2_hsum(s2);
+	if (r > 3)
+		counts[3] = (uint32) planes_avx2_hsum(s3);
 }
 
 static LION_TARGET("avx2") void
@@ -483,81 +629,157 @@ planes_strided_avx2(const uint64 *bits, const uint64 *const *planes,
 
 #define LION_TARGET_AVX512	LION_TARGET("avx2,avx512f,avx512vl,avx512vpopcntdq")
 
-/*
- * One INTERLEAVED group, as AVX2's, each lane's word counted whole into its
- * 64-bit sum; a shorter group's lanes loaded under a mask of its r planes,
- * which reads nothing past them.
- */
-static pg_always_inline LION_TARGET_AVX512 void
-planes_interleaved_group_avx512(const uint64 *bits, const uint64 *planes,
-								uint32 nwords, uint32 k, uint32 j0, uint32 r,
-								uint32 *counts)
+/* sum plus the popcounts of b AND v, lane by lane */
+static pg_always_inline LION_TARGET_AVX512 __m256i
+planes_avx512_add(__m256i sum, __m256i b, __m256i v)
 {
-	const __mmask8 lanes = (__mmask8) ((1u << r) - 1);
-	__m256i		sum = _mm256_setzero_si256();
-	uint64		s[4];
+	return _mm256_add_epi64(sum, _mm256_popcnt_epi64(_mm256_and_si256(b, v)));
+}
+
+#define planes_avx512_load(p)	_mm256_loadu_si256((const __m256i *) (p))
+
+/*
+ * INTERLEAVED, g full groups at once, as AVX2's, each lane's word counted
+ * whole into its 64-bit sum; counts NULL as AVX2's.
+ */
+static pg_always_inline LION_TARGET_AVX512 uint64
+planes_interleaved_groups_avx512(const uint64 *bits, const uint64 *planes,
+								 uint32 nwords, uint32 k, uint32 j0, uint32 g,
+								 uint32 *counts)
+{
+	const __m256i zero = _mm256_setzero_si256();
+	__m256i		s0 = zero;
+	__m256i		s1 = zero;
+	__m256i		s2 = zero;
+	__m256i		s3 = zero;
 	uint32		w;
-	uint32		i;
 
 	for (w = 0; w < nwords; w++)
 	{
 		__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
 		const uint64 *at = planes + (Size) w * k + j0;
-		__m256i		p = (r == 4) ?
-			_mm256_loadu_si256((const __m256i *) at) :
-			_mm256_maskz_loadu_epi64(lanes, at);
 
-		sum = _mm256_add_epi64(sum, _mm256_popcnt_epi64(_mm256_and_si256(b, p)));
+		s0 = planes_avx512_add(s0, b, planes_avx512_load(at));
+		if (g > 1)
+			s1 = planes_avx512_add(s1, b, planes_avx512_load(at + 4));
+		if (g > 2)
+			s2 = planes_avx512_add(s2, b, planes_avx512_load(at + 8));
+		if (g > 3)
+			s3 = planes_avx512_add(s3, b, planes_avx512_load(at + 12));
 	}
-	_mm256_storeu_si256((__m256i *) s, sum);
-	for (i = 0; i < r; i++)
-		counts[i] = (uint32) s[i];
+	if (counts == NULL)
+		return planes_avx2_weigh4(s0);
+	planes_avx2_lanes_out(s0, 4, counts);
+	if (g > 1)
+		planes_avx2_lanes_out(s1, 4, counts + 4);
+	if (g > 2)
+		planes_avx2_lanes_out(s2, 4, counts + 8);
+	if (g > 3)
+		planes_avx2_lanes_out(s3, 4, counts + 12);
+	return 0;
+}
+
+/*
+ * INTERLEAVED, the last r planes (1 .. 3), loaded under a mask of r lanes,
+ * which reads nothing past them.
+ */
+static pg_always_inline LION_TARGET_AVX512 void
+planes_interleaved_last_avx512(const uint64 *bits, const uint64 *planes,
+							   uint32 nwords, uint32 k, uint32 j0, uint32 r,
+							   uint32 *counts)
+{
+	const __mmask8 lanes = (__mmask8) ((1u << r) - 1);
+	__m256i		sum = _mm256_setzero_si256();
+	uint32		w;
+
+	for (w = 0; w < nwords; w++)
+		sum = planes_avx512_add(sum, _mm256_set1_epi64x((long long) bits[w]),
+								_mm256_maskz_loadu_epi64(lanes, planes + (Size) w * k + j0));
+	planes_avx2_lanes_out(sum, r, counts);
 }
 
 static LION_TARGET_AVX512 void
 planes_interleaved_avx512(const uint64 *bits, const uint64 *planes,
 						  uint32 nwords, uint32 k, uint32 *counts)
 {
-	uint32		j0;
+	uint32		j0 = 0;
 
-	for (j0 = 0; j0 + 4 <= k; j0 += 4)
-		planes_interleaved_group_avx512(bits, planes, nwords, k, j0, 4, counts + j0);
+	if (k == PLANES_K_QUERY)
+	{
+		planes_interleaved_groups_avx512(bits, planes, nwords, PLANES_K_QUERY, 0, 1, counts);
+		return;
+	}
+
+	for (; j0 + 16 <= k; j0 += 16)
+		planes_interleaved_groups_avx512(bits, planes, nwords, k, j0, 4, counts + j0);
+	switch ((k - j0) / 4)
+	{
+		case 3:
+			planes_interleaved_groups_avx512(bits, planes, nwords, k, j0, 3, counts + j0);
+			break;
+		case 2:
+			planes_interleaved_groups_avx512(bits, planes, nwords, k, j0, 2, counts + j0);
+			break;
+		case 1:
+			planes_interleaved_groups_avx512(bits, planes, nwords, k, j0, 1, counts + j0);
+			break;
+		default:
+			break;
+	}
+	j0 = k - k % 4;
 	if (j0 < k)
-		planes_interleaved_group_avx512(bits, planes, nwords, k, j0, k - j0, counts + j0);
+		planes_interleaved_last_avx512(bits, planes, nwords, k, j0, k - j0, counts + j0);
 }
 
-/* One STRIDED group, as AVX2's; the last nwords % 4 words under a mask. */
+/* STRIDED, one group of r planes, as AVX2's; the last nwords % 4 words masked. */
 static pg_always_inline LION_TARGET_AVX512 void
 planes_strided_group_avx512(const uint64 *bits, const uint64 *const *p,
 							uint32 nwords, uint32 r, uint32 *counts)
 {
 	const __m256i zero = _mm256_setzero_si256();
-	__m256i		sum[4] = {zero, zero, zero, zero};
+	const uint64 *p0 = p[0];
+	const uint64 *p1 = r > 1 ? p[1] : p0;
+	const uint64 *p2 = r > 2 ? p[2] : p0;
+	const uint64 *p3 = r > 3 ? p[3] : p0;
+	__m256i		s0 = zero;
+	__m256i		s1 = zero;
+	__m256i		s2 = zero;
+	__m256i		s3 = zero;
 	uint32		nvec = nwords & ~(uint32) 3;
 	uint32		w;
-	uint32		i;
 
 	for (w = 0; w < nvec; w += 4)
 	{
-		__m256i		b = _mm256_loadu_si256((const __m256i *) (bits + w));
+		__m256i		b = planes_avx512_load(bits + w);
 
-		for (i = 0; i < r; i++)
-			sum[i] = _mm256_add_epi64(sum[i],
-									  _mm256_popcnt_epi64(_mm256_and_si256(b,
-																		   _mm256_loadu_si256((const __m256i *) (p[i] + w)))));
+		s0 = planes_avx512_add(s0, b, planes_avx512_load(p0 + w));
+		if (r > 1)
+			s1 = planes_avx512_add(s1, b, planes_avx512_load(p1 + w));
+		if (r > 2)
+			s2 = planes_avx512_add(s2, b, planes_avx512_load(p2 + w));
+		if (r > 3)
+			s3 = planes_avx512_add(s3, b, planes_avx512_load(p3 + w));
 	}
 	if (w < nwords)
 	{
 		const __mmask8 tail = (__mmask8) ((1u << (nwords - w)) - 1);
 		__m256i		b = _mm256_maskz_loadu_epi64(tail, bits + w);
 
-		for (i = 0; i < r; i++)
-			sum[i] = _mm256_add_epi64(sum[i],
-									  _mm256_popcnt_epi64(_mm256_and_si256(b,
-																		   _mm256_maskz_loadu_epi64(tail, p[i] + w))));
+		s0 = planes_avx512_add(s0, b, _mm256_maskz_loadu_epi64(tail, p0 + w));
+		if (r > 1)
+			s1 = planes_avx512_add(s1, b, _mm256_maskz_loadu_epi64(tail, p1 + w));
+		if (r > 2)
+			s2 = planes_avx512_add(s2, b, _mm256_maskz_loadu_epi64(tail, p2 + w));
+		if (r > 3)
+			s3 = planes_avx512_add(s3, b, _mm256_maskz_loadu_epi64(tail, p3 + w));
 	}
-	for (i = 0; i < r; i++)
-		counts[i] = (uint32) planes_avx2_hsum(sum[i]);
+	counts[0] = (uint32) planes_avx2_hsum(s0);
+	if (r > 1)
+		counts[1] = (uint32) planes_avx2_hsum(s1);
+	if (r > 2)
+		counts[2] = (uint32) planes_avx2_hsum(s2);
+	if (r > 3)
+		counts[3] = (uint32) planes_avx2_hsum(s3);
 }
 
 static LION_TARGET_AVX512 void
@@ -651,15 +873,82 @@ planes_weigh(const uint32 *counts, uint32 k)
 	return sum;
 }
 
+/*
+ * The weighted sum of lionvec's four query planes, each implementation's
+ * pass and its weighing in one function, the stride a constant and the
+ * lanes weighed in registers.  Through the counts of any k - a call more,
+ * an array of 64 counts on the stack, a loop of shifts - an AVX-512 sum over
+ * 24 words (1536 dimensions) took 22 - 28 ns where lionvec_plane_dot() takes
+ * 11 - 15; this way 16 against 15, and AVX2's 26 against 29, POPCNT's 38
+ * against 35 (DESIGN.md §50, Measured).
+ */
+static uint64
+planes_dot4_portable(const uint64 *bits, const uint64 *planes, uint32 nwords)
+{
+	uint32		c[PLANES_K_QUERY];
+
+	planes_count_words(bits, planes, NULL, true, nwords, PLANES_K_QUERY, false, c);
+	return (uint64) c[0] + 2 * (uint64) c[1] + 4 * (uint64) c[2] + 8 * (uint64) c[3];
+}
+
+#ifdef LION_HAVE_X86_SIMD
+static LION_TARGET("popcnt") uint64
+planes_dot4_popcnt(const uint64 *bits, const uint64 *planes, uint32 nwords)
+{
+	uint32		c[PLANES_K_QUERY];
+
+	planes_count_words(bits, planes, NULL, true, nwords, PLANES_K_QUERY, true, c);
+	return (uint64) c[0] + 2 * (uint64) c[1] + 4 * (uint64) c[2] + 8 * (uint64) c[3];
+}
+
+static LION_TARGET("avx2") uint64
+planes_dot4_avx2(const uint64 *bits, const uint64 *planes, uint32 nwords)
+{
+	return planes_interleaved_groups_avx2(bits, planes, nwords, PLANES_K_QUERY, 0, 1, NULL);
+}
+
+#ifdef LION_HAVE_X86_AVX512
+static LION_TARGET_AVX512 uint64
+planes_dot4_avx512(const uint64 *bits, const uint64 *planes, uint32 nwords)
+{
+	return planes_interleaved_groups_avx512(bits, planes, nwords, PLANES_K_QUERY, 0, 1, NULL);
+}
+#endif
+#endif
+
+/* Any k, through the counts. */
+static pg_noinline uint64
+planes_dot_counts(const uint64 *bits, const uint64 *planes, uint32 nwords,
+				  uint32 k)
+{
+	uint32		counts[LION_PLANES_MAX_BITS];
+
+	lion_planes_count_interleaved(bits, planes, nwords, k, counts);
+	return planes_weigh(counts, k);
+}
+
 uint64
 lion_planes_dot_interleaved(const uint64 *bits, const uint64 *planes,
 							uint32 nwords, uint32 k)
 {
-	uint32		counts[LION_PLANES_MAX_BITS];
-
 	Assert(k <= LION_PLANES_MAX_BITS);
-	lion_planes_count_interleaved(bits, planes, nwords, k, counts);
-	return planes_weigh(counts, k);
+	if (k != PLANES_K_QUERY)
+		return planes_dot_counts(bits, planes, nwords, k);
+	switch (lion_simd_current())
+	{
+#ifdef LION_HAVE_X86_SIMD
+#ifdef LION_HAVE_X86_AVX512
+		case LION_SIMD_AVX512:
+			return planes_dot4_avx512(bits, planes, nwords);
+#endif
+		case LION_SIMD_AVX2:
+			return planes_dot4_avx2(bits, planes, nwords);
+		case LION_SIMD_POPCNT:
+			return planes_dot4_popcnt(bits, planes, nwords);
+#endif
+		default:
+			return planes_dot4_portable(bits, planes, nwords);
+	}
 }
 
 uint64
