@@ -189,10 +189,17 @@ typedef struct OjKeySet
 /* The join the node answers: its two sides, its key and its key sets */
 typedef struct OjJoin
 {
-	RelOptInfo *fact;
+	RelOptInfo *fact;			/* the relations the node reads: a table, or
+								 * the one leaf a partitioned parent is
+								 * pruned to (lion_single_leaf()) ... */
 	RelOptInfo *dim;
-	Var		   *fkvar;			/* the fact's key column */
-	Var		   *pkvar;			/* the dimension's */
+	RelOptInfo *facttop;		/* ... and the relations the join is of, as
+								 * the query names them: the same, or the
+								 * parent, whose columns the join outputs */
+	RelOptInfo *dimtop;
+	Var		   *fkvar;			/* the fact's key column, as the fact
+								 * numbers it */
+	Var		   *pkvar;			/* the dimension's, as the dimension does */
 	IndexOptInfo *pkidx;		/* the unique btree on it */
 	Expr	   *keyqual;		/* `pk = NULL`, the descent's qual */
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
@@ -234,11 +241,13 @@ oj_target_ok(RelOptInfo *rel, Relids relids)
 static bool
 oj_side_ok(PlannerInfo *root, RelOptInfo *rel)
 {
+	RelOptInfo *leaf = lion_single_leaf(root, rel);
 	ListCell   *lc;
 
-	if (!lion_ordered_rel_ok(root, rel))
+	/* a table, or a partitioned parent pruned to one leaf (DESIGN.md §16) */
+	if (leaf == NULL || !lion_ordered_rel_ok(root, leaf))
 		return false;
-	foreach(lc, rel->baserestrictinfo)
+	foreach(lc, leaf->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 
@@ -281,6 +290,8 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 	int			strategy;
 	Oid			lefttype;
 	Oid			righttype;
+	RelOptInfo *factleaf;
+	RelOptInfo *dimleaf;
 
 	memset(j, 0, sizeof(OjJoin));
 
@@ -320,11 +331,30 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 		return false;
 
 	/*
+	 * Each side is the relation the node reads: the table, or the one leaf
+	 * a partitioned parent is pruned to (lion_single_leaf(), DESIGN.md
+	 * §16, "A parent pruned to one leaf"), whose indexes and statistics
+	 * are the join's and whose columns its key and the descent's qual are
+	 * written over, the way the leaf's own scan evaluates them.  What the
+	 * join outputs stays the parent's (oj_plan_path()).
+	 */
+	factleaf = lion_single_leaf(root, fact);
+	dimleaf = lion_single_leaf(root, dim);
+	if (factleaf == NULL || dimleaf == NULL)
+		return false;
+	j->fkvar = (Var *) lion_leaf_expr(root, (Node *) j->fkvar, factleaf,
+									  fact);
+	j->pkvar = (Var *) lion_leaf_expr(root, (Node *) j->pkvar, dimleaf, dim);
+	pkarg = lion_leaf_expr(root, pkarg, dimleaf, dim);
+	if (!IsA(j->fkvar, Var) || !IsA(j->pkvar, Var))
+		return false;
+
+	/*
 	 * The dimension's key is unique under that equality, by a btree the
 	 * descent reads (lion_column_unique_index()), the equality its with the
 	 * key column on the left.
 	 */
-	j->pkidx = lion_column_unique_index(dim, j->pkvar->varattno, opno,
+	j->pkidx = lion_column_unique_index(dimleaf, j->pkvar->varattno, opno,
 										op->inputcollid);
 	if (j->pkidx == NULL || !op_in_opfamily(opno, j->pkidx->opfamily[0]))
 		return false;
@@ -340,8 +370,10 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 	if (!oj_side_ok(root, fact) || !oj_side_ok(root, dim))
 		return false;
 
-	j->fact = fact;
-	j->dim = dim;
+	j->fact = factleaf;
+	j->dim = dimleaf;
+	j->facttop = fact;
+	j->dimtop = dim;
 	j->keyec = rinfo->parent_ec;
 	j->keyqual = make_opclause(opno, BOOLOID, false, (Expr *) copyObject(pkarg),
 							   (Expr *) makeNullConst(righttype, -1,
@@ -944,6 +976,8 @@ oj_loop_over_walk(Path *p, RelOptInfo *fact, Path **walk)
 	outer = jp->outerjoinpath;
 	while (outer != NULL && IsA(outer, ProjectionPath))
 		outer = ((ProjectionPath *) outer)->subpath;
+	/* a parent pruned to one leaf: core's Append over the leaf's walk */
+	outer = lion_single_leaf_path(outer);
 	if (outer == NULL || !IsA(outer, CustomPath) ||
 		((CustomPath *) outer)->methods != &lion_ordered_path_methods ||
 		outer->parent != fact)
@@ -1028,7 +1062,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, const OjJoin *j,
 		else
 			best = NULL;
 	}
-	if (best != NULL && best->parent == fact)
+	if (best != NULL && (best->parent == fact || best->parent == j->facttop))
 	{
 		c->factwalk = true;
 		c->indexonly = (best->pathtype == T_IndexOnlyScan);
@@ -2000,7 +2034,7 @@ os_split_of(PlannerInfo *root, OjJoin *j, OsSplit *sp)
 	if (lion_ordered_split_max <= 0 || list_length(root->query_pathkeys) < 2)
 		return false;
 	sp->pathkey = (PathKey *) linitial(root->query_pathkeys);
-	if (!bms_is_subset(j->dim->relids, sp->pathkey->pk_eclass->ec_relids))
+	if (!bms_is_subset(j->dimtop->relids, sp->pathkey->pk_eclass->ec_relids))
 		return false;			/* no column of the dimension's */
 	sp->index = lion_ordered_column_order(root, j->dim, sp->pathkey,
 										  &sp->indexcol, &sp->col);
@@ -2337,13 +2371,23 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		{
 			TargetEntry *tle = lfirst_node(TargetEntry, lc);
 			Var		   *var = (Var *) tle->expr;
+			Expr	   *out = (Expr *) copyObject(tle->expr);
 
 			if (side == 0 && IsA(var, Var) && var->varno == fkvar->varno &&
 				var->varattno == fkvar->varattno)
 				fkresno = resno;
+
+			/*
+			 * A side that scans the one leaf a partitioned parent is pruned
+			 * to outputs the leaf's columns, and its whole row converted to
+			 * the parent's row type; the join outputs them as the parent the
+			 * query names numbers them (lion_top_expr(), DESIGN.md §16),
+			 * which is what the target list above and the nodes over it
+			 * refer to.  The values are the same, by position.
+			 */
+			out = lion_top_expr(root, out);
 			sctlist = lappend(sctlist,
-							  makeTargetEntry((Expr *) copyObject(tle->expr),
-											  resno++, NULL, false));
+							  makeTargetEntry(out, resno++, NULL, false));
 		}
 		if (side == 0)
 			nfact = list_length(sctlist);

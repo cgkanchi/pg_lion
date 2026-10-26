@@ -1,0 +1,276 @@
+-- LionOrderedJoin and LionOrderedSplit over a partitioned table the planner
+-- prunes to one leaf (DESIGN.md section 16, "A parent pruned to one leaf";
+-- section 47.1).
+--
+-- A query names the parent, as an application does; plan-time pruning leaves
+-- one leaf; the node plans on that leaf - its indexes, its statistics, its
+-- own scan - and outputs the parent's columns, which is what the query's
+-- target and the nodes above refer to.  Either side may be such a parent:
+-- the fact (LIST by grp, each sub-partitioned by LIST on ver, the leaf the
+-- queries hit attached with two dropped columns, so that it numbers its
+-- columns differently from the parent), the dimension (LIST by kind, each
+-- leaf with its own unique btree on the key), or both.  A parent several
+-- leaves are left of, or none, is declined, and core plans the join.  Every
+-- query is run through the node (lion's paths priced at a thousandth) and
+-- through the ordinary plan, and the two answers are compared row by row,
+-- as ordjoin.sql compares them.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET default_statistics_target = 1000;
+SET work_mem = '64MB';
+
+CREATE TABLE dim (
+	pk int NOT NULL,
+	kind int NOT NULL,			-- the partitioning key: ten values
+	flag bool NOT NULL,			-- lion: two thirds true
+	tags text[] NOT NULL,		-- lion
+	lvl int NOT NULL,			-- lion: a hundred values
+	payload text
+) PARTITION BY LIST (kind);
+DO $$ DECLARE k int; BEGIN
+	FOR k IN 0..9 LOOP
+		EXECUTE format('CREATE TABLE dim_k%s PARTITION OF dim FOR VALUES IN (%s)', k, k);
+		EXECUTE format('CREATE UNIQUE INDEX dim_k%s_pk ON dim_k%s (pk)', k, k);
+	END LOOP;
+END $$;
+INSERT INTO dim
+SELECT i,
+	   ((hashint8extended(i::bigint, 1) & 9223372036854775807) % 10)::int,
+	   i % 3 <> 0,
+	   ARRAY['t' || (i % 10), 'u' || (i % 7)],
+	   ((hashint8extended(i::bigint, 2) & 9223372036854775807) % 100)::int,
+	   repeat(md5(i::text), 4)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX dim_flag ON dim USING lion (flag);
+CREATE INDEX dim_tags ON dim USING lion (tags);
+CREATE INDEX dim_lvl ON dim USING lion (lvl);
+
+CREATE TABLE fact (
+	id int NOT NULL,
+	fk int,						-- a dim row, NULL in every 101st row
+	grp int NOT NULL,			-- the partitioning key: five groups
+	ver int NOT NULL,			-- the sub-partitioning key: three versions
+	score numeric,				-- the order; NULL in every 89th row
+	tags text[] NOT NULL,		-- lion
+	note text,
+	PRIMARY KEY (id, grp, ver)
+) PARTITION BY LIST (grp);
+DO $$ DECLARE g int; v int; BEGIN
+	FOR g IN 0..4 LOOP
+		EXECUTE format('CREATE TABLE fact_g%s PARTITION OF fact FOR VALUES IN (%s) PARTITION BY LIST (ver)', g, g);
+		FOR v IN 0..2 LOOP
+			CONTINUE WHEN g = 2 AND v = 1;
+			EXECUTE format('CREATE TABLE fact_g%s_v%s PARTITION OF fact_g%s FOR VALUES IN (%s)', g, v, g, v);
+		END LOOP;
+	END LOOP;
+END $$;
+-- the leaf the queries hit numbers its columns differently from the parent
+CREATE TABLE fact_g2_v1 (
+	junk1 text,
+	id int NOT NULL,
+	fk int,
+	junk2 bigint,
+	grp int NOT NULL,
+	ver int NOT NULL,
+	score numeric,
+	tags text[] NOT NULL,
+	note text
+);
+ALTER TABLE fact_g2_v1 DROP COLUMN junk1;
+ALTER TABLE fact_g2_v1 DROP COLUMN junk2;
+ALTER TABLE fact_g2 ATTACH PARTITION fact_g2_v1 FOR VALUES IN (1);
+INSERT INTO fact
+SELECT i,
+	   CASE WHEN i % 101 = 0 THEN NULL
+			ELSE 1 + ((hashint8extended(i::bigint, 3) & 9223372036854775807) % 100000)::int END,
+	   i % 5,
+	   i % 3,
+	   CASE WHEN i % 89 = 0 THEN NULL
+			ELSE ((hashint8extended(i::bigint, 4) & 9223372036854775807) % 1000000)::numeric / 100 END,
+	   ARRAY['a' || (i % 4), 'b' || (i % 9)],
+	   'n'
+  FROM generate_series(1, 500000) i;
+CREATE INDEX fact_grp_score ON fact (grp, score DESC NULLS LAST) INCLUDE (fk);
+CREATE INDEX fact_tags ON fact USING lion (tags, grp, ver);
+VACUUM (FREEZE, ANALYZE) dim;
+VACUUM (FREEZE, ANALYZE) fact;
+
+-- the attached leaf really does number the columns differently
+SELECT attname, attnum FROM pg_attribute
+ WHERE attrelid = 'fact_g2_v1'::regclass AND attnum > 0 AND NOT attisdropped
+   AND attname IN ('fk', 'score')
+ ORDER BY attnum;
+
+/*
+ * oj() runs q through the node - lion's paths priced at a thousandth - and
+ * through the ordinary plan (the node off), compares the two answers in
+ * order, and says whether the first plan was the node, or its split.
+ */
+CREATE FUNCTION oj(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	r record;
+	used boolean := false;
+	split boolean := false;
+	keys text := '';
+	a text[] := '{}';
+	b text[] := '{}';
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Custom Scan \(LionOrderedSplit\)' THEN
+			split := true;
+		END IF;
+		IF ln ~ '^\s*Key Sets: ' THEN
+			keys := format(' (key sets: %s)', regexp_replace(ln, '^\s*Key Sets: ', ''));
+		END IF;
+	END LOOP;
+	FOR r IN EXECUTE q LOOP
+		a := a || r::text;
+	END LOOP;
+
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_ordered_join', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		b := b || r::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_join', 'on', true);
+
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the node, %s ordinary; first %s / %s',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0),
+					  a[1], b[1]);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN split THEN 'LionOrderedSplit' || keys
+					   WHEN used THEN 'LionOrderedJoin' || keys
+					   ELSE 'no LionOrderedJoin' END,
+				  coalesce(array_length(a, 1), 0));
+END $$;
+
+/*
+ * oj_plan() prints the plan with lion's paths priced at a thousandth,
+ * without the lines whose contents vary between majors.
+ */
+CREATE FUNCTION oj_plan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln !~ '^\s*(Index Searches|Disabled|Storage|Planning|Execution|Buffers)' THEN
+			RETURN NEXT ln;
+		END IF;
+	END LOOP;
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+END $$;
+
+-- 1. Both parents pruned to one leaf each: the node, on the leaves' indexes,
+--    naming the parents' columns.  The fact's leaf is the attached one.
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- another leaf of the fact, numbered as the parent is
+SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 0 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- a page further in, and the whole join
+SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20 OFFSET 200');
+SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id');
+-- the fact's columns the join outputs, every one of them, and the dimension's
+SELECT oj('SELECT f.*, d.pk, d.flag, d.tags FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- a whole row of either parent: the leaf's row converted to the parent's
+-- row type (the attached leaf's has the dropped columns), output as the
+-- parent's whole-row column
+SELECT oj('SELECT f, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, d, row_to_json(f) FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- 2. A key set beside them, from a leaf of the dimension's parent
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3
+	  AND f.fk IN (SELECT d2.pk FROM dim d2 WHERE d2.kind = 3 AND d2.flag)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- 3. The split, by a column of the dimension's leaf
+SELECT * FROM oj_plan('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY d.flag DESC, f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, d.flag FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY d.flag, f.score DESC NULLS LAST, f.id LIMIT 30 OFFSET 100');
+
+-- 4. Declined: a parent several leaves are left of, on either side, or none
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver IN (0, 1) AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind IN (3, 4) AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- pruned to nothing: an empty answer, core's
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 7 AND f.tags @> ''{a1}'' AND d.kind = 3
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- 5. The leaves named outright, with the same clauses, plan the same node
+--    (the equality on grp is what lets the fact's btree give the order)
+SELECT oj('SELECT f.id, f.score, d.pk, d.lvl FROM fact_g2_v1 f JOIN dim_k3 d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}'' AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+
+-- 6. The other nodes a parent pruned to one leaf gets, by the same rule:
+--    LionOrdered on the fact's parent alone (DESIGN.md section 30.11), and
+--    LionBtreeScan as a nested loop's probe of the dimension's parent
+--    (section 40.10; the probe needs every clause of the dimension answered
+--    from an index, so kind gets a lion index for it), each on the leaf,
+--    under core's Append of one child, which the plan leaves out
+SELECT * FROM oj_plan('SELECT f.id, f.score FROM fact f
+	WHERE f.grp = 2 AND f.ver = 1 AND f.tags @> ''{a1}''
+	ORDER BY f.score DESC NULLS LAST LIMIT 20');
+CREATE INDEX dim_kind ON dim USING lion (kind);
+ANALYZE dim;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SELECT * FROM oj_plan('SELECT f.id, d.pk FROM fact f JOIN dim d ON d.pk = f.fk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.id <= 40000 AND d.kind = 3 AND d.lvl < 30');
+SELECT oj('SELECT f.id, d.pk FROM fact f JOIN dim d ON d.pk = f.fk
+	WHERE f.grp = 2 AND f.ver = 1 AND f.id <= 40000 AND d.kind = 3 AND d.lvl < 30
+	ORDER BY f.id');
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+
+DROP TABLE fact;
+DROP TABLE dim;
+DROP FUNCTION oj(text);
+DROP FUNCTION oj_plan(text);

@@ -4506,7 +4506,9 @@ lion_ordered_rel_ok(PlannerInfo *root, RelOptInfo *rel)
 	Relation	relation;
 	bool		supported;
 
-	if (rel->reloptkind != RELOPT_BASEREL || rel->rtekind != RTE_RELATION)
+	if ((rel->reloptkind != RELOPT_BASEREL &&
+		 rel->reloptkind != RELOPT_OTHER_MEMBER_REL) ||
+		rel->rtekind != RTE_RELATION)
 		return false;
 	if (lion_old_snapshot_threshold_active())
 		return false;
