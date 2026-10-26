@@ -215,6 +215,7 @@ lion_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (lion_prev_build_simple_rel_hook)
 		lion_prev_build_simple_rel_hook(root, rel, rte);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #else
 static void
@@ -225,6 +226,7 @@ lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
 										 rel);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #endif
 

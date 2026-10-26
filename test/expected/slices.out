@@ -709,6 +709,8 @@ SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
 (1 row)
 
 -- ranges, summed from the summaries, whose walk ends where the slices begin
+-- (the bitmap scan off: the two cost about the same here)
+SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k > -150;
                     QUERY PLAN                    
 --------------------------------------------------
@@ -746,6 +748,7 @@ SELECT slc_both($$SELECT count(*) FROM %s WHERE k <> 3$$);
  same
 (1 row)
 
+RESET enable_bitmapscan;
 -- IS NOT NULL and a range by bitmap scans: a walk of the whole column
 SET pg_lion.enable_count_pushdown = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k IS NOT NULL;
