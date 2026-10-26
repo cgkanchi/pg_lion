@@ -135,10 +135,15 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 
 /*
  * One target per live leaf partition (DESIGN.md §16): its heap, its two
- * group indexes and one index per clause, InvalidOid wherever it has none.
+ * group indexes and one index per clause, InvalidOid wherever it has none;
+ * then one flag per residual clause, whether its bounds imply it (§16,
+ * "Residual clauses over a partitioned table").  Every partition has the
+ * same number of those, as many as the residual clauses: the path's list
+ * holds them (RESID), and the plan's custom_exprs, which the executor
+ * counts them against (lion_begin_partitions()).
  */
 static void
-lion_priv_decode_parts(List *priv, LionCountPriv *out)
+lion_priv_decode_parts(List *priv, LionPrivStage stage, LionCountPriv *out)
 {
 	List	   *parts = (List *) list_nth(priv, LION_PRIV_PARTS);
 	int			i;
@@ -155,7 +160,7 @@ lion_priv_decode_parts(List *priv, LionCountPriv *out)
 		LionCountPrivPart *part = &out->part[i];
 
 		if (one == NIL || !IsA(one, OidList) ||
-			list_length(one) != 3 + out->nclause)
+			list_length(one) < 3 + out->nclause)
 			elog(ERROR, "LionCount: partition %d has %d Oids for %d clauses",
 				 i, list_length(one), out->nclause);
 		part->heapoid = linitial_oid(one);
@@ -165,6 +170,27 @@ lion_priv_decode_parts(List *priv, LionCountPriv *out)
 											 Max(out->nclause, 1));
 		for (j = 0; j < out->nclause; j++)
 			part->clauseidxoid[j] = list_nth_oid(one, 3 + j);
+
+		part->nresid = list_length(one) - 3 - out->nclause;
+		if (part->nresid != out->part[0].nresid ||
+			(part->nresid > 0 && (out->flags & LION_FLAG_RESID) == 0) ||
+			(stage == LION_PRIV_STAGE_PATH &&
+			 part->nresid != list_length(out->resid)))
+			elog(ERROR, "LionCount: partition %d has flags for %d residual clauses",
+				 i, part->nresid);
+		if (part->nresid > 0)
+		{
+			part->residdrop = (bool *) palloc0(sizeof(bool) * part->nresid);
+			for (j = 0; j < part->nresid; j++)
+			{
+				Oid			flag = list_nth_oid(one, 3 + out->nclause + j);
+
+				if (flag != 0 && flag != 1)
+					elog(ERROR, "LionCount: partition %d has flags for %d residual clauses",
+						 i, part->nresid);
+				part->residdrop[j] = (flag == 1);
+			}
+		}
 	}
 }
 
@@ -868,7 +894,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 		out->resid = m;
 	}
 
-	lion_priv_decode_parts(priv, out);
+	lion_priv_decode_parts(priv, stage, out);
 	lion_priv_decode_ors(priv, out);
 
 	/* count(DISTINCT k) (DESIGN.md §26): k */
@@ -1015,6 +1041,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 
 		for (j = 0; j < p->nclause; j++)
 			one = lappend_oid(one, part->clauseidxoid[j]);
+		for (j = 0; j < part->nresid; j++)
+			one = lappend_oid(one, part->residdrop[j] ? 1 : 0);
 		parts = lappend(parts, one);
 	}
 	for (i = 0; i < p->nor; i++)
@@ -1332,14 +1360,16 @@ lion_count_priv_set_where(LionCountPriv *p, List *whereidx, List *whereattnos,
  * One PARTS target per relation of a partitioned table's `targets`
  * (LionCountTarget, DESIGN.md §16): its heap, its driving indexes when
  * `groupidx` - InvalidOid where it has none, and always for an FK-side join,
- * whose fact column grouped by is FACTGROUP's - and its index for each of
- * the clauses lion_count_priv_set_where() has set, InvalidOid for a clause
- * the partition's bounds imply.
+ * whose fact column grouped by is FACTGROUP's - its index for each of the
+ * clauses lion_count_priv_set_where() has set, InvalidOid for a clause the
+ * partition's bounds imply, and which of the residual clauses set in RESID
+ * its bounds imply as well.
  */
 void
 lion_count_priv_set_parts(LionCountPriv *p, List *targets, bool groupidx)
 {
 	ListCell   *lc;
+	int			nresid = list_length(p->resid);
 	int			i = 0;
 	int			j;
 
@@ -1366,6 +1396,14 @@ lion_count_priv_set_parts(LionCountPriv *p, List *targets, bool groupidx)
 
 			part->clauseidxoid[j] = (idx != NULL) ? idx->indexoid :
 				InvalidOid;
+		}
+		part->nresid = nresid;
+		if (nresid > 0)
+		{
+			part->residdrop = (bool *) palloc0(sizeof(bool) * nresid);
+			for (j = 0; j < nresid; j++)
+				part->residdrop[j] = (t->residdrop != NULL &&
+									  t->residdrop[j]);
 		}
 	}
 }
@@ -1517,15 +1555,15 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 		elog(ERROR, "LionCount: a sum over every entry that names no column");
 
 	/*
-	 * Residual clauses (DESIGN.md §10) are tested on the rows of one plain
-	 * table's counts: never beside a sum over entries that reads no row, the
-	 * decoded walk, a join, partitions or the ranges of a parallel GROUP BY,
-	 * none of which the planner offers with them.  The ranges of a parallel
-	 * count test them as its serial node does, each range on its own rows.
+	 * Residual clauses (DESIGN.md §10) are tested on the rows of a table's
+	 * or of each partition's counts: never beside a sum over entries that
+	 * reads no row, the decoded walk, a join or the ranges of a parallel
+	 * GROUP BY, none of which the planner offers with them.  The ranges of a
+	 * parallel count test them as its serial node does, each range on its
+	 * own rows.
 	 */
 	if ((p->flags & LION_FLAG_RESID) != 0 &&
-		(sumall || decode || p->hasjoin || p->npart > 0 || p->nwcol > 0 ||
-		 pgroup))
+		(sumall || decode || p->hasjoin || p->nwcol > 0 || pgroup))
 		elog(ERROR, "LionCount: residual clauses in a shape that tests no row");
 
 	/*

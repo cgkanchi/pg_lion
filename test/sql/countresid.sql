@@ -152,7 +152,7 @@ SELECT q, cr_q(q) FROM (VALUES
 
 -- ---- what is declined: nothing else to select the rows, a range summed
 -- over its entries, a volatile function, a subplan, a whole-row or system
--- column, a partitioned table, and the switch ----
+-- column, and the switch ----
 SELECT q, cr_q(q) FROM (VALUES
 	('SELECT count(*) FROM cr WHERE id % 2 = 0'),
 	('SELECT a, count(*) FROM cr WHERE id % 2 = 0 GROUP BY a'),
@@ -220,7 +220,8 @@ SELECT cr_q('SELECT count(*) FROM crm WHERE a = 2 AND p LIKE ''a%''');
 SELECT cr_q('SELECT b, count(*) FROM crm WHERE a = 2 AND id % 3 = 0 GROUP BY b');
 DROP MATERIALIZED VIEW crm;
 
--- ---- a partitioned table is declined ----
+-- ---- a partitioned table tests it in each partition (DESIGN.md §16,
+-- "Residual clauses over a partitioned table"; partition_residual.sql) ----
 CREATE TABLE crp (a int, p text) PARTITION BY RANGE (a);
 CREATE TABLE crp1 PARTITION OF crp FOR VALUES FROM (0) TO (3);
 CREATE TABLE crp2 PARTITION OF crp FOR VALUES FROM (3) TO (7);

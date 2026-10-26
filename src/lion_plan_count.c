@@ -424,6 +424,14 @@ typedef struct LionCountPathBuild
 								 * column outside the ORs (§41) */
 	List	   *residual;		/* clauses no posting set answers, tested on
 								 * the heap (§10, "Residual clauses") */
+	Bitmapset  *residable;		/* the restrictions, by position, that could
+								 * be residual (§16, "Residual clauses over a
+								 * partitioned table") ... */
+	Bitmapset  *forceresid;		/* ... and the ones this attempt makes so,
+								 * asked for by the one before */
+	Bitmapset  *keyattnos;		/* the partitioning keys' columns, at every
+								 * level the planner keeps */
+	bool		keyattnosdone;
 	int			nfilter;		/* filtered counts (§10): their conditions */
 	List	   *filterexprs;	/* ... each one once, by equal() */
 	List	   *filtercols;		/* ... an IntList {filter, attno} for each
@@ -1460,10 +1468,14 @@ lion_all_as_and(Node *clause)
 /*
  * May a WHERE clause no posting set answers be tested on the heap tuple of
  * each row the others select (DESIGN.md §10, "Residual clauses")?  Of one
- * plain table's count, not an FK-side join's: an expression over the
- * table's own user columns, Params and constants that calls nothing
- * volatile and holds no subplan, which the node evaluates as the ordinary
- * plan's scan would - with ExecInitQual() - on the rows the snapshot sees.
+ * table's count, or each partition's, not an FK-side join's: an expression
+ * over the table's own user columns, Params and constants that calls
+ * nothing volatile and holds no subplan, which the node evaluates as the
+ * ordinary plan's scan would - with ExecInitQual() - on the rows the
+ * snapshot sees.  Over a partitioned table, not one on a partitioning key
+ * with a Param or a stable function in it: that is a clause run-time
+ * pruning decides, and the node, which keeps the planner's partitions
+ * (§16), would fetch the rows of every partition pruning skips to test it.
  */
 static bool
 lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
@@ -1471,9 +1483,10 @@ lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
 	Node	   *clause = (Node *) rinfo->clause;
 	List	   *vars;
 	ListCell   *lc;
+	Bitmapset  *attnos = NULL;
 	bool		ok = true;
 
-	if (!lion_enable_count_residual || cx->partitioned || cx->fj != NULL)
+	if (!lion_enable_count_residual || cx->fj != NULL)
 		return false;
 	if (contain_subplans(clause) || contain_volatile_functions(clause) ||
 		contain_agg_clause(clause) || contain_window_function(clause))
@@ -1489,17 +1502,82 @@ lion_residual_ok(LionCountPathBuild *cx, RestrictInfo *rinfo)
 			ok = false;
 			break;
 		}
+		attnos = bms_add_member(attnos, (int) var->varattno);
 	}
 	list_free(vars);
+	if (ok && cx->partitioned &&
+		(lion_contains_param(clause) || contain_mutable_functions(clause)))
+	{
+		if (!cx->keyattnosdone)
+		{
+			cx->keyattnos = lion_partition_key_attnos(cx->root,
+													  cx->input_rel);
+			cx->keyattnosdone = true;
+		}
+		if (bms_overlap(attnos, cx->keyattnos))
+			ok = false;
+	}
+	bms_free(attnos);
 	return ok;
 }
 
 /*
+ * Does rel - a table, or a partitioned one, through every level down to its
+ * live leaves - have a lion index to answer clause ci on column attno (in
+ * rel's own numbering, translated for each child)?  Of a partitioned table,
+ * any live leaf's will do: a column no leaf indexes is what makes the clause
+ * residual (lion_where_indexed()), and one some leaf indexes and another
+ * does not is the partitions' to settle when they are matched
+ * (lion_collect_targets()).
+ */
+static bool
+lion_rel_has_index(PlannerInfo *root, RelOptInfo *rel, AttrNumber attno,
+				   const LionClauseInfo *ci)
+{
+	AttrNumber	col = 1;
+
+	check_stack_depth();
+	if (IS_PARTITIONED_REL(rel))
+	{
+		int			i;
+
+		for (i = 0; i < rel->nparts; i++)
+		{
+			RelOptInfo *child = rel->part_rels[i];
+			AttrNumber	cattno = attno;
+
+			if (child == NULL || !bms_is_member(i, rel->live_parts) ||
+				IS_DUMMY_REL(child))
+				continue;
+			if (attno > 0 && !LION_ATTNO_IS_VCOL(attno))
+			{
+				Var		   *cvar = lion_child_var(root, child->relid, attno);
+
+				if (cvar == NULL)
+					continue;
+				cattno = cvar->varattno;
+			}
+			if (lion_rel_has_index(root, child, cattno, ci))
+				return true;
+		}
+		return false;
+	}
+	return lion_match_index(rel, attno, ci->kind, ci->opno, ci->cmptype,
+							ci->strategy, ci->extractquery, ci->collation,
+							ci->positions, &col) != NULL;
+}
+
+/*
  * Has every clause the analysis of one restriction appended, from position
- * `from` on, an index of this (plain) table to answer it?  A clause of the
- * right shape on a column no lion index covers - `id > 10` - is only found
- * out when the relation's indexes are matched (lion_collect_targets()),
- * which declines the whole query; asked here, it can be residual instead.
+ * `from` on, an index of this table to answer it?  A clause of the right
+ * shape on a column no lion index covers - `id > 10` - is only found out
+ * when the relation's indexes are matched (lion_collect_targets()), which
+ * declines the whole query; asked here, it can be residual instead.  A
+ * partitioned table has no indexes of its own, and its live leaves' stand
+ * for them (lion_rel_has_index()): a column no leaf indexes is found out
+ * here, and one some leaf indexes and another does not when the partitions
+ * are matched, which may ask for a second attempt then (DESIGN.md §16,
+ * "Residual clauses over a partitioned table").
  */
 static bool
 lion_where_indexed(LionCountPathBuild *cx, int from)
@@ -1511,14 +1589,11 @@ lion_where_indexed(LionCountPathBuild *cx, int from)
 	forboth(l1, cx->whereattnos, l2, cx->clauseinfos)
 	{
 		LionClauseInfo *ci = (LionClauseInfo *) lfirst(l2);
-		AttrNumber	col = 1;
 
 		if (i++ < from)
 			continue;
-		if (lion_match_index(cx->input_rel, (AttrNumber) lfirst_int(l1),
-							 ci->kind, ci->opno, ci->cmptype, ci->strategy,
-							 ci->extractquery, ci->collation, ci->positions,
-							 &col) == NULL)
+		if (!lion_rel_has_index(cx->root, cx->input_rel,
+								(AttrNumber) lfirst_int(l1), ci))
 			return false;
 	}
 	return true;
@@ -1745,6 +1820,23 @@ lion_count_path_where(LionCountPathBuild *cx)
 
 		cx->rinfono++;
 		cx->rinfoclauses = lappend(cx->rinfoclauses, rinfo->clause);
+
+		/*
+		 * Over a partitioned table, a restriction some partition could
+		 * neither answer nor leave out in the attempt before is residual in
+		 * this one, without analysis (DESIGN.md §16, "Residual clauses over
+		 * a partitioned table"); and every restriction that could be is
+		 * noted, for lion_collect_targets() to ask for.
+		 */
+		if (cx->partitioned && lion_residual_ok(cx, rinfo))
+		{
+			cx->residable = bms_add_member(cx->residable, cx->rinfono);
+			if (bms_is_member(cx->rinfono, cx->forceresid))
+			{
+				cx->residual = lappend(cx->residual, rinfo->clause);
+				continue;
+			}
+		}
 		lion_count_path_snapshot(cx, &snap);
 
 		/* a clause of an expression column is one of a column (§41) */
@@ -1818,9 +1910,19 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 		else
 			answered = lion_count_path_where_leaf(cx, rinfo, clause);
+		/*
+		 * ... on a column no lion index covers, where it may be residual
+		 * (below) rather than decline the query when the indexes are
+		 * matched.  Over a partitioned table an OR is left as answered: its
+		 * arms may be what the partitions' bounds refute or imply, which
+		 * narrows it to clauses their indexes answer (DESIGN.md §16, "OR
+		 * arms the partition bounds refute"), and where they cannot, the
+		 * partitions ask for it to be residual (lion_collect_targets()).
+		 */
 		if (answered &&
-			((lion_enable_count_residual && !cx->partitioned &&
-			  cx->fj == NULL) || cx->cells) &&
+			((lion_enable_count_residual && cx->fj == NULL &&
+			  !(cx->partitioned && IsA(clause, BoolExpr) &&
+				((BoolExpr *) clause)->boolop == OR_EXPR)) || cx->cells) &&
 			!lion_where_indexed(cx, startlen))
 			answered = false;
 		if (answered)
@@ -1852,12 +1954,37 @@ lion_count_path_where(LionCountPathBuild *cx)
 		}
 
 		/*
-		 * No posting set answers the clause.  On a plain table it may be
-		 * RESIDUAL (DESIGN.md §10, "Residual clauses"): tested on the heap
-		 * tuple of each row the other clauses select, whatever of it was
-		 * taken already (the first arms of an OR) undone.  Whether the
-		 * query may then be counted at all is lion_count_path_strategy()'s
-		 * to say, and whether it should, the price's.
+		 * No posting set answers the clause.  Over a partitioned table
+		 * whose every partition's bounds imply it, no row counted can fail
+		 * it, and it is left out of the plan altogether (DESIGN.md §16,
+		 * "Clauses the partition bounds imply").  Whatever of it was taken
+		 * already goes too, all of it: the first arms of an OR, and an OR
+		 * the posting sets answer but for being one complement OR too many,
+		 * whose entry in `ors` would otherwise make the clauses after it its
+		 * arms.
+		 */
+		if (cx->partitioned &&
+			lion_implied_everywhere(root, input_rel, input_rel,
+									(Node *) rinfo->clause))
+		{
+			List	   *implied =
+				lappend(cx->impliedtexts,
+						makeString(lion_deparse_rel_clause(root, rti,
+														   (Node *) rinfo->clause)));
+
+			lion_count_path_restore(cx, &snap);
+			cx->impliedtexts = implied;
+			continue;
+		}
+
+		/*
+		 * Otherwise it may be RESIDUAL (DESIGN.md §10, "Residual clauses"):
+		 * tested on the heap tuple of each row the other clauses select -
+		 * of the table, or of each partition whose bounds do not imply it
+		 * (§16) - whatever of it was taken already (the first arms of an
+		 * OR) undone.  Whether the query may then be counted at all is
+		 * lion_count_path_strategy()'s to say, and whether it should, the
+		 * price's.
 		 */
 		if (lion_residual_ok(cx, rinfo))
 		{
@@ -1868,31 +1995,9 @@ lion_count_path_where(LionCountPathBuild *cx)
 			continue;
 		}
 
-		/*
-		 * Otherwise that declines the query - unless every partition it
-		 * counts has bounds that imply the clause, when no row it counts can
-		 * fail it, and it is left out.  Whatever of it was taken already
-		 * goes too, all of it: the first arms of an OR, and an OR the
-		 * posting sets answer but for being one complement OR too many,
-		 * whose entry in `ors` would otherwise make the clauses after it its
-		 * arms.
-		 */
-		if (!cx->partitioned ||
-			!lion_implied_everywhere(root, input_rel, input_rel,
-									 (Node *) rinfo->clause))
-		{
-			lion_count_path_snapshot_free(&snap);
-			return false;
-		}
-		{
-			List	   *implied =
-				lappend(cx->impliedtexts,
-						makeString(lion_deparse_rel_clause(root, rti,
-														   (Node *) rinfo->clause)));
-
-			lion_count_path_restore(cx, &snap);
-			cx->impliedtexts = implied;
-		}
+		/* ... and otherwise it declines the query */
+		lion_count_path_snapshot_free(&snap);
+		return false;
 	}
 
 	/* every phase after this one reads the ORs by the runs they name */
@@ -3070,9 +3175,11 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	 * ... and they have to be few enough that fetching them one at a time
 	 * beats reading the table in order (LION_RESID_MAX_SHARE), whatever the
 	 * price of each says: a sequential scan reads a page's rows together.
+	 * A partitioned table is asked this of each partition that tests them,
+	 * once the partitions are known (lion_count_path_targets()).
 	 */
-	if (cx->residual != NIL &&
-		lion_residual_rows(root, input_rel, cx->residual) >
+	if (cx->residual != NIL && !cx->partitioned &&
+		lion_residual_rows(root, input_rel, input_rel, cx->residual) >
 		LION_RESID_MAX_SHARE * Max(input_rel->tuples, 1.0))
 		return false;
 
@@ -3265,6 +3372,11 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	cx->imply.driven = (ndrive > 0);
 	cx->imply.skipped = cx->impliedtexts;
 	cx->imply.ors = cx->ors;
+	cx->imply.residual = cx->residual;
+	cx->imply.residable = cx->residable;
+	cx->imply.wantresid = NULL;
+	cx->imply.wanted = false;
+	cx->imply.hard = false;
 	if (!lion_collect_targets(root, input_rel, drive, ndrive, cx->whereattnos,
 							 cx->clauseinfos,
 							 cx->partitioned ? &cx->imply : NULL,
@@ -3272,6 +3384,35 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		return false;
 	if (cx->targets == NIL)
 		return false;			/* everything was pruned: leave it to the planner */
+
+	/*
+	 * The residual clauses' rows have to be few enough to fetch one at a
+	 * time (LION_RESID_MAX_SHARE), as a table's have
+	 * (lion_count_path_strategy()): over the partitions that test them,
+	 * taken together - a sub-partition of the one kind the WHERE selects
+	 * fetches every row of its own, and the ordinary plan reads it in
+	 * order, but that plan is the whole table's, and the question is of
+	 * the whole.  Each partition's rows are its own estimate.
+	 */
+	if (cx->residual != NIL && cx->partitioned)
+	{
+		ListCell   *lc;
+		double		rows = 0.0;
+		double		tuples = 0.0;
+
+		foreach(lc, cx->targets)
+		{
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+			List	   *kept = lion_target_residual(cx->residual, t);
+
+			if (kept == NIL)
+				continue;
+			rows += lion_residual_rows(root, input_rel, t->rel, kept);
+			tuples += Max(t->rel->tuples, 1.0);
+		}
+		if (rows > LION_RESID_MAX_SHARE * tuples)
+			return false;
+	}
 
 	/*
 	 * Planned with a partial index (DESIGN.md §45): every row the count can
@@ -4569,15 +4710,35 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	}
 	list_free(walksave.clauses);
 
-	/* the residual clauses' test of each row the others select (§10) */
+	/*
+	 * The residual clauses' test of each row the others select (§10): of
+	 * the table's, or of each partition's that tests them (§16, "Residual
+	 * clauses over a partitioned table"), each priced as its own heap.
+	 */
 	if (cx->residual != NIL)
 	{
 		/* ... once per run beside filtered counts, the WHERE's rows each */
-		Cost		resid = lion_cost_residual(root, input_rel, cx->residual,
-											   (1 + cx->nfilter) *
-											   ((cx->topkn > 0) ?
-												(double) cx->topkcand :
-												cx->numgroups));
+		double		counts = (1 + cx->nfilter) *
+			((cx->topkn > 0) ? (double) cx->topkcand : cx->numgroups);
+		Cost		resid = 0.0;
+
+		if (!cx->partitioned)
+			resid = lion_cost_residual(root, input_rel, input_rel,
+									   cx->residual, counts);
+		else
+		{
+			ListCell   *lc;
+
+			foreach(lc, cx->targets)
+			{
+				LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+				List	   *kept = lion_target_residual(cx->residual, t);
+
+				if (kept != NIL)
+					resid += lion_cost_residual(root, input_rel, t->rel, kept,
+												counts);
+			}
+		}
 
 		cpath->path.total_cost += resid;
 		if (cpath->path.startup_cost > 0)
@@ -4601,8 +4762,16 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 		double		reads = rangeprice.reads;
 
 		if (cx->residual != NIL)
-			reads += lion_residual_pages(root, input_rel, cx->residual,
-										 (1 + cx->nfilter) * cx->numgroups);
+		{
+			LionCountTarget *t = (LionCountTarget *) linitial(cx->targets);
+			List	   *kept = cx->partitioned ?
+				lion_target_residual(cx->residual, t) : cx->residual;
+
+			if (kept != NIL)
+				reads += lion_residual_pages(root, input_rel, t->rel, kept,
+											 (1 + cx->nfilter) *
+											 cx->numgroups);
+		}
 		lion_units_bitmap_cold(&units, cpath->path.total_cost, reads);
 	}
 
@@ -5418,46 +5587,49 @@ lion_try_distinct_path(PlannerInfo *root, RelOptInfo *input_rel,
  * The rest of lion_try_count_path(), inside the scope of the relation's
  * expression columns.
  */
-static void
-lion_try_count_path_scoped(LionCountPathBuild *cxp)
+/*
+ * One attempt at the path, phase by phase: false where a phase declines it.
+ * Over a partitioned table an attempt may decline at the partitions, where
+ * one can neither answer a restriction nor leave it out, and ask for it to
+ * be residual instead (cx->imply.wantresid; DESIGN.md §16, "Residual
+ * clauses over a partitioned table"): the caller's to try once more.
+ */
+static bool
+lion_try_count_path_once(LionCountPathBuild *cx)
 {
-	LionCountPathBuild cx = *cxp;
 	CustomPath *cpath;
 
-	/* a GROUP BY of expressions, or a WHERE over them, counted by cells */
-	lion_try_count_cells(cxp);
-
-	if (!lion_count_path_group_by(&cx))
-		return;
-	if (!lion_count_path_where(&cx))
-		return;
-	if (!lion_count_path_fkjoin(&cx))
-		return;
-	if (!lion_count_path_having(&cx))
-		return;
-	if (!lion_count_path_distinct(&cx))
-		return;
-	if (!lion_count_path_countcol(&cx))
-		return;
-	if (!lion_count_path_outputs(&cx))
-		return;
-	if (!lion_count_path_strategy(&cx))
-		return;
-	if (!lion_count_path_filters(&cx))
-		return;
+	if (!lion_count_path_group_by(cx))
+		return false;
+	if (!lion_count_path_where(cx))
+		return false;
+	if (!lion_count_path_fkjoin(cx))
+		return false;
+	if (!lion_count_path_having(cx))
+		return false;
+	if (!lion_count_path_distinct(cx))
+		return false;
+	if (!lion_count_path_countcol(cx))
+		return false;
+	if (!lion_count_path_outputs(cx))
+		return false;
+	if (!lion_count_path_strategy(cx))
+		return false;
+	if (!lion_count_path_filters(cx))
+		return false;
 	/* §37's aggregates beside a sum over every row, and nothing else */
-	if (cx.wattnos != NIL && !cx.sumall)
-		return;
-	if (!lion_count_path_targets(&cx))
-		return;
+	if (cx->wattnos != NIL && !cx->sumall)
+		return false;
+	if (!lion_count_path_targets(cx))
+		return false;
 
-	lion_count_path_estimate(&cx);
-	lion_count_path_topk(&cx);
-	lion_count_path_fill(&cx);
-	if (!lion_count_path_anti(&cx))
-		return;
-	cpath = lion_count_path_make(&cx);
-	lion_count_path_add(&cx, cpath);
+	lion_count_path_estimate(cx);
+	lion_count_path_topk(cx);
+	lion_count_path_fill(cx);
+	if (!lion_count_path_anti(cx))
+		return false;
+	cpath = lion_count_path_make(cx);
+	lion_count_path_add(cx, cpath);
 
 	/*
 	 * Two columns are the nested loop of DESIGN.md §20, which ANDs the sets of
@@ -5465,12 +5637,44 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	 * once whatever the number of pairs: both are priced, and add_path()
 	 * keeps the cheaper.
 	 */
-	if (lion_count_path_decodable(&cx))
+	if (lion_count_path_decodable(cx))
 	{
-		cx.decode = true;
-		lion_count_path_estimate(&cx);
-		lion_count_path_fill(&cx);
-		cpath = lion_count_path_make(&cx);
-		lion_count_path_add(&cx, cpath);
+		cx->decode = true;
+		lion_count_path_estimate(cx);
+		lion_count_path_fill(cx);
+		cpath = lion_count_path_make(cx);
+		lion_count_path_add(cx, cpath);
+	}
+	return true;
+}
+
+static void
+lion_try_count_path_scoped(LionCountPathBuild *cxp)
+{
+	LionCountPathBuild cx = *cxp;
+
+	/* a GROUP BY of expressions, or a WHERE over them, counted by cells */
+	lion_try_count_cells(cxp);
+
+	if (lion_try_count_path_once(&cx))
+		return;
+
+	/*
+	 * Over a partitioned table, a restriction that some partition could
+	 * neither answer from an index nor leave out by its bounds declined the
+	 * attempt; where it could be tested on the rows instead, the partitions
+	 * asked for that (DESIGN.md §16, "Residual clauses over a partitioned
+	 * table"), and the build is made once more, from the start, with every
+	 * restriction they asked for residual.  Once: the second attempt's
+	 * partitions have an index for every clause left, or leave it out, as
+	 * the first attempt established.
+	 */
+	if (cx.partitioned && cx.forceresid == NULL && !cx.imply.hard &&
+		cx.imply.wantresid != NULL)
+	{
+		LionCountPathBuild again = *cxp;
+
+		again.forceresid = cx.imply.wantresid;
+		(void) lion_try_count_path_once(&again);
 	}
 }

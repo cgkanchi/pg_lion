@@ -470,7 +470,9 @@ VACUUM (FREEZE, ANALYZE) lion_ne_p;
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_p WHERE k = 2 AND cardinality(tags) > 0$$);
 SELECT lion_ne($$SELECT k, count(*) FROM lion_ne_p WHERE tags = '{}' GROUP BY k$$);
 SELECT lion_ne($$SELECT count(*) FROM lion_ne_p WHERE k = 2 AND array_length(tags, 1) IS NULL$$);
--- a partition whose tags no lion index holds answers nothing
+-- a partition whose tags no lion index holds tests the clause on its rows,
+-- and so do the others (DESIGN.md §16, "Residual clauses over a partitioned
+-- table")
 CREATE TABLE lion_ne_p3 PARTITION OF lion_ne_p FOR VALUES FROM (4000) TO (5000);
 CREATE INDEX ON lion_ne_p3 USING lion (k);
 INSERT INTO lion_ne_p SELECT i, i % 6, '{}' FROM generate_series(4000, 4099) i;

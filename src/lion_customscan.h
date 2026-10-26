@@ -1223,7 +1223,10 @@ typedef struct LionVColScope
  *		table (DESIGN.md §16): heap Oid, the outer and inner group index Oids
  *		(InvalidOid if none), then one index Oid per WHERE clause - or
  *		InvalidOid for a clause the partition's bounds imply, which it leaves
- *		out (§16, "Clauses the partition bounds imply")
+ *		out (§16, "Clauses the partition bounds imply") - then one Oid per
+ *		residual clause (member 21): 1 where the partition's bounds imply
+ *		it, and it tests none of its rows for it, else 0 (§16, "Residual
+ *		clauses over a partitioned table")
  *	6	OidList: the operator of each WHERE clause (InvalidOid for a null
  *		test), which is what EXPLAIN prints a multi-key clause with
  *	7	List of IntList, one per OR restriction (DESIGN.md §19):
@@ -1500,6 +1503,12 @@ typedef struct LionVColScope
  * the LION_TL_ANTI columns: the anti join over a small inner side (DESIGN.md
  * §27), whose matched rows an older build would have counted.
  *
+ * Shape 30 moved no member but gave each partition's OidList in the PARTS
+ * member (5) one Oid per residual clause after the clause indexes: residual
+ * clauses over a partitioned table (DESIGN.md §16, "Residual clauses over a
+ * partitioned table"), which an older build refused to plan and would have
+ * read as too many Oids.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1512,7 +1521,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491d
+#define LION_PRIV_MAGIC		0x5242491e
 #define LION_PRIV_NMEMBERS	26
 
 /*
@@ -1709,6 +1718,19 @@ typedef struct LionPartState
 	Relation	groupidx2;
 	Relation   *clauseidx;		/* one per WHERE clause */
 	Relation	fgidx;
+
+	/*
+	 * The residual clauses this partition's bounds imply (DESIGN.md §16,
+	 * "Residual clauses over a partitioned table"), one flag per residual
+	 * clause of the plan, and the qual of the ones it keeps: NULL until its
+	 * first turn (lion_part_residual()), the node's own where it keeps them
+	 * all, and resid NULL with residinit set where it keeps none.
+	 */
+	int			nresid;
+	bool	   *residdrop;
+	bool		residinit;
+	ExprState  *resid;
+	List	   *residexprs;
 } LionPartState;
 
 /*
@@ -2405,6 +2427,12 @@ typedef struct LionCountPrivPart
 	Oid			groupidxoid2;
 	Oid		   *clauseidxoid;	/* nclause; InvalidOid for a clause the
 								 * partition's bounds imply */
+	int			nresid;			/* the residual clauses (DESIGN.md §10), and
+								 * which of them this partition's bounds
+								 * imply, so that it tests none of its rows
+								 * for them (§16, "Residual clauses over a
+								 * partitioned table") */
+	bool	   *residdrop;
 } LionCountPrivPart;
 
 /* The FK-side join (DESIGN.md §27): JOIN */
@@ -3071,12 +3099,16 @@ typedef struct LionCountScanState
 	 * relation counted.  Evaluated in residecxt, reset after each row.
 	 */
 	ExprState  *resid;
+	ExprState  *residall;		/* ... over every clause: the plain table's,
+								 * and a partition's that leaves none out */
 	List	   *residexprs;		/* ... the clauses, for EXPLAIN */
 	TupleTableSlot *residslot;
 	ExprContext *residecxt;
 	int			nresidcol;
 	int		   *residslotcol;
-	AttrNumber *residattno;
+	AttrNumber *residattno;		/* the PARENT's numbering (DESIGN.md §16) */
+	AttrNumber *residheapattno; /* ... and the relation counted's, set when
+								 * it is made so (lion_open_relation()) */
 
 	/*
 	 * Whether the statement leaves the relation being counted alone
@@ -3619,6 +3651,12 @@ typedef struct LionCountTarget
 												 * (LionDriveInfo.bound), with
 												 * no index in driveidx; NULL
 												 * otherwise */
+	bool	   *residdrop;		/* one per residual clause (DESIGN.md §10):
+								 * this partition's bounds imply it, and no
+								 * row of it is tested for it (§16, "Residual
+								 * clauses over a partitioned table"); NULL
+								 * when none is */
+	int			nresiddrop;
 } LionCountTarget;
 
 /*
@@ -3677,6 +3715,23 @@ typedef struct LionImply
 								 * that every partition implies, which are no
 								 * clauses of the plan (LION_PRIV_IMPLIED) */
 	List	   *ors;			/* the plan's LION_PRIV_ORS */
+
+	/*
+	 * The residual clauses (DESIGN.md §10), which each leaf tests on its
+	 * rows but for the ones its bounds imply or refute (§16, "Residual
+	 * clauses over a partitioned table"); and, among the restrictions, the
+	 * ones that could be residual instead of answered (`residable`, by
+	 * position in `clauses`) - which lion_leaf_drops() asks for in wantresid
+	 * where a leaf can neither answer one nor leave it out, rather than
+	 * declining the query, for the build to try once more with them
+	 * residual.  hard: a leaf declined for another reason, so no second
+	 * attempt would help.
+	 */
+	List	   *residual;
+	Bitmapset  *residable;
+	Bitmapset  *wantresid;
+	bool		wanted;			/* the last leaf, or tree, declined so */
+	bool		hard;
 } LionImply;
 
 /*
@@ -3880,6 +3935,10 @@ extern Var *lion_child_var(PlannerInfo *root, Index childrelid,
 extern List *lion_leaf_partition_qual(Relation relation, Index relid);
 extern char *lion_deparse_rel_clause(PlannerInfo *root, Index rti,
 									 Node *clause);
+extern Bitmapset *lion_partition_key_attnos(PlannerInfo *root,
+											RelOptInfo *toprel);
+extern List *lion_target_residual(List *residual,
+								  const LionCountTarget *t);
 extern bool lion_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel,
 									RelOptInfo *rel, Node *clause);
 extern bool lion_rinfos_implied_everywhere(PlannerInfo *root,
@@ -3889,7 +3948,7 @@ extern bool lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
 extern bool lion_collect_targets(PlannerInfo *root, RelOptInfo *rel,
 								 const LionDriveInfo *drive, int ndrive,
 								 List *whereattnos, List *clauseinfos,
-								 const LionImply *imply, List **targets);
+								 LionImply *imply, List **targets);
 extern Bitmapset *lion_notnullattnums(PlannerInfo *root, RelOptInfo *rel);
 
 /* lion_plan_partial.c (DESIGN.md §45) */
@@ -4169,14 +4228,16 @@ extern Cost lion_cost_posfilter(PlannerInfo *root, RelOptInfo *rel,
 								List *whereidx, List *wherecol,
 								List *whereclauses, List *wherekinds,
 								List *ors, double cand, double counts);
-extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *rel,
-								 List *residual);
+extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *toprel,
+								 RelOptInfo *rel, List *residual);
 extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,
 							  IndexOptInfo *idx);
-extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *rel,
-							   List *residual, double counts);
-extern double lion_residual_pages(PlannerInfo *root, RelOptInfo *rel,
-								  List *residual, double counts);
+extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *toprel,
+							   RelOptInfo *rel, List *residual,
+							   double counts);
+extern double lion_residual_pages(PlannerInfo *root, RelOptInfo *toprel,
+								  RelOptInfo *rel, List *residual,
+								  double counts);
 
 /*
  * The largest share of a table the rows that residual clauses are tested on
@@ -4221,13 +4282,13 @@ extern void lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 								 List *whereclauses, List *whereconsts,
 								 List *wherekinds, List *whereopnos,
 								 List *whereinor, List *ors,
-								 const LionImply *imply);
+								 LionImply *imply);
 extern void lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 								   const LionFkJoin *fj, List *whereattnos,
 								   List *clauseinfos, List *whereclauses,
 								   List *whereconsts, List *wherekinds,
 								   List *whereopnos, List *whereinor,
-								   List *ors, const LionImply *imply);
+								   List *ors, LionImply *imply);
 
 /* lion_plan_count.c */
 extern void lion_try_count_path(PlannerInfo *root, RelOptInfo *input_rel,
