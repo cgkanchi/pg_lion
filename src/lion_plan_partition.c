@@ -486,6 +486,52 @@ lion_top_var(PlannerInfo *root, Var *var)
 }
 
 /*
+ * expr, an entry of a leaf's target reached through its parent, as the
+ * parent numbers it: a column through lion_top_var(); the leaf's whole row
+ * converted to the parent's row type (the ConvertRowtypeExpr
+ * adjust_appendrel_attrs() makes of a whole-row Var of the parent, nested
+ * once a level where it is not collapsed) as the parent's whole-row Var,
+ * which is what the query's target holds and what the conversion the leaf's
+ * scan evaluates yields.  Anything else is returned as it is.
+ */
+Expr *
+lion_top_expr(PlannerInfo *root, Expr *expr)
+{
+	Expr	   *inner = expr;
+	Oid			rowtype = InvalidOid;
+
+	if (IsA(expr, Var))
+		return (Expr *) lion_top_var(root, (Var *) expr);
+	while (inner != NULL && IsA(inner, ConvertRowtypeExpr))
+	{
+		if (!OidIsValid(rowtype))
+			rowtype = ((ConvertRowtypeExpr *) inner)->resulttype;
+		inner = ((ConvertRowtypeExpr *) inner)->arg;
+	}
+	if (OidIsValid(rowtype) && inner != NULL && IsA(inner, Var) &&
+		((Var *) inner)->varattno == 0 && ((Var *) inner)->varlevelsup == 0)
+	{
+		Var		   *var = (Var *) inner;
+		Index		relid = (Index) var->varno;
+		RelOptInfo *toprel;
+		Var		   *out;
+
+		if (relid == 0 || relid >= (Index) root->simple_rel_array_size ||
+			root->simple_rel_array[relid] == NULL)
+			return expr;
+		toprel = lion_top_rel(root, root->simple_rel_array[relid]);
+		if (toprel == NULL || toprel->relid == relid)
+			return expr;
+		out = (Var *) copyObject(var);
+		out->varno = (int) toprel->relid;
+		out->varnosyn = toprel->relid;
+		out->vartype = rowtype;
+		return (Expr *) out;
+	}
+	return expr;
+}
+
+/*
  * The columns of partitioned table toprel that it, or a sub-partitioned
  * child under it that the planner keeps, partitions by - the columns of the
  * key expressions at every level, in toprel's numbering, as a Bitmapset of

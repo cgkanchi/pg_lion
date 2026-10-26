@@ -3945,6 +3945,7 @@ extern RelOptInfo *lion_top_rel(PlannerInfo *root, RelOptInfo *rel);
 extern Node *lion_leaf_expr(PlannerInfo *root, Node *expr, RelOptInfo *leaf,
 							RelOptInfo *top);
 extern Var *lion_top_var(PlannerInfo *root, Var *var);
+extern Expr *lion_top_expr(PlannerInfo *root, Expr *expr);
 extern List *lion_target_residual(List *residual,
 								  const LionCountTarget *t);
 extern bool lion_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel,

@@ -2379,13 +2379,13 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 
 			/*
 			 * A side that scans the one leaf a partitioned parent is pruned
-			 * to outputs the leaf's columns; the join outputs them as the
-			 * parent the query names numbers them (lion_top_var(),
-			 * DESIGN.md §16), which is what the target list above and the
-			 * nodes over it refer to.  The values are the same, by position.
+			 * to outputs the leaf's columns, and its whole row converted to
+			 * the parent's row type; the join outputs them as the parent the
+			 * query names numbers them (lion_top_expr(), DESIGN.md §16),
+			 * which is what the target list above and the nodes over it
+			 * refer to.  The values are the same, by position.
 			 */
-			if (IsA(out, Var))
-				out = (Expr *) lion_top_var(root, (Var *) out);
+			out = lion_top_expr(root, out);
 			sctlist = lappend(sctlist,
 							  makeTargetEntry(out, resno++, NULL, false));
 		}

@@ -6065,11 +6065,15 @@ asking it rather than by a rule of its own:
 - **`lion_leaf_expr(root, expr, leaf, top)`**: an expression written over the parent's columns, as
   the leaf numbers them (`adjust_appendrel_attrs_multilevel()`): the join's key and the descent's
   qual, which the leaf's scan evaluates.
-- **`lion_top_var(root, var)`**: a leaf's Var as the topmost parent numbers it (`lion_top_rel()`,
-  `lion_parent_attno()`): what the node outputs. The query's target and the nodes above refer to
-  the parent's Vars, and `set_customscan_references()` resolves a `custom_scan_tlist` by varno and
-  varattno. A leaf attached with columns dropped numbers them differently from the parent, which
-  is what the translation is for.
+- **`lion_top_var(root, var)`**, **`lion_top_expr(root, expr)`**: a leaf's Var as the topmost
+  parent numbers it (`lion_top_rel()`, `lion_parent_attno()`): what the node outputs. The query's
+  target and the nodes above refer to the parent's Vars, and `set_customscan_references()`
+  resolves a `custom_scan_tlist` by varno and varattno. A leaf attached with columns dropped
+  numbers them differently from the parent, which is what the translation is for. A whole-row
+  reference to the parent (`SELECT f`, `row_to_json(f)`) is a ConvertRowtypeExpr over the leaf's
+  whole row in the leaf's target (`adjust_appendrel_attrs()`), which the leaf's scan evaluates to
+  a row of the parent's type; `lion_top_expr()` writes it as the parent's whole-row Var. Left as
+  the conversion, setrefs.c finds no entry for the parent's Var and fails the plan.
 - **`lion_single_leaf_path(path)`**: the one-child Append seen through to the leaf's path, for
   what inspects a plan's side (the walk a loop is over, `oj_loop_over_walk()`).
 
@@ -6097,10 +6101,10 @@ is core's.
 by `grp`, each sub-partitioned by LIST on `ver`, the leaf the queries hit attached with two dropped
 columns; the dimension LIST by `kind`, each leaf with its own unique B-tree on the key - with a key
 set from another reference to the dimension's parent, a page further in, the whole join, every
-column of the fact; declines a parent several leaves are left of on either side and one pruned to
-nothing; plans the same node with the leaves named; and gets LionOrdered on the fact's parent and
-LionBtreeScan as a nested loop's probe of the dimension's, every answer compared with the ordinary
-plan's row by row.
+column of the fact, either parent's whole row; declines a parent several leaves are left of on
+either side and one pruned to nothing; plans the same node with the leaves named; and gets
+LionOrdered on the fact's parent and LionBtreeScan as a nested loop's probe of the dimension's,
+every answer compared with the ordinary plan's row by row.
 
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
