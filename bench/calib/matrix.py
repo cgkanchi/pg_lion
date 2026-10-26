@@ -493,8 +493,12 @@ def run(args):
             for n in ('ordjoin', 'probe'):
                 if n in scales:
                     scales[n] = float('nan')
-        elif 'lion' in arms:
-            arms['lion'] = arm(off(*SCANS), off(*JOINS), off('enable_tidscan'), extra)
+        else:
+            # ordjoin and probe force at a margin such a build rejects
+            arms.pop('ordjoin', None)
+            arms.pop('probe', None)
+            if 'lion' in arms:
+                arms['lion'] = arm(off(*SCANS), off(*JOINS), off('enable_tidscan'), extra)
         planned = plan_all(psql, cat, base, q, arms, scales)
         plans = {}
         info = {}
