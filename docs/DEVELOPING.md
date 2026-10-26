@@ -124,6 +124,23 @@ belongs to someone else or is open to others.  The cluster runs with `wal_level 
 that index builds and the write paths of indexes created in the same transaction are WAL-logged in
 the suite as they are in production.
 
+## Calibrating the cost model
+
+Two scripts in `bench/calib/`, both Python's standard library and `psql`, best run on a release
+build with nothing else on the machine:
+
+    python3 bench/calib/ops.py --setup && python3 bench/calib/ops.py   # lion's operations against core's
+    python3 bench/calib/matrix.py --setup-only && python3 bench/calib/matrix.py --out run.json   # plan choices
+
+`ops.py` times each lion-only operation the planner prices against the core operation it stands in
+for, on the same build, and prices it at that operation's own rate - its time over core's price of
+it, in `cpu_operator_cost`s - printed beside the setting that charges it (DESIGN.md §49,
+"Calibration"): a nested loop's B-tree probe against core's Index Scan, apportioned between
+`pg_lion.probe_rescan_cost` and `pg_lion.probe_entry_cost`. It prints a sequential scan's rate
+too, the slope of its time over its quals, for comparison. `matrix.py` plans and times a fixed set of queries under
+every arm and reports the planner's mispicks (DESIGN.md §39, "The matrix"); `--set
+pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own work alone.
+
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
