@@ -466,14 +466,6 @@ lion_verify_keycmp(LionState *col, Datum key, const char *raw)
 										   lion_fetch_key(col, raw)));
 }
 
-/* What the heap says of the row a code names (lion_verify_row_state()). */
-typedef enum LionVerifyRow
-{
-	LION_VERIFY_ROW_DEAD,		/* dead to every transaction there is */
-	LION_VERIFY_ROW_INSERTING,	/* the transaction that inserted it runs on */
-	LION_VERIFY_ROW_INSERTED	/* its insert committed */
-} LionVerifyRow;
-
 /*
  * The heap row at code: DEAD - an unused or dead line pointer, or a tuple
  * HeapTupleSatisfiesVacuum() calls dead against the oldest non-removable xid,
@@ -486,7 +478,7 @@ typedef enum LionVerifyRow
  * deleted it too; either is sound, as nothing of that transaction's is
  * between the two steps while the check runs.
  */
-static LionVerifyRow
+LionVerifyRow
 lion_verify_row_state(LionVerifyState *vs, uint64 code)
 {
 	ItemPointerData tid;

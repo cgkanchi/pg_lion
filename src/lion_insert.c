@@ -1831,7 +1831,7 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
  * included - a slice of a dense column is bitsets, so most of its inserts
  * are a bit set in place.
  */
-static void
+void
 lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
 					  int pos, uint32 ckey, uint16 lo)
 {
