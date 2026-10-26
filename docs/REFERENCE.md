@@ -863,9 +863,11 @@ working around a bad choice:
   Sets Tested On: <index>` in `EXPLAIN`). With neither, the walk reads each row to test its key,
   and the planner charges it the pages of those reads.
   It needs an inner join of two tables on one equality whose dimension side has a unique
-  one-column B-tree and no other clause between them; heap tables or materialized views, not
-  partitioned, without row-level security or `TABLESAMPLE`; a `SELECT` without `FOR UPDATE`/`FOR
-  SHARE`; and a B-tree of the fact that gives the `ORDER BY` at least its first column. It is
+  one-column B-tree and no other clause between them; heap tables or materialized views, or a
+  partitioned table of which plan-time pruning leaves exactly one partition, which the node runs
+  on (DESIGN.md §16, "A parent pruned to one leaf"), without row-level security or `TABLESAMPLE`; a `SELECT`
+  without `FOR UPDATE`/`FOR SHARE`; and a B-tree of the fact that gives the `ORDER BY` at least
+  its first column. It is
   never parallel and never the inner side of a parameterized nested loop. The fact's walk is
   index-only where its B-tree holds every column of the fact the query reads (`Ordered By: <index>
   (index only)`); the dimension's row is read from its heap once its entry has passed the

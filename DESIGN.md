@@ -6039,6 +6039,73 @@ more than half the rows to fetch of every partition and of the one sub-partition
 clause, and the switch; a dirty heap before and after VACUUM; and a LATERAL value in the clause,
 which rescans the node partition by partition.
 
+### A parent pruned to one leaf (2026-10-26)
+
+An application names the partitioned table, and plan-time pruning leaves it one leaf: every
+statement of the CPC replay (2026-10-26) names one `(customer_product_id, version)` pair of a table
+LIST-partitioned by the first and sub-partitioned by the second, 2,918 leaves. The nodes that scan
+one relation got the leaf: `set_rel_pathlist_hook` runs for each partition
+(`RELOPT_OTHER_MEMBER_REL`), LionOrdered and LionBtreeScan plan on it (§30.11, §40.10), and core's
+Append of that one child costs nothing (`create_append_path()` takes the child's cost and pathkeys)
+and is elided (`set_append_references()`), so the plan is the leaf's. The join nodes did not:
+`set_join_pathlist_hook` is called with the parent - `reloptkind` RELOPT_BASEREL, `rte->inh`, no
+`indexlist` of its own, its paths an Append - and `oj_side_ok()` refused it, so a query naming the
+parent got core's plan where the same query naming the leaf got LionOrderedSplit over
+LionOrderedJoin: 15 of the replay's discover_page statements, 1,278 s with 12 timeouts against 27 s.
+
+The gate is one, shared, in lion_plan_partition.c, so that a node supports a partitioned table by
+asking it rather than by a rule of its own:
+
+- **`lion_single_leaf(root, rel)`**: the one relation a path over rel reads. rel itself for a
+  table, a materialized view or a leaf reached through its parent; for a partitioned parent the
+  one live, non-dummy leaf through every level of sub-partitioning; NULL for a parent several
+  leaves are left of or none, an old-style inheritance parent (whose children need not share its
+  columns), or anything else. A node offered a relation asks this of it and plans its physical side
+  - indexes, statistics, scan - on the leaf.
+- **`lion_leaf_expr(root, expr, leaf, top)`**: an expression written over the parent's columns, as
+  the leaf numbers them (`adjust_appendrel_attrs_multilevel()`): the join's key and the descent's
+  qual, which the leaf's scan evaluates.
+- **`lion_top_var(root, var)`**, **`lion_top_expr(root, expr)`**: a leaf's Var as the topmost
+  parent numbers it (`lion_top_rel()`, `lion_parent_attno()`): what the node outputs. The query's
+  target and the nodes above refer to the parent's Vars, and `set_customscan_references()`
+  resolves a `custom_scan_tlist` by varno and varattno. A leaf attached with columns dropped
+  numbers them differently from the parent, which is what the translation is for. A whole-row
+  reference to the parent (`SELECT f`, `row_to_json(f)`) is a ConvertRowtypeExpr over the leaf's
+  whole row in the leaf's target (`adjust_appendrel_attrs()`), which the leaf's scan evaluates to
+  a row of the parent's type; `lion_top_expr()` writes it as the parent's whole-row Var. Left as
+  the conversion, setrefs.c finds no entry for the parent's Var and fails the plan.
+- **`lion_single_leaf_path(path)`**: the one-child Append seen through to the leaf's path, for
+  what inspects a plan's side (the walk a loop is over, `oj_loop_over_walk()`).
+
+LionOrderedJoin and LionOrderedSplit (§47, §48) take either side so. `oj_side_ok()` asks for the
+leaf and tests it (`lion_ordered_rel_ok()`, which accepts a member rel; the leaf's restrictions);
+`oj_key_join()` plans on the leaves - `OjJoin.fact` and `dim` are the leaves, the unique B-tree the
+dimension leaf's own, `fkvar`, `pkvar` and the descent's qual in the leaves' numbering - and keeps
+the relations the query names as `facttop` and `dimtop`, for what the join outputs
+(`oj_plan_path()` writes the `custom_scan_tlist` through `lion_top_var()`), for the competitor's
+walk (`oj_competitor()`) and for the split's test that its first sort key is the dimension's
+(`os_split_of()`). The executor is unchanged: it composes its slot from the child scans' by
+position, and the leaf's scan outputs its `reltarget`, the parent's translated, in the parent's
+order. Either side may be such a parent, or both, or a key set's table (§47.6: a key set is a
+scan of core's path, the Append included). Declined: a parent several leaves are left of - core's
+Append or MergeAppend over them, which the node would have to merge in order - or none, which is
+a dummy rel and core's empty answer. A clause on the partition key with a Param or a stable
+function is a filter of the leaf's scan as any other: run-time pruning could only remove the one
+leaf, and the clause tested on its rows gives the same answer.
+
+What LionCount does with a partitioned table (above) is a different thing: it counts every leaf
+the planner keeps, as one node. The join and the walks run on one leaf, and a parent with several
+is core's.
+
+`test/sql/ordjoin_partition.sql` runs the join and the split through both parents - the fact LIST
+by `grp`, each sub-partitioned by LIST on `ver`, the leaf the queries hit attached with two dropped
+columns; the dimension LIST by `kind`, each leaf with its own unique B-tree on the key - with a key
+set from another reference to the dimension's parent, a page further in, the whole join, every
+column of the fact, either parent's whole row; declines a parent several leaves are left of on
+either side and one pruned to nothing; plans the same node with the leaves named; and gets
+LionOrdered on the fact's parent and LionBtreeScan as a nested loop's probe of the dimension's,
+every answer compared with the ordinary plan's row by row.
+
 ## 17. Multi-key operator classes: arrays and tsvector (v1, implemented)
 
 GIN-style extraction so one row can contribute many keys: `array_ops` (DEFAULT FOR TYPE anyarray,
@@ -29660,11 +29727,13 @@ NOT EXISTS to other tables. Each side is a LionOrdered plan built for the join (
   A join with a second clause - `AND f.ver < d.kind` - is declined: the node tests nothing between
   the rows. Either table may be the fact; the hook is called for each orientation and each is tried.
 - **Each side** (`oj_side_ok()`, `lion_ordered_rel_ok()`). A table LionOrdered may scan (§30.1,
-  `lo_rel_ok()`): a heap table or a materialized view, not partitioned, no TABLESAMPLE, no security
-  quals or RLS, not the query's result relation, no LATERAL reference, not proven empty, under no
-  `old_snapshot_threshold`; of the heap AM. None of its restriction clauses is pseudoconstant -
-  core would gate the side's scan with a Result - or holds a SubPlan, whose plan EXPLAIN could not
-  show under the join; its target is its own plain columns. Neither side needs a lion clause: a
+  `lo_rel_ok()`): a heap table or a materialized view, or a partitioned table plan-time pruning
+  leaves one leaf of, which the node plans on (`lion_single_leaf()`, §16, "A parent pruned to one
+  leaf"); no TABLESAMPLE, no security quals or RLS, not the query's result relation, no LATERAL
+  reference, not proven empty, under no `old_snapshot_threshold`; of the heap AM. None of its
+  restriction clauses is pseudoconstant - core would gate the side's scan with a Result - or holds
+  a SubPlan, whose plan EXPLAIN could not show under the join; its target is its own plain columns.
+  Neither side needs a lion clause: a
   side without one is walked or probed with no set, every row it meets fetched and filtered. One of
   them has a set, or a key set filters; with neither, core's nested loop already is the plan.
 - **The order** (`lion_ordered_orders()`). The fact's ordered B-tree paths as §30.2 takes them -
@@ -30116,8 +30185,9 @@ index tuple, the rejected rows are not fetched and need no price.
 - **Key sets of another type**: a key column of a type other than the fact key's, or an equality
   whose two sides hash with different functions, is declined rather than cast.
 - **A semi join's inner side of several tables**, a key set by IN over a join: only one table.
-- **Parallel**, parameterized paths, partitioned tables, an outer join as the join itself, PHVs and
-  LATERAL references at the join: declined (§47.1).
+- **Parallel**, parameterized paths, a partitioned table several leaves are left of (one leaf:
+  §16, "A parent pruned to one leaf"), an outer join as the join itself, PHVs and LATERAL
+  references at the join: declined (§47.1).
 - **More than one dimension.** A second key join to another dimension is core's, above the node.
 - **A walk that fills slowly, at run time.** Not alone under the LIMIT the node is priced at its
   whole walk (§47.10), and alone a key set's keys are taken to be spread over it; nothing at run
