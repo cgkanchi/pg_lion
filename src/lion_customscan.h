@@ -264,6 +264,36 @@
 									 (kind) <= 0x60000000 + MaxAttrNumber)
 #define LION_TL_ANTI_RESNO(kind)	((AttrNumber) ((kind) - 0x60000000))
 
+/*
+ * An aggregate of a bit-sliced column answered from its slices (DESIGN.md
+ * §52): LION_TL_SAGG(j) is the j'th of them (LionSAgg).  Above the anti
+ * join's columns.
+ */
+#define LION_TL_SAGG(j)				(0x70000000 + (j))
+#define LION_TL_IS_SAGG(kind)		((kind) >= 0x70000000 && \
+									 (kind) < 0x70000000 + 0x10000)
+#define LION_TL_SAGG_NO(kind)		((kind) - 0x70000000)
+
+/* ... and what each one computes, as core's aggregate of the column's type */
+#define LION_SAGG_NONE		0
+#define LION_SAGG_COUNT		1	/* count(x): an int8 */
+#define LION_SAGG_SUM		2	/* sum(int2), sum(int4): an int8, wrapping */
+#define LION_SAGG_SUM8		3	/* sum(int8): a numeric */
+#define LION_SAGG_AVG		4	/* avg(int2), avg(int4): a numeric */
+#define LION_SAGG_AVG8		5	/* avg(int8): a numeric */
+#define LION_SAGG_MIN		6	/* min(x): the column's type */
+#define LION_SAGG_MAX		7	/* max(x) */
+#define LION_SAGG_MAXKIND	LION_SAGG_MAX
+
+/*
+ * What a sliced column's aggregates ask of its slices (DESIGN.md §52): every
+ * bit slice's count, for a sum or an average; each descent; E's count alone
+ * is what count(x) and every other needs.
+ */
+#define LION_SWANT_SUM		0x1
+#define LION_SWANT_MIN		0x2
+#define LION_SWANT_MAX		0x4
+
 /* ... and what each one computes */
 #define LION_WAGG_NONE		0
 #define LION_WAGG_SUM		1	/* sum(int2), sum(int4): an int8 */
@@ -1034,6 +1064,24 @@ typedef struct LionVColScope
 #define LION_DESCENT_COST		(lion_descent_cost * cpu_operator_cost)
 
 /*
+ * The counts of a sliced column's slices (DESIGN.md §52, "Cost"): a key of
+ * the collected WHERE their walk meets - its image made, the map asked, the
+ * cursors that stand there popped off and pushed back on their heap - each
+ * slice container read and counted there, and each step of a descent for a
+ * minimum or a maximum - the slice located and its count set up - beside the
+ * seeks and containers the step's count reads.  §52's measurements are where
+ * the defaults come from.
+ */
+#define LION_SLICE_KEY_COST		(lion_slice_key_cost * cpu_operator_cost)
+#define LION_SLICE_CONTAINER_COST (lion_slice_container_cost * cpu_operator_cost)
+#define LION_SLICE_STEP_COST	(lion_slice_step_cost * cpu_operator_cost)
+#define LION_SLICE_STEP_KEY_COST (lion_slice_step_key_cost * cpu_operator_cost)
+#define LION_SLICE_STEP_ROW_COST (lion_slice_step_row_cost * cpu_operator_cost)
+#define LION_SLICE_PAGE_COST	(lion_slice_page_cost * cpu_operator_cost)
+/* ... and the levels of a slice's posting tree a seek descends */
+#define LION_POSTREE_SEEK_LEVELS	2.0
+
+/*
  * A page of a lion index that a custom path reads while the index is
  * resident (lion_index_page_cost(), DESIGN.md §22, §39): a buffer hit,
  * pinned, locked and stepped through.  Measured on the release build (§10,
@@ -1366,7 +1414,13 @@ typedef struct LionVColScope
  *		custom_scan_tlist - the table's at LION_TL_RESID columns or the ones
  *		the target list prints, the inner side's at LION_TL_ANTI ones - and
  *		leaves the list two members long
- *	25	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
+ *	25	List, or empty: the aggregates of bit-sliced columns answered from
+ *		their slices (DESIGN.md §52): an IntList of the columns' attnums, an
+ *		OidList of the lion index whose slices each is read from and an
+ *		IntList of its key column there; lion_plan_custom_path() adds a List
+ *		of one IntList per aggregate - its LION_SAGG_* kind and the column's
+ *		position in those lists - whose results are LION_TL_SAGG columns
+ *	26	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
 #define LION_PRIV_VERSION	0
@@ -1394,7 +1448,8 @@ typedef struct LionVColScope
 #define LION_PRIV_PARTIAL	22
 #define LION_PRIV_CELLS		23
 #define LION_PRIV_ANTI		24
-#define LION_PRIV_TLKINDS	25
+#define LION_PRIV_SLICES	25
+#define LION_PRIV_TLKINDS	26
 
 /*
  * Shape of the list above: "RBI" and a shape version, and its length.  Shape
@@ -1509,6 +1564,11 @@ typedef struct LionVColScope
  * partitioned table"), which an older build refused to plan and would have
  * read as too many Oids.
  *
+ * Shape 31 added the SLICES member (25) in front of the target-list kinds,
+ * and the LION_TL_SAGG columns: sums, averages, counts, minima and maxima of
+ * bit-sliced columns from their slices (DESIGN.md §52), which an older build
+ * would have taken for counts.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1521,8 +1581,8 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491e
-#define LION_PRIV_NMEMBERS	26
+#define LION_PRIV_MAGIC		0x5242491f
+#define LION_PRIV_NMEMBERS	27
 
 /*
  * The anti join over a small inner side (LION_PRIV_ANTI): its scan keys at
@@ -2050,6 +2110,78 @@ typedef struct LionWaggState
 } LionWaggState;
 
 /*
+ * A bit-sliced column the aggregates of DESIGN.md §52 are taken over, what
+ * they ask of it (LION_SWANT_*), and its answers for the rows counted -
+ * |E ∧ F|, the sum of their values, their extremes' encodings.
+ */
+typedef struct LionSCol
+{
+	AttrNumber	attno;			/* the heap column */
+	Oid			idxoid;
+	AttrNumber	idxcol;			/* its key column in idxoid */
+	int			want;			/* LION_SWANT_*: what its aggregates ask */
+	Oid			typid;			/* the type it is sliced as */
+	int			nbits;
+	int64		count;			/* the rows with a value */
+#ifdef HAVE_INT128
+	int128		sum;			/* ... the sum of their values */
+#endif
+	uint64		minenc;			/* ... the smallest's and largest's */
+	uint64		maxenc;			/* encodings, when count > 0 */
+
+	/*
+	 * A GROUP BY's: E ∧ WHERE, collected once a relation, the first time a
+	 * group asks (c0done) - none (hasc0 false) where the column has no row
+	 * not NULL - and released with the WHERE (lion_slice_release()).
+	 */
+	bool		c0done;
+	bool		hasc0;
+	LionPostingSet c0;
+} LionSCol;
+
+typedef struct LionSAgg
+{
+	int			kind;			/* LION_SAGG_* */
+	int			col;			/* its column, in LionSliceState.col */
+	Datum		result;
+	bool		resnull;
+} LionSAgg;
+
+/*
+ * The aggregates of sliced columns from their slices (DESIGN.md §52): ncol
+ * columns, each counted against the WHERE collected with its existence
+ * slice, and nagg aggregates made of those counts.  needcount says the
+ * target list has counts besides, which the node makes as before.  The rest
+ * is what EXPLAIN ANALYZE reports, over every run: the slices located (and
+ * of those, none there), the counts, the slice containers the walks counted
+ * and those of them the plane kernel did - at how many keys - the descents'
+ * steps and their candidate sets collected, and the copies of E ∧ WHERE made.
+ */
+typedef struct LionSliceState
+{
+	int			ncol;
+	LionSCol   *col;
+	int			nagg;
+	LionSAgg   *agg;
+	bool		needcount;
+	MemoryContext cxt;			/* the results' */
+	MemoryContext relcxt;		/* a GROUP BY's copies of E ∧ WHERE */
+	int64		groups;			/* the groups answered */
+	int64		located;
+	int64		absent;
+	int64		counts;
+	int64		containers;
+	int64		kernelkeys;
+	int64		kernelplanes;
+	int64		steps;
+	int64		collects;
+	int64		copies;
+	int64		runs;
+	int64		tidsrechecked;	/* the counts' heap rechecks, TIDs */
+	int64		blocksrechecked;	/* ... and blocks */
+} LionSliceState;
+
+/*
  * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"): each
  * participant claims a range of container keys at a time (lion_key_ranges(),
  * the counter in the node's shared struct), collects the WHERE of that range
@@ -2498,6 +2630,21 @@ typedef struct LionCountPrivWAgg
 	Oid			collation;		/* ... and its collation */
 } LionCountPrivWAgg;
 
+/* A bit-sliced column aggregates are answered from (§52): SLICES' lists */
+typedef struct LionCountPrivSCol
+{
+	AttrNumber	attno;			/* the heap column */
+	Oid			idxoid;			/* the lion index whose slices it reads */
+	AttrNumber	idxcol;			/* ... the column's key column there */
+} LionCountPrivSCol;
+
+/* ... and one of those aggregates, from SLICES' fourth list (PLAN stage) */
+typedef struct LionCountPrivSAgg
+{
+	int			kind;			/* LION_SAGG_* */
+	int			col;			/* its column, in scol */
+} LionCountPrivSAgg;
+
 /*
  * Counts by cells (DESIGN.md §10, "Counts by cells"): CELLS's dimensions and
  * predicates.  A dimension is one column the predicates are of, and its
@@ -2702,6 +2849,11 @@ typedef struct LionCountPriv
 	bool		hasanti;		/* ANTI (§27, "The anti join over a small
 								 * inner side") */
 	LionCountPrivAnti anti;
+
+	int			nscol;			/* SLICES (§52), or 0 */
+	LionCountPrivSCol *scol;
+	int			nsagg;			/* PLAN stage only */
+	LionCountPrivSAgg *sagg;
 
 	int			ntl;			/* TLKINDS: PLAN stage only */
 	int		   *tlkind;
@@ -3018,6 +3170,9 @@ typedef struct LionCountScanState
 	Datum	   *gbkey;
 	bool	   *gbnull;
 	int64	   *gbcount;
+	Datum	  **gbsvalues;		/* each group's aggregates of sliced columns
+								 * (DESIGN.md §52), when the plan has any */
+	bool	  **gbsnull;
 	int			gbmax;
 	int			gbn;
 	int			gbpos;
@@ -3035,6 +3190,12 @@ typedef struct LionCountScanState
 	 * NULL when the plan has none (lion_st_wagg()).
 	 */
 	struct LionWaggState *wagg;
+
+	/*
+	 * The aggregates of sliced columns from their slices (DESIGN.md §52), or
+	 * NULL when the plan has none.
+	 */
+	struct LionSliceState *slice;
 
 	/*
 	 * A parallel GROUP BY (DESIGN.md §10, "A GROUP BY in parallel"), or NULL
@@ -3831,6 +3992,10 @@ extern bool lion_index_can_emit_value(IndexOptInfo *idx, AttrNumber col);
 extern bool lion_contains_param(Node *expr);
 extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   int *argwidth);
+extern int	lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
+							   Oid *argtype);
+extern IndexOptInfo *lion_find_sliced_index(RelOptInfo *rel, AttrNumber attno,
+											AttrNumber *colp, Oid *typid);
 extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
 									  int kind, Oid opno, Oid cmptype,
 									  StrategyNumber strategy,
@@ -4158,6 +4323,10 @@ extern void lion_target_lists(const LionCountTarget *t, List *whereclauses,
 							  List *wherekinds, List *ors, List **idx,
 							  List **col, List **clauses, List **kinds,
 							  List **tors, int *joinclause);
+extern void lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath,
+								 RelOptInfo *rel, List *idxs, List *cols,
+								 List *wants, double whererows,
+								 bool haswhere, bool counts, double ngroups);
 extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
 								RelOptInfo *rel, List *idxs, List *cols,
 								List *naggs, bool counts);
@@ -4386,6 +4555,17 @@ extern TupleTableSlot *lion_distinct_relation(LionCountScanState *st);
 extern void lion_wagg_run(LionCountScanState *st);
 extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 										   bool *exhausted);
+
+/* lion_exec_slice.c: the aggregates of sliced columns (DESIGN.md §52) */
+extern void lion_slice_run(LionCountScanState *st);
+extern void lion_slice_none(LionCountScanState *st);
+extern void lion_slice_group(LionCountScanState *st, int ngset,
+							 LionPostingSet *const *gsets);
+extern void lion_slice_keep(LionCountScanState *st, MemoryContext cxt,
+							Datum **values, bool **isnull);
+extern void lion_slice_put(LionCountScanState *st, const Datum *values,
+						   const bool *isnull);
+extern void lion_slice_release(LionCountScanState *st);
 extern void lion_decode_reset(LionCountScanState *st);
 extern bool lion_decode_fill(LionCountScanState *st, int c, bool restart);
 extern void lion_decode_caps(LionCountScanState *st);

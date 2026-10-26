@@ -1,0 +1,140 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_explain s1_begin s1_slices s2_begin s2_write s2_slices s1_slices s3_slices s2_commit s1_slices s3_slices s1_commit s1_slices
+step s1_explain: EXPLAIN (COSTS OFF)
+				  SELECT count(a), sum(a), min(a), max(a) FROM spd WHERE grp = 1;
+				  EXPLAIN (COSTS OFF)
+				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp;
+QUERY PLAN                                                                      
+--------------------------------------------------------------------------------
+Custom Scan (LionCount)                                                         
+  Lion Indexes: spd_grp (grp = 1)                                               
+  Aggregates From Slices: spd_v (a: every bit counted, min descent, max descent)
+(3 rows)
+
+QUERY PLAN                                                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------
+Custom Scan (LionCount)                                                                                                                      
+  Lion Indexes: spd_grp (grp)                                                                                                                
+  Group Key: grp                                                                                                                             
+  Aggregates From Slices: spd_v (a: every bit counted), spd_v (b: existence counted, min descent), spd_v (ts: existence counted, max descent)
+(4 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO spd VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL);
+				  UPDATE spd SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM spd WHERE id % 7 = 3;
+step s2_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s2_commit: COMMIT;
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+
+
+starting permutation: s2_begin s2_write s2_slices s3_slices s2_rollback s3_slices
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO spd VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL);
+				  UPDATE spd SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM spd WHERE id % 7 = 3;
+step s2_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s2_rollback: ROLLBACK;
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+
+starting permutation: s1_begin s1_slices s2_begin s2_write s2_commit s3_vacuum s1_slices s3_slices s1_commit s3_vacuum s3_slices
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO spd VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL);
+				  UPDATE spd SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM spd WHERE id % 7 = 3;
+step s2_commit: COMMIT;
+step s3_vacuum: VACUUM spd;
+step s1_slices: SELECT * FROM spd_both();
+same|lion                                                           
+----+---------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_vacuum: VACUUM spd;
+step s3_slices: SELECT * FROM spd_both();
+same|lion                                                                                           
+----+-----------------------------------------------------------------------------------------------
+t   |2059 3664 -2147483648 2147483647 | 3601 10701119038845 -9223372036854775808 9223372036854775807
+(1 row)
+

@@ -1357,6 +1357,13 @@ lion_count_runs(LionCountScanState *st, bool sum)
 			lion_locate_where(st);
 			n = lion_run_count(st, sum, r);
 			st->runcount[r] += n;
+
+			/*
+			 * the aggregates of sliced columns (DESIGN.md §52), over the
+			 * WHERE's rows: run 0's, its sets still located
+			 */
+			if (r == 0 && st->slice != NULL)
+				lion_slice_run(st);
 			/* a partition's rows are its indexes' (lion_count_report_reads()) */
 			if (p >= 0)
 				st->statrows += n;
@@ -1845,6 +1852,28 @@ lion_group_batch_fill(LionCountScanState *st)
 	lion_count_groups_copy(st->heap, estate->es_snapshot, n, st->gbsets,
 						   &st->wherecoll, st->gbcount, &st->stats,
 						   st->viscache, st->rel_read_only, st->gbimages);
+
+	/*
+	 * The aggregates of sliced columns (DESIGN.md §52) of each group with a
+	 * row, while its set is located, kept for its row.
+	 */
+	if (st->slice != NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(st->gbatchcxt);
+		st->gbsvalues = (Datum **) palloc0(sizeof(Datum *) * n);
+		st->gbsnull = (bool **) palloc0(sizeof(bool *) * n);
+		MemoryContextSwitchTo(oldcxt);
+		for (i = 0; i < n; i++)
+		{
+			LionPostingSet *gs = &st->gbsets[i];
+
+			if (st->gbcount[i] == 0)
+				continue;
+			lion_slice_group(st, 1, &gs);
+			lion_slice_keep(st, st->gbatchcxt, &st->gbsvalues[i],
+							&st->gbsnull[i]);
+		}
+	}
 	for (i = 0; i < n; i++)
 		lion_posting_set_release(&st->gbsets[i]);
 
@@ -2460,6 +2489,9 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 
 			if (st->gbcount[i] == 0)
 				continue;
+			/* the group's aggregates of sliced columns (§52), kept */
+			if (st->slice != NULL)
+				lion_slice_put(st, st->gbsvalues[i], st->gbsnull[i]);
 			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
 								   (Datum) 0, true, st->gbcount[i]);
 		}
@@ -2500,6 +2532,17 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 								 st->groupset.ntids,
 								 lion_entry_scan_batch_left(&st->escan) > 0);
 		keyisnull = st->groupset.keyisnull;
+
+		/*
+		 * the group's aggregates of sliced columns (DESIGN.md §52), its set
+		 * still located
+		 */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs = &st->groupset;
+
+			lion_slice_group(st, 1, &gs);
+		}
 		lion_posting_set_release(&st->groupset);
 
 		if (coal != NULL &&
@@ -2602,6 +2645,14 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		count = lion_group_count(st, st->ndsource, st->dsources,
 								 st->ndsource - 1, st->dsources[0].sets->ntids,
 								 lion_ingroup_more(st));
+
+		/* the group's aggregates of sliced columns (DESIGN.md §52) */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs = st->dsources[0].sets;
+
+			lion_slice_group(st, 1, &gs);
+		}
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
@@ -2750,6 +2801,16 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
 								 Min(st->groupset.ntids, st->groupset2.ntids),
 								 more);
+
+		/* the pair's aggregates of sliced columns (DESIGN.md §52) */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs[2];
+
+			gs[0] = &st->groupset;
+			gs[1] = &st->groupset2;
+			lion_slice_group(st, 2, gs);
+		}
 		lion_posting_set_release(&st->groupset2);
 		MemoryContextSwitchTo(oldcxt);
 

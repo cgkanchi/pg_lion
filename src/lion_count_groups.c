@@ -107,6 +107,161 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 					   LionVisCache *cache, bool rel_read_only,
 					   PGAlignedBlock *images)
 {
+	lion_count_groups_copy_ext(heap, snapshot, ngroups, groups, copy, counts,
+							   stats, cache, rel_read_only, images, NULL);
+}
+
+/*
+ * A width's image of the copy's container at a key, for the plane kernel
+ * (DESIGN.md §52, "The kernel"): the words of a bitmap of `width` words a
+ * block (lion_container.h, "widths") whose members are those of the full
+ * image `full` (a BITSET's LION_BITSET_WORDS words) at offsets below 64 *
+ * width - the only ones a NARROW of that width has, so that its AND with
+ * the result counts exactly what its AND with the full image counts.  The
+ * full image itself at the full width; `out` holds LION_WIDTH_WORDS(width).
+ */
+static const uint64 *
+lion_groups_width_image(const uint64 *full, uint32 width, uint64 *out)
+{
+	uint32		b;
+
+	if (width == LION_BITSET_WIDTH)
+		return full;
+	for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		memcpy(out + b * width, full + b * LION_BITSET_WIDTH,
+			   sizeof(uint64) * width);
+	return out;
+}
+
+/*
+ * The groups standing at a key whose every block the map vouches for, in a
+ * walk asked for the kernel (lion_count_groups_copy_ext(), DESIGN.md §52):
+ * each counted without its intersection being built.  The BITSETs and
+ * NARROWs of one width - where the copy's container has an image, wc - all
+ * together, by one strided pass of lion_planes_count_strided() over their
+ * payloads against the image at that width; with the kernel off each of
+ * them, and every other kind always, by lion_container_and_cardinality(),
+ * an ARRAY against the image by a bit test a member.  w is the copy's
+ * container, wc its image or NULL, and `wanted` its blocks, every one of
+ * them all-visible: a group's count lies on those blocks, which is what
+ * blocks_skipped_via_vm takes for a group with a row there - no fewer than
+ * its rows lie on.
+ */
+static void
+lion_groups_count_clean(LionGroupsKernel *opts, int nhot, const int *hot,
+						LionSetCursor *cur, LionCountCtx *gcx,
+						const LionContainer *w, const LionContainer *wc,
+						uint64 wanted)
+{
+	const uint64 **planes;
+	int		   *who;
+	int			nin[LION_BITSET_WIDTH + 1];
+	int			first[LION_BITSET_WIDTH + 1];
+	uint32	   *kcounts;
+	uint64		nimg[LION_WIDTH_WORDS(LION_NARROW_MAX_WIDTH)];
+	int			nblocks = pg_popcount64(wanted);
+	bool		passed = false;
+	uint32		width;
+	int			at;
+	int			i;
+
+	planes = (const uint64 **) palloc(sizeof(uint64 *) * nhot);
+	who = (int *) palloc(sizeof(int) * nhot);
+	kcounts = (uint32 *) palloc(sizeof(uint32) * nhot);
+
+	/* the kernel's groups by width, each width's together in planes[] */
+	memset(nin, 0, sizeof(nin));
+	for (i = 0; i < nhot; i++)
+	{
+		width = lion_container_width(cur[hot[i]].cur);
+		if (opts->kernel && wc != NULL && width > 0 &&
+			width <= LION_BITSET_WIDTH)
+			nin[width]++;
+	}
+	at = 0;
+	for (width = 0; width <= LION_BITSET_WIDTH; width++)
+	{
+		first[width] = at;
+		at += nin[width];
+		nin[width] = 0;
+	}
+
+	for (i = 0; i < nhot; i++)
+	{
+		int			g = hot[i];
+		const LionContainer *c = cur[g].cur;
+		uint32		n;
+		uint64		blocks;
+
+		opts->containers++;
+		width = lion_container_width(c);
+		if (opts->kernel && wc != NULL && width > 0 &&
+			width <= LION_BITSET_WIDTH)
+		{
+			planes[first[width] + nin[width]] = LION_BITSET_DATA(c);
+			who[first[width] + nin[width]] = g;
+			nin[width]++;
+			continue;
+		}
+		if (wc != NULL && c->type == LION_CT_ARRAY)
+			n = lion_container_and_image_count(c, LION_BITSET_DATA(wc),
+											   &blocks);
+		else
+			n = lion_container_and_cardinality(c, wc != NULL ? wc : w);
+		if (n == 0)
+			continue;
+		gcx[g].count += n;
+		gcx[g].stats.blocks_skipped_via_vm += nblocks;
+	}
+
+	for (width = 1; width <= LION_BITSET_WIDTH; width++)
+	{
+		const uint64 *img;
+		int			j;
+
+		if (nin[width] == 0)
+			continue;
+		if (w->type == LION_CT_NARROW && lion_container_width(w) == width)
+			img = LION_BITSET_DATA(w);	/* the copy's own words */
+		else
+			img = lion_groups_width_image(LION_BITSET_DATA(wc), width, nimg);
+		lion_planes_count_strided(img, &planes[first[width]],
+								  LION_WIDTH_WORDS(width),
+								  (uint32) nin[width], kcounts);
+		opts->kernelplanes += nin[width];
+		passed = true;
+		for (j = 0; j < nin[width]; j++)
+		{
+			int			g = who[first[width] + j];
+
+			if (kcounts[j] == 0)
+				continue;
+			gcx[g].count += kcounts[j];
+			gcx[g].stats.blocks_skipped_via_vm += nblocks;
+		}
+	}
+	if (passed)
+		opts->kernelkeys++;
+	pfree(planes);
+	pfree(who);
+	pfree(kcounts);
+}
+
+/*
+ * lion_count_groups_copy(), and with opts not NULL the groups at a key whose
+ * every block is all-visible counted without their intersections being
+ * built - by the plane kernel where opts->kernel says so - and what it did
+ * added to opts (lion_groups_count_clean(); DESIGN.md §52, "The kernel").
+ * A bit-sliced column's slices are the groups it is for: some dozens of
+ * BITSETs or NARROWs of one width at most keys of a dense column.
+ */
+void
+lion_count_groups_copy_ext(Relation heap, Snapshot snapshot, int ngroups,
+						   LionPostingSet *groups, const LionPostingSet *copy,
+						   int64 *counts, LionCountStats *stats,
+						   LionVisCache *cache, bool rel_read_only,
+						   PGAlignedBlock *images, LionGroupsKernel *opts)
+{
 	const LionMatSet *mat;
 	MemoryContext cxt;
 	MemoryContext oldcxt;
@@ -243,6 +398,7 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 		uint64		wanted;
 		uint64		allvis;
 		int			nhot = 0;
+		int			ndone = 0;
 		int			i;
 
 		/* the copy at or past the smallest key a group stands at */
@@ -319,7 +475,29 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 #endif
 		}
 
-		for (i = 0; i < nhot; i++)
+		/*
+		 * Asked for the kernel (DESIGN.md §52), at a key whose every block
+		 * is all-visible: every group here that trusts the map is counted
+		 * without its intersection - all of them, or none and each below as
+		 * always.  Not under SERIALIZABLE, whose blocks counted from the map
+		 * take their predicate locks a block at a time below.
+		 */
+		if (opts != NULL && !base.serializable && (wanted & ~allvis) == 0)
+		{
+			for (i = 0; i < nhot; i++)
+			{
+				if (!trust[hot[i]])
+					break;
+			}
+			if (i == nhot)
+			{
+				lion_groups_count_clean(opts, nhot, hot, cur, gcx, w, wc,
+										wanted);
+				ndone = nhot;
+			}
+		}
+
+		for (i = ndone; i < nhot; i++)
 		{
 			LionCountCtx *cx = &gcx[hot[i]];
 			const LionContainer *c = cur[hot[i]].cur;
@@ -337,6 +515,8 @@ lion_count_groups_copy(Relation heap, Snapshot snapshot, int ngroups,
 				blocks = lion_container_block_mask(work);
 				built = true;
 			}
+			if (opts != NULL)
+				opts->containers++;
 			if (n == 0)
 				continue;
 

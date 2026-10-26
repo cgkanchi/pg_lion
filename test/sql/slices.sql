@@ -279,7 +279,12 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT k) FROM slc_w1;
 SELECT slc_both($$SELECT count(DISTINCT k) FROM %s$$);
 SELECT slc_both($$SELECT count(DISTINCT k) FROM %s WHERE g = 2$$);
 SELECT slc_both($$SELECT count(DISTINCT ts) FROM %s$$);
--- the aggregates over keys (§37)
+-- the aggregates over keys (§37), the slices' answer (§52) set aside
+SET pg_lion.enable_count_slices = off;
+EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
+SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
+RESET pg_lion.enable_count_slices;
+-- and from the slices, which this small table's costs choose (§52)
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
 SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
 -- ranges, summed from the summaries, whose walk ends where the slices begin
