@@ -25946,6 +25946,46 @@ page that holds no member (§44.6).
   without a branch: adding into the query's own fields, which every store to qc and the planes
   might overwrite, and a branch on each bit of each code, which the CPU cannot predict, made it 45
   us a row at 1536 dimensions, 16% of a build; it takes 12, and gives the same planes to the bit.
+  **2026-10-26: the choice and plane 1 come from §50.** lionvec no longer chooses its own set. Every
+  kernel in lion_vec_math.c dispatches at each call on `lion_simd_current()`, the extension's one
+  choice (§50), which picks on every CPU the set `lionvec_kernels_init()` picked, by the same
+  `__builtin_cpu_supports()` tests - AVX-512 (AVX2 with AVX-512F, VL and VPOPCNTDQ), else AVX2, else
+  POPCNT, else portable - where function pointers set at load were; `lionvec_kernels_init()` now
+  only resolves the choice and asks `lion_simd_f16c()` once, and the AVX2 and AVX-512 sets convert
+  halves with F16C where it says the build knows it and the CPU has it. The build's tests are
+  lion_planes.h's: `LION_HAVE_X86_SIMD`, `LION_TARGET()` and `LION_HAVE_X86_F16C` for
+  `LIONVEC_HAVE_X86`, `LIONVEC_TARGET()` and `LIONVEC_HAVE_F16C`, which tested the same compilers;
+  `LIONVEC_HAVE_AVX512` went with the one AVX-512 kernel there was, and no macro of lionvec's own is
+  left. **From §50:** plane 1 is `lion_planes_dot_interleaved(bits, planes, nwords, 4)`, that
+  module's pass of constant stride for four interleaved planes in each implementation, which
+  `lionvec_plane_dot()`, now an inline function of lion_vec_math.h, calls; lionvec's own portable,
+  POPCNT, AVX2 and AVX-512 plane-1 kernels are deleted. **Here still:** the 8-bit sum, `l2sq`, the
+  rotation and the halves, each portable and AVX2 (the halves F16C), the AVX-512 set running the
+  AVX2 ones; and `lionvec_query_init()`'s planes, built in registers as above, which §50's scatter
+  reproduces to the bit but would need the codes in an array first. The unit tests force a set with
+  `lionvec_kernel_force()` as before, its `LIONVEC_KERNELS_*` numbers now `lion_simd_force()` of the
+  implementation of that number, which moves §50's and the container library's kernels with
+  lionvec's (`lionvec_kernels_init()` restores the best). vec_test passes with the same 119,295
+  checks (119,262 without the x86-64 kernels), every statistic it prints the same to the digit, and
+  an index of 100,000 random unit vectors of 1536 dimensions, rebuilt under each build, is the same
+  28,020 pages to the byte but their LSNs. Measured on §50's machine (Emerald Rapids, AVX-512 with
+  VPOPCNTDQ, four cores shared with other builds; gcc 13.3, -O2, PostgreSQL 16), before / after, ns:
+  `lionvec_plane_dot()` at 1536 dimensions in a harness linked as vec_test is, pinned to a core, the
+  median of eight alternated runs of the median of 31 rounds: portable 136 / 133, POPCNT 30.4 /
+  30.1, AVX2 25.4 / 26.7, AVX-512 16.6 / 12.9; and `lionvec_estimate1()` around it 140 / 136, 46.1 /
+  43.8, 35.2 / 35.7, 21.3 / 18.9. That is after one fix in §50 ("Kernels"): with the portable pass
+  inlined into `lion_planes_dot_interleaved()`, every call saved six registers and grew a frame
+  before jumping to its kernel, and AVX2's estimate took 39.2 against 36.5. A server whose flags
+  have link-time optimization, as Ubuntu's packages' do (`-flto=auto`, which PGXS builds the
+  extension with), inlines the dispatch into `lionvec_estimate1()`: a load of the choice and a
+  direct call, where the pointer was an indirect one. End to end, eight queries `ORDER BY embedding
+  <=> $1 LIMIT 10` on that table's `vector_cosine_ops` index, warm, under `EXPLAIN (ANALYZE, TIMING
+  OFF)`, the two builds alternated over 20 sessions of seven rounds each, 140 runs of each query a
+  build: the queries' medians 33.1 - 67.9 ms before and 32.7 - 66.3 after, the geometric mean of
+  their ratios 0.983, within the spread between sessions (a tenth). Such a query probes 581
+  partitions, estimates some 40,000 candidates by plane 1 and refines 16,000, so plane 1 is about 2%
+  of it. Its index's build (`REINDEX`, whose k-means and assignment estimate their candidate
+  centroids by plane 1), alternated, took 142.9 and 141.5 s before and 138.4 and 139.7 after.
 
 ### 44.4 The scan (lion_vec_scan.c)
 
@@ -31069,7 +31109,11 @@ STRIDED planes took longer than four calls of one (AVX2 671 ns against 450, AVX-
 with its canary, a loop of variable shifts, 22 - 28 ns against `lionvec_plane_dot()`'s 11 - 15 with
 AVX-512. Every INTERLEAVED kernel now has a pass of constant stride for k = 4, and the weighted sum a
 function for each implementation that weighs its lanes in registers (`planes_dot4_*()`): 16 ns
-against 15.
+against 15. *(2026-10-26, when lionvec took its plane 1 from here, §44.3: a third. The portable
+`planes_dot4_portable()`, the one of the four without a target of its own, was inlined into
+`lion_planes_dot_interleaved()`, and its loop's registers made the dispatch save six and grow a
+frame on every call, whichever kernel it then jumped to - AVX2's estimate 39.2 ns against lionvec's
+36.5. It is `pg_noinline` now, and the dispatch a test of k, a load of the choice and a jump.)*
 
 ### One choice of implementation (`lion_simd_*`)
 
@@ -31105,7 +31149,9 @@ The extension chose its SIMD kernels twice, by the same tests written twice: lio
   under every forced implementation with the same 3,139,381 checks as before (2,887,036 without the
   x86-64 kernels), under AddressSanitizer and UBSan too.
 - lion_vec_math.c is unchanged: lionvec still chooses its own set, under its own `LIONVEC_HAVE_*`
-  tests, until it takes its kernels from here ("Not done").
+  tests, until it takes its kernels from here ("Not done"). *(Since 2026-10-26 it does, §44.3,
+  "Kernels": every kernel of lionvec's dispatches on `lion_simd_current()`, under `LION_HAVE_X86_*`,
+  and its plane 1 is `lion_planes_dot_interleaved(bits, planes, nwords, 4)`.)*
 
 ### The transpose
 
@@ -31191,7 +31237,10 @@ summed over those rows, modulo 2^64:
   implementations, at every word count an index takes (1 to 127) on random and full inputs; and for
   45 queries of 64 to 7,232 dimensions and every metric, the scatter of the query's 4-bit codes -
   recomputed from `qc`, `qlo` and `qdelta` as `lionvec_query_init()` rounds them - is the planes it
-  built, to the bit, and the gather of its planes the codes.
+  built, to the bit, and the gather of its planes the codes. *(Since 2026-10-26
+  `lionvec_plane_dot()` is that weighted sum, §44.3, so the bridge pairs this module's
+  implementations against one another through lionvec's call; vec_test checks lionvec's against its
+  own count a bit at a time, as before.)*
 
 113,714 checks on this section's machine, 37,169 without the x86-64 kernels, under AddressSanitizer
 and UBSan as well (`make unit SANITIZE=1`). Deliberate faults - a byte run of 33 vectors, a wrong
@@ -31210,7 +31259,12 @@ test.
   Its 8-bit sums, l2sq, rotation and halves stay its own kernels, under the one choice.
   `lionvec_query_init()` may keep building its planes in registers as it does, which the scatter
   reproduces to the bit; the scatter would need the codes in an array first, and the time is the
-  floats' arithmetic, not the planes'.
+  floats' arithmetic, not the planes'. *(Done 2026-10-26, §44.3, "Kernels", as this says, with no
+  macro of lionvec's own left and `lionvec_kernel_force()` keeping its numbers; one fix here
+  ("Kernels" above: the portable pass out of line). Plane 1 at 1536 dimensions with AVX-512 took
+  16.6 ns before and 12.9 after, AVX2 25.4 and 26.7, POPCNT 30.4 and 30.1; vec_test's checks, a
+  rebuilt index's pages and the regression suite's plans are as they were, and a query and a build
+  on 100,000 rows of 1536 dimensions took what they took, within the noise.)*
 - **The bit-sliced index** (§51), which would call `lion_planes_count_strided()` per container key
   with the filter's BITSET words and its slices' payloads - slices of other representations through
   the container library's AND cardinality, a NARROW against the filter at its width - and weigh the
