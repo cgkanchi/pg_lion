@@ -60,11 +60,11 @@ ifeq ($(WERROR),1)
 PG_CFLAGS += -Werror
 endif
 # `make LION_NO_SIMD=1` leaves out the x86-64 kernels - the container
-# library's AVX2 and POPCNT ones, lion_planes.c's and lionvec's AVX-512,
-# AVX2 and POPCNT ones - which x86-64 GCC and clang builds pick between at
-# run time (DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels"; §50),
-# and runs the portable ones everywhere.  The unit tests always build a copy
-# that way too.
+# library's AVX2 and POPCNT ones, lion_planes.c's AVX-512, AVX2 and POPCNT
+# ones (lionvec's plane 1 among them) and lionvec's AVX2 and F16C ones -
+# which x86-64 GCC and clang builds pick between at run time (DESIGN.md §3,
+# "Whole-bitset kernels"; §44.3, "Kernels"; §50), and runs the portable ones
+# everywhere.  The unit tests always build a copy that way too.
 ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
 endif
@@ -184,12 +184,15 @@ test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
 
 # lionvec's arithmetic (DESIGN.md §44.3 - §44.4): the rotation, the codes, the
 # kernels and how often the estimates' bounds hold; and the same without the
-# x86-64 kernels, as container_test_nosimd is built.
-test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
-	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+# x86-64 kernels, as container_test_nosimd is built.  Its plane-1 kernel and
+# its choice of kernels are lion_planes.c's, linked with it.
+VEC_TEST_SRCS = test/unit/vec_test.c src/lion_vec_math.c src/lion_planes.c
+VEC_TEST_DEPS = $(VEC_TEST_SRCS) src/lion_vec_math.h src/lion_planes.h
+test/unit/vec_test: $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ $(VEC_TEST_SRCS) $(UNIT_LDFLAGS)
 
-test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
-	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+test/unit/vec_test_nosimd: $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ $(VEC_TEST_SRCS) $(UNIT_LDFLAGS)
 
 # Bit-plane arithmetic and the choice of SIMD implementation (DESIGN.md §50):
 # every implementation's popcounts per plane, in both layouts, against a
