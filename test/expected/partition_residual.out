@@ -1,0 +1,503 @@
+-- Residual clauses over a partitioned table (DESIGN.md section 16,
+-- "Residual clauses over a partitioned table").
+--
+-- A WHERE clause no lion index answers - one on a column without an index,
+-- an expression - used to send a count over a partitioned table to the
+-- ordinary plan, where the same count over one of its partitions tested the
+-- clause on the heap row of each row the other clauses select (section 10,
+-- "Residual clauses").  Now each partition does the same, but for a clause
+-- its bounds imply, which it tests none of its rows for, and one they
+-- refute, which leaves it out of the count.  What has to be checked: the
+-- clause is tested in every partition whose bounds do not decide it and in
+-- none that do, across sub-partitions and a partition that numbers its
+-- columns differently; a parameter or a stable expression on the partition
+-- key keeps the ordinary plan, where run-time pruning decides it, and off
+-- the key does not; the shapes that take a residual clause over one table
+-- take it over partitions; and every answer is the ordinary plan's, with
+-- dead and updated rows the residual must not see.  Each query is run with
+-- every other scan disabled, so that a node built at all is the plan, and
+-- again as the ordinary plan with the pushdown off; the two answers are
+-- compared as multisets both ways round.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+/*
+ * lion_rp() runs one query through the node - core's sequential and bitmap
+ * scans off and the margin marking lion's paths down, so that a path built
+ * at all is the plan - and as the ordinary plan with the pushdown off,
+ * checks that the two results are the same multiset, and says whether the
+ * node ran, with its residual filter and what the partitions leave out.  A
+ * prepared statement's EXECUTE is run as it is.
+ */
+CREATE FUNCTION lion_rp(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	pushed boolean := false;
+	resid text := NULL;
+	implied text := NULL;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			pushed := true;
+		END IF;
+		IF ln LIKE '%Residual Filter:%' THEN
+			resid := btrim(split_part(ln, 'Residual Filter:', 2));
+		END IF;
+		IF ln LIKE '%Implied by Partition Bounds:%' THEN
+			implied := btrim(split_part(ln, 'Implied by Partition Bounds:', 2));
+		END IF;
+	END LOOP;
+	IF q ~* '^\s*EXECUTE' THEN
+		EXECUTE format('CREATE TEMP TABLE lion_rp_on AS %s', q);
+	ELSE
+		EXECUTE format('CREATE TEMP TABLE lion_rp_on AS SELECT s::text AS r FROM (%s) s', q);
+	END IF;
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	IF q ~* '^\s*EXECUTE' THEN
+		EXECUTE format('CREATE TEMP TABLE lion_rp_off AS %s', q);
+	ELSE
+		EXECUTE format('CREATE TEMP TABLE lion_rp_off AS SELECT s::text AS r FROM (%s) s', q);
+	END IF;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM lion_rp_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM lion_rp_on EXCEPT ALL SELECT * FROM lion_rp_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM lion_rp_off EXCEPT ALL SELECT * FROM lion_rp_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE lion_rp_on, lion_rp_off';
+
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows%s%s',
+				  CASE WHEN pushed THEN 'pushed down' ELSE 'not pushed down' END,
+				  nrows,
+				  CASE WHEN resid IS NULL THEN '' ELSE '; residual: ' || resid END,
+				  CASE WHEN implied IS NULL THEN '' ELSE '; implied: ' || implied END);
+END $$;
+/*
+ * The plan of one query as lion_rp() plans it - without the "Disabled:
+ * true" PostgreSQL 18 prints under a disabled node, so that every release
+ * prints the same plan.
+ */
+CREATE FUNCTION lion_rpplan(q text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		CONTINUE WHEN ln ~ '^\s*Disabled: true$';
+		RETURN NEXT ln;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+END $$;
+-- ---- the table ----------------------------------------------------------
+/*
+ * RANGE-partitioned by day, a month a partition, the second month
+ * sub-partitioned by LIST on kind; the first month is created apart and
+ * attached, with two columns dropped, so that it numbers the columns the
+ * residual clauses read differently from the parent.  country, kind and
+ * tags have lion indexes; amount, w and p have none, and are what the
+ * residual clauses are on.  w is 0 in dead versions only, which a residual
+ * dividing by it must never see.
+ */
+CREATE TABLE rp (
+	id		int NOT NULL,
+	day		date NOT NULL,
+	country	text NOT NULL,
+	kind	text NOT NULL,
+	amount	int,
+	w		int NOT NULL,
+	tags	text[],
+	p		text
+) PARTITION BY RANGE (day);
+CREATE TABLE rp_m1 (
+	junk1	text,
+	id		int NOT NULL,
+	day		date NOT NULL,
+	junk2	bigint,
+	country	text NOT NULL,
+	kind	text NOT NULL,
+	amount	int,
+	w		int NOT NULL,
+	tags	text[],
+	p		text
+);
+ALTER TABLE rp_m1 DROP COLUMN junk1;
+ALTER TABLE rp_m1 DROP COLUMN junk2;
+ALTER TABLE rp ATTACH PARTITION rp_m1 FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE rp_m2 PARTITION OF rp FOR VALUES FROM ('2026-02-01') TO ('2026-03-01')
+	PARTITION BY LIST (kind);
+CREATE TABLE rp_m2_click PARTITION OF rp_m2 FOR VALUES IN ('click');
+CREATE TABLE rp_m2_rest PARTITION OF rp_m2 DEFAULT;
+CREATE TABLE rp_m3 PARTITION OF rp FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+INSERT INTO rp
+SELECT i,
+	   '2026-01-01'::date + (i % 90),
+	   (ARRAY['US', 'DE', 'FR', 'JP', 'BR'])[1 + (i / 7) % 5],
+	   (ARRAY['view', 'click', 'purchase'])[1 + (i / 3) % 3],
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE i % 1000 END,
+	   i % 9 + 1,
+	   CASE WHEN i % 10 = 0 THEN NULL ELSE ARRAY['t' || (i % 6), 't' || (i % 17)] END,
+	   CASE WHEN i % 11 = 0 THEN NULL ELSE md5(i::text) END
+  FROM generate_series(1, 60000) i;
+CREATE INDEX rp_country ON rp USING lion (country);
+CREATE INDEX rp_kind ON rp USING lion (kind);
+CREATE INDEX rp_tags ON rp USING lion (tags);
+VACUUM (FREEZE, ANALYZE) rp;
+-- the attached partition really does number the columns differently
+SELECT attname, attnum FROM pg_attribute
+ WHERE attrelid = 'rp_m1'::regclass AND attnum > 0 AND NOT attisdropped
+   AND attname IN ('amount', 'w', 'p')
+ ORDER BY attnum;
+ attname | attnum 
+---------+--------
+ amount  |      7
+ w       |      8
+ p       |     10
+(3 rows)
+
+-- ---- what used to be declined is counted ---------------------------------
+-- A clause on a column no lion index covers, tested in every partition;
+-- on the attached partition's own column numbers as on the others'.
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND amount > 900');
+                    lion_rp                    
+-----------------------------------------------
+ pushed down, 1 rows; residual: (amount > 900)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE kind = ''click'' AND id % 2 = 0');
+                    lion_rp                    
+-----------------------------------------------
+ pushed down, 1 rows; residual: ((id % 2) = 0)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE tags && ''{t3}'' AND length(p) = 32 AND amount % 7 = 1');
+                                 lion_rp                                  
+--------------------------------------------------------------------------
+ pushed down, 1 rows; residual: ((length(p) = 32) AND ((amount % 7) = 1))
+(1 row)
+
+SELECT lion_rpplan('SELECT count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rpplan                     
+-----------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: rp_m1, rp_m2_click, rp_m2_rest, rp_m3
+   Lion Indexes: (country = 'US'::text)
+   Residual Filter: (p ~~ 'a%'::text)
+(4 rows)
+
+-- ---- a range on the partition key ----------------------------------------
+-- The month in the middle implies it and tests none of its rows for it; the
+-- months at the ends test theirs.  Plan-time pruning has already left out
+-- the partitions wholly outside the range.
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-01-20'' AND day < ''2026-03-10''');
+                                                                                                 lion_rp                                                                                                 
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: ((day >= '01-20-2026'::date) AND (day < '03-10-2026'::date)); implied: (day >= '01-20-2026'::date) in 3 of 4 partitions, (day < '03-10-2026'::date) in 3 of 4 partitions
+(1 row)
+
+SELECT lion_rpplan('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-01-20'' AND day < ''2026-03-10''');
+                                                           lion_rpplan                                                            
+----------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: rp_m1, rp_m2_click, rp_m2_rest, rp_m3
+   Lion Indexes: (country = 'US'::text)
+   Residual Filter: ((day >= '01-20-2026'::date) AND (day < '03-10-2026'::date))
+   Implied by Partition Bounds: (day >= '01-20-2026'::date) in 3 of 4 partitions, (day < '03-10-2026'::date) in 3 of 4 partitions
+(5 rows)
+
+-- implied by both sub-partitions of the second month, through their parent's bound
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-01-20''');
+                                                        lion_rp                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: (day >= '01-20-2026'::date); implied: (day >= '01-20-2026'::date) in 3 of 4 partitions
+(1 row)
+
+SELECT lion_rpplan('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-01-20''');
+                                   lion_rpplan                                   
+---------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: rp_m1, rp_m2_click, rp_m2_rest, rp_m3
+   Lion Indexes: (country = 'US'::text)
+   Residual Filter: (day >= '01-20-2026'::date)
+   Implied by Partition Bounds: (day >= '01-20-2026'::date) in 3 of 4 partitions
+(5 rows)
+
+-- implied by every partition kept: no residual at all
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-01''');
+                          lion_rp                          
+-----------------------------------------------------------
+ pushed down, 1 rows; implied: (day >= '02-01-2026'::date)
+(1 row)
+
+-- a clause on the key no bound decides, beside one the bounds do
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-01-20'' AND extract(day FROM day) < 10');
+                                                                               lion_rp                                                                               
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: ((day >= '01-20-2026'::date) AND (EXTRACT(day FROM day) < '10'::numeric)); implied: (day >= '01-20-2026'::date) in 3 of 4 partitions
+(1 row)
+
+-- with pruning off, a partition whose bounds refute the clause is left out
+SET enable_partition_pruning = off;
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-15''');
+                                                        lion_rp                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: (day >= '02-15-2026'::date); implied: (day >= '02-15-2026'::date) in 1 of 3 partitions
+(1 row)
+
+SELECT lion_rpplan('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-15''');
+                                   lion_rpplan                                   
+---------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: rp_m2_click, rp_m2_rest, rp_m3
+   Lion Indexes: (country = 'US'::text)
+   Residual Filter: (day >= '02-15-2026'::date)
+   Implied by Partition Bounds: (day >= '02-15-2026'::date) in 1 of 3 partitions
+(5 rows)
+
+RESET enable_partition_pruning;
+-- ---- the shapes ----------------------------------------------------------
+SELECT lion_rp('SELECT country, count(*) FROM rp WHERE kind = ''click'' AND p LIKE ''a%'' GROUP BY country');
+                                                lion_rp                                                 
+--------------------------------------------------------------------------------------------------------
+ pushed down, 5 rows; residual: (p ~~ 'a%'::text); implied: (kind = 'click'::text) in 1 of 3 partitions
+(1 row)
+
+SELECT lion_rp('SELECT kind, count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-15'' GROUP BY kind');
+                                                        lion_rp                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ pushed down, 3 rows; residual: (day >= '02-15-2026'::date); implied: (day >= '02-15-2026'::date) in 1 of 3 partitions
+(1 row)
+
+SELECT lion_rp('SELECT country, kind, count(*) FROM rp WHERE tags && ''{t1}'' AND amount > 500 GROUP BY country, kind');
+                    lion_rp                     
+------------------------------------------------
+ pushed down, 15 rows; residual: (amount > 500)
+(1 row)
+
+SELECT lion_rp('SELECT country, count(*) FROM rp WHERE kind = ''click'' AND p LIKE ''a%'' GROUP BY country HAVING count(*) > 100');
+                                                lion_rp                                                 
+--------------------------------------------------------------------------------------------------------
+ pushed down, 5 rows; residual: (p ~~ 'a%'::text); implied: (kind = 'click'::text) in 1 of 3 partitions
+(1 row)
+
+SELECT lion_rp('SELECT country, count(*) FROM rp WHERE kind = ''click'' AND p LIKE ''a%'' GROUP BY country ORDER BY 2 DESC, 1 LIMIT 2');
+                                                lion_rp                                                 
+--------------------------------------------------------------------------------------------------------
+ pushed down, 2 rows; residual: (p ~~ 'a%'::text); implied: (kind = 'click'::text) in 1 of 3 partitions
+(1 row)
+
+SELECT lion_rp('SELECT count(kind) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+-- an uncorrelated subquery is a parameter by now, as it is over one table
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND amount > (SELECT 900)');
+                   lion_rp                    
+----------------------------------------------
+ pushed down, 1 rows; residual: (amount > $0)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FILTER (WHERE kind = ''click''), count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country IN (''US'', ''DE'') AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country <> ''US'' AND kind = ''view'' AND amount > 100');
+                    lion_rp                    
+-----------------------------------------------
+ pushed down, 1 rows; residual: (amount > 100)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE kind = ''view'' AND ((country = ''US'' AND p LIKE ''a%'') OR amount > 900)');
+                                              lion_rp                                              
+---------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: (((country = 'US'::text) AND (p ~~ 'a%'::text)) OR (amount > 900))
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND 100 / w > 20');
+                     lion_rp                     
+-------------------------------------------------
+ pushed down, 1 rows; residual: ((100 / w) > 20)
+(1 row)
+
+SELECT lion_rp('SELECT DISTINCT country FROM rp WHERE kind = ''click'' AND p LIKE ''a%''');
+                                                lion_rp                                                 
+--------------------------------------------------------------------------------------------------------
+ pushed down, 5 rows; residual: (p ~~ 'a%'::text); implied: (kind = 'click'::text) in 1 of 3 partitions
+(1 row)
+
+-- ---- what stays the ordinary plan's ----------------------------------------
+-- A parameter or a stable expression on the partition key: run-time
+-- pruning's, which the node does not do.  Off the key, either is residual.
+PREPARE rp_key(date) AS SELECT count(*) FROM rp WHERE country = 'US' AND day >= $1;
+PREPARE rp_off(text) AS SELECT count(*) FROM rp WHERE country = 'US' AND p LIKE $1;
+SET plan_cache_mode = force_generic_plan;
+SELECT lion_rp('EXECUTE rp_key(''2026-02-15'')');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_rp('EXECUTE rp_off(''a%'')');
+                 lion_rp                  
+------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ $1)
+(1 row)
+
+RESET plan_cache_mode;
+DEALLOCATE rp_key;
+DEALLOCATE rp_off;
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND day >= current_date - 100000');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND p < current_setting(''application_name'') || ''zzz''');
+                                             lion_rp                                             
+-------------------------------------------------------------------------------------------------
+ pushed down, 1 rows; residual: (p < (current_setting('application_name'::text) || 'zzz'::text))
+(1 row)
+
+-- a volatile function, a subplan, and nothing else to select the rows
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND amount > random() * 0');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND (SELECT count(*) FROM rp r2 WHERE r2.id = rp.id + 1 AND r2.day = rp.day) > 0');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE p LIKE ''a%''');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+-- more than half the rows of the partitions that test it to fetch: of
+-- every partition, and of the one sub-partition of the kind selected, the
+-- only partition left to test the clause
+SELECT lion_rp('SELECT count(*) FROM rp WHERE kind <> ''click'' AND p LIKE ''a%''');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+SELECT lion_rp('SELECT country, count(*) FROM rp WHERE kind = ''click'' AND day >= ''2026-02-15'' GROUP BY country');
+         lion_rp         
+-------------------------
+ not pushed down, 5 rows
+(1 row)
+
+-- and the switch
+SET pg_lion.enable_count_residual = off;
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+         lion_rp         
+-------------------------
+ not pushed down, 1 rows
+(1 row)
+
+RESET pg_lion.enable_count_residual;
+-- ---- a dirty heap -----------------------------------------------------------
+-- Rows deleted and updated after the VACUUM, among them dead versions with
+-- w = 0, in every partition.
+DELETE FROM rp WHERE id % 97 = 0;
+UPDATE rp SET country = 'US', p = 'a' || p WHERE id % 89 = 0;
+UPDATE rp SET w = 0 WHERE id % 61 = 0;
+UPDATE rp SET w = 5 WHERE id % 61 = 0;
+UPDATE rp SET w = 0 WHERE id % 53 = 0;
+DELETE FROM rp WHERE id % 53 = 0;
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND 100 / w > 20');
+                     lion_rp                     
+-------------------------------------------------
+ pushed down, 1 rows; residual: ((100 / w) > 20)
+(1 row)
+
+SELECT lion_rp('SELECT kind, count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-15'' GROUP BY kind');
+                                                        lion_rp                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ pushed down, 3 rows; residual: (day >= '02-15-2026'::date); implied: (day >= '02-15-2026'::date) in 1 of 3 partitions
+(1 row)
+
+VACUUM (ANALYZE) rp;
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND p LIKE ''a%''');
+                     lion_rp                      
+--------------------------------------------------
+ pushed down, 1 rows; residual: (p ~~ 'a%'::text)
+(1 row)
+
+SELECT lion_rp('SELECT count(*) FROM rp WHERE country = ''US'' AND 100 / w > 20');
+                     lion_rp                     
+-------------------------------------------------
+ pushed down, 1 rows; residual: ((100 / w) > 20)
+(1 row)
+
+SELECT lion_rp('SELECT kind, count(*) FROM rp WHERE country = ''US'' AND day >= ''2026-02-15'' GROUP BY kind');
+                                                        lion_rp                                                        
+-----------------------------------------------------------------------------------------------------------------------
+ pushed down, 3 rows; residual: (day >= '02-15-2026'::date); implied: (day >= '02-15-2026'::date) in 1 of 3 partitions
+(1 row)
+
+-- ---- a rescan ---------------------------------------------------------------
+-- A LATERAL value in the residual clause rescans the node, partition by
+-- partition each time.
+SELECT lion_rp('SELECT v.m, (SELECT count(*) FROM rp WHERE country = ''US'' AND amount % 10 = v.m) FROM generate_series(0, 3) v(m)');
+                       lion_rp                        
+------------------------------------------------------
+ pushed down, 4 rows; residual: ((amount % 10) = v.m)
+(1 row)
+
+DROP TABLE rp;
+DROP FUNCTION lion_rp(text);
+DROP FUNCTION lion_rpplan(text);

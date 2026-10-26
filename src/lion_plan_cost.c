@@ -6072,22 +6072,36 @@ lion_multikey_nkeys(IndexOptInfo *idx, AttrNumber col, Node *clause)
  * partial index `WHERE w > 5` under `w > 7 AND b = 4` was priced as fetching
  * every row with b = 4, as the whole index is, and the two plans tied where
  * the partial one fetches 40% of the rows and runs in half the time.
+ *
+ * Of `rel`, the query's relation toprel itself or a leaf partition of it
+ * (DESIGN.md §16, "Residual clauses over a partitioned table"), whose rows
+ * are the restriction's mapped onto its columns and estimated by its own
+ * statistics (lion_rel_clauses_selectivity()); the residual clauses are
+ * toprel's, the ones the leaf tests.
  */
 double
-lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
+lion_residual_rows(PlannerInfo *root, RelOptInfo *toprel, RelOptInfo *rel,
+				   List *residual)
 {
 	IndexOptInfo *pidx = lion_partial_index_of(rel);
 	List	   *others = NIL;
 	ListCell   *lc;
 	double		rows;
 
-	foreach(lc, rel->baserestrictinfo)
+	foreach(lc, toprel->baserestrictinfo)
 	{
 		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
 
-		if (!list_member_ptr(residual, rinfo->clause))
-			others = lappend(others, rinfo);
+		if (list_member_ptr(residual, rinfo->clause))
+			continue;
+		/* a leaf's are bare clauses: lion_rel_clauses_selectivity()'s */
+		others = lappend(others, (rel != toprel) ? (Node *) rinfo->clause :
+						 (Node *) rinfo);
 	}
+	if (rel != toprel)
+		others = (List *) adjust_appendrel_attrs_multilevel(root,
+															(Node *) others,
+															rel, toprel);
 	if (pidx != NULL)
 	{
 		List	   *extra = NIL;
@@ -6101,9 +6115,13 @@ lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
 		}
 		others = list_concat(others, extra);
 	}
-	rows = clamp_row_est(Max(rel->tuples, 1.0) *
-						 clauselist_selectivity(root, others, rel->relid,
-												JOIN_INNER, NULL));
+	if (rel != toprel)
+		rows = clamp_row_est(Max(rel->tuples, 1.0) *
+							 lion_rel_clauses_selectivity(root, rel, others));
+	else
+		rows = clamp_row_est(Max(rel->tuples, 1.0) *
+							 clauselist_selectivity(root, others, rel->relid,
+													JOIN_INNER, NULL));
 	list_free(others);
 	return rows;
 }
@@ -6126,11 +6144,11 @@ lion_residual_rows(PlannerInfo *root, RelOptInfo *rel, List *residual)
  * again: `counts` counts of rows/counts rows each.
  */
 Cost
-lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
-				   double counts)
+lion_cost_residual(PlannerInfo *root, RelOptInfo *toprel, RelOptInfo *rel,
+				   List *residual, double counts)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
-	double		rows = lion_residual_rows(root, rel, residual);
+	double		rows = lion_residual_rows(root, toprel, rel, residual);
 	double		pages;
 	double		spc_random;
 	double		spc_seq;
@@ -6159,11 +6177,11 @@ lion_cost_residual(PlannerInfo *root, RelOptInfo *rel, List *residual,
  * of pages read at random.
  */
 double
-lion_residual_pages(PlannerInfo *root, RelOptInfo *rel, List *residual,
-					double counts)
+lion_residual_pages(PlannerInfo *root, RelOptInfo *toprel, RelOptInfo *rel,
+					List *residual, double counts)
 {
 	double		T = Max((double) rel->pages, 1.0);
-	double		rows = lion_residual_rows(root, rel, residual);
+	double		rows = lion_residual_rows(root, toprel, rel, residual);
 	double		n;
 
 	counts = Min(Max(counts, 1.0), rows);

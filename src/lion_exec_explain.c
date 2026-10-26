@@ -888,6 +888,44 @@ lion_explain_bounds(LionCountScanState *st, List *ancestors, ExplainState *es)
 			lion_explain_implied(st, st->ors[it->orno].first,
 								 &st->ors[it->orno], ancestors, es, &buf);
 	}
+
+	/*
+	 * ... and the residual clauses some partitions' bounds imply, which
+	 * those test none of their rows for (DESIGN.md §16, "Residual clauses
+	 * over a partitioned table"), deparsed as the Residual Filter line is.
+	 */
+	if (st->residexprs != NIL && st->npart > 0)
+	{
+		List	   *context = NIL;
+		int			j = 0;
+
+		foreach(lc, st->residexprs)
+		{
+			int			n = 0;
+			int			p;
+
+			for (p = 0; p < st->npart; p++)
+			{
+				if (st->part[p].residdrop != NULL && st->part[p].residdrop[j])
+					n++;
+			}
+			if (n > 0)
+			{
+				if (context == NIL)
+					context = set_deparse_context_plan(es->deparse_cxt,
+													   st->css.ss.ps.plan,
+													   ancestors);
+				if (buf.len > 0)
+					appendStringInfoString(&buf, ", ");
+				appendStringInfoString(&buf,
+									   deparse_expression((Node *) lfirst(lc),
+														  context, false,
+														  false));
+				lion_explain_part_count(st, n, &buf);
+			}
+			j++;
+		}
+	}
 	if (buf.len > 0)
 		ExplainPropertyText("Implied by Partition Bounds", buf.data, es);
 	pfree(buf.data);
