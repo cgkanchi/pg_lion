@@ -29,7 +29,8 @@
  *	  It also holds the extension's choice among its SIMD implementations
  *	  (portable, POPCNT, AVX2, AVX-512 with VPOPCNTDQ), made once per process
  *	  from what the build and the CPU have, which the container library's
- *	  whole-bitset kernels (lion_container.c) follow as these kernels do.
+ *	  whole-bitset kernels (lion_container.c) and lionvec's
+ *	  (lion_vec_math.c) follow as these kernels do.
  *	  Every implementation returns the same counts, to the bit.
  *
  *	  Frontend-safe (c.h, port/pg_bitutils.h and libpgcommon only), so that
@@ -58,8 +59,8 @@
  * GCC 8 and clang 8, which know VPOPCNTDQ, the AVX-512 one; from GCC 11 and
  * clang 18, whose __builtin_cpu_supports() knows "f16c", F16C's presence.
  * LION_NO_SIMD (make LION_NO_SIMD=1) leaves them all out, and every build
- * then runs the portable one.  lion_vec_math.c makes the same tests under
- * names of its own until lionvec takes its kernels from here.
+ * then runs the portable one.  lion_container.c and lion_vec_math.c build
+ * their own x86-64 kernels under these tests.
  */
 #if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
 	((defined(__clang__) && __clang_major__ >= 6) || \
@@ -149,8 +150,8 @@ lion_simd_current(void)
 
 #ifdef FRONTEND
 /*
- * For the unit tests: make every kernel - these, and the container
- * library's - run impl, or the best again for LION_SIMD_AUTO.  Returns
+ * For the unit tests: make every kernel - these, the container library's
+ * and lionvec's - run impl, or the best again for LION_SIMD_AUTO.  Returns
  * false, and changes nothing, for one the build or the CPU does not have.
  */
 extern bool lion_simd_force(LionSimdImpl impl);
