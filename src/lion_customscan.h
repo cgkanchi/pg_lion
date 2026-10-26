@@ -4521,6 +4521,7 @@ extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  List *keyfold, double rows,
 										  Cost startup, Cost total);
 extern void lion_ordered_probe_key(PlanState *ps, Datum key);
+extern void lion_ordered_join_probes(PlannerInfo *root, RelOptInfo *joinrel);
 extern void lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array);
 
 /*

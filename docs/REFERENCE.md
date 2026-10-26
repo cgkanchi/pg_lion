@@ -665,6 +665,11 @@ working around a bad choice:
   every relation a `ctid`, which no index returns) and `enable_indexonlyscan`; the planner
   prices the set's build spread over the loop's rescans - over the outer side's distinct keys when
   `enable_memoize` is on - against PostgreSQL's heap fetch per outer row.
+  Under a plain nested loop the probe returns its row as it read it, as PostgreSQL's Index Scan
+  does, so `EXPLAIN VERBOSE` lists every column of the relation as its `Output` (in index-only
+  mode the columns the index does not hold are NULL, and nothing reads them); under a `Memoize`,
+  which caches the rows, it returns only the columns the query needs (DESIGN.md §49, "The probe's
+  projection").
   `pg_lion.enable_btree_scan` turns it off with the other walks.
 - `pg_lion.enable_heap_probe` (off): also offer that probe where the B-tree does not cover what
   the query reads of the relation - a primary key under a Lion filter, the query reading other
