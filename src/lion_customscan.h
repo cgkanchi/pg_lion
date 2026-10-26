@@ -4522,6 +4522,16 @@ extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Cost startup, Cost total);
 extern void lion_ordered_probe_key(PlanState *ps, Datum key);
 extern void lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array);
+
+/*
+ * A join's test of its fact walk's key, made on the walked B-tree's index
+ * tuple before the heap fetch (lion_ordered_entry_test(), DESIGN.md §47.6):
+ * false turns the entry away unfetched.
+ */
+typedef bool (*LionOrderedEntryTest) (void *arg, Datum key, bool isnull);
+extern void lion_ordered_entry_test(PlanState *ps, AttrNumber indexcol,
+									Oid type, LionOrderedEntryTest test,
+									void *arg);
 extern IndexOptInfo *lion_ordered_column_order(PlannerInfo *root,
 											   RelOptInfo *rel, PathKey *want,
 											   int *indexcol, Var **var);
