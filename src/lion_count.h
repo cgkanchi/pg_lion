@@ -1316,6 +1316,13 @@ extern bool lion_scankey_sets(Relation index, ScanKey skey, int *nsets,
 							  LionPostingSet **sets, LionKeyNode **tree,
 							  bool *nomatch);
 
+/*
+ * The source's answer at container keys [lo, hi) alone - hi PG_UINT64_MAX for
+ * no end - each stream it reads sought to lo and left at hi, so that the
+ * answer's parts can be read apart (DESIGN.md §40.9, "Built in parts").  Before
+ * the first lion_source_next().
+ */
+extern void lion_source_bound(LionSource *src, uint32 lo, uint64 hi);
 extern const LionContainer *lion_source_next(LionSource *src);
 extern bool lion_source_sorted(LionSource *src);
 extern bool lion_source_exact(LionSource *src);

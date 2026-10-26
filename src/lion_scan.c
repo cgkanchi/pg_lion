@@ -3389,6 +3389,15 @@ struct LionSource
 	LionSourceShape shape;
 
 	/*
+	 * lion_source_bound(): the container keys handed out, [blo, bhi) - every
+	 * stream below sought to blo as it opens, and left at bhi - and whether
+	 * the bound has been met
+	 */
+	uint32		blo;
+	uint64		bhi;
+	bool		bdone;
+
+	/*
 	 * Queries decided from stored positions (lion_posfilter.c): every
 	 * container the shape below yields goes through each, which is exact for
 	 * the scan because its keys are ANDed - whatever else the shape answers,
@@ -3949,6 +3958,7 @@ lion_source_build(LionScanOpaque so, bool keeppins, MemoryContext parent)
 	src->cxt = cxt;
 	src->keeppins = keeppins;
 	src->shape = LION_SRC_NONE;
+	src->bhi = PG_UINT64_MAX;
 	src->entrycxt = AllocSetContextCreate(cxt, "lion index scan entry",
 										  0,
 										  LION_SCAN_ENTRY_BLOCK,
@@ -4439,6 +4449,8 @@ lion_source_list_batch(LionSource *src)
 													  src->restnegs,
 													  src->nrestnegs),
 										src->keeppins);
+		if (src->blo > 0)
+			lion_stream_seek(src->stream, src->blo);
 		MemoryContextSwitchTo(oldcxt);
 		return true;
 	}
@@ -4474,9 +4486,14 @@ lion_source_union_window(LionSource *src)
 		src->udone = true;
 		return false;
 	}
-	src->ustart = src->ufirst ? 0 : src->unext;
+	src->ustart = src->ufirst ? src->blo : src->unext;
 	src->ufirst = false;
-	end = src->ustart + (uint64) src->uwidth;
+	if (src->ustart >= src->bhi)
+	{
+		src->udone = true;
+		return false;
+	}
+	end = Min(src->ustart + (uint64) src->uwidth, src->bhi);
 
 	/*
 	 * The state is looked up per window, and the ranges re-pointed at it:
@@ -4688,12 +4705,12 @@ lion_source_window(LionSource *src)
 		const LionContainer *c = lion_stream_next(src->reststream);
 		int			k = src->wn;
 
-		if (c == NULL)
+		if (c == NULL || c->ckey >= src->bhi)
 		{
 			src->restdone = true;
 			break;
 		}
-		if (c->cardinality == 0)
+		if (c->cardinality == 0 || c->ckey < src->blo)
 			continue;
 		if (src->wrest[k] == NULL)
 			src->wrest[k] = (uint64 *) palloc(LION_BITSET_BYTES);
@@ -4822,7 +4839,16 @@ lion_source_next_raw(LionSource *src)
 			return NULL;
 
 		case LION_SRC_SETS:
-			return lion_stream_next(src->stream);
+			/* a sparse segment's keys may start below a seek's */
+			while ((c = lion_stream_next(src->stream)) != NULL &&
+				   c->ckey < src->blo)
+				;
+			if (c != NULL && c->ckey >= src->bhi)
+			{
+				src->bdone = true;
+				return NULL;
+			}
+			return c;
 
 		case LION_SRC_UNION:
 			return lion_source_union_next(src);
@@ -4835,8 +4861,10 @@ lion_source_next_raw(LionSource *src)
 			{
 				if (src->stream != NULL)
 				{
-					c = lion_stream_next(src->stream);
-					if (c != NULL)
+					while ((c = lion_stream_next(src->stream)) != NULL &&
+						   c->ckey < src->blo)
+						;
+					if (c != NULL && c->ckey < src->bhi)
 						return c;
 
 					/*
@@ -4888,8 +4916,10 @@ lion_source_next_raw(LionSource *src)
 
 				if (src->stream != NULL)
 				{
-					c = lion_stream_next(src->stream);
-					if (c != NULL)
+					while ((c = lion_stream_next(src->stream)) != NULL &&
+						   c->ckey < src->blo)
+						;
+					if (c != NULL && c->ckey < src->bhi)
 						return c;
 
 					/*
@@ -4918,6 +4948,8 @@ lion_source_next_raw(LionSource *src)
 				oldcxt = MemoryContextSwitchTo(src->entrycxt);
 				src->stream = lion_stream_begin(src->nsets + 1, src->sets,
 												src->tree, src->keeppins);
+				if (src->blo > 0)
+					lion_stream_seek(src->stream, src->blo);
 				MemoryContextSwitchTo(oldcxt);
 
 				CHECK_FOR_INTERRUPTS();
@@ -4960,6 +4992,8 @@ lion_source_next(LionSource *src)
 {
 	const LionContainer *c;
 
+	if (src->bdone)
+		return NULL;
 	while ((c = lion_source_next_raw(src)) != NULL)
 	{
 		int			i;
@@ -5016,6 +5050,21 @@ lion_source_open(Relation index, ScanKey keys, int nkeys, bool keeppins,
 	MemoryContextSwitchTo(oldcxt);
 
 	return lion_source_build(so, keeppins, cxt);
+}
+
+void
+lion_source_bound(LionSource *src, uint32 lo, uint64 hi)
+{
+	MemoryContext oldcxt = MemoryContextSwitchTo(src->cxt);
+
+	src->blo = lo;
+	src->bhi = hi;
+	/* a WALK's and a LIST's streams are sought as they open, a UNION's too */
+	if (lo > 0 && src->shape == LION_SRC_SETS)
+		lion_stream_seek(src->stream, lo);
+	else if (lo > 0 && src->shape == LION_SRC_WINDOW)
+		lion_stream_seek(src->reststream, lo);
+	MemoryContextSwitchTo(oldcxt);
 }
 
 bool
