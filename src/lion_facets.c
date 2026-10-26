@@ -98,17 +98,6 @@ typedef enum LionFacetSel
 	LION_FSEL_TREE				/* the rows of a tree over located sets */
 } LionFacetSel;
 
-/* The filter, being taken apart into located sets. */
-typedef struct LionFacetFilter
-{
-	Relation	heap;
-	Snapshot	snapshot;
-	List	   *indexes;		/* the lion indexes of heap, opened */
-	List	   *vetted;			/* OIDs of the ones lion_reader_vet() passed */
-	int			nsets;
-	int			maxsets;
-	LionPostingSet *sets;
-} LionFacetFilter;
 
 /*
  * A key counted, or a candidate to count.  A key that is not NULL nor of a
@@ -136,10 +125,9 @@ typedef struct LionFacetRun
 	Snapshot	snapshot;
 	int64		k;				/* the top k counted; -1: every key */
 	int64		limit;			/* the keys returned; -1: every one */
-	bool		hasfilter;
-	bool		hascopy;		/* the filter is collected into copy */
-	LionPostingSet copy;
-	LionCountSource filtersrc;	/* the filter as a source, when not */
+	LionTextFilter tf;			/* the filter (lion_text_filter_begin()):
+								 * tf.copy when tf.hascopy, tf.src when
+								 * not */
 	LionVisCache *cache;
 	LionCountStats stats;
 	double		share;			/* of the table's rows the filter keeps */
@@ -192,7 +180,7 @@ typedef struct LionFacetRun
  * all of its WHERE clause: nothing else of a SELECT may come out of it.
  */
 static Node *
-lion_facets_parse(Relation heap, const char *filter)
+lion_facets_parse(Relation heap, const char *filter, const char *what)
 {
 	const char *prefix = "SELECT WHERE ";
 	char	   *sql = psprintf("%s%s", prefix, filter);
@@ -207,12 +195,12 @@ lion_facets_parse(Relation heap, const char *filter)
 	if (list_length(raw) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("a facet filter must be one WHERE condition")));
+				 errmsg("a %s must be one WHERE condition", what)));
 	rs = linitial_node(RawStmt, raw);
 	if (!IsA(rs->stmt, SelectStmt))
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("a facet filter must be one WHERE condition")));
+				 errmsg("a %s must be one WHERE condition", what)));
 	sel = (SelectStmt *) rs->stmt;
 	if (sel->op != SETOP_NONE || sel->whereClause == NULL ||
 		sel->targetList != NIL || sel->fromClause != NIL ||
@@ -224,7 +212,7 @@ lion_facets_parse(Relation heap, const char *filter)
 		sel->withClause != NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("a facet filter must be one WHERE condition")));
+				 errmsg("a %s must be one WHERE condition", what)));
 
 	/*
 	 * No source text: an error position would count the characters of the
@@ -240,7 +228,7 @@ lion_facets_parse(Relation heap, const char *filter)
 	if (pstate->p_hasSubLinks || checkExprHasSubLink(qual))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a facet filter cannot contain a subquery")));
+				 errmsg("a %s cannot contain a subquery", what)));
 	free_parsestate(pstate);
 
 	return qual;
@@ -278,7 +266,7 @@ lion_facets_check_filter(Relation heap, Node *qual)
 }
 
 pg_noreturn static void
-lion_facets_unanswerable(LionFacetFilter *ff, Node *clause, const char *why)
+lion_facets_unanswerable(LionTextFilter *ff, Node *clause, const char *why)
 {
 	List	   *dpcontext;
 	char	   *text;
@@ -288,10 +276,11 @@ lion_facets_unanswerable(LionFacetFilter *ff, Node *clause, const char *why)
 	text = deparse_expression(clause, dpcontext, false, false);
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("facet filter condition %s cannot be answered from lion indexes",
-					text),
+			 errmsg("%s condition %s cannot be answered from lion indexes",
+					ff->what, text),
 			 errdetail("%s", why),
-			 errhint("A facet filter is an AND and OR of equalities, IN lists and IS NULL on columns with a lion index, and of the operators of a multi-key lion index (@>, &&, @@, ?, ...) that its keys answer exactly.")));
+			 errhint("A %s is an AND and OR of equalities, IN lists and IS NULL on columns with a lion index, and of the operators of a multi-key lion index (@>, &&, @@, ?, ...) that its keys answer exactly.",
+					 ff->what)));
 }
 
 /* The table's own column, under any binary relabelling, or NULL. */
@@ -317,7 +306,7 @@ lion_facets_column(Node *node)
  * (ExecInitExpr()).
  */
 static Datum
-lion_facets_value(LionFacetFilter *ff, Node *clause, Node *expr, bool *isnull)
+lion_facets_value(LionTextFilter *ff, Node *clause, Node *expr, bool *isnull)
 {
 	EState	   *estate;
 	ExprState  *es;
@@ -332,7 +321,8 @@ lion_facets_value(LionFacetFilter *ff, Node *clause, Node *expr, bool *isnull)
 	if (contain_volatile_functions(expr))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("a facet filter cannot compare with a volatile expression")));
+				 errmsg("a %s cannot compare with a volatile expression",
+						ff->what)));
 
 	if (IsA(expr, Const))
 	{
@@ -372,7 +362,7 @@ lion_facets_collation_ok(Oid idxcoll, Oid exprcoll)
  * index taken is vetted once (lion_reader_vet()) before it is read.
  */
 static Relation
-lion_facets_find_index(LionFacetFilter *ff, Var *var, Oid opno, Oid inputcollid,
+lion_facets_find_index(LionTextFilter *ff, Var *var, Oid opno, Oid inputcollid,
 					   AttrNumber *idxcol, StrategyNumber *strategy,
 					   Oid *subtype)
 {
@@ -446,7 +436,7 @@ lion_facets_shift(LionKeyNode *node, int delta)
  * (lion_scankey_sets()), appended to the filter's, and the tree over them.
  */
 static LionFacetSel
-lion_facets_locate(LionFacetFilter *ff, Node *clause, Relation index,
+lion_facets_locate(LionTextFilter *ff, Node *clause, Relation index,
 				   ScanKey skey, LionKeyNode **tree)
 {
 	LionPostingSet *sets;
@@ -487,7 +477,7 @@ lion_facets_locate(LionFacetFilter *ff, Node *clause, Relation index,
 
 /* `var op value` or `var op ANY (array)` */
 static LionFacetSel
-lion_facets_opclause(LionFacetFilter *ff, Node *clause, Node *left,
+lion_facets_opclause(LionTextFilter *ff, Node *clause, Node *left,
 					 Node *right, Oid opno, Oid inputcollid, bool isarray,
 					 LionKeyNode **tree)
 {
@@ -539,7 +529,7 @@ lion_facets_opclause(LionFacetFilter *ff, Node *clause, Node *left,
  * ff->sets that *tree is set to.
  */
 static LionFacetSel
-lion_facets_filter_tree(LionFacetFilter *ff, Node *node, LionKeyNode **tree)
+lion_facets_filter_tree(LionTextFilter *ff, Node *node, LionKeyNode **tree)
 {
 	check_stack_depth();
 	CHECK_FOR_INTERRUPTS();
@@ -643,11 +633,15 @@ lion_facets_filter_tree(LionFacetFilter *ff, Node *node, LionKeyNode **tree)
 }
 
 /*
- * The filter of a run, taken apart into posting sets and collected once:
- * false when it selects no row at all.
+ * A filter given as text, taken apart into posting sets and collected once
+ * (lion_count_int.h, LionTextFilter): false when it selects no row at all.
+ * lion_index_facets() and lion_index_slice_agg() (lion_slice.c) both take
+ * one; `what` names it in their errors.
  */
-static bool
-lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
+bool
+lion_text_filter_begin(LionTextFilter *ff, const char *what, Relation heap,
+					   Snapshot snapshot, const char *filter,
+					   LionCountStats *stats)
 {
 	Node	   *qual;
 	List	   *oids;
@@ -656,15 +650,16 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
 	LionFacetSel sel;
 
 	memset(ff, 0, sizeof(*ff));
-	ff->heap = run->heap;
-	ff->snapshot = run->snapshot;
+	ff->what = what;
+	ff->heap = heap;
+	ff->snapshot = snapshot;
 
-	qual = lion_facets_parse(run->heap, filter);
-	lion_facets_check_filter(run->heap, qual);
+	qual = lion_facets_parse(heap, filter, what);
+	lion_facets_check_filter(heap, qual);
 	qual = eval_const_expressions(NULL, qual);
 
 	/* the table's lion indexes, in OID order, the planner's */
-	oids = RelationGetIndexList(run->heap);
+	oids = RelationGetIndexList(heap);
 	foreach(lc, oids)
 	{
 		Relation	index = index_open(lfirst_oid(lc), AccessShareLock);
@@ -682,11 +677,11 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
 	if (sel == LION_FSEL_ALL)
 		return true;
 
-	run->hasfilter = true;
-	memset(&run->filtersrc, 0, sizeof(LionCountSource));
-	run->filtersrc.nsets = ff->nsets;
-	run->filtersrc.sets = ff->sets;
-	run->filtersrc.tree = tree;
+	ff->hasfilter = true;
+	memset(&ff->src, 0, sizeof(LionCountSource));
+	ff->src.nsets = ff->nsets;
+	ff->src.sets = ff->sets;
+	ff->src.tree = tree;
 
 	if (!lion_sets_satisfiable(ff->nsets, ff->sets, tree))
 		return false;
@@ -705,21 +700,61 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
 	{
 		bool		spilled;
 
-		if (lion_sources_collect(run->heap, run->snapshot, 1, &run->filtersrc,
+		if (lion_sources_collect(heap, snapshot, 1, &ff->src,
 								 get_hash_memory_limit(), true, NULL,
-								 &run->copy, &spilled, &run->stats))
+								 &ff->copy, &spilled, stats))
 		{
 			int			i;
 
-			if (!run->copy.found)
+			if (!ff->copy.found)
 				return false;	/* the filter's sets have no row in common */
-			run->hascopy = true;
+			ff->hascopy = true;
 			for (i = 0; i < ff->nsets; i++)
 				lion_posting_set_release(&ff->sets[i]);
 			ff->nsets = 0;
 		}
 	}
 	return true;
+}
+
+/*
+ * The index-usage statistics of the indexes a filter read
+ * (pg_stat_user_indexes; REFERENCE.md, "Monitoring"): a scan of each, the
+ * rows counted as each one's idx_tup_read - all but `except`, which its
+ * caller counts.
+ */
+void
+lion_text_filter_report(LionTextFilter *ff, Relation except, int64 rows)
+{
+	ListCell   *lc;
+
+	foreach(lc, ff->indexes)
+	{
+		Relation	index = (Relation) lfirst(lc);
+
+		if (index == except ||
+			!list_member_oid(ff->vetted, RelationGetRelid(index)))
+			continue;
+		pgstat_count_index_scan(index);
+		pgstat_count_index_tuples(index, rows);
+	}
+}
+
+void
+lion_text_filter_end(LionTextFilter *ff)
+{
+	ListCell   *lc;
+	int			i;
+
+	for (i = 0; i < ff->nsets; i++)
+		lion_posting_set_release(&ff->sets[i]);
+	ff->nsets = 0;
+	if (ff->hascopy)
+		lion_posting_set_release(&ff->copy);
+	ff->hascopy = false;
+	foreach(lc, ff->indexes)
+		index_close((Relation) lfirst(lc), AccessShareLock);
+	ff->indexes = NIL;
 }
 
 /*
@@ -730,38 +765,13 @@ lion_facets_filter(LionFacetRun *run, const char *filter, LionFacetFilter *ff)
  * counts its own.
  */
 static void
-lion_facets_report(LionFacetRun *run, LionFacetFilter *ff)
+lion_facets_report(LionFacetRun *run)
 {
-	ListCell   *lc;
-
 	pgstat_count_index_scan(run->index);
 	pgstat_count_index_tuples(run->index, run->rows);
-	foreach(lc, ff->indexes)
-	{
-		Relation	index = (Relation) lfirst(lc);
-
-		if (index == run->index ||
-			!list_member_oid(ff->vetted, RelationGetRelid(index)))
-			continue;
-		pgstat_count_index_scan(index);
-		pgstat_count_index_tuples(index, run->rows);
-	}
+	lion_text_filter_report(&run->tf, run->index, run->rows);
 	if (run->fetched > 0)
 		lion_pgstat_count_fetches(run->heap, run->fetched);
-}
-
-static void
-lion_facets_filter_end(LionFacetFilter *ff)
-{
-	ListCell   *lc;
-	int			i;
-
-	for (i = 0; i < ff->nsets; i++)
-		lion_posting_set_release(&ff->sets[i]);
-	ff->nsets = 0;
-	foreach(lc, ff->indexes)
-		index_close((Relation) lfirst(lc), AccessShareLock);
-	ff->indexes = NIL;
 }
 
 /* ---------------------------------------------------------------------
@@ -1089,15 +1099,15 @@ lion_facets_count(LionFacetRun *run, const LionFacetKey *k)
 		memset(src, 0, sizeof(src));
 		src[0].nsets = 1;
 		src[0].sets = &ps;
-		if (run->hascopy)
+		if (run->tf.hascopy)
 		{
 			src[1].nsets = 1;
-			src[1].sets = &run->copy;
+			src[1].sets = &run->tf.copy;
 			n = 2;
 		}
-		else if (run->hasfilter)
+		else if (run->tf.hasfilter)
 		{
-			src[1] = run->filtersrc;
+			src[1] = run->tf.src;
 			n = 2;
 		}
 		count = lion_count_sources_cached(run->heap, run->snapshot, n, src,
@@ -1459,29 +1469,29 @@ lion_facets_resolve(LionFacetRun *run, LionFacetKey *k)
 	r.key = k->key;
 
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
-									  (1 + Max(run->filtersrc.nsets, 1)));
+									  (1 + Max(run->tf.src.nsets, 1)));
 	if (lion_posting_set_lookup_col(run->index, run->attno, k->key,
 									InvalidOid, &sets[0]))
 	{
 		LionKeyNode *args[2];
 
-		if (run->hascopy)
+		if (run->tf.hascopy)
 		{
-			sets[1] = run->copy;
+			sets[1] = run->tf.copy;
 			nsets = 2;
 			args[0] = lion_keynode_leaf(0);
 			args[1] = lion_keynode_leaf(1);
 			tree = lion_keynode_op(LION_KN_AND, args, 2);
 		}
-		else if (run->hasfilter)
+		else if (run->tf.hasfilter)
 		{
-			LionKeyNode *ftree = lion_source_tree(&run->filtersrc);
+			LionKeyNode *ftree = lion_source_tree(&run->tf.src);
 
 			if (ftree == NULL)
 				elog(ERROR, "lion index facets: a filter with no sets");
-			memcpy(&sets[1], run->filtersrc.sets,
-				   sizeof(LionPostingSet) * run->filtersrc.nsets);
-			nsets = 1 + run->filtersrc.nsets;
+			memcpy(&sets[1], run->tf.src.sets,
+				   sizeof(LionPostingSet) * run->tf.src.nsets);
+			nsets = 1 + run->tf.src.nsets;
 			args[0] = lion_keynode_leaf(0);
 			args[1] = lion_facets_tree_shift(ftree, 1);
 			tree = lion_keynode_op(LION_KN_AND, args, 2);
@@ -1531,7 +1541,7 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 	int			i;
 
 	run->counted += n;
-	if (!run->hascopy || n == 1)
+	if (!run->tf.hascopy || n == 1)
 	{
 		for (i = 0; i < n; i++)
 			lion_facets_keep_key(run, &keys[i],
@@ -1566,7 +1576,7 @@ lion_facets_count_keep(LionFacetRun *run, LionFacetKey *keys, int n)
 	}
 	if (nfound > 0)
 		lion_count_groups_copy(run->heap, run->snapshot, nfound, sets,
-							   &run->copy, counts, &run->stats, run->cache,
+							   &run->tf.copy, counts, &run->stats, run->cache,
 							   false, run->images);
 	for (i = 0; i < nfound; i++)
 		lion_posting_set_release(&sets[i]);
@@ -1672,7 +1682,7 @@ lion_facets_walk(LionFacetRun *run)
 static bool
 lion_facets_heap_ok(LionFacetRun *run)
 {
-	return run->hascopy &&
+	return run->tf.hascopy &&
 		run->index->rd_index->indkey.values[run->attno - 1] != 0 &&
 		heap_attisnull(run->index->rd_indextuple, Anum_pg_index_indpred,
 					   NULL);
@@ -1684,7 +1694,7 @@ lion_facets_heap_ok(LionFacetRun *run)
  * selects, a row at a time.  Each TID of the copy is fetched as an index scan
  * fetches it (table_index_fetch_tuple(): the HOT chain followed, the
  * snapshot applied, the predicate lock taken), and the copy holds every row
- * the snapshot sees under the filter (lion_facets_filter()), so the counts
+ * the snapshot sees under the filter (lion_text_filter_begin()), so the counts
  * are exact without the visibility map.  The row's value is taken apart by
  * the index's own extraction, which drops NULL and repeated elements, and
  * grouped under the column's equality - the index's entries' classes.
@@ -1767,7 +1777,7 @@ lion_facets_heap(LionFacetRun *run)
 	h.heapatt = run->index->rd_index->indkey.values[run->attno - 1];
 	h.nullcount = 0;
 
-	stream = lion_stream_begin(1, &run->copy, NULL, false);
+	stream = lion_stream_begin(1, &run->tf.copy, NULL, false);
 	done = lion_facets_rows(run, stream, lion_facets_heap_row, &h);
 	lion_stream_end(stream);
 	if (!done)
@@ -1897,7 +1907,7 @@ lion_facets_topk(LionFacetRun *run, int cap)
 			tocount++;
 		if (i == n && maxout > 0)
 			tocount = Max(tocount, (double) run->walked);
-		if ((double) run->copy.ntids < tocount * LION_FACET_KEY_ROWS)
+		if ((double) run->tf.copy.ntids < tocount * LION_FACET_KEY_ROWS)
 		{
 			for (i = 0; i < n; i++)
 				lion_facets_key_free(run, &cand[i]);
@@ -1962,7 +1972,6 @@ lion_index_facets(PG_FUNCTION_ARGS)
 	Oid			idxoid;
 	AttrNumber	attno = PG_ARGISNULL(3) ? 1 : (AttrNumber) PG_GETARG_INT16(3);
 	LionFacetRun run;
-	LionFacetFilter ff;
 	LionCountCall call;
 	Oid			outfunc;
 	bool		isvarlena;
@@ -1976,7 +1985,6 @@ lion_index_facets(PG_FUNCTION_ARGS)
 	idxoid = PG_GETARG_OID(0);
 
 	memset(&run, 0, sizeof(run));
-	memset(&ff, 0, sizeof(ff));
 	run.limit = PG_ARGISNULL(1) ? -1 : PG_GETARG_INT32(1);
 	if (!PG_ARGISNULL(1) && run.limit < 0)
 		ereport(ERROR,
@@ -2031,17 +2039,19 @@ lion_index_facets(PG_FUNCTION_ARGS)
 		run.heap_counts = (int64 *) palloc(sizeof(int64) * Max(run.k, 1));
 
 	if (!PG_ARGISNULL(2))
-		any = lion_facets_filter(&run, text_to_cstring(PG_GETARG_TEXT_PP(2)),
-								 &ff);
+		any = lion_text_filter_begin(&run.tf, "facet filter", run.heap,
+									 run.snapshot,
+									 text_to_cstring(PG_GETARG_TEXT_PP(2)),
+									 &run.stats);
 
 	if (any && run.k != 0)
 	{
 		run.share = 1.0;
-		if (run.hascopy && run.heap->rd_rel->reltuples > 0)
-			run.share = Min(1.0, Max((double) run.copy.ntids /
+		if (run.tf.hascopy && run.heap->rd_rel->reltuples > 0)
+			run.share = Min(1.0, Max((double) run.tf.copy.ntids /
 									 run.heap->rd_rel->reltuples, 1e-6));
 		run.batch = 1;
-		if (run.hascopy)
+		if (run.tf.hascopy)
 		{
 			run.batch = lion_count_groups_batch(run.index);
 			run.images = (PGAlignedBlock *)
@@ -2052,7 +2062,7 @@ lion_index_facets(PG_FUNCTION_ARGS)
 		{
 			/* every key: by the keys, or by the filter's rows when fewer */
 			run.heapread = lion_facets_heap_ok(&run) &&
-				(double) run.copy.ntids <
+				(double) run.tf.copy.ntids <
 				(double) lion_facets_nentries(&run) * LION_FACET_KEY_ROWS &&
 				lion_facets_heap(&run);
 			/* ... and by the keys when the rows' keys outgrew hash_mem */
@@ -2139,10 +2149,8 @@ lion_index_facets(PG_FUNCTION_ARGS)
 		}
 	}
 
-	lion_facets_report(&run, &ff);
-	lion_facets_filter_end(&ff);
-	if (run.hascopy)
-		lion_posting_set_release(&run.copy);
+	lion_facets_report(&run);
+	lion_text_filter_end(&run.tf);
 	lion_vis_cache_destroy(run.cache);
 	if (run.estate != NULL)
 		FreeExecutorState(run.estate);

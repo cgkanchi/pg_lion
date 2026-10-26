@@ -888,6 +888,25 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 						 errhint("REINDEX the index.")));
 			ix->cols[i].summarized = true;
 		}
+
+		/*
+		 * Slices (DESIGN.md §51), likewise: a build gives them only to a
+		 * scalar column of a type it can encode, at that type's width.
+		 */
+		if ((meta->slice_cols & (((uint32) 1) << i)) != 0)
+		{
+			int			nbits = lion_slice_type_nbits(ix->cols[i].typid);
+
+			if (nbits == 0 || ix->cols[i].multikey || !ix->cols[i].typbyval ||
+				ix->cols[i].typlen != nbits / 8)
+				ereport(ERROR,
+						(errcode(ERRCODE_INDEX_CORRUPTED),
+						 errmsg("index \"%s\" records slices for key column %d, whose key type cannot be sliced",
+								RelationGetRelationName(index), i + 1),
+						 errhint("REINDEX the index.")));
+			ix->cols[i].sliced = true;
+			ix->cols[i].slicebits = nbits;
+		}
 	}
 
 	/*
@@ -939,6 +958,39 @@ lion_settle_store_positions(Relation index, LionIndexState *ix,
 			 errmsg("store_positions needs a key column whose operator class can store positions"),
 			 errdetail("Index \"%s\" has none; tsvector_ops is one that can.",
 					   RelationGetRelationName(index))));
+}
+
+/*
+ * The key columns a build slices (DESIGN.md §51): with `slices = on`, every
+ * scalar key column whose key type lion_slice_type_nbits() takes - by value,
+ * at the width it encodes - and none otherwise.  A column of another type is
+ * simply not sliced, which lion_index_stats() says (`sliced`).  The state the
+ * build writes with is settled here too, as lion_fill_index_state() would
+ * settle it from the meta page these columns are recorded on.
+ */
+uint32
+lion_settle_slices(LionIndexState *ix, const LionOptions *opts)
+{
+	uint32		cols = 0;
+	int			i;
+
+	for (i = 0; i < ix->ncolumns && i < 32; i++)
+	{
+		LionState  *col = &ix->cols[i];
+		int			nbits = lion_slice_type_nbits(col->typid);
+
+		col->sliced = false;
+		col->slicebits = 0;
+		if (!opts->slices || nbits == 0 || col->multikey || !col->typbyval ||
+			col->typlen != nbits / 8)
+			continue;
+		col->sliced = true;
+		col->slicebits = nbits;
+		cols |= ((uint32) 1) << i;
+	}
+	ix->meta.slice_cols = cols;
+	ix->meta.version = (cols != 0) ? LION_VERSION_V15 : LION_VERSION_V14;
+	return cols;
 }
 
 /*

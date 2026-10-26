@@ -451,6 +451,32 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 		return ikind < sk->kind ? -1 : 1;
 
 	/*
+	 * A SLICE entry (DESIGN.md §51) is one per position, and its one-byte key
+	 * - the bit position - is that position, compared bytewise here in the
+	 * prefix rather than in the tail: two slices of one column are never
+	 * candidates for being the same entry, so a lookup of one is exact
+	 * without an equality to decide it (lion_dir_scan_run_ext()), as a
+	 * reserved entry's is, and a pivot made of one routes by it.  A search
+	 * key with no stored form stands before every slice of the column, which
+	 * is where a walk of them starts.
+	 */
+	if (ikind == LION_KIND_SLICE)
+	{
+		Size		n;
+		int			c;
+
+		if (sk->raw == NULL)
+			return 1;
+		n = Min((Size) item->keylen, sk->rawlen);
+		c = (n > 0) ? memcmp(LionEntryGetKey(item), sk->raw, n) : 0;
+		if (c != 0)
+			return c < 0 ? -1 : 1;
+		if ((Size) item->keylen != sk->rawlen)
+			return (Size) item->keylen < sk->rawlen ? -1 : 1;
+		return 0;
+	}
+
+	/*
 	 * One of each reserved entry and one last SUMMARY entry per column: their
 	 * kind is their whole position.  VALUE and SUMMARY entries are ordered by their
 	 * keys (DESIGN.md §32: a summary's key is its bucket's upper bound).
@@ -554,6 +580,18 @@ lion_search_key_init(LionState *state, LionSearchKey *sk, int kind, Datum key,
 	sk->collation = state->collation;
 	sk->raw = NULL;
 	sk->rawlen = 0;
+}
+
+void
+lion_search_key_slice(LionState *state, LionSearchKey *sk, int pos,
+					  uint8 *posbyte)
+{
+	Assert(pos >= 0 && pos <= LION_SLICE_EXISTS);
+	lion_search_key_init(state, sk, LION_KIND_SLICE, (Datum) 0, 0);
+	sk->cmpproc = NULL;			/* the prefix compares the position itself */
+	*posbyte = (uint8) pos;
+	sk->raw = (const char *) posbyte;
+	sk->rawlen = LION_SLICE_KEYLEN;
 }
 
 void

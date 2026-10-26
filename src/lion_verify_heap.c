@@ -615,8 +615,8 @@ lion_verify_found_positions(const LionPosMember *expect, bool have,
  */
 static LionVerifyFound
 lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
-					   uint16 reservedflag, uint32 hash, uint32 ckey,
-					   uint16 lo, const LionPosMember *expect)
+					   uint16 reservedflag, int slicepos, uint32 hash,
+					   uint32 ckey, uint16 lo, const LionPosMember *expect)
 {
 	Relation	index = vs->index;
 	Buffer		entrybuf;
@@ -627,7 +627,10 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 	bool		present = false;
 	LionVerifyFound found = LION_VFOUND_ABSENT;
 
-	if ((reservedflag != 0) ?
+	if ((slicepos >= 0) ?
+		lion_find_slice_entry(index, state, BUFFER_LOCK_SHARE, slicepos,
+							  &entrybuf, &entryoff) :
+		(reservedflag != 0) ?
 		lion_find_reserved_entry(index, state, BUFFER_LOCK_SHARE,
 								reservedflag, &entrybuf, &entryoff) :
 		lion_find_entry(index, state, BUFFER_LOCK_SHARE, key, hash,
@@ -730,6 +733,31 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 }
 
 /*
+ * Is the row at code in the SLICE of column state at pos (DESIGN.md §51), as
+ * the index is now?  A slice is found as a reserved entry is, and its set
+ * searched as any entry's (lion_verify_tid_present()).
+ */
+bool
+lion_verify_in_slice(LionVerifyState *vs, LionState *state, int pos,
+					 uint64 code)
+{
+	return lion_verify_tid_present(vs, state, (Datum) 0, 0, pos, 0,
+								   lion_code_ckey(code), lion_code_lo(code),
+								   NULL) == LION_VFOUND_PRESENT;
+}
+
+/* ... and under the VALUE entry of key, a value of column state? */
+bool
+lion_verify_under_key(LionVerifyState *vs, LionState *state, Datum key,
+					  uint64 code)
+{
+	return lion_verify_tid_present(vs, state, key, 0, -1,
+								   lion_hash_key(state, key),
+								   lion_code_ckey(code), lion_code_lo(code),
+								   NULL) == LION_VFOUND_PRESENT;
+}
+
+/*
  * A member's positions as a tsvector prints them - "3,7A" - for a message,
  * or "none" for a member of a stripped tsvector's key.
  */
@@ -769,7 +797,7 @@ lion_verify_one_key(LionVerifyState *vs, LionState *state, ItemPointer tid,
 	bool		typisvarlena;
 	LionVerifyFound found;
 
-	found = lion_verify_tid_present(vs, state, key, reservedflag, hash,
+	found = lion_verify_tid_present(vs, state, key, reservedflag, -1, hash,
 									lion_code_ckey(code), lion_code_lo(code),
 									expect);
 	if (found == LION_VFOUND_PRESENT)
@@ -933,6 +961,10 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 				key = PointerGetDatum(PG_DETOAST_DATUM(key));
 
 			lion_verify_one_key(vs, state, tid, key, 0, code, NULL);
+
+			/* ... and in exactly the slices its value's bits name (§51) */
+			if (state->sliced)
+				lion_verify_row_slices(vs, state, tid, key, code);
 		}
 
 		CHECK_FOR_INTERRUPTS();
