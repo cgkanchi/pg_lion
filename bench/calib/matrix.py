@@ -183,12 +183,13 @@ ARMS = {
     # LionOrderedJoin (or its split) at the forcing margin; and a nested
     # loop's LionBtreeScan probe, index-only where the B-tree covers the
     # query and in heap mode where it does not, with no Memoize over it
-    'probejoin': off(*JOINS),
+    'probejoin': arm(off(*JOINS), {'pg_lion.enable_probe_join': 'on'}),
     'ordjoin': arm(off('pg_lion.enable_btree_scan'),
-                   {'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
+                   {'pg_lion.enable_ordered_join': 'on',
+                    'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
     'probe': arm(off('enable_hashjoin', 'enable_mergejoin', 'enable_memoize',
                      'pg_lion.enable_ordered_join', 'pg_lion.enable_probe_join'),
-                 {'pg_lion.enable_heap_probe': 'on',
+                 {'pg_lion.enable_btree_scan': 'on', 'pg_lion.enable_heap_probe': 'on',
                   'pg_lion.pushdown_margin': str(LION_FORCE_MARGIN)}),
 }
 # arms whose settings are what they force: --set does not override them
