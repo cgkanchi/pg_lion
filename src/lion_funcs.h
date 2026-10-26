@@ -477,4 +477,31 @@ extern void lion_verify_heapallindexed(LionVerifyState *vs);
 /* lion_verify_summary.c */
 extern void lion_verify_summaries(LionVerifyState *vs);
 
+/*
+ * What the heap says of the row a code names: DEAD to every transaction there
+ * is - what an insert that failed or crashed between the steps of a row that
+ * goes into several sets leaves (§32, §50) - its inserting transaction still
+ * running, or its insert committed.
+ */
+typedef enum LionVerifyRow
+{
+	LION_VERIFY_ROW_DEAD,		/* dead to every transaction there is */
+	LION_VERIFY_ROW_INSERTING,	/* the transaction that inserted it runs on */
+	LION_VERIFY_ROW_INSERTED	/* its insert committed */
+} LionVerifyRow;
+
+extern LionVerifyRow lion_verify_row_state(LionVerifyState *vs, uint64 code);
+
+/* lion_verify_slice.c (DESIGN.md §50) */
+extern void lion_verify_slices(LionVerifyState *vs);
+extern void lion_verify_row_slices(LionVerifyState *vs, LionState *state,
+								   ItemPointer tid, Datum key, uint64 code);
+
+/* lion_verify_heap.c: is code in the slice at pos of column state, now? */
+extern bool lion_verify_in_slice(LionVerifyState *vs, LionState *state,
+								 int pos, uint64 code);
+/* ... and under the VALUE entry of key? */
+extern bool lion_verify_under_key(LionVerifyState *vs, LionState *state,
+								  Datum key, uint64 code);
+
 #endif							/* LION_FUNCS_H */

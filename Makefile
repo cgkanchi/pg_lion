@@ -25,7 +25,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
-       src/lion_verify_summary.o
+       src/lion_verify_summary.o src/lion_verify_slice.o
 # lionvec, the nearest-neighbour index of pgvector's `vector` and `halfvec`
 # (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
 # standalone.

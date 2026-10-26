@@ -49,6 +49,8 @@
 #include "lion_count_int.h"
 
 #include "access/htup_details.h"
+#include "access/table.h"
+#include "catalog/index.h"
 #include "catalog/pg_type_d.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -60,6 +62,7 @@
 #include "utils/numeric.h"
 
 PG_FUNCTION_INFO_V1(lion_index_slice_agg);
+PG_FUNCTION_INFO_V1(lion_debug_slice_insert);
 
 /* One run of the function. */
 typedef struct LionSliceRun
@@ -726,4 +729,59 @@ lion_index_slice_agg(PG_FUNCTION_ARGS)
 	lion_count_sql_close(&call);
 
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * lion_debug_slice_insert(idx regclass, attno int2, pos int2, t tid): put the
+ * row t into the slice at pos (a bit, or 64 for the existence slice) of
+ * sliced key column attno, whatever its value - a slice made wrong on
+ * purpose, for the tests of lion_index_verify() (test/sql/slices.sql), which
+ * create the function from the library as they create
+ * lion_debug_key_skew().  Superuser only; the index is written as an insert
+ * writes it, under RowExclusiveLock.
+ */
+Datum
+lion_debug_slice_insert(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	AttrNumber	attno = PG_GETARG_INT16(1);
+	int			pos = PG_GETARG_INT16(2);
+	ItemPointer tid = PG_GETARG_ITEMPOINTER(3);
+	Relation	heap;
+	Relation	index;
+	LionIndexState *ix;
+	LionState  *state;
+	uint64		code;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_slice_insert() is for superusers")));
+
+	heap = table_open(IndexGetRelation(relid, false), RowExclusiveLock);
+	index = index_open(relid, RowExclusiveLock);
+	if (index->rd_rel->relam != lion_get_am_oid())
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("index \"%s\" is not a lion index",
+						RelationGetRelationName(index))));
+	ix = lion_get_index_state(index);
+	if (attno < 1 || attno > ix->ncolumns || !ix->cols[attno - 1].sliced)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("key column %d of lion index \"%s\" is not bit-sliced",
+						attno, RelationGetRelationName(index))));
+	state = &ix->cols[attno - 1];
+	if (pos != LION_SLICE_EXISTS && (pos < 0 || pos >= state->slicebits))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("key column %d of lion index \"%s\" has no slice %d",
+						attno, RelationGetRelationName(index), pos)));
+	lion_check_key_offset(tid);
+	code = lion_tid_to_code(tid);
+	lion_slice_insert_one(index, heap, state, pos, lion_code_ckey(code),
+						  lion_code_lo(code));
+	index_close(index, RowExclusiveLock);
+	table_close(heap, RowExclusiveLock);
+	PG_RETURN_VOID();
 }

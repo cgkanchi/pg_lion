@@ -4296,6 +4296,9 @@ lion_index_verify(PG_FUNCTION_ARGS)
 	 */
 	lion_verify_summaries(&vs);
 
+	/* ... and what the bit slices hold (DESIGN.md §50) */
+	lion_verify_slices(&vs);
+
 	/*
 	 * What writers running beside the check cost it (DESIGN.md §7), in the
 	 * spirit of ambulkdelete's DEBUG1 breakdown.

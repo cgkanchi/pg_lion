@@ -2181,6 +2181,15 @@ extern bool lion_find_slice_entry(Relation index, LionState *state,
 								  int lockmode, int pos, Buffer *buf,
 								  OffsetNumber *offnum);
 
+/*
+ * Add the row at (ckey, lo) to the SLICE of column state at pos, creating
+ * the entry when there is none (lion_insert.c): one step of an insert into a
+ * sliced column, and what lion_debug_slice_insert() damages a slice with.
+ */
+extern void lion_slice_insert_one(Relation index, Relation heaprel,
+								  LionState *state, int pos, uint32 ckey,
+								  uint16 lo);
+
 static inline bool
 lion_find_null_entry(Relation index, LionState *state, int lockmode,
 					Buffer *buf, OffsetNumber *offnum)
