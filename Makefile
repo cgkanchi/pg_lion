@@ -19,7 +19,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_plan_private.o src/lion_plan_partial.o src/lion_plan_nonempty.o \
        src/lion_plan_cells.o src/lion_plan_anti.o src/lion_ordjoin.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
-       src/lion_exec_cells.o \
+       src/lion_exec_cells.o src/lion_exec_slice.o \
        src/lion_exec_fkjoin.o src/lion_exec_anti.o src/lion_exec_run.o src/lion_exec_explain.o \
        src/lion_probejoin.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which

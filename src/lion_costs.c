@@ -81,6 +81,12 @@ double		lion_fkjoin_copy_probe_cost;
 double		lion_fkjoin_copy_member_cost;
 double		lion_fkjoin_copy_container_cost;
 double		lion_fkjoin_batch_row_cost;
+double		lion_slice_key_cost;
+double		lion_slice_container_cost;
+double		lion_slice_step_cost;
+double		lion_slice_step_key_cost;
+double		lion_slice_step_row_cost;
+double		lion_slice_page_cost;
 double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
@@ -189,6 +195,20 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each fold or merge of a lion range collected as a source into a container of its union that is not a bitset"},
 	{"pg_lion.spill_read_cost", &lion_spill_read_cost, 27.0, LION_OP,
 	 "Sets the planner's estimate of the cost of each container a lion count reads back from a set spilled to a temporary file"},
+
+	/* lion_plan_cost.c: the aggregates of sliced columns (§52) */
+	{"pg_lion.slice_key_cost", &lion_slice_key_cost, 120.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each container key at which a lion count of a sliced column's slices meets its WHERE"},
+	{"pg_lion.slice_container_cost", &lion_slice_container_cost, 15.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each container of a sliced column's slice that a lion count reads and counts"},
+	{"pg_lion.slice_page_cost", &lion_slice_page_cost, 200.0, LION_OP,
+	 "Sets the planner's estimate of the cost of copying and walking each posting page of a sliced column's slice that a lion count reads, beside its read"},
+	{"pg_lion.slice_step_cost", &lion_slice_step_cost, 1000.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each step of a lion descent over a sliced column's slices for a minimum or a maximum"},
+	{"pg_lion.slice_step_key_cost", &lion_slice_step_key_cost, 50.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each container key of the candidates a step of a lion descent over a sliced column's slices counts"},
+	{"pg_lion.slice_step_row_cost", &lion_slice_step_row_cost, 0.9, LION_OP,
+	 "Sets the planner's estimate of the cost of each candidate row a step of a lion descent over a sliced column's slices counts"},
 
 	/* lion_plan_fkjoin_cost.c: the FK-side join (§27) */
 	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 14.0, LION_TUPLE,

@@ -2206,6 +2206,9 @@ lion_release_where(LionCountScanState *st)
 	 * closed here, and its memory goes with wherecxt below.
 	 */
 	lion_posting_set_release(&st->wherecoll);
+
+	/* ... and a GROUP BY's copies of it with sliced columns' E (§52) */
+	lion_slice_release(st);
 	st->wtried = false;
 	st->wcollected = false;
 	st->wknown = false;
@@ -2482,6 +2485,17 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					LionWAgg   *a =
 						&lion_st_wagg(st)->agg[LION_TL_WAGG_NO(kind)];
 
+					slot->tts_values[i] = a->result;
+					slot->tts_isnull[i] = a->resnull;
+					break;
+				}
+				if (LION_TL_IS_SAGG(kind))
+				{
+					/* an aggregate of a sliced column (DESIGN.md §52) */
+					LionSAgg   *a = &st->slice->agg[LION_TL_SAGG_NO(kind)];
+
+					Assert(st->slice != NULL &&
+						   LION_TL_SAGG_NO(kind) < st->slice->nagg);
 					slot->tts_values[i] = a->result;
 					slot->tts_isnull[i] = a->resnull;
 					break;

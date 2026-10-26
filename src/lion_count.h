@@ -927,8 +927,151 @@ extern void lion_count_groups_copy(Relation heap, Snapshot snapshot,
 								   LionCountStats *stats, LionVisCache *cache,
 								   bool rel_read_only, PGAlignedBlock *images);
 
+/*
+ * The same walk, its groups at a key whose every block is all-visible
+ * counted without their intersections being built, where opts is not NULL
+ * (DESIGN.md §52, "The kernel"): the BITSETs and NARROWs of one width that
+ * stand there against the copy's image by one pass of
+ * lion_planes_count_strided() when opts->kernel is set, and the rest - all
+ * of them, with the kernel off - each by lion_container_and_cardinality().
+ * The answers are lion_count_groups_copy()'s to the row.  What it did is
+ * added to opts' counters.
+ */
+typedef struct LionGroupsKernel
+{
+	bool		kernel;			/* in: the plane kernel where it applies */
+	int64		containers;		/* out: the groups' containers counted */
+	int64		kernelkeys;		/* out: keys at which the kernel ran */
+	int64		kernelplanes;	/* out: containers its passes counted */
+} LionGroupsKernel;
+
+extern void lion_count_groups_copy_ext(Relation heap, Snapshot snapshot,
+									   int ngroups, LionPostingSet *groups,
+									   const LionPostingSet *copy,
+									   int64 *counts, LionCountStats *stats,
+									   LionVisCache *cache,
+									   bool rel_read_only,
+									   PGAlignedBlock *images,
+									   LionGroupsKernel *opts);
+
 /* How many groups of index one lion_count_groups_copy() may take. */
 extern int	lion_count_groups_batch(Relation index);
+
+/*
+ * BIT-SLICED AGGREGATES (DESIGN.md §51, §52; lion_slice.c).  A sliced key
+ * column keeps a posting set per bit of its values' encoding
+ * (lion_slice_enc.h) and an existence slice E of its rows not NULL; with F a
+ * set of rows,
+ *
+ *		count(x) = |E ∧ F|,  sum(x) = Σ 2^i |S_i ∧ F| - count · 2^(nbits-1)
+ *
+ * and min and max by a descent from the top bit, a counted AND a bit.  Every
+ * count is the count engine's: a slice located with its pin ANDed with F,
+ * which is a collected, pinless copy on a primary - the SQL function's
+ * filter, the LionCount node's E ∧ WHERE - or, on a hot standby where nothing
+ * is collected, the located sources of a filter counted beside each slice.
+ *
+ * A LionSliceAgg is one run over one column: begun on a heap, an index and a
+ * key column of it that is sliced, under a snapshot, with the caller's
+ * visibility cache, and ended once its answers are out.  It keeps the
+ * counters EXPLAIN ANALYZE and DEBUG1 report, and the count engine's
+ * statistics of its counts.
+ */
+typedef struct LionSliceAgg
+{
+	Relation	heap;
+	Relation	index;
+	AttrNumber	attno;			/* the key column of index */
+	int			nbits;			/* its encoding's width */
+	Snapshot	snapshot;
+	LionVisCache *cache;
+	bool		rel_read_only;
+	bool		kernel;			/* the plane kernel where it applies */
+	int			batch;			/* slices counted together at most */
+	PGAlignedBlock *images;		/* ... and their cursors' page images */
+	MemoryContext cxt;			/* the run's */
+	MemoryContext stepcxt;		/* reset around every count */
+	MemoryContext candcxt;		/* a descent's candidate sets */
+	LionCountStats stats;		/* the count engine's, of every count */
+
+	/* what DEBUG1 and EXPLAIN ANALYZE report */
+	int64		located;		/* slices located */
+	int64		absent;			/* ... that had no entry */
+	int64		counts;			/* counted ANDs */
+	int64		collects;		/* candidate sets collected */
+	int64		steps;			/* descent steps */
+	LionGroupsKernel walk;		/* the batches' containers, and the kernel's */
+} LionSliceAgg;
+
+/*
+ * The rows a run's counts are made over: a collected copy ANDed with every
+ * slice - `inexists` when it holds no row the column has NULL in, as E ∧ F
+ * does, so that a descent may begin from it - or, without one, nsrc sources
+ * counted beside every slice (a standby's), or nothing: every row.
+ */
+typedef struct LionSliceFilter
+{
+	const LionPostingSet *copy;
+	bool		inexists;
+	int			nsrc;
+	LionCountSource *srcs;
+} LionSliceFilter;
+
+/* Whether a run may use the plane kernel (pg_lion.enable_slice_kernel) */
+extern PGDLLIMPORT bool lion_enable_slice_kernel;
+
+extern void lion_slice_agg_begin(LionSliceAgg *sa, Relation heap,
+								 Relation index, AttrNumber attno,
+								 Snapshot snapshot, LionVisCache *cache,
+								 bool rel_read_only);
+extern void lion_slice_agg_end(LionSliceAgg *sa);
+
+/*
+ * counts[i] = |S_i ∧ F| for every bit slice i, and counts[nbits] = |E ∧ F|:
+ * every slice where `bits` is set, E alone (the others 0) where it is not.
+ * counts holds LION_SLICE_NPOS(nbits).
+ */
+extern void lion_slice_counts(LionSliceAgg *sa, const LionSliceFilter *f,
+							  bool bits, int64 *counts);
+
+/*
+ * The largest (max) or smallest encoding of the rows of E ∧ F the snapshot
+ * sees, which number `visible` (> 0): the descent.
+ */
+extern uint64 lion_slice_extreme(LionSliceAgg *sa, const LionSliceFilter *f,
+								 bool max, int64 visible);
+
+/*
+ * The answers, made of the counts: sum(x) as core's sum() of the column's
+ * type returns it and avg(x) as its avg() does - in 128 bits where the
+ * compiler has them, else not taken - and a value of the column's type from
+ * an encoding.
+ */
+#ifdef HAVE_INT128
+extern int128 lion_slice_counts_sum(const int64 *counts, int nbits);
+extern Datum lion_slice_int128_numeric(int128 v);
+#endif
+extern Datum lion_slice_value_datum(uint64 enc, int nbits, Oid typid);
+
+/*
+ * What a column's slices hold, from their entries' headers alone: how many
+ * slices have an entry, and the rows and items (containers and sparse
+ * segments) they record - for the planner, which prices the slices' counts
+ * from it (DESIGN.md §52, "Cost") and leaves their pages out of the index's
+ * (lion_amcost.c).
+ */
+typedef struct LionSliceShape
+{
+	int			nbits;			/* the column's width */
+	int			nslices;		/* entries found, E among them */
+	bool		complete;		/* every slice's entry was read */
+	double		rows[LION_PLANES_MAX_BITS + 1]; /* each slice's ntids, by
+												 * position, E's last */
+	double		items[LION_PLANES_MAX_BITS + 1];	/* ... and its items */
+} LionSliceShape;
+
+extern void lion_slice_shape(Relation index, AttrNumber attno,
+							 LionSliceShape *shape);
 
 /*
  * THE GROUPS OF SEVERAL COLUMNS, DECODED KEY BY KEY (DESIGN.md §34,
@@ -1771,6 +1914,12 @@ extern PGDLLIMPORT bool lion_enable_count_partial;
  * planner switch.
  */
 extern PGDLLIMPORT bool lion_enable_topk;
+
+/*
+ * Whether the count pushdown may answer sum, avg, count, min and max of a
+ * bit-sliced column from its slices (DESIGN.md §52).  A planner switch.
+ */
+extern PGDLLIMPORT bool lion_enable_count_slices;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);

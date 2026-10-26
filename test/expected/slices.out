@@ -676,13 +676,30 @@ SELECT slc_both($$SELECT count(DISTINCT ts) FROM %s$$);
  same
 (1 row)
 
--- the aggregates over keys (§37)
+-- the aggregates over keys (§37), the slices' answer (§52) set aside
+SET pg_lion.enable_count_slices = off;
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
               QUERY PLAN               
 ---------------------------------------
  Custom Scan (LionCount)
    Lion Indexes: slc_w1_k.g (all rows)
    Aggregates Over Keys: slc_w1_k (k)
+(3 rows)
+
+SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
+ slc_both 
+----------
+ same
+(1 row)
+
+RESET pg_lion.enable_count_slices;
+-- and from the slices, which this small table's costs choose (§52)
+EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
+                                     QUERY PLAN                                      
+-------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slc_w1_k.g (all rows)
+   Aggregates From Slices: slc_w1_k (k: every bit counted, min descent, max descent)
 (3 rows)
 
 SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
