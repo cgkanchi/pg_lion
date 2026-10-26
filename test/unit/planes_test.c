@@ -92,7 +92,7 @@ rnd_below(uint32 n)
 static void *
 xmalloc(Size n)
 {
-	void	   *p = malloc(n > 0 ? n : 1);
+	void	   *p = calloc(1, n > 0 ? n : 1);
 
 	if (p == NULL)
 	{
@@ -110,15 +110,15 @@ xmalloc(Size n)
 static uint64 *
 words_alloc(uint32 nwords, uint32 shift, void **base)
 {
-	char	   *p;
+	void	   *p = NULL;
 
-	if (posix_memalign((void **) &p, 32, shift + Max(nwords, 1) * sizeof(uint64)) != 0)
+	if (posix_memalign(&p, 32, shift + Max(nwords, 1) * sizeof(uint64)) != 0)
 	{
 		printf("out of memory\n");
 		exit(2);
 	}
 	*base = p;
-	return (uint64 *) (p + shift);
+	return (uint64 *) ((char *) p + shift);
 }
 
 /* The implementations, as forced. */
