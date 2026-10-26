@@ -1187,7 +1187,7 @@ lion_verify_meta(LionVerifyState *vs)
 	 * with.
 	 */
 	/*
-	 * The sliced columns of §50, in the word that was the bucket count: as
+	 * The sliced columns of §51, in the word that was the bucket count: as
 	 * many as the version says, columns the index has, and columns that can
 	 * be sliced (lion_fill_index_state() refuses the rest before this runs).
 	 */

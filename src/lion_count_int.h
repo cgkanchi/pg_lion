@@ -1461,7 +1461,7 @@ extern void lion_count_open_indexes(Snapshot snapshot, int nidx,
 /*
  * The same for a caller whose query calls other functions than count(*) and
  * the column's equality - lion_index_slice_agg()'s count(x), sum(x), min(x)
- * and max(x) (DESIGN.md §50) - and checks EXECUTE on those itself:
+ * and max(x) (DESIGN.md §51) - and checks EXECUTE on those itself:
  * ownfuncs leaves both of those checks out, and everything else is as above.
  */
 extern void lion_count_open_indexes_ext(Snapshot snapshot, int nidx,

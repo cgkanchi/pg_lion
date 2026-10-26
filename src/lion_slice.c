@@ -3,7 +3,7 @@
  * lion_slice.c
  *		lion_index_slice_agg(): count, sum, min and max of a bit-sliced key
  *		column's rows under an optional filter, from its SLICE entries alone
- *		(DESIGN.md §50, "The SQL function").
+ *		(DESIGN.md §51, "The SQL function").
  *
  * A sliced column keeps one posting set per bit of its values' encoding
  * (lion_slice_enc.h) - slice i holds the rows whose encoded value has bit i
@@ -27,12 +27,15 @@
  * TID on a page the map does not vouch for is decided in the heap under the
  * snapshot.  So each count is exact, and so is each answer made of them.
  *
- * THE SEAM for the bit-plane kernel (src/lion_planes.[ch], in progress):
+ * THE SEAM for the bit-plane kernel (DESIGN.md §50, src/lion_planes.[ch]):
  * lion_slice_counts() counts the slices one set at a time - a batch of them
  * through lion_count_groups_copy(), which reads the filter's container at
  * each key once for all of them, but ANDs and counts each slice's container
- * on its own.  The kernel will take a container key's k slice containers as
- * k planes and count the AND of each with the filter's in one strided pass.
+ * on its own, a lion_container_and_cardinality()-shaped step per slice.  At a
+ * container key where the slices are BITSETs the kernel takes their payloads
+ * as k planes and counts the AND of each with the filter's image in one
+ * strided pass (lion_planes_count_strided(bits, planes, nwords, k, counts));
+ * the slices there that are not BITSETs keep the container AND.
  *
  * Nothing here is reached by the planner yet: the function is called by name
  * and goes through the reader contract of every such function
@@ -140,8 +143,9 @@ lion_slice_count_set(LionSliceRun *run, LionPostingSet *set,
  * its keys.  A slice with no entry has no row.
  *
  * THE SEAM (see the file header): a slice at a time, a container of it at a
- * time.  The strided plane kernel replaces the inner AND-and-count of the
- * batch with one pass over the k slices' containers at a key.
+ * time.  lion_planes_count_strided() (DESIGN.md §50) replaces the inner
+ * AND-and-count of the batch with one pass over the k slices' BITSET
+ * payloads at a key.
  */
 static void
 lion_slice_counts(LionSliceRun *run, int64 *counts)

@@ -451,7 +451,7 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 		return ikind < sk->kind ? -1 : 1;
 
 	/*
-	 * A SLICE entry (DESIGN.md §50) is one per position, and its one-byte key
+	 * A SLICE entry (DESIGN.md §51) is one per position, and its one-byte key
 	 * - the bit position - is that position, compared bytewise here in the
 	 * prefix rather than in the tail: two slices of one column are never
 	 * candidates for being the same entry, so a lookup of one is exact

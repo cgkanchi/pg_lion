@@ -930,7 +930,7 @@ lion_build_add_entry(LionBuildState *bs, LionEntryTuple *entry, Size size)
 	}
 
 	lion_build_level_add(bs, bs->leaf, entry, size);
-	/* the keys, for the §17 guard; a summary (§32) or a slice (§50) is not one */
+	/* the keys, for the §17 guard; a summary (§32) or a slice (§51) is not one */
 	if (!LionEntryIsDerived(entry))
 		bs->ndistinct++;
 
@@ -1225,7 +1225,7 @@ lion_builder_create(LionBuildState *bs, Datum key, int keykind, uint32 hash,
 		datumCopy(key, cs->typbyval, cs->typlen);
 
 	/*
-	 * A SLICE entry's key is its one-byte position (DESIGN.md §50), which
+	 * A SLICE entry's key is its one-byte position (DESIGN.md §51), which
 	 * `key` carries as a uint8.
 	 */
 	if (keykind == LION_KIND_SLICE)
@@ -1941,7 +1941,7 @@ lion_builder_cmp(const void *a, const void *b, void *arg)
 
 	if (x->keykind != y->keykind)
 		return x->keykind < y->keykind ? -1 : 1;
-	if (x->keykind == LION_KIND_SLICE)	/* one per position (§50) */
+	if (x->keykind == LION_KIND_SLICE)	/* one per position (§51) */
 		return memcmp(x->rawkey, y->rawkey, LION_SLICE_KEYLEN);
 	if (x->keykind != LION_KEY_REAL)
 		return 0;				/* one of each reserved entry per column */
@@ -2425,7 +2425,7 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 		lion_sum_key_begin(bs, bs->sum);
 
 	/*
-	 * A sliced column's SLICE entries (DESIGN.md §50) come after its values
+	 * A sliced column's SLICE entries (DESIGN.md §51) come after its values
 	 * AND its summaries: the first slice closes the summaries, which are
 	 * written here, where the directory order puts them.
 	 */
@@ -2562,7 +2562,7 @@ lion_build_index_state(Relation index, LionIndexState *ix, MemoryContext cxt,
 		meta.order_flags |= LION_META_POSITIONS;
 	lion_fill_index_state(index, ix, &meta, cxt);
 	lion_settle_store_positions(index, ix, opts);
-	/* ... and the columns it slices (DESIGN.md §50), which the spool reads */
+	/* ... and the columns it slices (DESIGN.md §51), which the spool reads */
 	(void) lion_settle_slices(ix, opts);
 
 	return inline_limit;
@@ -3483,7 +3483,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	/* ... and which columns got summaries (§32). */
 	lion_meta_record_summaries(LionPageGetMeta((Page) metabuf->data),
 							   bs.summary_cols, bs.sumtids);
-	/* ... and which are bit-sliced, which sets the version (§50). */
+	/* ... and which are bit-sliced, which sets the version (§51). */
 	lion_meta_record_slices(LionPageGetMeta((Page) metabuf->data),
 							bs.ix.meta.slice_cols);
 	/* ... and each column's distinct keys, for the planner (§33). */

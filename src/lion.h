@@ -528,7 +528,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
  * bit, which is no flag of this format.  So opening a version 13 index is an
  * ERROR whose hint asks for REINDEX.
  *
- * Version 15 (DESIGN.md §50) is version 14 plus SLICE ENTRIES: after a
+ * Version 15 (DESIGN.md §51) is version 14 plus SLICE ENTRIES: after a
  * bit-sliced column's VALUE entries and summaries, one entry per bit of its
  * values' encoding and one of the rows not NULL, of a kind no build before
  * knows - it would read a slice as a VALUE entry with a one-byte key, and fail
@@ -548,7 +548,7 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 #define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
 #define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17), NARROW
 								 * items anywhere, no flag (§38) */
-#define LION_VERSION_V15		15	/* ... plus the SLICE entries of §50 */
+#define LION_VERSION_V15		15	/* ... plus the SLICE entries of §51 */
 
 typedef struct LionMetaPageData
 {
@@ -558,7 +558,7 @@ typedef struct LionMetaPageData
 	uint16		container_bits; /* LION_CONTAINER_BITS at build time */
 
 	/*
-	 * BIT-SLICED KEY COLUMNS (DESIGN.md §50): bit i - 1, key column i keeps
+	 * BIT-SLICED KEY COLUMNS (DESIGN.md §51): bit i - 1, key column i keeps
 	 * SLICE entries, decided when the index was built and fixed for its life.
 	 * Nonzero only on a version 15 meta page.  The word was nbuckets, the
 	 * hash directory's bucket count, which is 0 on every meta page written
@@ -799,13 +799,13 @@ lion_sumsq_add(uint64 *sum, uint64 n)
 #define LionEntryIsKeyless(e)	(((e)->flags & LION_ENTRY_KEYLESS) != 0)
 #define LionEntryIsSummary(e)	(((e)->flags & LION_ENTRY_SUMKINDS) != 0)
 #define LionEntryIsSumLast(e)	(((e)->flags & LION_ENTRY_SUMLAST) != 0)
-/* A bit slice or the existence slice of a sliced column (DESIGN.md §50). */
+/* A bit slice or the existence slice of a sliced column (DESIGN.md §51). */
 #define LionEntryIsSlice(e)		(((e)->flags & LION_ENTRY_SLICE) != 0)
 /*
  * A summary or a slice: an entry whose posting set is derived from its
  * column's rows and that sorts after every VALUE entry of the column.  Every
  * walk that returns keys stops at the first one, as it stops at the next
- * column's first entry (DESIGN.md §32, §50).
+ * column's first entry (DESIGN.md §32, §51).
  */
 #define LionEntryIsDerived(e)	(((e)->flags & LION_ENTRY_DERIVED) != 0)
 #define LION_NULLKEY_HASH		0
@@ -844,7 +844,7 @@ lion_sumsq_add(uint64 *sum, uint64 n)
  * of a column's values ends at its first summary exactly as it ends at the
  * next column's first entry.  SUMMARY entries are ordered by their keys like
  * values; the one SUMLAST entry a column may have is ordered by its kind
- * alone.  The SLICE entries of §50 come last, after the summaries, each
+ * alone.  The SLICE entries of §51 come last, after the summaries, each
  * ordered by its one-byte key - the bit position - which the prefix compares
  * bytewise (lion_cmp_prefix()): one entry per position, found as a reserved
  * entry is found, and the first of a column's derived kinds that a walk of
@@ -867,7 +867,7 @@ lion_sumsq_add(uint64 *sum, uint64 n)
 #define LION_KIND_VALUE		6
 #define LION_KIND_SUMMARY	7	/* DESIGN.md §32 */
 #define LION_KIND_SUMLAST	8
-#define LION_KIND_SLICE		9	/* DESIGN.md §50 */
+#define LION_KIND_SLICE		9	/* DESIGN.md §51 */
 
 /*
  * The kinds of the reserved entries, which have no key and one per column:
@@ -1102,7 +1102,7 @@ typedef struct LionOptions
 	int			summaries;		/* LION_SUMOPT_*, DESIGN.md §32 */
 	int			summary_tids;	/* TIDs a summary bucket takes (§32) */
 	int			store_positions;	/* LION_POSOPT_*, DESIGN.md §17 */
-	bool		slices;			/* bit-sliced columns, DESIGN.md §50 */
+	bool		slices;			/* bit-sliced columns, DESIGN.md §51 */
 } LionOptions;
 
 /*
@@ -1290,7 +1290,7 @@ typedef struct LionState
 	bool		summarized;
 
 	/*
-	 * The column is BIT-SLICED (DESIGN.md §50): its bit in the meta page's
+	 * The column is BIT-SLICED (DESIGN.md §51): its bit in the meta page's
 	 * slice_cols.  Only ever set on a scalar column whose key type
 	 * lion_slice_type_nbits() takes, and only on a version 15 index; slicebits
 	 * is that width, 16, 32 or 64.  Inserts keep the slices current;
@@ -2138,7 +2138,7 @@ extern LionEntryTuple *lion_make_reserved_entry(AttrNumber attno,
 											  Size payloadlen, Size *size);
 
 /*
- * The same for a SLICE entry (DESIGN.md §50): its one-byte key is pos, a bit
+ * The same for a SLICE entry (DESIGN.md §51): its one-byte key is pos, a bit
  * position or LION_SLICE_EXISTS, and LION_ENTRY_SLICE is set on top of the
  * caller's INLINE/CHAIN flag.
  */
@@ -2155,7 +2155,7 @@ lion_entry_slice_pos(const LionEntryTuple *e)
 }
 
 /*
- * A search key for the SLICE entry of column state at pos (DESIGN.md §50):
+ * A search key for the SLICE entry of column state at pos (DESIGN.md §51):
  * the kind and the one-byte key, which the prefix compares (lion_dir.c).
  * posbyte is the caller's, and has to live as long as sk.
  */
@@ -2176,7 +2176,7 @@ extern bool lion_find_reserved_entry(Relation index, LionState *state,
 									int lockmode, uint16 reservedflag,
 									Buffer *buf, OffsetNumber *offnum);
 
-/* ... and a SLICE entry of a bit-sliced column (DESIGN.md §50). */
+/* ... and a SLICE entry of a bit-sliced column (DESIGN.md §51). */
 extern bool lion_find_slice_entry(Relation index, LionState *state,
 								  int lockmode, int pos, Buffer *buf,
 								  OffsetNumber *offnum);
@@ -2680,7 +2680,7 @@ extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
 
 /*
- * ... and which are bit-sliced (DESIGN.md §50), which decides the version:
+ * ... and which are bit-sliced (DESIGN.md §51), which decides the version:
  * 15 when any is, 14 - byte for byte what it was - when none is.  After
  * lion_meta_record_summaries(), which sets 14.
  */

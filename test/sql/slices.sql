@@ -1,4 +1,4 @@
--- Bit-sliced key columns (DESIGN.md §50): the SLICE entries a column built
+-- Bit-sliced key columns (DESIGN.md §51): the SLICE entries a column built
 -- WITH (slices = on) keeps, lion_index_slice_agg() against the query it
 -- stands for, verify, and the readers that must not see slices.
 \set VERBOSITY terse
@@ -73,7 +73,7 @@ EXCEPTION WHEN OTHERS THEN
 		CASE WHEN detail <> '' THEN ' (' || detail || ')' ELSE '' END;
 END $$;
 
--- The meta page's format version and sliced columns (DESIGN.md §50): the
+-- The meta page's format version and sliced columns (DESIGN.md §51): the
 -- little-endian words at 28 and 36 of block 0.
 CREATE FUNCTION slc_meta(idx regclass, OUT version int8, OUT slice_cols int8)
 LANGUAGE sql AS $$

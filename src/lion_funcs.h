@@ -480,7 +480,7 @@ extern void lion_verify_summaries(LionVerifyState *vs);
 /*
  * What the heap says of the row a code names: DEAD to every transaction there
  * is - what an insert that failed or crashed between the steps of a row that
- * goes into several sets leaves (§32, §50) - its inserting transaction still
+ * goes into several sets leaves (§32, §51) - its inserting transaction still
  * running, or its insert committed.
  */
 typedef enum LionVerifyRow
@@ -492,7 +492,7 @@ typedef enum LionVerifyRow
 
 extern LionVerifyRow lion_verify_row_state(LionVerifyState *vs, uint64 code);
 
-/* lion_verify_slice.c (DESIGN.md §50) */
+/* lion_verify_slice.c (DESIGN.md §51) */
 extern void lion_verify_slices(LionVerifyState *vs);
 extern void lion_verify_row_slices(LionVerifyState *vs, LionState *state,
 								   ItemPointer tid, Datum key, uint64 code);

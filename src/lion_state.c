@@ -890,7 +890,7 @@ lion_fill_index_state(Relation index, LionIndexState *ix,
 		}
 
 		/*
-		 * Slices (DESIGN.md §50), likewise: a build gives them only to a
+		 * Slices (DESIGN.md §51), likewise: a build gives them only to a
 		 * scalar column of a type it can encode, at that type's width.
 		 */
 		if ((meta->slice_cols & (((uint32) 1) << i)) != 0)
@@ -961,7 +961,7 @@ lion_settle_store_positions(Relation index, LionIndexState *ix,
 }
 
 /*
- * The key columns a build slices (DESIGN.md §50): with `slices = on`, every
+ * The key columns a build slices (DESIGN.md §51): with `slices = on`, every
  * scalar key column whose key type lion_slice_type_nbits() takes - by value,
  * at the width it encodes - and none otherwise.  A column of another type is
  * simply not sliced, which lion_index_stats() says (`sliced`).  The state the

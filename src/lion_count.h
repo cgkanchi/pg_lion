@@ -538,7 +538,7 @@ extern bool lion_posting_set_lookup_reserved_col(Relation index,
 												 LionPostingSet *ps);
 
 /*
- * ... and one SLICE of a bit-sliced column (DESIGN.md §50): pos is a bit
+ * ... and one SLICE of a bit-sliced column (DESIGN.md §51): pos is a bit
  * position of the column's encoding (lion_slice_enc.h) or LION_SLICE_EXISTS.
  * False when the slice has no entry - no row of the column has that bit, or
  * none at all - which counts as an empty set.  Located with its pin, as every

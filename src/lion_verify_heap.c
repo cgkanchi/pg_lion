@@ -733,7 +733,7 @@ lion_verify_tid_present(LionVerifyState *vs, LionState *state, Datum key,
 }
 
 /*
- * Is the row at code in the SLICE of column state at pos (DESIGN.md §50), as
+ * Is the row at code in the SLICE of column state at pos (DESIGN.md §51), as
  * the index is now?  A slice is found as a reserved entry is, and its set
  * searched as any entry's (lion_verify_tid_present()).
  */
@@ -962,7 +962,7 @@ lion_verify_heap_callback(Relation index, ItemPointer tid, Datum *values,
 
 			lion_verify_one_key(vs, state, tid, key, 0, code, NULL);
 
-			/* ... and in exactly the slices its value's bits name (§50) */
+			/* ... and in exactly the slices its value's bits name (§51) */
 			if (state->sliced)
 				lion_verify_row_slices(vs, state, tid, key, code);
 		}

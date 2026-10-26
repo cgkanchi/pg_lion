@@ -1819,7 +1819,7 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 }
 
 /* ---------------------------------------------------------------------
- * Bit slices (DESIGN.md §50)
+ * Bit slices (DESIGN.md §51)
  * --------------------------------------------------------------------- */
 
 /*
@@ -1885,11 +1885,11 @@ lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
  * VACUUM takes out of all of them; lion_index_verify() knows such a row by
  * its being dead (lion_verify_slices()).
  *
- * THE SEAM for the plane kernel (DESIGN.md §50, "Not done"): one row, one
- * descent per slice.  An insert of many rows - a COPY, an INSERT ... SELECT
- * - could transpose them into planes and add each plane's word to its slice
- * once; aminsert is handed one row at a time, so that is a bulk-insert path
- * of its own.
+ * THE SEAM for the plane kernel (DESIGN.md §50, §51 "Not done"): one row,
+ * one descent per slice.  An insert of many rows - a COPY, an INSERT ...
+ * SELECT - could turn them into planes (lion_planes_scatter_strided()) and
+ * add each plane's word to its slice once; aminsert is handed one row at a
+ * time, so that is a bulk-insert path of its own.
  */
 static void
 lion_slice_insert(Relation index, Relation heaprel, LionState *state,
@@ -2041,7 +2041,7 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 			}
 
 			/*
-			 * ... and in its bit slices (DESIGN.md §50), a step after that
+			 * ... and in its bit slices (DESIGN.md §51), a step after that
 			 * with nothing held in between, as for the summary.
 			 */
 			if (state->sliced)
