@@ -529,8 +529,12 @@ counters, the dimension's behind `Dimension` (`Dimension Descents`, `Dimension H
 The planner prices it against PostgreSQL's plans. A nested loop's Memoize is taken at the cache hits
 the `LIMIT` lets it meet, not at the hit ratio of the loop's whole walk. Where the tables outgrow
 `effective_cache_size`, the pages PostgreSQL's nested loop reads for each fact row and key it keeps
-are charged as cold reads, as are the node's own, which are fewer. `pg_lion.enable_ordered_join`
-turns it off (DESIGN.md §47).
+are charged as cold reads, as are the node's own, which are fewer. Either table may be partitioned
+when the query's `WHERE` lets plan-time pruning leave it one partition - `f.grp = 2` over a fact
+table partitioned by `grp` - and the node then runs on that partition's indexes while the query
+names the parent, as `LionOrdered` and `LionBtreeScan` do (DESIGN.md §16, "A parent pruned to one
+leaf"); a table several partitions are left of is joined by PostgreSQL's plans.
+`pg_lion.enable_ordered_join` turns it off (DESIGN.md §47).
 
 When the page is ordered first by a column of the dimension with few values, and then by the
 fact's B-tree, no B-tree gives the order, and PostgreSQL joins every row of both filters and sorts:

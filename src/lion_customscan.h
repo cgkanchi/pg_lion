@@ -3937,6 +3937,14 @@ extern char *lion_deparse_rel_clause(PlannerInfo *root, Index rti,
 									 Node *clause);
 extern Bitmapset *lion_partition_key_attnos(PlannerInfo *root,
 											RelOptInfo *toprel);
+extern AttrNumber lion_parent_attno(PlannerInfo *root, Index childrelid,
+									Index toprelid, AttrNumber childattno);
+extern RelOptInfo *lion_single_leaf(PlannerInfo *root, RelOptInfo *rel);
+extern Path *lion_single_leaf_path(Path *path);
+extern RelOptInfo *lion_top_rel(PlannerInfo *root, RelOptInfo *rel);
+extern Node *lion_leaf_expr(PlannerInfo *root, Node *expr, RelOptInfo *leaf,
+							RelOptInfo *top);
+extern Var *lion_top_var(PlannerInfo *root, Var *var);
 extern List *lion_target_residual(List *residual,
 								  const LionCountTarget *t);
 extern bool lion_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel,
