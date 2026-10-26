@@ -165,8 +165,10 @@ uncommitted rows, are what the query would see.
   an `int4`, 193 for an `int8`), each over the filter's containers. On 5 million rows it took 26 to
   52 ms, against 30 ms for the query at a 1% filter and 140 to 330 ms at 10% and 50% (DESIGN.md
   §51.11): a win from some 1% of the rows up, sooner for narrower types.
-- The planner does not use slices yet: `SELECT sum(x) ... WHERE ...` takes its ordinary plan. The
-  LionCount pushdown of `sum`, `avg`, `min`, `max` and ranges from slices is the next step.
+- The planner answers the same aggregates from the slices in its own plans: `SELECT sum(x),
+  min(x) ... WHERE ...` and `... GROUP BY g` take the `LionCount` node where the cost model says so
+  ("The count pushdown", below; DESIGN.md §52). The function stays for a filter in text, and as
+  the reference the tests check the node against.
 
 
 ## Key types
@@ -570,8 +572,10 @@ or `ALTER INDEX ... SET`; a value outside the range is an error, as for any relo
 column (DESIGN.md §51). A sliced column keeps, after its keys and their summaries, one posting set
 per bit of its values - the rows whose value, as a signed integer of the type's width with the sign
 bit flipped, has that bit set: 16 for `int2`, 32 for `int4` and `date`, 64 for `int8`, `time`,
-`timestamp` and `timestamptz` - and one of its rows that are not NULL; `lion_index_slice_agg()`
-counts `sum`, `min` and `max` under a filter from them. A key column of any other type (`oid`,
+`timestamp` and `timestamptz` - and one of its rows that are not NULL; the count pushdown
+(`pg_lion.enable_count_slices`, below) and `lion_index_slice_agg()` count `sum`, `avg`, `min` and
+`max` under a filter, and per group, from them. The planner prices the index's scans of its keys
+by its pages less the slices', which those scans do not read (DESIGN.md §52). A key column of any other type (`oid`,
 `float4`, `float8`, `numeric`, `interval`, text, arrays, ...) is simply not sliced, and
 `lion_index_stats().sliced` says which are. Every insert into a sliced column also puts the row
 into the slice of each bit its value has set - about half the bits for values spread over the type,
@@ -1002,6 +1006,39 @@ working around a bad choice:
   never fetched; `EXPLAIN` prints `Key Set Index: <index>`. Each join is offered both ways and the
   planner keeps the cheaper: the fold looks every key up before the walk starts. Off, the key sets
   are only tested after each row is read.
+- `pg_lion.enable_count_slices`: let the count pushdown answer `count(x)`, `sum(x)`, `avg(x)`,
+  `min(x)` and `max(x)` of a column a Lion index slices (`slices = on`) from its bit slices
+  (DESIGN.md §52): under any `WHERE` the pushdown takes - equalities, `IN`, `IS [NOT] NULL`, `<>`,
+  `OR`s, multi-key operators, ranges on other columns, parameters and stable expressions - beside
+  `count(*)` and filtered counts, and per group of a `GROUP BY` of one or two Lion-indexed columns
+  (with a `HAVING` on them). `sum` and `avg` of `int2`, `int4` and `int8`, `min` and `max` of those
+  and of `date`, `time`, `timestamp` and `timestamptz`, of the bare column; the results are core's
+  to the bit (an `int8` sum in `numeric`, `sum(int4)` wrapping in `int8` as core's does, `avg` as
+  core's `numeric`). EXPLAIN prints `Aggregates From Slices: <index> (<column>: every bit counted |
+  existence counted[, min descent][, max descent])`, a column a time, and for a `GROUP BY` `Slice
+  Groups: one at a time` or `decoded by batch` (`pg_lion.enable_slice_decode`, below); `EXPLAIN
+  ANALYZE` adds `Slices Located`, `Slices Absent` (a bit no row has), `Slice Counts`, `Slice
+  Containers Counted`, `Slice Containers by Kernel`, `Slice Kernel Keys` and `Slice Kernel` (the
+  plane kernel's instruction set, below), `Slice Descent Steps`, `Slice Candidate Sets`, `Slice
+  WHERE Copies`, `Slice Batches Decoded`, `Slice Keys Decoded`, `Slice Rows Decoded` and the heap
+  rechecks of pages not all-visible. With no `WHERE` and no `GROUP BY` it competes with the
+  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. Not taken: a join, a
+  partitioned table, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
+  expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
+  column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
+  aggregates over keys or to the ordinary plan.
+- `pg_lion.enable_slice_decode`: answer those aggregates of a `GROUP BY` of one column a batch of
+  groups at a time (DESIGN.md §52, "The decode route"): one walk of the batch's groups and the
+  `WHERE` reads each slice once and every row's value off them - 64 rows at a time by a transpose
+  of the slices' words - where a group at a time counts every slice against a copy of each
+  group's rows. The planner prices both and keeps the cheaper: a group at a time for a few
+  groups, by batch from some ten (on 5M rows, 20 groups under a 10% `WHERE` in 41 ms against 220
+  a group at a time, 200 in 41 ms against 1,734, and the ordinary plan's 181 to 186). Two grouping columns, and groups an `IN` list on
+  the grouping column drives, are answered a group at a time. Off, every group is.
+- `pg_lion.enable_slice_kernel`: count a key's slices that are bitmaps of one width, at a container
+  key the visibility map vouches for, in one pass of the bit-plane kernel (`lion_planes_count_strided()`,
+  DESIGN.md §50, §52). Off, each slice's container is ANDed with the `WHERE` and counted on its own;
+  the answers are the same.
 - `pg_lion.enable_topk`: for `GROUP BY g ORDER BY count(*) DESC LIMIT k`, count only the groups
   that can be among the first `k`: each key's entry records how many rows it holds, which bounds
   its count, so the largest of those are counted first and the rest are never read once they cannot
@@ -1157,6 +1194,15 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `probe_step_cost` | 10 | `cpu_operator_cost` | a container of a set a summed range probes |
 | `range_fold_cost` | 420 | `cpu_operator_cost` | a fold into a container of a range's union, collected as a source, that is not a bitset |
 | `spill_read_cost` | 27 | `cpu_operator_cost` | a container a count reads back from a set spilled to a temporary file: a range collected as a source, the FK-side join's copy of its fact filters |
+| `slice_key_cost` | 120 | `cpu_operator_cost` | a container key of a `WHERE`'s copy at which a count of a sliced column's slices meets it, a batch of up to 64 slices (DESIGN.md §52) |
+| `slice_container_cost` | 15 | `cpu_operator_cost` | a container of such a slice read and counted there |
+| `slice_page_cost` | 200 | `cpu_operator_cost` | a posting page of such a slice copied and walked, beside its read |
+| `slice_step_cost` | 1000 | `cpu_operator_cost` | a step of a `min` or `max` descent over the slices: the slice located and the count set up |
+| `slice_step_key_cost` | 50 | `cpu_operator_cost` | a container key of the candidates such a step counts |
+| `slice_step_row_cost` | 0.9 | `cpu_operator_cost` | a candidate row such a step counts, up to 1,024 a key |
+| `slice_gather_cost` | 12 | `cpu_operator_cost` | a `GROUP BY` decoding a batch of groups (`pg_lion.enable_slice_decode`): a word of 64 rows' values gathered from 32 slices by a transpose |
+| `slice_decode_bit_cost` | 0.3 | `cpu_operator_cost` | ... a bit of a row's value read on its own, where a word holds too few rows to transpose |
+| `slice_decode_row_cost` | 1.0 | `cpu_operator_cost` | ... a row's value added to its group's aggregates |
 | `fkjoin_count_cost` | 14 | `cpu_tuple_cost` | an FK-side join's count that probes the fact filters, a dimension row |
 | `fkjoin_row_cost` | 20 | `cpu_tuple_cost` | a row the FK-side join hands up |
 | `fkjoin_probe_cost` | 10 | `cpu_operator_cost` | a probe of such a count into a fact filter |
@@ -1476,9 +1522,10 @@ caller; the pushdown only uses an index whose collation matches the clause or gr
 Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, `date`, `time`,
 `timestamp` and `timestamptz` key columns only - not `oid`, whose order is unsigned, nor floats,
 `numeric` or `interval` - for every such column of the index or none (the option is the index's,
-not a column's), and are read only by `lion_index_slice_agg()`: the planner does not answer `sum`,
-`avg`, `min`, `max` or ranges from them yet. An insert into a sliced column costs a posting-set
-insert per set bit of its value.
+not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
+from them (DESIGN.md §52), but not a range on the sliced column itself, a percentile, a join's or
+a partitioned table's aggregates. An insert into a sliced column costs a posting-set insert per set
+bit of its value.
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
 the planner prices them out and declines the count pushdown and `LionOrdered` - a filtered
