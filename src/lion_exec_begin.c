@@ -556,6 +556,50 @@ lion_close_parts(LionCountScanState *st)
 }
 
 /*
+ * The residual clauses partition `part` tests its rows for (DESIGN.md §16,
+ * "Residual clauses over a partitioned table"): the node's own qual where
+ * its bounds imply none of them, NULL where they imply all - every row of
+ * the partition passes them, and none is fetched for them - and otherwise
+ * a qual over the ones they do not imply, made at its first turn and kept
+ * for the rescans, in the query's context as the node's own was
+ * (lion_begin_residual()).  The functions it calls were checked then.
+ */
+static ExprState *
+lion_part_residual(LionCountScanState *st, LionPartState *part)
+{
+	List	   *kept = NIL;
+	ListCell   *lc;
+	int			i = 0;
+
+	if (st->residall == NULL || part->nresid == 0)
+		return st->residall;
+	if (part->residinit)
+		return part->resid;
+
+	foreach(lc, st->residexprs)
+	{
+		if (!part->residdrop[i])
+			kept = lappend(kept, lfirst(lc));
+		i++;
+	}
+	if (list_length(kept) == list_length(st->residexprs))
+		part->resid = st->residall;
+	else if (kept != NIL)
+	{
+		MemoryContext oldcxt =
+			MemoryContextSwitchTo(st->css.ss.ps.state->es_query_cxt);
+
+		part->resid = ExecInitQual(kept, &st->css.ss.ps);
+		MemoryContextSwitchTo(oldcxt);
+	}
+	else
+		part->resid = NULL;
+	part->residexprs = kept;
+	part->residinit = true;
+	return part->resid;
+}
+
+/*
  * Make a relation the one counted: the plain table (p < 0), whose relations
  * are opened here, once for the life of the node, or leaf partition p for its
  * turn, whose relations have been open since the node was (lion_open_parts()).
@@ -600,6 +644,16 @@ lion_open_relation(LionCountScanState *st, int p)
 	}
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
+
+	/*
+	 * The residual clauses this relation tests its rows for (DESIGN.md §10;
+	 * a partition's bounds may imply some, §16), and the columns they read
+	 * as this relation numbers them.
+	 */
+	st->resid = (part != NULL) ? lion_part_residual(st, part) : st->residall;
+	for (i = 0; i < st->nresidcol; i++)
+		st->residheapattno[i] = lion_heap_attno_in(st->heap, st->plan.heapoid,
+												   st->residattno[i]);
 
 	/* the indexes read from here on are the ones reported */
 	st->statopen = true;
@@ -748,6 +802,7 @@ lion_close_relation(LionCountScanState *st)
 
 	lion_count_report_reads(st);
 	st->statopen = false;
+	st->resid = st->residall;	/* a partition's qual is its turn's */
 
 	/* the counts' map page is this relation's */
 	lion_vis_cache_release_vm(st->viscache);
@@ -1052,8 +1107,11 @@ lion_begin_target_list(LionCountScanState *st, CustomScan *cscan,
  * EXECUTE on every function they call and calls the object access hook), over
  * a slot of the node's own scan tuple, whose columns setrefs.c pointed their
  * Vars at.  The heap column of each such place is the custom_scan_tlist
- * entry's: the residual clauses read only plain columns of the one table
- * counted (lion_residual_ok()).
+ * entry's, in the PARENT's numbering (DESIGN.md §16): the residual clauses
+ * read only plain columns of the table counted (lion_residual_ok()), and
+ * the column each has in the relation being counted is looked up when that
+ * relation is made so (lion_open_relation()), as a partition may number
+ * it differently.
  */
 static void
 lion_begin_residual(LionCountScanState *st, CustomScanState *node,
@@ -1066,6 +1124,7 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 	int			n = 0;
 
 	st->resid = NULL;
+	st->residall = NULL;
 	st->residexprs = NIL;
 	st->nresidcol = 0;
 	if ((priv->flags & LION_FLAG_RESID) == 0)
@@ -1073,7 +1132,8 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 
 	resid = list_copy_tail(exprs, priv->nclause + priv->nwagg);
 	st->residexprs = resid;
-	st->resid = ExecInitQual(resid, &node->ss.ps);
+	st->residall = ExecInitQual(resid, &node->ss.ps);
+	st->resid = st->residall;
 	st->residslot = ExecInitExtraTupleSlot(estate,
 										   node->ss.ss_ScanTupleSlot->tts_tupleDescriptor,
 										   &TTSOpsVirtual);
@@ -1083,6 +1143,8 @@ lion_begin_residual(LionCountScanState *st, CustomScanState *node,
 	st->residslotcol = (int *) palloc(sizeof(int) * Max(list_length(vars), 1));
 	st->residattno = (AttrNumber *)
 		palloc(sizeof(AttrNumber) * Max(list_length(vars), 1));
+	st->residheapattno = (AttrNumber *)
+		palloc0(sizeof(AttrNumber) * Max(list_length(vars), 1));
 	foreach(lc, vars)
 	{
 		Var		   *var = (Var *) lfirst(lc);
@@ -1524,6 +1586,17 @@ lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 			st->part[i].groupidxoid = priv->part[i].groupidxoid;
 			st->part[i].groupidxoid2 = priv->part[i].groupidxoid2;
 			st->part[i].clauseidxoid = priv->part[i].clauseidxoid;
+
+			/*
+			 * ... and which of the residual clauses, one flag each, which
+			 * the plan carries in custom_exprs and the path's list counted
+			 * (lion_priv_decode_parts()), so the plan's are counted here
+			 */
+			if (priv->part[i].nresid != list_length(st->residexprs))
+				elog(ERROR, "LionCount: partition %d has flags for %d of %d residual clauses",
+					 i, priv->part[i].nresid, list_length(st->residexprs));
+			st->part[i].nresid = priv->part[i].nresid;
+			st->part[i].residdrop = priv->part[i].residdrop;
 		}
 
 		/*

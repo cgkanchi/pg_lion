@@ -760,8 +760,8 @@ working around a bad choice:
   left out under `Implied by Index Predicate`. Off, the pushdown reads whole Lion indexes only.
 - `pg_lion.enable_count_residual`: let the count pushdown take a `WHERE` clause no Lion index
   answers - `payload LIKE 'ab%'`, `id > 1000`, `length(s) = 64` - beside ones that do, testing it on
-  the heap row of each row the others select (DESIGN.md §10, "Residual clauses"). Off, such a count
-  goes to the ordinary plan.
+  the heap row of each row the others select (DESIGN.md §10, "Residual clauses"), over one table or
+  each partition of a partitioned one (§16). Off, such a count goes to the ordinary plan.
 - `pg_lion.enable_count_anti`: let the count pushdown answer `SELECT count(*) FROM t WHERE ... AND
   NOT EXISTS (SELECT 1 FROM s WHERE s.a = t.k ...)` over a small inner side as the count of the
   `WHERE` less the rows some inner row matches: the node runs the inner side as its child, looks

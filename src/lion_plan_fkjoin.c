@@ -1602,7 +1602,7 @@ static bool
 lion_fkjoin_setup(PlannerInfo *root, RelOptInfo *rel, const LionFkJoin *fj,
 				  List *whereattnos, List *clauseinfos, List *whereclauses,
 				  List *whereconsts, List *wherekinds, List *whereopnos,
-				  List *whereinor, List *ors, const LionImply *imply,
+				  List *whereinor, List *ors, LionImply *imply,
 				  List *tlexprs, List *having, const LionDriveInfo *fgdrive,
 				  LionFkJoinSetup *out)
 {
@@ -1831,7 +1831,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 					 const LionFkJoin *fj, List *having,
 					 List *whereattnos, List *clauseinfos, List *whereclauses,
 					 List *whereconsts, List *wherekinds, List *whereopnos,
-					 List *whereinor, List *ors, const LionImply *imply)
+					 List *whereinor, List *ors, LionImply *imply)
 {
 	List	   *exprs;
 	List	   *items;
@@ -2507,7 +2507,7 @@ lion_try_semijoin_path(PlannerInfo *root, RelOptInfo *rel,
 					   const LionFkJoin *fj, List *whereattnos,
 					   List *clauseinfos, List *whereclauses,
 					   List *whereconsts, List *wherekinds, List *whereopnos,
-					   List *whereinor, List *ors, const LionImply *imply)
+					   List *whereinor, List *ors, LionImply *imply)
 {
 	RelOptInfo *joinrel = fj->joinrel;
 	RelOptInfo *outerrel = fj->dimchild;

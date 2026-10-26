@@ -143,8 +143,9 @@ one, `length(name) = 3` - does not send the count to the ordinary plan when the 
 select rows: the node counts those rows and tests the clause on each of them in the heap
 (`Residual Filter` in EXPLAIN; DESIGN.md §10, "Residual clauses"). It does the work of a bitmap
 heap scan over the same rows, so it is taken when the other clauses select at most half the table,
-and the planner compares its price with the ordinary plan's; a volatile function, a subquery, a
-partitioned table or a join's count keeps the ordinary plan. `pg_lion.enable_count_residual = off`
+and the planner compares its price with the ordinary plan's; a volatile function, a subquery or a
+join's count keeps the ordinary plan. Over a partitioned table each partition tests the clause on
+its own rows, except where its bounds decide it (below). `pg_lion.enable_count_residual = off`
 turns it off.
 
 An expression index counts as a column of its expression (DESIGN.md §41). With `CREATE INDEX ON
@@ -174,6 +175,17 @@ proof can show. An `OR` with an arm per kind - `(kind = 'a' AND tags && '{x}') O
 (kind = 'b' AND tags && '{y}')` - is narrowed the same way: each partition leaves out the arms its
 bounds rule out and, in the arm it keeps, the `kind = ...` they imply, so the partition of `'a'`
 counts `tags && '{x}'` alone (`Refuted by Partition Bounds` in `EXPLAIN`).
+
+A clause no partition's Lion index answers and the bounds do not decide - `ts >= '2026-10-19' AND
+ts < '2026-10-26'` over monthly partitions, `payload LIKE 'ab%'` - is tested on each partition's
+rows as it is over one table (`Residual Filter`; DESIGN.md §16, "Residual clauses over a
+partitioned table"): the partitions whose bounds imply it test none of theirs, so the months inside
+the range are counted from their indexes alone and only the two at its ends read their heaps
+(`Implied by Partition Bounds: ... in 2 of 3 partitions`), and a partition whose bounds rule it
+out is left out. The rule of half the table is asked of the partitions that test the clause,
+together. A parameter or a stable expression on the partition key (`ts >= $1`, `ts >= now() -
+interval '7 days'`) keeps the ordinary plan, whose run-time pruning decides it; on any other column
+it is tested like any other clause.
 
 When every query of a workload carries the same few filters that keep most of the table - `WHERE
 active AND state = 'published' AND ...` - a partial index on them holds only those rows, and the
