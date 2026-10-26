@@ -677,6 +677,9 @@ def main():
     args = ap.parse_args()
     if args.sweep is None:
         args.sweep = ['pg_lion.pushdown_margin=1,0.9,0.8,0.7,0.6,0.5']
+    unknown = [n for n in args.arms or [] if n not in ARMS]
+    if unknown:
+        ap.error('--arms: no arm %s (the arms: %s)' % (', '.join(unknown), ', '.join(ARMS)))
     for s in args.sweep:
         k, _, vs = s.partition('=')
         if not vs or any(len(v.split('+')) != len(k.split('+')) for v in vs.split(',')):
