@@ -28290,6 +28290,12 @@ faster from the disk and the same warm, and the inline table's queries took main
 - **Choosing between lionvec and HNSW.** With both on one column, the planner takes HNSW for
   nearly every query, as pgvector prices an HNSW scan at almost nothing: on 200,000 random
   256-dimension rows, about 13 against lionvec's 3,100 unfiltered (format 1).
+- **Progressive refinement from planes 2 to 8** (evaluated 2026-10-26, §44.14): the 8-bit codes
+  kept as seven bit-planes, a refine reading them until its bound decides. On DBpedia it would stop
+  at 3.2 planes a row and 4.0 a centroid, but the sums are a tenth of a warm query, reading the
+  REFINE item costs a refine more than its sum, and an integer kernel over today's bytes takes as
+  much off: not worth a format. That kernel, `lionvec_sum8()` against the query rounded to 16-bit
+  integers (60 ns against 326 warm, 373 against 682 out of L2), is not done either.
 
 ### 44.12 Parallel build (lion_vec.c, lion_vec_math.c; 2026-10-15)
 
@@ -28986,6 +28992,192 @@ the same TOAST pages nothing either (§44.7, "Exact path pricing").
   chunk page, after the scan - 22 of the exact path's 1,631 pages from the disk, whose chunk pages
   it has just read. The scan has every one of the values in hand; handing them to the projection
   would need the planner's help (a target list naming the scan's distance), not the index's.
+
+### 44.14 Progressive refinement from planes 2 to 8 (evaluated 2026-10-26; not done)
+
+The idea: keep a row's 8-bit codes (§44.3) as seven more bit-planes, planes 2 to 8 of each code,
+most significant first - plane 1 being the code's top bit, the sign - so that a refine reads plane
+2, bounds the row by the codes' top two bits, and stops as soon as that bound puts the row past
+the k-th; else reads plane 3; and so on, plane 8 being the codes as a refine reads them today
+(§44.4), 1,536 bytes at 1536 dimensions. It was evaluated before the format was touched, with a
+frontend prototype on lionvec's own encoder (`test/unit/vecplanes_eval.c`, `make vecplanes-eval`;
+not in `make unit`), on DBpedia's rows and on vec_test's kinds of data, and with the scan's refines
+timed on a server. **The format is not changed**: on DBpedia a refine does stop early, but the
+8-bit sums are a tenth of a warm query, the larger part of a refine is reading its REFINE item,
+which planes do not shorten, and a kernel over today's bytes takes about as much off as the
+planes would, with no new format.
+
+**The estimator.** The top m bits of a code c leave 2^(8-m) steps; their middle is
+
+    r_m(c) = -4 + (c_m + 2^(7-m)) / 32 = (-4 + 2^(2-m)) + sum over p <= m of 2^(3-p) b_p(c)
+
+c_m the code with its 8 - m low bits cleared and b_p its plane-p bit, so that r_8 is
+`lionvec_recon8[]` and r_1 is 2 sign(c), and r_m is linear in the planes: for any v,
+
+    <r_m, v> = (-4 + 2^(2-m)) sum(v) + sum over p <= m of 2^(3-p) S_p(v)
+
+S_p(v) the sum of v over the dimensions plane p has set - one more S_p a plane. The estimate is
+§44.3's with r_m for the code's vector, `|x| <r_m, qc> / (|r_m| alpha_m)` with
+`alpha_m = <r_m / |r_m|, x / |x|>`, and its error, by the same argument (the part of x / |x| that
+r_m misses, sqrt(1 - alpha_m^2) long, points nowhere in particular after the rotation), a Gaussian
+of standard deviation
+
+    |x| / alpha_m * sqrt(|qc|^2 (1 - alpha_m^2) / (dimsp - 1) + varq)
+
+varq the query's own rounding a dimension, `e^2 / dimsp`, as plane 1's (§44.3), when the S_p come
+from a quantized query, and 0 when they come from its floats; a bound of epsilon of those either
+side holds with the Gaussian's probability, whatever the data. Each prefix needs its own alpha_m
+and |r_m| a row, both computed by the build from x: six pairs more than the REFINE item holds
+(alpha8 and |r| are m = 8's), 48 bytes. For a standard Gaussian coordinate (numerical
+integration) alpha_m is 0.7979, 0.8681, 0.9607, 0.9897, 0.9974, 0.99935, 0.99983, 0.99996 for
+m = 1 .. 8, the relative error `sqrt(1 - alpha_m^2) / alpha_m` 0.756, 0.572, 0.289, 0.144, 0.072,
+0.036, 0.018, 0.0094: near plane 1's at two planes, a fifth of it at four, an eightieth at eight,
+halving a plane from three on. The rows' own, measured on 2,000 clustered rows of 1536
+dimensions, are those to the third digit (0.79763, 0.86831, ..., 0.99996). Over every pair of
+those rows and 12 queries the bound was outside 1, 2 and 3 standard deviations for 0.295 - 0.308,
+0.037 - 0.045 and 0.0016 - 0.0028 of them at every m from 2 to 8, floats or quantized, against
+the Gaussian's 0.317, 0.046 and 0.0027 (the same at 384 dimensions); eight planes' estimate from
+the S_p was `lionvec_estimate8()`'s to the bit, and the codes' top bit was the sign bit in all
+3,072,000 dimensions. (A zero coordinate, or a negative one that rounds into code 128, would
+differ; a format would make the encoder give the top bit the sign's.)
+
+**Its sums: popcounts, not masked floats.** S_p from the floats is a masked sum of dimsp floats a
+plane, in double in 16 lanes as `lionvec_sum8()`'s; the prototype's portable, AVX2 (a mask, compare
+and AND) and AVX-512VL (a masked add, 256 bits) versions agree to the bit, and a plane takes 245 ns
+with AVX-512, 432 with AVX2 and 1,820 portably at 1536 dimensions warm, against the whole 8-bit
+sum's 326, 406 and 890: a plane costs most of what all eight do, and the planes cost more than the
+bytes they save. From the query quantized to 8 bits a dimension over its own range, as 8 interleaved
+planes (plane 1's quantization, four bits wider), S_p is `qlo popcount(P_p) + qdelta
+lion_planes_dot_interleaved(P_p, Q, dimsp / 64, 8)`: integer counts in every implementation, and the
+rest a few operations in double, as deterministic as `lionvec_estimate1()` under
+`-ffp-contract=off`. 32 ns a plane with AVX-512, 56 with AVX2. Its rounding adds about three
+quarters of the codes' own variance at plane 8, a sixth at plane 7 and next to nothing below, and
+the bound, which counts it, stays as calibrated (the ranges above are the quantized sums' as well as
+the floats'). No new kernel: the weighted sum of k = 8 interleaved planes is lion_planes.c's general
+pass.
+
+**The planes a refine needs.** A best-first scan refines a row, or a centroid less the margin,
+whenever its lower bound lies below the key the scan stops at, about the k-th row's; so a
+progressive refine reads planes 2 to m until the prefix's lower bound passes that key, or all
+seven, and a row whose plane-1 lower bound passes it is never refined. The prototype keys every
+row against the query exactly, takes the tenth least key as the stopping key, and for each row and
+centroid that plane 1 leaves below it records the first plane whose bound passes it: the bound
+`LIONVEC_EPS8(eps)` wide at every plane, as the codes' is ("2 eps"), or eps wide at planes 2 to 7,
+as plane 1's ("eps"), eps the default 4; the S_p quantized. Partitions are k-means' (three
+iterations over a strided sample of at most 32,768 rows, exact distances, spherical for cosine) at
+the default `8 sqrt(n)`, no spill, and the centroids' bound comes off the margin of 3 as the scan's
+does (`lv_part_key()`). DBpedia is §44.9's text-embedding-3-large set, its 115,186 rows and 200
+held-out queries as `knn_dbpedia.py` holds them out, cosine; vec_test's kinds are 20,000 rows and
+40 queries of 1536 dimensions, cosine: "clusters" `make_clusters()`'s 12 centres, "random"
+isotropic Gaussian rows (random unit vectors), "tight" 200 centres with each row 0.4 of a
+centre's length from its own. "Refined" is the mean a query, "past today" the share the 8-bit
+codes put past the stopping key, then the share past by planes 2 - 3, 2 - 4, 2 - 5 and 2 - 6, and
+the planes and bytes a refine reads on average, at 2 eps and at eps:
+
+| data | refined | past today | by 3 / 4 / 5 / 6 (2 eps) | planes, bytes (2 eps) | planes, bytes (eps) |
+| --- | --- | --- | --- | --- | --- |
+| DBpedia, every row | 87.9 | 88.0% | 48.9 / 76.3 / 83.8 / 86.4% | 3.17, 609 | 2.32, 446 |
+| DBpedia, rows of the 27.1 partitions probed | 63.1 | 86.2% | 45.1 / 73.5 / 81.4 / 84.3% | 3.30, 634 | 2.47, 474 |
+| DBpedia, centroids (2,715) | 98.9 | 72.6% | 31.3 / 56.7 / 65.9 / 69.8% | 4.05, 777 | 3.34, 641 |
+| clusters, rows | 1,667 | 99.0% | 0.1 / 26.4 / 81.6 / 95.5% | 3.98, 765 | 2.97, 570 |
+| clusters, centroids (1,131) | 94.0 | 0.2% | 0 / 0 / 0 / 0% | 7.00, 1,344 | 7.00, 1,343 |
+| random, rows | 8,687 | 99.9% | 62.4 / 96.0 / 99.2 / 99.7% | 2.43, 466 | 1.50, 288 |
+| random, centroids | 1,128 | 33.9% | 0.4 / 6.7 / 17.8 / 26.1% | 6.18, 1,187 | 5.83, 1,119 |
+| tight, rows | 101 | 80.0% | 0 / 0 / 2.0 / 33.4% | 6.00, 1,152 | 5.17, 992 |
+| tight, centroids | 5.8 | 0% | 0 / 0 / 0 / 0% | 7.00, 1,344 | 7.00, 1,344 |
+
+So on DBpedia a refine does stop early: half the rows at plane 3, three quarters by plane 4, a
+centroid at four planes on average, 40 to 51% of the codes' bytes (the 12% of rows that are fetched,
+and the 27% of centroids probed, read all seven). The model is near what the scan does: on the
+server below it refined 85 rows and 119 centroids a query and probed 35 partitions, so that 70% of
+the centroids it refined were passed by (§44.9's 2026-10-15 count: 88 rows, 123 centroids, 36
+partitions); the model refines 88 rows - 63 in the 27 partitions a margin alone probes, with no
+spill - and 99 centroids, 73% passed by. The floats' S_p give the same shares to a tenth of a point.
+Synthetic data brackets it: random vectors, whose distances plane 1 hardly tells apart, stop at
+plane 3; tight clusters, whose refined rows are the cluster's own and nearly as near as the tenth,
+at 6; and where the margin is wide against the centroids' spread (clusters, tight) a refined
+centroid is a probed one and reads everything. At 384 dimensions the shares are within two points of
+these; L2 on the clusters, 3.98 planes, the same.
+
+**What a refine's sums cost**, ns at 1536 dimensions, warm (one row again and again), from a pool
+of 16,384 rows (24 MB of each layout: past a core's 2 MB of L2, within the L3) one at a time in a
+random order, and with the lines it reads flushed first (`clflush`), the median of 9 rounds, on
+the Emerald Rapids of §50 pinned to a core; "bytes, 16-bit query" is the comparison below:
+
+| | AVX-512 | AVX2 | POPCNT | portable |
+| --- | --- | --- | --- | --- |
+| `lionvec_sum8()` | 326 / 682 / 1,399 | 406 / 767 / 1,535 | 888 / 1,312 / 1,867 | 890 / 1,142 / 1,803 |
+| planes 2 - 3, quantized | 58 / 230 / 609 | 109 / 332 / 652 | 184 / 349 / 675 | 552 / 757 / 955 |
+| planes 2 - 4 | 86 / 328 / 698 | 161 / 441 / 774 | 276 / 477 / 1,102 | 828 / 1,078 / 1,317 |
+| planes 2 - 8 | 227 / 572 / 1,028 | 386 / 729 / 1,420 | 657 / 921 / 1,506 | 1,965 / 2,216 / 2,554 |
+| bytes, 16-bit query | 60 / 373 / 747 | 60 / 323 / 912 | 442 / 673 / 1,561 | 509 / 718 / 1,691 |
+
+Weighted by DBpedia's planes, a row's sums would take 95 / 313 / 737 ns with AVX-512 where they
+take 326 / 682 / 1,399, a centroid's 124 / 370 / 819; with AVX2 172 / 439 / 842 and
+220 / 510 / 983 against 406 / 767 / 1,535.
+
+**How much of a scan that is.** Timed inside the scan (a build of this tree with `clock_gettime()`
+around `lv_refine()`, `lv_refine_part()` and their parts, not kept), PostgreSQL 16, 2 GB of shared
+buffers, every relation prewarmed, AVX-512, LIMIT 10 at the defaults (margin 3, patience 30, spill),
+two or three rounds after a warming one. DBpedia's 115,186 rows, 2,715 partitions: a query took 1.44
+ms at the median and refined 85.2 rows and 118.5 centroids (35.1 partitions probed, 10.8 rows
+fetched). The rows' refines were 15.8% of its time and their sums 5.0%; the centroids' 11.9% and
+6.1%. A row's refine took 3,125 ns: 108 looking into the queue for what to read ahead, **1,810
+reading its REFINE item** (the read, the lock, the page's and the item's checks), 988 the sum and 66
+after; a centroid's 1,697, its sum 866. On 100,000 random unit vectors of 1536 dimensions (50
+queries) a query took 57 to 67 ms, refined 14,082 rows and 2,413 centroids, and the rows' refines
+were 63 to 65% of it, their sums 22 to 25%: 2,982 ns a refine, of which 1,474 reading the item and
+1,039 the sum.
+
+So progressive planes would take 5 to 5.5% off a warm DBpedia query (about half of the sums'
+11.1%, at the pool's ratios or the flushed ones) and 13 to 16% off the random vectors' - before
+anything a real scan would add: the scan does not know the stopping key until it stops, so a
+refine must stop against what it knows (the next key in its queues, or the tier's k-th least
+upper bound, §44.4), and a row put back with planes unread costs another 1.5 to 1.8 us reading its
+item if it comes back, which the model does not charge; nor its partial sum and planes read,
+which a queue item, held to 48 bytes, has no room for. Cold,
+nothing: a REFINE page is read whole whatever part of an item a refine looks at.
+
+**Why not.**
+
+- A kernel over the codes as they are takes nearly as much. Against the query rounded to 16-bit
+  integers, `sum c_i w_i` is exact in integers in every implementation - the same to the bit by
+  construction, as plane 1's counts are - and <r_8, q> an affine function of it, `sum(c_i)` and
+  `sum(w_i)`; the rounding, a 65,534th of the query's range, adds a hundred-thousandth of the
+  codes' own variance. With AVX2's `VPMADDWD` (the prototype's) it takes 60 / 373 / 747 ns
+  against the planes' 95 - 124 / 313 - 370 / 737 - 819 on DBpedia with AVX-512: better warm, as
+  good from the pool and flushed; and with AVX2 60 / 323 / 912 against 172 - 220 / 439 - 510 /
+  842 - 983. That is 5% off a DBpedia query (the sums at 0.53 - 0.55 of their time from the pool
+  or flushed) and 11 to 13% off the random vectors', leaving the planes at most half a point
+  beyond it on DBpedia and two or three on random vectors - for a new format.
+- What a refine costs most is not its sum. Reading the REFINE item is 1.8 us of a row's 3.1;
+  fewer bytes of the item leave it as it is.
+- The format would cost: 48 bytes a row of alpha_m and |r_m|; a second quantization of the query
+  (8 planes, 1.5 KB at 1536 dimensions); plane 1 against that query as well - the CODE item's
+  plane 1 is gone by the time a row is refined, so either a pass over it at every probe for the
+  rows a probe keeps, or plane 1 again in the REFINE item, which takes the most dimensions from
+  8128 to 8064; a row's planes read and partial sum in its queue item and its progress entry; a
+  refine stopping against a key it does not know (above); and the build, inserts (SOAR's decoded
+  centroids, §44.3), VACUUM's checks, `lion_index_verify()` and the SQL diagnostics reading planes
+  where they read bytes - for a few percent, and for data like DBpedia's.
+
+**When to look again**: if reading a REFINE item became cheap enough that the sums were most of a
+refine (refines batched by page, say, or the codes nearer the queue), the bytes a refine reads
+would be what it waits on, and planes stop at 40 to 51% of them on DBpedia; or for vectors
+whose distances plane 1 tells apart as badly as random ones', where rows' refines are two thirds
+of a query and planes stop at 30% of the bytes. The 16-bit integer kernel for `lionvec_sum8()`
+is the change worth making now, and wants its own measurement in a scan.
+
+**The prototype** (`test/unit/vecplanes_eval.c`): part 1 the prefixes' alphas and the bounds'
+calibration on clustered rows, part 2 the planes needed on vec_test's three kinds at 384 and 1536
+dimensions (and L2 at 1536), part 3 the costs (`--costs` alone); `--file ROWS QUERIES DIMS` runs
+part 2 on raw float4 vectors, cosine - DBpedia's here, written from the shards as
+`knn_dbpedia.py` reads them, the 200 queries of `np.random.default_rng(0).choice(115386, 200,
+replace=False)` apart. It checks that eight planes are `lionvec_estimate8()`, that its masked
+sums and integer dot agree with their portable forms to the bit, and that the bounds are
+calibrated (at most 0.40 outside 1 standard deviation and 0.006 outside 3), and exits 1 if not;
+it runs in a few minutes, DBpedia's file in five (its k-means most of it). Its kernels are the
+evaluation's own, not lionvec's; the flushed column needs the x86-64 build (`clflush`).
 
 ## 45. Partial indexes in the count pushdown (2026-10-19)
 

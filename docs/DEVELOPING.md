@@ -37,6 +37,8 @@ has the setting, DESIGN.md §9).
                                                           # entry layout, lionvec's arithmetic, the read
                                                           # stream ring; no server
     make planes-bench PG_CONFIG=.local/pg/bin/pg_config   # the bit-plane kernels timed, at -O2
+    make vecplanes-eval PG_CONFIG=.local/pg/bin/pg_config # lionvec's codes as bit-planes 2-8, evaluated
+                                                          # and not adopted (DESIGN.md §44.14); minutes
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
 the container library's passes over whole bitsets, AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of the
