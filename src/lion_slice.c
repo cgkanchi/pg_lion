@@ -87,7 +87,7 @@ typedef struct LionSliceRun
 	/* what DEBUG1 reports */
 	int64		counts;			/* counted ANDs */
 	int64		collects;		/* candidate sets collected */
-	int64		absent;			/* slices with no entry */
+	int64		absent;			/* lookups of a slice with no entry */
 } LionSliceRun;
 
 /* ---------------------------------------------------------------------
@@ -715,7 +715,7 @@ lion_index_slice_agg(PG_FUNCTION_ARGS)
 		nulls[2] = nulls[3] = false;
 	}
 
-	elog(DEBUG1, "lion_index_slice_agg(%s): %d slices, %lld absent, %lld counts, %lld candidate sets collected, %lld heap blocks counted from the map, %lld TIDs rechecked",
+	elog(DEBUG1, "lion_index_slice_agg(%s): %d slices, %lld lookups of a slice with no entry, %lld counts, %lld candidate sets collected, %lld heap blocks counted from the map, %lld TIDs rechecked",
 		 RelationGetRelationName(run.index), LION_SLICE_NPOS(run.nbits),
 		 (long long) run.absent, (long long) run.counts,
 		 (long long) run.collects,
