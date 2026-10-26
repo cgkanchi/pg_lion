@@ -366,7 +366,8 @@ def plan_cost(p, scale=1.0):
 
 
 def plan_all(psql, cat, base, q, arms, scales=None):
-    """scales: {arm: the factor plan_cost() scales its lion nodes by}"""
+    """scales: {arm: the factor plan_cost() scales its lion nodes by, or None
+    where the arm's cost is not a plan's}"""
     script = base
     for name, settings in arms.items():
         script += 'BEGIN;\n' + set_local(cat.usable(settings))
@@ -375,8 +376,9 @@ def plan_all(psql, cat, base, q, arms, scales=None):
     res = {}
     for name in arms:
         p = json.loads(out[name][0])[0]
+        scale = (scales or {}).get(name, 1.0)
         res[name] = (signature(p['Plan'], cat),
-                     plan_cost(p, (scales or {}).get(name, 1.0)),
+                     None if scale is None else plan_cost(p, scale),
                      kind(p['Plan'], cat))
     return res
 
@@ -480,7 +482,7 @@ def run(args):
         # lion nodes are priced back at the margin the other arms plan at;
         # a build whose margin stops at 1 forces lion's paths with every
         # core scan off, which does not disable them there.  So are
-        # ordjoin's and probe's, but their costs are not plans' (nan): a
+        # ordjoin's and probe's, but their costs are not plans' (None): a
         # LionOrderedJoin's under a Limit, of which the Limit takes a share,
         # and a probe's, a scan of a loop, would be scaled whole
         scales = {}
@@ -492,7 +494,7 @@ def run(args):
                         float(extra.get('pg_lion.pushdown_margin', 1))
             for n in ('ordjoin', 'probe'):
                 if n in scales:
-                    scales[n] = float('nan')
+                    scales[n] = None
         else:
             # ordjoin and probe force at a margin such a build rejects
             arms.pop('ordjoin', None)
@@ -582,7 +584,7 @@ def report(result, sweeps):
     by = {}
     for rec in recs:
         for sig, p in rec['plans'].items():
-            if p.get('ms', 0) > 0 and p['cost'] == p['cost']:
+            if p.get('ms', 0) > 0 and p['cost'] is not None:
                 by.setdefault(p['kind'], []).append(p['cost'] / p['ms'])
     for k in sorted(by, key=lambda k: -len(by[k])):
         v = by[k]
