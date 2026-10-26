@@ -29919,23 +29919,27 @@ or an INCLUDE one - is the key column itself, stored as the key's type and retur
 (`oj_itup_col()`, and `lion_ordered_entry_test()` checks it again at run time), the join, not
 folded, has the walk hand it each member's key from the index tuple before the fetch
 (`oj_entry_test()`: each key set's hash probe, in a memory context of its own reset an entry), and
-an entry a key set rejects is turned away unfetched - an index-only walk does not visit the heap
-for its visibility either. The walk asks its B-tree for index tuples (`xs_want_itup`) as an
-index-only walk does. It is right for the same reason the fold is: every version a TID of the
-B-tree reaches holds the key its index tuple holds, an update of an indexed column - an INCLUDE one
-too - being never HOT, so the version the snapshot sees, if any, would have been rejected after the
-fetch; a NULL key is rejected as the strict clause rejects it, and not counted. A rejected row
-takes no tuple predicate lock, which core's plan, fetching it and filtering, would: under
-SERIALIZABLE the B-tree's own lock on the leaf page it read stands for it, as for core's index-only
-scan, and an update that moves the row's key into a key set writes a new entry there
-(`test/isolation/keyset_index_tuple_serializable.spec` ends in the serialization failure core's
-plan ends in). The join's test after the fetch stays, and passes every row. A rejected entry
-whose row is dead is not marked dead in the B-tree either, as a fetch that finds its chain dead
-marks it (`kill_prior_tuple`), so a later walk meets it again until VACUUM, as core's index-only
-scan leaves the entries it does not fetch: in ordjoin.sql a query walked twice walks 60 entries
-more the second time than it did when the first fetched them. EXPLAIN prints `Key Sets Tested On:
-<index>`, and under ANALYZE `Heap Fetches` are the kept members and `Keys Rejected by Key Sets` the
-rest. Folded paths are still offered beside them; `add_path()` keeps the cheaper.
+an entry a key set rejects is turned away unfetched. The walk asks its B-tree for index tuples
+(`xs_want_itup`) to read the key, as an index-only walk asks for them to read its columns; that does
+not make it index-only, and it fetches the rows the key sets keep. Where the walk is index-only the
+test comes before the visibility map's, and a rejected entry on a page not all-visible is not
+visited for its visibility either. It is right for the same reason the fold is: every version a TID
+of the B-tree reaches holds the key its index tuple holds, an update of an indexed column - an
+INCLUDE one too - being never HOT, so the version the snapshot sees, if any, would have been
+rejected after the fetch; a NULL key is rejected as the strict clause rejects it, and not counted. A
+rejected row takes no tuple predicate lock, which core's plan, fetching it and filtering, would:
+under SERIALIZABLE the B-tree's own lock on the leaf page it read stands for it, as for core's
+index-only scan, and an update that moves the row's key into a key set writes a new entry there
+(`test/isolation/keyset_index_tuple_serializable.spec` ends in the serialization failure core's plan
+ends in). The join's test after the fetch stays, and passes every row. A rejected entry whose row is
+dead is not marked dead in the B-tree either, as a fetch that finds its chain dead marks it
+(`kill_prior_tuple`), so a later walk meets it again until VACUUM, as core's index-only scan leaves
+the entries it does not fetch: in ordjoin.sql a query walked twice walks 60 entries more the second
+time than it did when the first fetched them. EXPLAIN prints `Key Sets Tested On: <index>`, and
+under ANALYZE `Heap Fetches` are the kept members and `Keys Rejected by Key Sets` the entries a key
+set turned away; an entry whose key is NULL is in neither, turned away uncounted as the join's test
+after the fetch leaves it uncounted. Folded paths are still offered beside them; `add_path()` keeps
+the cheaper.
 
 **Measured** (2026-10-26; the stand-in above, its indexes the private workload's: the key the third
 column of a multicolumn lion index `(product_id, intensity, company_id)`, a plain B-tree on the key,
@@ -30073,29 +30077,29 @@ split under a LATERAL subquery's clause, its LIMIT 1 keeping it from being pulle
 under core's price. A key set's key in the target: with nested loops and merge joins off, the side
 table's hash join above reads the key set's key, `Hash Cond: (s.fk = ib.fk)`, which the node fills.
 
-test/sql/ordjoin_keyfold.sql, §47.6's fold, in a schema of its own: a 20,000-row dimension with
-lion indexes on a three-value `tier` and a ten-value `region`; a 200,000-row fact table, ten rows a
-key, every 97th key NULL, with a B-tree by a random rank that does not hold the key and a lion
-index on a twenty-value `prod`; a key table of sixty keys for product 7 (600 fact rows) and 2,000
-for product 3, and one of 40 keys repeated and NULLs. Each query through the node, forced, and
-through core's plan, answers compared in order. Without a lion index of the key, the split led by
-the tier under product 7's key set walks 18,275 entries, every one fetched, 18,043 keys rejected;
-with nothing forced the plan is core's, the walk priced at its share's fetches (§47.3), and for
-product 3's two thousand keys the split's. With `cpc_fk`, a lion index of the key: the same split
-forced walks 17,792 entries over a set of the key set's 610 rows, 54 met, then switches and
-fetches the 556 left, 610 fetches in all and no key rejected; the join with a fact and a
-dimension lion clause besides, its set the AND of both; with nothing forced core's plan for
-product 7 - the key table, then the key's lion index - and the split folded for product 3. A key
-set of repeated keys and NULLs; two key sets, an IN on the fact's key and an EXISTS on the
-dimension's, two leaves; an empty one; the whole join without a LIMIT; a LATERAL rescan whose key
-set is built and handed again for each of three rows (`Key Set Builds: 3`); a key updated and a row
-inserted in the transaction before the query. Not folded: a partial lion index of the key whose
-predicate the query does not imply, and folded into where it does; a key table of `bigint` keys,
-no key set; `pg_lion.enable_key_set_fold` off. Section 6, the key tested on the index tuple: with
-no lion index of the key and the B-tree `(rank DESC) INCLUDE (fk)`, the split under product 7's
-key set walks the same 18,275 entries and fetches 55, 18,043 keys rejected unfetched, and with
-nothing forced the split is the plan, for product 3 too; repeated keys and NULLs, two key sets, a
-LATERAL rescan; a key updated, a row inserted and rows of the set's keys updated HOT in the
+test/sql/ordjoin_keyfold.sql, §47.6's fold, in a schema of its own: a 20,000-row dimension with lion
+indexes on a three-value `tier` and a ten-value `region`; a 200,000-row fact table, ten rows a key,
+every 97th key NULL, with a B-tree by a random rank that does not hold the key and a lion index on a
+twenty-value `prod`; a key table of sixty keys for product 7 (600 fact rows) and 2,000 for product
+3, and one of 40 keys repeated and NULLs. Each query through the node, forced, and through core's
+plan, answers compared in order. Without a lion index of the key, the split led by the tier under
+product 7's key set walks 18,275 entries, every one fetched, 18,043 keys rejected; with nothing
+forced the plan is core's, the walk priced at its share's fetches (§47.3), and for product 3's two
+thousand keys the split's. With `cpc_fk`, a lion index of the key: the same split forced walks
+17,792 entries over a set of the key set's 610 rows, 54 met, then switches and fetches the 556 left,
+610 fetches in all and no key rejected; the join with a fact and a dimension lion clause besides,
+its set the AND of both; with nothing forced core's plan for product 7 - the key table, then the
+key's lion index - and the split folded for product 3. A key set of repeated keys and NULLs; two key
+sets, an IN on the fact's key and an EXISTS on the dimension's, two leaves; an empty one; the whole
+join without a LIMIT; a LATERAL rescan whose key set is built and handed again for each of three
+rows (`Key Set Builds: 3`); a key updated and a row inserted in the transaction before the query.
+Not folded: a partial lion index of the key whose predicate the query does not imply, and folded
+into where it does; a key table of `bigint` keys, no key set; `pg_lion.enable_key_set_fold` off.
+Section 6, the key tested on the index tuple: with no lion index of the key and the B-tree `(rank
+DESC) INCLUDE (fk)`, the split under product 7's key set walks the same 18,275 entries and fetches
+55, 18,043 keys rejected unfetched - the other 177 entries NULL keys, turned away uncounted - and
+with nothing forced the split is the plan, for product 3 too; repeated keys and NULLs, two key sets,
+a LATERAL rescan; a key updated, a row inserted and rows of the set's keys updated HOT in the
 transaction; and the key a key column, `(rank DESC, fk)`.
 test/isolation/keyset_index_tuple_serializable.spec: the write skew of a row whose key an update
 moves into the key set, after the join turned its entry away unfetched, ends in a serialization
