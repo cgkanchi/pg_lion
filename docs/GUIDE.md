@@ -163,14 +163,31 @@ map calls all-visible - as after a `VACUUM` - the rows of each key are the count
 and nothing else is read; a `VACUUM` that removes rows from the index while the walk runs, or a
 table that is not all-visible, has each key's rows counted instead.
 
-With a `WHERE`, an integer, date, time or timestamp column indexed `WITH (slices = on)` keeps one
-posting set per bit of its values, and `SELECT * FROM lion_index_slice_agg('events_amount',
-'country = ''JP''')` answers `count`, `sum`, `min` and `max` of the column under that filter from
-those sets alone, exactly, without reading the rows (DESIGN.md §51; the filter is
-`lion_index_facets()`'s). The price is an insert into each set bit's set on every write of the
-column. The planner does not use the slices yet - `SELECT sum(amount) FROM events WHERE ...` takes
-its ordinary plan - and answering `sum`, `avg`, `min`, `max` and ranges from them in the `LionCount`
-pushdown is coming.
+With a `WHERE`, or per group, an integer, date, time or timestamp column indexed `WITH (slices =
+on)` keeps one posting set per bit of its values, and the count pushdown answers `count`, `sum`,
+`avg`, `min` and `max` of it from those sets alone, exactly, without reading the rows (`Aggregates
+From Slices` in EXPLAIN; DESIGN.md §51, §52):
+
+```sql
+CREATE INDEX ON events USING lion (amount) WITH (slices = on);
+SELECT sum(amount), avg(amount), max(amount), count(*) FROM events
+ WHERE country = 'JP' AND tags && '{mobile}';
+SELECT country, sum(amount), min(amount) FROM events
+ WHERE device = 'ios' GROUP BY country;
+```
+
+The `WHERE` is collected once with the column's existence slice; a sum counts every bit's slice
+against it in one walk of its container keys, and a `min` or a `max` descends from the top bit, a
+counted AND a bit, so the work grows with the column's width and the `WHERE`'s container keys, not
+its rows. A `GROUP BY` of one or two Lion-indexed columns does the same for each group - a few
+dozen counted ANDs a group, or, for many groups of one column, a pass over the slices a batch of
+groups that reads every row's value off them. The planner weighs this against the ordinary plan;
+on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166, and the sum,
+minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
+price is an insert into each set bit's set on every write of the column. A range on the sliced
+column itself (`amount > 100`), a percentile, a join and a partitioned table are not answered from
+the slices yet; `SELECT * FROM lion_index_slice_agg('events_amount', 'country = ''JP''')` answers
+the same aggregates for a filter given as text.
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -

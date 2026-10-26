@@ -192,6 +192,8 @@ pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own wo
     src/lion_range.c        range restrictions, and iterating every entry of an index
     src/lion_count_sql.c    the SQL count functions (lion_index_count() and the others)
     src/lion_facets.c       lion_index_facets(): the rows under each key of a column, under a filter
+    src/lion_slice.c        a bit-sliced column's counts and descents (LionSliceAgg), lion_index_slice_agg()
+    src/lion_slice_decode.c a sliced column's aggregates for a batch of groups, decoded key by key
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
                             -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model

@@ -22,6 +22,8 @@ bool		lion_enable_decoded_walk = true;
 bool		lion_enable_count_cells = true;
 int			lion_count_cells_max = 134217728;
 bool		lion_enable_topk = true;
+bool		lion_enable_count_slices = true;
+bool		lion_enable_slice_decode = true;
 bool		lion_enable_count_residual = true;
 bool		lion_enable_count_partial = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
@@ -661,6 +663,51 @@ lion_wagg_add_target(Aggref *agg, LionCountPriv *priv,
 }
 
 /*
+ * An aggregate of DESIGN.md §52 in the tuple the node produces: agg of one of
+ * priv's sliced columns, answered from its slices.  Appends it to *ctlist
+ * with its LION_TL_SAGG kind, and what it computes to priv's aggregates - its
+ * LION_SAGG_* kind and its column's position in priv's.  False for any other
+ * aggregate; an aggregate already in *ctlist is done.  priv->sagg has room
+ * for one more.
+ */
+static bool
+lion_sagg_add_target(Aggref *agg, LionCountPriv *priv, List **ctlist,
+					 List **kinds)
+{
+	AttrNumber	attno;
+	Oid			argtype;
+	int			skind = lion_sagg_classify(agg, priv->scanrelid, &attno,
+										   &argtype);
+	LionCountPrivSAgg *a;
+	int			c;
+	ListCell   *lc;
+
+	if (skind == LION_SAGG_NONE)
+		return false;
+	for (c = 0; c < priv->nscol; c++)
+	{
+		if (priv->scol[c].attno == attno)
+			break;
+	}
+	if (c == priv->nscol)
+		return false;			/* another column's count */
+
+	foreach(lc, *ctlist)
+	{
+		if (equal(((TargetEntry *) lfirst(lc))->expr, agg))
+			return true;
+	}
+	a = &priv->sagg[priv->nsagg++];
+	a->kind = skind;
+	a->col = c;
+	*ctlist = lappend(*ctlist,
+					  makeTargetEntry((Expr *) copyObject(agg),
+									  list_length(*ctlist) + 1, NULL, false));
+	*kinds = lappend_int(*kinds, LION_TL_SAGG(priv->nsagg - 1));
+	return true;
+}
+
+/*
  * Turn the path into a CustomScan.
  *
  * scan.scanrelid is 0 because this is an upper node, so custom_scan_tlist has
@@ -839,6 +886,10 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	if (priv.nwcol > 0)
 		priv.wagg = (LionCountPrivWAgg *)
 			palloc0(sizeof(LionCountPrivWAgg) * Max(list_length(want), 1));
+	/* ... and of a sliced column (DESIGN.md §52) */
+	if (priv.nscol > 0)
+		priv.sagg = (LionCountPrivSAgg *)
+			palloc0(sizeof(LionCountPrivSAgg) * Max(list_length(want), 1));
 
 	foreach(lc, want)
 	{
@@ -858,6 +909,9 @@ lion_plan_custom_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		sexpr = (priv.vcols != NIL) ?
 			lion_vcol_subst_with(expr, priv.vcols, priv.scanrelid) : expr;
 
+		if (IsA(sexpr, Aggref) && priv.nscol > 0 &&
+			lion_sagg_add_target((Aggref *) sexpr, &priv, &ctlist, &kinds))
+			continue;
 		if (IsA(sexpr, Aggref) && priv.nwcol > 0 &&
 			lion_wagg_add_target((Aggref *) sexpr, &priv, &ctlist, &kinds,
 								 &wargs))
