@@ -39,14 +39,15 @@ has the setting, DESIGN.md §9).
     make planes-bench PG_CONFIG=.local/pg/bin/pg_config   # the bit-plane kernels timed, at -O2
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
-the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
-the bit-plane kernels and of lionvec's, compiled with target attributes, and pick one at run time by
-what the CPU has - one choice for the extension, `lion_simd_current()` in `src/lion_planes.h`, except
-lionvec's, which still choose their own; other targets and compilers get a portable one, and
-`make LION_NO_SIMD=1` leaves the x86-64 ones out (DESIGN.md §3, "Whole-bitset kernels"; §44.3,
-"Kernels"; §50).  `make unit` runs the bit-plane, container and lionvec tests against each version
-the CPU has, and once more built without the x86-64 ones (`test/unit/planes_test_nosimd`,
-`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
+the container library's passes over whole bitsets, AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of the
+bit-plane kernels - lionvec's plane 1 among them - and AVX2 (and F16C) ones of lionvec's others,
+compiled with target attributes, and pick one at run time by what the CPU has - one choice for the
+extension, `lion_simd_current()` in `src/lion_planes.h`, which every one of them follows; other
+targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
+(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels"; §50).  `make unit` runs the bit-plane,
+container and lionvec tests against each version the CPU has, and once more built without the
+x86-64 ones (`test/unit/planes_test_nosimd`, `test/unit/container_test_nosimd`,
+`test/unit/vec_test_nosimd`).
 
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
@@ -213,8 +214,9 @@ pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own wo
                             exact distances
     src/lion_vec_loc.c      its locator: where vectors in TOAST lie, so that the scan reads them from their
                             chunks' pages directly - the lookups, the checked reads, LOC and LOCDIR pages
-    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
-                            unit-tested standalone (test/unit/vec_test.c)
+    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds - plane 1's kernel
+                            lion_planes.c's, and every kernel run by lion_planes' choice - frontend-safe
+                            and unit-tested standalone (test/unit/vec_test.c)
     src/lion_readahead.[ch] reading a relation's blocks in an order its reader predicts: a read stream
                             over the blocks it pushes, or over a list it knows whole (17 and later), asks
                             of the kernel, or plain reads
