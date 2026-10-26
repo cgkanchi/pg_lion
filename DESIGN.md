@@ -29752,6 +29752,34 @@ them (`lion_probe_rel_rows()`):
   each key it lets through names a row, and the orphan share is taken at the first key set only.
   Core's `eqjoinsel_semi()` takes `setrows / nd` where `nd` passes `dim.tuples`, the same, and then
   takes the orphan share again at the join.
+- **The key sets folded** (§47.6, "Folded into the walk"; `oj_fold_share()`): the walk is priced
+  over the AND of its set and the rows of the key sets' keys, `keysel = P(fk IS NOT NULL) * Π
+  min(1, hit * setrows / dim.tuples)` of the table, taken as independent of the fact's quals
+  (`lo_cost()`'s `keysel`): its members, pieces, bytes and fetches are the AND's, its rows
+  `factrows * keysel`, every key a dimension key that each key set passes (a test each all the
+  same). Each key set's leaf is priced in the start-up (`lion_ordered_keys_price()`): its keys'
+  entries located in the key's lion index, `index_pages_fetched()` over the index's pages at
+  `random_page_cost` as `genericcostestimate()` prices an IN list's descents, a descent's
+  comparisons a key, and a piece a container key its rows reach; and an operator a key for the
+  array. Its pages join the cold reads. Folded and not are both offered (`oj_add_paths()`), and
+  `add_path()` keeps what it keeps: a page the walk meets in a few hundred entries does not pay a
+  thousand keys' lookups back.
+- **The fetches the key sets reject**, not folded: the walk fetches each member to read its key,
+  and the key sets keep `kept = descents / keys` of them. Core's Limit takes `s` of a run priced
+  whole, which charges those fetches `s` of the pages Mackert and Lohman give the whole walk's -
+  each page once, a page for the seventy fetches the whole walk makes of it - where the LIMIT's
+  share makes `s * fetches` of them, which read the pages that many fetches read: a walk that
+  fetches a million rows for a hundred was charged a fifth of the table. So the pages of the
+  share's fetches at their own count (`lion_ordered_heap_price()`, `lo_cost()`'s heap price with
+  its correlation) past `s` of the whole walk's are charged, for the share `1 - kept` of them the
+  key sets reject, at `1 / s` of it in the run, which the Limit takes `s` of. Not alone under the
+  LIMIT (`s` 1) or with nothing rejected it is 0; folded there is nothing to reject.
+- **The key sets tested on the index tuple** (§47.6, "Tested on the index tuple";
+  `oj_itup_col()`), not folded, where the walked B-tree holds the key: the walk fetches only the
+  members the key sets keep, so its heap price is that of `kept` of its fetches - `lo_cost()`'s
+  heap price over the whole walk (`lion_ordered_heap_price()`) for them in place of all of them, and
+  a `cpu_tuple_cost` less for each fetch not made - and nothing is fetched for nothing: the term
+  above is 0. The key's test is a hash probe, as after the fetch.
 - **A descent**, as `btcostestimate()` prices one: `ceil(log2(index tuples))` comparisons,
   `(tree_height + 1) * 50` operator costs for the pages descended, an index tuple, an operator;
   and the B-tree's pages the descents read, `index_pages_fetched(descents, index pages)` at
@@ -29898,7 +29926,9 @@ The fact's side's lines as LionOrdered prints them - `Ordered By: <index>[ (inde
 Cond`, `Filter`, `Lion Cond`, `Lion Indexes` - then `Dimension: <table> [<alias>] via <index>`
 and the dimension's side's lines behind `Dimension ` (`Dimension Filter`, `Dimension Lion Cond`,
 `Dimension Lion Indexes`; its index and its descent's key, the join's clause, are not repeated),
-then `Key Sets: <table>, ...`. Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
+then `Key Sets: <table>, ...` and, where they are folded into the fact's set, `Key Set Index:
+<index>`, or, where the fact's walked B-tree holds the key and they are tested on its index
+tuples, `Key Sets Tested On: <index>` (§47.6). Under ANALYZE: the fact's counters - `Index Entries Walked`, `Lion
 Set Hits`, `Heap Fetches`, `Rows Removed by Lion Recheck`, `Rows Removed by Filter`, `Lion Set: N
 containers, exact|rechecked[, after N keys probed (probe budget)][, N builds]`, `Switched to Fetch
 and Sort` and the sort's method and space, `Scans Stopped Early`; then `Key Set Keys` (the last
@@ -29959,6 +29989,112 @@ context; a NULL key matches nothing. `Key Set Keys` counts them. Planning takes 
 join rel whole: a join rel some of whose tables are not key sets gets no path, and core's join of
 the node's rows to them above is the plan.
 
+**Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
+after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
+private workload's pages a key set of 746 companies kept 101 of 969,731 entries walked, each
+fetched (70.6 s against core's 0.9). Where the fact's key has a lion index the key sets are ANDed
+into the walk's set instead, and an entry whose key a key set lacks is not a member: never
+fetched. The index (`oj_key_index()`): a lion index of the fact, not partial unless the query
+implies its predicate, with a key column that is the key itself, a plain column, scalar - an entry
+a row, not multikey - of the key's type, whose equality strategy is each key set's hashable
+equality, under the key sets' collation; so the rows of a key there are the rows that key set's
+test passes, and an index that answers a key's rows differently is not taken. The keys are known
+only at run time, so the fact's plan carries a leaf for each key set (the fact side's third member,
+their count `LO_PRIV_INTS`' fifth): `fk = ANY (NULL::type[])` on that index, ANDed at the root of
+its tree before the lion access's - or the tree alone where the fact has none - in the key sets'
+order.
+When the join builds a key set (`oj_exec()`) it hands its keys to the walk as an array of the key's
+type in the set's memory (`oj_keyset_array()`), the leaf's scan key's argument
+(`lion_ordered_keyset_keys()`, as `lion_ordered_probe_key()` hands the dimension its key), which
+drops the walk's set and restarts its walk; the set is then made from them as §30.4 makes any
+set, lazily or at once - a list longer than a batch built - an AND that a key set with no row
+empties before the lion access is read. The walk refuses to make its set while a leaf still holds
+the planned NULL. The join's test stays and passes every row: the posting union is exact for a
+scalar equality, and the test costs a hash probe. What follows is LionOrdered's: members are root
+TIDs and a member's row the version the snapshot sees (§30.5) - an update of the key is not HOT and
+puts the new version under its new key; NULL keys are in no key's postings; repeated keys are one
+array element each, the set's; an empty key set ends the scan before the walk, its empty array
+handed all the same so that no leaf keeps a freed array; a rescan keeps the set unless a key set
+is rebuilt (its plan's Param) or a lion qual's Param changed. And the walk's early stop and its
+fetch-and-sort switch (§30.4) now see the key sets: a set of a few thousand members switches to
+fetching and sorting them after 32 entries walked a member it has not met, which is the filter
+first, at run time. EXPLAIN prints `Key Set Index: <index>` after `Key Sets`, and the fact's `Lion
+Indexes` leaves that index's leaves out; under ANALYZE `Lion Set Hits`, `Heap Fetches` and `Lion
+Set` are the AND's, `Keys Rejected by Key Sets` 0. `pg_lion.enable_key_set_fold` (on) offers it;
+the price is §47.3's.
+
+**Measured** (2026-10-25; PostgreSQL 18.6 release, the shared VM of four cores, `shared_buffers` 1
+GB, `work_mem` 4 MB; warm, the median of seven runs, and buffers-cold - every buffer evicted with
+`pg_buffercache_evict_all()` before each run, the kernel's cache warm - of five). A stand-in for the
+page: a 2,000,000-row fact (165 MB) walked by a B-tree of a random rank that does not hold the key,
+a 1,000,000-row dimension with a three-value lion `tier`, and a key table whose 746 keys hold 1,487
+fact rows, 0.075% of the entries; `... WHERE f.company_id IN (SELECT company_id FROM installbase
+WHERE product_id = 7) ORDER BY d.tier, f.rank DESC LIMIT 100`, and 19,817 keys (2%) for product 3.
+"Before" is the parent commit; core's plan is with the node off.
+
+| the key's index | key set | before | after | core's plan |
+|---|---|---|---|---|
+| none | 746 keys | split, 419 ms (371,712 walked, all fetched, 371,412 rejected); cold 717 | core's hash join, 220 ms; cold 250 | 224 ms |
+| lion | 746 keys | core's, 37 ms (the split, forced: 473) | core's, 36 ms (the split folded, forced: 52 - 46,560 walked, 1,487 fetched, 0 rejected; cold 85 against 635) | 37 ms |
+| lion | 19,817 keys | split, 60 ms (13,342 walked and fetched) | split folded, 77 ms (275 fetched) | 328 ms |
+| B-tree | 746 keys | core's, 51 ms | core's, 32 ms | 33 ms |
+| B-tree | 19,817 keys | split, 72 ms; cold 123 | core's, 326 ms; cold 547 | 328 ms |
+| none | 19,817 keys | split, 61 ms | split, 66 ms | 524 ms |
+
+Without an index of the key the page goes to core's plan, 1.9 times faster warm and 2.9 cold. With
+the key's lion index core's plan is the key table first and the key's lion index looked up for each
+key, 37 ms, and stays; the split folded runs 52 ms, nine times the split not folded. Folding the 2%
+key set reads 19,817 keys' postings to save 13,067 fetches, and is chosen at 77 ms where the split
+not folded ran 60. The 2% key set over a B-tree of the key is §47.7's warm case. Ordered by the rank
+alone, with `d.region < 10`, the node gave way to core's hash join without an index of the key (266
+against 255 ms); at a `work_mem` of 64 MB core's nested loop over the rank's B-tree, a Memoize
+under its semi join, came out under both and ran 946 ms (§47.7).
+
+**Tested on the index tuple** (2026-10-26; `oj_itup_col()`, `lion_ordered_entry_test()`). The
+private workload's walked B-tree holds the key it joins on - `cpc_rank_idx (customer_product_id,
+version, model_score DESC) INCLUDE (company_id)` - while its lion index has the key as the eighth of
+twenty columns and a plain B-tree has it alone. Folding reads the postings of every key; the
+B-tree's index tuple has the key already. Where a column of the fact's walked B-tree - a key column
+or an INCLUDE one - is the key column itself, stored as the key's type and returnable
+(`oj_itup_col()`, and `lion_ordered_entry_test()` checks it again at run time), the join, not
+folded, has the walk hand it each member's key from the index tuple before the fetch
+(`oj_entry_test()`: each key set's hash probe, in a memory context of its own reset an entry), and
+an entry a key set rejects is turned away unfetched. The walk asks its B-tree for index tuples
+(`xs_want_itup`) to read the key, as an index-only walk asks for them to read its columns; that does
+not make it index-only, and it fetches the rows the key sets keep. Where the walk is index-only the
+test comes before the visibility map's, and a rejected entry on a page not all-visible is not
+visited for its visibility either. It is right for the same reason the fold is: every version a TID
+of the B-tree reaches holds the key its index tuple holds, an update of an indexed column - an
+INCLUDE one too - being never HOT, so the version the snapshot sees, if any, would have been
+rejected after the fetch; a NULL key is rejected as the strict clause rejects it, and not counted. A
+rejected row takes no tuple predicate lock, which core's plan, fetching it and filtering, would:
+under SERIALIZABLE the B-tree's own lock on the leaf page it read stands for it, as for core's
+index-only scan, and an update that moves the row's key into a key set writes a new entry there
+(`test/isolation/keyset_index_tuple_serializable.spec` ends in the serialization failure core's plan
+ends in). The join's test after the fetch stays, and passes every row. A rejected entry whose row is
+dead is not marked dead in the B-tree either, as a fetch that finds its chain dead marks it
+(`kill_prior_tuple`), so a later walk meets it again until VACUUM, as core's index-only scan leaves
+the entries it does not fetch: in ordjoin.sql a query walked twice walks 60 entries more the second
+time than it did when the first fetched them. EXPLAIN prints `Key Sets Tested On: <index>`, and
+under ANALYZE `Heap Fetches` are the kept members and `Keys Rejected by Key Sets` the entries a key
+set turned away; an entry whose key is NULL is in neither, turned away uncounted as the join's test
+after the fetch leaves it uncounted. Folded paths are still offered beside them; `add_path()` keeps
+the cheaper.
+
+**Measured** (2026-10-26; the stand-in above, its indexes the private workload's: the key the third
+column of a multicolumn lion index `(product_id, intensity, company_id)`, a plain B-tree on the key,
+and the walked B-tree `(rank DESC) INCLUDE (company_id)`; release build, the median of five, warm,
+and buffers-cold as above).
+
+| key set | before the fold | folded (§47.6 above) | tested on the index tuple | core's plan |
+|---|---|---|---|---|
+| 746 keys | core's, 35 ms; cold 61 | core's, 32 ms; cold 56 | core's, 25 ms; cold 49 | 34 ms |
+| 19,817 keys | split, 57 ms (13,342 walked and fetched, 13,067 rejected); cold 493 | split folded, 75 ms (275 fetched); cold 92 | split, 27 ms (13,342 walked, 275 fetched, 13,067 rejected unfetched); cold 35 | 307 ms |
+
+Without the price of §47.3 for the rejected fetches the fold is not chosen (the split not folded,
+52 ms warm), which is the plan that read the disk for the workload's rejected rows; tested on the
+index tuple, the rejected rows are not fetched and need no price.
+
 ### 47.7 Not done
 
 - **A key set past `work_mem`.** Declined at plan time from the estimate; at run time a set
@@ -29990,20 +30126,33 @@ the node's rows to them above is the plan.
   priced. Under a key set the turn could be to the filter first: its keys looked up in a B-tree of
   the fact's key and their rows sorted in the walk's order past its position (the B-tree's order is
   the score's, then the TID's), arm by arm under the split - about core's plan, after the walk
-  before it. Under a filter above, which the node does not see, it could only be the rest of the
-  join at once, the two sets hash-joined and sorted: core's plan of the join without the page's
-  filters, a bound, but the dense page's 6.5 seconds on §47.10's tables. Either needs a price for
-  the switch, as §30.4's has, and a sort past `work_mem`.
-- **A key set's keys tested before the fact's heap.** In heap mode the walk fetches the member's
-  row, and the join then reads its key for the key sets; where the B-tree holds the key (`INCLUDE
-  (fk)`) the key could be tested on the index tuple and a rejected entry never fetched. An
-  index-only walk fetches no row either way.
+  before it. Folded into the walk's set (§47.6) that is the fetch-and-sort switch's, where the
+  fact's key has a lion index; without one it is not done. Under a filter above, which the node
+  does not see, it could only be the rest of the join at once, the two sets hash-joined and sorted:
+  core's plan of the join without the page's filters, a bound, but the dense page's 6.5 seconds on
+  §47.10's tables. Either needs a price for the switch, as §30.4's has, and a sort past `work_mem`.
+- **A key set's keys tested before the fact's heap, where neither index holds the key.** Folded
+  where the key has a lion index, tested on the index tuple where the walked B-tree holds it
+  (§47.6). With neither, the walk fetches the member's row and the join reads its key.
+- **The rejected fetches on a warm machine.** Not folded, and where the walked B-tree does not hold
+  the key (§47.6, "Tested on the index tuple"), the fetches a key set rejects are priced at their
+  own pages (§47.3), each page a `random_page_cost`, which is what they cost where the walk reads
+  the disk - the private workload's walk read 541,680 buffers - and many times what they
+  cost where the table is in memory. There the node can lose a page it runs faster: §47.6's
+  measurements, the 2% key set over a B-tree of the key, 72 ms through the split and 326 through
+  core's plan. And core's own nested loop over the fact's B-tree, its key table's semi join
+  Memoized above, keeps its Limit's share of the whole walk's pages: where the key has no index and
+  the ORDER BY is the B-tree's, that loop can come out under the node and core's filter first and
+  be the slowest of the three (946 ms at a `work_mem` of 64 MB, against the node's 354 and the hash
+  join's 292; the split's order has no such loop). At `random_page_cost = 1.1` the 2% key set keeps
+  the split, and the 0.075% one keeps it too (405 ms against core's 224).
 - **A key set's other columns.** A table a column of which the query reads is not a key set, even a
   column its clauses pin to a constant, which the node could fill as it fills the key: §47.10 says
   why that would cost the page its plan. A key that repeats under the table's clauses is not one
   either: the rows would have to come out once for each of its rows.
 - **Arms a key set passes over.** Under the split, an arm none of whose dimension rows a key set's
-  keys name walks to its end (§47.10, "What a key set leaves"). The key set's keys could be
+  keys name walks to its end (§47.10, "What a key set leaves") - folded (§47.6), to the last
+  member of its set, or to the switch, which fetches and sorts them. The key set's keys could be
   descended once into the dimension and tested against each arm's set, and an arm with none passed
   over; it is not.
 
@@ -30067,6 +30216,36 @@ alone, its walk both arms long (§47.10, "What a key set leaves"). Not alone and
 split under a LATERAL subquery's clause, its LIMIT 1 keeping it from being pulled up, at 2.2 times
 under core's price. A key set's key in the target: with nested loops and merge joins off, the side
 table's hash join above reads the key set's key, `Hash Cond: (s.fk = ib.fk)`, which the node fills.
+
+test/sql/ordjoin_keyfold.sql, §47.6's fold, in a schema of its own: a 20,000-row dimension with lion
+indexes on a three-value `tier` and a ten-value `region`; a 200,000-row fact table, ten rows a key,
+every 97th key NULL, with a B-tree by a random rank that does not hold the key and a lion index on a
+twenty-value `prod`; a key table of sixty keys for product 7 (600 fact rows) and 2,000 for product
+3, and one of 40 keys repeated and NULLs. Each query through the node, forced, and through core's
+plan, answers compared in order. Without a lion index of the key, the split led by the tier under
+product 7's key set walks 18,275 entries, every one fetched, 18,043 keys rejected; with nothing
+forced the plan is core's, the walk priced at its share's fetches (§47.3), and for product 3's two
+thousand keys the split's. With `cpc_fk`, a lion index of the key: the same split forced walks
+17,792 entries over a set of the key set's 610 rows, 54 met, then switches and fetches the 556 left,
+610 fetches in all and no key rejected; the join with a fact and a dimension lion clause besides,
+its set the AND of both; with nothing forced core's plan for product 7 - the key table, then the
+key's lion index - and the split folded for product 3. A key set of repeated keys and NULLs; two key
+sets, an IN on the fact's key and an EXISTS on the dimension's, two leaves; an empty one; the whole
+join without a LIMIT; a LATERAL rescan whose key set is built and handed again for each of three
+rows (`Key Set Builds: 3`); a key updated and a row inserted in the transaction before the query.
+Not folded: a partial lion index of the key whose predicate the query does not imply, and folded
+into where it does; a key table of `bigint` keys, no key set; `pg_lion.enable_key_set_fold` off.
+Section 6, the key tested on the index tuple: with no lion index of the key and the B-tree `(rank
+DESC) INCLUDE (fk)`, the split under product 7's key set walks the same 18,275 entries and fetches
+55, 18,043 keys rejected unfetched - the other 177 entries NULL keys, turned away uncounted - and
+with nothing forced the split is the plan, for product 3 too; repeated keys and NULLs, two key sets,
+a LATERAL rescan; a key updated, a row inserted and rows of the set's keys updated HOT in the
+transaction; and the key a key column, `(rank DESC, fk)`.
+test/isolation/keyset_index_tuple_serializable.spec: the write skew of a row whose key an update
+moves into the key set, after the join turned its entry away unfetched, ends in a serialization
+failure in either order of the commits. ordjoin.sql's B-tree `fact_grp_score` holds the key
+(`INCLUDE (fk)`), so its key sets are tested on the index tuple too: 191 heap fetches where there
+were 19,944, 2,750 where there were 82,302.
 
 ### 47.9 Measured (2026-10-23; PostgreSQL 17, the dev cluster - a VM of four cores, `shared_buffers` 2 GB; warm and cold; EXPLAIN (ANALYZE, TIMING OFF))
 
@@ -30437,7 +30616,9 @@ core's Limit pays whole; the child's start-up is its own total too. Both are div
 **The sides' sets** (§47.4). The fact's is weighed for its lazy set by the arms up to `m`, their
 shares of its walk summed - two whole arms weigh 2. The dimension's is built at once under a split,
 whatever its weight (§48.4, "Built at once"), and `oj_cost()` prices its build whole, as it does
-for the join.
+for the join. Key sets folded into the fact's set (§47.6) are priced in it as for the join (§47.3),
+once: the set is kept from arm to arm, the key sets built once; and each arm's run, not folded,
+carries the pages of the fetches its key sets reject at the arm's own share (§47.3).
 
 **Where the price and the run part:**
 
@@ -30460,7 +30641,8 @@ for the join.
 - *A filter above the split*, a join or a clause that drops rows of the arms: §47.10 prices the
   split at every arm. A key set filters inside it, and its keys are taken to be spread over the
   arms as the dimension's quals are; a key set of one arm's rows walks the others to their ends
-  (§47.10, "What a key set leaves").
+  (§47.10, "What a key set leaves") - folded into the fact's set (§47.6), each to the last member
+  of the set, or to the switch.
 
 ### 48.4 Execution (`os_begin()`, `os_exec()`, `os_next_arm()`, `os_rescan()`; `lion_ordered_narrow_begin()`, `_add()`, `_end()`, lion_ordered.c)
 
@@ -30555,7 +30737,8 @@ its `Dimension Lion Set` is the dimension's set, not an arm's.
 - **A cap at run time.** None: a column with more entries than planned - values inserted since
   ANALYZE - runs every one.
 - **A multikey column**, whose rows are under several entries: declined.
-- **Arms a key set passes over**, and a switch from a slow arm to the filter first: §47.7.
+- **Arms a key set passes over**, and a switch from a slow arm to the filter first: §47.7 - the
+  switch is the fetch-and-sort's where the key sets are folded into the fact's set (§47.6).
 
 ### 48.7 Tests
 
@@ -30612,3 +30795,179 @@ sizes: its Limit 2,197 against core's 104,372 for the dense `d.flag DESC` page, 
 90,083 for the medium. It keeps core's plan for the sparse page, rightly: the arm walks 1.19 million
 entries for its twenty rows, 4.3 times slower than core's plan, and is priced 128,890 warm and
 190,970 cold against 77,161. Not measured: other majors.
+
+## 49. A lion path's own price, and the heap probe (2026-10-25)
+
+§39 prices a lion path against the cheapest core plan it meets: its own price times that plan's
+rate, divided by that plan's cold reads, scaled by the rows that plan's probes of a skewed key meet
+and by its Memoize's hits under a LIMIT. Each correction reads the competitor's plan, so each new
+shape of core plan needs a new reading (§39's "The join that reads the dimension" is the latest),
+and a path's price moves with a plan it is not part of. This section starts replacing that with a
+rule: **a lion path is priced by the work it does, in core's units, and core's plans by core.**
+
+- **Its own work, itemized.** No factor comes from another path.
+- **What it shares with core, at core's prices.** Heap pages through `index_pages_fetched()` and the
+  tablespace's page costs, a B-tree descent through the index's `amcostestimate`, a row at
+  `cpu_tuple_cost`, quals at `cost_qual_eval()`. A table read cold is core's to price, through
+  `effective_cache_size` and the tablespace's `random_page_cost`, and then it is priced so for every
+  plan alike.
+- **What is lion's alone, at its constants** (§31), fitted in core's units.
+- **One set of row estimates.** What lion knows better than core (n_distinct, §33; the rows of an
+  intersection, `pg_lion.enable_rows_correction`) goes to every path or to none.
+- **Scans that core composes.** Where lion can offer a path of a relation that core's join search
+  combines - the inner side of a nested loop, under a Memoize, a semi, anti or left join - its price
+  meets core's alternative for the same relation and parameterization in `add_path()`, both made by
+  the same formulas, and nothing needs to read the plan around it.
+
+### The switch (`pg_lion.competitor_pricing`)
+
+On by default, §39 as it was. Off, `lion_competitor_of()` finds the competitor's kind (for the margin,
+which stays a policy) and takes nothing else from it: rate 1, no nested loop's or bitmap heap scan's
+cold reads (`lion_competitor_bitmap_cold()`, `lion_units_scan_cold()`), no Memoize scale, and
+LionOrderedJoin weighs no competitor of its own (`oj_cost()`). A skewed key's rows
+(`lion_skew_param_factor()`, `lion_skew_clauses_factor()`) are core's: lion's paths, the AM's scans
+and the competitors are all priced at core's rows per key. Off is the ablation of §39 in one
+setting; the next step is to run the private workload and the matrix with it off, and keep only what
+moves a plan to a faster one.
+
+### The heap probe (`pg_lion.enable_heap_probe`)
+
+§40.10's probe is index-only: a nested loop's inner `LionBtreeScan` descends a covering B-tree to the
+outer row's key and tests the entry against the relation's lion set. It declined the heap mode as "a
+plan that loses to core's wherever the set does not" reject most rows. That is a judgement for the
+price, and the price can make it: in heap mode the probe is core's parameterized Index Scan of the
+same B-tree with the lion test in place of the Filter, the heap row fetched for a member alone. Its
+fetches are a subset of the Index Scan's, priced by the same formula (`lo_cost()` with `loops`), so
+its price is lower by the rejected rows' pages and quals and higher by the set's build, spread over
+the scans (§40.10), and an entry's test. Where the B-tree does not cover what the scan must return,
+`lo_set_rel_pathlist()` takes its parameterized paths alone (`lo_btree_paths()`; its unparameterized
+walk would read every member's row) and offers each paired lion access in heap mode: `iocols` NIL,
+no `LO_FLAG_INDEXONLY`; the executor's heap fetch, recheck and EvalPlanQual are §30's. It needs
+`enable_indexscan`. This is the shape LionProbeJoin (§46) and LionOrderedJoin's dimension (§47)
+each build inside a join of their own; as a path of the relation, core composes it with any join.
+
+**The probe's members over the loop.** `lo_cost()` counted a probe's members and their pages a scan
+at a time, each clamped to one: a set that passes one key in a hundred was charged a heap fetch and a
+page an outer row - core's Index Scan's - plus its own test, and lost to it everywhere. A key finds
+its entry in every scan and the set passes a share of them, so a probe's members are now counted over
+all of the loop's scans and shared out (`fetched`, `candidates`), and a scan that fetches less than a
+row reads that share of a page (`pages_corr`). The index-only probes are priced by the same counts.
+In competitor_cold.sql three plans moved to LionProbeJoin, whose probe is priced the same way
+(`lion_ordered_probe_price()`): the anti join's nested loop at ten times the cache with the cold
+charge at 0, and the Memoize loop in the cache and at ten times it uncharged. Warm, on PostgreSQL 18.6
+(release), medians of nine over three rounds: the anti join ties (node 1.54 to 1.89 ms, loop 1.46 to
+1.92), and the Memoize query runs faster through the node (5.22 to 5.67 against 5.79 to 7.00).
+
+**Measured** (heapprobe.sql's tables: a 100,000-row dimension on 2,619 pages, 200,000 fact rows;
+PostgreSQL 18.6 release, warm, hash and merge joins off, `pg_lion.competitor_pricing` off; medians of
+five to seven runs on a shared VM whose runs vary by a third, so a difference below that is a tie):
+
+| outer rows | the set passes | heap probe | core's Index Scan | the planner takes |
+|---|---|---|---|---|
+| 3,585 | 0.7% | 6.9 ms | 11.1 ms | the probe |
+| 3,585 | 10% | 7.3 to 10.5 | 10.6 | the probe |
+| 40,000 | 10% | 65.9 | 80.2 | core's, at a price 1.8% below the probe's ("The probe's own work", below) |
+| 200,000 | 10% | 267 | 406 | core's, at a price 1% below the probe's |
+| 4,000 | 100% | 12.3 | 13.0 | core's (the set rejects nothing) |
+| 200,000 | 100% | 388 | 376 | core's |
+| 3 | 7% | | | core's (the build is not paid back) |
+
+With 200,000 outer rows over a 2,619-page table both plans read every page about once, which is all
+`index_pages_fetched()` charges them, and each heap fetch past that is a `cpu_tuple_cost`: the 180,000
+fetches the probe saves, about 0.7 us each here, are priced at a hundredth of a unit, and the two come
+out within 1%. That is core's price of a cached heap fetch, which core's own plans take too; by this
+section's rule the probe takes it as well, and the near tie goes to core's plan. Where the pages are
+not all read - fewer outer rows, a larger table, a cold one at its `random_page_cost` - the fetches
+the probe saves are pages, and its price shows them.
+
+### Calibration (`bench/calib/ops.py`)
+
+A lion constant is a multiple of a core cost setting; what multiple is set by the core operation the
+lion operation stands in for. Core's plans do not run at one rate. On PostgreSQL 18.6 (release), on
+the shared VM above, a cached sequential scan's quals take 4.9 to 5.5 ns a `cpu_operator_cost` - the
+slope of its time over the number of `a <> -k` quals a row - and a nested loop of cached Index Scans
+12 to 15 ns: core prices a descent and a heap fetch at less of their time than a qual. A lion
+operation that competes with one of them is priced at that one's rate - its time over core's price
+of it - so that the planner weighs the two as their times weigh. Priced at the sequential scan's
+rate, a probe's few hundred nanoseconds cost two and a half times what core charges for the same
+time in the Index Scan the probe replaces. A ratio measured on one machine carries to another far
+better than a rate of cost units a millisecond, which is the machine's. This is not §39's rates: a
+constant is fitted once, offline, against the core operation its own shape replaces, and no price
+reads the plan it meets.
+
+`bench/calib/ops.py` checks the measurements into the tree. It prints the sequential scan's rate for
+comparison; its first lion operation is the probe: the heap probe over a set that passes every row,
+against core's Index Scan of the same B-tree with no filter - the same descents and fetches - as the
+slopes of their times and of core's price over 50,000, 100,000 and 200,000 outer rows, so that the
+set's build stays out; of a unique key (`calib_ops_dim`) and of a key of eight entries on one page
+(`calib_ops_many`), which apportion the probe's own work between the scan and the entry.
+
+**The probe's own work.** Under callgrind (a single-user backend, 10,000 and 30,000 outer rows, with
+the cache and branch simulators, the difference over 20,000) a scan of the probe runs no more
+instructions than core's Index Scan, but 134 instruction cache misses to core's 69: the node's code -
+`lo_next()`, `lo_rescan()`, the set's lookup - runs beside core's between one outer row and the next,
+and the two no longer fit the first-level cache. An entry costs about 370 instructions more: the
+set's lookup, two binary searches - the container key's (`lo_set_find()`, 96 instructions and 1.6
+mispredicted branches an entry) and the member's in its container (`lion_container_contains()`, 110
+and 1.4) - and the node's projection of its target into a slot of its own (about 110 with its
+bookkeeping), where core's Index Scan returns the heap tuple through a physical target list. The
+key's search now starts within what sorted, distinct keys allow - an index no further from either end
+than the key is from that end's key - so a set with a container at every key of its range, as a set
+of a share of most blocks' rows has, finds it with no search: one run before measured an entry at 93
+ns over core's, seven after at 31 to 107 (median 49).
+
+Over those seven runs, at the Index Scan's rate, an outer row of a unique key costs the probe 14 to 29
+`cpu_operator_cost`s more than core's (median 20), one of eight entries 40 to 70 (median 51): an entry
+4.4, a scan 15.6. They are two settings: `pg_lion.probe_entry_cost` (4.5), charged by `lo_cost()` for
+each entry an index parameterized by the outer row walks, in place of the walk's `LO_PROBE_TUPLES`
+(a probe marks nothing), and `pg_lion.probe_rescan_cost` (16), charged a scan of LionBtreeScan's
+probe. A probe of a unique key was charged 9 an entry and nothing a scan, and is now charged 20.5.
+LionProbeJoin's probes (`lion_ordered_probe_price()`) take the entry's price; a scan of them is the
+join's own loop, not a node's rescan, and is not measured.
+
+**The descent is startup.** `lo_cost()` puts the B-tree's descent in the walk's run, so LionBtreeScan's
+probe offered `add_path()` a first row at 0.00 against core's Index Scan's 0.29 - for the same
+descent - and, its total within `add_path()`'s 1% of core's, won on it: at 40,000 outer rows the plan
+above was the probe's at a price 1.8% above core's. The probe's path now takes the descent as its
+startup, as `cost_index()` has an Index Scan's (`ipath`'s startup, in `lo_set_rel_pathlist()`). The
+walks keep it in their run - one descent beside a set's build - and `lion_ordered_probe_price()`,
+which takes a probe's price as its total less its startup, the build, keeps it in the probe's price.
+
+**What it costs.** Priced so, the probe keeps the 3,585-row loop of the table above and loses the
+40,000-row one to core's Index Scan, at a price 1.8% below the probe's - re-timed, the probe 70.5 ms
+against core's 77.9 - and the 196,000-row one (359 against 419). The probe's saving is heap fetches
+of cached pages, which core prices at an Index Scan's entry and its fetch, `cpu_index_tuple_cost` +
+`cpu_operator_cost` + `cpu_tuple_cost`: 7 `cpu_operator_cost`s, about 95 ns at the Index Scan's rate,
+against about 300 ns measured for each row past the first of a key's eight on one page (the
+`calib_ops_many` loop), and more for a row on a page of its own. A probe that saves most of them wins
+by more than its price says, and the near ties go to core's plan. That is core's price of a cached
+fetch, which every core plan takes too; by this section's rule the probe takes it as well, and how
+lion's plans fare against core's on a warm machine rests on core's page costs as the deployment sets
+them.
+
+**Not done.**
+
+- *Column values from the sets.* A query that reads a low-cardinality lion column of the dimension
+  still fetches the row for it; the probe could return its value from the column's per-value sets,
+  as LionProbeJoin's labels give a predicate's truth, and be covering for it.
+- *The comparison with LionProbeJoin and LionOrderedJoin* on their fixtures and the private
+  workload, with the switch off, before either default changes.
+- *The probe's projection* (above). Core's Index Scan under a plain nested loop returns the heap
+  tuple; the node projects its target. Core gives a CustomPath no physical target list
+  (`use_physical_tlist()`), and `PlanCustomPath` is not told whether its parent needs an exact one
+  (an Append's child) or a small one (a Memoize's) - the flags `create_scan_plan()` reads; a
+  pathtarget of the relation's columns would have a Memoize cache whole rows.
+- *LionProbeJoin's scan*: its overhead over core's nested loop, which `probe_rescan_cost` does not
+  price.
+- *The harness's next operations* - the set's build a container (`lo_build_excess()`'s
+  `LO_BUILD_PIECE_TIDS` is a correction of §30.3's price, not a measurement of its own), a
+  container's AND, a count - each against the core operation it stands in for, at that operation's
+  rate.
+
+**Tests.** test/sql/heapprobe.sql: every query through the heap probe and through core's plan,
+answers compared - an inner join, a left join, a Memoize chosen at the prices, an ORDER BY the loop
+keeps, a residual filter, `FOR SHARE` of the dimension, rows updated after the VACUUM - and the
+choice at the prices between the probe and core's Index Scan. costrates.sql: with the switch off no
+rate moves a count, a GROUP BY, an FK-side join or a semi or anti join, each at its reference price.
+competitor_cold.sql: with the switch off LionProbeJoin's price at ten times the cache is its price
+with no cold charge.
