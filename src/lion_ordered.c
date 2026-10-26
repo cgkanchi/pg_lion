@@ -127,7 +127,9 @@ static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
  *					whose column is walked, LO_FLAG_LIONWALK)
  *	LO_PRIV_INTS	IntList (scan direction, flags, where a lion column's walk
  *					puts its NULL entry - LION_ORDER_NULLS_* - and the
- *					column it walks, 1-based; 0 and 0 for a btree)
+ *					column it walks, 1-based; 0 and 0 for a btree; and the
+ *					leaves a LionOrderedJoin's key sets are folded into, the
+ *					first of the tree's, 0 for none - §47.6)
  *	LO_PRIV_ORDCOLS	IntList: the index column (0-based) of each ordered
  *					index qual, in custom_exprs' order
  *	LO_PRIV_TREE	List of IntList, the lion tree in preorder: an inner node
@@ -319,7 +321,15 @@ static const char *const lo_lazy_why_names[LO_LAZY_NWHY] = {
  * (the fact's: the share of its walk the join's LIMIT is expected to take;
  * the dimension's: the descents the join is expected to make) and, for the
  * dimension, the qual its unique btree is descended by, `pk = NULL`, the
- * NULL the key each descent is handed (lion_ordered_probe_key()).
+ * NULL the key each descent is handed (lion_ordered_probe_key()).  For the
+ * fact, where the join folds its key sets into the walk's set (DESIGN.md
+ * §47.6, "Folded into the walk"), the third is a List of the fact key's lion
+ * index (an OidList), the key's column in it (an IntList, 0-based) and a qual
+ * for each key set, `fk = ANY (NULL)`, whose array is the key set's keys,
+ * handed in by the join once it has built them (lion_ordered_keyset_keys());
+ * each a leaf of the set's tree, ANDed with the rest at its root before them,
+ * so that the set holds the members whose key is in every key set.  NIL
+ * where they are not folded.
  */
 #define LO_SIDE_MAGIC		0x4c4f534a	/* "LOSJ" */
 #define LO_SIDE_FACT		1
@@ -339,6 +349,7 @@ typedef struct LoPriv
 	int			flags;			/* ... LO_FLAG_* */
 	int			nulls;			/* ... LION_ORDER_NULLS_* */
 	AttrNumber	walkattno;		/* ... 0 for a btree */
+	int			nkeyleaves;		/* ... a join's key sets' leaves, first */
 	List	   *ordcols;		/* ORDCOLS: IntList */
 	List	   *tree;			/* TREE: NIL when there is no set */
 	List	   *leaves;			/* LEAVES: OidList */
@@ -366,7 +377,7 @@ lo_priv_flags(List *priv)
 	if (list_length(priv) != LO_PRIV_NMEMBERS)
 		return 0;
 	ints = (List *) list_nth(priv, LO_PRIV_INTS);
-	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 4)
+	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5)
 		return 0;
 	return lsecond_int(ints);
 }
@@ -408,13 +419,14 @@ lo_priv_decode(List *priv, LoPriv *out)
 
 	ord = lo_priv_list(priv, LO_PRIV_ORD, T_OidList);
 	ints = lo_priv_list(priv, LO_PRIV_INTS, T_IntList);
-	if (list_length(ord) != 1 || list_length(ints) != 4)
+	if (list_length(ord) != 1 || list_length(ints) != 5)
 		elog(ERROR, "LionOrdered: malformed custom_private");
 	out->ordoid = linitial_oid(ord);
 	out->dir = linitial_int(ints);
 	out->flags = lsecond_int(ints);
 	out->nulls = lthird_int(ints);
 	out->walkattno = (AttrNumber) lfourth_int(ints);
+	out->nkeyleaves = list_nth_int(ints, 4);
 
 	out->ordcols = lo_priv_list(priv, LO_PRIV_ORDCOLS, T_IntList);
 	out->tree = lo_priv_list(priv, LO_PRIV_TREE, T_List);
@@ -502,8 +514,8 @@ lo_priv_build(const LoPriv *p)
 
 	priv = list_make5(list_make2_int(LO_PRIV_MAGIC, LO_PRIV_NMEMBERS),
 					  list_make1_oid(p->ordoid),
-					  list_make4_int(p->dir, p->flags, p->nulls,
-									 (int) p->walkattno),
+					  list_make5_int(p->dir, p->flags, p->nulls,
+									 (int) p->walkattno, p->nkeyleaves),
 					  p->ordcols,
 					  p->tree);
 	priv = lappend(priv, p->leaves);
@@ -828,6 +840,14 @@ typedef struct LionOrderedState
 	 */
 	bool		side;
 	bool		keyed;
+
+	/*
+	 * ... and its fact, with the join's key sets folded into its set (DESIGN.md
+	 * §47.6): the first nkeyleaves leaves of the tree, one a key set, each an
+	 * `fk = ANY (array)` on the fact key's lion index whose array the join
+	 * hands in once it has built the key set (lion_ordered_keyset_keys()).
+	 */
+	int			nkeyleaves;
 
 	/*
 	 * ... narrowed, for a LionOrderedSplit's arm (DESIGN.md §48), to the rows
@@ -1817,6 +1837,13 @@ lo_lion_pages(Path *lion)
  * visibility map, and the heap read for the share of pages not all-visible -
  * a LionProbeJoin's descent where the dimension's WHERE is empty (§46).
  *
+ * With `keysel` below 1 a LionOrderedJoin's key sets are folded into the
+ * fact's set (DESIGN.md §47.6): the set is the lion access's, or none's, ANDed
+ * with the rows whose key the key sets hold, `keysel` of the table's, taken
+ * to be independent of the rest; their lookups cost `keybuild`
+ * (lion_ordered_keys_price()), at the start, and the set's members, pieces,
+ * bytes and fetches are the AND's.
+ *
  * With `reads_p` not NULL, the pages the walk reads go there, which a bitmap
  * heap scan's cold reads are weighed against (DESIGN.md §39, "A bitmap heap
  * scan's cold reads"): the btree's, as its amcostestimate() counts them, the
@@ -1830,8 +1857,8 @@ static bool
 lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		List *lionrinfos, List *lionqual, List *residual, double rows,
 		bool indexonly, double loops, double scans, bool probebuild,
-		int *workers, Cost *startup_p, Cost *total_p, double *reads_p,
-		double *fetches_p)
+		double keysel, Cost keybuild, int *workers, Cost *startup_p,
+		Cost *total_p, double *reads_p, double *fetches_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
@@ -1945,17 +1972,30 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 														   &cols));
 		}
 	}
+
+	/*
+	 * A join's key sets folded into the set (§47.6): the AND of the lion
+	 * access's set, or of none, with the rows of the key sets' keys.
+	 */
+	keysel = Min(Max(keysel, 0.0), 1.0);
+	if (keysel < 1.0)
+	{
+		sel *= keysel;
+		candsel *= keysel;
+	}
 	members = Min(clamp_row_est(candsel * tuples * setskew), tuples);
 	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
 	/*
 	 * the lookups, the copy of their answer into the set, and its spill - a
-	 * probe's share of them (§40.10)
+	 * probe's share of them (§40.10) - and the key sets' lookups
 	 */
-	startup = (lion == NULL) ? 0.0 :
-		lioncost + ncont * cpu_operator_cost +
-		lo_set_pieces(root, lion, members, ncont) +
-		lo_spill_cost(lo_set_bytes(members, ncont));
+	if (lion == NULL && keysel >= 1.0)
+		startup = 0.0;
+	else
+		startup = lioncost + keybuild + ncont * cpu_operator_cost +
+			((lion != NULL) ? lo_set_pieces(root, lion, members, ncont) : 0.0) +
+			lo_spill_cost(lo_set_bytes(members, ncont));
 	if (calls > 1.0 && !rebuilt)
 		scans *= calls;
 	if (scans > 1.0)
@@ -4173,8 +4213,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lion == lioncover && !indexonly)
 				continue;
 			lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-					indexonly, 1.0, 1.0, ord->path.param_info != NULL, NULL,
-					&startup, &total, &reads, NULL);
+					indexonly, 1.0, 1.0, ord->path.param_info != NULL, 1.0,
+					0.0, NULL, &startup, &total, &reads, NULL);
 			if (indexonly)
 				lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, &lion_ordered_path_methods,
@@ -4185,8 +4225,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lo_parallel_ok(rel, ord) &&
 				lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
 						rows, indexonly, 1.0, 1.0,
-						ord->path.param_info != NULL, &workers, &startup,
-						&total, &reads, NULL))
+						ord->path.param_info != NULL, 1.0, 0.0, &workers,
+						&startup, &total, &reads, NULL))
 			{
 				if (indexonly)
 					lo_cold_price_partial(&cold, reads, rows, &startup,
@@ -4253,7 +4293,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 				continue;
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 					rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
-					NULL, &startup, &total, &reads, NULL);
+					1.0, 0.0, NULL, &startup, &total, &reads, NULL);
 			lo_cold_price(&cold, reads, &startup, &total);
 			lo_add_path(rel, NULL, pathkeys != NIL ?
 						&lion_ordered_path_methods : &lion_btree_path_methods,
@@ -4264,7 +4304,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			if (lo_parallel_ok(rel, ipath) &&
 				lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 						rows, true, 1.0, 1.0, ipath->path.param_info != NULL,
-						&workers, &startup, &total, &reads, NULL))
+						1.0, 0.0, &workers, &startup, &total, &reads, NULL))
 			{
 				lo_cold_price_partial(&cold, reads, rows, &startup, &total);
 				lo_add_path(rel, NULL, pathkeys != NIL ?
@@ -4331,8 +4371,8 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 			}
 			lo_cost(root, rel, ipath, lion, lionrinfos, lionqual, residual,
 					ppi->ppi_rows, indexonly, loops, scans,
-					ipath->path.param_info != NULL, NULL, &startup, &total,
-					NULL, NULL);
+					ipath->path.param_info != NULL, 1.0, 0.0, NULL, &startup,
+					&total, NULL, NULL);
 			total += LO_PROBE_RESCAN_COST;
 
 			/*
@@ -4674,13 +4714,16 @@ lion_ordered_set_info(PlannerInfo *root, RelOptInfo *rel, Path *lion,
  * index-only mode where the btree has every column the side needs and
  * indexonly_ok (*iocols is then its mapping, NIL otherwise).  *fetches is the
  * heap fetches of the whole walk (lo_cost()), *lionpages the lion index pages
- * the set's build reads.
+ * the set's build reads.  With keysel below 1 the join's key sets are folded
+ * into the set, the rows of their keys `keysel` of the table's and their
+ * lookups `keybuild` (§47.6, lo_cost()).
  */
 void
 lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 						Path *lion, double rows, bool indexonly_ok,
-						List **iocols, Cost *startup, Cost *total,
-						double *fetches, double *lionpages)
+						double keysel, Cost keybuild, List **iocols,
+						Cost *startup, Cost *total, double *fetches,
+						double *lionpages)
 {
 	List	   *lionrinfos = NIL;
 	bool		lossy = false;
@@ -4701,9 +4744,85 @@ lion_ordered_walk_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
 	if (!indexonly)
 		*iocols = NIL;
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual, rows,
-				   indexonly, 1.0, 1.0, true, NULL, startup, total, NULL,
-				   fetches);
+				   indexonly, 1.0, 1.0, true, keysel, keybuild, NULL, startup,
+				   total, NULL, fetches);
 	*lionpages = lo_lion_pages(lion);
+}
+
+/*
+ * The price of the set of the rows of `nkeys` keys of a key column of lion
+ * index idx of rel, `members` rows in all - a LionOrderedJoin's key set
+ * folded into its fact's walk (DESIGN.md §47.6, §47.3): each key's entry
+ * located in the index, as genericcostestimate() prices an IN list's
+ * descents, the index's pages they read through index_pages_fetched() at
+ * random_page_cost and a descent's comparisons a key; and the copy of their
+ * postings into the set, a piece a container key each key's rows reach, as
+ * lo_set_pieces() prices one, and an operator a container key.  *pages is
+ * the index pages read, for the cold reads.
+ */
+Cost
+lion_ordered_keys_price(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+						double nkeys, double members, double *pages)
+{
+	double		relpages = Max((double) rel->pages, 1.0);
+	double		ipages = Max((double) idx->pages, 1.0);
+	double		itups = Max(idx->tuples, 1.0);
+	double		n = clamp_row_est(nkeys);
+	double		m = clamp_row_est(members);
+	double		perkey;
+	double		ncont;
+	double		pieces;
+	double		spc_random;
+	double		spc_seq;
+
+	get_tablespace_page_costs(idx->reltablespace, &spc_random, &spc_seq);
+	perkey = Max(ceil(m / n * ipages / itups), 1.0);
+	*pages = index_pages_fetched(n * perkey, (BlockNumber) ipages, ipages,
+								 root);
+	ncont = Min(ceil(relpages / LION_BLOCKS_PER_CONTAINER), m);
+	pieces = Min(m, n * ncont);
+	return *pages * spc_random +
+		n * ceil(log(itups) / log(2.0)) * cpu_operator_cost +
+		pieces * LO_PIECE_TUPLES * cpu_tuple_cost +
+		ncont * cpu_operator_cost;
+}
+
+/*
+ * The price of the heap pages a walk of ord over rel reads for `fetches`
+ * fetches over `walked` entries, as lo_cost() prices them: Mackert and
+ * Lohman's pages over the fetches at random_page_cost, interpolated toward the
+ * pages the walked entries span, read in order, by the square of the btree's
+ * correlation (cost_index()'s rule).
+ */
+Cost
+lion_ordered_heap_price(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord,
+						double walked, double fetches)
+{
+	double		tuples = Max(rel->tuples, 1.0);
+	double		pages = Max((double) rel->pages, 1.0);
+	double		spc_random;
+	double		spc_seq;
+	double		max_io;
+	double		min_io;
+	double		pages_corr;
+	Cost		s;
+	Cost		t;
+	Selectivity isel;
+	double		corr = 0.0;
+	double		ipages = 0.0;
+
+	if (fetches <= 0.0)
+		return 0.0;
+	ord->indexinfo->amcostestimate(root, ord, 1.0, &s, &t, &isel, &corr,
+								   &ipages);
+	get_tablespace_page_costs(rel->reltablespace, &spc_random, &spc_seq);
+	max_io = index_pages_fetched(fetches, rel->pages,
+								 (double) ord->indexinfo->pages, root) *
+		spc_random;
+	pages_corr = (fetches < 1.0) ? fetches :
+		ceil(Min(fetches, walked / tuples * pages));
+	min_io = (pages_corr > 0) ? spc_random + (pages_corr - 1) * spc_seq : 0;
+	return max_io + corr * corr * (min_io - max_io);
 }
 
 /*
@@ -4760,8 +4879,8 @@ lion_ordered_walk_reads(PlannerInfo *root, Path *path, double share,
 						   lionrinfos, lionqual);
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, residual,
 				   cp->path.rows, indexonly, 1.0, 1.0,
-				   ord->path.param_info != NULL, NULL, &startup, &total,
-				   &walkreads, &fetches);
+				   ord->path.param_info != NULL, 1.0, 0.0, NULL, &startup,
+				   &total, &walkreads, &fetches);
 	if (indexonly)
 	{
 		LionUnits	cold;
@@ -4783,23 +4902,26 @@ lion_ordered_walk_reads(PlannerInfo *root, Path *path, double share,
  * join's LIMIT is expected to take), or the dimension's probe of its unique
  * btree (`weight` the descents the join is expected to make, keyqual the
  * `pk = NULL` it is descended by).  Serial, unparameterized; a probe in heap
- * mode.
+ * mode.  The fact's keyfold, where the join folds its key sets into its set
+ * (§47.6): the fact key's lion index, the key's column in it and a qual for
+ * each key set, as LO_SIDE_FACT's comment has them; NIL for none.
  */
 CustomPath *
 lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord, Path *lion,
 					   List *iocols, bool dim, double weight, Expr *keyqual,
-					   double rows, Cost startup, Cost total)
+					   List *keyfold, double rows, Cost startup, Cost total)
 {
 	CustomPath *cp = makeNode(CustomPath);
 	List	   *info;
 
-	Assert(dim ? (keyqual != NULL && iocols == NIL) : keyqual == NULL);
+	Assert(dim ? (keyqual != NULL && iocols == NIL && keyfold == NIL) :
+		   keyqual == NULL);
 	info = list_make3(list_make2_int(LO_SIDE_MAGIC,
 									 dim ? LO_SIDE_DIM : LO_SIDE_FACT),
 					  makeConst(FLOAT8OID, -1, InvalidOid, sizeof(float8),
 								Float8GetDatum(weight), false,
 								FLOAT8PASSBYVAL),
-					  keyqual);
+					  dim ? (Node *) keyqual : (Node *) keyfold);
 	cp->path.pathtype = T_CustomScan;
 	cp->path.parent = rel;
 	cp->path.pathtarget = rel->reltarget;
@@ -4972,6 +5094,8 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	ListCell   *lc;
 	int			side = 0;
 	double		sideweight = 0.0;
+	List	   *keyfold = NIL;
+	int			nkeyleaves = 0;
 
 	if (list_length(best_path->custom_private) == 4)
 	{
@@ -4997,7 +5121,19 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 			ordquals = list_make1(keyqual);
 			ordcols = list_make1_int(0);
 		}
-		else if (side != LO_SIDE_FACT)
+		else if (side == LO_SIDE_FACT)
+		{
+			keyfold = (List *) lthird(info);
+			if (keyfold != NIL &&
+				(!IsA(keyfold, List) || list_length(keyfold) != 3 ||
+				 !IsA(linitial(keyfold), OidList) ||
+				 list_length((List *) linitial(keyfold)) != 1 ||
+				 !IsA(lsecond(keyfold), IntList) ||
+				 list_length((List *) lsecond(keyfold)) != 1 ||
+				 !IsA(lthird(keyfold), List)))
+				elog(ERROR, "LionOrdered: malformed key sets of a join's fact");
+		}
+		else
 			elog(ERROR, "LionOrdered: unrecognized side %d of a join", side);
 	}
 
@@ -5155,6 +5291,41 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 		if (lossy)
 			flags |= LO_FLAG_LOSSY;
 	}
+
+	/*
+	 * A join's key sets folded into its fact's set (§47.6): a leaf each, on
+	 * the fact key's lion index, ANDed at the root before the lion access's
+	 * tree, so that a key set whose keys have no row empties the AND before
+	 * the rest is read.  Their quals are not the lion qual: the join tests the
+	 * key against its key sets itself, and an inexact set's recheck is the
+	 * lion access's.
+	 */
+	if (keyfold != NIL)
+	{
+		Oid			keyidx = linitial_oid((List *) linitial(keyfold));
+		int			keycol = linitial_int((List *) lsecond(keyfold));
+		List	   *kquals = (List *) lthird(keyfold);
+		List	   *ktree = NIL;
+		List	   *kleaves = NIL;
+		int			nchild;
+
+		nkeyleaves = list_length(kquals);
+		nchild = nkeyleaves + (tree != NIL ? 1 : 0);
+		if (nkeyleaves < 1)
+			elog(ERROR, "LionOrdered: a join's fact with no key set to fold");
+		if (nchild > 1)
+			ktree = list_make1(list_make2_int(LO_NODE_AND, nchild));
+		foreach(lc, kquals)
+		{
+			if (!IsA(lfirst(lc), ScalarArrayOpExpr))
+				elog(ERROR, "LionOrdered: malformed key set of a join's fact");
+			ktree = lappend(ktree, list_make3_int(LO_NODE_LEAF, 1, keycol));
+			kleaves = lappend_oid(kleaves, keyidx);
+		}
+		tree = list_concat(ktree, tree);
+		leaves = list_concat(kleaves, leaves);
+		lionquals = list_concat((List *) copyObject(kquals), lionquals);
+	}
 	residual = lo_residual(clauses, ordrinfos, lionrinfos, lionqual);
 
 	/*
@@ -5203,6 +5374,7 @@ lo_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	priv.flags = flags;
 	priv.nulls = nulls;
 	priv.walkattno = (AttrNumber) walkattno;
+	priv.nkeyleaves = nkeyleaves;
 	priv.ordcols = ordcols;
 	priv.tree = tree;
 	priv.leaves = leaves;
@@ -6868,6 +7040,7 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	st->probe = (priv.flags & LO_FLAG_PROBE) != 0;
 	st->side = (priv.flags & LO_FLAG_SIDE) != 0;
 	st->keyed = (priv.flags & LO_FLAG_KEYED) != 0;
+	st->nkeyleaves = priv.nkeyleaves;
 	st->vmbuffer = InvalidBuffer;
 	st->walknulls = priv.nulls;
 	st->walkattno = priv.walkattno;
@@ -6914,6 +7087,13 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		 (!st->side || !st->probe || st->indexonly ||
 		  list_length(priv.ordcols) != 1)))
 		elog(ERROR, "LionOrdered: malformed side of a join");
+
+	/* ... and its fact's key sets' leaves, of its tree (§47.6) */
+	if (st->nkeyleaves < 0 ||
+		(st->nkeyleaves > 0 &&
+		 (!st->side || st->keyed || tree == NIL ||
+		  st->nkeyleaves > list_length(leafoids))))
+		elog(ERROR, "LionOrdered: malformed key sets of a join's fact");
 
 	/*
 	 * What the node evaluates in place of the ordinary plan, initialised - and
@@ -7116,6 +7296,17 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 		ExecIndexBuildScanKeys(&node->ss.ps, leaf->index, leaf->quals, false,
 							   &leaf->keys, &leaf->nkeys,
 							   &leaf->rtkeys, &leaf->nrtkeys, NULL, NULL);
+
+		/*
+		 * A join's key set's leaf (§47.6): one equality to an array, NULL as
+		 * planned, which the join fills with the key set's keys.
+		 */
+		if (i < st->nkeyleaves &&
+			(leaf->nkeys != 1 || leaf->nrtkeys != 0 ||
+			 leaf->keys[0].sk_strategy != LION_STRAT_EQUAL ||
+			 (leaf->keys[0].sk_flags & (SK_SEARCHARRAY | SK_ISNULL)) !=
+			 (SK_SEARCHARRAY | SK_ISNULL)))
+			elog(ERROR, "LionOrdered: malformed key set of a join's fact");
 	}
 
 	/* which Params a rescan has to rebuild the set for */
@@ -7839,6 +8030,22 @@ lo_next(ScanState *ss)
 	st->ran = true;
 
 	/*
+	 * A join's fact whose key sets are folded into its set (§47.6) is walked
+	 * only once the join has handed it every key set's keys: a leaf still
+	 * NULL as planned would select nothing.
+	 */
+	if (st->nkeyleaves > 0 && st->set == NULL && !st->lazy)
+	{
+		int			i;
+
+		for (i = 0; i < st->nkeyleaves; i++)
+		{
+			if ((st->leaves[i].keys[0].sk_flags & SK_ISNULL) != 0)
+				elog(ERROR, "LionOrdered: a join's fact walked before its key sets were built");
+		}
+	}
+
+	/*
 	 * The set: lazily, evaluated only where the walk goes, when its keys
 	 * can be sought (§30.4, "The set, lazily"); built otherwise - by one
 	 * participant of a parallel walk for all of them, when the Gather has
@@ -8536,8 +8743,12 @@ lo_explain_lines(LionOrderedState *st, List *ancestors, ExplainState *es,
 											LO_EXPR_VALUEQUAL),
 					lo_label(prefix, "Filter per Value"), ancestors, es);
 
+	/*
+	 * A join's key sets' leaves (§47.6) are the join's to name, on its "Key
+	 * Set Index" line: its lion qual holds none of their quals.
+	 */
 	resetStringInfo(&buf);
-	for (i = 0; i < st->nleaves; i++)
+	for (i = st->nkeyleaves; i < st->nleaves; i++)
 	{
 		int			j;
 
@@ -8545,7 +8756,7 @@ lo_explain_lines(LionOrderedState *st, List *ancestors, ExplainState *es,
 		if (name == NULL)
 			name = "???";
 		/* each index once, in the order the tree first names it */
-		for (j = 0; j < i; j++)
+		for (j = st->nkeyleaves; j < i; j++)
 			if (st->leaves[j].indexoid == st->leaves[i].indexoid)
 				break;
 		if (j < i)
@@ -8747,6 +8958,46 @@ lion_ordered_probe_key(PlanState *ps, Datum key)
 	st->okeys[0].sk_argument = key;
 	st->okeys[0].sk_flags &= ~SK_ISNULL;
 	ExecReScan(ps);
+}
+
+/*
+ * Hand a join's fact (DESIGN.md §47.6) the keys of its key set `keyset`, an
+ * array of the key's type that the join has just built, for the leaf of its
+ * set the key set is folded into: the set is made again from them at the
+ * next row, its walk restarted.  array must stay valid until the next
+ * call for the key set, or the end of the scan: it is the scan key's
+ * argument, which a set made again, lazily or at once, reads.
+ *
+ * The join hands them in as it builds its key sets, at the start of a scan
+ * or of a rescan, before it asks the walk for a row: whatever this scan's
+ * walk met belongs to the set it is given up with, and goes with it.
+ */
+void
+lion_ordered_keyset_keys(PlanState *ps, int keyset, Datum array)
+{
+	LionOrderedState *st = (LionOrderedState *) ps;
+	ScanKey		sk;
+
+	if (!IsA(ps, CustomScanState) ||
+		((CustomScanState *) ps)->methods != &lo_exec_methods || !st->side ||
+		st->keyed || keyset < 0 || keyset >= st->nkeyleaves)
+		elog(ERROR, "LionOrdered: not a join's fact with key set %d", keyset);
+	sk = &st->leaves[keyset].keys[0];
+	sk->sk_argument = array;
+	sk->sk_flags &= ~SK_ISNULL;
+
+	/* the walk, and what it met of the old set, before the set */
+	lo_scan_reset(st);
+	if (BufferIsValid(st->vmbuffer))
+	{
+		ReleaseBuffer(st->vmbuffer);
+		st->vmbuffer = InvalidBuffer;
+	}
+	st->started = false;
+	st->done = false;
+	if (st->lazy)
+		lo_lazy_end(st);
+	st->set = NULL;
 }
 
 /* ---------------------------------------------------------------------
@@ -9233,7 +9484,7 @@ lion_ordered_probe_price(PlannerInfo *root, RelOptInfo *rel,
 		(void) lo_lion_qual(lion, &lionrinfos, &lossy);
 	(void) lo_cost(root, rel, ord, lion, lionrinfos, lionqual, NIL, 0.0,
 				   true, Max(loops, 1.0), 1.0, ord->path.param_info != NULL,
-				   NULL, &startup, &total, NULL, NULL);
+				   1.0, 0.0, NULL, &startup, &total, NULL, NULL);
 	*perprobe = Max(total - startup, 0.0);
 	*probe = ord;
 	return true;

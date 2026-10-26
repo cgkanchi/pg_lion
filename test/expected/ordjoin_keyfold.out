@@ -1,0 +1,417 @@
+-- A LionOrderedJoin's key sets folded into its fact's walk (DESIGN.md §47.6,
+-- "Folded into the walk").
+--
+-- A table that only filters the join's key - `f.fk IN (SELECT fk FROM ib
+-- WHERE prod = 7)` - is a key set: its keys are read into a hash set before
+-- the walk.  Where the fact's key has a lion index, its keys' rows there are
+-- ANDed into the walk's set, and an entry whose key the key set lacks is
+-- never fetched; without one, the walk fetches every member of its set to
+-- read its key, and the key set rejects it after the fetch, which the price
+-- charges at the pages of the fetches the LIMIT's share makes.  The fact's
+-- B-tree here orders by a rank and does not hold the key.  Each query is run
+-- through the node (lion's paths priced at a thousandth) and through core's
+-- plan with the node off, and the two answers compared row by row in order;
+-- every ORDER BY ends in a unique key.  What is chosen with nothing forced is
+-- printed as the node's name, or core's, without the plan.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET default_statistics_target = 1000;
+SET work_mem = '64MB';
+CREATE SCHEMA ojfold;
+SET search_path = ojfold, public;
+-- the dimension: three tiers (the split's column), ten regions
+CREATE TABLE co (
+	pk int PRIMARY KEY,
+	tier int NOT NULL,			-- lion: three values
+	region int NOT NULL,		-- lion: ten values
+	name text NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO co
+SELECT i, 1 + ((hashint8extended(i::bigint, 1) & 9223372036854775807) % 3)::int,
+	   ((hashint8extended(i::bigint, 2) & 9223372036854775807) % 10)::int,
+	   'c' || i
+  FROM generate_series(1, 20000) i;
+CREATE INDEX co_tier ON co USING lion (tier);
+CREATE INDEX co_region ON co USING lion (region);
+-- the fact: ten rows a key, every 97th key NULL; a B-tree by rank that does
+-- not hold the key
+CREATE TABLE cpc (
+	id int PRIMARY KEY,
+	fk int,
+	prod int NOT NULL,			-- lion: twenty values
+	rank int NOT NULL,
+	note text NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO cpc
+SELECT i, CASE WHEN i % 97 = 0 THEN NULL
+			   ELSE 1 + ((hashint8extended(i::bigint, 3) & 9223372036854775807) % 20000)::int END,
+	   ((hashint8extended(i::bigint, 4) & 9223372036854775807) % 20)::int,
+	   ((hashint8extended(i::bigint, 5) & 9223372036854775807) % 1000000)::int,
+	   md5(i::text)
+  FROM generate_series(1, 200000) i;
+CREATE INDEX cpc_rank ON cpc (rank DESC);
+CREATE INDEX cpc_prod ON cpc USING lion (prod);
+-- the key table: product 7 sixty keys, product 3 two thousand
+CREATE TABLE ib (fk int NOT NULL, prod int NOT NULL, PRIMARY KEY (fk, prod))
+	WITH (autovacuum_enabled = off);
+INSERT INTO ib SELECT 1 + (k * 331) % 20000, 7 FROM generate_series(1, 60) k;
+INSERT INTO ib SELECT 1 + (k * 7) % 20000, 3 FROM generate_series(1, 2000) k;
+-- ... and a table of keys with repeats and NULLs, for an IN
+CREATE TABLE ibdup (fk int) WITH (autovacuum_enabled = off);
+INSERT INTO ibdup SELECT 1 + (k % 40) * 331 FROM generate_series(1, 400) k;
+INSERT INTO ibdup SELECT NULL FROM generate_series(1, 5);
+VACUUM (FREEZE, ANALYZE) co;
+VACUUM (FREEZE, ANALYZE) cpc;
+VACUUM (FREEZE, ANALYZE) ib;
+VACUUM (FREEZE, ANALYZE) ibdup;
+/*
+ * okf_kind() says what the plan of q is: LionOrderedSplit, LionOrderedJoin
+ * or core's, its key sets, and the index they are folded into.  okf() runs q
+ * through the node - lion's paths priced at a thousandth - and through
+ * core's plan (the node off), compares the two answers in order, and says
+ * what the first plan was.  okf_run() runs q through the node under EXPLAIN
+ * ANALYZE and prints the lines asked for, their counters.
+ */
+CREATE FUNCTION okf_kind(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	split boolean := false;
+	keys text := '';
+	fold text := '';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Custom Scan \(LionOrderedSplit\)' THEN
+			split := true;
+		END IF;
+		IF ln ~ '^\s*Key Sets: ' THEN
+			keys := regexp_replace(ln, '^\s*Key Sets: ', '');
+		END IF;
+		IF ln ~ '^\s*Key Set Index: ' THEN
+			fold := regexp_replace(ln, '^\s*Key Set Index: ', ' in ');
+		END IF;
+	END LOOP;
+	RETURN CASE WHEN split THEN 'LionOrderedSplit'
+				WHEN used THEN 'LionOrderedJoin'
+				ELSE 'core''s plan' END ||
+		CASE WHEN keys <> '' THEN format(' (key sets: %s%s)', keys, fold)
+			 ELSE '' END;
+END $$;
+CREATE FUNCTION okf(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+	kind text;
+	a text[] := '{}';
+	b text[] := '{}';
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	kind := ojfold.okf_kind(q);
+	FOR r IN EXECUTE q LOOP
+		a := a || r::text;
+	END LOOP;
+
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	PERFORM set_config('pg_lion.enable_ordered_join', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		b := b || r::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_join', 'on', true);
+
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the node, %s ordinary; first %s / %s',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0),
+					  a[1], b[1]);
+	END IF;
+	RETURN format('%s, %s rows', kind, coalesce(array_length(a, 1), 0));
+END $$;
+CREATE FUNCTION okf_run(q text, pat text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF ln ~ pat THEN
+			RETURN NEXT regexp_replace(btrim(regexp_replace(ln, '\s*\(actual.*\)', '')),
+									   ', after \d+ keys probed \([^)]*\)', '');
+		END IF;
+	END LOOP;
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+END $$;
+-- 1. No lion index on the key.  The page: the tier leading the ORDER BY, the
+--    rank after it, product 7's sixty keys a key set - six hundred of the
+--    walk's two hundred thousand entries.  Forced, the split walks the first
+--    arm, every entry fetched to read its key and rejected after the fetch.
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                   okf                    
+------------------------------------------
+ LionOrderedSplit (key sets: ib), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
+             okf_run              
+----------------------------------
+ Arms Run: 1
+ Key Sets: ib
+ Index Entries Walked: 18275
+ Heap Fetches: 18275
+ Key Set Keys: 60
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 18043
+(7 rows)
+
+-- ... and with nothing forced, core's plan: the key table first.  The walk is
+--     priced at the pages of the fetches the LIMIT's share of it makes, which
+--     the key set rejects all but one in three hundred of.
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+  okf_kind   
+-------------
+ core's plan
+(1 row)
+
+-- ... a key set of a tenth of the keys, which the walk meets the page in a
+--     few hundred entries of: the split, with nothing forced.
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+            okf_kind             
+---------------------------------
+ LionOrderedSplit (key sets: ib)
+(1 row)
+
+-- 2. The key's lion index: the key set folded into the walk's set.  The split
+--    and the join, forced; the walk's set the rows of the key set's keys, its
+--    entries fetched only for them, no key rejected.
+CREATE INDEX cpc_fk ON cpc USING lion (fk);
+ANALYZE cpc;
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                        okf                         
+----------------------------------------------------
+ LionOrderedSplit (key sets: ib in cpc_fk), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
+                            okf_run                            
+---------------------------------------------------------------
+ Arms Run: 1
+ Key Sets: ib
+ Key Set Index: cpc_fk
+ Index Entries Walked: 17792
+ Lion Set Hits: 54
+ Heap Fetches: 610
+ Lion Set: 33 containers, exact
+ Switched to Fetch and Sort: 1 of 1 scans, 556 members fetched
+ Key Set Keys: 60
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 0
+(11 rows)
+
+SELECT okf($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 10 AND d.region < 5
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                        okf                        
+---------------------------------------------------
+ LionOrderedJoin (key sets: ib in cpc_fk), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 10 AND d.region < 5
+	ORDER BY f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Key Set|Keys Rejected|Lion Indexes|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
+                            okf_run                            
+---------------------------------------------------------------
+ Lion Indexes: cpc_prod
+ Key Sets: ib
+ Key Set Index: cpc_fk
+ Index Entries Walked: 10000
+ Lion Set Hits: 13
+ Heap Fetches: 296
+ Lion Set: 33 containers, exact
+ Switched to Fetch and Sort: 1 of 1 scans, 283 members fetched
+ Key Set Keys: 60
+ Key Set Builds: 1
+ Keys Rejected by Key Sets: 0
+(11 rows)
+
+-- ... and with nothing forced
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+  okf_kind   
+-------------
+ core's plan
+(1 row)
+
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                 okf_kind                  
+-------------------------------------------
+ LionOrderedSplit (key sets: ib in cpc_fk)
+(1 row)
+
+-- 3. What a folded key set keeps: a key set of repeated keys and NULLs; two
+--    key sets, an IN on the fact's key and an EXISTS on the dimension's, each
+--    a leaf of the set; an empty one, which ends the scan before the walk;
+--    the whole join without a LIMIT; a key set rebuilt for each row of a
+--    LATERAL rescan, its keys handed to the walk again (Key Set Builds: 3).
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ibdup)
+	ORDER BY f.rank DESC, f.id LIMIT 30$$);
+                         okf                          
+------------------------------------------------------
+ LionOrderedJoin (key sets: ibdup in cpc_fk), 30 rows
+(1 row)
+
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
+                             okf                             
+-------------------------------------------------------------
+ LionOrderedSplit (key sets: ibdup x, ib in cpc_fk), 20 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
+	'^\s*(Key Set|Keys Rejected|Lion Set)');
+            okf_run             
+--------------------------------
+ Key Sets: ibdup x, ib
+ Key Set Index: cpc_fk
+ Lion Set Hits: 12
+ Lion Set: 26 containers, exact
+ Key Set Keys: 2040
+ Key Set Builds: 2
+ Keys Rejected by Key Sets: 0
+(7 rows)
+
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 99)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                       okf                        
+--------------------------------------------------
+ LionOrderedJoin (key sets: ib in cpc_fk), 0 rows
+(1 row)
+
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY d.tier, f.rank DESC, f.id$$);
+                         okf                         
+-----------------------------------------------------
+ LionOrderedSplit (key sets: ib in cpc_fk), 610 rows
+(1 row)
+
+SELECT okf($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
+	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+			  ORDER BY f.rank DESC LIMIT 100) s
+	ORDER BY v.p, s.rank DESC, s.id$$);
+                        okf                         
+----------------------------------------------------
+ LionOrderedJoin (key sets: ib in cpc_fk), 200 rows
+(1 row)
+
+SELECT * FROM okf_run($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
+	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+			  ORDER BY f.rank DESC LIMIT 100) s
+	ORDER BY v.p, s.rank DESC, s.id$$,
+	'^\s*(Key Set|Keys Rejected)');
+           okf_run            
+------------------------------
+ Key Sets: ib
+ Key Set Index: cpc_fk
+ Key Set Keys: 0
+ Key Set Builds: 3
+ Keys Rejected by Key Sets: 0
+(5 rows)
+
+-- 4. MVCC: a fact row's key changed in the transaction, before the query - an
+--    update of an indexed column, a new version under the new key - and a row
+--    inserted with a key of the set: both found, as core's plan finds them.
+BEGIN;
+UPDATE cpc SET fk = 1 + 331 WHERE id = 5;
+INSERT INTO cpc VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                        okf                        
+---------------------------------------------------
+ LionOrderedJoin (key sets: ib in cpc_fk), 20 rows
+(1 row)
+
+ROLLBACK;
+-- 5. A partial lion index of the key: not folded into where the query does
+--    not imply its predicate - it lacks rows the walk may meet - and folded
+--    into where it does.  A key table of another type than the key's is no
+--    key set at all (§47.7), folded or not: the plan is core's, its keys
+--    looked up in the key's lion index.  And the setting off.
+DROP INDEX cpc_fk;
+CREATE INDEX cpc_fk_part ON cpc USING lion (fk) WHERE prod < 10;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                   okf                   
+-----------------------------------------
+ LionOrderedJoin (key sets: ib), 20 rows
+(1 row)
+
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 5
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                          okf                           
+--------------------------------------------------------
+ LionOrderedJoin (key sets: ib in cpc_fk_part), 20 rows
+(1 row)
+
+DROP INDEX cpc_fk_part;
+CREATE INDEX cpc_fk ON cpc USING lion (fk);
+CREATE TABLE ib8 AS SELECT fk::bigint AS fk FROM ib WHERE prod = 7;
+ANALYZE ib8;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib8) AND d.region < 5
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+         okf          
+----------------------
+ core's plan, 20 rows
+(1 row)
+
+SET pg_lion.enable_key_set_fold = off;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+	ORDER BY f.rank DESC, f.id LIMIT 20$$);
+                   okf                   
+-----------------------------------------
+ LionOrderedJoin (key sets: ib), 20 rows
+(1 row)
+
+RESET pg_lion.enable_key_set_fold;
+SET client_min_messages = warning;
+DROP SCHEMA ojfold CASCADE;
+RESET client_min_messages;
+RESET search_path;
