@@ -1123,6 +1123,40 @@ extern void lion_count_groups_decode(Relation heap, Snapshot snapshot,
 									 LionVisCache *cache, bool rel_read_only);
 
 /*
+ * A SLICED COLUMN'S AGGREGATES FOR A BATCH OF GROUPS, DECODED KEY BY KEY
+ * (DESIGN.md §52, "The decode route", lion_slice_decode.c): for each of
+ * ngroups located sets of one grouping column, the visible rows of the group
+ * with a value that `where` - the collected WHERE, or NULL for none - holds,
+ * and their values' encodings summed, least and greatest, read off the
+ * column's slices (located, pinless): slices[i] for bit i < nbits, not found
+ * for a bit no row has, and slices[nbits] its existence slice.  The groups
+ * carry the §9 interlock: located with their pins.  The arrays are the
+ * caller's, ngroups each; sumenc, minenc and maxenc may be NULL where not
+ * wanted.
+ */
+typedef struct LionSliceGroupsOut
+{
+	int64	   *allcount;		/* the group's rows `where` holds, a value or
+								 * not: its count(*); NULL where not wanted */
+	int64	   *count;
+#ifdef HAVE_INT128
+	int128	   *sumenc;
+#endif
+	uint64	   *minenc;
+	uint64	   *maxenc;
+} LionSliceGroupsOut;
+
+extern void lion_count_groups_slices(Relation heap, Snapshot snapshot,
+									 int ngroups, LionPostingSet *groups,
+									 PGAlignedBlock *images,
+									 const LionPostingSet *where, int nbits,
+									 LionPostingSet *slices,
+									 LionSliceGroupsOut *out,
+									 LionCountStats *stats,
+									 LionDecodeStats *dstats,
+									 LionVisCache *cache, bool rel_read_only);
+
+/*
  * COUNTS BY CELLS (DESIGN.md §10, "Counts by cells", lion_count_decode.c):
  * the decoded walk of one column - the DRIVER, whose located sets in
  * `driver` carry the §9 interlock as column 0's of a decoded pass do - with
@@ -1920,6 +1954,7 @@ extern PGDLLIMPORT bool lion_enable_topk;
  * bit-sliced column from its slices (DESIGN.md §52).  A planner switch.
  */
 extern PGDLLIMPORT bool lion_enable_count_slices;
+extern PGDLLIMPORT bool lion_enable_slice_decode;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);

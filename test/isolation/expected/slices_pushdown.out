@@ -5,6 +5,10 @@ step s1_explain: EXPLAIN (COSTS OFF)
 				  SELECT count(a), sum(a), min(a), max(a) FROM spd WHERE grp = 1;
 				  EXPLAIN (COSTS OFF)
 				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp;
+				  SET pg_lion.enable_slice_decode = off;
+				  EXPLAIN (COSTS OFF)
+				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp;
+				  RESET pg_lion.enable_slice_decode;
 QUERY PLAN                                                                      
 --------------------------------------------------------------------------------
 Custom Scan (LionCount)                                                         
@@ -18,7 +22,17 @@ Custom Scan (LionCount)
   Lion Indexes: spd_grp (grp)                                                                                                                
   Group Key: grp                                                                                                                             
   Aggregates From Slices: spd_v (a: every bit counted), spd_v (b: existence counted, min descent), spd_v (ts: existence counted, max descent)
-(4 rows)
+  Slice Groups: decoded by batch                                                                                                             
+(5 rows)
+
+QUERY PLAN                                                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------
+Custom Scan (LionCount)                                                                                                                      
+  Lion Indexes: spd_grp (grp)                                                                                                                
+  Group Key: grp                                                                                                                             
+  Aggregates From Slices: spd_v (a: every bit counted), spd_v (b: existence counted, min descent), spd_v (ts: existence counted, max descent)
+  Slice Groups: one at a time                                                                                                                
+(5 rows)
 
 step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
 step s1_slices: SELECT * FROM spd_both();

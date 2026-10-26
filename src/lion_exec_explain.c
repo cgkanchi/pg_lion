@@ -1152,6 +1152,12 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 		}
 		ExplainPropertyText("Aggregates From Slices", buf.data, es);
 		pfree(buf.data);
+
+		/* a GROUP BY's: a group at a time, or decoded a batch at a time */
+		if (st->plan.groupattno != 0)
+			ExplainPropertyText("Slice Groups",
+								st->slice->decode ? "decoded by batch" :
+								"one at a time", es);
 	}
 
 	/*
@@ -1517,9 +1523,12 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Slices Located", NULL, ss->located, es);
 		if (ss->absent > 0)
 			ExplainPropertyInteger("Slices Absent", NULL, ss->absent, es);
-		ExplainPropertyInteger("Slice Counts", NULL, ss->counts, es);
-		ExplainPropertyInteger("Slice Containers Counted", NULL,
-							   ss->containers, es);
+		if (ss->counts > 0 || ss->batches == 0)
+		{
+			ExplainPropertyInteger("Slice Counts", NULL, ss->counts, es);
+			ExplainPropertyInteger("Slice Containers Counted", NULL,
+								   ss->containers, es);
+		}
 		if (ss->kernelplanes > 0)
 		{
 			ExplainPropertyInteger("Slice Containers by Kernel", NULL,
@@ -1536,6 +1545,18 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 			ExplainPropertyInteger("Slice Candidate Sets", NULL,
 								   ss->collects, es);
 		ExplainPropertyInteger("Slice WHERE Copies", NULL, ss->copies, es);
+		if (ss->batches > 0)
+		{
+			ExplainPropertyInteger("Slice Batches Decoded", NULL, ss->batches,
+								   es);
+			ExplainPropertyInteger("Slice Keys Decoded", NULL, ss->decodekeys,
+								   es);
+			ExplainPropertyInteger("Slice Rows Decoded", NULL, ss->decoderows,
+								   es);
+			if (ss->decoderechecked > 0)
+				ExplainPropertyInteger("Slice Rows Rechecked", NULL,
+									   ss->decoderechecked, es);
+		}
 		if (ss->tidsrechecked > 0)
 		{
 			ExplainPropertyInteger("Slice Heap TIDs Rechecked", NULL,

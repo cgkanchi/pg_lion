@@ -68,6 +68,9 @@ extern PGDLLIMPORT double lion_slice_step_cost;
 extern PGDLLIMPORT double lion_slice_step_key_cost;
 extern PGDLLIMPORT double lion_slice_step_row_cost;
 extern PGDLLIMPORT double lion_slice_page_cost;
+extern PGDLLIMPORT double lion_slice_gather_cost;
+extern PGDLLIMPORT double lion_slice_decode_bit_cost;
+extern PGDLLIMPORT double lion_slice_decode_row_cost;
 
 /* The FK-side join (§27) */
 extern PGDLLIMPORT double lion_fkjoin_count_cost;

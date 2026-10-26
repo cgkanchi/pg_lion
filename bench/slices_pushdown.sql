@@ -65,8 +65,9 @@ VACUUM (FREEZE, ANALYZE) slp;
 DROP TABLE IF EXISTS slp_bench;
 CREATE TABLE slp_bench (shape text, query text, plan text, ms numeric,
 						lion_plan text, lion_ms numeric, nokernel_ms numeric,
-						lion_cost numeric, ordinary_plan text,
-						ordinary_ms numeric, ordinary_cost numeric);
+						lion_cost numeric, pairs_ms numeric, pairs_cost numeric,
+						ordinary_plan text, ordinary_ms numeric,
+						ordinary_cost numeric);
 
 -- The plan's top node and the node below an Aggregate, marked with what the
 -- LionCount node answers the aggregates by, and its total cost.
@@ -91,6 +92,8 @@ BEGIN
 			plan := plan || ' (slices)';
 		ELSIF ln ~ 'Aggregates Over Keys' THEN
 			plan := plan || ' (keys)';
+		ELSIF ln ~ 'Slice Groups: decoded' THEN
+			plan := plan || ' decoded';
 		END IF;
 	END LOOP;
 END $$;
@@ -113,8 +116,9 @@ BEGIN
 END $$;
 
 -- One shape: the plan the planner picks; the LionCount node, preferred over
--- every other scan, with the plane kernel and without; the ordinary plan
--- (the pushdown off) - timed, their answers compared.
+-- every other scan, with the plane kernel and without, and - for a GROUP BY -
+-- with the groups counted one at a time (the decode route off); the ordinary
+-- plan (the pushdown off) - timed, their answers compared.
 CREATE OR REPLACE PROCEDURE slp_run(shape text, q text, reps int)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -123,6 +127,10 @@ DECLARE
 	lp record;
 	l record;
 	c record;
+	pp record;
+	pt record;
+	pms numeric;
+	pcost numeric;
 	o record;
 	b record;
 BEGIN
@@ -136,6 +144,17 @@ BEGIN
 	SET LOCAL pg_lion.enable_slice_kernel = off;
 	SELECT * INTO c FROM slp_time(q, reps);
 	RESET pg_lion.enable_slice_kernel;
+	IF q ~ 'GROUP BY' THEN
+		SET LOCAL pg_lion.enable_slice_decode = off;
+		SELECT * INTO pp FROM slp_plan(q);
+		SELECT * INTO pt FROM slp_time(q, reps);
+		RESET pg_lion.enable_slice_decode;
+		IF pt.answer IS DISTINCT FROM l.answer THEN
+			RAISE EXCEPTION 'different answers one group at a time for %', q;
+		END IF;
+		pms := pt.ms;
+		pcost := round(pp.cost);
+	END IF;
 	RESET enable_seqscan;
 	RESET enable_bitmapscan;
 	RESET pg_lion.enable_plain_scan;
@@ -149,7 +168,8 @@ BEGIN
 			l.answer, c.answer, b.answer;
 	END IF;
 	INSERT INTO slp_bench VALUES (shape, q, p.plan, a.ms, lp.plan, l.ms, c.ms,
-								  round(lp.cost), o.plan, b.ms, round(o.cost));
+								  round(lp.cost), pms, pcost,
+								  o.plan, b.ms, round(o.cost));
 END $$;
 
 \if :{?only}
@@ -198,5 +218,5 @@ CALL slp_run('2 u4 sum 50% pairs 10x20', 'SELECT g10, h20, sum(u4) FROM slp WHER
 \endif
 
 SELECT shape, plan, ms, lion_plan, lion_ms, nokernel_ms, lion_cost,
-	   ordinary_plan, ordinary_ms, ordinary_cost
+	   pairs_ms, pairs_cost, ordinary_plan, ordinary_ms, ordinary_cost
   FROM slp_bench ORDER BY shape;

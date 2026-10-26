@@ -5678,7 +5678,7 @@ lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx, double keys,
 void
 lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 					 List *idxs, List *cols, List *wants, double whererows,
-					 bool haswhere, bool counts, double ngroups)
+					 bool haswhere, bool counts, double ngroups, int batch)
 {
 	Cost		where = cpath->path.total_cost;
 	Cost		run = counts ? where : 0.0;
@@ -5741,6 +5741,41 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 			run += Min(shape.items[nbits], nkeys) * LION_CONTAINER_COST;
 		run += ckeys * LION_FKJOIN_COPY_CONTAINER_COST;
 		collected = true;
+
+		/*
+		 * The decode route (DESIGN.md §52): a walk of C0's keys a batch of
+		 * groups, each bit slice read at those keys and made a plane of each
+		 * key's positions, the batch's groups' containers read there, and
+		 * every row of C0 in a group given its value once.
+		 */
+		if (ngroups > 0.0 && batch > 0)
+		{
+			double		nbatch = ceil(units / (double) batch);
+			double		grows = Max(tuples / units, 1.0);
+			double		gkeys = Max(nkeys * (1.0 - exp(-grows / nkeys)), 1.0);
+			double		words = ckeys * LION_BITSET_WORDS;
+			double		perword = crows / words;
+			double		wordsused = words * (1.0 - exp(-perword));
+
+			for (s = 0; s <= nbits; s++)
+				unit += lion_slice_read_cost(root, idx, ckeys, nkeys,
+											 shape.items[s], shape.rows[s],
+											 width);
+			unit += ckeys * LION_SLICE_KEY_COST;
+
+			/*
+			 * Each word of rows: its rows' values gathered by a transpose,
+			 * or read a bit at a time where they are fewer than
+			 * LION_SLICE_GATHER_MIN; each row added to its group's answers.
+			 */
+			run += nbatch * unit +
+				units * Min(gkeys, ckeys) * LION_SLICE_CONTAINER_COST +
+				wordsused * Min(Max(perword, 1.0) * nbits *
+								LION_SLICE_DECODE_BIT_COST,
+								LION_SLICE_GATHER_COST * nbits / 32.0) +
+				crows * LION_SLICE_DECODE_ROW_COST;
+			continue;
+		}
 
 		/*
 		 * A GROUP BY's group - its share of C0's rows - is its own copy of

@@ -24,6 +24,14 @@ setup
 	  FROM generate_series(1, 6000) i;
 	CREATE INDEX spd_grp ON spd USING lion (grp);
 	CREATE INDEX spd_v ON spd USING lion (a, b, ts) WITH (slices = on);
+	-- the GROUP BY's groups one at a time, as the decode route is the
+	-- cheaper here; STABLE, so that it reads its caller's snapshot
+	CREATE FUNCTION spd_pairs() RETURNS text
+	LANGUAGE sql STABLE SET pg_lion.enable_slice_decode = off AS $f$
+	SELECT string_agg(format('%s: %s %s %s', grp, s, mn, mx), ', ' ORDER BY grp)
+	  FROM (SELECT grp, sum(a) AS s, min(b) AS mn, max(ts) AS mx
+			  FROM spd GROUP BY grp) g
+	$f$;
 	CREATE FUNCTION spd_both(OUT same bool, OUT lion text)
 	LANGUAGE sql AS $f$
 	WITH l AS (
@@ -36,7 +44,8 @@ setup
 			   (SELECT string_agg(format('%s: %s %s %s', grp, s, mn, mx), ', '
 								  ORDER BY grp)
 				  FROM (SELECT grp, sum(a) AS s, min(b) AS mn, max(ts) AS mx
-						  FROM spd GROUP BY grp) g) AS g),
+						  FROM spd GROUP BY grp) g) AS g,
+			   spd_pairs() AS gp),
 	q AS (
 		SELECT (SELECT format('%s %s %s %s', count(a + 0), sum(a + 0),
 							  min(a + 0), max(a + 0))
@@ -52,7 +61,8 @@ setup
 				  FROM (SELECT grp, sum(a + 0) AS s, min(b + 0) AS mn,
 							   max(ts + interval '0 s') AS mx
 						  FROM spd GROUP BY grp) g) AS g)
-	SELECT (l.a, l.b, l.ts, l.g) = (q.a, q.b, q.ts, q.g), l.a || ' | ' || l.b
+	SELECT (l.a, l.b, l.ts, l.g, l.gp) = (q.a, q.b, q.ts, q.g, q.g),
+		   l.a || ' | ' || l.b
 	  FROM l, q
 	$f$;
 }
@@ -61,6 +71,7 @@ setup { VACUUM (FREEZE, ANALYZE) spd; }
 teardown
 {
 	DROP FUNCTION spd_both();
+	DROP FUNCTION spd_pairs();
 	DROP TABLE spd;
 }
 
@@ -72,7 +83,11 @@ setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
 step s1_explain	{ EXPLAIN (COSTS OFF)
 				  SELECT count(a), sum(a), min(a), max(a) FROM spd WHERE grp = 1;
 				  EXPLAIN (COSTS OFF)
-				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp; }
+				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp;
+				  SET pg_lion.enable_slice_decode = off;
+				  EXPLAIN (COSTS OFF)
+				  SELECT grp, sum(a), min(b), max(ts) FROM spd GROUP BY grp;
+				  RESET pg_lion.enable_slice_decode; }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_slices	{ SELECT * FROM spd_both(); }
 step s1_commit	{ COMMIT; }

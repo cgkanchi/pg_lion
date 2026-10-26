@@ -18,7 +18,7 @@
 #define LION_FLAG_ALL \
 	(LION_FLAG_SINGLEGROUP | LION_FLAG_SUMALL | LION_FLAG_GROUPIDX | \
 	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID | \
-	 LION_FLAG_RANGEWALK)
+	 LION_FLAG_RANGEWALK | LION_FLAG_SLICEDECODE)
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
@@ -1826,11 +1826,20 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 			(p->flags & LION_FLAG_RANGEWALK) != 0 || decode ||
 			(p->groupattno != 0 && (!hasgroupidx || p->nfilter > 0)))
 			elog(ERROR, "LionCount: malformed slice aggregates");
+		/* decoded a batch at a time: the groups of one column's walk */
+		if ((p->flags & LION_FLAG_SLICEDECODE) != 0 &&
+			(p->groupattno == 0 || p->groupattno2 != 0))
+			elog(ERROR, "LionCount: malformed slice aggregates");
 		for (i = 0; i < p->nscol; i++)
 		{
 			if (LION_ATTNO_IS_VCOL(p->scol[i].attno))
 				elog(ERROR, "LionCount: malformed slice aggregates");
 		}
+	}
+	else if ((p->flags & LION_FLAG_SLICEDECODE) != 0)
+		elog(ERROR, "LionCount: malformed slice aggregates");
+	if (p->nscol > 0)
+	{
 #ifndef HAVE_INT128
 		for (i = 0; i < p->nsagg; i++)
 		{
