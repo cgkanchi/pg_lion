@@ -674,8 +674,9 @@ working around a bad choice:
   the columns the query needs (DESIGN.md §49, "The probe's projection"). Below a `Gather` - the
   outer side a parallel scan, each process running the loop for its own outer rows - it is
   `Parallel Custom Scan (LionBtreeScan)`: parallel-aware for its set alone, which the processes
-  build together and read from shared memory, as a parallel walk's (below), and `EXPLAIN ANALYZE`
-  sums the processes' counters.
+  build together and read from shared memory, as a parallel walk's (below) - a lazy set
+  (`pg_lion.enable_lazy_set`, where the process meets few outer rows) stays each process's own -
+  and `EXPLAIN ANALYZE` sums the processes' counters.
   `pg_lion.enable_btree_scan` turns it off with the other walks.
 - `pg_lion.enable_heap_probe` (off): also offer that probe where the B-tree does not cover what
   the query reads of the relation - a primary key under a Lion filter, the query reading other
