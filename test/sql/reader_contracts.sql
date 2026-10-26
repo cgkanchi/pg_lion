@@ -22,7 +22,7 @@ INSERT INTO rcon SELECT g, g % 10, g % 7,
 	to_tsvector('simple', 'w' || (g % 10) || CASE WHEN g % 3 = 0 THEN ' secret' ELSE '' END)
   FROM generate_series(1, 3000) g;
 CREATE INDEX rcon_k ON rcon USING lion (k);
-CREATE INDEX rcon_j ON rcon USING lion (j);
+CREATE INDEX rcon_j ON rcon USING lion (j) WITH (slices = on);
 CREATE INDEX rcon_d ON rcon USING lion (d) WITH (store_positions = true);
 VACUUM ANALYZE rcon;
 
@@ -39,7 +39,8 @@ INSERT INTO rcon_readers VALUES
 	('lion_bm25_score',              $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d') > 0$$),
 	('lion_bm25_score, a named column', $$SELECT lion_bm25_score('secret'::tsvector, 'secret', '%1$s_d', col => 'd') > 0$$),
 	('lion_index_facets',            $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_d', 3)$$),
-	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$);
+	('lion_index_facets, filtered',  $$SELECT string_agg(key || ':' || count, ' ') FROM lion_index_facets('%1$s_j', 3, 'k = 3 AND d @@ $q$secret$q$')$$),
+	('lion_index_slice_agg',         $$SELECT count || ' ' || sum || ' ' || min || ' ' || max FROM lion_index_slice_agg('%1$s_j', 'k = 3')$$);
 
 -- what each reader says for the relation rel: its answer, or its error
 CREATE FUNCTION rcon_try(stmt text, rel text) RETURNS text LANGUAGE plpgsql AS $$
@@ -94,6 +95,14 @@ SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
 RESET ROLE;
 GRANT EXECUTE ON FUNCTION int4eq(int4, int4), texteq(text, text) TO PUBLIC;
 
+-- ... and on an aggregate the query a reader stands for calls: refused by it
+-- (lion_index_slice_agg() stands for count, sum, min and max of the column)
+REVOKE EXECUTE ON FUNCTION sum(int4) FROM PUBLIC;
+SET ROLE rcon_reader;
+SELECT name, rcon_try(stmt, 'rcon') FROM rcon_readers ORDER BY name;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION sum(int4) TO PUBLIC;
+
 -- an index that is not valid, as a failed CREATE INDEX CONCURRENTLY leaves
 -- one: refused
 UPDATE pg_index SET indisvalid = false
@@ -105,7 +114,7 @@ UPDATE pg_index SET indisvalid = true
 -- an unpopulated materialized view: refused, as querying it is
 CREATE MATERIALIZED VIEW rcon_mv AS SELECT * FROM rcon WITH NO DATA;
 CREATE INDEX rcon_mv_k ON rcon_mv USING lion (k);
-CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j);
+CREATE INDEX rcon_mv_j ON rcon_mv USING lion (j) WITH (slices = on);
 CREATE INDEX rcon_mv_d ON rcon_mv USING lion (d) WITH (store_positions = true);
 SELECT name, rcon_try(stmt, 'rcon_mv') FROM rcon_readers ORDER BY name;
 
