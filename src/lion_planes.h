@@ -217,4 +217,40 @@ extern void lion_planes_gather_interleaved(const uint64 *planes, uint32 n,
 extern void lion_planes_gather_strided(const uint64 *const *planes, uint32 n,
 									   uint32 nbits, uint64 *values);
 
+/* ----------------------------------------------------------------
+ *			comparisons of a bit-sliced column with a constant
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * O'Neil and Quass's range algorithm over bit slices (1997, "Improved query
+ * performance with variant indexes"; DESIGN.md §53), one bit at a time from
+ * the top.  For a constant c and the rows of a set E, eq starts as E and acc
+ * empty, and a step for each bit i of the encoding, from the highest down,
+ * with the slice S_i of the rows whose bit i is set, keeps
+ *
+ *	eq	the rows of E whose bits above and at i are c's,
+ *	acc	LT: the rows of E already known below c - for c's bit 1, the rows
+ *			of eq without bit i, before eq loses them;
+ *		GT: the rows of E already known above c - for c's bit 0, the rows
+ *			of eq with bit i;
+ *		EQ: not kept (acc may be NULL).
+ *
+ * so that after the last bit acc is the rows below (LT) or above (GT) c and
+ * eq the rows equal to it.  A step is one or two word operations a word.
+ * slice NULL is a slice of no row (a bit no value has).  Returns whether eq
+ * holds a row afterwards: once it holds none, no later step can change acc,
+ * and the caller may stop.  eq, acc and slice are nwords words each, and the
+ * caller's to lay out as it likes, the same for all three.
+ */
+typedef enum LionBsiOp
+{
+	LION_BSI_LT,
+	LION_BSI_GT,
+	LION_BSI_EQ
+} LionBsiOp;
+
+extern bool lion_planes_bsi_step(LionBsiOp op, bool cbit, const uint64 *slice,
+								 uint64 *eq, uint64 *acc, uint32 nwords);
+
 #endif							/* LION_PLANES_H */

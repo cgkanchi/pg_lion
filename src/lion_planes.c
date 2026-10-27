@@ -1207,3 +1207,96 @@ lion_planes_gather_strided(const uint64 *const *planes, uint32 n, uint32 nbits,
 		planes_store_values(m, values, n, w);
 	}
 }
+
+/* ----------------------------------------------------------------
+ *			comparisons of a bit-sliced column with a constant
+ * ----------------------------------------------------------------
+ */
+
+/*
+ * One step of O'Neil and Quass's comparison (lion_planes.h).  Plain word
+ * loops, which the compiler vectorizes at -O2 whatever the target: a step is
+ * one AND and at most one AND-NOT and one OR a word, bound by the memory the
+ * words are read from rather than by the operations, which no kernel of the
+ * implementations above would make fewer.
+ */
+bool
+lion_planes_bsi_step(LionBsiOp op, bool cbit, const uint64 *slice,
+					 uint64 *eq, uint64 *acc, uint32 nwords)
+{
+	uint64		any = 0;
+	uint32		w;
+
+	if (slice == NULL)
+	{
+		/* a slice of no row: no row of eq has the bit */
+		if (!cbit)
+		{
+			for (w = 0; w < nwords; w++)
+				any |= eq[w];
+			return any != 0;
+		}
+		if (op == LION_BSI_LT)
+		{
+			/* c's bit is 1 and no row's is: every row of eq is below c */
+			for (w = 0; w < nwords; w++)
+				acc[w] |= eq[w];
+		}
+		memset(eq, 0, sizeof(uint64) * nwords);
+		return false;
+	}
+
+	if (cbit)
+	{
+		if (op == LION_BSI_LT)
+		{
+			for (w = 0; w < nwords; w++)
+			{
+				uint64		e = eq[w];
+				uint64		s = slice[w];
+
+				acc[w] |= e & ~s;
+				e &= s;
+				eq[w] = e;
+				any |= e;
+			}
+		}
+		else
+		{
+			for (w = 0; w < nwords; w++)
+			{
+				uint64		e = eq[w] & slice[w];
+
+				eq[w] = e;
+				any |= e;
+			}
+		}
+	}
+	else
+	{
+		if (op == LION_BSI_GT)
+		{
+			for (w = 0; w < nwords; w++)
+			{
+				uint64		e = eq[w];
+				uint64		s = slice[w];
+
+				acc[w] |= e & s;
+				e &= ~s;
+				eq[w] = e;
+				any |= e;
+			}
+		}
+		else
+		{
+			for (w = 0; w < nwords; w++)
+			{
+				uint64		e = eq[w] & ~slice[w];
+
+				eq[w] = e;
+				any |= e;
+			}
+		}
+	}
+	return any != 0;
+}
