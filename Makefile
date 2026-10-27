@@ -8,7 +8,7 @@ PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o 
 # The count engine: its interface is src/lion_count.h, and its files share the
 # private header src/lion_count_int.h.
 COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
-       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_count_shared.o \
+       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_slice_decode.o src/lion_count_shared.o \
        src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o src/lion_facets.o src/lion_slice.o
 # The LionCount custom scan: its planner half (lion_plan_*) and its executor
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
@@ -19,7 +19,7 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_plan_private.o src/lion_plan_partial.o src/lion_plan_nonempty.o \
        src/lion_plan_cells.o src/lion_plan_anti.o src/lion_ordjoin.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
-       src/lion_exec_cells.o \
+       src/lion_exec_cells.o src/lion_exec_slice.o \
        src/lion_exec_fkjoin.o src/lion_exec_anti.o src/lion_exec_run.o src/lion_exec_explain.o \
        src/lion_probejoin.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which

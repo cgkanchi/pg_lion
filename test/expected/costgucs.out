@@ -69,12 +69,21 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.recheck_group_tid_cost        | 6       | 6        | user    | real
  pg_lion.recheck_tid_cost              | 1.5     | 1.5      | user    | real
  pg_lion.resident_page_cost            | 120     | 120      | user    | real
+ pg_lion.slice_container_cost          | 15      | 15       | user    | real
+ pg_lion.slice_decode_bit_cost         | 0.3     | 0.3      | user    | real
+ pg_lion.slice_decode_row_cost         | 1       | 1        | user    | real
+ pg_lion.slice_gather_cost             | 12      | 12       | user    | real
+ pg_lion.slice_key_cost                | 120     | 120      | user    | real
+ pg_lion.slice_page_cost               | 200     | 200      | user    | real
+ pg_lion.slice_step_cost               | 1000    | 1000     | user    | real
+ pg_lion.slice_step_key_cost           | 50      | 50       | user    | real
+ pg_lion.slice_step_row_cost           | 0.9     | 0.9      | user    | real
  pg_lion.spill_read_cost               | 27      | 27       | user    | real
  pg_lion.union_key_cost                | 30      | 30       | user    | real
  pg_lion.union_member_cost             | 0.25    | 0.25     | user    | real
  pg_lion.union_set_cost                | 100     | 100      | user    | real
  pg_lion.walk_pass_cost                | 5       | 5        | user    | real
-(47 rows)
+(56 rows)
 
 -- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
@@ -86,7 +95,7 @@ SELECT count(*) AS settings,
  WHERE name LIKE 'pg_lion.%\_cost';
  settings | from_zero | unbounded | custom_group | unit_named 
 ----------+-----------+-----------+--------------+------------
-       47 | t         | t         | t            | t
+       56 | t         | t         | t            | t
 (1 row)
 
 -- 50000 rows; a has 10 values and g 100, both placed at random, about 55
