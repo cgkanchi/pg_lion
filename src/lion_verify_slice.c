@@ -471,6 +471,7 @@ lion_verify_column_slices(LionVerifyState *vs, LionState *col)
 	sc.desc = CreateTemplateTupleDesc(2);
 	TupleDescInitEntry(sc.desc, (AttrNumber) 1, "code", INT8OID, -1, 0);
 	TupleDescInitEntry(sc.desc, (AttrNumber) 2, "enc", INT8OID, -1, 0);
+	TupleDescFinalize(sc.desc);
 	sc.slot = MakeSingleTupleTableSlot(sc.desc, &TTSOpsVirtual);
 	sc.rslot = MakeSingleTupleTableSlot(sc.desc, &TTSOpsMinimalTuple);
 	sc.sort = tuplesort_begin_heap(sc.desc, 1, &sortcol, &sortop, &sortcoll,
