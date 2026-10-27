@@ -26454,7 +26454,16 @@ asks pass unasked, then asks again. A cold relation is asked for all along, a wa
 often (a margin-8 scan asks for 65 pages rather than 880), and one warm in parts loses at most 256
 asks at a time; the PART chain, which every scan reads and so is warm whatever else is, does not
 count. Warm it then costs about 2%: 2.33 ms against 2.29 at a margin of 3 and 4.99 against 4.91 at
-8.
+8. While a relation's asks rest, the looks into the queues for them rest too (2026-10-27), as they
+do while a stream rests ("Read streams" below): on 16 a look read up to 257 entries of its queue and
+chose its asks only for `lion_ask()` to let them pass, 5.6% of a warm DBpedia query by perf and 6%
+of a random vector's. So a look whose every ask would pass - the index's, or the heap's and, of a
+row placed in TOAST, the TOAST relation's too - is let pass and chooses nothing, which has the next
+entry out at its level bring the next; each such entry counts one against the rest, the ask the look
+would have made for it, so the rest ends after 256 of them as it did after 256 asks, and the first
+look after it asks for all it chooses, a resting look having marked nothing. It asks a little more
+that way, 93 pages a warm DBpedia query against 80 and 2,346 against 1,876 on random vectors, and
+looks 450 ns less a refine ("The refine's reads" below).
 
 **Read streams** (2026-10-17; lion_readahead.c, lion_readahead_ring.c). From PostgreSQL 17 a scan
 reads the pages it expects through core's read stream (`read_stream_begin_relation()`) instead of
@@ -26541,6 +26550,53 @@ reads they served and the pages of those they read into shared buffers, the read
 given (unpredicted, or made while resting), the pages they read ahead and released unread, and the
 times one ended and started again - and the heap's asks as
 `H heap pages prefetched (X not in shared buffers)`. On 16, `stream` is accepted and is `fadvise`.
+
+**The refine's reads** (2026-10-27). A refine reads one REFINE item - a row's (`lv_refine()`) or a
+centroid's (`lv_refine_part()`): `lion_readahead_read()`, which on 16 is `ReadBuffer()`, the share
+lock, `lionvec_check_page()`, `lionvec_refine_at()` and `lionvec_estimate8()` over its codes - and
+warm, every page in shared buffers, a row's took 2.6 us on DBpedia at 1536 dimensions, 1.0 of them
+in the estimate (the timing of 2026-10-26 found 3,125 ns, 1,810 of them from the read through the
+item's checks). A shared-buffer hit does not cost that; a chain of cache misses does, each waiting
+for the one before it. Timing each step twice over, the second time on the same inputs a moment
+later (temporary `rdtsc` instrumentation, each timestamp behind `lfence`, so that a step waits for
+its own loads), gives the instructions' cost as the repeat and the misses' as the difference. On 4
+KB pages, first and repeat, ns a row: `ReadBuffer()` 871 and 92 - the buffer table is a chained
+hash, and its segment, its element and then the buffer's descriptor are read one after another,
+three misses, two thirds of the step in `hash_search_with_hash_value()` and a quarter in
+`PinBuffer()` by perf; the lock 40 and 41; `lionvec_check_page()` 789 and 28 - the page header, then
+the special space where its `pd_special` points, on the page's other 4 KB half, two more misses in a
+row, each a TLB miss as well; `lionvec_refine_at()` 180 and 34 - the line pointer lies in the
+header's line, the item's first line is the miss; and `lionvec_estimate8()` 986 and 396 - 24 lines
+of codes read in order, which the hardware prefetcher catches only after the first few. A centroid's
+refine (245, 168, 98 and 681) is cheaper only because its 543 pages come up query after query and
+stay in the cache. The rest of the list it was not: a query's rows share no REFINE page - 85 refines
+read 85 pages, none the one before it, and even a random-vector query's 13,400 refines read 10,180
+pages, 0.45 of them the one before - so refining a page's rows together, or keeping its pin from one
+refine to the next, would save nothing (centroids do share, 118 refines on 62 pages, 1.7 of them
+consecutive: not worth a pin cache); and the checks cost 28 ns once their lines are there. Huge
+pages take the TLB misses out of all of it, the buffer table's and the descriptors' lines included:
+a row's refine 3,480 to 3,110 ns serialized, a DBpedia query 6% faster and a random-vector one 11%,
+so `huge_pages = on` is worth recommending for a warm index - a setting, not a change.
+
+What the scan can change is the order of the misses: it asks for the lines before it needs them
+(`lion_prefetch()`, lion_compat.h: `__builtin_prefetch`, which reads nothing, waits for nothing and
+never faults), so that they run together. Once the buffer is pinned and before it is locked, both
+refines prefetch the page header and the special space, whose place on a lionvec page is fixed
+(`BLCKSZ - MAXALIGN(sizeof(LionVecPageOpaqueData))`), nothing of the page read before the lock; and
+`lionvec_refine_at()`, once the line pointer has given it the item and its length is checked,
+prefetches every line of the item before it reads the header (`lion_prefetch_range()`, a macro: GCC
+13 deletes a function that only prefetches), so that the header's miss and the codes' overlap and
+the estimate finds its codes on the way. The chain after the pin is then the header and the special
+space together, then the item, in place of four misses and the prefetcher's run-up: serialized, a
+row's refine on DBpedia 3,590 to 2,950 ns, the check 843 to 100, the estimate 911 to 488 and the
+lock 40 to 472, where the two lines' misses now land (a locked instruction waits for them). The
+buffer table's three misses stay: the lookup is core's, an extension cannot prefetch into it, and
+the pages being distinct no refine shares one. The look into the queues before a refine
+(`lv_prefetch_due()`) was the other cost, 450 to 540 ns of a row's refine on DBpedia and 5.6% of a
+warm query by perf, mostly to choose asks that then rested: it rests with the asks now ("Prefetch"
+above), 47 ns. Measured (§44.9, "The refine's reads"): warm, the same rows in the same order, a
+DBpedia query 1.151 to 1.071 ms and a random-vector query 50.7 to 39.7 ms on 4 KB pages, 1.083 to
+0.976 and 45.2 to 33.9 on huge pages; cold, the same reads and the same time.
 
 **A parallel scan** (2026-10-16). `amcanparallel`: with `pg_lion.vector_parallel_scan` on (off by
 default since 2026-10-17, the measurements below finding it slower everywhere; off, `lo_knn_partial()`
@@ -27971,6 +28027,57 @@ format 5, under `pg_lion.vector_toast_direct` off and on. The exact path from th
 at 1% against 179.7, reading 1,631 pages against 2,717 and waiting 12.7 ms against 152.7, and 158.6
 at 3% against 457.2; warm 7.9 against 14.1 and 16.4 against 31.8. The probing kinds were 6 to 7%
 faster from the disk and the same warm, and the inline table's queries took main's time.
+
+**The refine's reads** (2026-10-27; §44.4, "The refine's reads"). The 115,186 DBpedia rows as
+`knn_dbpedia.py load` makes them (each vector in its row, `toast_tuple_target = 8160`, 900 MB) and
+the cosine index the build chooses (247 MB), the 200 held-out queries, LIMIT 10 at the default
+margin 3 and patience 30; and `rnd`, 100,000 random unit vectors of 1536 dimensions (a row a page,
+782 MB), a cosine index of 2,529 partitions in 51 regions (216 MB), 20 random unit queries - a query
+of random vectors probes 477 partitions and refines 13,400 rows and 2,400 centroids, where DBpedia's
+probes 35 and refines 85 rows and 118 centroids. PostgreSQL 16.15 (apt.postgresql.org's), pgvector
+0.8.7, a VM of 4 vCPUs of a Xeon at 2.1 GHz with AVX-512 and 15 GB, `shared_buffers` 2 GB,
+`huge_pages` off unless said, `effective_io_concurrency` 200 (64 pages ahead, asked of the kernel:
+16 has no streams), every relation prewarmed, each query run once untimed and then timed under
+`EXPLAIN (ANALYZE, BUFFERS, TIMING OFF)`, the median of the 200 (the 20), the builds taking turns
+round by round in one server, each build's median of 3 rounds (2 on huge pages). The steps of a
+row's refine, ns a refine, serialized (each timestamp behind `lfence`), the first time and, in
+brackets, a repeat with its inputs cached, on 4 KB pages; the builds: main, the prefetches
+("prefetched"), and with the look resting ("resting"):
+
+| Rows' refine, ns | due | read | lock | check | at | est | after | all |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| DBpedia, main | 454 | 1,055 (92) | 40 (41) | 843 (28) | 175 (34) | 911 (396) | 112 | 3,590 |
+| DBpedia, prefetched | 486 | 1,010 | 472 | 100 | 281 | 488 | 117 | 2,954 |
+| DBpedia, resting | 47 | 990 | 468 | 108 | 273 | 483 | 116 | 2,485 |
+| random, main | 220 | 670 (82) | 38 (37) | 560 (30) | 188 (35) | 986 (380) | 162 | 2,824 |
+| random, prefetched | 222 | 636 | 219 | 80 | 261 | 445 | 150 | 2,012 |
+| random, resting | 83 | 638 | 212 | 77 | 271 | 454 | 156 | 1,892 |
+
+A centroid's refine on DBpedia, huge pages: 1,796 ns on main, 1,291 prefetched, 1,186 resting. The
+timing itself costs - with it a DBpedia query took 1.45 ms against 1.15 - so the shares are the
+instrumented scan's: the rows' refines 18% of it on DBpedia and 55% on the random vectors on main,
+14% and 46% resting. Without it, the server's median ms, and the `PrefetchBuffer()` calls a query:
+
+| Warm | DBpedia, ms | asks | random, ms | asks |
+| --- | --- | --- | --- | --- |
+| main | 1.151 | 80 | 50.7 | 1,876 |
+| prefetched | 1.129 | 80 | 40.5 | 1,876 |
+| resting | 1.071 | 93 | 39.7 | 2,346 |
+| main, huge pages | 1.083 | 80 | 45.2 | 1,876 |
+| prefetched, huge pages | 1.039 | 80 | 37.5 | 1,876 |
+| resting, huge pages | 0.976 | 93 | 33.9 | 2,346 |
+
+By perf on the resting build, 4 KB pages, the look (`lv_prefetch_queue()`) is gone from a DBpedia
+query's profile (5.6% on main), `lionvec_check_page()` is 3.1% of it against 5.7 and
+`lionvec_sum8_avx2()` 4.9 against 8.0; on the random vectors 5.9 against 12.9 and 14.7 against 25.2,
+and `lionvec_refine_at()`, which now issues the item's prefetches and meets its header's miss, 7.2
+against 1.3. The buffer table's `hash_search_with_hash_value()` keeps its 10 and 15%. Cold, each
+query alone after a restart with the page cache dropped, every build read the same pages (344 a
+DBpedia query, 11,757 a random one) and the times are the disk's noise: main 13.1 ms on DBpedia
+against 11.6 resting, 8.8 and 7.2 of them waiting on reads (20 queries each, two passes), and the
+random vectors 264 against 259 (12 each); the prefetches alone 10.2 and 240 (10 and 6). Every build
+returned the same rows in the same order for every query. The prefetches cost nothing cold: a page
+that is not in shared buffers is read before they are issued.
 
 ### 44.10 Tests
 
