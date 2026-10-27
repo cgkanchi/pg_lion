@@ -32436,7 +32436,9 @@ What the tables say:
   and the located sources would do, as §34's does without a copy.
 - **A summed range's collection for C0 is underpriced**: `u4 sum, range 10%` runs at 210 units a
   millisecond, priced as half the summed walk where collecting the range from its summaries and
-  entries costs more; the decision there is right by a wide margin (40 ms against 167).
+  entries costs more; the decision there is right by a wide margin (40 ms against 167). *(2026-10-27,
+  §53.8: priced now as §32 prices a range taken as a source, once beside the WHERE; underpriced, it
+  kept the summaries' route against ranges from slices twice as fast.)*
 - **The competitor's warm pages**: at a 0.1% `WHERE`, `min` and `max` were priced 6,746 against
   core's index scan at 15,040 and ran 10.5 ms against 3.7 warm - core's random page cost for
   pages that are in shared buffers is §39's to correct, not this section's.
