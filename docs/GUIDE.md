@@ -186,9 +186,10 @@ on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166
 minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
 price is an insert into each set bit's set on every write of the column: an `INSERT` of many rows
 into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
-`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). A percentile, a join
-and a partitioned table are not answered from the slices yet; `SELECT * FROM lion_index_slice_agg('events_amount', 'country = ''JP''')` answers
-the same aggregates for a filter given as text.
+`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). A
+percentile, a join and a partitioned table are not answered from the slices yet; `SELECT * FROM
+lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
+given as text.
 
 The slices answer a range on the sliced column itself too - `amount > 100`, `amount BETWEEN 100 AND
 5000`, `amount <> 0`, alone or beside other filters, under a `GROUP BY` of other columns, in an
