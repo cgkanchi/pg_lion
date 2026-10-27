@@ -1112,6 +1112,7 @@ typedef struct LionVColScope
 #define LION_SLICE_RANGE_KEY_COST	(lion_slice_range_key_cost * cpu_operator_cost)
 #define LION_SLICE_RANGE_STEP_COST	(lion_slice_range_step_cost * cpu_operator_cost)
 #define LION_SLICE_RANGE_WORD_COST	(lion_slice_range_word_cost * cpu_operator_cost)
+#define LION_SLICE_RANGE_CONTAINER_COST (lion_slice_range_container_cost * cpu_operator_cost)
 
 /*
  * A page of a lion index that a custom path reads while the index is
