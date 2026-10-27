@@ -34,7 +34,14 @@
  *		since lionvec takes its plane-1 kernel from here, is each
  *		implementation of this sum against every other through lionvec's
  *		call - and the scatter of a query's 4-bit codes is the planes
- *		lionvec_query_init() builds, to the bit.
+ *		lionvec_query_init() builds, to the bit;
+ *	  - the comparison of a bit-sliced column with a constant
+ *		(lion_planes_bsi_step(), DESIGN.md §53): LT, GT and EQ folded from
+ *		the top bit against the values compared one by one, every width of
+ *		8 to 64 bits, 1 to 512 words, rows missing from E, slices of no row
+ *		given as NULL, constants at and around the values held, 0 and the
+ *		largest, and a fold stopped where eq first empties the same as one
+ *		run to the last bit.
  *
  *	  With --bench it times the kernels instead (make planes-bench, at -O2).
  *	  Exit status is 0 only if every check passed.
@@ -1149,6 +1156,155 @@ bench(void)
 	free(values);
 }
 
+
+/* ---------- comparisons of a bit-sliced column with a constant ---------- */
+
+/*
+ * nwords words of rows, each row in E with probability dens / 256 and then
+ * a value of nbits bits - drawn from few distinct values with `few`, so that
+ * the constants meet rows equal to them - its bits spread over nbits slices,
+ * a slice with no row left NULL as the reader leaves a bit no value has.
+ * Then every constant tried: LT, GT and EQ folded from the top bit, stopping
+ * where eq first empties and also run to the end, against the values one by
+ * one.
+ */
+static void
+test_bsi_one(uint32 nwords, uint32 nbits, uint32 dens, bool few)
+{
+	uint32		n = nwords * 64;
+	uint64		mask = (nbits == 64) ? PG_UINT64_MAX :
+		((UINT64CONST(1) << nbits) - 1);
+	uint64	   *vals = (uint64 *) xmalloc(sizeof(uint64) * n);
+	bool	   *has = (bool *) xmalloc(sizeof(bool) * n);
+	uint64	   *e = (uint64 *) xmalloc(sizeof(uint64) * nwords);
+	uint64	   *slices[64];
+	const uint64 *sp[64];
+	uint64		pool[8];
+	uint64		consts[24];
+	int			nconsts = 0;
+	uint32		i;
+	uint32		j;
+	int			k;
+
+	for (k = 0; k < 8; k++)
+		pool[k] = rnd64() & mask;
+	for (j = 0; j < nbits; j++)
+		slices[j] = (uint64 *) xmalloc(sizeof(uint64) * nwords);
+	for (i = 0; i < n; i++)
+	{
+		has[i] = (rnd_below(256) < dens);
+		vals[i] = few ? pool[rnd_below(8)] : (rnd64() & mask);
+		if (!has[i])
+			continue;
+		e[i / 64] |= UINT64CONST(1) << (i % 64);
+		for (j = 0; j < nbits; j++)
+			if ((vals[i] >> j) & 1)
+				slices[j][i / 64] |= UINT64CONST(1) << (i % 64);
+	}
+	for (j = 0; j < nbits; j++)
+	{
+		bool		any = false;
+
+		for (i = 0; i < nwords; i++)
+			any |= (slices[j][i] != 0);
+		sp[j] = any ? slices[j] : NULL;
+	}
+
+	consts[nconsts++] = 0;
+	consts[nconsts++] = mask;
+	consts[nconsts++] = mask - 1;
+	consts[nconsts++] = 1;
+	for (k = 0; k < 4; k++)
+	{
+		uint64		v = pool[rnd_below(8)];
+
+		consts[nconsts++] = v;
+		consts[nconsts++] = (v + 1) & mask;
+		consts[nconsts++] = (v - 1) & mask;
+	}
+	for (i = 0; i < n && nconsts < 22; i += 1 + rnd_below(n))
+		if (has[i])
+			consts[nconsts++] = vals[i];
+	consts[nconsts++] = rnd64() & mask;
+
+	for (k = 0; k < nconsts; k++)
+	{
+		uint64		c = consts[k];
+		int			op;
+
+		for (op = 0; op < 3; op++)
+		{
+			int			stop;
+
+			for (stop = 0; stop < 2; stop++)
+			{
+				uint64	   *eq = (uint64 *) xmalloc(sizeof(uint64) * nwords);
+				uint64	   *acc = (uint64 *) xmalloc(sizeof(uint64) * nwords);
+				bool		ok = true;
+				bool		live = true;
+				int			b;
+
+				memcpy(eq, e, sizeof(uint64) * nwords);
+				for (b = (int) nbits - 1; b >= 0; b--)
+				{
+					bool		r;
+
+					if (stop && !live)
+						break;
+					r = lion_planes_bsi_step((LionBsiOp) op,
+											 ((c >> b) & 1) != 0, sp[b], eq,
+											 (op == LION_BSI_EQ && (b & 1)) ?
+											 NULL : acc, nwords);
+					live = r;
+				}
+				for (i = 0; i < n; i++)
+				{
+					bool		ineq = (eq[i / 64] >> (i % 64)) & 1;
+					bool		inacc = (acc[i / 64] >> (i % 64)) & 1;
+					bool		wanteq = has[i] && vals[i] == c;
+					bool		wantacc = has[i] &&
+						((op == LION_BSI_LT && vals[i] < c) ||
+						 (op == LION_BSI_GT && vals[i] > c));
+
+					if (ineq != wanteq || (op != LION_BSI_EQ &&
+										   inacc != wantacc) ||
+						(op == LION_BSI_EQ && inacc))
+						ok = false;
+				}
+				CHECK(ok, "a comparison folded from the slices is the values'");
+				free(eq);
+				free(acc);
+			}
+		}
+	}
+
+	for (j = 0; j < nbits; j++)
+		free(slices[j]);
+	free(vals);
+	free(has);
+	free(e);
+}
+
+static void
+test_bsi(void)
+{
+	static const uint32 widths[] = {8, 16, 32, 33, 63, 64};
+	static const uint32 nws[] = {1, 3, 64, 128, 512};
+	static const uint32 dens[] = {0, 3, 128, 256};
+	int			a;
+	int			b;
+	int			d;
+
+	cur_phase = "bsi";
+	for (a = 0; a < (int) lengthof(widths); a++)
+		for (b = 0; b < (int) lengthof(nws); b++)
+			for (d = 0; d < (int) lengthof(dens); d++)
+			{
+				test_bsi_one(nws[b], widths[a], dens[d], false);
+				test_bsi_one(nws[b], widths[a], dens[d], true);
+			}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -1165,6 +1321,7 @@ main(int argc, char **argv)
 	test_transpose();
 	test_scatter();
 	test_lionvec();
+	test_bsi();
 
 	printf("planes_test: %ld checks, %ld failed\n", nchecks, nfail);
 	if (nfail == 0)

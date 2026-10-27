@@ -851,8 +851,15 @@ lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
 	 */
 	if (kind == LION_CLAUSE_RANGE || kind == LION_CLAUSE_RANGESRC)
 	{
-		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
-														  idx->opfamily[i])))
+		/*
+		 * ... and a range taken as a source may have a hole, `<>` (§35),
+		 * which a build that answers ranges from slices makes one of
+		 * (§53).
+		 */
+		StrategyNumber s = get_op_opfamily_strategy(opno, idx->opfamily[i]);
+
+		if (!(LION_STRAT_IS_RANGE(s) ||
+			  (kind == LION_CLAUSE_RANGESRC && s == LION_STRAT_NE)))
 			return false;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 										  cmptype, LION_CMP_PROC)))
@@ -2512,6 +2519,72 @@ lion_find_sliced_index(RelOptInfo *rel, AttrNumber attno, AttrNumber *colp,
 		}
 	}
 	return NULL;
+}
+
+/*
+ * The index whose slices answer a range on plain column attno of rel
+ * (DESIGN.md §53), or NULL: the index the range's clauses are matched to -
+ * the first whole lion index of the column (lion_find_roaring_index(),
+ * lion_match_index()), outside the scope of a partial index (§45), which
+ * keeps no slices the planner reads - when it slices the column at its
+ * type's width; *colp its key column there and *typid the type its keys are
+ * sliced as.
+ */
+IndexOptInfo *
+lion_range_sliced_index(RelOptInfo *rel, AttrNumber attno, AttrNumber *colp,
+						Oid *typid)
+{
+	IndexOptInfo *idx;
+	AttrNumber	col = 0;
+	Relation	index;
+	LionState  *state;
+	bool		sliced;
+
+	if (attno <= 0 || lion_partial_index_of(rel) != NULL)
+		return NULL;
+	idx = lion_find_roaring_index(rel, attno, false, &col);
+	if (idx == NULL || col <= 0 || idx->hypothetical || idx->indpred != NIL)
+		return NULL;
+	index = index_open(idx->indexoid, NoLock);
+	state = lion_index_column_state(index, col);
+	sliced = state->sliced && state->slicebits > 0 &&
+		lion_slice_type_nbits(state->typid) == state->slicebits;
+	*typid = state->typid;
+	index_close(index, NoLock);
+	if (!sliced)
+		return NULL;
+	*colp = col;
+	return idx;
+}
+
+/* Does any whole lion index of rel slice a column (DESIGN.md §51)? */
+bool
+lion_rel_has_sliced_index(RelOptInfo *rel)
+{
+	Oid			lionam = lion_get_am_oid();
+	ListCell   *lc;
+
+	if (!OidIsValid(lionam))
+		return false;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	index;
+		LionIndexState *ix;
+		bool		any = false;
+		int			c;
+
+		if (idx->relam != lionam || idx->hypothetical || idx->indpred != NIL)
+			continue;
+		index = index_open(idx->indexoid, NoLock);
+		ix = lion_get_index_state(index);
+		for (c = 0; c < ix->ncolumns; c++)
+			any |= ix->cols[c].sliced;
+		index_close(index, NoLock);
+		if (any)
+			return true;
+	}
+	return false;
 }
 
 /*
