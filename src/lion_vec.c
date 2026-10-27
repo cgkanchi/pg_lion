@@ -786,7 +786,11 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
  * (§44.5).  A row VACUUM removes is dead to every snapshot, so a scan that
  * finds it gone loses nothing.  reflocruns is the meta page's: the runs of
  * the TOAST place every REFINE item of the index ends with, 0 for none
- * (§44.13), of which an item uses no more.
+ * (§44.13), of which an item uses no more.  The item's line pointer is
+ * checked as lionvec_item_ok() checks a PART or REGION item's - its length,
+ * then the item inside the page's data - before a line of the item is
+ * prefetched or read: a corrupt offset, up to 32,767, would have those reads
+ * go past the page.
  */
 LionVecRefine *
 lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
@@ -805,6 +809,12 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a refine item of %u bytes at (%u,%u)",
 						RelationGetRelationName(index), ItemIdGetLength(iid), blk, off)));
+	if (ItemIdGetOffset(iid) < ((PageHeader) page)->pd_upper ||
+		(Size) ItemIdGetOffset(iid) + ItemIdGetLength(iid) > ((PageHeader) page)->pd_special)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("lionvec index \"%s\" has a refine item outside its page at (%u,%u)",
+						RelationGetRelationName(index), blk, off)));
 	ref = (LionVecRefine *) PageGetItem(page, iid);
 
 	/*
