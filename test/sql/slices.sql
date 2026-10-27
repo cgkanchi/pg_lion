@@ -6,6 +6,8 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
 
 -- The query lion_index_slice_agg(idx, filter, attno) stands for, with every
 -- lion path off so that the code under test does not answer it:
@@ -279,20 +281,23 @@ EXPLAIN (COSTS OFF) SELECT count(DISTINCT k) FROM slc_w1;
 SELECT slc_both($$SELECT count(DISTINCT k) FROM %s$$);
 SELECT slc_both($$SELECT count(DISTINCT k) FROM %s WHERE g = 2$$);
 SELECT slc_both($$SELECT count(DISTINCT ts) FROM %s$$);
--- the aggregates over keys (§37), the slices' answer (§52) set aside
+-- the aggregates over keys (§37), a walk of the entries' headers on an
+-- all-visible heap, which costs less than the slices' answer (§52) for every
+-- row of the table: the plan with pg_lion.enable_count_slices off, and on
 SET pg_lion.enable_count_slices = off;
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
 SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
 RESET pg_lion.enable_count_slices;
--- and from the slices, which this small table's costs choose (§52)
 EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1;
-SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s$$);
 -- ranges, summed from the summaries, whose walk ends where the slices begin
 -- (the bitmap scan off: the two cost about the same here); a range this
 -- wide is answered from the slices themselves (§53, test/sql/slices_range.sql)
--- unless pg_lion.enable_slice_ranges is off
+-- unless pg_lion.enable_slice_ranges is off - and under it the aggregates
+-- come from the slices too (§52), as no walk of keys answers a WHERE
 SET enable_bitmapscan = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k > -150;
+EXPLAIN (COSTS OFF) SELECT sum(k), min(k), max(k), count(*) FROM slc_w1 WHERE k > -150;
+SELECT slc_both($$SELECT sum(k), min(k), max(k), count(*) FROM %s WHERE k > -150$$);
 SET pg_lion.enable_slice_ranges = off;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slc_w1 WHERE k > -150;
 SELECT slc_both($$SELECT count(*) FROM %s WHERE k > -150$$);
