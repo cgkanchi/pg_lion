@@ -27,6 +27,7 @@
 \endif
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
+LOAD 'pg_lion';
 SET max_parallel_workers_per_gather = 0;
 SET max_parallel_maintenance_workers = 0;
 SET maintenance_work_mem = '1GB';

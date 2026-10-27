@@ -5022,6 +5022,31 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * collected, never walked (below).
 	 */
 	if (cx->sattnos != NIL)
+	{
+		Cost		rangecollect = 0.0;
+
+		/*
+		 * A range that bounds the sum over its entries is collected for the
+		 * aggregates' WHERE (lion_slice_where_sources()), from its entries
+		 * and summaries, as a range taken as a source is (§32).
+		 */
+		if (cx->sumall && cx->rangevar != NULL && first->driveidx[0] != NULL)
+		{
+			LionRangeMem mem = {0};
+			List	   *bounds = NIL;
+			bool		spills;
+			bool		evicts;
+			ListCell   *lc;
+
+			foreach(lc, cx->rangeclauses)
+				bounds = lappend(bounds, ((RestrictInfo *) lfirst(lc))->clause);
+			rangecollect = lion_cost_range_source(root, input_rel,
+												  first->driveidx[0],
+												  first->drivecol[0], bounds,
+												  cx->rangesel, &mem, &spills,
+												  &evicts);
+			list_free(bounds);
+		}
 		lion_cost_slice_path(root, cpath, input_rel, cx->sidx, cx->scols,
 							 cx->swants, input_rel->rows,
 							 cx->nwhere > 0 ||
@@ -5030,7 +5055,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 							 (cx->ngroup > 0) ? cx->numgroups : 0.0,
 							 cx->slicedecode ?
 							 lion_count_groups_batch_est(cx->first->driveidx[0]) :
-							 0);
+							 0, rangecollect);
+	}
 
 	/*
 	 * A range taken as a source (DESIGN.md §32) is collected - past the
@@ -6134,14 +6160,13 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	 * build of their own beside the one that answers them otherwise - from
 	 * the entries' keys with no WHERE (§37), or not at all - and add_path()
 	 * keeps the cheaper.
-	 */
-	/*
-	 * The ranges on sliced columns from their slices (DESIGN.md §53): a build
-	 * of its own beside each that walks or collects them from their entries
-	 * and summaries - with the slices' aggregates and without - which
-	 * declines itself where no range is one the slices answer, and
-	 * add_path() keeps the cheaper.  With pg_lion.prefer_slice_ranges, for
-	 * the tests, a build that answers its ranges so leaves the other out.
+	 *
+	 * The ranges on sliced columns from their slices (§53): a build of its
+	 * own beside each that walks or collects them from their entries and
+	 * summaries - with the slices' aggregates and without - which declines
+	 * itself where no range is one the slices answer; add_path() keeps the
+	 * cheapest.  With pg_lion.prefer_slice_ranges, for the tests, a build that
+	 * answers its ranges so leaves the other out.
 	 */
 	may = lion_query_may_slice_ranges(cxp);
 	if (lion_query_has_slice_aggs(cxp))

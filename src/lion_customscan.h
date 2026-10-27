@@ -4405,7 +4405,7 @@ extern void lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath,
 								 RelOptInfo *rel, List *idxs, List *cols,
 								 List *wants, double whererows,
 								 bool haswhere, bool counts, double ngroups,
-								 int batch);
+								 int batch, Cost rangecollect);
 extern void lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath,
 								RelOptInfo *rel, List *idxs, List *cols,
 								List *naggs, bool counts);

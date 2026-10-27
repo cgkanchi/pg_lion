@@ -5843,7 +5843,8 @@ lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx, double keys,
 void
 lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 					 List *idxs, List *cols, List *wants, double whererows,
-					 bool haswhere, bool counts, double ngroups, int batch)
+					 bool haswhere, bool counts, double ngroups, int batch,
+					 Cost rangecollect)
 {
 	Cost		where = cpath->path.total_cost;
 	Cost		run = counts ? where : 0.0;
@@ -5898,10 +5899,18 @@ lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 			erows;
 		ckeys = Max(nkeys * (1.0 - exp(-crows / nkeys)), 1.0);
 
-		/* the collection, once for every column (they share the WHERE) */
+		/*
+		 * The collection, once for every column (they share the WHERE); and
+		 * a range that bounds the sum over its entries collected for it
+		 * (lion_range_collect()), whose price the caller made as a range
+		 * taken as a source is priced, rangecollect (2026-10-27, §53.7: it
+		 * was taken to be in the half of the WHERE's price, which priced
+		 * the collection of a range of a column in no heap order from its
+		 * summaries at a fifth of its time).
+		 */
 		if (haswhere)
 			run += (counts || collected ? 0.5 : 1.0) * where +
-				ckeys * LION_PROBE_COST;
+				ckeys * LION_PROBE_COST + (collected ? 0.0 : rangecollect);
 		else
 			run += Min(shape.items[nbits], nkeys) * LION_CONTAINER_COST;
 		run += ckeys * LION_FKJOIN_COPY_CONTAINER_COST;
