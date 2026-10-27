@@ -664,6 +664,21 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §53: whether the count pushdown may answer a range on a
+	 * bit-sliced column from its slices - O'Neil's descent, key by key -
+	 * where that is priced cheaper than walking its entries and summaries.
+	 * Off, every range is walked or collected from its entries as before.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_slice_ranges",
+							 "Lets the count pushdown answer a range on a bit-sliced lion column from its slices.",
+							 "Off, such ranges are answered from the column's entries and summaries.",
+							 &lion_enable_slice_ranges,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_slice_kernel",
 							 "Lets the counts of a bit-sliced column's slices use the bit-plane kernel where the slices are bitmaps of one width.",
 							 "Off, each slice's container is counted on its own; the answers are the same either way.",
