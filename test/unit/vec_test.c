@@ -14,13 +14,21 @@
  *	  - a row's codes: the bits are the signs, the popcount theirs, the alphas
  *		and norms what their definitions say, a row at the mean all zeros;
  *	  - the query's planes: they quantize it within half a step, and the sum
- *		and variance kept with them are the planes' own;
+ *		and variance kept with them are the planes' own; its rounding to
+ *		16-bit integers, within half a step, its ends at +-32767, and its
+ *		sum, variance and constant term its own, a constant query all 0s,
+ *		and none without its array, which changes nothing else;
  *	  - every kernel the build and CPU have (portable, POPCNT, AVX2,
  *		AVX-512): plane 1's against a naive count, the sums against their
- *		sixteen lanes added as the header says and the rotation against the
- *		portable one's, to the bit, at every dimsp an index takes and from
- *		unaligned pointers; and end to end, the same rotations, estimates and
- *		k-means as the portable set's;
+ *		sixteen lanes added as the header says, the 8-bit codes' integer
+ *		sums against plain ones, and the rotation against the portable
+ *		one's, to the bit, at every dimsp an index takes and from unaligned
+ *		pointers; and end to end, the same rotations, estimates and k-means
+ *		as the portable set's;
+ *	  - the 8-bit codes' estimate: the reconstructions' inner product with
+ *		the rounded query, within the rounding's reach of the floats', its
+ *		error the formula's, the rounding's variance included, and the same
+ *		under every set;
  *	  - a halfvec's halves: the portable conversion of each of the 65,536
  *		against its value computed in double from its sign, exponent and
  *		mantissa, a NaN a quiet NaN of its payload; every set's (F16C where
@@ -116,6 +124,25 @@ swap_rng(void)
 	rng_state = kernel_rng_state;
 	kernel_rng_state = t;
 }
+
+/*
+ * The tests of the 8-bit codes' integer sums and of the query's rounding to
+ * 16 bits draw from generators seeded where they draw: rng_seed() swaps one
+ * in and returns the state it displaced, which the caller puts back.  So
+ * neither the shared sequence nor the kernel tests' moves, and the inputs
+ * at a dimsp are the same whichever set of kernels is forced.
+ */
+static uint64
+rng_seed(uint64 seed)
+{
+	uint64		t = rng_state;
+
+	rng_state = seed;
+	return t;
+}
+
+/* a distinct, nonzero seed for each n */
+#define RNG_SEED(base, n)	((base) + (uint64) (n) * UINT64CONST(0x9E3779B97F4A7C15))
 
 /* uniform in (0, 1) */
 static double
@@ -530,6 +557,7 @@ query_alloc(LionVecQuery *q, int D)
 	q->dimsp = D;
 	q->qc = falloc(D);
 	q->planes = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+	q->qw = (int16 *) xmalloc(sizeof(int16) * D);
 }
 
 static void
@@ -537,6 +565,7 @@ query_free(LionVecQuery *q)
 {
 	free(q->qc);
 	free(q->planes);
+	free(q->qw);
 }
 
 static void
@@ -608,6 +637,145 @@ test_query(void)
 	query_free(&q);
 	free(mean);
 	free(x);
+}
+
+/*
+ * The query's rounding to 16-bit integers, for the 8-bit codes
+ * (lionvec_query_init()): every coordinate within half a step of q^_i =
+ * qmid + qwdelta qw_i, qmid the middle of qc's range and qwdelta a 65,534th
+ * of it, so that the minimum rounds to -32767 and the maximum to 32767;
+ * qwsum the qw_i's sum; varq8 the mean square of qc - q^, at most a quarter
+ * of a step's square; qw0 = (-4 + 1/64) (dimsp qmid + qwdelta qwsum).  A
+ * constant query rounds to all 0s, a step of 1 and no error.  And with qw
+ * NULL nothing else in the query changes and nothing is rounded.  For four
+ * kinds of query - centred; narrow and off centre; one coordinate a million
+ * below the rest; every scale from 2^-40 to 2^40 - under each metric, from
+ * a generator of its own.
+ */
+static void
+test_query_rounding(void)
+{
+	int			D = 512;
+	float	   *mean = falloc(D);
+	float	   *x = falloc(D);
+	float	   *qc0 = falloc(D);
+	uint64	   *planes0 = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+	LionVecQuery q;
+	uint64		saved = rng_seed(UINT64CONST(0xBB67AE8584CAA73B));
+	int			k;
+	int			i;
+
+	cur_phase = "query rounding";
+	query_alloc(&q, D);
+	for (i = 0; i < D; i++)
+		mean[i] = (float) (rnd_gauss() * 0.2);
+
+	for (k = 0; k < 4 * LIONVEC_NSTRATEGIES; k++)
+	{
+		int			kind = k / LIONVEC_NSTRATEGIES;
+		int			metric = k % LIONVEC_NSTRATEGIES + 1;
+		int			big = (int) (rnd64() % D);
+		double		mn = INFINITY;
+		double		mx = -INFINITY;
+		double		e2 = 0.0;
+		double		abssum = 0.0;
+		int64		sum = 0;
+		bool		half_ok = true;
+		bool		range_ok = true;
+		bool		ends_ok = true;
+
+		for (i = 0; i < D; i++)
+		{
+			double		g = rnd_gauss();
+
+			x[i] = kind == 0 ? (float) (mean[i] + g) :
+				kind == 1 ? (float) (mean[i] - 5.0 + 0.01 * g) :
+				kind == 2 ? (float) (mean[i] + (i == big ? -1e6 : g)) :
+				(float) (mean[i] + ldexp(g, (int) (rnd64() % 81) - 40));
+		}
+		lionvec_query_init(&q, metric, mean, x, 3.0);
+		for (i = 0; i < D; i++)
+		{
+			mn = Min(mn, (double) q.qc[i]);
+			mx = Max(mx, (double) q.qc[i]);
+		}
+		for (i = 0; i < D; i++)
+		{
+			double		e = q.qc[i] - (q.qmid + q.qwdelta * q.qw[i]);
+
+			half_ok &= fabs(e) <= q.qwdelta / 2 * (1 + 1e-9);
+			range_ok &= q.qw[i] >= -32767;	/* and <= 32767, as an int16 is */
+			ends_ok &= (q.qc[i] != mn || q.qw[i] == -32767) &&
+				(q.qc[i] != mx || q.qw[i] == 32767);
+			sum += q.qw[i];
+			abssum += abs(q.qw[i]);
+			e2 += e * e;
+		}
+		CHECK(q.qmid == (mx + mn) / 2 && q.qwdelta == (mx - mn) / 65534,
+			  "the rounding is not centred on qc's range in 65,534 steps");
+		CHECK(half_ok, "a query coordinate is more than half a step from its rounding");
+		CHECK(range_ok, "a rounded query coordinate is beyond +-32767");
+		CHECK(ends_ok, "the query's least and greatest are not rounded to -32767 and 32767");
+		CHECK(q.qwsum == (double) sum, "qwsum is not the sum of the rounded query");
+		CHECK(fabs(q.varq8 - e2 / D) <= 1e-9 * (e2 / D),
+			  "varq8 is not the rounding's mean square error");
+		CHECK(q.varq8 <= q.qwdelta * q.qwdelta / 4 * (1 + 1e-9),
+			  "varq8 is more than a quarter of a step's square");
+		CHECK(fabs(q.qw0 - (-4.0 + 1.0 / 64) * (D * q.qmid + q.qwdelta * (double) sum)) <=
+			  1e-12 * 4 * (D * fabs(q.qmid) + q.qwdelta * abssum),
+			  "qw0 is not the query's part of the 8-bit estimate");
+		if (kind == 2)
+			CHECK(q.qw[big] == -32767 && q.qwdelta > 15.0,
+				  "a coordinate of a million below the rest is not the range's");
+
+		/* without qw: the same query, unrounded */
+		{
+			LionVecQuery with = q;
+			int16	   *qw = q.qw;
+
+			memcpy(qc0, q.qc, sizeof(float) * D);
+			memcpy(planes0, q.planes, sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+			q.qw = NULL;
+			lionvec_query_init(&q, metric, mean, x, 3.0);
+			CHECK(memcmp(q.qc, qc0, sizeof(float) * D) == 0 &&
+				  memcmp(q.planes, planes0, sizeof(uint64) * (D / 64) * LIONVEC_QBITS) == 0 &&
+				  memcmp(&q.qlo, &with.qlo, sizeof(double)) == 0 &&
+				  memcmp(&q.qdelta, &with.qdelta, sizeof(double)) == 0 &&
+				  memcmp(&q.qsum, &with.qsum, sizeof(double)) == 0 &&
+				  memcmp(&q.qnorm2, &with.qnorm2, sizeof(double)) == 0 &&
+				  memcmp(&q.var1, &with.var1, sizeof(double)) == 0 &&
+				  memcmp(&q.varq, &with.varq, sizeof(double)) == 0 &&
+				  memcmp(&q.eps, &with.eps, sizeof(double)) == 0 &&
+				  memcmp(&q.offset, &with.offset, sizeof(double)) == 0,
+				  "without qw, the rest of the query is not the same");
+			CHECK(q.varq8 == 0.0 && q.qmid == 0.0 && q.qwdelta == 0.0 &&
+				  q.qwsum == 0.0 && q.qw0 == 0.0, "without qw, the query is rounded");
+			q.qw = qw;
+		}
+	}
+
+	/* constant queries, of no mean so that each qc_i is exactly c: all 0s */
+	for (k = 0; k < 3; k++)
+	{
+		float		c = k == 0 ? 0.0f : k == 1 ? 0.375f : -2.5e10f;
+		bool		ok = true;
+
+		for (i = 0; i < D; i++)
+			x[i] = c;
+		lionvec_query_init(&q, LIONVEC_L2, NULL, x, 3.0);
+		for (i = 0; i < D; i++)
+			ok &= q.qw[i] == 0;
+		CHECK(ok && q.qwdelta == 1.0 && q.qmid == c && q.varq8 == 0.0 && q.qwsum == 0.0 &&
+			  q.qw0 == (-4.0 + 1.0 / 64) * ((double) D * c),
+			  "a constant query is not rounded to 0s, a step of 1 and no error");
+	}
+
+	rng_state = saved;
+	query_free(&q);
+	free(mean);
+	free(x);
+	free(qc0);
+	free(planes0);
 }
 
 /* ---------- the kernels ---------- */
@@ -685,11 +853,84 @@ rnd_float(int kind)
 }
 
 /*
+ * lionvec_dot8()'s inputs: the codes random, all 0 or all 255; w random
+ * over the rounded query's range, -32767 .. 32767, all 32767, all -32767,
+ * all -32768 - which no query takes, but which the kernels' blocks are
+ * sized for (lion_vec_math.c) - or those three mixed.  With all 255, the
+ * largest sums of either sign, 255 * 32767 * dimsp and beyond, go through
+ * every block.
+ */
+#define DOT8_CODES		3
+#define DOT8_WS			5
+#define DOT8_CASES		(DOT8_CODES * DOT8_WS)
+
+/*
+ * lionvec_dot8() at dimsp D under the set forced, on each of the inputs:
+ * the sum of the products and the sum of the codes against a plain int64
+ * loop.  The codes are D / 64 mod 32 bytes off malloc's alignment, as the
+ * other sums' are, and w 7 D / 64 mod 16 int16s off it, so that over the
+ * dimsps each walks every alignment against a 32-byte vector, and the two
+ * do not walk in step; each buffer ends where its input does, so that an
+ * over-read is a sanitizer's error.  The inputs come from a generator
+ * seeded by D alone; res holds the portable set's results, two a case,
+ * which another set's must equal - integers, so to the bit.
+ */
+static void
+dot8_check(int which, int D, int64 *res, bool *ok, bool *same)
+{
+	static const int16 extremes[3] = {32767, -32767, -32768};
+	int			off = (D / 64) % 32;
+	int			woff = (D / 64 * 7) % 16;
+	uint8	   *codesbuf = (uint8 *) xmalloc(D + off);
+	int16	   *wbuf = (int16 *) xmalloc(sizeof(int16) * (D + woff));
+	uint8	   *codes = codesbuf + off;
+	int16	   *w = wbuf + woff;
+	uint64		saved = rng_seed(RNG_SEED(UINT64CONST(0xD1B54A32D192ED03), D));
+	int			cc;
+	int			cw;
+	int			i;
+
+	for (cc = 0; cc < DOT8_CODES; cc++)
+	{
+		for (cw = 0; cw < DOT8_WS; cw++)
+		{
+			int64	   *r = res + 2 * (cc * DOT8_WS + cw);
+			int64		ref = 0;
+			int64		refc = 0;
+			int64		sumc = -1;
+			int64		dot;
+
+			for (i = 0; i < D; i++)
+			{
+				codes[i] = cc == 0 ? (uint8) rnd64() : cc == 1 ? 0 : 255;
+				w[i] = cw == 0 ? (int16) ((int) (rnd64() % 65535) - 32767) :
+					cw < 4 ? extremes[cw - 1] : extremes[rnd64() % 3];
+				ref += (int64) codes[i] * w[i];
+				refc += codes[i];
+			}
+			dot = lionvec_dot8(codes, w, D, &sumc);
+			*ok &= dot == ref && sumc == refc;
+			if (which == LIONVEC_KERNELS_PORTABLE)
+			{
+				r[0] = dot;
+				r[1] = sumc;
+			}
+			else
+				*same &= dot == r[0] && sumc == r[1];
+		}
+	}
+	rng_state = saved;
+	free(codesbuf);
+	free(wbuf);
+}
+
+/*
  * Every kernel the build and CPU have, against a reference: plane 1's
  * against a bit-at-a-time count; the sums against lanes_reference(), to
- * the bit; the rotation against the portable kernel's, to the bit.  At
- * every dimsp an index takes, from pointers at every alignment the
- * kernels' loads could straddle.
+ * the bit; the 8-bit codes' integer sums against plain ones and the
+ * portable set's (dot8_check()); the rotation against the portable
+ * kernel's, to the bit.  At every dimsp an index takes, from pointers at
+ * every alignment the kernels' loads could straddle.
  */
 static void
 test_kernels(void)
@@ -698,6 +939,9 @@ test_kernels(void)
 	int			ran = 0;
 	char		names[128] = "";
 	long		draws;
+	int64	   *dot8_res = (int64 *) xmalloc(sizeof(int64) * 2 * DOT8_CASES *
+											 (TEST_MAX_DIMSP / 64));
+	int			dot8_dims = 0;
 
 	cur_phase = "kernels";
 	swap_rng();
@@ -723,6 +967,8 @@ test_kernels(void)
 		bool		l2_near = true;
 		bool		sum8_near = true;
 		bool		rot_ok = true;
+		bool		dot8_ok = true;
+		bool		dot8_same = true;
 
 		if (!lionvec_kernel_force(which))
 		{
@@ -828,6 +1074,10 @@ test_kernels(void)
 				free(y);
 				free(rot.signs);
 			}
+
+			dot8_check(which, D, dot8_res + (Size) (D / 64 - 1) * 2 * DOT8_CASES,
+					   &dot8_ok, &dot8_same);
+			dot8_dims++;
 			free(codesbuf);
 			free(qcbuf);
 			free(bbuf);
@@ -839,9 +1089,15 @@ test_kernels(void)
 		CHECK(l2_ok, "an l2sq differs from the lanes' sum");
 		CHECK(l2_near, "an l2sq is not near the plain sum");
 		CHECK(rot_ok, "a rotation differs from the portable one");
+		CHECK(dot8_ok, "an 8-bit integer sum differs from the plain one");
+		CHECK(dot8_same, "an 8-bit integer sum differs from the portable set's");
 	}
 	CHECK(ran >= 1, "no kernel ran");
+	CHECK(dot8_dims == ran * (TEST_MAX_DIMSP / 64), "lionvec_dot8() missed a dimsp");
 	printf("vec_test: kernels tested: %s\n", names);
+	printf("vec_test: lionvec_dot8() at %d dimsps, 64 to %d, under each set: %d inputs each\n",
+		   dot8_dims / Max(ran, 1), TEST_MAX_DIMSP, DOT8_CASES);
+	free(dot8_res);
 	lionvec_kernels_init();
 	swap_rng();
 
@@ -853,6 +1109,185 @@ test_kernels(void)
 	 */
 	for (draws = 0; draws < 2 * 107 * 693; draws++)
 		(void) rnd64();
+}
+
+/*
+ * lionvec_estimate8()'s algebra under every set of kernels.  Its estimate
+ * is |x| <r, q^> / (|r| alpha8), r the codes' reconstructions and q^ the
+ * query as lionvec_query_init() rounds it, q^_i = qmid + qwdelta qw_i:
+ * against that sum taken serially here, to within 1e-9 and what the
+ * affine formula's own rounding can add - a few units in the last place of
+ * its terms, each at most 8 sum(|qmid| + qwdelta |qw_i|).  And within the
+ * rounding's reach of the floats' estimate, from lionvec_sum8(): each
+ * |r_i| is below 4 and each |qc_i - q^_i| at most half a step.  Its error
+ * is 2 eps |x| / alpha8 sqrt(var1 (1 - alpha8^2) + varq8), not less than
+ * without varq8.  And every set's estimates and errors are the portable
+ * set's, to the bit.
+ *
+ * At four dimsps, for queries centred, off centre, narrow and negative,
+ * constant (max == min) and with one coordinate so large that nearly every
+ * other rounds to the same integer; for rows of three spreads, one near the
+ * query and one at the mean.  The inputs come from a generator seeded by
+ * the dimsp alone, so that every set sees the same.
+ */
+#define E8_QUERIES		5
+#define E8_ROWS			5
+
+static void
+test_estimate8(void)
+{
+	static const int dims[] = {64, 320, 1536, TEST_MAX_DIMSP};
+	int			nd = (int) lengthof(dims);
+	double	   *res0 = (double *) xmalloc(sizeof(double) * 2 * nd * E8_QUERIES * E8_ROWS);
+	double		worst_alg = 0.0;
+	double		worst_near = 0.0;
+	int			which;
+	int			ran = 0;
+	int			nest = 0;
+
+	cur_phase = "estimate8";
+	for (which = 0; which <= LIONVEC_KERNELS_MAX; which++)
+	{
+		bool		alg_ok = true;
+		bool		near_ok = true;
+		bool		err_ok = true;
+		bool		same = true;
+		bool		shape_ok = true;
+		int			t;
+
+		if (!lionvec_kernel_force(which))
+			continue;
+		ran++;
+		nest = 0;
+		for (t = 0; t < nd; t++)
+		{
+			int			D = dims[t];
+			float	   *mean = falloc(D);
+			float	   *qx = falloc(D);
+			float	   *x = falloc(D);
+			LionVecQuery q;
+			EncBufs		b;
+			uint64		saved = rng_seed(RNG_SEED(UINT64CONST(0x6A09E667F3BCC909), D));
+			int			k;
+			int			j;
+			int			i;
+
+			query_alloc(&q, D);
+			enc_alloc(&b, D);
+			for (i = 0; i < D; i++)
+				mean[i] = (float) (rnd_gauss() * 0.2);
+			for (k = 0; k < E8_QUERIES; k++)
+			{
+				int			big = (int) (rnd64() % D);
+
+				/*
+				 * qc Gaussian; off centre by 3; narrow and negative; 0.375
+				 * throughout, with no mean, which would round in being taken
+				 * off; Gaussian but for one coordinate of a million
+				 */
+				for (i = 0; i < D; i++)
+				{
+					double		g = rnd_gauss();
+
+					qx[i] = k == 0 ? (float) (mean[i] + g) :
+						k == 1 ? (float) (mean[i] + 3.0 + 0.5 * g) :
+						k == 2 ? (float) (mean[i] - 0.25 + 0.01 * g) :
+						k == 3 ? 0.375f :
+						(float) (mean[i] + (i == big ? 1e6 : g));
+				}
+				lionvec_query_init(&q, LIONVEC_L2, k == 3 ? NULL : mean, qx, 3.0);
+				if (k == 3)
+					shape_ok &= q.qmid == 0.375 && q.qwdelta == 1.0 && q.qwsum == 0.0;
+				else if (k == 4)
+				{
+					int			nmin = 0;
+
+					for (i = 0; i < D; i++)
+						nmin += q.qw[i] == -32767;
+					shape_ok &= nmin >= D * 9 / 10 && q.qw[big] == 32767;
+				}
+
+				for (j = 0; j < E8_ROWS; j++)
+				{
+					double	   *r0 = res0 + 2 * ((t * E8_QUERIES + k) * E8_ROWS + j);
+					double		est;
+					double		err;
+					double		sref = 0.0;
+					double		mag = 0.0;
+					double		a;
+					double		miss;
+					double		scale;
+					double		eref;
+					double		s8;
+					double		ef;
+					double		reach;
+					double		errref;
+					double		err0;
+
+					/* spreads of 0.05, 0.1 and 0.15; near the query; the mean */
+					for (i = 0; i < D; i++)
+						x[i] = j < E8_ROWS - 2 ? (float) (mean[i] + rnd_gauss() * 0.05 * (1 + j)) :
+							j == E8_ROWS - 2 ? (float) (mean[i] + 0.5 * q.qc[i] + 0.05 * rnd_gauss()) :
+							mean[i];
+					lionvec_encode(mean, D, x, &b.e);
+					lionvec_estimate8(&q, b.codes, b.e.norm, b.e.alpha8, b.e.rnorm8,
+									  &est, &err);
+
+					for (i = 0; i < D; i++)
+					{
+						sref += (double) lionvec_recon8[b.codes[i]] *
+							(q.qmid + q.qwdelta * q.qw[i]);
+						mag += fabs(q.qmid) + q.qwdelta * abs(q.qw[i]);
+					}
+					a = Max((double) b.e.alpha8, 1e-6);
+					miss = Max(1.0 - a * a, 0.0);
+					scale = b.e.rnorm8 > 0.0f ? b.e.norm / (b.e.rnorm8 * a) : 0.0;
+					eref = scale * sref;
+					alg_ok &= fabs(est - eref) <= 1e-9 * fabs(eref) + 1e-12 * scale * mag;
+					if (eref != 0.0)
+						worst_alg = Max(worst_alg, fabs(est - eref) / fabs(eref));
+
+					s8 = lionvec_sum8(b.codes, q.qc, D);
+					ef = b.e.rnorm8 > 0.0f ? b.e.norm * s8 / (b.e.rnorm8 * a) : 0.0;
+					reach = scale * 4.0 * D * q.qwdelta / 2;
+					near_ok &= fabs(est - ef) <= reach + scale * 1e-9 * fabs(s8);
+					if (reach > 0.0)
+						worst_near = Max(worst_near, fabs(est - ef) / reach);
+
+					errref = 2.0 * q.eps * b.e.norm / a * sqrt(q.var1 * miss + q.varq8);
+					err0 = 2.0 * q.eps * b.e.norm / a * sqrt(q.var1 * miss);
+					err_ok &= fabs(err - errref) <= 1e-12 * errref && err >= err0;
+
+					if (which == LIONVEC_KERNELS_PORTABLE)
+					{
+						r0[0] = est;
+						r0[1] = err;
+					}
+					else
+						same &= memcmp(&est, &r0[0], sizeof(double)) == 0 &&
+							memcmp(&err, &r0[1], sizeof(double)) == 0;
+					nest++;
+				}
+			}
+			rng_state = saved;
+			query_free(&q);
+			enc_free(&b);
+			free(mean);
+			free(qx);
+			free(x);
+		}
+		CHECK(alg_ok, "an 8-bit estimate is not |x| <r, q^> / (|r| alpha8)");
+		CHECK(near_ok, "an 8-bit estimate is beyond the rounding's reach of the floats'");
+		CHECK(err_ok, "an 8-bit estimate's error is not 2 eps |x| / alpha8 sqrt(var1 miss + varq8)");
+		CHECK(shape_ok, "a constant query, or one of a wide range, is rounded otherwise");
+		if (which != LIONVEC_KERNELS_PORTABLE)
+			CHECK(same, "a kernel set's 8-bit estimates differ from the portable set's");
+	}
+	lionvec_kernels_init();
+	printf("vec_test: lionvec_estimate8(): %d estimates under each of %d sets: at most %.1e "
+		   "of <r, q^> off it, %.1e of the rounding's reach off the floats'\n",
+		   nest, ran, worst_alg, worst_near);
+	free(res0);
 }
 
 /* ---------- a halfvec's halves, and pgvector's datums ---------- */
@@ -4073,7 +4508,9 @@ main(void)
 	test_prepare();
 	test_encode();
 	test_query();
+	test_query_rounding();
 	test_kernels();
+	test_estimate8();
 	test_halves();
 	test_datums();
 	test_bounds_nan();

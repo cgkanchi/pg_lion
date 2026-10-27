@@ -25,17 +25,20 @@
  *		 quantized to QB_BITS bits by popcounts;
  *	  3. what a refine's sums cost - lionvec_sum8(), planes 2 to m both
  *		 ways, and for comparison the bytes against a query rounded to
- *		 16-bit integers - under each implementation the CPU runs: warm, from
- *		 a pool of rows past the L2, and with their lines flushed first
- *		 (--costs: this part alone).
+ *		 16-bit integers, the evaluation's and lionvec_dot8(), which
+ *		 lionvec_estimate8() runs - under each implementation the CPU runs:
+ *		 warm, from a pool of rows past the L2, and with their lines flushed
+ *		 first (--costs: this part alone).
  *
  *	  The kernels here (the masked sums, the integer dot) are the
  *	  evaluation's, each checked against its portable form; none is
- *	  lionvec's.  make vecplanes-eval PG_CONFIG=... builds it at -O2 and
- *	  runs it; --quick runs smaller data.  It prints what it measured; it
- *	  checks only that the prefix of all eight planes is the codes' own
- *	  estimate, that its kernels agree with their portable forms, and that
- *	  the prefixes' bounds are calibrated, and exits 1 if not.
+ *	  lionvec's, but lionvec_dot8() is checked against the integer dot's
+ *	  portable form too.  make vecplanes-eval PG_CONFIG=... builds it at -O2
+ *	  and runs it; --quick runs smaller data.  It prints what it measured;
+ *	  it checks only that the prefix of all eight planes is the codes' own
+ *	  estimate, and lionvec_estimate8()'s but for its query's rounding, that
+ *	  the kernels agree with their portable forms, and that the prefixes'
+ *	  bounds are calibrated, and exits 1 if not.
  *-------------------------------------------------------------------------
  */
 #include "c.h"
@@ -499,6 +502,7 @@ query_alloc(Query *Q, int D)
 	Q->q.dimsp = D;
 	Q->q.qc = falloc(D);
 	Q->q.planes = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * LIONVEC_QBITS);
+	Q->q.qw = (int16 *) xmalloc(sizeof(int16) * D);
 	Q->qd = (double *) xmalloc(sizeof(double) * D);
 	Q->qb = (uint64 *) xmalloc(sizeof(uint64) * (D / 64) * QB_BITS);
 	Q->qw = (int16 *) xmalloc(sizeof(int16) * D);
@@ -509,6 +513,7 @@ query_free(Query *Q)
 {
 	free(Q->q.qc);
 	free(Q->q.planes);
+	free(Q->q.qw);
 	free(Q->qd);
 	free(Q->qb);
 	free(Q->qw);
@@ -656,6 +661,9 @@ eval_prefixes(const Rows *r, const float *mean, const float *qx, int nq, int met
 	long		outq[NPLANES + 1][3] = {{0}};
 	long		n = 0;
 	double		maxdiff = 0.0;
+	double		maxround = 0.0;
+	double		maxreach = 0.0;
+	bool		round_ok = true;
 	int			i;
 	int			j;
 	int			m;
@@ -682,18 +690,43 @@ eval_prefixes(const Rows *r, const float *mean, const float *qx, int nq, int met
 		query_init(&Q, metric, mean, qx + (Size) j * r->D, 1.0);
 		for (i = 0; i < r->n; i++)
 		{
+			const uint8 *codes = r->codes + (Size) i * r->D;
+			double		a8 = Max((double) r->alpha[(Size) i * 9 + 8], 1e-6);
+			double		rn8 = r->rnorm[(Size) i * 9 + 8];
+			double		scale8 = rn8 > 0.0 ? r->norm[i] / (rn8 * a8) : 0.0;
 			double		ip = 0.0;
+			double		reach = 0.0;
 			double		e8;
 			double		err8;
+			double		ef8;
 			int			d;
 
 			for (d = 0; d < r->D; d++)
+			{
 				ip += (double) r->xc[(Size) i * r->D + d] * Q.qd[d];
+				reach += fabs((double) lionvec_recon8[codes[d]]) *
+					fabs(Q.qd[d] - (Q.q.qmid + Q.q.qwdelta * Q.q.qw[d]));
+			}
+			reach *= scale8;
 			prefix_estimates(r, i, &Q, &P);
-			lionvec_estimate8(&Q.q, r->codes + (Size) i * r->D, r->norm[i],
+			lionvec_estimate8(&Q.q, codes, r->norm[i],
 							  r->alpha[(Size) i * 9 + 8], r->rnorm[(Size) i * 9 + 8],
 							  &e8, &err8);
-			maxdiff = Max(maxdiff, fabs(P.estf[8] - e8) / Max(fabs(err8), 1e-30));
+
+			/*
+			 * The codes' estimate from the floats, as lionvec_estimate8()
+			 * made it before it rounded the query to 16 bits; and its own,
+			 * which the rounding moves by <r, qc - q^> |x| / (|r| alpha8),
+			 * a few thousandths of its error and never more than the
+			 * rounding's reach, sum |r_i| |qc_i - q^_i| |x| / (|r| alpha8).
+			 */
+			ef8 = rn8 > 0.0 ?
+				r->norm[i] * lionvec_sum8(codes, Q.q.qc, r->D) / (rn8 * a8) : 0.0;
+			maxdiff = Max(maxdiff, fabs(P.estf[8] - ef8) / Max(fabs(err8), 1e-30));
+			maxround = Max(maxround, fabs(P.estf[8] - e8) / Max(fabs(err8), 1e-30));
+			if (reach > 0.0)
+				maxreach = Max(maxreach, fabs(P.estf[8] - e8) / reach);
+			round_ok &= fabs(P.estf[8] - e8) <= reach + 1e-6 * fabs(err8);
 			for (m = 2; m <= NPLANES; m++)
 			{
 				int			s;
@@ -708,9 +741,12 @@ eval_prefixes(const Rows *r, const float *mean, const float *qx, int nq, int met
 		}
 	}
 	query_free(&Q);
-	printf("  the prefix's sum at 8 planes against lionvec_estimate8(): at most %.2e of its own error\n",
+	printf("  the prefix's sum at 8 planes against the codes' from the floats (lionvec_sum8()): at most %.2e of its own error\n",
 		   maxdiff);
 	CHECK(maxdiff < 1e-6, "eight planes are not the codes' estimate");
+	printf("  the prefix's sum at 8 planes against lionvec_estimate8(): at most %.2e of its own error, %.3f of the 16-bit query's reach\n",
+		   maxround, maxreach);
+	CHECK(round_ok, "eight planes are not lionvec_estimate8()'s but for its query's rounding");
 	printf("  outside 1, 2, 3 sd (the Gaussian's 0.3173, 0.0455, 0.0027), floats | %d-bit query:\n",
 		   QB_BITS);
 	for (m = 2; m <= NPLANES; m++)
@@ -1161,7 +1197,7 @@ fence(void)
 
 enum
 {
-	T_SUM8, T_DOT4, T_QUANT, T_FLOAT, T_INT16
+	T_SUM8, T_DOT4, T_QUANT, T_FLOAT, T_INT16, T_DOT8
 };
 
 enum
@@ -1172,7 +1208,9 @@ enum
 /*
  * One refine's sums: the codes' (T_SUM8), or planes 2 .. upto, popcounts
  * of the quantized query (T_QUANT) or masked float sums (T_FLOAT); T_DOT4,
- * plane 1's own popcounts, for scale.
+ * plane 1's own popcounts, for scale; and the codes against the query
+ * rounded to 16-bit integers, the evaluation's integer dot (T_INT16) and
+ * lionvec_dot8() (T_DOT8), which lionvec_estimate8() runs.
  */
 static inline double
 one_refine(int what, const uint8 *codes, const uint64 *planes, int upto,
@@ -1195,6 +1233,12 @@ one_refine(int what, const uint8 *codes, const uint64 *planes, int upto,
 			return s;
 		case T_INT16:
 			return (double) idot16(codes, Q->qw, D);
+		case T_DOT8:
+			{
+				int64		sc;
+
+				return (double) lionvec_dot8(codes, Q->q.qw, D, &sc);
+			}
 		case T_FLOAT:
 			for (p = 2; p <= upto; p++)
 				s += psum(planes + (p - 1) * nw, Q->qd, nw);
@@ -1256,7 +1300,7 @@ time_refine(int what, int mode, const Rows *R, int upto, const Query *Q,
 
 				if (mode == M_FLUSHED)
 				{
-					if (what == T_SUM8 || what == T_INT16)
+					if (what == T_SUM8 || what == T_INT16 || what == T_DOT8)
 						flush_lines(c, D);
 					else if (what != T_DOT4)
 						flush_lines(pl + nw, sizeof(uint64) * nw * (upto - 1));
@@ -1296,6 +1340,7 @@ eval_costs(int D)
 		{T_QUANT, 6, "quantized, planes 2-6"},
 		{T_QUANT, 8, "quantized, planes 2-8"},
 		{T_INT16, 8, "bytes, 16-bit query"},
+		{T_DOT8, 8, "lionvec_dot8()"},
 		{T_FLOAT, 2, "floats, plane 2"},
 		{T_FLOAT, 4, "floats, planes 2-4"},
 		{T_FLOAT, 8, "floats, planes 2-8"},
@@ -1360,6 +1405,17 @@ eval_costs(int D)
 			CHECK(idot16(R.codes + (Size) i * D, Q.qw, D) ==
 				  idot16_portable(R.codes + (Size) i * D, Q.qw, D),
 				  "an integer dot is not the portable one's");
+			{
+				const uint8 *codes = R.codes + (Size) i * D;
+				int64		sc = -1;
+				int64		scref = 0;
+
+				for (d = 0; d < D; d++)
+					scref += codes[d];
+				CHECK(lionvec_dot8(codes, Q.q.qw, D, &sc) ==
+					  idot16_portable(codes, Q.q.qw, D) && sc == scref,
+					  "lionvec_dot8() is not the portable integer dot, or its sum not the codes'");
+			}
 		}
 		for (c = 0; c < (int) lengthof(calls); c++)
 		{

@@ -877,6 +877,7 @@ test_lionvec(void)
 			q.dimsp = dimsp;
 			q.qc = (float *) xmalloc(dimsp * sizeof(float));
 			q.planes = (uint64 *) xmalloc((dimsp / 64) * LIONVEC_QBITS * sizeof(uint64));
+			q.qw = NULL;
 			for (d = 0; d < dimsp; d++)
 			{
 				/* sums of uniforms: Gaussian enough, and some of one sign */
