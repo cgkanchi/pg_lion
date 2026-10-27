@@ -1,5 +1,6 @@
--- Damage a lionvec insert would have carried on with: an ERROR before it
--- locks the wrong page or writes, never a wait for ever or a PANIC.
+-- Damage a lionvec insert or scan would have carried on with: an ERROR
+-- before it locks the wrong page, writes, or reads past a page, never a wait
+-- for ever or a PANIC.
 --
 -- 1. A meta page whose chain end, or whose refine_tail, names the meta page
 --    itself.  An insert holds the meta page EXCLUSIVE from its first page to
@@ -13,6 +14,11 @@
 --    no items and room to spare: the next NULL row was added to it in a
 --    GenericXLog copy, where PageAddItemExtended() PANICked
 --    (lionvec_check_page()).
+-- 3. A row's REFINE item whose line pointer's offset lies past the page,
+--    its length right.  lionvec_refine_at() checked the length but not the
+--    place, which lionvec_item_ok() checks of a PART or REGION item, and a
+--    scan read the item - its header, then its codes - from whatever memory
+--    follows the page: an offset goes up to 32,767.
 --
 -- As in test/sql/corrupt_records.sql, the pages are damaged ON DISK and read
 -- back from there by moving the index to another tablespace, which copies
@@ -136,6 +142,29 @@ SELECT get_byte(p, 12) | (get_byte(p, 13) << 8) > 24 AS has_items
 SELECT lion_vr_poke('lion_vr_i', :lion_vr_tail, 12, '\x0000'::bytea);
 SELECT lion_vr_reread('lion_vr_i');
 SELECT lion_vr_try('INSERT INTO lion_vr VALUES (100, NULL)');
+DROP INDEX lion_vr_i;
+
+-- ---------- 3. a REFINE item past its page ----------
+-- Row 7's, on refine_tail's page (it holds every one of these rows'), its
+-- line pointer (4 bytes from byte 24 on: the offset in the low 15 bits, the
+-- length in the high 15) given the block size as its offset; a scan ordered
+-- by row 7's vector refines it.
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_flush('lion_vr_i');
+SELECT lion_vr_u32(lion_vr_block('lion_vr_i', 0), 76) AS lion_vr_tail \gset
+SELECT 20 + 4 * i AS lion_vr_lp, lp AS lion_vr_lpv
+  FROM lion_vr_block('lion_vr_i', :lion_vr_tail) p,
+	   generate_series(1, ((lion_vr_u32(p, 12) & 65535)::int - 24) / 4) i,
+	   LATERAL (SELECT lion_vr_u32(p, 20 + 4 * i) AS lp) l,
+	   LATERAL (SELECT (lp & 32767)::int AS o) io
+ WHERE format('(%s,%s)', (lion_vr_u32(p, o) >> 16) | ((lion_vr_u32(p, o) & 65535) << 16),
+			  lion_vr_u32(p, o + 4) & 65535)::tid = (SELECT ctid FROM lion_vr WHERE id = 7) \gset
+SELECT lion_vr_poke('lion_vr_i', :lion_vr_tail, :lion_vr_lp,
+					lion_vr_le32(((:lion_vr_lpv >> 15) << 15) | current_setting('block_size')::int));
+SELECT lion_vr_reread('lion_vr_i');
+SET enable_seqscan = off;
+SELECT lion_vr_try($$SELECT id FROM lion_vr ORDER BY v <-> '[7,0,1]' LIMIT 1$$);
+RESET enable_seqscan;
 DROP INDEX lion_vr_i;
 
 -- ---------- an undamaged index still works ----------
