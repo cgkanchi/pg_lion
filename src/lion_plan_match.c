@@ -851,8 +851,15 @@ lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
 	 */
 	if (kind == LION_CLAUSE_RANGE || kind == LION_CLAUSE_RANGESRC)
 	{
-		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
-														  idx->opfamily[i])))
+		/*
+		 * ... and a range taken as a source may have a hole, `<>` (§35),
+		 * which a build that answers ranges from slices makes one of
+		 * (§53).
+		 */
+		StrategyNumber s = get_op_opfamily_strategy(opno, idx->opfamily[i]);
+
+		if (!(LION_STRAT_IS_RANGE(s) ||
+			  (kind == LION_CLAUSE_RANGESRC && s == LION_STRAT_NE)))
 			return false;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 										  cmptype, LION_CMP_PROC)))

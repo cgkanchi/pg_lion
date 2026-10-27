@@ -2007,6 +2007,7 @@ extern PGDLLIMPORT bool lion_enable_topk;
 extern PGDLLIMPORT bool lion_enable_count_slices;
 extern PGDLLIMPORT bool lion_enable_slice_decode;
 extern PGDLLIMPORT bool lion_enable_slice_ranges;
+extern PGDLLIMPORT bool lion_prefer_slice_ranges;
 extern PGDLLIMPORT create_upper_paths_hook_type lion_prev_create_upper_paths_hook;
 
 extern void lion_count_scan_register(void);
