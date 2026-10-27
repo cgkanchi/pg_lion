@@ -1101,6 +1101,19 @@ typedef struct LionVColScope
 #define LION_POSTREE_SEEK_LEVELS	2.0
 
 /*
+ * A range from a sliced column's slices (DESIGN.md §53, "Cost"): each
+ * container key of the existence slice E folded - E's container laid out at
+ * its width, the comparisons' images begun, the key's rows made a container
+ * and put in the copy - each step of a comparison there - a slice's
+ * container at the key found by its cursor and laid out at E's width - and
+ * each word a step folds, one or two word operations.  The slices' pages are
+ * lion_slice_read_cost()'s.  Fitted in §53's measurements.
+ */
+#define LION_SLICE_RANGE_KEY_COST	(lion_slice_range_key_cost * cpu_operator_cost)
+#define LION_SLICE_RANGE_STEP_COST	(lion_slice_range_step_cost * cpu_operator_cost)
+#define LION_SLICE_RANGE_WORD_COST	(lion_slice_range_word_cost * cpu_operator_cost)
+
+/*
  * A page of a lion index that a custom path reads while the index is
  * resident (lion_index_page_cost(), DESIGN.md §22, §39): a buffer hit,
  * pinned, locked and stepped through.  Measured on the release build (§10,
@@ -4045,6 +4058,9 @@ extern int	lion_wagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   int *argwidth);
 extern int	lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno,
 							   Oid *argtype);
+extern IndexOptInfo *lion_range_sliced_index(RelOptInfo *rel, AttrNumber attno,
+											 AttrNumber *colp, Oid *typid);
+extern bool lion_rel_has_sliced_index(RelOptInfo *rel);
 extern IndexOptInfo *lion_find_sliced_index(RelOptInfo *rel, AttrNumber attno,
 											AttrNumber *colp, Oid *typid);
 extern IndexOptInfo *lion_match_index(RelOptInfo *rel, AttrNumber attno,
@@ -4365,6 +4381,16 @@ typedef struct LionRangeMem
  * that the ranges in memory before it went to files to make room for it.
  */
 extern double lion_container_max_bytes(double tuples, double pages);
+/*
+ * ... and one collected from the slices of a sliced column (DESIGN.md §53),
+ * which the planner names by the first bound of each such range
+ * (lion_cost_set_sliced()) around its pricing of a build that has them.
+ */
+extern Cost lion_cost_slice_range(PlannerInfo *root, RelOptInfo *rel,
+								  IndexOptInfo *idx, AttrNumber col,
+								  List *bounds, Selectivity sel,
+								  LionRangeMem *mem, bool *spills);
+extern void lion_cost_set_sliced(List *clauses);
 extern Cost lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel,
 								   IndexOptInfo *idx, AttrNumber col,
 								   List *bounds, Selectivity sel,

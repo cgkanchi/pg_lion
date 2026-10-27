@@ -90,6 +90,9 @@ double		lion_slice_page_cost;
 double		lion_slice_gather_cost;
 double		lion_slice_decode_bit_cost;
 double		lion_slice_decode_row_cost;
+double		lion_slice_range_key_cost;
+double		lion_slice_range_step_cost;
+double		lion_slice_range_word_cost;
 double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
@@ -218,6 +221,14 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of reading one bit of a row's value off a sliced column's slice, in a lion GROUP BY decoding a batch of groups"},
 	{"pg_lion.slice_decode_row_cost", &lion_slice_decode_row_cost, 1.0, LION_OP,
 	 "Sets the planner's estimate of the cost of adding a row's value to its group's aggregates, in a lion GROUP BY decoding a batch of groups"},
+
+	/* lion_plan_cost.c: ranges from slices (§53) */
+	{"pg_lion.slice_range_key_cost", &lion_slice_range_key_cost, 800.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each container key of a sliced column's existence slice at which a lion range from its slices is folded and its rows collected"},
+	{"pg_lion.slice_range_step_cost", &lion_slice_range_step_cost, 60.0, LION_OP,
+	 "Sets the planner's estimate of the cost of each step of a lion range from a sliced column's slices: a slice's container at a key laid out and folded"},
+	{"pg_lion.slice_range_word_cost", &lion_slice_range_word_cost, 0.25, LION_OP,
+	 "Sets the planner's estimate of the cost of each 64-row word a step of a lion range from a sliced column's slices folds"},
 
 	/* lion_plan_fkjoin_cost.c: the FK-side join (§27) */
 	{"pg_lion.fkjoin_count_cost", &lion_fkjoin_count_cost, 14.0, LION_TUPLE,
