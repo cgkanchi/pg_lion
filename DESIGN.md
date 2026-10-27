@@ -26773,7 +26773,11 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   LOCDIR tail and a partition's tail that is its PART page, BEFORE the lock
   (`lionvec_insert_readbuf()`): a buffer content lock is not reentrant, and the second one waited
   for this very backend with interrupts held off, which only a restart of the server ended
-  (`test/sql/vector_corrupt_records.sql`).
+  (`test/sql/vector_corrupt_records.sql`). Every REFINE item lies inside its page's data, as a PART
+  or REGION item must (`lionvec_item_ok()`): `lionvec_refine_at()` checks its line pointer's offset
+  against `pd_upper` and its end against `pd_special` after its length and before the item's first
+  prefetch or read, where an offset past the page - up to 32,767 - had a scan read the item from
+  whatever memory follows it (the same file, 2026-10-27).
 
 ### 44.6 Filtered nearest neighbours (LionOrdered, lion_ordered.c)
 
@@ -28386,11 +28390,13 @@ that is not in shared buffers is read before they are issued.
   every history and damage that can make a place wrong (§44.13, "Tests"); and (2026-10-18) the
   plan a 1% filter gets by the exact path's price, in TOAST and inline (§44.7, "Exact path
   pricing").
-- **vector_corrupt_records.sql** (2026-10-18): an insert into an index whose meta page names
-  itself as the NULL chain's end and as `refine_tail`, which waited for its own lock for ever, and
-  into a CODE tail whose `pd_lower` is inside the page header, which PANICked: each an ERROR now
-  (§44.5, "Format checks"). On 16 too: the file is read back through `ALTER INDEX ... SET
-  TABLESPACE` (§3, 2026-10-18).
+- **vector_corrupt_records.sql** (2026-10-18): an insert into an index whose meta page names itself
+  as the NULL chain's end and as `refine_tail`, which waited for its own lock for ever, and into a
+  CODE tail whose `pd_lower` is inside the page header, which PANICked: each an ERROR now (§44.5,
+  "Format checks"); and (2026-10-27) a scan that refines a row whose REFINE item's line pointer puts
+  it past the page, its length right, which read the item from the memory after the page: an ERROR
+  before a byte of it is prefetched or read. On 16 too: the file is read back through `ALTER INDEX
+  ... SET TABLESPACE` (§3, 2026-10-18).
 - **test/modules/lion_hooktest/sql/oldsnapshot_vector.sql** (2026-10-18; `make hookcheck` on 16
   with pgvector, next to oldsnapshot.sql on its server started with `old_snapshot_threshold = 60`,
   §44.5): a plain order and a filtered one (no LionOrdered, and no error under `error`) planned as
