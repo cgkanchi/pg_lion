@@ -28,6 +28,9 @@
  *	  Plane 1 is compared with a query quantized to four bits a dimension,
  *	  as four more bit-planes, so that the inner product is popcounts of
  *	  ANDs; the rounding adds Delta^2 / 12 to the variance, Delta the step.
+ *	  The 8-bit codes are compared with the query rounded to 16-bit
+ *	  integers, a 65,534th of its range a step, so that the inner product
+ *	  is exact in integers; that rounding adds its own errors' variance too.
  *
  *	  A vector comes from pgvector's `vector`, whose elements are floats, or
  *	  its `halfvec`, whose elements are IEEE 754 binary16 halves and are
@@ -122,19 +125,28 @@ typedef struct LionVecEncoded
 
 /*
  * A query, prepared against one index: centred and rotated as the rows are,
- * and quantized for plane 1.
+ * quantized for plane 1, and rounded to 16-bit integers for the 8-bit codes
+ * - unless qw is NULL, which leaves it unrounded, for a caller that never
+ * calls lionvec_estimate8() on it (k-means, which prepares every sample row
+ * as a query in every iteration).
  */
 typedef struct LionVecQuery
 {
 	int			dimsp;
 	float	   *qc;				/* [dimsp], q - mean, rotated */
 	uint64	   *planes;			/* [dimsp / 64][LIONVEC_QBITS], interleaved */
+	int16	   *qw;				/* [dimsp], or NULL: the rounding's integers */
 	double		qlo;			/* the quantization: qc_i ~ qlo + qdelta * u_i */
 	double		qdelta;
 	double		qsum;			/* sum of the quantized qc_i */
+	double		qmid;			/* the rounding: qc_i ~ qmid + qwdelta * qw_i */
+	double		qwdelta;
+	double		qwsum;			/* sum of the qw_i, an integer */
+	double		qw0;			/* the query's own part of lionvec_estimate8() */
 	double		qnorm2;			/* |qc|^2 */
 	double		var1;			/* |qc|^2 / (dimsp - 1): the codes' variance factor */
 	double		varq;			/* the quantization's own variance, plane 1 only */
+	double		varq8;			/* the rounding's own variance, 8-bit codes only */
 	double		eps;			/* the bounds' width, in standard deviations */
 	double		offset;			/* key minus distance: lionvec_key_exact() */
 } LionVecQuery;
@@ -169,13 +181,22 @@ extern void lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *						query's codes, over nwords words of each: the
  *						weighted sum of lion_planes.c, of LIONVEC_QBITS
  *						interleaved planes
- *	lionvec_sum8		sum over i < dimsp of lionvec_recon8[codes[i]] qc[i]
+ *	lionvec_dot8		sum over i < dimsp of codes[i] w[i], and into *sumc
+ *						the sum over i < dimsp of codes[i], both exactly:
+ *						a row's 8-bit codes against the query rounded to
+ *						16-bit integers, which lionvec_estimate8() makes
+ *						<r, qc> of
+ *	lionvec_sum8		sum over i < dimsp of lionvec_recon8[codes[i]] qc[i]:
+ *						the codes against qc itself, in floating point - the
+ *						reference the unit test checks lionvec_dot8()'s
+ *						estimate by, which no scan or build runs
  *	lionvec_l2sq		sum over i < dimsp of (a[i] - b[i])^2
  *	lionvec_halves		x[i] = the float of the half h[i], i < n: a halfvec's
  *						elements, exactly, a NaN as the quiet NaN of its
  *						payload
  *
- * and the rotation's, inside lionvec_rotate().  The sums are in double, in
+ * and the rotation's, inside lionvec_rotate().  lionvec_dot8()'s sums are
+ * integers, exact in every kernel.  The others are in double, in
  * LIONVEC_LANES partial sums - the i-th term into partial i % LIONVEC_LANES
  * - added up in a fixed order, which every kernel keeps: each returns what
  * the portable one does, to the bit, as do the rotation's and the halves'
@@ -191,6 +212,8 @@ lionvec_plane_dot(const uint64 *bits, const uint64 *planes, int nwords)
 												LIONVEC_QBITS);
 }
 
+extern int64 lionvec_dot8(const uint8 *codes, const int16 *w, int dimsp,
+						  int64 *sumc);
 extern double lionvec_sum8(const uint8 *codes, const float *qc, int dimsp);
 extern double lionvec_l2sq(const float *a, const float *b, int dimsp);
 extern void lionvec_halves(const uint16 *h, int n, float *x);
