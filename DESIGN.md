@@ -31936,7 +31936,7 @@ walk of the filter's container keys whose heap blocks are counted from the visib
 0.76 million block counts for u4 at 1%, 2.3 million at 50%, 1.4 and 4.0 million for u8), and some
 30 to 50 candidate sets collected. So it is 3x to 8x faster at 10% and 50%, level at 1% for an int4,
 and slower at 1% for an int8, whose 128 descent steps cost more than the query's 50,000 rows. That
-is the cost the planner task has to weigh: (2 · nbits + 1) counts over the filter's container keys
+is the cost the planner task has to weigh: (3 · nbits + 1) counts over the filter's container keys
 against the filter's rows read, and only `sum` and `count` - 33 or 65 counts, no descent - where
 the query asks for no `min` or `max`.
 
@@ -32006,7 +32006,7 @@ a record; "Insert cost, revisited".)*
   lion_slice.c, over a `LionSliceRun` whose filter is `LionTextFilter`'s collected copy, so a
   LionCount plan, whose filter is its own sources, lifts them into an interface that takes a
   collected copy (or, on a standby, constraint lists) - and §51.11's numbers are what its cost
-  model has to weigh: (2 · nbits + 1) counts against the filter's rows. *(2026-10-26, §52: done
+  model has to weigh: (3 · nbits + 1) counts against the filter's rows. *(2026-10-26, §52: done
   for `count`, `sum`, `avg`, `min` and `max` under the node's WHERE and per group of a GROUP BY of
   one or two columns, through `LionSliceAgg` - the interface both the function and the node now
   use. Ranges on the sliced column and percentiles are still to do, §52.10.)*

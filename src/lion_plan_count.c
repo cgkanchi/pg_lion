@@ -4590,7 +4590,7 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 					  LionWalkSave *walksave, bool plain)
 {
 	PlannerInfo *root = cx->root;
-	List	   *sliced = NIL;
+	List	   *volatile sliced = NIL;
 
 	/*
 	 * The ranges this build answers from slices (DESIGN.md §53), by their
@@ -4614,62 +4614,75 @@ lion_count_path_price(LionCountPathBuild *cx, CustomPath *cpath,
 	lion_cost_set_sliced(sliced);
 
 	/*
-	 * Beside a GROUP BY, count(DISTINCT k) is the (g, k) nested loop of
-	 * DESIGN.md §20, g outer and k inner, and is priced as those pairs
-	 * (DESIGN.md §26); without one, k's entries are the "groups" of the walk.
+	 * Cleared on every way out, a cancellation inside the pricing included:
+	 * a later pricing of another build reads the static without setting it
+	 * (lion_cost_range_source()), and the list lives in this planning's
+	 * memory context.
 	 */
-	if (cx->decode)
-	{
-		lion_cost_decode_path(root, cpath, targets, cx->whereclauses,
-							  cx->wherekinds, cx->ors, cx->ngroup,
-							  cx->groupest, cx->numgroups, cx->outrows);
-		memset(rangeprice, 0, sizeof(LionRangeCost));
-	}
-	else if (cx->topkn > 0)
+	PG_TRY();
 	{
 		/*
-		 * The top k (DESIGN.md §36): a walk of every entry's header, and the
-		 * candidates counted - the largest entries, whose rows the column's
-		 * most common values say.
+		 * Beside a GROUP BY, count(DISTINCT k) is the (g, k) nested loop of
+		 * DESIGN.md §20, g outer and k inner, and is priced as those pairs
+		 * (DESIGN.md §26); without one, k's entries are the "groups" of the walk.
 		 */
-		lion_cost_topk_path(root, cpath, targets, cx->whereclauses,
-							cx->wherekinds, cx->ors, cx->groupest[0],
-							(cx->rangevar != NULL) ? cx->rangesel : 1.0,
-							(double) cx->topkcand, cx->topkrows,
-							Min(cx->outrows, (double) cx->topkcand));
-		memset(rangeprice, 0, sizeof(LionRangeCost));
+		if (cx->decode)
+		{
+			lion_cost_decode_path(root, cpath, targets, cx->whereclauses,
+								  cx->wherekinds, cx->ors, cx->ngroup,
+								  cx->groupest, cx->numgroups, cx->outrows);
+			memset(rangeprice, 0, sizeof(LionRangeCost));
+		}
+		else if (cx->topkn > 0)
+		{
+			/*
+			 * The top k (DESIGN.md §36): a walk of every entry's header, and the
+			 * candidates counted - the largest entries, whose rows the column's
+			 * most common values say.
+			 */
+			lion_cost_topk_path(root, cpath, targets, cx->whereclauses,
+								cx->wherekinds, cx->ors, cx->groupest[0],
+								(cx->rangevar != NULL) ? cx->rangesel : 1.0,
+								(double) cx->topkcand, cx->topkrows,
+								Min(cx->outrows, (double) cx->topkcand));
+			memset(rangeprice, 0, sizeof(LionRangeCost));
+		}
+		else if (plain)
+			lion_cost_count_path(root, cpath, targets, cx->whereclauses,
+								 cx->wherekinds, cx->ors, 1.0, 0, 0, cx->outrows,
+								 LION_DISTINCT_NONE, LION_RANGED_NONE, 1.0,
+								 rangeprice, walksave);
+		else
+			lion_cost_count_path(root, cpath, targets, cx->whereclauses,
+								 cx->wherekinds, cx->ors,
+								 cx->numgroups, cx->groupest[0],
+								 (cx->ngroup == 2) ? cx->groupest[1] :
+								 (cx->distvar != NULL && cx->ngroup == 1) ?
+								 cx->distest : 0,
+								 cx->outrows,
+								 (cx->distvar == NULL) ? LION_DISTINCT_NONE :
+								 cx->distcounts ? LION_DISTINCT_COUNT :
+								 LION_DISTINCT_EXISTS,
+								 (cx->rangevar == NULL) ?
+								 ((cx->sumall && cx->distvar == NULL) ?
+								  LION_RANGED_SUMALL :
+								  LION_RANGED_NONE) :
+								 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
+								 cx->rangesel, rangeprice, walksave);
+		/*
+		 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
+		 * after - or, with no count in the target list, instead of - the sum over
+		 * every row.
+		 */
+		if (cx->wattnos != NIL)
+			lion_cost_wagg_path(root, cpath, cx->input_rel, cx->widx, cx->wcols,
+								cx->wnaggs, cx->wcounts);
 	}
-	else if (plain)
-		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
-							 cx->wherekinds, cx->ors, 1.0, 0, 0, cx->outrows,
-							 LION_DISTINCT_NONE, LION_RANGED_NONE, 1.0,
-							 rangeprice, walksave);
-	else
-		lion_cost_count_path(root, cpath, targets, cx->whereclauses,
-							 cx->wherekinds, cx->ors,
-							 cx->numgroups, cx->groupest[0],
-							 (cx->ngroup == 2) ? cx->groupest[1] :
-							 (cx->distvar != NULL && cx->ngroup == 1) ?
-							 cx->distest : 0,
-							 cx->outrows,
-							 (cx->distvar == NULL) ? LION_DISTINCT_NONE :
-							 cx->distcounts ? LION_DISTINCT_COUNT :
-							 LION_DISTINCT_EXISTS,
-							 (cx->rangevar == NULL) ?
-							 ((cx->sumall && cx->distvar == NULL) ?
-							  LION_RANGED_SUMALL :
-							  LION_RANGED_NONE) :
-							 cx->sumall ? LION_RANGED_SUM : LION_RANGED_WALK,
-							 cx->rangesel, rangeprice, walksave);
-	/*
-	 * The aggregates over lion columns' entries (DESIGN.md §37): their walks,
-	 * after - or, with no count in the target list, instead of - the sum over
-	 * every row.
-	 */
-	if (cx->wattnos != NIL)
-		lion_cost_wagg_path(root, cpath, cx->input_rel, cx->widx, cx->wcols,
-							cx->wnaggs, cx->wcounts);
-	lion_cost_set_sliced(NIL);
+	PG_FINALLY();
+	{
+		lion_cost_set_sliced(NIL);
+	}
+	PG_END_TRY();
 	list_free(sliced);
 }
 

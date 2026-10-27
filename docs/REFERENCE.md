@@ -161,7 +161,7 @@ uncommitted rows, are what the query would see.
   not sliced (the error says which) - and a multi-key column.
 - A partial index answers for the rows it holds (`... WHERE <predicate> AND <filter>`). `SET
   client_min_messages = debug1` shows the slices counted and the descent's steps.
-- **Its cost** hardly depends on how many rows the filter keeps: 2 · bits + 1 counted ANDs (97 for
+- **Its cost** hardly depends on how many rows the filter keeps: 3 · bits + 1 counted ANDs (97 for
   an `int4`, 193 for an `int8`), each over the filter's containers. On 5 million rows it took 26 to
   52 ms, against 30 ms for the query at a 1% filter and 140 to 330 ms at 10% and 50% (DESIGN.md
   §51.11): a win from some 1% of the rows up, sooner for narrower types.
