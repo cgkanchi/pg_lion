@@ -324,10 +324,18 @@ lionvec_encode(const float *mean, int dimsp, float *x, LionVecEncoded *e)
 
 /*
  * Prepare q from the rotated query x[0 .. dimsp): q->qc must hold dimsp
- * floats and q->planes dimsp / 64 * LIONVEC_QBITS words, and q->dimsp be
- * set.  The quantization is uniform over qc's own range, rounded to the
- * nearest step; its variance in an estimate is what its errors actually are,
- * |e|^2 / dimsp, taken over a row's signs as if they were coin flips.
+ * floats, q->planes dimsp / 64 * LIONVEC_QBITS words and q->qw dimsp int16s,
+ * or be NULL (lion_vec_math.h), and q->dimsp be set.  The quantization is
+ * uniform over qc's own range, rounded to the nearest step; its variance in
+ * an estimate is what its errors actually are, |e|^2 / dimsp, taken over a
+ * row's signs as if they were coin flips.
+ *
+ * The rounding for the 8-bit codes (lionvec_estimate8()) is uniform over
+ * the same range, centred on its middle, qmid, in 65,534 steps of qwdelta,
+ * so that every qw_i is within +-32767: the nearest step, ties to even,
+ * clamped to that against the division's own rounding.  Its variance is
+ * its errors', as plane 1's quantization's is, and a 65,534th of the range
+ * is so fine that it is a hundred-thousandth or so of the codes' own.
  *
  * The sums are kept in locals and each word of the planes is assembled in
  * registers, its bits set without a branch: the build runs this for every
@@ -351,6 +359,10 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 	double		qsum = 0.0;
 	double		qlo;
 	double		qdelta;
+	double		qmid = 0.0;
+	double		qwdelta = 0.0;
+	double		ew2 = 0.0;
+	int64		qwsum = 0;
 	int			i;
 	int			w;
 
@@ -398,12 +410,43 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 		q->planes[w * LIONVEC_QBITS + 3] = p3;
 	}
 
+	if (q->qw != NULL)
+	{
+		const float *qc = q->qc;
+		int16	   *qw = q->qw;
+
+		qmid = (mx + mn) / 2;
+		qwdelta = mx > mn ? (mx - mn) / 65534 : 1.0;
+		for (i = 0; i < dimsp; i++)
+		{
+			double		c = qc[i];
+			double		t = (c - qmid) / qwdelta;
+			double		r;
+
+			/*
+			 * within +-32767 whatever the division rounds to; a NaN, which
+			 * no vector pgvector accepts has, to -32767
+			 */
+			t = Min(Max(t, -32767.0), 32767.0);
+			r = rint(t);
+			qw[i] = (int16) r;
+			qwsum += qw[i];
+			ew2 += (c - (qmid + qwdelta * r)) * (c - (qmid + qwdelta * r));
+		}
+	}
+
 	q->qnorm2 = qnorm2;
 	q->qlo = qlo;
 	q->qdelta = qdelta;
 	q->qsum = qsum;
+	q->qmid = qmid;
+	q->qwdelta = qwdelta;
+	q->qwsum = (double) qwsum;
+	q->qw0 = (-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8) *
+		((double) dimsp * qmid + qwdelta * (double) qwsum);
 	q->var1 = q->qnorm2 / (dimsp - 1);
 	q->varq = e2 / dimsp;
+	q->varq8 = ew2 / dimsp;
 	q->eps = eps;
 	if (metric == LIONVEC_L2)
 		q->offset = q->qnorm2;
@@ -420,7 +463,8 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  * (DESIGN.md §44.3, "Kernels"): plane 1's popcounts against the query's
  * planes, for every centroid of every query and every row a probe reads,
  * and, in k-means, every centroid for every sample row in every iteration;
- * the 8-bit codes' sum, for every centroid and row a scan refines; the
+ * the 8-bit codes' integer sums against the query rounded to 16 bits
+ * (lionvec_dot8()), for every centroid and row a scan refines; the
  * exact distances of k-means' candidates; and the rotation and, of a
  * halfvec, the conversion of its halves to floats, each once a query and
  * twice a row built.  Each has a portable kernel and, on x86-64, ones
@@ -435,10 +479,13 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *			portable
  *	AVX2	plane 1 a word's four planes in one vector against the row's
  *			word broadcast, each byte's popcount looked up a nibble at a
- *			time with VPSHUFB (Mula); the sums and the rotation four
- *			doubles or eight floats at a time; and, where the CPU has F16C
- *			as well, which AVX2 does not imply (lion_simd_f16c()), the
- *			halves eight at a time with VCVTPH2PS
+ *			time with VPSHUFB (Mula); the 8-bit codes' integer sums
+ *			sixteen codes at a time, widened to 16 bits and multiplied in
+ *			pairs with VPMADDWD, and added up with VPSADBW; the other
+ *			sums and the rotation four doubles or eight floats at a time;
+ *			and, where the CPU has F16C as well, which AVX2 does not
+ *			imply (lion_simd_f16c()), the halves eight at a time with
+ *			VCVTPH2PS
  *	AVX-512	AVX2's, but plane 1 counted with VPOPCNTDQ, a word's four
  *			planes in one instruction
  *
@@ -454,16 +501,23 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  *
  * Every kernel returns what the portable one does, to the bit, so that a
  * scan, a build and an insert decide alike whichever runs.  Plane 1's are
- * integer counts.  The sums are in double, of terms each kernel computes
- * with the same operations - the 8-bit codes' products are exact, a code's
- * reconstruction being a float and a float's product with a float a double
- * - added in LIONVEC_LANES partial sums, the i-th term into partial i %
- * LIONVEC_LANES, and those in a fixed tree (lionvec_lanes_sum()): the
- * portable kernels add in that order too.  The file is compiled with
- * -ffp-contract=off (the Makefile), for GCC and clang would otherwise fuse
- * a multiply and an add into one rounding wherever the target has fused
- * multiply-adds - the portable kernels built for aarch64 or x86-64-v3 -
- * and l2sq's terms, unlike the 8-bit codes', are not exact.  The
+ * integer counts, and lionvec_dot8()'s integer sums, exact in every kernel
+ * and so the same by construction, whatever order each adds in; the double
+ * arithmetic lionvec_estimate8() makes of them is the same code of the same
+ * inputs whichever kernel ran.  The other sums are in double, of terms each
+ * kernel computes with the same operations - lionvec_sum8()'s products are
+ * exact, a code's reconstruction being a float and a float's product with
+ * a float a double - added in LIONVEC_LANES partial sums, the i-th term
+ * into partial i % LIONVEC_LANES, and those in a fixed tree
+ * (lionvec_lanes_sum()): the portable kernels add in that order too.
+ * lionvec_sum8() is the codes against qc itself, unrounded, which no scan
+ * or build runs: the reference the unit test checks lionvec_dot8()'s
+ * estimates by.  The file is compiled with -ffp-contract=off (the
+ * Makefile), for GCC and clang would otherwise fuse a multiply and an add
+ * into one rounding wherever the target has fused multiply-adds - the
+ * portable kernels built for aarch64 or x86-64-v3 - and l2sq's terms,
+ * unlike lionvec_sum8()'s, are not exact, nor is the arithmetic
+ * lionvec_estimate8() does after its integer sums.  The
  * rotation's butterflies are the portable ones' additions and subtractions,
  * of the same operands, in the same order for each coordinate.  The halves'
  * conversion is exact, every half being a float, and VCVTPH2PS makes a NaN
@@ -523,6 +577,53 @@ lionvec_sum8_portable(const uint8 *codes, const float *qc, int dimsp)
 			p[l] += LIONVEC_RECON8(c[l]) * (double) q[l];
 	}
 	return lionvec_lanes_sum(p);
+}
+
+/*
+ * The 8-bit codes' integer sums run in blocks of LIONVEC_DOT8_STEPS runs of
+ * sixteen codes, into 32-bit partial sums that each block's end widens into
+ * 64 bits: a product of a code and a 16-bit integer is at most 255 * 32768
+ * = 8,355,840 in magnitude, so that a block puts at most 64 of them into
+ * each of the portable kernel's sixteen partial sums, and 128, two a run,
+ * into each of the AVX2 kernel's eight: 1,069,547,520, under 2^31.
+ */
+#define LIONVEC_DOT8_STEPS		64
+
+static int64
+lionvec_dot8_portable(const uint8 *codes, const int16 *w, int dimsp,
+					  int64 *sumc)
+{
+	int64		dot = 0;
+	int64		sc = 0;
+	int			i = 0;
+
+	Assert(dimsp % 64 == 0);
+	while (i < dimsp)
+	{
+		int32		p[LIONVEC_LANES] = {0};
+		int32		s[LIONVEC_LANES] = {0};
+		int			end = Min(dimsp, i + LIONVEC_DOT8_STEPS * LIONVEC_LANES);
+		int			l;
+
+		for (; i < end; i += LIONVEC_LANES)
+		{
+			const uint8 *c = codes + i;
+			const int16 *q = w + i;
+
+			for (l = 0; l < LIONVEC_LANES; l++)
+			{
+				p[l] += (int32) c[l] * (int32) q[l];
+				s[l] += c[l];
+			}
+		}
+		for (l = 0; l < LIONVEC_LANES; l++)
+		{
+			dot += p[l];
+			sc += s[l];
+		}
+	}
+	*sumc = sc;
+	return dot;
 }
 
 static double
@@ -641,6 +742,52 @@ lionvec_sum8_avx2(const uint8 *codes, const float *qc, int dimsp)
 		p12 = _mm256_add_pd(p12, lionvec_avx2_terms8(codes + i + 12, qc + i + 12));
 	}
 	return lionvec_avx2_fold(p0, p4, p8, p12);
+}
+
+/*
+ * Sixteen codes a step: widened to 16 bits and multiplied by w's sixteen
+ * integers with VPMADDWD, which adds each pair of products into one of
+ * eight 32-bit partial sums, widened into four 64-bit ones at the end of
+ * each block (LIONVEC_DOT8_STEPS); and the same sixteen bytes summed with
+ * VPSADBW against zero, into two 64-bit sums.
+ */
+static LION_TARGET("avx2") int64
+lionvec_dot8_avx2(const uint8 *codes, const int16 *w, int dimsp, int64 *sumc)
+{
+	const __m128i zero = _mm_setzero_si128();
+	__m256i		dot64 = _mm256_setzero_si256();
+	__m128i		sum64 = _mm_setzero_si128();
+	__m128i		d;
+	int			i = 0;
+
+	Assert(dimsp % 64 == 0);
+	while (i < dimsp)
+	{
+		__m256i		dot32 = _mm256_setzero_si256();
+		__m128i		lo;
+		__m128i		hi;
+		int			end = Min(dimsp, i + LIONVEC_DOT8_STEPS * 16);
+
+		for (; i < end; i += 16)
+		{
+			__m128i		c = _mm_loadu_si128((const __m128i *) (codes + i));
+			__m256i		q = _mm256_loadu_si256((const __m256i *) (w + i));
+			__m256i		p = _mm256_madd_epi16(_mm256_cvtepu8_epi16(c), q);
+
+			dot32 = _mm256_add_epi32(dot32, p);
+			sum64 = _mm_add_epi64(sum64, _mm_sad_epu8(c, zero));
+		}
+		lo = _mm256_castsi256_si128(dot32);
+		hi = _mm256_extracti128_si256(dot32, 1);
+		dot64 = _mm256_add_epi64(dot64, _mm256_cvtepi32_epi64(lo));
+		dot64 = _mm256_add_epi64(dot64, _mm256_cvtepi32_epi64(hi));
+	}
+	d = _mm_add_epi64(_mm256_castsi256_si128(dot64),
+					  _mm256_extracti128_si256(dot64, 1));
+	d = _mm_add_epi64(d, _mm_unpackhi_epi64(d, d));
+	sum64 = _mm_add_epi64(sum64, _mm_unpackhi_epi64(sum64, sum64));
+	*sumc = (int64) _mm_cvtsi128_si64(sum64);
+	return (int64) _mm_cvtsi128_si64(d);
 }
 
 /* terms i .. i + 3 of l2sq */
@@ -794,6 +941,16 @@ lionvec_has_f16c(void)
 	if (unlikely(lionvec_f16c < 0))
 		lionvec_f16c = lion_simd_f16c() ? 1 : 0;
 	return lionvec_f16c > 0;
+}
+
+int64
+lionvec_dot8(const uint8 *codes, const int16 *w, int dimsp, int64 *sumc)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (lionvec_avx2_set(lion_simd_current()))
+		return lionvec_dot8_avx2(codes, w, dimsp, sumc);
+#endif
+	return lionvec_dot8_portable(codes, w, dimsp, sumc);
 }
 
 double
@@ -1429,6 +1586,7 @@ lionvec_kmeans_assign(const LionVecSample *s, int from, int to, int k,
 	q.dimsp = dimsp;
 	q.qc = w->qc;
 	q.planes = w->planes;
+	q.qw = NULL;				/* never refined: not rounded */
 
 	for (i = from; i < to; i++)
 	{
@@ -1752,15 +1910,32 @@ lionvec_estimate1(const LionVecQuery *q, const uint64 *bits, uint16 popcount,
 	*err = q->eps * norm / a * sqrt(q->var1 * miss + q->varq);
 }
 
-/* From the 8-bit codes, against qc itself. */
+/*
+ * From the 8-bit codes, against the query rounded to 16-bit integers, q^_i =
+ * qmid + qwdelta qw_i (lionvec_query_init(); q->qw may not be NULL).  With
+ * r_i = (-4 + 1/64) + c_i / 32, the middle of code c_i's step,
+ *
+ *	<r, q^> = (-4 + 1/64) (dimsp qmid + qwdelta sum(qw_i))
+ *			  + (1/32) (qmid sum(c_i) + qwdelta sum(c_i qw_i))
+ *
+ * of which the first line is the query's alone, q->qw0, and the sums of the
+ * second lionvec_dot8()'s, exact.  The rounding's error adds its variance,
+ * q->varq8, to the codes', as plane 1's quantization's does to plane 1's.
+ */
 void
 lionvec_estimate8(const LionVecQuery *q, const uint8 *codes, float norm,
 				  float alpha8, float rnorm8, double *est, double *err)
 {
-	double		s = lionvec_sum8(codes, q->qc, q->dimsp);
+	int64		sumc;
+	int64		cw;
+	double		s;
 	double		a = Max((double) alpha8, 1e-6);
 	double		miss = Max(1.0 - a * a, 0.0);
 
+	Assert(q->qw != NULL);
+	cw = lionvec_dot8(codes, q->qw, q->dimsp, &sumc);
+	s = q->qw0 + (1.0 / LIONVEC_STEPS8) *
+		(q->qmid * (double) sumc + q->qwdelta * (double) cw);
 	*est = rnorm8 > 0.0f ? norm * s / (rnorm8 * a) : 0.0;
-	*err = LIONVEC_EPS8(q->eps) * norm / a * sqrt(q->var1 * miss);
+	*err = LIONVEC_EPS8(q->eps) * norm / a * sqrt(q->var1 * miss + q->varq8);
 }
