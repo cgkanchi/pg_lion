@@ -246,3 +246,214 @@ SELECT q, slr_q(q) FROM unnest(ARRAY[
 	'SELECT count(*) FROM slr WHERE f > 5',
 	'SELECT count(*) FROM slr WHERE f BETWEEN 1 AND 3 AND b > 0'
 ]) q;
+
+-- ---------- 2. beside the other clauses ----------
+-- equalities, lists, null tests, `<>` and ranges on other columns, two
+-- ranges from slices on two columns, and a range and an equality or a list
+-- on the same column
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE b > 0 AND g = 3',
+	'SELECT count(*) FROM slr WHERE b > 0 AND g IN (1, 2, 9)',
+	'SELECT count(*) FROM slr WHERE b > 0 AND a IS NULL',
+	'SELECT count(*) FROM slr WHERE b > 0 AND c IS NOT NULL',
+	'SELECT count(*) FROM slr WHERE b > 0 AND g <> 3',
+	'SELECT count(*) FROM slr WHERE b > 0 AND f > 7',
+	'SELECT count(*) FROM slr WHERE b > 0 AND c < 0',
+	'SELECT count(*) FROM slr WHERE b BETWEEN -50000 AND 50000 AND d > ''2000-01-01'' AND g = 4',
+	'SELECT count(*) FROM slr WHERE b > 0 AND b = 7919',
+	'SELECT count(*) FROM slr WHERE b > 0 AND b IN (7919, -7919, 15838)',
+	'SELECT count(*), count(b), count(a) FROM slr WHERE b < 0',
+	'SELECT count(*) FILTER (WHERE g = 1), count(*) FROM slr WHERE b < 0'
+]) q;
+
+-- a GROUP BY of another column, of two, and of the range's own column,
+-- whose walk the range bounds as before; count(DISTINCT) of another column
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT g, count(*) FROM slr WHERE b > 0 GROUP BY g',
+	'SELECT g, h, count(*) FROM slr WHERE c < 0 GROUP BY g, h',
+	'SELECT a, count(*) FROM slr WHERE a > 990 GROUP BY a',
+	'SELECT g, count(*) FROM slr WHERE b > 0 AND a <> 5 GROUP BY g',
+	'SELECT count(DISTINCT g) FROM slr WHERE b > 99000',
+	'SELECT g, count(*) FROM slr WHERE b > 0 GROUP BY g ORDER BY count(*) DESC LIMIT 3'
+]) q;
+SELECT slr_plan('SELECT g, count(*) FROM slr WHERE b > 0 GROUP BY g');
+SELECT slr_plan('SELECT a, count(*) FROM slr WHERE a > 990 GROUP BY a');
+
+-- the aggregates of sliced columns (DESIGN.md §52) under a range from
+-- slices: of the same column - sum(x) WHERE x > c - and of another, of the
+-- one row and of a GROUP BY's groups, a group at a time and decoded
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT sum(b), count(b), min(b), max(b) FROM slr WHERE b > 0',
+	'SELECT sum(b), avg(b) FROM slr WHERE b BETWEEN -1000 AND 1000',
+	'SELECT sum(c), min(c), max(c) FROM slr WHERE c < -5000000000',
+	'SELECT min(d), max(d), count(d) FROM slr WHERE d > ''1990-01-01''',
+	'SELECT min(ts), max(ts) FROM slr WHERE ts < ''2000-01-01''',
+	'SELECT max(tz), min(t) FROM slr WHERE tz > ''2020-01-01 12:00+00''',
+	'SELECT sum(a), max(c) FROM slr WHERE b > 0',
+	'SELECT sum(b) FROM slr WHERE b <> 0 AND g = 3',
+	'SELECT g, sum(b), min(b), count(*) FROM slr WHERE b > 0 GROUP BY g',
+	'SELECT g, sum(c), max(a) FROM slr WHERE b < 0 AND h = 1 GROUP BY g'
+]) q;
+SET pg_lion.enable_slice_decode = off;
+SELECT slr_q('SELECT g, sum(b), min(b), count(*) FROM slr WHERE b > 0 GROUP BY g');
+RESET pg_lion.enable_slice_decode;
+SELECT slr_plan('SELECT sum(b), max(b) FROM slr WHERE b > 0');
+SELECT slr_plan('SELECT g, sum(b), count(*) FROM slr WHERE b < 0 GROUP BY g');
+
+-- in an OR, a leaf of the union like any range (§32), and ANDed with E it
+-- pins itself: an OR of a range alone, BETWEEN SYMMETRIC (an OR of two
+-- ranges), and an arm with two columns
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE b > 90000 OR g = 2',
+	'SELECT count(*) FROM slr WHERE b > 90000 OR c < -9000000000',
+	'SELECT count(*) FROM slr WHERE (b BETWEEN 1 AND 50000 AND h = 1) OR a < -900',
+	'SELECT count(*) FROM slr WHERE b BETWEEN SYMMETRIC 50000 AND -50000',
+	'SELECT count(*) FROM slr WHERE (b > 90000 OR g = 2) AND d < ''2000-01-01''',
+	'SELECT g, count(*) FROM slr WHERE b < -90000 OR a > 900 GROUP BY g'
+]) q;
+SELECT slr_plan('SELECT count(*) FROM slr WHERE b > 90000 OR g = 2');
+SELECT slr_plan('SELECT count(*) FROM slr WHERE b BETWEEN SYMMETRIC 50000 AND -50000');
+
+-- ---------- 3. parameters and stable expressions ----------
+-- a generic plan's bounds, a NULL one, crossed ones, ones past the type's
+-- range, and a stable expression; a LATERAL rescan, the range collected
+-- again for each outer row
+SET plan_cache_mode = force_generic_plan;
+SET pg_lion.prefer_slice_ranges = on;
+PREPARE slr_p1(int) AS SELECT count(*) FROM slr WHERE b > $1;
+PREPARE slr_p2(int8, int8) AS SELECT count(*), sum(b) FROM slr WHERE b BETWEEN $1 AND $2;
+PREPARE slr_p3(date) AS SELECT g, count(*) FROM slr WHERE d < $1 GROUP BY g ORDER BY g;
+PREPARE slr_p4(int) AS SELECT count(*) FROM slr WHERE a <> $1 AND a > 0;
+EXPLAIN (COSTS OFF) EXECUTE slr_p1(0);
+EXPLAIN (COSTS OFF) EXECUTE slr_p2(1, 2);
+EXECUTE slr_p1(0);
+EXECUTE slr_p1(-100000000);
+EXECUTE slr_p1(2147483647);
+EXECUTE slr_p1(NULL);
+EXECUTE slr_p2(-50000, 50000);
+EXECUTE slr_p2(50000, -50000);
+EXECUTE slr_p2(-9223372036854775808, 9223372036854775807);
+EXECUTE slr_p2(3000000000, 9000000000);
+EXECUTE slr_p2(NULL, 5);
+EXECUTE slr_p3('2000-01-01');
+EXECUTE slr_p3('infinity');
+EXECUTE slr_p4(7);
+EXECUTE slr_p4(NULL);
+RESET plan_cache_mode;
+RESET pg_lion.prefer_slice_ranges;
+DEALLOCATE ALL;
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FROM slr WHERE b > 0;
+SELECT count(*) FROM slr WHERE b > -100000000;
+SELECT count(*) FROM slr WHERE b > 2147483647;
+SELECT count(*), sum(b) FROM slr WHERE b BETWEEN -50000 AND 50000;
+SELECT count(*), sum(b) FROM slr WHERE b BETWEEN -9223372036854775808 AND 9223372036854775807;
+SELECT g, count(*) FROM slr WHERE d < '2000-01-01' GROUP BY g ORDER BY g;
+SELECT g, count(*) FROM slr WHERE d < 'infinity' GROUP BY g ORDER BY g;
+SELECT count(*) FROM slr WHERE a <> 7 AND a > 0;
+RESET pg_lion.enable_count_pushdown;
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE tz < now()',
+	'SELECT count(*) FROM slr WHERE d > current_date - 20000',
+	'SELECT o.x, s.n FROM (VALUES (-50000), (0), (50000), (NULL)) o(x), LATERAL (SELECT count(*) AS n FROM slr WHERE slr.b > o.x) s'
+]) q;
+
+-- ---------- 4. the heap the map does not vouch for ----------
+-- Rows deleted and updated and not vacuumed: the copy holds the slices'
+-- rows, and every count rechecks their pages in the heap.
+DELETE FROM slr WHERE id % 50 = 7;
+UPDATE slr SET b = -b, c = c + 1, d = d + 1, a = -a WHERE id % 40 = 3;
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE b > 0',
+	'SELECT count(*) FROM slr WHERE b BETWEEN -1000 AND 1000 AND g = 3',
+	'SELECT sum(b), min(b), max(b) FROM slr WHERE b > 0',
+	'SELECT g, count(*) FROM slr WHERE c < 0 GROUP BY g',
+	'SELECT count(*) FROM slr WHERE a <> 0 AND a < 100'
+]) q;
+-- rows this transaction inserted at the extremes, deleted and updated,
+-- seen by its own counts, and rolled back
+BEGIN;
+INSERT INTO slr (id, g, h, a, b, c, d, ts, tz) VALUES
+	(40001, 3, 0, 32767, 2147483647, 9223372036854775807, 'infinity', 'infinity', 'infinity'),
+	(40002, 3, 0, -32768, -2147483648, -9223372036854775808, '-infinity', '-infinity', '-infinity'),
+	(40003, 3, 0, 0, 0, 0, '2000-01-01', '2000-01-01', '2000-01-01');
+DELETE FROM slr WHERE g = 3 AND id % 3 = 0;
+UPDATE slr SET b = b + 1 WHERE g = 4 AND id % 7 = 0;
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE b > 2147483646',
+	'SELECT count(*) FROM slr WHERE b < -2147483647',
+	'SELECT count(*) FROM slr WHERE b >= 0 AND g = 3',
+	'SELECT count(*) FROM slr WHERE c > 9223372036854775806 OR c < -9223372036854775807',
+	'SELECT count(*), max(d) FROM slr WHERE d > ''2100-01-01''',
+	'SELECT g, count(*), sum(b) FROM slr WHERE b BETWEEN 0 AND 100000 GROUP BY g'
+]) q;
+ROLLBACK;
+SELECT slr_q('SELECT count(*) FROM slr WHERE b > 2147483646');
+-- ... and after VACUUM, the map's again
+VACUUM (FREEZE) slr;
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr WHERE b > 0',
+	'SELECT sum(b), min(b), max(b) FROM slr WHERE b > 0',
+	'SELECT g, count(*) FROM slr WHERE c < 0 GROUP BY g'
+]) q;
+SELECT slr_plan('SELECT count(*) FROM slr WHERE b > 0', true);
+
+-- ---------- 5. a copy past the memory ----------
+-- At the least hash table the copy goes to a temporary file, which the
+-- counts read a container at a time.
+SET work_mem = '64kB';
+SET hash_mem_multiplier = 1;
+SELECT slr_q('SELECT count(*) FROM slr WHERE b > -90000 AND c > -9000000000');
+SELECT slr_q('SELECT g, count(*) FROM slr WHERE b > -90000 GROUP BY g');
+SELECT slr_plan('SELECT count(*) FROM slr WHERE b > -90000 AND c > -9000000000', true);
+RESET work_mem;
+RESET hash_mem_multiplier;
+
+-- ---------- 6. the planner's choice ----------
+-- 100,000 rows of unique values in no heap order, a column with summaries
+-- and slices and its twin with slices alone: a selective range is summed
+-- from the summaries, or walked, and a wide one is folded from the slices.
+CREATE TABLE slr_c (id int, k int4, k2 int4, g int) WITH (autovacuum_enabled = off);
+INSERT INTO slr_c SELECT i, (i * 7919) % 100003, (i * 7919) % 100003, i % 10
+  FROM generate_series(1, 100000) i;
+CREATE INDEX slr_c_k ON slr_c USING lion (k) WITH (summaries = on, slices = on);
+CREATE INDEX slr_c_k2 ON slr_c USING lion (k2) WITH (slices = on);
+CREATE INDEX slr_c_g ON slr_c USING lion (g);
+VACUUM (FREEZE, ANALYZE) slr_c;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k < 100;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k < 60000;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k2 < 100;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k2 < 60000;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM slr_c WHERE k2 BETWEEN 1000 AND 90000 GROUP BY g;
+EXPLAIN (COSTS OFF) SELECT sum(k) FROM slr_c WHERE k > 30000;
+SET pg_lion.enable_slice_ranges = off;
+EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k < 60000;
+RESET pg_lion.enable_slice_ranges;
+SELECT q, slr_q(q, false) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr_c WHERE k < 100',
+	'SELECT count(*) FROM slr_c WHERE k < 60000',
+	'SELECT count(*) FROM slr_c WHERE k2 < 100',
+	'SELECT count(*) FROM slr_c WHERE k2 < 60000',
+	'SELECT sum(k) FROM slr_c WHERE k > 30000'
+]) q;
+
+-- ---------- 7. declines ----------
+-- a partitioned table, a join, and a column no index slices: their ranges
+-- are answered as before
+CREATE TABLE slr_part (k int, v int4) PARTITION BY RANGE (k);
+CREATE TABLE slr_part1 PARTITION OF slr_part FOR VALUES FROM (0) TO (50);
+CREATE TABLE slr_part2 PARTITION OF slr_part FOR VALUES FROM (50) TO (100);
+INSERT INTO slr_part SELECT i % 100, i FROM generate_series(1, 2000) i;
+CREATE INDEX ON slr_part USING lion (k);
+CREATE INDEX ON slr_part USING lion (v) WITH (slices = on);
+VACUUM ANALYZE slr_part;
+SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7');
+CREATE TABLE slr_dim (g int PRIMARY KEY, name text);
+INSERT INTO slr_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
+ANALYZE slr_dim;
+SELECT slr_q('SELECT d.name, count(*) FROM slr s JOIN slr_dim d ON d.g = s.g WHERE s.b > 0 GROUP BY d.name');
+SELECT slr_q('SELECT count(*) FROM slr_c WHERE id > 50000 AND g = 3');
+-- with the switch off, nothing is answered from slices
+SET pg_lion.enable_slice_ranges = off;
+SELECT slr_q('SELECT count(*) FROM slr WHERE b > 0 AND g = 3');
+RESET pg_lion.enable_slice_ranges;

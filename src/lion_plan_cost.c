@@ -3133,7 +3133,8 @@ lion_cost_slice_range(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			break;
 		topconst++;
 	}
-	steps = Min((double) nbits, topconst + ceil(log2(perkey)) + 2.0);
+	steps = Min((double) nbits,
+				topconst + 2.0 + (1.0 - c2) * ceil(log2(perkey)));
 
 	/* E and the slices the steps reach, read at E's keys */
 	read = lion_slice_read_cost(root, idx, ekeys, nkeys, shape.items[nbits],
@@ -3149,11 +3150,14 @@ lion_cost_slice_range(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	/* the copy, and E again at its keys for the counts' AND */
 	ucont = conts + (runs - conts) * c2;
 	bytes += (runs * LION_RANGE_RUN_BYTES - bytes) * c2;
-	copy = ucont * (LION_FKJOIN_COPY_CONTAINER_COST + LION_MEMORY_PROBE_COST) +
+	copy = ucont * LION_SLICE_RANGE_CONTAINER_COST +
 		lion_slice_read_cost(root, idx, ucont, nkeys, shape.items[nbits],
 							 shape.rows[nbits], width);
 	bytes += ucont * (sizeof(LionContainer *) + sizeof(uint32));
 	spillheld = ucont * LION_SPILL_ENTRY_BYTES + BLCKSZ;
+	elog(DEBUG1, "lion range from slices of %s, column %d: %.0f keys of E, %.1f steps a comparison, %.0f comparisons, %.0f words, %.0f containers of the copy; read %.1f, fold %.1f, copy %.1f",
+		 get_rel_name(idx->indexoid), (int) col, ekeys, steps, nchains,
+		 nwords, ucont, read, fold, copy);
 	if (bytes <= budget)
 	{
 		mem->held += bytes;
