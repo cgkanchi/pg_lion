@@ -32635,8 +32635,13 @@ What the tables say:
   writer's rows at every column's extremes, updates and deletes, committed, rolled back, and
   VACUUMed under the reader's snapshot - for the one row and for each group of a `GROUP BY`,
   decoded and a group at a time.
-- `test/sql/slices.sql` keeps §37's plan with the path off and shows the slices' plan for the
-  same query; its summed range turns the bitmap scan off (§52.7).
+- `test/sql/slices.sql` keeps §37's plan with the path off and on - on an all-visible heap the
+  walk of the entries' headers is the cheaper answer for every row of its 8k-row table - and
+  shows the slices' plan under its summed range, which turns the bitmap scan off (§52.7). The
+  test commits synchronously, as the suite's tests that VACUUM do: the dev cluster commits
+  asynchronously, and a VACUUM that runs before the WAL writer's next flush cannot set
+  all-visible, which left the §37 walk priced as a count of every entry and the plan to a race
+  (2026-10-27, seen on 19 in rmgr mode).
 - `costgucs.sql` lists the nine settings; `priv_decode.out` (`make hookcheck`) the plan's new
   member.
 - The whole suite: 191 regression and 32 isolation tests in generic WAL mode and again with
