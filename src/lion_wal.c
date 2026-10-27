@@ -94,10 +94,11 @@ struct LionWalState
 	bool		needwal;		/* RelationNeedsWAL() */
 	bool		incrit;			/* did we open the critical section? */
 	int			nblocks;
+	int			maxblocks;		/* what this record may register */
 	GenericXLogState *gx;		/* generic mode only */
 	xl_lion_header hdr;
 	StringInfoData main;		/* record-level payload after the header */
-	LionWalBlock blk[LION_WAL_MAX_BLOCKS];
+	LionWalBlock blk[LION_WAL_MAX_BLOCKS_WIDE];
 
 	/*
 	 * The item image a DELTA or SPLICE is computed against
@@ -212,7 +213,7 @@ lion_wal_setup_buffers(void)
 
 		initStringInfo(&lion_wal_cur.main);
 		enlargeStringInfo(&lion_wal_cur.main, 256);
-		for (i = 0; i < LION_WAL_MAX_BLOCKS; i++)
+		for (i = 0; i < LION_WAL_MAX_BLOCKS_WIDE; i++)
 		{
 			initStringInfo(&lion_wal_cur.blk[i].ops);
 			enlargeStringInfo(&lion_wal_cur.blk[i].ops, LION_WAL_OPS_INITSZ);
@@ -440,6 +441,19 @@ lion_rmgr_registered(void)
 LionWalState *
 lion_wal_begin(Relation index)
 {
+	return lion_wal_begin_ext(index, LION_WAL_MAX_BLOCKS);
+}
+
+int
+lion_wal_max_blocks(Relation index)
+{
+	return lion_wal_mode(index) == LION_WAL_MODE_RMGR ?
+		LION_WAL_MAX_BLOCKS_WIDE : LION_WAL_MAX_BLOCKS;
+}
+
+LionWalState *
+lion_wal_begin_ext(Relation index, int maxblocks)
+{
 	LionWalState *state = &lion_wal_cur;
 	int			i;
 
@@ -450,6 +464,7 @@ lion_wal_begin(Relation index)
 
 	state->index = index;
 	state->nblocks = 0;
+	state->maxblocks = Min(Max(maxblocks, 1), lion_wal_max_blocks(index));
 	state->gx = NULL;
 	state->incrit = false;
 	state->needwal = RelationNeedsWAL(index);
@@ -460,7 +475,7 @@ lion_wal_begin(Relation index)
 	state->saveoff = InvalidOffsetNumber;
 	state->savelen = 0;
 	resetStringInfo(&state->main);
-	for (i = 0; i < LION_WAL_MAX_BLOCKS; i++)
+	for (i = 0; i < state->maxblocks; i++)
 	{
 		state->blk[i].buf = InvalidBuffer;
 		state->blk[i].page = NULL;
@@ -489,6 +504,15 @@ lion_wal_begin(Relation index)
 						RelationGetRelationName(index)),
 				 errdetail("Without the resource manager the index can be read but not written: inserts, updates and the VACUUM that removes its dead entries fail."),
 				 errhint("Add \"pg_lion\" to shared_preload_libraries and restart, or REINDEX the index to rebuild it with wal_mode = generic.")));
+
+	/*
+	 * XLogInsert() takes XLR_NORMAL_MAX_BLOCK_ID + 1 buffers without asking;
+	 * a wider record makes room first, which allocates, and so cannot be
+	 * done in the critical section below.  The room stays for the backend.
+	 */
+	if (state->rmgr && state->needwal &&
+		state->maxblocks > XLR_NORMAL_MAX_BLOCK_ID + 1)
+		XLogEnsureRecordSpace(state->maxblocks - 1, 0);
 
 	lion_wal_open = true;
 
@@ -524,7 +548,7 @@ lion_wal_register_buffer(LionWalState *state, Buffer buf, int flags)
 			return state->blk[i].page;
 	}
 
-	if (state->nblocks >= LION_WAL_MAX_BLOCKS)
+	if (state->nblocks >= state->maxblocks)
 		elog(ERROR, "lion index: too many buffers in one WAL record");
 
 	b = &state->blk[state->nblocks];
@@ -756,7 +780,7 @@ lion_wal_register_data(LionWalState *state, const void *ptr, Size len)
 static void
 lion_wal_order_blocks(LionWalState *state)
 {
-	LionWalBlock tmp[LION_WAL_MAX_BLOCKS];
+	LionWalBlock tmp[LION_WAL_MAX_BLOCKS_WIDE];
 	int			n = 0;
 	int			pass;
 	int			i;

@@ -1,0 +1,125 @@
+-- Inserts into bit-sliced columns (DESIGN.md §51, "Insert cost, revisited"):
+-- a row's slices of a column found by one descent and a walk of the leaves
+-- that hold them - across leaves, and across splits of the leaf the walk
+-- holds - and the in-place adds of several slices written in one record.
+-- What is checked is what is stored: lion_index_verify() with
+-- heapallindexed, which looks every row up in every slice of its column, and
+-- lion_index_slice_agg() against the query it stands for.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+
+-- count, sum, min and max of key column attno from its slices, against the
+-- query with every lion path off: 'same' and the answer, or both.
+CREATE FUNCTION si_cmp(idx regclass, attno int2 DEFAULT 1) RETURNS text
+LANGUAGE plpgsql
+SET enable_indexscan = off SET enable_bitmapscan = off
+SET pg_lion.enable_count_pushdown = off AS $$
+DECLARE
+	l record;
+	r record;
+	tbl regclass;
+	col text;
+BEGIN
+	SELECT i.indrelid INTO tbl FROM pg_index i WHERE i.indexrelid = idx;
+	col := pg_get_indexdef(idx, attno, true);
+	SELECT * INTO l FROM lion_index_slice_agg(idx, NULL, attno);
+	EXECUTE format('SELECT count(%1$s) AS count, sum(%1$s)::numeric AS sum, min(%1$s)::text AS min, max(%1$s)::text AS max FROM %2$s',
+				   col, tbl) INTO r;
+	IF (l.count, l.sum, l.min, l.max) IS NOT DISTINCT FROM (r.count, r.sum, r.min, r.max) THEN
+		RETURN format('same: %s %s %s %s', l.count, l.sum, l.min, l.max);
+	END IF;
+	RETURN format('DIFFERENT: lion %s %s %s %s, query %s %s %s %s',
+				  l.count, l.sum, l.min, l.max, r.count, r.sum, r.min, r.max);
+END $$;
+
+-- ---------- 1. slices on many leaves, and splits under the walk ----------
+-- An int8 column of sixteen values whose bits look random, in heap order a
+-- row each in turn, under an index built empty: every slice is an INLINE
+-- entry, an ARRAY of about half the rows, that grows by a member a row until
+-- it spills at inline_limit (4096 bytes by default).  So while the table is
+-- small the column's 65 slices fill one directory leaf after another - the
+-- sixteen keys' entries take less than one - a row's walk crosses them, and
+-- the entries that grow out of their slack split the leaf the walk holds.
+CREATE TABLE si_a (id int, v int8) WITH (autovacuum_enabled = off);
+CREATE INDEX si_a_v ON si_a USING lion (v) WITH (slices = on);
+INSERT INTO si_a
+SELECT i, ((i % 16 + 1) * 11400714819323198485::numeric % 18446744073709551616
+		   - 9223372036854775808)::int8
+  FROM generate_series(1, 1000) i;
+SELECT leaf_pages >= 6 AS slices_on_many_leaves, slice_entries, slice_pages
+  FROM lion_index_stats('si_a_v');
+SELECT lion_index_verify('si_a_v', true);
+SELECT si_cmp('si_a_v');
+-- ... until the slices spill - a NARROW of some 2 kB a container key, 64
+-- heap pages, past the second - and the rows go into posting trees.
+INSERT INTO si_a
+SELECT i, ((i % 16 + 1) * 11400714819323198485::numeric % 18446744073709551616
+		   - 9223372036854775808)::int8
+  FROM generate_series(1001, 30000) i;
+SELECT slice_entries, slice_tids, slice_pages > 0 AS spilled
+  FROM lion_index_stats('si_a_v');
+SELECT lion_index_verify('si_a_v', true);
+SELECT si_cmp('si_a_v');
+
+-- ---------- 2. dense slices: the in-place adds, several to a record ----------
+-- A table whose int4 and int8 slices are posting trees of BITSETs, then rows
+-- appended to it by one INSERT ... SELECT and by single-row INSERTs: each
+-- row lands in the last container of every slice it has a bit in, in place,
+-- and the adds on one leaf go out three posting leaves to a record.  Some of
+-- the containers are ARRAYs that run out of slack, and the new container
+-- keys begin as sparse segments, which goes the ordinary way in the middle
+-- of a walk.
+CREATE TABLE si_b (id int, v4 int4, v8 int8) WITH (autovacuum_enabled = off);
+INSERT INTO si_b SELECT i, (i * 2654435761::int8 % 4294967296 - 2147483648)::int4,
+	   (i * 11400714819323198485::numeric % 18446744073709551616 - 9223372036854775808)::int8
+  FROM generate_series(1, 20000) i;
+CREATE INDEX si_b_v ON si_b USING lion (v4, v8) WITH (slices = on);
+INSERT INTO si_b SELECT i, (i * 2654435761::int8 % 4294967296 - 2147483648)::int4,
+	   (i * 11400714819323198485::numeric % 18446744073709551616 - 9223372036854775808)::int8
+  FROM generate_series(20001, 26000) i;
+DO $$
+BEGIN
+	FOR i IN 26001 .. 26300 LOOP
+		INSERT INTO si_b VALUES (i, (i * 7919) % 100000 - 50000, -i::int8 * 1000003);
+	END LOOP;
+END $$;
+SELECT attno, slice_entries, slice_tids FROM lion_index_stats('si_b_v') ORDER BY attno;
+SELECT lion_index_verify('si_b_v', true);
+SELECT si_cmp('si_b_v', 1::int2), si_cmp('si_b_v', 2::int2);
+
+-- ---------- 3. INLINE and CHAIN slices in one column ----------
+-- Values below 1000 clear bits 10 to 30 of their encoding, and the negative
+-- ones above -65536 set bits 16 to 30: those slices hold the negative rows
+-- alone, one in fifty, INLINE beside the dense CHAIN ones, and a negative
+-- row's walk meets both.  The column has summaries too, which an insert
+-- writes between the key and the slices.
+CREATE TABLE si_c (id int, v int4) WITH (autovacuum_enabled = off);
+INSERT INTO si_c SELECT i, CASE WHEN i % 50 = 0 THEN -i ELSE i % 1000 END
+  FROM generate_series(1, 30000) i;
+CREATE INDEX si_c_v ON si_c USING lion (v) WITH (slices = on, summaries = on);
+INSERT INTO si_c SELECT i, CASE WHEN i % 50 = 0 THEN -i ELSE i % 1000 END
+  FROM generate_series(30001, 33000) i;
+SELECT slice_entries, slice_pages > 0 AS some_chain, summary_entries > 0 AS summarized
+  FROM lion_index_stats('si_c_v');
+SELECT lion_index_verify('si_c_v', true);
+SELECT si_cmp('si_c_v');
+
+-- ---------- 4. rows rolled back, deleted, and a VACUUM ----------
+BEGIN;
+INSERT INTO si_b SELECT i, -i, i::int8 << 30 FROM generate_series(30001, 31000) i;
+ROLLBACK;
+DELETE FROM si_b WHERE id % 5 = 0;
+INSERT INTO si_b VALUES (40001, NULL, NULL), (40002, 0, 0),
+	(40003, -2147483648, -9223372036854775808), (40004, 2147483647, 9223372036854775807);
+SELECT lion_index_verify('si_b_v', true);
+SELECT si_cmp('si_b_v', 1::int2), si_cmp('si_b_v', 2::int2);
+VACUUM si_b;
+INSERT INTO si_b SELECT i, (i * 31) % 4096 - 2048, (i::int8 * 7) << 20
+  FROM generate_series(50001, 52000) i;
+SELECT lion_index_verify('si_b_v', true);
+SELECT si_cmp('si_b_v', 1::int2), si_cmp('si_b_v', 2::int2);
+
+DROP TABLE si_a, si_b, si_c;
+DROP FUNCTION si_cmp(regclass, int2);
