@@ -32449,3 +32449,404 @@ What the tables say:
 - **The slices' page estimate** (§52.7) overstates a column in heap order; an exact count would
   need the meta page to keep the slices' pages, a format change.
 - **The plane scatter** of §51.14 (build and bulk insert) is still to do.
+
+## 53. Ranges from slices (2026-10-27)
+
+§52.12 left the fourth level of the slices' planner task undone: a range on the sliced column
+itself. Until this section a range on any lion column was answered from its VALUE entries - the
+walk of every key it covers that bounds the count (§28), or the union of those entries collected
+into a copy where it is a source (§32) - or, on a column with summaries, from the summaries of the
+buckets it covers whole and the keys at its two ends. Both grow with the range: a walk with the
+keys it covers, a collection with the containers its sets hand out. A sliced column keeps its
+values as bits, and O'Neil and Quass's range algorithm (1997, "Improved query performance with
+variant indexes", Algorithm 4.3) answers any range from them with a fixed amount of work at each
+container key, whatever the range covers:
+
+    SELECT count(*) FROM events WHERE amount BETWEEN 100 AND 5000;
+    SELECT sum(amount), max(amount) FROM events WHERE amount > 100;
+    SELECT country, count(*) FROM events WHERE ts >= $1 AND amount <> 0 GROUP BY country;
+
+`x > c`, `x >= c`, `x < c`, `x <= c`, `BETWEEN` and `x <> c` on a column a lion index slices
+(§51) are now collected from its slices where the planner prices that cheaper than walking or
+summing the entries: folded into a private copy key by key, the copy a source like §32's collected
+range, ANDed with the column's existence slice E located with its pin. Nothing downstream
+changed: the WHERE collected once and the group batches of §10, §52's slice aggregates, the
+parallel count and the spill of §32 take the copy as they take any collected range.
+
+### 53.1 The fold (`lion_slice_range_collect()`, `lion_planes_bsi_step()`)
+
+A range on a sliced column of nbits bits is, once its bounds are encodings (§53.2), the rows of E
+whose encoding lies in [lo, hi] and equals none of the holes h1 ... hk (`<>`). For one constant c
+O'Neil's descent keeps two sets - EQ, the rows whose bits so far are c's, and an accumulator - and
+folds one slice S_i a step, from the top bit down:
+
+    LT (rows below c):  c_i = 1: LT |= EQ ∧ ¬S_i;  EQ &= S_i      c_i = 0: EQ &= ¬S_i
+    GT (rows above c):  c_i = 0: GT |= EQ ∧ S_i;   EQ &= ¬S_i     c_i = 1: EQ &= S_i
+    EQ (rows equal):    EQ &= S_i or ¬S_i by c_i
+
+and the range is
+
+    E ∧ ¬LT(lo) ∧ ¬GT(hi) ∧ ¬EQ(h1) ∧ ... ∧ ¬EQ(hk)
+
+A one-sided range needs one comparison, LT of its lower bound or GT of its upper, a BETWEEN
+two, and `<>` one EQ a hole. The fold runs at each container key of E (`lion_slice_range_collect()`,
+lion_slice.c), on images of the key's rows:
+
+- **E's container is the start.** Every slice holds rows of E only, so the images are laid out
+  at the WIDTH of E's container there (§38: a heap block's words, 2 for a table of 100 rows a
+  page, 128 words a key where a full bitset is 512), and a slice's container of another width or
+  kind is laid out to it (`lion_slice_range_plane()`: a BITSET's or a NARROW's words where the widths
+  agree, read in place; another width's block by block; an ARRAY's members or a RUN's runs set
+  word by word). A member past E's width is no member of E and is left out, which the AND with
+  E's rows makes exact.
+- **A step is one or two word operations a word** (`lion_planes_bsi_step()`, lion_planes.c, plain
+  loops the compiler vectorizes; a slice with no entry, or none at the key, is a slice of no row).
+- **A comparison stops where EQ empties**: once no row is equal to the constant on the bits so far,
+  no later step can add to its accumulator. A key's rows that agree on their top bits keep EQ alive
+  through them, and past those the rows halve about every step, so a comparison takes the bits the
+  key's rows need to differ from the constant, some log2 of the rows a key and two: about 14 of an
+  int4's 32, or of an int8's 64, at 7,700 rows a key of values spread over the type (§53.7). Where
+  the column is in the heap's order, the rows at a key share their values' top bits and part from
+  the constant at the first bit they differ in: the bits every row of the column shares and two or
+  three more (11.7 of a sequential int4's 32, 23.8 of an int8's 64 whose values take 43). Each
+  slice is read by a cursor that holds no pin (`lion_cursor_init_at()` with `droppins`), sought to
+  the key only when a comparison reaches its bit.
+- **The key's rows** - E less what the comparisons rule out - are made a container
+  (`lion_bits_to_container()`) and appended to the copy in key order (`lion_collect_add()`): within
+  the memory the relation's collected sources share (`lion_collect_within()`, §32), and past it
+  into a temporary file, as lion_sources_collect() spills (the copy-building half of that function,
+  factored out as `lion_collect_begin()`, `_add()` and `_finish()`).
+
+The bounds that leave every row of E in (`x >= -2147483648` on an int4, `x < 5000000000` on one)
+need no fold: the source is E itself, located with its pin. Bounds that cross, a NULL bound, and
+one past the type's range on the side that excludes everything select nothing, and the source is
+missing (§53.2).
+
+### 53.2 The bounds as encodings (`lion_slice_range_add()`, `_settle()`)
+
+A bound's value is the column's own type's, or for an integer column one of the integer family's
+other types (§28's cross-type comparisons, `int4col < 5000000000::int8`); every type of the
+allowlist orders as the signed integer its Datum is (§51.1), so `x op v` holds of a row exactly when
+it holds of the two integers. The bounds are clipped to the type's range [-2^(nbits-1),
+2^(nbits-1) - 1] as they are added - `x > v` with v at or past the greatest value selects nothing,
+`x < v` with v past it bounds nothing - ANDed into one closed interval [L, H] of values, and
+encoded once they are all in (`lion_slice_encode()`): lo = enc(L), hi = enc(H), LT needed where lo
+is not 0 and GT where hi is not all ones, a hole kept only inside [L, H]. The infinities of date,
+timestamp and timestamptz are their types' extremes and need nothing of their own: `ts <
+'infinity'` is every row but the infinite ones, `ts > 'infinity'` none. A NULL bound (a parameter's)
+makes the range empty, every operator involved being strict; `BETWEEN 9 AND 3` crosses, and is
+empty. The executor builds the bounds at every locate of the WHERE (per run and rescan, the
+parameters being values then), from each bound clause's value and type
+(`lion_rangesrc_range()`); a bound of another type, which no shipped family has, sends the range
+to §32's collection instead.
+
+### 53.3 A source that pins itself, and why it is exact
+
+The copy holds no pin, as every collected range (§32, "What it needs beside it"), so a count with
+nothing else that carries the §9 interlock would recheck every row in the heap; the planner took
+§32's ranges only beside a pinned source. A range from slices brings its own: its source is the AND
+of the copy and E, located with its pin (`lion_locate_range_sliced()`), and an AND is pinned when
+any of its sets is (`lion_plan_node()`). E holds every row the copy can hold, so the AND counts what
+the copy does. `count(*) WHERE x > c` needs nothing beside it, and an OR's leaf from slices is pinned
+as any leaf.
+
+**Why it is exact.** The slices and E are read without a pin, after the snapshot was taken. A row
+the snapshot sees is in E and in exactly the slices of its value's bits: its insert wrote every
+one of them before its transaction committed (§51.6, key first), and only VACUUM takes a TID out of
+a set, for a row no snapshot sees. Whenever each slice is read, then, the fold classifies a visible
+row by its value, and the copy holds it exactly when its value is in the range. A row the snapshot
+does not see may be classified by slices read before and after a write moved it, or VACUUM took it
+from some of them: it is in the copy or not, and is counted beside E located with its pin, whose
+container the map is asked under - the collected copy's argument (lion_sources_collect()): a dead
+TID the copy still lists is gone from E's container or on a heap page whose all-visible bit VACUUM
+cannot yet have set, and the recheck under the snapshot rejects it. The transaction's own rows are
+rows its snapshot sees, decided in the heap as every other; a TID whose row was replaced after the
+snapshot is a row the snapshot does not see. On a hot standby the planner offers none of this, as
+it collects nothing there (§10), and an executor that met such a plan there would collect the range
+from its entries instead.
+
+### 53.4 The planner (`lion_try_count_path_scoped()`, `lion_count_path_strategy()`)
+
+A build of the count path of its own (`LionCountPathBuild.slicerange`), beside each of the builds
+§52 made - with the slices' aggregates and without - in which every range on a column whose index
+slices it is a source from the slices:
+
+- **Which ranges.** A range on a column whose clauses are matched to an index that slices it at its
+  type's width (`lion_range_sliced_index()`: the first whole lion index of the column, which is the
+  one `lion_match_index()` takes), with bounds of types the encoding takes - outside the scope of a
+  partial index. Not one that bounds the walk of a `GROUP BY` or `count(DISTINCT)` of its own
+  column, whose entries the walk reads anyway; never the summed driver of §28. An OR's range leaf
+  likewise (a union holds the §9 pin, which it now does). `x <> c` on such a column, outside the
+  ORs and the filtered counts' conditions, is made a range with a HOLE (§35) - a positive source,
+  where it is otherwise a negated one that only subtracts - and joins any other range on the column
+  in the one fold (`lion_index_answers()` takes strategy 10 for a RANGESRC). Every bound is marked
+  `LION_CLAUSE_SLICED` in the plan's clause kinds, beside §32's `LION_CLAUSE_WALK`, which a range
+  from slices never is.
+- **Declined** where the build has no range to answer so (no duplicate of the other build), and on
+  a partitioned table, an FK-side or anti join, a `SELECT DISTINCT`'s groups and a hot standby
+  (`lion_query_may_slice_ranges()`), and with `pg_lion.enable_slice_ranges` off.
+- **The price** (§53.5) is the build's own; `add_path()` keeps the cheapest of it, the build that
+  walks and sums the entries, the summaries' collections, and core's paths. That is the whole of
+  "summaries at selective ranges, slices at wide ones": each prices what it reads.
+
+`pg_lion.prefer_slice_ranges` (off; for the tests) leaves the other builds out where the build from
+slices is made.
+
+### 53.5 Cost (`lion_cost_slice_range()`, four settings)
+
+A range from slices is a range taken as a source (§32, "Costs"): its rows, the planner's selectivity
+of its bounds, are a source of the AND like any, priced by the count model as before. What differs
+is the collection, which `lion_count_rel_range_source()` prices by `lion_cost_slice_range()` for a
+range whose first bound the build marked (the planner hands the cost model the list of them,
+`lion_cost_set_sliced()`, around its pricing of the build), in place of §32's
+`lion_cost_range_source()` - and which is never priced walked. From what the slices' entries record
+(`lion_slice_shape()`, as §52.6 reads it):
+
+- **the keys**: E's container keys - its rows over the heap's keys - each folded at
+  `pg_lion.slice_range_key_cost` (700 `cpu_operator_cost`, 1.4 us at 500 units a millisecond: E's
+  container laid out, the comparisons' images begun, the key's rows counted for a container);
+- **the steps**: one comparison for a range bounded on one side, two on both, each taking at a key
+  the bits every row of the column agrees on from the top (`topconst`: the slices of no row and of
+  every row, which the shape says), two more, and - where the column is not in the heap's order,
+  its correlation's square interpolating - log2 of the rows a key, which a uniform column's need to
+  part from the constant: 15 of an int4's 32 at 7,700 rows a key (14.3 measured), 11.7 measured
+  for a sequential int4 (its nine constant top bits and 2.7), 23.8 for a sequential int8 (21 and
+  2.8). A step is
+  `pg_lion.slice_range_step_cost` (8) and `slice_range_word_cost` (0.1) a word of the key's
+  width: 20.8, 42 ns, at a width of 2;
+- **the slices read**: E and the top `steps` slices at E's keys, as §52's counts read a slice
+  (`lion_slice_read_cost()`: each container met, each posting page read and copied, the seeks);
+- **the copy**: a container of the range's rows a key they lie at - a key of the heap's each for a
+  column in no order, their share of the keys for one in order, the correlation interpolating as
+  for §32's union - at `pg_lion.slice_range_container_cost` (900, 1.8 us: the image made a
+  container and optimized, copied into the copy, and its AND with E's container in the count), and
+  E read again at those keys; within what the ranges before it left of a hash table's memory, or
+  past it into a file written and read once.
+
+Fitted on §53.7's 5M rows and five columns - uniform and sequential int4 and int8, and a
+timestamp's microseconds in heap order - with a one-sided range on each side and a BETWEEN at 1%,
+10%, 50% and 90% of each, sixty ranges in all, by least squares over what the rest of the price
+leaves of each one's time at 500 units a millisecond: 680 a key, 20.4 a step at width 2, 874 a
+container. With the settings rounded to those, the price of the sixty runs at 344 to 770 units a
+millisecond, median 498, and the steps it counts were 0.94 to 1.06 times those EXPLAIN ANALYZE
+counted. DEBUG1 reports each estimate's parts: the keys, the steps a comparison, the comparisons,
+the words, the copy's containers, and the read, fold and copy prices.
+
+### 53.6 EXPLAIN
+
+    Custom Scan (LionCount)
+      Lion Indexes: t_x (x >= 100 AND x <= 5000), t_g (g = 3)
+      Range From Slices: x >= 100 AND x <= 5000 (32 slices)
+
+`Range From Slices` names each range the plan folds - a WHERE's, and an OR arm's - with its
+bounds and the slices its column has (its width). `EXPLAIN ANALYZE` adds `Slice Range Descents`
+(collections: a range once a relation, run, rescan and participant), `Slice Range Keys` (E's
+container keys folded), `Slice Range Steps` (the comparisons' steps: a slice's container laid out
+and folded at a key, the container operations the price counts) and `Slice Range Copies Spilled`;
+the range is among the `Range Sources Collected` (and `Spilled`) of §32 too.
+
+### 53.7 Measured
+
+`bench/slices_range.sql` (`psql -X -v rows=5000000 -f bench/slices_range.sql`, then `-v
+setup=off`): 5,000,000 rows on about 41,700 pages - 651 container keys of E, 7,700 rows a key -
+with five columns: `u4` and `u8` uniform over their types, `s4` and `s8` the row number (`s8` times
+1,000,003) in the heap's order, and `t8` a timestamp's microseconds, a row a second with a second's
+jitter, in the heap's order. Each under a one-column lion index with slices, without summaries
+(phase 1), with them (phase 2) and with a btree beside (phase 3); each range a `BETWEEN` centred
+in the column's values, of 0.1% to 90% of the rows. PostgreSQL 16 at -O2 without assertions, four
+cores of a 2.80 GHz Xeon shared with another session's builds and tests (a load of about two), no
+parallel workers, `work_mem` 64 MB; each number the median of five runs, the shapes taken in turn,
+warm. `slices` is the range from slices (`pg_lion.prefer_slice_ranges`, the other scans off);
+`walk` the same count with `pg_lion.enable_slice_ranges` off, on the index without summaries
+(§28's walk of the range's entries); `summaries` the same on the index with them (§32); `ordinary`
+the plan with the pushdown off; `btree` the same with a btree on the column beside (an index-only
+scan); `plan` what the planner chose at its defaults, and its time, on the index without summaries
+and with them. Every answer of each was compared with the ordinary plan's. ms:
+
+**count(\*)**:
+
+| col | %   | slices | walk    | summaries | ordinary | btree | plan, no summaries  | plan, summaries     |
+|-----|-----|--------|---------|-----------|----------|-------|---------------------|---------------------|
+| u4  | 0.1 | 7.7    | 1.6     | 1.9       | 7.2      | 0.7   | walk 1.6            | summaries 1.9       |
+| u4  | 1   | 8.4    | 14.0    | 3.6       | 47.2     | 5.9   | slices 8.3          | summaries 4.0       |
+| u4  | 10  | 7.8    | 139.3   | 7.6       | 216.2    | 57.9  | slices 7.7          | summaries 7.6       |
+| u4  | 50  | 7.4    | 712.3   | 32.3      | 361.8    | 283.1 | slices 7.4          | slices 7.4          |
+| u4  | 90  | 7.0    | 1,304.0 | 55.7      | 395.7    | 359.8 | slices 7.8          | slices 7.1          |
+| u8  | 0.1 | 7.0    | 1.6     | 0.5       | 7.3      | 0.7   | walk 1.6            | summaries 0.5       |
+| u8  | 1   | 7.9    | 13.9    | 2.2       | 47.4     | 5.9   | slices 8.2          | summaries 2.2       |
+| u8  | 10  | 7.4    | 137.3   | 7.2       | 202.6    | 56.7  | slices 7.5          | summaries 7.4       |
+| u8  | 50  | 7.3    | 746.4   | 34.8      | 386.3    | 284.2 | slices 7.4          | slices 6.9          |
+| u8  | 90  | 7.1    | 1,251.8 | 61.6      | 374.8    | 422.0 | slices 7.5          | slices 8.0          |
+| s4  | 0.1 | 2.6    | 1.3     | 1.4       | 2.1      | 0.5   | Index Scan 2.1      | Index Scan 2.1      |
+| s4  | 1   | 2.7    | 12.0    | 1.4       | 20.4     | 4.1   | slices 2.8          | summaries 1.4       |
+| s4  | 10  | 3.4    | 128.7   | 1.3       | 204.2    | 39.4  | slices 3.6          | summaries 1.3       |
+| s4  | 50  | 6.0    | 629.8   | 2.0       | 327.5    | 195.1 | slices 6.3          | summaries 2.0       |
+| s4  | 90  | 8.3    | 1,054.3 | 2.7       | 356.1    | 397.1 | slices 8.4          | summaries 2.7       |
+| s8  | 0.1 | 3.2    | 1.3     | 1.4       | 2.1      | 0.6   | Index Scan 2.1      | Index Scan 2.2      |
+| s8  | 1   | 3.2    | 11.7    | 1.3       | 20.0     | 4.1   | slices 3.4          | summaries 1.4       |
+| s8  | 10  | 3.9    | 115.7   | 1.4       | 198.7    | 47.2  | slices 4.0          | summaries 1.3       |
+| s8  | 50  | 6.6    | 575.7   | 2.0       | 329.4    | 237.6 | slices 6.6          | summaries 1.9       |
+| s8  | 90  | 9.0    | 1,081.0 | 2.7       | 379.4    | 393.9 | slices 9.0          | summaries 2.7       |
+| t8  | 0.1 | 4.5    | 1.3     | 1.5       | 2.2      | 0.5   | Index Scan 2.2      | Index Scan 2.2      |
+| t8  | 1   | 4.7    | 11.8    | 1.4       | 20.5     | 4.3   | slices 4.7          | summaries 1.4       |
+| t8  | 10  | 5.4    | 117.2   | 1.4       | 204.1    | 42.7  | slices 5.3          | summaries 1.3       |
+| t8  | 50  | 8.1    | 610.0   | 2.0       | 360.2    | 199.7 | slices 8.1          | summaries 2.0       |
+| t8  | 90  | 10.4   | 1,077.0 | 2.6       | 390.5    | 406.5 | slices 10.5         | summaries 2.6       |
+
+(`Index Scan` is the lion index's own plain scan under an Aggregate, §29.) With the btree beside,
+the planner took its index-only scan at 0.1% (0.6 to 0.8 ms) and the LionCount node from 1% up -
+the summaries, and the slices at 50% and 90% of u4 and u8 (7.7 to 8.0 ms).
+
+**sum(x)** under the range, end to end (§52's sum of the slices over the copy, against its sum
+over C0 collected from the summaries and entries; the medians of three such runs, after §53.8's
+price of that collection; `btree` and `ordinary` from the first):
+
+| col | %   | slices | summaries | ordinary | btree | plan, summaries     |
+|-----|-----|--------|-----------|----------|-------|---------------------|
+| u4  | 0.1 | 14.3   | 10.1      | 7.2      | 0.7   | summaries 10.1      |
+| u4  | 1   | 15.6   | 14.2      | 45.4     | 6.7   | summaries 14.2      |
+| u4  | 10  | 15.2   | 33.3      | 154.9    | 63.7  | slices 15.6         |
+| u4  | 50  | 14.1   | 66.3      | 386.4    | 291.6 | slices 14.3         |
+| u4  | 90  | 14.5   | 91.3      | 468.3    | 384.2 | slices 14.8         |
+| u8  | 0.1 | 20.6   | 14.7      | 8.1      | 0.8   | summaries 14.7      |
+| u8  | 1   | 21.5   | 20.6      | 45.8     | 6.2   | summaries 20.8      |
+| u8  | 10  | 21.2   | 36.4      | 161.4    | 75.6  | slices 21.0         |
+| u8  | 50  | 21.0   | 68.8      | 393.9    | 409.2 | slices 21.5         |
+| u8  | 90  | 21.4   | 99.3      | 393.2    | 422.5 | slices 21.3         |
+| s4  | 0.1 | 2.9    | 2.3       | 2.3      | 1.0   | Index Scan 2.6      |
+| s4  | 1   | 3.1    | 2.6       | 6.7      | 4.4   | Index Scan 7.1      |
+| s4  | 10  | 4.2    | 3.6       | 57.0     | 40.9  | summaries 3.4       |
+| s4  | 50  | 9.4    | 10.4      | 280.5    | 198.7 | slices 9.7          |
+| s4  | 90  | 14.9   | 17.8      | 412.4    | 368.8 | slices 14.8         |
+| s8  | 0.1 | 3.2    | 2.2       | 2.4      | 0.5   | Index Scan 2.4      |
+| s8  | 1   | 3.6    | 2.4       | 7.0      | 4.3   | Index Scan 7.2      |
+| s8  | 10  | 5.0    | 3.8       | 54.7     | 41.5  | summaries 4.0       |
+| s8  | 50  | 13.0   | 12.6      | 276.1    | 208.8 | slices 13.4         |
+| s8  | 90  | 20.1   | 21.5      | 418.3    | 472.4 | slices 19.7         |
+| t8  | 0.1 | 4.7    | 2.3       | 2.3      | 1.0   | Index Scan 2.5      |
+| t8  | 1   | 4.8    | 2.5       | 7.1      | 4.4   | Index Scan 7.2      |
+| t8  | 10  | 6.7    | 4.1       | 56.0     | 48.8  | summaries 3.9       |
+| t8  | 50  | 15.3   | 13.4      | 268.5    | 215.3 | summaries 13.5      |
+| t8  | 90  | 23.3   | 23.0      | 425.6    | 455.4 | slices 22.8         |
+
+What the tables say:
+
+- **A range from slices costs about the same at any width** on a column in no order: 7.0 to 8.4 ms
+  for the count at 0.1% and at 90% of u4 and u8 - every key of E folded through about 14 steps a
+  comparison (14.3 measured, for an int8 as for an int4: the steps are what 7,700 rows need to part
+  from the constant, not the type's bits), and a container of the copy at every key. On a column in
+  the heap's order it grows with the keys the range spans, 2.6 to 10.4 ms, the keys outside it
+  stopping at their first bit that differs from the bounds' and giving no container.
+- **Against the walk** of its entries the range from slices is 1.7 to 186 times faster from 1% up;
+  at 0.1%, 5,000 entries walked (1.3 to 1.6 ms) are faster, and the planner walks them.
+- **Against the summaries** it depends on the column's order. A column in no order spreads each
+  bucket's rows over the whole heap, so what the summaries read grows with the buckets a range
+  covers: 0.5 to 3.6 ms at up to 1%, a tie at 10% (7.2 to 7.6 ms), 32 to 62 ms from 50% up, where
+  the slices are 4.4 to 8.7 times faster. A column in the heap's order keeps a bucket's rows in a
+  few keys, whose summaries are a few containers: 1.3 to 2.7 ms at any width, 1.9 to 4 times the
+  slices' speed. The planner chose the faster wherever the two were not tied - summaries for the
+  selective ranges and for the ordered columns, slices for the wide ranges of the uniform ones,
+  §53.4's "each prices what it reads" - but at 0.1% of an ordered column (below).
+- **Against the btree's index-only scan**: 7.4 to 12 times faster at 10%, 39 to 59 at 90%; at 0.1%
+  the btree's 0.5 to 0.8 ms wins, and the planner takes it when it is there.
+- **sum(x)**: the slices' sum under a range from slices is 14 to 16 ms on u4 and 21 on u8 at any
+  width - the range's fold, then §52's 33 (or 65) counted ANDs at the copy's keys. Over C0 collected
+  from the summaries and entries it grows with the range, 10 to 91 ms (u4); from 10% up the slices
+  are 2.2 to 6.3 times faster and the planner takes them, below it keeps the summaries, 1.1 to 1.4
+  times faster. On the ordered columns the two are within 20% of each other from 50% up, and the
+  planner takes either. (Before §53.8's price of C0's collection it took the summaries at 10% of
+  u4 and u8, 31 and 38 ms against the slices' 15 and 22.)
+- **Where the planner was wrong**, it was in prices this section did not set: the lion index's
+  plain scan (§29) taken at 0.1% of an ordered column, 2.1 ms against the walk's 1.3, and for the
+  sum of 1% of one, 7.1 to 7.2 ms against the summaries' 2.4 to 2.6; and the summaries' sum at
+  0.1% of u4 and u8, 10.1 and 14.7 ms, against the ordinary plan's 7.2 and 8.1 (§53.10).
+
+### 53.8 Beside it
+
+- **The parallel count** (§10, "A count in parallel") divides the WHERE's keys among its
+  participants; each folds the range over E for itself, as each collects §32's ranges, and counts
+  its share. A `GROUP BY` beside a range taken as a source stays serial, as beside any.
+- **§52's summed range is priced as collected.** The slices' aggregates collect a range that
+  bounds the sum over its entries for their WHERE (C0, `lion_slice_where_sources()`), which
+  `lion_cost_slice_path()` took to be within half of the WHERE's price; it is now priced as §32
+  prices a range taken as a source (`lion_cost_range_source()`, its memory and spill), once, beside
+  the WHERE (§52.12's "underpriced" bullet). Without it the build from slices lost to that one at
+  10% of a uniform column's sum, whose collection it priced at a fifth of its time (§53.7).
+- **The copy's building** - `lion_collect_begin()`, `lion_collect_add()` and
+  `lion_collect_finish()` (lion_count.c) - is factored out of `lion_sources_collect_keys()`, which
+  calls them as before; the fold hands them its containers a key at a time.
+- **A range from slices is never served from a private copy of E** on its second use, as a
+  located set may be (`nomaterialize`): E carries the source's pin.
+- **New settings**: `pg_lion.enable_slice_ranges` (on), `pg_lion.prefer_slice_ranges` (off, not in
+  the sample file), and the four costs of §53.5.
+- **lion_planes.c** gains `lion_planes_bsi_step()` and its unit tests; lion_slice.c gains the
+  counting side (`lion_slice_range_*()`), nothing on the insert side.
+
+### 53.9 Tests
+
+- `test/sql/slices_range.sql`: every answer against the ordinary plan (the pushdown off, a
+  sequential scan) as multisets, with how its ranges were answered (`slr_q()`: from slices, not, or
+  no pushdown), under `pg_lion.prefer_slice_ranges`: each type of the allowlist with NULLs,
+  negatives, each type's extremes and the next ones in, and the infinities - every operator, BETWEEN
+  and `<>`, bounds at, beside and past the type's range (an int4 or int8 bound on an int2 column, an
+  int8 one on an int4), reversed and crossed bounds, several bounds and holes on one column; beside
+  equalities, lists, null tests, `<>` and ranges of other columns, two ranges from slices, a range
+  and an equality or a list on one column; a `GROUP BY` of another column, of two, and of the
+  range's own (still a bound), the top k and `count(DISTINCT)`; §52's aggregates of the same and of
+  other columns, the one row and a `GROUP BY`'s groups decoded and a group at a time; an OR's
+  leaves, `BETWEEN SYMMETRIC`; a generic plan's parameters (NULL, crossed, past the type), stable
+  expressions, a LATERAL rescan; deletes and updates on a dirty heap, this transaction's rows at the
+  extremes, deleted and updated, rolled back, and VACUUM; a copy past a 64 kB `work_mem`, spilled;
+  the plans and `EXPLAIN ANALYZE`'s counters; a parallel count's Gather, and a `GROUP BY` beside it
+  kept serial; the planner's choice, with nothing preferred, over 100,000 unique values with
+  summaries and slices and with slices alone, at 0.1% and 60%, and with the switch off; the declines:
+  a float column, a partitioned table, a join, a column no index slices, the switch off.
+- `test/isolation/slices_range.spec`: ranges from slices, a `<>`, an OR and a sum under a range,
+  beside the same counts of expressions of the columns, which only the ordinary plan computes, in
+  one statement: a REPEATABLE READ reader across a writer's rows at every column's extremes, updates
+  that move rows across the bounds and deletes, committed, rolled back, and VACUUMed under the
+  reader's snapshot.
+- `test/unit/planes_test.c`: `lion_planes_bsi_step()`'s LT, GT and EQ folded over random columns of
+  8 to 64 bits and 1 to 512 words, against the values compared one by one, stopped where EQ
+  empties and run to the last bit.
+- `test/sql/slices.sql`'s wide range on its sliced column is now answered from the slices; it
+  shows that plan and keeps its answers on the summaries' walk with the switch off.
+- `costgucs.sql` lists the four settings.
+- The whole suite: 192 regression and 33 isolation tests in generic WAL mode and again with the
+  resource manager registered (`shared_preload_libraries = pg_lion`, an index built there reporting
+  `rmgr`), the injection-point specs skipped on this build as always; the unit tests.
+
+### 53.10 Not done
+
+- **The AM's own scans** (`amgetbitmap`, `amgettuple`) of a range on a sliced column still walk its
+  keys or its summaries (§28, "Bitmap scans"; §29.3). What it would take, on §28's template: in
+  `liongetbitmap()`, a range key on a sliced column priced (in `lioncostestimate()`) cheaper folded
+  than walked would be folded at each container key of E - or, beside other columns' sets, at the
+  keys of each window of their stream (`lion_emit_intersect()`), E and the slices sought there - and
+  the key's rows added to the caller's bitmap, or ANDed with the window's container first; the
+  bitmap scan needs no §9 interlock, since the executor visits every TID it emits, so the fold
+  holds no pin, as here. The plain scan's stream (§29.3) would take the folded containers a window
+  at a time the same way. Neither changes the format; the price is §53.5's with the copy left out.
+- **Partitioned tables, joins**: each partition would fold its own index's slices, and the
+  planner's build decide per partition - the slices' index is matched per relation already
+  (§16), but the build is declined whole, as §52's is. The FK-side join's fact filters (§27) and
+  the anti join's take ranges as §32's sources only. A filtered count's condition (§10, "Filtered
+  counts") takes its ranges from the entries.
+- **The fold at the WHERE's keys alone**: beside a selective clause, E's keys are mostly keys the
+  count never reaches. Folding only at the keys of the other sources (sought as the probe of §32
+  seeks a summed range's sets) would make the copy the WHERE's and no longer a source of its own,
+  which is what kept everything downstream unchanged; the planner's choice of the summaries or the
+  walk for a selective range covers the case where it matters most. Likewise each participant of
+  a parallel count folds the whole of E, where its share of the keys would do.
+- **A BETWEEN's two comparisons share their EQ** while lo and hi agree on their top bits, and could
+  be folded as one there: a BETWEEN of u4 took 9.4 ms where one bound took 7.5 in §53.5's runs, the
+  steps the sharing would save.
+- **The full domain at plan time**: bounds every value meets are E alone at run time (§53.1), but
+  the planner prices the fold all the same; and an `x <> c` alone, which is E less c's rows, is
+  priced and run as a fold with one EQ, where E and c's entry, subtracted, would do with no fold.
+- **The competitors' prices** (§53.7): the lion index's plain scan (§29) is taken for a range of
+  0.1% of a column in the heap's order, 2.1 ms, over the walk's 1.3, and for the sum of 1% of one,
+  7.1 ms, over the summaries' 2.6; the summaries' sum of 0.1% of a uniform column is taken at 10 to
+  15 ms over the ordinary plan's 7 to 8. Neither is this section's price, nor changed by it.
+- **On a hot standby** the planner offers none of this, as none of §32's collections (§10).
+- **Percentiles** and the rest of §52.12 stand.
