@@ -40,6 +40,7 @@ then queries run without them (each backend warns once), and inserts into their 
 | --- | --- |
 | Dashboards, facet counts, `GROUP BY` over large tables | **Lion.** This is what it is for. |
 | Range counts on a column with many distinct values (timestamps, ids) | Lion `WITH (summaries = auto)` |
+| Sums, averages and extremes of an integer column under filters, and wide ranges on it | Lion `WITH (slices = on)` on that column (see below) |
 | Array membership and full-text search, especially counts | Lion. Phrases and ranking come from the index too. |
 | jsonb `@>`, `?` and jsonpath filters, especially counts | Lion |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column | B-tree |
@@ -94,9 +95,9 @@ SELECT country, count(*) FROM events GROUP BY country ORDER BY count(*) DESC LIM
 ```
 
 All three are answered from the indexes. Grouping by several lion-indexed columns works too, as do
-`count(DISTINCT col)` and `sum`/`min`/`max` of an indexed column over the whole table. Partitioned
-tables are counted partition by partition, and filters that a partition's bounds already imply are
-skipped.
+`count(DISTINCT col)` and `sum`/`min`/`max` of an indexed column over the whole table, or under any
+filter and per group when the column is sliced (below). Partitioned tables are counted partition
+by partition, and filters that a partition's bounds already imply are skipped.
 
 ### Ranges
 
@@ -109,6 +110,30 @@ SELECT count(*) FROM events WHERE created_at >= now() - interval '7 days';
 Without `summaries`, a range reads every distinct value inside it, which is slow for a timestamp
 column. With them, lion keeps a pre-merged bitmap per block of about 4,096 rows and reads those
 instead.
+
+### Sums, extremes and wide ranges from bit slices
+
+```sql
+CREATE INDEX events_amount ON events USING lion (amount) WITH (slices = on);
+
+SELECT sum(amount), avg(amount), max(amount) FROM events WHERE country = 'JP';
+SELECT country, sum(amount), min(amount) FROM events WHERE device = 'ios' GROUP BY country;
+SELECT count(*) FROM events WHERE amount > 100;
+```
+
+A sliced integer, date, time or timestamp column keeps one bitmap per bit of its values beside its
+ordinary entries. A sum under a filter is then the sum over bits of 2^i times the rows of bit i's
+bitmap that pass the filter, a minimum or maximum a descent from the top bit, and a range on the
+column a comparison from the top bit down at each block of heap pages, so the work grows with the
+column's width and the filter's bitmaps, not with the rows or the distinct values the query covers
+(`Aggregates From Slices` and `Range From Slices` in `EXPLAIN`). On 5M rows a sum under a 10%
+filter took 7 ms where the ordinary plan took 166, the sum, minimum and maximum of each of 200
+groups 41 ms against 181, and a count over half the rows of a column of distinct values 7 ms
+against 32 from summaries and 362 for the ordinary plan; a selective range stays with the
+summaries or the values, and the planner prices each. The price is on writes: every set bit of a
+value is one more posting-set insert, so an `INSERT` into a table with two sliced columns took 4.6
+times as long as without slices with `pg_lion` preloaded. Floats, `numeric`, joins and partitioned
+tables are not answered from slices yet ([GUIDE.md](docs/GUIDE.md), DESIGN.md §51 to §53).
 
 ### Joins
 
@@ -282,7 +307,11 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
 - No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans
   (of lion's own indexes: a `lionvec` scan can run in parallel).
   Use a covering B-tree for ordered or row-returning queries, as shown above.
-- Inserts are about 1.5× slower than B-tree.
+- Inserts are about 1.5× slower than B-tree. A sliced column (`WITH (slices = on)`) pays a
+  posting-set insert per set bit of each value on top: an `INSERT` into a table with a sliced
+  `int4` and a sliced `int8` column took 4.6× as long as without slices with `pg_lion` preloaded,
+  and about 11× without it. Slices serve int2, int4, int8, date, time and timestamp columns on one
+  table; not floats, `numeric`, joins or partitioned tables.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
 - A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and
   is slower than GIN.
