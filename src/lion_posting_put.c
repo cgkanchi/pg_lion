@@ -223,14 +223,31 @@ lion_tree_put_items_locked(Relation index, Relation heaprel, Buffer buf,
 		 * cur comes off the page, and the item is copied out of a work buffer
 		 * of LION_CONTAINER_MAX_SIZE bytes, so a page that claims more than
 		 * that (only a corrupt one can) gets the exact size.
+		 *
+		 * An INSERT's rewrite (slack) keeps the length only while it leaves
+		 * the item LION_ITEM_SLACK_MIN bytes to grow into, and otherwise
+		 * gives it fresh slack when the page has room (DESIGN.md §51,
+		 * "Insert cost, revisited").  A rewrite that left the length as it
+		 * was with no room in it put the next member on the general path
+		 * again, and a RUN never gets out of that by itself: a member that
+		 * extends a run changes no size, but the in-place add asks for the
+		 * bytes of one more run whatever it does (lion_container_inplace_
+		 * need()), so every row of a heap page that filled the slack with
+		 * its new run rewrote the item at the same length - a quarter of the
+		 * inserts into a sliced column's existence slice.
 		 */
 		if (cur >= sizes[0] && cur <= (Size) LION_CONTAINER_MAX_SIZE &&
-			cur - sizes[0] <= LION_ITEM_SLACK_BOUND)
+			cur - sizes[0] <= LION_ITEM_SLACK_BOUND &&
+			(!slack || allocs[0] == sizes[0] ||
+			 cur - sizes[0] >= LION_ITEM_SLACK_MIN))
 			writesz = cur;
 		else if (slack &&
 				 MAXALIGN(allocs[0]) <=
 				 MAXALIGN(cur) + PageGetExactFreeSpace(page))
 			writesz = allocs[0];
+		else if (cur >= sizes[0] && cur <= (Size) LION_CONTAINER_MAX_SIZE &&
+				 cur - sizes[0] <= LION_ITEM_SLACK_BOUND)
+			writesz = cur;		/* no room for slack: as it was */
 		lion_item_zero_slack(items[0], sizes[0], writesz);
 
 		{

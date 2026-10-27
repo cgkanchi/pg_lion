@@ -87,6 +87,20 @@ CREATE INDEX lion_rec_ct  ON lion_rec USING lion (ct);
 CREATE INDEX lion_rec_b   ON lion_rec USING lion (b)   WITH (inline_limit = 64);
 CREATE INDEX lion_rec_arr ON lion_rec USING lion (arr) WITH (inline_limit = 64);
 
+/*
+ * BIT SLICES (DESIGN.md §51), filled by aminsert too: an int8, a nullable
+ * int4, and an int4 expression that is a small value but for one row in 97,
+ * which is negative and alone sets bits 10 to 30 of its encoding.  So every
+ * row the writer inserts goes into a few dozen slices of each column, one
+ * walk of the leaves a column, the dense slices' adds in place on their
+ * posting trees' tails three to a record and the rare bits' INLINE slices
+ * beside them (§51, "Insert cost, revisited") - the records every crash
+ * round replays - and VACUUM takes the deleted rows out of all of them.
+ */
+CREATE INDEX lion_rec_slc ON lion_rec USING lion
+	(id, nn, ((CASE WHEN id % 97 = 0 THEN -id ELSE id % 1000 END)::int4))
+	WITH (slices = on);
+
 INSERT INTO lion_rec
 SELECT g.* FROM generate_series(1, 40000) i, lion_rec_gen(i) g;
 
@@ -230,6 +244,8 @@ LANGUAGE sql IMMUTABLE AS $$
 	  ('lion_rec_nn', 'select count(*) from lion_rec'),
 	  /* ... two columns of it; the summaries' rows are counted apart. */
 	  ('lion_rec_sum', 'select 2 * (select count(*) from lion_rec)'),
+	  /* ... three, and the slices' rows are counted apart too. */
+	  ('lion_rec_slc', 'select 3 * (select count(*) from lion_rec)'),
 	  /* The multicolumn index (DESIGN.md §24): ntids over ALL its columns.
 	   * The per-column totals are checked by lion_rec_mc_columns() below. */
 	  ('lion_rec_mc',
@@ -403,6 +419,33 @@ END $$;
  *                   vacuumed with nothing else running; otherwise ntids may
  *                   still hold TIDs of dead tuples and only >= is required.
  */
+/*
+ * Key column attno of lion_rec_slc from its slices (lion_index_slice_agg())
+ * against a sequential scan, with no lion path to answer the scan.
+ */
+CREATE FUNCTION lion_rec_slice_cmp(attno int2) RETURNS text
+LANGUAGE plpgsql
+SET enable_indexscan = off SET enable_bitmapscan = off
+SET pg_lion.enable_count_pushdown = off AS $$
+DECLARE
+	l record;
+	q record;
+	col text := pg_get_indexdef('lion_rec_slc'::regclass, attno, true);
+BEGIN
+	SELECT * INTO l FROM lion_index_slice_agg('lion_rec_slc', NULL, attno);
+	EXECUTE format('SELECT count(%1$s) AS count, sum(%1$s)::numeric AS sum, '
+				   'min(%1$s)::text AS min, max(%1$s)::text AS max FROM lion_rec',
+				   col) INTO q;
+	IF (l.count, l.sum, l.min, l.max) IS NOT DISTINCT FROM
+		(q.count, q.sum, q.min, q.max) THEN
+		RETURN format('slices of lion_rec_slc column %s (%s): %s rows, sum %s, %s .. %s',
+					  attno, col, l.count, l.sum, l.min, l.max);
+	END IF;
+	RETURN format('MISMATCH slices of lion_rec_slc column %s (%s): %s %s %s %s, scan %s %s %s %s',
+				  attno, col, l.count, l.sum, l.min, l.max,
+				  q.count, q.sum, q.min, q.max);
+END $$;
+
 CREATE FUNCTION lion_rec_check(heapallindexed boolean DEFAULT true,
 							  exact_ntids boolean DEFAULT false)
 RETURNS TABLE (ok boolean, detail text)
@@ -578,6 +621,20 @@ BEGIN
 	detail := format('lion_rec_mc column 4 (arr) nullelem_tids = %s, heap wants %s%s',
 					 got, want, CASE WHEN ok THEN '' ELSE ' MISMATCH' END);
 	RETURN NEXT;
+
+	/*
+	 * 3c. the bit slices (DESIGN.md §51): count, sum, min and max of each
+	 * sliced column from its slices alone, against the same of a sequential
+	 * scan.  Each is a count under this statement's snapshot, so exact with
+	 * dead rows in the slices, before a VACUUM as after one, and on a
+	 * standby too, where the descent for min and max collects nothing.
+	 */
+	FOR r IN SELECT a AS attno FROM generate_series(1, 3) a LOOP
+		res := lion_rec_slice_cmp(r.attno::int2);
+		ok := res NOT LIKE 'MISMATCH%';
+		detail := res;
+		RETURN NEXT;
+	END LOOP;
 
 	/* 4. single-key counts: index vs seqscan vs count() vs pushdown. */
 	FOR r IN SELECT * FROM lion_rec_keys() LOOP

@@ -1490,6 +1490,119 @@ lion_dir_find_ext(Relation index, Relation heaprel, LionIndexState *ix,
 }
 
 /*
+ * The next of the SLICE keys a writer puts one row into, in ascending order,
+ * found from the leaf it already holds (DESIGN.md §51, "Insert cost,
+ * revisited").  *bufp is a directory leaf the caller holds EXCLUSIVE, reached
+ * for an earlier key of the same walk - by lion_dir_find() with forwrite or
+ * by this function - and held since; *bufp may be replaced by a leaf to its
+ * right, which is then the one held, and *offnum is the entry, or where it
+ * belongs.
+ *
+ * What a fresh descent would do from the leaf it lands on, from here: move
+ * right while the leaf's high key does not exceed sk, finishing every
+ * unfinished split the walk steps onto (a writer must not step over one,
+ * lion_dir_descend()), then search the leaf.  The held leaf's range begins
+ * at or below sk - it held the earlier key, and a split of it while it was
+ * held (an entry that grew, a new one) kept its lower bound and moved what
+ * sorts above the cut to the right - so the walk ends on the leaf whose range
+ * holds sk, the leaf every writer of sk descends to.  Moving right releases
+ * the leaf before it locks the sibling, as the descent's move-right does
+ * (lion_dir_step_right()), and so holds nothing but one leaf at a time.
+ *
+ * Only for a key whose prefix run is at most one entry: a SLICE key carries
+ * its position in the prefix (lion_cmp_prefix()), so two slices never tie
+ * and no run spans pages, and find-or-create needs no guard - holding the
+ * leaf that holds sk serialises its writers, as lion_dir_find() does when
+ * the run stays on one page.
+ */
+bool
+lion_dir_find_next(Relation index, Relation heaprel, LionIndexState *ix,
+				   const LionSearchKey *sk, OffsetNumber hint, Buffer *bufp,
+				   OffsetNumber *offnum)
+{
+	Buffer		buf = *bufp;
+	Page		page;
+	OffsetNumber off = InvalidOffsetNumber;
+	OffsetNumber first;
+	OffsetNumber maxoff;
+	bool		moved = false;
+	LionRightWalk walk;
+
+	Assert(sk->kind == LION_KIND_SLICE && sk->raw != NULL);
+	Assert(LionPageIsLeaf(BufferGetPage(buf)));
+
+	lion_rightwalk_init(&walk);
+	for (;;)
+	{
+		page = BufferGetPage(buf);
+		if (LionPageIsRightmost(page))
+			break;
+		if (LionPageIncompleteSplit(page))
+		{
+			lion_dir_finish_split(index, heaprel, ix, buf);
+			continue;
+		}
+		if (lion_cmp_entry(lion_page_highkey(page), sk) > 0)
+			break;
+		buf = lion_dir_step_right(index, buf, BUFFER_LOCK_EXCLUSIVE, &walk);
+		moved = true;
+	}
+
+	/*
+	 * On the leaf it held, the walk's next slice is a step or two past the
+	 * last one (hint), the positions between them that the row has not set:
+	 * look there before searching, once the item before the hint is seen to
+	 * sort below sk, which makes the first item at or above sk one at or
+	 * past it whatever happened on the leaf since.
+	 */
+	page = BufferGetPage(buf);
+	first = lion_page_first_data(page);
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (!moved && OffsetNumberIsValid(hint) && hint >= first &&
+		hint <= OffsetNumberNext(maxoff) &&
+		(hint == first ||
+		 lion_cmp_entry(lion_page_item(page, OffsetNumberPrev(hint)), sk) < 0))
+	{
+		int			steps;
+
+		for (off = hint, steps = 0; off <= maxoff; off++, steps++)
+		{
+			if (steps == 8)
+			{
+				off = InvalidOffsetNumber;
+				break;
+			}
+			if (lion_cmp_entry(lion_page_item(page, off), sk) >= 0)
+				break;
+		}
+	}
+	if (!OffsetNumberIsValid(off))
+		off = lion_page_binsrch_ext(page, sk, false);
+	*bufp = buf;
+	*offnum = off;
+
+	return off <= maxoff &&
+		lion_cmp_prefix(lion_page_item(page, off), sk) == 0;
+}
+
+/*
+ * Would lion_dir_find_next() look for sk on the leaf buf itself, which the
+ * caller holds - is buf the rightmost leaf, or does its high key exceed sk?
+ * (A leaf the caller holds EXCLUSIVE is never flagged INCOMPLETE_SPLIT: a
+ * descent repairs the leaf it lands on, and a split the caller made of it
+ * finished before the split returned.)
+ */
+bool
+lion_dir_leaf_holds(Buffer buf, const LionSearchKey *sk)
+{
+	Page		page = BufferGetPage(buf);
+
+	return LionPageIsRightmost(page) ||
+		(!LionPageIncompleteSplit(page) &&
+		 lion_cmp_entry(lion_page_highkey(page), sk) > 0);
+}
+
+/*
  * The leaf where one key column's run of entries begins (DESIGN.md §24).
  *
  * Every entry of that column sorts at or above (attno, MINF), which is a

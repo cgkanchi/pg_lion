@@ -2011,6 +2011,21 @@ extern bool lion_dir_find_ext(Relation index, Relation heaprel,
 							 BufferAccessStrategy strategy);
 
 /*
+ * lion_dir_find() with forwrite for the next SLICE key of a walk, in
+ * ascending order, from the leaf *buf the caller holds EXCLUSIVE since it
+ * found an earlier key of the walk: moves right as a descent would (and may
+ * leave a leaf further right in *buf), never needs a guard (DESIGN.md §51,
+ * "Insert cost, revisited").  hint, when valid, is the offset of the earlier
+ * key on that leaf, where the search may begin.
+ */
+extern bool lion_dir_find_next(Relation index, Relation heaprel,
+							   LionIndexState *ix, const LionSearchKey *sk,
+							   OffsetNumber hint, Buffer *buf,
+							   OffsetNumber *offnum);
+/* ... and whether it would look on the held leaf buf itself */
+extern bool lion_dir_leaf_holds(Buffer buf, const LionSearchKey *sk);
+
+/*
  * The pieces of the above, for a caller that walks the leaves itself; _ext
  * reads the sibling through strategy.
  */
