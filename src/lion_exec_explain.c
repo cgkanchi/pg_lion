@@ -1392,6 +1392,32 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Lists Collected", NULL, lists[0], es);
 	if (lists[2] > 0)
 		ExplainPropertyInteger("Lists Spilled", NULL, lists[2], es);
+
+	/*
+	 * The ranges collected from slices (DESIGN.md §53): the collections -
+	 * each range once a relation, a run and a rescan, in every participant
+	 * - the container keys of E they folded, their bit steps (a comparison
+	 * of a slice's container with the key's rows each: the container
+	 * operations the planner prices) and the collections that went to a
+	 * file.  Only when there were any.
+	 */
+	{
+		const LionSliceRangeStats *a = &st->sliceranges;
+		const LionSliceRangeStats *w = &st->worker.sliceranges;
+
+		if (a->descents + w->descents > 0)
+		{
+			ExplainPropertyInteger("Slice Range Descents", NULL,
+								   a->descents + w->descents, es);
+			ExplainPropertyInteger("Slice Range Keys", NULL,
+								   a->keys + w->keys, es);
+			ExplainPropertyInteger("Slice Range Steps", NULL,
+								   a->steps + w->steps, es);
+		}
+		if (a->spilled + w->spilled > 0)
+			ExplainPropertyInteger("Slice Range Copies Spilled", NULL,
+								   a->spilled + w->spilled, es);
+	}
 }
 
 /*
