@@ -107,7 +107,7 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    50181|   50181
+    50167|   50167
 (1 row)
 
 via_index|via_heap
@@ -175,7 +175,7 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    50188|   50188
+    50176|   50176
 (1 row)
 
 via_index|via_heap
@@ -236,7 +236,7 @@ lion_index_verify
 
 via_index|via_heap
 ---------+--------
-    43673|   43673
+    43659|   43659
 (1 row)
 
 via_index|via_heap
