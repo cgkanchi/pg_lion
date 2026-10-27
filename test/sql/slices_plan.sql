@@ -91,8 +91,11 @@ BEGIN
 					  ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
 		IF NOT ana OR
 		   ln ~ '(LionCount|Lion Indexes|Count Filter|Aggregates From Slices|Slice|Range Sources)' THEN
-			RETURN NEXT regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
-									   'Slice Kernel: .*$', 'Slice Kernel: (the CPU''s)');
+			-- the heap rechecks depend on which pages the heap left dirty,
+			-- which differs between majors: shown as made or not, not counted
+			RETURN NEXT regexp_replace(regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
+												  'Slice Kernel: .*$', 'Slice Kernel: (the CPU''s)'),
+									   '(Slice Heap (TIDs|Blocks) Rechecked): [1-9][0-9]*$', '\1: >0');
 		END IF;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
