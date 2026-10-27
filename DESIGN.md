@@ -26034,6 +26034,69 @@ page that holds no member (§44.6).
   partitions, estimates some 40,000 candidates by plane 1 and refines 16,000, so plane 1 is about 2%
   of it. Its index's build (`REINDEX`, whose k-means and assignment estimate their candidate
   centroids by plane 1), alternated, took 142.9 and 141.5 s before and 138.4 and 139.7 after.
+  **2026-10-27: the 8-bit sum in integers (`lionvec_dot8()`).** What §44.14 found worth doing
+  instead of planes: `lionvec_estimate8()` no longer sums `recon8[c_i] qc_i` in double
+  (`lionvec_sum8()`, 16 lanes, the AVX2 kernel four doubles at a time) but takes the codes against
+  the query rounded to 16-bit integers once a scan, in `lionvec_query_init()`: `w_i = round((qc_i
+  - mid) / delta)` with `mid = (max + min) / 2` and `delta = (max - min) / 65534` over qc's own
+  range (plane 1's quantization is over the same range, in 15 steps), so that every w_i is within
+  +-32767, kept with `sum(w)` and the rounding's variance `e^2 / dimsp` (`qw`, `qmid`, `qwdelta`,
+  `qwsum`, `varq8`; `qw0` below). The kernel computes `sum(c_i w_i)` and `sum(c_i)` exactly in
+  integers: portably in sixteen 32-bit lanes over blocks of 64 runs of 16, widened to 64 bits a
+  block (a product is under 2^23, so 64 fit a lane with room), and under AVX2 sixteen codes a step
+  widened to 16 bits and multiplied in pairs by VPMADDWD into eight 32-bit lanes, widened every 64
+  steps, the bytes summed by VPSADBW; the POPCNT set runs the portable one and the AVX-512 set
+  AVX2's, as for the other kernels. Then
+
+      <r_8, q^> = (-4 + 1/64) (dimsp mid + delta sum(w)) + (1/32) (mid sum(c) + delta sum(c w))
+
+  for the rounded query q^ - the codes' reconstructions being `(-4 + 1/64) + c / 32` - of which the
+  first term is the query's alone (`qw0`, once a query), and the estimate is what it was of that
+  sum; its error adds the rounding's variance under the root, `sqrt(var1 (1 - alpha8^2) + varq8)`,
+  as plane 1's adds `varq`. The rounding is a 65,534th of the range a step, so `varq8` is some
+  `delta^2 / 12`, a hundred-thousandth of the codes' own variance at 1536 dimensions, and the
+  coverage test's calibration holds: its printed shares of rows outside 2 standard deviations
+  moved by one in the fourth decimal (0.0404 to 0.0403 at 100 dimensions under L2, 0.0414 to
+  0.0415 at 1536), nothing outside 6. The integer sums are the same in every implementation by
+  construction, whatever order each adds in, and the double arithmetic after them is the same
+  code of the same inputs under `-ffp-contract=off`, so every set still estimates the same bytes
+  (`test_kernels_agree()`). k-means' queries, one a sample row an iteration, are not rounded
+  (`qw` NULL): they never reach the codes; a scan's, the build's assignment pass's (once a row) and
+  an insert's are. `lionvec_sum8()` stays as the reference the unit test checks the estimate
+  against (and `vecplanes_eval`'s comparison row); no scan or build runs it. Tested in
+  `test_kernels()`, `test_estimate8()` and `test_query_rounding()` (§44.10): the kernel against
+  a plain integer loop at every dimsp from 64 to 8128 from unaligned pointers, over codes and
+  weights at and mixed between their extremes, every set the portable one's; the rounding's
+  every property; and the estimate against the serial sum over the rounded query (to 1e-9),
+  within the rounding's reach of the floats' (`lionvec_sum8()`'s, 0.04 of that reach at most),
+  its error as stated, every set the portable set's bytes. vec_test passes 119,449 checks
+  (119,395 without the x86-64 kernels; 119,295 and 119,262 before), under ASan and UBSan too,
+  and mutants of the kernel (an oversized block, a dropped lane or half of the byte sum, `floor`
+  for `rint`, 65,535 steps, the wrong constant, the variance over dimsp - 1 or left out of the
+  error) each fail it. Measured on this tree's machine - a 4-vCPU VM of a Xeon at 2.1 GHz with
+  AVX-512 and VPOPCNTDQ, gcc 13.3, PostgreSQL 16.15 - in `vecplanes_eval --costs` (§44.14's
+  harness, at `-O1` as the unit tests are built; ns a refine at 1536 dimensions, warm / from a
+  24 MB pool / the lines flushed, pinned to a core, one run of both rows), `lionvec_sum8()`
+  368 / 523 / 1,500 with AVX2, 365 / 511 / 1,500 with AVX-512 and 1,005 / 1,167 / 2,107
+  portably; `lionvec_dot8()` 78 / 241 / 1,136, 75 / 242 / 1,100 and 274 / 439 / 1,406 (271 /
+  438 / 1,384 with POPCNT): 4.7 times faster warm, 2.2 from the pool, 1.3 flushed. The
+  prototype's `idot16` is 57 / 205 / 1,083: the byte sum's VPSADBW shares the shuffle port with
+  the widening, 20 ns warm; a rounding grid through zero would need no `sum(c)`, for a step up
+  to twice as wide, and is not done. In a scan (`bench/results/2026-10-27-lionvec-dot8/`):
+  100,000 random unit vectors of 1536 dimensions in TOAST, `vector_cosine_ops` at the defaults,
+  the index built once by the old library (104 s) and read by both, 50 held-out queries `ORDER
+  BY embedding <=> q LIMIT 10`, everything in 4 GB of shared buffers and prewarmed, the two
+  libraries alternated over 4 sessions of 5 rounds each of every query: the sessions' medians of
+  the queries' medians 42.8 - 47.0 ms before and 35.7 - 39.2 after (45.7 and 36.9 at their
+  medians), and each query's time under the new library over its time under the old 0.81 at the
+  median of the 200 pairs, quartiles 0.78 and 0.85; each query probes 547.8 partitions and
+  refines 14,957 rows on average under both (4 of the 50 queries' candidates or refines differ
+  by a few: 16 rows more refined in 748,000, one partition more probed in 27,000, the bounds
+  having moved by the rounding's variance), and recall is 0.632 for every query under both, row
+  for row. That is about the 11 to 13% §44.14 expected of random vectors, and a little more: the
+  sums were a quarter of their query there, and this machine's memory is slower against its
+  cores. DBpedia was not on this machine; §44.14's arithmetic put the kernel at 5% of its warm
+  query, whose sums are a tenth of it. No format change: the codes are read as they are.
 
 ### 44.4 The scan (lion_vec_scan.c)
 
@@ -27924,6 +27987,13 @@ faster from the disk and the same warm, and the inline table's queries took main
   partial sums added in the header's order and the rotation against the portable one's, all to the
   bit, at every dimsp from 64 to 8128, from unaligned pointers, over inputs of every scale, denormals
   and signed zeros, and end to end the same rotations, estimates and k-means as the portable set's
+  (2026-10-27: and `lionvec_dot8()` against a plain integer loop, both its sums, at every dimsp
+  from 64 to 8128 from unaligned pointers, over codes and 16-bit weights at and mixed between
+  their extremes, every set the portable one's results; the query's rounding - every coordinate
+  within half a step, the extremes at +-32767, the sums and the variance as stated, a constant
+  query's zeros, and the same query but for the rounding with `qw` NULL; and the estimate: the
+  affine formula against the serial sum over the rounded query to 1e-9, within the rounding's
+  reach of the floats' estimate, its error as stated, and every set the portable set's bytes)
   (`test/unit/vec_test_nosimd` is the same program built with `-DLION_NO_SIMD`); the halves'
   conversion, the portable one against a reference computed in double from each half's fields,
   over all 65,536 halves (2,046 NaNs, each quiet with its payload), and each set's against the
@@ -28342,8 +28412,9 @@ faster from the disk and the same warm, and the inline table's queries took main
   kept as seven bit-planes, a refine reading them until its bound decides. On DBpedia it would stop
   at 3.2 planes a row and 4.0 a centroid, but the sums are a tenth of a warm query, reading the
   REFINE item costs a refine more than its sum, and an integer kernel over today's bytes takes as
-  much off: not worth a format. That kernel, `lionvec_sum8()` against the query rounded to 16-bit
-  integers (60 ns against 326 warm, 373 against 682 out of L2), is not done either.
+  much off: not worth a format. That kernel, the codes against the query rounded to 16-bit
+  integers (60 ns against 326 warm, 373 against 682 out of L2), is done: `lionvec_dot8()`,
+  2026-10-27 (§44.3, "Kernels", with its measurement in a scan).
 
 ### 44.12 Parallel build (lion_vec.c, lion_vec_math.c; 2026-10-15)
 
@@ -29053,7 +29124,8 @@ not in `make unit`), on DBpedia's rows and on vec_test's kinds of data, and with
 timed on a server. **The format is not changed**: on DBpedia a refine does stop early, but the
 8-bit sums are a tenth of a warm query, the larger part of a refine is reading its REFINE item,
 which planes do not shorten, and a kernel over today's bytes takes about as much off as the
-planes would, with no new format.
+planes would, with no new format. That kernel is built (2026-10-27, `lionvec_dot8()`; §44.3,
+"Kernels"), and the sums it replaced are kept as the unit test's reference, nothing else.
 
 **The estimator.** The top m bits of a code c leave 2^(8-m) steps; their middle is
 
@@ -29197,7 +29269,10 @@ nothing: a REFINE page is read whole whatever part of an item a refine looks at.
   good from the pool and flushed; and with AVX2 60 / 323 / 912 against 172 - 220 / 439 - 510 /
   842 - 983. That is 5% off a DBpedia query (the sums at 0.53 - 0.55 of their time from the pool
   or flushed) and 11 to 13% off the random vectors', leaving the planes at most half a point
-  beyond it on DBpedia and two or three on random vectors - for a new format.
+  beyond it on DBpedia and two or three on random vectors - for a new format. **2026-10-27**:
+  that kernel is `lionvec_dot8()` (§44.3, "Kernels"), VPMADDWD under AVX2 as the prototype's,
+  the AVX-512 set running it too, and the portable one in sixteen 32-bit lanes; measured in a
+  scan there.
 - What a refine costs most is not its sum. Reading the REFINE item is 1.8 us of a row's 3.1;
   fewer bytes of the item leave it as it is.
 - The format would cost: 48 bytes a row of alpha_m and |r_m|; a second quantization of the query
@@ -29214,14 +29289,15 @@ refine (refines batched by page, say, or the codes nearer the queue), the bytes 
 would be what it waits on, and planes stop at 40 to 51% of them on DBpedia; or for vectors
 whose distances plane 1 tells apart as badly as random ones', where rows' refines are two thirds
 of a query and planes stop at 30% of the bytes. The 16-bit integer kernel for `lionvec_sum8()`
-is the change worth making now, and wants its own measurement in a scan.
+was the change worth making now: made on 2026-10-27, as `lionvec_dot8()`, and measured in a scan
+(§44.3, "Kernels").
 
 **The prototype** (`test/unit/vecplanes_eval.c`): part 1 the prefixes' alphas and the bounds'
 calibration on clustered rows, part 2 the planes needed on vec_test's three kinds at 384 and 1536
 dimensions (and L2 at 1536), part 3 the costs (`--costs` alone); `--file ROWS QUERIES DIMS` runs
 part 2 on raw float4 vectors, cosine - DBpedia's here, written from the shards as
 `knn_dbpedia.py` reads them, the 200 queries of `np.random.default_rng(0).choice(115386, 200,
-replace=False)` apart. It checks that eight planes are `lionvec_estimate8()`, that its masked
+replace=False)` apart. It checks that eight planes are the floats' estimate (`lionvec_sum8()`'s, to 1e-6 of its error; 2026-10-27: and `lionvec_estimate8()`'s but for its query's rounding, within that rounding's reach, 5e-3 of the error at most), that its masked
 sums and integer dot agree with their portable forms to the bit, and that the bounds are
 calibrated (at most 0.40 outside 1 standard deviation and 0.006 outside 3), and exits 1 if not;
 it runs in a few minutes, DBpedia's file in five (its k-means most of it). Its kernels are the
