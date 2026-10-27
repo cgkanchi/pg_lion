@@ -1903,6 +1903,7 @@ lionvec_build_use_arrays(LionVecBuildState *bs)
 	bs->q.dimsp = dimsp;
 	bs->q.qc = palloc(sizeof(float) * dimsp);
 	bs->q.planes = palloc(sizeof(uint64) * (dimsp / 64) * LIONVEC_QBITS);
+	bs->q.qw = palloc(sizeof(int16) * dimsp);
 	bs->lo = palloc(sizeof(double) * k);
 	bs->hi = palloc(sizeof(double) * k);
 	bs->cand = palloc(sizeof(int) * k);
@@ -4319,6 +4320,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	is.q.dimsp = dimsp;
 	is.q.qc = palloc(sizeof(float) * dimsp);
 	is.q.planes = palloc(sizeof(uint64) * nw * LIONVEC_QBITS);
+	is.q.qw = palloc(sizeof(int16) * dimsp);
 	lionvec_query_init(&is.q, LIONVEC_L2, NULL, xc, LIONVEC_ASSIGN_EPS);
 	lionvec_cands_begin(&is.cs, m);
 

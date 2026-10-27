@@ -65,6 +65,17 @@
  */
 #define LION_WAL_MAX_BLOCKS		4
 
+/*
+ * The most a record of the resource manager carries when its writer asks for
+ * more (lion_wal_begin_ext()): the batched in-place adds of a row's bit
+ * slices (DESIGN.md §51, "Insert cost, revisited"), which hold no lock they
+ * could not have held one at a time - every posting leaf after the first is
+ * only tried - and so rest on no bound.  Eight is what the header's masks
+ * can describe.  A generic record keeps to LION_WAL_MAX_BLOCKS, GenericXLog's
+ * own limit, whatever is asked.
+ */
+#define LION_WAL_MAX_BLOCKS_WIDE	8
+
 /* ---------- record types (the top four bits of xl_info) ---------- */
 
 #define LION_XLOG_ITEM_SET			0x00	/* in-place change inside items */
@@ -241,6 +252,15 @@ typedef struct LionWalState LionWalState;
  * with the shared_preload_libraries hint.
  */
 extern LionWalState *lion_wal_begin(Relation index);
+
+/*
+ * The same for a record of up to maxblocks buffers, which an rmgr-mode index
+ * gets up to LION_WAL_MAX_BLOCKS_WIDE of (making room for them in the WAL
+ * insertion state before the critical section opens) and a generic-mode one
+ * LION_WAL_MAX_BLOCKS; lion_wal_max_blocks() says which.
+ */
+extern LionWalState *lion_wal_begin_ext(Relation index, int maxblocks);
+extern int	lion_wal_max_blocks(Relation index);
 
 /*
  * Register a buffer and get the Page to work on: the scratch image in generic

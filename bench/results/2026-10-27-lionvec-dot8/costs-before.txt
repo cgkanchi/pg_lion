@@ -1,0 +1,31 @@
+vecplanes_eval: best implementation avx512
+3. what a refine's sums cost
+  384 dimensions (a pool of 65536 rows, 24 MB): ns a refine, warm / pool / flushed
+                                           portable                 popcnt                   avx2                 avx512
+    lionvec_sum8()                225 /   333 /   772      246 /   337 /   785       79 /   202 /   700       88 /   192 /   693
+    plane 1 (4-bit query)          35 /   108 /   NaN        9 /   100 /   NaN        8 /   104 /   NaN        4 /    97 /   NaN
+    quantized, plane 2             81 /   145 /   229       32 /   125 /   203       20 /   120 /   196       16 /   109 /   181
+    quantized, planes 2-3         144 /   226 /   376       62 /   154 /   299       38 /   137 /   284       29 /   123 /   268
+    quantized, planes 2-4         251 /   315 /   518       94 /   185 /   404       67 /   160 /   384       44 /   133 /   403
+    quantized, planes 2-5         314 /   458 /   620      126 /   212 /   429       78 /   178 /   411       62 /   161 /   376
+    quantized, planes 2-6         409 /   489 /   734      143 /   247 /   533       96 /   214 /   511       70 /   166 /   477
+    quantized, planes 2-8         507 /   614 /   985      221 /   323 /   769      144 /   238 /   710      103 /   206 /   668
+    bytes, 16-bit query           130 /   229 /   697      134 /   231 /   689       14 /   135 /   580       15 /   138 /   543
+    floats, plane 2               420 /  1975 /  1954      425 /  1956 /  1995       95 /   170 /   266       61 /   168 /   229
+    floats, planes 2-4           1512 /  5588 /  5445     1305 /  5612 /  6797      287 /   361 /   586      183 /   267 /   474
+    floats, planes 2-8           3364 / 12836 / 12519     3751 / 12714 / 12546      677 /   794 /  1189      378 /   497 /   895
+  1536 dimensions (a pool of 16384 rows, 24 MB): ns a refine, warm / pool / flushed
+                                           portable                 popcnt                   avx2                 avx512
+    lionvec_sum8()                934 /   987 /  1754      860 /  1059 /  1845      315 /   471 /  1494      313 /   450 /  1452
+    plane 1 (4-bit query)         131 /   241 /   NaN       28 /   131 /   NaN       24 /   134 /   NaN       13 /   109 /   NaN
+    quantized, plane 2            321 /   353 /   546       87 /   179 /   401       49 /   150 /   361       29 /   123 /   354
+    quantized, planes 2-3         534 /   646 /  1005      173 /   278 /   769       97 /   207 /   729       55 /   172 /   649
+    quantized, planes 2-4         788 /   896 /  1384      260 /   374 /  1033      160 /   292 /   974       89 /   222 /   864
+    quantized, planes 2-5        1043 /  1179 /  1694      372 /   479 /  1212      193 /   357 /  1124      127 /   243 /   968
+    quantized, planes 2-6        1313 /  1462 /  2064      440 /   557 /  1395      263 /   390 /  1238      151 /   271 /  1089
+    quantized, planes 2-8        1845 /  2048 /  2678      614 /   730 /  1591      370 /   583 /  1370      200 /   362 /  1169
+    bytes, 16-bit query           502 /   621 /  1510      553 /   733 /  1513       48 /   202 /  1024       49 /   211 /   992
+    floats, plane 2              1884 /  7163 /  7071     1716 /  7281 /  7251      373 /   459 /   672      212 /   308 /   514
+    floats, planes 2-4           5304 / 21707 / 22421     5583 / 21201 / 24041     1128 /  1236 /  1739      642 /   750 /  1298
+    floats, planes 2-8          37138 / 49613 / 49747    35878 / 50076 / 50049     2633 /  2825 /  3462     1492 /  1638 /  2377
+vecplanes_eval: 0 checks failed

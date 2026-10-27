@@ -98,7 +98,8 @@ static const relopt_parse_elt lion_relopt_tab[] = {
 	{"wal_mode", RELOPT_TYPE_ENUM, offsetof(LionOptions, wal_mode)},
 	{"summaries", RELOPT_TYPE_ENUM, offsetof(LionOptions, summaries)},
 	{"summary_tids", RELOPT_TYPE_INT, offsetof(LionOptions, summary_tids)},
-	{"store_positions", RELOPT_TYPE_ENUM, offsetof(LionOptions, store_positions)}
+	{"store_positions", RELOPT_TYPE_ENUM, offsetof(LionOptions, store_positions)},
+	{"slices", RELOPT_TYPE_BOOL, offsetof(LionOptions, slices)}
 };
 
 /* DESIGN.md §32: which key columns a build gives summary posting sets. */
@@ -214,6 +215,7 @@ lion_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (lion_prev_build_simple_rel_hook)
 		lion_prev_build_simple_rel_hook(root, rel, rte);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #else
 static void
@@ -224,6 +226,7 @@ lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
 										 rel);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #endif
 
@@ -333,6 +336,19 @@ _PG_init(void)
 					  LION_DEFAULT_SUMMARY_TIDS, LION_MIN_SUMMARY_TIDS,
 					  LION_MAX_SUMMARY_TIDS,
 					  ShareUpdateExclusiveLock);
+
+	/*
+	 * DESIGN.md §51.  Bit slices: one posting set per bit of every value of
+	 * a key column of an integer, date, time or timestamp type, from which
+	 * sum, min and max under a filter are counted without the rows.  "off"
+	 * by default - every insert into a sliced column pays a posting-set
+	 * insert per set bit - and, like summaries, read at build time only and
+	 * recorded on the meta page, so it is REINDEX that adds or drops them.
+	 */
+	add_bool_reloption(lion_relopt_kind, "slices",
+					   "Keep bit-sliced posting sets of every integer, date, time and timestamp key column",
+					   false,
+					   ShareUpdateExclusiveLock);
 
 	/*
 	 * DESIGN.md §17, "Stored positions".  "auto" by default: a tsvector
@@ -621,6 +637,65 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §52: whether the count pushdown may answer sum, avg, count,
+	 * min and max of a bit-sliced column (§51) from its slices, and whether
+	 * the slices' counts may use the plane kernel (§50) at the container
+	 * keys where they are bitmaps of one width.  Off, the first leaves such
+	 * aggregates to the other plans; the second counts each slice's
+	 * container by lion_container_and_cardinality(), with the same answers.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_slices",
+							 "Lets the count pushdown answer sum, avg, count, min and max of a bit-sliced lion column from its slices.",
+							 "Off, such aggregates go to the aggregates over keys or to the ordinary plan.",
+							 &lion_enable_count_slices,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_slice_decode",
+							 "Lets a GROUP BY of one column answer the aggregates of bit-sliced columns a batch of groups at a time.",
+							 "Off, each group's aggregates are counted from the slices on their own.",
+							 &lion_enable_slice_decode,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §53: whether the count pushdown may answer a range on a
+	 * bit-sliced column from its slices - O'Neil's descent, key by key -
+	 * where that is priced cheaper than walking its entries and summaries.
+	 * Off, every range is walked or collected from its entries as before.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_slice_ranges",
+							 "Lets the count pushdown answer a range on a bit-sliced lion column from its slices.",
+							 "Off, such ranges are answered from the column's entries and summaries.",
+							 &lion_enable_slice_ranges,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.prefer_slice_ranges",
+							 "Makes the count pushdown answer a range on a bit-sliced lion column from its slices wherever it can, whatever the price.",
+							 "For tests: the plan that answers ranges from their entries and summaries is not offered beside it.",
+							 &lion_prefer_slice_ranges,
+							 false,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_slice_kernel",
+							 "Lets the counts of a bit-sliced column's slices use the bit-plane kernel where the slices are bitmaps of one width.",
+							 "Off, each slice's container is counted on its own; the answers are the same either way.",
+							 &lion_enable_slice_kernel,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 
 	/*
 	 * DESIGN.md §36: whether a GROUP BY ordered by its count under a LIMIT
@@ -1391,6 +1466,12 @@ lionbuildempty(Relation index)
 		lion_meta_record_summaries(&meta, cols, (uint32) opts.summary_tids);
 	}
 
+	/*
+	 * Slices (DESIGN.md §51): "on" slices every column it can encode, of an
+	 * empty index as of a full one; the first insert makes the entries.
+	 */
+	lion_meta_record_slices(&meta, lion_settle_slices(&ix, &opts));
+
 	/* Meta page, pointing at the one leaf that is also the root (§21). */
 	buf = ExtendBufferedRel(BMR_REL(index), INIT_FORKNUM, NULL,
 							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
@@ -1404,6 +1485,7 @@ lionbuildempty(Relation index)
 	LionPageGetMeta(BufferGetPage(buf))->version = meta.version;
 	LionPageGetMeta(BufferGetPage(buf))->summary_cols = meta.summary_cols;
 	LionPageGetMeta(BufferGetPage(buf))->summary_tids = meta.summary_tids;
+	LionPageGetMeta(BufferGetPage(buf))->slice_cols = meta.slice_cols;
 	MarkBufferDirty(buf);
 	log_newpage_buffer(buf, true);
 	END_CRIT_SECTION();

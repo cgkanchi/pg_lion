@@ -163,6 +163,49 @@ map calls all-visible - as after a `VACUUM` - the rows of each key are the count
 and nothing else is read; a `VACUUM` that removes rows from the index while the walk runs, or a
 table that is not all-visible, has each key's rows counted instead.
 
+With a `WHERE`, or per group, an integer, date, time or timestamp column indexed `WITH (slices =
+on)` keeps one posting set per bit of its values, and the count pushdown answers `count`, `sum`,
+`avg`, `min` and `max` of it from those sets alone, exactly, without reading the rows (`Aggregates
+From Slices` in EXPLAIN; DESIGN.md §51, §52):
+
+```sql
+CREATE INDEX ON events USING lion (amount) WITH (slices = on);
+SELECT sum(amount), avg(amount), max(amount), count(*) FROM events
+ WHERE country = 'JP' AND tags && '{mobile}';
+SELECT country, sum(amount), min(amount) FROM events
+ WHERE device = 'ios' GROUP BY country;
+```
+
+The `WHERE` is collected once with the column's existence slice; a sum counts every bit's slice
+against it in one walk of its container keys, and a `min` or a `max` descends from the top bit, a
+counted AND a bit, so the work grows with the column's width and the `WHERE`'s container keys, not
+its rows. A `GROUP BY` of one or two Lion-indexed columns does the same for each group - a few
+dozen counted ANDs a group, or, for many groups of one column, a pass over the slices a batch of
+groups that reads every row's value off them. The planner weighs this against the ordinary plan;
+on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166, and the sum,
+minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
+price is an insert into each set bit's set on every write of the column: an `INSERT` of many rows
+into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
+`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). A
+percentile, a join and a partitioned table are not answered from the slices yet; `SELECT * FROM
+lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
+given as text.
+
+The slices answer a range on the sliced column itself too - `amount > 100`, `amount BETWEEN 100 AND
+5000`, `amount <> 0`, alone or beside other filters, under a `GROUP BY` of other columns, in an
+`OR`, and as the filter of the aggregates above (`SELECT sum(amount) ... WHERE amount > 100`) - by
+O'Neil's descent from the top bit at each block of 64 heap pages, whatever share of the rows the
+range holds (`Range From Slices: amount > 100 (32 slices)` in EXPLAIN; DESIGN.md §53). A range
+otherwise reads every distinct value it covers, or with `summaries = on` the pre-merged sets of
+the buckets it covers, and both grow with the range; the slices' work does not. The planner
+prices each and keeps the cheaper: on 5M rows of distinct values in no particular order, a count
+over 10% of them took 8 ms from the slices against 139 ms walking the values (and 216 for the
+ordinary plan), 50% 7 ms against 712, and a selective range stays with the values or the
+summaries, which read less. With summaries, values stored in the heap's order are best served by
+them at every width; values in no order by the slices once a range holds more than about a tenth
+of the rows (at half of them, 7 ms against the summaries' 32). `SET pg_lion.enable_slice_ranges =
+off` leaves ranges to the values and summaries.
+
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
 except a clause the partition's bounds imply. `kind = 'a'` over a table partitioned by `kind`,

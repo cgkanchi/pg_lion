@@ -95,6 +95,22 @@ static bool lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumb
 										 Buffer entrybuf, OffsetNumber entryoff,
 										 LionEntryTuple *entry, Size entrysize,
 										 uint16 lo, bool *done);
+
+/* What the first half of an in-place insert decides (lion_*_inplace_check()). */
+#define LION_INPLACE_NO		0	/* the member needs the general path */
+#define LION_INPLACE_YES	1	/* it goes in in place */
+#define LION_INPLACE_DUP	2	/* it is there already */
+
+static int	lion_container_inplace_check(Relation index, Buffer buf,
+										 OffsetNumber off, uint16 lo);
+static void lion_container_inplace_apply(LionWalState *xstate, Buffer buf,
+										 OffsetNumber off, uint16 lo);
+static int	lion_segment_inplace_check(Relation index, Buffer buf,
+									   OffsetNumber off, uint32 ckey,
+									   uint16 lo);
+static void lion_segment_inplace_apply(LionWalState *xstate, Buffer buf,
+									   OffsetNumber off, uint32 ckey,
+									   uint16 lo);
 static Buffer lion_insert_lock_chain_page(Relation index, Relation heaprel,
 										  BlockNumber entryblk, uint32 hash,
 										  BlockNumber head, BlockNumber tail,
@@ -679,6 +695,58 @@ lion_insert_inline_pos(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
+ * The INLINE entry `entry`, itemsz bytes on page, rebuilt around newpay
+ * (newlen bytes, ndelta more items than it had) and counting one more TID, at
+ * the length the growth slack gives it - palloc'd, *newsize bytes.
+ *
+ * GROWTH SLACK, the INLINE half of DESIGN.md §4.
+ *
+ * The payload this key had may already have room for the member that was
+ * just added to it, because the last insert-driven rewrite left some: then
+ * the entry KEEPS the bytes the page has allotted it (*newsize == itemsz)
+ * and only its own bytes change.  PageIndexTupleOverwrite() then moves no
+ * other entry on the leaf, as a change of length would (1.5-2.9 KB of record
+ * in generic mode), and the record is a delta of the counters and the tail
+ * of the payload.
+ *
+ * Otherwise the entry is written at its new length PLUS fresh slack, which is
+ * what puts the next few inserts on the cheap path.  Only what fits on the
+ * leaf as it stands: slack is never worth a split, and never worth compacting
+ * an entry that has too much of it either.
+ */
+static LionEntryTuple *
+lion_inline_rebuilt(LionState *state, Page page, LionEntryTuple *entry,
+					Size itemsz, const char *newpay, Size newlen, int ndelta,
+					Size *newsize)
+{
+	Size		payoff = LionEntryPayloadOffset(entry);
+	Size		need = payoff + newlen;
+	uint32		ncontainers = lion_entry_ncontainers(entry);
+	uint64		ntids = lion_entry_ntids(entry);
+	Size		writesz;
+	LionEntryTuple *newentry;
+
+	if (itemsz >= need && itemsz - need <= LION_ENTRY_SLACK_BOUND)
+		writesz = itemsz;
+	else
+	{
+		Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
+											PageGetExactFreeSpace(page));
+
+		writesz = lion_entry_alloc_size(payoff, newlen,
+										(Size) state->ix->meta.inline_limit,
+										Max(maxsize, need));
+	}
+
+	newentry = lion_entry_rebuild_slack(entry, newpay, newlen, writesz,
+										newsize);
+	lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
+	lion_entry_set_ntids(newentry, ntids + 1);
+
+	return newentry;
+}
+
+/*
  * Add (ckey, lo) to the INLINE entry at (entrybuf, entryoff), spilling the
  * posting set onto container pages if it no longer fits.  entrybuf is held
  * EXCLUSIVE.
@@ -697,8 +765,6 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	Size		itemsz = ItemIdGetLength(iid);
 	Size		payoff = LionEntryPayloadOffset(entry);
 	Size		paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
-	uint32		ncontainers = lion_entry_ncontainers(entry);
-	uint64		ntids = lion_entry_ntids(entry);
 	char	   *oldpay;
 	char	   *newpay;
 	Size		newlen;
@@ -738,41 +804,9 @@ lion_insert_inline(Relation index, Relation heaprel, LionState *state,
 	{
 		LionEntryTuple *newentry;
 		Size		newsize;
-		Size		need = payoff + newlen;
-		Size		writesz;
 
-		/*
-		 * GROWTH SLACK, the INLINE half of DESIGN.md §4.
-		 *
-		 * The payload this key had may already have room for the member that
-		 * was just added to it, because the last insert-driven rewrite left
-		 * some: then the entry KEEPS the bytes the page has allotted it and
-		 * only its own bytes change.  PageIndexTupleOverwrite() then moves no
-		 * other entry on the leaf, as a change of length would (1.5-2.9 KB of
-		 * record in generic mode), and the record is a delta of the counters
-		 * and the tail of the payload.
-		 *
-		 * Otherwise the entry is written at its new length PLUS fresh slack,
-		 * which is what puts the next few inserts on the cheap path.  Only
-		 * what fits on the leaf as it stands: slack is never worth a split,
-		 * and never worth compacting an entry that has too much of it either.
-		 */
-		if (itemsz >= need && itemsz - need <= LION_ENTRY_SLACK_BOUND)
-			writesz = itemsz;
-		else
-		{
-			Size		maxsize = MAXALIGN_DOWN(MAXALIGN(itemsz) +
-												PageGetExactFreeSpace(page));
-
-			writesz = lion_entry_alloc_size(payoff, newlen,
-											(Size) state->ix->meta.inline_limit,
-											Max(maxsize, need));
-		}
-
-		newentry = lion_entry_rebuild_slack(entry, newpay, newlen, writesz,
-											&newsize);
-		lion_entry_set_ncontainers(newentry, (uint32) ((int) ncontainers + ndelta));
-		lion_entry_set_ntids(newentry, ntids + 1);
+		newentry = lion_inline_rebuilt(state, page, entry, itemsz, newpay,
+									   newlen, ndelta, &newsize);
 
 		/*
 		 * DESIGN.md §21: a grown entry that no longer fits its leaf splits the
@@ -850,18 +884,56 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 							 LionEntryTuple *entry, Size entrysize, uint16 lo,
 							 bool *done)
 {
+	LionWalState *xstate;
+
+	switch (lion_container_inplace_check(index, buf, off, lo))
+	{
+		case LION_INPLACE_NO:
+			return false;
+		case LION_INPLACE_DUP:
+			*done = true;
+			return true;		/* already indexed: no record at all */
+		default:
+			break;
+	}
+	*done = true;
+
+	xstate = lion_wal_begin(index);
+	lion_container_inplace_apply(xstate, buf, off, lo);
+
+	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
+
+	/* The entry always travels with the container change. */
+	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
+		elog(ERROR, "lion index: could not update entry %u on block %u",
+			 entryoff, BufferGetBlockNumber(entrybuf));
+
+	lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
+
+	return true;
+}
+
+/*
+ * The first half of lion_insert_container_inplace(), which decides before any
+ * record opens: can the container at (buf, off) - held EXCLUSIVE, and come
+ * through lion_page_item_fetch() - take lo in place (LION_INPLACE_YES), does
+ * it hold lo already (LION_INPLACE_DUP), or does the member need the general
+ * path (LION_INPLACE_NO)?  The ERROR of lion_page_check_alone() is raised
+ * here, outside the record, for a YES.
+ */
+static int
+lion_container_inplace_check(Relation index, Buffer buf, OffsetNumber off,
+							 uint16 lo)
+{
 	Page		page = BufferGetPage(buf);
 	ItemId		iid = PageGetItemId(page, off);
 	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
 	Size		alloc = ItemIdGetLength(iid);
 	Size		need;
-	LionWalState *xstate;
-	Page		p;
-	LionContainer *c;
 
 	need = lion_container_inplace_need(onpage, lo);
 	if (need == 0)
-		return false;			/* would change its representation */
+		return LION_INPLACE_NO;	/* would change its representation */
 
 	/*
 	 * A member that closes the one-value gap between two runs MERGES them,
@@ -882,16 +954,14 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 		!lion_container_contains(onpage, lo) &&
 		alloc > lion_container_size(onpage) - sizeof(LionRun) +
 		LION_ITEM_SLACK_BOUND)
-		return false;
+		return LION_INPLACE_NO;
 
 	if (alloc < need)
-		return false;
-
-	*done = true;
+		return LION_INPLACE_NO;
 
 	/* Already indexed: do not start a record at all. */
 	if (lion_container_contains(onpage, lo))
-		return true;
+		return LION_INPLACE_DUP;
 
 	/*
 	 * The member goes into the bytes the line pointer allots the item, which
@@ -900,16 +970,28 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	 */
 	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
 
-	xstate = lion_wal_begin(index);
-	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
-	c = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
+	return LION_INPLACE_YES;
+}
+
+/*
+ * The second half, inside the record xstate: add lo to the container at
+ * (buf, off), which lion_container_inplace_check() said takes it in place,
+ * and log the operation.  Registers buf; the caller logs the entry.
+ */
+static void
+lion_container_inplace_apply(LionWalState *xstate, Buffer buf,
+							 OffsetNumber off, uint16 lo)
+{
+	Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+	ItemId		iid = PageGetItemId(p, off);
+	LionContainer *c = (LionContainer *) PageGetItem(p, iid);
 
 	if (!lion_container_add(c, lo))
 		elog(ERROR, "lion index: container %u on block %u changed under an exclusive lock",
 			 c->ckey, BufferGetBlockNumber(buf));
 
 	/* The whole point: the item still ends where it ended. */
-	Assert(lion_container_size(c) <= alloc);
+	Assert(lion_container_size(c) <= ItemIdGetLength(iid));
 
 	/*
 	 * This is the hot-key insert record of DESIGN.md §25, and it logs the
@@ -920,17 +1002,6 @@ lion_insert_container_inplace(Relation index, Buffer buf, OffsetNumber off,
 	 * the two pages identical to the byte.
 	 */
 	lion_wal_op(xstate, p, LION_OP_CONTAINER_ADD, off, lo, NULL, 0);
-
-	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
-
-	/* The entry always travels with the container change. */
-	if (!lion_replace_entry(index, xstate, entrybuf, entryoff, entry, entrysize))
-		elog(ERROR, "lion index: could not update entry %u on block %u",
-			 entryoff, BufferGetBlockNumber(entrybuf));
-
-	lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
-
-	return true;
 }
 
 /*
@@ -953,53 +1024,22 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 						   LionEntryTuple *entry, Size entrysize,
 						   uint32 ckey, uint16 lo, bool *done)
 {
-	Page		page = BufferGetPage(buf);
-	ItemId		iid = PageGetItemId(page, off);
-	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
-	Size		alloc = ItemIdGetLength(iid);
-	Size		need;
 	LionWalState *xstate;
-	Page		p;
-	LionContainer *s;
-	bool		dup = false;
 
-	Assert(onpage->type == LION_CT_SPARSE);
-
-	need = lion_sparse_insert_size(onpage, ckey, lo);
-	if (need == 0)
-		return false;			/* would have to split */
-	if (lion_sparse_count(onpage, ckey) + 1 >= LION_SPARSE_THRESHOLD)
-		return false;			/* would have to promote the container key */
-	if (alloc < need)
-		return false;			/* no slack inside the item */
-
+	switch (lion_segment_inplace_check(index, buf, off, ckey, lo))
+	{
+		case LION_INPLACE_NO:
+			return false;
+		case LION_INPLACE_DUP:
+			*done = true;
+			return true;
+		default:
+			break;
+	}
 	*done = true;
 
-	if (lion_sparse_contains(onpage, ckey, lo))
-		return true;
-
-	/* As for a container (lion_insert_container_inplace()). */
-	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
-
 	xstate = lion_wal_begin(index);
-	p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
-	s = (LionContainer *) PageGetItem(p, PageGetItemId(p, off));
-
-	if (!lion_sparse_insert(s, ckey, lo, &dup) || dup)
-		elog(ERROR, "lion index: sparse segment %u on block %u changed under an exclusive lock",
-			 off, BufferGetBlockNumber(buf));
-
-	Assert(lion_sparse_size(s) <= alloc);
-
-	/*
-	 * The call, not the bytes: a pair inside the segment rewrites the stream
-	 * from where it goes in.
-	 */
-	lion_wal_op(xstate, p, LION_OP_SPARSE_INS, off, lo, &ckey, sizeof(uint32));
-
-	/* A segment's range can grow in either direction. */
-	lion_page_update_minmax(p);
-	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
+	lion_segment_inplace_apply(xstate, buf, off, ckey, lo);
 
 	lion_entry_set_ntids(entry, lion_entry_ntids(entry) + 1);
 
@@ -1010,6 +1050,63 @@ lion_insert_segment_inplace(Relation index, Buffer buf, OffsetNumber off,
 	lion_wal_finish(xstate, LION_XLOG_ITEM_SET);
 
 	return true;
+}
+
+/* The first half of lion_insert_segment_inplace(), as for a container. */
+static int
+lion_segment_inplace_check(Relation index, Buffer buf, OffsetNumber off,
+						   uint32 ckey, uint16 lo)
+{
+	Page		page = BufferGetPage(buf);
+	ItemId		iid = PageGetItemId(page, off);
+	LionContainer *onpage = (LionContainer *) PageGetItem(page, iid);
+	Size		alloc = ItemIdGetLength(iid);
+	Size		need;
+
+	Assert(onpage->type == LION_CT_SPARSE);
+
+	need = lion_sparse_insert_size(onpage, ckey, lo);
+	if (need == 0)
+		return LION_INPLACE_NO;	/* would have to split */
+	if (lion_sparse_count(onpage, ckey) + 1 >= LION_SPARSE_THRESHOLD)
+		return LION_INPLACE_NO;	/* would have to promote the container key */
+	if (alloc < need)
+		return LION_INPLACE_NO;	/* no slack inside the item */
+
+	if (lion_sparse_contains(onpage, ckey, lo))
+		return LION_INPLACE_DUP;
+
+	/* As for a container (lion_container_inplace_check()). */
+	lion_page_check_alone(index, page, BufferGetBlockNumber(buf), off);
+
+	return LION_INPLACE_YES;
+}
+
+/* The second half: the pair in, inside the record, and the page's bounds. */
+static void
+lion_segment_inplace_apply(LionWalState *xstate, Buffer buf, OffsetNumber off,
+						   uint32 ckey, uint16 lo)
+{
+	Page		p = lion_wal_register_buffer(xstate, buf, LION_WALBUF_STD);
+	ItemId		iid = PageGetItemId(p, off);
+	LionContainer *s = (LionContainer *) PageGetItem(p, iid);
+	bool		dup = false;
+
+	if (!lion_sparse_insert(s, ckey, lo, &dup) || dup)
+		elog(ERROR, "lion index: sparse segment %u on block %u changed under an exclusive lock",
+			 off, BufferGetBlockNumber(buf));
+
+	Assert(lion_sparse_size(s) <= ItemIdGetLength(iid));
+
+	/*
+	 * The call, not the bytes: a pair inside the segment rewrites the stream
+	 * from where it goes in.
+	 */
+	lion_wal_op(xstate, p, LION_OP_SPARSE_INS, off, lo, &ckey, sizeof(uint32));
+
+	/* A segment's range can grow in either direction. */
+	lion_page_update_minmax(p);
+	lion_wal_op(xstate, p, LION_OP_MINMAX, 0, 0, NULL, 0);
 }
 
 /*
@@ -1100,6 +1197,64 @@ lion_insert_lock_chain_page(Relation index, Relation heaprel,
 }
 
 /*
+ * Which item of the posting leaf buf, held EXCLUSIVE and owning ckey, takes
+ * (ckey, lo), and at what offset (*off):
+ *
+ *	LION_TARGET_CONTAINER	the container with that very ckey;
+ *	LION_TARGET_SEGMENT		the sparse segment that covers the ckey, or else
+ *							the one immediately before the gap the ckey falls
+ *							in, or else the one immediately after it, when it
+ *							has room for the pair - both are adjacent items,
+ *							so nothing can end up between the pair and the
+ *							segment it joins;
+ *	LION_TARGET_NEW			none: the pair becomes a new one-pair segment,
+ *							inserted at *off.
+ *
+ * Every item looked at here has been through lion_page_item_fetch(), so the
+ * in-place paths may take the item at *off as it stands.  One decision for
+ * lion_insert_chain_leaf() and for the slices' batched in-place adds
+ * (lion_slice_batch_add()), which therefore put a member where the other
+ * would.
+ */
+#define LION_TARGET_CONTAINER	0
+#define LION_TARGET_SEGMENT		1
+#define LION_TARGET_NEW			2
+
+static int
+lion_chain_target(Relation index, Buffer buf, uint32 ckey, uint16 lo,
+				  OffsetNumber *offp)
+{
+	Page		cpage = BufferGetPage(buf);
+	BlockNumber blk = BufferGetBlockNumber(buf);
+	OffsetNumber off;
+	OffsetNumber maxoff;
+	bool		found;
+
+	off = lion_page_find_item(index, cpage, blk, ckey, &found);
+	*offp = off;
+
+	if (found)
+		return lion_page_item_fetch(index, cpage, blk, off)->type ==
+			LION_CT_SPARSE ? LION_TARGET_SEGMENT : LION_TARGET_CONTAINER;
+
+	maxoff = PageGetMaxOffsetNumber(cpage);
+	if (off > FirstOffsetNumber &&
+		lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
+												   OffsetNumberPrev(off)),
+							  ckey, lo))
+	{
+		*offp = OffsetNumberPrev(off);
+		return LION_TARGET_SEGMENT;
+	}
+	if (off <= maxoff &&
+		lion_segment_has_room(lion_page_item_fetch(index, cpage, blk, off),
+							  ckey, lo))
+		return LION_TARGET_SEGMENT;
+
+	return LION_TARGET_NEW;
+}
+
+/*
  * Add (ckey, lo) on the leaf buf, which owns ckey and is held EXCLUSIVE, for
  * the CHAIN entry at (entrybuf, entryoff), also held EXCLUSIVE.  ecopy is the
  * caller's private copy of that entry (esize bytes) and cbuf a work buffer of
@@ -1117,80 +1272,39 @@ lion_insert_chain_leaf(Relation index, Relation heaprel, Buffer buf,
 					   LionEntryTuple *ecopy, Size esize, LionContainer *cbuf,
 					   uint32 ckey, uint16 lo, bool mayput)
 {
-	Page		cpage = BufferGetPage(buf);
-	BlockNumber blk = BufferGetBlockNumber(buf);
 	OffsetNumber off;
-	bool		found;
 	int			delta;
 
-	/*
-	 * Which item owns this ckey: a container, a segment, or nothing yet?
-	 * Every item looked at here has been through lion_page_item_fetch(), so
-	 * the in-place paths below may take the item at off as it stands.
-	 */
-	off = lion_page_find_item(index, cpage, blk, ckey, &found);
-
-	if (found &&
-		lion_page_item_fetch(index, cpage, blk, off)->type == LION_CT_SPARSE)
+	switch (lion_chain_target(index, buf, ckey, lo, &off))
 	{
-		bool		done = false;
+		case LION_TARGET_SEGMENT:
+			{
+				bool		done = false;
 
-		if (lion_insert_segment_inplace(index, buf, off, entrybuf, entryoff,
-										ecopy, esize, ckey, lo, &done))
-			return true;
-		if (!mayput)
-			return false;
-		lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
-						   entryoff, ecopy, ckey, lo);
-		return true;
-	}
-
-	if (!found)
-	{
-		/*
-		 * Nothing covers the ckey.  Prefer the segment immediately before the
-		 * gap, then the one immediately after it; both are adjacent items, so
-		 * nothing can end up between the pair and the segment it joins.
-		 */
-		OffsetNumber maxoff = PageGetMaxOffsetNumber(cpage);
-		OffsetNumber target = InvalidOffsetNumber;
-
-		if (off > FirstOffsetNumber &&
-			lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
-													   OffsetNumberPrev(off)),
-								  ckey, lo))
-			target = OffsetNumberPrev(off);
-		else if (off <= maxoff &&
-				 lion_segment_has_room(lion_page_item_fetch(index, cpage, blk,
-															off),
-									   ckey, lo))
-			target = off;
-
-		if (target != InvalidOffsetNumber)
-		{
-			bool		done = false;
-
-			if (lion_insert_segment_inplace(index, buf, target, entrybuf,
-											entryoff, ecopy, esize, ckey, lo,
-											&done))
+				if (lion_insert_segment_inplace(index, buf, off, entrybuf,
+												entryoff, ecopy, esize, ckey,
+												lo, &done))
+					return true;
+				if (!mayput)
+					return false;
+				lion_insert_segment(index, heaprel, buf, off, true, entrybuf,
+								   entryoff, ecopy, ckey, lo);
 				return true;
+			}
+		case LION_TARGET_NEW:
 			if (!mayput)
 				return false;
-			lion_insert_segment(index, heaprel, buf, target, true, entrybuf,
+			lion_insert_segment(index, heaprel, buf, off, false, entrybuf,
 							   entryoff, ecopy, ckey, lo);
 			return true;
-		}
-
-		/* No segment to join: the pair becomes a new one-pair segment. */
-		if (!mayput)
-			return false;
-		lion_insert_segment(index, heaprel, buf, off, false, entrybuf, entryoff,
-						   ecopy, ckey, lo);
-		return true;
+		default:
+			break;
 	}
 
 	/* A container with this ckey. */
 	{
+		Page		cpage = BufferGetPage(buf);
+		BlockNumber blk = BufferGetBlockNumber(buf);
 		ItemId		ciid = PageGetItemId(cpage, off);
 		bool		done = false;
 
@@ -1818,6 +1932,588 @@ lion_insert_one(Relation index, Relation heaprel, LionState *state, Datum key,
 	UnlockReleaseBuffer(leafbuf);
 }
 
+/* ---------------------------------------------------------------------
+ * Bit slices (DESIGN.md §51)
+ * --------------------------------------------------------------------- */
+
+/*
+ * Put the row at (ckey, lo) into the SLICE entry of column state at pos,
+ * which a find-or-create on the leaf *leafbuf, held EXCLUSIVE, found at
+ * entryoff (found) or says belongs there: a new INLINE entry, or the member
+ * added by the same INLINE and CHAIN paths a key's entry takes, the in-place
+ * fast paths for a BITSET or a slack item and their records included - a
+ * slice of a dense column is bitsets, so most of its inserts are a bit set
+ * in place.  *leafbuf stays held, though a split of it may have moved the
+ * entries above its cut to a new right sibling.  The caller has made the
+ * writer's SERIALIZABLE check (lion_writer_check()).
+ */
+static void
+lion_slice_put(Relation index, Relation heaprel, LionState *state,
+			   Buffer *leafbuf, OffsetNumber entryoff, bool movedright,
+			   bool found, int pos, uint32 ckey, uint16 lo)
+{
+	if (!found)
+	{
+		char		payload[LION_SPARSE_SINGLETON_MAX];
+		Size		paylen = lion_put_singleton(payload, ckey, lo);
+		LionEntryTuple *entry;
+		Size		size;
+
+		entry = lion_make_slice_entry((AttrNumber) state->attno, pos,
+									  LION_ENTRY_INLINE, payload, paylen,
+									  &size);
+		lion_entry_set_ncontainers(entry, 1);
+		lion_entry_set_ntids(entry, 1);
+		lion_dir_add_entry(index, heaprel, state->ix, leafbuf, entryoff,
+						   movedright, entry, size);
+		pfree(entry);
+	}
+	else if ((lion_page_entry(BufferGetPage(*leafbuf), entryoff)->flags &
+			  LION_ENTRY_INLINE) != 0)
+		lion_insert_inline(index, heaprel, state, *leafbuf, entryoff, ckey, lo,
+						   NULL);
+	else
+		lion_insert_chain(index, heaprel, *leafbuf, entryoff, ckey, lo, NULL);
+}
+
+/*
+ * Add one row to the SLICE entry of column state at pos: the entry located
+ * or created by the find-or-create every new entry takes (lion_dir_find(),
+ * which with the position in the prefix finds exactly that slice), and the
+ * member put in by lion_slice_put().  What lion_debug_slice_insert() damages
+ * a slice with; a row's inserts go through lion_slice_insert().
+ */
+void
+lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
+					  int pos, uint32 ckey, uint16 lo)
+{
+	LionSearchKey sk;
+	uint8		posbyte;
+	Buffer		leafbuf;
+	OffsetNumber entryoff;
+	bool		movedright;
+	bool		found;
+
+	lion_search_key_slice(state, &sk, pos, &posbyte);
+	found = lion_dir_find(index, heaprel, state->ix, &sk, BUFFER_LOCK_EXCLUSIVE,
+						  true, &leafbuf, &entryoff, &movedright);
+
+	/* SERIALIZABLE: the page that stands for the slice (DESIGN.md §9) */
+	lion_writer_check(index, leafbuf, entryoff, found);
+
+	lion_slice_put(index, heaprel, state, &leafbuf, entryoff, movedright,
+				   found, pos, ckey, lo);
+	UnlockReleaseBuffer(leafbuf);
+}
+
+/*
+ * SEVERAL SLICES TO A RECORD: a row's in-place adds into the slices of a
+ * column that are on one directory leaf (DESIGN.md §51, "Insert cost,
+ * revisited").
+ *
+ * A dense slice is a posting tree, and a row appended to the table lands in
+ * the last container of each of its slices' trees, on the tree's tail, where
+ * the hot-key insert sets the bit in place: a record of the container page
+ * and the entry's leaf (lion_insert_container_inplace()).  The leaf is the
+ * same for every slice of the run, so a row of an int8 column wrote it into
+ * 33 records on average.  Here the adds are gathered first - each slice's
+ * tail locked, its item found and checked for room, everything fallible done
+ * - and then made in one ITEM_SET record of the posting leaves and the leaf:
+ * up to three posting leaves in generic mode, GenericXLog's four buffers in
+ * all, and up to seven with the resource manager, which takes a wider record
+ * when asked (lion_wal_begin_ext(), LION_WAL_MAX_BLOCKS_WIDE).  On the leaf
+ * each CHAIN entry's counter is raised in place and logged as the bytes that
+ * changed (lion_slice_count_one()), and an INLINE slice whose grown payload
+ * fits the bytes its entry has joins the record as a rewrite of the entry at
+ * its length (lion_slice_batch_inline()).  The record is ITEM_SET as before
+ * - ENTRY when every slice in it was INLINE - with more blocks and more
+ * operations per block, which its redo has always taken (lion_redo_apply()
+ * runs any stream on any block), so the WAL format is unchanged.
+ *
+ * LOCKS.  The leaf is held throughout, so no other writer of these slices
+ * runs, and each tail is locked after it, as a single insert does.  The one
+ * thing new is holding several posting leaves, of different sets, at once;
+ * so a tail after the first is only ever TRIED (ConditionalLockBuffer()), and
+ * when it is busy the batch is written and let go, and the slice starts a new
+ * one, waiting for its tail with nothing but the leaf held.  So the batch
+ * waits for exactly what a single insert waits for, in the same order, and
+ * adds no edge to any wait-for graph on the primary.  On a standby, redo
+ * takes the record's posting leaves in order and then the leaf (DESIGN.md
+ * §25), holding each to the end of the record; no reader holds a content
+ * lock on a posting page while it waits for another (a cursor copies the
+ * page and lets the lock go, a descent lets the parent go before it locks
+ * the child), so the several leaves close no cycle there either.
+ *
+ * What is not batched goes the ordinary way, with the batch written first:
+ * a slice that needs the general path (an item without room, a new segment,
+ * a member past a NARROW's width), a tail that is not the set's rightmost
+ * leaf or does not own the ckey (lion_insert_lock_chain_page()'s hint), an
+ * INLINE slice that has to grow or spill, and a new one - each of which may
+ * split the leaf, which would move the batch's entries - and the batch is
+ * also written before the walk leaves its leaf.
+ */
+typedef struct LionSliceAdd
+{
+	Buffer		buf;			/* the slice's tail, held EXCLUSIVE; or
+								 * InvalidBuffer, an INLINE slice */
+	OffsetNumber off;			/* the item that takes the member */
+	bool		segment;		/* a sparse segment, else a container */
+	OffsetNumber entryoff;		/* the slice's entry on the batch's leaf */
+	LionEntryTuple *ecopy;		/* an INLINE slice: the entry as it is to be,
+								 * its payload grown and its count raised;
+								 * NULL for a CHAIN one, whose count is
+								 * raised in place */
+	Size		esize;			/* its length, which is the old one's */
+} LionSliceAdd;
+
+typedef struct LionSliceBatch
+{
+	uint32		ckey;			/* the row, the same in every slice */
+	uint16		lo;
+	int			n;				/* adds */
+	int			nbufs;			/* of them, the ones with a posting leaf */
+	int			maxbufs;		/* posting leaves a record takes beside the
+								 * leaf: lion_wal_max_blocks() - 1 */
+	bool		checked;		/* the leaf's items checked since it last
+								 * changed but by the batch (see
+								 * lion_slice_batch_check_leaf()) */
+	LionSliceAdd adds[LION_SLICE_MAX_POS];
+} LionSliceBatch;
+
+/*
+ * Each entry the batch rewrites is overwritten in place, at its length,
+ * inside the record, so it has to be alone in its bytes, which a single
+ * insert checks of the one entry by a pass over the leaf's line pointers
+ * (lion_page_check_alone()).  The walk holds the leaf, and the batch's
+ * records change it by nothing but such rewrites, which keep every item
+ * where it is; so the batch checks every item of the leaf once instead, in
+ * one pass over the page (lion_page_check_items()), until the walk moves to
+ * another leaf or changes this one the ordinary way (b->checked).  For a
+ * column of 17 or 33 slices on a leaf of a few hundred entries that is a
+ * quarter to an eighth of the work - a pass that marks the few 8-byte units
+ * of each item, against 17 or 33 passes over every line pointer - which the
+ * profile of the batched inserts had put at some 13% of their time.
+ */
+static void
+lion_slice_batch_check_leaf(Relation index, LionSliceBatch *b, Buffer leafbuf)
+{
+	if (b->checked)
+		return;
+	lion_page_check_items(index, BufferGetPage(leafbuf),
+						  BufferGetBlockNumber(leafbuf));
+	b->checked = true;
+}
+
+/* What lion_slice_batch_add() did with a slice. */
+#define LION_SLICE_TAKEN	0	/* in the batch, or there already */
+#define LION_SLICE_ORDINARY	1	/* it needs lion_slice_put() */
+#define LION_SLICE_BUSY		2	/* its tail is locked: write the batch first */
+
+/*
+ * Take the batch's row into the CHAIN slice entry at (leafbuf, entryoff), if
+ * it goes in in place on its set's tail.  leafbuf is held EXCLUSIVE.  On
+ * LION_SLICE_ORDINARY and LION_SLICE_BUSY nothing of the attempt is held; the
+ * tail is waited for only when the batch is empty.
+ */
+static int
+lion_slice_batch_add(Relation index, LionSliceBatch *b, Buffer leafbuf,
+					 OffsetNumber entryoff)
+{
+	Page		page = BufferGetPage(leafbuf);
+	BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
+	uint32		ckey = b->ckey;
+	uint16		lo = b->lo;
+	LionEntryTuple *entry;
+	LionSliceAdd *a;
+	BlockNumber head;
+	BlockNumber tail;
+	Buffer		buf;
+	Page		cpage;
+	OffsetNumber off;
+	int			target;
+	int			verdict;
+	int			i;
+
+	Assert(b->nbufs < b->maxbufs && b->n < LION_SLICE_MAX_POS);
+
+	entry = lion_page_entry_fetch(index, page, leafblk, entryoff);
+	Assert((entry->flags & LION_ENTRY_CHAIN) != 0);
+	head = lion_entry_head(entry);
+	tail = lion_entry_tail(entry);
+
+	/*
+	 * Links that cannot be a page of the set, and a tail another slice of
+	 * the batch claims, are lion_insert_lock_chain_page()'s ERROR to raise,
+	 * on the ordinary path.
+	 */
+	if (!BlockNumberIsValid(head) || !BlockNumberIsValid(tail) ||
+		head == leafblk || tail == leafblk)
+		return LION_SLICE_ORDINARY;
+	for (i = 0; i < b->n; i++)
+		if (BufferIsValid(b->adds[i].buf) &&
+			BufferGetBlockNumber(b->adds[i].buf) == tail)
+			return LION_SLICE_ORDINARY;
+
+	buf = ReadBuffer(index, tail);
+	if (b->nbufs == 0)
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	else if (!ConditionalLockBuffer(buf))
+	{
+		ReleaseBuffer(buf);
+		return LION_SLICE_BUSY;
+	}
+	cpage = BufferGetPage(buf);
+
+	/* lion_insert_lock_chain_page()'s hint, and its owner check */
+	if (!lion_page_owns_entry(cpage, lion_entry_owner(entry), head) ||
+		!LionPageIsPostingLeaf(cpage) || !LionPageIsRightmost(cpage) ||
+		LionPageIncompleteSplit(cpage) ||
+		PageGetMaxOffsetNumber(cpage) < FirstOffsetNumber ||
+		ckey < LionPageGetOpaque(cpage)->minckey)
+	{
+		UnlockReleaseBuffer(buf);
+		return LION_SLICE_ORDINARY;
+	}
+
+	target = lion_chain_target(index, buf, ckey, lo, &off);
+	if (target == LION_TARGET_CONTAINER)
+		verdict = lion_container_inplace_check(index, buf, off, lo);
+	else if (target == LION_TARGET_SEGMENT)
+		verdict = lion_segment_inplace_check(index, buf, off, ckey, lo);
+	else
+		verdict = LION_INPLACE_NO;
+
+	if (verdict != LION_INPLACE_YES)
+	{
+		UnlockReleaseBuffer(buf);
+		return verdict == LION_INPLACE_DUP ? LION_SLICE_TAKEN :
+			LION_SLICE_ORDINARY;
+	}
+
+	/* The entry is rewritten in place at its size, inside the record. */
+	lion_slice_batch_check_leaf(index, b, leafbuf);
+
+	/* its counter is raised in place (lion_slice_count_one()) */
+	a = &b->adds[b->n++];
+	b->nbufs++;
+	a->buf = buf;
+	a->off = off;
+	a->segment = (target == LION_TARGET_SEGMENT);
+	a->entryoff = entryoff;
+	a->ecopy = NULL;
+	a->esize = 0;
+
+	return LION_SLICE_TAKEN;
+}
+
+/*
+ * The same for the INLINE slice entry at (leafbuf, entryoff): taken when the
+ * entry holds the grown payload within the bytes it has - its growth slack
+ * (lion_inline_rebuilt()) - so that its overwrite moves nothing on the leaf
+ * and cannot fail, and can share a record.  The new entry is the one
+ * lion_insert_inline() would write, built the same way.  An entry that has
+ * to grow on the leaf - which may split it - or to spill is left to the
+ * ordinary path, which computes the same thing again: the batch's other
+ * entries keep their lengths, so the leaf's free space it reads is the same.
+ * Takes no buffer.
+ */
+static int
+lion_slice_batch_inline(Relation index, LionState *state, LionSliceBatch *b,
+						Buffer leafbuf, OffsetNumber entryoff)
+{
+	Page		page = BufferGetPage(leafbuf);
+	BlockNumber leafblk = BufferGetBlockNumber(leafbuf);
+	LionEntryTuple *entry;
+	LionEntryTuple *newentry;
+	LionSliceAdd *a;
+	Size		itemsz;
+	Size		paylen;
+	Size		newlen;
+	Size		newsize;
+	char	   *newpay;
+	int			ndelta;
+
+	Assert(b->n < LION_SLICE_MAX_POS);
+
+	entry = lion_page_entry_fetch(index, page, leafblk, entryoff);
+	Assert((entry->flags & LION_ENTRY_INLINE) != 0 &&
+		   lion_entry_posext(entry) == NULL);
+	itemsz = ItemIdGetLength(PageGetItemId(page, entryoff));
+	paylen = LION_ENTRY_PAYLOAD_LEN(entry, itemsz);
+
+	newpay = (char *) palloc(paylen + LION_CONTAINER_MAX_SIZE);
+	newlen = lion_inline_add(index, leafblk, entryoff,
+							 LionEntryGetPayload(entry), paylen, b->ckey,
+							 b->lo, newpay, &ndelta);
+	if (newlen == 0)
+	{
+		pfree(newpay);
+		return LION_SLICE_TAKEN;	/* already indexed */
+	}
+	if (newlen > lion_inline_max(LionEntryPayloadOffset(entry),
+								 (Size) state->ix->meta.inline_limit))
+	{
+		pfree(newpay);
+		return LION_SLICE_ORDINARY; /* it spills */
+	}
+
+	newentry = lion_inline_rebuilt(state, page, entry, itemsz, newpay, newlen,
+								   ndelta, &newsize);
+	pfree(newpay);
+	if (newsize != itemsz)
+	{
+		pfree(newentry);
+		return LION_SLICE_ORDINARY;
+	}
+
+	/* lion_dir_place()'s check of the item it overwrites */
+	lion_slice_batch_check_leaf(index, b, leafbuf);
+
+	a = &b->adds[b->n++];
+	a->buf = InvalidBuffer;
+	a->off = InvalidOffsetNumber;
+	a->segment = false;
+	a->entryoff = entryoff;
+	a->ecopy = newentry;
+	a->esize = newsize;
+
+	return LION_SLICE_TAKEN;
+}
+
+/*
+ * One more TID in the CHAIN slice entry at (leafbuf, entryoff), inside the
+ * record xstate.  An in-place add changes nothing of a CHAIN entry but its
+ * ntids counter, so the counter is raised where it is, and logged as the
+ * bytes of it that changed - one, but on a carry - in a SETBYTES, which
+ * replay copies over the same bytes of the same entry (lion_redo_apply()):
+ * nine bytes of record, where the DELTA of a rewritten entry
+ * (lion_replace_entry()) is some fourteen, and costs a copy of the entry and
+ * a comparison besides, which the profile of the batched inserts put at an
+ * eighth of their time.
+ */
+static void
+lion_slice_count_one(LionWalState *xstate, Buffer leafbuf,
+					 OffsetNumber entryoff)
+{
+	Page		p = lion_wal_register_buffer(xstate, leafbuf, LION_WALBUF_STD);
+	LionEntryTuple *e = (LionEntryTuple *) PageGetItem(p,
+													   PageGetItemId(p, entryoff));
+	char	   *ctr = (char *) e + offsetof(LionEntryChainHdr, ntids);
+	char		old[sizeof(uint64)];
+	int			first;
+	int			last;
+
+	Assert((e->flags & LION_ENTRY_CHAIN) != 0);
+	memcpy(old, ctr, sizeof(old));
+	lion_entry_set_ntids(e, lion_entry_ntids(e) + 1);
+
+	for (first = 0; first < (int) sizeof(old) - 1 && old[first] == ctr[first];
+		 first++)
+		;
+	for (last = (int) sizeof(old) - 1; last > first && old[last] == ctr[last];
+		 last--)
+		;
+	lion_wal_op(xstate, p, LION_OP_SETBYTES, entryoff,
+				(uint16) (offsetof(LionEntryChainHdr, ntids) + first),
+				ctr + first, (Size) (last - first + 1));
+}
+
+/*
+ * Write the batch b in one record - the posting leaves first, each with its
+ * CONTAINER_ADD or SPARSE_INS (and MINMAX), then the leaf with each CHAIN
+ * entry's counter (lion_slice_count_one()) and each INLINE entry's DELTA, the
+ * order redo takes them in (DESIGN.md §25): an ITEM_SET, or an ENTRY when
+ * every slice of it was INLINE - and let the posting leaves go.  leafbuf
+ * stays held.
+ */
+static void
+lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
+{
+	LionWalState *xstate;
+	int			i;
+
+	if (b->n == 0)
+		return;
+	xstate = lion_wal_begin_ext(index, b->nbufs + 1);
+	for (i = 0; i < b->n; i++)
+	{
+		LionSliceAdd *a = &b->adds[i];
+
+		if (!BufferIsValid(a->buf))
+			continue;
+		if (a->segment)
+			lion_segment_inplace_apply(xstate, a->buf, a->off, b->ckey, b->lo);
+		else
+			lion_container_inplace_apply(xstate, a->buf, a->off, b->lo);
+	}
+
+	/*
+	 * Every entry keeps its length, so no overwrite moves another item or
+	 * fails (lion_replace_entry() tests before it writes, and has nothing to
+	 * refuse here).
+	 */
+	for (i = 0; i < b->n; i++)
+	{
+		LionSliceAdd *a = &b->adds[i];
+
+		if (BufferIsValid(a->buf))
+			lion_slice_count_one(xstate, leafbuf, a->entryoff);
+		else if (!lion_replace_entry(index, xstate, leafbuf, a->entryoff,
+									 a->ecopy, a->esize))
+			elog(ERROR, "lion index: could not update entry %u on block %u",
+				 a->entryoff, BufferGetBlockNumber(leafbuf));
+	}
+	lion_wal_finish(xstate, b->nbufs > 0 ? LION_XLOG_ITEM_SET :
+					LION_XLOG_ENTRY);
+
+	for (i = 0; i < b->n; i++)
+	{
+		if (BufferIsValid(b->adds[i].buf))
+			UnlockReleaseBuffer(b->adds[i].buf);
+		if (b->adds[i].ecopy != NULL)
+			pfree(b->adds[i].ecopy);
+	}
+	b->n = 0;
+	b->nbufs = 0;
+}
+
+/*
+ * A row of a sliced column: into the slice of every bit its value's encoding
+ * has set, in ascending position, and then into the existence slice, AFTER
+ * the row went under its key.  Readers see no half-done row: its transaction
+ * has not committed (lioninsert()).  A failure between the steps leaves a
+ * dead row in some of the sets and not the others, which no snapshot sees and
+ * the next VACUUM takes out of all of them; lion_index_verify() knows such a
+ * row by its being dead (lion_verify_slices()).
+ *
+ * ONE DESCENT for the column (DESIGN.md §51, "Insert cost, revisited"): a
+ * column's slices sort together, by position, after its summaries, so they
+ * are one run on one leaf or a few adjacent ones, and the positions a row
+ * needs are visited in that order.  The first is found by a descent; each
+ * next one from the leaf the walk holds (lion_dir_find_next()), which moves
+ * right as a descent would when the slices spill onto the next leaf or a
+ * split of the held leaf moved them there.  The leaf stays held from the
+ * first slice to the last.  Each slice has its writer check; the in-place
+ * adds go into a batch of several slices to a record (lion_slice_batch_add()
+ * above), and anything else is put in as by an insert of its own
+ * (lion_slice_put()), its posting pages locked after the leaf and let go
+ * before the next, after the batch is written - so the lock order and the
+ * split protocol are those of one insert, repeated.  Holding the leaf across
+ * the steps keeps out the other writers of these slices for the row's whole
+ * walk, rather than for each step; they would queue on the same leaf for
+ * every step anyway.
+ *
+ * THE SEAM for the plane kernel (DESIGN.md §50, §51 "Not done"): one row at
+ * a time.  An insert of many rows - a COPY, an INSERT ... SELECT - could turn
+ * them into planes (lion_planes_scatter_strided()) and add each plane's word
+ * to its slice once; aminsert is handed one row at a time, so that is a
+ * bulk-insert path of its own.
+ */
+static void
+lion_slice_insert(Relation index, Relation heaprel, LionState *state,
+				  Datum key, uint32 ckey, uint16 lo)
+{
+	int			nbits = state->slicebits;
+	int			pos[LION_SLICE_MAX_POS];
+	int			npos = 0;
+	int64		v;
+	uint64		enc;
+	Buffer		leafbuf = InvalidBuffer;
+	OffsetNumber entryoff = InvalidOffsetNumber;
+	LionSliceBatch batch;
+	int			i;
+
+	switch (nbits)
+	{
+		case 16:
+			v = DatumGetInt16(key);
+			break;
+		case 32:
+			v = DatumGetInt32(key);
+			break;
+		default:
+			v = DatumGetInt64(key);
+			break;
+	}
+	enc = lion_slice_encode(v, nbits);
+	while (enc != 0)
+	{
+		pos[npos++] = pg_rightmost_one_pos64(enc);
+		enc &= enc - 1;
+	}
+	pos[npos++] = LION_SLICE_EXISTS;
+
+	batch.ckey = ckey;
+	batch.lo = lo;
+	batch.n = 0;
+	batch.nbufs = 0;
+	batch.maxbufs = lion_wal_max_blocks(index) - 1;
+	batch.checked = false;
+
+	for (i = 0; i < npos; i++)
+	{
+		LionSearchKey sk;
+		uint8		posbyte;
+		bool		movedright = false;
+		bool		found;
+
+		lion_search_key_slice(state, &sk, pos[i], &posbyte);
+		if (i == 0)
+			found = lion_dir_find(index, heaprel, state->ix, &sk,
+								  BUFFER_LOCK_EXCLUSIVE, true, &leafbuf,
+								  &entryoff, &movedright);
+		else
+		{
+			/* the batch's entries are on the leaf: written before it goes */
+			if (!lion_dir_leaf_holds(leafbuf, &sk))
+			{
+				lion_slice_batch_write(index, leafbuf, &batch);
+				batch.checked = false;
+			}
+			found = lion_dir_find_next(index, heaprel, state->ix, &sk,
+									   entryoff, &leafbuf, &entryoff);
+		}
+
+		/* SERIALIZABLE: the page that stands for the slice (DESIGN.md §9) */
+		lion_writer_check(index, leafbuf, entryoff, found);
+
+		if (found)
+		{
+			int			r;
+
+			if ((lion_page_entry(BufferGetPage(leafbuf), entryoff)->flags &
+				 LION_ENTRY_CHAIN) != 0)
+			{
+				r = lion_slice_batch_add(index, &batch, leafbuf, entryoff);
+				if (r == LION_SLICE_BUSY)
+				{
+					lion_slice_batch_write(index, leafbuf, &batch);
+					r = lion_slice_batch_add(index, &batch, leafbuf, entryoff);
+					Assert(r != LION_SLICE_BUSY);
+				}
+			}
+			else
+				r = lion_slice_batch_inline(index, state, &batch, leafbuf,
+											entryoff);
+			if (r == LION_SLICE_TAKEN)
+			{
+				if (batch.nbufs == batch.maxbufs)
+					lion_slice_batch_write(index, leafbuf, &batch);
+				continue;
+			}
+		}
+
+		/* the ordinary path, which may split the leaf: the batch goes first */
+		lion_slice_batch_write(index, leafbuf, &batch);
+		lion_slice_put(index, heaprel, state, &leafbuf, entryoff, movedright,
+					   found, pos[i], ckey, lo);
+		batch.checked = false;
+	}
+
+	lion_slice_batch_write(index, leafbuf, &batch);
+	UnlockReleaseBuffer(leafbuf);
+}
+
 /*
  * aminsert
  *
@@ -1934,6 +2630,13 @@ lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 				LION_INJECTION_POINT("lion-insert-before-summary");
 				lion_summary_insert(index, heapRel, state, key, ckey, lo);
 			}
+
+			/*
+			 * ... and in its bit slices (DESIGN.md §51), a step after that
+			 * with nothing held in between, as for the summary.
+			 */
+			if (state->sliced)
+				lion_slice_insert(index, heapRel, state, key, ckey, lo);
 		}
 
 		CHECK_FOR_INTERRUPTS();

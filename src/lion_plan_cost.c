@@ -3016,6 +3016,161 @@ lion_cost_range_source(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 }
 
 /*
+ * The WHERE clauses - the first bound of each range - that the plan being
+ * priced answers from slices (DESIGN.md §53): set by the planner around its
+ * pricing of a build that does (lion_cost_set_sliced()), NIL otherwise.  A
+ * range taken as a source whose first bound is one is priced by
+ * lion_cost_slice_range() rather than lion_cost_range_source().
+ */
+static List *lion_cost_sliced = NIL;
+
+void
+lion_cost_set_sliced(List *clauses)
+{
+	lion_cost_sliced = clauses;
+}
+
+static Cost lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx,
+								 double keys, double nkeys, double items,
+								 double rows, double width);
+
+/*
+ * A RANGE FROM SLICES (DESIGN.md §53, "Cost"): the range on key column col of
+ * idx bounded by `bounds`, of selectivity sel, collected from the column's
+ * slices (lion_slice_range_collect()) - a fold at every container key of its
+ * existence slice E, whatever share of the rows the range holds - and then
+ * counted ANDed with E.  From what the slices' entries record
+ * (lion_slice_shape(); as every slice holding half of every key's rows where
+ * it cannot read them whole):
+ *
+ *	- each of E's keys folded (LION_SLICE_RANGE_KEY_COST);
+ *	- at each, each comparison - one for a range bounded on one side, two on
+ *	  both - takes the steps that tell the key's rows apart from its
+ *	  constant: the top bits every row agrees on (a slice of no row or of
+ *	  every row), and as many more as the key's rows need to differ, log2 of
+ *	  them, and two; a step a slice's container found and laid out
+ *	  (LION_SLICE_RANGE_STEP_COST) and folded, its words a bitmap of the
+ *	  heap's width a block (LION_SLICE_RANGE_WORD_COST a word);
+ *	- E and the slices the steps reach read at those keys, as the slices'
+ *	  counts read them (lion_slice_read_cost());
+ *	- the copy: a container written a key of the range's rows (two bytes a
+ *	  row, a run a heap block where the column is in the heap's order, the
+ *	  correlation interpolating as for a range's union), within what the
+ *	  ranges before it left of a hash table's memory (*mem) or past it into
+ *	  a file (*spills), written once and read once;
+ *	- and E read again at the copy's keys for the counts' AND with it.
+ *
+ * Its rows are the range's, as for any range taken as a source; the fold's
+ * work is not, which is the point: it is the same at 0.1% of the rows as at
+ * 90%, where the walk of a range's entries and summaries grows with them.
+ */
+Cost
+lion_cost_slice_range(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					  AttrNumber col, List *bounds, Selectivity sel,
+					  LionRangeMem *mem, bool *spills)
+{
+	double		limit = (double) get_hash_memory_limit();
+	double		budget = Max(limit - mem->held, 0.0);
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		rowsperpage = Max(tuples / heap_pages, 1.0);
+	double		width = Min(Max(ceil(rowsperpage / 64.0), 1.0),
+							(double) LION_BITSET_WIDTH);
+	double		nwords = LION_BLOCKS_PER_CONTAINER * width;
+	double		rows = tuples * sel;
+	double		conts = lion_containers_for(heap_pages, rows);
+	double		ckeys = Max(heap_pages / LION_BLOCKS_PER_CONTAINER, 1.0);
+	double		runs = Min(ckeys, Max(1.0, rows * ckeys / tuples));
+	double		bytes = Min(rows * sizeof(uint16) + conts * LION_CONTAINER_HDRSZ,
+							conts * LION_CONTAINER_MAX_SIZE);
+	Var		   *var = lion_index_col_var(root, rel, idx, col);
+	double		corr = (var != NULL) ? lion_var_correlation(root, rel, var) : 0.0;
+	double		c2 = corr * corr;
+	double		ucont;
+	double		spillheld;
+	LionSliceShape shape;
+	Relation	index;
+	double		erows;
+	double		ekeys;
+	double		perkey;
+	double		steps;
+	double		nchains = Min((double) list_length(bounds), 2.0);
+	int			topconst = 0;
+	int			nbits;
+	int			s;
+	Cost		read;
+	Cost		fold;
+	Cost		copy;
+
+	*spills = false;
+
+	/* the planner holds the index locked since get_relation_info() */
+	index = index_open(idx->indexoid, NoLock);
+	lion_slice_shape(index, col, &shape);
+	index_close(index, NoLock);
+	nbits = Max(shape.nbits, 1);
+	if (!shape.complete || shape.nslices == 0)
+	{
+		for (s = 0; s < nbits; s++)
+		{
+			shape.rows[s] = tuples / 2.0;
+			shape.items[s] = nkeys;
+		}
+		shape.rows[nbits] = tuples;
+		shape.items[nbits] = nkeys;
+	}
+
+	/* E: its rows, and the keys they lie at */
+	erows = Max(shape.rows[nbits], 1.0);
+	ekeys = lion_containers_for(heap_pages, erows);
+	perkey = Max(erows / ekeys, 1.0);
+
+	/* the steps of a comparison at a key */
+	for (s = nbits - 1; s >= 0; s--)
+	{
+		if (shape.rows[s] > 0.001 * erows && shape.rows[s] < 0.999 * erows)
+			break;
+		topconst++;
+	}
+	steps = Min((double) nbits,
+				topconst + 2.0 + (1.0 - c2) * ceil(log2(perkey)));
+
+	/* E and the slices the steps reach, read at E's keys */
+	read = lion_slice_read_cost(root, idx, ekeys, nkeys, shape.items[nbits],
+								shape.rows[nbits], width);
+	for (s = nbits - 1; s >= 0 && s >= nbits - (int) steps; s--)
+		read += lion_slice_read_cost(root, idx, ekeys, nkeys, shape.items[s],
+									 shape.rows[s], width);
+
+	fold = ekeys * (LION_SLICE_RANGE_KEY_COST +
+					nchains * steps * (LION_SLICE_RANGE_STEP_COST +
+									   nwords * LION_SLICE_RANGE_WORD_COST));
+
+	/* the copy, and E again at its keys for the counts' AND */
+	ucont = conts + (runs - conts) * c2;
+	bytes += (runs * LION_RANGE_RUN_BYTES - bytes) * c2;
+	copy = ucont * LION_SLICE_RANGE_CONTAINER_COST +
+		lion_slice_read_cost(root, idx, ucont, nkeys, shape.items[nbits],
+							 shape.rows[nbits], width);
+	bytes += ucont * (sizeof(LionContainer *) + sizeof(uint32));
+	spillheld = ucont * LION_SPILL_ENTRY_BYTES + BLCKSZ;
+	elog(DEBUG1, "lion range from slices of %s, column %d: %.0f keys of E, %.1f steps a comparison, %.0f comparisons, %.0f words, %.0f containers of the copy; read %.1f, fold %.1f, copy %.1f",
+		 get_rel_name(idx->indexoid), (int) col, ekeys, steps, nchains,
+		 nwords, ucont, read, fold, copy);
+	if (bytes <= budget)
+	{
+		mem->held += bytes;
+		mem->inmem += bytes;
+		mem->inmemspill += spillheld;
+		return read + fold + copy;
+	}
+	mem->held += spillheld;
+	*spills = true;
+	return read + fold + copy + 2.0 * ceil(bytes / BLCKSZ) * seq_page_cost;
+}
+
+/*
  * The heap recheck of a range walk (DESIGN.md §28): `tids` candidates on the
  * pages the visibility map cannot vouch for, counted `entries` at a time.  The
  * visibility cache fetches a dirty page once per query - but it answers a page
@@ -3314,7 +3469,8 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	Cost		collect;
 	LionWalkRange *walk = NULL;
 	bool		spills;
-	bool		evicts;
+	bool		evicts = false;
+	bool		sliced;
 	ListCell   *lc;
 	int			j;
 
@@ -3326,11 +3482,19 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	for (j = c->ci; j < c->nclause; j++)
 		if (c->rangelead[j] == c->ci)
 			bounds = lappend(bounds, list_nth(c->whereclauses, j));
+	sliced = list_member_ptr(lion_cost_sliced,
+							 list_nth(c->whereclauses, c->ci));
 	sel = lion_rel_clauses_selectivity(c->root, c->rel, bounds);
 	c->clausesel[c->ci++] = sel;
 
-	collect = lion_cost_range_source(c->root, c->rel, idx, col, bounds, sel,
-									 &c->rangesrc_mem, &spills, &evicts);
+	/* from the slices (DESIGN.md §53), or from the entries (§32) */
+	if (sliced)
+		collect = lion_cost_slice_range(c->root, c->rel, idx, col, bounds,
+										sel, &c->rangesrc_mem, &spills);
+	else
+		collect = lion_cost_range_source(c->root, c->rel, idx, col, bounds,
+										 sel, &c->rangesrc_mem, &spills,
+										 &evicts);
 	c->rangesrc_cost += collect;
 	if (c->orgrp[c->ci - 1] < 0)
 		c->rangesrc_and++;
@@ -3338,9 +3502,10 @@ lion_count_rel_range_source(LionCountRelCost *c, IndexOptInfo *idx,
 	/*
 	 * Fit or not: the existence tests of a count(DISTINCT), which stop at
 	 * their first row, walk a range 15 to 130 times faster than they
-	 * collect one that fits (DESIGN.md §32).
+	 * collect one that fits (DESIGN.md §32).  Not one from slices, which
+	 * has no walk.
 	 */
-	if (c->walksave != NULL && c->orgrp[c->ci - 1] < 0)
+	if (c->walksave != NULL && c->orgrp[c->ci - 1] < 0 && !sliced)
 	{
 		LionWalkRange *wr = (LionWalkRange *) palloc0(sizeof(LionWalkRange));
 
@@ -5605,6 +5770,253 @@ lion_cost_wagg_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
 	}
 
 	cpath->path.rows = 1.0;
+#if PG_VERSION_NUM >= 180000
+	cpath->path.disabled_nodes = 0;
+#endif
+	cpath->path.startup_cost = run;
+	cpath->path.total_cost = run;
+}
+
+/*
+ * THE AGGREGATES OF SLICED COLUMNS FROM THEIR SLICES (DESIGN.md §52): for
+ * each column - idxs[c], key column cols[c], asked wants[c] (LION_SWANT_*) -
+ * the WHERE collected with its existence slice E, the slices counted against
+ * that copy C0 = E ∧ WHERE in one walk of its container keys, and a descent
+ * for each extreme asked.  Added to the count of the WHERE the path prices
+ * (cpath) when the target list has counts too, and in its place when not.
+ *
+ *	- the collection: the WHERE's merge - what the count of it is priced at,
+ *	  half of it again beside the count, whose pages it reads again cached -
+ *	  E sought at each of C0's keys and a container of the copy written
+ *	  there (LION_FKJOIN_COPY_CONTAINER_COST); with no WHERE, E's containers
+ *	  read and written;
+ *	- the walk: each key of C0 (LION_SLICE_KEY_COST: the copy's image, the
+ *	  map, the cursors' heap), and each slice read at C0's keys - every slice
+ *	  for a sum, E alone otherwise - as lion_slice_read_cost() prices it;
+ *	- a descent: nbits steps (LION_SLICE_STEP_COST: the slice located and the
+ *	  count set up), each - but a bit no row has, a slice with no entry - a
+ *	  count of the candidates, LION_SLICE_STEP_KEY_COST a key and
+ *	  LION_SLICE_STEP_ROW_COST a row of them, which a step that splits them
+ *	  narrows to the rows kept: those with the bit for the maximum, without
+ *	  it for the minimum, taken to have it as often as E's rows have it
+ *	  (the slice's rows over E's) - so a uniform column's halve at every bit
+ *	  of its range, and a skewed one's minimum keeps most of them for long.
+ *	  The collection of the rows kept is in the two prices, as fitted.
+ *
+ * What the slices hold comes from their entries' headers (lion_slice_shape()),
+ * read at plan time; a column whose slices it cannot read whole is taken as
+ * every slice holding half of every key's rows.
+ */
+
+/*
+ * A slice of `items` containers holding `rows` read at `keys` of the heap's
+ * nkeys container keys - a count's cursor over it, which copies each posting
+ * page it lands on and steps or seeks through its containers: the containers
+ * met there, the pages they lie on - each a page read (lion_index_page_cost())
+ * and a copy of it walked (LION_SLICE_PAGE_COST) - and, where the keys are
+ * fewer than the pages, a descent of the posting tree to each page sought.
+ * A container takes what a bitmap of the heap's width does, at most, and an
+ * ARRAY's two bytes a row below that.
+ */
+static Cost
+lion_slice_read_cost(PlannerInfo *root, IndexOptInfo *idx, double keys,
+					 double nkeys, double items, double rows, double width)
+{
+	double		perbytes;
+	double		pages;
+	double		reads;
+	double		seeks;
+
+	if (items <= 0.0)
+		return 0.0;
+	perbytes = 8.0 + Min(2.0 * rows / items, 512.0 * width);
+	pages = Max(ceil(items * perbytes / BLCKSZ), 1.0);
+	reads = pages * (1.0 - exp(-keys / pages));
+	seeks = reads * exp(-keys / pages);
+	return items * Min(keys / nkeys, 1.0) * LION_SLICE_CONTAINER_COST +
+		reads * (lion_index_page_cost(root, (double) idx->pages,
+									  seq_page_cost) +
+				 LION_SLICE_PAGE_COST) +
+		seeks * LION_POSTREE_SEEK_LEVELS * LION_DESCENT_COST;
+}
+
+void
+lion_cost_slice_path(PlannerInfo *root, CustomPath *cpath, RelOptInfo *rel,
+					 List *idxs, List *cols, List *wants, double whererows,
+					 bool haswhere, bool counts, double ngroups, int batch,
+					 Cost rangecollect)
+{
+	Cost		where = cpath->path.total_cost;
+	Cost		run = counts ? where : 0.0;
+	double		units = Max(ngroups, 1.0);
+	double		outrows = cpath->path.rows;
+	double		heap_pages = Max((double) rel->pages, 1.0);
+	double		nkeys = Max(ceil(heap_pages / LION_BLOCKS_PER_CONTAINER), 1.0);
+	double		tuples = Max(rel->tuples, 1.0);
+	double		rowsperpage = Max(tuples / heap_pages, 1.0);
+	double		width = Min(ceil(rowsperpage / 64.0),
+							(double) LION_BITSET_WIDTH);
+	ListCell   *l1;
+	ListCell   *l2;
+	ListCell   *l3;
+	bool		collected = false;
+
+	forthree(l1, idxs, l2, cols, l3, wants)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(l1);
+		AttrNumber	col = (AttrNumber) lfirst_int(l2);
+		int			want = lfirst_int(l3);
+		LionSliceShape shape;
+		Relation	index;
+		double		erows;
+		double		crows;
+		double		ckeys;
+		double		npos;
+		Cost		unit = 0.0;
+		int			nbits;
+		int			s;
+
+		/* the planner holds the index locked since get_relation_info() */
+		index = index_open(idx->indexoid, NoLock);
+		lion_slice_shape(index, col, &shape);
+		index_close(index, NoLock);
+		nbits = Max(shape.nbits, 1);
+		npos = (double) LION_SLICE_NPOS(nbits);
+		if (!shape.complete || shape.nslices == 0)
+		{
+			for (s = 0; s < nbits; s++)
+			{
+				shape.rows[s] = tuples / 2.0;
+				shape.items[s] = nkeys;
+			}
+			shape.rows[nbits] = tuples;
+			shape.items[nbits] = nkeys;
+		}
+
+		/* C0 = E ∧ WHERE: the WHERE's share of E's rows, and their keys */
+		erows = Max(shape.rows[nbits], 1.0);
+		crows = haswhere ? erows * Min(Max(whererows, 1.0) / tuples, 1.0) :
+			erows;
+		ckeys = Max(nkeys * (1.0 - exp(-crows / nkeys)), 1.0);
+
+		/*
+		 * The collection, once for every column (they share the WHERE); and
+		 * a range that bounds the sum over its entries collected for it
+		 * (lion_range_collect()), whose price the caller made as a range
+		 * taken as a source is priced, rangecollect (2026-10-27, §53.7: it
+		 * was taken to be in the half of the WHERE's price, which priced
+		 * the collection of a range of a column in no heap order from its
+		 * summaries at a fifth of its time).
+		 */
+		if (haswhere)
+			run += (counts || collected ? 0.5 : 1.0) * where +
+				ckeys * LION_PROBE_COST + (collected ? 0.0 : rangecollect);
+		else
+			run += Min(shape.items[nbits], nkeys) * LION_CONTAINER_COST;
+		run += ckeys * LION_FKJOIN_COPY_CONTAINER_COST;
+		collected = true;
+
+		/*
+		 * The decode route (DESIGN.md §52): a walk of C0's keys a batch of
+		 * groups, each bit slice read at those keys and made a plane of each
+		 * key's positions, the batch's groups' containers read there, and
+		 * every row of C0 in a group given its value once.
+		 */
+		if (ngroups > 0.0 && batch > 0)
+		{
+			double		nbatch = ceil(units / (double) batch);
+			double		grows = Max(tuples / units, 1.0);
+			double		gkeys = Max(nkeys * (1.0 - exp(-grows / nkeys)), 1.0);
+			double		words = ckeys * LION_BITSET_WORDS;
+			double		perword = crows / words;
+			double		wordsused = words * (1.0 - exp(-perword));
+
+			for (s = 0; s <= nbits; s++)
+				unit += lion_slice_read_cost(root, idx, ckeys, nkeys,
+											 shape.items[s], shape.rows[s],
+											 width);
+			unit += ckeys * LION_SLICE_KEY_COST;
+
+			/*
+			 * Each word of rows: its rows' values gathered by a transpose,
+			 * or read a bit at a time where they are fewer than
+			 * LION_SLICE_GATHER_MIN; each row added to its group's answers.
+			 */
+			run += nbatch * unit +
+				units * Min(gkeys, ckeys) * LION_SLICE_CONTAINER_COST +
+				wordsused * Min(Max(perword, 1.0) * nbits *
+								LION_SLICE_DECODE_BIT_COST,
+								LION_SLICE_GATHER_COST * nbits / 32.0) +
+				crows * LION_SLICE_DECODE_ROW_COST;
+			continue;
+		}
+
+		/*
+		 * A GROUP BY's group - its share of C0's rows - is its own copy of
+		 * C0, made at the keys its rows lie at, and counted as the one row
+		 * is: every group alike.
+		 */
+		if (ngroups > 0.0)
+		{
+			crows = Max(crows / units, 1.0);
+			ckeys = Max(nkeys * (1.0 - exp(-crows / nkeys)), 1.0);
+			unit += ckeys * (LION_MEMORY_PROBE_COST + LION_CONTAINER_COST +
+							 LION_FKJOIN_COPY_CONTAINER_COST);
+		}
+
+		/* the walk: E, and every bit slice for a sum, each located */
+		for (s = 0; s <= nbits; s++)
+		{
+			if (s < nbits && (want & LION_SWANT_SUM) == 0)
+				continue;
+			unit += lion_slice_read_cost(root, idx, ckeys, nkeys,
+										 shape.items[s], shape.rows[s], width);
+		}
+		unit += ckeys * LION_SLICE_KEY_COST *
+			ceil(((want & LION_SWANT_SUM) ? npos : 1.0) /
+				 (double) LION_GROUP_BATCH_MAX);
+		unit += ((want & LION_SWANT_SUM) ? npos : 1.0) * 2.0 * LION_DESCENT_COST;
+
+		/*
+		 * The descents, a step a bit from the top.  A bit no row has (a
+		 * slice with no entry) is a lookup; one every candidate has, or
+		 * none, is a count of the candidates that leaves them as they were;
+		 * a bit that splits them is a count and a collection of the ones
+		 * kept - those with it, for the maximum, or without it, for the
+		 * minimum - which are taken to have it as often as E's rows do.
+		 */
+		for (s = 0; s < 2; s++)
+		{
+			bool		max = (s == 1);
+			double		rows = crows;
+			double		keys = ckeys;
+			int			bit;
+
+			if ((want & (max ? LION_SWANT_MAX : LION_SWANT_MIN)) == 0)
+				continue;
+			for (bit = nbits - 1; bit >= 0; bit--)
+			{
+				double		p = Min(shape.rows[bit] / erows, 1.0);
+
+				unit += LION_SLICE_STEP_COST;
+				if (p <= 0.0)
+					continue;	/* no entry: no row has it */
+				unit += lion_slice_read_cost(root, idx, keys, nkeys,
+											 shape.items[bit], shape.rows[bit],
+											 width);
+				unit += keys * (LION_SLICE_STEP_KEY_COST +
+								Min(rows / keys, LION_MEMBER_CAP) *
+								LION_SLICE_STEP_ROW_COST);
+				if (p >= 1.0 || rows <= 1.0)
+					continue;	/* every candidate has it */
+				rows = Max(rows * (max ? p : 1.0 - p), 1.0);
+				keys = Max(nkeys * (1.0 - exp(-rows / nkeys)), 1.0);
+			}
+		}
+		run += unit * units;
+	}
+
+	cpath->path.rows = (ngroups > 0.0) ? outrows : 1.0;
 #if PG_VERSION_NUM >= 180000
 	cpath->path.disabled_nodes = 0;
 #endif

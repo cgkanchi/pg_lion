@@ -825,11 +825,12 @@ lion_walk_next(LionLeafWalk *w, Size *itemlen)
 
 			/*
 			 * Bounded to one key column (DESIGN.md §24), and to its values:
-			 * the column's summary entries (§32) come after its last value.
+			 * the column's summary entries (§32) and slices (§51) come after
+			 * its last value.
 			 */
 			if (entry->attno < w->col->attno)
 				continue;
-			if (entry->attno > w->col->attno || LionEntryIsSummary(entry))
+			if (entry->attno > w->col->attno || LionEntryIsDerived(entry))
 			{
 				w->done = true;
 				return NULL;

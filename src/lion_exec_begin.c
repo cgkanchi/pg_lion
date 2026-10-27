@@ -922,6 +922,9 @@ lion_begin_list_batch(LionCountScanState *st, EState *estate)
 	st->lbatch = NULL;
 	if (st->mode != LION_MODE_COUNT)
 		return;
+	/* the slices count against the whole list, collected (DESIGN.md §52) */
+	if (st->plan.nscol > 0)
+		return;
 
 	lb = (LionListBatch *) MemoryContextAllocZero(estate->es_query_cxt,
 												  sizeof(LionListBatch));
@@ -929,6 +932,82 @@ lion_begin_list_batch(LionCountScanState *st, EState *estate)
 	lb->part = 0;
 	lb->nparts = 1;				/* every batch, but in a parallel range */
 	st->lbatch = lb;
+}
+
+/*
+ * The aggregates of sliced columns from their slices (DESIGN.md §52): each
+ * column, what its aggregates ask of its slices, and whether the target list
+ * has counts besides, which the node makes as before.  Their state is there
+ * only when the plan has them.
+ */
+static void
+lion_begin_slices(LionCountScanState *st, const LionCountPriv *priv,
+				  EState *estate)
+{
+	LionSliceState *ss;
+	int			i;
+
+	st->slice = NULL;
+	if (priv->nscol == 0)
+		return;
+
+	ss = (LionSliceState *) MemoryContextAllocZero(estate->es_query_cxt,
+												   sizeof(LionSliceState));
+	ss->ncol = priv->nscol;
+	ss->col = (LionSCol *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionSCol) * ss->ncol);
+	for (i = 0; i < ss->ncol; i++)
+	{
+		ss->col[i].attno = priv->scol[i].attno;
+		ss->col[i].idxoid = priv->scol[i].idxoid;
+		ss->col[i].idxcol = priv->scol[i].idxcol;
+	}
+	ss->nagg = priv->nsagg;
+	ss->agg = (LionSAgg *) MemoryContextAllocZero(estate->es_query_cxt,
+												  sizeof(LionSAgg) *
+												  Max(ss->nagg, 1));
+	for (i = 0; i < ss->nagg; i++)
+	{
+		LionSAgg   *a = &ss->agg[i];
+
+		a->kind = priv->sagg[i].kind;
+		a->col = priv->sagg[i].col;
+		a->resnull = true;
+		switch (a->kind)
+		{
+			case LION_SAGG_SUM:
+			case LION_SAGG_SUM8:
+			case LION_SAGG_AVG:
+			case LION_SAGG_AVG8:
+				ss->col[a->col].want |= LION_SWANT_SUM;
+				break;
+			case LION_SAGG_MIN:
+				ss->col[a->col].want |= LION_SWANT_MIN;
+				break;
+			case LION_SAGG_MAX:
+				ss->col[a->col].want |= LION_SWANT_MAX;
+				break;
+			default:
+				break;
+		}
+	}
+
+	/* counts are wanted where the target list has anything else */
+	ss->needcount = false;
+	for (i = 0; i < st->ntlist; i++)
+	{
+		if (!LION_TL_IS_SAGG(st->tlkind[i]))
+			ss->needcount = true;
+	}
+	ss->cxt = AllocSetContextCreate(estate->es_query_cxt,
+									"LionCount slice aggregates",
+									ALLOCSET_SMALL_SIZES);
+	ss->relcxt = AllocSetContextCreate(estate->es_query_cxt,
+									   "LionCount slice copies",
+									   ALLOCSET_DEFAULT_SIZES);
+	/* a GROUP BY's groups a batch at a time (DESIGN.md §52, "The decode route") */
+	ss->decode = (priv->flags & LION_FLAG_SLICEDECODE) != 0;
+	st->slice = ss;
 }
 
 /*
@@ -1275,6 +1354,7 @@ lion_begin_clauses(LionCountScanState *st, CustomScanState *node,
 
 		cl->kind = priv->clause[i].kind;
 		cl->walk = priv->clause[i].walk;
+		cl->sliced = priv->clause[i].sliced;
 		cl->idxoid = priv->clause[i].idxoid;
 		cl->attno = priv->clause[i].attno;
 		cl->opno = priv->clause[i].opno;
@@ -2073,6 +2153,7 @@ lion_begin_custom_scan(CustomScanState *node, EState *estate, int eflags)
 	lion_begin_join(st, priv, estate);
 	lion_begin_target_list(st, cscan, priv);
 	lion_begin_wagg(st, node, priv, own, estate);
+	lion_begin_slices(st, priv, estate);
 	lion_begin_residual(st, node, priv, own, estate);
 	lion_begin_clauses(st, node, priv, own);
 	lion_begin_driving_column(st, priv);

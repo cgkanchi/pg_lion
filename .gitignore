@@ -17,6 +17,10 @@ test/unit/vec_test
 test/unit/vec_test_nosimd
 test/unit/readahead_test
 test/unit/arena_test
+test/unit/planes_test
+test/unit/planes_test_nosimd
+test/unit/planes_bench
+test/unit/vecplanes_eval
 __pycache__/
 *.pyc
 .deps/

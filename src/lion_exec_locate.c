@@ -739,10 +739,26 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 			continue;
 		if (rs->index == NULL)
 		{
+			LionState  *state = lion_index_column_state(cl->idx, cl->idxcol);
+
 			rs->index = cl->idx;
 			rs->col = cl->idxcol;
 			rs->lead = i;
 			lion_range_init(&rs->range, cl->idx, cl->idxcol);
+
+			/*
+			 * From the slices where the plan says so (DESIGN.md §53) - and
+			 * the column is still sliced as the plan saw it, which a REINDEX
+			 * since may have changed: else collected from its entries, the
+			 * same rows.  Not on a hot standby, where the planner offers it
+			 * nowhere.
+			 */
+			rs->sliced = cl->sliced && state->sliced &&
+				state->slicebits == lion_slice_type_nbits(state->typid) &&
+				!RecoveryInProgress();
+			if (rs->sliced)
+				lion_slice_range_init(&rs->srange, state->typid,
+									  state->slicebits);
 		}
 		else if (RelationGetRelid(cl->idx) != RelationGetRelid(rs->index) ||
 				 cl->idxcol != rs->col)
@@ -754,6 +770,12 @@ lion_rangesrc_range(LionCountScanState *st, int first, int n, bool toplevel,
 		lion_range_add(&rs->range, cl->idx, strategy, get_opcode(cl->opno),
 					   cl->valtype, cl->val, cl->valisnull,
 					   cl->idx->rd_indcollation[cl->idxcol - 1]);
+		if (rs->sliced && lion_slice_range_type_ok(rs->srange.typid,
+												   cl->valtype))
+			lion_slice_range_add(&rs->srange, strategy, cl->valtype, cl->val,
+								 cl->valisnull);
+		else
+			rs->sliced = false;
 	}
 	if (rs->index == NULL)
 		elog(ERROR, "LionCount: a range source without bounds");
@@ -857,6 +879,85 @@ lion_range_collect_fn(void *arg, Size budget, bool spill, LionPostingSet *ps,
 							  &rc->nsums);
 }
 
+/* ... and one from slices (DESIGN.md §53) */
+static bool
+lion_slice_range_collect_fn(void *arg, Size budget, bool spill,
+							LionPostingSet *ps, Size *held, bool *spilled)
+{
+	LionCountScanState *st = (LionCountScanState *) ((void **) arg)[0];
+	LionRangeSource *rs = (LionRangeSource *) ((void **) arg)[1];
+
+	return lion_slice_range_collect(rs->index, rs->col, &rs->srange, budget,
+									spill, ps, held, spilled,
+									&st->sliceranges);
+}
+
+/*
+ * A range on a sliced column, from its slices (DESIGN.md §53, "Ranges from
+ * slices"): the rows of the column's existence slice E whose values are in
+ * it, folded from the slices into one private, pinless copy - O'Neil's
+ * descent at each container key of E (lion_slice_range_collect()) -
+ * within what is left of the memory the relation's collected sources share,
+ * and past it into a file, as a range collected from its entries is
+ * (lion_collect_within()).  Its tree is that copy ANDed with E located with
+ * its pin: E holds every row the copy may count, and carries the §9
+ * interlock, so the source needs nothing beside it to count from the map.
+ * Bounds that every value meets are E alone, with nothing to fold; bounds
+ * that cross, a NULL bound or one past the type's range in the direction
+ * that excludes everything select nothing, and the tree is NULL.
+ */
+static LionKeyNode *
+lion_locate_range_sliced(LionCountScanState *st, LionRangeSource *rs,
+						 LionPostingSet **sets, int *nsets)
+{
+	LionSliceRange *r = &rs->srange;
+	LionPostingSet ps;
+	LionPostingSet e;
+	LionKeyNode **args;
+	void	   *arg[2];
+	bool		spilled;
+	int			n = 0;
+
+	lion_slice_range_settle(r);
+	if (r->empty)
+		return NULL;
+
+	*sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * 2);
+	if (!r->all)
+	{
+		arg[0] = st;
+		arg[1] = rs;
+		lion_collect_within(st, lion_slice_range_collect_fn, arg,
+							&st->clause[rs->lead], &ps, &spilled);
+		if (!ps.found)
+		{
+			pfree(*sets);
+			*sets = NULL;
+			return NULL;
+		}
+		(*sets)[n++] = ps;
+	}
+	if (!lion_posting_set_lookup_slice_col(rs->index, rs->col,
+										   LION_SLICE_EXISTS, &e))
+	{
+		/* no row has a value: nothing is in the range */
+		lion_posting_set_release(&e);
+		if (n > 0)
+			lion_posting_set_release(&(*sets)[0]);
+		pfree(*sets);
+		*sets = NULL;
+		return NULL;
+	}
+	(*sets)[n++] = e;
+	*nsets = n;
+	if (n == 1)
+		return lion_key_node(0);
+	args = (LionKeyNode **) palloc(sizeof(LionKeyNode *) * 2);
+	args[0] = lion_key_node(0);
+	args[1] = lion_key_node(1);
+	return lion_bool_node(LION_KN_AND, args, 2);
+}
+
 /*
  * Locate a range taken as a source (DESIGN.md §32, "A range as a source"):
  * the rows whose key lies in it, which is the union of the disjoint sets a
@@ -916,6 +1017,8 @@ lion_locate_range(LionCountScanState *st, LionRangeSource *rs, bool walkable,
 		return NULL;
 	if (rs->lead < 0 || rs->lead >= st->nclause)
 		elog(ERROR, "LionCount: a range source of no clause");
+	if (rs->sliced)
+		return lion_locate_range_sliced(st, rs, sets, nsets);
 	if (walkable)
 	{
 		st->clause[rs->lead].counted |= LION_SRC_WALKED;
@@ -1941,6 +2044,16 @@ lion_locate_where(LionCountScanState *st)
 			src->tree = lion_locate_range(st, rs, walkable,
 										  &src->sets, &src->nsets, &walked);
 			Assert(!walked || walkable);
+
+			/*
+			 * A range from slices carries the §9 interlock with E, which it
+			 * is ANDed with (DESIGN.md §53): E stays on the pinned path,
+			 * never served from a private copy made on its second use, or a
+			 * count with nothing else pinned - the complement's count of the
+			 * WHERE beside a summed range (§28) - would recheck every row.
+			 */
+			if (rs->sliced)
+				src->nomaterialize = true;
 			if (walked)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
@@ -2206,6 +2319,9 @@ lion_release_where(LionCountScanState *st)
 	 * closed here, and its memory goes with wherecxt below.
 	 */
 	lion_posting_set_release(&st->wherecoll);
+
+	/* ... and a GROUP BY's copies of it with sliced columns' E (§52) */
+	lion_slice_release(st);
 	st->wtried = false;
 	st->wcollected = false;
 	st->wknown = false;
@@ -2482,6 +2598,17 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 					LionWAgg   *a =
 						&lion_st_wagg(st)->agg[LION_TL_WAGG_NO(kind)];
 
+					slot->tts_values[i] = a->result;
+					slot->tts_isnull[i] = a->resnull;
+					break;
+				}
+				if (LION_TL_IS_SAGG(kind))
+				{
+					/* an aggregate of a sliced column (DESIGN.md §52) */
+					LionSAgg   *a = &st->slice->agg[LION_TL_SAGG_NO(kind)];
+
+					Assert(st->slice != NULL &&
+						   LION_TL_SAGG_NO(kind) < st->slice->nagg);
 					slot->tts_values[i] = a->result;
 					slot->tts_isnull[i] = a->resnull;
 					break;

@@ -831,7 +831,7 @@ SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
 
 VACUUM lion_di;
 ERROR:  index "lion_di_old_i" is not a valid lion index
-DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14.
+DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14 or 15.
 HINT:  REINDEX the index: its on-disk format predates this build of pg_lion.
 CONTEXT:  while cleaning up index "lion_di_old_i" of relation "public.lion_di"
 -- To the planner such an index is not there (DESIGN.md §21, "An index of
@@ -883,7 +883,7 @@ SELECT count(*) FROM lion_di a JOIN lion_di b ON a.k = b.k WHERE a.k = 7 AND b.k
 
 INSERT INTO lion_di VALUES (7);
 ERROR:  index "lion_di_old_i" is not a valid lion index
-DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14.
+DETAIL:  Meta page magic 52424931 version 13, expected 52424931 version 14 or 15.
 HINT:  REINDEX the index: its on-disk format predates this build of pg_lion.
 REINDEX INDEX lion_di_old_i;
 SELECT lion_di_lion('SELECT count(*) FROM lion_di WHERE k = 7') AS planned_with_lion;
