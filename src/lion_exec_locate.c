@@ -2044,6 +2044,16 @@ lion_locate_where(LionCountScanState *st)
 			src->tree = lion_locate_range(st, rs, walkable,
 										  &src->sets, &src->nsets, &walked);
 			Assert(!walked || walkable);
+
+			/*
+			 * A range from slices carries the §9 interlock with E, which it
+			 * is ANDed with (DESIGN.md §53): E stays on the pinned path,
+			 * never served from a private copy made on its second use, or a
+			 * count with nothing else pinned - the complement's count of the
+			 * WHERE beside a summed range (§28) - would recheck every row.
+			 */
+			if (rs->sliced)
+				src->nomaterialize = true;
 			if (walked)
 				src->rangewalk = rs;
 			else if (src->tree == NULL)
