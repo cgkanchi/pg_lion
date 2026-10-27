@@ -492,4 +492,52 @@ lion_toast_snapshot(SnapshotData *data)
 						 (cost), (tuples))
 #endif
 
+/*
+ * A hint that the cache line holding addr is about to be read, so that its
+ * miss, if it misses, runs while the code goes on to other work (DESIGN.md
+ * §44.4, "The refine's reads").  It reads nothing, waits for nothing and
+ * never faults, so it may name a page before its lock is taken, or a line
+ * the caller ends up not reading.  pg_prefetch_mem() where the server's
+ * headers define it - no release's do, through 18 - else GCC's and clang's
+ * builtin, for a read, kept in every level of the cache; elsewhere nothing.
+ */
+#if defined(pg_prefetch_mem)
+#define lion_prefetch(addr)		pg_prefetch_mem(addr)
+#elif defined(__GNUC__) || defined(__clang__)
+#define lion_prefetch(addr)		__builtin_prefetch((addr))
+#else
+#define lion_prefetch(addr)		((void) (addr))
+#endif
+
+/* the line lion_prefetch_range() steps by: every x86-64's, most aarch64s' */
+#define LION_PREFETCH_LINE		64
+
+/*
+ * ... and every line of the bytes bytes at ptr: the line ptr is on, each
+ * line after it, and the one the last byte is on, every address it names
+ * inside the range.  A core of longer lines is asked for some line twice,
+ * which costs no more than the instruction.  A macro, not an inline
+ * function: GCC (13, -O2) judges a function that only prefetches to have no
+ * effect ("looping const") and deletes each call to it that its early
+ * inliner left - and that inliner leaves one with a loop - prefetches and
+ * all.
+ */
+#define lion_prefetch_range(ptr, bytes) \
+	do { \
+		const char *lion_pf_p = (const char *) (ptr); \
+		Size		lion_pf_len = (bytes); \
+		\
+		if (lion_pf_len > 0) \
+		{ \
+			Size		lion_pf_n = ((uintptr_t) lion_pf_p % LION_PREFETCH_LINE + \
+									 lion_pf_len + LION_PREFETCH_LINE - 1) / \
+				LION_PREFETCH_LINE; \
+			Size		lion_pf_i; \
+			\
+			for (lion_pf_i = 0; lion_pf_i + 1 < lion_pf_n; lion_pf_i++) \
+				lion_prefetch(lion_pf_p + lion_pf_i * LION_PREFETCH_LINE); \
+			lion_prefetch(lion_pf_p + lion_pf_len - 1); \
+		} \
+	} while (0)
+
 #endif							/* LION_COMPAT_H */

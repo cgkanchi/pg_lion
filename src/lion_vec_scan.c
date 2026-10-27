@@ -707,7 +707,13 @@ lv_prefetch_bound(const LvScanOpaque *so)
  * rows before them; the kernel is asked in lionvec_least()'s.  Returns how
  * many it chose: the caller looks again after half as many such entries
  * have come out, so that what it asked for stays about dist ahead
- * (lv_prefetch_due()).
+ * (lv_prefetch_due()).  A resting stream takes no look
+ * (lion_readahead_dormant()); and while the asks of the kernel rest
+ * (LionAsk) - every relation's the look would ask of, its asks would pass
+ * unasked - the look is let pass too, and returns 0, so that the next entry
+ * out at the level brings the next: each such entry is counted against the
+ * rest as the ask the look would have made for it, and the rest ends after
+ * as many entries as it would have asks (DESIGN.md §44.4, "Prefetch").
  */
 static int
 lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
@@ -726,6 +732,25 @@ lv_prefetch_queue(IndexScanDesc scan, LvScanOpaque *so, LvHeap *h,
 	/* a resting stream takes nothing: no look (lion_readahead_dormant()) */
 	if (!fetch && lion_readahead_dormant(ra))
 		return 0;
+	/*
+	 * Nor while every relation's asks of the kernel the look would make
+	 * rest: the index's (so->iask, which its three readaheads share), or the
+	 * heap's and, while rows are placed in TOAST, the TOAST relation's, a
+	 * placed row asking of both.  If any would ask, look.
+	 */
+	if (so->rmode == LION_READAHEAD_FADVISE)
+	{
+		LionAsk    *a = fetch ? &so->hask : &so->iask;
+		LionAsk    *t = fetch && so->tref > 0 && so->tpf > 0 ? &so->task : NULL;
+
+		if (a->dormant > 0 && (t == NULL || t->dormant > 0))
+		{
+			a->dormant--;
+			if (t != NULL)
+				t->dormant--;
+			return 0;
+		}
+	}
 	Assert(dist <= LIONVEC_PREFETCH_MAX && so->pfkey != NULL);
 	top = Min(h->n, LV_PF_TOP(dist));
 	for (i = 0; i < top; i++)
@@ -2832,6 +2857,19 @@ lv_refine_part(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 
 	lv_prefetch_due(scan, so, &so->cpfdue, &so->parts, LV_CENT1, false);
 	buf = lion_readahead_read(so->crefs, item->rblk);
+
+	/*
+	 * The page's header and its special space, which lionvec_check_page()
+	 * reads one after the other - the second where the first's pd_special
+	 * says, a fixed place on a lionvec page - asked for at once before the
+	 * lock is taken, so that their misses overlap the lock and each other
+	 * (DESIGN.md §44.4, "The refine's reads").  Only hints: nothing of the
+	 * page is read before the lock, and of a page that is not what it should
+	 * be, the check says so.
+	 */
+	lion_prefetch(BufferGetPage(buf));
+	lion_prefetch((char *) BufferGetPage(buf) + BLCKSZ -
+				  MAXALIGN(sizeof(LionVecPageOpaqueData)));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
@@ -3649,6 +3687,15 @@ lv_refine(IndexScanDesc scan, LvScanOpaque *so, LvItem *item)
 
 	lv_prefetch_due(scan, so, &so->rpfdue, &so->rows, LV_PLANE1, false);
 	buf = lion_readahead_read(so->rrefs, item->rblk);
+
+	/*
+	 * The page's header and special space, asked for together while the
+	 * lock is taken, as a centroid's are (lv_refine_part(); DESIGN.md §44.4,
+	 * "The refine's reads").
+	 */
+	lion_prefetch(BufferGetPage(buf));
+	lion_prefetch((char *) BufferGetPage(buf) + BLCKSZ -
+				  MAXALIGN(sizeof(LionVecPageOpaqueData)));
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	lionvec_check_page(index, page, item->rblk, LIONVEC_PAGE_REFINE);
