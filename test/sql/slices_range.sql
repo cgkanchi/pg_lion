@@ -485,10 +485,11 @@ CREATE INDEX ON slr_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slr_part;
 -- whether the count of a partitioned table is pushed down at all is the cost
 -- model's call and differs between majors; what is tested is that no range
--- comes from slices there
-SELECT CASE WHEN slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7')
-				 LIKE 'range from slices%' THEN 'from slices' ELSE 'not from slices' END
-	   AS partitioned;
+-- comes from slices there, so the two plans without one print alike and
+-- anything else - slices, or a mismatch of the rows - prints as it is
+SELECT CASE WHEN r LIKE 'range not from slices%' OR r LIKE 'no pushdown%'
+			THEN 'not from slices' ELSE r END AS partitioned
+  FROM (SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7') AS r) s;
 CREATE TABLE slr_dim (g int PRIMARY KEY, name text);
 INSERT INTO slr_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slr_dim;
