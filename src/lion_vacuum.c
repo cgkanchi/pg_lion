@@ -333,7 +333,7 @@ lion_vac_counts_rows(LionVacState *vs, const LionEntryTuple *entry)
 {
 	return vs->rowattno != InvalidAttrNumber &&
 		entry->attno == vs->rowattno &&
-		(entry->flags & LION_ENTRY_SUMKINDS) == 0;
+		(entry->flags & LION_ENTRY_DERIVED) == 0;
 }
 
 /*
@@ -1174,7 +1174,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 				lion_sumsq_add(&sumsq[entry->attno - 1],
 							   lion_entry_ntids(entry));
 			}
-			if (entry->attno == rowcol && !LionEntryIsSummary(entry))
+			if (entry->attno == rowcol && !LionEntryIsDerived(entry))
 				rows += lion_entry_ntids(entry);
 		}
 
@@ -1594,10 +1594,15 @@ summary_gone:
 
 	{
 		uint16		pflags = LION_KIND_IS_RESERVED(ent->kind) ?
-			lion_reserved_flag(ent->kind) : 0;
+			lion_reserved_flag(ent->kind) :
+			(ent->kind == LION_KIND_SLICE) ? LION_ENTRY_SLICE : 0;
 
-		/* the key where an entry of its column has it (lion_entryfmt.h) */
-		if (ent->attno >= 1 && ent->attno <= vs->ix->ncolumns)
+		/*
+		 * the key where an entry of its column has it (lion_entryfmt.h); a
+		 * slice's one byte is at the header's end (DESIGN.md §51)
+		 */
+		if (ent->attno >= 1 && ent->attno <= vs->ix->ncolumns &&
+			ent->kind != LION_KIND_SLICE)
 			pflags |= lion_key_layout_flags(lion_column(vs->ix,
 														(AttrNumber) ent->attno));
 		probesz = lion_entry_payoff_for(pflags, ent->keylen);

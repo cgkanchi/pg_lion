@@ -29,34 +29,14 @@
 #endif
 
 /*
- * x86-64 GCC and clang build POPCNT and AVX2 kernels beside the portable
- * ones, as lion_container.c does (§3); from GCC 8 and clang 8, which know
- * VPOPCNTDQ, plane 1's with it; and from GCC 11 and clang 18, whose
- * __builtin_cpu_supports() knows F16C, the halves' with it ("Kernels"
- * below).
+ * The x86-64 kernels below are built where lion_planes.h's LION_HAVE_X86_SIMD
+ * says the compiler can (GCC 5 or clang 6, and not LION_NO_SIMD), and the
+ * halves' F16C one where LION_HAVE_X86_F16C says its __builtin_cpu_supports()
+ * knows F16C (GCC 11, clang 18) ("Kernels" below).  None is AVX-512's:
+ * plane 1's, the only one there was, is lion_planes.c's.
  */
-#if !defined(LION_NO_SIMD) && defined(__x86_64__) && \
-	((defined(__clang__) && __clang_major__ >= 6) || \
-	 (!defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 5))
-#define LIONVEC_HAVE_X86 1
-#define LIONVEC_TARGET(isa)	__attribute__((target(isa)))
+#ifdef LION_HAVE_X86_SIMD
 #include <immintrin.h>
-#if (defined(__clang__) && __clang_major__ >= 8) || \
-	(!defined(__clang__) && __GNUC__ >= 8)
-#define LIONVEC_HAVE_AVX512 1
-#endif
-#if (defined(__clang__) && __clang_major__ >= 18) || \
-	(!defined(__clang__) && __GNUC__ >= 11)
-#define LIONVEC_HAVE_F16C 1
-#endif
-#endif
-
-/* the portable kernel's popcount, as lion_container.c chooses it */
-#if (defined(__GNUC__) || defined(__clang__)) && \
-	(defined(__POPCNT__) || !(defined(__x86_64__) || defined(__i386__)))
-#define lionvec_popcount64(w)	((uint32) __builtin_popcountll(w))
-#else
-#define lionvec_popcount64(w)	((uint32) pg_popcount64(w))
 #endif
 
 float		lionvec_recon8[256];
@@ -219,9 +199,8 @@ lionvec_rotate_portable(const LionVecRotation *rot, float *x)
 	}
 }
 
-/* the rotation's kernel ("Kernels" below) */
-static void (*lionvec_rotate_kernel) (const LionVecRotation *rot, float *x) =
-	lionvec_rotate_portable;
+/* the rotation's kernel, by the extension's choice ("Kernels" below) */
+static void lionvec_rotate_kernel(const LionVecRotation *rot, float *x);
 
 /* Rotate x[0 .. dimsp) in place. */
 void
@@ -345,10 +324,18 @@ lionvec_encode(const float *mean, int dimsp, float *x, LionVecEncoded *e)
 
 /*
  * Prepare q from the rotated query x[0 .. dimsp): q->qc must hold dimsp
- * floats and q->planes dimsp / 64 * LIONVEC_QBITS words, and q->dimsp be
- * set.  The quantization is uniform over qc's own range, rounded to the
- * nearest step; its variance in an estimate is what its errors actually are,
- * |e|^2 / dimsp, taken over a row's signs as if they were coin flips.
+ * floats, q->planes dimsp / 64 * LIONVEC_QBITS words and q->qw dimsp int16s,
+ * or be NULL (lion_vec_math.h), and q->dimsp be set.  The quantization is
+ * uniform over qc's own range, rounded to the nearest step; its variance in
+ * an estimate is what its errors actually are, |e|^2 / dimsp, taken over a
+ * row's signs as if they were coin flips.
+ *
+ * The rounding for the 8-bit codes (lionvec_estimate8()) is uniform over
+ * the same range, centred on its middle, qmid, in 65,534 steps of qwdelta,
+ * so that every qw_i is within +-32767: the nearest step, ties to even,
+ * clamped to that against the division's own rounding.  Its variance is
+ * its errors', as plane 1's quantization's is, and a 65,534th of the range
+ * is so fine that it is a hundred-thousandth or so of the codes' own.
  *
  * The sums are kept in locals and each word of the planes is assembled in
  * registers, its bits set without a branch: the build runs this for every
@@ -372,6 +359,10 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 	double		qsum = 0.0;
 	double		qlo;
 	double		qdelta;
+	double		qmid = 0.0;
+	double		qwdelta = 0.0;
+	double		ew2 = 0.0;
+	int64		qwsum = 0;
 	int			i;
 	int			w;
 
@@ -419,12 +410,43 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
 		q->planes[w * LIONVEC_QBITS + 3] = p3;
 	}
 
+	if (q->qw != NULL)
+	{
+		const float *qc = q->qc;
+		int16	   *qw = q->qw;
+
+		qmid = (mx + mn) / 2;
+		qwdelta = mx > mn ? (mx - mn) / 65534 : 1.0;
+		for (i = 0; i < dimsp; i++)
+		{
+			double		c = qc[i];
+			double		t = (c - qmid) / qwdelta;
+			double		r;
+
+			/*
+			 * within +-32767 whatever the division rounds to; a NaN, which
+			 * no vector pgvector accepts has, to -32767
+			 */
+			t = Min(Max(t, -32767.0), 32767.0);
+			r = rint(t);
+			qw[i] = (int16) r;
+			qwsum += qw[i];
+			ew2 += (c - (qmid + qwdelta * r)) * (c - (qmid + qwdelta * r));
+		}
+	}
+
 	q->qnorm2 = qnorm2;
 	q->qlo = qlo;
 	q->qdelta = qdelta;
 	q->qsum = qsum;
+	q->qmid = qmid;
+	q->qwdelta = qwdelta;
+	q->qwsum = (double) qwsum;
+	q->qw0 = (-LIONVEC_CLIP8 + 0.5 / LIONVEC_STEPS8) *
+		((double) dimsp * qmid + qwdelta * (double) qwsum);
 	q->var1 = q->qnorm2 / (dimsp - 1);
 	q->varq = e2 / dimsp;
+	q->varq8 = ew2 / dimsp;
 	q->eps = eps;
 	if (metric == LIONVEC_L2)
 		q->offset = q->qnorm2;
@@ -441,44 +463,61 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  * (DESIGN.md §44.3, "Kernels"): plane 1's popcounts against the query's
  * planes, for every centroid of every query and every row a probe reads,
  * and, in k-means, every centroid for every sample row in every iteration;
- * the 8-bit codes' sum, for every centroid and row a scan refines; the
+ * the 8-bit codes' integer sums against the query rounded to 16 bits
+ * (lionvec_dot8()), for every centroid and row a scan refines; the
  * exact distances of k-means' candidates; and the rotation and, of a
  * halfvec, the conversion of its halves to floats, each once a query and
  * twice a row built.  Each has a portable kernel and, on x86-64, ones
  * compiled with __attribute__((target)) for what the CPU has, so that the
- * extension builds with the default -march and runs on any x86-64:
+ * extension builds with the default -march and runs on any x86-64.  Which
+ * runs is the extension's one choice of implementation, lion_simd_current()
+ * (lion_planes.h, DESIGN.md §50), resolved at the first call to the best
+ * the CPU runs and read at every call, so that a FRONTEND build's
+ * lion_simd_force() - lionvec_kernel_force() - moves every kernel at once:
  *
  *	POPCNT	plane 1 a word at a time with the POPCNT instruction; the rest
  *			portable
- *	AVX2	plane 1 32 bytes at a time, the row's word against its four
- *			planes, each byte's popcount looked up a nibble at a time with
- *			VPSHUFB (Mula, as lion_container.c counts); the sums and the
- *			rotation four doubles or eight floats at a time; and, where the
- *			CPU has F16C as well, which AVX2 does not imply, the halves
- *			eight at a time with VCVTPH2PS
+ *	AVX2	plane 1 a word's four planes in one vector against the row's
+ *			word broadcast, each byte's popcount looked up a nibble at a
+ *			time with VPSHUFB (Mula); the 8-bit codes' integer sums
+ *			sixteen codes at a time, widened to 16 bits and multiplied in
+ *			pairs with VPMADDWD, and added up with VPSADBW; the other
+ *			sums and the rotation four doubles or eight floats at a time;
+ *			and, where the CPU has F16C as well, which AVX2 does not
+ *			imply (lion_simd_f16c()), the halves eight at a time with
+ *			VCVTPH2PS
  *	AVX-512	AVX2's, but plane 1 counted with VPOPCNTDQ, a word's four
  *			planes in one instruction
  *
- * chosen at load (lionvec_kernels_init()) as the CPU allows, best first;
- * __builtin_cpu_supports() also checks that the OS saves the registers.
- * AVX-512 is taken for VPOPCNTDQ alone (Ice Lake, Zen 4 and on), on
- * 256-bit vectors: AVX-512BW's VPSHUFB counted plane 1 only a sixth faster
- * than AVX2's, and the sums eight doubles at a time only a tenth faster,
- * where a scan waits on the codes' cache lines more than on either, so no
- * 512-bit instruction runs, for which some cores lower their clock.
+ * Plane 1's kernels are lion_planes.c's, the weighted sum of four
+ * interleaved planes (lion_planes_dot_interleaved(), whose k = 4 has a pass
+ * of its own in each implementation); the others are here.  AVX-512 is
+ * taken for VPOPCNTDQ alone (Ice Lake, Zen 4 and on), on 256-bit vectors:
+ * AVX-512BW's VPSHUFB counted plane 1 only a sixth faster than AVX2's, and
+ * the sums eight doubles at a time only a tenth faster, where a scan waits
+ * on the codes' cache lines more than on either, so no 512-bit instruction
+ * runs, for which some cores lower their clock; its set's other kernels are
+ * AVX2's.
  *
  * Every kernel returns what the portable one does, to the bit, so that a
  * scan, a build and an insert decide alike whichever runs.  Plane 1's are
- * integer counts.  The sums are in double, of terms each kernel computes
- * with the same operations - the 8-bit codes' products are exact, a code's
- * reconstruction being a float and a float's product with a float a double
- * - added in LIONVEC_LANES partial sums, the i-th term into partial i %
- * LIONVEC_LANES, and those in a fixed tree (lionvec_lanes_sum()): the
- * portable kernels add in that order too.  The file is compiled with
- * -ffp-contract=off (the Makefile), for GCC and clang would otherwise fuse
- * a multiply and an add into one rounding wherever the target has fused
- * multiply-adds - the portable kernels built for aarch64 or x86-64-v3 -
- * and l2sq's terms, unlike the 8-bit codes', are not exact.  The
+ * integer counts, and lionvec_dot8()'s integer sums, exact in every kernel
+ * and so the same by construction, whatever order each adds in; the double
+ * arithmetic lionvec_estimate8() makes of them is the same code of the same
+ * inputs whichever kernel ran.  The other sums are in double, of terms each
+ * kernel computes with the same operations - lionvec_sum8()'s products are
+ * exact, a code's reconstruction being a float and a float's product with
+ * a float a double - added in LIONVEC_LANES partial sums, the i-th term
+ * into partial i % LIONVEC_LANES, and those in a fixed tree
+ * (lionvec_lanes_sum()): the portable kernels add in that order too.
+ * lionvec_sum8() is the codes against qc itself, unrounded, which no scan
+ * or build runs: the reference the unit test checks lionvec_dot8()'s
+ * estimates by.  The file is compiled with -ffp-contract=off (the
+ * Makefile), for GCC and clang would otherwise fuse a multiply and an add
+ * into one rounding wherever the target has fused multiply-adds - the
+ * portable kernels built for aarch64 or x86-64-v3 - and l2sq's terms,
+ * unlike lionvec_sum8()'s, are not exact, nor is the arithmetic
+ * lionvec_estimate8() does after its integer sums.  The
  * rotation's butterflies are the portable ones' additions and subtractions,
  * of the same operands, in the same order for each coordinate.  The halves'
  * conversion is exact, every half being a float, and VCVTPH2PS makes a NaN
@@ -488,46 +527,6 @@ lionvec_query_init(LionVecQuery *q, int metric, const float *mean,
  */
 
 /* ---------- portable ---------- */
-
-static pg_always_inline uint32
-lionvec_dot_words(const uint64 *bits, const uint64 *planes, int nwords,
-				  bool hw)
-{
-	uint32		s0 = 0;
-	uint32		s1 = 0;
-	uint32		s2 = 0;
-	uint32		s3 = 0;
-	int			w;
-
-	StaticAssertStmt(LIONVEC_QBITS == 4, "the kernels unroll four planes");
-	for (w = 0; w < nwords; w++)
-	{
-		uint64		b = bits[w];
-		const uint64 *p = planes + w * LIONVEC_QBITS;
-
-#ifdef LIONVEC_HAVE_X86
-		if (hw)
-		{
-			s0 += (uint32) __builtin_popcountll(b & p[0]);
-			s1 += (uint32) __builtin_popcountll(b & p[1]);
-			s2 += (uint32) __builtin_popcountll(b & p[2]);
-			s3 += (uint32) __builtin_popcountll(b & p[3]);
-			continue;
-		}
-#endif
-		s0 += lionvec_popcount64(b & p[0]);
-		s1 += lionvec_popcount64(b & p[1]);
-		s2 += lionvec_popcount64(b & p[2]);
-		s3 += lionvec_popcount64(b & p[3]);
-	}
-	return s0 + 2 * s1 + 4 * s2 + 8 * s3;
-}
-
-static uint32
-lionvec_dot_portable(const uint64 *bits, const uint64 *planes, int nwords)
-{
-	return lionvec_dot_words(bits, planes, nwords, false);
-}
 
 /*
  * The partial sums p[0 .. LIONVEC_LANES) added up: (p_l + p_l+8) + (p_l+4 +
@@ -578,6 +577,53 @@ lionvec_sum8_portable(const uint8 *codes, const float *qc, int dimsp)
 			p[l] += LIONVEC_RECON8(c[l]) * (double) q[l];
 	}
 	return lionvec_lanes_sum(p);
+}
+
+/*
+ * The 8-bit codes' integer sums run in blocks of LIONVEC_DOT8_STEPS runs of
+ * sixteen codes, into 32-bit partial sums that each block's end widens into
+ * 64 bits: a product of a code and a 16-bit integer is at most 255 * 32768
+ * = 8,355,840 in magnitude, so that a block puts at most 64 of them into
+ * each of the portable kernel's sixteen partial sums, and 128, two a run,
+ * into each of the AVX2 kernel's eight: 1,069,547,520, under 2^31.
+ */
+#define LIONVEC_DOT8_STEPS		64
+
+static int64
+lionvec_dot8_portable(const uint8 *codes, const int16 *w, int dimsp,
+					  int64 *sumc)
+{
+	int64		dot = 0;
+	int64		sc = 0;
+	int			i = 0;
+
+	Assert(dimsp % 64 == 0);
+	while (i < dimsp)
+	{
+		int32		p[LIONVEC_LANES] = {0};
+		int32		s[LIONVEC_LANES] = {0};
+		int			end = Min(dimsp, i + LIONVEC_DOT8_STEPS * LIONVEC_LANES);
+		int			l;
+
+		for (; i < end; i += LIONVEC_LANES)
+		{
+			const uint8 *c = codes + i;
+			const int16 *q = w + i;
+
+			for (l = 0; l < LIONVEC_LANES; l++)
+			{
+				p[l] += (int32) c[l] * (int32) q[l];
+				s[l] += c[l];
+			}
+		}
+		for (l = 0; l < LIONVEC_LANES; l++)
+		{
+			dot += p[l];
+			sc += s[l];
+		}
+	}
+	*sumc = sc;
+	return dot;
 }
 
 static double
@@ -644,78 +690,12 @@ lionvec_halves_portable(const uint16 *h, int n, float *x)
 		x[i] = lionvec_half_float(h[i]);
 }
 
-#ifdef LIONVEC_HAVE_X86
-
-/* ---------- POPCNT ---------- */
-
-static LIONVEC_TARGET("popcnt") uint32
-lionvec_dot_popcnt(const uint64 *bits, const uint64 *planes, int nwords)
-{
-	return lionvec_dot_words(bits, planes, nwords, true);
-}
+#ifdef LION_HAVE_X86_SIMD
 
 /* ---------- AVX2 ---------- */
 
-/* The popcount of each byte of v, 0 .. 8: two nibbles looked up (Mula). */
-static pg_always_inline LIONVEC_TARGET("avx2") __m256i
-lionvec_avx2_byte_counts(__m256i v)
-{
-	const __m256i lut = _mm256_setr_epi8(0, 1, 1, 2, 1, 2, 2, 3,
-										 1, 2, 2, 3, 2, 3, 3, 4,
-										 0, 1, 1, 2, 1, 2, 2, 3,
-										 1, 2, 2, 3, 2, 3, 3, 4);
-	const __m256i nibble = _mm256_set1_epi8(0x0f);
-	__m256i		lo = _mm256_and_si256(v, nibble);
-	__m256i		hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), nibble);
-
-	return _mm256_add_epi8(_mm256_shuffle_epi8(lut, lo),
-						   _mm256_shuffle_epi8(lut, hi));
-}
-
-/* the plane sums in the four lanes of v, weighed: s0 + 2 s1 + 4 s2 + 8 s3 */
-static pg_always_inline LIONVEC_TARGET("avx2") uint32
-lionvec_avx2_weigh(__m256i v)
-{
-	uint64		s[4];
-
-	_mm256_storeu_si256((__m256i *) s, v);
-	return (uint32) (s[0] + 2 * s[1] + 4 * s[2] + 8 * s[3]);
-}
-
-/*
- * A word's four planes are one vector, the planes being interleaved by
- * word: the row's word broadcast, ANDed with them and counted a byte at a
- * time, lane j counting plane j.  The byte counts add up over 31 words at
- * most, 248 a byte, before VPSADBW sums each lane's bytes.
- */
-#define LIONVEC_AVX2_RUN		31
-
-static LIONVEC_TARGET("avx2") uint32
-lionvec_dot_avx2(const uint64 *bits, const uint64 *planes, int nwords)
-{
-	__m256i		sum = _mm256_setzero_si256();
-	int			w = 0;
-
-	while (w < nwords)
-	{
-		int			end = Min(nwords, w + LIONVEC_AVX2_RUN);
-		__m256i		counts = _mm256_setzero_si256();
-
-		for (; w < end; w++)
-		{
-			__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
-			__m256i		p = _mm256_loadu_si256((const __m256i *) (planes + w * LIONVEC_QBITS));
-
-			counts = _mm256_add_epi8(counts,
-									 lionvec_avx2_byte_counts(_mm256_and_si256(b, p)));
-		}
-		sum = _mm256_add_epi64(sum, _mm256_sad_epu8(counts, _mm256_setzero_si256()));
-	}
-	return lionvec_avx2_weigh(sum);
-}
-
 /* 16 partial sums in four vectors, added up as lionvec_lanes_sum() does */
-static pg_always_inline LIONVEC_TARGET("avx2") double
+static pg_always_inline LION_TARGET("avx2") double
 lionvec_avx2_fold(__m256d p0, __m256d p4, __m256d p8, __m256d p12)
 {
 	__m256d		u = _mm256_add_pd(_mm256_add_pd(p0, p8), _mm256_add_pd(p4, p12));
@@ -730,7 +710,7 @@ lionvec_avx2_fold(__m256d p0, __m256d p4, __m256d p8, __m256d p12)
  * -4 + (c + 1/2) / 32, computed as lionvec_recon8[] holds them (exactly:
  * the unit test checks it), times qc's.
  */
-static pg_always_inline LIONVEC_TARGET("avx2") __m256d
+static pg_always_inline LION_TARGET("avx2") __m256d
 lionvec_avx2_terms8(const uint8 *codes, const float *qc)
 {
 	const __m256d step = _mm256_set1_pd(1.0 / LIONVEC_STEPS8);
@@ -744,7 +724,7 @@ lionvec_avx2_terms8(const uint8 *codes, const float *qc)
 	return _mm256_mul_pd(r, _mm256_cvtps_pd(_mm_loadu_ps(qc)));
 }
 
-static LIONVEC_TARGET("avx2") double
+static LION_TARGET("avx2") double
 lionvec_sum8_avx2(const uint8 *codes, const float *qc, int dimsp)
 {
 	__m256d		p0 = _mm256_setzero_pd();
@@ -764,8 +744,54 @@ lionvec_sum8_avx2(const uint8 *codes, const float *qc, int dimsp)
 	return lionvec_avx2_fold(p0, p4, p8, p12);
 }
 
+/*
+ * Sixteen codes a step: widened to 16 bits and multiplied by w's sixteen
+ * integers with VPMADDWD, which adds each pair of products into one of
+ * eight 32-bit partial sums, widened into four 64-bit ones at the end of
+ * each block (LIONVEC_DOT8_STEPS); and the same sixteen bytes summed with
+ * VPSADBW against zero, into two 64-bit sums.
+ */
+static LION_TARGET("avx2") int64
+lionvec_dot8_avx2(const uint8 *codes, const int16 *w, int dimsp, int64 *sumc)
+{
+	const __m128i zero = _mm_setzero_si128();
+	__m256i		dot64 = _mm256_setzero_si256();
+	__m128i		sum64 = _mm_setzero_si128();
+	__m128i		d;
+	int			i = 0;
+
+	Assert(dimsp % 64 == 0);
+	while (i < dimsp)
+	{
+		__m256i		dot32 = _mm256_setzero_si256();
+		__m128i		lo;
+		__m128i		hi;
+		int			end = Min(dimsp, i + LIONVEC_DOT8_STEPS * 16);
+
+		for (; i < end; i += 16)
+		{
+			__m128i		c = _mm_loadu_si128((const __m128i *) (codes + i));
+			__m256i		q = _mm256_loadu_si256((const __m256i *) (w + i));
+			__m256i		p = _mm256_madd_epi16(_mm256_cvtepu8_epi16(c), q);
+
+			dot32 = _mm256_add_epi32(dot32, p);
+			sum64 = _mm_add_epi64(sum64, _mm_sad_epu8(c, zero));
+		}
+		lo = _mm256_castsi256_si128(dot32);
+		hi = _mm256_extracti128_si256(dot32, 1);
+		dot64 = _mm256_add_epi64(dot64, _mm256_cvtepi32_epi64(lo));
+		dot64 = _mm256_add_epi64(dot64, _mm256_cvtepi32_epi64(hi));
+	}
+	d = _mm_add_epi64(_mm256_castsi256_si128(dot64),
+					  _mm256_extracti128_si256(dot64, 1));
+	d = _mm_add_epi64(d, _mm_unpackhi_epi64(d, d));
+	sum64 = _mm_add_epi64(sum64, _mm_unpackhi_epi64(sum64, sum64));
+	*sumc = (int64) _mm_cvtsi128_si64(sum64);
+	return (int64) _mm_cvtsi128_si64(d);
+}
+
 /* terms i .. i + 3 of l2sq */
-static pg_always_inline LIONVEC_TARGET("avx2") __m256d
+static pg_always_inline LION_TARGET("avx2") __m256d
 lionvec_avx2_terms_l2(const float *a, const float *b)
 {
 	__m256d		d = _mm256_sub_pd(_mm256_cvtps_pd(_mm_loadu_ps(a)),
@@ -774,7 +800,7 @@ lionvec_avx2_terms_l2(const float *a, const float *b)
 	return _mm256_mul_pd(d, d);
 }
 
-static LIONVEC_TARGET("avx2") double
+static LION_TARGET("avx2") double
 lionvec_l2sq_avx2(const float *a, const float *b, int dimsp)
 {
 	__m256d		p0 = _mm256_setzero_pd();
@@ -801,7 +827,7 @@ lionvec_l2sq_avx2(const float *a, const float *b, int dimsp)
  * it does (the swapped vector less the run); then those of 8 and up
  * between runs, and the scale.  n is a power of two, 64 or more.
  */
-static LIONVEC_TARGET("avx2") void
+static LION_TARGET("avx2") void
 lionvec_fwht_avx2(float *x, int n)
 {
 	const __m256 scale = _mm256_set1_ps((float) (1.0 / sqrt((double) n)));
@@ -840,7 +866,7 @@ lionvec_fwht_avx2(float *x, int n)
 		_mm256_storeu_ps(x + i, _mm256_mul_ps(_mm256_loadu_ps(x + i), scale));
 }
 
-static LIONVEC_TARGET("avx2") void
+static LION_TARGET("avx2") void
 lionvec_rotate_avx2(const LionVecRotation *rot, float *x)
 {
 	int			r;
@@ -861,12 +887,12 @@ lionvec_rotate_avx2(const LionVecRotation *rot, float *x)
 	}
 }
 
-#ifdef LIONVEC_HAVE_F16C
+#ifdef LION_HAVE_X86_F16C
 
 /* ---------- F16C ---------- */
 
 /* The halves eight at a time, the last n % 8 from a vector padded with zeros. */
-static LIONVEC_TARGET("avx2,f16c") void
+static LION_TARGET("avx2,f16c") void
 lionvec_halves_f16c(const uint16 *h, int n, float *x)
 {
 	int			i;
@@ -884,136 +910,134 @@ lionvec_halves_f16c(const uint16 *h, int n, float *x)
 	}
 }
 
-#endif							/* LIONVEC_HAVE_F16C */
+#endif							/* LION_HAVE_X86_F16C */
 
-#ifdef LIONVEC_HAVE_AVX512
-
-/* ---------- AVX-512 ---------- */
-
-/* AVX2's, with VPOPCNTDQ counting each plane's word whole */
-static LIONVEC_TARGET("avx512f,avx512vl,avx512vpopcntdq") uint32
-lionvec_dot_avx512(const uint64 *bits, const uint64 *planes, int nwords)
-{
-	__m256i		sum = _mm256_setzero_si256();
-	int			w;
-
-	for (w = 0; w < nwords; w++)
-	{
-		__m256i		b = _mm256_set1_epi64x((long long) bits[w]);
-		__m256i		p = _mm256_loadu_si256((const __m256i *) (planes + w * LIONVEC_QBITS));
-
-		sum = _mm256_add_epi64(sum, _mm256_popcnt_epi64(_mm256_and_si256(b, p)));
-	}
-	return lionvec_avx2_weigh(sum);
-}
-
-#endif							/* LIONVEC_HAVE_AVX512 */
-#endif							/* LIONVEC_HAVE_X86 */
+#endif							/* LION_HAVE_X86_SIMD */
 
 /* ---------- the choice ---------- */
 
-LionVecDotKernel lionvec_plane_dot = lionvec_dot_portable;
-LionVecSum8Kernel lionvec_sum8 = lionvec_sum8_portable;
-LionVecL2Kernel lionvec_l2sq = lionvec_l2sq_portable;
-LionVecHalfKernel lionvec_halves = lionvec_halves_portable;
+#ifdef LION_HAVE_X86_SIMD
+/*
+ * Whether impl's set has the AVX2 kernels: AVX2's, and AVX-512's, whose one
+ * kernel of its own, plane 1's, is lion_planes.c's.
+ */
+static inline bool
+lionvec_avx2_set(LionSimdImpl impl)
+{
+	return impl == LION_SIMD_AVX2 || impl == LION_SIMD_AVX512;
+}
+#endif
 
 /*
- * Use the set which, if the build has it and the CPU runs it.  The AVX2
- * and AVX-512 sets convert halves with F16C where the CPU has that too, and
- * portably where it does not.
+ * Whether the build knows F16C and the CPU has it (lion_simd_f16c()), asked
+ * once: the AVX2 and AVX-512 sets convert halves with it where it is, and
+ * portably where it is not.  Not forced, being no implementation of its own.
  */
-static bool
-lionvec_kernels_set(int which)
-{
-	LionVecDotKernel dot = lionvec_dot_portable;
-	LionVecSum8Kernel sum8 = lionvec_sum8_portable;
-	LionVecL2Kernel l2sq = lionvec_l2sq_portable;
-	LionVecHalfKernel halves = lionvec_halves_portable;
-	void		(*rotate) (const LionVecRotation *rot, float *x) = lionvec_rotate_portable;
+static int	lionvec_f16c = -1;
 
-	switch (which)
-	{
-		case LIONVEC_KERNELS_PORTABLE:
-			break;
-#ifdef LIONVEC_HAVE_X86
-		case LIONVEC_KERNELS_POPCNT:
-			if (!__builtin_cpu_supports("popcnt"))
-				return false;
-			dot = lionvec_dot_popcnt;
-			break;
-		case LIONVEC_KERNELS_AVX2:
-			if (!__builtin_cpu_supports("avx2"))
-				return false;
-			dot = lionvec_dot_avx2;
-			sum8 = lionvec_sum8_avx2;
-			l2sq = lionvec_l2sq_avx2;
-			rotate = lionvec_rotate_avx2;
-#ifdef LIONVEC_HAVE_F16C
-			if (__builtin_cpu_supports("f16c"))
-				halves = lionvec_halves_f16c;
-#endif
-			break;
-#ifdef LIONVEC_HAVE_AVX512
-		case LIONVEC_KERNELS_AVX512:
-			if (!__builtin_cpu_supports("avx2") ||
-				!__builtin_cpu_supports("avx512f") ||
-				!__builtin_cpu_supports("avx512vl") ||
-				!__builtin_cpu_supports("avx512vpopcntdq"))
-				return false;
-			dot = lionvec_dot_avx512;
-			sum8 = lionvec_sum8_avx2;
-			l2sq = lionvec_l2sq_avx2;
-			rotate = lionvec_rotate_avx2;
-#ifdef LIONVEC_HAVE_F16C
-			if (__builtin_cpu_supports("f16c"))
-				halves = lionvec_halves_f16c;
-#endif
-			break;
-#endif
-#endif
-		default:
-			return false;
-	}
-	lionvec_plane_dot = dot;
-	lionvec_sum8 = sum8;
-	lionvec_l2sq = l2sq;
-	lionvec_halves = halves;
-	lionvec_rotate_kernel = rotate;
-	return true;
+static inline bool
+lionvec_has_f16c(void)
+{
+	if (unlikely(lionvec_f16c < 0))
+		lionvec_f16c = lion_simd_f16c() ? 1 : 0;
+	return lionvec_f16c > 0;
 }
 
-/* The best set: called once at load, before any vector is rotated. */
+int64
+lionvec_dot8(const uint8 *codes, const int16 *w, int dimsp, int64 *sumc)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (lionvec_avx2_set(lion_simd_current()))
+		return lionvec_dot8_avx2(codes, w, dimsp, sumc);
+#endif
+	return lionvec_dot8_portable(codes, w, dimsp, sumc);
+}
+
+double
+lionvec_sum8(const uint8 *codes, const float *qc, int dimsp)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (lionvec_avx2_set(lion_simd_current()))
+		return lionvec_sum8_avx2(codes, qc, dimsp);
+#endif
+	return lionvec_sum8_portable(codes, qc, dimsp);
+}
+
+double
+lionvec_l2sq(const float *a, const float *b, int dimsp)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (lionvec_avx2_set(lion_simd_current()))
+		return lionvec_l2sq_avx2(a, b, dimsp);
+#endif
+	return lionvec_l2sq_portable(a, b, dimsp);
+}
+
+void
+lionvec_halves(const uint16 *h, int n, float *x)
+{
+#ifdef LION_HAVE_X86_F16C
+	if (lionvec_avx2_set(lion_simd_current()) && lionvec_has_f16c())
+	{
+		lionvec_halves_f16c(h, n, x);
+		return;
+	}
+#endif
+	lionvec_halves_portable(h, n, x);
+}
+
+static void
+lionvec_rotate_kernel(const LionVecRotation *rot, float *x)
+{
+#ifdef LION_HAVE_X86_SIMD
+	if (lionvec_avx2_set(lion_simd_current()))
+	{
+		lionvec_rotate_avx2(rot, x);
+		return;
+	}
+#endif
+	lionvec_rotate_portable(rot, x);
+}
+
+/*
+ * Called once at load, before any vector is rotated: the choice resolved
+ * and F16C looked for, so that no scan pays for either.  In a FRONTEND
+ * build, the best set again after lionvec_kernel_force().
+ */
 void
 lionvec_kernels_init(void)
 {
-	int			which;
-
-#ifdef LIONVEC_HAVE_X86
-	/* a no-op after libgcc's constructor, which has run by any first call */
-	__builtin_cpu_init();
+#ifdef FRONTEND
+	(void) lion_simd_force(LION_SIMD_AUTO);
 #endif
-	for (which = LIONVEC_KERNELS_MAX; which > LIONVEC_KERNELS_PORTABLE; which--)
-	{
-		if (lionvec_kernels_set(which))
-			return;
-	}
-	lionvec_kernels_set(LIONVEC_KERNELS_PORTABLE);
+	(void) lion_simd_current();
+	(void) lionvec_has_f16c();
 }
 
 #ifdef FRONTEND
 bool
 lionvec_kernel_force(int which)
 {
-#ifdef LIONVEC_HAVE_X86
-	__builtin_cpu_init();
-#endif
-	return lionvec_kernels_set(which);
+	StaticAssertStmt(LIONVEC_KERNELS_PORTABLE == 0 &&
+					 LION_SIMD_PORTABLE + LIONVEC_KERNELS_POPCNT == LION_SIMD_POPCNT &&
+					 LION_SIMD_PORTABLE + LIONVEC_KERNELS_AVX2 == LION_SIMD_AVX2 &&
+					 LION_SIMD_PORTABLE + LIONVEC_KERNELS_AVX512 == LION_SIMD_AVX512 &&
+					 LIONVEC_KERNELS_MAX == LIONVEC_KERNELS_AVX512 &&
+					 LION_SIMD_AVX512 == LION_SIMD_NIMPLS - 1,
+					 "lionvec's sets are lion_planes.h's implementations, numbered from 0");
+	if (which < LIONVEC_KERNELS_PORTABLE || which > LIONVEC_KERNELS_MAX)
+		return false;
+	return lion_simd_force((LionSimdImpl) (LION_SIMD_PORTABLE + which));
 }
 
 bool
 lionvec_kernel_f16c(void)
 {
-	return lionvec_halves != lionvec_halves_portable;
+#ifdef LION_HAVE_X86_F16C
+	return lionvec_avx2_set(lion_simd_current()) && lionvec_has_f16c();
+#else
+	return false;
+#endif
 }
 #endif
 
@@ -1562,6 +1586,7 @@ lionvec_kmeans_assign(const LionVecSample *s, int from, int to, int k,
 	q.dimsp = dimsp;
 	q.qc = w->qc;
 	q.planes = w->planes;
+	q.qw = NULL;				/* never refined: not rounded */
 
 	for (i = from; i < to; i++)
 	{
@@ -1885,15 +1910,32 @@ lionvec_estimate1(const LionVecQuery *q, const uint64 *bits, uint16 popcount,
 	*err = q->eps * norm / a * sqrt(q->var1 * miss + q->varq);
 }
 
-/* From the 8-bit codes, against qc itself. */
+/*
+ * From the 8-bit codes, against the query rounded to 16-bit integers, q^_i =
+ * qmid + qwdelta qw_i (lionvec_query_init(); q->qw may not be NULL).  With
+ * r_i = (-4 + 1/64) + c_i / 32, the middle of code c_i's step,
+ *
+ *	<r, q^> = (-4 + 1/64) (dimsp qmid + qwdelta sum(qw_i))
+ *			  + (1/32) (qmid sum(c_i) + qwdelta sum(c_i qw_i))
+ *
+ * of which the first line is the query's alone, q->qw0, and the sums of the
+ * second lionvec_dot8()'s, exact.  The rounding's error adds its variance,
+ * q->varq8, to the codes', as plane 1's quantization's does to plane 1's.
+ */
 void
 lionvec_estimate8(const LionVecQuery *q, const uint8 *codes, float norm,
 				  float alpha8, float rnorm8, double *est, double *err)
 {
-	double		s = lionvec_sum8(codes, q->qc, q->dimsp);
+	int64		sumc;
+	int64		cw;
+	double		s;
 	double		a = Max((double) alpha8, 1e-6);
 	double		miss = Max(1.0 - a * a, 0.0);
 
+	Assert(q->qw != NULL);
+	cw = lionvec_dot8(codes, q->qw, q->dimsp, &sumc);
+	s = q->qw0 + (1.0 / LIONVEC_STEPS8) *
+		(q->qmid * (double) sumc + q->qwdelta * (double) cw);
 	*est = rnorm8 > 0.0f ? norm * s / (rnorm8 * a) : 0.0;
-	*err = LIONVEC_EPS8(q->eps) * norm / a * sqrt(q->var1 * miss);
+	*err = LIONVEC_EPS8(q->eps) * norm / a * sqrt(q->var1 * miss + q->varq8);
 }

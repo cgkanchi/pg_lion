@@ -33,17 +33,23 @@ has the setting, DESIGN.md §9).
     make PG_CONFIG=.local/pg/bin/pg_config && make PG_CONFIG=.local/pg/bin/pg_config install
     eval "$(./dev.sh env)"
     make PG_CONFIG=.local/pg/bin/pg_config installcheck   # regress files + isolation specs
-    make unit PG_CONFIG=.local/pg/bin/pg_config           # containers, segments, positions, entry layout,
-                                                          # lionvec's arithmetic, the read stream ring;
-                                                          # no server
+    make unit PG_CONFIG=.local/pg/bin/pg_config           # bit-planes, containers, segments, positions,
+                                                          # entry layout, lionvec's arithmetic, the read
+                                                          # stream ring; no server
+    make planes-bench PG_CONFIG=.local/pg/bin/pg_config   # the bit-plane kernels timed, at -O2
+    make vecplanes-eval PG_CONFIG=.local/pg/bin/pg_config # lionvec's codes as bit-planes 2-8, evaluated
+                                                          # and not adopted (DESIGN.md §44.14); minutes
 
 No `-march` is needed for speed: on x86-64, GCC and clang builds carry AVX2 and POPCNT versions of
-the container library's passes over whole bitsets, and AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of
-lionvec's kernels, compiled with target attributes, and pick one at run time by what the CPU has;
-other targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
-(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels").  `make unit` runs the container and
-lionvec tests against each version the CPU has, and once more built without the x86-64 ones
-(`test/unit/container_test_nosimd`, `test/unit/vec_test_nosimd`).
+the container library's passes over whole bitsets, AVX-512 (VPOPCNTDQ), AVX2 and POPCNT ones of the
+bit-plane kernels - lionvec's plane 1 among them - and AVX2 (and F16C) ones of lionvec's others,
+compiled with target attributes, and pick one at run time by what the CPU has - one choice for the
+extension, `lion_simd_current()` in `src/lion_planes.h`, which every one of them follows; other
+targets and compilers get a portable one, and `make LION_NO_SIMD=1` leaves the x86-64 ones out
+(DESIGN.md §3, "Whole-bitset kernels"; §44.3, "Kernels"; §50).  `make unit` runs the bit-plane,
+container and lionvec tests against each version the CPU has, and once more built without the
+x86-64 ones (`test/unit/planes_test_nosimd`, `test/unit/container_test_nosimd`,
+`test/unit/vec_test_nosimd`).
 
 Lion logs through one of two WAL resource managers (DESIGN.md §25), chosen per index at
 CREATE INDEX, so the suite has to pass in both:
@@ -149,8 +155,13 @@ database's files from the OS cache and starts it - before each timed run.
 ## Source layout
 
     src/lion_tid.h          TID <-> (container key, 15-bit lo) encoding; 9 offset bits at 8K pages
+    src/lion_planes.[ch]    bit-plane arithmetic - popcounts of a bit vector AND each of k planes, interleaved
+                            or each its own array, their weighted sum, the 64x64 bit transpose and values to
+                            and from planes - and the extension's one choice of SIMD implementation
+                            (portable, POPCNT, AVX2, AVX-512); below the container library and lionvec,
+                            frontend-safe and unit-tested standalone (test/unit/planes_test.c)
     src/lion_container.[ch] container library (array/bitset/run/narrow), set algebra, AVX2/POPCNT bitset kernels
-                            picked at run time, unit-tested standalone
+                            picked by that choice at run time, unit-tested standalone
     src/lion_sparse.[ch]    sparse (container key, offset) segments, unit-tested standalone
     src/lion.h              on-disk structs, the relation state, and the page layer's and the AM's functions
     src/lion_entryfmt.h     the directory entry tuple's byte layout and accessors, unit-tested standalone
@@ -167,7 +178,8 @@ database's files from the OS cache and starts it - before each timed run.
     src/lion_amcost.c       amcostestimate: the cost of plain and bitmap scans
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
     src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
-    src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
+    src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path; a row's
+                            bit slices a walk of the leaf a column, their in-place adds several to a record)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
     src/lion_funcs.[ch]     lion_index_stats() and the other diagnostics; lion_funcs.h is private to them
     src/lion_verify*.c      lion_index_verify(): pages and posting sets, the directory, rechecks and
@@ -186,6 +198,8 @@ database's files from the OS cache and starts it - before each timed run.
     src/lion_range.c        range restrictions, and iterating every entry of an index
     src/lion_count_sql.c    the SQL count functions (lion_index_count() and the others)
     src/lion_facets.c       lion_index_facets(): the rows under each key of a column, under a filter
+    src/lion_slice.c        a bit-sliced column's counts and descents (LionSliceAgg), lion_index_slice_agg()
+    src/lion_slice_decode.c a sliced column's aggregates for a batch of groups, decoded key by key
     src/lion_customscan.h   the LionCount custom scan's private header, shared by its planner half:
     src/lion_plan_*.c       create_upper_paths_hook -> CustomPath/CustomScan "LionCount"; set_join_pathlist_hook
                             -> "LionSemiJoin"/"LionAntiJoin"; index matching, partitions, the cost model
@@ -210,8 +224,9 @@ database's files from the OS cache and starts it - before each timed run.
                             exact distances
     src/lion_vec_loc.c      its locator: where vectors in TOAST lie, so that the scan reads them from their
                             chunks' pages directly - the lookups, the checked reads, LOC and LOCDIR pages
-    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds, frontend-safe and
-                            unit-tested standalone (test/unit/vec_test.c)
+    src/lion_vec_math.[ch]  its rotation, bit-plane codes, kernels and error bounds - plane 1's kernel
+                            lion_planes.c's, and every kernel run by lion_planes' choice - frontend-safe
+                            and unit-tested standalone (test/unit/vec_test.c)
     src/lion_readahead.[ch] reading a relation's blocks in an order its reader predicts: a read stream
                             over the blocks it pushes, or over a list it knows whole (17 and later), asks
                             of the kernel, or plain reads

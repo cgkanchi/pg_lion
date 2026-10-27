@@ -2287,7 +2287,6 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 {
 	bool		posfiltered = (filter != NULL && filter->npos > 0);
 	LionCollect col;
-	LionMatSet *mat;
 	Relation	index = NULL;
 	int			i;
 	int			j;
@@ -2315,28 +2314,76 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	if (spill)
 		PrepareTempTablespaces();
 
-	memset(&col, 0, sizeof(col));
-	col.cxt = CurrentMemoryContext;
-	col.maxbytes = maxbytes;
-	col.spill = spill;
+	lion_collect_begin(&col, maxbytes, spill);
 	col.ranged = ranged;
 	col.lo = lo;
 	col.hi = hi;
 	col.filter = posfiltered ? filter : NULL;
-	col.cap = 8192;
-	col.buf = (char *) palloc(col.cap);
-	col.offcap = 256;
-	col.offs = (Size *) palloc(sizeof(Size) * col.offcap);
 
 	if (filter != NULL && filter->heap != heap)
 		elog(ERROR, "lion index count: a row filter for another relation");
 	(void) lion_count_sources_run(heap, snapshot, nsources, sources, stats,
 								  NULL, false, false, &col);
 
-	if (col.failed)
+	return lion_collect_finish(&col, index, posfiltered, out, spilled, NULL);
+}
+
+/*
+ * A copy built a container at a time in ascending key order, one per key,
+ * within maxbytes or - with spill - past it in a temporary file
+ * (lion_collect_container()): what lion_sources_collect() builds of the
+ * merge it runs, and what any other caller that makes a set's containers
+ * itself builds of them - the ranges from slices (lion_slice_range_collect(),
+ * DESIGN.md §53).  Begun in the current memory context, which the copy is
+ * made in.
+ */
+void
+lion_collect_begin(LionCollect *col, Size maxbytes, bool spill)
+{
+	memset(col, 0, sizeof(LionCollect));
+	col->cxt = CurrentMemoryContext;
+	col->maxbytes = maxbytes;
+	col->spill = spill;
+	col->cap = 8192;
+	col->buf = (char *) palloc(col->cap);
+	col->offcap = 256;
+	col->offs = (Size *) palloc(sizeof(Size) * col->offcap);
+}
+
+/* The next container: false once the copy has failed (outgrown, no spill). */
+bool
+lion_collect_add(LionCollect *col, const LionContainer *c)
+{
+	lion_collect_container(col, c);
+	return !col->failed;
+}
+
+/*
+ * The set the copy makes, into *out, named after index and found when it
+ * holds a row - as lion_sources_collect() describes it - and false, with
+ * nothing kept, when it failed.  *held, unless NULL, is what the set holds
+ * in memory.
+ */
+bool
+lion_collect_finish(LionCollect *col, Relation index, bool posfiltered,
+					LionPostingSet *out, bool *spilled, Size *held)
+{
+	LionMatSet *mat;
+	int			i;
+
+	memset(out, 0, sizeof(LionPostingSet));
+	out->pinbuf = InvalidBuffer;
+	out->head = InvalidBlockNumber;
+	*spilled = false;
+	if (held != NULL)
+		*held = 0;
+
+	if (col->failed)
 	{
-		pfree(col.buf);
-		pfree(col.offs);
+		if (col->buf != NULL)
+			pfree(col->buf);
+		if (col->offs != NULL)
+			pfree(col->offs);
 		return false;
 	}
 
@@ -2349,9 +2396,9 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	out->cxt = CurrentMemoryContext;
 	out->entryblk = InvalidBlockNumber;
 	out->entryoff = InvalidOffsetNumber;
-	if (col.spilled)
+	if (col->spilled)
 	{
-		mat = lion_spill_finish(&col.sp);
+		mat = lion_spill_finish(&col->sp);
 
 		/*
 		 * Every count against the copy - the FK-side join's per dimension
@@ -2368,30 +2415,32 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 		mat->posfiltered = posfiltered;
 		out->found = true;
 		out->mat = mat;
-		out->ntids = col.members;
+		out->ntids = col->members;
 		out->ncontainers = (uint32) mat->ncontainers;
 		*spilled = true;
+		if (held != NULL)
+			*held = mat->held;
 		return true;
 	}
-	if (col.noffs == 0)
+	if (col->noffs == 0)
 	{
-		pfree(col.buf);
-		pfree(col.offs);
+		pfree(col->buf);
+		pfree(col->offs);
 		return true;
 	}
 
 	mat = (LionMatSet *) palloc0(sizeof(LionMatSet));
-	mat->ncontainers = col.noffs;
-	mat->bytes = col.used;
-	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col.used, (Size) 1)) +
-		sizeof(LionContainer *) * Max(col.noffs, 1);
-	mat->buf = col.buf;
+	mat->ncontainers = col->noffs;
+	mat->bytes = col->used;
+	mat->held = sizeof(LionMatSet) + MAXALIGN(Max(col->used, (Size) 1)) +
+		sizeof(LionContainer *) * Max(col->noffs, 1);
+	mat->buf = col->buf;
 	mat->containers = (LionContainer **)
-		palloc_extended(sizeof(LionContainer *) * Max(col.noffs, 1),
+		palloc_extended(sizeof(LionContainer *) * Max(col->noffs, 1),
 						MCXT_ALLOC_HUGE);
-	for (i = 0; i < col.noffs; i++)
-		mat->containers[i] = (LionContainer *) (col.buf + col.offs[i]);
-	pfree(col.offs);
+	for (i = 0; i < col->noffs; i++)
+		mat->containers[i] = (LionContainer *) (col->buf + col->offs[i]);
+	pfree(col->offs);
 
 	/*
 	 * The keys, which the budget above made room for, and the direct index
@@ -2399,14 +2448,16 @@ lion_sources_collect_keys(Relation heap, Snapshot snapshot, int nsources,
 	 * copy seeks it at each container of its own key's set.
 	 */
 	lion_mat_index(mat, CurrentMemoryContext,
-				   maxbytes > mat->held ? maxbytes - mat->held : 0);
+				   col->maxbytes > mat->held ? col->maxbytes - mat->held : 0);
 	mat->collected = true;
 	mat->posfiltered = posfiltered;
 
 	out->found = true;
 	out->mat = mat;
-	out->ntids = col.members;
-	out->ncontainers = (uint32) col.noffs;
+	out->ntids = col->members;
+	out->ncontainers = (uint32) col->noffs;
+	if (held != NULL)
+		*held = mat->held;
 
 	return true;
 }

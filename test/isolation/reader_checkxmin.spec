@@ -19,7 +19,7 @@ teardown
 
 session s1
 step s1_update	{ UPDATE rx SET k = 2, d = to_tsvector('simple', 'new'); }
-step s1_index	{ CREATE INDEX rx_k ON rx USING lion (k);
+step s1_index	{ CREATE INDEX rx_k ON rx USING lion (k) WITH (slices = on);
 				  CREATE INDEX rx_d ON rx USING lion (d) WITH (store_positions = true); }
 step s1_check	{ SELECT indexrelid::regclass, indcheckxmin FROM pg_index
 					WHERE indrelid = 'rx'::regclass ORDER BY 1::text; }
@@ -37,6 +37,7 @@ step s2_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rx_k'); }
 step s2_bm25	{ SELECT count(*) FROM lion_bm25('rx_d', 'old', 10); }
 step s2_facets	{ SELECT * FROM lion_index_facets('rx_d', 5); }
 step s2_facetsf	{ SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'old'$$); }
+step s2_slices	{ SELECT * FROM lion_index_slice_agg('rx_k'); }
 step s2_commit	{ COMMIT; }
 
 session s3
@@ -48,8 +49,10 @@ step s3_groups	{ SELECT count(*) FROM lion_index_count_group_stats('rx_k'); }
 step s3_bm25	{ SELECT count(*) FROM lion_bm25('rx_d', 'new', 10); }
 step s3_facets	{ SELECT * FROM lion_index_facets('rx_d', 5); }
 step s3_facetsf	{ SELECT * FROM lion_index_facets('rx_k', NULL, $$d @@ 'new'$$); }
+step s3_slices	{ SELECT * FROM lion_index_slice_agg('rx_k'); }
 
 permutation s2_begin s2_snap s1_update s1_index s1_check
 			s2_sp s2_count s2_back s2_sp s2_count2 s2_back s2_sp s2_any s2_back s2_sp s2_stats s2_back s2_sp s2_groups s2_back s2_sp s2_bm25 s2_back
-			s2_sp s2_facets s2_back s2_sp s2_facetsf s2_back
+			s2_sp s2_facets s2_back s2_sp s2_facetsf s2_back s2_sp s2_slices s2_back
 			s2_commit s3_count s3_count2 s3_any s3_stats s3_groups s3_bm25 s3_facets s3_facetsf
+			s3_slices

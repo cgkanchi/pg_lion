@@ -787,6 +787,9 @@ lion_explain_nwhere(LionCountScanState *st)
  * FK-side join's key and the plan's items, each with what it answers; and a
  * line of its own for each filtered count's.
  */
+static void lion_explain_slice_ranges(LionCountScanState *st,
+									  List *ancestors, ExplainState *es);
+
 static void
 lion_explain_indexes(LionCountScanState *st, List *ancestors,
 					 ExplainState *es)
@@ -845,6 +848,122 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
 		ExplainPropertyText(label, buf.data, es);
 		pfree(buf.data);
 	}
+
+	lion_explain_slice_ranges(st, ancestors, es);
+}
+
+/*
+ * One range from slices (DESIGN.md §53) for "Range From Slices": the bounds
+ * on lead's column among clauses [first, first + n) that are a range from
+ * slices, ANDed - `x > 10 AND x <= 20` - and the slices its column has,
+ * `(32 slices)`.
+ */
+static void
+lion_explain_slice_range(LionCountScanState *st, int lead, int first, int n,
+						 List *ancestors, ExplainState *es, StringInfo buf)
+{
+	LionClauseState *cl = &st->clause[lead];
+	bool		firstbound = true;
+	int			nbits = 0;
+	int			j;
+
+	if (buf->len > 0)
+		appendStringInfoString(buf, ", ");
+	for (j = first; j < first + n; j++)
+	{
+		LionClauseState *b = &st->clause[j];
+
+		if (b->kind != LION_CLAUSE_RANGESRC || !b->sliced ||
+			b->attno != cl->attno || st->inor[j] != st->inor[lead])
+			continue;
+		if (!firstbound)
+			appendStringInfoString(buf, " AND ");
+		lion_explain_clause(st, b, ancestors, es, buf);
+		firstbound = false;
+	}
+	if (OidIsValid(cl->idxoid) && cl->attno > 0)
+	{
+		Relation	idx = index_open(cl->idxoid, AccessShareLock);
+		AttrNumber	col = lion_index_col_for_kind(idx, cl->attno, cl->kind,
+												  st->plan.vcols);
+
+		nbits = lion_index_column_state(idx, col)->slicebits;
+		index_close(idx, AccessShareLock);
+	}
+	appendStringInfo(buf, " (%d slices)", nbits);
+}
+
+/*
+ * "Range From Slices" (DESIGN.md §53): each range the plan collects from the
+ * slices of its column - a WHERE's, and an OR's leaf, one an arm - with its
+ * bounds and the slices its column has.
+ */
+static void
+lion_explain_slice_ranges(LionCountScanState *st, List *ancestors,
+						  ExplainState *es)
+{
+	StringInfoData buf;
+	int			i;
+	int			j;
+	int			o;
+
+	initStringInfo(&buf);
+
+	/* outside the ORs: the first bound of each column's range */
+	for (i = 0; i < st->nclause; i++)
+	{
+		LionClauseState *cl = &st->clause[i];
+
+		if (cl->kind != LION_CLAUSE_RANGESRC || !cl->sliced || st->inor[i])
+			continue;
+		for (j = 0; j < i; j++)
+		{
+			if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
+				st->clause[j].sliced && !st->inor[j] &&
+				st->clause[j].attno == cl->attno)
+				break;
+		}
+		if (j < i)
+			continue;
+		lion_explain_slice_range(st, i, 0, st->nclause, ancestors, es, &buf);
+	}
+
+	/* ... and in each arm of an OR */
+	for (o = 0; o < st->nor; o++)
+	{
+		LionOrState *orst = &st->ors[o];
+		int			armfirst = orst->first;
+		int			a;
+
+		for (a = 0; a < orst->narms; a++)
+		{
+			int			len = orst->armlen[a];
+
+			for (i = armfirst; i < armfirst + len; i++)
+			{
+				LionClauseState *cl = &st->clause[i];
+
+				if (cl->kind != LION_CLAUSE_RANGESRC || !cl->sliced)
+					continue;
+				for (j = armfirst; j < i; j++)
+				{
+					if (st->clause[j].kind == LION_CLAUSE_RANGESRC &&
+						st->clause[j].sliced &&
+						st->clause[j].attno == cl->attno)
+						break;
+				}
+				if (j < i)
+					continue;
+				lion_explain_slice_range(st, i, armfirst, len, ancestors, es,
+										 &buf);
+			}
+			armfirst += len;
+		}
+	}
+
+	if (buf.len > 0)
+		ExplainPropertyText("Range From Slices", buf.data, es);
+	pfree(buf.data);
 }
 
 /*
@@ -1127,6 +1246,40 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	}
 
 	/*
+	 * The sliced columns aggregates are answered from (DESIGN.md §52): each
+	 * index and column, and which of its slices are counted against the
+	 * WHERE - every bit's and E's for a sum or an average, E's alone
+	 * otherwise - and the descents its extremes take.
+	 */
+	if (st->slice != NULL)
+	{
+		int			c;
+
+		initStringInfo(&buf);
+		for (c = 0; c < st->slice->ncol; c++)
+		{
+			LionSCol   *col = &st->slice->col[c];
+			int			want = col->want;
+
+			appendStringInfo(&buf, "%s%s (%s: %s%s%s)", (c > 0) ? ", " : "",
+							 get_rel_name(col->idxoid),
+							 lion_explain_attname(st, col->attno),
+							 (want & LION_SWANT_SUM) ?
+							 "every bit counted" : "existence counted",
+							 (want & LION_SWANT_MIN) ? ", min descent" : "",
+							 (want & LION_SWANT_MAX) ? ", max descent" : "");
+		}
+		ExplainPropertyText("Aggregates From Slices", buf.data, es);
+		pfree(buf.data);
+
+		/* a GROUP BY's: a group at a time, or decoded a batch at a time */
+		if (st->plan.groupattno != 0)
+			ExplainPropertyText("Slice Groups",
+								st->slice->decode ? "decoded by batch" :
+								"one at a time", es);
+	}
+
+	/*
 	 * The top k by count (DESIGN.md §36): k, and how many entries the walk of
 	 * their counts keeps as candidates.
 	 */
@@ -1358,6 +1511,32 @@ lion_explain_range_counters(LionCountScanState *st, ExplainState *es)
 		ExplainPropertyInteger("Lists Collected", NULL, lists[0], es);
 	if (lists[2] > 0)
 		ExplainPropertyInteger("Lists Spilled", NULL, lists[2], es);
+
+	/*
+	 * The ranges collected from slices (DESIGN.md §53): the collections -
+	 * each range once a relation, a run and a rescan, in every participant
+	 * - the container keys of E they folded, their bit steps (a comparison
+	 * of a slice's container with the key's rows each: the container
+	 * operations the planner prices) and the collections that went to a
+	 * file.  Only when there were any.
+	 */
+	{
+		const LionSliceRangeStats *a = &st->sliceranges;
+		const LionSliceRangeStats *w = &st->worker.sliceranges;
+
+		if (a->descents + w->descents > 0)
+		{
+			ExplainPropertyInteger("Slice Range Descents", NULL,
+								   a->descents + w->descents, es);
+			ExplainPropertyInteger("Slice Range Keys", NULL,
+								   a->keys + w->keys, es);
+			ExplainPropertyInteger("Slice Range Steps", NULL,
+								   a->steps + w->steps, es);
+		}
+		if (a->spilled + w->spilled > 0)
+			ExplainPropertyInteger("Slice Range Copies Spilled", NULL,
+								   a->spilled + w->spilled, es);
+	}
 }
 
 /*
@@ -1473,6 +1652,63 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		if (st->wagg->slow > 0)
 			ExplainPropertyInteger("Key Walks Counted", NULL, st->wagg->slow,
 								   es);
+	}
+
+	/*
+	 * The aggregates of sliced columns (DESIGN.md §52): the slices located
+	 * and how many of them had no entry, the counted ANDs, the slices'
+	 * containers the walks counted - and of those the plane kernel's, at how
+	 * many keys, and which kernel - the descents' steps and the candidate
+	 * sets they collected, and the copies of E ∧ WHERE made.
+	 */
+	if (st->slice != NULL && st->slice->runs > 0)
+	{
+		LionSliceState *ss = st->slice;
+
+		ExplainPropertyInteger("Slices Located", NULL, ss->located, es);
+		if (ss->absent > 0)
+			ExplainPropertyInteger("Slices Absent", NULL, ss->absent, es);
+		if (ss->counts > 0 || ss->batches == 0)
+		{
+			ExplainPropertyInteger("Slice Counts", NULL, ss->counts, es);
+			ExplainPropertyInteger("Slice Containers Counted", NULL,
+								   ss->containers, es);
+		}
+		if (ss->kernelplanes > 0)
+		{
+			ExplainPropertyInteger("Slice Containers by Kernel", NULL,
+								   ss->kernelplanes, es);
+			ExplainPropertyInteger("Slice Kernel Keys", NULL, ss->kernelkeys,
+								   es);
+			ExplainPropertyText("Slice Kernel",
+								lion_simd_name(lion_simd_current()), es);
+		}
+		if (ss->steps > 0)
+			ExplainPropertyInteger("Slice Descent Steps", NULL, ss->steps,
+								   es);
+		if (ss->collects > 0)
+			ExplainPropertyInteger("Slice Candidate Sets", NULL,
+								   ss->collects, es);
+		ExplainPropertyInteger("Slice WHERE Copies", NULL, ss->copies, es);
+		if (ss->batches > 0)
+		{
+			ExplainPropertyInteger("Slice Batches Decoded", NULL, ss->batches,
+								   es);
+			ExplainPropertyInteger("Slice Keys Decoded", NULL, ss->decodekeys,
+								   es);
+			ExplainPropertyInteger("Slice Rows Decoded", NULL, ss->decoderows,
+								   es);
+			if (ss->decoderechecked > 0)
+				ExplainPropertyInteger("Slice Rows Rechecked", NULL,
+									   ss->decoderechecked, es);
+		}
+		if (ss->tidsrechecked > 0)
+		{
+			ExplainPropertyInteger("Slice Heap TIDs Rechecked", NULL,
+								   ss->tidsrechecked, es);
+			ExplainPropertyInteger("Slice Heap Blocks Rechecked", NULL,
+								   ss->blocksrechecked, es);
+		}
 	}
 
 	/*

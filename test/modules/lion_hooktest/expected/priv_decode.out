@@ -22,9 +22,9 @@ SELECT lion_hooktest_priv_decode('path') AS nclause;
 
 -- the shape marker, and the plan's number of members
 SELECT lion_hooktest_priv_decode('magic');
-ERROR:  LionCount: unrecognized custom_private shape (26 members)
+ERROR:  LionCount: unrecognized custom_private shape (27 members)
 SELECT lion_hooktest_priv_decode('path at plan');
-ERROR:  LionCount: unrecognized custom_private shape (25 members)
+ERROR:  LionCount: unrecognized custom_private shape (26 members)
 -- a member's node type, and its length against the number of clauses
 SELECT lion_hooktest_priv_decode('oids as ints');
 ERROR:  LionCount: malformed OIDS member of custom_private

@@ -851,8 +851,15 @@ lion_index_answers(IndexOptInfo *idx, AttrNumber col, int kind, Oid opno,
 	 */
 	if (kind == LION_CLAUSE_RANGE || kind == LION_CLAUSE_RANGESRC)
 	{
-		if (!LION_STRAT_IS_RANGE(get_op_opfamily_strategy(opno,
-														  idx->opfamily[i])))
+		/*
+		 * ... and a range taken as a source may have a hole, `<>` (§35),
+		 * which a build that answers ranges from slices makes one of
+		 * (§53).
+		 */
+		StrategyNumber s = get_op_opfamily_strategy(opno, idx->opfamily[i]);
+
+		if (!(LION_STRAT_IS_RANGE(s) ||
+			  (kind == LION_CLAUSE_RANGESRC && s == LION_STRAT_NE)))
 			return false;
 		if (!OidIsValid(get_opfamily_proc(idx->opfamily[i], idx->opcintype[i],
 										  cmptype, LION_CMP_PROC)))
@@ -2459,6 +2466,236 @@ bool
 lion_contains_param(Node *expr)
 {
 	return lion_contains_param_walker(expr, NULL);
+}
+
+/*
+ * A whole lion index of rel that keeps slices of plain column attno
+ * (DESIGN.md §51), the first in rel's list, or NULL: *colp its key column
+ * there and *typid the type its keys are sliced as (lion_slice_type_nbits()
+ * its width) - the column's own, or its domain's base.  A scalar key column
+ * of one of the allowlist's types holds the rows' own values.  The planner
+ * holds the indexes it lists locked since get_relation_info(), and the
+ * sliced columns are read off the relation's cached meta page.
+ */
+IndexOptInfo *
+lion_find_sliced_index(RelOptInfo *rel, AttrNumber attno, AttrNumber *colp,
+					   Oid *typid)
+{
+	Oid			lionam = lion_get_am_oid();
+	ListCell   *lc;
+
+	if (!OidIsValid(lionam) || attno <= 0)
+		return NULL;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		if (idx->relam != lionam || idx->hypothetical ||
+			idx->indpred != NIL)
+			continue;
+		for (c = 0; c < idx->nkeycolumns; c++)
+		{
+			Relation	index;
+			LionState  *state;
+			bool		sliced;
+			Oid			keytype;
+
+			if (idx->indexkeys[c] != attno ||
+				lion_opfamily_is_multikey(idx->opfamily[c],
+										  idx->opcintype[c]))
+				continue;
+			index = index_open(idx->indexoid, NoLock);
+			state = lion_index_column_state(index, (AttrNumber) (c + 1));
+			keytype = state->typid;
+			sliced = state->sliced && state->slicebits > 0 &&
+				lion_slice_type_nbits(keytype) == state->slicebits;
+			index_close(index, NoLock);
+			if (!sliced)
+				continue;
+			*colp = (AttrNumber) (c + 1);
+			*typid = keytype;
+			return idx;
+		}
+	}
+	return NULL;
+}
+
+/*
+ * The index whose slices answer a range on plain column attno of rel
+ * (DESIGN.md §53), or NULL: the index the range's clauses are matched to -
+ * the first whole lion index of the column (lion_find_roaring_index(),
+ * lion_match_index()), outside the scope of a partial index (§45), which
+ * keeps no slices the planner reads - when it slices the column at its
+ * type's width; *colp its key column there and *typid the type its keys are
+ * sliced as.
+ */
+IndexOptInfo *
+lion_range_sliced_index(RelOptInfo *rel, AttrNumber attno, AttrNumber *colp,
+						Oid *typid)
+{
+	IndexOptInfo *idx;
+	AttrNumber	col = 0;
+	Relation	index;
+	LionState  *state;
+	bool		sliced;
+
+	if (attno <= 0 || lion_partial_index_of(rel) != NULL)
+		return NULL;
+	idx = lion_find_roaring_index(rel, attno, false, &col);
+	if (idx == NULL || col <= 0 || idx->hypothetical || idx->indpred != NIL)
+		return NULL;
+	index = index_open(idx->indexoid, NoLock);
+	state = lion_index_column_state(index, col);
+	sliced = state->sliced && state->slicebits > 0 &&
+		lion_slice_type_nbits(state->typid) == state->slicebits;
+	*typid = state->typid;
+	index_close(index, NoLock);
+	if (!sliced)
+		return NULL;
+	*colp = col;
+	return idx;
+}
+
+/* Does any whole lion index of rel slice a column (DESIGN.md §51)? */
+bool
+lion_rel_has_sliced_index(RelOptInfo *rel)
+{
+	Oid			lionam = lion_get_am_oid();
+	ListCell   *lc;
+
+	if (!OidIsValid(lionam))
+		return false;
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		Relation	index;
+		LionIndexState *ix;
+		bool		any = false;
+		int			c;
+
+		if (idx->relam != lionam || idx->hypothetical || idx->indpred != NIL)
+			continue;
+		index = index_open(idx->indexoid, NoLock);
+		ix = lion_get_index_state(index);
+		for (c = 0; c < ix->ncolumns; c++)
+			any |= ix->cols[c].sliced;
+		index_close(index, NoLock);
+		if (any)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Is agg an aggregate a bit-sliced column's slices answer (DESIGN.md §52) -
+ * and which?  count, sum, avg, min or max of a bare column of relation rti
+ * (a RelabelType over it allowed, which a domain's column brings), with no
+ * DISTINCT, ORDER BY or FILTER: count(x) of any type, sum and avg of an
+ * int2, int4 or int8 - sum and avg of a date, time or timestamp are no SQL
+ * aggregates - and min and max of each type of the allowlist
+ * (lion_slice_type_nbits()), each answered as core's aggregate of that type
+ * answers it.  *attno is the column, and *argtype the type the aggregate
+ * takes it as - which the slices have to be of - or InvalidOid for count(x),
+ * which takes any.  Whether it is sliced is the caller's to ask.  Without
+ * 128-bit integers sum and avg are not taken.
+ */
+int
+lion_sagg_classify(Aggref *agg, Index rti, AttrNumber *attno, Oid *argtype)
+{
+	Node	   *arg;
+	Var		   *v;
+	int			kind;
+	Oid			type = InvalidOid;
+
+	if (agg->aggdistinct != NIL || agg->aggorder != NIL ||
+		agg->aggfilter != NULL || agg->agglevelsup != 0 || agg->aggstar ||
+		agg->aggkind != AGGKIND_NORMAL || agg->aggsplit != AGGSPLIT_SIMPLE ||
+		list_length(agg->args) != 1)
+		return LION_SAGG_NONE;
+	arg = (Node *) ((TargetEntry *) linitial(agg->args))->expr;
+	while (arg != NULL && IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+	if (arg == NULL || !IsA(arg, Var))
+		return LION_SAGG_NONE;
+	v = (Var *) arg;
+	if (v->varno != (int) rti || v->varattno <= 0 || v->varlevelsup != 0)
+		return LION_SAGG_NONE;
+
+	switch (agg->aggfnoid)
+	{
+		case F_COUNT_ANY:
+			kind = LION_SAGG_COUNT;
+			break;
+#ifdef HAVE_INT128
+		case F_SUM_INT2:
+			kind = LION_SAGG_SUM;
+			type = INT2OID;
+			break;
+		case F_SUM_INT4:
+			kind = LION_SAGG_SUM;
+			type = INT4OID;
+			break;
+		case F_SUM_INT8:
+			kind = LION_SAGG_SUM8;
+			type = INT8OID;
+			break;
+		case F_AVG_INT2:
+			kind = LION_SAGG_AVG;
+			type = INT2OID;
+			break;
+		case F_AVG_INT4:
+			kind = LION_SAGG_AVG;
+			type = INT4OID;
+			break;
+		case F_AVG_INT8:
+			kind = LION_SAGG_AVG8;
+			type = INT8OID;
+			break;
+#endif
+		case F_MIN_INT2:
+		case F_MAX_INT2:
+			type = INT2OID;
+			kind = (agg->aggfnoid == F_MIN_INT2) ? LION_SAGG_MIN : LION_SAGG_MAX;
+			break;
+		case F_MIN_INT4:
+		case F_MAX_INT4:
+			type = INT4OID;
+			kind = (agg->aggfnoid == F_MIN_INT4) ? LION_SAGG_MIN : LION_SAGG_MAX;
+			break;
+		case F_MIN_INT8:
+		case F_MAX_INT8:
+			type = INT8OID;
+			kind = (agg->aggfnoid == F_MIN_INT8) ? LION_SAGG_MIN : LION_SAGG_MAX;
+			break;
+		case F_MIN_DATE:
+		case F_MAX_DATE:
+			type = DATEOID;
+			kind = (agg->aggfnoid == F_MIN_DATE) ? LION_SAGG_MIN : LION_SAGG_MAX;
+			break;
+		case F_MIN_TIME:
+		case F_MAX_TIME:
+			type = TIMEOID;
+			kind = (agg->aggfnoid == F_MIN_TIME) ? LION_SAGG_MIN : LION_SAGG_MAX;
+			break;
+		case F_MIN_TIMESTAMP:
+		case F_MAX_TIMESTAMP:
+			type = TIMESTAMPOID;
+			kind = (agg->aggfnoid == F_MIN_TIMESTAMP) ? LION_SAGG_MIN :
+				LION_SAGG_MAX;
+			break;
+		case F_MIN_TIMESTAMPTZ:
+		case F_MAX_TIMESTAMPTZ:
+			type = TIMESTAMPTZOID;
+			kind = (agg->aggfnoid == F_MIN_TIMESTAMPTZ) ? LION_SAGG_MIN :
+				LION_SAGG_MAX;
+			break;
+		default:
+			return LION_SAGG_NONE;
+	}
+	*attno = v->varattno;
+	*argtype = type;
+	return kind;
 }
 
 /*

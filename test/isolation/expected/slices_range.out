@@ -1,0 +1,153 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_explain s1_begin s1_ranges s2_begin s2_write s2_ranges s1_ranges s3_ranges s2_commit s1_ranges s3_ranges s1_commit s1_ranges
+step s1_explain: EXPLAIN (COSTS OFF)
+				  SELECT count(*) FROM srg WHERE b BETWEEN 0 AND 3000000000;
+				  EXPLAIN (COSTS OFF)
+				  SELECT sum(a), min(a), max(a) FROM srg WHERE a > 100;
+				  EXPLAIN (COSTS OFF)
+				  SELECT grp, count(*) FROM srg WHERE b < 0 OR a > 450 GROUP BY grp;
+QUERY PLAN                                                           
+---------------------------------------------------------------------
+Custom Scan (LionCount)                                              
+  Lion Indexes: srg_v.b (b >= 0 AND b <= '3000000000'::bigint)       
+  Range From Slices: b >= 0 AND b <= '3000000000'::bigint (64 slices)
+(3 rows)
+
+QUERY PLAN                                                                      
+--------------------------------------------------------------------------------
+Custom Scan (LionCount)                                                         
+  Lion Indexes: srg_v.a (a > 100)                                               
+  Range From Slices: a > 100 (32 slices)                                        
+  Aggregates From Slices: srg_v (a: every bit counted, min descent, max descent)
+(4 rows)
+
+QUERY PLAN                                                            
+----------------------------------------------------------------------
+Custom Scan (LionCount)                                               
+  Lion Indexes: srg_grp (grp), srg_v.b, srg_v.a ((b < 0) OR (a > 450))
+  Range From Slices: b < 0 (64 slices), a > 450 (32 slices)           
+  Group Key: grp                                                      
+(4 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO srg VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL),
+					(10004, 1, 0, 0, '2020-01-15');
+				  UPDATE srg SET a = -a, b = -b, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM srg WHERE id % 7 = 3;
+step s2_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s2_commit: COMMIT;
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+
+
+starting permutation: s2_begin s2_write s2_ranges s3_ranges s2_rollback s3_ranges
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO srg VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL),
+					(10004, 1, 0, 0, '2020-01-15');
+				  UPDATE srg SET a = -a, b = -b, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM srg WHERE id % 7 = 3;
+step s2_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s2_rollback: ROLLBACK;
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+
+starting permutation: s1_begin s1_ranges s2_begin s2_write s2_commit s3_vacuum s1_ranges s3_ranges s1_commit s3_vacuum s3_ranges
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO srg VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(10002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(10003, 0, NULL, NULL, NULL),
+					(10004, 1, 0, 0, '2020-01-15');
+				  UPDATE srg SET a = -a, b = -b, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM srg WHERE id % 7 = 3;
+step s2_commit: COMMIT;
+step s3_vacuum: VACUUM srg;
+step s1_ranges: SELECT * FROM srg_both();
+same|lion                                                        
+----+------------------------------------------------------------
+t   |2994 3000 480 5394 | 718200 101 499 | 0: 217, 1: 231, 2: 219
+(1 row)
+
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_vacuum: VACUUM srg;
+step s3_ranges: SELECT * FROM srg_both();
+same|lion                                                                   
+----+-----------------------------------------------------------------------
+t   |2574 2348 494 4618 | 2148102320 101 2147483647 | 0: 168, 1: 664, 2: 172
+(1 row)
+

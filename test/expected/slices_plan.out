@@ -1,0 +1,1188 @@
+-- Aggregates of bit-sliced columns answered from their slices by the
+-- LionCount node (DESIGN.md §52): count, sum, avg, min and max of a column a
+-- lion index slices (§51), under a WHERE of every kind the count pushdown
+-- takes, beside count(*) and filtered counts.  Every answer is checked
+-- against the ordinary plan (the pushdown off, a sequential scan), and the
+-- plan that ran it is shown.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, YMD';
+/*
+ * slp_q() runs q with the lion paths preferred - every other scan disabled -
+ * then as a sequential scan with the pushdown off, and compares the two as
+ * multisets.  It says what the node did: answered aggregates from slices -
+ * a GROUP BY's decoded a batch of groups at a time - over keys (§37), counts
+ * only, or nothing.
+ */
+CREATE FUNCTION slp_q(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	slices boolean := false;
+	decoded boolean := false;
+	keys boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Aggregates From Slices:' THEN
+			slices := true;
+		END IF;
+		IF ln ~ 'Aggregates Over Keys:' THEN
+			keys := true;
+		END IF;
+		IF ln ~ 'Slice Groups: decoded' THEN
+			decoded := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE slp_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE slp_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM slp_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM slp_on EXCEPT ALL SELECT * FROM slp_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM slp_off EXCEPT ALL SELECT * FROM slp_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE slp_on, slp_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN decoded THEN 'from slices, decoded'
+					   WHEN slices THEN 'from slices' WHEN keys THEN 'over keys'
+					   WHEN used THEN 'counts only' ELSE 'no pushdown' END,
+				  nrows);
+END $$;
+/*
+ * The plan of q with the lion paths preferred, as EXPLAIN (COSTS OFF) prints
+ * it - or, with analyze, the node's own lines of EXPLAIN ANALYZE, the
+ * counters that depend on nothing but the data (the kernel's name aside).
+ */
+CREATE FUNCTION slp_plan(q text, ana bool DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE CASE WHEN ana
+					  THEN 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
+					  ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
+		IF NOT ana OR
+		   ln ~ '(LionCount|Lion Indexes|Count Filter|Aggregates From Slices|Slice|Range Sources)' THEN
+			-- the heap rechecks depend on which pages the heap left dirty,
+			-- which differs between majors: shown as made or not, not counted
+			RETURN NEXT regexp_replace(regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
+												  'Slice Kernel: .*$', 'Slice Kernel: (the CPU''s)'),
+									   '(Slice Heap (TIDs|Blocks) Rechecked): [1-9][0-9]*$', '\1: >0');
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+END $$;
+-- ---------- 1. every type of the allowlist ----------
+-- 30,000 rows of some 500 heap pages (eight container keys): NULLs,
+-- negatives, and each type's extremes - its least and greatest values, the
+-- infinities of date and timestamp - in a few rows of their own.
+CREATE TABLE slp (id int, g int, h int, r int4, tags int[],
+				  a int2, b int4, c int8, d date, t time, ts timestamp,
+				  tz timestamptz, f float8, pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO slp
+SELECT i, i % 10, i % 4, (i * 37) % 1000,
+	   ARRAY[i % 7, 10 + i % 5],
+	   CASE WHEN i % 17 = 0 THEN NULL ELSE (i * 13) % 2001 - 1000 END,
+	   CASE WHEN i % 19 = 0 THEN NULL ELSE (i * 7919) % 200001 - 100000 END,
+	   CASE WHEN i % 23 = 0 THEN NULL ELSE (i::int8 * 1000003) % 20000000001 - 10000000000 END,
+	   CASE WHEN i % 29 = 0 THEN NULL ELSE date '2000-01-01' + (i * 7) % 20000 - 10000 END,
+	   CASE WHEN i % 31 = 0 THEN NULL ELSE time '00:00' + (i * 61) % 86400 * interval '1 s' END,
+	   CASE WHEN i % 37 = 0 THEN NULL ELSE timestamp '2000-01-01' + (i * 7777) % 1000000 * interval '1 min' - interval '500000 min' END,
+	   CASE WHEN i % 41 = 0 THEN NULL ELSE timestamptz '2020-01-01 00:00+00' + (i * 3331) % 100000 * interval '1 s' END,
+	   (i % 100) / 7.0,
+	   repeat('x', 80)
+  FROM generate_series(1, 30000) i;
+INSERT INTO slp (id, g, h, r, tags, a, b, c, d, t, ts, tz, f, pad) VALUES
+	(30001, 3, 1, 5, '{1}', -32768, -2147483648, -9223372036854775808,
+	 '-infinity', '00:00', '-infinity', '-infinity', -1e300, 'least'),
+	(30002, 3, 2, 6, '{2}', 32767, 2147483647, 9223372036854775807,
+	 'infinity', '24:00', 'infinity', 'infinity', 1e300, 'greatest'),
+	(30003, 3, 3, 7, '{3}', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 'nulls');
+CREATE INDEX slp_g ON slp USING lion (g);
+CREATE INDEX slp_h ON slp USING lion (h);
+CREATE INDEX slp_r ON slp USING lion (r) WITH (summaries = on, summary_tids = 64);
+CREATE INDEX slp_tags ON slp USING lion (tags);
+CREATE INDEX slp_v ON slp USING lion (a, b, c, d, t, ts, tz) WITH (slices = on);
+CREATE INDEX slp_f ON slp USING lion (f) WITH (slices = on);
+VACUUM (FREEZE, ANALYZE) slp;
+SELECT attno, sliced FROM lion_index_stats('slp_v') ORDER BY attno;
+ attno | sliced 
+-------+--------
+     1 | t
+     2 | t
+     3 | t
+     4 | t
+     5 | t
+     6 | t
+     7 | t
+(7 rows)
+
+SELECT attno, sliced FROM lion_index_stats('slp_f') ORDER BY attno;
+ attno | sliced 
+-------+--------
+     1 | f
+(1 row)
+
+-- What the plan shows: the slices' index and column, which slices it counts
+-- against the WHERE and which descents it makes.
+SELECT * FROM slp_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM slp WHERE g = 3');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+(3 rows)
+
+SELECT * FROM slp_plan('SELECT sum(b), count(*) FROM slp WHERE g = 3');
+                        slp_plan                        
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted)
+(3 rows)
+
+SELECT * FROM slp_plan('SELECT max(c), min(d), count(*) FROM slp WHERE g = 3');
+                                                    slp_plan                                                    
+----------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (c: existence counted, max descent), slp_v (d: existence counted, min descent)
+(3 rows)
+
+SELECT * FROM slp_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM slp WHERE g = 3', true);
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slices Located: 98
+   Slice Counts: 97
+   Slice Containers Counted: 429
+   Slice Containers by Kernel: 413
+   Slice Kernel Keys: 13
+   Slice Kernel: (the CPU's)
+   Slice Descent Steps: 64
+   Slice Candidate Sets: 4
+   Slice WHERE Copies: 1
+(12 rows)
+
+SELECT count(b), sum(b), avg(b), min(b), max(b) FROM slp WHERE g = 3;
+ count |   sum   |          avg          |     min     |    max     
+-------+---------+-----------------------+-------------+------------
+  2844 | -287666 | -101.1483825597749648 | -2147483648 | 2147483647
+(1 row)
+
+SELECT slp_q('SELECT count(a), sum(a), avg(a), min(a), max(a) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(c), sum(c), avg(c), min(c), max(c) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(d), min(d), max(d) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(t), min(t), max(t) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(ts), min(ts), max(ts) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(tz), min(tz), max(tz) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT count(a), sum(a), min(a), max(a), count(c), sum(c), min(c), max(c),
+	   min(d), max(d), min(t), max(t), min(ts), max(ts), min(tz), max(tz)
+  FROM slp WHERE g = 3;
+ count | sum |  min   |  max  | count |      sum       |         min          |         max         |    min    |   max    |   min    |   max    |    min    |   max    |    min    |   max    
+-------+-----+--------+-------+-------+----------------+----------------------+---------------------+-----------+----------+----------+----------+-----------+----------+-----------+----------
+  2826 | 215 | -32768 | 32767 |  2871 | -4777333903346 | -9223372036854775808 | 9223372036854775807 | -infinity | infinity | 00:00:00 | 24:00:00 | -infinity | infinity | -infinity | infinity
+(1 row)
+
+-- several columns of one index, and every aggregate at once
+SELECT slp_q('SELECT sum(a), sum(b), sum(c), max(d), min(t), max(ts), min(tz), count(*) FROM slp WHERE g = 4');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT sum(a), sum(b), sum(c), max(d), min(t), max(ts), min(tz), count(*) FROM slp WHERE g = 4');
+                                                                                                                                             slp_plan                                                                                                                                             
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 4)
+   Aggregates From Slices: slp_v (a: every bit counted), slp_v (b: every bit counted), slp_v (c: every bit counted), slp_v (d: existence counted, max descent), slp_v (t: existence counted, min descent), slp_v (ts: existence counted, max descent), slp_v (tz: existence counted, min descent)
+(3 rows)
+
+-- the extremes, where the WHERE takes them in, and NULLs only
+SELECT slp_q('SELECT count(c), sum(c), avg(c), min(c), max(c), min(d), max(ts) FROM slp WHERE h IN (1, 2)');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT sum(c), avg(c), min(c), max(c), min(a), max(a), min(d), max(d) FROM slp WHERE g = 3 AND h IN (1, 2);
+      sum       |         avg          |         min          |         max         |  min   |  max  |    min    |   max    
+----------------+----------------------+----------------------+---------------------+--------+-------+-----------+----------
+ -2378680406714 | -1655309955.95963814 | -9223372036854775808 | 9223372036854775807 | -32768 | 32767 | -infinity | infinity
+(1 row)
+
+SELECT slp_q('SELECT count(b), sum(b), min(b), max(b) FROM slp WHERE g = 3 AND h IN (1, 2)');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM slp WHERE tags @> ''{3}'' AND g = 3 AND h = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), count(*) FROM slp WHERE g = 99');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- sum(int4) of the extremes: the int8 core adds them in
+SELECT slp_q('SELECT sum(b), avg(b) FROM slp WHERE r < 10 AND g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ---------- 2. a WHERE of every kind ----------
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE g IN (1, 5, 9)');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE g <> 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE g NOT IN (2, 3)');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE b IS NOT NULL');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(b), count(*) FROM slp WHERE b IS NULL');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE c IS NULL AND g = 1');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE g = 1 OR h = 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE (g = 1 AND h = 1) OR tags && ''{4}''');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE tags @> ''{2, 12}''');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE tags && ''{1, 6}'' AND h = 0');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ranges on another column: summed, and as a source beside a clause
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE r < 300');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE r < 300');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_r (r < 300)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+(3 rows)
+
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE r BETWEEN 200 AND 700 AND g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT sum(b), min(b), max(b) FROM slp WHERE r BETWEEN 200 AND 700 AND g = 3');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_r (r >= 200 AND r <= 700), slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+(3 rows)
+
+SELECT slp_q('SELECT sum(b), max(b) FROM slp WHERE r >= 990');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), max(b), count(*) FROM slp WHERE r > 2000');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a range of a column with nothing else, and no count beside it
+SELECT * FROM slp_plan('SELECT sum(b), max(b) FROM slp WHERE r < 300 OR g = 2');
+                              slp_plan                               
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_r, slp_g ((r < 300) OR (g = 2))
+   Aggregates From Slices: slp_v (b: every bit counted, max descent)
+(3 rows)
+
+SELECT slp_q('SELECT sum(b), max(b) FROM slp WHERE r < 300 OR g = 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- an equality on the sliced column itself, and a NULL test of it
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(b) FROM slp WHERE b = 15827');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(c), max(c), count(*) FROM slp WHERE b IS NULL AND g = 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a stable expression, evaluated once a scan
+CREATE FUNCTION slp_lim() RETURNS int LANGUAGE sql STABLE AS $$ SELECT 400 $$;
+SELECT slp_q('SELECT sum(b), min(b), max(b), count(*) FROM slp WHERE r < slp_lim() AND h = 1');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), max(b) FROM slp WHERE g = length(current_setting(''DateStyle''))');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- no WHERE: the slices, or the aggregates over keys (§37), which the cost
+-- decides between
+SELECT slp_q('SELECT sum(b), max(b), min(b), count(*) FROM slp');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT sum(b), max(b), min(b), count(*) FROM slp');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_h (all rows)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+(3 rows)
+
+SET pg_lion.enable_count_slices = off;
+SELECT slp_q('SELECT sum(b), max(b), min(b), count(*) FROM slp');
+       slp_q       
+-------------------
+ over keys, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), max(b) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+RESET pg_lion.enable_count_slices;
+-- ---------- 3. beside counts, filtered counts and a HAVING ----------
+SELECT slp_q('SELECT count(*), count(b), sum(b), count(*) FILTER (WHERE h = 1), max(b) FROM slp WHERE g = 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT count(*), count(b), sum(b), count(*) FILTER (WHERE h = 1), max(b) FROM slp WHERE g = 2');
+                              slp_plan                               
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 2)
+   Count Filter 1: slp_h (h = 1)
+   Aggregates From Slices: slp_v (b: every bit counted, max descent)
+(4 rows)
+
+SELECT slp_q('SELECT sum(CASE WHEN h = 1 THEN 1 ELSE 0 END), sum(b) FROM slp WHERE g IN (2, 3)');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b) FROM slp WHERE g = 2 HAVING sum(b) > 0');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b) FROM slp WHERE g = 2 HAVING sum(b) < 0');
+        slp_q        
+---------------------
+ from slices, 0 rows
+(1 row)
+
+SELECT slp_q('SELECT max(b) - min(b), sum(b)::numeric / count(b), round(avg(c)) FROM slp WHERE g = 2');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- with the plane kernel off: each slice's container counted on its own, the
+-- same answers
+SET pg_lion.enable_slice_kernel = off;
+SELECT slp_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT count(b), sum(b) FROM slp WHERE g = 3', true);
+                        slp_plan                        
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted)
+   Slices Located: 34
+   Slice Counts: 33
+   Slice Containers Counted: 429
+   Slice WHERE Copies: 1
+(7 rows)
+
+RESET pg_lion.enable_slice_kernel;
+-- ---------- 4. parameters ----------
+SET plan_cache_mode = force_generic_plan;
+PREPARE slp_p1(int) AS SELECT count(b), sum(b), min(b), max(b), count(*) FROM slp WHERE g = $1;
+PREPARE slp_p2(int[]) AS SELECT sum(c), max(d) FROM slp WHERE g = ANY ($1);
+PREPARE slp_p3(int, int) AS SELECT sum(b), min(b) FROM slp WHERE r BETWEEN $1 AND $2;
+EXPLAIN (COSTS OFF) EXECUTE slp_p1(3);
+                                    QUERY PLAN                                    
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = $1)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+(3 rows)
+
+EXECUTE slp_p1(3);
+ count |   sum   |     min     |    max     | count 
+-------+---------+-------------+------------+-------
+  2844 | -287666 | -2147483648 | 2147483647 |  3003
+(1 row)
+
+EXECUTE slp_p1(7);
+ count |  sum  |  min   |  max  | count 
+-------+-------+--------+-------+-------
+  2842 | 30738 | -99977 | 99979 |  3000
+(1 row)
+
+EXECUTE slp_p1(NULL);
+ count | sum | min | max | count 
+-------+-----+-----+-----+-------
+     0 |     |     |     |     0
+(1 row)
+
+EXECUTE slp_p2('{1,2}');
+      sum       |    max     
+----------------+------------
+ -9590723824859 | 2027-05-16
+(1 row)
+
+EXECUTE slp_p3(100, 200);
+   sum   |  min   
+---------+--------
+ 2035378 | -99959
+(1 row)
+
+EXECUTE slp_p3(900, 100);
+ sum | min 
+-----+-----
+     |    
+(1 row)
+
+RESET plan_cache_mode;
+SELECT count(b), sum(b), min(b), max(b), count(*) FROM slp WHERE g = 7;
+ count |  sum  |  min   |  max  | count 
+-------+-------+--------+-------+-------
+  2842 | 30738 | -99977 | 99979 |  3000
+(1 row)
+
+SELECT sum(c), max(d) FROM slp WHERE g = ANY ('{1,2}');
+      sum       |    max     
+----------------+------------
+ -9590723824859 | 2027-05-16
+(1 row)
+
+SELECT sum(b), min(b) FROM slp WHERE r BETWEEN 100 AND 200;
+   sum   |  min   
+---------+--------
+ 2035378 | -99959
+(1 row)
+
+DEALLOCATE ALL;
+-- a LATERAL rescan: the node counted again for every outer row
+SELECT o.g, s.* FROM (VALUES (1), (2), (99)) o(g),
+	   LATERAL (SELECT sum(b), min(c), max(ts) FROM slp WHERE slp.g = o.g) s
+ ORDER BY 1;
+ g  |  sum   |     min     |         max         
+----+--------+-------------+---------------------
+  1 | -70133 | -9998999997 | 2000-12-13 03:27:00
+  2 | 382738 | -9997999994 | 2000-12-12 23:24:00
+ 99 |        |             | 
+(3 rows)
+
+-- ---------- 5. the heap the map does not vouch for ----------
+-- Rows deleted and updated and not vacuumed: every count rechecks their
+-- pages in the heap, whatever the slices still hold.
+DELETE FROM slp WHERE id % 50 = 7;
+UPDATE slp SET b = -b, c = c + 1, d = d + 1 WHERE id % 40 = 3;
+SELECT slp_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(c), min(d), max(d), count(*) FROM slp WHERE h = 3 OR g = 1');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b), max(b), min(b) FROM slp');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT count(b), sum(b) FROM slp WHERE g = 3', true);
+                        slp_plan                        
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted)
+   Slices Located: 34
+   Slice Counts: 33
+   Slice Containers Counted: 429
+   Slice WHERE Copies: 1
+   Slice Heap TIDs Rechecked: >0
+   Slice Heap Blocks Rechecked: >0
+(9 rows)
+
+-- rows this transaction inserted, with the column's extremes, and deleted
+BEGIN;
+INSERT INTO slp (id, g, h, r, a, b, c, d) VALUES
+	(40001, 3, 0, 1, 32767, 2147483647, 9223372036854775807, 'infinity'),
+	(40002, 3, 0, 2, -32768, -2147483648, -9223372036854775808, '-infinity');
+DELETE FROM slp WHERE g = 3 AND id % 3 = 0;
+SELECT slp_q('SELECT count(b), sum(b), min(b), max(b), sum(c), min(c), max(c), max(d), count(*) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT sum(b), min(b), max(b), max(d), min(a), max(a) FROM slp WHERE g = 3;
+    sum     |     min     |    max     |   max    |  min   |  max  
+------------+-------------+------------+----------+--------+-------
+ 2148555839 | -2147483648 | 2147483647 | infinity | -32768 | 32767
+(1 row)
+
+ROLLBACK;
+SELECT slp_q('SELECT count(b), sum(b), min(b), max(b), sum(c), min(c), max(c), max(d), count(*) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ... and after VACUUM, the map's again
+VACUUM (FREEZE) slp;
+SELECT slp_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(c), min(d), max(d), count(*) FROM slp WHERE h = 3 OR g = 1');
+        slp_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT * FROM slp_plan('SELECT count(b), sum(b) FROM slp WHERE g = 3', true);
+                        slp_plan                        
+--------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted)
+   Slices Located: 34
+   Slice Counts: 33
+   Slice Containers Counted: 429
+   Slice Containers by Kernel: 429
+   Slice Kernel Keys: 13
+   Slice Kernel: (the CPU's)
+   Slice WHERE Copies: 1
+(10 rows)
+
+-- (a REPEATABLE READ snapshot across another session's changes:
+-- test/isolation/slices_pushdown.spec)
+-- ---------- 6. GROUP BY ----------
+-- A group at a time: each group's set ANDed into the WHERE's copy, and that
+-- copy counted against the slices and descended as the one row is - a group
+-- of one column, its values walked; of two, its pairs; of an IN list's
+-- values.  Or a batch of groups at a time (one column's walk): the slices
+-- read once a batch, each row's value read off them and added to its
+-- group's.  The price decides between the two; here each is asked for in
+-- turn, and every answer checked against the ordinary plan's.
+CREATE FUNCTION slp_groups(route text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	q text;
+BEGIN
+	IF route = 'one at a time' THEN
+		PERFORM set_config('pg_lion.enable_slice_decode', 'off', false);
+	ELSE
+		PERFORM set_config('pg_lion.slice_gather_cost', '0', false);
+		PERFORM set_config('pg_lion.slice_decode_bit_cost', '0', false);
+		PERFORM set_config('pg_lion.slice_decode_row_cost', '0', false);
+	END IF;
+	FOREACH q IN ARRAY ARRAY[
+		'SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g',
+		'SELECT g, count(a), sum(a), avg(a), avg(c), min(d), max(tz) FROM slp GROUP BY g',
+		'SELECT h, sum(c), min(c), max(c), max(d), count(*) FROM slp WHERE tags && ''{1, 6}'' GROUP BY h',
+		'SELECT g, sum(b), max(b) FROM slp WHERE g IN (1, 2, 99) GROUP BY g',
+		'SELECT g, sum(b), max(b) FROM slp WHERE r < 300 GROUP BY g',
+		'SELECT g, count(b), sum(b), min(b), count(*) FROM slp WHERE b IS NULL GROUP BY g',
+		'SELECT g, count(c), sum(c), max(c) FROM slp WHERE c IS NULL OR h = 3 GROUP BY g',
+		'SELECT r, sum(b), min(b), max(b), count(*) FROM slp GROUP BY r',
+		'SELECT r, max(ts), min(t) FROM slp WHERE g = 3 GROUP BY r',
+		'SELECT b, sum(c), count(*) FROM slp WHERE g = 3 GROUP BY b',
+		'SELECT g, sum(b) FROM slp GROUP BY g HAVING max(b) > 99990',
+		'SELECT g, sum(b) FROM slp GROUP BY g HAVING sum(b) > 0 AND count(*) > 2000',
+		'SELECT g, h, sum(b), max(d), count(*) FROM slp GROUP BY g, h',
+		'SELECT g, h, min(c), avg(b) FROM slp WHERE r BETWEEN 100 AND 600 GROUP BY g, h']
+	LOOP
+		RETURN NEXT slp_q(q);
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_slice_decode', 'on', false);
+	PERFORM set_config('pg_lion.slice_gather_cost', '12', false);
+	PERFORM set_config('pg_lion.slice_decode_bit_cost', '0.3', false);
+	PERFORM set_config('pg_lion.slice_decode_row_cost', '1', false);
+END $$;
+SELECT * FROM slp_groups('one at a time');
+       slp_groups       
+------------------------
+ from slices, 5 rows
+ from slices, 10 rows
+ from slices, 4 rows
+ from slices, 2 rows
+ from slices, 10 rows
+ from slices, 10 rows
+ from slices, 10 rows
+ from slices, 980 rows
+ from slices, 103 rows
+ from slices, 2845 rows
+ from slices, 2 rows
+ from slices, 6 rows
+ from slices, 21 rows
+ from slices, 20 rows
+(14 rows)
+
+SELECT * FROM slp_groups('decoded');
+           slp_groups            
+---------------------------------
+ from slices, decoded, 5 rows
+ from slices, decoded, 10 rows
+ from slices, decoded, 4 rows
+ from slices, 2 rows
+ from slices, decoded, 10 rows
+ from slices, decoded, 10 rows
+ from slices, decoded, 10 rows
+ from slices, decoded, 980 rows
+ from slices, decoded, 103 rows
+ from slices, decoded, 2845 rows
+ from slices, decoded, 2 rows
+ from slices, decoded, 6 rows
+ from slices, 21 rows
+ from slices, 20 rows
+(14 rows)
+
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g), slp_h (h = 1)
+   Group Key: g
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slice Groups: decoded by batch
+(5 rows)
+
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g', true);
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g), slp_h (h = 1)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slice Groups: decoded by batch
+   Slices Located: 33
+   Slice WHERE Copies: 0
+   Slice Batches Decoded: 1
+   Slice Keys Decoded: 13
+   Slice Rows Decoded: 6823
+(9 rows)
+
+SET pg_lion.enable_slice_decode = off;
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g');
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g), slp_h (h = 1)
+   Group Key: g
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slice Groups: one at a time
+(5 rows)
+
+SELECT * FROM slp_plan('SELECT g, sum(b), min(b), max(b), count(*) FROM slp WHERE h = 1 GROUP BY g', true);
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g), slp_h (h = 1)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slice Groups: one at a time
+   Slices Located: 486
+   Slice Counts: 485
+   Slice Containers Counted: 2145
+   Slice Containers by Kernel: 2145
+   Slice Kernel Keys: 65
+   Slice Kernel: (the CPU's)
+   Slice Descent Steps: 320
+   Slice Candidate Sets: 51
+   Slice WHERE Copies: 6
+(13 rows)
+
+RESET pg_lion.enable_slice_decode;
+-- two columns: the pairs, a group at a time
+SELECT * FROM slp_plan('SELECT g, h, sum(b), max(d) FROM slp GROUP BY g, h');
+                                             slp_plan                                              
+---------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_h (h), slp_g (g)
+   Group Key: h, g
+   Aggregates From Slices: slp_v (b: every bit counted), slp_v (d: existence counted, max descent)
+   Slice Groups: one at a time
+(5 rows)
+
+-- many groups: a thousand values of r, a few rows each, in batches
+SELECT * FROM slp_plan('SELECT r, sum(b), min(b), max(b), count(*) FROM slp GROUP BY r', true);
+                                     slp_plan                                     
+----------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_r (r)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent, max descent)
+   Slice Groups: decoded by batch
+   Slices Located: 132
+   Slice WHERE Copies: 0
+   Slice Batches Decoded: 4
+   Slice Keys Decoded: 52
+   Slice Rows Decoded: 27856
+(9 rows)
+
+-- the group with NULL, the extremes' group, a group the WHERE empties
+SELECT g, sum(c), min(c), max(c), min(a), max(a), max(d) FROM slp WHERE h IN (1, 2) GROUP BY g ORDER BY g;
+ g |      sum       |         min          |         max         |  min   |  max  |    max     
+---+----------------+----------------------+---------------------+--------+-------+------------
+ 0 | -2381685415728 |          -9989999970 |          9990059970 |  -1000 |  1000 | 2027-05-09
+ 1 | -2410700442774 |          -9998999997 |          9981059943 |  -1000 |  1000 | 2027-05-06
+ 2 | -2399665469668 |          -9997999994 |          9982059946 |  -1000 |   999 | 2027-05-13
+ 3 | -2378680406714 | -9223372036854775808 | 9223372036854775807 | -32768 | 32767 | infinity
+ 4 | -2387645433608 |          -9985999958 |          9994059982 |  -1000 |  1000 | 2027-05-17
+ 5 | -2396660460653 |          -9994999985 |          9985059955 |  -1000 |   999 | 2027-05-14
+ 6 | -2395671487686 |          -9993999982 |          9986059958 |  -1000 |   999 | 2027-04-11
+ 7 | -1899712339674 |          -9982999949 |          9997059991 |   -998 |   999 | 2027-04-28
+ 8 | -2383705361789 |          -9981999946 |          9998059994 |   -999 |  1000 | 2027-05-05
+ 9 | -2392689478740 |          -9990999973 |          9989059967 |  -1000 |  1000 | 2027-05-02
+(10 rows)
+
+-- HAVING, and ordered above the node
+SELECT * FROM slp_plan('SELECT g, sum(b) FROM slp GROUP BY g HAVING max(b) > 99990');
+                              slp_plan                               
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Filter: ((max(b)) > 99990)
+   Lion Indexes: slp_g (g)
+   Group Key: g
+   Aggregates From Slices: slp_v (b: every bit counted, max descent)
+   Slice Groups: decoded by batch
+(6 rows)
+
+SELECT g, sum(b), max(b) FROM slp GROUP BY g ORDER BY sum(b) DESC LIMIT 3;
+ g |  sum   |  max  
+---+--------+-------
+ 6 | 701141 | 99992
+ 2 | 382738 | 99983
+ 7 | 369908 | 99979
+(3 rows)
+
+-- with the kernel off, the same
+SET pg_lion.enable_slice_kernel = off;
+SELECT slp_q('SELECT g, h, sum(b), max(d), count(*) FROM slp GROUP BY g, h');
+        slp_q         
+----------------------
+ from slices, 21 rows
+(1 row)
+
+RESET pg_lion.enable_slice_kernel;
+-- a generic plan's parameter
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+PREPARE slp_p4(int) AS SELECT g, sum(b), min(b), count(*) FROM slp WHERE h = $1 GROUP BY g ORDER BY g;
+EXPLAIN (COSTS OFF) EXECUTE slp_p4(2);
+                                QUERY PLAN                                 
+---------------------------------------------------------------------------
+ Sort
+   Sort Key: g
+   ->  Custom Scan (LionCount)
+         Lion Indexes: slp_g (g), slp_h (h = $1)
+         Group Key: g
+         Aggregates From Slices: slp_v (b: every bit counted, min descent)
+         Slice Groups: decoded by batch
+(7 rows)
+
+EXECUTE slp_p4(2);
+ g |    sum     |    min     | count 
+---+------------+------------+-------
+ 0 |    -114232 |     -99828 |  1500
+ 2 |    -232634 |     -99846 |  1500
+ 3 | 2147483647 | 2147483647 |     1
+ 4 |    -455033 |     -99864 |  1500
+ 6 |      26568 |     -99792 |  1500
+ 8 |    -195831 |     -99810 |  1500
+(6 rows)
+
+RESET plan_cache_mode;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+SELECT g, sum(b), min(b), count(*) FROM slp WHERE h = 2 GROUP BY g ORDER BY g;
+ g |    sum     |    min     | count 
+---+------------+------------+-------
+ 0 |    -114232 |     -99828 |  1500
+ 2 |    -232634 |     -99846 |  1500
+ 3 | 2147483647 | 2147483647 |     1
+ 4 |    -455033 |     -99864 |  1500
+ 6 |      26568 |     -99792 |  1500
+ 8 |    -195831 |     -99810 |  1500
+(6 rows)
+
+DEALLOCATE ALL;
+-- the heap the map does not vouch for, and this transaction's rows
+BEGIN;
+UPDATE slp SET b = b + 1, c = NULL WHERE id % 11 = 0;
+DELETE FROM slp WHERE id % 23 = 5;
+INSERT INTO slp (id, g, h, r, b, c) VALUES
+	(40003, 5, 1, 3, 2147483647, -9223372036854775808),
+	(40004, NULL, 1, 4, -7, NULL);
+SELECT * FROM slp_groups('one at a time');
+       slp_groups       
+------------------------
+ from slices, 6 rows
+ from slices, 11 rows
+ from slices, 4 rows
+ from slices, 2 rows
+ from slices, 11 rows
+ from slices, 10 rows
+ from slices, 11 rows
+ from slices, 980 rows
+ from slices, 103 rows
+ from slices, 2722 rows
+ from slices, 2 rows
+ from slices, 5 rows
+ from slices, 22 rows
+ from slices, 20 rows
+(14 rows)
+
+SELECT * FROM slp_groups('decoded');
+           slp_groups            
+---------------------------------
+ from slices, decoded, 6 rows
+ from slices, decoded, 11 rows
+ from slices, decoded, 4 rows
+ from slices, 2 rows
+ from slices, decoded, 11 rows
+ from slices, decoded, 10 rows
+ from slices, decoded, 11 rows
+ from slices, decoded, 980 rows
+ from slices, decoded, 103 rows
+ from slices, decoded, 2722 rows
+ from slices, decoded, 2 rows
+ from slices, decoded, 5 rows
+ from slices, 22 rows
+ from slices, 20 rows
+(14 rows)
+
+ROLLBACK;
+-- declined: a filtered count beside a GROUP BY, three columns, a grouping
+-- by an expression
+SELECT slp_q('SELECT g, sum(b), count(*) FILTER (WHERE h = 1) FROM slp GROUP BY g');
+        slp_q         
+----------------------
+ no pushdown, 10 rows
+(1 row)
+
+SELECT slp_q('SELECT g, h, r, sum(b) FROM slp WHERE r < 5 GROUP BY g, h, r');
+        slp_q        
+---------------------
+ no pushdown, 5 rows
+(1 row)
+
+SELECT slp_q('SELECT g % 2, sum(b) FROM slp GROUP BY g % 2');
+        slp_q        
+---------------------
+ no pushdown, 2 rows
+(1 row)
+
+DROP FUNCTION slp_groups(text);
+-- ---------- 7. the index's pages ----------
+-- A scan of a sliced index's keys reads none of its slices, and the planner
+-- prices it by the index's pages less the slices', estimated from their
+-- entries' headers: as it prices the same index without slices, about.
+-- (Counting the slices' pages, the range's scan here was priced 1.4 times
+-- the unsliced index's, and the AND's 1.3.)
+REINDEX INDEX slp_v;
+CREATE INDEX slp_v2 ON slp USING lion (a, b, c, d, t, ts, tz);
+VACUUM ANALYZE slp;
+-- The price of the bitmap index scan alone, of q with no other scan:
+CREATE FUNCTION slp_cost(q text) RETURNS numeric LANGUAGE plpgsql AS $$
+DECLARE j json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
+	RETURN (j -> 0 -> 'Plan' -> 'Plans' -> 0 ->> 'Total Cost')::numeric;
+END $$;
+SET enable_seqscan = off;
+SET enable_indexscan = off;
+SET pg_lion.enable_count_pushdown = off;
+BEGIN;
+DROP INDEX slp_v2;
+SELECT slp_cost('SELECT id FROM slp WHERE b = 15827') AS sliced_eq,
+	   slp_cost('SELECT id FROM slp WHERE c > 0') AS sliced_range,
+	   slp_cost('SELECT id FROM slp WHERE a IN (1, 2, 3) AND d > ''2000-01-01''') AS sliced_and \gset
+ROLLBACK;
+BEGIN;
+DROP INDEX slp_v;
+SELECT slp_cost('SELECT id FROM slp WHERE b = 15827') AS plain_eq,
+	   slp_cost('SELECT id FROM slp WHERE c > 0') AS plain_range,
+	   slp_cost('SELECT id FROM slp WHERE a IN (1, 2, 3) AND d > ''2000-01-01''') AS plain_and \gset
+ROLLBACK;
+SELECT round(:sliced_eq / :plain_eq, 1) AS eq, round(:sliced_range / :plain_range, 1) AS range,
+	   round(:sliced_and / :plain_and, 1) AS "and";
+ eq  | range | and 
+-----+-------+-----
+ 1.0 |   1.0 | 1.0
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_indexscan;
+RESET pg_lion.enable_count_pushdown;
+DROP INDEX slp_v2;
+DROP FUNCTION slp_cost(text);
+-- ---------- 8. declined ----------
+-- a column that is not sliced, and a float column, which no slice takes
+SELECT slp_q('SELECT sum(r), max(r) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(f), max(f) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- an aggregate of an expression of the column, DISTINCT, FILTER, ORDER BY
+SELECT slp_q('SELECT sum(b / 2) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(DISTINCT b) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT sum(b) FILTER (WHERE h = 1) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT min(b ORDER BY b) FROM slp WHERE g = 3');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- a residual clause no posting set answers
+SELECT slp_q('SELECT sum(b) FROM slp WHERE g = 3 AND pad LIKE ''l%''');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- a join
+CREATE TABLE slp_dim (g int PRIMARY KEY, name text);
+INSERT INTO slp_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
+ANALYZE slp_dim;
+SELECT slp_q('SELECT sum(s.b), max(s.b) FROM slp s JOIN slp_dim d ON d.g = s.g WHERE d.name = ''g3''');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- a partitioned table
+CREATE TABLE slp_part (k int, v int4) PARTITION BY RANGE (k);
+CREATE TABLE slp_part1 PARTITION OF slp_part FOR VALUES FROM (0) TO (50);
+CREATE TABLE slp_part2 PARTITION OF slp_part FOR VALUES FROM (50) TO (100);
+INSERT INTO slp_part SELECT i % 100, i FROM generate_series(1, 2000) i;
+CREATE INDEX ON slp_part USING lion (k);
+CREATE INDEX ON slp_part USING lion (v) WITH (slices = on);
+VACUUM ANALYZE slp_part;
+SELECT slp_q('SELECT sum(v), max(v) FROM slp_part WHERE k = 7');
+        slp_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT slp_q('SELECT count(*) FROM slp_part WHERE k = 7');
+        slp_q        
+---------------------
+ counts only, 1 rows
+(1 row)
+
+-- EXECUTE on what the node replaces (DESIGN.md §9, "Privileges"): an
+-- aggregate revoked is refused as the ordinary plan refuses it
+CREATE ROLE regress_slp_user;
+GRANT SELECT ON slp TO regress_slp_user;
+REVOKE EXECUTE ON FUNCTION max(int4) FROM PUBLIC;
+SET ROLE regress_slp_user;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) SELECT sum(b), min(b) FROM slp WHERE g = 3;
+                             QUERY PLAN                              
+---------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: slp_g (g = 3)
+   Aggregates From Slices: slp_v (b: every bit counted, min descent)
+(3 rows)
+
+SELECT sum(b), min(b) FROM slp WHERE g = 3;
+  sum   |     min     
+--------+-------------
+ -18608 | -2147483648
+(1 row)
+
+SELECT sum(b), max(b) FROM slp WHERE g = 3;
+ERROR:  permission denied for aggregate max
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+RESET ROLE;
+GRANT EXECUTE ON FUNCTION max(int4) TO PUBLIC;
+REVOKE SELECT ON slp FROM regress_slp_user;
+DROP ROLE regress_slp_user;
+DROP TABLE slp, slp_dim, slp_part;
+DROP FUNCTION slp_lim();
+DROP FUNCTION slp_plan(text, bool);
+DROP FUNCTION slp_q(text);

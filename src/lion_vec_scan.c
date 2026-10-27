@@ -4074,6 +4074,7 @@ lv_start(IndexScanDesc scan, LvScanOpaque *so)
 	so->q.dimsp = so->info->dimsp;
 	so->q.qc = palloc(sizeof(float) * so->info->dimsp);
 	so->q.planes = palloc0(sizeof(uint64) * (so->info->dimsp / 64) * LIONVEC_QBITS);
+	so->q.qw = palloc(sizeof(int16) * so->info->dimsp);
 	lionvec_query_init(&so->q, so->metric, so->info->mean, x, lionvec_epsilon);
 	lv_start_toast(scan, so);
 

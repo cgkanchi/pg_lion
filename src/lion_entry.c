@@ -274,6 +274,44 @@ lion_make_reserved_entry(AttrNumber attno, uint16 reservedflag, uint16 flags,
 }
 
 /*
+ * Build a SLICE entry tuple (DESIGN.md §51): the key is the one byte pos - a
+ * bit position, or LION_SLICE_EXISTS - and the payload an ordinary INLINE
+ * payload, so that once the entry exists the insert, VACUUM and count paths
+ * treat it as any other.  No layout flag: the key is a byte, not a value of
+ * the column, and a sliced column's key type is passed by value anyway.
+ */
+LionEntryTuple *
+lion_make_slice_entry(AttrNumber attno, int pos, uint16 flags,
+					  const char *payload, Size payloadlen, Size *size)
+{
+	LionEntryTuple *entry;
+	Size		payoff;
+	Size		total;
+
+	Assert(attno >= 1);
+	Assert(pos >= 0 && pos <= LION_SLICE_EXISTS);
+
+	flags |= LION_ENTRY_SLICE;
+	payoff = lion_entry_payoff_for(flags, LION_SLICE_KEYLEN);
+	total = payoff + payloadlen;
+	if (total > LION_MAX_ENTRY_SIZE)
+		lion_entry_too_large(total);
+
+	entry = (LionEntryTuple *) palloc0(total);
+	lion_entry_init(entry, flags, (uint16) attno, LION_SLICE_KEYLEN);
+	*(uint8 *) LionEntryGetKey(entry) = (uint8) pos;
+
+	if (payloadlen > 0)
+	{
+		Assert(payload != NULL);
+		memcpy(((char *) entry) + payoff, payload, payloadlen);
+	}
+
+	*size = total;
+	return entry;
+}
+
+/*
  * A private copy of entry - an INLINE one, usually on a page - in the shape
  * of a CHAIN entry: the CHAIN header form (lion_entryfmt.h), the same key,
  * kind and positions extension (with no inline positions), no payload, and
@@ -588,6 +626,22 @@ lion_find_reserved_entry(Relation index, LionState *state, int lockmode,
 	lion_search_key_init(state, &sk, lion_reserved_kind(reservedflag),
 						 (Datum) 0, LION_NULLKEY_HASH);
 
+	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
+						 buf, offnum, NULL);
+}
+
+/*
+ * The SLICE entry of column state at pos (DESIGN.md §51): one per position,
+ * found as a reserved entry is (lion_cmp_prefix() compares the position).
+ */
+bool
+lion_find_slice_entry(Relation index, LionState *state, int lockmode, int pos,
+					  Buffer *buf, OffsetNumber *offnum)
+{
+	LionSearchKey sk;
+	uint8		posbyte;
+
+	lion_search_key_slice(state, &sk, pos, &posbyte);
 	return lion_dir_find(index, NULL, state->ix, &sk, lockmode, false,
 						 buf, offnum, NULL);
 }

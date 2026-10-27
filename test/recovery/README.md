@@ -108,14 +108,21 @@ directions.
 The fixture is a table with one column per operator class kind — `int4`,
 `text`, `citext`, `bool`, a nullable `int4`, `int4[]` (with `NULL`, `'{}'`,
 empty arrays with dimensions and all-`NULL`-element rows) and `tsvector` (with
-`NULL` and empty rows) — so every reserved entry is populated. Three of the seven lion indexes
+`NULL` and empty rows) — so every reserved entry is populated. Four of the ten lion indexes
 are created on the empty table and filled by `aminsert`, so their entries go
 through INLINE→CHAIN spills, sparse-segment promotions and container-page
-splits under WAL; four are built by `ambuild` after the load.
-`inline_limit = 64` on three of them makes spills and splits frequent rather
+splits under WAL; six are built by `ambuild` after the load, among them a
+multicolumn one (DESIGN.md §24) and one with summaries (§32).
+`inline_limit = 64` on five of them makes spills and splits frequent rather
 than rare, and the 3000 distinct values of `t` over ~800 heap pages give about
 one member per container key, which is what puts sparse segments in an index at
-all.
+all. One of the four filled by `aminsert`, `lion_rec_slc`, keeps bit slices
+(DESIGN.md §51) of an `int8`, a nullable `int4` and an `int4` expression that
+is negative one row in 97: every row the writer inserts goes into a few dozen
+slices, the dense ones' in-place adds several to a record and the rare bits'
+INLINE slices beside them (§51, "Insert cost, revisited"), which every crash
+round replays and the standby replays under `wal_consistency_checking` in
+rmgr mode.
 
 **Phase 1, crash recovery under load.** Eight rounds of: ~2 s of mixed writes
 (pgbench, 4 clients, `synchronous_commit = on`, ~430 transactions/s), then kill
@@ -143,8 +150,12 @@ finish a half-applied two-pass bulkdelete. After every restart:
   shut down and must print `redo starts at`, and `pg_waldump -r Generic` over
   the replayed range must have found generic records. A round that replayed
   nothing fails the run instead of passing silently.
-* `lion_index_verify(idx, true)` on all seven indexes — structure plus
-  every heap tuple present under every key it extracts to.
+* `lion_index_verify(idx, true)` on every index — structure plus
+  every heap tuple present under every key it extracts to, and in every
+  slice of its value's bits.
+* `count`, `sum`, `min` and `max` of each sliced column from its slices
+  (`lion_index_slice_agg()`) against a sequential scan - on a standby too,
+  where the function's descent collects nothing (DESIGN.md §51.10).
 * every single-key probe counted four ways — forced index path, forced
   sequential scan with no index path at all, `lion_index_count()`, and the
   count pushdown — must give the same number. 19 probes, including absent

@@ -1,0 +1,121 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_slices s2_begin s2_write s2_slices s1_slices s3_slices s2_commit s1_slices s3_slices s1_commit s1_slices
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO ssnap VALUES
+					(1001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(1003, 0, NULL, NULL, NULL);
+				  UPDATE ssnap SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM ssnap WHERE id % 7 = 3;
+step s2_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s2_commit: COMMIT;
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+
+
+starting permutation: s2_begin s2_write s2_slices s3_slices s2_rollback s3_slices
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO ssnap VALUES
+					(1001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(1003, 0, NULL, NULL, NULL);
+				  UPDATE ssnap SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM ssnap WHERE id % 7 = 3;
+step s2_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s2_rollback: ROLLBACK;
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+
+starting permutation: s1_begin s1_slices s2_begin s2_write s2_commit s3_vacuum s1_slices s3_slices s1_commit s3_vacuum s3_slices
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO ssnap VALUES
+					(1001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1002, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(1003, 0, NULL, NULL, NULL);
+				  UPDATE ssnap SET a = -a, b = b * 2, grp = 1 WHERE id % 10 = 0;
+				  DELETE FROM ssnap WHERE id % 7 = 3;
+step s2_commit: COMMIT;
+step s3_vacuum: VACUUM ssnap;
+step s1_slices: SELECT * FROM ssnap_both();
+same|lion                                                      
+----+----------------------------------------------------------
+t   |200 -6700 -485 425 | 600 -59699459100 -398999997 200001800
+(1 row)
+
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_vacuum: VACUUM ssnap;
+step s3_slices: SELECT * FROM ssnap_both();
+same|lion                                                                                        
+----+--------------------------------------------------------------------------------------------
+t   |207 -4803 -2147483648 2147483647 | 516 -55852489560 -9223372036854775808 9223372036854775807
+(1 row)
+

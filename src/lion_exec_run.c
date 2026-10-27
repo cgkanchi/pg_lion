@@ -509,7 +509,17 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 	{
 		/* Without a group index a clause has to drive the count. */
 		st->done = true;
-		count = lion_count_relation(st);
+
+		/*
+		 * ... and the aggregates of sliced columns from their slices
+		 * (DESIGN.md §52), beside the counts or without any
+		 */
+		if (st->slice == NULL || st->slice->needcount)
+			count = lion_count_relation(st);
+		else
+			count = 0;
+		if (st->slice != NULL)
+			lion_slice_run(st);
 
 		/*
 		 * A plain aggregate always produces its one row; a GROUP BY whose
@@ -538,6 +548,8 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 			lion_st_dist(st)->count = 0;
 			lion_st_dist(st)->colcount = 0;
 		}
+		if (st->slice != NULL)
+			lion_slice_none(st);
 		Assert((st->mode == LION_MODE_SUM || st->mode == LION_MODE_DISTINCT) ==
 			   (lion_plan_flag(st, LION_FLAG_SUMALL) ||
 				(st->plan.distattno != 0 && st->plan.groupattno == 0)));
@@ -564,11 +576,18 @@ lion_exec_custom_scan_internal(CustomScanState *node)
 				 * (DESIGN.md §37), beside the counts or without any.
 				 */
 				bool		hasagg = (st->wagg != NULL && st->wagg->nagg > 0);
-				int64		total = (!hasagg || st->wagg->needcount) ?
+				bool		hasslice = (st->slice != NULL);
+				int64		total = ((!hasagg && !hasslice) ||
+									 (hasagg && st->wagg->needcount) ||
+									 (hasslice && st->slice->needcount)) ?
 					lion_sumall_relation(st) : 0;
 
 				if (hasagg)
 					lion_wagg_run(st);
+
+				/* ... and of sliced columns, from their slices (§52) */
+				if (hasslice)
+					lion_slice_run(st);
 				st->done = true;
 
 				/*
@@ -1164,6 +1183,10 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 		sums->rangeeval[i] += st->rangeeval[i];
 	sums->summaries += st->summaries;
 	sums->rangeprobed += st->rangeprobed;
+	sums->sliceranges.descents += st->sliceranges.descents;
+	sums->sliceranges.keys += st->sliceranges.keys;
+	sums->sliceranges.steps += st->sliceranges.steps;
+	sums->sliceranges.spilled += st->sliceranges.spilled;
 	sums->wherecollected += st->wherecollected;
 	sums->wherespilled += st->wherespilled;
 	sums->groupbatches += st->groupbatches;

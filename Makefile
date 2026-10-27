@@ -8,8 +8,8 @@ PAGES_OBJS = src/lion_pages.o src/lion_meta.o src/lion_state.o src/lion_entry.o 
 # The count engine: its interface is src/lion_count.h, and its files share the
 # private header src/lion_count_int.h.
 COUNT_OBJS = src/lion_set.o src/lion_set_copy.o src/lion_cursor.o src/lion_expr.o src/lion_vis.o \
-       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_count_shared.o \
-       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o src/lion_facets.o
+       src/lion_count.o src/lion_count_groups.o src/lion_count_decode.o src/lion_slice_decode.o src/lion_count_shared.o \
+       src/lion_rangesrc.o src/lion_range.o src/lion_count_sql.o src/lion_facets.o src/lion_slice.o
 # The LionCount custom scan: its planner half (lion_plan_*) and its executor
 # half (lion_exec_*), which share the private header src/lion_customscan.h.
 CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_target.o \
@@ -19,13 +19,13 @@ CUSTOMSCAN_OBJS = src/lion_plan_match.o src/lion_plan_partition.o src/lion_plan_
        src/lion_plan_private.o src/lion_plan_partial.o src/lion_plan_nonempty.o \
        src/lion_plan_cells.o src/lion_plan_anti.o src/lion_ordjoin.o \
        src/lion_exec_begin.o src/lion_exec_locate.o src/lion_exec_count.o \
-       src/lion_exec_cells.o \
+       src/lion_exec_cells.o src/lion_exec_slice.o \
        src/lion_exec_fkjoin.o src/lion_exec_anti.o src/lion_exec_run.o src/lion_exec_explain.o \
        src/lion_probejoin.o
 # The SQL-callable helpers: lion_funcs.c and lion_index_verify()'s files, which
 # share the private header src/lion_funcs.h.
 FUNCS_OBJS = src/lion_funcs.o src/lion_verify.o src/lion_verify_dir.o src/lion_verify_heap.o \
-       src/lion_verify_summary.o
+       src/lion_verify_summary.o src/lion_verify_slice.o
 # lionvec, the nearest-neighbour index of pgvector's `vector` and `halfvec`
 # (DESIGN.md §44): the AM, its scan, and its arithmetic, which is unit-tested
 # standalone.
@@ -34,7 +34,10 @@ VEC_OBJS = src/lion_vec.o src/lion_vec_scan.o src/lion_vec_loc.o src/lion_vec_ma
 # over them from 17 on, asks of the kernel before (DESIGN.md §44.4, "Read
 # streams"); the ring's bookkeeping is unit-tested standalone.
 READAHEAD_OBJS = src/lion_readahead.o src/lion_readahead_ring.o
-OBJS = src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_dir_delete.o src/lion_posting.o src/lion_posting_delete.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
+# Bit-plane arithmetic and the extension's one choice of SIMD implementation
+# (DESIGN.md §50), below the container library and lionvec; unit-tested
+# standalone.
+OBJS = src/lion_planes.o src/lion_container.o src/lion_sparse.o src/lion_positions.o src/lion_wal.o src/lion_waldelta.o $(PAGES_OBJS) src/lion_dir.o src/lion_dir_delete.o src/lion_posting.o src/lion_posting_delete.o src/lion_postree.o src/lion_posbuild.o src/lion_posfilter.o src/lion_bm25.o src/lion_bm25_scan.o src/lion_reader.o \
        src/lion_am.o src/lion_amcost.o src/lion_build.o src/lion_spool.o src/lion_scan.o \
        src/lion_insert.o src/lion_vacuum.o $(FUNCS_OBJS) $(COUNT_OBJS) $(CUSTOMSCAN_OBJS) \
        src/lion_multikey.o src/lion_jsonb.o src/lion_fkjoin.o src/lion_ordered.o src/lion_selfuncs.o \
@@ -56,9 +59,11 @@ PG_CFLAGS = -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers 
 ifeq ($(WERROR),1)
 PG_CFLAGS += -Werror
 endif
-# `make LION_NO_SIMD=1` leaves out the container library's AVX2 and POPCNT
-# kernels, which x86-64 GCC and clang builds pick between at run time
-# (DESIGN.md §3, "Whole-bitset kernels"), and runs the portable one
+# `make LION_NO_SIMD=1` leaves out the x86-64 kernels - the container
+# library's AVX2 and POPCNT ones, lion_planes.c's AVX-512, AVX2 and POPCNT
+# ones (lionvec's plane 1 among them) and lionvec's AVX2 and F16C ones -
+# which x86-64 GCC and clang builds pick between at run time (DESIGN.md §3,
+# "Whole-bitset kernels"; §44.3, "Kernels"; §50), and runs the portable ones
 # everywhere.  The unit tests always build a copy that way too.
 ifeq ($(LION_NO_SIMD),1)
 PG_CFLAGS += -DLION_NO_SIMD
@@ -73,7 +78,9 @@ src/lion_vec_math.o: override CFLAGS += $(VEC_MATH_CFLAGS)
 src/lion_vec_math.bc: override BITCODE_CFLAGS += $(VEC_MATH_CFLAGS)
 EXTRA_CLEAN = test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
               test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-              test/unit/readahead_test test/results test/isolation/results
+              test/unit/readahead_test test/unit/arena_test \
+              test/unit/planes_test test/unit/planes_test_nosimd test/unit/planes_bench test/unit/vecplanes_eval \
+              test/results test/isolation/results
 # Every object and dependency file in src, not only those OBJS names now, so
 # that a source removed or renamed leaves no object behind.
 EXTRA_CLEAN += src/*.o src/*.d src/*.bc
@@ -133,12 +140,17 @@ UNIT_CFLAGS += -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-
 UNIT_LDFLAGS += -fsanitize=address,undefined
 test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
     test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
-    test/unit/readahead_test test/unit/arena_test: .lion-force-unit
+    test/unit/readahead_test test/unit/arena_test \
+    test/unit/planes_test test/unit/planes_test_nosimd: .lion-force-unit
 .PHONY: .lion-force-unit
 endif
 
-test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
+# The container library picks its whole-bitset kernels by the extension's
+# one choice of SIMD implementation, which lion_planes.c holds, so every test
+# that links the library links that too.
+test/unit/container_test: test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+                          src/lion_container.h src/lion_planes.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c src/lion_planes.c $(UNIT_LDFLAGS)
 
 # The same tests with -DLION_NO_SIMD: the build without the x86-64 kernels,
 # which must refuse to force them and run the portable one.  On an x86-64
@@ -147,15 +159,19 @@ test/unit/container_test: test/unit/container_test.c src/lion_container.c src/li
 # pg_popcount() - which container_test covers when it forces the portable
 # kernel.
 UNIT_NOSIMD_CFLAGS = -DLION_NO_SIMD $(if $(filter x86_64 amd64,$(shell uname -m)),-mpopcnt)
-test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c $(UNIT_LDFLAGS)
+test/unit/container_test_nosimd: test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+                                 src/lion_container.h src/lion_planes.h src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/container_test.c src/lion_container.c src/lion_planes.c \
+		$(UNIT_LDFLAGS)
 
-test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c \
-                       src/lion_sparse.h src/lion_positions.h src/lion_container.h src/lion_tid.h
-	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c $(UNIT_LDFLAGS)
+test/unit/sparse_test: test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c src/lion_planes.c \
+                       src/lion_sparse.h src/lion_positions.h src/lion_container.h src/lion_planes.h \
+                       src/lion_tid.h
+	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/sparse_test.c src/lion_sparse.c src/lion_container.c src/lion_planes.c \
+		$(UNIT_LDFLAGS)
 
 test/unit/positions_test: test/unit/positions_test.c src/lion_positions.c \
-                          src/lion_positions.h src/lion_container.h src/lion_tid.h
+                          src/lion_positions.h src/lion_container.h src/lion_planes.h src/lion_tid.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/positions_test.c src/lion_positions.c $(UNIT_LDFLAGS)
 
 # The WAL's item encoding (DESIGN.md §25, LION_OP_DELTA and LION_OP_SPLICE):
@@ -168,12 +184,49 @@ test/unit/entry_test: test/unit/entry_test.c src/lion_entryfmt.h
 
 # lionvec's arithmetic (DESIGN.md §44.3 - §44.4): the rotation, the codes, the
 # kernels and how often the estimates' bounds hold; and the same without the
-# x86-64 kernels, as container_test_nosimd is built.
-test/unit/vec_test: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
-	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+# x86-64 kernels, as container_test_nosimd is built.  Its plane-1 kernel and
+# its choice of kernels are lion_planes.c's, linked with it.
+VEC_TEST_SRCS = test/unit/vec_test.c src/lion_vec_math.c src/lion_planes.c
+VEC_TEST_DEPS = $(VEC_TEST_SRCS) src/lion_vec_math.h src/lion_planes.h
+test/unit/vec_test: $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ $(VEC_TEST_SRCS) $(UNIT_LDFLAGS)
 
-test/unit/vec_test_nosimd: test/unit/vec_test.c src/lion_vec_math.c src/lion_vec_math.h
-	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ test/unit/vec_test.c src/lion_vec_math.c $(UNIT_LDFLAGS)
+test/unit/vec_test_nosimd: $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ $(VEC_TEST_SRCS) $(UNIT_LDFLAGS)
+
+# Bit-plane arithmetic and the choice of SIMD implementation (DESIGN.md §50):
+# every implementation's popcounts per plane, in both layouts, against a
+# count a bit at a time, the transpose and the values' planes both ways; and
+# against lionvec's own plane-1 kernel and query planes, so lionvec's
+# arithmetic is linked and compiled as vec_test compiles it.  Again without
+# the x86-64 kernels.  `make planes-bench` times the kernels, built at -O2.
+PLANES_TEST_SRCS = test/unit/planes_test.c src/lion_planes.c src/lion_vec_math.c
+PLANES_TEST_DEPS = $(PLANES_TEST_SRCS) src/lion_planes.h src/lion_vec_math.h
+test/unit/planes_test: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+test/unit/planes_test_nosimd: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) $(UNIT_NOSIMD_CFLAGS) -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+test/unit/planes_bench: $(PLANES_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -O2 -DNDEBUG -o $@ $(PLANES_TEST_SRCS) $(UNIT_LDFLAGS)
+
+.PHONY: planes-bench
+planes-bench: test/unit/planes_bench
+	./test/unit/planes_bench --bench
+
+# An evaluation, not a test (DESIGN.md §44.14): whether lionvec's 8-bit codes
+# kept as bit-planes 2 to 8 would let a refine stop early - the planes a
+# refine needs on vec_test's kinds of data, and what a plane's sum costs
+# against the codes' - linked as vec_test is, built at -O2.  Not in `make
+# unit`: it takes minutes, and what it prints is measurements.
+test/unit/vecplanes_eval: test/unit/vecplanes_eval.c $(VEC_TEST_DEPS)
+	$(CC) $(UNIT_CFLAGS) $(VEC_MATH_CFLAGS) -O2 -DNDEBUG -o $@ test/unit/vecplanes_eval.c \
+		src/lion_vec_math.c src/lion_planes.c $(UNIT_LDFLAGS)
+
+.PHONY: vecplanes-eval
+vecplanes-eval: test/unit/vecplanes_eval
+	./test/unit/vecplanes_eval
 
 # The read stream ring's bookkeeping (DESIGN.md §44.4, "Read streams"),
 # against a model of core's read stream.
@@ -187,9 +240,12 @@ test/unit/arena_test: test/unit/arena_test.c src/lion_arena.c src/lion_arena.h
 	$(CC) $(UNIT_CFLAGS) -o $@ test/unit/arena_test.c src/lion_arena.c $(UNIT_LDFLAGS)
 
 .PHONY: unit
-unit: test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
+unit: test/unit/planes_test test/unit/planes_test_nosimd \
+      test/unit/container_test test/unit/container_test_nosimd test/unit/sparse_test test/unit/positions_test \
       test/unit/waldelta_test test/unit/entry_test test/unit/vec_test test/unit/vec_test_nosimd \
       test/unit/readahead_test test/unit/arena_test
+	./test/unit/planes_test
+	./test/unit/planes_test_nosimd
 	./test/unit/container_test
 	./test/unit/container_test_nosimd
 	./test/unit/sparse_test

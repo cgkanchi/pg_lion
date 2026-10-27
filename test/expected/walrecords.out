@@ -332,5 +332,63 @@ SELECT lion_index_verify('lion_wu_k', true);
  
 (1 row)
 
-DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws, lion_wu;
+/*
+ * SEVERAL SLICES TO A RECORD (DESIGN.md §51, "Insert cost, revisited").  A
+ * row of a sliced column goes into the slice of every bit its value's
+ * encoding has set: -1 has 31 of an int4's, and the existence slice makes
+ * 32.  Where the slices are posting trees (inline_limit = 64 spills them) the
+ * member goes into the last container of each in place, and the adds into
+ * slices whose entries share a directory leaf go out several posting leaves
+ * and the leaf to a record: three and the leaf in generic mode, the four
+ * blocks every record keeps to; seven and the leaf with the resource
+ * manager.  So a row's 32 slices write some eleven records, or five, not 32.
+ * Where they are INLINE entries that grow within their slack, the row's
+ * slices on one leaf are one record of that leaf alone.
+ */
+CREATE TABLE lion_wsl (id int, v int4);
+INSERT INTO lion_wsl SELECT i, -1 FROM generate_series(1, 20000) i;
+CREATE INDEX lion_wsl_v ON lion_wsl USING lion (v) WITH (slices = on, inline_limit = 64);
+CREATE INDEX lion_wsl_w ON lion_wsl USING lion (v) WITH (slices = on);
+SELECT pg_current_wal_lsn() AS lsn12 \gset
+INSERT INTO lion_wsl SELECT i, -1 FROM generate_series(20001, 20200) i;
+SELECT pg_switch_wal() IS NOT NULL AS wal_switched_seven_times;
+ wal_switched_seven_times 
+--------------------------
+ t
+(1 row)
+
+SELECT pg_current_wal_lsn() AS lsn13 \gset
+WITH r AS (
+	SELECT relfilenode = pg_relation_filenode('lion_wsl_v') AS chain,
+		   start_lsn, count(*) AS nblocks
+	  FROM pg_get_wal_block_info(:'lsn12', :'lsn13', false)
+	 WHERE relfilenode IN (pg_relation_filenode('lion_wsl_v'),
+						   pg_relation_filenode('lion_wsl_w'))
+	 GROUP BY 1, 2)
+SELECT max(nblocks) FILTER (WHERE chain) AS chain_most_blocks,
+	   count(*) FILTER (WHERE chain AND nblocks = max_blocks) >= 200 * 3
+	   AS chain_full_records,
+	   count(*) FILTER (WHERE chain) <= 200 * 14 AS chain_records_per_row_at_most_14,
+	   max(nblocks) FILTER (WHERE NOT chain) AS inline_most_blocks,
+	   count(*) FILTER (WHERE NOT chain) <= 200 * 4 AS inline_records_per_row_at_most_4
+  FROM r, (SELECT CASE lion_index_wal_mode('lion_wsl_v') WHEN 'rmgr' THEN 8 ELSE 4 END
+		   AS max_blocks) m;
+ chain_most_blocks | chain_full_records | chain_records_per_row_at_most_14 | inline_most_blocks | inline_records_per_row_at_most_4 
+-------------------+--------------------+----------------------------------+--------------------+----------------------------------
+                 4 | t                  | t                                |                  1 | t
+(1 row)
+
+SELECT lion_index_verify('lion_wsl_v', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+SELECT lion_index_verify('lion_wsl_w', true);
+ lion_index_verify 
+-------------------
+ 
+(1 row)
+
+DROP TABLE lion_wr, lion_wd, lion_wi, lion_wl, lion_ws, lion_wu, lion_wsl;
 DROP EXTENSION pg_walinspect;
