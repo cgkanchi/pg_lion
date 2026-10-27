@@ -508,7 +508,13 @@ deterministic and a GenericXLog delta of a later change stays small. An item tha
 over itself keeps the allocated length it already has whenever that is still enough (and not
 wastefully more), because then PageIndexTupleOverwrite() moves no other item on the page at all;
 the exception is an item that has far more room than it can use - a segment replaced by the
-container one of its container keys was promoted to - which gives the excess back.
+container one of its container keys was promoted to - which gives the excess back. *(2026-10-27:
+an INSERT's rewrite keeps the length only while it leaves the item `LION_ITEM_SLACK_MIN` bytes to
+grow into, and takes fresh slack otherwise when the page has room. A RUN whose new run used up its
+slack was rewritten at the same length, with no room, by every later member of that run - an
+extended run needs no byte but the in-place add asks for a run's four whatever it does - so a
+quarter of the inserts into a sliced column's existence slice took the general path: §51,
+"Insert cost, revisited".)*
 
 An insert whose item has room inside it adds the member there and nowhere else
 (`lion_insert_container_inplace()`, `lion_insert_segment_inplace()` in lion_insert.c): the item keeps
@@ -9710,6 +9716,9 @@ longer than a batch included.
   sorted TID tail merged into the containers on the next insert that finds it full, or by VACUUM),
   which stays inside the pinned-page protocol and keeps counts exact. Multi-key classes are the one
   place a real pending list might pay; revisit only with a measured tsvector ingestion case.
+  *(2026-10-27: bit slices (§51) are the other place, some 50 posting-set inserts a row; the
+  deferred tail is designed for them there, measured and not started - §51, "Insert cost,
+  revisited".)*
 - **FK-side join pushdown: implemented, see §27.** `GROUP BY dim.attr` over a fact table joined on
   a lion-indexed FK column. The sketch here - per dimension group, the union of the member keys'
   posting sets ANDed with the fact filters - became a count per DIMENSION ROW emitted as a partial
@@ -10465,6 +10474,17 @@ deviations from what this section assumed:
 Nothing above changes generic mode, where GenericXLogFinish() opens its own
 critical section.
 
+*(2026-10-27: a fifth call, `lion_wal_begin_ext(index, maxblocks)`, opens a
+record of more than `LION_WAL_MAX_BLOCKS` (4) buffers in rmgr mode - up to
+`LION_WAL_MAX_BLOCKS_WIDE`, 8, the bits of the header's masks - and makes room
+for them in the WAL insertion state (`XLogEnsureRecordSpace()`) before the
+critical section, since that may allocate; `lion_wal_max_blocks()` says what
+an index gets, 4 in generic mode, which is GenericXLog's own limit. Only the
+batched adds of a row's bit slices ask for it (§51, "Insert cost,
+revisited"), and their lock argument does not rest on the four: every
+posting leaf after the first is only tried. Every other record keeps to
+four.)*
+
 ### The record catalogue as implemented
 
 An rmgr record's payload is, per registered block, a packed stream of eight-byte
@@ -10483,10 +10503,15 @@ block's so that redo can read it even when every block carries a full-page
 image.
 
     record          info  buffers  payload
-    ITEM_SET        0x00  1-2      CONTAINER_ADD or SPARSE_INS on the container
+    ITEM_SET        0x00  1-8      CONTAINER_ADD or SPARSE_INS on the container
                                    page, MINMAX if a segment's range grew, and
                                    the entry tuple on the directory leaf.  The
-                                   hot-key insert record: ~64 bytes.
+                                   hot-key insert record: ~64 bytes.  A row's
+                                   bit slices (§51, "Insert cost, revisited"):
+                                   the same on up to seven container pages
+                                   (three in generic mode), then the leaf with
+                                   a SETBYTES of each CHAIN entry's counter
+                                   and a DELTA of each INLINE entry.
     ITEM_REPLACE    0x10  2        DELTA (the ranges of the item at its allotted
                                    length that differ from what the page holds)
                                    or SPLICE (the same with the bytes an insert
@@ -10566,6 +10591,11 @@ image.
 The operations are: INIT, SPECIAL (the whole 32-byte page special area), ADD,
 ADDMANY, REPLACE, DELTA, SPLICE, SETBYTES, MULTIDEL, DELETE_NC, DELETE, MINMAX,
 FLAGS, META, DELETED, CONTAINER_ADD, SPARSE_INS, NDISTINCT (§33).
+*(2026-10-27: SETBYTES, replayed by every build since this section but written
+by none, is now the counter of a CHAIN slice entry in a row's batched record -
+the byte or two of its `ntids` that changed (§51, "Insert cost, revisited"). It
+names its bytes, so nothing about masking changes, and
+`wal_consistency_checking` checks it under the recovery harness's slices.)*
 
 **DELTA is what a rewrite of one item costs now**, and it is the one operation
 whose payload is a function of the page as well as of the record. It says: the
@@ -10772,6 +10802,8 @@ written keeps its order. The records that name more than one block, in the
 order redo takes them:
 
     ITEM_SET, ITEM_REPLACE, ITEM_ADD         container page, entry leaf
+    ITEM_SET of a row's bit slices           up to seven container pages (three in generic
+                                             mode), each of another set, then the entry leaf
     ITEM_DELETE, VACUUM_PAGE (VACUUM)        container page (cleanup), entry leaf
     SPLIT of a posting leaf                  P, N (new), M (new, between them), entry leaf
     SPLIT pushing a leaf root down           root, new child, entry leaf
@@ -31647,7 +31679,11 @@ records (some 1.5 µs and 91 bytes of WAL a slice insert), 12 times with generic
 deltas are half of it; single-row INSERTs, 6 and 10 times. That is the price of a BSI. One descent
 per slice is the plain version: the slices of a column are a few leaves at most, and a row's could
 be filled with the leaf held, or a multi-row insert transposed into planes
-(`lion_planes_scatter_strided()`) and added a word a plane - §51.14.
+(`lion_planes_scatter_strided()`) and added a word a plane - §51.14. *(2026-10-27: filled with the
+leaf held - one descent a column, the in-place adds several slices to a record - and the
+existence slice's RUNs kept on the fast path: 4.6 and 2.8 times with the resource manager,
+10.9 and 10.7 with generic WAL, from 10.0, 5.9, 15.7 and 13.5 measured again on that day's
+machine; "Insert cost, revisited", below.)*
 
 ### 51.7 VACUUM
 
@@ -31935,7 +31971,8 @@ index built there in mode `rmgr`, as `make installcheck-rmgr` does.
   constant slices but make the encoding a column's state that inserts can outgrow; constant slices
   are a RUN container a container key, cheap to keep (0.21 MB at 5M rows, §51.11), and nothing in
   the format stops a later version.
-- **One descent per slice on insert** (§51.6).
+- **One descent per slice on insert** (§51.6). *(2026-10-27: one a column, and several slices to
+a record; "Insert cost, revisited".)*
 - **The cost model counts the slices' pages** (lion_amcost.c): an index scan's pages are priced as
   `tuples * index->pages / index->tuples`, and `index->pages` now includes the slices' - 13% of the
   u4 index's pages in §51.11, 23% of the u8's, 28% of the k4's - so a sliced index's scans are
@@ -31971,7 +32008,223 @@ index built there in mode `rmgr`, as `make installcheck-rmgr` does.
   place), `numeric` and `interval` (not one integer).
 - **Per-column control** (§51.13), and an `ALTER INDEX` that adds slices without a REINDEX.
 - **The standby path of the descent** is exercised by no test here: the recovery harness's
-  standby readers do not call the function yet.
+  standby readers do not call the function yet. *(2026-10-27: they do - the harness's checks
+  compare a sliced index's `count`, `sum`, `min` and `max` with a scan on the primary, on a hot
+  standby and on the promoted node; "Insert cost, revisited", below.)*
+
+### Insert cost, revisited (2026-10-27)
+
+§51.11 measured an `INSERT ... SELECT` of 100,000 rows into a table with a sliced int4 index and a
+sliced int8 one - some 50 slice inserts a row - at 9.1 times the time without slices with the
+resource manager and 11.9 with generic WAL, 48 MB of WAL become 502 (rmgr) and 205 become 588
+(generic), single-row inserts at 5.6 and 9.5 times; the generic profile spent 22 of 40 stacks
+computing page deltas and 9 descending. A row did one directory descent and wrote one record per
+slice: 17 of each for an int4 spread over the type, 33 for an int8. This section cuts that without
+changing what is stored - the same entries, the same members in the same containers, the same
+counts; the one thing that differs on disk is how much growth slack some items are given (3
+below). Three changes, in the order they were tried, each measured, then two the profile of the
+second pointed at.
+
+**1. One descent a column** (`lion_slice_insert()`, `lion_dir_find_next()`). A column's slices
+sort together, by position, after its summaries (§51.2), so they are one run on one leaf or a few
+adjacent ones, and a row's positions, ascending, are visited in that order. The first is found by
+the descent every insert makes (`lion_dir_find()` for write); each next one from the leaf the walk
+holds, by what a descent does on the leaf it lands on: move right while the high key does not
+exceed the key, finishing every unfinished split the walk steps onto, then search the leaf. That
+is the leaf every writer of that slice descends to, because the held leaf's range begins at or below
+the key - it held an earlier key of the walk, and a split of it while it was held (an INLINE slice
+that outgrew the leaf, a new slice entry) kept its lower bound and moved what sorts above the cut to
+the right - and a slice key's prefix run is one entry (§51.2), so no run spans pages and
+find-or-create needs no guard: holding that leaf serialises the slice's writers, as
+`lion_dir_find()` does when a run stays on one page. Moving right releases the leaf before it locks
+the sibling, as the descent's move-right does. The leaf is held from the first slice to the last;
+each slice has its own SERIALIZABLE check (`lion_writer_check()`), and its posting pages are locked
+after the leaf, as for one insert, so the lock order and the split protocol are those of one insert
+repeated. Holding the leaf through the walk keeps the slices' other writers out for a row's walk
+rather than a step, but they queued on the same leaf for every step anyway. The search on the
+held leaf starts at the previous slice's offset (`hint`) once the item before it is seen to sort
+below the key - so whatever happened on the leaf since, the first item at or above the key is at or
+past it - and is a binary search otherwise; a row's next slice is a step or two on.
+
+**2. Several slices to a record** (`lion_slice_batch_add()`, `lion_slice_batch_inline()`,
+`lion_slice_batch_write()`). A dense slice is a posting tree, and a row appended to the table goes
+into the last container of each of its slices, on the tree's tail, in place: before, a record of
+that container page and the entry's leaf (`lion_insert_container_inplace()`), one per slice, and
+the leaf is the same for every one of them. Now the in-place adds of a row into the slices on one
+leaf are gathered - each slice's tail locked, its item found by the decision a single insert makes
+(`lion_chain_target()`, shared, so a member goes where it went), checked for room by the first half
+of the in-place insert (`lion_container_inplace_check()`, `lion_segment_inplace_check()`),
+everything fallible done - and made in ONE ITEM_SET record: the posting leaves first, each with its
+CONTAINER_ADD or SPARSE_INS (and MINMAX), then the leaf. Three posting leaves a record in generic
+mode, GenericXLog's four buffers in all; seven with the resource manager, which opens a wider
+record when asked (`lion_wal_begin_ext()`, `LION_WAL_MAX_BLOCKS_WIDE` = 8, the bits of the
+header's masks; §25). On the leaf a CHAIN entry changes in nothing but its `ntids`, so the counter
+is raised where it is and logged as a SETBYTES of the byte or two of it that changed
+(`lion_slice_count_one()`) - nine bytes, where the DELTA of a rewritten entry is some fourteen and
+costs a copy and a comparison besides. An INLINE slice whose grown payload fits the bytes its entry
+has - its growth slack, §4 - joins the record as a rewrite of the entry at its length, which moves
+nothing and cannot fail; one that has to grow, or spill, goes the ordinary way. So does everything
+else that is not an in-place add: an item without room, a new segment, a member past a NARROW's
+width, a tail that is not its set's rightmost leaf or does not own the container key (the append
+hint of `lion_insert_lock_chain_page()`), a new slice - each of which may split the leaf and move
+the batch's entries, so the batch is written first, and also before the walk leaves its leaf. When
+every slice of a batch was INLINE the record is an ENTRY of the leaf alone.
+
+*The WAL format is unchanged*: no new record type, no new operation, no new redo. ITEM_SET and
+ENTRY have always replayed any stream on any block (`lion_redo_apply()`), and SETBYTES had a redo
+and no writer; the catalogue (§25) now says ITEM_SET takes up to eight blocks. A record of more
+than five buffers needs `XLogEnsureRecordSpace()`, which may allocate, so the shim calls it before
+the critical section opens; nothing else in redo, `rm_mask()` or the shim changed. Every operation
+names its bytes as before, so masking is what it was, and `wal_consistency_checking` checks the new
+shapes where it can only check anything, in replay: a crash of a cluster loaded with slice inserts
+of both kinds (dense and INLINE, appended, after a VACUUM, single rows) replayed with it, in rmgr
+mode, and the recovery harness, whose fixture now has a sliced index filled by `aminsert` (below).
+
+*Locks.* The one thing new is a backend holding posting leaves of several sets at once, so a tail
+after a batch's first is only TRIED (`ConditionalLockBuffer()`); a busy one has the batch written
+and let go, and the slice starts a new batch, waiting for its tail with nothing but the leaf held.
+The batch therefore waits for exactly what a single insert waits for, in the same order, and adds
+no edge to any wait-for graph on the primary - VACUUM's pass 2 holds a posting page only while it
+tries the leaf, as before (§11). On a standby redo takes the posting leaves and then the leaf
+(§25, "Replay takes a posting set's pages BEFORE the entry's leaf") and holds them all to the end
+of the record, which closes no cycle either: no reader holds a content lock on a posting page while
+it waits for another lock - a cursor copies a page and lets the lock go (`lion_cursor_take_page()`),
+a descent lets the parent go before it locks the child, a walk right lets the page go before the
+next. Each entry the batch rewrites has to be alone in its bytes; a single insert checks that of
+its one entry by a pass over the leaf's line pointers (`lion_page_check_alone()`), and the walk,
+which changes the leaf by nothing but same-length rewrites while it batches, checks every item of
+the leaf once instead (`lion_page_check_items()`) until it moves or changes the leaf otherwise -
+some 13% of the batched inserts' time in a profile, at 17 or 33 passes over a leaf of a few
+hundred entries a row.
+
+**3. The fast paths, counted.** A counting build (`LION_SLICE_STATS`, a patch not kept) sorted
+every slice insert of §51.11's benchmark by the path it took. Rows appended to the table land in
+the last container of each slice, so an in-place add is the rule, and the question is how often it
+fails and why:
+
+| where the slice inserts went              | `INSERT ... SELECT`, before | after     | 10,000 INSERTs, before | after   |
+|-------------------------------------------|-----------------------------|-----------|------------------------|---------|
+| slice inserts                             | 5,000,448                   | 5,000,448 | 500,201                | 500,201 |
+| in place: a container                     | 4,932,286                   | 4,971,710 | 492,110                | 496,675 |
+| in place: a sparse segment                | 1,568                       | 1,568     | 196                    | 196     |
+| general: a new container key's first pair | 784                         | 784       | 98                     | 98      |
+| general: its fourth, which promotes it    | 784                         | 784       | 98                     | 98      |
+| general: an ARRAY out of slack            | 16,550                      | 15,923    | 1,856                  | 1,780   |
+| general: a RUN out of slack               | 48,476                      | 9,679     | 5,843                  | 1,354   |
+| off the fast path                         | 1.33%                       | 0.54%     | 1.58%                  | 0.67%   |
+
+(Nothing else: no tail that was not its set's rightmost leaf, no busy tail, no INLINE or new slice
+on a table of a million rows.) The paths a single insert takes are the batch's - the decisions are
+the same functions - so "before" is the code before this section. The RUNs were the existence
+slices': a quarter of their inserts took the general path. A row extends the last run of its
+container key, which changes no size, but the in-place add asks for room for one more run whatever
+it does (`lion_container_inplace_need()`, which its redo asks too, so the writer cannot ask less
+without a WAL change); a new heap page's run used up the slack, the general path then rewrote the
+item at the SAME length, since it still fit (§4: an item written back over itself keeps its
+length), and so with no room, and every later row of that heap page took the general path again.
+An insert's rewrite now keeps the length only while it leaves `LION_ITEM_SLACK_MIN` bytes to grow
+into, and takes fresh slack otherwise when the page has room (`lion_tree_put_items_locked()`); what
+is left of the RUNs is tails too full for fresh slack, and the ARRAYs are the 64 bytes of slack an
+item may have (§4), a rewrite every 32 members, and the new container keys every 64 heap pages are
+inherent. It is one record in 75 to 185 either way, so it shows little in the time below; it is
+the general path's descent of the posting tree and its rewrite each time, and not slices' only:
+any key whose rows come in heap order is a RUN that met the same thing.
+
+**Measured** (2026-10-27): §51.11's benchmark (`bench/slices_insert.sql`, one run of the insert
+half of `bench/slices.sql`, seeded, so every run inserts the same rows and its WAL is the same to a
+few hundred bytes), 100,000 rows by one `INSERT ... SELECT` and then 10,000 single-row INSERTs into
+a table of 1,000,000 rows with a lion index on an int4 column and one on an int8, both sliced; each
+change a build of its own, the builds alternated within each of four rounds (the cluster restarted
+for each, as the resource manager's library is read at start), medians. PostgreSQL 16.15 at -O2, a
+2.8 GHz Xeon of four cores with AVX-512, 15 GB, `shared_buffers` 2 GB, `fsync` and
+`synchronous_commit` off; the machine had other clusters on it, a load of 1.2 to 2.0 through the
+runs. It is not the machine of §51.11, which is why "before" is measured again: it is slower, by a
+quarter with the resource manager and by more than half with generic WAL, whose byte-wise
+comparison of every page it logs is most of its time. Milliseconds, and MB of WAL:
+
+| insert                            | no index | lion, no slices | before | 1. one descent | 2. + several to a record | 3. + the slack rule | after  | slices / no slices, before → after |
+|-----------------------------------|----------|-----------------|--------|----------------|--------------------------|---------------------|--------|------------------------------------|
+| `INSERT ... SELECT` 100k, rmgr    | 70       | 1,017           | 10,189 | 6,915          | 6,015                    | 6,032               | 4,711  | 10.0x → 4.6x                       |
+| ... its WAL                       | 7.2      | 47.7            | 453.1  | 453.1          | 298.5                    | 296.1               | 223.2  | 9.5x → 4.7x                        |
+| 10,000 INSERTs, rmgr              | 72       | 241             | 1,429  | 887            | 794                      | 827                 | 674    | 5.9x → 2.8x                        |
+| ... their WAL                     | 0.7      | 14.1            | 54.8   | 54.8           | 39.4                     | 39.1                | 31.8   | 3.9x → 2.3x                        |
+| `INSERT ... SELECT` 100k, generic | 77       | 2,622           | 41,229 | 38,822         | 29,699                   | 28,971              | 28,650 | 15.7x → 10.9x                      |
+| ... its WAL                       | 7.2      | 136.4           | 515.2  | 515.2          | 360.7                    | 358.7               | 358.7  | 3.8x → 2.6x                        |
+| 10,000 INSERTs, generic           | 81       | 399             | 5,373  | 5,429          | 4,626                    | 4,369               | 4,289  | 13.5x → 10.7x                      |
+| ... their WAL                     | 0.7      | 23.5            | 61.8   | 61.8           | 46.4                     | 46.2                | 46.2   | 2.6x → 2.0x                        |
+
+"Before" is the code of §51; the build of §52, which changes no insert, measured 9,504, 1,169,
+41,677 and 5,784 ms in the four rows of time, the same within the noise. "2." is three posting
+leaves a record in both modes and the entries' DELTAs; "after" adds the leaf's check once a walk and
+the hint (rmgr 5,182 and 720, generic 28,154 and 4,342 ms), then the wide records and the counters
+as SETBYTES (rmgr 4,929 and 714 with the first, 4,711 and 674 with both; generic, which takes
+neither, is as it was within the noise). With the resource manager a slice insert went from 1.8 µs
+and 81 bytes of WAL to 0.74 µs and 35 bytes ((10,189 - 1,017) ms and (453.1 - 47.7) MB over
+5,000,448 of them, against (4,711 - 1,017) and (223.2 - 47.7)); with generic WAL from 7.7 µs and
+76 bytes to 5.2 µs and 44. A row's 50 slices write some 8 records with the resource manager and 17
+with generic WAL, not 50. The descents went first, 3.3 s of the 10.2 with the resource manager, as
+the profile said; then the records mattered more in generic mode, where a record is a page image
+of each block it names and three slices a record took 9.1 s, than with the resource manager, where
+they took 0.9 and the leaf's check and the hint as much again.
+
+**Where it stands.** With the resource manager the `INSERT ... SELECT` costs 4.6 times what it costs
+without slices and a single-row INSERT 2.8 times; with generic WAL, 10.9 and 10.7 times. All but the
+resource manager's single rows are above the 3x this work aimed at, for two different reasons. Generic WAL
+pays a page image a block of a record, copied in and compared byte by byte at the end
+(`GenericXLogFinish()`), and a row's slices are 50 posting leaves, each a different page: batching
+took the leaf's images from one a slice to one a batch of three, 100 images a row to some 67, and
+that is the floor while every slice insert writes its own posting leaf. With the resource manager
+what is left is the work of 50 in-place adds a row - a buffer pinned and locked, the container
+found and checked, a bit set, a few bytes logged - at some 0.74 µs each: no longer a descent or a
+record a slice, but a posting page a slice. Neither moves further without a row's slices sharing a
+page.
+
+**The deferred tail - designed, not started** (2026-10-27). §23 kept one form of batching -
+"per-key deferred appends kept inside the entry tuple (a small sorted TID tail merged into the
+containers on the next insert that finds it full, or by VACUUM), which stays inside the pinned-page
+protocol and keeps counts exact" - and slices are where it would pay: a CHAIN slice entry would
+carry, after its header and key, a tail of up to T codes (a new entry flag, so format 16), and a
+row's slice inserts would append its code to each slice's tail on the leaf - one record of one
+page a column, in either mode, the 50 posting leaves a row replaced by two leaves and a T-th of the
+posting writes. A tail that is full is merged into the tree by the insert that finds it so: its
+codes go into their containers by the paths above, a record a posting leaf, and the tail is emptied
+in the record of the last. What it costs is every reader of a slice: a slice becomes its tree AND
+its tail, so `lion_posting_set_lookup_slice_col()` and the counts of §52 (the batch counts, the
+kernel, the decode route) would copy the tail from the leaf under its lock and keep the leaf's pin
+as the §9 interlock for its codes, as for an INLINE set; VACUUM's pass 1 would filter tails on the
+leaf under its cleanup lock, and the merge would move codes from the leaf to a posting page, which
+is the spill's hazard (§18, §25: a reader holding a stale copy of the tail while VACUUM cleans the
+page its codes moved to), answered as the spill's is - VACUUM cleanup-locks the leaf before it
+walks its entries' trees, and the standby barrier carries it; and verify reads tails as members.
+It is not started here: it is a format change whose whole cost is in the readers of slices, which
+are the count engine's code §52 has just written (`lion_count*.c`, `lion_exec_slice.c`,
+`lion_slice_decode.c`), and the measurements say what it would buy - generic WAL from some 67 page
+images a row to 2 or 3, the resource manager from 50 posting-page visits a row to 2 leaf visits and
+50 appends - but not yet that inserts into sliced columns are what someone is waiting on. A bulk
+insert transposed into planes (`lion_planes_scatter_strided()`, §51.14) is the other route, and it
+needs an end-of-statement hook (`aminsertcleanup`, PostgreSQL 17) and a reader of the statement's
+own rows to wait for it, which 16 does not have.
+
+**Tests.** `test/sql/slices_insert.sql`: an int8 column of sixteen values whose bits look random,
+under an index built empty, whose 64 INLINE slices of about 2 kB fill one directory leaf after
+another, so that a row's walk crosses leaves and the slices that grow out of their slack split the
+leaf the walk holds, until they spill; dense int4 and int8 slices taking an `INSERT ... SELECT` and
+single-row inserts in place, with ARRAYs out of slack and new container keys in the middle of
+walks; INLINE slices beside CHAIN ones in one column with summaries; a rollback, deletes, NULLs, the
+types' extremes and a VACUUM - each followed by `lion_index_verify()` with heapallindexed and
+`lion_index_slice_agg()` against the query. `walrecords.sql` pins what the records are in each
+mode: a row's 32 CHAIN slices in records of four blocks (generic) or eight (rmgr), at most 14
+records a row (some 12 or 6 in fact, the value's own insert with them), and its INLINE slices in
+records of the leaf alone. The recovery harness's fixture has a sliced index of three columns filled by
+`aminsert` - an int8, a nullable int4, and an int4 expression negative one row in 97, so that INLINE
+slices sit beside dense ones - which every crash round of phase 1 replays, the hot standby of phase
+2 replays (in rmgr mode under `wal_consistency_checking`), and whose `count`, `sum`, `min` and
+`max` from the slices the checks compare with a scan on the primary, the standby and the promoted
+node. On this build `make recovery-check-rmgr` passed the phases a server without injection points
+runs (1, 1f, 1h, 2, 4 and 5), 930,119 index records replayed across its crashes and the standby's
+replay compared page by page under `wal_consistency_checking = 'pg_lion'`, and so did
+`make recovery-check WAL_CONSISTENCY=1` in generic mode (690,840 records); the whole suite passed
+in both modes (192 regression files and 32 isolation specs, the injection points' skipped).
 
 ## 52. Aggregates and ranges from slices in the count pushdown (2026-10-26)
 
