@@ -75,6 +75,10 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.slice_gather_cost             | 12      | 12       | user    | real
  pg_lion.slice_key_cost                | 120     | 120      | user    | real
  pg_lion.slice_page_cost               | 200     | 200      | user    | real
+ pg_lion.slice_range_container_cost    | 900     | 900      | user    | real
+ pg_lion.slice_range_key_cost          | 700     | 700      | user    | real
+ pg_lion.slice_range_step_cost         | 8       | 8        | user    | real
+ pg_lion.slice_range_word_cost         | 0.1     | 0.1      | user    | real
  pg_lion.slice_step_cost               | 1000    | 1000     | user    | real
  pg_lion.slice_step_key_cost           | 50      | 50       | user    | real
  pg_lion.slice_step_row_cost           | 0.9     | 0.9      | user    | real
@@ -83,7 +87,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.union_member_cost             | 0.25    | 0.25     | user    | real
  pg_lion.union_set_cost                | 100     | 100      | user    | real
  pg_lion.walk_pass_cost                | 5       | 5        | user    | real
-(56 rows)
+(60 rows)
 
 -- from 0 up, among the customized options as every extension's settings are
 SELECT count(*) AS settings,
@@ -95,7 +99,7 @@ SELECT count(*) AS settings,
  WHERE name LIKE 'pg_lion.%\_cost';
  settings | from_zero | unbounded | custom_group | unit_named 
 ----------+-----------+-----------+--------------+------------
-       56 | t         | t         | t            | t
+       60 | t         | t         | t            | t
 (1 row)
 
 -- 50000 rows; a has 10 values and g 100, both placed at random, about 55
