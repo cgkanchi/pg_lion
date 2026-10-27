@@ -184,10 +184,25 @@ dozen counted ANDs a group, or, for many groups of one column, a pass over the s
 groups that reads every row's value off them. The planner weighs this against the ordinary plan;
 on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166, and the sum,
 minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
-price is an insert into each set bit's set on every write of the column. A range on the sliced
-column itself (`amount > 100`), a percentile, a join and a partitioned table are not answered from
-the slices yet; `SELECT * FROM lion_index_slice_agg('events_amount', 'country = ''JP''')` answers
-the same aggregates for a filter given as text.
+price is an insert into each set bit's set on every write of the column. A percentile, a join and
+a partitioned table are not answered from the slices yet; `SELECT * FROM
+lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
+given as text.
+
+The slices answer a range on the sliced column itself too - `amount > 100`, `amount BETWEEN 100 AND
+5000`, `amount <> 0`, alone or beside other filters, under a `GROUP BY` of other columns, in an
+`OR`, and as the filter of the aggregates above (`SELECT sum(amount) ... WHERE amount > 100`) - by
+O'Neil's descent from the top bit at each block of 64 heap pages, whatever share of the rows the
+range holds (`Range From Slices: amount > 100 (32 slices)` in EXPLAIN; DESIGN.md §53). A range
+otherwise reads every distinct value it covers, or with `summaries = on` the pre-merged sets of
+the buckets it covers, and both grow with the range; the slices' work does not. The planner
+prices each and keeps the cheaper: on 5M rows of distinct values in no particular order, a count
+over 10% of them took 8 ms from the slices against 139 ms walking the values (and 216 for the
+ordinary plan), 50% 7 ms against 712, and a selective range stays with the values or the
+summaries, which read less. With summaries, values stored in the heap's order are best served by
+them at every width; values in no order by the slices once a range holds more than about a tenth
+of the rows (at half of them, 7 ms against the summaries' 32). `SET pg_lion.enable_slice_ranges =
+off` leaves ranges to the values and summaries.
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -
