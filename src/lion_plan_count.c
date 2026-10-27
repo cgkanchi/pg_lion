@@ -483,6 +483,18 @@ typedef struct LionCountPathBuild
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
+
+/* Does a GROUP BY or a count(DISTINCT) of the build walk column attno? */
+static bool
+lion_count_path_walks_column(const LionCountPathBuild *cx, AttrNumber attno)
+{
+	int			g;
+
+	for (g = 0; g < cx->ngroup; g++)
+		if (cx->groupattno[g] == attno)
+			return true;
+	return cx->distvar != NULL && cx->distvar->varattno == attno;
+}
 static void lion_try_count_cells(const LionCountPathBuild *cxp);
 static int	lion_count_path_filter_no(LionCountPathBuild *cx, Node *fexpr);
 
@@ -1219,6 +1231,37 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 						  &cx->whereclauses, &cx->whereconsts,
 						  &cx->wherekinds, &cx->whereopnos,
 						  &cx->whereinor);
+		lion_count_path_noted(cx);
+		return true;
+	}
+
+	/*
+	 * In a build that answers ranges from slices (DESIGN.md §53), `x <> c` on
+	 * a column the slices answer is a range with a HOLE (§35), taken as a
+	 * source from the slices - E less the rows equal to c, ANDed with E - and
+	 * one with any other range on the column, whose bounds it joins in the
+	 * one fold: a positive source that carries its own pin, where `<>`
+	 * elsewhere only subtracts.  Not on a column a GROUP BY or a
+	 * count(DISTINCT) walks, nor in a filtered count's condition.
+	 */
+	if (leaf.kind == LION_CLAUSE_NE && cx->slicerange && cx->curfilter == 0 &&
+		!lion_count_path_walks_column(cx, leaf.var->varattno) &&
+		lion_slice_range_ok(cx->input_rel, leaf.var->varattno,
+							leaf.cmptype))
+	{
+		leaf.kind = LION_CLAUSE_RANGESRC;
+		cx->hasrangesrc = true;
+		cx->havepositive = true;
+		cx->slicedsrc = true;
+		cx->nsliced++;
+		cx->nonnullattnos = lappend_int(cx->nonnullattnos,
+										(int) leaf.var->varattno);
+		lion_append_clause(&leaf, clause, false,
+						  &cx->whereattnos, &cx->clauseinfos,
+						  &cx->whereclauses, &cx->whereconsts,
+						  &cx->wherekinds, &cx->whereopnos,
+						  &cx->whereinor);
+		((LionClauseInfo *) llast(cx->clauseinfos))->sliced = true;
 		lion_count_path_noted(cx);
 		return true;
 	}
@@ -6080,6 +6123,8 @@ static void
 lion_try_count_path_scoped(LionCountPathBuild *cxp)
 {
 	LionCountPathBuild cx = *cxp;
+	bool		may;
+	bool		sliced = false;
 
 	/* a GROUP BY of expressions, or a WHERE over them, counted by cells */
 	lion_try_count_cells(cxp);
@@ -6090,36 +6135,44 @@ lion_try_count_path_scoped(LionCountPathBuild *cxp)
 	 * the entries' keys with no WHERE (§37), or not at all - and add_path()
 	 * keeps the cheaper.
 	 */
+	/*
+	 * The ranges on sliced columns from their slices (DESIGN.md §53): a build
+	 * of its own beside each that walks or collects them from their entries
+	 * and summaries - with the slices' aggregates and without - which
+	 * declines itself where no range is one the slices answer, and
+	 * add_path() keeps the cheaper.  With pg_lion.prefer_slice_ranges, for
+	 * the tests, a build that answers its ranges so leaves the other out.
+	 */
+	may = lion_query_may_slice_ranges(cxp);
 	if (lion_query_has_slice_aggs(cxp))
 	{
-		LionCountPathBuild sl = *cxp;
+		LionCountPathBuild sl;
+		bool		both = false;
 
-		sl.slicemode = true;
-		(void) lion_try_count_path_once(&sl);
-
-		/* ... with its ranges from slices too (DESIGN.md §53) */
-		if (lion_query_may_slice_ranges(cxp))
+		if (may)
 		{
 			sl = *cxp;
 			sl.slicemode = true;
 			sl.slicerange = true;
+			both = lion_try_count_path_once(&sl);
+			sliced |= both;
+		}
+		if (!(both && lion_prefer_slice_ranges))
+		{
+			sl = *cxp;
+			sl.slicemode = true;
 			(void) lion_try_count_path_once(&sl);
 		}
 	}
-
-	/*
-	 * The ranges on sliced columns from their slices (DESIGN.md §53): a build
-	 * of its own beside the one that walks or collects them from their
-	 * entries and summaries, which declines itself where no range is one the
-	 * slices answer, and add_path() keeps the cheaper.
-	 */
-	if (lion_query_may_slice_ranges(cxp))
+	if (may)
 	{
 		LionCountPathBuild sr = *cxp;
 
 		sr.slicerange = true;
-		(void) lion_try_count_path_once(&sr);
+		sliced |= lion_try_count_path_once(&sr);
 	}
+	if (sliced && lion_prefer_slice_ranges)
+		return;
 
 	if (lion_try_count_path_once(&cx))
 		return;

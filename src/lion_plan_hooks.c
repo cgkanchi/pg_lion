@@ -25,6 +25,7 @@ bool		lion_enable_topk = true;
 bool		lion_enable_count_slices = true;
 bool		lion_enable_slice_decode = true;
 bool		lion_enable_slice_ranges = true;
+bool		lion_prefer_slice_ranges = false;
 bool		lion_enable_count_residual = true;
 bool		lion_enable_count_partial = true;
 create_upper_paths_hook_type lion_prev_create_upper_paths_hook = NULL;
