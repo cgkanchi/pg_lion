@@ -16050,6 +16050,13 @@ pin on the page its containers came from is kept until they have been through th
 The WHERE sets are materialized on their second use as for any GROUP BY (§9), so a selective filter
 is probed in memory, entry after entry.
 
+*(2026-10-27, §53: on a column a lion index slices (§51) a range has a third form, whose work does
+not grow with it: the rows in range folded from the column's bit slices at each container key of
+its existence slice E, collected into a copy that is a source, ANDed with E located with its pin.
+It is offered by a build of its own, priced, beside the walk and the summaries; a range from slices
+never drives the sum, and a range that bounds a GROUP BY's or count(DISTINCT)'s walk of its own
+column is still a bound.)*
+
 Accepted (`lion_try_count_path()`), every other rule of §10, §14 and §16 unchanged:
 
 1. **`count(*)`, `count(k)` or `count(col)` under §14's rules, `WHERE <range on k> [AND ...]`**
@@ -20340,6 +20347,12 @@ every group, pair or dimension row the node counts - and it is exact: the same a
 collected fact filters of §27 (it is only ever counted beside a located set that holds the §9 pin,
 which settles any TID VACUUM has since removed; it cannot miss a row visible to the snapshot,
 because it is read after the snapshot was taken).
+
+*(2026-10-27, §53: a range on a sliced column may be collected from its slices instead - O'Neil's
+descent at each container key of the column's existence slice E, the same work at 0.1% of the rows
+as at 90% - into a copy built and spilled as lion_sources_collect()'s is, and ANDed with E located
+with its pin, so that it needs nothing beside it to carry the §9 interlock. The planner prices it
+against this collection, the walk and the summaries, in a build of its own.)*
 
 **Too large to collect.** The collections of one relation share one hash table's memory
 (`get_hash_memory_limit()`): a union is at most a container per container key of the heap, about
@@ -32392,7 +32405,12 @@ What the tables say:
   planner offering it beside §28's walk of entries and §32's summaries for a range on a sliced
   column, priced at nbits × the keys' words against the entries walked - which wins for a wide
   range over a near-unique column (u4's 5 million entries) and loses to §32's summaries for a
-  narrow one; and the measurement with and without summaries the task asked for.
+  narrow one; and the measurement with and without summaries the task asked for. *(2026-10-27,
+  §53: done - over E's container keys rather than the WHERE's copy, so that the range is a source
+  like any and nothing downstream changed; the comparisons LT of the lower bound, GT of the upper
+  and EQ of each `<>`, each stopping where its EQ empties; the copy built as lion_sources_collect()
+  builds one, not as a union, since it comes a container a key in key order; and ANDed with E,
+  which pins it. Measured with and without summaries in §53.7.)*
 - **Percentiles** (`percentile_disc(f) WITHIN GROUP (ORDER BY x)`, `percentile_cont`): the k-th
   value by Rinfret, O'Neil and O'Neil's descent - §51.10's min descent with the rank in place of
   the count: at bit i, `|C ∧ ¬S_i|` against the rank still to go, the bit clear and C narrowed to
