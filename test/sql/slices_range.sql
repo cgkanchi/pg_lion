@@ -483,7 +483,12 @@ INSERT INTO slr_part SELECT i % 100, i FROM generate_series(1, 2000) i;
 CREATE INDEX ON slr_part USING lion (k);
 CREATE INDEX ON slr_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slr_part;
-SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7');
+-- whether the count of a partitioned table is pushed down at all is the cost
+-- model's call and differs between majors; what is tested is that no range
+-- comes from slices there
+SELECT CASE WHEN slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7')
+				 LIKE 'range from slices%' THEN 'from slices' ELSE 'not from slices' END
+	   AS partitioned;
 CREATE TABLE slr_dim (g int PRIMARY KEY, name text);
 INSERT INTO slr_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slr_dim;

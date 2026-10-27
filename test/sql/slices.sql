@@ -348,16 +348,27 @@ SELECT slc_err($$CREATE INDEX slc_bad ON slc_w2 USING lion (k) WITH (slices = ma
 -- before anything has read the new index's meta page into the buffers.
 CREATE FUNCTION slc_poke(idx regclass, pos int8, val int8)
 RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+	path text := pg_relation_filepath(idx);
+	bs int := current_setting('block_size')::int;
+	f bytea := pg_read_binary_file(path);
+	page bytea := substring(f FROM 1 FOR bs);
+	ck int;
+	lo oid;
 BEGIN
-	EXECUTE format('COPY (SELECT 1) TO PROGRAM %L',
-				   format('cat >/dev/null; printf ''\%s\%s'' | dd of=%s bs=1 seek=%s conv=notrunc 2>/dev/null',
-						  lpad(to_oct(val & 255), 3, '0'),
-						  lpad(to_oct((val >> 8) & 255), 3, '0'),
-						  pg_relation_filepath(idx), pos));
+	-- the uint16 at pos of block 0, little-endian; pd_checksum is the uint16
+	-- at byte 8 (data checksums are on by default from PostgreSQL 18)
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, (val & 255)::int),
+										  1, ((val >> 8) & 255)::int)
+					FROM pos::int + 1);
+	ck := page_checksum(page, 0)::int & 65535;
+	page := overlay(page PLACING set_byte(set_byte('\x0000'::bytea, 0, ck & 255), 1, ck >> 8)
+					FROM 9);
+	f := overlay(f PLACING page FROM 1);
+	lo := lo_from_bytea(0, f);
+	PERFORM lo_export(lo, path);
+	PERFORM lo_unlink(lo);
 END $$;
-CREATE FUNCTION to_oct(x int8) RETURNS text LANGUAGE sql IMMUTABLE AS $$
-	SELECT ((x >> 6) & 7)::text || ((x >> 3) & 7)::text || (x & 7)::text
-$$;
 CREATE TABLE slc_f (k int);
 INSERT INTO slc_f SELECT generate_series(1, 100);
 CREATE INDEX slc_f_k ON slc_f USING lion (k) WITH (slices = on);
@@ -376,7 +387,6 @@ DROP TABLE slc_f;
 DROP TABLE slc, slc_e, slc_w1, slc_w2;
 DROP FUNCTION slc_both(text);
 DROP FUNCTION slc_poke(regclass, int8, int8);
-DROP FUNCTION to_oct(int8);
 DROP FUNCTION slc_meta(regclass);
 DROP FUNCTION slc_err(text);
 DROP FUNCTION slc_cmp(regclass, text, int2);
