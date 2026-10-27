@@ -53,10 +53,12 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
+#include "utils/date.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/numeric.h"
+#include "utils/timestamp.h"
 
 PG_FUNCTION_INFO_V1(lion_index_slice_agg);
 PG_FUNCTION_INFO_V1(lion_debug_slice_insert);
@@ -744,6 +746,530 @@ lion_slice_shape(Relation index, AttrNumber attno, LionSliceShape *shape)
 		nleaves++;
 	}
 	UnlockReleaseBuffer(buf);
+}
+
+/* ---------------------------------------------------------------------
+ * A range on the column from its slices (DESIGN.md §53)
+ * --------------------------------------------------------------------- */
+
+/*
+ * The bounds of a range on a sliced column, a bound at a time.  Each bound's
+ * value is the column's own type's, or for an integer column another integer
+ * type's (the integer family's cross-type comparisons, DESIGN.md §28): either
+ * way a 64-bit integer whose order is the btree order of the type - the
+ * allowlist's types are the signed-integer order of their Datum's bits, the
+ * infinities of date and the timestamps their extremes (lion_slice_enc.h).
+ * So `x op v` holds for x exactly when it holds for the integers, and the
+ * bounds clip to the type's range [-2^(nbits-1), 2^(nbits-1) - 1] as they
+ * are added: `int4col < 5000000000` bounds nothing, `int4col > 5000000000`
+ * selects nothing, as with btree.
+ */
+void
+lion_slice_range_init(LionSliceRange *r, Oid typid, int nbits)
+{
+	Assert(nbits >= 1 && nbits <= LION_SLICE_MAX_BITS);
+	memset(r, 0, sizeof(LionSliceRange));
+	r->nbits = nbits;
+	r->typid = typid;
+	r->lov = (nbits == 64) ? PG_INT64_MIN : -(INT64CONST(1) << (nbits - 1));
+	r->hiv = (nbits == 64) ? PG_INT64_MAX : (INT64CONST(1) << (nbits - 1)) - 1;
+}
+
+/*
+ * Can a bound of type valtype on a column of key type coltype be encoded?
+ * The integers among themselves, and every other type of the allowlist with
+ * its own type alone - which is all lion's families compare them with.
+ */
+bool
+lion_slice_range_type_ok(Oid coltype, Oid valtype)
+{
+	valtype = getBaseType(valtype);
+	switch (coltype)
+	{
+		case INT2OID:
+		case INT4OID:
+		case INT8OID:
+			return valtype == INT2OID || valtype == INT4OID ||
+				valtype == INT8OID;
+		case DATEOID:
+		case TIMEOID:
+		case TIMESTAMPOID:
+		case TIMESTAMPTZOID:
+			return valtype == coltype;
+		default:
+			return false;
+	}
+}
+
+/* A bound's value as the 64-bit integer the type orders by. */
+static int64
+lion_slice_range_value(Oid valtype, Datum value)
+{
+	switch (getBaseType(valtype))
+	{
+		case INT2OID:
+			return (int64) DatumGetInt16(value);
+		case INT4OID:
+			return (int64) DatumGetInt32(value);
+		case INT8OID:
+			return DatumGetInt64(value);
+		case DATEOID:
+			return (int64) DatumGetDateADT(value);
+		case TIMEOID:
+			return (int64) DatumGetTimeADT(value);
+		case TIMESTAMPOID:
+			return (int64) DatumGetTimestamp(value);
+		case TIMESTAMPTZOID:
+			return (int64) DatumGetTimestampTz(value);
+		default:
+			elog(ERROR, "lion index: a range bound of type %u on a sliced column",
+				 valtype);
+	}
+	return 0;					/* keep the compiler quiet */
+}
+
+void
+lion_slice_range_add(LionSliceRange *r, StrategyNumber strategy, Oid valtype,
+					 Datum value, bool isnull)
+{
+	int64		minv = (r->nbits == 64) ? PG_INT64_MIN :
+		-(INT64CONST(1) << (r->nbits - 1));
+	int64		maxv = (r->nbits == 64) ? PG_INT64_MAX :
+		(INT64CONST(1) << (r->nbits - 1)) - 1;
+	int64		v;
+
+	if (!lion_slice_range_type_ok(r->typid, valtype))
+		elog(ERROR, "lion index: a range bound of type %u on a column sliced as type %u",
+			 valtype, r->typid);
+	if (isnull)
+	{
+		/* every operator involved is strict: a NULL bound selects nothing */
+		r->empty = true;
+		return;
+	}
+	v = lion_slice_range_value(valtype, value);
+	switch (strategy)
+	{
+		case LION_STRAT_LT:
+			if (v <= minv)
+				r->empty = true;
+			else
+				r->hiv = Min(r->hiv, v - 1);
+			break;
+		case LION_STRAT_LE:
+			if (v < minv)
+				r->empty = true;
+			else
+				r->hiv = Min(r->hiv, v);
+			break;
+		case LION_STRAT_GE:
+			if (v > maxv)
+				r->empty = true;
+			else
+				r->lov = Max(r->lov, v);
+			break;
+		case LION_STRAT_GT:
+			if (v >= maxv)
+				r->empty = true;
+			else
+				r->lov = Max(r->lov, v + 1);
+			break;
+		case LION_STRAT_NE:
+			if (v < minv || v > maxv)
+				break;			/* a hole no value of the type is in */
+			if (r->nholes >= r->maxholes)
+			{
+				r->maxholes = Max(4, r->maxholes * 2);
+				r->holev = (r->holev == NULL) ?
+					(int64 *) palloc(sizeof(int64) * r->maxholes) :
+					(int64 *) repalloc(r->holev, sizeof(int64) * r->maxholes);
+			}
+			r->holev[r->nholes++] = v;
+			break;
+		default:
+			elog(ERROR, "lion index: strategy %d is no range of a sliced column",
+				 (int) strategy);
+	}
+}
+
+/*
+ * Once every bound is in: the bounds as encodings - lo and hi, which a
+ * range that reaches the type's least or greatest value does not need
+ * (haslo, hashi) - and the holes inside them; empty when the bounds cross,
+ * all when they leave every row of E.
+ */
+void
+lion_slice_range_settle(LionSliceRange *r)
+{
+	uint64		mask = lion_slice_mask(r->nbits);
+	int			n = 0;
+	int			i;
+
+	if (!r->empty && r->lov > r->hiv)
+		r->empty = true;
+	if (r->empty)
+		return;
+	r->lo = lion_slice_encode(r->lov, r->nbits);
+	r->hi = lion_slice_encode(r->hiv, r->nbits);
+	r->haslo = (r->lo != 0);
+	r->hashi = (r->hi != mask);
+	if (r->nholes > 0)
+		r->holes = (uint64 *) palloc(sizeof(uint64) * r->nholes);
+	for (i = 0; i < r->nholes; i++)
+	{
+		if (r->holev[i] < r->lov || r->holev[i] > r->hiv)
+			continue;			/* outside the range already */
+		r->holes[n++] = lion_slice_encode(r->holev[i], r->nbits);
+	}
+	r->nholes = n;
+	r->all = (!r->haslo && !r->hashi && r->nholes == 0);
+}
+
+/*
+ * The members of container c at its key, as a bitmap of `width` words a heap
+ * block (lion_container.h, "widths"), into buf of LION_WIDTH_WORDS(width)
+ * words: a BITSET's or a NARROW's words where the widths agree are the
+ * container's own (returned in place), anything else is laid out into buf.
+ * A member at an offset the width does not reach is left out: every caller
+ * here lays a slice out at the width of E's container at the key, and ANDs
+ * it with rows of E, which have none there.
+ */
+static const uint64 *
+lion_slice_range_plane(const LionContainer *c, uint32 width, uint64 *buf)
+{
+	const uint32 offmask = (1U << LION_OFFSET_BITS) - 1;
+	const uint32 reach = 64 * width;	/* the offsets the width holds */
+	uint32		nwords = LION_WIDTH_WORDS(width);
+	uint32		cw = lion_container_width(c);
+
+	if (cw == width)
+		return LION_BITSET_DATA(c);
+	if (cw > 0)
+	{
+		const uint64 *d = LION_BITSET_DATA(c);
+		uint32		take = Min(cw, width);
+		uint32		b;
+
+		for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+		{
+			memcpy(buf + (Size) b * width, d + (Size) b * cw,
+				   sizeof(uint64) * take);
+			if (take < width)
+				memset(buf + (Size) b * width + take, 0,
+					   sizeof(uint64) * (width - take));
+		}
+		return buf;
+	}
+
+	memset(buf, 0, sizeof(uint64) * nwords);
+	if (c->type == LION_CT_ARRAY)
+	{
+		const uint16 *m = LION_ARRAY_DATA(c);
+		uint32		n = lion_container_cardinality(c);
+		uint32		i;
+
+		for (i = 0; i < n; i++)
+		{
+			uint32		off = m[i] & offmask;
+
+			if (off < reach)
+				buf[(m[i] >> LION_OFFSET_BITS) * width + off / 64] |=
+					UINT64CONST(1) << (off % 64);
+		}
+	}
+	else if (c->type == LION_CT_RUN)
+	{
+		const LionRun *runs = LION_RUN_DATA(c);
+		uint32		nruns = LION_RUN_NRUNS(c);
+		uint32		i;
+
+		for (i = 0; i < nruns; i++)
+		{
+			uint32		lo0 = runs[i].start;
+			uint32		lo1 = lo0 + runs[i].len_minus_1;
+			uint32		b;
+
+			if (lo1 >= LION_CONTAINER_RANGE)
+				lo1 = LION_CONTAINER_RANGE - 1;
+			for (b = lo0 >> LION_OFFSET_BITS; b <= (lo1 >> LION_OFFSET_BITS); b++)
+			{
+				uint32		o0 = (b == (lo0 >> LION_OFFSET_BITS)) ?
+					(lo0 & offmask) : 0;
+				uint32		o1 = (b == (lo1 >> LION_OFFSET_BITS)) ?
+					(lo1 & offmask) : offmask;
+				uint64	   *w = buf + (Size) b * width;
+				uint32		k;
+
+				if (o1 >= reach)
+					o1 = reach - 1;
+				if (o0 > o1)
+					continue;
+				for (k = o0 / 64; k <= o1 / 64; k++)
+				{
+					uint32		from = (k == o0 / 64) ? o0 % 64 : 0;
+					uint32		to = (k == o1 / 64) ? o1 % 64 : 63;
+					uint64		bits = (to == 63 ? PG_UINT64_MAX :
+										((UINT64CONST(1) << (to + 1)) - 1));
+
+					bits &= ~((UINT64CONST(1) << from) - 1);
+					w[k] |= bits;
+				}
+			}
+		}
+	}
+	else
+		elog(ERROR, "lion index: a slice container of type %d", (int) c->type);
+	return buf;
+}
+
+/* The container a pinless cursor over a slice holds at key, or NULL. */
+static const LionContainer *
+lion_slice_range_at(LionSetCursor *sc, uint32 key)
+{
+	if (sc->valid && sc->cur->ckey < key)
+	{
+		if (sc->cur->ckey + 1 == key)
+			lion_cursor_next(sc);
+		else
+			lion_cursor_seek(sc, key);
+	}
+	if (!sc->valid || sc->cur->ckey != key)
+		return NULL;
+	return sc->cur;
+}
+
+/* One comparison of the fold: its constant, and its images at a key. */
+typedef struct LionSliceChain
+{
+	LionBsiOp	op;
+	uint64		c;
+	uint64	   *eq;
+	uint64	   *acc;			/* NULL for a hole's EQ */
+	bool		live;
+} LionSliceChain;
+
+/*
+ * The rows of the range, collected from the column's slices into one
+ * private, pinless set (lion_collect_begin()): within maxbytes, or past it
+ * into a temporary file where spill allows, as a range's union is
+ * (lion_range_collect()) - false when it does not fit and may not spill.
+ * *out not found when no row is in it.  The caller has settled r and seen to
+ * an empty range and to one that is all of E, which need no fold.
+ *
+ * O'NEIL'S DESCENT, KEY BY KEY.  At each container key of E, E's container
+ * there - the rows with a value - is the image the comparisons start from,
+ * at the width it has (a heap block's words, lion_container.h): every slice
+ * holds rows of E only, so nothing past E's width matters.  Each comparison
+ * is a chain of lion_planes_bsi_step()s from the top bit down - the rows
+ * below lo (LT), the rows above hi (GT), the rows equal to each hole (EQ) -
+ * each step reading the slice of its bit there, laid out at E's width, and a
+ * chain stops at the bit where no row is still equal to its constant: past a
+ * few more bits than the rows at the key need to tell them apart (some 13 of
+ * an int4's 32 at 6,400 rows a key, fewer where the column is in the heap's
+ * order), and no later step can change it.  The key's rows are then E less
+ * LT, GT and every hole's EQ, made a container and collected.  A slice with
+ * no entry, or none at the key, is a slice of no row there.
+ *
+ * WHY IT IS EXACT.  The sets are located and read here without keeping a pin
+ * (the cursors drop each page once it is copied), after the snapshot was
+ * taken.  A row the snapshot sees is in E and in exactly the slices of its
+ * value's bits - its insert wrote every one of them before its transaction
+ * committed, and only VACUUM takes a TID out of a set, for a row no snapshot
+ * sees - so whenever each slice is read, the fold classifies it by its value,
+ * and the copy holds it exactly when its value is in the range.  A row the
+ * snapshot does not see may be classified by slices read before and after a
+ * write moved it: it is in the copy or not, and whoever counts the copy
+ * counts it beside a set located with its pin - the copy's contract
+ * (lion_sources_collect()) - whose interlock and the heap's recheck reject
+ * it.
+ */
+bool
+lion_slice_range_collect(Relation index, AttrNumber attno,
+						 const LionSliceRange *r, Size maxbytes, bool spill,
+						 LionPostingSet *out, Size *held, bool *spilled,
+						 LionSliceRangeStats *stats)
+{
+	int			nbits = r->nbits;
+	MemoryContext cxt;
+	MemoryContext oldcxt;
+	LionCollect col;
+	LionCountCtx scx;
+	LionPostingSet *sets;
+	LionSetCursor *scur;
+	LionSetCursor ecur;
+	LionSliceChain *chains;
+	int			nchains = 0;
+	uint64	   *eimg;
+	uint64	   *sbuf;
+	uint64	   *img;
+	LionContainer *tmp;
+	bool		ok;
+	int			i;
+
+	Assert(!r->empty && !r->all);
+	memset(out, 0, sizeof(LionPostingSet));
+	out->pinbuf = InvalidBuffer;
+	out->head = InvalidBlockNumber;
+	*held = 0;
+	*spilled = false;
+
+	/* the catalogs a spill's file needs, looked up before the walk starts */
+	if (spill)
+		PrepareTempTablespaces();
+
+	/* the copy in the caller's context, everything else in one of its own */
+	lion_collect_begin(&col, maxbytes, spill);
+	cxt = AllocSetContextCreate(CurrentMemoryContext,
+								"lion slice range", ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(cxt);
+
+	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) *
+									  LION_SLICE_NPOS(nbits));
+	scur = (LionSetCursor *) palloc0(sizeof(LionSetCursor) * nbits);
+	memset(&scx, 0, sizeof(scx));
+	scx.cxt = cxt;
+	scx.vmbuf = InvalidBuffer;
+	scx.droppins = true;
+
+	/* E, and each bit's slice: a bit no row has is a set not found */
+	for (i = 0; i < LION_SLICE_NPOS(nbits); i++)
+		(void) lion_posting_set_lookup_slice_col(index, attno,
+												 lion_slice_index_pos(i, nbits),
+												 &sets[i]);
+
+	chains = (LionSliceChain *) palloc0(sizeof(LionSliceChain) *
+										(2 + r->nholes));
+	if (r->haslo)
+	{
+		chains[nchains].op = LION_BSI_LT;
+		chains[nchains++].c = r->lo;
+	}
+	if (r->hashi)
+	{
+		chains[nchains].op = LION_BSI_GT;
+		chains[nchains++].c = r->hi;
+	}
+	for (i = 0; i < r->nholes; i++)
+	{
+		chains[nchains].op = LION_BSI_EQ;
+		chains[nchains++].c = r->holes[i];
+	}
+	for (i = 0; i < nchains; i++)
+	{
+		chains[i].eq = (uint64 *) palloc(LION_BITSET_BYTES);
+		chains[i].acc = (chains[i].op == LION_BSI_EQ) ? NULL :
+			(uint64 *) palloc(LION_BITSET_BYTES);
+	}
+	eimg = (uint64 *) palloc(LION_BITSET_BYTES);
+	sbuf = (uint64 *) palloc(LION_BITSET_BYTES);
+	img = (uint64 *) palloc(LION_BITSET_BYTES);
+	tmp = (LionContainer *) palloc(MAXALIGN(LION_CONTAINER_MAX_SIZE));
+
+	if (sets[nbits].found)
+	{
+		lion_cursor_init_at(&ecur, &sets[nbits], &scx, true, 0, NULL);
+		for (i = 0; i < nbits; i++)
+			lion_cursor_init_at(&scur[i], &sets[i], &scx, true, 0, NULL);
+
+		while (ecur.valid && !col.failed)
+		{
+			const LionContainer *e = ecur.cur;
+			uint32		key = e->ckey;
+			uint32		width = lion_container_width(e);
+			uint32		nwords;
+			const uint64 *ew;
+			int			live = nchains;
+			int			bit;
+			uint32		b;
+			uint32		w;
+
+			if (width == 0)
+				width = lion_container_min_width(e);
+			nwords = LION_WIDTH_WORDS(width);
+			ew = lion_slice_range_plane(e, width, eimg);
+			if (ew != eimg)
+				memcpy(eimg, ew, sizeof(uint64) * nwords);
+			for (i = 0; i < nchains; i++)
+			{
+				memcpy(chains[i].eq, eimg, sizeof(uint64) * nwords);
+				if (chains[i].acc != NULL)
+					memset(chains[i].acc, 0, sizeof(uint64) * nwords);
+				chains[i].live = true;
+			}
+
+			/* the fold, from the top bit, while a chain still has rows */
+			for (bit = nbits - 1; bit >= 0 && live > 0; bit--)
+			{
+				const LionContainer *s = lion_slice_range_at(&scur[bit], key);
+				const uint64 *sw = (s == NULL) ? NULL :
+					lion_slice_range_plane(s, width, sbuf);
+
+				for (i = 0; i < nchains; i++)
+				{
+					LionSliceChain *ch = &chains[i];
+
+					if (!ch->live)
+						continue;
+					ch->live = lion_planes_bsi_step(ch->op,
+													((ch->c >> bit) & 1) != 0,
+													sw, ch->eq, ch->acc,
+													nwords);
+					stats->steps++;
+					if (!ch->live)
+						live--;
+				}
+			}
+
+			/* E less what the chains rule out */
+			for (i = 0; i < nchains; i++)
+			{
+				const uint64 *out_w = (chains[i].op == LION_BSI_EQ) ?
+					chains[i].eq : chains[i].acc;
+
+				for (w = 0; w < nwords; w++)
+					eimg[w] &= ~out_w[w];
+			}
+
+			/* ... a container of the key's, at its full width */
+			if (width == LION_BITSET_WIDTH)
+				memcpy(img, eimg, LION_BITSET_BYTES);
+			else
+			{
+				for (b = 0; b < LION_BLOCKS_PER_CONTAINER; b++)
+				{
+					memcpy(img + (Size) b * LION_BITSET_WIDTH,
+						   eimg + (Size) b * width, sizeof(uint64) * width);
+					memset(img + (Size) b * LION_BITSET_WIDTH + width, 0,
+						   sizeof(uint64) * (LION_BITSET_WIDTH - width));
+				}
+			}
+			lion_bits_to_container(img, key, tmp);
+			if (lion_container_cardinality(tmp) > 0)
+				(void) lion_collect_add(&col, tmp);
+			stats->keys++;
+
+			lion_cursor_next(&ecur);
+			CHECK_FOR_INTERRUPTS();
+		}
+		lion_cursor_close(&ecur);
+		for (i = 0; i < nbits; i++)
+			lion_cursor_close(&scur[i]);
+	}
+
+	for (i = 0; i < LION_SLICE_NPOS(nbits); i++)
+		lion_posting_set_release(&sets[i]);
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(cxt);
+
+	ok = lion_collect_finish(&col, index, false, out, spilled, held);
+	if (ok)
+	{
+		out->attno = attno;
+		stats->descents++;
+		if (*spilled)
+			stats->spilled++;
+	}
+	return ok;
 }
 
 /* ---------------------------------------------------------------------

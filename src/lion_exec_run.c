@@ -1183,6 +1183,10 @@ lion_scan_sums_add(LionScanWorkerSums *sums, const LionCountScanState *st)
 		sums->rangeeval[i] += st->rangeeval[i];
 	sums->summaries += st->summaries;
 	sums->rangeprobed += st->rangeprobed;
+	sums->sliceranges.descents += st->sliceranges.descents;
+	sums->sliceranges.keys += st->sliceranges.keys;
+	sums->sliceranges.steps += st->sliceranges.steps;
+	sums->sliceranges.spilled += st->sliceranges.spilled;
 	sums->wherecollected += st->wherecollected;
 	sums->wherespilled += st->wherespilled;
 	sums->groupbatches += st->groupbatches;

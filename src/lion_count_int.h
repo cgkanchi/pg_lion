@@ -1071,6 +1071,11 @@ extern const LionContainer *lion_count_posfilter(LionCountCtx *cx,
 extern LionRowFilter *lion_row_filter_nopos(LionRowFilter *filter);
 extern void lion_recheck_flush(LionCountCtx *cx);
 extern int64 lion_recheck_visible(LionCountCtx *cx, bool *vis);
+extern void lion_collect_begin(LionCollect *col, Size maxbytes, bool spill);
+extern bool lion_collect_add(LionCollect *col, const LionContainer *c);
+extern bool lion_collect_finish(LionCollect *col, Relation index,
+								bool posfiltered, LionPostingSet *out,
+								bool *spilled, Size *held);
 
 /*
  * A cursor on a grouped walk's heap (lion_count_groups_copy(),
