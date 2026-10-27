@@ -89,8 +89,11 @@ BEGIN
 					  ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
 		IF NOT ana OR
 		   ln ~ '(LionCount|Lion Indexes|Count Filter|Aggregates From Slices|Slice|Range Sources)' THEN
-			RETURN NEXT regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
-									   'Slice Kernel: .*$', 'Slice Kernel: (the CPU''s)');
+			-- the heap rechecks depend on which pages the heap left dirty,
+			-- which differs between majors: shown as made or not, not counted
+			RETURN NEXT regexp_replace(regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
+												  'Slice Kernel: .*$', 'Slice Kernel: (the CPU''s)'),
+									   '(Slice Heap (TIDs|Blocks) Rechecked): [1-9][0-9]*$', '\1: >0');
 		END IF;
 	END LOOP;
 	PERFORM set_config('enable_seqscan', 'on', true);
@@ -650,8 +653,8 @@ SELECT * FROM slp_plan('SELECT count(b), sum(b) FROM slp WHERE g = 3', true);
    Slice Counts: 33
    Slice Containers Counted: 429
    Slice WHERE Copies: 1
-   Slice Heap TIDs Rechecked: 59908
-   Slice Heap Blocks Rechecked: 1610
+   Slice Heap TIDs Rechecked: >0
+   Slice Heap Blocks Rechecked: >0
 (9 rows)
 
 -- rows this transaction inserted, with the column's extremes, and deleted
