@@ -806,6 +806,17 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 				 errmsg("lionvec index \"%s\" has a refine item of %u bytes at (%u,%u)",
 						RelationGetRelationName(index), ItemIdGetLength(iid), blk, off)));
 	ref = (LionVecRefine *) PageGetItem(page, iid);
+
+	/*
+	 * Every line of the item asked for at once, before its header is read:
+	 * the header's miss and its codes', which a scan's lionvec_estimate8()
+	 * reads next, overlap, where they came one after another and the
+	 * hardware prefetcher caught up with the codes only after a few
+	 * (DESIGN.md §44.4, "The refine's reads").  The length is the one just
+	 * checked, an item's of this index, no more than a page holds; a caller
+	 * that reads only the header wastes a few dozen hints.
+	 */
+	lion_prefetch_range(ref, ItemIdGetLength(iid));
 	if (ref->nloc > reflocruns)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
