@@ -1357,6 +1357,13 @@ lion_count_runs(LionCountScanState *st, bool sum)
 			lion_locate_where(st);
 			n = lion_run_count(st, sum, r);
 			st->runcount[r] += n;
+
+			/*
+			 * the aggregates of sliced columns (DESIGN.md §52), over the
+			 * WHERE's rows: run 0's, its sets still located
+			 */
+			if (r == 0 && st->slice != NULL)
+				lion_slice_run(st);
 			/* a partition's rows are its indexes' (lion_count_report_reads()) */
 			if (p >= 0)
 				st->statrows += n;
@@ -1793,6 +1800,31 @@ lion_group_batch_ok(LionCountScanState *st)
 }
 
 /*
+ * May the rest of the walk be taken a batch at a time for the aggregates of
+ * sliced columns (DESIGN.md §52, "The decode route"), whose slices are then
+ * read once a batch: the plan says so, the walk is one column's entries -
+ * no coalesce group, no second column - and the slices can be read without
+ * their pins, which a standby's counts cannot do.  The groups' counts are
+ * then batched as the collected WHERE's are, or made one by one before it
+ * is collected.
+ */
+static bool
+lion_slice_batch_ok(LionCountScanState *st)
+{
+	int			k;
+
+	if (st->slice == NULL || !st->slice->decode || st->coal != NULL ||
+		st->nsource != st->nitem + 1 || RecoveryInProgress())
+		return false;
+	for (k = 1; k <= st->nitem; k++)
+	{
+		if (st->sources[k].rangewalk != NULL)
+			return false;
+	}
+	return true;
+}
+
+/*
  * Take the next batch of entries from the walk, count them together against
  * the collected WHERE, and keep their keys and counts for the rows that
  * follow; the sets are released before this returns.  False when the walk
@@ -1809,6 +1841,7 @@ lion_group_batch_fill(LionCountScanState *st)
 {
 	EState	   *estate = st->css.ss.ps.state;
 	MemoryContext oldcxt;
+	bool		decode;
 	int			n = 0;
 	int			i;
 
@@ -1842,9 +1875,78 @@ lion_group_batch_fill(LionCountScanState *st)
 	if (n == 0)
 		return false;
 
-	lion_count_groups_copy(st->heap, estate->es_snapshot, n, st->gbsets,
-						   &st->wherecoll, st->gbcount, &st->stats,
-						   st->viscache, st->rel_read_only, st->gbimages);
+	/*
+	 * The decode route of the slices (DESIGN.md §52, "The decode route"):
+	 * the WHERE as one copy - collected before the first batch, if no count
+	 * has collected it yet - and one walk a column of the batch's groups
+	 * with it, which counts the groups too, from the first column's.  A
+	 * WHERE left with no copy - one that selects nothing by its sets, which
+	 * the row filter decides - has its groups counted and answered one by
+	 * one instead.
+	 */
+	decode = (st->slice != NULL && st->slice->decode && !RecoveryInProgress());
+	if (decode && st->nitem > 0 && !st->wtried)
+		lion_where_collect(st, st->sources, st->nitem);
+	decode = decode && (st->nitem == 0 || st->wcollected);
+	if (st->slice != NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(st->gbatchcxt);
+		st->gbsvalues = (Datum **) palloc0(sizeof(Datum *) * n);
+		st->gbsnull = (bool **) palloc0(sizeof(bool *) * n);
+		MemoryContextSwitchTo(oldcxt);
+	}
+
+	if (decode)
+		lion_slice_batch(st, n, st->gbsets, st->gbcount, true, st->gbimages,
+						 st->wcollected ? &st->wherecoll : NULL,
+						 st->gbatchcxt, st->gbsvalues, st->gbsnull);
+	else
+	{
+		if (st->wcollected)
+			lion_count_groups_copy(st->heap, estate->es_snapshot, n,
+								   st->gbsets, &st->wherecoll, st->gbcount,
+								   &st->stats, st->viscache,
+								   st->rel_read_only, st->gbimages);
+		else
+		{
+			/*
+			 * A batch the slices' decode route asked for
+			 * (lion_slice_batch_ok()) that cannot decode: each group counted
+			 * as the walk one at a time counts it, its set in the driver's
+			 * slot.
+			 */
+			LionCountSource saved = st->sources[0];
+
+			for (i = 0; i < n; i++)
+			{
+				st->sources[0].nsets = 1;
+				st->sources[0].sets = &st->gbsets[i];
+				st->gbcount[i] = lion_group_count(st, st->nsource,
+												  st->sources, st->nitem,
+												  st->gbsets[i].ntids,
+												  i + 1 < n);
+			}
+			st->sources[0] = saved;
+		}
+
+		/*
+		 * The aggregates of sliced columns (DESIGN.md §52) of each group with
+		 * a row, while its set is located, kept for its row.
+		 */
+		if (st->slice != NULL)
+		{
+			for (i = 0; i < n; i++)
+			{
+				LionPostingSet *gs = &st->gbsets[i];
+
+				if (st->gbcount[i] == 0)
+					continue;
+				lion_slice_group(st, 1, &gs);
+				lion_slice_keep(st, st->gbatchcxt, &st->gbsvalues[i],
+								&st->gbsnull[i]);
+			}
+		}
+	}
 	for (i = 0; i < n; i++)
 		lion_posting_set_release(&st->gbsets[i]);
 
@@ -2460,10 +2562,13 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 
 			if (st->gbcount[i] == 0)
 				continue;
+			/* the group's aggregates of sliced columns (§52), kept */
+			if (st->slice != NULL)
+				lion_slice_put(st, st->gbsvalues[i], st->gbsnull[i]);
 			return lion_emit_tuple(st, st->gbkey[i], st->gbnull[i],
 								   (Datum) 0, true, st->gbcount[i]);
 		}
-		if (lion_group_batch_ok(st))
+		if (lion_group_batch_ok(st) || lion_slice_batch_ok(st))
 		{
 			if (lion_group_batch_fill(st))
 				continue;
@@ -2500,6 +2605,17 @@ lion_next_group(LionCountScanState *st, bool *exhausted)
 								 st->groupset.ntids,
 								 lion_entry_scan_batch_left(&st->escan) > 0);
 		keyisnull = st->groupset.keyisnull;
+
+		/*
+		 * the group's aggregates of sliced columns (DESIGN.md §52), its set
+		 * still located
+		 */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs = &st->groupset;
+
+			lion_slice_group(st, 1, &gs);
+		}
 		lion_posting_set_release(&st->groupset);
 
 		if (coal != NULL &&
@@ -2602,6 +2718,14 @@ lion_next_group_inlist(LionCountScanState *st, bool *exhausted)
 		count = lion_group_count(st, st->ndsource, st->dsources,
 								 st->ndsource - 1, st->dsources[0].sets->ntids,
 								 lion_ingroup_more(st));
+
+		/* the group's aggregates of sliced columns (DESIGN.md §52) */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs = st->dsources[0].sets;
+
+			lion_slice_group(st, 1, &gs);
+		}
 		lion_posting_set_release(&st->groupset);
 		MemoryContextSwitchTo(oldcxt);
 
@@ -2750,6 +2874,16 @@ lion_next_group2(LionCountScanState *st, bool *exhausted)
 		count = lion_group_count(st, st->nsource, st->sources, st->nitem,
 								 Min(st->groupset.ntids, st->groupset2.ntids),
 								 more);
+
+		/* the pair's aggregates of sliced columns (DESIGN.md §52) */
+		if (st->slice != NULL && count > 0)
+		{
+			LionPostingSet *gs[2];
+
+			gs[0] = &st->groupset;
+			gs[1] = &st->groupset2;
+			lion_slice_group(st, 2, gs);
+		}
 		lion_posting_set_release(&st->groupset2);
 		MemoryContextSwitchTo(oldcxt);
 

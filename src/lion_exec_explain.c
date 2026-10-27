@@ -1127,6 +1127,40 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	}
 
 	/*
+	 * The sliced columns aggregates are answered from (DESIGN.md §52): each
+	 * index and column, and which of its slices are counted against the
+	 * WHERE - every bit's and E's for a sum or an average, E's alone
+	 * otherwise - and the descents its extremes take.
+	 */
+	if (st->slice != NULL)
+	{
+		int			c;
+
+		initStringInfo(&buf);
+		for (c = 0; c < st->slice->ncol; c++)
+		{
+			LionSCol   *col = &st->slice->col[c];
+			int			want = col->want;
+
+			appendStringInfo(&buf, "%s%s (%s: %s%s%s)", (c > 0) ? ", " : "",
+							 get_rel_name(col->idxoid),
+							 lion_explain_attname(st, col->attno),
+							 (want & LION_SWANT_SUM) ?
+							 "every bit counted" : "existence counted",
+							 (want & LION_SWANT_MIN) ? ", min descent" : "",
+							 (want & LION_SWANT_MAX) ? ", max descent" : "");
+		}
+		ExplainPropertyText("Aggregates From Slices", buf.data, es);
+		pfree(buf.data);
+
+		/* a GROUP BY's: a group at a time, or decoded a batch at a time */
+		if (st->plan.groupattno != 0)
+			ExplainPropertyText("Slice Groups",
+								st->slice->decode ? "decoded by batch" :
+								"one at a time", es);
+	}
+
+	/*
 	 * The top k by count (DESIGN.md §36): k, and how many entries the walk of
 	 * their counts keeps as candidates.
 	 */
@@ -1473,6 +1507,63 @@ lion_explain_group_counters(LionCountScanState *st, ExplainState *es)
 		if (st->wagg->slow > 0)
 			ExplainPropertyInteger("Key Walks Counted", NULL, st->wagg->slow,
 								   es);
+	}
+
+	/*
+	 * The aggregates of sliced columns (DESIGN.md §52): the slices located
+	 * and how many of them had no entry, the counted ANDs, the slices'
+	 * containers the walks counted - and of those the plane kernel's, at how
+	 * many keys, and which kernel - the descents' steps and the candidate
+	 * sets they collected, and the copies of E ∧ WHERE made.
+	 */
+	if (st->slice != NULL && st->slice->runs > 0)
+	{
+		LionSliceState *ss = st->slice;
+
+		ExplainPropertyInteger("Slices Located", NULL, ss->located, es);
+		if (ss->absent > 0)
+			ExplainPropertyInteger("Slices Absent", NULL, ss->absent, es);
+		if (ss->counts > 0 || ss->batches == 0)
+		{
+			ExplainPropertyInteger("Slice Counts", NULL, ss->counts, es);
+			ExplainPropertyInteger("Slice Containers Counted", NULL,
+								   ss->containers, es);
+		}
+		if (ss->kernelplanes > 0)
+		{
+			ExplainPropertyInteger("Slice Containers by Kernel", NULL,
+								   ss->kernelplanes, es);
+			ExplainPropertyInteger("Slice Kernel Keys", NULL, ss->kernelkeys,
+								   es);
+			ExplainPropertyText("Slice Kernel",
+								lion_simd_name(lion_simd_current()), es);
+		}
+		if (ss->steps > 0)
+			ExplainPropertyInteger("Slice Descent Steps", NULL, ss->steps,
+								   es);
+		if (ss->collects > 0)
+			ExplainPropertyInteger("Slice Candidate Sets", NULL,
+								   ss->collects, es);
+		ExplainPropertyInteger("Slice WHERE Copies", NULL, ss->copies, es);
+		if (ss->batches > 0)
+		{
+			ExplainPropertyInteger("Slice Batches Decoded", NULL, ss->batches,
+								   es);
+			ExplainPropertyInteger("Slice Keys Decoded", NULL, ss->decodekeys,
+								   es);
+			ExplainPropertyInteger("Slice Rows Decoded", NULL, ss->decoderows,
+								   es);
+			if (ss->decoderechecked > 0)
+				ExplainPropertyInteger("Slice Rows Rechecked", NULL,
+									   ss->decoderechecked, es);
+		}
+		if (ss->tidsrechecked > 0)
+		{
+			ExplainPropertyInteger("Slice Heap TIDs Rechecked", NULL,
+								   ss->tidsrechecked, es);
+			ExplainPropertyInteger("Slice Heap Blocks Rechecked", NULL,
+								   ss->blocksrechecked, es);
+		}
 	}
 
 	/*

@@ -215,6 +215,7 @@ lion_build_simple_rel(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte)
 	if (lion_prev_build_simple_rel_hook)
 		lion_prev_build_simple_rel_hook(root, rel, rte);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #else
 static void
@@ -225,6 +226,7 @@ lion_get_relation_info(PlannerInfo *root, Oid relationObjectId,
 		lion_prev_get_relation_info_hook(root, relationObjectId, inhparent,
 										 rel);
 	lion_drop_other_format(rel);
+	lion_leave_out_slice_pages(rel);
 }
 #endif
 
@@ -635,6 +637,41 @@ _PG_init(void)
 							PGC_USERSET,
 							0,
 							NULL, NULL, NULL);
+
+	/*
+	 * DESIGN.md §52: whether the count pushdown may answer sum, avg, count,
+	 * min and max of a bit-sliced column (§51) from its slices, and whether
+	 * the slices' counts may use the plane kernel (§50) at the container
+	 * keys where they are bitmaps of one width.  Off, the first leaves such
+	 * aggregates to the other plans; the second counts each slice's
+	 * container by lion_container_and_cardinality(), with the same answers.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_count_slices",
+							 "Lets the count pushdown answer sum, avg, count, min and max of a bit-sliced lion column from its slices.",
+							 "Off, such aggregates go to the aggregates over keys or to the ordinary plan.",
+							 &lion_enable_count_slices,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_slice_decode",
+							 "Lets a GROUP BY of one column answer the aggregates of bit-sliced columns a batch of groups at a time.",
+							 "Off, each group's aggregates are counted from the slices on their own.",
+							 &lion_enable_slice_decode,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_slice_kernel",
+							 "Lets the counts of a bit-sliced column's slices use the bit-plane kernel where the slices are bitmaps of one width.",
+							 "Off, each slice's container is counted on its own; the answers are the same either way.",
+							 &lion_enable_slice_kernel,
+							 true,
+							 PGC_USERSET,
+							 GUC_NOT_IN_SAMPLE,
+							 NULL, NULL, NULL);
 
 	/*
 	 * DESIGN.md §36: whether a GROUP BY ordered by its count under a LIMIT

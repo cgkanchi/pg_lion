@@ -18,7 +18,7 @@
 #define LION_FLAG_ALL \
 	(LION_FLAG_SINGLEGROUP | LION_FLAG_SUMALL | LION_FLAG_GROUPIDX | \
 	 LION_FLAG_RANGE | LION_FLAG_DECODE | LION_FLAG_RESID | \
-	 LION_FLAG_RANGEWALK)
+	 LION_FLAG_RANGEWALK | LION_FLAG_SLICEDECODE)
 #define LION_JOINFLAG_ALL \
 	(LION_JOINFLAG_COLLECT | LION_JOINFLAG_ROWS | LION_JOINFLAG_UNIQUE | \
 	 LION_JOINFLAG_WALK | LION_JOINFLAG_SUM | LION_JOINFLAG_COUNTS | \
@@ -33,7 +33,7 @@ static const char *const lion_priv_name[LION_PRIV_NMEMBERS] = {
 	"VERSION", "OIDS", "INTS", "CONSTS", "CLAUSEKINDS", "PARTS", "CLAUSEOPS",
 	"ORS", "HAVING", "DISTINCT", "JOIN", "EXECUTE", "COALESCE", "IMPLIED",
 	"FACTGROUP", "GROUPN", "ALLROWS", "TOPK", "WAGG", "VCOLS", "FILTERS",
-	"RESID", "PARTIAL", "CELLS", "ANTI",
+	"RESID", "PARTIAL", "CELLS", "ANTI", "SLICES",
 	"TLKINDS"
 };
 
@@ -63,6 +63,7 @@ static const NodeTag lion_priv_tag[LION_PRIV_NMEMBERS] = {
 	T_List,						/* PARTIAL */
 	T_List,						/* CELLS */
 	T_List,						/* ANTI */
+	T_List,						/* SLICES */
 	T_IntList					/* TLKINDS */
 };
 
@@ -469,6 +470,70 @@ lion_priv_decode_wagg(List *priv, LionPrivStage stage, LionCountPriv *out)
 }
 
 /*
+ * The aggregates of bit-sliced columns answered from their slices
+ * (DESIGN.md §52): three lists of one element per column, and at plan time a
+ * fourth of one IntList per aggregate - {kind, column}.
+ */
+static void
+lion_priv_decode_slices(List *priv, LionPrivStage stage, LionCountPriv *out)
+{
+	List	   *s = (List *) list_nth(priv, LION_PRIV_SLICES);
+	List	   *attnos;
+	List	   *oids;
+	List	   *cols;
+	List	   *specs;
+	int			i;
+
+	if (s == NIL)
+		return;
+	if (list_length(s) != (stage == LION_PRIV_STAGE_PLAN ? 4 : 3))
+		elog(ERROR, "LionCount: malformed slice aggregates");
+	attnos = (List *) linitial(s);
+	oids = (List *) lsecond(s);
+	cols = (List *) lthird(s);
+	if (attnos == NIL || !IsA(attnos, IntList) ||
+		!lion_priv_is(oids, T_OidList) || !lion_priv_is(cols, T_IntList) ||
+		list_length(oids) != list_length(attnos) ||
+		list_length(cols) != list_length(attnos))
+		elog(ERROR, "LionCount: malformed slice aggregates");
+
+	out->nscol = list_length(attnos);
+	out->scol = (LionCountPrivSCol *)
+		palloc0(sizeof(LionCountPrivSCol) * out->nscol);
+	for (i = 0; i < out->nscol; i++)
+	{
+		out->scol[i].attno = (AttrNumber) list_nth_int(attnos, i);
+		out->scol[i].idxoid = list_nth_oid(oids, i);
+		out->scol[i].idxcol = (AttrNumber) list_nth_int(cols, i);
+		if (out->scol[i].attno <= 0 || !OidIsValid(out->scol[i].idxoid) ||
+			out->scol[i].idxcol < 1)
+			elog(ERROR, "LionCount: malformed slice aggregates");
+	}
+
+	if (stage != LION_PRIV_STAGE_PLAN)
+		return;
+	specs = (List *) lfourth(s);
+	if (!lion_priv_is(specs, T_List))
+		elog(ERROR, "LionCount: malformed slice aggregates");
+	out->nsagg = list_length(specs);
+	out->sagg = (LionCountPrivSAgg *)
+		palloc0(sizeof(LionCountPrivSAgg) * Max(out->nsagg, 1));
+	for (i = 0; i < out->nsagg; i++)
+	{
+		List	   *spec = (List *) list_nth(specs, i);
+		LionCountPrivSAgg *a = &out->sagg[i];
+
+		if (spec == NIL || !IsA(spec, IntList) || list_length(spec) != 2)
+			elog(ERROR, "LionCount: malformed slice aggregates");
+		a->kind = list_nth_int(spec, 0);
+		a->col = list_nth_int(spec, 1);
+		if (a->col < 0 || a->col >= out->nscol ||
+			a->kind <= LION_SAGG_NONE || a->kind > LION_SAGG_MAXKIND)
+			elog(ERROR, "LionCount: malformed slice aggregates");
+	}
+}
+
+/*
  * The kinds of custom_scan_tlist's columns (LION_TL_*), each one of the
  * kinds there are: a child's column, a group key or count, a clause's
  * stored key, or an aggregate over keys or its key.  Which of them the plan
@@ -490,6 +555,7 @@ lion_priv_decode_tlkinds(List *priv, LionCountPriv *out)
 			!(kind >= 0 && kind < LION_TL_WHEREKEY + out->nclause) &&
 			!LION_TL_IS_WAGG(kind) && !LION_TL_IS_WKEY(kind) &&
 			!LION_TL_IS_RESID(kind) && !LION_TL_IS_ANTI(kind) &&
+			!(LION_TL_IS_SAGG(kind) && LION_TL_SAGG_NO(kind) < out->nsagg) &&
 			!(LION_TL_IS_CELLPRED(kind) &&
 			  LION_TL_CELLPRED_NO(kind) < out->ncellpred) &&
 			!(LION_TL_IS_FCOUNT(kind) &&
@@ -990,6 +1056,7 @@ lion_count_priv_decode(List *priv, LionPrivStage stage, LionCountPriv *out)
 	lion_priv_decode_partial(priv, out);
 	lion_priv_decode_cells(priv, stage, out);
 	lion_priv_decode_anti(priv, stage, out);
+	lion_priv_decode_slices(priv, stage, out);
 
 	if (stage == LION_PRIV_STAGE_PLAN)
 		lion_priv_decode_tlkinds(priv, out);
@@ -1256,6 +1323,33 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		m = list_make2(aints, aoids);
 		if (stage == LION_PRIV_STAGE_PATH)
 			m = lappend(m, a->exprs);
+	}
+	priv = lappend(priv, m);
+
+	/* the slice aggregates (DESIGN.md §52): their kinds at the PLAN stage */
+	m = NIL;
+	if (p->nscol > 0)
+	{
+		List	   *attnos = NIL;
+		List	   *idxoids = NIL;
+		List	   *cols = NIL;
+
+		for (i = 0; i < p->nscol; i++)
+		{
+			attnos = lappend_int(attnos, (int) p->scol[i].attno);
+			idxoids = lappend_oid(idxoids, p->scol[i].idxoid);
+			cols = lappend_int(cols, (int) p->scol[i].idxcol);
+		}
+		m = list_make3(attnos, idxoids, cols);
+		if (stage == LION_PRIV_STAGE_PLAN)
+		{
+			List	   *specs = NIL;
+
+			for (i = 0; i < p->nsagg; i++)
+				specs = lappend(specs, list_make2_int(p->sagg[i].kind,
+													  p->sagg[i].col));
+			m = lappend(m, specs);
+		}
 	}
 	priv = lappend(priv, m);
 
@@ -1711,6 +1805,50 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 			(LION_TL_IS_WAGG(p->tlkind[i]) &&
 			 LION_TL_WAGG_NO(p->tlkind[i]) >= p->nwagg))
 			elog(ERROR, "LionCount: malformed aggregates over keys");
+	}
+
+	/*
+	 * The aggregates of sliced columns from their slices (DESIGN.md §52)
+	 * are counted against the WHERE of one table collected whole: no join,
+	 * partitions, count(DISTINCT), top k, aggregates over keys, residual
+	 * clause, anti join, cells, coalesce group or expression column, no
+	 * range walked at every count, and not in parallel; one row, a count's
+	 * or a sum's, or the groups of one column's walk or two's pairs, with no
+	 * filtered counts beside them.  Their kinds need the 128-bit sums where
+	 * they sum.
+	 */
+	if (p->nscol > 0)
+	{
+		if (p->hasjoin || p->npart > 0 || p->distattno != 0 ||
+			p->topkn > 0 || p->nwcol > 0 ||
+			(p->flags & LION_FLAG_RESID) != 0 || p->hasanti ||
+			p->ncelldim > 0 || p->coalconst != NULL || parallel_aware ||
+			(p->flags & LION_FLAG_RANGEWALK) != 0 || decode ||
+			(p->groupattno != 0 && (!hasgroupidx || p->nfilter > 0)))
+			elog(ERROR, "LionCount: malformed slice aggregates");
+		/* decoded a batch at a time: the groups of one column's walk */
+		if ((p->flags & LION_FLAG_SLICEDECODE) != 0 &&
+			(p->groupattno == 0 || p->groupattno2 != 0))
+			elog(ERROR, "LionCount: malformed slice aggregates");
+		for (i = 0; i < p->nscol; i++)
+		{
+			if (LION_ATTNO_IS_VCOL(p->scol[i].attno))
+				elog(ERROR, "LionCount: malformed slice aggregates");
+		}
+	}
+	else if ((p->flags & LION_FLAG_SLICEDECODE) != 0)
+		elog(ERROR, "LionCount: malformed slice aggregates");
+	if (p->nscol > 0)
+	{
+#ifndef HAVE_INT128
+		for (i = 0; i < p->nsagg; i++)
+		{
+			if (p->sagg[i].kind != LION_SAGG_COUNT &&
+				p->sagg[i].kind != LION_SAGG_MIN &&
+				p->sagg[i].kind != LION_SAGG_MAX)
+				elog(ERROR, "LionCount: a sum from slices without 128-bit integers");
+		}
+#endif
 	}
 
 	/* count(DISTINCT k) and count(k) of that k read the k's state (§26) */
