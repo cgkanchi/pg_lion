@@ -173,7 +173,8 @@ pg_lion.competitor_pricing=off` runs it with lion's paths priced by their own wo
     src/lion_amcost.c       amcostestimate: the cost of plain and bitmap scans
     src/lion_build.c        ambuild via tuplesort (hash, key, tid code); INLINE entries or per-key posting trees
     src/lion_scan.c         amgetbitmap, and amgettuple for plain index scans
-    src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path)
+    src/lion_insert.c       aminsert (serialised on the directory leaf; bitset in-place fast path; a row's
+                            bit slices a walk of the leaf a column, their in-place adds several to a record)
     src/lion_vacuum.c       ambulkdelete with cleanup locks on every page, two-pass cancellable protocol
     src/lion_funcs.[ch]     lion_index_stats() and the other diagnostics; lion_funcs.h is private to them
     src/lion_verify*.c      lion_index_verify(): pages and posting sets, the directory, rechecks and

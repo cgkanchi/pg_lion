@@ -184,7 +184,9 @@ dozen counted ANDs a group, or, for many groups of one column, a pass over the s
 groups that reads every row's value off them. The planner weighs this against the ordinary plan;
 on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166, and the sum,
 minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
-price is an insert into each set bit's set on every write of the column. A range on the sliced
+price is an insert into each set bit's set on every write of the column: an `INSERT` of many rows
+into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
+`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). A range on the sliced
 column itself (`amount > 100`), a percentile, a join and a partitioned table are not answered from
 the slices yet; `SELECT * FROM lion_index_slice_agg('events_amount', 'country = ''JP''')` answers
 the same aggregates for a filter given as text.

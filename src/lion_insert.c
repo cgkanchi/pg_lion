@@ -2007,8 +2007,9 @@ lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
 }
 
 /*
- * ONE RECORD for a row's in-place adds into the CHAIN slices of a column
- * that are on one directory leaf (DESIGN.md §51, "Insert cost, revisited").
+ * SEVERAL SLICES TO A RECORD: a row's in-place adds into the slices of a
+ * column that are on one directory leaf (DESIGN.md §51, "Insert cost,
+ * revisited").
  *
  * A dense slice is a posting tree, and a row appended to the table lands in
  * the last container of each of its slices' trees, on the tree's tail, where
@@ -2016,15 +2017,18 @@ lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
  * and the entry's leaf (lion_insert_container_inplace()).  The leaf is the
  * same for every slice of the run, so a row of an int8 column wrote it into
  * 33 records on average.  Here the adds are gathered first - each slice's
- * tail locked, its item found and checked for room, its entry copied with its
- * count raised, everything fallible done - and then made in one ITEM_SET
- * record of up to LION_SLICE_BATCH posting leaves and the leaf, which holds
- * every entry's DELTA: LION_WAL_MAX_BLOCKS buffers, the bound every record
- * and every lock-order argument keeps.  The record is ITEM_SET as before,
- * with more blocks and more operations per block, which its redo has always
- * taken (lion_redo_apply() runs any stream on any block), so the WAL format
- * is unchanged.  A batch of one is byte for byte the record of a single
- * insert.
+ * tail locked, its item found and checked for room, everything fallible done
+ * - and then made in one ITEM_SET record of the posting leaves and the leaf:
+ * up to three posting leaves in generic mode, GenericXLog's four buffers in
+ * all, and up to seven with the resource manager, which takes a wider record
+ * when asked (lion_wal_begin_ext(), LION_WAL_MAX_BLOCKS_WIDE).  On the leaf
+ * each CHAIN entry's counter is raised in place and logged as the bytes that
+ * changed (lion_slice_count_one()), and an INLINE slice whose grown payload
+ * fits the bytes its entry has joins the record as a rewrite of the entry at
+ * its length (lion_slice_batch_inline()).  The record is ITEM_SET as before
+ * - ENTRY when every slice in it was INLINE - with more blocks and more
+ * operations per block, which its redo has always taken (lion_redo_apply()
+ * runs any stream on any block), so the WAL format is unchanged.
  *
  * LOCKS.  The leaf is held throughout, so no other writer of these slices
  * runs, and each tail is locked after it, as a single insert does.  The one
@@ -2044,9 +2048,9 @@ lion_slice_insert_one(Relation index, Relation heaprel, LionState *state,
  * a slice that needs the general path (an item without room, a new segment,
  * a member past a NARROW's width), a tail that is not the set's rightmost
  * leaf or does not own the ckey (lion_insert_lock_chain_page()'s hint), an
- * INLINE slice and a new one - each of which may split the leaf, which would
- * move the batch's entries - and the batch is also written before the walk
- * leaves its leaf.
+ * INLINE slice that has to grow or spill, and a new one - each of which may
+ * split the leaf, which would move the batch's entries - and the batch is
+ * also written before the walk leaves its leaf.
  */
 typedef struct LionSliceAdd
 {
@@ -2086,8 +2090,9 @@ typedef struct LionSliceBatch
  * one pass over the page (lion_page_check_items()), until the walk moves to
  * another leaf or changes this one the ordinary way (b->checked).  For a
  * column of 17 or 33 slices on a leaf of a few hundred entries that is a
- * twentieth of the work, which the profile of the batched inserts had put at
- * a sixth of their time.
+ * quarter to an eighth of the work - a pass that marks the few 8-byte units
+ * of each item, against 17 or 33 passes over every line pointer - which the
+ * profile of the batched inserts had put at some 13% of their time.
  */
 static void
 lion_slice_batch_check_leaf(Relation index, LionSliceBatch *b, Buffer leafbuf)
@@ -2388,12 +2393,15 @@ lion_slice_batch_write(Relation index, Buffer leafbuf, LionSliceBatch *b)
  * next one from the leaf the walk holds (lion_dir_find_next()), which moves
  * right as a descent would when the slices spill onto the next leaf or a
  * split of the held leaf moved them there.  The leaf stays held from the
- * first slice to the last, and each slice is put in as by an insert of its
- * own - its writer check, its posting pages locked after the leaf and let go
- * before the next - so the lock order and the split protocol are those of
- * one insert, repeated.  Holding the leaf across the steps keeps out the
- * other writers of these slices for the row's whole walk, rather than for
- * each step; they would queue on the same leaf for every step anyway.
+ * first slice to the last.  Each slice has its writer check; the in-place
+ * adds go into a batch of several slices to a record (lion_slice_batch_add()
+ * above), and anything else is put in as by an insert of its own
+ * (lion_slice_put()), its posting pages locked after the leaf and let go
+ * before the next, after the batch is written - so the lock order and the
+ * split protocol are those of one insert, repeated.  Holding the leaf across
+ * the steps keeps out the other writers of these slices for the row's whole
+ * walk, rather than for each step; they would queue on the same leaf for
+ * every step anyway.
  *
  * THE SEAM for the plane kernel (DESIGN.md §50, §51 "Not done"): one row at
  * a time.  An insert of many rows - a COPY, an INSERT ... SELECT - could turn

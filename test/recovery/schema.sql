@@ -431,6 +431,7 @@ DECLARE
 	l record;
 	q record;
 	col text := pg_get_indexdef('lion_rec_slc'::regclass, attno, true);
+	name text := regexp_replace(col, '\s+', ' ', 'g');	/* a detail is one line */
 BEGIN
 	SELECT * INTO l FROM lion_index_slice_agg('lion_rec_slc', NULL, attno);
 	EXECUTE format('SELECT count(%1$s) AS count, sum(%1$s)::numeric AS sum, '
@@ -439,10 +440,10 @@ BEGIN
 	IF (l.count, l.sum, l.min, l.max) IS NOT DISTINCT FROM
 		(q.count, q.sum, q.min, q.max) THEN
 		RETURN format('slices of lion_rec_slc column %s (%s): %s rows, sum %s, %s .. %s',
-					  attno, col, l.count, l.sum, l.min, l.max);
+					  attno, name, l.count, l.sum, l.min, l.max);
 	END IF;
 	RETURN format('MISMATCH slices of lion_rec_slc column %s (%s): %s %s %s %s, scan %s %s %s %s',
-				  attno, col, l.count, l.sum, l.min, l.max,
+				  attno, name, l.count, l.sum, l.min, l.max,
 				  q.count, q.sum, q.min, q.max);
 END $$;
 

@@ -579,9 +579,12 @@ by its pages less the slices', which those scans do not read (DESIGN.md §52). A
 `float4`, `float8`, `numeric`, `interval`, text, arrays, ...) is simply not sliced, and
 `lion_index_stats().sliced` says which are. Every insert into a sliced column also puts the row
 into the slice of each bit its value has set - about half the bits for values spread over the type,
-so some 17 posting-set inserts for an `int4`, 33 for an `int8` - which is the price of the option:
-an `INSERT` of such values into a lion index of an `int4` and one of an `int8` took about 9 times
-as long as without slices (DESIGN.md §51.11). The slices of a dense column are mostly bitsets, which
+so some 17 posting-set inserts for an `int4`, 33 for an `int8` - which is the price of the option.
+A row's slices of a column are found by one descent and their in-place changes written several
+to a WAL record, and still an `INSERT ... SELECT` of such values into a lion index of an `int4`
+and one of an `int8` took about 4.6 times as long as without slices with `pg_lion` preloaded
+(the custom WAL records), about 11 times without it, and single-row INSERTs 2.8 and 11 times
+(DESIGN.md §51, "Insert cost, revisited"); preload it for a table that takes many writes. The slices of a dense column are mostly bitsets, which
 an insert changes in place; they added 4% to 40% to the size of the indexes measured, the most to a
 column of few keys. An index build with slices took 1.2 to 1.5 times as long. Read at build
 time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes effect at the next REINDEX. An
@@ -1525,7 +1528,8 @@ Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, 
 not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
 from them (DESIGN.md §52), but not a range on the sliced column itself, a percentile, a join's or
 a partitioned table's aggregates. An insert into a sliced column costs a posting-set insert per set
-bit of its value.
+bit of its value - in place, several to a WAL record, but a posting page each (DESIGN.md §51,
+"Insert cost, revisited").
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
 the planner prices them out and declines the count pushdown and `LionOrdered` - a filtered
