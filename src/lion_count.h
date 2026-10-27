@@ -1074,6 +1074,57 @@ extern void lion_slice_shape(Relation index, AttrNumber attno,
 							 LionSliceShape *shape);
 
 /*
+ * A RANGE ON A SLICED COLUMN FROM ITS SLICES (DESIGN.md §53, lion_slice.c):
+ * the bounds of `x > c`, `x >= c`, `x < c`, `x <= c`, BETWEEN and `x <> c`
+ * on a key column sliced nbits wide, ANDed, as encodings
+ * (lion_slice_enc.h): the rows of E whose encoding lies in [lo, hi] and is
+ * none of holes[].  Built a bound at a time with the bound's value and type
+ * (lion_slice_range_add()) and settled once they are all in
+ * (lion_slice_range_settle()), which clips the bounds to the type's range:
+ * a bound past it, a NULL one or bounds that cross leave the range `empty`,
+ * and bounds that every value meets leave it `all` - E itself.
+ */
+typedef struct LionSliceRange
+{
+	int			nbits;
+	Oid			typid;			/* the column's key type */
+	int64		lov;			/* the least value inside, as the type's */
+	int64		hiv;			/* ... and the greatest */
+	int			nholes;
+	int			maxholes;
+	int64	   *holev;			/* `<>` values */
+	bool		empty;
+	/* settled: */
+	bool		all;			/* every row of E, no hole */
+	bool		haslo;			/* the rows below lo are taken out */
+	bool		hashi;			/* ... and those above hi */
+	uint64		lo;
+	uint64		hi;
+	uint64	   *holes;			/* the holes inside [lo, hi], encoded */
+} LionSliceRange;
+
+/* What a collection from slices did, for EXPLAIN ANALYZE. */
+typedef struct LionSliceRangeStats
+{
+	int64		descents;		/* collections made */
+	int64		keys;			/* container keys of E folded */
+	int64		steps;			/* bit steps, a comparison each: the
+								 * container operations */
+	int64		spilled;		/* collections that went to a file */
+} LionSliceRangeStats;
+
+extern void lion_slice_range_init(LionSliceRange *r, Oid typid, int nbits);
+extern bool lion_slice_range_type_ok(Oid coltype, Oid valtype);
+extern void lion_slice_range_add(LionSliceRange *r, StrategyNumber strategy,
+								 Oid valtype, Datum value, bool isnull);
+extern void lion_slice_range_settle(LionSliceRange *r);
+extern bool lion_slice_range_collect(Relation index, AttrNumber attno,
+									 const LionSliceRange *r, Size maxbytes,
+									 bool spill, LionPostingSet *out,
+									 Size *held, bool *spilled,
+									 LionSliceRangeStats *stats);
+
+/*
  * THE GROUPS OF SEVERAL COLUMNS, DECODED KEY BY KEY (DESIGN.md §34,
  * lion_count_decode.c).  One pass of a GROUP BY of ncol columns: column c's
  * values in the pass are the nsets located sets of cols[c], and the rows of a

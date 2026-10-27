@@ -123,7 +123,8 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 
 		cl->kind = list_nth_int(ckinds, i);
 		cl->walk = (cl->kind & LION_CLAUSE_WALK) != 0;
-		cl->kind &= ~LION_CLAUSE_WALK;
+		cl->sliced = (cl->kind & LION_CLAUSE_SLICED) != 0;
+		cl->kind &= ~(LION_CLAUSE_WALK | LION_CLAUSE_SLICED);
 		cl->idxoid = list_nth_oid(oids, 3 + i);
 		cl->attno = (AttrNumber) list_nth_int(ints, 4 + i);
 		cl->opno = list_nth_oid(ops, i);
@@ -131,6 +132,8 @@ lion_priv_decode_relation(List *priv, LionCountPriv *out)
 			elog(ERROR, "LionCount: unknown clause kind %d", cl->kind);
 		if (cl->walk && cl->kind != LION_CLAUSE_RANGESRC)
 			elog(ERROR, "LionCount: a clause of kind %d walked", cl->kind);
+		if (cl->sliced && (cl->kind != LION_CLAUSE_RANGESRC || cl->walk))
+			elog(ERROR, "LionCount: a clause of kind %d from slices", cl->kind);
 	}
 }
 
@@ -1097,7 +1100,8 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		oids = lappend_oid(oids, p->clause[i].idxoid);
 		ints = lappend_int(ints, (int) p->clause[i].attno);
 		ckinds = lappend_int(ckinds, p->clause[i].kind |
-							 (p->clause[i].walk ? LION_CLAUSE_WALK : 0));
+							 (p->clause[i].walk ? LION_CLAUSE_WALK : 0) |
+							 (p->clause[i].sliced ? LION_CLAUSE_SLICED : 0));
 		ops = lappend_oid(ops, p->clause[i].opno);
 	}
 	for (i = 0; i < p->npart; i++)

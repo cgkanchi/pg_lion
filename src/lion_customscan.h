@@ -686,6 +686,16 @@ StaticAssertDecl(LION_MAX_GROUPCOLS <= LION_MAX_DECODE_COLS,
 #define LION_CLAUSE_WALK		0x100
 
 /*
+ * ... and the first bound of a range the plan collects from the slices of
+ * its column (DESIGN.md §53, "Ranges from slices"), where the planner found
+ * that cheaper than walking its entries and summaries: the executor folds
+ * the slices into the copy (lion_slice_range_collect()) and counts it beside
+ * the column's existence slice, located with its pin.  Never with
+ * LION_CLAUSE_WALK.
+ */
+#define LION_CLAUSE_SLICED		0x200
+
+/*
  * A RANGE clause is neither: it is not a source of the count at all, but a
  * bound on the entry walk that drives it (DESIGN.md §28), so it is never
  * located, never merged and never priced as a lookup.  A RANGESRC clause is a
@@ -1621,6 +1631,7 @@ typedef struct LionClauseState
 {
 	int			kind;			/* LION_CLAUSE_* */
 	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
+	bool		sliced;			/* RANGESRC: LION_CLAUSE_SLICED */
 	Oid			idxoid;
 	Oid			opno;			/* the clause's operator (0 for a null test) */
 	AttrNumber	attno;			/* the HEAP column (the parent's, with §16's
@@ -1761,6 +1772,10 @@ typedef struct LionRangeSource
 	AttrNumber	col;			/* its KEY COLUMN in index */
 	LionRange	range;
 	bool		walk;			/* one of its bounds is LION_CLAUSE_WALK */
+	bool		sliced;			/* ... or LION_CLAUSE_SLICED, and the key
+								 * column is sliced: srange is its bounds
+								 * as encodings (DESIGN.md §53) */
+	LionSliceRange srange;
 	int			lead;			/* the clause of its first bound, which
 								 * counts it (LionClauseState.counted) */
 } LionRangeSource;
@@ -2574,6 +2589,7 @@ typedef struct LionCountPrivClause
 	Oid			opno;			/* InvalidOid for a null test */
 	int			filter;			/* FILTERS: 0, or its filtered count's */
 	bool		walk;			/* RANGESRC: LION_CLAUSE_WALK */
+	bool		sliced;			/* RANGESRC: LION_CLAUSE_SLICED */
 } LionCountPrivClause;
 
 /* One live leaf partition (DESIGN.md §16): an OidList of PARTS */
@@ -2904,6 +2920,7 @@ typedef struct LionScanWorkerSums
 	int64		rangeeval[3];
 	int64		summaries;
 	int64		rangeprobed;
+	LionSliceRangeStats sliceranges;
 	int64		wherecollected;
 	int64		wherespilled;
 	int64		groupbatches;
@@ -3006,6 +3023,13 @@ typedef struct LionCountScanState
 	 * Probed".
 	 */
 	int64		rangeprobed;
+
+	/*
+	 * The ranges collected from slices (DESIGN.md §53): the collections, the
+	 * container keys of E they folded, their bit steps and the collections
+	 * that went to a file - EXPLAIN ANALYZE's "Slice Range" lines.
+	 */
+	LionSliceRangeStats sliceranges;
 
 	/*
 	 * The ranges taken as sources (DESIGN.md §32, "A range as a source"), and
@@ -3858,6 +3882,8 @@ typedef struct LionClauseInfo
 	StrategyNumber strategy;	/* multi-key clauses only */
 	Oid			extractquery;	/* multi-key clauses only */
 	Oid			collation;		/* clause input collation; InvalidOid if the operator ignores it */
+	bool		sliced;			/* RANGESRC: from the slices of its index's
+								 * column (LION_CLAUSE_SLICED, §53) */
 	bool		valueout;		/* the target list prints this column's value,
 								 * so the index has to be able to produce it
 								 * (lion_index_can_emit_value()) */
