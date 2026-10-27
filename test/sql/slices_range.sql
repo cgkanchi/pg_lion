@@ -287,8 +287,8 @@ SELECT q, slr_q(q) FROM unnest(ARRAY[
 	'SELECT sum(b), avg(b) FROM slr WHERE b BETWEEN -1000 AND 1000',
 	'SELECT sum(c), min(c), max(c) FROM slr WHERE c < -5000000000',
 	'SELECT min(d), max(d), count(d) FROM slr WHERE d > ''1990-01-01''',
-	'SELECT min(ts), max(ts) FROM slr WHERE ts < ''2000-01-01''',
-	'SELECT max(tz), min(t) FROM slr WHERE tz > ''2020-01-01 12:00+00''',
+	'SELECT min(ts), max(ts), count(ts) FROM slr WHERE ts < ''2000-01-01''',
+	'SELECT max(tz), min(t), count(*) FROM slr WHERE tz > ''2020-01-01 12:00+00''',
 	'SELECT sum(a), max(c) FROM slr WHERE b > 0',
 	'SELECT sum(b) FROM slr WHERE b <> 0 AND g = 3',
 	'SELECT g, sum(b), min(b), count(*) FROM slr WHERE b > 0 GROUP BY g',
@@ -399,15 +399,51 @@ SELECT q, slr_q(q) FROM unnest(ARRAY[
 SELECT slr_plan('SELECT count(*) FROM slr WHERE b > 0', true);
 
 -- ---------- 5. a copy past the memory ----------
--- At the least hash table the copy goes to a temporary file, which the
--- counts read a container at a time.
+-- 600,000 rows of four bytes on 42 container keys: the copy of half of them,
+-- a 2 kB bitmap a key, is past the least hash table and goes to a temporary
+-- file, which the counts read a container at a time - beside a GROUP BY's
+-- WHERE collected once, beside another clause, and as the aggregates' WHERE.
+CREATE TABLE slr_s (k int4, g int2) WITH (autovacuum_enabled = off);
+INSERT INTO slr_s SELECT hashint4(i), i % 10 FROM generate_series(1, 600000) i;
+CREATE INDEX slr_s_k ON slr_s USING lion (k) WITH (slices = on);
+CREATE INDEX slr_s_g ON slr_s USING lion (g);
+VACUUM (FREEZE, ANALYZE) slr_s;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
-SELECT slr_q('SELECT count(*) FROM slr WHERE b > -90000 AND c > -9000000000');
-SELECT slr_q('SELECT g, count(*) FROM slr WHERE b > -90000 GROUP BY g');
-SELECT slr_plan('SELECT count(*) FROM slr WHERE b > -90000 AND c > -9000000000', true);
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr_s WHERE k > 0',
+	'SELECT g, count(*) FROM slr_s WHERE k BETWEEN -1500000000 AND 1500000000 GROUP BY g',
+	'SELECT count(*) FROM slr_s WHERE k > 0 AND g = 3',
+	'SELECT sum(k), max(k) FROM slr_s WHERE k < 0'
+]) q;
+SELECT slr_plan('SELECT count(*) FROM slr_s WHERE k > 0', true);
 RESET work_mem;
 RESET hash_mem_multiplier;
+
+-- ---------- 5b. in parallel ----------
+-- A count of one row divided among the participants of a Gather by ranges of
+-- container keys: each collects the range from the slices, as each collects
+-- a range of the entries (§10, "A count in parallel").  A GROUP BY beside a
+-- range taken as a source stays serial, as it does beside any.
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SET pg_lion.parallel_range_keys = 1;
+SELECT q, slr_q(q) FROM unnest(ARRAY[
+	'SELECT count(*) FROM slr_s WHERE k > 0 AND g = 3',
+	'SELECT count(*) FROM slr_s WHERE k BETWEEN -1000000000 AND 1000000000 AND g IN (1, 2)',
+	'SELECT g, count(*) FROM slr_s WHERE k > 0 GROUP BY g'
+]) q;
+SELECT slr_plan('SELECT count(*) FROM slr_s WHERE k > 0 AND g = 3');
+SELECT slr_plan('SELECT g, count(*) FROM slr_s WHERE k > 0 GROUP BY g');
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+RESET pg_lion.parallel_range_keys;
 
 -- ---------- 6. the planner's choice ----------
 -- 100,000 rows of unique values in no heap order, a column with summaries
