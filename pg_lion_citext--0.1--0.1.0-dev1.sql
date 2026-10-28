@@ -14,16 +14,19 @@ DECLARE
 	cs		text := (SELECT pg_catalog.quote_ident(n.nspname)
 					 FROM pg_catalog.pg_extension x JOIN pg_catalog.pg_namespace n ON n.oid = x.extnamespace
 					 WHERE x.extname = 'citext');
+	ct		oid := '@extschema:citext@.citext'::pg_catalog.regtype;
 	m		record;
 BEGIN
 	FOR m IN
 		SELECT * FROM (VALUES (6, '<'), (7, '<='), (8, '>='), (9, '>'), (10, '<>')) v(strategy, op)
-		WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amop WHERE amopfamily = fam AND amopstrategy = v.strategy)
+		WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amop WHERE amopfamily = fam AND amopstrategy = v.strategy
+						  AND amoplefttype = ct AND amoprighttype = ct)
 	LOOP
 		EXECUTE pg_catalog.format('ALTER OPERATOR FAMILY citext_ops USING lion ADD OPERATOR %s %s.%s (%s.citext, %s.citext)',
 								  m.strategy, cs, m.op, cs, cs);
 	END LOOP;
-	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amproc WHERE amprocfamily = fam AND amprocnum = 4) THEN
+	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amproc WHERE amprocfamily = fam AND amprocnum = 4
+				   AND amproclefttype = ct AND amprocrighttype = ct) THEN
 		ALTER OPERATOR FAMILY citext_ops USING lion ADD
 			FUNCTION 4 (@extschema:citext@.citext, @extschema:citext@.citext)
 				@extschema:citext@.citext_cmp(@extschema:citext@.citext, @extschema:citext@.citext);
