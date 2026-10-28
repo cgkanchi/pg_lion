@@ -4323,6 +4323,10 @@ extern void lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel,
 								 LionUnits *u);
 extern double lion_units_bitmap_factor(const LionUnits *u, Cost own,
 									   double reads);
+extern Cost lion_units_bitmap_reads(PlannerInfo *root, Path *path,
+									double *pages);
+extern Cost lion_units_stream_cold_page(PlannerInfo *root, double idxpages,
+										Oid reltablespace);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
 
@@ -4849,6 +4853,9 @@ extern Cost lion_ordered_heap_price(PlannerInfo *root, RelOptInfo *rel,
 									double fetches);
 extern bool lion_ordered_walk_reads(PlannerInfo *root, Path *path,
 									double share, double *reads);
+extern bool lion_ordered_scan_reads(PlannerInfo *root, Path *path,
+									double *reads, double *idxpages,
+									bool *indexonly);
 extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Path *lion, List *iocols, bool dim,
 										  double weight, Expr *keyqual,

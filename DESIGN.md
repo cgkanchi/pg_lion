@@ -30491,7 +30491,8 @@ of the fact's B-tree its Index Cond selects:
 - **the node's** (`ownreads`): the fact heap pages of its fetches (`lo_cost()`'s fetches of the
   whole walk, `fetches_p`), a leaf a descent and a dimension heap page a member, each
   `index_pages_fetched()` of `s` of them; the lion index pages the two sets' builds read
-  (`lo_lion_pages()`, `LionOrderedSet.lionpages`); and each key set's table, whole.
+  (`lo_lion_pages()`, `LionOrderedSet.lionpages`); and the pages each key set's plan reads
+  (`OjKeySet.reads`, "The feed" in §47.6).
 
 Each page is charged `lion_units_cold_page()`, `perpage`: `pg_lion.cold_page_cost` less the
 `random_page_cost` core charged it, in the share of the query's tables and the two B-trees
@@ -30581,8 +30582,8 @@ the node's rows to the table above it, and every fact row the table rejects has 
 fetched, descended and its dimension row read. A table becomes a key set when:
 
 - it is a base relation of the query, a table, with no LATERAL reference and no TABLESAMPLE,
-  whose cheapest total path is unparameterized and returns the key: core's plan of it is the key
-  set's child;
+  with an unparameterized path, and its target returns the key: the plan of it the node picks
+  ("The feed", below) is the key set's child;
 - it is the whole inner side of a semi join - minimal and syntactic, an IN or an EXISTS of it
   alone - whose outer side is in the join rel, and in no other special join's sides
   (`oj_semi_of()`: a second IN has the first's table in its syntactic outer side, which is let
@@ -30615,6 +30616,56 @@ A key set is a simplehash of Datums (`ojkeys`), each non-NULL key copied once in
 context; a NULL key matches nothing. `Key Set Keys` counts them. Planning takes the key sets of a
 join rel whole: a join rel some of whose tables are not key sets gets no path, and core's join of
 the node's rows to them above is the plan.
+
+**The feed** (2026-10-28; `oj_keyset_feed()`, `oj_feed_cold()`). A key set's plan runs once, before
+the walk, and reads its table's matching rows whatever the walk's LIMIT. Core's cheapest path of
+the table prices its pages as if cached: `cost_bitmap_heap_scan()` never looks at
+`effective_cache_size`. So a bitmap heap scan that reads most of a large table at random beats a
+covering walk of the key's B-tree (§40) that reads a tenth of the pages in order, and runs several
+times slower when the table is not in the cache. With `pg_lion.competitor_pricing` on, the walk's
+own price carries the bitmap heap scan's cold reads (`lo_cold_price()`, §39) and wins; off, neither
+carries any, and core's cheapest path is the bitmap heap scan.
+
+The node picks the plan itself, among the table's unparameterized paths and a Gather over each of
+its partial ones (core gathers only the cheapest, and `add_path()` may have freed the Gather over a
+parallel walk). Each is ranked at its `total_cost` plus what its reads cost outside the cache, in
+the share of the query's tables and the plan's indexes that `effective_cache_size` cannot hold, at
+the price §39 gives such a page over the `random_page_cost` core charged it:
+
+- a lion walk, LionOrdered or LionBtreeScan, serial or under a Gather or Gather Merge
+  (`lion_ordered_scan_reads()`: `lo_cost()` taken again): its B-tree's pages, its set's lion pages
+  and its heap fetches, at `cold_stream_page_cost` where it is index-only and at `cold_page_cost` in
+  heap mode, a synchronous read a member;
+- a bitmap heap scan (`lion_units_bitmap_reads()`, `lion_bitmap_reads()`'s pages): its heap and
+  index pages, at `cold_stream_page_cost`;
+- an index scan, the AM's own plain scan of a lion index among them: the index pages its
+  selectivity reads and its rows' heap pages (`index_pages_fetched()`, those not all-visible where
+  it is index-only), at `cold_page_cost`;
+- anything else - a sequential scan, which reads in order at about the `seq_page_cost` core charges
+  it - nothing.
+
+There is no cap: this only chooses among the table's own plans, all of which the node runs the
+same way. The chosen plan keeps its own `total_cost` in §47.3's price, so the node is still priced
+in core's units, warm, as every other path of the join rel is; the cold reads move which plan is
+the child, never the node's price against core's joins. With `competitor_pricing` on the plans are
+ranked at their `total_cost` alone, as core's `cheapest_total_path` ranks them: a walk's price
+carries the cold weighing already. The pages the chosen plan reads are §47.3's `ownreads` for the
+key set, in place of the table's pages.
+
+**Measured** (2026-10-28; PostgreSQL 18.6 with assertions, 16 vCPU, `shared_buffers` 512 MB,
+`effective_cache_size` 1 GB, `random_page_cost` 1.1, `competitor_pricing` off; core's joins off so
+that the node is the plan). A 16,000,000-row key table of 2.9 GB whose filter a lion index answers,
+with a B-tree on its key; `f.fk IN (SELECT fk FROM kt WHERE <filter>)` with 240,000 matching rows
+(1.5%), the fact of 5,000,000 rows walked by a B-tree under `LIMIT 50`. Cold is a restart with every
+file of the cluster dropped from the kernel's cache; three runs each.
+
+| | key set's plan | cold | warm |
+|---|---|---|---|
+| before | Bitmap Heap Scan of 223,000 heap pages, priced 181,818 | 3.4 to 6.5 s | 1.34 to 1.61 s |
+| after | Gather over a parallel LionOrdered of the key's B-tree, index-only, 19,700 pages, priced 278,244 and 70,126 cold | 1.2 to 1.5 s | 0.49 to 0.51 s |
+
+With `effective_cache_size` large enough to hold the tables nothing is charged and the bitmap heap
+scan is taken, at core's price.
 
 **Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
 after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
