@@ -10,8 +10,8 @@
 #             and make dist leaves out
 #   LICENSE
 #
-# except that deleting README.md, DESIGN.md or LICENSE is not: make dist
-# names them, and git archive fails on a path that is not there.
+# except that deleting README.md, DESIGN.md, LICENSE or the whole of docs/ is
+# not: make dist names them, and git archive fails on a path that is not there.
 #
 # Anything else - src/, test/, the SQL and control files, META.json, the
 # Makefile, dev.sh, .github/ - runs everything.  So does every event that is
@@ -75,7 +75,14 @@ jobs:
                 else
                   echo "docs: $f"
                 fi ;;
-              *.md|docs/*|bench/*)
+              docs/*)
+                if [ ! -d docs ]; then
+                  echo "code: $f (docs/ deleted; make dist names it)"
+                  code=true
+                else
+                  echo "docs: $f"
+                fi ;;
+              *.md|bench/*)
                 echo "docs: $f" ;;
               *)
                 echo "code: $f"
