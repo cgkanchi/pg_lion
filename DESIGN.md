@@ -19785,8 +19785,10 @@ list's selectivity in it already. `test/sql/ordered_lists.sql`.
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
 (§30.3):
 
-- start-up: a descent, `2 random_page_cost`, and the set's `C_lion` plus copying its answer, as
-  §30.3;
+- start-up: a descent, `2 random_page_cost` of the index's tablespace, and the set's `C_lion` plus
+  its build as every LionOrdered set is priced (`lo_set_build_price()`: a `cpu_operator_cost` a
+  container key, its pieces, its spill), its members the candidates when it leaves quals to the
+  recheck (`lo_set_candsel()`, §40.8), and `s` their share from there on;
 - the walk: `W = s_w T` TIDs and `E = min(W, s_w nd)` entries; each entry
   `range_union_entry_cost` (a small entry of a walk, §28, "Counting a walk"), each TID
   `cpu_operator_cost`, and the directory leaves under them at `seq_page_cost` - `E` entries of a
@@ -19794,7 +19796,8 @@ clauses, `nd` the column's distinct values, and a set of selectivity `s` and ind
   pages;
 - the heap: `F = s W` rows fetched (`W` without a set), priced as `cost_index()` prices fetches, the
   column's correlation with the heap interpolating (`lion_var_heap_correlation()`), plus
-  `cpu_tuple_cost` and the filter per row fetched and the target per row returned;
+  `cpu_tuple_cost`, the filter and the recheck of a lossy set per row fetched and the target per row
+  returned;
 - rows: `lion_probe_rel_rows()`, as §30.3. Core's LIMIT scaling of the run cost is the walk's
   behaviour: it stops when the Limit stops pulling.
 
@@ -27009,7 +27012,8 @@ nothing. Since the restricted scan returns members only, a LIMIT is never left s
 **Cost** (`lo_cost_knn()`): the lion lookups and the set as `lo_cost()` prices them, plus
 `lion_vec_scan_cost()` for the members (§44.7) as start-up; then per member, at worst, a random
 page (none where the exact path read the row's heap page before its first row, §44.7, "Exact path
-pricing"), an index tuple, a probe and a tuple, its quals and the target. On 20,000 rows of 200
+pricing"), an index tuple, a probe and a tuple, its quals, the recheck where the set leaves quals to
+it (its members are then the candidates, §40.8) and the target. On 20,000 rows of 200
 dimensions (format 1) the planner chose a sort of the lion bitmap scan's rows for a filter keeping
 1% of them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most
 rows pass and the set costs more than the rows it saves.
