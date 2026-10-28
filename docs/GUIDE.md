@@ -589,9 +589,12 @@ above the rest: the node is offered without the key set and priced for its whole
 a sort of the whole join. Raise `join_collapse_limit` and `from_collapse_limit` to at least the
 query's number of tables (for the transaction with `SET LOCAL`, or for a role or a function with
 `ALTER ... SET`); below `geqo_threshold` (12) the planner still searches every join order, at more
-planning time. The set must also fit in `work_mem`, which is estimated from the rows the key set's
-table returns, not from its distinct keys: a filter that matches many rows of few keys may need a
-larger `work_mem` for the query.
+planning time. Raising them is not free: the planner may then also join the `EXISTS`'s table early,
+de-duplicated, and sort the whole join, which is slow when it underestimates how many rows the
+`EXISTS` keeps (a broad filter over skewed keys), where the split plan stopped at the `LIMIT`. Set
+them for the queries that need them, and compare with the default. The set must also fit in
+`work_mem`, which is estimated from the rows the key set's table returns, not from its distinct
+keys: a filter that matches many rows of few keys may need a larger `work_mem` for the query.
 
 When the page is ordered first by a column of the dimension with few values, and then by the
 fact's B-tree, no B-tree gives the order, and PostgreSQL joins every row of both filters and sorts:
