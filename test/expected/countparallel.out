@@ -127,6 +127,7 @@ CREATE INDEX lcp_abc ON lcp USING lion (a, b, c);
 CREATE INDEX lcp_tags ON lcp USING lion (tags);
 CREATE INDEX lcp_w ON lcp USING lion (w);
 CREATE INDEX lcp_id ON lcp USING lion (id);
+NOTICE:  lion index "lcp_id": column "id" has about one row per key
 VACUUM (FREEZE, ANALYZE) lcp;
 -- ---------- 1. the plans ----------
 EXPLAIN (COSTS OFF) SELECT count(*) FROM lcp WHERE a = 1 AND b;

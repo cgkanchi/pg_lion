@@ -48,6 +48,7 @@ SELECT i,
 	   repeat('p', 40)
   FROM generate_series(1, 60000) i;
 CREATE INDEX snn_l ON snn USING lion (a, b, c, d);
+NOTICE:  lion index "snn_l": column "d" has about one row per key
 CREATE INDEX snn_m ON snn USING lion (tags, tv, j, g);
 -- covering: LionOrdered and LionBtreeScan walk it index-only (DESIGN.md §40)
 CREATE INDEX snn_bt ON snn (id) INCLUDE (a, b, c, d, g, tags, tv, j);

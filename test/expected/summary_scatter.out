@@ -73,8 +73,10 @@ SELECT i, (i * 7919) % 30011,
 -- small buckets; the timestamp's summaries are posting trees of their own
 CREATE INDEX lion_sc_k ON lion_sc USING lion (k)
 	WITH (summaries = on, summary_tids = 64);
+NOTICE:  lion index "lion_sc_k": column "k" has about one row per key
 CREATE INDEX lion_sc_ts ON lion_sc USING lion (ts)
 	WITH (summaries = on, summary_tids = 128, inline_limit = 64);
+NOTICE:  lion index "lion_sc_ts": column "ts" has about one row per key
 CREATE INDEX lion_sc_g ON lion_sc USING lion (g);
 CREATE INDEX lion_sc_s ON lion_sc USING lion (s);
 CREATE INDEX lion_sc_c ON lion_sc USING lion (c);
@@ -247,6 +249,7 @@ SELECT (lo.r * hi.m % 600011)::int, (1000 * hi.j + lo.i) % 5,
  ORDER BY hi.j, lo.i;
 CREATE INDEX lion_sc_w_r ON lion_sc_w USING lion (r)
 	WITH (summaries = on, summary_tids = 64);
+NOTICE:  lion index "lion_sc_w_r": column "r" has about one row per key
 CREATE INDEX lion_sc_w_g ON lion_sc_w USING lion (g);
 CREATE INDEX lion_sc_w_s ON lion_sc_w USING lion (s);
 VACUUM (FREEZE, ANALYZE) lion_sc_w;

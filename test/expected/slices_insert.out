@@ -103,6 +103,7 @@ INSERT INTO si_b SELECT i, (i * 2654435761::int8 % 4294967296 - 2147483648)::int
 	   (i * 11400714819323198485::numeric % 18446744073709551616 - 9223372036854775808)::int8
   FROM generate_series(1, 20000) i;
 CREATE INDEX si_b_v ON si_b USING lion (v4, v8) WITH (slices = on);
+NOTICE:  lion index "si_b_v": columns "v4", "v8" have about one row per key
 INSERT INTO si_b SELECT i, (i * 2654435761::int8 % 4294967296 - 2147483648)::int4,
 	   (i * 11400714819323198485::numeric % 18446744073709551616 - 9223372036854775808)::int8
   FROM generate_series(20001, 26000) i;

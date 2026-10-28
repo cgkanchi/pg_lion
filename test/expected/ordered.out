@@ -1216,6 +1216,7 @@ CREATE TABLE lwalk (id int PRIMARY KEY, u int, k int) WITH (autovacuum_enabled =
 INSERT INTO lwalk SELECT i, i, (i * 7919) % 20011 FROM generate_series(1, 20000) i;
 CREATE INDEX lwalk_k ON lwalk (k, id);
 CREATE INDEX lwalk_u ON lwalk USING lion (u);
+NOTICE:  lion index "lwalk_u": column "u" has about one row per key
 VACUUM (FREEZE, ANALYZE) lwalk;
 SET work_mem = '64kB';
 SET hash_mem_multiplier = 1;
@@ -1272,6 +1273,7 @@ INSERT INTO lwalk2 SELECT i, (i::bigint * 7919 % 30011)::int, (i::bigint * 10472
   FROM generate_series(1, 30000) i;
 CREATE INDEX lwalk2_k ON lwalk2 (k, id);
 CREATE INDEX lwalk2_u ON lwalk2 USING lion (u);
+NOTICE:  lion index "lwalk2_u": column "u" has about one row per key
 VACUUM (FREEZE, ANALYZE) lwalk2;
 SELECT pg_relation_size('lwalk2') / 8192 / 64 AS keys;
  keys 
