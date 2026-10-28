@@ -9838,9 +9838,11 @@ longer than a batch included.
   - Publishing: a PGXN account and upload of the zip, and a README install section (`pgxn
     install pg_lion --testing` while `release_status` is testing, which is what the client needs
     to see a release that is not stable).
-  - Version scripts: done 2026-10-28, see the addendum "Extension versions" below. Format-version
-    bumps that need REINDEX must say so in the release notes (an upgrade script's NOTICE is not
-    seen: the server runs extension scripts with `client_min_messages` at WARNING or above). (The
+  - Version scripts: done 2026-10-28, see the addendum "Extension versions" below. Any upgrade
+    that leaves existing indexes needing REINDEX - a format-version bump, or a support function
+    or operator changed under an index, as the catch-up from 0.1 does - must say so in the
+    release notes (an upgrade script's NOTICE is not seen: the server runs extension scripts with
+    `client_min_messages` at WARNING or above). (The
     seven pre-18 opclasses of the addendum below need no repair there: lionvalidate() accepts
     their hash functions on every major.)
   - ~~Hook coexistence in the matrix~~ - done 2026-09-23, see "Hook coexistence" below.
@@ -9949,8 +9951,9 @@ The rules (`test/upgrade/lint.py` checks them in CI, upgrade.yml):
   reached through upgrade scripts `<ext>--<from>--<to>.sql`, and a chain of them leads from every
   version that has one to the current one.
 - `default_version` is `X.Y.Z` at a release and `X.Y.Z-devN` between releases, where `X.Y.Z` is
-  the release being prepared and META.json's `version`. META.json's `provides` names the same
-  version and the install script.
+  the release being prepared. META.json's `version` and each `provides.<ext>.version` are that
+  `X.Y.Z`, without the `-devN`; `provides.<ext>.file` is the install script,
+  `<ext>--<default_version>.sql`.
 - Changing an install script that the base branch has under the same version is refused: rename
   it to the next `-devN` (`git mv`), set `default_version` and META.json's `file`, and add
   `<ext>--<old>--<new>.sql` doing the same change with plain DDL - `CREATE OR REPLACE FUNCTION`,

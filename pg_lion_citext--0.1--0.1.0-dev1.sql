@@ -11,14 +11,17 @@ DECLARE
 					JOIN pg_catalog.pg_am a ON a.oid = c.opcmethod
 					WHERE a.amname = 'lion' AND c.opcname = 'citext_ops'
 					  AND c.opcnamespace = pg_catalog.to_regnamespace(pg_catalog.quote_ident(pg_catalog.current_schema())));
+	cs		text := (SELECT pg_catalog.quote_ident(n.nspname)
+					 FROM pg_catalog.pg_extension x JOIN pg_catalog.pg_namespace n ON n.oid = x.extnamespace
+					 WHERE x.extname = 'citext');
 	m		record;
 BEGIN
 	FOR m IN
 		SELECT * FROM (VALUES (6, '<'), (7, '<='), (8, '>='), (9, '>'), (10, '<>')) v(strategy, op)
 		WHERE NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amop WHERE amopfamily = fam AND amopstrategy = v.strategy)
 	LOOP
-		EXECUTE pg_catalog.format('ALTER OPERATOR FAMILY citext_ops USING lion ADD OPERATOR %s @extschema:citext@.%s (@extschema:citext@.citext, @extschema:citext@.citext)',
-								  m.strategy, m.op);
+		EXECUTE pg_catalog.format('ALTER OPERATOR FAMILY citext_ops USING lion ADD OPERATOR %s %s.%s (%s.citext, %s.citext)',
+								  m.strategy, cs, m.op, cs, cs);
 	END LOOP;
 	IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amproc WHERE amprocfamily = fam AND amprocnum = 4) THEN
 		ALTER OPERATOR FAMILY citext_ops USING lion ADD
