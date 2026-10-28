@@ -484,7 +484,7 @@ INSERT INTO slr_part SELECT i % 100, i FROM generate_series(1, 2000) i;
 CREATE INDEX ON slr_part USING lion (k);
 CREATE INDEX ON slr_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slr_part;
-SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7') AS partitioned;
+SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k IN (7, 70)') AS partitioned;
 CREATE TABLE slr_dim (g int PRIMARY KEY, name text);
 INSERT INTO slr_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slr_dim;

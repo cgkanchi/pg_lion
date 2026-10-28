@@ -33211,6 +33211,11 @@ nothing, pruning off, a generic plan and a LATERAL rescan; a dirty heap - update
 between leaves, deletes, this transaction's rows rolled back - and VACUUM, with `EXPLAIN ANALYZE`'s
 counters; and the declines (a leaf with an unsliced, a partial or an expression's index, a
 `GROUP BY`, a residual clause, the switch off; a REINDEX under a cursor refused).
+`test/sql/slices_partitioned_leaf.sql` has the cases pruned to one leaf (of a sub-partitioned
+parent, an empty one, a LIST's NULL partition, one of a HASH's), apart because PostgreSQL 18.0 to
+18.6 drop a disabled path's `disabled_nodes` in an Append of one child (fixed upstream for 18.7):
+the plan forced off is not off there and is the cheaper on data this small, so the file stops at
+once on those releases.
 `test/isolation/slices_partitioned.spec` runs §52.11's snapshot checks against a parent of three
 leaves, the writer's updates moving rows between them; `slices_plan.sql`'s partitioned table now
 gets its one row from the slices and its `GROUP BY` from core.

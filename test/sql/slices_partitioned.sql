@@ -252,14 +252,9 @@ SELECT spt_q('SELECT sum(b) FROM spr WHERE g = 2 HAVING sum(b) < 0');
 SELECT spt_q('SELECT sum(a) + 1, max(c) - min(c), avg(b) * 2 FROM spr WHERE h = 2');
 
 -- ---------- 2. pruning, and what the bounds imply ----------
--- a WHERE on the key that prunes to some partitions, to one leaf of the
--- sub-partitioned one, to the empty one, and to none at all
-SELECT * FROM spt_plan('SELECT sum(b), max(c) FROM spr WHERE k >= 100 AND k < 200 AND g = 3');
-SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k >= 100 AND k < 200 AND g = 3');
+-- a WHERE on the key that prunes to some partitions and to none at all (to
+-- one leaf: slices_partitioned_leaf.sql)
 SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k < 200 AND g = 3');
-SELECT spt_q('SELECT sum(b), avg(a), min(d) FROM spr WHERE k >= 300 AND k < 400 AND g = 1');
-SELECT spt_q('SELECT sum(b), avg(a), min(d) FROM spr WHERE k >= 300 AND k < 400 AND g = 5');
-SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE k >= 200 AND k < 300');
 SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM spr WHERE k > 1000');
 SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM spr WHERE k > 1000;
 -- the key's clause implied by the partitions kept: they are counted whole
@@ -358,13 +353,11 @@ SELECT * FROM spt_plan('SELECT sum(v), max(w), min(d) FROM spl WHERE g = 4');
 SELECT spt_q('SELECT count(v), sum(v), avg(v), min(v), max(v) FROM spl WHERE g = 4');
 SELECT spt_q('SELECT count(w), sum(w), avg(w), min(w), max(w) FROM spl');
 SELECT spt_q('SELECT count(d), min(d), max(d) FROM spl WHERE g IN (0, 10)');
--- pruned by the key, which the partitions kept imply: the NULL partition,
--- the hashed ones, one of them through the hash key, two lists
-SELECT spt_q('SELECT sum(v), max(w), count(*) FROM spl WHERE kind IS NULL AND g = 4');
+-- pruned by the key, which the partitions kept imply: the hashed ones, two
+-- lists (the NULL partition alone, and one hashed leaf through the hash key:
+-- slices_partitioned_leaf.sql)
 SELECT spt_q('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h''');
-SELECT spt_q('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h'' AND g = 4');
 SELECT spt_q('SELECT sum(v), avg(v), count(*) FROM spl WHERE kind IN (''a'', ''h'') AND g <> 4');
-SELECT * FROM spt_plan('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h'' AND g = 4');
 -- ... and where a partition kept does not imply it - 'b' of the list of two,
 -- 'z' of the default - the clause on the unindexed key is tested on the
 -- rows, a residual clause, which the slices decline

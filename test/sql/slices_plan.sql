@@ -429,7 +429,7 @@ INSERT INTO slp_part SELECT i % 100, i FROM generate_series(1, 2000) i;
 CREATE INDEX ON slp_part USING lion (k);
 CREATE INDEX ON slp_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slp_part;
-SELECT slp_q('SELECT sum(v), max(v) FROM slp_part WHERE k = 7');
+SELECT slp_q('SELECT sum(v), max(v) FROM slp_part WHERE k IN (7, 70)');
 SELECT slp_q('SELECT k, sum(v), max(v) FROM slp_part WHERE k IN (7, 70) GROUP BY k');
 SELECT slp_q('SELECT count(*) FROM slp_part WHERE k = 7');
 
