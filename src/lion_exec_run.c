@@ -60,7 +60,13 @@ lion_run_partition(LionCountScanState *st, int p)
 	lion_open_relation(st, p);
 	lion_locate_where(st);
 
-	if (lion_plan_flag(st, LION_FLAG_GROUPIDX))
+	/*
+	 * ... the counts where the target list has them beside the aggregates of
+	 * sliced columns, or has no such aggregates (DESIGN.md §52)
+	 */
+	if (st->slice != NULL && !st->slice->needcount)
+		count = 0;
+	else if (lion_plan_flag(st, LION_FLAG_GROUPIDX))
 	{
 		/* No group key of its own: the only driver left is a sum-over-all. */
 		Assert(lion_plan_flag(st, LION_FLAG_SUMALL));
@@ -68,6 +74,13 @@ lion_run_partition(LionCountScanState *st, int p)
 	}
 	else
 		count = lion_count_relation(st);
+
+	/*
+	 * ... and the partition's answers to those aggregates, from its own
+	 * slices, while its WHERE's sets are located (§52.13)
+	 */
+	if (st->slice != NULL)
+		lion_slice_part(st);
 
 	/* its rows are its indexes' (lion_count_report_reads()) */
 	st->statrows += count;
@@ -180,6 +193,14 @@ lion_exec_partitioned(LionCountScanState *st)
 	if (lion_plan_flag(st, LION_FLAG_GROUPIDX) && st->plan.groupattno != 0)
 		return lion_next_partial_group(st);
 
+	/*
+	 * The aggregates of sliced columns (DESIGN.md §52, "Partitioned
+	 * tables"): each partition's answers added up as its turn comes, and
+	 * the one row's made of the totals after the last.
+	 */
+	if (st->slice != NULL)
+		lion_slice_parts_begin(st);
+
 	/* every run's count, over every partition (DESIGN.md §10) */
 	if (st->nrun > 1)
 		total = lion_count_runs(st, lion_plan_flag(st, LION_FLAG_GROUPIDX));
@@ -188,6 +209,8 @@ lion_exec_partitioned(LionCountScanState *st)
 		for (p = 0; p < st->npart; p++)
 			total += lion_run_partition(st, p);
 	}
+	if (st->slice != NULL)
+		lion_slice_parts_end(st);
 
 	st->done = true;
 
