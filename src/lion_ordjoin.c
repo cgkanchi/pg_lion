@@ -66,6 +66,9 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  *	OJ_PRIV_ITUP	OidList: the fact's walked btree, on whose index tuples
  *					the walk tests the key sets before it fetches (§47.6,
  *					"Tested on the index tuple"); NIL where it does not
+ *	OJ_PRIV_EXECUTE	OidList: the functions of the join's clauses, which the
+ *					plan the node replaces would check EXECUTE on and the
+ *					node does not initialise (oj_execute_functions())
  *
  * custom_plans are the fact's walk, the dimension's probe and each key set's
  * plan, in that order; custom_scan_tlist is the fact's target list followed by
@@ -81,7 +84,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 #define OJ_PRIV_KEYCOLS		4
 #define OJ_PRIV_FOLD		5
 #define OJ_PRIV_ITUP		6
-#define OJ_PRIV_NMEMBERS	7
+#define OJ_PRIV_EXECUTE		7
+#define OJ_PRIV_NMEMBERS	8
 
 static Plan *oj_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
@@ -183,6 +187,7 @@ typedef struct OjKeySet
 	Path	   *path;			/* the plan the set is built from */
 	Oid			eqop;			/* the key type's equality, hashable */
 	Oid			collation;
+	Oid			clauseop;		/* the operator of the query's clause */
 	double		rows;			/* the keys the set is expected to hold */
 } OjKeySet;
 
@@ -202,6 +207,7 @@ typedef struct OjJoin
 	Var		   *pkvar;			/* the dimension's, as the dimension does */
 	IndexOptInfo *pkidx;		/* the unique btree on it */
 	Expr	   *keyqual;		/* `pk = NULL`, the descent's qual */
+	Oid			joinop;			/* the operator of the query's clause */
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
 	List	   *keysets;		/* OjKeySet */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
@@ -329,6 +335,7 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 	}
 	else
 		return false;
+	j->joinop = op->opno;
 
 	/*
 	 * Each side is the relation the node reads: the table, or the one leaf
@@ -672,6 +679,7 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	ks->path = x->cheapest_total_path;
 	ks->eqop = eqop;
 	ks->collation = j->keyec->ec_collation;
+	ks->clauseop = op->opno;
 	ks->rows = clamp_row_est(x->cheapest_total_path->rows);
 	j->keysets = lappend(j->keysets, ks);
 	return true;
@@ -1389,6 +1397,26 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 }
 
 /*
+ * The functions of the join's clauses (DESIGN.md §9, "Privileges"), which
+ * the plan the node replaces would check EXECUTE on as it initialised its
+ * joins - the key's clause, and each key set's - and which the node does not
+ * initialise: it descends the dimension's btree for the key with a scan key,
+ * and tests a key set's keys through a hash table.  Each side's own quals
+ * are initialised by its scan, and each key set's plan is core's.
+ */
+static List *
+oj_execute_functions(const OjJoin *j)
+{
+	List	   *funcs = list_make1_oid(get_opcode(j->joinop));
+	ListCell   *lc;
+
+	foreach(lc, j->keysets)
+		funcs = list_append_unique_oid(funcs,
+									   get_opcode(((OjKeySet *) lfirst(lc))->clauseop));
+	return funcs;
+}
+
+/*
  * A LionOrderedJoin path of the join j (DESIGN.md §47.2), at the price given:
  * the fact's walk of ord with its set factlion, index-only by iocols; the
  * dimension's probe with its set dimlion; the key sets.  factweight is the
@@ -1485,6 +1513,7 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 									list_make1_oid(j->keyidx->indexoid) :
 									NIL,
 									itup);
+	cp->custom_private = lappend(cp->custom_private, oj_execute_functions(j));
 	cp->methods = &lion_ordjoin_path_methods;
 	return cp;
 }
@@ -2347,6 +2376,7 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *keyinfo = (List *) lthird(best_path->custom_private);
 	List	   *fold = (List *) lfourth(best_path->custom_private);
 	List	   *itup = (List *) list_nth(best_path->custom_private, 4);
+	List	   *execfuncs = (List *) list_nth(best_path->custom_private, 5);
 	int			itupcol = (itup != NIL) ?
 		linitial_int((List *) lsecond(itup)) : 0;
 	List	   *sctlist = NIL;
@@ -2445,6 +2475,8 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	cscan->custom_private = lappend(cscan->custom_private,
 									itup != NIL ?
 									list_copy((List *) linitial(itup)) : NIL);
+	cscan->custom_private = lappend(cscan->custom_private,
+									list_copy(execfuncs));
 	cscan->methods = &oj_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -2587,9 +2619,11 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	List	   *keycols;
 	List	   *fold;
 	List	   *itup;
+	List	   *execfuncs;
 	AttrNumber	itupcol;
 	int			ncols = list_length(cscan->custom_scan_tlist);
 	int			i;
+	ListCell   *lc;
 
 	if (list_length(cscan->custom_private) != OJ_PRIV_NMEMBERS)
 		elog(ERROR, "LionOrderedJoin: unrecognized custom_private shape");
@@ -2600,10 +2634,21 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	keycols = (List *) list_nth(cscan->custom_private, OJ_PRIV_KEYCOLS);
 	fold = (List *) list_nth(cscan->custom_private, OJ_PRIV_FOLD);
 	itup = (List *) list_nth(cscan->custom_private, OJ_PRIV_ITUP);
+	execfuncs = (List *) list_nth(cscan->custom_private, OJ_PRIV_EXECUTE);
 	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5 ||
 		linitial_int(ints) != OJ_PRIV_MAGIC ||
-		index == NIL || !IsA(index, OidList) || list_length(index) != 1)
+		index == NIL || !IsA(index, OidList) || list_length(index) != 1 ||
+		execfuncs == NIL || !IsA(execfuncs, OidList))
 		elog(ERROR, "LionOrderedJoin: unrecognized custom_private shape");
+
+	/*
+	 * The EXECUTE checks of the plan the node replaces
+	 * (oj_execute_functions()), for the current user whenever the plan
+	 * starts, plain EXPLAIN included, as ExecInitNode() makes them: a cached
+	 * plan answers a REVOKE and a SET ROLE as the ordinary one does.
+	 */
+	foreach(lc, execfuncs)
+		lion_check_execute(lfirst_oid(lc));
 	st->nfact = lsecond_int(ints);
 	st->fkresno = (AttrNumber) lthird_int(ints);
 	st->nkeysets = lfourth_int(ints);
