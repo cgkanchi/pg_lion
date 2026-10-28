@@ -7,14 +7,15 @@ Building, testing and finding your way around the source. Section numbers (§) r
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
 `src/lion_compat.h`.  It needs a POSIX `mmap()`: LionOrdered's set, past `hash_mem`, lives in a
 temporary file mapped into memory (`src/lion_arena.c`, DESIGN.md §30.4, "Spilling").  CI (`.github/workflows/ci.yml`) builds and tests, on
-each pull request, 16 to 19 as the PGDG packages (18 on arm64 too) and 18 built from source
+each pull request, 16 to 19 as the PGDG packages and 18 built from source
 with assertions and injection points, and on every one of them
 runs the unit tests (as built, and under ASan and UBSan), the SQL regression files in `test/sql`
 and the isolation specs in `test/isolation` in both WAL modes, `make hookcheck`, and the
 crash-recovery/hot-standby harness (`test/recovery/run.sh`) in both WAL modes with
 `wal_consistency_checking`.  The other source builds - 16, 17, 19 and master, with assertions,
-and from 17 with injection points - run when `.github/workflows/source.yml` is started by hand
-from the Actions tab, which builds all five by default; master is tested only there.  On the source builds pg_lion itself is compiled with UBSan
+and from 17 with injection points - run when `.github/workflows/optional.yml` is started by hand
+from the Actions tab, which builds all five by default; master is tested only there.  The same
+workflow runs 18's packages on arm64, which is not a first-class target.  On the source builds pg_lion itself is compiled with UBSan
 (`COPT=-fsanitize=undefined -fno-sanitize-recover=all`), so the whole suite runs under it and a
 report aborts the backend that met it.  What parks a backend on an injection point - the isolation
 specs that do (`grep -l injection_points test/isolation/*.spec`), which are the race tests of the
