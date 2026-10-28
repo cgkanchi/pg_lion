@@ -42,7 +42,7 @@ if [ "$(git rev-parse --is-shallow-repository)" = true ]; then
 fi
 
 failed=0
-db=lion_upgrade_test
+db=lion_upgrade_test_$$
 
 # the old install script put in the extension directory for the test under
 # way, removed however the script ends
@@ -51,7 +51,11 @@ unplant() {
 	[ -z "$planted" ] || rm -f "$planted"
 	planted=
 }
-trap unplant EXIT
+cleanup() {
+	unplant
+	dropdb --if-exists "$db" 2>/dev/null
+}
+trap cleanup EXIT
 
 # Whether a CREATE EXTENSION error is one of the two this server is expected
 # to give an old script: a C function the library no longer has, or one of the
@@ -97,7 +101,8 @@ for ext in $exts; do
 
 	dropdb --if-exists "$db" 2>/dev/null && createdb "$db" || exit 1
 	if ! $PSQL -d "$db" -c "CREATE EXTENSION $ext CASCADE" 2> "$OUT/$ext-fresh.err"; then
-		if grep -q 'is not available' "$OUT/$ext-fresh.err"; then
+		if grep -q 'is not available' "$OUT/$ext-fresh.err" &&
+		   ! grep -q "extension \"$ext\" is not available" "$OUT/$ext-fresh.err"; then
 			echo "$ext: skipped, an extension it requires is not installed: $(head -1 "$OUT/$ext-fresh.err")"
 			continue
 		fi
@@ -198,5 +203,4 @@ for ext in $exts; do
 	unset done_blobs
 done
 
-dropdb --if-exists "$db" 2>/dev/null
 exit $failed
