@@ -102,6 +102,7 @@ FROM generate_series(1, 30000) g;
 CREATE INDEX ka_s ON ka USING lion (s);
 CREATE INDEX ka_i ON ka USING lion (i);
 CREATE INDEX ka_b ON ka USING lion (b);
+NOTICE:  lion index "ka_b": column "b" has about one row per key
 CREATE INDEX ka_t ON ka USING lion (t);
 CREATE INDEX ka_d ON ka USING lion (d);
 CREATE INDEX ka_f ON ka USING lion (f);

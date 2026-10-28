@@ -107,6 +107,7 @@ CREATE INDEX lgw_n ON lgw USING lion (n);
 CREATE INDEX lgw_r ON lgw USING lion (r);
 CREATE INDEX lgw_one ON lgw USING lion (one);
 CREATE INDEX lgw_u ON lgw USING lion (u);
+NOTICE:  lion index "lgw_u": column "u" has about one row per key
 CREATE INDEX lgw_tags ON lgw USING lion (tags);
 VACUUM (FREEZE, ANALYZE) lgw;
 -- ---------- 1. filters collected once ----------

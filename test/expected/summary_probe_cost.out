@@ -93,6 +93,7 @@ SELECT i, CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END,
   FROM generate_series(1, 200003) i;
 CREATE INDEX lion_spc_i ON lion_spc_t USING lion (kind, tags, ts)
 	WITH (summaries = on, summary_tids = 128);
+NOTICE:  lion index "lion_spc_i": column "ts" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_spc_t;
 SELECT pg_relation_size('lion_spc_t') / 8192 / 64 + 1 AS container_keys;
  container_keys 
@@ -189,6 +190,7 @@ SELECT lion_index_verify('lion_spc_i', true);
 -- probed, whatever the memory, and priced so: the plain scan is chosen.
 ALTER INDEX lion_spc_i SET (summaries = off);
 REINDEX INDEX lion_spc_i;
+NOTICE:  lion index "lion_spc_i": column "ts" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_spc_t;
 TRUNCATE lion_spc_r;
 SET work_mem = '4MB';

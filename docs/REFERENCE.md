@@ -941,15 +941,20 @@ working around a bad choice:
   none of its columns in the output - is read once, before the walk, into a hash set of its keys,
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
-  spilled). The table is read by the cheapest of its own plans once the pages each reads outside
-  the cache are charged - a bitmap heap scan's or a covering (index-only) walk's at
-  `pg_lion.cold_stream_page_cost`, an index scan's or a walk's that fetches heap rows at
-  `pg_lion.cold_page_cost`, in the share of the tables and the plan's indexes that
-  `effective_cache_size` cannot hold - so that a walk of the key's B-tree is taken over a bitmap
-  heap scan of most of the table where the table is larger than the cache. With
-  `pg_lion.competitor_pricing` on, nothing is charged and the plans are taken at their own price,
-  which for a walk carries that weighing already. Where the fact's key column has a Lion index of its own (scalar, of the key's type,
-  not partial unless the query implies its predicate), the key set's keys are also looked up in it
+  spilled; the keys are estimated as the rows the table's plan returns). The table is read by the
+  cheapest of its own plans once the pages each reads outside the cache are charged - a bitmap
+  heap scan's or a covering (index-only) walk's at `pg_lion.cold_stream_page_cost`, an index
+  scan's or a walk's that fetches heap rows at `pg_lion.cold_page_cost`, in the share of the
+  tables and the plan's indexes that `effective_cache_size` cannot hold - so that a walk of the
+  key's B-tree is taken over a bitmap heap scan of most of the table where the table is larger
+  than the cache. With `pg_lion.competitor_pricing` on, nothing is charged and the plans are taken
+  at their own price, which for a walk carries that weighing already. The key set's table must be
+  planned in one join problem with the two tables: where its explicit `JOIN`s and the semi joins
+  of its `EXISTS` and `IN` pass `join_collapse_limit` items, or a pulled-up subquery's `FROM` list
+  passes `from_collapse_limit`, PostgreSQL may join an `EXISTS` above the rest of the query and the
+  node is offered without its key set (docs/GUIDE.md). Where the fact's key column has a Lion
+  index of its own (scalar, of the key's type, not partial unless the query implies its
+  predicate), the key set's keys are also looked up in it
   and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
   (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`). Where the fact's
   ordering B-tree holds the key column, as a key or an `INCLUDE` column, each entry's key is tested

@@ -165,6 +165,7 @@ SELECT i, (i * 7919) % 200, (i * 7919) % 200, i, i % 10,
   FROM generate_series(1, 30000) i;
 CREATE INDEX lis_k ON lis USING lion (k);
 CREATE INDEX lis_u ON lis USING lion (u);
+NOTICE:  lion index "lis_u": column "u" has about one row per key
 CREATE INDEX lis_n ON lis USING lion (n);
 CREATE INDEX lis_t ON lis USING lion (t);
 CREATE INDEX lis_ci ON lis USING lion (ci);
@@ -805,6 +806,7 @@ CREATE TABLE lis_f (id int, k int, u int);
 INSERT INTO lis_f SELECT i, (i::int8 * 7919 % 300)::int, i FROM generate_series(1, 600000) i;
 CREATE INDEX lis_f_k ON lis_f USING lion (k);
 CREATE INDEX lis_f_u ON lis_f USING lion (u);
+NOTICE:  lion index "lis_f_u": column "u" has about one row per key
 VACUUM (FREEZE, ANALYZE) lis_f;
 SET pg_lion.enable_count_pushdown = off;
 SELECT lion_top('SELECT id FROM lis_f WHERE u = 123456');
@@ -1272,6 +1274,7 @@ INSERT INTO lis_w SELECT g, g % 50, (g::int8 * 7919 % 20000)::int, g
   FROM generate_series(1, 200000) g;
 INSERT INTO lis_w SELECT NULL, g % 50, g, -g FROM generate_series(1, 500) g;
 CREATE INDEX lis_w_abd ON lis_w USING lion (a, b, d);
+NOTICE:  lion index "lis_w_abd": column "a" has about one row per key
 VACUUM (FREEZE, ANALYZE) lis_w;
 /*
  * lion_bufs() runs a query as a plain index scan, or as a bitmap scan, under

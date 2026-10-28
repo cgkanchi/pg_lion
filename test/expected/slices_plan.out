@@ -132,6 +132,7 @@ CREATE INDEX slp_h ON slp USING lion (h);
 CREATE INDEX slp_r ON slp USING lion (r) WITH (summaries = on, summary_tids = 64);
 CREATE INDEX slp_tags ON slp USING lion (tags);
 CREATE INDEX slp_v ON slp USING lion (a, b, c, d, t, ts, tz) WITH (slices = on);
+NOTICE:  lion index "slp_v": columns "b", "c", "d", "t", "ts", "tz" have about one row per key
 CREATE INDEX slp_f ON slp USING lion (f) WITH (slices = on);
 VACUUM (FREEZE, ANALYZE) slp;
 SELECT attno, sliced FROM lion_index_stats('slp_v') ORDER BY attno;
@@ -1038,7 +1039,9 @@ DROP FUNCTION slp_groups(text);
 -- (Counting the slices' pages, the range's scan here was priced 1.4 times
 -- the unsliced index's, and the AND's 1.3.)
 REINDEX INDEX slp_v;
+NOTICE:  lion index "slp_v": columns "b", "c", "d", "t", "ts", "tz" have about one row per key
 CREATE INDEX slp_v2 ON slp USING lion (a, b, c, d, t, ts, tz);
+NOTICE:  lion index "slp_v2": columns "b", "c", "d", "t", "ts", "tz" have about one row per key
 VACUUM ANALYZE slp;
 -- The price of the bitmap index scan alone, of q with no other scan:
 CREATE FUNCTION slp_cost(q text) RETURNS numeric LANGUAGE plpgsql AS $$

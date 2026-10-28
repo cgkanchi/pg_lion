@@ -582,6 +582,22 @@ the query names the parent, as `LionOrdered` and `LionBtreeScan` do (DESIGN.md ย
 pruned to one leaf"); when several partitions remain, PostgreSQL plans the join.
 `pg_lion.enable_ordered_join` turns it off (DESIGN.md ยง47).
 
+A key set is only seen when PostgreSQL plans the fact, the dimension and the key set's table as one
+join problem. PostgreSQL flattens explicit `JOIN`s - and the semi joins it makes of `EXISTS` and
+`IN` - into one problem only while the result has at most `join_collapse_limit` (8 by default)
+items, and pulls a subquery's `FROM` list up into its parent's only while the merged list has at
+most `from_collapse_limit` (8) items; past either, the query is planned in parts (a plain
+comma-separated `FROM` list is never split), and an `EXISTS` may then be joined above the rest: the node is offered without the key set and priced for its whole walk, and loses to
+a sort of the whole join. Raise `join_collapse_limit` and `from_collapse_limit` to at least the
+query's number of tables (for the transaction with `SET LOCAL`, or for a role or a function with
+`ALTER ... SET`); below `geqo_threshold` (12) the planner still searches every join order, at more
+planning time. Raising them is not free: the planner may then also join the `EXISTS`'s table early,
+de-duplicated, and sort the whole join, which is slow when it underestimates how many rows the
+`EXISTS` keeps (a broad filter over skewed keys), where the split plan stopped at the `LIMIT`. Set
+them for the queries that need them, and compare with the default. The set must also fit in
+`work_mem`, which is estimated from the rows the key set's table returns, not from its distinct
+keys: a filter that matches many rows of few keys may need a larger `work_mem` for the query.
+
 When the page is ordered first by a column of the dimension with few values, and then by the
 fact's B-tree, no B-tree gives the order, and PostgreSQL joins every row of both filters and sorts:
 

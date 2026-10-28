@@ -299,6 +299,7 @@ SELECT lpr_rows($$SELECT * FROM lpr WHERE ts >= '2026-01-10' AND c < 5$$, NULL) 
 
 -- A Param has no value to compare with the histogram at plan time.
 CREATE INDEX lpr_lion ON lpr USING lion (ts, c, v);
+NOTICE:  lion index "lpr_lion": columns "ts", "v" have about one row per key
 PREPARE lpr_p(timestamptz) AS SELECT count(*) FROM lpr WHERE ts >= $1;
 SET plan_cache_mode = force_generic_plan;
 EXECUTE lpr_p('2026-01-02 02:00');
