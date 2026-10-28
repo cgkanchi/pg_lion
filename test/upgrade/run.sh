@@ -54,16 +54,14 @@ unplant() {
 trap unplant EXIT
 
 # Whether a CREATE EXTENSION error is one of the two this server is expected
-# to give an old script: a core function this major does not have (such as
-# hashbool()), or a C function the library no longer has.  Anything else,
-# including a missing lion function, is a failure.
+# to give an old script: a C function the library no longer has, or one of the
+# core functions below that some majors lack.  Anything else is a failure.
 expected_install_error() {
 	local err
 	err=$(grep -m1 ERROR "$1")
 	case "$err" in
 	*'could not find function "'*'" in file'*) return 0 ;;
-	*'ERROR:  function lion'*) return 1 ;;
-	*'ERROR:  function '*') does not exist'*) return 0 ;;
+	*'ERROR:  function hashbool(boolean) does not exist') return 0 ;;
 	esac
 	return 1
 }
