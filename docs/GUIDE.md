@@ -1,4 +1,4 @@
-# pg_lion usage guide
+# pg_lion usage guide 
 
 The detailed version of the README's feature tour: what each query shape does, how to recognise it in `EXPLAIN`, and where the design notes are. Section numbers (§) refer to [DESIGN.md](../DESIGN.md).
 
