@@ -22,10 +22,11 @@ SELECT line FROM (
 	FROM members m JOIN pg_init_privs i ON i.classoid = m.classid AND i.objoid = m.objid AND i.objsubid = m.objsubid
 	UNION ALL
 	-- functions, aggregates and procedures
-	SELECT format('function %s(%s) returns %s kind=%s lang=%s src=%s vol=%s par=%s strict=%s secdef=%s leak=%s cost=%s rows=%s support=%s config=%s acl=%s',
+	SELECT format('function %s(%s) returns %s kind=%s lang=%s src=%s bin=%s vol=%s par=%s strict=%s secdef=%s leak=%s cost=%s rows=%s support=%s config=%s acl=%s',
 		p.proname, pg_get_function_arguments(p.oid), pg_get_function_result(p.oid),
 		p.prokind, l.lanname,
 		CASE WHEN l.lanname IN ('c', 'internal') THEN p.prosrc ELSE md5(p.prosrc) END,
+		p.probin,
 		p.provolatile, p.proparallel, p.proisstrict, p.prosecdef, p.proleakproof,
 		p.procost, p.prorows, p.prosupport, p.proconfig, p.proacl)
 	FROM members m JOIN pg_proc p ON m.classid = 'pg_proc'::regclass AND p.oid = m.objid
