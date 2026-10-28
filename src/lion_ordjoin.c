@@ -222,6 +222,7 @@ typedef struct OjJoin
 	double		abovepass;		/* the rows the joins of the key sets above
 								 * it return a join rel row
 								 * (oj_keysets_above()) */
+	double		aboverep;		/* ... a row the key sets keep */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
 	IndexOptInfo *keyidx;		/* the fact key's lion index the key sets
 								 * fold into (oj_key_index()), or NULL */
@@ -313,6 +314,7 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 
 	memset(j, 0, sizeof(OjJoin));
 	j->abovepass = 1.0;
+	j->aboverep = 1.0;
 
 	/* one clause: f.fk = d.pk, between two columns */
 	if (list_length(clauses) != 1)
@@ -1044,12 +1046,15 @@ oj_search_relids(PlannerInfo *root)
  *	  the key class's member of x equal to it;
  *	- x is a table oj_keyset_above() takes.
  *
- * The node then returns the rows the key sets keep, and j->abovepass is
- * the rows their joins above return a row of joinrel - the share each key
- * set keeps, and for an inner join each kept row once for each of x's rows
- * of its key, ks.rows / ks.keys of them - over which the LIMIT's share of a
- * walk is taken (oj_competitor()); the tables are not counted against the
- * node's being alone under the LIMIT (oj_alone()).
+ * The node then returns the rows the key sets keep.  j->aboverep is the
+ * rows their joins above return a kept row: one for a semi join, and for an
+ * inner join one for each of x's rows of its key, its rows with a non-NULL
+ * key over its distinct keys, which estimate_num_groups() counts without
+ * NULL.  j->abovepass is the rows they return a row of joinrel, the share
+ * each key set keeps times that.  Over them the LIMIT's share of a walk is
+ * taken, the node's (oj_cost(), os_cost()) and its competitors'
+ * (oj_competitor()); the tables are not counted against the node's being
+ * alone under the LIMIT (oj_alone()).
  */
 static void
 oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
@@ -1059,6 +1064,7 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	int			relid;
 
 	j->abovepass = 1.0;
+	j->aboverep = 1.0;
 	if (j->keyec == NULL || j->keyec->ec_has_volatile || j->keyec->ec_broken)
 		return;
 	search = oj_search_relids(root);
@@ -1107,8 +1113,14 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		if (!ok || (ks = oj_keyset_above(root, j, x)) == NULL)
 			continue;
 		j->keysets = lappend(j->keysets, ks);
-		j->abovepass *= semi ? ks->pass : ks->pass * ks->rows / ks->keys;
+		if (!semi)
+			j->aboverep *= Max(1.0, ks->rows *
+							   nulltestsel(root, IS_NOT_NULL,
+										   (Node *) ks->keyvar, relid,
+										   JOIN_INNER, NULL) / ks->keys);
+		j->abovepass *= ks->pass;
 	}
+	j->abovepass *= j->aboverep;
 }
 
 /*
@@ -1750,7 +1762,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * hard stop has its own stricter rule (lo_limit(), the node the query
 	 * level's only table), which this is not.
 	 */
-	*share = oj_limit_share(root, j, out);
+	*share = oj_limit_share(root, j, out * j->aboverep);
 
 	/*
 	 * The members the key sets reject, fetched for nothing where they are
@@ -2309,7 +2321,8 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	double		dimtuples = Max(j->dim->tuples, 1.0);
 	double		dimpages = (double) j->dim->pages;
 	double		setbytes = 0.0;
-	double		limit = j->alone ? root->limit_tuples : -1.0;
+	double		limit = j->alone && root->limit_tuples > 0 ?
+		root->limit_tuples / j->aboverep : -1.0;
 	double		need = limit;
 	double		rows = 0.0;
 	double		spc_random;

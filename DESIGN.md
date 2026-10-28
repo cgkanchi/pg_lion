@@ -30749,11 +30749,14 @@ drops is one that join would drop where:
   join clause of its own, no other column in its target. A table a column of which the query reads
   - a dimension of another join - or an EXISTS that tests more than the key is not one.
 
-The node's rows are then those its key sets keep, and the joins above return `abovepass` rows a
-row of the join rel: the product of the key sets' `pass`, an inner join's times the rows of its
-table a key, `setrows / setkeys`, each of which the join returns the row once for. The LIMIT's share
-of the competitor's walk is taken over that many (`oj_competitor()`),
-and the tables are not counted against the node being alone under the LIMIT (`oj_alone()`, §47.10).
+The node's rows are then those its key sets keep, and the joins above return `aboverep` rows for
+each: one for a semi join, and for an inner join one for each of its table's rows with that key,
+`setrows * P(key IS NOT NULL) / setkeys` (`estimate_num_groups()` counts no group for NULL), at
+least one. A row of the join rel gives `abovepass` rows above, the product of the key sets' `pass`
+times `aboverep`. The LIMIT's share of a walk is taken over the rows above: the node's own output
+times `aboverep` (`oj_cost()`, and `os_cost()`'s limit divided by it), the competitor's rows times
+`abovepass` (`oj_competitor()`). The tables are not counted against the node being alone under the
+LIMIT (`oj_alone()`, §47.10).
 A table inside the join search is joined there and is a key set of the join rel that holds it, as
 before, so a query planned whole keeps the plan it had. EXPLAIN shows the key set under the node and
 the join above with its own scan of the table: the table is read twice.
