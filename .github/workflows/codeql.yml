@@ -8,7 +8,7 @@
 # Both run the security-extended query suite.  Alerts appear under the
 # repository's Security -> Code scanning; a pull request gets the ones its
 # change introduces.  Runs on pushes to main, on pull requests, weekly, and by
-# hand.
+# hand; a pull request that changes only documentation (changes.yml) skips it.
 #
 # This is an advanced setup: CodeQL's "default setup" (Settings -> Code
 # security) must stay off, or GitHub refuses to process these results.
@@ -33,8 +33,13 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   analyze:
     name: CodeQL (${{ matrix.language }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
