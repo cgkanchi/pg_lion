@@ -33,3 +33,4 @@ test/modules/*/results/
 .pgbench-*/
 test/soak/out/
 src/*.d
+test/upgrade/out/

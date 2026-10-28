@@ -68,6 +68,13 @@ make PG_CONFIG=/path/to/pg_config install
 CREATE EXTENSION pg_lion;
 ```
 
+After installing a newer build, bring each database's copy up to date (and `pg_lion_citext` and
+`pg_lion_vector`, where installed):
+
+```sql
+ALTER EXTENSION pg_lion UPDATE;
+```
+
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 
 ```

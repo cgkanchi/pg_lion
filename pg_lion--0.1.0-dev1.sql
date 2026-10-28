@@ -1,4 +1,4 @@
-/* pg_lion--0.1.sql */
+/* pg_lion--0.1.0-dev1.sql */
 
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION pg_lion" to load this file. \quit
