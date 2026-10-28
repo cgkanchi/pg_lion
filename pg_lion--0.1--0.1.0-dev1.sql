@@ -842,8 +842,13 @@ BEGIN
 		WHERE f.opfnamespace = s AND f.opfmethod = am ORDER BY f.opfname
 	LOOP
 		seen := seen || sf.opfname;
+		-- only pg_lion's own: a user's family of this name is never touched,
+		-- and moving today's in then fails on the name
 		SELECT f.oid INTO ef FROM pg_catalog.pg_opfamily f
-		WHERE f.opfnamespace = e AND f.opfmethod = am AND f.opfname = sf.opfname;
+		WHERE f.opfnamespace = e AND f.opfmethod = am AND f.opfname = sf.opfname
+		  AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+					  WHERE d.classid = 'pg_catalog.pg_opfamily'::pg_catalog.regclass
+						AND d.objid = f.oid AND d.refobjid = ext AND d.deptype = 'e');
 
 		-- a family no index uses is simply replaced
 		IF ef IS NOT NULL AND NOT EXISTS (

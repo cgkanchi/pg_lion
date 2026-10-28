@@ -232,11 +232,12 @@ for ext in $exts; do
 		fi
 		# what the catalog listing leaves out, objects that are no longer the
 		# extension's, must be exactly what the update said it detached
-		if ! detached "$db" "$ext" | LC_ALL=C comm -13 "$OUT/$tag.free" - > "$OUT/$tag.detached"; then
+		if ! detached "$db" "$ext" > "$OUT/$tag.free.after"; then
 			echo "$tag: could not list the objects outside the extension" >&2
 			failed=1
 			continue
 		fi
+		LC_ALL=C comm -13 "$OUT/$tag.free" "$OUT/$tag.free.after" > "$OUT/$tag.detached"
 		sed -n -e 's/^WARNING:  operator family \(.*\) is no longer part of .*/family \1/p' \
 			   -e 's/^WARNING:  function \(.*\) is no longer part of .*/function \1/p' \
 			"$OUT/$tag.update" | LC_ALL=C sort > "$OUT/$tag.warned"
