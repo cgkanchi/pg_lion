@@ -850,6 +850,16 @@ BEGIN
 					  WHERE d.classid = 'pg_catalog.pg_opfamily'::pg_catalog.regclass
 						AND d.objid = f.oid AND d.refobjid = ext AND d.deptype = 'e');
 
+		-- a class someone added to pg_lion's family is theirs: neither dropped nor
+		-- reconciled, so the update stops
+		IF EXISTS (SELECT 1 FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = ef
+				   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+								   WHERE d.classid = 'pg_catalog.pg_opclass'::pg_catalog.regclass
+									 AND d.objid = oc.oid AND d.refobjid = ext AND d.deptype = 'e')) THEN
+			RAISE EXCEPTION 'operator family %.% has an operator class that is not part of pg_lion', ename, sf.opfname
+				USING HINT = 'Drop that operator class and its indexes, update, and create them again.';
+		END IF;
+
 		-- a family no index uses is simply replaced
 		IF ef IS NOT NULL AND NOT EXISTS (
 			SELECT 1 FROM pg_catalog.pg_index i, pg_catalog.pg_opclass oc
@@ -1046,6 +1056,16 @@ BEGIN
 			AND d.objid = f.oid AND d.refobjid = ext AND d.deptype = 'e'
 		WHERE NOT (f.opfname = ANY (seen))
 	LOOP
+		-- a class someone added to pg_lion's family is theirs: neither dropped nor
+		-- reconciled, so the update stops
+		IF EXISTS (SELECT 1 FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = c.oid
+				   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+								   WHERE d.classid = 'pg_catalog.pg_opclass'::pg_catalog.regclass
+									 AND d.objid = oc.oid AND d.refobjid = ext AND d.deptype = 'e')) THEN
+			RAISE EXCEPTION 'operator family %.% has an operator class that is not part of pg_lion', ename, c.opfname
+				USING HINT = 'Drop that operator class and its indexes, update, and create them again.';
+		END IF;
+
 		IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i, pg_catalog.pg_opclass oc
 					   WHERE oc.opcfamily = c.oid AND oc.oid = ANY (i.indclass::oid[])) THEN
 			EXECUTE pg_catalog.format('DROP OPERATOR FAMILY %s.%I USING lion', en, c.opfname);

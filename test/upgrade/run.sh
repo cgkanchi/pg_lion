@@ -237,7 +237,11 @@ for ext in $exts; do
 			failed=1
 			continue
 		fi
-		LC_ALL=C comm -13 "$OUT/$tag.free" "$OUT/$tag.free.after" > "$OUT/$tag.detached"
+		if ! LC_ALL=C comm -13 "$OUT/$tag.free" "$OUT/$tag.free.after" > "$OUT/$tag.detached"; then
+			echo "$tag: could not compare the objects outside the extension" >&2
+			failed=1
+			continue
+		fi
 		sed -n -e 's/^WARNING:  operator family \(.*\) is no longer part of .*/family \1/p' \
 			   -e 's/^WARNING:  function \(.*\) is no longer part of .*/function \1/p' \
 			"$OUT/$tag.update" | LC_ALL=C sort > "$OUT/$tag.warned"
