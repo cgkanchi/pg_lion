@@ -1004,7 +1004,9 @@ oj_search_relids(PlannerInfo *root)
 #if PG_VERSION_NUM >= 190000
 	geqo = (Geqo_planner_extension_id >= 0) ? GetGeqoPrivateData(root) : NULL;
 #else
-	geqo = (GeqoPrivateData *) root->join_search_private;
+	/* the field is any join search's: GEQO's only where no hook took it */
+	geqo = (join_search_hook == NULL) ?
+		(GeqoPrivateData *) root->join_search_private : NULL;
 #endif
 	if (root->join_rel_level != NULL)
 		initial = root->join_rel_level[1];
