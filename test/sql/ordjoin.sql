@@ -383,6 +383,138 @@ SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
 	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
 RESET work_mem;
 
+-- 9b. A key set joined above the node (DESIGN.md §47.6, "A join above"):
+--     past join_collapse_limit core plans the fact and the
+--     dimension in a part of their own and joins the EXISTS or the IN above
+--     it.  Its table is a key set all the same, and the semi join above
+--     tests again the rows the node returns.  At a join_collapse_limit of 1
+--     the explicit JOIN is such a part; at 8 a query of more tables than
+--     that; at 16 the same query is planned whole and the table is a key set
+--     inside the join, as in 9.  Every answer is the ordinary plan's.
+SET join_collapse_limit = 1;
+SELECT * FROM oj_run('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x = 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x = 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 10 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- ... two of them, and an IN whose keys repeat
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl < 10 AND d.flag
+	  AND f.fk IN (SELECT pk FROM flt WHERE x < 3) AND d.pk IN (SELECT k FROM fltn)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- ... an empty one
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = f.fk AND x.x = 99)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- ... and what is not one: a table whose clauses call a volatile function,
+--     which the join above would call again, and a NOT EXISTS
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x = 2 AND random() < 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag
+	  AND NOT EXISTS (SELECT 1 FROM flt x WHERE x.pk = f.fk AND x.x = 2)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET join_collapse_limit;
+-- ... nine tables: four left joins, an anti join and a LATERAL subquery
+--     besides the fact, the dimension and the EXISTS, at the default limits,
+--     at 16, and under GEQO.  flt's key is unique, and core makes the EXISTS
+--     an inner join; fltn's repeats, and stays a semi join; and an EXISTS
+--     that tests more than the key, which is no key set.
+SELECT oj('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN fltn n ON n.k = d.pk
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.k IS NULL
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x < 3)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+-- (fltn read twice: the key set's plan under the node, and the semi join's
+-- above it)
+SELECT regexp_replace(l, '^\s*(->\s*)?', '') FROM oj_run('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN flt n ON n.pk = d.pk + 4
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.pk IS NULL
+	  AND EXISTS (SELECT 1 FROM fltn y WHERE y.k = d.pk)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20') l
+	WHERE l ~ '^\s*(->\s*)?(Custom Scan \(LionOrderedJoin\)|Key Sets:|Seq Scan on fltn)';
+SELECT oj('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN flt n ON n.pk = d.pk + 4
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.pk IS NULL
+	  AND EXISTS (SELECT 1 FROM fltn y WHERE y.k = d.pk)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SELECT oj('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN fltn n ON n.k = d.pk
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.k IS NULL
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x < d.kind)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+SET join_collapse_limit = 16;
+SET from_collapse_limit = 16;
+SELECT oj('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN fltn n ON n.k = d.pk
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.k IS NULL
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x < 3)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET join_collapse_limit;
+RESET from_collapse_limit;
+SET geqo_threshold = 2;
+SELECT oj('SELECT f.id, f.score, d.pk, a.x, b.x, c.x, e.x, l.pk
+	FROM fact f JOIN dim d ON f.fk = d.pk
+	LEFT JOIN flt a ON a.pk = d.pk
+	LEFT JOIN flt b ON b.pk = d.pk + 1
+	LEFT JOIN flt c ON c.pk = d.pk + 2
+	LEFT JOIN flt e ON e.pk = d.pk + 3
+	LEFT JOIN LATERAL (SELECT pk FROM flt z WHERE z.pk >= d.pk ORDER BY z.pk LIMIT 1) l ON true
+	LEFT JOIN fltn n ON n.k = d.pk
+	WHERE f.grp = 2 AND d.lvl < 10 AND d.flag AND n.k IS NULL
+	  AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = d.pk AND x.x < 3)
+	ORDER BY f.score DESC NULLS LAST, f.id LIMIT 20');
+RESET geqo_threshold;
+-- ... the fact and the dimension on the nullable side of a left join: no
+--     key set from above, whose drops a null-extended row would replace
+SET join_collapse_limit = 1;
+SELECT oj('SELECT y.pk, s.id, s.score FROM flt y LEFT JOIN
+	(SELECT f.id, f.score, d.pk FROM fact f JOIN dim d ON f.fk = d.pk
+	 WHERE f.grp = 2 AND f.tags @> ''{a1}'' AND d.lvl = 3 AND d.flag) s ON s.pk = y.pk
+	WHERE y.x = 2 AND EXISTS (SELECT 1 FROM flt x WHERE x.pk = y.pk AND x.x = 2)
+	ORDER BY y.pk, s.score DESC NULLS LAST, s.id LIMIT 20');
+RESET join_collapse_limit;
+
 -- 10. The fact's walk index-only, where its btree has every column of the
 --     fact the join needs: no heap read for a member on an all-visible page;
 --     with no set, every entry a member; and with an inexact set, each

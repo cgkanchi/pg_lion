@@ -32,6 +32,7 @@
 
 #include "common/hashfn.h"
 #include "nodes/multibitmapset.h"
+#include "optimizer/geqo.h"
 #include "utils/datum.h"
 
 #include "lion_customscan.h"
@@ -190,7 +191,13 @@ typedef struct OjKeySet
 	Oid			eqop;			/* the key type's equality, hashable */
 	Oid			collation;
 	Oid			clauseop;		/* the operator of the query's clause */
-	double		rows;			/* the keys the set is expected to hold */
+	double		rows;			/* the rows its plan is expected to return */
+	double		keys;			/* ... the distinct keys among them, which
+								 * the set holds (oj_keyset_new()) */
+	double		pass;			/* the share of the fact's non-NULL keys it
+								 * holds (oj_keyset_pass()) */
+	bool		above;			/* its semi join is planned above the join
+								 * rel (oj_keysets_above()) */
 } OjKeySet;
 
 /* The join the node answers: its two sides, its key and its key sets */
@@ -212,6 +219,8 @@ typedef struct OjJoin
 	Oid			joinop;			/* the operator of the query's clause */
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
 	List	   *keysets;		/* OjKeySet */
+	double		abovepass;		/* the share of the join rel's rows the key
+								 * sets above it keep (oj_keysets_above()) */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
 	IndexOptInfo *keyidx;		/* the fact key's lion index the key sets
 								 * fold into (oj_key_index()), or NULL */
@@ -302,6 +311,7 @@ oj_key_join(PlannerInfo *root, RelOptInfo *fact, RelOptInfo *dim,
 	RelOptInfo *dimleaf;
 
 	memset(j, 0, sizeof(OjJoin));
+	j->abovepass = 1.0;
 
 	/* one clause: f.fk = d.pk, between two columns */
 	if (list_length(clauses) != 1)
@@ -671,6 +681,121 @@ oj_feed_cold(PlannerInfo *root, Path *path, double *pages)
 }
 
 /*
+ * The equality of the key's class, in the fact key's type, that hashes both
+ * sides with one function - the key sets' hash table's - or InvalidOid.
+ */
+static Oid
+oj_keyset_eqop(OjJoin *j, Oid type)
+{
+	ListCell   *lc;
+
+	foreach(lc, j->keyec->ec_opfamilies)
+	{
+		Oid			opno = get_opfamily_member(lfirst_oid(lc), type, type,
+											   BTEqualStrategyNumber);
+		RegProcedure lhash;
+		RegProcedure rhash;
+
+		if (OidIsValid(opno) && op_hashjoinable(opno, type) &&
+			get_op_hash_functions(opno, &lhash, &rhash) && lhash == rhash)
+			return opno;
+	}
+	return InvalidOid;
+}
+
+/*
+ * The share of the fact's non-NULL keys that a key set of x by its column
+ * key holds (DESIGN.md §47.3, "The key sets"): core's own estimate of the
+ * fact's semi join to x by the key (eqjoinsel_semi()) - the fact's most
+ * common keys matched against x's, the rest by the distinct keys x's rows
+ * hold - over the fact's non-NULL share, at most 1.  The clause is the
+ * planner's own, not the query's: core caches a selectivity in the query's
+ * RestrictInfo.
+ */
+static double
+oj_keyset_pass(PlannerInfo *root, OjJoin *j, RelOptInfo *x, Var *key,
+			   Oid eqop, Oid collation)
+{
+	SpecialJoinInfo sjinfo;
+	Expr	   *clause;
+	Selectivity sel;
+	Selectivity nonnull;
+
+	memset(&sjinfo, 0, sizeof(SpecialJoinInfo));
+	sjinfo.type = T_SpecialJoinInfo;
+	sjinfo.min_lefthand = j->fact->relids;
+	sjinfo.syn_lefthand = j->fact->relids;
+	sjinfo.min_righthand = x->relids;
+	sjinfo.syn_righthand = x->relids;
+	sjinfo.jointype = JOIN_SEMI;
+	clause = make_opclause(eqop, BOOLOID, false,
+						   (Expr *) copyObject(j->fkvar),
+						   (Expr *) copyObject(key), InvalidOid, collation);
+	sel = clause_selectivity(root, (Node *) clause, 0, JOIN_SEMI, &sjinfo);
+	nonnull = nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar,
+						  j->fact->relid, JOIN_INNER, NULL);
+	if (nonnull <= 0.0)
+		return 1.0;
+	return Min(1.0, Max(sel, 0.0) / nonnull);
+}
+
+/*
+ * A key set of x by its column key under eqop, the query's clause's
+ * operator clauseop (DESIGN.md §47.6): its plan (oj_keyset_feed()); the rows
+ * that plan is expected to return, and the distinct keys among them - core's
+ * estimate_num_groups(), which a GROUP BY of them would be priced at - which
+ * the set holds, a hash entry and a copied key each, and which must fit
+ * work_mem: the set is never spilled; and the share of the fact's keys it
+ * holds (oj_keyset_pass()).  NULL where x's target lacks the key, x has no
+ * unparameterized path or the keys do not fit.
+ */
+static OjKeySet *
+oj_keyset_new(PlannerInfo *root, OjJoin *j, RelOptInfo *x, Var *key,
+			  Oid eqop, Oid clauseop)
+{
+	RangeTblEntry *rte = root->simple_rte_array[x->relid];
+	Oid			type = exprType((Node *) key);
+	OjKeySet   *ks;
+	Path	   *feed;
+	double		reads;
+	double		rows;
+	double		keys;
+	double		bytes;
+	int32		width;
+
+	if (!oj_target_has(x->reltarget, key))
+		return NULL;
+	feed = oj_keyset_feed(root, x, &reads);
+	if (feed == NULL)
+		return NULL;
+	rows = clamp_row_est(feed->rows);
+	keys = clamp_row_est(Min(estimate_num_groups(root,
+												 list_make1(key), rows,
+												 NULL, NULL), rows));
+	width = get_attavgwidth(rte->relid, key->varattno);
+	if (width <= 0)
+		width = get_typavgwidth(type, key->vartypmod);
+	bytes = keys *
+		(2.0 * (sizeof(Datum) + sizeof(uint32) + sizeof(char) + 3) +
+		 (get_typbyval(type) ? 0.0 : MAXALIGN(width) + 16.0));
+	if (bytes > (double) work_mem * 1024.0)
+		return NULL;
+
+	ks = (OjKeySet *) palloc0(sizeof(OjKeySet));
+	ks->rel = x;
+	ks->keyvar = key;
+	ks->path = feed;
+	ks->reads = reads;
+	ks->eqop = eqop;
+	ks->collation = j->keyec->ec_collation;
+	ks->clauseop = clauseop;
+	ks->rows = rows;
+	ks->keys = keys;
+	ks->pass = oj_keyset_pass(root, j, x, key, eqop, ks->collation);
+	return ks;
+}
+
+/*
  * May x, a table of joinrel, be folded into a key set of the join j
  * (DESIGN.md §47.6)?  Appends it to j->keysets when it may:
  *
@@ -695,8 +820,8 @@ oj_feed_cold(PlannerInfo *root, Path *path, double *pages)
  *	  column with the fact's key, which equals it, and is the very value x's
  *	  row holds where the key's equality is the identity of its values
  *	  (lion_type_equalimage(), under the type's default equality);
- *	- the keys its path is expected to return fit work_mem: the set is held
- *	  in memory, and never spilled.
+ *	- the distinct keys its path is expected to return fit work_mem: the
+ *	  set is held in memory, and never spilled (oj_keyset_new()).
  */
 static bool
 oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
@@ -713,14 +838,8 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	Var		   *r;
 	Var		   *key;
 	Oid			type;
-	Oid			eqop = InvalidOid;
-	RegProcedure lhash;
-	RegProcedure rhash;
+	Oid			eqop;
 	OjKeySet   *ks;
-	Path	   *feed;
-	double		reads;
-	double		bytes;
-	int32		width;
 	ListCell   *lc;
 
 	if (j->keyec == NULL || j->keyec->ec_has_volatile || j->keyec->ec_broken)
@@ -772,18 +891,7 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	type = exprType((Node *) j->fkvar);
 	if (exprType((Node *) key) != type)
 		return false;
-	foreach(lc, j->keyec->ec_opfamilies)
-	{
-		Oid			opno = get_opfamily_member(lfirst_oid(lc), type, type,
-											   BTEqualStrategyNumber);
-
-		if (OidIsValid(opno) && op_hashjoinable(opno, type) &&
-			get_op_hash_functions(opno, &lhash, &rhash) && lhash == rhash)
-		{
-			eqop = opno;
-			break;
-		}
-	}
+	eqop = oj_keyset_eqop(j, type);
 	if (!OidIsValid(eqop))
 		return false;
 
@@ -808,32 +916,186 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 			return false;
 	}
 
-	/* its feed, with the key, and the set it makes in work_mem */
-	if (!oj_target_has(x->reltarget, key))
+	ks = oj_keyset_new(root, j, x, key, eqop, op->opno);
+	if (ks == NULL)
 		return false;
-	feed = oj_keyset_feed(root, x, &reads);
-	if (feed == NULL)
-		return false;
-	width = get_attavgwidth(rte->relid, key->varattno);
-	if (width <= 0)
-		width = get_typavgwidth(type, key->vartypmod);
-	bytes = feed->rows *
-		(2.0 * (sizeof(Datum) + sizeof(uint32) + sizeof(char) + 3) +
-		 (get_typbyval(type) ? 0.0 : MAXALIGN(width) + 16.0));
-	if (bytes > (double) work_mem * 1024.0)
-		return false;
-
-	ks = (OjKeySet *) palloc0(sizeof(OjKeySet));
-	ks->rel = x;
-	ks->keyvar = key;
-	ks->path = feed;
-	ks->reads = reads;
-	ks->eqop = eqop;
-	ks->collation = j->keyec->ec_collation;
-	ks->clauseop = op->opno;
-	ks->rows = clamp_row_est(feed->rows);
 	j->keysets = lappend(j->keysets, ks);
 	return true;
+}
+
+/*
+ * A key set of j from x, a table joined above joinrel (oj_keysets_above()),
+ * or NULL: a table as oj_keyset_of() takes one, with no PlaceHolderVar
+ * computed at it and no volatile function in its clauses, which the join
+ * above evaluates again; its key the key class's member of x, a plain column
+ * of the fact key's type with a hashable equality; and nothing of it wanted
+ * above but that key - no join clause of its own (joininfo), no other column
+ * in its target - so that it only filters the key, as an EXISTS of it does:
+ * the join above tests the key and nothing else, and a table the query reads
+ * a column of, the dimension of another join among them, is no key set.
+ */
+static OjKeySet *
+oj_keyset_above(PlannerInfo *root, OjJoin *j, RelOptInfo *x)
+{
+	RangeTblEntry *rte = root->simple_rte_array[x->relid];
+	Var		   *key = NULL;
+	Oid			eqop;
+	OjKeySet   *ks;
+	ListCell   *lc;
+
+	if (x->reloptkind != RELOPT_BASEREL || rte == NULL ||
+		rte->rtekind != RTE_RELATION || rte->tablesample != NULL ||
+		!bms_is_empty(x->lateral_relids) || x->joininfo != NIL ||
+		contain_volatile_functions((Node *) x->baserestrictinfo))
+		return NULL;
+	foreach(lc, root->placeholder_list)
+	{
+		PlaceHolderInfo *phinfo = (PlaceHolderInfo *) lfirst(lc);
+
+		if (bms_overlap(phinfo->ph_eval_at, x->relids))
+			return NULL;
+	}
+	foreach(lc, j->keyec->ec_members)
+	{
+		EquivalenceMember *em = (EquivalenceMember *) lfirst(lc);
+		Var		   *v;
+
+		if (em->em_is_child || em->em_is_const ||
+			!bms_equal(em->em_relids, x->relids))
+			continue;
+		v = oj_plain_var((Node *) em->em_expr);
+		if (v != NULL && v->varno == (int) x->relid)
+		{
+			key = v;
+			break;
+		}
+	}
+	if (key == NULL || exprType((Node *) key) != exprType((Node *) j->fkvar))
+		return NULL;
+	foreach(lc, x->reltarget->exprs)
+	{
+		Var		   *v = (Var *) lfirst(lc);
+
+		if (!IsA(v, Var) || v->varno != key->varno ||
+			v->varattno != key->varattno)
+			return NULL;
+	}
+	eqop = oj_keyset_eqop(j, exprType((Node *) key));
+	if (!OidIsValid(eqop))
+		return NULL;
+	ks = oj_keyset_new(root, j, x, key, eqop, eqop);
+	if (ks != NULL)
+		ks->above = true;
+	return ks;
+}
+
+/*
+ * The relations of the join search under way - its first level's, or
+ * GEQO's - or NULL where neither says: another extension's join search.
+ */
+static Relids
+oj_search_relids(PlannerInfo *root)
+{
+	List	   *initial;
+	Relids		relids = NULL;
+	ListCell   *lc;
+
+	if (root->join_rel_level != NULL)
+		initial = root->join_rel_level[1];
+	else if (root->join_search_private != NULL)
+		initial = ((GeqoPrivateData *) root->join_search_private)->initial_rels;
+	else
+		return NULL;
+	foreach(lc, initial)
+		relids = bms_add_members(relids, ((RelOptInfo *) lfirst(lc))->relids);
+	return relids;
+}
+
+/*
+ * The key sets of j from tables joined above joinrel by the key (DESIGN.md
+ * §47.6, "A join above"), appended to j->keysets.  A query with more tables
+ * than join_collapse_limit (or from_collapse_limit) is planned in parts, and
+ * an EXISTS or an IN - or the inner join core makes of one on a unique key -
+ * is then joined above the part that holds the fact and the dimension: the
+ * node is offered without that table, which is a key set all the same - its
+ * plan run before the walk, its keys tested - while the join stays above and
+ * tests the rows the node returns again.  Only a table outside the join
+ * search under way (oj_search_relids()): one inside it is joined in it, and
+ * a key set of the join rel that holds it (oj_keyset_of()), as before.  A row
+ * whose key the table lacks is a row that join would drop, where
+ *
+ *	- the table x, not in joinrel, is the whole inner side of a semi join
+ *	  within whose syntactic outer side joinrel is, or is on no special
+ *	  join's inner side at all, an inner join: either way each of joinrel's
+ *	  rows meets the join on its way up, and the join drops the rows whose
+ *	  key x lacks among the rows x's own clauses let through;
+ *	- joinrel is on no special join's inner side but those wholly within it,
+ *	  and on no side of a FULL join reaching past it: its rows are never
+ *	  null-extended, and the rows above them hold the key each of them has,
+ *	  the key class's member of x equal to it;
+ *	- x is a table oj_keyset_above() takes.
+ *
+ * The node then returns the rows the key sets keep, and j->abovepass is
+ * their share of joinrel's rows, over which the LIMIT's share of a walk is
+ * taken (oj_competitor()); the tables are not counted against the node's
+ * being alone under the LIMIT (oj_alone()).
+ */
+static void
+oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
+{
+	ListCell   *lc;
+	Relids		search;
+	int			relid;
+
+	j->abovepass = 1.0;
+	if (j->keyec == NULL || j->keyec->ec_has_volatile || j->keyec->ec_broken)
+		return;
+	search = oj_search_relids(root);
+	if (search == NULL)
+		return;
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+		Relids		rh = bms_union(sjinfo->min_righthand,
+								   sjinfo->syn_righthand);
+		Relids		sides = bms_union(rh, sjinfo->syn_lefthand);
+
+		if (bms_overlap(rh, joinrel->relids) &&
+			!bms_is_subset(rh, joinrel->relids))
+			return;
+		if (sjinfo->jointype == JOIN_FULL &&
+			bms_overlap(sides, joinrel->relids) &&
+			!bms_is_subset(sides, joinrel->relids))
+			return;
+	}
+
+	relid = -1;
+	while ((relid = bms_next_member(root->all_baserels, relid)) >= 0)
+	{
+		RelOptInfo *x = (relid < root->simple_rel_array_size) ?
+			root->simple_rel_array[relid] : NULL;
+		bool		ok = true;
+		OjKeySet   *ks;
+
+		if (x == NULL || bms_is_member(relid, search))
+			continue;
+		foreach(lc, root->join_info_list)
+		{
+			SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+			if (!bms_is_member(relid, sjinfo->min_righthand) &&
+				!bms_is_member(relid, sjinfo->syn_righthand))
+				continue;
+			ok = ok && sjinfo->jointype == JOIN_SEMI &&
+				bms_equal(sjinfo->min_righthand, x->relids) &&
+				bms_equal(sjinfo->syn_righthand, x->relids) &&
+				bms_is_subset(joinrel->relids, sjinfo->syn_lefthand);
+		}
+		if (!ok || (ks = oj_keyset_above(root, j, x)) == NULL)
+			continue;
+		j->keysets = lappend(j->keysets, ks);
+		j->abovepass *= ks->pass;
+	}
 }
 
 /*
@@ -1003,7 +1265,7 @@ oj_special_ok(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
  * which core prices from the node's own start-up, total and rows.
  */
 static bool
-oj_alone(PlannerInfo *root, RelOptInfo *joinrel)
+oj_alone(PlannerInfo *root, RelOptInfo *joinrel, const OjJoin *j)
 {
 	Query	   *parse = root->parse;
 	Relids		rest = bms_difference(root->all_baserels, joinrel->relids);
@@ -1015,6 +1277,13 @@ oj_alone(PlannerInfo *root, RelOptInfo *joinrel)
 	if (parse->limitOption == LIMIT_OPTION_WITH_TIES ||
 		root->hasHavingQual || parse->hasTargetSRFs)
 		return false;
+	foreach(lc, j->keysets)
+	{
+		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+
+		if (ks->above)
+			rest = bms_del_members(rest, ks->rel->relids);
+	}
 	if (bms_is_empty(rest))
 		return true;
 
@@ -1186,7 +1455,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, const OjJoin *j,
 		ordered = (p->pathkeys != NIL && pathkeys != NIL &&
 				   linitial(p->pathkeys) == linitial(pathkeys));
 		cost = ordered ?
-			p->startup_cost + oj_limit_share(root, j, p->rows) *
+			p->startup_cost + oj_limit_share(root, j, p->rows * j->abovepass) *
 			(p->total_cost - p->startup_cost) :
 			p->total_cost;
 		if (best == NULL || cost < c->cost)
@@ -1201,7 +1470,7 @@ oj_competitor(PlannerInfo *root, RelOptInfo *joinrel, const OjJoin *j,
 		lion_competitor_kind(best) != LION_COMPETITOR_NESTLOOP)
 		return;
 	c->nestloop = true;
-	share = oj_limit_share(root, j, best->rows);
+	share = oj_limit_share(root, j, best->rows * j->abovepass);
 	c->memo = lion_memoize_limit_extra(root, best, share);
 	if (bestwalk != NULL)
 	{
@@ -1262,12 +1531,11 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * dimension's unique btree and a test of the TID against its set; and for
  * each member found a heap fetch, its recheck and its filter; then the join's
  * own target.  A non-NULL key costs its descent whether or not it names a
- * dimension row; found of them do (oj_found_share()).  A key set's keys are
- * taken to be dimension keys: it lets through ks.rows / dim.tuples of the
- * keys that name a row, found x ks.rows / dim.tuples of them all - ks.rows /
- * max(nd, dim.tuples), core's eqjoinsel_semi() once nd passes dim.tuples -
- * and each key it lets through names one, so that the orphan share is taken
- * once, at the first key set or, with none, at the members and the rows.
+ * dimension row; found of them do (oj_found_share()).  A key set lets
+ * through ks.pass of the keys, core's semi join selectivity of the fact's key
+ * to its table (oj_keyset_pass()); each key it lets through is taken to name
+ * a dimension row, so that the orphan share is taken once, at the first key
+ * set or, with none, at the members and the rows.
  * *rows is what it returns: of the descents that find a dimension row, the
  * share of the dimension's rows that pass its quals (lion_probe_rel_rows()).
  *
@@ -1384,9 +1652,9 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 		startup += ks->path->total_cost + ks->rows * cpu_operator_cost;
 		run += descents * cpu_operator_cost;
 		if (fold)
-			startup += ks->rows * cpu_operator_cost;
+			startup += ks->keys * cpu_operator_cost;
 		else
-			descents *= Min(1.0, hit * ks->rows / dimtuples);
+			descents *= ks->pass;
 		hit = 1.0;
 	}
 	kept = Min(descents / keys, 1.0);
@@ -1672,21 +1940,17 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 /*
  * The key sets of j folded into the fact's set (DESIGN.md §47.6, §47.3): the
  * share of the fact's rows whose key every key set holds, as oj_cost() takes
- * the key sets' keys - its non-NULL keys, found x ks.rows / dim.tuples of
- * them at the first key set, ks.rows / dim.tuples at each after - and into
- * *build the price of their leaves, each the rows of its own keys on the fact
- * key's lion index (lion_ordered_keys_price()), *pages the index pages those
- * read.
+ * the key sets' keys - its non-NULL keys, ks.pass of them at each key set -
+ * and into *build the price of their leaves, each the rows of its ks.keys
+ * keys on the fact key's lion index (lion_ordered_keys_price()), *pages the
+ * index pages those read.
  */
 static double
 oj_fold_share(PlannerInfo *root, OjJoin *j, Cost *build, double *pages)
 {
-	double		dimtuples = Max(j->dim->tuples, 1.0);
 	double		tuples = Max(j->fact->tuples, 1.0);
-	double		found = oj_found_share(root, j, dimtuples);
 	double		nonnull = nulltestsel(root, IS_NOT_NULL, (Node *) j->fkvar,
 									  j->fact->relid, JOIN_INNER, NULL);
-	double		hit = found;
 	double		sel = nonnull;
 	ListCell   *lc;
 
@@ -1695,14 +1959,12 @@ oj_fold_share(PlannerInfo *root, OjJoin *j, Cost *build, double *pages)
 	foreach(lc, j->keysets)
 	{
 		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
-		double		own = Min(1.0, found * ks->rows / dimtuples);
 		double		p;
 
-		*build += lion_ordered_keys_price(root, j->fact, j->keyidx, ks->rows,
-										  tuples * nonnull * own, &p);
+		*build += lion_ordered_keys_price(root, j->fact, j->keyidx, ks->keys,
+										  tuples * nonnull * ks->pass, &p);
 		*pages += p;
-		sel *= Min(1.0, hit * ks->rows / dimtuples);
-		hit = 1.0;
+		sel *= ks->pass;
 	}
 	return sel;
 }
@@ -2343,7 +2605,8 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 	if (!bms_is_empty(joinrel->lateral_relids) ||
 		!oj_target_ok(joinrel, joinrel->relids))
 		return;
-	j->alone = oj_alone(root, joinrel);
+	oj_keysets_above(root, joinrel, j);
+	j->alone = oj_alone(root, joinrel, j);
 	j->keyidx = oj_key_index(j, &j->keycol);
 	ords = lion_ordered_orders(j->fact);
 	split = os_split_of(root, j, &sp);
