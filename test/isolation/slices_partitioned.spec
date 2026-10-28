@@ -1,9 +1,10 @@
 # Snapshot semantics of the aggregates of sliced columns over a PARTITIONED
 # table, answered by one LionCount node from every partition's own slices
-# and added up across the partitions (DESIGN.md §52, "Partitioned tables").
+# and added up across the partitions (DESIGN.md §52.13).
 #
 # Every step reports count, sum, min and max of the sliced columns under a
-# WHERE, as the node answers them, next to the same aggregates of
+# WHERE, and a count and a sum under a range on a sliced column (§53), as
+# the node answers them from the slices, next to the same aggregates of
 # expressions of the columns (`a + 0`), which no slice answers and which
 # the ordinary plan computes from the rows - in the same statement, and so
 # under the same snapshot: they must always be equal.  The REPEATABLE READ
@@ -42,7 +43,9 @@ setup
 							  min(b), max(b))
 				  FROM sptp WHERE grp IN (0, 1)) AS b,
 			   (SELECT format('%s %s %s', count(ts), min(ts), max(ts))
-				  FROM sptp WHERE grp <> 1) AS ts),
+				  FROM sptp WHERE grp <> 1) AS ts,
+			   (SELECT format('%s %s', count(*), sum(b))
+				  FROM sptp WHERE a BETWEEN -200 AND 300) AS r),
 	q AS (
 		SELECT (SELECT format('%s %s %s %s', count(a + 0), sum(a + 0),
 							  min(a + 0), max(a + 0))
@@ -52,8 +55,10 @@ setup
 				  FROM sptp WHERE grp IN (0, 1)) AS b,
 			   (SELECT format('%s %s %s', count(ts + interval '0 s'),
 							  min(ts + interval '0 s'), max(ts + interval '0 s'))
-				  FROM sptp WHERE grp <> 1) AS ts)
-	SELECT (l.a, l.b, l.ts) = (q.a, q.b, q.ts), l.a || ' | ' || l.b
+				  FROM sptp WHERE grp <> 1) AS ts,
+			   (SELECT format('%s %s', count(*), sum(b + 0))
+				  FROM sptp WHERE a + 0 BETWEEN -200 AND 300) AS r)
+	SELECT (l.a, l.b, l.ts, l.r) = (q.a, q.b, q.ts, q.r), l.a || ' | ' || l.b
 	  FROM l, q
 	$f$;
 }
@@ -69,9 +74,12 @@ teardown
 # answers its aggregates from the slices.
 session s1
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
-				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC'; }
+				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC';
+				  SET pg_lion.prefer_slice_ranges = on; }
 step s1_explain	{ EXPLAIN (COSTS OFF)
-				  SELECT count(a), sum(a), min(a), max(a) FROM sptp WHERE grp = 1; }
+				  SELECT count(a), sum(a), min(a), max(a) FROM sptp WHERE grp = 1;
+				  EXPLAIN (COSTS OFF)
+				  SELECT count(*), sum(b) FROM sptp WHERE a BETWEEN -200 AND 300; }
 step s1_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; }
 step s1_slices	{ SELECT * FROM sptp_both(); }
 step s1_commit	{ COMMIT; }
@@ -81,7 +89,8 @@ step s1_commit	{ COMMIT; }
 # row of grp 1 in one partition.
 session s2
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
-				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC'; }
+				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC';
+				  SET pg_lion.prefer_slice_ranges = on; }
 step s2_begin	{ BEGIN; }
 step s2_write	{ INSERT INTO sptp VALUES
 					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
@@ -98,7 +107,8 @@ step s2_rollback	{ ROLLBACK; }
 # A reader that takes a fresh snapshot for every statement, and a VACUUM.
 session s3
 setup			{ SET enable_seqscan = off; SET enable_bitmapscan = off;
-				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC'; }
+				  SET pg_lion.enable_plain_scan = off; SET TimeZone = 'UTC';
+				  SET pg_lion.prefer_slice_ranges = on; }
 step s3_slices	{ SELECT * FROM sptp_both(); }
 step s3_vacuum	{ VACUUM sptp; }
 

@@ -1073,10 +1073,12 @@ working around a bad choice:
   other columns, as an `OR`'s arm, under `count(DISTINCT)` of another column, as the filter of
   the slices' own aggregates (`sum(x) WHERE x > c`), with parameters and stable expressions - but
   not a range that bounds the walk of a `GROUP BY` or `count(DISTINCT)` of its own column, nor on
-  a partitioned table, in a join, in a filtered count's condition, inside a partial index's scope
-  or on a hot standby. `x <> c` from the slices is a positive source - every row with a value but
-  c's - where it otherwise only subtracts c's rows. Bounds past the type's range, NULL bounds,
-  infinities and a reversed `BETWEEN` give the ordinary query's answer. EXPLAIN prints `Range From
+  a partitioned table one of whose partitions has no index slicing the column (each partition
+  folds its own index's slices, DESIGN.md §53.11), in a join, in a filtered count's condition,
+  inside a partial index's scope or on a hot standby. `x <> c` from the slices is a positive
+  source - every row with a value but c's - where it otherwise only subtracts c's rows. Bounds
+  past the type's range, NULL bounds, infinities and a reversed `BETWEEN` give the ordinary
+  query's answer. EXPLAIN prints `Range From
   Slices: x > 10 (32 slices)` - each such range's bounds and its column's width - and the range in
   `Lion Indexes` as any; `EXPLAIN ANALYZE` adds `Slice Range Descents` (collections), `Slice Range
   Keys` (container keys folded), `Slice Range Steps` (a slice's container folded at a key, the
@@ -1576,9 +1578,10 @@ Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, 
 `numeric` or `interval` - for every such column of the index or none (the option is the index's,
 not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
 from them (DESIGN.md §52), and a range on the sliced column itself (DESIGN.md §53), but not a
-percentile, a join's aggregates or ranges, a partitioned table's `GROUP BY` or ranges, nor a
-bitmap or plain scan's range; a partitioned table's one row is answered when every partition
-has its own index slicing the column (DESIGN.md §52.13). An insert into a sliced column costs a posting-set insert per set bit of its value - in
+percentile, a join's aggregates or ranges, a partitioned table's `GROUP BY`, nor a bitmap or
+plain scan's range; a partitioned table's one row and its ranges are answered when every
+partition has its own index slicing the column (DESIGN.md §52.13, §53.11). An insert into a
+sliced column costs a posting-set insert per set bit of its value - in
 place, several to a WAL record, but a posting page each (DESIGN.md §51, "Insert cost, revisited").
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
