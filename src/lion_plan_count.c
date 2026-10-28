@@ -485,6 +485,8 @@ typedef struct LionCountPathBuild
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
 static RelOptInfo *lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel,
 										 AttrNumber *attnos, int natts);
+static bool lion_count_slice_range_ok(const LionCountPathBuild *cx,
+									  AttrNumber attno, Oid cmptype);
 
 /* Does a GROUP BY or a count(DISTINCT) of the build walk column attno? */
 static bool
@@ -1069,8 +1071,8 @@ lion_count_path_where_or(LionCountPathBuild *cx, Node *clause)
 			{
 				leaf.kind = LION_CLAUSE_RANGESRC;
 				if (cx->slicerange &&
-					lion_slice_range_ok(cx->input_rel, leaf.var->varattno,
-										leaf.cmptype))
+					lion_count_slice_range_ok(cx, leaf.var->varattno,
+											  leaf.cmptype))
 					sliced = true;
 				else
 					thisrange = true;
@@ -1248,8 +1250,7 @@ lion_count_path_where_leaf(LionCountPathBuild *cx, RestrictInfo *rinfo,
 	 */
 	if (leaf.kind == LION_CLAUSE_NE && cx->slicerange && cx->curfilter == 0 &&
 		!lion_count_path_walks_column(cx, leaf.var->varattno) &&
-		lion_slice_range_ok(cx->input_rel, leaf.var->varattno,
-							leaf.cmptype))
+		lion_count_slice_range_ok(cx, leaf.var->varattno, leaf.cmptype))
 	{
 		leaf.kind = LION_CLAUSE_RANGESRC;
 		cx->hasrangesrc = true;
@@ -2551,6 +2552,30 @@ lion_count_sliced_index(const LionCountPathBuild *cx, AttrNumber attno,
 }
 
 /*
+ * lion_slice_range_ok() of the table the build counts (DESIGN.md §53): a
+ * partitioned table's first live leaf's, attno translated as above - every
+ * leaf's is asked once the partitions are known
+ * (lion_count_path_slice_range_parts()).
+ */
+static bool
+lion_count_slice_range_ok(const LionCountPathBuild *cx, AttrNumber attno,
+						  Oid cmptype)
+{
+	RelOptInfo *rel = cx->input_rel;
+
+	if (cx->partitioned)
+	{
+		AttrNumber	a = attno;
+
+		rel = lion_count_first_leaf(cx->root, rel, &a, 1);
+		if (rel == NULL || a == 0)
+			return false;
+		attno = a;
+	}
+	return lion_slice_range_ok(rel, attno, cmptype);
+}
+
+/*
  * An aggregate of sliced column attno answered from its slices (DESIGN.md
  * §52), of kind skind taking the column as argtype (lion_sagg_classify()):
  * over one table, with no GROUP BY or one of one or two lion-indexed columns
@@ -2705,6 +2730,59 @@ lion_count_path_slice_parts(LionCountPathBuild *cx)
 			t->sliceidx[i] = idx;
 			t->slicecol[i] = col;
 			i++;
+		}
+	}
+	return true;
+}
+
+/*
+ * The ranges a build answers from slices over a partitioned table (DESIGN.md
+ * §53, §52.13): the clauses were taken from the first live leaf's index
+ * (lion_count_slice_range_ok()), and each partition the node counts reads
+ * the index its target matched them to - which has to slice the column at
+ * its type's width, and take the bounds' type, too.  The executor would
+ * collect a range from the entries of a partition whose index does not
+ * (lion_rangesrc_range(), as after a REINDEX), the same rows, but the build
+ * is priced as from slices in every partition: one that cannot is the build
+ * without them, which is offered beside it, and this one is declined.  A
+ * partition that leaves the clause out, its bounds implying it (§16), reads
+ * nothing for it.
+ */
+static bool
+lion_count_path_slice_range_parts(LionCountPathBuild *cx)
+{
+	ListCell   *lc;
+
+	if (!cx->partitioned || cx->nsliced == 0)
+		return true;
+	foreach(lc, cx->targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		ListCell   *l1;
+		ListCell   *l2;
+		ListCell   *l3;
+
+		forthree(l1, cx->clauseinfos, l2, t->whereidx, l3, t->wherecol)
+		{
+			LionClauseInfo *ci = (LionClauseInfo *) lfirst(l1);
+			IndexOptInfo *idx = (IndexOptInfo *) lfirst(l2);
+			IndexOptInfo *sidx;
+			AttrNumber	attno;
+			AttrNumber	col = 0;
+			Oid			typid = InvalidOid;
+
+			if (!ci->sliced || ci->kind != LION_CLAUSE_RANGESRC ||
+				idx == NULL)
+				continue;
+			attno = lion_count_leaf_attno(cx, t->rel, ci->attno);
+			if (attno == 0)
+				return false;
+			sidx = lion_range_sliced_index(t->rel, attno, &col, &typid);
+			if (sidx == NULL || sidx->indexoid != idx->indexoid ||
+				col != (AttrNumber) lfirst_int(l3) ||
+				(OidIsValid(ci->cmptype) &&
+				 !lion_slice_range_type_ok(typid, ci->cmptype)))
+				return false;
 		}
 	}
 	return true;
@@ -3358,8 +3436,8 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 
 					if (!ok)
 						break;
-					ok = lion_slice_range_ok(cx->input_rel, v->varattno,
-											 ci->cmptype);
+					ok = lion_count_slice_range_ok(cx, v->varattno,
+												   ci->cmptype);
 				}
 				sliceable[r++] = ok;
 			}
@@ -4181,7 +4259,7 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		ListCell   *lc;
 		int			i = 0;
 
-		Assert(cx->slicerange && !cx->partitioned);
+		Assert(cx->slicerange);
 		foreach(lc, cx->clauseinfos)
 		{
 			LionClauseInfo *ci = (LionClauseInfo *) lfirst(lc);
@@ -6267,6 +6345,9 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 	/* ... from every partition's own slices (§52.13) */
 	if (!lion_count_path_slice_parts(cx))
 		return false;
+	/* ... and the ranges from every partition's own slices (§53) */
+	if (!lion_count_path_slice_range_parts(cx))
+		return false;
 
 	lion_count_path_estimate(cx);
 	lion_count_path_topk(cx);
@@ -6356,18 +6437,31 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
  * May a build answer ranges from slices (DESIGN.md §53)?  A table with a lion
  * index that slices a column - the WHERE is not analysed yet, and the build
  * declines itself where no range is one the slices answer - counted on its
- * own: not partitioned, no FK-side or anti join, outside a partial index's
- * scope, not on a hot standby, where nothing is collected (§10).
+ * own: no FK-side or anti join, outside a partial index's scope, not on a hot
+ * standby, where nothing is collected (§10).  A partitioned table asks its
+ * first live leaf, and every partition its own once they are known
+ * (lion_count_path_slice_range_parts()); not inside a partial index's scope
+ * at all, which is a partition's at a time.
  */
 static bool
 lion_query_may_slice_ranges(const LionCountPathBuild *cx)
 {
-	if (!lion_enable_slice_ranges || cx->partitioned || cx->fj != NULL ||
+	RelOptInfo *rel = cx->input_rel;
+
+	if (!lion_enable_slice_ranges || cx->fj != NULL ||
 		cx->anti != NULL || cx->distinctstage || RecoveryInProgress() ||
 		cx->input_rel->baserestrictinfo == NIL ||
 		lion_partial_index_of(cx->input_rel) != NULL)
 		return false;
-	return lion_rel_has_sliced_index(cx->input_rel);
+	if (cx->partitioned)
+	{
+		if (lion_partial_active())
+			return false;
+		rel = lion_count_first_leaf(cx->root, rel, NULL, 0);
+		if (rel == NULL)
+			return false;
+	}
+	return lion_rel_has_sliced_index(rel);
 }
 
 static void

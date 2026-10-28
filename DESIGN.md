@@ -33198,7 +33198,8 @@ planner keeps (§16):
   serialize; an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
   on the partition key with `enable_partition_pruning` off, or one a kept leaf's bounds do not
   imply, which stays residual (§16, "Residual clauses over a partitioned table"); a hot standby,
-  as for a table.
+  as for a table. A range on a sliced column, as the `WHERE` of these aggregates or of a count,
+  is §53.11's.
 
 Tests: `test/sql/slices_partitioned.sql` compares every answer with the pushdown forced
 (sequential, bitmap and plain scans off) against the pushdown off, as multisets of text, and names
@@ -33347,8 +33348,9 @@ slices it is a source from the slices:
   `LION_CLAUSE_SLICED` in the plan's clause kinds, beside §32's `LION_CLAUSE_WALK`, which a range
   from slices never is.
 - **Declined** where the build has no range to answer so (no duplicate of the other build), and on
-  a partitioned table, an FK-side or anti join, a `SELECT DISTINCT`'s groups and a hot standby
-  (`lion_query_may_slice_ranges()`), and with `pg_lion.enable_slice_ranges` off.
+  an FK-side or anti join, a `SELECT DISTINCT`'s groups and a hot standby
+  (`lion_query_may_slice_ranges()`), and with `pg_lion.enable_slice_ranges` off. A partitioned
+  table takes it partition by partition (§53.11).
 - **The price** (§53.5) is the build's own; `add_path()` keeps the cheapest of it, the build that
   walks and sums the entries, the summaries' collections, and core's paths. That is the whole of
   "summaries at selective ranges, slices at wide ones": each prices what it reads.
@@ -33564,7 +33566,8 @@ What the tables say:
   the plans and `EXPLAIN ANALYZE`'s counters; a parallel count's Gather, and a `GROUP BY` beside it
   kept serial; the planner's choice, with nothing preferred, over 100,000 unique values with
   summaries and slices and with slices alone, at 0.1% and 60%, and with the switch off; the declines:
-  a float column, a partitioned table, a join, a column no index slices, the switch off.
+  a float column, a join, a column no index slices, the switch off; a partitioned table's range
+  from slices (§53.11, whose tests are `slices_partitioned.sql`'s).
 - `test/isolation/slices_range.spec`: ranges from slices, a `<>`, an OR and a sum under a range,
   beside the same counts of expressions of the columns, which only the ordinary plan computes, in
   one statement: a REPEATABLE READ reader across a writer's rows at every column's extremes, updates
@@ -33593,9 +33596,10 @@ What the tables say:
   at a time the same way. Neither changes the format; the price is §53.5's with the copy left out.
 - **Partitioned tables, joins**: each partition would fold its own index's slices, and the
   planner's build decide per partition - the slices' index is matched per relation already
-  (§16), but the build is declined whole, as §52's is. The FK-side join's fact filters (§27) and
-  the anti join's take ranges as §32's sources only. A filtered count's condition (§10, "Filtered
-  counts") takes its ranges from the entries.
+  (§16), but the build is declined whole, as §52's is. *(2026-10-28, §53.11: partitioned
+  tables done, every partition's index slicing the column or the build declined.)* The FK-side
+  join's fact filters (§27) and the anti join's take ranges as §32's sources only. A filtered
+  count's condition (§10, "Filtered counts") takes its ranges from the entries.
 - **The fold at the WHERE's keys alone**: beside a selective clause, E's keys are mostly keys the
   count never reaches. Folding only at the keys of the other sources (sought as the probe of §32
   seeks a summed range's sets) would make the copy the WHERE's and no longer a source of its own,
@@ -33614,3 +33618,56 @@ What the tables say:
   15 ms over the ordinary plan's 7 to 8. Neither is this section's price, nor changed by it.
 - **On a hot standby** the planner offers none of this, as none of §32's collections (§10).
 - **Percentiles** and the rest of §52.12 stand.
+
+### 53.11 Partitioned tables (2026-10-28)
+
+The ranges of §53.4 over a partitioned table, in the one LionCount node that counts every leaf
+(§16), each leaf folding its own index's slices:
+
+    SELECT count(*) FROM parted WHERE k > 50 AND k < 350 AND v <> 17;
+
+      Custom Scan (LionCount)
+        Partitions: parted_1, parted_2a, parted_2b, parted_3
+        Lion Indexes: (k > 50 AND k < 350), (v <> 17)
+        Range From Slices: k > 50 AND k < 350 (32 slices), v <> 17 (32 slices)
+        Implied by Partition Bounds: (k > 50) in 3 of 4 partitions, (k < 350) in 3 of 4 partitions
+
+It fell out of what was there: the executor resolves a range against the index the leaf's turn
+matched its bounds to (`lion_rangesrc_range()`), and decides from that index's column whether the
+slices answer it; the cost model prices a range source per relation by its clause
+(`lion_cost_sliced`), and a partitioned count is priced as the sum of its leaves' counts (§49), so a
+range from slices is priced in each leaf by §53.5's formula with the leaf's index and rows. What
+changed:
+
+- **The planner** asks the first live leaf where it asked the table - whether any whole lion
+  index slices a column (`lion_query_may_slice_ranges()`), and whether the one a range's column
+  is matched to slices it at width and takes the bounds' type (`lion_count_slice_range_ok()`, the
+  column translated as §52.13's are) - and, once the leaves are known, every leaf
+  (`lion_count_path_slice_range_parts()`): the index its target matched each bound to has to be
+  the one `lion_range_sliced_index()` finds on the leaf, at the same key column. A leaf whose
+  index does not slice the column declines the build; the build that collects or walks the
+  range from the entries is offered beside it as always, and the executor's fallback - a range
+  from the entries where the column is no longer sliced, as after a REINDEX - is never planned.
+  A leaf that leaves a bound out, its partition bounds implying it (§16), reads nothing for it,
+  and a range whose every bound is so left out in every leaf is not shown in EXPLAIN. Not inside a
+  partial index's scope (§45), which is a leaf's at a time; not on a hot standby.
+- **The pin** (lion_plan_partition.c): a leaf that leaves clauses out must keep one that selects
+  rows and carries the §9 interlock (`lion_leaf_selects()`, `lion_pinned_not_implied()`), which a
+  range collected from its entries does not - but a range from slices does, ANDed with E located
+  with its pin (§53.3), alone or as an OR's leaf. Before this, `count(*) ... WHERE v > c` on a
+  partitioned table had no clause to carry the pin and was declined.
+- **EXPLAIN**'s `(N slices)` is read from a leaf's index (the plan holds none for a partitioned
+  table), and a bound every leaf leaves out is not printed.
+
+The ranges compose with §52.13's aggregates (`sum(w), max(ts) ... WHERE g = 3 AND v BETWEEN a AND
+b`, from slices both), with the counts' partial groups of a `GROUP BY` (`g, count(*) ... WHERE v >
+c GROUP BY g`, the Finalize Agg above), and with pruning. Over 9,000 rows in 4 leaves, `count(*)
+WHERE v > 1000` was priced 60.71, the sum of the four leaves named alone (15.61, 14.71, 14.79,
+15.61), against 633.57 collected from the entries. Tests: section 6 of
+`test/sql/slices_partitioned.sql` (each type, beside equalities and lists, `<>`, an OR's leaf,
+bounds of another type, crossed and past the type, ranges on the partition key implied by some
+leaves and by all, a `GROUP BY`, §52.13's aggregates, a generic plan with a NULL bound, a dirty heap
+and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf whose index does
+not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
+partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
+sum under a range from slices beside the aggregates.
