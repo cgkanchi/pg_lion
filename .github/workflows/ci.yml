@@ -1,31 +1,35 @@
-# Build and test pg_lion against every supported PostgreSQL major.
+# Build and test pg_lion on every pull request:
 #
-#   pgdg    16, 17, 18 and 19 (beta) from apt.postgresql.org: the packaged
-#           server and postgresql-server-dev-N headers a PGXN user builds
-#           against.  Packaged servers have no injection_points module, so the
-#           Makefile skips the specs that need it and says so.
-#   source  REL_19_STABLE and master built from source with --enable-cassert
-#           and --enable-injection-points, the injection_points module and the
-#           isolation tester installed, so every isolation spec runs.  The
-#           build is cached per upstream commit.  These are also the only jobs
-#           with an assert build, so the debug_discard_caches run is here.
+#   pgdg    16, 17, 18 and 19 (beta) from apt.postgresql.org (pgdg.yml): the
+#           packaged server and postgresql-server-dev-N headers a PGXN user
+#           builds against.  Packaged servers have no injection_points
+#           module, so the Makefile skips the specs that need it and says so.
+#   source  REL_18_STABLE built from source with --enable-cassert and
+#           --enable-injection-points, pg_lion built with UBSan
+#           (source.yml).
 #   dist    make dist, META.json validated against the PGXN Meta Spec, and the
 #           archive built and tested on its own, outside the checkout.
 #
+# Started by hand, optional.yml builds REL_16_STABLE, REL_17_STABLE,
+# REL_19_STABLE and master from source too, with the debug_discard_caches
+# run, and runs 18's packages on arm64, which is not a first-class target.
+#
 # The injection-point specs - the race tests of the VACUUM/count/split
-# interlocks - therefore run on 19 and master only.  16 has no injection
-# points at all, and 17 and 18 would need a source build of their own
-# (PGDG ships no injection_points module); docs/DEVELOPING.md says so.
+# interlocks - therefore run on 18 from source on every pull request, and on
+# every major from 17 in a run of optional.yml.  16 has no
+# injection points at all, and PGDG ships no injection_points module;
+# docs/DEVELOPING.md says so.  The concurrent soak (test/soak) runs weekly,
+# in soak.yml.
 #
 # The crash-recovery and hot-standby harness (test/recovery/run.sh) runs on
 # every major, in both WAL modes and with wal_consistency_checking, so that
 # every major replays lion's records: its phases 1, 1f, 2, 4 and 5 on the
 # packages, and all of them, the injection-point phases included, on the
-# source builds.
+# source build.
 #
 # lionvec's tests (the vector*.sql files, the lionvec_*.spec specs and the
 # harness's phase 5) need pgvector: its package on the pgdg jobs, a build of
-# its default branch on the source jobs, its 18 package on the dist job.
+# its default branch on the source builds, its 18 package on the dist job.
 # Where it is expected - every job but a beta major's packages, which may not
 # have one yet - a failed install or build fails the job, and PGVECTOR=1
 # makes the Makefile and the harness fail instead of skipping those tests, as
@@ -67,267 +71,19 @@ env:
   LION_PORT: "55432"
 
 jobs:
+  # 16 to 19 from apt.postgresql.org (pgdg.yml); 18 on arm64 runs there
+  # from optional.yml, by hand.
   pgdg:
-    name: PostgreSQL ${{ matrix.pg }} (PGDG packages)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: ["16", "17", "18", "19"]
-    env:
-      PG: ${{ matrix.pg }}
-      PG_CONFIG: .local/pg/bin/pg_config
-    steps:
-      - uses: actions/checkout@v7
+    uses: ./.github/workflows/pgdg.yml
+    with:
+      versions: '["16", "17", "18", "19"]'
 
-      - name: Install PostgreSQL ${{ matrix.pg }} from apt.postgresql.org
-        run: |
-          # No auto-created cluster: the tests run their own.
-          sudo mkdir -p /etc/postgresql-common/createcluster.d
-          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
-          # Beta majors live in a component named after the version.
-          if [ "$PG" -ge 19 ]; then
-            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -c "$PG"
-          else
-            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
-          fi
-          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
-          mkdir -p .local
-          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
-          .local/pg/bin/pg_config --version
-
-      # pg_lion_vector's tests need pgvector.  Every released major has a
-      # package, and a missing one fails the job; once it is installed,
-      # PGVECTOR=1 goes into the job's environment, under which the Makefile
-      # will not leave lionvec's regression files and specs out, nor the
-      # recovery harness its phase 5 - so an install that put nothing where
-      # the server looks cannot pass green with no lionvec test run.  A beta
-      # major apt.postgresql.org has no package for yet still tests
-      # everything else, and says so.
-      - name: Install pgvector
-        run: |
-          if sudo apt-get install -y --no-install-recommends "postgresql-$PG-pgvector"; then
-            echo "PGVECTOR=1" >> "$GITHUB_ENV"
-          elif [ "$PG" -ge 19 ]; then
-            echo "::warning::no pgvector package for PostgreSQL $PG yet; the vector tests are skipped"
-          else
-            echo "::error::no pgvector package for PostgreSQL $PG"
-            exit 1
-          fi
-
-      - name: Build
-        run: make -j4 WERROR=1
-
-      - name: Install
-        run: sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
-
-      - name: Unit tests
-        run: make unit
-
-      - name: Unit tests with ASan and UBSan
-        run: make unit SANITIZE=1 WERROR=1
-
-      - name: Start a private cluster
-        run: ./dev.sh reset
-
-      - name: installcheck (generic WAL)
-        run: |
-          eval "$(./dev.sh env)"
-          make installcheck
-
-      - name: installcheck-rmgr (custom resource manager preloaded)
-        run: |
-          eval "$(./dev.sh env)"
-          make installcheck-rmgr
-
-      # pg_lion beside another extension on the same planner hook and with
-      # its own resource manager, in both load orders, the non-heap table AM
-      # refusals, counts on a sixteen-buffer pool, and - on 16, the only
-      # major with the setting - the refusal to read a lion index under
-      # old_snapshot_threshold (test/hook-check.sh).
-      # The test module goes into the packaged installation with sudo, like
-      # pg_lion itself.
-      - name: hookcheck (hook coexistence, table AMs)
-        run: |
-          sudo make -C test/modules/lion_hooktest install PG_CONFIG="$PWD/$PG_CONFIG" WERROR=1
-          eval "$(./dev.sh env)"
-          make hookcheck HOOKCHECK_SKIP_INSTALL=1
-
-      # WAL replay on the packaged majors too - without these steps nothing
-      # on 16-18 ever replayed a lion record.  The recovery harness's phases
-      # 1, 1f, 1h, 2 and 4 (crash recovery under load, a VACUUM on a server
-      # without the resource manager, the free space map entries a crash
-      # leaves on pages in use, a hot standby that replays everything the
-      # primary writes, and its promotion, and lion_index_verify() on a
-      # standby beside replay), and 5 (lionvec's TOAST locator, where
-      # pgvector is installed), in both WAL modes, with
-      # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e,
-      # 1g and 3 park a backend on an injection point, which the packaged
-      # servers cannot.  The extension is already in the packaged prefix
-      # (the Install step put it there with sudo), which this user cannot
-      # write to, so the harness uses it instead of installing its own.
-      - name: Crash recovery and standby replay (custom resource manager, consistency checked)
-        run: |
-          RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 1h 2 4 5" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
-
-      - name: Crash recovery and standby replay (generic WAL, consistency checked)
-        run: |
-          RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
-            --phases "1 1f 1h 2 4 5" --conf "wal_consistency_checking = 'generic'"
-
-      - name: Show regression diffs
-        if: failure()
-        run: |
-          find test -name regression.diffs -exec cat {} + || true
-          tail -n 100 .local/pg.log || true
-          tail -n 200 test/recovery/log/*.log || true
-
+  # PostgreSQL 18 from source, with assertions and injection points
+  # (source.yml); the other branches run there from optional.yml, by hand.
   source:
-    name: PostgreSQL ${{ matrix.branch }} (source, cassert, injection points)
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        branch: [REL_19_STABLE, master]
-    env:
-      PGPREFIX: /home/runner/pg-${{ matrix.branch }}
-      PG_CONFIG: .local/pg/bin/pg_config
-      # Fail rather than skip if the injection_points module is missing: the
-      # Makefile then refuses to leave the injection-point specs out, and
-      # test/recovery/run.sh fails instead of skipping its phases 1b-1e, 1g and 3.
-      INJECTION_POINTS: "1"
-      # The same for pgvector, which the job builds: lionvec's regression
-      # files and specs, and the recovery harness's phase 5, fail rather
-      # than skip without it.
-      PGVECTOR: "1"
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Resolve the upstream commit
-        id: upstream
-        run: |
-          sha=$(git ls-remote https://github.com/postgres/postgres.git "refs/heads/${{ matrix.branch }}" | cut -f1)
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Cache the PostgreSQL build
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.PGPREFIX }}
-          key: pg-${{ runner.os }}-${{ matrix.branch }}-${{ steps.upstream.outputs.sha }}-cassert-inj-v1
-
-      - name: Build PostgreSQL ${{ matrix.branch }}
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bison flex
-          git clone -q --depth 1 --branch "${{ matrix.branch }}" \
-            https://github.com/postgres/postgres.git "$RUNNER_TEMP/postgres"
-          cd "$RUNNER_TEMP/postgres"
-          ./configure -q --prefix="$PGPREFIX" --without-icu --without-zlib --without-readline \
-            --enable-cassert --enable-debug --enable-injection-points CFLAGS="-O1 -g"
-          make -s -j4
-          make -s install
-          make -s -C src/test/isolation install
-          make -s -C src/test/modules/injection_points install
-          make -s -C contrib install
-
-      - name: Link the installation
-        run: |
-          mkdir -p .local
-          ln -sfn "$PGPREFIX" .local/pg
-          .local/pg/bin/pg_config --version
-
-      # pgvector's default branch, built against this one.  A build that
-      # fails fails the job, here, rather than leaving the Makefile to find
-      # no vector.control and skip every lionvec test with the job still
-      # green, as continue-on-error did; a master pgvector does not build
-      # against yet is a red job to look at, not a silent loss of coverage.
-      - name: Build pgvector
-        run: |
-          git clone -q --depth 1 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
-          make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PWD/$PG_CONFIG"
-          make -s -C "$RUNNER_TEMP/pgvector" install PG_CONFIG="$PWD/$PG_CONFIG"
-          test -f "$("$PG_CONFIG" --sharedir)/extension/vector.control"
-
-      - name: Build
-        run: make -j4 WERROR=1
-
-      - name: Install
-        run: make install
-
-      - name: Unit tests
-        run: make unit
-
-      - name: Unit tests with ASan and UBSan
-        run: make unit SANITIZE=1 WERROR=1
-
-      - name: Start a private cluster
-        run: ./dev.sh reset
-
-      - name: installcheck (generic WAL, all isolation specs)
-        run: |
-          eval "$(./dev.sh env)"
-          set -o pipefail
-          make installcheck 2>&1 | tee installcheck.log
-          if grep -q 'skipping isolation specs' installcheck.log; then
-            echo "injection-point specs were skipped"; exit 1
-          fi
-
-      # debug_discard_caches = 1 flushes every cache entry at every catalog
-      # read, which is how the relcache-flush bugs of DESIGN.md §21 ("A
-      # relcache flush must not free the state") were found.  The setting
-      # exists only in assert builds, so only these jobs can run it.  The
-      # whole suite under it takes hours; test/sql/discard_caches.sql, which
-      # the step above already ran with the setting switched on around its
-      # own queries, is run again here with it on for EVERY statement - the
-      # builds, inserts, VACUUMs and verify() between those queries too.
-      # PGOPTIONS reaches every session pg_regress opens, which it extends
-      # rather than replaces.  Measured on an assert 18.6 on a busy 4-CPU box:
-      # 17 minutes, against about 3 for the same file in the step above; if
-      # that is too much for two jobs, `if: matrix.branch == 'master'` halves
-      # it.
-      - name: discard_caches.sql with debug_discard_caches = 1 throughout
-        run: |
-          eval "$(./dev.sh env)"
-          PGOPTIONS="-c debug_discard_caches=1" make installcheck REGRESS=discard_caches ISOLATION=
-
-      - name: installcheck-rmgr with wal_consistency_checking
-        run: |
-          eval "$(./dev.sh env)"
-          make installcheck-rmgr WAL_CONSISTENCY=1
-
-      - name: hookcheck (hook coexistence, table AMs)
-        run: |
-          eval "$(./dev.sh env)"
-          make hookcheck WERROR=1
-
-      # wal_consistency_checking compares pages only when a record is REPLAYED,
-      # so the step above (a primary that never replays) proves little about
-      # redo.  The recovery harness crashes the primary under load and builds
-      # a hot standby from it, which replays every record both phases write,
-      # and a mismatch is a FATAL in the startup process (test/recovery/README.md).
-      # INJECTION_POINTS is the job's already; it is repeated here because
-      # these are the steps that depend on it: without it run.sh would skip
-      # the injection-point phases and still report ALL ... PASSED.
-      - name: Crash recovery and standby replay (custom resource manager, consistency checked)
-        env:
-          INJECTION_POINTS: "1"
-        run: make recovery-check-rmgr RECOVERY_PREFIX="$PGPREFIX"
-
-      - name: Crash recovery and standby replay (generic WAL, consistency checked)
-        env:
-          INJECTION_POINTS: "1"
-        run: ./test/recovery/run.sh --prefix "$PGPREFIX" --conf "wal_consistency_checking = 'generic'"
-
-      - name: Show regression diffs
-        if: failure()
-        run: |
-          find test -name regression.diffs -exec cat {} + || true
-          tail -n 100 .local/pg.log || true
-          tail -n 200 test/recovery/log/*.log || true
+    uses: ./.github/workflows/source.yml
+    with:
+      branches: '["REL_18_STABLE"]'
 
   dist:
     name: PGXN archive (build and test from the zip)

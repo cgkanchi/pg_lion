@@ -6103,8 +6103,9 @@ function is a filter of the leaf's scan as any other: run-time pruning could onl
 leaf, and the clause tested on its rows gives the same answer.
 
 What LionCount does with a partitioned table (above) is a different thing: it counts every leaf
-the planner keeps, as one node. The join and the walks run on one leaf, and a parent with several
-is core's.
+the planner keeps, as one node. Its aggregates of sliced columns (§52) are each leaf's own, added up
+in the node (§52.13). The join and the walks need the planner to keep one leaf; a parent with
+several leaves left gets core's Append for them.
 
 `test/sql/ordjoin_partition.sql` runs the join and the split through both parents - the fact LIST
 by `grp`, each sub-partitioned by LIST on `ver`, the leaf the queries hit attached with two dropped
@@ -8356,8 +8357,11 @@ would read the directory in an order it is not in. The outcomes, in this order:
   and the cross-type equality only. No comparison of any kind is used on a directory in
   (kind, hash, bytes) order - the family's cross-type proc 4 included - and the family's
   cross-type hash agrees with the stored keys' by the family's contract, so the descent is exact;
-- the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops` and `float_ops`, the only
-  families with cross-type equality, carry them): descend as usual;
+- the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops`, `float_ops` and
+  `datetime_ops`, the families with cross-type equality, carry them): descend as usual, by proc 4
+  ALONE - the hash term is left out of the search key and the run of entries proc 4 ties is
+  scanned with the equality, because `datetime_ops`' types do not hash compatibly (§28, "Cross-type
+  date and timestamp");
 - otherwise a BINARY coercion of the value to the key type (`find_coercion_pathway()` returning
   `COERCION_PATH_RELABELTYPE`: the same bytes, varchar to text): the value becomes one of the
   index's own and hash, equality and ordering are all the index's own, which is consistent by
@@ -9918,7 +9922,8 @@ longer than a batch included.
   - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
     (§26's existence test), printing its key under the value-representation contract; max needs the
     backward walk §21's leftlink was kept for;
-  - cross-type date/timestamp members (`datecol < now()`), with their equality;
+  - DONE (2026-10-28, §28 "Cross-type date and timestamp"): cross-type date/timestamp members
+    (`datecol < now()`), with their equality;
   - carry the recheck batch across the entries of a range SUM, as §15's disjoint sum carries it
     across a list's sets: the entries' counts are only added up, so their dirty TIDs may be
     rechecked together, one visit per page per batch, instead of per entry (§28's measured 68,384
@@ -10482,6 +10487,21 @@ they write, each deleted once the leader has replayed it.
   would have to be stitched. Nor do the workers write their pages into the index themselves: the
   bulk writer is one process's, and the block numbers are only known once the leader has replayed
   the columns before.
+
+**Progress** (`pg_stat_progress_create_index`, `lionbuildphasename()`). The build reports its phases
+numbered on from core's `initializing`, as nbtree's are: `scanning table`, whose blocks the heap AM
+reports; `merging runs (workers)`, a parallel leader's own export once its share of the scan is
+done (`lion_spool_export()`) and its wait for the other participants'; `writing columns`; and
+`copying columns (workers)`, the leader's wait for and replay of a column a worker wrote. Through the
+write, `tuples_total` is the (key, code) pairs the spools took (`lion_spool_ntids()`: a row's code
+once for each key column, once for each key of a multi-key column, and once for each slice a sliced
+column puts it in, §51), each of which the merge hands out once, and `tuples_done` those written:
+`lion_build_emit()` counts them and reports every 64k, when it checks for interrupts, and at the end
+of each column, and a replayed column adds the count its worker kept (`LionBuildColumn`) once it is
+in. An assertion checks at the end that the two agree. The scan's blocks are cleared at the switch
+to the write, as nbtree clears them. Only the process whose build the view shows reports, a serial
+build or a parallel one's leader, as in core's builds; a worker counts the codes of the columns it
+writes and reports nothing.
 
 **The index is the one the sorted build wrote, page for page.** The same keys come out in the same
 order with the same codes and the same stored bytes, and the builders and the directory are
@@ -15921,9 +15941,9 @@ is unreleased - to every SCALAR class of the install script that has proc 4, and
 The script rules of 7c6e439 hold: the operators are core's, which an unqualified operator name in an
 extension script finds in pg_catalog first; citext's are named `@extschema:citext@.<` and so on,
 never through the target schema (`test/sql/hardening.sql` plants a `<` there and shows it is not
-the one chosen). Cross-type date/timestamp comparisons (`datecol < now()`) are not added: the lion
-date and timestamp classes have no cross-type EQUALITY either, and a family gains a type pair whole
-or not at all.
+the one chosen). Cross-type date/timestamp comparisons (`datecol < now()`) came later, as a family
+of their own (below, "Cross-type date and timestamp"): a family gains a type pair whole or not at
+all, equality included.
 
 **`lionvalidate()`** accepts strategies 6..9 in a scalar family only for a type pair that ALSO has
 proc 4 - the walk needs the comparison, and an operator the index could only answer by testing every
@@ -15938,6 +15958,55 @@ from btree as well. Collation is the planner's rule for equality, unchanged: the
 offered where `IndexCollMatchesExprColl()` holds, and the pushdown makes the same test in
 `lion_match_index()`. NULL keys never satisfy a range: the walk visits VALUE entries only, so the
 reserved NULL (and EMPTY) entries are never in one.
+
+### Cross-type date and timestamp (2026-10-28)
+
+`date_ops`, `timestamp_ops` and `timestamptz_ops` are one family, `datetime_ops`, as in btree, with
+five of btree's six cross-type pairs: `=`, the four comparisons and `<>`, and core's own proc 4 for
+each (`date_cmp_timestamp`, `timestamptz_cmp_timestamp` and the rest). So the commonest dashboard
+filters reach the column's index where they used to go to the heap: `created_at >= current_date`
+on a `timestamptz` column (a date bound), `tz >= localtimestamp - interval '7 days'` (a timestamp
+bound), `ts >= current_date - 7` on a `timestamp` one, `d = timestamp '...'`.
+
+The pair left out is a `timestamp` KEY against a `timestamptz` value (`ts >= now()`), because its
+comparison is not monotonic in the key. `timestamp_cmp_timestamptz` turns the key into an instant
+at the session's `TimeZone`, and a local time a DST change skips is taken at the offset before the
+change: in New York 2026-03-08 02:30 is 07:30 UTC while 03:00 is 07:00 UTC, so the key that sorts
+first compares later. A descent by that comparison lands in the wrong place, and a walk that ends
+at the first key past a bound stops before keys that still match; with the pair in the family, an
+equality probe at 03:00-04 found one of the two matching rows. btree's `datetime_ops` has the pair
+and the same fault (PostgreSQL's B-tree gives wrong answers on the same data), but lion's rule is
+the sequential scan's answer, so the clause stays a filter. The other direction is safe: a
+`timestamptz` key against a `timestamp` value converts the VALUE once, and the keys are instants
+in order already; a date converts to the instant of its first moment, which never goes backwards
+from one day to the next. Keeping the pair would need a lookup that tests every key within the
+largest UTC offset (about 16 hours) of the value with the operator itself, and trusts the order
+only outside that window; that is not built. The index compares a key with the value
+exactly as the operator does, since proc 4 IS the operator's comparison; where one side is
+timestamptz that comparison reads the session's `TimeZone`, which is why those operators are
+STABLE, and a scan evaluates them at run time as btree's does (`test/sql/datetime_crosstype.sql`
+shows one query answering differently under two zones, the same three ways: pushdown, bitmap scan,
+no index).
+
+What the integer and float families have and this one does not is a compatible HASH: a date and
+the timestamp at its midnight are equal and hash apart (`hashdate` of a day number,
+`timestamp_hash` of microseconds), and a timestamp and a timestamptz are equal only at a time zone
+the hash cannot know. §21's directory orders VALUE entries by `(proc 4, hash, bytes)`, and a lookup
+used to place a cross-type value by both terms, the hash being the search type's own on the
+promise that a family's types hash compatibly. That promise is now asked only of an UNORDERED
+column (§21, "Cross-type searches"): a cross-type search of an ORDERED column leaves the hash term
+out (`LionSearchKey.nohash`, set by `lion_probe_search_key()` whenever the probe has the family's
+cross-type proc 4), so the key stands before the whole run of entries proc 4 ties with it, and the
+run scan's equality decides among them - one entry, for these types, whose comparison never ties
+two different values. Every path that locates a cross-type value goes through that one search key
+(the single lookup, the batched list walk, the bitmap and plain scans, the joins' key lookups, the
+SQL counts), so none of them can find a hash where another finds none. A date, timestamp or
+timestamptz column is always ordered - its proc 4 is the type's default btree comparison, which a
+build can always reproduce (§21's rule 1) - so the unordered route never meets this family.
+
+Bit slices (§51, §53) still answer only a bound of the column's own type
+(`lion_slice_range_type_ok()`): a cross-type bound on a sliced column is a range of entries or
+summaries, as on any other column, and the slices still answer the aggregates over it.
 
 ### The bounded walk (`LionRange`, lion_range.c)
 
@@ -19839,8 +19908,10 @@ list's selectivity in it already. `test/sql/ordered_lists.sql`.
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
 (§30.3):
 
-- start-up: a descent, `2 random_page_cost`, and the set's `C_lion` plus copying its answer, as
-  §30.3;
+- start-up: a descent, `2 random_page_cost` of the index's tablespace, and the set's `C_lion` plus
+  its build as every LionOrdered set is priced (`lo_set_build_price()`: a `cpu_operator_cost` a
+  container key and its pieces; then its spill, `lo_spill_cost()`), its members the candidates when it leaves quals to the
+  recheck (`lo_set_candsel()`, §40.8), and `s` their share from there on;
 - the walk: `W = s_w T` TIDs and `E = min(W, s_w nd)` entries; each entry
   `range_union_entry_cost` (a small entry of a walk, §28, "Counting a walk"), each TID
   `cpu_operator_cost`, and the directory leaves under them at `seq_page_cost` - `E` entries of a
@@ -19848,7 +19919,8 @@ clauses, `nd` the column's distinct values, and a set of selectivity `s` and ind
   pages;
 - the heap: `F = s W` rows fetched (`W` without a set), priced as `cost_index()` prices fetches, the
   column's correlation with the heap interpolating (`lion_var_heap_correlation()`), plus
-  `cpu_tuple_cost` and the filter per row fetched and the target per row returned;
+  `cpu_tuple_cost` and the recheck of a lossy set per row fetched, the filter per row the recheck
+  passes and the target per row returned;
 - rows: `lion_probe_rel_rows()`, as §30.3. Core's LIMIT scaling of the run cost is the walk's
   behaviour: it stops when the Limit stops pulling.
 
@@ -26914,7 +26986,19 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   (`allow_sync = false`), which could start part-way through the heap: the sample must be the same
   from build to build, and the second scan's REFINE items then lie in heap order, as each
   partition's CODE items do whatever order the rows came in, being sorted by TID. Built in
-  parallel from PostgreSQL 16 (§44.12); progress is reported for the second scan. `CREATE INDEX
+  parallel from PostgreSQL 16 (§44.12). Its phases are reported in `pg_stat_progress_create_index`
+  (`lionvecbuildphasename()`), numbered on from core's `initializing` as nbtree's are: `sampling
+  table`, the first scan, and `assigning rows to partitions`, the second, with the blocks the heap
+  AM reports, and the second with its rows done, every 1024 (`LIONVEC_PROGRESS_ROWS`), of the rows
+  the first met, which differ only by a row pruned between the scans or one a `CONCURRENTLY`
+  build's snapshots disagree on; between them `computing centroids`, k-means' iterations done of
+  `LIONVEC_KMEANS_ITERS`, reported after each that moved the centroids (through
+  `LionVecKmeansWork`'s `progress` serially, by the leader in parallel), fewer than all of them when
+  k-means stops early; then `sorting rows`, the CODE items' sort, `writing partitions`, the rows
+  written to the CODE chains, each by its own item and not its copy, and `WAL-logging index`. Only
+  a serial build or a parallel one's leader reports, as in core's builds; in the second scan each
+  process adds its rows to a shared atomic count every 1024, before it says it is done, and the
+  leader reports the count. `CREATE INDEX
   CONCURRENTLY` and
   `REINDEX` work as for any AM. An unlogged index's init fork is the meta page and empty REST and
   NULL chains.
@@ -27063,7 +27147,8 @@ nothing. Since the restricted scan returns members only, a LIMIT is never left s
 **Cost** (`lo_cost_knn()`): the lion lookups and the set as `lo_cost()` prices them, plus
 `lion_vec_scan_cost()` for the members (§44.7) as start-up; then per member, at worst, a random
 page (none where the exact path read the row's heap page before its first row, §44.7, "Exact path
-pricing"), an index tuple, a probe and a tuple, its quals and the target. On 20,000 rows of 200
+pricing"), an index tuple, a probe and a tuple, the recheck where the set leaves quals to it (its
+members are then the candidates, §40.8), the quals of a member the recheck passes, and the target. On 20,000 rows of 200
 dimensions (format 1) the planner chose a sort of the lion bitmap scan's rows for a filter keeping
 1% of them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most
 rows pass and the set costs more than the rows it saves.
@@ -30144,6 +30229,14 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   fact filter with no entry (`x = 77`), it is 16.7 against 138, and both run in hundredths of a
   millisecond.
 
+**Privileges** (§9, "EXECUTE on what a count replaces"; 2026-10-28). The node initialises only
+the WHERE's quals (for its set) and the heap recheck; the join's clause, which core's nested loop
+initialises as its Index Scan's `indexqualorig`, the anti join's clause, and the predicates of the
+GROUP BY's expressions, which setrefs.c replaces with the node's columns in the Agg above, nobody
+would. So the planner records their functions with the dimension's WHERE in custom_private member
+`PJ_PRIV_EXECUTE` (`pj_execute_functions()`), and `pj_begin()` checks them for the current user
+before anything starts, plain EXPLAIN included. node_contracts.sql runs the node through each.
+
 **Declined, and why.**
 
 - *A join path* (`set_join_pathlist_hook`) emitting the dimension's columns: those are what the
@@ -30545,7 +30638,8 @@ of the fact's B-tree its Index Cond selects:
 - **the node's** (`ownreads`): the fact heap pages of its fetches (`lo_cost()`'s fetches of the
   whole walk, `fetches_p`), a leaf a descent and a dimension heap page a member, each
   `index_pages_fetched()` of `s` of them; the lion index pages the two sets' builds read
-  (`lo_lion_pages()`, `LionOrderedSet.lionpages`); and each key set's table, whole.
+  (`lo_lion_pages()`, `LionOrderedSet.lionpages`); and the pages each key set's plan reads
+  (`OjKeySet.reads`, "The feed" in §47.6).
 
 Each page is charged `lion_units_cold_page()`, `perpage`: `pg_lion.cold_page_cost` less the
 `random_page_cost` core charged it, in the share of the query's tables and the two B-trees
@@ -30559,8 +30653,12 @@ more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discoun
 
 ### 47.4 Execution (`oj_begin()`, `oj_exec()`, `oj_rescan()`)
 
-- **Begin.** The custom_private shape is checked against the plan's children and target, then the
-  sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
+- **Begin.** The custom_private shape is checked against the plan's children and target, and
+  EXECUTE is asked of the current user, plain EXPLAIN included, on the functions of the join's
+  clause and of each key set's (`OJ_PRIV_EXECUTE`, `oj_execute_functions()`; §9, "EXECUTE on what
+  a count replaces"): the node descends the dimension's B-tree with a scan key and tests a key set
+  through a hash table, so nothing initialises those clauses as the joins it replaces would. Then
+  the sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
   and kept out of `custom_ps`; each key set's plan goes into `custom_ps`, and EXPLAIN shows it
   under the join. LionOrdered's `lo_begin()` checks its side's flags: a serial B-tree walk, and the
   dimension a probe in heap mode with exactly one scan key, `pk = NULL`, an equality on the first
@@ -30635,8 +30733,8 @@ the node's rows to the table above it, and every fact row the table rejects has 
 fetched, descended and its dimension row read. A table becomes a key set when:
 
 - it is a base relation of the query, a table, with no LATERAL reference and no TABLESAMPLE,
-  whose cheapest total path is unparameterized and returns the key: core's plan of it is the key
-  set's child;
+  with an unparameterized path, and its target returns the key: the plan of it the node picks
+  ("The feed", below) is the key set's child;
 - it is the whole inner side of a semi join - minimal and syntactic, an IN or an EXISTS of it
   alone - whose outer side is in the join rel, and in no other special join's sides
   (`oj_semi_of()`: a second IN has the first's table in its syntactic outer side, which is let
@@ -30669,6 +30767,56 @@ A key set is a simplehash of Datums (`ojkeys`), each non-NULL key copied once in
 context; a NULL key matches nothing. `Key Set Keys` counts them. Planning takes the key sets of a
 join rel whole: a join rel some of whose tables are not key sets gets no path, and core's join of
 the node's rows to them above is the plan.
+
+**The feed** (2026-10-28; `oj_keyset_feed()`, `oj_feed_cold()`). A key set's plan runs once, before
+the walk, and reads its table's matching rows whatever the walk's LIMIT. Core's cheapest path of
+the table prices its pages as if cached: `cost_bitmap_heap_scan()` never looks at
+`effective_cache_size`. So a bitmap heap scan that reads most of a large table at random beats a
+covering walk of the key's B-tree (§40) that reads a tenth of the pages in order, and runs several
+times slower when the table is not in the cache. With `pg_lion.competitor_pricing` on, the walk's
+own price carries the bitmap heap scan's cold reads (`lo_cold_price()`, §39) and wins; off, neither
+carries any, and core's cheapest path is the bitmap heap scan.
+
+The node picks the plan itself, among the table's unparameterized paths and a Gather over each of
+its partial ones (core gathers only the cheapest, and `add_path()` may have freed the Gather over a
+parallel walk). Each is ranked at its `total_cost` plus what its reads cost outside the cache, in
+the share of the query's tables and the plan's indexes that `effective_cache_size` cannot hold, at
+the price §39 gives such a page over the `random_page_cost` core charged it:
+
+- a lion walk, LionOrdered or LionBtreeScan, serial or under a Gather or Gather Merge
+  (`lion_ordered_scan_reads()`: `lo_cost()` taken again): its B-tree's pages, its set's lion pages
+  and its heap fetches, at `cold_stream_page_cost` where it is index-only and at `cold_page_cost` in
+  heap mode, a synchronous read a member;
+- a bitmap heap scan (`lion_units_bitmap_reads()`, `lion_bitmap_reads()`'s pages): its heap and
+  index pages, at `cold_stream_page_cost`;
+- an index scan, the AM's own plain scan of a lion index among them: the index pages its
+  selectivity reads and its rows' heap pages (`index_pages_fetched()`, those not all-visible where
+  it is index-only), at `cold_page_cost`;
+- anything else - a sequential scan, which reads in order at about the `seq_page_cost` core charges
+  it - nothing.
+
+There is no cap: this only chooses among the table's own plans, all of which the node runs the
+same way. The chosen plan keeps its own `total_cost` in §47.3's price, so the node is still priced
+in core's units, warm, as every other path of the join rel is; the cold reads move which plan is
+the child, never the node's price against core's joins. With `competitor_pricing` on the plans are
+ranked at their `total_cost` alone, as core's `cheapest_total_path` ranks them: a walk's price
+carries the cold weighing already. The pages the chosen plan reads are §47.3's `ownreads` for the
+key set, in place of the table's pages.
+
+**Measured** (2026-10-28; PostgreSQL 18.6 with assertions, 16 vCPU, `shared_buffers` 512 MB,
+`effective_cache_size` 1 GB, `random_page_cost` 1.1, `competitor_pricing` off; core's joins off so
+that the node is the plan). A 16,000,000-row key table of 2.9 GB whose filter a lion index answers,
+with a B-tree on its key; `f.fk IN (SELECT fk FROM kt WHERE <filter>)` with 240,000 matching rows
+(1.5%), the fact of 5,000,000 rows walked by a B-tree under `LIMIT 50`. Cold is a restart with every
+file of the cluster dropped from the kernel's cache; three runs each.
+
+| | key set's plan | cold | warm |
+|---|---|---|---|
+| before | Bitmap Heap Scan of 223,000 heap pages, priced 181,818 | 3.4 to 6.5 s | 1.34 to 1.61 s |
+| after | Gather over a parallel LionOrdered of the key's B-tree, index-only, 19,700 pages, priced 278,244 and 70,126 cold | 1.2 to 1.5 s | 0.49 to 0.51 s |
+
+With `effective_cache_size` large enough to hold the query's tables and the plan's indexes nothing
+is charged and the bitmap heap scan is taken, at core's price.
 
 **Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
 after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
@@ -32768,8 +32916,9 @@ percentiles (§52.12).
   (WHERE ...)` beside the aggregates and a `HAVING` over them; a `GROUP BY` of one or two
   lion-indexed columns, an `IN` list on the grouping column driving its groups (§15), or none.
 - **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join), a
-  partitioned table (each partition would answer its own and core's partial aggregates add them
-  up, which needs the partial states of `avg` and `sum(int8)` serialized - not written), a
+  partitioned table's `GROUP BY` (each partition would answer its own and core's partial
+  aggregates add them up, which needs the partial states of `avg` and `sum(int8)` serialized - not
+  written; the one row of a partitioned table is taken, §52.13), a
   residual clause (§10: the slices would have to be counted over the rows the heap keeps), the
   aggregates over keys in the same target list (§37), `count(DISTINCT)`, the top k (§36), the
   decoded walk of §34, three grouping columns, a filtered count beside a `GROUP BY`, a coalesce
@@ -33010,14 +33159,14 @@ Batches Decoded`, `Slice Keys Decoded` and `Slice Rows Decoded` (and `Slice Rows
 `Slice Heap TIDs Rechecked` and `Slice Heap Blocks Rechecked` where the map did not vouch for a
 page.
 
-### 52.9 Not on a standby, a join or partitions
+### 52.9 Not on a standby, a join or a partitioned table's groups
 
 Restated from §52.1 because the task asked for each: on a hot standby the planner offers none of
 this (the pushdown collects nothing there, §10), and a plan made on the primary runs exact and
 slow - every slice counted beside the located sets, the descent's steps intersected again, and the
 groups a group at a time; a join (the FK-side join of §27, a semi or anti join) and a partitioned
-table are declined, the latter for want of serialized partial states for core's Finalize Agg
-(§52.12).
+table's `GROUP BY` are declined, the latter for want of serialized partial states for core's
+Finalize Agg (§52.12). A partitioned table's one row is answered (§52.13).
 
 ### 52.10 Measured
 
@@ -33115,8 +33264,8 @@ What the tables say:
   masked); the index's pages (§52.7), the bitmap scans' prices against the same index without
   slices; EXECUTE on `max(int4)` revoked, refused by the node as by core's Agg; the declines - a
   column not sliced, a float column, an expression, DISTINCT, FILTER, ORDER BY, a residual
-  clause, a join, a partitioned table, a filtered count beside a `GROUP BY`, three grouping
-  columns, a grouping expression.
+  clause, a join, a partitioned table's `GROUP BY` (its one row is answered, §52.13), a filtered
+  count beside a `GROUP BY`, three grouping columns, a grouping expression.
 - `test/isolation/slices_pushdown.spec`: the node's answers beside the same aggregates of `x + 0`,
   which only the ordinary plan computes, in one statement: a REPEATABLE READ reader across a
   writer's rows at every column's extremes, updates and deletes, committed, rolled back, and
@@ -33172,7 +33321,8 @@ What the tables say:
   slices beside its columns would answer it in one pass, if its tally did not spill (a dense tally
   of the pass's combinations, whose rows go up final), or with serialized partial states below a
   Finalize Agg.
-- **Partitioned tables, joins**: each partition answering its own needs partial states core's
+- **Partitioned tables' groups, joins** *(the one row of a partitioned table: done 2026-10-28,
+  §52.13)*: each partition answering its own needs partial states core's
   Finalize Agg can combine - `sum(int8)` and `avg` keep `internal` states, which the node would
   have to emit serialized (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the
   int8 sums of `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row
@@ -33194,6 +33344,82 @@ What the tables say:
 - **The slices' page estimate** (§52.7) overstates a column in heap order; an exact count would
   need the meta page to keep the slices' pages, a format change.
 - **The plane scatter** of §51.14 (build and bulk insert) is still to do.
+
+### 52.13 Partitioned tables (2026-10-28)
+
+The one row of §52.2 over a partitioned table, as one LionCount node that counts every leaf the
+planner keeps (§16):
+
+    SELECT count(b), sum(b), avg(b), min(ts), max(ts) FROM parted WHERE g = 3;
+
+      Custom Scan (LionCount)
+        Partitions: parted_1, parted_2, parted_3
+        Lion Indexes: (g = 3)
+        Aggregates From Slices: (b: every bit counted), (ts: existence counted, min descent, max descent)
+
+- **What is taken**: the aggregates, columns, `WHERE`s and switches of §52.1, with no `GROUP BY`,
+  wherever the pushdown takes the partitioned table (§16: equalities, `IN`, ranges, `OR`s and the
+  rest on lion-indexed columns of every leaf, a clause on the partition key a leaf's bounds imply
+  left out of that leaf's runs, plan-time pruning). Every live leaf must have a whole lion index
+  that slices the column at its type's width (`lion_find_sliced_index()` on the leaf, the column's
+  number translated through `lion_leaf_expr()`, `lion_count_path_slice_parts()`), each leaf its
+  own, at whatever key position and under whatever column numbering - a leaf attached with dropped
+  columns, or with an index of its own listed before the one the parent's index made. A leaf
+  without one - no index slicing the column, a partial one, an expression's - and the whole query
+  is declined (to the counts with an Agg above them, or core's plan): an aggregate over some
+  leaves' slices and others' rows would be a second executor.
+- **The plan**: member 25 (`SLICES`) keeps one index and key-column pair per sliced column on
+  each leaf, leaf-major in `PARTS` order (`nrel × ncol`, `nrel` 1 for a table), its one-index-per-column lists
+  otherwise unchanged; `LION_PRIV_MAGIC` changed with it.
+- **The executor**: each leaf's slice indexes open with its relation and stay open for the node's
+  life, as §16 keeps every relation the node reads (`lion_open_parts()`), so a `REINDEX` of one
+  under an open cursor is refused as it is for the leaf's other indexes - where a table's opens
+  its slice index for each run. A leaf's turn (`lion_run_partition()`, or run 0 of
+  `lion_count_runs()`) locates its `WHERE`, counts it if the target list asks a count, and then
+  `lion_slice_part()` answers the leaf's aggregates as `lion_slice_column()` answers a table's -
+  C0 = E ∧ WHERE collected against the leaf's existence slice, every bit counted for a sum, the
+  descents for the extremes - before the leaf's sets are released, so that the §9 interlock is a
+  leaf's at a time as before. The answers are added up as they come (`LionSCol.tcount`, `tsum` in
+  `int128`, the least `minenc` and greatest `maxenc` of the leaves with a row, §51.1's encodings
+  being order-preserving), and after the last leaf `lion_slice_parts_end()` hands the totals to
+  `lion_slice_results()`, which builds the row as for a table: `sum(int8)`'s `numeric` and
+  `sum(int4)`'s `int8`, `avg`'s scale, NULL where no leaf had a row. A leaf with no rows, or none
+  that pass, adds nothing; a parent pruned to nothing is core's dummy rel and its one row of
+  NULLs, never this node; a leaf whose index slices the column at another type or width is an
+  error, since the planner checked every leaf.
+- **The price**: the sum of the leaves' own (§49): each leaf's runs priced as a table's
+  (`lion_count_path_price_runs()` over that leaf's target alone) and its slices by
+  `lion_cost_slice_path()` with the leaf's rows, its index's pages and its sliced ranges
+  (`lion_cost_slice_rel()`), then §39's units once over the total. Nothing else's price changed;
+  a parent pruned to one leaf is priced as that leaf named alone.
+- **EXPLAIN** names no index in `Aggregates From Slices`, as it names none in `Lion Indexes`:
+  each leaf reads its own.
+- **Not taken**: a `GROUP BY` (§52.12: core's Finalize HashAggregate combines the leaves'
+  partial groups, and `avg` and `sum(int8)` have `internal` partial states the node would have to
+  serialize; an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
+  on the partition key with `enable_partition_pruning` off, or one a kept leaf's bounds do not
+  imply, which stays residual (§16, "Residual clauses over a partitioned table"); a hot standby,
+  as for a table. A range on a sliced column, as the `WHERE` of these aggregates or of a count,
+  is §53.11's.
+
+Tests: `test/sql/slices_partitioned.sql` compares every answer with the pushdown forced
+(sequential, bitmap and plain scans off) against the pushdown off, as multisets of text, and names
+the plan that ran it - over RANGE, LIST (a NULL partition, a default) and HASH partitioning and
+two levels of it, an empty leaf, a leaf attached with dropped and reordered columns and its own
+index, every type of the allowlist with NULLs, extremes and infinities, `int8` sums past
+`bigint`; `WHERE`s on other indexed columns, pruning by the key, the key implied, pruned to
+nothing, pruning off, a generic plan and a LATERAL rescan; a dirty heap - updates that move rows
+between leaves, deletes, this transaction's rows rolled back - and VACUUM, with `EXPLAIN ANALYZE`'s
+counters; and the declines (a leaf with an unsliced, a partial or an expression's index, a
+`GROUP BY`, a residual clause, the switch off; a REINDEX under a cursor refused).
+`test/sql/slices_partitioned_leaf.sql` has the cases pruned to one leaf (of a sub-partitioned
+parent, an empty one, a LIST's NULL partition, one of a HASH's), apart because PostgreSQL 18.0 to
+18.6 drop a disabled path's `disabled_nodes` in an Append of one child (fixed upstream for 18.7):
+the plan forced off is not off there and is the cheaper on data this small, so the file stops at
+once on those releases.
+`test/isolation/slices_partitioned.spec` runs §52.11's snapshot checks against a parent of three
+leaves, the writer's updates moving rows between them; `slices_plan.sql`'s partitioned table now
+gets its one row from the slices and its `GROUP BY` from core.
 
 ## 53. Ranges from slices (2026-10-27)
 
@@ -33328,8 +33554,9 @@ slices it is a source from the slices:
   `LION_CLAUSE_SLICED` in the plan's clause kinds, beside §32's `LION_CLAUSE_WALK`, which a range
   from slices never is.
 - **Declined** where the build has no range to answer so (no duplicate of the other build), and on
-  a partitioned table, an FK-side or anti join, a `SELECT DISTINCT`'s groups and a hot standby
-  (`lion_query_may_slice_ranges()`), and with `pg_lion.enable_slice_ranges` off.
+  an FK-side or anti join, a `SELECT DISTINCT`'s groups and a hot standby
+  (`lion_query_may_slice_ranges()`), and with `pg_lion.enable_slice_ranges` off. A partitioned
+  table takes it partition by partition (§53.11).
 - **The price** (§53.5) is the build's own; `add_path()` keeps the cheapest of it, the build that
   walks and sums the entries, the summaries' collections, and core's paths. That is the whole of
   "summaries at selective ranges, slices at wide ones": each prices what it reads.
@@ -33545,7 +33772,8 @@ What the tables say:
   the plans and `EXPLAIN ANALYZE`'s counters; a parallel count's Gather, and a `GROUP BY` beside it
   kept serial; the planner's choice, with nothing preferred, over 100,000 unique values with
   summaries and slices and with slices alone, at 0.1% and 60%, and with the switch off; the declines:
-  a float column, a partitioned table, a join, a column no index slices, the switch off.
+  a float column, a join, a column no index slices, the switch off; a partitioned table's range
+  from slices (§53.11, whose tests are `slices_partitioned.sql`'s).
 - `test/isolation/slices_range.spec`: ranges from slices, a `<>`, an OR and a sum under a range,
   beside the same counts of expressions of the columns, which only the ordinary plan computes, in
   one statement: a REPEATABLE READ reader across a writer's rows at every column's extremes, updates
@@ -33574,9 +33802,10 @@ What the tables say:
   at a time the same way. Neither changes the format; the price is §53.5's with the copy left out.
 - **Partitioned tables, joins**: each partition would fold its own index's slices, and the
   planner's build decide per partition - the slices' index is matched per relation already
-  (§16), but the build is declined whole, as §52's is. The FK-side join's fact filters (§27) and
-  the anti join's take ranges as §32's sources only. A filtered count's condition (§10, "Filtered
-  counts") takes its ranges from the entries.
+  (§16), but the build is declined whole, as §52's is. *(2026-10-28, §53.11: partitioned
+  tables done, every partition's index slicing the column or the build declined.)* The FK-side
+  join's fact filters (§27) and the anti join's take ranges as §32's sources only. A filtered
+  count's condition (§10, "Filtered counts") takes its ranges from the entries.
 - **The fold at the WHERE's keys alone**: beside a selective clause, E's keys are mostly keys the
   count never reaches. Folding only at the keys of the other sources (sought as the probe of §32
   seeks a summed range's sets) would make the copy the WHERE's and no longer a source of its own,
@@ -33595,3 +33824,56 @@ What the tables say:
   15 ms over the ordinary plan's 7 to 8. Neither is this section's price, nor changed by it.
 - **On a hot standby** the planner offers none of this, as none of §32's collections (§10).
 - **Percentiles** and the rest of §52.12 stand.
+
+### 53.11 Partitioned tables (2026-10-28)
+
+The ranges of §53.4 over a partitioned table, in the one LionCount node that counts every leaf
+(§16), each leaf folding its own index's slices:
+
+    SELECT count(*) FROM parted WHERE k > 50 AND k < 350 AND v <> 17;
+
+      Custom Scan (LionCount)
+        Partitions: parted_1, parted_2a, parted_2b, parted_3
+        Lion Indexes: (k > 50 AND k < 350), (v <> 17)
+        Range From Slices: k > 50 AND k < 350 (32 slices), v <> 17 (32 slices)
+        Implied by Partition Bounds: (k > 50) in 3 of 4 partitions, (k < 350) in 3 of 4 partitions
+
+It fell out of what was there: the executor resolves a range against the index the leaf's turn
+matched its bounds to (`lion_rangesrc_range()`), and decides from that index's column whether the
+slices answer it; the cost model prices a range source per relation by its clause
+(`lion_cost_sliced`), and a partitioned count is priced as the sum of its leaves' counts (§49), so a
+range from slices is priced in each leaf by §53.5's formula with the leaf's index and rows. What
+changed:
+
+- **The planner** asks the first live leaf where it asked the table - whether any whole lion
+  index slices a column (`lion_query_may_slice_ranges()`), and whether the one a range's column
+  is matched to slices it at width and takes the bounds' type (`lion_count_slice_range_ok()`, the
+  column translated as §52.13's are) - and, once the leaves are known, every leaf
+  (`lion_count_path_slice_range_parts()`): the index its target matched each bound to has to be
+  the one `lion_range_sliced_index()` finds on the leaf, at the same key column. A leaf whose
+  index does not slice the column declines the build; the build that collects or walks the
+  range from the entries is offered beside it as always, and the executor's fallback - a range
+  from the entries where the column is no longer sliced, as after a REINDEX - is never planned.
+  A leaf that leaves a bound out, its partition bounds implying it (§16), reads nothing for it,
+  and a range whose every bound is so left out in every leaf is not shown in EXPLAIN. Not inside a
+  partial index's scope (§45), which is a leaf's at a time; not on a hot standby.
+- **The pin** (lion_plan_partition.c): a leaf that leaves clauses out must keep one that selects
+  rows and carries the §9 interlock (`lion_leaf_selects()`, `lion_pinned_not_implied()`), which a
+  range collected from its entries does not - but a range from slices does, ANDed with E located
+  with its pin (§53.3), alone or as an OR's leaf. Before this, `count(*) ... WHERE v > c` on a
+  partitioned table had no clause to carry the pin and was declined.
+- **EXPLAIN**'s `(N slices)` is read from a leaf's index (the plan holds none for a partitioned
+  table), and a bound every leaf leaves out is not printed.
+
+The ranges compose with §52.13's aggregates (`sum(w), max(ts) ... WHERE g = 3 AND v BETWEEN a AND
+b`, from slices both), with the counts' partial groups of a `GROUP BY` (`g, count(*) ... WHERE v >
+c GROUP BY g`, the Finalize Agg above), and with pruning. Over 9,000 rows in 4 leaves, `count(*)
+WHERE v > 1000` was priced 60.71, the sum of the four leaves named alone (15.61, 14.71, 14.79,
+15.61), against 633.57 collected from the entries. Tests: section 6 of
+`test/sql/slices_partitioned.sql` (each type, beside equalities and lists, `<>`, an OR's leaf,
+bounds of another type, crossed and past the type, ranges on the partition key implied by some
+leaves and by all, a `GROUP BY`, §52.13's aggregates, a generic plan with a NULL bound, a dirty heap
+and VACUUM, the plans and `EXPLAIN ANALYZE`'s counters, and the declines: a leaf whose index does
+not slice the column, until pruning leaves it out, and the switch); `slices_range.sql`'s
+partitioned table now answered; and the isolation spec `slices_partitioned.spec` with a count and a
+sum under a range from slices beside the aggregates.

@@ -1194,7 +1194,11 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_META:
-				if (op.len != sizeof(LionMetaPageData))
+				/* the special area's size before what it holds */
+				if (op.len != sizeof(LionMetaPageData) || PageIsNew(page) ||
+					PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+					LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
+					!LionPageIsMeta(page))
 					elog(PANIC, "pg_lion: bad META payload on block %u", blkno);
 				memcpy(LionPageGetMeta(page), payload, sizeof(LionMetaPageData));
 
@@ -1210,7 +1214,10 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_NDISTINCT:
-				if (op.len != sizeof(LionMetaNdistinct) || !LionPageIsMeta(page))
+				if (op.len != sizeof(LionMetaNdistinct) || PageIsNew(page) ||
+					PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+					LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
+					!LionPageIsMeta(page))
 					elog(PANIC, "pg_lion: bad NDISTINCT payload on block %u",
 						 blkno);
 				memcpy(LionPageGetMetaNdistinct(page), payload,

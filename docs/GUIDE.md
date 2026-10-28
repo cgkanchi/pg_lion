@@ -186,8 +186,10 @@ on 5M rows the sum under a 10% filter took 7 ms where the ordinary plan took 166
 minimum and maximum of each of 200 groups under it 41 ms against 181 (DESIGN.md §52.10). The
 price is an insert into each set bit's set on every write of the column: an `INSERT` of many rows
 into a sliced `int4` and a sliced `int8` column took 4.6 times as long as without slices with
-`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). A
-percentile, a join and a partitioned table are not answered from the slices yet; `SELECT * FROM
+`pg_lion` preloaded and about 11 times without it (DESIGN.md §51, "Insert cost, revisited"). Over a
+partitioned table whose every partition has its own sliced index, the aggregates without a `GROUP
+BY` are answered too, each partition from its own slices (DESIGN.md §52.13); a percentile, a join
+and a partitioned table's `GROUP BY` are not answered from the slices yet; `SELECT * FROM
 lion_index_slice_agg('events_amount', 'country = ''JP''')` answers the same aggregates for a filter
 given as text.
 
@@ -203,8 +205,9 @@ over 10% of them took 8 ms from the slices against 139 ms walking the values (an
 ordinary plan), 50% 7 ms against 712, and a selective range stays with the values or the
 summaries, which read less. With summaries, values stored in the heap's order are best served by
 them at every width; values in no order by the slices once a range holds more than about a tenth
-of the rows (at half of them, 7 ms against the summaries' 32). `SET pg_lion.enable_slice_ranges =
-off` leaves ranges to the values and summaries.
+of the rows (at half of them, 7 ms against the summaries' 32). On a partitioned table each
+partition folds its own index's slices, when every partition has one slicing the column (DESIGN.md
+§53.11). `SET pg_lion.enable_slice_ranges = off` leaves ranges to the values and summaries.
 
 On a partitioned table the pushdown counts each partition the planner keeps, with that partition's
 own Lion indexes (DESIGN.md §16), and every `WHERE` clause needs one in every partition counted -

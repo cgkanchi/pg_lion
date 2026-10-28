@@ -177,7 +177,12 @@ One default operator class per type, reusing the hash access method's hash funct
 (`int2/int4/int8`, one family with cross-type equality), `float4/float8`, `numeric`, `bool`, `"char"`,
 `name`, `text` (and `varchar` through it), `char(n)`, `bytea`, `uuid`, `date`, `time`, `timetz`,
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
-`oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
+`oid`, and any enum. `date`, `timestamp` and `timestamptz` are one family too, as in btree, so
+`ts >= current_date - 7` on a `timestamp` column and `created_at >= current_date` on a
+`timestamptz` one use the index; a comparison with a `timestamptz` is made at the session's
+`TimeZone`, as the operator makes it. A `timestamp` column against a `timestamptz` value
+(`ts >= now()`) does not use the index: that comparison is not in the column's order across a DST
+gap, so no ordered lookup by it can be exact. Bit slices answer only bounds of the column's own type. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
 pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type.
 
@@ -936,7 +941,14 @@ working around a bad choice:
   none of its columns in the output - is read once, before the walk, into a hash set of its keys,
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
-  spilled). Where the fact's key column has a Lion index of its own (scalar, of the key's type,
+  spilled). The table is read by the cheapest of its own plans once the pages each reads outside
+  the cache are charged - a bitmap heap scan's or a covering (index-only) walk's at
+  `pg_lion.cold_stream_page_cost`, an index scan's or a walk's that fetches heap rows at
+  `pg_lion.cold_page_cost`, in the share of the tables and the plan's indexes that
+  `effective_cache_size` cannot hold - so that a walk of the key's B-tree is taken over a bitmap
+  heap scan of most of the table where the table is larger than the cache. With
+  `pg_lion.competitor_pricing` on, nothing is charged and the plans are taken at their own price,
+  which for a walk carries that weighing already. Where the fact's key column has a Lion index of its own (scalar, of the key's type,
   not partial unless the query implies its predicate), the key set's keys are also looked up in it
   and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
   (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`). Where the fact's
@@ -1044,8 +1056,11 @@ working around a bad choice:
   plane kernel's instruction set, below), `Slice Descent Steps`, `Slice Candidate Sets`, `Slice
   WHERE Copies`, `Slice Batches Decoded`, `Slice Keys Decoded`, `Slice Rows Decoded` and the heap
   rechecks of pages not all-visible. With no `WHERE` and no `GROUP BY` it competes with the
-  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. Not taken: a join, a
-  partitioned table, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
+  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. On a partitioned table
+  the one row is answered when every partition the planner keeps has a whole Lion index of its own
+  slicing the column, each partition's answers added up in the node (DESIGN.md §52.13; EXPLAIN
+  names no index there). Not taken: a join, a partitioned table's `GROUP BY` or one partition
+  without such an index, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
   expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
   column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
   aggregates over keys or to the ordinary plan.
@@ -1070,10 +1085,12 @@ working around a bad choice:
   other columns, as an `OR`'s arm, under `count(DISTINCT)` of another column, as the filter of
   the slices' own aggregates (`sum(x) WHERE x > c`), with parameters and stable expressions - but
   not a range that bounds the walk of a `GROUP BY` or `count(DISTINCT)` of its own column, nor on
-  a partitioned table, in a join, in a filtered count's condition, inside a partial index's scope
-  or on a hot standby. `x <> c` from the slices is a positive source - every row with a value but
-  c's - where it otherwise only subtracts c's rows. Bounds past the type's range, NULL bounds,
-  infinities and a reversed `BETWEEN` give the ordinary query's answer. EXPLAIN prints `Range From
+  a partitioned table one of whose partitions has no index slicing the column (each partition
+  folds its own index's slices, DESIGN.md §53.11), in a join, in a filtered count's condition,
+  inside a partial index's scope or on a hot standby. `x <> c` from the slices is a positive
+  source - every row with a value but c's - where it otherwise only subtracts c's rows. Bounds
+  past the type's range, NULL bounds, infinities and a reversed `BETWEEN` give the ordinary
+  query's answer. EXPLAIN prints `Range From
   Slices: x > 10 (32 slices)` - each such range's bounds and its column's width - and the range in
   `Lion Indexes` as any; `EXPLAIN ANALYZE` adds `Slice Range Descents` (collections), `Slice Range
   Keys` (container keys folded), `Slice Range Steps` (a slice's container folded at a key, the
@@ -1227,8 +1244,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
-| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
-| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"); 0 turns the charge off |
+| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads; and, with `competitor_pricing` off, an index scan or a heap-fetching walk (`LionOrdered`, `LionBtreeScan` not index-only) that may feed a `LionOrderedJoin`'s key set; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"; §47.6, "The feed"); 0 turns the charge off |
+| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads; and, with `competitor_pricing` off, the bitmap heap scans and covering walks that may feed a `LionOrderedJoin`'s key set; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"; §47.6, "The feed"); 0 turns the charge off |
 | `probe_entry_cost` | 4.5 | `cpu_operator_cost` | an entry a nested loop's B-tree probe (`LionBtreeScan` parameterized by the outer row, and `LionProbeJoin`'s descents) meets, beyond core's Index Scan of the same B-tree: its test against the set, measured at that Index Scan's own rate (DESIGN.md §49, "The probe's own work") |
 | `probe_rescan_cost` | 16 | `cpu_operator_cost` | a scan of `LionBtreeScan`'s probe beyond core's Index Scan's: its rescan, and its code run beside core's, measured so |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
@@ -1517,6 +1534,22 @@ and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "
 - In `pg_stat_user_tables`, a table's `idx_scan` is the sum of its indexes', and its
   `idx_tup_fetch` adds its own fetches to theirs; no Lion node counts a `seq_scan`.
 
+`CREATE INDEX` and `REINDEX` report their phases in `pg_stat_progress_create_index`, whose `phase`
+reads `building index: ` and the phase's name; a parallel build's leader reports for all its
+processes, and a phase marked "(workers)" is one only a parallel build goes through.
+
+- **lion** (DESIGN.md §24, "Progress"): `scanning table`, with `blocks_total` and `blocks_done`;
+  `merging runs (workers)`, the leader merging its own share of the scan and waiting for the
+  workers' shares; `writing columns`; and `copying columns (workers)`, the leader writing into the
+  index a column a worker wrote. Through the last two, `tuples_total` is the (key, row) pairs the
+  index holds - a row once for each key column and for each key of a multi-key column, and once for
+  each bit slice of a bit-sliced column it is in - and `tuples_done` the pairs written.
+- **lionvec** (DESIGN.md §44.5): `sampling table`, the first pass, with blocks; `computing
+  centroids`, with k-means' iterations done out of at most `tuples_total` (it stops sooner once no
+  row moves); `assigning rows to partitions`, the second pass, with blocks, and the rows done out of
+  those the first pass read; `sorting rows`; `writing partitions`, with the rows written; and
+  `WAL-logging index`, for an index that is WAL-logged.
+
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap
@@ -1573,8 +1606,10 @@ Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, 
 `numeric` or `interval` - for every such column of the index or none (the option is the index's,
 not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
 from them (DESIGN.md §52), and a range on the sliced column itself (DESIGN.md §53), but not a
-percentile, a join's or a partitioned table's aggregates or ranges, nor a bitmap or plain scan's
-range. An insert into a sliced column costs a posting-set insert per set bit of its value - in
+percentile, a join's aggregates or ranges, a partitioned table's `GROUP BY`, nor a bitmap or
+plain scan's range; a partitioned table's one row and its ranges are answered when every
+partition has its own index slicing the column (DESIGN.md §52.13, §53.11). An insert into a
+sliced column costs a posting-set insert per set bit of its value - in
 place, several to a WAL record, but a posting page each (DESIGN.md §51, "Insert cost, revisited").
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so

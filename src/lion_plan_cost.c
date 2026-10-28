@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 
+#include "optimizer/restrictinfo.h"
 #include "tsearch/ts_type.h"
 
 #include "lion_customscan.h"
@@ -89,6 +90,60 @@ lion_index_dir_pages(IndexOptInfo *idx, double *height)
 
 	index_close(indexrel, AccessShareLock);
 	return Max(dirpages, 1.0);
+}
+
+/*
+ * A clause of rel's as lion's cost model hands it to core's selectivity
+ * functions, which it asks with varRelid 0: the clause itself where it is of
+ * rel alone, and a join clause - `fk = outer.pk`, taken as a parameterized
+ * index clause - as a RestrictInfo of its own whose cached selectivity is the
+ * clause's per probe, rel's column against one value (1/n_distinct), as
+ * core's amcostestimate()s estimate an index clause with rel as varRelid.
+ * Asked with varRelid 0 and no join, core takes the join clause for a
+ * restriction, finds no constant, returns DEFAULT_EQ_SEL and caches it in
+ * the query's RestrictInfo (clause_selectivity_ext()), where the size
+ * estimate of every join over the clause would then read 1/200 back.
+ */
+Node *
+lion_rel_clause(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+{
+	Node	   *bare = IsA(clause, RestrictInfo) ?
+		(Node *) ((RestrictInfo *) clause)->clause : clause;
+	Relids		relids = pull_varnos(root, bare);
+	RestrictInfo *rinfo;
+	Selectivity sel;
+
+	if (bms_membership(relids) != BMS_MULTIPLE)
+		return clause;
+	sel = clause_selectivity(root, bare,
+							 bms_is_member((int) rel->relid, relids) ?
+							 (int) rel->relid : 0,
+							 JOIN_INNER, NULL);
+	rinfo = make_simple_restrictinfo(root, (Expr *) bare);
+	rinfo->norm_selec = sel;
+	rinfo->outer_selec = sel;
+	return (Node *) rinfo;
+}
+
+/* lion_rel_clause() of each of clauses, in a new list */
+List *
+lion_rel_clauses(PlannerInfo *root, RelOptInfo *rel, List *clauses)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+		result = lappend(result,
+						 lion_rel_clause(root, rel, (Node *) lfirst(lc)));
+	return result;
+}
+
+/* The selectivity of a clause of rel's, as lion_rel_clause() takes it. */
+Selectivity
+lion_rel_clause_selectivity(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+{
+	return clause_selectivity(root, lion_rel_clause(root, rel, clause), 0,
+							  JOIN_INNER, NULL);
 }
 
 /*
@@ -1116,8 +1171,7 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	double		psel;
 
 	memset(sc, 0, sizeof(*sc));
-	sel = clause_selectivity(root, lion_vcol_unvar(clause), 0, JOIN_INNER,
-							 NULL);
+	sel = lion_rel_clause_selectivity(root, rel, lion_vcol_unvar(clause));
 
 	/*
 	 * A partial index's sets hold its predicate's rows alone (DESIGN.md §45):
@@ -2195,8 +2249,8 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 			if (LION_CLAUSE_IS_POSITIVE(lfirst_int(lc2)) && orgrp[ci] < 0 &&
 				k <= nsrc)
 				f.rows[k++] = tuples *
-					clause_selectivity(root, lion_vcol_unvar(lfirst(lc)), 0,
-									   JOIN_INNER, NULL);
+					lion_rel_clause_selectivity(root, rel,
+												lion_vcol_unvar(lfirst(lc)));
 			ci++;
 		}
 		foreach(lc, ors)
@@ -2216,9 +2270,8 @@ lion_cost_range_sum(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *groupidx,
 				for (j = 0; j < nleaves; j++, leaf++)
 					if (leaf < list_length(whereclauses))
 						armrows = Min(armrows, tuples *
-									  clause_selectivity(root,
-														 lion_vcol_unvar(list_nth(whereclauses, leaf)),
-														 0, JOIN_INNER, NULL));
+									  lion_rel_clause_selectivity(root, rel,
+																  lion_vcol_unvar(list_nth(whereclauses, leaf))));
 				rows += armrows;
 			}
 			if (k <= nsrc)
@@ -6692,8 +6745,8 @@ lion_cost_recheck_read(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 		cost_qual_eval_node(&qual_cost, clause, root);
 		perrow += qual_cost.per_tuple;
 		if (mode == LION_QMODE_ALL)
-			cand /= Max(clause_selectivity(root, lion_vcol_unvar(clause), 0,
-										   JOIN_INNER, NULL),
+			cand /= Max(lion_rel_clause_selectivity(root, rel,
+													lion_vcol_unvar(clause)),
 						1e-10);
 		else if (lion_tsquery_pos_shape(root, rel, (IndexOptInfo *) lfirst(lc1),
 										(AttrNumber) lfirst_int(lc4), clause,
@@ -7093,8 +7146,7 @@ lion_tsquery_pos_shape_of(PlannerInfo *root, RelOptInfo *rel,
 		itemlex[i] = n;
 		lexitem[n] = i;
 		lop = lion_tsquery_operand_clause(op, tsq, &items[i].qoperand);
-		sels[n] = Min(Max(clause_selectivity(root, (Node *) lop, 0,
-											 JOIN_INNER, NULL),
+		sels[n] = Min(Max(lion_rel_clause_selectivity(root, rel, (Node *) lop),
 						  1e-10), 1.0);
 		shares[n] = Min(sels[n] / nonnull, 1.0);
 		n++;

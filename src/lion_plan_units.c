@@ -1523,6 +1523,64 @@ lion_bitmap_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 }
 
 /*
+ * A core path's bitmap heap scans read cold (lion_bitmap_cold()), for a plan
+ * that is chosen by its cold price rather than weighed against one: what they
+ * would pay for the pages outside the cache over what core charged them, and
+ * in *pages the pages they read, heap and index.  Both 0 where the path has
+ * no bitmap heap scan; the charge 0 where the cache holds everything.  Not
+ * under pg_lion.competitor_pricing: a key set's feed (lion_ordjoin.c,
+ * DESIGN.md §47.6) is picked by its price with these reads whichever way the
+ * switch is set.
+ */
+Cost
+lion_units_bitmap_reads(PlannerInfo *root, Path *path, double *pages)
+{
+	LionBitmapReads r;
+	double		resident;
+
+	*pages = 0.0;
+	if (root == NULL || path == NULL)
+		return 0.0;
+	memset(&r, 0, sizeof(r));
+	lion_bitmap_reads(root, path, 1.0, &r);
+	*pages = r.pages;
+	if (r.heappages <= 0.0 || r.over <= 0.0)
+		return 0.0;
+	resident = Min((double) effective_cache_size /
+				   Max(root->total_table_pages + r.idxpages, 1.0), 1.0);
+	if (resident >= 1.0)
+		return 0.0;
+	return (1.0 - resident) * r.over;
+}
+
+/*
+ * What a page read outside the cache in an order the device or the kernel
+ * reads ahead of costs over the random_page_cost core charges it: the price
+ * lion_bitmap_cold() gives a bitmap heap scan's pages and a covering walk's
+ * own, LION_COLD_STREAM_PAGE_COST less the tablespace's random_page_cost, in
+ * the share of the query's tables and idxpages of index that
+ * effective_cache_size cannot hold.  0 when it holds them all.
+ */
+Cost
+lion_units_stream_cold_page(PlannerInfo *root, double idxpages,
+							Oid reltablespace)
+{
+	double		resident;
+	double		spc_random_page_cost;
+	double		spc_seq_page_cost;
+
+	resident = Min((double) effective_cache_size /
+				   Max(root->total_table_pages + idxpages, 1.0), 1.0);
+	get_tablespace_page_costs(reltablespace, &spc_random_page_cost,
+							  &spc_seq_page_cost);
+	if (resident >= 1.0 ||
+		LION_COLD_STREAM_PAGE_COST <= spc_random_page_cost)
+		return 0.0;
+	return (1.0 - resident) *
+		(LION_COLD_STREAM_PAGE_COST - spc_random_page_cost);
+}
+
+/*
  * The factor a lion path's price, `price` in its competitor's units, takes
  * against a competitor of cost `cost` with `cold` of uncached reads, its own
  * being `lioncold`: both plans with their uncached reads added, the path at

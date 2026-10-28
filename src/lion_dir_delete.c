@@ -382,16 +382,7 @@ lion_dirdel_count(Relation index, int n)
 	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
-	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-		!LionPageIsMeta(page))
-	{
-		UnlockReleaseBuffer(buf);
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("lion index \"%s\": block 0 is not the meta page",
-						RelationGetRelationName(index))));
-	}
-	lion_meta_check_version(index, LionPageGetMeta(page));
+	lion_meta_check_page(index, buf);
 	dirpages = LionPageGetMeta(page)->dirpages;
 	if (dirpages <= 1)
 	{

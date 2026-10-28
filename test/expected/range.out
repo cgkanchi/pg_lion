@@ -251,7 +251,7 @@ SELECT count(*) AS range_members,
    AND o.amopstrategy BETWEEN 6 AND 9;
  range_members | with_proc4 
 ---------------+------------
-           148 |        148
+           168 |        168
 (1 row)
 
 SELECT amvalidate(c.oid) AS valid, count(*)
