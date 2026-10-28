@@ -3,10 +3,9 @@
 # injection_points module and the isolation tester installed, so every
 # isolation spec runs.  The server build is cached per upstream commit.
 #
-# Every pull request runs this for REL_18_STABLE alone, called from ci.yml.
-# Started by hand from the Actions tab (workflow_dispatch), it runs the
-# whole list by default - REL_16_STABLE to REL_19_STABLE and master - or the
-# branches given.
+# ci.yml calls this for REL_18_STABLE on every pull request; optional.yml,
+# started by hand, calls it for the whole list by default - REL_16_STABLE to
+# REL_19_STABLE and master - or the branches given.
 #
 # These are the only jobs with an assert build, so the debug_discard_caches
 # run is here (on 16, 19 and master: the oldest major's compatibility code
@@ -26,12 +25,6 @@ on:
         description: JSON list of postgres.git branches to build
         type: string
         required: true
-  workflow_dispatch:
-    inputs:
-      branches:
-        description: JSON list of postgres.git branches to build
-        type: string
-        default: '["REL_16_STABLE", "REL_17_STABLE", "REL_18_STABLE", "REL_19_STABLE", "master"]'
 
 permissions:
   contents: read
