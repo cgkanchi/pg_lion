@@ -404,43 +404,9 @@ SELECT spt_q('SELECT sum(a) + 1, max(c) - min(c), avg(b) * 2 FROM spr WHERE h = 
 (1 row)
 
 -- ---------- 2. pruning, and what the bounds imply ----------
--- a WHERE on the key that prunes to some partitions, to one leaf of the
--- sub-partitioned one, to the empty one, and to none at all
-SELECT * FROM spt_plan('SELECT sum(b), max(c) FROM spr WHERE k >= 100 AND k < 200 AND g = 3');
-                                       spt_plan                                        
----------------------------------------------------------------------------------------
- Custom Scan (LionCount)
-   Partitions: spr_2
-   Lion Indexes: (g = 3)
-   Implied by Partition Bounds: (k >= 100), (k < 200)
-   Aggregates From Slices: (b: every bit counted), (c: existence counted, max descent)
-(5 rows)
-
-SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k >= 100 AND k < 200 AND g = 3');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
+-- a WHERE on the key that prunes to some partitions and to none at all (to
+-- one leaf: slices_partitioned_leaf.sql)
 SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k < 200 AND g = 3');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
-SELECT spt_q('SELECT sum(b), avg(a), min(d) FROM spr WHERE k >= 300 AND k < 400 AND g = 1');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
-SELECT spt_q('SELECT sum(b), avg(a), min(d) FROM spr WHERE k >= 300 AND k < 400 AND g = 5');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
-SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE k >= 200 AND k < 300');
         spt_q        
 ---------------------
  from slices, 1 rows
@@ -698,21 +664,10 @@ SELECT spt_q('SELECT count(d), min(d), max(d) FROM spl WHERE g IN (0, 10)');
  from slices, 1 rows
 (1 row)
 
--- pruned by the key, which the partitions kept imply: the NULL partition,
--- the hashed ones, one of them through the hash key, two lists
-SELECT spt_q('SELECT sum(v), max(w), count(*) FROM spl WHERE kind IS NULL AND g = 4');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
+-- pruned by the key, which the partitions kept imply: the hashed ones, two
+-- lists (the NULL partition alone, and one hashed leaf through the hash key:
+-- slices_partitioned_leaf.sql)
 SELECT spt_q('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h''');
-        spt_q        
----------------------
- from slices, 1 rows
-(1 row)
-
-SELECT spt_q('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h'' AND g = 4');
         spt_q        
 ---------------------
  from slices, 1 rows
@@ -723,16 +678,6 @@ SELECT spt_q('SELECT sum(v), avg(v), count(*) FROM spl WHERE kind IN (''a'', ''h
 ---------------------
  from slices, 1 rows
 (1 row)
-
-SELECT * FROM spt_plan('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h'' AND g = 4');
-                                       spt_plan                                        
----------------------------------------------------------------------------------------
- Custom Scan (LionCount)
-   Partitions: spl_h0
-   Lion Indexes: (g = 4)
-   Implied by Partition Bounds: (kind = 'h'::text)
-   Aggregates From Slices: (v: every bit counted), (w: existence counted, min descent)
-(5 rows)
 
 -- ... and where a partition kept does not imply it - 'b' of the list of two,
 -- 'z' of the default - the clause on the unindexed key is tested on the

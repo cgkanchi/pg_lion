@@ -1,0 +1,17 @@
+-- Aggregates of bit-sliced columns over a partitioned table that plan-time
+-- pruning leaves ONE leaf of (DESIGN.md §52.13, §16, "A parent pruned to one
+-- leaf"): the cases of slices_partitioned.sql that prune to a single leaf,
+-- through a sub-partitioned parent, to an empty leaf, to the NULL partition
+-- of a LIST and to one leaf of a HASH.
+--
+-- PostgreSQL 18.0 to 18.6 lose a disabled path's disabled_nodes in an
+-- Append of one child (fixed upstream in 18.7, "Propagate disabled_nodes to
+-- single-child Append paths"), so the ordinary plan the checks below
+-- disable is not disabled there, and it wins on cost against the slices on
+-- data this small.  The test stops at once there, and on builds of the 18
+-- branch stamped 18.6 that have the fix, which the version cannot tell
+-- apart (slices_partitioned_leaf_1.out).
+SELECT current_setting('server_version_num')::int BETWEEN 180000 AND 180006
+	AS append_drops_disabled \gset
+\if :append_drops_disabled
+\quit
