@@ -1,0 +1,148 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_explain s1_begin s1_slices s2_begin s2_write s2_slices s1_slices s3_slices s2_commit s1_slices s3_slices s1_commit s1_slices
+step s1_explain: EXPLAIN (COSTS OFF)
+				  SELECT count(a), sum(a), min(a), max(a) FROM sptp WHERE grp = 1;
+				  EXPLAIN (COSTS OFF)
+				  SELECT count(*), sum(b) FROM sptp WHERE a BETWEEN -200 AND 300;
+QUERY PLAN                                                                
+--------------------------------------------------------------------------
+Custom Scan (LionCount)                                                   
+  Partitions: sptp_1, sptp_2, sptp_3                                      
+  Lion Indexes: (grp = 1)                                                 
+  Aggregates From Slices: (a: every bit counted, min descent, max descent)
+(4 rows)
+
+QUERY PLAN                                                        
+------------------------------------------------------------------
+Custom Scan (LionCount)                                           
+  Partitions: sptp_1, sptp_2, sptp_3                              
+  Lion Indexes: (a >= '-200'::integer AND a <= 300)               
+  Range From Slices: a >= '-200'::integer AND a <= 300 (32 slices)
+  Aggregates From Slices: (b: every bit counted)                  
+(5 rows)
+
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO sptp VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(2001, 0, NULL, NULL, NULL);
+				  UPDATE sptp SET a = -a, b = b * 2, grp = 1, id = id + 4000
+				   WHERE id % 10 = 0 AND id < 4000;
+				  DELETE FROM sptp WHERE id % 7 = 3;
+				  DELETE FROM sptp WHERE grp = 1 AND id >= 2000 AND id < 4000;
+step s2_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s2_commit: COMMIT;
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
+
+starting permutation: s2_begin s2_write s2_slices s3_slices s2_rollback s3_slices
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO sptp VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(2001, 0, NULL, NULL, NULL);
+				  UPDATE sptp SET a = -a, b = b * 2, grp = 1, id = id + 4000
+				   WHERE id % 10 = 0 AND id < 4000;
+				  DELETE FROM sptp WHERE id % 7 = 3;
+				  DELETE FROM sptp WHERE grp = 1 AND id >= 2000 AND id < 4000;
+step s2_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s2_rollback: ROLLBACK;
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+
+starting permutation: s1_begin s1_slices s2_begin s2_write s2_commit s3_vacuum s1_slices s3_slices s1_commit s3_vacuum s3_slices
+step s1_begin: BEGIN ISOLATION LEVEL REPEATABLE READ;
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s2_begin: BEGIN;
+step s2_write: INSERT INTO sptp VALUES
+					(10001, 1, 2147483647, 9223372036854775807, 'infinity'),
+					(1, 1, -2147483648, -9223372036854775808, '-infinity'),
+					(2001, 0, NULL, NULL, NULL);
+				  UPDATE sptp SET a = -a, b = b * 2, grp = 1, id = id + 4000
+				   WHERE id % 10 = 0 AND id < 4000;
+				  DELETE FROM sptp WHERE id % 7 = 3;
+				  DELETE FROM sptp WHERE grp = 1 AND id >= 2000 AND id < 4000;
+step s2_commit: COMMIT;
+step s3_vacuum: VACUUM sptp;
+step s1_slices: SELECT * FROM sptp_both();
+same|lion                                                                               
+----+-----------------------------------------------------------------------------------
+t   |2000 -1000 -500 499 | 4000 10402036006000 2600509001.50000000 -398999997 5600018000
+(1 row)
+
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
+step s1_commit: COMMIT;
+step s3_vacuum: VACUUM sptp;
+step s3_slices: SELECT * FROM sptp_both();
+same|lion                                                                                                               
+----+-------------------------------------------------------------------------------------------------------------------
+t   |1430 12365 -2147483648 2147483647 | 3030 8303733955114 2740506255.81320132 -9223372036854775808 9223372036854775807
+(1 row)
+
