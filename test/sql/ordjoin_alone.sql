@@ -69,15 +69,15 @@ CREATE INDEX fact_rec ON fact USING lion (rec);
 
 -- the small key table, unique by (fk, kind): kind 1's keys drawn 4,000 times
 -- from every key, kind 2's 9,000 times from past the slice's, and forty in it
-CREATE TABLE ib (fk int NOT NULL, kind int NOT NULL, since int NOT NULL,
+CREATE TABLE kt (fk int NOT NULL, kind int NOT NULL, since int NOT NULL,
 	PRIMARY KEY (fk, kind)) WITH (autovacuum_enabled = off);
-INSERT INTO ib SELECT DISTINCT k, kind, k % 7
+INSERT INTO kt SELECT DISTINCT k, kind, k % 7
   FROM generate_series(1, 3) kind,
 	   LATERAL (SELECT CASE WHEN kind = 2 THEN 50001 ELSE 1 END +
 					   ((hashint8extended(g::bigint * 10 + kind, 8) & 9223372036854775807) %
 						CASE WHEN kind = 2 THEN 50000 ELSE 100000 END)::int k
 				  FROM generate_series(1, CASE WHEN kind = 2 THEN 9000 ELSE 4000 END) g) s;
-INSERT INTO ib SELECT 1000 * g + 7, 2, 0 FROM generate_series(1, 40) g;
+INSERT INTO kt SELECT 1000 * g + 7, 2, 0 FROM generate_series(1, 40) g;
 
 -- a side table per key and day, joined to the fact's key: 'high' for every
 -- key past the slice's, and in the slice for the fifth of its keys with the
@@ -97,7 +97,7 @@ INSERT INTO sup SELECT k, 1 FROM generate_series(1, 100000, 50) k;
 
 VACUUM (FREEZE, ANALYZE) dim;
 VACUUM (FREEZE, ANALYZE) fact;
-VACUUM (FREEZE, ANALYZE) ib;
+VACUUM (FREEZE, ANALYZE) kt;
 VACUUM (FREEZE, ANALYZE) sig;
 VACUUM (FREEZE, ANALYZE) sup;
 
@@ -209,7 +209,7 @@ SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score, f.rec, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL AND s.level = 'high'
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -218,7 +218,7 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, f.rec, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL AND s.level = 'high'
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -227,7 +227,7 @@ SELECT * FROM oja_run($$SELECT d.pk, d.flag, d.rel, f.score, f.rec, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL AND s.level = 'high'
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -238,7 +238,7 @@ SELECT oja_plan($$SELECT d.pk, d.flag, f.score, f.rec, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL AND s.level = 'high'
 	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 100$$);
@@ -246,7 +246,7 @@ SELECT oja($$SELECT d.pk, d.flag, f.score, f.rec, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL AND s.level = 'high'
 	ORDER BY f.score DESC NULLS LAST, d.pk LIMIT 100$$);
@@ -312,18 +312,18 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 -- ... the key table, no key set: a column of it read, or its kind not pinned
 --     to one value, which leaves a key in it twice.  (A key repeated comes
 --     out repeated, the rows alike, so the ORDER BY needs no more keys.)
-SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score, ib.since
+SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score, kt.since
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
 	LIMIT 100$$);
-SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, ib.since
+SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, kt.since
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -331,13 +331,13 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, ib.since
 SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
-	JOIN ib ON ib.fk = d.pk AND ib.kind IN (2, 3)
+	JOIN kt ON kt.fk = d.pk AND kt.kind IN (2, 3)
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
 	LIMIT 100$$);
 SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
-	JOIN ib ON ib.fk = d.pk AND ib.kind IN (2, 3)
+	JOIN kt ON kt.fk = d.pk AND kt.kind IN (2, 3)
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
 	LIMIT 100$$);
 -- 3. Alone under the LIMIT, the split's: the page with only left joins and
@@ -399,7 +399,7 @@ SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 1
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 1
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -408,7 +408,7 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 1
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 1
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -417,7 +417,7 @@ SELECT * FROM oja_run($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 1
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 1
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -432,7 +432,7 @@ SELECT oja_plan($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -441,7 +441,7 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 	FROM dim d
 	JOIN fact f ON f.grp = 1 AND f.ver = 2 AND f.fk = d.pk
 	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = f.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
-	JOIN ib ON ib.fk = d.pk AND ib.kind = 2
+	JOIN kt ON kt.fk = d.pk AND kt.kind = 2
 	LEFT JOIN sup ON sup.fk = d.pk AND sup.reason = 1
 	WHERE sup.fk IS NULL
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.rel DESC NULLS LAST, d.pk
@@ -455,16 +455,16 @@ SELECT oja($$SELECT d.pk, d.flag, d.rel, f.score, s.level
 SET enable_nestloop = off;
 SET enable_mergejoin = off;
 SELECT * FROM oja_lines($$SELECT d.pk, d.flag, f.score, s.level
-	FROM ib JOIN dim d ON ib.fk = d.pk AND ib.kind = 2
-	JOIN fact f ON f.fk = ib.fk AND f.grp = 1 AND f.ver = 2
-	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = ib.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
+	FROM kt JOIN dim d ON kt.fk = d.pk AND kt.kind = 2
+	JOIN fact f ON f.fk = kt.fk AND f.grp = 1 AND f.ver = 2
+	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = kt.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
 	WHERE s.level = 'high'
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.pk LIMIT 100$$,
 	'(Hash Cond:|Custom Scan|Key Sets:)');
 SELECT oja($$SELECT d.pk, d.flag, f.score, s.level
-	FROM ib JOIN dim d ON ib.fk = d.pk AND ib.kind = 2
-	JOIN fact f ON f.fk = ib.fk AND f.grp = 1 AND f.ver = 2
-	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = ib.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
+	FROM kt JOIN dim d ON kt.fk = d.pk AND kt.kind = 2
+	JOIN fact f ON f.fk = kt.fk AND f.grp = 1 AND f.ver = 2
+	LEFT JOIN LATERAL (SELECT s.* FROM sig s WHERE s.fk = kt.fk AND s.grp = 1 AND s.ver = 2 AND s.day = 3) s ON true
 	WHERE s.level = 'high'
 	ORDER BY d.flag DESC NULLS LAST, f.score DESC NULLS LAST, d.pk LIMIT 100$$);
 RESET enable_mergejoin;

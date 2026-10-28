@@ -22,15 +22,15 @@ setup
 	SELECT i, CASE WHEN i = 2000 THEN 150 ELSE 1 + (i * 7) % 200 END, i
 	  FROM generate_series(1, 2000) i;
 	CREATE INDEX kfct_rank ON kfct (rank DESC) INCLUDE (fk);
-	CREATE TABLE kib (fk int NOT NULL, prod int NOT NULL, PRIMARY KEY (fk, prod));
-	INSERT INTO kib SELECT k, 1 FROM generate_series(1, 10) k;
+	CREATE TABLE kkt (fk int NOT NULL, prod int NOT NULL, PRIMARY KEY (fk, prod));
+	INSERT INTO kkt SELECT k, 1 FROM generate_series(1, 10) k;
 	ANALYZE kco;
 	ANALYZE kfct;
-	ANALYZE kib;
+	ANALYZE kkt;
 }
 teardown
 {
-	DROP TABLE kco, kfct, kib;
+	DROP TABLE kco, kfct, kkt;
 }
 
 session s1
@@ -39,15 +39,15 @@ setup
 	SET pg_lion.pushdown_margin = 1000;
 	SET enable_hashjoin = off; SET enable_mergejoin = off;
 }
-step s1_plan	{ EXPLAIN (COSTS OFF) SELECT f.id, f.fk FROM kfct f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kib WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3; }
+step s1_plan	{ EXPLAIN (COSTS OFF) SELECT f.id, f.fk FROM kfct f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kkt WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3; }
 step s1_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
-step s1_read	{ SELECT f.id, f.fk FROM kfct f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kib WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3; }
-step s1_insert	{ INSERT INTO kib VALUES (5, 9); }
+step s1_read	{ SELECT f.id, f.fk FROM kfct f JOIN kco d ON f.fk = d.pk WHERE f.fk IN (SELECT fk FROM kkt WHERE prod = 1) ORDER BY f.rank DESC LIMIT 3; }
+step s1_insert	{ INSERT INTO kkt VALUES (5, 9); }
 step s1_commit	{ COMMIT; }
 
 session s2
 step s2_begin	{ BEGIN ISOLATION LEVEL SERIALIZABLE; }
-step s2_read	{ SELECT count(*) FROM kib WHERE prod = 9; }
+step s2_read	{ SELECT count(*) FROM kkt WHERE prod = 9; }
 step s2_update	{ UPDATE kfct SET fk = 1 WHERE id = 2000; }
 step s2_commit	{ COMMIT; }
 
