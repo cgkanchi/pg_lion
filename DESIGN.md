@@ -6051,8 +6051,8 @@ which rescans the node partition by partition.
 ### A parent pruned to one leaf (2026-10-26)
 
 An application names the partitioned table, and plan-time pruning leaves it one leaf: every
-statement of the CPC replay (2026-10-26) names one `(customer_product_id, version)` pair of a table
-LIST-partitioned by the first and sub-partitioned by the second, 2,918 leaves. The nodes that scan
+statement of a private workload names one `(a, b)` pair of a table LIST-partitioned by the first
+and sub-partitioned by the second, into thousands of leaves. The nodes that scan
 one relation got the leaf: `set_rel_pathlist_hook` runs for each partition
 (`RELOPT_OTHER_MEMBER_REL`), LionOrdered and LionBtreeScan plan on it (§30.11, §40.10), and core's
 Append of that one child costs nothing (`create_append_path()` takes the child's cost and pathkeys)
@@ -6060,7 +6060,7 @@ and is elided (`set_append_references()`), so the plan is the leaf's. The join n
 `set_join_pathlist_hook` is called with the parent - `reloptkind` RELOPT_BASEREL, `rte->inh`, no
 `indexlist` of its own, its paths an Append - and `oj_side_ok()` refused it, so a query naming the
 parent got core's plan where the same query naming the leaf got LionOrderedSplit over
-LionOrderedJoin: 15 of the replay's discover_page statements, 1,278 s with 12 timeouts against 27 s.
+LionOrderedJoin, and on the workload ran many times slower, some statements timing out.
 
 The gate is one, shared, in lion_plan_partition.c, so that a node supports a partitioned table by
 asking it rather than by a rule of its own:
@@ -30634,8 +30634,8 @@ the node's rows to them above is the plan.
 
 **Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
 after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
-private workload's pages a key set of 746 companies kept 101 of 969,731 entries walked, each
-fetched (70.6 s against core's 0.9). Where the fact's key has a lion index the key sets are ANDed
+private workload's pages a small key set kept about one entry in ten thousand walked, each
+fetched, and ran many times slower than core's plan. Where the fact's key has a lion index the key sets are ANDed
 into the walk's set instead, and an entry whose key a key set lacks is not a member: never
 fetched. The index (`oj_key_index()`): a lion index of the fact, not partial unless the query
 implies its predicate, with a key column that is the key itself, a plain column, scalar - an entry
@@ -30671,8 +30671,8 @@ GB, `work_mem` 4 MB; warm, the median of seven runs, and buffers-cold - every bu
 `pg_buffercache_evict_all()` before each run, the kernel's cache warm - of five). A stand-in for the
 page: a 2,000,000-row fact (165 MB) walked by a B-tree of a random rank that does not hold the key,
 a 1,000,000-row dimension with a three-value lion `tier`, and a key table whose 746 keys hold 1,487
-fact rows, 0.075% of the entries; `... WHERE f.company_id IN (SELECT company_id FROM installbase
-WHERE product_id = 7) ORDER BY d.tier, f.rank DESC LIMIT 100`, and 19,817 keys (2%) for product 3.
+fact rows, 0.075% of the entries; `... WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7) ORDER BY
+d.tier, f.rank DESC LIMIT 100`, and 19,817 keys (2%) for product 3.
 "Before" is the parent commit; core's plan is with the node off.
 
 | the key's index | key set | before | after | core's plan |
@@ -30694,9 +30694,8 @@ against 255 ms); at a `work_mem` of 64 MB core's nested loop over the rank's B-t
 under its semi join, came out under both and ran 946 ms (§47.7).
 
 **Tested on the index tuple** (2026-10-26; `oj_itup_col()`, `lion_ordered_entry_test()`). The
-private workload's walked B-tree holds the key it joins on - `cpc_rank_idx (customer_product_id,
-version, model_score DESC) INCLUDE (company_id)` - while its lion index has the key as the eighth of
-twenty columns and a plain B-tree has it alone. Folding reads the postings of every key; the
+walked B-tree may hold the key it joins on - `(a, b, rank DESC) INCLUDE (fk)` - while a lion index
+has the key as one of many columns and a plain B-tree has it alone. Folding reads the postings of every key; the
 B-tree's index tuple has the key already. Where a column of the fact's walked B-tree - a key column
 or an INCLUDE one - is the key column itself, stored as the key's type and returnable
 (`oj_itup_col()`, and `lion_ordered_entry_test()` checks it again at run time), the join, not
@@ -30724,9 +30723,9 @@ set turned away; an entry whose key is NULL is in neither, turned away uncounted
 after the fetch leaves it uncounted. Folded paths are still offered beside them; `add_path()` keeps
 the cheaper.
 
-**Measured** (2026-10-26; the stand-in above, its indexes the private workload's: the key the third
-column of a multicolumn lion index `(product_id, intensity, company_id)`, a plain B-tree on the key,
-and the walked B-tree `(rank DESC) INCLUDE (company_id)`; release build, the median of five, warm,
+**Measured** (2026-10-26; the stand-in above, its indexes of that shape: the key the third column
+of a multicolumn lion index `(prod, x, fk)`, a plain B-tree on the key, and the walked B-tree
+`(rank DESC) INCLUDE (fk)`; release build, the median of five, warm,
 and buffers-cold as above).
 
 | key set | before the fold | folded (§47.6 above) | tested on the index tuple | core's plan |

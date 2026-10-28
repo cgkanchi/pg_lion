@@ -1,7 +1,7 @@
 -- A LionOrderedJoin's key sets folded into its fact's walk (DESIGN.md §47.6,
 -- "Folded into the walk").
 --
--- A table that only filters the join's key - `f.fk IN (SELECT fk FROM ib
+-- A table that only filters the join's key - `f.fk IN (SELECT fk FROM kt
 -- WHERE prod = 7)` - is a key set: its keys are read into a hash set before
 -- the walk.  Where the fact's key has a lion index, its keys' rows there are
 -- ANDed into the walk's set, and an entry whose key the key set lacks is
@@ -44,37 +44,37 @@ CREATE INDEX co_region ON co USING lion (region);
 
 -- the fact: ten rows a key, every 97th key NULL; a B-tree by rank that does
 -- not hold the key
-CREATE TABLE cpc (
+CREATE TABLE fct (
 	id int PRIMARY KEY,
 	fk int,
 	prod int NOT NULL,			-- lion: twenty values
 	rank int NOT NULL,
 	note text NOT NULL
 ) WITH (autovacuum_enabled = off);
-INSERT INTO cpc
+INSERT INTO fct
 SELECT i, CASE WHEN i % 97 = 0 THEN NULL
 			   ELSE 1 + ((hashint8extended(i::bigint, 3) & 9223372036854775807) % 20000)::int END,
 	   ((hashint8extended(i::bigint, 4) & 9223372036854775807) % 20)::int,
 	   ((hashint8extended(i::bigint, 5) & 9223372036854775807) % 1000000)::int,
 	   md5(i::text)
   FROM generate_series(1, 200000) i;
-CREATE INDEX cpc_rank ON cpc (rank DESC);
-CREATE INDEX cpc_prod ON cpc USING lion (prod);
+CREATE INDEX fct_rank ON fct (rank DESC);
+CREATE INDEX fct_prod ON fct USING lion (prod);
 
 -- the key table: product 7 sixty keys, product 3 two thousand
-CREATE TABLE ib (fk int NOT NULL, prod int NOT NULL, PRIMARY KEY (fk, prod))
+CREATE TABLE kt (fk int NOT NULL, prod int NOT NULL, PRIMARY KEY (fk, prod))
 	WITH (autovacuum_enabled = off);
-INSERT INTO ib SELECT 1 + (k * 331) % 20000, 7 FROM generate_series(1, 60) k;
-INSERT INTO ib SELECT 1 + (k * 7) % 20000, 3 FROM generate_series(1, 2000) k;
+INSERT INTO kt SELECT 1 + (k * 331) % 20000, 7 FROM generate_series(1, 60) k;
+INSERT INTO kt SELECT 1 + (k * 7) % 20000, 3 FROM generate_series(1, 2000) k;
 -- ... and a table of keys with repeats and NULLs, for an IN
-CREATE TABLE ibdup (fk int) WITH (autovacuum_enabled = off);
-INSERT INTO ibdup SELECT 1 + (k % 40) * 331 FROM generate_series(1, 400) k;
-INSERT INTO ibdup SELECT NULL FROM generate_series(1, 5);
+CREATE TABLE ktdup (fk int) WITH (autovacuum_enabled = off);
+INSERT INTO ktdup SELECT 1 + (k % 40) * 331 FROM generate_series(1, 400) k;
+INSERT INTO ktdup SELECT NULL FROM generate_series(1, 5);
 
 VACUUM (FREEZE, ANALYZE) co;
-VACUUM (FREEZE, ANALYZE) cpc;
-VACUUM (FREEZE, ANALYZE) ib;
-VACUUM (FREEZE, ANALYZE) ibdup;
+VACUUM (FREEZE, ANALYZE) fct;
+VACUUM (FREEZE, ANALYZE) kt;
+VACUUM (FREEZE, ANALYZE) ktdup;
 
 /*
  * okf_kind() says what the plan of q is: LionOrderedSplit, LionOrderedJoin
@@ -164,53 +164,53 @@ END $$;
 --    rank after it, product 7's sixty keys a key set - six hundred of the
 --    walk's two hundred thousand entries.  Forced, the split walks the first
 --    arm, every entry fetched to read its key and rejected after the fetch.
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
 
 -- ... and with nothing forced, core's plan: the key table first.  The walk is
 --     priced at the pages of the fetches the LIMIT's share of it makes, which
 --     the key set rejects all but one in three hundred of.
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
 
 -- ... a key set of a tenth of the keys, which the walk meets the page in a
 --     few hundred entries of: the split, with nothing forced.
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
 
 -- 2. The key's lion index: the key set folded into the walk's set.  The split
 --    and the join, forced; the walk's set the rows of the key set's keys, its
 --    entries fetched only for them, no key rejected.
-CREATE INDEX cpc_fk ON cpc USING lion (fk);
-ANALYZE cpc;
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+CREATE INDEX fct_fk ON fct USING lion (fk);
+ANALYZE fct;
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
-SELECT okf($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 10 AND d.region < 5
+SELECT okf($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7) AND f.prod < 10 AND d.region < 5
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 10 AND d.region < 5
+SELECT * FROM okf_run($$SELECT f.id, f.rank, f.prod, d.pk, d.region FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7) AND f.prod < 10 AND d.region < 5
 	ORDER BY f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Key Set|Keys Rejected|Lion Indexes|Index Entries Walked|Heap Fetches|Lion Set|Switched)');
 
 -- ... and with nothing forced
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
 
 -- 3. What a folded key set keeps: a key set of repeated keys and NULLs; two
@@ -218,32 +218,32 @@ SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk
 --    a leaf of the set; an empty one, which ends the scan before the walk;
 --    the whole join without a LIMIT; a key set rebuilt for each row of a
 --    LATERAL rescan, its keys handed to the walk again (Key Set Builds: 3).
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ibdup)
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ktdup)
 	ORDER BY f.rank DESC, f.id LIMIT 30$$);
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
-	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ktdup x WHERE x.fk = d.pk)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
-	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ktdup x WHERE x.fk = d.pk)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Key Set|Keys Rejected|Lion Set)');
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 99)
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 99)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id$$);
 SELECT okf($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
-	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+	LATERAL (SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM kt WHERE prod = v.p)
 			  ORDER BY f.rank DESC LIMIT 100) s
 	ORDER BY v.p, s.rank DESC, s.id$$);
 SELECT * FROM okf_run($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
-	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+	LATERAL (SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM kt WHERE prod = v.p)
 			  ORDER BY f.rank DESC LIMIT 100) s
 	ORDER BY v.p, s.rank DESC, s.id$$,
 	'^\s*(Key Set|Keys Rejected)');
@@ -252,10 +252,10 @@ SELECT * FROM okf_run($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
 --    update of an indexed column, a new version under the new key - and a row
 --    inserted with a key of the set: both found, as core's plan finds them.
 BEGIN;
-UPDATE cpc SET fk = 1 + 331 WHERE id = 5;
-INSERT INTO cpc VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+UPDATE fct SET fk = 1 + 331 WHERE id = 5;
+INSERT INTO fct VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 ROLLBACK;
 
@@ -264,24 +264,24 @@ ROLLBACK;
 --    into where it does.  A key table of another type than the key's is no
 --    key set at all (§47.7), folded or not: the plan is core's, its keys
 --    looked up in the key's lion index.  And the setting off.
-DROP INDEX cpc_fk;
-CREATE INDEX cpc_fk_part ON cpc USING lion (fk) WHERE prod < 10;
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+DROP INDEX fct_fk;
+CREATE INDEX fct_fk_part ON fct USING lion (fk) WHERE prod < 10;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7) AND f.prod < 5
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7) AND f.prod < 5
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
-DROP INDEX cpc_fk_part;
-CREATE INDEX cpc_fk ON cpc USING lion (fk);
-CREATE TABLE ib8 AS SELECT fk::bigint AS fk FROM ib WHERE prod = 7;
+DROP INDEX fct_fk_part;
+CREATE INDEX fct_fk ON fct USING lion (fk);
+CREATE TABLE ib8 AS SELECT fk::bigint AS fk FROM kt WHERE prod = 7;
 ANALYZE ib8;
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
 	WHERE f.fk IN (SELECT fk FROM ib8) AND d.region < 5
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 SET pg_lion.enable_key_set_fold = off;
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 RESET pg_lion.enable_key_set_fold;
 
@@ -290,41 +290,41 @@ RESET pg_lion.enable_key_set_fold;
 --    sets on its index tuples before it fetches, and an entry they reject is
 --    turned away unfetched - Heap Fetches the rows they keep, Keys Rejected
 --    by Key Sets the rest - and with nothing forced the split is the plan.
-DROP INDEX cpc_fk;
-DROP INDEX cpc_rank;
-CREATE INDEX cpc_rank ON cpc (rank DESC) INCLUDE (fk);
-ANALYZE cpc;
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+DROP INDEX fct_fk;
+DROP INDEX fct_rank;
+CREATE INDEX fct_rank ON fct (rank DESC) INCLUDE (fk);
+ANALYZE fct;
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Arms Run|Key Set|Keys Rejected|Index Entries Walked|Heap Fetches|Switched)');
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
-SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
+SELECT okf_kind($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
 
 -- ... repeated keys and NULLs, a NULL key in the index tuple turned away as
 --     the strict clause turns it away; two key sets; a key set rebuilt for
 --     each row of a LATERAL rescan, its keys tested anew.
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ibdup)
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ktdup)
 	ORDER BY f.rank DESC, f.id LIMIT 30$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ibdup)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM ktdup)
 	ORDER BY f.rank DESC, f.id LIMIT 30$$,
 	'^\s*(Key Set|Keys Rejected|Heap Fetches)');
-SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 3)
-	  AND EXISTS (SELECT 1 FROM ibdup x WHERE x.fk = d.pk)
+SELECT okf($$SELECT f.id, f.rank, d.pk, d.tier FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 3)
+	  AND EXISTS (SELECT 1 FROM ktdup x WHERE x.fk = d.pk)
 	ORDER BY d.tier, f.rank DESC, f.id LIMIT 20$$);
 SELECT okf($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
-	LATERAL (SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-			  WHERE f.fk IN (SELECT fk FROM ib WHERE prod = v.p)
+	LATERAL (SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+			  WHERE f.fk IN (SELECT fk FROM kt WHERE prod = v.p)
 			  ORDER BY f.rank DESC LIMIT 100) s
 	ORDER BY v.p, s.rank DESC, s.id$$);
 
@@ -334,23 +334,23 @@ SELECT okf($$SELECT v.p, s.* FROM (VALUES (7), (3), (99)) v(p),
 --     of the set's keys updated HOT, their index tuples' key their new
 --     versions' too: all found as core's plan finds them.
 BEGIN;
-UPDATE cpc SET fk = 1 + 331 WHERE id = 5;
-INSERT INTO cpc VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
-UPDATE cpc SET note = 'hot' WHERE fk IN (SELECT fk FROM ib WHERE prod = 7) AND id % 2 = 0;
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+UPDATE fct SET fk = 1 + 331 WHERE id = 5;
+INSERT INTO fct VALUES (200001, 1 + 2 * 331, 1, 999999, 'new');
+UPDATE fct SET note = 'hot' WHERE fk IN (SELECT fk FROM kt WHERE prod = 7) AND id % 2 = 0;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 ROLLBACK;
 
 -- ... and the key a key column of the B-tree, after the rank it orders by
-DROP INDEX cpc_rank;
-CREATE INDEX cpc_rank ON cpc (rank DESC, fk);
-ANALYZE cpc;
-SELECT okf($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+DROP INDEX fct_rank;
+CREATE INDEX fct_rank ON fct (rank DESC, fk);
+ANALYZE fct;
+SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
-SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM cpc f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib WHERE prod = 7)
+SELECT * FROM okf_run($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
+	WHERE f.fk IN (SELECT fk FROM kt WHERE prod = 7)
 	ORDER BY f.rank DESC, f.id LIMIT 20$$,
 	'^\s*(Key Set|Keys Rejected|Index Entries Walked|Heap Fetches)');
 
