@@ -1979,6 +1979,7 @@ INSERT INTO lion_rp SELECT i, (i * 7919) % 200, timestamp '2024-01-01' + i * int
 CREATE INDEX lion_rp_lo_lion ON lion_rp USING lion (lo);
 CREATE INDEX lion_rp_lo_bt ON lion_rp (lo);
 CREATE INDEX lion_rp_uq_lion ON lion_rp USING lion (uq);
+NOTICE:  lion index "lion_rp_uq_lion": column "uq" has about one row per key
 CREATE INDEX lion_rp_uq_bt ON lion_rp (uq);
 VACUUM (FREEZE, ANALYZE) lion_rp;
 SELECT lion_rpick('SELECT count(*) FROM lion_rp WHERE lo BETWEEN 10 AND 30');

@@ -133,6 +133,7 @@ SELECT i, i, (i * 7919) % 20011, i % 7,
   FROM generate_series(1, 20000) i;
 CREATE INDEX lion_src_ur ON lion_src_t USING lion (u, r)
 	WITH (summaries = on, summary_tids = 64);
+NOTICE:  lion index "lion_src_ur": columns "u", "r" have about one row per key
 CREATE INDEX lion_src_g ON lion_src_t USING lion (g);
 CREATE INDEX lion_src_k ON lion_src_t USING lion (k);
 CREATE INDEX lion_src_a ON lion_src_t USING lion (a);
@@ -318,6 +319,7 @@ SELECT i, hashint4(i) & 1048575, i % 7, i / 2 % 30, repeat('x', 79)
   FROM generate_series(1, 360000) i;
 CREATE INDEX lion_src_w_ur ON lion_src_w USING lion (u, r)
 	WITH (summaries = on, summary_tids = 1024);
+NOTICE:  lion index "lion_src_w_ur": columns "u", "r" have about one row per key
 CREATE INDEX lion_src_w_g ON lion_src_w USING lion (g);
 CREATE INDEX lion_src_w_a ON lion_src_w USING lion (a);
 VACUUM (FREEZE, ANALYZE) lion_src_w;
@@ -476,6 +478,7 @@ INSERT INTO lion_src_p SELECT i, i % 5, '2025-01-01'::timestamptz + (i * 37 % 20
   FROM generate_series(0, 19999) i;
 CREATE INDEX lion_src_p1_i ON lion_src_p1 USING lion (u, g, ts) WITH (summaries = on, summary_tids = 64);
 CREATE INDEX lion_src_p2_i ON lion_src_p2 USING lion (u, g, ts);
+NOTICE:  lion index "lion_src_p2_i": columns "u", "ts" have about one row per key
 VACUUM (FREEZE, ANALYZE) lion_src_p;
 SELECT lion_src('SELECT g, count(*) FROM lion_src_p WHERE ts >= ''2025-01-05'' GROUP BY g');
                               lion_src                               
@@ -506,6 +509,7 @@ INSERT INTO lion_src_fact SELECT i % 30, i, i % 11 FROM generate_series(1, 30000
 CREATE INDEX lion_src_fact_fk ON lion_src_fact USING lion (fk);
 CREATE INDEX lion_src_fact_tsv ON lion_src_fact USING lion (ts, v)
 	WITH (summaries = on, summary_tids = 128);
+NOTICE:  lion index "lion_src_fact_tsv": column "ts" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_src_fact;
 ANALYZE lion_src_dim;
 SELECT lion_src('SELECT d.attr, count(*) FROM lion_src_fact f JOIN lion_src_dim d ON f.fk = d.pk WHERE f.ts >= 12000 GROUP BY d.attr');
@@ -572,6 +576,7 @@ CREATE INDEX lion_src_cf_fk ON lion_src_cf USING lion (fk);
 CREATE INDEX lion_src_cf_bfk ON lion_src_cf (fk);
 CREATE INDEX lion_src_cf_ts ON lion_src_cf USING lion (ts)
 	WITH (summaries = on, summary_tids = 1024);
+NOTICE:  lion index "lion_src_cf_ts": column "ts" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_src_cf;
 VACUUM (FREEZE, ANALYZE) lion_src_cd;
 RESET default_statistics_target;

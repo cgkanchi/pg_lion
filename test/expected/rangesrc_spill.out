@@ -156,10 +156,13 @@ SELECT i, hashint4(i) & 1048575, hashint4(i + 3) & 1048575, i % 7, i % 300,
   FROM generate_series(1, 360000) i;
 CREATE INDEX lion_rss_t_u ON lion_rss_t USING lion (u)
 	WITH (summaries = on, summary_tids = 1024);
+NOTICE:  lion index "lion_rss_t_u": column "u" has about one row per key
 CREATE INDEX lion_rss_t_r ON lion_rss_t USING lion (r)
 	WITH (summaries = on, summary_tids = 1024);
+NOTICE:  lion index "lion_rss_t_r": column "r" has about one row per key
 CREATE INDEX lion_rss_t_s ON lion_rss_t USING lion (s)
 	WITH (summaries = on, summary_tids = 1024);
+NOTICE:  lion index "lion_rss_t_s": column "s" has about one row per key
 CREATE INDEX lion_rss_t_g ON lion_rss_t USING lion (g);
 CREATE INDEX lion_rss_t_h ON lion_rss_t USING lion (h);
 CREATE INDEX lion_rss_t_a ON lion_rss_t USING lion (a);
