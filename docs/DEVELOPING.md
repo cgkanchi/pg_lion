@@ -130,6 +130,31 @@ belongs to someone else or is open to others.  The cluster runs with `wal_level 
 that index builds and the write paths of indexes created in the same transaction are WAL-logged in
 the suite as they are in production.
 
+## Changing the SQL scripts
+
+An installed extension's functions and operator classes change only through `ALTER EXTENSION
+... UPDATE`, so a change to `pg_lion--<version>.sql` (or pg_lion_citext's, or pg_lion_vector's)
+is a new version (§23, "Extension versions"):
+
+1. `git mv pg_lion--0.1.0-devN.sql pg_lion--0.1.0-devN+1.sql`, make the change there, and set
+   `default_version` in `pg_lion.control` and `provides.pg_lion.file` in META.json to match.
+2. Add `pg_lion--0.1.0-devN--0.1.0-devN+1.sql` making the same change to an installed copy:
+   `CREATE OR REPLACE FUNCTION` where the arguments and result stay the same, `DROP FUNCTION`
+   then `CREATE FUNCTION` where they or the OUT columns change, `ALTER OPERATOR FAMILY ... ADD`
+   for new strategies and support functions, `CREATE OPERATOR CLASS` for new classes, and the
+   same `COMMENT`, `GRANT` and `REVOKE`.  Never edit an upgrade script that is on main.
+3. Run the checks, which CI runs too (`.github/workflows/upgrade.yml`, on 18's packages):
+
+       ./test/upgrade/lint.py origin/main     # versions, script names, META.json, no edits to old scripts
+       make upgradecheck                      # every earlier version updated, against a fresh install
+
+   `make upgradecheck` needs the build installed, the dev cluster running, write access to the
+   installation's extension directory (it puts each old install script there during its test)
+   and the full git history.
+
+A release turns `0.1.0-devN` into `0.1.0` the same way, with an upgrade script that changes
+nothing.
+
 ## Calibrating the cost model
 
 Two scripts in `bench/calib/`, both Python's standard library and `psql`, best run on a release

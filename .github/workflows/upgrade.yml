@@ -1,0 +1,83 @@
+# The extensions' SQL versions (DESIGN.md section 23, "Extension versions"):
+#
+#   lint     test/upgrade/lint.py against the pull request's base: a change
+#            to an install script needs a new version and an upgrade script
+#            to it, upgrade scripts are never changed or removed, and the
+#            control files, the scripts and META.json agree.
+#   upgrade  test/upgrade/run.sh on PostgreSQL 18's packages: ALTER
+#            EXTENSION ... UPDATE from every earlier install script in the
+#            history, with an index on every operator class, must give the
+#            catalogs of a fresh install, and the indexes must REINDEX.
+#
+# Both need the whole history, hence fetch-depth 0.
+
+name: Extension upgrades
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upgrade-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  LION_SOCK: /tmp/lion-sock
+  LION_PORT: "55432"
+  PG: "18"
+
+jobs:
+  upgrade:
+    name: Extension versions and upgrade scripts
+    runs-on: ubuntu-24.04
+    env:
+      PG_CONFIG: .local/pg/bin/pg_config
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Lint the versions and scripts
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          case "$GITHUB_EVENT_NAME" in
+            pull_request) test/upgrade/lint.py "origin/$BASE_REF" ;;
+            push)         test/upgrade/lint.py "$BEFORE" ;;
+            *)            test/upgrade/lint.py ;;
+          esac
+
+      - name: Install PostgreSQL ${{ env.PG }} from apt.postgresql.org
+        run: |
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG" \
+            "postgresql-$PG-pgvector"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          # run.sh puts each old install script there for its test
+          sudo chown "$USER" "$(.local/pg/bin/pg_config --sharedir)/extension"
+
+      - name: Build and install
+        run: |
+          make -j4 WERROR=1
+          sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
+
+      - name: Upgrade from every earlier version
+        run: |
+          ./dev.sh reset
+          eval "$(./dev.sh env)"
+          test/upgrade/run.sh
+
+      - name: Show the update outputs
+        if: failure()
+        run: |
+          tail -n 50 test/upgrade/out/*.update test/upgrade/out/*.err 2>/dev/null || true
+          tail -n 100 .local/pg.log || true
