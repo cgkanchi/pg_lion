@@ -6103,7 +6103,8 @@ function is a filter of the leaf's scan as any other: run-time pruning could onl
 leaf, and the clause tested on its rows gives the same answer.
 
 What LionCount does with a partitioned table (above) is a different thing: it counts every leaf
-the planner keeps, as one node. The join and the walks run on one leaf, and a parent with several
+the planner keeps, as one node. Its aggregates of sliced columns (§52) are each leaf's own, added up
+in the node (§52.13). The join and the walks run on one leaf, and a parent with several
 is core's.
 
 `test/sql/ordjoin_partition.sql` runs the join and the split through both parents - the fact LIST
@@ -32714,8 +32715,9 @@ percentiles (§52.12).
   (WHERE ...)` beside the aggregates and a `HAVING` over them; a `GROUP BY` of one or two
   lion-indexed columns, an `IN` list on the grouping column driving its groups (§15), or none.
 - **Declined** (`lion_count_path_slices_ok()`): a join (the FK-side join of §27, an anti join), a
-  partitioned table (each partition would answer its own and core's partial aggregates add them
-  up, which needs the partial states of `avg` and `sum(int8)` serialized - not written), a
+  partitioned table's `GROUP BY` (each partition would answer its own and core's partial
+  aggregates add them up, which needs the partial states of `avg` and `sum(int8)` serialized - not
+  written; the one row of a partitioned table is taken, §52.13), a
   residual clause (§10: the slices would have to be counted over the rows the heap keeps), the
   aggregates over keys in the same target list (§37), `count(DISTINCT)`, the top k (§36), the
   decoded walk of §34, three grouping columns, a filtered count beside a `GROUP BY`, a coalesce
@@ -32956,14 +32958,14 @@ Batches Decoded`, `Slice Keys Decoded` and `Slice Rows Decoded` (and `Slice Rows
 `Slice Heap TIDs Rechecked` and `Slice Heap Blocks Rechecked` where the map did not vouch for a
 page.
 
-### 52.9 Not on a standby, a join or partitions
+### 52.9 Not on a standby, a join or a partitioned table's groups
 
 Restated from §52.1 because the task asked for each: on a hot standby the planner offers none of
 this (the pushdown collects nothing there, §10), and a plan made on the primary runs exact and
 slow - every slice counted beside the located sets, the descent's steps intersected again, and the
 groups a group at a time; a join (the FK-side join of §27, a semi or anti join) and a partitioned
-table are declined, the latter for want of serialized partial states for core's Finalize Agg
-(§52.12).
+table's `GROUP BY` are declined, the latter for want of serialized partial states for core's
+Finalize Agg (§52.12). A partitioned table's one row is answered (§52.13).
 
 ### 52.10 Measured
 
@@ -33061,8 +33063,8 @@ What the tables say:
   masked); the index's pages (§52.7), the bitmap scans' prices against the same index without
   slices; EXECUTE on `max(int4)` revoked, refused by the node as by core's Agg; the declines - a
   column not sliced, a float column, an expression, DISTINCT, FILTER, ORDER BY, a residual
-  clause, a join, a partitioned table, a filtered count beside a `GROUP BY`, three grouping
-  columns, a grouping expression.
+  clause, a join, a partitioned table's `GROUP BY` (its one row is answered, §52.13), a filtered
+  count beside a `GROUP BY`, three grouping columns, a grouping expression.
 - `test/isolation/slices_pushdown.spec`: the node's answers beside the same aggregates of `x + 0`,
   which only the ordinary plan computes, in one statement: a REPEATABLE READ reader across a
   writer's rows at every column's extremes, updates and deletes, committed, rolled back, and
@@ -33118,7 +33120,8 @@ What the tables say:
   slices beside its columns would answer it in one pass, if its tally did not spill (a dense tally
   of the pass's combinations, whose rows go up final), or with serialized partial states below a
   Finalize Agg.
-- **Partitioned tables, joins**: each partition answering its own needs partial states core's
+- **Partitioned tables' groups, joins** *(the one row of a partitioned table: done 2026-10-28,
+  §52.13)*: each partition answering its own needs partial states core's
   Finalize Agg can combine - `sum(int8)` and `avg` keep `internal` states, which the node would
   have to emit serialized (`int8_avg_serialize()`, `numeric_poly_serialize()`); `min`, `max` and the
   int8 sums of `sum(int2/int4)` combine as they are. The FK-side join's counts per dimension row
@@ -33140,6 +33143,76 @@ What the tables say:
 - **The slices' page estimate** (§52.7) overstates a column in heap order; an exact count would
   need the meta page to keep the slices' pages, a format change.
 - **The plane scatter** of §51.14 (build and bulk insert) is still to do.
+
+### 52.13 Partitioned tables (2026-10-28)
+
+The one row of §52.2 over a partitioned table, as one LionCount node that counts every leaf the
+planner keeps (§16):
+
+    SELECT count(b), sum(b), avg(b), min(ts), max(ts) FROM parted WHERE g = 3;
+
+      Custom Scan (LionCount)
+        Partitions: parted_1, parted_2, parted_3
+        Lion Indexes: (g = 3)
+        Aggregates From Slices: (b: every bit counted), (ts: existence counted, min descent, max descent)
+
+- **What is taken**: the aggregates, columns, `WHERE`s and switches of §52.1, with no `GROUP BY`,
+  wherever the pushdown takes the partitioned table (§16: equalities, `IN`, ranges, `OR`s and the
+  rest on lion-indexed columns of every leaf, a clause on the partition key a leaf's bounds imply
+  left out of that leaf's runs, plan-time pruning). Every live leaf must have a whole lion index
+  that slices the column at its type's width (`lion_find_sliced_index()` on the leaf, the column's
+  number translated through `lion_leaf_expr()`, `lion_count_path_slice_parts()`), each leaf its
+  own, at whatever key position and under whatever column numbering - a leaf attached with dropped
+  columns, or with an index of its own listed before the one the parent's index made. A leaf
+  without one - no index slicing the column, a partial one, an expression's - and the whole query
+  is declined (to the counts with an Agg above them, or core's plan): an aggregate over some
+  leaves' slices and others' rows would be a second executor.
+- **The plan**: member 25 (`SLICES`) keeps one index and key column a column a leaf, leaf-major
+  in `PARTS` order (`nrel × ncol`, `nrel` 1 for a table), its one-index-per-column lists
+  otherwise unchanged; `LION_PRIV_MAGIC` changed with it.
+- **The executor**: each leaf's slice indexes open with its relation and stay open for the node's
+  life, as §16 keeps every relation the node reads (`lion_open_parts()`), so a `REINDEX` of one
+  under an open cursor is refused as it is for the leaf's other indexes - where a table's opens
+  its slice index for each run. A leaf's turn (`lion_run_partition()`, or run 0 of
+  `lion_count_runs()`) locates its `WHERE`, counts it if the target list asks a count, and then
+  `lion_slice_part()` answers the leaf's aggregates as `lion_slice_column()` answers a table's -
+  C0 = E ∧ WHERE collected against the leaf's existence slice, every bit counted for a sum, the
+  descents for the extremes - before the leaf's sets are released, so that the §9 interlock is a
+  leaf's at a time as before. The answers are added up as they come (`LionSCol.tcount`, `tsum` in
+  `int128`, the least `minenc` and greatest `maxenc` of the leaves with a row, §51.1's encodings
+  being order-preserving), and after the last leaf `lion_slice_parts_end()` hands the totals to
+  `lion_slice_results()`, which builds the row as for a table: `sum(int8)`'s `numeric` and
+  `sum(int4)`'s `int8`, `avg`'s scale, NULL where no leaf had a row. A leaf with no rows, or none
+  that pass, adds nothing; a parent pruned to nothing is core's dummy rel and its one row of
+  NULLs, never this node; a leaf whose index slices the column at another type or width is an
+  error, since the planner checked every leaf.
+- **The price**: the sum of the leaves' own (§49): each leaf's runs priced as a table's
+  (`lion_count_path_price_runs()` over that leaf's target alone) and its slices by
+  `lion_cost_slice_path()` with the leaf's rows, its index's pages and its sliced ranges
+  (`lion_cost_slice_rel()`), then §39's units once over the total. Nothing else's price changed;
+  a parent pruned to one leaf is priced as that leaf named alone.
+- **EXPLAIN** names no index in `Aggregates From Slices`, as it names none in `Lion Indexes`:
+  each leaf reads its own.
+- **Not taken**: a `GROUP BY` (§52.12: core's Finalize HashAggregate combines the leaves'
+  partial groups, and `avg` and `sum(int8)` have `internal` partial states the node would have to
+  serialize; an in-node merge of every leaf's groups is what §16 removed for its memory); a clause
+  on the partition key with `enable_partition_pruning` off, or one a kept leaf's bounds do not
+  imply, which stays residual (§16, "Residual clauses over a partitioned table"); a hot standby,
+  as for a table.
+
+Tests: `test/sql/slices_partitioned.sql` compares every answer with the pushdown forced
+(sequential, bitmap and plain scans off) against the pushdown off, as multisets of text, and names
+the plan that ran it - over RANGE, LIST (a NULL partition, a default) and HASH partitioning and
+two levels of it, an empty leaf, a leaf attached with dropped and reordered columns and its own
+index, every type of the allowlist with NULLs, extremes and infinities, `int8` sums past
+`bigint`; `WHERE`s on other indexed columns, pruning by the key, the key implied, pruned to
+nothing, pruning off, a generic plan and a LATERAL rescan; a dirty heap - updates that move rows
+between leaves, deletes, this transaction's rows rolled back - and VACUUM, with `EXPLAIN ANALYZE`'s
+counters; and the declines (a leaf with an unsliced, a partial or an expression's index, a
+`GROUP BY`, a residual clause, the switch off; a REINDEX under a cursor refused).
+`test/isolation/slices_partitioned.spec` runs §52.11's snapshot checks against a parent of three
+leaves, the writer's updates moving rows between them; `slices_plan.sql`'s partitioned table now
+gets its one row from the slices and its `GROUP BY` from core.
 
 ## 53. Ranges from slices (2026-10-27)
 

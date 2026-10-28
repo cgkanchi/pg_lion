@@ -1249,7 +1249,9 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	 * The sliced columns aggregates are answered from (DESIGN.md §52): each
 	 * index and column, and which of its slices are counted against the
 	 * WHERE - every bit's and E's for a sum or an average, E's alone
-	 * otherwise - and the descents its extremes take.
+	 * otherwise - and the descents its extremes take.  A partitioned scan
+	 * names no index, as it names none in Lion Indexes: each partition reads
+	 * its own (§52.13).
 	 */
 	if (st->slice != NULL)
 	{
@@ -1261,8 +1263,10 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 			LionSCol   *col = &st->slice->col[c];
 			int			want = col->want;
 
-			appendStringInfo(&buf, "%s%s (%s: %s%s%s)", (c > 0) ? ", " : "",
+			appendStringInfo(&buf, "%s%s%s(%s: %s%s%s)", (c > 0) ? ", " : "",
+							 (st->npart > 0) ? "" :
 							 get_rel_name(col->idxoid),
+							 (st->npart > 0) ? "" : " ",
 							 lion_explain_attname(st, col->attno),
 							 (want & LION_SWANT_SUM) ?
 							 "every bit counted" : "existence counted",

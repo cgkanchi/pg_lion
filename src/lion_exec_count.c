@@ -1360,10 +1360,16 @@ lion_count_runs(LionCountScanState *st, bool sum)
 
 			/*
 			 * the aggregates of sliced columns (DESIGN.md §52), over the
-			 * WHERE's rows: run 0's, its sets still located
+			 * WHERE's rows: run 0's, its sets still located - a partition's
+			 * added to the others' (§52.13)
 			 */
 			if (r == 0 && st->slice != NULL)
-				lion_slice_run(st);
+			{
+				if (p >= 0)
+					lion_slice_part(st);
+				else
+					lion_slice_run(st);
+			}
 			/* a partition's rows are its indexes' (lion_count_report_reads()) */
 			if (p >= 0)
 				st->statrows += n;

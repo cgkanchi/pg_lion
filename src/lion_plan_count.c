@@ -483,6 +483,8 @@ typedef struct LionCountPathBuild
 } LionCountPathBuild;
 
 static void lion_try_count_path_scoped(LionCountPathBuild *cxp);
+static RelOptInfo *lion_count_first_leaf(PlannerInfo *root, RelOptInfo *rel,
+										 AttrNumber *attnos, int natts);
 
 /* Does a GROUP BY or a count(DISTINCT) of the build walk column attno? */
 static bool
@@ -2522,12 +2524,41 @@ lion_count_path_wagg(LionCountPathBuild *cx, AttrNumber attno)
 }
 
 /*
+ * The whole lion index of rel slicing column attno - the first in its
+ * list, lion_find_sliced_index()'s - and its key column and the type it
+ * slices the column as, or NULL; for a partitioned rel, its first live
+ * leaf's, attno translated through every level (lion_count_first_leaf()):
+ * what the type of the aggregates of a partitioned table's sliced column is
+ * taken from, which every partition is then held to
+ * (lion_count_path_slice_parts()).
+ */
+static IndexOptInfo *
+lion_count_sliced_index(const LionCountPathBuild *cx, AttrNumber attno,
+						AttrNumber *colp, Oid *typid)
+{
+	RelOptInfo *rel = cx->input_rel;
+
+	if (cx->partitioned)
+	{
+		AttrNumber	a = attno;
+
+		rel = lion_count_first_leaf(cx->root, rel, &a, 1);
+		if (rel == NULL || a == 0)
+			return NULL;
+		attno = a;
+	}
+	return lion_find_sliced_index(rel, attno, colp, typid);
+}
+
+/*
  * An aggregate of sliced column attno answered from its slices (DESIGN.md
  * §52), of kind skind taking the column as argtype (lion_sagg_classify()):
- * over one table, not a partitioned one, with no GROUP BY or one of one or
- * two lion-indexed columns walked by their entries, and from a whole lion
- * index that slices the column as that type (lion_find_sliced_index()).
- * Notes the column, its index and what its aggregates ask of the slices.
+ * over one table, with no GROUP BY or one of one or two lion-indexed columns
+ * walked by their entries, or over a partitioned one with no GROUP BY (§52,
+ * "Partitioned tables"), and from a whole lion index that slices the column
+ * as that type (lion_find_sliced_index(); a partitioned table's first live
+ * leaf's here, every leaf's once the partitions are known).  Notes the
+ * column, its index and what its aggregates ask of the slices.
  */
 static bool
 lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
@@ -2541,7 +2572,8 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 	int			i = 0;
 
 	if (cx->fj != NULL || cx->anti != NULL || cx->ngroup > 2 ||
-		cx->singlegroup || cx->partitioned || cx->distvar != NULL ||
+		cx->singlegroup || (cx->partitioned && cx->ngroup > 0) ||
+		cx->distvar != NULL ||
 		cx->groupcoal != NULL || cx->cells || LION_ATTNO_IS_VCOL(attno))
 		return false;
 
@@ -2562,7 +2594,7 @@ lion_count_path_sagg(LionCountPathBuild *cx, AttrNumber attno, int skind,
 		}
 		i++;
 	}
-	idx = lion_find_sliced_index(cx->input_rel, attno, &col, &typid);
+	idx = lion_count_sliced_index(cx, attno, &col, &typid);
 	if (idx == NULL || (OidIsValid(argtype) && argtype != typid))
 		return false;
 	cx->sattnos = lappend_int(cx->sattnos, (int) attno);
@@ -2598,9 +2630,84 @@ lion_count_path_slices_ok(LionCountPathBuild *cx)
 	return cx->sattnos != NIL && cx->wattnos == NIL &&
 		cx->ncompl == 0 && !cx->runtimemulti && !cx->prefixmulti &&
 		cx->residual == NIL && cx->topkn == 0 && !cx->decode &&
-		cx->distvar == NULL && cx->ngroup <= 2 && !cx->partitioned &&
+		cx->distvar == NULL && cx->ngroup <= 2 &&
+		!(cx->partitioned && cx->ngroup > 0) &&
 		(cx->ngroup == 0 || cx->nfilter == 0) &&
 		!RecoveryInProgress();
+}
+
+/*
+ * The column top numbers attno, as leaf - a partition under it, at any
+ * level - numbers it (lion_leaf_expr()), or 0 where leaf has no such
+ * column.
+ */
+static AttrNumber
+lion_count_leaf_attno(LionCountPathBuild *cx, RelOptInfo *leaf,
+					  AttrNumber attno)
+{
+	Oid			typid;
+	int32		typmod;
+	Oid			collid;
+	Node	   *n;
+
+	if (leaf == cx->input_rel)
+		return attno;
+	get_atttypetypmodcoll(cx->rte->relid, attno, &typid, &typmod, &collid);
+	n = lion_leaf_expr(cx->root,
+					   (Node *) makeVar(cx->input_rel->relid, attno, typid,
+										typmod, collid, 0),
+					   leaf, cx->input_rel);
+	n = lion_strip(n);
+	return (n != NULL && IsA(n, Var)) ? ((Var *) n)->varattno : 0;
+}
+
+/*
+ * The aggregates of sliced columns over a partitioned table (DESIGN.md §52,
+ * "Partitioned tables"): each partition the node counts answers them from
+ * its own slices, so each has to have a whole lion index that slices each
+ * column - its own first, as one table's is found (lion_find_sliced_index()),
+ * the column as that partition numbers it - and as the one type the build
+ * took from the first leaf (stypes), at that type's width: a partition that
+ * has none, or slices the column as another type (a domain's base where the
+ * others slice the column's own, say), declines the query, which then has
+ * the ordinary plan or the counts' alone.  Notes each target's indexes.
+ */
+static bool
+lion_count_path_slice_parts(LionCountPathBuild *cx)
+{
+	ListCell   *lc;
+	int			n = list_length(cx->sattnos);
+
+	if (!cx->partitioned || n == 0)
+		return true;
+	foreach(lc, cx->targets)
+	{
+		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+		ListCell   *l1;
+		ListCell   *l2;
+		int			i = 0;
+
+		t->sliceidx = (IndexOptInfo **) palloc0(sizeof(IndexOptInfo *) * n);
+		t->slicecol = (AttrNumber *) palloc0(sizeof(AttrNumber) * n);
+		forboth(l1, cx->sattnos, l2, cx->stypes)
+		{
+			AttrNumber	attno = lion_count_leaf_attno(cx, t->rel,
+													  (AttrNumber) lfirst_int(l1));
+			AttrNumber	col = 0;
+			Oid			typid = InvalidOid;
+			IndexOptInfo *idx;
+
+			if (attno == 0)
+				return false;
+			idx = lion_find_sliced_index(t->rel, attno, &col, &typid);
+			if (idx == NULL || typid != lfirst_oid(l2))
+				return false;
+			t->sliceidx[i] = idx;
+			t->slicecol[i] = col;
+			i++;
+		}
+	}
+	return true;
 }
 
 /*
@@ -4185,9 +4292,37 @@ lion_count_path_fill(LionCountPathBuild *cx)
 		forthree(l1, cx->sattnos, l2, cx->sidx, l3, cx->scols)
 		{
 			p->scol[i].attno = (AttrNumber) lfirst_int(l1);
-			p->scol[i].idxoid = ((IndexOptInfo *) lfirst(l2))->indexoid;
-			p->scol[i].idxcol = (AttrNumber) lfirst_int(l3);
+			p->scol[i].idxoid = cx->partitioned ? InvalidOid :
+				((IndexOptInfo *) lfirst(l2))->indexoid;
+			p->scol[i].idxcol = cx->partitioned ? 0 :
+				(AttrNumber) lfirst_int(l3);
 			i++;
+		}
+
+		/*
+		 * ... and a partitioned table's, each partition's own index
+		 * (lion_count_path_slice_parts()), in PARTS order
+		 */
+		if (cx->partitioned)
+		{
+			ListCell   *lc;
+			int			j = 0;
+
+			Assert(p->npart == list_length(cx->targets));
+			foreach(lc, cx->targets)
+			{
+				LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+				LionCountPrivPart *part = &p->part[j++];
+
+				part->sliceidxoid = (Oid *) palloc0(sizeof(Oid) * p->nscol);
+				part->sliceidxcol = (AttrNumber *)
+					palloc0(sizeof(AttrNumber) * p->nscol);
+				for (i = 0; i < p->nscol; i++)
+				{
+					part->sliceidxoid[i] = t->sliceidx[i]->indexoid;
+					part->sliceidxcol[i] = t->slicecol[i];
+				}
+			}
 		}
 	}
 
@@ -4539,13 +4674,13 @@ lion_count_run_plain(LionCountPathBuild *cx, int r)
  * (lion_count_run_plain()).
  */
 static List *
-lion_count_run_targets(LionCountPathBuild *cx, int r)
+lion_count_run_targets(LionCountPathBuild *cx, List *targets, int r)
 {
 	List	   *out = NIL;
 	int			nclause = list_length(cx->clauseinfos);
 	ListCell   *lc;
 
-	foreach(lc, cx->targets)
+	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
 		LionCountTarget *rt = (LionCountTarget *) palloc(sizeof(LionCountTarget));
@@ -4966,6 +5101,116 @@ lion_count_groups_batch_est(IndexOptInfo *idx)
 	return n;
 }
 
+/*
+ * The price of counting `targets` (lion_count_path_price()), on cpath:
+ * filtered counts (DESIGN.md §10, "Filtered counts") are a count of the
+ * WHERE and one of the WHERE with each filter, and the node's price is
+ * theirs added up - each filter one more intersection, or walk, with its
+ * own clauses priced into it.
+ */
+static void
+lion_count_path_price_runs(LionCountPathBuild *cx, CustomPath *cpath,
+						   List *targets, LionRangeCost *rangeprice,
+						   LionWalkSave *walksave)
+{
+	Cost		startup = 0;
+	Cost		total = 0;
+	LionRangeCost runs = {0};	/* a parallel count's, over the runs */
+	int			r;
+
+	if (cx->nfilter == 0)
+	{
+		lion_count_path_price(cx, cpath, targets, rangeprice, walksave,
+							  false);
+		return;
+	}
+	for (r = 0; r <= cx->nfilter; r++)
+	{
+		lion_count_path_price(cx, cpath,
+							  lion_count_run_targets(cx, targets, r),
+							  rangeprice, walksave,
+							  lion_count_run_plain(cx, r));
+		startup += cpath->path.startup_cost;
+		total += cpath->path.total_cost;
+		runs.countrange += rangeprice->countrange;
+		runs.whole += rangeprice->whole;
+		runs.pages += rangeprice->pages;
+		runs.reads += rangeprice->reads;
+	}
+	cpath->path.startup_cost = startup;
+	cpath->path.total_cost = total;
+	rangeprice->countrange = runs.countrange;
+	rangeprice->whole = runs.whole;
+	rangeprice->pages = runs.pages;
+	rangeprice->reads = runs.reads;
+}
+
+/*
+ * The slices' work of the aggregates of sliced columns (DESIGN.md §52) over
+ * relation t - the table, or one partition with its own indexes (§52,
+ * "Partitioned tables") - priced onto cpath's price of counting it
+ * (lion_cost_slice_path()).
+ */
+static void
+lion_cost_slice_rel(LionCountPathBuild *cx, CustomPath *cpath,
+					LionCountTarget *t)
+{
+	PlannerInfo *root = cx->root;
+	RelOptInfo *rel = cx->partitioned ? t->rel : cx->input_rel;
+	List	   *idxs = cx->sidx;
+	List	   *cols = cx->scols;
+	Cost		rangecollect = 0.0;
+
+	/* a partition's own indexes, found for it (lion_count_path_slice_parts()) */
+	if (cx->partitioned)
+	{
+		int			i;
+
+		idxs = NIL;
+		cols = NIL;
+		for (i = 0; i < list_length(cx->sattnos); i++)
+		{
+			idxs = lappend(idxs, t->sliceidx[i]);
+			cols = lappend_int(cols, (int) t->slicecol[i]);
+		}
+	}
+
+	/*
+	 * A range that bounds the sum over its entries is collected for the
+	 * aggregates' WHERE (lion_slice_where_sources()), from its entries and
+	 * summaries, as a range taken as a source is (§32).
+	 */
+	if (cx->sumall && cx->rangevar != NULL && t->driveidx[0] != NULL)
+	{
+		LionRangeMem mem = {0};
+		List	   *bounds = NIL;
+		bool		spills;
+		bool		evicts;
+		ListCell   *lc;
+
+		foreach(lc, cx->rangeclauses)
+			bounds = lappend(bounds, ((RestrictInfo *) lfirst(lc))->clause);
+		rangecollect = lion_cost_range_source(root, rel, t->driveidx[0],
+											  t->drivecol[0], bounds,
+											  cx->rangesel, &mem, &spills,
+											  &evicts);
+		list_free(bounds);
+	}
+	lion_cost_slice_path(root, cpath, rel, idxs, cols, cx->swants, rel->rows,
+						 cx->nwhere > 0 ||
+						 cx->input_rel->baserestrictinfo != NIL,
+						 cx->wcounts || cx->nfilter > 0 || cx->ngroup > 0,
+						 (cx->ngroup > 0) ? cx->numgroups : 0.0,
+						 cx->slicedecode ?
+						 lion_count_groups_batch_est(t->driveidx[0]) : 0,
+						 rangecollect);
+	if (cx->partitioned)
+	{
+		list_free(idxs);
+		list_free(cols);
+	}
+}
+
 static void
 lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 {
@@ -4990,41 +5235,8 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 
 	lion_count_skew_units(cx, &units);
 
-	/*
-	 * Filtered counts (DESIGN.md §10, "Filtered counts") are a count of the
-	 * WHERE and one of the WHERE with each filter: the node's price is theirs
-	 * added up - each filter one more intersection, or walk, with its own
-	 * clauses priced into it.
-	 */
-	if (cx->nfilter == 0)
-		lion_count_path_price(cx, cpath, cx->targets, &rangeprice, &walksave,
-							  false);
-	else
-	{
-		Cost		startup = 0;
-		Cost		total = 0;
-		LionRangeCost runs = {0};	/* a parallel count's, over the runs */
-		int			r;
-
-		for (r = 0; r <= cx->nfilter; r++)
-		{
-			lion_count_path_price(cx, cpath, lion_count_run_targets(cx, r),
-								  &rangeprice, &walksave,
-								  lion_count_run_plain(cx, r));
-			startup += cpath->path.startup_cost;
-			total += cpath->path.total_cost;
-			runs.countrange += rangeprice.countrange;
-			runs.whole += rangeprice.whole;
-			runs.pages += rangeprice.pages;
-			runs.reads += rangeprice.reads;
-		}
-		cpath->path.startup_cost = startup;
-		cpath->path.total_cost = total;
-		rangeprice.countrange = runs.countrange;
-		rangeprice.whole = runs.whole;
-		rangeprice.pages = runs.pages;
-		rangeprice.reads = runs.reads;
-	}
+	lion_count_path_price_runs(cx, cpath, cx->targets, &rangeprice,
+							   &walksave);
 
 	/*
 	 * The aggregates of sliced columns (DESIGN.md §52): their slices counted
@@ -5033,42 +5245,37 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	 * beside a GROUP BY, which counts its groups whatever the target list
 	 * says, again against each group's sets.  Every range of their plan is
 	 * collected, never walked (below).
+	 *
+	 * A partitioned table's are each partition's own, counted in its turn
+	 * against its own WHERE (§52.13): priced as the sum
+	 * of every partition's price as one table's - its count, by the same
+	 * model over that partition alone, and its slices' work over its own
+	 * pages, rows and indexes.
 	 */
-	if (cx->sattnos != NIL)
+	if (cx->sattnos != NIL && !cx->partitioned)
+		lion_cost_slice_rel(cx, cpath, first);
+	else if (cx->sattnos != NIL)
 	{
-		Cost		rangecollect = 0.0;
+		Cost		startup = 0.0;
+		Cost		total = 0.0;
+		ListCell   *lc;
 
-		/*
-		 * A range that bounds the sum over its entries is collected for the
-		 * aggregates' WHERE (lion_slice_where_sources()), from its entries
-		 * and summaries, as a range taken as a source is (§32).
-		 */
-		if (cx->sumall && cx->rangevar != NULL && first->driveidx[0] != NULL)
+		foreach(lc, cx->targets)
 		{
-			LionRangeMem mem = {0};
-			List	   *bounds = NIL;
-			bool		spills;
-			bool		evicts;
-			ListCell   *lc;
+			LionCountTarget *t = (LionCountTarget *) lfirst(lc);
+			LionRangeCost partprice;
+			LionWalkSave partsave = {0};
 
-			foreach(lc, cx->rangeclauses)
-				bounds = lappend(bounds, ((RestrictInfo *) lfirst(lc))->clause);
-			rangecollect = lion_cost_range_source(root, input_rel,
-												  first->driveidx[0],
-												  first->drivecol[0], bounds,
-												  cx->rangesel, &mem, &spills,
-												  &evicts);
-			list_free(bounds);
+			lion_count_path_price_runs(cx, cpath, list_make1(t), &partprice,
+									   &partsave);
+			list_free(partsave.clauses);
+			lion_cost_slice_rel(cx, cpath, t);
+			startup += cpath->path.startup_cost;
+			total += cpath->path.total_cost;
 		}
-		lion_cost_slice_path(root, cpath, input_rel, cx->sidx, cx->scols,
-							 cx->swants, input_rel->rows,
-							 cx->nwhere > 0 ||
-							 input_rel->baserestrictinfo != NIL,
-							 cx->wcounts || cx->nfilter > 0 || cx->ngroup > 0,
-							 (cx->ngroup > 0) ? cx->numgroups : 0.0,
-							 cx->slicedecode ?
-							 lion_count_groups_batch_est(cx->first->driveidx[0]) :
-							 0, rangecollect);
+		cpath->path.startup_cost = startup;
+		cpath->path.total_cost = total;
+		cpath->path.rows = 1.0;
 	}
 
 	/*
@@ -6057,6 +6264,9 @@ lion_try_count_path_once(LionCountPathBuild *cx)
 		return false;
 	if (!lion_count_path_targets(cx))
 		return false;
+	/* ... from every partition's own slices (§52.13) */
+	if (!lion_count_path_slice_parts(cx))
+		return false;
 
 	lion_count_path_estimate(cx);
 	lion_count_path_topk(cx);
@@ -6110,8 +6320,11 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
 	List	   *exprs;
 	ListCell   *lc;
 
-	if (!lion_enable_count_slices || cx->partitioned || cx->fj != NULL ||
+	if (!lion_enable_count_slices || cx->fj != NULL ||
 		cx->anti != NULL || cx->distinctstage || RecoveryInProgress())
+		return false;
+	/* a partitioned table's with no GROUP BY (§52.13) */
+	if (cx->partitioned && cx->parse->groupClause != NIL)
 		return false;
 	exprs = pull_var_clause((Node *) cx->output_rel->reltarget->exprs,
 							PVC_INCLUDE_AGGREGATES | PVC_RECURSE_WINDOWFUNCS |
@@ -6133,8 +6346,7 @@ lion_query_has_slice_aggs(const LionCountPathBuild *cx)
 		if (IsA(n, Aggref) &&
 			lion_sagg_classify((Aggref *) n, cx->rti, &attno,
 							   &argtype) != LION_SAGG_NONE &&
-			lion_find_sliced_index(cx->input_rel, attno, &col,
-								   &typid) != NULL)
+			lion_count_sliced_index(cx, attno, &col, &typid) != NULL)
 			return true;
 	}
 	return false;

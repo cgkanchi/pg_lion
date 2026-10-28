@@ -474,8 +474,12 @@ lion_priv_decode_wagg(List *priv, LionPrivStage stage, LionCountPriv *out)
 
 /*
  * The aggregates of bit-sliced columns answered from their slices
- * (DESIGN.md §52): three lists of one element per column, and at plan time a
- * fourth of one IntList per aggregate - {kind, column}.
+ * (DESIGN.md §52): three lists - the columns, and the index and key column
+ * of each, of every relation the node counts: the table's, or each live leaf
+ * partition's in PARTS order (§52.13), which PARTS has
+ * decoded already - and at plan time a fourth of one IntList per aggregate -
+ * {kind, column}.  A partitioned table's own index Oids stay invalid, as
+ * OIDS's do: the partitions' are in their LionCountPrivPart.
  */
 static void
 lion_priv_decode_slices(List *priv, LionPrivStage stage, LionCountPriv *out)
@@ -485,7 +489,9 @@ lion_priv_decode_slices(List *priv, LionPrivStage stage, LionCountPriv *out)
 	List	   *oids;
 	List	   *cols;
 	List	   *specs;
+	int			nrel = Max(out->npart, 1);
 	int			i;
+	int			p;
 
 	if (s == NIL)
 		return;
@@ -496,8 +502,8 @@ lion_priv_decode_slices(List *priv, LionPrivStage stage, LionCountPriv *out)
 	cols = (List *) lthird(s);
 	if (attnos == NIL || !IsA(attnos, IntList) ||
 		!lion_priv_is(oids, T_OidList) || !lion_priv_is(cols, T_IntList) ||
-		list_length(oids) != list_length(attnos) ||
-		list_length(cols) != list_length(attnos))
+		list_length(oids) != nrel * list_length(attnos) ||
+		list_length(cols) != nrel * list_length(attnos))
 		elog(ERROR, "LionCount: malformed slice aggregates");
 
 	out->nscol = list_length(attnos);
@@ -506,11 +512,38 @@ lion_priv_decode_slices(List *priv, LionPrivStage stage, LionCountPriv *out)
 	for (i = 0; i < out->nscol; i++)
 	{
 		out->scol[i].attno = (AttrNumber) list_nth_int(attnos, i);
-		out->scol[i].idxoid = list_nth_oid(oids, i);
-		out->scol[i].idxcol = (AttrNumber) list_nth_int(cols, i);
-		if (out->scol[i].attno <= 0 || !OidIsValid(out->scol[i].idxoid) ||
-			out->scol[i].idxcol < 1)
+		if (out->scol[i].attno <= 0)
 			elog(ERROR, "LionCount: malformed slice aggregates");
+	}
+	for (p = 0; p < nrel; p++)
+	{
+		LionCountPrivPart *part = (out->npart > 0) ? &out->part[p] : NULL;
+
+		if (part != NULL)
+		{
+			part->sliceidxoid = (Oid *) palloc0(sizeof(Oid) * out->nscol);
+			part->sliceidxcol = (AttrNumber *)
+				palloc0(sizeof(AttrNumber) * out->nscol);
+		}
+		for (i = 0; i < out->nscol; i++)
+		{
+			Oid			idxoid = list_nth_oid(oids, p * out->nscol + i);
+			AttrNumber	idxcol = (AttrNumber)
+				list_nth_int(cols, p * out->nscol + i);
+
+			if (!OidIsValid(idxoid) || idxcol < 1)
+				elog(ERROR, "LionCount: malformed slice aggregates");
+			if (part != NULL)
+			{
+				part->sliceidxoid[i] = idxoid;
+				part->sliceidxcol[i] = idxcol;
+			}
+			else
+			{
+				out->scol[i].idxoid = idxoid;
+				out->scol[i].idxcol = idxcol;
+			}
+		}
 	}
 
 	if (stage != LION_PRIV_STAGE_PLAN)
@@ -1339,10 +1372,21 @@ lion_priv_encode(const LionCountPriv *p, LionPrivStage stage)
 		List	   *cols = NIL;
 
 		for (i = 0; i < p->nscol; i++)
-		{
 			attnos = lappend_int(attnos, (int) p->scol[i].attno);
-			idxoids = lappend_oid(idxoids, p->scol[i].idxoid);
-			cols = lappend_int(cols, (int) p->scol[i].idxcol);
+		/* the table's indexes, or every partition's in turn (§52) */
+		for (j = 0; j < Max(p->npart, 1); j++)
+		{
+			for (i = 0; i < p->nscol; i++)
+			{
+				bool		part = (p->npart > 0);
+
+				idxoids = lappend_oid(idxoids, part ?
+									  p->part[j].sliceidxoid[i] :
+									  p->scol[i].idxoid);
+				cols = lappend_int(cols, part ?
+								   (int) p->part[j].sliceidxcol[i] :
+								   (int) p->scol[i].idxcol);
+			}
 		}
 		m = list_make3(attnos, idxoids, cols);
 		if (stage == LION_PRIV_STAGE_PLAN)
@@ -1813,17 +1857,20 @@ lion_count_priv_check(const LionCountPriv *p, bool parallel_aware,
 
 	/*
 	 * The aggregates of sliced columns from their slices (DESIGN.md §52)
-	 * are counted against the WHERE of one table collected whole: no join,
-	 * partitions, count(DISTINCT), top k, aggregates over keys, residual
-	 * clause, anti join, cells, coalesce group or expression column, no
-	 * range walked at every count, and not in parallel; one row, a count's
-	 * or a sum's, or the groups of one column's walk or two's pairs, with no
-	 * filtered counts beside them.  Their kinds need the 128-bit sums where
-	 * they sum.
+	 * are counted against the WHERE of one relation collected whole: no
+	 * join, count(DISTINCT), top k, aggregates over keys, residual clause,
+	 * anti join, cells, coalesce group or expression column, no range
+	 * walked at every count, and not in parallel; one row, a count's or a
+	 * sum's, or the groups of one column's walk or two's pairs, with no
+	 * filtered counts beside them - and over a partitioned table, the one
+	 * row alone, the partitions' answers added up by the node (§52,
+	 * "Partitioned tables").  Their kinds need the 128-bit sums where they
+	 * sum.
 	 */
 	if (p->nscol > 0)
 	{
-		if (p->hasjoin || p->npart > 0 || p->distattno != 0 ||
+		if (p->hasjoin || (p->npart > 0 && p->groupattno != 0) ||
+			p->distattno != 0 ||
 			p->topkn > 0 || p->nwcol > 0 ||
 			(p->flags & LION_FLAG_RESID) != 0 || p->hasanti ||
 			p->ncelldim > 0 || p->coalconst != NULL || parallel_aware ||

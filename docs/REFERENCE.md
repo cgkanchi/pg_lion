@@ -1044,8 +1044,11 @@ working around a bad choice:
   plane kernel's instruction set, below), `Slice Descent Steps`, `Slice Candidate Sets`, `Slice
   WHERE Copies`, `Slice Batches Decoded`, `Slice Keys Decoded`, `Slice Rows Decoded` and the heap
   rechecks of pages not all-visible. With no `WHERE` and no `GROUP BY` it competes with the
-  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. Not taken: a join, a
-  partitioned table, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
+  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. On a partitioned table
+  the one row is answered when every partition the planner keeps has a whole Lion index of its own
+  slicing the column, each partition's answers added up in the node (DESIGN.md §52.13; EXPLAIN
+  names no index there). Not taken: a join, a partitioned table's `GROUP BY` or one partition
+  without such an index, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
   expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
   column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
   aggregates over keys or to the ordinary plan.
@@ -1573,8 +1576,9 @@ Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, 
 `numeric` or `interval` - for every such column of the index or none (the option is the index's,
 not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
 from them (DESIGN.md §52), and a range on the sliced column itself (DESIGN.md §53), but not a
-percentile, a join's or a partitioned table's aggregates or ranges, nor a bitmap or plain scan's
-range. An insert into a sliced column costs a posting-set insert per set bit of its value - in
+percentile, a join's aggregates or ranges, a partitioned table's `GROUP BY` or ranges, nor a
+bitmap or plain scan's range; a partitioned table's one row is answered when every partition
+has its own index slicing the column (DESIGN.md §52.13). An insert into a sliced column costs a posting-set insert per set bit of its value - in
 place, several to a WAL record, but a posting page each (DESIGN.md §51, "Insert cost, revisited").
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so
