@@ -14,10 +14,7 @@ v_parked
         
 (1 row)
 
-step s2_evict: 
-	SELECT buffers_skipped = 0 AS all_evicted
-	  FROM pg_buffercache_evict_relation('vn_d');
-
+step s2_evict: SELECT vn_evict() AS all_evicted;
 all_evicted
 -----------
 t          
