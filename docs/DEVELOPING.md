@@ -7,23 +7,26 @@ Building, testing and finding your way around the source. Section numbers (§) r
 Builds against PostgreSQL 16, 17, 18, 19 and master (20devel); the version differences live in
 `src/lion_compat.h`.  It needs a POSIX `mmap()`: LionOrdered's set, past `hash_mem`, lives in a
 temporary file mapped into memory (`src/lion_arena.c`, DESIGN.md §30.4, "Spilling").  CI (`.github/workflows/ci.yml`) builds and tests every one of those majors on
-each push - 16 to 19 as the PGDG packages, 19 and master also built from source with assertions and
-injection points - and on every one of them runs the unit tests (as built, and under ASan and
-UBSan), the SQL regression files in `test/sql` and the isolation specs in `test/isolation` in both
-WAL modes, `make hookcheck`, and the crash-recovery/hot-standby harness (`test/recovery/run.sh`) in
-both WAL modes with `wal_consistency_checking`.  One gap is deliberate and worth knowing: what parks
-a backend on an injection point - the isolation specs that do (`grep -l injection_points
-test/isolation/*.spec`), which are the race tests of the VACUUM/count/split interlocks, and the
-harness's phases 1b-1e, 1g and 3 - needs a server configured with `--enable-injection-points` and
-the `injection_points` test module.  PostgreSQL 16 has no injection points, and the PGDG packages
-ship without the module, so CI runs those specs and phases only on its 19 and master source builds,
-where a missing module fails the job (`INJECTION_POINTS=1`); on the packages the Makefile leaves the
-specs out and says so, and the harness runs its phases 1, 1f, 2, 4 and 5.  On 16-18 the interlocks
-are covered by the same code and by those tests on the newer majors, not by a test on that major.
+each pull request - 16 to 19 as the PGDG packages (18 on arm64 too), and every one of them also
+built from source with assertions, and from 17 with injection points - and on every one of them
+runs the unit tests (as built, and under ASan and UBSan), the SQL regression files in `test/sql`
+and the isolation specs in `test/isolation` in both WAL modes, `make hookcheck`, and the
+crash-recovery/hot-standby harness (`test/recovery/run.sh`) in both WAL modes with
+`wal_consistency_checking`.  On the source builds pg_lion itself is compiled with UBSan
+(`COPT=-fsanitize=undefined -fno-sanitize-recover=all`), so the whole suite runs under it and a
+report aborts the backend that met it.  What parks a backend on an injection point - the isolation
+specs that do (`grep -l injection_points test/isolation/*.spec`), which are the race tests of the
+VACUUM/count/split interlocks, and the harness's phases 1b-1e, 1g and 3 - needs a server configured
+with `--enable-injection-points` and the `injection_points` test module.  PostgreSQL 16 has no
+injection points, and the PGDG packages ship without the module, so CI runs those specs and phases
+on its 17, 18, 19 and master source builds, where a missing module fails the job
+(`INJECTION_POINTS=1`); on 16 and the packages the Makefile leaves the specs out and says so, and
+the harness runs its phases 1, 1f, 2, 4 and 5.  The concurrent soak (`test/soak`) runs weekly on
+18's packages, and by hand from the Actions tab (`.github/workflows/soak.yml`).
 lionvec's tests need pgvector, which every job installs or builds; a failed install or build fails
 the job, and `PGVECTOR=1` keeps the Makefile and the harness from skipping them, except on 19's
 packages while apt.postgresql.org has none for a beta.  The source builds are also the only ones
-with assertions, so `debug_discard_caches` runs there (`discard_caches.sql`), and `make hookcheck`
+with assertions, so `debug_discard_caches` runs there (`discard_caches.sql`, on 16, 19 and master), and `make hookcheck`
 on 16 is where the refusal to read a lion index under `old_snapshot_threshold` is tested (16 alone
 has the setting, DESIGN.md §9).
 

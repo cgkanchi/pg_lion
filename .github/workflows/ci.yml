@@ -3,19 +3,26 @@
 #   pgdg    16, 17, 18 and 19 (beta) from apt.postgresql.org: the packaged
 #           server and postgresql-server-dev-N headers a PGXN user builds
 #           against.  Packaged servers have no injection_points module, so the
-#           Makefile skips the specs that need it and says so.
-#   source  REL_19_STABLE and master built from source with --enable-cassert
-#           and --enable-injection-points, the injection_points module and the
-#           isolation tester installed, so every isolation spec runs.  The
-#           build is cached per upstream commit.  These are also the only jobs
-#           with an assert build, so the debug_discard_caches run is here.
+#           Makefile skips the specs that need it and says so.  18 runs on
+#           arm64 as well, where the SIMD kernels' portable versions are the
+#           ones the server picks rather than fallbacks.
+#   source  REL_16_STABLE to REL_19_STABLE and master built from source with
+#           --enable-cassert and, from 17, --enable-injection-points, the
+#           injection_points module and the isolation tester installed, so
+#           every isolation spec runs.  The build is cached per upstream
+#           commit.  These are also the only jobs with an assert build, so the
+#           debug_discard_caches run is here (on 16, 19 and master: the oldest
+#           major's compatibility code and the two newest), and pg_lion is
+#           built with UndefinedBehaviorSanitizer there, so the whole suite
+#           runs under it and a report fails the step that met it.
 #   dist    make dist, META.json validated against the PGXN Meta Spec, and the
 #           archive built and tested on its own, outside the checkout.
 #
 # The injection-point specs - the race tests of the VACUUM/count/split
-# interlocks - therefore run on 19 and master only.  16 has no injection
-# points at all, and 17 and 18 would need a source build of their own
-# (PGDG ships no injection_points module); docs/DEVELOPING.md says so.
+# interlocks - therefore run on every major from 17, from source.  16 has no
+# injection points at all, and PGDG ships no injection_points module;
+# docs/DEVELOPING.md says so.  The concurrent soak (test/soak) runs weekly,
+# in soak.yml.
 #
 # The crash-recovery and hot-standby harness (test/recovery/run.sh) runs on
 # every major, in both WAL modes and with wal_consistency_checking, so that
@@ -68,12 +75,16 @@ env:
 
 jobs:
   pgdg:
-    name: PostgreSQL ${{ matrix.pg }} (PGDG packages)
-    runs-on: ubuntu-24.04
+    name: PostgreSQL ${{ matrix.pg }} (PGDG packages${{ matrix.os == 'ubuntu-24.04-arm' && ', arm64' || '' }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         pg: ["16", "17", "18", "19"]
+        os: [ubuntu-24.04]
+        include:
+          - pg: "18"
+            os: ubuntu-24.04-arm
     env:
       PG: ${{ matrix.pg }}
       PG_CONFIG: .local/pg/bin/pg_config
@@ -184,19 +195,26 @@ jobs:
           tail -n 200 test/recovery/log/*.log || true
 
   source:
-    name: PostgreSQL ${{ matrix.branch }} (source, cassert, injection points)
+    name: PostgreSQL ${{ matrix.branch }} (source, cassert${{ matrix.branch != 'REL_16_STABLE' && ', injection points' || '' }})
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
-        branch: [REL_19_STABLE, master]
+        branch: [REL_16_STABLE, REL_17_STABLE, REL_18_STABLE, REL_19_STABLE, master]
     env:
       PGPREFIX: /home/runner/pg-${{ matrix.branch }}
       PG_CONFIG: .local/pg/bin/pg_config
       # Fail rather than skip if the injection_points module is missing: the
       # Makefile then refuses to leave the injection-point specs out, and
       # test/recovery/run.sh fails instead of skipping its phases 1b-1e, 1g and 3.
-      INJECTION_POINTS: "1"
+      # 16 has no injection points, so there the specs and phases are left
+      # out on purpose (0, not unset: nothing is guessed).
+      INJECTION_POINTS: ${{ matrix.branch == 'REL_16_STABLE' && '0' || '1' }}
+      # pg_lion itself, not the server, is built with UBSan for the tests:
+      # a report aborts the backend (-fno-sanitize-recover), which fails the
+      # test that met it, and the report is in the server log the failure
+      # step prints.
+      LION_UBSAN: -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
       # The same for pgvector, which the job builds: lionvec's regression
       # files and specs, and the recovery harness's phase 5, fail rather
       # than skip without it.
@@ -226,12 +244,16 @@ jobs:
           git clone -q --depth 1 --branch "${{ matrix.branch }}" \
             https://github.com/postgres/postgres.git "$RUNNER_TEMP/postgres"
           cd "$RUNNER_TEMP/postgres"
+          inj=
+          [ "$INJECTION_POINTS" = 1 ] && inj=--enable-injection-points
           ./configure -q --prefix="$PGPREFIX" --without-icu --without-zlib --without-readline \
-            --enable-cassert --enable-debug --enable-injection-points CFLAGS="-O1 -g"
+            --enable-cassert --enable-debug $inj CFLAGS="-O1 -g"
           make -s -j4
           make -s install
           make -s -C src/test/isolation install
-          make -s -C src/test/modules/injection_points install
+          if [ "$INJECTION_POINTS" = 1 ]; then
+            make -s -C src/test/modules/injection_points install
+          fi
           make -s -C contrib install
 
       - name: Link the installation
@@ -255,6 +277,17 @@ jobs:
       - name: Build
         run: make -j4 WERROR=1
 
+      # And again with UBSan, the build the tests below run: not with
+      # WERROR, because GCC's -Warray-bounds reports false positives in code
+      # the sanitizer has instrumented (the build above has every warning
+      # an error).  The check is that the library really needs libubsan: a
+      # module that only references its symbols would not load at all.
+      - name: Build with UBSan
+        run: |
+          make clean
+          make -j4 COPT="$LION_UBSAN"
+          readelf -d pg_lion.so | grep -q 'libubsan'
+
       - name: Install
         run: make install
 
@@ -272,7 +305,7 @@ jobs:
           eval "$(./dev.sh env)"
           set -o pipefail
           make installcheck 2>&1 | tee installcheck.log
-          if grep -q 'skipping isolation specs' installcheck.log; then
+          if [ "$INJECTION_POINTS" = 1 ] && grep -q 'skipping isolation specs' installcheck.log; then
             echo "injection-point specs were skipped"; exit 1
           fi
 
@@ -290,6 +323,7 @@ jobs:
       # that is too much for two jobs, `if: matrix.branch == 'master'` halves
       # it.
       - name: discard_caches.sql with debug_discard_caches = 1 throughout
+        if: matrix.branch == 'REL_16_STABLE' || matrix.branch == 'REL_19_STABLE' || matrix.branch == 'master'
         run: |
           eval "$(./dev.sh env)"
           PGOPTIONS="-c debug_discard_caches=1" make installcheck REGRESS=discard_caches ISOLATION=
@@ -309,23 +343,20 @@ jobs:
       # redo.  The recovery harness crashes the primary under load and builds
       # a hot standby from it, which replays every record both phases write,
       # and a mismatch is a FATAL in the startup process (test/recovery/README.md).
-      # INJECTION_POINTS is the job's already; it is repeated here because
-      # these are the steps that depend on it: without it run.sh would skip
-      # the injection-point phases and still report ALL ... PASSED.
+      # These are the steps that depend on the job's INJECTION_POINTS: set
+      # to 1 (17 and later), run.sh fails rather than skip the injection-point
+      # phases and still report ALL ... PASSED; set to 0 (16) it skips them.
       - name: Crash recovery and standby replay (custom resource manager, consistency checked)
-        env:
-          INJECTION_POINTS: "1"
         run: make recovery-check-rmgr RECOVERY_PREFIX="$PGPREFIX"
 
       - name: Crash recovery and standby replay (generic WAL, consistency checked)
-        env:
-          INJECTION_POINTS: "1"
         run: ./test/recovery/run.sh --prefix "$PGPREFIX" --conf "wal_consistency_checking = 'generic'"
 
       - name: Show regression diffs
         if: failure()
         run: |
           find test -name regression.diffs -exec cat {} + || true
+          grep -h -A 30 'runtime error' .local/pg.log test/recovery/log/*.log || true
           tail -n 100 .local/pg.log || true
           tail -n 200 test/recovery/log/*.log || true
 

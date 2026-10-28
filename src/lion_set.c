@@ -263,6 +263,13 @@ lion_probe_search_key(LionState *state, LionProbe *probe, Datum key,
 	{
 		sk->eqproc = &probe->eqproc;
 		sk->cmpproc = probe->hascmp ? &probe->cmpproc : NULL;
+
+		/*
+		 * The family's cross-type proc 4 places the value; its hash, of the
+		 * search type's own function, need not be the stored key's (date and
+		 * timestamp hash apart, DESIGN.md §21), so it plays no part.
+		 */
+		sk->nohash = probe->hascmp;
 	}
 }
 

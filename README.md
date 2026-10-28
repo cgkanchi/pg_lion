@@ -111,6 +111,10 @@ Without `summaries`, a range reads every distinct value inside it, which is slow
 column. With them, lion keeps a pre-merged bitmap per block of about 4,096 rows and reads those
 instead.
 
+`date`, `timestamp` and `timestamptz` compare with one another through the index, as with a B-tree:
+`created_at >= current_date` works on a `timestamptz` column, and `now() - interval '7 days'` on a
+`timestamp` one.
+
 ### Sums, extremes and wide ranges from bit slices
 
 ```sql

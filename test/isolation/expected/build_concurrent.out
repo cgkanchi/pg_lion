@@ -1,0 +1,144 @@
+Parsed test spec with 3 sessions
+
+starting permutation: s1_begin s1_write s2_cic s1_commit s3_write s3_check s3_valid s3_verify
+step s1_begin: BEGIN;
+step s1_write: 
+	INSERT INTO lion_cic SELECT i, i % 11, i % 3 FROM generate_series(6001, 6500) i;
+	UPDATE lion_cic SET k = 100 WHERE i BETWEEN 1 AND 200;
+	DELETE FROM lion_cic WHERE i BETWEEN 201 AND 300;
+
+step s2_cic: CREATE INDEX CONCURRENTLY lion_cic_k ON lion_cic USING lion (k); <waiting ...>
+step s1_commit: COMMIT;
+step s2_cic: <... completed>
+step s3_write: 
+	INSERT INTO lion_cic SELECT i, 100, i % 3 FROM generate_series(7001, 7100) i;
+	DELETE FROM lion_cic WHERE i BETWEEN 301 AND 350;
+
+step s3_check: 
+	SELECT (SELECT count(*) FROM lion_cic WHERE k = 100) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 = 100) AS k100_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k IN (0, 3, 5)) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 IN (0, 3, 5)) AS kin_ok,
+		   (SELECT count(*) FROM lion_cic WHERE g = 1) =
+		   (SELECT count(*) FROM lion_cic WHERE g + 0 = 1) AS g1_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k = 100) AS k100;
+
+k100_ok|kin_ok|g1_ok|k100
+-------+------+-----+----
+t      |t     |t    | 300
+(1 row)
+
+step s3_valid: 
+	SELECT c.relname, i.indisvalid, i.indisready
+	  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+	 WHERE i.indrelid = 'lion_cic'::regclass AND c.relname LIKE 'lion_cic_%'
+	   AND c.relname <> 'lion_cic_pkey'
+	 ORDER BY 1;
+
+relname   |indisvalid|indisready
+----------+----------+----------
+lion_cic_g|t         |t         
+lion_cic_k|t         |t         
+(2 rows)
+
+step s3_verify: 
+	SELECT lion_index_verify('lion_cic_k', true) AS k, lion_index_verify('lion_cic_g', true) AS g;
+
+k|g
+-+-
+ | 
+(1 row)
+
+
+starting permutation: s1_begin s1_write s2_cic s1_rollback s3_check s3_valid s3_verify
+step s1_begin: BEGIN;
+step s1_write: 
+	INSERT INTO lion_cic SELECT i, i % 11, i % 3 FROM generate_series(6001, 6500) i;
+	UPDATE lion_cic SET k = 100 WHERE i BETWEEN 1 AND 200;
+	DELETE FROM lion_cic WHERE i BETWEEN 201 AND 300;
+
+step s2_cic: CREATE INDEX CONCURRENTLY lion_cic_k ON lion_cic USING lion (k); <waiting ...>
+step s1_rollback: ROLLBACK;
+step s2_cic: <... completed>
+step s3_check: 
+	SELECT (SELECT count(*) FROM lion_cic WHERE k = 100) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 = 100) AS k100_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k IN (0, 3, 5)) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 IN (0, 3, 5)) AS kin_ok,
+		   (SELECT count(*) FROM lion_cic WHERE g = 1) =
+		   (SELECT count(*) FROM lion_cic WHERE g + 0 = 1) AS g1_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k = 100) AS k100;
+
+k100_ok|kin_ok|g1_ok|k100
+-------+------+-----+----
+t      |t     |t    |   0
+(1 row)
+
+step s3_valid: 
+	SELECT c.relname, i.indisvalid, i.indisready
+	  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+	 WHERE i.indrelid = 'lion_cic'::regclass AND c.relname LIKE 'lion_cic_%'
+	   AND c.relname <> 'lion_cic_pkey'
+	 ORDER BY 1;
+
+relname   |indisvalid|indisready
+----------+----------+----------
+lion_cic_g|t         |t         
+lion_cic_k|t         |t         
+(2 rows)
+
+step s3_verify: 
+	SELECT lion_index_verify('lion_cic_k', true) AS k, lion_index_verify('lion_cic_g', true) AS g;
+
+k|g
+-+-
+ | 
+(1 row)
+
+
+starting permutation: s1_begin s1_write s2_ric s1_commit s3_write s3_check s3_valid s3_verify_g
+step s1_begin: BEGIN;
+step s1_write: 
+	INSERT INTO lion_cic SELECT i, i % 11, i % 3 FROM generate_series(6001, 6500) i;
+	UPDATE lion_cic SET k = 100 WHERE i BETWEEN 1 AND 200;
+	DELETE FROM lion_cic WHERE i BETWEEN 201 AND 300;
+
+step s2_ric: REINDEX INDEX CONCURRENTLY lion_cic_g; <waiting ...>
+step s1_commit: COMMIT;
+step s2_ric: <... completed>
+step s3_write: 
+	INSERT INTO lion_cic SELECT i, 100, i % 3 FROM generate_series(7001, 7100) i;
+	DELETE FROM lion_cic WHERE i BETWEEN 301 AND 350;
+
+step s3_check: 
+	SELECT (SELECT count(*) FROM lion_cic WHERE k = 100) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 = 100) AS k100_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k IN (0, 3, 5)) =
+		   (SELECT count(*) FROM lion_cic WHERE k + 0 IN (0, 3, 5)) AS kin_ok,
+		   (SELECT count(*) FROM lion_cic WHERE g = 1) =
+		   (SELECT count(*) FROM lion_cic WHERE g + 0 = 1) AS g1_ok,
+		   (SELECT count(*) FROM lion_cic WHERE k = 100) AS k100;
+
+k100_ok|kin_ok|g1_ok|k100
+-------+------+-----+----
+t      |t     |t    | 300
+(1 row)
+
+step s3_valid: 
+	SELECT c.relname, i.indisvalid, i.indisready
+	  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+	 WHERE i.indrelid = 'lion_cic'::regclass AND c.relname LIKE 'lion_cic_%'
+	   AND c.relname <> 'lion_cic_pkey'
+	 ORDER BY 1;
+
+relname   |indisvalid|indisready
+----------+----------+----------
+lion_cic_g|t         |t         
+(1 row)
+
+step s3_verify_g: SELECT lion_index_verify('lion_cic_g', true) AS g;
+g
+-
+ 
+(1 row)
+

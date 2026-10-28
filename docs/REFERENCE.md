@@ -177,7 +177,10 @@ One default operator class per type, reusing the hash access method's hash funct
 (`int2/int4/int8`, one family with cross-type equality), `float4/float8`, `numeric`, `bool`, `"char"`,
 `name`, `text` (and `varchar` through it), `char(n)`, `bytea`, `uuid`, `date`, `time`, `timetz`,
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
-`oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
+`oid`, and any enum. `date`, `timestamp` and `timestamptz` are one family too, as in btree, so
+`ts >= now() - interval '7 days'` on a `timestamp` column and `created_at >= current_date` on a
+`timestamptz` one use the index; a comparison with a `timestamptz` is made at the session's
+`TimeZone`, as the operator makes it. Bit slices answer only bounds of the column's own type. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
 pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type.
 
