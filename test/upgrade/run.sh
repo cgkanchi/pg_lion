@@ -157,6 +157,13 @@ for ext in $exts; do
 				indexes=$((indexes + 1))
 			fi
 		done < <(opclasses "$db" "$ext")
+		if [ $indexes -ne $i ]; then
+			echo "$tag: $((i - indexes)) of $i operator classes could not be indexed:" >&2
+			cat "$OUT/$tag.idx.err" >&2
+			unplant
+			failed=1
+			continue
+		fi
 
 		if ! $PSQL -d "$db" -c "ALTER EXTENSION $ext UPDATE" 2> "$OUT/$tag.update"; then
 			echo "$tag: ALTER EXTENSION UPDATE failed:" >&2
@@ -180,7 +187,7 @@ for ext in $exts; do
 			failed=1
 			continue
 		fi
-		echo "$tag: ok ($indexes of $i operator classes indexed$(grep -q WARNING "$OUT/$tag.update" && echo "; $(grep -c WARNING "$OUT/$tag.update") warnings, in $OUT/$tag.update"))"
+		echo "$tag: ok ($i operator classes indexed$(grep -q WARNING "$OUT/$tag.update" && echo "; $(grep -c WARNING "$OUT/$tag.update") warnings, in $OUT/$tag.update"))"
 	done
 	unset done_blobs
 done
