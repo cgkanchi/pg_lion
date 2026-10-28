@@ -9974,7 +9974,8 @@ privileges - to equal a fresh install's, and every index to REINDEX. The one dif
 is whether a class holds a member or it is loose in the family: `ALTER OPERATOR FAMILY ... ADD`
 can only add loose ones, and that only changes what `DROP OPERATOR CLASS` takes with it. A script
 for another major (before 2026-09-24 they named `hashbool()`, 18's) or naming a C function the
-library no longer has is skipped and reported; the newest earlier one must install.
+library no longer has is skipped and reported; any other install failure fails the check, and
+the newest earlier one must install.
 
 The catch-up from `0.1` (`pg_lion--0.1--0.1.0-dev1.sql`) is the one upgrade script that cannot
 know what it upgrades from: `0.1` was never released, and its script changed many times under
