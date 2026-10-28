@@ -68,6 +68,17 @@ make PG_CONFIG=/path/to/pg_config install
 CREATE EXTENSION pg_lion;
 ```
 
+After installing a newer build, bring each database's copy up to date:
+
+```sql
+ALTER EXTENSION pg_lion UPDATE;
+ALTER EXTENSION pg_lion_citext UPDATE;  -- where installed
+ALTER EXTENSION pg_lion_vector UPDATE;  -- where installed
+```
+
+Lion indexes built by an older build may then need `REINDEX`: lion refuses an index in an older
+on-disk format, with an error that says so, until it is rebuilt.
+
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 
 ```

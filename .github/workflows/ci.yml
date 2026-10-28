@@ -117,15 +117,10 @@ jobs:
           cpanm -q -n -l "$RUNNER_TEMP/perl5" PGXN::Meta::Validator
           PERL5LIB="$RUNNER_TEMP/perl5/lib/perl5" perl "$RUNNER_TEMP/perl5/bin/validate_pgxn_meta" META.json
 
-      - name: Check that the control files and META.json agree
-        run: |
-          # PGXN version X.Y.0 is extension version X.Y (DESIGN.md section 23).
-          meta=$(sed -n 's/^   "version": "\(.*\)",$/\1/p' META.json)
-          for c in pg_lion pg_lion_citext pg_lion_vector; do
-            ctl=$(sed -n "s/^default_version = '\(.*\)'$/\1/p" $c.control)
-            test "$ctl.0" = "$meta" || { echo "$c.control default_version $ctl vs META.json $meta"; exit 1; }
-            test -f "$c--$ctl.sql"
-          done
+      - name: Check that the control files, the SQL scripts and META.json agree
+        # DESIGN.md section 23, "Extension versions"; upgrade.yml also checks
+        # the scripts against the base branch and runs the upgrades.
+        run: test/upgrade/lint.py
 
       - name: Install PostgreSQL ${{ env.PG }} from apt.postgresql.org
         run: |
