@@ -742,8 +742,9 @@ lionvec_insert_readbuf(Relation index, BlockNumber blk)
 }
 
 /*
- * A CODE item, checked against the length a row of its kind has: NULL rows
- * and cosine zero vectors carry the header alone, every other row its plane.
+ * A CODE item, checked to lie inside its page (lionvec_item_inside()) and
+ * against the length a row of its kind has: NULL rows and cosine zero
+ * vectors carry the header alone, every other row its plane.
  * copies says whether the chain may hold a row's copy (LIONVEC_SPILL): it is
  * a partition's, of an index that spills.  A copy is of a row with a vector.
  */
@@ -755,7 +756,8 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	LionVecCode *code;
 	Size		len;
 
-	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) < LIONVEC_CODE_HDRSZ)
+	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) < LIONVEC_CODE_HDRSZ ||
+		!lionvec_item_inside(page, iid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed item at (%u,%u)",
@@ -788,9 +790,8 @@ lionvec_code_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
  * the TOAST place every REFINE item of the index ends with, 0 for none
  * (§44.13), of which an item uses no more.  The item's line pointer is
  * checked as lionvec_item_ok() checks a PART or REGION item's - its length,
- * then the item inside the page's data - before a line of the item is
- * prefetched or read: a corrupt offset, up to 32,767, would have those reads
- * go past the page.
+ * then the item inside the page's data (lionvec_item_inside()) - before a
+ * line of the item is prefetched or read.
  */
 LionVecRefine *
 lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
@@ -809,8 +810,7 @@ lionvec_refine_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a refine item of %u bytes at (%u,%u)",
 						RelationGetRelationName(index), ItemIdGetLength(iid), blk, off)));
-	if (ItemIdGetOffset(iid) < ((PageHeader) page)->pd_upper ||
-		(Size) ItemIdGetOffset(iid) + ItemIdGetLength(iid) > ((PageHeader) page)->pd_special)
+	if (!lionvec_item_inside(page, iid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a refine item outside its page at (%u,%u)",
@@ -853,8 +853,7 @@ lionvec_item_ok(Page page, OffsetNumber off, Size size)
 		return false;
 	iid = PageGetItemId(page, off);
 	return ItemIdIsNormal(iid) && ItemIdGetLength(iid) == size &&
-		ItemIdGetOffset(iid) >= ((PageHeader) page)->pd_upper &&
-		(Size) ItemIdGetOffset(iid) + size <= ((PageHeader) page)->pd_special;
+		lionvec_item_inside(page, iid);
 }
 
 /*
