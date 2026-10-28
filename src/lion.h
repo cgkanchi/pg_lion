@@ -2505,6 +2505,7 @@ extern LionContainer *lion_page_poschunk_fetch(Relation index, Page page,
 extern void lion_read_meta(Relation index, LionMetaPageData *meta);
 extern void lion_meta_check_version(Relation index,
 									const LionMetaPageData *meta);
+extern void lion_meta_check_page(Relation index, Buffer buf);
 extern bool lion_index_other_format(Relation index);
 
 /* ---------- AM entry points ---------- */
