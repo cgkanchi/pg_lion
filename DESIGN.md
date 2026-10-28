@@ -970,7 +970,7 @@ the last key had been hashed; the sorted build keeps one open page per level.
     Handler follows contrib/bloom in master: `static const IndexAmRoutine amroutine = {...}` returned
     with PG_RETURN_POINTER.
 
-Operator classes (in `pg_lion--0.1.sql`): one DEFAULT opclass per type, reusing the hash AM's
+Operator classes (in the install script, `pg_lion--<version>.sql`): one DEFAULT opclass per type, reusing the hash AM's
 support-1 functions and the btree AM's support-1 functions as proc 4 (§21), plus the two multi-key
 classes of §17. Generate the list from the dev cluster with
 `SELECT ... FROM pg_amproc JOIN pg_opclass ... WHERE amname='hash' AND amprocnum=1` for at least:
@@ -1679,7 +1679,7 @@ with the reference query under one snapshot while another session writes, commit
     src/lion_customscan.c     the LionCount custom scan (§10) - since split into its planner half,
                               lion_plan_*.c, and its executor half, lion_exec_*.c, which
                               lion_customscan.h joins
-    pg_lion.control, pg_lion--0.1.sql, Makefile, test/                    (am-core, then wave 2)
+    pg_lion.control, pg_lion--<version>.sql, Makefile, test/                    (am-core, then wave 2)
 
 Coding conventions: PostgreSQL C style (tabs, K&R braces on their own line for functions, /* */
 comments, `elog(ERROR, ...)` for internal errors, `ereport` with errcode for user-facing errors),
@@ -6134,7 +6134,7 @@ segments, VACUUM, the visibility-map interlock - is unchanged.
 
     strategies   1 =      2 @>      3 &&      4 <@      5 @@      17 array =      18 @@@
 
-The extraction functions are GIN's, named directly in `pg_lion--0.1.sql`:
+The extraction functions are GIN's, named directly in the install script:
 
     CREATE OPERATOR CLASS array_ops DEFAULT FOR TYPE anyarray USING lion AS
         OPERATOR 2 @> (anyarray, anyarray),
@@ -9811,12 +9811,9 @@ longer than a batch included.
     and runtime prerequisite (the minimum since eb1579e, `src/lion_compat.h`), `citext` runtime-
     recommended and test-required (only the companion needs it, and its control file's
     `requires = 'pg_lion, citext'` enforces that at CREATE EXTENSION), resources and tags.
-  - Versions: PGXN's semver `X.Y.0` is the extension version `X.Y`. The control files keep
-    `default_version = '0.1'` and `pg_lion--0.1.sql`: renaming to 0.1.0 buys nothing before a
-    first release and would break the scripts and sections that name `pg_lion--0.1.sql`
-    (bench/run_container_bits_experiment.sh, §6, §8, §17) and `ALTER EXTENSION` on existing dev
-    clusters. The next SQL change ships as `pg_lion--0.1--0.2.sql` with META.json 0.2.0; the CI
-    dist job fails if a control file's version plus `.0` differs from META.json's.
+  - Versions: see the addendum "Extension versions" below. A release's extension version is
+    META.json's semver, `0.1.0`; between releases every change to an install script is a new
+    `X.Y.Z-devN` with an upgrade script to it.
   - `make dist`: `git archive` of the committed HEAD into `pg_lion-<version>.zip` (META.json,
     README, LICENSE, DESIGN, Makefile, control and SQL files, `src/`, `test/{sql,expected,isolation,
     unit,recovery}`, `test/rmgr-check.sh`, `dev.sh`; no `.local`, bench, review evidence or build
@@ -9845,10 +9842,13 @@ longer than a batch included.
   - Publishing: a PGXN account and upload of the zip, and a README install section (`pgxn
     install pg_lion --testing` while `release_status` is testing, which is what the client needs
     to see a release that is not stable).
-  - Version scripts: from 0.2, `pg_lion--0.1--0.2.sql` upgrade paths and `ALTER EXTENSION
-    UPDATE`; format-version bumps that need REINDEX must say so in the upgrade script's NOTICE and
-    in the release notes. (The seven pre-18 opclasses of the addendum below need no repair
-    there: lionvalidate() accepts their hash functions on every major.)
+  - Version scripts: done 2026-10-28, see the addendum "Extension versions" below. Any upgrade
+    that leaves existing indexes needing REINDEX - a format-version bump, or a support function
+    or operator changed under an index, as the catch-up from 0.1 does - must say so in the
+    release notes (an upgrade script's NOTICE is not seen: the server runs extension scripts with
+    `client_min_messages` at WARNING or above). (The
+    seven pre-18 opclasses of the addendum below need no repair there: lionvalidate() accepts
+    their hash functions on every major.)
   - ~~Hook coexistence in the matrix~~ - done 2026-09-23, see "Hook coexistence" below.
 - **Citus and TimescaleDB compatibility - verified 2026-10-12 against Citus 14.2 and TimescaleDB
   2.30.2 on PostgreSQL 18.6; the findings are in the addendum "Citus and TimescaleDB" below.** These are the environments the
@@ -9941,6 +9941,63 @@ longer than a batch included.
     interval '1 day'`, the commonest range of all). The node takes any expression an index scan
     would take as a run-time key, for every clause kind and not only a range bound, and evaluates
     it once per scan beside the Params.
+
+### §23 addendum: Extension versions (2026-10-28)
+
+The SQL objects of an installed extension change only through `ALTER EXTENSION ... UPDATE`, so
+every change to an install script needs a new version name and an upgrade script that makes the
+same change to an installed copy; without one, an installed copy keeps whatever it was installed
+with (an old OUT row type, a missing function, a removed one, a class without its newer
+strategies) while the library underneath it moves on.
+
+The rules (`test/upgrade/lint.py` checks them in CI, upgrade.yml):
+
+- Each extension has one install script, `<ext>--<default_version>.sql`; older versions are
+  reached through upgrade scripts `<ext>--<from>--<to>.sql`, and a chain of them leads from every
+  version that has one to the current one.
+- `default_version` is `X.Y.Z` at a release and `X.Y.Z-devN` between releases, where `X.Y.Z` is
+  the release being prepared. META.json's `version` and each `provides.<ext>.version` are that
+  `X.Y.Z`, without the `-devN`; `provides.<ext>.file` is the install script,
+  `<ext>--<default_version>.sql`.
+- Changing an install script that the base branch has under the same version is refused: rename
+  it to the next `-devN` (`git mv`), set `default_version` and META.json's `file`, and add
+  `<ext>--<old>--<new>.sql` doing the same change with plain DDL - `CREATE OR REPLACE FUNCTION`,
+  `DROP FUNCTION` and `CREATE FUNCTION` where the arguments, the result or the OUT columns change,
+  `ALTER OPERATOR FAMILY ... ADD` for new strategies and support functions, `CREATE OPERATOR
+  CLASS` for new classes. An upgrade script, once on main, is never changed or removed.
+- A release turns `X.Y.Z-devN` into `X.Y.Z` by renaming the install script unchanged, with an
+  upgrade script between the two that holds only comments.
+
+The extensions are versioned separately: a change to pg_lion's SQL does not bump pg_lion_citext.
+
+`test/upgrade/run.sh` (also `make upgradecheck`) proves the scripts: for every version of every
+install script in the git history, it installs that script under its version, creates an index
+on every operator class it has (so that the update meets families in use), runs `ALTER EXTENSION
+UPDATE`, and requires `test/upgrade/catalog.sql`'s dump of the extension - its members, every
+function's signature, result, volatility, parallel safety, strictness, ACL and comment, every
+operator family's operators and support functions, the classes and their defaults, the initial
+privileges - to equal a fresh install's, every index to REINDEX, and the objects the update left
+in the extension's schema outside any extension to be exactly those its WARNINGs say it detached.
+The one difference it allows
+is whether a class holds a member or it is loose in the family: `ALTER OPERATOR FAMILY ... ADD`
+can only add loose ones, and that only changes what `DROP OPERATOR CLASS` takes with it. A script
+for another major (before 2026-09-24 they named `hashbool()`, 18's) or naming a C function the
+library no longer has is skipped and reported; any other install failure fails the check, and
+the newest earlier one must install.
+
+The catch-up from `0.1` (`pg_lion--0.1--0.1.0-dev1.sql`) is the one upgrade script that cannot
+know what it upgrades from: `0.1` was never released, and its script changed many times under
+that one name. It runs today's install script into a scratch schema and reconciles:
+a function whose arguments and result match is replaced in place (keeping grants and dependent
+views), any other is dropped and today's moved in; an operator family no index uses is dropped and
+today's moved in; one an index uses is brought level member by member, and a support function or
+operator its class holds that changed (array_ops' and tsvector_ops' extraction functions became
+lion's own on 2026-10-19) is switched in `pg_amproc`/`pg_amop` and `pg_depend`, since no DDL can
+replace a member a class holds. Such indexes were written in a format this build refuses anyway,
+so they are rebuilt with REINDEX after the update. A family that is gone but that indexes still
+use (`tsvector_pos_ops`, briefly in 2026-10) is detached from the extension with a WARNING rather
+than dropped with its indexes. pg_lion_citext's and pg_lion_vector's catch-ups only add what their
+scripts gained: citext_ops' strategies 6 to 10 and support function 4, and the halfvec classes.
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 
@@ -10091,7 +10148,7 @@ clusters with `shared_preload_libraries = 'pg_lion'`, over a 200k-row table with
   an ERROR. It failed cleanly, but it also broke every such database of a server that preloads
   pg_lion for rmgr mode. The lookup now returns InvalidOid there, and no index or operator
   matches; `test/sql/noextension.sql` covers it under installcheck-rmgr.
-- Upgrading from 16 or 17 to 18 or later keeps the seven opclasses that `pg_lion--0.1.sql`
+- Upgrading from 16 or 17 to 18 or later keeps the seven opclasses that the install script
   creates through `lion_create_opclass_pre18()` (bool, bytea, date, timestamptz, xid, xid8, cid)
   on their pre-18 substitute hash functions (hashchar, hashvarlena, hashint4, timestamp_hash,
   hashint8), because the dump carries the old catalog rows. The indexes are correct: the
@@ -13304,7 +13361,7 @@ So when any aggregate of the query needs the rows, every aggregate is answered o
   key").
 
 **The aggregates that add n up.** Two are wanted: one with count's answer, an int8 that is 0 over no
-rows, and one with sum's, NULL over no rows. They are the extension's own, in pg_lion--0.1.sql:
+rows, and one with sum's, NULL over no rows. They are the extension's own, in the install script:
 `lion_join_count(int8)` is `int8pl` from an initial 0, and `lion_join_sum(int8)` is `int8pl` from
 NULL (the strict transition takes the first value as its state); both combine with `int8pl` and are
 PARALLEL SAFE. Against core's `sum(int8)` with a cast back from numeric (and a `coalesce(..., 0)` for
@@ -15869,7 +15926,7 @@ descent to where that run begins and a leaf walk to where it ends.
 
 Four new strategy numbers, in btree's order and after the five §17 uses: **6 `<`, 7 `<=`, 8 `>=`,
 9 `>`** (`LION_STRAT_LT` .. `LION_STRAT_GT`; `amstrategies` 5 -> 9). They are added in place - 0.1
-is unreleased - to every SCALAR class of `pg_lion--0.1.sql` that has proc 4, and to `citext_ops`:
+is unreleased - to every SCALAR class of the install script that has proc 4, and to `citext_ops`:
 
 - `integer_ops` and `float_ops` get the four operators for every type pair they already have an
   equality and a cross-type proc 4 for (`<(int4, int8)` beside `btint48cmp`, and so on), so
@@ -22309,7 +22366,7 @@ against the sequential scan's 1.1. A fourth, the price of a partial btree's walk
 ### The operator: strategy 10, a range with a hole
 
 Strategy 10 is `<>`, added beside the range comparisons (§28) of every class and type pair that
-has them, citext's included: 36 operators in `pg_lion--0.1.sql`, one in `pg_lion_citext--0.1.sql`.
+has them, citext's included: 36 operators in the install script, one in pg_lion_citext's.
 `lionvalidate()` takes it where it takes a range, beside support function 4 for the same pair
 (`LION_STRAT_IS_WALK()`). `k <> c` is every VALUE entry of the column but c's, which is a walk of
 the column with a HOLE: a `LionRange` bound of strategy `LION_STRAT_NE` that fails the one entry

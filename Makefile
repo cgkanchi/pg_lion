@@ -45,7 +45,7 @@ OBJS = src/lion_planes.o src/lion_container.o src/lion_sparse.o src/lion_positio
 PGFILEDESC = "pg_lion - roaring bitmap inverted index"
 
 EXTENSION = pg_lion pg_lion_citext pg_lion_vector
-DATA = pg_lion--0.1.sql pg_lion_citext--0.1.sql pg_lion_vector--0.1.sql
+DATA = $(foreach e,$(EXTENSION),$(wildcard $(e)--*.sql))
 
 REGRESS = $(patsubst test/sql/%.sql,%,$(sort $(wildcard test/sql/*.sql)))
 REGRESS_OPTS = --inputdir=test --outputdir=test
@@ -343,6 +343,21 @@ installcheck-rmgr:
 hookcheck:
 	HOOKCHECK_FULL=$(if $(HOOKCHECK_FULL),$(HOOKCHECK_FULL),0) WERROR=$(if $(WERROR),$(WERROR),0) \
 		PG_CONFIG="$(PG_CONFIG)" ./test/hook-check.sh
+
+# The extensions' SQL versions (DESIGN.md §23, "Extension versions"): the
+# lint, against UPGRADE_BASE (default origin/main) when that names a commit,
+# then ALTER EXTENSION ... UPDATE from every earlier install script in the git
+# history, each against a fresh install of the current one.  Needs the build
+# installed, the dev cluster running (eval "$(./dev.sh env)"), write access to
+# the installation's extension directory, and the full git history.
+#
+#   make upgradecheck
+#   make upgradecheck UPGRADE_BASE=HEAD~1
+UPGRADE_BASE ?= origin/main
+.PHONY: upgradecheck
+upgradecheck:
+	./test/upgrade/lint.py $(shell git rev-parse -q --verify '$(UPGRADE_BASE)^{commit}' >/dev/null && echo '$(UPGRADE_BASE)')
+	PG_CONFIG="$(PG_CONFIG)" ./test/upgrade/run.sh
 
 .PHONY: recovery-check
 recovery-check:

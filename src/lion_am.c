@@ -955,7 +955,7 @@ lionoptions(Datum reloptions, bool validate)
  * no hash function of their own: their hash opclasses used a physically
  * compatible function of another type, and hashvalidate() accepted exactly
  * those pairs.  The extension script names the same functions on those
- * servers (pg_lion--0.1.sql), so the same pairs are accepted here.  They are
+ * servers (pg_lion--<version>.sql), so the same pairs are accepted here.  They are
  * accepted on EVERY major, not only below 18: pg_upgrade from 16 or 17 carries
  * the old pg_amproc rows onto an 18+ server (DESIGN.md §23 addendum), and the
  * substitutes compute the same hash as the new functions, so those indexes

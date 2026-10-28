@@ -8,19 +8,19 @@
    "provides": {
       "pg_lion": {
          "abstract": "Roaring-bitmap inverted index access method (USING lion)",
-         "file": "pg_lion--0.1.sql",
+         "file": "pg_lion--0.1.0-dev1.sql",
          "docfile": "README.md",
          "version": "0.1.0"
       },
       "pg_lion_citext": {
          "abstract": "lion operator class for citext (case-insensitive equality)",
-         "file": "pg_lion_citext--0.1.sql",
+         "file": "pg_lion_citext--0.1.0-dev1.sql",
          "docfile": "README.md",
          "version": "0.1.0"
       },
       "pg_lion_vector": {
          "abstract": "lionvec: bit-plane nearest-neighbour index for pgvector (USING lionvec)",
-         "file": "pg_lion_vector--0.1.sql",
+         "file": "pg_lion_vector--0.1.0-dev1.sql",
          "docfile": "README.md",
          "version": "0.1.0"
       }
