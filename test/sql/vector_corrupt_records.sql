@@ -19,6 +19,10 @@
 --    place, which lionvec_item_ok() checks of a PART or REGION item, and a
 --    scan read the item - its header, then its codes - from whatever memory
 --    follows the page: an offset goes up to 32,767.
+-- 4. The same of a CODE item, the NULL rows' first: lionvec_code_at()
+--    checked its length and not its place either, and VACUUM, which reads
+--    every CODE item, read the row's flags and TID from past the page.  Every
+--    item reader now asks lionvec_item_inside().
 --
 -- As in test/sql/corrupt_records.sql, the pages are damaged ON DISK and read
 -- back from there by moving the index to another tablespace, which copies
@@ -165,6 +169,22 @@ SELECT lion_vr_reread('lion_vr_i');
 SET enable_seqscan = off;
 SELECT lion_vr_try($$SELECT id FROM lion_vr ORDER BY v <-> '[7,0,1]' LIMIT 1$$);
 RESET enable_seqscan;
+DROP INDEX lion_vr_i;
+
+-- ---------- 4. a CODE item past its page ----------
+-- The NULL rows' tail's first line pointer given the block size as its
+-- offset, its length kept; VACUUM, with a row to remove, reads it.
+CREATE INDEX lion_vr_i ON lion_vr USING lionvec (v);
+SELECT lion_vr_flush('lion_vr_i');
+SELECT lion_vr_u32(lion_vr_block('lion_vr_i', 0), 72) AS lion_vr_tail \gset
+SELECT lion_vr_u32(lion_vr_block('lion_vr_i', :lion_vr_tail), 24) AS lion_vr_lpv \gset
+SELECT lion_vr_poke('lion_vr_i', :lion_vr_tail, 24,
+					lion_vr_le32(((:lion_vr_lpv >> 15) << 15) | current_setting('block_size')::int));
+SELECT lion_vr_reread('lion_vr_i');
+DELETE FROM lion_vr WHERE id = 50;
+\set VERBOSITY sqlstate
+VACUUM lion_vr;
+\set VERBOSITY terse
 DROP INDEX lion_vr_i;
 
 -- ---------- an undamaged index still works ----------
