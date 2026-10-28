@@ -184,7 +184,9 @@ typedef struct OjKeySet
 {
 	RelOptInfo *rel;
 	Var		   *keyvar;			/* its key column */
-	Path	   *path;			/* the plan the set is built from */
+	Path	   *path;			/* the plan the set is built from
+								 * (oj_keyset_feed()) */
+	double		reads;			/* ... and the pages it reads */
 	Oid			eqop;			/* the key type's equality, hashable */
 	Oid			collation;
 	Oid			clauseop;		/* the operator of the query's clause */
@@ -523,12 +525,157 @@ oj_keyset_unique(RelOptInfo *x, Var *key, Oid opno, Oid collation)
 	return false;
 }
 
+static Cost oj_feed_cold(PlannerInfo *root, Path *path, double *pages);
+
+/*
+ * The plan a key set of x is built from (DESIGN.md §47.6, "The feed"): of
+ * x's unparameterized paths, and a Gather over each of its partial ones, the
+ * cheapest at its price plus what its reads cost cold - the pages it reads
+ * outside the cache, each at what that costs over the price core's estimate
+ * gave it; *reads the pages it reads, which oj_cost() weighs against a loop's.
+ * The plan runs once, at the start, its reads its own, whatever the walk's
+ * LIMIT: core's cheapest_total_path prices them as if cached, and a bitmap
+ * heap scan that reads the whole table at random is taken over a covering
+ * walk that reads a tenth of the pages in order, and runs several times
+ * slower cold.
+ *
+ *	- a lion walk (lion_ordered_scan_reads()): its btree's pages, its set's
+ *	  lion pages and its heap fetches, at lion_units_stream_cold_page() where
+ *	  it is index-only, read in order as a bitmap heap scan's are, and at
+ *	  lion_units_cold_page() in heap mode, a synchronous read a member;
+ *	- an index scan, plain or index-only, the AM's own scan of a lion index
+ *	  among them: the index's pages its selectivity reads and the heap pages
+ *	  of its rows (index_pages_fetched(), those not all-visible where it is
+ *	  index-only), at lion_units_cold_page(), each a synchronous read;
+ *	- a bitmap heap scan (lion_units_bitmap_reads()): its heap and index
+ *	  pages, at the stream price;
+ *	- anything else - a sequential scan, which reads in order at about the
+ *	  seq_page_cost core charges it - nothing more, its reads the table's
+ *	  pages.
+ *
+ * Each under a Gather or a Gather Merge as alone, its reads the whole
+ * plan's.
+ *
+ * The plan keeps its own price (oj_cost() adds its total_cost), so the node
+ * is priced in core's units as every path of the join rel is; the cold reads
+ * only choose among x's plans.  Under pg_lion.competitor_pricing a covering
+ * walk's price carries the bitmap heap scan's cold reads already
+ * (lo_cold_price(), §39), so the plans are taken at their price alone, as
+ * core's cheapest_total_path takes them.  A disabled path is taken only
+ * where every one is.  NULL where x has no unparameterized path.
+ */
+static Path *
+oj_keyset_feed(PlannerInfo *root, RelOptInfo *x, double *reads)
+{
+	List	   *cands = NIL;
+	Path	   *best = NULL;
+	Cost		bestcost = 0.0;
+	double		bestreads = 0.0;
+	ListCell   *lc;
+
+	*reads = 0.0;
+	foreach(lc, x->pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (p->param_info == NULL)
+			cands = lappend(cands, p);
+	}
+	foreach(lc, x->partial_pathlist)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+
+		if (p->param_info == NULL && p->parallel_safe)
+			cands = lappend(cands,
+							create_gather_path(root, x, p, x->reltarget,
+											   NULL, NULL));
+	}
+	foreach(lc, cands)
+	{
+		Path	   *p = (Path *) lfirst(lc);
+		double		pages;
+		Cost		cost = p->total_cost + oj_feed_cold(root, p, &pages);
+
+		if (best == NULL ||
+#if PG_VERSION_NUM >= 180000
+			p->disabled_nodes < best->disabled_nodes ||
+			(p->disabled_nodes == best->disabled_nodes && cost < bestcost))
+#else
+			cost < bestcost)
+#endif
+		{
+			best = p;
+			bestcost = cost;
+			bestreads = pages;
+		}
+	}
+	if (best != NULL)
+		elog(DEBUG2, "lion: key set of %u fed by a path of %.2f, cold %.2f, reading %.0f pages",
+			 x->relid, best->total_cost, bestcost - best->total_cost,
+			 bestreads);
+	*reads = bestreads;
+	return best;
+}
+
+/*
+ * What a key set's plan reads cold, over its price (oj_keyset_feed()), and
+ * in *pages the pages it reads.  0 under pg_lion.competitor_pricing, whose
+ * walks' prices carry it.
+ */
+static Cost
+oj_feed_cold(PlannerInfo *root, Path *path, double *pages)
+{
+	RelOptInfo *x = path->parent;
+	Path	   *walk = path;
+	double		idxpages;
+	bool		indexonly;
+	Cost		perpage;
+	Cost		cold;
+
+	if (IsA(walk, GatherPath))
+		walk = ((GatherPath *) walk)->subpath;
+	else if (IsA(walk, GatherMergePath))
+		walk = ((GatherMergePath *) walk)->subpath;
+	if (lion_ordered_scan_reads(root, walk, pages, &idxpages, &indexonly))
+	{
+		perpage = indexonly ?
+			lion_units_stream_cold_page(root, idxpages, x->reltablespace) :
+			lion_units_cold_page(root, idxpages, x->reltablespace);
+		cold = *pages * perpage;
+	}
+	else if (IsA(walk, IndexPath))
+	{
+		IndexPath  *ip = (IndexPath *) walk;
+		double		ipages = Max((double) ip->indexinfo->pages, 1.0);
+		double		heap = 0.0;
+
+		*pages = Min(Max(ceil(ip->indexselectivity * ipages), 1.0), ipages);
+		if (ip->path.pathtype != T_IndexOnlyScan || x->allvisfrac < 1.0)
+		{
+			heap = index_pages_fetched(clamp_row_est(ip->indexselectivity *
+													 x->tuples),
+									   x->pages, ipages, root);
+			if (ip->path.pathtype == T_IndexOnlyScan)
+				heap *= 1.0 - x->allvisfrac;
+		}
+		*pages += heap;
+		cold = *pages * lion_units_cold_page(root, ipages, x->reltablespace);
+	}
+	else
+	{
+		cold = lion_units_bitmap_reads(root, path, pages);
+		if (*pages <= 0.0)
+			*pages = (double) x->pages;
+	}
+	return lion_competitor_pricing ? 0.0 : cold;
+}
+
 /*
  * May x, a table of joinrel, be folded into a key set of the join j
  * (DESIGN.md §47.6)?  Appends it to j->keysets when it may:
  *
- *	- a table with no LATERAL reference and no TABLESAMPLE, whose cheapest
- *	  path is unparameterized and carries the key;
+ *	- a table with no LATERAL reference and no TABLESAMPLE, with an
+ *	  unparameterized path (oj_keyset_feed()), whose target carries the key;
  *	- the whole inner side of a semi join - an EXISTS or an IN - whose outer
  *	  side is in the join; or in no special join at all, inner-joined, and
  *	  then its key unique among the rows its quals let through
@@ -570,6 +717,8 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	RegProcedure lhash;
 	RegProcedure rhash;
 	OjKeySet   *ks;
+	Path	   *feed;
+	double		reads;
 	double		bytes;
 	int32		width;
 	ListCell   *lc;
@@ -659,15 +808,16 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 			return false;
 	}
 
-	/* the cheapest path, with the key, and the set it makes in work_mem */
-	if (x->cheapest_total_path == NULL ||
-		x->cheapest_total_path->param_info != NULL ||
-		!oj_target_has(x->reltarget, key))
+	/* its feed, with the key, and the set it makes in work_mem */
+	if (!oj_target_has(x->reltarget, key))
+		return false;
+	feed = oj_keyset_feed(root, x, &reads);
+	if (feed == NULL)
 		return false;
 	width = get_attavgwidth(rte->relid, key->varattno);
 	if (width <= 0)
 		width = get_typavgwidth(type, key->vartypmod);
-	bytes = x->cheapest_total_path->rows *
+	bytes = feed->rows *
 		(2.0 * (sizeof(Datum) + sizeof(uint32) + sizeof(char) + 3) +
 		 (get_typbyval(type) ? 0.0 : MAXALIGN(width) + 16.0));
 	if (bytes > (double) work_mem * 1024.0)
@@ -676,11 +826,12 @@ oj_keyset_of(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	ks = (OjKeySet *) palloc0(sizeof(OjKeySet));
 	ks->rel = x;
 	ks->keyvar = key;
-	ks->path = x->cheapest_total_path;
+	ks->path = feed;
+	ks->reads = reads;
 	ks->eqop = eqop;
 	ks->collation = j->keyec->ec_collation;
 	ks->clauseop = op->opno;
-	ks->rows = clamp_row_est(x->cheapest_total_path->rows);
+	ks->rows = clamp_row_est(feed->rows);
 	j->keysets = lappend(j->keysets, ks);
 	return true;
 }
@@ -1163,10 +1314,10 @@ oj_found_share(PlannerInfo *root, OjJoin *j, double dimtuples)
  * of its own already); the node reads the fact's heap for its fetches
  * (factfetches over the whole walk, lo_cost()'s), a leaf for each descent,
  * the dimension's heap for each member, the lion index pages its sets'
- * builds read, and the key sets' tables.  Each page is charged perpage,
- * lion_units_cold_page() over core's random_page_cost in the
- * share of the tables effective_cache_size cannot hold, and the price
- * multiplied by
+ * builds read, and the pages the key sets' plans read (oj_keyset_feed()).
+ * Each page is charged perpage, lion_units_cold_page() over core's
+ * random_page_cost in the share of the tables effective_cache_size cannot
+ * hold, and the price multiplied by
  *
  *	(own + ownreads * perpage) * (core + memo) /
  *		((core + memo + corereads * perpage) * own)
@@ -1384,7 +1535,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 				index_pages_fetched(s * members, dim->pages, idxpages, root) +
 				factlionpages + ds->lionpages;
 			foreach(lc, j->keysets)
-				ownreads += (double) ((OjKeySet *) lfirst(lc))->rel->pages;
+				ownreads += ((OjKeySet *) lfirst(lc))->reads;
 
 			u.nlcold = corereads * perpage;
 			u.coldpage = perpage;
