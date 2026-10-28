@@ -582,22 +582,16 @@ the query names the parent, as `LionOrdered` and `LionBtreeScan` do (DESIGN.md �
 pruned to one leaf"); when several partitions remain, PostgreSQL plans the join.
 `pg_lion.enable_ordered_join` turns it off (DESIGN.md §47).
 
-PostgreSQL flattens explicit `JOIN`s - and the semi joins it makes of `EXISTS` and `IN` - into
-one join problem only while the result has at most `join_collapse_limit` (8 by default) items, and
+PostgreSQL flattens explicit `JOIN`s (and the semi joins it makes of `EXISTS` and `IN`) into one
+join problem only while the result has at most `join_collapse_limit` (8 by default) items, and
 pulls a subquery's `FROM` list up into its parent's only while the merged list has at most
 `from_collapse_limit` (8) items; past either, the query is planned in parts (a plain
 comma-separated `FROM` list is never split), and an `EXISTS` or `IN` may be joined above the part
-that holds the fact and the dimension. Such a table is still a key set when it is joined by the
-key and nothing else of it is wanted above: its keys are tested in the walk, and the join above
-stays and tests the rows again (DESIGN.md §47.6, "A join above"). A table the query reads another
-column of, or an `EXISTS` that tests more than the key, is a key set only when it is planned in one
-problem with the fact and the dimension. For those, raise `join_collapse_limit` and
-`from_collapse_limit` to at least the query's number of tables (for the transaction with
-`SET LOCAL`, or for a role or a function with `ALTER ... SET`); below `geqo_threshold` (12) the
-planner still searches every join order, at more planning time. Raising them is not free: the
-planner may then also join the `EXISTS`'s table early, de-duplicated, and sort the whole join,
-which is slow when it underestimates how many rows the `EXISTS` keeps (a broad filter over skewed
-keys). Set them for the queries that need them, and compare with the default. The set must also
+that holds the fact and the dimension. Such a table is still a key set: its keys are tested in the
+walk, and the join above stays and tests the rows again (DESIGN.md §47.6, "A join above"), so the
+limits need not be raised for it. Whether planned in one problem or in parts, a table is a key set
+only when it is joined by the key alone and nothing else of it is wanted: a table the query reads
+another column of, or an `EXISTS` that tests more than the key, is never one. The set must also
 fit in `work_mem`, estimated from the distinct keys the key set's table returns.
 
 When the page is ordered first by a column of the dimension with few values, and then by the
