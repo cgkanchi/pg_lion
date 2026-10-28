@@ -1,0 +1,1123 @@
+-- Aggregates of bit-sliced columns over a PARTITIONED table, answered from
+-- every partition's own slices by one LionCount node (DESIGN.md §52.13,
+-- §16): count, sum, avg, min and max of a column each leaf's lion index
+-- slices, the partitions' answers added up by the node; and ranges on such
+-- columns from each partition's slices (§53, section 6).
+-- Every answer is checked against the ordinary plan (the pushdown off), and
+-- the plan that ran it is named.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET TimeZone = 'UTC';
+SET DateStyle = 'ISO, YMD';
+/*
+ * spt_q() runs q with the lion paths preferred - every other scan disabled -
+ * then with the pushdown off, and compares the two as multisets of rows as
+ * text, so that a sum's numeric, an average's scale and a timestamp's
+ * format have to be core's to the character.  It says what the node did:
+ * answered aggregates from slices, counts only, or nothing.
+ */
+CREATE FUNCTION spt_q(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	slices boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Aggregates From Slices:' THEN
+			slices := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE spt_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE spt_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM spt_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM spt_on EXCEPT ALL SELECT * FROM spt_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM spt_off EXCEPT ALL SELECT * FROM spt_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE spt_on, spt_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s, %s rows',
+				  CASE WHEN slices THEN 'from slices'
+					   WHEN used THEN 'counts only' ELSE 'no pushdown' END,
+				  nrows);
+END $$;
+-- The plan of q with the lion paths preferred, as EXPLAIN (COSTS OFF)
+-- prints it, or EXPLAIN ANALYZE's lines of the node that depend on nothing
+-- but the data.
+CREATE FUNCTION spt_plan(q text, ana bool DEFAULT false) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	FOR ln IN EXECUTE CASE WHEN ana
+					  THEN 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF, BUFFERS OFF) '
+					  ELSE 'EXPLAIN (COSTS OFF) ' END || q LOOP
+		IF NOT ana OR
+		   ln ~ '(LionCount|Partitions|Lion Indexes|Implied by|Aggregates From Slices|Range From Slices|Slices Located|Slices Absent|Slice Counts|Slice WHERE Copies|Slice Descent Steps|Slice Range|Slice Heap)' THEN
+			RETURN NEXT regexp_replace(regexp_replace(ln, '\s+\(actual.*$', ''),
+									   '(Slice Heap (TIDs|Blocks) Rechecked): [1-9][0-9]*$', '\1: >0');
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+END $$;
+/*
+ * spt_r() is spt_q() for the ranges on sliced columns (DESIGN.md §53): q
+ * runs with a range the slices can answer answered so
+ * (pg_lion.prefer_slice_ranges), then with the pushdown off, and it says
+ * whether the node took its ranges from slices, and its aggregates.
+ */
+CREATE FUNCTION spt_r(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	sliced boolean := false;
+	aggs boolean := false;
+	nrows bigint;
+	ndiff bigint;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.prefer_slice_ranges', 'on', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Range From Slices:' THEN
+			sliced := true;
+		END IF;
+		IF ln ~ 'Aggregates From Slices:' THEN
+			aggs := true;
+		END IF;
+	END LOOP;
+	EXECUTE format('CREATE TEMP TABLE spt_on AS SELECT s::text AS r FROM (%s) s', q);
+
+	PERFORM set_config('pg_lion.prefer_slice_ranges', 'off', true);
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE format('CREATE TEMP TABLE spt_off AS SELECT s::text AS r FROM (%s) s', q);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+
+	EXECUTE 'SELECT count(*) FROM spt_on' INTO nrows;
+	EXECUTE 'SELECT (SELECT count(*) FROM (SELECT * FROM spt_on EXCEPT ALL SELECT * FROM spt_off) a)'
+			' + (SELECT count(*) FROM (SELECT * FROM spt_off EXCEPT ALL SELECT * FROM spt_on) b)'
+		INTO ndiff;
+	EXECUTE 'DROP TABLE spt_on, spt_off';
+	IF ndiff <> 0 THEN
+		RETURN format('MISMATCH: %s rows differ', ndiff);
+	END IF;
+	RETURN format('%s%s, %s rows',
+				  CASE WHEN sliced THEN 'range from slices'
+					   WHEN used THEN 'range not from slices'
+					   ELSE 'no pushdown' END,
+				  CASE WHEN aggs THEN ', aggregates from slices' ELSE '' END,
+				  nrows);
+END $$;
+-- ---------- 1. RANGE partitions, every type of the allowlist ----------
+-- Four leaves of the range on k: two of rows, one with no row, and one
+-- sub-partitioned by LIST on g (with a default); and a fifth attached with
+-- two columns dropped and the rest in another order, whose own sliced index
+-- puts the columns at other key positions than its siblings' - which the
+-- parent's index does not match, so the leaf gets the parent's too, after
+-- its own.  NULLs, negatives, the types' extremes and infinities, and int8
+-- values whose sum is far past the int8 range.
+CREATE TABLE spr (k int, g int, h int, a int2, b int4, c int8, d date,
+				  ts timestamp, tz timestamptz, pad text)
+	PARTITION BY RANGE (k);
+CREATE TABLE spr_1 PARTITION OF spr FOR VALUES FROM (0) TO (100)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spr_2 PARTITION OF spr FOR VALUES FROM (100) TO (200)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spr_empty PARTITION OF spr FOR VALUES FROM (200) TO (300)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spr_4 PARTITION OF spr FOR VALUES FROM (300) TO (400)
+	PARTITION BY LIST (g);
+CREATE TABLE spr_4a PARTITION OF spr_4 FOR VALUES IN (0, 1, 2)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spr_4b PARTITION OF spr_4 DEFAULT
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spr_5 (x1 int, tz timestamptz, ts timestamp, x2 text, d date,
+					c int8, b int4, a int2, h int, g int, k int, pad text)
+	WITH (autovacuum_enabled = off);
+ALTER TABLE spr_5 DROP COLUMN x1, DROP COLUMN x2;
+CREATE INDEX spr_5_own ON spr_5 USING lion (tz, d, c, a, b, ts) WITH (slices = on);
+ALTER TABLE spr ATTACH PARTITION spr_5 FOR VALUES FROM (400) TO (500);
+CREATE INDEX spr_g ON spr USING lion (g);
+CREATE INDEX spr_h ON spr USING lion (h);
+CREATE INDEX spr_v ON spr USING lion (a, b, c, d, ts, tz) WITH (slices = on);
+INSERT INTO spr
+SELECT CASE WHEN i % 4 = 0 THEN i % 100
+			WHEN i % 4 = 1 THEN 100 + i % 100
+			WHEN i % 4 = 2 THEN 300 + i % 100
+			ELSE 400 + i % 100 END,
+	   i % 7, i % 3,
+	   CASE WHEN i % 17 = 0 THEN NULL ELSE (i * 13) % 2001 - 1000 END,
+	   CASE WHEN i % 19 = 0 THEN NULL ELSE (i * 7919) % 200001 - 100000 END,
+	   CASE WHEN i % 23 = 0 THEN NULL
+			ELSE 4000000000000000000 + (i::int8 * 1000003) % 1000000000 END,
+	   CASE WHEN i % 29 = 0 THEN NULL ELSE date '2000-01-01' + (i * 7) % 20000 - 10000 END,
+	   CASE WHEN i % 37 = 0 THEN NULL
+			ELSE timestamp '2000-01-01' + (i * 7777) % 1000000 * interval '1 min' END,
+	   CASE WHEN i % 41 = 0 THEN NULL
+			ELSE timestamptz '2020-01-01 00:00+00' + (i * 3331) % 100000 * interval '1 s' END,
+	   repeat('x', 40)
+  FROM generate_series(1, 6000) i;
+-- the extremes, in two partitions; a row of NULLs in a third
+INSERT INTO spr VALUES
+	(5, 3, 0, -32768, -2147483648, -9223372036854775808, '-infinity',
+	 '-infinity', '-infinity', 'least'),
+	(450, 3, 1, 32767, 2147483647, 9223372036854775807, 'infinity',
+	 'infinity', 'infinity', 'greatest'),
+	(150, 3, 2, NULL, NULL, NULL, NULL, NULL, NULL, 'nulls');
+VACUUM (FREEZE, ANALYZE) spr;
+-- spr_5 has the parent's index and its own, which it lists first
+SELECT c.relname, i.indexrelid::regclass
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indrelid
+ WHERE c.relname = 'spr_5' ORDER BY i.indexrelid;
+ relname |       indexrelid        
+---------+-------------------------
+ spr_5   | spr_5_own
+ spr_5   | spr_5_g_idx
+ spr_5   | spr_5_h_idx
+ spr_5   | spr_5_a_b_c_d_ts_tz_idx
+(4 rows)
+
+-- the plans: the one row from every partition's slices, no index named
+SELECT * FROM spt_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3');
+                                  spt_plan                                  
+----------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4b, spr_5
+   Lion Indexes: (g = 3)
+   Aggregates From Slices: (b: every bit counted, min descent, max descent)
+(4 rows)
+
+SELECT * FROM spt_plan('SELECT sum(c), count(*) FROM spr');
+                           spt_plan                           
+--------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4a, spr_4b, spr_5
+   Lion Indexes: (all rows)
+   Aggregates From Slices: (c: every bit counted)
+(4 rows)
+
+SELECT * FROM spt_plan('SELECT max(tz), min(d), count(*) FROM spr WHERE h = 1 AND g IN (1, 2)');
+                                              spt_plan                                               
+-----------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4a, spr_5
+   Lion Indexes: (g = ANY ('{1,2}'::integer[])), (h = 1)
+   Aggregates From Slices: (tz: existence counted, max descent), (d: existence counted, min descent)
+(4 rows)
+
+SELECT * FROM spt_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3', true);
+                                  spt_plan                                  
+----------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4b, spr_5
+   Lion Indexes: (g = 3)
+   Aggregates From Slices: (b: every bit counted, min descent, max descent)
+   Slices Located: 392
+   Slice Counts: 388
+   Slice Descent Steps: 256
+   Slice WHERE Copies: 4
+(8 rows)
+
+-- every type, under an equality on another indexed column
+SELECT spt_q('SELECT count(a), sum(a), avg(a), min(a), max(a) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(c), sum(c), avg(c), min(c), max(c) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(d), min(d), max(d) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(ts), min(ts), max(ts) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(tz), min(tz), max(tz) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ... the answers themselves: the int8 sum is a numeric far past int8
+SELECT count(c), sum(c), avg(c), min(a), max(b), min(d), max(ts), min(tz)
+  FROM spr WHERE g = 3;
+ count |          sum           |         avg         |  min   |    max     |    min    |   max    |    min    
+-------+------------------------+---------------------+--------+------------+-----------+----------+-----------
+   822 | 3280000000409669375985 | 3990267640401057635 | -32768 | 2147483647 | -infinity | infinity | -infinity
+(1 row)
+
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(c), sum(c), avg(c), min(a), max(b), min(d), max(ts), min(tz)
+  FROM spr WHERE g = 3;
+ count |          sum           |         avg         |  min   |    max     |    min    |   max    |    min    
+-------+------------------------+---------------------+--------+------------+-----------+----------+-----------
+   822 | 3280000000409669375985 | 3990267640401057635 | -32768 | 2147483647 | -infinity | infinity | -infinity
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+-- no WHERE: every row of every partition
+SELECT spt_q('SELECT count(a), sum(a), avg(a), min(a), max(a), count(b), sum(b), avg(b), min(b), max(b) FROM spr');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(c), sum(c), avg(c), min(c), max(c), count(*) FROM spr');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(d), min(d), max(d), count(ts), min(ts), max(ts), count(tz), min(tz), max(tz) FROM spr');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- several columns at once, beside count(*) and a filtered count
+SELECT spt_q('SELECT sum(a), max(b), min(c), max(tz), count(*), count(*) FILTER (WHERE h = 1) FROM spr WHERE g <> 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- WHEREs of other shapes: IN, OR, IS NULL, a range on another column, NOT IN
+SELECT spt_q('SELECT sum(b), min(b), max(b) FROM spr WHERE g IN (1, 4, 6)');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(c), avg(a) FROM spr WHERE g = 1 OR h = 2');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(b), sum(b), max(ts) FROM spr WHERE b IS NULL OR g = 0');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(b), min(c) FROM spr WHERE a IS NOT NULL AND g = 5');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(b), max(a), count(*) FROM spr WHERE g >= 2 AND g < 5 AND h = 0');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(a), min(tz) FROM spr WHERE g NOT IN (1, 2) AND h = 1');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- an equality on the sliced column itself, and a WHERE that selects nothing
+SELECT spt_q('SELECT count(b), sum(b), min(b) FROM spr WHERE b = 2147483647');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM spr WHERE g = 99');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a HAVING over the aggregates
+SELECT spt_q('SELECT sum(b) FROM spr WHERE g = 2 HAVING sum(b) > 0');
+        spt_q        
+---------------------
+ from slices, 0 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(b) FROM spr WHERE g = 2 HAVING sum(b) < 0');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- expressions over the aggregates
+SELECT spt_q('SELECT sum(a) + 1, max(c) - min(c), avg(b) * 2 FROM spr WHERE h = 2');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ---------- 2. pruning, and what the bounds imply ----------
+-- a WHERE on the key that prunes to some partitions and to none at all (to
+-- one leaf: slices_partitioned_leaf.sql)
+SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k < 200 AND g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM spr WHERE k > 1000');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT count(b), sum(b), avg(b), min(b), max(b), count(*) FROM spr WHERE k > 1000;
+ count | sum | avg | min | max | count 
+-------+-----+-----+-----+-----+-------
+     0 |     |     |     |     |     0
+(1 row)
+
+-- the key's clause implied by the partitions kept: they are counted whole
+SELECT * FROM spt_plan('SELECT sum(b), min(tz) FROM spr WHERE k >= 300');
+                                        spt_plan                                        
+----------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_4a, spr_4b, spr_5
+   Lion Indexes: (all rows)
+   Implied by Partition Bounds: (k >= 300)
+   Aggregates From Slices: (b: every bit counted), (tz: existence counted, min descent)
+(5 rows)
+
+SELECT spt_q('SELECT sum(b), min(tz) FROM spr WHERE k >= 300');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- with plan-time pruning off, the key's clause is a residual one (§16,
+-- "Residual clauses over a partitioned table") - implied or refuted by
+-- every partition's bounds, but residual in the plan - and the slices
+-- decline a residual clause, as on one table
+SET enable_partition_pruning = off;
+SELECT spt_q('SELECT sum(b), max(c), count(*) FROM spr WHERE k < 200 AND g = 3');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+RESET enable_partition_pruning;
+-- a generic plan's parameter on another column, and on the key
+PREPARE spr_p(int) AS SELECT count(b), sum(b), min(a), max(c) FROM spr WHERE g = $1;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+EXPLAIN (COSTS OFF) EXECUTE spr_p(3);
+                                                         QUERY PLAN                                                         
+----------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4a, spr_4b, spr_5
+   Lion Indexes: (g = $1)
+   Aggregates From Slices: (b: every bit counted), (a: existence counted, min descent), (c: existence counted, max descent)
+(4 rows)
+
+EXECUTE spr_p(3);
+ count |  sum   |  min   |         max         
+-------+--------+--------+---------------------
+   814 | 230120 | -32768 | 9223372036854775807
+(1 row)
+
+EXECUTE spr_p(99);
+ count | sum | min | max 
+-------+-----+-----+-----
+     0 |     |     |    
+(1 row)
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET pg_lion.enable_plain_scan;
+RESET plan_cache_mode;
+SET pg_lion.enable_count_pushdown = off;
+EXECUTE spr_p(3);
+ count |  sum   |  min   |         max         
+-------+--------+--------+---------------------
+   814 | 230120 | -32768 | 9223372036854775807
+(1 row)
+
+EXECUTE spr_p(99);
+ count | sum | min | max 
+-------+-----+-----+-----
+     0 |     |     |    
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
+DEALLOCATE spr_p;
+-- a LATERAL value: the node rescanned, every partition again
+SELECT spt_q('SELECT v.g, s.* FROM (VALUES (1), (3), (99)) v(g),
+			  LATERAL (SELECT sum(b), min(c), max(tz) FROM spr WHERE spr.g = v.g) s');
+        spt_q        
+---------------------
+ from slices, 3 rows
+(1 row)
+
+-- ---------- 3. a dirty heap, then VACUUM ----------
+-- updates (some moving rows to another partition), deletes and inserts,
+-- not vacuumed: the rows on pages the map does not vouch for are rechecked
+-- in the heap, partition by partition
+UPDATE spr SET b = -b, c = c - 1 WHERE k % 10 = 3;
+UPDATE spr SET k = k + 100 WHERE k BETWEEN 10 AND 14;
+DELETE FROM spr WHERE k % 10 = 7;
+INSERT INTO spr (k, g, h, a, b, c, d, ts, tz)
+SELECT 300 + i % 100, i % 7, i % 3, -i, i * 1000, 9000000000000000000 - i,
+	   date '1990-01-01' + i, timestamp '1990-01-01' + i * interval '1 h',
+	   timestamptz '1990-01-01 00:00+00' + i * interval '1 h'
+  FROM generate_series(1, 300) i;
+SELECT * FROM spt_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3', true);
+                                  spt_plan                                  
+----------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4b, spr_5
+   Lion Indexes: (g = 3)
+   Aggregates From Slices: (b: every bit counted, min descent, max descent)
+   Slices Located: 392
+   Slice Counts: 388
+   Slice Descent Steps: 256
+   Slice WHERE Copies: 4
+   Slice Heap TIDs Rechecked: >0
+   Slice Heap Blocks Rechecked: >0
+(10 rows)
+
+SELECT spt_q('SELECT count(a), sum(a), avg(a), min(a), max(a) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(c), sum(c), avg(c), min(c), max(c) FROM spr');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(d), min(d), max(d), min(ts), max(tz) FROM spr WHERE h = 1');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- this transaction's own rows at the extremes, and its deletes, rolled back
+BEGIN;
+INSERT INTO spr (k, g, h, a, b, c) VALUES
+	(50, 3, 0, 32767, 2147483647, 9223372036854775807),
+	(350, 3, 0, -32768, -2147483648, -9223372036854775808);
+DELETE FROM spr WHERE g = 3 AND k >= 400;
+SELECT spt_q('SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(c), min(c), max(c) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+ROLLBACK;
+SELECT spt_q('SELECT count(a), sum(a), min(a), max(a), count(b), sum(b), min(b), max(b), sum(c), min(c), max(c) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+VACUUM (FREEZE, ANALYZE) spr;
+SELECT * FROM spt_plan('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3', true);
+                                  spt_plan                                  
+----------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spr_1, spr_2, spr_empty, spr_4b, spr_5
+   Lion Indexes: (g = 3)
+   Aggregates From Slices: (b: every bit counted, min descent, max descent)
+   Slices Located: 392
+   Slice Counts: 388
+   Slice Descent Steps: 256
+   Slice WHERE Copies: 4
+(8 rows)
+
+SELECT spt_q('SELECT count(b), sum(b), avg(b), min(b), max(b) FROM spr WHERE g = 3');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(c), sum(c), avg(c), min(c), max(c) FROM spr');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(d), min(d), max(d), min(ts), max(tz) FROM spr WHERE h = 1');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ---------- 4. LIST and HASH partitions, and two levels ----------
+-- LIST by a text key with a NULL partition and a default, and the leaves of
+-- a HASH partitioning under one of them
+CREATE TABLE spl (kind text, g int, v int4, w int8, d date)
+	PARTITION BY LIST (kind);
+CREATE TABLE spl_a PARTITION OF spl FOR VALUES IN ('a')
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_bc PARTITION OF spl FOR VALUES IN ('b', 'c')
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_null PARTITION OF spl FOR VALUES IN (NULL)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_h PARTITION OF spl FOR VALUES IN ('h') PARTITION BY HASH (g);
+CREATE TABLE spl_h0 PARTITION OF spl_h FOR VALUES WITH (MODULUS 3, REMAINDER 0)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_h1 PARTITION OF spl_h FOR VALUES WITH (MODULUS 3, REMAINDER 1)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_h2 PARTITION OF spl_h FOR VALUES WITH (MODULUS 3, REMAINDER 2)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spl_def PARTITION OF spl DEFAULT WITH (autovacuum_enabled = off);
+CREATE INDEX spl_g ON spl USING lion (g);
+CREATE INDEX spl_v ON spl USING lion (v, w, d) WITH (slices = on);
+INSERT INTO spl
+SELECT (ARRAY['a', 'b', 'c', NULL, 'h', 'h', 'z'])[1 + i % 7], i % 11,
+	   CASE WHEN i % 5 = 0 THEN NULL ELSE i * 101 - 200000 END,
+	   CASE WHEN i % 9 = 0 THEN NULL ELSE i::int8 * 2000000000000000 END,
+	   CASE WHEN i % 6 = 0 THEN NULL ELSE date '2010-01-01' + i END
+  FROM generate_series(1, 4000) i;
+VACUUM (FREEZE, ANALYZE) spl;
+SELECT * FROM spt_plan('SELECT sum(v), max(w), min(d) FROM spl WHERE g = 4');
+                                                          spt_plan                                                          
+----------------------------------------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spl_a, spl_bc, spl_h0, spl_null, spl_def
+   Lion Indexes: (g = 4)
+   Aggregates From Slices: (v: every bit counted), (w: existence counted, max descent), (d: existence counted, min descent)
+(4 rows)
+
+SELECT spt_q('SELECT count(v), sum(v), avg(v), min(v), max(v) FROM spl WHERE g = 4');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(w), sum(w), avg(w), min(w), max(w) FROM spl');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT count(d), min(d), max(d) FROM spl WHERE g IN (0, 10)');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- pruned by the key, which the partitions kept imply: the hashed ones, two
+-- lists (the NULL partition alone, and one hashed leaf through the hash key:
+-- slices_partitioned_leaf.sql)
+SELECT spt_q('SELECT sum(v), min(w), count(*) FROM spl WHERE kind = ''h''');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(v), avg(v), count(*) FROM spl WHERE kind IN (''a'', ''h'') AND g <> 4');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- ... and where a partition kept does not imply it - 'b' of the list of two,
+-- 'z' of the default - the clause on the unindexed key is tested on the
+-- rows, a residual clause, which the slices decline
+SELECT spt_q('SELECT sum(v), max(w) FROM spl WHERE kind = ''b'' AND g = 4');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(v), avg(v), count(*) FROM spl WHERE kind = ''z''');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- ---------- 5. declines ----------
+-- a partition without a lion index slicing the column: the query keeps the
+-- ordinary plan (or the counts alone), whatever the other partitions have
+CREATE TABLE spd (k int, g int, v int4, w int8) PARTITION BY RANGE (k);
+CREATE TABLE spd_1 PARTITION OF spd FOR VALUES FROM (0) TO (100);
+CREATE TABLE spd_2 PARTITION OF spd FOR VALUES FROM (100) TO (200);
+CREATE TABLE spd_3 PARTITION OF spd FOR VALUES FROM (200) TO (300);
+INSERT INTO spd SELECT i % 300, i % 5, i, i::int8 * 7 FROM generate_series(1, 3000) i;
+CREATE INDEX ON spd USING lion (g);
+CREATE INDEX ON spd_1 USING lion (v, w) WITH (slices = on);
+CREATE INDEX ON spd_2 USING lion (v, w) WITH (slices = on);
+-- spd_3: v indexed, not sliced
+CREATE INDEX ON spd_3 USING lion (v, w);
+VACUUM (FREEZE, ANALYZE) spd;
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- ... answered once pruning leaves only the partitions that slice it
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2 AND k < 200');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a partial sliced index is no index for the slices, as on one table
+CREATE INDEX ON spd_3 USING lion (v, w) WITH (slices = on) WHERE g < 3;
+ANALYZE spd;
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- nor one over an expression of the column
+CREATE INDEX ON spd_3 USING lion ((v + 0), (w + 0)) WITH (slices = on);
+ANALYZE spd;
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- a whole one is, its columns in another order than its siblings'
+CREATE INDEX ON spd_3 USING lion (w, v) WITH (slices = on);
+ANALYZE spd;
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+SELECT spt_q('SELECT sum(v), avg(w), min(v), max(w), count(*) FROM spd');
+        spt_q        
+---------------------
+ from slices, 1 rows
+(1 row)
+
+-- a GROUP BY over a partitioned table is not answered from slices (its
+-- groups go up as partial aggregates; an average or an int8 sum would need
+-- serialized partial states)
+SELECT spt_q('SELECT g, sum(v), max(w) FROM spd GROUP BY g');
+        spt_q        
+---------------------
+ no pushdown, 5 rows
+(1 row)
+
+-- a residual clause, as on one table
+SELECT spt_q('SELECT sum(v) FROM spd WHERE g = 2 AND w % 3 = 0');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+-- the switch
+SET pg_lion.enable_count_slices = off;
+SELECT spt_q('SELECT sum(v), max(w) FROM spd WHERE g = 2');
+        spt_q        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+RESET pg_lion.enable_count_slices;
+-- a cursor over the one row: the partitions' indexes stay open, so a
+-- REINDEX of one of them under it is refused as core refuses it
+BEGIN;
+SET LOCAL enable_seqscan = off;
+SET LOCAL enable_bitmapscan = off;
+SET LOCAL pg_lion.enable_plain_scan = off;
+DECLARE spd_c CURSOR FOR SELECT sum(v), max(w) FROM spd WHERE g = 2;
+FETCH spd_c;
+  sum   |  max  
+--------+-------
+ 899700 | 20979
+(1 row)
+
+REINDEX INDEX spd_1_v_w_idx;
+ERROR:  cannot REINDEX INDEX "spd_1_v_w_idx" because it is being used by active queries in this session
+ROLLBACK;
+-- ---------- 6. ranges from slices (DESIGN.md §53) ----------
+-- A range on a sliced column as a source of the count, from each
+-- partition's own slices: RANGE partitions, one of them sub-partitioned by
+-- LIST, one with no row, one attached with a column dropped and the rest in
+-- another order; the partition key k sliced too, so that a range on it is
+-- one the partitions' bounds imply in some and not in others.
+CREATE TABLE spq (k int, g int, v int4, w int8, d date, ts timestamptz)
+	PARTITION BY RANGE (k);
+CREATE TABLE spq_1 PARTITION OF spq FOR VALUES FROM (0) TO (100)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spq_2 PARTITION OF spq FOR VALUES FROM (100) TO (200)
+	PARTITION BY LIST (g);
+CREATE TABLE spq_2a PARTITION OF spq_2 FOR VALUES IN (0, 1, 2, 3)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spq_2b PARTITION OF spq_2 DEFAULT
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spq_empty PARTITION OF spq FOR VALUES FROM (200) TO (300)
+	WITH (autovacuum_enabled = off);
+CREATE TABLE spq_4 (x int, ts timestamptz, d date, w int8, v int4, g int, k int)
+	WITH (autovacuum_enabled = off);
+ALTER TABLE spq_4 DROP COLUMN x;
+ALTER TABLE spq ATTACH PARTITION spq_4 FOR VALUES FROM (300) TO (400);
+CREATE INDEX spq_g ON spq USING lion (g);
+CREATE INDEX spq_v ON spq USING lion (k, v, w, d, ts) WITH (slices = on);
+INSERT INTO spq
+SELECT CASE WHEN i % 3 = 0 THEN i % 100 WHEN i % 3 = 1 THEN 100 + i % 100
+			ELSE 300 + i % 100 END,
+	   i % 7,
+	   CASE WHEN i % 13 = 0 THEN NULL ELSE (i * 7919) % 100003 - 50000 END,
+	   CASE WHEN i % 11 = 0 THEN NULL
+			ELSE (i::int8 * 1000003) % 2000000000000 - 1000000000000 END,
+	   CASE WHEN i % 17 = 0 THEN NULL ELSE date '2000-01-01' + (i * 37) % 9000 END,
+	   CASE WHEN i % 19 = 0 THEN NULL
+			ELSE timestamptz '2020-01-01 00:00+00' + (i * 3331) % 100000 * interval '1 min' END
+  FROM generate_series(1, 6000) i;
+INSERT INTO spq VALUES
+	(5, 3, -2147483648, -9223372036854775808, '-infinity', '-infinity'),
+	(350, 3, 2147483647, 9223372036854775807, 'infinity', 'infinity');
+VACUUM (FREEZE, ANALYZE) spq;
+SET pg_lion.prefer_slice_ranges = on;
+SELECT * FROM spt_plan('SELECT count(*) FROM spq WHERE v > 1000');
+                       spt_plan                        
+-------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spq_1, spq_2a, spq_2b, spq_empty, spq_4
+   Lion Indexes: (v > 1000)
+   Range From Slices: v > 1000 (32 slices)
+(4 rows)
+
+SELECT * FROM spt_plan('SELECT count(*), sum(w), max(ts) FROM spq WHERE g = 3 AND v BETWEEN -20000 AND 30000');
+                                        spt_plan                                        
+----------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spq_1, spq_2a, spq_empty, spq_4
+   Lion Indexes: (v >= '-20000'::integer AND v <= 30000), (g = 3)
+   Range From Slices: v >= '-20000'::integer AND v <= 30000 (32 slices)
+   Aggregates From Slices: (w: every bit counted), (ts: existence counted, max descent)
+(5 rows)
+
+SELECT * FROM spt_plan('SELECT count(*) FROM spq WHERE k > 50 AND k < 350 AND v <> 17');
+                                           spt_plan                                           
+----------------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spq_1, spq_2a, spq_2b, spq_empty, spq_4
+   Lion Indexes: (k > 50 AND k < 350), (v <> 17)
+   Range From Slices: k > 50 AND k < 350 (32 slices), v <> 17 (32 slices)
+   Implied by Partition Bounds: (k > 50) in 4 of 5 partitions, (k < 350) in 4 of 5 partitions
+(5 rows)
+
+SELECT * FROM spt_plan('SELECT count(*) FROM spq WHERE v > 1000', true);
+                       spt_plan                        
+-------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spq_1, spq_2a, spq_2b, spq_empty, spq_4
+   Lion Indexes: (v > 1000)
+   Range From Slices: v > 1000 (32 slices)
+   Slice Range Descents: 5
+   Slice Range Keys: 4
+   Slice Range Steps: 110
+(7 rows)
+
+RESET pg_lion.prefer_slice_ranges;
+-- each type, alone and beside other clauses, in an OR's arm
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 1000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v >= -50000 AND v < 0');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE w <= 0');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE d BETWEEN ''2005-01-01'' AND ''2015-12-31''');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE ts < ''2020-02-01 00:00+00''');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE g = 3 AND v BETWEEN -20000 AND 30000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE g IN (1, 5) AND v > 0 AND w < 500000000000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v <> 17');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v <> 17 AND v > -1000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE g = 1 OR ts < ''2020-01-10 00:00+00''');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+-- bounds of another integer type, crossed, and past the type's range
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 100::int8 AND w > 5::int4');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 10 AND v < 5');
+        spt_r        
+---------------------
+ no pushdown, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 3000000000::int8');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE v >= -2147483648');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+-- on the partition key: implied by some partitions' bounds, by every one's,
+-- pruned to some
+SELECT spt_r('SELECT count(*) FROM spq WHERE k > 50 AND k < 350');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE k > 50 AND k < 350 AND v <> 17');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE k >= 0 AND v > 5');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE k >= 300 AND v > 5');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+-- per group: the counts' partial groups, under a range from slices
+SELECT spt_r('SELECT g, count(*) FROM spq WHERE v > 1000 GROUP BY g');
+           spt_r           
+---------------------------
+ range from slices, 7 rows
+(1 row)
+
+-- with the aggregates of sliced columns (§52.13), of the range's own column
+-- and of others
+SELECT spt_r('SELECT sum(v), min(v), max(v), count(*) FROM spq WHERE v > 1000');
+                       spt_r                       
+---------------------------------------------------
+ range from slices, aggregates from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT sum(w), avg(w), max(ts), count(v) FROM spq WHERE g = 2 AND v BETWEEN -1000 AND 40000');
+                       spt_r                       
+---------------------------------------------------
+ range from slices, aggregates from slices, 1 rows
+(1 row)
+
+-- a generic plan's bounds, a NULL among them
+PREPARE spq_p(int, int) AS
+	SELECT count(*), sum(w) FROM spq WHERE v BETWEEN $1 AND $2;
+SET plan_cache_mode = force_generic_plan;
+SET enable_seqscan = off;
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
+SET pg_lion.prefer_slice_ranges = on;
+EXPLAIN (COSTS OFF) EXECUTE spq_p(0, 1);
+                      QUERY PLAN                       
+-------------------------------------------------------
+ Custom Scan (LionCount)
+   Partitions: spq_1, spq_2a, spq_2b, spq_empty, spq_4
+   Lion Indexes: (v >= $1 AND v <= $2)
+   Range From Slices: v >= $1 AND v <= $2 (32 slices)
+   Aggregates From Slices: (w: every bit counted)
+(5 rows)
+
+EXECUTE spq_p(-1000, 40000);
+ count |        sum        
+-------+-------------------
+  2275 | -2059803105409372
+(1 row)
+
+EXECUTE spq_p(NULL, 40000);
+ count | sum 
+-------+-----
+     0 |    
+(1 row)
+
+RESET pg_lion.prefer_slice_ranges;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET enable_seqscan;
+RESET plan_cache_mode;
+SELECT count(*), sum(w) FROM spq WHERE v BETWEEN -1000 AND 40000;
+ count |        sum        
+-------+-------------------
+  2275 | -2059803105409372
+(1 row)
+
+DEALLOCATE spq_p;
+-- a dirty heap - updates moving rows between partitions, deletes, inserts
+-- at the extremes - and then VACUUM
+UPDATE spq SET k = k + 100, v = -v WHERE k < 100 AND g = 2;
+DELETE FROM spq WHERE g = 4 AND k >= 300;
+INSERT INTO spq VALUES (150, 4, 2147483647, NULL, NULL, NULL),
+	(390, 6, -2147483648, 1, '2010-01-01', '2020-01-01 00:00+00');
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 1000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*), sum(w) FROM spq WHERE g = 2 AND v < 0');
+                       spt_r                       
+---------------------------------------------------
+ range from slices, aggregates from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spq WHERE k > 50 AND k < 350 AND v <> 17');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+VACUUM spq;
+SELECT spt_r('SELECT count(*) FROM spq WHERE v > 1000');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*), sum(w) FROM spq WHERE g = 2 AND v < 0');
+                       spt_r                       
+---------------------------------------------------
+ range from slices, aggregates from slices, 1 rows
+(1 row)
+
+-- declines: a partition whose index for the column does not slice it, until
+-- pruning leaves it out; the switch
+CREATE TABLE spqd (k int, g int, v int4) PARTITION BY RANGE (k);
+CREATE TABLE spqd_1 PARTITION OF spqd FOR VALUES FROM (0) TO (100);
+CREATE TABLE spqd_2 PARTITION OF spqd FOR VALUES FROM (100) TO (200);
+INSERT INTO spqd SELECT i % 200, i % 5, i * 3 FROM generate_series(1, 2000) i;
+CREATE INDEX ON spqd USING lion (g);
+CREATE INDEX ON spqd_1 USING lion (v) WITH (slices = on);
+CREATE INDEX ON spqd_2 USING lion (v);
+VACUUM ANALYZE spqd;
+SELECT spt_r('SELECT count(*) FROM spqd WHERE g = 1 AND v > 1000');
+             spt_r             
+-------------------------------
+ range not from slices, 1 rows
+(1 row)
+
+SELECT spt_r('SELECT count(*) FROM spqd WHERE g = 1 AND v > 1000 AND k < 100');
+           spt_r           
+---------------------------
+ range from slices, 1 rows
+(1 row)
+
+SET pg_lion.enable_slice_ranges = off;
+SELECT spt_r('SELECT count(*) FROM spq WHERE g = 3 AND v > 1000');
+             spt_r             
+-------------------------------
+ range not from slices, 1 rows
+(1 row)
+
+RESET pg_lion.enable_slice_ranges;
+DROP TABLE spr, spl, spd, spq, spqd;
+DROP FUNCTION spt_q(text), spt_r(text), spt_plan(text, bool);

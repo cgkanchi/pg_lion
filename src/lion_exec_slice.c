@@ -327,7 +327,9 @@ lion_slice_column(LionCountScanState *st, LionSCol *col, int ngset,
 	int			n;
 	int			g;
 
-	idx = index_open(col->idxoid, AccessShareLock);
+	/* a partition's is open for the node's life (lion_open_parts()) */
+	idx = (col->idx != NULL) ? col->idx :
+		index_open(col->idxoid, AccessShareLock);
 	state = lion_index_column_state(idx, col->idxcol);
 	if (!state->sliced || lion_slice_type_nbits(state->typid) != state->slicebits)
 		elog(ERROR, "LionCount: key column %d of lion index \"%s\" is not sliced",
@@ -438,7 +440,8 @@ done:
 	/* a read of the index's slices (pg_stat_user_indexes) */
 	pgstat_count_index_scan(idx);
 	pgstat_count_index_tuples(idx, col->count);
-	index_close(idx, AccessShareLock);
+	if (col->idx == NULL)
+		index_close(idx, AccessShareLock);
 }
 
 /* Every column's answers, and so every aggregate's: see the callers. */
@@ -487,6 +490,124 @@ lion_slice_run(LionCountScanState *st)
 }
 
 /*
+ * THE ONE ROW OF A PARTITIONED TABLE (DESIGN.md §52.13).
+ * The node counts each live leaf partition in its turn (§16), its WHERE
+ * located in it, so the partitions' answers are added up here as their
+ * turns come - nothing like a partial aggregate goes up: every column's rows
+ * with a value counted, their 128-bit sums added, the least of their least
+ * encodings and the greatest of their greatest kept - and the one row is
+ * made of the totals once the last partition has had its turn, as the one
+ * row of a table is made of its own (lion_slice_results()).  An encoding
+ * orders as the values do (§51.1), and every partition's index slices the
+ * column as one type at one width, which the planner chose them for and
+ * which is checked again here.  A partition whose WHERE selects nothing, or
+ * whose column has no row not NULL, adds nothing: a table of such
+ * partitions, or of none, answers 0 and NULLs, as core's aggregates do over
+ * no row.
+ */
+void
+lion_slice_parts_begin(LionCountScanState *st)
+{
+	LionSliceState *ss = st->slice;
+	int			c;
+
+	Assert(ss != NULL && st->npart > 0);
+	MemoryContextReset(ss->cxt);
+	for (c = 0; c < ss->ncol; c++)
+	{
+		LionSCol   *col = &ss->col[c];
+
+		col->tcount = 0;
+#ifdef HAVE_INT128
+		col->tsum = 0;
+#endif
+		col->tminenc = 0;
+		col->tmaxenc = 0;
+		col->ttypid = InvalidOid;
+		col->tnbits = 0;
+	}
+	ss->parts = true;
+	ss->runs++;
+}
+
+/*
+ * The answers of the partition whose turn it is, its WHERE located now
+ * (lion_locate_where()) and its sets still pinned, added to the totals.
+ */
+void
+lion_slice_part(LionCountScanState *st)
+{
+	LionSliceState *ss = st->slice;
+	MemoryContext runcxt;
+	MemoryContext oldcxt;
+	int			c;
+
+	Assert(ss != NULL && ss->parts && st->located);
+	if (st->wheremissing)
+		return;
+	runcxt = AllocSetContextCreate(CurrentMemoryContext,
+								   "LionCount slice aggregates run",
+								   ALLOCSET_DEFAULT_SIZES);
+	oldcxt = MemoryContextSwitchTo(runcxt);
+	for (c = 0; c < ss->ncol; c++)
+	{
+		LionSCol   *col = &ss->col[c];
+
+		CHECK_FOR_INTERRUPTS();
+		if (col->idx == NULL)
+			elog(ERROR, "LionCount: a partition without the index of a sliced column");
+		lion_slice_column(st, col, 0, NULL);
+		if (col->tnbits != 0 &&
+			(col->typid != col->ttypid || col->nbits != col->tnbits))
+			elog(ERROR, "LionCount: the partitions slice column %d as different types",
+				 (int) col->attno);
+		col->ttypid = col->typid;
+		col->tnbits = col->nbits;
+		if (col->count <= 0)
+			continue;
+#ifdef HAVE_INT128
+		col->tsum += col->sum;
+#endif
+		if (col->tcount == 0 || col->minenc < col->tminenc)
+			col->tminenc = col->minenc;
+		if (col->tcount == 0 || col->maxenc > col->tmaxenc)
+			col->tmaxenc = col->maxenc;
+		col->tcount += col->count;
+	}
+	MemoryContextSwitchTo(oldcxt);
+	MemoryContextDelete(runcxt);
+}
+
+/* ... and the one row's answers, from the totals of every partition. */
+void
+lion_slice_parts_end(LionCountScanState *st)
+{
+	LionSliceState *ss = st->slice;
+	int			c;
+
+	Assert(ss != NULL && ss->parts);
+	for (c = 0; c < ss->ncol; c++)
+	{
+		LionSCol   *col = &ss->col[c];
+
+		col->count = col->tcount;
+#ifdef HAVE_INT128
+		col->sum = col->tsum;
+#endif
+		col->minenc = col->tminenc;
+		col->maxenc = col->tmaxenc;
+		if (col->tnbits != 0)
+		{
+			col->typid = col->ttypid;
+			col->nbits = col->tnbits;
+		}
+	}
+	ss->parts = false;
+	MemoryContextReset(ss->cxt);
+	lion_slice_results(st);
+}
+
+/*
  * A group's answers (DESIGN.md §52, "GROUP BY"): of the rows of gsets[] - the
  * group's set, located by the walk with its pin, or a pair's two (§20) - that
  * the WHERE keeps.  Called once the group's count has found it a row, and
@@ -529,7 +650,8 @@ lion_slice_column_batch(LionCountScanState *st, LionSCol *col, int n,
 	int			i;
 	int			g;
 
-	idx = index_open(col->idxoid, AccessShareLock);
+	idx = (col->idx != NULL) ? col->idx :
+		index_open(col->idxoid, AccessShareLock);
 	state = lion_index_column_state(idx, col->idxcol);
 	if (!state->sliced || lion_slice_type_nbits(state->typid) != state->slicebits)
 		elog(ERROR, "LionCount: key column %d of lion index \"%s\" is not sliced",
@@ -584,7 +706,8 @@ lion_slice_column_batch(LionCountScanState *st, LionSCol *col, int n,
 	lion_slice_agg_end(&sa);
 
 	pgstat_count_index_scan(idx);
-	index_close(idx, AccessShareLock);
+	if (col->idx == NULL)
+		index_close(idx, AccessShareLock);
 }
 
 /*
