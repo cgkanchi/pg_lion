@@ -998,12 +998,18 @@ oj_search_relids(PlannerInfo *root)
 {
 	List	   *initial;
 	Relids		relids = NULL;
+	GeqoPrivateData *geqo;
 	ListCell   *lc;
 
+#if PG_VERSION_NUM >= 190000
+	geqo = (Geqo_planner_extension_id >= 0) ? GetGeqoPrivateData(root) : NULL;
+#else
+	geqo = (GeqoPrivateData *) root->join_search_private;
+#endif
 	if (root->join_rel_level != NULL)
 		initial = root->join_rel_level[1];
-	else if (root->join_search_private != NULL)
-		initial = ((GeqoPrivateData *) root->join_search_private)->initial_rels;
+	else if (geqo != NULL)
+		initial = geqo->initial_rels;
 	else
 		return NULL;
 	foreach(lc, initial)
