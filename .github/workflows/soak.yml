@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       duration:
-        description: Seconds of load per WAL mode
+        description: Seconds of load per WAL mode (at most 5400)
         default: "600"
 
 permissions:
@@ -38,8 +38,22 @@ jobs:
   soak:
     name: Soak (PostgreSQL 18, both WAL modes)
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # Two modes of at most 90 minutes each, one after the other
+    # (test/soak/modes.sh), and the setup.
+    timeout-minutes: 210
     steps:
+      - name: Check the duration
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '600' }}
+        run: |
+          case "$SOAK_DURATION" in
+            ''|*[!0-9]*) echo "duration must be a whole number of seconds, not '$SOAK_DURATION'" >&2; exit 1 ;;
+          esac
+          if [ "$SOAK_DURATION" -gt 5400 ]; then
+            echo "duration $SOAK_DURATION is over 5400 seconds a mode: both modes would not finish inside the job's time limit" >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
 
       - name: Install PostgreSQL ${{ env.PG }} from apt.postgresql.org

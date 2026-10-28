@@ -15907,11 +15907,26 @@ reserved NULL (and EMPTY) entries are never in one.
 ### Cross-type date and timestamp (2026-10-28)
 
 `date_ops`, `timestamp_ops` and `timestamptz_ops` are one family, `datetime_ops`, as in btree, with
-all six cross-type pairs: `=`, the four comparisons and `<>`, and core's own proc 4 for each
-(`date_cmp_timestamp`, `timestamp_cmp_timestamptz` and the rest). So the commonest dashboard
-filters reach the column's index where they used to go to the heap: `ts >= now() - interval '7
-days'` on a `timestamp` column (a timestamptz bound), `created_at >= current_date` on a
-`timestamptz` one (a date bound), `d = timestamp '...'`. The index compares a key with the value
+five of btree's six cross-type pairs: `=`, the four comparisons and `<>`, and core's own proc 4 for
+each (`date_cmp_timestamp`, `timestamptz_cmp_timestamp` and the rest). So the commonest dashboard
+filters reach the column's index where they used to go to the heap: `created_at >= current_date`
+on a `timestamptz` column (a date bound), `tz >= localtimestamp - interval '7 days'` (a timestamp
+bound), `ts >= current_date - 7` on a `timestamp` one, `d = timestamp '...'`.
+
+The pair left out is a `timestamp` KEY against a `timestamptz` value (`ts >= now()`), because its
+comparison is not monotonic in the key. `timestamp_cmp_timestamptz` turns the key into an instant
+at the session's `TimeZone`, and a local time a DST change skips is taken at the offset before the
+change: in New York 2026-03-08 02:30 is 07:30 UTC while 03:00 is 07:00 UTC, so the key that sorts
+first compares later. A descent by that comparison lands in the wrong place, and a walk that ends
+at the first key past a bound stops before keys that still match; with the pair in the family, an
+equality probe at 03:00-04 found one of the two matching rows. btree's `datetime_ops` has the pair
+and the same fault (PostgreSQL's B-tree gives wrong answers on the same data), but lion's rule is
+the sequential scan's answer, so the clause stays a filter. The other direction is safe: a
+`timestamptz` key against a `timestamp` value converts the VALUE once, and the keys are instants
+in order already; a date converts to the instant of its first moment, which never goes backwards
+from one day to the next. Keeping the pair would need a lookup that tests every key within the
+largest UTC offset (about 16 hours) of the value with the operator itself, and trusts the order
+only outside that window; that is not built. The index compares a key with the value
 exactly as the operator does, since proc 4 IS the operator's comparison; where one side is
 timestamptz that comparison reads the session's `TimeZone`, which is why those operators are
 STABLE, and a scan evaluates them at run time as btree's does (`test/sql/datetime_crosstype.sql`
