@@ -131,6 +131,7 @@ SELECT i,
 	   (i::bigint * 7919 % 400000)::int
   FROM generate_series(1, 400000) i;
 CREATE INDEX ogn_u ON ogn USING lion (u);
+NOTICE:  lion index "ogn_u": column "u" has about one row per key
 CREATE INDEX ogn_g ON ogn USING lion (g);
 CREATE INDEX ogn_tags ON ogn USING lion (tags);
 CREATE INDEX ogn_k ON ogn (k, id);
@@ -419,6 +420,7 @@ SELECT i,
 	   repeat('x', 1900)
   FROM generate_series(1, 16640) i;
 CREATE INDEX og_u ON og USING lion (u) WITH (summaries = 'on', summary_tids = '64');
+NOTICE:  lion index "og_u": column "u" has about one row per key
 CREATE INDEX og_k ON og (k, id);
 VACUUM (FREEZE, ANALYZE) og;
 SELECT pg_relation_size('og') / 8192 / 64 AS keys;

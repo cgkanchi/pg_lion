@@ -3360,6 +3360,50 @@ lion_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 
 #endif							/* PG_VERSION_NUM >= 170000 */
 
+/*
+ * One NOTICE naming the scalar key columns with about one row per key: such a
+ * column costs a directory entry per row - a header, the key and a posting
+ * set of one TID, more than a B-tree's index tuple for the same key - and its
+ * entries are most of the directory every lookup in the index descends.  A
+ * column can be one in each partition of a partitioned table when it is not
+ * in the whole table.  Only
+ * from LION_NEAR_UNIQUE_MIN_ROWS rows, where the bytes matter, and only a
+ * notice: the index is built either way, and a FK-side join (DESIGN.md §27)
+ * needs the key in a lion index.
+ */
+#define LION_NEAR_UNIQUE_MIN_ROWS	10000
+
+static void
+lion_build_notice_near_unique(Relation index, const LionIndexState *ix,
+							  const uint64 *nvalues, uint64 rows)
+{
+	TupleDesc	desc = RelationGetDescr(index);
+	StringInfoData cols;
+	int			ncols = 0;
+	int			i;
+
+	if (rows < LION_NEAR_UNIQUE_MIN_ROWS)
+		return;
+	initStringInfo(&cols);
+	for (i = 0; i < ix->ncolumns; i++)
+	{
+		if (ix->cols[i].multikey || nvalues[i] * 2 <= rows)
+			continue;
+		appendStringInfo(&cols, "%s\"%s\"", ncols > 0 ? ", " : "",
+						 NameStr(TupleDescAttr(desc, i)->attname));
+		ncols++;
+	}
+	if (ncols > 0)
+		ereport(NOTICE,
+				(errmsg_plural("lion index \"%s\": column %s has about one row per key",
+							   "lion index \"%s\": columns %s have about one row per key",
+							   ncols, RelationGetRelationName(index), cols.data),
+				 errdetail("Over " UINT64_FORMAT " rows, each key takes a directory entry of its own.",
+						   rows),
+				 errhint("A B-tree indexes such a column in less space; leave it out of the lion index unless a lion join needs it there.")));
+	pfree(cols.data);
+}
+
 IndexBuildResult *
 lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -3520,6 +3564,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	if (bs.max_entries > 0 && bs.ndistinct > (int64) bs.max_entries)
 		lion_warn_max_entries(index, bs.ndistinct);
+	lion_build_notice_near_unique(index, &bs.ix, bs.nvalues, bs.rows);
 
 	if (bs.spool != NULL)
 		lion_spool_end(bs.spool);

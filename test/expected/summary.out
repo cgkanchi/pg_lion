@@ -98,10 +98,12 @@ SELECT i, i, (i * 7919) % 9001, i % 7,
 -- small buckets, so that twenty thousand rows make hundreds of them
 CREATE INDEX lion_sm_urg ON lion_sm USING lion (u, r, g)
 	WITH (summaries = on, summary_tids = 32);
+NOTICE:  lion index "lion_sm_urg": column "u" has about one row per key
 CREATE INDEX lion_sm_k ON lion_sm USING lion (k)
 	WITH (summaries = on, summary_tids = 64);
 CREATE INDEX lion_sm_t ON lion_sm USING lion (t)
 	WITH (summaries = on, summary_tids = 48);
+NOTICE:  lion index "lion_sm_t": column "t" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_sm;
 -- every ordered scalar column got summaries, and they hold every row with a
 -- value; the NULL rows are in none
@@ -904,6 +906,7 @@ INSERT INTO lion_sm_p SELECT i, i % 3 FROM generate_series(0, 19999) i;
 CREATE INDEX lion_sm_p1_i ON lion_sm_p1 USING lion (u, g) WITH (summaries = on, summary_tids = 32);
 CREATE INDEX lion_sm_p2_i ON lion_sm_p2 USING lion (u, g);
 CREATE INDEX lion_sm_p3_i ON lion_sm_p3 USING lion (u, g) WITH (summaries = on, summary_tids = 100);
+NOTICE:  lion index "lion_sm_p3_i": column "u" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_sm_p;
 SELECT lion_sm('SELECT count(*) FROM lion_sm_p WHERE u >= 100');
             lion_sm             
@@ -929,6 +932,7 @@ INSERT INTO lion_sm_ts
 SELECT '2025-01-01 00:00:00+00'::timestamptz + i * interval '1 minute', i % 50
   FROM generate_series(1, 30000) i;
 CREATE INDEX lion_sm_ts_i ON lion_sm_ts USING lion (ts, c) WITH (summaries = auto);
+NOTICE:  lion index "lion_sm_ts_i": column "ts" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_sm_ts;
 SELECT attno, summary_entries > 0 AS has FROM lion_index_stats('lion_sm_ts_i');
  attno | has 

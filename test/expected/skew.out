@@ -270,6 +270,7 @@ SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
 
 -- a unique column: one row, as core has it
 CREATE INDEX lsw_fact_id ON lsw_fact USING lion (id);
+NOTICE:  lion index "lsw_fact_id": column "id" has about one row per key
 SELECT relid, attnum, rows, keyrows
   FROM lsw_skew_rows('SELECT d.id, (SELECT count(*) FROM lsw_fact f WHERE f.id = d.id AND f.doc @@ $$a1 & b2$$::tsquery) FROM lsw_dim d WHERE d.grp = 1');
   relid   | attnum | rows | keyrows 

@@ -33,6 +33,7 @@ SELECT i,
   FROM generate_series(1, 60000) i;
 CREATE INDEX lol_l ON lol USING lion (a, g, b, n);
 CREATE INDEX lol_ts ON lol USING lion (ts);
+NOTICE:  lion index "lol_ts": column "ts" has about one row per key
 CREATE INDEX lol_tags ON lol USING lion (tags);
 CREATE INDEX lol_k ON lol (k, id);
 VACUUM (FREEZE, ANALYZE) lol;

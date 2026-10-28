@@ -92,6 +92,7 @@ CREATE INDEX lion_rs_k ON lion_rs USING lion (k);
 CREATE INDEX lion_rs_t ON lion_rs USING lion (t);
 CREATE INDEX lion_rs_g ON lion_rs USING lion (g);
 CREATE INDEX lion_rs_u ON lion_rs USING lion (u);
+NOTICE:  lion index "lion_rs_u": column "u" has about one row per key
 VACUUM (FREEZE, ANALYZE) lion_rs;
 -- ---------- 1. full domain: the range covers every key ----------
 -- the NULL rows of k are not counted; nothing is summed at all

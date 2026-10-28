@@ -130,6 +130,7 @@ INSERT INTO slr (id, g, h, a, b, c, d, t, ts, tz, f, pad) VALUES
 CREATE INDEX slr_g ON slr USING lion (g);
 CREATE INDEX slr_h ON slr USING lion (h);
 CREATE INDEX slr_v ON slr USING lion (a, b, c, d, t, ts, tz) WITH (slices = on);
+NOTICE:  lion index "slr_v": columns "b", "c", "d", "t", "ts", "tz" have about one row per key
 CREATE INDEX slr_f ON slr USING lion (f) WITH (slices = on);
 VACUUM (FREEZE, ANALYZE) slr;
 -- The plan: the range's index and bounds, and the line that says it is
@@ -833,6 +834,7 @@ SELECT slr_plan('SELECT count(*) FROM slr WHERE b > 0', true);
 CREATE TABLE slr_s (k int4, g int2) WITH (autovacuum_enabled = off);
 INSERT INTO slr_s SELECT hashint4(i), i % 10 FROM generate_series(1, 600000) i;
 CREATE INDEX slr_s_k ON slr_s USING lion (k) WITH (slices = on);
+NOTICE:  lion index "slr_s_k": column "k" has about one row per key
 CREATE INDEX slr_s_g ON slr_s USING lion (g);
 VACUUM (FREEZE, ANALYZE) slr_s;
 SET work_mem = '64kB';
@@ -924,7 +926,9 @@ CREATE TABLE slr_c (id int, k int4, k2 int4, g int) WITH (autovacuum_enabled = o
 INSERT INTO slr_c SELECT i, (i * 7919) % 100003, (i * 7919) % 100003, i % 10
   FROM generate_series(1, 100000) i;
 CREATE INDEX slr_c_k ON slr_c USING lion (k) WITH (summaries = on, slices = on);
+NOTICE:  lion index "slr_c_k": column "k" has about one row per key
 CREATE INDEX slr_c_k2 ON slr_c USING lion (k2) WITH (slices = on);
+NOTICE:  lion index "slr_c_k2": column "k2" has about one row per key
 CREATE INDEX slr_c_g ON slr_c USING lion (g);
 VACUUM (FREEZE, ANALYZE) slr_c;
 EXPLAIN (COSTS OFF) SELECT count(*) FROM slr_c WHERE k < 100;
