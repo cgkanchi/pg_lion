@@ -338,8 +338,8 @@ lion_meta_check_version(Relation index, const LionMetaPageData *meta)
 /*
  * Check that BUF, block 0 read and locked by the caller for a write or for
  * the one field it wants, is the meta page of this format: the special
- * area's size first, as lion_read_meta() checks it, then the page's kind,
- * then lion_meta_check_version().  A page that is not one is refused as
+ * area's size first, as lion_read_meta() checks it, then its page id and
+ * kind, then lion_meta_check_version().  A page that is not one is refused as
  * damage, the buffer released first; the caller's other buffers go with
  * the error.
  */
@@ -349,6 +349,7 @@ lion_meta_check_page(Relation index, Buffer buf)
 	Page		page = BufferGetPage(buf);
 
 	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
+		LionPageGetOpaque(page)->page_id != LION_PAGE_ID ||
 		!LionPageIsMeta(page))
 	{
 		UnlockReleaseBuffer(buf);
