@@ -219,8 +219,9 @@ typedef struct OjJoin
 	Oid			joinop;			/* the operator of the query's clause */
 	EquivalenceClass *keyec;	/* the key's class, or NULL: no key sets */
 	List	   *keysets;		/* OjKeySet */
-	double		abovepass;		/* the share of the join rel's rows the key
-								 * sets above it keep (oj_keysets_above()) */
+	double		abovepass;		/* the rows the joins of the key sets above
+								 * it return a join rel row
+								 * (oj_keysets_above()) */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
 	IndexOptInfo *keyidx;		/* the fact key's lion index the key sets
 								 * fold into (oj_key_index()), or NULL */
@@ -1044,9 +1045,11 @@ oj_search_relids(PlannerInfo *root)
  *	- x is a table oj_keyset_above() takes.
  *
  * The node then returns the rows the key sets keep, and j->abovepass is
- * their share of joinrel's rows, over which the LIMIT's share of a walk is
- * taken (oj_competitor()); the tables are not counted against the node's
- * being alone under the LIMIT (oj_alone()).
+ * the rows their joins above return a row of joinrel - the share each key
+ * set keeps, and for an inner join each kept row once for each of x's rows
+ * of its key, ks.rows / ks.keys of them - over which the LIMIT's share of a
+ * walk is taken (oj_competitor()); the tables are not counted against the
+ * node's being alone under the LIMIT (oj_alone()).
  */
 static void
 oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
@@ -1083,6 +1086,7 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		RelOptInfo *x = (relid < root->simple_rel_array_size) ?
 			root->simple_rel_array[relid] : NULL;
 		bool		ok = true;
+		bool		semi = false;
 		OjKeySet   *ks;
 
 		if (x == NULL || bms_is_member(relid, search))
@@ -1094,6 +1098,7 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 			if (!bms_is_member(relid, sjinfo->min_righthand) &&
 				!bms_is_member(relid, sjinfo->syn_righthand))
 				continue;
+			semi = true;
 			ok = ok && sjinfo->jointype == JOIN_SEMI &&
 				bms_equal(sjinfo->min_righthand, x->relids) &&
 				bms_equal(sjinfo->syn_righthand, x->relids) &&
@@ -1102,7 +1107,7 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		if (!ok || (ks = oj_keyset_above(root, j, x)) == NULL)
 			continue;
 		j->keysets = lappend(j->keysets, ks);
-		j->abovepass *= ks->pass;
+		j->abovepass *= semi ? ks->pass : ks->pass * ks->rows / ks->keys;
 	}
 }
 
