@@ -75,6 +75,9 @@ After installing a newer build, bring each database's copy up to date (and `pg_l
 ALTER EXTENSION pg_lion UPDATE;
 ```
 
+Lion indexes built by an older build may then need `REINDEX`: lion refuses an index in an older
+on-disk format, with an error that says so, until it is rebuilt.
+
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 
 ```
