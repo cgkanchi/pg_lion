@@ -44,10 +44,30 @@ INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
 -- a table on nc.j that only filters, its key of another type
 CREATE TABLE ncx (pk int8 PRIMARY KEY, flag bool NOT NULL);
 INSERT INTO ncx SELECT i, i % 3 = 0 FROM generate_series(0, 6) i;
+-- the joins by key (DESIGN.md §46-§48): a dimension of lion columns under a
+-- primary key, and a fact of few rows without a lion index, its key of
+-- another type, so that the join's operator is a function of its own; a
+-- table of keys that filters the fact's key, and one for a NOT EXISTS
+CREATE TABLE ncpd (pk int PRIMARY KEY, r int NOT NULL, t text NOT NULL);
+INSERT INTO ncpd SELECT i, i % 5, 't' || (i % 3) FROM generate_series(1, 2000) i;
+CREATE INDEX ncpd_r ON ncpd USING lion (r);
+CREATE INDEX ncpd_t ON ncpd USING lion (t);
+CREATE TABLE ncpf (id int PRIMARY KEY, fk int8, ch int NOT NULL, rk int NOT NULL);
+INSERT INTO ncpf SELECT i, 1 + (i * 37) % 2000, i % 3, (i * 7919) % 30001
+  FROM generate_series(1, 30) i;
+CREATE INDEX ncpf_rk ON ncpf (rk);
+CREATE TABLE ncpk (fk int8 NOT NULL, prod int NOT NULL);
+INSERT INTO ncpk SELECT 1 + (i * 37) % 2000, i % 2 FROM generate_series(1, 30) i;
+CREATE TABLE ncpb (k int8);
+INSERT INTO ncpb SELECT 1 + (i * 37 * 2) % 2000 FROM generate_series(1, 10) i;
 VACUUM (FREEZE, ANALYZE) nc;
 VACUUM (FREEZE, ANALYZE) ncd;
 VACUUM (FREEZE, ANALYZE) ncx;
-GRANT SELECT ON nc, ncd, ncx TO lion_nc_yes, lion_nc_no;
+VACUUM (FREEZE, ANALYZE) ncpd;
+VACUUM (FREEZE, ANALYZE) ncpf;
+VACUUM (FREEZE, ANALYZE) ncpk;
+VACUUM (FREEZE, ANALYZE) ncpb;
+GRANT SELECT ON nc, ncd, ncx, ncpd, ncpf, ncpk, ncpb TO lion_nc_yes, lion_nc_no;
 -- every custom node, with a query it answers, a function it stands in for,
 -- and the settings that make the planner choose it; a new node goes here
 CREATE TABLE nc_nodes (node text PRIMARY KEY, q text, fn regprocedure, force text);
@@ -112,7 +132,31 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') FROM nc WHERE d @@ ''w1 & w3''
 	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') DESC LIMIT 5',
 	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
-	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan');
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
+	('LionProbeJoin',
+	 'SELECT f.ch, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk WHERE d.t = ''t1'' GROUP BY 1',
+	 'int48eq(int4,int8)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionProbeJoin, its WHERE',
+	 'SELECT f.ch, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk WHERE d.r = 3 GROUP BY 1',
+	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionProbeJoin, a predicate of its GROUP BY',
+	 'SELECT d.r = 2, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk GROUP BY 1',
+	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionProbeJoin, a NOT EXISTS',
+	 'SELECT f.ch, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.t = ''t1'' AND NOT EXISTS (SELECT 1 FROM ncpb b WHERE b.k = f.fk) GROUP BY 1',
+	 'int8eq(int8,int8)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedJoin',
+	 'SELECT f.id, d.pk FROM ncpf f JOIN ncpd d ON f.fk = d.pk WHERE d.r = 3 ORDER BY f.rk, f.id LIMIT 5',
+	 'int48eq(int4,int8)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedJoin, a key set',
+	 'SELECT f.id, d.pk FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.r = 3 AND f.fk IN (SELECT fk FROM ncpk WHERE prod = 1) ORDER BY f.rk, f.id LIMIT 5',
+	 'int8eq(int8,int8)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedSplit',
+	 'SELECT f.id, d.pk, d.r FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.r < 3 AND f.fk IN (SELECT fk FROM ncpk WHERE prod = 1) ORDER BY d.r, f.rk, f.id LIMIT 5',
+	 'int4lt(int4,int4)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop');
 -- lion's paths on, and the core settings in force turned off (for the
 -- transaction); or every lion path off and core's settings back
 CREATE FUNCTION nc_paths(force text, lion boolean) RETURNS void
@@ -122,7 +166,8 @@ DECLARE
 BEGIN
 	FOREACH g IN ARRAY ARRAY['pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin',
 							 'pg_lion.enable_ordered_scan', 'pg_lion.enable_btree_scan',
-							 'pg_lion.enable_bm25_scan'] LOOP
+							 'pg_lion.enable_bm25_scan', 'pg_lion.enable_probe_join',
+							 'pg_lion.enable_ordered_join'] LOOP
 		PERFORM set_config(g, CASE WHEN lion THEN 'on' ELSE 'off' END, true);
 	END LOOP;
 	FOREACH g IN ARRAY string_to_array(force, ' ') LOOP
@@ -258,7 +303,8 @@ BEGIN
 	FOREACH g IN ARRAY string_to_array(n.force, ' ') ||
 			ARRAY['pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin',
 				  'pg_lion.enable_ordered_scan', 'pg_lion.enable_btree_scan',
-				  'pg_lion.enable_bm25_scan', 'pg_lion.pushdown_margin',
+				  'pg_lion.enable_bm25_scan', 'pg_lion.enable_probe_join',
+				  'pg_lion.enable_ordered_join', 'pg_lion.pushdown_margin',
 				  'plan_cache_mode'] LOOP
 		EXECUTE 'RESET ' || g;
 	END LOOP;
@@ -420,6 +466,55 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionOrdered                                      | granted to the role: the answer
  LionOrdered                                      | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionOrdered                                      | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionOrderedJoin                                  | plan: planned
+ LionOrderedJoin                                  | every privilege: the ordinary plan's answer
+ LionOrderedJoin                                  | without EXECUTE on int48eq(integer,bigint): ERROR: permission denied for function int48eq, as the ordinary plan
+ LionOrderedJoin                                  | plain EXPLAIN: as the ordinary plan
+ LionOrderedJoin                                  | granted to the role: the answer
+ LionOrderedJoin                                  | a cached plan (planned, the answer) without it: ERROR: permission denied for function int48eq
+ LionOrderedJoin                                  | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int48eq
+ LionOrderedJoin, a key set                       | plan: planned
+ LionOrderedJoin, a key set                       | every privilege: the ordinary plan's answer
+ LionOrderedJoin, a key set                       | without EXECUTE on int8eq(bigint,bigint): ERROR: permission denied for function int8eq, as the ordinary plan
+ LionOrderedJoin, a key set                       | plain EXPLAIN: as the ordinary plan
+ LionOrderedJoin, a key set                       | granted to the role: the answer
+ LionOrderedJoin, a key set                       | a cached plan (planned, the answer) without it: ERROR: permission denied for function int8eq
+ LionOrderedJoin, a key set                       | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int8eq
+ LionOrderedSplit                                 | plan: planned
+ LionOrderedSplit                                 | every privilege: the ordinary plan's answer
+ LionOrderedSplit                                 | without EXECUTE on int4lt(integer,integer): ERROR: permission denied for function int4lt, as the ordinary plan
+ LionOrderedSplit                                 | plain EXPLAIN: as the ordinary plan
+ LionOrderedSplit                                 | granted to the role: the answer
+ LionOrderedSplit                                 | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4lt
+ LionOrderedSplit                                 | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4lt
+ LionProbeJoin                                    | plan: planned
+ LionProbeJoin                                    | every privilege: the ordinary plan's answer
+ LionProbeJoin                                    | without EXECUTE on int48eq(integer,bigint): ERROR: permission denied for function int48eq, as the ordinary plan
+ LionProbeJoin                                    | plain EXPLAIN: as the ordinary plan
+ LionProbeJoin                                    | granted to the role: the answer
+ LionProbeJoin                                    | a cached plan (planned, the answer) without it: ERROR: permission denied for function int48eq
+ LionProbeJoin                                    | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int48eq
+ LionProbeJoin, a NOT EXISTS                      | plan: planned
+ LionProbeJoin, a NOT EXISTS                      | every privilege: the ordinary plan's answer
+ LionProbeJoin, a NOT EXISTS                      | without EXECUTE on int8eq(bigint,bigint): ERROR: permission denied for function int8eq, as the ordinary plan
+ LionProbeJoin, a NOT EXISTS                      | plain EXPLAIN: as the ordinary plan
+ LionProbeJoin, a NOT EXISTS                      | granted to the role: the answer
+ LionProbeJoin, a NOT EXISTS                      | a cached plan (planned, the answer) without it: ERROR: permission denied for function int8eq
+ LionProbeJoin, a NOT EXISTS                      | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int8eq
+ LionProbeJoin, a predicate of its GROUP BY       | plan: planned
+ LionProbeJoin, a predicate of its GROUP BY       | every privilege: the ordinary plan's answer
+ LionProbeJoin, a predicate of its GROUP BY       | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionProbeJoin, a predicate of its GROUP BY       | plain EXPLAIN: as the ordinary plan
+ LionProbeJoin, a predicate of its GROUP BY       | granted to the role: the answer
+ LionProbeJoin, a predicate of its GROUP BY       | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionProbeJoin, a predicate of its GROUP BY       | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
+ LionProbeJoin, its WHERE                         | plan: planned
+ LionProbeJoin, its WHERE                         | every privilege: the ordinary plan's answer
+ LionProbeJoin, its WHERE                         | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
+ LionProbeJoin, its WHERE                         | plain EXPLAIN: as the ordinary plan
+ LionProbeJoin, its WHERE                         | granted to the role: the answer
+ LionProbeJoin, its WHERE                         | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
+ LionProbeJoin, its WHERE                         | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
  LionSemiJoin                                     | plan: planned
  LionSemiJoin                                     | every privilege: the ordinary plan's answer
  LionSemiJoin                                     | without EXECUTE on int4eq(integer,integer): ERROR: permission denied for function int4eq, as the ordinary plan
@@ -427,7 +522,7 @@ SELECT node, nc_check(node) FROM nc_nodes ORDER BY node;
  LionSemiJoin                                     | granted to the role: the answer
  LionSemiJoin                                     | a cached plan (planned, the answer) without it: ERROR: permission denied for function int4eq
  LionSemiJoin                                     | SECURITY DEFINER, owned by the role with it: the answer; by the role without it: ERROR: permission denied for function int4eq
-(161 rows)
+(210 rows)
 
 -- nothing is left revoked from PUBLIC by this file
 SELECT fn FROM nc_nodes WHERE NOT has_function_privilege('public', fn, 'EXECUTE');
@@ -443,7 +538,7 @@ DROP FUNCTION nc_explain(text, text);
 DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
-DROP TABLE nc_nodes, nc, ncd, ncx;
+DROP TABLE nc_nodes, nc, ncd, ncx, ncpd, ncpf, ncpk, ncpb;
 DROP FUNCTION nc_bucket(int);
 DROP ROLE lion_nc_yes;
 DROP ROLE lion_nc_no;

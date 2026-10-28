@@ -21,6 +21,9 @@
 -- 11. A directory entry whose line pointer reaches into a CHAIN entry, which
 --     every record of an insert into that entry's posting set rewrites in
 --     place, by its own line pointer (lion_page_check_alone()).
+-- 12. Two chunks of a position tree's leaf at the same bytes, which VACUUM
+--     wrote back by their line pointers, one over the other
+--     (lion_page_check_items()).
 --
 -- The pages are damaged on disk, as corrupt.sql does it (pg_buffercache_evict(),
 -- PostgreSQL 17 and later - on 16 the test is skipped,
@@ -446,6 +449,31 @@ SELECT lion_di_try('INSERT INTO lion_di_c VALUES (7)');
 SELECT count(*) FROM lion_di_c WHERE k = 7;
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_c_i')$$);
 DROP TABLE lion_di_c;
+-- ---------- 12. position chunks at the same bytes, and VACUUM ----------
+-- 'every' is twice in every row, so its positions spill to a position tree.
+-- The second line pointer of one of its leaves is made a copy of the
+-- first: each still reads as a whole chunk, but VACUUM writes the chunks
+-- back by their line pointers in one record, so the page is refused first.
+CREATE TABLE lion_di_p (id int, d tsvector);
+INSERT INTO lion_di_p
+	SELECT g, to_tsvector('simple', 'every word every') FROM generate_series(1, 4000) g;
+CREATE INDEX lion_di_p_i ON lion_di_p USING lion (d) WITH (store_positions = true);
+SELECT lion_di_evict('lion_di_p_i');
+SELECT min(blk) AS lion_di_blk
+  FROM generate_series(1, (pg_relation_size('lion_di_p_i') / 8192 - 1)::int) blk,
+	   LATERAL lion_di_block('lion_di_p_i', blk) p,
+	   LATERAL (SELECT (lion_di_u32(p, 16) & 65535)::int AS sp) s
+ WHERE sp BETWEEN 24 AND 8160
+   AND (lion_di_u32(p, sp + 28) & 65535) = 65415		-- LION_PAGE_ID
+   AND (lion_di_u32(p, sp + 26) & 140) = 132			-- CONTAINER | POSITIONS, not DELETED
+   AND (lion_di_u32(p, 12) & 65535) >= 32 \gset
+SELECT lion_di_poke('lion_di_p_i', :lion_di_blk, 28,
+					substring(lion_di_block('lion_di_p_i', :lion_di_blk) FROM 25 FOR 4));
+DELETE FROM lion_di_p WHERE id = 1;
+\set VERBOSITY terse
+VACUUM lion_di_p;
+\set VERBOSITY default
+DROP TABLE lion_di_p;
 -- ---------- an undamaged index still works ----------
 CREATE INDEX lion_di_i ON lion_di USING lion (k);
 SELECT count(*) FROM lion_di WHERE k = 7;

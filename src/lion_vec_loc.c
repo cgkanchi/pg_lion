@@ -401,10 +401,11 @@ lionvec_place_read(Relation toastrel, Snapshot tsnap, BlockNumber nblocks,
  */
 
 /*
- * A LOC entry, checked: its length against its runs, its runs against the
- * value's nchunks chunks and a heap page's line pointers, its TID and value
- * id valid, its flags 0.  ERRCODE_INDEX_CORRUPTED if not: the scan reads
- * nothing of a malformed entry.
+ * A LOC entry, checked: inside its page (lionvec_item_inside()), its length
+ * against its runs, its runs against the value's nchunks chunks and a heap
+ * page's line pointers, its TID and value id valid, its flags 0.
+ * ERRCODE_INDEX_CORRUPTED if not: the scan reads nothing of a malformed
+ * entry.
  */
 LionVecLoc *
 lionvec_loc_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
@@ -414,7 +415,8 @@ lionvec_loc_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	LionVecLoc *loc;
 	Size		len;
 
-	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) < LIONVEC_LOC_SIZE(1))
+	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) < LIONVEC_LOC_SIZE(1) ||
+		!lionvec_item_inside(page, iid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed locator entry at (%u,%u)",
@@ -431,14 +433,19 @@ lionvec_loc_at(Relation index, Page page, BlockNumber blk, OffsetNumber off,
 	return loc;
 }
 
-/* A LOCDIR item, checked: its length, a LOC page's block, and its range. */
+/*
+ * A LOCDIR item, checked: inside its page (lionvec_item_inside()), its
+ * length, a LOC page's block, and its range.  The locator's append writes
+ * the item it returns.
+ */
 static LionVecLocDir *
 lionvec_locdir_at(Relation index, Page page, BlockNumber blk, OffsetNumber off)
 {
 	ItemId		iid = PageGetItemId(page, off);
 	LionVecLocDir *d;
 
-	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) != sizeof(LionVecLocDir))
+	if (!ItemIdIsNormal(iid) || ItemIdGetLength(iid) != sizeof(LionVecLocDir) ||
+		!lionvec_item_inside(page, iid))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has a malformed locator directory item at (%u,%u)",
