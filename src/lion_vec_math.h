@@ -655,7 +655,9 @@ typedef struct LionVecRoute
 
 /*
  * What lionvec_kmeans() works in: the caller's arrays, of the lengths given,
- * so that it allocates nothing.
+ * so that it allocates nothing; and, when set, what it calls with the
+ * iterations made after each that moved its centroids, which a build's
+ * progress is (DESIGN.md §44.5).
  */
 typedef struct LionVecKmeansWork
 {
@@ -674,6 +676,8 @@ typedef struct LionVecKmeansWork
 	float	   *qc;				/* [dimsp] */
 	uint64	   *planes;			/* [dimsp / 64][LIONVEC_QBITS] */
 	LionVecRoute route;			/* with regions: each row's routing; else unused */
+	void		(*progress) (void *arg, int made);	/* or NULL */
+	void	   *progress_arg;
 } LionVecKmeansWork;
 
 /*

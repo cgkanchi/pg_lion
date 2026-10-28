@@ -177,7 +177,12 @@ One default operator class per type, reusing the hash access method's hash funct
 (`int2/int4/int8`, one family with cross-type equality), `float4/float8`, `numeric`, `bool`, `"char"`,
 `name`, `text` (and `varchar` through it), `char(n)`, `bytea`, `uuid`, `date`, `time`, `timetz`,
 `timestamp`, `timestamptz`, `interval`, `macaddr`, `inet`, `pg_lsn`, `xid`, `cid`, `tid`,
-`oid`, and any enum. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
+`oid`, and any enum. `date`, `timestamp` and `timestamptz` are one family too, as in btree, so
+`ts >= current_date - 7` on a `timestamp` column and `created_at >= current_date` on a
+`timestamptz` one use the index; a comparison with a `timestamptz` is made at the session's
+`TimeZone`, as the operator makes it. A `timestamp` column against a `timestamptz` value
+(`ts >= now()`) does not use the index: that comparison is not in the column's order across a DST
+gap, so no ordered lookup by it can be exact. Bit slices answer only bounds of the column's own type. `jsonb` has `jsonb_ops` for whole documents too, but it is not the default:
 `jsonb_contains_ops` is (see "jsonb containment" below). Case-insensitive text: `CREATE EXTENSION
 pg_lion_citext` (requires `citext`) adds `citext_ops`. Domains resolve to their base type.
 
@@ -1528,6 +1533,22 @@ and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "
   for a residual clause, and those `LionOrdered` fetched by its set's TIDs.
 - In `pg_stat_user_tables`, a table's `idx_scan` is the sum of its indexes', and its
   `idx_tup_fetch` adds its own fetches to theirs; no Lion node counts a `seq_scan`.
+
+`CREATE INDEX` and `REINDEX` report their phases in `pg_stat_progress_create_index`, whose `phase`
+reads `building index: ` and the phase's name; a parallel build's leader reports for all its
+processes, and a phase marked "(workers)" is one only a parallel build goes through.
+
+- **lion** (DESIGN.md §24, "Progress"): `scanning table`, with `blocks_total` and `blocks_done`;
+  `merging runs (workers)`, the leader merging its own share of the scan and waiting for the
+  workers' shares; `writing columns`; and `copying columns (workers)`, the leader writing into the
+  index a column a worker wrote. Through the last two, `tuples_total` is the (key, row) pairs the
+  index holds - a row once for each key column and for each key of a multi-key column, and once for
+  each bit slice of a bit-sliced column it is in - and `tuples_done` the pairs written.
+- **lionvec** (DESIGN.md §44.5): `sampling table`, the first pass, with blocks; `computing
+  centroids`, with k-means' iterations done out of at most `tuples_total` (it stops sooner once no
+  row moves); `assigning rows to partitions`, the second pass, with blocks, and the rows done out of
+  those the first pass read; `sorting rows`; `writing partitions`, with the rows written; and
+  `WAL-logging index`, for an index that is WAL-logged.
 
 ## Known limitations
 

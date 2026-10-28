@@ -1,0 +1,157 @@
+# pg_lion built and tested against the PostgreSQL packages of
+# apt.postgresql.org: the packaged server and postgresql-server-dev-N
+# headers a PGXN user builds against.  Packaged servers have no
+# injection_points module, so the Makefile skips the specs that need it and
+# says so.
+#
+# ci.yml calls this on every pull request for 16 to 19 on x86-64;
+# optional.yml calls it, when started by hand, for 18 on arm64, where the
+# SIMD kernels' portable versions are the ones the server picks rather than
+# fallbacks.  arm64 is not a first-class target.
+
+name: PGDG packages
+
+on:
+  workflow_call:
+    inputs:
+      versions:
+        description: JSON list of PostgreSQL majors
+        type: string
+        required: true
+      runner:
+        description: The runner label
+        type: string
+        default: ubuntu-24.04
+
+permissions:
+  contents: read
+
+env:
+  LION_SOCK: /tmp/lion-sock
+  LION_PORT: "55432"
+
+jobs:
+  pgdg:
+    name: PostgreSQL ${{ matrix.pg }} (PGDG packages${{ inputs.runner == 'ubuntu-24.04-arm' && ', arm64' || '' }})
+    runs-on: ${{ inputs.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ${{ fromJSON(inputs.versions) }}
+    env:
+      PG: ${{ matrix.pg }}
+      PG_CONFIG: .local/pg/bin/pg_config
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL ${{ matrix.pg }} from apt.postgresql.org
+        run: |
+          # No auto-created cluster: the tests run their own.
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          # Beta majors live in a component named after the version.
+          if [ "$PG" -ge 19 ]; then
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y -c "$PG"
+          else
+            sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          fi
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          .local/pg/bin/pg_config --version
+
+      # pg_lion_vector's tests need pgvector.  Every released major has a
+      # package, and a missing one fails the job; once it is installed,
+      # PGVECTOR=1 goes into the job's environment, under which the Makefile
+      # will not leave lionvec's regression files and specs out, nor the
+      # recovery harness its phase 5 - so an install that put nothing where
+      # the server looks cannot pass green with no lionvec test run.  A beta
+      # major apt.postgresql.org has no package for yet still tests
+      # everything else, and says so.
+      - name: Install pgvector
+        run: |
+          if sudo apt-get install -y --no-install-recommends "postgresql-$PG-pgvector"; then
+            echo "PGVECTOR=1" >> "$GITHUB_ENV"
+          elif [ "$PG" -ge 19 ]; then
+            echo "::warning::no pgvector package for PostgreSQL $PG yet; the vector tests are skipped"
+          else
+            echo "::error::no pgvector package for PostgreSQL $PG"
+            exit 1
+          fi
+
+      - name: Build
+        run: make -j4 WERROR=1
+
+      - name: Install
+        run: sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
+
+      - name: Unit tests
+        run: make unit
+
+      # ASan cannot place its shadow memory under the 32 bits of mmap
+      # randomization Ubuntu 24.04's kernels default to, and loops on
+      # AddressSanitizer:DEADLYSIGNAL instead of running: the arm64 runners
+      # keep that default (the x86 images already lower it).  28 bits is
+      # what ASan supports.  The time limit makes a hang a red step rather
+      # than a job that holds a runner for hours.
+      - name: Unit tests with ASan and UBSan
+        timeout-minutes: 30
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make unit SANITIZE=1 WERROR=1
+
+      - name: Start a private cluster
+        run: ./dev.sh reset
+
+      - name: installcheck (generic WAL)
+        run: |
+          eval "$(./dev.sh env)"
+          make installcheck
+
+      - name: installcheck-rmgr (custom resource manager preloaded)
+        run: |
+          eval "$(./dev.sh env)"
+          make installcheck-rmgr
+
+      # pg_lion beside another extension on the same planner hook and with
+      # its own resource manager, in both load orders, the non-heap table AM
+      # refusals, counts on a sixteen-buffer pool, and - on 16, the only
+      # major with the setting - the refusal to read a lion index under
+      # old_snapshot_threshold (test/hook-check.sh).
+      # The test module goes into the packaged installation with sudo, like
+      # pg_lion itself.
+      - name: hookcheck (hook coexistence, table AMs)
+        run: |
+          sudo make -C test/modules/lion_hooktest install PG_CONFIG="$PWD/$PG_CONFIG" WERROR=1
+          eval "$(./dev.sh env)"
+          make hookcheck HOOKCHECK_SKIP_INSTALL=1
+
+      # WAL replay on the packaged majors too - without these steps nothing
+      # on 16-18 ever replayed a lion record.  The recovery harness's phases
+      # 1, 1f, 1h, 2 and 4 (crash recovery under load, a VACUUM on a server
+      # without the resource manager, the free space map entries a crash
+      # leaves on pages in use, a hot standby that replays everything the
+      # primary writes, and its promotion, and lion_index_verify() on a
+      # standby beside replay), and 5 (lionvec's TOAST locator, where
+      # pgvector is installed), in both WAL modes, with
+      # wal_consistency_checking, as the source jobs run them.  Phases 1b-1e,
+      # 1g and 3 park a backend on an injection point, which the packaged
+      # servers cannot.  The extension is already in the packaged prefix
+      # (the Install step put it there with sudo), which this user cannot
+      # write to, so the harness uses it instead of installing its own.
+      - name: Crash recovery and standby replay (custom resource manager, consistency checked)
+        run: |
+          RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
+            --phases "1 1f 1h 2 4 5" --mode rmgr --conf "wal_consistency_checking = 'pg_lion'"
+
+      - name: Crash recovery and standby replay (generic WAL, consistency checked)
+        run: |
+          RECOVERY_SKIP_INSTALL=1 ./test/recovery/run.sh --prefix "/usr/lib/postgresql/$PG" \
+            --phases "1 1f 1h 2 4 5" --conf "wal_consistency_checking = 'generic'"
+
+      - name: Show regression diffs
+        if: failure()
+        run: |
+          find test -name regression.diffs -exec cat {} + || true
+          tail -n 100 .local/pg.log || true
+          tail -n 200 test/recovery/log/*.log || true
