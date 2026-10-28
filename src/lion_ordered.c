@@ -2366,7 +2366,9 @@ lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 
 	cost_qual_eval(&qcost, residual, root);
 	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
-	run += members * (qcost.per_tuple + rqcost.per_tuple) +
+	/* the recheck of every candidate, the quals of the rows it passes */
+	run += members * rqcost.per_tuple +
+		Min(clamp_row_est(sel * tuples), members) * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
@@ -3034,6 +3036,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	double		pages = Max((double) rel->pages, 1.0);
 	Selectivity swalk = 1.0;
 	Selectivity sel = 1.0;
+	Selectivity passsel = 1.0;
 	double		walked;
 	double		entries;
 	double		ndistinct;
@@ -3101,6 +3104,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 		 * recheck then filters, so `sel` from here is the candidates' share
 		 */
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
+		passsel = sel;
 		sel = lo_set_candsel(root, rel, lion, sel, &rechecked);
 		if (rechecked != NIL)
 			cost_qual_eval(&rqcost, lionqual, root);
@@ -3190,7 +3194,8 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 
 	cost_qual_eval(&qcost, residual, root);
 	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
-	run += fetched * (cpu_tuple_cost + qcost.per_tuple + rqcost.per_tuple) +
+	run += fetched * (cpu_tuple_cost + rqcost.per_tuple) +
+		fetched * Min(passsel / Max(sel, 1e-9), 1.0) * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
 
 	/* a list: one more descent for each of its values after the first */
