@@ -583,9 +583,11 @@ pruned to one leaf"); when several partitions remain, PostgreSQL plans the join.
 `pg_lion.enable_ordered_join` turns it off (DESIGN.md §47).
 
 A key set is only seen when PostgreSQL plans the fact, the dimension and the key set's table as one
-join problem. A query with more `FROM` items than `join_collapse_limit` (8 by default), counting
-every joined table and subquery, is split into smaller problems, and an `EXISTS` may then be joined
-above the rest: the node is offered without the key set and priced for its whole walk, and loses to
+join problem. PostgreSQL flattens explicit `JOIN`s - and the semi joins it makes of `EXISTS` and
+`IN` - into one problem only while the result has at most `join_collapse_limit` (8 by default)
+items, and pulls a subquery's `FROM` list up into its parent's only while the merged list has at
+most `from_collapse_limit` (8) items; past either, the query is planned in parts (a plain
+comma-separated `FROM` list is never split), and an `EXISTS` may then be joined above the rest: the node is offered without the key set and priced for its whole walk, and loses to
 a sort of the whole join. Raise `join_collapse_limit` and `from_collapse_limit` to at least the
 query's number of tables (for the transaction with `SET LOCAL`, or for a role or a function with
 `ALTER ... SET`); below `geqo_threshold` (12) the planner still searches every join order, at more

@@ -3443,7 +3443,7 @@ lion_build_notice_near_unique(Relation index, const LionIndexState *ix,
 							   ncols, RelationGetRelationName(index), cols.data),
 				 errdetail("Over " UINT64_FORMAT " rows, each key takes a directory entry of its own.",
 						   rows),
-				 errhint("A B-tree indexes such a column in less space; leave it out of the lion index unless a lion join needs it there.")));
+				 errhint("A B-tree indexes such a column in less space; leave it out of the lion index unless a query needs it there, as a lion join or lion_index_facets() filter does.")));
 	pfree(cols.data);
 }
 
