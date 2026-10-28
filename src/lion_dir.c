@@ -496,6 +496,15 @@ lion_cmp_prefix(const LionEntryTuple *item, const LionSearchKey *sk)
 	}
 
 	/*
+	 * A cross-type search of an ordered column leaves the hash out (nohash):
+	 * every entry proc 4 ties with the value is a candidate, the run scan's
+	 * equality decides, and with no stored form the key stands before the
+	 * whole run (lion_cmp_entry()).
+	 */
+	if (sk->nohash)
+		return 0;
+
+	/*
 	 * The hash term.  No entry stores its hash (DESIGN.md §21, "Entry
 	 * tuples"): it is recomputed from the stored key, which in an ordered
 	 * column happens only when proc 4 ties - once or twice a descent - and in
@@ -575,6 +584,7 @@ lion_search_key_init(LionState *state, LionSearchKey *sk, int kind, Datum key,
 	sk->key = key;
 	sk->hash = hash;
 	sk->hashlazy = false;
+	sk->nohash = false;
 	sk->cmpproc = state->ordered ? &state->cmpproc : NULL;
 	sk->eqproc = &state->eqproc;
 	sk->collation = state->collation;

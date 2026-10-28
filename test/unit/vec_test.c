@@ -1959,6 +1959,7 @@ sample_free(Sample *sm)
 static void
 kmeans_work(LionVecKmeansWork *w, int n, int k, int D)
 {
+	memset(w, 0, sizeof(*w));
 	w->count = (int *) xmalloc(sizeof(int) * k);
 	w->assign = (int *) xmalloc(sizeof(int) * n);
 	w->bits = (uint64 *) xmalloc(sizeof(uint64) * (Size) k * (D / 64));

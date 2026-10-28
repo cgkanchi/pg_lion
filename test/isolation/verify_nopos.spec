@@ -102,6 +102,24 @@ setup
 		END LOOP;
 		RETURN damaged;
 	END $f$;
+
+	/*
+	 * Every buffer of the index evicted, dirty ones written back first:
+	 * pg_buffercache_evict() a buffer at a time, which PostgreSQL 17 has
+	 * (pg_buffercache_evict_relation() is 18's), and then none left.
+	 */
+	CREATE FUNCTION vn_evict() RETURNS bool LANGUAGE plpgsql AS $f$
+	BEGIN
+		PERFORM pg_buffercache_evict(bufferid)
+		   FROM pg_buffercache
+		  WHERE relfilenode = pg_relation_filenode('vn_d')
+			AND reldatabase = (SELECT oid FROM pg_database
+								WHERE datname = current_database());
+		RETURN NOT EXISTS (SELECT 1 FROM pg_buffercache
+							WHERE relfilenode = pg_relation_filenode('vn_d')
+							  AND reldatabase = (SELECT oid FROM pg_database
+												  WHERE datname = current_database()));
+	END $f$;
 }
 
 teardown
@@ -110,6 +128,7 @@ teardown
 	DROP FUNCTION v_parked(text);
 	DROP FUNCTION v_verify(regclass);
 	DROP FUNCTION vn_damage();
+	DROP FUNCTION vn_evict();
 	/* Injection points are cluster-wide: never leave one attached. */
 	DO $$ BEGIN PERFORM injection_points_detach('lion-verify-heap-scan');
 	   EXCEPTION WHEN OTHERS THEN NULL; END $$;
@@ -130,10 +149,7 @@ session s2
 step s2_at_scan	{ SELECT v_parked('lion-verify-heap-scan'); }
 # Pages a backend holds in a buffer are read from there, not from the file;
 # the eviction writes back any that are dirty before the file is damaged.
-step s2_evict	{
-	SELECT buffers_skipped = 0 AS all_evicted
-	  FROM pg_buffercache_evict_relation('vn_d');
-}
+step s2_evict	{ SELECT vn_evict() AS all_evicted; }
 step s2_damage	{ SELECT vn_damage() AS leaves_damaged; }
 step s2_wake	{
 	SELECT injection_points_detach('lion-verify-heap-scan');

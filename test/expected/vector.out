@@ -38,6 +38,24 @@ SELECT opcname, amvalidate(c.oid)
  vector_l2_ops      | t
 (6 rows)
 
+-- the build's phases, as pg_stat_progress_create_index names them (DESIGN.md
+-- §44.5); what a build reports in them only another session could see, by a
+-- race, so it is left alone, as core's tests leave theirs
+SELECT n, pg_indexam_progress_phasename(a.oid, n) AS phase
+  FROM pg_am a, generate_series(1, 8) n
+ WHERE a.amname = 'lionvec' ORDER BY n;
+ n |            phase             
+---+------------------------------
+ 1 | initializing
+ 2 | sampling table
+ 3 | computing centroids
+ 4 | assigning rows to partitions
+ 5 | sorting rows
+ 6 | writing partitions
+ 7 | WAL-logging index
+ 8 | 
+(8 rows)
+
 /*
  * vt_vec() is a pseudo-random vector of n coordinates in (-scale, scale),
  * the same on every platform: from hashint8extended(), not random().
