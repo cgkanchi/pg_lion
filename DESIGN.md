@@ -30633,10 +30633,9 @@ join rel whole: a join rel some of whose tables are not key sets gets no path, a
 the node's rows to them above is the plan.
 
 **Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
-after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
-private workload's pages a small key set kept about one entry in ten thousand walked, each
-fetched, and ran many times slower than core's plan. Where the fact's key has a lion index the key sets are ANDed
-into the walk's set instead, and an entry whose key a key set lacks is not a member: never
+after the fetch, a key set leaves the walk to fetch every member of its set to read the key, and
+a selective key set has it fetch many rows for each it keeps. Where the fact's key has a lion index
+the key sets are ANDed into the walk's set instead, and an entry whose key a key set lacks is not a member: never
 fetched. The index (`oj_key_index()`): a lion index of the fact, not partial unless the query
 implies its predicate, with a key column that is the key itself, a plain column, scalar - an entry
 a row, not multikey - of the key's type, whose equality strategy is each key set's hashable

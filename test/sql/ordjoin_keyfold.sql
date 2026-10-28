@@ -274,10 +274,10 @@ SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 DROP INDEX fct_fk_part;
 CREATE INDEX fct_fk ON fct USING lion (fk);
-CREATE TABLE ib8 AS SELECT fk::bigint AS fk FROM kt WHERE prod = 7;
-ANALYZE ib8;
+CREATE TABLE kt8 AS SELECT fk::bigint AS fk FROM kt WHERE prod = 7;
+ANALYZE kt8;
 SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
-	WHERE f.fk IN (SELECT fk FROM ib8) AND d.region < 5
+	WHERE f.fk IN (SELECT fk FROM kt8) AND d.region < 5
 	ORDER BY f.rank DESC, f.id LIMIT 20$$);
 SET pg_lion.enable_key_set_fold = off;
 SELECT okf($$SELECT f.id, f.rank, d.pk FROM fct f JOIN co d ON f.fk = d.pk
