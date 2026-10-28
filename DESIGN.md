@@ -10433,6 +10433,21 @@ they write, each deleted once the leader has replayed it.
   bulk writer is one process's, and the block numbers are only known once the leader has replayed
   the columns before.
 
+**Progress** (`pg_stat_progress_create_index`, `lionbuildphasename()`). The build reports its phases
+numbered on from core's `initializing`, as nbtree's are: `scanning table`, whose blocks the heap AM
+reports; `merging runs (workers)`, a parallel leader's own export once its share of the scan is
+done (`lion_spool_export()`) and its wait for the other participants'; `writing columns`; and
+`copying columns (workers)`, the leader's wait for and replay of a column a worker wrote. Through the
+write, `tuples_total` is the (key, code) pairs the spools took (`lion_spool_ntids()`: a row's code
+once for each key column, once for each key of a multi-key column, and once for each slice a sliced
+column puts it in, §51), each of which the merge hands out once, and `tuples_done` those written:
+`lion_build_emit()` counts them and reports every 64k, when it checks for interrupts, and at the end
+of each column, and a replayed column adds the count its worker kept (`LionBuildColumn`) once it is
+in. An assertion checks at the end that the two agree. The scan's blocks are cleared at the switch
+to the write, as nbtree clears them. Only the process whose build the view shows reports, a serial
+build or a parallel one's leader, as in core's builds; a worker counts the codes of the columns it
+writes and reports nothing.
+
 **The index is the one the sorted build wrote, page for page.** The same keys come out in the same
 order with the same codes and the same stored bytes, and the builders and the directory are
 unchanged, so every block is allocated in the same order. Checked against the tuplesort build by
@@ -26898,7 +26913,19 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   (`allow_sync = false`), which could start part-way through the heap: the sample must be the same
   from build to build, and the second scan's REFINE items then lie in heap order, as each
   partition's CODE items do whatever order the rows came in, being sorted by TID. Built in
-  parallel from PostgreSQL 16 (§44.12); progress is reported for the second scan. `CREATE INDEX
+  parallel from PostgreSQL 16 (§44.12). Its phases are reported in `pg_stat_progress_create_index`
+  (`lionvecbuildphasename()`), numbered on from core's `initializing` as nbtree's are: `sampling
+  table`, the first scan, and `assigning rows to partitions`, the second, with the blocks the heap
+  AM reports, and the second with its rows done, every 1024 (`LIONVEC_PROGRESS_ROWS`), of the rows
+  the first met, which differ only by a row pruned between the scans or one a `CONCURRENTLY`
+  build's snapshots disagree on; between them `computing centroids`, k-means' iterations done of
+  `LIONVEC_KMEANS_ITERS`, reported after each that moved the centroids (through
+  `LionVecKmeansWork`'s `progress` serially, by the leader in parallel), fewer than all of them when
+  k-means stops early; then `sorting rows`, the CODE items' sort, `writing partitions`, the rows
+  written to the CODE chains, each by its own item and not its copy, and `WAL-logging index`. Only
+  a serial build or a parallel one's leader reports, as in core's builds; in the second scan each
+  process adds its rows to a shared atomic count every 1024, before it says it is done, and the
+  leader reports the count. `CREATE INDEX
   CONCURRENTLY` and
   `REINDEX` work as for any AM. An unlogged index's init fork is the meta page and empty REST and
   NULL chains.

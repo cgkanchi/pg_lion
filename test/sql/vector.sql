@@ -30,6 +30,13 @@ SELECT opcname, amvalidate(c.oid)
   FROM pg_opclass c JOIN pg_am a ON a.oid = c.opcmethod
  WHERE a.amname = 'lionvec' ORDER BY opcname;
 
+-- the build's phases, as pg_stat_progress_create_index names them (DESIGN.md
+-- §44.5); what a build reports in them only another session could see, by a
+-- race, so it is left alone, as core's tests leave theirs
+SELECT n, pg_indexam_progress_phasename(a.oid, n) AS phase
+  FROM pg_am a, generate_series(1, 8) n
+ WHERE a.amname = 'lionvec' ORDER BY n;
+
 /*
  * vt_vec() is a pseudo-random vector of n coordinates in (-scale, scale),
  * the same on every platform: from hashint8extended(), not random().

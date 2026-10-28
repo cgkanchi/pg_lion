@@ -879,7 +879,7 @@ lion_handler(PG_FUNCTION_ARGS)
 #endif
 		.amoptions = lionoptions,
 		.amproperty = NULL,
-		.ambuildphasename = NULL,
+		.ambuildphasename = lionbuildphasename,	/* DESIGN.md §24, "Progress" */
 		.amvalidate = lionvalidate,
 		.amadjustmembers = NULL,
 		.ambeginscan = lionbeginscan,

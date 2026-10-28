@@ -1520,6 +1520,22 @@ and `pg_stat_user_tables`, as its own index scans keep them (DESIGN.md §29.7, "
 - In `pg_stat_user_tables`, a table's `idx_scan` is the sum of its indexes', and its
   `idx_tup_fetch` adds its own fetches to theirs; no Lion node counts a `seq_scan`.
 
+`CREATE INDEX` and `REINDEX` report their phases in `pg_stat_progress_create_index`, whose `phase`
+reads `building index: ` and the phase's name; a parallel build's leader reports for all its
+processes, and a phase marked "(workers)" is one only a parallel build goes through.
+
+- **lion** (DESIGN.md §24, "Progress"): `scanning table`, with `blocks_total` and `blocks_done`;
+  `merging runs (workers)`, the leader merging its own share of the scan and waiting for the
+  workers' shares; `writing columns`; and `copying columns (workers)`, the leader writing into the
+  index a column a worker wrote. Through the last two, `tuples_total` is the (key, row) pairs the
+  index holds - a row once for each key column and for each key of a multi-key column, and once for
+  each bit slice of a bit-sliced column it is in - and `tuples_done` the pairs written.
+- **lionvec** (DESIGN.md §44.5): `sampling table`, the first pass, with blocks; `computing
+  centroids`, with k-means' iterations done out of at most `tuples_total` (it stops sooner once no
+  row moves); `assigning rows to partitions`, the second pass, with blocks, and the rows done out of
+  those the first pass read; `sorting rows`; `writing partitions`, with the rows written; and
+  `WAL-logging index`, for an index that is WAL-logged.
+
 ## Known limitations
 
 Equality, `IN` lists, scalar ranges and the multi-key operators above are supported, through bitmap

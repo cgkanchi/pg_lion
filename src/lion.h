@@ -2520,6 +2520,19 @@ extern bool lion_index_other_format(Relation index);
 
 extern IndexBuildResult *lionbuild(Relation heap, Relation index, struct IndexInfo *indexInfo);
 extern void lionbuildempty(Relation index);
+
+/*
+ * The build's phases, as pg_stat_progress_create_index shows them
+ * (lionbuildphasename(), DESIGN.md §24, "Progress"), numbered on from
+ * PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE, which is 1 (commands/progress.h),
+ * as nbtree numbers its own.
+ */
+#define LION_PROGRESS_PHASE_TABLESCAN	2	/* the heap into the spool */
+#define LION_PROGRESS_PHASE_EXPORT		3	/* a parallel leader's own runs */
+#define LION_PROGRESS_PHASE_WRITE		4	/* a column merged and written */
+#define LION_PROGRESS_PHASE_REPLAY		5	/* a worker's column copied */
+
+extern char *lionbuildphasename(int64 phasenum);
 extern bool lioninsert(Relation index, Datum *values, bool *isnull, ItemPointer ht_ctid,
 					  Relation heapRel, IndexUniqueCheck checkUnique, bool indexUnchanged,
 					  struct IndexInfo *indexInfo);
