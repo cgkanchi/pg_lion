@@ -1725,6 +1725,8 @@ lionvec_kmeans(const LionVecSample *s, int k, int iters, bool unit,
 								  routed ? r : NULL) == 0)
 			break;
 		lionvec_kmeans_update(s, k, unit, w->assign, cent, w);
+		if (w->progress != NULL)
+			w->progress(w->progress_arg, made);
 	}
 	return made;
 }

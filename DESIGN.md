@@ -8357,8 +8357,11 @@ would read the directory in an order it is not in. The outcomes, in this order:
   and the cross-type equality only. No comparison of any kind is used on a directory in
   (kind, hash, bytes) order - the family's cross-type proc 4 included - and the family's
   cross-type hash agrees with the stored keys' by the family's contract, so the descent is exact;
-- the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops` and `float_ops`, the only
-  families with cross-type equality, carry them): descend as usual;
+- the family's cross-type proc 4 (`btint48cmp` and friends; `integer_ops`, `float_ops` and
+  `datetime_ops`, the families with cross-type equality, carry them): descend as usual, by proc 4
+  ALONE - the hash term is left out of the search key and the run of entries proc 4 ties is
+  scanned with the equality, because `datetime_ops`' types do not hash compatibly (§28, "Cross-type
+  date and timestamp");
 - otherwise a BINARY coercion of the value to the key type (`find_coercion_pathway()` returning
   `COERCION_PATH_RELABELTYPE`: the same bytes, varchar to text): the value becomes one of the
   index's own and hash, equality and ordering are all the index's own, which is consistent by
@@ -9919,7 +9922,8 @@ longer than a batch included.
   - `min(k)` / `max(k)`: walk from either end of the column to the first entry with a visible row
     (§26's existence test), printing its key under the value-representation contract; max needs the
     backward walk §21's leftlink was kept for;
-  - cross-type date/timestamp members (`datecol < now()`), with their equality;
+  - DONE (2026-10-28, §28 "Cross-type date and timestamp"): cross-type date/timestamp members
+    (`datecol < now()`), with their equality;
   - carry the recheck batch across the entries of a range SUM, as §15's disjoint sum carries it
     across a list's sets: the entries' counts are only added up, so their dirty TIDs may be
     rechecked together, one visit per page per batch, instead of per entry (§28's measured 68,384
@@ -10429,6 +10433,21 @@ they write, each deleted once the leader has replayed it.
   would have to be stitched. Nor do the workers write their pages into the index themselves: the
   bulk writer is one process's, and the block numbers are only known once the leader has replayed
   the columns before.
+
+**Progress** (`pg_stat_progress_create_index`, `lionbuildphasename()`). The build reports its phases
+numbered on from core's `initializing`, as nbtree's are: `scanning table`, whose blocks the heap AM
+reports; `merging runs (workers)`, a parallel leader's own export once its share of the scan is
+done (`lion_spool_export()`) and its wait for the other participants'; `writing columns`; and
+`copying columns (workers)`, the leader's wait for and replay of a column a worker wrote. Through the
+write, `tuples_total` is the (key, code) pairs the spools took (`lion_spool_ntids()`: a row's code
+once for each key column, once for each key of a multi-key column, and once for each slice a sliced
+column puts it in, §51), each of which the merge hands out once, and `tuples_done` those written:
+`lion_build_emit()` counts them and reports every 64k, when it checks for interrupts, and at the end
+of each column, and a replayed column adds the count its worker kept (`LionBuildColumn`) once it is
+in. An assertion checks at the end that the two agree. The scan's blocks are cleared at the switch
+to the write, as nbtree clears them. Only the process whose build the view shows reports, a serial
+build or a parallel one's leader, as in core's builds; a worker counts the codes of the columns it
+writes and reports nothing.
 
 **The index is the one the sorted build wrote, page for page.** The same keys come out in the same
 order with the same codes and the same stored bytes, and the builders and the directory are
@@ -15868,9 +15887,9 @@ is unreleased - to every SCALAR class of `pg_lion--0.1.sql` that has proc 4, and
 The script rules of 7c6e439 hold: the operators are core's, which an unqualified operator name in an
 extension script finds in pg_catalog first; citext's are named `@extschema:citext@.<` and so on,
 never through the target schema (`test/sql/hardening.sql` plants a `<` there and shows it is not
-the one chosen). Cross-type date/timestamp comparisons (`datecol < now()`) are not added: the lion
-date and timestamp classes have no cross-type EQUALITY either, and a family gains a type pair whole
-or not at all.
+the one chosen). Cross-type date/timestamp comparisons (`datecol < now()`) came later, as a family
+of their own (below, "Cross-type date and timestamp"): a family gains a type pair whole or not at
+all, equality included.
 
 **`lionvalidate()`** accepts strategies 6..9 in a scalar family only for a type pair that ALSO has
 proc 4 - the walk needs the comparison, and an operator the index could only answer by testing every
@@ -15885,6 +15904,55 @@ from btree as well. Collation is the planner's rule for equality, unchanged: the
 offered where `IndexCollMatchesExprColl()` holds, and the pushdown makes the same test in
 `lion_match_index()`. NULL keys never satisfy a range: the walk visits VALUE entries only, so the
 reserved NULL (and EMPTY) entries are never in one.
+
+### Cross-type date and timestamp (2026-10-28)
+
+`date_ops`, `timestamp_ops` and `timestamptz_ops` are one family, `datetime_ops`, as in btree, with
+five of btree's six cross-type pairs: `=`, the four comparisons and `<>`, and core's own proc 4 for
+each (`date_cmp_timestamp`, `timestamptz_cmp_timestamp` and the rest). So the commonest dashboard
+filters reach the column's index where they used to go to the heap: `created_at >= current_date`
+on a `timestamptz` column (a date bound), `tz >= localtimestamp - interval '7 days'` (a timestamp
+bound), `ts >= current_date - 7` on a `timestamp` one, `d = timestamp '...'`.
+
+The pair left out is a `timestamp` KEY against a `timestamptz` value (`ts >= now()`), because its
+comparison is not monotonic in the key. `timestamp_cmp_timestamptz` turns the key into an instant
+at the session's `TimeZone`, and a local time a DST change skips is taken at the offset before the
+change: in New York 2026-03-08 02:30 is 07:30 UTC while 03:00 is 07:00 UTC, so the key that sorts
+first compares later. A descent by that comparison lands in the wrong place, and a walk that ends
+at the first key past a bound stops before keys that still match; with the pair in the family, an
+equality probe at 03:00-04 found one of the two matching rows. btree's `datetime_ops` has the pair
+and the same fault (PostgreSQL's B-tree gives wrong answers on the same data), but lion's rule is
+the sequential scan's answer, so the clause stays a filter. The other direction is safe: a
+`timestamptz` key against a `timestamp` value converts the VALUE once, and the keys are instants
+in order already; a date converts to the instant of its first moment, which never goes backwards
+from one day to the next. Keeping the pair would need a lookup that tests every key within the
+largest UTC offset (about 16 hours) of the value with the operator itself, and trusts the order
+only outside that window; that is not built. The index compares a key with the value
+exactly as the operator does, since proc 4 IS the operator's comparison; where one side is
+timestamptz that comparison reads the session's `TimeZone`, which is why those operators are
+STABLE, and a scan evaluates them at run time as btree's does (`test/sql/datetime_crosstype.sql`
+shows one query answering differently under two zones, the same three ways: pushdown, bitmap scan,
+no index).
+
+What the integer and float families have and this one does not is a compatible HASH: a date and
+the timestamp at its midnight are equal and hash apart (`hashdate` of a day number,
+`timestamp_hash` of microseconds), and a timestamp and a timestamptz are equal only at a time zone
+the hash cannot know. §21's directory orders VALUE entries by `(proc 4, hash, bytes)`, and a lookup
+used to place a cross-type value by both terms, the hash being the search type's own on the
+promise that a family's types hash compatibly. That promise is now asked only of an UNORDERED
+column (§21, "Cross-type searches"): a cross-type search of an ORDERED column leaves the hash term
+out (`LionSearchKey.nohash`, set by `lion_probe_search_key()` whenever the probe has the family's
+cross-type proc 4), so the key stands before the whole run of entries proc 4 ties with it, and the
+run scan's equality decides among them - one entry, for these types, whose comparison never ties
+two different values. Every path that locates a cross-type value goes through that one search key
+(the single lookup, the batched list walk, the bitmap and plain scans, the joins' key lookups, the
+SQL counts), so none of them can find a hash where another finds none. A date, timestamp or
+timestamptz column is always ordered - its proc 4 is the type's default btree comparison, which a
+build can always reproduce (§21's rule 1) - so the unordered route never meets this family.
+
+Bit slices (§51, §53) still answer only a bound of the column's own type
+(`lion_slice_range_type_ok()`): a cross-type bound on a sliced column is a range of entries or
+summaries, as on any other column, and the slices still answer the aggregates over it.
 
 ### The bounded walk (`LionRange`, lion_range.c)
 
@@ -26864,7 +26932,19 @@ scans took 5 and 8 times as long as the serial one (§44.9).
   (`allow_sync = false`), which could start part-way through the heap: the sample must be the same
   from build to build, and the second scan's REFINE items then lie in heap order, as each
   partition's CODE items do whatever order the rows came in, being sorted by TID. Built in
-  parallel from PostgreSQL 16 (§44.12); progress is reported for the second scan. `CREATE INDEX
+  parallel from PostgreSQL 16 (§44.12). Its phases are reported in `pg_stat_progress_create_index`
+  (`lionvecbuildphasename()`), numbered on from core's `initializing` as nbtree's are: `sampling
+  table`, the first scan, and `assigning rows to partitions`, the second, with the blocks the heap
+  AM reports, and the second with its rows done, every 1024 (`LIONVEC_PROGRESS_ROWS`), of the rows
+  the first met, which differ only by a row pruned between the scans or one a `CONCURRENTLY`
+  build's snapshots disagree on; between them `computing centroids`, k-means' iterations done of
+  `LIONVEC_KMEANS_ITERS`, reported after each that moved the centroids (through
+  `LionVecKmeansWork`'s `progress` serially, by the leader in parallel), fewer than all of them when
+  k-means stops early; then `sorting rows`, the CODE items' sort, `writing partitions`, the rows
+  written to the CODE chains, each by its own item and not its copy, and `WAL-logging index`. Only
+  a serial build or a parallel one's leader reports, as in core's builds; in the second scan each
+  process adds its rows to a shared atomic count every 1024, before it says it is done, and the
+  leader reports the count. `CREATE INDEX
   CONCURRENTLY` and
   `REINDEX` work as for any AM. An unlogged index's init fork is the meta page and empty REST and
   NULL chains.

@@ -251,7 +251,7 @@ struct LionSpool
 	int			firstfile;		/* column c's tapes are file firstfile + c */
 	BlockNumber curblk;			/* the heap page the scan is on */
 	bool		haveblk;
-	double		ntids;			/* (key, code) pairs added */
+	double		ntids;			/* (key, code) pairs added, slices' too */
 	double		nrows;			/* rows added, each once */
 	int			nspills;		/* runs spilled, all columns together */
 	int			unchecked;		/* pairs added since the budget was checked */
@@ -756,9 +756,10 @@ lion_acc_add_reserved(LionSpool *sp, LionAccCol *col, int kind, uint64 code)
  * A row's code in the SLICE entry at index idx of a bit-sliced column
  * (DESIGN.md §51).  Not a key the budget counts by itself: a row brings at
  * most LION_ACC_NSLICES of them, and the budget is checked at every heap page.
+ * It is a pair all the same, which the build's progress counts (lion_build.c).
  */
 static inline void
-lion_acc_add_slice(LionAccCol *col, int idx, uint64 code)
+lion_acc_add_slice(LionSpool *sp, LionAccCol *col, int idx, uint64 code)
 {
 	if (col->slices[idx] == NULL)
 		col->slices[idx] =
@@ -769,6 +770,7 @@ lion_acc_add_slice(LionAccCol *col, int idx, uint64 code)
 							   0, code, NULL);
 	else
 		lion_acc_append(col, col->slices[idx], code, NULL);
+	sp->ntids += 1;
 }
 
 /*
@@ -783,7 +785,7 @@ lion_acc_add_slice(LionAccCol *col, int idx, uint64 code)
  * as whole items - the dedicated route the section describes.
  */
 static void
-lion_acc_add_slices(LionAccCol *col, Datum key, uint64 code)
+lion_acc_add_slices(LionSpool *sp, LionAccCol *col, Datum key, uint64 code)
 {
 	int			nbits = col->state->slicebits;
 	int64		v;
@@ -806,10 +808,10 @@ lion_acc_add_slices(LionAccCol *col, Datum key, uint64 code)
 	{
 		int			bit = pg_rightmost_one_pos64(enc);
 
-		lion_acc_add_slice(col, bit, code);
+		lion_acc_add_slice(sp, col, bit, code);
 		enc &= enc - 1;
 	}
-	lion_acc_add_slice(col, nbits, code);
+	lion_acc_add_slice(sp, col, nbits, code);
 }
 
 /* ---------------------------------------------------------------------
@@ -2538,7 +2540,7 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 
 			/* ... and a sliced column's bits (DESIGN.md §51) */
 			if (cs->sliced)
-				lion_acc_add_slices(col, key, code);
+				lion_acc_add_slices(sp, col, key, code);
 		}
 	}
 
@@ -2546,6 +2548,11 @@ lion_spool_add(LionSpool *sp, ItemPointer tid, Datum *values, bool *isnull)
 	MemoryContextReset(sp->rowcxt);
 }
 
+/*
+ * The (key, code) pairs added, a bit-sliced column's slices included: every
+ * one comes out of the merge once, which is what the build's progress counts
+ * against (lion_build.c).
+ */
 double
 lion_spool_ntids(const LionSpool *sp)
 {
