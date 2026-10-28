@@ -148,6 +148,12 @@ for ext in $exts; do
 		# an index on every operator class it has, so that the update meets
 		# families in use
 		$PSQL -d "$db" -c "CREATE TYPE lion_upgrade_enum AS ENUM ('a', 'b')" || exit 1
+		if ! opclasses "$db" "$ext" > "$OUT/$tag.classes"; then
+			echo "$tag: could not list the operator classes" >&2
+			unplant
+			failed=1
+			continue
+		fi
 		i=0
 		indexes=0
 		while IFS='|' read -r type am class; do
@@ -156,7 +162,7 @@ for ext in $exts; do
 					-c "CREATE INDEX t${i}_idx ON t$i USING $am (c $class)" 2>> "$OUT/$tag.idx.err"; then
 				indexes=$((indexes + 1))
 			fi
-		done < <(opclasses "$db" "$ext")
+		done < "$OUT/$tag.classes"
 		if [ $indexes -ne $i ]; then
 			echo "$tag: $((i - indexes)) of $i operator classes could not be indexed:" >&2
 			cat "$OUT/$tag.idx.err" >&2

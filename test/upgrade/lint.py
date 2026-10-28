@@ -111,9 +111,10 @@ def main():
         if set(install) != {cur}:
             fail('%s: the install scripts are %s; there must be exactly one, %s--%s.sql (older versions are reached by upgrade scripts)'
                  % (ext, sorted(install.values()) or 'none', ext, cur))
+        # every upgrade script's target must lead on to the current version
         for (a, b) in upgrade:
-            if not reaches(upgrade, a, cur):
-                fail('%s: no upgrade path from %s to %s' % (ext, a, cur))
+            if not reaches(upgrade, b, cur):
+                fail('%s: %s--%s--%s.sql leads to %s, which has no upgrade path to %s' % (ext, ext, a, b, b, cur))
 
         if not base:
             continue
