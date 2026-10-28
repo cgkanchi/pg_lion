@@ -12,8 +12,9 @@
 # UPDATE, and requires the extension's catalog entries (test/upgrade/
 # catalog.sql) to equal those of a fresh CREATE EXTENSION, and every index to
 # REINDEX.  A version of the script that this server cannot install (one for
-# a later PostgreSQL major, or naming a C function the library no longer has)
-# is skipped and reported; the newest earlier version must install.
+# another PostgreSQL major, or naming a C function the library no longer has)
+# is skipped and reported; any other install failure fails, and the newest
+# earlier version must install.
 #
 # It needs the current build installed (make install), a server to talk to
 # (./dev.sh env sets PGHOST and friends), and write access to the server's
@@ -42,6 +43,30 @@ fi
 
 failed=0
 db=lion_upgrade_test
+
+# the old install script put in the extension directory for the test under
+# way, removed however the script ends
+planted=
+unplant() {
+	[ -z "$planted" ] || rm -f "$planted"
+	planted=
+}
+trap unplant EXIT
+
+# Whether a CREATE EXTENSION error is one of the two this server is expected
+# to give an old script: a core function this major does not have (such as
+# hashbool()), or a C function the library no longer has.  Anything else,
+# including a missing lion function, is a failure.
+expected_install_error() {
+	local err
+	err=$(grep -m1 ERROR "$1")
+	case "$err" in
+	*'could not find function "'*'" in file'*) return 0 ;;
+	*'ERROR:  function lion'*) return 1 ;;
+	*'ERROR:  function '*') does not exist'*) return 0 ;;
+	esac
+	return 1
+}
 
 # The extension's indexable operator classes, as "<column type>|<am>|<class>"
 # lines, separated by |: polymorphic input types get a concrete type of their kind.
@@ -95,7 +120,7 @@ for ext in $exts; do
 		done_blobs[$ver:$blob]=1
 		# the current version's own script is the fresh install; an earlier
 		# commit's script under the current version name is what
-		# test/upgrade/lint.sh refuses on a pull request
+		# test/upgrade/lint.py refuses on a pull request
 		[ "$ver" != "$cur" ] || continue
 
 		tag="$ext-$ver-${commit:0:8}"
@@ -104,13 +129,14 @@ for ext in $exts; do
 			failed=1
 			continue
 		fi
-		git cat-file blob "$blob" > "$EXTDIR/$ext--$ver.sql"
+		planted="$EXTDIR/$ext--$ver.sql"
+		git cat-file blob "$blob" > "$planted"
 
 		dropdb --if-exists "$db" 2>/dev/null && createdb "$db" || exit 1
 		if ! $PSQL -d "$db" -c "CREATE EXTENSION $ext VERSION '$ver' CASCADE" 2> "$OUT/$tag.err"; then
-			rm -f "$EXTDIR/$ext--$ver.sql"
-			if [ $newest = 1 ]; then
-				echo "$tag: the newest earlier version does not install:" >&2
+			unplant
+			if [ $newest = 1 ] || ! expected_install_error "$OUT/$tag.err"; then
+				echo "$tag: does not install:" >&2
 				cat "$OUT/$tag.err" >&2
 				failed=1
 			else
@@ -137,11 +163,11 @@ for ext in $exts; do
 		if ! $PSQL -d "$db" -c "ALTER EXTENSION $ext UPDATE" 2> "$OUT/$tag.update"; then
 			echo "$tag: ALTER EXTENSION UPDATE failed:" >&2
 			cat "$OUT/$tag.update" >&2
-			rm -f "$EXTDIR/$ext--$ver.sql"
+			unplant
 			failed=1
 			continue
 		fi
-		rm -f "$EXTDIR/$ext--$ver.sql"
+		unplant
 
 		$PSQL -d "$db" -v ext="$ext" -f test/upgrade/catalog.sql > "$OUT/$tag.cat" || exit 1
 		if ! diff -u "$OUT/$ext-fresh.cat" "$OUT/$tag.cat" > "$OUT/$tag.diff"; then
