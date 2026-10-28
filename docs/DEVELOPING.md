@@ -15,7 +15,9 @@ crash-recovery/hot-standby harness (`test/recovery/run.sh`) in both WAL modes wi
 `wal_consistency_checking`.  The other source builds - 16, 17, 19 and master, with assertions,
 and from 17 with injection points - run when `.github/workflows/optional.yml` is started by hand
 from the Actions tab, which builds all five by default; master is tested only there.  The same
-workflow runs 18's packages on arm64, which is not a first-class target.  On the source builds pg_lion itself is compiled with UBSan
+workflow runs 18's packages on arm64, which is not a first-class target.  A pull request that changes only
+documentation - Markdown files, `docs/`, `bench/` and `LICENSE`, as `.github/workflows/changes.yml`
+says - skips the build and test jobs and CodeQL; the `CI result` check still reports, and passes.  On the source builds pg_lion itself is compiled with UBSan
 (`COPT=-fsanitize=undefined -fno-sanitize-recover=all`), so the whole suite runs under it and a
 report aborts the backend that met it.  What parks a backend on an injection point - the isolation
 specs that do (`grep -l injection_points test/isolation/*.spec`), which are the race tests of the
