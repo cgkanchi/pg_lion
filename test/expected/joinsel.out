@@ -17,6 +17,7 @@ CREATE TABLE jsl (fk int NOT NULL, a int NOT NULL, flag int NOT NULL);
 INSERT INTO jsl SELECT i, 1, i % 3 FROM generate_series(1, 20000) i;
 CREATE INDEX jsl_fk ON jsl (fk);
 CREATE INDEX jsl_lion ON jsl USING lion (a, flag, fk);
+NOTICE:  lion index "jsl_lion": column "fk" has about one row per key
 CREATE TABLE jsl_i (fk int NOT NULL, grp int NOT NULL);
 INSERT INTO jsl_i SELECT 1 + (i * 37) % 20000, i % 125 FROM generate_series(1, 5000) i;
 CREATE TABLE jsl_d (id int PRIMARY KEY);
