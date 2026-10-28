@@ -30090,6 +30090,14 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   fact filter with no entry (`x = 77`), it is 16.7 against 138, and both run in hundredths of a
   millisecond.
 
+**Privileges** (§9, "EXECUTE on what a count replaces"; 2026-10-28). The node initialises only
+the WHERE's quals (for its set) and the heap recheck; the join's clause, which core's nested loop
+initialises as its Index Scan's `indexqualorig`, the anti join's clause, and the predicates of the
+GROUP BY's expressions, which setrefs.c replaces with the node's columns in the Agg above, nobody
+would. So the planner records their functions with the dimension's WHERE in custom_private member
+`PJ_PRIV_EXECUTE` (`pj_execute_functions()`), and `pj_begin()` checks them for the current user
+before anything starts, plain EXPLAIN included. node_contracts.sql runs the node through each.
+
 **Declined, and why.**
 
 - *A join path* (`set_join_pathlist_hook`) emitting the dimension's columns: those are what the
@@ -30505,8 +30513,12 @@ more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discoun
 
 ### 47.4 Execution (`oj_begin()`, `oj_exec()`, `oj_rescan()`)
 
-- **Begin.** The custom_private shape is checked against the plan's children and target, then the
-  sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
+- **Begin.** The custom_private shape is checked against the plan's children and target, and
+  EXECUTE is asked of the current user, plain EXPLAIN included, on the functions of the join's
+  clause and of each key set's (`OJ_PRIV_EXECUTE`, `oj_execute_functions()`; §9, "EXECUTE on what
+  a count replaces"): the node descends the dimension's B-tree with a scan key and tests a key set
+  through a hash table, so nothing initialises those clauses as the joins it replaces would. Then
+  the sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
   and kept out of `custom_ps`; each key set's plan goes into `custom_ps`, and EXPLAIN shows it
   under the join. LionOrdered's `lo_begin()` checks its side's flags: a serial B-tree walk, and the
   dimension a probe in heap mode with exactly one scan key, `pk = NULL`, an equality on the first
