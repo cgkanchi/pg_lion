@@ -936,7 +936,11 @@ working around a bad choice:
   none of its columns in the output - is read once, before the walk, into a hash set of its keys,
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
-  spilled). Where the fact's key column has a Lion index of its own (scalar, of the key's type,
+  spilled). The table is read by the cheapest of its own plans once the pages each reads outside
+  the cache are charged - a bitmap heap scan's or a covering walk's at `pg_lion.cold_stream_page_cost`,
+  an index scan's at `pg_lion.cold_page_cost`, in the share of the tables `effective_cache_size`
+  cannot hold - so that a walk of the key's B-tree is taken over a bitmap heap scan of most of the
+  table where the table is larger than the cache. Where the fact's key column has a Lion index of its own (scalar, of the key's type,
   not partial unless the query implies its predicate), the key set's keys are also looked up in it
   and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
   (`pg_lion.enable_key_set_fold`, below; `Key Set Index: <index>` in `EXPLAIN`). Where the fact's
@@ -1227,8 +1231,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
-| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
-| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads, in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"); 0 turns the charge off |
+| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads; and an index scan that may feed a `LionOrderedJoin`'s key set; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"; §47.6, "The feed"); 0 turns the charge off |
+| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads; and the bitmap heap scans and covering walks that may feed a `LionOrderedJoin`'s key set, whatever `competitor_pricing` says; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"; §47.6, "The feed"); 0 turns the charge off |
 | `probe_entry_cost` | 4.5 | `cpu_operator_cost` | an entry a nested loop's B-tree probe (`LionBtreeScan` parameterized by the outer row, and `LionProbeJoin`'s descents) meets, beyond core's Index Scan of the same B-tree: its test against the set, measured at that Index Scan's own rate (DESIGN.md §49, "The probe's own work") |
 | `probe_rescan_cost` | 16 | `cpu_operator_cost` | a scan of `LionBtreeScan`'s probe beyond core's Index Scan's: its rescan, and its code run beside core's, measured so |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
