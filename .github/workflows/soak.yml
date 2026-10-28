@@ -47,7 +47,8 @@ jobs:
           SOAK_DURATION: ${{ inputs.duration || '600' }}
         run: |
           case "$SOAK_DURATION" in
-            ''|*[!0-9]*) echo "duration must be a whole number of seconds, not '$SOAK_DURATION'" >&2; exit 1 ;;
+            # no leading zero: soak.sh's shell arithmetic would read it as octal
+            ''|*[!0-9]*|0*) echo "duration must be a whole number of seconds without leading zeroes, not '$SOAK_DURATION'" >&2; exit 1 ;;
           esac
           if [ "$SOAK_DURATION" -gt 5400 ]; then
             echo "duration $SOAK_DURATION is over 5400 seconds a mode: both modes would not finish inside the job's time limit" >&2
