@@ -75,6 +75,7 @@
 #include "catalog/index.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
+#include "commands/progress.h"
 #include "executor/instrument.h"
 #include "miscadmin.h"
 #include "nodes/execnodes.h"
@@ -526,6 +527,15 @@ typedef struct LionBuildState
 	LionPosBuild *posbuild;
 	bool		curpos;			/* ... for the column being written */
 	LionPageWriter pw;
+
+	/*
+	 * Progress (DESIGN.md §24, "Progress"): the (key, code) pairs written so
+	 * far, counted by whoever writes a column, and reported by the process
+	 * whose build pg_stat_progress_create_index shows - a serial build, or
+	 * the leader of a parallel one, never a worker, as in core's builds.
+	 */
+	bool		progress;
+	uint64		ncodes;
 } LionBuildState;
 
 static void lion_build_callback(Relation index, ItemPointer tid, Datum *values,
@@ -2406,7 +2416,6 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 	MemoryContext oldctx = MemoryContextSwitchTo(bs->tmpctx);
 	LionBuilder *one;
 	LionBuilder **b = (n == 1) ? &one : palloc(sizeof(LionBuilder *) * n);
-	uint64		ncodes = 0;
 	uint64		code;
 	int			which;
 	int			i;
@@ -2484,8 +2493,18 @@ lion_build_emit(void *arg, LionSpoolGroup *group)
 			lion_sum_add(bs->sum, code);
 			bs->sum->ntids++;
 		}
-		if ((++ncodes & 0xFFFF) == 0)
+
+		/*
+		 * An interrupt and the progress (DESIGN.md §24, "Progress") every
+		 * 64k codes, of one key or of many.
+		 */
+		if ((++bs->ncodes & 0xFFFF) == 0)
+		{
 			CHECK_FOR_INTERRUPTS();
+			if (bs->progress)
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+											 (int64) bs->ncodes);
+		}
 	}
 
 	/*
@@ -2716,6 +2735,9 @@ lion_build_column(LionBuildState *bs, int c)
 	}
 	bs->curpos = false;
 	bs->cur = NULL;
+	if (bs->progress)
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+									 (int64) bs->ncodes);
 }
 
 /* ---------------------------------------------------------------------
@@ -2778,6 +2800,8 @@ typedef struct LionBuildShared
 	int			nparticipantsdone;
 	double		reltuples;
 	double		indtuples;
+	double		ntids;			/* the spools' (key, code) pairs, for the
+								 * leader's progress */
 	bool		brokenhotchain;
 
 	/* The write (LionBuildColumn says which column is whose). */
@@ -2803,6 +2827,7 @@ typedef struct LionBuildColumn
 	bool		done;			/* the worker's file is complete */
 	bool		summarized;
 	int64		nsummaries;
+	uint64		ncodes;			/* the (key, code) pairs it wrote */
 } LionBuildColumn;
 
 typedef struct LionBuildLeader
@@ -2870,6 +2895,14 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	reltuples = table_index_build_scan(heap, index, indexInfo, true, progress,
 									   lion_build_callback, spool, scan);
 
+	/*
+	 * The leader's share of the scan is done; what is left of its part is
+	 * merging its runs into its tapes, and then waiting for the workers'.
+	 */
+	if (progress)
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+									 LION_PROGRESS_PHASE_EXPORT);
+
 	blocks = palloc(sizeof(int64) * shared->ncols);
 	lion_spool_export(spool, &tapes[filenum * shared->ncols], blocks);
 
@@ -2879,6 +2912,7 @@ lion_parallel_scan_and_spool(LionBuildShared *shared, TapeShare *tapes,
 	shared->nparticipantsdone++;
 	shared->reltuples += reltuples;
 	shared->indtuples += lion_spool_nrows(spool);
+	shared->ntids += lion_spool_ntids(spool);
 	if (indexInfo->ii_BrokenHotChain)
 		shared->brokenhotchain = true;
 	SpinLockRelease(&shared->mutex);
@@ -3029,10 +3063,11 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 			started = true;
 		}
 
-		/* each column counts its own blocks, from 0 */
+		/* each column counts its own blocks, from 0, and its own codes */
 		bs.nblocks = 0;
 		bs.summary_cols = 0;
 		bs.nsummaries = 0;
+		bs.ncodes = 0;
 		lion_parallel_colname(name, c);
 		bs.colout = BufFileCreateFileSet(&shared->fileset.fs, name);
 		bs.reader = lion_parallel_reader(shared, tapes, &bs.ix, c,
@@ -3047,6 +3082,7 @@ lion_parallel_write_columns(LionBuildShared *shared, LionBuildColumn *columns,
 		SpinLockAcquire(&shared->mutex);
 		columns[c].summarized = (bs.summary_cols != 0);
 		columns[c].nsummaries = bs.nsummaries;
+		columns[c].ncodes = bs.ncodes;
 		columns[c].done = true;
 		SpinLockRelease(&shared->mutex);
 		ConditionVariableBroadcast(&shared->coldonecv);
@@ -3116,6 +3152,10 @@ lion_parallel_replay_column(LionBuildState *bs, int c)
 	if (col->summarized)
 		bs->summary_cols |= ((uint32) 1) << (bs->ix.cols[c].attno - 1);
 	bs->nsummaries += col->nsummaries;
+	bs->ncodes += col->ncodes;
+	if (bs->progress)
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+									 (int64) bs->ncodes);
 }
 
 static void
@@ -3213,6 +3253,7 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 	shared->nparticipantsdone = 0;
 	shared->reltuples = 0.0;
 	shared->indtuples = 0.0;
+	shared->ntids = 0.0;
 	shared->brokenhotchain = false;
 	ConditionVariableInit(&shared->coldonecv);
 	table_parallelscan_initialize(heap,
@@ -3281,10 +3322,11 @@ lion_begin_parallel(LionBuildState *bs, Relation heap, Relation index,
 
 /*
  * Wait for every participant's tapes.  Returns the number of heap tuples the
- * scan saw.
+ * scan saw, and in *ntids the (key, code) pairs the spools took.
  */
 static double
-lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
+lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain,
+					   double *ntids)
 {
 	LionBuildShared *shared = bs->leader->shared;
 	double		reltuples;
@@ -3294,6 +3336,7 @@ lion_parallel_heapscan(LionBuildState *bs, bool *brokenhotchain)
 	SpinLockAcquire(&shared->mutex);
 	reltuples = shared->reltuples;
 	bs->indtuples = shared->indtuples;
+	*ntids = shared->ntids;
 	if (shared->brokenhotchain)
 		*brokenhotchain = true;
 	SpinLockRelease(&shared->mutex);
@@ -3360,6 +3403,31 @@ lion_parallel_build_main(dsm_segment *seg, shm_toc *toc)
 
 #endif							/* PG_VERSION_NUM >= 170000 */
 
+/*
+ * The name of a phase of the build, for pg_stat_progress_create_index
+ * (DESIGN.md §24, "Progress").  The ones a parallel build alone goes
+ * through say "(workers)", as GIN's do.
+ */
+char *
+lionbuildphasename(int64 phasenum)
+{
+	switch (phasenum)
+	{
+		case PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE:
+			return "initializing";
+		case LION_PROGRESS_PHASE_TABLESCAN:
+			return "scanning table";
+		case LION_PROGRESS_PHASE_EXPORT:
+			return "merging runs (workers)";
+		case LION_PROGRESS_PHASE_WRITE:
+			return "writing columns";
+		case LION_PROGRESS_PHASE_REPLAY:
+			return "copying columns (workers)";
+		default:
+			return NULL;
+	}
+}
+
 IndexBuildResult *
 lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
@@ -3367,6 +3435,7 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	LionOptions opts;
 	LionBuildState bs;
 	double		reltuples;
+	double		ntids;
 	BulkWriteBuffer metabuf;
 	int			ncols;
 	int			c;
@@ -3387,6 +3456,14 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	ncols = bs.ix.ncolumns;
 
 	/*
+	 * Progress (DESIGN.md §24, "Progress"): the scan's blocks are the heap
+	 * AM's to report (table_index_build_scan()), the rest is ours.
+	 */
+	bs.progress = true;
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+								 LION_PROGRESS_PHASE_TABLESCAN);
+
+	/*
 	 * The scan.  Core asks for workers only where the AM can take them
 	 * (amcanbuildparallel, 17 and later) and plan_create_index_workers()
 	 * allows them: max_parallel_maintenance_workers, the table's
@@ -3397,7 +3474,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		lion_begin_parallel(&bs, heap, index, indexInfo->ii_Concurrent,
 							indexInfo->ii_ParallelWorkers);
 	if (bs.leader != NULL)
-		reltuples = lion_parallel_heapscan(&bs, &indexInfo->ii_BrokenHotChain);
+		reltuples = lion_parallel_heapscan(&bs, &indexInfo->ii_BrokenHotChain,
+										   &ntids);
 	else
 #endif
 	{
@@ -3412,6 +3490,28 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 										   lion_build_callback, bs.spool, NULL);
 		bs.indtuples = lion_spool_nrows(bs.spool);
+		ntids = lion_spool_ntids(bs.spool);
+	}
+
+	/*
+	 * The write's target: every (key, code) pair the spools took, each of
+	 * which the merge hands out once; and the scan's blocks cleared, as
+	 * nbtree clears them.
+	 */
+	{
+		const int	progress_index[] = {
+			PROGRESS_CREATEIDX_SUBPHASE,
+			PROGRESS_CREATEIDX_TUPLES_TOTAL,
+			PROGRESS_SCAN_BLOCKS_TOTAL,
+			PROGRESS_SCAN_BLOCKS_DONE
+		};
+		const int64 progress_vals[] = {
+			LION_PROGRESS_PHASE_WRITE,
+			(int64) ntids,
+			0, 0
+		};
+
+		pgstat_progress_update_multi_param(4, progress_index, progress_vals);
 	}
 
 	/*
@@ -3451,9 +3551,13 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 			if (!lion_parallel_take_column(bs.leader, c, &alone))
 			{
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+											 LION_PROGRESS_PHASE_REPLAY);
 				lion_parallel_replay_column(&bs, c);
 				continue;
 			}
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+										 LION_PROGRESS_PHASE_WRITE);
 			bs.memkb = alone ? maintenance_work_mem :
 				maintenance_work_mem / bs.leader->nparticipants;
 			bs.reader = lion_parallel_reader(bs.leader->shared,
@@ -3474,6 +3578,8 @@ lionbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	lion_build_finish_dir(&bs);
 
+	/* every pair the spools took, written once (lion_spool_ntids()) */
+	Assert(bs.ncodes == (uint64) ntids);
 	Assert(BlockNumberIsValid(bs.root));
 	metabuf = smgr_bulk_get_buf(bs.bulk);
 	lion_init_metapage((Page) metabuf->data, bs.inline_limit, bs.root,

@@ -60,6 +60,7 @@
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "common/pg_prng.h"
 #include "executor/instrument.h"
@@ -1328,6 +1329,26 @@ lionvec_note_key(Page page, ItemPointer tid)
 #define LIONVEC_KMEANS_ITERS	10
 
 /*
+ * The build's phases, as pg_stat_progress_create_index shows them
+ * (lionvecbuildphasename(), DESIGN.md §44.5), numbered on from
+ * PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE, which is 1 (commands/progress.h),
+ * as nbtree numbers its own.  The two scans' blocks are the heap AM's to
+ * report (table_index_build_scan()); the rest is the build's.
+ */
+#define LIONVEC_PROGRESS_PHASE_SAMPLE	2	/* the first pass */
+#define LIONVEC_PROGRESS_PHASE_KMEANS	3	/* the centroids */
+#define LIONVEC_PROGRESS_PHASE_ASSIGN	4	/* the second pass */
+#define LIONVEC_PROGRESS_PHASE_SORT		5	/* the CODE items' sort */
+#define LIONVEC_PROGRESS_PHASE_WRITE	6	/* the chains and the meta page */
+#define LIONVEC_PROGRESS_PHASE_WAL		7	/* log_newpage_range() */
+
+/*
+ * The second pass's rows and the CODE chains' are reported every this many,
+ * and a parallel build's processes add theirs to the shared count as often.
+ */
+#define LIONVEC_PROGRESS_ROWS	1024
+
+/*
  * The reservoir (lion_vec_math.h, lionvec_sample_max()) starts at
  * LIONVEC_SAMPLE_FIRST rows and doubles as it fills, so that a small
  * table's sample takes what its rows do and not the half of
@@ -1417,6 +1438,7 @@ typedef struct LionVecBuildState
 	float	   *hbuf;			/* [dims]: a halfvec row's floats */
 	double	   *sum;			/* [dims] */
 	double		nsum;			/* rows with a vector (cosine: a nonzero one) */
+	double		nmet;			/* rows, a NULL or a zero vector too */
 	BlockNumber hblocks;		/* the heap's blocks as the pass began */
 	LionVecRotation srot;
 	uint8	   *scodes;			/* [scap][dimsp] */
@@ -1472,6 +1494,16 @@ typedef struct LionVecBuildState
 	LionVecBuildLeader *leader; /* a parallel build's, in its leader */
 	MemoryContext buildcxt;		/* what lasts the build */
 	MemoryContext tmpcxt;		/* reset after each row */
+
+	/*
+	 * Progress (DESIGN.md §44.5): reported by a serial build and a parallel
+	 * one's leader, never by a worker, as in core's builds.  The second
+	 * pass's rows not yet counted, and in a parallel build the count every
+	 * process adds them to, in shared memory.
+	 */
+	bool		progress;
+	uint32		npending;
+	pg_atomic_uint64 *rowsdone;
 } LionVecBuildState;
 
 Buffer
@@ -1709,6 +1741,7 @@ lionvec_build_mean_callback(Relation index, ItemPointer tid, Datum *values,
 	int			i;
 	double		scale = 1.0;
 
+	bs->nmet += 1.0;
 	if (isnull[0])
 		return;
 	old = MemoryContextSwitchTo(bs->tmpcxt);
@@ -1912,6 +1945,51 @@ lionvec_build_use_arrays(LionVecBuildState *bs)
 }
 
 /*
+ * The second pass's rows done, for pg_stat_progress_create_index: this
+ * process's, or in a parallel build every process's, its own pending ones
+ * added to the shared count first.
+ */
+static void
+lionvec_build_progress_rows(LionVecBuildState *bs)
+{
+	uint64		done;
+
+	if (bs->rowsdone != NULL)
+		done = pg_atomic_add_fetch_u64(bs->rowsdone, bs->npending);
+	else
+		done = (uint64) bs->indtuples;
+	bs->npending = 0;
+	if (bs->progress)
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+									 (int64) done);
+}
+
+/* k-means' iterations done (LionVecKmeansWork's progress) */
+static void
+lionvec_build_progress_kmeans(void *arg, int made)
+{
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, made);
+}
+
+/* A phase of the build begun, its count to reach total, and no blocks. */
+static void
+lionvec_build_progress_phase(int phase, int64 total)
+{
+	const int	progress_index[] = {
+		PROGRESS_CREATEIDX_SUBPHASE,
+		PROGRESS_CREATEIDX_TUPLES_TOTAL,
+		PROGRESS_CREATEIDX_TUPLES_DONE,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 progress_vals[] = {
+		phase, total, 0, 0, 0
+	};
+
+	pgstat_progress_update_multi_param(5, progress_index, progress_vals);
+}
+
+/*
  * What lionvec_kmeans() works in, its centroids' plane 1 in bs->a, and its
  * routing through bs's regions, if any, its own.
  */
@@ -2098,6 +2176,8 @@ lionvec_build_centroids(LionVecBuildState *bs, const LionVecSample *sample)
 
 	Assert(k >= 1 && k <= sample->n);
 	lionvec_build_kmeans_work(bs, &w);
+	if (bs->progress)
+		w.progress = lionvec_build_progress_kmeans;
 	if (routed)
 		lionvec_build_region_maker(bs, &mk);
 	else
@@ -2463,6 +2543,8 @@ lionvec_build_callback(Relation index, ItemPointer tid, Datum *values,
 	if (it->hasloc)
 		lionvec_build_put_loc(bs, it->loc);
 	bs->indtuples += 1;
+	if (++bs->npending >= LIONVEC_PROGRESS_ROWS)
+		lionvec_build_progress_rows(bs);
 
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(bs->tmpcxt);
@@ -2529,6 +2611,7 @@ lionvec_build_write_codes(LionVecBuildState *bs, Tuplesortstate *sort,
 	TupleTableSlot *slot = MakeSingleTupleTableSlot(lionvec_build_sort_desc(),
 													&TTSOpsMinimalTuple);
 	int64		last = -1;
+	int64		nrows = 0;
 	bool		more;
 
 	if (bs->nparts > 0)
@@ -2617,11 +2700,18 @@ lionvec_build_write_codes(LionVecBuildState *bs, Tuplesortstate *sort,
 				InvalidOffsetNumber)
 				elog(ERROR, "lionvec: could not add an item of %zu bytes", len);
 			lionvec_note_key(page, &code->tid);
+			/* the rows written, each by its own item, not its copy's */
+			if (bs->progress && (code->flags & LIONVEC_SPILL) == 0 &&
+				++nrows % LIONVEC_PROGRESS_ROWS == 0)
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+											 nrows);
 			more = tuplesort_gettupleslot(sort, true, false, slot, NULL);
 		}
 	}
 	MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+	if (bs->progress)
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, nrows);
 
 	/*
 	 * The locator (§44.13): kept where the plan said, or where the second
@@ -2924,7 +3014,13 @@ typedef struct LionVecBuildShared
 	int			kmoved;
 	ConditionVariable donecv;
 
-	/* SCAN: each process reports here, under mutex, when its sort is done */
+	/*
+	 * SCAN: the rows every process has assigned so far, for the leader's
+	 * progress (DESIGN.md §44.5), each adding its own every
+	 * LIONVEC_PROGRESS_ROWS; and each reports here, under mutex, when its
+	 * sort is done.
+	 */
+	pg_atomic_uint64 rowsdone;
 	int			nparticipantsdone;
 	double		reltuples;
 	double		indtuples;
@@ -3146,6 +3242,8 @@ lionvec_parallel_kmeans(LionVecBuildState *bs, const LionVecSample *s,
 		if (moved == 0)
 			break;
 		lionvec_kmeans_update(s, k, unit, bs->a.assign, bs->a.cent, w);
+		if (bs->progress)
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE, made);
 	}
 	return made;
 }
@@ -3170,10 +3268,13 @@ lionvec_parallel_rows(LionVecBuildState *bs, LionVecBuildShared *shared,
 	lionvec_build_rows_begin(bs, heap, memkb, coordinate);
 
 	indexInfo->ii_Concurrent = shared->isconcurrent;
+	bs->rowsdone = &shared->rowsdone;
 	scan = lion_table_beginscan_parallel(heap,
 										 ParallelTableScanFromLionVecBuildShared(shared));
 	reltuples = table_index_build_scan(heap, bs->index, indexInfo, true, progress,
 									   lionvec_build_callback, bs, scan);
+	/* the last rows counted before this process says it is done */
+	lionvec_build_progress_rows(bs);
 	lionvec_build_end_refine(bs);
 	lionvec_build_rows_end(bs);
 	tuplesort_performsort(bs->sort);
@@ -3306,6 +3407,7 @@ lionvec_begin_parallel(LionVecBuildState *bs, Relation heap, bool isconcurrent,
 	shared->phase = LIONVEC_PHASE_NONE;
 	shared->generation = 0;
 	pg_atomic_init_u64(&shared->next, 0);
+	pg_atomic_init_u64(&shared->rowsdone, 0);
 	shared->refine_tail = InvalidBlockNumber;
 	table_parallelscan_initialize(heap,
 								  ParallelTableScanFromLionVecBuildShared(shared),
@@ -3409,6 +3511,9 @@ lionvec_parallel_heapscan(LionVecBuildState *bs, Relation heap,
 							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
 	}
 	ConditionVariableCancelSleep();
+	/* every process's rows, each having added its last before it said so */
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+								 (int64) pg_atomic_read_u64(&shared->rowsdone));
 
 	coordinate = palloc0(sizeof(SortCoordinateData));
 	coordinate->isWorker = false;
@@ -3629,9 +3734,12 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 * is the same from build to build; nor does the second, whose items are
 	 * sorted back into heap order (by TID) whatever order it reads them in.
 	 */
+	bs.progress = true;
+	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+								 LIONVEC_PROGRESS_PHASE_SAMPLE);
 	INSTR_TIME_SET_CURRENT(start);
 	bs.hblocks = RelationGetNumberOfBlocks(heap);
-	table_index_build_scan(heap, index, indexInfo, false, false,
+	table_index_build_scan(heap, index, indexInfo, false, true,
 						   lionvec_build_mean_callback, &bs, NULL);
 
 	/* the rotation, and the mean rotated, in this backend's memory */
@@ -3693,6 +3801,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		int			request = lionvec_build_workers(heap, index, bs.nsum);
 		LionVecSample sample;
 
+		/* k-means' iterations, at most (DESIGN.md §44.5) */
+		lionvec_build_progress_phase(LIONVEC_PROGRESS_PHASE_KMEANS,
+									 LIONVEC_KMEANS_ITERS);
+
 		if (request > 0)
 			lionvec_begin_parallel(&bs, heap, indexInfo->ii_Concurrent, request);
 		if (bs.leader == NULL && bs.a.cent == NULL)
@@ -3727,7 +3839,13 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	INSTR_TIME_SUBTRACT(t, start);
 	secs[1] = INSTR_TIME_GET_DOUBLE(t);
 
-	/* pass 2: the REFINE items in place, the CODE items to the sort */
+	/*
+	 * pass 2: the REFINE items in place, the CODE items to the sort; its
+	 * target the rows the first pass met, which differ only by rows a
+	 * concurrent prune or a CONCURRENTLY build's snapshot left out of one
+	 */
+	lionvec_build_progress_phase(LIONVEC_PROGRESS_PHASE_ASSIGN,
+								 (int64) bs.nmet);
 	INSTR_TIME_SET_CURRENT(start);
 	if (bs.leader != NULL)
 		reltuples = lionvec_parallel_heapscan(&bs, heap,
@@ -3738,6 +3856,7 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 		lionvec_build_rows_begin(&bs, heap, maintenance_work_mem, NULL);
 		reltuples = table_index_build_scan(heap, index, indexInfo, false, true,
 										   lionvec_build_callback, &bs, NULL);
+		lionvec_build_progress_rows(&bs);
 		lionvec_build_end_refine(&bs);
 		lionvec_build_rows_end(&bs);
 		sort = bs.sort;
@@ -3751,7 +3870,10 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	INSTR_TIME_SET_CURRENT(start);
 	heads = palloc(sizeof(BlockNumber) * (bs.nparts + 2));
 	tails = palloc(sizeof(BlockNumber) * (bs.nparts + 2));
+	lionvec_build_progress_phase(LIONVEC_PROGRESS_PHASE_SORT, 0);
 	tuplesort_performsort(sort);
+	lionvec_build_progress_phase(LIONVEC_PROGRESS_PHASE_WRITE,
+								 (int64) bs.indtuples);
 	lionvec_build_write_codes(&bs, sort, heads, tails);
 	tuplesort_end(sort);
 	meta.part_head = InvalidBlockNumber;
@@ -3818,8 +3940,12 @@ lionvecbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	UnlockReleaseBuffer(metabuf);
 
 	if (RelationNeedsWAL(index))
+	{
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
+									 LIONVEC_PROGRESS_PHASE_WAL);
 		log_newpage_range(index, MAIN_FORKNUM, 0,
 						  RelationGetNumberOfBlocks(index), true);
+	}
 	INSTR_TIME_SET_CURRENT(t);
 	INSTR_TIME_SUBTRACT(t, start);
 	secs[3] = INSTR_TIME_GET_DOUBLE(t);
@@ -5518,6 +5644,34 @@ lionvecvalidate(Oid opclassoid)
 	return result;
 }
 
+/*
+ * The name of a phase of the build, for pg_stat_progress_create_index
+ * (DESIGN.md §44.5).
+ */
+static char *
+lionvecbuildphasename(int64 phasenum)
+{
+	switch (phasenum)
+	{
+		case PROGRESS_CREATEIDX_SUBPHASE_INITIALIZE:
+			return "initializing";
+		case LIONVEC_PROGRESS_PHASE_SAMPLE:
+			return "sampling table";
+		case LIONVEC_PROGRESS_PHASE_KMEANS:
+			return "computing centroids";
+		case LIONVEC_PROGRESS_PHASE_ASSIGN:
+			return "assigning rows to partitions";
+		case LIONVEC_PROGRESS_PHASE_SORT:
+			return "sorting rows";
+		case LIONVEC_PROGRESS_PHASE_WRITE:
+			return "writing partitions";
+		case LIONVEC_PROGRESS_PHASE_WAL:
+			return "WAL-logging index";
+		default:
+			return NULL;
+	}
+}
+
 Datum
 lionvec_handler(PG_FUNCTION_ARGS)
 {
@@ -5578,7 +5732,7 @@ lionvec_handler(PG_FUNCTION_ARGS)
 #endif
 		.amoptions = lionvecoptions,
 		.amproperty = NULL,
-		.ambuildphasename = NULL,
+		.ambuildphasename = lionvecbuildphasename,
 		.amvalidate = lionvecvalidate,
 		.amadjustmembers = NULL,
 		.ambeginscan = lionvecbeginscan,
