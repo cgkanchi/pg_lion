@@ -30680,8 +30680,8 @@ file of the cluster dropped from the kernel's cache; three runs each.
 | before | Bitmap Heap Scan of 223,000 heap pages, priced 181,818 | 3.4 to 6.5 s | 1.34 to 1.61 s |
 | after | Gather over a parallel LionOrdered of the key's B-tree, index-only, 19,700 pages, priced 278,244 and 70,126 cold | 1.2 to 1.5 s | 0.49 to 0.51 s |
 
-With `effective_cache_size` large enough to hold the tables nothing is charged and the bitmap heap
-scan is taken, at core's price.
+With `effective_cache_size` large enough to hold the query's tables and the plan's indexes nothing
+is charged and the bitmap heap scan is taken, at core's price.
 
 **Folded into the walk** (2026-10-25; `oj_key_index()`, `lion_ordered_keyset_keys()`). Tested
 after the fetch, a key set leaves the walk to fetch every member of its set to read the key: on a
