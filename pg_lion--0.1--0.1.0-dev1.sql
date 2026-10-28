@@ -27,6 +27,9 @@
  *	  function or operator a class holds that is now another one switched in
  *	  the catalogs, as no DDL can (an index on it was built with the old one,
  *	  and its format is refused until it is rebuilt with REINDEX anyway).
+ *	- a class indexes use that moved to another family (date_ops, timestamp_ops
+ *	  and timestamptz_ops, now in datetime_ops) joins today's family and takes
+ *	  today's members for its type, in the catalogs; its old family goes.
  *	- a family that is gone but that indexes still use is detached from the
  *	  extension, with a WARNING, rather than dropped with them.
  *
@@ -583,7 +586,10 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT FOR TYPE uuid USING lion AS
 	FUNCTION	1	uuid_hash(uuid),
 	FUNCTION	4	uuid_cmp(uuid, uuid);
 
-SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion AS
+CREATE OPERATOR FAMILY datetime_ops USING lion;
+
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (date, date),
 	OPERATOR	6	< (date, date),
 	OPERATOR	7	<= (date, date),
@@ -613,7 +619,8 @@ CREATE OPERATOR CLASS timetz_ops DEFAULT FOR TYPE timetz USING lion AS
 	FUNCTION	1	timetz_hash(timetz),
 	FUNCTION	4	timetz_cmp(timetz, timetz);
 
-CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
+CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (timestamp, timestamp),
 	OPERATOR	6	< (timestamp, timestamp),
 	OPERATOR	7	<= (timestamp, timestamp),
@@ -623,7 +630,8 @@ CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
 	FUNCTION	1	timestamp_hash(timestamp),
 	FUNCTION	4	timestamp_cmp(timestamp, timestamp);
 
-SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (timestamptz, timestamptz),
 	OPERATOR	6	< (timestamptz, timestamptz),
 	OPERATOR	7	<= (timestamptz, timestamptz),
@@ -632,6 +640,43 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT 
 	OPERATOR	10	<> (timestamptz, timestamptz),
 	FUNCTION	1	%s,
 	FUNCTION	4	timestamptz_cmp(timestamptz, timestamptz)', 'timestamptz_hash(timestamptz)', 'timestamp_hash(timestamp)');
+
+ALTER OPERATOR FAMILY datetime_ops USING lion ADD
+	OPERATOR	1	= (date, timestamp),
+	OPERATOR	6	< (date, timestamp),
+	OPERATOR	7	<= (date, timestamp),
+	OPERATOR	8	>= (date, timestamp),
+	OPERATOR	9	> (date, timestamp),
+	OPERATOR	10	<> (date, timestamp),
+	OPERATOR	1	= (date, timestamptz),
+	OPERATOR	6	< (date, timestamptz),
+	OPERATOR	7	<= (date, timestamptz),
+	OPERATOR	8	>= (date, timestamptz),
+	OPERATOR	9	> (date, timestamptz),
+	OPERATOR	10	<> (date, timestamptz),
+	OPERATOR	1	= (timestamp, date),
+	OPERATOR	6	< (timestamp, date),
+	OPERATOR	7	<= (timestamp, date),
+	OPERATOR	8	>= (timestamp, date),
+	OPERATOR	9	> (timestamp, date),
+	OPERATOR	10	<> (timestamp, date),
+	OPERATOR	1	= (timestamptz, date),
+	OPERATOR	6	< (timestamptz, date),
+	OPERATOR	7	<= (timestamptz, date),
+	OPERATOR	8	>= (timestamptz, date),
+	OPERATOR	9	> (timestamptz, date),
+	OPERATOR	10	<> (timestamptz, date),
+	OPERATOR	1	= (timestamptz, timestamp),
+	OPERATOR	6	< (timestamptz, timestamp),
+	OPERATOR	7	<= (timestamptz, timestamp),
+	OPERATOR	8	>= (timestamptz, timestamp),
+	OPERATOR	9	> (timestamptz, timestamp),
+	OPERATOR	10	<> (timestamptz, timestamp),
+	FUNCTION	4	(date, timestamp) date_cmp_timestamp(date, timestamp),
+	FUNCTION	4	(date, timestamptz) date_cmp_timestamptz(date, timestamptz),
+	FUNCTION	4	(timestamp, date) timestamp_cmp_date(timestamp, date),
+	FUNCTION	4	(timestamptz, date) timestamptz_cmp_date(timestamptz, date),
+	FUNCTION	4	(timestamptz, timestamp) timestamptz_cmp_timestamp(timestamptz, timestamp);
 
 CREATE OPERATOR CLASS interval_ops DEFAULT FOR TYPE interval USING lion AS
 	OPERATOR	1	= (interval, interval),
@@ -789,6 +834,8 @@ DECLARE
 	c		record;
 	m		record;
 	ec		record;
+	ops		oid[];
+	procs	oid[];
 BEGIN
 	FOR sf IN
 		SELECT f.oid, f.opfname FROM pg_catalog.pg_opfamily f
@@ -807,20 +854,60 @@ BEGIN
 		END IF;
 
 		IF ef IS NULL THEN
-			FOR c IN SELECT oc.opcname FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = sf.oid LOOP
+			FOR c IN SELECT oc.* FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = sf.oid LOOP
 				-- a class of this name in another family moves out of the way
-				SELECT oc.oid INTO ec FROM pg_catalog.pg_opclass oc
+				SELECT oc.* INTO ec FROM pg_catalog.pg_opclass oc
 				WHERE oc.opcnamespace = e AND oc.opcmethod = am AND oc.opcname = c.opcname;
-				IF FOUND THEN
-					IF EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE ec.oid = ANY (i.indclass::oid[])) THEN
-						RAISE EXCEPTION 'operator class %.% moved to another family, and indexes use it', ename, c.opcname
-							USING HINT = 'Drop those indexes, update, and create them again.';
-					END IF;
+				CONTINUE WHEN NOT FOUND;
+				IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE ec.oid = ANY (i.indclass::oid[])) THEN
 					EXECUTE pg_catalog.format('DROP OPERATOR CLASS %s.%I USING lion', en, c.opcname);
+					CONTINUE;
 				END IF;
+
+				-- Indexes use it (as date_ops, timestamp_ops and timestamptz_ops
+				-- moved from families of their own into datetime_ops): the
+				-- installed class, which the indexes name, joins today's family
+				-- and takes over today's class's members, in the catalogs, as no
+				-- DDL can.  Its own members, in the old family, go.
+				IF ec.opcintype <> c.opcintype OR ec.opckeytype <> c.opckeytype THEN
+					RAISE EXCEPTION 'operator class %.% changed in a way this update cannot make while indexes use it',
+						ename, c.opcname
+						USING HINT = 'Drop those indexes, update, and create them again.';
+				END IF;
+				ops := ARRAY(SELECT d.objid FROM pg_catalog.pg_depend d
+							 WHERE d.classid = 'pg_catalog.pg_amop'::pg_catalog.regclass AND d.deptype = 'i'
+							   AND d.refclassid = 'pg_catalog.pg_opclass'::pg_catalog.regclass AND d.refobjid = ec.oid);
+				procs := ARRAY(SELECT d.objid FROM pg_catalog.pg_depend d
+							   WHERE d.classid = 'pg_catalog.pg_amproc'::pg_catalog.regclass AND d.deptype = 'i'
+								 AND d.refclassid = 'pg_catalog.pg_opclass'::pg_catalog.regclass AND d.refobjid = ec.oid);
+				DELETE FROM pg_catalog.pg_amop WHERE oid = ANY (ops);
+				DELETE FROM pg_catalog.pg_amproc WHERE oid = ANY (procs);
+				DELETE FROM pg_catalog.pg_depend
+				WHERE (classid = 'pg_catalog.pg_amop'::pg_catalog.regclass AND objid = ANY (ops))
+				   OR (classid = 'pg_catalog.pg_amproc'::pg_catalog.regclass AND objid = ANY (procs));
+				UPDATE pg_catalog.pg_depend SET refobjid = ec.oid
+				WHERE refclassid = 'pg_catalog.pg_opclass'::pg_catalog.regclass AND refobjid = c.oid
+				  AND classid IN ('pg_catalog.pg_amop'::pg_catalog.regclass, 'pg_catalog.pg_amproc'::pg_catalog.regclass);
+				UPDATE pg_catalog.pg_depend SET refobjid = sf.oid
+				WHERE classid = 'pg_catalog.pg_opclass'::pg_catalog.regclass AND objid = ec.oid
+				  AND refclassid = 'pg_catalog.pg_opfamily'::pg_catalog.regclass AND refobjid = ec.opcfamily;
+				UPDATE pg_catalog.pg_opclass SET opcfamily = sf.oid, opcdefault = c.opcdefault WHERE oid = ec.oid;
+				EXECUTE pg_catalog.format('DROP OPERATOR CLASS lion_upgrade_new.%I USING lion', c.opcname);
+				-- the old family, empty now unless other classes still hold it
+				IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = ec.opcfamily)
+				   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amop WHERE amopfamily = ec.opcfamily)
+				   AND NOT EXISTS (SELECT 1 FROM pg_catalog.pg_amproc WHERE amprocfamily = ec.opcfamily) THEN
+					EXECUTE pg_catalog.format('DROP OPERATOR FAMILY %s USING lion',
+						(SELECT pg_catalog.quote_ident(ns.nspname) || '.' || pg_catalog.quote_ident(f.opfname)
+						 FROM pg_catalog.pg_opfamily f JOIN pg_catalog.pg_namespace ns ON ns.oid = f.opfnamespace
+						 WHERE f.oid = ec.opcfamily));
+				END IF;
+				-- other sessions must not keep the indexes' old family cached
+				UPDATE pg_catalog.pg_class SET relname = relname
+				WHERE oid IN (SELECT i.indexrelid FROM pg_catalog.pg_index i WHERE ec.oid = ANY (i.indclass::oid[]));
 			END LOOP;
 			EXECUTE pg_catalog.format('ALTER OPERATOR FAMILY lion_upgrade_new.%I USING lion SET SCHEMA %s', sf.opfname, en);
-			FOR c IN SELECT oc.opcname FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = sf.oid LOOP
+			FOR c IN SELECT oc.opcname FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = sf.oid AND oc.opcnamespace = s LOOP
 				EXECUTE pg_catalog.format('ALTER OPERATOR CLASS lion_upgrade_new.%I USING lion SET SCHEMA %s', c.opcname, en);
 			END LOOP;
 			CONTINUE;

@@ -474,8 +474,9 @@ SELECT q, slr_q(q, false) FROM unnest(ARRAY[
 ]) q;
 
 -- ---------- 7. declines ----------
--- a partitioned table, a join, and a column no index slices: their ranges
--- are answered as before
+-- a join and a column no index slices: their ranges are answered as before;
+-- a partitioned table's come from every partition's own slices (DESIGN.md
+-- §53, §52.13; test/sql/slices_partitioned.sql)
 CREATE TABLE slr_part (k int, v int4) PARTITION BY RANGE (k);
 CREATE TABLE slr_part1 PARTITION OF slr_part FOR VALUES FROM (0) TO (50);
 CREATE TABLE slr_part2 PARTITION OF slr_part FOR VALUES FROM (50) TO (100);
@@ -483,13 +484,7 @@ INSERT INTO slr_part SELECT i % 100, i FROM generate_series(1, 2000) i;
 CREATE INDEX ON slr_part USING lion (k);
 CREATE INDEX ON slr_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slr_part;
--- whether the count of a partitioned table is pushed down at all is the cost
--- model's call and differs between majors; what is tested is that no range
--- comes from slices there, so the two plans without one print alike and
--- anything else - slices, or a mismatch of the rows - prints as it is
-SELECT CASE WHEN r LIKE 'range not from slices%' OR r LIKE 'no pushdown%'
-			THEN 'not from slices' ELSE r END AS partitioned
-  FROM (SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k = 7') AS r) s;
+SELECT slr_q('SELECT count(*) FROM slr_part WHERE v > 1000 AND k IN (7, 70)') AS partitioned;
 CREATE TABLE slr_dim (g int PRIMARY KEY, name text);
 INSERT INTO slr_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slr_dim;

@@ -3884,15 +3884,17 @@ lion_isect_measured_part(int n, const LionIsectClause *cl, int64 budget,
 
 /* Core's estimate of the AND of the clauses cl[idx[0 .. n)], or of cl[0 .. n). */
 static Selectivity
-lion_isect_core_sel(PlannerInfo *root, const LionIsectClause *cl,
-					const int *idx, int n)
+lion_isect_core_sel(PlannerInfo *root, RelOptInfo *rel,
+					const LionIsectClause *cl, const int *idx, int n)
 {
 	List	   *group = NIL;
 	Selectivity sel;
 	int			i;
 
 	for (i = 0; i < n; i++)
-		group = lappend(group, cl[idx != NULL ? idx[i] : i].clause);
+		group = lappend(group,
+						lion_rel_clause(root, rel,
+										cl[idx != NULL ? idx[i] : i].clause));
 	sel = clauselist_selectivity(root, group, 0, JOIN_INNER, NULL);
 	list_free(group);
 	return sel;
@@ -4016,7 +4018,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 			mminsel = Min(mminsel, mcl[i].sel);
 		}
 		if (nused < ncl)
-			msel = lion_isect_core_sel(root, mcl, idxs, nused);
+			msel = lion_isect_core_sel(root, rel, mcl, idxs, nused);
 		pfree(idxs);
 		if (msel <= 0.0)
 			measured = false;
@@ -4050,7 +4052,7 @@ lion_isect_probe(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 
 		if (res.partn >= 2 && res.partrows > 0.0)
 		{
-			Selectivity psel = lion_isect_core_sel(root, mcl, res.part,
+			Selectivity psel = lion_isect_core_sel(root, rel, mcl, res.part,
 												   res.partn);
 			double		keep;
 
@@ -4291,8 +4293,7 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		cl[ncl].attno = idx->indexkeys[cols[i] - 1];
 		cl[ncl].clause = (canon == lion_isect_bare(clauses[i])) ?
 			clauses[i] : canon;
-		cl[ncl].sel = clause_selectivity(root, cl[ncl].clause, 0, JOIN_INNER,
-										 NULL);
+		cl[ncl].sel = lion_rel_clause_selectivity(root, rel, cl[ncl].clause);
 		minsel = Min(minsel, cl[ncl].sel);
 		group = lappend(group, cl[ncl].clause);
 		ncl++;
@@ -4305,7 +4306,8 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	 * probe finds (raw).
 	 */
 	coresel = (ncl >= 2) ?
-		clauselist_selectivity(root, group, 0, JOIN_INNER, NULL) : 0.0;
+		clauselist_selectivity(root, lion_rel_clauses(root, rel, group), 0,
+							   JOIN_INNER, NULL) : 0.0;
 	raisable = (coresel * LION_ISECT_ERROR <= minsel);
 	if (ncl < 2 || coresel <= 0.0 || (!raisable && raw == NULL) ||
 		!lion_isect_readable(root, rel, idx, ncl, cl))

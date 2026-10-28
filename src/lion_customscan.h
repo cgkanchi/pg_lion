@@ -1455,9 +1455,12 @@ typedef struct LionVColScope
  *	25	List, or empty: the aggregates of bit-sliced columns answered from
  *		their slices (DESIGN.md §52): an IntList of the columns' attnums, an
  *		OidList of the lion index whose slices each is read from and an
- *		IntList of its key column there; lion_plan_custom_path() adds a List
- *		of one IntList per aggregate - its LION_SAGG_* kind and the column's
- *		position in those lists - whose results are LION_TL_SAGG columns
+ *		IntList of its key column there - for a partitioned table, every
+ *		live leaf partition's in turn, in PARTS order, the columns' in
+ *		attnum-list order within each (§52.13);
+ *		lion_plan_custom_path() adds a List of one IntList per aggregate -
+ *		its LION_SAGG_* kind and the column's position in the first list -
+ *		whose results are LION_TL_SAGG columns
  *	26	IntList: LION_TL_* for each custom_scan_tlist column (added at plan
  *		time, when the target list is known)
  */
@@ -1607,6 +1610,12 @@ typedef struct LionVColScope
  * bit-sliced columns from their slices (DESIGN.md §52), which an older build
  * would have taken for counts.
  *
+ * Shape 32 moved no member but made the SLICES member's (25) index lists
+ * one entry per column per partition for a partitioned table: aggregates of
+ * sliced columns from each partition's slices (DESIGN.md §52, "Partitioned
+ * tables"), which an older build refused to plan and would have read as
+ * too many Oids.
+ *
  * Shape 6 changed no member's POSITION, which is exactly what the marker is
  * for: since DESIGN.md §24 an index Oid here may name a MULTICOLUMN index, and
  * the key column it is read for is not in the list at all - the executor
@@ -1619,7 +1628,7 @@ typedef struct LionVColScope
  * planner has always chosen the column by it, so a plan of any shape-13 build
  * names the column the executor now derives.
  */
-#define LION_PRIV_MAGIC		0x5242491f
+#define LION_PRIV_MAGIC		0x52424920
 #define LION_PRIV_NMEMBERS	27
 
 /*
@@ -1834,6 +1843,16 @@ typedef struct LionPartState
 	bool		residinit;
 	ExprState  *resid;
 	List	   *residexprs;
+
+	/*
+	 * The aggregates of sliced columns from their slices (DESIGN.md §52,
+	 * "Partitioned tables"): this partition's lion index slicing each of the
+	 * plan's sliced columns, and its key column there, one per column, open
+	 * from Begin to End as its other indexes are.
+	 */
+	Oid		   *sliceidxoid;
+	AttrNumber *sliceidxcol;
+	Relation   *sliceidx;
 } LionPartState;
 
 /*
@@ -2180,6 +2199,25 @@ typedef struct LionSCol
 	bool		c0done;
 	bool		hasc0;
 	LionPostingSet c0;
+
+	/*
+	 * A partitioned table's (DESIGN.md §52.13): the
+	 * partition's index for its turn, open for the node's life
+	 * (LionPartState.sliceidx; NULL for a plain table, whose index is opened
+	 * for each run), and the answers of the partitions counted so far - the
+	 * rows with a value, their sum, their extremes' encodings, of one type
+	 * and width in every partition - which the one row is made of once the
+	 * last has been counted (lion_slice_parts_end()).
+	 */
+	Relation	idx;
+	int64		tcount;
+#ifdef HAVE_INT128
+	int128		tsum;
+#endif
+	uint64		tminenc;
+	uint64		tmaxenc;
+	Oid			ttypid;
+	int			tnbits;
 } LionSCol;
 
 typedef struct LionSAgg
@@ -2207,6 +2245,8 @@ typedef struct LionSliceState
 	int			nagg;
 	LionSAgg   *agg;
 	bool		needcount;
+	bool		parts;			/* the partitions' answers are being
+								 * added up (lion_slice_parts_begin()) */
 	MemoryContext cxt;			/* the results' */
 	MemoryContext relcxt;		/* a GROUP BY's copies of E ∧ WHERE */
 	int64		groups;			/* the groups answered */
@@ -2620,6 +2660,11 @@ typedef struct LionCountPrivPart
 								 * for them (§16, "Residual clauses over a
 								 * partitioned table") */
 	bool	   *residdrop;
+	Oid		   *sliceidxoid;	/* SLICES (DESIGN.md §52, "Partitioned
+								 * tables"): the lion index slicing each
+								 * sliced column here ... */
+	AttrNumber *sliceidxcol;	/* ... and its key column there; NULL
+								 * without sliced columns */
 } LionCountPrivPart;
 
 /* The FK-side join (DESIGN.md §27): JOIN */
@@ -3881,6 +3926,13 @@ typedef struct LionCountTarget
 								 * clauses over a partitioned table"); NULL
 								 * when none is */
 	int			nresiddrop;
+	IndexOptInfo **sliceidx;	/* a partition's, beside the aggregates of
+								 * sliced columns (DESIGN.md §52,
+								 * "Partitioned tables"): its whole lion
+								 * index slicing each column, as one table's
+								 * is found (lion_find_sliced_index()) ... */
+	AttrNumber *slicecol;		/* ... and its key column there; NULL for a
+								 * plain table, whose are the build's own */
 } LionCountTarget;
 
 /*
@@ -4323,6 +4375,10 @@ extern void lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel,
 								 LionUnits *u);
 extern double lion_units_bitmap_factor(const LionUnits *u, Cost own,
 									   double reads);
+extern Cost lion_units_bitmap_reads(PlannerInfo *root, Path *path,
+									double *pages);
+extern Cost lion_units_stream_cold_page(PlannerInfo *root, double idxpages,
+										Oid reltablespace);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
 
@@ -4489,6 +4545,11 @@ extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *toprel,
 								 RelOptInfo *rel, List *residual);
 extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,
 							  IndexOptInfo *idx);
+extern Node *lion_rel_clause(PlannerInfo *root, RelOptInfo *rel, Node *clause);
+extern List *lion_rel_clauses(PlannerInfo *root, RelOptInfo *rel,
+							  List *clauses);
+extern Selectivity lion_rel_clause_selectivity(PlannerInfo *root,
+												RelOptInfo *rel, Node *clause);
 extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *toprel,
 							   RelOptInfo *rel, List *residual,
 							   double counts);
@@ -4646,6 +4707,9 @@ extern TupleTableSlot *lion_next_group_any(LionCountScanState *st,
 
 /* lion_exec_slice.c: the aggregates of sliced columns (DESIGN.md §52) */
 extern void lion_slice_run(LionCountScanState *st);
+extern void lion_slice_parts_begin(LionCountScanState *st);
+extern void lion_slice_part(LionCountScanState *st);
+extern void lion_slice_parts_end(LionCountScanState *st);
 extern void lion_slice_none(LionCountScanState *st);
 extern void lion_slice_group(LionCountScanState *st, int ngset,
 							 LionPostingSet *const *gsets);
@@ -4849,6 +4913,9 @@ extern Cost lion_ordered_heap_price(PlannerInfo *root, RelOptInfo *rel,
 									double fetches);
 extern bool lion_ordered_walk_reads(PlannerInfo *root, Path *path,
 									double share, double *reads);
+extern bool lion_ordered_scan_reads(PlannerInfo *root, Path *path,
+									double *reads, double *idxpages,
+									bool *indexonly);
 extern CustomPath *lion_ordered_side_path(RelOptInfo *rel, IndexPath *ord,
 										  Path *lion, List *iocols, bool dim,
 										  double weight, Expr *keyqual,
