@@ -420,7 +420,8 @@ CREATE TABLE slp_dim (g int PRIMARY KEY, name text);
 INSERT INTO slp_dim SELECT i, 'g' || i FROM generate_series(0, 9) i;
 ANALYZE slp_dim;
 SELECT slp_q('SELECT sum(s.b), max(s.b) FROM slp s JOIN slp_dim d ON d.g = s.g WHERE d.name = ''g3''');
--- a partitioned table
+-- a partitioned table: its one row is answered from every partition's
+-- slices (slices_partitioned.sql), its GROUP BY is not
 CREATE TABLE slp_part (k int, v int4) PARTITION BY RANGE (k);
 CREATE TABLE slp_part1 PARTITION OF slp_part FOR VALUES FROM (0) TO (50);
 CREATE TABLE slp_part2 PARTITION OF slp_part FOR VALUES FROM (50) TO (100);
@@ -429,6 +430,7 @@ CREATE INDEX ON slp_part USING lion (k);
 CREATE INDEX ON slp_part USING lion (v) WITH (slices = on);
 VACUUM ANALYZE slp_part;
 SELECT slp_q('SELECT sum(v), max(v) FROM slp_part WHERE k = 7');
+SELECT slp_q('SELECT k, sum(v), max(v) FROM slp_part WHERE k IN (7, 70) GROUP BY k');
 SELECT slp_q('SELECT count(*) FROM slp_part WHERE k = 7');
 
 -- EXECUTE on what the node replaces (DESIGN.md §9, "Privileges"): an
