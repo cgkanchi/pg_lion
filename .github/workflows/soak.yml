@@ -1,0 +1,78 @@
+# The concurrent soak (test/soak/README.md), weekly and by hand.
+#
+# The regression files and isolation specs each pin one interleaving; the
+# soak runs pgbench writers, a VACUUM loop, checking readers and
+# lion_index_verify() for minutes at a time and compares every answer a lion
+# path gives with a sequential scan's inside the same snapshot, in both WAL
+# modes, with a hot standby in rmgr mode.  It takes too long for every pull
+# request, so it runs once a week against PostgreSQL 18's packages and the
+# head of main, and from the Actions tab on any branch (workflow_dispatch),
+# where the minutes per mode can be chosen.
+
+name: Soak
+
+on:
+  schedule:
+    # Sundays, 05:17 UTC: off the hour, when the runners are quiet.
+    - cron: "17 5 * * 0"
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: Seconds of load per WAL mode
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soak-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LION_SOCK: /tmp/lion-sock
+  LION_PORT: "55432"
+  PG: "18"
+  PG_CONFIG: .local/pg/bin/pg_config
+
+jobs:
+  soak:
+    name: Soak (PostgreSQL 18, both WAL modes)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install PostgreSQL ${{ env.PG }} from apt.postgresql.org
+        run: |
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo 'create_main_cluster = false' | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends "postgresql-$PG" "postgresql-server-dev-$PG"
+          mkdir -p .local
+          ln -sfn "/usr/lib/postgresql/$PG" .local/pg
+          .local/pg/bin/pg_config --version
+
+      - name: Build
+        run: make -j4 WERROR=1
+
+      - name: Install
+        run: sudo make install PG_CONFIG="$PWD/$PG_CONFIG"
+
+      - name: Start a private cluster
+        run: ./dev.sh reset
+
+      - name: Soak
+        env:
+          SOAK_DURATION: ${{ inputs.duration || '600' }}
+        run: |
+          eval "$(./dev.sh env)"
+          make soak
+
+      - name: Keep the soak's output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-out
+          path: test/soak/out/
+          if-no-files-found: ignore
+          retention-days: 14

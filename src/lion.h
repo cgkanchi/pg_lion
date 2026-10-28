@@ -1781,12 +1781,20 @@ extern bool lion_keys_equal(LionState *state, Datum a, Datum b);
  *	kind		LION_KIND_NULL / EMPTY / VALUE
  *	key, hash	the value being looked for, and its hash (the hash must be the
  *				one the index would have stored for it, which for a cross-type
- *				search is the SEARCH type's own hash function: a roaring
- *				opfamily's types hash compatibly)
+ *				search of an UNORDERED column is the SEARCH type's own hash
+ *				function: such a family's types must hash compatibly; an
+ *				ordered column's cross-type search sets nohash instead)
  *	hashlazy	hash is not filled in: it is lion_hash_key(col, key), and the
  *				comparison computes it the first time the order needs it,
  *				which in an ordered column is only on a proc-4 tie (a key
  *				made from a stored entry, lion_search_key_exact())
+ *	nohash		the hash term is left out of the order: a cross-type search
+ *				of an ORDERED column, whose hash need not be the one the
+ *				index stored for an equal key (a date and the timestamp at
+ *				its midnight are equal and hash apart, DESIGN.md §21,
+ *				"Cross-type searches").  The key then compares as the start
+ *				of the run of entries proc 4 ties with it, and that run is
+ *				what the equality decides among
  *	cmpproc		comparison of a STORED key against this one, stored key on the
  *				LEFT; NULL means the index has no ordering and the prefix is
  *				(kind, hash) alone
@@ -1807,6 +1815,7 @@ typedef struct LionSearchKey
 	Datum		key;
 	uint32		hash;
 	bool		hashlazy;
+	bool		nohash;
 	FmgrInfo   *cmpproc;
 	FmgrInfo   *eqproc;
 	Oid			collation;

@@ -1245,8 +1245,10 @@ lionvalidate(Oid opclassoid)
 
 		/*
 		 * Every type used by an operator must be hashable by this family:
-		 * that is what lets a cross-type equality use the index, because the
-		 * search value is hashed with its OWN type's function.  A multi-key
+		 * that is what lets a cross-type equality use an UNORDERED column's
+		 * index, because the search value is hashed with its OWN type's
+		 * function (an ordered column's cross-type search goes by proc 4
+		 * alone, DESIGN.md §28, "Cross-type date and timestamp").  A multi-key
 		 * family hashes keys and not the types its operators mention, so the
 		 * rule does not apply to it.
 		 */

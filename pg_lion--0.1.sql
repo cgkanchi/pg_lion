@@ -283,7 +283,22 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT FOR TYPE uuid USING lion AS
 	FUNCTION	1	uuid_hash(uuid),
 	FUNCTION	4	uuid_cmp(uuid, uuid);
 
-SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion AS
+/*
+ * date, timestamp and timestamptz: one family, as in btree's datetime_ops, so
+ * that `tscol >= current_date` and `ts >= now() - interval '7 days'` on a
+ * timestamp column can use the index.  The cross-type comparisons are core's
+ * own (date_cmp_timestamp and friends), so the index compares a date with a
+ * timestamp exactly as the operator does, the session's TimeZone included
+ * where timestamptz is one side (those are STABLE, as they are in btree).
+ * Unlike integer_ops and float_ops the types do not hash compatibly - a date
+ * and the timestamp at its midnight are equal and hash apart - so a
+ * cross-type lookup locates its entry by proc 4 alone (DESIGN.md §21,
+ * "Cross-type searches"), which these classes always have.
+ */
+CREATE OPERATOR FAMILY datetime_ops USING lion;
+
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS date_ops DEFAULT FOR TYPE date USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (date, date),
 	OPERATOR	6	< (date, date),
 	OPERATOR	7	<= (date, date),
@@ -313,7 +328,8 @@ CREATE OPERATOR CLASS timetz_ops DEFAULT FOR TYPE timetz USING lion AS
 	FUNCTION	1	timetz_hash(timetz),
 	FUNCTION	4	timetz_cmp(timetz, timetz);
 
-CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
+CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (timestamp, timestamp),
 	OPERATOR	6	< (timestamp, timestamp),
 	OPERATOR	7	<= (timestamp, timestamp),
@@ -323,7 +339,8 @@ CREATE OPERATOR CLASS timestamp_ops DEFAULT FOR TYPE timestamp USING lion AS
 	FUNCTION	1	timestamp_hash(timestamp),
 	FUNCTION	4	timestamp_cmp(timestamp, timestamp);
 
-SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion AS
+SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT FOR TYPE timestamptz USING lion
+	FAMILY datetime_ops AS
 	OPERATOR	1	= (timestamptz, timestamptz),
 	OPERATOR	6	< (timestamptz, timestamptz),
 	OPERATOR	7	<= (timestamptz, timestamptz),
@@ -332,6 +349,50 @@ SELECT lion_create_opclass_pre18('CREATE OPERATOR CLASS timestamptz_ops DEFAULT 
 	OPERATOR	10	<> (timestamptz, timestamptz),
 	FUNCTION	1	%s,
 	FUNCTION	4	timestamptz_cmp(timestamptz, timestamptz)', 'timestamptz_hash(timestamptz)', 'timestamp_hash(timestamp)');
+
+ALTER OPERATOR FAMILY datetime_ops USING lion ADD
+	OPERATOR	1	= (date, timestamp),
+	OPERATOR	6	< (date, timestamp),
+	OPERATOR	7	<= (date, timestamp),
+	OPERATOR	8	>= (date, timestamp),
+	OPERATOR	9	> (date, timestamp),
+	OPERATOR	10	<> (date, timestamp),
+	OPERATOR	1	= (date, timestamptz),
+	OPERATOR	6	< (date, timestamptz),
+	OPERATOR	7	<= (date, timestamptz),
+	OPERATOR	8	>= (date, timestamptz),
+	OPERATOR	9	> (date, timestamptz),
+	OPERATOR	10	<> (date, timestamptz),
+	OPERATOR	1	= (timestamp, date),
+	OPERATOR	6	< (timestamp, date),
+	OPERATOR	7	<= (timestamp, date),
+	OPERATOR	8	>= (timestamp, date),
+	OPERATOR	9	> (timestamp, date),
+	OPERATOR	10	<> (timestamp, date),
+	OPERATOR	1	= (timestamp, timestamptz),
+	OPERATOR	6	< (timestamp, timestamptz),
+	OPERATOR	7	<= (timestamp, timestamptz),
+	OPERATOR	8	>= (timestamp, timestamptz),
+	OPERATOR	9	> (timestamp, timestamptz),
+	OPERATOR	10	<> (timestamp, timestamptz),
+	OPERATOR	1	= (timestamptz, date),
+	OPERATOR	6	< (timestamptz, date),
+	OPERATOR	7	<= (timestamptz, date),
+	OPERATOR	8	>= (timestamptz, date),
+	OPERATOR	9	> (timestamptz, date),
+	OPERATOR	10	<> (timestamptz, date),
+	OPERATOR	1	= (timestamptz, timestamp),
+	OPERATOR	6	< (timestamptz, timestamp),
+	OPERATOR	7	<= (timestamptz, timestamp),
+	OPERATOR	8	>= (timestamptz, timestamp),
+	OPERATOR	9	> (timestamptz, timestamp),
+	OPERATOR	10	<> (timestamptz, timestamp),
+	FUNCTION	4	(date, timestamp) date_cmp_timestamp(date, timestamp),
+	FUNCTION	4	(date, timestamptz) date_cmp_timestamptz(date, timestamptz),
+	FUNCTION	4	(timestamp, date) timestamp_cmp_date(timestamp, date),
+	FUNCTION	4	(timestamp, timestamptz) timestamp_cmp_timestamptz(timestamp, timestamptz),
+	FUNCTION	4	(timestamptz, date) timestamptz_cmp_date(timestamptz, date),
+	FUNCTION	4	(timestamptz, timestamp) timestamptz_cmp_timestamp(timestamptz, timestamp);
 
 CREATE OPERATOR CLASS interval_ops DEFAULT FOR TYPE interval USING lion AS
 	OPERATOR	1	= (interval, interval),
