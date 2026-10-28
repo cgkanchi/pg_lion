@@ -18,7 +18,9 @@ With BASE, a git revision (the pull request's base branch), also:
   - an install script BASE has under default_version is unchanged: a change to
     the SQL needs a new version and an upgrade script to it;
   - BASE's default_version has a chain of upgrade scripts to today's;
-  - every upgrade script BASE has is still here, unchanged.
+  - every upgrade script BASE has is still here, unchanged;
+  - where BASE has X.Y.Z-devN and this tree X.Y.Z, the install script is
+    BASE's unchanged and the upgrade script between them holds no SQL.
 """
 
 import json
@@ -29,6 +31,8 @@ import sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
 VERSION_RE = re.compile(r'^(\d+\.\d+\.\d+)(-dev\d+)?$')
+# versions from before the X.Y.Z scheme, which upgrade scripts start from
+OLD_VERSIONS = {'0.1'}
 errors = []
 
 
@@ -58,10 +62,20 @@ def scripts(ext, names):
         if len(parts) == 1:
             install[parts[0]] = name
         elif len(parts) == 2:
+            if not all(VERSION_RE.match(v) or v in OLD_VERSIONS for v in parts):
+                fail('%s: a version in the name is not X.Y.Z or X.Y.Z-devN' % name)
             upgrade[tuple(parts)] = name
         else:
             fail('%s: not a script name PostgreSQL understands' % name)
     return install, upgrade
+
+
+def new_install(ext, ver):
+    path = os.path.join(ROOT, '%s--%s.sql' % (ext, ver))
+    if not os.path.exists(path):
+        return None
+    with open(path, 'rb') as f:
+        return f.read()
 
 
 def reaches(upgrade, start, goal):
@@ -125,15 +139,26 @@ def main():
         binstall, bupgrade = scripts(ext, base_files)
         if bver == cur:
             old = git_show(base, '%s--%s.sql' % (ext, cur))
-            with open(os.path.join(ROOT, '%s--%s.sql' % (ext, cur)), 'rb') as f:
-                new = f.read()
-            if old is not None and old != new:
+            if old is not None and old != new_install(ext, cur):
                 fail('%s--%s.sql changed, but %s.control still says %s: give the change a new version '
                      '(default_version, META.json) and an upgrade script %s--%s--<new>.sql from this one '
                      '(DESIGN.md section 23, "Extension versions")' % (ext, cur, ext, cur, ext, cur))
         elif not reaches(upgrade, bver, cur):
             fail('%s: %s has version %s and this tree %s, but no upgrade scripts lead from one to the other'
                  % (ext, base, bver, cur))
+        bm = VERSION_RE.match(bver or '')
+        if bm and bm.group(2) and bm.group(1) == release and not m.group(2):
+            # the release of X.Y.Z-devN: the same SQL, under the release's name
+            if git_show(base, '%s--%s.sql' % (ext, bver)) != new_install(ext, cur):
+                fail('%s--%s.sql differs from %s\'s %s--%s.sql: a release takes the last -devN\'s SQL unchanged'
+                     % (ext, cur, base, ext, bver))
+            name = upgrade.get((bver, cur))
+            if name is None:
+                fail('%s: %s--%s--%s.sql is missing: the release needs an empty upgrade script from %s'
+                     % (ext, ext, bver, cur, bver))
+            elif any(l.strip() and not l.strip().startswith('--')
+                     for l in open(os.path.join(ROOT, name)).read().splitlines()):
+                fail('%s: an upgrade from X.Y.Z-devN to X.Y.Z has nothing to do, so holds only comments' % name)
         for pair, name in bupgrade.items():
             if pair not in upgrade:
                 fail('%s: %s has it, and it is gone: an upgrade script is never removed' % (name, base))

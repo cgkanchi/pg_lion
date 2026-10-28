@@ -9965,7 +9965,8 @@ The rules (`test/upgrade/lint.py` checks them in CI, upgrade.yml):
   `DROP FUNCTION` and `CREATE FUNCTION` where the arguments, the result or the OUT columns change,
   `ALTER OPERATOR FAMILY ... ADD` for new strategies and support functions, `CREATE OPERATOR
   CLASS` for new classes. An upgrade script, once on main, is never changed or removed.
-- A release turns `X.Y.Z-devN` into `X.Y.Z` with an empty upgrade script between the two.
+- A release turns `X.Y.Z-devN` into `X.Y.Z` by renaming the install script unchanged, with an
+  upgrade script between the two that holds only comments.
 
 The extensions are versioned separately: a change to pg_lion's SQL does not bump pg_lion_citext.
 
@@ -9975,7 +9976,9 @@ on every operator class it has (so that the update meets families in use), runs 
 UPDATE`, and requires `test/upgrade/catalog.sql`'s dump of the extension - its members, every
 function's signature, result, volatility, parallel safety, strictness, ACL and comment, every
 operator family's operators and support functions, the classes and their defaults, the initial
-privileges - to equal a fresh install's, and every index to REINDEX. The one difference it allows
+privileges - to equal a fresh install's, every index to REINDEX, and the objects the update left
+in the extension's schema outside any extension to be exactly those its WARNINGs say it detached.
+The one difference it allows
 is whether a class holds a member or it is loose in the family: `ALTER OPERATOR FAMILY ... ADD`
 can only add loose ones, and that only changes what `DROP OPERATOR CLASS` takes with it. A script
 for another major (before 2026-09-24 they named `hashbool()`, 18's) or naming a C function the

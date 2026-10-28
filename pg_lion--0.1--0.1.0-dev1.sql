@@ -857,7 +857,10 @@ BEGIN
 			FOR c IN SELECT oc.* FROM pg_catalog.pg_opclass oc WHERE oc.opcfamily = sf.oid LOOP
 				-- a class of this name in another family moves out of the way
 				SELECT oc.* INTO ec FROM pg_catalog.pg_opclass oc
-				WHERE oc.opcnamespace = e AND oc.opcmethod = am AND oc.opcname = c.opcname;
+				WHERE oc.opcnamespace = e AND oc.opcmethod = am AND oc.opcname = c.opcname
+				  AND EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
+							  WHERE d.classid = 'pg_catalog.pg_opclass'::pg_catalog.regclass
+								AND d.objid = oc.oid AND d.refobjid = ext AND d.deptype = 'e');
 				CONTINUE WHEN NOT FOUND;
 				IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_index i WHERE ec.oid = ANY (i.indclass::oid[])) THEN
 					EXECUTE pg_catalog.format('DROP OPERATOR CLASS %s.%I USING lion', en, c.opcname);
@@ -947,7 +950,8 @@ BEGIN
 				   o.oid AS ooid, o.amopopr AS oopr, o.amoppurpose AS opurpose, o.amopsortfamily AS osort,
 				   EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
 						   WHERE d.classid = 'pg_catalog.pg_amop'::pg_catalog.regclass
-							 AND d.objid = o.oid AND d.deptype = 'i') AS held
+							 AND d.objid = o.oid AND d.deptype = 'i'
+							 AND d.refclassid = 'pg_catalog.pg_opclass'::pg_catalog.regclass) AS held
 			FROM (SELECT * FROM pg_catalog.pg_amop WHERE amopfamily = sf.oid) n
 			FULL JOIN (SELECT * FROM pg_catalog.pg_amop WHERE amopfamily = ef) o
 				ON n.amopstrategy = o.amopstrategy AND n.amoplefttype = o.amoplefttype
@@ -995,7 +999,8 @@ BEGIN
 				   o.oid AS ooid, o.amproc AS oproc,
 				   EXISTS (SELECT 1 FROM pg_catalog.pg_depend d
 						   WHERE d.classid = 'pg_catalog.pg_amproc'::pg_catalog.regclass
-							 AND d.objid = o.oid AND d.deptype = 'i') AS held
+							 AND d.objid = o.oid AND d.deptype = 'i'
+							 AND d.refclassid = 'pg_catalog.pg_opclass'::pg_catalog.regclass) AS held
 			FROM (SELECT * FROM pg_catalog.pg_amproc WHERE amprocfamily = sf.oid) n
 			FULL JOIN (SELECT * FROM pg_catalog.pg_amproc WHERE amprocfamily = ef) o
 				ON n.amprocnum = o.amprocnum AND n.amproclefttype = o.amproclefttype
