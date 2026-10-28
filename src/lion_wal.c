@@ -1194,7 +1194,7 @@ lion_redo_apply(Page page, char *data, Size len, BlockNumber blkno)
 				break;
 
 			case LION_OP_META:
-				if (op.len != sizeof(LionMetaPageData))
+				if (op.len != sizeof(LionMetaPageData) || !LionPageIsMeta(page))
 					elog(PANIC, "pg_lion: bad META payload on block %u", blkno);
 				memcpy(LionPageGetMeta(page), payload, sizeof(LionMetaPageData));
 
