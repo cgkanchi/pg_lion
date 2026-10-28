@@ -324,18 +324,20 @@ EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
 EXPLAIN (COSTS OFF)
 SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
  WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
-                               QUERY PLAN                                
--------------------------------------------------------------------------
- HashAggregate
+                                  QUERY PLAN                                   
+-------------------------------------------------------------------------------
+ GroupAggregate
    Group Key: o.region
-   ->  Merge Join
-         Merge Cond: (e.owner_id = o.id)
-         ->  Sort
-               Sort Key: e.owner_id
-               ->  Index Scan using events_lion on events e
-                     Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
-         ->  Index Scan using owners_pkey on owners o
-(9 rows)
+   ->  Sort
+         Sort Key: o.region
+         ->  Merge Join
+               Merge Cond: (e.owner_id = o.id)
+               ->  Sort
+                     Sort Key: e.owner_id
+                     ->  Index Scan using events_lion on events e
+                           Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
+               ->  Index Scan using owners_pkey on owners o
+(11 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)

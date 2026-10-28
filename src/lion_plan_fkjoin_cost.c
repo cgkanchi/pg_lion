@@ -481,7 +481,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			continue;
 		}
 
-		sel = clause_selectivity(root, clause, 0, JOIN_INNER, NULL);
+		sel = lion_rel_clause_selectivity(root, rel, clause);
 		probesets = 0.0;
 		if (IsA(clause, RestrictInfo))
 			clause = (Node *) ((RestrictInfo *) clause)->clause;

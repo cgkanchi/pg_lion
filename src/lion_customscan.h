@@ -4489,6 +4489,11 @@ extern double lion_residual_rows(PlannerInfo *root, RelOptInfo *toprel,
 								 RelOptInfo *rel, List *residual);
 extern double lion_index_rows(PlannerInfo *root, RelOptInfo *rel,
 							  IndexOptInfo *idx);
+extern Node *lion_rel_clause(PlannerInfo *root, RelOptInfo *rel, Node *clause);
+extern List *lion_rel_clauses(PlannerInfo *root, RelOptInfo *rel,
+							  List *clauses);
+extern Selectivity lion_rel_clause_selectivity(PlannerInfo *root,
+												RelOptInfo *rel, Node *clause);
 extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *toprel,
 							   RelOptInfo *rel, List *residual,
 							   double counts);
