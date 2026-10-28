@@ -30779,8 +30779,7 @@ index tuple, the rejected rows are not fetched and need no price.
 - **The rejected fetches on a warm machine.** Not folded, and where the walked B-tree does not hold
   the key (§47.6, "Tested on the index tuple"), the fetches a key set rejects are priced at their
   own pages (§47.3), each page a `random_page_cost`, which is what they cost where the walk reads
-  the disk - the private workload's walk read 541,680 buffers - and many times what they
-  cost where the table is in memory. There the node can lose a page it runs faster: §47.6's
+  the disk, and many times what they cost where the table is in memory. There the node can lose a page it runs faster: §47.6's
   measurements, the 2% key set over a B-tree of the key, 72 ms through the split and 326 through
   core's plan. And core's own nested loop over the fact's B-tree, its key table's semi join
   Memoized above, keeps its Limit's share of the whole walk's pages: where the key has no index and
