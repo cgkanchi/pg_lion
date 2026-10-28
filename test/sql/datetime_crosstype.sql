@@ -2,9 +2,11 @@
 -- "Cross-type date and timestamp").
 --
 -- The three classes share one family, datetime_ops, as they do in btree, so a
--- clause that compares a column of one with a value of another - `ts >= now()
--- - interval '7 days'` on a timestamp column, `tz >= current_date` on a
--- timestamptz one - reaches the column's lion index.  The types do not hash
+-- clause that compares a column of one with a value of another - `ts >=
+-- current_date - 7` on a timestamp column, `tz >= current_date` on a
+-- timestamptz one - reaches the column's lion index; all but a timestamp
+-- column against a timestamptz value, which no index can order exactly
+-- across a DST gap (the last section below).  The types do not hash
 -- compatibly (a date and the timestamp at its midnight are equal and hash
 -- apart), so a cross-type lookup finds its entry by the family's cross-type
 -- comparison alone, and the run of entries it ties is what the equality
@@ -95,7 +97,9 @@ SELECT c.opcname, f.opfname, amvalidate(c.oid)
 EXPLAIN (COSTS OFF)
 SELECT count(*) FROM xdt_t WHERE d = timestamp '2026-03-08';
 EXPLAIN (COSTS OFF)
-SELECT count(*) FROM xdt_t WHERE ts >= now() - interval '7 days';
+SELECT count(*) FROM xdt_t WHERE ts >= current_date - 7;
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE tz >= localtimestamp - interval '7 days';
 EXPLAIN (COSTS OFF)
 SELECT * FROM xdt_t WHERE tz >= date '2026-03-30';
 
@@ -105,7 +109,6 @@ SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamp ''2026-03-08 00:00:00
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 America/New_York''');
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 UTC''');
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = date ''2026-03-08''');
-SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = timestamptz ''2026-03-08 03:30 America/New_York''');
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz = date ''2026-03-08''');
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz = timestamp ''2026-11-01 01:30''');
 SELECT xdt('SELECT g, count(*) FROM xdt_t WHERE ts = date ''2026-03-11'' GROUP BY g');
@@ -161,6 +164,23 @@ SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz >= timestamp ''2026-03-08 13:00'
 SET timezone = 'America/New_York';
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 Asia/Kolkata''');
 SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz >= timestamp ''2026-03-08 13:00'' AND tz < date ''2026-03-09''');
+
+-- ---------- a timestamp column against a timestamptz value ----------
+-- That comparison turns each key into an instant at the session's TimeZone,
+-- and the instants are not in the keys' order across a DST gap: 2026-03-08
+-- 02:30 does not exist in New York, is taken as 02:30 EST, 07:30 UTC, and so
+-- sorts before 03:00 (07:00 UTC) and compares after it.  An ordered descent
+-- would miss rows there, so the family leaves the pair out and the clause is
+-- a filter, as with no index; each answer below takes rows from both sides
+-- of the gap.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE ts >= now() - interval '7 days';
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE ts = timestamptz '2026-03-08 03:30 America/New_York';
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = timestamptz ''2026-03-08 03:30 America/New_York''');
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts < timestamptz ''2026-03-08 03:15 America/New_York'' AND ts >= date ''2026-03-08''');
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts > timestamptz ''2026-03-08 03:15 America/New_York'' AND ts < date ''2026-03-09''');
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz < timestamp ''2026-03-08 02:30'' AND tz >= date ''2026-03-08''');
 
 -- ---------- a partitioned table ----------
 CREATE TABLE xdt_p (id int, d date, ts timestamp, tz timestamptz, g int)

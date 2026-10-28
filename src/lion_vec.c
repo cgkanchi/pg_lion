@@ -3507,8 +3507,21 @@ lionvec_parallel_heapscan(LionVecBuildState *bs, Relation heap,
 			break;
 		}
 		SpinLockRelease(&shared->mutex);
-		ConditionVariableSleep(&shared->donecv,
-							   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+
+		/*
+		 * Only the leader reports progress, so while the workers still scan
+		 * it wakes once a second to show the rows they have added since.
+		 */
+		if (bs->progress)
+		{
+			pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+										 (int64) pg_atomic_read_u64(&shared->rowsdone));
+			(void) ConditionVariableTimedSleep(&shared->donecv, 1000,
+											   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
+		}
+		else
+			ConditionVariableSleep(&shared->donecv,
+								   WAIT_EVENT_PARALLEL_CREATE_INDEX_SCAN);
 	}
 	ConditionVariableCancelSleep();
 	/* every process's rows, each having added its last before it said so */

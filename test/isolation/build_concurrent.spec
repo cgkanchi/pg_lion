@@ -39,6 +39,12 @@ session s2
 step s2_cic		{ CREATE INDEX CONCURRENTLY lion_cic_k ON lion_cic USING lion (k); }
 step s2_ric		{ REINDEX INDEX CONCURRENTLY lion_cic_g; }
 
+# An older snapshot, on no table: the build waits for it only after it has
+# validated, with the index ready (written to) but not yet valid (used).
+session s4
+step s4_begin	{ BEGIN ISOLATION LEVEL REPEATABLE READ; SELECT 1 AS snap; }
+step s4_commit	{ COMMIT; }
+
 session s3
 setup		{ SET enable_seqscan = off; SET enable_indexscan = off; SET pg_lion.enable_count_pushdown = off; }
 step s3_write	{
@@ -77,3 +83,8 @@ permutation s1_begin s1_write s2_cic s1_rollback s3_check s3_valid s3_verify
 
 # REINDEX CONCURRENTLY of an existing lion index under the same writes.
 permutation s1_begin s1_write s2_ric s1_commit s3_write s3_check s3_valid s3_verify_g
+
+# Writes while the new index is ready and not valid: they reach it only
+# through aminsert, after the validation has read it.
+permutation s4_begin s1_begin s1_write s2_cic s1_commit s3_write s3_valid s4_commit s3_check s3_valid s3_verify
+permutation s4_begin s1_begin s1_write s2_ric s1_commit s3_write s3_valid s4_commit s3_check s3_valid s3_verify_g

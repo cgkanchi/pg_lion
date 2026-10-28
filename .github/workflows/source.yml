@@ -186,10 +186,16 @@ jobs:
       # These are the steps that depend on the job's INJECTION_POINTS: set
       # to 1 (17 and later), run.sh fails rather than skip the injection-point
       # phases and still report ALL ... PASSED; set to 0 (16) it skips them.
+      # run.sh builds its own copy of the extension; COPT in the environment
+      # reaches that make, so the library it tests is UBSan's too.
       - name: Crash recovery and standby replay (custom resource manager, consistency checked)
+        env:
+          COPT: ${{ env.LION_UBSAN }}
         run: make recovery-check-rmgr RECOVERY_PREFIX="$PGPREFIX"
 
       - name: Crash recovery and standby replay (generic WAL, consistency checked)
+        env:
+          COPT: ${{ env.LION_UBSAN }}
         run: ./test/recovery/run.sh --prefix "$PGPREFIX" --conf "wal_consistency_checking = 'generic'"
 
       - name: Show regression diffs

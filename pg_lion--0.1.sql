@@ -285,15 +285,24 @@ CREATE OPERATOR CLASS uuid_ops DEFAULT FOR TYPE uuid USING lion AS
 
 /*
  * date, timestamp and timestamptz: one family, as in btree's datetime_ops, so
- * that `tscol >= current_date` and `ts >= now() - interval '7 days'` on a
- * timestamp column can use the index.  The cross-type comparisons are core's
- * own (date_cmp_timestamp and friends), so the index compares a date with a
- * timestamp exactly as the operator does, the session's TimeZone included
- * where timestamptz is one side (those are STABLE, as they are in btree).
- * Unlike integer_ops and float_ops the types do not hash compatibly - a date
- * and the timestamp at its midnight are equal and hash apart - so a
- * cross-type lookup locates its entry by proc 4 alone (DESIGN.md §21,
- * "Cross-type searches"), which these classes always have.
+ * that `tscol >= current_date` on a timestamp or timestamptz column and
+ * `tzcol >= localtimestamp - interval '7 days'` on a timestamptz one can use
+ * the index.  The cross-type comparisons are core's own (date_cmp_timestamp
+ * and friends), so the index compares a date with a timestamp exactly as the
+ * operator does, the session's TimeZone included where timestamptz is one
+ * side (those are STABLE, as they are in btree).  Unlike integer_ops and
+ * float_ops the types do not hash compatibly - a date and the timestamp at
+ * its midnight are equal and hash apart - so a cross-type lookup locates its
+ * entry by proc 4 alone (DESIGN.md §21, "Cross-type searches"), which these
+ * classes always have.
+ *
+ * Five of btree's six pairs: not a timestamp KEY against a timestamptz
+ * value.  That comparison converts the key to an instant at the session's
+ * TimeZone, which does not keep the keys' order across a DST gap (in New
+ * York 2026-03-08 02:30 sorts before 03:00 and is the later instant), so no
+ * descent by it can be exact (DESIGN.md §28, "Cross-type date and
+ * timestamp").  A timestamptz key against a timestamp value is fine: the
+ * value is converted once, and the keys are instants already.
  */
 CREATE OPERATOR FAMILY datetime_ops USING lion;
 
@@ -369,12 +378,6 @@ ALTER OPERATOR FAMILY datetime_ops USING lion ADD
 	OPERATOR	8	>= (timestamp, date),
 	OPERATOR	9	> (timestamp, date),
 	OPERATOR	10	<> (timestamp, date),
-	OPERATOR	1	= (timestamp, timestamptz),
-	OPERATOR	6	< (timestamp, timestamptz),
-	OPERATOR	7	<= (timestamp, timestamptz),
-	OPERATOR	8	>= (timestamp, timestamptz),
-	OPERATOR	9	> (timestamp, timestamptz),
-	OPERATOR	10	<> (timestamp, timestamptz),
 	OPERATOR	1	= (timestamptz, date),
 	OPERATOR	6	< (timestamptz, date),
 	OPERATOR	7	<= (timestamptz, date),
@@ -390,7 +393,6 @@ ALTER OPERATOR FAMILY datetime_ops USING lion ADD
 	FUNCTION	4	(date, timestamp) date_cmp_timestamp(date, timestamp),
 	FUNCTION	4	(date, timestamptz) date_cmp_timestamptz(date, timestamptz),
 	FUNCTION	4	(timestamp, date) timestamp_cmp_date(timestamp, date),
-	FUNCTION	4	(timestamp, timestamptz) timestamp_cmp_timestamptz(timestamp, timestamptz),
 	FUNCTION	4	(timestamptz, date) timestamptz_cmp_date(timestamptz, date),
 	FUNCTION	4	(timestamptz, timestamp) timestamptz_cmp_timestamp(timestamptz, timestamp);
 
