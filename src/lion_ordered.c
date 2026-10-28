@@ -1710,6 +1710,54 @@ lo_rechecked_quals(PlannerInfo *root, Path *lion)
 }
 
 /*
+ * The share of rel's rows a set of lion access `lion` holds (DESIGN.md
+ * §30.3, §40.8): `sel`, what the access selects, or, when it leaves quals
+ * to the recheck (lo_rechecked_quals()), its candidates - sel over the
+ * share of rows those quals keep.  *rechecked_p gets those quals, NIL for
+ * an exact set.
+ */
+static Selectivity
+lo_set_candsel(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+			   Selectivity sel, List **rechecked_p)
+{
+	List	   *rechecked = lo_rechecked_quals(root, lion);
+	Selectivity candsel = sel;
+
+	if (rechecked != NIL)
+	{
+		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
+												  JOIN_INNER, NULL);
+
+		if (rsel > 0)
+			candsel = Min(sel / rsel, 1.0);
+	}
+	*rechecked_p = rechecked;
+	return candsel;
+}
+
+/*
+ * The price of building a set of `members` TIDs of rel beyond its lookups
+ * (DESIGN.md §30.3): a cpu_operator_cost a container key, and the copy of
+ * lion access `lion`'s pieces into it (lo_set_pieces()) - none with `lion`
+ * NULL, a set of a join's key sets alone (§47.6).  Every price of a set is
+ * its lookups and this: lo_cost(), lo_cost_knn(), lo_cost_walk() and
+ * lion_ordered_set_price().  *bytes_p gets what the set takes
+ * (lo_set_bytes()); its spill past hash_mem (lo_spill_cost()) is the
+ * caller's, since a probe's sets share one.
+ */
+static Cost
+lo_set_build_price(PlannerInfo *root, RelOptInfo *rel, Path *lion,
+				   double members, double *bytes_p)
+{
+	double		pages = Max((double) rel->pages, 1.0);
+	double		ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
+
+	*bytes_p = lo_set_bytes(members, ncont);
+	return ncont * cpu_operator_cost +
+		((lion != NULL) ? lo_set_pieces(root, lion, members, ncont) : 0.0);
+}
+
+/*
  * What §30.3's price of the lookups charges a nested loop's probe for beyond
  * what its set's build does (DESIGN.md §40.10, "Cost"): in TIDs, each a
  * cpu_index_tuple_cost and the bitmap's tenth of a cpu_operator_cost.
@@ -1912,7 +1960,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		tuples = Max(rel->tuples, 1.0);
 	double		pages = Max((double) rel->pages, 1.0);
 	double		members;
-	double		ncont;
 	double		walked;
 	double		fetched;
 	double		candidates;
@@ -1993,17 +2040,13 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 					   0.0);
 
 	/* the set's members: the candidates, when it leaves quals to the recheck */
-	candsel = sel;
-	rechecked = (lion != NULL) ? lo_rechecked_quals(root, lion) : NIL;
+	rechecked = NIL;
+	candsel = (lion != NULL) ?
+		lo_set_candsel(root, rel, lion, sel, &rechecked) : sel;
 	rqcost.startup = 0;
 	rqcost.per_tuple = 0;
 	if (rechecked != NIL)
 	{
-		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
-												  JOIN_INNER, NULL);
-
-		if (rsel > 0)
-			candsel = Min(sel / rsel, 1.0);
 		cost_qual_eval(&rqcost, lionqual, root);
 		if (indexonly)
 		{
@@ -2028,7 +2071,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		candsel *= keysel;
 	}
 	members = Min(clamp_row_est(candsel * tuples * setskew), tuples);
-	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
 
 	/*
 	 * the lookups, the copy of their answer into the set, and its spill - a
@@ -2037,9 +2079,13 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (lion == NULL && keysel >= 1.0)
 		startup = 0.0;
 	else
-		startup = lioncost + keybuild + ncont * cpu_operator_cost +
-			((lion != NULL) ? lo_set_pieces(root, lion, members, ncont) : 0.0) +
-			lo_spill_cost(lo_set_bytes(members, ncont));
+	{
+		double		setbytes;
+
+		startup = lioncost + keybuild +
+			lo_set_build_price(root, rel, lion, members, &setbytes) +
+			lo_spill_cost(setbytes);
+	}
 	if (calls > 1.0 && !rebuilt)
 		scans *= calls;
 	if (scans > 1.0)
@@ -2286,34 +2332,44 @@ lo_knn_path(IndexPath *ipath)
  */
 static void
 lo_cost_knn(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
-			List *residual, double rows, Cost *startup_p, Cost *total_p)
+			List *lionqual, List *residual, double rows, Cost *startup_p,
+			Cost *total_p)
 {
 	Cost		lioncost;
 	Selectivity sel;
 	double		tuples = Max(rel->tuples, 1.0);
-	double		pages = Max((double) rel->pages, 1.0);
 	double		members;
-	double		ncont;
+	double		setbytes;
+	List	   *rechecked;
+	QualCost	rqcost;
 	Cost		fetch;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
 
+	/* the set's members: the candidates, which the recheck then filters */
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
-	members = clamp_row_est(sel * tuples);
-	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
+	members = clamp_row_est(lo_set_candsel(root, rel, lion, sel, &rechecked) *
+							tuples);
+	rqcost.startup = 0;
+	rqcost.per_tuple = 0;
+	if (rechecked != NIL)
+		cost_qual_eval(&rqcost, lionqual, root);
 
-	startup = lioncost + ncont * cpu_operator_cost +
-		lo_set_pieces(root, lion, members, ncont) +
-		lo_spill_cost(lo_set_bytes(members, ncont)) +
+	startup = lioncost +
+		lo_set_build_price(root, rel, lion, members, &setbytes) +
+		lo_spill_cost(setbytes) +
 		lion_vec_scan_cost(root, ord, members, &fetch);
 
 	run = members * (fetch + cpu_index_tuple_cost + cpu_operator_cost +
 					 cpu_tuple_cost);
 
 	cost_qual_eval(&qcost, residual, root);
-	startup += qcost.startup + rel->reltarget->cost.startup;
-	run += members * qcost.per_tuple + rows * rel->reltarget->cost.per_tuple;
+	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
+	/* the recheck of every candidate, the quals of the rows it passes */
+	run += members * rqcost.per_tuple +
+		Min(clamp_row_est(sel * tuples), members) * qcost.per_tuple +
+		rows * rel->reltarget->cost.per_tuple;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -2980,6 +3036,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	double		pages = Max((double) rel->pages, 1.0);
 	Selectivity swalk = 1.0;
 	Selectivity sel = 1.0;
+	Selectivity passsel = 1.0;
 	double		walked;
 	double		entries;
 	double		ndistinct;
@@ -2987,6 +3044,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	double		entrybytes;
 	double		leaves;
 	double		fetched;
+	double		idx_random;
 	double		spc_random;
 	double		spc_seq;
 	double		max_io;
@@ -2994,6 +3052,7 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	double		pages_corr;
 	double		corr;
 	QualCost	qcost;
+	QualCost	rqcost;
 	Cost		startup;
 	Cost		run;
 	VariableStatData vardata;
@@ -3028,20 +3087,31 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	perentry = walked / entries;
 
 	/* the descent to where the walk starts */
-	startup = 2.0 * random_page_cost;
+	get_tablespace_page_costs(w->index->reltablespace, &idx_random, NULL);
+	startup = 2.0 * idx_random;
+	rqcost.startup = 0;
+	rqcost.per_tuple = 0;
 	if (lion != NULL)
 	{
 		Cost		lioncost;
 		double		members;
-		double		ncont;
-
+		double		setbytes;
+		List	   *rechecked;
 		List	   *shared;
 
+		/*
+		 * The set: its members the candidates, which every fetched row's
+		 * recheck then filters, so `sel` from here is the candidates' share
+		 */
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
+		passsel = sel;
+		sel = lo_set_candsel(root, rel, lion, sel, &rechecked);
+		if (rechecked != NIL)
+			cost_qual_eval(&rqcost, lionqual, root);
 		members = clamp_row_est(sel * tuples);
-		ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), members);
-		startup += lioncost + ncont * cpu_operator_cost +
-			lo_spill_cost(lo_set_bytes(members, ncont));
+		startup += lioncost +
+			lo_set_build_price(root, rel, lion, members, &setbytes) +
+			lo_spill_cost(setbytes);
 
 		/*
 		 * What the set selects among the rows walked: not what the walked
@@ -3123,13 +3193,14 @@ lo_cost_walk(PlannerInfo *root, RelOptInfo *rel, LoWalk *w, Path *lion,
 	run += max_io + corr * corr * (min_io - max_io);
 
 	cost_qual_eval(&qcost, residual, root);
-	startup += qcost.startup + rel->reltarget->cost.startup;
-	run += fetched * (cpu_tuple_cost + qcost.per_tuple) +
+	startup += qcost.startup + rqcost.startup + rel->reltarget->cost.startup;
+	run += fetched * (cpu_tuple_cost + rqcost.per_tuple) +
+		fetched * Min(passsel / Max(sel, 1e-9), 1.0) * qcost.per_tuple +
 		rows * rel->reltarget->cost.per_tuple;
 
 	/* a list: one more descent for each of its values after the first */
 	if (w->nlist > 1.0)
-		run += (w->nlist - 1.0) * 2.0 * random_page_cost;
+		run += (w->nlist - 1.0) * 2.0 * idx_random;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -4239,7 +4310,7 @@ lo_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, RangeTblEntry *rte,
 					lionvec_postfilter != LIONVEC_POSTFILTER_ALLOW)
 					continue;
 				/* a lionvec index returns no values: heap mode (§44.6) */
-				lo_cost_knn(root, rel, ord, lion, residual, rows,
+				lo_cost_knn(root, rel, ord, lion, lionqual, residual, rows,
 							&startup, &total);
 				lo_add_path(rel, NULL, &lion_ordered_path_methods,
 							ord->path.pathkeys, list_make3(ord, lion, NIL),
@@ -9824,32 +9895,16 @@ lion_ordered_set_price(PlannerInfo *root, RelOptInfo *rel, Path *lion,
 	double		pages = Max((double) rel->pages, 1.0);
 	Cost		lioncost;
 	Selectivity sel;
-	Selectivity candsel;
 	List	   *rechecked;
-	double		m;
-	double		ncont;
 
 	cost_bitmap_tree_node(lion, &lioncost, &sel);
 	lioncost = Max(lioncost -
 				   lo_build_excess(root, lion, tuples, pages) *
 				   (cpu_index_tuple_cost + 0.1 * cpu_operator_cost),
 				   0.0);
-	candsel = sel;
-	rechecked = lo_rechecked_quals(root, lion);
-	if (rechecked != NIL)
-	{
-		Selectivity rsel = clauselist_selectivity(root, rechecked, rel->relid,
-												  JOIN_INNER, NULL);
-
-		if (rsel > 0)
-			candsel = Min(sel / rsel, 1.0);
-	}
-	m = clamp_row_est(candsel * tuples);
-	ncont = Min(ceil(pages / LION_BLOCKS_PER_CONTAINER), m);
-	*members = m;
-	*bytes = lo_set_bytes(m, ncont);
-	return lioncost + ncont * cpu_operator_cost +
-		lo_set_pieces(root, lion, m, ncont);
+	*members = clamp_row_est(lo_set_candsel(root, rel, lion, sel, &rechecked) *
+							 tuples);
+	return lioncost + lo_set_build_price(root, rel, lion, *members, bytes);
 }
 
 /*

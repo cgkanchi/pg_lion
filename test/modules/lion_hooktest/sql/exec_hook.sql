@@ -32,9 +32,25 @@ CREATE TABLE ncd (pk int PRIMARY KEY, name text NOT NULL);
 INSERT INTO ncd SELECT i, 'n' || (i % 2) FROM generate_series(0, 12) i;
 CREATE TABLE ncx (pk int8 PRIMARY KEY, flag bool NOT NULL);
 INSERT INTO ncx SELECT i, i % 3 = 0 FROM generate_series(0, 6) i;
+CREATE TABLE ncpd (pk int PRIMARY KEY, r int NOT NULL, t text NOT NULL);
+INSERT INTO ncpd SELECT i, i % 5, 't' || (i % 3) FROM generate_series(1, 2000) i;
+CREATE INDEX ncpd_r ON ncpd USING lion (r);
+CREATE INDEX ncpd_t ON ncpd USING lion (t);
+CREATE TABLE ncpf (id int PRIMARY KEY, fk int8, ch int NOT NULL, rk int NOT NULL);
+INSERT INTO ncpf SELECT i, 1 + (i * 37) % 2000, i % 3, (i * 7919) % 30001
+  FROM generate_series(1, 30) i;
+CREATE INDEX ncpf_rk ON ncpf (rk);
+CREATE TABLE ncpk (fk int8 NOT NULL, prod int NOT NULL);
+INSERT INTO ncpk SELECT 1 + (i * 37) % 2000, i % 2 FROM generate_series(1, 30) i;
+CREATE TABLE ncpb (k int8);
+INSERT INTO ncpb SELECT 1 + (i * 37 * 2) % 2000 FROM generate_series(1, 10) i;
 VACUUM (FREEZE, ANALYZE) nc;
 VACUUM (FREEZE, ANALYZE) ncd;
 VACUUM (FREEZE, ANALYZE) ncx;
+VACUUM (FREEZE, ANALYZE) ncpd;
+VACUUM (FREEZE, ANALYZE) ncpf;
+VACUUM (FREEZE, ANALYZE) ncpk;
+VACUUM (FREEZE, ANALYZE) ncpb;
 
 CREATE TABLE nc_nodes (node text PRIMARY KEY, q text, fn regprocedure, force text);
 INSERT INTO nc_nodes VALUES
@@ -90,7 +106,28 @@ INSERT INTO nc_nodes VALUES
 	 'SELECT id, lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') FROM nc WHERE d @@ ''w1 & w3''
 	   ORDER BY lion_bm25_score(d, ''w1 & w3'', ''nc_d'', col => ''d'') DESC LIMIT 5',
 	 'lion_bm25_score(tsvector,tsquery,regclass,float8,float8,name)',
-	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan');
+	 'enable_seqscan enable_bitmapscan pg_lion.enable_plain_scan'),
+	('LionProbeJoin',
+	 'SELECT f.ch, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk WHERE d.t = ''t1'' GROUP BY 1',
+	 'int48eq(int4,int8)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionProbeJoin, a predicate of its GROUP BY',
+	 'SELECT d.r = 2, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk GROUP BY 1',
+	 'int4eq(int4,int4)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionProbeJoin, a NOT EXISTS',
+	 'SELECT f.ch, count(*) FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.t = ''t1'' AND NOT EXISTS (SELECT 1 FROM ncpb b WHERE b.k = f.fk) GROUP BY 1',
+	 'int8eq(int8,int8)', 'enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedJoin',
+	 'SELECT f.id, d.pk FROM ncpf f JOIN ncpd d ON f.fk = d.pk WHERE d.r = 3 ORDER BY f.rk, f.id LIMIT 5',
+	 'int48eq(int4,int8)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedJoin, a key set',
+	 'SELECT f.id, d.pk FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.r = 3 AND f.fk IN (SELECT fk FROM ncpk WHERE prod = 1) ORDER BY f.rk, f.id LIMIT 5',
+	 'int8eq(int8,int8)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop'),
+	('LionOrderedSplit',
+	 'SELECT f.id, d.pk, d.r FROM ncpf f JOIN ncpd d ON f.fk = d.pk
+	   WHERE d.r < 3 AND f.fk IN (SELECT fk FROM ncpk WHERE prod = 1) ORDER BY d.r, f.rk, f.id LIMIT 5',
+	 'int4lt(int4,int4)', 'enable_sort enable_hashjoin enable_mergejoin enable_nestloop');
 
 -- lion's paths on and the core settings in force off, or the other way round
 CREATE FUNCTION nc_paths(force text, lion boolean) RETURNS void
@@ -100,7 +137,8 @@ DECLARE
 BEGIN
 	FOREACH g IN ARRAY ARRAY['pg_lion.enable_count_pushdown', 'pg_lion.enable_semijoin',
 							 'pg_lion.enable_ordered_scan', 'pg_lion.enable_btree_scan',
-							 'pg_lion.enable_bm25_scan'] LOOP
+							 'pg_lion.enable_bm25_scan', 'pg_lion.enable_probe_join',
+							 'pg_lion.enable_ordered_join'] LOOP
 		PERFORM set_config(g, CASE WHEN lion THEN 'on' ELSE 'off' END, true);
 	END LOOP;
 	FOREACH g IN ARRAY string_to_array(force, ' ') LOOP
@@ -194,5 +232,5 @@ DROP FUNCTION nc_explain(text, text);
 DROP FUNCTION nc_try(text);
 DROP FUNCTION nc_rows(text);
 DROP FUNCTION nc_paths(text, boolean);
-DROP TABLE nc_nodes, nc, ncd, ncx;
+DROP TABLE nc_nodes, nc, ncd, ncx, ncpd, ncpf, ncpk, ncpb;
 DROP FUNCTION nc_bucket(int);

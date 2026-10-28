@@ -480,6 +480,21 @@ extern bool lionvec_reads_placed(Relation heap, const LionVecMetaData *meta,
 								 int dims, bool half);
 extern void lionvec_check_page(Relation index, Page page, BlockNumber blk,
 							   uint16 type);
+
+/*
+ * Whether the item of a normal line pointer lies inside its page's data,
+ * between pd_upper and pd_special, which lionvec_check_page() has checked:
+ * what every item reader asks before it reads a byte of the item, as a
+ * corrupt offset, up to 32,767, would have the read - or a write - go past
+ * the page.
+ */
+static inline bool
+lionvec_item_inside(Page page, ItemId iid)
+{
+	return ItemIdGetOffset(iid) >= ((PageHeader) page)->pd_upper &&
+		(Size) ItemIdGetOffset(iid) + ItemIdGetLength(iid) <=
+		((PageHeader) page)->pd_special;
+}
 extern Buffer lionvec_insert_readbuf(Relation index, BlockNumber blk);
 extern LionVecCode *lionvec_code_at(Relation index, Page page, BlockNumber blk,
 									OffsetNumber off, int dimsp, bool copies);

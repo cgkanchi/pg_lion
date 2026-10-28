@@ -19785,8 +19785,10 @@ list's selectivity in it already. `test/sql/ordered_lists.sql`.
 clauses, `nd` the column's distinct values, and a set of selectivity `s` and index cost `C_lion`
 (§30.3):
 
-- start-up: a descent, `2 random_page_cost`, and the set's `C_lion` plus copying its answer, as
-  §30.3;
+- start-up: a descent, `2 random_page_cost` of the index's tablespace, and the set's `C_lion` plus
+  its build as every LionOrdered set is priced (`lo_set_build_price()`: a `cpu_operator_cost` a
+  container key and its pieces; then its spill, `lo_spill_cost()`), its members the candidates when it leaves quals to the
+  recheck (`lo_set_candsel()`, §40.8), and `s` their share from there on;
 - the walk: `W = s_w T` TIDs and `E = min(W, s_w nd)` entries; each entry
   `range_union_entry_cost` (a small entry of a walk, §28, "Counting a walk"), each TID
   `cpu_operator_cost`, and the directory leaves under them at `seq_page_cost` - `E` entries of a
@@ -19794,7 +19796,8 @@ clauses, `nd` the column's distinct values, and a set of selectivity `s` and ind
   pages;
 - the heap: `F = s W` rows fetched (`W` without a set), priced as `cost_index()` prices fetches, the
   column's correlation with the heap interpolating (`lion_var_heap_correlation()`), plus
-  `cpu_tuple_cost` and the filter per row fetched and the target per row returned;
+  `cpu_tuple_cost` and the recheck of a lossy set per row fetched, the filter per row the recheck
+  passes and the target per row returned;
 - rows: `lion_probe_rel_rows()`, as §30.3. Core's LIMIT scaling of the run cost is the walk's
   behaviour: it stops when the Limit stops pulling.
 
@@ -27009,7 +27012,8 @@ nothing. Since the restricted scan returns members only, a LIMIT is never left s
 **Cost** (`lo_cost_knn()`): the lion lookups and the set as `lo_cost()` prices them, plus
 `lion_vec_scan_cost()` for the members (§44.7) as start-up; then per member, at worst, a random
 page (none where the exact path read the row's heap page before its first row, §44.7, "Exact path
-pricing"), an index tuple, a probe and a tuple, its quals and the target. On 20,000 rows of 200
+pricing"), an index tuple, a probe and a tuple, the recheck where the set leaves quals to it (its
+members are then the candidates, §40.8), the quals of a member the recheck passes, and the target. On 20,000 rows of 200
 dimensions (format 1) the planner chose a sort of the lion bitmap scan's rows for a filter keeping
 1% of them, the node from 3% to 30%, and the plain lionvec scan with a Filter from 60%, where most
 rows pass and the set costs more than the rows it saves.
@@ -30090,6 +30094,14 @@ node from those truths, `setrefs.c` matching each predicate inside them to the n
   fact filter with no entry (`x = 77`), it is 16.7 against 138, and both run in hundredths of a
   millisecond.
 
+**Privileges** (§9, "EXECUTE on what a count replaces"; 2026-10-28). The node initialises only
+the WHERE's quals (for its set) and the heap recheck; the join's clause, which core's nested loop
+initialises as its Index Scan's `indexqualorig`, the anti join's clause, and the predicates of the
+GROUP BY's expressions, which setrefs.c replaces with the node's columns in the Agg above, nobody
+would. So the planner records their functions with the dimension's WHERE in custom_private member
+`PJ_PRIV_EXECUTE` (`pj_execute_functions()`), and `pj_begin()` checks them for the current user
+before anything starts, plain EXPLAIN included. node_contracts.sql runs the node through each.
+
 **Declined, and why.**
 
 - *A join path* (`set_join_pathlist_hook`) emitting the dimension's columns: those are what the
@@ -30505,8 +30517,12 @@ more than the loop keeping its price, and at least 1 / `pg_lion.cold_max_discoun
 
 ### 47.4 Execution (`oj_begin()`, `oj_exec()`, `oj_rescan()`)
 
-- **Begin.** The custom_private shape is checked against the plan's children and target, then the
-  sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
+- **Begin.** The custom_private shape is checked against the plan's children and target, and
+  EXECUTE is asked of the current user, plain EXPLAIN included, on the functions of the join's
+  clause and of each key set's (`OJ_PRIV_EXECUTE`, `oj_execute_functions()`; §9, "EXECUTE on what
+  a count replaces"): the node descends the dimension's B-tree with a scan key and tests a key set
+  through a hash table, so nothing initialises those clauses as the joins it replaces would. Then
+  the sides are initialised as children of the join (`ExecInitNode()`, neither backward nor marked)
   and kept out of `custom_ps`; each key set's plan goes into `custom_ps`, and EXPLAIN shows it
   under the join. LionOrdered's `lo_begin()` checks its side's flags: a serial B-tree walk, and the
   dimension a probe in heap mode with exactly one scan key, `pk = NULL`, an equality on the first

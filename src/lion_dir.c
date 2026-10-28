@@ -724,18 +724,8 @@ lion_dir_root(Relation index, LionIndexState *ix, uint32 *height)
 	buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
-	/* the special area's size first, as lion_read_meta() checks it */
-	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-		!LionPageIsMeta(page))
-	{
-		UnlockReleaseBuffer(buf);
-		ereport(ERROR,
-				(errcode(ERRCODE_INDEX_CORRUPTED),
-				 errmsg("lion index \"%s\": block 0 is not the meta page",
-						RelationGetRelationName(index))));
-	}
+	lion_meta_check_page(index, buf);
 	meta = LionPageGetMeta(page);
-	lion_meta_check_version(index, meta);
 	root = meta->root;
 	h = meta->height;
 	UnlockReleaseBuffer(buf);
@@ -2323,8 +2313,15 @@ lion_dir_split(Relation index, Relation heaprel, LionIndexState *ix, Buffer buf,
 		lion_dir_check_level(index, BufferGetPage(qbuf), oldright, level);
 	}
 
+	/*
+	 * The record below writes the meta page's root, height and page count,
+	 * so block 0 is checked first, as every other writer of it does: a
+	 * damaged one is refused here, before anything is logged, rather than
+	 * written over.
+	 */
 	metabuf = ReadBuffer(index, LION_METAPAGE_BLKNO);
 	LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+	lion_meta_check_page(index, metabuf);
 
 	xstate = lion_wal_begin(index);
 

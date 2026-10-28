@@ -890,24 +890,19 @@ lionvacuumcleanup(IndexVacuumInfo *info, IndexBulkDeleteResult *stats)
  * not reusable yet when the last ambulkdelete ended.  The meta page keeps it
  * in its special area's maxckey, which nothing else uses on that page; an
  * index that never had it reads 0, "none".  The page's format is asked for
- * first (lion_meta_check_version()): this is the one read of the meta page a
- * VACUUM with nothing to remove makes.
+ * first (lion_meta_check_page()): this is the one read of the meta page a
+ * VACUUM with nothing to remove makes, so a damaged block 0 is refused here
+ * rather than passed over.
  */
 static uint32
 lion_vac_pending_get(Relation index)
 {
 	Buffer		buf = ReadBuffer(index, LION_METAPAGE_BLKNO);
-	Page		page;
-	uint32		pending = 0;
+	uint32		pending;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	page = BufferGetPage(buf);
-	if (!PageIsNew(page) && PageGetSpecialSize(page) == LION_SPECIAL_SIZE &&
-		LionPageIsMeta(page))
-	{
-		lion_meta_check_version(index, LionPageGetMeta(page));
-		pending = LionPageGetOpaque(page)->maxckey;
-	}
+	lion_meta_check_page(index, buf);
+	pending = LionPageGetOpaque(BufferGetPage(buf))->maxckey;
 	UnlockReleaseBuffer(buf);
 	return pending;
 }
@@ -920,14 +915,8 @@ lion_vac_pending_put(Relation index, uint32 npending)
 	LionWalState *xstate;
 
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	lion_meta_check_page(index, buf);
 	page = BufferGetPage(buf);
-	if (PageIsNew(page) || PageGetSpecialSize(page) != LION_SPECIAL_SIZE ||
-		!LionPageIsMeta(page))
-	{
-		UnlockReleaseBuffer(buf);
-		return;
-	}
-	lion_meta_check_version(index, LionPageGetMeta(page));
 	if (LionPageGetOpaque(page)->maxckey == npending)
 	{
 		UnlockReleaseBuffer(buf);
@@ -2268,6 +2257,15 @@ lion_vacuum_postree_leaf(LionVacState *vs, Buffer buf)
 
 	if (maxoff < FirstOffsetNumber)
 		return;
+
+	/*
+	 * The chunks are written back by their line pointers and the empty ones
+	 * deleted, in one record, as on a directory leaf: so the page as a whole
+	 * has to hold together (lion_page_check_items()), not only each chunk
+	 * (lion_page_poschunk_fetch() below), or a chunk written back into bytes
+	 * that reach into its neighbour overwrites the neighbour.
+	 */
+	lion_page_check_items(vs->index, page, blk);
 
 	delofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxoff);
 	workofs = (OffsetNumber *) palloc(sizeof(OffsetNumber) * maxoff);

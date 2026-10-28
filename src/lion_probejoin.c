@@ -79,6 +79,9 @@ bool		lion_enable_probe_join = true;
  *	PJ_PRIV_PREDS	a predicate each: [dim, kind, bit, ntruth, truths ...]
  *	PJ_PRIV_RECHECK	the WHERE's qual over the dimension's heap tuple (its
  *					Vars INDEX_VAR), for a set built inexact; or NIL
+ *	PJ_PRIV_EXECUTE	oids: the functions the plan the node replaces would
+ *					check EXECUTE on and the node does not initialise
+ *					(pj_execute_functions())
  *
  * custom_exprs is every tree's leaves' index quals, in order, each with a
  * CaseTestExpr where the key is (pj_keyless()): setrefs.c fixes their Params
@@ -100,7 +103,8 @@ bool		lion_enable_probe_join = true;
 #define PJ_PRIV_DIMS		4
 #define PJ_PRIV_PREDS		5
 #define PJ_PRIV_RECHECK		6
-#define PJ_PRIV_NMEMBERS	7
+#define PJ_PRIV_EXECUTE		7
+#define PJ_PRIV_NMEMBERS	8
 
 #define PJ_INT_MAGIC		0
 #define PJ_INT_NFACT		1	/* the fact's columns */
@@ -565,6 +569,34 @@ pj_labels(PlannerInfo *root, RelOptInfo *dim, PjPlan *pp)
 		}
 	}
 	return true;
+}
+
+/*
+ * The functions the plan the node replaces would check EXECUTE on, which the
+ * node itself does not initialise (DESIGN.md §9, "Privileges"): the join's
+ * clause, which core's nested loop initialises as its Index Scan's
+ * indexqualorig; the dimension's WHERE, its Filter; the anti join's clause;
+ * and the predicates of the GROUP BY's expressions, which setrefs.c replaces
+ * with the node's columns in the Agg above, so that core initialises none
+ * of them.  The WHERE's own quals are initialised for its set as well, and
+ * the fact's and the anti join's tables are core's plans.
+ */
+static List *
+pj_execute_functions(RelOptInfo *dim, LionProbeShape *ps,
+					 LionCellsPlan *cells)
+{
+	List	   *funcs = NIL;
+	ListCell   *lc;
+
+	funcs = lion_expr_functions((Node *) ps->joinclause->clause, funcs);
+	foreach(lc, dim->baserestrictinfo)
+		funcs = lion_expr_functions((Node *) lfirst_node(RestrictInfo, lc)->clause,
+									funcs);
+	if (ps->anticlause != NULL)
+		funcs = lion_expr_functions((Node *) ps->anticlause->clause, funcs);
+	if (cells != NULL)
+		funcs = lion_expr_functions((Node *) cells->predexprs, funcs);
+	return funcs;
 }
 
 /*
@@ -1215,6 +1247,7 @@ pj_try_shape(PlannerInfo *root, RelOptInfo *input_rel, RelOptInfo *output_rel,
 	priv = lappend(priv, dims);
 	priv = lappend(priv, preds);
 	priv = lappend(priv, recheck);
+	priv = lappend(priv, pj_execute_functions(dim, ps, pp.cells));
 	Assert(list_length(priv) == PJ_PRIV_NMEMBERS);
 	bundle = list_make4(priv, tlexprs,
 						list_make2_int(firstjunk, (int) dim->relid), keyless);
@@ -1522,8 +1555,18 @@ pj_begin(CustomScanState *node, EState *estate, int eflags)
 	Relation	heap = node->ss.ss_currentRelation;
 	List	   *recheck;
 	Plan	   *factplan;
+	ListCell   *lc;
 
 	pj_decode(st, cscan);
+
+	/*
+	 * The EXECUTE checks of the plan the node replaces
+	 * (pj_execute_functions()), for the current user whenever the plan
+	 * starts, plain EXPLAIN included, as ExecInitNode() makes them: a cached
+	 * plan answers a REVOKE and a SET ROLE as the ordinary one does.
+	 */
+	foreach(lc, pj_priv_list(priv, PJ_PRIV_EXECUTE, T_OidList, true))
+		lion_check_execute(lfirst_oid(lc));
 	if (list_length(cscan->custom_plans) != (st->antikeycol > 0 ? 2 : 1))
 		elog(ERROR, "LionProbeJoin: malformed child plans");
 	factplan = (Plan *) linitial(cscan->custom_plans);
