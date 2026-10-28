@@ -45,6 +45,9 @@
 # 23).  All of them use ./dev.sh's private cluster, pointed at a socket
 # directory and port of the job's own through LION_SOCK and LION_PORT, and
 # .local/pg is a symlink to the installation under test.
+#
+# A pull request that changes only documentation skips all of the above
+# (changes.yml says which files count); "CI result" still reports, and passes.
 
 name: CI
 
@@ -71,9 +74,16 @@ env:
   LION_PORT: "55432"
 
 jobs:
+  # Whether this is a pull request that changes only documentation
+  # (changes.yml), in which case the build and test jobs are skipped.
+  changes:
+    uses: ./.github/workflows/changes.yml
+
   # 16 to 19 from apt.postgresql.org (pgdg.yml); 18 on arm64 runs there
   # from optional.yml, by hand.
   pgdg:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     uses: ./.github/workflows/pgdg.yml
     with:
       versions: '["16", "17", "18", "19"]'
@@ -81,12 +91,16 @@ jobs:
   # PostgreSQL 18 from source, with assertions and injection points
   # (source.yml); the other branches run there from optional.yml, by hand.
   source:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     uses: ./.github/workflows/source.yml
     with:
       branches: '["REL_18_STABLE"]'
 
   dist:
     name: PGXN archive (build and test from the zip)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     env:
       PG: "18"
@@ -143,3 +157,21 @@ jobs:
           ./dev.sh reset
           eval "$(./dev.sh env)"
           make installcheck || { find test -name regression.diffs -exec cat {} +; exit 1; }
+
+  # One check that sums up the rest: it fails if any job above failed or was
+  # cancelled, and passes if they passed or were skipped as docs-only.  The
+  # skipped jobs report under other names than a run's (a skipped call of
+  # pgdg.yml is one "pgdg" check, not one per major), so this is the check
+  # to require if branch protection ever requires one.
+  result:
+    name: CI result
+    needs: [changes, pgdg, source, dist]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the jobs' results
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$RESULTS" | jq -e 'all(.[]; .result == "success" or .result == "skipped")' > /dev/null
