@@ -517,6 +517,15 @@ lion_open_parts(LionCountScanState *st)
 		for (i = 0; i < st->nclause; i++)
 			part->clauseidx[i] = lion_open_index(part->clauseidxoid[i]);
 		part->fgidx = lion_open_index(part->fgidxoid);
+
+		/* the indexes whose slices answer the aggregates (DESIGN.md §52) */
+		if (st->slice != NULL)
+		{
+			part->sliceidx = (Relation *)
+				palloc0(sizeof(Relation) * st->slice->ncol);
+			for (i = 0; i < st->slice->ncol; i++)
+				part->sliceidx[i] = lion_open_index(part->sliceidxoid[i]);
+		}
 	}
 }
 
@@ -531,6 +540,15 @@ lion_close_parts(LionCountScanState *st)
 	{
 		LionPartState *part = &st->part[p];
 
+		if (part->sliceidx != NULL)
+		{
+			for (i = 0; i < st->slice->ncol; i++)
+			{
+				if (part->sliceidx[i] != NULL)
+					index_close(part->sliceidx[i], AccessShareLock);
+				part->sliceidx[i] = NULL;
+			}
+		}
 		if (part->fgidx != NULL)
 			index_close(part->fgidx, AccessShareLock);
 		part->fgidx = NULL;
@@ -641,6 +659,23 @@ lion_open_relation(LionCountScanState *st, int p)
 			st->clause[i].idx = part->clauseidx[i];
 		st->groupidx = part->groupidx;
 		st->groupidx2 = part->groupidx2;
+
+		/*
+		 * ... and its own index slicing each column the aggregates of
+		 * sliced columns are taken over, whose slices its turn counts
+		 * (DESIGN.md §52.13)
+		 */
+		if (st->slice != NULL)
+		{
+			for (i = 0; i < st->slice->ncol; i++)
+			{
+				LionSCol   *col = &st->slice->col[i];
+
+				col->idx = part->sliceidx[i];
+				col->idxoid = part->sliceidxoid[i];
+				col->idxcol = part->sliceidxcol[i];
+			}
+		}
 	}
 	lion_check_table_am(st->heap);	/* the planner declined it; see there */
 	st->rel_read_only = lion_rel_read_only(st, st->heap);
@@ -844,6 +879,12 @@ lion_close_relation(LionCountScanState *st)
 	}
 	if (st->innercxt != NULL)
 		MemoryContextReset(st->innercxt);
+	/* a partition's slice indexes are its turn's (DESIGN.md §52) */
+	if (st->slice != NULL && !own)
+	{
+		for (i = 0; i < st->slice->ncol; i++)
+			st->slice->col[i].idx = NULL;
+	}
 	for (i = 0; i < st->nclause; i++)
 	{
 		if (st->clause[i].idx != NULL && own)
@@ -1677,6 +1718,10 @@ lion_begin_partitions(LionCountScanState *st, const LionCountPriv *priv)
 					 i, priv->part[i].nresid, list_length(st->residexprs));
 			st->part[i].nresid = priv->part[i].nresid;
 			st->part[i].residdrop = priv->part[i].residdrop;
+
+			/* ... and its index slicing each sliced column (§52) */
+			st->part[i].sliceidxoid = priv->part[i].sliceidxoid;
+			st->part[i].sliceidxcol = priv->part[i].sliceidxcol;
 		}
 
 		/*

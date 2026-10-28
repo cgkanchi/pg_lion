@@ -1044,8 +1044,11 @@ working around a bad choice:
   plane kernel's instruction set, below), `Slice Descent Steps`, `Slice Candidate Sets`, `Slice
   WHERE Copies`, `Slice Batches Decoded`, `Slice Keys Decoded`, `Slice Rows Decoded` and the heap
   rechecks of pages not all-visible. With no `WHERE` and no `GROUP BY` it competes with the
-  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. Not taken: a join, a
-  partitioned table, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
+  aggregates over keys (`Aggregates Over Keys`, DESIGN.md §37) on price. On a partitioned table
+  the one row is answered when every partition the planner keeps has a whole Lion index of its own
+  slicing the column, each partition's answers added up in the node (DESIGN.md §52.13; EXPLAIN
+  names no index there). Not taken: a join, a partitioned table's `GROUP BY` or one partition
+  without such an index, a residual clause, `DISTINCT`, `FILTER` or `ORDER BY` in the aggregate, an
   expression of the column, a filtered count beside a `GROUP BY`, three grouping columns, a float
   column, and a hot standby, where the pushdown collects nothing. Off, these aggregates go to the
   aggregates over keys or to the ordinary plan.
@@ -1070,10 +1073,12 @@ working around a bad choice:
   other columns, as an `OR`'s arm, under `count(DISTINCT)` of another column, as the filter of
   the slices' own aggregates (`sum(x) WHERE x > c`), with parameters and stable expressions - but
   not a range that bounds the walk of a `GROUP BY` or `count(DISTINCT)` of its own column, nor on
-  a partitioned table, in a join, in a filtered count's condition, inside a partial index's scope
-  or on a hot standby. `x <> c` from the slices is a positive source - every row with a value but
-  c's - where it otherwise only subtracts c's rows. Bounds past the type's range, NULL bounds,
-  infinities and a reversed `BETWEEN` give the ordinary query's answer. EXPLAIN prints `Range From
+  a partitioned table one of whose partitions has no index slicing the column (each partition
+  folds its own index's slices, DESIGN.md §53.11), in a join, in a filtered count's condition,
+  inside a partial index's scope or on a hot standby. `x <> c` from the slices is a positive
+  source - every row with a value but c's - where it otherwise only subtracts c's rows. Bounds
+  past the type's range, NULL bounds, infinities and a reversed `BETWEEN` give the ordinary
+  query's answer. EXPLAIN prints `Range From
   Slices: x > 10 (32 slices)` - each such range's bounds and its column's width - and the range in
   `Lion Indexes` as any; `EXPLAIN ANALYZE` adds `Slice Range Descents` (collections), `Slice Range
   Keys` (container keys folded), `Slice Range Steps` (a slice's container folded at a key, the
@@ -1573,8 +1578,10 @@ Bit slices (`slices = on`, DESIGN.md §51) are kept for `int2`, `int4`, `int8`, 
 `numeric` or `interval` - for every such column of the index or none (the option is the index's,
 not a column's). The count pushdown answers `count`, `sum`, `avg`, `min` and `max` of the column
 from them (DESIGN.md §52), and a range on the sliced column itself (DESIGN.md §53), but not a
-percentile, a join's or a partitioned table's aggregates or ranges, nor a bitmap or plain scan's
-range. An insert into a sliced column costs a posting-set insert per set bit of its value - in
+percentile, a join's aggregates or ranges, a partitioned table's `GROUP BY`, nor a bitmap or
+plain scan's range; a partitioned table's one row and its ranges are answered when every
+partition has its own index slicing the column (DESIGN.md §52.13, §53.11). An insert into a
+sliced column costs a posting-set insert per set bit of its value - in
 place, several to a WAL record, but a posting page each (DESIGN.md §51, "Insert cost, revisited").
 On PostgreSQL 16 a server with `old_snapshot_threshold` set (it is -1, off, by default; 17 removed
 the setting) does not read lion or `lionvec` indexes at all: neither detects "snapshot too old", so

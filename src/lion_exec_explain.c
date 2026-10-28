@@ -856,7 +856,11 @@ lion_explain_indexes(LionCountScanState *st, List *ancestors,
  * One range from slices (DESIGN.md §53) for "Range From Slices": the bounds
  * on lead's column among clauses [first, first + n) that are a range from
  * slices, ANDed - `x > 10 AND x <= 20` - and the slices its column has,
- * `(32 slices)`.
+ * `(32 slices)`.  Over a partitioned table (§52.13), a bound every partition
+ * leaves out, its bounds implying it (§16), is not shown - nor the range,
+ * when that is every bound of it - and the slices are those of the first
+ * partition's index that reads it: the planner had every partition's slice
+ * the column at its type's width.
  */
 static void
 lion_explain_slice_range(LionCountScanState *st, int lead, int first, int n,
@@ -867,21 +871,52 @@ lion_explain_slice_range(LionCountScanState *st, int lead, int first, int n,
 	int			nbits = 0;
 	int			j;
 
-	if (buf->len > 0)
-		appendStringInfoString(buf, ", ");
 	for (j = first; j < first + n; j++)
 	{
 		LionClauseState *b = &st->clause[j];
 
 		if (b->kind != LION_CLAUSE_RANGESRC || !b->sliced ||
-			b->attno != cl->attno || st->inor[j] != st->inor[lead])
+			b->attno != cl->attno || st->inor[j] != st->inor[lead] ||
+			lion_explain_dropped_all(st, j))
 			continue;
+		if (firstbound && buf->len > 0)
+			appendStringInfoString(buf, ", ");
 		if (!firstbound)
 			appendStringInfoString(buf, " AND ");
 		lion_explain_clause(st, b, ancestors, es, buf);
 		firstbound = false;
+
+		/* the slices: the table's index, or a partition's */
+		if (nbits == 0 && st->npart > 0)
+		{
+			int			p;
+
+			for (p = 0; p < st->npart && nbits == 0; p++)
+			{
+				LionPartState *part = &st->part[p];
+				Relation	idx;
+				char	   *name;
+				AttrNumber	attno;
+				AttrNumber	col;
+
+				if (!OidIsValid(part->clauseidxoid[j]) || cl->attno <= 0)
+					continue;
+				name = get_attname(st->plan.heapoid, cl->attno, false);
+				attno = get_attnum(part->heapoid, name);
+				pfree(name);
+				if (attno == InvalidAttrNumber)
+					continue;
+				idx = index_open(part->clauseidxoid[j], AccessShareLock);
+				col = lion_index_col_for_kind(idx, attno, cl->kind,
+											  st->plan.vcols);
+				nbits = lion_index_column_state(idx, col)->slicebits;
+				index_close(idx, AccessShareLock);
+			}
+		}
 	}
-	if (OidIsValid(cl->idxoid) && cl->attno > 0)
+	if (firstbound)
+		return;
+	if (st->npart == 0 && OidIsValid(cl->idxoid) && cl->attno > 0)
 	{
 		Relation	idx = index_open(cl->idxoid, AccessShareLock);
 		AttrNumber	col = lion_index_col_for_kind(idx, cl->attno, cl->kind,
@@ -1249,7 +1284,9 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 	 * The sliced columns aggregates are answered from (DESIGN.md §52): each
 	 * index and column, and which of its slices are counted against the
 	 * WHERE - every bit's and E's for a sum or an average, E's alone
-	 * otherwise - and the descents its extremes take.
+	 * otherwise - and the descents its extremes take.  A partitioned scan
+	 * names no index, as it names none in Lion Indexes: each partition reads
+	 * its own (§52.13).
 	 */
 	if (st->slice != NULL)
 	{
@@ -1261,8 +1298,10 @@ lion_explain_group_keys(LionCountScanState *st, List *ancestors,
 			LionSCol   *col = &st->slice->col[c];
 			int			want = col->want;
 
-			appendStringInfo(&buf, "%s%s (%s: %s%s%s)", (c > 0) ? ", " : "",
+			appendStringInfo(&buf, "%s%s%s(%s: %s%s%s)", (c > 0) ? ", " : "",
+							 (st->npart > 0) ? "" :
 							 get_rel_name(col->idxoid),
+							 (st->npart > 0) ? "" : " ",
 							 lion_explain_attname(st, col->attno),
 							 (want & LION_SWANT_SUM) ?
 							 "every bit counted" : "existence counted",

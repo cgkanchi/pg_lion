@@ -132,8 +132,9 @@ groups 41 ms against 181, and a count over half the rows of a column of distinct
 against 32 from summaries and 362 for the ordinary plan; a selective range stays with the
 summaries or the values, and the planner prices each. The price is on writes: every set bit of a
 value is one more posting-set insert, so an `INSERT` into a table with two sliced columns took 4.6
-times as long as without slices with `pg_lion` preloaded. Floats, `numeric`, joins and partitioned
-tables are not answered from slices yet ([GUIDE.md](docs/GUIDE.md), DESIGN.md §51 to §53).
+times as long as without slices with `pg_lion` preloaded. A partitioned table's one row and its
+ranges are answered from every partition's own slices; its `GROUP BY`, floats, `numeric` and joins
+are not answered from slices yet ([GUIDE.md](docs/GUIDE.md), DESIGN.md §51 to §53).
 
 ### Joins
 
@@ -311,7 +312,8 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
   posting-set insert per set bit of each value on top: an `INSERT` into a table with a sliced
   `int4` and a sliced `int8` column took 4.6× as long as without slices with `pg_lion` preloaded,
   and about 11× without it. Slices serve int2, int4, int8, date, time and timestamp columns on one
-  table; not floats, `numeric`, joins or partitioned tables.
+  table, and a partitioned table's aggregates without a `GROUP BY` and its ranges; not floats,
+  `numeric`, joins, or a partitioned table's `GROUP BY`.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
 - A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and
   is slower than GIN.

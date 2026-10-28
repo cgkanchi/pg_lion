@@ -673,7 +673,9 @@ lion_implied_everywhere(PlannerInfo *root, RelOptInfo *toprel, RelOptInfo *rel,
  * Is there still a clause that selects rows and carries the §9 interlock among
  * the ones a partition keeps (drop[] says which restrictions it leaves out):
  * a positive clause other than a range collected into memory, or an OR
- * without one among its leaves (lion_leaf_drops())?
+ * without one among its leaves (lion_leaf_drops())?  A range from slices
+ * (DESIGN.md §53) is ANDed with its column's existence slice, located with
+ * its pin, and so carries the interlock itself.
  */
 static bool
 lion_leaf_selects(List *clauseinfos, const bool *drop, const bool *orrange)
@@ -692,7 +694,7 @@ lion_leaf_selects(List *clauseinfos, const bool *drop, const bool *orrange)
 			ci->incompl)
 			continue;
 		if (ci->inor ? (r < 0 || !orrange[r]) :
-			ci->kind != LION_CLAUSE_RANGESRC)
+			(ci->kind != LION_CLAUSE_RANGESRC || ci->sliced))
 			return true;
 	}
 	return false;
@@ -737,19 +739,23 @@ lion_pinned_not_implied(PlannerInfo *root, RelOptInfo *toprel,
 		if (!LION_CLAUSE_IS_POSITIVE(ci->kind) || ci->rinfono < 0 ||
 			ci->incompl)
 			continue;
+		/*
+		 * a range from slices carries its own (DESIGN.md §53), one collected
+		 * from its entries none (§32)
+		 */
 		if (ci->inor)
 		{
-			/* an OR carries the pin when no leaf of it is a range */
+			/* an OR carries the pin when no leaf of it is such a range */
 			foreach(l2, clauseinfos)
 			{
 				LionClauseInfo *other = (LionClauseInfo *) lfirst(l2);
 
 				if (other->rinfono == ci->rinfono &&
-					other->kind == LION_CLAUSE_RANGESRC)
+					other->kind == LION_CLAUSE_RANGESRC && !other->sliced)
 					pinned = false;
 			}
 		}
-		else if (ci->kind == LION_CLAUSE_RANGESRC)
+		else if (ci->kind == LION_CLAUSE_RANGESRC && !ci->sliced)
 			pinned = false;
 		if (pinned &&
 			!lion_implied_everywhere(root, toprel, toprel,
@@ -812,8 +818,8 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 	bool	   *present;		/* some clause came of the restriction */
 	bool	   *need;			/* ... and this partition has no index for it */
 	bool	   *keep;			/* ... and it may not be left out */
-	bool	   *orrange;		/* an OR with a range leaf it keeps: carries no
-								 * pin */
+	bool	   *orrange;		/* an OR with a range leaf it keeps, collected
+								 * from its entries: carries no pin */
 	bool	   *drop;
 	bool	   *armdrop;		/* an OR's leaf, left out with its arm or alone */
 	bool	   *dropped;
@@ -932,7 +938,8 @@ lion_leaf_drops(PlannerInfo *root, RelOptInfo *leaf, List *partqual,
 				need[r] = true;
 			if (ci->kind == LION_CLAUSE_RANGE || (ci->valueout && !ci->inor))
 				keep[r] = true;
-			if (ci->inor && ci->kind == LION_CLAUSE_RANGESRC && !armdrop[i])
+			if (ci->inor && ci->kind == LION_CLAUSE_RANGESRC && !ci->sliced &&
+				!armdrop[i])
 				orrange[r] = true;
 		}
 		i++;
