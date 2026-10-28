@@ -30608,7 +30608,7 @@ fetched, descended and its dimension row read. A table becomes a key set when:
   under the clause proves it (`lion_column_is_unique()`), and so does a unique B-tree of more
   columns whose others the table's restriction clauses pin to a constant each
   (`oj_column_pinned()`: `col = <pseudo-constant>` either way round, by an equality of the
-  column's family in the index, under the index's collation for it) - `ib (fk, kind)` under
+  column's family in the index, under the index's collation for it) - `kt (fk, kind)` under
   `kind = 2`, the key set holding those rows' keys alone; immediate, B-tree, and partial only where
   the clauses imply its predicate, as `relation_has_unique_index_for()` takes them;
 - nothing of it is in the join rel's target but its key, and the key only where core put it there
@@ -30858,7 +30858,7 @@ EXISTS; the split with kind 1 a key set (`Arms Run: 1`, 332 descents); and with 
 alone, its walk both arms long (§47.10, "What a key set leaves"). Not alone and still taken: the
 split under a LATERAL subquery's clause, its LIMIT 1 keeping it from being pulled up, at 2.2 times
 under core's price. A key set's key in the target: with nested loops and merge joins off, the side
-table's hash join above reads the key set's key, `Hash Cond: (s.fk = ib.fk)`, which the node fills.
+table's hash join above reads the key set's key, `Hash Cond: (s.fk = kt.fk)`, which the node fills.
 
 test/sql/ordjoin_keyfold.sql, §47.6's fold, in a schema of its own: a 20,000-row dimension with lion
 indexes on a three-value `tier` and a ten-value `region`; a 200,000-row fact table, ten rows a key,
@@ -30868,7 +30868,7 @@ twenty-value `prod`; a key table of sixty keys for product 7 (600 fact rows) and
 plan, answers compared in order. Without a lion index of the key, the split led by the tier under
 product 7's key set walks 18,275 entries, every one fetched, 18,043 keys rejected; with nothing
 forced the plan is core's, the walk priced at its share's fetches (§47.3), and for product 3's two
-thousand keys the split's. With `cpc_fk`, a lion index of the key: the same split forced walks
+thousand keys the split's. With `fct_fk`, a lion index of the key: the same split forced walks
 17,792 entries over a set of the key set's 610 rows, 54 met, then switches and fetches the 556 left,
 610 fetches in all and no key rejected; the join with a fact and a dimension lion clause besides,
 its set the AND of both; with nothing forced core's plan for product 7 - the key table, then the
@@ -31039,7 +31039,7 @@ rejections are the node's, an entry of the fact's walk and a hash probe each, be
 and it filters nothing above. The page's small key table was kept out of §47.6 for two reasons,
 both lifted:
 
-- *its key unique only with its primary key's other columns pinned* - `ib (fk, kind)` under `kind
+- *its key unique only with its primary key's other columns pinned* - `kt (fk, kind)` under `kind
   = 2` - which `lion_column_is_unique()`, a unique B-tree of the key alone, does not prove:
   `oj_keyset_unique()` takes a unique B-tree whose other columns the table's own restriction
   clauses pin to a constant each, the key set holding only those rows' keys;
