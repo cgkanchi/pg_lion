@@ -10,8 +10,9 @@
 # script under its version in a new database, creates a lion (or lionvec)
 # index on every operator class the extension then had, runs ALTER EXTENSION
 # UPDATE, and requires the extension's catalog entries (test/upgrade/
-# catalog.sql) to equal those of a fresh CREATE EXTENSION, and every index to
-# REINDEX.  A version of the script that this server cannot install (one for
+# catalog.sql) to equal those of a fresh CREATE EXTENSION, the objects the
+# update left outside the extension to be those it warned it detached, and
+# every index to REINDEX.  A version of the script that this server cannot install (one for
 # another PostgreSQL major, or naming a C function the library no longer has)
 # is skipped and reported; any other install failure fails, and the newest
 # earlier version must install.
@@ -89,6 +90,37 @@ opclasses() {
 		JOIN pg_type t ON t.oid = c.opcintype
 		WHERE d.deptype = 'e'
 		ORDER BY c.opcname"
+}
+
+# Objects in the extension's schema that belong to no extension, as
+# "family <schema>.<name>", "class <schema>.<name>" and "function <signature>"
+# lines.  Those an update adds must be the families and functions it reported
+# leaving in place, detached, because indexes use them; a detached class whose
+# family is still the extension's is listed, and no warning accounts for it.
+detached() {
+	$PSQL -d "$1" -At -c "
+		WITH x AS (SELECT extnamespace AS ns FROM pg_extension WHERE extname = '$2')
+		SELECT line FROM (
+			SELECT 'family ' || n.nspname || '.' || f.opfname AS line
+			FROM pg_opfamily f JOIN pg_namespace n ON n.oid = f.opfnamespace, x
+			WHERE f.opfnamespace = x.ns
+			  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_opfamily'::regclass
+							  AND d.objid = f.oid AND d.deptype = 'e')
+			UNION ALL
+			SELECT 'class ' || n.nspname || '.' || c.opcname
+			FROM pg_opclass c JOIN pg_namespace n ON n.oid = c.opcnamespace, x
+			WHERE c.opcnamespace = x.ns
+			  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_opclass'::regclass
+							  AND d.objid = c.oid AND d.deptype = 'e')
+			  AND EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_opfamily'::regclass
+						  AND d.objid = c.opcfamily AND d.deptype = 'e')
+			UNION ALL
+			SELECT 'function ' || p.oid::regprocedure
+			FROM pg_proc p, x
+			WHERE p.pronamespace = x.ns
+			  AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_proc'::regclass
+							  AND d.objid = p.oid AND d.deptype = 'e')
+		) l ORDER BY line COLLATE \"C\""
 }
 
 for ext in $exts; do
@@ -176,6 +208,12 @@ for ext in $exts; do
 			continue
 		fi
 
+		if ! detached "$db" "$ext" > "$OUT/$tag.free"; then
+			echo "$tag: could not list the objects outside the extension" >&2
+			unplant
+			failed=1
+			continue
+		fi
 		if ! $PSQL -d "$db" -c "ALTER EXTENSION $ext UPDATE" 2> "$OUT/$tag.update"; then
 			echo "$tag: ALTER EXTENSION UPDATE failed:" >&2
 			cat "$OUT/$tag.update" >&2
@@ -189,6 +227,22 @@ for ext in $exts; do
 		if ! diff -u "$OUT/$ext-fresh.cat" "$OUT/$tag.cat" > "$OUT/$tag.diff"; then
 			echo "$tag: the catalogs after the update differ from a fresh install of $cur:" >&2
 			cat "$OUT/$tag.diff" >&2
+			failed=1
+			continue
+		fi
+		# what the catalog listing leaves out, objects that are no longer the
+		# extension's, must be exactly what the update said it detached
+		if ! detached "$db" "$ext" | LC_ALL=C comm -13 "$OUT/$tag.free" - > "$OUT/$tag.detached"; then
+			echo "$tag: could not list the objects outside the extension" >&2
+			failed=1
+			continue
+		fi
+		sed -n -e 's/^WARNING:  operator family \(.*\) is no longer part of .*/family \1/p' \
+			   -e 's/^WARNING:  function \(.*\) is no longer part of .*/function \1/p' \
+			"$OUT/$tag.update" | LC_ALL=C sort > "$OUT/$tag.warned"
+		if ! diff -u "$OUT/$tag.warned" "$OUT/$tag.detached" > "$OUT/$tag.detached.diff"; then
+			echo "$tag: the objects left outside the extension differ from those the update reported detaching:" >&2
+			cat "$OUT/$tag.detached.diff" >&2
 			failed=1
 			continue
 		fi
