@@ -951,9 +951,9 @@ working around a bad choice:
   at their own price, which for a walk carries that weighing already. Where a query's explicit
   `JOIN`s and the semi joins of its `EXISTS` and `IN` pass `join_collapse_limit` items, or a
   pulled-up subquery's `FROM` list passes `from_collapse_limit`, PostgreSQL may join an `EXISTS`
-  or `IN` above the rest of the query; its table is still a key set when it is joined by the key
-  and nothing else of it is wanted above, and the join above tests the node's rows again. Any other
-  key set's table must be planned in one join problem with the two tables (docs/GUIDE.md). Where the fact's key column has a Lion
+  or `IN` above the rest of the query; its table is still a key set, and the join above tests the
+  node's rows again (docs/GUIDE.md). Either way a key set's table is joined by the key alone, and
+  nothing else of it is wanted. Where the fact's key column has a Lion
   index of its own (scalar, of the key's type, not partial unless the query implies its
   predicate), the key set's keys are also looked up in it
   and their rows ANDed into the walk's set, so that a row whose key the table lacks is never read
