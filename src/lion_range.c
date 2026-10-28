@@ -1295,6 +1295,7 @@ lion_entry_scan_fill(LionEntryScan *es, bool copy)
 			lion_fetch_key(state, es->lastkey) : (Datum) 0;
 		sk.hash = es->lasthash;
 		sk.hashlazy = (es->lastkind == LION_KIND_VALUE);
+		sk.nohash = false;
 		sk.cmpproc = state->ordered ? &state->cmpproc : NULL;
 		sk.eqproc = &state->eqproc;
 		sk.collation = state->collation;

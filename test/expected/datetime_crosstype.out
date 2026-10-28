@@ -1,0 +1,439 @@
+-- date, timestamp and timestamptz compared with one another (DESIGN.md §28,
+-- "Cross-type date and timestamp").
+--
+-- The three classes share one family, datetime_ops, as they do in btree, so a
+-- clause that compares a column of one with a value of another - `ts >=
+-- current_date - 7` on a timestamp column, `tz >= current_date` on a
+-- timestamptz one - reaches the column's lion index; all but a timestamp
+-- column against a timestamptz value, which no index can order exactly
+-- across a DST gap (the last section below).  The types do not hash
+-- compatibly (a date and the timestamp at its midnight are equal and hash
+-- apart), so a cross-type lookup finds its entry by the family's cross-type
+-- comparison alone, and the run of entries it ties is what the equality
+-- decides among.  Every answer below is checked three ways: through the count
+-- pushdown, through bitmap scans of the lion indexes, and with no index at
+-- all.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET timezone = 'America/New_York';
+/*
+ * The rows q returns, as one text, the same three ways: the count pushdown
+ * and lion's other custom scans preferred, lion's bitmap scans alone, and no
+ * index.  'ok' and the first way's answer when the three agree.
+ */
+CREATE FUNCTION xdt(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	w	text := 'SELECT coalesce(string_agg(x::text, '' '' ORDER BY x::text), ''-'') FROM (' || q || ') x';
+	a	text;
+	b	text;
+	c	text;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
+	EXECUTE w INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	EXECUTE w INTO b;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE w INTO c;
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('pg_lion.pushdown_margin', '1', true);
+	IF a = b AND b = c THEN
+		RETURN 'ok ' || a;
+	END IF;
+	RETURN 'MISMATCH pushdown=' || a || ' bitmap=' || b || ' none=' || c;
+END $$;
+-- Midnights, times inside a day, the hour a DST change skips (2026-03-08
+-- 02:30 does not exist in New York) and the hour one repeats (2026-11-01
+-- 01:30 happens twice), and NULLs.
+CREATE TABLE xdt_t (id int, d date, ts timestamp, tz timestamptz, g int)
+  WITH (autovacuum_enabled = off);
+INSERT INTO xdt_t
+SELECT i,
+	   date '2026-03-01' + i % 40,
+	   timestamp '2026-03-01' + (i % 40) * interval '1 day' +
+	   CASE i % 3 WHEN 0 THEN interval '0' WHEN 1 THEN interval '90 min'
+	   ELSE (i % 24) * interval '1 hour' END,
+	   timestamptz '2026-03-01 00:00 America/New_York' + (i % 40) * interval '1 day' +
+	   (i % 5) * interval '30 min' +
+	   CASE WHEN i % 7 = 0 THEN interval '0' ELSE interval '2 hours' END,
+	   i % 5
+  FROM generate_series(1, 4000) i;
+INSERT INTO xdt_t VALUES (0, NULL, NULL, NULL, 0);
+INSERT INTO xdt_t
+SELECT -i, date '2026-03-08', timestamp '2026-03-08 02:30',
+	   timestamptz '2026-11-01 01:30 America/New_York', 1
+  FROM generate_series(1, 30) i;
+CREATE INDEX xdt_t_d ON xdt_t USING lion (d);
+CREATE INDEX xdt_t_ts ON xdt_t USING lion (ts);
+CREATE INDEX xdt_t_tz ON xdt_t USING lion (tz);
+CREATE INDEX xdt_t_g ON xdt_t USING lion (g);
+VACUUM ANALYZE xdt_t;
+-- ---------- the family ----------
+SELECT c.opcname, f.opfname, amvalidate(c.oid)
+  FROM pg_opclass c JOIN pg_opfamily f ON f.oid = c.opcfamily
+ WHERE c.opcmethod = (SELECT oid FROM pg_am WHERE amname = 'lion')
+   AND c.opcname IN ('date_ops', 'timestamp_ops', 'timestamptz_ops')
+ ORDER BY 1;
+     opcname     |   opfname    | amvalidate 
+-----------------+--------------+------------
+ date_ops        | datetime_ops | t
+ timestamp_ops   | datetime_ops | t
+ timestamptz_ops | datetime_ops | t
+(3 rows)
+
+-- ---------- the indexes are used ----------
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE d = timestamp '2026-03-08';
+                                      QUERY PLAN                                       
+---------------------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: xdt_t_d (d = 'Sun Mar 08 00:00:00 2026'::timestamp without time zone)
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE ts >= current_date - 7;
+                     QUERY PLAN                      
+-----------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: xdt_t_ts (ts >= (CURRENT_DATE - 7))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE tz >= localtimestamp - interval '7 days';
+                                QUERY PLAN                                
+--------------------------------------------------------------------------
+ Custom Scan (LionCount)
+   Lion Indexes: xdt_t_tz (tz >= (LOCALTIMESTAMP - '@ 7 days'::interval))
+(2 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT * FROM xdt_t WHERE tz >= date '2026-03-30';
+                   QUERY PLAN                   
+------------------------------------------------
+ Bitmap Heap Scan on xdt_t
+   Recheck Cond: (tz >= '03-30-2026'::date)
+   ->  Bitmap Index Scan on xdt_t_tz
+         Index Cond: (tz >= '03-30-2026'::date)
+(4 rows)
+
+-- ---------- equality: a value of each other type, in each column ----------
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamp ''2026-03-08''');
+   xdt    
+----------
+ ok (130)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamp ''2026-03-08 00:00:00.000001''');
+  xdt   
+--------
+ ok (0)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 America/New_York''');
+   xdt    
+----------
+ ok (130)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 UTC''');
+  xdt   
+--------
+ ok (0)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = date ''2026-03-08''');
+   xdt   
+---------
+ ok (33)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz = date ''2026-03-08''');
+  xdt   
+--------
+ ok (0)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz = timestamp ''2026-11-01 01:30''');
+   xdt   
+---------
+ ok (30)
+(1 row)
+
+SELECT xdt('SELECT g, count(*) FROM xdt_t WHERE ts = date ''2026-03-11'' GROUP BY g');
+    xdt    
+-----------
+ ok (0,33)
+(1 row)
+
+-- ---------- ranges and <> ----------
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d > timestamp ''2026-03-20 00:00''');
+    xdt    
+-----------
+ ok (2000)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d >= timestamp ''2026-03-20 00:00:01''');
+    xdt    
+-----------
+ ok (2000)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d < timestamptz ''2026-03-20 03:00 UTC''');
+    xdt    
+-----------
+ ok (1930)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts <= date ''2026-03-05''');
+   xdt    
+----------
+ ok (433)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts BETWEEN date ''2026-03-08'' AND timestamptz ''2026-03-08 04:00 America/New_York''');
+   xdt   
+---------
+ ok (97)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz >= date ''2026-03-30'' AND tz < timestamp ''2026-04-02 01:00''');
+   xdt    
+----------
+ ok (300)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d <> timestamp ''2026-03-08''');
+    xdt    
+-----------
+ ok (3900)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz <> date ''2026-03-08''');
+    xdt    
+-----------
+ ok (4030)
+(1 row)
+
+SELECT xdt('SELECT g, count(*) FROM xdt_t WHERE tz > timestamp ''2026-03-25 01:00'' GROUP BY g');
+                    xdt                     
+--------------------------------------------
+ ok (0,300) (1,330) (2,300) (3,300) (4,400)
+(1 row)
+
+-- ---------- lists, combined with other columns ----------
+-- Equal values of two types in one list, a value no row has, and a list long
+-- enough to be located in one walk of the directory.
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d IN (timestamp ''2026-03-08'', timestamp ''2026-03-08 00:00'', timestamp ''2026-03-09 01:00'', timestamp ''2026-03-10'')');
+   xdt    
+----------
+ ok (230)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = ANY (ARRAY[date ''2026-03-02'', date ''2026-03-03'', date ''2026-03-31''])');
+   xdt    
+----------
+ ok (100)
+(1 row)
+
+SELECT xdt($q$SELECT count(*) FROM xdt_t WHERE d = ANY (ARRAY(
+  SELECT timestamp '2026-02-20' + i * interval '12 hours' FROM generate_series(0, 120) i))$q$);
+    xdt    
+-----------
+ ok (4030)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz IN (date ''2026-03-08'', date ''2026-03-09'') OR g = 3');
+   xdt    
+----------
+ ok (800)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d >= timestamp ''2026-03-10 01:00'' AND tz < date ''2026-03-30'' AND g = 2');
+   xdt    
+----------
+ ok (400)
+(1 row)
+
+SELECT xdt('SELECT count(DISTINCT d) FROM xdt_t WHERE ts > date ''2026-03-15''');
+   xdt   
+---------
+ ok (26)
+(1 row)
+
+-- ---------- rows, in order ----------
+CREATE INDEX xdt_t_id ON xdt_t (id);
+VACUUM ANALYZE xdt_t;
+SELECT xdt('SELECT id FROM xdt_t WHERE d >= timestamp ''2026-03-20 12:00'' AND g = 1 ORDER BY id LIMIT 5');
+             xdt             
+-----------------------------
+ ok (21) (26) (31) (36) (61)
+(1 row)
+
+SELECT xdt('SELECT id FROM xdt_t WHERE tz BETWEEN date ''2026-03-08'' AND timestamp ''2026-03-09'' ORDER BY id DESC LIMIT 5');
+                  xdt                  
+---------------------------------------
+ ok (3807) (3847) (3887) (3927) (3967)
+(1 row)
+
+-- ---------- semi and anti joins on a key of another type ----------
+CREATE TABLE xdt_k (k int PRIMARY KEY, ts timestamp, dd date)
+  WITH (autovacuum_enabled = off);
+INSERT INTO xdt_k
+SELECT i, timestamp '2026-03-01' + i * interval '1 day' +
+		  CASE WHEN i % 2 = 0 THEN interval '0' ELSE interval '1 hour' END,
+	   date '2026-03-01' + i
+  FROM generate_series(0, 60, 3) i;
+VACUUM ANALYZE xdt_k;
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d IN (SELECT ts FROM xdt_k)');
+   xdt    
+----------
+ ok (700)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t t WHERE NOT EXISTS (SELECT 1 FROM xdt_k k WHERE k.ts = t.d)');
+    xdt    
+-----------
+ ok (3331)
+(1 row)
+
+SELECT xdt('SELECT k.k, count(*) FROM xdt_t t JOIN xdt_k k ON t.ts = k.dd GROUP BY k.k');
+                                                      xdt                                                       
+----------------------------------------------------------------------------------------------------------------
+ ok (0,33) (12,34) (15,34) (18,34) (21,34) (24,34) (27,34) (3,34) (30,34) (33,34) (36,34) (39,34) (6,34) (9,34)
+(1 row)
+
+-- ---------- the session's time zone decides, as for the operators ----------
+-- A timestamptz compared with a date or a timestamp is compared at the
+-- session's TimeZone; the index follows it: each answer below differs between
+-- the two zones.
+SET timezone = 'Asia/Kolkata';
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 Asia/Kolkata''');
+   xdt    
+----------
+ ok (130)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz >= timestamp ''2026-03-08 13:00'' AND tz < date ''2026-03-09''');
+   xdt   
+---------
+ ok (85)
+(1 row)
+
+SET timezone = 'America/New_York';
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE d = timestamptz ''2026-03-08 00:00 Asia/Kolkata''');
+  xdt   
+--------
+ ok (0)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz >= timestamp ''2026-03-08 13:00'' AND tz < date ''2026-03-09''');
+  xdt   
+--------
+ ok (0)
+(1 row)
+
+-- ---------- a timestamp column against a timestamptz value ----------
+-- That comparison turns each key into an instant at the session's TimeZone,
+-- and the instants are not in the keys' order across a DST gap: 2026-03-08
+-- 02:30 does not exist in New York, is taken as 02:30 EST, 07:30 UTC, and so
+-- sorts before 03:00 (07:00 UTC) and compares after it.  An ordered descent
+-- would miss rows there, so the family leaves the pair out and the clause is
+-- a filter, as with no index; each answer below takes rows from both sides
+-- of the gap.
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE ts >= now() - interval '7 days';
+                       QUERY PLAN                       
+--------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on xdt_t
+         Filter: (ts >= (now() - '@ 7 days'::interval))
+(3 rows)
+
+EXPLAIN (COSTS OFF)
+SELECT count(*) FROM xdt_t WHERE ts = timestamptz '2026-03-08 03:30 America/New_York';
+                                   QUERY PLAN                                    
+---------------------------------------------------------------------------------
+ Aggregate
+   ->  Seq Scan on xdt_t
+         Filter: (ts = 'Sun Mar 08 03:30:00 2026 EDT'::timestamp with time zone)
+(3 rows)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts = timestamptz ''2026-03-08 03:30 America/New_York''');
+   xdt   
+---------
+ ok (30)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts < timestamptz ''2026-03-08 03:15 America/New_York'' AND ts >= date ''2026-03-08''');
+   xdt   
+---------
+ ok (67)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE ts > timestamptz ''2026-03-08 03:15 America/New_York'' AND ts < date ''2026-03-09''');
+   xdt   
+---------
+ ok (63)
+(1 row)
+
+SELECT xdt('SELECT count(*) FROM xdt_t WHERE tz < timestamp ''2026-03-08 02:30'' AND tz >= date ''2026-03-08''');
+   xdt   
+---------
+ ok (15)
+(1 row)
+
+-- ---------- a partitioned table ----------
+CREATE TABLE xdt_p (id int, d date, ts timestamp, tz timestamptz, g int)
+  PARTITION BY RANGE (id);
+CREATE TABLE xdt_p1 PARTITION OF xdt_p FOR VALUES FROM (MINVALUE) TO (2000)
+  WITH (autovacuum_enabled = off);
+CREATE TABLE xdt_p2 PARTITION OF xdt_p FOR VALUES FROM (2000) TO (MAXVALUE)
+  WITH (autovacuum_enabled = off);
+INSERT INTO xdt_p SELECT * FROM xdt_t;
+CREATE INDEX ON xdt_p USING lion (d);
+CREATE INDEX ON xdt_p USING lion (tz);
+CREATE INDEX ON xdt_p USING lion (g);
+VACUUM ANALYZE xdt_p;
+SELECT xdt('SELECT count(*) FROM xdt_p WHERE d = timestamp ''2026-03-08''');
+   xdt    
+----------
+ ok (130)
+(1 row)
+
+SELECT xdt('SELECT g, count(*) FROM xdt_p WHERE tz < date ''2026-03-05'' GROUP BY g');
+                xdt                 
+------------------------------------
+ ok (0,100) (1,100) (2,100) (3,100)
+(1 row)
+
+-- ---------- the SQL count of a key of another type ----------
+SELECT lion_index_count('xdt_t_d', timestamp '2026-03-08') AS lion,
+	   (SELECT count(*) FROM xdt_t WHERE d = timestamp '2026-03-08') AS query;
+ lion | query 
+------+-------
+  130 |   130
+(1 row)
+
+SELECT lion_index_count('xdt_t_d', timestamp '2026-03-08 06:00') AS lion;
+ lion 
+------
+    0
+(1 row)
+
+DROP TABLE xdt_t, xdt_k, xdt_p;
+DROP FUNCTION xdt(text);

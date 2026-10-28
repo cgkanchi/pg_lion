@@ -17,6 +17,13 @@ SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_lion;
 CREATE EXTENSION IF NOT EXISTS pageinspect;
 
+-- The build's phases, as pg_stat_progress_create_index names them (DESIGN.md
+-- §24, "Progress").  What a build reports in them is left alone, as core's
+-- tests leave theirs: another session would see it only by a race.
+SELECT n, pg_indexam_progress_phasename(a.oid, n) AS phase
+  FROM pg_am a, generate_series(1, 6) n
+ WHERE a.amname = 'lion' ORDER BY n;
+
 SELECT setseed(0.31);
 
 CREATE FUNCTION lion_build_digest(idx regclass) RETURNS text

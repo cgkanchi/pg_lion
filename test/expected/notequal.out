@@ -108,7 +108,7 @@ SELECT count(*) AS ne_operators,
    AND o.amopstrategy = 10;
  ne_operators | families 
 --------------+----------
-           37 |       26
+           42 |       24
 (1 row)
 
 SELECT count(*) AS range_pairs_without_ne
