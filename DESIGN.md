@@ -6104,8 +6104,8 @@ leaf, and the clause tested on its rows gives the same answer.
 
 What LionCount does with a partitioned table (above) is a different thing: it counts every leaf
 the planner keeps, as one node. Its aggregates of sliced columns (§52) are each leaf's own, added up
-in the node (§52.13). The join and the walks run on one leaf, and a parent with several
-is core's.
+in the node (§52.13). The join and the walks need the planner to keep one leaf; a parent with
+several leaves left gets core's Append for them.
 
 `test/sql/ordjoin_partition.sql` runs the join and the split through both parents - the fact LIST
 by `grp`, each sub-partitioned by LIST on `ver`, the leaf the queries hit attached with two dropped
@@ -33167,8 +33167,8 @@ planner keeps (§16):
   without one - no index slicing the column, a partial one, an expression's - and the whole query
   is declined (to the counts with an Agg above them, or core's plan): an aggregate over some
   leaves' slices and others' rows would be a second executor.
-- **The plan**: member 25 (`SLICES`) keeps one index and key column a column a leaf, leaf-major
-  in `PARTS` order (`nrel × ncol`, `nrel` 1 for a table), its one-index-per-column lists
+- **The plan**: member 25 (`SLICES`) keeps one index and key-column pair per sliced column on
+  each leaf, leaf-major in `PARTS` order (`nrel × ncol`, `nrel` 1 for a table), its one-index-per-column lists
   otherwise unchanged; `LION_PRIV_MAGIC` changed with it.
 - **The executor**: each leaf's slice indexes open with its relation and stay open for the node's
   life, as §16 keeps every relation the node reads (`lion_open_parts()`), so a `REINDEX` of one
