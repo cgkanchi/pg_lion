@@ -30465,25 +30465,35 @@ them (`lion_probe_rel_rows()`):
   bitmap scan's price (§30.3): its walk is most of its price, where the LIMIT scales this one's walk
   and not its build. A `cpu_operator_cost` a fact row for its key's test.
 - **The keys**: `keys = factrows * P(fk IS NOT NULL)` (`nulltestsel()`). Each key set adds its
-  plan's total cost and a `cpu_operator_cost` a key to the startup, a `cpu_operator_cost` to each
-  key still tested, and lets through the share of keys its keys are of the dimension's rows among
-  the keys that name one, `min(1, found * setrows / dim.tuples)` (`found` below), which is `setrows
-  / max(nd, dim.tuples)`: the descents left. A key set's keys are taken to be dimension keys, so
-  each key it lets through names a row, and the orphan share is taken at the first key set only.
-  Core's `eqjoinsel_semi()` takes `setrows / nd` where `nd` passes `dim.tuples`, the same, and then
-  takes the orphan share again at the join.
+  plan's total cost and a `cpu_operator_cost` a row to the startup, a `cpu_operator_cost` to each
+  key still tested, and lets through `pass` of them, the descents left (`oj_keyset_pass()`):
+  core's own selectivity of the fact's semi join to the key set's table by the key
+  (`eqjoinsel_semi()` through `clause_selectivity()`, on a clause and a `JOIN_SEMI`
+  `SpecialJoinInfo` made for it, so that the query's RestrictInfo keeps its own cached
+  selectivity), over `P(fk IS NOT NULL)`, at most 1. It matches the fact's most common keys against
+  the table's where both have them, and otherwise takes the table's distinct keys after its
+  clauses against the fact's, so a key set of a few keys each of which many fact rows hold, or of a
+  few keys none of which the fact holds, is priced at what it lets through and not at its share of
+  the dimension's rows. A key set's keys are taken to be dimension keys, so each key it lets
+  through names a row, and the orphan share is taken at the first key set only. Where the table's
+  clauses pick out the keys the fact holds most of, which no statistic of either table records,
+  `pass` is low; where they pick out keys the fact lacks, high (§47.7).
+- **The distinct keys**: a key set holds each key once, `setkeys` of them,
+  `estimate_num_groups()` over its plan's rows (what core prices a GROUP BY of them at), at most
+  those rows. They size the set against `work_mem` (§47.6) and the fold's leaves (below). An IN
+  over a table whose keys repeat holds far fewer keys than it has rows.
 - **The key sets folded** (§47.6, "Folded into the walk"; `oj_fold_share()`): the walk is priced
   over the AND of its set and the rows of the key sets' keys, `keysel = P(fk IS NOT NULL) * Π
-  min(1, hit * setrows / dim.tuples)` of the table, taken as independent of the fact's quals
+  pass` of the table, taken as independent of the fact's quals
   (`lo_cost()`'s `keysel`): its members, pieces, bytes and fetches are the AND's, its rows
   `factrows * keysel`, every key a dimension key that each key set passes (a test each all the
-  same). Each key set's leaf is priced in the start-up (`lion_ordered_keys_price()`): its keys'
-  entries located in the key's lion index, `index_pages_fetched()` over the index's pages at
-  `random_page_cost` as `genericcostestimate()` prices an IN list's descents, a descent's
-  comparisons a key, and a piece a container key its rows reach; and an operator a key for the
-  array. Its pages join the cold reads. Folded and not are both offered (`oj_add_paths()`), and
-  `add_path()` keeps what it keeps: a page the walk meets in a few hundred entries does not pay a
-  thousand keys' lookups back.
+  same). Each key set's leaf is priced in the start-up (`lion_ordered_keys_price()`): its
+  `setkeys` keys' entries located in the key's lion index, `index_pages_fetched()` over the
+  index's pages at `random_page_cost` as `genericcostestimate()` prices an IN list's descents, a
+  descent's comparisons a key, and a piece a container key its rows reach; and an operator a key
+  for the array. Its pages join the cold reads. Folded and not are both offered
+  (`oj_add_paths()`), and `add_path()` keeps what it keeps: a page the walk meets in a few hundred
+  entries does not pay a thousand keys' lookups back.
 - **The fetches the key sets reject**, not folded: the walk fetches each member to read its key,
   and the key sets keep `kept = descents / keys` of them. Core's Limit takes `s` of a run priced
   whole, which charges those fetches `s` of the pages Mackert and Lohman give the whole walk's -
@@ -30707,12 +30717,68 @@ fetched, descended and its dimension row read. A table becomes a key set when:
 - its key is of the fact key's type, with an equality in the class's families that hashes both
   sides with one function: the set is a hash table of that type's values, under the class's
   collation;
-- its path's rows, at the bytes a simplehash entry and a copied key take, fit `work_mem`.
+- its distinct keys (§47.3, `oj_keyset_new()`), at the bytes a simplehash entry and a copied key
+  take, fit `work_mem`.
 
 A key set is a simplehash of Datums (`ojkeys`), each non-NULL key copied once into the set's
 context; a NULL key matches nothing. `Key Set Keys` counts them. Planning takes the key sets of a
 join rel whole: a join rel some of whose tables are not key sets gets no path, and core's join of
 the node's rows to them above is the plan.
+
+**A join above** (2026-10-28; `oj_keysets_above()`, `oj_keyset_above()`). A query of more tables
+than `join_collapse_limit` (or `from_collapse_limit`) is planned in parts: the fact and the
+dimension in one, with the tables written next to them, and an EXISTS or an IN elsewhere in the
+query joined above that part's plan. The key set's table is then not in any join rel the node is
+offered for, and without it the node's walk passes every fact row the EXISTS would drop; raising
+the limits plans the query whole, and also lets core reorder every other join in it, which can
+cost another query its plan. So a table outside the join search under way - not in the first level
+of `join_rel_level`, or in GEQO's initial rels; another extension's join search gets none - and
+joined above it by the key is a key set too: its plan is the key set's child, its keys are tested
+as any key set's are, and the join stays above and tests the node's rows again. A row the key set
+drops is one that join would drop where:
+
+- the table is the whole inner side, minimal and syntactic, of a semi join whose syntactic outer
+  side holds the join rel - an IN or an EXISTS of it alone - or on no special join's inner side, an
+  inner join (core makes one of an EXISTS on a unique key, `reduce_unique_semijoins()`; a key
+  that repeats is fine here, the join above being the one that returns the rows);
+- the join rel is on no special join's inner side but those wholly within it, and on no side of a
+  FULL join reaching past it: its rows reach that join, never null-extended, holding the key;
+- the table is a base relation with no LATERAL reference, TABLESAMPLE, volatile function in its
+  clauses or PlaceHolderVar computed at it; its key the key class's member of it, a plain column of
+  the fact key's type with a hashable equality; and nothing of it wanted above but that key - no
+  join clause of its own, no other column in its target. A table a column of which the query reads
+  - a dimension of another join - or an EXISTS that tests more than the key is not one.
+
+The node's rows are then those its key sets keep, and the joins above return `aboverep` rows for
+each: one for a semi join, and for an inner join one for each of its table's rows with that key,
+`setrows * P(key IS NOT NULL) / setkeys` (`estimate_num_groups()` counts no group for NULL), at
+least one. A row of the join rel gives `abovepass` rows above, the product of the key sets' `pass`
+times `aboverep`. The LIMIT's share of a walk is taken over the rows above: the node's own output
+times `aboverep` (`oj_cost()`, and `os_cost()`'s limit divided by it), the competitor's rows times
+`abovepass` (`oj_competitor()`). The tables are not counted against the node being alone under the
+LIMIT (`oj_alone()`, §47.10).
+A table inside the join search is joined there and is a key set of the join rel that holds it, as
+before, so a query planned whole keeps the plan it had. EXPLAIN shows the key set under the node and
+the join above with its own scan of the table: the table is read twice.
+
+**Measured** (2026-10-28; PostgreSQL 18.6 with assertions, the shared VM, `random_page_cost` 1.1,
+`work_mem` 256 MB, `competitor_pricing` off; warm, three runs). A synthetic query of ten tables,
+a 2,000,000-row fact walked by a B-tree under `LIMIT 100`, a 3,000,000-row dimension, and an
+EXISTS on a 10,000,000-row table filtered by a lion index, whose matches crowd on a few thousand
+keys; four filters of that table. Before, at the
+default limits the EXISTS was a nested loop semi join above the walk; at 16 the query was planned
+whole and the table was a key set.
+
+| filter | before, default limits | before, at 16 | after, default limits | after, at 16 |
+|---|---|---|---|---|
+| 1 | 2.9 to 6.6 s | 0.88 to 0.97 s | 0.89 to 1.11 s | 0.89 to 0.94 s |
+| 2 | 1.9 to 2.2 s | 0.40 to 0.52 s | 0.36 to 0.39 s | 0.35 to 0.37 s |
+| 3 | 1.9 to 2.0 s | 0.18 to 0.30 s | 0.17 to 0.44 s | 0.17 to 0.19 s |
+| 4 | 1.9 to 2.0 s | 0.35 to 0.51 s | 0.31 to 0.38 s | 0.31 to 0.36 s |
+
+Under the first filter the key set holds 3,177 keys and rejects 923,434 of the walk's keys;
+`setkeys` took it at 179,000, the matches spread over the table's distinct keys at the statistics'
+rate where they crowd on a few (§47.7). The plan is the same either way.
 
 **The feed** (2026-10-28; `oj_keyset_feed()`, `oj_feed_cold()`). A key set's plan runs once, before
 the walk, and reads its table's matching rows whatever the walk's LIMIT. Core's cheapest path of
@@ -30888,6 +30954,11 @@ index tuple, the rejected rows are not fetched and need no price.
 - **The dimension index-only.** The probe always reads the member's heap row. Where a B-tree on the
   key holds every column the query reads of the dimension, §40.10's nested loop probe
   (`LionBtreeScan`) answers it from the index; a covering form of the join's probe is not built.
+- **A key set's estimates under correlated clauses.** `pass` and `setkeys` (§47.3) take the
+  table's clauses as independent of its key: a filter whose matches crowd on a few keys, or on the
+  keys the fact holds most rows of, is estimated at many times the keys it holds, as core's own
+  estimate of the semi join is. That leans toward declining a key set for `work_mem` and pricing it
+  as passing more than it does; nothing corrects it at run time but the walk's own switch.
 - **Key sets of another type**: a key column of a type other than the fact key's, or an equality
   whose two sides hash with different functions, is declined rather than cast.
 - **A semi join's inner side of several tables**, a key set by IN over a join: only one table.
@@ -30966,7 +31037,15 @@ columns the B-tree lacks (`Heap Fetches` its candidates); the switch, made due a
 count (0.7 to 1.4 times it, the check coarse enough that ANALYZE's sample does not move it), with a
 key set and without; taking every non-NULL key to name a row would make it about twice (1.6 to 2.4).
 Declined: a second join clause, a key that is not unique, `FOR SHARE`, no lion clause on either
-side, the setting off (core's nested loop over a Memoize).
+side, the setting off (core's nested loop over a Memoize). Section 9b, a key set joined above
+(§47.6, "A join above"): at a `join_collapse_limit` of 1 an EXISTS, an IN, two of them (one of a
+table whose keys repeat) and an empty one, each a key set of a node its semi join is planned
+above; not one: a table whose clauses call a volatile function, a NOT EXISTS, the fact and the
+dimension on a left join's nullable side. A nine-table query - four left joins, a LATERAL
+subquery, an anti join and an EXISTS - at the default limits, a key set from above (the EXISTS on
+a unique key an inner join, and on a key that repeats a semi join, its table read twice in the
+plan: the key set's child and the semi join's), and not with an EXISTS that tests more than the
+key; at 16 the same query planned whole, its key set inside the join; under GEQO.
 
 btreescan_param.sql's cursor section turns the node off: under that section's
 `pushdown_margin = 1000` the node took the join from the `LionBtreeScan` probe the section tests.
