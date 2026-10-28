@@ -6,20 +6,17 @@
 #           Makefile skips the specs that need it and says so.  18 runs on
 #           arm64 as well, where the SIMD kernels' portable versions are the
 #           ones the server picks rather than fallbacks.
-#   source  REL_16_STABLE to REL_19_STABLE and master built from source with
-#           --enable-cassert and, from 17, --enable-injection-points, the
-#           injection_points module and the isolation tester installed, so
-#           every isolation spec runs.  The build is cached per upstream
-#           commit.  These are also the only jobs with an assert build, so the
-#           debug_discard_caches run is here (on 16, 19 and master: the oldest
-#           major's compatibility code and the two newest), and pg_lion is
-#           built with UndefinedBehaviorSanitizer there, so the whole suite
-#           runs under it and a report fails the step that met it.
+#   source  REL_18_STABLE built from source with --enable-cassert and
+#           --enable-injection-points, pg_lion built with UBSan
+#           (source.yml).  REL_16_STABLE, REL_17_STABLE, REL_19_STABLE
+#           and master build there, with the debug_discard_caches run, when
+#           that workflow is started by hand.
 #   dist    make dist, META.json validated against the PGXN Meta Spec, and the
 #           archive built and tested on its own, outside the checkout.
 #
 # The injection-point specs - the race tests of the VACUUM/count/split
-# interlocks - therefore run on every major from 17, from source.  16 has no
+# interlocks - therefore run on 18 from source on every pull request, and on
+# every major from 17 when source.yml is started by hand.  16 has no
 # injection points at all, and PGDG ships no injection_points module;
 # docs/DEVELOPING.md says so.  The concurrent soak (test/soak) runs weekly,
 # in soak.yml.
@@ -28,11 +25,11 @@
 # every major, in both WAL modes and with wal_consistency_checking, so that
 # every major replays lion's records: its phases 1, 1f, 2, 4 and 5 on the
 # packages, and all of them, the injection-point phases included, on the
-# source builds.
+# source build.
 #
 # lionvec's tests (the vector*.sql files, the lionvec_*.spec specs and the
 # harness's phase 5) need pgvector: its package on the pgdg jobs, a build of
-# its default branch on the source jobs, its 18 package on the dist job.
+# its default branch on the source builds, its 18 package on the dist job.
 # Where it is expected - every job but a beta major's packages, which may not
 # have one yet - a failed install or build fails the job, and PGVECTOR=1
 # makes the Makefile and the harness fail instead of skipping those tests, as
@@ -135,8 +132,17 @@ jobs:
       - name: Unit tests
         run: make unit
 
+      # ASan cannot place its shadow memory under the 32 bits of mmap
+      # randomization Ubuntu 24.04's kernels default to, and loops on
+      # AddressSanitizer:DEADLYSIGNAL instead of running: the arm64 runners
+      # keep that default (the x86 images already lower it).  28 bits is
+      # what ASan supports.  The time limit makes a hang a red step rather
+      # than a job that holds a runner for hours.
       - name: Unit tests with ASan and UBSan
-        run: make unit SANITIZE=1 WERROR=1
+        timeout-minutes: 30
+        run: |
+          sudo sysctl -w vm.mmap_rnd_bits=28
+          make unit SANITIZE=1 WERROR=1
 
       - name: Start a private cluster
         run: ./dev.sh reset
@@ -194,171 +200,12 @@ jobs:
           tail -n 100 .local/pg.log || true
           tail -n 200 test/recovery/log/*.log || true
 
+  # PostgreSQL 18 from source, with assertions and injection points
+  # (source.yml); the other branches run there by hand.
   source:
-    name: PostgreSQL ${{ matrix.branch }} (source, cassert${{ matrix.branch != 'REL_16_STABLE' && ', injection points' || '' }})
-    runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        branch: [REL_16_STABLE, REL_17_STABLE, REL_18_STABLE, REL_19_STABLE, master]
-    env:
-      PGPREFIX: /home/runner/pg-${{ matrix.branch }}
-      PG_CONFIG: .local/pg/bin/pg_config
-      # Fail rather than skip if the injection_points module is missing: the
-      # Makefile then refuses to leave the injection-point specs out, and
-      # test/recovery/run.sh fails instead of skipping its phases 1b-1e, 1g and 3.
-      # 16 has no injection points, so there the specs and phases are left
-      # out on purpose (0, not unset: nothing is guessed).
-      INJECTION_POINTS: ${{ matrix.branch == 'REL_16_STABLE' && '0' || '1' }}
-      # pg_lion itself, not the server, is built with UBSan for the tests:
-      # a report aborts the backend (-fno-sanitize-recover), which fails the
-      # test that met it, and the report is in the server log the failure
-      # step prints.
-      LION_UBSAN: -fsanitize=undefined -fno-sanitize-recover=all -fno-omit-frame-pointer
-      # The same for pgvector, which the job builds: lionvec's regression
-      # files and specs, and the recovery harness's phase 5, fail rather
-      # than skip without it.
-      PGVECTOR: "1"
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Resolve the upstream commit
-        id: upstream
-        run: |
-          sha=$(git ls-remote https://github.com/postgres/postgres.git "refs/heads/${{ matrix.branch }}" | cut -f1)
-          test -n "$sha"
-          echo "sha=$sha" >> "$GITHUB_OUTPUT"
-
-      - name: Cache the PostgreSQL build
-        id: cache
-        uses: actions/cache@v6
-        with:
-          path: ${{ env.PGPREFIX }}
-          key: pg-${{ runner.os }}-${{ matrix.branch }}-${{ steps.upstream.outputs.sha }}-cassert-inj-v1
-
-      - name: Build PostgreSQL ${{ matrix.branch }}
-        if: steps.cache.outputs.cache-hit != 'true'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends bison flex
-          git clone -q --depth 1 --branch "${{ matrix.branch }}" \
-            https://github.com/postgres/postgres.git "$RUNNER_TEMP/postgres"
-          cd "$RUNNER_TEMP/postgres"
-          inj=
-          [ "$INJECTION_POINTS" = 1 ] && inj=--enable-injection-points
-          ./configure -q --prefix="$PGPREFIX" --without-icu --without-zlib --without-readline \
-            --enable-cassert --enable-debug $inj CFLAGS="-O1 -g"
-          make -s -j4
-          make -s install
-          make -s -C src/test/isolation install
-          if [ "$INJECTION_POINTS" = 1 ]; then
-            make -s -C src/test/modules/injection_points install
-          fi
-          make -s -C contrib install
-
-      - name: Link the installation
-        run: |
-          mkdir -p .local
-          ln -sfn "$PGPREFIX" .local/pg
-          .local/pg/bin/pg_config --version
-
-      # pgvector's default branch, built against this one.  A build that
-      # fails fails the job, here, rather than leaving the Makefile to find
-      # no vector.control and skip every lionvec test with the job still
-      # green, as continue-on-error did; a master pgvector does not build
-      # against yet is a red job to look at, not a silent loss of coverage.
-      - name: Build pgvector
-        run: |
-          git clone -q --depth 1 https://github.com/pgvector/pgvector.git "$RUNNER_TEMP/pgvector"
-          make -s -C "$RUNNER_TEMP/pgvector" PG_CONFIG="$PWD/$PG_CONFIG"
-          make -s -C "$RUNNER_TEMP/pgvector" install PG_CONFIG="$PWD/$PG_CONFIG"
-          test -f "$("$PG_CONFIG" --sharedir)/extension/vector.control"
-
-      - name: Build
-        run: make -j4 WERROR=1
-
-      # And again with UBSan, the build the tests below run: not with
-      # WERROR, because GCC's -Warray-bounds reports false positives in code
-      # the sanitizer has instrumented (the build above has every warning
-      # an error).  The check is that the library really needs libubsan: a
-      # module that only references its symbols would not load at all.
-      - name: Build with UBSan
-        run: |
-          make clean
-          make -j4 COPT="$LION_UBSAN"
-          readelf -d pg_lion.so | grep -q 'libubsan'
-
-      - name: Install
-        run: make install
-
-      - name: Unit tests
-        run: make unit
-
-      - name: Unit tests with ASan and UBSan
-        run: make unit SANITIZE=1 WERROR=1
-
-      - name: Start a private cluster
-        run: ./dev.sh reset
-
-      - name: installcheck (generic WAL, all isolation specs)
-        run: |
-          eval "$(./dev.sh env)"
-          set -o pipefail
-          make installcheck 2>&1 | tee installcheck.log
-          if [ "$INJECTION_POINTS" = 1 ] && grep -q 'skipping isolation specs' installcheck.log; then
-            echo "injection-point specs were skipped"; exit 1
-          fi
-
-      # debug_discard_caches = 1 flushes every cache entry at every catalog
-      # read, which is how the relcache-flush bugs of DESIGN.md §21 ("A
-      # relcache flush must not free the state") were found.  The setting
-      # exists only in assert builds, so only these jobs can run it.  The
-      # whole suite under it takes hours; test/sql/discard_caches.sql, which
-      # the step above already ran with the setting switched on around its
-      # own queries, is run again here with it on for EVERY statement - the
-      # builds, inserts, VACUUMs and verify() between those queries too.
-      # PGOPTIONS reaches every session pg_regress opens, which it extends
-      # rather than replaces.  Measured on an assert 18.6 on a busy 4-CPU box:
-      # 17 minutes, against about 3 for the same file in the step above; if
-      # that is too much for two jobs, `if: matrix.branch == 'master'` halves
-      # it.
-      - name: discard_caches.sql with debug_discard_caches = 1 throughout
-        if: matrix.branch == 'REL_16_STABLE' || matrix.branch == 'REL_19_STABLE' || matrix.branch == 'master'
-        run: |
-          eval "$(./dev.sh env)"
-          PGOPTIONS="-c debug_discard_caches=1" make installcheck REGRESS=discard_caches ISOLATION=
-
-      - name: installcheck-rmgr with wal_consistency_checking
-        run: |
-          eval "$(./dev.sh env)"
-          make installcheck-rmgr WAL_CONSISTENCY=1
-
-      - name: hookcheck (hook coexistence, table AMs)
-        run: |
-          eval "$(./dev.sh env)"
-          make hookcheck WERROR=1
-
-      # wal_consistency_checking compares pages only when a record is REPLAYED,
-      # so the step above (a primary that never replays) proves little about
-      # redo.  The recovery harness crashes the primary under load and builds
-      # a hot standby from it, which replays every record both phases write,
-      # and a mismatch is a FATAL in the startup process (test/recovery/README.md).
-      # These are the steps that depend on the job's INJECTION_POINTS: set
-      # to 1 (17 and later), run.sh fails rather than skip the injection-point
-      # phases and still report ALL ... PASSED; set to 0 (16) it skips them.
-      - name: Crash recovery and standby replay (custom resource manager, consistency checked)
-        run: make recovery-check-rmgr RECOVERY_PREFIX="$PGPREFIX"
-
-      - name: Crash recovery and standby replay (generic WAL, consistency checked)
-        run: ./test/recovery/run.sh --prefix "$PGPREFIX" --conf "wal_consistency_checking = 'generic'"
-
-      - name: Show regression diffs
-        if: failure()
-        run: |
-          find test -name regression.diffs -exec cat {} + || true
-          grep -h -A 30 'runtime error' .local/pg.log test/recovery/log/*.log || true
-          tail -n 100 .local/pg.log || true
-          tail -n 200 test/recovery/log/*.log || true
+    uses: ./.github/workflows/source.yml
+    with:
+      branches: '["REL_18_STABLE"]'
 
   dist:
     name: PGXN archive (build and test from the zip)
