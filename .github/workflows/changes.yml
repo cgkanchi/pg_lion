@@ -1,0 +1,95 @@
+# Whether a pull request changes anything CI tests.  ci.yml and codeql.yml
+# call this first and skip their builds when it says no, so a pull request
+# that touches only documentation does not spend an hour of runners.
+#
+# A pull request is docs-only when every file it adds, changes or deletes is
+#
+#   *.md      anywhere: README.md, DESIGN.md, docs/, the tests' READMEs
+#   docs/     the user documentation
+#   bench/    the benchmark harness and its results, which no CI job runs
+#             and make dist leaves out
+#   LICENSE
+#
+# except that deleting README.md, DESIGN.md, LICENSE or the whole of docs/ is
+# not: make dist names them, and git archive fails on a path that is not there.
+#
+# Anything else - src/, test/, the SQL and control files, META.json, the
+# Makefile, dev.sh, .github/ - runs everything.  So does every event that is
+# not a pull request: a push to main, a schedule, a run started by hand.
+#
+# The jobs that skip report as skipped, which GitHub counts as passing; the
+# "CI result" job in ci.yml is the one check to require, if branch
+# protection ever requires any.
+
+name: Changes
+
+on:
+  workflow_call:
+    outputs:
+      code:
+        description: "'true' unless the event is a pull request that changes only documentation"
+        value: ${{ jobs.changes.outputs.code }}
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Code or docs only
+    runs-on: ubuntu-24.04
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      # A pull request's checkout is its merge commit, whose first parent is
+      # the base branch's head: the diff between the two is exactly what
+      # merging would change, whatever has landed on the base since the
+      # branch was cut.
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+
+      - name: Classify the changed files
+        id: diff
+        run: |
+          if [ "$GITHUB_EVENT_NAME" != pull_request ]; then
+            echo "not a pull request: everything runs"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Renames as a deletion and an addition, so a file moved out of
+          # src/ into docs/ still counts as touching src/.
+          if ! files=$(git diff --no-renames --name-only HEAD^1 HEAD); then
+            echo "::warning::could not diff the merge commit: everything runs"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          code=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              README.md|DESIGN.md|LICENSE)
+                if [ ! -e "$f" ]; then
+                  echo "code: $f (deleted; make dist names it)"
+                  code=true
+                else
+                  echo "docs: $f"
+                fi ;;
+              docs/*)
+                if [ ! -d docs ]; then
+                  echo "code: $f (docs/ deleted; make dist names it)"
+                  code=true
+                else
+                  echo "docs: $f"
+                fi ;;
+              *.md|bench/*)
+                echo "docs: $f" ;;
+              *)
+                echo "code: $f"
+                code=true ;;
+            esac
+          done <<< "$files"
+          if [ "$code" = false ]; then
+            echo "::notice::docs-only change: the build and test jobs are skipped"
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
