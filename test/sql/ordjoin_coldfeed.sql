@@ -71,9 +71,9 @@ VACUUM (FREEZE, ANALYZE) kt;
 
 /*
  * ocf_set() sets, for the rest of the statement, every setting this test
- * moves to its default, core's joins off - so that the plan is the node,
- * whichever plan feeds its key set - and then the settings in sw, name and
- * value in turn.
+ * moves to its default, no workers, core's joins off - so that the plan is
+ * the node, whichever plan feeds its key set - and then the settings in sw,
+ * name and value in turn.
  */
 CREATE FUNCTION ocf_set(sw text[]) RETURNS void
 LANGUAGE plpgsql AS $$
@@ -83,10 +83,14 @@ DECLARE
 BEGIN
 	FOREACH n IN ARRAY ARRAY['effective_cache_size', 'pg_lion.cold_stream_page_cost',
 							 'pg_lion.cold_page_cost', 'pg_lion.competitor_pricing',
-							 'enable_bitmapscan', 'pg_lion.enable_ordered_join'] LOOP
+							 'enable_bitmapscan', 'pg_lion.enable_ordered_join',
+							 'parallel_setup_cost', 'parallel_tuple_cost',
+							 'min_parallel_table_scan_size',
+							 'min_parallel_index_scan_size'] LOOP
 		PERFORM set_config(n, (SELECT boot_val FROM pg_settings WHERE name = n),
 						   true);
 	END LOOP;
+	PERFORM set_config('max_parallel_workers_per_gather', '0', true);
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_nestloop', 'off', true);
@@ -98,24 +102,33 @@ END $$;
 /*
  * What feeds the node's key set under the settings in sw: the first scan of
  * kt in the plan - a bitmap heap scan, lion's covering walk, or another -
- * and whether the node is the plan at all.
+ * "under a Gather" where a Gather or Gather Merge between the node and it
+ * runs it in workers, and whether the node is the plan at all.
  */
 CREATE FUNCTION ocf_feed(q text, sw text[] DEFAULT '{}') RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
 	ln text;
 	node boolean := false;
+	gather text := '';
+	kind text;
 BEGIN
 	PERFORM ocf_set(sw);
 	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		kind := NULL;
 		IF ln ~ 'Custom Scan \(LionOrdered(Join|Split)\)' THEN
 			node := true;
+		ELSIF node AND ln ~ '->  Gather' THEN
+			gather := ' under a Gather';
 		ELSIF ln ~ 'Bitmap Heap Scan on kt' THEN
-			RETURN CASE WHEN node THEN 'bitmap heap scan' ELSE 'no node' END;
+			kind := 'bitmap heap scan';
 		ELSIF ln ~ 'Custom Scan \(Lion(Ordered|BtreeScan)\) on kt' THEN
-			RETURN CASE WHEN node THEN 'covering walk' ELSE 'no node' END;
+			kind := 'covering walk';
 		ELSIF ln ~ ' on kt' THEN
-			RETURN CASE WHEN node THEN 'other' ELSE 'no node' END;
+			kind := 'other';
+		END IF;
+		IF kind IS NOT NULL THEN
+			RETURN CASE WHEN node THEN kind || gather ELSE 'no node' END;
 		END IF;
 	END LOOP;
 	RETURN 'no key set';
@@ -140,7 +153,8 @@ END $$;
 -- scan's 800 heap pages are cold, the walk's 140 B-tree pages hardly less
 -- so, and the walk feeds the key set - and not with the cold charge off.  With
 -- competitor_pricing on the walk's price carries the bitmap heap scan's
--- cold reads (lo_cold_price()), and is taken at it.
+-- cold reads (lo_cold_price()), and is taken at it.  With workers the
+-- walk is taken in them, under a Gather the node puts over its partial path.
 SELECT n, ocf_feed('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
 					 WHERE co.tier = 1
 					   AND f.fk IN (SELECT k FROM kt WHERE c IN (1, 2))
@@ -149,7 +163,8 @@ SELECT n, ocf_feed('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
 			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
 			   ('... no stream charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}'),
 			   ('... competitor pricing on', '{effective_cache_size, 1MB, pg_lion.competitor_pricing, on}'),
-			   ('... no bitmap scans', '{effective_cache_size, 1MB, enable_bitmapscan, off}')) v(n, sw);
+			   ('... no bitmap scans', '{effective_cache_size, 1MB, enable_bitmapscan, off}'),
+			   ('... in workers', '{effective_cache_size, 1MB, max_parallel_workers_per_gather, 2, parallel_setup_cost, 0, parallel_tuple_cost, 0, min_parallel_table_scan_size, 0, min_parallel_index_scan_size, 0}')) v(n, sw);
 
 -- an EXISTS, the same key set
 SELECT n, ocf_feed('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
@@ -170,6 +185,7 @@ SELECT count(DISTINCT ocf_rows(q, sw)) AS answers
 	   (VALUES ('{}'::text[]),
 			   ('{effective_cache_size, 1MB}'),
 			   ('{effective_cache_size, 1MB, pg_lion.competitor_pricing, on}'),
+			   ('{effective_cache_size, 1MB, max_parallel_workers_per_gather, 2, parallel_setup_cost, 0, parallel_tuple_cost, 0, min_parallel_table_scan_size, 0, min_parallel_index_scan_size, 0}'),
 			   ('{pg_lion.enable_ordered_join, off, enable_hashjoin, on}')) v(sw);
 SELECT count(DISTINCT ocf_rows(q, sw)) AS answers
   FROM (VALUES ('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
