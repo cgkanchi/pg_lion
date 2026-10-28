@@ -1141,11 +1141,10 @@ typedef struct LionVColScope
  * lion path's competitor, and a page the lion path reads in its place
  * (lion_bitmap_cold(), DESIGN.md §39, "A bitmap heap scan's cold reads"):
  * asked for ahead of the scan, effective_io_concurrency at a time, so that
- * the reads overlap one another and the scan's own work.  Measured on a
- * private workload, the same device under both: a parallel bitmap heap scan
- * read 1.9M uncached heap pages at 33 us a page, and 605k at 40 us, where a
- * nested loop's synchronous probe paid 270 to 300 us a page - 0.11 to 0.15
- * of it, an eighth in the middle.  An eighth of LION_COLD_PAGE_COST's 50 is
+ * the reads overlap one another and the scan's own work.  Measured on one
+ * device under both: a bitmap heap scan's uncached heap pages took 33 to 40
+ * us a page, where a nested loop's synchronous probe paid 270 to 300 us a
+ * page - 0.11 to 0.15 of it, an eighth in the middle.  An eighth of LION_COLD_PAGE_COST's 50 is
  * 6.25 seq_page_cost, 12.5 us at 500 units a millisecond.
  */
 #define LION_COLD_STREAM_PAGE_COST	(lion_cold_stream_page_cost * seq_page_cost)

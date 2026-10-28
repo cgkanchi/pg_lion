@@ -212,9 +212,9 @@ SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1;
 -- The count reads the sets the scan reads, and the scan fetches every row
 -- besides: whatever either is priced at, the count is priced below the scan,
 -- past add_path()'s fuzz of 1%.  Within it, the Aggregate over the scan,
--- parallel safe, won the tie against the count, which is not: a private
--- workload's count, priced 0.8% below the scan, went to the scan, and so did
--- the counts here priced 0.5% below it, at it and at twice it.  Parallel
+-- parallel safe, won the tie against the count, which is not: a count
+-- priced less than 1% below the scan went to the scan, as did the counts
+-- here priced 0.5% below it, at it and at twice it.  Parallel
 -- plans are allowed, as by default, or no path would be parallel safe.
 SET max_parallel_workers_per_gather = 2;
 SELECT n, istr_pushed_at(c, 0.995) AS within_fuzz, istr_pushed_at(c, 1.0) AS tie,

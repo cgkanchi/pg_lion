@@ -4691,12 +4691,10 @@ set the recheck "next to anything that answers"; `lo_lazy_ok()` refused it): the
 rechecked every row of the others' answer, the plain scan set `xs_recheck`, and the sets of §30 and
 §40 were reported inexact, so that the index-only walk fetched every candidate's heap tuple to
 recheck it. Beside a strict qual of its own column it was, and is, IMPLIED, neither answered nor
-rechecked: the strict qual never selects a NULL. On a private workload's shape - about 3M rows, a
-lion index on four columns, three equalities and `IS NOT NULL` on a column NULL on half the rows
-with 50,000 values, read by LionOrdered's index-only walk of a covering btree under a merge
-anti-join - the set was rechecked: 1,414,286 heap fetches for 705,998 rows, 708,288 of them thrown
-away by the recheck, 1.58M buffers, 5.4 s cold and 0.6 to 1.4 s warm. Now the set is exact: no
-heap fetch, 154k buffers, 0.9 s on the first run after a restart and 0.11 to 0.13 s warm.
+rechecked: the strict qual never selects a NULL. Where such a set fed LionOrdered's index-only
+walk of a covering btree, every candidate was fetched from the heap and about half of them thrown
+away by the recheck. Now the set is exact: no heap fetch, a fraction of the buffers, and many times
+faster cold and warm.
 
 The count pushdown answered it exactly all along, as a NEGATED source (above), and the scans now
 do the same. Every row the index holds is under exactly one of a column's NULL entry and its other
@@ -17732,8 +17730,8 @@ and off, both as a nested loop's inner scan and with the value a constant, the t
 agreeing; without the correction, at about a third.
 
 *(2026-10-19: the correction carries what the probe measures, mistakes included. On a private
-workload's table loaded in batches, a sample that met none of a conjunction's 9.2M rows measured it
-empty, and the table was sized at one row for every plan above it. The probe now samples the
+workload's table loaded in batches, a sample that met none of a conjunction's millions of rows
+measured it empty, and the table was sized at one row for every plan above it. The probe now samples the
 driver's own containers and lowers no estimate further than its sample can rule out ("A sample of
 the driver's own rows", "What a sample can rule out", below); the correction is as it was.)*
 
@@ -17823,10 +17821,10 @@ ORs that are no list. On 991c315 the plans and costs differ, the count is the OR
 LionOrdered is priced for core's product in both forms.
 
 **A run of `<>` is one exclusion** (2026-10-20, `lion_neq_runs()`, `lion_canonical_clause_list()`,
-`lion_cost_canonical_sel()`). A private workload filters a column with a high null fraction by 13
-to 80 exclusions - `col <> 'x' AND col <> 'y' AND ...` - and core's estimate of them sized the
-table at a 460th of its rows; the nested loop over another table's B-tree chosen for that took
-643 s for a count. Core estimates `k <> v` as `1 - freq(v) - nullfrac` (neqsel(): eqsel()'s
+`lion_cost_canonical_sel()`). A filter of a column with a high null fraction by dozens of
+exclusions - `col <> 'x' AND col <> 'y' AND ...` - is sized by core's estimate at a tiny fraction
+of the table's rows, and a nested loop over another table's B-tree chosen for that can run for
+minutes on a count. Core estimates `k <> v` as `1 - freq(v) - nullfrac` (neqsel(): eqsel()'s
 estimate of `k = v`, less the NULLs, which no `<>` keeps) and a conjunction as the product of its
 clauses, so the NULLs are taken away once a clause. `k <> ALL (array)` - `NOT IN` - fares no
 better: scalararraysel() sums it as disjoint, `1 - sum(freq(v) + nullfrac)`, and once that is below
@@ -17999,12 +17997,11 @@ with a heap filter - 202 ms against 40 for LionOrdered. The switch bounds what a
 and the model does not second-guess it.
 
 **A sample of the driver's own rows** (2026-10-19, `lion_isect_by_rank()`, `lion_isect_walk()`,
-`lion_isect_presence()`, `lion_posting_separators()`). A private workload's table is loaded in
-batches - a source, then a wave of it, each batch's rows in the order of a kind column. A
-conjunction of a wave and a kind, 9.2M rows, was estimated at one row with the probe on (6.6M
-with it off), and so was every conjunction of those two and one more equality; the rows correction
-made the one row the table's ("The relation's rows", above), and every plan above it was built for
-it.
+`lion_isect_presence()`, `lion_posting_separators()`). On a table loaded in batches, each batch's
+rows in the order of one column, a conjunction of millions of rows was estimated at one row with
+the probe on (near its true rows with it off), and so was every conjunction of those columns and
+one more equality; the rows correction made the one row the table's ("The relation's rows",
+above), and every plan above it was built for it.
 
 Reproduced on 1.5M rows loaded in 300 batches of 5,000 - a source column of 12 values by a wave
 column of 25, source-major - each batch's rows in the order of a kind of four values (45, 25, 11
@@ -18032,8 +18029,8 @@ heap between them:
   The other sources are then walked along those keys as the merge seeks them, the fewest rows first
   (`lion_isect_presence()`, at most 32 buffers a source): a key some source has no container at
   holds no row of the AND and is ruled out, not sampled. What is left - on a batched heap, the
-  stretches where every source's batch lies, which is what the private workload's tags present for
-  some sources only come to - is counted when it is no more containers than the other sources'
+  stretches where every source's batch lies, which is what a column present for some sources only
+  comes to - is counted when it is no more containers than the other sources'
   sets can be sought at within the probe's seeks (`LION_ISECT_KEYS`, or `LION_ISECT_SEEKS` over
   the other sources' sets where that is more): every one ANDed, the AND's exact count. More are
   sampled every n/32-th, from the middle of the first n/32, each standing for its share of the
@@ -21895,19 +21892,16 @@ key drawn by key has N / K rows on average and one drawn by row has Σn² / N. O
 keys are skewed the two are orders of magnitude apart, and every probe of such a key is priced
 for a sliver of what it reads.
 
-**Measured** (a private workload, a fact table's key column into a dimension): 205 million rows
-over 13.3 million keys, 15.4 rows a key over all of them and 13.5 over the keys outside the MCV
-list. ANALYZE's MCV list has 500 values. Their frequencies add up to 13% of the rows, their keys
-hold 13.4%, and the smallest of them has 21,912 rows. Over all the rows Σn² / Σn is 17,105, with 88% of Σn² in
-the keys of the MCV list. Outside them a key drawn by row has 2,396 rows (the formula below).
-The keys the workload's queries probed met:
+**Measured** (a private workload, a fact table's key column into a dimension): a key column of
+a few rows a key on average, with most of Σn² in the keys of ANALYZE's MCV list, and a key drawn
+by row outside them with orders of magnitude more rows than the mean (the formula below). The keys
+the workload's queries probed met:
 
-- 770 to 1,800 rows each, from outer sets of 60 to 6,000 keys. Core priced each of those probes
-  at the per-key mean, 50 to 130 times too few rows; the formula is 1.3 to 3.1 times
+- from small outer sets, hundreds to thousands of rows each. Core priced each of those probes at
+  the per-key mean, one to two orders of magnitude too few rows; the formula is within a few times
   above them.
-- 3 to 117 rows a key, from outer sets of 1 to 47 million keys. Those sets cover most of the keys
-  and meet about the per-key mean, as core has it. They are planned as hash joins, which no
-  probe's rows price (Limits, below).
+- from outer sets covering most of the keys, about the per-key mean, as core has it. They are
+  planned as hash joins, which no probe's rows price (Limits, below).
 
 §39's "A skewed key's probes" has what that did to a plan.
 
@@ -23448,12 +23442,11 @@ lion path, a test switches off what it competes with that is not an index scan (
 
 ### The AM's own scan of the same sets (2026-10-19)
 
-A private workload's four-clause count went to an Aggregate over a plain scan of the same lion
-index, priced 491,708, where the count was priced 487,598: 0.8% below it, inside `add_path()`'s fuzz
-of 1%, where two paths of the same pathkeys and parameterization are kept by parallel safety first.
+A private workload's count went to an Aggregate over a plain scan of the same lion index, though
+the count was priced below it: less than 1% below, inside `add_path()`'s fuzz of 1%, where two paths of the same pathkeys and parameterization are kept by parallel safety first.
 The Aggregate over the scan is parallel safe; `LionCount` is not (it counts the whole relation, so
 it may not run inside a worker), and lost the tie. The scan's heap side was priced from the
-conjunction's estimate, 2,734 rows for 131,778 ("A sample of the driver's own rows", §29.11): a
+conjunction's estimate, far below its rows ("A sample of the driver's own rows", §29.11): a
 fair estimate would have priced the scan far above the count, and a worse one below it.
 
 Neither the estimate nor the margin is the point: such a scan does what the count does and more. A
@@ -23830,16 +23823,14 @@ other than the FK-side join's, which compare with the loop at its price.
 
 Core prices a bitmap heap scan's heap pages at `random_page_cost` falling to `seq_page_cost` with
 the square root of the share of the table one scan reads (`cost_bitmap_heap_scan()`), as if each
-page were cached or a device's cheap random read. On a private workload, over a fact heap almost
-four times `effective_cache_size`, a covering walk of a B-tree on the fact's key, index-only over
-the lion set (LionOrdered, §40), was priced at about 1.1M units against a parallel bitmap heap
-scan's 605k, 1.82 times, and lost; cold it ran in 11.0 s against the scan's 24 s, 2.2 times
-faster. The walk's price was right, 10 us a unit; the scan's 605k heap pages, which core charged
-some 1.08 units each, took 40 us each, four times the walk's rate. They are not a loop's reads: a
-bitmap heap scan asks for its pages ahead of itself (`effective_io_concurrency`), so that the
-reads overlap one another and the scan's own work. On the same device a parallel bitmap heap scan
-read 1.9M uncached pages at 33 us a page and this one 605k at 40 us, where a nested loop's
-synchronous probe paid 270 to 300 us: 0.11 to 0.15 of it.
+page were cached or a device's cheap random read. On a private workload, over a fact heap several
+times `effective_cache_size`, a covering walk of a B-tree on the fact's key, index-only over the
+lion set (LionOrdered, §40), was priced at about twice a parallel bitmap heap scan and lost; cold
+it ran about twice as fast. The walk's price was right; the scan's heap pages, which core charged
+about one unit each, took four times the walk's rate. They are not a loop's reads: a bitmap heap
+scan asks for its pages ahead of itself (`effective_io_concurrency`), so that the reads overlap one
+another and the scan's own work. On the same device a bitmap heap scan's uncached pages took 33 to
+40 us each, where a nested loop's synchronous probe paid 270 to 300 us: 0.11 to 0.15 of it.
 
 So against a competitor that reads through bitmap heap scans (`lion_bitmap_cold()`,
 lion_plan_units.c), and the same way §39's loop is priced:
@@ -23899,21 +23890,21 @@ dimension a descent at a time; it is priced against a loop's cold reads alone.
 **The cap** is `pg_lion.cold_max_discount` (2 by default, 1 to 10), the loop's and the bitmap's
 alike. It is the warm floor: where the cache holds what both plans read after all -
 `effective_cache_size` set below the real cache, a hot working set - a lion path chosen for those
-reads can take up to the cap times its competitor's time. The measured case:
+reads can take up to the cap times its competitor's time. The measured case (§39's private
+workload above), prices, times and pages as shares of the bitmap heap scan's:
 
 | | the walk | the bitmap heap scan |
 |---|---|---|
-| priced | 1.1M | 605k |
-| ran, cold | 11.0 s | 24 s |
-| its pages, uncached | an estimated 95k of the B-tree's | 605k of the heap |
-| their cold reads, x 0.74 uncached | 95k x 0.74 x (6.25 - 1.1) = 0.36M | 605k x 0.74 x (6.25 - 1.08) = 2.3M |
+| priced | 1.82 | 1 |
+| ran, cold | 1 | 2.2 |
+| its pages, uncached | an estimated 0.16 of the scan's, the B-tree's | 1, the heap's |
+| their cold reads, x 0.74 uncached | 0.16 x 0.74 x (6.25 - 1.1) = 0.60 | 1 x 0.74 x (6.25 - 1.08) = 3.8 |
 
-The factor, uncapped, is (1.1M + 0.36M) x 605k / ((605k + 2.3M) x 1.1M) = 0.28: the walk at 0.30M
-against the scan's 605k. The walk's pages are an estimate, and move it little: none would make it
-0.21, three times as many 0.41. The case needs a cap above 1.82 (1.1M / 605k). At 1.5 the walk is
-priced at 733k and loses; at 1.82 it ties within `add_path()`'s fuzz; at 2 it is priced at 550k
-and wins by 9%; at 2.5, at 440k. The model's own ratio, 2.9M against 1.46M, is 2.0 against the
-measured 2.2.
+The factor, uncapped, is (1.82 + 0.60) / ((1 + 3.8) x 1.82) = 0.28: the walk at 0.50 of the scan's
+price. The walk's pages are an estimate, and move it little: none would make it 0.21, three times
+as many 0.41. The case needs a cap above 1.82. At 1.5 the walk is priced at 1.21 of the scan and
+loses; at 1.82 it ties within `add_path()`'s fuzz; at 2 it is priced at 0.91 and wins by 9%; at
+2.5, at 0.73. The model's own ratio, 4.8 against 2.42, is 2.0 against the measured 2.2.
 
 **The default is 2**, Chinmay's choice after the measured cold and warm comparison (1.5 was
 proposed, 2 recommended). It is the smallest round cap that takes the measured case with room past
@@ -24182,9 +24173,8 @@ by however many rows it is short.
 
 **Measured** (the same private workload as §33's). A nested loop from a dimension's small set of
 keys into the fact table, its inner side the fact's B-tree on the key. Lion's probe of a key was
-priced at 57 a call, 54 of that about 13 container seeks of about 4 random pages each. Core's
-B-tree scan was priced at 18.46 a call: the per-key rows, 13 heap pages at a `random_page_cost` of
-1.1. The loop won. Run cold, each of its calls read about 4,700 heap tuples and took 1.7 s.
+priced at about three times core's B-tree scan, which was priced at the per-key rows. The loop
+won. Run cold, each of its calls read thousands of heap tuples and took more than a second.
 
 **R1: the rows are the same on both sides, or core's on both.** A lion path is priced at the
 skewed rows only where its competitor meets them too. The competitor is priced at those rows as
@@ -24274,9 +24264,9 @@ competitor's own price corrected and not a guess about the cache. The cold reads
 on top of it, within that cap. In `test/sql/skew.sql` the LionCount against the loop is priced far
 below the loop, past the cap at its default of 2 (`past_cold_bound`).
 
-**Plans.** At the figure the measured loop's index scan meets about 2,396 rows a call, not about
-15, and is charged for its heap pages and CPU at those rows. That is nearer the 4,700 tuples a call
-it read than core's 13 pages were. This build has not been run on that workload. The regression
+**Plans.** At the figure the measured loop's index scan meets over a hundred times the per-key
+mean a call, and is charged for its heap pages and CPU at those rows. That is nearer the tuples a
+call it read than core's per-key estimate was. This build has not been run on that workload. The regression
 test's fixtures reproduce the plan's shape at a small scale: a skewed key column, its B-tree, a
 lion index, a correlated subquery, a nested loop and a generic plan. `pg_lion.enable_skew_estimate`
 off gives back the plans this section changes. `test/sql/correlated.sql`'s plans move with it, and
