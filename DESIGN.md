@@ -23133,9 +23133,9 @@ nested loop's cold reads", "A bitmap heap scan's cold reads"), within `pg_lion.c
 and a Memoize's misses under a LIMIT ("A Memoize under a LIMIT"). Why:
 
 - A private workload ran every statement faster warm with the switch off (rates, skew estimate,
-  cold reads and Memoize scale all off), by about a fifth in all. Cold, the switch off lost one
-  statement 2.7 times over: a hash join of a table several times `effective_cache_size`, read by a
-  bitmap heap scan, the case the cold reads price - which is why they stay.
+  cold reads and Memoize scale all off). Cold, the switch off lost a statement whose hash join read
+  a table larger than `effective_cache_size` by a bitmap heap scan, the case the cold reads price -
+  which is why they stay.
 - The rates were constants for plans whose units a millisecond spread four to six times within one
   kind (a hash aggregate's 121 to 799, "The matrix"), fitted on an assert build. Each fixed some
   plans and broke others: the held-out set's two GROUP BYs under a selective WHERE took a rate of
