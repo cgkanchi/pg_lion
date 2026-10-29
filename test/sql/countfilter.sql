@@ -296,11 +296,11 @@ UPDATE lion_cfpt SET a = 0 WHERE b = 3 AND a = 2;
 SELECT lion_cf('SELECT count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1 END), count(*) FROM lion_cfpt');
 -- a WHERE the one partition left implies, beside a clause it does not: on a
 -- table this small one pass over the rows is the cheaper plan, unless the
--- rates say otherwise (DESIGN.md §39)
-SET pg_lion.bitmap_rate = 0.25;
+-- margin says otherwise (DESIGN.md §39)
+SET pg_lion.pushdown_margin = 4;
 SELECT lion_cf('SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
 SELECT lion_cf_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
-RESET pg_lion.bitmap_rate;
+RESET pg_lion.pushdown_margin;
 SELECT lion_cf('SELECT g, count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1 ELSE 0 END), count(*) FROM lion_cfpt GROUP BY g');
 SELECT lion_cf('SELECT a, count(*) FILTER (WHERE b IN (1, 2)) FROM lion_cfpt WHERE g <> 4 GROUP BY a');
 

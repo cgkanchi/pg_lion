@@ -7,11 +7,10 @@
 -- covering walk of the key's B-tree that reads a fraction of the pages in
 -- order, and runs several times slower when the heap is not in the cache.
 -- The node picks the key set's plan itself: of the table's unparameterized
--- paths, and a Gather over each partial one, the cheapest at its price plus
--- the pages it reads outside the cache, as effective_cache_size says.  With
--- pg_lion.competitor_pricing on the walk's own price carries that weighing
--- already (bitmap_cold.sql), and the plans are taken at their price.  Every
--- answer is the same whichever plan is taken.
+-- paths, and a Gather over each partial one, the cheapest.  A covering
+-- walk's price carries the cold reads of the bitmap heap scan it competes
+-- with, as effective_cache_size says (bitmap_cold.sql).  Every answer is the
+-- same whichever plan is taken.
 \set VERBOSITY terse
 SET client_min_messages = warning;
 LOAD 'pg_lion';
@@ -82,7 +81,7 @@ DECLARE
 	i int;
 BEGIN
 	FOREACH n IN ARRAY ARRAY['effective_cache_size', 'pg_lion.cold_stream_page_cost',
-							 'pg_lion.cold_page_cost', 'pg_lion.competitor_pricing',
+							 'pg_lion.cold_page_cost',
 							 'enable_bitmapscan', 'pg_lion.enable_ordered_join',
 							 'parallel_setup_cost', 'parallel_tuple_cost',
 							 'min_parallel_table_scan_size',
@@ -94,7 +93,6 @@ BEGIN
 	PERFORM set_config('enable_hashjoin', 'off', true);
 	PERFORM set_config('enable_mergejoin', 'off', true);
 	PERFORM set_config('enable_nestloop', 'off', true);
-	PERFORM set_config('pg_lion.competitor_pricing', 'off', true);
 	FOR i IN 1 .. coalesce(array_length(sw, 1), 0) BY 2 LOOP
 		PERFORM set_config(sw[i], sw[i + 1], true);
 	END LOOP;
@@ -151,10 +149,10 @@ END $$;
 -- The tables fit in the cache: the bitmap heap scan, at core's price, below
 -- the walk's.  A cache of a megabyte holds a few percent of them: the
 -- scan's 800 heap pages are cold, the walk's 140 B-tree pages hardly less
--- so, and the walk feeds the key set - and not with the cold charge off.  With
--- competitor_pricing on the walk's price carries the bitmap heap scan's
--- cold reads (lo_cold_price()), and is taken at it.  With workers the
--- walk is taken in them, under a Gather the node puts over its partial path.
+-- so, and the walk, its price carrying the bitmap heap scan's cold reads
+-- (lo_cold_price()), feeds the key set - and not with the cold charge off.
+-- With workers the walk is taken in them, under a Gather the node puts over
+-- its partial path.
 SELECT n, ocf_feed('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
 					 WHERE co.tier = 1
 					   AND f.fk IN (SELECT k FROM kt WHERE c IN (1, 2))
@@ -162,7 +160,6 @@ SELECT n, ocf_feed('SELECT f.id, co.name FROM f JOIN co ON co.pk = f.fk
   FROM (VALUES ('in the cache', '{}'::text[]),
 			   ('a cache of 1MB', '{effective_cache_size, 1MB}'),
 			   ('... no stream charge', '{effective_cache_size, 1MB, pg_lion.cold_stream_page_cost, 0}'),
-			   ('... competitor pricing on', '{effective_cache_size, 1MB, pg_lion.competitor_pricing, on}'),
 			   ('... no bitmap scans', '{effective_cache_size, 1MB, enable_bitmapscan, off}'),
 			   ('... in workers', '{effective_cache_size, 1MB, max_parallel_workers_per_gather, 2, parallel_setup_cost, 0, parallel_tuple_cost, 0, min_parallel_table_scan_size, 0, min_parallel_index_scan_size, 0}')) v(n, sw);
 
@@ -184,7 +181,6 @@ SELECT count(DISTINCT ocf_rows(q, sw)) AS answers
 				  ORDER BY f.rank DESC, f.id LIMIT 20')) q(q),
 	   (VALUES ('{}'::text[]),
 			   ('{effective_cache_size, 1MB}'),
-			   ('{effective_cache_size, 1MB, pg_lion.competitor_pricing, on}'),
 			   ('{effective_cache_size, 1MB, max_parallel_workers_per_gather, 2, parallel_setup_cost, 0, parallel_tuple_cost, 0, min_parallel_table_scan_size, 0, min_parallel_index_scan_size, 0}'),
 			   ('{pg_lion.enable_ordered_join, off, enable_hashjoin, on}')) v(sw);
 SELECT count(DISTINCT ocf_rows(q, sw)) AS answers
