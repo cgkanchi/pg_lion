@@ -197,22 +197,17 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and joins or groups them; with their 11,250 rows it reads
--- them by a bitmap scan and hashes the join, and counts the top k from the
--- index.
+-- an index scan and groups them; with their 11,250 rows it counts the top k
+-- from the index.  (The join of those rows to their owners goes to a hash
+-- join or to the FK-side join depending on the major, and the two run within
+-- a third of each other; only its answers are checked, below.)
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
-EXPLAIN (COSTS OFF)
-SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
- WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
  GROUP BY owner_id ORDER BY count(*) DESC, owner_id LIMIT 3;
 SET pg_lion.enable_index_mcv = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
-EXPLAIN (COSTS OFF)
-SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
- WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
  GROUP BY owner_id ORDER BY count(*) DESC, owner_id LIMIT 3;
