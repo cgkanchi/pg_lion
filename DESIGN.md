@@ -20222,11 +20222,8 @@ what the defaults are fitted to:
   ratios, units a millisecond, are what the model says each plan does per unit of time; a lion
   path well above the competitor's ratio is overpriced, and well below it underpriced, which is
   the mispick waiting to happen. Core's own CPU-bound scans ran at 400 to 700 (§10, "The units").
-  *(Since §39 a lion path's cost is in its competitor's units, and over a margin if one is set:
-  force its plans with core's `enable_*` settings and `pg_lion.enable_plain_scan` on a table
-  with no other index, or set every `pg_lion.*_rate` and `pg_lion.pushdown_margin` to 1, to read
-  lion's own, and calibrate the rates themselves against
-  core's plans the same way.)*
+  *(A lion path's cost is its own price over `pg_lion.pushdown_margin`, with §39's cold-read
+  and Memoize corrections where they apply: set the margin to 1 to read lion's own.)*
 - Which setting to move is the one whose term dominates the path's price, read against the
   node's counters: `Containers Visited`, `Directory Pages Read` and `Heap TIDs Rechecked` of a
   count are the containers, the descents and the recheck candidates `container_cost`,
