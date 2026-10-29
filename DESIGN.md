@@ -18604,7 +18604,7 @@ it. So `lion_plain_heap_correlation()` notes what is left over for an unparamete
 (`lion_plain_note_remainder()`), and lion's set_rel_pathlist_hook adds it to the path once the
 relation's paths are built and offers the bitmap heap scan of the same index path again beside it
 (`lion_plain_pay_remainders()`, in `lion_selfuncs.c`, run by `lion_plain_set_rel_pathlist()` before
-LionOrdered's hook sees the paths, and again for the AM scans §40.12 builds after it);
+LionOrdered's hook sees the paths);
 set_rel_pathlist() allows a hook to modify the core paths, and the two are then compared as any
 others. The plain path keeps its startup cost, which is what a LIMIT asks of it. The hook offers the
 sequential scan and the TID scans again as well, rebuilt as set_plain_rel_pathlist() builds them
@@ -21903,7 +21903,6 @@ the workload's queries probed met:
 - from outer sets covering most of the keys, about the per-key mean, as core has it. They are
   planned as hash joins, which no probe's rows price (Limits, below).
 
-§39's "A skewed key's probes" has what that did to a plan.
 
 **The statistic.** Σn² of each key column is summed in the same pass that counts its n_distinct
 and over the same entries: the VALUE entries with at least one TID, each adding the square of its
@@ -21924,87 +21923,13 @@ counts, in the same `LION_OP_NDISTINCT` record, under the same lock and the same
 already there is written again. A sum is known where it is above zero and below the saturated
 maximum, over a count of some rows (`LionMetaSumsqKnown()`).
 
-**The formula** (`lion_skew_rows_of()`, lion_selfuncs.c). From ANALYZE's row of the column take the
-null fraction and the MCV list's frequencies f_i, and the rows N the planner finds the table to
-have. The keys outside the list hold `N (1 - nullfrac - Σf_i)` rows and `Σn² - Σ(f_i N)²` of the
-sum, so a row drawn from them belongs to a key of
-
-    (Σn² - Σ(f_i N)²) / (N (1 - nullfrac - Σf_i))
-
-rows on average, and of `Σn² / (N (1 - nullfrac))` with no MCV list. The result is bounded below by
-core's rows per key, as `var_eq_non_const()` has them, and above by N. A unique column has
-Σn² = N (1 - nullfrac), its NULL entry not being one of the VALUE entries summed, and with no MCV
-list stays at its one row; a probe of a most common value is what the MCV list is for, and the
-formula leaves those keys out. A column whose MCV list holds every value has no key outside it
-(what the formula would leave is rounding) and keeps core's rows.
-
-Σn² was summed over the rows the count was taken over, and the table may have grown since. It is
-scaled by the count's convention (`lion_ndistinct_value()`), with g the table's rows over the rows
-counted. A count of a tenth of the rows or fewer is a fixed set of keys, each of which grew with
-the table, so Σn² grows as g². More keys than that grow with the table and keep their rows, so
-Σn² grows as g. Past a factor of 2 the count is not used (`lion_nd_current()`), and neither is the
-sum.
-
-The index is chosen as for n_distinct (§33, "The hook"): non-partial, a scalar opclass with the
-type's equality, the column itself, the count nearest the table's rows. The column must have
-ANALYZE's statistics. The figure is worked out once a planner run and column and kept in the
-planner run's memory with the counts (`lion_skew_param_factor()`). So it is worked out from the
-column's own row: ANALYZE's MCV list without the values one relation's clauses list (below, "The
-frequencies of the listed values"), which are that query's, and without the probe scope's
-corrected ends. The lookup sets `lion_skew_unlisted`, under which the hook serves neither.
-
-**What it is used for.** The figure is lion's own. Path rows keep core's per-key rows, and so does
-every estimate core makes, n_distinct among them (§40.12). Lion prices its probes of a key the
-plan does not know at the figure, and the competitor they are weighed against is priced at the
-same rows, its price then put back into core's units (§39, "A skewed key's probes"). Those probes
-are:
-
-- a walk of a B-tree keyed on the column (`lo_cost()`), and the set of a walk whose lion access
-  equates the column to the Param (`lion_skew_set_extra()`);
-- a LionCount whose WHERE equates the column to a Param (`lion_count_rel_set_clause()`);
-- an unparameterized AM scan of a lion index whose index clauses equate the column to a Param - a
-  correlated subquery's scan, or a generic plan's (`lioncostestimate()`, `lion_skew_am_paths()`,
-  §40.12); the AM's other scans keep core's rows;
-- an FK-side join's lookups against a nested loop (`lion_cost_fkjoin_rel()`).
-
-`pg_lion.enable_skew_estimate` (on by default, PGC_USERSET) turns it all off. The figure is a
-factor of the competitor's price as well as lion's, so it moves plans both ways, and the setting
-puts them back to what they were.
-
-**Inspecting it.** `lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct`
-and `sumsq` from the meta page, with `sumsq` NULL where it is unknown.
-`lion_debug_skew_rows(text)` plans a query and returns the figure and core's rows per key for each
-column a probe was priced on. Both are C functions for the tests, superuser only, that the
-extension's SQL does not create: `test/sql/skew.sql` binds them from the library.
-
-**Tests** (`test/sql/skew.sql`):
-
-- the setting's row in `pg_settings`;
-- on 15,000 rows, the build's Σn² exactly. The figure is 162.07 rows against core's 15. A VACUUM
-  that deletes counts what is left, and an ANALYZE of a small directory counts the inserts. A table
-  that doubles without a count doubles the figure, and past twice the rows counted it is not used;
-- on a fact of 200,000 rows over a dimension of 20,128 keys (eight of 5,000 rows, 120 of 1,000, the
-  rest of two), the figure, 750.50 rows against core's 10. A unique column stays at one row and its
-  plan's cost does not move;
-- the plans that flip with the setting: a correlated count (an aggregate over the key's B-tree off,
-  a LionCount on), a nested loop over one key's rows (the loop's index scan off, the walk of the
-  B-tree on; with the walk switched off, the LionCount on, priced past the cold reads' bound), and a
-  generic plan's parameter;
-- every answer against core's;
-- an EXISTS over the fact whose probed relation lists keys 9 to 128, the keys of 1,000 rows
-  outside ANALYZE's list: the figure stays 750.50 with `pg_lion.enable_index_mcv` on and off, and
-  the semi-join's estimate, which takes the list's rows, is larger with it on;
-- the fact's lion index replaced by a copy partial on a predicate every row meets
-  (`fk IS NOT NULL`), beside a whole lion index of the key alone that the figure comes from: the
-  correlated count reads the copy alone, its plans flip with the setting as the whole index's do,
-  and it is priced as it was over the whole index;
-- a semi and an anti join of the dimension's group 1 to the fact over the key's B-tree: on the key
-  alone no figure is worked out for the loop's probe, and the lion path's price does not move with
-  the setting; with a second clause, the fact's id against the dimension's, which lion declines,
-  the loop's probe is priced at the figure, 750.50 rows (§39, "Against a nested loop").
-
-`test/sql/correlated.sql` runs with the setting off: it is about the loops of a correlated
-subquery, and its fixtures' keys are skewed enough to move its plans.
+**Not used by the planner.** Lion priced its probes of a key the plan does not know, and the core
+paths they competed with, at the rows a key drawn by row has (Σn² / N outside ANALYZE's MCV list)
+until 2026-10-29, when that went with §39's rates: the competitor's price corrected is a rate of its
+own, and the rates are gone (§39, "Without the rates"). The sum is still counted and kept, at the
+cost of a multiply and an add an entry, for `lion_debug_key_skew(regclass)`, which returns each key
+column's `rows`, `ndistinct` and `sumsq` from the meta page (`sumsq` NULL where it is unknown) - a C
+function for the tests, superuser only, that the extension's SQL does not create.
 
 ### Limits
 
@@ -22019,10 +21944,6 @@ subquery, and its fixtures' keys are skewed enough to move its plans.
 - Dead row versions count until VACUUM (above).
 - An index whose meta page predates this section supplies nothing until a build, a VACUUM that
   deletes, or an ANALYZE within the bound has counted it.
-- The rows of a probed key are a mean over the keys outside the MCV list, weighted by their rows.
-  It is right for outer rows drawn as the fact's rows are, and too many for an outer set that
-  covers most of the keys, which meets about the per-key mean. Such sets are hash joins, which no
-  probe's rows price.
 
 ### The frequencies of the listed values (2026-10-23)
 
@@ -23174,7 +23095,7 @@ probed at keys where it was built (`unionprobe.sql`), posting trees on fewer blo
 (`scanand.sql`, `basic.sql`). The first version's changes to `treeprobe.sql` and
 `fkjoin_adaptive.sql` stand, and so does `count_split_race.spec`'s wider pad.
 
-## 39. The competitor's units, and a margin for the pushdown (2026-10-01)
+## 39. The competitor, and a margin for the pushdown (2026-10-01)
 
 §10's "The reference" fits every CPU constant of lion's model at 500 cost units a millisecond, the
 middle of core's sequential scans (400 to 700) and index-only scans (415 to 535), so that lion is
@@ -23198,14 +23119,48 @@ the cheaper by its fuzz factor of 1%. The outcomes are not symmetric - where lio
 to 100 times, where it loses it loses by 1.5 to 13 - and the losses of the last two passes were not
 constants: ClickBench Q15 (0451360, a clause a partial index's predicate implies priced twice) and
 a `count(DISTINCT)` priced as a walk it did not make were formulas, which no setting of the 37
-multipliers of §31 corrects. This section changes nothing in a formula and refits nothing; it
-corrects the units a lion path is compared in, and gives a site a margin a lion path has to win by -
+multipliers of §31 corrects. This section changed nothing in a formula and refit nothing; it
+corrected the units a lion path is compared in, and gave a site a margin a lion path has to win by -
 which it first set to 0.8, and which the matrix set back to 1 ("The margin", "The matrix").
 
-### The competitor's units (`lion_plan_units.c`)
+**Without the rates (2026-10-29).** The units are gone: a lion custom path is priced at its own
+price, in the units lion's constants are fitted in, over the margin. The rates (one for each kind of
+competitor, the hash aggregate's of its hashing alone), the skew estimate that priced a probed
+key's competitor at the rows such a key meets (§33), and `pg_lion.competitor_pricing`, the switch
+that turned them all off (§49), went together. What is left of the competitor is what it reads
+that lion's path does not, which no constant of lion's model can price: its uncached reads ("A
+nested loop's cold reads", "A bitmap heap scan's cold reads"), within `pg_lion.cold_max_discount`,
+and a Memoize's misses under a LIMIT ("A Memoize under a LIMIT"). Why:
 
-A lion custom path is priced in the units of the cheapest core path of the relation it is added
-to, found when the planner hook that adds it starts:
+- A private workload ran every statement faster warm with the switch off (rates, skew estimate,
+  cold reads and Memoize scale all off), by about a fifth in all. Cold, the switch off lost one
+  statement 2.7 times over: a hash join of a table several times `effective_cache_size`, read by a
+  bitmap heap scan, the case the cold reads price - which is why they stay.
+- The rates were constants for plans whose units a millisecond spread four to six times within one
+  kind (a hash aggregate's 121 to 799, "The matrix"), fitted on an assert build. Each fixed some
+  plans and broke others: the held-out set's two GROUP BYs under a selective WHERE took a rate of
+  the hashing alone to give back.
+- What they bought, measured: with `hashagg_rate` at 1 the held-out set's six whole-table GROUP BYs
+  went to a hash aggregate 1.0 to 2.4 times slower ("Held out"); with `hashjoin_rate` at 1 a
+  LionProbeJoin under a NOT EXISTS of 150,000 keys at scale went to the hash anti join, 2,021 ms
+  against 879 warm (§49, "On the fixtures' shapes at scale"). Those are now lost, to be won back by
+  pricing the node's own work, not its competitor's.
+- In the regression suite, an FK-side `count(DISTINCT)` GROUP BY went to a hash join, the faster
+  plan (0.47 ms against 0.64), and a count of a position filter at a hundred keys went to a hash
+  join, the slower (3.2 ms against 1.4); the bitmap heap scan test's FK-side join needed a wider
+  fact for its cold reads to tip it; and the count against the AM's own scan of the same sets is
+  pinned through `cpu_operator_cost`, the rates having been the one lever that moved the count's
+  price without the scan's.
+
+The subsections below that describe the rates, the matrix's and the held-out set's measurements of
+them, are the record of what they measured.
+
+### The competitor (`lion_plan_units.c`)
+
+A lion custom path's competitor is the cheapest core path of the relation it is added to, found
+when the planner hook that adds it starts. Its price does not move a lion path's; what it reads
+does (its cold reads, a Memoize's misses under a LIMIT, below), and its kind decides where the
+margin applies ("The margin"):
 
 - **Which path.** The upper rel's, for LionCount and the FK-side join (`create_upper_paths_hook`
   runs after core has added every grouped path); the join rel's, for LionSemiJoin and LionAntiJoin
@@ -23238,96 +23193,31 @@ to, found when the planner hook that adds it starts:
   kind. In an upper rel's plan, a semi or anti join over a join that is most of its cost is that
   join's kind ("The join that reads the dimension", below). (A hash aggregate over a join was
   first a hashed aggregate: "What running it changed".)
-- **Its rate**: the cost units a millisecond such plans run at, over 500 - a setting for each kind
-  that is not the reference (below).
-- **The price**: the path's own price, as lion's model makes it in the reference units, times the
-  rate (`lion_units_price()`) - its pages with its CPU terms. A rate is the ratio of two whole
-  plans' cost units a millisecond, pages and all, and a time in one unit is a time in another by
-  that one factor. Every choice the model makes inside a price - walk or probe, collect or seek,
-  the inside of a range or its complement, the decoded walk or the nested loop - is made before
-  the conversion, in the units lion's constants were fitted in, so that the competitor changes how
-  dear a lion path is and never which of its forms the executor runs. (The first version of this
-  section converted the CPU terms alone, the pages left in core's convention: "What running it
-  changed", below.)
-
-**On the path's own cost.** The converted price is the path's cost, as EXPLAIN shows it, rather than
-a correction made only where `add_path()` compares. It is the simplest, it is what every later
-comparison sees - a Sort above the node avoided, a LIMIT's fraction of it, a join above a
-LionSemiJoin - and it is what makes the comparisons with the other paths of the relation, added
-before or after, consistent with the one the rate was chosen for. It is also what a lion path's
-cost means from here on: its price in the units of the plan it was measured against. A bench
-measuring lion's own units a millisecond forces lion's plans with core's `enable_*` settings, or
-sets each rate to 1 (`bench/calib/`, below).
+- **The price**: the path's own price, as lion's model makes it (`lion_units_price()`), times the
+  factor its competitor's cold reads and Memoize give it, over the margin. Every choice the model
+  makes inside a price - walk or probe, collect or seek, the inside of a range or its complement,
+  the decoded walk or the nested loop - is made before, so that the competitor changes how dear a
+  lion path is and never which of its forms the executor runs.
 
 **Only the node's own price.** What core puts above or below a lion node is core's plan, priced by
-core in its own units, and is not converted: the Finalize Agg over a partitioned count and the
-Gather and Finalize Agg over a parallel one; the dimension scan an FK-side join reads its rows from
-and the rows a semi or anti join emits (a `cpu_tuple_cost` each, as core's joins charge them); the
-HAVING the node evaluates (`cost_qual_eval()`, as `cost_agg()` charges it). The parallel GROUP BY's
-participant price is made of the serial node's converted price and its converted per-range terms.
+core: the Finalize Agg over a partitioned count and the Gather and Finalize Agg over a parallel
+one; the dimension scan an FK-side join reads its rows from and the rows a semi or anti join emits
+(a `cpu_tuple_cost` each, as core's joins charge them); the HAVING the node evaluates
+(`cost_qual_eval()`, as `cost_agg()` charges it).
 
-**Not converted at all**: LionOrdered, whose competitors are the base rel's scans - sequential,
-index-only, index, bitmap - which are the reference or have no one rate (below); the AM's own
-plain, index-only and bitmap scans, which compete inside core's path machinery and are priced as
-core prices its own; and a path with nothing to compete with. When every path core has for the
-relation is disabled (`DISABLED`: `disabled_nodes` on PostgreSQL 18, `disable_cost` before it) -
-a plan forced with core's `enable_*` settings, as most of the regression suite and the matrix's
-`lion` arm force one - there are no units to convert into, and the path is priced in lion's own,
-which its choices among its own forms - a walk in order or a Sort over one, serial or parallel -
-are made in. Priced at the disabled plan's rate, a forced semi join under `fkjoin_semipath.sql`'s
-LIMIT took the walk in the outer side's order (the disabled nested loop's 2) over the Sort its
-model prefers.
-
-### The rates
-
-| setting | default | the plans | §10's data, units a millisecond |
-|---|---|---|---|
-| `pg_lion.hashagg_rate` | 0.1 | an aggregate that hashes: its own cost, less its input's ("A hashed aggregate's own rate") | whole plans: 208 (200 groups), 157 (20,000), 309 (parallel); 210 on the PostgreSQL 16 repro above, against lion's 510 there |
-| `pg_lion.agg_rate` | 1.0 | a plain or sorted aggregate over a scan | 401 to 695 over sequential scans, 415 to 536 over index-only ones, 699 sorted: around the reference by construction (§10 fitted lion to these); 263 on the repro |
-| `pg_lion.hashjoin_rate` | 0.5 | a hash join | 280 and 283 with 1,000 and 4,400 rows hashed, 185 at 140,000, 57 at 1.4M (in batches); 219 parallel |
-| `pg_lion.mergejoin_rate` | 1.0 | a merge join | none measured |
-| `pg_lion.bitmap_rate` | 1.0 | a bitmap heap scan | 4,419, 1,702, 544 for 500, 25,000 and 250,000 scattered rows; about 70 for §22's BitmapAnd |
-
-Sequential, index-only and plain index scans are the reference and have no setting, and so are
-nested loops (below, "Held out") and everything else (`OTHER`: a function scan, a MinMaxAgg, a
-nested loop over a materialized side).
-
-- **Hashed aggregates, 0.1 of their own cost.** Hashing is charged one or two `cpu_operator_cost`
-  a row for about 94 ns (§10). Over a whole table that is most of the plan's time, and every such
-  plan ran at 0.31 to 0.62 of the reference; over a selective index scan it is almost none of it.
-  The rate is the hashing's, and a plan's own rate follows from its shape ("A hashed aggregate's
-  own rate", below).
-- **Hash joins, 0.5.** The FK-side join's competitor is a hash join of the fact with a filtered
-  dimension, the small-hash end of §10's measurements (0.56, 0.57); joins that hash more run lower
-  (0.37 at 140,000 rows, 0.11 in batches). 0.5 is the conservative end: a lower rate favours lion.
-- **Nested loops, the reference.** §10 measured a nested loop into an index at 1,057 units a
-  millisecond, §31 about 2,000 over warm indexes (`fk fwd tsq dim2 1.2k`). A rate of 2.0 built from
-  those changed no plan of the two matrices and was taken out ("Held out", below). §31's FK-join
-  mispick against a nested loop, which 2.0 would have priced away, did not reproduce on the held-out
-  tables: over 14 dimension sets of 250 to 375,000 keys, lion's node was chosen at either rate and
-  was the faster plan or within noise of it.
-- **Aggregates over a scan, 1.0.** Around the reference by construction - lion was fitted to the
-  middle of these very plans. The repro measured 0.53 on another machine and version, where lion's
-  own reference would have to be measured again too; the setting is there for that.
-- **Bitmap heap scans, 1.0: too little to say.** §10's 544 to 4,419 are scans whose price is pages -
-  a warm random page charged `random_page_cost` - which lion's pages share by convention; §22's
-  BitmapAnd ran at about 70, its price CPU per TID charged far below its time. One rate cannot be
-  both, and the kind cannot tell them apart; it prices at the reference, as before.
-- **Merge joins, 1.0**: none measured.
-
-`SET client_min_messages = debug2` logs, for each lion path priced, the kind of plan it was priced
-against (`lion` before it when that plan is the AM's own scan), that plan's cost, the rate and the
-margin.
+**Nothing to compete with.** When every path core has for the relation is disabled (`DISABLED`:
+`disabled_nodes` on PostgreSQL 18, `disable_cost` before it) - a plan forced with core's `enable_*`
+settings, as most of the regression suite and the matrix's `lion` arm force one - or there is none
+yet, the path is priced at its own price, with no margin.
 
 ### The margin
 
-`pg_lion.pushdown_margin`, default **1**, no margin, range 0.01 to 1000. Set below 1, a lion custom path's own price, in
-its competitor's units, is divided by the margin before the path is offered to `add_path()`, so that
+`pg_lion.pushdown_margin`, default **1**, no margin, range 0.01 to 1000. Set below 1, a lion custom path's own price
+is divided by the margin before the path is offered to `add_path()`, so that
 a lion path is chosen only where its price comes to at most that share of the best core plan's - at
 0.8, a near tie within 25% goes to core. It applies to every lion custom path - LionCount (serial,
 parallel, partitioned, the FK-side join), LionSemiJoin, LionAntiJoin and LionOrdered (startup and
-total alike) - and to the node's own price only, as the rates do: core's nodes around it are not
-marked up. The AM's own scans compete inside core's path machinery on their plain cost, unmarked.
+total alike) - and to the node's own price only: core's nodes around it are not marked up. The AM's own scans compete inside core's path machinery on their plain cost, unmarked.
 This section first made 0.8 the default; the matrix made it 1 ("1, from the matrix", below).
 
 **Divided, not declined.** Not adding the path would be cheaper and would leave EXPLAIN's costs
@@ -23433,7 +23323,7 @@ core's disabled paths never do. The mapping follows what the node reads:
   scan of core's, and the AM's own bitmap scans are core's paths, which the setting already
   disables.
 
-The disabled mark goes on the node's own cost, outside the margin and the competitor's units: the
+The disabled mark goes on the node's own cost, outside the margin: the
 price is divided by the margin first, then marked, so that no margin turns a disabled path into an
 enabled one. `pg_lion.enable_*` are unchanged and still leave a lion path out altogether. To force a
 lion path, a test switches off what it competes with that is not an index scan (`enable_seqscan`,
@@ -23476,8 +23366,10 @@ Only where the dominance is plain:
   workers, which the serial count does not, and keeps its price; nor a path an `enable_*` setting
   disabled, which loses whatever its cost.
 
-`test/sql/isectstretch.sql` pins it with the count's own price set, by `pg_lion.agg_rate`, to 0.995,
-1 and 2 times the scan's: before, the scan's Aggregate won all three; now the count does.
+`test/sql/isectstretch.sql` pins it with the count's own price set to 0.995 and 0.9995 of the
+scan's, for counts of a row or none, whose scan fetches next to nothing: a higher
+`cpu_operator_cost` brings the two prices together, the count being more operators than the scan
+(found by bisection). Without the edge the scan's Aggregate wins both.
 
 ### Resident index pages: §22's third rung
 
@@ -23499,7 +23391,7 @@ it is when the index is resident, `lion_index_page_cost()`, a third rung below `
   units): §10's warm page read in order, 0.6 us against the 2 us that `seq_page_cost` stands for at
   500 units a millisecond (the posting leaves a probe's seeks cross fit at 0.7, a directory page
   descended at 0.6 with its search). Never above `device`: a page core prices lower keeps core's
-  price. In a competitor's units both are converted with the rest of the price.
+  price.
 - **Walked and probed alike**, as §22 asked: the driver's walk of its sets and the other sources'
   probes of theirs (`lion_cost_set_pages()`), a GROUP BY's entry scan and a second column's
   (`lion_count_rel_entry_scan()`, `lion_count_rel_pair_cost()`), a range's leaves read again by a
@@ -23595,7 +23487,7 @@ python3 bench/calib/matrix.py --label before --out before.json
 python3 bench/calib/matrix.py --label after --out after.json
 python3 bench/calib/matrix.py --label own --out own.json --set pg_lion.pushdown_margin=1 \
     --set pg_lion.hashagg_rate=1 --set pg_lion.agg_rate=1 --set pg_lion.hashjoin_rate=1 \
-    --set pg_lion.mergejoin_rate=1 --set pg_lion.bitmap_rate=1
+    --set pg_lion.mergejoin_rate=1 --set pg_lion.bitmap_rate=1    # settings since removed
 python3 bench/calib/matrix.py compare before.json after.json
 ```
 
@@ -23744,42 +23636,6 @@ Differences of about 50 ms in time lost with no plan changed are the fastest arm
 What the held-out set found that no constant rate can fix: two GROUP BYs under a selective WHERE
 (`h.group.tag.w.c50`, `h.group.c1k.w.geo`) where the node, chosen at any of these rates, takes 148
 and 256 ms against a hash aggregate's 46 and 85.
-
-### A hashed aggregate's own rate
-
-Those two lost to one rate for every plan with a hash aggregate. Over `WHERE c50 = 9` (60,000 rows
-by an index scan) core's HashAggregate costs 60,997 and runs in 49 ms warm, 1,245 units a
-millisecond: its cost is the scan's, which runs near or above the reference, and its hashing is 314
-of it. At 0.42 the node's own 76,157 came to 31,986 and won; it takes 150 ms.
-
-So `pg_lion.hashagg_rate` is now the rate of the hashing alone - each hashed aggregate's cost less
-its input's - and the rest of the plan is taken at the reference
-(`lion_hashagg_plan_rate()`):
-
-    rate = total / ((total - hashing) + hashing / hashagg_rate)
-
-Fitted on the calibration matrix alone, its four whole-table GROUP BYs over a sequential scan
-(their time less the scan's cost at 500 units a millisecond, over the aggregate's own cost):
-0.106, 0.087, 0.116 and 0.110 for `c20`, `c200`, `c20, c2` and `c200, c20`; 0.1. A whole-table
-GROUP BY comes to 0.35 to 0.43 as before, the two above to 0.96 and 0.88.
-
-| | calibration set (39): mispicks, time lost | held out (41): mispicks, time lost |
-|---|---|---|
-| 0.42 for the whole plan | 3, 81 ms of 514 | 10, 509 ms of 4,549 |
-| 0.1 for the hashing | 4, 93 ms of 560 | 9, 311 ms of 4,432 |
-
-The plans that changed are the two above, now the hash aggregate (148 ms to 55, 256 to 127), and
-`fk.status.kind` and `h.fk.semi.d10`, the hash join's near ties, which moved with the run's noise
-and not with this rate: neither has a hashed aggregate over a scan. No GROUP BY of either set moved
-to a slower plan.
-
-What it gives back, in the regression suite: three small GROUP BYs. A whole-table one over a dirty
-heap of wide rows (`pushdown.sql`) is a tie on the release build, 14.8 ms against 15.6, and goes to
-the hash aggregate. A prepared top-k with its LIMIT a parameter (`topk.sql`) goes the other way, to
-the node. And a GROUP BY under `d @@ ANY (...)` over 4,000 rows (`positions.sql`) goes to the hash
-aggregate at 4.5 ms against the node's 2.4 (assert build): its input is a sequential scan whose `@@`
-core charges one `cpu_operator_cost` a row, far below its time, and only the hashing is now priced
-below its time. That error is the filter's cost, not the aggregate's.
 
 ### A nested loop's cold reads (2026-10-09)
 
@@ -23973,10 +23829,7 @@ that falls back on a default; `est_unique_keys` from 19) and the hit ratio from 
 units: it is multiplied by `memoscale`, the loop's price of the share (its startup and `s` of its
 run) over that price plus the extra (`lion_units_price()`). That scale is not bounded by
 `pg_lion.cold_max_discount`, since it is the competitor's own price, corrected; the cap bounds only
-the cold reads on top, which take the loop at `nlcost / memoscale` (`lion_units_cold()`). Where the
-loop's probes also meet a skewed key and the path is priced at its rows ("A skewed key's probes",
-below), the two corrections add: the price is multiplied by `skewscale * memoscale`, and the cold
-reads take the loop at `nlcost + nlextra + nlcost / memoscale - nlcost`. Every lion path priced
+the cold reads on top, which take the loop at `nlcost / memoscale` (`lion_units_cold()`). Every lion path priced
 against such a loop through `lion_units_for()` sees it, and LionOrderedJoin weighs its own
 competitor the same way (§47.3). A LionOrdered walk is priced against a scan of its relation, never
 a loop, and its price does not change. `pg_lion.enable_memoize_limit` (on) turns it off.
@@ -24001,8 +23854,8 @@ LionProbeJoin, which take every join below the aggregate):
   (PostgreSQL 18) and `JOIN_RIGHT_ANTI`, which emit their inner side - whose emitted side reaches
   a join, down through the nodes that pass rows up, and costs at least what the semi or anti join
   adds over it, is passed through to that side. The competitor's kind is the join's below it
-  (`lion_competitor_kind()`), and the nested loop whose cold reads, skewed probes and outer side
-  are weighed is the first one below it (`lion_nestloop_cold()`, `lion_competitor_skew()`). A
+  (`lion_competitor_kind()`), and the nested loop whose cold reads and outer side are weighed is
+  the first one below it (`lion_nestloop_cold()`, `lion_nestloop_outer()`). A
   semi or anti join over a scan, or one that is most of the plan's cost itself, is its own kind. A
   join rel's lion paths - LionSemiJoin and LionAntiJoin as join paths - compete with that one join,
   their outer side core's child at core's price, and take the semi or anti join as it is.
@@ -24010,7 +23863,7 @@ LionProbeJoin, which take every join below the aggregate):
   under a Material or a projection) probes it once a miss, at the hit ratio
   `cost_memoize_rescan()` priced it at (`lion_memoize_misses()`, as the bitmap heap scans' reads
   count it): a leaf and the heap pages of a probe's rows for each miss.
-- **in a subquery's plan** (`lion_nestloop_cold()`, `lion_competitor_skew()`): a loop below a
+- **in a subquery's plan** (`lion_nestloop_cold()`): a loop below a
   subquery scan is the subquery's, and its pages, the residency over its tables and a Memoize's
   keys are looked up in the subquery's planner info, whose range table its Vars refer to.
 - **the loop less its outer side** (`lion_units_cold()`, `LionUnits.nlshared`): where the lion path
@@ -24127,20 +23980,8 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
 - **Three of lion's mispicks** in the matrix are formulas, not units: the IN lists' unions
   (`eq.c20k.in100`, `eq.c1m.in1000`, priced at 0.78 and 0.60 of an index-only scan's aggregate
   and 1.3 to 2.2 times slower) and the 20,000-entry GROUP BY (`group.c20k`, priced 1.09 times a
-  sorted aggregate over an index-only scan and 1.4 times faster). Neither the rates nor the margin
-  is the tool for them, and this section refits none of the 37 constants they are made of.
-- **The rates on a release build.** This run's build was assert-enabled, and its own run's medians
-  disagree with the defaults in both directions depending on what they are taken over (above). A
-  release build's matrix, the rates fitted to its near ties, is the measurement that could move
-  them.
-- **LionOrdered** is not converted: its competitors are the reference or have no one rate. The
-  matrix measured the one it meets most - a btree's index scan in order under a LIMIT - at 40 to
-  115 units a millisecond, a fourth to a twelfth of the reference; a rate of its own would favour
-  LionOrdered, but four queries are too few to set one.
-- **Bitmap heap scans** have one rate for plans that run at 70 and at 4,400 units a millisecond;
-  splitting the kind by what the scan's price is made of (pages or TIDs) would let §22's BitmapAnd
-  have its own rate. Every bitmap scan the matrix timed was the AM's own, priced by lion's model,
-  and measures nothing of the rate.
+  sorted aggregate over an index-only scan and 1.4 times faster). The margin is not the tool for
+  them, and this section refits none of the 37 constants they are made of.
 - **The parallel GROUP BY's participants** are priced with the serial node's competitor; core's
   partial paths are not searched for one of their own.
 - **One residency for both sides' common reads.** A B-tree leaf a probe is counted for the loop and
@@ -24154,123 +23995,8 @@ under a LIMIT to an index scan three times slower (0.13 to 0.15 ms against 0.04 
 - **The FK-side join's factor** weighs its own price against the loop's whole cost, the dimension
   scan it reads as its child at core's price inside it: `nlshared` is LionProbeJoin's alone, and
   the same pull towards 1 is not measured there.
-- **The other readers of the loop.** A skewed key's probes (`lion_competitor_skew()`) are looked
-  for past a semi or anti join but not through a Memoize; a Memoize under a LIMIT
-  (`lion_memoize_limit_scale()`) only on the plan's top join.
-- **A semi or anti join that is most of its plan's cost** is its own kind and rate: a hash anti join
-  of a large table at the hash join's 0.5, a nested loop anti join at the reference. And a join
-  rel's semi and anti join paths compete with their one join as it is, its kind the semi or anti
-  join's.
-
-### A skewed key's probes (2026-10-23)
-
-§33's "The rows of a probed key" has the rows a probe of a key the plan does not know meets, on a
-column whose keys are skewed: from Σn², and many times the per-key rows core prices it at. Lion
-prices its own probes of such a key there. Its competitor was priced at core's rows, so the
-comparison was between a lion path at the rows it meets and a core path at a sliver of them, and
-the lion path lost to plans that run many times slower. A competitor at core's rows is under-priced
-by however many rows it is short.
-
-**Measured** (the same private workload as §33's). A nested loop from a dimension's small set of
-keys into the fact table, its inner side the fact's B-tree on the key. Lion's probe of a key was
-priced at about three times core's B-tree scan, which was priced at the per-key rows. The loop
-won. Run cold, each of its calls read thousands of heap tuples and took more than a second.
-
-**R1: the rows are the same on both sides, or core's on both.** A lion path is priced at the
-skewed rows only where its competitor meets them too. The competitor is priced at those rows as
-well, and the lion path's price is put back into core's units by the competitor's price at core's
-rows over its price at the skewed rows:
-
-    price = lion's price at the skewed rows x competitor at core's rows / competitor at the skewed rows
-
-So the two compare as they would at the rows both meet, and everything else the plan weighs them
-against stays in core's units. Where no competitor meets the rows (none, or a sequential scan whose
-price no key's rows change), the lion path keeps core's rows too. AM scans are core's scans of a
-lion index and keep core's rows: they compete with core's paths of the relation by core's own
-rules. An unparameterized one whose index clauses equate the key to a value the plan does not know
-- a correlated subquery's scan, a generic plan's - is lion's plan of the relation, and is priced in
-the units of its other plans (§40.12). Path rows never change.
-
-**What the competitor costs at the skewed rows** (`lion_skew_scan_extra()`, lion_plan_skew.c) is
-the difference between core's own price terms worked out at core's rows and at `factor` times
-them:
-
-- an index scan: `cost_index()`'s heap pages, Mackert and Lohman's over the loop's scans and
-  interpolated by the index's correlation, which it takes from the AM's `amcostestimate`;
-- the leaf pages `genericcostestimate()` prorates;
-- a bitmap heap scan: `cost_bitmap_heap_scan()`'s pages and the price of a page;
-- a CPU charge for each row, index tuple and restriction qual.
-
-The descent, the start-up and everything above the scan are left as they were. The factor is the
-largest of the figures (`lion_skew_param_factor()`) for the scan's index clauses that equate a
-column to a value the plan does not know: a Param, or another relation's Var
-(`lion_skew_clauses_factor()`).
-
-**Against a nested loop** (`lion_competitor_skew()`, lion_plan_units.c). The inner side must be
-one index scan or bitmap heap scan parameterized by the outer rows, under a Material or a
-projection at most. The extra is what core's own model of the loop (`final_cost_nestloop()`)
-charges more at the skewed rows. An inner join's every probe reads its key's rows: the extra is
-the loops (the outer rows) times one scan's extra. A probe into an inner side core proved unique
-stops at its key's first match, and that loop is left at core's price. Core prices a semi or anti
-join's loop by its outer rows with a match and without one. A matched row's probe reads
-`2 / (match_count + 1)` of a scan, and the match count grows with the key's rows, so the first
-match comes no later at a heavy key. An unmatched row's probe costs a fraction of a scan where the
-scan's index answers every join clause (`lion_competitor_key_only()`, core's static
-`has_indexed_join_quals()` restated): the join has no clause left to evaluate itself, the inner
-side is a parameterized index or index-only scan or a bitmap heap scan over one index scan, and
-each clause its parameterization takes from the join's outer side is one of its index clauses or
-of the same equivalence class as one, with at least one such clause. That loop is left at core's
-price too. Otherwise core charges an unmatched row a full scan, which grows with the key's rows,
-and the extra is the unmatched rows times one scan's extra: the outer rows less the join's rows
-for a semi join, which emits the matched ones, and the join's rows for an anti join, which emits
-the unmatched ones. The inner side's restriction clauses are left out of the test, as core leaves
-them out: its match count already scales with the key's rows, so the first match past such a
-clause comes no later at a heavy key, and an outer row with no match, which reads every row of its
-key, is under-charged by core at any key - core's model, not the skew's. In
-`test/sql/skew.sql`'s section 10 no figure is worked out for the probe of a semi or anti join on
-the key alone, and the lion path weighed against it keeps its price; a probe with a clause beyond
-the key is priced at the figure. A loop below a subquery scan is the subquery's, and its Vars are
-looked up in the subquery's planner info (`rel->subroot`), not the outer root's. The paths that
-price their lookups at the figure take it with `lion_units_take_skew()`, which sets the scale:
-
-    skewscale = (nlcost - nlouter) / (nlcost - nlouter + nlextra)
-
-That is the loop's price without its outer side, at core's rows over at the skewed ones. The outer
-side is left out because the lion path takes it as its child at core's price, and it would dilute
-the correction. The FK-side join and its semi join path do this, their lookups priced at the same
-rows (`lion_fkjoin_fk_keys()`: the keys the skewed rows per key would make, n_distinct over the
-factor).
-
-**Against the relation's own paths** (`lion_skew_rel_scale()`): a walk of a B-tree keyed on the
-column (`lo_cost()`), a LionCount whose WHERE equates it to a Param
-(`lion_count_skew_units()`), and an unparameterized AM scan of a lion index that does
-(`lion_skew_am_paths()`, §40.12). The competitor is the cheapest of core's paths of the relation
-with the same parameterization, neither one of lion's custom paths nor disabled. The scale is its
-price over its price plus its extra, for one scan or for the walk's loops. By the time the count
-or the walk is costed, `add_path()` may have pruned that path in favour of a lion path. So the
-scale is worked out once a planner run for each relation, outer rels and loops, and kept
-(`lion_skew_scale_keep()`). The unparameterized one is worked out at the top of lion's
-`set_rel_pathlist_hook` (`lion_skew_rel_note()`), from core's paths alone: the relation's paths
-that read no lion index, and core's index paths and sequential scan built again over its other
-indexes, which `add_path()` may have dropped for an AM scan of a lion index. Where the query level
-stops at a count of rows - a LIMIT, an `EXISTS`'s first row - both sides are priced for the rows
-they read until the count is found (§40.12, "A count of rows").
-
-**The cold reads, on top.** `lion_nestloop_cold()` counts the loop's heap pages at the skewed
-rows: one changed term, `indexselectivity x skew`. `lion_units_cold()` weighs the lion path
-against the loop at its corrected price, nlcost + nlextra. The skew correction is the skewscale
-`lion_units_price()` multiplies by, outside `pg_lion.cold_max_discount`, because it is the
-competitor's own price corrected and not a guess about the cache. The cold reads' factor applies
-on top of it, within that cap. In `test/sql/skew.sql` the LionCount against the loop is priced far
-below the loop, past the cap at its default of 2 (`past_cold_bound`).
-
-**Plans.** At the figure the measured loop's index scan meets over a hundred times the per-key
-mean a call, and is charged for its heap pages and CPU at those rows. That is nearer the tuples a
-call it read than core's per-key estimate was. This build has not been run on that workload. The regression
-test's fixtures reproduce the plan's shape at a small scale: a skewed key column, its B-tree, a
-lion index, a correlated subquery, a nested loop and a generic plan. `pg_lion.enable_skew_estimate`
-off gives back the plans this section changes. `test/sql/correlated.sql`'s plans move with it, and
-that test runs with the setting off (§33's subsection).
+- **The other readers of the loop.** A Memoize under a LIMIT (`lion_memoize_limit_scale()`) is
+  looked for only on the plan's top join.
 
 ## 40. Lion-filtered walks of a covering B-tree, index-only (`LionOrdered`'s index-only mode and `LionBtreeScan`, lion_ordered.c; 2026-10-06)
 
@@ -25253,7 +24979,7 @@ loop over an assumed number of calls.
   again at every call, as `Lion Set`'s `N builds` shows; its lookups' pages alone are spread over
   the calls (`lo_lion_amortized()`: each leaf of the lion access priced again at the calls, the
   difference taken off), the build's CPU a call's. Beside it the walk is offered the set without
-  the Param, built once (§40.12, "A set without the key"). An InitPlan's Param in the Lion Cond is
+  the Param, built once (§40.12). An InitPlan's Param in the Lion Cond is
   set once per execution, before the calls, and rebuilds nothing: only a Param the levels above
   hand down (`lion_has_outer_param()`, their `plan_params`) counts. The heap's pages are a call's,
   as core's.
@@ -25301,190 +25027,15 @@ scalar `max()` sub-select and an `EXISTS` through the walk; the walk with an Ini
 its Lion Cond, its set built once and kept through every call; every answer compared with core's plan, the lion
 paths off; and the join of the same rows, its plans unchanged.
 
-### 40.12 A correlated subquery's skewed key, in lion's units (2026-10-24)
+### 40.12 A set without the key (`lo_set_rel_pathlist()`, 2026-10-24)
 
-The shape is §40.11's, on a skewed key column, and capped:
-
-    SELECT d.pk,
-           (SELECT count(*) FROM (SELECT 1 FROM fact f
-                                   WHERE f.fk = d.pk AND f.tsv @@ '<a tsquery>'::tsquery
-                                   LIMIT 21) s) AS n
-      FROM dim d WHERE <a filter on d> ...
-
-a count a row shows as "20 or more", or the plain count, in a page of a query with an `EXISTS`, an
-outer join and an `ORDER BY ... LIMIT`. The subquery's scan equates the key to the outer row's
-value, a probe of a key the plan does not know: on a skewed column it meets the rows §33's figure
-has, not core's rows per key, and lion prices its probes there and puts the price back into core's
-units by its competitor's two prices (§39, R1). A correlated subquery's level has no loop to weigh
-it against; the competitor is the relation's own cheapest path (`lion_skew_rel_note()`), and the
-comparison is fair only where both sides of it are priced at the same rows and the same cap.
-
-**The competitor is core's own scan.** The scale of an unparameterized scan of a relation whose
-restrictions equate a skewed key to a value the plan does not know is worked out once a planner
-run, at the top of lion's `set_rel_pathlist_hook`, against the cheapest of:
-
-- the relation's paths that read no lion index, are no custom path of lion's and are not disabled;
-- core's index paths and sequential scan built again on a copy of the relation that sees its other
-  indexes alone (`lion_skew_scratch()`): by then `add_path()` has dropped the core paths that an
-  AM scan of the lion index beat at core's rows.
-
-The relation is one core builds index paths for, as the copy builds them again, and with the scan
-core plans for it (as `lo_rel_ok()` has it): a plain table or a materialized view, not an
-inheritance parent, whose rows are its children's Append, nor a parent whose children the query
-does not reach (`lion_rel_is_unexpanded_parent()`, §23), nor a sampled relation, which core reads
-by its sample alone, nor one already proven empty, whose pages the planner leaves out of
-`root->total_table_pages`, which `cost_index()` asserts they are in. Such a relation keeps core's
-rows.
-
-An AM scan of a lion index is lion's plan, not its competitor. Were it the competitor, it would
-keep core's rows, its scale would be 1, and every lion path of the relation would keep core's rows
-with it: in `test/sql/correlated_skew.sql`, where the AM's plain scan is the cheapest at core's
-rows, the count would be priced at 2.36 a call, against the 0.12 it is priced at against core's
-scan, with the AM's plain scans on or off.
-
-**The AM's scans in the same units** (`lion_skew_am_paths()`, `lioncostestimate()`). Where the scale
-is below 1, the relation's unparameterized paths whose index scans are all of lion indexes and whose
-index clauses equate the key are taken out, serial and partial. The lion indexes' paths are built
-again on a copy of the relation that sees them alone, with `lion_skew_am_rel` set, under which
-`lioncostestimate()` prices a scan whose index clauses equate the key at their factor
-(`lion_skew_am_factor()`):
-
-- the index tuples and the pages `genericcostestimate()` prorates, at the selectivity times the
-  factor (`lion_cost_prorate()`, the tail of `lion_cost_canonical_sel()`);
-- each set of the AND at its clause's factor (`lion_cost_set_and()`'s `skewed`), the key's set at
-  the rows a probed key meets, the others at their own;
-- the heap, which core prices from the selectivity the AM returns.
-
-Each such path's run is then cut to the share a count of rows takes (below), and the whole
-multiplied by the scale (`lion_skew_reprice()`; before PostgreSQL 18 a disabled path's
-`disable_cost` is left whole). A partial path takes the scale alone. A plain scan's remainder
-(§29.11) is priced alike (`lion_plain_scale_remainder()`) and paid there
-(`lion_plain_pay_remainders()`): lion's pass that pays remainders runs on the relation's paths
-first in the hook chain, before this note, and these are built after it. The pass offers the bitmap
-heap scan of the same index path beside each, priced from it at the same rows and put into core's
-units alike. Core's paths of the copy above are then offered again at core's prices, against these
-at their whole price. Path rows stay core's. A parameterized AM scan, a join's inner side, keeps
-core's rows as §39 has it; a scan of a lion index on other columns meets no more rows at a heavy
-key and keeps its price; a BitmapAnd of a lion index and another index is core's mixture and keeps
-it too.
-
-**A count of rows** (`lion_skew_limit_rows()`, `lion_skew_limit_read()`,
-`lion_skew_limit_share()`). Where the query level is the relation alone and ends at a count k of
-its rows - a LIMIT (core's `limit_tuples`, the LIMIT and OFFSET together), or the absolute count a
-caller asks for (`tuple_fraction` at 1 or more: an `EXISTS` sub-select's first row) - and nothing
-between the scan and the count reads more of it (no grouping, aggregate, DISTINCT, window,
-set-returning function, ORDER BY or set operation), a scan stops once it has k rows. Core's scan
-of the key's B-tree filters the key's rows by the rest of the WHERE, which passes p of them (the
-relation's restriction selectivity over the index clauses'), and reads the key's rows until k
-pass:
-
-    read = N_key                      no count, or N_key x p <= k
-         = core's rows                core's rows x p >= k
-         = max(min(k / p, N_key), core's rows)  otherwise
-
-with N_key the rows at the factor. The extra (`lion_skew_scan_extra()`) is priced at the rows it
-reads. A bitmap heap scan builds its whole bitmap first: its index tuples are the key's every row,
-its heap pages and rows those it reads. Lion's path at the factor returns `out = sel x N x factor`
-rows, and is charged the share of its run that k of them take, over the share core's Limit node
-takes of it at core's rows (k / rows where its rows pass k; core prices the Limit from the path's
-own rows, and it would be counted twice):
-
-    share = min((k / out) / (k / rows if rows > k, else 1), 1)      1 where out <= k
-
-A start-up - a set built whole first - is charged whole. The AM's scans take the share
-(`lion_skew_am_paths()`) and so does the walk (`lo_cost()`, an unparameterized and serial one). The
-two sides of the comparison shrink alike under a cap: the AM's scan of the test's capped count is
-priced the same, in core's units, under a LIMIT of 21 and one of 100,000.
-
-**The walk's set at the rows** (`lion_skew_set_extra()`). A walk whose lion access equates the key
-to the Param builds the set of the key's rows with the rest of its Lion Cond, and that set meets
-the rows a probed key meets too: each such leaf's index side is priced again under
-`lion_skew_am_rel` and the difference added to the set's price, its members at the largest factor
-(`lo_cost()`). An unparameterized walk only; a remainder the AM notes while pricing it again is no
-plain path's to pay (`lion_plain_remainders_drop()`).
-
-**A set without the key** (`lo_set_rel_pathlist()`). In a correlated subquery the walk is offered,
+In a correlated subquery the walk is offered,
 beside the lion accesses of the relation's restrictions, those of its restrictions without the
 clauses that hold the outer query's Param (`lion_has_outer_param()`). The walk keyed on the Param
 answers the key; the set of the rest holds no Param and is built once and kept for every call
 (`lo_rescan()`, §40.11), its build divided by the calls (`lion_outer_param_loops()`), where the set
 with the key is built again at each. `Lion Set` shows no builds count for it; the test's ten calls
 show `85 containers, exact`, against `50 containers, exact, 10 builds` for the set with the key.
-
-**§33's n_distinct hook keeps n_distinct.** The figure is the rows one probe of a key the plan does
-not know meets: a cost of the probe, and not the number of the column's distinct values. The hook
-feeds every estimate of the column - GROUP BY's groups, a join's rows, `var_eq_non_const()` - and a
-skew-weighted n_distinct would shrink them all by the factor. The figure stays lion's own, priced
-into its paths and their competitors and nowhere else.
-
-**Measured** (2026-10-24, release build, PostgreSQL 18). A dimension of 100,000 keys and a fact of
-2.85 million rows on them: keys 1 to 16 have 100,000 to 220,000 rows each, keys 17 to 316 300
-each, the rest one to three; `tsv` holds three words of 600; a lion index on (fk, tsv) and B-trees
-on (fk) and (fk, id); the subquery called for the 316 keys of one group, keys 1 to 316. A
-statistics target of 10 on fk gives the figure 86,314 rows against core's 28, and every row below
-is at that target. At the default target every heavy key is in the MCV list and the figure is
-what the sample's error leaves (below); the rows with `pg_lion.enable_skew_estimate` off stand for
-that, the figure at core's rows. Warm, best of three; cold, the cluster restarted and the OS cache
-dropped. `Q8` is an OR of eight phrases, `(w7 <-> w8) | ... | (w21 <-> w22)`.
-
-| settings | tsquery, form | before: plan, warm, cold | after: plan, warm, cold |
-|---|---|---|---|
-| walk off, `random_page_cost` 1.1, `effective_cache_size` 1MB | `w7`, capped | B-tree Index Scan, 85 ms, 600 ms | lion Index Scan, 35 ms, 102 ms |
-| ... and the count pushdown off | `w7`, count | B-tree Index Scan, 1,563 ms, 2,559 ms | lion Index Scan, 51 ms, 864 ms |
-| walk off, as above | two phrases, capped | B-tree Index Scan, 1,658 ms, 2,719 ms | lion Index Scan, 128 ms, 143 ms |
-| ... and the count pushdown off | two phrases, count | B-tree Index Scan, 1,684 ms, 2,625 ms | lion Index Scan, 141 ms, 152 ms |
-| skew estimate off | Q8, capped | Bitmap Heap Scan of the (fk, id) B-tree, 2,684 ms, 3,848 ms | walk, set built once, 84 ms, 128 ms |
-| skew estimate off | Q8, count | Bitmap Heap Scan, 2,657 ms, 3,755 ms | walk, set built once, 81 ms, 113 ms |
-| skew estimate off | `w1:* \| w2:* \| w3:*`, capped | walk, set built at each call, 12,772 ms | walk, set built once, 190 ms |
-| skew estimate off | `w1:* \| w2:* \| w3:*`, count | LionCount, 12,711 ms | walk, set built once, 544 ms |
-| skew estimate off | `w7`, count | LionCount, 34 ms | walk, set built once, 125 ms |
-| default | `w7`, capped | walk, 39 ms, 65 ms | lion Index Scan, 26 ms, 104 ms |
-| default | Q8, capped | walk, 527 ms | lion Index Scan, 564 ms |
-| default | `w1:* \| w2:* \| w3:*`, capped | walk, 12,757 ms | walk, set built once, 194 ms |
-
-Where the plan is the same before and after (the count at the default settings, LionCount; `w7 &
-w8` with the walk off, the lion Index Scan) the times are too. In the page around the subquery
-(the `EXISTS`, an anti join, `ORDER BY ... LIMIT 100`), with the skew estimate off, the capped
-count over Q8 took 2,572 ms before and 100 ms after, and the count 2,660 and 91 ms; `w7`'s count
-43 ms after against LionCount's 18. At the default settings Q8's capped count took 130 ms before
-and 99 ms after.
-
-**What is worse.** A walk reads its key's every entry, and where the plan prices the key at core's
-rows - the skew estimate off, or a figure blind to the key - the set built once makes it cheaper
-than the count for a key it reads many times more of: `w7`'s count with the skew estimate off,
-34 ms to 125 ms. Cold, the capped `w7` at the default settings moved from the walk (65 ms) to the
-lion Index Scan (104 ms), which warm is the faster (39 ms to 26). An 8-phrase OR's capped count at
-the default settings went from the walk to the lion Index Scan, 527 ms to 564.
-
-**Not done.**
-
-- A probe of a most common key. The figure is the rows a key outside the MCV list meets (§33, "The
-  rows of a probed key", measured against the workload's probed sets), and a probe of a key in the
-  list is priced at it too, below the rows it meets. The table above is that case: its heavy keys,
-  1 to 16 of 100,000 rows and more, are probed by 16 of the 316 calls. At the default statistics
-  target all of them are in the MCV list, and what the remainder keeps of them is the error of
-  ANALYZE's sampled frequencies against the exact Σn²: six ANALYZEs gave 63, 351, 28, 28, 11,536
-  and 28 against core's 28. At a target of 10 the list holds keys 7 to 16, keys 1 to 6 are left in
-  the remainder, and the figure is 86,314. So the table's figure moves with the statistics target.
-- A prefix union inside a count. With the skew estimate on, `w1:* | w2:* | w3:*`'s count goes to
-  LionCount before and after, and takes 13 s, where core's own plan takes 1.8 s and the walk with
-  the set built once 0.5 s: LionCount's price of the AND of a heavy key with a large OR of prefixes
-  (§29.11) is well under what it costs, which is not this section's to price.
-- The walk's calls are the outer relation's rows before its filter (§40.11's "Not done"), so the
-  set built once is divided among more calls than there are.
-- A parameterized AM scan of a lion index, a join's inner side, keeps core's rows (§39).
-
-**Tests.** test/sql/correlated_skew.sql: the figure; the count priced the same with the AM's plain
-scans on and off; the AM's scan of the lion index chosen at the figure for the capped count and the
-count where core's B-tree scan is chosen at core's rows, and priced below a third of core's plan;
-the AM's scan priced alike under a LIMIT of 21 and of 100,000; the walk's set without the key, with
-the skew estimate off and on, built once for ten calls; the plans with every path on; every answer
-compared with core's plan; and the relations left out - an inheritance parent planned as its Append,
-a parent read alone (`FROM ONLY`) at core's rows, a sampled relation as its Sample Scan, and one
-proven empty by its CHECK constraint, an index path of which fails `cost_index()`'s assertion on
-an assert-enabled build. test/sql/correlated.sql and
-test/sql/skew.sql, whose correlated plans weigh the count against core's scan, turn the walk off
-there.
 
 ## 41. Expression columns in the count pushdown (2026-10-09)
 
@@ -30827,40 +30378,27 @@ Under the first filter the key set holds 3,177 keys and rejects 923,434 of the w
 `setkeys` took it at 179,000, the matches spread over the table's distinct keys at the statistics'
 rate where they crowd on a few (§47.7). The plan is the same either way.
 
-**The feed** (2026-10-28; `oj_keyset_feed()`, `oj_feed_cold()`). A key set's plan runs once, before
-the walk, and reads its table's matching rows whatever the walk's LIMIT. Core's cheapest path of
-the table prices its pages as if cached: `cost_bitmap_heap_scan()` never looks at
+**The feed** (2026-10-28; `oj_keyset_feed()`, `oj_feed_reads()`). A key set's plan runs once,
+before the walk, and reads its table's matching rows whatever the walk's LIMIT. Core's cheapest
+path of the table prices its pages as if cached: `cost_bitmap_heap_scan()` never looks at
 `effective_cache_size`. So a bitmap heap scan that reads most of a large table at random beats a
 covering walk of the key's B-tree (§40) that reads a tenth of the pages in order, and runs several
-times slower when the table is not in the cache. With `pg_lion.competitor_pricing` on, the walk's
-own price carries the bitmap heap scan's cold reads (`lo_cold_price()`, §39) and wins; off, neither
-carries any, and core's cheapest path is the bitmap heap scan.
+times slower when the table is not in the cache - unless the walk's price carries the bitmap heap
+scan's cold reads, which it does (`lo_cold_price()`, §39), and wins.
 
 The node picks the plan itself, among the table's unparameterized paths and a Gather over each of
 its partial ones (core gathers only the cheapest, and `add_path()` may have freed the Gather over a
-parallel walk). Each is ranked at its `total_cost` plus what its reads cost outside the cache, in
-the share of the query's tables and the plan's indexes that `effective_cache_size` cannot hold, at
-the price §39 gives such a page over the `random_page_cost` core charged it:
+parallel walk), at their `total_cost`, as core's `cheapest_total_path` ranks them. The chosen plan
+keeps its own `total_cost` in §47.3's price, and the pages it reads are §47.3's `ownreads` for the
+key set, in place of the table's pages (`oj_feed_reads()`): a lion walk's, LionOrdered or
+LionBtreeScan, serial or under a Gather or Gather Merge (`lion_ordered_scan_reads()`: `lo_cost()`
+taken again); a bitmap heap scan's heap and index pages (`lion_units_bitmap_pages()`); an index
+scan's index pages and its rows' heap pages (`index_pages_fetched()`, those not all-visible where it
+is index-only); and the table's for anything else.
 
-- a lion walk, LionOrdered or LionBtreeScan, serial or under a Gather or Gather Merge
-  (`lion_ordered_scan_reads()`: `lo_cost()` taken again): its B-tree's pages, its set's lion pages
-  and its heap fetches, at `cold_stream_page_cost` where it is index-only and at `cold_page_cost` in
-  heap mode, a synchronous read a member;
-- a bitmap heap scan (`lion_units_bitmap_reads()`, `lion_bitmap_reads()`'s pages): its heap and
-  index pages, at `cold_stream_page_cost`;
-- an index scan, the AM's own plain scan of a lion index among them: the index pages its
-  selectivity reads and its rows' heap pages (`index_pages_fetched()`, those not all-visible where
-  it is index-only), at `cold_page_cost`;
-- anything else - a sequential scan, which reads in order at about the `seq_page_cost` core charges
-  it - nothing.
-
-There is no cap: this only chooses among the table's own plans, all of which the node runs the
-same way. The chosen plan keeps its own `total_cost` in §47.3's price, so the node is still priced
-in core's units, warm, as every other path of the join rel is; the cold reads move which plan is
-the child, never the node's price against core's joins. With `competitor_pricing` on the plans are
-ranked at their `total_cost` alone, as core's `cheapest_total_path` ranks them: a walk's price
-carries the cold weighing already. The pages the chosen plan reads are §47.3's `ownreads` for the
-key set, in place of the table's pages.
+Until 2026-10-29 the plans were also ranked by their own cold reads where
+`pg_lion.competitor_pricing` was off, the walks' prices then carrying none; that went with the
+switch (§49).
 
 **Measured** (2026-10-28; PostgreSQL 18.6 with assertions, 16 vCPU, `shared_buffers` 512 MB,
 `effective_cache_size` 1 GB, `random_page_cost` 1.1, `competitor_pricing` off; core's joins off so
@@ -31720,14 +31258,11 @@ rule: **a lion path is priced by the work it does, in core's units, and core's p
 
 ### The switch (`pg_lion.competitor_pricing`)
 
-On by default, §39 as it was. Off, `lion_competitor_of()` finds the competitor's kind (for the margin,
-which stays a policy) and takes nothing else from it: rate 1, no nested loop's or bitmap heap scan's
-cold reads (`lion_competitor_bitmap_cold()`, `lion_units_scan_cold()`), no Memoize scale, and
-LionOrderedJoin weighs no competitor of its own (`oj_cost()`). A skewed key's rows
-(`lion_skew_param_factor()`, `lion_skew_clauses_factor()`) are core's: lion's paths, the AM's scans
-and the competitors are all priced at core's rows per key. Off is the ablation of §39 in one
-setting; the next step is to run the private workload and the matrix with it off, and keep only what
-moves a plan to a faster one.
+On by default, §39 as it was; off, a lion path took nothing from its competitor but its kind, for
+the margin: no rate, no cold reads, no Memoize scale, no skewed key's rows. It was the ablation of
+§39 in one setting, and is gone with the rates and the skew estimate (§39, "Without the rates");
+the cold reads and the Memoize under a LIMIT stay, unconditionally. The measurements below were
+made with it.
 
 **On the fixtures' shapes at scale** (2026-10-26; PostgreSQL 18.6 release, the shared VM of four
 cores, `shared_buffers` 1 GB, `work_mem` 64 MB, `effective_cache_size` 4 GB; `bench/calib/joins.sql`

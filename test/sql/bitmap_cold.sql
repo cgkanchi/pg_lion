@@ -248,9 +248,9 @@ SELECT q, count(DISTINCT lbc_rows(q, sw)) AS answers
  GROUP BY q ORDER BY q;
 
 -- ---------- 3. the FK-side join ----------
--- A fact of 50,000 rows of 300 bytes over a dimension of 5,000 keys, x of
+-- A fact of 50,000 rows of 600 bytes over a dimension of 5,000 keys, x of
 -- 50 values at random: core's plan is a hash join of the dimension with a
--- bitmap heap scan of the fact's two values, some 1,400 of its 2,200 pages.
+-- bitmap heap scan of the fact's two values, some 1,600 of its 4,200 pages.
 -- The FK-side join, which reads the fact's posting sets alone, loses to it
 -- while the tables fit in the cache and is taken with a cache of a
 -- megabyte; not with the charge off.  (PostgreSQL 19 may aggregate the
@@ -263,7 +263,7 @@ CREATE TABLE lbc_x (fk int8 NOT NULL, x int NOT NULL, pad text)
 	WITH (autovacuum_enabled = off);
 INSERT INTO lbc_x
 SELECT 1 + (i::int8 * 7919) % 5000, (hashint4(i) & 2147483647) % 50,
-	   repeat('y', 300)
+	   repeat('y', 600)
   FROM generate_series(1, 50000) i;
 CREATE INDEX lbc_x_lion ON lbc_x USING lion (x, fk);
 VACUUM (FREEZE, ANALYZE) lbc_d;

@@ -107,7 +107,6 @@ CREATE OR REPLACE FUNCTION soak.rand_gucs() RETURNS text[]
 LANGUAGE plpgsql VOLATILE AS $$
 DECLARE
 	g text[] := '{}';
-	r text;
 BEGIN
 	IF random() < 0.15 THEN g := g || 'work_mem=64kB'::text;
 	ELSIF random() < 0.3 THEN g := g || 'work_mem=1MB'::text; END IF;
@@ -137,7 +136,7 @@ BEGIN
 		IF random() < 0.1 THEN g := g || 'enable_mergejoin=off'::text; END IF;
 		IF random() < 0.1 THEN g := g || 'enable_nestloop=off'::text; END IF;
 	END IF;
-	-- The units and the margin a lion path is priced in (DESIGN.md §39), on a
+	-- The margin and the cold reads a lion path is priced with (DESIGN.md §39), on a
 	-- build that has them: each now and then at a bound or between, so that
 	-- lion's paths are chosen where they never are by default, and not where
 	-- they always are.  No answer may depend on it.
@@ -145,11 +144,9 @@ BEGIN
 		IF random() < 0.4 THEN
 			g := g || ('pg_lion.pushdown_margin=' || soak.pick('{0.01,0.1,0.5,0.99,1,1000}'));
 		END IF;
-		FOREACH r IN ARRAY '{hashagg,agg,hashjoin,mergejoin,bitmap}'::text[] LOOP
-			IF random() < 0.25 THEN
-				g := g || format('pg_lion.%s_rate=%s', r, soak.pick('{0.001,0.05,1,20,1000}'));
-			END IF;
-		END LOOP;
+		IF random() < 0.2 THEN
+			g := g || ('pg_lion.cold_max_discount=' || soak.pick('{1,2,10}'));
+		END IF;
 		IF random() < 0.2 THEN
 			g := g || ('pg_lion.resident_page_cost=' || soak.pick('{0,1,120,100000}'));
 		END IF;
