@@ -1,0 +1,328 @@
+-- LionOrderedJoin with the key sets of an EXISTS joined above it deferred
+-- (DESIGN.md §47.11).
+--
+-- Under a LIMIT the node is also offered with the key set of an EXISTS
+-- joined above it left unbuilt: the semi join above filters the walk's rows,
+-- and the set is built only once the node has returned more rows than the
+-- LIMIT was priced to take.  The EXISTS's table here holds a broad tag, on
+-- the rows of two keys in three, whose set is most of the table's rows to
+-- build for a page met in a hundred and fifty rows, and a late tag, on the
+-- rows of the keys of the fact's lowest scores alone, which the walk meets
+-- last: there the walk runs past the rows it was priced for and builds the
+-- set.  Each query is run as planned and through core's plan with the node
+-- off, and the two answers compared row by row in order; every ORDER BY ends in a unique key.  The
+-- EXISTS is joined above the node's part of the query with join_collapse_limit
+-- at 1, which plans the explicit join on its own, and inside the same join
+-- search at the default.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+SET default_statistics_target = 1000;
+SET work_mem = '64MB';
+CREATE SCHEMA ojdefer;
+SET search_path = ojdefer, public;
+CREATE TABLE dim (
+	pk int PRIMARY KEY,
+	flag bool NOT NULL,			-- lion: a third true
+	rel int NOT NULL,			-- the ORDER BY's third key
+	payload text NOT NULL
+) WITH (autovacuum_enabled = off);
+INSERT INTO dim
+SELECT i, i % 3 = 0,
+	   ((hashint8extended(i::bigint, 7) & 9223372036854775807) % 1000)::int,
+	   repeat(md5(i::text), 4)
+  FROM generate_series(1, 60000) i;
+CREATE INDEX dim_flag ON dim USING lion (flag);
+-- one row per key, 40,000 of the dimension's keys, a score each
+CREATE TABLE fact (
+	fk int PRIMARY KEY,
+	score int NOT NULL,
+	rec text NOT NULL			-- lion: x, y or z
+) WITH (autovacuum_enabled = off);
+INSERT INTO fact
+SELECT k, ((hashint8extended(k::bigint, 4) & 9223372036854775807) % 100000000)::int,
+	   (ARRAY['x', 'y', 'z'])[1 + ((hashint8extended(k::bigint, 5) & 9223372036854775807) % 3)::int]
+  FROM generate_series(1, 40000) k;
+CREATE INDEX fact_score ON fact (score DESC) INCLUDE (fk);
+CREATE INDEX fact_rec ON fact USING lion (rec);
+-- the EXISTS's table: four rows a key, the first tagged 1 where the key is
+-- not a multiple of 5, the second 2 where the key is one of the 400 of the
+-- fact's lowest scores, the third 3 where it is one of the 20,000 of its
+-- lower half; every other row 0
+CREATE TABLE child (fk int NOT NULL, tag int NOT NULL, pad int NOT NULL)
+	WITH (autovacuum_enabled = off);
+INSERT INTO child
+SELECT k, CASE WHEN g = 1 AND k % 5 <> 0 THEN 1
+			   WHEN g = 2 AND r.rank <= 400 THEN 2
+			   WHEN g = 3 AND r.rank <= 20000 THEN 3 ELSE 0 END, g
+  FROM generate_series(1, 60000) k
+  LEFT JOIN (SELECT fk, row_number() OVER (ORDER BY score) AS rank FROM fact) r
+	ON r.fk = k,
+	   generate_series(1, 4) g;
+CREATE INDEX child_fk ON child (fk);
+CREATE INDEX child_tag ON child USING lion (tag);
+VACUUM (FREEZE, ANALYZE) dim;
+VACUUM (FREEZE, ANALYZE) fact;
+VACUUM (FREEZE, ANALYZE) child;
+/*
+ * ojd() runs q as planned and through core's plan (the node off), compares
+ * the two answers in order, and says which node the first plan was and with
+ * which key sets.  Nothing is forced: pricing lion's paths at a thousandth,
+ * as other tests force the node, leaves the semi join's probes above it at
+ * core's price, and the deferred set, whose walk returns more rows for them
+ * to probe, is never taken.  ojd_run() runs q under EXPLAIN ANALYZE and
+ * prints the node's lines asked for.
+ */
+CREATE FUNCTION ojd_kind(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	used boolean := false;
+	split boolean := false;
+	keys text := '';
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionOrderedJoin\)' THEN
+			used := true;
+		END IF;
+		IF ln ~ 'Custom Scan \(LionOrderedSplit\)' THEN
+			split := true;
+		END IF;
+		IF ln ~ '^\s*Key Sets: ' THEN
+			keys := format(' (key sets: %s)', regexp_replace(ln, '^\s*Key Sets: ', ''));
+		END IF;
+	END LOOP;
+	RETURN CASE WHEN split THEN 'LionOrderedSplit' || keys
+				WHEN used THEN 'LionOrderedJoin' || keys
+				ELSE 'core''s plan' END;
+END $$;
+CREATE FUNCTION ojd_plan(q text) RETURNS text
+LANGUAGE sql AS $$ SELECT ojdefer.ojd_kind(q) $$;
+CREATE FUNCTION ojd(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r record;
+	kind text;
+	a text[] := '{}';
+	b text[] := '{}';
+BEGIN
+	kind := ojdefer.ojd_kind(q);
+	FOR r IN EXECUTE q LOOP
+		a := a || r::text;
+	END LOOP;
+
+	PERFORM set_config('pg_lion.enable_ordered_join', 'off', true);
+	FOR r IN EXECUTE q LOOP
+		b := b || r::text;
+	END LOOP;
+	PERFORM set_config('pg_lion.enable_ordered_join', 'on', true);
+
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s rows through the node, %s ordinary; first %s / %s',
+					  coalesce(array_length(a, 1), 0), coalesce(array_length(b, 1), 0),
+					  a[1], b[1]);
+	END IF;
+	RETURN format('%s, %s rows', kind, coalesce(array_length(a, 1), 0));
+END $$;
+CREATE FUNCTION ojd_run(q text, pat text) RETURNS SETOF text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+BEGIN
+	FOR ln IN EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' || q LOOP
+		IF ln ~ pat THEN
+			RETURN NEXT btrim(regexp_replace(ln, '\s*\(actual.*\)', ''));
+		END IF;
+	END LOOP;
+END $$;
+-- 1. The broad tag, the EXISTS joined above the explicit join: the split
+--    with the key set deferred, never built - the page is met long before
+--    the walk reaches the rows it would be built at.
+SET join_collapse_limit = 1;
+SELECT ojd_plan($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                    ojd_plan                     
+-------------------------------------------------
+ LionOrderedSplit (key sets: child c (deferred))
+(1 row)
+
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                            ojd                            
+-----------------------------------------------------------
+ LionOrderedSplit (key sets: child c (deferred)), 100 rows
+(1 row)
+
+SELECT * FROM ojd_run($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$,
+	'^\s*(Key Sets|Key Set Builds|Keys Rejected by Key Sets):');
+           ojd_run            
+------------------------------
+ Key Sets: child c (deferred)
+ Key Set Builds: 0
+ Keys Rejected by Key Sets: 0
+(3 rows)
+
+-- ... ordered by the fact's score, the join's own order, which core's
+--     nested loop over the score's btree walks as well
+SELECT ojd($$SELECT d.pk, d.flag, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY f.score DESC, d.pk LIMIT 100$$);
+          ojd          
+-----------------------
+ core's plan, 100 rows
+(1 row)
+
+-- 2. The same, the EXISTS's table inside the join search: a key set of the
+--    join of the fact and the dimension alone, deferred, the semi join core
+--    plans above it.
+RESET join_collapse_limit;
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                            ojd                            
+-----------------------------------------------------------
+ LionOrderedSplit (key sets: child c (deferred)), 100 rows
+(1 row)
+
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE d.pk IN (SELECT c.fk FROM child c WHERE c.tag = 1)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                            ojd                            
+-----------------------------------------------------------
+ LionOrderedSplit (key sets: child c (deferred)), 100 rows
+(1 row)
+
+SELECT * FROM ojd_run($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE d.pk IN (SELECT c.fk FROM child c WHERE c.tag = 1)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$,
+	'^\s*(Key Sets|Key Set Builds):');
+           ojd_run            
+------------------------------
+ Key Sets: child c (deferred)
+ Key Set Builds: 0
+(2 rows)
+
+-- 3. Late tags: their rows' keys are those of the fact's lowest scores,
+--    which the walk meets last.  Tag 3, half the keys, is priced as met in
+--    about two hundred rows, and the walk is deferred; it returns the rows
+--    it was priced for, and more, then builds the set, and every key past
+--    that is tested before its descent: the same answer, the set built once.
+SET join_collapse_limit = 1;
+SELECT * FROM ojd_run($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 3 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$,
+	'^\s*(Key Sets|Key Set Builds):');
+           ojd_run            
+------------------------------
+ Key Sets: child c (deferred)
+ Key Set Builds: 1
+(2 rows)
+
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 3 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                            ojd                            
+-----------------------------------------------------------
+ LionOrderedSplit (key sets: child c (deferred)), 100 rows
+(1 row)
+
+-- ... tag 2, 400 keys, is priced as the long walk it is: not deferred
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 2 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+          ojd          
+-----------------------
+ core's plan, 100 rows
+(1 row)
+
+RESET join_collapse_limit;
+-- 4. No LIMIT, or the switch off: nothing deferred.
+SET join_collapse_limit = 1;
+SET pg_lion.enable_key_set_defer = off;
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$);
+                      ojd                       
+------------------------------------------------
+ LionOrderedSplit (key sets: child c), 100 rows
+(1 row)
+
+RESET pg_lion.enable_key_set_defer;
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 2 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk$$);
+          ojd          
+-----------------------
+ core's plan, 400 rows
+(1 row)
+
+RESET join_collapse_limit;
+-- 5. A lion index on the fact's key, which key sets fold into (§47.6): a
+--    deferred set is never folded, its keys coming after the walk has begun;
+--    a tag no row has, and the broad tag, the same answers.
+CREATE INDEX fact_fk ON fact USING lion (fk);
+NOTICE:  lion index "fact_fk": column "fk" has about one row per key
+ANALYZE fact;
+SET join_collapse_limit = 1;
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 9 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$) ~ ', 0 rows$';
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 1 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$) ~ ', 100 rows$';
+ ?column? 
+----------
+ t
+(1 row)
+
+SELECT * FROM ojd_run($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 3 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$,
+	'^\s*(Key Sets|Key Set Index):');
+           ojd_run            
+------------------------------
+ Key Sets: child c (deferred)
+(1 row)
+
+SELECT ojd($$SELECT d.pk, d.flag, d.rel, f.score
+	FROM dim d JOIN fact f ON f.fk = d.pk
+	WHERE EXISTS (SELECT 1 FROM child c WHERE c.tag = 3 AND c.fk = d.pk)
+	ORDER BY d.flag DESC, f.score DESC, d.rel DESC, d.pk LIMIT 100$$) ~ ', 100 rows$';
+ ?column? 
+----------
+ t
+(1 row)
+
+RESET join_collapse_limit;
+SET client_min_messages = warning;
+DROP SCHEMA ojdefer CASCADE;
+RESET client_min_messages;
+RESET search_path;

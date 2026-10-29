@@ -952,7 +952,9 @@ working around a bad choice:
   `JOIN`s and the semi joins of its `EXISTS` and `IN` pass `join_collapse_limit` items, or a
   pulled-up subquery's `FROM` list passes `from_collapse_limit`, PostgreSQL may join an `EXISTS`
   or `IN` above the rest of the query; its table is still a key set, and the join above tests the
-  node's rows again (docs/GUIDE.md). Either way a key set's table is joined by the key alone, and
+  node's rows again (docs/GUIDE.md). Under a `LIMIT`, such a key set - or one of an `EXISTS` or
+  `IN` joined above the node in the same join search - may be deferred, built only if the walk
+  runs long (`pg_lion.enable_key_set_defer`, below). Either way a key set's table is joined by the key alone, and
   nothing else of it is wanted. Where the fact's key column has a Lion
   index of its own (scalar, of the key's type, not partial unless the query implies its
   predicate), the key set's keys are also looked up in it
@@ -1046,6 +1048,13 @@ working around a bad choice:
   never fetched; `EXPLAIN` prints `Key Set Index: <index>`. Each join is offered both ways and the
   planner keeps the cheaper: the fold looks every key up before the walk starts. Off, the key sets
   are only tested after each row is read.
+- `pg_lion.enable_key_set_defer` (on by default): under a `LIMIT`, also offer `LionOrderedJoin`
+  and `LionOrderedSplit` with the key set of an `EXISTS` or `IN` that PostgreSQL joins above them
+  deferred (DESIGN.md §47.11): the join above filters the walk's rows, and the set is built only
+  once the walk has returned about twice the rows the `LIMIT` was priced to take, or more where
+  the set is costly to build. A broad `EXISTS`, whose set would read most of its table, then costs
+  the page a few hundred of its probes. `EXPLAIN` prints `(deferred)` after the table in `Key
+  Sets` and `Key Sets Deferred For: <N> rows`. Off, a key set is always built before the walk.
 - `pg_lion.enable_count_slices`: let the count pushdown answer `count(x)`, `sum(x)`, `avg(x)`,
   `min(x)` and `max(x)` of a column a Lion index slices (`slices = on`) from its bit slices
   (DESIGN.md §52): under any `WHERE` the pushdown takes - equalities, `IN`, `IS [NOT] NULL`, `<>`,

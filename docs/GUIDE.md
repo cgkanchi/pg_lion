@@ -594,6 +594,13 @@ only when it is joined by the key alone and nothing else of it is wanted: a tabl
 another column of, or an `EXISTS` that tests more than the key, is never one. The set must also
 fit in `work_mem`, estimated from the distinct keys the key set's table returns.
 
+An `EXISTS` with a broad filter - one most keys pass - is costly as a set built first: its table is
+read almost whole for a page the walk meets in a few hundred rows. Under a `LIMIT`, the planner
+also offers the walk with such a set deferred, whether the `EXISTS` is joined above in another part
+or in the same problem: the semi join above filters the walk's rows, and the set is built only if
+the walk runs well past the rows the `LIMIT` was priced to take (`Key Sets: child c (deferred)`,
+`Key Sets Deferred For: <N> rows`; DESIGN.md §47.11, `pg_lion.enable_key_set_defer`).
+
 When the page is ordered first by a column of the dimension with few values, and then by the
 fact's B-tree, no B-tree gives the order, and PostgreSQL joins every row of both filters and sorts:
 
