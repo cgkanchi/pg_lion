@@ -42,6 +42,7 @@
 
 bool		lion_enable_ordered_join = true;
 static bool lion_enable_key_set_fold = true;
+static bool lion_enable_key_set_defer = true;
 static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 
 /*
@@ -70,6 +71,9 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
  *	OJ_PRIV_EXECUTE	OidList: the functions of the join's clauses, which the
  *					plan the node replaces would check EXECUTE on and the
  *					node does not initialise (oj_execute_functions())
+ *	OJ_PRIV_DEFER	IntList: the rows the node returns before it builds its
+ *					deferred key sets (§47.11), then for each key set 1
+ *					where it is deferred, 0 where it is built before the walk
  *
  * custom_plans are the fact's walk, the dimension's probe and each key set's
  * plan, in that order; custom_scan_tlist is the fact's target list followed by
@@ -86,7 +90,8 @@ static set_join_pathlist_hook_type oj_prev_set_join_pathlist_hook = NULL;
 #define OJ_PRIV_FOLD		5
 #define OJ_PRIV_ITUP		6
 #define OJ_PRIV_EXECUTE		7
-#define OJ_PRIV_NMEMBERS	8
+#define OJ_PRIV_DEFER		8
+#define OJ_PRIV_NMEMBERS	9
 
 static Plan *oj_plan_path(PlannerInfo *root, RelOptInfo *rel,
 						  CustomPath *best_path, List *tlist,
@@ -224,6 +229,10 @@ typedef struct OjJoin
 								 * (oj_keysets_above()) */
 	double		aboverep;		/* ... a row the key sets keep */
 	bool		alone;			/* alone under the LIMIT (oj_alone()) */
+	bool		defer;			/* the key sets above are deferred: built
+								 * only once the node has returned deferat
+								 * rows (§47.11) */
+	double		deferat;		/* ... that many, set per path */
 	IndexOptInfo *keyidx;		/* the fact key's lion index the key sets
 								 * fold into (oj_key_index()), or NULL */
 	int			keycol;			/* ... the key's column in it, 0-based */
@@ -1055,9 +1064,17 @@ oj_search_relids(PlannerInfo *root)
  * taken, the node's (oj_cost(), os_cost()) and its competitors'
  * (oj_competitor()); the tables are not counted against the node's being
  * alone under the LIMIT (oj_alone()).
+ *
+ * With `insearch`, for the paths whose key sets above are deferred
+ * (DESIGN.md §47.11), a table inside the join search is taken too where it
+ * is the whole inner side of a semi join above joinrel: an EXISTS or an IN
+ * the search joins to joinrel's rows later, by the same rules.  Built first,
+ * such a set would only repeat the key set of the larger join rel that holds
+ * the table (oj_keyset_of()); deferred, the semi join is the filter.
  */
 static void
-oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
+oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
+				 bool insearch)
 {
 	ListCell   *lc;
 	Relids		search;
@@ -1095,7 +1112,8 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 		bool		semi = false;
 		OjKeySet   *ks;
 
-		if (x == NULL || bms_is_member(relid, search))
+		if (x == NULL || bms_is_member(relid, joinrel->relids) ||
+			(!insearch && bms_is_member(relid, search)))
 			continue;
 		foreach(lc, root->join_info_list)
 		{
@@ -1110,7 +1128,9 @@ oj_keysets_above(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 				bms_equal(sjinfo->syn_righthand, x->relids) &&
 				bms_is_subset(joinrel->relids, sjinfo->syn_lefthand);
 		}
-		if (!ok || (ks = oj_keyset_above(root, j, x)) == NULL)
+		/* a table of the search: the inner side of a semi join alone */
+		if (!ok || (bms_is_member(relid, search) && !semi) ||
+			(ks = oj_keyset_above(root, j, x)) == NULL)
 			continue;
 		j->keysets = lappend(j->keysets, ks);
 		if (!semi)
@@ -1408,6 +1428,18 @@ oj_limit_share(PlannerInfo *root, const OjJoin *j, double rows)
 }
 
 /*
+ * The rows the joins of the key sets above return a row of the node: one or
+ * more for each it keeps (j->aboverep); and where those key sets are deferred
+ * (DESIGN.md §47.11), the node keeps every row, and the joins above return
+ * j->abovepass of a row for each, the share they keep with them.
+ */
+static double
+oj_above_rows(const OjJoin *j)
+{
+	return j->defer ? j->abovepass : j->aboverep;
+}
+
+/*
  * Is p core's nested loop over the fact's LionOrdered walk - its outer side,
  * under a projection, a LionOrdered path of fact, and its inner side free of
  * lion's paths?  *walk is that walk.
@@ -1674,6 +1706,9 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	{
 		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
 
+		/* deferred (§47.11): the join above it is the filter */
+		if (j->defer && ks->above)
+			continue;
 		startup += ks->path->total_cost + ks->rows * cpu_operator_cost;
 		run += descents * cpu_operator_cost;
 		if (fold)
@@ -1762,7 +1797,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 	 * hard stop has its own stricter rule (lo_limit(), the node the query
 	 * level's only table), which this is not.
 	 */
-	*share = oj_limit_share(root, j, out * j->aboverep);
+	*share = oj_limit_share(root, j, out * oj_above_rows(j));
 
 	/*
 	 * The members the key sets reject, fetched for nothing where they are
@@ -1828,7 +1863,12 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 				index_pages_fetched(s * members, dim->pages, idxpages, root) +
 				factlionpages + ds->lionpages;
 			foreach(lc, j->keysets)
-				ownreads += ((OjKeySet *) lfirst(lc))->reads;
+			{
+				OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+
+				if (!(j->defer && ks->above))
+					ownreads += ks->reads;
+			}
 
 			u.nlcold = corereads * perpage;
 			u.coldpage = perpage;
@@ -1858,6 +1898,72 @@ oj_execute_functions(const OjJoin *j)
 		funcs = list_append_unique_oid(funcs,
 									   get_opcode(((OjKeySet *) lfirst(lc))->clauseop));
 	return funcs;
+}
+
+/*
+ * The rows the node returns before it builds its deferred key sets
+ * (DESIGN.md §47.11), into j->deferat, for a path priced at startup and total
+ * for rows: twice the rows the LIMIT is expected to take of it - the joins
+ * above keeping abovepass of them - or, where it is more, the rows that cost
+ * what the sets' plans do, as a lazy set builds itself once its probes have
+ * cost what the build would (§30.4).  A row costs its share of the node's run
+ * and, for each deferred set, the join above's test of it: the cheapest
+ * parameterized path of the set's table, a probe of its key, or a
+ * cpu_operator_cost where it has none (a hash join's probe).  A walk the
+ * joins above keep fewer rows of than they were priced at is then given up
+ * on, at about twice its price, for the walk the built sets filter.
+ */
+static void
+oj_defer_at(PlannerInfo *root, OjJoin *j, double rows, Cost startup,
+			Cost total)
+{
+	double		need = root->limit_tuples / Max(j->abovepass, 1e-10);
+	double		perrow = (total - startup) / Max(rows, 1.0);
+	Cost		build = 0.0;
+	ListCell   *lc;
+
+	foreach(lc, j->keysets)
+	{
+		OjKeySet   *ks = (OjKeySet *) lfirst(lc);
+		Cost		probe = -1.0;
+		ListCell   *lcp;
+
+		if (!ks->above)
+			continue;
+		build += ks->path->total_cost + ks->rows * cpu_operator_cost;
+		foreach(lcp, ks->rel->pathlist)
+		{
+			Path	   *p = (Path *) lfirst(lcp);
+
+			if (p->param_info != NULL &&
+				(probe < 0.0 || p->total_cost < probe))
+				probe = p->total_cost;
+		}
+		perrow += (probe < 0.0) ? cpu_operator_cost : probe;
+	}
+	j->deferat = Max(2.0 * need, 1.0);
+	if (perrow > 0.0)
+		j->deferat = Max(j->deferat, build / perrow);
+	j->deferat = Min(j->deferat, (double) PG_INT32_MAX);
+}
+
+/*
+ * The plan's OJ_PRIV_DEFER (DESIGN.md §47.11): the rows before the deferred
+ * key sets are built, and for each key set whether it is one - none where
+ * the path defers nothing.
+ */
+static List *
+oj_defer_info(const OjJoin *j)
+{
+	List	   *info;
+	ListCell   *lc;
+
+	if (!j->defer)
+		return NIL;
+	info = list_make1_int((int) j->deferat);
+	foreach(lc, j->keysets)
+		info = lappend_int(info, ((OjKeySet *) lfirst(lc))->above ? 1 : 0);
+	return info;
 }
 
 /*
@@ -1958,6 +2064,7 @@ oj_join_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 									NIL,
 									itup);
 	cp->custom_private = lappend(cp->custom_private, oj_execute_functions(j));
+	cp->custom_private = lappend(cp->custom_private, oj_defer_info(j));
 	cp->methods = &lion_ordjoin_path_methods;
 	return cp;
 }
@@ -2041,6 +2148,8 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 	oj_cost(root, joinrel, j, &ds, ord, factstartup, facttotal, factrows,
 			factfetches, factlionpages, fold, comp, 1.0, &rows, &probes,
 			&share, &startup, &total);
+	if (j->defer)
+		oj_defer_at(root, j, rows, startup, total);
 
 	/*
 	 * Not alone under the LIMIT (oj_alone(), DESIGN.md §47.10): the first
@@ -2055,9 +2164,10 @@ oj_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
 					  iocols, fold, share, clamp_row_est(probes * share),
 					  factrows, factstartup, facttotal, ds.build, rows,
 					  startup / margin, total / margin);
-	elog(DEBUG2, "lion: a LionOrderedJoin path over %s%s, %.2f..%.2f for %.0f rows",
+	elog(DEBUG2, "lion: a LionOrderedJoin path over %s%s%s, %.2f..%.2f for %.0f rows",
 		 get_rel_name(ord->indexinfo->indexoid),
-		 fold ? ", key sets folded" : "", cp->path.startup_cost,
+		 fold ? ", key sets folded" : "",
+		 j->defer ? ", key sets above deferred" : "", cp->path.startup_cost,
 		 cp->path.total_cost, rows);
 
 	/* a walk of an index and descents of another, as index scans are */
@@ -2322,7 +2432,7 @@ os_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	double		dimpages = (double) j->dim->pages;
 	double		setbytes = 0.0;
 	double		limit = j->alone && root->limit_tuples > 0 ?
-		root->limit_tuples / j->aboverep : -1.0;
+		root->limit_tuples / oj_above_rows(j) : -1.0;
 	double		need = limit;
 	double		rows = 0.0;
 	double		spc_random;
@@ -2449,6 +2559,8 @@ os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 	os_cost(root, joinrel, j, sp, &ds, ord, factstartup, facttotal, factrows,
 			factfetches, factlionpages, fold, comp, &rows, &factweight,
 			&dimweight, &startup, &total, &armstartup, &armtotal);
+	if (j->defer)
+		oj_defer_at(root, j, rows, startup, total);
 
 	child = oj_join_path(root, joinrel, j, ord, joinkeys, factlion, dimlion,
 						 iocols, fold, factweight, clamp_row_est(dimweight),
@@ -2476,10 +2588,11 @@ os_add_path(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 								  lion_ordered_split_max),
 				   list_make1_oid(sp->index->indexoid));
 	cp->methods = &lion_ordsplit_path_methods;
-	elog(DEBUG2, "lion: a LionOrderedSplit path over %s by %s%s, %d arms, %.2f..%.2f for %.0f rows",
+	elog(DEBUG2, "lion: a LionOrderedSplit path over %s by %s%s%s, %d arms, %.2f..%.2f for %.0f rows",
 		 get_rel_name(ord->indexinfo->indexoid),
 		 get_rel_name(sp->index->indexoid),
-		 fold ? ", key sets folded" : "", sp->arms.n,
+		 fold ? ", key sets folded" : "",
+		 j->defer ? ", key sets above deferred" : "", sp->arms.n,
 		 cp->path.startup_cost, cp->path.total_cost, rows);
 
 	/* a walk of two indexes and descents of a third, as index scans are */
@@ -2584,7 +2697,9 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 			{
 				int			fold;
 
-				for (fold = 0; fold <= (j->keyidx != NULL ? 1 : 0); fold++)
+				/* never with a key set deferred, whose keys come late */
+				for (fold = 0; fold <= (j->keyidx != NULL && !j->defer ? 1 : 0);
+					 fold++)
 					os_add_path(root, joinrel, j, sp, ord,
 								(List *) lfirst(lcj), pathkeys,
 								&comps[foreach_current_index(lc)],
@@ -2596,58 +2711,25 @@ os_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, OsSplit *sp,
 }
 
 /*
- * The paths of a join j recognized in joinrel: one for each ordered btree of
- * the fact whose order the query wants, with each of the fact's lion accesses
- * and each of the dimension's - every pair is priced and add_path() keeps
- * what it keeps.  A side without a lion access is walked or probed with no
- * set, every row it meets filtered; one side has a set, or a key set
- * filters.  An ORDER BY that leads with a column of the dimension is the
- * split's (os_add_paths(), §48), whose arms narrow the dimension by the
- * column's entries, a set of their own; where a column of the fact is in the
- * same class, both are offered and add_path() keeps what it keeps.  Each is
- * priced for the LIMIT only where the join is alone under it (oj_alone(),
- * §47.10), and as the whole walk elsewhere.  The join rel's target is plain
- * columns of its tables: the fact's and the dimension's, and a key set's key
- * where oj_keyset_of() let it be.  Where the fact's key has a lion index the
- * key sets fold into (oj_key_index(), §47.6), each pair is offered twice,
- * the key sets folded into the fact's set and tested after its fetches, and
- * add_path() keeps what it keeps: the fold reads every key's postings before
- * the walk, which a page met in a few entries does not pay back.
+ * The paths of the join j (oj_add_paths()), with its key sets as j holds
+ * them: the split's (os_add_paths()) where sp is not NULL, and one for each
+ * of the fact's orders the query wants, each of the fact's lion accesses and
+ * each of the dimension's - folded too where the fact's key has a lion index
+ * and nothing is deferred.
  */
 static void
-oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
+oj_add_paths_for(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j,
+				 List *ords, OsSplit *sp, List *factcands, List *dimcands,
+				 bool anyset)
 {
-	List	   *ords;
-	List	   *factcands;
-	List	   *dimcands;
 	List	   *keys = NIL;
 	OjCompetitor *comps;
-	OsSplit		sp;
-	bool		split;
-	bool		anyset;
+	int			maxfold = (j->keyidx != NULL && !j->defer) ? 1 : 0;
 	ListCell   *lc;
 	ListCell   *lck;
 
-	if (!bms_is_empty(joinrel->lateral_relids) ||
-		!oj_target_ok(joinrel, joinrel->relids))
-		return;
-	oj_keysets_above(root, joinrel, j);
-	j->alone = oj_alone(root, joinrel, j);
-	j->keyidx = oj_key_index(j, &j->keycol);
-	ords = lion_ordered_orders(j->fact);
-	split = os_split_of(root, j, &sp);
-	if (ords == NIL && !split)
-		return;
-	factcands = lion_ordered_accesses(root, j->fact);
-	dimcands = lion_ordered_accesses(root, j->dim);
-	anyset = (factcands != NIL || dimcands != NIL || j->keysets != NIL);
-	if (factcands == NIL)
-		factcands = list_make1(NULL);
-	if (dimcands == NIL)
-		dimcands = list_make1(NULL);
-
-	if (split)
-		os_add_paths(root, joinrel, j, &sp, factcands, dimcands);
+	if (sp != NULL)
+		os_add_paths(root, joinrel, j, sp, factcands, dimcands);
 	if (ords == NIL || !anyset)
 		return;
 
@@ -2690,7 +2772,7 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 			{
 				int			fold;
 
-				for (fold = 0; fold <= (j->keyidx != NULL ? 1 : 0); fold++)
+				for (fold = 0; fold <= maxfold; fold++)
 					oj_add_path(root, joinrel, j, ord, pathkeys,
 								&comps[foreach_current_index(lc)],
 								(Path *) lfirst(lc2), (Path *) lfirst(lc3),
@@ -2698,6 +2780,84 @@ oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
 			}
 		}
 	}
+}
+
+/*
+ * The paths of a join j recognized in joinrel: one for each ordered btree of
+ * the fact whose order the query wants, with each of the fact's lion accesses
+ * and each of the dimension's - every pair is priced and add_path() keeps
+ * what it keeps.  A side without a lion access is walked or probed with no
+ * set, every row it meets filtered; one side has a set, or a key set
+ * filters.  An ORDER BY that leads with a column of the dimension is the
+ * split's (os_add_paths(), §48), whose arms narrow the dimension by the
+ * column's entries, a set of their own; where a column of the fact is in the
+ * same class, both are offered and add_path() keeps what it keeps.  Each is
+ * priced for the LIMIT only where the join is alone under it (oj_alone(),
+ * §47.10), and as the whole walk elsewhere.  The join rel's target is plain
+ * columns of its tables: the fact's and the dimension's, and a key set's key
+ * where oj_keyset_of() let it be.  Where the fact's key has a lion index the
+ * key sets fold into (oj_key_index(), §47.6), each pair is offered twice,
+ * the key sets folded into the fact's set and tested after its fetches, and
+ * add_path() keeps what it keeps: the fold reads every key's postings before
+ * the walk, which a page met in a few entries does not pay back.
+ *
+ * Under a LIMIT, the paths are offered again with the key sets above
+ * deferred (§47.11) - those of tables outside the join search, and the
+ * EXISTS and IN of tables inside it that are joined above joinrel - where
+ * there is one and the join is then alone under the LIMIT: the joins above
+ * filter the node's rows, and the sets are built only if the walk runs on
+ * past the rows the LIMIT was priced to take.
+ */
+static void
+oj_add_paths(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j)
+{
+	List	   *ords;
+	List	   *factcands;
+	List	   *dimcands;
+	List	   *inrel = NIL;
+	OsSplit		sp;
+	bool		split;
+	bool		anyset;
+	bool		anyabove = false;
+	ListCell   *lc;
+
+	if (!bms_is_empty(joinrel->lateral_relids) ||
+		!oj_target_ok(joinrel, joinrel->relids))
+		return;
+	inrel = list_copy(j->keysets);
+	oj_keysets_above(root, joinrel, j, false);
+	j->alone = oj_alone(root, joinrel, j);
+	j->keyidx = oj_key_index(j, &j->keycol);
+	ords = lion_ordered_orders(j->fact);
+	split = os_split_of(root, j, &sp);
+	if (ords == NIL && !split)
+		return;
+	factcands = lion_ordered_accesses(root, j->fact);
+	dimcands = lion_ordered_accesses(root, j->dim);
+	anyset = (factcands != NIL || dimcands != NIL || j->keysets != NIL);
+	if (factcands == NIL)
+		factcands = list_make1(NULL);
+	if (dimcands == NIL)
+		dimcands = list_make1(NULL);
+
+	oj_add_paths_for(root, joinrel, j, ords, split ? &sp : NULL, factcands,
+					 dimcands, anyset);
+
+	/* again with the key sets above deferred, the search's own among them */
+	if (!lion_enable_key_set_defer || root->limit_tuples <= 0)
+		return;
+	j->keysets = inrel;
+	oj_keysets_above(root, joinrel, j, true);
+	foreach(lc, j->keysets)
+		anyabove = anyabove || ((OjKeySet *) lfirst(lc))->above;
+	if (!anyabove)
+		return;
+	j->defer = true;
+	j->alone = oj_alone(root, joinrel, j);
+	if (j->alone)
+		oj_add_paths_for(root, joinrel, j, ords, split ? &sp : NULL,
+						 factcands, dimcands, true);
+	j->defer = false;
 }
 
 /*
@@ -2817,6 +2977,7 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 	List	   *fold = (List *) lfourth(best_path->custom_private);
 	List	   *itup = (List *) list_nth(best_path->custom_private, 4);
 	List	   *execfuncs = (List *) list_nth(best_path->custom_private, 5);
+	List	   *defer = (List *) list_nth(best_path->custom_private, 6);
 	int			itupcol = (itup != NIL) ?
 		linitial_int((List *) lsecond(itup)) : 0;
 	List	   *sctlist = NIL;
@@ -2917,6 +3078,7 @@ oj_plan_path(PlannerInfo *root, RelOptInfo *rel, CustomPath *best_path,
 									list_copy((List *) linitial(itup)) : NIL);
 	cscan->custom_private = lappend(cscan->custom_private,
 									list_copy(execfuncs));
+	cscan->custom_private = lappend(cscan->custom_private, list_copy(defer));
 	cscan->methods = &oj_scan_methods;
 	return &cscan->scan.plan;
 }
@@ -2978,6 +3140,8 @@ typedef struct OjKeySetState
 	ojkeys_hash *keys;			/* NULL: not built for this scan */
 	uint64		nkeys;			/* EXPLAIN ANALYZE: the last build's keys */
 	uint64		builds;
+	bool		deferred;		/* built once the node has returned deferat
+								 * rows (§47.11) */
 } OjKeySetState;
 
 /* ---------------------------------------------------------------------
@@ -3001,6 +3165,9 @@ typedef struct OjState
 								 * the key sets are tested on, or InvalidOid */
 	MemoryContext testcxt;		/* ... that test's, reset an entry */
 	uint64		rejected;		/* EXPLAIN ANALYZE: keys no key set holds */
+	uint64		deferat;		/* the rows before the deferred key sets are
+								 * built (§47.11), 0 where none is */
+	uint64		returned;		/* the rows returned, over every rescan */
 } OjState;
 
 static Node *
@@ -3060,6 +3227,7 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	List	   *fold;
 	List	   *itup;
 	List	   *execfuncs;
+	List	   *defer;
 	AttrNumber	itupcol;
 	int			ncols = list_length(cscan->custom_scan_tlist);
 	int			i;
@@ -3075,6 +3243,7 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 	fold = (List *) list_nth(cscan->custom_private, OJ_PRIV_FOLD);
 	itup = (List *) list_nth(cscan->custom_private, OJ_PRIV_ITUP);
 	execfuncs = (List *) list_nth(cscan->custom_private, OJ_PRIV_EXECUTE);
+	defer = (List *) list_nth(cscan->custom_private, OJ_PRIV_DEFER);
 	if (ints == NIL || !IsA(ints, IntList) || list_length(ints) != 5 ||
 		linitial_int(ints) != OJ_PRIV_MAGIC ||
 		index == NIL || !IsA(index, OidList) || list_length(index) != 1 ||
@@ -3114,8 +3283,12 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 		(itup != NIL) != (itupcol > 0) ||
 		(itup != NIL &&
 		 (!IsA(itup, OidList) || list_length(itup) != 1 ||
-		  st->nkeysets < 1 || fold != NIL)))
+		  st->nkeysets < 1 || fold != NIL)) ||
+		(defer != NIL &&
+		 (!IsA(defer, IntList) || list_length(defer) != 1 + st->nkeysets ||
+		  linitial_int(defer) < 1 || fold != NIL)))
 		elog(ERROR, "LionOrderedJoin: malformed plan");
+	st->deferat = (defer != NIL) ? (uint64) linitial_int(defer) : 0;
 	st->keyindex = (fold != NIL) ? linitial_oid(fold) : InvalidOid;
 	st->itupindex = (itup != NIL) ? linitial_oid(itup) : InvalidOid;
 
@@ -3144,6 +3317,7 @@ oj_begin(CustomScanState *node, EState *estate, int eflags)
 
 		ks->child = ExecInitNode(plan, estate, eflags);
 		node->custom_ps = lappend(node->custom_ps, ks->child);
+		ks->deferred = (defer != NIL && list_nth_int(defer, 1 + i) != 0);
 		ks->col = (AttrNumber) list_nth_int(keycols, i);
 		if (ks->col < 1 || ks->col > list_length(plan->targetlist))
 			elog(ERROR, "LionOrderedJoin: malformed key set");
@@ -3284,6 +3458,14 @@ oj_exec(CustomScanState *node)
 	{
 		if (st->keysets[i].keys == NULL)
 		{
+			/*
+			 * Deferred (§47.11): the join above filters the rows until the
+			 * walk has run past the rows the LIMIT was priced to take.  An
+			 * empty set built then ends the scan as one built first does:
+			 * the join above drops every row it would have returned.
+			 */
+			if (st->keysets[i].deferred && st->returned < st->deferat)
+				continue;
 			oj_keyset_build(&st->keysets[i], econtext);
 			if (OidIsValid(st->keyindex))
 				lion_ordered_keyset_keys(st->fact, i,
@@ -3319,6 +3501,9 @@ oj_exec(CustomScanState *node)
 		oldcxt = MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
 		for (i = 0; i < st->nkeysets; i++)
 		{
+			/* deferred, not built yet: the join above tests the row */
+			if (st->keysets[i].keys == NULL)
+				continue;
 			if (ojkeys_lookup(st->keysets[i].keys, key) == NULL)
 				break;
 		}
@@ -3358,6 +3543,9 @@ oj_exec(CustomScanState *node)
 			scanslot->tts_isnull[i] = false;
 		}
 		ExecStoreVirtualTuple(scanslot);
+
+		/* at deferat, the next row's call builds the deferred sets */
+		st->returned++;
 
 		if (node->ss.ps.ps_ProjInfo == NULL)
 			return scanslot;
@@ -3481,8 +3669,15 @@ oj_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 				oj_explain_rel(&buf, key->varno, es);
 			else
 				appendStringInfoString(&buf, "???");
+			if (st->keysets[i].deferred)
+				appendStringInfoString(&buf, " (deferred)");
 		}
 		ExplainPropertyText("Key Sets", buf.data, es);
+
+		/* the rows before the deferred ones are built (§47.11) */
+		if (st->deferat > 0)
+			ExplainPropertyInteger("Key Sets Deferred For", "rows",
+								   (int64) st->deferat, es);
 
 		/* the fact key's lion index they are folded into (§47.6) */
 		if (OidIsValid(st->keyindex))
@@ -3852,6 +4047,15 @@ lion_ordjoin_init(void)
 							 "Offer LionOrderedJoin's key sets folded into the fact's walk where the fact's key has a lion index.",
 							 "The walk's set is then the rows of the key sets' keys, and an entry a key set rejects is never fetched.",
 							 &lion_enable_key_set_fold,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("pg_lion.enable_key_set_defer",
+							 "Offer LionOrderedJoin with the key sets of an EXISTS or IN joined above it deferred, under a LIMIT.",
+							 "The join above then filters the walk's rows, and the key sets are built only if the walk runs past twice the rows the LIMIT was priced to take.",
+							 &lion_enable_key_set_defer,
 							 true,
 							 PGC_USERSET,
 							 0,
