@@ -197,8 +197,9 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and joins or groups them; with their 11,250 rows it counts
--- them from the index.
+-- an index scan and joins or groups them; with their 11,250 rows it reads
+-- them by a bitmap scan and hashes the join, and counts the top k from the
+-- index.
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
 EXPLAIN (COSTS OFF)

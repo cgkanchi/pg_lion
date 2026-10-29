@@ -565,16 +565,16 @@ SELECT lion_cf('SELECT count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1
 
 -- a WHERE the one partition left implies, beside a clause it does not: on a
 -- table this small one pass over the rows is the cheaper plan, unless the
--- margin says otherwise (DESIGN.md §39)
+-- margin says otherwise (DESIGN.md §39).  The bitmap scans and the AM's plain
+-- scans are off, so that the pass is what the count competes with: the
+-- margin does not apply against the AM's own scans, nor against a plan
+-- every scan of which is disabled.
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET pg_lion.pushdown_margin = 4;
-SELECT lion_cf('SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
-     lion_cf      
-------------------
- pushdown, 1 rows
-(1 row)
-
-SELECT lion_cf_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
-                          lion_cf_plan                           
+EXPLAIN (COSTS OFF)
+SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
+                           QUERY PLAN                            
 -----------------------------------------------------------------
  Custom Scan (LionCount)
    Partitions: lion_cfpt0
@@ -583,7 +583,24 @@ SELECT lion_cf_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cf
    Implied by Partition Bounds: (g = ANY ('{0,1,2}'::integer[]))
 (5 rows)
 
+SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
+ count | count | count 
+-------+-------+-------
+   185 |   369 |   739
+(1 row)
+
 RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+-- the same counts without the node
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
+ count | count | count 
+-------+-------+-------
+   185 |   369 |   739
+(1 row)
+
+RESET pg_lion.enable_count_pushdown;
 SELECT lion_cf('SELECT g, count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1 ELSE 0 END), count(*) FROM lion_cfpt GROUP BY g');
      lion_cf      
 ------------------
