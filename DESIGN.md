@@ -23147,8 +23147,9 @@ and a Memoize's misses under a LIMIT ("A Memoize under a LIMIT"). Why:
   pricing the node's own work, not its competitor's.
 - In the regression suite, an FK-side `count(DISTINCT)` GROUP BY went to a hash join, the faster
   plan (0.47 ms against 0.64), and a count of a position filter at a hundred keys went to a hash
-  join, the slower (3.2 ms against 1.4); so did `index_mcv.sql`'s FK-side GROUP BY over 11,250 rows,
-  a near tie (5.8 ms against the node's 4.5, release build); the bitmap heap scan test's FK-side join needed a wider
+  join, the slower (3.2 ms against 1.4); so did `index_mcv.sql`'s FK-side GROUP BY over 11,250 rows
+  on PostgreSQL 16 and 18, while 19 keeps the node (5.8 ms against the node's 4.5,
+  release build), so that test no longer shows its plan; the bitmap heap scan test's FK-side join needed a wider
   fact for its cold reads to tip it; and the count against the AM's own scan of the same sets is
   pinned through `cpu_operator_cost`, the rates having been the one lever that moved the count's
   price without the scan's.

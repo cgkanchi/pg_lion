@@ -273,9 +273,10 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and joins or groups them; with their 11,250 rows it reads
--- them by a bitmap scan and hashes the join, and counts the top k from the
--- index.
+-- an index scan and groups them; with their 11,250 rows it counts the top k
+-- from the index.  (The join of those rows to their owners goes to a hash
+-- join or to the FK-side join depending on the major, and the two run within
+-- a third of each other; only its answers are checked, below.)
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
                          QUERY PLAN                          
@@ -285,23 +286,6 @@ EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
    ->  Bitmap Index Scan on events_lion
          Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
 (4 rows)
-
-EXPLAIN (COSTS OFF)
-SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
- WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
-                               QUERY PLAN                                
--------------------------------------------------------------------------
- HashAggregate
-   Group Key: o.region
-   ->  Hash Join
-         Hash Cond: (e.owner_id = o.id)
-         ->  Bitmap Heap Scan on events e
-               Recheck Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
-               ->  Bitmap Index Scan on events_lion
-                     Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
-         ->  Hash
-               ->  Index Scan using owners_pkey on owners o
-(10 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
@@ -324,24 +308,6 @@ EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
  Index Scan using events_lion on events
    Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
 (2 rows)
-
-EXPLAIN (COSTS OFF)
-SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
- WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
-                                  QUERY PLAN                                   
--------------------------------------------------------------------------------
- GroupAggregate
-   Group Key: o.region
-   ->  Sort
-         Sort Key: o.region
-         ->  Merge Join
-               Merge Cond: (e.owner_id = o.id)
-               ->  Sort
-                     Sort Key: e.owner_id
-                     ->  Index Scan using events_lion on events e
-                           Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
-               ->  Index Scan using owners_pkey on owners o
-(11 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
