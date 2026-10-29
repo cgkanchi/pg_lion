@@ -296,11 +296,23 @@ UPDATE lion_cfpt SET a = 0 WHERE b = 3 AND a = 2;
 SELECT lion_cf('SELECT count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1 END), count(*) FROM lion_cfpt');
 -- a WHERE the one partition left implies, beside a clause it does not: on a
 -- table this small one pass over the rows is the cheaper plan, unless the
--- margin says otherwise (DESIGN.md §39)
+-- margin says otherwise (DESIGN.md §39).  The bitmap scans and the AM's plain
+-- scans are off, so that the pass is what the count competes with: the
+-- margin does not apply against the AM's own scans, nor against a plan
+-- every scan of which is disabled.
+SET enable_bitmapscan = off;
+SET pg_lion.enable_plain_scan = off;
 SET pg_lion.pushdown_margin = 4;
-SELECT lion_cf('SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
-SELECT lion_cf_plan('SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1');
+EXPLAIN (COSTS OFF)
+SELECT count(*) FILTER (WHERE b = 1), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
+SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
 RESET pg_lion.pushdown_margin;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+-- the same counts without the node
+SET pg_lion.enable_count_pushdown = off;
+SELECT count(*) FILTER (WHERE b = 1), count(*) FILTER (WHERE b IN (2, 3)), count(*) FROM lion_cfpt WHERE g IN (0, 1, 2) AND a = 1;
+RESET pg_lion.enable_count_pushdown;
 SELECT lion_cf('SELECT g, count(*) FILTER (WHERE a = 1), sum(CASE WHEN b = 2 THEN 1 ELSE 0 END), count(*) FROM lion_cfpt GROUP BY g');
 SELECT lion_cf('SELECT a, count(*) FILTER (WHERE b IN (1, 2)) FROM lion_cfpt WHERE g <> 4 GROUP BY a');
 

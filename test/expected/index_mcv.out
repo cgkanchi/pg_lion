@@ -273,8 +273,9 @@ SELECT what, s.*
 
 -- ---------- 9. plans ----------
 -- The planner that expected 34 rows of five heavy values reads them through
--- an index scan and joins or groups them; with their 11,250 rows it counts
--- them from the index.
+-- an index scan and joins or groups them; with their 11,250 rows it reads
+-- them by a bitmap scan and hashes the join, and counts the top k from the
+-- index.
 SET enable_seqscan = off;
 EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
                          QUERY PLAN                          
@@ -288,16 +289,19 @@ EXPLAIN (COSTS OFF) SELECT * FROM events WHERE kind IN (1, 2, 3, 4, 5);
 EXPLAIN (COSTS OFF)
 SELECT o.region, count(*) FROM events e JOIN owners o ON e.owner_id = o.id
  WHERE e.kind IN (1, 2, 3, 4, 5) GROUP BY o.region;
-                                                       QUERY PLAN                                                       
-------------------------------------------------------------------------------------------------------------------------
- Finalize HashAggregate
+                               QUERY PLAN                                
+-------------------------------------------------------------------------
+ HashAggregate
    Group Key: o.region
-   ->  Custom Scan (LionCount)
-         Lion Indexes: events_lion.owner_id (owner_id = o.id), events_lion.kind (kind = ANY ('{1,2,3,4,5}'::integer[]))
-         Join Key Lookups: in index order
-         Fact Filters: collected once
-         ->  Index Scan using owners_pkey on owners o
-(7 rows)
+   ->  Hash Join
+         Hash Cond: (e.owner_id = o.id)
+         ->  Bitmap Heap Scan on events e
+               Recheck Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
+               ->  Bitmap Index Scan on events_lion
+                     Index Cond: (kind = ANY ('{1,2,3,4,5}'::integer[]))
+         ->  Hash
+               ->  Index Scan using owners_pkey on owners o
+(10 rows)
 
 EXPLAIN (COSTS OFF)
 SELECT owner_id, count(*) FROM events WHERE kind IN (1, 2, 3, 4, 5)
