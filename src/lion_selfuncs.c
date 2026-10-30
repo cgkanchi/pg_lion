@@ -6985,8 +6985,18 @@ lion_skew_path_probes(PlannerInfo *root, RelOptInfo *rel, Path *path)
 			return lion_skew_bitmap_probes(root, rel,
 										   ((BitmapHeapPath *) path)->bitmapqual);
 		case T_CustomScan:
-			/* a B-tree's walk, whose parameterization is its index's */
-			return ((CustomPath *) path)->methods == &lion_btree_path_methods;
+			{
+				CustomPath *cpath = (CustomPath *) path;
+				Node	   *ipath;
+
+				/* a B-tree's walk, where its index answers the clause */
+				if (cpath->methods != &lion_btree_path_methods ||
+					cpath->custom_private == NIL)
+					return false;
+				ipath = linitial(cpath->custom_private);
+				return IsA(ipath, IndexPath) &&
+					lion_skew_path_probes(root, rel, (Path *) ipath);
+			}
 		default:
 			return false;
 	}
