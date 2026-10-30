@@ -197,6 +197,14 @@ BEGIN
 		END IF;
 	END LOOP;
 END $$;
+CREATE FUNCTION lsw_total(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	RETURN (p->0->'Plan'->>'Total Cost')::float8;
+END $$;
 CREATE FUNCTION lsw_node(q text, OUT rows float8, OUT cost float8)
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -215,6 +223,7 @@ INSERT INTO lsw_q VALUES
 	('semi', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
 	('semi_beyond', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id > d.id)$q$),
 	('semi_filter', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id = d.id + 1)$q$),
+	('semi_where', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id % 7 = 0)$q$),
 	('semi_within', $q$SELECT count(*) FROM lsw_dim o WHERE EXISTS (SELECT FROM lsw_dim d JOIN lsw_fact f ON f.fk = d.id WHERE d.grp = 1 AND d.id = o.id + 0)$q$);
 
 -- a probed key meets (320,080,000 - 8 x 5,000^2) / 160,000 rows, where core
@@ -264,10 +273,12 @@ DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got AS ' || (SELECT q FROM lsw_q WHER
 -- not answer - a probe with no match reads every row of its key, and the
 -- probe is priced at the rows the key meets.  So is one that equates the
 -- fact's id to an outer value: the B-tree answers the key alone, and reads
--- the key's rows to find the id.  So is a probe from within
--- the semi join's inner side, by its dimension: an ordinary inner probe.
+-- the key's rows to find the id, and one that filters the fact on its id
+-- alone.  So is a probe from within the semi join's inner side, by its
+-- dimension: an ordinary inner probe.
 SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
+SET enable_seqscan = off;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
 SET pg_lion.enable_semijoin = off;
@@ -275,6 +286,7 @@ SELECT cost AS semi_on FROM lsw_q, lsw_node(q) WHERE name = 'semi' \gset
 SELECT cost AS beyond_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond' \gset
 SELECT cost AS within_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_within' \gset
 SELECT cost AS filter_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_filter' \gset
+SELECT cost AS where_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_where' \gset
 SET pg_lion.enable_skew_estimate = off;
 SELECT (SELECT cost FROM lsw_q, lsw_node(q) WHERE name = 'semi') = :semi_on
 	   AS semi_unchanged,
@@ -282,8 +294,22 @@ SELECT (SELECT cost FROM lsw_q, lsw_node(q) WHERE name = 'semi') = :semi_on
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond') AS beyond_factor,
 	   (SELECT round((:filter_on / cost)::numeric)
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_filter') AS filter_factor,
+	   (SELECT round((:where_on / cost)::numeric)
+		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_where') AS where_factor,
 	   (SELECT round((:within_on / cost)::numeric)
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_within') AS within_factor;
+-- A bitmap heap scan's bitmap is whole before its first row: a semi
+-- join's probe by its key alone reads all of a heavy key's entries, and is
+-- priced so.
+RESET enable_seqscan;
+SET enable_indexscan = off;
+SET enable_bitmapscan = on;
+SELECT lsw_total(q) AS bitmap_off FROM lsw_q WHERE name = 'semi' \gset
+SET pg_lion.enable_skew_estimate = on;
+SELECT lsw_plan(q) FROM lsw_q WHERE name = 'semi';
+SELECT round((lsw_total(q) / :bitmap_off)::numeric) AS bitmap_factor
+  FROM lsw_q WHERE name = 'semi';
+RESET enable_indexscan;
 RESET pg_lion.enable_skew_estimate;
 RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
@@ -307,5 +333,5 @@ SELECT w.count AS want, g.count AS got FROM lsw_want w, lsw_got g;
 RESET random_page_cost;
 RESET effective_cache_size;
 DROP TABLE lsw_fact, lsw_dim;
-DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json), lsw_node(text),
+DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json), lsw_node(text), lsw_total(text),
 	lsw_key_skew(regclass), lsw_skew_rows(text);
