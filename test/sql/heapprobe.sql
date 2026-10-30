@@ -22,7 +22,6 @@ SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
 SET default_statistics_target = 1000;
 SET work_mem = '64MB';
-SET pg_lion.competitor_pricing = off;
 
 CREATE TYPE hp_grade AS ENUM ('delta', 'gamma', 'alpha', 'beta');
 CREATE TABLE hp_dim (
@@ -237,7 +236,7 @@ SELECT hp($$SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
 SELECT hp_run($$SELECT f.id, d.name FROM hp_fact f JOIN hp_dim d ON d.id = f.dim_id
 				WHERE f.g < 10 AND d.grade = 'alpha' AND d.verified$$);
 
--- 3. The choice, at the prices (pg_lion.competitor_pricing off, no margin):
+-- 3. The choice, at the prices (no margin):
 --    the loop's inner side is the probe where the set rejects rows the loop
 --    would fetch, and core's Index Scan where it rejects none - the probe's
 --    set is then built for nothing.

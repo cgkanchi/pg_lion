@@ -547,44 +547,17 @@ oj_keyset_unique(RelOptInfo *x, Var *key, Oid opno, Oid collation)
 	return false;
 }
 
-static Cost oj_feed_cold(PlannerInfo *root, Path *path, double *pages);
+static double oj_feed_reads(PlannerInfo *root, Path *path);
 
 /*
  * The plan a key set of x is built from (DESIGN.md §47.6, "The feed"): of
  * x's unparameterized paths, and a Gather over each of its partial ones, the
- * cheapest at its price plus what its reads cost cold - the pages it reads
- * outside the cache, each at what that costs over the price core's estimate
- * gave it; *reads the pages it reads, which oj_cost() weighs against a loop's.
- * The plan runs once, at the start, its reads its own, whatever the walk's
- * LIMIT: core's cheapest_total_path prices them as if cached, and a bitmap
- * heap scan that reads the whole table at random is taken over a covering
- * walk that reads a tenth of the pages in order, and runs several times
- * slower cold.
- *
- *	- a lion walk (lion_ordered_scan_reads()): its btree's pages, its set's
- *	  lion pages and its heap fetches, at lion_units_stream_cold_page() where
- *	  it is index-only, read in order as a bitmap heap scan's are, and at
- *	  lion_units_cold_page() in heap mode, a synchronous read a member;
- *	- an index scan, plain or index-only, the AM's own scan of a lion index
- *	  among them: the index's pages its selectivity reads and the heap pages
- *	  of its rows (index_pages_fetched(), those not all-visible where it is
- *	  index-only), at lion_units_cold_page(), each a synchronous read;
- *	- a bitmap heap scan (lion_units_bitmap_reads()): its heap and index
- *	  pages, at the stream price;
- *	- anything else - a sequential scan, which reads in order at about the
- *	  seq_page_cost core charges it - nothing more, its reads the table's
- *	  pages.
- *
- * Each under a Gather or a Gather Merge as alone, its reads the whole
- * plan's.
- *
- * The plan keeps its own price (oj_cost() adds its total_cost), so the node
- * is priced in core's units as every path of the join rel is; the cold reads
- * only choose among x's plans.  Under pg_lion.competitor_pricing a covering
- * walk's price carries the bitmap heap scan's cold reads already
- * (lo_cold_price(), §39), so the plans are taken at their price alone, as
- * core's cheapest_total_path takes them.  A disabled path is taken only
- * where every one is.  NULL where x has no unparameterized path.
+ * cheapest; *reads the pages it reads (oj_feed_reads()), which oj_cost()
+ * weighs against a loop's.  A covering walk's price carries the cold reads a
+ * bitmap heap scan of the table would make (lo_cold_price(), §39), so the
+ * plans are taken at their price alone, as core's cheapest_total_path takes
+ * them.  A disabled path is taken only where every one is.  NULL where x has
+ * no unparameterized path.
  */
 static Path *
 oj_keyset_feed(PlannerInfo *root, RelOptInfo *x, double *reads)
@@ -592,7 +565,6 @@ oj_keyset_feed(PlannerInfo *root, RelOptInfo *x, double *reads)
 	List	   *cands = NIL;
 	Path	   *best = NULL;
 	Cost		bestcost = 0.0;
-	double		bestreads = 0.0;
 	ListCell   *lc;
 
 	*reads = 0.0;
@@ -615,8 +587,7 @@ oj_keyset_feed(PlannerInfo *root, RelOptInfo *x, double *reads)
 	foreach(lc, cands)
 	{
 		Path	   *p = (Path *) lfirst(lc);
-		double		pages;
-		Cost		cost = p->total_cost + oj_feed_cold(root, p, &pages);
+		Cost		cost = p->total_cost;
 
 		if (best == NULL ||
 #if PG_VERSION_NUM >= 180000
@@ -628,50 +599,44 @@ oj_keyset_feed(PlannerInfo *root, RelOptInfo *x, double *reads)
 		{
 			best = p;
 			bestcost = cost;
-			bestreads = pages;
 		}
 	}
-	if (best != NULL)
-		elog(DEBUG2, "lion: key set of %u fed by a path of %.2f, cold %.2f, reading %.0f pages",
-			 x->relid, best->total_cost, bestcost - best->total_cost,
-			 bestreads);
-	*reads = bestreads;
+	if (best == NULL)
+		return NULL;
+	*reads = oj_feed_reads(root, best);
+	elog(DEBUG2, "lion: key set of %u fed by a path of %.2f, reading %.0f pages",
+		 x->relid, best->total_cost, *reads);
 	return best;
 }
 
 /*
- * What a key set's plan reads cold, over its price (oj_keyset_feed()), and
- * in *pages the pages it reads.  0 under pg_lion.competitor_pricing, whose
- * walks' prices carry it.
+ * The pages a key set's plan reads (oj_keyset_feed()): a lion walk's
+ * (lion_ordered_scan_reads()), an index scan's index pages and heap pages of
+ * its rows, a bitmap heap scan's (lion_units_bitmap_pages()), and otherwise
+ * the table's.
  */
-static Cost
-oj_feed_cold(PlannerInfo *root, Path *path, double *pages)
+static double
+oj_feed_reads(PlannerInfo *root, Path *path)
 {
 	RelOptInfo *x = path->parent;
 	Path	   *walk = path;
+	double		pages;
 	double		idxpages;
 	bool		indexonly;
-	Cost		perpage;
-	Cost		cold;
 
 	if (IsA(walk, GatherPath))
 		walk = ((GatherPath *) walk)->subpath;
 	else if (IsA(walk, GatherMergePath))
 		walk = ((GatherMergePath *) walk)->subpath;
-	if (lion_ordered_scan_reads(root, walk, pages, &idxpages, &indexonly))
-	{
-		perpage = indexonly ?
-			lion_units_stream_cold_page(root, idxpages, x->reltablespace) :
-			lion_units_cold_page(root, idxpages, x->reltablespace);
-		cold = *pages * perpage;
-	}
-	else if (IsA(walk, IndexPath))
+	if (lion_ordered_scan_reads(root, walk, &pages, &idxpages, &indexonly))
+		return pages;
+	if (IsA(walk, IndexPath))
 	{
 		IndexPath  *ip = (IndexPath *) walk;
 		double		ipages = Max((double) ip->indexinfo->pages, 1.0);
 		double		heap = 0.0;
 
-		*pages = Min(Max(ceil(ip->indexselectivity * ipages), 1.0), ipages);
+		pages = Min(Max(ceil(ip->indexselectivity * ipages), 1.0), ipages);
 		if (ip->path.pathtype != T_IndexOnlyScan || x->allvisfrac < 1.0)
 		{
 			heap = index_pages_fetched(clamp_row_est(ip->indexselectivity *
@@ -680,16 +645,10 @@ oj_feed_cold(PlannerInfo *root, Path *path, double *pages)
 			if (ip->path.pathtype == T_IndexOnlyScan)
 				heap *= 1.0 - x->allvisfrac;
 		}
-		*pages += heap;
-		cold = *pages * lion_units_cold_page(root, ipages, x->reltablespace);
+		return pages + heap;
 	}
-	else
-	{
-		cold = lion_units_bitmap_reads(root, path, pages);
-		if (*pages <= 0.0)
-			*pages = (double) x->pages;
-	}
-	return lion_competitor_pricing ? 0.0 : cold;
+	pages = lion_units_bitmap_pages(root, path);
+	return (pages > 0.0) ? pages : (double) x->pages;
 }
 
 /*
@@ -1823,7 +1782,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 	/* the loop's Memoize and the cold reads, over the LIMIT's share */
 	factor = 1.0;
-	if (comp->nestloop && lion_competitor_pricing)
+	if (comp->nestloop)
 	{
 		double		s = *share;
 		double		ordpages = Max((double) ord->indexinfo->pages, 1.0);
@@ -1833,9 +1792,8 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 
 		memset(&u, 0, sizeof(LionUnits));
 		u.kind = LION_COMPETITOR_NESTLOOP;
-		u.rate = 1.0;
+		u.factor = 1.0;
 		u.margin = 1.0;
-		u.skewscale = 1.0;
 		u.nlcost = comp->cost;
 		u.memoscale = (comp->memo > 0.0 && comp->cost > 0.0) ?
 			comp->cost / (comp->cost + comp->memo) : 1.0;
@@ -1874,7 +1832,7 @@ oj_cost(PlannerInfo *root, RelOptInfo *joinrel, OjJoin *j, LionOrderedSet *ds,
 			u.coldpage = perpage;
 			lion_units_cold(&u, startup + s * run, ownreads);
 		}
-		factor = u.rate * u.memoscale;
+		factor = u.factor * u.memoscale;
 	}
 	*startup_p = startup * factor;
 	*total_p = (startup + run) * factor;

@@ -772,7 +772,7 @@ pj_units(PlannerInfo *root, const PjPlan *pp, const LionUnits *base,
 /*
  * The node's path over `child` - the fact's cheapest path, or its partial
  * one - priced (DESIGN.md §46, "Cost"): the child's and the anti join's
- * child's costs, core's own; and in the competitor's units (§39) the sets'
+ * child's costs, core's own; and at the node's own price (§39) the sets'
  * builds, the anti join's lookups, a descent of the B-tree for each fact
  * row (§40.10's scan of the probe), each member's tests and truths, and the
  * rows it emits.

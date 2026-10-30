@@ -7,7 +7,7 @@
 # ordjoin_keyfold.sql, heapprobe.sql, competitor_cold.sql), their row counts
 # chosen on both sides of the crossovers DESIGN.md measured.  Run with
 #
-#   --sweep pg_lion.competitor_pricing+pg_lion.enable_heap_probe=on+off,off+off,on+on,off+on
+#   --sweep pg_lion.enable_heap_probe=on,off
 #   --arms core,hashjoin,nestloop,lion,probejoin,ordjoin,probe
 
 # §46: the CASE over the dimension's lion columns beside a fact column, the

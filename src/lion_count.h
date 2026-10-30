@@ -2095,7 +2095,7 @@ typedef struct LionAndCost
 
 extern Cost lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 							  IndexOptInfo **idxs, const AttrNumber *cols,
-							  Node **clauses, double isect, bool skewed,
+							  Node **clauses, double isect,
 							  LionAndCost *out);
 
 /* What an AM scan's position filters decode and decide (DESIGN.md §17). */
@@ -2200,25 +2200,6 @@ extern double lion_probe_rel_factor(PlannerInfo *root, RelOptInfo *rel);
  */
 extern double lion_outer_param_loops(PlannerInfo *root, Node *quals);
 extern bool lion_has_outer_param(PlannerInfo *root, Node *node);
-
-/*
- * The rows a probed key meets on a skewed key column (DESIGN.md §33, "The
- * rows of a probed key"), as a factor over core's rows per key: for column
- * var of rel, and the largest over the clauses that equate a column of rel
- * to a value the plan does not know - a Param, another relation's Var.  1
- * where nothing is known, or pg_lion.enable_skew_estimate is off.
- */
-extern double lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel,
-									 Var *var);
-extern double lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel,
-									   List *clauses);
-/* ... and the factor an AM scan of a lion index is priced at (§40.12) */
-extern double lion_skew_am_factor(PlannerInfo *root, IndexPath *path);
-/* ... and the scales lion_skew_rel_scale() found, kept for the planner run */
-extern bool lion_skew_scale_find(PlannerInfo *root, RelOptInfo *rel,
-								 Relids outer, double loops, double *scale);
-extern void lion_skew_scale_keep(PlannerInfo *root, RelOptInfo *rel,
-								 Relids outer, double loops, double scale);
 
 /*
  * The intersection probe (DESIGN.md §29.11, "Correlated sets"): what lion's
@@ -2346,11 +2327,7 @@ extern void lion_amcostestimate(PlannerInfo *root, IndexPath *path,
  */
 extern void lion_plain_note_remainder(PlannerInfo *root, IndexPath *path,
 									  Cost remainder);
-extern void lion_plain_scale_remainder(PlannerInfo *root, IndexPath *path,
-									   double share, double scale);
 extern void lion_plain_pay_remainders(PlannerInfo *root, RelOptInfo *rel,
 									  RangeTblEntry *rte);
-extern int	lion_plain_remainders_mark(PlannerInfo *root);
-extern void lion_plain_remainders_drop(PlannerInfo *root, int mark);
 
 #endif							/* LION_COUNT_H */
