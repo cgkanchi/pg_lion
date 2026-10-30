@@ -7050,7 +7050,10 @@ lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 	}
 }
 
-/* The clauses a path's own index scans answer (an OR's arms answer none) */
+/*
+ * The clauses a path's own index scans answer exactly: not a lossy one, whose
+ * rows the scan rechecks, nor an OR's arms
+ */
 static List *
 lion_skew_bitmap_answers(Path *bitmapqual)
 {
@@ -7060,7 +7063,12 @@ lion_skew_bitmap_answers(Path *bitmapqual)
 	if (IsA(bitmapqual, IndexPath))
 	{
 		foreach(lc, ((IndexPath *) bitmapqual)->indexclauses)
-			answers = lappend(answers, ((IndexClause *) lfirst(lc))->rinfo);
+		{
+			IndexClause *iclause = (IndexClause *) lfirst(lc);
+
+			if (!iclause->lossy)
+				answers = lappend(answers, iclause->rinfo);
+		}
 	}
 	else if (IsA(bitmapqual, BitmapAndPath))
 	{
