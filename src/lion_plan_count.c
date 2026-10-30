@@ -4032,8 +4032,9 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 
 /*
  * Does a clause on var alone, gclause, keep the value v of it?  Only a
- * binary operator between var and a constant is evaluated; anything else is
- * taken to keep it.
+ * binary operator between var and a constant is evaluated, and not a
+ * volatile one; anything else is taken to keep it.  A NULL result keeps
+ * nothing, as a WHERE reads it.
  */
 static bool
 lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
@@ -4043,7 +4044,11 @@ lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
 	Node	   *r;
 	Const	   *c;
 	bool		varleft;
+	Oid			fn;
 	FmgrInfo	flinfo;
+	Datum		res;
+
+	LOCAL_FCINFO(fcinfo, 2);
 
 	if (!IsA(gclause, OpExpr))
 		return true;
@@ -4059,14 +4064,18 @@ lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
 	else
 		return true;
 	c = (Const *) (varleft ? r : l);
-	if (c->constisnull)
+	fn = get_opcode(op->opno);
+	if (c->constisnull || func_volatile(fn) == PROVOLATILE_VOLATILE)
 		return true;
-	fmgr_info(get_opcode(op->opno), &flinfo);
-	return DatumGetBool(varleft ?
-						FunctionCall2Coll(&flinfo, op->inputcollid,
-										  v, c->constvalue) :
-						FunctionCall2Coll(&flinfo, op->inputcollid,
-										  c->constvalue, v));
+	fmgr_info(fn, &flinfo);
+	InitFunctionCallInfoData(*fcinfo, &flinfo, 2, op->inputcollid,
+							 NULL, NULL);
+	fcinfo->args[0].value = varleft ? v : c->constvalue;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = varleft ? c->constvalue : v;
+	fcinfo->args[1].isnull = false;
+	res = FunctionCallInvoke(fcinfo);
+	return !fcinfo->isnull && DatumGetBool(res);
 }
 
 /*
