@@ -11834,11 +11834,12 @@ make the node do more lookups than it was priced for, never give a wrong answer.
 is a GROUP BY of the key, whose Agg takes each of the node's rows as a group of its own ("Grouped
 by the join key"): it relies on the proof as core's unique inner join relies on its own, and with
 the same guarantees - an index that is valid, enforced immediately and not partial when the plan is
-made, and whose DROP invalidates the plan.
+made, and whose DROP invalidates the plan. So does the uniting of a batch's keys under a GROUP BY
+of a fact column, whose union counts a fact row once however many dimension rows share its key
+("Grouped by a fact column, the keys united").
 
-It guards the inner join's GROUP BY of the key and the dimension LEFT JOIN the fact. A semi join's
-count is not a sum over join pairs, and the forward
-one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
+It guards the inner join's GROUP BY of the key, its keys united, and the dimension-side LEFT JOIN
+to the fact. A semi join's count is not a sum over join pairs, and the forward one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
 ("Forward semi joins over a non-unique key", below), which makes the question moot there.
 
 ### The join semantics the lookup must reproduce
@@ -13730,9 +13731,9 @@ node runs core's cheapest path of it, under the query's snapshot, as it runs a t
 **Recognition** (`lion_fkjoin_recognize()`, `lion_fkjoin_try_fact()`), from the SpecialJoinInfos,
 not from the shape of the join tree:
 
-- every special join is a semi or an anti join (an outer join declines; an anti join made of
-  `LEFT JOIN ... IS NULL` is taken inside the dimension and declines with the fact its inner side:
-  "A dimension that is any join"), inside the join;
+- every special join in the join tree is a semi or an anti join (an outer join declines; an anti
+  join made of `LEFT JOIN ... IS NULL` is taken inside the dimension and declines when the fact is
+  its inner side: "A dimension that is any join");
   every table of the join is a base relation with no LATERAL references and no TABLESAMPLE; and,
   as before, no PlaceHolderVar, no pseudoconstant qual and no LATERAL range table entry anywhere;
 - each table of the join is tried as the fact `F` - a plain or partitioned table with no RLS or
@@ -13819,7 +13820,7 @@ GROUP BY the join key - `d`'s or the fact's - over inner, reverse semi, anti and
 with the dimension's own semi and anti joins in any number, nested or not, and a partitioned fact.
 **Declined**: an outer join inside the dimension; a LATERAL reference, a PlaceHolderVar, a
 pseudoconstant qual; a second join clause between the fact and any table of the dimension; a semi
-join of the dimension's that needs the fact; the fact inside another semi join's inner side (its
+join inside the dimension that involves the fact; the fact inside another semi join's inner side (its
 join is that table's); a dimension with no table the key may be taken from. (An inner join inside
 the dimension, a non-unique key and a partitioned `d` are taken since "A dimension that is any
 join".)
@@ -13927,15 +13928,18 @@ for each. `count(DISTINCT x)` is the core Agg's over the node's rows, one a dime
 joins, and is blind to their multiplicity. So the dimension may be any join core plans of the tables
 that are not the fact, provided the fact joins it by one key equality and nothing of the fact is
 wanted above but what the node emits. Its rows are core's: the node runs the join rel's cheapest
-path as its child, as for a dimension of one table.
+path as its child, as for a dimension of one table. What does rest on a key that never repeats - a
+GROUP BY of the key, the dimension-side LEFT JOIN to the fact, a batch's keys united under a GROUP BY
+of a fact column - is taken only where an index proves it of the one visible table ("Uniqueness of
+the dimension key").
 
 **Recognition** (`lion_fkjoin_try_fact()`, `lion_fkjoin_pick_dim()`):
 
 - the dimension's VISIBLE tables are those in no inner side of its own semi and anti joins: the
   tables whose rows its rows are (`dimvisible`). There may be several, inner-joined;
 - the key is taken from one of them, `d`: a table joined to the fact by exactly one clause, a strict
-  operator between a plain column of each, and the one the semi or anti join with the fact is made
-  on where there is one. With the key's equivalence class holding a column of several of them
+  operator between a plain column of each, and the table on which the semi or anti join with the
+  fact is made, where there is one. With the key's equivalence class holding a column of several of them
   (`f.fk = d.pk = l.k`) any of them is the key, the class holding them equal in every row; one whose
   column an index proves unique is taken first, so that a dimension of one table keeps its proof.
   `d` may be a partitioned parent: core plans it, and the lookups take the key from its rows;
@@ -13948,8 +13952,10 @@ path as its child, as for a dimension of one table.
   node's rows".
 
 **Uniqueness** (`keyunique`): the dimension's rows hold each key at most once when there is one
-visible table and an index proves its key unique. Only a GROUP BY of the key rests on it ("Grouped
-by the join key": each of the node's rows a group of its own), and asks it; the dimension LEFT JOIN
+visible table and an index proves its key unique. Only a GROUP BY of the key ("Grouped by the join
+key": each of the node's rows a group of its own) and the keys united under a GROUP BY of a fact
+column ("Grouped by a fact column, the keys united": a fact row counted once by the union) rest on
+it, and ask it; the dimension LEFT JOIN
 the fact keeps it as its scope guard; and the forward semi join over a joined dimension is the inner
 join only with it. Without it a GROUP BY of the key is grouped by the Agg above the node, as any
 other grouping column is.
@@ -14701,7 +14707,10 @@ counted beside a group's set, located from the index and pinned as an IN list's 
 the §9 interlock for any dead TID the copy still lists; the dimension rows are read by the child
 under the same snapshot as before. A key the same bytes as the one before it in the batch - which
 that proof says does not come - is left out of the union and counted key by key, so the rows would
-still add up to the join's.
+still add up to the join's. An inner join whose key is not proven unique ("A dimension that is any
+join") is never united: two dimension rows of one key count its fact rows twice and the union once,
+and that bytes check does not catch the repeat under a nondeterministic collation, where `'a'` and
+`'A'` are one key in other bytes.
 
 **Bounds and fall-backs.** The keys located at once are what work_mem holds of them
 (`lion_array_batch_size()` sets at most, and no more than half of work_mem's worth of

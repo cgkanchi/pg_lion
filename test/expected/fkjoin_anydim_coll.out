@@ -1,0 +1,125 @@
+-- FK-side join pushdown over a dimension key that repeats under a
+-- nondeterministic collation (DESIGN.md §27, "A dimension that is any join"
+-- and "Grouped by a fact column, the keys united").
+--
+-- Under a case-insensitive collation 'k1' and 'K1' are one key in other
+-- bytes.  A dimension holding both pairs each fact row of that key with two
+-- rows, so the join counts it twice; a union of the two keys' sets would
+-- count it once.  Grouped by a fact column, such a key is counted key by key,
+-- never united.  Every answer is checked against the same query with the
+-- pushdown off and sequential scans only.
+--
+-- Nondeterministic collations need ICU; the test is skipped without it
+-- (test/expected/fkjoin_anydim_coll_1.out).
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET pg_lion.enable_semijoin = off;
+-- core lists its "unicode" ICU collation in pg_collation even in a build
+-- without ICU, so whether one can be created is the only test
+DO $$
+BEGIN
+	IF getdatabaseencoding() = 'UTF8' THEN
+		CREATE COLLATION adc_ci (provider = icu, locale = 'und-u-ks-level2',
+								 deterministic = false);
+	END IF;
+EXCEPTION WHEN feature_not_supported THEN
+	NULL;						-- a build without ICU
+END $$;
+SELECT NOT EXISTS (SELECT 1 FROM pg_collation WHERE collname = 'adc_ci')
+	   AS adc_skip \gset
+\if :adc_skip
+\echo 'no ICU collations, or not a UTF8 database: skipped'
+\else
+/*
+ * adc_check() runs a query with every join method disabled, so that the node
+ * is taken wherever it has a path, and says how it counted a fact column's
+ * groups; then with the pushdown off and sequential scans only, and says
+ * whether the rows are the same.
+ */
+CREATE FUNCTION adc_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'pushed down';
+		ELSIF ln LIKE '%Fact Groups Counted Against: united join keys%' THEN
+			how := 'united';
+		END IF;
+	END LOOP;
+	EXECUTE format('SELECT string_agg(s::text, '' '' ORDER BY s::text) FROM (%s) s', q)
+		INTO got;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE format('SELECT string_agg(s::text, '' '' ORDER BY s::text) FROM (%s) s', q)
+		INTO want;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	IF got IS NOT DISTINCT FROM want THEN
+		RETURN how || ', same rows';
+	END IF;
+	RETURN how || ', DIFFERENT: ' || coalesce(got, 'NULL') || ' against ' ||
+		coalesce(want, 'NULL');
+END $$;
+-- the fact: 40 groups of x over 2,000 keys
+CREATE TABLE adc_f (id int, x int, fk text COLLATE adc_ci);
+INSERT INTO adc_f SELECT i, i % 40, 'k' || (i % 2000)
+  FROM generate_series(1, 100000) i;
+CREATE INDEX adc_f_lion ON adc_f USING lion (x, fk);
+-- a dimension of every key, and half of them again in upper case
+CREATE TABLE adc_n (k text COLLATE adc_ci, attr int);
+INSERT INTO adc_n SELECT 'k' || i, 1 FROM generate_series(0, 1999) i;
+INSERT INTO adc_n SELECT 'K' || i, 2 FROM generate_series(0, 999) i;
+-- the same keys, unique under the collation
+CREATE TABLE adc_u (k text COLLATE adc_ci PRIMARY KEY);
+INSERT INTO adc_u SELECT 'K' || i FROM generate_series(0, 1999) i;
+VACUUM (FREEZE, ANALYZE) adc_f, adc_n, adc_u;
+-- grouped by a fact column: counted key by key, each repeat for itself
+SELECT adc_check('SELECT f.x, count(*) FROM adc_f f JOIN adc_n n ON n.k = f.fk GROUP BY f.x');
+       adc_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT adc_check('SELECT count(*) FROM adc_f f JOIN adc_n n ON n.k = f.fk');
+       adc_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- the forward semi join's keys, distinct under the collation, and a unique
+-- key: united
+SELECT adc_check('SELECT f.x, count(*) FROM adc_f f WHERE f.fk IN (SELECT k FROM adc_n) GROUP BY f.x');
+     adc_check     
+-------------------
+ united, same rows
+(1 row)
+
+SELECT adc_check('SELECT f.x, count(*) FROM adc_f f JOIN adc_u u ON u.k = f.fk GROUP BY f.x');
+     adc_check     
+-------------------
+ united, same rows
+(1 row)
+
+DROP TABLE adc_f, adc_n, adc_u;
+DROP FUNCTION adc_check(text);
+DROP COLLATION adc_ci;
+\endif
