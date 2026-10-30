@@ -22020,8 +22020,11 @@ rows per key price right.
 A semi or anti join's probe ends at its key's first match, no later at a heavy key, and one with
 no match ends at once where the index answers every join clause. So where the relation is on the
 inner side of a semi or anti join and is probed by the join's outer side, a parameterization whose
-clauses all equate a column to an outer value keeps core's price; one with a clause beyond those,
-which a probe with no match reads every row of its key for, is repriced. A probe whose outer
+clauses all equate a column to an outer value keeps core's rows, and each of its paths whose index
+answers every one of those clauses keeps core's price; a path that filters one its index does not
+answer reads the rows of the keys it does answer to find a match, or that there is none, and its
+run is repriced as above. A parameterization with a clause beyond those, which a probe with no
+match reads every row of its key for, is repriced whole. A probe whose outer
 values do not all come from the join's outer side - from another relation of the inner side, say -
 is an ordinary probe there, and is repriced.
 

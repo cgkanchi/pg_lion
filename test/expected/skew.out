@@ -257,6 +257,7 @@ INSERT INTO lsw_q VALUES
 	('loop', $q$SELECT count(*) FROM lsw_dim d JOIN lsw_fact f ON f.fk = d.id WHERE d.grp = 1 AND d.id % 3 = 0 AND f.doc @@ 'a1 | a2'::tsquery$q$),
 	('semi', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
 	('semi_beyond', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id > d.id)$q$),
+	('semi_filter', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id = d.id + 1)$q$),
 	('semi_within', $q$SELECT count(*) FROM lsw_dim o WHERE EXISTS (SELECT FROM lsw_dim d JOIN lsw_fact f ON f.fk = d.id WHERE d.grp = 1 AND d.id = o.id + 0)$q$);
 -- a probed key meets (320,080,000 - 8 x 5,000^2) / 160,000 rows, where core
 -- has 200,000 / 20,128
@@ -328,7 +329,9 @@ DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got AS ' || (SELECT q FROM lsw_q WHER
 -- join clause: the loop keeps core's price.  With a join clause beyond the
 -- key - the fact's id against the outer row's, which the key's B-tree does
 -- not answer - a probe with no match reads every row of its key, and the
--- probe is priced at the rows the key meets.  So is a probe from within
+-- probe is priced at the rows the key meets.  So is one that equates the
+-- fact's id to an outer value: the B-tree answers the key alone, and reads
+-- the key's rows to find the id.  So is a probe from within
 -- the semi join's inner side, by its dimension: an ordinary inner probe.
 SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
@@ -338,16 +341,19 @@ SET pg_lion.enable_semijoin = off;
 SELECT cost AS semi_on FROM lsw_q, lsw_node(q) WHERE name = 'semi' \gset
 SELECT cost AS beyond_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond' \gset
 SELECT cost AS within_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_within' \gset
+SELECT cost AS filter_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_filter' \gset
 SET pg_lion.enable_skew_estimate = off;
 SELECT (SELECT cost FROM lsw_q, lsw_node(q) WHERE name = 'semi') = :semi_on
 	   AS semi_unchanged,
 	   (SELECT round((:beyond_on / cost)::numeric)
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond') AS beyond_factor,
+	   (SELECT round((:filter_on / cost)::numeric)
+		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_filter') AS filter_factor,
 	   (SELECT round((:within_on / cost)::numeric)
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_within') AS within_factor;
- semi_unchanged | beyond_factor | within_factor 
-----------------+---------------+---------------
- t              |            75 |            75
+ semi_unchanged | beyond_factor | filter_factor | within_factor 
+----------------+---------------+---------------+---------------
+ t              |            75 |            75 |            75
 (1 row)
 
 RESET pg_lion.enable_skew_estimate;

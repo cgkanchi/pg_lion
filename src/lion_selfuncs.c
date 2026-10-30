@@ -7050,6 +7050,78 @@ lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 	}
 }
 
+/* The clauses a path's own index scans answer (an OR's arms answer none) */
+static List *
+lion_skew_bitmap_answers(Path *bitmapqual)
+{
+	List	   *answers = NIL;
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+	{
+		foreach(lc, ((IndexPath *) bitmapqual)->indexclauses)
+			answers = lappend(answers, ((IndexClause *) lfirst(lc))->rinfo);
+	}
+	else if (IsA(bitmapqual, BitmapAndPath))
+	{
+		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
+			answers = list_concat(answers,
+								  lion_skew_bitmap_answers((Path *) lfirst(lc)));
+	}
+	return answers;
+}
+
+/* Does a path's own index answer every one of clauses? */
+static bool
+lion_skew_path_answers(Path *path, List *clauses)
+{
+	List	   *answers = NIL;
+	ListCell   *lc;
+
+	switch (path->pathtype)
+	{
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+			answers = lion_skew_bitmap_answers(path);
+			break;
+		case T_BitmapHeapScan:
+			answers = lion_skew_bitmap_answers(((BitmapHeapPath *) path)->bitmapqual);
+			break;
+		case T_CustomScan:
+			{
+				CustomPath *cpath = (CustomPath *) path;
+
+				if (cpath->methods == &lion_btree_path_methods &&
+					cpath->custom_private != NIL &&
+					IsA(linitial(cpath->custom_private), IndexPath))
+					answers = lion_skew_bitmap_answers(linitial(cpath->custom_private));
+				break;
+			}
+		default:
+			break;
+	}
+	foreach(lc, clauses)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		ListCell   *la;
+		bool		found = false;
+
+		foreach(la, answers)
+		{
+			RestrictInfo *answer = (RestrictInfo *) lfirst(la);
+
+			if (answer == rinfo || equal(answer->clause, rinfo->clause))
+			{
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+	}
+	return true;
+}
+
 /*
  * Is rel probed as a semi or anti join's inner side, by its outer side?  A
  * probe whose outer values do not all come from the join's outer side - from
@@ -7119,12 +7191,13 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 													  ppi->ppi_clauses);
 		double		rows;
 		double		scale;
+		bool		semi;
 		ListCell   *lp;
 
-		if (factor < LION_SKEW_MIN_FACTOR || ppi->ppi_rows <= 0.0 ||
-			(lion_skew_semi_inner(root, rel, ppi->ppi_req_outer) &&
-			 !lion_skew_beyond_keys(root, rel, ppi->ppi_clauses)))
+		if (factor < LION_SKEW_MIN_FACTOR || ppi->ppi_rows <= 0.0)
 			continue;
+		semi = lion_skew_semi_inner(root, rel, ppi->ppi_req_outer) &&
+			!lion_skew_beyond_keys(root, rel, ppi->ppi_clauses);
 		rows = Min(clamp_row_est(ppi->ppi_rows * factor),
 				   Max(rel->rows, ppi->ppi_rows));
 		if (rows <= ppi->ppi_rows)
@@ -7140,6 +7213,16 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 
 			if (path->param_info != ppi)
 				continue;
+
+			/*
+			 * A semi join's probe by keys alone stops at the first row it
+			 * finds, which a path whose index answers every key finds at
+			 * once.  One that filters a key its index does not answer reads
+			 * the rows of the keys it does answer to find it, or to find
+			 * there is none.
+			 */
+			if (semi && lion_skew_path_answers(path, ppi->ppi_clauses))
+				continue;
 			path->total_cost = path->startup_cost +
 				(path->total_cost - path->startup_cost) *
 				Min(lion_skew_path_factor(root, rel, path), scale);
@@ -7153,9 +7236,11 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 				path->startup_cost += more;
 				path->total_cost += more;
 			}
-			path->rows = clamp_row_est(path->rows * scale);
+			if (!semi)
+				path->rows = clamp_row_est(path->rows * scale);
 		}
-		ppi->ppi_rows = rows;
+		if (!semi)
+			ppi->ppi_rows = rows;
 	}
 }
 
