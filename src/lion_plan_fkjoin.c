@@ -127,7 +127,7 @@ lion_fkjoin_agg_is_distinct(Aggref *agg, const LionFkJoin *fj)
 	if (v->varlevelsup != 0 || v->varattno <= 0)
 		return false;
 
-	if (v->varno == fj->pkvar->varno)
+	if (bms_is_member(v->varno, fj->dimvisible))
 		return true;			/* a dimension column */
 
 	if (v->varno != fj->fkvar->varno || v->varattno != fj->fkvar->varattno)
@@ -348,13 +348,16 @@ lion_fkjoin_fact_group(PlannerInfo *root, PathTarget *target,
  * compatible with the join operator under the join's collation - the
  * equality the key is unique under:
  *
- *	- the dimension's key in an inner join, which an index proves unique
- *	  under that equality and collation (lion_column_is_unique(), which
- *	  recognising the join asked), or in a semi join where one does; a NULL
+ *	- the dimension's key in an inner join over a dimension of one table,
+ *	  which an index proves unique under that equality and collation
+ *	  (lion_column_is_unique(), which recognising the join asked, keyunique;
+ *	  a dimension joined to other tables may repeat it), or in a semi join
+ *	  where one does; a NULL
  *	  key is no row of either.  An anti join's rows include NULL keys, which
  *	  would be one group of several rows, and it is not asked;
  *	- the fact's join column standing for it (lion_fkjoin_fk_is_key()): in an
- *	  inner join each dimension row's key once, and in the forward semi join
+ *	  inner join each dimension row's key once, where keyunique, and in the
+ *	  forward semi join
  *	  over a non-unique key each DISTINCT key once, which the node makes
  *	  distinct itself by the join operator's family.
  *
@@ -391,11 +394,13 @@ lion_fkjoin_groups_per_row(PlannerInfo *root, const LionFkJoin *fj,
 				  lion_column_is_unique(fj->dimrel, fj->pkvar->varattno,
 										fj->opno, fj->collation)))
 				continue;
+			if (fj->jointype == JOIN_INNER && !fj->keyunique)
+				continue;
 		}
 		else if (v->varno == fj->fkvar->varno &&
 				 v->varattno == fj->fkvar->varattno)
 		{
-			if (!fkkey)
+			if (!fkkey || (fj->jointype == JOIN_INNER && !fj->keyunique))
 				continue;
 		}
 		else
@@ -564,7 +569,7 @@ lion_fkjoin_agg_kind(Aggref *agg, const LionFkJoin *fj)
 	{
 		Var		   *v = (Var *) lfirst(lc);
 
-		if (!IsA(v, Var) || v->varno != (int) fj->dimrel->relid ||
+		if (!IsA(v, Var) || !bms_is_member(v->varno, fj->dimvisible) ||
 			v->varattno <= 0 || v->varlevelsup != 0)
 			return LION_FKAGG_NONE;
 	}
@@ -1919,7 +1924,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 			 */
 			if (v->varattno <= 0 || v->varlevelsup != 0)
 				return;
-			if (v->varno == (int) fj->dimrel->relid)
+			if (bms_is_member(v->varno, fj->dimvisible))
 			{
 				if (!lion_fkjoin_child_has(fj, v))
 					return;
@@ -2068,7 +2073,7 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 
 			if (!IsA(v, Var) || v->varlevelsup != 0 || v->varattno <= 0)
 				return;
-			if (v->varno == (int) fj->dimrel->relid)
+			if (bms_is_member(v->varno, fj->dimvisible))
 			{
 				if (!lion_fkjoin_child_has(fj, v))
 					return;
