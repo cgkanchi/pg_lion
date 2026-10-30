@@ -6994,15 +6994,29 @@ lion_skew_path_probes(PlannerInfo *root, RelOptInfo *rel, Path *path)
 
 /*
  * Is rel probed as a semi or anti join's inner side, by its outer side?  A
- * probe whose outer values all come from within the join's inner side is an
- * ordinary inner probe there, and reads every row of its key.
+ * probe whose outer values do not all come from the join's outer side - from
+ * within its inner side, say - is an ordinary inner probe there, and reads
+ * every row of its key.  A partitionwise join's child relations count as
+ * their top parents.
  */
 static bool
 lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel, Relids req_outer)
 {
 	Relids		relids = IS_OTHER_REL(rel) ? rel->top_parent_relids :
 		rel->relids;
+	Relids		outer = NULL;
 	ListCell   *lc;
+	int			x = -1;
+
+	while ((x = bms_next_member(req_outer, x)) >= 0)
+	{
+		Index		top = x;
+
+		while (root->append_rel_array != NULL &&
+			   root->append_rel_array[top] != NULL)
+			top = root->append_rel_array[top]->parent_relid;
+		outer = bms_add_member(outer, top);
+	}
 
 	foreach(lc, root->join_info_list)
 	{
@@ -7010,7 +7024,7 @@ lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel, Relids req_outer)
 
 		if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
 			bms_overlap(sjinfo->syn_righthand, relids) &&
-			!bms_is_subset(req_outer, sjinfo->syn_righthand))
+			bms_is_subset(outer, sjinfo->syn_lefthand))
 			return true;
 	}
 	return false;

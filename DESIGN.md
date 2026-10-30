@@ -22018,8 +22018,9 @@ A semi or anti join's probe ends at its key's first match, no later at a heavy k
 no match ends at once where the index answers every join clause. So where the relation is on the
 inner side of a semi or anti join and is probed by the join's outer side, a parameterization whose
 clauses all equate a column to an outer value keeps core's price; one with a clause beyond those,
-which a probe with no match reads every row of its key for, is repriced. A probe by another
-relation of the inner side alone is an ordinary probe there, and is repriced.
+which a probe with no match reads every row of its key for, is repriced. A probe whose outer
+values do not all come from the join's outer side - from another relation of the inner side, say -
+is an ordinary probe there, and is repriced.
 
 Only parameterized paths are repriced. A correlated subquery's scan and a generic plan's Param
 are restrictions of the relation, not parameterizations, and keep core's rows; so does every
