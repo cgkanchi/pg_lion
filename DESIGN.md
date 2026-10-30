@@ -22008,8 +22008,9 @@ paths (`set_rel_pathlist_hook`, `lion_skew_reprice_params()`), each such paramet
 figure is at least twice core's rows per key has its rows grown by that factor, up to the
 relation's own rows, and so do its paths' rows. A path whose index answers the clause - an index
 scan with it among its index clauses, a bitmap heap scan with it under its bitmap, a
-LionBtreeScan whose B-tree has it among its index clauses - reads the rows it finds, and its run
-cost grows by the same factor; any other path reads what it read before. Below a factor of 2 the column is near
+LionBtreeScan whose B-tree has it among its index clauses - reads the rows that clause finds, and
+its run cost grows by that clause's factor, up to the rows' own (where the parameterization equates
+two skewed columns, a path whose index answers only one grows by that one's); any other path reads what it read before. Below a factor of 2 the column is near
 enough to uniform that core's figure stands: the two agree exactly where every key has the same
 rows. The join's rows are not touched: they are the outer rows' share of the column's, which core's
 rows per key price right.
