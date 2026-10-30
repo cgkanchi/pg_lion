@@ -15,8 +15,7 @@ It prints, as Markdown:
   - per category: mispicks, time lost, the chosen plans' total against the
     fastest plans' total;
   - per kind of plan: cost units a millisecond (EXPLAIN's total cost over the
-    measured time), the number §10's "The reference" and §39's rates are made
-    of;
+    measured time), the number §10's "The reference" is made of;
   - for each --sweep NAME=V1,V2,..: the planner's choices with that setting
     at each value, and their mispicks (plans not yet timed are timed).
 
@@ -29,14 +28,14 @@ PGUSER, PGDATABASE, or --dbname); it needs only Python's standard library.
   python3 bench/calib/matrix.py --setup --rows 2000000      # build the tables
   python3 bench/calib/matrix.py --out after.json            # run, print
   python3 bench/calib/matrix.py --out own.json \\
-      --set pg_lion.pushdown_margin=1 --set pg_lion.hashagg_rate=1 ...
+      --set pg_lion.pushdown_margin=1 ...
                                               # lion's own units a millisecond
   python3 bench/calib/matrix.py compare before.json after.json
   python3 bench/calib/matrix.py --setup-only --setup-file bench/calib/joins.sql \\
       --rows 4000000                          # §46 to §49's joins at scale
   python3 bench/calib/matrix.py --queries bench/calib/joins.py --only '^hp\\.' \\
       --arms core,hashjoin,nestloop,probe \\
-      --sweep 'pg_lion.competitor_pricing+pg_lion.enable_heap_probe=on+off,off+off,on+on,off+on'
+      --sweep 'pg_lion.enable_heap_probe+enable_memoize=on+on,off+on,on+off,off+off'
                                               # two settings swept together
   ... --cold 'CMD' --repeats 3                # each run after CMD (caches dropped,
                                               # the server restarted): cold

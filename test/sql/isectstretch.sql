@@ -158,43 +158,76 @@ BEGIN
 END $$;
 
 /*
- * ... with the count's own price made `share` of the cost of core's plan of
- * q: the access method's scan of the same sets, which fetches each row the
- * count only counts, feeding an Aggregate.  The count's own price is had with
- * the index scans off, where nothing of core's reads the sets; it is set to
- * that share by pg_lion.agg_rate, the rate a count is priced at against an
- * aggregate (DESIGN.md §39).  NULL where either plan is not what it should be.
+ * The count's own price and the cost of core's plan of q - the access
+ * method's scan of the same sets, which fetches each row the count only
+ * counts, feeding an Aggregate - at cpu_operator_cost `f` times its default.
+ * The count's own price is had with the index scans off, where nothing of
+ * core's reads the sets.  NULLs where either plan is not what it should be.
  */
-CREATE FUNCTION istr_pushed_at(q text, share float8) RETURNS boolean
+CREATE FUNCTION istr_prices(q text, f float8, OUT own float8, OUT scan float8)
 LANGUAGE plpgsql AS $$
 DECLARE
 	j		json;
-	own		float8;
-	scan	float8;
-	res		boolean;
 BEGIN
+	PERFORM set_config('cpu_operator_cost',
+					   (f * (SELECT boot_val::float8 FROM pg_settings
+							  WHERE name = 'cpu_operator_cost'))::text, true);
 	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
 	PERFORM set_config('enable_bitmapscan', 'off', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
 	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
 	PERFORM set_config('enable_bitmapscan', 'on', true);
-	IF j->0->'Plan'->>'Custom Plan Provider' IS DISTINCT FROM 'LionCount' THEN
-		RETURN NULL;
+	IF j->0->'Plan'->>'Custom Plan Provider' IS NOT DISTINCT FROM 'LionCount' THEN
+		own := (j->0->'Plan'->>'Total Cost')::float8;
 	END IF;
-	own := (j->0->'Plan'->>'Total Cost')::float8;
 
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
 	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO j;
 	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
-	IF j->0->'Plan'->>'Node Type' <> 'Aggregate' OR
-	   j->0->'Plan'->'Plans'->0->>'Node Type' NOT IN ('Index Scan', 'Bitmap Heap Scan') THEN
+	IF j->0->'Plan'->>'Node Type' = 'Aggregate' AND
+	   j->0->'Plan'->'Plans'->0->>'Node Type' IN ('Index Scan', 'Bitmap Heap Scan') THEN
+		scan := (j->0->'Plan'->>'Total Cost')::float8;
+	END IF;
+END $$;
+
+/*
+ * ... with the count's own price made `share` of the scan's.  The scan reads
+ * what the count reads and fetches its rows besides, so it is the dearer:
+ * the nearer the dearer a query's rows are fewer.  Both are made of
+ * operators and of pages, the count more of operators, so a higher
+ * cpu_operator_cost brings the two nearer; it is found by bisection.  NULL
+ * where no setting up to ten thousand times the default makes it within a
+ * part in ten thousand of `share`.
+ */
+CREATE FUNCTION istr_pushed_at(q text, share float8) RETURNS boolean
+LANGUAGE plpgsql AS $$
+DECLARE
+	lo		float8 := 1;
+	hi		float8 := 10000;
+	f		float8;
+	p		record;
+	res		boolean;
+BEGIN
+	FOR i IN 1 .. 60 LOOP
+		f := sqrt(lo * hi);
+		p := istr_prices(q, f);
+		IF p.own IS NULL OR p.scan IS NULL THEN
+			RETURN NULL;
+		END IF;
+		EXIT WHEN abs(p.own / p.scan - share) <= 0.0001 * share;
+		IF p.own / p.scan < share THEN
+			lo := f;
+		ELSE
+			hi := f;
+		END IF;
+	END LOOP;
+	IF abs(p.own / p.scan - share) > 0.0001 * share THEN
 		RETURN NULL;
 	END IF;
-	scan := (j->0->'Plan'->>'Total Cost')::float8;
-
-	PERFORM set_config('pg_lion.agg_rate', (share * scan / own)::text, true);
 	res := istr_pushed(q);
-	PERFORM set_config('pg_lion.agg_rate', '1', true);
+	PERFORM set_config('cpu_operator_cost',
+					   (SELECT boot_val FROM pg_settings
+						 WHERE name = 'cpu_operator_cost'), true);
 	RETURN res;
 END $$;
 
@@ -214,14 +247,14 @@ SELECT count(*) FROM istr WHERE src = 4 AND wave = 5 AND tag = 'x' AND flag = 1;
 -- past add_path()'s fuzz of 1%.  Within it, the Aggregate over the scan,
 -- parallel safe, used to win the tie against the count, which is not: a
 -- count priced less than 1% below the scan went to the Aggregate, as did
--- the counts here priced 0.5% below it, at it and at twice it.  Each of
+-- the counts here of a row or none priced 0.5% and 0.05% below it.  Each of
 -- them is now the LionCount plan (t below).  Parallel plans are allowed,
 -- as by default, or no path would be parallel safe.
 SET max_parallel_workers_per_gather = 2;
-SELECT n, istr_pushed_at(c, 0.995) AS within_fuzz, istr_pushed_at(c, 1.0) AS tie,
-	   istr_pushed_at(c, 2.0) AS twice
+SELECT n, istr_pushed_at(c, 0.995) AS within_fuzz,
+	   istr_pushed_at(c, 0.9995) AS near_tie
   FROM (SELECT n, replace(q, 'SELECT n FROM', 'SELECT count(*) FROM') AS c
-		  FROM istr_q WHERE n IN (2, 6)) s
+		  FROM istr_q WHERE n IN (7, 8)) s
  ORDER BY n;
 RESET max_parallel_workers_per_gather;
 
@@ -234,5 +267,6 @@ SELECT count(*) FROM istr WHERE src = 3 AND tag = 'x';
 
 DROP TABLE istr, istr_q;
 DROP FUNCTION istr_rows(text, boolean), istr_relrows(text),
-	istr_actual(text), istr_pushed(text), istr_pushed_at(text, float8);
+	istr_actual(text), istr_pushed(text), istr_pushed_at(text, float8),
+	istr_prices(text, float8);
 RESET default_statistics_target;

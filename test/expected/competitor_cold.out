@@ -112,8 +112,8 @@ END $$;
 -- table names are dropped
 \set anti 'SELECT d.flag, f.kind, count(*) FROM lion_cc_f f JOIN lion_cc_d d ON f.fk = d.pk WHERE f.id <= 300 AND d.seg IN (1, 2, 3, 4, 5, 6) AND NOT EXISTS (SELECT 1 FROM lion_cc_s s WHERE s.fk = d.pk AND s.why = 1) GROUP BY 1, 2'
 -- Core hashes the anti join's table over its nested loop into the
--- dimension.  The plan's cost is the loop's, and so are its units: a nested
--- loop's rate, not a hash join's.  With the dimension in the cache, the
+-- dimension.  The plan's cost is the loop's, and so are its cold reads: a
+-- nested loop's, not a hash join's.  With the dimension in the cache, the
 -- loop at its price beats the node.
 SET effective_cache_size = '4GB';
 SELECT lion_cc_plan(:'anti');
@@ -287,38 +287,6 @@ SELECT lion_cc_same(:'par');
 RESET max_parallel_workers_per_gather;
 RESET parallel_setup_cost;
 RESET parallel_tuple_cost;
--- With pg_lion.competitor_pricing off (DESIGN.md §49) the node is priced by
--- its own work alone, and the loop's cold reads are not weighed against it:
--- at ten times the cache it costs what it costs with no cold charge at all,
--- where competitor pricing takes them off its price.  The node's own cost,
--- the plan forced to it.
-CREATE FUNCTION lion_cc_cost(q text) RETURNS float8
-LANGUAGE plpgsql AS $$
-DECLARE
-	p json;
-BEGIN
-	PERFORM set_config('pg_lion.pushdown_margin', '1000', true);
-	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
-	RETURN (SELECT max((n->>'Total Cost')::float8)
-			  FROM jsonb_path_query(p::jsonb, 'lax $.** ? (@."Custom Plan Provider" == "LionProbeJoin")') n);
-END $$;
-SET effective_cache_size = '1MB';
-SET pg_lion.competitor_pricing = off;
-SELECT lion_cc_cost(:'big') AS own \gset
-RESET pg_lion.competitor_pricing;
-SET pg_lion.cold_page_cost = 0;
-SET pg_lion.cold_stream_page_cost = 0;
-SELECT lion_cc_cost(:'big') AS uncharged \gset
-RESET pg_lion.cold_page_cost;
-RESET pg_lion.cold_stream_page_cost;
-SELECT lion_cc_cost(:'big') AS charged \gset
-SELECT :own = :uncharged AS own_is_uncharged, :charged < :own AS cold_takes_off;
- own_is_uncharged | cold_takes_off 
-------------------+----------------
- t                | t
-(1 row)
-
-DROP FUNCTION lion_cc_cost(text);
 RESET enable_hashjoin;
 RESET enable_mergejoin;
 RESET effective_cache_size;

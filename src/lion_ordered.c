@@ -1977,9 +1977,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	double		ipages = 0.0;
 	double		calls;
 	bool		rebuilt = false;
-	double		skew;
-	double		skewscale = 1.0;
-	double		setskew = 1.0;
 	QualCost	qcost;
 	Cost		startup;
 	Cost		run;
@@ -1994,28 +1991,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	sel = 1.0;
 	if (lion != NULL)
 		cost_bitmap_tree_node(lion, &lioncost, &sel);
-
-	/*
-	 * A key the plan does not know - the outer row's, a Param - on a skewed
-	 * key column: the walk meets the rows a probed key meets (DESIGN.md §33,
-	 * "The rows of a probed key"), and so do its members' tests and fetches
-	 * below, where its competitor - the cheapest of core's paths of rel with
-	 * the same parameterization - meets them too and is priced at them
-	 * (lion_skew_rel_scale(), DESIGN.md §39, "A skewed key's probes"); the
-	 * price is put back into core's units at the end by the competitor's two
-	 * prices.  A competitor no key's rows change, a sequential scan, leaves
-	 * the walk at core's rows too.  A set whose lion quals equate the key to
-	 * that value meets those rows as well: its lookups, and the members it
-	 * copies, are priced at them (lion_skew_set_extra(), §40.12).
-	 */
-	skew = lion_skew_clauses_factor(root, rel, ord->indexclauses);
-	if (skew > 1.0)
-		skewscale = lion_skew_rel_scale(root, rel,
-										PATH_REQ_OUTER(&ord->path),
-										(ord->path.param_info != NULL) ?
-										loops : 1.0);
-	if (skewscale < 1.0 && lion != NULL && ord->path.param_info == NULL)
-		lioncost += lion_skew_set_extra(root, rel, lion, &setskew);
 
 	/* the calls of a correlated subquery, each walk a probe (§40.11) */
 	calls = lion_outer_param_loops(root,
@@ -2070,7 +2045,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 		sel *= keysel;
 		candsel *= keysel;
 	}
-	members = Min(clamp_row_est(candsel * tuples * setskew), tuples);
+	members = Min(clamp_row_est(candsel * tuples), tuples);
 
 	/*
 	 * the lookups, the copy of their answer into the set, and its spill - a
@@ -2097,8 +2072,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	 * parameterized by the outer row, at its own (LO_PROBE_ENTRY_COST)
 	 */
 	walked = clamp_row_est(ord->indexselectivity * tuples);
-	if (skewscale < 1.0)
-		walked = Min(clamp_row_est(walked * skew), tuples);
 	cpu = walked * ((ord->path.param_info != NULL) ? LO_PROBE_ENTRY_COST :
 					LO_PROBE_TUPLES * cpu_tuple_cost + cpu_operator_cost);
 
@@ -2276,28 +2249,6 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (workers != NULL)
 		cpu /= lion_parallel_divisor(*workers);
 	run += cpu;
-
-	/*
-	 * A walk of a skewed key whose query level stops at a count of rows -
-	 * a correlated subquery's LIMIT, an EXISTS's first row
-	 * (lion_skew_limit_rows(), DESIGN.md §40.12) - stops once it has them:
-	 * its run is charged the share of it the count takes at the rows a
-	 * probed key meets, over the share core's Limit takes at core's rows
-	 * (lion_skew_limit_share()).  The set is built whole first, and keeps
-	 * its price.
-	 */
-	if (skewscale < 1.0 && ord->path.param_info == NULL && workers == NULL)
-		run *= lion_skew_limit_share(root, rel, rows, skew,
-									 lion_skew_limit_rows(root, rel));
-
-	/*
-	 * Priced at the rows a probed key meets, the walk is put back into core's
-	 * units by what its competitor costs at core's rows over what it costs at
-	 * those: the two compare as they would at the rows both meet, and the
-	 * loop around them stays in core's units.
-	 */
-	startup *= skewscale;
-	run *= skewscale;
 
 	*startup_p = startup;
 	*total_p = startup + run;
@@ -3218,8 +3169,7 @@ static double lo_margin = 1.0;
  * pg_lion.pushdown_margin (§39): its price divided by the margin, startup
  * and total alike, so that whatever it is compared with - the btree scan it
  * walks, a Sort over another path, a LIMIT's fraction of either - it is
- * taken only by that margin.  Its competitors are the relation's scans, which
- * are lion's reference units already: it has no rate.
+ * taken only by that margin.
  *
  * A btree's walk may run in a worker when the relation may be read in one
  * (`parallel_safe`, DESIGN.md §40.9): whole, as the inner side of a join a
@@ -4568,8 +4518,6 @@ lion_ordered_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	LoKnn		knn;
 	IndexPath  *first;
 
-	/* core's price of a skewed key's scan, before lion's paths join it */
-	lion_skew_rel_note(root, rel, rte);
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
 

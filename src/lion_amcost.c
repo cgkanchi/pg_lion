@@ -1973,7 +1973,6 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	bool		fullscan = lion_scan_walks_whole_index(path, &emits_all_rows);
 	double		walkrows = 0.0;
 	double		idxloops;
-	double		skew;
 
 	/*
 	 * pg_lion.enable_plain_scan off (DESIGN.md §29.11, "Plain scans switched
@@ -2037,21 +2036,6 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	costs.indexTotalCost = Max(costs.indexTotalCost, costs.indexStartupCost);
 
 	lion_cost_canonical_sel(root, path, idxloops, fullscan, &costs);
-
-	/*
-	 * A correlated subquery's scan, or a generic plan's, that equates a
-	 * skewed key to a value the plan does not know, while the relation's
-	 * scans are priced again in lion's units (DESIGN.md §40.12): the rows a
-	 * probed key meets, which lion's other paths of it are priced at
-	 * (lion_skew_am_factor()).  The key's sets, the index tuples and pages
-	 * prorated by the selectivity, and the heap side core prices from the
-	 * selectivity all move with them; the path's rows stay core's, and the
-	 * caller puts the price back into core's units (lion_skew_am_paths()).
-	 */
-	skew = fullscan ? 1.0 : lion_skew_am_factor(root, path);
-	if (skew > 1.0)
-		lion_cost_prorate(root, path, idxloops, &costs,
-						  Min(costs.indexSelectivity * skew, 1.0));
 
 	if (fullscan)
 	{
@@ -2139,7 +2123,7 @@ lioncostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 			setcost = lion_cost_set_and(root, index->rel, nsets, setidx,
 										setcols, (Node **) setquals, factor,
-										skew > 1.0, &setand);
+										&setand);
 			if (idxloops > 1)
 				setcost = setand.cpu +
 					index_pages_fetched((setand.leafpages + setand.setpages) *

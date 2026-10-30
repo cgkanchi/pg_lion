@@ -1,32 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * lion_plan_units.c
- *		The units a lion path is priced in against the core plan it competes
- *		with (DESIGN.md §39).
+ *		What a lion path reads of the core plan it competes with (DESIGN.md
+ *		§39).
  *
- * Lion's CPU constants are fitted at 500 cost units a millisecond, the middle
- * of core's sequential and index-only scans (§10, "The reference").  Core's
- * other plans run at rates of their own - a hash aggregate at about 200, a
- * hash join at 60 to 280, a nested loop over warm indexes at 1,000 to 2,000
- * (§10, "The units"; §31) - so a lion path priced honestly against a scan is
- * priced dearly against a hash aggregate and cheaply against a nested loop,
- * and loses to the one where it is faster and wins against the other where it
- * is slower.  Each of lion's custom paths is therefore priced in the units of
- * the cheapest core path of its relation: the kind of plan that is
- * (lion_competitor_kind()) has a rate, pg_lion.<kind>_rate, the multiple of
- * the reference its plans run at, and the path's own price is multiplied by
- * it (lion_units_price()).
- *
- * The price is converted whole, its pages with its CPU terms.  A rate is the
- * ratio of two whole plans' cost units a millisecond, pages and all, and a
- * time in one unit is a time in another by that one factor.  Converting the
- * CPU terms alone, as this file first did, priced a page differently against
- * each kind of competitor: two of lion's own forms that read pages and CPU in
- * different shares - the decoded walk and the nested loop of a GROUP BY, a
- * walk and a probe, a collected filter and a sought one - then changed order
- * with the competitor, and the executor follows the form the price picks.
- * Converted whole, every choice inside a price is made in lion's own units,
- * which its constants were fitted in.
+ * A lion path is priced by the work it does, in core's units (DESIGN.md
+ * §49), and compared with core's plans by add_path() as any path is.  What
+ * this file reads of the cheapest core plan of the path's relation corrects
+ * core's price where core's own model leaves out what that plan pays: the
+ * pages a nested loop or a bitmap heap scan finds outside the cache, which
+ * core charges as if cached (lion_units_cold()), and a Memoize under a LIMIT,
+ * which meets fewer hits than core priced (lion_memoize_limit_scale()).  The
+ * path is offered at pg_lion.pushdown_margin against it (lion_units_margin()).
  *
  * Part of the LionCount custom scan: lion_customscan.h describes the node
  * and declares what its files share.
@@ -194,7 +179,7 @@ lion_path_has_lion(Path *path)
  * Is a nested loop's inner side an index or bitmap scan parameterized by its
  * outer rows - what §10 and §31 measured, a scan of warm index pages each one
  * charged as a random read?  A nested loop over a materialized inner side is
- * CPU, at core's own rate.
+ * CPU, and reads nothing cold.
  */
 static bool
 lion_nestloop_probes_index(JoinPath *jp)
@@ -292,14 +277,15 @@ lion_competitor_below(Path *path, bool through)
 }
 
 /*
- * What kind of plan a core path is, for its rate (DESIGN.md §39): down from
- * its top through the nodes that pass a scan's or a join's rows up, to the
- * first that says what its units are.
+ * What kind of plan a core path is (DESIGN.md §39) - which says what of it
+ * this file reads: a nested loop's cold reads and Memoize, a bitmap heap
+ * scan's cold reads - down from its top through the nodes that pass a scan's
+ * or a join's rows up, to the first that says what it is.
  *
  *	- a join is its join method: a HASH JOIN, a MERGE JOIN, or a NESTED LOOP
  *	  into a parameterized index scan - aggregated or not, hashed or not: an
- *	  aggregate over a join is the join's kind, whose rate was measured with
- *	  the aggregate over it and whose rows are what the aggregate is fed;
+ *	  aggregate over a join is the join's kind, whose rows are what the
+ *	  aggregate is fed;
  *	- an aggregate that hashes, anywhere above a scan - a Finalize Agg over
  *	  the Partial HashAggregates of a parallel plan included - is a HASHED
  *	  AGGREGATE: hashing is what core charges far below its time;
@@ -406,118 +392,6 @@ lion_competitor_kind(Path *path)
 		path = lion_competitor_below(path, through);
 	}
 	return hashed ? LION_COMPETITOR_HASHAGG : LION_COMPETITOR_OTHER;
-}
-
-/*
- * The rate of a kind of core plan: the cost units a millisecond its plans
- * run at, as a multiple of the 500 lion's CPU constants are fitted at.  The
- * scans the constants were fitted against are the reference, 1, and so are
- * nested loops, whose rate moved no plan (DESIGN.md §39, "Held out").
- */
-double
-lion_competitor_rate(LionCompetitor kind)
-{
-	switch (kind)
-	{
-		case LION_COMPETITOR_AGG:
-			return lion_agg_rate;
-		case LION_COMPETITOR_HASHJOIN:
-			return lion_hashjoin_rate;
-		case LION_COMPETITOR_MERGEJOIN:
-			return lion_mergejoin_rate;
-		case LION_COMPETITOR_BITMAP:
-			return lion_bitmap_rate;
-		case LION_COMPETITOR_HASHAGG:	/* per plan: lion_hashagg_plan_rate() */
-		case LION_COMPETITOR_NONE:
-		case LION_COMPETITOR_DISABLED:
-		case LION_COMPETITOR_NESTLOOP:
-		case LION_COMPETITOR_SEQSCAN:
-		case LION_COMPETITOR_INDEXONLY:
-		case LION_COMPETITOR_INDEX:
-		case LION_COMPETITOR_OTHER:
-			break;
-	}
-	return 1.0;
-}
-
-/*
- * The rate of a plan that hashes, path (DESIGN.md §39, "A hashed aggregate's
- * own rate"): not one rate for the whole plan.  What core charges far below
- * its time is the hashing alone - a cpu_operator_cost or two a row for about
- * 100 ns - and the scan or join under it runs at its own rate, near the
- * reference: a hash aggregate over a whole table spends most of its time
- * hashing, one over the few thousand rows of a selective index scan almost
- * none.  So the hashed aggregates' own cost, total less input, is taken at
- * pg_lion.hashagg_rate and the rest at the reference, and the plan's rate is
- * its cost over that: its cost units a millisecond, as a multiple of 500.
- * Down from the top through what passes rows up, every hashed aggregate on
- * the way counted (a Finalize over the Partial ones of a parallel plan), to
- * the first join or scan; an Append's dearest child, as for its kind.
- */
-static double
-lion_hashagg_plan_rate(Path *path)
-{
-	Cost		total = (path != NULL) ? path->total_cost : 0.0;
-	Cost		hashing = 0.0;
-	double		rate = (lion_hashagg_rate > 0.0) ? lion_hashagg_rate : 1.0;
-	Cost		reference;
-
-	while (path != NULL)
-	{
-		Path	   *input = NULL;
-		bool		hashes = false;
-
-		switch (nodeTag(path))
-		{
-			case T_AggPath:
-				input = ((AggPath *) path)->subpath;
-				hashes = (((AggPath *) path)->aggstrategy == AGG_HASHED ||
-						  ((AggPath *) path)->aggstrategy == AGG_MIXED);
-				break;
-			case T_GroupingSetsPath:
-				input = ((GroupingSetsPath *) path)->subpath;
-				hashes = (((GroupingSetsPath *) path)->aggstrategy == AGG_HASHED ||
-						  ((GroupingSetsPath *) path)->aggstrategy == AGG_MIXED);
-				break;
-			case T_NestPath:
-			case T_MergePath:
-			case T_HashPath:
-			case T_BitmapHeapPath:
-			case T_IndexPath:
-			case T_Path:
-				path = NULL;
-				continue;
-			case T_AppendPath:
-			case T_MergeAppendPath:
-				{
-					List	   *subpaths = IsA(path, AppendPath) ?
-						((AppendPath *) path)->subpaths :
-						((MergeAppendPath *) path)->subpaths;
-					Path	   *dearest = NULL;
-					ListCell   *lc;
-
-					foreach(lc, subpaths)
-					{
-						Path	   *p = (Path *) lfirst(lc);
-
-						if (dearest == NULL ||
-							p->total_cost > dearest->total_cost)
-							dearest = p;
-					}
-					path = dearest;
-					continue;
-				}
-			default:
-				break;
-		}
-		if (hashes && input != NULL && path->total_cost > input->total_cost)
-			hashing += path->total_cost - input->total_cost;
-		path = (input != NULL) ? input : lion_path_input(path);
-	}
-	if (total <= 0.0 || hashing <= 0.0 || hashing > total)
-		return 1.0;
-	reference = (total - hashing) + hashing / rate;
-	return total / reference;
 }
 
 /*
@@ -743,17 +617,14 @@ static double lion_memoize_misses(PlannerInfo *root, MemoizePath *mpath,
  * Memoize over the inner scan probes it once a cache miss, at the hit ratio
  * cost_memoize_rescan() priced it at (lion_memoize_misses()), as the bitmap
  * heap scans' reads count it; an inner side that is not one index scan takes
- * no charge, and probes a semi join stops early are counted whole.  The heap
- * pages are counted at the rows a probe of a skewed key meets, `skew` times
- * core's (§39, "A skewed key's probes"; lion_competitor_skew()).  The loop
+ * no charge, and probes a semi join stops early are counted whole.  The loop
  * is the competitor's kind's: in an upper rel's plan, past a semi or anti
  * join over it (lion_competitor_below()).  A loop below a subquery scan is
  * the subquery's, and its pages, its residency and a Memoize's keys are
  * looked up in the subquery's planner info.
  */
 static void
-lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
-				   double skew)
+lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 {
 	JoinPath   *jp = NULL;
 	bool		through = lion_competitor_through(path);
@@ -815,8 +686,7 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
 	if (ip->path.pathtype != T_IndexOnlyScan || baserel->allvisfrac < 1.0)
 	{
 		double		heap = index_pages_fetched(loops *
-											   Max(Min(ip->indexselectivity *
-													   skew, 1.0) *
+											   Max(ip->indexselectivity *
 												   baserel->tuples, 1.0),
 											   baserel->pages, idxpages,
 											   root);
@@ -829,172 +699,39 @@ lion_nestloop_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage,
 }
 
 /*
- * Does a semi or anti join's probe of a key with no match end at once: does
- * the index of the loop's inner side answer every join clause?  This is
- * core's has_indexed_join_quals() (costsize.c) restated, since that function
- * is static: final_cost_nestloop() charges an unmatched outer row a full
- * inner scan wherever it says no.  The join itself has no clause left to
- * evaluate (joinrestrictinfo); the inner side is a parameterized index or
- * index-only scan, or a bitmap heap scan over one index scan (not an AND or
- * an OR of them), with nothing above it; and each clause its
- * parameterization takes from the join's outer side
- * (join_clause_is_movable_into() the inner rel within the join) is one of
- * its index clauses or of the same equivalence class as one
- * (is_redundant_with_indexclauses()), with at least one such clause.  The
- * inner side's restriction clauses are not looked at, as core does not look
- * at them.
+ * The outer side of a nested loop competitor, best: what it costs, into
+ * *outer, and the rels it reads, into *outerrels - NULL for a loop in a
+ * subquery's plan, whose relids are another query level's.  A path that
+ * reads that side as its child is weighed against the loop's cost less it
+ * (lion_units_cold()).  The loop is the competitor's kind's: in an upper
+ * rel's plan, past a semi or anti join over it (lion_competitor_below()).
+ * 0 and NULL where there is no loop.
  */
-static bool
-lion_competitor_key_only(JoinPath *jp)
+static void
+lion_nestloop_outer(Path *best, Cost *outer, Relids *outerrels)
 {
-	Path	   *inner = jp->innerjoinpath;
-	List	   *indexclauses;
-	bool		found = false;
-	ListCell   *lc;
-
-	if (jp->joinrestrictinfo != NIL)
-		return false;
-	if (inner == NULL || inner->param_info == NULL || inner->parent == NULL ||
-		jp->path.parent == NULL)
-		return false;
-	switch (inner->pathtype)
-	{
-		case T_IndexScan:
-		case T_IndexOnlyScan:
-			if (!IsA(inner, IndexPath))
-				return false;
-			indexclauses = ((IndexPath *) inner)->indexclauses;
-			break;
-		case T_BitmapHeapScan:
-			{
-				Path	   *bitmapqual;
-
-				if (!IsA(inner, BitmapHeapPath))
-					return false;
-				bitmapqual = ((BitmapHeapPath *) inner)->bitmapqual;
-				if (bitmapqual == NULL || !IsA(bitmapqual, IndexPath))
-					return false;
-				indexclauses = ((IndexPath *) bitmapqual)->indexclauses;
-				break;
-			}
-		default:
-			return false;
-	}
-	foreach(lc, indexclauses)
-	{
-		IndexClause *iclause = (IndexClause *) lfirst(lc);
-
-		if (iclause == NULL || !IsA(iclause, IndexClause) ||
-			iclause->rinfo == NULL)
-			return false;
-	}
-	foreach(lc, inner->param_info->ppi_clauses)
-	{
-		RestrictInfo *rinfo = (RestrictInfo *) lfirst(lc);
-
-		if (rinfo == NULL || !IsA(rinfo, RestrictInfo))
-			return false;
-		if (!join_clause_is_movable_into(rinfo, inner->parent->relids,
-										 jp->path.parent->relids))
-			continue;
-		if (!is_redundant_with_indexclauses(rinfo, indexclauses))
-			return false;
-		found = true;
-	}
-	return found;
-}
-
-/*
- * A SKEWED KEY'S PROBES (§39): how many times core's rows per key a nested
- * loop's probes of a skewed key column meet (lion_skew_scan_factor()), in
- * *extra what the loop costs more at them - its inner side an index or a
- * bitmap heap scan parameterized by the outer rows, under a Material or a
- * projection.  The extra is what core's own model of the loop
- * (final_cost_nestloop()) charges more at the skewed rows.  An inner join's
- * every probe reads its key's rows: the loops times one scan's extra.  A
- * probe into an inner side core proved unique stops at its key's first
- * match: 1.  A semi or anti join's matched outer row reads
- * 2 / (match_count + 1) of a scan, and the match count grows with the key's
- * rows, so the first match comes no later at a heavy key.  Its unmatched
- * outer row costs a fraction of a scan where the index answers every join
- * clause (lion_competitor_key_only()), which more rows do not change: 1 for
- * those loops, as for any other inner side or plan.  Otherwise core charges
- * an unmatched row a full scan, which grows with the key's rows: the extra is
- * those rows times one scan's extra - the outer rows less the join's for a
- * semi join, which emits the matched ones, and the join's rows for an anti
- * join, which emits the unmatched ones.  A loop below a subquery scan is the
- * subquery's, and its Vars are looked up in the subquery's planner info.  The
- * loop is the competitor's kind's: in an upper rel's plan, past a semi or
- * anti join over it (lion_competitor_below()).
- *
- * Of any loop found, whatever its inner side, *outer and *outerrels are what
- * its outer side costs and the rels it reads: lion_units_cold() weighs a
- * path that reads that side as its child against the loop's cost less it.
- * The rels are NULL for a loop in a subquery's plan, whose relids are
- * another query level's.
- */
-static double
-lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer,
-					 Relids *outerrels)
-{
-	JoinPath   *jp = NULL;
 	bool		through = lion_competitor_through(best);
 	bool		subquery = false;
 	Path	   *scan;
-	double		loops;
-	double		probes;
-	double		skew;
 
-	*extra = 0.0;
 	*outer = 0.0;
 	*outerrels = NULL;
-	if (root == NULL)
-		return 1.0;
 	for (scan = best; scan != NULL; scan = lion_competitor_below(scan, through))
 	{
 		if (IsA(scan, NestPath) && !(through && lion_join_filters(scan)))
 		{
-			jp = (JoinPath *) scan;
-			break;
+			JoinPath   *jp = (JoinPath *) scan;
+
+			if (jp->outerjoinpath == NULL)
+				return;
+			*outer = jp->outerjoinpath->total_cost;
+			if (!subquery && jp->outerjoinpath->parent != NULL)
+				*outerrels = jp->outerjoinpath->parent->relids;
+			return;
 		}
 		if (IsA(scan, SubqueryScanPath))
-		{
-			root = (scan->parent != NULL) ? scan->parent->subroot : NULL;
-			if (root == NULL)
-				return 1.0;
 			subquery = true;
-		}
 	}
-	if (jp == NULL || jp->outerjoinpath == NULL)
-		return 1.0;
-	*outer = jp->outerjoinpath->total_cost;
-	if (!subquery && jp->outerjoinpath->parent != NULL)
-		*outerrels = jp->outerjoinpath->parent->relids;
-	if (jp->inner_unique)
-		return 1.0;
-	scan = jp->innerjoinpath;
-	while (scan != NULL &&
-		   (IsA(scan, MaterialPath) || IsA(scan, ProjectionPath)))
-		scan = lion_path_input(scan);
-	if (scan == NULL || scan->param_info == NULL ||
-		(!IsA(scan, IndexPath) && !IsA(scan, BitmapHeapPath)))
-		return 1.0;
-	if ((jp->jointype == JOIN_SEMI || jp->jointype == JOIN_ANTI) &&
-		lion_competitor_key_only(jp))
-		return 1.0;
-	loops = Max(jp->outerjoinpath->rows, 1.0);
-
-	/* the probes core charges a full scan: the unmatched outer rows */
-	if (jp->jointype == JOIN_SEMI)
-		probes = Max(loops - jp->path.rows, 0.0);
-	else if (jp->jointype == JOIN_ANTI)
-		probes = Min(Max(jp->path.rows, 0.0), loops);
-	else
-		probes = loops;
-	skew = lion_skew_scan_factor(root, scan);
-	if (skew > 1.0 && probes > 0.0)
-		*extra = probes * lion_skew_scan_extra(root, scan, skew, loops, 0.0);
-	return skew;
 }
 
 /*
@@ -1002,8 +739,8 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer,
  * `reads` pages, priced against a nested loop with cold reads
  * (lion_nestloop_cold()): both plans with their uncached pages added, the
  * loop's cost and cold reads against the path's price and its own cold reads
- * - the path at (own x rate + its cold reads) / (cost + the loop's cold
- * reads) of the loop's cost, which is a factor of its rate.  For the FK-side
+ * - the path at (own + its cold reads) / (cost + the loop's cold reads) of
+ * the loop's cost, a factor of its price (u->factor).  For the FK-side
  * join, whose reads lion_cost_fkjoin_path() counts: a lookup's leaf and set,
  * the fact filters located, the heap of a recheck.  Each path of a relation
  * takes its own reads, so that two of lion's forms compare as their prices
@@ -1017,25 +754,12 @@ lion_competitor_skew(PlannerInfo *root, Path *best, Cost *extra, Cost *outer,
  * price and the lion path can be the slower, by up to that factor where its
  * own price is the dearer.
  *
- * A loop whose probes meet more rows than core priced, on a skewed key, and
- * a path priced at those rows (lion_units_take_skew()), are weighed with the
- * loop at its price at them, nlcost + nlextra: the correction is the
- * skewscale lion_units_price() applies, outside the bound, and the cold
- * reads are the factor on top of it, within it, as before.  The two do not
- * count nlextra twice: the skewscale converts the path's price into core's
- * units, and the factor is each side's cold reads over its own warm price at
- * the rows both meet, a ratio in which nlextra is only the loop's share of
- * that price.  Only the FK-side join comes here, and its skewscale is this
- * loop's (lion_units_take_skew()); a count's, from its relation's own scan
- * (lion_skew_clauses_scale()), never meets the cold reads.
- *
  * A loop over a Memoize whose LIMIT meets fewer hits than core priced
  * (lion_memoize_limit_scale()) is weighed at its price with them as well,
  * nlcost / memoscale - nlcost more: lion_memoize_limit_extra() brought into
- * the frame of its cost, added to nlextra where both apply.  memoscale itself
- * multiplies the path's price (lion_units_price()), outside the bound, as the
- * skewscale does; the factor is each side's cold reads over its own warm
- * price, in which the extra is the loop's.
+ * the frame of its cost.  memoscale itself multiplies the path's price
+ * (lion_units_price()), outside the bound; the factor is each side's cold
+ * reads over its own warm price, in which the extra is the loop's.
  *
  * A path that reads the loop's outer side as its child, at core's price
  * beside its own (nlshared: LionProbeJoin's fact, pj_units()), is weighed
@@ -1055,8 +779,8 @@ static double lion_cold_cap(void);
 void
 lion_units_cold(LionUnits *u, Cost own, double reads)
 {
-	Cost		price = own * u->rate;
-	Cost		loop = u->nlcost + ((u->skewscale < 1.0) ? u->nlextra : 0.0) +
+	Cost		price = own;
+	Cost		loop = u->nlcost +
 		((u->memoscale > 0.0 && u->memoscale < 1.0) ?
 		 u->nlcost / u->memoscale - u->nlcost : 0.0);
 	Cost		lioncold;
@@ -1082,7 +806,7 @@ lion_units_cold(LionUnits *u, Cost own, double reads)
 	elog(DEBUG2, "lion: a nested loop's cold reads, %.2f over its %.2f%s against %.2f over %.2f, at factor %g",
 		 u->nlcold, loop, shared ? " less its outer side" : "", lioncold,
 		 price, factor);
-	u->rate *= factor;
+	u->factor *= factor;
 }
 
 /*
@@ -1523,65 +1247,24 @@ lion_bitmap_cold(PlannerInfo *root, Path *path, Cost *cold, Cost *perpage)
 }
 
 /*
- * A core path's bitmap heap scans read cold (lion_bitmap_cold()), for a plan
- * that is chosen by its cold price rather than weighed against one: what they
- * would pay for the pages outside the cache over what core charged them, and
- * in *pages the pages they read, heap and index.  Both 0 where the path has
- * no bitmap heap scan; the charge 0 where the cache holds everything.  Not
- * under pg_lion.competitor_pricing: a key set's feed (lion_ordjoin.c,
- * DESIGN.md §47.6) is picked by its price with these reads whichever way the
- * switch is set.
+ * The pages a core path's bitmap heap scans read, heap and index
+ * (lion_bitmap_reads()); 0 where it has none.  A key set's feed
+ * (lion_ordjoin.c, DESIGN.md §47.6) counts them as its reads.
  */
-Cost
-lion_units_bitmap_reads(PlannerInfo *root, Path *path, double *pages)
+double
+lion_units_bitmap_pages(PlannerInfo *root, Path *path)
 {
 	LionBitmapReads r;
-	double		resident;
 
-	*pages = 0.0;
 	if (root == NULL || path == NULL)
 		return 0.0;
 	memset(&r, 0, sizeof(r));
 	lion_bitmap_reads(root, path, 1.0, &r);
-	*pages = r.pages;
-	if (r.heappages <= 0.0 || r.over <= 0.0)
-		return 0.0;
-	resident = Min((double) effective_cache_size /
-				   Max(root->total_table_pages + r.idxpages, 1.0), 1.0);
-	if (resident >= 1.0)
-		return 0.0;
-	return (1.0 - resident) * r.over;
+	return r.pages;
 }
 
 /*
- * What a page read outside the cache in an order the device or the kernel
- * reads ahead of costs over the random_page_cost core charges it: the price
- * lion_bitmap_cold() gives a bitmap heap scan's pages and a covering walk's
- * own, LION_COLD_STREAM_PAGE_COST less the tablespace's random_page_cost, in
- * the share of the query's tables and idxpages of index that
- * effective_cache_size cannot hold.  0 when it holds them all.
- */
-Cost
-lion_units_stream_cold_page(PlannerInfo *root, double idxpages,
-							Oid reltablespace)
-{
-	double		resident;
-	double		spc_random_page_cost;
-	double		spc_seq_page_cost;
-
-	resident = Min((double) effective_cache_size /
-				   Max(root->total_table_pages + idxpages, 1.0), 1.0);
-	get_tablespace_page_costs(reltablespace, &spc_random_page_cost,
-							  &spc_seq_page_cost);
-	if (resident >= 1.0 ||
-		LION_COLD_STREAM_PAGE_COST <= spc_random_page_cost)
-		return 0.0;
-	return (1.0 - resident) *
-		(LION_COLD_STREAM_PAGE_COST - spc_random_page_cost);
-}
-
-/*
- * The factor a lion path's price, `price` in its competitor's units, takes
+ * The factor a lion path's price, `price`, takes
  * against a competitor of cost `cost` with `cold` of uncached reads, its own
  * being `lioncold`: both plans with their uncached reads added, the path at
  * (price + lioncold) / (cost + cold) of the competitor's cost, at most 1 and
@@ -1603,21 +1286,20 @@ lion_cold_factor(Cost price, Cost lioncold, Cost cost, Cost cold)
  * A lion path whose own price is `own`, in lion's units, and which reads
  * `reads` pages, priced against a competitor with a bitmap heap scan's cold
  * reads (lion_bitmap_cold()), as lion_units_cold() prices one against a
- * nested loop's: its rate times lion_cold_factor().  For the counts and the
+ * nested loop's: its factor times lion_cold_factor().  For the counts and the
  * FK-side join; nothing where the competitor has no such reads.
  */
 void
 lion_units_bitmap_cold(LionUnits *u, Cost own, double reads)
 {
-	double		factor = lion_units_bitmap_factor(u, own * u->rate, reads);
+	double		factor = lion_units_bitmap_factor(u, own, reads);
 
-	u->rate *= factor;
+	u->factor *= factor;
 }
 
 /*
- * ... the factor itself, for a path whose price in its competitor's units is
- * `own`: the covering walks of a base rel (lion_units_scan_cold()), which
- * have no rate, multiply their own price by it.
+ * ... the factor itself, for a path whose own price is `own`: the covering
+ * walks of a base rel (lion_units_scan_cold()) multiply their price by it.
  */
 double
 lion_units_bitmap_factor(const LionUnits *u, Cost own, double reads)
@@ -1647,7 +1329,7 @@ lion_competitor_bitmap_cold(PlannerInfo *root, Path *best,
 {
 	*bmcold = 0.0;
 	*bmcoldpage = 0.0;
-	if (!lion_competitor_pricing || best == NULL ||
+	if (best == NULL ||
 		kind == LION_COMPETITOR_NONE || kind == LION_COMPETITOR_DISABLED ||
 		nlcold > 0.0)
 		return;
@@ -1662,9 +1344,8 @@ lion_competitor_bitmap_cold(PlannerInfo *root, Path *best,
  * lion's, under the Gather core puts over it: its cost and parallel_setup_cost
  * with a parallel_tuple_cost a row, as cost_gather() prices it.  Where that is
  * a bitmap heap scan with cold reads, u holds them and its cost
- * (lion_units_bitmap_factor() reads nothing else); otherwise u has none.  The
- * walks are not converted (their competitors' units are the reference), and
- * their margin is lion_units_margin_for()'s.
+ * (lion_units_bitmap_factor() reads nothing else); otherwise u has none.
+ * Their margin is lion_units_margin_for()'s.
  */
 void
 lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
@@ -1676,12 +1357,9 @@ lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 
 	memset(u, 0, sizeof(LionUnits));
 	u->kind = LION_COMPETITOR_NONE;
-	u->rate = 1.0;
+	u->factor = 1.0;
 	u->margin = 1.0;
-	u->skewscale = 1.0;
 	u->memoscale = 1.0;
-	if (!lion_competitor_pricing)
-		return;
 	foreach(lc, rel->partial_pathlist)
 	{
 		Path	   *p = (Path *) lfirst(lc);
@@ -1724,31 +1402,26 @@ lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
  * and DISABLED when every one it has is disabled - a plan forced by core's
  * enable_* settings, which leave a lion path nothing to compete with.
  * *ownscan says whether that path is one of the AM's own scans of a lion
- * index (lion_path_is_lion_scan()), *rate its rate; *nlcold and *coldpage
- * a nested loop's cold reads (lion_nestloop_cold()), when root is given;
- * *skew, *nlextra, *nlouter and *nlouterrels the rows its probes of a
- * skewed key meet, what it costs more at them, and its outer side's cost and
- * rels (lion_competitor_skew()); and *memoscale the share of its price a loop
- * over a Memoize is priced at under the LIMIT (lion_memoize_limit_scale()).
+ * index (lion_path_is_lion_scan()); *nlcold and *coldpage a nested loop's
+ * cold reads (lion_nestloop_cold()), when root is given; *nlouter and
+ * *nlouterrels its outer side's cost and rels (lion_nestloop_outer()); and
+ * *memoscale the share of its price a loop over a Memoize is priced at under
+ * the LIMIT (lion_memoize_limit_scale()).
  */
 static LionCompetitor
 lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
-				   bool *ownscan, double *rate, Cost *nlcold, Cost *coldpage,
-				   Cost *nlextra, Cost *nlouter, Relids *nlouterrels,
-				   double *skew, double *memoscale)
+				   bool *ownscan, Cost *nlcold, Cost *coldpage,
+				   Cost *nlouter, Relids *nlouterrels, double *memoscale)
 {
 	Path	   *best = lion_competitor_path(rel);
 	LionCompetitor kind;
 
 	*cost = (best != NULL) ? best->total_cost : 0.0;
 	*ownscan = false;
-	*rate = 1.0;
 	*nlcold = 0.0;
 	*coldpage = 0.0;
-	*nlextra = 0.0;
 	*nlouter = 0.0;
 	*nlouterrels = NULL;
-	*skew = 1.0;
 	*memoscale = 1.0;
 	if (best == NULL)
 		return LION_COMPETITOR_NONE;
@@ -1756,21 +1429,10 @@ lion_competitor_of(PlannerInfo *root, RelOptInfo *rel, Cost *cost,
 		return LION_COMPETITOR_DISABLED;
 	*ownscan = lion_path_is_lion_scan(best);
 	kind = lion_competitor_kind(best);
-
-	/*
-	 * Priced by its own work alone (pg_lion.competitor_pricing off, DESIGN.md
-	 * §49): the competitor's kind still says whether there is one to offer
-	 * the margin against, and nothing of its plan corrects the price.
-	 */
-	if (!lion_competitor_pricing)
-		return kind;
-	*rate = (kind == LION_COMPETITOR_HASHAGG) ?
-		lion_hashagg_plan_rate(best) : lion_competitor_rate(kind);
 	if (kind == LION_COMPETITOR_NESTLOOP)
 	{
-		*skew = lion_competitor_skew(root, best, nlextra, nlouter,
-									 nlouterrels);
-		lion_nestloop_cold(root, best, nlcold, coldpage, *skew);
+		lion_nestloop_outer(best, nlouter, nlouterrels);
+		lion_nestloop_cold(root, best, nlcold, coldpage);
 		*memoscale = lion_memoize_limit_scale(root, best);
 	}
 	return kind;
@@ -1811,21 +1473,18 @@ static RelOptInfo *lion_units_pinned_rel = NULL;
 static LionCompetitor lion_units_pinned_kind;
 static Cost lion_units_pinned_cost;
 static bool lion_units_pinned_ownscan;
-static double lion_units_pinned_rate;
 static Cost lion_units_pinned_nlcold;
 static Cost lion_units_pinned_coldpage;
-static Cost lion_units_pinned_nlextra;
 static Cost lion_units_pinned_nlouter;
 static Relids lion_units_pinned_nlouterrels;
-static double lion_units_pinned_skew;
 static double lion_units_pinned_memoscale;
 static Cost lion_units_pinned_bmcold;
 static Cost lion_units_pinned_bmcoldpage;
 
 /*
- * The units a lion path of rel is to be priced in - the cheapest core path's
- * kind and its rate, the reference when there is none - and the margin it is
- * offered at (lion_competitor_margin()).
+ * What a lion path of rel is priced against - the cheapest core path's kind,
+ * cost, cold reads and Memoize - and the margin it is offered at
+ * (lion_competitor_margin()).
  */
 void
 lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
@@ -1838,37 +1497,31 @@ lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u)
 		u->kind = lion_units_pinned_kind;
 		cost = lion_units_pinned_cost;
 		ownscan = lion_units_pinned_ownscan;
-		u->rate = lion_units_pinned_rate;
 		u->nlcold = lion_units_pinned_nlcold;
 		u->coldpage = lion_units_pinned_coldpage;
-		u->nlextra = lion_units_pinned_nlextra;
 		u->nlouter = lion_units_pinned_nlouter;
 		u->nlouterrels = lion_units_pinned_nlouterrels;
-		u->skew = lion_units_pinned_skew;
 		u->memoscale = lion_units_pinned_memoscale;
 		u->bmcold = lion_units_pinned_bmcold;
 		u->bmcoldpage = lion_units_pinned_bmcoldpage;
 	}
 	else
 	{
-		u->kind = lion_competitor_of(root, rel, &cost, &ownscan, &u->rate,
-									 &u->nlcold, &u->coldpage, &u->nlextra,
-									 &u->nlouter, &u->nlouterrels, &u->skew,
-									 &u->memoscale);
+		u->kind = lion_competitor_of(root, rel, &cost, &ownscan,
+									 &u->nlcold, &u->coldpage, &u->nlouter,
+									 &u->nlouterrels, &u->memoscale);
 		lion_competitor_bitmap_cold(root, lion_competitor_path(rel), u->kind,
 									u->nlcold, &u->bmcold, &u->bmcoldpage);
 	}
-	if (u->rate <= 0.0)
-		u->rate = 1.0;
+	u->factor = 1.0;
 	if (u->memoscale <= 0.0 || u->memoscale > 1.0)
 		u->memoscale = 1.0;
-	u->skewscale = 1.0;
 	u->nlshared = 0.0;
 	u->margin = lion_competitor_margin(u->kind, ownscan);
 	u->nlcost = cost;
-	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at rate %g and margin %g",
+	elog(DEBUG2, "lion: priced against a %s%s, cost %.2f, at margin %g",
 		 ownscan ? "lion " : "", lion_competitor_names[u->kind], cost,
-		 u->rate, u->margin);
+		 u->margin);
 }
 
 /*
@@ -1883,13 +1536,10 @@ lion_units_pin(PlannerInfo *root, RelOptInfo *rel)
 	lion_units_pinned_kind = lion_competitor_of(root, rel,
 												&lion_units_pinned_cost,
 												&lion_units_pinned_ownscan,
-												&lion_units_pinned_rate,
 												&lion_units_pinned_nlcold,
 												&lion_units_pinned_coldpage,
-												&lion_units_pinned_nlextra,
 												&lion_units_pinned_nlouter,
 												&lion_units_pinned_nlouterrels,
-												&lion_units_pinned_skew,
 												&lion_units_pinned_memoscale);
 	lion_competitor_bitmap_cold(root, lion_competitor_path(rel),
 								lion_units_pinned_kind,
@@ -1941,8 +1591,8 @@ lion_units_margin(void)
 }
 
 /*
- * ... for a LionOrdered path of the base rel rel, which has no rate (its
- * competitors are the reference): the margin, or none when rel's scans are
+ * ... for a LionOrdered path of the base rel rel: the margin, or none when
+ * rel's scans are
  * all disabled.  Not the AM's scans' exemption: the cheapest scan of the
  * relation is rarely what a LionOrdered path is chosen over - that is an
  * ordered btree scan of core's, or a Sort, under a LIMIT - and a lion bitmap
@@ -1953,64 +1603,30 @@ lion_units_margin_for(RelOptInfo *rel)
 {
 	Cost		cost;
 	bool		ownscan;
-	double		rate;
 	Cost		nlcold;
 	Cost		coldpage;
-	Cost		nlextra;
 	Cost		nlouter;
 	Relids		nlouterrels;
-	double		skew;
 	double		memoscale;
 	LionCompetitor kind = lion_competitor_of(NULL, rel, &cost, &ownscan,
-											 &rate, &nlcold, &coldpage,
-											 &nlextra, &nlouter, &nlouterrels,
-											 &skew, &memoscale);
+											 &nlcold, &coldpage, &nlouter,
+											 &nlouterrels, &memoscale);
 
 	return lion_competitor_margin(kind, false);
 }
 
 /*
- * A lion path's own price, in lion's units, converted into the competitor's
- * and offered at the margin; priced at the rows its probes of a skewed key
- * meet, put back into core's units (lion_units_take_skew()); and, against a
- * loop over a Memoize whose LIMIT meets fewer hits than core priced, put into
- * core's units of that loop (memoscale, lion_memoize_limit_scale()): the two
- * then compare as they would with the loop at its price with those hits, and
- * the plan around them stays in core's units.  The memoscale is not bounded
- * by pg_lion.cold_max_discount, which bounds only the cold reads on top
- * (lion_units_cold()): it is the competitor's own price, corrected.
+ * A lion path's own price, corrected by its competitor's cold reads
+ * (u->factor, lion_units_cold()) and, against a loop over a Memoize whose
+ * LIMIT meets fewer hits than core priced, put into core's units of that loop
+ * (memoscale, lion_memoize_limit_scale()) - the two then compare as they
+ * would with the loop at its price with those hits - and offered at the
+ * margin.  The memoscale is not bounded by pg_lion.cold_max_discount, which
+ * bounds only the cold reads (lion_units_cold()): it is the competitor's own
+ * price, corrected.
  */
 Cost
 lion_units_price(const LionUnits *u, Cost own)
 {
-	return own * u->rate * u->skewscale * u->memoscale / u->margin;
-}
-
-/*
- * A SKEWED KEY'S PROBES (DESIGN.md §39): the factor over core's rows per key
- * that a nested loop competitor's probes of a skewed key meet
- * (lion_competitor_skew()), which the path is to be priced at - its lookups
- * of the same keys meeting the same rows - and from now on its price is
- * scaled back into core's units by the loop's price at core's rows over its
- * price at those: the loop without its outer side, which the lion path takes
- * as its child at core's price, nlcost - nlouter, over that and nlextra.  The
- * two then compare as they would at the rows both meet, and the plan around
- * them stays in core's units.  The scale is not bounded: it is the
- * competitor's own price, corrected, and pg_lion.cold_max_discount
- * (lion_cold_cap()) bounds only the cold reads on top of it
- * (lion_units_cold()).  A path that does not price its lookups at the factor
- * does not call this, and keeps core's rows on both sides.  1 where the
- * competitor meets no skewed key.
- */
-double
-lion_units_take_skew(LionUnits *u)
-{
-	Cost		loop = u->nlcost - u->nlouter;
-
-	if (u->skew <= 1.0 || u->nlextra <= 0.0 || loop <= 0.0)
-		return 1.0;
-	u->skewscale = loop / (loop + u->nlextra);
-	elog(DEBUG2, "lion: the competitor's probes of a skewed key meet %g times its rows, %.2f more over its %.2f",
-		 u->skew, u->nlextra, loop);
-	return u->skew;
+	return own * u->factor * u->memoscale / u->margin;
 }

@@ -1154,8 +1154,7 @@ typedef struct LionSetClause
 
 static void
 lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
-					 AttrNumber col, Node *clause, double skew,
-					 LionSetClause *sc)
+					 AttrNumber col, Node *clause, LionSetClause *sc)
 {
 	double		heap_pages = Max((double) rel->pages, 1.0);
 	Node	   *bare = IsA(clause, RestrictInfo) ?
@@ -1182,16 +1181,6 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	itup = lion_index_rows(root, rel, idx);
 	psel = lion_index_clause_share(root, idx, lion_vcol_unvar(bare), sel);
 
-	/*
-	 * A key the plan does not know, priced at the rows a probed key meets
-	 * where the caller says so (DESIGN.md §33, "The rows of a probed key"):
-	 * the clause's share of the table's rows and of the index's alike.
-	 */
-	if (skew > 1.0)
-	{
-		sel = Min(sel * skew, 1.0);
-		psel = Min(psel * skew, 1.0);
-	}
 	sc->sel = sel;
 
 	/*
@@ -1452,15 +1441,12 @@ lion_cost_set_pages(PlannerInfo *root, RelOptInfo *rel,
  * The parts come back in *out, so that a caller that repeats the AND - a
  * nested loop's inner scan - can amortize its pages over the repetitions.
  * isect is what the intersection probe found of the AND's rows against the
- * product of the clauses' selectivities (lion_merge_cpu_cost()).  skewed
- * prices each clause that equates a skewed key to a value the plan does not
- * know at the rows a probed key meets (lion_skew_clauses_factor(); DESIGN.md
- * §40.12), the others at their own.
+ * product of the clauses' selectivities (lion_merge_cpu_cost()).
  */
 Cost
 lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 				  IndexOptInfo **idxs, const AttrNumber *cols, Node **clauses,
-				  double isect, bool skewed, LionAndCost *out)
+				  double isect, LionAndCost *out)
 {
 	LionSetClause *sc;
 	double	   *members;
@@ -1495,12 +1481,7 @@ lion_cost_set_and(PlannerInfo *root, RelOptInfo *rel, int n,
 
 	for (i = 0; i < n; i++)
 	{
-		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i],
-							 skewed ?
-							 lion_skew_clauses_factor(root, rel,
-													  list_make1(clauses[i])) :
-							 1.0,
-							 &sc[i]);
+		lion_cost_set_clause(root, rel, idxs[i], cols[i], clauses[i], &sc[i]);
 
 		lookup += sc[i].lookup;
 		out->leafpages += sc[i].lookuppages;
@@ -1657,7 +1638,7 @@ lion_cost_notnull(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		return 0.0;
 	isnull = (NullTest *) copyObject(bare);
 	isnull->nulltesttype = IS_NULL;
-	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, 1.0, &sc);
+	lion_cost_set_clause(root, rel, idx, col, (Node *) isnull, &sc);
 
 	/* the lookup, whichever way it is answered */
 	cost = sc.randompages * random_page_cost + sc.descent;
@@ -3640,25 +3621,15 @@ lion_count_rel_set_clause(LionCountRelCost *c, IndexOptInfo *idx,
 	Selectivity sel;
 	double		nkeys;
 	double		qkeys = 1.0;
-	double		skew;
 
 	/*
 	 * The clause's sets, priced as every AND of them is priced
 	 * (lion_cost_set_clause()): its lookups - a directory leaf and a
 	 * descent, or an IN list's leaves in key order and a search per value
 	 * - are charged here, and what a walk of them reads once the driver
-	 * is known, below.  A key the plan does not know - a Param, a
-	 * correlated subquery's outer row - is priced at the rows a probed key
-	 * meets on a skewed column (DESIGN.md §33, "The rows of a probed key"),
-	 * where the relation's own scan of it is priced at them too, and the
-	 * count's price put back into core's units by that scan's two prices
-	 * (lion_count_path_add(); §39, "A skewed key's probes").
+	 * is known, below.
 	 */
-	skew = lion_skew_clauses_factor(c->root, c->rel,
-									list_make1(lion_vcol_unvar(clause)));
-	if (skew > 1.0 && lion_skew_rel_scale(c->root, c->rel, NULL, 1.0) >= 1.0)
-		skew = 1.0;
-	lion_cost_set_clause(c->root, c->rel, idx, col, clause, skew, sc);
+	lion_cost_set_clause(c->root, c->rel, idx, col, clause, sc);
 	sel = sc->sel;
 	nkeys = sc->nkeys;
 	c->clauseindex[c->ci] = idx;

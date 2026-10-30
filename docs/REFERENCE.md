@@ -942,13 +942,10 @@ working around a bad choice:
   and each fact row's key is tested against it before the lookup; its key must be of the join
   key's type with a hashable equality, and its expected keys must fit in `work_mem` (a set is not
   spilled; the keys are estimated as the rows the table's plan returns). The table is read by the
-  cheapest of its own plans once the pages each reads outside the cache are charged - a bitmap
-  heap scan's or a covering (index-only) walk's at `pg_lion.cold_stream_page_cost`, an index
-  scan's or a walk's that fetches heap rows at `pg_lion.cold_page_cost`, in the share of the
-  tables and the plan's indexes that `effective_cache_size` cannot hold - so that a walk of the
-  key's B-tree is taken over a bitmap heap scan of most of the table where the table is larger
-  than the cache. With `pg_lion.competitor_pricing` on, nothing is charged and the plans are taken
-  at their own price, which for a walk carries that weighing already. Where a query's explicit
+  cheapest of its own plans. A covering (index-only) walk of the key's B-tree is priced with the
+  uncached reads of the bitmap heap scan it competes with (`pg_lion.cold_stream_page_cost`, in the
+  share of the tables that `effective_cache_size` cannot hold), so it is taken over a bitmap heap
+  scan of most of the table where the table is larger than the cache. Where a query's explicit
   `JOIN`s and the semi joins of its `EXISTS` and `IN` pass `join_collapse_limit` items, or a
   pulled-up subquery's `FROM` list passes `from_collapse_limit`, PostgreSQL may join an `EXISTS`
   or `IN` above the rest of the query; its table is still a key set, and the join above tests the
@@ -1169,17 +1166,6 @@ working around a bad choice:
   table. Each value is looked up once per planning, one descent of the index's directory, and an
   `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
   shows ANALYZE's list.
-- `pg_lion.enable_skew_estimate` (on by default): price Lion's probes of a key the plan does not
-  know (a nested loop's outer row, a correlated subquery's, a generic plan's parameter) at the rows
-  such a key really meets on a skewed column, and price the core scan they compete with at the same
-  rows (DESIGN.md §33, "The rows of a probed key", and §39, "A skewed key's probes"). The planner
-  prices such a probe at the column's rows per key. But the keys a query probes are drawn as rows
-  are, so on a column where a few keys have thousands of rows and most have a handful, a probe
-  meets many times that. The same pass that counts a Lion index's keys sums the squares of their
-  rows, and with ANALYZE's most common values that gives the rows of a probed key outside them.
-  Lion's price is then put back into the planner's units, so row estimates and every other plan
-  comparison are unchanged. The same conditions as `pg_lion.enable_index_ndistinct` apply. Off,
-  every probe is priced at the planner's rows per key.
 - `pg_lion.enable_memoize_limit` (on by default): price a nested loop that Lion's paths compete
   with at the cache hits its Memoize meets under the query's `LIMIT` (DESIGN.md §39, "A Memoize
   under a LIMIT"). The planner prices a Memoize at one hit ratio for every call of the loop's whole
@@ -1250,8 +1236,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |
-| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads; and, with `competitor_pricing` off, an index scan or a heap-fetching walk (`LionOrdered`, `LionBtreeScan` not index-only) that may feed a `LionOrderedJoin`'s key set; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"; §47.6, "The feed"); 0 turns the charge off |
-| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads; and, with `competitor_pricing` off, the bitmap heap scans and covering walks that may feed a `LionOrderedJoin`'s key set; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"; §47.6, "The feed"); 0 turns the charge off |
+| `cold_page_cost` | 50 | `seq_page_cost` | a page read from the device, not the cache, one synchronous read at a time: a nested loop's inner index scan (a `Memoize`'s misses where one sits over it; in a grouped query, the loop under a semi or anti join above it) competing with an FK-side join or a `LionProbeJoin`, and that join's own reads; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A nested loop's cold reads"); 0 turns the charge off |
+| `cold_stream_page_cost` | 6.25 | `seq_page_cost` | a page read from the device, not the cache, asked for ahead of the reader: a bitmap heap scan's heap and index pages competing with a covering walk (`LionOrdered`, `LionBtreeScan` index-only), a count or an FK-side join, and those paths' own reads; in the share of the tables `effective_cache_size` cannot hold (DESIGN.md §39, "A bitmap heap scan's cold reads"); 0 turns the charge off |
 | `probe_entry_cost` | 4.5 | `cpu_operator_cost` | an entry a nested loop's B-tree probe (`LionBtreeScan` parameterized by the outer row, and `LionProbeJoin`'s descents) meets, beyond core's Index Scan of the same B-tree: its test against the set, measured at that Index Scan's own rate (DESIGN.md §49, "The probe's own work") |
 | `probe_rescan_cost` | 16 | `cpu_operator_cost` | a scan of `LionBtreeScan`'s probe beyond core's Index Scan's: its rescan, and its code run beside core's, measured so |
 | `entry_count_cost` | 50 | `cpu_tuple_cost` | a count of a GROUP BY: an entry, or a pair of two |
@@ -1292,31 +1278,6 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `fkjoin_sort_seq_page_cost` | 0.75 | `seq_page_cost` | a page that sort writes or reads past `work_mem`, the sequential share |
 | `fkjoin_sort_random_page_cost` | 0.25 | `random_page_cost` | ... and the random share |
 
-Rate settings (DESIGN.md §39, "The competitor's units"). The cost settings above are fitted at 500
-cost units a millisecond, the rate of PostgreSQL's own sequential and index-only scans; its other
-plans run at rates of their own - a hash aggregate over a whole table at about 200, a hash join
-at about 250. A kind of plan with no setting below (scans, nested loops) is priced at the
-reference, 1. A `LionCount`, `LionSemiJoin` or `LionAntiJoin` path is priced in the units of the
-cheapest PostgreSQL plan it competes with: its own price, pages and CPU alike, times that kind of
-plan's rate below, so its cost in `EXPLAIN` is that plan's units; which of its own forms Lion runs
-is decided before, in its own units. Set a rate to 1 to price Lion as fitted against that kind of
-plan; `SET client_min_messages = debug2` logs which kind each path was priced against, at which
-rate and margin. A plan forced with PostgreSQL's `enable_*` settings, with nothing of PostgreSQL's
-left enabled to compete with, is priced in Lion's own units. To read Lion's own cost units a
-millisecond when calibrating the cost settings above, force its plans that way - `enable_seqscan`
-and `enable_bitmapscan` off, and `pg_lion.enable_plain_scan`, which leave Lion's paths enabled, on
-a table with no other index - or set every rate below to 1. `bench/calib/matrix.py` measures each
-kind of plan's units a millisecond, and the planner's mispicks, on synthetic tables (DESIGN.md §39,
-"The matrix").
-
-| `pg_lion.` | default | the PostgreSQL plans it is the rate of, as a multiple of 500 units a millisecond |
-|---|---|---|
-| `hashagg_rate` | 0.1 | an aggregate that hashes: its own cost, less its input's; the rest of its plan is priced at 1 |
-| `agg_rate` | 1.0 | a plain or sorted aggregate over a scan |
-| `hashjoin_rate` | 0.5 | a hash join |
-| `mergejoin_rate` | 1.0 | a merge join |
-| `bitmap_rate` | 1.0 | a bitmap heap scan |
-
 `pg_lion.pushdown_margin` (1, no margin; 0.01 to 1000): the share of the cheapest competing plan's
 cost a Lion custom path (`LionCount`, `LionSemiJoin`, `LionAntiJoin`, `LionOrdered`,
 `LionBtreeScan`) must be priced at to be chosen. Its own price is divided by it: set below 1, a near
@@ -1335,14 +1296,6 @@ count reads it from - since that scan does the count's work and fetches every ro
 the planner's 1% tie, whatever either is estimated at (DESIGN.md §39, "The AM's own scan of the
 same sets"). A path disabled by PostgreSQL's `enable_*` settings (above) loses to an enabled one,
 and Lion's switches leave theirs out, whatever the margin or price.
-
-`pg_lion.competitor_pricing` (on): whether a Lion custom path's price is corrected by what Lion
-reads of the PostgreSQL plan it competes with - the rates above, that plan's uncached reads
-(`cold_page_cost`, `cold_stream_page_cost`, `cold_max_discount`), the rows a skewed key meets
-(`pg_lion.enable_skew_estimate`) and a `Memoize`'s hits under a `LIMIT`
-(`pg_lion.enable_memoize_limit`). Off, a Lion path is priced by its own work alone, in
-PostgreSQL's units, and PostgreSQL's plans by PostgreSQL (DESIGN.md §49); the margin still
-applies.
 
 `pg_lion.cold_max_discount` (2; 1 to 10): the most the uncached reads of a competing plan may
 divide a Lion custom path's price by, where the query's tables do not fit in

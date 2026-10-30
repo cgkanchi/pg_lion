@@ -118,8 +118,8 @@ plan (`work_mem` of 64 kB or 1 MB, which makes counts batch their rechecks and
 GROUP BYs spill; the decoded walk, the top k, the lazy set, the probes and the
 plain scan switched off now and then; bitmap and index scans off, which leaves
 the pushdown nothing to lose to; sorts, hash aggregates and core's join
-methods off, one or all of them; on a build with DESIGN.md §39's units,
-`pg_lion.pushdown_margin`, each `pg_lion.<kind>_rate`,
+methods off, one or all of them; on a build with DESIGN.md §39's margin,
+`pg_lion.pushdown_margin`, `pg_lion.cold_max_discount`,
 `pg_lion.resident_page_cost` and `effective_cache_size` now and then at a
 bound or between, which chooses lion's paths where they are never chosen by
 default and declines them where they always are; a parallel plan) - and the
@@ -185,11 +185,11 @@ reproducer in `findings/`.
 
 ## cost_bounds.sql
 
-Not a soak: on a build with DESIGN.md §39's units and margin, 26 queries -
+Not a soak: on a build with DESIGN.md §39's margin, 26 queries -
 counts, GROUP BYs, count(DISTINCT), the top k, a multi-key column, a
 partitioned table, the FK-side, semi and anti joins, LATERAL joins,
-LionOrdered, six of them as generic plans - each planned under 13 settings
-from the defaults to every rate and the margin at their bounds, with core's
+LionOrdered, six of them as generic plans - each planned under 12 settings
+from the defaults to the margin at its bounds, with core's
 joins or aggregates all off, with core's sequential and bitmap scans and the
 AM's plain scans off, and in parallel, and each answer compared
 with the same query's with lion's paths off.  It prints every plan's lion

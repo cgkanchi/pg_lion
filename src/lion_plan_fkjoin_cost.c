@@ -35,23 +35,6 @@ lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel, Var *fkvar)
 }
 
 /*
- * ... as the node's own price takes it: the keys the rows a probed key meets
- * would make, where its competitor's probes of the key are priced at `skew`
- * times core's rows per key (DESIGN.md §39, "A skewed key's probes";
- * lion_units_take_skew()) - the lookups then meet those rows, in as many
- * containers, as the loop's probes do.  The keys themselves, n_distinct,
- * when skew is 1.
- */
-static double
-lion_fkjoin_fk_keys(PlannerInfo *root, RelOptInfo *rel, Var *fkvar,
-					double skew)
-{
-	double		nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
-
-	return (skew > 1.0) ? Max(nd / skew, 1.0) : nd;
-}
-
-/*
  * How many participants a parallel plan's rows are divided among: core's
  * get_parallel_divisor() (costsize.c), which is static there.  The leader
  * takes part less the more workers it has to serve.
@@ -292,7 +275,7 @@ lion_fkjoin_filters_sel(List *whereclauses)
 
 static Cost
 lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
-					 List *wherecol, Var *fkvar, double fkskew, int joinclause,
+					 List *wherecol, Var *fkvar, int joinclause,
 					 List *whereclauses, List *wherekinds, List *ors,
 					 double dimrows, double found, bool exists,
 					 double rowbytes, int workers, double copyroom,
@@ -360,7 +343,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 	*walk = false;
 
 	/* How many rows one key of the fk column has, and in how many containers. */
-	nd = lion_fkjoin_fk_keys(root, rel, fkvar, fkskew);
+	nd = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
 	perkey = tuples / nd;
 	cfk = lion_containers_for(heap_pages, perkey);
 
@@ -870,7 +853,7 @@ lion_cost_fkjoin_united_counts(const LionFkJoinCost *parts, double tuples,
  */
 Cost
 lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
-					  Var *fkvar, double fkskew, int joinclause,
+					  Var *fkvar, int joinclause,
 					  List *whereclauses,
 					  List *wherekinds, List *ors, double dimrows, double found,
 					  bool exists, double rowbytes, int workers, bool *collect,
@@ -913,13 +896,13 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 	{
 		double		tuples = Max(rel->tuples, 1.0);
 		double		reach = Min(found * tuples /
-								lion_fkjoin_fk_keys(root, rel, fkvar, fkskew),
+								lion_fkjoin_fk_ndistinct(root, rel, fkvar),
 								tuples);
 		double		groups = lion_fact_groups(root, first);
 		LionFkJoinCost parts;
 
 		run = lion_cost_fkjoin_rel(root, rel, first->whereidx,
-								   first->wherecol, fkvar, fkskew, joinclause,
+								   first->wherecol, fkvar, joinclause,
 								   whereclauses, wherekinds, ors, dimrows,
 								   found, exists, rowbytes, workers,
 								   copylimit, collect, walk, force, &parts);
@@ -974,7 +957,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 		return run;
 	}
 
-	ndall = lion_fkjoin_fk_keys(root, rel, fkvar, fkskew);
+	ndall = lion_fkjoin_fk_ndistinct(root, rel, fkvar);
 	foreach(lc, targets)
 	{
 		LionCountTarget *t = (LionCountTarget *) lfirst(lc);
@@ -1002,7 +985,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 			leafvar = fkvar;	/* lion_collect_targets() found the column */
 		lion_target_lists(t, whereclauses, wherekinds, ors, &tidx, &tcol,
 						  &tclauses, &tkinds, &tors, &tjoin);
-		nd = lion_fkjoin_fk_keys(root, t->rel, leafvar, fkskew);
+		nd = lion_fkjoin_fk_ndistinct(root, t->rel, leafvar);
 
 		/* the keys this leaf's turn looks up, and those it finds */
 		turn = lion_leaf_turn_share(root, t->rel);
@@ -1015,7 +998,7 @@ lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel, List *targets,
 				(1.0 - exp(-(tuples / nd) *
 						   Min(Max(t->rel->rows, 1.0) / tuples, 1.0)));
 
-		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar, fkskew,
+		(void) lion_cost_fkjoin_rel(root, t->rel, tidx, tcol, leafvar,
 									tjoin,
 									tclauses, tkinds, tors, tdim, tfound,
 									exists, rowbytes, workers,
