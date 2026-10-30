@@ -7071,7 +7071,7 @@ lion_skew_bitmap_answers(Path *bitmapqual)
 	return answers;
 }
 
-/* Does a path's own index answer every one of clauses? */
+/* Does a path's own index answer every one of clauses (pseudoconstants aside)? */
 static bool
 lion_skew_path_answers(Path *path, List *clauses)
 {
@@ -7104,7 +7104,7 @@ lion_skew_path_answers(Path *path, List *clauses)
 	{
 		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
 		ListCell   *la;
-		bool		found = false;
+		bool		found = rinfo->pseudoconstant;
 
 		foreach(la, answers)
 		{
@@ -7216,19 +7216,23 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 
 			/*
 			 * A semi join's probe by keys alone stops at the first row it
-			 * finds, which a path whose index answers every key finds at
-			 * once.  One that filters a key its index does not answer reads
-			 * the rows of the keys it does answer to find it, or to find
-			 * there is none.
+			 * finds, which a path whose index answers every key and every
+			 * restriction of the relation finds at once.  One that filters a
+			 * key or a restriction its index does not answer reads the rows
+			 * of the keys it does answer to find it, or to find there is
+			 * none.
 			 */
-			if (semi && lion_skew_path_answers(path, ppi->ppi_clauses))
-				continue;
-			path->total_cost = path->startup_cost +
-				(path->total_cost - path->startup_cost) *
-				Min(lion_skew_path_factor(root, rel, path), scale);
+			if (!semi || !lion_skew_path_answers(path, ppi->ppi_clauses) ||
+				!lion_skew_path_answers(path, rel->baserestrictinfo))
+				path->total_cost = path->startup_cost +
+					(path->total_cost - path->startup_cost) *
+					Min(lion_skew_path_factor(root, rel, path), scale);
 			if (IsA(path, BitmapHeapPath))
 			{
-				/* the bitmap's index scans, in its startup */
+				/*
+				 * the bitmap's index scans, in its startup: it is whole
+				 * before the first row, a semi join's probe's too
+				 */
 				Cost		more = lion_skew_bitmap_more(root, rel,
 														 ((BitmapHeapPath *) path)->bitmapqual,
 														 scale);
