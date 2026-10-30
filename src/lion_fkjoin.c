@@ -18,11 +18,10 @@
  *		Why the count is exact is DESIGN.md §27's argument: the join's count
  *		for a group is the sum over the group's dimension rows of each row's
  *		matching fact rows, so it is additive over dimension rows whatever the
- *		key holds.  Uniqueness is required anyway, as a scope decision - it is
- *		what bounds the node's work by the dimension's key count, which the
- *		cost model assumes - and it is proved here rather than taken from
- *		core's relation_has_unique_index_for(), which before PostgreSQL 19
- *		does not compare collations.
+ *		key holds.  Uniqueness is proved here only for what rests on it - a
+ *		GROUP BY of the key, the dimension LEFT JOIN the fact (keyunique) -
+ *		rather than taken from core's relation_has_unique_index_for(), which
+ *		before PostgreSQL 19 does not compare collations.
  *
  *		The semi and anti joins of `EXISTS`, `IN` and `NOT EXISTS` are
  *		recognised here too: the dimension is the outer side, whose rows the
@@ -40,15 +39,16 @@
  *		key".  What this file asks of it is an order to make the keys distinct
  *		by: a btree family that has the join operator as its equality.
  *
- *		The dimension may be a join itself: one table that carries the key,
- *		and other tables joined to it only as the inner side of semi and anti
- *		joins, whose rows are that table's rows, each at most once - DESIGN.md
- *		§27, "A dimension that is a join".  The node's child is then core's
- *		cheapest path of that join rel, and each table of the query that
- *		qualifies as the fact is offered as one.  What this file checks for it
- *		is in the SpecialJoinInfos: which of them joins the fact, that none of
- *		the others involves the fact, and that exactly one table of the
- *		dimension is outside every inner side.
+ *		The dimension may be any join of the other tables: tables inner-joined
+ *		to one another, and tables joined to them as the inner side of semi
+ *		and anti joins - a NOT EXISTS or a `LEFT JOIN ... IS NULL` - whose
+ *		rows the dimension's are not - DESIGN.md §27, "A dimension that is a
+ *		join" and "A dimension that is any join".  The node's child is then
+ *		core's cheapest path of that join rel, and each table of the query
+ *		that qualifies as the fact is offered as one.  What this file checks
+ *		for it is in the SpecialJoinInfos: which of them joins the fact, that
+ *		none of the others involves the fact, and which table outside every
+ *		inner side the key is taken from (lion_fkjoin_pick_dim()).
  *
  *		A table inner-joined to the fact on a unique key of its own, nothing of
  *		it wanted above the join, only filters the fact's rows: it is folded
@@ -474,6 +474,77 @@ lion_fkjoin_filter_of(PlannerInfo *root, RelOptInfo *joinrel,
 }
 
 /*
+ * Which of the dimension's tables `visible` - those whose rows its rows are,
+ * none of them inside a semi or anti join - holds its key: the one table of
+ * them joined to the fact by exactly one clause, a strict operator between a
+ * plain column of each, and the one the semi or anti join with the fact is
+ * made on (`key`, its outer side, or the forward one's inner side).  Several
+ * may qualify where the key's equivalence class holds a column of each - the
+ * fact joined to `d ⋈ x` on `f.fk = d.pk = x.pk` - and any of them is the key,
+ * the class holding them equal in every row; one whose column an index
+ * proves unique is taken first, so that a dimension of one table keeps its
+ * proof.  0 when none does.
+ */
+static int
+lion_fkjoin_pick_dim(PlannerInfo *root, RelOptInfo *fact, Relids visible,
+					 SpecialJoinInfo *key, bool forward)
+{
+	int			first = 0;
+	int			i = -1;
+
+	while ((i = bms_next_member(visible, i)) >= 0)
+	{
+		RelOptInfo *cand = root->simple_rel_array[i];
+		List	   *clauses;
+		RestrictInfo *rinfo;
+		OpExpr	   *op;
+		Var		   *dv = NULL;
+		bool		factside = false;
+		ListCell   *lc;
+
+		if (!lion_fkjoin_rel_ok(root, cand))
+			continue;
+		if (key != NULL &&
+			!bms_is_member(i, forward ? key->min_righthand :
+						   key->min_lefthand))
+			continue;
+		clauses = (i < (int) fact->relid) ?
+			lion_fkjoin_pair_clauses(root, cand, fact) :
+			lion_fkjoin_pair_clauses(root, fact, cand);
+		if (list_length(clauses) != 1)
+			continue;
+		rinfo = (RestrictInfo *) linitial(clauses);
+		if (!IsA(rinfo, RestrictInfo) || rinfo->pseudoconstant ||
+			!IsA(rinfo->clause, OpExpr))
+			continue;
+		op = (OpExpr *) rinfo->clause;
+		if (list_length(op->args) != 2 || !op_strict(op->opno))
+			continue;
+		foreach(lc, op->args)
+		{
+			Node	   *arg = lion_fkjoin_strip((Node *) lfirst(lc));
+
+			if (arg == NULL || !IsA(arg, Var) ||
+				((Var *) arg)->varattno <= 0 ||
+				((Var *) arg)->varlevelsup != 0)
+				break;
+			if (((Var *) arg)->varno == (int) fact->relid)
+				factside = true;
+			else if (((Var *) arg)->varno == i)
+				dv = (Var *) arg;
+		}
+		if (lc != NULL || !factside || dv == NULL)
+			continue;
+		if (lion_column_is_unique(cand, dv->varattno, op->opno,
+								  op->inputcollid))
+			return i;
+		if (first == 0)
+			first = i;
+	}
+	return first;
+}
+
+/*
  * One way of taking `joinrel` apart: the relation `factrelid` as the fact,
  * everything else as the dimension (DESIGN.md §27, "A dimension that is a
  * join").  Fills *fj and returns true when it qualifies.
@@ -496,14 +567,14 @@ lion_fkjoin_filter_of(PlannerInfo *root, RelOptInfo *joinrel,
  * syntactic outer side, which only says where the EXISTS was written: core
  * computes the semi join over its minimal outer side, and so may the child.
  *
- * The dimension's rows are the rows of ONE of its tables, each at most once,
- * when every other table of it is inside the inner side of one of those semi
- * or anti joins: a semi or anti join returns rows of its outer side, each at
- * most once, and the tables inside its inner side add none to them, nested
- * semi joins and inner joins in there included.  So the dimension's own table
- * is the one table of it that no special join has on its inner side, and
- * there has to be exactly one: two would be an inner join inside the
- * dimension, which may repeat a row.
+ * The dimension's rows are rows of its VISIBLE tables, those no semi or anti
+ * join has on its inner side: a semi or anti join returns rows of its outer
+ * side, each at most once, and the tables inside its inner side add none to
+ * them.  With one visible table they are that table's rows, each at most
+ * once; with several, inner-joined, a row of one may repeat, which an inner
+ * join's count is exact over (DESIGN.md §27, "A dimension that is any join")
+ * and only a GROUP BY of the key asks about (keyunique).  The key is taken
+ * from one of them (lion_fkjoin_pick_dim()).
  *
  * The tables of `folded` are dimensions that only filter, `filters` their
  * LionFkFilters: not the dimension's, and taken only beside an inner join of
@@ -519,9 +590,11 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	RelOptInfo *dimchild;
 	Relids		dimrels;
 	Relids		hidden = NULL;
+	Relids		visible;
 	SpecialJoinInfo *key = NULL;
 	bool		forward = false;
 	bool		joined;
+	bool		keyunique;
 	int			dimrelid;
 	List	   *clauses;
 	RestrictInfo *rinfo;
@@ -584,8 +657,15 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 		if (bms_equal(sjinfo->min_righthand, fact->relids) &&
 			bms_equal(sjinfo->syn_righthand, fact->relids))
 		{
-			/* the fact alone inside an EXISTS, an IN or a NOT EXISTS */
+			/*
+			 * the fact alone inside an EXISTS, an IN or a NOT EXISTS - not
+			 * the anti join of a `LEFT JOIN fact ... WHERE f.fk IS NULL`,
+			 * which is left to the ordinary plan
+			 */
 			if (key != NULL)
+				return false;
+			if (sjinfo->jointype == JOIN_ANTI &&
+				!lion_fkjoin_sublink_anti(root, sjinfo))
 				return false;
 			key = sjinfo;
 			continue;
@@ -611,14 +691,18 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 		hidden = bms_add_members(hidden, sjinfo->syn_righthand);
 	}
 
-	/* ---- the dimension's own table: the one no semi or anti join hides ---- */
-	if (!bms_get_singleton_member(bms_difference(bms_difference(dimrels, hidden),
-												 root->outer_join_rels),
-								  &dimrelid))
+	/*
+	 * ---- the dimension's own table ----
+	 *
+	 * Of the tables no semi or anti join hides, whose rows the dimension's
+	 * are: the one whose column the key is (lion_fkjoin_pick_dim()).
+	 */
+	visible = bms_difference(bms_difference(dimrels, hidden),
+							 root->outer_join_rels);
+	dimrelid = lion_fkjoin_pick_dim(root, fact, visible, key, forward);
+	if (dimrelid <= 0)
 		return false;
 	dim = root->simple_rel_array[dimrelid];
-	if (!lion_fkjoin_rel_ok(root, dim) || lion_fkjoin_is_parent(root, dim))
-		return false;
 
 	/*
 	 * ---- exactly one join clause ----
@@ -750,23 +834,28 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	 * needs the proof.  A joined dimension's rows are its own table's, each at
 	 * most once (above), so a key unique in the table is unique in them.
 	 */
+	keyunique = bms_membership(visible) == BMS_SINGLETON &&
+		lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
+							  op->inputcollid);
 	if (key == NULL || key->jointype == JOIN_LEFT)
 	{
 		/*
-		 * A LEFT JOIN's count is a sum over the dimension rows as an inner
-		 * join's is, each row's own count or - with no fact row - its one
-		 * null-extended row; the proof is the inner join's scope guard.
+		 * An inner join's count is a sum over the dimension rows, whatever
+		 * they hold: a key two of them share is counted for each, as the
+		 * join pairs it with each.  So any join of the dimension's tables
+		 * will do, and its rows are core's to make; only a GROUP BY of the
+		 * key asks that no key repeat (keyunique, lion_plan_fkjoin.c).  A
+		 * LEFT JOIN's count is a sum over the dimension rows too, each row's
+		 * own count or - with no fact row - its one null-extended row, and
+		 * keeps the proof as its scope guard.
 		 */
-		if (!lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
-								   op->inputcollid))
+		if (key != NULL && !keyunique)
 			return false;
 		jointype = (key == NULL) ? JOIN_INNER : JOIN_LEFT;
 	}
 	else if (forward)
 	{
-		if (joined &&
-			lion_column_is_unique(dim, argvar[di]->varattno, op->opno,
-								  op->inputcollid))
+		if (joined && keyunique)
 			jointype = JOIN_INNER;
 		else
 		{
@@ -831,6 +920,8 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 	fj->joinrel = joinrel;
 	fj->uniqsortop = sortop;
 	fj->filters = filters;
+	fj->dimvisible = visible;
+	fj->keyunique = keyunique;
 	return true;
 }
 
@@ -886,11 +977,13 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 	 * dimension is what lets the dimension be a join (DESIGN.md §27, "A
 	 * dimension that is a join"): it never repeats a row of its outer side.
 	 *
-	 * So semi and anti joins, within the join, or that one LEFT JOIN: an
-	 * anti join made from
-	 * `LEFT JOIN ... WHERE f.fk IS NULL` is left alone; the NOT EXISTS one
-	 * is told apart from it by lion_fkjoin_sublink_anti(), and its relid, if
-	 * the release gives it one, is no table of the join.
+	 * So semi and anti joins, within the join, or that one LEFT JOIN.  An
+	 * anti join made from `LEFT JOIN ... WHERE x.k IS NULL` is let through
+	 * too, for the dimension's own (lion_fkjoin_try_fact()): inside the
+	 * dimension it is core's to run, as a NOT EXISTS is, and its rows are its
+	 * outer side's.  With the fact its inner side it is left alone.  The NOT
+	 * EXISTS one is told apart from it by lion_fkjoin_sublink_anti(), and
+	 * either one's relid is no table of the join.
 	 */
 	foreach(lc, root->join_info_list)
 	{
@@ -913,8 +1006,6 @@ lion_fkjoin_recognize(PlannerInfo *root, RelOptInfo *joinrel, LionFkJoin **out)
 			continue;
 		}
 		if (sjinfo->jointype != JOIN_SEMI && sjinfo->jointype != JOIN_ANTI)
-			return 0;
-		if (sjinfo->ojrelid != 0 && !lion_fkjoin_sublink_anti(root, sjinfo))
 			return 0;
 		if (!bms_is_subset(sjinfo->syn_lefthand, joinrel->relids) ||
 			!bms_is_subset(sjinfo->syn_righthand, joinrel->relids) ||
@@ -1150,6 +1241,8 @@ lion_fkjoin_recognize_join(PlannerInfo *root, RelOptInfo *joinrel,
 	fj->joinrel = joinrel;
 	fj->uniqsortop = InvalidOid;
 	fj->joinpath = true;
+	fj->dimvisible = bms_difference(outerrel->relids, root->outer_join_rels);
+	fj->keyunique = false;
 	return true;
 }
 

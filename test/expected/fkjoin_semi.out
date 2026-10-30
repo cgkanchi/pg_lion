@@ -669,8 +669,8 @@ SELECT lion_sj('SELECT avg(d.attr) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM li
 
 -- three relations: the dimension semi-joined to a second table is a dimension
 -- that is a join (DESIGN.md §27, "A dimension that is a join"), pushed down
--- since, and fkjoin_dimjoin tests it; an inner join inside the dimension,
--- which may repeat its rows, is still declined
+-- since, and fkjoin_dimjoin tests it; and so is an inner join inside the
+-- dimension, which may repeat its rows (fkjoin_anydim.sql)
 SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3) AND EXISTS (SELECT 1 FROM lion_sdn n WHERE n.k = d.pk)');
        lion_sj       
 ---------------------
@@ -678,9 +678,9 @@ SELECT lion_sj('SELECT count(*) FROM lion_sd d WHERE EXISTS (SELECT 1 FROM lion_
 (1 row)
 
 SELECT lion_sj('SELECT count(*) FROM lion_sd d JOIN lion_sdn n ON n.k = d.pk WHERE EXISTS (SELECT 1 FROM lion_sf f WHERE f.fk = d.pk AND f.x = 3)');
-         lion_sj         
--------------------------
- not pushed down, 1 rows
+       lion_sj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- a subquery the planner cannot pull up

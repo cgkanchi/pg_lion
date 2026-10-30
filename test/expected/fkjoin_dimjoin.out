@@ -632,10 +632,10 @@ SELECT lion_gj('SELECT count(DISTINCT d.attr), count(*), max(d.grp) FROM lion_gj
  pushed down, 1 rows
 (1 row)
 
-SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind IN (''a'', ''c'') AND f1.ts >= now() - interval ''120 days'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w2'') GROUP BY d.region', 'fact');
-           lion_gj            
-------------------------------
- pushed down, fact f1, 3 rows
+SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind IN (''a'', ''c'') AND f1.ts >= now() - interval ''120 days'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w2'') GROUP BY d.region');
+       lion_gj       
+---------------------
+ pushed down, 3 rows
 (1 row)
 
 SELECT lion_gj('SELECT f1.fk, count(*) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind = ''b'' AND f1.x = 4 AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1) GROUP BY f1.fk');
@@ -708,12 +708,12 @@ SELECT lion_gj('SELECT count(*) FROM lion_gj_n n WHERE NOT EXISTS (SELECT 1 FROM
  pushed down, 1 rows
 (1 row)
 
--- an inner join over the joined non-unique dimension is declined: nothing
--- proves its key unique
+-- an inner join over the joined non-unique dimension: counted for each of its
+-- rows, as the join pairs them (fkjoin_anydim.sql)
 SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_n n ON f2.fk = n.k WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'')');
-         lion_gj         
--------------------------
- not pushed down, 1 rows
+       lion_gj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- ... and grouped by its key it is not a group a row: hashed
@@ -1002,17 +1002,18 @@ SELECT lion_gj('SELECT v.r, (SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 7 A
 -- ---- 7. declined ---------------------------------------------------------------
 -- (over a few hundred dimension rows: with every join disabled, the ordinary
 -- plans of these can be slow)
--- an inner join inside the dimension, which may repeat its rows
+-- an inner join inside the dimension, which may repeat its rows: taken since an
+-- inner join's count is exact over any dimension (fkjoin_anydim.sql)
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d JOIN lion_gj_n n ON n.k = d.pk WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
-         lion_gj         
--------------------------
- not pushed down, 1 rows
+       lion_gj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk JOIN lion_gj_n n ON n.attr = d.attr WHERE d.pk < 300 AND n.k < 100 AND f2.y = 5');
-         lion_gj         
--------------------------
- not pushed down, 1 rows
+       lion_gj       
+---------------------
+ pushed down, 1 rows
 (1 row)
 
 -- an outer join, and with it a PlaceHolderVar

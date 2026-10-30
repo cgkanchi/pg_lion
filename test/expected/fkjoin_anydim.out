@@ -1,0 +1,238 @@
+-- FK-side join pushdown whose dimension is any join (DESIGN.md §27, "A
+-- dimension that is any join").
+--
+-- The count of an inner join is a sum over the dimension's rows of each row's
+-- matching fact rows, whatever produced those rows: an inner join of several
+-- tables, a list named through its partitioned parent, a key that repeats, an
+-- anti join written as `LEFT JOIN ... IS NULL`.  Every answer is checked
+-- against the same query with the pushdown off and sequential scans only.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET pg_lion.enable_semijoin = off;
+SET default_statistics_target = 1000;
+/*
+ * ad_check() runs a query with every join method disabled, so that the node
+ * is taken wherever it has a path, and says whether it was; then with the
+ * pushdown off and sequential scans only, and says whether the rows are the
+ * same.
+ */
+CREATE FUNCTION ad_check(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	how text := 'not pushed down';
+	got text;
+	want text;
+BEGIN
+	PERFORM set_config('enable_hashjoin', 'off', true);
+	PERFORM set_config('enable_mergejoin', 'off', true);
+	PERFORM set_config('enable_nestloop', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN (COSTS OFF) ' || q LOOP
+		IF ln LIKE '%Custom Scan (LionCount)%' THEN
+			how := 'pushed down';
+		END IF;
+	END LOOP;
+	EXECUTE format('SELECT string_agg(s::text, '' '' ORDER BY s::text) FROM (%s) s', q)
+		INTO got;
+	PERFORM set_config('enable_hashjoin', 'on', true);
+	PERFORM set_config('enable_mergejoin', 'on', true);
+	PERFORM set_config('enable_nestloop', 'on', true);
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_indexonlyscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE format('SELECT string_agg(s::text, '' '' ORDER BY s::text) FROM (%s) s', q)
+		INTO want;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_indexonlyscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	IF got IS NOT DISTINCT FROM want THEN
+		RETURN how || ', same rows';
+	END IF;
+	RETURN how || ', DIFFERENT: ' || coalesce(got, 'NULL') || ' against ' ||
+		coalesce(want, 'NULL');
+END $$;
+-- the fact: a lion index on its filter and its key
+CREATE TABLE ad_f (id int, x int, fk int);
+INSERT INTO ad_f SELECT i, i % 7, i % 2500 + 1 FROM generate_series(1, 30000) i;
+INSERT INTO ad_f VALUES (30001, 3, NULL);
+CREATE INDEX ad_f_lion ON ad_f USING lion (x, fk);
+-- the dimension's table, unique on its key
+CREATE TABLE ad_d (pk int PRIMARY KEY, attr int);
+INSERT INTO ad_d SELECT i, i % 5 FROM generate_series(1, 3000) i;
+-- a list of the dimension's keys, partitioned by list, unique within a list
+CREATE TABLE ad_l (v int, k int, score int) PARTITION BY LIST (v);
+CREATE TABLE ad_l_1 PARTITION OF ad_l FOR VALUES IN (1);
+CREATE TABLE ad_l_2 PARTITION OF ad_l FOR VALUES IN (2);
+INSERT INTO ad_l SELECT 1, i * 3, i % 11 FROM generate_series(1, 900) i;
+INSERT INTO ad_l SELECT 2, i * 2, i % 11 FROM generate_series(1, 900) i;
+CREATE UNIQUE INDEX ad_l_1_key ON ad_l_1 (v, k);
+CREATE UNIQUE INDEX ad_l_2_key ON ad_l_2 (v, k);
+-- keys to leave out
+CREATE TABLE ad_s (k int, kind text);
+INSERT INTO ad_s SELECT i * 30, CASE WHEN i % 2 = 0 THEN 'a' ELSE 'b' END
+FROM generate_series(1, 60) i;
+-- a dimension whose key repeats
+CREATE TABLE ad_n (k int, attr int);
+INSERT INTO ad_n SELECT i % 400 + 1, i % 3 FROM generate_series(1, 1000) i;
+VACUUM (FREEZE, ANALYZE) ad_f, ad_d, ad_l, ad_s, ad_n;
+-- ---- 1. an inner join inside the dimension --------------------------------------
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 1 AND l.k = d.pk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT count(DISTINCT d.pk), count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 1 AND l.k = d.pk WHERE f.x IN (2, 3)');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT d.attr, count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 2 AND l.k = d.pk WHERE f.x = 3 GROUP BY d.attr');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- a column of the other table of the dimension, counted and grouped by
+SELECT ad_check('SELECT l.score, count(*), count(DISTINCT l.k) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 1 AND l.k = d.pk WHERE f.x = 3 GROUP BY l.score');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- three tables, the key's class holding a column of each
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 1 AND l.k = d.pk JOIN ad_l m ON m.v = 2 AND m.k = l.k WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- ---- 2. the list's own spellings ------------------------------------------------
+-- through a subquery, with the keys left out by LEFT JOIN ... IS NULL
+SELECT ad_check('WITH c AS (SELECT d.pk AS kid, NULL AS tag FROM ad_d d JOIN ad_l l ON l.v = 1 AND l.k = d.pk LEFT JOIN ad_s s ON s.k = d.pk AND s.kind = ''a'' WHERE s.k IS NULL) SELECT count(DISTINCT c.kid), count(*) FROM ad_f f JOIN c ON c.kid = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- ... and by NOT EXISTS
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_l l ON l.v = 1 AND l.k = d.pk WHERE f.x = 3 AND NOT EXISTS (SELECT 1 FROM ad_s s WHERE s.k = d.pk)');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- the LEFT JOIN ... IS NULL over a dimension of one table
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk LEFT JOIN ad_s s ON s.k = d.pk WHERE f.x = 3 AND s.k IS NULL');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- the list alone, named through its partitioned parent
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_l l ON l.v = 1 AND l.k = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT l.score, count(*) FROM ad_f f JOIN ad_l l ON l.k = f.fk WHERE f.x = 3 GROUP BY l.score');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- ---- 3. a key that repeats ------------------------------------------------------
+-- each dimension row counts its fact rows, as the join pairs them
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT count(DISTINCT f.fk), count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT n.attr, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3 GROUP BY n.attr');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- a GROUP BY of the key, whose groups are then several rows each
+SELECT ad_check('SELECT f.fk, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3 AND f.fk < 40 GROUP BY f.fk');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT d.pk, count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_n n ON n.k = d.pk WHERE f.x = 3 AND d.pk < 40 GROUP BY d.pk');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- the inner join repeats a dimension row of a unique key
+SELECT ad_check('SELECT count(*), count(DISTINCT d.pk) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_n n ON n.attr = d.attr WHERE f.x = 3 AND d.pk < 100 AND n.k < 20');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+-- ---- 4. in parallel -------------------------------------------------------------
+SET max_parallel_workers_per_gather = 2;
+SET parallel_setup_cost = 0;
+SET parallel_tuple_cost = 0;
+SET min_parallel_table_scan_size = 0;
+SET min_parallel_index_scan_size = 0;
+SELECT ad_check('WITH c AS (SELECT d.pk AS kid FROM ad_d d JOIN ad_l l ON l.v = 1 AND l.k = d.pk LEFT JOIN ad_s s ON s.k = d.pk WHERE s.k IS NULL) SELECT count(DISTINCT c.kid), count(*) FROM ad_f f JOIN c ON c.kid = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT count(*) FROM ad_f f JOIN ad_l l ON l.v = 1 AND l.k = f.fk WHERE f.x = 3');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+SELECT ad_check('SELECT f.fk, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3 AND f.fk < 40 GROUP BY f.fk');
+        ad_check        
+------------------------
+ pushed down, same rows
+(1 row)
+
+RESET max_parallel_workers_per_gather;
+RESET parallel_setup_cost;
+RESET parallel_tuple_cost;
+RESET min_parallel_table_scan_size;
+RESET min_parallel_index_scan_size;
+-- ---- 5. declined ----------------------------------------------------------------
+-- the fact the inner side of a LEFT JOIN ... IS NULL: the dimension rows
+-- without a fact row, which the ordinary plan answers
+SELECT ad_check('SELECT count(*) FROM ad_d d LEFT JOIN ad_f f ON f.fk = d.pk AND f.x = 3 WHERE f.fk IS NULL');
+          ad_check          
+----------------------------
+ not pushed down, same rows
+(1 row)
+
+-- a column of a table left out by the anti join, which no row carries
+SELECT ad_check('SELECT count(*), max(s.kind) FROM ad_f f JOIN ad_d d ON d.pk = f.fk LEFT JOIN ad_s s ON s.k = d.pk WHERE f.x = 3 AND s.k IS NULL');
+          ad_check          
+----------------------------
+ not pushed down, same rows
+(1 row)
+
+DROP TABLE ad_f, ad_d, ad_l, ad_s, ad_n;
+DROP FUNCTION ad_check(text);
