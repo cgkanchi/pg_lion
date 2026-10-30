@@ -4284,8 +4284,7 @@ extern List *lion_expr_functions(Node *expr, List *funcs);
 
 /*
  * The kinds of core plan a lion path is priced against (DESIGN.md §39,
- * lion_plan_units.c), each with its rate: the cost units a millisecond its
- * plans run at, as a multiple of the 500 lion's CPU constants are fitted at.
+ * lion_plan_units.c)
  */
 typedef enum LionCompetitor
 {
@@ -4304,13 +4303,14 @@ typedef enum LionCompetitor
 } LionCompetitor;
 
 /*
- * The units a lion path's own price is converted into (lion_units_for()), and
- * the margin it is offered at
+ * What a lion path's own price is corrected by, from the core plan it
+ * competes with (lion_units_for()), and the margin it is offered at
  */
 typedef struct LionUnits
 {
 	LionCompetitor kind;		/* the cheapest core path's kind */
-	double		rate;			/* ... and its rate */
+	double		factor;			/* its cold reads' factor on the path's
+								 * price (lion_units_cold()), 1 for none */
 	double		margin;			/* pg_lion.pushdown_margin, or 1 */
 	Cost		nlcost;			/* the cheapest core path's cost */
 	Cost		nlcold;			/* a nested loop's cold reads, over that */
@@ -4320,11 +4320,6 @@ typedef struct LionUnits
 	Cost		bmcold;			/* its bitmap heap scans' cold reads, over
 								 * that, where the loop has none */
 	Cost		bmcoldpage;		/* ... and a cold page's charge, for lion's */
-	double		skew;			/* the rows a nested loop's probes of a
-								 * skewed key meet, as a factor over core's
-								 * (§39, "A skewed key's probes"), 1 for
-								 * none */
-	Cost		nlextra;		/* ... what the loop costs more at them */
 	Cost		nlouter;		/* the cost of the loop's outer side */
 	Relids		nlouterrels;	/* ... and its rels, NULL for a loop in
 								 * a subquery's plan */
@@ -4332,13 +4327,6 @@ typedef struct LionUnits
 								 * as its child at core's price, so that its
 								 * cold reads weigh against the loop's own
 								 * (lion_units_cold()); 0 otherwise */
-	double		skewscale;		/* the loop's price at core's rows over its
-								 * price at those, its outer side apart,
-								 * once the path is priced at them
-								 * (lion_units_take_skew()) - or a count's
-								 * scan's, for its WHERE
-								 * (lion_skew_clauses_scale()); 1 until
-								 * then */
 } LionUnits;
 
 /*
@@ -4360,7 +4348,6 @@ extern Cost lion_memoize_limit_extra(PlannerInfo *root, Path *path,
 									 double share);
 extern bool lion_path_has_lion(Path *path);
 extern LionCompetitor lion_competitor_kind(Path *path);
-extern double lion_competitor_rate(LionCompetitor kind);
 extern Path *lion_competitor_path(RelOptInfo *rel);
 extern void lion_units_for(PlannerInfo *root, RelOptInfo *rel, LionUnits *u);
 extern void lion_units_pin(PlannerInfo *root, RelOptInfo *rel);
@@ -4368,35 +4355,14 @@ extern void lion_units_unpin(void);
 extern RelOptInfo *lion_units_pin_move(RelOptInfo *rel);
 extern Cost lion_units_price(const LionUnits *u, Cost own);
 extern void lion_units_cold(LionUnits *u, Cost own, double reads);
-extern double lion_units_take_skew(LionUnits *u);
 extern void lion_units_bitmap_cold(LionUnits *u, Cost own, double reads);
 extern void lion_units_scan_cold(PlannerInfo *root, RelOptInfo *rel,
 								 LionUnits *u);
 extern double lion_units_bitmap_factor(const LionUnits *u, Cost own,
 									   double reads);
-extern Cost lion_units_bitmap_reads(PlannerInfo *root, Path *path,
-									double *pages);
-extern Cost lion_units_stream_cold_page(PlannerInfo *root, double idxpages,
-										Oid reltablespace);
+extern double lion_units_bitmap_pages(PlannerInfo *root, Path *path);
 extern double lion_units_margin(void);
 extern double lion_units_margin_for(RelOptInfo *rel);
-
-/* lion_plan_skew.c */
-extern double lion_skew_scan_factor(PlannerInfo *root, Path *scan);
-extern Cost lion_skew_scan_extra(PlannerInfo *root, Path *scan, double factor,
-								 double loops, double limit);
-extern double lion_skew_limit_rows(PlannerInfo *root, RelOptInfo *rel);
-extern double lion_skew_limit_share(PlannerInfo *root, RelOptInfo *rel,
-									double rows, double factor, double limit);
-extern void lion_skew_reprice(Path *path, double share, double scale);
-extern Cost lion_skew_set_extra(PlannerInfo *root, RelOptInfo *rel, Path *lion,
-								double *factor);
-extern double lion_skew_rel_scale(PlannerInfo *root, RelOptInfo *rel,
-								  Relids required_outer, double loops);
-extern double lion_skew_clauses_scale(PlannerInfo *root, RelOptInfo *rel,
-									  List *clauses);
-extern void lion_skew_rel_note(PlannerInfo *root, RelOptInfo *rel,
-							   RangeTblEntry *rte);
 
 /* lion_plan_cost.c */
 extern double lion_index_dir_pages(IndexOptInfo *idx, double *height);
@@ -4575,7 +4541,7 @@ extern double lion_fkjoin_fk_ndistinct(PlannerInfo *root, RelOptInfo *rel,
 									   Var *fkvar);
 extern double lion_parallel_divisor(int workers);
 extern Cost lion_cost_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
-								  List *targets, Var *fkvar, double fkskew,
+								  List *targets, Var *fkvar,
 								  int joinclause,
 								  List *whereclauses, List *wherekinds,
 								  List *ors, double dimrows, double found,

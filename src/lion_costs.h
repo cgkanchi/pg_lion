@@ -97,18 +97,6 @@ extern PGDLLIMPORT double lion_fkjoin_sort_seq_page_cost;
 extern PGDLLIMPORT double lion_fkjoin_sort_random_page_cost;
 
 /*
- * The units a lion path is priced in against the plan it competes with
- * (DESIGN.md §39): the cost units a millisecond each kind of core plan runs
- * at, as a multiple of the 500 that lion's CPU constants are fitted at (§10,
- * "The reference").
- */
-extern PGDLLIMPORT double lion_hashagg_rate;
-extern PGDLLIMPORT double lion_agg_rate;
-extern PGDLLIMPORT double lion_hashjoin_rate;
-extern PGDLLIMPORT double lion_mergejoin_rate;
-extern PGDLLIMPORT double lion_bitmap_rate;
-
-/*
  * The share of a lion path's own price it is offered at (DESIGN.md §39, "The
  * margin"): its price is divided by it, so that it must come to this share
  * of the best core plan's to be chosen.  1 is no margin.
@@ -120,14 +108,6 @@ extern PGDLLIMPORT double lion_pushdown_margin;
  * (DESIGN.md §39, "A nested loop's cold reads"): the warm floor.
  */
 extern PGDLLIMPORT double lion_cold_max_discount;
-
-/*
- * Whether a lion path's price is corrected by what lion reads of the core
- * plan it competes with (DESIGN.md §39): the rates, the cold reads, a skewed
- * key's rows and a Memoize's LIMIT.  Off, a path is priced by its own work
- * alone (DESIGN.md §49).
- */
-extern PGDLLIMPORT bool lion_competitor_pricing;
 
 extern void lion_costs_init(void);
 

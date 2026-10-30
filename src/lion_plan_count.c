@@ -4739,8 +4739,7 @@ lion_count_run_plain(LionCountPathBuild *cx, int r)
  * made from it, where there is one.
  *
  * The price is the node's own, in the units of the cheapest core path
- * output_rel has (DESIGN.md §39): times that plan's rate, and over the
- * margin.  What core puts above it - the Finalize Agg of a partitioned or a
+ * output_rel has (DESIGN.md §39): over the margin.  What core puts above it - the Finalize Agg of a partitioned or a
  * parallel GROUP BY, the Gather - core prices itself, in its own units, as it
  * prices the same nodes over its own plans.
  */
@@ -5088,35 +5087,12 @@ lion_count_ownscan_cost(LionCountPathBuild *cx)
 #define LION_COUNT_OWNSCAN_EDGE		1.02
 
 /*
- * A WHERE clause that equates a skewed key to a value the plan does not know
- * is priced at the rows a probed key meets where the relation's own scan of
- * the key is priced at them too (lion_count_rel_set_clause()), and the
- * count's price is put back into core's units by that scan's price at core's
- * rows over its price at those (DESIGN.md §39, "A skewed key's probes"),
- * whatever the competitor: the set was priced so whatever it is.
- */
-static void
-lion_count_skew_units(LionCountPathBuild *cx, LionUnits *units)
-{
-	List	   *clauses = NIL;
-	ListCell   *lc;
-
-	if (cx->first == NULL || cx->whereclauses == NIL)
-		return;
-	foreach(lc, cx->whereclauses)
-		clauses = lappend(clauses, lion_vcol_unvar((Node *) lfirst(lc)));
-	units->skewscale = lion_skew_clauses_scale(cx->root, cx->first->rel,
-											   clauses);
-	list_free(clauses);
-}
-
-/*
  * The anti join over a small inner side (DESIGN.md §27) on the price of the
- * serial node cpath, whose own work `units` converted: its lookups, the
- * node's own work, converted as the count is; and its child, core's plan in
+ * serial node cpath, whose own work `units` priced: its lookups, the
+ * node's own work, priced as the count is; and its child, core's plan in
  * core's units, as an FK-side join's dimension is.  Both before the first
  * row, which comes once every key is looked up.  Returns the lookups'
- * converted price, which a participant of the parallel form that makes the
+ * price, which a participant of the parallel form that makes the
  * run pays too (lion_count_anti_parallel()); 0 without the anti join.
  */
 static Cost
@@ -5142,7 +5118,7 @@ lion_count_anti_price(const LionCountPathBuild *cx, const LionUnits *units,
  * ... and of its parallel form: the child a participant runs
  * (lion_anti_parallel_child()), where the join's expressions may be
  * evaluated in a worker and the inner side has one, and into *run the price
- * of a participant's run - `lookups`, the lookups converted, and that
+ * of a participant's run - `lookups`, the lookups' price, and that
  * child's price.  NULL, and *run 0, when there is none.
  */
 static Path *
@@ -5310,8 +5286,6 @@ lion_count_path_add(LionCountPathBuild *cx, CustomPath *cpath)
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
 								 cx->whereinor))
 		units.margin = 1.0;
-
-	lion_count_skew_units(cx, &units);
 
 	lion_count_path_price_runs(cx, cpath, cx->targets, &rangeprice,
 							   &walksave);
@@ -5882,7 +5856,7 @@ lion_add_parallel_cells_path(LionCountPathBuild *cx, CustomPath *serial,
  * where the query may run in parallel.  The price is the node's own in the
  * units of the cheapest core path (DESIGN.md §39), the qual over the
  * predicates evaluated once a cell; beside the anti join over a small inner
- * side (§27) its lookups, converted as the count is, and its child, core's
+ * side (§27) its lookups, priced as the count is, and its child, core's
  * plan in core's units, both before the first row.
  */
 static void
@@ -5903,7 +5877,6 @@ lion_count_cells_add(LionCountPathBuild *cx, CustomPath *cpath)
 	if (lion_where_query_unknown(cx->whereclauses, cx->wherekinds,
 								 cx->whereinor))
 		units.margin = 1.0;
-	lion_count_skew_units(cx, &units);
 	lion_cost_cells_path(root, cpath, cx->targets, cx->whereclauses,
 						 cx->wherekinds, cx->ors, cx->cellplan,
 						 cx->cellwhererows, cx->outrows, &perrange);
