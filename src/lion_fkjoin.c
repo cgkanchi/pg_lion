@@ -19,9 +19,10 @@
  *		for a group is the sum over the group's dimension rows of each row's
  *		matching fact rows, so it is additive over dimension rows whatever the
  *		key holds.  Uniqueness is proved here only for what rests on it - a
- *		GROUP BY of the key, the dimension LEFT JOIN the fact (keyunique) -
- *		rather than taken from core's relation_has_unique_index_for(), which
- *		before PostgreSQL 19 does not compare collations.
+ *		GROUP BY of the key, its keys united, the dimension LEFT JOIN the fact
+ *		(keyunique) - rather than taken from core's
+ *		relation_has_unique_index_for(), which before PostgreSQL 19 does not
+ *		compare collations.
  *
  *		The semi and anti joins of `EXISTS`, `IN` and `NOT EXISTS` are
  *		recognised here too: the dimension is the outer side, whose rows the
@@ -573,7 +574,7 @@ lion_fkjoin_pick_dim(PlannerInfo *root, RelOptInfo *fact, Relids visible,
  * them.  With one visible table they are that table's rows, each at most
  * once; with several, inner-joined, a row of one may repeat, which an inner
  * join's count is exact over (DESIGN.md §27, "A dimension that is any join")
- * and only a GROUP BY of the key asks about (keyunique).  The key is taken
+ * and only a GROUP BY of the key, or its keys united, asks about (keyunique).  The key is taken
  * from one of them (lion_fkjoin_pick_dim()).
  *
  * The tables of `folded` are dimensions that only filter, `filters` their
@@ -844,7 +845,8 @@ lion_fkjoin_try_fact(PlannerInfo *root, RelOptInfo *joinrel, int factrelid,
 		 * they hold: a key two of them share is counted for each, as the
 		 * join pairs it with each.  So any join of the dimension's tables
 		 * will do, and its rows are core's to make; only a GROUP BY of the
-		 * key asks that no key repeat (keyunique, lion_plan_fkjoin.c).  A
+		 * key, or its keys united, asks that no key repeat (keyunique,
+		 * lion_plan_fkjoin.c).  A
 		 * LEFT JOIN's count is a sum over the dimension rows too, each row's
 		 * own count or - with no fact row - its one null-extended row, and
 		 * keeps the proof as its scope guard.

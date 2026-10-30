@@ -117,6 +117,9 @@ SELECT ad_check('SELECT n.attr, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk W
 -- a GROUP BY of the key, whose groups are then several rows each
 SELECT ad_check('SELECT f.fk, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk WHERE f.x = 3 AND f.fk < 40 GROUP BY f.fk');
 SELECT ad_check('SELECT d.pk, count(*) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_n n ON n.k = d.pk WHERE f.x = 3 AND d.pk < 40 GROUP BY d.pk');
+-- grouped by a fact column: each group counts the repeats too, the keys
+-- counted one by one rather than united
+SELECT ad_check('SELECT f.x, count(*) FROM ad_f f JOIN ad_n n ON n.k = f.fk GROUP BY f.x');
 -- the inner join repeats a dimension row of a unique key
 SELECT ad_check('SELECT count(*), count(DISTINCT d.pk) FROM ad_f f JOIN ad_d d ON d.pk = f.fk JOIN ad_n n ON n.attr = d.attr WHERE f.x = 3 AND d.pk < 100 AND n.k < 20');
 

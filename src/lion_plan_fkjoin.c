@@ -2224,13 +2224,18 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * the HAVING, and counts alone - the rows of the batch's keys in one
 	 * group are one row's worth to the Finalize Agg, which adds them up: so
 	 * the keys may be united once, and each group counted against the union
-	 * ("Grouped by a fact column, the keys united").  An inner join's - or
-	 * the forward semi join's distinct keys' - fk sets are disjoint, a fact
-	 * row having one fk value, so the union's count in a group is their
-	 * counts' sum there.
+	 * ("Grouped by a fact column, the keys united").  The keys of an inner
+	 * join over a unique key - or the forward semi join's distinct keys -
+	 * have disjoint fk sets, a fact row having one fk value, so the union's
+	 * count in a group is their counts' sum there.  A key that repeats does
+	 * not: two dimension rows of one key count its fact rows twice, and the
+	 * union once.  The executor counts a repeat of the same bytes key by key,
+	 * but under a nondeterministic collation 'a' and 'A' are one key in other
+	 * bytes, so a key not proven unique is counted key by key throughout.
 	 */
 	mayunite = (fgvar != NULL && rowagg == NULL && !keyrows &&
-				jointype == LION_JOIN_INNER);
+				jointype == LION_JOIN_INNER &&
+				(fj->jointype == JOIN_UNIQUE_INNER || fj->keyunique));
 
 	lion_add_fkjoin_paths(root, rel, output_rel, fj, having, targets,
 						  fj->dimpath, 0, nodetarget, base, joinclause,
