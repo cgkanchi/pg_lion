@@ -69,6 +69,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
@@ -7052,7 +7053,9 @@ lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 
 /*
  * The clauses a path's own index scans answer exactly: not a lossy one, whose
- * rows the scan rechecks, nor an OR's arms
+ * rows the scan rechecks, nor an OR's arms.  Only a B-tree is known never to
+ * ask for a recheck at run time; other methods (GiST, GIN, BRIN, lion's own
+ * hashed keys) may, so their clauses count as unanswered.
  */
 static List *
 lion_skew_bitmap_answers(Path *bitmapqual)
@@ -7062,6 +7065,8 @@ lion_skew_bitmap_answers(Path *bitmapqual)
 
 	if (IsA(bitmapqual, IndexPath))
 	{
+		if (((IndexPath *) bitmapqual)->indexinfo->relam != BTREE_AM_OID)
+			return NIL;
 		foreach(lc, ((IndexPath *) bitmapqual)->indexclauses)
 		{
 			IndexClause *iclause = (IndexClause *) lfirst(lc);
