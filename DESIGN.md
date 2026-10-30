@@ -30627,6 +30627,8 @@ index tuple, the rejected rows are not fetched and need no price.
   does not see, it could only be the rest of the join at once, the two sets hash-joined and sorted:
   core's plan of the join without the page's filters, a bound, but the dense page's 6.5 seconds on
   §47.10's tables. Either needs a price for the switch, as §30.4's has, and a sort past `work_mem`.
+  Where the filter above is an EXISTS or IN whose table could be a key set, the turn is to the key
+  set (§47.11): the set deferred, and built once the walk has run past the rows it was priced for.
 - **A key set's keys tested before the fact's heap, where neither index holds the key.** Folded
   where the key has a lion index, tested on the index tuple where the walked B-tree holds it
   (§47.6). With neither, the walk fetches the member's row and the join reads its key.
@@ -30962,6 +30964,79 @@ over. Read, the side table stays a join above; not read, it is a key set (its ke
 table not read, are a key set's estimate: 8.6 and 11 times faster than the join above, about 3 and
 11 times slower than core's plan. Ordered by the score alone, the page is core's either way (50 and
 54 ms). Not measured: cold, other majors.
+
+### 47.11 Deferred key sets (`oj_add_paths()`, `oj_defer_at()`, 2026-10-29)
+
+A key set is built before the walk: its plan runs to its end, and the node's start-up is that
+plan's whole price (§47.3). For an EXISTS whose filter matches many rows - hundreds of thousands
+over a large share of the keys - the plan reads every one of them, while a page under a LIMIT is
+met in a thousand or so rows of the walk, a tenth of which the EXISTS passes. Built first, the set costs the node more than core's
+plan of the page, which joins the whole fact to the dimension and sorts it, and core's plan is
+taken: about 1.4 seconds against 0.07 on the measurements below. Where the EXISTS is joined above
+the node (§47.6, "A join above"), or inside the join search but above the join rel, the semi join
+above tests the node's rows anyway; the set only spares the walk the descents of the rows that
+join would drop.
+
+**The deferred paths.** Under a LIMIT each join is offered again with the key sets above deferred
+(`oj_add_paths()`): the tables of §47.6's "A join above", and, for these paths alone, the table of
+an EXISTS or IN inside the join search, the whole inner side of a semi join above the join rel, by
+the same rules (`oj_keysets_above()` with `insearch`; an inner-joined table inside the search is
+not taken, its join being the one that returns its rows). A deferred set is not built before the
+walk, its keys are not tested, and it is never folded (§47.6), whose fold needs the keys before
+the walk; the key sets of the join rel itself are built as before. The joins above filter the
+node's rows, which they drop `abovepass` of (§47.6), and the node is alone under the LIMIT where
+the deferred sets' tables are its only other filters (§47.10).
+
+**Price** (`oj_cost()`, `os_cost()`). A deferred set adds nothing to the start-up and no test a
+key, and lets every key through: the descents, members and rows are the walk's without it. The
+LIMIT's share is taken over the rows the joins above return, `out * abovepass` (`oj_above_rows()`),
+in place of `out * aboverep` for the sets built first; the split's arms are priced to meet
+`limit / abovepass` rows. The semi join above is core's, at core's price of its probes. Both ways
+are offered and `add_path()` keeps what it keeps: a narrow EXISTS, whose rows the walk meets in
+many thousands of entries, keeps its set built first.
+
+**The turn** (`oj_defer_at()`, `oj_exec()`). The node counts the rows it returns, over every
+rescan - the split's arms are rescans - and at `deferat` of them builds the deferred sets; from the
+next row on, each key is tested as a key set's is, on the walked B-tree's index tuple where it
+holds the key (§47.6, "Tested on the index tuple"), and an empty set ends the scan, as one built
+first does: the join above would drop every row the node returned. `deferat` is twice the rows the
+LIMIT is expected to take of the node, `limit / abovepass`, or, where more, the rows that cost what
+the sets' plans do, as a lazy set builds itself once its probes have cost what the build would
+(§30.4): a row costs its share of the node's run and, for each deferred set, the join above's test
+of it, the cheapest parameterized path of the set's table (a probe of its key; a
+`cpu_operator_cost` where it has none, a hash join's probe). A walk whose rows the joins above keep
+fewer of than they were priced at - the EXISTS's keys among the rows the walk meets last - is then
+given up on at about twice its price, plus the build, for the walk the built sets filter. Nothing
+the set drops is a row the join above would keep: before it is built the node drops nothing, after
+it only rows whose key the EXISTS's table lacks.
+
+**EXPLAIN** prints `(deferred)` after each deferred set's table in `Key Sets`, and `Key Sets
+Deferred For: <N> rows`; `Key Set Builds` is 0 where the walk never reached them.
+`pg_lion.enable_key_set_defer` (on) offers the deferred paths.
+
+**Tests** (`ordjoin_defer`): a broad tag deferred and never built, with the EXISTS above the
+explicit join (`join_collapse_limit` 1) and inside the search, and as an IN; a tag on the keys of
+the fact's lower half of scores, priced as met in two hundred rows, deferred, built once at the
+turn, the same rows; a narrow tag not deferred; the switch off and no LIMIT, nothing deferred;
+with a lion index on the fact's key, a deferred set never folded, the split's paths as the join's.
+Every answer against core's plan with the node off, row by row.
+
+**Measured** (2026-10-29; PostgreSQL 18.6 built without assertions, 4 cores, `shared_buffers` 4 GB,
+warm, the median of three runs after one; `random_page_cost` 1.1, `work_mem` 256 MB). A dimension
+of 3M rows, 80% `flag`; a fact leaf of 2M of its keys with a score B-tree including the key; a
+child table of 20M rows over the dimension's keys, 10M of them on 5,000 keys, a `tsvector` of
+three tags each; the page of §47.10's shape with eight tables, `EXISTS (SELECT 1 FROM child c WHERE
+c.doc @@ q AND c.fk = d.pk)`, ordered by `d.flag DESC, f.score DESC, d.rel DESC`, `LIMIT 100`:
+
+| `q` | collapse limits 8 (EXISTS above) | limits 16 (inside the search) |
+|---|---|---|
+| `(s1 \| s2) & (f1 \| f2)` (554,462 rows, 9% of the keys) | 1,409 ms (core's sort of the join) to 64 ms, deferred | 1,472 ms to 69 ms |
+| `s1 & f1 & w1` (144 keys) | 980 ms, set built first, either way | 29 to 30 ms, either way |
+
+The same rows in every case, and with the node off. The narrow tag at limit 8 walks the whole leaf
+(3.9M entries) for its keys: the leaf's lion index has no column of the key, so the key set cannot
+be folded (§47.6), and every entry is tested on the B-tree's tuple; with a lion index on the key
+it takes 300 to 340 ms. Not measured: cold, other majors.
 
 ## 48. An ORDER BY led by the dimension: the join an arm at a time (LionOrderedSplit, lion_ordjoin.c, 2026-10-24)
 
