@@ -6991,7 +6991,8 @@ lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
 
 /*
  * What the index scans under a bitmap heap scan's bitmap read more at the
- * rows a skewed probe meets: each index scan's cost, up to scale times, by
+ * rows a skewed probe meets: each index scan's index cost (indextotalcost,
+ * what cost_bitmap_heap_scan() charges it at), up to scale times, by
  * the factor of the skewed clauses its index answers.  A bitmap heap scan
  * charges them to its startup, which its run's factor does not reach.
  */
@@ -7004,7 +7005,7 @@ lion_skew_bitmap_more(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
 	ListCell   *lc;
 
 	if (IsA(bitmapqual, IndexPath))
-		return bitmapqual->total_cost *
+		return ((IndexPath *) bitmapqual)->indextotalcost *
 			(Min(lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual),
 				 scale) - 1.0);
 	if (IsA(bitmapqual, BitmapAndPath))
