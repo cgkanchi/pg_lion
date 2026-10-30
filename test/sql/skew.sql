@@ -300,7 +300,8 @@ SELECT (SELECT cost FROM lsw_q, lsw_node(q) WHERE name = 'semi') = :semi_on
 		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_within') AS within_factor;
 -- A bitmap heap scan's bitmap is whole before its first row: a semi
 -- join's probe by its key alone reads all of a heavy key's entries, and is
--- priced so.
+-- priced so.  Its run is repriced too, as the bitmap here is lion's, whose
+-- scan may ask for a recheck: only a B-tree's clauses count as exact.
 RESET enable_seqscan;
 SET enable_indexscan = off;
 SET enable_bitmapscan = on;
