@@ -422,7 +422,7 @@ SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d
 SELECT lion_gj('SELECT d.attr, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.attr');
 SELECT lion_gj('SELECT d.pk, count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0) GROUP BY d.pk');
 SELECT lion_gj('SELECT count(DISTINCT d.attr), count(*), max(d.grp) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = d.pk AND f1.id % 3 = 0)');
-SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind IN (''a'', ''c'') AND f1.ts >= now() - interval ''120 days'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w2'') GROUP BY d.region', 'fact');
+SELECT lion_gj('SELECT d.region, count(*), sum(d.small), count(d.attr) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind IN (''a'', ''c'') AND f1.ts >= now() - interval ''120 days'' AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.doc @@ ''w2'') GROUP BY d.region');
 SELECT lion_gj('SELECT f1.fk, count(*) FROM lion_gj_f1 f1 JOIN lion_gj_d d ON f1.fk = d.pk WHERE f1.kind = ''b'' AND f1.x = 4 AND EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = d.pk AND f3.z = 1) GROUP BY f1.fk');
 -- an inner join inside an EXISTS of the dimension, and nested EXISTS there:
 -- the dimension's rows are still its table's, each once
@@ -444,8 +444,8 @@ RESET pg_lion.enable_count_pushdown;
 SELECT lion_gj('SELECT count(*) FROM lion_gj_n n WHERE n.attr < 3 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.y = 5)');
 SELECT lion_gj('SELECT n.attr, count(*), count(n.k) FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f3 f3 WHERE f3.fk = n.k AND f3.z = 4) AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.y < 3) GROUP BY n.attr');
 SELECT lion_gj('SELECT count(*) FROM lion_gj_n n WHERE NOT EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.x = 2) AND NOT EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.doc @@ ''v4'')');
--- an inner join over the joined non-unique dimension is declined: nothing
--- proves its key unique
+-- an inner join over the joined non-unique dimension: counted for each of its
+-- rows, as the join pairs them (fkjoin_anydim.sql)
 SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_n n ON f2.fk = n.k WHERE f2.y = 5 AND EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'')');
 -- ... and grouped by its key it is not a group a row: hashed
 SELECT * FROM lion_gj_explain('SELECT n.k, count(*) FROM lion_gj_n n WHERE EXISTS (SELECT 1 FROM lion_gj_f1 f1 WHERE f1.fk = n.k AND f1.kind = ''b'') AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = n.k AND f2.id % 3 = 0) GROUP BY n.k');
@@ -582,7 +582,8 @@ SELECT lion_gj('SELECT v.r, (SELECT count(*) FROM lion_gj_f2 f2 WHERE f2.y < 7 A
 -- ---- 7. declined ---------------------------------------------------------------
 -- (over a few hundred dimension rows: with every join disabled, the ordinary
 -- plans of these can be slow)
--- an inner join inside the dimension, which may repeat its rows
+-- an inner join inside the dimension, which may repeat its rows: taken since an
+-- inner join's count is exact over any dimension (fkjoin_anydim.sql)
 SELECT lion_gj('SELECT count(*) FROM lion_gj_d d JOIN lion_gj_n n ON n.k = d.pk WHERE d.pk < 300 AND EXISTS (SELECT 1 FROM lion_gj_f2 f2 WHERE f2.fk = d.pk AND f2.y = 5)');
 SELECT lion_gj('SELECT count(*) FROM lion_gj_f2 f2 JOIN lion_gj_d d ON f2.fk = d.pk JOIN lion_gj_n n ON n.attr = d.attr WHERE d.pk < 300 AND n.k < 100 AND f2.y = 5');
 -- an outer join, and with it a PlaceHolderVar

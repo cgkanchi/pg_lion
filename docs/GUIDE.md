@@ -290,8 +290,9 @@ WHERE cu.country = 'NZ'
   AND EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = cu.id AND o.status = 'open');
 ```
 
-Written as a JOIN, the first form needs `customers.id` unique (a primary key). As `EXISTS` or `IN`
-it does not: over a key that repeats - `o.customer_id IN (SELECT customer_id FROM visits WHERE
+Written as a JOIN, the first form counts each order once per customer row it joins, as the join
+does, whether or not `customers.id` is unique. As `EXISTS` or `IN` each order counts once: over a
+key that repeats - `o.customer_id IN (SELECT customer_id FROM visits WHERE
 ...)` - the node sorts the subquery's keys and counts each distinct key's orders once (DESIGN.md
 §27; five million fact rows against 9,776 rows over 8,848 distinct keys took 117 ms, against 585
 for the hash semi join, on an assert build). The JOIN and the second form may group by the
@@ -358,14 +359,20 @@ key once per partition it was looked up in. The partitions are the ones plan-tim
 partition that only run-time pruning would remove, as with `ts >= now() - interval '1 year'` over
 partitions by year, is counted too, and contributes nothing.
 
-The dimension may itself be a join: one table that carries the key, and other tables joined to it
-only by `EXISTS`, `IN` or `NOT EXISTS`, which never repeat its rows (DESIGN.md §27, "A dimension
-that is a join"). A dimension `d` with an `EXISTS` on each of two fact tables `f1` and `f2` is
+The dimension may itself be a join of any tables but the fact table (DESIGN.md §27, "A dimension
+that is a join" and "A dimension that is any join"): inner joins, `EXISTS`, `IN`, `NOT EXISTS` or
+`LEFT JOIN ... WHERE x.k IS NULL`, spelled in a subquery or a `WITH` or not, and a list named through
+its partitioned parent. Counting orders of open status for the customers on one list, less the ones
+excluded, `SELECT count(*) FROM orders o JOIN customers cu ON cu.id = o.customer_id JOIN lists l ON
+l.list_id = 7 AND l.customer_id = cu.id LEFT JOIN excluded x ON x.customer_id = cu.id WHERE o.status
+= 'open' AND x.customer_id IS NULL`, reads no order row: each customer the join returns is looked
+up in the orders' Lion index on `customer_id`, which also holds `status`. A dimension `d` with an `EXISTS` on each of two fact tables `f1` and `f2` is
 then `f2` counted against `d` semi-joined to `f1`, or `f1` against `d` semi-joined to `f2`,
 whichever the cost model prices lower; and `SELECT count(*) FROM f2 WHERE ... AND f2.fk IN (SELECT
 d.pk FROM dim d WHERE ... AND EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND ...))` counts `f2`
-against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. An
-inner or outer join inside the dimension, which could repeat a row, keeps the ordinary plan.
+against the dimension rows that pass. The node's child is PostgreSQL's own plan of that join. A
+grouping by the join key is grouped by PostgreSQL's aggregate when the join could repeat a key. An
+outer join inside the dimension, other than the `IS NULL` one, keeps the ordinary plan.
 
 A second table joined to the fact table only to filter it is folded into a fact filter (DESIGN.md
 §27, "A second dimension that only filters"). In `SELECT cu.country, count(*) FROM orders o JOIN
