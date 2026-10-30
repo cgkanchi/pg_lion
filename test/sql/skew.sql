@@ -1,0 +1,300 @@
+-- The rows a probed key meets on a skewed key column (DESIGN.md §33, "The
+-- rows of a probed key").
+--
+-- A nested loop's inner scan, parameterized by a join clause that equates a
+-- key column to the outer row's value, is priced by core at the column's
+-- rows per key.  The keys a join probes are drawn as rows are, each with the
+-- chance of its rows, and on a column with a few large keys past the most
+-- common values a probe meets many times that.  A lion index sums the
+-- squares of its keys' rows, Σn², in the pass that counts them; with the MCV
+-- list's shares that gives the rows a key outside the list has, by the row,
+-- and where those are at least twice core's, the probes are priced at them.
+-- pg_lion.enable_skew_estimate turns it off.  Every answer is compared with
+-- core's.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+LOAD 'pg_lion';
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+-- VACUUM can only set all-visible once the commit record is on disk
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- lion_debug_key_skew(): what an index's meta page holds for each key
+-- column, the rows counted over, the keys and the sum of the squares of
+-- their rows; lion_debug_skew_rows(): plan a query and return, for each
+-- column a probe was priced on, the rows a probed key meets and core's rows
+-- per key
+CREATE FUNCTION lsw_key_skew(regclass, OUT col int2, OUT rows int8,
+							 OUT ndistinct int8, OUT sumsq numeric)
+	RETURNS SETOF record
+	AS '$libdir/pg_lion', 'lion_debug_key_skew' LANGUAGE C STRICT;
+CREATE FUNCTION lsw_skew_rows(text, OUT relid regclass, OUT attnum int2,
+							  OUT rows float8, OUT keyrows float8)
+	RETURNS SETOF record
+	AS '$libdir/pg_lion', 'lion_debug_skew_rows' LANGUAGE C STRICT;
+
+-- ---------- 1. the setting ----------
+SELECT name, setting, boot_val, context, vartype
+  FROM pg_settings
+ WHERE name = 'pg_lion.enable_skew_estimate';
+
+-- ---------- 2. the figure ----------
+-- 15,000 rows: keys 1 to 10 of 500 rows each, 11 to 1,010 of ten each.
+-- Small enough for ANALYZE to read every row; k's most common value is one
+-- of the ten.  lsw_probe is a nested loop's probe of k from two outer rows.
+CREATE TABLE lsw_s (id int NOT NULL, k int NOT NULL)
+	WITH (autovacuum_enabled = off);
+ALTER TABLE lsw_s ALTER k SET STATISTICS 1;
+INSERT INTO lsw_s
+SELECT i, CASE WHEN i <= 5000 THEN 1 + (i - 1) / 500 ELSE 11 + (i - 5001) / 10 END
+  FROM generate_series(1, 15000) i;
+CREATE INDEX lsw_s_k ON lsw_s USING lion (k);
+VACUUM ANALYZE lsw_s;
+\set lsw_probe 'SELECT count(*) FROM (VALUES (1), (2)) t(x) JOIN lsw_s s ON s.k = t.x'
+/* the meta page's figures, and the table's own */
+CREATE FUNCTION lsw_s_check() RETURNS TABLE (rows int8, ndistinct int8,
+											 sumsq numeric, exact boolean)
+LANGUAGE sql AS $$
+	SELECT s.rows, s.ndistinct, s.sumsq,
+		   s.sumsq = (SELECT sum(n::numeric * n)
+						FROM (SELECT count(*) AS n FROM lsw_s GROUP BY k) g) AND
+		   s.ndistinct = (SELECT count(DISTINCT k) FROM lsw_s)
+	  FROM lsw_key_skew('lsw_s_k') s
+$$;
+-- the build's: 10 x 500^2 + 1,000 x 10^2
+SELECT * FROM lsw_s_check();
+-- a probe of k: (2,600,000 - 500^2) / 14,500 rows, against 15,000 / 1,010
+SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lsw_skew_rows(:'lsw_probe');
+-- off, nothing is worked out
+SET pg_lion.enable_skew_estimate = off;
+SELECT count(*) AS figures FROM lsw_skew_rows(:'lsw_probe');
+RESET pg_lion.enable_skew_estimate;
+-- a column whose MCV list holds every value has no key outside it: a probe
+-- keeps core's rows
+CREATE TABLE lsw_m (k int NOT NULL) WITH (autovacuum_enabled = off);
+INSERT INTO lsw_m
+SELECT CASE WHEN i <= 900 THEN 1 WHEN i <= 990 THEN 2 ELSE 3 END
+  FROM generate_series(1, 1000) i;
+CREATE INDEX lsw_m_k ON lsw_m USING lion (k);
+ANALYZE lsw_m;
+SELECT (SELECT sumsq FROM lsw_key_skew('lsw_m_k')) AS sumsq,
+	   (SELECT array_length(most_common_vals::text::int[], 1) FROM pg_stats
+		 WHERE tablename = 'lsw_m' AND attname = 'k') AS mcvs;
+SELECT relid, attnum, rows = keyrows AS core_rows, keyrows
+  FROM lsw_skew_rows('SELECT count(*) FROM (VALUES (1), (2)) t(x) JOIN lsw_m m ON m.k = t.x');
+DROP TABLE lsw_m;
+-- a VACUUM that deletes counts what is left: half of key 2's rows, and
+-- every row of keys 11 to 20
+DELETE FROM lsw_s WHERE (k = 2 AND id % 2 = 0) OR k BETWEEN 11 AND 20;
+VACUUM lsw_s;
+SELECT * FROM lsw_s_check();
+-- an ANALYZE whose directory is small walks it: key 3 grows to 900 rows
+INSERT INTO lsw_s SELECT 20000 + i, 3 FROM generate_series(1, 400) i;
+ANALYZE lsw_s;
+SELECT * FROM lsw_s_check();
+
+-- the table grows without a count: each of its keys - a tenth of its rows
+-- or fewer, so a fixed set - grows with it, and Σn² as the square of the
+-- growth.  The same rows again, twice the table, twice the rows a probed key
+-- meets; past twice the rows counted the count is not used, nor the sum.
+CREATE TEMP TABLE lsw_fig (step text, rows float8, keyrows float8);
+INSERT INTO lsw_fig
+SELECT 'counted', rows, keyrows FROM lsw_skew_rows(:'lsw_probe');
+INSERT INTO lsw_s SELECT id + 100000, k FROM lsw_s;
+INSERT INTO lsw_fig
+SELECT 'doubled', rows, keyrows FROM lsw_skew_rows(:'lsw_probe');
+SELECT round(((SELECT rows FROM lsw_fig WHERE step = 'doubled') /
+			  (SELECT rows FROM lsw_fig WHERE step = 'counted'))::numeric, 1)
+	   AS growth;
+INSERT INTO lsw_s SELECT id + 200000, k FROM lsw_s WHERE id % 4 = 0;
+SELECT rows IS NULL AS stale FROM lsw_skew_rows(:'lsw_probe');
+DROP TABLE lsw_s, lsw_fig;
+DROP FUNCTION lsw_s_check();
+
+-- ---------- 3. the probes ----------
+-- A dimension of 20,128 keys and a fact of 200,000 rows on them: keys 1 to
+-- 8 have 5,000 rows each, keys 9 to 128 1,000 each, the other 20,000 two.
+-- Every row read by ANALYZE; the key's statistics target 8, so that its
+-- most common values are the eight largest keys.  doc holds two words, a of
+-- three values and b of four.  The fact's lion index holds both; a B-tree
+-- on the key.  Keys 9 to 18 are the dimension's group 1.
+CREATE TABLE lsw_dim (id int PRIMARY KEY, grp int NOT NULL);
+INSERT INTO lsw_dim
+SELECT i, CASE WHEN i <= 8 THEN 0 WHEN i <= 128 THEN 1 + (i - 9) / 10
+			   ELSE 100 + i % 1000 END
+  FROM generate_series(1, 20128) i;
+CREATE TABLE lsw_fact (id int NOT NULL, fk int NOT NULL, doc tsvector NOT NULL,
+					   pad text)
+	WITH (autovacuum_enabled = off);
+INSERT INTO lsw_fact
+SELECT row_number() OVER (ORDER BY hashint4(k * 7 + n)), k,
+	   to_tsvector('simple',
+				   'a' || (hashint4(k * 31 + n) & 2147483647) % 3 ||
+				   ' b' || (hashint4(k * 17 + n + 5) & 2147483647) % 4),
+	   repeat('p', 150)
+  FROM (SELECT k, generate_series(1, CASE WHEN k <= 8 THEN 5000
+										  WHEN k <= 128 THEN 1000
+										  ELSE 2 END) AS n
+		  FROM generate_series(1, 20128) k) s
+ ORDER BY hashint4(k * 7 + n);
+ALTER TABLE lsw_fact ALTER fk SET STATISTICS 8;
+CREATE INDEX lsw_fact_lion ON lsw_fact USING lion (fk, doc);
+CREATE INDEX lsw_fact_fk ON lsw_fact (fk);
+SET default_statistics_target = 1000;
+VACUUM (FREEZE, ANALYZE) lsw_dim;
+VACUUM (FREEZE, ANALYZE) lsw_fact;
+RESET default_statistics_target;
+
+/*
+ * lsw_plan() is q's plan as its nodes' names, a node's children in brackets
+ * after it: a custom scan by its name, an index scan with its index's.
+ * lsw_node() is the first node of q's plan, top down, scanning lsw_fact with
+ * a parameter - the loop's probe - as its rows and run cost.
+ */
+CREATE FUNCTION lsw_names(p json) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	r text := coalesce(p->>'Custom Plan Provider', p->>'Node Type') ||
+		coalesce(' ' || (p->>'Index Name'), '');
+	c json;
+	kids text[] := '{}';
+BEGIN
+	FOR c IN SELECT * FROM json_array_elements(coalesce(p->'Plans', '[]'::json))
+	LOOP
+		kids := kids || lsw_names(c);
+	END LOOP;
+	IF cardinality(kids) > 0 THEN
+		r := r || '[' || array_to_string(kids, ', ') || ']';
+	END IF;
+	RETURN r;
+END $$;
+CREATE FUNCTION lsw_plan(q text) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (COSTS OFF, FORMAT JSON) ' || q INTO p;
+	RETURN lsw_names(p->0->'Plan');
+END $$;
+CREATE FUNCTION lsw_find(p json, OUT rows float8, OUT cost float8)
+LANGUAGE plpgsql AS $$
+DECLARE
+	c json;
+BEGIN
+	IF p->>'Relation Name' = 'lsw_fact' AND
+	   coalesce(p->>'Index Cond', p->>'Recheck Cond', '') LIKE '%d.id%' THEN
+		rows := (p->>'Plan Rows')::float8;
+		cost := (p->>'Total Cost')::float8 - (p->>'Startup Cost')::float8;
+		RETURN;
+	END IF;
+	FOR c IN SELECT * FROM json_array_elements(coalesce(p->'Plans', '[]'::json))
+	LOOP
+		SELECT * INTO rows, cost FROM lsw_find(c);
+		IF rows IS NOT NULL THEN
+			RETURN;
+		END IF;
+	END LOOP;
+END $$;
+CREATE FUNCTION lsw_node(q text, OUT rows float8, OUT cost float8)
+LANGUAGE plpgsql AS $$
+DECLARE
+	p json;
+BEGIN
+	EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO p;
+	SELECT * INTO rows, cost FROM lsw_find(p->0->'Plan');
+END $$;
+
+-- The queries: a count over the keys of group 1, by a join, and as a semi
+-- join with the fact on its inner side, with and without a join clause
+-- beyond the key.
+CREATE TEMP TABLE lsw_q (name text PRIMARY KEY, q text);
+INSERT INTO lsw_q VALUES
+	('loop', $q$SELECT count(*) FROM lsw_dim d JOIN lsw_fact f ON f.fk = d.id WHERE d.grp = 1 AND d.id % 3 = 0 AND f.doc @@ 'a1 | a2'::tsquery$q$),
+	('semi', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id)$q$),
+	('semi_beyond', $q$SELECT count(*) FROM lsw_dim d WHERE d.grp = 1 AND EXISTS (SELECT FROM lsw_fact f WHERE f.fk = d.id AND f.id > d.id)$q$);
+
+-- a probed key meets (320,080,000 - 8 x 5,000^2) / 160,000 rows, where core
+-- has 200,000 / 20,128
+SELECT relid, attnum, round(rows::numeric, 2) AS rows, keyrows
+  FROM lsw_q, lsw_skew_rows(q) WHERE name = 'loop';
+-- a unique column: one row, as core has it, and so no probe repriced
+CREATE INDEX lsw_fact_id ON lsw_fact USING lion (id);
+SELECT relid, attnum, rows, keyrows
+  FROM lsw_skew_rows('SELECT count(*) FROM lsw_dim d JOIN lsw_fact f ON f.id = d.id WHERE d.grp = 1');
+DROP INDEX lsw_fact_id;
+
+-- A table the cache cannot hold, on storage whose random reads cost little
+-- more than sequential ones.
+SET random_page_cost = 1.1;
+SET effective_cache_size = '1MB';
+
+-- ---------- 4. a nested loop ----------
+-- The loop's probe of the key, at core's 10 rows a key and at the 750 a
+-- probed key meets: its rows and its run cost grow by the same factor.
+SET pg_lion.enable_count_pushdown = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET pg_lion.enable_skew_estimate = off;
+SELECT rows AS rows_off, cost AS cost_off
+  FROM lsw_q, lsw_node(q) WHERE name = 'loop' \gset
+SET pg_lion.enable_skew_estimate = on;
+SELECT round((rows / :rows_off)::numeric) AS rows_factor,
+	   round((cost / :cost_off)::numeric) AS cost_factor
+  FROM lsw_q, lsw_node(q) WHERE name = 'loop';
+RESET pg_lion.enable_count_pushdown;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+-- At core's rows the loop is the plan; at the rows the key meets, the
+-- count, which reads no heap for the fact.
+SET pg_lion.enable_skew_estimate = off;
+SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
+SET pg_lion.enable_skew_estimate = on;
+SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_got AS ' || (SELECT q FROM lsw_q WHERE name = 'loop'); END $$;
+
+-- ---------- 5. a semi join's probe ----------
+-- A semi join's probe comes to its key's first match no later at a heavy
+-- key, and one with no match ends at once where the index answers every
+-- join clause: the loop keeps core's price.  With a join clause beyond the
+-- key - the fact's id against the outer row's, which the key's B-tree does
+-- not answer - a probe with no match reads every row of its key, and the
+-- probe is priced at the rows the key meets.
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+SET enable_hashjoin = off;
+SET enable_mergejoin = off;
+SET pg_lion.enable_semijoin = off;
+SELECT cost AS semi_on FROM lsw_q, lsw_node(q) WHERE name = 'semi' \gset
+SELECT cost AS beyond_on FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond' \gset
+SET pg_lion.enable_skew_estimate = off;
+SELECT (SELECT cost FROM lsw_q, lsw_node(q) WHERE name = 'semi') = :semi_on
+	   AS semi_unchanged,
+	   (SELECT round((:beyond_on / cost)::numeric)
+		  FROM lsw_q, lsw_node(q) WHERE name = 'semi_beyond') AS beyond_factor;
+RESET pg_lion.enable_skew_estimate;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+RESET enable_hashjoin;
+RESET enable_mergejoin;
+RESET pg_lion.enable_semijoin;
+
+-- ---------- 6. the answers, against core's ----------
+SET pg_lion.enable_count_pushdown = off;
+SET pg_lion.enable_btree_scan = off;
+SET pg_lion.enable_plain_scan = off;
+SET enable_bitmapscan = off;
+DO $$ BEGIN EXECUTE 'CREATE TEMP TABLE lsw_want AS ' || (SELECT q FROM lsw_q WHERE name = 'loop'); END $$;
+SELECT lsw_plan(q) FROM lsw_q WHERE name = 'loop';
+RESET pg_lion.enable_count_pushdown;
+RESET pg_lion.enable_btree_scan;
+RESET pg_lion.enable_plain_scan;
+RESET enable_bitmapscan;
+SELECT w.count AS want, g.count AS got FROM lsw_want w, lsw_got g;
+
+RESET random_page_cost;
+RESET effective_cache_size;
+DROP TABLE lsw_fact, lsw_dim;
+DROP FUNCTION lsw_plan(text), lsw_names(json), lsw_find(json), lsw_node(text),
+	lsw_key_skew(regclass), lsw_skew_rows(text);

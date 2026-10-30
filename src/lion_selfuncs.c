@@ -1052,12 +1052,15 @@ static get_relation_stats_hook_type lion_prev_relation_stats_hook = NULL;
 static set_rel_pathlist_hook_type lion_prev_set_rel_pathlist_hook = NULL;
 static void lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 										Index rti, RangeTblEntry *rte);
+static void lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel);
 
 /* n_distinct from the directory (DESIGN.md §33), at the end of this file */
 static get_index_stats_hook_type lion_prev_index_stats_hook = NULL;
 static bool lion_enable_index_ndistinct = true;
 static bool lion_enable_index_mcv = true;
+static bool lion_enable_skew_estimate = true;
 static bool lion_ndistinct_nested = false;
+static bool lion_skew_unlisted = false;	/* lion_skew_compute()'s lookup */
 static bool lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte,
 								 AttrNumber attnum, VariableStatData *vardata);
 static bool lion_index_expr_stats(PlannerInfo *root, Oid indexOid,
@@ -1070,7 +1073,7 @@ lion_relation_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 {
 	LionProbeScope *scope = lion_probe_scope;
 
-	if (scope != NULL && root != NULL &&
+	if (scope != NULL && !lion_skew_unlisted && root != NULL &&
 		root->glob == scope->glob && rte->rtekind == RTE_RELATION &&
 		!rte->inh && rte->relid == scope->relid)
 	{
@@ -1146,6 +1149,19 @@ lion_selfuncs_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/*
+	 * DESIGN.md §33, "The rows of a probed key": a nested loop's probe of a
+	 * skewed key column priced at the rows a probed key meets, from a lion
+	 * index's sum of squares of its keys' rows.
+	 */
+	DefineCustomBoolVariable("pg_lion.enable_skew_estimate",
+							 "Prices a nested loop's probes of a skewed key column at the rows a probed key meets, from a lion index's sum of squares.",
+							 "Off, a key looked up by a join is priced at the planner's rows per key.",
+							 &lion_enable_skew_estimate,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 }
 
 /*
@@ -4859,8 +4875,10 @@ lion_plain_pay_remainders(PlannerInfo *root, RelOptInfo *rel,
 
 /*
  * set_rel_pathlist_hook: rel's rows corrected (lion_correct_rel_rows()),
- * before 18 the IN lists an OR of equalities spells, and each plain lion
- * path's remainder paid (lion_plain_pay_remainders()).
+ * before 18 the IN lists an OR of equalities spells, each plain lion path's
+ * remainder paid (lion_plain_pay_remainders()), and, after the hooks before
+ * this one, each probe of a skewed key column priced at the rows a probed key
+ * meets (lion_skew_reprice_params()).
  */
 static void
 lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
@@ -4901,6 +4919,9 @@ lion_plain_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 
 	if (lion_prev_set_rel_pathlist_hook != NULL)
 		lion_prev_set_rel_pathlist_hook(root, rel, rti, rte);
+
+	/* last, so that every hook's parameterized paths are there to reprice */
+	lion_skew_reprice_params(root, rel);
 }
 
 /* ---------------------------------------------------------------------
@@ -4993,6 +5014,7 @@ typedef struct LionNdistinctCache
 	List	   *mcvrows;		/* LionMcvRow (below) */
 	HTAB	   *mcvkeys;		/* LionMcvKey: the keys looked up (below) */
 	List	   *outerrels;		/* LionOuterRel (lion_outer_param_loops()) */
+	List	   *skews;			/* LionSkewCol (lion_skew_param_factor()) */
 } LionNdistinctCache;
 
 static LionRunCache *lion_nd_caches = NULL;
@@ -6049,7 +6071,7 @@ lion_ndistinct_stats(PlannerInfo *root, RangeTblEntry *rte, AttrNumber attnum,
 	ListCell   *lc;
 	int			i;
 
-	listed = lion_enable_index_mcv;
+	listed = lion_enable_index_mcv && !lion_skew_unlisted;
 	if ((!lion_enable_index_ndistinct && !listed) ||
 		root == NULL || root->glob == NULL ||
 		root->simple_rte_array == NULL || attnum <= 0 ||
@@ -6496,4 +6518,628 @@ lion_outer_param_loops(PlannerInfo *root, Node *quals)
 	}
 	list_free(ids);
 	return Max(loops, 1.0);
+}
+
+
+/* ---------------------------------------------------------------------
+ * The rows a probed key meets (DESIGN.md §33, "The rows of a probed key")
+ * --------------------------------------------------------------------- */
+
+/*
+ * A key the planner does not know when it plans - an equality to a Param, a
+ * correlated subquery's outer row, a nested loop's outer row - core prices
+ * at the rows per key, (1 - nullfrac) / n_distinct of the table
+ * (var_eq_non_const()).  That is the mean of a key drawn at random from the
+ * column's keys.  The keys a query probes are not drawn so: an outer row
+ * names the key its own row references, and the keys of many rows are the
+ * keys rows are drawn by - each with the chance of its rows.  On a column
+ * whose keys are skewed - a few with thousands of rows, most with a handful -
+ * that mean is far above the per-key one, and a probe priced at the per-key
+ * rows meets hundreds of times as many.
+ *
+ * The most common values the planner knows by name, and a probe of one of
+ * them is what the MCV list is for; the mean that matters is the rest's.  A
+ * lion index counts each key column's keys in one pass of its entries at
+ * build, in VACUUM's walk and in the ANALYZE of a small directory (§33), and
+ * the same pass sums the squares of their rows, Σn² (lion.h,
+ * LionMetaNdistinct).  Of N rows, the share f_i of each most common value and
+ * the null fraction, the keys outside the MCV list hold N (1 - nullfrac -
+ * Σf_i) rows and Σn² - Σ(f_i N)² of the sum, so a row drawn from them belongs
+ * to a key of
+ *
+ *		(Σn² - Σ (f_i N)²) / (N (1 - nullfrac - Σ f_i))
+ *
+ * rows on average, and with no MCV list to a key of Σn² / (N (1 -
+ * nullfrac)).  That is the figure, never below core's rows per key nor above
+ * N.  A unique column has Σn² = N and stays at its one row.
+ *
+ * Σn² was summed over the rows the count was taken over; the table may have
+ * grown since.  It is scaled as the count's convention scales the keys
+ * (lion_ndistinct_value()): a fixed number of keys - a count of a tenth of
+ * the rows or less - grows each key with the table, Σn² as the square of
+ * the growth; keys that grow with the table keep their rows, Σn² growing as
+ * the table.  Past a factor of 2 the count is not used (lion_nd_current()),
+ * nor is the sum.  The column needs ANALYZE's statistics - the null fraction
+ * and the MCV list are its - and the index what n_distinct's does (§33,
+ * "The hook"): non-partial, a scalar opclass with the type's equality, the
+ * column itself.
+ *
+ * The figure is lion's own: path rows, and every estimate core makes, keep
+ * core's per-key rows, and so do the AM's own scans.  Lion's probes of the
+ * key - a walk of a B-tree keyed on it, a LionCount's set of it, an FK-side
+ * join's lookups against a nested loop - are priced at it where the
+ * competitor they are weighed against meets it too, and that competitor is
+ * priced at it as well (lion_plan_skew.c, lion_units_take_skew(); §39, "A
+ * skewed key's probes"): the comparison is made under the rows both would
+ * meet, and its result put back into core's units.
+ * pg_lion.enable_skew_estimate off, nothing here is used.
+ */
+
+/* One column's figure, as this planner run worked it out. */
+typedef struct LionSkewCol
+{
+	Oid			relid;
+	AttrNumber	attnum;
+	double		rows;			/* the rows a probed key meets, 0 unknown */
+	double		keyrows;		/* core's rows per key, 0 without statistics */
+} LionSkewCol;
+
+/* lion_debug_skew_rows(): the figures worked out while it plans, or not */
+static bool lion_skew_collecting = false;
+static List *lion_skew_collected = NIL;
+static MemoryContext lion_skew_collect_cxt = NULL;
+
+/*
+ * The figure for key column col of an index whose meta page holds nd, for a
+ * table of tuples rows now, the null fraction, and the MCV list's shares
+ * (their sum and the sum of their squares, hasmcv when it has any); keyrows,
+ * core's rows per key, when it says nothing more.
+ */
+static double
+lion_skew_rows_of(const LionMetaNdistinct *nd, int col, double tuples,
+				  double nullfrac, bool hasmcv, double mcvsum, double mcvsq,
+				  double keyrows)
+{
+	double		growth = tuples / (double) nd->rows;
+	double		sumsq = (double) nd->sumsq[col] * growth;
+	double		rest;
+
+	/* a fixed number of keys: each grew with the table */
+	if ((double) nd->ndistinct[col] <= 0.1 * (double) nd->rows)
+		sumsq *= growth;
+	rest = tuples * (1.0 - nullfrac);
+	if (hasmcv)
+	{
+		rest -= tuples * mcvsum;
+		sumsq -= tuples * tuples * mcvsq;
+	}
+	if (rest < 1.0 || sumsq <= 0.0)
+		return keyrows;
+	return Min(Max(sumsq / rest, keyrows), tuples);
+}
+
+/* Work out var's figure on rel (above) into *col. */
+static void
+lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
+				  LionSkewCol *col)
+{
+	LionNdistinctCache *cache = lion_nd_cache_for(root);
+	const LionMetaNdistinct *best = NULL;
+	int			bestcol = -1;
+	double		best_drift = 0;
+	uint64		best_count = 0;
+	double		tuples = rel->tuples;
+	VariableStatData vardata;
+	bool		saveunlisted;
+	ListCell   *lc;
+
+	col->rows = 0;
+	col->keyrows = 0;
+	if (tuples < 1.0)
+		return;
+
+	/* the index counted over the rows nearest the table's, as for §33 */
+	foreach(lc, rel->indexlist)
+	{
+		IndexOptInfo *idx = (IndexOptInfo *) lfirst(lc);
+		int			c;
+
+		for (c = 0; c < idx->nkeycolumns; c++)
+		{
+			const LionMetaNdistinct *nd = NULL;
+			float4		value;
+			double		drift;
+			uint64		count;
+
+			if (idx->indexkeys[c] != var->varattno ||
+				!lion_nd_column_count(cache, idx, c, var->vartype,
+									  var->varcollid, tuples, &value, &drift,
+									  &count, &nd) ||
+				!LionMetaSumsqKnown(nd, c))
+				continue;
+			if (best == NULL || drift < best_drift ||
+				(drift == best_drift && count > best_count))
+			{
+				best = nd;
+				bestcol = c;
+				best_drift = drift;
+				best_count = count;
+			}
+		}
+	}
+	if (best == NULL)
+		return;
+
+	/*
+	 * Core's rows per key, as var_eq_non_const() has them, and the MCVs:
+	 * ANALYZE's, without the values a relation's clauses list (§33, "The
+	 * frequencies of the listed values"), which are one relation's of one
+	 * query, and without the probe scope's ends.  The figure is the
+	 * column's, kept for every relation of the table the run plans
+	 * (lion_skew_param_factor()).
+	 */
+	saveunlisted = lion_skew_unlisted;
+	lion_skew_unlisted = true;
+	PG_TRY();
+	{
+		examine_variable(root, (Node *) var, 0, &vardata);
+	}
+	PG_FINALLY();
+	{
+		lion_skew_unlisted = saveunlisted;
+	}
+	PG_END_TRY();
+	if (HeapTupleIsValid(vardata.statsTuple))
+	{
+		Form_pg_statistic stats = (Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
+		double		nullfrac = stats->stanullfrac;
+		bool		isdefault;
+		double		ndist = get_variable_numdistinct(&vardata, &isdefault);
+		double		keysel = 1.0 - nullfrac;
+		double		mcvsum = 0;
+		double		mcvsq = 0;
+		bool		hasmcv = false;
+		bool		allmcv = false;
+		AttStatsSlot sslot;
+
+		if (ndist > 1)
+			keysel /= ndist;
+		if (get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
+							 InvalidOid, ATTSTATSSLOT_NUMBERS))
+		{
+			int			i;
+
+			for (i = 0; i < sslot.nnumbers; i++)
+			{
+				mcvsum += sslot.numbers[i];
+				mcvsq += (double) sslot.numbers[i] * sslot.numbers[i];
+			}
+			hasmcv = (sslot.nnumbers > 0);
+			allmcv = (hasmcv && ndist <= (double) sslot.nnumbers);
+			if (hasmcv && keysel > sslot.numbers[0])
+				keysel = sslot.numbers[0];
+			free_attstatsslot(&sslot);
+		}
+		col->keyrows = clamp_row_est(keysel * tuples);
+
+		/*
+		 * A list that holds every value leaves no key outside it - what is
+		 * left of the rows and of the sum is rounding - and core prices a
+		 * probe of any of them by the list: core's rows.
+		 */
+		if (allmcv)
+			col->rows = col->keyrows;
+		else
+			col->rows = lion_skew_rows_of(best, bestcol, tuples, nullfrac,
+										  hasmcv, mcvsum, mcvsq,
+										  col->keyrows);
+	}
+	ReleaseVariableStats(vardata);
+}
+
+/*
+ * How many times core's rows per key the rows are that an equality of column
+ * var of rel to a value not known at plan time meets (above): 1 where nothing
+ * says more, or the setting is off.  Once per planner run and column.
+ */
+static double
+lion_skew_param_factor(PlannerInfo *root, RelOptInfo *rel, Var *var)
+{
+	LionNdistinctCache *cache;
+	RangeTblEntry *rte;
+	LionSkewCol *col = NULL;
+	MemoryContext oldcxt;
+	ListCell   *lc;
+
+	if (!lion_enable_skew_estimate ||
+		root == NULL || root->glob == NULL ||
+		rel == NULL || var == NULL || !IS_SIMPLE_REL(rel) ||
+		rel->rtekind != RTE_RELATION || rel->indexlist == NIL ||
+		var->varlevelsup != 0 || (Index) var->varno != rel->relid ||
+		var->varattno <= 0)
+		return 1.0;
+	rte = planner_rt_fetch(rel->relid, root);
+	if (rte->rtekind != RTE_RELATION || rte->inh ||
+		rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return 1.0;
+
+	cache = lion_nd_cache_for(root);
+	foreach(lc, cache->skews)
+	{
+		LionSkewCol *c = (LionSkewCol *) lfirst(lc);
+
+		if (c->relid == rte->relid && c->attnum == var->varattno)
+		{
+			col = c;
+			break;
+		}
+	}
+	if (col == NULL)
+	{
+		oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+		col = (LionSkewCol *) palloc0(sizeof(LionSkewCol));
+		col->relid = rte->relid;
+		col->attnum = var->varattno;
+		cache->skews = lappend(cache->skews, col);
+		MemoryContextSwitchTo(oldcxt);
+		lion_skew_compute(root, rel, var, col);
+		if (col->rows > 0.0)
+			elog(DEBUG2, "lion: a probed key of column %d of \"%s\" meets %.1f rows, %.1f per key",
+				 (int) col->attnum, get_rel_name(col->relid), col->rows,
+				 col->keyrows);
+		if (lion_skew_collecting)
+		{
+			LionSkewCol *copy;
+
+			oldcxt = MemoryContextSwitchTo(lion_skew_collect_cxt);
+			copy = (LionSkewCol *) palloc(sizeof(LionSkewCol));
+			memcpy(copy, col, sizeof(LionSkewCol));
+			lion_skew_collected = lappend(lion_skew_collected, copy);
+			MemoryContextSwitchTo(oldcxt);
+		}
+	}
+	if (col->rows <= 0.0 || col->keyrows <= 0.0)
+		return 1.0;
+	return Max(col->rows / col->keyrows, 1.0);
+}
+
+static bool
+lion_skew_has_param(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Param))
+		return true;
+	return expression_tree_walker(node, lion_skew_has_param, context);
+}
+
+/*
+ * The column of rel that clause - a RestrictInfo, an IndexClause or a bare
+ * clause - equates (an operator estimated by eqsel) to a value no row of rel
+ * decides and the plan does not know: one holding a Param, or another
+ * relation's Var, and nothing volatile.  NULL for any other clause.
+ */
+static Var *
+lion_skew_param_eq_var(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+{
+	OpExpr	   *op;
+	Node	   *left;
+	Node	   *right;
+	Node	   *other;
+	Var		   *var;
+	Relids		varnos;
+
+	if (clause != NULL && IsA(clause, IndexClause))
+		clause = (Node *) ((IndexClause *) clause)->rinfo;
+	if (clause != NULL && IsA(clause, RestrictInfo))
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (clause == NULL || !IsA(clause, OpExpr))
+		return NULL;
+	op = (OpExpr *) clause;
+	if (list_length(op->args) != 2 || get_oprrest(op->opno) != F_EQSEL)
+		return NULL;
+	left = (Node *) linitial(op->args);
+	right = (Node *) lsecond(op->args);
+	while (IsA(left, RelabelType))
+		left = (Node *) ((RelabelType *) left)->arg;
+	while (IsA(right, RelabelType))
+		right = (Node *) ((RelabelType *) right)->arg;
+	if (IsA(left, Var) && (Index) ((Var *) left)->varno == rel->relid &&
+		((Var *) left)->varlevelsup == 0)
+	{
+		var = (Var *) left;
+		other = (Node *) lsecond(op->args);
+	}
+	else if (IsA(right, Var) && (Index) ((Var *) right)->varno == rel->relid &&
+			 ((Var *) right)->varlevelsup == 0)
+	{
+		var = (Var *) right;
+		other = (Node *) linitial(op->args);
+	}
+	else
+		return NULL;
+	if (var->varattno <= 0 || contain_volatile_functions(other))
+		return NULL;
+	varnos = pull_varnos(root, other);
+	if (bms_is_member(rel->relid, varnos))
+		return NULL;
+	if (bms_is_empty(varnos) && !lion_skew_has_param(other, NULL))
+		return NULL;
+	return var;
+}
+
+/*
+ * How many times core's rows per key a scan of rel meets through the clauses
+ * - RestrictInfos, IndexClauses or bare clauses - that equate one of its
+ * columns to a value the plan does not know (lion_skew_param_eq_var()): the
+ * largest of their factors (lion_skew_param_factor()), 1 for none.
+ */
+static double
+lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel, List *clauses)
+{
+	double		factor = 1.0;
+	ListCell   *lc;
+
+	if (!lion_enable_skew_estimate || rel == NULL)
+		return 1.0;
+	foreach(lc, clauses)
+	{
+		Var		   *var = lion_skew_param_eq_var(root, rel, (Node *) lfirst(lc));
+
+		if (var != NULL)
+			factor = Max(factor, lion_skew_param_factor(root, rel, var));
+	}
+	return factor;
+}
+
+/*
+ * A nested loop's probes of a skewed key column (DESIGN.md §33, "The rows of
+ * a probed key"): the paths of rel parameterized by a join clause that
+ * equates one of its key columns to an outer row's value - the inner side of
+ * a nested loop - are priced at the rows such a probe meets, where those are
+ * at least LION_SKEW_MIN_FACTOR times core's rows per key.  Below that the
+ * column is near enough to uniform that core's figure stands: the two agree
+ * exactly when every key has the same rows, and the figure is never below
+ * core's.
+ *
+ * A semi or anti join's probe is the exception: it ends at its key's first
+ * match, no later at a heavy key, and one with no match ends at once where
+ * the index answers every join clause.  So where rel is the inner side of a
+ * semi or anti join, a parameterization whose clauses all equate a column to
+ * an outer value keeps core's price; one with a clause beyond those - which
+ * a probe with no match reads every row of its key for - is repriced.
+ *
+ * The parameterization's rows grow by the factor, up to rel's own rows, and
+ * so does each of its paths' rows.  A path whose index answers the clause -
+ * an index scan with it among its index clauses, a bitmap heap scan with it
+ * under its bitmap, a LionBtreeScan's walk of the key's B-tree - reads the
+ * rows it finds, and its run cost grows with them; any other path reads what it read before and only returns more.  The
+ * join's rows are not touched: they are the outer rows' share of the
+ * column's, which core's rows per key price right.
+ */
+#define LION_SKEW_MIN_FACTOR	2.0
+
+/* Does clause - an IndexClause or a RestrictInfo - probe a skewed key? */
+static bool
+lion_skew_clause_skewed(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+{
+	Var		   *var = lion_skew_param_eq_var(root, rel, clause);
+
+	return var != NULL &&
+		lion_skew_param_factor(root, rel, var) >= LION_SKEW_MIN_FACTOR;
+}
+
+/* Does the bitmap under a bitmap heap scan answer a skewed key's probe? */
+static bool
+lion_skew_bitmap_probes(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
+{
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+	{
+		foreach(lc, ((IndexPath *) bitmapqual)->indexclauses)
+		{
+			if (lion_skew_clause_skewed(root, rel, (Node *) lfirst(lc)))
+				return true;
+		}
+		return false;
+	}
+	if (IsA(bitmapqual, BitmapAndPath))
+	{
+		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
+		{
+			if (lion_skew_bitmap_probes(root, rel, (Path *) lfirst(lc)))
+				return true;
+		}
+		return false;
+	}
+	if (IsA(bitmapqual, BitmapOrPath))
+	{
+		foreach(lc, ((BitmapOrPath *) bitmapqual)->bitmapquals)
+		{
+			if (!lion_skew_bitmap_probes(root, rel, (Path *) lfirst(lc)))
+				return false;
+		}
+		return true;
+	}
+	return false;
+}
+
+/* Does path read the rows its skewed probe finds (above)? */
+static bool
+lion_skew_path_probes(PlannerInfo *root, RelOptInfo *rel, Path *path)
+{
+	ListCell   *lc;
+
+	switch (path->pathtype)
+	{
+		case T_IndexScan:
+		case T_IndexOnlyScan:
+			foreach(lc, ((IndexPath *) path)->indexclauses)
+			{
+				if (lion_skew_clause_skewed(root, rel, (Node *) lfirst(lc)))
+					return true;
+			}
+			return false;
+		case T_BitmapHeapScan:
+			return lion_skew_bitmap_probes(root, rel,
+										   ((BitmapHeapPath *) path)->bitmapqual);
+		case T_CustomScan:
+			/* a B-tree's walk, whose parameterization is its index's */
+			return ((CustomPath *) path)->methods == &lion_btree_path_methods;
+		default:
+			return false;
+	}
+}
+
+/* Is rel on the inner side of a semi or anti join? */
+static bool
+lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel)
+{
+	Relids		relids = IS_OTHER_REL(rel) ? rel->top_parent_relids :
+		rel->relids;
+	ListCell   *lc;
+
+	foreach(lc, root->join_info_list)
+	{
+		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
+
+		if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
+			bms_overlap(sjinfo->syn_righthand, relids))
+			return true;
+	}
+	return false;
+}
+
+/* Has a parameterization a clause beyond equalities to outer values? */
+static bool
+lion_skew_beyond_keys(PlannerInfo *root, RelOptInfo *rel, List *clauses)
+{
+	ListCell   *lc;
+
+	foreach(lc, clauses)
+	{
+		if (lion_skew_param_eq_var(root, rel, (Node *) lfirst(lc)) == NULL)
+			return true;
+	}
+	return false;
+}
+
+static void
+lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
+{
+	bool		semi;
+	ListCell   *lc;
+
+	if (!lion_enable_skew_estimate || !IS_SIMPLE_REL(rel) ||
+		rel->rtekind != RTE_RELATION || rel->ppilist == NIL ||
+		IS_DUMMY_REL(rel))
+		return;
+	semi = lion_skew_semi_inner(root, rel);
+
+	foreach(lc, rel->ppilist)
+	{
+		ParamPathInfo *ppi = (ParamPathInfo *) lfirst(lc);
+		double		factor = lion_skew_clauses_factor(root, rel,
+													  ppi->ppi_clauses);
+		double		rows;
+		double		scale;
+		ListCell   *lp;
+
+		if (factor < LION_SKEW_MIN_FACTOR || ppi->ppi_rows <= 0.0 ||
+			(semi && !lion_skew_beyond_keys(root, rel, ppi->ppi_clauses)))
+			continue;
+		rows = Min(clamp_row_est(ppi->ppi_rows * factor),
+				   Max(rel->rows, ppi->ppi_rows));
+		if (rows <= ppi->ppi_rows)
+			continue;
+		scale = rows / ppi->ppi_rows;
+		elog(DEBUG2, "lion: probes of \"%s\" priced at %.1f rows, %.1f before",
+			 get_rel_name(planner_rt_fetch(rel->relid, root)->relid), rows,
+			 ppi->ppi_rows);
+
+		foreach(lp, rel->pathlist)
+		{
+			Path	   *path = (Path *) lfirst(lp);
+
+			if (path->param_info != ppi)
+				continue;
+			if (lion_skew_path_probes(root, rel, path))
+				path->total_cost = path->startup_cost +
+					(path->total_cost - path->startup_cost) * scale;
+			path->rows = clamp_row_est(path->rows * scale);
+		}
+		ppi->ppi_rows = rows;
+	}
+}
+
+/*
+ * lion_debug_skew_rows(q text, OUT relid regclass, OUT attnum int2,
+ * OUT rows float8, OUT keyrows float8): plan q and return the figure worked
+ * out for each column a probe of it was priced on (above) - rows NULL where
+ * nothing is known, keyrows NULL without statistics - in the order they were
+ * worked out.  For the tests, which create it from the library; superuser
+ * only.  q is planned as a statement of its own, with no parameters.
+ */
+PG_FUNCTION_INFO_V1(lion_debug_skew_rows);
+
+Datum
+lion_debug_skew_rows(PG_FUNCTION_ARGS)
+{
+	char	   *q = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	List	   *raw;
+	ListCell   *lc;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("lion_debug_skew_rows() is for superusers")));
+	if (lion_skew_collecting)
+		elog(ERROR, "lion_debug_skew_rows() cannot be called while it plans");
+	InitMaterializedSRF(fcinfo, 0);
+
+	lion_skew_collect_cxt = AllocSetContextCreate(CurrentMemoryContext,
+												  "lion skew rows",
+												  ALLOCSET_SMALL_SIZES);
+	lion_skew_collected = NIL;
+	lion_skew_collecting = true;
+	PG_TRY();
+	{
+		raw = pg_parse_query(q);
+		foreach(lc, raw)
+		{
+			RawStmt    *stmt = lfirst_node(RawStmt, lc);
+			List	   *queries;
+
+			queries = pg_analyze_and_rewrite_fixedparams(stmt, q, NULL, 0,
+														 NULL);
+			(void) pg_plan_queries(queries, q, CURSOR_OPT_PARALLEL_OK, NULL);
+		}
+	}
+	PG_FINALLY();
+	{
+		lion_skew_collecting = false;
+	}
+	PG_END_TRY();
+
+	foreach(lc, lion_skew_collected)
+	{
+		LionSkewCol *col = (LionSkewCol *) lfirst(lc);
+		Datum		values[4];
+		bool		nulls[4] = {false, false, false, false};
+
+		values[0] = ObjectIdGetDatum(col->relid);
+		values[1] = Int16GetDatum(col->attnum);
+		values[2] = Float8GetDatum(col->rows);
+		nulls[2] = (col->rows <= 0.0);
+		values[3] = Float8GetDatum(col->keyrows);
+		nulls[3] = (col->keyrows <= 0.0);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+							 nulls);
+	}
+	lion_skew_collected = NIL;
+	MemoryContextDelete(lion_skew_collect_cxt);
+	lion_skew_collect_cxt = NULL;
+	return (Datum) 0;
 }
