@@ -22016,18 +22016,19 @@ rows per key price right.
 
 A semi or anti join's probe ends at its key's first match, no later at a heavy key, and one with
 no match ends at once where the index answers every join clause. So where the relation is on the
-inner side of a semi or anti join, a parameterization whose clauses all equate a column to an
-outer value keeps core's price; one with a clause beyond those, which a probe with no match reads
-every row of its key for, is repriced.
+inner side of a semi or anti join and is probed by the join's outer side, a parameterization whose
+clauses all equate a column to an outer value keeps core's price; one with a clause beyond those,
+which a probe with no match reads every row of its key for, is repriced. A probe by another
+relation of the inner side alone is an ordinary probe there, and is repriced.
 
 Only parameterized paths are repriced. A correlated subquery's scan and a generic plan's Param
 are restrictions of the relation, not parameterizations, and keep core's rows; so does every
 estimate core makes from the column. `pg_lion.enable_skew_estimate` (on) turns it off.
-`lion_debug_skew_rows(text)` plans a query and returns, for each column a probe was priced on,
-the figure and core's rows per key; `lion_debug_key_skew(regclass)` returns each key column's
-`rows`, `ndistinct` and `sumsq` from the meta page (`sumsq` NULL where it is unknown). Both are C
-functions for the tests, superuser only, that the extension's SQL does not create
-(`test/sql/skew.sql`).
+`lion_debug_skew_rows(text)` plans a query and returns, for each column whose figure a probe's
+pricing computed, repriced or not, the figure and core's rows per key;
+`lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct` and `sumsq` from the
+meta page (`sumsq` NULL where it is unknown). Both are C functions for the tests, superuser only,
+that the extension's SQL does not create (`test/sql/skew.sql`).
 
 ### Limits
 

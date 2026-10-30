@@ -6992,9 +6992,13 @@ lion_skew_path_probes(PlannerInfo *root, RelOptInfo *rel, Path *path)
 	}
 }
 
-/* Is rel on the inner side of a semi or anti join? */
+/*
+ * Is rel probed as a semi or anti join's inner side, by its outer side?  A
+ * probe whose outer values all come from within the join's inner side is an
+ * ordinary inner probe there, and reads every row of its key.
+ */
 static bool
-lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel)
+lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel, Relids req_outer)
 {
 	Relids		relids = IS_OTHER_REL(rel) ? rel->top_parent_relids :
 		rel->relids;
@@ -7005,7 +7009,8 @@ lion_skew_semi_inner(PlannerInfo *root, RelOptInfo *rel)
 		SpecialJoinInfo *sjinfo = (SpecialJoinInfo *) lfirst(lc);
 
 		if ((sjinfo->jointype == JOIN_SEMI || sjinfo->jointype == JOIN_ANTI) &&
-			bms_overlap(sjinfo->syn_righthand, relids))
+			bms_overlap(sjinfo->syn_righthand, relids) &&
+			!bms_is_subset(req_outer, sjinfo->syn_righthand))
 			return true;
 	}
 	return false;
@@ -7028,14 +7033,12 @@ lion_skew_beyond_keys(PlannerInfo *root, RelOptInfo *rel, List *clauses)
 static void
 lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 {
-	bool		semi;
 	ListCell   *lc;
 
 	if (!lion_enable_skew_estimate || !IS_SIMPLE_REL(rel) ||
 		rel->rtekind != RTE_RELATION || rel->ppilist == NIL ||
 		IS_DUMMY_REL(rel))
 		return;
-	semi = lion_skew_semi_inner(root, rel);
 
 	foreach(lc, rel->ppilist)
 	{
@@ -7047,7 +7050,8 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 		ListCell   *lp;
 
 		if (factor < LION_SKEW_MIN_FACTOR || ppi->ppi_rows <= 0.0 ||
-			(semi && !lion_skew_beyond_keys(root, rel, ppi->ppi_clauses)))
+			(lion_skew_semi_inner(root, rel, ppi->ppi_req_outer) &&
+			 !lion_skew_beyond_keys(root, rel, ppi->ppi_clauses)))
 			continue;
 		rows = Min(clamp_row_est(ppi->ppi_rows * factor),
 				   Max(rel->rows, ppi->ppi_rows));
