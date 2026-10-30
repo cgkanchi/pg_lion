@@ -23726,8 +23726,9 @@ lion_plan_units.c), and the same way §39's loop is priced:
   (`lo_cold_price()`). A parallel walk's partial cost is one participant's share where the scan's
   is a whole plan's, so it is priced under the Gather core puts over it - `parallel_setup_cost`
   and a `parallel_tuple_cost` a row, as `lion_units_scan_cold()` adds to the scan's partial path -
-  and the Gather's share taken out again (`lo_cold_price_partial()`). The margin divides the
-  result as it divides any price.
+  and the factor taken of that discounts the walk's own startup and total, never the Gather's
+  overhead, which core charges only where a Gather takes the walk's rows (`lo_cold_price_partial()`).
+  The margin divides the result as it divides any price.
 
 `pg_lion.cold_stream_page_cost` is 6.25 `seq_page_cost`, an eighth of `cold_page_cost`'s 50: the
 middle of the measured 0.11 to 0.15. The device measured is some three times slower than the

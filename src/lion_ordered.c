@@ -3242,13 +3242,16 @@ lo_cold_price(const LionUnits *cold, double reads, Cost *startup, Cost *total)
  * ... and a partial walk's, whose startup and total are one participant's
  * share with no Gather over it, where the scan's cost it is weighed against
  * (lion_units_scan_cold()) is a whole plan's: the serial scan's, or a
- * partial one's under its Gather.  So the walk is priced under the same
- * Gather - parallel_setup_cost, and a parallel_tuple_cost a row of the
- * relation's `rows`, as cost_gather() and lion_units_scan_cold() charge them
- * - the factor is taken of that, and the Gather's share is taken out again:
- * both prices in one unit, and the Gather's overhead discounted with the
- * walk under it.  Never a startup below 0, nor a total below the startup,
- * which a deep discount of a small partial cost would otherwise give.
+ * partial one's under its Gather.  So the factor is taken of the walk under
+ * the same Gather - parallel_setup_cost, and a parallel_tuple_cost a row of
+ * the relation's `rows`, as cost_gather() and lion_units_scan_cold() charge
+ * them - both prices in one unit; and it is the walk's own startup and total
+ * that it discounts, never the Gather's overhead.  That overhead is core's
+ * to charge, and only where a Gather does take the walk's rows: under a join
+ * whose Gather is above it, a walk discounted by the overhead's discounted
+ * share - parallel_tuple_cost over every row of a large relation - came out
+ * at a twentieth of its price, far past pg_lion.cold_max_discount, and the
+ * joins it fed looked cheap.
  */
 static void
 lo_cold_price_partial(const LionUnits *cold, double reads, double rows,
@@ -3256,14 +3259,11 @@ lo_cold_price_partial(const LionUnits *cold, double reads, double rows,
 {
 	Cost		overhead = parallel_setup_cost +
 		parallel_tuple_cost * clamp_row_est(rows);
-	Cost		gathered = *total + overhead;
-	double		factor = lion_units_bitmap_factor(cold, gathered, reads);
+	double		factor = lion_units_bitmap_factor(cold, *total + overhead,
+												  reads);
 
-	if (factor >= 1.0)
-		return;
-	*startup = Max((*startup + parallel_setup_cost) * factor -
-				   parallel_setup_cost, 0.0);
-	*total = Max(gathered * factor - overhead, *startup);
+	*startup *= factor;
+	*total *= factor;
 }
 
 /*
