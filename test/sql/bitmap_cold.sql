@@ -178,10 +178,12 @@ SELECT round((lbc_cost(q, '{effective_cache_size, 1MB, pg_lion.pushdown_margin, 
 						'Bitmap Heap Scan') AS scan
 		  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q)) c;
 
--- A parallel walk is priced under the Gather core puts over it: its partial
--- cost is one participant's share and the scan's a whole plan's, so the cap
--- applies to the walk with parallel_setup_cost (and a parallel_tuple_cost a
--- row, 0 here) added, which is taken out again
+-- A parallel walk is weighed under the Gather core puts over it: its partial
+-- cost is one participant's share and the scan's a whole plan's, so the
+-- factor is taken of the walk with parallel_setup_cost (and a
+-- parallel_tuple_cost a row, 0 here) added.  It discounts the walk alone,
+-- never the Gather's overhead, so the walk's own price is cut by the cap and
+-- no more
 SET max_parallel_workers_per_gather = 2;
 SET min_parallel_table_scan_size = 0;
 SET min_parallel_index_scan_size = 0;
@@ -191,9 +193,20 @@ SET effective_cache_size = '1MB';
 EXPLAIN (COSTS OFF) SELECT sum(id) FROM lbc_f WHERE c IN (1, 2);
 RESET effective_cache_size;
 SELECT d AS cold_max_discount,
-	   round(((lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off}', 'LionBtreeScan') + 100) /
-			  (lbc_cost(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.cold_max_discount', d],
-						'LionBtreeScan') + 100))::numeric, 3) AS gathered_own_over_cold
+	   round((lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off}', 'LionBtreeScan') /
+			  lbc_cost(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.cold_max_discount', d],
+					   'LionBtreeScan'))::numeric, 3) AS partial_own_over_cold
+  FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q),
+	   unnest('{1.5, 2}'::text[]) d;
+-- ... however large the Gather's tuple cost over the relation's rows, which
+-- a walk under a join never pays: discounting it too, and taking it out
+-- whole, once cut the walk far past the cap
+SELECT d AS cold_max_discount,
+	   round((lbc_cost(q, '{effective_cache_size, 1MB, enable_bitmapscan, off, parallel_tuple_cost, 1}',
+					   'LionBtreeScan') /
+			  lbc_cost(q, ARRAY['effective_cache_size', '1MB', 'pg_lion.cold_max_discount', d,
+								'parallel_tuple_cost', '1'],
+					   'LionBtreeScan'))::numeric, 3) AS partial_own_over_cold
   FROM (VALUES ('SELECT sum(id) FROM lbc_f WHERE c IN (1, 2)')) v(q),
 	   unnest('{1.5, 2}'::text[]) d;
 SET max_parallel_workers_per_gather = 0;
