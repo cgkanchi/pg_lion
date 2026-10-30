@@ -7203,11 +7203,16 @@ lion_debug_skew_rows(PG_FUNCTION_ARGS)
 			(void) pg_plan_queries(queries, q, CURSOR_OPT_PARALLEL_OK, NULL);
 		}
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
 		lion_skew_collecting = false;
+		lion_skew_collected = NIL;
+		MemoryContextDelete(lion_skew_collect_cxt);
+		lion_skew_collect_cxt = NULL;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	lion_skew_collecting = false;
 
 	foreach(lc, lion_skew_collected)
 	{
