@@ -15,11 +15,6 @@
  *		value the price was fitted or derived at: the comment above each
  *		macro is why it is that value.
  *
- *		The rates of DESIGN.md §39 are here too: the cost units a millisecond
- *		of each kind of core plan, as a multiple of the reference the
- *		multipliers are fitted at, which a lion path is priced in against
- *		that kind of plan (lion_plan_units.c).
- *
  *		This file holds nothing but the tables of them and their
  *		registration, called from _PG_init.
  *
@@ -98,14 +93,8 @@ double		lion_fkjoin_sort_compare_cost;
 double		lion_fkjoin_sort_key_cost;
 double		lion_fkjoin_sort_seq_page_cost;
 double		lion_fkjoin_sort_random_page_cost;
-double		lion_hashagg_rate;
-double		lion_agg_rate;
-double		lion_hashjoin_rate;
-double		lion_mergejoin_rate;
-double		lion_bitmap_rate;
 double		lion_pushdown_margin;
 double		lion_cold_max_discount;
-bool		lion_competitor_pricing = true;
 
 typedef struct LionCostSetting
 {
@@ -269,56 +258,11 @@ static const LionCostSetting lion_cost_settings[] = {
 };
 
 /*
- * THE COMPETITORS' UNITS (DESIGN.md §39).  Lion's CPU constants are fitted at
- * 500 cost units a millisecond, the middle of core's sequential and
- * index-only scans (§10, "The reference"); core's other plans run at rates
- * of their own, and a lion path is priced in the units of the plan it
- * competes with: its own price times that plan's rate over 500
- * (lion_plan_units.c).  pg_lion.<kind>_rate is that ratio
- * for one kind of core plan, its default what §10's table measured; a kind
- * the table has too little of to say, or whose rate is the reference, is
- * priced at 1.  Sequential, index-only and plain index scans are the
- * reference itself and have no setting; nor have nested loops, whose
- * measured rate changed no plan of §39's matrices (§39, "Held out").
- */
-typedef struct LionRateSetting
-{
-	const char *name;			/* the setting */
-	double	   *variable;		/* the rate it holds */
-	double		boot;			/* its default */
-	const char *desc;			/* the plans it is the rate of */
-} LionRateSetting;
-
-static const LionRateSetting lion_rate_settings[] = {
-	/*
-	 * §39, "A hashed aggregate's own rate": the hashing of the calibration
-	 * matrix's four whole-table GROUP BYs, its time less its scan's at the
-	 * reference, ran at 0.087 to 0.116 of it
-	 */
-	{"pg_lion.hashagg_rate", &lion_hashagg_rate, 0.1,
-	 "a hashed aggregate's own work, its cost less its input's"},
-	/* §10: 401 to 695 over sequential scans, 415 to 536 over index-only ones */
-	{"pg_lion.agg_rate", &lion_agg_rate, 1.0,
-	 "a plain or sorted aggregate over a scan"},
-	/* §10: 280 and 283 with 1,000 to 4,400 rows hashed, 185 at 140,000 */
-	{"pg_lion.hashjoin_rate", &lion_hashjoin_rate, 0.5,
-	 "a hash join"},
-	/* no measurement */
-	{"pg_lion.mergejoin_rate", &lion_mergejoin_rate, 1.0,
-	 "a merge join"},
-	/* §10: 544 to 4,419 page-bound; §22: about 70 TID-bound - no one rate */
-	{"pg_lion.bitmap_rate", &lion_bitmap_rate, 1.0,
-	 "a bitmap heap scan"},
-};
-
-/*
  * Register the settings, from _PG_init.  They are user settings, real-valued
  * from 0 to DBL_MAX as core's cost settings are, and shown by EXPLAIN
  * (SETTINGS) when changed.  pg_settings lists them among the customized
  * options, as it does every extension's: no API puts a custom setting in one
  * of core's groups, and core's own records are not an extension's to edit.
- * The rates are ratios, from a thousandth to a thousand: a rate of 0 would
- * make lion's CPU free.
  */
 void
 lion_costs_init(void)
@@ -343,29 +287,14 @@ lion_costs_init(void)
 								 NULL, NULL, NULL);
 	}
 
-	for (i = 0; i < (int) lengthof(lion_rate_settings); i++)
-	{
-		const LionRateSetting *s = &lion_rate_settings[i];
-
-		DefineCustomRealVariable(s->name,
-								 psprintf("Sets the planner's estimate of the cost units a millisecond of %s, as a multiple of the rate lion's CPU costs are fitted at.",
-										  s->desc),
-								 "A lion custom path's own price is this multiple of its fitted price against the cheapest core plan of this kind (DESIGN.md §39); 1 prices it as fitted.",
-								 s->variable,
-								 s->boot,
-								 0.001, 1000.0,
-								 PGC_USERSET,
-								 GUC_EXPLAIN,
-								 NULL, NULL, NULL);
-	}
-
 	/*
-	 * THE MARGIN (DESIGN.md §39): a lion custom path's own price, converted
-	 * into its competitor's units, is divided by it - so that below 1 a lion
-	 * path is chosen only where its price is at most this share of the best
-	 * core path's, and a near tie goes to core.  1, no margin, by default:
-	 * §39's matrix found lion the faster plan in most of its near ties, and
-	 * every plan a margin moved moved to a slower one.
+	 * THE MARGIN (DESIGN.md §39): a lion custom path's own price is divided
+	 * by it - so that below 1 a lion path is chosen only where its price is
+	 * at most this share of the best core path's, and a near tie goes to
+	 * core.  1, no margin, by default: §39's matrix found lion the faster
+	 * plan in most of its near ties, and every plan a margin moved moved to a
+	 * slower one.  Tests set it high to force a lion path, since core's
+	 * enable_indexscan also turns lion's paths off.
 	 */
 	DefineCustomRealVariable("pg_lion.pushdown_margin",
 							 "Sets the share of the cheapest competing plan's cost a lion custom path's own price must come to for it to be chosen.",
@@ -391,22 +320,6 @@ lion_costs_init(void)
 							 &lion_cold_max_discount,
 							 2.0,
 							 1.0, 10.0,
-							 PGC_USERSET,
-							 GUC_EXPLAIN,
-							 NULL, NULL, NULL);
-
-	/*
-	 * WHETHER THE COMPETITOR CORRECTS THE PRICE (DESIGN.md §49): on, a lion
-	 * path's own price is taken into the units of the core plan it competes
-	 * with and weighed against that plan's cold reads, a skewed key's rows
-	 * and a Memoize's LIMIT (§39); off, it is priced by the work it does
-	 * alone, in core's units, and core's plans by core.
-	 */
-	DefineCustomBoolVariable("pg_lion.competitor_pricing",
-							 "Corrects a lion custom path's price by what lion reads of the core plan it competes with.",
-							 "Off, a lion path is priced by its own work alone: no rate, no competitor's cold reads, skewed keys or Memoize hits (DESIGN.md §39, §49).",
-							 &lion_competitor_pricing,
-							 true,
 							 PGC_USERSET,
 							 GUC_EXPLAIN,
 							 NULL, NULL, NULL);

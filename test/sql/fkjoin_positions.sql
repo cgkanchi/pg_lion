@@ -190,7 +190,9 @@ SELECT round((fp_inner_cost('foo <-> bar') -
  * lexemes' members up to its key's ten rows, take ten times as long on the
  * release build (0.33 ms against 3.2 ms); priced over a sixteenth of the
  * candidates and `foo`'s members alone, the join was taken.  At a hundred
- * keys the join collects the filter once and is the plan.
+ * keys a hash join over a sequential scan of the fact is the plan, priced
+ * below the FK-side join, which collects the filter once and takes less than
+ * half as long on a release build (1.4 ms against 3.2 ms).
  */
 CREATE TABLE fp_not (id int, fk int, d tsvector) WITH (autovacuum_enabled = off);
 INSERT INTO fp_not

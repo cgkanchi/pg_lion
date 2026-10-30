@@ -20,10 +20,6 @@ RESET client_min_messages;
 -- VACUUM can only set all-visible once the commit record is on disk
 SET synchronous_commit = on;
 SET max_parallel_workers_per_gather = 0;
--- The key column below is skewed: the rows a probe of it meets, and the
--- probes priced at them, are skew's to test (DESIGN.md §33, "The rows of a
--- probed key"); here every probe is priced at core's rows per key.
-SET pg_lion.enable_skew_estimate = off;
 -- A dimension of 100,208 keys, and a fact of 300,000 rows on them: keys 1
 -- to 8 have 5,000 rows each, keys 9 to 208 300 each, and the other 100,000
 -- one to three; the key's column analyzed at a statistics target of 8, so
