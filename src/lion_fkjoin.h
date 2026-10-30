@@ -125,6 +125,13 @@ typedef struct LionFkJoin
 								 * aggregate over the query's join */
 	List	   *filters;		/* LionFkFilter: the dimensions folded into
 								 * fact filters, an inner join's only */
+	Relids		dimvisible;		/* the dimension's tables whose rows it
+								 * returns - dimrel, and the tables
+								 * inner-joined to it - whose columns its rows
+								 * may carry up */
+	bool		keyunique;		/* no two of the dimension's rows hold one
+								 * key: dimrel's key column is provably unique
+								 * and no other table joins it to more rows */
 } LionFkJoin;
 
 /*

@@ -633,15 +633,17 @@ SELECT lion_fj('SELECT g, (SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk
 (1 row)
 
 -- ---- 6. declined --------------------------------------------------------------
+-- (the first three are taken since an inner join's count stopped asking that
+-- the key be unique: fkjoin_anydim.sql)
 -- a non-unique dimension key
 CREATE TABLE lion_fdn (k int8, attr int);
 INSERT INTO lion_fdn SELECT i % 50, i % 3 FROM generate_series(1, 100) i;
 CREATE INDEX ON lion_fdn (k);
 ANALYZE lion_fdn;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdn d ON f.fk = d.k GROUP BY d.attr');
-         lion_fj         
--------------------------
- not pushed down, 3 rows
+       lion_fj       
+---------------------
+ pushed down, 3 rows
 (1 row)
 
 -- a second join clause, an outer join, two fact columns in the output (one
@@ -742,17 +744,16 @@ SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ffp f JOIN lion_fd d ON f.fk =
 (1 row)
 
 DROP TABLE lion_ffp;
--- ... and a partitioned dimension, which has no index list to prove its key
--- unique from
+-- ... and a partitioned dimension
 CREATE TABLE lion_fdp (k int8 PRIMARY KEY, attr int) PARTITION BY RANGE (k);
 CREATE TABLE lion_fdp1 PARTITION OF lion_fdp FOR VALUES FROM (0) TO (50);
 CREATE TABLE lion_fdp2 PARTITION OF lion_fdp FOR VALUES FROM (50) TO (200);
 INSERT INTO lion_fdp SELECT i, i % 4 FROM generate_series(1, 100) i;
 ANALYZE lion_fdp;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdp d ON f.fk = d.k GROUP BY d.attr');
-         lion_fj         
--------------------------
- not pushed down, 4 rows
+       lion_fj       
+---------------------
+ pushed down, 4 rows
 (1 row)
 
 DROP TABLE lion_fdp;
@@ -763,9 +764,9 @@ CREATE UNIQUE INDEX ON lion_fdc (k COLLATE "C");
 INSERT INTO lion_fdc SELECT 'k' || i, i % 3 FROM generate_series(1, 100) i;
 ANALYZE lion_fdc;
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ff f JOIN lion_fdc d ON f.tk = d.k GROUP BY d.attr');
-         lion_fj         
--------------------------
- not pushed down, 3 rows
+       lion_fj       
+---------------------
+ pushed down, 3 rows
 (1 row)
 
 CREATE UNIQUE INDEX ON lion_fdc (k);

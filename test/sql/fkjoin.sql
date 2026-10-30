@@ -340,6 +340,8 @@ RESET lion_fj.xs;
 SELECT lion_fj('SELECT g, (SELECT count(*) FROM lion_ff f JOIN lion_fd d ON f.fk = d.pk WHERE d.attr = g.g AND f.x = 2) FROM generate_series(0, 7) g');
 
 -- ---- 6. declined --------------------------------------------------------------
+-- (the first three are taken since an inner join's count stopped asking that
+-- the key be unique: fkjoin_anydim.sql)
 -- a non-unique dimension key
 CREATE TABLE lion_fdn (k int8, attr int);
 INSERT INTO lion_fdn SELECT i % 50, i % 3 FROM generate_series(1, 100) i;
@@ -379,8 +381,7 @@ DROP INDEX lion_ffp_fk;
 CREATE INDEX ON lion_ffp1 USING lion (fk);
 SELECT lion_fj('SELECT d.attr, count(*) FROM lion_ffp f JOIN lion_fd d ON f.fk = d.pk GROUP BY d.attr');
 DROP TABLE lion_ffp;
--- ... and a partitioned dimension, which has no index list to prove its key
--- unique from
+-- ... and a partitioned dimension
 CREATE TABLE lion_fdp (k int8 PRIMARY KEY, attr int) PARTITION BY RANGE (k);
 CREATE TABLE lion_fdp1 PARTITION OF lion_fdp FOR VALUES FROM (0) TO (50);
 CREATE TABLE lion_fdp2 PARTITION OF lion_fdp FOR VALUES FROM (50) TO (200);

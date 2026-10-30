@@ -11814,13 +11814,10 @@ Consequences, each of them a rule rather than an optimisation:
 The sum above is the join count whatever `d.pk` holds - a duplicated key is two dimension rows,
 each counted with its own multiplicity, which is exactly what the join does - so, unlike the
 backlog sketch's union (where two rows of one group with one key would have been counted once),
-this design does not need uniqueness to be RIGHT. v1 requires it anyway, as a scope decision:
-
-- the ordinary star schema has it (the dimension's primary key), and it bounds the node's work by
-  the dimension's KEY count, which is what the cost model assumes: every lookup finds a different
-  fk entry, so no fact row is read twice;
-- a non-unique key is the shape where a hash join over the fact wins in any case, because the
-  lookups multiply, and it is kept out of the tested surface.
+this design does not need uniqueness to be RIGHT. v1 required it anyway, as a scope decision (the
+ordinary star schema has it, and a non-unique key was kept out of the tested surface); since "A
+dimension that is any join" an inner join takes any dimension, and the proof is asked only where a
+rule below rests on it. The cost model prices the child's rows, a lookup each, whatever they hold.
 
 The proof is `lion_column_is_unique()` (§26's unique column takes the same one): a single-column,
 UNIQUE, immediately enforced, non-partial btree index on the dimension's join column whose opfamily
@@ -11837,10 +11834,12 @@ make the node do more lookups than it was priced for, never give a wrong answer.
 is a GROUP BY of the key, whose Agg takes each of the node's rows as a group of its own ("Grouped
 by the join key"): it relies on the proof as core's unique inner join relies on its own, and with
 the same guarantees - an index that is valid, enforced immediately and not partial when the plan is
-made, and whose DROP invalidates the plan.
+made, and whose DROP invalidates the plan. So does the uniting of a batch's keys under a GROUP BY
+of a fact column, whose union counts a fact row once however many dimension rows share its key
+("Grouped by a fact column, the keys united").
 
-It guards the inner join only. A semi join's count is not a sum over join pairs, and the forward
-one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
+It guards the inner join's GROUP BY of the key, its keys united, and the dimension-side LEFT JOIN
+to the fact. A semi join's count is not a sum over join pairs, and the forward one over a key that nothing proves unique is counted over the dimension's DISTINCT keys instead
 ("Forward semi joins over a non-unique key", below), which makes the question moot there.
 
 ### The join semantics the lookup must reproduce
@@ -13732,9 +13731,9 @@ node runs core's cheapest path of it, under the query's snapshot, as it runs a t
 **Recognition** (`lion_fkjoin_recognize()`, `lion_fkjoin_try_fact()`), from the SpecialJoinInfos,
 not from the shape of the join tree:
 
-- every special join is a semi join or the anti join of a NOT EXISTS (an outer join, and an anti
-  join made of `LEFT JOIN ... IS NULL`, decline: "Telling the two anti joins apart"), inside the
-  join;
+- every special join in the join tree is a semi or an anti join (an outer join declines; an anti
+  join made of `LEFT JOIN ... IS NULL` is taken inside the dimension and declines when the fact is
+  its inner side: "A dimension that is any join");
   every table of the join is a base relation with no LATERAL references and no TABLESAMPLE; and,
   as before, no PlaceHolderVar, no pseudoconstant qual and no LATERAL range table entry anywhere;
 - each table of the join is tried as the fact `F` - a plain or partitioned table with no RLS or
@@ -13747,11 +13746,10 @@ not from the shape of the join tree:
   outer side (`EXISTS (SELECT 1 FROM f1 WHERE f1.fk = d.pk AND f1.x = f2.y)`, a condition on the
   fact's rows no posting set answers) or in its inner side declines. `F` may be in its syntactic
   outer side, which only says where the `EXISTS` was written;
-- the dimension's own table `d` is the one table of `D` in no inner side of those special joins,
-  and there has to be exactly one: a second (`d JOIN x ON ...`) is an inner join inside the
-  dimension, which may repeat a row of `d`, and declines - unless it only filters the fact, which
-  folds it before `D` is formed ("A second dimension that only filters"). `d` is a plain table or a materialized
-  view, as a dimension of one table is;
+- the dimension's own table `d` is a table of `D` in no inner side of those special joins; there
+  may be several, inner-joined, and `d` is the one the key is taken from ("A dimension that is any
+  join"). A table that only filters the fact is folded before `D` is formed ("A second dimension
+  that only filters"). `d` is a plain, partitioned or materialized-view relation;
 - exactly one join clause between `F` and all of `D` - the equivalence classes' clauses between
   them and `F`'s joininfo, as before - and it is taken between `F` and `d`. A dimension that is a
   join may hold other members of the key's class: with `f1.fk = d.pk` and `f2.fk = d.pk`, one class
@@ -13778,7 +13776,8 @@ an `EXISTS` are three offers.
 index list. A key unique in `d` is unique in the dimension's rows, since they are rows of `d` each
 at most once - which the recognition above checks rather than assumes.
 
-- An inner join needs the proof, as before (a non-unique key declines, tested).
+- An inner join needs none for its counts ("A dimension that is any join"); its GROUP BY of the key
+  asks it.
 - A reverse semi join and an anti join need none: they are per dimension row, and duplicated and
   NULL keys among the child's rows are rows as before (tested over a non-unique dimension). GROUP
   BY the key of a reverse semi join is each row a group of its own only with the proof ("Grouped
@@ -13819,11 +13818,12 @@ a hash semi join over f1's filtered rows - but the child was the larger part of 
 of "Every aggregate over the node's rows" (counted rows below a LionJoinAgg for an inner join),
 GROUP BY the join key - `d`'s or the fact's - over inner, reverse semi, anti and forward semi joins,
 with the dimension's own semi and anti joins in any number, nested or not, and a partitioned fact.
-**Declined**: an inner or outer join inside the dimension; a non-unique key in an inner join; a
-LATERAL reference, a PlaceHolderVar, a pseudoconstant qual; a second join clause between the fact
-and any table of the dimension; a semi join of the dimension's that needs the fact; the fact
-inside another semi join's inner side (its join is that table's); a dimension whose own table is
-partitioned or not a table (as before).
+**Declined**: an outer join inside the dimension; a LATERAL reference, a PlaceHolderVar, a
+pseudoconstant qual; a second join clause between the fact and any table of the dimension; a semi
+join inside the dimension that involves the fact; the fact inside another semi join's inner side (its
+join is that table's); a dimension with no table the key may be taken from. (An inner join inside
+the dimension, a non-unique key and a partitioned `d` are taken since "A dimension that is any
+join".)
 
 EXPLAIN is unchanged: the child is the join, under the node, as core plans it. A forward semi join
 taken as the inner join prints no `Join Type`, as the one core makes of a single table's does not.
@@ -13905,6 +13905,70 @@ at 14,947 dimension rows the loop is priced at 137,687 and runs in 1,349 ms, aga
 have, at the fact's average rows a key again; at 3,831 it is priced at 121,671 and runs in 601 to
 660 ms, about as fast as the node, and is chosen rightly. For (B) the node is chosen at both sizes,
 the probed plan never.
+
+### A dimension that is any join (2026-10-30)
+
+A count of a fact filtered by lion and joined on its key to a list of keys fell back to a bitmap heap
+scan of the fact whenever the list was spelled as a join rather than an `IN`: the fact's
+`count(*)`, and `count(DISTINCT key)`, over
+
+    fact f JOIN (d JOIN list l ON l.part = $1 AND l.k = d.pk
+                   LEFT JOIN excluded x ON x.k = d.pk WHERE x.k IS NULL) c ON c.pk = f.fk
+
+was answered by reading the heap of every fact row the filter kept, for its key alone. Three rules
+of the recognition declined it, none of them about the count: the dimension's tables were one table
+and semi or anti joins only, so `d JOIN l` declined; the dimension's table could not be a
+partitioned parent, so `l` alone, named through its parent, declined; and an anti join made of
+`LEFT JOIN ... IS NULL` declined anywhere in the query.
+
+**Why any join is exact.** An inner join's count is the sum, over the dimension's rows, of each
+row's fact rows ("What is computed, and why it is exact"), whatever the rows are and however many
+share a key: the join pairs a fact row with each dimension row of its key, and the node counts it
+for each. `count(DISTINCT x)` is the core Agg's over the node's rows, one a dimension row that
+joins, and is blind to their multiplicity. So the dimension may be any join core plans of the tables
+that are not the fact, provided the fact joins it by one key equality and nothing of the fact is
+wanted above but what the node emits. Its rows are core's: the node runs the join rel's cheapest
+path as its child, as for a dimension of one table. What does rest on a key that never repeats - a
+GROUP BY of the key, the dimension-side LEFT JOIN to the fact, a batch's keys united under a GROUP BY
+of a fact column - is taken only where an index proves it of the one visible table ("Uniqueness of
+the dimension key").
+
+**Recognition** (`lion_fkjoin_try_fact()`, `lion_fkjoin_pick_dim()`):
+
+- the dimension's VISIBLE tables are those in no inner side of its own semi and anti joins: the
+  tables whose rows its rows are (`dimvisible`). There may be several, inner-joined;
+- the key is taken from one of them, `d`: a table joined to the fact by exactly one clause, a strict
+  operator between a plain column of each, and the table on which the semi or anti join with the
+  fact is made, where there is one. With the key's equivalence class holding a column of several of them
+  (`f.fk = d.pk = l.k`) any of them is the key, the class holding them equal in every row; one whose
+  column an index proves unique is taken first, so that a dimension of one table keeps its proof.
+  `d` may be a partitioned parent: core plans it, and the lookups take the key from its rows;
+- an anti join made of `LEFT JOIN ... IS NULL` is the dimension's own like a NOT EXISTS: core runs
+  it inside the child, and its rows are its outer side's. Its inner side's columns are NULL in every
+  row and are not among the visible tables, so a query that names one declines. With the fact its
+  inner side - the dimension rows without a fact row - it declines, as before;
+- the node's rows carry columns of any visible table (`lion_fkjoin_child_has()` checks the child
+  emits them), for a GROUP BY, `count(DISTINCT)` or the aggregates of "Every aggregate over the
+  node's rows".
+
+**Uniqueness** (`keyunique`): the dimension's rows hold each key at most once when there is one
+visible table and an index proves its key unique. Only a GROUP BY of the key ("Grouped by the join
+key": each of the node's rows a group of its own) and the keys united under a GROUP BY of a fact
+column ("Grouped by a fact column, the keys united": a fact row counted once by the union) rest on
+it, and ask it; the dimension LEFT JOIN
+the fact keeps it as its scope guard; and the forward semi join over a joined dimension is the inner
+join only with it. Without it a GROUP BY of the key is grouped by the Agg above the node, as any
+other grouping column is.
+
+**Cost.** Unchanged: the child's price is core's, and the lookups are priced per row of it. With a
+key that repeats the lookups repeat, priced so.
+
+**Tests**: `fkjoin_anydim.sql` - an inner join inside the dimension, its other table's columns
+counted and grouped by, three tables over one key class; the list through a subquery with
+`LEFT JOIN ... IS NULL`, with `NOT EXISTS`, and through its partitioned parent; a key that repeats,
+with GROUP BYs of the key; parallel plans; and the fact inside `LEFT JOIN ... IS NULL` and a column
+of an excluded table, declined. Every answer against core's plan with the pushdown off.
+`fkjoin_dimjoin.sql`'s inner join inside the dimension is taken now.
 
 ### Probed, then collected (2026-09-29)
 
@@ -14643,7 +14707,10 @@ counted beside a group's set, located from the index and pinned as an IN list's 
 the §9 interlock for any dead TID the copy still lists; the dimension rows are read by the child
 under the same snapshot as before. A key the same bytes as the one before it in the batch - which
 that proof says does not come - is left out of the union and counted key by key, so the rows would
-still add up to the join's.
+still add up to the join's. An inner join whose key is not proven unique ("A dimension that is any
+join") is never united: two dimension rows of one key count its fact rows twice and the union once,
+and that bytes check does not catch the repeat under a nondeterministic collation, where `'a'` and
+`'A'` are one key in other bytes.
 
 **Bounds and fall-backs.** The keys located at once are what work_mem holds of them
 (`lion_array_batch_size()` sets at most, and no more than half of work_mem's worth of
