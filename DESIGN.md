@@ -22010,7 +22010,9 @@ relation's own rows, and so do its paths' rows. A path whose index answers the c
 scan with it among its index clauses, a bitmap heap scan with it under its bitmap, a
 LionBtreeScan whose B-tree has it among its index clauses - reads the rows that clause finds, and
 its run cost grows by that clause's factor, up to the rows' own (where the parameterization equates
-two skewed columns, a path whose index answers only one grows by that one's); any other path reads what it read before. Below a factor of 2 the column is near
+two skewed columns, a path whose index answers only one grows by that one's), and a bitmap heap
+scan's startup by what each index scan under its bitmap reads more by the factor of the clauses it
+answers; any other path reads what it read before. Below a factor of 2 the column is near
 enough to uniform that core's figure stands: the two agree exactly where every key has the same
 rows. The join's rows are not touched: they are the outer rows' share of the column's, which core's
 rows per key price right.

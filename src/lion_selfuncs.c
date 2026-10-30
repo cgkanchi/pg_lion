@@ -6916,8 +6916,9 @@ lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel, List *clauses)
  * clause - an index scan with it among its index clauses, a bitmap heap scan
  * with it under its bitmap, a LionBtreeScan whose B-tree has it among its
  * index clauses - reads the rows that clause finds, and its run cost grows
- * by that clause's factor, up to the rows' own; any other path reads what it
- * read before and only returns more.  The join's rows are not touched: they
+ * by that clause's factor, up to the rows' own (and a bitmap heap scan's
+ * startup by what its bitmap's index scans of the key read more); any other
+ * path reads what it read before and only returns more.  The join's rows are not touched: they
  * are the outer rows' share of the column's, which core's rows per key price
  * right.
  */
@@ -6986,6 +6987,33 @@ lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
 		return Max(factor, 1.0);
 	}
 	return 1.0;
+}
+
+/*
+ * What the index scans under a bitmap heap scan's bitmap read more at the
+ * rows a skewed probe meets: each index scan's cost, up to scale times, by
+ * the factor of the skewed clauses its index answers.  A bitmap heap scan
+ * charges them to its startup, which its run's factor does not reach.
+ */
+static Cost
+lion_skew_bitmap_more(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual,
+					  double scale)
+{
+	List	   *quals = NIL;
+	Cost		more = 0.0;
+	ListCell   *lc;
+
+	if (IsA(bitmapqual, IndexPath))
+		return bitmapqual->total_cost *
+			(Min(lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual),
+				 scale) - 1.0);
+	if (IsA(bitmapqual, BitmapAndPath))
+		quals = ((BitmapAndPath *) bitmapqual)->bitmapquals;
+	else if (IsA(bitmapqual, BitmapOrPath))
+		quals = ((BitmapOrPath *) bitmapqual)->bitmapquals;
+	foreach(lc, quals)
+		more += lion_skew_bitmap_more(root, rel, (Path *) lfirst(lc), scale);
+	return more;
 }
 
 /*
@@ -7114,6 +7142,16 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 			path->total_cost = path->startup_cost +
 				(path->total_cost - path->startup_cost) *
 				Min(lion_skew_path_factor(root, rel, path), scale);
+			if (IsA(path, BitmapHeapPath))
+			{
+				/* the bitmap's index scans, in its startup */
+				Cost		more = lion_skew_bitmap_more(root, rel,
+														 ((BitmapHeapPath *) path)->bitmapqual,
+														 scale);
+
+				path->startup_cost += more;
+				path->total_cost += more;
+			}
 			path->rows = clamp_row_est(path->rows * scale);
 		}
 		ppi->ppi_rows = rows;
