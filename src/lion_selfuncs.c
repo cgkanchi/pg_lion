@@ -7202,35 +7202,31 @@ lion_debug_skew_rows(PG_FUNCTION_ARGS)
 														 NULL);
 			(void) pg_plan_queries(queries, q, CURSOR_OPT_PARALLEL_OK, NULL);
 		}
+		lion_skew_collecting = false;
+
+		foreach(lc, lion_skew_collected)
+		{
+			LionSkewCol *col = (LionSkewCol *) lfirst(lc);
+			Datum		values[4];
+			bool		nulls[4] = {false, false, false, false};
+
+			values[0] = ObjectIdGetDatum(col->relid);
+			values[1] = Int16GetDatum(col->attnum);
+			values[2] = Float8GetDatum(col->rows);
+			nulls[2] = (col->rows <= 0.0);
+			values[3] = Float8GetDatum(col->keyrows);
+			nulls[3] = (col->keyrows <= 0.0);
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+		}
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
 		lion_skew_collecting = false;
 		lion_skew_collected = NIL;
 		MemoryContextDelete(lion_skew_collect_cxt);
 		lion_skew_collect_cxt = NULL;
-		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	lion_skew_collecting = false;
-
-	foreach(lc, lion_skew_collected)
-	{
-		LionSkewCol *col = (LionSkewCol *) lfirst(lc);
-		Datum		values[4];
-		bool		nulls[4] = {false, false, false, false};
-
-		values[0] = ObjectIdGetDatum(col->relid);
-		values[1] = Int16GetDatum(col->attnum);
-		values[2] = Float8GetDatum(col->rows);
-		nulls[2] = (col->rows <= 0.0);
-		values[3] = Float8GetDatum(col->keyrows);
-		nulls[3] = (col->keyrows <= 0.0);
-		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
-							 nulls);
-	}
-	lion_skew_collected = NIL;
-	MemoryContextDelete(lion_skew_collect_cxt);
-	lion_skew_collect_cxt = NULL;
 	return (Datum) 0;
 }
