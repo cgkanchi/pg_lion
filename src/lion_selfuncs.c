@@ -6905,100 +6905,119 @@ lion_skew_clauses_factor(PlannerInfo *root, RelOptInfo *rel, List *clauses)
  * A semi or anti join's probe is the exception: it ends at its key's first
  * match, no later at a heavy key, and one with no match ends at once where
  * the index answers every join clause.  So where rel is the inner side of a
- * semi or anti join, a parameterization whose clauses all equate a column to
- * an outer value keeps core's price; one with a clause beyond those - which
- * a probe with no match reads every row of its key for - is repriced.
+ * semi or anti join and is probed by its outer side, a parameterization whose
+ * clauses all equate a column to an outer value keeps core's price; one with
+ * a clause beyond those - which a probe with no match reads every row of its
+ * key for - is repriced.  A probe whose outer values do not all come from
+ * the join's outer side is an ordinary one there, and is repriced.
  *
  * The parameterization's rows grow by the factor, up to rel's own rows, and
- * so does each of its paths' rows.  A path whose index answers the clause -
- * an index scan with it among its index clauses, a bitmap heap scan with it
- * under its bitmap, a LionBtreeScan's walk of the key's B-tree - reads the
- * rows it finds, and its run cost grows with them; any other path reads what it read before and only returns more.  The
- * join's rows are not touched: they are the outer rows' share of the
- * column's, which core's rows per key price right.
+ * so does each of its paths' rows.  A path whose index answers a skewed
+ * clause - an index scan with it among its index clauses, a bitmap heap scan
+ * with it under its bitmap, a LionBtreeScan whose B-tree has it among its
+ * index clauses - reads the rows that clause finds, and its run cost grows
+ * by that clause's factor, up to the rows' own; any other path reads what it
+ * read before and only returns more.  The join's rows are not touched: they
+ * are the outer rows' share of the column's, which core's rows per key price
+ * right.
  */
 #define LION_SKEW_MIN_FACTOR	2.0
 
-/* Does clause - an IndexClause or a RestrictInfo - probe a skewed key? */
-static bool
-lion_skew_clause_skewed(PlannerInfo *root, RelOptInfo *rel, Node *clause)
+/*
+ * The factor clause - an IndexClause or a RestrictInfo - probes a skewed key
+ * by; 1 below LION_SKEW_MIN_FACTOR or where it probes no key.
+ */
+static double
+lion_skew_clause_factor(PlannerInfo *root, RelOptInfo *rel, Node *clause)
 {
 	Var		   *var = lion_skew_param_eq_var(root, rel, clause);
+	double		factor;
 
-	return var != NULL &&
-		lion_skew_param_factor(root, rel, var) >= LION_SKEW_MIN_FACTOR;
+	if (var == NULL)
+		return 1.0;
+	factor = lion_skew_param_factor(root, rel, var);
+	return factor >= LION_SKEW_MIN_FACTOR ? factor : 1.0;
 }
 
-/* Does the bitmap under a bitmap heap scan answer a skewed key's probe? */
-static bool
-lion_skew_bitmap_probes(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
+/* The largest factor (above) of the skewed clauses an index path answers */
+static double
+lion_skew_index_factor(PlannerInfo *root, RelOptInfo *rel, IndexPath *ipath)
 {
+	double		factor = 1.0;
+	ListCell   *lc;
+
+	foreach(lc, ipath->indexclauses)
+		factor = Max(factor,
+					 lion_skew_clause_factor(root, rel, (Node *) lfirst(lc)));
+	return factor;
+}
+
+/*
+ * The factor the bitmap under a bitmap heap scan reads its skewed probe's
+ * rows by: an AND's largest, an OR's smallest (each of its arms must answer
+ * a skewed key for the OR to read more).
+ */
+static double
+lion_skew_bitmap_factor(PlannerInfo *root, RelOptInfo *rel, Path *bitmapqual)
+{
+	double		factor;
 	ListCell   *lc;
 
 	if (IsA(bitmapqual, IndexPath))
-	{
-		foreach(lc, ((IndexPath *) bitmapqual)->indexclauses)
-		{
-			if (lion_skew_clause_skewed(root, rel, (Node *) lfirst(lc)))
-				return true;
-		}
-		return false;
-	}
+		return lion_skew_index_factor(root, rel, (IndexPath *) bitmapqual);
 	if (IsA(bitmapqual, BitmapAndPath))
 	{
+		factor = 1.0;
 		foreach(lc, ((BitmapAndPath *) bitmapqual)->bitmapquals)
-		{
-			if (lion_skew_bitmap_probes(root, rel, (Path *) lfirst(lc)))
-				return true;
-		}
-		return false;
+			factor = Max(factor,
+						 lion_skew_bitmap_factor(root, rel, (Path *) lfirst(lc)));
+		return factor;
 	}
 	if (IsA(bitmapqual, BitmapOrPath))
 	{
+		factor = -1.0;
 		foreach(lc, ((BitmapOrPath *) bitmapqual)->bitmapquals)
 		{
-			if (!lion_skew_bitmap_probes(root, rel, (Path *) lfirst(lc)))
-				return false;
+			double		arm = lion_skew_bitmap_factor(root, rel,
+													  (Path *) lfirst(lc));
+
+			factor = (factor < 0.0) ? arm : Min(factor, arm);
 		}
-		return true;
+		return Max(factor, 1.0);
 	}
-	return false;
+	return 1.0;
 }
 
-/* Does path read the rows its skewed probe finds (above)? */
-static bool
-lion_skew_path_probes(PlannerInfo *root, RelOptInfo *rel, Path *path)
+/*
+ * The factor path's run reads its skewed probe's rows by (above), from the
+ * clauses its own index answers; 1 where it answers none.
+ */
+static double
+lion_skew_path_factor(PlannerInfo *root, RelOptInfo *rel, Path *path)
 {
-	ListCell   *lc;
-
 	switch (path->pathtype)
 	{
 		case T_IndexScan:
 		case T_IndexOnlyScan:
-			foreach(lc, ((IndexPath *) path)->indexclauses)
-			{
-				if (lion_skew_clause_skewed(root, rel, (Node *) lfirst(lc)))
-					return true;
-			}
-			return false;
+			return lion_skew_index_factor(root, rel, (IndexPath *) path);
 		case T_BitmapHeapScan:
-			return lion_skew_bitmap_probes(root, rel,
+			return lion_skew_bitmap_factor(root, rel,
 										   ((BitmapHeapPath *) path)->bitmapqual);
 		case T_CustomScan:
 			{
 				CustomPath *cpath = (CustomPath *) path;
 				Node	   *ipath;
 
-				/* a B-tree's walk, where its index answers the clause */
+				/* a B-tree's walk, by the clauses its index answers */
 				if (cpath->methods != &lion_btree_path_methods ||
 					cpath->custom_private == NIL)
-					return false;
+					return 1.0;
 				ipath = linitial(cpath->custom_private);
-				return IsA(ipath, IndexPath) &&
-					lion_skew_path_probes(root, rel, (Path *) ipath);
+				return IsA(ipath, IndexPath) ?
+					lion_skew_index_factor(root, rel, (IndexPath *) ipath) : 1.0;
 			}
 		default:
-			return false;
+			return 1.0;
 	}
 }
 
@@ -7092,9 +7111,9 @@ lion_skew_reprice_params(PlannerInfo *root, RelOptInfo *rel)
 
 			if (path->param_info != ppi)
 				continue;
-			if (lion_skew_path_probes(root, rel, path))
-				path->total_cost = path->startup_cost +
-					(path->total_cost - path->startup_cost) * scale;
+			path->total_cost = path->startup_cost +
+				(path->total_cost - path->startup_cost) *
+				Min(lion_skew_path_factor(root, rel, path), scale);
 			path->rows = clamp_row_est(path->rows * scale);
 		}
 		ppi->ppi_rows = rows;
