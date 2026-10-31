@@ -5303,11 +5303,11 @@ lion_nd_core_lookup(PlannerInfo *root, Node *node, int varRelid,
 
 /*
  * The most values of one column of one relation whose frequencies are looked
- * up: as many as the longest IN list the count pushdown takes as a literal
- * (LION_MAX_ARRAY_ELEMS, DESIGN.md §15), past which lion_analyze_leaf()
- * declines a list.  Each is a descent of the directory, once per planner run,
- * and each joins the most common values that core's estimate of an IN list
- * walks once per value listed (var_eq_const()): so the bound is on both.
+ * up: LION_MAX_ARRAY_ELEMS, a thousand; a longer list has its column
+ * estimated as without the frequencies.  Each is a descent of the directory,
+ * once per planner run, and each joins the most common values that core's
+ * estimate of an IN list walks once per value listed (var_eq_const()): so
+ * the bound is on both.
  */
 #define LION_MCV_MAX_KEYS	LION_MAX_ARRAY_ELEMS
 

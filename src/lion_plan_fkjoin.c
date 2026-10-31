@@ -2127,8 +2127,8 @@ lion_try_fkjoin_path(PlannerInfo *root, RelOptInfo *rel,
 	 * every count reads (DESIGN.md §27) whatever the list's length - a list
 	 * too long to open at once is read as a windowed union for it
 	 * (lion_count_sources_run()) - and the cost model prices the per-count
-	 * reading of an array it cannot see as the longest list a literal may be
-	 * (lion_cost_fkjoin_rel()), so that the copy is what it chooses.  An
+	 * reading of an array it cannot see as at least LION_MAX_ARRAY_ELEMS
+	 * values (lion_cost_fkjoin_rel()), so that the copy is what it chooses.  An
 	 * expression's array is priced by its plan-time estimate.
 	 */
 

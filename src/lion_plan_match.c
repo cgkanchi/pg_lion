@@ -2007,11 +2007,16 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 		out->val = right;
 
 		/*
-		 * The length cap of DESIGN.md §15 applies to the lists whose length is
-		 * known now: a literal array and the ARRAY[...] a generic plan keeps
-		 * for `k IN ($1, $2)`.  A parameter that IS an array has no length
-		 * until the executor has it, and by then there is no plan to decline
-		 * in favour of, so it is answered whatever its length.
+		 * The length cap of DESIGN.md §15 (LION_MAX_LIST_ELEMS) applies to
+		 * the lists whose length is known now: a literal array and the
+		 * ARRAY[...] a generic plan keeps for `k IN ($1, $2)`.  The executor
+		 * locates a list longer than lion_array_batch_size() a batch at a
+		 * time, or collects it into one union, so the cap bounds what a
+		 * statement's text can make the node hold - a Datum and a hash per
+		 * value, and the planner's copies of the list - not its pins.  A
+		 * parameter that IS an array has no length until the executor has
+		 * it, and by then there is no plan to decline in favour of, so it
+		 * is answered whatever its length.
 		 *
 		 * Any other array expression - a stable function's, `k = ANY
 		 * (string_to_array(current_setting(...), ','))` - is estimated as
@@ -2029,13 +2034,13 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 			if (((Const *) out->val)->constisnull)
 				return false;
 			nelems = lion_array_const_nelems((Const *) out->val);
-			if (nelems < 0 || nelems > LION_MAX_ARRAY_ELEMS)
+			if (nelems < 0 || nelems > LION_MAX_LIST_ELEMS)
 				return false;
 		}
 		else if (IsA(out->val, ArrayExpr))
 		{
 			nelems = list_length(((ArrayExpr *) out->val)->elements);
-			if (nelems > LION_MAX_ARRAY_ELEMS)
+			if (nelems > LION_MAX_LIST_ELEMS)
 				return false;
 		}
 		else if (!IsA(out->val, Param))
@@ -2047,7 +2052,7 @@ lion_analyze_leaf(PlannerInfo *root, Node *clause, Index rti,
 				ScalarArrayOpExpr *costsaop;
 
 				nelems = lion_array_const_nelems((Const *) est);
-				if (nelems > LION_MAX_ARRAY_ELEMS)
+				if (nelems > LION_MAX_LIST_ELEMS)
 					return false;
 
 				costsaop = (ScalarArrayOpExpr *) copyObject(saop);

@@ -489,7 +489,7 @@ lion_cost_fkjoin_rel(PlannerInfo *root, RelOptInfo *rel, List *whereidx,
 			 * whatever it turns out to hold, and priced once at
 			 * estimate_array_length()'s guess.  But a count that PROBES the
 			 * filters builds its union again per dimension row, so there it
-			 * is priced as the longest list a literal may be: underpricing a
+			 * is priced as at least LION_MAX_ARRAY_ELEMS values: underpricing a
 			 * scan's one-off work costs a little, underpricing a dimension
 			 * row's costs that many times over (the 2026-09-23 review's
 			 * 43,000 values over 20,000 dimension rows ran for minutes).
