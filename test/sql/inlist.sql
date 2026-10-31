@@ -228,6 +228,8 @@ SET work_mem = '64kB';
 SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 2500, 1700)));
 SELECT lion_incmp(format('SELECT a, count(*) FROM lion_in WHERE a = ANY (''%s''::int[]) GROUP BY a', lion_inlist(0, 2500, 1700)));
 RESET work_mem;
+-- the longest list pushed down, 100,000 values, and one more declined
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 99999, 1000000)));
 SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 100000, 1000000)));
 
 /*
