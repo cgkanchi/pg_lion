@@ -152,6 +152,38 @@ SELECT lion_tq('SELECT count(*) FROM tk WHERE light GROUP BY g ORDER BY count(*)
 SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g <> 1020 GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
 SELECT lion_trun('SELECT g, count(*) FROM tk WHERE g <> 1020 GROUP BY g ORDER BY count(*) DESC, g LIMIT 3');
 SELECT lion_tq('SELECT g, count(*) FROM tk WHERE g IS NOT NULL GROUP BY g ORDER BY count(*) DESC LIMIT 2');
+-- ... and are not priced as candidates: with one value holding most of the
+-- rows, leaving it out prices the top k below leaving out a value no row has.
+CREATE TABLE tkd (g int) WITH (autovacuum_enabled = off);
+INSERT INTO tkd SELECT CASE WHEN i % 10 < 8 THEN 0 ELSE i % 20000 + 1 END
+FROM generate_series(1, 200000) i;
+CREATE INDEX tkd_g ON tkd USING lion (g);
+VACUUM ANALYZE tkd;
+CREATE FUNCTION lion_tcost(q text) RETURNS float8
+LANGUAGE plpgsql AS $$
+DECLARE
+	ln text;
+	c float8;
+BEGIN
+	PERFORM set_config('enable_seqscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('enable_hashagg', 'off', true);
+	FOR ln IN EXECUTE 'EXPLAIN ' || q LOOP
+		IF ln ~ 'Custom Scan \(LionCount\)' THEN
+			c := substring(ln FROM '\.\.([0-9.]+) rows')::float8;
+		END IF;
+	END LOOP;
+	PERFORM set_config('enable_seqscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('enable_hashagg', 'on', true);
+	RETURN c;
+END
+$$;
+SELECT lion_tq('SELECT g, count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10');
+SELECT lion_tcost('SELECT g, count(*) FROM tkd WHERE g <> 0 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10') <
+	   lion_tcost('SELECT g, count(*) FROM tkd WHERE g <> -1 GROUP BY g ORDER BY count(*) DESC, g LIMIT 10') / 2 AS cheaper;
 
 -- 6. Declined: an ORDER BY that is not the count descending, a HAVING, a
 --    DISTINCT, a window function, a LIMIT only known at run time, a count
@@ -236,4 +268,5 @@ SELECT c::text, count(*) FROM tkc GROUP BY c, c::text ORDER BY count(*) DESC, 1 
 
 DROP FUNCTION lion_trun(text);
 DROP FUNCTION lion_tq(text);
-DROP TABLE tk, tkc;
+DROP FUNCTION lion_tcost(text);
+DROP TABLE tk, tkc, tkd;
