@@ -579,10 +579,11 @@ lion_posting_set_lookup(Relation index, Datum key, Oid keytype,
  * rows included until VACUUM - read with the leaf share-locked for a moment
  * and nothing kept: no posting set, pin or predicate lock.  For the planner
  * (DESIGN.md §33, "The frequencies of the listed values"); key is of the
- * column's own key type.  False, with *ntids 0, when the key has no entry.
+ * column's own key type.  False, with *ntids 0, when the key has no entry;
+ * *blkp, when blkp is not NULL, the leaf it was found on.
  */
 extern bool lion_key_ntids(Relation index, AttrNumber attno, Datum key,
-						   uint64 *ntids);
+						   uint64 *ntids, BlockNumber *blkp);
 
 /*
  * Locate the posting sets of nvalues keys of one index at once: the IN list

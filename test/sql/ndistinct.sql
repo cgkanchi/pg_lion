@@ -80,20 +80,26 @@ SET pg_lion.enable_index_ndistinct = off;
 SELECT lnd_rows('SELECT k FROM lnd GROUP BY k') < 70010 / 2 AS core_below_half;
 RESET pg_lion.enable_index_ndistinct;
 
--- ---------- 4. past that, ANALYZE leaves the count as it was ----------
+-- ---------- 4. past that, ANALYZE counts a sample of the leaves ----------
 -- At statistics target 1 the bound is 300 pages, and k's directory is larger.
--- 10,000 more values: neither ANALYZE nor a VACUUM with nothing to delete
--- counts them.
+-- 10,000 more values: ANALYZE reads some of the leaves, all of those that hold
+-- the heavy values, and scales up the rest.  A VACUUM with nothing to delete
+-- does the same.  Each sample is a different one, so only the estimate's
+-- distance from the true 80,010 is printed.
 ALTER TABLE lnd ALTER k SET STATISTICS 1;
 SELECT leaf_pages + internal_pages > 300 AS past_bound
   FROM lion_index_stats('lnd_k');
 INSERT INTO lnd SELECT i, 120000 + (i - 240001) / 2, 0
   FROM generate_series(240001, 260000) i;
-ANALYZE lnd;
-SELECT ndistinct FROM lion_index_stats('lnd_k');
-VACUUM lnd;
-SELECT ndistinct FROM lion_index_stats('lnd_k');
 SELECT count(DISTINCT k) AS k_values FROM lnd;
+ANALYZE lnd;
+SELECT abs(ndistinct - 80010) <= 0.1 * 80010 AS sampled_near
+  FROM lion_index_stats('lnd_k');
+SELECT abs(lnd_rows('SELECT k FROM lnd GROUP BY k') - 80010) <= 0.1 * 80010
+	AS lion_count;
+VACUUM lnd;
+SELECT abs(ndistinct - 80010) <= 0.1 * 80010 AS sampled_near
+  FROM lion_index_stats('lnd_k');
 
 -- ---------- 5. after deletes, VACUUM counts on its own walk ----------
 -- 20,000 values go, and their entries with them.  The VACUUM that deletes

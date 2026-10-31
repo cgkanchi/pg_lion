@@ -142,9 +142,13 @@
  */
 #include "postgres.h"
 
+#include <math.h>
+
 #include "access/generic_xlog.h"
 #include "access/transam.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_statistic.h"
+#include "common/pg_prng.h"
 #include "commands/vacuum.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -153,12 +157,15 @@
 #include "storage/freespace.h"
 #include "storage/indexfsm.h"
 #include "storage/procarray.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/sampling.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
 #include "lion.h"
+#include "lion_count.h"
 
 /*
  * Where ambulkdelete's time goes (DESIGN.md §18, "Measure first").
@@ -1060,20 +1067,358 @@ lion_vacuum_count_budget(Relation index)
 }
 
 /*
+ * Add one directory leaf's VALUE entries to each key column's count and Σn²,
+ * and its rows under the first scalar column to *rows.  No reserved entry
+ * (§14, §17) is a value, nor is a summary (§32), nor an entry with no TID at
+ * all; a key whose rows are all dead is, until the VACUUM that empties its
+ * entry deletes it - an estimate, as ANALYZE's own is.
+ */
+static void
+lion_vacuum_count_leaf(Page page, LionIndexState *ix, AttrNumber rowcol,
+					   uint64 *nvalues, uint64 *sumsq, uint64 *rows)
+{
+	OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+	OffsetNumber off;
+
+	for (off = lion_page_first_data(page); off <= maxoff; off++)
+	{
+		ItemId		iid = PageGetItemId(page, off);
+		LionEntryTuple *entry;
+
+		if (!ItemIdIsUsed(iid))
+			continue;
+		entry = lion_entry_at(page, iid);
+		if (entry->attno < 1 || entry->attno > ix->ncolumns)
+			continue;
+		/* a key with no row at all, whose entry VACUUM has not deleted */
+		if (lion_entry_kind(entry) == LION_KIND_VALUE && lion_entry_ntids(entry) > 0)
+		{
+			nvalues[entry->attno - 1]++;
+			lion_sumsq_add(&sumsq[entry->attno - 1],
+						   lion_entry_ntids(entry));
+		}
+		if (entry->attno == rowcol && !LionEntryIsDerived(entry))
+			*rows += lion_entry_ntids(entry);
+	}
+}
+
+/*
+ * A sampled count scaled up: est rounded, at least one where the sample saw
+ * any, and PG_UINT64_MAX - unknown, for a Σn² - past what a uint64 holds.
+ */
+static uint64
+lion_vacuum_scaled(double est, bool seen)
+{
+	uint64		v;
+
+	if (est >= (double) PG_UINT64_MAX)
+		return PG_UINT64_MAX;
+	v = (uint64) rint(est);
+	if (v == 0 && seen)
+		v = 1;
+	return v;
+}
+
+/* The most common values of a column whose leaves a sampled count reads */
+#define LION_SAMPLE_MCV_MAX		100
+
+/* Order (block, leaf position) pairs by block. */
+static int
+lion_vacuum_blkpos_cmp(const void *a, const void *b)
+{
+	BlockNumber ba = ((const BlockNumber *) a)[0];
+	BlockNumber bb = ((const BlockNumber *) b)[0];
+
+	return (ba > bb) - (ba < bb);
+}
+
+/*
+ * Mark as read whole (weight 1) the leaves that hold ANALYZE's most common
+ * values of each scalar key column - the first LION_SAMPLE_MCV_MAX of each
+ * list, its heaviest - found by a lookup of each (lion_key_ntids()).  A
+ * column whose statistics are of another type than its key, or that has none,
+ * marks nothing.  The number of leaves newly marked; *nlookups the lookups.
+ */
+static int
+lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
+					   const BlockNumber *blks, int nleaves, double *weight,
+					   int *nlookups)
+{
+	Form_pg_index indexform = index->rd_index;
+	TupleDesc	desc = RelationGetDescr(index);
+	BlockNumber *pairs;
+	int			nmarked = 0;
+	int			c;
+	int			i;
+
+	*nlookups = 0;
+	pairs = (BlockNumber *) palloc(sizeof(BlockNumber) * 2 * nleaves);
+	for (i = 0; i < nleaves; i++)
+	{
+		pairs[2 * i] = blks[i];
+		pairs[2 * i + 1] = (BlockNumber) i;
+	}
+	qsort(pairs, nleaves, sizeof(BlockNumber) * 2, lion_vacuum_blkpos_cmp);
+
+	for (c = 0; c < ix->ncolumns && c < INDEX_MAX_KEYS; c++)
+	{
+		AttrNumber	attnum = indexform->indkey.values[c];
+		Oid			relid = indexform->indrelid;
+		HeapTuple	tup;
+		AttStatsSlot sslot;
+
+		if (ix->cols[c].multikey)
+			continue;
+		if (attnum == 0)
+		{
+			relid = RelationGetRelid(index);
+			attnum = (AttrNumber) (c + 1);
+		}
+		tup = SearchSysCache3(STATRELATTINH, ObjectIdGetDatum(relid),
+							  Int16GetDatum(attnum), BoolGetDatum(false));
+		if (!HeapTupleIsValid(tup))
+			continue;
+		if (get_attstatsslot(&sslot, tup, STATISTIC_KIND_MCV, InvalidOid,
+							 ATTSTATSSLOT_VALUES))
+		{
+			if (sslot.valuetype == TupleDescAttr(desc, c)->atttypid)
+			{
+				int			k;
+
+				for (k = 0; k < sslot.nvalues && k < LION_SAMPLE_MCV_MAX; k++)
+				{
+					uint64		ntids;
+					BlockNumber key[2];
+					BlockNumber *hit;
+
+					(*nlookups)++;
+					CHECK_FOR_INTERRUPTS();
+					if (!lion_key_ntids(index, (AttrNumber) (c + 1),
+										sslot.values[k], &ntids, &key[0]))
+						continue;
+					hit = (BlockNumber *) bsearch(key, pairs, nleaves,
+												  sizeof(BlockNumber) * 2,
+												  lion_vacuum_blkpos_cmp);
+					/* a leaf split off since the list was read is sampled */
+					if (hit != NULL && weight[hit[1]] == 0)
+					{
+						weight[hit[1]] = 1.0;
+						nmarked++;
+					}
+				}
+			}
+			free_attstatsslot(&sslot);
+		}
+		ReleaseSysCache(tup);
+	}
+	pfree(pairs);
+	return nmarked;
+}
+
+/*
+ * Counting a sample (DESIGN.md §33, "Counting a sample"): the counts of a
+ * directory larger than the budget, estimated from a sample of its leaves, as
+ * ANALYZE estimates a table's statistics from a sample of its blocks.
+ *
+ * Every entry of a leaf is one key, and carries its TIDs, so a leaf's share of
+ * a column's keys, of its Σn² and of the rows is read off the leaf alone, and
+ * a sample of leaves scales up by the number of leaves - which the downlinks
+ * of level 1 list, read in a walk along it (lion_dir_leaves()).  The entries
+ * are in the order of their key column first (§24), so a column's keys are a
+ * run of leaves, and a short run - a column of a few keys, which a sample of
+ * the leaves would find by luck or not at all - lies on the leaf where the run
+ * of leaves whose lower bound is in one column ends.  That leaf is read
+ * whatever the sample: every leaf whose right neighbour's lower bound is in
+ * another column, the last leaf with them.  The others are sampled in strata,
+ * one per column their lower bound is in, each its share of what the budget
+ * leaves - one leaf at least - and each sampled leaf stands for its stratum's
+ * leaves over its sample.  The estimate of each column is unbiased, and its
+ * error the sample's.  A few heavy keys carry much of a skewed column's Σn²,
+ * and a sample that finds the leaf of one or misses it would swing the sum by
+ * that key's square; those keys are the ones ANALYZE has just listed as the
+ * column's most common values, so the leaf each of them is on is looked up
+ * (lion_vacuum_mcv_leaves()) and read whole too, and the sum is sampled only
+ * over the rest - which is the part the planner uses (§33, "The rows of a
+ * probed key").
+ *
+ * The walk along level 1, the lookups and the leaves read count against the
+ * budget; a directory whose level 1 alone would use half of it, or whose
+ * leaves that must be read leave nothing to sample, is not counted, and keeps
+ * the counts it has.  Each page is read SHARE alone through the ring, the leaves in
+ * their order left to right, and a block a downlink named that is no longer
+ * a live leaf when it is read - deleted since, or reused - counts as empty.
+ */
+static void
+lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
+						AttrNumber rowcol, const LionMetaPageData *meta,
+						BlockNumber budget)
+{
+	Relation	index = info->index;
+	LionMetaNdistinct nd;
+	BlockNumber *blks;
+	uint16	   *starts;
+	double	   *weight;
+	double	   *estv;
+	double	   *ests;
+	double		estrows = 0;
+	bool	   *seen;
+	bool	   *saturated;
+	uint64	   *nvalues;
+	uint64	   *sumsq;
+	uint64	   *finalv;
+	uint64	   *finals;
+	uint64		rows;
+	BlockNumber internal;
+	BlockNumber leafbudget;
+	int			nleaves;
+	int			ncertain = 0;
+	int			nlookups;
+	int			nrest;
+	int		   *rest;
+	int			i;
+	int			c;
+
+	nleaves = lion_dir_leaves(index, ix, info->strategy, budget / 2,
+							  &blks, &starts);
+	if (nleaves <= 0)
+		return;
+
+	/* the leaf that ends each run of one lower-bound column is read whole */
+	weight = (double *) palloc0(sizeof(double) * nleaves);
+	for (i = 0; i < nleaves; i++)
+	{
+		if (i == nleaves - 1 || starts[i + 1] != starts[i])
+		{
+			weight[i] = 1.0;
+			ncertain++;
+		}
+	}
+	/* and so is the leaf of each of ANALYZE's most common values */
+	ncertain += lion_vacuum_mcv_leaves(index, ix, blks, nleaves, weight,
+									   &nlookups);
+	nrest = nleaves - ncertain;
+	internal = meta->dirpages > (uint32) nleaves ?
+		meta->dirpages - (uint32) nleaves : 0;
+	if ((uint64) budget <= (uint64) internal + ncertain + nlookups)
+	{
+		pfree(weight);
+		pfree(blks);
+		pfree(starts);
+		return;
+	}
+	leafbudget = budget - internal - ncertain - nlookups;
+
+	/* each stratum: the run's leaves not read whole, its share of the rest */
+	rest = (int *) palloc(sizeof(int) * nleaves);
+	i = 0;
+	while (i < nleaves)
+	{
+		int			run = i;
+		int			len = 0;
+
+		while (run < nleaves - 1 && starts[run + 1] == starts[i])
+			run++;
+		for (c = i; c <= run; c++)
+			if (weight[c] == 0)
+				rest[len++] = c;
+		if (len > 0)
+		{
+			BlockSamplerData bs;
+			uint64		want = (uint64) leafbudget * (uint64) len / (uint64) nrest;
+			int			n = (int) Max(1, Min(want, (uint64) len));
+			int			k;
+			double		w;
+
+			(void) BlockSampler_Init(&bs, (BlockNumber) len, n,
+									 pg_prng_uint32(&pg_global_prng_state));
+			n = 0;
+			while (BlockSampler_HasMore(&bs))
+			{
+				weight[rest[BlockSampler_Next(&bs)]] = -1.0;
+				n++;
+			}
+			w = (double) len / (double) n;
+			for (k = 0; k < len; k++)
+				if (weight[rest[k]] < 0)
+					weight[rest[k]] = w;
+		}
+		i = run + 1;
+	}
+	pfree(rest);
+
+	estv = (double *) palloc0(sizeof(double) * ix->ncolumns);
+	ests = (double *) palloc0(sizeof(double) * ix->ncolumns);
+	seen = (bool *) palloc0(sizeof(bool) * ix->ncolumns);
+	saturated = (bool *) palloc0(sizeof(bool) * ix->ncolumns);
+	nvalues = (uint64 *) palloc(sizeof(uint64) * ix->ncolumns);
+	sumsq = (uint64 *) palloc(sizeof(uint64) * ix->ncolumns);
+	for (i = 0; i < nleaves; i++)
+	{
+		Buffer		buf;
+		Page		page;
+
+		if (weight[i] == 0)
+			continue;
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, blks[i], RBM_NORMAL,
+								 info->strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		memset(nvalues, 0, sizeof(uint64) * ix->ncolumns);
+		memset(sumsq, 0, sizeof(uint64) * ix->ncolumns);
+		rows = 0;
+		if (!PageIsNew(page) && LionPageIsLeaf(page) &&
+			!LionPageIsDeleted(page) && !LionPageIsHalfDead(page))
+			lion_vacuum_count_leaf(page, ix, rowcol, nvalues, sumsq, &rows);
+		UnlockReleaseBuffer(buf);
+
+		for (c = 0; c < ix->ncolumns; c++)
+		{
+			estv[c] += weight[i] * (double) nvalues[c];
+			ests[c] += weight[i] * (double) sumsq[c];
+			seen[c] |= (nvalues[c] > 0);
+			saturated[c] |= (sumsq[c] == PG_UINT64_MAX);
+		}
+		estrows += weight[i] * (double) rows;
+		lion_vacuum_delay_point();
+	}
+
+	finalv = nvalues;
+	finals = sumsq;
+	for (c = 0; c < ix->ncolumns; c++)
+	{
+		finalv[c] = lion_vacuum_scaled(estv[c], seen[c]);
+		finals[c] = saturated[c] ? PG_UINT64_MAX :
+			lion_vacuum_scaled(ests[c], seen[c]);
+	}
+	lion_meta_fill_ndistinct(&nd, ix, finalv, finals,
+							 lion_vacuum_scaled(estrows, false));
+	lion_meta_write_ndistinct(index, &nd);
+
+	pfree(estv);
+	pfree(ests);
+	pfree(seen);
+	pfree(saturated);
+	pfree(nvalues);
+	pfree(sumsq);
+	pfree(weight);
+	pfree(blks);
+	pfree(starts);
+}
+
+/*
  * Count the VALUE entries of each key column, and the rows under the first
  * scalar one, and record them on the meta page for the planner's n_distinct
  * (DESIGN.md §33): for a VACUUM or an ANALYZE that has no ambulkdelete walk
- * to count them on (lion_vac_count()), and only when the directory is small.
+ * to count them on (lion_vac_count()).
  *
  * It may read no more pages than ANALYZE's sample of the table does
  * (lion_vacuum_count_budget()).  The meta page knows how many pages the
  * directory has - exactly, as the build and every split keep it (§21) - so a
- * directory larger than that is not read at all, and one that grows past it
- * while it is walked is abandoned at the page that would pass it.  Either way
- * nothing is written and the index keeps the counts it has: a count of part
- * of the directory is a wrong count, where an old one is only old, and the
- * planner stops using an old one once the table has outgrown it (§33,
- * "Stale counts").
+ * directory larger than that is not walked but sampled
+ * (lion_vacuum_sample_keys()), and one that grows past it while it is walked
+ * is abandoned at the page that would pass it, keeping the counts it has: a
+ * count of part of the directory is a wrong count, where an old one is only
+ * old.
  *
  * One walk of the directory leaves, left to right from the leftmost, each
  * read under a SHARE lock alone and let go before the next: nothing else is
@@ -1083,11 +1428,8 @@ lion_vacuum_count_budget(Relation index)
  * between it and the right sibling the walk goes to next, and one that split
  * before is read with its new sibling: nothing is counted twice or missed but
  * what writers add or VACUUM deletes meanwhile, which is the precision an
- * estimate needs.  No reserved entry (§14, §17) is a value, nor is a
- * summary (§32), nor an entry with no TID at all; a key whose rows are all
- * dead is, until the VACUUM that empties its entry deletes it - an estimate,
- * as ANALYZE's own is.  The leaves go through the VACUUM's or ANALYZE's
- * buffer ring.
+ * estimate needs (lion_vacuum_count_leaf()).  The leaves go through the
+ * VACUUM's or ANALYZE's buffer ring.
  */
 static void
 lion_vacuum_count_keys(IndexVacuumInfo *info)
@@ -1108,9 +1450,14 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	if (!lion_vac_may_count(index, ix))
 		return;
 	budget = lion_vacuum_count_budget(index);
+	if (budget == 0)
+		return;
 	lion_read_meta(index, &meta);
 	if (meta.dirpages > budget)
+	{
+		lion_vacuum_sample_keys(info, ix, rowcol, &meta, budget);
 		return;
+	}
 
 	nvalues = (uint64 *) palloc0(sizeof(uint64) * ix->ncolumns);
 	sumsq = (uint64 *) palloc0(sizeof(uint64) * ix->ncolumns);
@@ -1123,8 +1470,6 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	{
 		Buffer		buf;
 		Page		page;
-		OffsetNumber maxoff;
-		OffsetNumber off;
 		BlockNumber next;
 
 		if (++nread > budget)
@@ -1144,28 +1489,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 			elog(ERROR, "lion index \"%s\": block %u is not a directory leaf",
 				 RelationGetRelationName(index), blk);
 		}
-
-		maxoff = PageGetMaxOffsetNumber(page);
-		for (off = lion_page_first_data(page); off <= maxoff; off++)
-		{
-			ItemId		iid = PageGetItemId(page, off);
-			LionEntryTuple *entry;
-
-			if (!ItemIdIsUsed(iid))
-				continue;
-			entry = lion_entry_at(page, iid);
-			if (entry->attno < 1 || entry->attno > ix->ncolumns)
-				continue;
-			/* a key with no row at all, whose entry VACUUM has not deleted */
-			if (lion_entry_kind(entry) == LION_KIND_VALUE && lion_entry_ntids(entry) > 0)
-			{
-				nvalues[entry->attno - 1]++;
-				lion_sumsq_add(&sumsq[entry->attno - 1],
-							   lion_entry_ntids(entry));
-			}
-			if (entry->attno == rowcol && !LionEntryIsDerived(entry))
-				rows += lion_entry_ntids(entry);
-		}
+		lion_vacuum_count_leaf(page, ix, rowcol, nvalues, sumsq, &rows);
 
 		next = LionPageIsRightmost(page) ? InvalidBlockNumber :
 			LionPageGetOpaque(page)->rightlink;
