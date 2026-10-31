@@ -860,6 +860,117 @@ lion_dir_leftmost_leaf_ext(Relation index, LionIndexState *ix,
 	}
 }
 
+/*
+ * Every leaf of the directory, left to right: its block number, read off the
+ * downlinks of level 1, and the key column its lower bound is in (the attno
+ * of its downlink's pivot; 0 for the leftmost leaf, whose bound is minus
+ * infinity).  A page's minus-infinity downlink is bounded by the left page's
+ * high key.  The descent to level 1 and the walk right along it read at most
+ * maxpages pages, each counted as lion_dir_count_read() counts it - those it
+ * steps over to pass a deleted page too; it gives up, and returns -1, rather
+ * than read past that.  So does a directory
+ * whose root is a leaf, which has no level 1 to read.  Each page is read
+ * SHARE alone, through strategy, and a page that splits under the walk has
+ * handed only what it was read with to its right: no leaf is listed twice,
+ * and one a writer adds meanwhile may be missed, which is all the precision
+ * a sample needs (lion_vacuum.c, "Counting a sample").
+ */
+int
+lion_dir_leaves(Relation index, LionIndexState *ix,
+				BufferAccessStrategy strategy, BlockNumber maxpages,
+				BlockNumber **blksp, uint16 **startsp)
+{
+	int64		read0 = lion_dir_pages_read;
+	Buffer		buf = lion_dir_get_root(index, ix, strategy);
+	LionRightWalk walk;
+	BlockNumber *blks;
+	uint16	   *starts;
+	uint16		start = 0;
+	int			n = 0;
+	int			cap = 256;
+
+	/* down the first downlinks to level 1 */
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		BlockNumber blk = BufferGetBlockNumber(buf);
+		int			level = LionPageGetOpaque(page)->level;
+		BlockNumber child;
+
+		if (LionPageIsLeaf(page))
+		{
+			UnlockReleaseBuffer(buf);
+			return -1;
+		}
+		if (level == 1)
+			break;
+		if (lion_dir_pages_read - read0 >= (int64) maxpages)
+		{
+			UnlockReleaseBuffer(buf);
+			return -1;
+		}
+		child = lion_dir_downlink_block(index, page, blk, lion_page_first_data(page));
+		UnlockReleaseBuffer(buf);
+
+		CHECK_FOR_INTERRUPTS();
+		buf = lion_dir_readbuf_ext(index, child, strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		lion_dir_check_page(index, BufferGetPage(buf), child);
+		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
+		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE, strategy);
+	}
+
+	blks = (BlockNumber *) palloc(sizeof(BlockNumber) * cap);
+	starts = (uint16 *) palloc(sizeof(uint16) * cap);
+	lion_rightwalk_init(&walk);
+	for (;;)
+	{
+		Page		page = BufferGetPage(buf);
+		BlockNumber blk = BufferGetBlockNumber(buf);
+
+		if (!LionPageIsDeleted(page))
+		{
+			OffsetNumber first = lion_page_first_data(page);
+			OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+			OffsetNumber off;
+
+			for (off = first; off <= maxoff; off++)
+			{
+				if (off != first)
+					start = lion_page_item(page, off)->attno;
+				if (n == cap)
+				{
+					cap *= 2;
+					blks = (BlockNumber *) repalloc(blks, sizeof(BlockNumber) * cap);
+					starts = (uint16 *) repalloc(starts, sizeof(uint16) * cap);
+				}
+				blks[n] = lion_dir_downlink_block(index, page, blk, off);
+				starts[n] = start;
+				n++;
+			}
+			/* the high key bounds the right page's minus-infinity downlink */
+			if (!LionPageIsRightmost(page))
+				start = lion_page_item(page, FirstOffsetNumber)->attno;
+		}
+		if (LionPageIsRightmost(page))
+			break;
+		if (lion_dir_pages_read - read0 >= (int64) maxpages)
+		{
+			UnlockReleaseBuffer(buf);
+			pfree(blks);
+			pfree(starts);
+			return -1;
+		}
+		buf = lion_dir_step_right_ext(index, buf, BUFFER_LOCK_SHARE, &walk,
+									  strategy);
+	}
+	UnlockReleaseBuffer(buf);
+
+	*blksp = blks;
+	*startsp = starts;
+	return n;
+}
+
 /* ---------------------------------------------------------------------
  * Descent
  * --------------------------------------------------------------------- */

@@ -21696,7 +21696,8 @@ and the planner is given it in place of ANALYZE's.
 - **At a VACUUM without ambulkdelete, and at ANALYZE** - a VACUUM that found no dead row (an
   insert-only table's autovacuum), and ANALYZE, which calls the cleanup with `analyze_only` when it
   is not part of a VACUUM (`do_analyze_rel()`, after `update_attstats()` and the pg_class updates):
-  `lion_vacuum_count_keys()` walks the directory, **but only when the directory is small** (below).
+  `lion_vacuum_count_keys()` walks the directory when it is small, and counts a sample of its
+  leaves when it is not (below).
   `VACUUM (ANALYZE)` calls the cleanup once, from VACUUM, and its ANALYZE step does not call it
   again. A VACUUM with `INDEX_CLEANUP off` calls neither and does not count.
 
@@ -21731,29 +21732,62 @@ meant to cost, so:
   count is taken; the count adds a comparison and an increment per entry to a pass that filters its
   posting set, and one meta page record at the end. The first version of this section walked the
   directory again in the cleanup, right after ambulkdelete had walked it: that walk is gone.
-- **ANALYZE, and a VACUUM with nothing to delete, count only a small directory.** The bound is what
+- **ANALYZE, and a VACUUM with nothing to delete, walk only a small directory.** The bound is what
   ANALYZE's own sample of the table reads for the index's columns: 300 rows - from at most as many
   heap blocks - per unit of the largest statistics target among the index's key columns
   (`lion_vacuum_count_budget()`: a table column's target is the table's, an expression's the index
   column's, -1 is `default_statistics_target` as `std_typanalyze()` takes it, 0 is nothing). At the
   default target of 100 that is 30,000 pages, some 230 MB of directory - a column of several
   million keys. The meta page knows the directory's size exactly (`dirpages`, which the build and
-  every split keep, §21), so a directory larger than the bound is not read at all: the cost of
-  deciding is the meta page. A walk that finds the directory has grown past the bound while it
-  walks (a concurrent insert splitting leaves) is abandoned at the page that would pass it.
-- **Nothing is written that was not counted whole.** Past the bound the index keeps the count it
-  has; a count of part of the directory would be wrong where an old one is only old, and the
-  planner stops using an old one once the table has outgrown it (below, "Stale counts").
+  every split keep, §21), so the cost of deciding is the meta page. A walk that finds the directory
+  has grown past the bound while it walks (a concurrent insert splitting leaves) is abandoned at the
+  page that would pass it, and the index keeps the count it has: a count of part of the directory
+  would be wrong where an old one is only old.
+- **A larger directory is counted from a sample**, as ANALYZE estimates a table from a sample of
+  its blocks (below, "Counting a sample"), within the same bound.
 - **Nothing is written that is already there.** `lion_meta_write_ndistinct()` compares the counts
   under the meta page's lock and writes no record - and so, the first time after a checkpoint, no
   image of the meta page - when an ANALYZE of an unchanged table counts what the page holds.
 
-So a large table's count is refreshed by its VACUUMs, which delete dead rows sooner or later on
-any table that is updated or deleted from, and a small table's by every ANALYZE as well. A large
-table that is only ever inserted into is counted at build (or REINDEX) and then not again: its
-VACUUMs have nothing to delete and its directory is past ANALYZE's bound. Its count is used while
-the table stays within a factor of 2 of the rows it was counted over, and after that the planner
-has ANALYZE's estimate again, exactly as without lion.
+So every ANALYZE - autovacuum's too, which a table that is only inserted into gets once a tenth of
+it is new - counts again, whole or from a sample, and so does every VACUUM but one with `INDEX_CLEANUP off`,
+on its own walk when it deletes. Between counts the planner scales a count by the table's growth, uses it while the table
+stays within a factor of 2 of the rows it was counted over, and past that has ANALYZE's estimate
+again, exactly as without lion (below, "Stale counts").
+
+### Counting a sample
+
+`lion_vacuum_sample_keys()`. Every VALUE entry of a directory leaf is one key and carries its TIDs,
+so a leaf's share of a column's keys, of its Σn² and of the rows is read off the leaf alone, and a sample
+of the leaves scales up by the number of leaves. The downlinks of level 1 list every leaf; a walk
+along level 1 reads them (`lion_dir_leaves()`), a few hundredths of the directory, and with each the
+key column its lower bound is in.
+
+- **Strata by column.** Entries are in the order of their key column first (§24), so a column's keys
+  are a run of leaves. A short run - a column of a few keys, which a sample of the leaves would find
+  by luck or not at all - lies on the leaf where the run of leaves whose lower bound is in one column
+  ends; that leaf is read whatever the sample, for every column, and the last leaf with them. The
+  other leaves are sampled in strata, one per column their lower bound is in, each its share of what
+  the bound leaves (one leaf at least), and each sampled leaf stands for its stratum's leaves over
+  its sample. Each column's estimate is unbiased.
+- **The heavy keys are read, not sampled.** A few heavy keys carry most of a skewed column's Σn²,
+  and a sample that found the leaf of one or missed it would swing the sum by that key's square.
+  They are the values ANALYZE has just listed as the column's most common - the cleanup runs after
+  ANALYZE writes its statistics - so, where the statistics are of the key column's own type, the
+  leaf each of the first 100 of them is on is looked up (`lion_key_ntids()`) and read whole too,
+  and only the rest is sampled: the part of the sum the planner uses (below, "The rows of a probed
+  key"). Statistics of another type (an expression ANALYZE keeps as its input's) mark no leaf.
+- **The bound.** Every page the walk along level 1 and the lookups read, and every leaf read whole
+  or sampled, counts against it. Each stratum gets one leaf and its share of what is left, so the
+  strata together never read more than the bound leaves them. A directory whose level 1 alone would
+  take half of the bound, or whose pages that must be read leave less than a leaf a stratum, is not
+  counted and keeps the counts it has.
+
+Each page is read SHARE alone through the VACUUM's or ANALYZE's ring, the leaves left to right. A
+leaf that a downlink named and is no longer a live leaf when it is read - deleted since, or reused -
+counts as empty, and a leaf a writer splits off meanwhile is not in the list: the precision an
+estimate needs. On a 2,000,000-row test column of 206,679 log-uniformly skewed keys, at a bound of
+300 pages over 11,320, three ANALYZEs put the keys at 193,249 to 207,544 and Σn² within 0.2%.
 
 ### The meta page, and the format
 
@@ -21975,7 +22009,10 @@ TIDs. That pass is one of:
 - at build, `lion_build_add_entry()`;
 - in VACUUM's ambulkdelete, `lion_vac_count()`, with the TIDs the entry keeps;
 - in the walk of a small directory at ANALYZE and at a VACUUM that deletes nothing,
-  `lion_vacuum_count_keys()`.
+  `lion_vacuum_count_keys()`;
+- or, past that walk's bound, estimated from a sample of the leaves, `lion_vacuum_sample_keys()`
+  (above, "Counting a sample"), which reads the leaves of the heavy keys whole where the statistics
+  are of the key's type.
 
 It is a `uint64` that saturates at its maximum (`lion_sumsq_add()`), which reads as unknown, as
 zero does. It costs a multiply and an add per entry, in a pass that reads every entry already.
@@ -21987,13 +22024,23 @@ counts, in the same `LION_OP_NDISTINCT` record, under the same lock and the same
 already there is written again. A sum is known where it is above zero and below the saturated
 maximum, over a count of some rows (`LionMetaSumsqKnown()`).
 
-**The figure.** Of a table of N rows, its null fraction and the share f_i of each of ANALYZE's
-most common values, the keys outside the MCV list hold N (1 - nullfrac - Σf_i) rows and
-Σn² - Σ(f_i N)² of the sum, so a key drawn by row from them has
+**The figure.** Of a table of N rows, its null fraction and the rows n_i of each of ANALYZE's
+most common values, the keys outside the MCV list hold N (1 - nullfrac) - Σn_i rows and
+Σn² - Σn_i² of the sum, so a key drawn by row from them has
 
-    (Σn² - Σ (f_i N)²) / (N (1 - nullfrac - Σ f_i))
+    (Σn² - Σ n_i²) / (N (1 - nullfrac) - Σ n_i)
 
-rows on average, and Σn² / (N (1 - nullfrac)) with no MCV list. The figure is never below core's
+rows on average, and Σn² / (N (1 - nullfrac)) with no MCV list. Each n_i is the index's own count
+of the value's rows, one lookup each (`lion_key_ntids()`) for the first 100 values of the list -
+its heaviest - and ANALYZE's share f_i N for any past them. Statistics of another type than the
+index column's are not looked up, and use the shares throughout; so do counts that add up to more
+rows than the table's estimate leaves the column (dead TIDs a VACUUM has yet to take, rows added
+since the estimate), which would leave the rest none. The shares will not do for the heavy
+ones: on a column whose few heaviest keys carry most of Σn², a share off by a few percent moves
+Σ(f_i N)² by more than the rest's whole sum. On a 2,000,000-row test column of log-uniformly skewed
+keys, whose keys outside its 100 heaviest meet 197 rows a probe, five ANALYZEs in a row gave the
+figure from the shares as -311, 194, -700, 248 and 568 - below zero, and so core's 10, as often as
+not - and from the index's counts as 203 to 207. The figure is never below core's
 rows per key nor above N; a unique column has Σn² = N and keeps its one row, and a column whose MCV
 list holds every value has no key outside it and keeps core's rows. Σn² was summed over the rows
 the count was taken over: it is scaled as the count is (`lion_ndistinct_value()`), as the square

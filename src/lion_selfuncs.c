@@ -5738,7 +5738,7 @@ lion_mcv_key_ntids(LionNdistinctCache *cache, Relation index, AttrNumber col,
 		return key->ntids;
 
 	CHECK_FOR_INTERRUPTS();
-	(void) lion_key_ntids(index, col, v->value, &ntids);
+	(void) lion_key_ntids(index, col, v->value, &ntids, NULL);
 
 	/* a collision keeps the key that came first */
 	if (key == NULL)
@@ -6543,16 +6543,24 @@ lion_outer_param_loops(PlannerInfo *root, Node *quals)
  * lion index counts each key column's keys in one pass of its entries at
  * build, in VACUUM's walk and in the ANALYZE of a small directory (§33), and
  * the same pass sums the squares of their rows, Σn² (lion.h,
- * LionMetaNdistinct).  Of N rows, the share f_i of each most common value and
- * the null fraction, the keys outside the MCV list hold N (1 - nullfrac -
- * Σf_i) rows and Σn² - Σ(f_i N)² of the sum, so a row drawn from them belongs
- * to a key of
+ * LionMetaNdistinct).  Of N rows, the rows n_i of each most common value and
+ * the null fraction, the keys outside the MCV list hold N (1 - nullfrac) -
+ * Σn_i rows and Σn² - Σn_i² of the sum, so a row drawn from them belongs to
+ * a key of
  *
- *		(Σn² - Σ (f_i N)²) / (N (1 - nullfrac - Σ f_i))
+ *		(Σn² - Σ n_i²) / (N (1 - nullfrac) - Σ n_i)
  *
  * rows on average, and with no MCV list to a key of Σn² / (N (1 -
  * nullfrac)).  That is the figure, never below core's rows per key nor above
  * N.  A unique column has Σn² = N and stays at its one row.
+ *
+ * Each n_i is the index's own count of the value's rows, looked up
+ * (lion_key_ntids()) for the first LION_SKEW_MCV_LOOKUPS of the list - its
+ * heaviest - and ANALYZE's f_i N for the rest.  On a column whose few
+ * heaviest keys carry most of Σn², ANALYZE's sampled shares are off by more
+ * than what the rest's sum is, and the figure taken from them swings from
+ * one ANALYZE to the next, below zero (and so to core's rows) as often as
+ * not; the counts are the index's, exact as the sum.
  *
  * Σn² was summed over the rows the count was taken over; the table may have
  * grown since.  It is scaled as the count's convention scales the keys
@@ -6590,15 +6598,18 @@ static bool lion_skew_collecting = false;
 static List *lion_skew_collected = NIL;
 static MemoryContext lion_skew_collect_cxt = NULL;
 
+/* The listed values whose rows the figure takes from the index, heaviest first */
+#define LION_SKEW_MCV_LOOKUPS	100
+
 /*
  * The figure for key column col of an index whose meta page holds nd, for a
- * table of tuples rows now, the null fraction, and the MCV list's shares
- * (their sum and the sum of their squares, hasmcv when it has any); keyrows,
- * core's rows per key, when it says nothing more.
+ * table of tuples rows now, the null fraction, and the MCV list's rows (their
+ * sum and the sum of their squares, hasmcv when it has any); keyrows, core's
+ * rows per key, when it says nothing more.
  */
 static double
 lion_skew_rows_of(const LionMetaNdistinct *nd, int col, double tuples,
-				  double nullfrac, bool hasmcv, double mcvsum, double mcvsq,
+				  double nullfrac, bool hasmcv, double mcvrows, double mcvsq,
 				  double keyrows)
 {
 	double		growth = tuples / (double) nd->rows;
@@ -6611,8 +6622,8 @@ lion_skew_rows_of(const LionMetaNdistinct *nd, int col, double tuples,
 	rest = tuples * (1.0 - nullfrac);
 	if (hasmcv)
 	{
-		rest -= tuples * mcvsum;
-		sumsq -= tuples * tuples * mcvsq;
+		rest -= mcvrows;
+		sumsq -= mcvsq;
 	}
 	if (rest < 1.0 || sumsq <= 0.0)
 		return keyrows;
@@ -6627,6 +6638,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 	LionNdistinctCache *cache = lion_nd_cache_for(root);
 	const LionMetaNdistinct *best = NULL;
 	int			bestcol = -1;
+	Oid			bestindex = InvalidOid;
 	double		best_drift = 0;
 	uint64		best_count = 0;
 	double		tuples = rel->tuples;
@@ -6663,6 +6675,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 			{
 				best = nd;
 				bestcol = c;
+				bestindex = idx->indexoid;
 				best_drift = drift;
 				best_count = count;
 			}
@@ -6697,8 +6710,10 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 		bool		isdefault;
 		double		ndist = get_variable_numdistinct(&vardata, &isdefault);
 		double		keysel = 1.0 - nullfrac;
-		double		mcvsum = 0;
+		double		mcvrows = 0;
 		double		mcvsq = 0;
+		double		freqrows = 0;
+		double		freqsq = 0;
 		bool		hasmcv = false;
 		bool		allmcv = false;
 		AttStatsSlot sslot;
@@ -6706,14 +6721,50 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 		if (ndist > 1)
 			keysel /= ndist;
 		if (get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
-							 InvalidOid, ATTSTATSSLOT_NUMBERS))
+							 InvalidOid,
+							 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
 		{
+			Relation	index = index_open(bestindex, NoLock);
+			bool		lookup = (sslot.valuetype ==
+								  TupleDescAttr(RelationGetDescr(index),
+												bestcol)->atttypid);
 			int			i;
 
+			/*
+			 * Each listed value's rows: the index's exact count of the
+			 * heaviest (lion_key_ntids()), ANALYZE's sampled frequency of the
+			 * rest.
+			 */
 			for (i = 0; i < sslot.nnumbers; i++)
 			{
-				mcvsum += sslot.numbers[i];
-				mcvsq += (double) sslot.numbers[i] * sslot.numbers[i];
+				double		freq = sslot.numbers[i] * tuples;
+				double		n = freq;
+				uint64		ntids;
+
+				freqrows += freq;
+				freqsq += freq * freq;
+				if (lookup && i < LION_SKEW_MCV_LOOKUPS && i < sslot.nvalues)
+				{
+					CHECK_FOR_INTERRUPTS();
+					(void) lion_key_ntids(index, (AttrNumber) (bestcol + 1),
+										  sslot.values[i], &ntids, NULL);
+					n = Min((double) ntids, tuples);
+				}
+				mcvrows += n;
+				mcvsq += n * n;
+			}
+			index_close(index, NoLock);
+
+			/*
+			 * Counts the table's estimate has not caught up with - dead TIDs
+			 * a VACUUM has yet to take, rows added since the last ANALYZE -
+			 * may hold more rows than the estimate leaves the column, and
+			 * would leave the rest no rows: the frequencies, then.
+			 */
+			if (mcvrows > tuples * (1.0 - nullfrac))
+			{
+				mcvrows = freqrows;
+				mcvsq = freqsq;
 			}
 			hasmcv = (sslot.nnumbers > 0);
 			allmcv = (hasmcv && ndist <= (double) sslot.nnumbers);
@@ -6732,7 +6783,7 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 			col->rows = col->keyrows;
 		else
 			col->rows = lion_skew_rows_of(best, bestcol, tuples, nullfrac,
-										  hasmcv, mcvsum, mcvsq,
+										  hasmcv, mcvrows, mcvsq,
 										  col->keyrows);
 	}
 	ReleaseVariableStats(vardata);
