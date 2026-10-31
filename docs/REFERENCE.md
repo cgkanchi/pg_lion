@@ -1550,7 +1550,8 @@ answered for an indexed column (DESIGN.md §26), and for a column a unique index
 primary key - as the `count(col)` it equals: `count(*)` where the column is NOT NULL, whether or not
 it has a lion index (a single-column, immediate, non-partial btree index under the `DISTINCT`'s
 collation; on a partitioned table, one on the parent, and then only without a `GROUP BY`). `IN`
-lists of more than 1000 values are left to the ordinary plan, a multi-key index can never drive a
+lists of more than 100,000 literal values are left to the ordinary plan (a parameter's array is
+taken at any length), a multi-key index can never drive a
 `GROUP BY` or a sum-over-all-entries count (its entries are keys, not row values; `USING lion (doc)`
 on `jsonb` is one, and `doc jsonb_ops` the index for `=` and `count(DISTINCT doc)` on whole
 documents), and the cost model inherits the

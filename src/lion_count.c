@@ -2944,8 +2944,8 @@ lion_count_sources_run(Relation heap, Snapshot snapshot, int nsources,
 		/*
 		 * One pass allocates a cursor, a staging buffer for the inline
 		 * payload or a whole page image for a chain, and a buffer for the
-		 * sparse segment it expands: up to ten kilobytes or so, a thousand
-		 * times over for the longest list the planner allows.  A context that
+		 * sparse segment it expands: up to ten kilobytes or so, once for
+		 * every value of the list.  A context that
 		 * is RESET after each pass hands the same memory out again, so the
 		 * pass runs in cache instead of walking a dozen megabytes of fresh
 		 * memory.  The keeper block is sized to hold all of it, which is what
