@@ -21987,13 +21987,57 @@ counts, in the same `LION_OP_NDISTINCT` record, under the same lock and the same
 already there is written again. A sum is known where it is above zero and below the saturated
 maximum, over a count of some rows (`LionMetaSumsqKnown()`).
 
-**Not used by the planner.** Lion priced its probes of a key the plan does not know, and the core
-paths they competed with, at the rows a key drawn by row has (Σn² / N outside ANALYZE's MCV list)
-until 2026-10-29, when that went with §39's rates: the competitor's price corrected is a rate of its
-own, and the rates are gone (§39, "Without the rates"). The sum is still counted and kept, at the
-cost of a multiply and an add an entry, for `lion_debug_key_skew(regclass)`, which returns each key
-column's `rows`, `ndistinct` and `sumsq` from the meta page (`sumsq` NULL where it is unknown) - a C
-function for the tests, superuser only, that the extension's SQL does not create.
+**The figure.** Of a table of N rows, its null fraction and the share f_i of each of ANALYZE's
+most common values, the keys outside the MCV list hold N (1 - nullfrac - Σf_i) rows and
+Σn² - Σ(f_i N)² of the sum, so a key drawn by row from them has
+
+    (Σn² - Σ (f_i N)²) / (N (1 - nullfrac - Σ f_i))
+
+rows on average, and Σn² / (N (1 - nullfrac)) with no MCV list. The figure is never below core's
+rows per key nor above N; a unique column has Σn² = N and keeps its one row, and a column whose MCV
+list holds every value has no key outside it and keeps core's rows. Σn² was summed over the rows
+the count was taken over: it is scaled as the count is (`lion_ndistinct_value()`), as the square
+of the growth for a fixed set of keys (a count of a tenth of the rows or fewer) and as the growth
+otherwise, and past a factor of 2 it is not used (`lion_nd_current()`). The index is the one
+n_distinct's would be ("The hook", above), and the column needs ANALYZE's statistics, whose null
+fraction and MCV list the figure takes (`lion_skew_rows_of()`, `lion_skew_compute()`).
+
+**Where it prices.** A nested loop's inner scan, a path of a base relation parameterized by a join
+clause that equates one of its key columns to the outer row's value. Once every hook has added its
+paths (`set_rel_pathlist_hook`, `lion_skew_reprice_params()`), each such parameterization whose
+figure is at least twice core's rows per key has its rows grown by that factor, up to the
+relation's own rows, and so do its paths' rows. A path whose index answers the clause - an index
+scan with it among its index clauses, a bitmap heap scan with it under its bitmap, a
+LionBtreeScan whose B-tree has it among its index clauses - reads the rows that clause finds, and
+its run cost grows by that clause's factor, up to the rows' own (where the parameterization equates
+two skewed columns, a path whose index answers only one grows by that one's), and a bitmap heap
+scan's startup by what each index scan under its bitmap reads more by the factor of the clauses it
+answers; any other path reads what it read before. Below a factor of 2 the column is near
+enough to uniform that core's figure stands: the two agree exactly where every key has the same
+rows. The join's rows are not touched: they are the outer rows' share of the column's, which core's
+rows per key price right.
+
+A semi or anti join's probe ends at its key's first match, no later at a heavy key, and one with
+no match ends at once where the index answers every join clause. So where the relation is on the
+inner side of a semi or anti join and is probed by the join's outer side, a parameterization whose
+clauses all equate a column to an outer value keeps core's rows, and each of its paths whose index
+answers every one of those clauses and every restriction of the relation keeps core's price for its
+run (answers exactly: a B-tree clause that is not lossy, since other methods can ask for a
+recheck at run time); a path that filters one its index does not answer reads the rows of the keys it does answer to
+find a match, or that there is none, and its run is repriced as above. A bitmap heap scan's bitmap
+is whole before its first row, so its index scans are repriced either way. A parameterization with a clause beyond those, which a probe with no
+match reads every row of its key for, is repriced whole. A probe whose outer
+values do not all come from the join's outer side - from another relation of the inner side, say -
+is an ordinary probe there, and is repriced.
+
+Only parameterized paths are repriced. A correlated subquery's scan and a generic plan's Param
+are restrictions of the relation, not parameterizations, and keep core's rows; so does every
+estimate core makes from the column. `pg_lion.enable_skew_estimate` (on) turns it off.
+`lion_debug_skew_rows(text)` plans a query and returns, for each column whose figure a probe's
+pricing computed, repriced or not, the figure and core's rows per key;
+`lion_debug_key_skew(regclass)` returns each key column's `rows`, `ndistinct` and `sumsq` from the
+meta page (`sumsq` NULL where it is unknown). Both are C functions for the tests, superuser only,
+that the extension's SQL does not create (`test/sql/skew.sql`).
 
 ### Limits
 
@@ -23196,7 +23240,9 @@ key's competitor at the rows such a key meets (§33), and `pg_lion.competitor_pr
 that turned them all off (§49), went together. What is left of the competitor is what it reads
 that lion's path does not, which no constant of lion's model can price: its uncached reads ("A
 nested loop's cold reads", "A bitmap heap scan's cold reads"), within `pg_lion.cold_max_discount`,
-and a Memoize's misses under a LIMIT ("A Memoize under a LIMIT"). Why:
+and a Memoize's misses under a LIMIT ("A Memoize under a LIMIT"). A probe of a skewed key is priced
+at the rows it meets on core's own parameterized paths instead (§33, "Where it prices"), so that
+every plan that probes the key, lion's or core's, is priced at the same rows. Why:
 
 - A private workload ran every statement faster warm with the switch off (rates, skew estimate,
   cold reads and Memoize scale all off). Cold, the switch off lost a statement whose hash join read

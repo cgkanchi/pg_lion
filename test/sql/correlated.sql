@@ -232,6 +232,9 @@ SET pg_lion.enable_plain_scan = off;
 SET enable_bitmapscan = off;
 SET enable_hashjoin = off;
 SET enable_mergejoin = off;
+-- at core's rows a key: the key is skewed, and the rows a probed key meets
+-- (skew.sql) would price the loop the other way round
+SET pg_lion.enable_skew_estimate = off;
 SELECT lsq_plan($$SELECT d.id, count(*) FROM lsq_dim d JOIN lsq_fact f ON f.fk = d.id WHERE d.grp = 7 AND f.doc @@ 'a1 & b3 & c1'::tsquery GROUP BY d.id$$);
 SELECT count(*) AS groups, sum(n) AS counted
   FROM (SELECT d.id, count(*) AS n FROM lsq_dim d JOIN lsq_fact f ON f.fk = d.id
@@ -241,6 +244,7 @@ RESET pg_lion.enable_plain_scan;
 RESET enable_bitmapscan;
 RESET enable_hashjoin;
 RESET enable_mergejoin;
+RESET pg_lion.enable_skew_estimate;
 
 -- ---------- 7. an InitPlan's Param in the Lion Cond ----------
 -- the lion index on the tsvector alone, so that the outer row's key is the
