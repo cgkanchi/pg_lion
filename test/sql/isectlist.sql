@@ -138,9 +138,16 @@ RESET pg_lion.enable_index_mcv;
 SELECT lim_count(q) FROM lim_q;
 -- the same rows, by a filter no index answers
 SELECT count(*) FROM lim WHERE k % 17 = 0 AND k BETWEEN 17 AND 85000;
+-- a value listed 2,000 times is one set, and counted once
+CREATE TABLE lim_q2 AS
+  SELECT format('SELECT count(*) FROM lim WHERE k IN (%s)',
+				string_agg(CASE WHEN i % 2 = 0 THEN '17'
+							ELSE (10000 + i)::text END, ', ')) AS q
+	FROM generate_series(1, 4000) i;
+SELECT lim_top(q), lim_count(q) FROM lim_q2;
 
 DROP TABLE lil, lil_q;
-DROP TABLE lim, lim_q;
+DROP TABLE lim, lim_q, lim_q2;
 DROP FUNCTION lim_top(text);
 DROP FUNCTION lim_count(text);
 DROP FUNCTION lil_rows(text, boolean);

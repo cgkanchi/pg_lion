@@ -6187,6 +6187,33 @@ typedef struct LionListSel
 	Selectivity sel;
 } LionListSel;
 
+/* How lion_list_sample_sel() sorts a list's values: by their bytes */
+typedef struct LionBytesSort
+{
+	int16		typlen;
+	bool		typbyval;
+} LionBytesSort;
+
+static int
+lion_bytes_cmp(const void *a, const void *b, void *arg)
+{
+	const LionBytesSort *t = (const LionBytesSort *) arg;
+	Datum		x = *(const Datum *) a;
+	Datum		y = *(const Datum *) b;
+	Size		xl;
+	Size		yl;
+	int			r;
+
+	if (t->typbyval)
+		return (x < y) ? -1 : (x > y) ? 1 : 0;
+	xl = datumGetSize(x, false, t->typlen);
+	yl = datumGetSize(y, false, t->typlen);
+	r = memcmp(DatumGetPointer(x), DatumGetPointer(y), Min(xl, yl));
+	if (r != 0)
+		return r;
+	return (xl < yl) ? -1 : (xl > yl) ? 1 : 0;
+}
+
 /*
  * Lion's own estimate of `col = ANY (array)` for a literal list longer than
  * the values whose frequencies lion serves core (LION_MCV_MAX_KEYS, DESIGN.md
@@ -6284,6 +6311,28 @@ lion_list_sample_sel(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	{
 		if (!nulls[i])
 			elems[nvalues++] = elems[i];
+	}
+
+	/*
+	 * A value listed twice is one set to the executor, which looks each up
+	 * once (lion_posting_set_lookup_many()): the list's values are counted
+	 * once each.  Equal by their bytes, which every value equal by the key's
+	 * equality is here but for a type of several spellings of one value
+	 * (numeric's 1.0 and 1.00), counted as many times as it is spelled.
+	 */
+	{
+		LionBytesSort sort;
+		int			u = 0;
+
+		sort.typlen = typlen;
+		sort.typbyval = typbyval;
+		qsort_arg(elems, nvalues, sizeof(Datum), lion_bytes_cmp, &sort);
+		for (i = 0; i < nvalues; i++)
+		{
+			if (u == 0 || lion_bytes_cmp(&elems[u - 1], &elems[i], &sort) != 0)
+				elems[u++] = elems[i];
+		}
+		nvalues = u;
 	}
 	k = Min(nvalues, LION_LIST_SAMPLE_KEYS);
 	index = index_open(idx->indexoid, NoLock);
