@@ -866,7 +866,9 @@ lion_dir_leftmost_leaf_ext(Relation index, LionIndexState *ix,
  * of its downlink's pivot; 0 for the leftmost leaf, whose bound is minus
  * infinity).  A page's minus-infinity downlink is bounded by the left page's
  * high key.  The descent to level 1 and the walk right along it read at most
- * maxpages pages; past that it gives up, and returns -1.  So does a directory
+ * maxpages pages, each counted as lion_dir_count_read() counts it - those it
+ * steps over to pass a deleted page too; it gives up, and returns -1, rather
+ * than read past that.  So does a directory
  * whose root is a leaf, which has no level 1 to read.  Each page is read
  * SHARE alone, through strategy, and a page that splits under the walk has
  * handed only what it was read with to its right: no leaf is listed twice,
@@ -878,9 +880,9 @@ lion_dir_leaves(Relation index, LionIndexState *ix,
 				BufferAccessStrategy strategy, BlockNumber maxpages,
 				BlockNumber **blksp, uint16 **startsp)
 {
+	int64		read0 = lion_dir_pages_read;
 	Buffer		buf = lion_dir_get_root(index, ix, strategy);
 	LionRightWalk walk;
-	BlockNumber nread = 1;
 	BlockNumber *blks;
 	uint16	   *starts;
 	uint16		start = 0;
@@ -895,13 +897,18 @@ lion_dir_leaves(Relation index, LionIndexState *ix,
 		int			level = LionPageGetOpaque(page)->level;
 		BlockNumber child;
 
-		if (LionPageIsLeaf(page) || nread > maxpages)
+		if (LionPageIsLeaf(page))
 		{
 			UnlockReleaseBuffer(buf);
 			return -1;
 		}
 		if (level == 1)
 			break;
+		if (lion_dir_pages_read - read0 >= (int64) maxpages)
+		{
+			UnlockReleaseBuffer(buf);
+			return -1;
+		}
 		child = lion_dir_downlink_block(index, page, blk, lion_page_first_data(page));
 		UnlockReleaseBuffer(buf);
 
@@ -911,7 +918,6 @@ lion_dir_leaves(Relation index, LionIndexState *ix,
 		lion_dir_check_page(index, BufferGetPage(buf), child);
 		lion_dir_check_level(index, BufferGetPage(buf), child, level - 1);
 		buf = lion_dir_past_deleted(index, buf, BUFFER_LOCK_SHARE, strategy);
-		nread++;
 	}
 
 	blks = (BlockNumber *) palloc(sizeof(BlockNumber) * cap);
@@ -948,7 +954,7 @@ lion_dir_leaves(Relation index, LionIndexState *ix,
 		}
 		if (LionPageIsRightmost(page))
 			break;
-		if (++nread > maxpages)
+		if (lion_dir_pages_read - read0 >= (int64) maxpages)
 		{
 			UnlockReleaseBuffer(buf);
 			pfree(blks);
