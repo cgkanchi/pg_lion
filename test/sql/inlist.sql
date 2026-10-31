@@ -211,14 +211,26 @@ SELECT lion_incmp('SELECT count(*) FROM lion_in WHERE b IN (1, 2)');
 SELECT lion_incmp('SELECT b, count(*) FROM lion_in WHERE b IN (1, 2) GROUP BY b');
 SELECT lion_incmp($$SELECT count(*) FROM lion_in WHERE b IN (1, 2) AND c IN ('c1', 'c3')$$);
 
--- ---- a list longer than the pushdown accepts ---------------------------
+-- ---- long literal lists -----------------------------------------------
 /*
- * Above LION_MAX_ARRAY_ELEMS (1000) values the pushdown declines - every
- * listed value would need a posting set of its own, each holding a pin - but
- * the bitmap scan still answers the query, and both must agree with the heap.
+ * A literal list of up to LION_MAX_LIST_ELEMS (100,000) values is pushed down
+ * (DESIGN.md §15, "Long lists"): one longer than a batch is located a batch at
+ * a time, as a parameter's array always was.  1,200 values was past the old
+ * cap of 1,000.  Past 100,000 the pushdown declines and the bitmap scan
+ * answers.  Both must agree with the heap.
  */
 SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 1200, 100000)));
 SELECT count(*) FROM lion_in WHERE a < 1201;
+SELECT lion_incmp(format('SELECT a, count(*) FROM lion_in WHERE a = ANY (''%s''::int[]) GROUP BY a', lion_inlist(0, 1200, 100000)));
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[]) AND b = 3', lion_inlist(0, 1200, 100000)));
+-- ... in batches: at 64kB of work_mem a batch is 1,000 values
+SET work_mem = '64kB';
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 2500, 1700)));
+SELECT lion_incmp(format('SELECT a, count(*) FROM lion_in WHERE a = ANY (''%s''::int[]) GROUP BY a', lion_inlist(0, 2500, 1700)));
+RESET work_mem;
+-- the longest list pushed down, 100,000 values, and one more declined
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 99999, 1000000)));
+SELECT lion_incmp(format('SELECT count(*) FROM lion_in WHERE a = ANY (''%s''::int[])', lion_inlist(0, 100000, 1000000)));
 
 /*
  * The union itself: lion_index_count_any() (DESIGN.md section 15).

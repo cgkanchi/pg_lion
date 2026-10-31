@@ -263,6 +263,7 @@ typedef struct LionProbeCache
 								 * (lion_isect_run_budget()) */
 	List	   *rowsfixed;		/* RelOptInfos whose rows the probe corrected */
 	List	   *posshapes;		/* lion_tsquery_pos_shape()'s findings */
+	List	   *listsels;		/* LionListSel: lion_list_sample_sel()'s */
 } LionProbeCache;
 
 static LionRunCache *lion_probe_caches = NULL;
@@ -2424,10 +2425,18 @@ bool		lion_enable_rows_correction = true;
  * The posting sets a probe seeks at each container it samples at most: a
  * list's values, a query's keys.  A conjunction of more is measured without
  * its widest clauses (lion_isect_measured_part()), each taken as independent
- * of the rest, as core takes it; a list of more values is never located for
- * the probe (lion_isect_scankey()), and is taken so too.
+ * of the rest, as core takes it; a list of more values is sought as a sample
+ * of LION_ISECT_LIST_SAMPLE of them (lion_isect_list_sample()).
  */
 #define LION_ISECT_MAX_SETS		32
+
+/*
+ * The values of a longer list the probe seeks in its place: an evenly spaced
+ * sample of them, whose AND with the other clauses stands for the list's in
+ * proportion to their rows (lion_isect_list_sample()).  Half the sets a probe
+ * seeks, so that the other clauses of the AND still fit beside it.
+ */
+#define LION_ISECT_LIST_SAMPLE	(LION_ISECT_MAX_SETS / 2)
 
 /*
  * The sampled containers that must keep a row of the AND for the probe to
@@ -2506,6 +2515,12 @@ typedef struct LionIsectClause
 	Node	   *clause;			/* as the caller has it */
 	ScanKeyData skey;			/* ... as the scan's key */
 	Selectivity sel;			/* core's selectivity of it */
+	double		scale;			/* the rows of the clause over those of its
+								 * scan key: 1, or for a list sampled
+								 * (lion_isect_list_sample()) core's estimate
+								 * of the list over its estimate of the
+								 * sample */
+	bool		sampled;		/* a list sought as a sample of its values */
 } LionIsectClause;
 
 /*
@@ -2573,17 +2588,64 @@ lion_isect_strip(Node *node)
 }
 
 /*
+ * LION_ISECT_LIST_SAMPLE of the values of a literal list of more than
+ * LION_ISECT_MAX_SETS, evenly spaced over the list as written, as an array
+ * of the list's type: the values the probe seeks in the list's place
+ * (DESIGN.md §29.11, "Long lists").  NULL elements are no row's and are not
+ * taken.  Spaced over the list rather than its first values, so that a list
+ * written in an order its rows follow - by size, by when they were added -
+ * is sampled across that order.
+ */
+static Const *
+lion_isect_list_sample(Const *arr)
+{
+	ArrayType  *a = DatumGetArrayTypeP(arr->constvalue);
+	Oid			elemtype = ARR_ELEMTYPE(a);
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	Datum	   *elems;
+	bool	   *nulls;
+	Datum	   *pick;
+	int			n;
+	int			nvalues = 0;
+	int			k;
+	int			i;
+
+	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+	deconstruct_array(a, elemtype, typlen, typbyval, typalign,
+					  &elems, &nulls, &n);
+	for (i = 0; i < n; i++)
+	{
+		if (!nulls[i])
+			elems[nvalues++] = elems[i];
+	}
+	k = Min(nvalues, LION_ISECT_LIST_SAMPLE);
+	pick = (Datum *) palloc(sizeof(Datum) * Max(k, 1));
+	for (i = 0; i < k; i++)
+		pick[i] = elems[(int) (((int64) i * nvalues + nvalues / 2) / k)];
+	return makeConst(arr->consttype, arr->consttypmod, arr->constcollid, -1,
+					 PointerGetDatum(construct_array(pick, k, elemtype, typlen,
+													 typbyval, typalign)),
+					 false, false);
+}
+
+/*
  * Is `clause` a set clause of index key column col0 (0-based) with a value to
  * look up now - an equality or a multi-key query with a constant, an IN list
- * of at most LION_ISECT_MAX_SETS constants, `IS NULL` - and what is it as the
- * scan's key?  The indexed expression may stand on either side of an
- * operator, as core matches it (match_index_to_operand()).  The clause is
+ * of constants, `IS NULL` - and what is it as the scan's key?  A list of more
+ * than LION_ISECT_MAX_SETS values is sought as a sample of them
+ * (lion_isect_list_sample()), which *sample, when it is not NULL, is set to;
+ * it is set to NULL for every other clause.  The indexed expression may
+ * stand on either side of an operator, as core matches it
+ * (match_index_to_operand()).  The clause is
  * taken in its canonical form (lion_canonical_clause()): an OR of equalities
  * on the column is the IN list it spells, and `NOT col` of a boolean column
  * is `col = false`, as an index scan is handed them.
  */
 static bool
-lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
+lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey,
+				   Const **sample)
 {
 	Oid			opfamily = idx->opfamily[col0];
 	bool		multikey = OidIsValid(get_opfamily_proc(opfamily,
@@ -2598,6 +2660,8 @@ lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
 	Oid			lefttype;
 	Oid			righttype;
 
+	if (sample != NULL)
+		*sample = NULL;
 	clause = lion_canonical_clause(clause);
 	if (clause == NULL)
 		return false;
@@ -2625,11 +2689,17 @@ lion_isect_scankey(IndexOptInfo *idx, int col0, Node *clause, ScanKey skey)
 		if (value == NULL || !IsA(value, Const))
 			return false;
 		arr = (Const *) value;
-		if (arr->constisnull ||
-			ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(arr->constvalue)),
+		if (arr->constisnull)
+			return false;
+		if (ArrayGetNItems(ARR_NDIM(DatumGetArrayTypeP(arr->constvalue)),
 						   ARR_DIMS(DatumGetArrayTypeP(arr->constvalue))) >
 			LION_ISECT_MAX_SETS)
-			return false;
+		{
+			arr = lion_isect_list_sample(arr);
+			value = (Node *) arr;
+			if (sample != NULL)
+				*sample = arr;
+		}
 		opno = saop->opno;
 		collid = saop->inputcollid;
 		flags = SK_SEARCHARRAY;
@@ -3409,6 +3479,17 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 		}
 		found = lion_scankey_sets(index, &cl[i].skey, &nlocated, &located,
 								  &tree, &nomatch);
+
+		/*
+		 * A sample of a list none of whose values has an entry says nothing
+		 * of the list's other values: the AND is measured without it.
+		 */
+		if (found && nomatch && cl[i].sampled)
+		{
+			for (j = 0; j < nlocated; j++)
+				lion_posting_set_release(&located[j]);
+			continue;
+		}
 		if (!found || totalsets + nlocated > LION_ISECT_MAX_SETS)
 		{
 			/* not measured: its sets let go of here, the AND without it */
@@ -3542,17 +3623,28 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 	{
 		double		rows = 0;
 		double		drows = (s.walkedrows > 0) ? s.walkedrows :
-			exact[driver] ? ntids[driver] : cl[src[driver]].sel * tuples;
+			exact[driver] ? ntids[driver] :
+			cl[src[driver]].sel / cl[src[driver]].scale * tuples;
+		double		wscale = 1.0;	/* the AND's rows over its sample's */
 		bool		counted = empty || ranked == LION_ISECT_EVERY ||
 			(ranked == LION_ISECT_UNRANKED && stride <= 1.0);
 
+		/*
+		 * What the sample of a list found stands for the list's rows in
+		 * proportion (DESIGN.md §29.11, "Long lists"): the AND's share, and
+		 * the bounds on it, are scaled by each sampled clause's ratio.  The
+		 * bounds are then an estimate's, not the sample's guarantee.
+		 */
+		for (i = 0; i < m; i++)
+			wscale *= cl[src[i]].scale;
 		if (!empty && s.drvrows > 0)
 			rows = s.androws / s.drvrows * drows;
-		res->sel = Min(rows / tuples, 1.0);
+		res->sel = Min(rows * wscale / tuples, 1.0);
 		res->ub = counted ? res->sel :
-			Min(lion_isect_upper(s.andunits, s.units) * s.scale * drows / tuples,
-				1.0);
-		res->lb = counted ? res->sel : Min(s.andunits / tuples, res->sel);
+			Min(lion_isect_upper(s.andunits, s.units) * s.scale * drows *
+				wscale / tuples, 1.0);
+		res->lb = counted ? res->sel :
+			Min(s.andunits * wscale / tuples, res->sel);
 		res->hits = counted ? INT_MAX : s.hits;
 		res->androws = s.andunits;
 
@@ -3561,13 +3653,18 @@ lion_isect_measure(RelOptInfo *rel, IndexOptInfo *idx, int n,
 		{
 			if (s.prefhits[j] >= LION_ISECT_MIN_HITS)
 			{
+				double		pscale = 1.0;
+
 				res->partn = j + 1;
 				res->part = (int *) MemoryContextAlloc(oldcxt,
 													   sizeof(int) * (j + 1));
 				for (i = 0; i <= j; i++)
+				{
 					res->part[i] = src[s.order[i]];
-				res->partsel = Min(s.prefrows[j] / s.drvrows * drows / tuples,
-								   1.0);
+					pscale *= cl[res->part[i]].scale;
+				}
+				res->partsel = Min(s.prefrows[j] / s.drvrows * drows *
+								   pscale / tuples, 1.0);
 				res->partrows = s.prefcount[j];
 				break;
 			}
@@ -3823,7 +3920,7 @@ lion_isect_rel_clauses(RelOptInfo *rel, IndexOptInfo *idx, AttrNumber **cols,
 			continue;
 		for (c = 0; c < idx->nkeycolumns; c++)
 		{
-			if (lion_isect_scankey(idx, c, (Node *) rinfo, &skey))
+			if (lion_isect_scankey(idx, c, (Node *) rinfo, &skey, NULL))
 			{
 				(*cols)[n] = (AttrNumber) (c + 1);
 				(*clauses)[n++] = (Node *) rinfo;
@@ -4274,15 +4371,18 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	{
 		Node	   *canon;
 		Node	   *list;
+		Const	   *sample;
 		bool		dup = false;
 		int			j;
 
 		if (cols[i] < 1 || cols[i] > idx->nkeycolumns ||
-			!lion_isect_scankey(idx, cols[i] - 1, clauses[i], &cl[ncl].skey))
+			!lion_isect_scankey(idx, cols[i] - 1, clauses[i], &cl[ncl].skey,
+								&sample))
 			continue;
 		canon = lion_canonical_clause(clauses[i]);
 		if ((list = lion_or_arm_list(rel, canon)) != NULL &&
-			lion_isect_scankey(idx, cols[i] - 1, list, &cl[ncl].skey))
+			lion_isect_scankey(idx, cols[i] - 1, list, &cl[ncl].skey,
+							   &sample))
 		{
 			for (j = 0; j < ncl && !dup; j++)
 				dup = (cl[j].col == cols[i] &&
@@ -4296,6 +4396,33 @@ lion_isect_factor_run(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 		cl[ncl].clause = (canon == lion_isect_bare(clauses[i])) ?
 			clauses[i] : canon;
 		cl[ncl].sel = lion_rel_clause_selectivity(root, rel, cl[ncl].clause);
+		cl[ncl].scale = 1.0;
+		cl[ncl].sampled = (sample != NULL);
+
+		/*
+		 * A list sought as a sample of its values (DESIGN.md §29.11, "Long
+		 * lists"): what the probe finds of the AND with the sample stands for
+		 * the AND with the list in proportion to their rows, by core's
+		 * estimates of the two - which are the values' own rows where lion
+		 * serves their frequencies (lion_mcv_clause()), a list of at most
+		 * LION_MCV_MAX_KEYS values.  A sample core gives no rows is no
+		 * measure of the list, and the clause is left to core's estimate.
+		 */
+		if (sample != NULL)
+		{
+			Node	   *whole = lion_canonical_clause(cl[ncl].clause);
+			ScalarArrayOpExpr *sub;
+			Selectivity subsel;
+
+			if (whole == NULL || !IsA(whole, ScalarArrayOpExpr))
+				continue;
+			sub = (ScalarArrayOpExpr *) copyObject(whole);
+			sub->args = list_make2(linitial(sub->args), sample);
+			subsel = lion_rel_clause_selectivity(root, rel, (Node *) sub);
+			if (subsel <= 0.0 || cl[ncl].sel <= 0.0)
+				continue;
+			cl[ncl].scale = Max(cl[ncl].sel / subsel, 1.0);
+		}
 		minsel = Min(minsel, cl[ncl].sel);
 		group = lappend(group, cl[ncl].clause);
 		ncl++;
@@ -5303,11 +5430,11 @@ lion_nd_core_lookup(PlannerInfo *root, Node *node, int varRelid,
 
 /*
  * The most values of one column of one relation whose frequencies are looked
- * up: as many as the longest IN list the count pushdown takes as a literal
- * (LION_MAX_ARRAY_ELEMS, DESIGN.md §15), past which lion_analyze_leaf()
- * declines a list.  Each is a descent of the directory, once per planner run,
- * and each joins the most common values that core's estimate of an IN list
- * walks once per value listed (var_eq_const()): so the bound is on both.
+ * up: LION_MAX_ARRAY_ELEMS, a thousand; a longer list has its column
+ * estimated as without the frequencies.  Each is a descent of the directory,
+ * once per planner run, and each joins the most common values that core's
+ * estimate of an IN list walks once per value listed (var_eq_const()): so
+ * the bound is on both.
  */
 #define LION_MCV_MAX_KEYS	LION_MAX_ARRAY_ELEMS
 
@@ -6043,6 +6170,196 @@ lion_mcv_stats(PlannerInfo *root, LionNdistinctCache *cache, RelOptInfo *rel,
 	MemoryContextSwitchTo(oldcxt);
 	MemoryContextDelete(cxt);
 	return result;
+}
+
+/*
+ * The values of a long list whose rows are counted for lion's own estimate of
+ * it (lion_list_sample_sel()): as many as lion serves the frequencies of.
+ */
+#define LION_LIST_SAMPLE_KEYS	LION_MCV_MAX_KEYS
+
+/* A list of this planner run whose rows were sampled, and what they came to */
+typedef struct LionListSel
+{
+	Oid			indexoid;
+	AttrNumber	col;
+	Const	   *arr;			/* the list, a copy in the run's memory */
+	Selectivity sel;
+} LionListSel;
+
+/* How lion_list_sample_sel() sorts a list's values: by their bytes */
+typedef struct LionBytesSort
+{
+	int16		typlen;
+	bool		typbyval;
+} LionBytesSort;
+
+static int
+lion_bytes_cmp(const void *a, const void *b, void *arg)
+{
+	const LionBytesSort *t = (const LionBytesSort *) arg;
+	Datum		x = *(const Datum *) a;
+	Datum		y = *(const Datum *) b;
+	Size		xl;
+	Size		yl;
+	int			r;
+
+	if (t->typbyval)
+		return (x < y) ? -1 : (x > y) ? 1 : 0;
+	xl = datumGetSize(x, false, t->typlen);
+	yl = datumGetSize(y, false, t->typlen);
+	r = memcmp(DatumGetPointer(x), DatumGetPointer(y), Min(xl, yl));
+	if (r != 0)
+		return r;
+	return (xl < yl) ? -1 : (xl > yl) ? 1 : 0;
+}
+
+/*
+ * Lion's own estimate of `col = ANY (array)` for a literal list longer than
+ * the values whose frequencies lion serves core (LION_MCV_MAX_KEYS, DESIGN.md
+ * §33): core's estimate of such a list takes every value for an average one
+ * of the column, so a list of mostly absent values - ids from elsewhere, few
+ * of them in this table - is estimated at many times its rows, and lion's
+ * count of it is priced for them (DESIGN.md §15, "Long lists").  The rows of
+ * LION_LIST_SAMPLE_KEYS values, evenly spaced over the list, are counted from
+ * the index (lion_key_ntids(), one descent each) and scaled to the list's
+ * values: that is the estimate.  For index key column col (1-based) of idx;
+ * false where it is not made, which is wherever lion would not serve the
+ * values' frequencies either (lion_mcv_stats()): not a list of constants of
+ * the key's type compared by its equality, a multi-key column, a user who may
+ * not read every row of the column, or pg_lion.enable_index_mcv off.  Each
+ * list is counted once a planner run.
+ */
+bool
+lion_list_sample_sel(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
+					 AttrNumber col, Node *clause, Selectivity *sel)
+{
+	ScalarArrayOpExpr *saop;
+	LionProbeCache *cache;
+	LionIsectClause cl;
+	LionListSel *ls;
+	Const	   *arr;
+	ArrayType  *a;
+	Relation	index;
+	MemoryContext oldcxt;
+	Datum	   *elems;
+	bool	   *nulls;
+	Oid			elemtype;
+	Oid			keytype;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	double		rows = 0.0;
+	int			n;
+	int			nvalues = 0;
+	int			k;
+	int			i;
+	ListCell   *lc;
+
+	if (IsA(clause, RestrictInfo))
+		clause = (Node *) ((RestrictInfo *) clause)->clause;
+	if (!lion_enable_index_mcv || clause == NULL ||
+		!IsA(clause, ScalarArrayOpExpr) || rel->tuples < 1.0 ||
+		col < 1 || col > idx->nkeycolumns || idx->hypothetical ||
+		idx->indpred != NIL || idx->relam != lion_get_am_oid() ||
+		lion_old_snapshot_threshold_active())
+		return false;
+	saop = (ScalarArrayOpExpr *) clause;
+	if (!saop->useOr || list_length(saop->args) != 2 ||
+		!match_index_to_operand((Node *) linitial(saop->args), col - 1, idx))
+		return false;
+	arr = (Const *) lion_isect_strip((Node *) lsecond(saop->args));
+	if (arr == NULL || !IsA(arr, Const) || arr->constisnull)
+		return false;
+	a = DatumGetArrayTypeP(arr->constvalue);
+	if (ARR_NDIM(a) != 1 ||
+		ArrayGetNItems(ARR_NDIM(a), ARR_DIMS(a)) <= LION_MCV_MAX_KEYS)
+		return false;
+	if (lion_opfamily_is_multikey(idx->opfamily[col - 1],
+								  idx->opcintype[col - 1]) ||
+		saop->opno != lion_index_equality_op(idx, col) ||
+		!lion_nd_same_equality(idx, col - 1,
+							   exprType((Node *) linitial(saop->args)),
+							   saop->inputcollid))
+		return false;
+	elemtype = ARR_ELEMTYPE(a);
+	keytype = IsPolymorphicType(idx->opcintype[col - 1]) ?
+		elemtype : idx->opcintype[col - 1];
+	if (!lion_mcv_same_bytes(elemtype, keytype))
+		return false;
+	memset(&cl, 0, sizeof(cl));
+	cl.col = col;
+	if (!lion_isect_readable(root, rel, idx, 1, &cl))
+		return false;
+
+	cache = lion_probe_cache_for(root);
+	foreach(lc, cache->listsels)
+	{
+		ls = (LionListSel *) lfirst(lc);
+		if (ls->indexoid == idx->indexoid && ls->col == col &&
+			equal(ls->arr, arr))
+		{
+			*sel = ls->sel;
+			return true;
+		}
+	}
+
+	get_typlenbyvalalign(elemtype, &typlen, &typbyval, &typalign);
+	deconstruct_array(a, elemtype, typlen, typbyval, typalign,
+					  &elems, &nulls, &n);
+	for (i = 0; i < n; i++)
+	{
+		if (!nulls[i])
+			elems[nvalues++] = elems[i];
+	}
+
+	/*
+	 * A value listed twice is one set to the executor, which looks each up
+	 * once (lion_posting_set_lookup_many()): the list's values are counted
+	 * once each.  Equal by their bytes, which every value equal by the key's
+	 * equality is here but for a type of several spellings of one value
+	 * (numeric's 1.0 and 1.00), counted as many times as it is spelled.
+	 */
+	{
+		LionBytesSort sort;
+		int			u = 0;
+
+		sort.typlen = typlen;
+		sort.typbyval = typbyval;
+		qsort_arg(elems, nvalues, sizeof(Datum), lion_bytes_cmp, &sort);
+		for (i = 0; i < nvalues; i++)
+		{
+			if (u == 0 || lion_bytes_cmp(&elems[u - 1], &elems[i], &sort) != 0)
+				elems[u++] = elems[i];
+		}
+		nvalues = u;
+	}
+	k = Min(nvalues, LION_LIST_SAMPLE_KEYS);
+	index = index_open(idx->indexoid, NoLock);
+	for (i = 0; i < k; i++)
+	{
+		uint64		ntids = 0;
+
+		CHECK_FOR_INTERRUPTS();
+		(void) lion_key_ntids(index, col,
+							  elems[(int) (((int64) i * nvalues + nvalues / 2) / k)],
+							  &ntids, NULL);
+		rows += (double) ntids;
+	}
+	index_close(index, NoLock);
+	pfree(elems);
+	pfree(nulls);
+
+	*sel = (k > 0) ? Min(rows / k * nvalues / rel->tuples, 1.0) : 0.0;
+	oldcxt = MemoryContextSwitchTo(cache->run.cxt);
+	ls = (LionListSel *) palloc(sizeof(LionListSel));
+	ls->indexoid = idx->indexoid;
+	ls->col = col;
+	ls->arr = (Const *) copyObject(arr);
+	ls->sel = *sel;
+	cache->listsels = lappend(cache->listsels, ls);
+	MemoryContextSwitchTo(oldcxt);
+	return true;
 }
 
 /*
