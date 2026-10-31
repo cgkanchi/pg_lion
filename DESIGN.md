@@ -4790,12 +4790,30 @@ off (the list's text and core's planning of it are most of both; the pushdown's 
 50 MB, some 400 bytes a value, whether or not it is chosen). The cost model chooses: a 10,000-value
 list on a 5,000-key column without a B-tree counted in 3.5 ms against a sequential scan's 60, and
 `GROUP BY k` over a 30,000-value list in 7.3 ms against 68; with a B-tree on the column the
-index-only scan is chosen from about 3,000 values, which is the faster plan there. Past about
-12,000 values of which most have no entry the list is overpriced - its rows are core's estimate,
-one equal share of the column per listed value - and the ordinary plan is chosen where the count
-would have been faster; that is the estimate's, not the cap's. `LION_MAX_ARRAY_ELEMS` = 1000 stays
-the bound where sets really are held at once: an OR's leaves (§19), a rewritten `NOT IN` (§10)
-and the frequencies the planner looks up (§33).
+index-only scan is chosen from about 3,000 values, which is the faster plan there.
+`LION_MAX_ARRAY_ELEMS` = 1000 stays the bound where sets really are held at once: an OR's leaves
+(§19), a rewritten `NOT IN` (§10) and the frequencies the planner looks up (§33).
+
+A list longer than those thousand frequencies is estimated by core as one equal share of the
+column's rows per listed value, which for ids from elsewhere, few of them in this table, is many
+times its rows; the count's sets were priced for them (`lion_cost_set_clause()`), and from about
+12,000 such values on that 1M-row table the sequential scan was chosen where the count was ten
+times faster. The count's price now takes the list's rows from the index instead
+(`lion_list_sample_sel()`): `LION_LIST_SAMPLE_KEYS` (1,000) values evenly spaced over the list,
+each counted by a descent of the directory as §33 counts a listed value (`lion_key_ntids()`), and
+their rows scaled to the list's length. It is made where §33 would serve the values' frequencies -
+`pg_lion.enable_index_mcv` on, a literal list of the key's type compared by its equality, not a
+multi-key column, an index neither partial nor hypothetical, a user who may read every row of the
+column - and once a list a planner run (`LionProbeCache.listsels`). Core's estimate of the
+relation's rows is left as it is: this prices lion's sets, which is what chose against the count.
+Listed values repeated are counted as often as listed, as core counts them. Measured as above
+(lists of every 17th integer over a 5,000-key column, 294 of the values in it): 30,000 values
+counted in 7.7 ms against the sequential scan's 53 and 70,000 in 16.5 ms against 59, both now
+chosen; at 100,000 the sequential scan still is, where the count takes 22 ms. What is left is the
+price of each value's search (`LION_DESCENT_COST` a value), the same for a value without an entry,
+and a list's values walked in order find their leaves cheaper than that; it is a constant every
+list's lookups share, and is left as it is. `test/sql/isectlist.sql` pins a 5,000-value list of
+294 present values counted, and the sequential scan chosen without the sample.
 
 ### The disjoint-sum short-circuit
 
@@ -18225,8 +18243,8 @@ with one:
   of the rest, as core takes them. The factor the probe finds for the part - its measure over
   core's estimate of the part - is the conjunction's, and the part is remembered as measured as
   well, which is what a wider conjunction of the run interpolates from (`lion_isect_part_factor()`).
-  A list of more than 32 values is never located for the probe (`lion_isect_scankey()`) and is taken
-  so too. Only a conjunction of which not two clauses fit is not measured: what the run measured of
+  A list of more than 32 values is measured by a sample of its values ("Long lists", below). Only a
+  conjunction of which not two clauses fit is not measured: what the run measured of
   its parts stands, or core's estimate.
 - **What a sample that met the AND in few containers says** (`lion_isect_take()`,
   `lion_isect_probe()`). The AND is made source by source at each sampled container, the driver
@@ -18275,6 +18293,32 @@ measured without the widest list, the 21 by the prefix the sample met often; the
 31 sets, and of the twelve conjunctions in one statement, within the run's budget; and, with three
 lion indexes of the same columns, three conjunctions of 32 sets in one statement each estimated at
 its relation's rows by the Bitmap Index Scan of whichever index the plan takes.
+
+**Long lists** (2026-10-31, `lion_isect_list_sample()`, `lion_isect_factor_run()`). A list of more
+than `LION_ISECT_MAX_SETS` (32) values was never located for the probe and was taken as independent
+of the rest of the AND, as core takes it. A list of ids chosen because they pass the other filters
+is the opposite of independent: every listed value's rows pass them, and core's product put a
+count over about a thousand such ids at a twentieth of its rows, which priced lion's plain scan for that
+many rows and chose it over the count. Such a list is now measured through
+`LION_ISECT_LIST_SAMPLE` (16) of its non-NULL values, evenly spaced over it: the sample is located
+and sought as a list of 16 values is, and what the probe measures of it is scaled by core's
+estimate of the whole list over core's estimate of the sample (at least one) - the clause's
+`scale`, applied to the measured rows, to the bounds a sample can rule out and raise to, to a
+measured part's rows, and to the driver's rows where it is the sample. A sample none of whose
+values has an entry says nothing of the list's other values, and its clause is left out of the
+measure as a clause too wide is, not taken as an AND that is empty. On `test/sql/isectlist.sql`'s
+table (100,000 rows, 200 hidden groups, a four-valued column that follows them), lion's estimate
+of the Bitmap Index Scan with the probe on and off:
+
+| conjunction | rows | probe | core |
+|---|---|---|---|
+| `c = 1` and 40 values of `g` all with `c = 1` | 20,000 | 20,000 | 5,000 |
+| `c = 2` and the same 40 values | 0 | 1 | 4,995 |
+| `c = 1` and 20 such values, 20 absent | 10,000 | 10,000 | 2,500 |
+| `c = 1` and 40 such values, 40 with `c = 3` | 20,000 | 10,000 | 10,000 |
+
+The last is core's estimate within `LION_ISECT_ERROR`, which the probe leaves as it is. On a synthetic
+table of 1M rows, that count is now estimated at 20,033 rows for its 20,033, where it had been 994.
 
 **The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
 sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.

@@ -1174,7 +1174,9 @@ working around a bad choice:
   taken, the column is estimated as without it; and only for a user who may read every row of the
   table. Each value is looked up once per planning, one descent of the index's directory, and an
   `IN` list of 1000 values took about 5 ms to plan where it took 0.5 without. `pg_stats` still
-  shows ANALYZE's list.
+  shows ANALYZE's list. A literal list longer than 1000 values is not given to the planner, but
+  Lion's own price of reading its entries counts the rows of 1000 values of it, evenly spaced, and
+  scales them to the list (DESIGN.md §15, "Long lists"), under the same conditions.
 - `pg_lion.enable_memoize_limit` (on by default): price a nested loop that Lion's paths compete
   with at the cache hits its Memoize meets under the query's `LIMIT` (DESIGN.md §39, "A Memoize
   under a LIMIT"). The planner prices a Memoize at one hit ratio for every call of the loop's whole
