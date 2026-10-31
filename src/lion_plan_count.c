@@ -4031,14 +4031,63 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 #define LION_TOPK_MAX_CAND	16384
 
 /*
+ * Does a clause on var alone, gclause, keep the value v of it?  Only a
+ * binary operator between var and a constant is evaluated, and not a
+ * volatile one; anything else is taken to keep it.  A NULL result keeps
+ * nothing, as a WHERE reads it.
+ */
+static bool
+lion_topk_value_kept(Var *var, Expr *gclause, Datum v)
+{
+	OpExpr	   *op;
+	Node	   *l;
+	Node	   *r;
+	Const	   *c;
+	bool		varleft;
+	Oid			fn;
+	FmgrInfo	flinfo;
+	Datum		res;
+
+	LOCAL_FCINFO(fcinfo, 2);
+
+	if (!IsA(gclause, OpExpr))
+		return true;
+	op = (OpExpr *) gclause;
+	if (list_length(op->args) != 2)
+		return true;
+	l = lion_strip((Node *) linitial(op->args));
+	r = lion_strip((Node *) lsecond(op->args));
+	if (equal(l, var) && IsA(r, Const))
+		varleft = true;
+	else if (equal(r, var) && IsA(l, Const))
+		varleft = false;
+	else
+		return true;
+	c = (Const *) (varleft ? r : l);
+	fn = get_opcode(op->opno);
+	if (c->constisnull || func_volatile(fn) == PROVOLATILE_VOLATILE)
+		return true;
+	fmgr_info(fn, &flinfo);
+	InitFunctionCallInfoData(*fcinfo, &flinfo, 2, op->inputcollid,
+							 NULL, NULL);
+	fcinfo->args[0].value = varleft ? v : c->constvalue;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = varleft ? c->constvalue : v;
+	fcinfo->args[1].isnull = false;
+	res = FunctionCallInvoke(fcinfo);
+	return !fcinfo->isnull && DatumGetBool(res);
+}
+
+/*
  * The rows of the cand largest groups of var, of ngroups: the frequencies of
- * its most common values, which the statistics keep largest first, and past
- * the end of that list the frequency of a value it leaves out; at the least
- * cand average groups.
+ * its most common values, which the statistics keep largest first - but for
+ * those a clause of the WHERE on var alone (gclauses) rejects, whose entries
+ * the walk passes by - and past the end of that list the frequency of a
+ * value it leaves out; at the least cand average groups.
  */
 static double
-lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, double cand,
-			   double ngroups)
+lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, List *gclauses,
+			   double cand, double ngroups)
 {
 	VariableStatData vardata;
 	AttStatsSlot sslot;
@@ -4048,22 +4097,40 @@ lion_topk_rows(PlannerInfo *root, RelOptInfo *rel, Var *var, double cand,
 	examine_variable(root, lion_vcol_unvar((Node *) var), 0, &vardata);
 	if (HeapTupleIsValid(vardata.statsTuple) &&
 		get_attstatsslot(&sslot, vardata.statsTuple, STATISTIC_KIND_MCV,
-						 InvalidOid, ATTSTATSSLOT_NUMBERS))
+						 InvalidOid,
+						 ATTSTATSSLOT_VALUES | ATTSTATSSLOT_NUMBERS))
 	{
 		Form_pg_statistic stats =
 			(Form_pg_statistic) GETSTRUCT(vardata.statsTuple);
 		double		mcv = 0.0;
 		double		top = 0.0;
+		int			kept = 0;
 		int			i;
 
 		for (i = 0; i < sslot.nnumbers; i++)
 		{
+			ListCell   *lc;
+			bool		keep = true;
+
 			mcv += sslot.numbers[i];
-			if (i < cand)
+			if (i < sslot.nvalues)
+				foreach(lc, gclauses)
+				{
+					if (!lion_topk_value_kept(var, (Expr *) lfirst(lc),
+											  sslot.values[i]))
+					{
+						keep = false;
+						break;
+					}
+				}
+			if (keep && kept < cand)
+			{
 				top += sslot.numbers[i];
+				kept++;
+			}
 		}
-		if (cand > sslot.nnumbers)
-			top += (cand - sslot.nnumbers) *
+		if (cand > kept)
+			top += (cand - kept) *
 				Max(1.0 - mcv - stats->stanullfrac, 0.0) /
 				Max(ngroups - sslot.nnumbers, 1.0);
 		rows = Max(rows, top * tuples);
@@ -4089,6 +4156,7 @@ lion_count_path_topk(LionCountPathBuild *cx)
 	bool		sumshort;
 	bool		groupdrive;
 	List	   *others = NIL;
+	List	   *gonly = NIL;
 	Selectivity sel;
 	double		cand;
 	ListCell   *lc;
@@ -4182,7 +4250,10 @@ lion_count_path_topk(LionCountPathBuild *cx)
 					   &attnos);
 		if (bms_get_singleton_member(attnos, &attno) &&
 			attno + FirstLowInvalidHeapAttributeNumber == cx->groupattno[0])
+		{
+			gonly = lappend(gonly, lion_vcol_subst((Node *) rinfo->clause));
 			continue;
+		}
 		others = lappend(others, rinfo);
 	}
 	sel = (others != NIL) ?
@@ -4197,8 +4268,8 @@ lion_count_path_topk(LionCountPathBuild *cx)
 
 	cx->topkn = limit + offset;
 	cx->topkcand = (int) cand;
-	cx->topkrows = lion_topk_rows(root, cx->input_rel, cx->groupvar[0], cand,
-								  cx->groupest[0]);
+	cx->topkrows = lion_topk_rows(root, cx->input_rel, cx->groupvar[0],
+								  gonly, cand, cx->groupest[0]);
 	cx->topkstrict = (list_length(parse->sortClause) > 1 ||
 					  parse->limitOption == LIMIT_OPTION_WITH_TIES);
 }

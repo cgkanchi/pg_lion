@@ -22593,8 +22593,10 @@ bound, and the bounds after it have to fall below that. Never fewer than k + 64,
 16,384, and only when that is under half the column's entries - past that every group is counted
 anyway. The price (`lion_cost_topk_path()`): every entry's header at two operator costs, the
 leaves of the walk, a lookup per candidate, and the candidates counted as the groups of a walk of
-that many entries are - their rows the column's most common values' frequencies, largest first
-(`lion_topk_rows()`) - with their rows rechecked. Nothing comes out before the last is counted.
+that many entries are - their rows the column's most common values' frequencies, largest first,
+leaving out the values a clause of the WHERE on g alone rejects (`g <> ''` passes the `''`
+entry by in the walk, so it is no candidate; only `g op constant` is evaluated against the
+values, any other clause keeps them) (`lion_topk_rows()`) - with their rows rechecked. Nothing comes out before the last is counted.
 
 The plan carries k, the candidates and the tie rule in a new member of custom_private,
 `LION_PRIV_TOPK` (shape 20). EXPLAIN prints `Top K: 10 by count, 74 candidates` (`with ties` when
