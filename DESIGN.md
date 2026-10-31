@@ -4806,7 +4806,7 @@ their rows scaled to the list's length. It is made where §33 would serve the va
 multi-key column, an index neither partial nor hypothetical, a user who may read every row of the
 column - and once a list a planner run (`LionProbeCache.listsels`). Core's estimate of the
 relation's rows is left as it is: this prices lion's sets, which is what chose against the count.
-Listed values repeated are counted as often as listed, as core counts them. Measured as above
+A value listed more than once is counted once, as the executor looks it up once. Measured as above
 (lists of every 17th integer over a 5,000-key column, 294 of the values in it): 30,000 values
 counted in 7.7 ms against the sequential scan's 53 and 70,000 in 16.5 ms against 59, both now
 chosen; at 100,000 the sequential scan still is, where the count takes 22 ms. What is left is the
