@@ -689,10 +689,12 @@ lion_posting_set_lookup_col(Relation index, AttrNumber attno, Datum key,
  * key is of the column's own key type (lion_probe_init()'s keytype
  * InvalidOid): a cross-type value may need a walk of every leaf
  * (lion_dir_find_by_scan()), which a plan may not cost.  False, with *ntids
- * 0, when the key has no entry.
+ * 0, when the key has no entry.  *blkp, when asked for, is the leaf the entry
+ * was found on (lion_vacuum.c, "Counting a sample").
  */
 bool
-lion_key_ntids(Relation index, AttrNumber attno, Datum key, uint64 *ntids)
+lion_key_ntids(Relation index, AttrNumber attno, Datum key, uint64 *ntids,
+			   BlockNumber *blkp)
 {
 	LionState  *state = lion_index_column_state(index, attno);
 	LionProbe	probe;
@@ -703,6 +705,8 @@ lion_key_ntids(Relation index, AttrNumber attno, Datum key, uint64 *ntids)
 	bool		found;
 
 	*ntids = 0;
+	if (blkp != NULL)
+		*blkp = InvalidBlockNumber;
 	lion_probe_init(index, state, InvalidOid, &probe);
 	key = lion_probe_value(&probe, key);
 	lion_probe_search_key(state, &probe, key,
@@ -711,7 +715,11 @@ lion_key_ntids(Relation index, AttrNumber attno, Datum key, uint64 *ntids)
 	found = lion_dir_find(index, NULL, state->ix, &sk, BUFFER_LOCK_SHARE,
 						  false, &buf, &off, &moved);
 	if (found)
+	{
 		*ntids = lion_entry_ntids(lion_page_entry(BufferGetPage(buf), off));
+		if (blkp != NULL)
+			*blkp = BufferGetBlockNumber(buf);
+	}
 	if (BufferIsValid(buf))
 		UnlockReleaseBuffer(buf);
 	return found;

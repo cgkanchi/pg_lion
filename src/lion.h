@@ -1863,6 +1863,16 @@ extern BlockNumber lion_dir_leftmost_leaf_ext(Relation index, LionIndexState *ix
 											  BufferAccessStrategy strategy);
 
 /*
+ * Every directory leaf's block number, left to right, and the key column its
+ * lower bound is in (0: minus infinity), from the downlinks of level 1, the
+ * walk reading at most maxpages pages; the number of leaves, or -1 when the
+ * walk would read more or the root is a leaf.
+ */
+extern int	lion_dir_leaves(Relation index, LionIndexState *ix,
+							BufferAccessStrategy strategy, BlockNumber maxpages,
+							BlockNumber **blksp, uint16 **startsp);
+
+/*
  * The leaf where key column `col`'s run of entries begins, and the offset of
  * its first entry on that leaf (DESIGN.md §24).  The run ends at the first
  * entry of the next column, which a walk recognises by its attno.
