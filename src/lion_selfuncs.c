@@ -6712,6 +6712,8 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 		double		keysel = 1.0 - nullfrac;
 		double		mcvrows = 0;
 		double		mcvsq = 0;
+		double		freqrows = 0;
+		double		freqsq = 0;
 		bool		hasmcv = false;
 		bool		allmcv = false;
 		AttStatsSlot sslot;
@@ -6735,9 +6737,12 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 			 */
 			for (i = 0; i < sslot.nnumbers; i++)
 			{
-				double		n = sslot.numbers[i] * tuples;
+				double		freq = sslot.numbers[i] * tuples;
+				double		n = freq;
 				uint64		ntids;
 
+				freqrows += freq;
+				freqsq += freq * freq;
 				if (lookup && i < LION_SKEW_MCV_LOOKUPS && i < sslot.nvalues)
 				{
 					CHECK_FOR_INTERRUPTS();
@@ -6749,6 +6754,18 @@ lion_skew_compute(PlannerInfo *root, RelOptInfo *rel, Var *var,
 				mcvsq += n * n;
 			}
 			index_close(index, NoLock);
+
+			/*
+			 * Counts the table's estimate has not caught up with - dead TIDs
+			 * a VACUUM has yet to take, rows added since the last ANALYZE -
+			 * may hold more rows than the estimate leaves the column, and
+			 * would leave the rest no rows: the frequencies, then.
+			 */
+			if (mcvrows > tuples * (1.0 - nullfrac))
+			{
+				mcvrows = freqrows;
+				mcvsq = freqsq;
+			}
 			hasmcv = (sslot.nnumbers > 0);
 			allmcv = (hasmcv && ndist <= (double) sslot.nnumbers);
 			if (hasmcv && keysel > sslot.numbers[0])

@@ -1137,12 +1137,11 @@ lion_vacuum_blkpos_cmp(const void *a, const void *b)
  * values of each scalar key column - the first LION_SAMPLE_MCV_MAX of each
  * list, its heaviest - found by a lookup of each (lion_key_ntids()).  A
  * column whose statistics are of another type than its key, or that has none,
- * marks nothing.  The number of leaves newly marked; *nlookups the lookups.
+ * marks nothing.  The number of leaves newly marked.
  */
 static int
 lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
-					   const BlockNumber *blks, int nleaves, double *weight,
-					   int *nlookups)
+					   const BlockNumber *blks, int nleaves, double *weight)
 {
 	Form_pg_index indexform = index->rd_index;
 	TupleDesc	desc = RelationGetDescr(index);
@@ -1151,7 +1150,6 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
 	int			c;
 	int			i;
 
-	*nlookups = 0;
 	pairs = (BlockNumber *) palloc(sizeof(BlockNumber) * 2 * nleaves);
 	for (i = 0; i < nleaves; i++)
 	{
@@ -1191,7 +1189,6 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
 					BlockNumber key[2];
 					BlockNumber *hit;
 
-					(*nlookups)++;
 					CHECK_FOR_INTERRUPTS();
 					if (!lion_key_ntids(index, (AttrNumber) (c + 1),
 										sslot.values[k], &ntids, &key[0]))
@@ -1220,9 +1217,9 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
  * directory larger than the budget, estimated from a sample of its leaves, as
  * ANALYZE estimates a table's statistics from a sample of its blocks.
  *
- * Every entry of a leaf is one key, and carries its TIDs, so a leaf's share of
- * a column's keys, of its Σn² and of the rows is read off the leaf alone, and
- * a sample of leaves scales up by the number of leaves - which the downlinks
+ * Every VALUE entry of a leaf is one key, and carries its TIDs, so a leaf's
+ * share of a column's keys, of its Σn² and of the rows is read off the leaf
+ * alone, and a sample of leaves scales up by the number of leaves - which the downlinks
  * of level 1 list, read in a walk along it (lion_dir_leaves()).  The entries
  * are in the order of their key column first (§24), so a column's keys are a
  * run of leaves, and a short run - a column of a few keys, which a sample of
@@ -1230,8 +1227,8 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
  * of leaves whose lower bound is in one column ends.  That leaf is read
  * whatever the sample: every leaf whose right neighbour's lower bound is in
  * another column, the last leaf with them.  The others are sampled in strata,
- * one per column their lower bound is in, each its share of what the budget
- * leaves - one leaf at least - and each sampled leaf stands for its stratum's
+ * one per column their lower bound is in, each one leaf and its share of the
+ * rest of what the budget leaves, and each sampled leaf stands for its stratum's
  * leaves over its sample.  The estimate of each column is unbiased, and its
  * error the sample's.  A few heavy keys carry much of a skewed column's Σn²,
  * and a sample that finds the leaf of one or misses it would swing the sum by
@@ -1241,17 +1238,17 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
  * over the rest - which is the part the planner uses (§33, "The rows of a
  * probed key").
  *
- * The walk along level 1, the lookups and the leaves read count against the
- * budget; a directory whose level 1 alone would use half of it, or whose
- * leaves that must be read leave nothing to sample, is not counted, and keeps
- * the counts it has.  Each page is read SHARE alone through the ring, the leaves in
- * their order left to right, and a block a downlink named that is no longer
- * a live leaf when it is read - deleted since, or reused - counts as empty.
+ * The pages the walk along level 1 and the lookups read, and the leaves read
+ * whole or sampled, count against the budget; a directory whose level 1 alone
+ * would use half of it, or whose pages that must be read leave less than a
+ * leaf for each stratum, is not counted, and keeps the counts it has.  Each
+ * page is read SHARE alone through the ring, the leaves in their order left
+ * to right, and a block a downlink named that is no longer a live leaf when
+ * it is read - deleted since, or reused - counts as empty.
  */
 static void
 lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
-						AttrNumber rowcol, const LionMetaPageData *meta,
-						BlockNumber budget)
+						AttrNumber rowcol, BlockNumber budget)
 {
 	Relation	index = info->index;
 	LionMetaNdistinct nd;
@@ -1268,11 +1265,12 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	uint64	   *finalv;
 	uint64	   *finals;
 	uint64		rows;
-	BlockNumber internal;
+	int64		read0 = lion_dir_pages_read;
+	int64		spent;
 	BlockNumber leafbudget;
 	int			nleaves;
 	int			ncertain = 0;
-	int			nlookups;
+	int			nstrata = 0;
 	int			nrest;
 	int		   *rest;
 	int			i;
@@ -1294,21 +1292,35 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 		}
 	}
 	/* and so is the leaf of each of ANALYZE's most common values */
-	ncertain += lion_vacuum_mcv_leaves(index, ix, blks, nleaves, weight,
-									   &nlookups);
+	ncertain += lion_vacuum_mcv_leaves(index, ix, blks, nleaves, weight);
 	nrest = nleaves - ncertain;
-	internal = meta->dirpages > (uint32) nleaves ?
-		meta->dirpages - (uint32) nleaves : 0;
-	if ((uint64) budget <= (uint64) internal + ncertain + nlookups)
+	/* a stratum: a run of one lower-bound column with a leaf left to sample */
+	for (i = 0, c = -1; i < nleaves; i++)
+	{
+		if (i > 0 && starts[i] != starts[i - 1])
+			c = -1;
+		if (weight[i] == 0 && c < 0)
+		{
+			nstrata++;
+			c = i;
+		}
+	}
+	/* every page read so far - the walk and the lookups - is charged */
+	spent = lion_dir_pages_read - read0;
+	if ((int64) budget <= spent + ncertain + nstrata)
 	{
 		pfree(weight);
 		pfree(blks);
 		pfree(starts);
 		return;
 	}
-	leafbudget = budget - internal - ncertain - nlookups;
+	leafbudget = (BlockNumber) (budget - spent - ncertain);
 
-	/* each stratum: the run's leaves not read whole, its share of the rest */
+	/*
+	 * Each stratum: the run's leaves not read whole, one of them and its
+	 * share of the rest of the budget, so that the strata together read no
+	 * more than leafbudget.
+	 */
 	rest = (int *) palloc(sizeof(int) * nleaves);
 	i = 0;
 	while (i < nleaves)
@@ -1324,8 +1336,9 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 		if (len > 0)
 		{
 			BlockSamplerData bs;
-			uint64		want = (uint64) leafbudget * (uint64) len / (uint64) nrest;
-			int			n = (int) Max(1, Min(want, (uint64) len));
+			uint64		want = 1 + (uint64) (leafbudget - nstrata) *
+				(uint64) len / (uint64) nrest;
+			int			n = (int) Min(want, (uint64) len);
 			int			k;
 			double		w;
 
@@ -1455,7 +1468,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	lion_read_meta(index, &meta);
 	if (meta.dirpages > budget)
 	{
-		lion_vacuum_sample_keys(info, ix, rowcol, &meta, budget);
+		lion_vacuum_sample_keys(info, ix, rowcol, budget);
 		return;
 	}
 
