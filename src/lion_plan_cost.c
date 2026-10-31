@@ -1173,6 +1173,19 @@ lion_cost_set_clause(PlannerInfo *root, RelOptInfo *rel, IndexOptInfo *idx,
 	sel = lion_rel_clause_selectivity(root, rel, lion_vcol_unvar(clause));
 
 	/*
+	 * A list longer than the values lion serves core the frequencies of is
+	 * estimated by core as that many average values of the column; lion
+	 * counts a sample of them instead (DESIGN.md §15, "Long lists").
+	 */
+	{
+		Selectivity lsel;
+
+		if (lion_list_sample_sel(root, rel, idx, col, lion_vcol_unvar(clause),
+								 &lsel))
+			sel = lsel;
+	}
+
+	/*
 	 * A partial index's sets hold its predicate's rows alone (DESIGN.md §45):
 	 * the rows the index has (itup), and the share of them the clause
 	 * selects (psel), price its sets where a whole index's are the table's

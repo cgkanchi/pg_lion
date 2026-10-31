@@ -4515,6 +4515,9 @@ extern List *lion_rel_clauses(PlannerInfo *root, RelOptInfo *rel,
 							  List *clauses);
 extern Selectivity lion_rel_clause_selectivity(PlannerInfo *root,
 												RelOptInfo *rel, Node *clause);
+extern bool lion_list_sample_sel(PlannerInfo *root, RelOptInfo *rel,
+								 IndexOptInfo *idx, AttrNumber col,
+								 Node *clause, Selectivity *sel);
 extern Cost lion_cost_residual(PlannerInfo *root, RelOptInfo *toprel,
 							   RelOptInfo *rel, List *residual,
 							   double counts);
