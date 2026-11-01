@@ -29,8 +29,9 @@ that reads a few percent of itself a query and fills its `LIMIT` under any lion 
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude
 faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
 
-**Status: beta.** It works on PostgreSQL 16 through 19 and master, and CI tests every one of them
-in both WAL modes, with crash recovery and standby replay. The on-disk format may still change
+**Status: beta.** It works on PostgreSQL 16 through 19 and master. CI tests 16 through 19 on every
+pull request (master in a run started by hand), in both WAL modes, with crash recovery and standby
+replay. The on-disk format may still change
 before 1.0; a release that changes it will say so, and the indexes will need a `REINDEX`. Until
 then queries run without them (each backend warns once), and inserts into their tables fail.
 
@@ -76,8 +77,10 @@ ALTER EXTENSION pg_lion_citext UPDATE;  -- where installed
 ALTER EXTENSION pg_lion_vector UPDATE;  -- where installed
 ```
 
-Lion indexes built by an older build may then need `REINDEX`: lion refuses an index in an older
-on-disk format, with an error that says so, until it is rebuilt.
+Lion indexes built by a build of another on-disk format then need `REINDEX`: lion refuses such an
+index, with an error that says so, until it is rebuilt. A database with a build from before 0.3.0
+installed has no update path: drop the extensions (`DROP EXTENSION ... CASCADE` drops their
+indexes too) and create them and the indexes again.
 
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 
@@ -85,7 +88,7 @@ Optionally, preload the library to get lion's own WAL format, which makes insert
 shared_preload_libraries = 'pg_lion'
 ```
 
-Indexes work either way, but an index built while the library is preloaded is written in Lion's
+Indexes work either way, but an index built while the library is preloaded is WAL-logged in lion's
 format from then on, and needs the preload for as long as it exists: without it, inserts and
 updates into its table fail, and so does VACUUM (autovacuum too), so dead rows pile up. To stop
 preloading it, first REINDEX each such index with `wal_mode = generic`. See
@@ -300,10 +303,10 @@ column alone, `embedding IS NOT NULL` or a distance bound, is no such filter: it
 rows.
 A range over a column of many distinct values, a timestamp or a price, is a walk of every key it
 covers unless the column's lion index keeps summaries (`WITH (summaries = auto)`): at 10% of a
-million unique values, 45 ms before the first row without them and 3 ms with. The index is 1.7 GB to
-HNSW's 3.8 GB (1.9 GB as built now, with every row's one-bit code in two partitions, which finds
-more of the nearest rows at each margin: the figures here are from before), and since a query
-reads only the partitions it needs, it holds up when memory is short: with PostgreSQL held to
+million unique values, 45 ms before the first row without them and 3 ms with. The index is 1.9 GB to
+HNSW's 3.8 GB (the figures here are of a build with fewer partitions and `spill = off`, 1.7 GB;
+the defaults find more of the nearest rows at each margin), and since a query reads only the
+partitions it needs, it holds up when memory is short: with PostgreSQL held to
 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took 51 ms and 767 pages (and 691 ms
 and 9,229 pages under the 1% filter, where lionvec read none).
 `vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
@@ -340,8 +343,8 @@ cold scan's wait on the disk by a third to a half on 115,000 embeddings).
   table that is not partitioned, and not in its joins.
 - `lionvec` assumes pgvector's distance functions are costed at 100 (the `ALTER FUNCTION`s under
   [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1 the planner may sort a
-  filter's rows by distance instead: before scans paused, it did for filters of 1% and 10% of a
-  million rows, 3 to 17 times slower. The setting is not kept by `pg_dump`, and an `ALTER
+  filter's rows by distance instead, which was 3 to 17 times slower for filters of 1% and 10% of
+  a million rows. The setting is not kept by `pg_dump`, and an `ALTER
   EXTENSION vector UPDATE` may reset it, so run them again after either.
 - If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered
   or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer

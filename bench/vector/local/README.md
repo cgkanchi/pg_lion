@@ -92,14 +92,6 @@ variable of `knn_dbpedia.py` can be set. The warm runs prewarm the index into `s
 (and its TOAST, under `KNN_INLINE=0`) into the kernel's cache (`KNN_PREWARM=read`), since its 8 GB
 do not fit `shared_buffers`, then run every query once untimed before timing it.
 
-**A database loaded before 2026-10-16** has its vectors in TOAST and its filter index without
-summaries. Reload it: `rm ~/lionbench/state/{load,build-*,warm-*,cold}.done`, then `run.sh` (the
-shards and the truth are kept). Inline storage leaves lionvec as it was and makes VectorChord's
-prefilter read a heap page a candidate rather than one for about 120: at 115k rows, cold, its 3%
-query went from 60 to 113 ms. To keep the TOAST layout and only add the summaries, rebuild the
-filter index instead: `pg.sh psql -d dbpedia -c 'DROP INDEX dbpedia_u' -c 'CREATE INDEX dbpedia_u
-ON dbpedia USING lion (u) WITH (summaries = auto)' -c 'ANALYZE dbpedia'`.
-
 **Smaller runs.** `NSHARDS=8 run.sh` takes 8 shards (about 308k rows) and finishes in a fraction
 of the time; `NSHARDS=3` reproduces the 115k set of the earlier results. Use a separate
 `BENCH_DIR` for each size, or clear `~/lionbench/state` and drop the database
