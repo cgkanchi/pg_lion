@@ -89,7 +89,6 @@ static relopt_kind lion_relopt_kind;
 bool		lion_enable_plain_scan = true;
 
 static const relopt_parse_elt lion_relopt_tab[] = {
-	{"buckets", RELOPT_TYPE_INT, offsetof(LionOptions, buckets)},
 	{"inline_limit", RELOPT_TYPE_INT, offsetof(LionOptions, inline_limit)},
 	{"max_entries", RELOPT_TYPE_INT, offsetof(LionOptions, max_entries)},
 	{"fillfactor", RELOPT_TYPE_INT, offsetof(LionOptions, fillfactor)},
@@ -258,16 +257,6 @@ _PG_init(void)
 	 * (lion_build_options()).
 	 */
 
-	/*
-	 * `buckets` is accepted and ignored since format 4 (DESIGN.md §21): the
-	 * hash directory it sized is gone, and refusing the option outright would
-	 * break every CREATE INDEX script that sets it.  lionoptions() says so
-	 * once, when the option is being set rather than merely read back.
-	 */
-	add_int_reloption(lion_relopt_kind, "buckets",
-					  "Ignored since format 4; the entry directory is a B-tree",
-					  0, 0, 65536,
-					  ShareUpdateExclusiveLock);
 	add_int_reloption(lion_relopt_kind, "fillfactor",
 					  "Percentage of a directory leaf ambuild fills",
 					  LION_DEFAULT_FILLFACTOR, LION_MIN_FILLFACTOR, 100,
@@ -929,10 +918,8 @@ lionoptions(Datum reloptions, bool validate)
 											lengthof(lion_relopt_tab));
 
 	/*
-	 * DESIGN.md §21: the hash directory `buckets` sized no longer exists.  The
-	 * option is still parsed so that existing DDL keeps working, and setting
-	 * it to anything says so.  validate is true only when the option is being
-	 * set, not when the relcache reads it back.
+	 * validate is true only when an option is being set, not when the
+	 * relcache reads it back.
 	 */
 	if (validate && opts != NULL && opts->wal_mode == LION_WALOPT_RMGR &&
 		!lion_rmgr_registered())
@@ -940,12 +927,6 @@ lionoptions(Datum reloptions, bool validate)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("wal_mode = rmgr needs the pg_lion WAL resource manager, which this server has not registered"),
 				 errhint("Add \"pg_lion\" to shared_preload_libraries and restart the server, or leave wal_mode at \"auto\".")));
-
-	if (validate && opts != NULL && opts->buckets > 0)
-		ereport(NOTICE,
-				(errmsg("buckets is ignored since format 4"),
-				 errdetail("The entry directory is a B-tree keyed by the index key; it grows by splitting."),
-				 errhint("Use fillfactor to control how full ambuild packs its leaves.")));
 
 	return (bytea *) opts;
 }

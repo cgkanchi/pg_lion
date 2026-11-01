@@ -772,8 +772,7 @@ SELECT lion_cmp('lion_grow', 'k = 12345');
  ok 1 rows
 (1 row)
 
--- `buckets` is accepted and ignored since format 4 (DESIGN.md §21).
-CREATE INDEX lion_grow_x ON lion_grow USING lion (k) WITH (buckets = 4);
+CREATE INDEX lion_grow_x ON lion_grow USING lion (k);
 INSERT INTO lion_grow VALUES (80001, 80001);
 SELECT entries = 80001 AS all_keys FROM lion_index_stats('lion_grow_x');
  all_keys 

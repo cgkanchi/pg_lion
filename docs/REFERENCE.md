@@ -567,11 +567,6 @@ rejects a row.  For a multi-key column the keys are the extracted elements or le
 moves out of its entry tuple onto container pages of its own. The build records it on the meta
 page, and inserts and VACUUM keep to that: `ALTER INDEX ... SET (inline_limit = ...)` takes effect
 at the next REINDEX.
-`buckets` (0 .. 65536, default 0): accepted and ignored. It sized the hash directory of the
-first index formats, which a B-tree keyed by the index key replaced (DESIGN.md §21); that tree
-grows by splitting and has nothing to size, so an index built with any value is the index built
-without it. A value above 0 is answered with a NOTICE saying so when it is set, by `CREATE INDEX`
-or `ALTER INDEX ... SET`; a value outside the range is an error, as for any reloption.
 `fillfactor` is what decides how full the build packs the directory's leaves.
 `slices` (`on` | `off`, default `off`): bit slices of every integer, date, time and timestamp key
 column (DESIGN.md §51). A sliced column keeps, after its keys and their summaries, one posting set
@@ -593,10 +588,7 @@ and one of an `int8` took about 4.6 times as long as without slices with `pg_lio
 (DESIGN.md §51, "Insert cost, revisited"); preload it for a table that takes many writes. The slices of a dense column are mostly bitsets, which
 an insert changes in place; they added 4% to 40% to the size of the indexes measured, the most to a
 column of few keys. An index build with slices took 1.2 to 1.5 times as long. Read at build
-time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes effect at the next REINDEX. An
-index with a sliced column is on-disk format 15, which a build of pg_lion before this option
-refuses; one without stays format 14, readable by both - so REINDEX with `slices = off` before
-going back to an older build.
+time, like `summaries`: `ALTER INDEX ... SET (slices = ...)` takes effect at the next REINDEX.
 `summaries` (`off` | `on` | `auto`, default `off`): summary posting sets for ranges (DESIGN.md §32).
 With `on` every ordered scalar key column keeps, after its keys, one posting set per bucket of
 consecutive keys, and a count over a range sums the buckets it covers whole instead of walking their

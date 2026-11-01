@@ -17,7 +17,7 @@
 -- 8. An entry whose TID count is less than what VACUUM removes from it.
 -- 9. An INLINE entry whose item ends between its key and the end of its
 --    positions extension, where the payload length wrapped around zero.
--- 10. An index whose meta page says a format version before this build's.
+-- 10. An index whose meta page says another format version than this build's.
 -- 11. A directory entry whose line pointer reaches into a CHAIN entry, which
 --     every record of an insert into that entry's posting set rewrites in
 --     place, by its own line pointer (lion_page_check_alone()).
@@ -329,17 +329,11 @@ SELECT lion_di_set_lplen('lion_di_s_i', :lion_di_blk, :lion_di_off, :lion_di_key
 SELECT lion_di_try($$SELECT count(*) FROM lion_di_s WHERE d @@ 'k007'$$);
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_s_i')$$);
 DROP TABLE lion_di_s;
--- ---------- 10. an index of an older format version ----------
--- An index with its meta page's version (at byte 28) made 13, the format
--- before this one, which filed an empty array with dimensions in the EMPTY
--- entry (DESIGN.md §17) and whose meta page could carry a flag for NARROW
--- items (§38) that this one does not have, then 11, the format before
--- every internal directory page began with a minus-infinity downlink (§21,
--- "Height"), then 9, the one before the compact entry tuples of §21, and
--- then 8, the one before the varbyte sparse segments of §13: its flags or
--- its directory may be what this build never writes, or its entries or
--- segments would be read wrongly, so lion_index_verify() reports it and a
--- reader refuses it, asking for a REINDEX - which makes it whole again.
+-- ---------- 10. an index of another format version ----------
+-- An index with its meta page's version (at byte 28) made 0, 2, 14 and 15,
+-- versions this build does not write: an index of another format may hold
+-- what this build would read wrongly, so lion_index_verify() reports it and
+-- a reader refuses it, asking for a REINDEX - which makes it whole again.
 CREATE FUNCTION lion_di_hint(q text) RETURNS text
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -354,19 +348,19 @@ END $$;
 CREATE INDEX lion_di_old_i ON lion_di USING lion (k);
 SELECT lion_di_evict('lion_di_old_i');
 SELECT lion_di_u32(lion_di_block('lion_di_old_i', 0), 28) AS version;
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(0));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(11));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(9));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(14));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(8));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(15));
 SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 SELECT lion_di_hint($$SELECT lion_index_count('lion_di_old_i', 1)$$);
 REINDEX INDEX lion_di_old_i;
@@ -379,7 +373,7 @@ SELECT lion_di_try($$SELECT lion_index_verify('lion_di_old_i')$$);
 -- that state there (lion_meta_check_version()).
 SELECT lion_index_count('lion_di_old_i', 1) > 0 AS warm;
 SELECT lion_di_evict('lion_di_old_i');
-SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(13));
+SELECT lion_di_poke('lion_di_old_i', 0, 28, lion_di_le32(2));
 SELECT lion_di_hint($$SELECT ntids FROM lion_index_stats('lion_di_old_i')$$);
 VACUUM lion_di;
 -- To the planner such an index is not there (DESIGN.md §21, "An index of

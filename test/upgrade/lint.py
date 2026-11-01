@@ -13,7 +13,9 @@ versions"):
   - every upgrade script is named <ext>--<from>--<to>.sql, and a chain of them
     leads from every version that has one to default_version.
 
-With BASE, a git revision (the pull request's base branch), also:
+With BASE, a git revision (the pull request's base branch), also, unless
+BASE's default_version is older than test/upgrade/floor (the first version
+that later ones are upgraded from):
 
   - an install script BASE has under default_version is unchanged: a change to
     the SQL needs a new version and an upgrade script to it;
@@ -31,9 +33,21 @@ import sys
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..')
 VERSION_RE = re.compile(r'^(\d+\.\d+\.\d+)(-dev\d+)?$')
-# versions from before the X.Y.Z scheme, which upgrade scripts start from
-OLD_VERSIONS = {'0.1'}
 errors = []
+
+
+def read_floor():
+    with open(os.path.join(ROOT, 'test', 'upgrade', 'floor')) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith('#'):
+                return line
+    raise SystemExit('lint: test/upgrade/floor names no version')
+
+
+def release_tuple(ver):
+    m = VERSION_RE.match(ver or '')
+    return tuple(int(x) for x in m.group(1).split('.')) if m else None
 
 
 def fail(msg):
@@ -62,7 +76,7 @@ def scripts(ext, names):
         if len(parts) == 1:
             install[parts[0]] = name
         elif len(parts) == 2:
-            if not all(VERSION_RE.match(v) or v in OLD_VERSIONS for v in parts):
+            if not all(VERSION_RE.match(v) for v in parts):
                 fail('%s: a version in the name is not X.Y.Z or X.Y.Z-devN' % name)
             upgrade[tuple(parts)] = name
         else:
@@ -98,6 +112,7 @@ def main():
     with open(os.path.join(ROOT, 'META.json')) as f:
         meta = json.load(f)
     files = os.listdir(ROOT)
+    floor = release_tuple(read_floor())
     if base:
         base_files = subprocess.run(['git', 'ls-tree', '--name-only', base], cwd=ROOT,
                                     capture_output=True, text=True, check=True).stdout.split()
@@ -136,6 +151,9 @@ def main():
         if bctl is None:
             continue    # a new extension
         bver = control_version(bctl.decode())
+        brel = release_tuple(bver)
+        if brel is None or brel < floor:
+            continue    # older than the floor: nothing upgrades from it
         binstall, bupgrade = scripts(ext, base_files)
         if bver == cur:
             old = git_show(base, '%s--%s.sql' % (ext, cur))

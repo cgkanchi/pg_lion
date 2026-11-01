@@ -396,7 +396,7 @@ SHOW pg_lion.vector_toast_direct;
 SELECT tt_meta('tt_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_pages('tt_v', 6) AS loc_pages, tt_pages('tt_v', 7) AS locdir_pages;
@@ -932,7 +932,7 @@ ANALYZE tt768;
 SELECT tt_meta('tt768_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_check('tt768_v');
@@ -970,7 +970,7 @@ ANALYZE tt1024;
 SELECT tt_meta('tt1024_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_check('tt1024_v');
@@ -1008,7 +1008,7 @@ ANALYZE tt3072;
 SELECT tt_meta('tt3072_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 3 runs in a refine item's place
+ format 1, flags 3, a locator, 3 runs in a refine item's place
 (1 row)
 
 SELECT tt_check('tt3072_v');
@@ -1046,7 +1046,7 @@ ANALYZE tth;
 SELECT tt_meta('tth_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_check('tth_v');
@@ -1114,7 +1114,7 @@ ANALYZE ttm;
 SELECT tt_meta('ttm_v');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_check('ttm_v');
@@ -1143,7 +1143,7 @@ CREATE INDEX ttm_e ON ttm USING lionvec ((v + v)) WITH (partitions = 4);
 SELECT tt_meta('ttm_e');
                             tt_meta                             
 ----------------------------------------------------------------
- format 5, flags 1, no locator, 0 runs in a refine item's place
+ format 1, flags 1, no locator, 0 runs in a refine item's place
 (1 row)
 
 SELECT tt_pages('ttm_e', 6) AS loc_pages;
@@ -1202,7 +1202,7 @@ CREATE INDEX tti_v ON tti USING lionvec (v) WITH (partitions = 4);
 SELECT tt_meta('tti_v');
                             tt_meta                             
 ----------------------------------------------------------------
- format 5, flags 1, no locator, 0 runs in a refine item's place
+ format 1, flags 1, no locator, 0 runs in a refine item's place
 (1 row)
 
 SELECT tt_pages('tti_v', 6) AS loc_pages, tt_pages('tti_v', 7) AS locdir_pages;
@@ -1218,7 +1218,7 @@ CREATE INDEX ttt_v ON ttt USING lionvec (v) WITH (partitions = 2);
 SELECT tt_meta('ttt_v');
                             tt_meta                             
 ----------------------------------------------------------------
- format 5, flags 1, no locator, 0 runs in a refine item's place
+ format 1, flags 1, no locator, 0 runs in a refine item's place
 (1 row)
 
 SELECT tt_pages('ttt_v', 6) AS loc_pages, tt_pages('ttt_v', 7) AS locdir_pages;
@@ -1234,7 +1234,7 @@ CREATE INDEX ttu_v ON ttu USING lionvec (v) WITH (partitions = 2);
 SELECT tt_meta('ttu_v', 'init');
                             tt_meta                            
 ---------------------------------------------------------------
- format 5, flags 2, a locator, 2 runs in a refine item's place
+ format 1, flags 2, a locator, 2 runs in a refine item's place
 (1 row)
 
 SELECT tt_pages('ttu_v', 6, 'init') AS loc_pages, tt_pages('ttu_v', 7, 'init') AS locdir_pages;
@@ -1301,7 +1301,7 @@ VACUUM (FREEZE, ANALYZE) ttc_in;
 SELECT tt_meta('ttc_v') AS toast, tt_meta('ttc_in_v') AS inline;
                              toast                             |                             inline                             
 ---------------------------------------------------------------+----------------------------------------------------------------
- format 5, flags 3, a locator, 2 runs in a refine item's place | format 5, flags 1, no locator, 0 runs in a refine item's place
+ format 1, flags 3, a locator, 2 runs in a refine item's place | format 1, flags 1, no locator, 0 runs in a refine item's place
 (1 row)
 
 /*

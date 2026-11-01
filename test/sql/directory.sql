@@ -214,20 +214,6 @@ SELECT count(*) FROM lion_ff WHERE k = 31337;
 DROP TABLE lion_ff;
 
 -- ---------------------------------------------------------------------
--- 6. `buckets` is accepted and ignored, with a NOTICE.
--- ---------------------------------------------------------------------
-
-SET client_min_messages = notice;
-CREATE TABLE lion_buckets (k int);
-CREATE INDEX lion_buckets_k ON lion_buckets USING lion (k) WITH (buckets = 128);
-SELECT reloptions FROM pg_class WHERE relname = 'lion_buckets_k';
--- and it changes nothing about the shape of the index
-SELECT directory_height, leaf_pages, internal_pages
-	FROM lion_index_stats('lion_buckets_k');
-DROP TABLE lion_buckets;
-SET client_min_messages = warning;
-
--- ---------------------------------------------------------------------
 -- 7. The INTERNAL levels are packed independently of `fillfactor`.
 --
 -- fillfactor is about leaving room on the LEAVES for later inserts.  Applied

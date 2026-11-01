@@ -9842,13 +9842,13 @@ longer than a batch included.
   Distribution through the PostgreSQL Extension Network is how the two environments below will
   install it, so it comes first. Done:
   - `META.json` (PGXN Meta Spec 1.0.0; `validate_pgxn_meta` from PGXN::Meta::Validator 0.16 says
-    OK, and CI runs it): distribution `pg_lion` 0.1.0, `release_status` testing (beta),
+    OK, and CI runs it): distribution `pg_lion` 0.3.0, `release_status` testing (beta),
     license `postgresql`, `provides` pg_lion and pg_lion_citext, PostgreSQL >= 16.0.0 as a build
     and runtime prerequisite (the minimum since eb1579e, `src/lion_compat.h`), `citext` runtime-
     recommended and test-required (only the companion needs it, and its control file's
     `requires = 'pg_lion, citext'` enforces that at CREATE EXTENSION), resources and tags.
   - Versions: see the addendum "Extension versions" below. A release's extension version is
-    META.json's semver, `0.1.0`; between releases every change to an install script is a new
+    META.json's semver, `0.3.0`; between releases every change to an install script is a new
     `X.Y.Z-devN` with an upgrade script to it.
   - `make dist`: `git archive` of the committed HEAD into `pg_lion-<version>.zip` (META.json,
     README, LICENSE, DESIGN, Makefile, control and SQL files, `src/`, `test/{sql,expected,isolation,
@@ -9880,7 +9880,7 @@ longer than a batch included.
     to see a release that is not stable).
   - Version scripts: done 2026-10-28, see the addendum "Extension versions" below. Any upgrade
     that leaves existing indexes needing REINDEX - a format-version bump, or a support function
-    or operator changed under an index, as the catch-up from 0.1 does - must say so in the
+    or operator changed under an index - must say so in the
     release notes (an upgrade script's NOTICE is not seen: the server runs extension scripts with
     `client_min_messages` at WARNING or above). (The
     seven pre-18 opclasses of the addendum below need no repair there: lionvalidate() accepts
@@ -10007,7 +10007,7 @@ The rules (`test/upgrade/lint.py` checks them in CI, upgrade.yml):
 The extensions are versioned separately: a change to pg_lion's SQL does not bump pg_lion_citext.
 
 `test/upgrade/run.sh` (also `make upgradecheck`) proves the scripts: for every version of every
-install script in the git history, it installs that script under its version, creates an index
+install script in the git history from `test/upgrade/floor` on, it installs that script under its version, creates an index
 on every operator class it has (so that the update meets families in use), runs `ALTER EXTENSION
 UPDATE`, and requires `test/upgrade/catalog.sql`'s dump of the extension - its members, every
 function's signature, result, volatility, parallel safety, strictness, ACL and comment, every
@@ -10021,19 +10021,13 @@ for another major (before 2026-09-24 they named `hashbool()`, 18's) or naming a 
 library no longer has is skipped and reported; any other install failure fails the check, and
 the newest earlier one must install.
 
-The catch-up from `0.1` (`pg_lion--0.1--0.1.0-dev1.sql`) is the one upgrade script that cannot
-know what it upgrades from: `0.1` was never released, and its script changed many times under
-that one name. It runs today's install script into a scratch schema and reconciles:
-a function whose arguments and result match is replaced in place (keeping grants and dependent
-views), any other is dropped and today's moved in; an operator family no index uses is dropped and
-today's moved in; one an index uses is brought level member by member, and a support function or
-operator its class holds that changed (array_ops' and tsvector_ops' extraction functions became
-lion's own on 2026-10-19) is switched in `pg_amproc`/`pg_amop` and `pg_depend`, since no DDL can
-replace a member a class holds. Such indexes were written in a format this build refuses anyway,
-so they are rebuilt with REINDEX after the update. A family that is gone but that indexes still
-use (`tsvector_pos_ops`, briefly in 2026-10) is detached from the extension with a WARNING rather
-than dropped with its indexes. pg_lion_citext's and pg_lion_vector's catch-ups only add what their
-scripts gained: citext_ops' strategies 6 to 10 and support function 4, and the halfvec classes.
+**0.3.0 starts afresh** (2026-11-01). Each extension's SQL is one install script,
+`<ext>--0.3.0.sql`, with no upgrade script from any earlier version, and the on-disk formats start
+again at 1: the lion meta page's `LION_VERSION` and lionvec's `LIONVEC_VERSION`. An index written by
+an earlier build is refused with a hint to REINDEX it (§21, "An index of another format"), and an
+extension installed by one is dropped and created again. `test/upgrade/floor` names 0.3.0: `run.sh`
+skips install scripts in the history older than it, and `lint.py` makes no comparison with a base
+branch whose version is older, so the rules above apply from 0.3.0 on.
 
 ### §23 addendum: hook coexistence (verified 2026-09-23)
 

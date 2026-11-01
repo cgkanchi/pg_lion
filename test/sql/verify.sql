@@ -557,9 +557,9 @@ SELECT lion_index_verify('lion_vfy_bad_limit');
 SET client_min_messages = warning;
 
 -- (13) the meta page's other words, each in an index of its own: sliced key
--- columns on a version 14 page (36, the word that was the bucket count,
--- DESIGN.md §51; every reader refuses it), a WAL mode the format does not have (56), an
--- order flag it does not have (bit 8 of 60), and its two counts of pages -
+-- columns the index does not have (36, DESIGN.md §51), a WAL mode the format
+-- does not have (56), an order flag it does not have (bit 8 of 60), and its
+-- two counts of pages -
 -- the directory's (52), which can be no page at all or fewer than the
 -- directory walk finds (lion_vfy_badd's has a root and six leaves), and the
 -- pages the last VACUUM could not hand out (12 of block 0's special area),
@@ -577,7 +577,7 @@ BEGIN
 END $$;
 SET client_min_messages = error;
 SELECT what, lion_vfy_meta(tbl, pos, val) AS verify
-  FROM (VALUES ('sliced columns, v14', 'lion_vfy_bad'::regclass, 36, lion_vfy_le32(5)),
+  FROM (VALUES ('sliced columns', 'lion_vfy_bad'::regclass, 36, lion_vfy_le32(5)),
 			   ('wal mode', 'lion_vfy_bad', 56, lion_vfy_le32(7)),
 			   ('order flags', 'lion_vfy_bad', 61, '\x01'::bytea),
 			   ('no directory pages', 'lion_vfy_bad', 52, lion_vfy_le32(0)),
