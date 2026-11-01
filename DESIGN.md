@@ -4925,12 +4925,15 @@ times slower.
   restrictions keep (`estimate_num_groups()`), and knows nothing of a list on the column: on a 4M-row
   table, 1,200 ids were estimated at 12,826 groups. A GROUP BY of a column can have no more
   groups than a `col = ANY (const array)` of it lists, nor more than one under a `col = const`, so
-  the node's estimate of each grouping column's groups is held to that
-  (`lion_group_list_bound()`), the non-NULL elements counted, repeats included, which is never
-  below the groups there can be. The column is matched under binary-compatible relabels alone:
-  a value-changing cast (a numeric column compared as float8) may map many values to one
-  constant. Of two grouping columns, one of them bounded, the node's groups are held to the
-  product. Only the node's own rows: an Agg core puts above other paths keeps core's estimate.
+  the node's groups are held to that (`lion_group_list_bound()`), the non-NULL elements counted,
+  repeats included, which is never below the groups there can be. The column is matched under
+  binary-compatible relabels alone - a value-changing cast (a numeric column compared as float8)
+  may map many values to one constant - and the equality under the grouping's collation alone,
+  since a case-insensitive one bounds nothing of a GROUP BY under "C". Of two grouping columns,
+  one of them bounded, the node's groups are held to the product. The bound is of the output
+  only: each column's estimate of its entries, which prices the walks (the nested loop of §20
+  visits every pair whatever the list), the top k and the decoded walk, is core's. Nor is it
+  anyone else's: an Agg core puts above other paths keeps core's estimate.
 - **Each group's work.** It was priced as a merge of the WHERE's sources at every group, each
   probed in memory (`LION_MEMORY_PROBE_COST`). The executor does not do that: once a group's count
   would read as much as the WHERE, it collects the WHERE once (`WHERE Sets Collected: 1`) and ANDs

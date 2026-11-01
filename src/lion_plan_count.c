@@ -357,8 +357,12 @@ typedef struct LionCountPathBuild
 	Oid			groupcoll[LION_MAX_GROUPCOLS];	/* the grouping's collation */
 	bool		groupvalueout[LION_MAX_GROUPCOLS];
 	double		groupest[LION_MAX_GROUPCOLS];
-	bool		groupbounded;	/* a restriction bounds some groupest[g]
-								 * (lion_group_list_bound()) */
+	double		groupbound[LION_MAX_GROUPCOLS];	/* the most groups a
+												 * restriction leaves
+												 * groupvar[g], or -1
+												 * (lion_group_list_bound()):
+												 * of the output alone, not
+												 * the entries a walk visits */
 	int			ngroup;
 	bool		decode;			/* three or more columns: the decoded walk
 								 * of DESIGN.md §34 counts them */
@@ -3695,9 +3699,11 @@ lion_group_bound_arg(Node *arg)
  * is matched under binary-compatible relabelling alone
  * (lion_group_bound_arg()): a cast that changes the value - a numeric column
  * compared as float8 - may map many of the column's values to one constant.
+ * And under the grouping's own collation, coll, alone: a case-insensitive
+ * equality bounds nothing of a GROUP BY under "C", whose groups it may merge.
  */
 static double
-lion_group_list_bound(RelOptInfo *rel, Node *var)
+lion_group_list_bound(RelOptInfo *rel, Node *var, Oid coll)
 {
 	double		bound = -1.0;
 	ListCell   *lc;
@@ -3709,6 +3715,10 @@ lion_group_list_bound(RelOptInfo *rel, Node *var)
 		Node	   *left;
 		Node	   *right;
 		double		n;
+
+		/* the equality's collation is the grouping's, or neither has one */
+		if (exprInputCollation(clause) != coll)
+			continue;
 
 		if (IsA(clause, OpExpr) &&
 			list_length(((OpExpr *) clause)->args) == 2 &&
@@ -3801,15 +3811,9 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	for (g = 0; g < cx->ngroup; g++)
 	{
 		Node	   *gv = lion_vcol_unvar((Node *) cx->groupvar[g]);
-		double		bound = lion_group_list_bound(input_rel, gv);
 
 		cx->groupest[g] = estimate_num_groups(root, list_make1(gv),
 											  input_rel->rows, NULL, NULL);
-		if (bound >= 0.0)
-		{
-			cx->groupest[g] = Max(Min(cx->groupest[g], bound), 1.0);
-			cx->groupbounded = true;
-		}
 	}
 
 	/*
@@ -3845,6 +3849,12 @@ lion_count_path_targets(LionCountPathBuild *cx)
 			cx->groupest[h] = tn;
 		}
 	}
+	/* ... and the most groups a restriction leaves each, in that order */
+	for (g = 0; g < cx->ngroup; g++)
+		cx->groupbound[g] =
+			lion_group_list_bound(input_rel,
+								  lion_vcol_unvar((Node *) cx->groupvar[g]),
+								  cx->groupcoll[g]);
 	if (cx->ngroup > 0)
 		cx->driveattno = cx->groupattno[0];
 
@@ -3995,7 +4005,9 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 
 	/* ---- build the path ---- */
 	if (cx->ngroup == 1)
-		cx->numgroups = cx->groupest[0];
+		cx->numgroups = (cx->groupbound[0] >= 0.0) ?
+			Max(Min(cx->groupest[0], cx->groupbound[0]), 1.0) :
+			cx->groupest[0];
 	else if (cx->ngroup >= 2)
 	{
 		List	   *vars = NIL;
@@ -4010,13 +4022,19 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 		 * restriction gives one: the estimate stands otherwise, extended
 		 * statistics' included
 		 */
-		if (cx->groupbounded)
 		{
 			double		bound = 1.0;
+			bool		bounded = false;
 
 			for (g = 0; g < cx->ngroup; g++)
-				bound *= cx->groupest[g];
-			cx->numgroups = Min(cx->numgroups, bound);
+			{
+				bounded |= (cx->groupbound[g] >= 0.0);
+				bound *= (cx->groupbound[g] >= 0.0) ?
+					Max(Min(cx->groupest[g], cx->groupbound[g]), 1.0) :
+					cx->groupest[g];
+			}
+			if (bounded)
+				cx->numgroups = Max(Min(cx->numgroups, bound), 1.0);
 		}
 	}
 	else if (cx->sumall && cx->rangevar != NULL)

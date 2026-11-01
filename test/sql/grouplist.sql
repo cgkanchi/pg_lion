@@ -107,7 +107,9 @@ SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
 	WHERE s @@ 'cy1 | cy2' AND c = ANY (%L::uuid[] || '{NULL}'::uuid[] || %L::uuid[]) GROUP BY c$q$,
 	lion_gllist(100), lion_gllist(100)), 400);
 -- an equality pins the group to one; two columns, one listed, at most the
--- list's values times the other's
+-- list's values times the other's where the node is chosen - a walk of the
+-- first column's entries visits every one of them, listed or not, and is
+-- priced so
 SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
 	WHERE s @@ 'cy1 | cy2' AND c = %L::uuid GROUP BY c$q$,
 	(SELECT c FROM lion_gl GROUP BY c ORDER BY count(*) DESC, c LIMIT 1)), 1);

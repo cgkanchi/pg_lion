@@ -123,7 +123,9 @@ SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
 (1 row)
 
 -- an equality pins the group to one; two columns, one listed, at most the
--- list's values times the other's
+-- list's values times the other's where the node is chosen - a walk of the
+-- first column's entries visits every one of them, listed or not, and is
+-- priced so
 SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
 	WHERE s @@ 'cy1 | cy2' AND c = %L::uuid GROUP BY c$q$,
 	(SELECT c FROM lion_gl GROUP BY c ORDER BY count(*) DESC, c LIMIT 1)), 1);
@@ -135,9 +137,9 @@ SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
 SELECT lion_glcmp(format($q$SELECT c, w, count(*) FROM lion_gl
 	WHERE s @@ 'cy1 | cy2' AND c = ANY (%L::uuid[]) GROUP BY c, w$q$,
 	lion_gllist(50)), 300);
-                         lion_glcmp                          
--------------------------------------------------------------
- Finalize HashAggregate, groups within the list, same answer
+         lion_glcmp         
+----------------------------
+ HashAggregate, same answer
 (1 row)
 
 DROP FUNCTION lion_glcmp(text, int);
