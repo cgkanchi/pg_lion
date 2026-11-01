@@ -2255,8 +2255,7 @@ Planner integration
     time the value is unknown, so `clause_selectivity()` gives the estimate it gives any non-Const
     comparison; at run time a NULL value selects no rows, which every operator involved agrees with
     by being strict.
-  - **So does any expression an index scan would take as a run-time key** (2026-09-27, a
-    real-workload benchmark). A time window is written `ts >= now() - interval '90 days'` or `d >=
+  - **So does any expression an index scan would take as a run-time key** (2026-09-27). A time window is written `ts >= now() - interval '90 days'` or `d >=
     current_date - 30`, and neither is a Const or a Param: `eval_const_expressions()` folds only
     immutable functions, and `now()`, `current_date` and `timestamptz` arithmetic (which depends on
     the time zone) are stable. Such a clause was declined before any cost was asked, on the filter
@@ -3183,7 +3182,7 @@ Every lion constant used to be fitted on the assert-enabled development build (-
 whose assertions inflate lion's own code far more than core's - so each of them was off, against
 core's units, by a factor nobody knew. This pass fitted them again on a RELEASE build: PostgreSQL
 18.6 at -O2 without assertions, on a 4-core, 15 GB VM, `shared_buffers` 5 GB with every relation
-of the test database resident (the production target is warm), `work_mem` 64 MB, and every core
+of the test database resident (the case the model is fitted for is warm), `work_mem` 64 MB, and every core
 cost GUC at its default (`random_page_cost` 4, `seq_page_cost` 1, the `cpu_*` and parallel costs as
 shipped). Numbers in this section and in the cost sections that cite it are from that build and
 machine; §31 has the data sets and the decision matrix. The first measurements are medians of five
@@ -6088,9 +6087,8 @@ which rescans the node partition by partition.
 
 ### A parent pruned to one leaf (2026-10-26)
 
-An application names the partitioned table, and plan-time pruning leaves it one leaf: every
-statement of a private workload names one `(a, b)` pair of a table LIST-partitioned by the first
-and sub-partitioned by the second, into thousands of leaves. The nodes that scan
+An application names the partitioned table, and plan-time pruning leaves it one leaf: a statement
+names one value of each partition key of a table partitioned into many leaves. The nodes that scan
 one relation got the leaf: `set_rel_pathlist_hook` runs for each partition
 (`RELOPT_OTHER_MEMBER_REL`), LionOrdered and LionBtreeScan plan on it (§30.11, §40.10), and core's
 Append of that one child costs nothing (`create_append_path()` takes the child's cost and pathkeys)
@@ -6098,7 +6096,7 @@ and is elided (`set_append_references()`), so the plan is the leaf's. The join n
 `set_join_pathlist_hook` is called with the parent - `reloptkind` RELOPT_BASEREL, `rte->inh`, no
 `indexlist` of its own, its paths an Append - and `oj_side_ok()` refused it, so a query naming the
 parent got core's plan where the same query naming the leaf got LionOrderedSplit over
-LionOrderedJoin, and on the workload ran many times slower, some statements timing out.
+LionOrderedJoin, and ran many times slower.
 
 The gate is one, shared, in lion_plan_partition.c, so that a node supports a partitioned table by
 asking it rather than by a rule of its own:
@@ -13730,8 +13728,8 @@ a range costs". The nested loop's warm cache, which its cost does not assume, is
 
 ### A dimension that is a join (2026-09-28)
 
-A benchmark's star queries over three tables timed out (past 120 s) where the same queries over two
-tables ran in 0.2 to 0.4 s through the node. Two shapes, over a dimension `d` and two facts:
+Star queries over three tables timed out where the same queries over two tables ran in well under
+a second through the node. Two shapes, over a dimension `d` and two facts:
 
     -- (A) a dimension semi-joined to two facts
     SELECT count(*) FROM dim d
@@ -21046,8 +21044,8 @@ changes what VACUUM and inserts maintain and the readers' disjointness argument,
 
 ### The price of a probe that does not fit (2026-10-19)
 
-A production workload counted a 90-day window on a near-unique timestamp with summaries, beside an
-equality and a multi-key overlap, on a heap the timestamp lies in no order on. The count was priced
+A count of a range on a near-unique timestamp with summaries, beside an equality and a multi-key
+overlap, on a heap the timestamp lies in no order on. The count was priced
 above a plain scan of the same index feeding `count(*)` and was not chosen. Reproduced on a release
 build over 20M rows: 729,000 heap pages, 11,392 container keys. Each summary of 4,096 rows is at
 some 3,440 of them, one or two rows at each. The equality holds half the rows, and the overlap a
@@ -24791,8 +24789,8 @@ times the CPU and memory, which on four busy ones shows; shared, it is built onc
 So it is shared, and each builds its own only when it would not fit.
 
 **Built in parts** (2026-10-26). The first participant to need the set built it whole while the
-others waited, idle for the whole build - 1 to 2 s on the 85 GB dimension of §40.10, every worker
-of the Gather waiting on one. An AND or an OR of sets is decided one container key at a time, so
+others waited, idle for the whole build - seconds on a dimension far larger than memory (§40.10),
+every worker of the Gather waiting on one. An AND or an OR of sets is decided one container key at a time, so
 the set's part at a range of container keys is the AND or the OR of its leaves' parts there, and
 the whole set is its parts in key order: the participants can build it a range each, with nothing
 to merge.
@@ -24850,8 +24848,8 @@ participant:
 The workers start a few milliseconds after the leader, so on a build of ten the leader builds
 most of the parts; a range's every part walks its 3,000 entries again, 25 to 30 ms a part on this
 table, so that more parts cost more than they divide. At the default part size the table's set
-is 5 parts, 88 to 104 ms for the range against 130 to 171 whole. A build of seconds - the 85 GB
-dimension's - leaves the workers' start a smaller share of it; this machine holds no such table to
+is 5 parts, 88 to 104 ms for the range against 130 to 171 whole. A build of seconds - a dimension far
+larger than memory - leaves the workers' start a smaller share of it; this machine holds no such table to
 measure. The parts take the memory one set took, where each participant building its own took it
 as many times over.
 
@@ -24875,9 +24873,9 @@ The shape is
 
 where the fact side's filter leaves few rows against the dimension's, so that core's plan is a
 nested loop over them into the dimension's primary key: an Index Scan that fetches each outer row's
-dimension row from the heap to test the filter on it, and throws most of them away. On a production
-table of this shape - an 85 GB dimension heap, filters of array overlap, a bool and two enum
-equalities - that was 603,000 heap fetches, 77% of them rejected by the Filter, read cold. Nothing
+dimension row from the heap to test the filter on it, and throws most of them away. On a dimension
+of this shape far larger than memory, with several filters, that is hundreds of thousands of heap
+fetches, most of them rejected by the Filter, read cold. Nothing
 of §40 so far could be the loop's inner side: every path the node built was unparameterized (§30.8
 declined parameterized paths, "an inner side needs no order"), and the walk of the whole primary key
 under a hash join reads every entry of the key where the loop wants six hundred thousand. What the
@@ -25095,7 +25093,7 @@ primary key - with lion indexes on an array, a bool and two enum columns and a `
 (id)` B-tree, and a 200,000-row fact table with a lion tsvector index and every fiftieth key NULL:
 every query run through the probe (hash and merge joins off, lion's paths priced at a thousandth)
 and through the ordinary plan (the walks off), the answers compared as multisets, the plan's shape
-and Index Cond named. The production shape, chosen with nothing disabled (`Index Entries Walked:
+and Index Cond named. The target shape, chosen with nothing disabled (`Index Entries Walked:
 714`, `Lion Set Hits: 135`, `Heap Fetches: 0`, the set built once), and core's plan with the switch
 off; a few outer rows, NULL outer keys, a LEFT JOIN and an empty set; repeated outer keys with a
 Memoize (`Hits: 26572  Misses: 2000`, two thousand walks) and without (28,572 walks), the set built
@@ -25116,7 +25114,7 @@ the clause was written. test/isolation/btreescan_param_serializable.spec is the 
 
 **Measured** (2026-10-23; PostgreSQL 16.15, the dev cluster: `shared_buffers` 2 GB, a VM of four
 cores and 15 GB shared with other work; warm, the tables in the OS cache; EXPLAIN (ANALYZE, TIMING
-OFF), medians of five or seven). Two synthetic dimensions with the production shape's filters - an
+OFF), medians of five or seven). Two synthetic dimensions with the target shape's filters - an
 array overlap of five tags of ten, a bool true in two thirds of the rows, enum equalities of 70% and
 80%: 18.7% of the rows pass - each joined from a fact table whose tsvector search picks the outer
 rows, `GROUP BY d.id ORDER BY n DESC LIMIT 100`: 6M rows of 410 bytes (a 2.3 GB heap, a 129 MB
@@ -25141,10 +25139,10 @@ same keys without a filter (2.56 s for 600,000). Warm, then, the probe ties core
 0.1 to 0.3% of the 50M rows and is 1.1 to 6.7 times faster where core's plan reads the dimension's
 heap whole. What it is for is the cold case, which a table in the OS cache cannot show: at 150,000
 outer rows of the 50M table core's Index Scan read 139,693 pages from outside `shared_buffers` and
-the probe 61,753, the primary key's leaves and the lion indexes; on a dimension of 85 GB each of
+the probe 61,753, the primary key's leaves and the lion indexes; on a dimension far larger than memory each of
 core's is a synchronous read from the device, and the probe reads none of them. A
 500M-row dimension was not built: its set's build grows with the heap's containers, 0.8 to 1.5 us
-each of each posting set, some 1 to 2 s for 85 GB under four filters.
+each of each posting set, seconds for a dimension far larger than memory.
 
 ### 40.11 A correlated subquery's calls (2026-10-23)
 
@@ -29774,8 +29772,8 @@ cells (§10, "Counts by cells") counts one table; the nested loop's probe (§40.
 that covers what the query reads of the dimension, and the group keys read the lion-indexed
 columns themselves. Core's plan is a nested loop over the fact's rows into the dimension's primary
 key - an Index Scan a fact row, the dimension row fetched from the heap for the Filter and for the
-group keys' columns - and on a production dimension of 87 GB that was two million random heap
-pages, 140 s cold. A hash join reads the dimension's WHERE whole, which is most of that heap.
+group keys' columns - and on a dimension far larger than memory that is millions of random heap
+pages, minutes cold. A hash join reads the dimension's WHERE whole, which is most of that heap.
 
     HashAggregate
       Group Key: CASE WHEN ((d.region = ANY ('{north,east}'::text[]))) THEN 'ne'::text WHEN ((d.tier = 1)) THEN 't1'::text ELSE 'other'::text END, f.channel
@@ -30106,7 +30104,7 @@ where the fact rows are few against the dimension's WHERE; the descent's price, 
 index scan's, makes it some 1.7 times too cheap against the hash join's in a warm cache, so that
 at 300,000 rows - 15% of the dimension - it is chosen and runs 1.6 times the hash join's time. Cold
 is not measured; the pages each plan reads say it goes the other way: the hash join reads the
-WHERE's heap pages, half of the 422 MB here and most of an 87 GB heap, and the nested loop a random
+WHERE's heap pages, half of the 422 MB here and most of a heap far larger than memory, and the nested loop a random
 heap page a fact row, where the node reads the primary key's leaves and the lion indexes and no
 heap page of an all-visible dimension.
 
@@ -31596,7 +31594,7 @@ nothing faster that the planner was told the truth about. So four of §39's corr
 their place: the hash join's rate, the Memoize under a LIMIT, and a bitmap heap scan's and a nested
 loop's cold reads; the switch stays on until each is priced as work. The skew factors and the rates
 other than the hash join's moved nothing here (no key of these tables is skewed, and no count
-competes with a hash aggregate); whether they earn theirs is the private workload's to say.
+competes with a hash aggregate); whether they earn theirs is for a workload that has them to say.
 
 ### The heap probe (`pg_lion.enable_heap_probe`)
 
