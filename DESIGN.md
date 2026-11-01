@@ -4769,12 +4769,51 @@ datum: deconstruct it, skip NULL elements, look up each value and emit its set. 
 filtered there - set semantics make them harmless, they only cost a second lookup.
 
 Count pushdown: accept `ScalarArrayOpExpr` with useOr = true whose operator is strategy 1 of the
-index opfamily and whose array is a non-NULL Const of at most LION_MAX_ARRAY_ELEMS = 1000 elements;
-the clause's posting set is the UNION of the elements' sets. Values are deduped, and since the
-disjoint-sum short-circuit below they are deduped **by entry** and not merely bytewise (see there).
-An empty array, an all-NULL one, or a list none of whose values has an entry means
-zero rows. Longer lists are left to the ordinary plan, because every listed value needs a posting
-set of its own and each may hold a buffer pin for as long as the node runs.
+index opfamily and whose array is a non-NULL one-dimensional Const of at most LION_MAX_LIST_ELEMS =
+100,000 elements; the clause's posting set is the UNION of the elements' sets. Values are deduped,
+and since the disjoint-sum short-circuit below they are deduped **by entry** and not merely bytewise
+(see there). An empty array, an all-NULL one, or a list none of whose values has an entry means
+zero rows.
+
+**Long lists.** The cap was a thousand while every listed value's set was located at once, each
+holding a pin for as long as the node ran. Neither holds now: the pins are bounded by the list pin
+budget ("The pin budget" below), and a list longer than `lion_array_batch_size()` is located a
+batch at a time or collected into one union ("A list too long to locate at once" below), as a
+parameter's array of any length always was. What a literal's length still costs is a Datum and a
+hash per value in the node, and the planner's work over the list (core's selectivity of an IN list
+walks it once per value, and the parser has built it already); the cap bounds that. Measured on a
+release build of PostgreSQL 18 at 1M rows, in ten count shapes (plain, AND, OR, GROUP BY on the
+list's column and another, count(DISTINCT), an FK-side join, a partitioned table, a partitioned
+GROUP BY), lists of 1,000 to 100,000 values: every answer the same with and without the pushdown,
+and the backend's peak memory at 100,000 values 114 to 210 MB against 83 to 161 MB with the pushdown
+off (the list's text and core's planning of it are most of both; the pushdown's planning adds 30 to
+50 MB, some 400 bytes a value, whether or not it is chosen). The cost model chooses: a 10,000-value
+list on a 5,000-key column without a B-tree counted in 3.5 ms against a sequential scan's 60, and
+`GROUP BY k` over a 30,000-value list in 7.3 ms against 68; with a B-tree on the column the
+index-only scan is chosen from about 3,000 values, which is the faster plan there.
+`LION_MAX_ARRAY_ELEMS` = 1000 stays the bound where sets really are held at once: an OR's leaves
+(§19), a rewritten `NOT IN` (§10) and the frequencies the planner looks up (§33).
+
+A list longer than those thousand frequencies is estimated by core as one equal share of the
+column's rows per listed value, which for ids from elsewhere, few of them in this table, is many
+times its rows; the count's sets were priced for them (`lion_cost_set_clause()`), and from about
+12,000 such values on that 1M-row table the sequential scan was chosen where the count was ten
+times faster. The count's price now takes the list's rows from the index instead
+(`lion_list_sample_sel()`): `LION_LIST_SAMPLE_KEYS` (1,000) values evenly spaced over the list,
+each counted by a descent of the directory as §33 counts a listed value (`lion_key_ntids()`), and
+their rows scaled to the list's length. It is made where §33 would serve the values' frequencies -
+`pg_lion.enable_index_mcv` on, a literal list of the key's type compared by its equality, not a
+multi-key column, an index neither partial nor hypothetical, a user who may read every row of the
+column - and once a list a planner run (`LionProbeCache.listsels`). Core's estimate of the
+relation's rows is left as it is: this prices lion's sets, which is what chose against the count.
+A value listed more than once is counted once, as the executor looks it up once. Measured as above
+(lists of every 17th integer over a 5,000-key column, 294 of the values in it): 30,000 values
+counted in 7.7 ms against the sequential scan's 53 and 70,000 in 16.5 ms against 59, both now
+chosen; at 100,000 the sequential scan still is, where the count takes 22 ms. What is left is the
+price of each value's search (`LION_DESCENT_COST` a value), the same for a value without an entry,
+and a list's values walked in order find their leaves cheaper than that; it is a constant every
+list's lookups share, and is left as it is. `test/sql/isectlist.sql` pins a 5,000-value list of
+294 present values counted, and the sequential scan chosen without the sample.
 
 ### The disjoint-sum short-circuit
 
@@ -4911,7 +4950,8 @@ starved every other backend of buffers instead.
 So `lion_posting_set_lookup_many()` keeps pins on at most a BUDGET of distinct leaves, and the
 budget is the BACKEND's: every list it has located and not yet released draws on the same one, so
 two unbounded lists in a query share it rather than taking one each. It is the smaller of
-`LION_LOOKUP_MAX_PINS` = 1000, the longest list the planner takes as a literal, and an eighth of
+`LION_LOOKUP_MAX_PINS` = 1000, so that a list of up to a thousand values keeps every leaf it
+located pinned, and an eighth of
 the pool the index is read into: shared_buffers, or for a TEMPORARY index the backend's own
 temp_buffers (as few as 100), which the first version of this budget did not tell apart - a list
 over a temporary table pinned up to a thousand local buffers of 1024 and failed with "no empty
@@ -5248,8 +5288,8 @@ size" where the ordinary plan answers. Two things now:
 - **A plain count locates it a batch at a time** (`lion_array_batch_prepare()`,
   `lion_count_batched()`). When the node counts the relation as one row - no GROUP BY, no
   count(DISTINCT) walk, no FK-side join - and an IN list that is a source of its own has more
-  values than `lion_array_batch_size()` (a work_mem of 256-byte sets, never fewer than the thousand
-  a literal may have), the list is not located with the other clauses. Its values are sorted as a
+  values than `lion_array_batch_size()` (a work_mem of 256-byte sets, never fewer than a
+  thousand), the list is not located with the other clauses. Its values are sorted as a
   lookup sorts them (`lion_probe_sort()`) and kept with their hashes, and the count locates a batch,
   counts it with the other sources, releases it - pins and all - and goes on to the next. The count
   of the list is the SUM of the batches' counts for the reason lion_run_batches() gives one level
@@ -7868,8 +7908,8 @@ NULL)) OR (country = 'c1')` - which is what EXPLAIN prints. The union of the arm
 rows, and nothing downstream changes: the arms are ordinary arms, flattened and carried as before.
 Distributing repeats a term in every arm it is distributed into, and each repetition is a leaf of its
 own - its own lookup, priced as such, and its own set of the union - and it multiplies arms: an AND of
-k two-way ORs is 2^k arms of k leaves. So the leaves of one OR are bounded by what an IN list's sets
-are bounded by, LION_MAX_ARRAY_ELEMS (§15), for the same reason: every set of the union may hold a
+k two-way ORs is 2^k arms of k leaves. So the leaves of one OR are bounded by LION_MAX_ARRAY_ELEMS
+(§15): every set of the union may hold a
 buffer pin for as long as the node runs, and a union's leaves are never materialized (above). Past
 it the query is declined; the bound applies to an OR as written as well, which no ordinary query
 comes near. The other option, an OR node inside an arm, would have kept a term to one lookup, at the
@@ -11982,7 +12022,7 @@ plan, and so is any other array a stable expression computes (`x = ANY
 (string_to_array(current_setting(...), ',')::int[])`). The cost model prices it two ways
 (`lion_cost_fkjoin_rel()`): collected, once per scan, at `estimate_array_length()`'s guess - an
 expression's array at its plan-time estimate, which the clause analysis puts in the clause (§10) -
-and probed, per dimension row, as the longest list a literal may be (LION_MAX_ARRAY_ELEMS). A
+and probed, per dimension row, as at least LION_MAX_ARRAY_ELEMS values (a literal at its length). A
 wrong guess about a scan's one-off work costs little; a wrong guess about a dimension row's costs
 that many times over, which is what the review measured. So the copy is what is chosen wherever it
 is the cheaper - priced spilled where it is not expected to fit - and a copy that does not fit at
@@ -18203,8 +18243,8 @@ with one:
   of the rest, as core takes them. The factor the probe finds for the part - its measure over
   core's estimate of the part - is the conjunction's, and the part is remembered as measured as
   well, which is what a wider conjunction of the run interpolates from (`lion_isect_part_factor()`).
-  A list of more than 32 values is never located for the probe (`lion_isect_scankey()`) and is taken
-  so too. Only a conjunction of which not two clauses fit is not measured: what the run measured of
+  A list of more than 32 values is measured by a sample of its values ("Long lists", below). Only a
+  conjunction of which not two clauses fit is not measured: what the run measured of
   its parts stands, or core's estimate.
 - **What a sample that met the AND in few containers says** (`lion_isect_take()`,
   `lion_isect_probe()`). The AND is made source by source at each sampled container, the driver
@@ -18253,6 +18293,32 @@ measured without the widest list, the 21 by the prefix the sample met often; the
 31 sets, and of the twelve conjunctions in one statement, within the run's budget; and, with three
 lion indexes of the same columns, three conjunctions of 32 sets in one statement each estimated at
 its relation's rows by the Bitmap Index Scan of whichever index the plan takes.
+
+**Long lists** (2026-10-31, `lion_isect_list_sample()`, `lion_isect_factor_run()`). A list of more
+than `LION_ISECT_MAX_SETS` (32) values was never located for the probe and was taken as independent
+of the rest of the AND, as core takes it. A list of ids chosen because they pass the other filters
+is the opposite of independent: every listed value's rows pass them, and core's product put a
+count over about a thousand such ids at a twentieth of its rows, which priced lion's plain scan for that
+many rows and chose it over the count. Such a list is now measured through
+`LION_ISECT_LIST_SAMPLE` (16) of its non-NULL values, evenly spaced over it: the sample is located
+and sought as a list of 16 values is, and what the probe measures of it is scaled by core's
+estimate of the whole list over core's estimate of the sample (at least one) - the clause's
+`scale`, applied to the measured rows, to the bounds a sample can rule out and raise to, to a
+measured part's rows, and to the driver's rows where it is the sample. A sample none of whose
+values has an entry says nothing of the list's other values, and its clause is left out of the
+measure as a clause too wide is, not taken as an AND that is empty. On `test/sql/isectlist.sql`'s
+table (100,000 rows, 200 hidden groups, a four-valued column that follows them), lion's estimate
+of the Bitmap Index Scan with the probe on and off:
+
+| conjunction | rows | probe | core |
+|---|---|---|---|
+| `c = 1` and 40 values of `g` all with `c = 1` | 20,000 | 20,000 | 5,000 |
+| `c = 2` and the same 40 values | 0 | 1 | 4,995 |
+| `c = 1` and 20 such values, 20 absent | 10,000 | 10,000 | 2,500 |
+| `c = 1` and 40 such values, 40 with `c = 3` | 20,000 | 10,000 | 10,000 |
+
+The last is core's estimate within `LION_ISECT_ERROR`, which the probe leaves as it is. On a synthetic
+table of 1M rows, that count is now estimated at 20,033 rows for its 20,033, where it had been 994.
 
 **The AND, as the count makes it** (2026-09-28, `lion_leapfrog()`). "One price for the AND of
 sets" prices a scan's AND as the count's merge, because the two make the same AND of the same sets.
@@ -22171,9 +22237,8 @@ for `$1`. A custom plan's value is a constant, and gets its frequency. `<>`, `NO
 DISTINCT FROM` are not looked up and do not refuse the column: their estimates are one minus the
 equality's.
 
-**The cap.** At most `LION_MCV_MAX_KEYS` distinct values of one column of one relation, 1,000 - the
-longest IN list the count pushdown takes as a literal (`LION_MAX_ARRAY_ELEMS`, §15), past which
-`lion_analyze_leaf()` declines a list. A column whose clauses name more is served as before. The
+**The cap.** At most `LION_MCV_MAX_KEYS` distinct values of one column of one relation, 1,000
+(`LION_MAX_ARRAY_ELEMS`, §15). A column whose clauses name more is served as before. The
 bound is on two costs: one descent per value, and core's estimate of each listed value, which walks
 the list once per value with the clause's operator - its time grows with the square of the list.
 Measured on the PostgreSQL 17 packages, best of five, planning `SELECT *` (a count, a join) of the

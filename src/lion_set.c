@@ -588,8 +588,8 @@ lion_probe_sort_unique(Datum *sorted, uint32 *hashes, int n, bool typbyval,
 /*
  * The most values of one IN list a count locates at once (DESIGN.md §15, "A
  * list too long to locate at once"): what a work_mem of located sets holds,
- * and never fewer than the longest list a literal may be, which is located
- * whole as it always was.
+ * and never fewer than LION_MAX_ARRAY_ELEMS, so that a list of a thousand
+ * values is located whole whatever work_mem says.
  */
 int
 lion_array_batch_size(void)
@@ -780,8 +780,8 @@ lion_posting_set_lookup_budgeted_col(Relation index, AttrNumber attno,
  * this backend has located and not yet released may keep pinned, all of them
  * together.  It is the smallest of
  *
- *	- LION_LOOKUP_MAX_PINS, 1000: the longest list the planner accepts as a
- *	  literal, so that a literal list pins exactly what it always did - a set
+ *	- LION_LOOKUP_MAX_PINS, 1000: so that a list of up to a thousand values
+ *	  keeps a pin on every leaf it located - a set
  *	  that is NOPIN costs a second descent in the disjoint sum and the visibility
  *	  map in an OR, and an ordinary query must not pay either;
  *	- an EIGHTH of the buffer pool the index is read into, so that one
@@ -1111,8 +1111,8 @@ lion_list_pin_return(LionPostingSet *ps)
  *	  values cost one pass over the leaves they live on instead of a thousand
  *	  random page reads (DESIGN.md §21);
  *	- duplicates are dropped in one pass over that order instead of by
- *	  comparing every value with every earlier one, which at the 1000 values
- *	  the planner allows is half a million datumIsEqual() calls.
+ *	  comparing every value with every earlier one, which at a thousand values
+ *	  is half a million datumIsEqual() calls.
  *
  * Duplicates are dropped TWICE OVER, and the second pass is the one that
  * matters (DESIGN.md §15).  The bytewise comparison comes first because it is

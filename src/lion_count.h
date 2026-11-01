@@ -68,14 +68,25 @@
 #define LION_GROUP_BATCH_MAX	256
 
 /*
- * An `IN` list longer than this is not pushed down: every listed value needs
- * its own posting set, and each of those may hold a buffer pin for as long as
- * the node runs (DESIGN.md §9).  A long list is also exactly the case where
- * the ordinary bitmap plan does well.  A list whose length the planner cannot
- * see is answered at any length, and one longer than this may be located a
- * batch at a time (lion_array_batch_size()).
+ * The most posting sets some shapes hold at once, each with a buffer pin for
+ * as long as the node runs (DESIGN.md §9): the leaves of an OR distributed
+ * into arms (lion_or_arms()), the conjuncts of a rewritten `NOT IN`
+ * (lion_all_as_and()) and of a multi-key `op ANY (array)`.  It is also the
+ * fewest values the executor locates in one batch of a long list
+ * (lion_array_batch_size()).
  */
 #define LION_MAX_ARRAY_ELEMS		1000
+
+/*
+ * The longest `IN` list whose length the planner can see - a literal array,
+ * an ARRAY[...] - that is pushed down (DESIGN.md §15, "Long lists").  A list
+ * longer than lion_array_batch_size() is located a batch at a time, or
+ * collected into one union, so its length costs no pins; what it does cost is
+ * a Datum and a hash per value in the node, and the planner's copies of the
+ * list.  A list whose length the planner cannot see (a parameter) is answered
+ * at any length.
+ */
+#define LION_MAX_LIST_ELEMS			100000
 
 /*
  * Instrumentation, reported by lion_index_count_stats() and by
