@@ -50,7 +50,7 @@
  * Format (DESIGN.md §44.2)
  * --------------------------------------------------------------------- */
 
-#define LIONVEC_MAGIC			0x4c56454d	/* "LVEM" */
+#define LIONVEC_MAGIC			0x4c565831	/* "LVX1" */
 #define LIONVEC_VERSION			1
 #define LIONVEC_METAPAGE		0
 

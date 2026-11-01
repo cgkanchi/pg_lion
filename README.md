@@ -305,10 +305,11 @@ column alone, `embedding IS NOT NULL` or a distance bound, is no such filter: it
 rows.
 A range over a column of many distinct values, a timestamp or a price, is a walk of every key it
 covers unless the column's lion index keeps summaries (`WITH (summaries = auto)`): at 10% of a
-million unique values, 45 ms before the first row without them and 3 ms with. The index is 1.9 GB to
-HNSW's 3.8 GB (the figures here are of a build with fewer partitions and `spill = off`, 1.7 GB;
-the defaults find more of the nearest rows at each margin), and since a query reads only the
-partitions it needs, it holds up when memory is short: with PostgreSQL held to
+million unique values, 45 ms before the first row without them and 3 ms with. Built with the defaults,
+the index is about 1.9 GB to HNSW's 3.8 GB. This section's measurements, from the 7.9 ms above to
+the memory figures below, are of a build with fewer partitions and `spill = off`, which is 1.7 GB;
+the defaults find more of the nearest rows at each margin. Since a query reads only the
+partitions it needs, lionvec holds up when memory is short: with PostgreSQL held to
 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took 51 ms and 767 pages (and 691 ms
 and 9,229 pages under the 1% filter, where lionvec read none).
 `vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are
