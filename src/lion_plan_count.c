@@ -3699,10 +3699,13 @@ lion_group_bound_arg(Node *arg)
  * is matched under binary-compatible relabelling alone
  * (lion_group_bound_arg()): a cast that changes the value - a numeric column
  * compared as float8 - may map many of the column's values to one constant.
- * And under the grouping's own equality, eqop, and collation, coll, alone: a
- * case-insensitive equality - a text column relabelled to citext, or one
- * compared under a nondeterministic collation - bounds nothing of a GROUP BY
- * under text's "C", whose groups it may merge.
+ * And under the grouping's own equality operator, eqop, and collation, coll,
+ * alone: a case-insensitive equality - a text column relabelled to citext, or
+ * one compared under a nondeterministic collation - bounds nothing of a GROUP
+ * BY under text's "C", whose groups it may merge; nor does a cross-type
+ * equality of the same family, which compares the column converted: a
+ * timestamp column against a timestamptz list matches two local times a
+ * daylight-saving gap maps to one instant.
  */
 static double
 lion_group_list_bound(RelOptInfo *rel, Node *var, Oid eqop, Oid coll)
@@ -3724,8 +3727,7 @@ lion_group_list_bound(RelOptInfo *rel, Node *var, Oid eqop, Oid coll)
 
 		if (IsA(clause, OpExpr) &&
 			list_length(((OpExpr *) clause)->args) == 2 &&
-			get_oprrest(((OpExpr *) clause)->opno) == F_EQSEL &&
-			equality_ops_are_compatible(((OpExpr *) clause)->opno, eqop))
+			((OpExpr *) clause)->opno == eqop)
 		{
 			left = lion_group_bound_arg(linitial(((OpExpr *) clause)->args));
 			right = lion_group_bound_arg(lsecond(((OpExpr *) clause)->args));
@@ -3738,9 +3740,7 @@ lion_group_list_bound(RelOptInfo *rel, Node *var, Oid eqop, Oid coll)
 		}
 		else if (IsA(clause, ScalarArrayOpExpr) &&
 				 ((ScalarArrayOpExpr *) clause)->useOr &&
-				 get_oprrest(((ScalarArrayOpExpr *) clause)->opno) == F_EQSEL &&
-				 equality_ops_are_compatible(((ScalarArrayOpExpr *) clause)->opno,
-											 eqop))
+				 ((ScalarArrayOpExpr *) clause)->opno == eqop)
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
 			Const	   *arr;
