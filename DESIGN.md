@@ -4927,7 +4927,9 @@ times slower.
   groups than a `col = ANY (const array)` of it lists, nor more than one under a `col = const`, so
   the node's estimate of each grouping column's groups is held to that
   (`lion_group_list_bound()`), the non-NULL elements counted, repeats included, which is never
-  below the groups there can be. Of two grouping columns, the node's groups are held to the
+  below the groups there can be. The column is matched under binary-compatible relabels alone:
+  a value-changing cast (a numeric column compared as float8) may map many values to one
+  constant. Of two grouping columns, one of them bounded, the node's groups are held to the
   product. Only the node's own rows: an Agg core puts above other paths keeps core's estimate.
 - **Each group's work.** It was priced as a merge of the WHERE's sources at every group, each
   probed in memory (`LION_MEMORY_PROBE_COST`). The executor does not do that: once a group's count
@@ -4935,7 +4937,8 @@ times slower.
   each listed value's set with the copy, sought from its key index (`lion_mat_seek()`). The price
   says so now (`lion_count_rel_list_once()`): the collection, and each group's containers visited
   with a seek step (`LION_PROBE_STEP_COST`) and an AND of its members against the copy, where the
-  WHERE could be collected (`lion_cost_where_collected()`) and two groups or more are walked.
+  WHERE could be collected (`lion_cost_where_collected()`) and two groups or more are walked -
+  not on a hot standby, which collects nothing and merges each group with the WHERE's sources.
 
 On the 4M-row table (a tsvector WHERE of 5% of the rows, 400,000 keys of a skewed size): lists of
 1,200 ids, and of 2,600 of which half have no entry, took 94 and 97 ms through LionOrdered and a
@@ -21842,7 +21845,7 @@ meant to cost, so:
 - **A larger directory is counted from a sample**, as ANALYZE estimates a table from a sample of
   its blocks (below, "Counting a sample"), within the same bound.
 - **The leaves are asked for ahead of their reads** (`lion_vacuum_prefetch()`, 2026-11-01), as far
-  ahead as `maintenance_io_concurrency`: the sample's from its list, and the walk's from a list of
+  ahead as the index tablespace's `maintenance_io_concurrency` (none at 0): the sample's from its list, and the walk's from a list of
   level 1's downlinks, read first where level 1 fits in the bound beside the leaves (it is far
   below a 32nd of them) and charged to it; a list that turns out not to fit is given up within the
   bound's slack, uncharged, and the walk made without it. Read one at a time, each leaf waited a full device round

@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "optimizer/restrictinfo.h"
 #include "tsearch/ts_type.h"
 
@@ -4169,7 +4170,9 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
  * key index (lion_mat_seek()), not a search of the sets it was made of:
  * LION_PROBE_STEP_COST a key of the group, where each group's merge with the
  * WHERE's sets probed in memory (LION_MEMORY_PROBE_COST) priced a list of
- * 1,200 ids of up to a few hundred rows each at 60,000 units for 27 ms.
+ * 1,200 ids of up to a few hundred rows each at 60,000 units for 27 ms.  Not
+ * on a hot standby, where nothing is collected (lion_where_collect()) and
+ * each group is merged with the WHERE's sources.
  */
 static void
 lion_count_rel_list_once(LionCountRelCost *c, double *mem, double *keys,
@@ -4249,7 +4252,7 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 		lion_count_rel_where_once(c, mem, keys, words, gm);
 	}
 	else if (c->distinct == LION_DISTINCT_NONE && c->groupdrive &&
-			 c->walked >= 2.0 && !c->nocollect &&
+			 c->walked >= 2.0 && !c->nocollect && !RecoveryInProgress() &&
 			 lion_cost_where_collected(c->nsrc, c->srcmembers,
 									   c->srccontainers, c->srcmany))
 	{

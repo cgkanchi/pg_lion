@@ -162,6 +162,7 @@
 #include "utils/rel.h"
 #include "utils/sampling.h"
 #include "utils/snapmgr.h"
+#include "utils/spccache.h"
 #include "utils/syscache.h"
 
 #include "lion.h"
@@ -1212,11 +1213,19 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
 	return nmarked;
 }
 
+/* The read-ahead depth of the index's tablespace, as core's own reads take it */
+static int
+lion_vacuum_prefetch_depth(Relation index)
+{
+	return get_tablespace_maintenance_io_concurrency(index->rd_rel->reltablespace);
+}
+
 /*
  * Ask the kernel ahead for the directory leaves a count reads (DESIGN.md §33,
  * "What counting costs"): blks[*next] up to, not including, blks[upto], as
- * many ahead of the read as maintenance_io_concurrency, which is what a
- * VACUUM's or an ANALYZE's own reads ahead use.  A leaf read one at a time
+ * many ahead of the read as the index's tablespace's maintenance_io_concurrency
+ * (lion_vacuum_prefetch_depth()), which is what a VACUUM's or an ANALYZE's own
+ * reads ahead use; none at 0.  A leaf read one at a time
  * waits a full device round trip each, and a sample spread over a cold
  * directory of tens of thousands of leaves waited that many - the table's own
  * sample, beside it, is read through a read stream.  PrefetchBuffer() pins
@@ -1225,8 +1234,10 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
  */
 static void
 lion_vacuum_prefetch(Relation index, const BlockNumber *blks, int nblks,
-					 int *next, int upto)
+					 int *next, int upto, int depth)
 {
+	if (depth <= 0)
+		return;
 	upto = Min(upto, nblks);
 	while (*next < upto)
 		(void) PrefetchBuffer(index, MAIN_FORKNUM, blks[(*next)++]);
@@ -1297,6 +1308,7 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	int			ntoread;
 	int			prefetched = 0;
 	int			nread;
+	int			depth = lion_vacuum_prefetch_depth(info->index);
 	int			i;
 	int			c;
 
@@ -1405,7 +1417,7 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 		if (weight[i] == 0)
 			continue;
 		lion_vacuum_prefetch(index, toread, ntoread, &prefetched,
-							 nread++ + 1 + maintenance_io_concurrency);
+							 nread++ + 1 + depth, depth);
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blks[i], RBM_NORMAL,
 								 info->strategy);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1499,12 +1511,14 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	int			nlisted = -1;
 	int			pos = 0;		/* the next listed leaf the walk reads */
 	int			prefetched = 0;
+	int			depth;
 
 	if (!lion_vac_may_count(index, ix))
 		return;
 	budget = lion_vacuum_count_budget(index);
 	if (budget == 0)
 		return;
+	depth = lion_vacuum_prefetch_depth(index);
 	lion_read_meta(index, &meta);
 	if (meta.dirpages > budget)
 	{
@@ -1529,7 +1543,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	 * meanwhile is not listed and is read as the walk reaches it; one listed
 	 * and gone since is asked for and not read.
 	 */
-	if (maintenance_io_concurrency > 0 &&
+	if (depth > 0 &&
 		(uint64) meta.dirpages + meta.dirpages / 32 + meta.height <= budget)
 	{
 		int64		read0 = lion_dir_pages_read;
@@ -1566,7 +1580,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 			int			j;
 
 			for (j = pos;
-				 j < Min(pos + 1 + maintenance_io_concurrency, nlisted); j++)
+				 j < Min(pos + 1 + depth, nlisted); j++)
 			{
 				if (listed[j] == blk)
 				{
@@ -1575,7 +1589,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 				}
 			}
 			lion_vacuum_prefetch(index, listed, nlisted, &prefetched,
-								 pos + maintenance_io_concurrency);
+								 pos + depth, depth);
 		}
 
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL,

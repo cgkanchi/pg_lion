@@ -357,6 +357,8 @@ typedef struct LionCountPathBuild
 	Oid			groupcoll[LION_MAX_GROUPCOLS];	/* the grouping's collation */
 	bool		groupvalueout[LION_MAX_GROUPCOLS];
 	double		groupest[LION_MAX_GROUPCOLS];
+	bool		groupbounded;	/* a restriction bounds some groupest[g]
+								 * (lion_group_list_bound()) */
 	int			ngroup;
 	bool		decode;			/* three or more columns: the decoded walk
 								 * of DESIGN.md §34 counts them */
@@ -3672,6 +3674,15 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	return true;
 }
 
+/* An operand of a group bound's clause, binary-compatible relabels taken off */
+static Node *
+lion_group_bound_arg(Node *arg)
+{
+	while (arg != NULL && IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+	return arg;
+}
+
 /*
  * The most groups a GROUP BY of var can have under rel's restrictions: the
  * values a `var = ANY (list)` or `var = c` of them leaves it, or -1 when none
@@ -3680,7 +3691,10 @@ lion_count_path_strategy(LionCountPathBuild *cx)
  * column: a list of a few thousand ids, each with many rows, was estimated
  * at hundreds of thousands of groups, and a walk of the column's entries
  * priced for as many.  Each list's non-NULL elements are counted, repeats
- * included, so the bound is never below the groups there can be.
+ * included, so the bound is never below the groups there can be.  The column
+ * is matched under binary-compatible relabelling alone
+ * (lion_group_bound_arg()): a cast that changes the value - a numeric column
+ * compared as float8 - may map many of the column's values to one constant.
  */
 static double
 lion_group_list_bound(RelOptInfo *rel, Node *var)
@@ -3700,8 +3714,8 @@ lion_group_list_bound(RelOptInfo *rel, Node *var)
 			list_length(((OpExpr *) clause)->args) == 2 &&
 			get_oprrest(((OpExpr *) clause)->opno) == F_EQSEL)
 		{
-			left = strip_implicit_coercions(linitial(((OpExpr *) clause)->args));
-			right = strip_implicit_coercions(lsecond(((OpExpr *) clause)->args));
+			left = lion_group_bound_arg(linitial(((OpExpr *) clause)->args));
+			right = lion_group_bound_arg(lsecond(((OpExpr *) clause)->args));
 			if (equal(left, var) && IsA(right, Const))
 				n = 1.0;
 			else if (equal(right, var) && IsA(left, Const))
@@ -3724,8 +3738,8 @@ lion_group_list_bound(RelOptInfo *rel, Node *var)
 			int			nelems;
 			int			i;
 
-			left = strip_implicit_coercions(linitial(saop->args));
-			right = strip_implicit_coercions(lsecond(saop->args));
+			left = lion_group_bound_arg(linitial(saop->args));
+			right = lion_group_bound_arg(lsecond(saop->args));
 			if (!equal(left, var) || !IsA(right, Const) ||
 				((Const *) right)->constisnull)
 				continue;
@@ -3792,7 +3806,10 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		cx->groupest[g] = estimate_num_groups(root, list_make1(gv),
 											  input_rel->rows, NULL, NULL);
 		if (bound >= 0.0)
+		{
 			cx->groupest[g] = Max(Min(cx->groupest[g], bound), 1.0);
+			cx->groupbounded = true;
+		}
 	}
 
 	/*
@@ -3988,7 +4005,12 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 			vars = lappend(vars, lion_vcol_unvar((Node *) cx->groupvar[g]));
 		cx->numgroups = estimate_num_groups(root, vars, input_rel->rows,
 											NULL, NULL);
-		/* ... no more than the combinations of the columns' bounds */
+		/*
+		 * ... no more than the combinations of the columns' bounds, where a
+		 * restriction gives one: the estimate stands otherwise, extended
+		 * statistics' included
+		 */
+		if (cx->groupbounded)
 		{
 			double		bound = 1.0;
 
