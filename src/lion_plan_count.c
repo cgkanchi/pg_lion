@@ -4110,6 +4110,38 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 												relrows, NULL, NULL);
 			else
 				relgroups = cx->numgroups;
+
+			/*
+			 * ... and no more than the combinations of the columns' bounds,
+			 * where a restriction gives one, as for the whole table above:
+			 * a list holds each partition's groups to its values too
+			 */
+			if (t->drivevar[0] != NULL)
+			{
+				double		bound = 1.0;
+				bool		bounded = false;
+				int			h;
+
+				for (h = 0; h < cx->ngroup; h++)
+				{
+					if (cx->groupbound[h] >= 0.0)
+					{
+						bounded = true;
+						bound *= Max(cx->groupbound[h], 1.0);
+					}
+					else if (t->drivevar[h] != NULL)
+						bound *= estimate_num_groups(root,
+													 list_make1(t->drivevar[h]),
+													 relrows, NULL, NULL);
+					else
+					{
+						bounded = false;	/* a column with no estimate here */
+						break;
+					}
+				}
+				if (bounded)
+					relgroups = Min(relgroups, bound);
+			}
 			cx->outrows += Min(relgroups, relrows);
 		}
 		cx->outrows = Max(cx->outrows, 1.0);
