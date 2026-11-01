@@ -3699,11 +3699,13 @@ lion_group_bound_arg(Node *arg)
  * is matched under binary-compatible relabelling alone
  * (lion_group_bound_arg()): a cast that changes the value - a numeric column
  * compared as float8 - may map many of the column's values to one constant.
- * And under the grouping's own collation, coll, alone: a case-insensitive
- * equality bounds nothing of a GROUP BY under "C", whose groups it may merge.
+ * And under the grouping's own equality, eqop, and collation, coll, alone: a
+ * case-insensitive equality - a text column relabelled to citext, or one
+ * compared under a nondeterministic collation - bounds nothing of a GROUP BY
+ * under text's "C", whose groups it may merge.
  */
 static double
-lion_group_list_bound(RelOptInfo *rel, Node *var, Oid coll)
+lion_group_list_bound(RelOptInfo *rel, Node *var, Oid eqop, Oid coll)
 {
 	double		bound = -1.0;
 	ListCell   *lc;
@@ -3722,7 +3724,8 @@ lion_group_list_bound(RelOptInfo *rel, Node *var, Oid coll)
 
 		if (IsA(clause, OpExpr) &&
 			list_length(((OpExpr *) clause)->args) == 2 &&
-			get_oprrest(((OpExpr *) clause)->opno) == F_EQSEL)
+			get_oprrest(((OpExpr *) clause)->opno) == F_EQSEL &&
+			equality_ops_are_compatible(((OpExpr *) clause)->opno, eqop))
 		{
 			left = lion_group_bound_arg(linitial(((OpExpr *) clause)->args));
 			right = lion_group_bound_arg(lsecond(((OpExpr *) clause)->args));
@@ -3735,7 +3738,9 @@ lion_group_list_bound(RelOptInfo *rel, Node *var, Oid coll)
 		}
 		else if (IsA(clause, ScalarArrayOpExpr) &&
 				 ((ScalarArrayOpExpr *) clause)->useOr &&
-				 get_oprrest(((ScalarArrayOpExpr *) clause)->opno) == F_EQSEL)
+				 get_oprrest(((ScalarArrayOpExpr *) clause)->opno) == F_EQSEL &&
+				 equality_ops_are_compatible(((ScalarArrayOpExpr *) clause)->opno,
+											 eqop))
 		{
 			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
 			Const	   *arr;
@@ -3854,7 +3859,7 @@ lion_count_path_targets(LionCountPathBuild *cx)
 		cx->groupbound[g] =
 			lion_group_list_bound(input_rel,
 								  lion_vcol_unvar((Node *) cx->groupvar[g]),
-								  cx->groupcoll[g]);
+								  cx->groupeqop[g], cx->groupcoll[g]);
 	if (cx->ngroup > 0)
 		cx->driveattno = cx->groupattno[0];
 
