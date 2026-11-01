@@ -567,7 +567,6 @@ rejects a row.  For a multi-key column the keys are the extracted elements or le
 moves out of its entry tuple onto container pages of its own. The build records it on the meta
 page, and inserts and VACUUM keep to that: `ALTER INDEX ... SET (inline_limit = ...)` takes effect
 at the next REINDEX.
-`fillfactor` is what decides how full the build packs the directory's leaves.
 `slices` (`on` | `off`, default `off`): bit slices of every integer, date, time and timestamp key
 column (DESIGN.md §51). A sliced column keeps, after its keys and their summaries, one posting set
 per bit of its values - the rows whose value, as a signed integer of the type's width with the sign

@@ -79,8 +79,10 @@ ALTER EXTENSION pg_lion_vector UPDATE;  -- where installed
 
 Lion indexes built by a build of another on-disk format then need `REINDEX`: lion refuses such an
 index, with an error that says so, until it is rebuilt. A database with a build from before 0.3.0
-installed has no update path: drop the extensions (`DROP EXTENSION ... CASCADE` drops their
-indexes too) and create them and the indexes again.
+installed has no update path: drop the extensions and create them and the indexes again.
+`DROP EXTENSION ... CASCADE` also drops every object that depends on them, such as views that call
+lion's functions, so save the definitions and grants of those objects first and recreate them
+after.
 
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 

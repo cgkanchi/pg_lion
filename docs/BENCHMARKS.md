@@ -143,8 +143,8 @@ OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 ([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
 lionvec built with `partitions = 1974` (`2 sqrt(n)`) and `spill = off` (the defaults are
 `8 sqrt(n)` partitions with each row in a second partition as well, `spill = on`: on 115,000
-text-embedding-3-large rows those read 1.8 times fewer code pages for 0.95 recall and 1.25 times
-fewer for 0.98, in about the same time, and make the index about 10% larger;
+text-embedding-3-large rows those read 1.8 times fewer code pages for 0.95 recall, in the same
+time, and 1.25 times fewer for 0.98, taking 1.3 times longer, and make the index about 18% larger;
 [results](../bench/results/2026-10-14-lionvec-dbpedia/)), against pgvector 0.8.6's HNSW on
 `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
 `shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
