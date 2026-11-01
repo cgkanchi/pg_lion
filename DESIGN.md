@@ -21841,6 +21841,15 @@ meant to cost, so:
   would be wrong where an old one is only old.
 - **A larger directory is counted from a sample**, as ANALYZE estimates a table from a sample of
   its blocks (below, "Counting a sample"), within the same bound.
+- **The leaves are asked for ahead of their reads** (`lion_vacuum_prefetch()`, 2026-11-01), as far
+  ahead as `maintenance_io_concurrency`: the sample's from its list, and the walk's from a list of
+  level 1's downlinks, read first where level 1 fits in the bound beside the leaves (it is far
+  below a 32nd of them) and charged to it; a list that turns out not to fit is given up within the
+  bound's slack, uncharged, and the walk made without it. Read one at a time, each leaf waited a full device round
+  trip, where the table's own sample beside it is read through a read stream: on storage with a
+  millisecond's latency a bound of 30,000 cold leaves is half a minute of ANALYZE on its own. The
+  ask pins nothing; a leaf a split adds while the walk runs is not listed and is read as the walk
+  reaches it, and one listed and gone since is asked for and not read.
 - **Nothing is written that is already there.** `lion_meta_write_ndistinct()` compares the counts
   under the meta page's lock and writes no record - and so, the first time after a checkpoint, no
   image of the meta page - when an ANALYZE of an unchanged table counts what the page holds.

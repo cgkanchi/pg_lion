@@ -1213,6 +1213,26 @@ lion_vacuum_mcv_leaves(Relation index, LionIndexState *ix,
 }
 
 /*
+ * Ask the kernel ahead for the directory leaves a count reads (DESIGN.md §33,
+ * "What counting costs"): blks[*next] up to, not including, blks[upto], as
+ * many ahead of the read as maintenance_io_concurrency, which is what a
+ * VACUUM's or an ANALYZE's own reads ahead use.  A leaf read one at a time
+ * waits a full device round trip each, and a sample spread over a cold
+ * directory of tens of thousands of leaves waited that many - the table's own
+ * sample, beside it, is read through a read stream.  PrefetchBuffer() pins
+ * nothing and only asks; every block is one a downlink named, below the
+ * relation's size, which nothing truncates.
+ */
+static void
+lion_vacuum_prefetch(Relation index, const BlockNumber *blks, int nblks,
+					 int *next, int upto)
+{
+	upto = Min(upto, nblks);
+	while (*next < upto)
+		(void) PrefetchBuffer(index, MAIN_FORKNUM, blks[(*next)++]);
+}
+
+/*
  * Counting a sample (DESIGN.md §33, "Counting a sample"): the counts of a
  * directory larger than the budget, estimated from a sample of its leaves, as
  * ANALYZE estimates a table's statistics from a sample of its blocks.
@@ -1273,6 +1293,10 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	int			nstrata = 0;
 	int			nrest;
 	int		   *rest;
+	BlockNumber *toread;
+	int			ntoread;
+	int			prefetched = 0;
+	int			nread;
 	int			i;
 	int			c;
 
@@ -1365,6 +1389,14 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	saturated = (bool *) palloc0(sizeof(bool) * ix->ncolumns);
 	nvalues = (uint64 *) palloc(sizeof(uint64) * ix->ncolumns);
 	sumsq = (uint64 *) palloc(sizeof(uint64) * ix->ncolumns);
+
+	/* the leaves to read, in order, asked for ahead of their reads */
+	toread = (BlockNumber *) palloc(sizeof(BlockNumber) * nleaves);
+	ntoread = 0;
+	for (i = 0; i < nleaves; i++)
+		if (weight[i] != 0)
+			toread[ntoread++] = blks[i];
+	nread = 0;
 	for (i = 0; i < nleaves; i++)
 	{
 		Buffer		buf;
@@ -1372,6 +1404,8 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 
 		if (weight[i] == 0)
 			continue;
+		lion_vacuum_prefetch(index, toread, ntoread, &prefetched,
+							 nread++ + 1 + maintenance_io_concurrency);
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blks[i], RBM_NORMAL,
 								 info->strategy);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -1413,6 +1447,7 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	pfree(saturated);
 	pfree(nvalues);
 	pfree(sumsq);
+	pfree(toread);
 	pfree(weight);
 	pfree(blks);
 	pfree(starts);
@@ -1459,6 +1494,11 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	BlockNumber budget;
 	BlockNumber nread;
 	BlockNumber blk;
+	BlockNumber *listed = NULL;
+	uint16	   *starts;
+	int			nlisted = -1;
+	int			pos = 0;		/* the next listed leaf the walk reads */
+	int			prefetched = 0;
 
 	if (!lion_vac_may_count(index, ix))
 		return;
@@ -1478,6 +1518,32 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 
 	/* the internal pages of the descent to the leftmost leaf, then leaves */
 	nread = meta.height;
+
+	/*
+	 * The leaves, listed from level 1's downlinks, to ask for ahead of the
+	 * walk (lion_vacuum_prefetch()): where level 1 - far fewer pages than a
+	 * 32nd of the leaves - fits in the budget beside them, its pages charged
+	 * to it.  A list that would not fit - long keys, a level 1 of few
+	 * downlinks a page - is given up within the budget's slack, uncharged,
+	 * and the walk is made as it would be without it.  A leaf a split adds
+	 * meanwhile is not listed and is read as the walk reaches it; one listed
+	 * and gone since is asked for and not read.
+	 */
+	if (maintenance_io_concurrency > 0 &&
+		(uint64) meta.dirpages + meta.dirpages / 32 + meta.height <= budget)
+	{
+		int64		read0 = lion_dir_pages_read;
+
+		nlisted = lion_dir_leaves(index, ix, info->strategy,
+								  budget - meta.dirpages - meta.height,
+								  &listed, &starts);
+		if (nlisted >= 0)
+		{
+			nread += (BlockNumber) (lion_dir_pages_read - read0);
+			pfree(starts);
+		}
+	}
+
 	blk = lion_dir_leftmost_leaf_ext(index, ix, info->strategy);
 	while (BlockNumberIsValid(blk))
 	{
@@ -1487,9 +1553,29 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 
 		if (++nread > budget)
 		{
+			if (nlisted >= 0)
+				pfree(listed);
 			pfree(nvalues);
 			pfree(sumsq);
 			return;
+		}
+
+		/* past this leaf in the list, and as far ahead of it as asked */
+		if (nlisted > 0)
+		{
+			int			j;
+
+			for (j = pos;
+				 j < Min(pos + 1 + maintenance_io_concurrency, nlisted); j++)
+			{
+				if (listed[j] == blk)
+				{
+					pos = j + 1;
+					break;
+				}
+			}
+			lion_vacuum_prefetch(index, listed, nlisted, &prefetched,
+								 pos + maintenance_io_concurrency);
 		}
 
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, blk, RBM_NORMAL,
@@ -1515,6 +1601,8 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 
 	lion_meta_fill_ndistinct(&nd, ix, nvalues, sumsq, rows);
 	lion_meta_write_ndistinct(index, &nd);
+	if (nlisted >= 0)
+		pfree(listed);
 	pfree(nvalues);
 	pfree(sumsq);
 }
