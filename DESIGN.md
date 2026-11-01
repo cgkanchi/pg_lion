@@ -4914,6 +4914,36 @@ total instead of being merged - the entries of a summed IN list, or the entries 
 IN list under an OR, a list the density test declined, and every multi-key clause still do. A GROUP
 BY reports zero as well: its groups are emitted, not summed.
 
+#### Groups a list drives (2026-11-01)
+
+Two things in the price of the driver above were wrong, and together they handed the GROUP BY to a
+B-tree on the column walked in order with the WHERE tested on each entry (LionOrdered, §30) - over
+uuid keys of up to a few hundred rows each, at lists of a thousand ids and more, a plan three to four
+times slower.
+
+- **The groups.** Core's estimate of a column's groups scales its distinct values to the rows the
+  restrictions keep (`estimate_num_groups()`), and knows nothing of a list on the column: on a 4M-row
+  table, 1,200 ids were estimated at 12,826 groups. A GROUP BY of a column can have no more
+  groups than a `col = ANY (const array)` of it lists, nor more than one under a `col = const`, so
+  the node's estimate of each grouping column's groups is held to that
+  (`lion_group_list_bound()`), the non-NULL elements counted, repeats included, which is never
+  below the groups there can be. Of two grouping columns, the node's groups are held to the
+  product. Only the node's own rows: an Agg core puts above other paths keeps core's estimate.
+- **Each group's work.** It was priced as a merge of the WHERE's sources at every group, each
+  probed in memory (`LION_MEMORY_PROBE_COST`). The executor does not do that: once a group's count
+  would read as much as the WHERE, it collects the WHERE once (`WHERE Sets Collected: 1`) and ANDs
+  each listed value's set with the copy, sought from its key index (`lion_mat_seek()`). The price
+  says so now (`lion_count_rel_list_once()`): the collection, and each group's containers visited
+  with a seek step (`LION_PROBE_STEP_COST`) and an AND of its members against the copy, where the
+  WHERE could be collected (`lion_cost_where_collected()`) and two groups or more are walked.
+
+On the 4M-row table (a tsvector WHERE of 5% of the rows, 400,000 keys of a skewed size): lists of
+1,200 ids, and of 2,600 of which half have no entry, took 94 and 97 ms through LionOrdered and a
+GroupAggregate, and take 26 and 28 ms as the count, which was priced 60,131 and 66,135 and is now
+30,283 and 33,772; an EXISTS over a table of the ids, the same groups, takes 27 and 30 ms.
+`grouplist.sql` checks the choice and the bound at 200,000 rows (8.2 ms through LionOrdered, 2.6 ms
+counted).
+
 #### §14's sum-over-all is the same argument
 
 `col IS NOT NULL` with nothing else (§14) sums the counts of every entry of that column's index, and

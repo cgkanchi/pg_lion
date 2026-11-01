@@ -3673,6 +3673,85 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 }
 
 /*
+ * The most groups a GROUP BY of var can have under rel's restrictions: the
+ * values a `var = ANY (list)` or `var = c` of them leaves it, or -1 when none
+ * bounds it.  Core's estimate of a column's groups scales its distinct values
+ * to the rows the restrictions keep, which knows nothing of a list on the
+ * column: a list of a few thousand ids, each with many rows, was estimated
+ * at hundreds of thousands of groups, and a walk of the column's entries
+ * priced for as many.  Each list's non-NULL elements are counted, repeats
+ * included, so the bound is never below the groups there can be.
+ */
+static double
+lion_group_list_bound(RelOptInfo *rel, Node *var)
+{
+	double		bound = -1.0;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Node	   *clause = (Node *) rinfo->clause;
+		Node	   *left;
+		Node	   *right;
+		double		n;
+
+		if (IsA(clause, OpExpr) &&
+			list_length(((OpExpr *) clause)->args) == 2 &&
+			get_oprrest(((OpExpr *) clause)->opno) == F_EQSEL)
+		{
+			left = strip_implicit_coercions(linitial(((OpExpr *) clause)->args));
+			right = strip_implicit_coercions(lsecond(((OpExpr *) clause)->args));
+			if (equal(left, var) && IsA(right, Const))
+				n = 1.0;
+			else if (equal(right, var) && IsA(left, Const))
+				n = 1.0;
+			else
+				continue;
+		}
+		else if (IsA(clause, ScalarArrayOpExpr) &&
+				 ((ScalarArrayOpExpr *) clause)->useOr &&
+				 get_oprrest(((ScalarArrayOpExpr *) clause)->opno) == F_EQSEL)
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+			Const	   *arr;
+			ArrayType  *a;
+			Datum	   *elems;
+			bool	   *nulls;
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+			int			nelems;
+			int			i;
+
+			left = strip_implicit_coercions(linitial(saop->args));
+			right = strip_implicit_coercions(lsecond(saop->args));
+			if (!equal(left, var) || !IsA(right, Const) ||
+				((Const *) right)->constisnull)
+				continue;
+			arr = (Const *) right;
+			a = DatumGetArrayTypeP(arr->constvalue);
+			get_typlenbyvalalign(ARR_ELEMTYPE(a), &typlen, &typbyval,
+								 &typalign);
+			deconstruct_array(a, ARR_ELEMTYPE(a), typlen, typbyval, typalign,
+							  &elems, &nulls, &nelems);
+			n = 0.0;
+			for (i = 0; i < nelems; i++)
+			{
+				if (!nulls[i])
+					n += 1.0;
+			}
+			pfree(elems);
+			pfree(nulls);
+		}
+		else
+			continue;
+		bound = (bound < 0.0) ? n : Min(bound, n);
+	}
+	return bound;
+}
+
+/*
  * The relations to count - the table, or each live leaf partition - and the
  * indexes on each (targets, first), found for the driving columns and the
  * clauses.  Orders the two grouping columns by their estimates, and sets
@@ -3706,9 +3785,15 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	 * probed per pair - are the ones whose bucket lookups are repeated.
 	 */
 	for (g = 0; g < cx->ngroup; g++)
-		cx->groupest[g] = estimate_num_groups(root,
-											  list_make1(lion_vcol_unvar((Node *) cx->groupvar[g])),
+	{
+		Node	   *gv = lion_vcol_unvar((Node *) cx->groupvar[g]);
+		double		bound = lion_group_list_bound(input_rel, gv);
+
+		cx->groupest[g] = estimate_num_groups(root, list_make1(gv),
 											  input_rel->rows, NULL, NULL);
+		if (bound >= 0.0)
+			cx->groupest[g] = Max(Min(cx->groupest[g], bound), 1.0);
+	}
 
 	/*
 	 * ... and the decoded walk of DESIGN.md §34 takes them in that order too:
@@ -3903,6 +3988,14 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 			vars = lappend(vars, lion_vcol_unvar((Node *) cx->groupvar[g]));
 		cx->numgroups = estimate_num_groups(root, vars, input_rel->rows,
 											NULL, NULL);
+		/* ... no more than the combinations of the columns' bounds */
+		{
+			double		bound = 1.0;
+
+			for (g = 0; g < cx->ngroup; g++)
+				bound *= cx->groupest[g];
+			cx->numgroups = Min(cx->numgroups, bound);
+		}
 	}
 	else if (cx->sumall && cx->rangevar != NULL)
 	{
