@@ -50,8 +50,8 @@
  * Format (DESIGN.md §44.2)
  * --------------------------------------------------------------------- */
 
-#define LIONVEC_MAGIC			0x4c56454d	/* "LVEM" */
-#define LIONVEC_VERSION			5
+#define LIONVEC_MAGIC			0x4c565831	/* "LVX1" */
+#define LIONVEC_VERSION			1
 #define LIONVEC_METAPAGE		0
 
 /* The rotation's seed.  Kept in the meta page, so it can change later. */
@@ -115,7 +115,7 @@ typedef struct LionVecMetaData
 	uint32		nregions;		/* the regions it holds; 0: none (§44.3) */
 
 	/*
-	 * The locator (DESIGN.md §44.13), LIONVEC_META_LOCATOR; format 5 on.  An
+	 * The locator (DESIGN.md §44.13), LIONVEC_META_LOCATOR.  An
 	 * index without one has its blocks invalid and the rest 0.
 	 */
 	BlockNumber loc_head;		/* the LOCDIR chain */
@@ -175,8 +175,7 @@ typedef struct LionVecCode
 typedef struct LionVecRefine
 {
 	ItemPointerData tid;		/* the row's, to tell a reused slot (§44.5) */
-	uint16		nloc;			/* runs in its place; 0: none (0 before
-								 * format 5, a pad) */
+	uint16		nloc;			/* runs in its place; 0: none */
 	float4		alpha8;			/* <r / |r|, x / |x|>, r the codes' vector */
 	float4		rnorm8;			/* |r| */
 	uint8		codes[FLEXIBLE_ARRAY_MEMBER];	/* dimsp 8-bit codes */

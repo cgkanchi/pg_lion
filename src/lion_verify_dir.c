@@ -1124,13 +1124,10 @@ lion_verify_meta(LionVerifyState *vs)
 	page = lion_verify_read_page(vs, LION_METAPAGE_BLKNO, LION_PAGE_META, &buf);
 	meta = LionPageGetMeta(page);
 
-	if (meta->magic != LION_MAGIC ||
-		(meta->version != LION_VERSION_V14 &&
-		 meta->version != LION_VERSION_V15))
-		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u or %u",
+	if (meta->magic != LION_MAGIC || meta->version != LION_VERSION)
+		lion_corrupt("lion index \"%s\": meta page has magic %08X version %u, expected %08X version %u",
 					RelationGetRelationName(vs->index), meta->magic,
-					meta->version, LION_MAGIC, LION_VERSION_V14,
-					LION_VERSION_V15);
+					meta->version, LION_MAGIC, LION_VERSION);
 	if (meta->summary_cols != 0 &&
 		(meta->summary_tids < LION_MIN_SUMMARY_TIDS ||
 		 meta->summary_tids > LION_MAX_SUMMARY_TIDS))
@@ -1187,14 +1184,9 @@ lion_verify_meta(LionVerifyState *vs)
 	 * with.
 	 */
 	/*
-	 * The sliced columns of §51, in the word that was the bucket count: as
-	 * many as the version says, columns the index has, and columns that can
+	 * The sliced columns of §51: columns the index has, and columns that can
 	 * be sliced (lion_fill_index_state() refuses the rest before this runs).
 	 */
-	if ((meta->version == LION_VERSION_V15) != (meta->slice_cols != 0))
-		lion_corrupt("lion index \"%s\": meta page version %u names sliced key columns %08X",
-					RelationGetRelationName(vs->index), meta->version,
-					meta->slice_cols);
 	if ((meta->slice_cols >> vs->ix->ncolumns) != 0 &&
 		vs->ix->ncolumns < 32)
 		lion_corrupt("lion index \"%s\": meta page names sliced key columns %08X of %d",

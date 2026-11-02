@@ -8,13 +8,8 @@ CREATE TABLE lion_opt AS
 SELECT i, (i % 97)::int4 AS k, 'v' || (i % 97) AS t
   FROM generate_series(1, 20000) i;
 
--- buckets: accepted and ignored since format 4 (DESIGN.md §21), still
--- validated exactly as it was
-CREATE INDEX lion_opt_b0 ON lion_opt USING lion (k) WITH (buckets = 0);
-CREATE INDEX lion_opt_b1 ON lion_opt USING lion (k) WITH (buckets = 1);
-CREATE INDEX lion_opt_b4096 ON lion_opt USING lion (k) WITH (buckets = 4096);
-CREATE INDEX lion_opt_bad1 ON lion_opt USING lion (k) WITH (buckets = -1);
-CREATE INDEX lion_opt_bad2 ON lion_opt USING lion (k) WITH (buckets = 65537);
+-- no options
+CREATE INDEX lion_opt_b0 ON lion_opt USING lion (k);
 
 -- inline_limit: 64 .. 4096
 CREATE INDEX lion_opt_i64 ON lion_opt USING lion (k) WITH (inline_limit = 64);
@@ -26,38 +21,24 @@ CREATE INDEX lion_opt_bad5 ON lion_opt USING lion (k) WITH (nosuchoption = 1);
 -- reloptions are recorded on the index
 SELECT c.relname, c.reloptions
   FROM pg_class c
- WHERE c.relname IN ('lion_opt_b0', 'lion_opt_b1', 'lion_opt_b4096', 'lion_opt_i64')
+ WHERE c.relname IN ('lion_opt_b0', 'lion_opt_i64', 'lion_opt_i4096')
  ORDER BY 1;
 
 -- the upper boundary is accepted by the parser, and the one past it is not
-ALTER INDEX lion_opt_b0 SET (buckets = 65536);
-ALTER INDEX lion_opt_b0 SET (buckets = 65537);
-ALTER INDEX lion_opt_b0 RESET (buckets);
+ALTER INDEX lion_opt_b0 SET (inline_limit = 4096);
+ALTER INDEX lion_opt_b0 SET (inline_limit = 4097);
+ALTER INDEX lion_opt_b0 RESET (inline_limit);
 
 -- All of these must find the same rows.
 SET enable_seqscan = off;
 SELECT count(*) FROM lion_opt WHERE k = 42;
 DROP INDEX lion_opt_b0;
 SELECT count(*) FROM lion_opt WHERE k = 42;
-DROP INDEX lion_opt_b1;
-SELECT count(*) FROM lion_opt WHERE k = 42;
-DROP INDEX lion_opt_b4096;
-SELECT count(*) FROM lion_opt WHERE k = 42;
 DROP INDEX lion_opt_i64;
 SELECT count(*) FROM lion_opt WHERE k = 42;
 DROP INDEX lion_opt_i4096;
 RESET enable_seqscan;
 SELECT count(*) FROM lion_opt WHERE k = 42;
-
-/*
- * buckets changes nothing at all since format 4: the entry directory is a
- * B-tree that grows by splitting, so two indexes that differ only in that
- * option are the same index (DESIGN.md §21).
- */
-CREATE INDEX lion_opt_b7 ON lion_opt USING lion (k) WITH (buckets = 7);
-CREATE INDEX lion_opt_b1000 ON lion_opt USING lion (k) WITH (buckets = 1000);
-SELECT directory_height, leaf_pages, entries FROM lion_index_stats('lion_opt_b7');
-SELECT directory_height, leaf_pages, entries FROM lion_index_stats('lion_opt_b1000');
 
 -- fillfactor: 10 .. 100, default 90 (DESIGN.md §21)
 CREATE INDEX lion_opt_ff ON lion_opt USING lion (k) WITH (fillfactor = 50);
@@ -67,12 +48,6 @@ SELECT reloptions FROM pg_class WHERE relname = 'lion_opt_ff';
 ALTER INDEX lion_opt_ff SET (fillfactor = 100);
 ALTER INDEX lion_opt_ff RESET (fillfactor);
 DROP INDEX lion_opt_ff;
-SELECT lion_index_verify('lion_opt_b7', true);
-SELECT lion_index_verify('lion_opt_b1000', true);
-SET enable_seqscan = off;
-SELECT count(*) FROM lion_opt WHERE k = 42;
-RESET enable_seqscan;
-DROP INDEX lion_opt_b7, lion_opt_b1000;
 
 /*
  * inline_limit defaults to the maximum (4096), so a posting set of one 1408

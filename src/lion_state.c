@@ -989,7 +989,6 @@ lion_settle_slices(LionIndexState *ix, const LionOptions *opts)
 		cols |= ((uint32) 1) << i;
 	}
 	ix->meta.slice_cols = cols;
-	ix->meta.version = (cols != 0) ? LION_VERSION_V15 : LION_VERSION_V14;
 	return cols;
 }
 

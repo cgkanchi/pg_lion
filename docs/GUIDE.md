@@ -774,7 +774,7 @@ vectors come last in its order, and a bound rejects rows by the distance it orde
 rows before them are the same. A bound few rows pass leaves the `LIMIT` unfilled, and the scan then
 reads to its end. `SET pg_lion.vector_postfilter = exact` plans a filtered query exactly instead, as a sort of the rows that pass the filter, which reads every one of them
 (`WHERE id = 5 ORDER BY embedding <=> $1 LIMIT 1` sorts the one row the primary key finds), and
-`allow` plans as before this rule, the scan with a `Filter` among the plans. `lionvec` does not
+`allow` keeps the scan with a `Filter` among the plans. `lionvec` does not
 support row-level security: it builds no index on a table that has it enabled, or on a partition of
 one, and a query such an index could order fails, whoever runs it. `pg_lion.enable_ordered_scan = off`
 takes the node away, and a filtered query then fails, or under `exact` is sorted. An HNSW index on

@@ -145,9 +145,9 @@ An installed extension's functions and operator classes change only through `ALT
 ... UPDATE`, so a change to `pg_lion--<version>.sql` (or pg_lion_citext's, or pg_lion_vector's)
 is a new version (§23, "Extension versions"):
 
-1. `git mv pg_lion--0.1.0-devN.sql pg_lion--0.1.0-devN+1.sql`, make the change there, and set
+1. `git mv pg_lion--<version>.sql pg_lion--<next>.sql`, make the change there, and set
    `default_version` in `pg_lion.control` and `provides.pg_lion.file` in META.json to match.
-2. Add `pg_lion--0.1.0-devN--0.1.0-devN+1.sql` making the same change to an installed copy:
+2. Add `pg_lion--<version>--<next>.sql` making the same change to an installed copy:
    `CREATE OR REPLACE FUNCTION` where the arguments and result stay the same, `DROP FUNCTION`
    then `CREATE FUNCTION` where they or the OUT columns change, `ALTER OPERATOR FAMILY ... ADD`
    for new strategies and support functions, `CREATE OPERATOR CLASS` for new classes, and the
@@ -161,8 +161,10 @@ is a new version (§23, "Extension versions"):
    installation's extension directory (it puts each old install script there during its test)
    and the full git history.
 
-A release turns `0.1.0-devN` into `0.1.0` the same way, with an upgrade script that changes
-nothing.
+`<next>` is `X.Y.Z-devN+1` after `X.Y.Z-devN`, and after a release the next release's `-dev1`
+(after 0.3.0, `0.3.1-dev1`).  A release turns `X.Y.Z-devN` into `X.Y.Z`
+the same way, with an upgrade script that changes nothing.  Versions before 0.3.0 have no upgrade
+path (`test/upgrade/floor`).
 
 ## Calibrating the cost model
 

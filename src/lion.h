@@ -58,7 +58,7 @@
 	(LION_PAGE_META | LION_PAGE_BUCKET | LION_PAGE_CONTAINER | LION_PAGE_DIR)
 
 /*
- * The special area of every page (format version 4, DESIGN.md §18 and §21).
+ * The special area of every page (DESIGN.md §18 and §21).
  *
  * owner_hash/owner_head name the posting set a CONTAINER page belongs to, and
  * every reader that reaches a container page through an entry's head or a
@@ -413,142 +413,13 @@ lion_rightwalk_step(Relation index, LionRightWalk *walk, BlockNumber blk,
 
 #define LION_MAGIC			0x52424931	/* 'RBI1' */
 /*
- * Version 2 indexes NULL keys (DESIGN.md §14).  The page format did not
- * change - a version 1 index is structurally valid - but it holds no NULL
- * entry, so `IS NULL` would answer "no rows" instead of the truth.  Refusing
- * to open it is the only safe reading: REINDEX turns it into a version 2 one.
- *
- * Version 3 (DESIGN.md §18) adds owner_hash/owner_head to the page special
- * area, which makes the special area 24 bytes instead of 16 and therefore
- * moves every item on every page.  A version 2 index cannot be read at all by
- * this code, so opening one is the same ERROR with the same REINDEX hint.
- *
- * Version 4 (DESIGN.md §21) replaces the hash-bucket entry directory with a
- * B-tree keyed by the index key: the special area grows again (leftlink and
- * level), the meta page points at a root instead of counting buckets, and
- * entry tuples live on directory leaves in key order.  Nothing of a version 3
- * index is readable, so opening one is the same ERROR with the same hint.
- *
- * Version 5 (DESIGN.md §22) makes each key's posting set a B-tree over
- * container keys: the entry's `head` is its ROOT, which is an internal page
- * of LionPostingPivot downlinks as soon as the set outgrows one page.  The
- * page HEADER did not have to change (§21 had already given container pages a
- * `level`), but a version 4 posting set of more than one page is a flat
- * rightlinked chain with no root above it, which this code cannot descend and
- * therefore cannot write to.  §22 planned to share §21's version number
- * because the two were meant to land together; §21 shipped first, so the bump
- * is separate.  Opening a version 4 index is the same ERROR with the same
- * REINDEX hint.
- *
- * Version 6 (DESIGN.md §24) gives every entry tuple the KEY COLUMN it belongs
- * to, in four bytes the header had been padding out, and makes that column the
- * leading term of the directory order.  A version 5 index has zeros there, so
- * every one of its entries would read as column 0 and no descent would find
- * anything; reading such an index by TREATING attno 0 as 1 was considered and
- * rejected in §24, because the two formats would then be told apart by a field
- * that means "column one" in one of them and "no column at all" in the other.
- * Opening a version 5 index is the same ERROR with the same REINDEX hint.
- *
- * Version 7 (DESIGN.md §32) is version 6 plus SUMMARY POSTING SETS: entries of
- * two new kinds, after a column's VALUE entries, each holding the union of the
- * posting sets of a run of that column's keys.  It is an ADDITION: every page
- * and every item of a version 6 index reads exactly as it did, and a version 6
- * index is simply one without summaries, which this code reads and writes as it
- * always has.  The number moves only so that a build of pg_lion that predates
- * summaries refuses an index that has them - it would take a summary entry for
- * a VALUE entry, whose kind is what an unknown flag reads as, and count its
- * rows twice.  A build writes version 7 only when at least one key column has
- * summaries (summary_cols below), so an index built with `summaries = off`
- * stays readable by the builds before this one.
- *
- * Version 8 (DESIGN.md §38) is version 7 plus NARROW CONTAINERS: items of a
- * fifth type, a bitset of the offsets below 64 * k of a container's heap
- * blocks, k being the item's width, 1 .. LION_NARROW_MAX_WIDTH, in its
- * header's flags byte.  It is an addition too - summary_cols says as before
- * whether there are summaries, and every page and item of a version 6 or 7
- * index reads as it did - and the number moves so that a build that
- * predates NARROW refuses an index that has one rather than reporting it
- * corrupt, or worse.
- *
- * Version 9 (DESIGN.md §13) stores a sparse segment's pairs as a stream of
- * delta varints instead of uint32 ckeys[] and uint16 los[], which
- * reinterprets every segment of every older index, so versions 6, 7 and 8
- * are no longer read: opening one is an ERROR whose hint asks for REINDEX.
- * Every index this build writes is version 9, whatever it holds: whether a
- * key column has summaries is what summary_cols says (§32).  The leaf-root
- * posting trees share the number.
- *
- * Version 10 (DESIGN.md §21, "Entry tuples") lays out every directory item
- * anew - a 12-byte header for an INLINE entry or a pivot and a 28-byte one
- * for a CHAIN entry, where every item had the same 32 bytes; no stored hash;
- * a by-value key at its type's width rather than as a whole Datum; the
- * payload packed right after the key (lion_entryfmt.h) - and it stamps the
- * pages of a posting tree with a hash of the key's bytes instead of the
- * key's hash.  So version 9 is no longer read either: opening one is an
- * ERROR whose hint asks for REINDEX.  Whether an index has summaries is said
- * as version 9 said it.
- *
- * Version 11 raises LION_MAX_KEY_SIZE from 2000 to 2047 bytes.  A version 10
- * index of jsonb_contains_ops (§42) holds as hashes the keys of 2001 to 2047
- * bytes that this build stores as they are, and so would not be found under
- * them; and LION_MAX_ENTRY_SIZE, which leaves room for the largest pivot,
- * shrank, so an INLINE entry a version 10 build wrote may be larger than a
- * page now leaves room for.  Opening a version 10 index is an ERROR whose
- * hint asks for REINDEX.
- *
- * Version 12 begins EVERY internal directory page with a minus-infinity
- * downlink, where version 11 did so only on the leftmost page of a level
- * (DESIGN.md §21, "Height").  A version 11 directory may have keyed first
- * downlinks and any height, which is what version 12 rules out, so opening
- * one is an ERROR whose hint asks for REINDEX.  Version 12 also has the pages
- * VACUUM takes out of the tree and hands out again - HALF_DEAD and DELETED
- * directory pages (§21, "Page deletion"), UNLINKED posting leaves (§22,
- * "Empty leaves") - and the count of them still waiting on the meta page
- * (§18, "Reuse").
- *
- * Version 13 files a multi-key row whose extracted keys are all NULL - an
- * array of NULLs - in a reserved entry of its own, LION_ENTRY_NULLELEMS,
- * where version 12 filed it in the EMPTY entry (DESIGN.md §17, "The reserved
- * EMPTY entry").  The EMPTY entry of a version 12 index may hold such rows,
- * which the count of a non-empty array (`array_length(a, 1) IS NOT NULL`)
- * would take away with the empty ones, so opening one is an ERROR whose hint
- * asks for REINDEX.
- *
- * Version 14 files an array with no element that has dimensions - `[0:-1]`,
- * an empty int2vector's or oidvector's cast to int2[] or oid[] - in reserved
- * entries of their own, LION_ENTRY_EMPTYDIM and LION_ENTRY_EMPTYINNER, where
- * version 13 filed it in the EMPTY entry with the arrays of no dimension
- * (§17).  `a = '{}'`, `a <> '{}'`, array_length() and array_ndims() tell the
- * two apart, so the EMPTY entry of a version 13 index answers them wrongly.
- * Version 14 also lets every index hold NARROW items (§38) wherever a
- * container goes, whoever writes them - the build, an INSERT or VACUUM - and
- * its order_flags have the bits defined below and no others, where version
- * 13 said with the flag 0x0004 that the build had written a NARROW, and
- * VACUUM made them only in such an index: a version 13 index may carry that
- * bit, which is no flag of this format.  So opening a version 13 index is an
- * ERROR whose hint asks for REINDEX.
- *
- * Version 15 (DESIGN.md §51) is version 14 plus SLICE ENTRIES: after a
- * bit-sliced column's VALUE entries and summaries, one entry per bit of its
- * values' encoding and one of the rows not NULL, of a kind no build before
- * knows - it would read a slice as a VALUE entry with a one-byte key, and fail
- * on it or count it.  An ADDITION, as version 7 was (§32): every page and item
- * of a version 14 index reads as it did, and a build writes version 15 only
- * when at least one key column is sliced (slice_cols below), so an index
- * built with `slices = off` is version 14 byte for byte and stays readable by
- * the builds before this one.  This build reads both.
+ * The on-disk format.  An index of any other version was written by a build
+ * of pg_lion with another format, older or newer, and opening it is an ERROR
+ * whose hint asks for REINDEX.  What an index holds beyond the base format -
+ * summaries (DESIGN.md §32), stored positions (§17), SLICE entries (§51) -
+ * the meta page's words below say, not the version.
  */
-#define LION_VERSION			6	/* the base format of versions 6 .. 8 */
-#define LION_VERSION_SUMMARIES	7	/* ... plus the summaries of §32 */
-#define LION_VERSION_NARROW		8	/* ... plus the NARROW items of §38 */
-#define LION_VERSION_V9			9	/* varbyte sparse segments (§13) */
-#define LION_VERSION_V10		10	/* compact entry tuples (§21) */
-#define LION_VERSION_V11		11	/* keys of up to 2047 bytes (§4) */
-#define LION_VERSION_V12		12	/* key-less first downlinks (§21) */
-#define LION_VERSION_V13		13	/* the NULLELEMS entry (§17) */
-#define LION_VERSION_V14		14	/* EMPTYDIM and EMPTYINNER (§17), NARROW
-								 * items anywhere, no flag (§38) */
-#define LION_VERSION_V15		15	/* ... plus the SLICE entries of §51 */
+#define LION_VERSION			1
 
 typedef struct LionMetaPageData
 {
@@ -560,10 +431,6 @@ typedef struct LionMetaPageData
 	/*
 	 * BIT-SLICED KEY COLUMNS (DESIGN.md §51): bit i - 1, key column i keeps
 	 * SLICE entries, decided when the index was built and fixed for its life.
-	 * Nonzero only on a version 15 meta page.  The word was nbuckets, the
-	 * hash directory's bucket count, which is 0 on every meta page written
-	 * since version 4 (§21) - exactly "no column is sliced" - so the struct
-	 * keeps its 56 bytes, as §25, §21's order record and §32 kept them.
 	 */
 	uint32		slice_cols;
 	uint32		inline_limit;	/* max inline payload bytes in an entry tuple */
@@ -573,10 +440,7 @@ typedef struct LionMetaPageData
 
 	/*
 	 * How this index is WAL-logged (DESIGN.md §25): LION_WAL_MODE_GENERIC or
-	 * LION_WAL_MODE_RMGR.  It lives in what was reserved space, so the format
-	 * version did not have to move: a version 6 index written before §25 has
-	 * a zero here, which is exactly "generic", and reads and writes as it
-	 * always did.  REINDEX is what changes an index's mode.
+	 * LION_WAL_MODE_RMGR.  REINDEX is what changes an index's mode.
 	 */
 	uint32		wal_mode;
 
@@ -589,9 +453,8 @@ typedef struct LionMetaPageData
 	 * between hash order and value order, and every descent then read it in
 	 * an order it is not in.
 	 *
-	 *	order_flags		LION_META_ORDER_RECORDED once the two words below
-	 *					mean something.  Zero on an index built before they
-	 *					existed, which is read the old way.
+	 *	order_flags		LION_META_ORDER_RECORDED once the build has filled
+	 *					in the two words below.
 	 *	ordered_cols	bit i - 1: key column i is in its comparison's order.
 	 *	order_ident		a hash of WHICH comparison each ordered column was
 	 *					built with - the source it runs (lion_proc_ident()),
@@ -600,22 +463,16 @@ typedef struct LionMetaPageData
 	 *					ways of replacing a comparison since are noticed
 	 *					rather than used.  A best-effort guard, not a proof:
 	 *					what the function CALLS is not in its source (§21).
-	 *
-	 * They live in what was reserved space, zero on every index written
-	 * before, so the format version stays at 6, as it did for wal_mode.
 	 */
 	uint32		order_flags;
 	uint32		ordered_cols;
 	uint32		order_ident;
 
 	/*
-	 * SUMMARY POSTING SETS (DESIGN.md §32), in the last two reserved words -
-	 * zero on every index written before them, which is exactly "no column
-	 * has summaries".
+	 * SUMMARY POSTING SETS (DESIGN.md §32).
 	 *
 	 *	summary_cols	bit i - 1: key column i has summaries, decided when the
-	 *					index was built and fixed for its life.  Nonzero only
-	 *					on a version 7 meta page.
+	 *					index was built and fixed for its life.
 	 *	summary_tids	how many TIDs a summary bucket takes before the next
 	 *					key above every key it holds starts a new one: the
 	 *					`summary_tids` reloption at build time.  Inserts read
@@ -633,9 +490,7 @@ typedef struct LionMetaPageData
  * every key column whose opclass can extract them (support function 5): the
  * `store_positions` reloption at build time, with "auto" settled by the
  * columns (LION_POSOPT_AUTO), so that the bit is set only on an index that
- * has such a column.  It shares order_flags because the reserved words are
- * spent; an index written before it has the bit clear, which is exactly "no
- * positions".  ALTER INDEX changes nothing until a REINDEX.
+ * has such a column.  ALTER INDEX changes nothing until a REINDEX.
  */
 #define LION_META_POSITIONS			0x0002
 
@@ -643,13 +498,7 @@ typedef struct LionMetaPageData
 StaticAssertDecl(INDEX_MAX_KEYS <= 32,
 				 "lion's meta page records the order of at most 32 key columns");
 
-/*
- * §25 and §21's order record spent four of the reserved words and §32's
- * summaries the last two, so the struct is exactly the size it has been since
- * version 4 and a meta page written by any of them reads as the others - which
- * is what let the format version stay at 6 until §32 needed it to move for a
- * reason of its own.
- */
+/* The key counts below follow the struct at a fixed offset. */
 StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 				 "the lion meta page payload must not change size");
 
@@ -657,14 +506,12 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
 
 /*
  * THE DISTINCT KEYS OF EACH KEY COLUMN (DESIGN.md §33), for the planner's
- * n_distinct.  The reserved words of LionMetaPageData are all spent, so they
- * follow it on the meta page, at LION_META_NDISTINCT_OFFSET, and are there
- * only when pd_lower covers them.  A meta page written before §33 ends at
- * LionMetaPageData, which is what pd_lower says, and reads as one without
- * counts - the zero that "no count" is everywhere else.  A build writes the
- * area, and a meta page without one gets it from the first VACUUM or ANALYZE
- * that counts; nothing before §33 reads past LionMetaPageData, which is why
- * the format version does not move (§33, "Format").
+ * n_distinct.  They follow LionMetaPageData on the meta page, at
+ * LION_META_NDISTINCT_OFFSET, and are there only when pd_lower covers them; a
+ * meta page that ends at LionMetaPageData reads as one without counts - the
+ * zero that "no count" is everywhere else.  A build writes the area, and a
+ * meta page without one gets it from the first VACUUM or ANALYZE that
+ * counts.
  *
  *	valid_cols	bit i - 1: ndistinct[i - 1] is key column i's count.  A
  *				multi-key column's keys are elements, not values of the
@@ -1092,7 +939,6 @@ lion_pivot_kindflags(uint16 flags)
 typedef struct LionOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly) */
-	int			buckets;		/* accepted and ignored since format 4 (§21) */
 	int			inline_limit;
 	int			max_entries;	/* 0 = unlimited (DESIGN.md §17) */
 	int			fillfactor;		/* directory leaf fill at build time (§21) */
@@ -1283,16 +1129,15 @@ typedef struct LionState
 
 	/*
 	 * The column has SUMMARY POSTING SETS (DESIGN.md §32): its bit in the meta
-	 * page's summary_cols.  Only ever set on an ordered scalar column, and only
-	 * on a version 7 index; inserts keep the summaries current and ranges read
-	 * them.
+	 * page's summary_cols.  Only ever set on an ordered scalar column; inserts
+	 * keep the summaries current and ranges read them.
 	 */
 	bool		summarized;
 
 	/*
 	 * The column is BIT-SLICED (DESIGN.md §51): its bit in the meta page's
 	 * slice_cols.  Only ever set on a scalar column whose key type
-	 * lion_slice_type_nbits() takes, and only on a version 15 index; slicebits
+	 * lion_slice_type_nbits() takes; slicebits
 	 * is that width, 16, 32 or 64.  Inserts keep the slices current;
 	 * lion_index_slice_agg() reads them.
 	 */
@@ -2733,9 +2578,7 @@ extern void lion_meta_record_summaries(LionMetaPageData *meta, uint32 cols,
 									   uint32 bucket_tids);
 
 /*
- * ... and which are bit-sliced (DESIGN.md §51), which decides the version:
- * 15 when any is, 14 - byte for byte what it was - when none is.  After
- * lion_meta_record_summaries(), which sets 14.
+ * ... and which are bit-sliced (DESIGN.md §51).
  */
 extern void lion_meta_record_slices(LionMetaPageData *meta, uint32 cols);
 

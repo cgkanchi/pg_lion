@@ -406,8 +406,7 @@ SELECT (SELECT leaf_pages FROM lion_index_stats('lion_grow_k')) <
 	   (SELECT entries FROM lion_index_stats('lion_grow_k')) = 80000 AS all_keys;
 SELECT lion_index_verify('lion_grow_k', true);
 SELECT lion_cmp('lion_grow', 'k = 12345');
--- `buckets` is accepted and ignored since format 4 (DESIGN.md §21).
-CREATE INDEX lion_grow_x ON lion_grow USING lion (k) WITH (buckets = 4);
+CREATE INDEX lion_grow_x ON lion_grow USING lion (k);
 INSERT INTO lion_grow VALUES (80001, 80001);
 SELECT entries = 80001 AS all_keys FROM lion_index_stats('lion_grow_x');
 DROP INDEX lion_grow_x;

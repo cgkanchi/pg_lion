@@ -2,8 +2,8 @@
 -- wrong is a read that fails its checks, and the scan reads that row from
 -- the heap, as it would have without one; only an entry that would make the
 -- scan return another row's vector, or one that is not an entry at all, is
--- an ERROR.  And a format-4 index, from before the locator, is refused
--- until a REINDEX.
+-- an ERROR.  And an index of another format version is refused until a
+-- REINDEX.
 --
 -- As in corrupt.sql, the pages are damaged ON DISK, under the server: each
 -- case writes the index out and drops its pages from the buffer pool
@@ -353,8 +353,8 @@ REINDEX INDEX tc_v;
 SELECT tc_cmp(:'qe', true) AS exact, tc_cmp(:'qp', false) AS probed;
 DROP TABLE tc;
 
--- ---------- 9. a format-4 index ----------
--- from before the locator: refused with the REINDEX hint, as format 3 is
+-- ---------- 9. an index of another format version ----------
+-- refused with the REINDEX hint
 CREATE TABLE tc4 (id int, v vector(1536)) WITH (autovacuum_enabled = off);
 INSERT INTO tc4 SELECT i, tc_vec(i, 1536) FROM generate_series(1, 100) i;
 CREATE INDEX tc4_v ON tc4 USING lionvec (v) WITH (partitions = 2);

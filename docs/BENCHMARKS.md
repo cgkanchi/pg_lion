@@ -141,9 +141,10 @@ OpenAI ada-002 embeddings of DBpedia entities (1536 dimensions; Qdrant's
 `dbpedia-openai-1M-1536-angular` set and the first 100 of its test queries), optionally under
 `WHERE u < s`, a uniform random column with a lion index that keeps a share `s` of the rows
 ([script](../bench/vector/knn.py), [results](../bench/results/2026-10-14-lionvec-partitions/)).
-lionvec in 1,974 partitions (`2 sqrt(n)`, its default then; now `8 sqrt(n)`, and each row in a
-second partition as well, `spill`: on 115,000 text-embedding-3-large rows those two together read
-1.8 times fewer code pages for 0.95 recall and 1.25 times fewer for 0.98, in about the same time;
+lionvec built with `partitions = 1974` (`2 sqrt(n)`) and `spill = off` (the defaults are
+`8 sqrt(n)` partitions with each row in a second partition as well, `spill = on`: on 115,000
+text-embedding-3-large rows those read 1.8 times fewer code pages for 0.95 recall, in the same
+time, and 1.25 times fewer for 0.98, taking 1.3 times longer, and make the index about 18% larger;
 [results](../bench/results/2026-10-14-lionvec-dbpedia/)), against pgvector 0.8.6's HNSW on
 `embedding::halfvec(1536)` (m 16, ef_construction 64). PostgreSQL 16, 4 vCPUs, 16 GB RAM,
 `shared_buffers` 5 GB, and pgvector's `vector` distance functions at `COST 100`, as lionvec's setup
@@ -162,8 +163,8 @@ defaults (margin 3, patience 30), at margins 2 and 4, and with the pause off:
 
 HNSW under a filter uses its iterative scan; without it, it returns 3.9 of the ten rows at 10% and
 0.4 at 1%. At 10% the planner chose lionvec's plain scan with a `Filter`, at 1% `LionOrdered`,
-and at 0.1% a sort of the 953 matching rows, for either index (since 2026-10-16 the plain scan with
-a `Filter` is a plan only under `pg_lion.vector_postfilter = allow`, DESIGN.md §44.6).
+and at 0.1% a sort of the 953 matching rows, for either index (the plain scan with a `Filter` is
+a plan only under `pg_lion.vector_postfilter = allow`, DESIGN.md §44.6).
 The pause stops a scan once 30
 times `sqrt(n) / 2` rows, here 30 partitions' worth, have brought nothing nearer; without it a query whose nearest rows lie
 far from every centroid reads hundreds of partitions (a mean of 254 of the 1,974 unfiltered, 77
@@ -198,12 +199,7 @@ are what to compare.
 codes; HNSW is 3.8 GB. lionvec builds in 19 minutes with the table cached, nearly all of it k-means
 and the assignment of every row to its nearest of the 1,974 centroids.
 
-Before the pause, at a margin of 2 narrowed under a filter, lionvec took 8.5 ms unfiltered (0.968),
-32 ms at 10% (0.989), 31 ms at 1% (0.979), 197 ms cold and 17 ms with 1 GB
-([results](../bench/results/2026-10-14-lionvec-partitions/before-pause/)). An earlier,
-unpartitioned lionvec read every row's one-bit code and returned the exact ten: 96 ms unfiltered,
-138 ms at 10%, 34 ms at 1% and 6.6 ms at 0.1%, and built in 98 s
-([results](../bench/results/2026-10-14-lionvec/)). Times vary between runs by up to a fifth.
+Times vary between runs by up to a fifth.
 
 ## Size, build and writes (5M rows, all seven indexes)
 

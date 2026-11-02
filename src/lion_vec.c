@@ -929,7 +929,8 @@ lionvec_check_meta(Relation index, Page page)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("index \"%s\" is not a lionvec index",
-						RelationGetRelationName(index))));
+						RelationGetRelationName(index)),
+				 errhint("If an older build of pg_lion wrote it, REINDEX it.")));
 	if (meta->version != LIONVEC_VERSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),

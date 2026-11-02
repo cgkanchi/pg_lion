@@ -1,0 +1,6 @@
+# The oldest version that ALTER EXTENSION ... UPDATE is tested from and that
+# test/upgrade/lint.py compares a pull request's base against: each
+# extension's SQL starts afresh at this version, with no upgrade script from
+# any earlier one.  run.sh skips install scripts of older versions in the
+# history, and lint.py skips a base branch whose version is older.
+0.3.0

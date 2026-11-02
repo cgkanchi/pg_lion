@@ -348,9 +348,9 @@ SELECT slc_cmp('slc_w1_k', 'g = 4');
 SELECT lion_index_verify('slc_w1_k', true);
 SELECT slc_err($$CREATE INDEX slc_bad ON slc_w2 USING lion (k) WITH (slices = maybe)$$);
 
--- A meta page whose version and sliced columns disagree, and one of a newer
--- format: refused by every reader.  Written on the file under the server,
--- before anything has read the new index's meta page into the buffers.
+-- A meta page of another format version: refused by every reader.  Written
+-- on the file under the server, before anything has read the new index's
+-- meta page into the buffers.
 CREATE FUNCTION slc_poke(idx regclass, pos int8, val int8)
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
@@ -377,15 +377,7 @@ END $$;
 CREATE TABLE slc_f (k int);
 INSERT INTO slc_f SELECT generate_series(1, 100);
 CREATE INDEX slc_f_k ON slc_f USING lion (k) WITH (slices = on);
-SELECT slc_poke('slc_f_k', 28, 14);
-SELECT slc_err($$SELECT lion_index_verify('slc_f_k')$$);
-DROP INDEX slc_f_k;
-CREATE INDEX slc_f_k ON slc_f USING lion (k);
-SELECT slc_poke('slc_f_k', 28, 15);
-SELECT slc_err($$SELECT lion_index_verify('slc_f_k')$$);
-DROP INDEX slc_f_k;
-CREATE INDEX slc_f_k ON slc_f USING lion (k) WITH (slices = on);
-SELECT slc_poke('slc_f_k', 28, 16);
+SELECT slc_poke('slc_f_k', 28, 2);
 SELECT slc_err($$SELECT lion_index_verify('slc_f_k')$$);
 DROP TABLE slc_f;
 

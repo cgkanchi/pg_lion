@@ -1,7 +1,6 @@
 /*-------------------------------------------------------------------------
  * lion_entryfmt.h
- *	  The layout of a directory entry tuple (DESIGN.md §21, "Entry tuples",
- *	  format version 10).
+ *	  The layout of a directory entry tuple (DESIGN.md §21, "Entry tuples").
  *
  *	  Every item on a directory page - an entry on a leaf, a high key, a
  *	  downlink - is a LionEntryTuple: a header, the key, and for an entry
@@ -84,7 +83,7 @@
 #define LION_ENTRY_MINUSINF	0x0040
 
 /*
- * SUMMARY entries (DESIGN.md §32, format version 7).  A summary entry's posting
+ * SUMMARY entries (DESIGN.md §32).  A summary entry's posting
  * set is the union of the posting sets of a run of its column's VALUE entries
  * - a BUCKET of keys - and its key is the largest key the bucket may hold: the
  * buckets of a column are (previous summary's key, this summary's key], in key
@@ -135,7 +134,7 @@
 #define LION_ENTRY_EMPTYINNER	0x2000
 
 /*
- * SLICE entries (DESIGN.md §51, format version 15).  A bit-sliced column keeps,
+ * SLICE entries (DESIGN.md §51).  A bit-sliced column keeps,
  * after its VALUE entries and its summaries, one entry per bit position of
  * its values' encoding (lion_slice_enc.h) whose posting set is the rows with
  * that bit set, and one EXISTENCE slice of every row not NULL.  Its key is

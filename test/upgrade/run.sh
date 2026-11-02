@@ -5,8 +5,9 @@
 # Usage: test/upgrade/run.sh [extension ...]	(default: every extension the
 # Makefile builds)
 #
-# For each version of <extension>--<version>.sql in the git history (so the
-# checkout needs its full history: fetch-depth 0 in CI), it installs that
+# For each version of <extension>--<version>.sql in the git history from
+# test/upgrade/floor's version on (so the checkout needs its full history:
+# fetch-depth 0 in CI), it installs that
 # script under its version in a new database, creates a lion (or lionvec)
 # index on every operator class the extension then had, runs ALTER EXTENSION
 # UPDATE, and requires the extension's catalog entries (test/upgrade/
@@ -44,6 +45,17 @@ fi
 
 failed=0
 db=lion_upgrade_test_$$
+floor=$(grep -v '^#' test/upgrade/floor | grep -m1 .)
+
+# Whether version $1 (X.Y.Z or X.Y.Z-devN) is older than the floor, by X.Y.Z.
+below_floor() {
+	local v=${1%%-dev*}
+	case "$v" in
+	[0-9]*.[0-9]*.[0-9]*) ;;
+	*) return 0 ;;
+	esac
+	[ "$v" != "$floor" ] && [ "$(printf '%s\n%s\n' "$v" "$floor" | sort -V | head -1)" = "$v" ]
+}
 
 # the old install script put in the extension directory for the test under
 # way, removed however the script ends
@@ -150,6 +162,7 @@ for ext in $exts; do
 	for commit in $(git log --format=%H -- "$ext.control" "$ext--*.sql"); do
 		ver=$(git show "$commit:$ext.control" 2>/dev/null | sed -n "s/^default_version = '\(.*\)'$/\1/p")
 		[ -n "$ver" ] || continue
+		! below_floor "$ver" || continue
 		blob=$(git rev-parse -q --verify "$commit:$ext--$ver.sql") || continue
 		[ -z "${done_blobs[$ver:$blob]:-}" ] || continue
 		done_blobs[$ver:$blob]=1
