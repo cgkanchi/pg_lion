@@ -153,7 +153,7 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each set of a lion union source that a count builds again"},
 	{"pg_lion.recheck_tid_cost", &lion_recheck_tid_cost, 1.5, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
-	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 1.0, LION_TUPLE,
+	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 2.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
 	{"pg_lion.recheck_sum_tid_cost", &lion_recheck_sum_tid_cost, 6.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of the heap recheck of a lion count summed over a column's entries"},

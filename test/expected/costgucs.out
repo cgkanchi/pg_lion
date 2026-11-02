@@ -66,7 +66,7 @@ SELECT name, setting, boot_val, context, vartype
  pg_lion.range_entry_cost              | 40      | 40       | user    | real
  pg_lion.range_fold_cost               | 420     | 420      | user    | real
  pg_lion.range_union_entry_cost        | 12      | 12       | user    | real
- pg_lion.recheck_group_tid_cost        | 1       | 1        | user    | real
+ pg_lion.recheck_group_tid_cost        | 2       | 2        | user    | real
  pg_lion.recheck_sum_tid_cost          | 6       | 6        | user    | real
  pg_lion.recheck_tid_cost              | 1.5     | 1.5      | user    | real
  pg_lion.resident_page_cost            | 120     | 120      | user    | real
@@ -308,10 +308,10 @@ SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') = :before AS same_cost
 -- a grouped count of a heap the visibility map vouches for half of: the node,
 -- at the grouped recheck's price, against a hash aggregate at the old one
 CREATE TABLE lcv WITH (autovacuum_enabled = off, fillfactor = 90) AS
-SELECT i AS id, i % 200 AS g, repeat('x', 40) AS pad FROM generate_series(1, 200000) i;
+SELECT i AS id, i % 200 AS g, repeat('x', 64) AS pad FROM generate_series(1, 200000) i;
 CREATE INDEX lcv_g ON lcv USING lion (g);
 VACUUM (FREEZE, ANALYZE) lcv;
-UPDATE lcv SET pad = repeat('y', 40) WHERE id % 100 = 0;
+UPDATE lcv SET pad = repeat('y', 64) WHERE id % 100 = 0;
 ANALYZE lcv;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcv GROUP BY g;
         QUERY PLAN         

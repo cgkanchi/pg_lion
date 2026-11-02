@@ -2502,7 +2502,7 @@ Planner integration
     that per member however it is organised (§15 builds the k-way one), and a single-key clause with
     k = 1 pays nothing for a merge it does not make;
   - **the heap the visibility map cannot vouch for**: `recheck_tids = rows × dirtyfrac` from
-    `pg_class.relallvisible/relpages`, `LION_RECHECK_TID_COST` (1.5 cpu_tuple_cost; 6 for a GROUP
+    `pg_class.relallvisible/relpages`, `LION_RECHECK_TID_COST` (1.5 cpu_tuple_cost; 2 for a GROUP
     BY's, `LION_RECHECK_GROUP_TID_COST`, "The units") each - that is a visibility-bit lookup in
     the per-query cache of §9 - on `Min(recheck_tids, heap_pages × dirtyfrac)` DISTINCT pages,
     fetched ONCE per query whatever brings the count back to them.
@@ -3269,10 +3269,10 @@ calibrated in §10's first version, before the posting tree, and never again.
 | `LION_ENTRY_COUNT_COST` (each count of a GROUP BY: one per entry of its column, per pair of two) | `cpu_tuple_cost` | 50 `cpu_tuple_cost` | 1.0 us a test of a walk of 20,000 entries; 1.3 us a group of 200 of six RUN containers |
 | `LION_LIST_GROUP_COST` (the same, a group of an IN list that drives them) | `cpu_tuple_cost` | 18 `cpu_tuple_cost` | 0.35 us a group over 1,000 of them |
 | `LION_UNION_SET_COST` (a set of a union source, rebuilt by every count of a GROUP BY; `LION_FKJOIN_SET_COST` is it) | 0 (80 `cpu_tuple_cost` in the FK join) | 100 `cpu_tuple_cost` | 2 us a set for 4 groups ANDed with a 1,000-value list; 2.7 and 6 us for 200 groups ANDed with a two-arm OR and a two-value list |
-| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache. *(The grouped one is 1 since 2026-11-01, below what it fits: see below.)* |
+| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache. *(The grouped one is 2 since 2026-11-01, below what it fits: see below.)* |
 | `LION_DISTINCT_TEST_COST` | 50 `cpu_tuple_cost` | unchanged | 1.0 us (§26) |
 
-**The grouped recheck below its fit (2026-11-01).** `LION_RECHECK_GROUP_TID_COST` went from 6 to 1
+**The grouped recheck below its fit (2026-11-01).** `LION_RECHECK_GROUP_TID_COST` went from 6 to 2
 `cpu_tuple_cost`, for a TID that takes 87 to 130 ns, on purpose. "Without the rates" (§39) left the
 whole-table GROUP BYs of a dirty heap to a hash aggregate core prices at about 190 units a
 millisecond, to be won back by pricing the node's own work; this constant is the only term of that
@@ -3281,18 +3281,27 @@ group summed over a column's entries keeps 6 as `LION_RECHECK_SUM_TID_COST`, sin
 sum at 1 beat a whole index's AND it runs twice as slow as (0.37 ms against 0.17,
 test/sql/countpartial.sql). At 5M rows, 1% of
 rows updated (48% of pages all-visible), 200 groups: a hash aggregate of 896 ms at 171,204 against
-the node's 326 ms at 214,714. On `bench/calib/matrix.py`'s ten grouped queries, 2M rows:
+the node's 326 ms at 214,714, and at 110,656 now. On `bench/calib/matrix.py`'s ten grouped queries, 2M rows:
 
-| rows updated | mispicks, time lost at 6 | at 2 | at 1 |
-|---|---|---|---|
-| 2% | 7, 1,194 ms | 3, 451 ms | |
-| 10% | 7, 1,067 ms | 3, 402 ms | 3, 402 ms |
-| 50% | 6, 621 ms | 6, 621 ms | 2, 264 ms |
-| 100% | 6, 494 ms | 6, 494 ms | 3, 305 ms |
+| rows updated | mispicks, time lost at 6 | at 3 | at 2 | at 1 |
+|---|---|---|---|---|
+| 1% | 7, 1,236 ms | 6, 1,119 ms | 3, 484 ms | 3, 484 ms |
+| 2% | 7, 1,194 ms | 6, 1,070 ms | 3, 451 ms | |
+| 5% | 7, 1,066 ms | 6, 956 ms | 3, 425 ms | 3, 425 ms |
+| 10% | 7, 1,067 ms | 7, 1,067 ms | 3, 402 ms | 3, 402 ms |
+| 50% | 6, 621 ms | 6, 621 ms | 6, 621 ms | 2, 264 ms |
+| 100% | 6, 494 ms | 6, 494 ms | 6, 494 ms | 3, 305 ms |
 
-Every plan the lower value moved to was the faster one, wholly dirty included, and the mispicks left
-are the same plan at every value. It is the rate in another form, the honest number being 6; what
-sets it apart is that a clean count and every other kind of competitor keep their prices.
+Every plan a lower value moved to was the faster one, wholly dirty included. 2 is the whole
+number nearest what the gap between the units explains (6 x 190 / 500, 2.3). On these tables it
+does all that 1 does up to 10% of rows updated, and leaves half and wholly updated tables to a hash
+aggregate 1.2 to 1.5 times slower, tables a VACUUM is due on. It also leaves narrow rows there, since
+a seq scan's price falls with the row and the recheck's does not: with 1% of rows updated and 200
+groups, a 40-byte column keeps the hash aggregate at 2 at 200,000 and at 1M rows, 2.2 to 3.3 times
+slower than the node (31 ms against 14, 157 against 77), and 1 moves it; at 64 bytes 2 moves it. It
+is the rate in another form, the
+honest number being 6; what sets it apart is that a clean count and every other kind of competitor
+keep their prices, and that it is a constant: nothing here reads a competing path.
 
 A GROUP BY is charged one merge per ENTRY of its column - the executor counts every entry and
 skips the empty ones after - with the entry's own set a source. Before, each group was charged

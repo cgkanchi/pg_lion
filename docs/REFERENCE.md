@@ -1238,7 +1238,7 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
-| `recheck_group_tid_cost` | 1.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `recheck_group_tid_cost` | 2.0 | `cpu_tuple_cost` | the same in a grouped count |
 | `recheck_sum_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in one count summed over a column's entries |
 | `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
