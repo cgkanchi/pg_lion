@@ -212,5 +212,20 @@ VACUUM bl_docs;
 SELECT members = (SELECT count(*) FROM bl_docs) AS members_right,
 	   sumlen = (SELECT sum(1 + (CASE WHEN d @@ 'w3' THEN 40 ELSE id % 7 END)) FROM bl_docs) AS sum_right
   FROM bl_words();
+-- a VACUUM that deleted every row records none, and as many rows of other
+-- lengths are walked, by a new connection and by one that saw the index empty
+DELETE FROM bl_docs;
+VACUUM bl_docs;
+SELECT * FROM bl_words();
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS empty_score;
+INSERT INTO bl_docs SELECT i, to_tsvector('simple', 'w1 ' || repeat('w3 ', 40))
+  FROM generate_series(1, 5658) i;
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS same_backend \gset
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS new_backend \gset
+ANALYZE bl_docs;
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS analyzed \gset
+SELECT :same_backend = :analyzed AS same_backend_right, :new_backend = :analyzed AS new_backend_right;
 DROP FUNCTION bl_words();
 DROP TABLE bl_docs;

@@ -316,7 +316,9 @@ lion_bm25_walk_lengths(Relation index, LionState *col, Datum lenkey,
  * into nd, for VACUUM and ANALYZE to write with their counts: the lengths of
  * every column that stores positions, walked now.  Each ANALYZE walks them
  * again rather than keeping a sum whose rows have not moved: rows replaced by
- * longer ones leave the count where it was.
+ * longer ones leave the count where it was.  A column left with no such rows
+ * records none, so that rows inserted later are not read at the lengths of
+ * rows that are gone.
  */
 void
 lion_bm25_count_lengths(Relation index, LionIndexState *ix,
@@ -330,9 +332,14 @@ lion_bm25_count_lengths(Relation index, LionIndexState *ix,
 		int64		members;
 		uint64		sumlen;
 
-		if (!lion_bm25_ranks(&ix->cols[i]) ||
-			lion_bm25_ntids(index, &ix->cols[i], lenkey, false) == 0)
+		if (!lion_bm25_ranks(&ix->cols[i]))
 			continue;
+		if (lion_bm25_ntids(index, &ix->cols[i], lenkey, false) == 0)
+		{
+			nd->ndistinct[i] = 0;
+			nd->sumsq[i] = 0;
+			continue;
+		}
 		lion_bm25_walk_lengths(index, &ix->cols[i], lenkey, &members, &sumlen);
 		nd->ndistinct[i] = (uint64) members;
 		nd->sumsq[i] = sumlen;
@@ -365,8 +372,18 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 	uint64		ntids = lion_bm25_ntids(index, col, lenkey, true);
 	bool		found;
 
+	StaticAssertStmt(sizeof(LionBm25StatsKey) == sizeof(Oid) + sizeof(int32),
+					 "LionBm25StatsKey has padding");
+	key.indexoid = RelationGetRelid(index);
+	key.attno = col->attno;
+
 	if (ntids == 0)
+	{
+		/* What this backend read belonged to rows that are gone */
+		if (lion_bm25_stats_cache != NULL)
+			(void) hash_search(lion_bm25_stats_cache, &key, HASH_REMOVE, NULL);
 		return false;
+	}
 
 	if (lion_bm25_stats_cache == NULL)
 	{
@@ -377,10 +394,6 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 		lion_bm25_stats_cache = hash_create("lion bm25 statistics", 16, &ctl,
 											HASH_ELEM | HASH_BLOBS);
 	}
-	StaticAssertStmt(sizeof(LionBm25StatsKey) == sizeof(Oid) + sizeof(int32),
-					 "LionBm25StatsKey has padding");
-	key.indexoid = RelationGetRelid(index);
-	key.attno = col->attno;
 	st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache, &key,
 									   HASH_FIND, &found);
 	if (!found || st->relnumber != index->rd_locator.relNumber ||

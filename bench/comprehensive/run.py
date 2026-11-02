@@ -95,6 +95,9 @@ class Suite:
             for key,value in vars(args).items():
                 if key != 'resume' and key in previous_args and value != previous_args[key]:
                     raise ValueError(f'Cannot resume with changed {key}: {value} != {previous_args[key]}')
+            # A run from before --shared-buffers records none, and ran at Cluster's default
+            if getattr(args,'shared_buffers','512MB') != previous_args.get('shared_buffers','512MB'):
+                raise ValueError('Cannot resume with a different shared_buffers')
             if self.previous['commit'] != command(['git','rev-parse','HEAD'],cwd=ROOT).strip():
                 raise ValueError('Cannot resume measurements against a different source commit')
             old_events=[json.loads(line) for line in (self.output/'operations.jsonl').read_text().splitlines()]

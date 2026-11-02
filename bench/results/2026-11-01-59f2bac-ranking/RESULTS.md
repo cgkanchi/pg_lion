@@ -1,6 +1,6 @@
 # Ranked full-text search: lion BM25 vs GIN + ts_rank
 
-`python3 bench/ranking/run.py --docs 500000 --repeats 9`, extension code at `59f2bac`, PostgreSQL 18.6 (packaged, `-O2`), shared buffers 2 GB, `work_mem` 64 MB, parallel query and JIT off, `pg_lion` preloaded. Ryzen 7 5700X3D, 8 cores, 23 GB RAM, WSL2. Warm cache, median of 9 runs after one warmup, each on a new connection, EXPLAIN ANALYZE execution time.
+`python3 bench/ranking/run.py --dsn 'dbname=rank' --docs 500000 --repeats 9`, extension code at `59f2bac`, PostgreSQL 18.6 (packaged, `-O2`), shared buffers 2 GB, `work_mem` 64 MB, parallel query and JIT off, `pg_lion` preloaded. Ryzen 7 5700X3D, 8 cores, 23 GB RAM, WSL2. Warm cache, median of 9 runs after one warmup, each on a new connection, EXPLAIN ANALYZE execution time.
 
 ```
 {"query": "two rare words", "tsquery": "w20000 | w31000", "matches": 584, "gin_ms": 3.25, "lion_ms": 3.742, "lion_scan": false}

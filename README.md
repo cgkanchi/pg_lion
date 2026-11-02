@@ -21,7 +21,7 @@ A lion index stores, for every distinct value, the set of rows that have it, as 
 - array membership (`tags @> ...`) and full-text search (`tsv @@ ...`), with phrase search and BM25 ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
-`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` and `halfvec` that reads a few percent of itself a query and fills its `LIMIT` under any lion filter (see [Nearest neighbours](#nearest-neighbours)).
+`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` and `halfvec` that reads a few percent of the index per query and fills its `LIMIT` under any lion filter (see [Nearest neighbours](#nearest-neighbours)).
 
 On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
 
@@ -181,7 +181,7 @@ SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
  LIMIT 10;
 ```
 
-When the query's words hold at least about 0.75% of the rows, the planner turns this into a `LionBm25` scan, which finds the top rows from the index and skips rows that can't make the cut, instead of scoring and sorting every match; with fewer matches, scoring and sorting them is faster. `lion_bm25(index, query, k)` returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable). An index on several tsvector columns ranks each one by its own statistics; name it with `col => 'body'`.
+When the query's words together hold at least about 0.75% of the rows (less if the tables and index outgrow `effective_cache_size`), the planner turns this into a `LionBm25` scan, which finds the top rows from the index and skips rows that can't make the cut, instead of scoring and sorting every match; with fewer, scoring and sorting the matches is faster. `lion_bm25(index, query, k)` returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable). An index on several tsvector columns ranks each one by its own statistics; name it with `col => 'body'`.
 
 ### Nearest neighbours
 
@@ -218,7 +218,7 @@ Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid
 - Inserts are about 1.4× slower than B-tree. A sliced column (`WITH (slices = on)`) pays a posting-set insert per set bit of each value on top: an `INSERT` into a table with a sliced `int4` and a sliced `int8` column took 4.6× as long as without slices with `pg_lion` preloaded, and about 11× without it. Slices serve int2, int4, int8, date, time and timestamp columns on one table, and a partitioned table's aggregates without a `GROUP BY` and its ranges; not floats, `numeric`, joins, or a partitioned table's `GROUP BY`.
 - A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
 - A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and is slower than GIN.
-- BM25 top-k slows down when every query term is very common. A query matching under about 0.75% of the rows has its matches scored and sorted rather than walked (`pg_lion.bm25_walk_min_share`).
+- BM25 top-k slows down when every query term is very common. A query whose words together hold under about 0.75% of the rows has its matches scored and sorted rather than walked (`pg_lion.bm25_walk_min_share`).
 - The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a table that is not partitioned, and not in its joins.
 - `lionvec` assumes pgvector's distance functions are costed at 100 (the `ALTER FUNCTION`s under [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1 the planner may sort a filter's rows by distance instead, which was 3 to 17 times slower for filters of 1% and 10% of a million rows. The setting is not kept by `pg_dump`, and an `ALTER EXTENSION vector UPDATE` may reset it, so run them again after either.
 - If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer rows than the `LIMIT` unless `hnsw.iterative_scan` is on.
@@ -234,7 +234,7 @@ The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
 ## Performance
 
-Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, warm cache, an 8-core Ryzen 7 5700X3D under WSL2, PostgreSQL 18.6), with how lion compares. "lion 10× faster" means the other index took ten times as long.
+Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, warm cache, an 8-core Ryzen 7 5700X3D under WSL2, PostgreSQL 18.6, `pg_lion.recheck_group_tid_cost` at 1, though the default of 2 picks the same plan for the one row it affects), with how lion compares. "lion 10× faster" means the other index took ten times as long.
 
 | Query                                                       | Lion     | B-tree                          | GIN                            |
 | ----------------------------------------------------------- | -------- | ------------------------------- | ------------------------------ |

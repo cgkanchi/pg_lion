@@ -4,7 +4,7 @@ Times and relative speeds from a synthetic benchmark. Absolute times depend on t
 ratios carry over better. "5× faster" means the other index took five times as long as lion. Times
 are milliseconds of query execution.
 
-**Setup.** The extension at `59f2bac`, PostgreSQL 18.6 (packaged, `-O2`), an 8-core Ryzen 7 5700X3D
+**Setup.** The extension at `59f2bac` (so `pg_lion.recheck_group_tid_cost` at 1; the default of 2 picks the same plan for the one query it affects), PostgreSQL 18.6 (packaged, `-O2`), an 8-core Ryzen 7 5700X3D
 under WSL2 with 23 GB RAM, focused profile. Lion preloaded, so its indexes use lion's own WAL format.
 Shared buffers 2 GB, which holds the tables and every index, `work_mem` 64 MB, parallel query and JIT
 off (index builds may still use parallel workers), warm cache. Each query is the median of seven
@@ -128,8 +128,9 @@ reach the top 10. Each run is on a new connection.
 | Two rare words | 584 | 3.74 | 3.25 | **1.2× slower** |
 | Two rare words ANDed | 18 | 0.57 | 0.56 | same |
 
-Below about 0.75% of the rows, as in the last two queries, sorting the matches beats the ranked walk,
-so lion does not offer it (`pg_lion.bm25_walk_min_share`), and both sides are a scan and a sort.
+When the query's words together hold under about 0.75% of the rows, as in the last two queries, sorting
+the matches beats the ranked walk, so lion does not offer it (`pg_lion.bm25_walk_min_share`, less when
+the tables and index outgrow `effective_cache_size`), and both sides are a scan and a sort.
 
 ## Nearest neighbours: lionvec against HNSW
 

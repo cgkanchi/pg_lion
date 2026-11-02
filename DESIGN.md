@@ -7058,7 +7058,9 @@ row, and the LionBm25 scan would return fewer rows than the sort of the same sco
   `lion_bm25_count_lengths()`), and a backend without its own reading takes that on the same 1/64
   terms. Without it every connection's first score paid the walk, 8 ms at 500k rows and 31 ms at 2M,
   and with it 0.4 ms at either. A built index has none until its first VACUUM or ANALYZE, and walks.
-  Each of them walks afresh, since rows replaced by longer ones leave the count where it was. The
+  Each of them walks afresh, since rows replaced by longer ones leave the count where it was, and a
+  key left with no rows records none, and drops a backend's reading that sees it so, or rows inserted
+  up to the old count would be read at the lengths of rows that are gone. The
   format is unchanged: an index whose words are zero reads as one with no reading.
 - **The column.** Keys are per key column (§24), so every column that stores positions has an empty
   key and lexeme entries of its own: its N, df, |d| and avgdl count that column alone, and a column
