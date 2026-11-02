@@ -1111,6 +1111,9 @@ working around a bad choice:
 - `pg_lion.enable_bm25_scan`: offer `LionBm25` for `ORDER BY lion_bm25_score(tsv, query, index
   [, ...]) DESC` with a `WHERE tsv @@ ...` it covers: the rows best first from the index's BM25
   walk (DESIGN.md §17, "Ranking"). Off, every match is scored and sorted.
+- `pg_lion.bm25_walk_min_share` (0.0075): the share of a table's rows a ranked query's lexemes must
+  hold for `LionBm25` to be offered, less when the tables and index outgrow `effective_cache_size`.
+  With fewer matches, sorting them is faster than the walk. 0 always offers it.
 - `pg_lion.enable_plain_scan`: let the planner use plain and index-only scans of Lion indexes
   (`amgettuple`, DESIGN.md §29). Off, Lion indexes are planned for bitmap scans only, as GIN
   indexes are, and every other index's scans are unaffected - where `enable_indexscan = off` would
@@ -1235,7 +1238,8 @@ was fitted at, and changing one changes plans, not results. Settable per session
 | `descent_cost` | 120 | `cpu_operator_cost` | a level of an entry directory descended |
 | `union_set_cost` | 100 | `cpu_tuple_cost` | a set of an `IN` list or `OR` rebuilt by each count of a GROUP BY |
 | `recheck_tid_cost` | 1.5 | `cpu_tuple_cost` | a candidate row of a count's heap recheck |
-| `recheck_group_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `recheck_group_tid_cost` | 1.0 | `cpu_tuple_cost` | the same in a grouped count |
+| `recheck_sum_tid_cost` | 6.0 | `cpu_tuple_cost` | the same in one count summed over a column's entries |
 | `position_member_cost` | 2.4 | `cpu_operator_cost` | a member of a lexeme's stored positions decoded by a position filter, seeking a candidate row (DESIGN.md §17, "Stored positions") |
 | `position_check_cost` | 4.3 | `cpu_operator_cost` | a candidate row decided from stored positions, per lexeme of the query |
 | `resident_page_cost` | 120 | `cpu_operator_cost` | a page of a Lion index a count reads while the index fits in `effective_cache_size` with the query's tables (DESIGN.md §39); a page that does not is priced as I/O |

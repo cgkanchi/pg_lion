@@ -3269,8 +3269,30 @@ calibrated in §10's first version, before the posting tree, and never again.
 | `LION_ENTRY_COUNT_COST` (each count of a GROUP BY: one per entry of its column, per pair of two) | `cpu_tuple_cost` | 50 `cpu_tuple_cost` | 1.0 us a test of a walk of 20,000 entries; 1.3 us a group of 200 of six RUN containers |
 | `LION_LIST_GROUP_COST` (the same, a group of an IN list that drives them) | `cpu_tuple_cost` | 18 `cpu_tuple_cost` | 0.35 us a group over 1,000 of them |
 | `LION_UNION_SET_COST` (a set of a union source, rebuilt by every count of a GROUP BY; `LION_FKJOIN_SET_COST` is it) | 0 (80 `cpu_tuple_cost` in the FK join) | 100 `cpu_tuple_cost` | 2 us a set for 4 groups ANDed with a 1,000-value list; 2.7 and 6 us for 200 groups ANDed with a two-arm OR and a two-value list |
-| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache |
+| `LION_RECHECK_TID_COST` / `LION_RECHECK_GROUP_TID_COST` (a candidate TID of the heap recheck) | `cpu_tuple_cost` | 1.5 / 6 `cpu_tuple_cost` | 24 to 29 ns a TID on pages holding 68 to 150 candidates, up to 70 ns at 34; 130 ns in a 200-group count of a wholly dirty table, 1.6M of 2M pages answered from the visibility cache. *(The grouped one is 1 since 2026-11-01, below what it fits: see below.)* |
 | `LION_DISTINCT_TEST_COST` | 50 `cpu_tuple_cost` | unchanged | 1.0 us (§26) |
+
+**The grouped recheck below its fit (2026-11-01).** `LION_RECHECK_GROUP_TID_COST` went from 6 to 1
+`cpu_tuple_cost`, for a TID that takes 87 to 130 ns, on purpose. "Without the rates" (§39) left the
+whole-table GROUP BYs of a dirty heap to a hash aggregate core prices at about 190 units a
+millisecond, to be won back by pricing the node's own work; this constant is the only term of that
+work that decides them, and it decides them only: a clean heap rechecks no TID, and a count of one
+group summed over a column's entries keeps 6 as `LION_RECHECK_SUM_TID_COST`, since a partial index's
+sum at 1 beat a whole index's AND it runs twice as slow as (0.37 ms against 0.17,
+test/sql/countpartial.sql). At 5M rows, 1% of
+rows updated (48% of pages all-visible), 200 groups: a hash aggregate of 896 ms at 171,204 against
+the node's 326 ms at 214,714. On `bench/calib/matrix.py`'s ten grouped queries, 2M rows:
+
+| rows updated | mispicks, time lost at 6 | at 2 | at 1 |
+|---|---|---|---|
+| 2% | 7, 1,194 ms | 3, 451 ms | |
+| 10% | 7, 1,067 ms | 3, 402 ms | 3, 402 ms |
+| 50% | 6, 621 ms | 6, 621 ms | 2, 264 ms |
+| 100% | 6, 494 ms | 6, 494 ms | 3, 305 ms |
+
+Every plan the lower value moved to was the faster one, wholly dirty included, and the mispicks left
+are the same plan at every value. It is the rate in another form, the honest number being 6; what
+sets it apart is that a clean count and every other kind of competitor keep their prices.
 
 A GROUP BY is charged one merge per ENTRY of its column - the executor counts every entry and
 skips the empty ones after - with the entry's own set a source. Before, each group was charged
@@ -7021,7 +7043,14 @@ row, and the LionBm25 scan would return fewer rows than the sort of the same sco
   verify carry it with no change, and it costs one member per row (about 2 MB at 500k rows).
 - **N** is the empty key's `ntids`. **avgdl** is the mean of its members' lengths; reading it walks
   the whole key, so a backend keeps it per index column until the key's `ntids` moves by more than
-  1/64 or the index is rebuilt.
+  1/64 or the index is rebuilt. VACUUM and ANALYZE walk the key too and record its members and the sum
+  of their lengths on the meta page (§33's area: the `ndistinct` and `sumsq` words of a multi-key
+  column, which it has no other use for and whose `valid_cols` bit stays clear;
+  `lion_bm25_count_lengths()`), and a backend without its own reading takes that on the same 1/64
+  terms. Without it every connection's first score paid the walk, 8 ms at 500k rows and 31 ms at 2M,
+  and with it 0.4 ms at either. A built index has none until its first VACUUM or ANALYZE, and walks.
+  Each of them walks afresh, since rows replaced by longer ones leave the count where it was. The
+  format is unchanged: an index whose words are zero reads as one with no reading.
 - **The column.** Keys are per key column (§24), so every column that stores positions has an empty
   key and lexeme entries of its own: its N, df, |d| and avgdl count that column alone, and a column
   of a multi-column index ranks exactly as an index on that column alone would, bit for bit.
@@ -7087,6 +7116,16 @@ call site. Its tf, length (every occurrence of every non-empty lexeme, capped at
 of addition are the walk's: both add a row's terms in descending order of idf, ties in query order,
 so a row gets the same float from either, bit for bit, as an incremental sort over the scan's order
 needs.
+
+**Few matches.** The walk is not offered when the query's lexemes hold fewer rows than
+`pg_lion.bm25_walk_min_share` (0.75%) of the table's, scaled down by how far the query's tables and
+the index outgrow `effective_cache_size`. Before its first row the walk reads most of the empty
+key's pages for candidates' lengths, a cost that levels off with the matches, while sorting grows
+with them, so warm the sort wins below a share of the rows that held across sizes: 1% at 100k rows,
+0.72% at 500k, 0.8% at 2M (two rare words at 500k, 584 matches: 3.5 ms against 0.8). No price says
+so, because core's estimate of a rare lexeme's rows is flat - the plain plan cost 16,953 from 387
+matches to 9,547 - so a declined path, decided on the walk's exact `ncand`, is what works. Cold, the
+walk's few heap pages beat the sort's one per match, hence the scaling.
 
 `LionBm25` (lion_bm25_scan.c) is a CustomScan offered from `set_rel_pathlist_hook` for a base table
 whose query's first pathkey is `lion_bm25_score(doc, Const, Const, Const, Const, Const) DESC`, the

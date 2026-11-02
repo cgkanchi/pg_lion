@@ -26,8 +26,9 @@ def command(args, **kwargs):
 
 
 class Cluster:
-    def __init__(self, prefix, output, preload=False):
+    def __init__(self, prefix, output, preload=False, shared_buffers='512MB'):
         self.preload = preload
+        self.shared_buffers = shared_buffers
         self.prefix, self.output = Path(prefix).resolve(), output
         self.root = Path(tempfile.mkdtemp(prefix='lion-comparison-', dir='/tmp'))
         self.data, self.socket = self.root/'data', self.root/'socket'
@@ -42,7 +43,8 @@ class Cluster:
             command([self.prefix/'bin/initdb', '-D', self.data, '-U', 'postgres', '--no-locale', '-A', 'trust'])
             with (self.data/'postgresql.conf').open('a') as f:
                 f.write(f"\nlisten_addresses=''\nunix_socket_directories='{self.socket}'\nport=55449\n"
-                        "shared_buffers='512MB'\nwork_mem='64MB'\nmaintenance_work_mem='512MB'\n"
+                        f"shared_buffers='{self.shared_buffers}'\n"
+                        "work_mem='64MB'\nmaintenance_work_mem='512MB'\n"
                         "max_parallel_workers_per_gather=0\njit=off\nautovacuum=off\n"
                         "checkpoint_timeout='1h'\nmax_wal_size='8GB'\ntrack_io_timing=on\n"
                         "fsync=on\nsynchronous_commit=on\nfull_page_writes=on\n")
@@ -136,7 +138,8 @@ class Suite:
                 raise ValueError(f'Partly measured portfolios need a separate output directory: {unfinished}')
         else:
             self.output.mkdir(parents=True, exist_ok=False)
-        self.cluster = Cluster(args.prefix, self.output, preload=args.preload)
+        self.cluster = Cluster(args.prefix, self.output, preload=args.preload,
+                               shared_buffers=getattr(args, 'shared_buffers', '512MB'))
         self.rng = random.Random(args.seed)
         mode='a' if args.resume else 'w'
         self.samples = (self.output/'samples.jsonl').open(mode, buffering=1)
@@ -481,6 +484,7 @@ def parse_args(argv=None):
     p.add_argument('--resume',action='store_true',help='Resume a stopped run at a completed portfolio boundary, with identical arguments')
     p.add_argument('--seed',type=int,default=20260920)
     p.add_argument('--preload',action='store_true',help="Start the cluster with shared_preload_libraries='pg_lion' so lion indexes use the custom WAL resource manager (wal_mode=auto -> rmgr)")
+    p.add_argument('--shared-buffers',default='2GB',help='Holds the tables and indexes at the default scales, so that a warm query reads nothing from outside the buffers; a smaller value makes timings depend on what the previous query evicted')
     args = p.parse_args(argv)
     full = args.profile == 'full'
     defaults = dict(families=FAMILIES if full else FOCUSED_FAMILIES,

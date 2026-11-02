@@ -166,6 +166,7 @@
 #include "utils/syscache.h"
 
 #include "lion.h"
+#include "lion_bm25.h"
 #include "lion_count.h"
 
 /*
@@ -731,7 +732,10 @@ lionbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		if (counted)
 			lion_meta_fill_ndistinct(&nd, vs.ix, vs.nvalues, vs.sumsq,
 									 (uint64) vs.numtids);
-		lion_meta_count_bulkdelete(index, counted ? &nd : NULL);
+		else
+			(void) lion_read_meta_ndistinct(index, &nd);
+		lion_bm25_count_lengths(index, vs.ix, &nd);
+		lion_meta_count_bulkdelete(index, &nd);
 	}
 	pfree(vs.nvalues);
 	pfree(vs.sumsq);
@@ -1451,6 +1455,7 @@ lion_vacuum_sample_keys(IndexVacuumInfo *info, LionIndexState *ix,
 	}
 	lion_meta_fill_ndistinct(&nd, ix, finalv, finals,
 							 lion_vacuum_scaled(estrows, false));
+	lion_bm25_count_lengths(index, ix, &nd);
 	lion_meta_write_ndistinct(index, &nd);
 
 	pfree(estv);
@@ -1514,7 +1519,19 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	int			depth;
 
 	if (!lion_vac_may_count(index, ix))
+	{
+		/*
+		 * An index of multi-key columns alone has no keys to count, and what
+		 * BM25 reads of its columns is still counted.
+		 */
+		if (lion_vac_may_write(index))
+		{
+			(void) lion_read_meta_ndistinct(index, &nd);
+			lion_bm25_count_lengths(index, ix, &nd);
+			lion_meta_write_ndistinct(index, &nd);
+		}
 		return;
+	}
 	budget = lion_vacuum_count_budget(index);
 	if (budget == 0)
 		return;
@@ -1614,6 +1631,7 @@ lion_vacuum_count_keys(IndexVacuumInfo *info)
 	}
 
 	lion_meta_fill_ndistinct(&nd, ix, nvalues, sumsq, rows);
+	lion_bm25_count_lengths(index, ix, &nd);
 	lion_meta_write_ndistinct(index, &nd);
 	if (nlisted >= 0)
 		pfree(listed);

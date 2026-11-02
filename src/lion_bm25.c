@@ -23,10 +23,11 @@
  *				empty key, which the extraction files for every row with a
  *				lexeme (lion_extract_internal());
  *	N			the rows filed under the empty key;
- *	avgdl		the mean length of the empty key's members, which a backend
- *				computes once and keeps until the empty key's row count has
- *				moved by more than 1/64 or the index has been rebuilt
- *				(lion_bm25_stats()).
+ *	avgdl		the mean length of the empty key's members, which VACUUM and
+ *				ANALYZE record on the meta page and a backend keeps; either is
+ *				used until the empty key's row count has moved by more than
+ *				1/64 from it, and past that, or with none recorded, a backend
+ *				computes it (lion_bm25_stats()).
  *
  *		score(d) = sum over t of idf(t) * tf * (k1 + 1) /
  *								(tf + k1 * (1 - b + b * |d| / avgdl))
@@ -284,11 +285,76 @@ lion_bm25_length(const LionPosMember *m)
 	return (m->npos > 0) ? (double) m->pos[0] : 0;
 }
 
+static bool lion_bm25_ranks(const LionState *col);
+
+/* The members of the empty key and the sum of their lengths, walked. */
+static void
+lion_bm25_walk_lengths(Relation index, LionState *col, Datum lenkey,
+					   int64 *members, uint64 *sumlen)
+{
+	LionPosCursor *cur = lion_bm25_open(index, col, lenkey, false);
+	const LionPosMember *m;
+	uint64		code = 0;
+	int64		n = 0;
+	uint64		sum = 0;
+
+	while ((m = lion_poscursor_next(index, cur, code)) != NULL)
+	{
+		sum += (uint64) lion_bm25_length(m);
+		n++;
+		code = m->code + 1;
+		if ((n & 0xfff) == 0)
+			CHECK_FOR_INTERRUPTS();
+	}
+	lion_poscursor_close(cur);
+	*members = n;
+	*sumlen = sum;
+}
+
+/*
+ * What lion_bm25_stats() reads of a column instead of walking its empty key,
+ * into nd, for VACUUM and ANALYZE to write with their counts: the lengths of
+ * every column that stores positions, walked now.  Each ANALYZE walks them
+ * again rather than keeping a sum whose rows have not moved: rows replaced by
+ * longer ones leave the count where it was.
+ */
+void
+lion_bm25_count_lengths(Relation index, LionIndexState *ix,
+						LionMetaNdistinct *nd)
+{
+	Datum		lenkey = PointerGetDatum(cstring_to_text_with_len("", 0));
+	int			i;
+
+	for (i = 0; i < ix->ncolumns && i < LION_META_MAX_COLS; i++)
+	{
+		int64		members;
+		uint64		sumlen;
+
+		if (!lion_bm25_ranks(&ix->cols[i]) ||
+			lion_bm25_ntids(index, &ix->cols[i], lenkey, false) == 0)
+			continue;
+		lion_bm25_walk_lengths(index, &ix->cols[i], lenkey, &members, &sumlen);
+		nd->ndistinct[i] = (uint64) members;
+		nd->sumsq[i] = sumlen;
+	}
+}
+
+/*
+ * Is a count of the empty key's rows within 1/64 of the one lengths were read
+ * at?
+ */
+static inline bool
+lion_bm25_lengths_current(uint64 ntids, uint64 then)
+{
+	return (ntids > then ? ntids - then : then - ntids) <= then / 64;
+}
+
 /*
  * N, the empty key's ntids, and avgdl: the mean length of the empty key's
- * members, walked from it, or this backend's last walk of the column's key
- * while its ntids is within 1/64 of what it was then and the index has not
- * been rebuilt.  False when no row has a lexeme.
+ * members - this backend's last reading of the column's key while its ntids
+ * is within 1/64 of what it was then and the index has not been rebuilt, the
+ * meta page's on the same terms, and otherwise walked from the key.  False
+ * when no row has a lexeme.
  */
 static bool
 lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
@@ -318,24 +384,23 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 	st = (LionBm25Stats *) hash_search(lion_bm25_stats_cache, &key,
 									   HASH_FIND, &found);
 	if (!found || st->relnumber != index->rd_locator.relNumber ||
-		(ntids > st->ntids ? ntids - st->ntids : st->ntids - ntids) >
-		st->ntids / 64)
+		!lion_bm25_lengths_current(ntids, st->ntids))
 	{
-		LionPosCursor *cur = lion_bm25_open(index, col, lenkey, false);
-		const LionPosMember *m;
-		uint64		code = 0;
-		int64		n = 0;
-		double		sum = 0;
+		LionMetaNdistinct nd;
+		int			c = col->attno - 1;
+		int64		n;
+		uint64		sum;
 
-		while ((m = lion_poscursor_next(index, cur, code)) != NULL)
+		if (c < LION_META_MAX_COLS && lion_read_meta_ndistinct(index, &nd) &&
+			(nd.valid_cols & (((uint32) 1) << c)) == 0 &&
+			nd.ndistinct[c] != 0 &&
+			lion_bm25_lengths_current(ntids, nd.ndistinct[c]))
 		{
-			sum += lion_bm25_length(m);
-			n++;
-			code = m->code + 1;
-			if ((n & 0xfff) == 0)
-				CHECK_FOR_INTERRUPTS();
+			n = (int64) nd.ndistinct[c];
+			sum = nd.sumsq[c];
 		}
-		lion_poscursor_close(cur);
+		else
+			lion_bm25_walk_lengths(index, col, lenkey, &n, &sum);
 
 		/*
 		 * The entry is made once the walk is done: made before it, a walk
@@ -347,7 +412,7 @@ lion_bm25_stats(Relation index, LionState *col, Datum lenkey,
 		st->relnumber = index->rd_locator.relNumber;
 		st->ntids = ntids;
 		st->nrows = n;
-		st->sumlen = sum;
+		st->sumlen = (double) sum;
 	}
 	if (st->nrows == 0)
 		return false;
