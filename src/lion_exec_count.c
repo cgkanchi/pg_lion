@@ -4161,10 +4161,12 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 	switch (st->mode)
 	{
 		case LION_MODE_DECODE:
-			Assert(st->decode != NULL);
+			if (st->decode == NULL)
+				break;
 			return lion_next_group_decode(st, exhausted);
 		case LION_MODE_CELLS:
-			Assert(st->decode != NULL && st->cells != NULL);
+			if (st->decode == NULL || st->cells == NULL)
+				break;
 			return lion_next_cells(st, exhausted);
 		case LION_MODE_GROUP_DISTINCT:
 			Assert(st->decode == NULL && st->plan.distattno != 0);
@@ -4187,6 +4189,7 @@ lion_next_group_any(LionCountScanState *st, bool *exhausted)
 		case LION_MODE_JOIN_FACTGROUP:
 			break;
 	}
-	elog(ERROR, "LionCount: mode %d has no groups", (int) st->mode);
+	elog(ERROR, "LionCount: mode %d has no groups, or not the state to make them",
+		 (int) st->mode);
 	return NULL;				/* keep compiler quiet */
 }

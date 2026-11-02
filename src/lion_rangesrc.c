@@ -1324,7 +1324,7 @@ lion_range_probe_fits(double rows, double containers, Size maxbytes)
 	copy = sizeof(LionMatSet) +
 		n * (item + sizeof(LionContainer *) + sizeof(uint32));
 	need = copy + n * (marks + sizeof(uint32) + 2 * sizeof(void *));
-	return copy <= (double) (maxbytes / 2) && need <= (double) maxbytes;
+	return copy <= (double) maxbytes / 2.0 && need <= (double) maxbytes;
 }
 
 /*

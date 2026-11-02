@@ -3494,7 +3494,8 @@ lion_plan_flag(const LionCountScanState *st, int flag)
 static inline LionTopkState *
 lion_st_topk(LionCountScanState *st)
 {
-	Assert(st->topk != NULL);
+	if (unlikely(st->topk == NULL))
+		elog(ERROR, "LionCount: no top k state");
 	return st->topk;
 }
 
@@ -3502,7 +3503,8 @@ lion_st_topk(LionCountScanState *st)
 static inline LionCoalState *
 lion_st_coal(LionCountScanState *st)
 {
-	Assert(st->coal != NULL);
+	if (unlikely(st->coal == NULL))
+		elog(ERROR, "LionCount: no coalesce group state");
 	return st->coal;
 }
 
@@ -3510,7 +3512,8 @@ lion_st_coal(LionCountScanState *st)
 static inline LionWaggState *
 lion_st_wagg(LionCountScanState *st)
 {
-	Assert(st->wagg != NULL);
+	if (unlikely(st->wagg == NULL))
+		elog(ERROR, "LionCount: no key aggregates state");
 	return st->wagg;
 }
 
@@ -3518,7 +3521,8 @@ lion_st_wagg(LionCountScanState *st)
 static inline LionInnerState *
 lion_st_inner(LionCountScanState *st)
 {
-	Assert(st->inner != NULL);
+	if (unlikely(st->inner == NULL))
+		elog(ERROR, "LionCount: no nested loop state");
 	return st->inner;
 }
 
@@ -3526,7 +3530,8 @@ lion_st_inner(LionCountScanState *st)
 static inline LionDistinctState *
 lion_st_dist(LionCountScanState *st)
 {
-	Assert(st->dist != NULL);
+	if (unlikely(st->dist == NULL))
+		elog(ERROR, "LionCount: no count(DISTINCT) state");
 	return st->dist;
 }
 
@@ -3534,7 +3539,8 @@ lion_st_dist(LionCountScanState *st)
 static inline LionListBatch *
 lion_st_lbatch(LionCountScanState *st)
 {
-	Assert(st->lbatch != NULL);
+	if (unlikely(st->lbatch == NULL))
+		elog(ERROR, "LionCount: no list batch state");
 	return st->lbatch;
 }
 
@@ -3542,7 +3548,8 @@ lion_st_lbatch(LionCountScanState *st)
 static inline LionRangedState *
 lion_st_ranged(LionCountScanState *st)
 {
-	Assert(st->ranged != NULL);
+	if (unlikely(st->ranged == NULL))
+		elog(ERROR, "LionCount: no ranges state");
 	return st->ranged;
 }
 
@@ -3550,7 +3557,8 @@ lion_st_ranged(LionCountScanState *st)
 static inline LionFactGroupState *
 lion_st_fg(LionCountScanState *st)
 {
-	Assert(st->fg != NULL);
+	if (unlikely(st->fg == NULL))
+		elog(ERROR, "LionCount: no fact group state");
 	return st->fg;
 }
 
@@ -3558,7 +3566,8 @@ lion_st_fg(LionCountScanState *st)
 static inline LionJoinState *
 lion_st_join(LionCountScanState *st)
 {
-	Assert(st->join != NULL);
+	if (unlikely(st->join == NULL))
+		elog(ERROR, "LionCount: no join state");
 	return st->join;
 }
 

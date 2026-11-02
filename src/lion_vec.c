@@ -1578,7 +1578,7 @@ lionvec_build_info(int metric, bool half, int dims, const float *mean)
 	lionvec_info_fix(info, mean != NULL);
 	if (dims > 0)
 		lionvec_rotation_init(&info->rot, dimsp, LIONVEC_SEED, info->rot.signs);
-	if (info->mean != NULL)
+	if (mean != NULL && info->mean != NULL)	/* none at 0 dimensions */
 		memcpy(info->mean, mean, sizeof(float) * dimsp);
 	return info;
 }
@@ -4515,9 +4515,10 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	 * Centroids whose numbers lionvec_part_at() and lionvec_cent_refine()
 	 * have checked leave min(k, m) candidates or more (lion_vec_math.h), so
 	 * two or more in an index that spills, which has two partitions or more
-	 * (lionvec_check_meta())
+	 * (lionvec_check_meta()).  The caller has one partition or more, so this
+	 * is one or more; nr is held to one as well, rank[0] being read below.
 	 */
-	if (nr < Min(k, m))
+	if (nr < Max(Min(k, m), 1))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("lionvec index \"%s\" has malformed centroids: %d of %d near a row, fewer than %d",
