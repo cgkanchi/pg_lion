@@ -4443,7 +4443,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	LionVecInsScan is;
 	LionVecInsCand *cands;
 	double	   *key;
-	int			rank[LIONVEC_SOAR_CANDS + 1];
+	int			rank[LIONVEC_SOAR_CANDS + 1] = {0};	/* lionvec_rank() sets nr */
 	uint8	   *ccodes = NULL;	/* spilling: [nc][dimsp], the candidates' codes */
 	float	   *calpha8 = NULL;
 	float	   *crnorm8 = NULL;

@@ -3561,6 +3561,15 @@ lion_st_fg(LionCountScanState *st)
 	return st->fg;
 }
 
+/* The aggregates of sliced columns' state, which only a plan with them has (§52) */
+static inline LionSliceState *
+lion_st_slice(LionCountScanState *st)
+{
+	if (unlikely(st->slice == NULL))
+		elog(ERROR, "LionCount: no sliced column state");
+	return st->slice;
+}
+
 /* The FK-side join's state, which only a join has (§27) */
 static inline LionJoinState *
 lion_st_join(LionCountScanState *st)

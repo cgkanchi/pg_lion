@@ -1187,8 +1187,8 @@ lion_verify_meta(LionVerifyState *vs)
 	 * The sliced columns of §51: columns the index has, and columns that can
 	 * be sliced (lion_fill_index_state() refuses the rest before this runs).
 	 */
-	if ((meta->slice_cols >> vs->ix->ncolumns) != 0 &&
-		vs->ix->ncolumns < 32)
+	if (vs->ix->ncolumns < 32 &&
+		(meta->slice_cols >> vs->ix->ncolumns) != 0)
 		lion_corrupt("lion index \"%s\": meta page names sliced key columns %08X of %d",
 					RelationGetRelationName(vs->index), meta->slice_cols,
 					vs->ix->ncolumns);

@@ -5938,6 +5938,9 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 	int			ncols = 0;
 	HeapTuple	result;
 
+	if (tuples < 1.0)			/* the caller's test: a frequency of rows */
+		return NULL;
+
 	/* ANALYZE's most common values, or the first free slot */
 	for (slot = 0; slot < STATISTIC_NUM_SLOTS; slot++)
 	{
@@ -6036,9 +6039,8 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 
 		for (i = 0; i < n; i++)
 			sum += ent[i].freq;
-		if (sum <= limit)
+		if (sum <= limit || sum <= 0.0)
 			break;
-		/* sum > limit >= 0 */
 		scale = limit / sum * (1.0 - 1e-6 * (pass + 1));
 		for (i = 0; i < n; i++)
 			ent[i].freq = (float4) (ent[i].freq * scale);
