@@ -732,16 +732,23 @@ lion_anti_held_begin(LionAntiState *as)
 	as->spilled |= LION_ANTI_SPILL_SUB;
 }
 
-/* A row of the held sort: a group's columns or a cell's code, a count, a loss */
+/*
+ * A row of the held sort: a group's columns or a cell's code, a count, a
+ * loss.  nkey is how many key[] and isnull[] hold, which is the sort's
+ * nheldkey.
+ */
 static void
-lion_anti_held_put(LionAntiState *as, const Datum *key, const bool *isnull,
-				   int64 count, int64 sub)
+lion_anti_held_put(LionAntiState *as, int nkey, const Datum *key,
+				   const bool *isnull, int64 count, int64 sub)
 {
 	TupleTableSlot *in = as->heldin;
 	int			g;
 
+	if (nkey != as->nheldkey)
+		elog(ERROR, "lion anti join: %d keys for a held sort of %d",
+			 nkey, as->nheldkey);
 	ExecClearTuple(in);
-	for (g = 0; g < as->nheldkey; g++)
+	for (g = 0; g < nkey; g++)
 	{
 		in->tts_values[g] = key[g];
 		in->tts_isnull[g] = isnull[g];
@@ -762,7 +769,7 @@ lion_anti_held_put_code(LionAntiState *as, uint64 code, int64 count,
 	Datum		key = Int64GetDatum((int64) code);
 	bool		isnull = false;
 
-	lion_anti_held_put(as, &key, &isnull, count, sub);
+	lion_anti_held_put(as, 1, &key, &isnull, count, sub);
 }
 
 /* Do the held sort's rows in heldcur and heldnext have one group or cell? */
@@ -930,7 +937,7 @@ lion_anti_group_lose(LionAntiState *as, const Datum *key, const bool *isnull)
 
 	if (as->merging)
 	{
-		lion_anti_held_put(as, key, isnull, 0, 1);
+		lion_anti_held_put(as, as->nheldkey, key, isnull, 0, 1);
 		return;
 	}
 	lion_anti_group_of(as, key, isnull, true)->n++;
@@ -944,7 +951,8 @@ lion_anti_group_lose(LionAntiState *as, const Datum *key, const bool *isnull)
 		LionAntiGroup *grp;
 
 		for (grp = as->gbuckets[i]; grp != NULL; grp = grp->next)
-			lion_anti_held_put(as, grp->key, grp->isnull, 0, grp->n);
+			lion_anti_held_put(as, as->nheldkey, grp->key, grp->isnull, 0,
+							   grp->n);
 	}
 	MemoryContextReset(as->gcxt);
 	as->gbuckets = NULL;
@@ -1377,7 +1385,7 @@ lion_anti_adjust(LionCountScanState *st, int nkeys, const Datum *keys,
 		else if (as->merging)
 		{
 			Assert(nkeys >= as->ngroup);
-			lion_anti_held_put(as, keys, keyisnull, *count, 0);
+			lion_anti_held_put(as, as->nheldkey, keys, keyisnull, *count, 0);
 			return true;
 		}
 		else

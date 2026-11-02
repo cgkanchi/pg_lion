@@ -1276,7 +1276,7 @@ lion_key_form(struct varlena *v, Size *size)
  * A key too long to store, the ERROR btree raises for a value too long for
  * an index tuple, of the index and - when the caller knows it - the heap row.
  */
-static void
+pg_noreturn static void
 lion_key_too_long(LionState *state, Size size, Relation heap, ItemPointer tid)
 {
 	Oid			indexoid = (state->ix != NULL) ? state->ix->indexrelid :

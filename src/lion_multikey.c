@@ -1906,7 +1906,12 @@ lion_ambiguous_values(LionState *state, Datum value, Datum key, Datum **values)
 															value,
 															PointerGetDatum(&nraw),
 															PointerGetDatum(&nulls)));
-	if (raw == NULL || nraw <= 0)
+	/*
+	 * The extraction set nraw through the pointer in a Datum, which a static
+	 * analyser does not follow: to it nraw is still 0 here.
+	 */
+	/* coverity[dead_error_line] */
+	if (nraw <= 0 || raw == NULL)
 		return 0;
 	out = (Datum *) palloc(sizeof(Datum) * nraw);
 	for (i = 0; i < nraw; i++)

@@ -1350,8 +1350,10 @@ lion_fkjoin_recognize_small_anti(PlannerInfo *root, RelOptInfo *joinrel,
 
 		if (sjinfo == anti)
 			continue;
-		if (!bms_is_subset(sjinfo->syn_lefthand, anti->syn_righthand) ||
-			!bms_is_subset(sjinfo->syn_righthand, anti->syn_righthand))
+		/* both of its sides within the anti join's inner side */
+		if (!bms_is_subset(bms_union(sjinfo->syn_lefthand,
+									 sjinfo->syn_righthand),
+						   anti->syn_righthand))
 			return false;
 	}
 

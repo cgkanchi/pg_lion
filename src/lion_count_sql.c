@@ -569,7 +569,8 @@ lion_count_open_indexes_ext(Snapshot snapshot, int nidx, const Oid *idxoid,
 	int			i;
 
 	/* index[] and keytype[] hold two; every caller opens one or two */
-	Assert(nidx >= 1 && nidx <= (int) lengthof(call->index));
+	if (nidx < 1 || nidx > (int) lengthof(call->index))
+		elog(ERROR, "lion index count: %d indexes, not one or two", nidx);
 
 	call->nkeys = nidx;
 	call->heap = NULL;
@@ -959,14 +960,15 @@ lion_count_sql_close(LionCountCall *call)
  * "Monitoring"): a scan of each index it read, once however often it is
  * named, and the rows it counted as each one's idx_tup_read - as a scan of
  * an index for each call, the way a nested loop's inner index scan is
- * counted for each outer row.
+ * counted for each outer row.  Both places are read: one a call did not
+ * open is NULL (lion_count_open_indexes_ext()).
  */
 void
 lion_count_sql_report(LionCountCall *call, int64 rows)
 {
 	int			i;
 
-	for (i = 0; i < call->nkeys; i++)
+	for (i = 0; i < (int) lengthof(call->index); i++)
 	{
 		if (call->index[i] == NULL ||
 			(i == 1 && call->index[0] == call->index[1]))
