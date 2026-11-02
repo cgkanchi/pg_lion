@@ -118,6 +118,7 @@
 
 #include "lion_compat.h"
 #include "lion_readahead.h"
+#include "lion_simplehash.h"
 #include "lion_vec.h"
 
 /* what an entry of the row queue knows of its row */
@@ -2903,7 +2904,7 @@ lv_cap(const LvScanOpaque *so)
 	int			cap;
 
 	cap = (int) Min((double) work_mem * 1024.0 / sizeof(LvItem),
-					(double) (MaxAllocSize / sizeof(LvItem) / 2));
+					(double) MaxAllocSize / sizeof(LvItem) / 2.0);
 	return Max(cap, 4 * so->batch + 64);
 }
 
@@ -3019,7 +3020,7 @@ lv_seen_evict(LvScanOpaque *so)
 		return false;
 	so->walkadded = so->nadded;
 	so->nwalks++;
-	lvseen_start_iterate(so->seen, &iter);
+	LION_SH_START_ITERATE(lvseen, so->seen, &iter);
 	while ((s = lvseen_iterate(so->seen, &iter)) != NULL)
 	{
 		if (lv_seen_behind(so, s))
@@ -3042,7 +3043,7 @@ lv_seen_evict(LvScanOpaque *so)
 	so->evicted = true;
 	so->behind = true;
 	so->twice = true;
-	lvseen_start_iterate(so->seen, &iter);
+	LION_SH_START_ITERATE(lvseen, so->seen, &iter);
 	while ((s = lvseen_iterate(so->seen, &iter)) != NULL)
 	{
 		if (lv_seen_near(so, s) || (ahead && lv_seen_ahead(so, s)))
@@ -3562,7 +3563,7 @@ lv_rest(IndexScanDesc scan, LvScanOpaque *so)
 		lvseen_iterator iter;
 		LvSeen	   *s;
 
-		lvseen_start_iterate(so->seen, &iter);
+		LION_SH_START_ITERATE(lvseen, so->seen, &iter);
 		while ((s = lvseen_iterate(so->seen, &iter)) != NULL)
 			Assert(s->level != LV_PLANE1);
 	}

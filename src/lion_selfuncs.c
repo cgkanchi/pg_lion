@@ -6028,7 +6028,7 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 	 * NULL, every entry is scaled down by the same factor to fit - a little
 	 * under, as the sum core makes of the float4 frequencies may round up.
 	 */
-	limit = 1.0 - stats->stanullfrac;
+	limit = Max(1.0 - stats->stanullfrac, 0.0);
 	for (pass = 0; pass < 3; pass++)
 	{
 		double		sum = 0;
@@ -6038,7 +6038,8 @@ lion_mcv_merge(LionMcvCollect *mc, HeapTuple base, Oid vartype,
 			sum += ent[i].freq;
 		if (sum <= limit)
 			break;
-		scale = Max(limit, 0.0) / sum * (1.0 - 1e-6 * (pass + 1));
+		/* sum > limit >= 0 */
+		scale = limit / sum * (1.0 - 1e-6 * (pass + 1));
 		for (i = 0; i < n; i++)
 			ent[i].freq = (float4) (ent[i].freq * scale);
 	}

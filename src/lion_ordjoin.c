@@ -3375,7 +3375,7 @@ oj_keyset_array(OjKeySetState *ks)
 	int			n = 0;
 	ArrayType  *arr;
 
-	ojkeys_start_iterate(ks->keys, &it);
+	LION_SH_START_ITERATE(ojkeys, ks->keys, &it);
 	while ((ent = ojkeys_iterate(ks->keys, &it)) != NULL)
 		elems[n++] = ent->key;
 	Assert((uint64) n == ks->nkeys);

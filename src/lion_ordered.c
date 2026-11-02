@@ -1999,7 +1999,7 @@ lo_cost(PlannerInfo *root, RelOptInfo *rel, IndexPath *ord, Path *lion,
 	if (calls > 1.0)
 	{
 		rebuilt = lion_has_outer_param(root, (Node *) lionqual);
-		if (rebuilt)
+		if (rebuilt && lion != NULL)	/* lionqual is lion's quals */
 			lioncost = Max(lioncost + lo_lion_amortized(root, lion, calls),
 						   0.0);
 	}
@@ -7167,7 +7167,8 @@ lo_probe_node(LionOrderedState *st, LoNode *node, uint32 ckey)
 				return NULL;
 			acc = r;
 		}
-		Assert(acc != NULL);	/* lo_lazy_ok(): a leaf has one */
+		if (acc == NULL)		/* lo_lazy_ok(): a leaf has one */
+			elog(ERROR, "LionOrdered: a lazy leaf with no key that selects");
 
 		/* ... less the NULL entries of its `IS NOT NULL` keys */
 		for (i = 0; i < leaf->nkeys; i++)
@@ -7806,6 +7807,18 @@ lo_begin(CustomScanState *node, EState *estate, int eflags)
 	}
 }
 
+/*
+ * The btree's scan, of a walk that is not a lion column's: begun before the
+ * walk reads a row (lo_start_walk()), and read only by such a walk.
+ */
+static inline IndexScanDesc
+lo_btree_scan(LionOrderedState *st)
+{
+	if (st->scan == NULL)
+		elog(ERROR, "LionOrdered: a btree walk with no scan");
+	return st->scan;
+}
+
 /* The next TID of the ordered index, or NULL at its end. */
 static ItemPointer
 lo_next_tid(LionOrderedState *st)
@@ -7819,11 +7832,11 @@ lo_next_tid(LionOrderedState *st)
 		return &st->walktid;
 	}
 #if PG_VERSION_NUM >= 200000
-	if (!tableam_index_getnext_tid(st->scan, st->dir))
+	if (!tableam_index_getnext_tid(lo_btree_scan(st), st->dir))
 		return NULL;
 	return &st->scan->xs_heaptid;
 #else
-	return index_getnext_tid(st->scan, st->dir);
+	return index_getnext_tid(lo_btree_scan(st), st->dir);
 #endif
 }
 
@@ -7837,7 +7850,7 @@ static bool
 lo_fetch_btree(LionOrderedState *st, TupleTableSlot *slot)
 {
 #if PG_VERSION_NUM >= 200000
-	IndexScanDesc scan = st->scan;
+	IndexScanDesc scan = lo_btree_scan(st);
 	ItemPointerData tid = scan->xs_heaptid;
 	bool		all_dead = false;
 	Snapshot	snapshot = scan->xs_snapshot;
@@ -7852,7 +7865,7 @@ lo_fetch_btree(LionOrderedState *st, TupleTableSlot *slot)
 	return table_tuple_fetch_row_version(scan->heapRelation, &tid, snapshot,
 										 slot);
 #else
-	return index_fetch_heap(st->scan, slot);
+	return index_fetch_heap(lo_btree_scan(st), slot);
 #endif
 }
 
@@ -7910,7 +7923,7 @@ lo_fetch(LionOrderedState *st, TupleTableSlot *slot)
 static bool
 lo_fetch_indexonly(LionOrderedState *st, TupleTableSlot *slot, bool *fromheap)
 {
-	IndexScanDesc scan = st->scan;
+	IndexScanDesc scan = lo_btree_scan(st);
 	ItemPointer tid = &scan->xs_heaptid;
 	int			i;
 
@@ -8544,6 +8557,8 @@ lo_next(ScanState *ss)
 		else
 			lo_build_set(st);
 	}
+	if (st->set == NULL && !st->noset && !st->lazy && !st->narrowing)
+		elog(ERROR, "LionOrdered: no set to walk with");
 	if (!st->started)
 		lo_start_walk(st);
 
@@ -8692,7 +8707,7 @@ lo_next(ScanState *ss)
 		 * index-only mode the heap tuple fetched for the row, if any, is let
 		 * go once the rechecks are done with it.
 		 */
-		ordrecheck = !st->lionwalk && st->scan->xs_recheck;
+		ordrecheck = !st->lionwalk && lo_btree_scan(st)->xs_recheck;
 		keep = true;
 		if (!st->noset && !st->exact)
 			keep = lo_lion_recheck(st, slot, &fromheap);
@@ -8734,9 +8749,13 @@ lo_next(ScanState *ss)
 		 * Scan locks it (DESIGN.md §40.5).
 		 */
 		if (!fromheap)
+		{
+			IndexScanDesc scan = lo_btree_scan(st);
+
 			PredicateLockPage(ss->ss_currentRelation,
-							  ItemPointerGetBlockNumber(&st->scan->xs_heaptid),
+							  ItemPointerGetBlockNumber(&scan->xs_heaptid),
 							  ss->ps.state->es_snapshot);
+		}
 		st->scanreturned++;
 		return slot;
 	}
@@ -8995,7 +9014,7 @@ lo_initialize_dsm(CustomScanState *node, ParallelContext *pcxt,
 	ConditionVariableInit(&sh->setcv);
 	sh->setstate = LO_SHSET_NONE;
 	sh->setroom = lion_enable_shared_set ?
-		(Size) Min(room, (double) (SIZE_MAX / 2)) : 0;
+		(Size) Min(room, (double) SIZE_MAX / 2.0) : 0;
 	sh->nplanned = pcxt->nworkers + 1;
 	sh->pscanoff = MAXALIGN(sizeof(LoShared));
 	if (!st->probe)

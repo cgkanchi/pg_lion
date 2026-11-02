@@ -2526,8 +2526,9 @@ lion_count_keys(Relation heap, Snapshot snapshot, int nkeys, Relation *indexes,
 
 	sets = (LionPostingSet *) palloc0(sizeof(LionPostingSet) * nkeys);
 
+	/* a key not found leaves its set empty, which counts 0 */
 	for (i = 0; i < nkeys; i++)
-		lion_posting_set_lookup_col(indexes[i], 1, keys[i],
+		(void) lion_posting_set_lookup_col(indexes[i], 1, keys[i],
 								   keytypes ? keytypes[i] : InvalidOid,
 								   &sets[i]);
 
