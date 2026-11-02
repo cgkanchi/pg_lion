@@ -7831,13 +7831,25 @@ lo_walk_set(LionOrderedState *st)
 	return st->set;
 }
 
+/*
+ * The walk of a lion column's entries, of a walk that is one: begun before
+ * the walk reads a row (lo_start_walk()).
+ */
+static inline LionOrderWalk *
+lo_order_walk(LionOrderedState *st)
+{
+	if (st->owalk == NULL)
+		elog(ERROR, "LionOrdered: a lion column's walk with no walk begun");
+	return st->owalk;
+}
+
 /* The next TID of the ordered index, or NULL at its end. */
 static ItemPointer
 lo_next_tid(LionOrderedState *st)
 {
 	if (st->lionwalk)
 	{
-		if (!lion_order_walk_next(st->owalk, &st->walktid))
+		if (!lion_order_walk_next(lo_order_walk(st), &st->walktid))
 			return NULL;
 		/* the btree's are counted by index_getnext_tid(), as for any scan */
 		pgstat_count_index_tuples(st->ordidx, 1);
@@ -8739,8 +8751,8 @@ lo_next(ScanState *ss)
 		 * filter above the node would, and one that fails takes the rest of
 		 * the entry with it, unread.
 		 */
-		if (st->valuequal != NULL && st->lionwalk && st->owalk != NULL &&
-			lion_order_walk_entryno(st->owalk) != st->valueentry)
+		if (st->valuequal != NULL && st->lionwalk &&
+			lion_order_walk_entryno(lo_order_walk(st)) != st->valueentry)
 		{
 			st->valueentry = lion_order_walk_entryno(st->owalk);
 			ResetExprContext(econtext);
