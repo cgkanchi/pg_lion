@@ -162,6 +162,21 @@ SHOW pg_lion.entry_count_cost;
 EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcg GROUP BY g;
 SELECT lcg_cost('SELECT g, count(*) FROM lcg GROUP BY g') = :before AS same_cost;
 
+-- a grouped count of a heap the visibility map vouches for half of: the node,
+-- at the grouped recheck's price, against a hash aggregate at the old one
+CREATE TABLE lcv WITH (autovacuum_enabled = off, fillfactor = 90) AS
+SELECT i AS id, i % 200 AS g, repeat('x', 64) AS pad FROM generate_series(1, 200000) i;
+CREATE INDEX lcv_g ON lcv USING lion (g);
+VACUUM (FREEZE, ANALYZE) lcv;
+UPDATE lcv SET pad = repeat('y', 64) WHERE id % 100 = 0;
+ANALYZE lcv;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcv GROUP BY g;
+BEGIN;
+SET LOCAL pg_lion.recheck_group_tid_cost = 6;
+EXPLAIN (COSTS OFF) SELECT g, count(*) FROM lcv GROUP BY g;
+ROLLBACK;
+DROP TABLE lcv;
+
 DROP FUNCTION lcg_cost(text, text, text, text[]);
 DROP FUNCTION lcg_plan(text, text, text);
 DROP TABLE lcg, lcf, lcd;

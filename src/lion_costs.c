@@ -49,6 +49,7 @@ double		lion_descent_cost;
 double		lion_union_set_cost;
 double		lion_recheck_tid_cost;
 double		lion_recheck_group_tid_cost;
+double		lion_recheck_sum_tid_cost;
 double		lion_position_member_cost;
 double		lion_position_check_cost;
 double		lion_resident_page_cost;
@@ -152,8 +153,10 @@ static const LionCostSetting lion_cost_settings[] = {
 	 "Sets the planner's estimate of the cost of each set of a lion union source that a count builds again"},
 	{"pg_lion.recheck_tid_cost", &lion_recheck_tid_cost, 1.5, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a lion count's heap recheck"},
-	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 6.0, LION_TUPLE,
+	{"pg_lion.recheck_group_tid_cost", &lion_recheck_group_tid_cost, 2.0, LION_TUPLE,
 	 "Sets the planner's estimate of the cost of each candidate row of a grouped lion count's heap recheck"},
+	{"pg_lion.recheck_sum_tid_cost", &lion_recheck_sum_tid_cost, 6.0, LION_TUPLE,
+	 "Sets the planner's estimate of the cost of each candidate row of the heap recheck of a lion count summed over a column's entries"},
 	{"pg_lion.position_member_cost", &lion_position_member_cost, 2.4, LION_OP,
 	 "Sets the planner's estimate of the cost of each member of a lexeme's stored positions that a lion position filter decodes"},
 	{"pg_lion.position_check_cost", &lion_position_check_cost, 4.3, LION_OP,

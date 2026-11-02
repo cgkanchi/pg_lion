@@ -180,3 +180,52 @@ DROP TABLE bm_docs;
 DROP FUNCTION bm_same(tsquery, text[], int, float8, float8);
 DROP FUNCTION bm_lion(tsquery, int, float8, float8);
 DROP FUNCTION bm_ref(text[], int, float8, float8);
+
+-- avgdl from the meta page (DESIGN.md §17, "Ranking"): a build records no
+-- lengths, VACUUM and ANALYZE do, in an index of a multi-key column alone, and
+-- a new connection scores with them the score it would have walked to
+CREATE EXTENSION IF NOT EXISTS pageinspect;
+CREATE TABLE bl_docs WITH (autovacuum_enabled = off) AS
+SELECT i AS id, to_tsvector('simple', 'w1 ' || repeat('w2 ', i % 7)) AS d
+  FROM generate_series(1, 6400) i;
+CREATE INDEX bl_docs_d ON bl_docs USING lion (d) WITH (store_positions = true);
+-- the words of key column 1: the members of its empty key, the sum of lengths
+CREATE FUNCTION bl_words(OUT members bigint, OUT sumlen bigint) LANGUAGE sql AS $$
+	SELECT sum(get_byte(p, 96 + b)::bigint << (8 * b)),
+		   sum(get_byte(p, 352 + b)::bigint << (8 * b))
+	  FROM get_raw_page('bl_docs_d', 0) p, generate_series(0, 6) b $$;
+SELECT * FROM bl_words();
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS walked \gset
+ANALYZE bl_docs;
+SELECT members, sumlen, sumlen = (SELECT sum(1 + id % 7) FROM bl_docs) AS sum_right
+  FROM bl_words();
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') = :walked AS same_from_meta;
+-- a row count past 1/64 of what was recorded is not taken from it, and a
+-- VACUUM that deleted records the lengths it left
+INSERT INTO bl_docs SELECT i, to_tsvector('simple', 'w1 ' || repeat('w3 ', 40))
+  FROM generate_series(1, 200) i;
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') = :walked AS stale_used;
+DELETE FROM bl_docs WHERE id % 7 = 0;
+VACUUM bl_docs;
+SELECT members = (SELECT count(*) FROM bl_docs) AS members_right,
+	   sumlen = (SELECT sum(1 + (CASE WHEN d @@ 'w3' THEN 40 ELSE id % 7 END)) FROM bl_docs) AS sum_right
+  FROM bl_words();
+-- a VACUUM that deleted every row records none, and as many rows of other
+-- lengths are walked, by a new connection and by one that saw the index empty
+DELETE FROM bl_docs;
+VACUUM bl_docs;
+SELECT * FROM bl_words();
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS empty_score;
+INSERT INTO bl_docs SELECT i, to_tsvector('simple', 'w1 ' || repeat('w3 ', 40))
+  FROM generate_series(1, 5658) i;
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS same_backend \gset
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS new_backend \gset
+ANALYZE bl_docs;
+\c
+SELECT lion_bm25_score('w1:1'::tsvector, 'w1', 'bl_docs_d') AS analyzed \gset
+SELECT :same_backend = :analyzed AS same_backend_right, :new_backend = :analyzed AS new_backend_right;
+DROP FUNCTION bl_words();
+DROP TABLE bl_docs;

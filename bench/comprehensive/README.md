@@ -9,8 +9,8 @@ The default **focused** suite compares **B-tree, GIN, roaring, and roaring_bitma
 Both profiles create a private temporary database cluster; neither changes `pg_index.indisvalid` or connects to a user-supplied database endpoint. The quick benchmark remains unchanged for frequent progress checks; focused adds high-cardinality/skew cases, low-memory diagnostics, and a third timing round.
 
 The run the [benchmark page](../../docs/BENCHMARKS.md) summarises is kept in
-[results/2026-10-11-3947945-pg18-focused](../results/2026-10-11-3947945-pg18-focused/REPORT.md),
-as [searchable HTML](../results/2026-10-11-3947945-pg18-focused/index.html) and raw records.
+[results/2026-11-01-59f2bac-pg18-focused](../results/2026-11-01-59f2bac-pg18-focused/REPORT.md),
+as [searchable HTML](../results/2026-11-01-59f2bac-pg18-focused/index.html) and raw records.
 
 ## Run
 
@@ -35,7 +35,7 @@ python3 bench/comprehensive/run.py --profile full \
   --prefix /path/to/postgresql --output bench/results/full-comparison
 ```
 
-Explicit options override profile defaults. For example, `--repeats 7` improves sampling without restoring irrelevant index types, and `--cold-repeats 1` adds a small restart experiment. Add `--preload` to measure Lion's custom WAL resource manager; leave it off to measure generic WAL. Keep that choice fixed across comparisons.
+`--shared-buffers` is 2 GB by default, which holds the tables and indexes at the default scales: at 512 MB, timings depended on what the previous query had evicted. Explicit options override profile defaults. For example, `--repeats 7` improves sampling without restoring irrelevant index types, and `--cold-repeats 1` adds a small restart experiment. Add `--preload` to measure Lion's custom WAL resource manager; leave it off to measure generic WAL. Keep that choice fixed across comparisons.
 
 For a full-path smoke test:
 

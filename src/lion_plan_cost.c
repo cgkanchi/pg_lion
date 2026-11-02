@@ -5412,9 +5412,11 @@ lion_cost_count_rel_one(PlannerInfo *root, RelOptInfo *rel,
 	run += c.merge_ops * cpu_operator_cost;
 	run += c.recheck_pages * lion_heap_page_cost(root, rel, c.recheck_pages,
 												 c.heap_pages);
-	run += c.recheck_tids * ((groupidx != NULL && !c.rangesum) ?
+	run += c.recheck_tids * ((groupidx == NULL || c.rangesum) ?
+							 LION_RECHECK_TID_COST :
+							 (root->parse->groupClause != NIL) ?
 							 LION_RECHECK_GROUP_TID_COST :
-							 LION_RECHECK_TID_COST);
+							 LION_RECHECK_SUM_TID_COST);
 	run += c.ingroups * cpu_tuple_cost;
 	run += c.pair_cost;
 	run += c.rangecost;

@@ -543,6 +543,14 @@ StaticAssertDecl(sizeof(LionMetaPageData) == 56,
  *				PG_UINT64_MAX, which the planner takes for unknown, as it
  *				takes 0 (LionMetaSumsqKnown()).
  *
+ * A multi-key column has no bit in valid_cols, and the two words its keys do
+ * not use hold what BM25 reads of it instead, when the column stores
+ * positions (lion_bm25_count_lengths()): ndistinct the members of its empty
+ * key, sumsq the sum of their lengths.  A build leaves them zero, and VACUUM
+ * and ANALYZE count them, so that a backend's first score of the column need
+ * not walk the key (lion_bm25_stats()).  Every other reader asks valid_cols
+ * first.
+ *
  * Nothing in it says when it was counted: a build writes exactly the bytes
  * every other build of the same rows writes, whatever the memory, the workers
  * or the snapshot (test/sql/build.sql compares them), and a time would differ.

@@ -93,6 +93,7 @@
 extern Datum lion_bm25_score(PG_FUNCTION_ARGS);
 
 bool		lion_enable_bm25_scan = true;
+double		lion_bm25_walk_min_share = 0.0075;
 
 static set_rel_pathlist_hook_type lion_bm25_prev_set_rel_pathlist_hook = NULL;
 
@@ -560,8 +561,23 @@ lion_bm25_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti,
 	 * query's lexemes and each candidate's length - at most, since MaxScore
 	 * skips some - for an index tuple and an operator's CPU each; then each
 	 * row costs a heap fetch, a random page at worst, and the WHERE.
+	 *
+	 * Those are its reads of the lexemes' rows; what it costs before them is
+	 * most of the pages of the empty key, read for the lengths, and that does
+	 * not grow with the matches where sorting them does.  So a query that
+	 * matches few rows is cheaper sorted, warm, and its price cannot say so:
+	 * core's estimate of a rare lexeme's rows, and so of the plain plan, is
+	 * flat below the share where the walk starts winning, while ncand is
+	 * exact.  Below that share of the rows the path is not offered.  What is
+	 * not resident the walk still saves (its rows' heap pages against every
+	 * match's), so the share falls with what the cache holds of the query's
+	 * tables and this index.
 	 */
 	ncand = lion_bm25_candidates(idx->indexoid, attno, query);
+	if (ncand < lion_bm25_walk_min_share * rel->tuples *
+		Min((double) effective_cache_size /
+			Max(root->total_table_pages + (double) idx->pages, 1.0), 1.0))
+		return;
 	rows = Max(rel->rows, 1.0);
 	firstL = (root->limit_tuples > 0 && root->limit_tuples < 1e9) ?
 		(int64) root->limit_tuples + 16 : 64;
@@ -869,6 +885,15 @@ lion_bm25_explain(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 lion_bm25_scan_init(void)
 {
+	DefineCustomRealVariable("pg_lion.bm25_walk_min_share",
+							 "Sets the share of a table's rows a ranked query's lexemes must hold for the LionBm25 scan to be offered.",
+							 NULL,
+							 &lion_bm25_walk_min_share,
+							 0.0075, 0.0, 1.0,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("pg_lion.enable_bm25_scan",
 							 "Answer ORDER BY lion_bm25_score(...) DESC from the index, best first.",
 							 NULL,

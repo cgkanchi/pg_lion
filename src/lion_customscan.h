@@ -1167,6 +1167,7 @@ typedef struct LionVColScope
  */
 #define LION_RECHECK_TID_COST	(lion_recheck_tid_cost * cpu_tuple_cost)
 #define LION_RECHECK_GROUP_TID_COST	(lion_recheck_group_tid_cost * cpu_tuple_cost)
+#define LION_RECHECK_SUM_TID_COST	(lion_recheck_sum_tid_cost * cpu_tuple_cost)
 
 /*
  * A candidate decided from stored positions (lion_posfilter.c, DESIGN.md §17

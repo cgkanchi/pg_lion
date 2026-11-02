@@ -54,6 +54,8 @@ extern AttrNumber lion_bm25_column(Relation index, LionIndexState *ix,
 extern List *lion_bm25_lexemes(TSQuery query, bool *prefix);
 extern bool lion_bm25_params_ok(double k1, double b);
 extern void lion_bm25_check_params(double k1, double b);
+extern void lion_bm25_count_lengths(Relation index, LionIndexState *ix,
+									LionMetaNdistinct *nd);
 extern double lion_bm25_plan_ncodes(Relation index, AttrNumber attno,
 									TSQuery query);
 extern bool lion_bm25_prepare(Relation index, AttrNumber attno, TSQuery query,
@@ -67,6 +69,7 @@ extern double lion_bm25_score_row(const LionBm25Query *q, TSVector doc);
 
 /* lion_bm25_scan.c */
 extern PGDLLIMPORT bool lion_enable_bm25_scan;
+extern PGDLLIMPORT double lion_bm25_walk_min_share;
 extern void lion_bm25_scan_init(void);
 
 #endif							/* LION_BM25_H */

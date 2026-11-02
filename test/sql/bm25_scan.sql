@@ -265,6 +265,30 @@ SELECT id FROM bs_docs WHERE d @@ 'w1 & w2'
 CREATE INDEX bs_docs_plain ON bs_docs USING lion (d) WITH (store_positions = false);
 SELECT lion_bm25_score(d, 'w1', 'bs_docs_plain') FROM bs_docs LIMIT 1;
 
+-- few matches: below pg_lion.bm25_walk_min_share of the rows sorting them is
+-- faster, and the scan is not offered; it is at 0, with the same rows
+CREATE TABLE bs_few WITH (autovacuum_enabled = off) AS
+SELECT i AS id, to_tsvector('simple', 'common w' || i % 50 ||
+							CASE WHEN i % 1000 = 7 THEN ' rare' ELSE '' END) AS d
+  FROM generate_series(1, 20000) i;
+CREATE INDEX bs_few_d ON bs_few USING lion (d) WITH (store_positions = true);
+VACUUM (FREEZE, ANALYZE) bs_few;
+SELECT bs_scanned($$SELECT id FROM bs_few WHERE d @@ 'rare'
+	ORDER BY lion_bm25_score(d, 'rare', 'bs_few_d') DESC LIMIT 3$$) AS rare_scanned;
+SELECT bs_scanned($$SELECT id FROM bs_few WHERE d @@ 'common'
+	ORDER BY lion_bm25_score(d, 'common', 'bs_few_d') DESC LIMIT 3$$) AS common_scanned;
+SELECT array_agg(id ORDER BY s DESC, id) AS sorted FROM
+	(SELECT id, lion_bm25_score(d, 'rare', 'bs_few_d') AS s FROM bs_few
+	  WHERE d @@ 'rare' ORDER BY s DESC, id LIMIT 3) t;
+SET pg_lion.bm25_walk_min_share = 0;
+SELECT bs_scanned($$SELECT id FROM bs_few WHERE d @@ 'rare'
+	ORDER BY lion_bm25_score(d, 'rare', 'bs_few_d') DESC LIMIT 3$$) AS rare_scanned;
+SELECT array_agg(id ORDER BY s DESC, id) AS walked FROM
+	(SELECT id, lion_bm25_score(d, 'rare', 'bs_few_d') AS s FROM bs_few
+	  WHERE d @@ 'rare' ORDER BY s DESC, id LIMIT 3) t;
+RESET pg_lion.bm25_walk_min_share;
+DROP TABLE bs_few;
+
 DROP TABLE bs_docs;
 DROP FUNCTION bs_same(tsquery, tsquery, int, text, float8, float8);
 DROP FUNCTION bs_scanned(text);
