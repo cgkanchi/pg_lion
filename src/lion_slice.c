@@ -512,15 +512,18 @@ Datum
 lion_slice_int128_numeric(int128 v)
 {
 	const int64 base = INT64CONST(1000000000000000000);
+	int128		q = v / base;
+	int64		r = (int64) (v % base);	/* |r| < base, the sign of v */
 	Datum		hi;
 
-	if (v >= (int128) PG_INT64_MIN && v <= (int128) PG_INT64_MAX)
-		return NumericGetDatum(int64_to_numeric((int64) v));
-	hi = lion_slice_int128_numeric(v / base);
+	/* v = q * base + r: a value under base in magnitude is r alone */
+	if (q == 0)
+		return NumericGetDatum(int64_to_numeric(r));
+	hi = lion_slice_int128_numeric(q);
 	return DirectFunctionCall2(numeric_add,
 							   DirectFunctionCall2(numeric_mul, hi,
 												   NumericGetDatum(int64_to_numeric(base))),
-							   NumericGetDatum(int64_to_numeric((int64) (v % base))));
+							   NumericGetDatum(int64_to_numeric(r)));
 }
 
 /*

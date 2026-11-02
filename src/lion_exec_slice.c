@@ -66,7 +66,7 @@
 static void
 lion_slice_results(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	MemoryContext oldcxt = MemoryContextSwitchTo(ss->cxt);
 	int			i;
 
@@ -140,7 +140,7 @@ lion_slice_results(LionCountScanState *st)
 void
 lion_slice_none(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	int			c;
 
 	MemoryContextReset(ss->cxt);
@@ -231,7 +231,7 @@ lion_slice_collect_into(LionCountScanState *st, LionSliceAgg *sa, int n,
 							  limit - st->rangesrc_held : 0,
 							  true, st->filter, out, &spilled, &sa->stats))
 		elog(ERROR, "LionCount: the WHERE of a slice aggregate could not be collected");
-	st->slice->copies++;
+	lion_st_slice(st)->copies++;
 }
 
 /*
@@ -267,7 +267,7 @@ static void
 lion_slice_c0(LionCountScanState *st, LionSCol *col, Relation idx,
 			  LionSliceAgg *sa)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	LionCountSource *srcs;
 	LionPostingSet e;
 	LionPostingSet range;
@@ -311,7 +311,7 @@ lion_slice_column(LionCountScanState *st, LionSCol *col, int ngset,
 				  LionPostingSet *const *gsets)
 {
 	EState	   *estate = st->css.ss.ps.state;
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	Snapshot	snapshot = estate->es_snapshot;
 	Relation	idx;
 	LionState  *state;
@@ -449,7 +449,7 @@ static void
 lion_slice_columns(LionCountScanState *st, int ngset,
 				   LionPostingSet *const *gsets)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	MemoryContext runcxt;
 	MemoryContext oldcxt;
 	int			c;
@@ -476,7 +476,7 @@ lion_slice_columns(LionCountScanState *st, int ngset,
 void
 lion_slice_run(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 
 	Assert(ss != NULL && st->located);
 	MemoryContextReset(ss->cxt);
@@ -508,7 +508,7 @@ lion_slice_run(LionCountScanState *st)
 void
 lion_slice_parts_begin(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	int			c;
 
 	Assert(ss != NULL && st->npart > 0);
@@ -537,7 +537,7 @@ lion_slice_parts_begin(LionCountScanState *st)
 void
 lion_slice_part(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	MemoryContext runcxt;
 	MemoryContext oldcxt;
 	int			c;
@@ -582,7 +582,7 @@ lion_slice_part(LionCountScanState *st)
 void
 lion_slice_parts_end(LionCountScanState *st)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	int			c;
 
 	Assert(ss != NULL && ss->parts);
@@ -618,7 +618,7 @@ void
 lion_slice_group(LionCountScanState *st, int ngset,
 				 LionPostingSet *const *gsets)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 
 	Assert(ss != NULL && st->located && ngset > 0);
 	MemoryContextReset(ss->cxt);
@@ -641,7 +641,7 @@ lion_slice_column_batch(LionCountScanState *st, LionSCol *col, int n,
 						const LionPostingSet *where, LionSliceGroupsOut *out)
 {
 	EState	   *estate = st->css.ss.ps.state;
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	Relation	idx;
 	LionState  *state;
 	LionSliceAgg sa;
@@ -727,7 +727,7 @@ lion_slice_batch(LionCountScanState *st, int n, LionPostingSet *gsets,
 				 const LionPostingSet *where, MemoryContext cxt,
 				 Datum **values, bool **isnull)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	LionSliceGroupsOut *outs;
 	MemoryContext runcxt;
 	MemoryContext oldcxt;
@@ -806,7 +806,7 @@ void
 lion_slice_keep(LionCountScanState *st, MemoryContext cxt, Datum **values,
 				bool **isnull)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	MemoryContext oldcxt = MemoryContextSwitchTo(cxt);
 	int			i;
 
@@ -829,7 +829,7 @@ lion_slice_keep(LionCountScanState *st, MemoryContext cxt, Datum **values,
 void
 lion_slice_put(LionCountScanState *st, const Datum *values, const bool *isnull)
 {
-	LionSliceState *ss = st->slice;
+	LionSliceState *ss = lion_st_slice(st);
 	int			i;
 
 	for (i = 0; i < ss->nagg; i++)
