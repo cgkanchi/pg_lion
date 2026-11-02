@@ -357,6 +357,12 @@ typedef struct LionCountPathBuild
 	Oid			groupcoll[LION_MAX_GROUPCOLS];	/* the grouping's collation */
 	bool		groupvalueout[LION_MAX_GROUPCOLS];
 	double		groupest[LION_MAX_GROUPCOLS];
+	double		groupbound[LION_MAX_GROUPCOLS];	/* the most groups a
+												 * restriction leaves
+												 * groupvar[g], or -1
+												 * (lion_group_list_bound()):
+												 * of the output alone, not
+												 * the entries a walk visits */
 	int			ngroup;
 	bool		decode;			/* three or more columns: the decoded walk
 								 * of DESIGN.md §34 counts them */
@@ -3672,6 +3678,108 @@ lion_count_path_strategy(LionCountPathBuild *cx)
 	return true;
 }
 
+/* An operand of a group bound's clause, binary-compatible relabels taken off */
+static Node *
+lion_group_bound_arg(Node *arg)
+{
+	while (arg != NULL && IsA(arg, RelabelType))
+		arg = (Node *) ((RelabelType *) arg)->arg;
+	return arg;
+}
+
+/*
+ * The most groups a GROUP BY of var can have under rel's restrictions: the
+ * values a `var = ANY (list)` or `var = c` of them leaves it, or -1 when none
+ * bounds it.  Core's estimate of a column's groups scales its distinct values
+ * to the rows the restrictions keep, which knows nothing of a list on the
+ * column: a list of a few thousand ids, each with many rows, was estimated
+ * at hundreds of thousands of groups, and a walk of the column's entries
+ * priced for as many.  Each list's non-NULL elements are counted, repeats
+ * included, so the bound is never below the groups there can be.  The column
+ * is matched under binary-compatible relabelling alone
+ * (lion_group_bound_arg()): a cast that changes the value - a numeric column
+ * compared as float8 - may map many of the column's values to one constant.
+ * And under the grouping's own equality operator, eqop, and collation, coll,
+ * alone: a case-insensitive equality - a text column relabelled to citext, or
+ * one compared under a nondeterministic collation - bounds nothing of a GROUP
+ * BY under text's "C", whose groups it may merge; nor does a cross-type
+ * equality of the same family, which compares the column converted: a
+ * timestamp column against a timestamptz list matches two local times a
+ * daylight-saving gap maps to one instant.
+ */
+static double
+lion_group_list_bound(RelOptInfo *rel, Node *var, Oid eqop, Oid coll)
+{
+	double		bound = -1.0;
+	ListCell   *lc;
+
+	foreach(lc, rel->baserestrictinfo)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+		Node	   *clause = (Node *) rinfo->clause;
+		Node	   *left;
+		Node	   *right;
+		double		n;
+
+		/* the equality's collation is the grouping's, or neither has one */
+		if (exprInputCollation(clause) != coll)
+			continue;
+
+		if (IsA(clause, OpExpr) &&
+			list_length(((OpExpr *) clause)->args) == 2 &&
+			((OpExpr *) clause)->opno == eqop)
+		{
+			left = lion_group_bound_arg(linitial(((OpExpr *) clause)->args));
+			right = lion_group_bound_arg(lsecond(((OpExpr *) clause)->args));
+			if (equal(left, var) && IsA(right, Const))
+				n = 1.0;
+			else if (equal(right, var) && IsA(left, Const))
+				n = 1.0;
+			else
+				continue;
+		}
+		else if (IsA(clause, ScalarArrayOpExpr) &&
+				 ((ScalarArrayOpExpr *) clause)->useOr &&
+				 ((ScalarArrayOpExpr *) clause)->opno == eqop)
+		{
+			ScalarArrayOpExpr *saop = (ScalarArrayOpExpr *) clause;
+			Const	   *arr;
+			ArrayType  *a;
+			Datum	   *elems;
+			bool	   *nulls;
+			int16		typlen;
+			bool		typbyval;
+			char		typalign;
+			int			nelems;
+			int			i;
+
+			left = lion_group_bound_arg(linitial(saop->args));
+			right = lion_group_bound_arg(lsecond(saop->args));
+			if (!equal(left, var) || !IsA(right, Const) ||
+				((Const *) right)->constisnull)
+				continue;
+			arr = (Const *) right;
+			a = DatumGetArrayTypeP(arr->constvalue);
+			get_typlenbyvalalign(ARR_ELEMTYPE(a), &typlen, &typbyval,
+								 &typalign);
+			deconstruct_array(a, ARR_ELEMTYPE(a), typlen, typbyval, typalign,
+							  &elems, &nulls, &nelems);
+			n = 0.0;
+			for (i = 0; i < nelems; i++)
+			{
+				if (!nulls[i])
+					n += 1.0;
+			}
+			pfree(elems);
+			pfree(nulls);
+		}
+		else
+			continue;
+		bound = (bound < 0.0) ? n : Min(bound, n);
+	}
+	return bound;
+}
+
 /*
  * The relations to count - the table, or each live leaf partition - and the
  * indexes on each (targets, first), found for the driving columns and the
@@ -3706,9 +3814,12 @@ lion_count_path_targets(LionCountPathBuild *cx)
 	 * probed per pair - are the ones whose bucket lookups are repeated.
 	 */
 	for (g = 0; g < cx->ngroup; g++)
-		cx->groupest[g] = estimate_num_groups(root,
-											  list_make1(lion_vcol_unvar((Node *) cx->groupvar[g])),
+	{
+		Node	   *gv = lion_vcol_unvar((Node *) cx->groupvar[g]);
+
+		cx->groupest[g] = estimate_num_groups(root, list_make1(gv),
 											  input_rel->rows, NULL, NULL);
+	}
 
 	/*
 	 * ... and the decoded walk of DESIGN.md §34 takes them in that order too:
@@ -3743,6 +3854,12 @@ lion_count_path_targets(LionCountPathBuild *cx)
 			cx->groupest[h] = tn;
 		}
 	}
+	/* ... and the most groups a restriction leaves each, in that order */
+	for (g = 0; g < cx->ngroup; g++)
+		cx->groupbound[g] =
+			lion_group_list_bound(input_rel,
+								  lion_vcol_unvar((Node *) cx->groupvar[g]),
+								  cx->groupeqop[g], cx->groupcoll[g]);
 	if (cx->ngroup > 0)
 		cx->driveattno = cx->groupattno[0];
 
@@ -3893,7 +4010,9 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 
 	/* ---- build the path ---- */
 	if (cx->ngroup == 1)
-		cx->numgroups = cx->groupest[0];
+		cx->numgroups = (cx->groupbound[0] >= 0.0) ?
+			Max(Min(cx->groupest[0], cx->groupbound[0]), 1.0) :
+			cx->groupest[0];
 	else if (cx->ngroup >= 2)
 	{
 		List	   *vars = NIL;
@@ -3903,6 +4022,25 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 			vars = lappend(vars, lion_vcol_unvar((Node *) cx->groupvar[g]));
 		cx->numgroups = estimate_num_groups(root, vars, input_rel->rows,
 											NULL, NULL);
+		/*
+		 * ... no more than the combinations of the columns' bounds, where a
+		 * restriction gives one: the estimate stands otherwise, extended
+		 * statistics' included
+		 */
+		{
+			double		bound = 1.0;
+			bool		bounded = false;
+
+			for (g = 0; g < cx->ngroup; g++)
+			{
+				bounded |= (cx->groupbound[g] >= 0.0);
+				bound *= (cx->groupbound[g] >= 0.0) ?
+					Max(Min(cx->groupest[g], cx->groupbound[g]), 1.0) :
+					cx->groupest[g];
+			}
+			if (bounded)
+				cx->numgroups = Max(Min(cx->numgroups, bound), 1.0);
+		}
 	}
 	else if (cx->sumall && cx->rangevar != NULL)
 	{
@@ -3972,6 +4110,38 @@ lion_count_path_estimate(LionCountPathBuild *cx)
 												relrows, NULL, NULL);
 			else
 				relgroups = cx->numgroups;
+
+			/*
+			 * ... and no more than the combinations of the columns' bounds,
+			 * where a restriction gives one, as for the whole table above:
+			 * a list holds each partition's groups to its values too
+			 */
+			if (t->drivevar[0] != NULL)
+			{
+				double		bound = 1.0;
+				bool		bounded = false;
+				int			h;
+
+				for (h = 0; h < cx->ngroup; h++)
+				{
+					if (cx->groupbound[h] >= 0.0)
+					{
+						bounded = true;
+						bound *= Max(cx->groupbound[h], 1.0);
+					}
+					else if (t->drivevar[h] != NULL)
+						bound *= estimate_num_groups(root,
+													 list_make1(t->drivevar[h]),
+													 relrows, NULL, NULL);
+					else
+					{
+						bounded = false;	/* a column with no estimate here */
+						break;
+					}
+				}
+				if (bounded)
+					relgroups = Min(relgroups, bound);
+			}
 			cx->outrows += Min(relgroups, relrows);
 		}
 		cx->outrows = Max(cx->outrows, 1.0);

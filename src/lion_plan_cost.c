@@ -10,6 +10,7 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "optimizer/restrictinfo.h"
 #include "tsearch/ts_type.h"
 
@@ -4160,6 +4161,57 @@ lion_count_rel_where_once(LionCountRelCost *c, double *mem, double *keys,
 }
 
 /*
+ * The groups an IN list on the GROUP BY column drives, each counted against
+ * the WHERE collected once (DESIGN.md §15, "Groups a list drives"): the
+ * executor collects the WHERE before the first group whose count would read
+ * as much (lion_group_count()), and then ANDs each listed value's set with
+ * that one copy, a group at a time - no batches, as the entry walk's are.
+ * The copy is sought in key order, the next of its containers found from its
+ * key index (lion_mat_seek()), not a search of the sets it was made of:
+ * LION_PROBE_STEP_COST a key of the group, where each group's merge with the
+ * WHERE's sets probed in memory (LION_MEMORY_PROBE_COST) priced a list of
+ * 1,200 ids of up to a few hundred rows each at 60,000 units for 27 ms.  Not
+ * on a hot standby, where nothing is collected (lion_where_collect()) and
+ * each group is merged with the WHERE's sources.
+ */
+static void
+lion_count_rel_list_once(LionCountRelCost *c, double *mem, double *keys,
+						 double *words, double gm)
+{
+	double		wkeys = lion_containers_for(c->heap_pages, c->matching);
+	double		copyw = -1.0;	/* the copy's words: its sources' AND */
+	double		gkeys = Max(keys[c->nsrc], 1.0);
+	double		lam = Min(gm / gkeys, LION_MEMBER_CAP);
+	double		visits;
+	double		collect;
+	double		per;
+	int			s;
+
+	for (s = 0; s < c->nsrc; s++)
+	{
+		wkeys = Min(wkeys, keys[s]);
+		copyw = (copyw < 0.0) ? words[s] : Min(copyw, words[s]);
+	}
+	wkeys = Max(wkeys, 1.0);
+	visits = Min(gkeys, wkeys);
+
+	collect = lion_merge_cpu_cost_sets(c->nsrc, mem, keys, NULL, NULL,
+									   c->srcsetpages, words, NULL, c->tuples,
+									   lion_probe_rel_factor(c->root, c->rel),
+									   c->srcprobes) +
+		lion_count_rel_subtract(c, wkeys, c->matching / wkeys,
+								Max(copyw, 0.0), false, 1.0) +
+		wkeys * LION_FKJOIN_COPY_CONTAINER_COST;
+	per = visits * (LION_CONTAINER_COST +
+					lion_container_members_cost(lam, words[c->nsrc]) +
+					LION_PROBE_STEP_COST +
+					((copyw > 0.0) ? LION_BITMAP_MEMBER_COST :
+					 LION_AND_MEMBER_COST) * lam);
+	c->merge_cpu = collect + c->walked * per;
+	c->whereonce = true;
+}
+
+/*
  * The merges of a count over one GROUP BY column, one a group - or the WHERE
  * collected once and the groups counted against it - and each count's own
  * set-up.
@@ -4198,6 +4250,13 @@ lion_count_rel_one_column(LionCountRelCost *c, double *mem, double *keys,
 								  c->srcmany))
 	{
 		lion_count_rel_where_once(c, mem, keys, words, gm);
+	}
+	else if (c->distinct == LION_DISTINCT_NONE && c->groupdrive &&
+			 c->walked >= 2.0 && !c->nocollect && !RecoveryInProgress() &&
+			 lion_cost_where_collected(c->nsrc, c->srcmembers,
+									   c->srccontainers, c->srcmany))
+	{
+		lion_count_rel_list_once(c, mem, keys, words, gm);
 	}
 	else
 	{

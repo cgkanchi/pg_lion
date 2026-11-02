@@ -1,0 +1,122 @@
+-- A GROUP BY of a column that a literal IN list restricts (DESIGN.md §15,
+-- "Groups a list drives").
+--
+-- The listed values drive the groups: there are no more groups than values,
+-- whatever the column's statistics say, and each listed key's set is ANDed
+-- with the rest of the WHERE, collected once.  Both are what the node's price
+-- now says.  Before, the groups were estimated as if the list were not there,
+-- and each group was priced as a merge of every WHERE source of its own; a
+-- B-tree on the column, walked in order with the WHERE tested on each entry
+-- (LionOrdered), then won on price and ran several times slower.  Each query
+-- is answered with the pushdown and with a sequential scan, and the two must
+-- agree.
+\set VERBOSITY terse
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_lion;
+RESET client_min_messages;
+/* VACUUM can only set all-visible for commits that reached disk (citext.sql). */
+SET synchronous_commit = on;
+SET max_parallel_workers_per_gather = 0;
+
+-- uuid keys of skewed sizes, a few rows a heap page each, a tsvector WHERE
+CREATE TABLE lion_gl (id int, c uuid, s tsvector, w int, pad text);
+INSERT INTO lion_gl
+SELECT i,
+       md5('c' || floor(20000 * power(((hashint4(i) & 2147483647) % 100000) / 100000.0, 3))::int)::uuid,
+       to_tsvector('simple', 'cy' || (hashint4(i + 3) & 2147483647) % 40 ||
+                             ' sz' || (hashint4(i + 7) & 2147483647) % 9),
+       i % 3,
+       repeat('x', 150)
+  FROM generate_series(1, 200000) i;
+CREATE INDEX lion_gl_c ON lion_gl (c);
+CREATE INDEX lion_gl_lion ON lion_gl USING lion (s, c, w);
+VACUUM ANALYZE lion_gl;
+
+/*
+ * The n most common keys and n values with no entry, as a literal array: an
+ * IN list of 2n values that holds the groups of the query to n.
+ */
+CREATE FUNCTION lion_gllist(n int) RETURNS text
+LANGUAGE sql AS $$
+	SELECT array_agg(c ORDER BY md5(c::text))::text
+	  FROM (SELECT c FROM (SELECT c, count(*) AS k FROM lion_gl GROUP BY c
+						   ORDER BY k DESC, c LIMIT n) a
+			UNION ALL
+			SELECT md5('absent' || g)::uuid FROM generate_series(1, n) g) b
+$$;
+
+/*
+ * lion_glcmp() plans q, says which node is at its top and whether the
+ * LionCount's estimate of its groups stays within bound, then compares the
+ * answer with a sequential scan's.
+ */
+CREATE FUNCTION lion_glcmp(q text, bound int) RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+	l text;
+	top text;
+	rows float8;
+	a text;
+	b text;
+BEGIN
+	FOR l IN EXECUTE 'EXPLAIN ' || q LOOP
+		IF top IS NULL THEN
+			top := substring(l from '^(Custom Scan \(\w+\)|[A-Z][a-zA-Z ]*\w)');
+		END IF;
+		IF l ~ 'Custom Scan \(LionCount\)' THEN
+			rows := substring(l from 'rows=([0-9]+)')::float8;
+		END IF;
+	END LOOP;
+	EXECUTE 'SELECT array_agg(r ORDER BY r)::text FROM (' || q || ') r' INTO a;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'off', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'off', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'off', true);
+	PERFORM set_config('enable_indexscan', 'off', true);
+	PERFORM set_config('enable_bitmapscan', 'off', true);
+	EXECUTE 'SELECT array_agg(r ORDER BY r)::text FROM (' || q || ') r' INTO b;
+	PERFORM set_config('pg_lion.enable_count_pushdown', 'on', true);
+	PERFORM set_config('pg_lion.enable_ordered_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_btree_scan', 'on', true);
+	PERFORM set_config('pg_lion.enable_plain_scan', 'on', true);
+	PERFORM set_config('enable_indexscan', 'on', true);
+	PERFORM set_config('enable_bitmapscan', 'on', true);
+	IF a IS DISTINCT FROM b THEN
+		RETURN format('MISMATCH: %s against %s', left(a, 120), left(b, 120));
+	END IF;
+	RETURN top || CASE WHEN rows IS NULL THEN ''
+					   WHEN rows <= bound THEN ', groups within the list'
+					   ELSE format(', %s groups estimated, over %s', rows, bound) END ||
+		', same answer';
+END $$;
+
+-- the list drives the groups: a LionCount, its groups no more than the list
+-- holds, where the B-tree walk won before
+SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
+	WHERE s @@ 'cy1 | cy2' AND c = ANY (%L::uuid[]) GROUP BY c$q$,
+	lion_gllist(300)), 600);
+-- a smaller list, and other WHEREs
+SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
+	WHERE s @@ 'sz3' AND c = ANY (%L::uuid[]) GROUP BY c$q$,
+	lion_gllist(40)), 80);
+SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
+	WHERE s @@ 'cy1 & sz2' AND c = ANY (%L::uuid[]) GROUP BY c$q$,
+	lion_gllist(300)), 600);
+-- NULLs in the list are no group, repeats one each
+SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
+	WHERE s @@ 'cy1 | cy2' AND c = ANY (%L::uuid[] || '{NULL}'::uuid[] || %L::uuid[]) GROUP BY c$q$,
+	lion_gllist(100), lion_gllist(100)), 400);
+-- an equality pins the group to one; two columns, one listed, at most the
+-- list's values times the other's where the node is chosen - a walk of the
+-- first column's entries visits every one of them, listed or not, and is
+-- priced so
+SELECT lion_glcmp(format($q$SELECT c, count(*) FROM lion_gl
+	WHERE s @@ 'cy1 | cy2' AND c = %L::uuid GROUP BY c$q$,
+	(SELECT c FROM lion_gl GROUP BY c ORDER BY count(*) DESC, c LIMIT 1)), 1);
+SELECT lion_glcmp(format($q$SELECT c, w, count(*) FROM lion_gl
+	WHERE s @@ 'cy1 | cy2' AND c = ANY (%L::uuid[]) GROUP BY c, w$q$,
+	lion_gllist(50)), 300);
+
+DROP FUNCTION lion_glcmp(text, int);
+DROP FUNCTION lion_gllist(int);
+DROP TABLE lion_gl;
