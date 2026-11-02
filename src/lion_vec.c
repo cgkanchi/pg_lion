@@ -4453,6 +4453,8 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	int			c;
 	int			i;
 
+	/* every field, the candidate scan's bounds too, before any is read */
+	memset(&is, 0, sizeof(is));
 	is.maxc = 64;
 	is.nc = 0;
 	is.cands = palloc(sizeof(LionVecInsCand) * is.maxc);
@@ -4541,7 +4543,7 @@ lionvec_insert_nearest(Relation index, const LionVecMetaData *meta,
 	if (spill)
 	{
 		float	   *cf = palloc(sizeof(float) * (Size) nr * dimsp);
-		const float *cfs[LIONVEC_SOAR_CANDS];
+		const float *cfs[LIONVEC_SOAR_CANDS] = {0};
 		LionVecInsCand *cd;
 		int			s;
 
