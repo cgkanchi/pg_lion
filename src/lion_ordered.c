@@ -7819,6 +7819,18 @@ lo_btree_scan(LionOrderedState *st)
 	return st->scan;
 }
 
+/*
+ * The set the walk tests its TIDs against, of a walk that has one (not
+ * noset, lazy or narrowing): built before the walk reads a row (lo_next()).
+ */
+static inline LionTidSet *
+lo_walk_set(LionOrderedState *st)
+{
+	if (st->set == NULL)
+		elog(ERROR, "LionOrdered: no set to walk with");
+	return st->set;
+}
+
 /* The next TID of the ordered index, or NULL at its end. */
 static ItemPointer
 lo_next_tid(LionOrderedState *st)
@@ -8557,8 +8569,6 @@ lo_next(ScanState *ss)
 		else
 			lo_build_set(st);
 	}
-	if (st->set == NULL && !st->noset && !st->lazy && !st->narrowing)
-		elog(ERROR, "LionOrdered: no set to walk with");
 	if (!st->started)
 		lo_start_walk(st);
 
@@ -8569,7 +8579,7 @@ lo_next(ScanState *ss)
 	 */
 	if (st->done ||
 		(st->narrowing ? (st->narrow == NULL || st->narrow->n == 0) :
-		 (!st->noset && (st->lazy ? st->lazyempty : st->set->n == 0))))
+		 (!st->noset && (st->lazy ? st->lazyempty : lo_walk_set(st)->n == 0))))
 		return ExecClearTuple(slot);
 	if (st->sorting)
 		return lo_sort_next(st, slot);
@@ -8649,7 +8659,7 @@ lo_next(ScanState *ss)
 		}
 		else if (!st->noset)
 		{
-			idx = lo_set_find(st->set, tid);
+			idx = lo_set_find(lo_walk_set(st), tid);
 			if (idx < 0)
 				continue;
 

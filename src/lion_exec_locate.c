@@ -2605,10 +2605,11 @@ lion_emit_keys(LionCountScanState *st, int nkeys, const Datum *keys,
 				if (LION_TL_IS_SAGG(kind))
 				{
 					/* an aggregate of a sliced column (DESIGN.md §52) */
-					LionSAgg   *a = &st->slice->agg[LION_TL_SAGG_NO(kind)];
+					LionSliceState *ss = lion_st_slice(st);
+					LionSAgg   *a;
 
-					Assert(st->slice != NULL &&
-						   LION_TL_SAGG_NO(kind) < st->slice->nagg);
+					Assert(LION_TL_SAGG_NO(kind) < ss->nagg);
+					a = &ss->agg[LION_TL_SAGG_NO(kind)];
 					slot->tts_values[i] = a->result;
 					slot->tts_isnull[i] = a->resnull;
 					break;
