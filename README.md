@@ -21,9 +21,9 @@ A lion index stores, for every distinct value, the set of rows that have it, as 
 - array membership (`tags @> ...`) and full-text search (`tsv @@ ...`), with phrase search and BM25 ranking;
 - jsonb containment, key existence and jsonpath (`doc @> ...`, `doc ? ...`, `doc @@ ...`).
 
-`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` and `halfvec` that reads a few percent of the index per query and fills its `LIMIT` under any lion filter (see [Nearest neighbours](#nearest-neighbours)).
+`pg_lion_vector` adds `lionvec`, a nearest-neighbour index for pgvector's `vector` and `halfvec` that works under any lion filter.
 
-On a vacuumed table these counts never touch the heap, so they can be one or two orders of magnitude faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
+On a vacuumed table most of these counts never touch the heap, so they are often orders of magnitude faster than a B-tree or GIN index. They show up in `EXPLAIN` as `Custom Scan (LionCount)`.
 
 ## When to use it
 
@@ -31,7 +31,7 @@ On a vacuumed table these counts never touch the heap, so they can be one or two
 | ------------------------------------------------------------------------------------- | ------------------------------------------------------------------- |
 | Dashboards, facet counts, `GROUP BY` over large tables                                | **Lion.** This is what it is for.                                   |
 | Range counts on a column with many distinct values (timestamps, ids)                  | Lion `WITH (summaries = auto)`                                      |
-| Sums, averages and extremes of an integer column under filters, and wide ranges on it | Lion `WITH (slices = on)` on that column (see below)                |
+| Sums, averages and extremes of an integer column under filters                        | Lion `WITH (slices = on)` on that column (see below)                |
 | Array membership and full-text search, especially counts                              | Lion. Phrases and ranking come from the index too.                  |
 | jsonb `@>`, `?` and jsonpath filters, especially counts                               | Lion                                                                |
 | Unique constraints, or `ORDER BY col LIMIT n` on a single column                      | B-tree                                                              |
@@ -45,7 +45,7 @@ Counts are fastest right after `VACUUM`. Rows on pages the visibility map doesn'
 
 ## Installing
 
-Build against your PostgreSQL's `pg_config`:
+pg_lion needs PostgreSQL 16 or later. Build against your PostgreSQL's `pg_config`:
 
 ```sh
 make PG_CONFIG=/path/to/pg_config
@@ -56,25 +56,17 @@ make PG_CONFIG=/path/to/pg_config install
 CREATE EXTENSION pg_lion;
 ```
 
-After installing a newer build, bring each database's copy up to date:
-
-```sql
-ALTER EXTENSION pg_lion UPDATE;
-ALTER EXTENSION pg_lion_citext UPDATE;  -- where installed
-ALTER EXTENSION pg_lion_vector UPDATE;  -- where installed
-```
-
-Lion indexes built by a build of another on-disk format then need `REINDEX`: lion refuses such an index, with an error that says so, until it is rebuilt. A database with a build from before 0.3.0 installed has no update path: drop the extensions and create them and the indexes again. `DROP EXTENSION ... CASCADE` also drops every object that depends on them, such as views that call lion's functions, so save the definitions and grants of those objects first and recreate them after.
-
 Optionally, preload the library to get lion's own WAL format, which makes inserts noticeably cheaper:
 
 ```
 shared_preload_libraries = 'pg_lion'
 ```
 
-Indexes work either way, but an index built while the library is preloaded is WAL-logged in lion's format from then on, and needs the preload for as long as it exists: without it, inserts and updates into its table fail, and so does VACUUM (autovacuum too), so dead rows pile up. To stop preloading it, first REINDEX each such index with `wal_mode = generic`. See [Reloptions → `wal_mode`](docs/REFERENCE.md#reloptions) for the details.
+An index built while the library is preloaded needs the preload until it is rebuilt: without it, writes and VACUUM on its table fail. See [`wal_mode`](docs/REFERENCE.md#reloptions) before you turn it off, and [Upgrading](docs/REFERENCE.md#upgrading) when you install a newer build.
 
 ## A quick tour
+
+The [usage guide](docs/GUIDE.md) covers each of these in detail.
 
 ### Counts and groups
 
@@ -88,7 +80,7 @@ SELECT country, count(*) FROM events GROUP BY country;
 SELECT country, count(*) FROM events GROUP BY country ORDER BY count(*) DESC LIMIT 10;
 ```
 
-All three are answered from the indexes. Grouping by several lion-indexed columns works too, as do `count(DISTINCT col)` and `sum`/`min`/`max` of an indexed column over the whole table, or under any filter and per group when the column is sliced (below). Partitioned tables are counted partition by partition, and filters that a partition's bounds already imply are skipped.
+All three are answered from the indexes. Grouping by several columns, `count(DISTINCT col)` and partitioned tables work too.
 
 ### Ranges
 
@@ -98,19 +90,17 @@ CREATE INDEX events_ts ON events USING lion (created_at) WITH (summaries = auto)
 SELECT count(*) FROM events WHERE created_at >= now() - interval '7 days';
 ```
 
-Without `summaries`, a range reads every distinct value inside it, which is slow for a timestamp column. With them, lion keeps a pre-merged bitmap per block of about 4,096 rows and reads those instead. `date`, `timestamp` and `timestamptz` compare with one another through the index, as with a B-tree: `created_at >= current_date` works on a `timestamptz` column, and `current_date - 7` on a `timestamp` one. The exception is a `timestamp` column against a `timestamptz` value (such as `now()`): across a DST gap that comparison does not follow the column's order, so lion leaves it to a filter rather than risk missing rows.
+With `summaries`, lion reads pre-merged bitmaps instead of every distinct value in the range, which matters on a column with many of them, such as a timestamp.
 
-### Sums, extremes and wide ranges from bit slices
+### Sums and extremes from bit slices
 
 ```sql
 CREATE INDEX events_amount ON events USING lion (amount) WITH (slices = on);
 
 SELECT sum(amount), avg(amount), max(amount) FROM events WHERE country = 'JP';
-SELECT country, sum(amount), min(amount) FROM events WHERE device = 'ios' GROUP BY country;
-SELECT count(*) FROM events WHERE amount > 100;
 ```
 
-A sliced integer, date, time or timestamp column keeps one bitmap per bit of its values beside its ordinary entries. A sum under a filter is then the sum over bits of 2^i times the rows of bit i's bitmap that pass the filter, a minimum or maximum a descent from the top bit, and a range on the column a comparison from the top bit down at each block of heap pages, so the work grows with the column's width and the filter's bitmaps, not with the rows or the distinct values the query covers (`Aggregates From Slices` and `Range From Slices` in `EXPLAIN`). On 5M rows a sum under a 10% filter took 7 ms where the ordinary plan took 166, the sum, minimum and maximum of each of 200 groups 41 ms against 181, and a count over half the rows of a column of distinct values 7 ms against 32 from summaries and 362 for the ordinary plan; a selective range stays with the summaries or the values, and the planner prices each. The price is on writes: every set bit of a value is one more posting-set insert, so an `INSERT` into a table with two sliced columns took 4.6 times as long as without slices with `pg_lion` preloaded. A partitioned table's one row and its ranges are answered from every partition's own slices; its `GROUP BY`, floats, `numeric` and joins are not answered from slices yet ([GUIDE.md](docs/GUIDE.md), DESIGN.md §51 to §53).
+A sliced integer, date, time or timestamp column keeps one bitmap per bit of its values, so these are answered without reading rows. The price is on writes: inserts become several times slower.
 
 ### Joins
 
@@ -122,7 +112,7 @@ SELECT count(*)
    AND EXISTS (SELECT 1 FROM customers c WHERE c.id = o.customer_id AND c.country = 'NZ');
 ```
 
-Lion looks up each matching customer in the `customer_id` index and counts against `status = 'open'` without visiting `orders`. JOIN, `IN` and `NOT EXISTS` forms work too, as do grouping by dimension columns and per-customer counts.
+Lion looks up each matching customer in the `customer_id` index and counts without visiting `orders`. JOIN, `IN` and `NOT EXISTS` forms work too.
 
 ### Returning rows
 
@@ -136,9 +126,7 @@ SELECT id, title FROM docs
  ORDER BY created_at DESC LIMIT 10;
 ```
 
-Lion walks the B-tree newest first and keeps only the entries whose rows are in the lion bitmap, stopping at the tenth (`Custom Scan (LionOrdered)` in `EXPLAIN`). The values come straight from the B-tree, so the heap is read only for pages that aren't all-visible.
-
-The walk also crosses a join to a dimension by its primary key: for `SELECT ... FROM fact f JOIN dim d ON f.dim_id = d.id WHERE <lion filters on both> ORDER BY f.score DESC LIMIT 20`, each fact row the walk keeps looks its key up in the dimension's primary key, and the entry is tested against the dimension's lion bitmap before the dimension row is read (`Custom Scan (LionOrderedJoin)`). When the `ORDER BY` leads with a lion-indexed column of the dimension that has a few values - `ORDER BY d.verified DESC, f.score DESC` - the join runs a value at a time, in that order, the dimension narrowed to the value's rows, until the page is full (`Custom Scan (LionOrderedSplit)`).
+Lion walks the B-tree newest first, keeping only the entries whose rows are in the lion bitmap, and stops at the tenth (`Custom Scan (LionOrdered)`).
 
 ### Arrays and full-text search
 
@@ -151,9 +139,7 @@ SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('english', 'roaring & bitmap')
 SELECT count(*) FROM docs WHERE tsv @@ to_tsquery('english', 'roaring <-> bitmap & !btree');
 ```
 
-Lion uses PostgreSQL's own operators and types, and returns exactly the rows a sequential scan or a GIN index would. A fuzz test in CI checks this against both.
-
-AND/OR queries are answered from the index alone, and so are phrases (`<->`), weights (`:A`) and NOT, because a `tsvector` index stores every word's positions by default. Storing positions roughly doubles the index size; `WITH (store_positions = off)` leaves them out, and then phrases, weights and NOT still work, but each candidate row is rechecked in the heap, as GIN does. A prefix (`foo:*`) is answered from the index too, as the OR of the indexed words that start with `foo`, unless it matches more than 1000 words; then lion rechecks rows, and GIN is faster.
+Lion uses PostgreSQL's own operators and types, and returns exactly the rows a sequential scan or a GIN index would. A `tsvector` index stores word positions by default, so phrases and weights are answered from the index too.
 
 ### jsonb
 
@@ -165,13 +151,9 @@ SELECT count(*) FROM docs WHERE doc ? 'discount' AND doc ?| '{eu,uk}';
 SELECT count(*) FROM docs WHERE doc @@ '$.items[*].sku == "A1"';
 ```
 
-The default operator class for `jsonb`, `jsonb_contains_ops`, indexes every path to a value in the document, with the value, so `@>`, `?`, `?|` and `?&` are answered from the index alone, with the same rows as a sequential scan or GIN. The one exception is a query whose array element has two or more fields (`{"items": [{"sku": "A", "qty": 2}]}`): the index finds the documents with both, and each one is rechecked in the heap to see that they sit in the same element, as GIN does for every `@>`. The index is about the size of GIN's `jsonb_ops`. To filter or group on a known field, an expression index such as `USING lion ((doc->>'status'))` is smaller. To compare whole documents with `=` or count the distinct ones, name lion's `jsonb_ops`: `USING lion (doc jsonb_ops)`.
-
-jsonpath `@?` and `@@` use the same index, and like GIN, lion rechecks every row it finds in the heap. The index narrows the rows on each `path == value` and on each path that must exist. A path stops narrowing at `.*`, `.**` or an item method such as `.size()`. A range (`$.price > 10`) only requires the path to exist. A path with more than 1000 distinct values under it narrows nothing.
+`@>`, `?`, `?|` and `?&` are generally answered from the index alone. jsonpath uses the same index to narrow the rows, and rechecks them in the heap, as GIN does. To filter or group on a known field, an expression index such as `USING lion ((doc->>'status'))` is smaller.
 
 ### Ranking with BM25
-
-A `tsvector` index can also rank, from the positions it stores:
 
 ```sql
 SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
@@ -181,23 +163,15 @@ SELECT id, title, lion_bm25_score(tsv, q, 'docs_tsv') AS score
  LIMIT 10;
 ```
 
-When the query's words together hold at least about 0.75% of the rows (less if the tables and index outgrow `effective_cache_size`), the planner turns this into a `LionBm25` scan, which finds the top rows from the index and skips rows that can't make the cut, instead of scoring and sorting every match; with fewer, scoring and sorting the matches is faster. `lion_bm25(index, query, k)` returns the same top `k` as `(ctid, score)` pairs, if you'd rather join yourself. Scores are Lucene's BM25 (`k1 = 1.2`, `b = 0.75`, both adjustable). An index on several tsvector columns ranks each one by its own statistics; name it with `col => 'body'`.
+A `tsvector` index can rank from the positions it stores, with Lucene's BM25. When enough rows hold the query's words, the planner finds the top rows from the index instead of scoring and sorting every match (`Custom Scan (LionBm25)`).
 
 ### Nearest neighbours
 
-With [pgvector](https://github.com/pgvector/pgvector) 0.7 or later installed:
+With [pgvector](https://github.com/pgvector/pgvector) 0.7 or later:
 
 ```sql
+CREATE EXTENSION vector;
 CREATE EXTENSION pg_lion_vector;
--- pgvector prices its distances as nearly free, which can make the planner sort a
--- filter's rows rather than use lionvec; price them closer to what they cost
-ALTER FUNCTION l2_distance(vector, vector) COST 100;
-ALTER FUNCTION vector_negative_inner_product(vector, vector) COST 100;
-ALTER FUNCTION cosine_distance(vector, vector) COST 100;
--- and halfvec's, if you index halfvec columns
-ALTER FUNCTION l2_distance(halfvec, halfvec) COST 100;
-ALTER FUNCTION halfvec_negative_inner_product(halfvec, halfvec) COST 100;
-ALTER FUNCTION cosine_distance(halfvec, halfvec) COST 100;
 
 CREATE INDEX items_embedding ON items USING lionvec (embedding vector_cosine_ops);
 CREATE INDEX items_category  ON items USING lion (category);
@@ -206,35 +180,25 @@ SELECT id FROM items ORDER BY embedding <=> $1 LIMIT 10;
 SELECT id FROM items WHERE category = 3 ORDER BY embedding <=> $1 LIMIT 10;
 ```
 
-`lionvec` partitions the rows by k-means when it builds, and keeps one bit per dimension of every row, rotated so that the error of a distance worked out from those bits is known, plus an 8-bit code read only when the bits can't decide. A query ranks the partitions by their centroids, reads the bits of the rows in the nearest few, refines the rows that might make the cut, and computes the last few distances exactly from the table, pausing once a few dozen partitions have brought nothing nearer. Like HNSW's, the answer is approximate: on 975,000 1536-dimension OpenAI embeddings a query reads 4% of the rows (9 MB) and returns 98% of the true ten nearest in 7.9 ms, about the time pgvector's HNSW takes to return 95% (8.1 ms at `ef_search` 100); `pg_lion.vector_margin` and `pg_lion.vector_patience` trade one for the other. Under a `WHERE` that lion indexes answer, the scan scores only the matching rows, so a filter of any selectivity gets its ten nearest: 24 ms at 1% of the rows (98% recall), where HNSW returns fewer than one row, or 95% of the right ones in 37 to 41 ms with iterative scans, and a filter of up to 2,000 rows (`pg_lion.vector_exact_rows`), or of up to 1.5 rows a partition (`pg_lion.vector_exact_per_partition`), is answered exactly. A `WHERE` that no lion index answers - a column without one, `id = 5` - is an error by default, rather than a filter of the rows the scan returns, which would let the plan decide which rows come back: the error suggests filtering the nearest rows of a subquery instead, and `SET pg_lion.vector_postfilter = exact` sorts the matching rows by distance, exactly, which reads every one of them ([REFERENCE.md](docs/REFERENCE.md#settings)). A clause of the vector column alone, `embedding IS NOT NULL` or a distance bound, is no such filter: it filters the scan's rows. A range over a column of many distinct values, a timestamp or a price, is a walk of every key it covers unless the column's lion index keeps summaries (`WITH (summaries = auto)`): at 10% of a million unique values, 45 ms before the first row without them and 3 ms with. Built with the defaults, the index is about 1.9 GB to HNSW's 3.8 GB. This section's measurements, from the 7.9 ms above to the memory figures below, are of a build with fewer partitions and `spill = off`, which is 1.7 GB; the defaults find more of the nearest rows at each margin. Since a query reads only the partitions it needs, lionvec holds up when memory is short: with PostgreSQL held to 1 GB, 19 ms and 100 pages read from disk a query, where HNSW took 51 ms and 767 pages (and 691 ms and 9,229 pages under the 1% filter, where lionvec read none). `vector_l2_ops` (`<->`, the default), `vector_ip_ops` (`<#>`) and `vector_cosine_ops` (`<=>`) are supported, and for a `halfvec` column `halfvec_l2_ops` (the default), `halfvec_ip_ops` and `halfvec_cosine_ops`, up to 8128 dimensions. See [BENCHMARKS.md](docs/BENCHMARKS.md#nearest-neighbours-lionvec-against-hnsw).
+Like HNSW, `lionvec` is approximate. Under a `WHERE` that lion indexes answer, it scores only the matching rows, so a filter of any selectivity still fills its `LIMIT`. The [guide](docs/GUIDE.md) has the distance function costs it assumes and what happens under a `WHERE` that no lion index answers.
 
 ## Supported types
 
-Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid`, dates, times, timestamps, `interval`, `inet`, `macaddr`, `jsonb` (paths, or whole values with `jsonb_ops`), `pg_lsn`, `oid`, enums, any array, and `tsvector`. Install `pg_lion_citext` for case-insensitive `citext`. Indexes can have several columns and can be built in parallel on PostgreSQL 17 and later. `pg_lion_vector` indexes pgvector's `vector` and `halfvec` with `lionvec` (one column, built in parallel from PostgreSQL 16; its scans can run in parallel too, and ask for the pages they will read before reading them, which cut a cold scan's wait on the disk by a third to a half on 115,000 embeddings).
+Integers, floats, `numeric`, `bool`, `text`/`varchar`, `char(n)`, `bytea`, `uuid`, dates, times, timestamps, `interval`, `inet`, `macaddr`, `jsonb`, `pg_lsn`, `oid`, enums, any array and `tsvector`, with `citext` through `pg_lion_citext`. Indexes can have several columns. `lionvec` indexes pgvector's `vector` and `halfvec`.
 
 ## Limitations
 
-- No `ORDER BY` from the index itself, no unique indexes, no `INCLUDE` columns, no parallel scans (of lion's own indexes: a `lionvec` scan can run in parallel). Use a covering B-tree for ordered or row-returning queries, as shown above.
-- Inserts are about 1.4× slower than B-tree. A sliced column (`WITH (slices = on)`) pays a posting-set insert per set bit of each value on top: an `INSERT` into a table with a sliced `int4` and a sliced `int8` column took 4.6× as long as without slices with `pg_lion` preloaded, and about 11× without it. Slices serve int2, int4, int8, date, time and timestamp columns on one table, and a partitioned table's aggregates without a `GROUP BY` and its ranges; not floats, `numeric`, joins, or a partitioned table's `GROUP BY`.
-- A plain `ORDER BY col LIMIT n` on one column is faster with a B-tree.
-- A full-text prefix (`foo:*`) matching more than 1000 distinct words is rechecked row by row, and is slower than GIN.
-- BM25 top-k slows down when every query term is very common. A query whose words together hold under about 0.75% of the rows has its matches scored and sorted rather than walked (`pg_lion.bm25_walk_min_share`).
-- The count pushdown uses an expression index (for example, lion on `(data->>'key')`) only on a table that is not partitioned, and not in its joins.
-- `lionvec` assumes pgvector's distance functions are costed at 100 (the `ALTER FUNCTION`s under [Nearest neighbours](#nearest-neighbours)). At pgvector's own cost of 1 the planner may sort a filter's rows by distance instead, which was 3 to 17 times slower for filters of 1% and 10% of a million rows. The setting is not kept by `pg_dump`, and an `ALTER EXTENSION vector UPDATE` may reset it, so run them again after either.
-- If the column also has an HNSW index, the planner chooses HNSW for nearly every query, filtered or not, because pgvector prices its scan as nearly free; under a filter it then returns fewer rows than the `LIMIT` unless `hnsw.iterative_scan` is on.
-- A `lionvec` query under a `WHERE` that no lion index answers fails by default (`pg_lion.vector_postfilter`); `SET pg_lion.vector_postfilter = exact` plans it as an exact sort instead.
-- A `lionvec` build chooses its partitions from a sample of what half of `maintenance_work_mem` holds, so a large table needs it large (376 MB for a million rows of 1536 dimensions, 12 GB for a billion); given too little, the build fails early, naming the setting it needs (`pg_lion.vector_build_sample`; `allow` builds fewer partitions instead).
-- `lionvec` does not support row-level security: it builds no index on a table that has it enabled, or on a partition of one, and a query such an index could order fails.
-- jsonb `<@` isn't indexed, and jsonpath (`@?`, `@@`) is always rechecked in the heap. Updating an indexed jsonb document writes one entry per path, so it costs more than with GIN's pending list.
-- `lionvec` answers only an `ORDER BY` of its distance, approximately, as HNSW and IVFFlat do. Its build is arithmetic: k-means, then every row compared with the centroids of the groups of partitions (regions) and of the partitions in the regions nearest it, so it grows with the rows times the square root of the partitions: 115,386 rows of 1536 dimensions in 2,717 partitions took 108 s alone and 36 s with three parallel workers (292 s and 85 s comparing every row with every centroid). It reuses the space of deleted rows only slowly and keeps the partitions it was built with, so a table with heavy churn or drift needs an occasional `REINDEX`. Each row it returns is read from the table twice. Its scan runs in parallel only with `pg_lion.vector_parallel_scan` on (off by default) and `parallel_setup_cost` lowered, and on 115,000 rows it was then 4 to 8 times slower than alone, each process probing about as much as one scan does; a filtered query stays serial.
-- On a hot standby, indexes using the default (generic) WAL mode recheck every row in counts. Preloading the library avoids this.
-- Loading the library changes estimates, and so plans, that have nothing to do with lion: a column with a lion index takes its number of distinct values, and the frequencies of the values a query compares it with, from the index, and a table's row estimate can be corrected from one, even with `pg_lion.enable_count_pushdown` off. Results never change. Set `pg_lion.enable_index_ndistinct`, `pg_lion.enable_index_mcv` and `pg_lion.enable_rows_correction` off to keep the planner's own estimates.
+- No unique indexes or `INCLUDE` columns. Use a B-tree for uniqueness, a plain `ORDER BY col LIMIT n`, and returning many rows in order.
+- Heap tables only.
+- With `pg_lion` preloaded, inserts are about 1.4× slower than B-tree, and more without it. Slices add much more.
+- An index on an array, `tsvector` or default `jsonb` column can't drive a `GROUP BY`.
+- Rows on pages that aren't all-visible are checked in the heap, and so is every row a jsonpath query finds.
+- `lionvec` needs its distance function costs set (see the [guide](docs/GUIDE.md)), and a table with heavy churn needs an occasional `REINDEX`.
+- Loading the library can change the plans of queries that have nothing to do with lion, through its estimates. Results don't change, and settings turn this off.
 
 The [full list](docs/REFERENCE.md#known-limitations) has the details.
 
 ## Performance
-
-Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, warm cache, an 8-core Ryzen 7 5700X3D under WSL2, PostgreSQL 18.6, `pg_lion.recheck_group_tid_cost` at 1, though the default of 2 picks the same plan for the one row it affects), with how lion compares. "lion 10× faster" means the other index took ten times as long.
 
 | Query                                                       | Lion     | B-tree                          | GIN                            |
 | ----------------------------------------------------------- | -------- | ------------------------------- | ------------------------------ |
@@ -255,7 +219,7 @@ Query execution times on a synthetic benchmark (5M rows unless noted, vacuumed, 
 | Top 10 by BM25 vs `ts_rank`, 33k matches (500k docs)        | 6.88 ms  |                                 | 97.6 ms (lion 14× faster)      |
 | Top 10 by BM25 vs `ts_rank`, 584 matches                    | 3.74 ms  |                                 | 3.25 ms (lion **1.2× slower**) |
 
-The lion indexes are smaller than both the B-tree and the GIN ones, build in under half B-tree's time, and inserts are about 1.4× slower than B-tree while writing a little less WAL. The [benchmark page](docs/BENCHMARKS.md) has every query, the setup and how to reproduce it.
+On the 5M-row table the lion indexes are smaller than both the B-tree and the GIN ones and build in under half B-tree's time. A `tsvector` index with positions is larger than GIN's. The [benchmark page](docs/BENCHMARKS.md) has every query, the setup and how to reproduce it.
 
 ## Documentation
 

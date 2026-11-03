@@ -25846,7 +25846,7 @@ appended in format 5 (§44.13). Every page's special space carries its next bloc
 
 So an index of n rows of d dimensions is about n (d / 8 + 36) bytes of CODE pages, twice that when
 it spills, and n (d + 20) of REFINE pages - 1.7 GB for the benchmark's 975,000 rows of 1536
-without spill (225 MB of it CODE pages), 1.9 GB with it - and C (d + 1.2 d / 8 + 70) of
+without spill (225 MB of it CODE pages), about 2 GB with it, estimated - and C (d + 1.2 d / 8 + 70) of
 centroids. A scan reads the PART chain, 500 KB there, and the CODE pages of the partitions it
 probes, each twice as long when the index spills.
 
