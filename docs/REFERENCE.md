@@ -392,7 +392,7 @@ or beside a `jsonb_contains_ops` index on the same column:
 
 ## Nearest neighbours: lionvec (DESIGN.md §44)
 
-`CREATE EXTENSION pg_lion_vector` (it needs pgvector 0.7 or later and `pg_lion`) adds the `lionvec`
+`CREATE EXTENSION pg_lion_vector` (it needs pgvector 0.7 or later and `pg_lion`, created in the database first, or with `CASCADE`) adds the `lionvec`
 index access method for pgvector's `vector` and `halfvec` types and three operator classes for
 each, one per distance:
 
@@ -421,7 +421,7 @@ last few from the heap with pgvector's own operator. It stops once the next cent
 `pg_lion.vector_patience` times `sqrt(n) / 2` rows (n the rows it was built with) have brought
 nothing nearer, so it reads a few percent of the rows, and a row in a partition it did not read is
 missed: the answer is approximate, as HNSW's and IVFFlat's are (at the defaults, 98% of the true ten
-nearest over 975,000 OpenAI embeddings, where HNSW at `ef_search` 100 returns 95%; DESIGN.md §44.9).
+nearest over 975,000 OpenAI embeddings, where HNSW at `ef_search` 100 returns 95%, on an October 14 build not re-measured since; DESIGN.md §44.9).
 Rows come back in the order of their true distances, and the distances are pgvector's; a row found
 too late - in a partition read after farther rows were returned, or when a bound of
 `pg_lion.vector_epsilon` standard deviations fails - is skipped, never returned out of order. NULL
@@ -465,7 +465,7 @@ second. A scan then finds more of the nearest rows at the same `pg_lion.vector_m
 OpenAI embeddings, 0.92 of the ten nearest at the default margin against 0.84 without), or as
 many at a smaller one, reading fewer partitions; it returns each row once. The cost is a second
 copy of every row's one-bit code: twice the code pages, which are an eighth of a 1536-dimension
-index (1.9 GB rather than 1.7 GB for a million rows), each partition twice as long to read, and an
+index (about 2 GB, estimated, rather than 1.7 GB for a million rows), each partition twice as long to read, and an
 insert written to two partitions. With fewer than two partitions there is nothing to spill to.
 The build reads it, so a change takes effect at the next `REINDEX`.
 
@@ -519,6 +519,20 @@ Under `pg_lion.vector_postfilter` `error` (the default) or `exact` a partial pat
 would follow is removed as the serial one is, and `LionOrdered` over a distance order is never
 parallel, so a filtered query runs in one process; under `allow` the parallel scan with a `Filter` is a plan like the
 serial one.
+
+## Upgrading
+
+After installing a newer build, bring each database's copy up to date:
+
+```sql
+ALTER EXTENSION pg_lion UPDATE;
+ALTER EXTENSION pg_lion_citext UPDATE;  -- where installed
+ALTER EXTENSION pg_lion_vector UPDATE;  -- where installed
+```
+
+Lion indexes built by a build of another on-disk format then need `REINDEX`. Until then, queries plan around such an index with a warning, so they still run but can be slow, while inserts into its table, VACUUM and lion's SQL functions fail with an error that says to rebuild it.
+
+A database with a build from before 0.3.0 installed has no update path: drop the extensions and create them and the indexes again. `DROP EXTENSION ... CASCADE` also drops every object that depends on them, such as views that call lion's functions, so save the definitions and grants of those objects first and recreate them after.
 
 ## Reloptions
 
@@ -1142,6 +1156,7 @@ working around a bad choice:
   the NULLs away once for each value and comes out hundreds of times short on a column with many
   NULLs ("A run of `<>` is one exclusion"). It applies to a table with a Lion index, with the probe
   on or off. Off, those correct Lion's own estimates only and the planner keeps its own row count.
+- `pg_lion.enable_skew_estimate`: price a nested loop's probes of a skewed key column at the rows a probed key meets, from a Lion index, whichever index or bitmap path answers the probe (DESIGN.md §33, "Where it prices"). Off, a key looked up by a join is priced at the planner's rows per key.
 - `pg_lion.enable_index_ndistinct`: give the planner a column's number of distinct values from a
   Lion index on it - the index's count of its keys, taken at build, by every VACUUM that deletes
   rows (in the walk it makes anyway) and by an ANALYZE when the index's directory is no larger than
@@ -1528,7 +1543,7 @@ access method itself (an `ORDER BY` is `LionOrdered`'s: a B-tree walked with a l
 lion index's own ordered column walked, §30), no index-only scans of a lion index
 that return a column (only those that need none, like `count(*)`; the rows of a Lion-filtered
 query come from a covering B-tree instead, §40), no INCLUDE columns, no
-parallel scan (a parallel build is supported from PostgreSQL 17). VACUUM reclaims the pages it
+parallel index scan, so a plain lion scan, `LionBm25`, `LionOrderedJoin`, `LionOrderedSplit` and `LionOrdered`'s walk of a lion column run in one process, and a parallel bitmap heap scan builds its bitmap in one (a parallel build is supported from PostgreSQL 17, and `LionCount`, `LionSemiJoin`, `LionAntiJoin` and `LionOrdered`'s walk of a B-tree can use workers). VACUUM reclaims the pages it
 empties, as a B-tree does: directory leaves, and the leaves of a key's posting tree while the key
 still has rows; the internal pages of a posting tree go with its key. Inserts serialise on the directory
 leaf that holds the key; see the measured
@@ -1641,8 +1656,7 @@ Raise `work_mem` or `hash_mem_multiplier`, add a `LIMIT`, or let such a query so
 enable_indexscan = off`), which spills to disk.
 pgvector prices its distance functions as nearly free (`COST 1`) and its vectors are stored out of
 line, so under a filter that keeps a large share of the rows the planner may sort them by distance
-where the `lionvec` scan is faster: on a million rows it did, for filters of 1% and 10%, 3 to 17
-times slower, until scans paused (`pg_lion.vector_patience`). `lionvec` assumes the three
+where the `lionvec` scan is faster. `lionvec` assumes the three
 functions its operator classes use cost 100 (`ALTER FUNCTION l2_distance(vector, vector) COST
 100`, and the same for `vector_negative_inner_product(vector, vector)` and `cosine_distance(vector,
 vector)`, and for a `halfvec` column `l2_distance(halfvec, halfvec)`,

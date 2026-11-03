@@ -169,6 +169,7 @@ on)` keeps one posting set per bit of its values, and the count pushdown answers
 From Slices` in EXPLAIN; DESIGN.md §51, §52):
 
 ```sql
+-- with lion indexes on country, tags and device too: a filter no lion index answers isn't taken
 CREATE INDEX ON events USING lion (amount) WITH (slices = on);
 SELECT sum(amount), avg(amount), max(amount), count(*) FROM events
  WHERE country = 'JP' AND tags && '{mobile}';
@@ -644,6 +645,7 @@ halves are read as floats and coded as a vector's - so it is no smaller, while t
 and what an exact distance reads of it from the table, takes half the space.
 
 ```sql
+CREATE EXTENSION vector;
 CREATE EXTENSION pg_lion_vector;
 -- once per database: at pgvector's own cost of 1 the planner may sort a filter's
 -- rows by distance where the lionvec scan is faster
@@ -692,10 +694,10 @@ By default the build also puts each row in a second partition, chosen among its 
 so that a query that passes the row's own partition by is likely to read it (`spill`, after SOAR),
 so a scan finds more of the nearest rows at the same margin; it returns each once. That doubles the
 one-bit code pages, an eighth of a 1536-dimension index: those 975,000 embeddings make an index of
-1.9 GB rather than 1.7 GB, and every insert writes to two partitions. On 115,000 OpenAI embeddings
+about 2 GB (estimated) rather than 1.7 GB, and every insert writes to two partitions. On 115,000 OpenAI embeddings
 the default margin returned 92% of the true ten nearest with it and 84% without, and a margin of 3
 with it as many as one of 5 without, reading less than half the partitions. `WITH (spill = off)`
-and a `REINDEX` keep one copy (the figures above and below are from an index without).
+and a `REINDEX` keep one copy (the figures above and below are from an index without, on an October 14 build not re-measured since).
 
 Building the index runs k-means over a sample of the rows and then finds every row's partition,
 comparing each row with the centroids of the groups of partitions (regions) and then of the
