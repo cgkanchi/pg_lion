@@ -15124,7 +15124,8 @@ this is for.
 **Recognition** (`lion_fkjoin_recognize_small_anti()`, from the join rel `create_upper_paths_hook`
 is given at `UPPERREL_GROUP_AGG`, where §27's joins are recognised):
 
-- a sublink anti join - NOT EXISTS pulled up by core, its RTE_JOIN not in the FROM list - whose
+- a sublink anti join - NOT EXISTS pulled up by core, its RTE_JOIN not in the FROM list - or one of
+  `LEFT JOIN ... IS NULL` that nothing above reads the inner side of (below), whose
   outer side is exactly one table t and whose two sides make the whole join rel; any other special
   join lies inside the inner side; no PlaceHolderVars, pseudoconstant quals or LATERAL references;
 - t a plain table or a materialized view as the fact of §27 is asked to be
@@ -15137,9 +15138,21 @@ is given at `UPPERREL_GROUP_AGG`, where §27's joins are recognised):
 - at least one of them a strict binary operator between a plain column of t and an expression of
   the inner side alone: the keys.
 
-`LEFT JOIN s ON s.a = t.k WHERE s.a IS NULL`, which core makes an anti join of, keeps its `IS NULL`
-quals above the join, and is not a sublink anti join: it is left alone, as not free and asked for by
-nothing. `t.k NOT IN (SELECT s.a ...)` is a hashed SubPlan on 16 to 18, which the node never sees.
+**`LEFT JOIN s ON ... WHERE s.a IS NULL`** (2026-11-05, `lion_small_anti_left()`). Core makes an anti
+join of it where the ON clauses are strict for the column tested (reduce_outer_joins()): the same join
+as the NOT EXISTS of the ON clauses, t's rows no row of s matches, with its own relid, a join entry of
+the FROM list. What differs is what lies above it: the LEFT JOIN's WHERE and target list may still
+name s's columns, which are NULL in every row the anti join emits. So it is taken as the NOT EXISTS
+is when nothing above the join reads s but `s.c IS NULL` tests of plain columns, true of every such
+row - each clause the join rel evaluates above the outer join (pushed down, in the joininfo of any
+table of the join) such a NullTest, and neither the processed target list (grouping, ordering and
+DISTINCT columns among it) nor the HAVING naming s or the outer join's relid. 16 and 17 keep the IS NULL
+that made the anti join among those clauses; later releases drop it
+(remove_redundant_nullability_quals()). The ON clauses are the anti join's own (not pushed down), its
+correlation as a NOT EXISTS's WHERE is; one of s alone is s's restriction, applied by the child. A
+WHERE above that reads s otherwise (`coalesce(s.f, 0) = 0`, `s.b IS NULL OR t.g = 1`), `count(s.f)`, a
+GROUP BY of s's column or a HAVING over it leave the query to core, and so does an IS NULL the ON is
+not strict for, which leaves a LEFT JOIN. `t.k NOT IN (SELECT s.a ...)` is a hashed SubPlan on 16 to 18, which the node never sees.
 19 makes an anti join of it where it proves that neither `t.k` nor `s.a` can be NULL (a NOT NULL
 column, or a strict qual on it) and its operator is a B-tree's or a hash index's, which gives no
 NULL for values that are not: then NOT IN and NOT EXISTS are the same join, a sublink anti join with
